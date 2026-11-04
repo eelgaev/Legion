@@ -19,7 +19,7 @@ jobs:
     env:
       CARGO_TARGET_DIR: /home/runner/cargo-target
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: ggml submodule
         run: git submodule update --init --depth 1 third_party/ggml
       - run: cargo fmt --check
