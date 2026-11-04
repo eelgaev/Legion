@@ -1,0 +1,1353 @@
+[
+  {
+    "name": "plain",
+    "system": null,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello there!",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      }
+    ],
+    "tools": [],
+    "add_generation_prompt": true,
+    "kwargs": {},
+    "templates": [
+      "qwen3",
+      "qwen36",
+      "gemma3",
+      "gemma4",
+      "nemotron35",
+      "deepseek41"
+    ]
+  },
+  {
+    "name": "plain_no_generation_prompt",
+    "system": null,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello there!",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      }
+    ],
+    "tools": [],
+    "add_generation_prompt": false,
+    "kwargs": {},
+    "templates": [
+      "qwen3",
+      "qwen36",
+      "gemma3",
+      "gemma4",
+      "nemotron35",
+      "deepseek41"
+    ]
+  },
+  {
+    "name": "system",
+    "system": "You are a helpful assistant.",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hi",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      }
+    ],
+    "tools": [],
+    "add_generation_prompt": true,
+    "kwargs": {},
+    "templates": [
+      "qwen3",
+      "qwen36",
+      "gemma3",
+      "gemma4",
+      "nemotron35",
+      "deepseek41"
+    ]
+  },
+  {
+    "name": "system_unicode_whitespace",
+    "system": "Réponds en français, s'il te plaît 日本語\n",
+    "messages": [
+      {
+        "role": "user",
+        "content": "  padded  \n",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      }
+    ],
+    "tools": [],
+    "add_generation_prompt": true,
+    "kwargs": {},
+    "templates": [
+      "qwen3",
+      "qwen36",
+      "gemma3",
+      "gemma4",
+      "nemotron35",
+      "deepseek41"
+    ]
+  },
+  {
+    "name": "multi_turn_reasoning",
+    "system": null,
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is 2+2?",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "assistant",
+        "content": "4.",
+        "reasoning": "Simple arithmetic.",
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "user",
+        "content": "And times 3?",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "assistant",
+        "content": "12.",
+        "reasoning": "4*3=12.",
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "user",
+        "content": "Thanks, and plus 1?",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      }
+    ],
+    "tools": [],
+    "add_generation_prompt": true,
+    "kwargs": {},
+    "templates": [
+      "qwen3",
+      "qwen36",
+      "gemma3",
+      "gemma4",
+      "nemotron35",
+      "deepseek41"
+    ]
+  },
+  {
+    "name": "multi_turn_reasoning_system",
+    "system": "Be brief.",
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is 2+2?",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "assistant",
+        "content": "4.",
+        "reasoning": "Simple arithmetic.",
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "user",
+        "content": "And times 3?",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "assistant",
+        "content": "12.",
+        "reasoning": "4*3=12.",
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "user",
+        "content": "Thanks, and plus 1?",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      }
+    ],
+    "tools": [],
+    "add_generation_prompt": true,
+    "kwargs": {},
+    "templates": [
+      "qwen3",
+      "qwen36",
+      "gemma3",
+      "gemma4",
+      "nemotron35",
+      "deepseek41"
+    ]
+  },
+  {
+    "name": "multi_turn_final_assistant",
+    "system": null,
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is 2+2?",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "assistant",
+        "content": "4.",
+        "reasoning": "Simple arithmetic.",
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "user",
+        "content": "And times 3?",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "assistant",
+        "content": "12.",
+        "reasoning": "4*3=12.",
+        "tool_calls": [],
+        "tool_call_id": null
+      }
+    ],
+    "tools": [],
+    "add_generation_prompt": false,
+    "kwargs": {},
+    "templates": [
+      "qwen3",
+      "qwen36",
+      "gemma3",
+      "gemma4",
+      "nemotron35",
+      "deepseek41"
+    ]
+  },
+  {
+    "name": "enable_thinking_false",
+    "system": null,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hi",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      }
+    ],
+    "tools": [],
+    "add_generation_prompt": true,
+    "kwargs": {
+      "enable_thinking": false
+    },
+    "templates": [
+      "qwen3",
+      "qwen36",
+      "gemma3",
+      "gemma4",
+      "nemotron35",
+      "deepseek41"
+    ]
+  },
+  {
+    "name": "enable_thinking_true",
+    "system": null,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hi",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      }
+    ],
+    "tools": [],
+    "add_generation_prompt": true,
+    "kwargs": {
+      "enable_thinking": true
+    },
+    "templates": [
+      "qwen3",
+      "qwen36",
+      "gemma3",
+      "gemma4",
+      "nemotron35",
+      "deepseek41"
+    ]
+  },
+  {
+    "name": "enable_thinking_true_system",
+    "system": "Sys.",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hi",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      }
+    ],
+    "tools": [],
+    "add_generation_prompt": true,
+    "kwargs": {
+      "enable_thinking": true
+    },
+    "templates": [
+      "qwen3",
+      "qwen36",
+      "gemma3",
+      "gemma4",
+      "nemotron35",
+      "deepseek41"
+    ]
+  },
+  {
+    "name": "preserve_thinking",
+    "system": null,
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is 2+2?",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "assistant",
+        "content": "4.",
+        "reasoning": "Simple arithmetic.",
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "user",
+        "content": "And times 3?",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "assistant",
+        "content": "12.",
+        "reasoning": "4*3=12.",
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "user",
+        "content": "Thanks, and plus 1?",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      }
+    ],
+    "tools": [],
+    "add_generation_prompt": true,
+    "kwargs": {
+      "preserve_thinking": true
+    },
+    "templates": [
+      "qwen36"
+    ]
+  },
+  {
+    "name": "tools",
+    "system": null,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Weather in Zürich?",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      }
+    ],
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": "Get the current weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string",
+              "description": "City name, e.g. Zürich"
+            },
+            "unit": {
+              "type": "string",
+              "enum": [
+                "celsius",
+                "fahrenheit"
+              ]
+            }
+          },
+          "required": [
+            "city"
+          ]
+        }
+      }
+    ],
+    "add_generation_prompt": true,
+    "kwargs": {},
+    "templates": [
+      "qwen3",
+      "qwen36",
+      "gemma3",
+      "gemma4",
+      "nemotron35",
+      "deepseek41"
+    ]
+  },
+  {
+    "name": "tools_system",
+    "system": "Use tools.",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Weather in Zürich?",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      }
+    ],
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": "Get the current weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string",
+              "description": "City name, e.g. Zürich"
+            },
+            "unit": {
+              "type": "string",
+              "enum": [
+                "celsius",
+                "fahrenheit"
+              ]
+            }
+          },
+          "required": [
+            "city"
+          ]
+        }
+      },
+      {
+        "name": "search",
+        "description": "Search the web",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "Search query"
+            },
+            "limit": {
+              "type": "integer",
+              "description": "Max results"
+            },
+            "tags": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Filters"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      }
+    ],
+    "add_generation_prompt": true,
+    "kwargs": {},
+    "templates": [
+      "qwen3",
+      "qwen36",
+      "gemma3",
+      "gemma4",
+      "nemotron35",
+      "deepseek41"
+    ]
+  },
+  {
+    "name": "tool_call_result",
+    "system": null,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Weather in Zürich?",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "assistant",
+        "content": "Let me check.",
+        "reasoning": "I should call the weather tool.",
+        "tool_calls": [
+          {
+            "id": "call_1",
+            "name": "get_weather",
+            "arguments": "{\"city\": \"Zürich\", \"unit\": \"celsius\"}"
+          }
+        ],
+        "tool_call_id": null
+      },
+      {
+        "role": "tool",
+        "content": "{\"temp\": 18, \"sky\": \"clear\"}",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": "call_1"
+      }
+    ],
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": "Get the current weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string",
+              "description": "City name, e.g. Zürich"
+            },
+            "unit": {
+              "type": "string",
+              "enum": [
+                "celsius",
+                "fahrenheit"
+              ]
+            }
+          },
+          "required": [
+            "city"
+          ]
+        }
+      }
+    ],
+    "add_generation_prompt": true,
+    "kwargs": {},
+    "templates": [
+      "qwen3",
+      "qwen36",
+      "gemma4",
+      "nemotron35",
+      "deepseek41"
+    ]
+  },
+  {
+    "name": "tool_call_result_thinking_false",
+    "system": null,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Weather in Zürich?",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "assistant",
+        "content": "Let me check.",
+        "reasoning": "I should call the weather tool.",
+        "tool_calls": [
+          {
+            "id": "call_1",
+            "name": "get_weather",
+            "arguments": "{\"city\": \"Zürich\", \"unit\": \"celsius\"}"
+          }
+        ],
+        "tool_call_id": null
+      },
+      {
+        "role": "tool",
+        "content": "{\"temp\": 18, \"sky\": \"clear\"}",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": "call_1"
+      }
+    ],
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": "Get the current weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string",
+              "description": "City name, e.g. Zürich"
+            },
+            "unit": {
+              "type": "string",
+              "enum": [
+                "celsius",
+                "fahrenheit"
+              ]
+            }
+          },
+          "required": [
+            "city"
+          ]
+        }
+      }
+    ],
+    "add_generation_prompt": true,
+    "kwargs": {
+      "enable_thinking": false
+    },
+    "templates": [
+      "qwen3",
+      "qwen36",
+      "gemma4",
+      "nemotron35",
+      "deepseek41"
+    ]
+  },
+  {
+    "name": "tool_call_result_thinking_true",
+    "system": null,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Weather in Zürich?",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "assistant",
+        "content": "Let me check.",
+        "reasoning": "I should call the weather tool.",
+        "tool_calls": [
+          {
+            "id": "call_1",
+            "name": "get_weather",
+            "arguments": "{\"city\": \"Zürich\", \"unit\": \"celsius\"}"
+          }
+        ],
+        "tool_call_id": null
+      },
+      {
+        "role": "tool",
+        "content": "{\"temp\": 18, \"sky\": \"clear\"}",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": "call_1"
+      }
+    ],
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": "Get the current weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string",
+              "description": "City name, e.g. Zürich"
+            },
+            "unit": {
+              "type": "string",
+              "enum": [
+                "celsius",
+                "fahrenheit"
+              ]
+            }
+          },
+          "required": [
+            "city"
+          ]
+        }
+      }
+    ],
+    "add_generation_prompt": true,
+    "kwargs": {
+      "enable_thinking": true
+    },
+    "templates": [
+      "qwen3",
+      "qwen36",
+      "gemma4",
+      "nemotron35",
+      "deepseek41"
+    ]
+  },
+  {
+    "name": "tool_call_continued",
+    "system": null,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Weather in Zürich?",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "assistant",
+        "content": "Let me check.",
+        "reasoning": "I should call the weather tool.",
+        "tool_calls": [
+          {
+            "id": "call_1",
+            "name": "get_weather",
+            "arguments": "{\"city\": \"Zürich\", \"unit\": \"celsius\"}"
+          }
+        ],
+        "tool_call_id": null
+      },
+      {
+        "role": "tool",
+        "content": "{\"temp\": 18, \"sky\": \"clear\"}",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": "call_1"
+      },
+      {
+        "role": "assistant",
+        "content": "It is 18 C and clear.",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "user",
+        "content": "Thanks!",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      }
+    ],
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": "Get the current weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string",
+              "description": "City name, e.g. Zürich"
+            },
+            "unit": {
+              "type": "string",
+              "enum": [
+                "celsius",
+                "fahrenheit"
+              ]
+            }
+          },
+          "required": [
+            "city"
+          ]
+        }
+      }
+    ],
+    "add_generation_prompt": true,
+    "kwargs": {},
+    "templates": [
+      "qwen3",
+      "qwen36",
+      "gemma4",
+      "nemotron35",
+      "deepseek41"
+    ]
+  },
+  {
+    "name": "parallel_tool_calls",
+    "system": "Use tools.",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Weather in Paris and news about it?",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "reasoning": null,
+        "tool_calls": [
+          {
+            "id": "call_a",
+            "name": "get_weather",
+            "arguments": "{\"city\": \"Paris\"}"
+          },
+          {
+            "id": "call_b",
+            "name": "search",
+            "arguments": "{\"query\": \"Paris news\", \"limit\": 3, \"tags\": [\"a\", \"b\"], \"opts\": {\"x\": [1, 2.5, null, true]}}"
+          }
+        ],
+        "tool_call_id": null
+      },
+      {
+        "role": "tool",
+        "content": "sunny, 21C",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": "call_a"
+      },
+      {
+        "role": "tool",
+        "content": "Nothing special today.",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": "call_b"
+      }
+    ],
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": "Get the current weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string",
+              "description": "City name, e.g. Zürich"
+            },
+            "unit": {
+              "type": "string",
+              "enum": [
+                "celsius",
+                "fahrenheit"
+              ]
+            }
+          },
+          "required": [
+            "city"
+          ]
+        }
+      },
+      {
+        "name": "search",
+        "description": "Search the web",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "Search query"
+            },
+            "limit": {
+              "type": "integer",
+              "description": "Max results"
+            },
+            "tags": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Filters"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      }
+    ],
+    "add_generation_prompt": true,
+    "kwargs": {},
+    "templates": [
+      "qwen3",
+      "qwen36",
+      "gemma4",
+      "nemotron35",
+      "deepseek41"
+    ]
+  },
+  {
+    "name": "parallel_tool_calls_no_generation_prompt",
+    "system": null,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Weather in Paris and news about it?",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "reasoning": null,
+        "tool_calls": [
+          {
+            "id": "call_a",
+            "name": "get_weather",
+            "arguments": "{\"city\": \"Paris\"}"
+          },
+          {
+            "id": "call_b",
+            "name": "search",
+            "arguments": "{\"query\": \"Paris news\", \"limit\": 3, \"tags\": [\"a\", \"b\"], \"opts\": {\"x\": [1, 2.5, null, true]}}"
+          }
+        ],
+        "tool_call_id": null
+      },
+      {
+        "role": "tool",
+        "content": "sunny, 21C",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": "call_a"
+      },
+      {
+        "role": "tool",
+        "content": "Nothing special today.",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": "call_b"
+      }
+    ],
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": "Get the current weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string",
+              "description": "City name, e.g. Zürich"
+            },
+            "unit": {
+              "type": "string",
+              "enum": [
+                "celsius",
+                "fahrenheit"
+              ]
+            }
+          },
+          "required": [
+            "city"
+          ]
+        }
+      },
+      {
+        "name": "search",
+        "description": "Search the web",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "Search query"
+            },
+            "limit": {
+              "type": "integer",
+              "description": "Max results"
+            },
+            "tags": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Filters"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      }
+    ],
+    "add_generation_prompt": false,
+    "kwargs": {},
+    "templates": [
+      "qwen3",
+      "qwen36",
+      "gemma4",
+      "nemotron35",
+      "deepseek41"
+    ]
+  },
+  {
+    "name": "tools_unsorted_keys",
+    "system": null,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Book me to Oslo from Zürich",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      }
+    ],
+    "tools": [
+      {
+        "name": "book_flight",
+        "description": "Book a flight",
+        "parameters": {
+          "type": "object",
+          "required": [
+            "to",
+            "from"
+          ],
+          "properties": {
+            "to": {
+              "type": "string",
+              "description": "Destination"
+            },
+            "from": {
+              "type": "string",
+              "description": "Origin"
+            },
+            "date": {
+              "type": "string",
+              "description": "ISO date"
+            },
+            "bags": {
+              "type": "integer",
+              "description": "Checked bags"
+            }
+          }
+        }
+      }
+    ],
+    "add_generation_prompt": true,
+    "kwargs": {},
+    "templates": [
+      "qwen3",
+      "qwen36",
+      "gemma4",
+      "nemotron35",
+      "deepseek41"
+    ]
+  },
+  {
+    "name": "tool_call_unsorted_keys",
+    "system": null,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Book me to Oslo from Zürich",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "reasoning": null,
+        "tool_calls": [
+          {
+            "id": "call_u",
+            "name": "book_flight",
+            "arguments": "{\"to\": \"Oslo\", \"from\": \"Zürich\", \"bags\": 2, \"date\": \"2026-11-02\"}"
+          }
+        ],
+        "tool_call_id": null
+      },
+      {
+        "role": "tool",
+        "content": "{\"status\": \"booked\"}",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": "call_u"
+      }
+    ],
+    "tools": [
+      {
+        "name": "book_flight",
+        "description": "Book a flight",
+        "parameters": {
+          "type": "object",
+          "required": [
+            "to",
+            "from"
+          ],
+          "properties": {
+            "to": {
+              "type": "string",
+              "description": "Destination"
+            },
+            "from": {
+              "type": "string",
+              "description": "Origin"
+            },
+            "date": {
+              "type": "string",
+              "description": "ISO date"
+            },
+            "bags": {
+              "type": "integer",
+              "description": "Checked bags"
+            }
+          }
+        }
+      }
+    ],
+    "add_generation_prompt": true,
+    "kwargs": {},
+    "templates": [
+      "qwen3",
+      "qwen36",
+      "gemma4",
+      "nemotron35",
+      "deepseek41"
+    ]
+  },
+  {
+    "name": "inline_think_in_content",
+    "system": null,
+    "messages": [
+      {
+        "role": "user",
+        "content": "q",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "assistant",
+        "content": "<think>\nhidden\n</think>\n\nanswer",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "user",
+        "content": "q2",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      }
+    ],
+    "tools": [],
+    "add_generation_prompt": true,
+    "kwargs": {},
+    "templates": [
+      "qwen3",
+      "qwen36"
+    ]
+  },
+  {
+    "name": "error_roles_not_alternating",
+    "system": null,
+    "messages": [
+      {
+        "role": "user",
+        "content": "a",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "user",
+        "content": "b",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      }
+    ],
+    "tools": [],
+    "add_generation_prompt": true,
+    "kwargs": {},
+    "templates": [
+      "gemma3"
+    ]
+  },
+  {
+    "name": "error_no_messages",
+    "system": null,
+    "messages": [],
+    "tools": [],
+    "add_generation_prompt": true,
+    "kwargs": {},
+    "templates": [
+      "qwen36"
+    ]
+  },
+  {
+    "name": "thinking_mode_chat",
+    "system": null,
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is 2+2?",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "assistant",
+        "content": "4.",
+        "reasoning": "Simple arithmetic.",
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "user",
+        "content": "And times 3?",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "assistant",
+        "content": "12.",
+        "reasoning": "4*3=12.",
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "user",
+        "content": "Thanks, and plus 1?",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      }
+    ],
+    "tools": [],
+    "add_generation_prompt": true,
+    "kwargs": {
+      "thinking_mode": "chat"
+    },
+    "templates": [
+      "deepseek41"
+    ]
+  },
+  {
+    "name": "reasoning_effort_max",
+    "system": null,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hi",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      }
+    ],
+    "tools": [],
+    "add_generation_prompt": true,
+    "kwargs": {
+      "reasoning_effort": "max"
+    },
+    "templates": [
+      "deepseek41"
+    ]
+  },
+  {
+    "name": "reasoning_effort_numeric",
+    "system": null,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hi",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      }
+    ],
+    "tools": [],
+    "add_generation_prompt": true,
+    "kwargs": {
+      "reasoning_effort": "30"
+    },
+    "templates": [
+      "deepseek41"
+    ]
+  },
+  {
+    "name": "drop_thinking_false",
+    "system": null,
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is 2+2?",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "assistant",
+        "content": "4.",
+        "reasoning": "Simple arithmetic.",
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "user",
+        "content": "And times 3?",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "assistant",
+        "content": "12.",
+        "reasoning": "4*3=12.",
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "user",
+        "content": "Thanks, and plus 1?",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      }
+    ],
+    "tools": [],
+    "add_generation_prompt": true,
+    "kwargs": {
+      "drop_thinking": false
+    },
+    "templates": [
+      "deepseek41"
+    ]
+  },
+  {
+    "name": "error_reasoning_effort",
+    "system": null,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hi",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      }
+    ],
+    "tools": [],
+    "add_generation_prompt": true,
+    "kwargs": {
+      "reasoning_effort": "huge"
+    },
+    "templates": [
+      "deepseek41"
+    ]
+  }
+]

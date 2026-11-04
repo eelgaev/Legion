@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Legion</title>
+  <link rel="icon" href="/assets/legion.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <!-- The Legion mark (an expert grid between corner brackets, after docs/legion.png), drawn
+       in currentColor; two cells use --mark-lit. Used by the header and the empty state. -->
+  <svg width="0" height="0" hidden aria-hidden="true">
+    <symbol id="legion-mark" viewBox="0 0 24 24">
+      <path d="M1 7V1h6M17 1h6v6M23 17v6h-6M7 23H1v-6" fill="none" stroke="currentColor" stroke-width="2"/>
+      <g fill="currentColor">
+        <rect x="4.5" y="4.5" width="3" height="3"/><rect x="8.5" y="4.5" width="3" height="3"/>
+        <rect x="12.5" y="4.5" width="3" height="3"/><rect x="16.5" y="4.5" width="3" height="3"/>
+        <rect x="4.5" y="8.5" width="3" height="3"/><rect x="8.5" y="8.5" width="3" height="3" style="fill: var(--mark-lit, currentColor)"/>
+        <rect x="12.5" y="8.5" width="3" height="3"/><rect x="16.5" y="8.5" width="3" height="3"/>
+        <rect x="4.5" y="12.5" width="3" height="3"/><rect x="8.5" y="12.5" width="3" height="3"/>
+        <rect x="12.5" y="12.5" width="3" height="3"/><rect x="16.5" y="12.5" width="3" height="3" style="fill: var(--mark-lit, currentColor)"/>
+        <rect x="4.5" y="16.5" width="3" height="3"/><rect x="8.5" y="16.5" width="3" height="3"/>
+        <rect x="12.5" y="16.5" width="3" height="3"/><rect x="16.5" y="16.5" width="3" height="3"/>
+      </g>
+    </symbol>
+  </svg>
+  <div id="shell">
+  <input type="checkbox" id="sidebar-toggle" hidden>
+  <aside id="sidebar" aria-label="Conversations">
+    <button id="new-chat" type="button"><span aria-hidden="true">+</span> New chat</button>
+    <input id="search" type="search" placeholder="Search chats" aria-label="Search chats">
+    <p class="label" id="chats-label">Chats</p>
+    <ul id="conversations" aria-labelledby="chats-label"></ul>
+  </aside>
+  <label for="sidebar-toggle" id="sidebar-scrim" aria-hidden="true"></label>
+  <div id="app">
+    <header id="header">
+      <label for="sidebar-toggle" id="sidebar-button" title="Conversations" aria-label="Conversations" role="button" tabindex="0">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+      </label>
+      <div id="brand">
+        <svg class="mark" aria-hidden="true"><use href="#legion-mark"/></svg>
+        <span>Legion</span>
+      </div>
+      <span id="model-chip"><span class="led" aria-hidden="true"></span><span id="model-name">connecting</span></span>
+      <button id="settings-button" type="button" title="Settings" aria-label="Settings">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg>
+        <span>Settings</span>
+      </button>
+    </header>
+    <section id="empty" aria-label="Start a chat">
+      <svg class="mark" aria-hidden="true"><use href="#legion-mark"/></svg>
+      <h2>Legion</h2>
+      <p class="tagline">For we are many.</p>
+      <p class="serving" hidden><span class="led" aria-hidden="true"></span>&gt; ready · serving <span id="empty-model"></span></p>
+      <div id="examples">
+        <button type="button">Explain mixture-of-experts routing in plain words</button>
+        <button type="button">Write a Rust function that splits a CSV line, with tests</button>
+        <button type="button">Compare speculative decoding and batching for throughput</button>
+        <button type="button">Draft a short, friendly README intro for a CLI tool</button>
+      </div>
+    </section>
+    <main id="messages" aria-live="polite"></main>
+    <form id="composer">
+      <div id="attach-bar" hidden>
+        <div id="pending-images"></div>
+        <small id="attach-error" hidden></small>
+      </div>
+      <textarea id="input" rows="1" placeholder="Message Legion" aria-label="Message" autofocus></textarea>
+      <input id="attach-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
+      <button id="attach" type="button" title="Attach images" aria-label="Attach images" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11.5l-8.2 8.2a5 5 0 0 1-7.1-7.1l8.5-8.5a3.3 3.3 0 0 1 4.7 4.7l-8.5 8.5a1.7 1.7 0 0 1-2.4-2.4l7.8-7.8"/></svg>
+      </button>
+      <label id="thinking-toggle" title="Ask the model to think before answering">
+        <input type="checkbox" id="thinking">
+        <span class="led" aria-hidden="true"></span>
+        Thinking
+      </label>
+      <button id="send" type="submit">Send</button>
+    </form>
+    <p id="composer-hint">Enter to send · Shift+Enter for a new line</p>
+  </div>
+  </div>
+  <dialog id="settings-dialog" aria-labelledby="settings-title">
+    <form id="settings-form" method="dialog" novalidate>
+      <div class="dialog-head">
+        <h2 id="settings-title">Settings</h2>
+        <button type="submit" class="close" aria-label="Close" title="Close">×</button>
+      </div>
+      <label class="field">
+        <span>System prompt</span>
+        <textarea id="s-system" rows="3" placeholder="Optional instructions sent before every message"></textarea>
+        <small class="field-error" hidden></small>
+      </label>
+      <fieldset>
+        <legend>Sampling</legend>
+        <div class="field-grid">
+          <label class="field"><span>Temperature</span><input id="s-temperature" type="number" min="0" max="2" step="0.01" placeholder="server default"><small class="field-error" hidden></small></label>
+          <label class="field"><span>Top P</span><input id="s-top-p" type="number" min="0" max="1" step="0.01" placeholder="server default"><small class="field-error" hidden></small></label>
+          <label class="field"><span>Top K</span><input id="s-top-k" type="number" min="0" step="1" placeholder="server default"><small class="field-error" hidden></small></label>
+          <label class="field"><span>Min P</span><input id="s-min-p" type="number" min="0" max="1" step="0.01" placeholder="server default"><small class="field-error" hidden></small></label>
+          <label class="field"><span>Max tokens</span><input id="s-max-tokens" type="number" min="1" step="1" placeholder="server default"><small class="field-error" hidden></small></label>
+          <label class="field"><span>Seed</span><input id="s-seed" type="number" min="0" step="1" placeholder="random"><small class="field-error" hidden></small></label>
+          <label class="field"><span>Presence penalty</span><input id="s-presence-penalty" type="number" min="-2" max="2" step="0.1" placeholder="server default"><small class="field-error" hidden></small></label>
+          <label class="field"><span>Frequency penalty</span><input id="s-frequency-penalty" type="number" min="-2" max="2" step="0.1" placeholder="server default"><small class="field-error" hidden></small></label>
+        </div>
+        <label class="field">
+          <span>Custom JSON</span>
+          <textarea id="s-custom" rows="2" spellcheck="false" placeholder='Merged into every request, e.g. {"repeat_penalty": 1.1}'></textarea>
+          <small class="field-error" hidden></small>
+        </label>
+      </fieldset>
+      <fieldset>
+        <legend>Server and look</legend>
+        <div class="field-grid">
+          <label class="field"><span>Model</span><select id="s-model"></select><small class="field-error" hidden></small></label>
+          <label class="field"><span>Theme</span><select id="s-theme">
+            <option value="system">System</option>
+            <option value="light">Light</option>
+            <option value="dark">Dark</option>
+          </select><small class="field-error" hidden></small></label>
+          <label class="field"><span>Glow</span><select id="s-glow">
+            <option value="off">Off</option>
+            <option value="on">On (dark theme)</option>
+          </select><small class="field-error" hidden></small></label>
+          <label class="field"><span>Scanlines</span><select id="s-scanlines">
+            <option value="off">Off</option>
+            <option value="on">On</option>
+          </select><small class="field-error" hidden></small></label>
+          <label class="field"><span>Font</span><select id="s-font">
+            <option value="system">System</option>
+            <option value="terminal">Terminal</option>
+          </select><small class="field-error" hidden></small></label>
+        </div>
+        <label class="field">
+          <span>API key</span>
+          <input id="s-api-key" type="password" spellcheck="false" autocomplete="off" placeholder="Sent as Authorization: Bearer">
+          <small class="field-error" hidden></small>
+        </label>
+      </fieldset>
+      <div id="settings-actions">
+        <button type="button" id="settings-reset">Reset to defaults</button>
+        <button type="submit">Done</button>
+      </div>
+    </form>
+  </dialog>
+  <script type="module" src="/assets/js/main.js"></script>
+</body>
+</html>

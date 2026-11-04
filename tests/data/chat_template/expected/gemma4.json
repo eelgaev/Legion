@@ -1,0 +1,62 @@
+{
+  "plain": {
+    "output": "<bos><|turn>user\nHello there!<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+  },
+  "plain_no_generation_prompt": {
+    "output": "<bos><|turn>user\nHello there!<turn|>\n"
+  },
+  "system": {
+    "output": "<bos><|turn>system\nYou are a helpful assistant.<turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+  },
+  "system_unicode_whitespace": {
+    "output": "<bos><|turn>system\nRéponds en français, s'il te plaît 日本語<turn|>\n<|turn>user\npadded<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+  },
+  "multi_turn_reasoning": {
+    "output": "<bos><|turn>user\nWhat is 2+2?<turn|>\n<|turn>model\n4.<turn|>\n<|turn>user\nAnd times 3?<turn|>\n<|turn>model\n12.<turn|>\n<|turn>user\nThanks, and plus 1?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+  },
+  "multi_turn_reasoning_system": {
+    "output": "<bos><|turn>system\nBe brief.<turn|>\n<|turn>user\nWhat is 2+2?<turn|>\n<|turn>model\n4.<turn|>\n<|turn>user\nAnd times 3?<turn|>\n<|turn>model\n12.<turn|>\n<|turn>user\nThanks, and plus 1?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+  },
+  "multi_turn_final_assistant": {
+    "output": "<bos><|turn>user\nWhat is 2+2?<turn|>\n<|turn>model\n4.<turn|>\n<|turn>user\nAnd times 3?<turn|>\n<|turn>model\n<|channel>thought\n4*3=12.\n<channel|>12.<turn|>\n"
+  },
+  "enable_thinking_false": {
+    "output": "<bos><|turn>user\nHi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+  },
+  "enable_thinking_true": {
+    "output": "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\n"
+  },
+  "enable_thinking_true_system": {
+    "output": "<bos><|turn>system\n<|think|>\nSys.<turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\n"
+  },
+  "tools": {
+    "output": "<bos><|turn>system\n<|tool>declaration:get_weather{description:<|\"|>Get the current weather for a city<|\"|>,parameters:{properties:{city:{description:<|\"|>City name, e.g. Zürich<|\"|>,type:<|\"|>STRING<|\"|>},unit:{enum:[<|\"|>celsius<|\"|>,<|\"|>fahrenheit<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWeather in Zürich?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+  },
+  "tools_system": {
+    "output": "<bos><|turn>system\nUse tools.<|tool>declaration:get_weather{description:<|\"|>Get the current weather for a city<|\"|>,parameters:{properties:{city:{description:<|\"|>City name, e.g. Zürich<|\"|>,type:<|\"|>STRING<|\"|>},unit:{enum:[<|\"|>celsius<|\"|>,<|\"|>fahrenheit<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><|tool>declaration:search{description:<|\"|>Search the web<|\"|>,parameters:{properties:{limit:{description:<|\"|>Max results<|\"|>,type:<|\"|>INTEGER<|\"|>},query:{description:<|\"|>Search query<|\"|>,type:<|\"|>STRING<|\"|>},tags:{description:<|\"|>Filters<|\"|>,items:{type:<|\"|>STRING<|\"|>},type:<|\"|>ARRAY<|\"|>}},required:[<|\"|>query<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWeather in Zürich?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+  },
+  "tool_call_result": {
+    "output": "<bos><|turn>system\n<|tool>declaration:get_weather{description:<|\"|>Get the current weather for a city<|\"|>,parameters:{properties:{city:{description:<|\"|>City name, e.g. Zürich<|\"|>,type:<|\"|>STRING<|\"|>},unit:{enum:[<|\"|>celsius<|\"|>,<|\"|>fahrenheit<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWeather in Zürich?<turn|>\n<|turn>model\n<|channel>thought\nI should call the weather tool.\n<channel|><|tool_call>call:get_weather{city:<|\"|>Zürich<|\"|>,unit:<|\"|>celsius<|\"|>}<tool_call|><|tool_response>response:get_weather{value:<|\"|>{\"temp\": 18, \"sky\": \"clear\"}<|\"|>}<tool_response|>Let me check.<turn|>\n"
+  },
+  "tool_call_result_thinking_false": {
+    "output": "<bos><|turn>system\n<|tool>declaration:get_weather{description:<|\"|>Get the current weather for a city<|\"|>,parameters:{properties:{city:{description:<|\"|>City name, e.g. Zürich<|\"|>,type:<|\"|>STRING<|\"|>},unit:{enum:[<|\"|>celsius<|\"|>,<|\"|>fahrenheit<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWeather in Zürich?<turn|>\n<|turn>model\n<|channel>thought\nI should call the weather tool.\n<channel|><|tool_call>call:get_weather{city:<|\"|>Zürich<|\"|>,unit:<|\"|>celsius<|\"|>}<tool_call|><|tool_response>response:get_weather{value:<|\"|>{\"temp\": 18, \"sky\": \"clear\"}<|\"|>}<tool_response|>Let me check.<turn|>\n"
+  },
+  "tool_call_result_thinking_true": {
+    "output": "<bos><|turn>system\n<|think|>\n<|tool>declaration:get_weather{description:<|\"|>Get the current weather for a city<|\"|>,parameters:{properties:{city:{description:<|\"|>City name, e.g. Zürich<|\"|>,type:<|\"|>STRING<|\"|>},unit:{enum:[<|\"|>celsius<|\"|>,<|\"|>fahrenheit<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWeather in Zürich?<turn|>\n<|turn>model\n<|channel>thought\nI should call the weather tool.\n<channel|><|tool_call>call:get_weather{city:<|\"|>Zürich<|\"|>,unit:<|\"|>celsius<|\"|>}<tool_call|><|tool_response>response:get_weather{value:<|\"|>{\"temp\": 18, \"sky\": \"clear\"}<|\"|>}<tool_response|>Let me check.<turn|>\n<|channel>thought\n"
+  },
+  "tool_call_continued": {
+    "output": "<bos><|turn>system\n<|tool>declaration:get_weather{description:<|\"|>Get the current weather for a city<|\"|>,parameters:{properties:{city:{description:<|\"|>City name, e.g. Zürich<|\"|>,type:<|\"|>STRING<|\"|>},unit:{enum:[<|\"|>celsius<|\"|>,<|\"|>fahrenheit<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWeather in Zürich?<turn|>\n<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>Zürich<|\"|>,unit:<|\"|>celsius<|\"|>}<tool_call|><|tool_response>response:get_weather{value:<|\"|>{\"temp\": 18, \"sky\": \"clear\"}<|\"|>}<tool_response|>Let me check.It is 18 C and clear.<turn|>\n<|turn>user\nThanks!<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+  },
+  "parallel_tool_calls": {
+    "output": "<bos><|turn>system\nUse tools.<|tool>declaration:get_weather{description:<|\"|>Get the current weather for a city<|\"|>,parameters:{properties:{city:{description:<|\"|>City name, e.g. Zürich<|\"|>,type:<|\"|>STRING<|\"|>},unit:{enum:[<|\"|>celsius<|\"|>,<|\"|>fahrenheit<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><|tool>declaration:search{description:<|\"|>Search the web<|\"|>,parameters:{properties:{limit:{description:<|\"|>Max results<|\"|>,type:<|\"|>INTEGER<|\"|>},query:{description:<|\"|>Search query<|\"|>,type:<|\"|>STRING<|\"|>},tags:{description:<|\"|>Filters<|\"|>,items:{type:<|\"|>STRING<|\"|>},type:<|\"|>ARRAY<|\"|>}},required:[<|\"|>query<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWeather in Paris and news about it?<turn|>\n<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|><|tool_call>call:search{limit:3,opts:{x:[1,2.5,null,true]},query:<|\"|>Paris news<|\"|>,tags:[<|\"|>a<|\"|>,<|\"|>b<|\"|>]}<tool_call|><|tool_response>response:get_weather{value:<|\"|>sunny, 21C<|\"|>}<tool_response|><|tool_response>response:search{value:<|\"|>Nothing special today.<|\"|>}<tool_response|>"
+  },
+  "parallel_tool_calls_no_generation_prompt": {
+    "output": "<bos><|turn>system\n<|tool>declaration:get_weather{description:<|\"|>Get the current weather for a city<|\"|>,parameters:{properties:{city:{description:<|\"|>City name, e.g. Zürich<|\"|>,type:<|\"|>STRING<|\"|>},unit:{enum:[<|\"|>celsius<|\"|>,<|\"|>fahrenheit<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><|tool>declaration:search{description:<|\"|>Search the web<|\"|>,parameters:{properties:{limit:{description:<|\"|>Max results<|\"|>,type:<|\"|>INTEGER<|\"|>},query:{description:<|\"|>Search query<|\"|>,type:<|\"|>STRING<|\"|>},tags:{description:<|\"|>Filters<|\"|>,items:{type:<|\"|>STRING<|\"|>},type:<|\"|>ARRAY<|\"|>}},required:[<|\"|>query<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWeather in Paris and news about it?<turn|>\n<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|><|tool_call>call:search{limit:3,opts:{x:[1,2.5,null,true]},query:<|\"|>Paris news<|\"|>,tags:[<|\"|>a<|\"|>,<|\"|>b<|\"|>]}<tool_call|><|tool_response>response:get_weather{value:<|\"|>sunny, 21C<|\"|>}<tool_response|><|tool_response>response:search{value:<|\"|>Nothing special today.<|\"|>}<tool_response|>"
+  },
+  "tools_unsorted_keys": {
+    "output": "<bos><|turn>system\n<|tool>declaration:book_flight{description:<|\"|>Book a flight<|\"|>,parameters:{properties:{bags:{description:<|\"|>Checked bags<|\"|>,type:<|\"|>INTEGER<|\"|>},date:{description:<|\"|>ISO date<|\"|>,type:<|\"|>STRING<|\"|>},from:{description:<|\"|>Origin<|\"|>,type:<|\"|>STRING<|\"|>},to:{description:<|\"|>Destination<|\"|>,type:<|\"|>STRING<|\"|>}},required:[<|\"|>to<|\"|>,<|\"|>from<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nBook me to Oslo from Zürich<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+  },
+  "tool_call_unsorted_keys": {
+    "output": "<bos><|turn>system\n<|tool>declaration:book_flight{description:<|\"|>Book a flight<|\"|>,parameters:{properties:{bags:{description:<|\"|>Checked bags<|\"|>,type:<|\"|>INTEGER<|\"|>},date:{description:<|\"|>ISO date<|\"|>,type:<|\"|>STRING<|\"|>},from:{description:<|\"|>Origin<|\"|>,type:<|\"|>STRING<|\"|>},to:{description:<|\"|>Destination<|\"|>,type:<|\"|>STRING<|\"|>}},required:[<|\"|>to<|\"|>,<|\"|>from<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nBook me to Oslo from Zürich<turn|>\n<|turn>model\n<|tool_call>call:book_flight{bags:2,date:<|\"|>2026-11-02<|\"|>,from:<|\"|>Zürich<|\"|>,to:<|\"|>Oslo<|\"|>}<tool_call|><|tool_response>response:book_flight{value:<|\"|>{\"status\": \"booked\"}<|\"|>}<tool_response|>"
+  }
+}

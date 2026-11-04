@@ -1,0 +1,4 @@
+[toolchain]
+# Pinned so that the clippy lint set (-D warnings) only changes in a PR that bumps it.
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]

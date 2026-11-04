@@ -1,0 +1,182 @@
+//
+// Byte copies that stand in for a captured stage graph's device-to-device memcpy nodes (#836).
+// Loaded at run time by src/ptx.rs; src/ggml/stage_graph/run/copy_node.rs puts a kernel node of
+// one of these in place of each such memcpy node, with the memcpy's operands as parameters, so
+// that cudaGraphExecUpdate can move a 2-D copy's pointers (it refuses that for memcpy nodes).
+//
+// Each copies `rows` rows of `n` elements from src (row r at src + r * spitch) to dst (row r at
+// dst + r * dpitch): CTA y-index over rows, x-index and thread over elements, both strided by the
+// grid. The element is 16, 4 or 1 bytes (the _b16, _b4, _b1 entries); copy_kernel.rs picks the
+// widest that every address and pitch is aligned to. Bytes are moved, never converted.
+
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry legion_stage_copy_b16(
+	.param .u64 p_dst,
+	.param .u64 p_dpitch,
+	.param .u64 p_src,
+	.param .u64 p_spitch,
+	.param .u64 p_n,
+	.param .u64 p_rows
+)
+{
+	.reg .pred %p<3>;
+	.reg .b32 %r<12>;
+	.reg .b64 %rd<20>;
+
+	ld.param.u64 %rd1, [p_dst];
+	ld.param.u64 %rd2, [p_dpitch];
+	ld.param.u64 %rd3, [p_src];
+	ld.param.u64 %rd4, [p_spitch];
+	ld.param.u64 %rd5, [p_n];
+	ld.param.u64 %rd6, [p_rows];
+	cvta.to.global.u64 %rd1, %rd1;
+	cvta.to.global.u64 %rd3, %rd3;
+	mov.u32 %r1, %ctaid.y;
+	cvt.u64.u32 %rd7, %r1;
+	mov.u32 %r2, %nctaid.y;
+	cvt.u64.u32 %rd8, %r2;
+	mov.u32 %r3, %ctaid.x;
+	mov.u32 %r4, %ntid.x;
+	mov.u32 %r5, %tid.x;
+	mov.u32 %r6, %nctaid.x;
+	mul.wide.u32 %rd9, %r3, %r4;
+	cvt.u64.u32 %rd10, %r5;
+	add.u64 %rd9, %rd9, %rd10;
+	mul.wide.u32 %rd11, %r6, %r4;
+$ROW:
+	setp.ge.u64 %p1, %rd7, %rd6;
+	@%p1 bra $DONE;
+	mad.lo.u64 %rd12, %rd7, %rd2, %rd1;
+	mad.lo.u64 %rd13, %rd7, %rd4, %rd3;
+	mov.u64 %rd14, %rd9;
+$COL:
+	setp.ge.u64 %p2, %rd14, %rd5;
+	@%p2 bra $NEXT;
+	shl.b64 %rd15, %rd14, 4;
+	add.u64 %rd16, %rd13, %rd15;
+	ld.global.v4.u32 {%r7, %r8, %r9, %r10}, [%rd16];
+	add.u64 %rd17, %rd12, %rd15;
+	st.global.v4.u32 [%rd17], {%r7, %r8, %r9, %r10};
+	add.u64 %rd14, %rd14, %rd11;
+	bra $COL;
+$NEXT:
+	add.u64 %rd7, %rd7, %rd8;
+	bra $ROW;
+$DONE:
+	ret;
+}
+
+.visible .entry legion_stage_copy_b4(
+	.param .u64 p_dst,
+	.param .u64 p_dpitch,
+	.param .u64 p_src,
+	.param .u64 p_spitch,
+	.param .u64 p_n,
+	.param .u64 p_rows
+)
+{
+	.reg .pred %p<3>;
+	.reg .b32 %r<12>;
+	.reg .b64 %rd<20>;
+
+	ld.param.u64 %rd1, [p_dst];
+	ld.param.u64 %rd2, [p_dpitch];
+	ld.param.u64 %rd3, [p_src];
+	ld.param.u64 %rd4, [p_spitch];
+	ld.param.u64 %rd5, [p_n];
+	ld.param.u64 %rd6, [p_rows];
+	cvta.to.global.u64 %rd1, %rd1;
+	cvta.to.global.u64 %rd3, %rd3;
+	mov.u32 %r1, %ctaid.y;
+	cvt.u64.u32 %rd7, %r1;
+	mov.u32 %r2, %nctaid.y;
+	cvt.u64.u32 %rd8, %r2;
+	mov.u32 %r3, %ctaid.x;
+	mov.u32 %r4, %ntid.x;
+	mov.u32 %r5, %tid.x;
+	mov.u32 %r6, %nctaid.x;
+	mul.wide.u32 %rd9, %r3, %r4;
+	cvt.u64.u32 %rd10, %r5;
+	add.u64 %rd9, %rd9, %rd10;
+	mul.wide.u32 %rd11, %r6, %r4;
+$ROW:
+	setp.ge.u64 %p1, %rd7, %rd6;
+	@%p1 bra $DONE;
+	mad.lo.u64 %rd12, %rd7, %rd2, %rd1;
+	mad.lo.u64 %rd13, %rd7, %rd4, %rd3;
+	mov.u64 %rd14, %rd9;
+$COL:
+	setp.ge.u64 %p2, %rd14, %rd5;
+	@%p2 bra $NEXT;
+	shl.b64 %rd15, %rd14, 2;
+	add.u64 %rd16, %rd13, %rd15;
+	ld.global.u32 %r7, [%rd16];
+	add.u64 %rd17, %rd12, %rd15;
+	st.global.u32 [%rd17], %r7;
+	add.u64 %rd14, %rd14, %rd11;
+	bra $COL;
+$NEXT:
+	add.u64 %rd7, %rd7, %rd8;
+	bra $ROW;
+$DONE:
+	ret;
+}
+
+.visible .entry legion_stage_copy_b1(
+	.param .u64 p_dst,
+	.param .u64 p_dpitch,
+	.param .u64 p_src,
+	.param .u64 p_spitch,
+	.param .u64 p_n,
+	.param .u64 p_rows
+)
+{
+	.reg .pred %p<3>;
+	.reg .b16 %rs<2>;
+	.reg .b32 %r<12>;
+	.reg .b64 %rd<20>;
+
+	ld.param.u64 %rd1, [p_dst];
+	ld.param.u64 %rd2, [p_dpitch];
+	ld.param.u64 %rd3, [p_src];
+	ld.param.u64 %rd4, [p_spitch];
+	ld.param.u64 %rd5, [p_n];
+	ld.param.u64 %rd6, [p_rows];
+	cvta.to.global.u64 %rd1, %rd1;
+	cvta.to.global.u64 %rd3, %rd3;
+	mov.u32 %r1, %ctaid.y;
+	cvt.u64.u32 %rd7, %r1;
+	mov.u32 %r2, %nctaid.y;
+	cvt.u64.u32 %rd8, %r2;
+	mov.u32 %r3, %ctaid.x;
+	mov.u32 %r4, %ntid.x;
+	mov.u32 %r5, %tid.x;
+	mov.u32 %r6, %nctaid.x;
+	mul.wide.u32 %rd9, %r3, %r4;
+	cvt.u64.u32 %rd10, %r5;
+	add.u64 %rd9, %rd9, %rd10;
+	mul.wide.u32 %rd11, %r6, %r4;
+$ROW:
+	setp.ge.u64 %p1, %rd7, %rd6;
+	@%p1 bra $DONE;
+	mad.lo.u64 %rd12, %rd7, %rd2, %rd1;
+	mad.lo.u64 %rd13, %rd7, %rd4, %rd3;
+	mov.u64 %rd14, %rd9;
+$COL:
+	setp.ge.u64 %p2, %rd14, %rd5;
+	@%p2 bra $NEXT;
+	add.u64 %rd16, %rd13, %rd14;
+	ld.global.u8 %rs1, [%rd16];
+	add.u64 %rd17, %rd12, %rd14;
+	st.global.u8 [%rd17], %rs1;
+	add.u64 %rd14, %rd14, %rd11;
+	bra $COL;
+$NEXT:
+	add.u64 %rd7, %rd7, %rd8;
+	bra $ROW;
+$DONE:
+	ret;
+}

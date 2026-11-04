@@ -1,0 +1,4 @@
+/target
+*.gguf
+!tests/data/*.gguf
+__pycache__/

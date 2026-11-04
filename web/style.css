@@ -1,0 +1,1017 @@
+/* Legion web UI. The look follows docs/legion.png: a phosphor-green terminal on a dark
+   console, with amber indicator LEDs. Light mode is the same palette on bone paper.
+   Theming: light-dark() picks the first color in light mode, the second in dark mode.
+   Add new colors as variables here; never hard-code colors elsewhere.
+   CSS has only block comments: a line comment would silently swallow the next rule. */
+@layer base, components;
+
+@layer base {
+  :root {
+    color-scheme: light dark;
+    --bg: light-dark(#f6f5ef, #08100b);
+    --surface: light-dark(#edebe2, #0d1610);
+    --surface-2: light-dark(#ffffff, #131d16);
+    --border: light-dark(#dad7ca, #213026);
+    --border-strong: light-dark(#c2bead, #34443a);
+    --text: light-dark(#1a211c, #dce8dd);
+    --muted: light-dark(#5b665d, #8b9b8d);
+    --accent: light-dark(#1d7a42, #6ff086);
+    --accent-hover: light-dark(#165f33, #96ffa6);
+    --accent-text: light-dark(#ffffff, #04210f);
+    --amber: light-dark(#b5650a, #ffb23f);
+    --glow: light-dark(transparent, rgb(124 255 138 / 0.35));
+    --amber-glow: light-dark(transparent, rgb(255 178 63 / 0.55));
+    --ring: color-mix(in srgb, var(--accent) 35%, transparent);
+    --user-bg: light-dark(#e2ecdf, #13211a);
+    --user-border: light-dark(#cadbc6, #1f3527);
+    --code-bg: light-dark(#121a15, #060907);
+    --code-head: light-dark(#1a241d, #0d130f);
+    --code-text: light-dark(#d4ecd8, #cfe8d3);
+    --code-muted: light-dark(#93ab98, #7d927f);
+    --code-border: light-dark(#121a15, #1d2820);
+    --error-bg: light-dark(#fbeaea, #2a1414);
+    --error-border: light-dark(#efc3be, #4a2420);
+    --error-text: light-dark(#a8261b, #ffb4ab);
+    --shadow-color: light-dark(rgb(40 52 40 / 0.1), rgb(0 0 0 / 0.55));
+    --scrim: rgb(0 0 0 / 0.5);
+    --radius: 12px;
+    --col: 780px;
+    --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    scrollbar-color: var(--border-strong) transparent;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; }
+
+  [hidden] { display: none !important; }
+
+  html, body { height: 100%; margin: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.55 var(--font);
+    text-wrap: pretty;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  ::selection { background: color-mix(in srgb, var(--accent) 30%, transparent); }
+
+  button, input, select, textarea { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+  button:disabled { cursor: default; opacity: 0.5; }
+
+  :where(button, a, input, select, textarea, summary, [tabindex]):focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  @keyframes pulse { 50% { opacity: 0.35; } }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+  }
+}
+
+@layer components {
+  /* ---------- Shell ----------
+     Wide: sidebar beside the chat. Narrow (container query): the sidebar is an overlay opened
+     by the header button, a label for the hidden #sidebar-toggle checkbox (:has(), no JS);
+     #sidebar-scrim (another label for it) closes it. */
+  body { container-type: inline-size; }
+
+  #shell {
+    display: grid;
+    grid-template-columns: 272px 1fr;
+    height: 100dvh;
+  }
+
+  .led {
+    flex: none;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--border-strong);
+  }
+
+  /* ---------- Sidebar ---------- */
+  #sidebar {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-height: 0;
+    padding: 14px 12px;
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+
+    & #new-chat {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 12px;
+      font-weight: 600;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      box-shadow: 0 1px 2px var(--shadow-color);
+
+      & span { font: 600 1.1rem/1 var(--mono); color: var(--accent); }
+      &:hover:not(:disabled) { border-color: var(--accent); }
+    }
+
+    & #search {
+      padding: 7px 12px;
+      font-size: 0.9rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+
+    & .label {
+      margin: 6px 4px -4px;
+      font: 600 0.7rem var(--mono);
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    & ul {
+      flex: 1;
+      overflow-y: auto;
+      margin: 4px -4px 0;
+      padding: 0 4px;
+      list-style: none;
+    }
+
+    & ul:empty::before {
+      content: "No chats yet";
+      display: block;
+      padding: 8px 10px;
+      font-size: 0.85rem;
+      color: var(--muted);
+    }
+
+    & li {
+      position: relative;
+      display: flex;
+      align-items: center;
+      gap: 2px;
+      margin-bottom: 2px;
+      font-size: 0.92rem;
+      border-radius: 8px;
+
+      &:hover, &:focus-within { background: var(--surface-2); }
+
+      &.current {
+        background: var(--surface-2);
+        box-shadow: 0 1px 2px var(--shadow-color);
+
+        &::before {
+          content: "";
+          position: absolute;
+          inset: 8px auto 8px 0;
+          width: 3px;
+          border-radius: 3px;
+          background: var(--accent);
+          box-shadow: 0 0 6px var(--glow);
+        }
+      }
+
+      & a {
+        flex: 1;
+        min-width: 0;
+        padding: 7px 10px;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+        color: inherit;
+        text-decoration: none;
+        border-radius: 8px;
+      }
+
+      & input {
+        flex: 1;
+        min-width: 0;
+        margin: 2px;
+        padding: 4px 8px;
+        background: var(--bg);
+        border: 1px solid var(--accent);
+        border-radius: 6px;
+      }
+
+      & button {
+        display: none;
+        padding: 2px 7px;
+        color: var(--muted);
+        background: none;
+        border: 0;
+        border-radius: 6px;
+        &:hover { color: var(--text); background: var(--surface); }
+      }
+
+      &:hover button, &:focus-within button { display: block; }
+      &.editing button { display: none; }
+    }
+  }
+
+  #sidebar-scrim { display: none; }
+
+  /* ---------- Header ---------- */
+  #app {
+    display: flex;
+    flex-direction: column;
+    height: 100dvh;
+    min-width: 0;
+  }
+
+  #header {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    min-height: 56px;
+    padding: 8px 20px;
+    border-bottom: 1px solid var(--border);
+
+    & svg:not(.mark) {
+      width: 18px;
+      height: 18px;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 1.8;
+      stroke-linecap: round;
+    }
+  }
+
+  #sidebar-button {
+    display: none;
+    padding: 6px;
+    margin-left: -6px;
+    border-radius: 8px;
+    cursor: pointer;
+    color: var(--muted);
+    &:hover { color: var(--text); background: var(--surface); }
+  }
+
+  #brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    color: var(--accent);
+    --mark-lit: var(--amber);
+
+    & .mark { width: 26px; height: 26px; filter: drop-shadow(0 0 4px var(--glow)); }
+    & span {
+      font: 700 1rem/1 var(--mono);
+      letter-spacing: 0.24em;
+      text-transform: uppercase;
+    }
+  }
+
+  /* Model chip: the LED is green once /v1/models answered, red on an error, amber while
+     connecting (main.js sets data-state). */
+  #model-chip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    padding: 3px 11px;
+    font: 0.8rem/1.6 var(--mono);
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+
+    & #model-name { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+    & .led { background: var(--amber); animation: pulse 1.2s infinite; }
+    &[data-state="ok"] .led { background: var(--accent); box-shadow: 0 0 6px var(--glow); animation: none; }
+    &[data-state="error"] .led { background: var(--error-text); animation: none; }
+  }
+
+  #settings-button {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: auto;
+    padding: 6px 12px;
+    font-size: 0.9rem;
+    color: var(--muted);
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    &:hover { color: var(--text); border-color: var(--border-strong); }
+  }
+
+  /* ---------- Empty state: shown while #messages has no children (:has(), no JS) ---------- */
+  #empty {
+    display: none;
+    flex: 1;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    padding: 24px 16px;
+    overflow-y: auto;
+    text-align: center;
+
+    & .mark {
+      width: 72px;
+      height: 72px;
+      margin-bottom: 14px;
+      color: var(--accent);
+      --mark-lit: var(--amber);
+      filter: drop-shadow(0 0 14px var(--glow));
+    }
+
+    /* Blocky monospace caps, like the CRT title in the logo (solid color; glow only when the
+       Glow setting is on, below). */
+    & h2 {
+      margin: 0;
+      padding-left: 0.3em;
+      font: 800 clamp(2.2rem, 7vw, 3.2rem)/1.05 var(--mono);
+      letter-spacing: 0.3em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
+
+    & .tagline { margin: 6px 0 0; font: 1.05rem var(--mono); color: var(--text); }
+    & .serving {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 10px 0 0;
+      font: 0.85rem var(--mono);
+      color: var(--muted);
+      & .led { background: var(--accent); box-shadow: 0 0 6px var(--glow); }
+    }
+    & #empty-model { color: var(--accent); }
+  }
+
+  #app:has(#messages:empty) {
+    & #empty { display: flex; }
+    & #messages { display: none; }
+  }
+
+  #examples {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 10px;
+    width: min(640px, 100%);
+    margin-top: 28px;
+
+    & button {
+      padding: 12px 14px;
+      font-size: 0.9rem;
+      line-height: 1.4;
+      text-align: left;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: 0 1px 2px var(--shadow-color);
+      transition: border-color 0.15s, translate 0.15s;
+
+      &::before { content: "> "; font-family: var(--mono); color: var(--accent); }
+      &:hover { border-color: var(--accent); translate: 0 -1px; }
+    }
+  }
+
+  /* ---------- Messages ---------- */
+  #messages {
+    flex: 1;
+    overflow-y: auto;
+    scrollbar-gutter: stable both-edges;
+    display: flex;
+    flex-direction: column;
+    gap: 22px;
+    padding: 24px max(16px, (100% - var(--col)) / 2) 32px;
+  }
+
+  .message { min-width: 0; }
+
+  .message.user {
+    align-self: flex-end;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 4px;
+    max-width: min(85%, 640px);
+
+    & > .text {
+      padding: 10px 15px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      background: var(--user-bg);
+      border: 1px solid var(--user-border);
+      border-radius: 18px 18px 4px 18px;
+    }
+
+    &.editing { align-self: stretch; align-items: stretch; max-width: none; }
+  }
+
+  .message.error {
+    align-self: stretch;
+
+    & > .text {
+      padding: 10px 14px;
+      font-size: 0.92rem;
+      color: var(--error-text);
+      background: var(--error-bg);
+      border: 1px solid var(--error-border);
+      border-radius: 10px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+
+      &::before { content: "error  "; font: 700 0.8rem var(--mono); text-transform: uppercase; }
+    }
+  }
+
+  .message.assistant { align-self: stretch; overflow-wrap: break-word; }
+
+  /* Collapsible model reasoning above the answer (open while it streams, see chat.js). The
+     LED pulses while the reply is still streaming. */
+  .message .thinking {
+    margin: 0 0 14px;
+    font-size: 0.9rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+
+    & summary {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      width: fit-content;
+      padding: 6px 12px;
+      font: 0.8rem var(--mono);
+      color: var(--muted);
+      list-style: none;
+      cursor: pointer;
+      user-select: none;
+
+      &::-webkit-details-marker { display: none; }
+      &::before {
+        content: "";
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--amber);
+        box-shadow: 0 0 6px var(--amber-glow);
+      }
+      &::after { content: "▸"; transition: rotate 0.15s; }
+      &:hover { color: var(--text); }
+    }
+
+    &[open] summary::after { rotate: 90deg; }
+
+    & .thinking-text {
+      max-height: 360px;
+      overflow-y: auto;
+      margin: 0 12px 10px;
+      padding-left: 12px;
+      color: var(--muted);
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      border-left: 2px solid var(--border-strong);
+    }
+  }
+
+  #messages.busy .message.assistant:last-child .thinking summary::before { animation: pulse 0.9s infinite; }
+
+  /* Generation stats under the answer: tokens, time to first token, tokens/s. */
+  .message .stats {
+    margin-top: 12px;
+    font: 0.74rem/1.5 var(--mono);
+    color: var(--muted);
+  }
+
+  /* Per-message actions (chat.js): revealed on hover or keyboard focus, hidden while a
+     reply streams. Touch devices have no hover, so they stay visible there. */
+  .message .actions {
+    display: flex;
+    gap: 2px;
+    margin-top: 4px;
+    margin-left: -8px;
+    opacity: 0;
+    transition: opacity 0.15s;
+
+    & button {
+      padding: 3px 8px;
+      font-size: 0.78rem;
+      color: var(--muted);
+      background: none;
+      border: 0;
+      border-radius: 6px;
+      &:hover { color: var(--text); background: var(--surface); }
+    }
+  }
+
+  .message.user .actions { margin: 0 -8px 0 0; }
+  .message:hover .actions, .message:focus-within .actions { opacity: 1; }
+  #messages.busy .actions { visibility: hidden; }
+  .message.editing .actions { visibility: hidden; }
+
+  @media (hover: none) {
+    .message .actions { opacity: 1; }
+  }
+
+  /* Inline editor for a user message (Edit -> Save & resend / Cancel). */
+  .message .edit {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+
+    & textarea {
+      padding: 10px 14px;
+      background: var(--surface-2);
+      border: 1px solid var(--accent);
+      border-radius: var(--radius);
+      resize: vertical;
+      field-sizing: content;
+      min-height: 3rem;
+      max-height: 300px;
+
+      &:focus { outline: none; box-shadow: 0 0 0 3px var(--ring); }
+    }
+
+    & .edit-row {
+      display: flex;
+      justify-content: flex-end;
+      gap: 6px;
+
+      & button {
+        padding: 5px 14px;
+        font-size: 0.85rem;
+        font-weight: 600;
+        color: var(--accent-text);
+        background: var(--accent);
+        border: 1px solid var(--accent);
+        border-radius: 8px;
+      }
+
+      /* Cancel is the last button in the row: a quiet secondary style. */
+      & button:last-child {
+        order: -1;
+        color: var(--muted);
+        background: none;
+        border-color: var(--border);
+        &:hover { color: var(--text); }
+      }
+    }
+  }
+
+  /* Thumbnails inside a stored user bubble (chat.js renders imagesRow). */
+  .message .bubble-images {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 6px;
+
+    & img { max-width: 160px; max-height: 160px; border: 1px solid var(--border); border-radius: 10px; }
+  }
+
+  /* ---------- Markdown inside assistant messages ----------
+     The answer lives in .content; the thinking block and the stats line are its siblings. */
+  .message.assistant {
+    & .content > :first-child { margin-top: 0; }
+    & .content > :last-child { margin-bottom: 0; }
+    & p, & ul, & ol, & blockquote, & table { margin: 0.75em 0; }
+    & ul, & ol { padding-left: 1.5em; }
+    & li + li { margin-top: 0.2em; }
+    & li::marker { color: var(--muted); }
+    & h1, & h2, & h3, & h4 { margin: 1.1em 0 0.45em; line-height: 1.25; }
+    & h1 { font-size: 1.45rem; }
+    & h2 { font-size: 1.25rem; }
+    & h3, & h4 { font-size: 1.05rem; }
+    & a { color: var(--accent); text-underline-offset: 2px; }
+    & a:hover { color: var(--accent-hover); }
+    & blockquote { padding: 2px 0 2px 14px; border-left: 3px solid var(--accent); color: var(--muted); }
+    & hr { border: 0; border-top: 1px solid var(--border); margin: 1.4em 0; }
+
+    & table {
+      display: block;
+      width: max-content;
+      max-width: 100%;
+      overflow-x: auto;
+      border-collapse: collapse;
+      font-size: 0.92rem;
+
+      & th, & td { padding: 7px 14px; border-bottom: 1px solid var(--border); }
+      & th {
+        font: 600 0.74rem var(--mono);
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        text-align: left;
+        color: var(--muted);
+        border-bottom: 1px solid var(--border-strong);
+      }
+      & tbody tr:hover { background: var(--surface); }
+      & td { font-variant-numeric: tabular-nums; }
+    }
+
+    & :not(pre) > code {
+      padding: 1px 5px;
+      font: 0.86em var(--mono);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+    }
+  }
+
+  .code-block {
+    margin: 0.9em 0;
+    overflow: hidden;
+    color: var(--code-text);
+    background: var(--code-bg);
+    border: 1px solid var(--code-border);
+    border-radius: 10px;
+
+    & .code-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 4px 6px 4px 14px;
+      font: 0.72rem var(--mono);
+      letter-spacing: 0.08em;
+      text-transform: lowercase;
+      color: var(--code-muted);
+      background: var(--code-head);
+      border-bottom: 1px solid var(--code-border);
+    }
+
+    & .copy-code {
+      padding: 2px 9px;
+      font: inherit;
+      color: inherit;
+      background: none;
+      border: 0;
+      border-radius: 5px;
+      &:hover { color: var(--code-text); background: var(--code-bg); }
+    }
+
+    & pre { margin: 0; }
+    & pre > code {
+      display: block;
+      padding: 12px 14px;
+      overflow-x: auto;
+      font: 0.85rem/1.55 var(--mono);
+      tab-size: 4;
+    }
+  }
+
+  /* ---------- Composer ----------
+     One rounded box: the textarea on top, a toolbar row below (attach, thinking, stop/send). */
+  #composer {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    width: min(var(--col), 100% - 32px);
+    margin: 4px auto 0;
+    padding: 8px;
+    background: var(--surface-2);
+    border: 1px solid var(--border-strong);
+    border-radius: 18px;
+    box-shadow: 0 2px 10px var(--shadow-color);
+    transition: border-color 0.15s, box-shadow 0.15s;
+
+    &:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--ring), 0 2px 10px var(--shadow-color); }
+
+    & textarea {
+      flex: 1 0 100%;
+      min-height: 2.6rem;
+      max-height: 40dvh;
+      padding: 6px 8px;
+      resize: none;
+      field-sizing: content;
+      background: none;
+      border: 0;
+      outline: none;
+    }
+
+    & svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+
+    /* Attach button (attach.js): a quiet icon button, shown only for vision models. */
+    & #attach {
+      display: grid;
+      place-items: center;
+      width: 34px;
+      height: 34px;
+      padding: 0;
+      color: var(--muted);
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: 50%;
+      &:hover { color: var(--text); border-color: var(--border-strong); }
+    }
+
+    /* Thinking toggle: a pill whose LED lights amber when checked (:has(), no JS class). */
+    & #thinking-toggle {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-right: auto;
+      padding: 6px 13px;
+      font: 0.8rem var(--mono);
+      color: var(--muted);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      cursor: pointer;
+      user-select: none;
+      white-space: nowrap;
+
+      position: relative;
+      & input { position: absolute; inset: 0; appearance: none; margin: 0; opacity: 0; cursor: pointer; }
+      &:hover { color: var(--text); }
+      &:has(:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+      &:has(:checked) {
+        color: var(--text);
+        border-color: var(--amber);
+        & .led { background: var(--amber); box-shadow: 0 0 6px var(--amber-glow); }
+      }
+    }
+
+    & #send, & #stop {
+      padding: 8px 18px;
+      font-weight: 600;
+      border-radius: 12px;
+    }
+
+    & #send {
+      color: var(--accent-text);
+      background: var(--accent);
+      border: 1px solid var(--accent);
+      &:hover:not(:disabled) { background: var(--accent-hover); }
+    }
+
+    & #stop {
+      color: var(--amber);
+      background: none;
+      border: 1px solid var(--amber);
+      &::before { content: "■ "; font-size: 0.75em; }
+    }
+
+    /* While a reply streams, Stop takes Send's place. */
+    &:has(#stop:not([hidden])) #send { display: none; }
+  }
+
+  /* The composer is a drop target (attach.js): a dashed outline while dragging over it. */
+  #composer.dragover { outline: 2px dashed var(--accent); outline-offset: 4px; }
+
+  #composer-hint {
+    margin: 6px 0 12px;
+    font: 0.72rem var(--mono);
+    text-align: center;
+    color: var(--muted);
+  }
+
+  /* Pending-image strip above the textarea: thumbnails with a remove button, plus inline error. */
+  #attach-bar {
+    order: -1;
+    flex-basis: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 4px 4px 2px;
+
+    & #pending-images { display: flex; flex-wrap: wrap; gap: 10px; }
+
+    & .thumb {
+      position: relative;
+
+      & img {
+        display: block; width: 60px; height: 60px; object-fit: cover;
+        border: 1px solid var(--border); border-radius: 10px;
+      }
+
+      & button {
+        position: absolute; top: -6px; right: -6px; width: 20px; height: 20px;
+        padding: 0; line-height: 1;
+        color: var(--bg); background: var(--text); border: 0; border-radius: 50%;
+      }
+    }
+
+    & #attach-error { color: var(--error-text); font-size: 0.85rem; }
+  }
+
+  /* ---------- Settings dialog (settings.js) ----------
+     Opened from the header, closed by Done, the close button, Escape or a backdrop click.
+     Fields persist on every input; .field-error shows validation inline. */
+  #settings-dialog {
+    width: min(600px, 100vw - 24px);
+    max-height: calc(100dvh - 24px);
+    padding: 0;
+    color: var(--text);
+    background: var(--bg);
+    border: 1px solid var(--border-strong);
+    border-radius: 16px;
+    box-shadow: 0 20px 60px var(--shadow-color);
+
+    &::backdrop { background: var(--scrim); backdrop-filter: blur(2px); }
+
+    & form { padding: 18px 20px 20px; }
+
+    & .dialog-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 14px;
+
+      & h2 { margin: 0; font: 700 1rem var(--mono); letter-spacing: 0.16em; text-transform: uppercase; color: var(--accent); }
+      & .close {
+        width: 32px;
+        height: 32px;
+        padding: 0;
+        font-size: 1.3rem;
+        line-height: 1;
+        color: var(--muted);
+        background: none;
+        border: 0;
+        border-radius: 50%;
+        &:hover { color: var(--text); background: var(--surface); }
+      }
+    }
+
+    & fieldset {
+      margin: 0 0 14px;
+      padding: 10px 14px 0;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+    }
+
+    & legend {
+      padding: 0 6px;
+      font: 600 0.72rem var(--mono);
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    & .field {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      margin-bottom: 12px;
+
+      & > span { font-size: 0.82rem; font-weight: 600; color: var(--muted); }
+
+      & input, & textarea, & select {
+        padding: 7px 10px;
+        background: var(--surface-2);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+
+        &:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--ring); }
+      }
+
+      & textarea {
+        resize: vertical;
+        field-sizing: content;
+        min-height: 2.5rem;
+        max-height: 140px;
+      }
+
+      & #s-custom { font: 0.85rem var(--mono); }
+
+      /* Invalid number or custom-JSON field: red border while its error is shown (:has(), no JS). */
+      &:has(.field-error:not([hidden])) :is(input, textarea) { border-color: var(--error-text); }
+    }
+
+    & .field-error { color: var(--error-text); font-size: 0.8rem; }
+
+    & .field-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      gap: 0 12px;
+    }
+
+    & #settings-actions {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      margin-top: 4px;
+
+      & button {
+        padding: 8px 16px;
+        font-weight: 600;
+        border-radius: 10px;
+      }
+
+      & #settings-reset {
+        color: var(--muted);
+        background: none;
+        border: 1px solid var(--border);
+        &:hover { color: var(--text); border-color: var(--border-strong); }
+      }
+
+      & button[type="submit"] {
+        color: var(--accent-text);
+        background: var(--accent);
+        border: 1px solid var(--accent);
+        &:hover { background: var(--accent-hover); }
+      }
+    }
+  }
+
+  /* ---------- Narrow screens ---------- */
+  @container (max-width: 760px) {
+    #shell { grid-template-columns: 1fr; }
+
+    #sidebar {
+      position: fixed;
+      inset: 0 auto 0 0;
+      z-index: 3;
+      width: min(300px, 85vw);
+      translate: -100%;
+      transition: translate 0.18s;
+      box-shadow: 0 0 30px var(--shadow-color);
+    }
+
+    #shell:has(#sidebar-toggle:checked) {
+      & #sidebar { translate: 0; }
+      & #sidebar-scrim { display: block; position: fixed; inset: 0; z-index: 2; background: var(--scrim); }
+    }
+
+    #sidebar-button { display: grid; place-items: center; }
+    #header { gap: 10px; padding: 8px 12px; }
+    #settings-button { padding: 6px 8px; & span { display: none; } }
+    #brand span { letter-spacing: 0.18em; }
+    #messages { padding-top: 18px; gap: 18px; }
+    .message.user { max-width: 90%; }
+    #composer { width: calc(100% - 20px); margin-bottom: 10px; }
+    #composer-hint { display: none; }
+  }
+
+  @container (max-width: 420px) {
+    #brand span { display: none; }
+  }
+
+  /* ---------- Optional phosphor glow: Settings > Glow (settings.js sets <html data-glow>).
+     Off by default. It only shows in the dark theme: the glow colors are transparent in light
+     mode. Text gets a faint halo; the brand, title, LEDs and focused composer a stronger one. */
+  :root[data-glow="on"] {
+    --glow-text: light-dark(transparent, rgb(124 255 138 / 0.4));
+    --glow-strong: light-dark(transparent, rgb(124 255 138 / 0.75));
+    --glow-wide: light-dark(transparent, rgb(124 255 138 / 0.3));
+    /* Dark theme goes monochrome phosphor: body text and muted text turn green too. */
+    --text: light-dark(#1a211c, #a9f7b4);
+    --muted: light-dark(#5b665d, #5fae6c);
+    --border: light-dark(#dad7ca, #1f4a2b);
+    --border-strong: light-dark(#c2bead, #2f6b3d);
+
+    & body { text-shadow: 0 0 3px var(--glow-text), 0 0 8px var(--glow-wide); }
+    & #brand span,
+    & #empty-model,
+    & .message.assistant a { text-shadow: 0 0 4px var(--glow-strong), 0 0 14px var(--glow-strong), 0 0 30px var(--glow-wide); }
+    & #empty h2 { text-shadow: 0 0 6px var(--glow-strong), 0 0 20px var(--glow-strong), 0 0 44px var(--glow-wide); }
+    & #brand .mark { filter: drop-shadow(0 0 6px var(--glow-strong)) drop-shadow(0 0 16px var(--glow-wide)); }
+    & #empty .mark { filter: drop-shadow(0 0 16px var(--glow-strong)) drop-shadow(0 0 48px var(--glow-wide)); }
+    & #model-chip[data-state="ok"] .led,
+    & #empty .serving .led { box-shadow: 0 0 6px var(--glow-strong), 0 0 18px var(--glow-wide); }
+    & .message .thinking summary::before { box-shadow: 0 0 14px var(--amber-glow); }
+    & #thinking-toggle:has(:checked) .led { box-shadow: 0 0 14px var(--amber-glow); }
+    & #composer { box-shadow: 0 0 26px -6px var(--glow-wide); }
+    & #composer:focus-within { box-shadow: 0 0 0 3px var(--ring), 0 0 40px -4px var(--glow-strong); }
+    & .code-block { box-shadow: 0 0 30px -6px var(--glow-wide); }
+    & #send { box-shadow: 0 0 22px 0 var(--glow-strong); }
+    & #examples button,
+    & .message.user { box-shadow: 0 0 18px -6px var(--glow-wide); }
+  }
+
+  /* Settings > Scanlines: a fixed CRT overlay above the page: dense dark lines, a heavy edge
+     vignette, a slow bright band rolling down the screen and a faint flicker. It takes no
+     clicks; the settings dialog sits in the top layer, above it. Reduced motion stops the
+     roll and flicker (base layer). */
+  :root[data-scanlines="on"] body::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: 10;
+    pointer-events: none;
+    background:
+      repeating-linear-gradient(to bottom, light-dark(rgb(0 0 0 / 0.09), rgb(0 0 0 / 0.4)) 0 1px, transparent 1px 3px),
+      radial-gradient(ellipse 80% 75% at center, transparent 55%, light-dark(rgb(0 0 0 / 0.12), rgb(0 0 0 / 0.6)));
+    animation: crt-flicker 0.12s steps(2) infinite;
+  }
+
+  :root[data-scanlines="on"] body::before {
+    content: "";
+    position: fixed;
+    inset: -30vh 0 auto;
+    height: 30vh;
+    z-index: 10;
+    pointer-events: none;
+    background: linear-gradient(to bottom, transparent, light-dark(rgb(0 0 0 / 0.03), rgb(124 255 138 / 0.05)), transparent);
+    animation: crt-roll 7s linear infinite;
+  }
+
+  @keyframes crt-roll { to { translate: 0 160vh; } }
+  @keyframes crt-flicker { 50% { opacity: 0.93; } }
+
+  /* Settings > Font: terminal lettering everywhere. No font ships with the UI; the stack picks a
+     terminal face if one is installed (Monofonto is the closest to the old green-screen look),
+     else the system monospace. */
+  :root[data-font="terminal"] {
+    --font: "Monofonto", "VT323", "Share Tech Mono", "Fixedsys Excelsior 3.01", "Glass TTY VT220", var(--mono);
+    --mono: "Monofonto", "VT323", "Share Tech Mono", ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    & body { letter-spacing: 0.02em; }
+    & .message :is(h1, h2, h3) { text-transform: uppercase; letter-spacing: 0.06em; }
+  }
+}

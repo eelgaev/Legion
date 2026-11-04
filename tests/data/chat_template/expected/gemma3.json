@@ -1,0 +1,41 @@
+{
+  "plain": {
+    "output": "<bos><start_of_turn>user\nHello there!<end_of_turn>\n<start_of_turn>model\n"
+  },
+  "plain_no_generation_prompt": {
+    "output": "<bos><start_of_turn>user\nHello there!<end_of_turn>\n"
+  },
+  "system": {
+    "output": "<bos><start_of_turn>user\nYou are a helpful assistant.\n\nHi<end_of_turn>\n<start_of_turn>model\n"
+  },
+  "system_unicode_whitespace": {
+    "output": "<bos><start_of_turn>user\nRéponds en français, s'il te plaît 日本語\n\n\npadded<end_of_turn>\n<start_of_turn>model\n"
+  },
+  "multi_turn_reasoning": {
+    "output": "<bos><start_of_turn>user\nWhat is 2+2?<end_of_turn>\n<start_of_turn>model\n4.<end_of_turn>\n<start_of_turn>user\nAnd times 3?<end_of_turn>\n<start_of_turn>model\n12.<end_of_turn>\n<start_of_turn>user\nThanks, and plus 1?<end_of_turn>\n<start_of_turn>model\n"
+  },
+  "multi_turn_reasoning_system": {
+    "output": "<bos><start_of_turn>user\nBe brief.\n\nWhat is 2+2?<end_of_turn>\n<start_of_turn>model\n4.<end_of_turn>\n<start_of_turn>user\nAnd times 3?<end_of_turn>\n<start_of_turn>model\n12.<end_of_turn>\n<start_of_turn>user\nThanks, and plus 1?<end_of_turn>\n<start_of_turn>model\n"
+  },
+  "multi_turn_final_assistant": {
+    "output": "<bos><start_of_turn>user\nWhat is 2+2?<end_of_turn>\n<start_of_turn>model\n4.<end_of_turn>\n<start_of_turn>user\nAnd times 3?<end_of_turn>\n<start_of_turn>model\n12.<end_of_turn>\n"
+  },
+  "enable_thinking_false": {
+    "output": "<bos><start_of_turn>user\nHi<end_of_turn>\n<start_of_turn>model\n"
+  },
+  "enable_thinking_true": {
+    "output": "<bos><start_of_turn>user\nHi<end_of_turn>\n<start_of_turn>model\n"
+  },
+  "enable_thinking_true_system": {
+    "output": "<bos><start_of_turn>user\nSys.\n\nHi<end_of_turn>\n<start_of_turn>model\n"
+  },
+  "tools": {
+    "output": "<bos><start_of_turn>user\nWeather in Zürich?<end_of_turn>\n<start_of_turn>model\n"
+  },
+  "tools_system": {
+    "output": "<bos><start_of_turn>user\nUse tools.\n\nWeather in Zürich?<end_of_turn>\n<start_of_turn>model\n"
+  },
+  "error_roles_not_alternating": {
+    "error": "Conversation roles must alternate user/assistant/user/assistant/..."
+  }
+}

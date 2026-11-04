@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- Legion mark (same drawing as #legion-mark in index.html): phosphor green on a dark tile. -->
+  <rect width="32" height="32" rx="6" fill="#08100b"/>
+  <g transform="translate(4 4)">
+    <path d="M1 7V1h6M17 1h6v6M23 17v6h-6M7 23H1v-6" fill="none" stroke="#6ff086" stroke-width="2"/>
+    <g fill="#6ff086">
+      <rect x="4.5" y="4.5" width="3" height="3"/><rect x="8.5" y="4.5" width="3" height="3"/>
+      <rect x="12.5" y="4.5" width="3" height="3"/><rect x="16.5" y="4.5" width="3" height="3"/>
+      <rect x="4.5" y="8.5" width="3" height="3"/><rect x="8.5" y="8.5" width="3" height="3" fill="#ffb23f"/>
+      <rect x="12.5" y="8.5" width="3" height="3"/><rect x="16.5" y="8.5" width="3" height="3"/>
+      <rect x="4.5" y="12.5" width="3" height="3"/><rect x="8.5" y="12.5" width="3" height="3"/>
+      <rect x="12.5" y="12.5" width="3" height="3"/><rect x="16.5" y="12.5" width="3" height="3" fill="#ffb23f"/>
+      <rect x="4.5" y="16.5" width="3" height="3"/><rect x="8.5" y="16.5" width="3" height="3"/>
+      <rect x="12.5" y="16.5" width="3" height="3"/><rect x="16.5" y="16.5" width="3" height="3"/>
+    </g>
+  </g>
+</svg>

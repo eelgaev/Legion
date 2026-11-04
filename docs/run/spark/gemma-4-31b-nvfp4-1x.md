@@ -1,0 +1,48 @@
+# Gemma 4 31B NVFP4 (RedHatAI): 1x DGX Spark
+
+[Back to the performance tables](../../../README.md#performance). How these runs were measured: [docs/run/README.md](../README.md).
+
+`--model` is the downloaded snapshot of `RedHatAI/gemma-4-31B-it-NVFP4`, `--spec-draft` the downloaded snapshot of
+`RedHatAI/gemma-4-31B-it-speculator.dflash2` (both read as shipped):
+
+```sh
+legion serve \
+  --model RedHatAI/gemma-4-31B-it-NVFP4 \
+  --port 8090 \
+  --device cuda \
+  --max-seqs 16 \
+  --ctx-size 262144 \
+  --prefix-cache-states 0 \
+  --spec dflash \
+  --spec-draft RedHatAI/gemma-4-31B-it-speculator.dflash2 \
+  --spec-gate-cost-model off \
+  --nvfp4-a4 prefill \
+  --spec-draft-weights q8_0 \
+  --spec-draft-lm-head q4
+```
+
+Deterministic client: 8 fixed prompts (prose, code, lists, chats, a story; thinking off and on), temperature 0,
+256 tokens each, 2 rounds at 1, 4 and 16 users (2026-11-03). At 1 user the speed depends on how many drafts
+the prompt accepts: 21.1 tok/s (story) to 39.7 (code in a chat), 27.8 in all (median), mean accepted length
+3.29, the same tokens in both rounds and the same tokens as without the three opt-ins. 80.8 tok/s at 4 users,
+219.8 at 16 users. Prefill 8K 1,710 and 32K 1,438 tok/s, one request each, from the same server. Prefill
+123K (122,880 tokens, one request, a later session of the same command): 849 tok/s (8K 1,719 and 32K 1,455
+in that session); 587 without the three opt-ins.
+
+The same session without the last three flags (all of them opt-in): 18-33 tok/s at 1 user (24.4 median,
+accepted length 3.36), 70.2 at 4 users, 154.3 at 16, prefill 8K 897 and 32K 710. `--nvfp4-a4 prefill` alone
+gives most of the prefill and 16-user gain (16 users ~187); the 8-bit drafter and its 4-bit head make each
+draft pass cheaper (16 users ~212 with both). `--spec-draft-vocab 131072` on top cuts the accepted length
+to ~2.3 and is slower at every concurrency.
+
+## What each flag does
+
+- `--max-seqs` (`16`): How many requests are decoded at once (continuous batching). Set to the highest concurrency the benchmark uses.
+- `--ctx-size` (`262144`): Maximum tokens per sequence (prompt plus output). The model's full native context (also the default when the flag is left out). The KV cache is shared, so short requests do not reserve it.
+- `--prefix-cache-states` (`0`): Saved recurrent states for prefix caching; `0` turns prefix caching off. Measurement only, so repeated benchmark prompts are not answered from the cache. Drop it for normal use.
+- `--spec` (`dflash`): Speculative decoding drafter. `dflash` drafts a block of tokens in one pass of a small block-diffusion model that reads the target's hidden states; one verify step then checks them, so greedy output does not change.
+- `--spec-draft` (`RedHatAI/gemma-4-31B-it-speculator.dflash2`): The drafter: RedHatAI's DFlash 2 speculator for Gemma 4 31B, a Hugging Face checkpoint read as shipped.
+- `--spec-gate-cost-model` (`off`): lets DFlash keep drafting at `--spec-max-batch` (8) or more decoding sequences, at the depth its step-cost model picks. Output-moving at 8 or more users.
+- `--nvfp4-a4` (`prefill`, opt-in): runs every NVFP4 matmul of batches over 64 tokens with 4-bit activations on the GB10's block-scaled FP4 tensor cores: prompt steps, and the 128-token verify steps of 16 users. The RedHatAI checkpoint is calibrated for 4-bit activations (vLLM runs it W4A4). For Gemma 4, q, k and v share one activation quantization with the attention norm folded into it, and gate, up and the GELU run as one kernel with the FFN norm folded in. Faster prefill and 16-user decode, output-moving (prompts and batches of over 64 tokens).
+- `--spec-draft-weights` (`q8_0`, opt-in): the drafter's BF16 layers (~4.8 GB read per draft pass) quantized to Q8_0 at load. Drafts only, every token is still verified by the full model; at 4 and 16 users the drafts shape the verify batches, so the text can move.
+- `--spec-draft-lm-head` (`q4`, opt-in): the drafter reads a 4-bit copy of Gemma's tied 262,144-row head (2.8 GB in BF16) made at load. Drafts only, as above.
