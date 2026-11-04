@@ -1,0 +1,24 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+reviews:
+  profile: chill
+  high_level_summary: true
+  poem: false
+  request_changes_workflow: false
+  auto_review:
+    enabled: true
+    drafts: false
+  path_filters:
+    - "!Cargo.lock"
+    - "!tests/data/**"
+    - "!third_party/**"
+  path_instructions:
+    - path: "src/**"
+      instructions: >-
+        Default behaviour must stay byte-identical: flag any change that can alter greedy output
+        without an opt-in flag. Features and tuning values are command-line flags (clap), not
+        environment variables. Unit tests go in the module's tests.rs, not inline test modules.
+    - path: "src/cuda/**"
+      instructions: >-
+        The minimum GPU is sm_70 (Volta). Flag code that needs a newer architecture without a
+        gate or a fallback.
