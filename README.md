@@ -6,6 +6,8 @@
 
 <p align="center">
   <a href="https://github.com/eelgaev/Legion/actions/workflows/ci.yml"><img src="https://github.com/eelgaev/Legion/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License: Apache-2.0"></a>
+  <a href="rust-toolchain.toml"><img src="https://img.shields.io/badge/rust-1.99.1-orange?logo=rust" alt="Rust 1.99.1"></a>
 </p>
 
 Legion is an LLM inference engine for mixture-of-experts models on NVIDIA unified-memory systems.
