@@ -4,9 +4,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+# A newer push to a pull request cancels its older run; pushes to main queue instead, so every
+# main commit gets its build.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 permissions:
   contents: read
 jobs:
@@ -16,10 +18,47 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, ARM64, cuda]
     timeout-minutes: 120
+    env:
+      CARGO_TARGET_DIR: /home/runner/cargo-target
     steps:
       - uses: actions/checkout@v5
       - name: ggml submodule
         run: git submodule update --init --depth 1 third_party/ggml
+      # A smoke test of the CPU release build: serve a tiny random-weight Gemma 4 31B checkpoint
+      # (the real model's layout at toy sizes, 66 MB, pinned revision, cached on the runner) and
+      # ask for 16 tokens. The weights are random, so only loading, the chat template and
+      # generation are checked, not the text.
+      - name: CPU release build
+        run: cargo build --release
+      - name: smoke test (tiny Gemma 4 31B on the CPU)
+        env:
+          REPO: optimum-intel-internal-testing/tiny-random-gemma4-31B
+          REV: 737d788c3f87c65f5a2e1ef8f7d795041d99d142
+        run: |
+          model=$HOME/ci-models/tiny-random-gemma4-31B-$REV
+          if [ ! -f "$model/.complete" ]; then
+            mkdir -p "$model"
+            for f in config.json generation_config.json chat_template.jinja tokenizer.json \
+                     tokenizer_config.json processor_config.json model.safetensors; do
+              curl -sfL --retry 3 -o "$model/$f" "https://huggingface.co/$REPO/resolve/$REV/$f"
+            done
+            touch "$model/.complete"
+          fi
+          port=18080
+          "$CARGO_TARGET_DIR/release/legion" serve --model "$model" --device cpu --threads 4 \
+            --ctx-size 1024 --max-seqs 1 --port $port > serve.log 2>&1 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null; wait $pid 2>/dev/null' EXIT
+          for i in $(seq 120); do
+            curl -sf -m 2 http://127.0.0.1:$port/health > /dev/null && break
+            kill -0 $pid 2>/dev/null || { cat serve.log; exit 1; }
+            sleep 0.5
+          done
+          id=$(curl -sf http://127.0.0.1:$port/v1/models | python3 -c 'import json, sys; print(json.load(sys.stdin)["data"][0]["id"])')
+          curl -sf -m 60 http://127.0.0.1:$port/v1/chat/completions -H 'content-type: application/json' \
+            -d "{\"model\": \"$id\", \"messages\": [{\"role\": \"user\", \"content\": \"Hello there\"}], \"max_tokens\": 16, \"temperature\": 0}" \
+            > reply.json || { cat serve.log; exit 1; }
+          python3 -c 'import json, sys; d = json.load(open("reply.json")); n = d["usage"]["completion_tokens"]; print("generated", n, "tokens"); sys.exit(n < 1)'
       # The release CUDA 13.0 build, as on the GB10 boxes. The runner has the toolkit but no
       # GPU, so this compiles and links the CUDA build (kernels for sm_121a) without running it.
       - name: release build with --features cuda
