@@ -614,13 +614,14 @@ pub fn probe_orders(k: usize) -> Vec<WideOrder> {
     out
 }
 
+/// One shape's [`probe_wide`] result: its name, its wide step size, the orders that match ggml's
+/// bits, and the fewest differing outputs of any order.
+pub type WideProbe = (String, usize, Vec<WideOrder>, usize);
+
 /// Every order of [`probe_orders`] for every BF16 weight shape and wide step size of `cfg` (as
 /// [`check_wide`]), in one graph with ggml's `mul_mat`: the orders with ggml's bits (#836: which
 /// order cuBLAS's kernel sums in), and the fewest differing outputs of any order.
-pub fn probe_wide(
-    gpu: &mut Backend,
-    cfg: &Config,
-) -> Result<Vec<(String, usize, Vec<WideOrder>, usize)>, String> {
+pub fn probe_wide(gpu: &mut Backend, cfg: &Config) -> Result<Vec<WideProbe>, String> {
     let mut shapes: Vec<(usize, usize)> = Vec::new();
     for g in cfg.groups.iter().filter(|g| !g.f32) {
         for &m in &g.ms {

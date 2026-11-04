@@ -68,9 +68,9 @@ pub(crate) fn plan(c: Copy2d) -> Option<Launch> {
         0
     };
     let align = c.dst | c.src | c.width | pitches;
-    let (entry, size) = if align % 16 == 0 {
+    let (entry, size) = if align.is_multiple_of(16) {
         (B16, 16)
-    } else if align % 4 == 0 {
+    } else if align.is_multiple_of(4) {
         (B4, 4)
     } else {
         (B1, 1)

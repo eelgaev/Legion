@@ -211,6 +211,7 @@ fn any_volta(_: &[crate::ggml::Device]) -> bool {
 /// VRAM below which a one-GPU or layer-split stage's decode state spills (#1131): it would not
 /// fit at all. Under tensor parallelism it spills once it takes the reserve the steps need
 /// (their buffers cannot spill there).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 const STATE_SPILL_SLACK: usize = 512 << 20;
 
 /// Whether stage `si`'s decode state spills into host memory (#1131), and its KV pool's
@@ -313,6 +314,7 @@ fn state_spill(
 /// `free` bytes free between them spills ([`state_spill`]): only rings spill, so not without
 /// them; under tensor parallelism (`tp`) once it leaves less than `reserve` per GPU, else once
 /// it leaves less than [`STATE_SPILL_SLACK`].
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) fn spill_needed(
     (state, rings): (usize, usize),
     free: usize,
@@ -1870,7 +1872,7 @@ fn fit_tp_slots(
         prompt_copy_tokens = exec.kv_slot_stage().2,
         gpus = n_dev,
         host_tier_tokens = host * KV_BLOCK,
-        host_backed_tokens = exec.kv_slot_host_budget().map_or(host, |b| b) * KV_BLOCK,
+        host_backed_tokens = exec.kv_slot_host_budget().unwrap_or(host) * KV_BLOCK,
         "tensor-parallel cache fitted in per-sequence slots"
     );
     Ok((dev, host))
@@ -4175,8 +4177,8 @@ impl LmEngine {
         // `--spec-gate-cost-model` not given: where MTP drafts pay again past the matvec
         // steps, the gate ends there (#814), before the MTP head's full-batch buffers and the
         // LM head's pool are sized below.
-        if !cfg.spec.gate_cost_model_given {
-            if let Some(until) = vram::mtp_gate_until_default(
+        if !cfg.spec.gate_cost_model_given
+            && let Some(until) = vram::mtp_gate_until_default(
                 matches!(drafting, Drafting::Mtp(_)),
                 cfg.spec.fixed,
                 volta,
@@ -4184,16 +4186,16 @@ impl LmEngine {
                 layout.stages.len(),
                 tp_fit || tp_start.is_some() || layout.node.is_some(),
                 cfg.spec.max_batch,
-            ) {
-                cfg.spec.gate_until = until;
-                tracing::info!(
-                    from = cfg.spec.max_batch,
-                    until,
-                    "MTP drafts stop only from --spec-max-batch to this many decoding sequences \
-                     on this V100 layer split (--spec-gate-cost-model on: at any number above \
-                     too; off: never)"
-                );
-            }
+            )
+        {
+            cfg.spec.gate_until = until;
+            tracing::info!(
+                from = cfg.spec.max_batch,
+                until,
+                "MTP drafts stop only from --spec-max-batch to this many decoding sequences \
+                 on this V100 layer split (--spec-gate-cost-model on: at any number above \
+                 too; off: never)"
+            );
         }
         let kv_keep = cfg
             .switches
