@@ -4,6 +4,10 @@
   <img src="docs/legion.png" alt="Legion. For we are many. Many experts. Many users. One engine." width="800">
 </p>
 
+<p align="center">
+  <a href="https://github.com/eelgaev/Legion/actions/workflows/ci.yml"><img src="https://github.com/eelgaev/Legion/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+</p>
+
 Legion is an LLM inference engine for mixture-of-experts models on NVIDIA unified-memory systems.
 It is Rust first: the host side is Rust, kernels are PTX where we can, and C/C++ only where there
 is no other choice (ggml provides the quantized kernels underneath).
