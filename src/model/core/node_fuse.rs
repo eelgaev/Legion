@@ -47,6 +47,10 @@ type Node = *mut ffi::ggml_tensor;
 /// router weights `[1, k, n]` when `params[0]` (else `src[0]` is weighted already), then the
 /// shared expert's output `[e, n]` (contiguous) and the gate logits `[1, n]` (any row stride)
 /// when `params[1]`; `params[2]` is `k`. With `k` 1 and no weights, the gate alone.
+/// `params[3]` set (weights and gate both there; made by [`fold`], #1176): the sum rounded as
+/// ggml-cuda's fused kernel rounds it (the first product, then one FMA per expert), and a row
+/// whose router weight is zero not read, its term made from a zero (the same value where that
+/// row holds +0.0, as the rows of the experts another rank holds under `--tp-moe-ep`).
 pub(crate) static MOE_SUM_GATE: ExternalOp = ExternalOp {
     name: "moe_sum_gate",
     cpu: cpu_moe_sum_gate,
@@ -813,7 +817,7 @@ impl Graph {
 unsafe fn cpu_moe_sum_gate(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
     // SAFETY: a node made by the rewrite (see MOE_SUM_GATE), host tensors.
     unsafe {
-        let [weights, gated, k, ..] = external_params(dst);
+        let [weights, gated, k, fma, ..] = external_params(dst);
         let x = &*dst.src[0];
         let w = (weights != 0).then(|| &*dst.src[1]);
         let at = 1 + usize::from(weights != 0);
@@ -826,17 +830,28 @@ unsafe fn cpu_moe_sum_gate(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
                 1.0 / (1.0 + (-gv).exp())
             });
             for col in 0..e {
+                let weight = |j: usize| w.map(|w| *(w.data as *const f32).add(t * k + j));
                 let term = |j: usize| {
                     let v = *xp.add((t * k + j) * e + col);
-                    match w {
-                        Some(w) => v * *(w.data as *const f32).add(t * k + j),
+                    match weight(j) {
+                        Some(wj) => v * wj,
                         None => v,
                     }
                 };
-                let mut sum = term(0);
-                for j in 1..k {
-                    sum += term(j);
-                }
+                let mut sum = if fma != 0 {
+                    // ggml-cuda's fused sum; a zero weight's row not read (see MOE_SUM_GATE).
+                    let wj = |j: usize| weight(j).unwrap_or(1.0);
+                    let row = |j: usize| {
+                        if wj(j) == 0.0 {
+                            0.0
+                        } else {
+                            *xp.add((t * k + j) * e + col)
+                        }
+                    };
+                    (1..k).fold(row(0) * wj(0), |acc, j| row(j).mul_add(wj(j), acc))
+                } else {
+                    (1..k).fold(term(0), |acc, j| acc + term(j))
+                };
                 if let (Some((sh, _)), Some(s)) = (gate, s) {
                     sum += *(sh.data as *const f32).add(t * e + col) * s;
                 }
@@ -904,6 +919,8 @@ unsafe extern "C" {
     /// The kernels as the CUDA runtime knows them (their host stubs' addresses), for
     /// `cudaLaunchKernel`.
     static legion_moe_sum_gate_kernel: *const c_void;
+    static legion_moe_tail_fma_kernel: *const c_void;
+    static legion_moe_tail_fma4_kernel: *const c_void;
     static legion_ids_remap_kernel: *const c_void;
     fn cudaLaunchKernel(
         func: *const c_void,
@@ -924,7 +941,7 @@ unsafe fn cuda_moe_sum_gate(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
     // SAFETY: a node made by the rewrite, device tensors of the stream's device; the kernel
     // reads `p` from the launch's copy of its argument.
     unsafe {
-        let [weights, gated, k, ..] = external_params(dst);
+        let [weights, gated, k, fma, ..] = external_params(dst);
         let x = &*dst.src[0];
         let w = (weights != 0).then(|| &*dst.src[1]);
         let at = 1 + usize::from(weights != 0);
@@ -932,6 +949,9 @@ unsafe fn cuda_moe_sum_gate(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
         let (e, n) = (dst.ne[0], dst.ne[1]);
         if n < 1 || e < 1 {
             return Ok(());
+        }
+        if fma != 0 && (w.is_none() || gate.is_none()) {
+            return Err("moe_sum_gate: the fused sum needs the weights and the gate".into());
         }
         let mut p = SumGate {
             x: x.data as *const f32,
@@ -944,9 +964,18 @@ unsafe fn cuda_moe_sum_gate(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
             k,
             n_tok: n as i32,
         };
+        // The fused sum's kernel: 4 columns a thread where every row is 16-byte aligned.
+        let aligned = |t: *const f32| (t as usize).is_multiple_of(16);
+        let v4 =
+            fma != 0 && e % 4 == 0 && aligned(p.x) && aligned(p.sh) && aligned(p.out.cast_const());
+        let (kernel, cols) = match (fma != 0, v4) {
+            (false, _) => (legion_moe_sum_gate_kernel, 1),
+            (true, false) => (legion_moe_tail_fma_kernel, 1),
+            (true, true) => (legion_moe_tail_fma4_kernel, 4),
+        };
         let grid = Dim3 {
             x: n as u32,
-            y: (e as u64).div_ceil(u64::from(THREADS)) as u32,
+            y: (e as u64).div_ceil(u64::from(THREADS) * cols) as u32,
             z: 1,
         };
         let block = Dim3 {
@@ -955,14 +984,7 @@ unsafe fn cuda_moe_sum_gate(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
             z: 1,
         };
         let mut args = [(&raw mut p).cast::<c_void>()];
-        match cudaLaunchKernel(
-            legion_moe_sum_gate_kernel,
-            grid,
-            block,
-            args.as_mut_ptr(),
-            0,
-            stream,
-        ) {
+        match cudaLaunchKernel(kernel, grid, block, args.as_mut_ptr(), 0, stream) {
             0 => Ok(()),
             e => Err(format!("moe_sum_gate: CUDA error {e}")),
         }
