@@ -3067,10 +3067,16 @@ impl Model {
             // differs between optimized and debug builds). A verify group keeps its states
             // (the commit advances them; see spec.rs) and stores the concatenated input for
             // the replay; any other group's history goes to its state now.
+            // Prompt groups: the conv normalizes its q and k heads too (`delta_prep`'s bits), so
+            // they are read and written once less; the op then computes g and beta only.
+            let prep_eps = hp.rms_eps / head_k as f32;
+            let conv_norm = chain.is_none() && fused::conv_norm_fits(heads, ng, sh.verify);
             let (conv, history) = if sh.verify {
                 // The whole window [history | chunk] for the replay, from the same op.
                 let keep = conv_w.ne()[0] - 1 + nt;
                 fused::conv_silu_window(ctx, qkv, conv_state, conv_w, keep)
+            } else if conv_norm {
+                fused::conv_silu_norm(ctx, qkv, conv_state, conv_w, heads, prep_eps)
             } else {
                 fused::conv_silu(ctx, qkv, conv_state, conv_w)
             };
@@ -3098,6 +3104,20 @@ impl Model {
                 (2 * head_k * n_k) as usize * es,
             );
             let (q, k, g, beta, stored) = match chain {
+                None if conv_norm => {
+                    // q and k: the views of the normalized conv output.
+                    let [g, beta] = fused::delta_gates(
+                        ctx,
+                        conv,
+                        cols(ctx, alpha_raw, off, ng),
+                        cols(ctx, beta_raw, off, ng),
+                        dt_bias,
+                        ssm_a,
+                        heads,
+                        prep_eps,
+                    );
+                    (q, k, g, beta, false)
+                }
                 None => {
                     // A pool that defers its commits stores the inputs in the delta rule
                     // (`gdn::rows_replay`), after it reads the last step's kept ones there; a
@@ -3119,7 +3139,7 @@ impl Model {
                         dt_bias,
                         ssm_a,
                         heads,
-                        hp.rms_eps / head_k as f32,
+                        prep_eps,
                         store,
                     );
                     (q, k, g, beta, store.is_some())
