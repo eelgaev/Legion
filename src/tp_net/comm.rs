@@ -762,6 +762,12 @@ fn add_rail(
         Ok(yes && b[0] == 1)
     };
     if !swap(s, rails >= 2)? {
+        if rails >= 2 {
+            tracing::warn!(
+                peer,
+                "tensor parallel: --tp-rails 2, but the peer runs one rail"
+            );
+        }
         return Ok(None);
     }
     let rail = ep.open_rail(rank).unwrap_or_else(|e| {
