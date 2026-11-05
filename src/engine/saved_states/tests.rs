@@ -84,6 +84,21 @@ fn replaced_and_dropped_tails_go_back_to_the_caller() {
 }
 
 #[test]
+fn only_tails_from_a_block_on_are_dropped() {
+    let mut s = SavedStates::new(4);
+    s.store(&[1], Kind::Anchor, Some(BlockId(1))).unwrap();
+    s.store(&[2], Kind::Anchor, None).unwrap();
+    s.store(&[3], Kind::Anchor, Some(BlockId(7))).unwrap();
+    s.store(&[4], Kind::Anchor, Some(BlockId(4))).unwrap();
+    let mut d = s.drop_tails_from(BlockId(4));
+    d.sort_by_key(|b| b.0);
+    assert_eq!(d, vec![BlockId(4), BlockId(7)]);
+    assert!(s.contains(&[1]) && s.contains(&[2]));
+    assert!(!s.contains(&[3]) && !s.contains(&[4]));
+    assert!(s.drop_tails_from(BlockId(4)).is_empty());
+}
+
+#[test]
 fn spaced_saves_fill_at_most_half_the_slots_until_a_prompt_resumes_from_one() {
     let mut s = SavedStates::new(4);
     store(&mut s, &[9]);

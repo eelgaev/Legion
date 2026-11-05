@@ -23,6 +23,35 @@ pub fn lend_range(row: usize, block: usize, keep: usize, n_blocks: usize) -> (us
     (from, n_blocks * block * row)
 }
 
+/// #1196: of a cache tensor's lent pieces `(offset, bytes)` (from its start, ascending), the
+/// indices of those holding a byte of a block in `held` (ascending block ids), the tensor's
+/// rows `row` bytes each, `block` rows a block: what a lend keeps in host memory so the blocks
+/// still in use keep their contents.
+pub fn held_pieces(
+    pieces: &[(usize, usize)],
+    row: usize,
+    block: usize,
+    held: &[u32],
+) -> Vec<usize> {
+    let bytes = row * block;
+    if bytes == 0 || held.is_empty() {
+        return Vec::new();
+    }
+    pieces
+        .iter()
+        .enumerate()
+        .filter(|&(_, &(off, n))| {
+            if n == 0 {
+                return false;
+            }
+            let (first, last) = (off / bytes, (off + n - 1) / bytes);
+            let i = held.partition_point(|&b| (b as usize) < first);
+            held.get(i).is_some_and(|&b| b as usize <= last)
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// The blocks to keep mapped for `tokens` tokens: whole blocks of `block` tokens, at least one,
 /// at most `n_blocks`.
 pub fn keep_blocks(tokens: usize, block: usize, n_blocks: usize) -> usize {

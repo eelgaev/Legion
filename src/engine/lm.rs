@@ -41,6 +41,7 @@ mod node;
 mod pair_tp;
 mod pipe;
 pub mod pipe_split;
+mod plan;
 mod preempt;
 pub mod report;
 mod response_format;
@@ -3282,6 +3283,90 @@ fn load_report(
     }
 }
 
+/// What [`log_memory_plan`] takes from [`LmEngine::load`]'s own decisions.
+struct MemoryPlanFacts<'a> {
+    ctx_size: usize,
+    max_seqs: usize,
+    /// KV blocks in all.
+    n_blocks: usize,
+    kv_lend: Option<&'a kv_vmm::KvLend>,
+    /// Per stage: its pools' tail lent to the expert cache at load (empty without a lend).
+    kv_lent_bytes: &'a [usize],
+    /// Per stage: the VRAM kept free of the expert cache for step compute buffers, and the
+    /// prompt steps' room the cache took (empty when the load measured none).
+    planned_compute: &'a [usize],
+    compute_spill: &'a [usize],
+}
+
+/// Logs the memory plan (#1196, [`plan`]) once loaded: per GPU and in host memory, from the
+/// load report, the load's own decisions and the driver. Printing only.
+fn log_memory_plan(
+    layout: &layout::Layout,
+    exec: &mut Executor,
+    report: &report::LoadReport,
+    f: MemoryPlanFacts<'_>,
+) {
+    let experts = exec
+        .experts_mut()
+        .map(|r| r.slot_bytes_by_cuda())
+        .unwrap_or_default();
+    let gpu = |d: crate::ggml::Device| {
+        let (free, total) = d.memory();
+        plan::Gpu {
+            device: d.name(),
+            name: d.description(),
+            cuda: cuda_index(d),
+            total: total as u64,
+            free: free as u64,
+        }
+    };
+    let keep_tokens = f.kv_lend.map(|l| l.keep * KV_BLOCK);
+    let n_stages = exec.stage_layers().len();
+    let mut gpus = Vec::new();
+    for (si, ((d, _), s)) in layout.stages.iter().zip(&report.stages).enumerate() {
+        let Some(d) = d.filter(|d| d.kind() != crate::ggml::DeviceKind::Cpu) else {
+            continue;
+        };
+        // Tensor parallelism: one stage over the meta device's GPUs.
+        let devs: Vec<plan::Gpu> = if layout.tp_devices.is_empty() {
+            vec![gpu(d)]
+        } else {
+            layout.tp_devices.iter().map(|&d| gpu(d)).collect()
+        };
+        let at = |v: &[usize]| v.get(si).map_or(0, |&b| b as u64);
+        let facts = plan::StageFacts {
+            kv_lent: at(f.kv_lent_bytes),
+            kv_vram_tokens: keep_tokens.unwrap_or(s.kv_tokens),
+            compute_allocated: if si < n_stages {
+                exec.compute_bytes(si) as u64
+            } else {
+                0
+            },
+            compute_planned: at(f.planned_compute),
+        };
+        gpus.extend(plan::stage_gpus(s, &facts, &devs, &experts));
+    }
+    let mut host = plan::host_from_report(report);
+    host.kv_spill_max = f.kv_lend.map_or(0, |l| l.host_budget as u64);
+    host.compute_spill_max = f.compute_spill.iter().sum::<usize>() as u64;
+    host.available = crate::residency::lookup_table::MemInfo::read().available;
+    let tail_tokens = f
+        .kv_lend
+        .map_or(0, |l| f.n_blocks.saturating_sub(l.keep) * KV_BLOCK);
+    let lent = f.kv_lent_bytes.iter().sum::<usize>() as u64;
+    plan::log(&plan::MemoryPlan {
+        context: plan::ContextPlan {
+            ctx_size: f.ctx_size,
+            max_seqs: f.max_seqs,
+            kv_pool_tokens: f.n_blocks * KV_BLOCK,
+            kv_host_tier_tokens: report.kv.host_tokens,
+            kv_spill_tokens: plan::spill_tokens(tail_tokens, lent, host.kv_spill_max),
+        },
+        gpus,
+        host,
+    });
+}
+
 /// The model's id: `--model-name`, else the checkpoint's `general.name`, else its file stem.
 fn model_id(cfg: &LmConfig, gguf: &GgufFile) -> String {
     cfg.model_name.clone().unwrap_or_else(|| {
@@ -4288,6 +4373,8 @@ impl LmEngine {
         }
         // `--kv-vmm-keep` (#814): the pools' tails, lent to the expert cache at its sizing.
         let mut kv_lend: Option<kv_vmm::KvLend> = None;
+        // Per stage: the bytes of its tail lent at load (for the memory plan).
+        let mut kv_lent_bytes: Vec<usize> = Vec::new();
         // A host tier (#352): more blocks, in pinned host memory on each GPU's node, after the
         // ones that fit in device memory. The allocator hands out device blocks first.
         let mut hbm_blocks = n_blocks;
@@ -4383,6 +4470,10 @@ impl LmEngine {
         }
         // The measured step compute buffers per stage (for the startup report).
         let mut measured_compute: Vec<usize> = Vec::new();
+        // Per stage, for the memory plan: the VRAM kept free of the expert cache for step
+        // compute buffers, and the prompt steps' room the cache took (may spill to host).
+        let mut planned_compute: Vec<usize> = Vec::new();
+        let mut compute_spill: Vec<usize> = Vec::new();
         if mode == ExpertMode::Cache {
             // The cache takes the VRAM the compute buffers leave: measure what the longest
             // prompt steps (a full chunk at the end of the context) need on each stage. A
@@ -4557,12 +4648,18 @@ impl LmEngine {
             } else {
                 compute.clone()
             };
+            compute_spill = compute
+                .iter()
+                .zip(&cache_compute)
+                .map(|(&c, &l)| c.saturating_sub(l))
+                .collect();
             // The head's room stays out of the kept step graphs' budget below: its graphs
             // keep buffers of their own.
             let mut cache_compute = cache_compute;
             if let Some(last) = cache_compute.last_mut() {
                 *last += mtp_head + head_pool;
             }
+            planned_compute = cache_compute.clone();
             let mut pinned = vec![0; cache_compute.len()];
             if let Some(last) = pinned.last_mut() {
                 *last = head_pool;
@@ -4586,6 +4683,7 @@ impl LmEngine {
                         for (l, b) in long.iter_mut().zip(&bytes) {
                             *l += b;
                         }
+                        kv_lent_bytes = bytes;
                         kv_lend = Some(lend);
                     }
                 } else if cfg.switches.kv_vmm_keep.is_some() {
@@ -4820,6 +4918,20 @@ impl LmEngine {
                 ngram,
                 engram,
                 saved_host_bytes,
+            },
+        );
+        log_memory_plan(
+            &layout,
+            &mut exec,
+            &load_report,
+            MemoryPlanFacts {
+                ctx_size: cfg.ctx_size,
+                max_seqs,
+                n_blocks,
+                kv_lend: kv_lend.as_ref(),
+                kv_lent_bytes: &kv_lent_bytes,
+                planned_compute: &planned_compute,
+                compute_spill: &compute_spill,
             },
         );
 
@@ -6186,9 +6298,13 @@ impl Worker {
             return Ok(());
         }
         let before = seq.table.blocks().len();
-        if self.kv_lend.as_ref().is_some_and(|l| !l.grown) {
+        if let Some(l) = self.kv_lend.as_ref().filter(|l| !l.grown) {
+            // #1196: a resumed prefix with blocks the last shrink kept in host memory gets
+            // them back in VRAM before this step reads them.
+            let keep = l.keep as u32;
+            let resume = l.host_held > 0 && seq.blocks.iter().any(|&b| b >= keep);
             let need = n.div_ceil(KV_BLOCK).saturating_sub(before);
-            self.kv_make_room(need)?;
+            self.kv_make_room(need, resume)?;
         }
         if self.pool.slot_blocks() > 0 {
             seq.table
@@ -6316,24 +6432,38 @@ impl Worker {
     /// planned as over the unlent cache), its freed VRAM backing the tail. Once no prompt is
     /// read, [`Self::restore_cache`] restores all of the cache but the tail's share, until
     /// [`Self::kv_shrink`].
-    fn kv_make_room(&mut self, need: usize) -> Result<(), String> {
+    ///
+    /// `resume` (#1196): a sequence resumes blocks past the kept ones that the last shrink
+    /// kept in host memory: the tail is mapped whatever `need`, and those
+    /// blocks are copied back into VRAM before a step reads them.
+    fn kv_make_room(&mut self, need: usize, resume: bool) -> Result<(), String> {
         let short = |w: &Self| need > w.pool.free_fast_blocks() as usize;
-        if need == 0 || !short(self) {
-            return Ok(());
-        }
-        // Everything they hold is a kept block while the tail is lent.
-        if let Some(radix) = &mut self.radix {
-            let n = need - self.pool.free_fast_blocks() as usize;
-            radix.evict(&mut self.pool, n as u32);
-        }
-        while short(self) && self.evict_warm() {}
-        if short(self) {
-            for b in self.saved.drop_tails() {
-                self.pool.decref(b);
+        if !resume {
+            if need == 0 || !short(self) {
+                return Ok(());
             }
-        }
-        if !short(self) {
-            return Ok(());
+            // Everything they hold is a kept block while the tail is lent, but blocks the
+            // last shrink kept in host memory (#1196).
+            let host_held = self.kv_lend.as_ref().is_some_and(|l| l.host_held > 0);
+            if let Some(radix) = &mut self.radix {
+                let n = need - self.pool.free_fast_blocks() as usize;
+                radix.evict(&mut self.pool, n as u32);
+                // Evicting an entry on the host-held tail frees no kept block: go on, least
+                // recently used first, until enough kept blocks are free.
+                while host_held
+                    && need > self.pool.free_fast_blocks() as usize
+                    && radix.evict(&mut self.pool, 1) > 0
+                {}
+            }
+            while short(self) && self.evict_warm() {}
+            if short(self) {
+                for b in self.saved.drop_tails() {
+                    self.pool.decref(b);
+                }
+            }
+            if !short(self) {
+                return Ok(());
+            }
         }
         let t = Instant::now();
         if !self.lent && self.can_lend {
@@ -6345,61 +6475,149 @@ impl Worker {
             }
         }
         let lend = self.kv_lend.as_mut().expect("a lent KV tail");
-        let bytes = lend
-            .grow(&self.exec)
-            .map_err(|e| format!("--kv-vmm-keep: cannot map the KV pools' tail: {e}"))?;
+        let host_held = lend.host_held;
+        let (bytes, restored) = match lend.grow(&self.exec) {
+            Ok(b) => b,
+            Err(e) => {
+                // Blocks kept in host memory may have lost their bytes: nothing resumes them.
+                if host_held > 0 {
+                    let keep = lend.keep as u32;
+                    self.kv_evict_tail(keep);
+                }
+                return Err(format!("--kv-vmm-keep: cannot map the KV pools' tail: {e}"));
+            }
+        };
         tracing::info!(
             ms = t.elapsed().as_secs_f64() * 1e3,
             mib = bytes >> 20,
+            from_host_mib = restored >> 20,
             cache_lent = self.lent,
+            resume,
             "KV pools' tail mapped for a sequence past the kept blocks (--kv-vmm-keep)"
         );
         Ok(())
+    }
+
+    /// Evicts every cached prefix and warm sequence holding a block from `keep` on, then the
+    /// saved tails if a block there is still in use: the KV pools' tail gives its blocks back
+    /// without keeping them (as before #1196).
+    fn kv_evict_tail(&mut self, keep: u32) {
+        if let Some(radix) = &mut self.radix {
+            radix.evict_from(&mut self.pool, keep);
+        }
+        let past = |w: &Warm| w.table.blocks().iter().any(|b| b.0 >= keep);
+        while let Some(i) = self.warm.iter().position(past) {
+            let w = self.warm.swap_remove(i);
+            w.table.release(&mut self.pool);
+            self.free_ring_and_slot(w.ring, w.kv_slot);
+        }
+        if self.pool.slow_in_use() > 0 {
+            for b in self.saved.drop_tails() {
+                self.pool.decref(b);
+            }
+        }
+    }
+
+    /// One eviction of a holder of a tail block (`keep` on) for the host copy's budget
+    /// ([`kv_vmm::evict_tail_holder`]; warm sequences least recently finished first).
+    fn kv_evict_tail_holder(&mut self, keep: u32) -> bool {
+        let warm = &mut self.warm;
+        let mut freed = None;
+        let evicted = kv_vmm::evict_tail_holder(
+            &mut self.pool,
+            self.radix.as_mut(),
+            &mut self.saved,
+            keep,
+            |pool| {
+                let past = |w: &Warm| w.table.blocks().iter().any(|b| b.0 >= keep);
+                let Some(i) = (0..warm.len())
+                    .filter(|&i| past(&warm[i]))
+                    .min_by_key(|&i| warm[i].stamp)
+                else {
+                    return false;
+                };
+                let w = warm.swap_remove(i);
+                w.table.release(pool);
+                freed = Some((w.ring, w.kv_slot));
+                true
+            },
+        );
+        if let Some((ring, slot)) = freed {
+            self.free_ring_and_slot(ring, slot);
+        }
+        evicted
     }
 
     /// `--kv-vmm-keep` (#814): gives the KV pools' tail back to the expert cache once no
     /// decoding sequence holds a block of it (cached prefixes and warm sequences on it go);
     /// the slots a restore left without VRAM for it are refilled (a lent cache's restore
     /// refills them). Nothing may be in flight (`pipe`).
+    ///
+    /// #1196: the cached prefixes, warm sequences and saved tails on it stay
+    /// as far as the pieces holding their blocks fit in the host budget (least recently used
+    /// go first); those pieces are copied into host memory and mapped where they were, and
+    /// the next [`Self::kv_make_room`] copies them back.
     fn kv_shrink(&mut self, decoding: &[Seq<'_>]) {
-        let Some(keep) = self
+        let Some((keep, budget)) = self
             .kv_lend
             .as_ref()
             .filter(|l| l.grown)
-            .map(|l| l.keep as u32)
+            .map(|l| (l.keep as u32, l.host_budget))
         else {
             return;
         };
         if decoding.iter().any(|s| s.blocks.iter().any(|&b| b >= keep)) {
             return;
         }
+        let mut host = None;
         if self.pool.slow_in_use() > 0 {
-            if let Some(radix) = &mut self.radix {
-                radix.evict_from(&mut self.pool, keep);
+            if budget > 0 {
+                host = kv_vmm::fit_host(
+                    budget,
+                    self,
+                    |w| {
+                        let held = w.pool.slow_used();
+                        w.kv_lend.as_ref().expect("checked above").host_plan(&held)
+                    },
+                    |w| w.kv_evict_tail_holder(keep),
+                );
             }
-            let past = |w: &Warm| w.table.blocks().iter().any(|b| b.0 >= keep);
-            while let Some(i) = self.warm.iter().position(past) {
-                let w = self.warm.swap_remove(i);
-                w.table.release(&mut self.pool);
-                self.free_ring_and_slot(w.ring, w.kv_slot);
-            }
-            if self.pool.slow_in_use() > 0 {
-                for b in self.saved.drop_tails() {
-                    self.pool.decref(b);
-                }
+            if host.is_none() {
+                self.kv_evict_tail(keep);
             }
         }
-        if self.pool.slow_in_use() > 0 {
+        if host.is_none() && self.pool.slow_in_use() > 0 {
             return;
         }
+        // Nothing held past the kept blocks: a lend as without host memory.
+        let host = host.filter(|h| h.bytes > 0);
         let t = Instant::now();
         let lend = self.kv_lend.as_mut().expect("checked above");
-        match lend.shrink(&mut self.exec) {
+        let mut shrunk = lend.shrink(&mut self.exec, host.as_ref());
+        if host.is_some()
+            && let Err(e) = &shrunk
+        {
+            let e = e.clone();
+            // Some pieces may be without their bytes: evict what the tail holds, then lend
+            // it as without host memory (or map it all again if something still holds it).
+            tracing::warn!(error = %e, "cannot keep the KV tail in host memory; evicting what it holds");
+            self.kv_evict_tail(keep);
+            let lend = self.kv_lend.as_mut().expect("checked above");
+            shrunk = if self.pool.slow_in_use() == 0 {
+                lend.shrink(&mut self.exec, None)
+            } else {
+                lend.grow(&self.exec).and(Err(e))
+            };
+        }
+        match shrunk {
             Ok(bytes) => {
+                let host_mib = self.kv_lend.as_ref().map_or(0, |l| l.host_held >> 20);
                 tracing::info!(
                     ms = t.elapsed().as_secs_f64() * 1e3,
                     mib = bytes >> 20,
-                    "KV pools' tail lent to the expert cache again (--kv-vmm-keep)"
+                    host_mib,
+                    "KV pools' tail lent to the expert cache again (--kv-vmm-keep); its \
+                     blocks still in use moved to host memory (host_mib)"
                 );
                 // The slots a restore left without VRAM for the tail (a lent cache gets them
                 // back with its restore).
@@ -6670,7 +6888,14 @@ impl Worker {
                             .saturating_sub(s.table.blocks().len())
                     })
                     .sum();
-                self.kv_make_room(need)?;
+                // #1196: resumed prefixes held in host memory go back to VRAM with the rest.
+                let resume = self.kv_lend.as_ref().is_some_and(|l| {
+                    l.host_held > 0
+                        && prefilling
+                            .iter()
+                            .any(|s| s.blocks.iter().any(|&b| b >= l.keep as u32))
+                });
+                self.kv_make_room(need, resume)?;
             }
         }
         // A long prompt turns a short lend into a long one until the cache is restored (the

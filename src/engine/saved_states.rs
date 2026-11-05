@@ -124,6 +124,20 @@ impl SavedStates {
         out
     }
 
+    /// Drops every entry whose tail block is `first` or later, returning the blocks (the
+    /// caller gives their references back): a KV pool's blocks past `first` that no longer
+    /// fit in host memory (#1196).
+    pub fn drop_tails_from(&mut self, first: BlockId) -> Vec<BlockId> {
+        let mut out = Vec::new();
+        for s in &mut self.slots {
+            if let Some(t) = s.as_ref().and_then(|s| s.tail).filter(|t| t.0 >= first.0) {
+                out.push(t);
+                *s = None;
+            }
+        }
+        out
+    }
+
     /// The tokens `slot`'s entry holds the state after, if it holds one.
     pub fn prefix_len(&self, slot: usize) -> Option<usize> {
         self.slots.get(slot)?.as_ref().map(|s| s.prefix.len())

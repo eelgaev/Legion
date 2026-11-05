@@ -21,7 +21,7 @@ use std::sync::Mutex;
 use crate::ggml::{BufferType, Context, GgmlError, Tensor, ffi};
 
 mod kv_vmm;
-pub use kv_vmm::{kv_vmm_remap, kv_vmm_type, kv_vmm_unmap};
+pub use kv_vmm::{kv_vmm_host_ok, kv_vmm_remap, kv_vmm_type, kv_vmm_unmap};
 mod tp_tier;
 pub use tp_tier::{LAZY_CHUNK_ROWS, tp_tier_back, tp_tier_devices, tp_tier_trim};
 

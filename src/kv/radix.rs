@@ -207,6 +207,44 @@ impl RadixCache {
         }
     }
 
+    /// Evicts the least recently used unlocked leaf that holds a block from `first` on or lies
+    /// under an entry that does: one step of [`Self::evict_from`] in LRU order, for a KV
+    /// pool that keeps what fits of its blocks past `first` in host memory (#1196). False
+    /// when there is no such leaf.
+    pub fn evict_lru_from(&mut self, pool: &mut BlockPool, first: u32) -> bool {
+        let past = |node: &Node| node.blocks.iter().any(|b| b.0 >= first);
+        let victim = self
+            .nodes
+            .iter()
+            .filter(|(id, node)| **id != 0 && node.locks == 0 && node.children.is_empty())
+            .filter(|(id, _)| {
+                let mut at = **id;
+                while at != 0 {
+                    let node = &self.nodes[&at];
+                    if past(node) {
+                        return true;
+                    }
+                    at = node.parent;
+                }
+                false
+            })
+            .min_by_key(|(id, node)| (node.last_access, **id))
+            .map(|(&id, _)| id);
+        let Some(id) = victim else {
+            return false;
+        };
+        let node = self.nodes.remove(&id).unwrap();
+        self.cached_blocks -= node.blocks.len() as u32;
+        for block in node.blocks {
+            pool.decref(block);
+        }
+        let parent = self.nodes.get_mut(&node.parent).unwrap();
+        parent
+            .children
+            .remove(&node.tokens[..self.block_size as usize]);
+        true
+    }
+
     pub fn cached_blocks(&self) -> u32 {
         self.cached_blocks
     }

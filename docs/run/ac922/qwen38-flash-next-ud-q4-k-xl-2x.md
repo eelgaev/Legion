@@ -33,6 +33,8 @@ legion serve \
 On a V100 layer split of 2 GPUs with the expert cache, the KV pools' tail is lent to the expert cache by default
 (`--kv-vmm-keep 32768`: each GPU keeps VRAM for the first 32,768 tokens of its pool and gives the rest, 1,440 MiB,
 to about 6,550 expert slots in all). A sequence past 32K maps the tail again; `--no-kv-vmm` turns the lend off.
+When the tail goes back, the chats cached on it move to pinned host memory and are copied back when resumed, with
+no flag (up to an eighth of the free host memory; the load log's "KV cache" line prints the split).
 
 Measured 2026-11-01 with this exact command on three server starts. Deterministic client at C=1/4/16, 2 rounds per
 start, the median of the 6 rounds (C=1 per request; 66.7 tok/s total over the round). Prefill 8192/32768/122880
