@@ -150,6 +150,15 @@ mod sys {
             kind: c_int,
             s: cudaStream_t,
         ) -> cudaError_t;
+        pub fn cudaMemcpy2D(
+            dst: *mut c_void,
+            dpitch: usize,
+            src: *const c_void,
+            spitch: usize,
+            width: usize,
+            height: usize,
+            kind: c_int,
+        ) -> cudaError_t;
         pub fn cudaMemset(p: *mut c_void, v: c_int, n: usize) -> cudaError_t;
         pub fn cudaStreamCreateWithFlags(s: *mut cudaStream_t, flags: c_uint) -> cudaError_t;
         pub fn cudaStreamDestroy(s: cudaStream_t) -> cudaError_t;

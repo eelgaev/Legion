@@ -636,13 +636,18 @@ fn handle(
             exec.commit(&commits).map_err(|e| e.to_string())?;
             Reply::Done
         }
-        Request::SaveRing { ring, n, restore } => {
-            exec.save_ring(ring as usize, n as usize, restore);
+        Request::SaveRing {
+            ring,
+            slot,
+            n,
+            restore,
+        } => {
+            exec.save_ring(ring as usize, slot as usize, n as usize, restore);
             Reply::Done
         }
-        Request::EnableRingSaves => {
+        Request::EnableRingSaves { slots } => {
             let bytes = exec
-                .enable_ring_saves(ring_bufts)
+                .enable_ring_saves(ring_bufts, slots as usize)
                 .map_err(|e| e.to_string())?;
             tracing::info!(
                 gib = bytes as f64 / (1u64 << 30) as f64,

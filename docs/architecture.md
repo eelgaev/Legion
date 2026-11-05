@@ -50,6 +50,7 @@ HTTP clients ──► src/server ──► src/engine (trait Engine) ──► 
 | `src/engine/reasoning.rs` | Streaming `<think>...</think>` splitter: turns model text into `TokenEvent::Reasoning` and `TokenEvent::Text` events. |
 | `src/engine/sampling.rs` | Token sampling from logits: penalties, temperature, top-k, top-p, min-p and a seeded RNG. |
 | `src/engine/saved_states.rs` | Bookkeeping for saved recurrent states, the half of prefix caching that hybrid models need. |
+| `src/engine/ring_checkpoints.rs` | Bookkeeping for saved sliding-window rings (context checkpoints), the half of prefix caching that ring models (Gemma 4) need; `--ring-checkpoints 0` turns them off (one copy per ring at its last prompt's end, as before). |
 | `src/engine/stop.rs` | Stop-string matching over streamed text. |
 | `src/engine/tool_parser/gemma4.rs` | Gemma 4 tool calls (`<|tool_call>call:NAME{...}<tool_call|>`, Gemma's argument notation). |
 | `src/engine/tool_parser.rs` | Streaming tool-call parsers: turn `<tool_call>...</tool_call>` blocks in model text into `TokenEvent::ToolCall` events. |

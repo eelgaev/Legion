@@ -255,7 +255,6 @@ impl Worker {
         seq.saves.clear();
         seq.ring = 0;
         seq.kv_slot = 0;
-        seq.ring_saved = None;
         seq.draft = Default::default();
         seq.draft_cap = 0;
         seq.draft_ngram = None;
@@ -293,7 +292,6 @@ impl Worker {
         };
         seq.ring = p.ring;
         seq.kv_slot = p.kv_slot;
-        seq.ring_saved = p.ring_saved;
         // A fresh id: model drafters dropped the old one's state.
         seq.id = self.next_id;
         self.next_id += 1;

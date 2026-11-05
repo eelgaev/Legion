@@ -1375,6 +1375,30 @@ struct EngineArgs {
     /// prompt ends and reply ends. Try 2048-4096 for many requests sharing a system prompt.
     #[arg(long, value_name = "N", default_value_t = 0)]
     prefix_cache_interval: usize,
+    /// Model engine, prefix caching on a model with sliding-window rings (Gemma 4): copies of
+    /// sequences' rings (context checkpoints) kept in pinned host memory, so a new prompt
+    /// resumes a cached conversation where it leaves it, not only near the end of its last
+    /// prompt. Each copy holds one ring (~1.2 GiB on Gemma 4 31B with --tp 2). Default: 3 per
+    /// --max-seqs where a third of the free host memory holds them, at least 1 per sequence.
+    /// 0: off, prefix caching as before checkpoints (one copy per sequence at its last prompt's
+    /// end, no --ring-checkpoint-every copies, a side request may take over a chat's cache, no
+    /// host KV tier memory taken).
+    #[arg(long, value_name = "N")]
+    ring_checkpoints: Option<usize>,
+    /// Model engine, with ring checkpoints: also save one every N prompt tokens (where a
+    /// prefill step ends past it, so the steps stay those of a run without them) over the last
+    /// --ring-checkpoint-span tokens of each prompt, besides every prompt's end. 0: prompt ends
+    /// only.
+    #[arg(long, value_name = "N", default_value_t = legion::engine::lm::RING_CHECKPOINT_EVERY)]
+    ring_checkpoint_every: usize,
+    /// Model engine, with ring checkpoints: how far back from a prompt's end
+    /// --ring-checkpoint-every saves.
+    #[arg(long, value_name = "N", default_value_t = legion::engine::lm::RING_CHECKPOINT_SPAN)]
+    ring_checkpoint_span: usize,
+    /// Model engine, debug: log, for a prompt that resumes nothing from the finished
+    /// sequences kept for prefix caching, the tokens it shares with each and its checkpoints.
+    #[arg(long)]
+    ring_checkpoint_log: bool,
     /// Model engine, debug (#46): with --prefix-cache-interval, end a prefill step at every
     /// point as before in-step saves (one more step per point), even where the step could save
     /// the state inside it. Off by default; for comparing the two ways' bits.
@@ -1989,6 +2013,10 @@ pub async fn run(
                 kv_slot_stage_rows: e.kv_slot_stage_rows,
                 prefix_cache_states,
                 prefix_cache_interval: e.prefix_cache_interval,
+                ring_checkpoints: e.ring_checkpoints,
+                ring_checkpoint_every: e.ring_checkpoint_every,
+                ring_checkpoint_span: e.ring_checkpoint_span,
+                ring_checkpoint_log: e.ring_checkpoint_log,
                 deterministic_gather,
                 prefix_capture_cut: e.prefix_capture_cut,
                 prefix_state_digests: e.prefix_state_digests,

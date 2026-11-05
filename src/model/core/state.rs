@@ -627,25 +627,44 @@ impl KvPool {
             .collect()
     }
 
-    /// Copies of the rings' tensors in `buft` (host memory), for [`Self::copy_ring`], and
-    /// their bytes; `None` without rings.
-    pub fn ring_copies(&self, buft: BufferType) -> Result<Option<(Context, usize)>, GgmlError> {
-        let tensors = self.ring_tensors();
-        if tensors.is_empty() {
+    /// `slots` copies of a ring of each ring tensor in `buft` (host memory), for
+    /// [`Self::copy_ring`], and their bytes; `None` without rings (or slots).
+    pub fn ring_copies(
+        &self,
+        buft: BufferType,
+        slots: usize,
+    ) -> Result<Option<(Context, usize)>, GgmlError> {
+        let (Some(ring), tensors) = (self.ring, self.ring_tensors()) else {
+            return Ok(None);
+        };
+        if tensors.is_empty() || slots == 0 {
             return Ok(None);
         }
         let ctx = Context::new(tensors.len(), 0);
+        let mut bytes = 0;
         for t in &tensors {
-            ctx.new_tensor(t.ty(), &t.shape()).named(&t.name());
+            let shape = [t.shape()[0], (slots * ring.positions()) as i64];
+            let c = ctx.new_tensor(t.ty(), &shape).named(&t.name());
+            bytes += c.nbytes();
         }
         ctx.alloc_tensors(buft)?;
-        Ok(Some((ctx, tensors.iter().map(|t| t.nbytes()).sum())))
+        Ok(Some((ctx, bytes)))
     }
 
-    /// Copies ring `r`'s positions `0..n` (all of them past the ring's length) to `copies`
-    /// ([`Self::ring_copies`], `save`), or back. Synchronous; the caller orders it against
-    /// the steps that use the ring.
-    pub fn copy_ring(&self, copies: &Context, r: usize, n: usize, save: bool) {
+    /// Bytes of one ring of every ring tensor (a slot of [`Self::ring_copies`]).
+    pub fn ring_copy_bytes(&self) -> usize {
+        let Some(ring) = self.ring else {
+            return 0;
+        };
+        (self.ring_tensors().iter())
+            .map(|t| t.nb()[1] * ring.positions())
+            .sum()
+    }
+
+    /// Copies ring `r`'s positions `0..n` (all of them past the ring's length) to copy `slot`
+    /// of `copies` ([`Self::ring_copies`], `save`), or back. Synchronous; the caller orders it
+    /// against the steps that use the ring.
+    pub fn copy_ring(&self, copies: &Context, r: usize, slot: usize, n: usize, save: bool) {
         let Some(ring) = self.ring else {
             return;
         };
@@ -654,11 +673,11 @@ impl KvPool {
         for t in self.ring_tensors() {
             let c = copies.tensor(&t.name()).expect("a copy per ring tensor");
             let row = t.nb()[1];
-            let (at, len) = (r * positions * row, cells * row);
+            let (at, to, len) = (r * positions * row, slot * positions * row, cells * row);
             if save {
-                t.copy_bytes_to(at, c, at, len);
+                t.copy_bytes_to(at, c, to, len);
             } else {
-                c.copy_bytes_to(at, t, at, len);
+                c.copy_bytes_to(to, t, at, len);
             }
         }
     }

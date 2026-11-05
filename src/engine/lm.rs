@@ -67,6 +67,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 use super::queue::{Scheduling, SchedulingPolicy, Ticket, WaitQueue};
+use super::ring_checkpoints::{self, RingCheckpoints};
 use super::sampling::Sampler;
 use super::saved_states::{Kind as SaveKind, SavedStates, save_points};
 use super::stop::StopMatcher;
@@ -98,6 +99,12 @@ pub const PIPELINE_PROMPT: usize = 4096;
 /// Prompt tokens per prefill graph. Bounds the attention scores buffer
 /// (`n_kv × chunk × n_head` floats) for long prompts.
 pub const PREFILL_CHUNK: usize = 512;
+
+/// `--ring-checkpoint-every` by default.
+pub const RING_CHECKPOINT_EVERY: usize = 1024;
+
+/// `--ring-checkpoint-span` by default.
+pub const RING_CHECKPOINT_SPAN: usize = 8192;
 
 /// Tokens per forward pass (`--max-batch-tokens`) by default.
 pub const MAX_BATCH_TOKENS: usize = 1024;
@@ -878,6 +885,16 @@ pub struct LmConfig {
     /// many prompt tokens (`--prefix-cache-interval`, [`super::saved_states::save_points`]);
     /// 0: only at branch points and ends.
     pub prefix_cache_interval: usize,
+    /// With prefix caching on a model with sliding-window rings (Gemma 4): copies of rings
+    /// kept in pinned host memory for the warm sequences ([`RingCheckpoints`]); `None`:
+    /// [`ring_checkpoint_slots`]'s default.
+    pub ring_checkpoints: Option<usize>,
+    /// A ring checkpoint every this many prompt tokens (at the step that ends past it) over the
+    /// last [`Self::ring_checkpoint_span`] tokens of a prompt; 0: at prompt ends only.
+    pub ring_checkpoint_every: usize,
+    pub ring_checkpoint_span: usize,
+    /// Log why a prompt resumed nothing from the warm sequences.
+    pub ring_checkpoint_log: bool,
     /// `--deterministic`'s admission in waves ([`waves`]): an idle engine gathers requests
     /// until none arrived for this long, admits them in a fixed order, and holds later ones
     /// until it is idle again. `None`: admit requests as they arrive.
@@ -1249,6 +1266,10 @@ impl LmConfig {
             kv_slot_stage_rows: KV_SLOT_STAGE_ROWS,
             prefix_cache_states: 8,
             prefix_cache_interval: 0,
+            ring_checkpoints: None,
+            ring_checkpoint_every: RING_CHECKPOINT_EVERY,
+            ring_checkpoint_span: RING_CHECKPOINT_SPAN,
+            ring_checkpoint_log: false,
             deterministic_gather: None,
             prefix_capture_cut: false,
             prefix_state_digests: false,
@@ -2270,6 +2291,66 @@ fn ring_save_bufts(layout: &layout::Layout) -> Vec<crate::ggml::BufferType> {
 #[cfg(not(feature = "cuda"))]
 fn ring_save_bufts(layout: &layout::Layout) -> Vec<crate::ggml::BufferType> {
     layout.stages.iter().map(|_| layout.host).collect()
+}
+
+/// Free memory on the NUMA node of the first GPU's ring copies ([`ring_save_bufts`]), if known.
+#[cfg(feature = "cuda")]
+fn ring_save_free(layout: &layout::Layout) -> Option<u64> {
+    let dev = (layout.tp_devices.first().copied())
+        .or_else(|| layout.stages.first().and_then(|(d, _)| *d))
+        .and_then(cuda_index)?;
+    let node = crate::residency::cuda::caps(dev)?.host_numa_id;
+    host_tier::node_memory(u32::try_from(node).ok()?).map(|m| m.free)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn ring_save_free(_: &layout::Layout) -> Option<u64> {
+    None
+}
+
+/// Ring checkpoints kept by default per ring ([`RingCheckpoints`]), memory permitting.
+pub const RING_CHECKPOINTS_PER_RING: usize = 3;
+
+/// Checkpoint slots for `rings` rings of `bytes` each: `given` (`--ring-checkpoints`; 0, off:
+/// one per ring, the single copy at a prompt's end of [`RingCheckpoints::single`]), else
+/// [`RING_CHECKPOINTS_PER_RING`] per ring where a third of the host memory left (`free`)
+/// holds them, never fewer than one per ring (a warm sequence's copy at its last prompt's end);
+/// one per ring where the free memory is unknown (an integrated GPU's memory is its KV
+/// cache's too).
+pub fn ring_checkpoint_slots(
+    given: Option<usize>,
+    rings: usize,
+    bytes: usize,
+    free: Option<u64>,
+) -> usize {
+    if let Some(n) = given {
+        return if n == 0 { rings } else { n };
+    }
+    let fit = free.map_or(0, |f| (f / 3) as usize / bytes.max(1));
+    fit.min(RING_CHECKPOINTS_PER_RING * rings).max(rings)
+}
+
+/// A host tier backed as its sequences grow (#1131) counted the node's free memory at load,
+/// which pinned checkpoints then take: `slots` checkpoints of `bytes` each, of which those
+/// past one per ring (`rings`, the old single save) come out of the tier's `budget` blocks of
+/// `block_bytes`, never below `keep` blocks (one context besides the sequences' backing),
+/// fewer checkpoints if they do not fit. The slots and the tier's new budget.
+pub fn ring_checkpoints_in_budget(
+    slots: usize,
+    rings: usize,
+    bytes: usize,
+    budget: Option<usize>,
+    block_bytes: usize,
+    keep: usize,
+) -> (usize, Option<usize>) {
+    let Some(held) = budget else {
+        return (slots, None);
+    };
+    let spare = held.saturating_sub(keep) * block_bytes;
+    let extra = slots.saturating_sub(rings).min(spare / bytes.max(1));
+    let slots = slots.min(rings) + extra;
+    let held = held - (extra * bytes).div_ceil(block_bytes.max(1));
+    (slots, Some(held))
 }
 
 /// Under tensor parallelism each GPU gathers its share of a cache row (its KV heads) by cells
@@ -4773,13 +4854,44 @@ impl LmEngine {
         // each ring saved at the end of its prompt in pinned host memory.
         let warm_on =
             saved_slots > 0 && (ring.is_some() || slot_blocks > 0) && !hp.has_slot_state();
-        if warm_on && ring.is_some() {
-            match exec.enable_ring_saves(&ring_save_bufts(&layout)) {
-                Ok(bytes) => tracing::info!(
-                    gib = bytes as f64 / (1u64 << 30) as f64,
-                    "prefix caching: finished sequences stay warm, their rings saved at the \
-                     end of each prompt"
-                ),
+        if warm_on && let Some(r) = ring {
+            let bytes = exec.ring_copy_bytes();
+            // A host tier backed as it fills holds its budget's memory only later: the
+            // checkpoints get a third of what it leaves of the node, at most.
+            let budget = exec.kv_slot_host_budget();
+            let block_bytes = exec.kv_block_bytes();
+            let free = (!integrated).then(|| ring_save_free(&layout)).flatten();
+            let free = free.map(|f| budget.map_or(f, |b| f.min((b * block_bytes) as u64)));
+            let slots = ring_checkpoint_slots(cfg.ring_checkpoints, r.sets, bytes, free);
+            let (slots, budget) = ring_checkpoints_in_budget(
+                slots,
+                r.sets,
+                bytes,
+                budget,
+                block_bytes,
+                slot_blocks + max_seqs * LAZY_CHUNK_BLOCKS,
+            );
+            match exec.enable_ring_saves(&ring_save_bufts(&layout), slots) {
+                Ok(saved) => {
+                    if let Some(held) = budget
+                        && budget != exec.kv_slot_host_budget()
+                    {
+                        exec.set_kv_slot_host_budget(budget);
+                        if let Ok(mut s) = stats.lock() {
+                            s.kv_blocks_total = lazy_slot_cap(held, max_seqs).min(n_blocks) as u32;
+                        }
+                    }
+                    tracing::info!(
+                        gib = saved as f64 / (1u64 << 30) as f64,
+                        checkpoints = slots,
+                        every = cfg.ring_checkpoint_every,
+                        span = cfg.ring_checkpoint_span,
+                        host_tier_backed_tokens = budget.map(|b| b * KV_BLOCK),
+                        "prefix caching: finished sequences stay warm, their rings saved at \
+                         the end of each prompt and every `every` tokens over its last `span` \
+                         (context checkpoints, in pinned host memory)"
+                    )
+                }
                 Err(e) => tracing::warn!(
                     error = %e,
                     "prefix caching: no room to save the rings; a warm sequence resumes only \
@@ -4815,6 +4927,7 @@ impl LmEngine {
             None => None,
         };
         let slot_host_budget = exec.kv_slot_host_budget();
+        let ring_ckpt_slots = exec.ring_save_slots();
         let worker = Worker {
             exec,
             tokenizer: tokenizer.clone(),
@@ -4858,6 +4971,14 @@ impl LmEngine {
             warm_on,
             warm_stamp: 0,
             ring_window: window,
+            ring_ckpts: if cfg.ring_checkpoints == Some(0) {
+                RingCheckpoints::single(ring_ckpt_slots)
+            } else {
+                RingCheckpoints::new(ring_ckpt_slots)
+            },
+            ring_ckpt_every: cfg.ring_checkpoint_every,
+            ring_ckpt_span: cfg.ring_checkpoint_span,
+            ring_ckpts_log: cfg.ring_checkpoint_log,
             saved: SavedStates::new(saved_slots),
             prefix_interval: cfg.prefix_cache_interval,
             gather: cfg.deterministic_gather,
@@ -5246,6 +5367,15 @@ struct Worker {
     warm_stamp: u64,
     /// The sliding window the rings serve (with rings).
     ring_window: usize,
+    /// Saved copies of the rings for the warm sequences ([`RingCheckpoints`]); none without
+    /// rings or prefix caching; one per ring at its prompt's end with `--ring-checkpoints 0`
+    /// ([`RingCheckpoints::single`]: no interval checkpoints, no guard in [`Self::warm_match`]).
+    ring_ckpts: RingCheckpoints,
+    /// `--ring-checkpoint-every` and `--ring-checkpoint-span`.
+    ring_ckpt_every: usize,
+    ring_ckpt_span: usize,
+    /// `--ring-checkpoint-log`.
+    ring_ckpts_log: bool,
     /// MTP drafting without `--spec-fixed`: the depth policy's measured costs
     /// ([`crate::spec::depth`]).
     depth: Option<crate::spec::depth::DepthModel>,
@@ -5297,10 +5427,14 @@ struct Warm {
     tokens: Vec<u32>,
     /// Positions up to here may have been written into the ring (drafts included).
     written: usize,
-    /// The ring as it was after this many prompt tokens, saved (`Executor::save_ring`).
-    saved: Option<usize>,
+    /// Its last prompt's length (`tokens` goes on with the reply).
+    prompt: usize,
     stamp: u64,
 }
+
+/// [`Worker::warm_match`]: the warm sequence's index, the tokens resumed, and the ring
+/// checkpoint its ring comes back from (slot, length), if any.
+type WarmMatch = (usize, usize, Option<(usize, usize)>);
 
 /// An admitted sequence.
 struct Seq<'t> {
@@ -5339,8 +5473,6 @@ struct Seq<'t> {
     ring: usize,
     /// Its slot of the KV cache, with slots ([`BlockPool::slotted`]); 0 without.
     kv_slot: u32,
-    /// See [`Warm::saved`].
-    ring_saved: Option<usize>,
     /// The most drafts `draft` was asked for.
     draft_cap: usize,
     adaptive: crate::spec::adaptive::AdaptiveState,
@@ -5383,7 +5515,6 @@ struct Placed {
     resumed: usize,
     ring: usize,
     kv_slot: u32,
-    ring_saved: Option<usize>,
 }
 
 enum Placement {
@@ -5660,7 +5791,6 @@ impl Worker {
             resumed,
             ring,
             kv_slot,
-            ring_saved,
         } = match self.place(
             job.media.as_ref().map_or(&job.prompt, |(_, key)| key),
             take,
@@ -5705,7 +5835,6 @@ impl Worker {
             draft: Draft::default(),
             ring,
             kv_slot,
-            ring_saved,
             draft_cap: 0,
             adaptive: Default::default(),
             ngram: (self.spec_config.mtp_ngram > 0 && matches!(self.drafting, Drafting::Mtp(_)))
@@ -5785,6 +5914,8 @@ impl Worker {
             table = std::mem::take(&mut w.table);
             resumed = m;
             warm = Some((w, restore));
+        } else if self.warm_on && !self.warm.is_empty() && self.ring_ckpts_log {
+            self.log_warm_miss(prompt);
         }
         let fresh = take.saturating_sub(resumed / KV_BLOCK);
         // `on-demand` leaves the decoding sequences room to grow (0 under `reserve`).
@@ -5821,17 +5952,17 @@ impl Worker {
         {
             self.pool.decref(b);
         }
-        let (ring, kv_slot, ring_saved) = match warm {
+        let (ring, kv_slot) = match warm {
             Some((w, restore)) => {
-                if let Some(n) = restore {
-                    self.exec.save_ring(w.ring, n, true);
+                if let Some((ckpt, at)) = restore {
+                    self.exec.save_ring(w.ring, ckpt, at, true);
+                    self.ring_ckpts.touch(ckpt);
                 }
-                (w.ring, w.kv_slot, w.saved.filter(|&n| n <= resumed))
+                // Its checkpoints past the resume point hold other tokens.
+                self.ring_ckpts.truncate(w.ring, resumed);
+                (w.ring, w.kv_slot)
             }
-            None => {
-                let (ring, slot) = self.take_ring_and_slot();
-                (ring, slot, None)
-            }
+            None => self.take_ring_and_slot(),
         };
 
         let copied = match from {
@@ -5857,7 +5988,6 @@ impl Worker {
             resumed,
             ring,
             kv_slot,
-            ring_saved,
         })
     }
 
@@ -5892,15 +6022,17 @@ impl Worker {
 
     /// The warm sequence ([`Warm`]) to resume `prompt` from: its index, the tokens resumed
     /// (the longest common prefix, leaving one prompt token to compute) and, when its ring
-    /// comes back from its save, the save's length.
-    fn warm_match(&self, prompt: &[u32]) -> Option<(usize, usize, Option<usize>)> {
+    /// comes back from a checkpoint ([`RingCheckpoints`]), that copy's slot and length.
+    ///
+    /// A warm sequence that would keep less than half its tokens is left alone while a ring
+    /// and KV slot are free: a request that shares only a template's first tokens with a chat
+    /// (a title or follow-up request, another chat) would otherwise take the chat's cache over
+    /// and cut it down to those tokens. Not with checkpoints off (`--ring-checkpoints 0`).
+    fn warm_match(&self, prompt: &[u32]) -> Option<WarmMatch> {
         let ring = self.exec.kv_ring();
-        // The window a token at `m` reads is still in a ring written up to `end` (each
-        // position overwrites the one `positions` before it; a step's drafts run ahead).
-        let holds = |m: usize, end: usize| {
-            ring.is_none_or(|r| m + r.positions() >= end + self.ring_window + self.spec_k + 2)
-        };
-        let mut best: Option<(usize, usize, Option<usize>)> = None;
+        let holds = |m: usize, end: usize| self.ring_holds(m, end);
+        let spare = !self.ring_ckpts.is_single() && self.spare_ring_and_slot();
+        let mut best: Option<WarmMatch> = None;
         for (i, w) in self.warm.iter().enumerate() {
             let common = (w.tokens.iter().zip(prompt))
                 .take_while(|(a, b)| a == b)
@@ -5908,20 +6040,66 @@ impl Worker {
             let m = common.min(prompt.len().saturating_sub(1));
             let got = if holds(m, w.written) {
                 Some((m, None))
+            } else if ring.is_some() {
+                (self.ring_ckpts.best(w.ring, m, holds)).map(|(m, at, slot)| (m, Some((slot, at))))
             } else {
-                (w.saved)
-                    .map(|n| (m.min(n), n))
-                    .filter(|&(m, n)| holds(m, n))
-                    .map(|(m, n)| (m, Some(n)))
+                None
             };
+            // A prompt sharing little of a warm sequence (a side request sharing the chat
+            // template or a system prompt) takes a spare ring and slot rather than this
+            // sequence's cache; one that covers its whole last prompt (the same question again)
+            // resumes it.
+            let steals = spare && 2 * m < w.tokens.len() && m + 1 < w.prompt;
             if let Some((m, restore)) = got
                 && m > 0
+                && !steals
                 && best.is_none_or(|b| m > b.1)
             {
                 best = Some((i, m, restore));
             }
         }
         best
+    }
+
+    /// Whether a ring written up to position `end` still holds the window a token at `m`
+    /// reads (each position overwrites the one `positions` before it; a step's drafts run
+    /// ahead). Always without rings.
+    fn ring_holds(&self, m: usize, end: usize) -> bool {
+        (self.exec.kv_ring())
+            .is_none_or(|r| m + r.positions() >= end + self.ring_window + self.spec_k + 2)
+    }
+
+    /// Whether a new sequence would get a free ring and KV slot without evicting a warm one.
+    fn spare_ring_and_slot(&self) -> bool {
+        let rings = self.exec.kv_ring().is_some();
+        let slots = self.pool.slot_blocks() > 0;
+        !(rings && self.free_rings.is_empty()) && !(slots && self.free_kv_slots.is_empty())
+    }
+
+    /// Saves ring `ring` as it is after `at` tokens in a checkpoint slot.
+    fn save_checkpoint(&mut self, ring: usize, at: usize) {
+        if let Some(slot) = self.ring_ckpts.store(ring, at) {
+            self.exec.save_ring(ring, slot, at, false);
+        }
+    }
+
+    /// `--ring-checkpoint-log`: why `prompt` resumed nothing from the warm sequences: per warm
+    /// sequence, the tokens it shares and its ring's checkpoints.
+    fn log_warm_miss(&self, prompt: &[u32]) {
+        for w in &self.warm {
+            let common = (w.tokens.iter().zip(prompt))
+                .take_while(|(a, b)| a == b)
+                .count();
+            let ckpts: Vec<usize> = self.ring_ckpts.of(w.ring).iter().map(|c| c.0).collect();
+            tracing::info!(
+                prompt_tokens = prompt.len(),
+                warm_tokens = w.tokens.len(),
+                common,
+                written = w.written,
+                checkpoints = ?ckpts,
+                "prefix cache: no warm resume"
+            );
+        }
     }
 
     /// Drops the least recently finished warm sequence: its blocks, ring and slot are free
@@ -5964,6 +6142,7 @@ impl Worker {
 
     fn free_ring_and_slot(&mut self, ring: usize, kv_slot: u32) {
         if self.exec.kv_ring().is_some() {
+            self.ring_ckpts.clear(ring);
             self.free_rings.push(ring);
         }
         if self.pool.slot_blocks() > 0 {
@@ -6053,7 +6232,7 @@ impl Worker {
                 kv_slot: seq.kv_slot,
                 tokens: seq.history[..n].to_vec(),
                 written: seq.n_past + self.spec_k + 1,
-                saved: seq.ring_saved,
+                prompt: seq.prompt.len().min(n),
                 stamp: self.warm_stamp,
             });
         } else {
@@ -6806,6 +6985,21 @@ impl Worker {
                     copies.push((Pool::Seq, seq.slot, Pool::Saved, s.slot));
                 }
             }
+            // A checkpoint of the ring inside the prompt's last part, where the next prompt of
+            // a chat that rewrites its last turns leaves this one ([`RingCheckpoints`]).
+            if !self.ring_ckpts.is_empty()
+                && !self.ring_ckpts.is_single()
+                && seq.media.is_none()
+                && ring_checkpoints::due(
+                    seq.n_past,
+                    seq.prompt.len(),
+                    self.ring_ckpts.latest(seq.ring),
+                    self.ring_ckpt_every,
+                    self.ring_ckpt_span,
+                )
+            {
+                self.save_checkpoint(seq.ring, seq.n_past);
+            }
             if seq.n_past < seq.prompt.len() {
                 continue;
             }
@@ -6814,10 +7008,9 @@ impl Worker {
             }
             // The ring at the end of the prompt, for the next turn of a chat (which resumes
             // there: the reply's reasoning is not in its prompt) once the reply has gone
-            // past what the ring holds ([`Warm::saved`]).
-            if self.exec.ring_saves() {
-                self.exec.save_ring(seq.ring, seq.n_past, false);
-                seq.ring_saved = Some(seq.n_past);
+            // past what the ring holds.
+            if !self.ring_ckpts.is_empty() {
+                self.save_checkpoint(seq.ring, seq.n_past);
             }
             let (t, mut row) = rows.next().expect("a logits row per finished prompt");
             if seq.resuming {
