@@ -201,7 +201,8 @@ pub(super) fn start(
         super::DeviceChoice::Cuda => t.transport,
     };
     let data = std::mem::take(&mut mesh.data);
-    let comm = tp_net::Comm::with_transport(t.rank, data, t.timeout, transport).map_err(device)?;
+    let comm =
+        tp_net::Comm::with_rails(t.rank, data, t.timeout, transport, t.rails).map_err(device)?;
     comm.set_collectives(t.wire, t.seq_par);
     comm.set_overlap(t.overlap);
     tracing::info!(

@@ -61,15 +61,32 @@ fn next_job<T>(rx: &mpsc::Receiver<T>) -> Option<T> {
 /// How a peer's partials travel.
 enum PeerLink {
     Tcp,
-    Rdma(Arc<Endpoint>),
+    /// RDMA, with a second rail (`--tp-rails 2`) or not.
+    Rdma(Arc<Endpoint>, Option<Arc<Endpoint>>),
 }
 
 /// An RDMA peer's view of this rank's pinned buffers: this rank's local key and the peer's
-/// region (where this rank writes), made by [`Comm::register_region`].
+/// region (where this rank writes), made by [`Comm::register_region`]; the same on the second
+/// rail (the same memory registered with its device).
 #[derive(Clone, Copy)]
 struct PeerRegion {
     lkey: u32,
     remote: RemoteRegion,
+    rail: Option<(u32, RemoteRegion)>,
+}
+
+/// With a second rail: exchanges of at least this many bytes to one peer go in [`RAIL_CHUNK`]
+/// pieces over both rails (smaller ones, decode steps, as one write on the first).
+const RAIL_MIN: usize = 1 << 20;
+/// The piece of a split exchange: each rail takes the next piece when one of its writes
+/// completes, so the faster rail carries more.
+const RAIL_CHUNK: usize = 1 << 20;
+/// Writes in flight per rail.
+const RAIL_DEPTH: usize = 4;
+
+/// Whether an exchange of `len` bytes to a peer goes over both rails.
+fn split_rails(len: usize, rails: bool) -> bool {
+    rails && len >= RAIL_MIN
 }
 
 /// An RDMA write's keys: the local key of the source, the peer's address and key.
@@ -85,7 +102,7 @@ enum SendJob {
     /// These bytes.
     Owned { seq: u32, data: Arc<Vec<u8>> },
     /// `len` bytes at host address `ptr`, once the GPU raised the flag at `ready` to `seq`; an
-    /// RDMA peer's write goes to `rdma`.
+    /// RDMA peer's write goes to `rdma` (and, split, to `rail` on the second rail).
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     Pinned {
         seq: u32,
@@ -93,6 +110,7 @@ enum SendJob {
         len: usize,
         ready: usize,
         rdma: Option<RdmaDst>,
+        rail: Option<RdmaDst>,
     },
 }
 
@@ -479,8 +497,16 @@ const RDMA_PINNED_ONLY: &str = "the RDMA transport carries a GPU's all-reduces o
                                 --tp-transport tcp for a CPU run";
 
 /// A writer to an RDMA peer: each partial as one write with immediate (its sequence number)
-/// into the peer's receive buffer, waited for until it completed.
-fn rdma_writer(ep: Arc<Endpoint>, rx: mpsc::Receiver<SendJob>, sh: Arc<Shared>, peer: usize) {
+/// into the peer's receive buffer, waited for until it completed. With a second rail
+/// (`rail`), a partial of at least [`RAIL_MIN`] bytes goes in pieces over both
+/// ([`send_split`]).
+fn rdma_writer(
+    ep: Arc<Endpoint>,
+    rail: Option<Arc<Endpoint>>,
+    rx: mpsc::Receiver<SendJob>,
+    sh: Arc<Shared>,
+    peer: usize,
+) {
     while let Some(job) = next_job(&rx) {
         if sh.failed() {
             return;
@@ -491,6 +517,7 @@ fn rdma_writer(ep: Arc<Endpoint>, rx: mpsc::Receiver<SendJob>, sh: Arc<Shared>, 
             len,
             ready,
             rdma: Some(dst),
+            rail: rail_dst,
         } = job
         else {
             sh.fail(RDMA_PINNED_ONLY.into());
@@ -501,6 +528,15 @@ fn rdma_writer(ep: Arc<Endpoint>, rx: mpsc::Receiver<SendJob>, sh: Arc<Shared>, 
             return;
         }
         sh.timing.report(seq, true);
+        if let (Some(r), Some(rd)) = (&rail, rail_dst)
+            && split_rails(len, true)
+        {
+            if !send_split([&ep, r], [dst, rd], (ptr, len), seq, &sh, peer) {
+                return;
+            }
+            sh.sent[peer].store(seq, Ordering::Release);
+            continue;
+        }
         if let Err(e) = ep.post_write((ptr, len, dst.lkey), (dst.raddr, dst.rkey), seq) {
             sh.fail(format!("sending all-reduce {seq} to rank {peer}: {e}"));
             return;
@@ -519,9 +555,64 @@ fn rdma_writer(ep: Arc<Endpoint>, rx: mpsc::Receiver<SendJob>, sh: Arc<Shared>, 
     }
 }
 
+/// Sends the `len` bytes at host address `ptr` to `peer` in [`RAIL_CHUNK`] pieces over both
+/// rails (`eps`, each with its keys in `dsts`), each a write with immediate `seq` at the same
+/// offset of the peer's buffer: up to [`RAIL_DEPTH`] writes in flight per rail, the next piece
+/// to the rail whose write completed, so each rail carries what it can. Returns once every
+/// piece completed; false on failure (recorded).
+fn send_split(
+    eps: [&Endpoint; 2],
+    dsts: [RdmaDst; 2],
+    (ptr, len): (usize, usize),
+    seq: u32,
+    sh: &Shared,
+    peer: usize,
+) -> bool {
+    let pieces = len.div_ceil(RAIL_CHUNK);
+    let (mut next, mut out) = (0usize, [0usize; 2]);
+    let what = || format!("all-reduce {seq} was not delivered to rank {peer}");
+    sh.poll_until(
+        || {
+            for q in 0..2 {
+                while let Some(done) = eps[q].poll_send()? {
+                    if done != seq || out[q] == 0 {
+                        return Err(format!(
+                            "rank {peer}: all-reduce {done} completed on rail {q}, this rank \
+                             sent {seq}"
+                        ));
+                    }
+                    out[q] -= 1;
+                }
+                while out[q] < RAIL_DEPTH && next < pieces {
+                    let off = next * RAIL_CHUNK;
+                    let n = RAIL_CHUNK.min(len - off);
+                    let d = dsts[q];
+                    eps[q]
+                        .post_write((ptr + off, n, d.lkey), (d.raddr + off as u64, d.rkey), seq)
+                        .map_err(|e| format!("sending all-reduce {seq} to rank {peer}: {e}"))?;
+                    out[q] += 1;
+                    next += 1;
+                }
+            }
+            Ok((next == pieces && out == [0, 0]).then_some(()))
+        },
+        what,
+    )
+    .is_some()
+}
+
 /// A reader of an RDMA peer: waits for the write with immediate `seq` (the data is in the
-/// receive buffer then) and raises the GPU's flag.
-fn rdma_reader(ep: Arc<Endpoint>, rx: mpsc::Receiver<RecvJob>, sh: Arc<Shared>, peer: usize) {
+/// receive buffer then) and raises the GPU's flag. With a second rail, for the writes of
+/// `seq` on both rails ([`recv_rails`]).
+fn rdma_reader(
+    ep: Arc<Endpoint>,
+    rail: Option<Arc<Endpoint>>,
+    rx: mpsc::Receiver<RecvJob>,
+    sh: Arc<Shared>,
+    peer: usize,
+) {
+    // With two rails: pieces of later exchanges seen while this one's were still coming.
+    let mut early = Vec::new();
     while let Some(job) = next_job(&rx) {
         if sh.failed() {
             return;
@@ -530,16 +621,22 @@ fn rdma_reader(ep: Arc<Endpoint>, rx: mpsc::Receiver<RecvJob>, sh: Arc<Shared>, 
             sh.fail(RDMA_PINNED_ONLY.into());
             return;
         };
-        let what = || format!("no all-reduce {seq} from rank {peer} in time");
-        let Some((got_seq, got_len)) = sh.poll_until(|| ep.poll_recv(), what) else {
-            return;
-        };
-        if got_seq != seq || got_len != len {
-            sh.fail(format!(
-                "rank {peer} sent all-reduce {got_seq} of {got_len} bytes, this rank waits for \
-                 {seq} of {len}: the ranks are out of step"
-            ));
-            return;
+        if let Some(r) = &rail {
+            if !recv_rails([&ep, r], (seq, len), &mut early, &sh, peer) {
+                return;
+            }
+        } else {
+            let what = || format!("no all-reduce {seq} from rank {peer} in time");
+            let Some((got_seq, got_len)) = sh.poll_until(|| ep.poll_recv(), what) else {
+                return;
+            };
+            if got_seq != seq || got_len != len {
+                sh.fail(format!(
+                    "rank {peer} sent all-reduce {got_seq} of {got_len} bytes, this rank waits \
+                     for {seq} of {len}: the ranks are out of step"
+                ));
+                return;
+            }
         }
         sh.timing.report(seq, false);
         // SAFETY: a u32 flag in pinned memory (see `Shared::fail`).
@@ -547,14 +644,68 @@ fn rdma_reader(ep: Arc<Endpoint>, rx: mpsc::Receiver<RecvJob>, sh: Arc<Shared>, 
     }
 }
 
+/// Waits until the writes with immediate `seq` on both rails (`eps`) add up to `len` bytes:
+/// one write on the first rail, or [`send_split`]'s pieces. The rails complete out of order,
+/// so a piece of a later exchange can come first; it waits in `early` for its own. False on
+/// failure (recorded).
+fn recv_rails(
+    eps: [&Endpoint; 2],
+    (seq, len): (u32, usize),
+    early: &mut Vec<(u32, usize)>,
+    sh: &Shared,
+    peer: usize,
+) -> bool {
+    let mut got = 0usize;
+    early.retain(|&(s, b)| {
+        let mine = s == seq;
+        if mine {
+            got += b;
+        }
+        !mine
+    });
+    let what = || format!("no all-reduce {seq} from rank {peer} in time");
+    let done = got >= len
+        || sh
+            .poll_until(
+                || {
+                    for ep in eps {
+                        if let Some((s, b)) = ep.poll_recv()? {
+                            if s == seq {
+                                got += b;
+                            } else if reached(s, seq) {
+                                early.push((s, b));
+                            } else {
+                                return Err(format!(
+                                    "rank {peer} sent all-reduce {s}, this rank waits for {seq}: \
+                                     the ranks are out of step"
+                                ));
+                            }
+                        }
+                    }
+                    Ok((got >= len).then_some(()))
+                },
+                what,
+            )
+            .is_some();
+    if done && got != len {
+        sh.fail(format!(
+            "rank {peer} sent {got} bytes of all-reduce {seq}, this rank waits for {len}: the \
+             ranks are out of step"
+        ));
+        return false;
+    }
+    done
+}
+
 /// Picks how the partials travel to `peer` over its data connection `s`: both ends swap their
 /// offers (whether they have an RDMA device on the connection's addresses, and its queue pair;
-/// none for `Tcp`) and take RDMA when both do.
+/// none for `Tcp`) and take RDMA when both do. With `rails` 2, an RDMA link also gets a second
+/// rail when both ends have one ([`add_rail`]).
 fn choose_link(
     s: &TcpStream,
     rank: usize,
     peer: usize,
-    transport: Transport,
+    (transport, rails): (Transport, usize),
     timeout: Duration,
 ) -> std::io::Result<PeerLink> {
     let fail = |e: String| super::invalid(format!("rank {peer}: {e}"));
@@ -574,19 +725,71 @@ fn choose_link(
     let old = s.read_timeout()?;
     s.set_read_timeout(Some(timeout))?;
     let far = rdma::swap_offers(&mut s, &mine).map_err(fail)?;
-    s.set_read_timeout(old)?;
-    match ep {
+    let link = match ep {
         Some(ep) if far.rdma => {
             ep.connect(&far).map_err(fail)?;
-            Ok(PeerLink::Rdma(Arc::new(ep)))
+            let rail = add_rail(&mut s, &ep, rank, peer, rails).map_err(fail)?;
+            Ok(PeerLink::Rdma(Arc::new(ep), rail.map(Arc::new)))
         }
         _ if transport == Transport::Rdma => Err(fail(format!(
             "--tp-transport rdma, but {} has no RDMA device on the data connection's address",
             if mine.rdma { "the peer" } else { "this rank" }
         ))),
         _ => Ok(PeerLink::Tcp),
-    }
+    };
+    s.set_read_timeout(old)?;
+    link
 }
+
+/// The second rail of the RDMA link `ep` to `peer` over its data connection `s`: both ends
+/// swap whether they want one (`rails` 2), then, when both do, their offers for a queue pair
+/// on their NIC port's second RDMA device ([`Endpoint::open_rail`]; none without one), and
+/// take it when both have one and connected it. `None`: the link has one rail.
+fn add_rail(
+    s: &mut TcpStream,
+    ep: &Endpoint,
+    rank: usize,
+    peer: usize,
+    rails: usize,
+) -> Result<Option<Endpoint>, String> {
+    let swap = |s: &mut TcpStream, yes: bool| -> Result<bool, String> {
+        let io = |e: std::io::Error| format!("second rail: {e}");
+        s.write_all(&[yes as u8]).map_err(io)?;
+        let mut b = [0u8; 1];
+        s.read_exact(&mut b).map_err(io)?;
+        Ok(yes && b[0] == 1)
+    };
+    if !swap(s, rails >= 2)? {
+        return Ok(None);
+    }
+    let rail = ep.open_rail(rank).unwrap_or_else(|e| {
+        tracing::warn!(peer, error = %e, "tensor parallel: no second RDMA rail");
+        None
+    });
+    let mine = rail.as_ref().map(Endpoint::offer).unwrap_or_default();
+    let far = rdma::swap_offers(s, &mine)?;
+    let rail = match rail {
+        Some(r) if far.rdma => match r.connect(&far) {
+            Ok(()) => Some(r),
+            Err(e) => {
+                tracing::warn!(peer, error = %e, "tensor parallel: no second RDMA rail");
+                None
+            }
+        },
+        _ => None,
+    };
+    if !swap(s, rail.is_some())? {
+        tracing::warn!(
+            peer,
+            "tensor parallel: --tp-rails 2, but a rank has no second rail"
+        );
+        return Ok(None);
+    }
+    Ok(rail)
+}
+
+/// An RDMA peer: its endpoint, its second rail's and its data connection.
+type RdmaPeer = (Arc<Endpoint>, Option<Arc<Endpoint>>, Mutex<TcpStream>);
 
 /// A peer's writer and reader queues.
 type Queues = (mpsc::Sender<SendJob>, mpsc::Sender<RecvJob>);
@@ -606,9 +809,10 @@ pub struct Comm {
     readers: Mutex<Vec<JoinHandle<()>>>,
     /// Disconnects once every writer thread ended (each holds a sender); `None` once shut down.
     writers_done: Mutex<Option<mpsc::Receiver<()>>>,
-    /// Per rank: the RDMA peer's endpoint and data connection (which then carries only the
-    /// regions of [`Comm::register_region`]); `None` for a TCP peer.
-    rdma: Vec<Option<(Arc<Endpoint>, Mutex<TcpStream>)>>,
+    /// Per rank: the RDMA peer's endpoint, its second rail's (`--tp-rails 2`) and the data
+    /// connection (which then carries only the regions of [`Comm::register_region`]); `None`
+    /// for a TCP peer.
+    rdma: Vec<Option<RdmaPeer>>,
     /// Per rank: the RDMA peer's region for this rank's writes (the latest registered).
     regions: Mutex<Vec<Option<PeerRegion>>>,
     /// `--tp-wire`: the smallest exchange (in values of the whole tensor) that travels in BF16
@@ -646,6 +850,20 @@ impl Comm {
         timeout: Duration,
         transport: Transport,
     ) -> std::io::Result<Arc<Self>> {
+        Self::with_rails(rank, data, timeout, transport, 1)
+    }
+
+    /// [`Comm::with_transport`] with `rails` RDMA rails per peer (`--tp-rails`, 1 or 2): with 2,
+    /// each RDMA link also takes its NIC port's second RDMA device when both ends have one, and
+    /// exchanges of at least 1 MiB go in pieces over both (the same bytes: the results do not
+    /// change). Every rank must pass the same.
+    pub fn with_rails(
+        rank: usize,
+        data: Vec<Option<TcpStream>>,
+        timeout: Duration,
+        transport: Transport,
+        rails: usize,
+    ) -> std::io::Result<Arc<Self>> {
         let n = data.len();
         let shared = Arc::new(Shared {
             failed: AtomicBool::new(false),
@@ -670,7 +888,7 @@ impl Comm {
             if peer == rank {
                 return Err(super::invalid("a data connection to this rank itself"));
             }
-            let link = choose_link(&s, rank, peer, transport, timeout)?;
+            let link = choose_link(&s, rank, peer, (transport, rails), timeout)?;
             let (wtx, wrx) = mpsc::channel();
             let (rtx, rrx) = mpsc::channel();
             let sh = shared.clone();
@@ -688,14 +906,15 @@ impl Comm {
                     readers.push(r.spawn(move || reader(rs, rrx, sh2, peer))?);
                     links.push(None);
                 }
-                PeerLink::Rdma(ep) => {
+                PeerLink::Rdma(ep, rail) => {
                     let (we, re) = (ep.clone(), ep.clone());
+                    let (wr, rr) = (rail.clone(), rail.clone());
                     writers.push(w.spawn(move || {
                         let _done = done;
-                        rdma_writer(we, wrx, sh, peer)
+                        rdma_writer(we, wr, wrx, sh, peer)
                     })?);
-                    readers.push(r.spawn(move || rdma_reader(re, rrx, sh2, peer))?);
-                    links.push(Some((ep.clone(), Mutex::new(s.try_clone()?))));
+                    readers.push(r.spawn(move || rdma_reader(re, rr, rrx, sh2, peer))?);
+                    links.push(Some((ep.clone(), rail.clone(), Mutex::new(s.try_clone()?))));
                 }
             }
             streams.push(s);
@@ -776,12 +995,18 @@ impl Comm {
         }
     }
 
-    /// How the partials travel to each peer, e.g. `rank 1: rdma (rocep1s0f1)`.
+    /// How the partials travel to each peer, e.g. `rank 1: rdma (rocep1s0f1)`, or with a second
+    /// rail `rank 1: rdma (rocep1s0f1 + roceP2p1s0f1)`.
     pub fn transports(&self) -> String {
         (0..self.n)
             .filter(|&p| p != self.rank)
             .map(|p| match &self.rdma[p] {
-                Some((ep, _)) => format!("rank {p}: rdma ({})", ep.device_name()),
+                Some((ep, None, _)) => format!("rank {p}: rdma ({})", ep.device_name()),
+                Some((ep, Some(r), _)) => format!(
+                    "rank {p}: rdma ({} + {})",
+                    ep.device_name(),
+                    r.device_name()
+                ),
                 None => format!("rank {p}: tcp"),
             })
             .collect::<Vec<_>>()
@@ -1117,39 +1342,52 @@ impl Comm {
         seq: u32,
     ) -> Result<Vec<rdma::Mr>, String> {
         let mut mrs = Vec::new();
-        let mut keys: Vec<Option<u32>> = vec![None; self.n];
+        let mut keys: Vec<Option<(u32, Option<u32>)>> = vec![None; self.n];
         for (peer, link) in self.rdma.iter().enumerate() {
-            let Some((ep, s)) = link else { continue };
-            let mr = ep.register(host, len)?;
-            let mine = RemoteRegion {
-                addr: host as u64,
-                rkey: mr.rkey(),
-                len: len as u64,
-            };
-            keys[peer] = Some(mr.lkey());
-            mrs.push(mr);
+            let Some((ep, rail, s)) = link else { continue };
             let mut s = s.lock().expect("stream lock");
-            s.write_all(&mine.encode(seq))
-                .map_err(|e| format!("sending a memory region to rank {peer}: {e}"))?;
+            let mut lkeys = Vec::new();
+            for e in std::iter::once(ep).chain(rail) {
+                let mr = e.register(host, len)?;
+                let mine = RemoteRegion {
+                    addr: host as u64,
+                    rkey: mr.rkey(),
+                    len: len as u64,
+                };
+                lkeys.push(mr.lkey());
+                mrs.push(mr);
+                s.write_all(&mine.encode(seq))
+                    .map_err(|e| format!("sending a memory region to rank {peer}: {e}"))?;
+            }
+            keys[peer] = Some((lkeys[0], lkeys.get(1).copied()));
         }
         let mut regions = self.regions.lock().expect("regions lock");
         for (peer, link) in self.rdma.iter().enumerate() {
-            let (Some((_, s)), Some(lkey)) = (link, keys[peer]) else {
+            let (Some((_, _, s)), Some((lkey, rail_lkey))) = (link, keys[peer]) else {
                 continue;
             };
-            let mut b = [0u8; 28];
             let mut s = s.lock().expect("stream lock");
-            s.set_read_timeout(Some(self.shared.timeout))
-                .and_then(|_| s.read_exact(&mut b))
-                .map_err(|e| format!("rank {peer}'s memory region: {e}"))?;
-            let remote = RemoteRegion::decode(&b, seq).map_err(|e| format!("rank {peer}: {e}"))?;
-            if remote.len != len as u64 {
-                return Err(format!(
-                    "rank {peer}'s buffers are {} bytes, this rank's {len}: the ranks differ",
-                    remote.len
-                ));
-            }
-            regions[peer] = Some(PeerRegion { lkey, remote });
+            let mut read = || {
+                let mut b = [0u8; 28];
+                s.set_read_timeout(Some(self.shared.timeout))
+                    .and_then(|_| s.read_exact(&mut b))
+                    .map_err(|e| format!("rank {peer}'s memory region: {e}"))?;
+                let remote =
+                    RemoteRegion::decode(&b, seq).map_err(|e| format!("rank {peer}: {e}"))?;
+                if remote.len != len as u64 {
+                    return Err(format!(
+                        "rank {peer}'s buffers are {} bytes, this rank's {len}: the ranks differ",
+                        remote.len
+                    ));
+                }
+                Ok(remote)
+            };
+            let remote = read()?;
+            let rail = match rail_lkey {
+                Some(l) => Some((l, read()?)),
+                None => None,
+            };
+            regions[peer] = Some(PeerRegion { lkey, remote, rail });
         }
         Ok(mrs)
     }
@@ -1198,6 +1436,13 @@ impl Comm {
                         raddr: r.remote.addr + remote_off as u64,
                         rkey: r.remote.rkey,
                     }),
+                    rail: regions[peer]
+                        .and_then(|r| r.rail)
+                        .map(|(lkey, remote)| RdmaDst {
+                            lkey,
+                            raddr: remote.addr + remote_off as u64,
+                            rkey: remote.rkey,
+                        }),
                 }
             },
             |peer| {

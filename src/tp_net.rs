@@ -76,6 +76,9 @@ pub struct TpNetConfig {
     pub timeout: Duration,
     /// How the partials travel.
     pub transport: Transport,
+    /// RDMA rails per peer (`--tp-rails`): 2 also takes each NIC port's second RDMA device
+    /// when both ends have one, and splits exchanges of at least 1 MiB over both; 0 or 1: one.
+    pub rails: usize,
     /// Log where the steps' time went every this many steps (0: never).
     pub profile: usize,
     /// The type the partials travel in (`--tp-wire`).
