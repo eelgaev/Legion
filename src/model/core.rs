@@ -3070,7 +3070,8 @@ impl Model {
             // Prompt groups: the conv normalizes its q and k heads too (`delta_prep`'s bits), so
             // they are read and written once less; the op then computes g and beta only.
             let prep_eps = hp.rms_eps / head_k as f32;
-            let conv_norm = chain.is_none() && fused::conv_norm_fits(heads, ng, sh.verify);
+            let conv_norm =
+                chain.is_none() && nt > 1 && fused::conv_norm_fits(heads, ng, sh.verify);
             let (conv, history) = if sh.verify {
                 // The whole window [history | chunk] for the replay, from the same op.
                 let keep = conv_w.ne()[0] - 1 + nt;
