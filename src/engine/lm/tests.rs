@@ -951,3 +951,41 @@ fn slot_prompt_copies_never_below_the_first_measurement() {
         0
     );
 }
+
+#[test]
+fn ring_checkpoint_slots_by_free_memory() {
+    let gib = 1usize << 30;
+    // 16 rings of 1 GiB: 3 per ring where a third of the free memory holds them.
+    assert_eq!(ring_checkpoint_slots(None, 16, gib, Some(300 << 30)), 48);
+    assert_eq!(ring_checkpoint_slots(None, 16, gib, Some(90 << 30)), 30);
+    // Never fewer than one per ring, nor more without knowing the free memory.
+    assert_eq!(ring_checkpoint_slots(None, 16, gib, Some(1 << 30)), 16);
+    assert_eq!(ring_checkpoint_slots(None, 16, gib, None), 16);
+    assert_eq!(ring_checkpoint_slots(Some(5), 16, gib, None), 5);
+}
+
+#[test]
+fn ring_checkpoints_come_out_of_a_lazy_host_tier() {
+    let gib = 1usize << 30;
+    let mib = 1usize << 20;
+    // No lazily backed tier: as sized.
+    assert_eq!(
+        ring_checkpoints_in_budget(48, 16, gib, None, mib, 0),
+        (48, None)
+    );
+    // 32 checkpoints past one per ring take 32 GiB of a 200 GiB budget.
+    assert_eq!(
+        ring_checkpoints_in_budget(48, 16, gib, Some(200 * 1024), mib, 1024),
+        (48, Some(168 * 1024))
+    );
+    // The budget keeps `keep` blocks: only 4 more checkpoints fit.
+    assert_eq!(
+        ring_checkpoints_in_budget(48, 16, gib, Some(10 * 1024), mib, 6 * 1024),
+        (20, Some(6 * 1024))
+    );
+    // One per ring was there before: never fewer.
+    assert_eq!(
+        ring_checkpoints_in_budget(48, 16, gib, Some(1024), mib, 2048),
+        (16, Some(1024))
+    );
+}

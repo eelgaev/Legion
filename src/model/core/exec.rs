@@ -480,6 +480,8 @@ pub struct Executor {
     kv_slot_host_budget: Option<usize>,
     /// See [`Self::enable_ring_saves`]: per stage, its rings' copies (empty: none).
     ring_saves: Vec<Option<crate::ggml::Context>>,
+    /// Copies each stage's `ring_saves` hold.
+    ring_save_slots: usize,
     /// Expert-cache work deferred to run beside a pass that reads other layers (see
     /// [`Self::set_after_overlap`]): the last target step's (its token count), run while the
     /// next MTP pass computes; the last MTP pass's, run while the next target step computes.
@@ -756,6 +758,7 @@ impl Executor {
             kv_slot_blocks: 0,
             kv_slot_host_budget: None,
             ring_saves: Vec::new(),
+            ring_save_slots: 0,
             deferred_target: None,
             deferred_tail: None,
             deferred_mtp: None,
@@ -876,22 +879,30 @@ impl Executor {
         names.join("+")
     }
 
-    /// Room to save each ring ([`Self::save_ring`]): per stage, a copy of its rings in
-    /// `bufts[stage]` (pinned host memory). Returns the bytes taken. After the last
-    /// [`Self::resize_kv`].
+    /// Room to save `slots` copies of rings ([`Self::save_ring`]): per stage, that many
+    /// rings' worth of its ring layers in `bufts[stage]` (pinned host memory). Returns the
+    /// bytes taken. After the last [`Self::resize_kv`].
     pub fn enable_ring_saves(
         &mut self,
         bufts: &[crate::ggml::BufferType],
+        slots: usize,
     ) -> Result<usize, ModelError> {
-        self.tp_enable_ring_saves()?;
+        self.tp_enable_ring_saves(slots)?;
         let (mut saves, mut bytes) = (Vec::new(), 0);
         for (s, &buft) in self.stages.iter().zip(bufts) {
-            let c = s.kv.ring_copies(buft)?;
+            let c = s.kv.ring_copies(buft, slots)?;
             bytes += c.as_ref().map_or(0, |c| c.1);
             saves.push(c.map(|c| c.0));
         }
         self.ring_saves = saves;
+        self.ring_save_slots = slots;
         Ok(bytes)
+    }
+
+    /// Bytes of one ring's copy over every stage ([`Self::enable_ring_saves`] takes this per
+    /// slot); 0 without rings.
+    pub fn ring_copy_bytes(&self) -> usize {
+        self.stages.iter().map(|s| s.kv.ring_copy_bytes()).sum()
     }
 
     /// Whether every GPU works on every token (GLM's parallel steps, [`Self::new_glm_par`]).
@@ -899,24 +910,38 @@ impl Executor {
         self.par.every_step
     }
 
-    /// Whether [`Self::save_ring`] has room.
-    pub fn ring_saves(&self) -> bool {
-        !self.ring_saves.is_empty()
+    /// The copies [`Self::save_ring`] has room for (0: none).
+    pub fn ring_save_slots(&self) -> usize {
+        if self.ring_saves.is_empty() {
+            0
+        } else {
+            self.ring_save_slots
+        }
     }
 
-    /// Saves ring `r`'s positions `0..n` (all of them past its length) in its copy, or
-    /// (`restore`) puts the copy back. Between steps: the ring's sequence runs none meanwhile.
-    pub fn save_ring(&mut self, r: usize, n: usize, restore: bool) {
-        self.tp_save_ring(r, n, restore);
+    /// Saves ring `r`'s positions `0..n` (all of them past its length) in copy `slot`, or
+    /// (`restore`) puts that copy back into ring `r`. Between steps: the ring's sequence runs
+    /// none meanwhile.
+    pub fn save_ring(&mut self, r: usize, slot: usize, n: usize, restore: bool) {
+        let t0 = std::time::Instant::now();
+        self.tp_save_ring(r, slot, n, restore);
         self.wait_commit();
         for s in &mut self.stages {
             s.backend.synchronize();
         }
         for (s, copies) in self.stages.iter().zip(&self.ring_saves) {
             if let Some(c) = copies {
-                s.kv.copy_ring(c, r, n, !restore);
+                s.kv.copy_ring(c, r, slot, n, !restore);
             }
         }
+        tracing::debug!(
+            ring = r,
+            slot,
+            n,
+            restore,
+            ms = t0.elapsed().as_secs_f64() * 1e3,
+            "ring copy"
+        );
     }
 
     /// The sliding-window layers' rings, if the pools have them.

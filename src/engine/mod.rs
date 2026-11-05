@@ -9,6 +9,7 @@ pub mod mock;
 pub mod queue;
 pub mod reasoning;
 pub mod replicas;
+pub mod ring_checkpoints;
 pub mod sampling;
 pub mod sampling_defaults;
 pub mod saved_states;

@@ -401,10 +401,11 @@ impl Executor {
     }
 
     /// The other ranks' mirror of [`Self::save_ring`].
-    pub(super) fn tp_save_ring(&mut self, r: usize, n: usize, restore: bool) {
+    pub(super) fn tp_save_ring(&mut self, r: usize, slot: usize, n: usize, restore: bool) {
         if let Some(lead) = self.tp.as_mut() {
             lead.mirror(&Request::SaveRing {
                 ring: r as u32,
+                slot: slot as u32,
                 n: n as u32,
                 restore,
             });
@@ -432,9 +433,13 @@ impl Executor {
     }
 
     /// The other ranks' [`Self::enable_ring_saves`], before this rank's: all of them or none.
-    pub(super) fn tp_enable_ring_saves(&mut self) -> Result<(), ModelError> {
+    pub(super) fn tp_enable_ring_saves(&mut self, slots: usize) -> Result<(), ModelError> {
         match self.tp.as_mut() {
-            Some(lead) => lead.call(&Request::EnableRingSaves).map(|_| ()),
+            Some(lead) => lead
+                .call(&Request::EnableRingSaves {
+                    slots: slots as u32,
+                })
+                .map(|_| ()),
             None => Ok(()),
         }
     }

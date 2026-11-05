@@ -70,10 +70,11 @@ fn requests_round_trip() {
         },
         Request::SaveRing {
             ring: 4,
+            slot: 9,
             n: 1000,
             restore: true,
         },
-        Request::EnableRingSaves,
+        Request::EnableRingSaves { slots: 48 },
         Request::TpMtp {
             groups: match step() {
                 Request::Step { groups, .. } => groups,

@@ -110,14 +110,18 @@ pub enum Request {
         taper: u32,
         gather_budget: u64,
     },
-    /// Save ring `ring`'s first `n` positions, or (`restore`) put the saved copy back.
+    /// Save ring `ring`'s first `n` positions in copy `slot`, or (`restore`) put that copy
+    /// back.
     SaveRing {
         ring: u32,
+        slot: u32,
         n: u32,
         restore: bool,
     },
-    /// Make room to save the rings.
-    EnableRingSaves,
+    /// Make room to save `slots` copies of rings.
+    EnableRingSaves {
+        slots: u32,
+    },
     /// The same MTP pass as rank 0's (the head's attention and FFN are split like the
     /// target's, so its all-reduces line up on every rank): its groups, the gather budget that
     /// cuts it into passes, and the residual rows it reads (`[tokens][width]`).
@@ -344,13 +348,22 @@ impl Request {
                 head.extend_from_slice(&gather_budget.to_le_bytes());
                 K_TP_STEP
             }
-            Request::SaveRing { ring, n, restore } => {
+            Request::SaveRing {
+                ring,
+                slot,
+                n,
+                restore,
+            } => {
                 put_u32(&mut head, ring);
+                put_u32(&mut head, slot);
                 put_u32(&mut head, n);
                 head.push(u8::from(restore));
                 K_SAVE_RING
             }
-            Request::EnableRingSaves => K_RING_SAVES,
+            Request::EnableRingSaves { slots } => {
+                put_u32(&mut head, slots);
+                K_RING_SAVES
+            }
             Request::TpMtp {
                 groups,
                 gather_budget,
@@ -459,10 +472,11 @@ impl Request {
             },
             K_SAVE_RING => Request::SaveRing {
                 ring: r.u32()?,
+                slot: r.u32()?,
                 n: r.u32()?,
                 restore: r.u8()? != 0,
             },
-            K_RING_SAVES => Request::EnableRingSaves,
+            K_RING_SAVES => Request::EnableRingSaves { slots: r.u32()? },
             K_TP_MTP => Request::TpMtp {
                 groups: get_groups(&mut r)?,
                 gather_budget: r.u64()?,

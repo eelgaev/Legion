@@ -238,8 +238,8 @@ unsafe extern "C" fn tier_alloc(
         memset_tensor: Some(tier_memset),
         set_tensor: Some(tier_set),
         get_tensor: Some(tier_get),
-        set_tensor_2d: None,
-        get_tensor_2d: None,
+        set_tensor_2d: Some(tier_set_2d),
+        get_tensor_2d: Some(tier_get_2d),
         cpy_tensor: None,
         clear: Some(tier_clear),
         reset: None,
@@ -630,6 +630,60 @@ unsafe extern "C" fn tier_get(
             data,
             ((*t).data as *const u8).add(off) as *const c_void,
             n,
+            CUDA_MEMCPY_DEFAULT,
+        );
+    }
+}
+
+/// `n_copies` rows of `size` bytes, `stride_tensor` apart in the tensor and `stride_data` in
+/// `data`, in one 2D copy: ggml's fallback copies each row on its own, and a tensor-parallel
+/// ring's save copies each GPU's share of every cell so.
+unsafe extern "C" fn tier_set_2d(
+    buffer: ffi::ggml_backend_buffer_t,
+    t: *mut ffi::ggml_tensor,
+    data: *const c_void,
+    off: usize,
+    size: usize,
+    n_copies: usize,
+    stride_tensor: usize,
+    stride_data: usize,
+) {
+    // SAFETY: rows of the tensor, addressable by the device (ggml checked the range).
+    unsafe {
+        cudaSetDevice(tier_buffer(buffer).device as c_int);
+        cudaMemcpy2D(
+            ((*t).data as *mut u8).add(off) as *mut c_void,
+            stride_tensor,
+            data,
+            stride_data,
+            size,
+            n_copies,
+            CUDA_MEMCPY_DEFAULT,
+        );
+    }
+}
+
+/// The reverse of [`tier_set_2d`].
+unsafe extern "C" fn tier_get_2d(
+    buffer: ffi::ggml_backend_buffer_t,
+    t: *const ffi::ggml_tensor,
+    data: *mut c_void,
+    off: usize,
+    size: usize,
+    n_copies: usize,
+    stride_tensor: usize,
+    stride_data: usize,
+) {
+    // SAFETY: as above.
+    unsafe {
+        cudaSetDevice(tier_buffer(buffer).device as c_int);
+        cudaMemcpy2D(
+            data,
+            stride_data,
+            ((*t).data as *const u8).add(off) as *const c_void,
+            stride_tensor,
+            size,
+            n_copies,
             CUDA_MEMCPY_DEFAULT,
         );
     }

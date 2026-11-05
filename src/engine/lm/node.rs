@@ -290,7 +290,7 @@ fn handle(
         Request::TpHello { .. }
         | Request::TpStep { .. }
         | Request::SaveRing { .. }
-        | Request::EnableRingSaves
+        | Request::EnableRingSaves { .. }
         | Request::TpMtp { .. }
         | Request::TpMtpChain { .. }
         | Request::TpMtpRows { .. }
