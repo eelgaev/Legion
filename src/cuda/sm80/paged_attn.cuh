@@ -34,6 +34,15 @@
 // tile. A CTA writes each of its columns' running (max in log2 units, sum, unnormalized output)
 // to p.scratch, laid out [D + 2, max_split, n_head, n_tok * n_seqs], and paged_split_combine
 // merges the splits in F32. A tile with one split writes dst directly, as without SPLIT.
+//
+// Wide prompt tiles (NWT = 16, 256-wide heads, prompt steps only): 16 warps and 128 query columns
+// a CTA, so every K/V byte read from L2 feeds twice the columns (the 8-warp kernel ran at about
+// 0.9 TB/s of L2 traffic on a GB10 at 32K, its bound). The register file then holds O^T but not Q
+// (128 registers a thread), so each thread keeps its Q fragments in shared memory, in fragment
+// order (a conflict-free 8-byte read per k-step), and K/V come in 16 KB chunks (128 dims) through
+// two stages. A column's scores keep one mma chain over both chunks of its dims, and a warp skips
+// only key tiles none of its columns sees (a masked tile adds exactly nothing to a column), so
+// every column gets the 8-warp kernel's bits.
 // ---------------------------------------------------------------------------------------------
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -45,16 +54,19 @@ namespace fa {
 // Per head size: dims per K/V chunk, ring stages and CTAs per SM. 256- and 512-wide heads take
 // the register file for one CTA (O^T alone is D / 4 registers per thread) and stream 32 KB
 // chunks through three stages (96 KB): on GB10 that ran 512-wide heads 17% faster than 16 KB
-// chunks through four. 128-wide heads fit two CTAs per SM.
-template <int D> struct Shape {
-    static constexpr int NW      = 8;                              // warps per CTA
-    static constexpr int COLS    = 8 * NW;                         // query columns per CTA
-    static constexpr int CH      = D >= 256 ? 256 : 128;           // dims per chunk
-    static constexpr int NS      = 3;                              // ring stages
-    static constexpr int MINB    = D >= 256 ? 1 : 2;               // CTAs per SM
-    static constexpr int UNITS   = CH / 8;                         // 16-byte units per row
-    static constexpr int CHUNK   = BLK * CH * (int) sizeof(half);  // bytes per chunk
-    static constexpr size_t SMEM = (size_t) NS * CHUNK;
+// chunks through four. 128-wide heads fit two CTAs per SM. NWT = 16: the wide prompt tiles above
+// (Q in shared memory after the ring, 64 KB for 256-wide heads, so 96 KB in all).
+template <int D, int NWT = 8> struct Shape {
+    static constexpr int NW      = NWT;                                    // warps per CTA
+    static constexpr int COLS    = 8 * NW;                                 // query columns per CTA
+    static constexpr bool QS     = NW > 8;                                 // Q in shared memory
+    static constexpr int CH      = D >= 256 && !QS ? 256 : 128;            // dims per chunk
+    static constexpr int NS      = QS ? 2 : 3;                             // ring stages
+    static constexpr int MINB    = D >= 256 || QS ? 1 : 2;                 // CTAs per SM
+    static constexpr int UNITS   = CH / 8;                                 // 16-byte units per row
+    static constexpr int CHUNK   = BLK * CH * (int) sizeof(half);          // bytes per chunk
+    static constexpr int QBYTES  = QS ? D / 16 * NW * 32 * 8 : 0;          // Q fragments
+    static constexpr size_t SMEM = (size_t) NS * CHUNK + QBYTES;
 };
 
 // Byte offset of 16-byte unit `u` of chunk row `r` (rows of UNITS units), XOR-swizzled by the
@@ -113,10 +125,11 @@ __device__ __forceinline__ int split_blocks(int max_split, int split, int * b0, 
     return ns;
 }
 
-template <int D, int G, bool C = false, bool SPLIT = false>
-__global__ void __launch_bounds__(Shape<D>::NW * 32, Shape<D>::MINB) paged_prefill_mma(const legion_paged_attn p) {
+template <int D, int G, bool C = false, bool SPLIT = false, int NWT = 8>
+__global__ void __launch_bounds__(Shape<D, NWT>::NW * 32, Shape<D, NWT>::MINB) paged_prefill_mma(const legion_paged_attn p) {
 #ifdef LEGION_PAGED_MMA
-    using SH = Shape<D>;
+    using SH = Shape<D, NWT>;
+    constexpr bool QS = SH::QS;
     constexpr int NS = SH::NS, CH = SH::CH, UNITS = SH::UNITS, CHUNK = SH::CHUNK;
     constexpr int NW = SH::NW, COLS = SH::COLS;
     constexpr int NC = D / CH;    // chunks of K, and of V, per key tile
@@ -165,8 +178,10 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, Shape<D>::MINB) paged_prefi
         c_first[j] = first_key(c_pos[j], p.window);
     }
 
-    // Q as B fragments (k = dims, n = columns): column gq, dims 2 tq + {0, 1} and + 8.
-    uint32_t qf[KS][2];
+    // Q as B fragments (k = dims, n = columns): column gq, dims 2 tq + {0, 1} and + 8. QS: in
+    // shared memory after the ring, k-step ks of this thread at q_at(ks) (only it reads them).
+    uint32_t qf[QS ? 1 : KS][2];
+    auto q_at = [&](int ks) { return (uint32_t) (NS * CHUNK + ((ks * NW + warp) * 32 + lane) * 8); };
     {
         const int c = warp * 8 + gq;
         const int t = tok_of(c);
@@ -176,8 +191,12 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, Shape<D>::MINB) paged_prefi
         for (int ks = 0; ks < KS; ks++) {
             const float2 a = *(const float2 *) (qr + ks * 16 + 2 * tq);
             const float2 b = *(const float2 *) (qr + ks * 16 + 8 + 2 * tq);
-            qf[ks][0] = pack(a.x, a.y);
-            qf[ks][1] = pack(b.x, b.y);
+            if constexpr (QS) {
+                *(uint2 *) (smem + q_at(ks)) = make_uint2(pack(a.x, a.y), pack(b.x, b.y));
+            } else {
+                qf[ks][0] = pack(a.x, a.y);
+                qf[ks][1] = pack(b.x, b.y);
+            }
         }
     }
 
@@ -265,16 +284,27 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, Shape<D>::MINB) paged_prefi
                 // S^T += K Q^T over this chunk's dims.
 #pragma unroll
                 for (int i = 0; i < 4; i++) {
-                    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                    // QS: one chain over all the dims (the 8-warp kernel's single 256-dim chunk).
+                    float acc[4];
+#pragma unroll
+                    for (int e = 0; e < 4; e++) {
+                        acc[e] = QS && part > 0 ? s[i][e] : 0.0f;
+                    }
 #pragma unroll
                     for (int ks = 0; ks < CH / 16; ks++) {
                         uint32_t a[4];
                         ldsm(a, st + k_lane + k_x[ks % 4] + i * 16 * ROWB + ks / 4 * 128);
-                        mma(acc, a, qf[part * (CH / 16) + ks]);
+                        if constexpr (QS) {
+                            const uint2 q = *(const uint2 *) (smem + q_at(part * (CH / 16) + ks));
+                            const uint32_t b[2] = {q.x, q.y};
+                            mma(acc, a, b);
+                        } else {
+                            mma(acc, a, qf[part * (CH / 16) + ks]);
+                        }
                     }
 #pragma unroll
                     for (int e = 0; e < 4; e++) {
-                        s[i][e] = part == 0 ? acc[e] : s[i][e] + acc[e];
+                        s[i][e] = QS || part == 0 ? acc[e] : s[i][e] + acc[e];
                     }
                 }
                 if (part == NC - 1) {
@@ -407,15 +437,30 @@ bool available() {
     return legion_device::compute_capability() >= 80;
 }
 
-template <int D, int G, bool C = false>
-int launch(const legion_paged_attn & p, cudaStream_t st) {
+// Prompt steps of at least this many tokens take the wide tiles (256-wide heads, plain cache
+// walks): verify and decode-sized groups keep the 8-warp kernel. Same bits either way.
+constexpr int WIDE_MIN_TOK = 256;
+
+template <int D, int G, bool C, int NWT>
+int launch_nw(const legion_paged_attn & p, cudaStream_t st) {
+    using SH = Shape<D, NWT>;
     static std::atomic<int8_t> opted_in[GGML_CUDA_MAX_DEVICES];
-    if (!legion_device::smem_opt_in(opted_in, paged_prefill_mma<D, G, C>, (int) Shape<D>::SMEM)) {
+    if (!legion_device::smem_opt_in(opted_in, paged_prefill_mma<D, G, C, false, NWT>, (int) SH::SMEM)) {
         return 2;
     }
-    constexpr int QT = Shape<D>::COLS / G;
-    paged_prefill_mma<D, G, C><<<dim3((p.n_tok + QT - 1) / QT, p.n_head_kv, p.n_seqs), Shape<D>::NW * 32, Shape<D>::SMEM, st>>>(p);
+    constexpr int QT = SH::COLS / G;
+    paged_prefill_mma<D, G, C, false, NWT><<<dim3((p.n_tok + QT - 1) / QT, p.n_head_kv, p.n_seqs), SH::NW * 32, SH::SMEM, st>>>(p);
     return cudaGetLastError() == cudaSuccess ? 0 : 2;
+}
+
+template <int D, int G, bool C = false>
+int launch(const legion_paged_attn & p, cudaStream_t st) {
+    if constexpr (D == 256 && !C) {
+        if (p.n_tok >= WIDE_MIN_TOK && !p.piece_blk && !p.ml) {
+            return launch_nw<D, G, C, 16>(p, st);
+        }
+    }
+    return launch_nw<D, G, C, 8>(p, st);
 }
 
 // Merges the splits of paged_prefill_mma<.., SPLIT> for row (token, head) blockIdx (y, x): one
