@@ -17,23 +17,49 @@ struct VmmType {
 
 static VMM_TYPES: Registry<VmmType> = Registry(Mutex::new(Vec::new()));
 
+/// What backs a piece of a tensor.
+enum Back {
+    /// Nothing: lent by [`kv_vmm_unmap`].
+    None,
+    /// VRAM (the physical handle).
+    Vram(CUmemGenericAllocationHandle),
+    /// A host piece ([`HostPiece`]) holding blocks still in use while the rest is lent
+    /// (#1196).
+    Host(HostPiece),
+}
+
+/// A tensor's piece: offset in the buffer, bytes, what backs it.
+struct Piece {
+    off: usize,
+    n: usize,
+    back: Back,
+}
+
 /// A buffer: a reserved range, mapped tensor by tensor as ggml places them.
 struct VmmBuffer {
     device: usize,
     va: CUdeviceptr,
     size: usize,
-    /// The tensors' pieces: offset, bytes, physical handle (0: unmapped, lent by
-    /// [`kv_vmm_unmap`]).
-    maps: Vec<(usize, usize, CUmemGenericAllocationHandle)>,
+    /// The tensors' pieces, in the order ggml placed them.
+    maps: Vec<Piece>,
 }
 
 impl VmmBuffer {
-    fn release(&self) {
+    fn release(&mut self) {
         // SAFETY: only what this buffer mapped and reserved.
         unsafe {
-            for &(off, n, h) in self.maps.iter().filter(|m| m.2 != 0) {
-                cuMemUnmap(self.va + off as u64, n);
-                cuMemRelease(h);
+            for p in &mut self.maps {
+                match std::mem::replace(&mut p.back, Back::None) {
+                    Back::None => {}
+                    Back::Vram(h) => {
+                        cuMemUnmap(self.va + p.off as u64, p.n);
+                        cuMemRelease(h);
+                    }
+                    Back::Host(hp) => {
+                        cuMemUnmap(self.va + p.off as u64, p.n);
+                        host_give(hp);
+                    }
+                }
             }
             cuMemAddressFree(self.va, self.size);
         }
@@ -51,15 +77,20 @@ impl VmmBuffer {
                 cuMemRelease(h);
                 return Err(e);
             }
-            self.maps.push((off, n, h));
+            self.maps.push(Piece {
+                off,
+                n,
+                back: Back::Vram(h),
+            });
             let a = access(CU_MEM_LOCATION_TYPE_DEVICE, self.device as i32);
             cu(cuMemSetAccess(va, n, &a, 1), "cuMemSetAccess(KV pool)")
         }
     }
 
-    /// Backs piece `i`, unmapped by [`kv_vmm_unmap`], with new VRAM again and zeroes it.
-    fn back(&mut self, i: usize) -> Result<(), String> {
-        let (off, n, _) = self.maps[i];
+    /// Backs piece `i`, which has nothing mapped now, with new VRAM again; zeroed with `zero`
+    /// (the caller writes all of it otherwise).
+    fn back(&mut self, i: usize, zero: bool) -> Result<(), String> {
+        let (off, n) = (self.maps[i].off, self.maps[i].n);
         let prop = alloc_prop(CU_MEM_LOCATION_TYPE_DEVICE, self.device as i32);
         let mut h: CUmemGenericAllocationHandle = 0;
         let va = self.va + off as u64;
@@ -76,11 +107,136 @@ impl VmmBuffer {
                 cuMemRelease(h);
                 return Err(e);
             }
-            self.maps[i].2 = h;
+            self.maps[i].back = Back::Vram(h);
+            if !zero {
+                return Ok(());
+            }
             // Masked cells are still multiplied (by an exact 0): finite, as a new pool's.
             rt(cudaMemset(va as *mut c_void, 0, n), "cudaMemset(KV pool)")
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Host pieces (#1196): pinned host memory on a GPU's NUMA node, each piece a physical
+// allocation of its own mapped twice: at a range of its own (where its copies read and write
+// it) and, while it backs a lent tail's piece, at that piece's address in the KV pool, so the
+// blocks there keep their address and stay readable by the device (over the link). Pooled for
+// the process: pinning gigabytes again for every lend would stall the engine; the pool's
+// bytes never pass the budget its caller gives.
+
+/// A host piece: its handle, its own range and bytes, the device that reads it.
+struct HostPiece {
+    device: usize,
+    h: CUmemGenericAllocationHandle,
+    va: CUdeviceptr,
+    n: usize,
+}
+
+struct HostPool {
+    free: Vec<HostPiece>,
+    /// Bytes of every host piece made (free or backing a piece).
+    bytes: usize,
+}
+
+static HOST_POOL: Mutex<HostPool> = Mutex::new(HostPool {
+    free: Vec::new(),
+    bytes: 0,
+});
+
+/// Unmaps and frees host piece `p` (not mapped in any KV pool).
+fn host_free(p: HostPiece) {
+    // SAFETY: the piece's own mapping and range, then its handle.
+    unsafe {
+        cuMemUnmap(p.va, p.n);
+        cuMemAddressFree(p.va, p.n);
+        cuMemRelease(p.h);
+    }
+}
+
+/// A host piece of `n` bytes for `device`: a free one of that size, else a new one, freeing
+/// other free ones while the pool would pass `budget` bytes. Fails when it still would.
+fn host_take(device: usize, n: usize, budget: usize) -> Result<HostPiece, String> {
+    let mut pool = HOST_POOL.lock().unwrap();
+    if let Some(i) = pool
+        .free
+        .iter()
+        .position(|p| p.device == device && p.n == n)
+    {
+        return Ok(pool.free.swap_remove(i));
+    }
+    while pool.bytes + n > budget {
+        let Some(p) = pool.free.pop() else {
+            return Err(format!(
+                "host pieces full ({} MiB of {} MiB)",
+                pool.bytes >> 20,
+                budget >> 20
+            ));
+        };
+        pool.bytes -= p.n;
+        host_free(p);
+    }
+    let node = device_numa_node(device).ok_or("the GPU's NUMA node is unknown")?;
+    let gran = granularity(CU_MEM_LOCATION_TYPE_HOST_NUMA, node as i32).max(1);
+    let prop = alloc_prop(CU_MEM_LOCATION_TYPE_HOST_NUMA, node as i32);
+    let mut p = HostPiece {
+        device,
+        h: 0,
+        va: 0,
+        n,
+    };
+    // SAFETY: a new handle mapped into a new range of its own; on failure released again.
+    unsafe {
+        cu(
+            cuMemCreate(&mut p.h, n, &prop, 0),
+            "cuMemCreate(KV host piece)",
+        )?;
+        let mapped = cu(
+            cuMemAddressReserve(&mut p.va, n, gran, 0, 0),
+            "cuMemAddressReserve(KV host piece)",
+        )
+        .and_then(|()| cu(cuMemMap(p.va, n, 0, p.h, 0), "cuMemMap(KV host piece)"));
+        if let Err(e) = mapped {
+            if p.va != 0 {
+                cuMemAddressFree(p.va, n);
+            }
+            cuMemRelease(p.h);
+            return Err(e);
+        }
+        let a = access(CU_MEM_LOCATION_TYPE_DEVICE, device as i32);
+        if let Err(e) = cu(
+            cuMemSetAccess(p.va, n, &a, 1),
+            "cuMemSetAccess(KV host piece)",
+        ) {
+            host_free(p);
+            return Err(e);
+        }
+    }
+    pool.bytes += n;
+    Ok(p)
+}
+
+/// Gives host piece `p` (no longer mapped in a KV pool) back to the pool.
+fn host_give(p: HostPiece) {
+    HOST_POOL.lock().unwrap().free.push(p);
+}
+
+/// Whether `--kv-vmm` tensor `t`'s pieces can be backed by host pieces (#1196): the driver
+/// maps host NUMA memory through VMM for its GPU, whose node is known, in granules that
+/// divide the pieces' (the device's).
+pub fn kv_vmm_host_ok(t: Tensor<'_>) -> bool {
+    let Some((b, _)) = vmm_of(t) else {
+        return false;
+    };
+    let Some(node) = device_numa_node(b.device) else {
+        return false;
+    };
+    if use_device(b.device).is_err() {
+        return false;
+    }
+    let dg = granularity(CU_MEM_LOCATION_TYPE_DEVICE, b.device as i32);
+    let hg = granularity(CU_MEM_LOCATION_TYPE_HOST_NUMA, node as i32);
+    dg > 0 && hg > 0 && dg.is_multiple_of(hg)
 }
 
 /// The `--kv-vmm` buffer of tensor `t` and its offset in it, if `t` lives in one.
@@ -109,50 +265,184 @@ fn vmm_of(t: Tensor<'_>) -> Option<(&'static mut VmmBuffer, usize)> {
     }
 }
 
-/// The KV lend (#814): unmaps and frees the pieces of `--kv-vmm` tensor `t` that lie wholly
-/// within bytes `from..to` of it, after the device finished everything queued. Returns the
-/// bytes given back. Nothing may read those bytes until [`kv_vmm_remap`] backs them again.
-pub fn kv_vmm_unmap(t: Tensor<'_>, from: usize, to: usize) -> Result<usize, String> {
+/// The KV lend (#814): unmaps and frees the VRAM of the pieces of `--kv-vmm` tensor `t` that
+/// lie wholly within bytes `from..to` of it, after the device finished everything queued.
+/// Returns those pieces (offset from `t`'s start, bytes), ascending. Nothing may read the
+/// bytes of a piece left without memory until [`kv_vmm_remap`] backs it again.
+///
+/// #1196: the pieces at the offsets in `host` (from `t`'s start, ascending) keep their bytes
+/// instead: copied into host pieces (at most `budget` bytes of them in the process) that are
+/// then mapped in their place, so the blocks there keep their address and contents. A piece
+/// already in host memory and not in `host` goes back to the pool. On an error, each piece is
+/// either as it was, in host memory with its bytes, or without memory.
+pub fn kv_vmm_unmap(
+    t: Tensor<'_>,
+    from: usize,
+    to: usize,
+    host: &[usize],
+    budget: usize,
+) -> Result<Vec<(usize, usize)>, String> {
     let (b, at) = vmm_of(t).ok_or("not a --kv-vmm tensor")?;
     let (from, to) = (at + from, at + to);
+    let lent = |p: &Piece| p.off >= from && p.off + p.n <= to;
+    let wanted = |p: &Piece| host.binary_search(&(p.off - at)).is_ok();
     use_device(b.device)?;
     // SAFETY: waits for every queued kernel (one of an earlier step may still read a piece),
-    // then unmaps and frees pieces of this buffer only.
+    // then copies, unmaps and frees pieces of this buffer only.
     unsafe {
         rt(cudaDeviceSynchronize(), "cudaDeviceSynchronize")?;
-        let mut freed = 0;
-        for m in b.maps.iter_mut() {
-            let (off, n, h) = *m;
-            if h == 0 || off < from || off + n > to {
+        // The host copies first, all queued, then waited for: VRAM is unmapped only after.
+        let mut copies: Vec<(usize, HostPiece)> = Vec::new();
+        let queued = (|| {
+            for (i, p) in b.maps.iter().enumerate() {
+                if !lent(p) || !wanted(p) || !matches!(p.back, Back::Vram(_)) {
+                    continue;
+                }
+                let hp = host_take(b.device, p.n, budget)?;
+                let r = rt(
+                    cudaMemcpyAsync(
+                        hp.va as *mut c_void,
+                        (b.va + p.off as u64) as *const c_void,
+                        p.n,
+                        CUDA_MEMCPY_DEFAULT,
+                        null_mut(),
+                    ),
+                    "cudaMemcpyAsync(KV piece to host)",
+                );
+                copies.push((i, hp));
+                r?;
+            }
+            rt(cudaDeviceSynchronize(), "cudaDeviceSynchronize")
+        })();
+        if let Err(e) = queued {
+            // No copy may still write a piece that goes back to the pool.
+            cudaDeviceSynchronize();
+            for (_, hp) in copies {
+                host_give(hp);
+            }
+            return Err(e);
+        }
+        let mut copies = copies.into_iter().peekable();
+        let mut out = Vec::new();
+        for (i, p) in b.maps.iter_mut().enumerate() {
+            if !lent(p) {
                 continue;
             }
-            cu(cuMemUnmap(b.va + off as u64, n), "cuMemUnmap(KV pool)")?;
-            cu(cuMemRelease(h), "cuMemRelease(KV pool)")?;
-            m.2 = 0;
-            freed += n;
+            out.push((p.off - at, p.n));
+            let va = b.va + p.off as u64;
+            let copy = copies.next_if(|c| c.0 == i).map(|c| c.1);
+            match std::mem::replace(&mut p.back, Back::None) {
+                Back::None => {}
+                Back::Vram(h) => {
+                    let unmapped = cu(cuMemUnmap(va, p.n), "cuMemUnmap(KV pool)");
+                    if let Err(e) = unmapped {
+                        p.back = Back::Vram(h);
+                        if let Some(hp) = copy {
+                            host_give(hp);
+                        }
+                        return Err(e);
+                    }
+                    cuMemRelease(h);
+                    if let Some(hp) = copy {
+                        let mapped = cu(cuMemMap(va, p.n, 0, hp.h, 0), "cuMemMap(KV host)");
+                        if let Err(e) = mapped {
+                            host_give(hp);
+                            return Err(e);
+                        }
+                        let a = access(CU_MEM_LOCATION_TYPE_DEVICE, b.device as i32);
+                        let r = cu(cuMemSetAccess(va, p.n, &a, 1), "cuMemSetAccess(KV host)");
+                        if let Err(e) = r {
+                            cuMemUnmap(va, p.n);
+                            host_give(hp);
+                            return Err(e);
+                        }
+                        p.back = Back::Host(hp);
+                    }
+                }
+                Back::Host(hp) if wanted(p) => p.back = Back::Host(hp),
+                Back::Host(hp) => {
+                    cu(cuMemUnmap(va, p.n), "cuMemUnmap(KV host)")?;
+                    host_give(hp);
+                }
+            }
         }
-        Ok(freed)
+        Ok(out)
     }
 }
 
-/// Backs every piece of `--kv-vmm` tensor `t` that [`kv_vmm_unmap`] freed with new, zeroed
-/// VRAM, done before this returns. Returns the bytes mapped.
-pub fn kv_vmm_remap(t: Tensor<'_>) -> Result<usize, String> {
+/// Backs every piece of `--kv-vmm` tensor `t` that [`kv_vmm_unmap`] left without memory with
+/// new, zeroed VRAM, and every piece it left in host memory with new VRAM holding its bytes
+/// (the host piece goes back to the pool), done before this returns. Returns the bytes
+/// mapped, and of them those that came from host memory.
+pub fn kv_vmm_remap(t: Tensor<'_>) -> Result<(usize, usize), String> {
     let (b, at) = vmm_of(t).ok_or("not a --kv-vmm tensor")?;
     let end = at + t.nbytes();
     use_device(b.device)?;
-    let mut mapped = 0;
-    for i in 0..b.maps.len() {
-        let (off, n, h) = b.maps[i];
-        if h != 0 || off < at || off >= end {
-            continue;
-        }
-        b.back(i)?;
-        mapped += n;
+    let ours = |p: &Piece| p.off >= at && p.off < end;
+    if b.maps
+        .iter()
+        .any(|p| ours(p) && matches!(p.back, Back::Host(_)))
+    {
+        // SAFETY: nothing queued may still read a host piece's mapping, unmapped below.
+        rt(unsafe { cudaDeviceSynchronize() }, "cudaDeviceSynchronize")?;
     }
-    // SAFETY: the zeroing above is done before any step can use the blocks.
-    rt(unsafe { cudaDeviceSynchronize() }, "cudaDeviceSynchronize")?;
-    Ok(mapped)
+    let (mut mapped, mut restored) = (0, 0);
+    let mut done: Vec<HostPiece> = Vec::new();
+    let r = (|| {
+        for i in 0..b.maps.len() {
+            let p = &mut b.maps[i];
+            if !ours(p) {
+                continue;
+            }
+            let (va, n) = (b.va + p.off as u64, p.n);
+            match std::mem::replace(&mut p.back, Back::None) {
+                Back::Vram(h) => p.back = Back::Vram(h),
+                Back::None => {
+                    b.back(i, true)?;
+                    mapped += n;
+                }
+                Back::Host(hp) => {
+                    // SAFETY: the host piece stays readable at its own range for the copy.
+                    if let Err(e) = cu(unsafe { cuMemUnmap(va, n) }, "cuMemUnmap(KV host)") {
+                        b.maps[i].back = Back::Host(hp);
+                        return Err(e);
+                    }
+                    if let Err(e) = b.back(i, false) {
+                        // Its bytes are lost: zeroed VRAM if any, as a lend that kept none.
+                        host_give(hp);
+                        return Err(e);
+                    }
+                    // SAFETY: both ranges are mapped for the device, `n` bytes each.
+                    let c = rt(
+                        unsafe {
+                            cudaMemcpyAsync(
+                                va as *mut c_void,
+                                hp.va as *const c_void,
+                                n,
+                                CUDA_MEMCPY_DEFAULT,
+                                null_mut(),
+                            )
+                        },
+                        "cudaMemcpyAsync(KV piece from host)",
+                    );
+                    done.push(hp);
+                    c?;
+                    mapped += n;
+                    restored += n;
+                }
+            }
+        }
+        Ok(())
+    })();
+    // SAFETY: the zeroing and copies above are done before any step can use the blocks, and
+    // before the host pieces they read go back to the pool.
+    let synced = rt(unsafe { cudaDeviceSynchronize() }, "cudaDeviceSynchronize");
+    for hp in done {
+        host_give(hp);
+    }
+    r?;
+    synced?;
+    Ok((mapped, restored))
 }
 
 fn vmm_type<'a>(buft: ffi::ggml_backend_buffer_type_t) -> &'a VmmType {
@@ -335,8 +625,8 @@ unsafe extern "C" fn vmm_clear(buffer: ffi::ggml_backend_buffer_t, v: u8) {
     // SAFETY: the mapped pieces only (the rest of the range has no memory behind it).
     unsafe {
         cudaSetDevice(b.device as c_int);
-        for &(off, n, _) in b.maps.iter().filter(|m| m.2 != 0) {
-            cudaMemset((b.va + off as u64) as *mut c_void, v as c_int, n);
+        for p in b.maps.iter().filter(|p| !matches!(p.back, Back::None)) {
+            cudaMemset((b.va + p.off as u64) as *mut c_void, v as c_int, p.n);
         }
         cudaDeviceSynchronize();
     }

@@ -1288,6 +1288,16 @@ pub(in crate::cli) struct SwitchArgs {
     /// elsewhere off (every block keeps its VRAM).
     #[arg(long, help_heading = HEADING, value_name = "TOKENS", value_parser = clap::value_parser!(u32).range(1..))]
     kv_vmm_keep: Option<u32>,
+    /// With --kv-vmm-keep: GiB of pinned host memory in all (each GPU's on its NUMA node)
+    /// that keep the KV of cached prefixes and finished chats past the kept tokens when the
+    /// rest of the pool goes back to the expert cache. Their blocks stay where they were, mapped onto host
+    /// memory, and are copied back into VRAM (the same bits) when a prompt resumes them, so a
+    /// chat past the kept tokens stays resumable instead of being read again. The least
+    /// recently used go when it is full; 0 evicts them all, as before. The expert cache gets
+    /// the same VRAM either way. Default: an eighth of the host memory available at load, at
+    /// most the pools' lent part.
+    #[arg(long, help_heading = HEADING, value_name = "GIB")]
+    kv_vmm_host: Option<u32>,
     /// Threads that read the model files at load (1-8; default 4). Replaces
     /// LEGION_LOAD_THREADS.
     #[arg(long, help_heading = HEADING, value_name = "THREADS", value_parser = clap::value_parser!(u8).range(1..=8))]
@@ -1532,6 +1542,7 @@ impl SwitchArgs {
                 (self.kv_vmm || self.kv_vmm_keep.is_some()).then_some(true)
             },
             kv_vmm_keep: self.kv_vmm_keep.map(|t| t as usize),
+            kv_vmm_host: self.kv_vmm_host.map(|g| g as usize),
         }
     }
 }

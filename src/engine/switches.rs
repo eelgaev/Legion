@@ -480,6 +480,10 @@ pub struct Switches {
     /// to the expert cache until needed (`engine::lm::kv_vmm::KvLend`; None: 32768 where
     /// `kv_vmm` is on by default, none elsewhere).
     pub kv_vmm_keep: Option<usize>,
+    /// `--kv-vmm-host`: GiB of host memory that keep the KV blocks past `kv_vmm_keep`'s that
+    /// cached prefixes and finished sequences hold when the tail goes back to the expert cache
+    /// (#1196; None: an eighth of the available memory, at most the tails; 0: off).
+    pub kv_vmm_host: Option<usize>,
 }
 
 /// Turns stage graphs on or off, with the model layer's list of the external ops they may

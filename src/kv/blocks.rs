@@ -101,6 +101,16 @@ impl BlockPool {
         slow - self.free_slow.len() as u32
     }
 
+    /// The allocated blocks from `fast` on, ascending (none for a slotted pool).
+    pub fn slow_used(&self) -> Vec<u32> {
+        if self.slot_blocks > 0 {
+            return Vec::new();
+        }
+        (self.fast..self.ref_counts.len() as u32)
+            .filter(|&b| self.ref_counts[b as usize] > 0)
+            .collect()
+    }
+
     pub fn block_size(&self) -> u32 {
         self.block_size
     }

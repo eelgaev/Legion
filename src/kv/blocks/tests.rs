@@ -431,3 +431,22 @@ fn a_capped_slotted_pool_hands_out_no_more_than_its_cap() {
     pool.set_slotted_cap(100);
     assert_eq!(pool.free_blocks(), 12);
 }
+
+#[test]
+fn slow_blocks_in_use_are_listed_ascending() {
+    let mut pool = BlockPool::with_fast(8, 16, 3);
+    assert!(pool.slow_used().is_empty());
+    let got: Vec<BlockId> = (0..7).map(|_| pool.allocate().unwrap()).collect();
+    // The fast ones first, then the slow ones lowest first (7 is still free).
+    assert_eq!(pool.slow_used(), [3, 4, 5, 6]);
+    assert!(pool.decref(got[4]));
+    pool.incref(got[5]);
+    assert!(!pool.decref(got[5]));
+    let mut slow: Vec<u32> = got[3..].iter().map(|b| b.0).collect();
+    slow.retain(|&b| b != got[4].0);
+    slow.sort_unstable();
+    assert_eq!(pool.slow_used(), slow);
+    // Fast blocks are never listed; nor is anything of a slotted pool.
+    assert!(pool.slow_used().iter().all(|&b| b >= 3));
+    assert!(BlockPool::slotted(2, 2, 16).slow_used().is_empty());
+}

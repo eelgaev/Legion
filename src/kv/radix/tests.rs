@@ -437,3 +437,40 @@ fn evict_from_drops_the_longer_prefixes_under_a_past_entry() {
     assert_eq!(cache.evict_from(&mut pool, 1), 1);
     busy.release(&mut pool);
 }
+
+#[test]
+fn evict_lru_from_drops_one_past_leaf_least_recently_used_first() {
+    // Blocks 0..2 fast, 2.. past the boundary.
+    let mut pool = BlockPool::with_fast(16, 2, 2);
+    let mut cache = RadixCache::new(2);
+    // A fast-only prefix: never evicted here.
+    let fast = insert(&mut cache, &mut pool, &[9, 9]);
+    assert_eq!(fast, [BlockId(0)]);
+    let mut busy = BlockTable::new();
+    busy.append(&mut pool, 2).unwrap();
+    // Two chats past the boundary; `a` grows by a turn (a longer entry under it).
+    let a = insert(&mut cache, &mut pool, &[1, 2, 3, 4]);
+    insert(&mut cache, &mut pool, &[1, 2, 3, 4, 5, 6]);
+    let b = insert(&mut cache, &mut pool, &[7, 8, 7, 8]);
+    assert!(a.iter().chain(&b).all(|x| x.0 >= 2));
+    assert_eq!(pool.slow_in_use(), 5);
+    // `b` is used again: `a` is the least recently used chat.
+    check_match(&mut cache, &[7, 8, 7, 8], &b);
+    // `a`'s turn first (its leaf), then `a` itself (a match would refresh it), then `b`.
+    assert!(cache.evict_lru_from(&mut pool, 2));
+    assert_eq!((cache.cached_blocks(), pool.slow_in_use()), (5, 4));
+    assert!(cache.evict_lru_from(&mut pool, 2));
+    assert_eq!((cache.cached_blocks(), pool.slow_in_use()), (3, 2));
+    check_match(&mut cache, &[1, 2, 3, 4], &[]);
+    check_match(&mut cache, &[7, 8, 7, 8], &b);
+    // A locked leaf stays.
+    let m = cache.match_prefix(&[7, 8, 7, 8]);
+    assert!(!cache.evict_lru_from(&mut pool, 2));
+    cache.unlock(&m);
+    assert!(cache.evict_lru_from(&mut pool, 2));
+    assert!(!cache.evict_lru_from(&mut pool, 2));
+    assert_eq!(pool.slow_in_use(), 0);
+    check_match(&mut cache, &[9, 9], &fast);
+    assert_eq!(cache.cached_blocks(), 1);
+    busy.release(&mut pool);
+}

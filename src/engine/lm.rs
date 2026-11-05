@@ -4580,8 +4580,9 @@ impl LmEngine {
                     && !long.is_empty();
                 if kv_vmm_all && plain {
                     let keep = crate::residency::kv_vmm::keep_blocks(tokens, KV_BLOCK, n_blocks);
+                    let host = cfg.switches.kv_vmm_host.map(|gib| gib << 30);
                     if let Some((lend, bytes)) =
-                        kv_vmm::KvLend::at_load(&exec, &layout, keep, n_blocks)?
+                        kv_vmm::KvLend::at_load(&exec, &layout, keep, n_blocks, host)?
                     {
                         for (l, b) in long.iter_mut().zip(&bytes) {
                             *l += b;
@@ -6186,9 +6187,13 @@ impl Worker {
             return Ok(());
         }
         let before = seq.table.blocks().len();
-        if self.kv_lend.as_ref().is_some_and(|l| !l.grown) {
+        if let Some(l) = self.kv_lend.as_ref().filter(|l| !l.grown) {
+            // #1196: a resumed prefix with blocks the last shrink kept in host memory gets
+            // them back in VRAM before this step reads them.
+            let keep = l.keep as u32;
+            let resume = l.host_held > 0 && seq.blocks.iter().any(|&b| b >= keep);
             let need = n.div_ceil(KV_BLOCK).saturating_sub(before);
-            self.kv_make_room(need)?;
+            self.kv_make_room(need, resume)?;
         }
         if self.pool.slot_blocks() > 0 {
             seq.table
@@ -6316,24 +6321,38 @@ impl Worker {
     /// planned as over the unlent cache), its freed VRAM backing the tail. Once no prompt is
     /// read, [`Self::restore_cache`] restores all of the cache but the tail's share, until
     /// [`Self::kv_shrink`].
-    fn kv_make_room(&mut self, need: usize) -> Result<(), String> {
+    ///
+    /// `resume` (#1196): a sequence resumes blocks past the kept ones that the last shrink
+    /// kept in host memory (`--kv-vmm-host`): the tail is mapped whatever `need`, and those
+    /// blocks are copied back into VRAM before a step reads them.
+    fn kv_make_room(&mut self, need: usize, resume: bool) -> Result<(), String> {
         let short = |w: &Self| need > w.pool.free_fast_blocks() as usize;
-        if need == 0 || !short(self) {
-            return Ok(());
-        }
-        // Everything they hold is a kept block while the tail is lent.
-        if let Some(radix) = &mut self.radix {
-            let n = need - self.pool.free_fast_blocks() as usize;
-            radix.evict(&mut self.pool, n as u32);
-        }
-        while short(self) && self.evict_warm() {}
-        if short(self) {
-            for b in self.saved.drop_tails() {
-                self.pool.decref(b);
+        if !resume {
+            if need == 0 || !short(self) {
+                return Ok(());
             }
-        }
-        if !short(self) {
-            return Ok(());
+            // Everything they hold is a kept block while the tail is lent, but blocks the
+            // last shrink kept in host memory (#1196).
+            let host_held = self.kv_lend.as_ref().is_some_and(|l| l.host_held > 0);
+            if let Some(radix) = &mut self.radix {
+                let n = need - self.pool.free_fast_blocks() as usize;
+                radix.evict(&mut self.pool, n as u32);
+                // Evicting an entry on the host-held tail frees no kept block: go on, least
+                // recently used first, until enough kept blocks are free.
+                while host_held
+                    && need > self.pool.free_fast_blocks() as usize
+                    && radix.evict(&mut self.pool, 1) > 0
+                {}
+            }
+            while short(self) && self.evict_warm() {}
+            if short(self) {
+                for b in self.saved.drop_tails() {
+                    self.pool.decref(b);
+                }
+            }
+            if !short(self) {
+                return Ok(());
+            }
         }
         let t = Instant::now();
         if !self.lent && self.can_lend {
@@ -6345,61 +6364,149 @@ impl Worker {
             }
         }
         let lend = self.kv_lend.as_mut().expect("a lent KV tail");
-        let bytes = lend
-            .grow(&self.exec)
-            .map_err(|e| format!("--kv-vmm-keep: cannot map the KV pools' tail: {e}"))?;
+        let host_held = lend.host_held;
+        let (bytes, restored) = match lend.grow(&self.exec) {
+            Ok(b) => b,
+            Err(e) => {
+                // Blocks kept in host memory may have lost their bytes: nothing resumes them.
+                if host_held > 0 {
+                    let keep = lend.keep as u32;
+                    self.kv_evict_tail(keep);
+                }
+                return Err(format!("--kv-vmm-keep: cannot map the KV pools' tail: {e}"));
+            }
+        };
         tracing::info!(
             ms = t.elapsed().as_secs_f64() * 1e3,
             mib = bytes >> 20,
+            from_host_mib = restored >> 20,
             cache_lent = self.lent,
+            resume,
             "KV pools' tail mapped for a sequence past the kept blocks (--kv-vmm-keep)"
         );
         Ok(())
+    }
+
+    /// Evicts every cached prefix and warm sequence holding a block from `keep` on, then the
+    /// saved tails if a block there is still in use: the KV pools' tail gives its blocks back
+    /// without keeping them (as before #1196).
+    fn kv_evict_tail(&mut self, keep: u32) {
+        if let Some(radix) = &mut self.radix {
+            radix.evict_from(&mut self.pool, keep);
+        }
+        let past = |w: &Warm| w.table.blocks().iter().any(|b| b.0 >= keep);
+        while let Some(i) = self.warm.iter().position(past) {
+            let w = self.warm.swap_remove(i);
+            w.table.release(&mut self.pool);
+            self.free_ring_and_slot(w.ring, w.kv_slot);
+        }
+        if self.pool.slow_in_use() > 0 {
+            for b in self.saved.drop_tails() {
+                self.pool.decref(b);
+            }
+        }
+    }
+
+    /// One eviction of a holder of a tail block (`keep` on) for the host copy's budget
+    /// ([`kv_vmm::evict_tail_holder`]; warm sequences least recently finished first).
+    fn kv_evict_tail_holder(&mut self, keep: u32) -> bool {
+        let warm = &mut self.warm;
+        let mut freed = None;
+        let evicted = kv_vmm::evict_tail_holder(
+            &mut self.pool,
+            self.radix.as_mut(),
+            &mut self.saved,
+            keep,
+            |pool| {
+                let past = |w: &Warm| w.table.blocks().iter().any(|b| b.0 >= keep);
+                let Some(i) = (0..warm.len())
+                    .filter(|&i| past(&warm[i]))
+                    .min_by_key(|&i| warm[i].stamp)
+                else {
+                    return false;
+                };
+                let w = warm.swap_remove(i);
+                w.table.release(pool);
+                freed = Some((w.ring, w.kv_slot));
+                true
+            },
+        );
+        if let Some((ring, slot)) = freed {
+            self.free_ring_and_slot(ring, slot);
+        }
+        evicted
     }
 
     /// `--kv-vmm-keep` (#814): gives the KV pools' tail back to the expert cache once no
     /// decoding sequence holds a block of it (cached prefixes and warm sequences on it go);
     /// the slots a restore left without VRAM for it are refilled (a lent cache's restore
     /// refills them). Nothing may be in flight (`pipe`).
+    ///
+    /// `--kv-vmm-host` (#1196): the cached prefixes, warm sequences and saved tails on it stay
+    /// as far as the pieces holding their blocks fit in the host budget (least recently used
+    /// go first); those pieces are copied into host memory and mapped where they were, and
+    /// the next [`Self::kv_make_room`] copies them back.
     fn kv_shrink(&mut self, decoding: &[Seq<'_>]) {
-        let Some(keep) = self
+        let Some((keep, budget)) = self
             .kv_lend
             .as_ref()
             .filter(|l| l.grown)
-            .map(|l| l.keep as u32)
+            .map(|l| (l.keep as u32, l.host_budget))
         else {
             return;
         };
         if decoding.iter().any(|s| s.blocks.iter().any(|&b| b >= keep)) {
             return;
         }
+        let mut host = None;
         if self.pool.slow_in_use() > 0 {
-            if let Some(radix) = &mut self.radix {
-                radix.evict_from(&mut self.pool, keep);
+            if budget > 0 {
+                host = kv_vmm::fit_host(
+                    budget,
+                    self,
+                    |w| {
+                        let held = w.pool.slow_used();
+                        w.kv_lend.as_ref().expect("checked above").host_plan(&held)
+                    },
+                    |w| w.kv_evict_tail_holder(keep),
+                );
             }
-            let past = |w: &Warm| w.table.blocks().iter().any(|b| b.0 >= keep);
-            while let Some(i) = self.warm.iter().position(past) {
-                let w = self.warm.swap_remove(i);
-                w.table.release(&mut self.pool);
-                self.free_ring_and_slot(w.ring, w.kv_slot);
-            }
-            if self.pool.slow_in_use() > 0 {
-                for b in self.saved.drop_tails() {
-                    self.pool.decref(b);
-                }
+            if host.is_none() {
+                self.kv_evict_tail(keep);
             }
         }
-        if self.pool.slow_in_use() > 0 {
+        if host.is_none() && self.pool.slow_in_use() > 0 {
             return;
         }
+        // Nothing held past the kept blocks: a lend as without host memory.
+        let host = host.filter(|h| h.bytes > 0);
         let t = Instant::now();
         let lend = self.kv_lend.as_mut().expect("checked above");
-        match lend.shrink(&mut self.exec) {
+        let mut shrunk = lend.shrink(&mut self.exec, host.as_ref());
+        if host.is_some()
+            && let Err(e) = &shrunk
+        {
+            let e = e.clone();
+            // Some pieces may be without their bytes: evict what the tail holds, then lend
+            // it as without host memory (or map it all again if something still holds it).
+            tracing::warn!(error = %e, "--kv-vmm-host: cannot keep the KV tail in host memory");
+            self.kv_evict_tail(keep);
+            let lend = self.kv_lend.as_mut().expect("checked above");
+            shrunk = if self.pool.slow_in_use() == 0 {
+                lend.shrink(&mut self.exec, None)
+            } else {
+                lend.grow(&self.exec).and(Err(e))
+            };
+        }
+        match shrunk {
             Ok(bytes) => {
+                let host_mib = self.kv_lend.as_ref().map_or(0, |l| l.host_held >> 20);
                 tracing::info!(
                     ms = t.elapsed().as_secs_f64() * 1e3,
                     mib = bytes >> 20,
-                    "KV pools' tail lent to the expert cache again (--kv-vmm-keep)"
+                    host_mib,
+                    "KV pools' tail lent to the expert cache again (--kv-vmm-keep); its \
+                     blocks still in use kept in host memory (--kv-vmm-host)"
                 );
                 // The slots a restore left without VRAM for the tail (a lent cache gets them
                 // back with its restore).
@@ -6670,7 +6777,14 @@ impl Worker {
                             .saturating_sub(s.table.blocks().len())
                     })
                     .sum();
-                self.kv_make_room(need)?;
+                // #1196: resumed prefixes held in host memory go back to VRAM with the rest.
+                let resume = self.kv_lend.as_ref().is_some_and(|l| {
+                    l.host_held > 0
+                        && prefilling
+                            .iter()
+                            .any(|s| s.blocks.iter().any(|&b| b >= l.keep as u32))
+                });
+                self.kv_make_room(need, resume)?;
             }
         }
         // A long prompt turns a short lend into a long one until the cache is restored (the
