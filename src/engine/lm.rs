@@ -4580,9 +4580,8 @@ impl LmEngine {
                     && !long.is_empty();
                 if kv_vmm_all && plain {
                     let keep = crate::residency::kv_vmm::keep_blocks(tokens, KV_BLOCK, n_blocks);
-                    let host = cfg.switches.kv_vmm_host.map(|gib| gib << 30);
                     if let Some((lend, bytes)) =
-                        kv_vmm::KvLend::at_load(&exec, &layout, keep, n_blocks, host)?
+                        kv_vmm::KvLend::at_load(&exec, &layout, keep, n_blocks)?
                     {
                         for (l, b) in long.iter_mut().zip(&bytes) {
                             *l += b;
@@ -6323,7 +6322,7 @@ impl Worker {
     /// [`Self::kv_shrink`].
     ///
     /// `resume` (#1196): a sequence resumes blocks past the kept ones that the last shrink
-    /// kept in host memory (`--kv-vmm-host`): the tail is mapped whatever `need`, and those
+    /// kept in host memory: the tail is mapped whatever `need`, and those
     /// blocks are copied back into VRAM before a step reads them.
     fn kv_make_room(&mut self, need: usize, resume: bool) -> Result<(), String> {
         let short = |w: &Self| need > w.pool.free_fast_blocks() as usize;
@@ -6442,7 +6441,7 @@ impl Worker {
     /// the slots a restore left without VRAM for it are refilled (a lent cache's restore
     /// refills them). Nothing may be in flight (`pipe`).
     ///
-    /// `--kv-vmm-host` (#1196): the cached prefixes, warm sequences and saved tails on it stay
+    /// #1196: the cached prefixes, warm sequences and saved tails on it stay
     /// as far as the pieces holding their blocks fit in the host budget (least recently used
     /// go first); those pieces are copied into host memory and mapped where they were, and
     /// the next [`Self::kv_make_room`] copies them back.
@@ -6489,7 +6488,7 @@ impl Worker {
             let e = e.clone();
             // Some pieces may be without their bytes: evict what the tail holds, then lend
             // it as without host memory (or map it all again if something still holds it).
-            tracing::warn!(error = %e, "--kv-vmm-host: cannot keep the KV tail in host memory");
+            tracing::warn!(error = %e, "cannot keep the KV tail in host memory; evicting what it holds");
             self.kv_evict_tail(keep);
             let lend = self.kv_lend.as_mut().expect("checked above");
             shrunk = if self.pool.slow_in_use() == 0 {
@@ -6506,7 +6505,7 @@ impl Worker {
                     mib = bytes >> 20,
                     host_mib,
                     "KV pools' tail lent to the expert cache again (--kv-vmm-keep); its \
-                     blocks still in use kept in host memory (--kv-vmm-host)"
+                     blocks still in use moved to host memory (host_mib)"
                 );
                 // The slots a restore left without VRAM for the tail (a lent cache gets them
                 // back with its restore).

@@ -217,8 +217,6 @@ fn flags_set_their_switches() {
         "--kv-vmm",
         "--kv-vmm-keep",
         "32768",
-        "--kv-vmm-host",
-        "48",
     ]);
     assert_eq!(
         s,
@@ -383,7 +381,6 @@ fn flags_set_their_switches() {
             qsa_pool_pad_steps: Some(64),
             kv_vmm: Some(true),
             kv_vmm_keep: Some(32768),
-            kv_vmm_host: Some(48),
         }
     );
 }
@@ -859,10 +856,6 @@ fn kv_vmm_keep_implies_kv_vmm_and_no_kv_vmm_turns_both_off() {
     assert_eq!((s.kv_vmm, s.kv_vmm_keep), (Some(true), Some(16384)));
     let s = switches(&["--no-kv-vmm"]);
     assert_eq!((s.kv_vmm, s.kv_vmm_keep), (Some(false), None));
-    // --kv-vmm-host (#1196): the engine's default unless given; 0 turns it off.
-    assert_eq!(switches(&[]).kv_vmm_host, None);
-    assert_eq!(switches(&["--kv-vmm-host", "0"]).kv_vmm_host, Some(0));
-    assert_eq!(switches(&["--kv-vmm-host", "64"]).kv_vmm_host, Some(64));
     for bad in [
         &["--no-kv-vmm", "--kv-vmm"][..],
         &["--no-kv-vmm", "--kv-vmm-keep", "1"],

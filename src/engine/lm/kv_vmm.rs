@@ -58,7 +58,7 @@ pub(super) fn apply(
 /// The block allocator hands out blocks below `keep` first
 /// ([`crate::kv::BlockPool::with_fast`]), so the pool grows only when those run out.
 ///
-/// #1196 (`--kv-vmm-host`): blocks past `keep` that cached prefixes and finished sequences
+/// #1196 (automatic): blocks past `keep` that cached prefixes and finished sequences
 /// still hold when the tail goes back need not be evicted: [`Self::shrink`] with a
 /// [`HostPlan`] keeps the pieces holding them in host memory, mapped where they were (the
 /// blocks keep their addresses and contents), and the next [`Self::grow`] copies them back
@@ -76,8 +76,8 @@ pub(super) struct KvLend {
     /// Per cache tensor (stage by stage, as [`Executor::kv_block_tensors`] lists them): its
     /// lent pieces.
     tails: Vec<Tail>,
-    /// `--kv-vmm-host`: the most host bytes the pieces holding blocks in use may take while
-    /// the tail is lent (0: none; they are evicted).
+    /// The most host bytes the pieces holding blocks in use may take while the tail is lent
+    /// ([`default_host_budget`]; 0 where the GPUs cannot map host memory: they are evicted).
     pub(super) host_budget: usize,
     /// Host bytes the pieces of the last shrink kept (0 while grown).
     pub(super) host_held: usize,
@@ -100,8 +100,9 @@ pub(super) struct HostPlan {
     pub(super) bytes: usize,
 }
 
-/// `--kv-vmm-host`'s default (#1196): an eighth of the host memory `available` at load, at
-/// most the `lent` bytes (the pools' whole tails).
+/// The host budget (#1196), chosen at load with no flag: an eighth of the host memory
+/// `available` at load, at most the `lent` bytes (the pools' whole tails; all of them on an
+/// AC922).
 pub(super) fn default_host_budget(lent: usize, available: u64) -> usize {
     lent.min(usize::try_from(available / 8).unwrap_or(usize::MAX))
 }
@@ -171,14 +172,13 @@ impl KvLend {
     /// Gives back the memory of every stage's blocks past `keep` (of `n_blocks`) at load,
     /// before the expert cache is sized. Per stage: the bytes given back. `None` when nothing
     /// would be (`keep` covers the pool, or the pools are not `--kv-vmm` ones).
-    /// `host_budget`: `--kv-vmm-host`'s bytes (`None`: [`default_host_budget`]; 0 where the
-    /// GPUs cannot map host memory into the pools).
+    /// The host budget is [`default_host_budget`] (0 where the GPUs cannot map host memory
+    /// into the pools).
     pub(super) fn at_load(
         exec: &Executor,
         layout: &layout::Layout,
         keep: usize,
         n_blocks: usize,
-        host_budget: Option<usize>,
     ) -> Result<Option<(Self, Vec<usize>)>, LoadError> {
         if keep >= n_blocks {
             return Ok(None);
@@ -200,15 +200,13 @@ impl KvLend {
         }
         lend.tails = tails;
         let host_ok = exec.kv_block_tensors().into_iter().flatten().all(host_ok);
-        let host_budget = host_budget.unwrap_or_else(|| {
-            let available = crate::residency::lookup_table::MemInfo::read().available;
-            default_host_budget(bytes.iter().sum(), available)
-        });
+        let available = crate::residency::lookup_table::MemInfo::read().available;
+        let host_budget = default_host_budget(bytes.iter().sum(), available);
         lend.host_budget = if host_ok { host_budget } else { 0 };
         if host_budget > 0 && !host_ok {
             tracing::warn!(
-                "--kv-vmm-host: the GPUs cannot map host memory into the KV pools; blocks past \
-                 the kept ones are evicted when the tail goes back"
+                "the GPUs cannot map host memory into the KV pools; cached chats past the kept \
+                 tokens are evicted when the tail goes back to the expert cache"
             );
         }
         lend.leave = layout
@@ -219,12 +217,14 @@ impl KvLend {
             .filter(|&(_, b)| b > 0)
             .collect();
         tracing::info!(
-            keep_tokens = keep * KV_BLOCK,
             pool_tokens = n_blocks * KV_BLOCK,
+            vram_tokens = keep * KV_BLOCK,
             lent_mib = ?bytes.iter().map(|b| b >> 20).collect::<Vec<_>>(),
             host_mib = lend.host_budget >> 20,
-            "KV pools' tails lent to the expert cache until a sequence needs them (--kv-vmm-keep); \
-             cached blocks on them kept in host memory up to host_mib (--kv-vmm-host)"
+            "KV cache: each GPU's pool keeps its first vram_tokens in VRAM; the rest (lent_mib \
+             a GPU) serves the expert cache until a sequence needs it; when it goes back, the \
+             chats cached on it move to host memory (up to host_mib in all) and come back to \
+             VRAM when resumed"
         );
         Ok(Some((lend, bytes)))
     }
