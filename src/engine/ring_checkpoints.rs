@@ -16,12 +16,17 @@
 //!
 //! When every slot is taken, a new checkpoint takes the least recently used one that is not
 //! its ring's latest (each warm sequence keeps the copy at its last prompt's end, as before).
+//!
+//! `--ring-checkpoints 0` turns them off ([`RingCheckpoints::single`]): one copy per ring, in
+//! its own slot, at the end of its last prompt only, as before checkpoints.
 
 /// Which checkpoint slot holds which ring's copy.
 #[derive(Debug)]
 pub struct RingCheckpoints {
     slots: Vec<Option<Checkpoint>>,
     tick: u64,
+    /// [`Self::single`]: ring `r`'s copy always in slot `r`.
+    single: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +42,23 @@ impl RingCheckpoints {
         Self {
             slots: vec![None; slots],
             tick: 0,
+            single: false,
         }
+    }
+
+    /// Checkpoints off (`--ring-checkpoints 0`): one slot per ring (`rings` of them), ring
+    /// `r`'s in slot `r`, each new copy replacing the last: the single save at a prompt's end
+    /// that came before checkpoints.
+    pub fn single(rings: usize) -> Self {
+        Self {
+            single: true,
+            ..Self::new(rings)
+        }
+    }
+
+    /// Whether checkpoints are off ([`Self::single`]).
+    pub fn is_single(&self) -> bool {
+        self.single
     }
 
     pub fn is_empty(&self) -> bool {
@@ -59,18 +80,22 @@ impl RingCheckpoints {
     }
 
     /// A slot for ring `ring`'s copy after `at` tokens, which the caller then saves: the one
-    /// already holding that point, a free one, or one taken from another checkpoint. None
-    /// without slots.
+    /// already holding that point, a free one, or one taken from another checkpoint ([`Self::single`]:
+    /// the ring's own). None without slots.
     pub fn store(&mut self, ring: usize, at: usize) -> Option<usize> {
         if self.slots.is_empty() {
             return None;
         }
         self.tick += 1;
         let tick = self.tick;
-        let slot = (self.slots.iter())
-            .position(|c| c.is_some_and(|c| c.ring == ring && c.at == at))
-            .or_else(|| self.slots.iter().position(Option::is_none))
-            .or_else(|| self.victim(ring))?;
+        let slot = if self.single {
+            (ring < self.slots.len()).then_some(ring)?
+        } else {
+            (self.slots.iter())
+                .position(|c| c.is_some_and(|c| c.ring == ring && c.at == at))
+                .or_else(|| self.slots.iter().position(Option::is_none))
+                .or_else(|| self.victim(ring))?
+        };
         self.slots[slot] = Some(Checkpoint {
             ring,
             at,

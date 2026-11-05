@@ -1380,6 +1380,9 @@ struct EngineArgs {
     /// resumes a cached conversation where it leaves it, not only near the end of its last
     /// prompt. Each copy holds one ring (~1.2 GiB on Gemma 4 31B with --tp 2). Default: 3 per
     /// --max-seqs where a third of the free host memory holds them, at least 1 per sequence.
+    /// 0: off, prefix caching as before checkpoints (one copy per sequence at its last prompt's
+    /// end, no --ring-checkpoint-every copies, a side request may take over a chat's cache, no
+    /// host KV tier memory taken).
     #[arg(long, value_name = "N")]
     ring_checkpoints: Option<usize>,
     /// Model engine, with ring checkpoints: also save one every N prompt tokens (where a

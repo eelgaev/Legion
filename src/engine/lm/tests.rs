@@ -962,6 +962,13 @@ fn ring_checkpoint_slots_by_free_memory() {
     assert_eq!(ring_checkpoint_slots(None, 16, gib, Some(1 << 30)), 16);
     assert_eq!(ring_checkpoint_slots(None, 16, gib, None), 16);
     assert_eq!(ring_checkpoint_slots(Some(5), 16, gib, None), 5);
+    // Off: one per ring, the single copy at a prompt's end, whatever the memory.
+    assert_eq!(ring_checkpoint_slots(Some(0), 16, gib, Some(300 << 30)), 16);
+    // Which takes nothing from a lazily backed host tier.
+    assert_eq!(
+        ring_checkpoints_in_budget(16, 16, gib, Some(200 * 1024), 1 << 20, 1024),
+        (16, Some(200 * 1024))
+    );
 }
 
 #[test]

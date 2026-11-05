@@ -103,3 +103,26 @@ fn due_over_the_last_span_every_so_many_tokens() {
     assert!(!due(9000, 9000, Some(8192), 1024, 4096));
     assert!(!due(6144, 9000, None, 0, 4096));
 }
+
+#[test]
+fn single_keeps_one_copy_per_ring_in_its_own_slot() {
+    let mut c = RingCheckpoints::single(4);
+    assert!(c.is_single());
+    assert!(!RingCheckpoints::new(4).is_single());
+    // Ring r's copy is always in slot r; a later save replaces it.
+    assert_eq!(c.store(2, 1000), Some(2));
+    assert_eq!(c.store(2, 3000), Some(2));
+    assert_eq!(c.of(2), vec![(3000, 2)]);
+    assert_eq!(c.store(0, 500), Some(0));
+    // Other rings' copies are never taken.
+    assert_eq!(c.of(0), vec![(500, 0)]);
+    assert_eq!(c.of(2), vec![(3000, 2)]);
+    // A ring past the slots has none.
+    assert_eq!(c.store(4, 100), None);
+    // Resuming before the copy drops it, as the old single save did.
+    c.truncate(2, 2000);
+    assert_eq!(c.of(2), vec![]);
+    let holds = |m: usize, at: usize| m + 500 >= at;
+    assert_eq!(c.best(0, 400, holds), Some((400, 500, 0)));
+    assert_eq!(RingCheckpoints::single(0).store(0, 1), None);
+}

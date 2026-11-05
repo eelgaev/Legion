@@ -2311,7 +2311,8 @@ fn ring_save_free(_: &layout::Layout) -> Option<u64> {
 /// Ring checkpoints kept by default per ring ([`RingCheckpoints`]), memory permitting.
 pub const RING_CHECKPOINTS_PER_RING: usize = 3;
 
-/// Checkpoint slots for `rings` rings of `bytes` each: `given` (`--ring-checkpoints`), else
+/// Checkpoint slots for `rings` rings of `bytes` each: `given` (`--ring-checkpoints`; 0, off:
+/// one per ring, the single copy at a prompt's end of [`RingCheckpoints::single`]), else
 /// [`RING_CHECKPOINTS_PER_RING`] per ring where a third of the host memory left (`free`)
 /// holds them, never fewer than one per ring (a warm sequence's copy at its last prompt's end);
 /// one per ring where the free memory is unknown (an integrated GPU's memory is its KV
@@ -2323,7 +2324,7 @@ pub fn ring_checkpoint_slots(
     free: Option<u64>,
 ) -> usize {
     if let Some(n) = given {
-        return n;
+        return if n == 0 { rings } else { n };
     }
     let fit = free.map_or(0, |f| (f / 3) as usize / bytes.max(1));
     fit.min(RING_CHECKPOINTS_PER_RING * rings).max(rings)
@@ -4970,7 +4971,11 @@ impl LmEngine {
             warm_on,
             warm_stamp: 0,
             ring_window: window,
-            ring_ckpts: RingCheckpoints::new(ring_ckpt_slots),
+            ring_ckpts: if cfg.ring_checkpoints == Some(0) {
+                RingCheckpoints::single(ring_ckpt_slots)
+            } else {
+                RingCheckpoints::new(ring_ckpt_slots)
+            },
             ring_ckpt_every: cfg.ring_checkpoint_every,
             ring_ckpt_span: cfg.ring_checkpoint_span,
             ring_ckpts_log: cfg.ring_checkpoint_log,
@@ -5363,7 +5368,8 @@ struct Worker {
     /// The sliding window the rings serve (with rings).
     ring_window: usize,
     /// Saved copies of the rings for the warm sequences ([`RingCheckpoints`]); none without
-    /// rings or prefix caching.
+    /// rings or prefix caching; one per ring at its prompt's end with `--ring-checkpoints 0`
+    /// ([`RingCheckpoints::single`]: no interval checkpoints, no guard in [`Self::warm_match`]).
     ring_ckpts: RingCheckpoints,
     /// `--ring-checkpoint-every` and `--ring-checkpoint-span`.
     ring_ckpt_every: usize,
@@ -6021,11 +6027,11 @@ impl Worker {
     /// A warm sequence that would keep less than half its tokens is left alone while a ring
     /// and KV slot are free: a request that shares only a template's first tokens with a chat
     /// (a title or follow-up request, another chat) would otherwise take the chat's cache over
-    /// and cut it down to those tokens.
+    /// and cut it down to those tokens. Not with checkpoints off (`--ring-checkpoints 0`).
     fn warm_match(&self, prompt: &[u32]) -> Option<WarmMatch> {
         let ring = self.exec.kv_ring();
         let holds = |m: usize, end: usize| self.ring_holds(m, end);
-        let spare = self.spare_ring_and_slot();
+        let spare = !self.ring_ckpts.is_single() && self.spare_ring_and_slot();
         let mut best: Option<WarmMatch> = None;
         for (i, w) in self.warm.iter().enumerate() {
             let common = (w.tokens.iter().zip(prompt))
@@ -6982,6 +6988,7 @@ impl Worker {
             // A checkpoint of the ring inside the prompt's last part, where the next prompt of
             // a chat that rewrites its last turns leaves this one ([`RingCheckpoints`]).
             if !self.ring_ckpts.is_empty()
+                && !self.ring_ckpts.is_single()
                 && seq.media.is_none()
                 && ring_checkpoints::due(
                     seq.n_past,
