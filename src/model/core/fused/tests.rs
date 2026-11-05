@@ -444,6 +444,115 @@ fn cuda_delta_prep_is_the_chain() {
     }
 }
 
+/// `conv_silu_norm` + `delta_gates` and `conv_silu` + `delta_prep` on `backend`: per output
+/// (q, k, v, g, beta, history), the fused pair's values and the plain pair's.
+fn conv_norm_case(
+    backend: &mut Backend,
+    heads: DeltaHeads,
+    nt: i64,
+    ns: i64,
+    d: i64,
+) -> Vec<(Vec<f32>, Vec<f32>)> {
+    let (head_k, n_k, head_v, n_v) = heads;
+    let qkv_dim = 2 * head_k * n_k + head_v * n_v;
+    let n = nt * ns;
+    let eps = 1e-6f32 / head_k as f32;
+    let ctx = Context::new(96, 96);
+    let x = ctx.new_tensor(types::F32, &[qkv_dim, nt, ns]).as_input();
+    let state = ctx.new_tensor(types::F32, &[d - 1, qkv_dim, ns]).as_input();
+    let w = ctx.new_tensor(types::F32, &[d, qkv_dim]).as_input();
+    let alpha = ctx.new_tensor(types::F32, &[n_v, n]).as_input();
+    let beta = ctx.new_tensor(types::F32, &[n_v, n]).as_input();
+    let dt_bias = ctx.new_tensor(types::F32, &[n_v]).as_input();
+    let a = ctx.new_tensor(types::F32, &[n_v]).as_input();
+    let es = 4usize;
+    let row = qkv_dim as usize * es;
+    let views = |conv| {
+        let nb = [head_k as usize * es, row, row * nt as usize];
+        let at = (head_k * n_k) as usize * es;
+        let nbv = [head_v as usize * es, row, row * nt as usize];
+        [
+            ctx.view_4d(conv, [head_k, n_k, nt, ns], nb, 0),
+            ctx.view_4d(conv, [head_k, n_k, nt, ns], nb, at),
+            ctx.view_4d(conv, [head_v, n_v, nt, ns], nbv, 2 * at),
+        ]
+    };
+    let (conv_n, hist_n) = conv_silu_norm(&ctx, x, state, w, heads, eps);
+    let [qn, kn, vn] = views(conv_n);
+    let [gn, bn] = delta_gates(&ctx, conv_n, alpha, beta, dt_bias, a, heads, eps);
+    let (conv_p, hist_p) = conv_silu(&ctx, x, state, w);
+    let [_, _, vp] = views(conv_p);
+    let [qp, kp, gp, bp] = delta_prep(&ctx, conv_p, alpha, beta, dt_bias, a, heads, eps, None);
+    let outs: Vec<_> = [qn, kn, vn, gn, bn, hist_n, qp, kp, vp, gp, bp, hist_p]
+        .iter()
+        .map(|t| ctx.cont(*t).as_output())
+        .collect();
+    let mut graph = ctx.new_graph(128);
+    for t in &outs {
+        graph.expand(*t);
+    }
+    ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+        .unwrap();
+    x.set_f32(&noise((qkv_dim * n) as usize, 21));
+    state.set_f32(&noise(((d - 1) * qkv_dim * ns) as usize, 22));
+    w.set_f32(&noise((d * qkv_dim) as usize, 23));
+    alpha.set_f32(&noise((n_v * n) as usize, 24));
+    beta.set_f32(&noise((n_v * n) as usize, 25));
+    dt_bias.set_f32(&noise(n_v as usize, 26));
+    a.set_f32(&noise(n_v as usize, 27));
+    backend.compute(&graph).unwrap();
+    let v: Vec<Vec<f32>> = outs.iter().map(|t| t.to_f32()).collect();
+    (0..6).map(|i| (v[i].clone(), v[i + 6].clone())).collect()
+}
+
+const CONV_NORM_CASES: [(DeltaHeads, i64, i64, i64); 3] = [
+    ((128, 2, 128, 4), 5, 2, 4),
+    ((128, 1, 64, 3), 70, 1, 4),
+    ((128, 3, 128, 6), 33, 3, 3),
+];
+
+/// Bit for bit: the fused pair's q, k and history are the plain pair's.
+fn assert_bits(cases: Vec<(Vec<f32>, Vec<f32>)>, what: &str) {
+    for (i, (fused, plain)) in cases.iter().enumerate() {
+        assert!(
+            fused.len() == plain.len()
+                && fused
+                    .iter()
+                    .zip(plain)
+                    .all(|(x, y)| x.to_bits() == y.to_bits()),
+            "{what}: output {i} differs (rel {:e})",
+            rel(fused, plain)
+        );
+    }
+}
+
+#[test]
+fn conv_silu_norm_is_conv_silu_then_delta_prep() {
+    let mut backend = Backend::cpu().unwrap();
+    backend.set_threads(4);
+    for (heads, nt, ns, d) in CONV_NORM_CASES {
+        let what = format!("{heads:?} {nt}x{ns} d {d}");
+        assert_bits(conv_norm_case(&mut backend, heads, nt, ns, d), &what);
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_conv_silu_norm_is_conv_silu_then_delta_prep() {
+    use crate::ggml::{DeviceKind, device_by_kind};
+    let mut gpu = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU device")
+        .init()
+        .unwrap();
+    let big = ((128, 16, 128, 48), 300, 1, 4);
+    for (heads, nt, ns, d) in CONV_NORM_CASES.into_iter().chain([big]) {
+        let what = format!("{heads:?} {nt}x{ns} d {d}");
+        assert_bits(conv_norm_case(&mut gpu, heads, nt, ns, d), &what);
+    }
+}
+
 /// `gated_norm` and ggml's chain (`rms_norm`, `mul` by the weight, `mul` by the gate) on
 /// `backend`: (op, chain).
 fn gated_case(

@@ -30,6 +30,11 @@ struct legion_conv_silu {
     float * hist;         // [keep, C, ns], contiguous: the last keep inputs of [state | x]
     int32_t C, nt, ns, d, keep;
     int32_t chunk;        // tokens per thread
+    // With norm_blocks > 0 (blocks of norm_head threads, one head each): the first norm_blocks
+    // blocks' outputs (a gated DeltaNet's q and k heads) are l2-normalized per token as
+    // delta_prep does it (eps norm_eps, scale norm_scale), bit for bit.
+    int32_t norm_blocks, norm_head;
+    float norm_eps, norm_scale;
     uint32_t grid[3];
     uint32_t block;
 };
@@ -198,6 +203,7 @@ struct legion_delta_prep {
     int32_t head_k, n_k, head_v, n_v, nt, n_tok;
     float eps;        // rms_norm eps (the model's eps / head_k)
     float scale_out;  // 1 / sqrt(head_k)
+    int32_t gates_only;  // g and beta only (conv_silu normalized q and k already); q, k unused
 };
 
 int legion_delta_prep_launch(const legion_delta_prep * p, void * stream);
@@ -288,16 +294,35 @@ namespace {
 
 constexpr int MAX_D = 8;
 
+// ggml-cuda's warp_reduce_sum (common.cuh): butterfly over the 32 lanes.
+__device__ __forceinline__ float warp_sum(float x) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        x += __shfl_xor_sync(0xffffffff, x, offset, 32);
+    }
+    return x;
+}
+
+constexpr int PREP_BLOCK = 256;  // ggml-cuda's rms_norm block for rows under 1024
+
 // Input j of channel c in [state | x] time order (j < d - 1: the state).
 __device__ __forceinline__ float conv_in(const legion_conv_silu & p, int j, int c, int s) {
     return j < p.d - 1 ? p.state[j + c * p.st_ld + s * p.st_sd] : p.x[c + (int64_t) (j - p.d + 1) * p.x_ld + s * p.x_sd];
 }
 
 // One thread per (channel, run of `chunk` tokens, sequence): a sliding window of d inputs in
-// registers; reads and writes are coalesced over the channels.
+// registers; reads and writes are coalesced over the channels. A norm block (one q or k head,
+// blockDim == norm_head) sums each token's squares as delta_prep_kernel's 256-thread block
+// does (the warps past the head add zeros there: s_sum's tail is zero here), so its outputs
+// are delta_prep's q and k, and the separate pass over them is saved.
 __global__ void conv_silu_kernel(legion_conv_silu p) {
+    __shared__ float s_sum[PREP_BLOCK / 32];
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     const int s = blockIdx.z;
+    const bool norm = (int) blockIdx.x < p.norm_blocks;  // the whole block: all its c < C
+    if (norm && threadIdx.x < PREP_BLOCK / 32) {
+        s_sum[threadIdx.x] = 0.0f;
+    }
     if (c >= p.C) {
         return;
     }
@@ -323,7 +348,24 @@ __global__ void conv_silu_kernel(legion_conv_silu p) {
                 acc += win[k] * w[k];
             }
         }
-        p.out[c + (int64_t) t * p.C + (int64_t) s * p.C * p.nt] = acc / (1.0f + __expf(-acc));
+        float y = acc / (1.0f + __expf(-acc));
+        if (norm) {
+            // delta_prep_kernel's sum, mean and scale of the head's row (it reads y back).
+            float tmp = 0.0f;
+            tmp += y * y;
+            tmp = warp_sum(tmp);
+            __syncthreads();  // the previous token's s_sum reads are done
+            if (threadIdx.x % 32 == 0) {
+                s_sum[threadIdx.x / 32] = tmp;
+            }
+            __syncthreads();
+            tmp = threadIdx.x % 32 < PREP_BLOCK / 32 ? s_sum[threadIdx.x % 32] : 0.0f;
+            tmp = warp_sum(tmp);
+            const float mean = tmp / p.norm_head;
+            const float scale = rsqrtf(mean + p.norm_eps);
+            y = p.norm_scale * (scale * y);
+        }
+        p.out[c + (int64_t) t * p.C + (int64_t) s * p.C * p.nt] = y;
 #pragma unroll
         for (int k = 0; k < MAX_D - 1; k++) {
             win[k] = win[k + 1];
@@ -619,23 +661,12 @@ __global__ void __launch_bounds__(HC_THREADS) hc_post_norm_kernel(legion_hc_post
     }
 }
 
-// ggml-cuda's warp_reduce_sum (common.cuh): butterfly over the 32 lanes.
-__device__ __forceinline__ float warp_sum(float x) {
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        x += __shfl_xor_sync(0xffffffff, x, offset, 32);
-    }
-    return x;
-}
-
-constexpr int PREP_BLOCK = 256;  // ggml-cuda's rms_norm block for rows under 1024
-
 // Blocks (h, t): h < 2 n_k normalizes q (h < n_k) or k head h % n_k of token t; h == 2 n_k
 // computes the token's g and beta. 256 threads, as ggml's rms_norm block: thread
 // i holds column i of the head (none past head_k), warp sums, then a warp sum of the 8 warps'.
 __global__ void delta_prep_kernel(legion_delta_prep p) {
     __shared__ float s_sum[PREP_BLOCK / 32];
-    const int h = blockIdx.x;
+    const int h = blockIdx.x + (p.gates_only ? 2 * p.n_k : 0);
     const int t = blockIdx.y;
     const int s = t / p.nt;
     const int ts = t - s * p.nt;
@@ -1555,7 +1586,8 @@ int legion_delta_prep_launch(const legion_delta_prep * p, void * stream) {
     if (p->head_k > PREP_BLOCK || p->n_tok < 1) {
         return -1;
     }
-    delta_prep_kernel<<<dim3(2 * p->n_k + 1, p->n_tok), PREP_BLOCK, 0, (cudaStream_t) stream>>>(*p);
+    const int heads = p->gates_only ? 0 : 2 * p->n_k;
+    delta_prep_kernel<<<dim3(heads + 1, p->n_tok), PREP_BLOCK, 0, (cudaStream_t) stream>>>(*p);
     return (int) cudaGetLastError();
 }
 
@@ -1794,6 +1826,10 @@ int legion_router_select_launch(const legion_router * p, void * stream) {
 int legion_conv_silu_launch(const legion_conv_silu * p, void * stream) {
     if (p->d < 1 || p->d > MAX_D) {
         return -1;
+    }
+    if (p->norm_blocks > 0 && (p->norm_head != (int) p->block || p->norm_head > PREP_BLOCK || p->norm_head % 32 != 0 ||
+                               (int64_t) p->norm_blocks * p->norm_head > p->C)) {
+        return -2;
     }
     conv_silu_kernel<<<dim3(p->grid[0], p->grid[1], p->grid[2]), p->block, 0, (cudaStream_t) stream>>>(*p);
     return (int) cudaGetLastError();

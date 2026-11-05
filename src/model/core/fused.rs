@@ -341,6 +341,56 @@ pub(super) fn conv_silu_window<'a>(
     w: Tensor<'a>,
     keep: i64,
 ) -> (Tensor<'a>, Tensor<'a>) {
+    conv_silu_node(ctx, x, state, w, keep, None)
+}
+
+/// Threads of a `conv_silu` CUDA block: one q or k head of [`conv_silu_norm`] each.
+const CONV_BLOCK: i64 = 128;
+
+/// Groups of more tokens than this take [`conv_silu_norm`] (prompt steps; decode and verify
+/// steps keep [`conv_silu`] and [`delta_prep`]).
+const CONV_NORM_MIN_TOKENS: i64 = 64;
+
+/// Whether a group of `n` tokens of a layer [`delta_prep`] takes ([`delta_prep_fits`]) runs
+/// [`conv_silu_norm`] and [`delta_gates`] instead of [`conv_silu`] and [`delta_prep`]: a
+/// non-verify prompt group with heads of [`CONV_BLOCK`].
+pub(super) fn conv_norm_fits(heads: DeltaHeads, n: i64, verify: bool) -> bool {
+    !verify && heads.0 == CONV_BLOCK && n > CONV_NORM_MIN_TOKENS
+}
+
+/// [`conv_silu`] with the q and k heads of its output (`n_k` of `head_k` each, then as many
+/// k heads, at the start of every row) l2-normalized per token as [`delta_prep`] does it, bit
+/// for bit: the conv output's q and k rows are then [`delta_prep`]'s q and k, without the pass
+/// that reads and writes them again ([`delta_gates`] computes the rest). `eps` is
+/// [`delta_prep`]'s. Heads of [`CONV_BLOCK`] only ([`conv_norm_fits`]).
+pub(super) fn conv_silu_norm<'a>(
+    ctx: &'a Context,
+    x: Tensor<'a>,
+    state: Tensor<'a>,
+    w: Tensor<'a>,
+    heads: DeltaHeads,
+    eps: f32,
+) -> (Tensor<'a>, Tensor<'a>) {
+    let (head_k, n_k, head_v, n_v) = heads;
+    assert_eq!(head_k, CONV_BLOCK, "conv_silu_norm: head size");
+    assert_eq!(
+        x.ne()[0],
+        2 * head_k * n_k + head_v * n_v,
+        "conv_silu_norm: conv rows"
+    );
+    let d = w.ne()[0];
+    conv_silu_node(ctx, x, state, w, d - 1, Some((2 * n_k, head_k, eps)))
+}
+
+/// The `conv_silu` node; `norm`: (heads normalized, head size, eps).
+fn conv_silu_node<'a>(
+    ctx: &'a Context,
+    x: Tensor<'a>,
+    state: Tensor<'a>,
+    w: Tensor<'a>,
+    keep: i64,
+    norm: Option<(i64, i64, f32)>,
+) -> (Tensor<'a>, Tensor<'a>) {
     let [c, nt, ns, _] = x.ne();
     let [d, wc, _, _] = w.ne();
     assert_eq!(wc, c, "conv_silu: kernel channels");
@@ -357,12 +407,18 @@ pub(super) fn conv_silu_window<'a>(
     assert!(w.is_contiguous(), "conv_silu: kernel contiguous");
     let n_out = c * nt * ns;
     let n_hist = keep * c * ns;
+    let (norm_heads, norm_head, eps) = norm.unwrap_or((0, 0, 0.0));
     let node = ctx.external_with(
         &CONV_SILU,
         types::F32,
         [n_out + n_hist, 1, 1, 1],
         &[x, state, w],
-        &[keep as i32],
+        &[
+            keep as i32,
+            norm_heads as i32,
+            norm_head as i32,
+            eps.to_bits() as i32,
+        ],
     );
     let out = ctx.view_3d(
         node,
@@ -390,7 +446,11 @@ unsafe fn cpu_conv_silu(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
         let (x, state, w) = (&*dst.src[0], &*dst.src[1], &*dst.src[2]);
         let (c_n, nt, ns) = (x.ne[0] as usize, x.ne[1] as usize, x.ne[2] as usize);
         let d = w.ne[0] as usize;
-        let keep = crate::ggml::external_params(dst)[0] as usize;
+        let params = crate::ggml::external_params(dst);
+        let keep = params[0] as usize;
+        // conv_silu_norm: these first channels' outputs are written by head below.
+        let (norm_heads, norm_head) = (params[1] as usize, params[2] as usize);
+        let norm_c = norm_heads * norm_head;
         let (x_ld, x_sd) = strides(x);
         let (st_ld, st_sd) = strides(state);
         let (xp, sp, wp) = (
@@ -407,18 +467,42 @@ unsafe fn cpu_conv_silu(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
                 *xp.add(c + (j + 1 - d) * x_ld + s * x_sd)
             }
         };
+        let conv = |t: usize, c: usize, s: usize| -> f32 {
+            let mut acc = 0f32;
+            for k in 0..d {
+                acc += input(t + k, c, s) * *wp.add(k + c * d);
+            }
+            acc / (1.0 + (-acc).exp())
+        };
         // Channels split over the threads: each reads and writes its own.
         for c in (ith..c_n).step_by(nth) {
             for s in 0..ns {
-                for t in 0..nt {
-                    let mut acc = 0f32;
-                    for k in 0..d {
-                        acc += input(t + k, c, s) * *wp.add(k + c * d);
+                if c >= norm_c {
+                    for t in 0..nt {
+                        *out.add(c + t * c_n + s * c_n * nt) = conv(t, c, s);
                     }
-                    *out.add(c + t * c_n + s * c_n * nt) = acc / (1.0 + (-acc).exp());
                 }
                 for j in 0..keep {
                     *hist.add(j + c * keep + s * keep * c_n) = input(nt + d - 1 - keep + j, c, s);
+                }
+            }
+        }
+        // The normalized heads split over the threads: `cpu_delta_prep`'s l2 norm of each.
+        let eps = f32::from_bits(params[3] as u32);
+        let scale_out = 1.0 / (norm_head as f32).sqrt();
+        let mut row = vec![0f32; norm_head];
+        for h in (ith..norm_heads).step_by(nth) {
+            for s in 0..ns {
+                for t in 0..nt {
+                    for (i, v) in row.iter_mut().enumerate() {
+                        *v = conv(t, h * norm_head + i, s);
+                    }
+                    let mean = row.iter().map(|v| v * v).sum::<f32>() / norm_head as f32;
+                    let scale = 1.0 / (mean + eps).sqrt();
+                    for (i, v) in row.iter().enumerate() {
+                        *out.add(h * norm_head + i + t * c_n + s * c_n * nt) =
+                            scale_out * (scale * v);
+                    }
                 }
             }
         }
@@ -443,6 +527,10 @@ struct ConvSilu {
     d: i32,
     keep: i32,
     chunk: i32,
+    norm_blocks: i32,
+    norm_head: i32,
+    norm_eps: f32,
+    norm_scale: f32,
     grid: [u32; 3],
     block: u32,
 }
@@ -461,8 +549,9 @@ unsafe fn cuda_conv_silu(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
         let (x_ld, x_sd) = strides(x);
         let (st_ld, st_sd) = strides(state);
         // Runs of 32 tokens a thread: enough blocks for a big step, few re-read inputs.
-        const BLOCK: u32 = 128;
+        const BLOCK: u32 = CONV_BLOCK as u32;
         const CHUNK: i64 = 32;
+        let params = crate::ggml::external_params(dst);
         let out = dst.data as *mut f32;
         let p = ConvSilu {
             x: x.data as *const f32,
@@ -478,8 +567,16 @@ unsafe fn cuda_conv_silu(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
             nt: nt as i32,
             ns: ns as i32,
             d: w.ne[0] as i32,
-            keep: crate::ggml::external_params(dst)[0],
+            keep: params[0],
             chunk: CHUNK as i32,
+            norm_blocks: params[1],
+            norm_head: params[2],
+            norm_eps: f32::from_bits(params[3] as u32),
+            norm_scale: if params[2] > 0 {
+                1.0 / (params[2] as f32).sqrt()
+            } else {
+                0.0
+            },
             grid: [
                 (c as u32).div_ceil(BLOCK),
                 (nt as u32).div_ceil(CHUNK as u32),
@@ -490,6 +587,10 @@ unsafe fn cuda_conv_silu(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
         match legion_conv_silu_launch(&p, stream) {
             0 => Ok(()),
             -1 => Err(format!("conv_silu: kernel width {} unsupported", w.ne[0])),
+            -2 => Err(format!(
+                "conv_silu: normalized heads of {} unsupported",
+                params[2]
+            )),
             e => Err(format!("conv_silu: CUDA error {e}")),
         }
     }
@@ -554,6 +655,79 @@ pub(super) fn delta_prep<'a>(
     eps: f32,
     store: Option<[Tensor<'a>; 4]>,
 ) -> [Tensor<'a>; 4] {
+    let (head_k, n_k, _, n_v) = heads;
+    let [_, nt, ns, _] = conv.ne();
+    let n = nt * ns;
+    let node = delta_prep_node(ctx, conv, alpha, beta, dt_bias, a, heads, eps, store, false);
+    let qk = head_k * n_k * n;
+    let heads_view = |at: i64| {
+        ctx.view_4d(
+            node,
+            [head_k, n_k, nt, ns],
+            [
+                head_k as usize * 4,
+                (head_k * n_k) as usize * 4,
+                (head_k * n_k * nt) as usize * 4,
+            ],
+            at as usize * 4,
+        )
+    };
+    let [g, beta] = gate_views(ctx, node, n_v, nt, ns, 2 * qk);
+    [heads_view(0), heads_view(qk), g, beta]
+}
+
+/// [`delta_prep`]'s `g` and `beta` only, for a conv output whose q and k heads
+/// [`conv_silu_norm`] normalized already (they are its q and k).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn delta_gates<'a>(
+    ctx: &'a Context,
+    conv: Tensor<'a>,
+    alpha: Tensor<'a>,
+    beta: Tensor<'a>,
+    dt_bias: Tensor<'a>,
+    a: Tensor<'a>,
+    heads: DeltaHeads,
+    eps: f32,
+) -> [Tensor<'a>; 2] {
+    let [_, nt, ns, _] = conv.ne();
+    let node = delta_prep_node(ctx, conv, alpha, beta, dt_bias, a, heads, eps, None, true);
+    gate_views(ctx, node, heads.3, nt, ns, 0)
+}
+
+/// `g` and `beta` (`[1, n_v, nt, ns]` each) of a `delta_prep` node, from float `at` on.
+fn gate_views<'a>(
+    ctx: &'a Context,
+    node: Tensor<'a>,
+    n_v: i64,
+    nt: i64,
+    ns: i64,
+    at: i64,
+) -> [Tensor<'a>; 2] {
+    let gb = n_v * nt * ns;
+    [at, at + gb].map(|at| {
+        ctx.view_4d(
+            node,
+            [1, n_v, nt, ns],
+            [4, n_v as usize * 4, (n_v * nt) as usize * 4],
+            at as usize * 4,
+        )
+    })
+}
+
+/// The `delta_prep` node: q, k, g and beta, or with `gates_only` g and beta.
+#[allow(clippy::too_many_arguments)]
+fn delta_prep_node<'a>(
+    ctx: &'a Context,
+    conv: Tensor<'a>,
+    alpha: Tensor<'a>,
+    beta: Tensor<'a>,
+    dt_bias: Tensor<'a>,
+    a: Tensor<'a>,
+    heads: DeltaHeads,
+    eps: f32,
+    store: Option<[Tensor<'a>; 4]>,
+    gates_only: bool,
+) -> Tensor<'a> {
     let (head_k, n_k, head_v, n_v) = heads;
     let [qkv_dim, nt, ns, _] = conv.ne();
     assert_eq!(
@@ -588,9 +762,9 @@ pub(super) fn delta_prep<'a>(
         // Written as side effects into the replay pool (memory of its own).
         args.extend(st);
     }
-    let qk = head_k * n_k * n;
+    let qk = if gates_only { 0 } else { head_k * n_k * n };
     let gb = n_v * n;
-    let node = ctx.external_with(
+    ctx.external_with(
         &DELTA_PREP,
         types::F32,
         [2 * qk + 2 * gb, 1, 1, 1],
@@ -601,34 +775,9 @@ pub(super) fn delta_prep<'a>(
             head_v as i32,
             n_v as i32,
             eps.to_bits() as i32,
+            gates_only as i32,
         ],
-    );
-    let heads_view = |at: i64| {
-        ctx.view_4d(
-            node,
-            [head_k, n_k, nt, ns],
-            [
-                head_k as usize * 4,
-                (head_k * n_k) as usize * 4,
-                (head_k * n_k * nt) as usize * 4,
-            ],
-            at as usize * 4,
-        )
-    };
-    let gate_view = |at: i64| {
-        ctx.view_4d(
-            node,
-            [1, n_v, nt, ns],
-            [4, n_v as usize * 4, (n_v * nt) as usize * 4],
-            at as usize * 4,
-        )
-    };
-    [
-        heads_view(0),
-        heads_view(qk),
-        gate_view(2 * qk),
-        gate_view(2 * qk + gb),
-    ]
+    )
 }
 
 unsafe fn cpu_delta_prep(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
@@ -649,10 +798,13 @@ unsafe fn cpu_delta_prep(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
         let out = dst.data as *mut f32;
         let scale_out = 1.0 / (head_k as f32).sqrt();
         let store = |i: usize| dst.src[5 + i].as_ref();
+        // `delta_gates`: g and beta only, from the output's start.
+        let gates_only = crate::ggml::external_params(dst)[5] != 0;
+        let (n_qk, at_g) = if gates_only { (0, 0) } else { (2, 2 * qk * n) };
         for t in (ith..n).step_by(nth) {
             let (ts, s) = (t % nt, t / nt);
             let row = cp.add(t * qkv_dim);
-            for which in 0..2 {
+            for which in 0..n_qk {
                 for h in 0..n_k {
                     let off = which * qk + h * head_k;
                     let x = std::slice::from_raw_parts(row.add(off), head_k);
@@ -676,8 +828,8 @@ unsafe fn cpu_delta_prep(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
                 let sp = if x > 20.0 { x } else { (1.0 + x.exp()).ln() };
                 let gv = sp * *(a.data as *const f32).add(i);
                 let bv = 1.0 / (1.0 + (-at(beta, i)).exp());
-                *out.add(2 * qk * n + t * n_v + i) = gv;
-                *out.add(2 * qk * n + n_v * n + t * n_v + i) = bv;
+                *out.add(at_g + t * n_v + i) = gv;
+                *out.add(at_g + n_v * n + t * n_v + i) = bv;
                 for (k, v) in [(2, gv), (3, bv)] {
                     if let Some(st) = store(k) {
                         let p = (st.data as *mut u8).add(ts * st.nb[2] + s * st.nb[3]);
@@ -720,6 +872,7 @@ struct DeltaPrep {
     n_tok: i32,
     eps: f32,
     scale_out: f32,
+    gates_only: i32,
 }
 
 #[cfg(feature = "cuda")]
@@ -736,7 +889,13 @@ unsafe fn cuda_delta_prep(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
         let (alpha, beta) = (&*dst.src[1], &*dst.src[2]);
         let (nt, ns) = (conv.ne[1], conv.ne[2]);
         let n = nt * ns;
-        let qk = (head_k * n_k) as i64 * n;
+        // `delta_gates`: no q and k in the output.
+        let gates_only = crate::ggml::external_params(dst)[5];
+        let qk = if gates_only != 0 {
+            0
+        } else {
+            (head_k * n_k) as i64 * n
+        };
         let gb = n_v as i64 * n;
         let out = dst.data as *mut f32;
         let mut st = [std::ptr::null_mut(); 4];
@@ -772,6 +931,7 @@ unsafe fn cuda_delta_prep(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
             n_tok: n as i32,
             eps: f32::from_bits(eps as u32),
             scale_out: 1.0 / (head_k as f32).sqrt(),
+            gates_only,
         };
         match legion_delta_prep_launch(&p, stream) {
             0 => Ok(()),
