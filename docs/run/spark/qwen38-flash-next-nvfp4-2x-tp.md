@@ -4,8 +4,8 @@
 
 `--model` is the downloaded snapshot of `nvidia/Qwen3.8-Flash-Next-NVFP4` on each Spark. One process per Spark.
 Rank 0 serves HTTP; `--tp-peers` lists the two ranks' addresses on the QSFP link (rank 0 first) and is the same on
-both. MTP uses the checkpoint's own head, so there is no `--spec-draft` file. Decode (38-51 tok/s at 1 user, 110.0 at 4,
-234.9 at 16) and prefill (2,523 / 2,609 / 2,506 tok/s at 8K / 32K / 123K):
+both. MTP uses the checkpoint's own head, so there is no `--spec-draft` file. Decode (38-52 tok/s at 1 user, 111.8 at 4,
+231.0 at 16) and prefill (2,567 / 2,669 / 2,565 tok/s at 8K / 32K / 123K):
 
 ```sh
 # rank 0
@@ -32,6 +32,7 @@ legion serve \
   --spec-fixed \
   --tp-moe-ep \
   --prefill-slots 16 \
+  --tp-rails 2 \
   --tp-rank 0 \
   --tp-peers <rank0-ip>:7619,<rank1-ip>:7619
 # rank 1: the same without --port, with --tp-rank 1
@@ -68,5 +69,9 @@ Measured against vLLM 0.33.0 with tensor parallel 2, MTP and CUDA graphs on the 
   together start decoding in the same step instead of four per step (16 users: 234.9 instead of about 223 tok/s in
   the same session without it; 1 and 4 users and prefill are unchanged). Batches change, so with several users
   greedy text can differ from the default's (as it already does between runs).
+- `--tp-rails` (`2`): Each Spark's QSFP port is two RDMA devices, one per PCIe link of about 108 Gb/s. With
+  `2`, prompt-step sums of at least 1 MiB go in 1 MiB pieces over both devices instead of only the one on the
+  `--tp-peers` address (the second needs no IP address). Prefill +2% (2,523 / 2,609 / 2,506 tok/s before);
+  decode steps stay on the first device, and the same bytes arrive, so output does not change.
 - `--tp-rank` (`0`): This process's rank in tensor parallelism across machines (one process per DGX Spark). Rank 0 serves HTTP.
 - `--tp-peers`: Every rank's `ip:port` on the QSFP link, in rank order, identical on all ranks.

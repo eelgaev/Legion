@@ -58,6 +58,9 @@ const IBV_WC_WITH_IMM: c_uint = 1 << 1;
 /// `IBV_MTU_256` .. `IBV_MTU_4096`.
 const IBV_MTU_MAX: u32 = 5;
 
+/// Where the kernel lists the RDMA devices.
+const IB_SYSFS: &str = "/sys/class/infiniband";
+
 /// Receive requests kept posted per queue pair (a write with immediate takes one each).
 const RECV_DEPTH: u32 = 64;
 const SEND_DEPTH: u32 = 16;
@@ -420,6 +423,82 @@ pub(super) fn find_gid(root: &Path, ip: IpAddr) -> Option<GidPlace> {
     None
 }
 
+/// The second rail of `primary` (`--tp-rails 2`): a RoCE GID on another RDMA device whose
+/// port is active and whose network device is the same physical NIC port as `primary`'s
+/// (equal `phys_switch_id` and `phys_port_name` under `net`, `/sys/class/net`). A DGX Spark's
+/// ConnectX-7 shows each QSFP port as two RDMA devices, one per PCIe Gen5 x4 link, each good
+/// for about 110 Gb/s of the port's 200; the second usually has no IP address, so its RoCE v1
+/// link-local GID (from the MAC, always there) is taken. `None` if there is no such device.
+pub(super) fn find_rail(ib: &Path, net: &Path, primary: &GidPlace) -> Option<GidPlace> {
+    let read = |p: std::path::PathBuf| {
+        std::fs::read_to_string(p)
+            .ok()
+            .map(|s| s.trim().to_string())
+    };
+    let ident = |nd: &str| -> Option<(String, String)> {
+        let sw = read(net.join(nd).join("phys_switch_id"))?;
+        let name = read(net.join(nd).join("phys_port_name"))?;
+        (!sw.is_empty() && !name.is_empty()).then_some((sw, name))
+    };
+    let port_dir = |dev: &str, port: u8| ib.join(dev).join("ports").join(port.to_string());
+    let p = port_dir(&primary.dev, primary.port);
+    let want = ident(&read(
+        p.join("gid_attrs/ndevs").join(primary.index.to_string()),
+    )?)?;
+    let mut devs: Vec<String> = std::fs::read_dir(ib)
+        .ok()?
+        .flatten()
+        .map(|d| d.file_name().to_string_lossy().into_owned())
+        .filter(|d| *d != primary.dev)
+        .collect();
+    devs.sort();
+    for dev in devs {
+        let Ok(rd) = std::fs::read_dir(ib.join(&dev).join("ports")) else {
+            continue;
+        };
+        let mut ports: Vec<u8> = rd
+            .flatten()
+            .filter_map(|e| e.file_name().to_string_lossy().parse().ok())
+            .collect();
+        ports.sort_unstable();
+        for port in ports {
+            let pd = port_dir(&dev, port);
+            if !read(pd.join("state")).is_some_and(|s| s.ends_with("ACTIVE")) {
+                continue;
+            }
+            let Ok(rd) = std::fs::read_dir(pd.join("gids")) else {
+                continue;
+            };
+            let mut idx: Vec<u8> = rd
+                .flatten()
+                .filter_map(|e| e.file_name().to_string_lossy().parse().ok())
+                .collect();
+            idx.sort_unstable();
+            for i in idx {
+                let at = |p: &str| pd.join(p).join(i.to_string());
+                let Some(gid) = read(at("gids")).as_deref().and_then(parse_gid) else {
+                    continue;
+                };
+                let link_local = gid.0[0] == 0xfe && gid.0[1] & 0xc0 == 0x80;
+                let v1 = read(at("gid_attrs/types")).is_some_and(|t| t == "IB/RoCE v1");
+                let same = read(at("gid_attrs/ndevs"))
+                    .as_deref()
+                    .and_then(ident)
+                    .is_some_and(|x| x == want);
+                if link_local && v1 && same {
+                    return Some(GidPlace {
+                        dev,
+                        port,
+                        index: i,
+                        gid,
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
 /// An opened device and its protection domain.
 pub(super) struct Device {
     v: &'static Verbs,
@@ -623,9 +702,25 @@ impl Endpoint {
     /// A queue pair on the device that holds `local` (the TCP connection's local address), in
     /// the INIT state with its receives posted; `None` if no device does.
     pub(super) fn open(local: IpAddr, rank: usize) -> Result<Option<Self>, String> {
-        let Some(place) = find_gid(Path::new("/sys/class/infiniband"), local) else {
+        let Some(place) = find_gid(Path::new(IB_SYSFS), local) else {
             return Ok(None);
         };
+        Self::open_at(place, rank).map(Some)
+    }
+
+    /// A queue pair on this endpoint's second rail ([`find_rail`]), in the INIT state with its
+    /// receives posted; `None` if the NIC port has no second RDMA device.
+    pub(super) fn open_rail(&self, rank: usize) -> Result<Option<Self>, String> {
+        let net = Path::new("/sys/class/net");
+        let Some(place) = find_rail(Path::new(IB_SYSFS), net, &self.dev.place) else {
+            return Ok(None);
+        };
+        Self::open_at(place, rank).map(Some)
+    }
+
+    /// A queue pair on the device and GID of `place`, in the INIT state with its receives
+    /// posted.
+    fn open_at(place: GidPlace, rank: usize) -> Result<Self, String> {
         let dev = Device::open(place)?;
         let v = dev.v;
         // SAFETY: libibverbs calls on the live device; everything made here is freed in Drop
@@ -691,7 +786,7 @@ impl Endpoint {
             for _ in 0..RECV_DEPTH {
                 ep.post_recv()?;
             }
-            Ok(Some(ep))
+            Ok(ep)
         }
     }
 

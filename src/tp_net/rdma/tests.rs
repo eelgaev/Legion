@@ -94,6 +94,90 @@ fn find_gid_skips_roce_v1_only() {
     assert!(find_gid(sys.path(), ip).is_none());
 }
 
+/// Adds to a fake infiniband tree: each (device, port, index) GID's netdev, and each
+/// device port's state; returns a fake `/sys/class/net` with each (netdev, switch id, port
+/// name).
+fn fake_rail_sysfs(
+    ib: &Path,
+    ndevs: &[(&str, u8, u8, &str)],
+    states: &[(&str, u8, &str)],
+    nets: &[(&str, &str, &str)],
+) -> tempfile::TempDir {
+    for &(dev, port, index, nd) in ndevs {
+        let p = ib.join(dev).join("ports").join(port.to_string());
+        std::fs::create_dir_all(p.join("gid_attrs/ndevs")).unwrap();
+        std::fs::write(
+            p.join("gid_attrs/ndevs").join(index.to_string()),
+            format!("{nd}\n"),
+        )
+        .unwrap();
+    }
+    for &(dev, port, state) in states {
+        let p = ib.join(dev).join("ports").join(port.to_string());
+        std::fs::write(p.join("state"), format!("{state}\n")).unwrap();
+    }
+    let net = tempfile::tempdir().unwrap();
+    for &(nd, sw, name) in nets {
+        let p = net.path().join(nd);
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("phys_switch_id"), format!("{sw}\n")).unwrap();
+        std::fs::write(p.join("phys_port_name"), format!("{name}\n")).unwrap();
+    }
+    net
+}
+
+#[test]
+fn find_rail_takes_the_link_local_roce_v1_gid_of_the_same_port() {
+    let mapped = "0000:0000:0000:0000:0000:ffff:c000:0201";
+    let ll = "fe80:0000:0000:0000:0000:0000:0000:0002";
+    let sys = fake_sysfs(&[
+        ("mlx5_a", 1, 3, mapped, "RoCE v2"),
+        // Another port's device: same type of GID, another netdev identity.
+        ("mlx5_b", 1, 0, ll, "IB/RoCE v1"),
+        // The second device of the primary's port: RoCE v2 link-local, then RoCE v1.
+        ("mlx5_c", 1, 1, ll, "RoCE v2"),
+        ("mlx5_c", 1, 0, ll, "IB/RoCE v1"),
+    ]);
+    let net = fake_rail_sysfs(
+        sys.path(),
+        &[
+            ("mlx5_a", 1, 3, "nd_a"),
+            ("mlx5_b", 1, 0, "nd_b"),
+            ("mlx5_c", 1, 0, "nd_c"),
+            ("mlx5_c", 1, 1, "nd_c"),
+        ],
+        &[
+            ("mlx5_a", 1, "4: ACTIVE"),
+            ("mlx5_b", 1, "4: ACTIVE"),
+            ("mlx5_c", 1, "4: ACTIVE"),
+        ],
+        &[
+            ("nd_a", "0c42a1", "p0"),
+            ("nd_b", "0c42a1", "p1"),
+            ("nd_c", "0c42a1", "p0"),
+        ],
+    );
+    let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+    let primary = find_gid(sys.path(), ip).unwrap();
+    assert_eq!(primary.dev, "mlx5_a");
+    let rail = find_rail(sys.path(), net.path(), &primary).unwrap();
+    assert_eq!(
+        rail,
+        GidPlace {
+            dev: "mlx5_c".into(),
+            port: 1,
+            index: 0,
+            gid: parse_gid(ll).unwrap(),
+        }
+    );
+    // The second device down: no rail.
+    std::fs::write(sys.path().join("mlx5_c/ports/1/state"), "1: DOWN\n").unwrap();
+    assert!(find_rail(sys.path(), net.path(), &primary).is_none());
+    // No netdev identity for the primary (no `phys_switch_id`): no rail.
+    std::fs::remove_file(net.path().join("nd_a/phys_switch_id")).unwrap();
+    assert!(find_rail(sys.path(), net.path(), &primary).is_none());
+}
+
 #[test]
 fn offer_round_trips() {
     let o = Offer {

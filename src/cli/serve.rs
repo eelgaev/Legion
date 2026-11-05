@@ -675,6 +675,15 @@ pub(super) struct ModelArgs {
     /// sums a token). Every rank must pass the same value.
     #[arg(long, value_name = "MODE", value_enum, default_value_t = legion::tp_net::Transport::Auto)]
     pub tp_transport: legion::tp_net::Transport,
+    /// With --tp-rank and RDMA: RDMA rails per peer, 1 (default) or 2. A DGX Spark's QSFP port
+    /// is two RDMA devices (two PCIe links of about 108 Gb/s each); 1 uses the one on the
+    /// --tp-peers address, 2 also the other (by its link-local RoCE v1 address, no IP needed)
+    /// and sends each prompt-step sum of at least 1 MiB in 1 MiB pieces over both, each
+    /// device taking the next piece as it frees up. The same bytes arrive: outputs do not
+    /// change. Decode-step sums stay on the first. A rank without a second device, or a peer
+    /// passing 1, keeps one rail.
+    #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=2))]
+    pub tp_rails: u8,
     /// With --tp-rank: log where the steps' time went (compute, waits for the other ranks'
     /// shares, the step send) every N steps on each rank, to tune a setup. 0 (default): off.
     #[arg(long, value_name = "N", default_value_t = 0)]
@@ -2081,6 +2090,7 @@ pub async fn run(
                     peers: e.model.tp_peers.clone(),
                     timeout: std::time::Duration::from_secs(e.model.tp_timeout.max(1)),
                     transport: e.model.tp_transport,
+                    rails: e.model.tp_rails.into(),
                     profile: e.model.tp_profile,
                     wire: e.model.tp_wire,
                     seq_par: e.model.tp_seq_par,
