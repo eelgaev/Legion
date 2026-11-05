@@ -1737,6 +1737,19 @@ impl ExpertResidency {
             .collect()
     }
 
+    /// Per CUDA device (ggml index) with tiered layers: the bytes its slots take, ascending
+    /// by index (for the load's memory plan). Layers on the CPU backend are left out.
+    pub fn slot_bytes_by_cuda(&self) -> Vec<(usize, u64)> {
+        let mut out: std::collections::BTreeMap<usize, u64> = Default::default();
+        for (il, _, bytes) in self.layer_slots() {
+            let dev = self.layers[il].as_ref().map(|l| l.dev);
+            if let Some(cuda) = dev.and_then(|d| self.devices[d].place.cuda) {
+                *out.entry(cuda).or_default() += bytes;
+            }
+        }
+        out.into_iter().collect()
+    }
+
     /// Per tiered layer: (layer id, slots, hits, misses).
     pub fn layer_stats(&self) -> Vec<(usize, usize, u64, u64)> {
         self.layers

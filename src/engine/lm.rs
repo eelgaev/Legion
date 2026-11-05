@@ -41,6 +41,7 @@ mod node;
 mod pair_tp;
 mod pipe;
 pub mod pipe_split;
+mod plan;
 mod preempt;
 pub mod report;
 mod response_format;
@@ -3282,6 +3283,90 @@ fn load_report(
     }
 }
 
+/// What [`log_memory_plan`] takes from [`LmEngine::load`]'s own decisions.
+struct MemoryPlanFacts<'a> {
+    ctx_size: usize,
+    max_seqs: usize,
+    /// KV blocks in all.
+    n_blocks: usize,
+    kv_lend: Option<&'a kv_vmm::KvLend>,
+    /// Per stage: its pools' tail lent to the expert cache at load (empty without a lend).
+    kv_lent_bytes: &'a [usize],
+    /// Per stage: the VRAM kept free of the expert cache for step compute buffers, and the
+    /// prompt steps' room the cache took (empty when the load measured none).
+    planned_compute: &'a [usize],
+    compute_spill: &'a [usize],
+}
+
+/// Logs the memory plan (#1196, [`plan`]) once loaded: per GPU and in host memory, from the
+/// load report, the load's own decisions and the driver. Printing only.
+fn log_memory_plan(
+    layout: &layout::Layout,
+    exec: &mut Executor,
+    report: &report::LoadReport,
+    f: MemoryPlanFacts<'_>,
+) {
+    let experts = exec
+        .experts_mut()
+        .map(|r| r.slot_bytes_by_cuda())
+        .unwrap_or_default();
+    let gpu = |d: crate::ggml::Device| {
+        let (free, total) = d.memory();
+        plan::Gpu {
+            device: d.name(),
+            name: d.description(),
+            cuda: cuda_index(d),
+            total: total as u64,
+            free: free as u64,
+        }
+    };
+    let keep_tokens = f.kv_lend.map(|l| l.keep * KV_BLOCK);
+    let n_stages = exec.stage_layers().len();
+    let mut gpus = Vec::new();
+    for (si, ((d, _), s)) in layout.stages.iter().zip(&report.stages).enumerate() {
+        let Some(d) = d.filter(|d| d.kind() != crate::ggml::DeviceKind::Cpu) else {
+            continue;
+        };
+        // Tensor parallelism: one stage over the meta device's GPUs.
+        let devs: Vec<plan::Gpu> = if layout.tp_devices.is_empty() {
+            vec![gpu(d)]
+        } else {
+            layout.tp_devices.iter().map(|&d| gpu(d)).collect()
+        };
+        let at = |v: &[usize]| v.get(si).map_or(0, |&b| b as u64);
+        let facts = plan::StageFacts {
+            kv_lent: at(f.kv_lent_bytes),
+            kv_vram_tokens: keep_tokens.unwrap_or(s.kv_tokens),
+            compute_allocated: if si < n_stages {
+                exec.compute_bytes(si) as u64
+            } else {
+                0
+            },
+            compute_planned: at(f.planned_compute),
+        };
+        gpus.extend(plan::stage_gpus(s, &facts, &devs, &experts));
+    }
+    let mut host = plan::host_from_report(report);
+    host.kv_spill_max = f.kv_lend.map_or(0, |l| l.host_budget as u64);
+    host.compute_spill_max = f.compute_spill.iter().sum::<usize>() as u64;
+    host.available = crate::residency::lookup_table::MemInfo::read().available;
+    let tail_tokens = f
+        .kv_lend
+        .map_or(0, |l| f.n_blocks.saturating_sub(l.keep) * KV_BLOCK);
+    let lent = f.kv_lent_bytes.iter().sum::<usize>() as u64;
+    plan::log(&plan::MemoryPlan {
+        context: plan::ContextPlan {
+            ctx_size: f.ctx_size,
+            max_seqs: f.max_seqs,
+            kv_pool_tokens: f.n_blocks * KV_BLOCK,
+            kv_host_tier_tokens: report.kv.host_tokens,
+            kv_spill_tokens: plan::spill_tokens(tail_tokens, lent, host.kv_spill_max),
+        },
+        gpus,
+        host,
+    });
+}
+
 /// The model's id: `--model-name`, else the checkpoint's `general.name`, else its file stem.
 fn model_id(cfg: &LmConfig, gguf: &GgufFile) -> String {
     cfg.model_name.clone().unwrap_or_else(|| {
@@ -4288,6 +4373,8 @@ impl LmEngine {
         }
         // `--kv-vmm-keep` (#814): the pools' tails, lent to the expert cache at its sizing.
         let mut kv_lend: Option<kv_vmm::KvLend> = None;
+        // Per stage: the bytes of its tail lent at load (for the memory plan).
+        let mut kv_lent_bytes: Vec<usize> = Vec::new();
         // A host tier (#352): more blocks, in pinned host memory on each GPU's node, after the
         // ones that fit in device memory. The allocator hands out device blocks first.
         let mut hbm_blocks = n_blocks;
@@ -4383,6 +4470,10 @@ impl LmEngine {
         }
         // The measured step compute buffers per stage (for the startup report).
         let mut measured_compute: Vec<usize> = Vec::new();
+        // Per stage, for the memory plan: the VRAM kept free of the expert cache for step
+        // compute buffers, and the prompt steps' room the cache took (may spill to host).
+        let mut planned_compute: Vec<usize> = Vec::new();
+        let mut compute_spill: Vec<usize> = Vec::new();
         if mode == ExpertMode::Cache {
             // The cache takes the VRAM the compute buffers leave: measure what the longest
             // prompt steps (a full chunk at the end of the context) need on each stage. A
@@ -4557,12 +4648,18 @@ impl LmEngine {
             } else {
                 compute.clone()
             };
+            compute_spill = compute
+                .iter()
+                .zip(&cache_compute)
+                .map(|(&c, &l)| c.saturating_sub(l))
+                .collect();
             // The head's room stays out of the kept step graphs' budget below: its graphs
             // keep buffers of their own.
             let mut cache_compute = cache_compute;
             if let Some(last) = cache_compute.last_mut() {
                 *last += mtp_head + head_pool;
             }
+            planned_compute = cache_compute.clone();
             let mut pinned = vec![0; cache_compute.len()];
             if let Some(last) = pinned.last_mut() {
                 *last = head_pool;
@@ -4586,6 +4683,7 @@ impl LmEngine {
                         for (l, b) in long.iter_mut().zip(&bytes) {
                             *l += b;
                         }
+                        kv_lent_bytes = bytes;
                         kv_lend = Some(lend);
                     }
                 } else if cfg.switches.kv_vmm_keep.is_some() {
@@ -4820,6 +4918,20 @@ impl LmEngine {
                 ngram,
                 engram,
                 saved_host_bytes,
+            },
+        );
+        log_memory_plan(
+            &layout,
+            &mut exec,
+            &load_report,
+            MemoryPlanFacts {
+                ctx_size: cfg.ctx_size,
+                max_seqs,
+                n_blocks,
+                kv_lend: kv_lend.as_ref(),
+                kv_lent_bytes: &kv_lent_bytes,
+                planned_compute: &planned_compute,
+                compute_spill: &compute_spill,
             },
         );
 
