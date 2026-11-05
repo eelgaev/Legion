@@ -6,6 +6,8 @@
 //                  by the router weights, then one add per expert, in expert order, each
 //                  rounded), and the shared expert gated by its sigmoid added: ggml's
 //                  op_sigmoid, mul and add, each rounded (shexp_gate_kernel's, fused.cu).
+//   moe_tail_fma   moe_sum_gate's tail where ggml-cuda fuses the weighted sum (one fma per
+//                  expert), zero-weight rows not read (#1176, --tp-moe-ep).
 //   ids_remap      the routed expert ids through the layer's expert table: ggml's cont and
 //                  get_rows of the I32 ids (integers, exact).
 //
@@ -68,6 +70,87 @@ __global__ void moe_sum_gate_kernel(const legion_moe_sum_gate p) {
     p.out[i] = sum;
 }
 
+// moe_tail_fma (#1176): a MoE layer's tail whose weighted sum ggml-cuda fuses, in one launch:
+// the first product rounded, then one fma per expert (moe_weighted_reduction_f32, as
+// fused.cu's moe_combine_kernel), then the shared expert gated by its sigmoid added
+// (moe_sum_gate_kernel's gate). A term whose router weight is zero is made from a zero instead
+// of its expert's row, which is not read: under --tp-moe-ep the experts another rank holds
+// have zero weights and rows the grouped NVFP4 kernels stored as +0.0, so the same values with
+// about half the rows read. V columns per thread (4: float4 loads, the host checks that
+// n_embd is a multiple of 4 and the rows 16-byte aligned).
+constexpr int TAIL_GROUP = 8;
+
+template <int V> __device__ __forceinline__ void load_cols(const float * src, float (&v)[V]) {
+    if constexpr (V == 4) {
+        const float4 q = *(const float4 *) src;
+        v[0]           = q.x;
+        v[1]           = q.y;
+        v[2]           = q.z;
+        v[3]           = q.w;
+    } else {
+#pragma unroll
+        for (int r = 0; r < V; ++r) {
+            v[r] = src[r];
+        }
+    }
+}
+
+template <int V> __global__ void moe_tail_fma_kernel(const legion_moe_sum_gate p) {
+    const int64_t t   = blockIdx.x;
+    const int64_t col = ((int64_t) blockIdx.y * blockDim.x + threadIdx.x) * V;
+    if (col >= p.n_embd) {
+        return;
+    }
+    const int64_t first = t * p.k;
+    const float * x     = p.x + first * p.n_embd + col;
+    float         sum[V] = {};
+    for (int j0 = 0; j0 < p.k; j0 += TAIL_GROUP) {
+        // A group's rows in flight before their sums (the weights are the token's: uniform).
+        float v[TAIL_GROUP][V];
+        float wj[TAIL_GROUP];
+#pragma unroll
+        for (int q = 0; q < TAIL_GROUP; ++q) {
+            const int j = j0 + q;
+            wj[q]       = j < p.k ? p.w[first + j] : 0.0f;
+            if (j < p.k && wj[q] != 0.0f) {
+                load_cols<V>(x + (int64_t) j * p.n_embd, v[q]);
+            } else {
+#pragma unroll
+                for (int r = 0; r < V; ++r) {
+                    v[q][r] = 0.0f;
+                }
+            }
+        }
+#pragma unroll
+        for (int q = 0; q < TAIL_GROUP; ++q) {
+            if (j0 + q < p.k) {
+#pragma unroll
+                for (int r = 0; r < V; ++r) {
+                    sum[r] = j0 + q == 0 ? __fmul_rn(v[q][r], wj[q]) : __fmaf_rn(v[q][r], wj[q], sum[r]);
+                }
+            }
+        }
+    }
+    // ggml-cuda's op_sigmoid (both built with fast math), then the mul and the add.
+    const float gv = p.g[t * p.g_ld];
+    const float s  = 1.0f / (1.0f + expf(-gv));
+    const int64_t i = t * p.n_embd + col;
+    float         sh[V];
+    load_cols<V>(p.sh + i, sh);
+#pragma unroll
+    for (int r = 0; r < V; ++r) {
+        sum[r] = __fadd_rn(sum[r], __fmul_rn(sh[r], s));
+    }
+    if constexpr (V == 4) {
+        *(float4 *) (p.out + i) = make_float4(sum[0], sum[1], sum[2], sum[3]);
+    } else {
+#pragma unroll
+        for (int r = 0; r < V; ++r) {
+            p.out[i + r] = sum[r];
+        }
+    }
+}
+
 __global__ void ids_remap_kernel(const legion_ids_remap p) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= p.n) {
@@ -85,3 +168,7 @@ __global__ void ids_remap_kernel(const legion_ids_remap p) {
 // (see gate_q8.cu for why they sit in an anonymous namespace).
 extern "C" const void * const legion_moe_sum_gate_kernel = reinterpret_cast<const void *>(&moe_sum_gate_kernel);
 extern "C" const void * const legion_ids_remap_kernel    = reinterpret_cast<const void *>(&ids_remap_kernel);
+extern "C" const void * const legion_moe_tail_fma_kernel =
+    reinterpret_cast<const void *>(&moe_tail_fma_kernel<1>);
+extern "C" const void * const legion_moe_tail_fma4_kernel =
+    reinterpret_cast<const void *>(&moe_tail_fma_kernel<4>);
