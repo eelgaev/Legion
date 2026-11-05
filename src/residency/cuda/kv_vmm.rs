@@ -324,49 +324,61 @@ pub fn kv_vmm_unmap(
         }
         let mut copies = copies.into_iter().peekable();
         let mut out = Vec::new();
-        for (i, p) in b.maps.iter_mut().enumerate() {
-            if !lent(p) {
-                continue;
-            }
-            out.push((p.off - at, p.n));
-            let va = b.va + p.off as u64;
-            let copy = copies.next_if(|c| c.0 == i).map(|c| c.1);
-            match std::mem::replace(&mut p.back, Back::None) {
-                Back::None => {}
-                Back::Vram(h) => {
-                    let unmapped = cu(cuMemUnmap(va, p.n), "cuMemUnmap(KV pool)");
-                    if let Err(e) = unmapped {
-                        p.back = Back::Vram(h);
+        // Every error exit leaves the copies not yet mapped in `copies`; they go back to the
+        // pool below, so a failed shrink never shrinks the host budget for good.
+        let mut walk = || -> Result<(), String> {
+            for (i, p) in b.maps.iter_mut().enumerate() {
+                if !lent(p) {
+                    continue;
+                }
+                out.push((p.off - at, p.n));
+                let va = b.va + p.off as u64;
+                let copy = copies.next_if(|c| c.0 == i).map(|c| c.1);
+                match std::mem::replace(&mut p.back, Back::None) {
+                    Back::None => {}
+                    Back::Vram(h) => {
+                        let unmapped = cu(cuMemUnmap(va, p.n), "cuMemUnmap(KV pool)");
+                        if let Err(e) = unmapped {
+                            p.back = Back::Vram(h);
+                            if let Some(hp) = copy {
+                                host_give(hp);
+                            }
+                            return Err(e);
+                        }
+                        cuMemRelease(h);
                         if let Some(hp) = copy {
-                            host_give(hp);
+                            let mapped = cu(cuMemMap(va, p.n, 0, hp.h, 0), "cuMemMap(KV host)");
+                            if let Err(e) = mapped {
+                                host_give(hp);
+                                return Err(e);
+                            }
+                            let a = access(CU_MEM_LOCATION_TYPE_DEVICE, b.device as i32);
+                            let r = cu(cuMemSetAccess(va, p.n, &a, 1), "cuMemSetAccess(KV host)");
+                            if let Err(e) = r {
+                                cuMemUnmap(va, p.n);
+                                host_give(hp);
+                                return Err(e);
+                            }
+                            p.back = Back::Host(hp);
                         }
-                        return Err(e);
                     }
-                    cuMemRelease(h);
-                    if let Some(hp) = copy {
-                        let mapped = cu(cuMemMap(va, p.n, 0, hp.h, 0), "cuMemMap(KV host)");
-                        if let Err(e) = mapped {
-                            host_give(hp);
+                    Back::Host(hp) if wanted(p) => p.back = Back::Host(hp),
+                    Back::Host(hp) => {
+                        if let Err(e) = cu(cuMemUnmap(va, p.n), "cuMemUnmap(KV host)") {
+                            p.back = Back::Host(hp);
                             return Err(e);
                         }
-                        let a = access(CU_MEM_LOCATION_TYPE_DEVICE, b.device as i32);
-                        let r = cu(cuMemSetAccess(va, p.n, &a, 1), "cuMemSetAccess(KV host)");
-                        if let Err(e) = r {
-                            cuMemUnmap(va, p.n);
-                            host_give(hp);
-                            return Err(e);
-                        }
-                        p.back = Back::Host(hp);
+                        host_give(hp);
                     }
-                }
-                Back::Host(hp) if wanted(p) => p.back = Back::Host(hp),
-                Back::Host(hp) => {
-                    cu(cuMemUnmap(va, p.n), "cuMemUnmap(KV host)")?;
-                    host_give(hp);
                 }
             }
+            Ok(())
+        };
+        let walked = walk();
+        for (_, hp) in copies {
+            host_give(hp);
         }
-        Ok(out)
+        walked.map(|()| out)
     }
 }
 
