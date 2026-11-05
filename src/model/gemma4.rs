@@ -547,12 +547,19 @@ impl Model {
         let norm = |t: Tensor<'a>, il: usize, name: &str| -> Result<Tensor<'a>, ModelError> {
             Ok(ctx.mul(ctx.rms_norm(t, eps), self.lw(il, name)?))
         };
+        // The positions (the first section of the multi-section position input) as one view
+        // for every layer's RoPE, in the graph ahead of the layers. A view made per RoPE lands
+        // in the graph between the head norm's `mul` and the `rope`, and ggml-cuda then runs
+        // norm, weight and RoPE as two kernels instead of its one fused kernel (the same
+        // operations, so the same bits).
+        let pos = ctx.view_1d(pass.pos, n, 0);
+        pass.graph.borrow_mut().expand(pos);
         let mut hidden = Vec::new();
         for il in layers {
             let h = norm(x, il, "attn_norm.weight")?;
             tap.tap("attn_norm", il, h);
             let pre = (x, self.lw(il, "attn_norm.weight")?, eps);
-            let o = self.gemma4_attention(pass, il, h, pre)?;
+            let o = self.gemma4_attention(pass, il, h, pre, pos)?;
             let o = norm(o, il, "post_attention_norm.weight")?;
             tap.tap("attn_post_norm", il, o);
             let attn_out = ctx.add(o, x);
@@ -599,17 +606,16 @@ impl Model {
         Ok((x, hidden))
     }
 
-    /// RoPE of `t` (`[head_dim, heads, n]`) for layer `il`: the sliding-window layers' base,
-    /// or the global layers' base and frequency factors.
+    /// RoPE of `t` (`[head_dim, heads, n]`) at positions `pos` for layer `il`: the
+    /// sliding-window layers' base, or the global layers' base and frequency factors.
     fn gemma4_rope<'a>(
         &'a self,
         pass: &Pass<'a>,
         il: usize,
         t: Tensor<'a>,
+        pos: Tensor<'a>,
     ) -> Result<Tensor<'a>, ModelError> {
         let (ctx, hp, g) = (pass.ctx, &self.hp, self.gemma());
-        // The positions are the first section of the (multi-section) position input.
-        let pos = ctx.view_1d(pass.pos, pass.n, 0);
         Ok(if g.swa[il] {
             ctx.rope_ext(
                 t,
@@ -638,12 +644,14 @@ impl Model {
 
     /// Attention of layer `il` over the normed residual `h`: queries always, keys and values
     /// into the cache unless the layer reads another layer's; then the output projection.
+    /// `pos`: the tokens' positions (I32 `[n]`).
     fn gemma4_attention<'a>(
         &'a self,
         pass: &Pass<'a>,
         il: usize,
         h: Tensor<'a>,
         pre: (Tensor<'a>, Tensor<'a>, f32),
+        pos: Tensor<'a>,
     ) -> Result<Tensor<'a>, ModelError> {
         let (ctx, tap, n) = (pass.ctx, &pass.tap, pass.n);
         let hp = &self.hp;
@@ -672,7 +680,7 @@ impl Model {
         let q = proj("attn_q.weight")?;
         let q = ctx.reshape_3d(q, d, hp.n_head, n);
         let q = ctx.mul(ctx.rms_norm(q, eps), self.lw(il, "attn_q_norm.weight")?);
-        let q = self.gemma4_rope(pass, il, q)?;
+        let q = self.gemma4_rope(pass, il, q, pos)?;
         tap.tap("Qcur_pos", il, q);
         if hp.owns_kv(il) {
             let k = proj("attn_k.weight")?;
@@ -685,7 +693,7 @@ impl Model {
             let v = ctx.reshape_3d(v, d, n_kv, n);
             let k = ctx.mul(ctx.rms_norm(k, eps), self.lw(il, "attn_k_norm.weight")?);
             let v = ctx.rms_norm(v, eps);
-            let k = self.gemma4_rope(pass, il, k)?;
+            let k = self.gemma4_rope(pass, il, k, pos)?;
             tap.tap("Kcur_pos", il, k);
             tap.tap("Vcur_normed", il, v);
             let mut graph = pass.graph.borrow_mut();
