@@ -13,6 +13,7 @@ permissions:
   contents: read
 jobs:
   build:
+    name: aarch64 CUDA 13 sm_121a (Spark-like)
     # Self-hosted aarch64 box with the CUDA 13.0 toolkit and no GPU. Pull requests from forks
     # do not run here: a public repo must not run untrusted code on a self-hosted runner.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
