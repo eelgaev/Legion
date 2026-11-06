@@ -58,6 +58,9 @@ pub struct Switches {
     /// Attention layers' K/V and indexer cache appends and pool-key op
     /// ([`crate::model::core::set_kv_append`]).
     pub kv_append: Option<bool>,
+    /// Gemma 4's layers sharing one positions view, so ggml-cuda fuses the heads' norm and RoPE
+    /// ([`crate::model::gemma4::set_head_rope_fused`]).
+    pub head_rope_fused: Option<bool>,
     /// Small steps read weight pairs that lie back to back as one matmul
     /// ([`crate::model::core::set_joined_matmuls`]).
     pub joined_matmuls: Option<bool>,
@@ -524,6 +527,10 @@ impl Switches {
         }
         set(self.norm_rope, core::set_norm_rope);
         set(self.kv_append, core::set_kv_append);
+        set(
+            self.head_rope_fused,
+            crate::model::gemma4::set_head_rope_fused,
+        );
         set(self.joined_matmuls, core::set_joined_matmuls);
         if let Some(n) = self.joined_prompt_min_tokens {
             core::set_joined_prompt_min_tokens(n);

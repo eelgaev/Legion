@@ -18,19 +18,20 @@ legion serve \
   --spec-gate-cost-model off \
   --nvfp4-a4 prefill \
   --spec-draft-weights q8_0 \
-  --spec-draft-lm-head q4
+  --spec-draft-lm-head q4 \
+  --head-rope-fused
 ```
 
 Deterministic client: 8 fixed prompts (prose, code, lists, chats, a story; thinking off and on), temperature 0,
-256 tokens each, 2 rounds at 1, 4 and 16 users (2026-11-03). At 1 user the speed depends on how many drafts
-the prompt accepts: 21.1 tok/s (story) to 39.7 (code in a chat), 27.8 in all (median), mean accepted length
-3.29, the same tokens in both rounds and the same tokens as without the three opt-ins. 80.8 tok/s at 4 users,
-219.8 at 16 users. Prefill 8K 1,710 and 32K 1,438 tok/s, one request each, from the same server. Prefill
-123K (122,880 tokens, one request, a later session of the same command): 849 tok/s (8K 1,719 and 32K 1,455
-in that session); 587 without the three opt-ins.
+256 tokens each, 2 rounds at 1, 4 and 16 users (2026-11-06). At 1 user the speed depends on how many drafts
+the prompt accepts: 22.1 tok/s (story) to 39.5 (code), 29.0 in all (median), mean accepted length 3.34, the
+same tokens in both rounds. 81.0 tok/s at 4 users, 235.1 at 16 users. Prefill 8K 1,845, 32K 1,540 and 123K
+(122,880 tokens) 874 tok/s, one request each, from the same server. The build before `--head-rope-fused`
+(and the captured-rows change that came with it), same session, without the flag: 21.9-40.2 at 1 user (28.3
+median), 81.9 at 4 users, 221.9 at 16, prefill 8K 1,727, 32K 1,458, 123K 848.
 
-The same session without the last three flags (all of them opt-in): 18-33 tok/s at 1 user (24.4 median,
-accepted length 3.36), 70.2 at 4 users, 154.3 at 16, prefill 8K 897 and 32K 710. `--nvfp4-a4 prefill` alone
+An earlier session (2026-11-03) without the last four flags (all of them opt-in): 18-33 tok/s at 1 user (24.4 median,
+accepted length 3.36), 70.2 at 4 users, 154.3 at 16, prefill 8K 897 and 32K 710 (123K 587). `--nvfp4-a4 prefill` alone
 gives most of the prefill and 16-user gain (16 users ~187); the 8-bit drafter and its 4-bit head make each
 draft pass cheaper (16 users ~212 with both). `--spec-draft-vocab 131072` on top cuts the accepted length
 to ~2.3 and is slower at every concurrency.
@@ -46,3 +47,4 @@ to ~2.3 and is slower at every concurrency.
 - `--nvfp4-a4` (`prefill`, opt-in): runs every NVFP4 matmul of batches over 64 tokens with 4-bit activations on the GB10's block-scaled FP4 tensor cores: prompt steps, and the 128-token verify steps of 16 users. The RedHatAI checkpoint is calibrated for 4-bit activations (vLLM runs it W4A4). For Gemma 4, q, k and v share one activation quantization with the attention norm folded into it, and gate, up and the GELU run as one kernel with the FFN norm folded in. Faster prefill and 16-user decode, output-moving (prompts and batches of over 64 tokens).
 - `--spec-draft-weights` (`q8_0`, opt-in): the drafter's BF16 layers (~4.8 GB read per draft pass) quantized to Q8_0 at load. Drafts only, every token is still verified by the full model; at 4 and 16 users the drafts shape the verify batches, so the text can move.
 - `--spec-draft-lm-head` (`q4`, opt-in): the drafter reads a 4-bit copy of Gemma's tied 262,144-row head (2.8 GB in BF16) made at load. Drafts only, as above.
+- `--head-rope-fused` (opt-in): every layer's RoPE reads one shared view of the positions, so ggml-cuda runs the q and k heads' norm, weight and RoPE as its one fused kernel instead of two. Prefill ~4% faster at 8K and 32K, 16 users a few percent. Output-moving: the fused kernel rounds differently.

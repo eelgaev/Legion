@@ -143,6 +143,12 @@ pub(in crate::cli) struct SwitchArgs {
     /// Decode about +2-5% on V100. Off by default.
     #[arg(long, help_heading = HEADING)]
     kv_append: bool,
+    /// CUDA, Gemma 4: one positions view shared by every layer's RoPE, so ggml-cuda runs the
+    /// q and k heads' norm, weight and RoPE as its one fused kernel instead of two. Prompts ~4%
+    /// faster at 8K on a DGX Spark (GB10). The fused kernel rounds differently, so greedy
+    /// output differs from the default. Off by default.
+    #[arg(long, help_heading = HEADING)]
+    head_rope_fused: bool,
     /// CUDA, steps of up to 3 tokens: two matmuls per layer each (DeltaNet alpha and beta; with
     /// --shexp-gate also the MoE router and the shared expert's gate) instead of one over both
     /// weights, which lie back to back in memory (the default: the same bits, one launch fewer
@@ -1350,6 +1356,7 @@ impl SwitchArgs {
             gdn_state_defer_min_seqs: self.gdn_state_defer_min_seqs,
             norm_rope: self.norm_rope.then_some(true),
             kv_append: self.kv_append.then_some(true),
+            head_rope_fused: self.head_rope_fused.then_some(true),
             joined_matmuls: self.no_joined_matmuls.then_some(false),
             joined_prompt_min_tokens: self.joined_prompt_min_tokens,
             joined_prompt_z: self.no_joined_prompt_z.then_some(false),

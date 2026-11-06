@@ -1,4 +1,4 @@
-use super::{SPARE_MAX_BYTES, Spare, copy_out, take_layer};
+use super::{SPARE_KEPT, SPARE_MAX_BYTES, Spare, copy_out, take_layer};
 
 fn floats(seed: usize, n: usize) -> Vec<f32> {
     (0..n).map(|i| (seed * 1_000_000 + i) as f32).collect()
@@ -37,18 +37,71 @@ fn copy_out_leaves_a_spare_too_small() {
 }
 
 #[test]
-fn keep_takes_the_biggest_worth_keeping() {
+fn keep_takes_the_vectors_worth_keeping() {
     let mut spare = Spare::default();
     // Under the minimum: dropped.
     spare.keep([floats(1, 10)], 400);
     assert_eq!(spare.capacity(), 0);
+    assert_eq!(spare.kept(), 0);
     spare.keep([floats(1, 200), floats(2, 300), floats(3, 250)], 400);
     assert_eq!(spare.capacity(), 300);
-    // Not bigger than the one kept: dropped.
-    spare.keep([floats(4, 300)], 400);
-    assert_eq!(spare.capacity(), 300);
+    assert_eq!(spare.kept(), 3);
     spare.keep([Vec::with_capacity(SPARE_MAX_BYTES / 4 + 1)], 400);
     assert_eq!(spare.capacity(), 300, "a whole prompt's output is not kept");
+    assert_eq!(spare.kept(), 3);
+}
+
+/// A drafter reading several layers: every layer's copy of the next chunk goes into a vector
+/// handed back, the smallest one with room each time.
+#[test]
+fn several_copies_reuse_several_spares() {
+    let mut spare = Spare::default();
+    let old: Vec<Vec<f32>> = (0..5).map(|k| floats(k, 1000 + k)).collect();
+    let at: Vec<*const f32> = old.iter().map(|v| v.as_ptr()).collect();
+    spare.keep(old, 0);
+    let mut got = Vec::new();
+    for k in 0..5 {
+        let src = floats(10 + k, 1000);
+        let v = copy_out(&mut spare, src.as_ptr() as usize, src.len());
+        assert_eq!(v, src);
+        got.push(v.as_ptr());
+    }
+    assert_eq!(spare.kept(), 0, "all taken");
+    // Smallest first: the vectors in the order they were made.
+    assert_eq!(got, at);
+    // A copy bigger than all of them makes a new vector and leaves them.
+    spare.keep([floats(1, 100), floats(2, 200)], 0);
+    let src = floats(3, 201);
+    assert_eq!(copy_out(&mut spare, src.as_ptr() as usize, src.len()), src);
+    assert_eq!(spare.kept(), 2);
+    assert_eq!(spare.capacity(), 200);
+}
+
+#[test]
+fn keep_holds_at_most_spare_kept_vectors_biggest_first() {
+    let mut spare = Spare::default();
+    spare.keep((0..SPARE_KEPT + 3).map(|k| floats(k, 100 + k)), 0);
+    assert_eq!(spare.kept(), SPARE_KEPT);
+    assert_eq!(spare.capacity(), 100 + SPARE_KEPT + 2);
+    // The smallest kept is the one the smallest copy takes.
+    let src = floats(0, 1);
+    let v = copy_out(&mut spare, src.as_ptr() as usize, 1);
+    assert_eq!(v.capacity(), 103);
+}
+
+#[test]
+fn keep_holds_at_most_spare_max_bytes_together() {
+    let mut spare = Spare::default();
+    let half = SPARE_MAX_BYTES / 4 / 2;
+    spare.keep(
+        [
+            Vec::<f32>::with_capacity(half),
+            Vec::with_capacity(half),
+            Vec::with_capacity(half),
+        ],
+        0,
+    );
+    assert_eq!(spare.kept(), 2);
 }
 
 #[test]

@@ -30,6 +30,7 @@ pub mod tiny;
 pub use assistant::AssistantParams;
 
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::ggml::{Context, ROPE_NEOX, Tensor};
 use crate::gguf::GgufFile;
@@ -41,6 +42,20 @@ use crate::model::core::{
     StatePool,
 };
 use crate::model::core::{Group, stable_fusions};
+
+/// Whether graphs built from now on share one positions view across the layers' RoPEs.
+static HEAD_ROPE_FUSED: AtomicBool = AtomicBool::new(false);
+
+/// Sets whether graphs built from now on make the positions view once, ahead of the layers,
+/// for every RoPE; `legion serve --head-rope-fused` turns it on. A view made per RoPE lands in
+/// the graph between the head norm's `mul` and the `rope`, so ggml-cuda runs the q and k heads'
+/// norm and weight as one kernel and the RoPE as another; with the shared view it runs its one
+/// fused norm + weight + RoPE kernel (8K prompts ~4% faster on a DGX Spark (GB10)). Off by
+/// default: the fused kernel's output is not the two kernels' bit for bit, so greedy output
+/// moves.
+pub fn set_head_rope_fused(on: bool) {
+    HEAD_ROPE_FUSED.store(on, Ordering::Relaxed);
+}
 
 /// The Gemma 4 specifics of [`Hparams`] (its [`Hparams::arch`]).
 #[derive(Debug, Clone, PartialEq)]
@@ -547,12 +562,19 @@ impl Model {
         let norm = |t: Tensor<'a>, il: usize, name: &str| -> Result<Tensor<'a>, ModelError> {
             Ok(ctx.mul(ctx.rms_norm(t, eps), self.lw(il, name)?))
         };
+        // With `--head-rope-fused`: the positions as one view for every layer's RoPE, in the
+        // graph ahead of the layers (else each RoPE makes its own, [`Model::gemma4_rope`]).
+        let pos = HEAD_ROPE_FUSED.load(Ordering::Relaxed).then(|| {
+            let pos = ctx.view_1d(pass.pos, n, 0);
+            pass.graph.borrow_mut().expand(pos);
+            pos
+        });
         let mut hidden = Vec::new();
         for il in layers {
             let h = norm(x, il, "attn_norm.weight")?;
             tap.tap("attn_norm", il, h);
             let pre = (x, self.lw(il, "attn_norm.weight")?, eps);
-            let o = self.gemma4_attention(pass, il, h, pre)?;
+            let o = self.gemma4_attention(pass, il, h, pre, pos)?;
             let o = norm(o, il, "post_attention_norm.weight")?;
             tap.tap("attn_post_norm", il, o);
             let attn_out = ctx.add(o, x);
@@ -600,16 +622,18 @@ impl Model {
     }
 
     /// RoPE of `t` (`[head_dim, heads, n]`) for layer `il`: the sliding-window layers' base,
-    /// or the global layers' base and frequency factors.
+    /// or the global layers' base and frequency factors. At positions `pos` (the layers' shared
+    /// view, [`set_head_rope_fused`]) or, without them, a view of its own.
     fn gemma4_rope<'a>(
         &'a self,
         pass: &Pass<'a>,
         il: usize,
         t: Tensor<'a>,
+        pos: Option<Tensor<'a>>,
     ) -> Result<Tensor<'a>, ModelError> {
         let (ctx, hp, g) = (pass.ctx, &self.hp, self.gemma());
         // The positions are the first section of the (multi-section) position input.
-        let pos = ctx.view_1d(pass.pos, pass.n, 0);
+        let pos = pos.unwrap_or_else(|| ctx.view_1d(pass.pos, pass.n, 0));
         Ok(if g.swa[il] {
             ctx.rope_ext(
                 t,
@@ -638,12 +662,14 @@ impl Model {
 
     /// Attention of layer `il` over the normed residual `h`: queries always, keys and values
     /// into the cache unless the layer reads another layer's; then the output projection.
+    /// `pos`: the layers' shared positions view, if any ([`Model::gemma4_rope`]).
     fn gemma4_attention<'a>(
         &'a self,
         pass: &Pass<'a>,
         il: usize,
         h: Tensor<'a>,
         pre: (Tensor<'a>, Tensor<'a>, f32),
+        pos: Option<Tensor<'a>>,
     ) -> Result<Tensor<'a>, ModelError> {
         let (ctx, tap, n) = (pass.ctx, &pass.tap, pass.n);
         let hp = &self.hp;
@@ -672,7 +698,7 @@ impl Model {
         let q = proj("attn_q.weight")?;
         let q = ctx.reshape_3d(q, d, hp.n_head, n);
         let q = ctx.mul(ctx.rms_norm(q, eps), self.lw(il, "attn_q_norm.weight")?);
-        let q = self.gemma4_rope(pass, il, q)?;
+        let q = self.gemma4_rope(pass, il, q, pos)?;
         tap.tap("Qcur_pos", il, q);
         if hp.owns_kv(il) {
             let k = proj("attn_k.weight")?;
@@ -685,7 +711,7 @@ impl Model {
             let v = ctx.reshape_3d(v, d, n_kv, n);
             let k = ctx.mul(ctx.rms_norm(k, eps), self.lw(il, "attn_k_norm.weight")?);
             let v = ctx.rms_norm(v, eps);
-            let k = self.gemma4_rope(pass, il, k)?;
+            let k = self.gemma4_rope(pass, il, k, pos)?;
             tap.tap("Kcur_pos", il, k);
             tap.tap("Vcur_normed", il, v);
             let mut graph = pass.graph.borrow_mut();
