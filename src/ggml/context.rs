@@ -940,6 +940,37 @@ impl<'a> Tensor<'a> {
         }
     }
 
+    /// [`Self::read_via`] of the tensor's bytes from `offset` on only: they land at the start
+    /// of `via` (returns `via`'s address and the byte count read).
+    pub fn read_tail_via(self, via: Tensor<'_>, offset: usize) -> (usize, usize) {
+        assert_eq!(
+            self.ty(),
+            ffi::ggml_type_GGML_TYPE_F32,
+            "read_tail_via on a non-F32 tensor"
+        );
+        assert!(
+            self.is_allocated() && via.is_allocated() && via.is_host(),
+            "read_tail_via needs allocated tensors and a host one to read through"
+        );
+        let n = self.nbytes();
+        assert!(offset <= n, "read_tail_via: offset past the tensor");
+        let n = n - offset;
+        assert!(
+            via.nbytes() >= n,
+            "read_tail_via: `{}` is too small",
+            via.name()
+        );
+        // SAFETY: `via` is allocated host memory of at least `n` bytes; the read stays within
+        // the tensor (`offset + n` is its size).
+        unsafe {
+            let data = (*via.raw()).data;
+            if n > 0 {
+                ffi::ggml_backend_tensor_get(self.raw(), data, offset, n);
+            }
+            (data as usize, n)
+        }
+    }
+
     /// For F32 tensors: like [`Self::set_f32`], through host tensor `via` (see
     /// [`Self::to_f32_via`]).
     pub fn set_f32_via(self, values: &[f32], via: Tensor<'_>) {

@@ -210,6 +210,16 @@ pub trait ModelDrafter: Send {
     fn block_drafts(&self) -> Option<usize> {
         None
     }
+
+    /// The first row of a request's [`DraftRequest::hidden`] that [`Self::step`] reads, for a
+    /// sequence of at least `n_tokens` tokens ([`DraftRequest::tokens`]) whose step ran `ran`
+    /// positions from `start`, the step's only request (a prompt chunk). The rows before it
+    /// may hold anything: the engine has the executor skip reading them back (#1133). It must
+    /// not grow when `n_tokens` shrinks, so a count known before the step (the tokens so far)
+    /// is safe. 0 (the default): every row.
+    fn rows_read_from(&self, _n_tokens: usize, _start: usize, _ran: usize) -> usize {
+        0
+    }
 }
 
 /// `--spec`: which drafter proposes tokens.

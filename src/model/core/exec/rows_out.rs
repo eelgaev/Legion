@@ -66,6 +66,20 @@ impl Spare {
         }
     }
 
+    /// A vector of `n` floats for a copy into its last ones ([`copy_out_tail`]): the smallest
+    /// kept one with room, its first floats left as they were (an earlier step's rows, zeros
+    /// past its old length), else a new one of zeros (its pages are not touched until written).
+    fn take_len(&mut self, n: usize) -> Vec<f32> {
+        match self.0.iter().rposition(|v| v.capacity() >= n) {
+            Some(i) => {
+                let mut v = self.0.remove(i);
+                v.resize(n, 0.0);
+                v
+            }
+            None => vec![0.0; n],
+        }
+    }
+
     /// Capacity of the biggest kept vector, in floats.
     #[cfg(test)]
     fn capacity(&self) -> usize {
@@ -82,16 +96,40 @@ impl Spare {
 /// `n` floats at `src` (memory the caller keeps alive and unchanged) in a vector (`spare`'s when
 /// it has room, else a new one), copied on four threads off the engine thread's core.
 pub(super) fn copy_out(spare: &mut Spare, src: usize, n: usize) -> Vec<f32> {
-    const THREADS: usize = 4;
     let mut v = spare.take(n);
-    let dst = v.as_mut_ptr() as usize;
+    copy_threads(src, v.as_mut_ptr() as usize, n);
+    // SAFETY: all `n` floats were written by `copy_threads` (it joined every thread).
+    unsafe { v.set_len(n) };
+    v
+}
+
+/// A vector of `n` floats whose floats from `from` on are the `n - from` floats at `src`
+/// (memory the caller keeps alive and unchanged), copied as [`copy_out`] copies; the first
+/// `from` hold whatever the vector held (an earlier step's rows, or zeros). For captured rows
+/// a drafter does not read (#1133): only the rows it reads were read back.
+pub(super) fn copy_out_tail(spare: &mut Spare, src: usize, n: usize, from: usize) -> Vec<f32> {
+    assert!(from <= n, "copy_out_tail: from past the end");
+    let mut v = spare.take_len(n);
+    // SAFETY: `v` holds `n` floats, so `from` is within it.
+    let dst = unsafe { v.as_mut_ptr().add(from) } as usize;
+    copy_threads(src, dst, n - from);
+    v
+}
+
+/// Copies `n` floats from `src` to `dst` (disjoint memory the caller keeps alive, `dst` with
+/// room for them) on four threads off the engine thread's core.
+fn copy_threads(src: usize, dst: usize, n: usize) {
+    const THREADS: usize = 4;
+    if n == 0 {
+        return;
+    }
     let pin = &crate::hw::host_core::off_host_core(&[]);
     std::thread::scope(|scope| {
         for t in 0..THREADS {
             let (lo, hi) = (n * t / THREADS, n * (t + 1) / THREADS);
             scope.spawn(move || {
                 crate::hw::host_core::pin_helper(pin);
-                // SAFETY: disjoint ranges of the `n` floats of capacity at `dst`, from the `n`
+                // SAFETY: disjoint ranges of the `n` floats of room at `dst`, from the `n`
                 // floats at `src` the caller keeps alive and unchanged.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
@@ -103,9 +141,6 @@ pub(super) fn copy_out(spare: &mut Spare, src: usize, n: usize) -> Vec<f32> {
             });
         }
     });
-    // SAFETY: all `n` floats were written above (the scope joined every thread).
-    unsafe { v.set_len(n) };
-    v
 }
 
 /// Captured layer `layer`'s rows of every micro-chunk in `hidden`, one after another, taken out
