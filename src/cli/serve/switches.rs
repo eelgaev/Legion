@@ -420,6 +420,15 @@ pub(in crate::cli) struct SwitchArgs {
     /// own kernel); decode and verify steps keep the default's kernels. For A/B runs.
     #[arg(long, value_enum, help_heading = HEADING, value_name = "MODE")]
     nvfp4_expert_mv_split: Option<MvSplit>,
+    /// CUDA, NVFP4 routed experts on Legion's W4A16 kernels, prompt steps of more than 64
+    /// tokens: the down projection stores each (token, expert) row as BF16 instead of F32, and
+    /// the weighted sum reads it back (on qwen4exp the hyper-connection norm the MoE tail folds
+    /// into reads the BF16 rows itself). Half the bytes of those rows written and read: on a
+    /// DGX Spark (GB10), Qwen3.8-Flash-Next NVFP4 prefill is a few percent faster. Each row is
+    /// rounded to BF16 before the sum, so output moves (opt-in); decode and verify steps keep
+    /// F32 rows.
+    #[arg(long, help_heading = HEADING)]
+    nvfp4_expert_rows_bf16: bool,
     /// qwen4exp speculative verify steps with NVFP4 routed experts on Legion's kernels: read
     /// the experts of the padding rows too (the rows after a sequence's drafts that fill every
     /// sequence up to the step's shape; nothing reads their output), instead of routing their
@@ -1403,6 +1412,7 @@ impl SwitchArgs {
             nvfp4_expert_mv_max: self.nvfp4_expert_mv_max.map(i64::from),
             nvfp4_expert_mv_tile: self.nvfp4_expert_mv_tile.map(i32::from),
             nvfp4_expert_mv_split: self.nvfp4_expert_mv_split,
+            nvfp4_expert_rows_bf16: self.nvfp4_expert_rows_bf16.then_some(true),
             moe_pad_remap: self.no_moe_pad_remap.then_some(false),
             moe_pad_remap_tiered: self.moe_pad_remap_tiered.then_some(true),
             moe_pad_remap_probe: self.moe_pad_remap_probe,
