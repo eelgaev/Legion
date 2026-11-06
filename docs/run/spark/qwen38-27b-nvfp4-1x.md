@@ -50,6 +50,9 @@ With these flags (2026-11-03, one round each), 16 users decode at 229.5 tok/s to
 them: DFlash keeps drafting at depth 7, mean accepted length 3.48. An 8,227-token prompt prefills in one step
 at 2,282 tok/s and a 32,746-token prompt at 1,900, against 2,145 / 1,888 from the same binary without them.
 A 122,528-token prompt prefills at 1,218 tok/s (2026-11-04, median of two servers: 1,223 / 1,212).
+Since prompt steps read back only the hidden-state rows DFlash takes in (2026-11-06, the same output): 8K
+2,315 and 32K 1,953 tok/s, against 2,255 / 1,867 from the build before in the same session; 123K 1,214 against
+1,189 there.
 1 and 4 users decoded at 33.8 (same 1-user text) and 95.4. Greedy text at 8 or more users changes (other
 drafts, other verify shapes), and so does a prompt longer than 4,096 tokens (other step sums). Below 8 users,
 and for prompts up to 4,096 tokens, the output is the same as without the flags.
