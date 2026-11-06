@@ -14,46 +14,68 @@
 //! chunk). The engine hands the rows back ([`super::Executor::recycle_rows`]) and the next
 //! chunk's copy goes into them ([`Spare`]).
 
-/// Vectors kept for the next copy are at most this big: a 4,096-token chunk's rows of
-/// Flash-Next are 168 MB; a several-stage prompt's whole output (gigabytes, put together by
-/// [`super::rows`]) is not kept.
+/// Vectors kept for the next copy are at most this big, and all of them together: a
+/// 4,096-token chunk's rows of Flash-Next are 168 MB; a several-stage prompt's whole output
+/// (gigabytes, put together by [`super::rows`]) is not kept.
 const SPARE_MAX_BYTES: usize = 1 << 30;
 
-/// A captured-rows vector the engine handed back, for the next big copy ([`copy_out`]).
+/// The most vectors kept. A drafter reading several of the target's layers (DFlash 2 on Gemma
+/// 4 31B: five, 44 MB each per 2,048-token chunk) has that many big copies per chunk; with one
+/// vector kept the other four were new vectors (their pages faulted in, ~2.5 ms each on the
+/// GB10) and were unmapped again once read, with the GPU idle before the next chunk.
+const SPARE_KEPT: usize = 8;
+
+/// Captured-rows vectors the engine handed back, for the next big copies ([`copy_out`]).
 #[derive(Default)]
-pub(super) struct Spare(Option<Vec<f32>>);
+pub(super) struct Spare(Vec<Vec<f32>>);
 
 impl Spare {
-    /// Keeps the biggest vector of `rows` of at least `min_bytes` and at most
-    /// [`SPARE_MAX_BYTES`] of capacity, unless the one kept is as big; drops the others.
+    /// Keeps the vectors of `rows` of at least `min_bytes` and at most [`SPARE_MAX_BYTES`] of
+    /// capacity, the biggest ones when more than [`SPARE_KEPT`] or more than
+    /// [`SPARE_MAX_BYTES`] together would be kept; drops the others.
     pub(super) fn keep(&mut self, rows: impl IntoIterator<Item = Vec<f32>>, min_bytes: usize) {
         for v in rows {
             let bytes = v.capacity() * 4;
-            let kept = self.0.as_ref().map_or(0, Vec::capacity) * 4;
-            if bytes >= min_bytes && bytes <= SPARE_MAX_BYTES && bytes > kept {
-                self.0 = Some(v);
+            if bytes >= min_bytes && bytes <= SPARE_MAX_BYTES {
+                self.0.push(v);
             }
         }
+        // Biggest first; the smallest go while over either limit.
+        self.0.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+        let mut total = 0;
+        let fit = self
+            .0
+            .iter()
+            .take_while(|v| {
+                total += v.capacity() * 4;
+                total <= SPARE_MAX_BYTES
+            })
+            .count();
+        self.0.truncate(fit.min(SPARE_KEPT));
     }
 
-    /// An empty vector with room for `n` floats: the kept one when it has the room.
+    /// An empty vector with room for `n` floats: the smallest kept one that has the room.
     fn take(&mut self, n: usize) -> Vec<f32> {
-        match self.0.take() {
-            Some(mut v) if v.capacity() >= n => {
+        match self.0.iter().rposition(|v| v.capacity() >= n) {
+            Some(i) => {
+                let mut v = self.0.remove(i);
                 v.clear();
                 v
             }
-            kept => {
-                self.0 = kept;
-                Vec::with_capacity(n)
-            }
+            None => Vec::with_capacity(n),
         }
     }
 
-    /// Capacity of the kept vector, in floats.
+    /// Capacity of the biggest kept vector, in floats.
     #[cfg(test)]
     fn capacity(&self) -> usize {
-        self.0.as_ref().map_or(0, Vec::capacity)
+        self.0.iter().map(Vec::capacity).max().unwrap_or(0)
+    }
+
+    /// How many vectors are kept.
+    #[cfg(test)]
+    fn kept(&self) -> usize {
+        self.0.len()
     }
 }
 
