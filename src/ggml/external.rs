@@ -229,6 +229,21 @@ pub fn external_params(dst: &ffi::ggml_tensor) -> [i32; EXTERNAL_PARAMS] {
     out
 }
 
+/// Sets parameter `i` of an external op node made by [`Context::external_with`] (one a later
+/// reader changes before the graph runs).
+///
+/// # Safety
+/// `node` is a valid external op node; `i` below [`EXTERNAL_PARAMS`].
+pub(crate) unsafe fn set_external_param(node: *mut ffi::ggml_tensor, i: usize, v: i32) {
+    assert!(i < EXTERNAL_PARAMS, "external param {i}");
+    // SAFETY: the caller's; within op_params after the custom-op header.
+    unsafe {
+        let p =
+            ((*node).op_params.as_mut_ptr() as *mut u8).add(std::mem::size_of::<CustomParams>());
+        std::ptr::write_unaligned((p as *mut i32).add(i), v);
+    }
+}
+
 #[cfg(feature = "cuda")]
 pub(crate) mod cuda {
     use std::cell::Cell;

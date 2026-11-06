@@ -119,9 +119,16 @@ struct legion_hc_post_norm {
     // F32 -> BF16 conversion before a cuBLAS BF16 GEMM), for the BF16 down weight's matmul
     // (#469). sm_80+, neither xn16 nor xq; with scale_at only at qwen4exp's shape (#836).
     __nv_bfloat16 * xnb;
+    // legion_hc_post_norm_rs_launch only (#1176): rank 0's and rank 1's BF16 partials of a
+    // tensor-parallel reduce-scatter laid out as out (token t at rs[r] + t * out_ld), whose sum
+    // out is, added here as src/cuda/tp_net.cu's tp_sum_bf16 adds them; out is not read. At the
+    // end: every other field keeps its place.
+    const __nv_bfloat16 * rs[2];
 };
 
 int legion_hc_post_norm_launch(const legion_hc_post_norm * p, void * stream);
+// hc_post_norm_v70_kernel's rebuilt BF16-xn form (xnb, scale_at) with out made from p->rs.
+int legion_hc_post_norm_rs_launch(const legion_hc_post_norm * p, void * stream);
 // Tests: launches of hc_post_norm from the calling thread take the generic kernel (1), the
 // register one where it applies (2) or the default choice (0).
 void legion_hc_post_norm_force_generic(int on);
@@ -988,7 +995,10 @@ __global__ void __launch_bounds__(HC_THREADS) hc_post_norm_reg_kernel(legion_hc_
 // it keep their code).
 // RB (#774): the streams' norm scales at p.scale_at instead of xn (with xn16, no xq; or, #836,
 // with B16 on sm_80+), for a reader that rebuilds xn (hc_mix16.cu).
-template <int HC, int NINJ, int PS, bool SM80 = false, bool Q = false, bool B16 = false, bool RB = false>
+// RS (#1176, legion_hc_post_norm_rs_launch): out made from the two ranks' BF16 partials p.rs,
+// rank 0's first, as tp_sum_bf16 makes it (each widened to F32, one rounded add): out's bits.
+template <int HC, int NINJ, int PS, bool SM80 = false, bool Q = false, bool B16 = false, bool RB = false,
+          bool RS = false>
 __global__ void __launch_bounds__(HC_THREADS, 4) hc_post_norm_v70_kernel(legion_hc_post_norm p) {
     static_assert(HC <= HC_MAX && NINJ <= HC_INJ_MAX, "hc_post_norm_v70_kernel: too many sums");
     static_assert(!(Q && B16), "hc_post_norm_v70_kernel: xq or xnb, not both");
@@ -1014,7 +1024,12 @@ __global__ void __launch_bounds__(HC_THREADS, 4) hc_post_norm_v70_kernel(legion_
     float ov[PS];
 #pragma unroll
     for (int r = 0; r < PS; r++) {
-        ov[r] = out[threadIdx.x + r * HC_THREADS];
+        if constexpr (RS) {
+            const int64_t i = t * p.out_ld + threadIdx.x + r * HC_THREADS;
+            ov[r] = __fadd_rn(__bfloat162float(p.rs[0][i]), __bfloat162float(p.rs[1][i]));
+        } else {
+            ov[r] = out[threadIdx.x + r * HC_THREADS];
+        }
     }
     float val[PER];
 #pragma unroll
@@ -1688,6 +1703,21 @@ int legion_hc_post_norm_launch(const legion_hc_post_norm * p, void * stream) {
     } else {
         hc_post_norm_dispatch<false>(p, st, major, minor);
     }
+    return (int) cudaGetLastError();
+}
+
+int legion_hc_post_norm_rs_launch(const legion_hc_post_norm * p, void * stream) {
+    int dev = 0, major = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+    // The rebuilt BF16-xn form legion_hc_post_norm_launch takes for xnb with scale_at.
+    if (major < 8 || p->hc != 4 || p->n_inj != 4 || p->e != 10 * HC_THREADS || p->xnb == nullptr ||
+        p->scale_at == 0 || p->xq != nullptr || p->xn16 != nullptr || p->rs[0] == nullptr ||
+        p->rs[1] == nullptr || p->n_tok < 1) {
+        return -1;
+    }
+    hc_post_norm_v70_kernel<4, 4, 10, true, false, true, true, true>
+        <<<p->n_tok, HC_THREADS, 0, (cudaStream_t) stream>>>(*p);
     return (int) cudaGetLastError();
 }
 

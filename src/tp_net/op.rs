@@ -412,8 +412,18 @@ pub(super) mod cuda {
         let r = unsafe {
             let src = (*dst.src[0]).data as usize;
             let plan = plain_plan(&comm, kind, dst);
-            start(&comm, &plan, src, stream, false)
-                .and_then(|seq| finish(&comm, &plan, seq, src, dst.data as usize, stream))
+            // A reduce-scatter whose reader adds the partials itself (#1176).
+            let defer = kind == Kind::ReduceScatter
+                && crate::tp_net::seq_par::deferred(dst)
+                && plan.wire == Wire::Bf16
+                && comm.n_ranks() == 2;
+            start(&comm, &plan, src, stream, false).and_then(|seq| {
+                if defer {
+                    hand_over(&comm, &plan, seq, dst.data as usize, stream)
+                } else {
+                    finish(&comm, &plan, seq, src, dst.data as usize, stream)
+                }
+            })
         };
         if let Err(e) = &r {
             // Final: the peers' and this stream's waits are released, later all-reduces refused.
@@ -504,6 +514,13 @@ pub(super) mod cuda {
         let mine = plan.pieces[rank];
         let bytes = plan.span * eb;
         let seq = comm.next_seq();
+        if let Some(d) = comm.deferred.lock().expect("deferred lock").as_ref() {
+            // Its reader runs before any later exchange starts (it holds the buffers).
+            return Err(format!(
+                "tp exchange {seq}: the sum of exchange {} was not taken by its reader",
+                d.seq
+            ));
+        }
         let mut in_flight = comm.in_flight.lock().expect("in-flight lock");
         if in_flight.len() > 1 {
             return Err(format!(
@@ -631,6 +648,85 @@ pub(super) mod cuda {
             in_flight.push_back(seq);
         }
         Ok(seq)
+    }
+
+    /// A reduce-scatter's sum handed to its reader ([`crate::tp_net::seq_par::defer_sum`]):
+    /// where the two ranks' BF16 partials of this rank's columns are, in rank order.
+    pub(crate) struct Deferred {
+        pub(crate) seq: u32,
+        /// The node's output (left unwritten), which the reader names.
+        dst: usize,
+        /// Device addresses of rank 0's and rank 1's BF16 partials, `[row, share]` each.
+        pub(crate) srcs: [u64; 2],
+    }
+
+    /// The second half of a deferred reduce-scatter `seq` ([`start`]): waits for the peer's
+    /// share, then leaves the sum to the node's reader ([`take_deferred`]); "consumed" is
+    /// raised after that reader ([`release_deferred`]). Two ranks, BF16 partials.
+    ///
+    /// # Safety
+    /// As [`finish`].
+    unsafe fn hand_over(
+        comm: &super::super::Comm,
+        plan: &Plan,
+        seq: u32,
+        dst: usize,
+        stream: *mut c_void,
+    ) -> Result<(), String> {
+        let rank = comm.rank();
+        let eb = plan.wire.bytes();
+        let mine = plan.pieces[rank];
+        let guard = comm.pinned.lock().expect("pinned lock");
+        let p = guard.as_ref().ok_or("tp exchange: no buffers")?;
+        let k = seq as usize % p.nbuf;
+        let (fd, dd) = (p.flags.dev, p.data.dev);
+        let own = dd + (p.send(k) + mine.0 * eb) as u64;
+        let peer = 1 - rank;
+        // SAFETY: as in `finish`.
+        check("cuStreamWaitValue32", unsafe {
+            cuStreamWaitValue32_v2(stream, fd + recv_flag(peer) as u64, seq, WAIT_GEQ)
+        })?;
+        let theirs = dd + p.recv(peer, k) as u64;
+        let srcs = if rank == 0 {
+            [own, theirs]
+        } else {
+            [theirs, own]
+        };
+        *comm.deferred.lock().expect("deferred lock") = Some(Deferred { seq, dst, srcs });
+        Ok(())
+    }
+
+    /// The deferred sum whose node's output is at `dst` (device address), for its reader to
+    /// add; `None` if that node summed itself. The reader then calls [`release_deferred`]
+    /// after its kernel.
+    pub(crate) fn take_deferred(comm: &super::super::Comm, dst: usize) -> Option<Deferred> {
+        let mut d = comm.deferred.lock().expect("deferred lock");
+        if d.as_ref().is_some_and(|x| x.dst == dst) {
+            d.take()
+        } else {
+            None
+        }
+    }
+
+    /// Raises "consumed" for the deferred sum `seq` on `stream`, after its reader's kernel.
+    ///
+    /// # Safety
+    /// `stream` is the stream the exchange ran on.
+    pub(crate) unsafe fn release_deferred(
+        comm: &super::super::Comm,
+        seq: u32,
+        stream: *mut c_void,
+    ) -> Result<(), String> {
+        let guard = comm.pinned.lock().expect("pinned lock");
+        let p = guard.as_ref().ok_or("tp exchange: no buffers")?;
+        // SAFETY: the flags are mapped for the stream's device and live with the communicator.
+        let r = check("cuStreamWriteValue32", unsafe {
+            cuStreamWriteValue32_v2(stream, p.flags.dev + CONSUMED as u64, seq, 0)
+        });
+        if let Err(e) = &r {
+            comm.fail(e.clone());
+        }
+        r
     }
 
     /// The second half of exchange `seq` ([`start`]): waits for every peer's share, adds them

@@ -835,6 +835,10 @@ pub struct Comm {
     /// The CUDA path's exchanges started ([`super::micro`]) and not finished yet, in order.
     #[cfg(feature = "cuda")]
     pub(super) in_flight: Mutex<std::collections::VecDeque<u32>>,
+    /// The CUDA path's reduce-scatter whose sum its reader makes ([`super::seq_par::defer_sum`]),
+    /// until that reader ran.
+    #[cfg(feature = "cuda")]
+    pub(super) deferred: Mutex<Option<super::op::cuda::Deferred>>,
 }
 
 impl Comm {
@@ -951,6 +955,8 @@ impl Comm {
             pinned: Mutex::new(None),
             #[cfg(feature = "cuda")]
             in_flight: Mutex::new(std::collections::VecDeque::new()),
+            #[cfg(feature = "cuda")]
+            deferred: Mutex::new(None),
         }))
     }
 

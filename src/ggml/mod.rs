@@ -36,7 +36,7 @@ pub(crate) use external::cuda::current_backend as current_cuda_backend;
 #[cfg(feature = "cuda")]
 pub(crate) use external::cuda::current_graph as current_cuda_graph;
 pub use external::{EXTERNAL_PARAMS, ExternalOp, external_params};
-pub(crate) use external::{make_external, op_of};
+pub(crate) use external::{make_external, op_of, set_external_param};
 pub use ops_gemma4::ROPE_NEOX;
 pub use ops_vision::{ROPE_VISION, SCALE_ALIGN_CORNERS, SCALE_BILINEAR};
 
