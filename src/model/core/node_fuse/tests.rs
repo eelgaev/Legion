@@ -218,3 +218,88 @@ fn users_are_each_nodes_readers() {
         assert!(g.users(x.raw()).is_empty(), "x is a leaf");
     }
 }
+
+/// #1176: the op in its fused-sum form (`params[3]`) rounds as ggml-cuda's fused sum (the first
+/// product, then one FMA per expert) and the shared expert's gate after it; with [`FMA_SKIP`]
+/// (`--tp-moe-ep`) it does not read
+/// the rows of zero router weights (NaN here: any read would show), and without it reads them
+/// as ggml-cuda does (NaN times zero: NaN).
+#[test]
+fn fused_sum_skips_zero_weight_rows() {
+    fused_sum_zero_weight_rows(FMA_SKIP);
+}
+
+#[test]
+fn fused_sum_reads_zero_weight_rows_without_ep() {
+    fused_sum_zero_weight_rows(1);
+}
+
+fn fused_sum_zero_weight_rows(fma: i32) {
+    let (e, k, n) = (12usize, 6usize, 3usize);
+    let mut backend = Backend::cpu().unwrap();
+    backend.set_threads(2);
+    let ctx = Context::new(64, 64);
+    let experts = ctx
+        .new_tensor(types::F32, &[e as i64, k as i64, n as i64])
+        .as_input();
+    let w = ctx
+        .new_tensor(types::F32, &[1, k as i64, n as i64])
+        .as_input();
+    let sh = ctx.new_tensor(types::F32, &[e as i64, n as i64]).as_input();
+    let g = ctx.new_tensor(types::F32, &[1, n as i64]).as_input();
+    let out = ctx
+        .external_with(
+            &MOE_SUM_GATE,
+            types::F32,
+            [e as i64, n as i64, 1, 1],
+            &[experts, w, sh, g],
+            &[1, 1, k as i32, fma],
+        )
+        .as_output();
+    let mut graph = ctx.new_graph(64);
+    graph.expand(out);
+    ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+        .unwrap();
+    // Every other expert another rank's: weight zero, its row never to be read.
+    let wv: Vec<f32> = noise(k * n, 22)
+        .iter()
+        .enumerate()
+        .map(|(i, v)| if i % 2 == 1 { 0.0 } else { v.abs() + 0.01 })
+        .collect();
+    let mut xv = noise(e * k * n, 21);
+    for (r, row) in xv.chunks_mut(e).enumerate() {
+        if wv[r] == 0.0 {
+            row.fill(f32::NAN);
+        }
+    }
+    let shv = noise(e * n, 23);
+    let gv: Vec<f32> = noise(n, 24).iter().map(|v| v * 8.0).collect();
+    experts.set_f32(&xv);
+    w.set_f32(&wv);
+    sh.set_f32(&shv);
+    g.set_f32(&gv);
+    backend.compute(&graph).unwrap();
+    let got = out.to_f32();
+    if fma != FMA_SKIP {
+        assert!(got.iter().all(|v| v.is_nan()), "{got:?}");
+        return;
+    }
+    for t in 0..n {
+        let s = 1.0 / (1.0 + (-gv[t]).exp());
+        for col in 0..e {
+            let row = |j: usize| {
+                let r = t * k + j;
+                if wv[r] == 0.0 { 0.0 } else { xv[r * e + col] }
+            };
+            let wj = |j: usize| wv[t * k + j];
+            let sum = (1..k).fold(row(0) * wj(0), |acc, j| row(j).mul_add(wj(j), acc));
+            let want = sum + shv[t * e + col] * s;
+            let have = got[t * e + col];
+            assert_eq!(
+                have.to_bits(),
+                want.to_bits(),
+                "[{t}, {col}]: {have} vs {want}"
+            );
+        }
+    }
+}

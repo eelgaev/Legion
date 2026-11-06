@@ -18,12 +18,17 @@
 //! read elsewhere) must be fused or not as before in the new layout ([`Undo::holds`]); where one
 //! is not, the rewrite is undone. The tail's nodes become `GGML_OP_NONE` views of the experts'
 //! rows without sources: the allocator gives them no memory and they keep nothing alive.
+//!
+//! A tail no such norm reads (under tensor parallelism the rank exchange reads it, #1176) whose
+//! sum ggml-cuda fuses becomes one [`MOE_SUM_GATE`] at the gate's add instead, in the fused
+//! sum's rounding; under `--tp-moe-ep` it does not read the rows of zero router weights (the
+//! rows of the experts the other ranks hold, which the grouped kernels stored as zeros).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::{Graph, Node, ON, Sum, f32_contiguous, is_view_op, root};
-use crate::ggml::ffi;
+use super::{FMA_SKIP, Gate, Graph, MOE_SUM_GATE, Node, ON, Sum, f32_contiguous, is_view_op, root};
 use crate::ggml::post_alloc::{Relaid, Relayout};
+use crate::ggml::{ffi, make_external};
 use crate::model::qwen4::{FoldSum, fold_moe, fold_target, moe_fold};
 
 /// The fold as a relayout (`crate::ggml::post_alloc::set_relayout`): only graphs holding a norm
@@ -72,8 +77,8 @@ unsafe fn rewrite(graph: *mut ffi::ggml_cgraph, cuda: bool) -> Option<Box<dyn Re
             folded,
             fma,
             left = undo.left.len(),
-            "hc moe fold: MoE tails made by the next hyper-connection norm (the first graphs; \
-             --hc-moe-fold)"
+            "hc moe fold: MoE tails made by the next hyper-connection norm, or as one op at \
+             the gate's add where no such norm reads them (the first graphs; --hc-moe-fold)"
         );
     }
     Some(Box::new(undo))
@@ -189,8 +194,8 @@ impl Graph {
                 return false;
             }
             let a = self.nodes[gt.add];
-            let (ni, view) = match *self.users(a) {
-                [u] if !is_view_op((*self.nodes[u]).op) => (u, None),
+            let reader = match *self.users(a) {
+                [u] if !is_view_op((*self.nodes[u]).op) => Some((u, None)),
                 [u] => {
                     let v = self.nodes[u];
                     match *self.users(v) {
@@ -199,27 +204,31 @@ impl Graph {
                             && (*v).ne == (*a).ne
                             && (*v).nb == (*a).nb =>
                         {
-                            (ni, Some(u))
+                            Some((ni, Some(u)))
                         }
-                        _ => return false,
+                        _ => None,
                     }
                 }
-                _ => return false,
+                _ => None,
             };
-            let norm = self.nodes[ni];
-            let read = view.map_or(a, |u| self.nodes[u]);
             let [e, n, _, _] = (*a).ne;
             let x = s.experts;
-            if self.none[ni]
-                || !fold_target(norm, cuda)
-                || (*norm).src[1] != read
-                || !self.only_read_by(a, &[ni])
-                || !f32_contiguous(x)
-                || (*x).ne != [e, s.k as i64, n, 1]
-                || s.k > i32::MAX as usize
-            {
+            if !f32_contiguous(x) || (*x).ne != [e, s.k as i64, n, 1] || s.k > i32::MAX as usize {
                 return false;
             }
+            let into_norm = reader.filter(|&(ni, view)| {
+                let norm = self.nodes[ni];
+                !self.none[ni]
+                    && fold_target(norm, cuda)
+                    && (*norm).src[1] == view.map_or(a, |u| self.nodes[u])
+                    && self.only_read_by(a, &[ni])
+            });
+            let Some((ni, view)) = into_norm else {
+                // No norm to fold into (under tensor parallelism the rank exchange reads the
+                // tail, #1176): a sum ggml-cuda fuses and its gate as one op at the gate's add.
+                return fused && self.fuse_tail(s, &gt, saved);
+            };
+            let norm = self.nodes[ni];
             let mut dead: Vec<usize> = (s.at..=s.last).collect();
             dead.extend(&gt.chain);
             dead.push(gt.add);
@@ -231,18 +240,60 @@ impl Graph {
             );
             let sum = if fused { FoldSum::Fma } else { FoldSum::Plain };
             fold_moe(norm, x, s.weights, s.k, sum, gt.sh, gt.g);
-            // Views of the experts' rows (alive until the norm) that read nothing: no memory of
-            // their own, nothing kept alive, nothing run.
-            let keep = root(x);
-            for i in dead {
-                let t = &mut *self.nodes[i];
-                t.op = ffi::ggml_op_GGML_OP_NONE;
-                t.src = [std::ptr::null_mut(); ffi::GGML_MAX_SRC as usize];
-                t.view_src = keep;
-                t.view_offs = 0;
-                self.none[i] = true;
-            }
+            self.retire(&dead, root(x));
             true
+        }
+    }
+
+    /// The tail of the sum `s`, which ggml-cuda fuses, with its gate `gt` as one
+    /// [`MOE_SUM_GATE`] in its FMA form at the gate's add (#1176): the add's values, rounded as
+    /// the tail's nodes round them, without the weighted sum written and read back, and under
+    /// `--tp-moe-ep` with the rows of zero router weights not read (the other ranks' experts:
+    /// half the rows on two ranks). Saves the nodes it changes first. Whether it did.
+    ///
+    /// # Safety
+    /// As [`Self::fold_tail`]; `s`'s experts are `[e, k, n]` contiguous F32 and `gt` its gate.
+    unsafe fn fuse_tail(
+        &mut self,
+        s: &Sum,
+        gt: &Gate,
+        saved: &mut Vec<(Node, ffi::ggml_tensor)>,
+    ) -> bool {
+        // SAFETY: the caller's; nodes and their sources are valid tensors.
+        unsafe {
+            let a = self.nodes[gt.add];
+            let mut dead: Vec<usize> = (s.at..=s.last).collect();
+            dead.extend(&gt.chain);
+            saved.push((a, std::ptr::read(a)));
+            saved.extend(
+                dead.iter()
+                    .map(|&i| (self.nodes[i], std::ptr::read(self.nodes[i]))),
+            );
+            let srcs = [s.experts, s.weights, gt.sh, gt.g];
+            // Rows of zero weights skipped only under --tp-moe-ep, where they hold +0.0.
+            let ep = crate::model::core::tp_ep::active() && crate::model::core::tp_ep::skip();
+            let fma = if ep { FMA_SKIP } else { 1 };
+            make_external(a, &MOE_SUM_GATE, &srcs, &[1, 1, s.k as i32, fma]);
+            self.retire(&dead, root(s.experts));
+            true
+        }
+    }
+
+    /// Nodes `dead` of a folded tail become views of `keep` (the experts' rows, alive until the
+    /// op that reads them now) that read nothing: no memory of their own, nothing kept alive,
+    /// nothing run.
+    ///
+    /// # Safety
+    /// Node indices of this graph; `keep` a valid tensor.
+    unsafe fn retire(&mut self, dead: &[usize], keep: Node) {
+        for &i in dead {
+            // SAFETY: the caller's.
+            let t = unsafe { &mut *self.nodes[i] };
+            t.op = ffi::ggml_op_GGML_OP_NONE;
+            t.src = [std::ptr::null_mut(); ffi::GGML_MAX_SRC as usize];
+            t.view_src = keep;
+            t.view_offs = 0;
+            self.none[i] = true;
         }
     }
 }

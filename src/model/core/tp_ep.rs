@@ -48,6 +48,15 @@ pub(crate) fn skip() -> bool {
     SKIP.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+pub(super) static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a model of this process runs an expert-parallel share (`--tp-moe-ep`): the rows of
+/// the experts other ranks hold are +0.0 with zero router weights, so a MoE tail may skip
+/// reading rows of zero weights for the same bits (`super::node_fuse`'s fused tail, #1176).
+pub(crate) fn active() -> bool {
+    ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Names of the tables in [`TpEp`]'s context.
 const SLOT: &str = "tp_ep.slot";
 const IDS: &str = "tp_ep.ids";

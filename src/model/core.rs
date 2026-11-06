@@ -1594,6 +1594,7 @@ impl Model {
             ranks,
             place.as_deref(),
         )?);
+        tp_ep::ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 

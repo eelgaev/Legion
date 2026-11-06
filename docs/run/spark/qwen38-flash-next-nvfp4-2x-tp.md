@@ -4,8 +4,8 @@
 
 `--model` is the downloaded snapshot of `nvidia/Qwen3.8-Flash-Next-NVFP4` on each Spark. One process per Spark.
 Rank 0 serves HTTP; `--tp-peers` lists the two ranks' addresses on the QSFP link (rank 0 first) and is the same on
-both. MTP uses the checkpoint's own head, so there is no `--spec-draft` file. Decode (38-52 tok/s at 1 user, 111.8 at 4,
-231.0 at 16) and prefill (2,567 / 2,669 / 2,565 tok/s at 8K / 32K / 123K):
+both. MTP uses the checkpoint's own head, so there is no `--spec-draft` file. Decode (38-51 tok/s at 1 user, 111.5 at 4,
+231.7 at 16) and prefill (2,701 / 2,816 / 2,685 tok/s at 8K / 32K / 123K):
 
 ```sh
 # rank 0
@@ -64,7 +64,8 @@ Measured against vLLM 0.33.0 with tensor parallel 2, MTP and CUDA graphs on the 
 - `--tp-moe-ep`: Expert parallelism inside tensor parallelism: each expert lives on one rank, so its fixed cost is paid once instead of on both Sparks. Each rank reads and repacks only its own NVFP4 experts at load. The checkpoint's per-expert scales keep its experts
   on Legion's grouped NVFP4 kernels, which skip the other rank's (token, expert) pairs, so each rank computes only
   its own experts' pairs (steps of up to 8 tokens, such as 1-user decode, still compute them on the rank's first
-  expert with a zero router weight, so they add nothing).
+  expert with a zero router weight, so they add nothing). In prompt steps the weighted expert sum and the shared
+  expert's gate then run as one kernel that skips the other rank's zero-weight rows (prefill +4-5%, same bits).
 - `--prefill-slots` (`16`): How many prompts are read in one step (default 4). At 16, sixteen requests arriving
   together start decoding in the same step instead of four per step (16 users: 234.9 instead of about 223 tok/s in
   the same session without it; 1 and 4 users and prefill are unchanged). Batches change, so with several users
