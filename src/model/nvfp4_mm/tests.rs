@@ -645,3 +645,45 @@ fn skipping_grids_keep_a_spare_tile() {
         );
     }
 }
+
+/// The nodes [`unread_nodes`] gives for a MoE tail that skips zero-weight rows (#1176): a
+/// [`skips`] down matmul on its SwiGLU's plan, and that SwiGLU when the down matmul alone reads
+/// it; nothing for unmarked nodes or a SwiGLU with a row map (its padding pairs are read).
+#[test]
+fn unread_skips_only_on_marked_expert_chains() {
+    let (k, m, n_expert, n_used, n_tok) = (128i64, 64i64, 8i64, 2i64, 4i64);
+    let weights = Context::new(4, 0);
+    let wg = weights.new_tensor(types::NVFP4, &[k, m, n_expert]);
+    let wu = weights.new_tensor(types::NVFP4, &[k, m, n_expert]);
+    let wd = weights.new_tensor(types::NVFP4, &[m, k, n_expert]);
+    let ctx = Context::new(64, 128);
+    let x = ctx.new_tensor(types::F32, &[k, 1, n_tok]);
+    let ids = ctx.new_tensor(types::I32, &[n_used, n_tok]);
+    let rows = ctx.new_tensor(types::I32, &[n_tok]);
+    let node = |t: Tensor<'_>| {
+        // SAFETY: the result views made below; their nodes are valid tensors.
+        unsafe { (*t.raw()).view_src }
+    };
+    let act = skips(swiglu_id(&ctx, wg, wu, x, ids, None, None));
+    let down = skips(mul_mat_id(&ctx, wd, act, ids, None));
+    // SAFETY: nodes made above.
+    unsafe {
+        assert_eq!(
+            unread_nodes(node(down), |_| true),
+            vec![node(down), node(act)]
+        );
+        assert_eq!(unread_nodes(node(down), |_| false), vec![node(down)]);
+        // Not marked by `skips`: its zeros are someone's reads.
+        let glu = swiglu_id(&ctx, wg, wu, x, ids, None, None);
+        let plain = mul_mat_id(&ctx, wd, glu, ids, None);
+        assert!(unread_nodes(node(plain), |_| true).is_empty());
+        // A row map's padding pairs: their rows are read.
+        let padded = skips(swiglu_id_rows(&ctx, wg, wu, x, ids, None, None, Some(rows)));
+        let on_rows = skips(mul_mat_id(&ctx, wd, padded, ids, None));
+        assert!(unread_nodes(node(on_rows), |_| true).is_empty());
+        let n = node(down);
+        leave_unread(n);
+        assert!(unread(&*n));
+        assert!(!unread(&*node(on_rows)));
+    }
+}

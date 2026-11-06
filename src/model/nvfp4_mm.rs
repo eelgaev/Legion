@@ -689,6 +689,69 @@ fn skipping(dst: &ffi::ggml_tensor) -> bool {
     dst.op_params[P_SKIP] != 0
 }
 
+/// Where a [`skips`] node keeps whether nothing reads its skipped pairs' rows ([`leave_unread`]).
+const P_UNREAD: usize = 15;
+
+/// Whether [`leave_unread`] marked the node `dst`.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn unread(dst: &ffi::ggml_tensor) -> bool {
+    dst.op_params[P_UNREAD] != 0
+}
+
+/// The grouped NVFP4 nodes whose skipped pairs' rows nothing reads, given `down`, the node of
+/// a down [`mul_mat_id`] marked by [`skips`] whose rows only a MoE tail reads that skips the
+/// rows of zero router weights (the fold's moe_sum_gate under `--tp-moe-ep`, #1176): `down`,
+/// and the [`swiglu_id`] whose plan it reads if that is marked too (the down matmul never
+/// reads a skipped pair's input). `read_only_by_down`: whether that SwiGLU's result is read
+/// by `down` alone.
+/// Without a row map the only skipped pairs are the ids of -1 (the other ranks' experts),
+/// whose router weights are zero; their zeros need not be stored. Empty when `down` is not
+/// such a node, or when its plan has padding rows.
+///
+/// # Safety
+/// `down` is a valid tensor whose sources are valid tensors.
+pub(crate) unsafe fn unread_nodes(
+    down: *mut ffi::ggml_tensor,
+    read_only_by_down: impl Fn(*mut ffi::ggml_tensor) -> bool,
+) -> Vec<*mut ffi::ggml_tensor> {
+    let is = |t: *mut ffi::ggml_tensor, op: &ExternalOp| {
+        // SAFETY: the caller's.
+        unsafe { crate::ggml::op_of(t).is_some_and(|o| std::ptr::eq(o, op)) }
+    };
+    // SAFETY: the caller's; a node of `NVFP4_MM_ID` has its sources (`mul_mat_id_act`).
+    unsafe {
+        if !is(down, &NVFP4_MM_ID) || !skipping(&*down) {
+            return Vec::new();
+        }
+        let mut x = (*down).src[1];
+        while !(*x).view_src.is_null() {
+            x = (*x).view_src;
+        }
+        let glu = (is(x, &NVFP4_SWIGLU_ID) && skipping(&*x)).then_some(x);
+        // A down matmul on a SwiGLU's plan has its padding pairs too.
+        if glu.is_some_and(|g| swiglu_rows(&*g).is_some()) {
+            return Vec::new();
+        }
+        let shared = (*down).op_params[P_PLAN] != 0;
+        if shared && glu.is_none() {
+            return Vec::new();
+        }
+        let mut out = vec![down];
+        // Only on the SwiGLU's own plan is the down matmul's routing surely the same.
+        out.extend(glu.filter(|&g| shared && read_only_by_down(g)));
+        out
+    }
+}
+
+/// Marks a node of [`unread_nodes`]: on CUDA its skipped pairs get no zeros stored.
+///
+/// # Safety
+/// `node` is one [`unread_nodes`] returned.
+pub(crate) unsafe fn leave_unread(node: *mut ffi::ggml_tensor) {
+    // SAFETY: the caller's.
+    unsafe { (*node).op_params[P_UNREAD] = 1 };
+}
+
 /// [`swiglu_id`] whose plan of the pairs routes each token's pairs as token `rows[t]`'s
 /// (`rows` I32 `[n_tok]`; a verify step's padding rows as their sequences' first rows, see
 /// [`crate::model::core::pad_rows`]): token `t`'s results are those of `rows[t]`'s experts on
@@ -1322,6 +1385,7 @@ mod cuda {
         pdl: i32,
         sel_lo: i32,
         sel_hi: i32,
+        unread_skips: i32,
     }
 
     /// `Params::sel_lo`, `sel_hi` for every expert.
@@ -1491,6 +1555,7 @@ mod cuda {
             pdl: 0,
             sel_lo: ALL.0,
             sel_hi: ALL.1,
+            unread_skips: 0,
         };
         launch(&mut p, kernel, stream)
     }
@@ -1538,6 +1603,7 @@ mod cuda {
             pdl: 0,
             sel_lo: ALL.0,
             sel_hi: ALL.1,
+            unread_skips: 0,
         };
         // SAFETY: parameters checked above; the node's stream.
         let code = unsafe {
@@ -1672,6 +1738,7 @@ mod cuda {
             pdl: (!shared.is_null() && EXPERT_PDL.load(Ordering::Relaxed)) as i32,
             sel_lo: ALL.0,
             sel_hi: split.map_or(ALL.1, |(cut, _)| cut),
+            unread_skips: unread(dst) as i32,
         };
         if let Some(t) = forced_tiles() {
             p.tiles_n = p.tiles_n.min(t);
@@ -1858,6 +1925,7 @@ mod cuda {
             pdl: 0,
             sel_lo: ALL.0,
             sel_hi: split.unwrap_or(ALL.1),
+            unread_skips: unread(dst) as i32,
         };
         if let Some(cut) = split {
             // The experts of more than `cut` pairs on the GEMM first, so the grouped SwiGLU mv

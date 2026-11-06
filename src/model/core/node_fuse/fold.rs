@@ -22,13 +22,17 @@
 //! A tail no such norm reads (under tensor parallelism the rank exchange reads it, #1176) whose
 //! sum ggml-cuda fuses becomes one [`MOE_SUM_GATE`] at the gate's add instead, in the fused
 //! sum's rounding; under `--tp-moe-ep` it does not read the rows of zero router weights (the
-//! rows of the experts the other ranks hold, which the grouped kernels stored as zeros).
+//! rows of the experts the other ranks hold, which the grouped kernels stored as zeros). Where
+//! that op alone reads the experts' rows, nothing reads those rows at all, so the grouped NVFP4
+//! down matmul (and the SwiGLU on its plan that only it reads) stores no zeros for them
+//! ([`nvfp4_mm::unread_nodes`]); every value read is the same.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{FMA_SKIP, Gate, Graph, MOE_SUM_GATE, Node, ON, Sum, f32_contiguous, is_view_op, root};
 use crate::ggml::post_alloc::{Relaid, Relayout};
 use crate::ggml::{ffi, make_external};
+use crate::model::nvfp4_mm;
 use crate::model::qwen4::{FoldSum, fold_moe, fold_target, moe_fold};
 
 /// The fold as a relayout (`crate::ggml::post_alloc::set_relayout`): only graphs holding a norm
@@ -41,6 +45,10 @@ static LOGGED: AtomicUsize = AtomicUsize::new(0);
 
 /// Relayouts undone (logged the first time).
 static UNDONE: AtomicUsize = AtomicUsize::new(0);
+
+/// Grouped NVFP4 nodes left without their skipped pairs' zeros so far (#1176; logged with the
+/// first relayouts).
+static UNREAD: AtomicUsize = AtomicUsize::new(0);
 
 /// [`Relayout::wants`].
 ///
@@ -77,6 +85,7 @@ unsafe fn rewrite(graph: *mut ffi::ggml_cgraph, cuda: bool) -> Option<Box<dyn Re
             folded,
             fma,
             left = undo.left.len(),
+            unread = UNREAD.load(Ordering::Relaxed),
             "hc moe fold: MoE tails made by the next hyper-connection norm, or as one op at \
              the gate's add where no such norm reads them (the first graphs; --hc-moe-fold)"
         );
@@ -273,6 +282,24 @@ impl Graph {
             // Rows of zero weights skipped only under --tp-moe-ep, where they hold +0.0.
             let ep = crate::model::core::tp_ep::active() && crate::model::core::tp_ep::skip();
             let fma = if ep { FMA_SKIP } else { 1 };
+            if ep {
+                // Then nothing reads the other ranks' rows: the grouped kernels need not store
+                // their zeros (the experts' rows read by the tail's `mul` alone, so by the new
+                // op alone).
+                let down = root(s.experts);
+                if self.only_read_by(down, &[s.at]) {
+                    let at = |t: Node| self.index.get(&(t as usize)).copied();
+                    let di = at(down);
+                    let marks = nvfp4_mm::unread_nodes(down, |g| {
+                        di.is_some_and(|di| at(g).is_some() && self.only_read_by(g, &[di]))
+                    });
+                    UNREAD.fetch_add(marks.len(), Ordering::Relaxed);
+                    for t in marks {
+                        saved.push((t, std::ptr::read(t)));
+                        nvfp4_mm::leave_unread(t);
+                    }
+                }
+            }
             make_external(a, &MOE_SUM_GATE, &srcs, &[1, 1, s.k as i32, fma]);
             self.retire(&dead, root(s.experts));
             true
