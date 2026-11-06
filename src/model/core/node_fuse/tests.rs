@@ -220,10 +220,21 @@ fn users_are_each_nodes_readers() {
 }
 
 /// #1176: the op in its fused-sum form (`params[3]`) rounds as ggml-cuda's fused sum (the first
-/// product, then one FMA per expert) and the shared expert's gate after it, and does not read
-/// the rows of zero router weights (NaN here: any read would show).
+/// product, then one FMA per expert) and the shared expert's gate after it; with [`FMA_SKIP`]
+/// (`--tp-moe-ep`) it does not read
+/// the rows of zero router weights (NaN here: any read would show), and without it reads them
+/// as ggml-cuda does (NaN times zero: NaN).
 #[test]
 fn fused_sum_skips_zero_weight_rows() {
+    fused_sum_zero_weight_rows(FMA_SKIP);
+}
+
+#[test]
+fn fused_sum_reads_zero_weight_rows_without_ep() {
+    fused_sum_zero_weight_rows(1);
+}
+
+fn fused_sum_zero_weight_rows(fma: i32) {
     let (e, k, n) = (12usize, 6usize, 3usize);
     let mut backend = Backend::cpu().unwrap();
     backend.set_threads(2);
@@ -242,7 +253,7 @@ fn fused_sum_skips_zero_weight_rows() {
             types::F32,
             [e as i64, n as i64, 1, 1],
             &[experts, w, sh, g],
-            &[1, 1, k as i32, 1],
+            &[1, 1, k as i32, fma],
         )
         .as_output();
     let mut graph = ctx.new_graph(64);
@@ -269,6 +280,10 @@ fn fused_sum_skips_zero_weight_rows() {
     g.set_f32(&gv);
     backend.compute(&graph).unwrap();
     let got = out.to_f32();
+    if fma != FMA_SKIP {
+        assert!(got.iter().all(|v| v.is_nan()), "{got:?}");
+        return;
+    }
     for t in 0..n {
         let s = 1.0 / (1.0 + (-gv[t]).exp());
         for col in 0..e {

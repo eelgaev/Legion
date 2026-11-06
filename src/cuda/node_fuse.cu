@@ -7,7 +7,7 @@
 //                  rounded), and the shared expert gated by its sigmoid added: ggml's
 //                  op_sigmoid, mul and add, each rounded (shexp_gate_kernel's, fused.cu).
 //   moe_tail_fma   moe_sum_gate's tail where ggml-cuda fuses the weighted sum (one fma per
-//                  expert), zero-weight rows not read (#1176, --tp-moe-ep).
+//                  expert), under --tp-moe-ep zero-weight rows not read (#1176).
 //   ids_remap      the routed expert ids through the layer's expert table: ggml's cont and
 //                  get_rows of the I32 ids (integers, exact).
 //
@@ -27,6 +27,7 @@ struct legion_moe_sum_gate {
     int64_t       n_embd;
     int32_t       k;
     int32_t       n_tok;
+    int32_t       skip_zero;  // moe_tail_fma: rows of zero router weights not read
 };
 
 struct legion_ids_remap {
@@ -73,10 +74,11 @@ __global__ void moe_sum_gate_kernel(const legion_moe_sum_gate p) {
 // moe_tail_fma (#1176): a MoE layer's tail whose weighted sum ggml-cuda fuses, in one launch:
 // the first product rounded, then one fma per expert (moe_weighted_reduction_f32, as
 // fused.cu's moe_combine_kernel), then the shared expert gated by its sigmoid added
-// (moe_sum_gate_kernel's gate). A term whose router weight is zero is made from a zero instead
-// of its expert's row, which is not read: under --tp-moe-ep the experts another rank holds
-// have zero weights and rows the grouped NVFP4 kernels stored as +0.0, so the same values with
-// about half the rows read. V columns per thread (4: float4 loads, the host checks that
+// (moe_sum_gate_kernel's gate). With p.skip_zero (only under --tp-moe-ep) a term whose router
+// weight is zero is made from a zero instead of its expert's row, which is not read: there the
+// experts another rank holds have zero weights and rows the grouped NVFP4 kernels stored as
+// +0.0, so the same values with about half the rows read. Without it every row is read, as
+// ggml-cuda reads them (a non-finite row times a zero weight stays NaN). V columns per thread (4: float4 loads, the host checks that
 // n_embd is a multiple of 4 and the rows 16-byte aligned).
 constexpr int TAIL_GROUP = 8;
 
@@ -112,7 +114,7 @@ template <int V> __global__ void moe_tail_fma_kernel(const legion_moe_sum_gate p
         for (int q = 0; q < TAIL_GROUP; ++q) {
             const int j = j0 + q;
             wj[q]       = j < p.k ? p.w[first + j] : 0.0f;
-            if (j < p.k && wj[q] != 0.0f) {
+            if (j < p.k && (!p.skip_zero || wj[q] != 0.0f)) {
                 load_cols<V>(x + (int64_t) j * p.n_embd, v[q]);
             } else {
 #pragma unroll

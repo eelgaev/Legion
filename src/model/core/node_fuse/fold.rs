@@ -21,12 +21,12 @@
 //!
 //! A tail no such norm reads (under tensor parallelism the rank exchange reads it, #1176) whose
 //! sum ggml-cuda fuses becomes one [`MOE_SUM_GATE`] at the gate's add instead, in the fused
-//! sum's rounding, that does not read the rows of zero router weights: under `--tp-moe-ep` the
-//! rows of the experts the other ranks hold, which the grouped kernels stored as zeros.
+//! sum's rounding; under `--tp-moe-ep` it does not read the rows of zero router weights (the
+//! rows of the experts the other ranks hold, which the grouped kernels stored as zeros).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::{Gate, Graph, MOE_SUM_GATE, Node, ON, Sum, f32_contiguous, is_view_op, root};
+use super::{FMA_SKIP, Gate, Graph, MOE_SUM_GATE, Node, ON, Sum, f32_contiguous, is_view_op, root};
 use crate::ggml::post_alloc::{Relaid, Relayout};
 use crate::ggml::{ffi, make_external};
 use crate::model::qwen4::{FoldSum, fold_moe, fold_target, moe_fold};
@@ -247,9 +247,9 @@ impl Graph {
 
     /// The tail of the sum `s`, which ggml-cuda fuses, with its gate `gt` as one
     /// [`MOE_SUM_GATE`] in its FMA form at the gate's add (#1176): the add's values, rounded as
-    /// the tail's nodes round them, without the weighted sum written and read back, and with
-    /// the rows of zero router weights not read (under `--tp-moe-ep`, the other ranks'
-    /// experts: half the rows on two ranks). Saves the nodes it changes first. Whether it did.
+    /// the tail's nodes round them, without the weighted sum written and read back, and under
+    /// `--tp-moe-ep` with the rows of zero router weights not read (the other ranks' experts:
+    /// half the rows on two ranks). Saves the nodes it changes first. Whether it did.
     ///
     /// # Safety
     /// As [`Self::fold_tail`]; `s`'s experts are `[e, k, n]` contiguous F32 and `gt` its gate.
@@ -270,7 +270,10 @@ impl Graph {
                     .map(|&i| (self.nodes[i], std::ptr::read(self.nodes[i]))),
             );
             let srcs = [s.experts, s.weights, gt.sh, gt.g];
-            make_external(a, &MOE_SUM_GATE, &srcs, &[1, 1, s.k as i32, 1]);
+            // Rows of zero weights skipped only under --tp-moe-ep, where they hold +0.0.
+            let ep = crate::model::core::tp_ep::active() && crate::model::core::tp_ep::skip();
+            let fma = if ep { FMA_SKIP } else { 1 };
+            make_external(a, &MOE_SUM_GATE, &srcs, &[1, 1, s.k as i32, fma]);
             self.retire(&dead, root(s.experts));
             true
         }

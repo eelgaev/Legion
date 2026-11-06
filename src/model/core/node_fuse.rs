@@ -48,9 +48,14 @@ type Node = *mut ffi::ggml_tensor;
 /// shared expert's output `[e, n]` (contiguous) and the gate logits `[1, n]` (any row stride)
 /// when `params[1]`; `params[2]` is `k`. With `k` 1 and no weights, the gate alone.
 /// `params[3]` set (weights and gate both there; made by [`fold`], #1176): the sum rounded as
-/// ggml-cuda's fused kernel rounds it (the first product, then one FMA per expert), and a row
-/// whose router weight is zero not read, its term made from a zero (the same value where that
-/// row holds +0.0, as the rows of the experts another rank holds under `--tp-moe-ep`).
+/// ggml-cuda's fused kernel rounds it (the first product, then one FMA per expert). With
+/// `params[3]` [`FMA_SKIP`] (only under `--tp-moe-ep`) a row whose router weight is zero is not
+/// read, its term made from a zero: the same value where that row holds +0.0, as the rows of
+/// the experts another rank holds there; otherwise every row is read, as ggml-cuda reads them.
+/// `params[3]` of a [`MOE_SUM_GATE`] in its fused-sum form that skips the rows of zero router
+/// weights (`1` reads them all).
+pub(crate) const FMA_SKIP: i32 = 2;
+
 pub(crate) static MOE_SUM_GATE: ExternalOp = ExternalOp {
     name: "moe_sum_gate",
     cpu: cpu_moe_sum_gate,
@@ -839,10 +844,11 @@ unsafe fn cpu_moe_sum_gate(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
                     }
                 };
                 let mut sum = if fma != 0 {
-                    // ggml-cuda's fused sum; a zero weight's row not read (see MOE_SUM_GATE).
+                    // ggml-cuda's fused sum; with FMA_SKIP a zero weight's row not read (see
+                    // MOE_SUM_GATE).
                     let wj = |j: usize| weight(j).unwrap_or(1.0);
                     let row = |j: usize| {
-                        if wj(j) == 0.0 {
+                        if fma == FMA_SKIP && wj(j) == 0.0 {
                             0.0
                         } else {
                             *xp.add((t * k + j) * e + col)
@@ -889,6 +895,7 @@ struct SumGate {
     n_embd: i64,
     k: i32,
     n_tok: i32,
+    skip_zero: i32,
 }
 
 /// `legion_ids_remap` (src/cuda/node_fuse.cu).
@@ -963,6 +970,7 @@ unsafe fn cuda_moe_sum_gate(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
             n_embd: e,
             k,
             n_tok: n as i32,
+            skip_zero: i32::from(fma == FMA_SKIP),
         };
         // The fused sum's kernel: 4 columns a thread where every row is 16-byte aligned.
         let aligned = |t: *const f32| (t as usize).is_multiple_of(16);
