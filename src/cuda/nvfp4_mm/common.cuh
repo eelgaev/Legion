@@ -80,6 +80,10 @@ struct legion_nvfp4_mm {
     // others none), so two launches on one plan split the experts by their pair counts (the
     // busy ones on the GEMM, the rest on the mv kernel). 0 and INT32_MAX: every expert.
     int32_t sel_lo, sel_hi;
+    // The GEMM's L2 prefetch run (blocks per row and prefetch, at most two runs ahead), 0 for
+    // its default; and its L2 cache hints (bit 0: the weight copies evict-first, bit 1: the
+    // activation copies evict-last), 0 for none. Neither changes a value (tuning, #1183).
+    int32_t pf, hint;
 };
 
 // The GEMM: tiles_m * tiles_n CTAs of 256 threads; mi = 1 or 2 (128 * mi rows), nt = 1, 2, 4,
@@ -205,6 +209,36 @@ __device__ __forceinline__ void cp_async16(void * s, const void * g, bool valid)
 __device__ __forceinline__ void cp_async16_n(void * s, const void * g, int bytes) {
     const uint32_t a = (uint32_t) __cvta_generic_to_shared(s);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(a), "l"(g), "r"(bytes));
+}
+
+// cp_async16_n with an L2 cache policy (createpolicy): where the line goes in L2's eviction
+// order, nothing else.
+// Before sm_80: the plain copy (no policies).
+__device__ __forceinline__ void cp_async16_n_pol(void * s, const void * g, int bytes, uint64_t pol) {
+#if __CUDA_ARCH__ >= 800
+    const uint32_t a = (uint32_t) __cvta_generic_to_shared(s);
+    asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2, %3;\n" ::"r"(a), "l"(g), "r"(bytes),
+                 "l"(pol));
+#else
+    (void) pol;
+    cp_async16_n(s, g, bytes);
+#endif
+}
+
+__device__ __forceinline__ uint64_t policy_evict_first() {
+    uint64_t pol = 0;
+#if __CUDA_ARCH__ >= 800
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(pol));
+#endif
+    return pol;
+}
+
+__device__ __forceinline__ uint64_t policy_evict_last() {
+    uint64_t pol = 0;
+#if __CUDA_ARCH__ >= 800
+    asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;\n" : "=l"(pol));
+#endif
+    return pol;
 }
 
 // A UE4M3 sub-block scale times 2^116 as a BF16 pair (ggml: sign ignored, 0x7f is 0).
@@ -427,6 +461,10 @@ __global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p)
     };
     auto row_ok = [&](int r) { return (GLU ? m0 + r / 32 * 16 + r % 16 : m0 + r) < p.m; };
 
+    // p.hint's L2 policies (tuning only: where lines sit in L2's eviction order).
+    const bool w_first = p.hint & 1, x_last = p.hint & 2;
+    const uint64_t pol_w = w_first ? policy_evict_first() : 0;
+    const uint64_t pol_x = x_last ? policy_evict_last() : 0;
     auto load = [&](int64_t step, int stage) {
         unsigned char * ws = smem + stage * STAGE;
         __nv_bfloat16 * xs = (__nv_bfloat16 *) (ws + W_STAGE);
@@ -442,7 +480,11 @@ __global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p)
                 const uint8_t * start = row_src(r) + step * 36;
                 const uint8_t * src = (const uint8_t *) ((uintptr_t) start & ~(uintptr_t) 15) + part * 16;
                 const int bytes = row_ok(r) ? min(16, (int) (start + 36 - src)) : 0;
-                cp_async16_n(ws + r * LDW + part * 16, src, bytes);
+                if (w_first) {
+                    cp_async16_n_pol(ws + r * LDW + part * 16, src, bytes, pol_w);
+                } else {
+                    cp_async16_n(ws + r * LDW + part * 16, src, bytes);
+                }
             }
         }
 #pragma unroll
@@ -452,15 +494,19 @@ __global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p)
                 const int t = c / 8, col = c % 8 * 8;
                 const bool ok = t < n_tok;
                 const int64_t off = !ok ? 0 : GROUPED ? x_off[t] : (n0 + t) * p.x_ld;
-                cp_async16(xs + t * LDX + col, p.x + off + step * BK + col, ok);
+                if (x_last) {
+                    cp_async16_n_pol(xs + t * LDX + col, p.x + off + step * BK + col, ok ? 16 : 0, pol_x);
+                } else {
+                    cp_async16(xs + t * LDX + col, p.x + off + step * BK + col, ok);
+                }
             }
         }
     };
 
     // Each row's next PF blocks in one L2 bulk prefetch, PF blocks ahead of the copies: the
     // copies read one block (36 bytes) of a row per step, too short a run for the LPDDR5X
-    // (see nvfp4_mvs).
-    constexpr int PF = 32;
+    // (see nvfp4_mvs). p.pf above 0 sets PF (tuning).
+    const int PF = p.pf > 0 ? p.pf : 32;
     auto prefetch = [&](int64_t step) {
 #if __CUDA_ARCH__ >= 900
         if (threadIdx.x < BM && step < steps) {

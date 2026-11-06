@@ -7,9 +7,9 @@
 
 use super::bench::routing_tiles;
 use super::{
-    GemmTune, Grouped, Kernel, MV_MAX_N, bf16_bits, force_gemm_tune, force_grouped_tiles,
-    force_kernel, glu_gemm_tile, mul_mat_id, pick_grouped, plan_grouped, set_expert_mv_max,
-    set_expert_mv_tile, swiglu_id,
+    GemmTune, Grouped, Kernel, MV_MAX_N, bf16_bits, force_expert_l2, force_gemm_tune,
+    force_grouped_tiles, force_kernel, glu_gemm_tile, mul_mat_id, pick_grouped, plan_grouped,
+    set_expert_mv_max, set_expert_mv_tile, swiglu_id,
 };
 use crate::ggml::{Backend, ComputeAllocator, Context, Graph, Tensor, types};
 
@@ -39,7 +39,8 @@ pub enum Family {
 /// One variant: the op, its tile (`mi`, `nt`; the SwiGLU's `mi` is always 2) and its stages and
 /// occupancy; `None`s are the defaults. A `tile` or `tune` is the GEMM's. `exact`: the default
 /// with a grid of the routing's own token tile count instead of the host's upper bound (#836:
-/// what the CTAs that find no tile cost).
+/// what the CTAs that find no tile cost). `l2` (#1183): the default GEMM with this L2
+/// prefetch run and these cache hints ([`super::force_expert_l2`]).
 #[derive(Clone, Copy, Debug)]
 pub struct Variant {
     pub op: Op,
@@ -47,12 +48,17 @@ pub struct Variant {
     pub tune: Option<GemmTune>,
     pub family: Family,
     pub exact: bool,
+    pub l2: Option<(u8, u8)>,
 }
 
 impl Variant {
     /// The op's default choice, the reference of the bit checks.
     pub fn is_default(&self) -> bool {
-        self.family == Family::Default && self.tile.is_none() && self.tune.is_none() && !self.exact
+        self.family == Family::Default
+            && self.tile.is_none()
+            && self.tune.is_none()
+            && !self.exact
+            && self.l2.is_none()
     }
 
     /// The kernel family this variant runs on at `per` pairs per expert.
@@ -71,6 +77,9 @@ impl Variant {
         };
         if self.exact {
             return format!("{op} exact");
+        }
+        if let Some((pf, hint)) = self.l2 {
+            return format!("{op} pf{pf} h{hint}");
         }
         match self.family {
             Family::Mv(nt) => return format!("{op} mv nt<={nt}"),
@@ -104,12 +113,30 @@ pub fn variants() -> Vec<Variant> {
         tune,
         family,
         exact: false,
+        l2: None,
     };
     let exact = |op| Variant {
         exact: true,
         ..v(op, None, None, Family::Default)
     };
+    // #1183: the default GEMM's L2 prefetch run (blocks) and cache hints.
+    let l2 = |op, pf, hint| Variant {
+        l2: Some((pf, hint)),
+        ..v(op, None, None, Family::Default)
+    };
+    const L2: [(u8, u8); 9] = [
+        (4, 0),
+        (8, 0),
+        (16, 0),
+        (24, 0),
+        (32, 1),
+        (32, 2),
+        (32, 3),
+        (8, 1),
+        (8, 3),
+    ];
     let mut out = vec![v(Op::Glu, None, None, Family::Default), exact(Op::Glu)];
+    out.extend(L2.map(|(pf, hint)| l2(Op::Glu, pf, hint)));
     for nt in [8, 16] {
         for t in TUNES {
             out.push(v(Op::Glu, Some((2, nt)), tune(t), Family::Default));
@@ -122,6 +149,7 @@ pub fn variants() -> Vec<Variant> {
     }
     out.push(v(Op::Down, None, None, Family::Default));
     out.push(exact(Op::Down));
+    out.extend(L2.map(|(pf, hint)| l2(Op::Down, pf, hint)));
     for (mi, nt) in [(1, 8), (1, 16), (2, 8), (2, 16)] {
         for t in TUNES {
             out.push(v(Op::Down, Some((mi, nt)), tune(t), Family::Default));
@@ -333,6 +361,9 @@ fn force(v: Option<&Variant>) {
     );
     let glu_nt = tile.filter(|_| !down).map(|(_, nt)| nt);
     force_gemm_tune(v.and_then(|v| v.tune), glu_nt);
+    let l2 = v.and_then(|v| v.l2);
+    force_expert_l2(true, l2.filter(|_| !down));
+    force_expert_l2(false, l2.filter(|_| down));
 }
 
 /// Every variant at every chunk size and pool of `cfg` on `gpu`; the variants take turns within

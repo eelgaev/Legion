@@ -1322,6 +1322,8 @@ mod cuda {
         pdl: i32,
         sel_lo: i32,
         sel_hi: i32,
+        pf: i32,
+        hint: i32,
     }
 
     /// `Params::sel_lo`, `sel_hi` for every expert.
@@ -1441,6 +1443,19 @@ mod cuda {
     pub(super) static FORCED_TUNE: AtomicU64 = AtomicU64::new(0);
     pub(super) static FORCED_GLU_NT: AtomicU64 = AtomicU64::new(0);
 
+    /// The expert GEMMs' L2 prefetch run and cache hints (`Params::pf`, `hint`) forced by
+    /// [`super::force_expert_l2`] (`pf | hint << 8`, plus 1 << 16 when set), down then SwiGLU.
+    pub(super) static FORCED_L2: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+    /// `(pf, hint)` of the expert GEMM (`glu`: the SwiGLU, else the down one).
+    fn expert_l2(glu: bool) -> (i32, i32) {
+        let v = FORCED_L2[glu as usize].load(Ordering::Relaxed);
+        if v & 1 << 16 != 0 {
+            return ((v & 0xff) as i32, (v >> 8 & 0xff) as i32);
+        }
+        (0, 0)
+    }
+
     fn forced_tune() -> Option<GemmTune> {
         let v = FORCED_TUNE.load(Ordering::Relaxed) as i32;
         (v != 0).then(|| GemmTune::from_code(v))
@@ -1491,6 +1506,8 @@ mod cuda {
             pdl: 0,
             sel_lo: ALL.0,
             sel_hi: ALL.1,
+            pf: 0,
+            hint: 0,
         };
         launch(&mut p, kernel, stream)
     }
@@ -1538,6 +1555,8 @@ mod cuda {
             pdl: 0,
             sel_lo: ALL.0,
             sel_hi: ALL.1,
+            pf: 0,
+            hint: 0,
         };
         // SAFETY: parameters checked above; the node's stream.
         let code = unsafe {
@@ -1672,6 +1691,8 @@ mod cuda {
             pdl: (!shared.is_null() && EXPERT_PDL.load(Ordering::Relaxed)) as i32,
             sel_lo: ALL.0,
             sel_hi: split.map_or(ALL.1, |(cut, _)| cut),
+            pf: expert_l2(false).0,
+            hint: expert_l2(false).1,
         };
         if let Some(t) = forced_tiles() {
             p.tiles_n = p.tiles_n.min(t);
@@ -1858,6 +1879,8 @@ mod cuda {
             pdl: 0,
             sel_lo: ALL.0,
             sel_hi: split.unwrap_or(ALL.1),
+            pf: expert_l2(true).0,
+            hint: expert_l2(true).1,
         };
         if let Some(cut) = split {
             // The experts of more than `cut` pairs on the GEMM first, so the grouped SwiGLU mv
@@ -1927,6 +1950,21 @@ pub fn force_gemm_tune(tune: Option<GemmTune>, glu_nt: Option<i32>) {
     }
     #[cfg(not(feature = "cuda"))]
     let _ = (tune, glu_nt);
+}
+
+/// Runs the expert GEMMs from now on (`glu`: the grouped SwiGLU one, else the grouped down
+/// one) with the L2 prefetch run `pf` (blocks; 0 its default) and the L2 cache hints `hint`
+/// (bit 0: weight copies evict-first, bit 1: activation copies evict-last), or the defaults
+/// for `None`: for tests and tuning (the same bits either way).
+#[doc(hidden)]
+pub fn force_expert_l2(glu: bool, l2: Option<(u8, u8)>) {
+    #[cfg(feature = "cuda")]
+    cuda::FORCED_L2[glu as usize].store(
+        l2.map_or(0, |(pf, hint)| pf as u64 | (hint as u64) << 8 | 1 << 16),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    #[cfg(not(feature = "cuda"))]
+    let _ = (glu, l2);
 }
 
 /// Launches every grouped mv [`mul_mat_id`] from now on as the variant `g`, or the default for
