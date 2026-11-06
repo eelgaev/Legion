@@ -2,6 +2,14 @@ name: ci
 on:
   push:
     branches: [main]
+    # A main push that only touches docs (README rows, run docs) builds nothing new; skip it so the
+    # single self-hosted runner stays free for pull requests. Pull requests always run.
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - 'THIRD-PARTY-NOTICES'
+      - '.coderabbit.yaml'
   pull_request:
   workflow_dispatch:
 # A newer push to a pull request cancels its older run; pushes to main queue instead, so every
