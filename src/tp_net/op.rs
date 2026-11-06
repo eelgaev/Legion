@@ -514,12 +514,13 @@ pub(super) mod cuda {
         let mine = plan.pieces[rank];
         let bytes = plan.span * eb;
         let seq = comm.next_seq();
-        if let Some(d) = comm.deferred.lock().expect("deferred lock").as_ref() {
-            // Its reader runs before any later exchange starts (it holds the buffers).
-            return Err(format!(
-                "tp exchange {seq}: the sum of exchange {} was not taken by its reader",
-                d.seq
-            ));
+        // A deferred sum whose reader has not run yet (the graph's order put this exchange
+        // first, or nothing read it): made here as `finish` makes it, so the reader finds its
+        // output written and this exchange may reuse the buffers.
+        let left = comm.deferred.lock().expect("deferred lock").take();
+        if let Some(d) = left {
+            // SAFETY: as in `finish`; the buffers are held until "consumed" below.
+            unsafe { complete_deferred(comm, &d, stream)? };
         }
         let mut in_flight = comm.in_flight.lock().expect("in-flight lock");
         if in_flight.len() > 1 {
@@ -656,6 +657,8 @@ pub(super) mod cuda {
         pub(crate) seq: u32,
         /// The node's output (left unwritten), which the reader names.
         dst: usize,
+        /// Its values (this rank's share).
+        n: usize,
         /// Device addresses of rank 0's and rank 1's BF16 partials, `[row, share]` each.
         pub(crate) srcs: [u64; 2],
     }
@@ -692,8 +695,44 @@ pub(super) mod cuda {
         } else {
             [theirs, own]
         };
-        *comm.deferred.lock().expect("deferred lock") = Some(Deferred { seq, dst, srcs });
+        *comm.deferred.lock().expect("deferred lock") = Some(Deferred {
+            seq,
+            dst,
+            n: mine.1,
+            srcs,
+        });
         Ok(())
+    }
+
+    /// The deferred sum `d` made by the exchange itself, as [`finish`] makes it (rank order,
+    /// the BF16 sum kernel), into its node's output, and its buffers freed.
+    ///
+    /// # Safety
+    /// As [`finish`]; `stream` is the stream the exchange ran on.
+    unsafe fn complete_deferred(
+        comm: &super::super::Comm,
+        d: &Deferred,
+        stream: *mut c_void,
+    ) -> Result<(), String> {
+        static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!(
+                seq = d.seq,
+                "tp reduce-scatter: a deferred sum made by the next exchange (once per process)"
+            );
+        }
+        let srcs = d.srcs.map(|a| a as *const f32);
+        // SAFETY: the caller's; `srcs` are the exchange's held BF16 buffers, `dst` its output.
+        unsafe {
+            sum(
+                legion_tp_net_sum_bf16_kernel,
+                &srcs,
+                d.dst as *mut f32,
+                d.n,
+                stream,
+            )?;
+            release_deferred(comm, d.seq, stream)
+        }
     }
 
     /// The deferred sum whose node's output is at `dst` (device address), for its reader to

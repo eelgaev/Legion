@@ -97,8 +97,9 @@ pub fn deferrable(out: Tensor<'_>) -> bool {
 /// next hyper-connection norm, `hc_post_norm` in its rebuilt BF16-xn form), which adds the two
 /// ranks' BF16 partials itself as the sum kernel does (rank order, one F32 rounding): on CUDA
 /// the node then waits for the peer's partial but does not sum, leaves `out` unwritten and the
-/// buffers held until the reader ran ([`super::op::cuda::take_deferred`]). The CPU op writes
-/// `out` either way.
+/// buffers held until the reader ran ([`super::op::cuda::take_deferred`]). If the next exchange
+/// starts first (the graph's order allows it), that exchange makes the sum into `out` as the
+/// node would have, and the reader reads `out`. The CPU op writes `out` either way.
 pub fn defer_sum(out: Tensor<'_>) {
     assert!(deferrable(out), "seq_par::defer_sum: not a deferrable sum");
     // SAFETY: a node of `reduce_scatter` (checked above).
