@@ -129,7 +129,8 @@ pub enum PeerWrites {
 }
 
 /// Per reader `r`: bit `w` set when GPU `w` writes into `r`'s VRAM inbox, for GPUs on NUMA
-/// nodes `nodes` where `w` can reach `r`'s memory when `can(w, r)`.
+/// nodes `nodes` where `w` can reach `r`'s memory when `can(w, r)`. GPUs of no known node
+/// ([`crate::residency::fallback::NO_NODE`]) are never a pair: no shared node is known.
 pub fn peer_masks(
     mode: PeerWrites,
     nodes: &[u32],
@@ -141,7 +142,11 @@ pub fn peer_masks(
         for w in (0..n).filter(|&w| w != r) {
             let on = match mode {
                 PeerWrites::Off => false,
-                PeerWrites::Pairs => nodes[w] == nodes[r] && can(w, r),
+                PeerWrites::Pairs => {
+                    crate::residency::fallback::known_node(nodes[r]).is_some()
+                        && nodes[w] == nodes[r]
+                        && can(w, r)
+                }
                 PeerWrites::All => can(w, r),
             };
             if on {
