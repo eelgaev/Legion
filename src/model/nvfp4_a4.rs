@@ -281,6 +281,33 @@ fn layout(out: usize, rows: i64, k: i64, plan: usize) -> ([usize; 4], usize) {
     ([codes, scales, dec, plan_at], plan_at + plan * 4)
 }
 
+/// Most CTAs a stream-K dense GEMM runs with (`legion_nvfp4_a4`'s `sk_max`).
+const SK_MAX: usize = 64;
+/// F32 accumulators one stream-K CTA hands on (`LEGION_NVFP4_A4_SK_ACC`).
+const SK_ACC: usize = 256 * 64;
+
+/// Scratch bytes for the stream-K split of a dense GEMM of `m` rows over `rows` tokens (the
+/// accumulators handed on, then the flags and the ticket), or 0 when the split cannot apply:
+/// it takes the 128 x 128 tile (over 64 tokens) with fewer tiles than [`SK_MAX`].
+fn sk_bytes(m: i64, rows: i64) -> usize {
+    let tiles = (m + 127) / 128 * ((rows + 127) / 128);
+    if rows > 64 && (tiles as usize) < SK_MAX {
+        SK_MAX * SK_ACC * 4 + (SK_MAX + 1) * 4
+    } else {
+        0
+    }
+}
+
+/// A node of `total` bytes with `sk` stream-K scratch bytes after them: (the scratch's offset,
+/// the new total).
+fn with_sk(total: usize, sk: usize) -> (usize, usize) {
+    if sk == 0 {
+        return (total, total);
+    }
+    let at = total.div_ceil(256) * 256;
+    (at, at + sk)
+}
+
 /// The ops' activation quantization alone (tests): `x` `[k, rows]` (F32 or BF16) to I8 bytes
 /// laid out as [`quant_layout`] says.
 #[doc(hidden)]
@@ -381,6 +408,7 @@ fn dense<'a>(
     let ty = out_type(act);
     let esize = crate::ggml::row_size(ty, 1);
     let (_, total) = layout((m * rows) as usize * esize, rows, k, 0);
+    let (_, total) = with_sk(total, sk_bytes(m, rows));
     let mut args = vec![w, x];
     args.extend(scale);
     if let Some(r) = res {
@@ -462,6 +490,8 @@ pub fn mul_mat_multi<'a>(
     let rows = n1 * n2 * n3;
     let m_sum: i64 = ws.iter().map(|(w, _)| w.ne()[1]).sum();
     let (_, total) = layout((m_sum * rows) as usize * 4, rows, k, 0);
+    let m_min = ws.iter().map(|(w, _)| w.ne()[1]).min().unwrap_or(0);
+    let (_, total) = with_sk(total, sk_bytes(m_min, rows));
     let mut args: Vec<Tensor<'a>> = ws.iter().map(|&(w, _)| w).collect();
     args.push(x);
     let mut mask = 0;
@@ -1273,6 +1303,17 @@ pub fn force_tokens_tile(nt: Option<i32>) {
     let _ = nt;
 }
 
+/// Launches every dense W4A4 GEMM from now on with one CTA per tile (`true`) instead of the
+/// stream-K split of GEMMs with fewer tiles than SMs (the default, `false`): for tests (the
+/// split gives the same bits) and tuning.
+#[doc(hidden)]
+pub fn force_no_stream_k(off: bool) {
+    #[cfg(feature = "cuda")]
+    cuda::NO_SK.store(off, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "cuda"))]
+    let _ = off;
+}
+
 /// The grouped tile of 64 tokens sized for two CTAs per SM (`legion_nvfp4_a4_gemm_launch`'s
 /// `LEGION_NVFP4_A4_TWO_CTAS | 4`), also for [`force_tokens_tile`].
 #[doc(hidden)]
@@ -1285,6 +1326,10 @@ mod cuda {
 
     /// A token tile forced by [`super::force_tokens_tile`]; 0 is none.
     pub(super) static FORCED_NT: AtomicI32 = AtomicI32::new(0);
+
+    /// The stream-K split turned off by [`super::force_no_stream_k`].
+    pub(super) static NO_SK: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
 
     /// A grouped kernel forced by [`super::force_grouped`]: 0 none, 1 the GEMM, `2 | rt << 8 |
     /// kw << 16` the decode kernel.
@@ -1344,6 +1389,9 @@ mod cuda {
         act: i32,
         pw: *const f32,
         res: *const f32,
+        sk_acc: *mut f32,
+        sk_flags: *mut i32,
+        sk_max: i32,
     }
 
     unsafe extern "C" {
@@ -1503,7 +1551,27 @@ mod cuda {
             act,
             pw: std::ptr::null(),
             res: std::ptr::null(),
+            sk_acc: std::ptr::null_mut(),
+            sk_flags: std::ptr::null_mut(),
+            sk_max: 0,
         }
+    }
+
+    /// Points `p` at the node's stream-K scratch when it has one (see [`super::sk_bytes`]):
+    /// `total` is the node's size without it, `(m_min, n)` what the builder reserved it for.
+    fn set_sk(p: &mut Params, dst: &ffi::ggml_tensor, total: usize, (m_min, n): (i64, i64)) {
+        let sk = super::sk_bytes(m_min, n);
+        if sk == 0 || NO_SK.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let (at, _) = super::with_sk(total, sk);
+        let base = dst.data as *mut u8;
+        // SAFETY: the scratch lies inside the node (see `dense` and `mul_mat_multi`).
+        unsafe {
+            p.sk_acc = base.add(at) as *mut f32;
+            p.sk_flags = base.add(at + super::SK_MAX * super::SK_ACC * 4) as *mut i32;
+        }
+        p.sk_max = super::SK_MAX as i32;
     }
 
     fn launch(p: &Params, nt: i32, stream: *mut c_void) -> Result<(), String> {
@@ -1555,6 +1623,8 @@ mod cuda {
             act,
         );
         p.res = scale_ptr(dst, has_res, 2 + has_scale as usize);
+        let (_, total) = super::layout((m * n) as usize * esize, n, k, 0);
+        set_sk(&mut p, dst, total, (m, n));
         launch(&p, nt, stream)
     }
 
@@ -1581,6 +1651,8 @@ mod cuda {
             quantize(dst, x, k, n, out_bytes, stream)?
         };
         let nt = tokens_tile(n);
+        let (_, total) = super::layout(out_bytes, n, k, 0);
+        let m_min = ws.iter().map(|w| w.ne[1]).min().unwrap_or(0);
         let mut out = dst.data as *mut u8;
         let mut si = count + 1;
         for (i, w) in ws.iter().enumerate() {
@@ -1595,7 +1667,8 @@ mod cuda {
                 (m + BM - 1) / BM,
                 (n + 16 * nt as i64 - 1) / (16 * nt as i64),
             );
-            let p = params(w, xq, scale, out as *mut c_void, (k, m, n), tiles, 0);
+            let mut p = params(w, xq, scale, out as *mut c_void, (k, m, n), tiles, 0);
+            set_sk(&mut p, dst, total, (m_min, n));
             launch(&p, nt, stream)?;
             // SAFETY: the outputs lie back to back at the start of the node (see `layout`).
             out = unsafe { out.add((m * n) as usize * 4) };

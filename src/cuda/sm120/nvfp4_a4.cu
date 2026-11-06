@@ -28,6 +28,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <algorithm>
 #include <cstdint>
 
 #if defined(__CUDA_ARCH__) && (defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL))
@@ -61,7 +62,16 @@ struct legion_nvfp4_a4 {
     // Dense, act 0: a residual (F32, the dst's layout) added to each output with __fadd_rn (never
     // contracted into an FMA), so dst holds the bits of the plain GEMM followed by ggml's add.
     const float * res;
+    // Dense GEMMs of fewer row x token tiles than the GPU has SMs (decode-sized batches): scratch
+    // for the stream-K split (see legion_nvfp4_a4_gemm_launch), room for sk_max CTAs' handed-on
+    // accumulators (LEGION_NVFP4_A4_SK_ACC floats each) and sk_max + 1 I32 flags; null: none.
+    float * sk_acc;
+    int32_t * sk_flags;
+    int32_t sk_max;
 };
+
+// F32 accumulators one CTA of the dense 128 x 128 tile hands on (64 per thread).
+#define LEGION_NVFP4_A4_SK_ACC (256 * 64)
 
 // Quantizes `rows` rows of k (F32 if x_bf16 is 0, else BF16; x_ld elements apart) to the layout
 // above: codes rows of q_ld bytes, scales rows of s_ld bytes, decode scales d. Blocks of 64
@@ -477,7 +487,13 @@ __global__ void __launch_bounds__(RQ_THREADS) nvfp4_a4_rms_quant(const float * x
 // SH (CW 16): weight rows only 8-byte aligned (w_ld % 16 == 8, bases 16-byte aligned): each
 // row's copies take the aligned window around its stage, which starts 0 or 8 bytes in by the
 // row's parity (a lane's rows all have its g's parity).
-template <class T, bool GROUPED, bool GLU, int CW, bool RES = false, bool SH = false>
+// SK (dense plain GEMMs, see legion_nvfp4_a4_gemm_launch): stream-K. The grid's CTAs take equal
+// runs of the (tile, k step) sequence in the order they start (a ticket); a run is the head of
+// one tile and / or a part of another. A CTA does the part that starts a tile first, hands its
+// accumulators on to the next CTA when the tile goes on there, then takes the earlier tile's
+// accumulators from the CTA before it and goes on with that tile's k steps: every output is still
+// one accumulator through all of k in order (the same MMAs in the same order, the same bits).
+template <class T, bool GROUPED, bool GLU, int CW, bool RES = false, bool SH = false, bool SK = false>
 __global__ void __launch_bounds__(256, T::MINB) nvfp4_a4_gemm(const legion_nvfp4_a4 p) {
 #ifdef LEGION_FP4_MMA
     constexpr int MI = T::MI, NT = T::NT, KB = T::KB, ST = T::ST, BM = T::BM, BN = T::BN;
@@ -485,14 +501,43 @@ __global__ void __launch_bounds__(256, T::MINB) nvfp4_a4_gemm(const legion_nvfp4
     constexpr int A_SCALES = T::A_SCALES, B_SCALES = T::B_SCALES;
     constexpr bool RAW = T::RAW;
     static_assert(CW == 4 || (CW == 8 && RAW && KB % 2 == 0) || (CW == 16 && RAW && KB % 2 == 0), "copy width");
+    static_assert(!SK || (!GROUPED && !GLU && MI * NT * 4 * 256 == LEGION_NVFP4_A4_SK_ACC), "stream-K tile");
     constexpr int BM_OUT = GLU ? BM / 2 : BM;
     extern __shared__ __align__(16) unsigned char smem[];
     __shared__ int64_t x_row[BN], d_off[GROUPED ? BN : 1];
     __shared__ float x_dec[BN];
-    __shared__ int32_t tile_expert, tile_tokens;
+    __shared__ int32_t tile_expert, tile_tokens, sk_ticket;
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane / 4, t = lane % 4;
     const int wm = warp / WN, wn = warp % WN;
+    const int64_t nblk = p.k / 64, steps = (nblk + KB - 1) / KB;
 
+    // This CTA's segments: tile, first and end k step. One whole tile without SK.
+    int nseg = 1, cta = 0;
+    int64_t seg_tile[2] = {(int64_t) blockIdx.x, 0}, seg_s0[2] = {0, 0}, seg_s1[2] = {steps, 0};
+    if (SK) {
+        if (threadIdx.x == 0) {
+            sk_ticket = atomicAdd(p.sk_flags + p.sk_max, 1);
+        }
+        __syncthreads();
+        cta = sk_ticket;
+        const int64_t work = (int64_t) p.tiles_m * p.tiles_n * steps;
+        const int64_t a = work * cta / gridDim.x, b = work * (cta + 1) / gridDim.x;
+        const int64_t ta = a / steps, tb = (b - 1) / steps;
+        if (tb > ta) {
+            // The head of tile tb first (it waits for nobody), then the rest of tile ta.
+            nseg = 2;
+            seg_tile[0] = tb, seg_s0[0] = 0, seg_s1[0] = b - tb * steps;
+            seg_tile[1] = ta, seg_s0[1] = a - ta * steps, seg_s1[1] = steps;
+        } else {
+            seg_tile[0] = ta, seg_s0[0] = a - ta * steps, seg_s1[0] = b - ta * steps;
+        }
+    }
+
+    for (int seg = 0; seg < nseg; seg++) {
+    const int64_t s0 = seg_s0[seg], s1 = seg_s1[seg];
+    if (SK) {
+        __syncthreads();  // the previous segment's readers of x_row / x_dec and the stages are done
+    }
     int64_t m0, n0 = 0;
     int n_tok;
     const uint8_t * w = p.w;
@@ -502,7 +547,7 @@ __global__ void __launch_bounds__(256, T::MINB) nvfp4_a4_gemm(const legion_nvfp4
     if (!GROUPED) {
         // Groups of group_m row tiles, token tiles inside a group: the CTAs resident at once
         // share weight rows and activations through L2.
-        const int pid = blockIdx.x, in_group = p.group_m * p.tiles_n;
+        const int pid = (int) seg_tile[seg], in_group = p.group_m * p.tiles_n;
         const int first_m = pid / in_group * p.group_m;
         const int group = min(p.tiles_m - first_m, p.group_m);
         m0 = (int64_t) (first_m + pid % in_group % group) * BM_OUT;
@@ -555,7 +600,6 @@ __global__ void __launch_bounds__(256, T::MINB) nvfp4_a4_gemm(const legion_nvfp4
         n_tok = tile_tokens;
     }
     __syncthreads();
-    const int64_t nblk = p.k / 64, steps = (nblk + KB - 1) / KB;
 
     // Weight row r of the tile (SwiGLU: the gate's or the up weight's).
     auto w_row = [&](int r, int64_t & row) {
@@ -698,22 +742,22 @@ __global__ void __launch_bounds__(256, T::MINB) nvfp4_a4_gemm(const legion_nvfp4
             return;
         }
         for (int r = threadIdx.x; r < BM; r += 256) {
-            if (step >= steps) {
+            if (step >= s1) {
                 break;
             }
             int64_t row;
             const uint8_t * wt = w_row(r, row);
             if (row < p.m) {
                 const uintptr_t a = (uintptr_t) (wt + row * p.w_ld + step * KB * 36);
-                const uintptr_t e = (uintptr_t) (wt + row * p.w_ld + min(nblk, (step + PF) * KB) * 36);
+                const uintptr_t e = (uintptr_t) (wt + row * p.w_ld + min(nblk, min(s1, step + PF) * KB) * 36);
                 const uintptr_t a16 = a & ~(uintptr_t) 15;
                 asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(a16),
                              "r"((uint32_t) ((e - a16 + 15) & ~(uintptr_t) 15)));
             }
         }
     };
-    prefetch(0);
-    prefetch(PF);
+    prefetch(s0);
+    prefetch(s0 + PF);
 
     float acc[MI][NT][4];
 #pragma unroll
@@ -789,20 +833,38 @@ __global__ void __launch_bounds__(256, T::MINB) nvfp4_a4_gemm(const legion_nvfp4
 
 #pragma unroll
     for (int s = 0; s < ST - 1; s++) {
-        if (s < steps) {
-            load(s, s);
+        if (s0 + s < s1) {
+            load(s0 + s, (int) ((s0 + s) % ST));
         }
         asm volatile("cp.async.commit_group;\n" ::);
     }
-    for (int64_t step = 0; step < steps; step++) {
+    if (SK && s0 > 0) {
+        // The tile's accumulators so far, from the CTA before this one (its run ends at s0).
+        if (threadIdx.x == 0) {
+            const volatile int32_t * f = p.sk_flags + cta - 1;
+            while (*f == 0) {
+                __nanosleep(100);
+            }
+            __threadfence();
+        }
+        __syncthreads();
+        const float * src = p.sk_acc + (int64_t) (cta - 1) * LEGION_NVFP4_A4_SK_ACC + threadIdx.x;
+#pragma unroll
+        for (int i = 0; i < MI; i++)
+#pragma unroll
+            for (int j = 0; j < NT; j++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) acc[i][j][e] = __ldcg(src + ((i * NT + j) * 4 + e) * 256);
+    }
+    for (int64_t step = s0; step < s1; step++) {
         asm volatile("cp.async.wait_group %0;\n" ::"n"(ST - 2));
         __syncthreads();
         const int64_t next = step + ST - 1;
-        if (next < steps) {
+        if (next < s1) {
             load(next, (int) (next % ST));
         }
         asm volatile("cp.async.commit_group;\n" ::);
-        if (step % PF == 0 && step > 0) {
+        if ((step - s0) % PF == 0 && step > s0) {
             prefetch(step + PF);
         }
         if (!live(0)) {
@@ -831,6 +893,23 @@ __global__ void __launch_bounds__(256, T::MINB) nvfp4_a4_gemm(const legion_nvfp4
         }
     }
     asm volatile("cp.async.wait_group 0;\n" ::);
+
+    if (SK && s1 < steps) {
+        // The tile goes on in the next CTA's run: hand the accumulators on.
+        float * out = p.sk_acc + (int64_t) cta * LEGION_NVFP4_A4_SK_ACC + threadIdx.x;
+#pragma unroll
+        for (int i = 0; i < MI; i++)
+#pragma unroll
+            for (int j = 0; j < NT; j++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) __stcg(out + ((i * NT + j) * 4 + e) * 256, acc[i][j][e]);
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            atomicExch(p.sk_flags + cta, 1);
+        }
+        continue;
+    }
 
     if constexpr (GLU) {
 #pragma unroll
@@ -902,6 +981,7 @@ __global__ void __launch_bounds__(256, T::MINB) nvfp4_a4_gemm(const legion_nvfp4
             }
         }
     }
+    }  // segments
 #endif
 }
 
@@ -1251,6 +1331,49 @@ int gemm(const legion_nvfp4_a4 & p, cudaStream_t st) {
     return status();
 }
 
+// The current device's SM count (0 if unknown), asked once per device.
+int sm_count() {
+    static int known[64];
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
+        cudaGetLastError();
+        return 0;
+    }
+    if (known[dev] == 0) {
+        int v = 0;
+        if (cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) {
+            cudaGetLastError();
+            return 0;
+        }
+        known[dev] = v;
+    }
+    return known[dev];
+}
+
+// The stream-K grid of a plain dense GEMM of tile T, or 0 for the one-CTA-per-tile grid: when the
+// tiles are fewer than the SMs (and the scratch is there), T + d CTAs for the largest divisor d of
+// the T tiles that fits the SMs, so that no CTA's run lies inside a tile (each run is the end of
+// one tile and / or the head of the next: no run waits before doing its head) and the runs are
+// equal. Decode-sized batches of Gemma 4 31B on the GB10 (48 SMs): attn_output and ffn_down
+// (5,376 rows: 42 tiles) on all 48 SMs instead of 42; k and v (4,096 rows, 32 tiles) on 48.
+template <class T> unsigned sk_grid(const legion_nvfp4_a4 & p) {
+    if (!p.sk_acc || !p.sk_flags || p.w2 || p.plan) {
+        return 0;
+    }
+    const int64_t tiles = (int64_t) p.tiles_m * p.tiles_n;
+    const int64_t steps = (p.k / 64 + T::KB - 1) / T::KB;
+    const int64_t sms = std::min(sm_count(), (int) p.sk_max);
+    if (tiles >= sms || steps < 8) {
+        return 0;
+    }
+    for (int64_t d = tiles; d >= 1; d--) {
+        if (tiles % d == 0 && tiles + d <= sms) {
+            return (unsigned) (tiles + d);
+        }
+    }
+    return 0;
+}
+
 // The dense GEMMs (SwiGLU, residual or plain) of tile T (RAW, KB even) with 16-byte weight
 // copies; -1 when the weight rows are not 16-byte aligned.
 template <class T> int dense16(const legion_nvfp4_a4 & p, cudaStream_t st) {
@@ -1262,8 +1385,19 @@ template <class T> int dense16(const legion_nvfp4_a4 & p, cudaStream_t st) {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, T::SMEM);
         kernel<<<(unsigned) p.tiles_m * (unsigned) p.tiles_n, 256, T::SMEM, st>>>(p);
     };
+    const unsigned sk = sk_grid<T>(p);
+    auto go_sk = [&](auto kernel) {
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, T::SMEM);
+        // The flags and the ticket counter start at zero every launch.
+        cudaMemsetAsync(p.sk_flags, 0, ((size_t) p.sk_max + 1) * sizeof(int32_t), st);
+        kernel<<<sk, 256, T::SMEM, st>>>(p);
+    };
     if (p.w2) {
         go(nvfp4_a4_gemm<T, false, true, 16>);
+    } else if (sk && p.res) {
+        go_sk(nvfp4_a4_gemm<T, false, false, 16, true, false, true>);
+    } else if (sk) {
+        go_sk(nvfp4_a4_gemm<T, false, false, 16, false, false, true>);
     } else if (p.res) {
         go(nvfp4_a4_gemm<T, false, false, 16, true>);
     } else {
@@ -1387,6 +1521,9 @@ int legion_nvfp4_a4_rms_quant_launch(const float * x, int64_t x_ld, const float 
 // at 4096 tokens, 4-5% at 512 to 1024), but not for 16-byte aligned rows or the SwiGLU, which
 // stream the weights from DRAM as fast with 8-byte copies (16-byte ones: 2-8% slower at 4096
 // tokens). Every variant has the same MMAs in the same order (the same bits).
+// Dense plain GEMMs of the nt 8 tile with fewer tiles than SMs and p->sk_acc set (65-128 tokens,
+// e.g. Gemma 4 31B's attn_output and ffn_down at 5,376 rows: 42 tiles on the GB10's 48 SMs) run
+// stream-K (sk_grid): every SM streams weights, each output still one accumulator through k.
 int legion_nvfp4_a4_gemm_launch(const legion_nvfp4_a4 * p, int nt, void * stream) {
     const cudaStream_t st = (cudaStream_t) stream;
     switch (nt) {

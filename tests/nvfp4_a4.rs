@@ -972,6 +972,44 @@ mod cuda {
         }
     }
 
+    /// The stream-K split of the dense GEMMs with fewer tiles than the GPU has SMs (batches of
+    /// 65-128 tokens, decode verify steps): the same bits as one CTA per tile, plain, through the
+    /// relu² epilogue and with the residual added.
+    #[test]
+    #[ignore = "needs a GPU with the FP4 kernels"]
+    fn cuda_stream_k_matches_one_cta_per_tile() {
+        let Some(mut gpu) = gpu() else { return };
+        for (k, m, n) in [
+            (2048, 1000, 128),
+            (4096, 300, 200),
+            (5376, 4096, 112),
+            (8192, 5376, 128),
+            (21504, 640, 96),
+        ] {
+            let wq = weights(k, m, (k + m) as u64);
+            let xs = activations(k, n, n as u64);
+            let rs = activations(m.div_ceil(16) * 16, n, 7)[..m * n].to_vec();
+            let shape = (k, m, n);
+            let mut got = Vec::new();
+            for off in [true, false] {
+                nvfp4_a4::force_no_stream_k(off);
+                got.push([
+                    run(&mut gpu, &wq, &xs, Some(0.25), Act::None, shape),
+                    run(&mut gpu, &wq, &xs, None, Act::ReluSqr, shape),
+                    run_add(&mut gpu, &wq, (&xs, &rs), Some(0.5), shape, true),
+                ]);
+            }
+            nvfp4_a4::force_no_stream_k(false);
+            for (i, what) in ["plain", "relu²", "residual"].iter().enumerate() {
+                assert!(
+                    same_bits(&got[0][i], &got[1][i]),
+                    "k {k} m {m} n {n}: stream-K {what}"
+                );
+            }
+            println!("stream-K k {k} m {m} n {n}: bit-exact");
+        }
+    }
+
     /// The grouped SwiGLU: the same bits as the chain it replaces (two grouped matmuls,
     /// ggml-cuda's `silu` and `mul`) at every token tile, and the CPU reference's values.
     #[test]
