@@ -174,6 +174,7 @@ struct legion_moe_fold {
     int64_t g_ld;
     int32_t k;
     int32_t fma;
+    const __nv_bfloat16 * x16;  // null, or (x null) the experts' outputs as BF16, read exactly
 };
 
 int legion_hc_post_norm_fold_launch(const legion_hc_post_norm * p, const legion_moe_fold * f, void * stream);
@@ -1395,10 +1396,11 @@ __global__ void __launch_bounds__(HC_THREADS, 4) hc_post_norm_moe_kernel(legion_
 // Token t's MoE tail for this thread's PS columns into ov (legion_moe_fold): each column's
 // experts in order, MOE_GROUP experts' loads in flight before their sums, then the gate. The same
 // values in the same order as the tail's kernels: their bits.
-template <int PS, bool FMA, bool W>
+template <int PS, bool FMA, bool W, bool X16 = false>
 __device__ __forceinline__ void moe_fold_row(const legion_moe_fold & f, int64_t t, float * ov) {
     constexpr int E = PS * HC_THREADS;
     const float * x = f.x + t * (int64_t) f.k * E;
+    const __nv_bfloat16 * x16 = f.x16 + t * (int64_t) f.k * E;
     // ggml-cuda's op_sigmoid (unary.cu), built with fast math as this file is
     const float sgate = 1.0f / (1.0f + expf(-f.g[t * f.g_ld]));
     for (int j0 = 0; j0 < f.k; j0 += MOE_GROUP) {
@@ -1408,10 +1410,11 @@ __device__ __forceinline__ void moe_fold_row(const legion_moe_fold & f, int64_t 
         for (int q = 0; q < MOE_GROUP; q++) {
             if (j0 + q < f.k) {
                 const float * xj = x + (int64_t) (j0 + q) * E;
+                const __nv_bfloat16 * xj16 = x16 + (int64_t) (j0 + q) * E;
                 wj[q] = W ? f.w[t * f.k + j0 + q] : 1.0f;
 #pragma unroll
                 for (int r = 0; r < PS; r++) {
-                    v[q][r] = xj[threadIdx.x + r * HC_THREADS];
+                    v[q][r] = X16 ? __bfloat162float(xj16[threadIdx.x + r * HC_THREADS]) : xj[threadIdx.x + r * HC_THREADS];
                 }
             }
         }
@@ -1445,7 +1448,7 @@ __device__ __forceinline__ void moe_fold_row(const legion_moe_fold & f, int64_t 
 // hc_post_norm_fold (#836): hc_post_norm_v70_kernel<4, 4, 10, true, false, true, true>'s pass
 // (sm_80+, the BF16 xn and the streams' scales, the L2 prefetch of gamma and the inject weights)
 // after moe_fold_row: from the token's out row on, the same values in the same order.
-template <bool FMA, bool W>
+template <bool FMA, bool W, bool X16 = false>
 __global__ void __launch_bounds__(HC_THREADS, 4) hc_post_norm_fold_kernel(legion_hc_post_norm p, legion_moe_fold f) {
     constexpr int HC = 4, NINJ = 4, PS = 10, PER = HC * PS;
     __shared__ float red[HC_MAX][HC_THREADS / 32];
@@ -1463,7 +1466,7 @@ __global__ void __launch_bounds__(HC_THREADS, 4) hc_post_norm_fold_kernel(legion
         }
     }
     float ov[PS];
-    moe_fold_row<PS, FMA, W>(f, t, ov);
+    moe_fold_row<PS, FMA, W, X16>(f, t, ov);
     float val[PER];
 #pragma unroll
     for (int i = 0; i < PER; i++) {
@@ -1743,11 +1746,19 @@ int legion_hc_post_norm_fold_launch(const legion_hc_post_norm * p, const legion_
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
     if (major < 8 || p->hc != 4 || p->n_inj != 4 || p->e != 10 * HC_THREADS || p->xnb == nullptr ||
         p->scale_at == 0 || p->xq != nullptr || p->xn16 != nullptr || p->n_tok < 1 || f->k < 1 ||
-        f->sh == nullptr || (f->w == nullptr && f->fma != 0)) {
+        f->sh == nullptr || (f->w == nullptr && f->fma != 0) || (f->x == nullptr) == (f->x16 == nullptr) ||
+        (f->x16 != nullptr && f->w == nullptr)) {
         return -1;
     }
     const cudaStream_t st = (cudaStream_t) stream;
-    if (f->w == nullptr) {
+    if (f->x16 != nullptr) {
+        // BF16 rows (--nvfp4-expert-rows-bf16, #1183): with the router weights only.
+        if (f->fma != 0) {
+            hc_post_norm_fold_kernel<true, true, true><<<p->n_tok, HC_THREADS, 0, st>>>(*p, *f);
+        } else {
+            hc_post_norm_fold_kernel<false, true, true><<<p->n_tok, HC_THREADS, 0, st>>>(*p, *f);
+        }
+    } else if (f->w == nullptr) {
         hc_post_norm_fold_kernel<false, false><<<p->n_tok, HC_THREADS, 0, st>>>(*p, *f);
     } else if (f->fma != 0) {
         hc_post_norm_fold_kernel<true, true><<<p->n_tok, HC_THREADS, 0, st>>>(*p, *f);

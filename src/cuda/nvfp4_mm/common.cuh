@@ -67,7 +67,8 @@ struct legion_nvfp4_mm {
     const uint8_t * w2;
     const float * scale2;
     // Epilogue: 0 stores F32; 1 stores relu(v)^2 as BF16 (squared-ReLU FFNs: the next matmul's
-    // input, which it would round to BF16 anyway). Fused SwiGLU (dense): the gate's activation,
+    // input, which it would round to BF16 anyway); 3 stores v as BF16 (rounded to nearest: the
+    // routed experts' per-pair rows, opt-in, #1183). Fused SwiGLU (dense): the gate's activation,
     // 0 silu, 2 the tanh GELU (a GeGLU FFN; see glu_gate).
     int32_t act;
     // Fused SwiGLU GEMM, above 0: GLM-5.3-Flash's clamp, silu(min(gate, limit)) *
@@ -81,9 +82,8 @@ struct legion_nvfp4_mm {
     // busy ones on the GEMM, the rest on the mv kernel). 0 and INT32_MAX: every expert.
     int32_t sel_lo, sel_hi;
     // The GEMM's L2 prefetch run (blocks per row and prefetch, at most two runs ahead), 0 for
-    // its default; and its L2 cache hints (bit 0: the weight copies evict-first, bit 1: the
-    // activation copies evict-last), 0 for none. Neither changes a value (tuning, #1183).
-    int32_t pf, hint;
+    // its default. Changes no value (tuning, #1183).
+    int32_t pf;
 };
 
 // The GEMM: tiles_m * tiles_n CTAs of 256 threads; mi = 1 or 2 (128 * mi rows), nt = 1, 2, 4,
@@ -211,36 +211,6 @@ __device__ __forceinline__ void cp_async16_n(void * s, const void * g, int bytes
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(a), "l"(g), "r"(bytes));
 }
 
-// cp_async16_n with an L2 cache policy (createpolicy): where the line goes in L2's eviction
-// order, nothing else.
-// Before sm_80: the plain copy (no policies).
-__device__ __forceinline__ void cp_async16_n_pol(void * s, const void * g, int bytes, uint64_t pol) {
-#if __CUDA_ARCH__ >= 800
-    const uint32_t a = (uint32_t) __cvta_generic_to_shared(s);
-    asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2, %3;\n" ::"r"(a), "l"(g), "r"(bytes),
-                 "l"(pol));
-#else
-    (void) pol;
-    cp_async16_n(s, g, bytes);
-#endif
-}
-
-__device__ __forceinline__ uint64_t policy_evict_first() {
-    uint64_t pol = 0;
-#if __CUDA_ARCH__ >= 800
-    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(pol));
-#endif
-    return pol;
-}
-
-__device__ __forceinline__ uint64_t policy_evict_last() {
-    uint64_t pol = 0;
-#if __CUDA_ARCH__ >= 800
-    asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;\n" : "=l"(pol));
-#endif
-    return pol;
-}
-
 // A UE4M3 sub-block scale times 2^116 as a BF16 pair (ggml: sign ignored, 0x7f is 0).
 __device__ __forceinline__ uint32_t scale_bf16x2(uint32_t d) {
     d &= 0x7f;
@@ -275,6 +245,8 @@ __device__ __forceinline__ void store_out(const legion_nvfp4_mm & p, int64_t i, 
     if (p.act == 1) {
         const float r = fmaxf(v, 0.0f);
         ((__nv_bfloat16 *) p.dst)[i] = __float2bfloat16_rn(r * r);
+    } else if (p.act == 3) {
+        ((__nv_bfloat16 *) p.dst)[i] = __float2bfloat16_rn(v);
     } else {
         p.dst[i] = v;
     }
@@ -461,10 +433,6 @@ __global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p)
     };
     auto row_ok = [&](int r) { return (GLU ? m0 + r / 32 * 16 + r % 16 : m0 + r) < p.m; };
 
-    // p.hint's L2 policies (tuning only: where lines sit in L2's eviction order).
-    const bool w_first = p.hint & 1, x_last = p.hint & 2;
-    const uint64_t pol_w = w_first ? policy_evict_first() : 0;
-    const uint64_t pol_x = x_last ? policy_evict_last() : 0;
     auto load = [&](int64_t step, int stage) {
         unsigned char * ws = smem + stage * STAGE;
         __nv_bfloat16 * xs = (__nv_bfloat16 *) (ws + W_STAGE);
@@ -480,11 +448,7 @@ __global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p)
                 const uint8_t * start = row_src(r) + step * 36;
                 const uint8_t * src = (const uint8_t *) ((uintptr_t) start & ~(uintptr_t) 15) + part * 16;
                 const int bytes = row_ok(r) ? min(16, (int) (start + 36 - src)) : 0;
-                if (w_first) {
-                    cp_async16_n_pol(ws + r * LDW + part * 16, src, bytes, pol_w);
-                } else {
-                    cp_async16_n(ws + r * LDW + part * 16, src, bytes);
-                }
+                cp_async16_n(ws + r * LDW + part * 16, src, bytes);
             }
         }
 #pragma unroll
@@ -494,11 +458,7 @@ __global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p)
                 const int t = c / 8, col = c % 8 * 8;
                 const bool ok = t < n_tok;
                 const int64_t off = !ok ? 0 : GROUPED ? x_off[t] : (n0 + t) * p.x_ld;
-                if (x_last) {
-                    cp_async16_n_pol(xs + t * LDX + col, p.x + off + step * BK + col, ok ? 16 : 0, pol_x);
-                } else {
-                    cp_async16(xs + t * LDX + col, p.x + off + step * BK + col, ok);
-                }
+                cp_async16(xs + t * LDX + col, p.x + off + step * BK + col, ok);
             }
         }
     };

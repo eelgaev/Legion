@@ -233,6 +233,13 @@ impl Graph {
             dead.extend(&gt.chain);
             dead.push(gt.add);
             dead.extend(view);
+            // BF16 rows read back as F32 (`--nvfp4-expert-rows-bf16`, #1183): the norm reads
+            // the BF16 rows (the cast is exact) and the cast goes too.
+            let (x, cast) = match self.bf16_rows(x, s.at) {
+                Some((rows, i)) => (rows, Some(i)),
+                None => (x, None),
+            };
+            dead.extend(cast);
             saved.push((norm, std::ptr::read(norm)));
             saved.extend(
                 dead.iter()
@@ -242,6 +249,28 @@ impl Graph {
             fold_moe(norm, x, s.weights, s.k, sum, gt.sh, gt.g);
             self.retire(&dead, root(x));
             true
+        }
+    }
+
+    /// Where `x` is a cast to F32 of contiguous BF16 rows of its shape (a node), read only by the
+    /// node `at`: those rows and the cast's index.
+    ///
+    /// # Safety
+    /// `x` is a valid tensor of the graph.
+    unsafe fn bf16_rows(&self, x: Node, at: usize) -> Option<(Node, usize)> {
+        // SAFETY: the caller's; sources are valid tensors.
+        unsafe {
+            let src = (*x).src[0];
+            let i = *self.index.get(&(x as usize))?;
+            ((*x).op == ffi::ggml_op_GGML_OP_CPY
+                && !self.none[i]
+                && !src.is_null()
+                && (*src).type_ == ffi::ggml_type_GGML_TYPE_BF16
+                && ffi::ggml_is_contiguous(src)
+                && (*src).ne == (*x).ne
+                // ggml's cast lists itself as its second source.
+                && self.only_read_by(x, &[at, i]))
+            .then_some((src, i))
         }
     }
 
