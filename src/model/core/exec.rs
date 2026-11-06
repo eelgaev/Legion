@@ -267,6 +267,39 @@ fn read_rows(
     }
 }
 
+/// [`read_rows`] of captured rows `t` (`[rows][width]`) from row `from` on only (#1133): the
+/// output keeps every row, those before `from` holding anything ([`rows_out::copy_out_tail`]).
+/// A DFlash drafter takes in only a prompt chunk's last rows (its ring): a 16,384-token step of
+/// Qwen3.8-27B read 5 x 335 MB back with the GPU idle, now at most its 4,096-row window.
+fn read_rows_from(
+    bounce: &mut Option<Context>,
+    small: &mut Option<Context>,
+    spare: &mut rows_out::Spare,
+    backend: &Backend,
+    t: Tensor<'_>,
+    from: usize,
+) -> Vec<f32> {
+    let width = t.ne()[0] as usize;
+    let n = t.nbytes() / 4;
+    let skip = (from * width).min(n);
+    if skip == 0 {
+        return read_rows(bounce, small, spare, backend, t);
+    }
+    let bytes = (n - skip) * 4;
+    let via = if bytes >= BOUNCE_MIN_BYTES {
+        bounce_for(bounce, backend, bytes)
+    } else {
+        bounce_for(small, backend, BOUNCE_MIN_BYTES)
+    };
+    match via {
+        Some(via) => {
+            let (src, _) = t.read_tail_via(via, skip * 4);
+            rows_out::copy_out_tail(spare, src, n, skip)
+        }
+        None => t.to_f32(),
+    }
+}
+
 /// Writes `parts` one after another into input `t` of a stage on `backend`, big ones through
 /// pinned memory (see [`read_rows`]), which the parts are copied into directly.
 fn write_rows(bounce: &mut Option<Context>, backend: &Backend, t: Tensor<'_>, parts: &[&[f32]]) {
@@ -453,6 +486,8 @@ pub struct Executor {
     mixed_aside: usize,
     /// The prompt chunk the engine runs after the next step ([`Self::set_prompt_next`]).
     prompt_next: Option<PromptNext>,
+    /// The next step's first captured row read back ([`Self::set_hidden_from`]).
+    hidden_from: usize,
     /// See [`Self::set_stage_cpus`].
     stage_cpus: Vec<Vec<u32>>,
     /// GLM's parallel decode steps ([`par_step`]).
@@ -745,6 +780,7 @@ impl Executor {
             mixed_kept: MIXED_KEPT,
             mixed_aside: 0,
             prompt_next: None,
+            hidden_from: 0,
             stage_cpus: Vec::new(),
             par: Default::default(),
             pair: Default::default(),
@@ -2613,10 +2649,22 @@ impl Executor {
         self.applied.clear();
         if self.tp.is_some() {
             self.prompt_next = None;
+            self.hidden_from = 0;
             self.captures.clear();
             return self.tp_step(groups);
         }
-        self.step_here(groups)
+        let out = self.step_here(groups);
+        self.hidden_from = 0;
+        out
+    }
+
+    /// The next [`Self::step`] reads its captured rows ([`StepOutput::hidden`]) back from row
+    /// `row` on only: the rows before it keep their length in the output but hold anything (an
+    /// earlier step's rows, or zeros). For a drafter that reads only a prompt chunk's last rows
+    /// (DFlash's ring, #1133); a step of one micro-chunk applies it, others read every row.
+    /// Only the next step reads it.
+    pub fn set_hidden_from(&mut self, row: usize) {
+        self.hidden_from = row;
     }
 
     /// [`Self::step`] on this machine.
@@ -3737,6 +3785,8 @@ impl Executor {
         let kept = kept_in(decode, mixed, shape).expect("prepared");
         let inputs = Inputs::from_parts(shape, parts, |i| kept.tensor(i));
         let defer = n_micro > 1 && captured.len() == 1;
+        // The one micro-chunk's rows are the step's ([`Executor::set_hidden_from`]).
+        let from = if n_micro == 1 { self.hidden_from } else { 0 };
         let parity = round % 2;
         let mut started = Vec::new();
         let mut o = inputs.output_with(group, n_vocab, |t| {
@@ -3760,7 +3810,7 @@ impl Executor {
                     return Vec::new();
                 }
             }
-            read_rows(bounce, bounce_small, spare, backend, t)
+            read_rows_from(bounce, bounce_small, spare, backend, t, from)
         });
         for (&layer, &(src, n)) in captured.iter().zip(&started) {
             deferred.start(k, layer, parity, src, n);

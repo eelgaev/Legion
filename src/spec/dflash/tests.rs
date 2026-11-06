@@ -571,6 +571,49 @@ fn ring_keep_from_is_the_window_before_the_last_token() {
     assert_eq!(ring_keep_from(2515, 520), 1994);
 }
 
+/// The old take-in loop's first piece taken in, as `ingest_from` must give it (#1133).
+fn ingest_from_by_loop(n_tokens: usize, start: usize, ran: usize, window: usize) -> usize {
+    let keep = ring_keep_from(n_tokens, window);
+    let mut at = ran.saturating_sub(window);
+    while at < ran {
+        let n = INGEST_CHUNK.min(ran - at);
+        if start + at + n <= keep {
+            at += n;
+            continue;
+        }
+        return at;
+    }
+    ran
+}
+
+#[test]
+fn ingest_from_is_the_first_piece_taken_in() {
+    // A 32K prompt in two 16K steps with the 4,096-row window: the first step's rows are all
+    // overwritten, the second's are read from its last window on.
+    assert_eq!(ingest_from(32_746, 0, 16_384, 4096), 16_384);
+    assert_eq!(ingest_from(32_747, 16_384, 16_362, 4096), 16_362 - 4096);
+    // A prompt in one step.
+    assert_eq!(ingest_from(8_228, 0, 8_227, 4096), 8_227 - 4096);
+    // Shorter than the window: every row.
+    assert_eq!(ingest_from(300, 0, 299, 4096), 0);
+    for window in [8, 520, 4096] {
+        for n_tokens in [0, 1, 100, 2515, 9000, 40_000] {
+            for start in [0, 7, 512, 2000, 16_384] {
+                for ran in [0, 1, 100, 511, 512, 513, 2048, 4097, 16_384] {
+                    let got = ingest_from(n_tokens, start, ran, window);
+                    assert_eq!(
+                        got,
+                        ingest_from_by_loop(n_tokens, start, ran, window),
+                        "{n_tokens} {start} {ran} {window}"
+                    );
+                    // A smaller token count (the one known before the step) never starts later.
+                    assert!(ingest_from(n_tokens.saturating_sub(1), start, ran, window) <= got);
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn a_long_prompt_skips_rows_its_later_chunks_overwrite() {
     let fx = Fixture::new();

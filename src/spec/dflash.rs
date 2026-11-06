@@ -408,21 +408,11 @@ impl DflashDrafter {
         self.check_hidden(r)?;
         let mut cache = self.caches.remove(&r.seq).expect("made by cache_for");
         cache.rollback(r.start);
-        // A ring holds `window` positions: older rows of a long chunk would be overwritten.
-        let skip = r.ran.saturating_sub(cache.window());
-        let keep = ring_keep_from(r.tokens.len(), cache.window());
         let mut feats = Vec::new();
-        let mut at = skip;
+        let mut at = ingest_from(r.tokens.len(), r.start, r.ran, cache.window());
         let mut result = Ok(());
         while at < r.ran {
             let n = INGEST_CHUNK.min(r.ran - at);
-            // A piece the sequence's later rows overwrite before any pass reads the ring (a
-            // long prompt's early chunks) is left out whole, so the pieces taken in are the
-            // same ones, of the same rows, as without the cut.
-            if r.start + at + n <= keep {
-                at += n;
-                continue;
-            }
             feats.clear();
             self.features(r, at..at + n, &mut feats);
             let positions: Vec<usize> = (r.start + at..r.start + at + n).collect();
@@ -650,6 +640,25 @@ fn ring_keep_from(n_tokens: usize, window: usize) -> usize {
     n_tokens.saturating_sub(1 + window)
 }
 
+/// The first of a step's `ran` rows (positions from `start`, of a sequence of `n_tokens`
+/// tokens) that [`DflashDrafter::ingest`] takes in; `ran` when none. A ring holds `window`
+/// positions, so a chunk's rows before its last `window` are overwritten; and a piece of
+/// [`INGEST_CHUNK`] rows that the sequence's later rows overwrite before any pass reads the
+/// ring (a long prompt's early chunks) is left out whole, so the pieces taken in are the same
+/// ones, of the same rows, as without the cut. Never grows when `n_tokens` shrinks.
+fn ingest_from(n_tokens: usize, start: usize, ran: usize, window: usize) -> usize {
+    let keep = ring_keep_from(n_tokens, window);
+    let mut at = ran.saturating_sub(window);
+    while at < ran {
+        let n = INGEST_CHUNK.min(ran - at);
+        if start + at + n > keep {
+            return at;
+        }
+        at += n;
+    }
+    ran
+}
+
 fn argmax(row: &[f32]) -> usize {
     let mut best = 0;
     for (i, &x) in row.iter().enumerate() {
@@ -739,6 +748,12 @@ impl ModelDrafter for DflashDrafter {
     /// DFlash 2 runs the whole block whatever the depth.
     fn block_drafts(&self) -> Option<usize> {
         self.model.cfg.v2.is_some().then(|| self.max_drafts())
+    }
+
+    /// A lone request takes in its rows from [`ingest_from`] on (`step` runs [`Self::ingest`]
+    /// for it).
+    fn rows_read_from(&self, n_tokens: usize, start: usize, ran: usize) -> usize {
+        ingest_from(n_tokens, start, ran, self.model.window)
     }
 }
 

@@ -1,4 +1,4 @@
-use super::{SPARE_KEPT, SPARE_MAX_BYTES, Spare, copy_out, take_layer};
+use super::{SPARE_KEPT, SPARE_MAX_BYTES, Spare, copy_out, copy_out_tail, take_layer};
 
 fn floats(seed: usize, n: usize) -> Vec<f32> {
     (0..n).map(|i| (seed * 1_000_000 + i) as f32).collect()
@@ -142,6 +142,41 @@ fn several_micro_chunks_are_concatenated_in_order() {
         hidden.iter().all(|h| h[0].1 == floats(9, 1)),
         "other layers untouched"
     );
+}
+
+/// Only the floats from `from` on are copied; the vector keeps its full length (#1133).
+#[test]
+fn copy_out_tail_copies_the_last_floats() {
+    for (n, from) in [(0, 0), (5, 0), (5, 5), (1023, 1000), (1 << 20, 3 << 18)] {
+        let src = floats(3, n - from);
+        let got = copy_out_tail(&mut Spare::default(), src.as_ptr() as usize, n, from);
+        assert_eq!(got.len(), n, "n = {n}");
+        assert!(
+            got[..from].iter().all(|&x| x == 0.0),
+            "a new vector's head is zeros"
+        );
+        assert_eq!(got[from..], src[..], "n = {n}, from = {from}");
+    }
+}
+
+/// A handed-back vector keeps its old head; longer or shorter ones are cut or padded to `n`.
+#[test]
+fn copy_out_tail_reuses_a_spare() {
+    for old_len in [1000, 800] {
+        let mut spare = Spare::default();
+        let old = floats(1, old_len);
+        let mut big = Vec::with_capacity(1000);
+        big.extend_from_slice(&old);
+        let at = big.as_ptr();
+        spare.keep([big], 0);
+        let src = floats(2, 100);
+        let got = copy_out_tail(&mut spare, src.as_ptr() as usize, 900, 800);
+        assert_eq!(got.as_ptr(), at, "the spare's memory");
+        assert_eq!(got.len(), 900);
+        assert_eq!(got[..800], old[..800]);
+        assert_eq!(got[800..], src[..]);
+        assert_eq!(spare.kept(), 0, "taken");
+    }
 }
 
 #[test]

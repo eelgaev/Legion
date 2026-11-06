@@ -6905,6 +6905,18 @@ impl Worker {
             _ => None,
         };
         self.exec.set_prompt_next(hint);
+        // A step of one prompt's chunk alone: its captured rows are read back only from the
+        // first one the model drafter takes in (DFlash: its ring's, #1133). `history` holds at
+        // most the tokens the drafter's request will name (`finish_step` may add the first
+        // sampled token), which can only start the rows read earlier.
+        let from = match (&self.drafting, &plan.chunks[..]) {
+            (Drafting::Model(d), &[(i, len)]) if decoding.is_empty() => {
+                let s = &prefilling[i];
+                d.rows_read_from(s.history.len(), s.n_past, len)
+            }
+            _ => 0,
+        };
+        self.exec.set_hidden_from(from);
         self.clock.lap(host_time::Phase::Pack, &mut at);
         let t_step = Instant::now();
         let out = self.exec.step(&groups).map_err(|e| e.to_string());
