@@ -250,3 +250,26 @@ fn a_drafter_with_its_own_head_ignores_the_cut() {
     assert_eq!(a.tokens, b.tokens);
     assert_eq!(a.probs, b.probs);
 }
+
+/// `--spec-draft-lm-head nvfp4`'s copy: the head (its scale folded in) back within FP4's error
+/// after the per-tensor decode scale, the largest magnitude exact.
+#[test]
+fn nvfp4_head_copy_round_trips() {
+    let (k, rows) = (128, 6);
+    let w: Vec<f32> = (0..k * rows)
+        .map(|i| ((i * 37 % 101) as f32 - 50.0) * 1e-3)
+        .collect();
+    let bytes: Vec<u8> = w.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let (q, dec) = crate::spec::q4_head::to_nvfp4(types::F32, &bytes, Some(&[2.0]), k).unwrap();
+    assert_eq!(q.len(), crate::ggml::row_size(types::NVFP4, k) * rows);
+    let back = crate::ggml::dequantize(types::NVFP4, &q, k * rows);
+    let amax = w.iter().fold(0f32, |m, v| m.max(v.abs())) * 2.0;
+    let mut exact = false;
+    for (b, v) in back.iter().zip(&w) {
+        let (got, want) = (b * dec, v * 2.0);
+        assert!((got - want).abs() <= 0.2 * amax, "{got} vs {want}");
+        exact |= want.abs() == amax && (got - want).abs() <= 1e-6 * amax;
+    }
+    assert!(exact, "the largest magnitude is not exact");
+    assert!(crate::spec::q4_head::to_nvfp4(types::F32, &bytes[..4 * 96], None, 96).is_err());
+}

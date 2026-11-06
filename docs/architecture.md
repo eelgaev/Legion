@@ -194,7 +194,7 @@ HTTP clients ──► src/server ──► src/engine (trait Engine) ──► 
 | `src/spec/` | Speculative decoding: the `TokenDrafter` and `ModelDrafter` interfaces, settings, counters, and the verify / rollback design. |
 | `src/spec/accept.rs` | Exact acceptance: greedy prefix + bonus token, rejection sampling for temperature > 0. |
 | `src/spec/eagle3.rs`, `src/spec/eagle3/` | EAGLE-3 drafter (`--spec eagle3`): checkpoint config and vocabulary map, weights, the head's ggml forward pass with its own KV cache, and a tiny random checkpoint for tests. |
-| `src/spec/q4_head.rs` | An output head's rows as Q4_K / Q4_0 with its FP8 or per-tensor scales folded in, for drafting (`--spec-draft-lm-head q4`). |
+| `src/spec/q4_head.rs` | An output head's rows as Q4_K / Q4_0 with its FP8 or per-tensor scales folded in, for drafting (`--spec-draft-lm-head q4`), or as NVFP4 with one per-tensor decode scale (`--spec-draft-lm-head nvfp4`, DFlash). |
 | `src/spec/ngram.rs` | N-gram / prompt-lookup drafter. |
 | `src/spec/suffix.rs` | Suffix-decoding drafter with a cross-request cache. |
 | `src/spec/dflash.rs` | DFlash block-diffusion drafter (`--spec dflash`): one pass drafts a block from the target's fused hidden states. Submodules: `config` (GGUF / Hugging Face hyperparameters), `weights` (checkpoint loading), `model` (the ingest and draft graphs; DFlash 2 batches a step's sequences into one of each), `cache` (per-sequence K/V ring), `v2` (DFlash 2: dynamic grouped convolutions and the candidate selector, whose walk runs on the host), `head` (the target's head cut down for drafting: `--spec-draft-vocab`, `--spec-draft-lm-head`), `tiny` (random test checkpoint). |

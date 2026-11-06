@@ -80,6 +80,9 @@ pub struct Model {
     markov: Option<Markov>,
     /// DFlash 2's selector codebooks.
     selector: Option<Selector>,
+    /// The head is the NVFP4 copy `--spec-draft-lm-head nvfp4` made: Legion's FP4 kernels
+    /// score with it.
+    pub fp4_head: bool,
 }
 
 /// `n` values of `ty` in `bytes` as floats (F32 has no conversion function in ggml's table).
@@ -394,6 +397,7 @@ impl Model {
             first_row,
             markov,
             selector,
+            fp4_head: false,
         })
     }
 
@@ -807,6 +811,10 @@ impl Model {
         let head = self.head();
         let logits = if head.ty() == types::I8 {
             crate::model::fp8::mul_mat(&ctx, head, x, self.head_scale())
+        } else if self.fp4_head && crate::model::nvfp4_a4::supports(head) {
+            crate::model::nvfp4_a4::mul_mat(&ctx, head, x, self.head_scale())
+        } else if self.fp4_head && crate::model::nvfp4_mm::supports(head) {
+            crate::model::nvfp4_mm::mul_mat(&ctx, head, x, self.head_scale())
         } else {
             let logits = mul_mat(&ctx, head, x);
             match self.head_scale() {

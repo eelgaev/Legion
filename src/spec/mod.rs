@@ -356,6 +356,11 @@ pub enum DraftLmHead {
     /// shortlist head the same way.
     #[value(name = "q4")]
     Q4,
+    /// DFlash only: an NVFP4 copy of those rows, made at load (UE4M3 scales per 16 values and
+    /// one F32 per-tensor scale, the head's scales folded in), run by Legion's FP4 kernels
+    /// (4-bit activations on GPUs with FP4 tensor cores, BF16 ones on other sm_80+ GPUs).
+    #[value(name = "nvfp4")]
+    Nvfp4,
 }
 
 /// Speculative decoding settings of an engine.

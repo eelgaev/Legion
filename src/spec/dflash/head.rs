@@ -1,6 +1,6 @@
 //! The target's output head as a DFlash drafter borrows it, cut down for drafting:
-//! `--spec-draft-vocab N` keeps its first `N` rows, `--spec-draft-lm-head q4` a 4-bit copy of
-//! them.
+//! `--spec-draft-vocab N` keeps its first `N` rows, `--spec-draft-lm-head q4|nvfp4` a 4-bit copy
+//! of them.
 //!
 //! A draft only changes what the target verifies, never what it emits, so the head the drafter
 //! scores its block with can be cheaper than the target's own. The Qwen vocabularies are
@@ -15,7 +15,7 @@ use std::path::Path;
 use crate::ggml::{BufferType, Context, types};
 use crate::gguf::{FileRange, GgufFile, Recipe};
 use crate::spec::DraftLmHead;
-use crate::spec::q4_head::to_q4;
+use crate::spec::q4_head::{to_nvfp4, to_q4};
 
 use super::model::floats;
 use super::weights::Store;
@@ -28,7 +28,8 @@ pub const SCALE: &str = "target.output.scale";
 /// Loads the first `rows` rows (0: all) of the output head of the target GGUF at `path` (its
 /// `output.weight`, or the token embeddings of a model with tied embeddings) as [`HEAD`], with
 /// its scale's matching values as [`SCALE`]; with [`DraftLmHead::Q4`] as a 4-bit copy that has
-/// the scale folded in.
+/// the scale folded in; with [`DraftLmHead::Nvfp4`] as an NVFP4 copy (the scale folded in) and
+/// its per-tensor decode scale as [`SCALE`].
 pub fn load(
     path: &Path,
     rows: usize,
@@ -87,6 +88,10 @@ pub fn load(
         DraftLmHead::Q4 => {
             let (q4, bytes) = to_q4(ty, &w, scale.as_deref(), k)?;
             (q4, bytes, None)
+        }
+        DraftLmHead::Nvfp4 => {
+            let (bytes, dec) = to_nvfp4(ty, &w, scale.as_deref(), k)?;
+            (types::NVFP4, bytes, Some(vec![dec]))
         }
     };
     let ctx = Context::new(2, 0);

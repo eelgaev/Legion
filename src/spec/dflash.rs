@@ -244,7 +244,11 @@ impl DflashDrafter {
         // `--spec-draft-vocab` / `--spec-draft-lm-head` cut down the target's head a DFlash
         // borrows; a drafter's own head (often a reduced vocabulary with `d2t`) and DSpark's
         // Markov head, which is as wide as the head, stay as they are.
-        let cut_head = opts.draft_vocab > 0 || opts.lm_head == crate::spec::DraftLmHead::Q4;
+        let cut_head = opts.draft_vocab > 0
+            || matches!(
+                opts.lm_head,
+                crate::spec::DraftLmHead::Q4 | crate::spec::DraftLmHead::Nvfp4
+            );
         let borrowed_head = flavor == Flavor::Dflash && !own("output.weight");
         if cut_head && !borrowed_head {
             tracing::warn!(
@@ -306,7 +310,7 @@ impl DflashDrafter {
         {
             window = window.min(w + 2 * cfg.block_size);
         }
-        let model = Model::new(
+        let mut model = Model::new(
             cfg,
             store,
             target.n_embd,
@@ -317,6 +321,8 @@ impl DflashDrafter {
             cut_head && borrowed_head,
         )
         .map_err(|e| format!("{}: {e}", path.display()))?;
+        model.fp4_head =
+            cut_head && borrowed_head && opts.lm_head == crate::spec::DraftLmHead::Nvfp4;
         if opts.min_confidence > 0.0 && !model.has_confidence() {
             return Err(format!(
                 "{}: the drafter has no confidence head to apply a minimum confidence of {}",

@@ -35,6 +35,8 @@ pub(super) struct DraftSettings {
     /// mtp`). `model`: as stored (all of them, or the first --spec-draft-vocab).
     /// `q4`: a 4-bit copy of those rows made at load (Q4_K, the head's scales folded in), which
     /// a draft pass reads instead (Qwen3.8-27B's FP8 head, 131,072 rows: 671 -> 377 MB).
+    /// `nvfp4` (DFlash only): an NVFP4 copy of those rows made at load, run by the FP4 GEMMs
+    /// (4-bit activations on a GB10) instead of the Q4_K MMQ path.
     /// `auto` (default): `q4` for the qwen4exp MTP head on an integrated GPU (GB10) when the
     /// target's head is 16- or 32-bit (Qwen3.8-Flash-Next-NVFP4's BF16 head), else `model`
     /// (always `model` for DFlash). Drafts only: every token is verified by the target, so the
