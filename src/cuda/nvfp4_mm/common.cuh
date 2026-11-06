@@ -465,8 +465,12 @@ __global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p)
 
     // Each row's next PF blocks in one L2 bulk prefetch, PF blocks ahead of the copies: the
     // copies read one block (36 bytes) of a row per step, too short a run for the LPDDR5X
-    // (see nvfp4_mvs). p.pf above 0 sets PF (tuning).
-    const int PF = p.pf > 0 ? p.pf : 32;
+    // (see nvfp4_mvs). The grouped SwiGLU GEMM's runs are 8 blocks (8 to 16 ahead): its CTAs'
+    // 256 rows x 32 blocks ahead put ~17 MB of weights in flight over the GPU, most of the
+    // GB10's 24 MiB L2, where the tiles' activations want to stay (#1183, as #749 found for the
+    // W4A4 GEMM: Qwen3.8-Flash-Next at 4K-token steps, 7949 -> 6935 us per layer). The down
+    // GEMM gains nothing from it. p.pf above 0 sets PF (tuning).
+    const int PF = p.pf > 0 ? p.pf : GROUPED && GLU ? 8 : 32;
     auto prefetch = [&](int64_t step) {
 #if __CUDA_ARCH__ >= 900
         if (threadIdx.x < BM && step < steps) {
