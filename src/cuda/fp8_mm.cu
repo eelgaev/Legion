@@ -30,6 +30,7 @@
 #include "ggml-cuda/common.cuh"
 #include "device_cache.cuh"
 
+#include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <mma.h>
@@ -521,6 +522,8 @@ __global__ void __launch_bounds__(128) fp8_gemv8(const legion_fp8_mm8 p) {
 
 // sm_89 and newer: the W8A8 GEMMs on mma.sync m16n8k32 E4M3 (fp8_gemm8, fp8_gemm8_skinny).
 #include "sm89/fp8_mm.cuh"
+// sm_90 and newer: fp8_gemm8 fed by TMA (fp8_gemm8_tma).
+#include "sm90/fp8_gemm8_tma.cuh"
 
 template <int BN, int W>
 void launch_gemm8_skinny_w(const legion_fp8_mm8 & p, cudaStream_t st) {
@@ -555,6 +558,69 @@ void launch_gemm8_w(const legion_fp8_mm8 & p, cudaStream_t st) {
     fp8_gemm8<RES, C><<<grid, 256, SMEM, st>>>(p);
 }
 
+// fp8_gemm8_tma on consumer Blackwell (compute capability 12.x: the GB10, where it was measured,
+// #1133); fp8_gemm8 elsewhere.
+bool gemm8_tma_device() {
+    const int cc = legion_device::compute_capability();
+    return cc >= 120 && cc < 130;
+}
+
+// The tensor map of `rows` rows of k bytes at `base` (E4M3 weights or activations), in boxes of
+// box_k bytes x box_rows rows in the swizzle of a8::Cfg's SWZ layout for BK = box_k; false
+// where the driver refuses it.
+bool gemm8_tma_map(CUtensorMap * map, const uint8_t * base, int64_t k, int64_t rows, int box_k, int box_rows) {
+    if (((uintptr_t) base & 15) != 0 || k % 16 != 0 || rows <= 0) {
+        return false;
+    }
+    const cuuint64_t dims[2]    = { (cuuint64_t) k, (cuuint64_t) rows };
+    const cuuint64_t strides[1] = { (cuuint64_t) k };
+    const cuuint32_t box[2]     = { (cuuint32_t) box_k, (cuuint32_t) box_rows };
+    const cuuint32_t elem[2]    = { 1, 1 };
+    const CUtensorMapSwizzle swz = box_k == 128 ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_64B;
+    return cuTensorMapEncodeTiled(map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, (void *) base, dims, strides, box, elem,
+                                  CU_TENSOR_MAP_INTERLEAVE_NONE, swz, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+                                  CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
+}
+
+// fp8_gemm8_tma where the device and the operands allow it; false: not launched.
+template <bool RES, class C>
+bool launch_gemm8_tma(const legion_fp8_mm8 & p, cudaStream_t st) {
+    constexpr size_t SMEM = gemm8_tma_smem<C>();
+    static_assert(SMEM <= 99 * 1024, "shared memory");
+    if (!gemm8_tma_device()) {
+        return false;
+    }
+    // The kernel image the device runs must be built for sm_90 or newer: one JIT-compiled from
+    // older PTX (a build without a 12.x target) has an empty body.
+    static std::atomic<int8_t> image_ok[GGML_CUDA_MAX_DEVICES];
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= GGML_CUDA_MAX_DEVICES) {
+        return false;
+    }
+    int8_t ok = image_ok[dev].load(std::memory_order_relaxed);
+    if (ok == 0) {
+        cudaFuncAttributes attr;
+        const bool sm90 = cudaFuncGetAttributes(&attr, fp8_gemm8_tma<RES, C>) == cudaSuccess &&
+                          attr.binaryVersion >= 90 && attr.ptxVersion >= 90;
+        ok = sm90 ? 1 : -1;
+        image_ok[dev].store(ok, std::memory_order_relaxed);
+    }
+    if (ok < 0) {
+        return false;
+    }
+    a8t::Maps maps;
+    if (!gemm8_tma_map(&maps.w, p.w, p.k, p.m, C::BK, C::TM) || !gemm8_tma_map(&maps.x, p.x, p.k, p.n, C::BK, a8::BN)) {
+        return false;
+    }
+    static std::atomic<int8_t> opted_in[GGML_CUDA_MAX_DEVICES];
+    if (!legion_device::smem_opt_in(opted_in, fp8_gemm8_tma<RES, C>, (int) SMEM)) {
+        return false;
+    }
+    const dim3 grid((unsigned) ((p.n + a8::BN - 1) / a8::BN), (unsigned) ((p.m + C::TM - 1) / C::TM));
+    fp8_gemm8_tma<RES, C><<<grid, 256, SMEM, st>>>(p, maps);
+    return true;
+}
+
 // The large-batch GEMM: 256-row tiles (WM 4) where their rows divide m and they make at least
 // GEMM8_WIDE_WAVES waves of CTAs (one per SM), else 128-row tiles: the wide tile copies fewer
 // bytes per MMA, but with fewer tiles the last wave's idle SMs cost more (Qwen3.8-27B's k and v
@@ -564,13 +630,18 @@ void launch_gemm8_w(const legion_fp8_mm8 & p, cudaStream_t st) {
 // faster (qkv 117 -> 136 TFLOPS, the fused-residual output 97 -> 114); where k is not a multiple
 // of 128, four 64-byte steps (96 KiB, 1.04-1.11x). The 128-row tile keeps three 64-byte steps,
 // now 48 KiB, so two CTAs share an SM without the residual (k/v: 96 -> 136 TFLOPS).
+// On consumer Blackwell the wide tile with 128-byte steps runs as fp8_gemm8_tma (#1133, GB10,
+// Qwen3.8-27B's projections at 4,096 to 16,384 tokens: 147-152 -> 156-163 TFLOPS, with the
+// residual 120-153 -> 128-155; 4 stages of 64 bytes are no faster there, 3 slower). The same bits.
 constexpr int64_t GEMM8_WIDE_WAVES = 8;
 template <bool RES>
 void launch_gemm8(const legion_fp8_mm8 & p, cudaStream_t st) {
     const int64_t wide_tiles = p.m / 256 * ((p.n + a8::BN - 1) / a8::BN);
     if (p.m % 256 == 0 && wide_tiles >= GEMM8_WIDE_WAVES * sm_count()) {
         if (p.k % 128 == 0) {
-            launch_gemm8_w<RES, a8::Cfg<4, 2, 128, true>>(p, st);
+            if (!launch_gemm8_tma<RES, a8::Cfg<4, 2, 128, true>>(p, st)) {
+                launch_gemm8_w<RES, a8::Cfg<4, 2, 128, true>>(p, st);
+            }
         } else {
             launch_gemm8_w<RES, a8::Cfg<4, 4, 64, true>>(p, st);
         }
