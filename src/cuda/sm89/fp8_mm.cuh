@@ -38,6 +38,115 @@ template <int WM_, int STAGES_ = 3, int BK_ = 64, bool SWZ_ = false> struct Cfg 
 constexpr int64_t RES_PF_STEPS = 4;
 }  // namespace a8
 
+// The MMAs of one K step of BK bytes from a stage's weights `ws` and activations `xs` into the
+// warp's accumulators (fp8_gemm8 and fp8_gemm8_tma): the same instructions in the same k order.
+// The ldmatrix reads are volatile so that the compiler keeps them before the barrier that hands
+// the stage back to the copies.
+template <class C, int NJ>
+__device__ __forceinline__ void gemm8_stage(const unsigned char * ws, const unsigned char * xs, int wm, int wn,
+                                            int lane, float (&acc)[4][NJ][4]) {
+#pragma unroll
+    for (int kk = 0; kk < C::BK; kk += 32) {
+        uint32_t a[4][4], b[NJ][2];
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const unsigned char * src = ws + C::off(wm * 64 + i * 16 + lane % 16, kk / 16 + lane / 16);
+            const uint32_t addr = (uint32_t) __cvta_generic_to_shared(src);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                : "=r"(a[i][0]), "=r"(a[i][1]), "=r"(a[i][2]), "=r"(a[i][3])
+                : "r"(addr));
+        }
+#pragma unroll
+        for (int j = 0; j < NJ / 2; j++) {
+            const int tok = wn * NJ * 8 + j * 16 + lane % 8 + (lane / 16) * 8;
+            const unsigned char * src = xs + C::off(tok, kk / 16 + (lane / 8) % 2);
+            const uint32_t addr = (uint32_t) __cvta_generic_to_shared(src);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                : "=r"(b[2 * j][0]), "=r"(b[2 * j][1]), "=r"(b[2 * j + 1][0]), "=r"(b[2 * j + 1][1])
+                : "r"(addr));
+        }
+#pragma unroll
+        for (int i = 0; i < 4; i++)
+#pragma unroll
+            for (int j = 0; j < NJ; j++)
+                asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                    "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                    : "+f"(acc[i][j][0]), "+f"(acc[i][j][1]), "+f"(acc[i][j][2]), "+f"(acc[i][j][3])
+                    : "r"(a[i][0]), "r"(a[i][1]), "r"(a[i][2]), "r"(a[i][3]), "r"(b[j][0]), "r"(b[j][1]));
+    }
+}
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+// WM 4 with a residual: the tile's residual (a token's TM rows are one 16-byte aligned run when
+// m0 + TM <= m) into L2 a few steps before the epilogue, which then loads it a row group at a
+// time from L2 instead of memory.
+template <bool RES, class C>
+__device__ __forceinline__ void gemm8_res_prefetch(const legion_fp8_mm8 & p, int64_t step, int64_t steps,
+                                                   int64_t m0, int64_t n0) {
+    if constexpr (RES && C::WM != 2) {
+        constexpr int64_t PF = a8::RES_PF_STEPS;
+        if (step == (steps > PF ? steps - PF : 0) && threadIdx.x < a8::BN && n0 + threadIdx.x < p.n &&
+            m0 + C::TM <= p.m) {
+            const float * a = p.res + (n0 + threadIdx.x) * p.m + m0;
+            if (((uintptr_t) a & 15) == 0) {
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(a), "r"((uint32_t) (C::TM * 4)));
+            }
+        }
+    }
+}
+#endif
+
+// The tile's outputs: the sums times the scales (plus the residual for RES) into p.dst.
+template <bool RES, class C, int NJ>
+__device__ __forceinline__ void gemm8_epilogue(const legion_fp8_mm8 & p, int64_t m0, int64_t n0, int wm, int wn,
+                                               int lane, const float (&acc)[4][NJ][4]) {
+    constexpr int WM = C::WM, WN = 8 / WM;
+    static_assert(NJ == a8::BN / 8 / WN, "n8 tiles per warp");
+    const float s = a8_static(p);
+    // RES: the residual loaded before the first store (dst may alias it as far as the compiler
+    // knows: loads between the stores would each wait out the memory latency). WM 2: the whole
+    // tile's at once; WM 4: a row group's (16 rows) before its stores, which keeps the 128
+    // accumulators plus 32 residuals in registers.
+    float rv[4][NJ][4];
+    auto load_res = [&](int i) {
+        const int64_t r0 = m0 + wm * 64 + i * 16 + lane / 4;
+#pragma unroll
+        for (int j = 0; j < NJ; j++) {
+            const int64_t t0 = n0 + wn * NJ * 8 + j * 8 + (lane % 4) * 2;
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int64_t row = r0 + (e / 2) * 8, tok = t0 + e % 2;
+                rv[i][j][e] = row < p.m && tok < p.n ? p.res[tok * p.m + row] : 0.0f;
+            }
+        }
+    };
+    if constexpr (RES && WM == 2) {
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            load_res(i);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        if constexpr (RES && WM != 2) {
+            load_res(i);
+        }
+        const int64_t r0 = m0 + wm * 64 + i * 16 + lane / 4;
+#pragma unroll
+        for (int j = 0; j < NJ; j++) {
+            const int64_t t0 = n0 + wn * NJ * 8 + j * 8 + (lane % 4) * 2;
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int64_t row = r0 + (e / 2) * 8, tok = t0 + e % 2;
+                if (row < p.m && tok < p.n) {
+                    const float v = acc[i][j][e] * a8_scale(p, s, row, tok);
+                    p.dst[tok * p.m + row] = RES ? __fadd_rn(v, rv[i][j][e]) : v;
+                }
+            }
+        }
+    }
+}
+
 // RES: p.res added to every output (the residual add fused into the epilogue).
 template <bool RES, class C>
 __global__ void __launch_bounds__(256) fp8_gemm8(const legion_fp8_mm8 p) {
@@ -99,97 +208,13 @@ __global__ void __launch_bounds__(256) fp8_gemm8(const legion_fp8_mm8 p) {
         }
         asm volatile("cp.async.commit_group;\n" ::);
 #if __CUDA_ARCH__ >= 900
-        if constexpr (RES && WM != 2) {
-            // The tile's residual (a token's TM rows are one 16-byte aligned run when m0 + TM
-            // <= m) into L2 a few steps before the epilogue, which then loads it a row group
-            // at a time from L2 instead of memory.
-            constexpr int64_t PF = a8::RES_PF_STEPS;
-            if (step == (steps > PF ? steps - PF : 0) && threadIdx.x < BN && n0 + threadIdx.x < p.n &&
-                m0 + TM <= p.m) {
-                const float * a = p.res + (n0 + threadIdx.x) * p.m + m0;
-                if (((uintptr_t) a & 15) == 0) {
-                    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(a), "r"((uint32_t) (TM * 4)));
-                }
-            }
-        }
+        gemm8_res_prefetch<RES, C>(p, step, steps, m0, n0);
 #endif
         const unsigned char * ws = smem + (step % STAGES) * TSTAGE;
-        const unsigned char * xs = ws + TM * LD;
-#pragma unroll
-        for (int kk = 0; kk < BK; kk += 32) {
-            uint32_t a[4][4], b[NJ][2];
-#pragma unroll
-            for (int i = 0; i < 4; i++) {
-                const unsigned char * src = ws + C::off(wm * 64 + i * 16 + lane % 16, kk / 16 + lane / 16);
-                const uint32_t addr = (uint32_t) __cvta_generic_to_shared(src);
-                asm("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                    : "=r"(a[i][0]), "=r"(a[i][1]), "=r"(a[i][2]), "=r"(a[i][3])
-                    : "r"(addr));
-            }
-#pragma unroll
-            for (int j = 0; j < NJ / 2; j++) {
-                const int tok = wn * NJ * 8 + j * 16 + lane % 8 + (lane / 16) * 8;
-                const unsigned char * src = xs + C::off(tok, kk / 16 + (lane / 8) % 2);
-                const uint32_t addr = (uint32_t) __cvta_generic_to_shared(src);
-                asm("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                    : "=r"(b[2 * j][0]), "=r"(b[2 * j][1]), "=r"(b[2 * j + 1][0]), "=r"(b[2 * j + 1][1])
-                    : "r"(addr));
-            }
-#pragma unroll
-            for (int i = 0; i < 4; i++)
-#pragma unroll
-                for (int j = 0; j < NJ; j++)
-                    asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
-                        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-                        : "+f"(acc[i][j][0]), "+f"(acc[i][j][1]), "+f"(acc[i][j][2]), "+f"(acc[i][j][3])
-                        : "r"(a[i][0]), "r"(a[i][1]), "r"(a[i][2]), "r"(a[i][3]), "r"(b[j][0]), "r"(b[j][1]));
-        }
+        gemm8_stage<C>(ws, ws + TM * LD, wm, wn, lane, acc);
     }
     asm volatile("cp.async.wait_group 0;\n" ::);
-
-    const float s = a8_static(p);
-    // RES: the residual loaded before the first store (dst may alias it as far as the compiler
-    // knows: loads between the stores would each wait out the memory latency). WM 2: the whole
-    // tile's at once; WM 4: a row group's (16 rows) before its stores, which keeps the 128
-    // accumulators plus 32 residuals in registers.
-    float rv[4][NJ][4];
-    auto load_res = [&](int i) {
-        const int64_t r0 = m0 + wm * 64 + i * 16 + lane / 4;
-#pragma unroll
-        for (int j = 0; j < NJ; j++) {
-            const int64_t t0 = n0 + wn * NJ * 8 + j * 8 + (lane % 4) * 2;
-#pragma unroll
-            for (int e = 0; e < 4; e++) {
-                const int64_t row = r0 + (e / 2) * 8, tok = t0 + e % 2;
-                rv[i][j][e] = row < p.m && tok < p.n ? p.res[tok * p.m + row] : 0.0f;
-            }
-        }
-    };
-    if constexpr (RES && WM == 2) {
-#pragma unroll
-        for (int i = 0; i < 4; i++) {
-            load_res(i);
-        }
-    }
-#pragma unroll
-    for (int i = 0; i < 4; i++) {
-        if constexpr (RES && WM != 2) {
-            load_res(i);
-        }
-        const int64_t r0 = m0 + wm * 64 + i * 16 + lane / 4;
-#pragma unroll
-        for (int j = 0; j < NJ; j++) {
-            const int64_t t0 = n0 + wn * NJ * 8 + j * 8 + (lane % 4) * 2;
-#pragma unroll
-            for (int e = 0; e < 4; e++) {
-                const int64_t row = r0 + (e / 2) * 8, tok = t0 + e % 2;
-                if (row < p.m && tok < p.n) {
-                    const float v = acc[i][j][e] * a8_scale(p, s, row, tok);
-                    p.dst[tok * p.m + row] = RES ? __fadd_rn(v, rv[i][j][e]) : v;
-                }
-            }
-        }
-    }
+    gemm8_epilogue<RES, C>(p, m0, n0, wm, wn, lane, acc);
 #endif
 }
 
