@@ -746,6 +746,15 @@ fn peer_writes_pick_the_gpus_of_a_node() {
     assert_eq!(m[..4], [0, 0, 0b1000, 0b0100]);
     let m = exchange::peer_masks(exchange::PeerWrites::All, &[none, none], all);
     assert_eq!(m[..2], [0b10, 0b01]);
+    // The pairs come from the GPUs' reported nodes: an unreported one is no node, not the
+    // node 0 its inbox may fall back to.
+    let gpus = exchange::gpu_nodes(&[None, None, Some(8), Some(8)]);
+    assert_eq!(gpus, [none, none, 8, 8]);
+    let m = exchange::peer_masks(exchange::PeerWrites::Pairs, &gpus, all);
+    assert_eq!(m[..4], [0, 0, 0b1000, 0b0100]);
+    let gpus = exchange::gpu_nodes(&[Some(0), Some(0), Some(8), Some(8)]);
+    let m = exchange::peer_masks(exchange::PeerWrites::Pairs, &gpus, all);
+    assert_eq!(m[..4], [0b0010, 0b0001, 0b1000, 0b0100]);
     // The default is the pairs.
     assert_eq!(exchange::PeerWrites::default(), exchange::PeerWrites::Pairs);
     // A whole step's reduce goes GPU to GPU: 8 MiB a slot at 512 tokens.
