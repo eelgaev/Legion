@@ -91,6 +91,33 @@ fn qwen_and_nemotron_keep_think_and_coder_parsers() {
 }
 
 #[test]
+fn glm_vocabularies_take_the_arg_key_parser_and_no_strict_tools() {
+    let tok = tokenizer(
+        &[
+            "<think>",
+            "</think>",
+            "<tool_call>",
+            "</tool_call>",
+            "<arg_key>",
+            "</arg_key>",
+            "<arg_value>",
+            "</arg_value>",
+            "<|observation|>",
+        ],
+        "glm4",
+    );
+    let format = ChatFormat::detect(&tok);
+    assert_eq!(format.prompt_reasoning("<|assistant|><think>"), Some(true));
+    check_parsers(
+        &format,
+        "<think>plan</think>answer",
+        "<tool_call>lookup<arg_key>n</arg_key><arg_value>3</arg_value></tool_call>",
+    );
+    assert_eq!(format.strict_tools(), None);
+    assert!(format.stop_tokens(&tok).contains(&8));
+}
+
+#[test]
 fn gemma_channels_take_precedence_and_start_inside_only_when_the_prompt_opens_them() {
     let tok = tokenizer(
         &["<|channel>", "<channel|>", "<|tool_call>", "<think>"],
@@ -140,7 +167,13 @@ fn partial_channel_vocabularies_keep_the_fallback_format() {
 
 #[test]
 fn stop_tokens_include_each_available_marker_even_without_channels() {
-    let tokens = ["<|im_end|>", "<|endoftext|>", "<turn|>", "<|tool_response>"];
+    let tokens = [
+        "<|im_end|>",
+        "<|endoftext|>",
+        "<turn|>",
+        "<|tool_response>",
+        "<|observation|>",
+    ];
     for mask in 0..1 << tokens.len() {
         let vocab: Vec<_> = tokens
             .iter()

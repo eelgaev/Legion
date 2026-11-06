@@ -1462,7 +1462,14 @@ impl Executor {
     /// stage.
     pub fn saved_states_to_host(&mut self) -> Result<Vec<usize>, ModelError> {
         self.wait_commit();
-        let hp = &self.model.hp;
+        // GLM's parallel steps keep each GPU's share of the states ([`Executor::new_glm_par`]):
+        // the host pool takes the same shapes, or a save or resume copies across mismatched
+        // pools.
+        let shard = self
+            .par
+            .every_step
+            .then(|| crate::model::glm5next::par::shard_hparams(&self.model.hp, self.stages.len()));
+        let hp = shard.as_ref().unwrap_or(&self.model.hp);
         let mut moved = Vec::with_capacity(self.stages.len());
         for s in &mut self.stages {
             let host = match s.backend.device().host_buffer_type() {

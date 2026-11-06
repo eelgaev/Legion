@@ -3,7 +3,7 @@
 
 use crate::engine::Tool;
 use crate::engine::reasoning::ReasoningParser;
-use crate::engine::tool_parser::{Gemma4Parser, Qwen3CoderParser, ToolParser};
+use crate::engine::tool_parser::{Gemma4Parser, GlmParser, Qwen3CoderParser, ToolParser};
 use crate::tokenizer::Tokenizer;
 
 #[derive(Clone)]
@@ -32,8 +32,14 @@ impl ChatFormat {
         let gemma4 = ["<|channel>", "<channel|>", "<|tool_call>"]
             .iter()
             .all(|t| tok.token_id(t).is_some());
+        // GLM (4.5 and later) writes its arguments as `<arg_key>`/`<arg_value>` pairs.
+        let glm = ["<tool_call>", "<arg_key>", "<arg_value>"]
+            .iter()
+            .all(|t| tok.token_id(t).is_some());
         let tools: fn(&[Tool]) -> Box<dyn ToolParser> = if gemma4 {
             |tools| Box::new(Gemma4Parser::new(tools))
+        } else if glm {
+            |tools| Box::new(GlmParser::new(tools))
         } else {
             |tools| Box::new(Qwen3CoderParser::new(tools))
         };
@@ -57,12 +63,20 @@ impl ChatFormat {
         };
         // Discover each end-of-generation token independently, as before, even when a
         // vocabulary lacks the full set of reasoning/tool markers. Gemma 4's tool-response
-        // opener hands control to the caller just like its end-of-turn token does.
-        let extra_stop_tokens = ["<|im_end|>", "<|endoftext|>", "<turn|>", "<|tool_response>"]
-            .into_iter()
-            .filter_map(|t| tok.token_id(t))
-            .collect();
-        let strict_tools = if gemma4 {
+        // opener and GLM's `<|observation|>` (the turn of the tool's results, which ends a
+        // reply that called tools) hand control to the caller just like an end-of-turn token.
+        let extra_stop_tokens = [
+            "<|im_end|>",
+            "<|endoftext|>",
+            "<turn|>",
+            "<|tool_response>",
+            "<|observation|>",
+        ]
+        .into_iter()
+        .filter_map(|t| tok.token_id(t))
+        .collect();
+        // Strict tools constrain the Qwen3-Coder format only.
+        let strict_tools = if gemma4 || glm {
             None
         } else {
             tok.token_id("<tool_call>")

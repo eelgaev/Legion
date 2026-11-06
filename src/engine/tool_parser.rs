@@ -7,10 +7,13 @@
 //! not parse (bad JSON, unknown tool, ...) is emitted verbatim as `Text` rather than dropped.
 //!
 //! Formats follow vllm's `hermes_tool_parser.py` and `qwen3coder_tool_parser.py` (Apache-2.0);
-//! Gemma 4's (`<|tool_call>call:NAME{...}<tool_call|>`) is in [`gemma4`].
+//! Gemma 4's (`<|tool_call>call:NAME{...}<tool_call|>`) is in [`gemma4`], GLM's
+//! (`<tool_call>NAME<arg_key>...</arg_key><arg_value>...</arg_value></tool_call>`) in [`glm`].
 
 mod gemma4;
+mod glm;
 pub use gemma4::Gemma4Parser;
+pub use glm::GlmParser;
 
 use serde_json::{Map, Value};
 
@@ -259,6 +262,7 @@ macro_rules! impl_tool_parser {
 impl_tool_parser!(HermesParser);
 impl_tool_parser!(Qwen3CoderParser);
 impl_tool_parser!(Gemma4Parser);
+impl_tool_parser!(GlmParser);
 
 #[cfg(test)]
 mod tests {
