@@ -29,6 +29,11 @@ static HC_NORM: ExternalOp = ExternalOp {
     cuda: None,
 };
 
+/// The [`hc_post_norm_rebuilt_xnb`] node's parameter set when its `out` is a deferred
+/// reduce-scatter ([`crate::tp_net::seq_par::defer_sum`], #1176); 7 and 8 are a folded MoE
+/// tail's.
+const P_RS: usize = 9;
+
 /// Most streams and inject outputs [`hc_norm`]'s CUDA kernel takes.
 pub(super) const HC_NORM_MAX: i64 = 8;
 
@@ -284,6 +289,14 @@ pub(super) fn hc_post_norm_rebuilt_xnb<'a>(
             padded: true,
         },
     );
+    // `out` the reduce-scatter of a `--tp-seq-par` step with BF16 partials (#1176): the norm
+    // adds the two ranks' partials itself, as the exchange's sum kernel adds them, so the sum
+    // is not written and read back.
+    if crate::tp_net::seq_par::deferrable(out) {
+        crate::tp_net::seq_par::defer_sum(out);
+        // SAFETY: the node just made, an external op node.
+        unsafe { crate::ggml::set_external_param(node.raw(), P_RS, 1) };
+    }
     let xnb = ctx.view_1d(node, (k * n) / 2, at.xn16 * 4);
     PostNormRebuiltXnb {
         res: ctx.view_3d(node, [e, hc, n], [e as usize * 4, k as usize * 4], 0),
@@ -728,6 +741,9 @@ struct HcPostNorm {
     xq: *mut i8,
     /// Null, or where `xn` rounded to BF16 goes (a BF16 down weight, #469).
     xnb: *mut u16,
+    /// Null, or (`legion_hc_post_norm_rs_launch`, #1176) rank 0's and rank 1's BF16 partials
+    /// whose sum is `out`, laid out as `out` (`out_ld`).
+    rs: [*const u16; 2],
 }
 
 /// `legion_moe_fold` (src/cuda/fused.cu): a folded MoE tail's inputs ([`fold_moe`]).
@@ -751,6 +767,7 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> i32;
     fn legion_hc_post_norm_launch(p: *const HcPostNorm, stream: *mut c_void) -> i32;
+    fn legion_hc_post_norm_rs_launch(p: *const HcPostNorm, stream: *mut c_void) -> i32;
     fn legion_hc_post_norm_s16_launch(p: *const HcPostNorm, in16: i32, stream: *mut c_void) -> i32;
     fn legion_hc_post_norm_moe_launch(
         p: *const HcPostNorm,
@@ -836,6 +853,7 @@ pub(crate) unsafe fn fold_target(node: *const ffi::ggml_tensor, cuda: bool) -> b
         let p = crate::ggml::external_params(n);
         // eps, down, quant, rebuild, moe, streams16, padded, fold
         if p[1..8] != [1, 0, 1, 0, 0, 1, 0]
+            || p[P_RS] != 0
             || n.src[5].is_null()
             || n.src[6..].iter().any(|s| !s.is_null())
         {
@@ -1131,7 +1149,7 @@ unsafe fn cuda_hc_post_norm(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
         let down = down.filter(|d| d.type_ == types::Q8_0);
         let rn = dst.data as *mut f32;
         let res16 = res.type_ == types::BF16;
-        let p = HcPostNorm {
+        let mut p = HcPostNorm {
             res: res.data as *const f32,
             // In the streams' own values (BF16 ones for BF16 streams).
             res_ld: (res.nb[2] / if res16 { 2 } else { 4 }) as i64,
@@ -1165,8 +1183,16 @@ unsafe fn cuda_hc_post_norm(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
             } else {
                 std::ptr::null_mut()
             },
+            rs: [std::ptr::null(); 2],
         };
-        let code = if params[7] != 0 {
+        // `out` a deferred reduce-scatter (#1176): the two ranks' BF16 partials added here.
+        let rs = (params[P_RS] != 0)
+            .then(|| crate::tp_net::seq_par::take_deferred(out))
+            .flatten();
+        let code = if let Some((srcs, _)) = rs {
+            p.rs = srcs.map(|a| a as *const u16);
+            legion_hc_post_norm_rs_launch(&p, stream)
+        } else if params[7] != 0 {
             // A folded MoE tail (#836): `out` (the experts' rows) is not read as a row.
             let (sh, g) = (&*dst.src[6], &*dst.src[7]);
             let f = MoeFold {
@@ -1191,7 +1217,14 @@ unsafe fn cuda_hc_post_norm(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
         };
         match code {
             0 => {}
-            e => return Err(format!("hc_post_norm: error {e}")),
+            e => {
+                let e = format!("hc_post_norm: error {e}");
+                if rs.is_some() {
+                    // The exchange's buffers stay held: no later exchange may wait on them.
+                    crate::tp_net::seq_par::fail_deferred(out, &e);
+                }
+                return Err(e);
+            }
         }
         if let Some(d) = down {
             // The converter ggml-cuda's cuBLAS matmul path dequantizes the weight with.
@@ -1201,7 +1234,11 @@ unsafe fn cuda_hc_post_norm(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
             let values = d.ne[0] * d.ne[1];
             to_f16(d.data, rn.add(at.down16) as *mut u16, values, stream);
         }
-        Ok(())
+        match rs {
+            // The exchange's buffers free once the partials were read.
+            Some((_, seq)) => crate::tp_net::seq_par::release_deferred(out, seq, stream),
+            None => Ok(()),
+        }
     }
 }
 

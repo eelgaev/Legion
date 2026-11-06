@@ -69,6 +69,85 @@ pub fn reduce_scatter<'a>(ctx: &'a Context, comm: i32, x: Tensor<'a>) -> Tensor<
     )
 }
 
+/// The parameter of a [`reduce_scatter`] node that [`defer_sum`] sets.
+const P_DEFERRED: usize = 1;
+
+/// Whether `out` is a [`reduce_scatter`] node whose sum a reader may take over ([`defer_sum`]):
+/// two ranks, its partials travel in BF16 (`--tp-wire bf16` at its size), it is not a graph
+/// output and no reader took it over yet.
+pub fn deferrable(out: Tensor<'_>) -> bool {
+    // SAFETY: `out` is a valid tensor of its context; a node of ours keeps its params.
+    unsafe {
+        let t = &*out.raw();
+        if !crate::ggml::op_of(t).is_some_and(|op| std::ptr::eq(op, &REDUCE_SCATTER)) {
+            return false;
+        }
+        let p = external_params(t);
+        let Some(c) = super::comm(p[0]) else {
+            return false;
+        };
+        // A graph output (a traced intermediate) is read as written.
+        let output = t.flags & ffi::ggml_tensor_flag_GGML_TENSOR_FLAG_OUTPUT as i32 != 0;
+        let full = ffi::ggml_nelements(t.src[0]) as usize;
+        !output && p[P_DEFERRED] == 0 && c.n_ranks() == 2 && c.wire(full) == super::Wire::Bf16
+    }
+}
+
+/// Hands the sum of the [`deferrable`] reduce-scatter `out` to its only reader (#1176: the
+/// next hyper-connection norm, `hc_post_norm` in its rebuilt BF16-xn form), which adds the two
+/// ranks' BF16 partials itself as the sum kernel does (rank order, one F32 rounding): on CUDA
+/// the node then waits for the peer's partial but does not sum, leaves `out` unwritten and the
+/// buffers held until the reader ran ([`super::op::cuda::take_deferred`]). If the next exchange
+/// starts first (the graph's order allows it), that exchange makes the sum into `out` as the
+/// node would have, and the reader reads `out`. The CPU op writes `out` either way.
+pub fn defer_sum(out: Tensor<'_>) {
+    assert!(deferrable(out), "seq_par::defer_sum: not a deferrable sum");
+    // SAFETY: a node of `reduce_scatter` (checked above).
+    unsafe { crate::ggml::set_external_param(out.raw(), P_DEFERRED, 1) };
+}
+
+/// Whether the [`reduce_scatter`] node `dst` hands its sum to its reader ([`defer_sum`]).
+pub(crate) fn deferred(dst: &ffi::ggml_tensor) -> bool {
+    external_params(dst)[P_DEFERRED] != 0
+}
+
+/// For the reader of the deferred reduce-scatter node `rs` ([`defer_sum`]), on CUDA: the device
+/// addresses of rank 0's and rank 1's BF16 partials of this rank's columns (`[row, share]`
+/// each) and the exchange's sequence number, for [`release_deferred`]. `None`: the node summed
+/// into its output itself.
+#[cfg(feature = "cuda")]
+pub(crate) fn take_deferred(rs: &ffi::ggml_tensor) -> Option<([u64; 2], u32)> {
+    if !deferred(rs) {
+        return None;
+    }
+    let c = super::comm(external_params(rs)[0])?;
+    super::op::cuda::take_deferred(&c, rs.data as usize).map(|d| (d.srcs, d.seq))
+}
+
+/// After the reader's kernel of [`take_deferred`]'s sum `seq`: the exchange's buffers free.
+///
+/// # Safety
+/// `stream` is the stream the node ran on.
+#[cfg(feature = "cuda")]
+pub(crate) unsafe fn release_deferred(
+    rs: &ffi::ggml_tensor,
+    seq: u32,
+    stream: *mut std::os::raw::c_void,
+) -> Result<(), String> {
+    let c = super::comm(external_params(rs)[0]).ok_or("tp reduce-scatter: the communicator")?;
+    // SAFETY: the caller's.
+    unsafe { super::op::cuda::release_deferred(&c, seq, stream) }
+}
+
+/// The reader of [`take_deferred`]'s sum could not run: its communicator fails with `e`, which
+/// releases every wait on the exchange's buffers.
+#[cfg(feature = "cuda")]
+pub(crate) fn fail_deferred(rs: &ffi::ggml_tensor, e: &str) {
+    if let Some(c) = super::comm(external_params(rs)[0]) {
+        c.fail(e.to_string());
+    }
+}
+
 /// Every rank's share of the columns of a `[row, cols]` tensor, from this rank's `x` (F32
 /// `[row, share]`): `[row, cols]`.
 pub fn all_gather<'a>(ctx: &'a Context, comm: i32, x: Tensor<'a>, cols: i64) -> Tensor<'a> {

@@ -244,3 +244,53 @@ fn off_unless_set_and_big_enough() {
     assert_eq!(got[0], (None, None, Some((0, 2))), "rank 0");
     assert_eq!(got[1], (None, None, Some((1, 2))));
 }
+
+#[test]
+fn only_a_two_rank_bf16_sum_is_deferred_once_and_the_cpu_still_sums() {
+    // #1176: a reader may take over a two-rank BF16 reduce-scatter's sum once; the CPU op
+    // writes the sum anyway, so the flag changes nothing there.
+    let (row, cols) = (4usize, 5usize);
+    let got = on_ranks(2, Wire::Bf16, move |r, c| {
+        let handle = register(c);
+        let mut backend = Backend::cpu().unwrap();
+        backend.set_threads(3);
+        let ctx = Context::new(16, 16);
+        let x = ctx
+            .new_tensor(types::F32, &[row as i64, cols as i64])
+            .as_input();
+        let part = reduce_scatter(&ctx, handle.id(), x);
+        let other = ctx.scale(part, 2.0);
+        // A traced intermediate keeps its sum.
+        let traced = reduce_scatter(&ctx, handle.id(), x).as_output();
+        let flags = (deferrable(part), deferrable(other), deferrable(traced));
+        defer_sum(part);
+        let after = deferrable(part);
+        let y = all_gather(&ctx, handle.id(), part, cols as i64).as_output();
+        let mut graph = ctx.new_graph(16);
+        graph.expand(y);
+        ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+            .unwrap();
+        x.set_f32(&values(r, 0, row * cols));
+        backend.compute(&graph).unwrap();
+        assert!(handle.comm().error().is_none());
+        (flags, after, y.to_f32())
+    });
+    // The gather rounds every column to BF16 too.
+    let want = wired(&want_sum(2, 0, row * cols, Wire::Bf16), Wire::Bf16);
+    for (r, (flags, after, y)) in got.into_iter().enumerate() {
+        assert_eq!(flags, (true, false, false), "rank {r}");
+        assert!(!after, "rank {r}");
+        assert_eq!(bits(&y), bits(&want), "rank {r}");
+    }
+}
+
+#[test]
+fn an_f32_wire_sum_is_not_deferred() {
+    let got = on_ranks(2, Wire::F32, |_, c| {
+        let handle = register(c);
+        let ctx = Context::new(16, 16);
+        let x = ctx.new_tensor(types::F32, &[4, 6]).as_input();
+        deferrable(reduce_scatter(&ctx, handle.id(), x))
+    });
+    assert_eq!(got, [false, false]);
+}
