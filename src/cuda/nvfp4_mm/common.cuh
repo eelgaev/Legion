@@ -80,6 +80,10 @@ struct legion_nvfp4_mm {
     // others none), so two launches on one plan split the experts by their pair counts (the
     // busy ones on the GEMM, the rest on the mv kernel). 0 and INT32_MAX: every expert.
     int32_t sel_lo, sel_hi;
+    // Grouped, nonzero (#1176): the plan's skipped pairs (ids of -1, no padding rows) get no
+    // zeros stored, because nothing reads their rows (the down matmul skips them, and the MoE
+    // tail of --tp-moe-ep does not read rows of zero router weights). 0: zeros, as before.
+    int32_t unread_skips;
 };
 
 // The GEMM: tiles_m * tiles_n CTAs of 256 threads; mi = 1 or 2 (128 * mi rows), nt = 1, 2, 4,
@@ -369,7 +373,7 @@ __global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p)
         if (legion_nvfp4::past_plan_tiles<TI>(p, tile)) {
             const int routed = p.plan[p.n_expert];
             const int skipped = (int) p.n - routed;
-            if (skipped > 0) {
+            if (skipped > 0 && !p.unread_skips) {
                 const int tiles = p.plan[p.n_expert + 1 + p.n + TI];
                 const int spare = tile - tiles, n_spare = (int) (gridDim.x / p.tiles_m) - tiles;
                 const int64_t rows = min((int64_t) BM_OUT, p.m - m0);
@@ -710,11 +714,11 @@ __global__ void __launch_bounds__(KW * 32) nvfp4_mvs(const legion_nvfp4_mm p) {
         n_tok = (int) min((int64_t) BN, p.n - (int64_t) blockIdx.y * BN);
     } else {
         // The host grid is an upper bound (no host sync for the routing): a CTA past the plan's
-        // own tile count with no padding pairs to store has nothing to do, and leaves before
-        // the plan scan (one load instead of find_tile's; #836). Selected launches (a split's)
-        // scan as before.
+        // own tile count with no padding pairs to store (none, or unread_skips) has nothing to
+        // do, and leaves before the plan scan (one load instead of find_tile's; #836). Selected
+        // launches (a split's) scan as before.
         if (legion_nvfp4::past_plan_tiles<legion_nvfp4::plan_tile_index(BN)>(p, blockIdx.y) &&
-            p.plan[p.n_expert] == (int) p.n) {
+            (p.plan[p.n_expert] == (int) p.n || p.unread_skips)) {
             return;
         }
         if (warp == 0) {
@@ -745,7 +749,7 @@ __global__ void __launch_bounds__(KW * 32) nvfp4_mvs(const legion_nvfp4_mm p) {
             // finite (zero) without reading any expert. The host grids keep one spare tile.
             const int routed = p.plan[p.n_expert];
             const int pad = (int) p.n - routed, spare = (int) blockIdx.y - tile_total;
-            if (pad > 0 && spare >= 0) {
+            if (pad > 0 && spare >= 0 && !p.unread_skips) {
                 // The kernel ahead may still read memory this result reuses (see the PDL
                 // note above): stores only after it is done, as the tiles' epilogues.
 #if __CUDA_ARCH__ >= 900
