@@ -590,6 +590,24 @@ bool launch_gemm8_tma(const legion_fp8_mm8 & p, cudaStream_t st) {
     if (!gemm8_tma_device()) {
         return false;
     }
+    // The kernel image the device runs must be built for sm_90 or newer: one JIT-compiled from
+    // older PTX (a build without a 12.x target) has an empty body.
+    static std::atomic<int8_t> image_ok[GGML_CUDA_MAX_DEVICES];
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= GGML_CUDA_MAX_DEVICES) {
+        return false;
+    }
+    int8_t ok = image_ok[dev].load(std::memory_order_relaxed);
+    if (ok == 0) {
+        cudaFuncAttributes attr;
+        const bool sm90 = cudaFuncGetAttributes(&attr, fp8_gemm8_tma<RES, C>) == cudaSuccess &&
+                          attr.binaryVersion >= 90 && attr.ptxVersion >= 90;
+        ok = sm90 ? 1 : -1;
+        image_ok[dev].store(ok, std::memory_order_relaxed);
+    }
+    if (ok < 0) {
+        return false;
+    }
     a8t::Maps maps;
     if (!gemm8_tma_map(&maps.w, p.w, p.k, p.m, C::BK, C::TM) || !gemm8_tma_map(&maps.x, p.x, p.k, p.n, C::BK, a8::BN)) {
         return false;
