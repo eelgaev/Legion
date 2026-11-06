@@ -251,3 +251,11 @@ manages the GPU(s), performs continuous batching (chunked prefill and decode und
 |---|---|---|
 | DGX Spark | GB10 (sm_121), 128 GB unified LPDDR5X | Clusters over RoCE (ConnectX-7) |
 | IBM AC922 | 4x V100-SXM2 16 GB (sm_70), POWER9 ppc64le | NVLink 2.0 to the CPUs, unified memory via ATS; GPU pairs on two NUMA nodes; build with gcc-toolset-12 |
+
+V100 (sm_70) builds need CUDA 12.x (12.2 or newer): CUDA 13 dropped sm_70. CI builds an x86_64 CUDA 12.4
+sm_70 binary next to the aarch64 CUDA 13.0 one. On an x86 box with V100s on PCIe (no ATS, often no NUMA
+node for the GPUs) the residency layer picks its fallbacks from what the driver reports and logs each once:
+experts in plain host memory are registered with the driver (`cuMemHostRegister`) when the GPUs cannot read
+pageable memory, pinned host memory uses `CU_MEM_LOCATION_TYPE_HOST` when a GPU has no NUMA node, and,
+when the GPUs' node is known, `--numa auto` prefers it instead of binding to it (with no known node the
+placement is unchanged).

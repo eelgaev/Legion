@@ -294,3 +294,49 @@ fn node_masks() {
     );
     assert!(node_mask(&[MASK_BITS as u32]).is_err());
 }
+
+/// A two-socket x86 box with GPUs on PCIe (a DGX-1 style host).
+fn pcie_box() -> Topology {
+    Topology {
+        nodes: vec![node(0, 0..20, 256), node(1, 20..40, 256)],
+    }
+}
+
+#[test]
+fn auto_prefers_the_gpus_node_on_a_pcie_host_only() {
+    let t = pcie_box();
+    let bind = auto(&t, &[Some(1), Some(1)], &free(&t));
+    let cpus: Vec<u32> = (20..40).collect();
+    assert_eq!(
+        prefer_on_pcie(bind.clone(), &NumaMode::Auto, true),
+        Plan::Prefer {
+            node: 1,
+            cpus: cpus.clone()
+        }
+    );
+    // An AC922 and the GB10 keep the binding.
+    assert_eq!(prefer_on_pcie(bind.clone(), &NumaMode::Auto, false), bind);
+    // `--numa <nodes>` binds as asked, even on a PCIe host.
+    let asked = plan(&NumaMode::Nodes(vec![1]), &t, &[], &free(&t)).unwrap();
+    assert_eq!(
+        prefer_on_pcie(asked.clone(), &NumaMode::Nodes(vec![1]), true),
+        asked
+    );
+    // Plans other than a bind stay as they are.
+    let per_gpu = auto(&t, &[Some(0), Some(1)], &free(&t));
+    assert_eq!(
+        prefer_on_pcie(per_gpu.clone(), &NumaMode::Auto, true),
+        per_gpu
+    );
+    let placed = Placement {
+        mode: NumaMode::Auto,
+        plan: Plan::Prefer { node: 1, cpus },
+        gpus: vec![Some(1), Some(0)],
+        error: None,
+    };
+    let lines = placed.lines();
+    assert!(lines[0].contains("memory preferred there"), "{}", lines[0]);
+    assert_eq!(lines[1], "CUDA0: NUMA node 1 · host buffers on node 1");
+    assert!(lines[2].contains("preferably on node 1"), "{}", lines[2]);
+    assert!(placed.warnings()[0].contains("prefers host memory on node 1"));
+}

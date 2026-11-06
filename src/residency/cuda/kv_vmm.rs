@@ -176,9 +176,9 @@ fn host_take(device: usize, n: usize, budget: usize) -> Result<HostPiece, String
         pool.bytes -= p.n;
         host_free(p);
     }
-    let node = device_numa_node(device).ok_or("the GPU's NUMA node is unknown")?;
-    let gran = granularity(CU_MEM_LOCATION_TYPE_HOST_NUMA, node as i32).max(1);
-    let prop = alloc_prop(CU_MEM_LOCATION_TYPE_HOST_NUMA, node as i32);
+    let node = alloc_node(device).ok_or("no pinned host memory for the GPU through VMM")?;
+    let gran = host_granularity(node).max(1);
+    let prop = host_prop(node);
     let mut p = HostPiece {
         device,
         h: 0,
@@ -222,20 +222,21 @@ fn host_give(p: HostPiece) {
 }
 
 /// Whether `--kv-vmm` tensor `t`'s pieces can be backed by host pieces (#1196): the driver
-/// maps host NUMA memory through VMM for its GPU, whose node is known, in granules that
-/// divide the pieces' (the device's).
+/// maps pinned host memory through VMM for its GPU (on its NUMA node, or of no node where it
+/// has none: [`alloc_node`]), in granules that divide the pieces' (the device's).
 pub fn kv_vmm_host_ok(t: Tensor<'_>) -> bool {
     let Some((b, _)) = vmm_of(t) else {
         return false;
     };
-    let Some(node) = device_numa_node(b.device) else {
+    // A GPU with no host NUMA node: host memory of no node (`alloc_node`).
+    let Some(node) = alloc_node(b.device) else {
         return false;
     };
     if use_device(b.device).is_err() {
         return false;
     }
     let dg = granularity(CU_MEM_LOCATION_TYPE_DEVICE, b.device as i32);
-    let hg = granularity(CU_MEM_LOCATION_TYPE_HOST_NUMA, node as i32);
+    let hg = host_granularity(node);
     dg > 0 && hg > 0 && dg.is_multiple_of(hg)
 }
 

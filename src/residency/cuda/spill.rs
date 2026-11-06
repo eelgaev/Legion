@@ -154,7 +154,7 @@ fn spill_map(t: &SpillType, size: usize) -> Result<Box<SpillBuffer>, String> {
                 b.mapped.0 = true;
             }
             if b.host_bytes > 0 {
-                let prop = alloc_prop(CU_MEM_LOCATION_TYPE_HOST_NUMA, t.node as i32);
+                let prop = host_prop(t.node);
                 cu(
                     cuMemCreate(&mut b.host, b.host_bytes, &prop, 0),
                     "cuMemCreate(spill host NUMA)",
@@ -353,8 +353,8 @@ unsafe extern "C" fn spill_clear(buffer: ffi::ggml_backend_buffer_t, v: u8) {
 }
 
 /// A buffer type for `device`'s step compute buffers that spills into pinned host memory on
-/// the device's NUMA node when VRAM runs short. `None` when the node is unknown or this driver
-/// cannot map host-NUMA memory through VMM (no unified memory to spill into).
+/// the device's NUMA node (host memory of no node where it has none: [`alloc_node`]) when VRAM
+/// runs short. `None` when this driver cannot map pinned host memory through VMM for it.
 pub fn spill_type(device: usize) -> Option<BufferType> {
     spill_type_keeping(device, SPILL_KEEPS_FREE)
 }
@@ -405,11 +405,12 @@ fn registered(device: usize, keep: usize) -> Option<&'static mut SpillType> {
         // pointers as before.
         return Some(unsafe { &mut *(&mut **t as *mut SpillType) });
     }
-    let node = device_numa_node(device)?;
+    // A GPU with no host NUMA node spills to host memory of no node (`alloc_node`).
+    let node = alloc_node(device)?;
     use_device(device).ok()?;
     let (dg, hg) = (
         granularity(CU_MEM_LOCATION_TYPE_DEVICE, device as i32),
-        granularity(CU_MEM_LOCATION_TYPE_HOST_NUMA, node as i32),
+        host_granularity(node),
     );
     if dg == 0 || hg == 0 || (dg.max(hg) % dg.min(hg)) != 0 {
         return None;

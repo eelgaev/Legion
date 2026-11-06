@@ -14,12 +14,15 @@
 //! loader fills them like any host buffer, and graphs read them like device weights.
 
 use std::cell::RefCell;
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::ptr::{NonNull, null_mut};
 use std::sync::Mutex;
 
+use super::fallback::{self, HostLoc, NO_NODE};
 use crate::ggml::{BufferType, Context, GgmlError, Tensor, ffi};
 
+mod host_register;
+pub use host_register::{HostRegistration, register_host};
 mod kv_vmm;
 pub use kv_vmm::{kv_vmm_host_ok, kv_vmm_remap, kv_vmm_type, kv_vmm_unmap};
 mod tp_tier;
@@ -41,6 +44,7 @@ mod sys {
 
     pub const CU_MEM_ALLOCATION_TYPE_PINNED: c_uint = 1;
     pub const CU_MEM_LOCATION_TYPE_DEVICE: c_uint = 1;
+    pub const CU_MEM_LOCATION_TYPE_HOST: c_uint = 2;
     pub const CU_MEM_LOCATION_TYPE_HOST_NUMA: c_uint = 3;
     pub const CU_MEM_ACCESS_FLAGS_PROT_READWRITE: c_uint = 3;
     pub const CU_MEM_ALLOC_GRANULARITY_MINIMUM: c_uint = 0;
@@ -49,9 +53,15 @@ mod sys {
     pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_uint = 75;
     pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_uint = 76;
     pub const CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS: c_uint = 88;
+    pub const CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM: c_uint = 91;
+    pub const CU_DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED: c_uint = 99;
     pub const CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES: c_uint = 100;
     pub const CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED: c_uint = 102;
+    pub const CU_DEVICE_ATTRIBUTE_READ_ONLY_HOST_REGISTER_SUPPORTED: c_uint = 113;
     pub const CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID: c_uint = 134;
+    pub const CU_MEMHOSTREGISTER_PORTABLE: c_uint = 0x01;
+    pub const CU_MEMHOSTREGISTER_DEVICEMAP: c_uint = 0x02;
+    pub const CU_MEMHOSTREGISTER_READ_ONLY: c_uint = 0x08;
     pub const CUDA_MEMCPY_DEFAULT: c_int = 4;
     pub const CUDA_STREAM_NON_BLOCKING: c_uint = 1;
     pub const CUDA_EVENT_DISABLE_TIMING: c_uint = 2;
@@ -131,9 +141,20 @@ mod sys {
             desc: *const CUmemAccessDesc,
             count: usize,
         ) -> CUresult;
+        // `cuda.h` maps both names to their `_v2` symbols.
+        #[link_name = "cuMemHostRegister_v2"]
+        pub fn cuMemHostRegister(p: *mut c_void, size: usize, flags: c_uint) -> CUresult;
+        pub fn cuMemHostUnregister(p: *mut c_void) -> CUresult;
+        #[link_name = "cuMemHostGetDevicePointer_v2"]
+        pub fn cuMemHostGetDevicePointer(
+            d: *mut CUdeviceptr,
+            p: *mut c_void,
+            flags: c_uint,
+        ) -> CUresult;
 
         pub fn cudaGetErrorString(e: cudaError_t) -> *const c_char;
         pub fn cudaSetDevice(d: c_int) -> cudaError_t;
+        pub fn cudaGetDevice(d: *mut c_int) -> cudaError_t;
         pub fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> cudaError_t;
         pub fn cudaFree(p: *mut c_void) -> cudaError_t;
         pub fn cudaDeviceSynchronize() -> cudaError_t;
@@ -284,6 +305,123 @@ fn access(location_type: u32, id: i32) -> CUmemAccessDesc {
     }
 }
 
+/// The driver location of host allocator node `node` ([`HostLoc::of`]): `HOST_NUMA` on a real
+/// node, as always; `HOST` for [`NO_NODE`] (a GPU with no host NUMA node).
+fn host_location(node: u32) -> (c_uint, c_int) {
+    match HostLoc::of(node) {
+        HostLoc::Numa(n) => (CU_MEM_LOCATION_TYPE_HOST_NUMA, n as c_int),
+        HostLoc::Host => (CU_MEM_LOCATION_TYPE_HOST, 0),
+    }
+}
+
+/// [`granularity`] of pinned host memory on allocator node `node` ([`host_location`]).
+fn host_granularity(node: u32) -> usize {
+    let (ty, id) = host_location(node);
+    granularity(ty, id)
+}
+
+/// [`alloc_prop`] of pinned host memory on allocator node `node` ([`host_location`]).
+fn host_prop(node: u32) -> CUmemAllocationProp {
+    let (ty, id) = host_location(node);
+    alloc_prop(ty, id)
+}
+
+/// The CPU's [`access`] to pinned host memory on allocator node `node` ([`host_location`]).
+fn host_access(node: u32) -> CUmemAccessDesc {
+    let (ty, id) = host_location(node);
+    access(ty, id)
+}
+
+/// Whether the driver allocates, maps and lets `device` and the CPU access pinned host memory
+/// of location type `HOST` (no NUMA node; CUDA 12.2+ drivers): one granule tried for real, as
+/// the granularity query alone can pass where `cuMemCreate` then refuses. `device` is current.
+fn host_type_works(device: usize) -> bool {
+    let g = granularity(CU_MEM_LOCATION_TYPE_HOST, 0);
+    if g == 0 {
+        return false;
+    }
+    let prop = alloc_prop(CU_MEM_LOCATION_TYPE_HOST, 0);
+    let (mut h, mut va) = (0, 0);
+    // SAFETY: one allocation in a range of its own, all released before returning.
+    unsafe {
+        if cuMemCreate(&mut h, g, &prop, 0) != 0 {
+            return false;
+        }
+        let mut ok = cuMemAddressReserve(&mut va, g, g, 0, 0) == 0;
+        let mapped = ok && cuMemMap(va, g, 0, h, 0) == 0;
+        if mapped {
+            let desc = [
+                access(CU_MEM_LOCATION_TYPE_HOST, 0),
+                access(CU_MEM_LOCATION_TYPE_DEVICE, device as c_int),
+            ];
+            ok = cuMemSetAccess(va, g, desc.as_ptr(), desc.len()) == 0;
+            cuMemUnmap(va, g);
+        } else {
+            ok = false;
+        }
+        if va != 0 {
+            cuMemAddressFree(va, g);
+        }
+        cuMemRelease(h);
+        ok
+    }
+}
+
+/// Per CUDA device without a known host NUMA node, the node its pinned host memory uses
+/// ([`no_node_host`]).
+static NO_NODE_HOST: Mutex<Vec<(usize, Option<u32>)>> = Mutex::new(Vec::new());
+
+/// The allocator node for pinned host memory of `device`, a GPU whose host NUMA node is unknown
+/// ([`fallback::host_node`] with no node): [`NO_NODE`] where the driver takes
+/// `CU_MEM_LOCATION_TYPE_HOST`, else node 0 where it takes `HOST_NUMA` 0. Probed once per
+/// device and said once in the log; the current device is left as it was.
+fn no_node_host(device: usize) -> Option<u32> {
+    if let Some(&(_, n)) = NO_NODE_HOST
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|&&(d, _)| d == device)
+    {
+        return n;
+    }
+    let mut current: c_int = -1;
+    // SAFETY: writes one int.
+    let had = unsafe { cudaGetDevice(&mut current) } == 0;
+    let chosen = use_device(device).ok().and_then(|()| {
+        fallback::host_node(
+            None,
+            |n| host_granularity(n) > 0,
+            || host_type_works(device),
+        )
+    });
+    if had && current >= 0 {
+        // SAFETY: a plain runtime call.
+        unsafe { cudaSetDevice(current) };
+    }
+    let mut list = NO_NODE_HOST.lock().unwrap();
+    if !list.iter().any(|&(d, _)| d == device) {
+        list.push((device, chosen));
+        tracing::info!(
+            device,
+            location = match chosen.map(HostLoc::of) {
+                Some(HostLoc::Host) => "CU_MEM_LOCATION_TYPE_HOST",
+                Some(HostLoc::Numa(_)) => "CU_MEM_LOCATION_TYPE_HOST_NUMA 0",
+                None => "none",
+            },
+            "{}",
+            fallback::host_node_note(chosen)
+        );
+    }
+    chosen
+}
+
+/// The allocator node for pinned host memory of CUDA device `device`: its host NUMA node
+/// ([`device_numa_node`]), as always; with no node known, [`no_node_host`]'s choice. `None`:
+/// no node and no pinned host memory through VMM for it.
+fn alloc_node(device: usize) -> Option<u32> {
+    device_numa_node(device).or_else(|| no_node_host(device))
+}
+
 /// Per CUDA device, the peer that stages a prompt's experts into it ([`set_stage_peer`]).
 static STAGE_PEERS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
@@ -322,6 +460,12 @@ pub struct Caps {
     pub host_numa_id: i32,
     pub pageable_access: bool,
     pub pageable_uses_host_page_tables: bool,
+    /// Host memory can be registered with the driver (`cuMemHostRegister`).
+    pub host_register: bool,
+    /// ... read-only (`CU_MEMHOSTREGISTER_READ_ONLY`).
+    pub read_only_register: bool,
+    /// Kernels read registered host memory at its host address.
+    pub host_pointer_registered: bool,
     pub integrated: bool,
     /// The compute capability's major version (7: Volta/Turing, 8: Ampere/Ada, 12: GB10).
     pub cc_major: i32,
@@ -331,6 +475,11 @@ pub struct Caps {
     pub sms: i32,
     /// Pinned host-NUMA memory can be allocated through VMM.
     pub host_numa_vmm: bool,
+    /// The node the host allocators place this device's pinned memory on: `host_numa_id` where
+    /// it is known and the driver places memory there; with no node known,
+    /// [`fallback::NO_NODE`] (`CU_MEM_LOCATION_TYPE_HOST`) or node 0 ([`fallback::host_node`]).
+    /// `None`: no pinned host memory through VMM.
+    pub host_node: Option<u32>,
     pub host_granularity: usize,
     pub device_granularity: usize,
 }
@@ -345,18 +494,30 @@ pub fn caps(device: usize) -> Option<Caps> {
         "cuDeviceGet",
     )
     .ok()?;
-    let attr = |a: u32| {
+    // `None` where the driver does not know the attribute (an older driver).
+    let query = |a: u32| {
         let mut v = 0;
         // SAFETY: writes one int.
-        unsafe { cuDeviceGetAttribute(&mut v, a, d) };
-        v
+        (unsafe { cuDeviceGetAttribute(&mut v, a, d) } == 0).then_some(v)
     };
+    let attr = |a: u32| query(a).unwrap_or(0);
     let vmm = attr(CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED) != 0;
-    let host_numa_id = attr(CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID);
-    let host_granularity = if vmm {
-        granularity(CU_MEM_LOCATION_TYPE_HOST_NUMA, host_numa_id.max(0))
-    } else {
-        0
+    // The driver's node; where it has none (or no such attribute), the one sysfs gives the
+    // GPU's PCI address, else -1: a failed query is "unknown", never node 0.
+    let host_numa_id = match query(CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID) {
+        Some(id) if id >= 0 => id,
+        _ => device_numa_node(device).map_or(-1, |n| n as i32),
+    };
+    let (host_granularity, host_node) = match (vmm, u32::try_from(host_numa_id)) {
+        (false, _) => (0, None),
+        (true, Ok(n)) => {
+            let g = granularity(CU_MEM_LOCATION_TYPE_HOST_NUMA, n as i32);
+            (g, (g > 0).then_some(n))
+        }
+        (true, Err(_)) => {
+            let node = no_node_host(device);
+            (node.map_or(0, host_granularity), node)
+        }
     };
     Some(Caps {
         vmm,
@@ -365,11 +526,16 @@ pub fn caps(device: usize) -> Option<Caps> {
         pageable_uses_host_page_tables: attr(
             CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES,
         ) != 0,
+        host_register: attr(CU_DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED) != 0,
+        read_only_register: attr(CU_DEVICE_ATTRIBUTE_READ_ONLY_HOST_REGISTER_SUPPORTED) != 0,
+        host_pointer_registered: attr(CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM)
+            != 0,
         integrated: attr(CU_DEVICE_ATTRIBUTE_INTEGRATED) != 0,
         cc_major: attr(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR),
         cc_minor: attr(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR),
         sms: attr(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT),
         host_numa_vmm: host_granularity > 0,
+        host_node,
         host_granularity,
         device_granularity: granularity(CU_MEM_LOCATION_TYPE_DEVICE, device as i32),
     })
@@ -609,7 +775,7 @@ fn arena_map(t: &ArenaType, sizes: &[(usize, u32)]) -> Result<Box<ArenaBuffer>, 
     }
     let mut off = 0usize;
     for &(size, node) in sizes.iter().filter(|z| z.0 > 0) {
-        let prop = alloc_prop(CU_MEM_LOCATION_TYPE_HOST_NUMA, node as i32);
+        let prop = host_prop(node);
         let mut handle = 0;
         // SAFETY: creates and maps one allocation inside the reserved range.
         unsafe {
@@ -627,7 +793,7 @@ fn arena_map(t: &ArenaType, sizes: &[(usize, u32)]) -> Result<Box<ArenaBuffer>, 
                 return fail(b, e);
             }
         }
-        let mut desc = vec![access(CU_MEM_LOCATION_TYPE_HOST_NUMA, node as i32)];
+        let mut desc = vec![host_access(node)];
         desc.extend(
             t.devices
                 .iter()
@@ -819,21 +985,30 @@ fn arena_type(
     nodes.dedup();
     let mut gran = 0;
     for &n in &nodes {
-        let g = granularity(CU_MEM_LOCATION_TYPE_HOST_NUMA, n as i32);
+        let g = host_granularity(n);
         if g == 0 {
             return Err("this driver cannot allocate host NUMA memory through cuMemCreate".into());
         }
         gran = gran.max(g);
     }
+    // A GPU with no host NUMA node: "Host" in place of a node number.
+    let label = |n: u32| {
+        if n == NO_NODE {
+            "Host".to_string()
+        } else {
+            n.to_string()
+        }
+    };
     let name = match &split {
         Some(_) => format!(
             "HostNuma{}",
             nodes
                 .iter()
-                .map(|n| n.to_string())
+                .map(|&n| label(n))
                 .collect::<Vec<_>>()
                 .join("+")
         ),
+        None if node == NO_NODE => "HostPinned".to_string(),
         None => format!("HostNuma{node}"),
     };
     let t: &'static mut ArenaType = Box::leak(Box::new(ArenaType {

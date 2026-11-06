@@ -302,7 +302,7 @@ unsafe extern "C" fn tier_init_tensor(
         0 => bytes,
         n => n.min(bytes),
     };
-    let host = (CU_MEM_LOCATION_TYPE_HOST_NUMA, ty.node as i32);
+    let host = host_location(ty.node);
     let device = (CU_MEM_LOCATION_TYPE_DEVICE, ty.device as i32);
     let done = if b.lazy.is_some() && ty.slot_rows > 0 {
         lazy_init(b, ty, off, bytes, row, slot)
@@ -370,11 +370,7 @@ fn lazy_init(
         }
     }
     let tail = n_slots * slot;
-    b.map(
-        off + tail,
-        bytes - tail,
-        (CU_MEM_LOCATION_TYPE_HOST_NUMA, ty.node as i32),
-    )?;
+    b.map(off + tail, bytes - tail, host_location(ty.node))?;
     let l = b.lazy.as_mut().expect("a lazy buffer");
     l.tensors.push((off, row, vram));
     l.backed.push(vec![vram; n_slots]);
@@ -393,7 +389,7 @@ impl TierBuffer {
         }
         let node = l.node;
         // Zeroed through a short-lived range of its own.
-        let prop = alloc_prop(CU_MEM_LOCATION_TYPE_HOST_NUMA, node as i32);
+        let prop = host_prop(node);
         let mut h: CUmemGenericAllocationHandle = 0;
         let mut va: CUdeviceptr = 0;
         // SAFETY: a new allocation, mapped into a new range to be zeroed, then unmapped.
@@ -502,7 +498,7 @@ pub fn tp_tier_back(slot: usize, rows: usize) -> Result<(), String> {
                     cuMemUnmap(b.va + (base + at) as u64, chunk);
                 }
             }
-            let host = (CU_MEM_LOCATION_TYPE_HOST_NUMA, node as i32);
+            let host = host_location(node);
             let h = match b.map_piece(base + have, want - have, host) {
                 Ok(h) => h,
                 Err(e) => {
@@ -730,12 +726,12 @@ pub fn tp_tier_devices(
         .iter()
         .map(|&device| {
             let caps = caps(device).ok_or("cannot query the GPU")?;
-            if !caps.host_numa_vmm || caps.host_numa_id < 0 {
+            // A GPU with no host NUMA node: host memory of no node (`Caps::host_node`).
+            let Some(node) = caps.host_node.filter(|_| caps.host_numa_vmm) else {
                 return Err(format!(
                     "CUDA{device}'s driver cannot map host NUMA memory (cuMemCreate)"
                 ));
-            }
-            let node = caps.host_numa_id as u32;
+            };
             let mut list = TIER_TYPES.0.lock().unwrap();
             if let Some(t) = list.iter_mut().find(|t| {
                 t.device == device

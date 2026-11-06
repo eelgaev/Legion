@@ -129,7 +129,8 @@ pub enum PeerWrites {
 }
 
 /// Per reader `r`: bit `w` set when GPU `w` writes into `r`'s VRAM inbox, for GPUs on NUMA
-/// nodes `nodes` where `w` can reach `r`'s memory when `can(w, r)`.
+/// nodes `nodes` where `w` can reach `r`'s memory when `can(w, r)`. GPUs of no known node
+/// ([`crate::residency::fallback::NO_NODE`]) are never a pair: no shared node is known.
 pub fn peer_masks(
     mode: PeerWrites,
     nodes: &[u32],
@@ -141,7 +142,11 @@ pub fn peer_masks(
         for w in (0..n).filter(|&w| w != r) {
             let on = match mode {
                 PeerWrites::Off => false,
-                PeerWrites::Pairs => nodes[w] == nodes[r] && can(w, r),
+                PeerWrites::Pairs => {
+                    crate::residency::fallback::known_node(nodes[r]).is_some()
+                        && nodes[w] == nodes[r]
+                        && can(w, r)
+                }
                 PeerWrites::All => can(w, r),
             };
             if on {
@@ -150,6 +155,15 @@ pub fn peer_masks(
         }
     }
     m
+}
+
+/// The GPUs' NUMA nodes for [`peer_masks`], from what each one reports: a GPU of no known node
+/// is [`crate::residency::fallback::NO_NODE`] (never a pair), not the node its memory is on.
+pub fn gpu_nodes(reported: &[Option<u32>]) -> Vec<u32> {
+    reported
+        .iter()
+        .map(|n| n.unwrap_or(crate::residency::fallback::NO_NODE))
+        .collect()
 }
 
 /// The exchange memory and state of one engine's GPUs.
@@ -313,10 +327,13 @@ impl Exchange {
             ctxs.push(ctx);
         }
         let peer_slot = peer_slot.next_multiple_of(16);
-        // The pairs by the GPUs' own nodes (the inboxes' `nodes` are all 0 under `--numa off`).
-        let topo: Vec<u32> = (0..n_dev)
-            .map(|d| crate::residency::cuda::device_numa_node(d).unwrap_or(nodes[d]))
-            .collect();
+        // The pairs by the GPUs' own nodes, never the inboxes' (all 0 under `--numa off`, or a
+        // fallback node for a GPU of no node).
+        let topo = gpu_nodes(
+            &(0..n_dev)
+                .map(crate::residency::cuda::device_numa_node)
+                .collect::<Vec<_>>(),
+        );
         // Peer access both ways (the pair exchange's setup), so the masks are symmetric.
         use crate::model::core::pair::link;
         let mask = if peer_slot == 0 || n_dev < 2 {

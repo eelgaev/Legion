@@ -97,7 +97,7 @@ pub(crate) fn room_note(nodes: &[Node]) -> String {
         .map(|n| {
             format!(
                 "node {}: {:.1} GiB free of {:.1} GiB, {:.1} GiB of it page cache",
-                n.node,
+                crate::residency::fallback::node_label(n.node),
                 gib(n.free),
                 gib(n.total),
                 gib(n.cache)
@@ -110,7 +110,7 @@ pub(crate) fn room_note(nodes: &[Node]) -> String {
 fn node_list(nodes: &[Node]) -> String {
     nodes
         .iter()
-        .map(|n| n.node.to_string())
+        .map(|n| crate::residency::fallback::node_label(n.node))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -123,10 +123,11 @@ fn node_list(nodes: &[Node]) -> String {
 pub(crate) fn parse_meminfo(text: &str) -> Option<NodeMemory> {
     let field = |name: &str| {
         text.lines().find_map(|l| {
-            // "Node", the node, the field, the value, "kB"
+            // "Node", the node, the field, the value, "kB" (a node's file), or the field, the
+            // value, "kB" (`/proc/meminfo`)
             let w: Vec<&str> = l.split_whitespace().collect();
             match w.as_slice() {
-                [_, _, key, value, ..] if *key == name => {
+                [_, _, key, value, ..] | [key, value, ..] if *key == name => {
                     value.parse::<u64>().ok().map(|kb| kb * 1024)
                 }
                 _ => None,
@@ -146,11 +147,15 @@ pub(crate) fn parse_meminfo(text: &str) -> Option<NodeMemory> {
     })
 }
 
-/// A NUMA node's memory for the tier (Linux), if known.
+/// A NUMA node's memory for the tier (Linux), if known; the whole host's for
+/// [`crate::residency::fallback::NO_NODE`] (host memory of no node, a GPU with no NUMA node).
 pub(crate) fn node_memory(node: u32) -> Option<NodeMemory> {
-    let text =
-        std::fs::read_to_string(format!("/sys/devices/system/node/node{node}/meminfo")).ok()?;
-    parse_meminfo(&text)
+    let path = if node == crate::residency::fallback::NO_NODE {
+        "/proc/meminfo".to_string()
+    } else {
+        format!("/sys/devices/system/node/node{node}/meminfo")
+    };
+    parse_meminfo(&std::fs::read_to_string(path).ok()?)
 }
 
 /// The startup line's speed note: what the link reads host blocks at, and what that costs.
