@@ -1217,7 +1217,14 @@ unsafe fn cuda_hc_post_norm(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
         };
         match code {
             0 => {}
-            e => return Err(format!("hc_post_norm: error {e}")),
+            e => {
+                let e = format!("hc_post_norm: error {e}");
+                if rs.is_some() {
+                    // The exchange's buffers stay held: no later exchange may wait on them.
+                    crate::tp_net::seq_par::fail_deferred(out, &e);
+                }
+                return Err(e);
+            }
         }
         if let Some(d) = down {
             // The converter ggml-cuda's cuBLAS matmul path dequantizes the weight with.

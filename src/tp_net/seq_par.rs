@@ -139,6 +139,15 @@ pub(crate) unsafe fn release_deferred(
     unsafe { super::op::cuda::release_deferred(&c, seq, stream) }
 }
 
+/// The reader of [`take_deferred`]'s sum could not run: its communicator fails with `e`, which
+/// releases every wait on the exchange's buffers.
+#[cfg(feature = "cuda")]
+pub(crate) fn fail_deferred(rs: &ffi::ggml_tensor, e: &str) {
+    if let Some(c) = super::comm(external_params(rs)[0]) {
+        c.fail(e.to_string());
+    }
+}
+
 /// Every rank's share of the columns of a `[row, cols]` tensor, from this rank's `x` (F32
 /// `[row, share]`): `[row, cols]`.
 pub fn all_gather<'a>(ctx: &'a Context, comm: i32, x: Tensor<'a>, cols: i64) -> Tensor<'a> {
