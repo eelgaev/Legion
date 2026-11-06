@@ -228,7 +228,7 @@ cargo build --release                          # CPU ggml
 CMAKE_CUDA_ARCHITECTURES=121 cargo build --release --features cuda  # GB10; 70 = V100
 ```
 
-Requirements: Rust (the version pinned in `rust-toolchain.toml`), cmake, a C/C++ compiler, and libclang (for bindgen); CUDA builds require nvcc.
+Requirements: Rust (the version pinned in `rust-toolchain.toml`), cmake, a C/C++ compiler, and libclang (for bindgen); CUDA builds require nvcc. V100 (sm_70) builds need CUDA 12.x (12.2+): CUDA 13 dropped sm_70.
 
 ## Run
 

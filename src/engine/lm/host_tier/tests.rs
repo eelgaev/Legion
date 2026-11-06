@@ -86,6 +86,15 @@ fn meminfo_parses() {
 }
 
 #[test]
+fn proc_meminfo_parses() {
+    // The whole host's file (`/proc/meminfo`): a GPU with no NUMA node.
+    let text = "MemTotal:       1000000 kB\nMemFree:        5000 kB\nMemAvailable:   9000 kB\n\
+                Active(file):   300 kB\nInactive(file): 200 kB\nDirty:          40 kB\n\
+                HugePages_Total:       0\n";
+    assert_eq!(parse_meminfo(text), mem(5460, 460, 1_000_000));
+}
+
+#[test]
 fn meminfo_counts_clean_page_cache() {
     let text = "Node 0 MemTotal:       263443456 kB\nNode 0 MemFree:        1000 kB\n\
                 Node 0 Active(file):   300 kB\nNode 0 Inactive(file): 200 kB\n\

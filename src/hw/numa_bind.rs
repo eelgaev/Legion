@@ -146,6 +146,10 @@ pub enum Plan {
     },
     /// Bind the process's CPUs and memory (`MPOL_BIND`) to `nodes`.
     Bind { nodes: Vec<u32>, cpus: Vec<u32> },
+    /// `--numa auto` on a discrete PCIe host ([`prefer_on_pcie`]): the process's CPUs bound to
+    /// `node`, its memory preferred there (`MPOL_PREFERRED`), so a model bigger than the
+    /// node's free memory spills to the other socket instead of failing to load.
+    Prefer { node: u32, cpus: Vec<u32> },
     /// GPUs on several nodes: each GPU's threads and pinned buffers on its own node; the rest
     /// first-touch (never interleaved).
     PerGpu { nodes: Vec<u32> },
@@ -234,6 +238,32 @@ pub fn plan(
         nodes,
         cpus: cpus.into_iter().collect(),
     })
+}
+
+/// `plan` for `--numa auto` on a host where binding memory to one node is the wrong default
+/// (`prefers`: [`crate::residency::fallback::numa_auto_prefers`], a discrete PCIe host): its
+/// one-node [`Plan::Bind`] becomes a [`Plan::Prefer`] of that node, the CPUs bound as before.
+/// Every other mode, plan or host keeps the plan as it is (an AC922 and the GB10 bind).
+pub fn prefer_on_pcie(plan: Plan, mode: &NumaMode, prefers: bool) -> Plan {
+    match plan {
+        Plan::Bind { nodes, cpus } if prefers && *mode == NumaMode::Auto && nodes.len() == 1 => {
+            Plan::Prefer {
+                node: nodes[0],
+                cpus,
+            }
+        }
+        plan => plan,
+    }
+}
+
+/// Whether `--numa auto` should prefer rather than bind memory on this host: only an x86 box
+/// is ever a discrete PCIe host here (an AC922 is POWER, Grace and the GB10 are Arm), so the
+/// others never ask NVML.
+fn auto_prefers() -> bool {
+    std::env::consts::ARCH == "x86_64"
+        && crate::residency::fallback::numa_auto_prefers(crate::residency::Platform::of(
+            &super::HardwareInfo::detect(),
+        ))
 }
 
 /// The outer restriction the process started under, if any: CPUs short of the machine's, a
@@ -328,8 +358,18 @@ impl Placement {
             Ok((topo, inherited)) => plan(&mode, topo, &gpus, inherited)?,
             Err(e) => Plan::Skip(format!("cannot read the NUMA topology: {e}")),
         };
+        let plan = match plan {
+            Plan::Bind { .. } if mode == NumaMode::Auto => {
+                prefer_on_pcie(plan, &mode, auto_prefers())
+            }
+            plan => plan,
+        };
         let error = match &plan {
             Plan::Bind { nodes, cpus } => bind_thread_memory(nodes)
+                .and_then(|()| set_process_affinity(cpus))
+                .err()
+                .map(|e| e.to_string()),
+            Plan::Prefer { node, cpus } => prefer_thread_memory(*node)
                 .and_then(|()| set_process_affinity(cpus))
                 .err()
                 .map(|e| e.to_string()),
@@ -361,6 +401,11 @@ impl Placement {
                 compress_cpulist(cpus),
                 node_list(nodes)
             ),
+            Plan::Prefer { node, cpus } => format!(
+                "--numa {mode}: CPUs {} bound to NUMA node {node}, memory preferred there (a \
+                 PCIe host: memory past the node's goes to the others)",
+                compress_cpulist(cpus)
+            ),
             Plan::PerGpu { nodes } => format!(
                 "--numa {mode}: GPUs on NUMA nodes {}: each GPU's threads and pinned host \
                  buffers on its own node, the rest first-touch",
@@ -374,7 +419,7 @@ impl Placement {
         let mut lines = vec![self.summary()];
         if matches!(
             self.plan,
-            Plan::Bind { .. } | Plan::PerGpu { .. } | Plan::Outer { .. }
+            Plan::Bind { .. } | Plan::Prefer { .. } | Plan::PerGpu { .. } | Plan::Outer { .. }
         ) {
             for (i, gpu) in self.gpus.iter().enumerate() {
                 let node = gpu.map_or_else(|| "unknown".into(), |g| g.to_string());
@@ -385,6 +430,12 @@ impl Placement {
                     (Plan::Bind { nodes, .. }, _) => format!(
                         "pinned buffers on its node, other host memory on node {}",
                         node_list(nodes)
+                    ),
+                    (Plan::Prefer { node, .. }, Some(g)) if node == g => {
+                        format!("host buffers on node {g}")
+                    }
+                    (Plan::Prefer { node, .. }, _) => format!(
+                        "pinned buffers on its node, other host memory preferably on node {node}"
                     ),
                     (Plan::PerGpu { .. }, Some(g)) => format!("its host buffers on node {g}"),
                     (
@@ -413,6 +464,11 @@ impl Placement {
                      what it reads from there crosses the socket",
                     self.mode,
                     node_list(nodes)
+                )),
+                Plan::Prefer { node, .. } if node != g => out.push(format!(
+                    "CUDA{i} is on NUMA node {g} but --numa {} prefers host memory on node \
+                     {node}: what it reads from there crosses the socket",
+                    self.mode
                 )),
                 Plan::Outer {
                     cpu_nodes,
@@ -520,6 +576,26 @@ pub fn bind_thread_memory(nodes: &[u32]) -> io::Result<()> {
         libc::syscall(
             libc::SYS_set_mempolicy,
             MPOL_BIND as libc::c_long,
+            mask.as_ptr(),
+            (MASK_BITS + 1) as libc::c_ulong,
+        )
+    };
+    if r != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Prefers `node` for the calling thread's future allocations (and those of the threads it
+/// starts), falling back to the other nodes when it is full (`MPOL_PREFERRED`), as
+/// `numactl --preferred` does.
+pub fn prefer_thread_memory(node: u32) -> io::Result<()> {
+    let mask = node_mask(&[node])?;
+    // SAFETY: as `bind_thread_memory`.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_set_mempolicy,
+            MPOL_PREFERRED as libc::c_long,
             mask.as_ptr(),
             (MASK_BITS + 1) as libc::c_ulong,
         )

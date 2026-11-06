@@ -350,6 +350,9 @@ pub struct Model {
     /// small steps' router ops; made at load ([`Self::prepare_router_bf16`]) or by the first
     /// graph that asks. Each copy is checked against the router it was made from on use.
     router_bf16: std::cell::OnceCell<Option<router_bf16::RouterBf16>>,
+    /// Host memory of the weights pinned for GPUs that cannot read pageable memory
+    /// ([`Self::keep_host_pins`]). Before the weights, so it is released while they are mapped.
+    host_pins: Option<Box<dyn std::any::Any + Send + Sync>>,
     pub hp: Hparams,
     pub(crate) weights: Weights,
     /// An MTP head loaded from a GGUF of its own ([`Self::load_mtp`]).
@@ -1435,6 +1438,7 @@ impl Model {
             ssd: None,
             joined: Default::default(),
             router_bf16: Default::default(),
+            host_pins: None,
             hp,
             weights,
             mtp: None,
@@ -1484,6 +1488,7 @@ impl Model {
             ssd: None,
             joined: Default::default(),
             router_bf16: Default::default(),
+            host_pins: None,
             hp,
             weights,
             mtp: None,
@@ -1643,6 +1648,12 @@ impl Model {
     /// `--spec-draft-vocab`).
     pub fn set_draft_vocab(&mut self, n: usize) {
         self.draft_vocab = n;
+    }
+
+    /// Keeps `pins` (host memory of the weights registered for the GPUs to read) for as long as
+    /// the model: it is released before the weights' memory.
+    pub fn keep_host_pins(&mut self, pins: Box<dyn std::any::Any + Send + Sync>) {
+        self.host_pins = Some(pins);
     }
 
     /// The MTP head's attention from now on: over the last `n` positions only (0: all; see

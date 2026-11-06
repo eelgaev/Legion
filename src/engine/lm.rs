@@ -84,6 +84,7 @@ use crate::model::core::{
     SpecPool, StatePool,
 };
 use crate::residency::ExpertMode;
+use crate::residency::fallback::known_node;
 use crate::spec::accept;
 use crate::spec::{Draft, DraftRequest, SeqId, SpecConfig, SpecCounters, TargetInfo, TokenDrafter};
 use crate::tokenizer::Tokenizer;
@@ -2087,14 +2088,15 @@ fn tier_for(
     stage_blocks: usize,
 ) -> Result<crate::model::core::KvTier, String> {
     let caps = crate::residency::cuda::caps(device).ok_or("cannot query the GPU")?;
-    if !caps.host_numa_vmm || caps.host_numa_id < 0 {
+    // A GPU with no host NUMA node: host memory of no node (`Caps::host_node`).
+    let Some(node) = caps.host_node.filter(|_| caps.host_numa_vmm) else {
         return Err(format!(
             "--kv-host-tokens: CUDA{device}'s driver cannot map host NUMA memory (cuMemCreate)"
         ));
-    }
+    };
     Ok(crate::model::core::KvTier {
         device,
-        node: caps.host_numa_id as u32,
+        node,
         hbm_blocks,
         stage_blocks,
         split: None,
@@ -2233,7 +2235,7 @@ fn pair_ranks_on(pair: Option<&tp_pair::TpPairRank>, node: u32) -> u64 {
 #[cfg(feature = "cuda")]
 fn tier_node(device: usize) -> Option<u32> {
     let caps = crate::residency::cuda::caps(device)?;
-    (caps.host_numa_vmm && caps.host_numa_id >= 0).then_some(caps.host_numa_id as u32)
+    caps.host_node.filter(|_| caps.host_numa_vmm)
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -2269,7 +2271,7 @@ fn ring_save_bufts(layout: &layout::Layout) -> Vec<crate::ggml::BufferType> {
     let pinned = |devs: Vec<usize>| {
         let node = (devs.first().copied())
             .and_then(crate::residency::cuda::caps)
-            .map(|c| c.host_numa_id.max(0) as u32);
+            .map(|c| c.host_node.unwrap_or(c.host_numa_id.max(0) as u32));
         node.and_then(|n| crate::residency::cuda::host_arena(n, &devs).ok())
             .unwrap_or(layout.host)
     };
@@ -2300,8 +2302,9 @@ fn ring_save_free(layout: &layout::Layout) -> Option<u64> {
     let dev = (layout.tp_devices.first().copied())
         .or_else(|| layout.stages.first().and_then(|(d, _)| *d))
         .and_then(cuda_index)?;
-    let node = crate::residency::cuda::caps(dev)?.host_numa_id;
-    host_tier::node_memory(u32::try_from(node).ok()?).map(|m| m.free)
+    let caps = crate::residency::cuda::caps(dev)?;
+    let node = u32::try_from(caps.host_numa_id).ok().or(caps.host_node)?;
+    host_tier::node_memory(node).map(|m| m.free)
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -2466,6 +2469,114 @@ pub(crate) fn use_rings(hp: &crate::model::core::Hparams, cfg: &LmConfig, paged:
         && prefixes_kept
 }
 
+/// The CUDA indices of the layout's GPUs: its stages', or under tensor parallelism the meta
+/// device's.
+#[cfg(feature = "cuda")]
+fn layout_cuda(layout: &layout::Layout) -> Vec<usize> {
+    let mut out: Vec<usize> = (layout.stages.iter().filter_map(|(d, _)| *d))
+        .chain(layout.tp_devices.iter().copied())
+        .filter_map(cuda_index)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Routed experts the GPUs read in place from plain host memory (the model file's mapping or a
+/// CPU buffer, with no pinned expert arena): where every GPU reads pageable memory (an AC922's
+/// ATS, the GB10, HMM), nothing to do, as before; else the expert ranges are registered with
+/// the driver for the GPUs to read at the same addresses ([`fallback::host_expert_read`]),
+/// kept with the model, or the load stops with what to do instead.
+#[cfg(feature = "cuda")]
+fn register_host_experts(model: &mut Model, layout: &layout::Layout) -> Result<(), LoadError> {
+    use crate::residency::fallback::{self, HostExpertRead};
+    let gpus = layout_cuda(layout);
+    let caps: Vec<_> = gpus
+        .iter()
+        .filter_map(|&d| crate::residency::cuda::caps(d))
+        .collect();
+    if caps.is_empty() || caps.len() < gpus.len() {
+        return Ok(());
+    }
+    let read = fallback::host_expert_read(
+        caps.iter().all(|c| c.pageable_access),
+        // The kernels take the tensors' host pointers: the registered memory must be read there.
+        caps.iter()
+            .all(|c| c.host_register && c.host_pointer_registered),
+        caps.iter().all(|c| c.read_only_register),
+    );
+    if read == HostExpertRead::InPlace {
+        return Ok(());
+    }
+    // The routed experts in host memory outside a pinned arena, with the padding past their
+    // last row the kernels read ([`crate::ggml::mapped_tail_padding`]).
+    let host_experts = |w: &crate::weights::Weights| -> Vec<(usize, usize)> {
+        w.tensors()
+            .filter(|&t| {
+                t.name().contains("_exps.")
+                    && t.is_host()
+                    && crate::residency::arena_node_of(t).is_none()
+            })
+            .map(|t| {
+                // SAFETY: reading the data pointer and the live buffer of an allocated host
+                // tensor.
+                let (p, end) = unsafe {
+                    let buf = (*t.raw()).buffer;
+                    let base = crate::ggml::ffi::ggml_backend_buffer_get_base(buf) as usize;
+                    let size = crate::ggml::ffi::ggml_backend_buffer_get_size(buf);
+                    ((*t.raw()).data as usize, base + size)
+                };
+                // Never past the buffer (a mapped file's tensors keep their padding inside it).
+                let pad = crate::ggml::mapped_tail_padding(t.ty(), t.ne()[0]);
+                (p, (t.nbytes() + pad).min(end.saturating_sub(p)))
+            })
+            .filter(|&(p, n)| p != 0 && n > 0)
+            .collect()
+    };
+    let mut ranges = host_experts(model.weights());
+    if let Some(w) = model.mtp_weights() {
+        ranges.extend(host_experts(w));
+    }
+    if ranges.is_empty() {
+        return Ok(());
+    }
+    let gib = ranges.iter().map(|r| r.1).sum::<usize>() as f64 / (1u64 << 30) as f64;
+    let stop = |why: &str| {
+        LoadError::Device(format!(
+            "{gib:.1} GiB of routed experts are in host memory, and {why}: fit them in VRAM \
+             (--experts device, with more GPUs or a smaller quant), or run on a driver and kernel \
+             with HMM (pageable memory access)"
+        ))
+    };
+    let read_only = match read {
+        HostExpertRead::InPlace => return Ok(()),
+        HostExpertRead::Refuse(why) => return Err(stop(why)),
+        HostExpertRead::Register { read_only } => read_only,
+    };
+    let start = Instant::now();
+    let pins = crate::residency::cuda::register_host(gpus[0], &ranges, read_only)
+        .map_err(|e| stop(&format!("registering them with the driver failed ({e})")))?;
+    tracing::info!(
+        gib,
+        read_only,
+        seconds = start.elapsed().as_secs_f64(),
+        "routed experts in host memory: the GPUs cannot read pageable memory (no ATS or HMM), \
+         so they are registered with the driver (cuMemHostRegister) and read in place through it{}",
+        if read_only {
+            ""
+        } else {
+            " (not read-only on this driver: the mapped file's pages are copied as they pin)"
+        }
+    );
+    model.keep_host_pins(Box::new(pins));
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+fn register_host_experts(_: &mut Model, _: &layout::Layout) -> Result<(), LoadError> {
+    Ok(())
+}
+
 /// The host arenas for the routed experts of a model on CUDA0..`n_gpus`, one per stage: pinned
 /// memory on the stage GPU's NUMA node, readable by every GPU of that node (`(buffer type,
 /// node)`), so each GPU reads its own layers' experts from its own socket's memory. Without
@@ -2480,7 +2591,12 @@ fn expert_arenas(
     #[cfg(feature = "cuda")]
     {
         let nodes: Vec<u32> = (0..n_gpus.max(1))
-            .map(|d| crate::residency::cuda::caps(d).map_or(0, |c| c.host_numa_id.max(0) as u32))
+            .map(|d| {
+                crate::residency::cuda::caps(d).map_or(0, |c| {
+                    // No host NUMA node: host memory of no node (`Caps::host_node`).
+                    c.host_node.unwrap_or(c.host_numa_id.max(0) as u32)
+                })
+            })
             .collect();
         // Expert parallelism (`--glm-parallel-decode`): one arena every GPU maps, each expert
         // on the node of the GPU that owns it.
@@ -2762,7 +2878,7 @@ fn open_lookup_table(
     let node = layout
         .arenas
         .as_ref()
-        .and_then(|a| a.first().map(|(_, n)| *n));
+        .and_then(|a| a.first().and_then(|&(_, n)| known_node(n)));
     let gpu = layout.stages[0].0;
     #[cfg(feature = "cuda")]
     let node = node.or_else(|| {
@@ -2982,7 +3098,7 @@ fn build_expert_cache(
             peer::set_auto(false);
         }
         if cfg.stage_peer && ep_cuda.is_none() {
-            stage_peers(&r, &nodes);
+            stage_peers(&r, &nodes)?;
         }
     }
     exec.set_experts(Some(r));
@@ -3063,10 +3179,31 @@ fn connect_peers(r: &crate::residency::experts::ExpertResidency, nodes: &[Option
 /// its host experts and writes into its staged ranges, so a prompt's staging copies split over
 /// both GPUs' links while the pair is idle ([`crate::residency::staging`]). As Project Maya's
 /// two-GPU prefill staging (mw00/project-maya, MIT). Must run before the cache is first lent.
+/// Every peer must reach its GPU's memory (`cuDeviceCanAccessPeer`): a pair without peer access
+/// (two PCIe GPUs on different root complexes) stops the load with a clear error rather than
+/// faulting in the first prompt's staging.
 #[cfg(feature = "cuda")]
-fn stage_peers(r: &crate::residency::experts::ExpertResidency, nodes: &[Option<u32>]) {
+fn stage_peers(
+    r: &crate::residency::experts::ExpertResidency,
+    nodes: &[Option<u32>],
+) -> Result<(), LoadError> {
     use crate::model::core::expert_mv::peer;
-    for (device, p) in peer::pairs(nodes).into_iter().enumerate() {
+    let pairs = peer::pairs(nodes);
+    let missing = crate::residency::fallback::missing_peer_access(
+        &pairs,
+        crate::model::core::pair::link::can_access,
+    );
+    if !missing.is_empty() {
+        let list: Vec<String> = (missing.iter())
+            .map(|(p, d)| format!("CUDA{p} cannot access CUDA{d}'s memory"))
+            .collect();
+        return Err(LoadError::Device(format!(
+            "--prefill-peer-stage needs peer access between the paired GPUs, and {} (no peer \
+             access between them): drop --prefill-peer-stage",
+            list.join(", ")
+        )));
+    }
+    for (device, p) in pairs.into_iter().enumerate() {
         let Some(p) = p else {
             tracing::warn!(
                 device,
@@ -3082,6 +3219,7 @@ fn stage_peers(r: &crate::residency::experts::ExpertResidency, nodes: &[Option<u
             Err(e) => tracing::warn!(device, peer = p, error = %e, "prefill peer staging: no peer"),
         }
     }
+    Ok(())
 }
 
 /// What [`load_report`] takes from [`LmEngine::load`]'s own decisions.
@@ -3209,7 +3347,7 @@ fn load_report(
                 a.get(si).map(|&(_, node)| node)
             });
             match arena {
-                Some(node) => add_host(&mut host, Some(node), HostUse::ExpertArena, bytes),
+                Some(node) => add_host(&mut host, known_node(node), HostUse::ExpertArena, bytes),
                 None => add_host(&mut host, None, HostUse::MappedExperts, bytes),
             }
         } else if layout.shared_host.is_some()
@@ -3241,10 +3379,11 @@ fn load_report(
     if host_blocks > 0 {
         for (si, node) in f.tier_nodes.iter().enumerate() {
             let bytes = (host_blocks * kv.get(si).map_or(0, |k| k.0)) as u64;
-            add_host(&mut host, *node, HostUse::KvHostTier, bytes);
+            let node = node.and_then(known_node);
+            add_host(&mut host, node, HostUse::KvHostTier, bytes);
             if let Some(h) = host
                 .iter_mut()
-                .find(|h| h.node == *node && h.kind == HostUse::KvHostTier)
+                .find(|h| h.node == node && h.kind == HostUse::KvHostTier)
             {
                 h.tokens = Some(host_blocks * KV_BLOCK);
             }
@@ -3734,6 +3873,10 @@ impl LmEngine {
             if drop_cache {
                 head.release_page_cache();
             }
+        }
+        // GPUs that cannot read pageable memory: their experts in host memory registered.
+        if device.is_some() {
+            register_host_experts(&mut model, &layout)?;
         }
         // The MoE routers' BF16 copies (#836) before the caches take the memory left.
         model.prepare_router_bf16();

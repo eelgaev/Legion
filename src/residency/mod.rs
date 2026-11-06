@@ -33,6 +33,7 @@ pub mod cuda;
 pub mod ep_balance;
 pub mod ep_prefetch;
 pub mod experts;
+pub mod fallback;
 pub mod kv_vmm;
 pub mod miss_split;
 pub mod split;
@@ -495,15 +496,20 @@ impl MemoryModel {
         let n = crate::ggml::cuda_device_count();
         let mut m = Self::nominal(Platform::of(hw), Some(hw), n);
         for d in &mut m.devices {
+            // Where the probe's host arena goes: the GPU's node; with none, the node the host
+            // allocators use for it (`Caps::host_node`).
+            let mut arena_node = None;
             if let Some(c) = cuda::caps(d.device) {
                 d.host_vmm = c.host_numa_vmm;
                 if c.host_numa_id >= 0 {
                     d.numa_node = Some(c.host_numa_id as u32);
                 }
+                arena_node = c.host_node;
             }
+            let node = d.numa_node.or(arena_node).unwrap_or(0);
             if probe
                 && d.host_vmm
-                && let Some(p) = experts::probe_device(d.device, d.numa_node.unwrap_or(0))
+                && let Some(p) = experts::probe_device(d.device, node)
             {
                 d.link.in_place_gbs = p.in_place_gbs;
                 d.link.copy_gbs = p.copy_gbs;

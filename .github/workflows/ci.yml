@@ -89,3 +89,34 @@ jobs:
           } > "$shim/bits/mathcalls.h"
           export NVCC_PREPEND_FLAGS="-isystem $shim"
           cargo build --release --features cuda
+  x86-cuda12-sm70:
+    # An x86 box with V100s (sm_70) on PCIe: CUDA 13 dropped sm_70, so such a build needs CUDA
+    # 12.x. GitHub's hosted x86_64 runner in the CUDA 12.4.1 devel image (no GPU): compiles and
+    # links the CUDA build for sm_70 only, never runs it.
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.4.1-devel-ubuntu22.04
+    timeout-minutes: 120
+    env:
+      CUDA_PATH: /usr/local/cuda
+      CMAKE_CUDA_ARCHITECTURES: "70"
+      LIBRARY_PATH: /usr/local/cuda/lib64/stubs
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates curl cmake \
+            build-essential pkg-config clang libclang-dev
+      - uses: actions/checkout@v5
+      - name: ggml submodule
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git submodule update --init --depth 1 third_party/ggml
+      - name: rust toolchain
+        run: |
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: release build with --features cuda (sm_70)
+        run: |
+          export PATH=/usr/local/cuda/bin:$PATH
+          cargo build --release --features cuda

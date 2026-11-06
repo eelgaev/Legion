@@ -278,8 +278,9 @@ impl Weights {
             let mut t = self
                 .get(&info.name)
                 .expect("every tensor was created above");
-            // A host arena on a NUMA node is filled by that node's CPUs.
-            let node = crate::residency::arena_node(self.groups[self.by_name[&info.name].0].buft);
+            // A host arena on a NUMA node is filled by that node's CPUs (one of no node, by any).
+            let node = crate::residency::arena_node(self.groups[self.by_name[&info.name].0].buft)
+                .and_then(crate::residency::fallback::known_node);
             assert_eq!(
                 info.size as usize,
                 t.nbytes(),
@@ -360,7 +361,7 @@ impl Weights {
                                 offset: p.offset + (r.start - at) as u64,
                                 len: r.len() as u64,
                                 dest: Dest::Host(head),
-                                node,
+                                node: node.and_then(crate::residency::fallback::known_node),
                             });
                         }
                         at += len;
