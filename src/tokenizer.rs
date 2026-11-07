@@ -73,6 +73,11 @@ const RE_LLAMA3: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[d
 // that llama.cpp adapts for its own regex engine (the two agree on ASCII text).
 const RE_GPT4O: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+// Source: same place (LLAMA_VOCAB_PRE_TYPE_TEKKEN), the regex of the original tokenizer.json
+// that llama.cpp adapts for its own regex engine (the two agree on ASCII text): single digits,
+// words split before capitals. Nemotron 3.5 Bolt 74B-A9B's GGUF names it `tekken`.
+const RE_TEKKEN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
 // Source: same place (LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM), three expressions applied one after
 // the other; the same three `Split` steps are in DeepSeek-V4.1-Flash's tokenizer.json, whose
 // GGUF names its pre-tokenizer `joyai-llm`. The last one is `RE_DEEPSEEK3`, the two before it
@@ -101,6 +106,7 @@ fn pre_regex(pre: &str) -> Option<(&'static str, bool)> {
         | "jina-v5-nano" | "glm4" | "glm5" => Some((RE_LLAMA3, true)),
         // Muse Glimmer's tokenizer is `llama4`.
         "gpt-4o" | "llama4" | "kanana2" | "talkie" => Some((RE_GPT4O, false)),
+        "tekken" => Some((RE_TEKKEN, true)),
         // The last of three expressions (`pre_splits`).
         "deepseek-v3" | "joyai-llm" => Some((RE_DEEPSEEK3, false)),
         _ => None,

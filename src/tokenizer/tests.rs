@@ -47,6 +47,40 @@ fn gpt4o_pre_tokens() {
     assert_eq!(split("CamelCase"), ["Camel", "Case"]);
 }
 
+/// The `tekken` pre-tokenizer (Nemotron 3.5 Bolt 74B-A9B's): case runs split, single digits,
+/// `/` kept with the punctuation before it, merges skipped for whole-vocabulary pieces.
+#[test]
+fn tekken_pre_tokens() {
+    let (re, ignore_merges) = pre_regex("tekken").unwrap();
+    assert!(ignore_merges);
+    let re = Regex::new(re).unwrap();
+    let split = |t: &str| -> Vec<String> {
+        re.find_iter(t)
+            .map(|m| m.unwrap().as_str().to_string())
+            .collect()
+    };
+    assert_eq!(
+        split("Hello WORLDwide, it's 12345 cases.//\n\nOK"),
+        [
+            "Hello",
+            " WORLDwide",
+            ",",
+            " it",
+            "'s",
+            " ",
+            "1",
+            "2",
+            "3",
+            "4",
+            "5",
+            " cases",
+            ".//\n\n",
+            "OK"
+        ]
+    );
+    assert_eq!(split("CamelCase"), ["Camel", "Case"]);
+}
+
 /// The `deepseek-v3` / `joyai-llm` pre-tokenizer: digits by three, CJK runs, then the third
 /// expression on each piece on its own. The expected pieces are what the `tokenizers` library
 /// gives with DeepSeek-V4.1-Flash's tokenizer.json (its three `Split` steps).
