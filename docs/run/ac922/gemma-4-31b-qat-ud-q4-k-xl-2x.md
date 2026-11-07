@@ -41,6 +41,10 @@ The README row is the MTP command.
 - The cache lives in a KV host tier in pinned memory on the GPUs' NUMA node, backed as the sequences grow.
   Part of the sliding-window rings is in host memory too.
   The ring the MTP assistant reads in every draft pass is always one of those kept in VRAM.
+- With `--max-seqs 4` the four slots don't fit in VRAM either, but the VRAM left past the rings does hold
+  about 49K tokens (`shared_device_tokens` in the startup log). The slots share it in 4096-token chunks,
+  the running sequence first: one user at 32K reads its whole context from VRAM, at 64K three quarters of it.
+  A finished (warm) sequence's chunks move to the host tier when a running one needs them.
 - llama.cpp's `-np 16 -kvu -c 262144` (see [other engines](../other-engines.md)) is 262,144 tokens in all, shared by its 16 slots.
 - Prompt steps copy each sequence's host-tier keys and values into GPU memory once per layer before attention.
   This happens for contexts up to the length whose copy fits in the compute buffers: 150,720 tokens here

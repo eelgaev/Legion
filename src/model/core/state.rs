@@ -713,6 +713,30 @@ impl KvPool {
             .sum()
     }
 
+    /// Bytes per cell of each tensor [`Self::bytes_per_block`] counts (every non-ring layer's
+    /// K, V and indexer keys), over all the devices a tensor-parallel cache splits it on.
+    pub fn cell_tensor_bytes(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        for (il, d) in self.dims.iter().enumerate() {
+            let Some((_, row)) = d.filter(|_| !self.ring_layers[il]) else {
+                continue;
+            };
+            let (dim, row) = (self.dims(il).0 as usize, row as usize);
+            match self.compact[il] {
+                0 if self.k_only[il] => out.push(self.types.k.bytes(dim, row)),
+                0 => {
+                    out.push(self.types.k.bytes(dim, row));
+                    out.push(self.types.v.bytes(dim, row));
+                }
+                r => out.push(self.types.v.bytes(dim + r as usize, row)),
+            }
+            if self.ctx.tensor(&format!("cache_idx-{il}")).is_some() {
+                out.push(2 * self.idx_dim as usize * 2);
+            }
+        }
+        out
+    }
+
     /// Bytes per cell of layer `il`'s own K and V (`row` values each, K only for a K-only
     /// layer, or a compact layer's granules).
     fn cell_bytes(&self, il: usize, row: usize) -> usize {
