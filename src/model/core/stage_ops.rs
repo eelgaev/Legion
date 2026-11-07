@@ -91,6 +91,21 @@ pub(crate) const PURE: &[&str] = &[
     // device-global scratch, the grid from the device's occupancy (fixed per kernel).
     "nvfp4_once",
     "nvfp4_once_glu",
+    // The W4A4 NVFP4 ops (`super::super::nvfp4_a4`, #1202): the activations' quantization into
+    // the node's own scratch, the expert plan (as `nvfp4_mm_id`'s), then the GEMM, matvec or
+    // combine, kernels and tiles picked by the shapes, the weights' alignment and settings
+    // fixed at startup; the TMA tile's tensor maps are encoded on the host from the node's
+    // pointers and passed as kernel parameters. They run for batches over 64 tokens under
+    // `--nvfp4-a4 prefill` (a 16-user verify step), from 9 under `experts-decode`; left out,
+    // each one cut such a step's capture in two. Their launchers must stay free of host waits
+    // and allocations (see `nvfp4_a4.cu`).
+    "nvfp4_a4_mm",
+    "nvfp4_a4_mm_multi",
+    "nvfp4_a4_mm_id",
+    "nvfp4_a4_mm_id_weighted",
+    "nvfp4_a4_swiglu",
+    "nvfp4_a4_swiglu_id",
+    "nvfp4_a4_quant",
     // Paged attention and the KV writes.
     "paged_attn",
     "norm_rope",
