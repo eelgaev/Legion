@@ -55,7 +55,11 @@ Since prompt steps read back only the hidden-state rows DFlash takes in (2026-11
 1,189 there.
 With the FP8 prompt-step GEMMs fed by TMA (2026-11-06, the same output): 8K 2,361 and 32K 1,989 tok/s, against
 2,320 / 1,973 from the build before in the same session; 123K 1,226 against 1,221 (median of three servers each).
-1 and 4 users decoded at 33.8 (same 1-user text) and 95.4. Greedy text at 8 or more users changes (other
+1 and 4 users decoded at 33.8 (same 1-user text) and 95.4.
+With the NVFP4 prompt-step GEMMs fed by TMA as well (2026-11-07, the same output): 8K 2,518 and 32K 2,097 tok/s,
+against 2,370 / 2,013 from the build before in the same session; 123K 1,268 against 1,245. 16 users decoded at
+226.1 tok/s total against 228.3 there (mean accepted length 3.41 against 3.49: at 8 or more users the drafts follow
+the requests' arrival timing). Greedy text at 8 or more users changes (other
 drafts, other verify shapes), and so does a prompt longer than 4,096 tokens (other step sums). Below 8 users,
 and for prompts up to 4,096 tokens, the output is the same as without the flags.
 

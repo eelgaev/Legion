@@ -107,7 +107,7 @@ off. llama.cpp runs across two DGX Sparks with its RPC backend (layer split).
 |---|---|---|---|--:|--:|--:|--:|--:|--:|
 | DGX Spark | Legion | [UD-Q4_K_XL GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) | MTP ⁹ | **23-40** | **80.1** | **121.7** | **880** | **822** | 652 |
 | DGX Spark | llama.cpp b12062 | UD-Q4_K_XL GGUF | MTP n=3 | 22-31 | 61.4 | 108.3 | 821 | 795 | — |
-| DGX Spark | Legion | [NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) | DFlash 2 ⁹ | **23-51** | **97.0** | **229.5** | 2,361 | 1,989 | 1,226 |
+| DGX Spark | Legion | [NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) | DFlash 2 ⁹ | **23-51** | **97.0** | **229.5** | 2,518 | 2,097 | 1,268 |
 | DGX Spark | vLLM 0.33.0 | NVFP4 | DFlash 2 | 20-45 | 84.2 | 193.1 | 2,548 | 2,140 | — |
 | AC922, 2x V100 | Legion | UD-Q4_K_XL GGUF | MTP ⁹ | 58-79 | **122.1** | **194.6** | **1,375** | **1,023** | **509** |
 | AC922, 2x V100 | llama.cpp b12062 | UD-Q4_K_XL GGUF | MTP n=3 | 63-85 | 105.4 | 148.6 | 807 | 732 | 500 |
