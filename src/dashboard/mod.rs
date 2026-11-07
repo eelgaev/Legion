@@ -7,11 +7,13 @@
 //! - [`latency`]: TTFT and inter-token percentiles over five minutes, lock-free.
 //! - [`logs`]: the in-memory ring of the last 2,000 log lines.
 //! - [`scale`]: each gauge's full scale from what the hardware reports.
-//! - [`speedo`]: the speedometer widget; [`ui`]: the layout and panels.
+//! - [`gauge`]: the link gauges (`LineGauge`); [`speedo`]: the memory speedometer.
+//! - [`ui`]: the layout and panels.
 //! - [`term`]: the terminal (raw mode, restore on exit, error and panic) and the key loop.
 //! - [`client`]: `legion top`'s HTTP client (SSE, reconnect with backoff).
 
 pub mod client;
+pub mod gauge;
 pub mod hub;
 pub mod latency;
 pub mod logs;

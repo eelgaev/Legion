@@ -11,6 +11,7 @@ use ratatui::layout::Rect;
 use tracing::Level;
 
 use super::client::{base_url, next_backoff, push_utf8, take_events};
+use super::gauge::{self, LEVELS, LinkGauge, MIN_BAR, load_color};
 use super::latency::{BUCKETS, LatencyWindow, bucket, bucket_end, quantile};
 use super::logs::{CAPACITY, LogLine, LogRing, kept, level_rank};
 use super::scale::*;
@@ -141,46 +142,214 @@ fn gb_figures_are_short() {
     assert_eq!(gb(450.2), "450");
 }
 
+fn line_text(l: &ratatui::text::Line) -> String {
+    l.spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
 #[test]
-fn bar_lines_show_what_a_dial_has() {
+fn bar_lines_show_what_a_memory_dial_has() {
     let d = Speedo {
-        title: "GPU0 PCIe".into(),
-        full_scale: Some(31.5),
-        tx: Some(3.0),
-        rx: Some(6.0),
-        legion: Some(5.0),
-        peak_tx: Some(4.0),
-        peak_rx: Some(7.0),
-        tx_label: "TX",
-        rx_label: "RX",
-        note: Some("PCIe 4.0 x16".into()),
+        title: "GPU0 memory (GPM)".into(),
+        full_scale: Some(273.0),
+        measured: Some(163.8),
+        legion: 120.0,
+        note: None,
     };
-    let text: Vec<String> = d
-        .bar_lines(40)
-        .iter()
-        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-        .collect();
-    assert_eq!(text.len(), 4);
-    assert!(text[0].starts_with("TX") && text[0].ends_with("3.00"));
-    assert!(text[1].starts_with("RX") && text[1].ends_with("6.00"));
-    assert!(text[2].starts_with('L') && text[2].ends_with("5.00"));
-    assert_eq!(text[3], "/31.5 GB/s pk 4.00/7.00 PCIe 4.0 x16");
-    // A memory dial: one measured value, no RX row.
+    let text: Vec<String> = d.bar_lines(40).iter().map(line_text).collect();
+    assert_eq!(text.len(), 3);
+    assert!(text[0].starts_with("meas") && text[0].ends_with("164"));
+    assert!(text[1].starts_with('L') && text[1].ends_with("120"));
+    assert_eq!(text[2], "/273 GB/s");
+    // Unified memory without GPM: Legion's bytes only.
     let m = Speedo {
-        rx: None,
-        rx_label: "",
-        tx_label: "meas",
+        measured: None,
         full_scale: None,
+        note: Some("no GPM".into()),
         ..d
     };
-    let text: Vec<String> = m
-        .bar_lines(40)
-        .iter()
-        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+    let text: Vec<String> = m.bar_lines(40).iter().map(line_text).collect();
+    assert_eq!(text.len(), 2);
+    assert!(text[0].starts_with('L'));
+    assert_eq!(text[1], "full scale n/a no GPM");
+}
+
+fn nvlink_cpu(rx: Option<f64>, tx: Option<f64>) -> LinkGauge {
+    LinkGauge {
+        name: "GPU0 NVLink CPU".into(),
+        short: "GPU0 CPU".into(),
+        full_scale: Some(75.0),
+        rx,
+        tx,
+        legion: Some(12.1),
+        peak: Some(20.0),
+        why: (rx.is_none() && tx.is_none()).then(|| "no NVML counter".into()),
+        detail: Some("3 links NVLink 2".into()),
+    }
+}
+
+#[test]
+fn a_link_gauge_fills_to_the_busier_direction_and_colours_by_load() {
+    let g = nvlink_cpu(Some(14.5), Some(3.2));
+    assert!(close(g.value().unwrap(), 14.5));
+    assert!(close(g.ratio(), 14.5 / 75.0));
+    assert!(close(nvlink_cpu(Some(1.0), Some(30.0)).ratio(), 0.4));
+    // Over the full scale clamps; no counter falls back to Legion's bytes.
+    assert_eq!(nvlink_cpu(Some(100.0), Some(1.0)).ratio(), 1.0);
+    assert!(close(nvlink_cpu(None, None).ratio(), 12.1 / 75.0));
+    // Nothing to show, no full scale, or NaN: an empty bar, never a panic in LineGauge.
+    let empty = LinkGauge {
+        legion: None,
+        ..nvlink_cpu(None, None)
+    };
+    assert_eq!(empty.value(), None);
+    assert_eq!(empty.ratio(), 0.0);
+    let unscaled = LinkGauge {
+        full_scale: None,
+        ..g.clone()
+    };
+    assert_eq!(unscaled.ratio(), 0.0);
+    assert_eq!(nvlink_cpu(Some(f64::NAN), None).ratio(), 0.0);
+    assert_eq!(
+        LinkGauge {
+            full_scale: Some(0.0),
+            ..g
+        }
+        .ratio(),
+        0.0
+    );
+    assert_eq!(load_color(0.0, true), ratatui::style::Color::Green);
+    assert_eq!(load_color(0.59, true), ratatui::style::Color::Green);
+    assert_eq!(load_color(0.6, true), ratatui::style::Color::Yellow);
+    assert_eq!(load_color(0.84, true), ratatui::style::Color::Yellow);
+    assert_eq!(load_color(0.85, true), ratatui::style::Color::Red);
+    assert_eq!(load_color(1.0, true), ratatui::style::Color::Red);
+    assert_eq!(load_color(0.9, false), ratatui::style::Color::DarkGray);
+}
+
+#[test]
+fn link_labels_get_shorter_level_by_level() {
+    let g = nvlink_cpu(Some(14.5), Some(3.2));
+    let text: Vec<String> = (0..LEVELS).map(|l| line_text(&g.label(l))).collect();
+    assert_eq!(
+        text[0],
+        "GPU0 NVLink CPU  RX 14.5  TX 3.20  / 75.0 GB/s  pk 20.0  Legion 12.1  3 links NVLink 2"
+    );
+    assert_eq!(
+        text[1],
+        "GPU0 NVLink CPU  RX 14.5  TX 3.20  / 75.0 GB/s  pk 20.0  Legion 12.1"
+    );
+    assert_eq!(
+        text[2],
+        "GPU0 NVLink CPU  RX 14.5  TX 3.20  / 75.0 GB/s  Legion 12.1"
+    );
+    assert_eq!(text[3], "GPU0 CPU RX 14.5 TX 3.20 / 75.0 GB/s L 12.1");
+    assert_eq!(text[4], "GPU0 CPU RX 14.5 TX 3.20 /75.0 L 12.1");
+    assert_eq!(text[5], "GPU0 CPU RX 14.5 TX 3.20 L 12.1");
+    for w in text.windows(2) {
+        assert!(w[1].chars().count() < w[0].chars().count(), "{w:?}");
+    }
+    // No counter: n/a with the reason, then just `no counter`.
+    let n = nvlink_cpu(None, None);
+    let text: Vec<String> = (0..LEVELS).map(|l| line_text(&n.label(l))).collect();
+    assert!(
+        text[0].contains("RX n/a  TX n/a (no NVML counter)"),
+        "{}",
+        text[0]
+    );
+    assert!(text[3].contains("RX n/a TX n/a (no NVML counter)"));
+    assert_eq!(text[5], "GPU0 CPU no counter L 12.1");
+    // Peer links have no Legion bytes; no full scale says so.
+    let p = LinkGauge {
+        name: "GPU1 NVLink peer".into(),
+        short: "GPU1 peer".into(),
+        legion: None,
+        full_scale: None,
+        peak: None,
+        detail: None,
+        ..nvlink_cpu(Some(1.0), Some(1.0))
+    };
+    assert_eq!(
+        line_text(&p.label(0)),
+        "GPU1 NVLink peer  RX 1.00  TX 1.00  full scale n/a"
+    );
+    assert_eq!(line_text(&p.label(4)), "GPU1 peer RX 1.00 TX 1.00 /n/a");
+}
+
+#[test]
+fn a_stack_picks_the_longest_labels_that_leave_room_for_the_bar() {
+    let gauges = vec![nvlink_cpu(Some(14.5), Some(3.2)), nvlink_cpu(None, None)];
+    assert_eq!(gauge::fit(&gauges, 200).0, 0);
+    for width in [30u16, 38, 50, 70, 90, 120] {
+        let (level, label_w) = gauge::fit(&gauges, width);
+        let widest = gauges.iter().map(|g| g.label(level).width()).max().unwrap();
+        assert_eq!(usize::from(label_w), widest);
+        if level + 1 < LEVELS {
+            assert!(label_w + 1 + MIN_BAR <= width, "{width}: level {level}");
+        }
+        if level > 0 {
+            // The next longer form would not have fit.
+            let longer = gauges
+                .iter()
+                .map(|g| g.label(level - 1).width())
+                .max()
+                .unwrap() as u16;
+            assert!(longer + 1 + MIN_BAR > width, "{width}: level {level}");
+        }
+    }
+    // Too narrow for any form: the shortest, clipped by the widget.
+    assert_eq!(gauge::fit(&gauges, 10).0, LEVELS - 1);
+}
+
+#[test]
+fn line_gauges_stack_one_per_row_with_their_bars_aligned_and_coloured() {
+    use ratatui::style::Color;
+    let gauges = vec![
+        nvlink_cpu(Some(7.5), Some(1.0)),  // 10%: green
+        nvlink_cpu(Some(50.0), Some(1.0)), // 67%: yellow
+        nvlink_cpu(Some(70.0), Some(1.0)), // 93%: red
+    ];
+    let mut t = Terminal::new(TestBackend::new(60, 3)).unwrap();
+    t.draw(|f| {
+        let area = f.area();
+        gauge::render_stack(f, area, &gauges);
+    })
+    .unwrap();
+    let buf = t.backend().buffer().clone();
+    let s = screen(t.backend());
+    let starts: Vec<u16> = (0..3)
+        .map(|y| {
+            (0..60)
+                .find(|&x| buf.cell((x, y)).unwrap().symbol() == "━")
+                .unwrap_or_else(|| panic!("no bar in row {y}\n{s}"))
+        })
         .collect();
-    assert_eq!(text.len(), 3);
-    assert!(text[0].starts_with("meas"));
-    assert!(text[2].starts_with("full scale n/a"));
+    assert!(starts.iter().all(|&x| x == starts[0]), "{starts:?}\n{s}");
+    // Every row ends in bar cells; the first is filled in the load's colour.
+    for (y, color) in [Color::Green, Color::Yellow, Color::Red]
+        .into_iter()
+        .enumerate()
+    {
+        let first = buf.cell((starts[y], y as u16)).unwrap();
+        assert_eq!(first.fg, color, "row {y}\n{s}");
+        let last = buf.cell((59, y as u16)).unwrap();
+        assert_eq!(last.symbol(), "━");
+    }
+    // 60 columns leave level 3 (43-cell labels) and a 16-cell bar from column 44: the red one
+    // fills 14 cells (44..58), the green one 1.
+    assert_eq!(starts[0], 44, "{s}");
+    assert_eq!(buf.cell((57, 2)).unwrap().fg, Color::Red, "{s}");
+    assert_eq!(buf.cell((58, 2)).unwrap().fg, Color::DarkGray, "{s}");
+    assert_eq!(buf.cell((45, 0)).unwrap().fg, Color::DarkGray, "{s}");
+    assert!(s.contains("GPU0 CPU RX 70.0 TX 1.00"), "{s}");
+    // More gauges than rows: side-by-side columns, none lost.
+    let mut t = Terminal::new(TestBackend::new(100, 2)).unwrap();
+    t.draw(|f| {
+        let area = f.area();
+        gauge::render_stack(f, area, &gauges);
+    })
+    .unwrap();
+    let s = screen(t.backend());
+    assert_eq!(s.matches("GPU0").count(), 3, "{s}");
 }
 
 // ---- snapshots and rates ----
@@ -374,6 +543,18 @@ fn ac922(t: f64) -> Snapshot {
         gpus: vec![gpu(0), gpu(1)],
         network: None,
     }
+}
+
+/// An AC922 with four V100s: eight NVLink gauges.
+fn ac922_4(t: f64) -> Snapshot {
+    let mut s = ac922(t);
+    s.header = header("Qwen3.8-Flash-Next-UD-Q4_K_XL", 4);
+    for index in 2..4 {
+        let mut g = s.gpus[0].clone();
+        g.index = index;
+        s.gpus.push(g);
+    }
+    s
 }
 
 /// A DGX Spark (GB10) at `t` seconds: unified memory, C2C without counters, GPM DRAM
@@ -845,26 +1026,29 @@ fn peaks_hold_then_fall() {
     let at = |t: f64, tx_rate: f64| {
         let mut s = pcie(t);
         s.gpus[0].links[0].tx_bytes = Some(tx_rate);
+        // RX idle: the gauge's peak is the busier direction's.
+        s.gpus[0].links[0].rx_bytes = Some(0.0);
         s
     };
     // 0 -> 10 GB in one second, then flat.
     app.push_snapshot(at(0.0, 0.0));
     app.push_snapshot(at(1.0, 10e9));
     app.push_snapshot(at(2.0, 10e9));
-    let (links, _) = app.dials();
+    let links = app.links();
     assert!(close(links[0].tx.unwrap(), 0.0));
-    assert!(close(links[0].peak_tx.unwrap(), 10.0));
+    assert!(close(links[0].peak.unwrap(), 10.0));
     app.push_snapshot(at(2.0 + ui::PEAK_HOLD_S + 1.0, 10e9));
-    let (links, _) = app.dials();
-    assert!(close(links[0].peak_tx.unwrap(), 0.0));
+    let links = app.links();
+    assert!(close(links[0].peak.unwrap(), 0.0));
 }
 
 #[test]
-fn dials_per_machine() {
-    let (links, memory) = app_with(ac922, 2).dials();
-    let titles: Vec<&str> = links.iter().map(|d| d.title.as_str()).collect();
+fn link_gauges_and_memory_dials_per_machine() {
+    let app = app_with(ac922, 2);
+    let links = app.links();
+    let names: Vec<&str> = links.iter().map(|d| d.name.as_str()).collect();
     assert_eq!(
-        titles,
+        names,
         [
             "GPU0 NVLink CPU",
             "GPU0 NVLink peer",
@@ -872,29 +1056,54 @@ fn dials_per_machine() {
             "GPU1 NVLink peer"
         ]
     );
+    let short: Vec<&str> = links.iter().map(|d| d.short.as_str()).collect();
+    assert_eq!(short, ["GPU0 CPU", "GPU0 peer", "GPU1 CPU", "GPU1 peer"]);
+    assert!(close(links[0].rx.unwrap(), 8.0));
+    assert!(close(links[0].tx.unwrap(), 2.0));
+    assert!(close(links[0].ratio(), 8.0 / 75.0));
     assert!(links[0].legion.is_some());
     assert!(links[1].legion.is_none());
+    assert_eq!(links[0].why, None);
+    assert_eq!(links[0].detail.as_deref(), Some("3 links NVLink 2"));
     // V100: no GPM and not unified: no memory dial.
-    assert!(memory.is_empty());
+    assert!(app.memory_dials().is_empty());
+    assert_eq!(app_with(ac922_4, 2).links().len(), 8);
 
-    let (links, memory) = app_with(gb10, 2).dials();
-    assert_eq!(links[0].title, "GPU0 C2C (Legion bytes)");
+    let app = app_with(gb10, 2);
+    let links = app.links();
+    assert_eq!(links[0].name, "GPU0 C2C");
     assert_eq!(links[0].tx, None);
+    assert_eq!(links[0].why.as_deref(), Some("no C2C counter"));
     assert!(close(links[0].legion.unwrap(), 1.0));
-    assert_eq!(links[1].title, "TP net (Legion bytes)");
+    assert_eq!(links[1].name, "TP net");
+    assert_eq!(links[1].why.as_deref(), Some("no NIC counter"));
     assert_eq!(links[1].full_scale, Some(25.0));
+    // No counter: the bar shows Legion's bytes (2 GB/s of the NIC's 25).
+    assert!(close(links[1].ratio(), 2.0 / 25.0));
+    let memory = app.memory_dials();
     assert_eq!(memory.len(), 1);
     assert_eq!(memory[0].title, "GPU0 memory (GPM)");
-    assert!(close(memory[0].tx.unwrap(), 163.8));
+    assert!(close(memory[0].measured.unwrap(), 163.8));
 
-    let (links, memory) = app_with(pcie, 2).dials();
+    let app = app_with(pcie, 2);
+    let links = app.links();
     assert_eq!(links.len(), 1);
-    assert_eq!(links[0].title, "GPU0 PCIe");
+    assert_eq!(links[0].name, "GPU0 PCIe");
+    assert_eq!(links[0].short, "GPU0 PCIe");
     assert!(close(links[0].tx.unwrap(), 1.0));
     assert!(close(links[0].rx.unwrap(), 3.0));
     assert!(close(links[0].legion.unwrap(), 2.0));
     assert_eq!(links[0].full_scale, Some(31.504));
-    assert!(memory.is_empty());
+    assert!(app.memory_dials().is_empty());
+}
+
+#[test]
+fn the_link_row_follows_the_link_count() {
+    // Links + borders; a memory dial keeps its 12 rows.
+    assert_eq!(ui::bandwidth_height(&app_with(pcie, 2)), 3);
+    assert_eq!(ui::bandwidth_height(&app_with(ac922, 2)), 6);
+    assert_eq!(ui::bandwidth_height(&app_with(ac922_4, 2)), 10);
+    assert_eq!(ui::bandwidth_height(&app_with(gb10, 2)), ui::DIAL_H);
 }
 
 #[test]
@@ -908,10 +1117,12 @@ fn a_link_without_counters_says_so() {
     };
     app.push_snapshot(at(0.0));
     app.push_snapshot(at(1.0));
-    let (links, _) = app.dials();
+    let links = app.links();
     assert_eq!(links[0].tx, None);
-    assert_eq!(links[0].peak_tx, None);
-    assert_eq!(links[0].note.as_deref(), Some("no NVML counter"));
+    assert_eq!(links[0].rx, None);
+    assert_eq!(links[0].peak, None);
+    assert_eq!(links[0].why.as_deref(), Some("no NVML counter"));
+    assert!(line_text(&links[0].label(0)).contains("TX n/a (no NVML counter)"));
 }
 
 #[test]
@@ -1075,8 +1286,10 @@ fn the_full_layout_at_200_by_60() {
         "Requests (2 active, 1 queued)",
         "Throughput",
         "Latency (5 min)",
-        "GPU0 NVLink CPU",
-        "GPU1 NVLink peer",
+        "Links",
+        "GPU0 NVLink CPU  RX 8.00  TX 2.00  / 75.0 GB/s  pk 8.00  Legion 5.00  3 links NVLink 2",
+        "GPU1 NVLink peer  RX 1.00  TX 1.00  / 75.0 GB/s  pk 1.00  3 links NVLink 2",
+        "━",
         "GPUs",
         "Speculative",
         "KV cache",
@@ -1118,6 +1331,41 @@ fn the_compact_layout_at_80_by_24() {
 }
 
 #[test]
+fn every_link_gauge_fits_at_both_sizes() {
+    // Four V100s: eight gauges, all shown, one per row, short labels at 80 x 24.
+    let mut app = app_with(ac922_4, 3);
+    app.focus = Panel::Links;
+    let s = render(&app, 80, 24);
+    for g in 0..4 {
+        for want in [
+            format!("GPU{g} CPU RX 8.00 TX 2.00 L 5.00"),
+            format!("GPU{g} peer RX 1.00 TX 1.00"),
+        ] {
+            assert!(s.contains(&want), "missing {want:?} in\n{s}");
+        }
+    }
+    assert_eq!(s.lines().count(), 24);
+    assert!(s.lines().all(|l| l.chars().count() == 80));
+    assert_eq!(s.lines().filter(|l| l.contains('━')).count(), 8, "{s}");
+    let s = render(&app, 200, 60);
+    for g in 0..4 {
+        assert!(s.contains(&format!("GPU{g} NVLink CPU  RX 8.00")), "{s}");
+        assert!(s.contains(&format!("GPU{g} NVLink peer  RX 1.00")), "{s}");
+    }
+    // The two-GPU AC922 and the GB10 in the compact layout.
+    let mut app = app_with(ac922, 3);
+    app.focus = Panel::Links;
+    let s = render(&app, 80, 24);
+    assert!(s.contains("GPU1 peer RX 1.00 TX 1.00"), "{s}");
+    let mut app = app_with(gb10, 3);
+    app.focus = Panel::Links;
+    let s = render(&app, 80, 24);
+    // No full scale for the C2C fixture: `/n/a`.
+    assert!(s.contains("GPU0 C2C no counter /n/a L 1.00"), "{s}");
+    assert!(s.contains("TP net no counter /25.0 L 2.00"), "{s}");
+}
+
+#[test]
 fn every_panel_draws_in_the_compact_layout() {
     for snaps in [ac922 as fn(f64) -> Snapshot, gb10, pcie] {
         let mut app = app_with(snaps, 2);
@@ -1155,11 +1403,13 @@ fn each_widget_draws_alone_at_both_sizes() {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| {
             let area = f.area();
-            ui::draw_dials(f, area, &app);
+            ui::draw_bandwidth(f, area, &app);
         })
         .unwrap();
         let s = screen(t.backend());
-        assert!(s.contains("C2C"), "{w}x{h}\n{s}");
+        assert!(s.contains("GPU0 C2C"), "{w}x{h}\n{s}");
+        assert!(s.contains("GPU0 memory (GPM)"), "{w}x{h}\n{s}");
+        assert!(s.contains('━'), "{w}x{h}\n{s}");
     }
 }
 
@@ -1170,8 +1420,9 @@ fn a_gb10_at_200_by_60_shows_c2c_memory_and_the_network() {
         "Qwen3.8-Flash-Next-NVFP4",
         "NVFP4",
         "TP2",
-        "GPU0 C2C (Legion bytes)",
-        "TP net (Legion bytes)",
+        "GPU0 C2C  RX n/a  TX n/a (no C2C counter)  full scale n/a  Legion 1.00",
+        "TP net  RX n/a  TX n/a (no NIC counter)  / 25.0 GB/s  pk 2.00  Legion 2.00",
+        "rocep1s0f0 200 Gb/sec (4X HDR)",
         "GPU0 memory (GPM)",
         "unified",
     ] {
@@ -1183,14 +1434,16 @@ fn a_gb10_at_200_by_60_shows_c2c_memory_and_the_network() {
 fn a_pcie_card_at_both_sizes() {
     let app = app_with(pcie, 3);
     let s = render(&app, 200, 60);
-    assert!(s.contains("GPU0 PCIe"), "{s}");
-    assert!(s.contains("/31.5 GB/s"), "{s}");
+    assert!(
+        s.contains("GPU0 PCIe  RX 3.00  TX 1.00  / 31.5 GB/s  pk 3.00  Legion 2.00  PCIe 4.0 x16"),
+        "{s}"
+    );
     assert!(s.contains("off (no --spec)"));
     assert!(s.contains("dense model"));
     let mut app = app;
     app.focus = Panel::Links;
     let s = render(&app, 80, 24);
-    assert!(s.contains("GPU0 PCIe"), "{s}");
+    assert!(s.contains("GPU0 PCIe RX 3.00 TX 1.00 L 2.00"), "{s}");
 }
 
 #[test]
@@ -1270,17 +1523,12 @@ fn tiny_terminals_do_not_panic() {
 }
 
 #[test]
-fn a_dial_draws_on_a_canvas_when_it_fits() {
+fn a_memory_dial_draws_on_a_canvas_when_it_fits() {
     let d = Speedo {
-        title: "GPU0 NVLink CPU".into(),
-        full_scale: Some(75.0),
-        tx: Some(20.0),
-        rx: Some(40.0),
-        legion: Some(30.0),
-        peak_tx: Some(25.0),
-        peak_rx: Some(50.0),
-        tx_label: "TX",
-        rx_label: "RX",
+        title: "GPU0 memory (GPM)".into(),
+        full_scale: Some(273.0),
+        measured: Some(160.0),
+        legion: 120.0,
         note: None,
     };
     let mut t = Terminal::new(TestBackend::new(30, 11)).unwrap();
@@ -1290,9 +1538,9 @@ fn a_dial_draws_on_a_canvas_when_it_fits() {
     })
     .unwrap();
     let s = screen(t.backend());
-    assert!(s.contains("GPU0 NVLink CPU"));
-    assert!(s.contains("TX 20.0"));
-    assert!(s.contains("/75.0 GB/s pk 25.0/50.0"));
+    assert!(s.contains("GPU0 memory (GPM)"));
+    assert!(s.contains("meas 160 L 120"), "{s}");
+    assert!(s.contains("/273 GB/s"), "{s}");
     // Braille dots: the arc and the needles.
     assert!(
         s.chars().any(|c| ('\u{2801}'..='\u{28ff}').contains(&c)),

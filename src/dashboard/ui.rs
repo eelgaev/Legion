@@ -1,9 +1,10 @@
 //! The dashboard's state ([`App`]: the last snapshots, the rates between them, a minute and
 //! ten minutes of history, the log lines, the keys' state) and its drawing ([`draw`]).
 //!
-//! Two layouts: the full one (120 x 46 and up) with dials and sparklines, and a compact one
-//! where Tab picks the panel next to the request table. Small terminals drop the sparklines
-//! first (under 36 rows), then the step bar (under 28); 80 x 24 works.
+//! Two layouts: the full one (120 x 46 and up) with a row of link gauges and memory dials and
+//! the sparklines, and a compact one where Tab picks the panel next to the request table.
+//! Small terminals drop the sparklines first (under 36 rows), then the step bar (under 28);
+//! 80 x 24 works.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -14,6 +15,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Sparkline, Table, Wrap};
 
+use super::gauge::{self, LinkGauge};
 use super::logs::{LogLine, level_rank};
 use super::snapshot::{LinkKind, Rates, Snapshot};
 use super::speedo::{Speedo, gb};
@@ -407,53 +409,65 @@ impl App {
         (minute, ten)
     }
 
-    /// Every link dial (per GPU, then the network) and memory dial, in the snapshot's order.
-    pub fn dials(&self) -> (Vec<Speedo>, Vec<Speedo>) {
+    /// Every link gauge (per GPU, then the network), in the snapshot's order.
+    pub fn links(&self) -> Vec<LinkGauge> {
         let Some(s) = &self.snap else {
-            return (Vec::new(), Vec::new());
+            return Vec::new();
         };
         let rates = self.rates.as_ref();
         let mut links = Vec::new();
-        let mut memory = Vec::new();
         for (gi, g) in s.gpus.iter().enumerate() {
             for (i, l) in g.links.iter().enumerate() {
                 let r = rates.and_then(|r| r.links.get(gi)).and_then(|v| v.get(i));
                 let peak = self.peaks.get(&(g.index, i));
                 let measured = l.tx_bytes.is_some() || l.rx_bytes.is_some();
-                let mut title = format!("GPU{} {}", g.index, l.kind.label());
-                if !measured && l.kind == LinkKind::C2c {
-                    title.push_str(" (Legion bytes)");
-                }
-                let note = if !measured && l.kind != LinkKind::C2c {
-                    Some("no NVML counter".to_string())
-                } else if !l.detail.is_empty() {
-                    Some(l.detail.clone())
-                } else {
-                    None
-                };
-                links.push(Speedo {
-                    title,
+                let rate = |v: Option<f64>| measured.then_some(v.unwrap_or(0.0));
+                links.push(LinkGauge {
+                    name: format!("GPU{} {}", g.index, l.kind.label()),
+                    short: format!("GPU{} {}", g.index, short_kind(l.kind)),
                     full_scale: l.full_scale_gb_s,
-                    tx: if measured {
-                        r.and_then(|r| r.tx_gb_s).or(Some(0.0))
-                    } else {
-                        None
-                    },
-                    rx: if measured {
-                        r.and_then(|r| r.rx_gb_s).or(Some(0.0))
-                    } else {
-                        None
-                    },
+                    rx: rate(r.and_then(|r| r.rx_gb_s)),
+                    tx: rate(r.and_then(|r| r.tx_gb_s)),
                     // Peer copies are not in Legion's model bytes.
                     legion: (l.kind != LinkKind::NvlinkPeer)
                         .then(|| r.map_or(0.0, |r| r.legion_gb_s)),
-                    peak_tx: peak.filter(|_| measured).map(|p| p.tx),
-                    peak_rx: peak.filter(|_| measured).map(|p| p.rx),
-                    tx_label: "TX",
-                    rx_label: "RX",
-                    note,
+                    peak: peak.filter(|_| measured).map(|p| p.tx.max(p.rx)),
+                    why: (!measured).then(|| {
+                        if l.kind == LinkKind::C2c {
+                            "no C2C counter".to_string()
+                        } else {
+                            "no NVML counter".to_string()
+                        }
+                    }),
+                    detail: (!l.detail.is_empty()).then(|| l.detail.clone()),
                 });
             }
+        }
+        if let Some(n) = &s.network {
+            let r = rates.and_then(|r| r.network);
+            links.push(LinkGauge {
+                name: LinkKind::Network.label().into(),
+                short: short_kind(LinkKind::Network).into(),
+                full_scale: n.full_scale_gb_s,
+                rx: None,
+                tx: None,
+                legion: Some(r.map_or(0.0, |r| r.legion_gb_s)),
+                peak: self.peaks.get(&(u32::MAX, 0)).map(|p| p.tx),
+                why: Some("no NIC counter".into()),
+                detail: (!n.detail.is_empty()).then(|| n.detail.clone()),
+            });
+        }
+        links
+    }
+
+    /// Every memory dial: GPUs with GPM or unified memory.
+    pub fn memory_dials(&self) -> Vec<Speedo> {
+        let Some(s) = &self.snap else {
+            return Vec::new();
+        };
+        let rates = self.rates.as_ref();
+        let mut memory = Vec::new();
+        for (gi, g) in s.gpus.iter().enumerate() {
             let m = &g.memory;
             let mr = rates.and_then(|r| r.memory.get(gi));
             if g.unified || m.gpm_dram_pct.is_some() {
@@ -465,13 +479,8 @@ impl App {
                         if gpm { " (GPM)" } else { " (Legion bytes)" }
                     ),
                     full_scale: m.peak_gb_s,
-                    tx: mr.and_then(|r| r.measured_gb_s),
-                    rx: None,
-                    legion: Some(mr.map_or(0.0, |r| r.legion_gb_s)),
-                    peak_tx: None,
-                    peak_rx: None,
-                    tx_label: "meas",
-                    rx_label: "",
+                    measured: mr.and_then(|r| r.measured_gb_s),
+                    legion: mr.map_or(0.0, |r| r.legion_gb_s),
                     note: (!gpm).then(|| match g.mem_busy_pct {
                         Some(p) => format!("busy {p:.0}%"),
                         None => "no GPM".into(),
@@ -479,23 +488,16 @@ impl App {
                 });
             }
         }
-        if let Some(n) = &s.network {
-            let r = rates.and_then(|r| r.network);
-            let peak = self.peaks.get(&(u32::MAX, 0));
-            links.push(Speedo {
-                title: "TP net (Legion bytes)".into(),
-                full_scale: n.full_scale_gb_s,
-                tx: None,
-                rx: None,
-                legion: Some(r.map_or(0.0, |r| r.legion_gb_s)),
-                peak_tx: peak.map(|p| p.tx),
-                peak_rx: None,
-                tx_label: "TX",
-                rx_label: "RX",
-                note: (!n.detail.is_empty()).then(|| n.detail.clone()),
-            });
-        }
-        (links, memory)
+        memory
+    }
+}
+
+/// A link's kind in a narrow label: `CPU`, `peer`, `PCIe`, `C2C`, `TP net`.
+fn short_kind(kind: LinkKind) -> &'static str {
+    match kind {
+        LinkKind::NvlinkCpu => "CPU",
+        LinkKind::NvlinkPeer => "peer",
+        k => k.label(),
     }
 }
 
@@ -613,10 +615,10 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 fn draw_full(f: &mut Frame, area: Rect, app: &App, mode: Mode) {
-    let [h, row1, dials, row3, steps, logs, foot] = Layout::vertical([
+    let [h, row1, bandwidth, row3, steps, logs, foot] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Length(13),
-        Constraint::Length(12),
+        Constraint::Length(bandwidth_height(app)),
         Constraint::Length(9),
         Constraint::Length(if mode.step_bar { 4 } else { 0 }),
         Constraint::Min(3),
@@ -630,7 +632,7 @@ fn draw_full(f: &mut Frame, area: Rect, app: &App, mode: Mode) {
     let [tp, lat] = Layout::vertical([Constraint::Min(5), Constraint::Length(4)]).areas(right);
     draw_throughput(f, tp, app, mode.sparklines);
     draw_latency(f, lat, app);
-    draw_dials(f, dials, app);
+    draw_bandwidth(f, bandwidth, app);
     let [gpu, spec, kv, moe] = Layout::horizontal([
         Constraint::Percentage(34),
         Constraint::Percentage(24),
@@ -688,8 +690,8 @@ pub fn draw_panel(f: &mut Frame, area: Rect, app: &App, panel: Panel, mode: Mode
     match panel {
         Panel::Requests => draw_requests(f, area, app),
         Panel::Throughput => draw_throughput(f, area, app, mode.sparklines),
-        Panel::Links => draw_link_bars(f, area, app, false),
-        Panel::Memory => draw_link_bars(f, area, app, true),
+        Panel::Links => draw_links(f, area, app),
+        Panel::Memory => draw_memory_bars(f, area, app),
         Panel::Gpu => draw_gpus(f, area, app),
         Panel::Spec => draw_spec(f, area, app, mode.sparklines),
         Panel::Kv => draw_kv(f, area, app),
@@ -966,52 +968,62 @@ fn hw_missing(app: &App) -> Option<String> {
     s.gpus.is_empty().then(|| "no GPU sampled".into())
 }
 
-/// The full layout's row of dials: the links, then the memory gauges.
-pub fn draw_dials(f: &mut Frame, area: Rect, app: &App) {
-    if let Some(why) = hw_missing(app) {
-        f.render_widget(
-            Paragraph::new(Line::styled(why, dim()))
-                .block(panel_block(app, Panel::Links, "Links".into()))
-                .wrap(Wrap { trim: true }),
-            area,
-        );
-        return;
+/// Link gauges the full layout's row gives a row each; more go into columns.
+pub const LINK_ROWS: u16 = 10;
+/// A memory dial's size in the full layout.
+pub const DIAL_W: u16 = 34;
+pub const DIAL_H: u16 = 12;
+
+/// The full layout's link and memory row: one row per link gauge, as tall as a memory dial
+/// where there is one.
+pub fn bandwidth_height(app: &App) -> u16 {
+    if hw_missing(app).is_some() {
+        return 4;
     }
-    let (links, memory) = app.dials();
-    let all: Vec<(Speedo, Panel)> = links
-        .into_iter()
-        .map(|d| (d, Panel::Links))
-        .chain(memory.into_iter().map(|d| (d, Panel::Memory)))
-        .collect();
-    if all.is_empty() {
-        return;
+    let links = (app.links().len() as u16).clamp(1, LINK_ROWS) + 2;
+    if app.memory_dials().is_empty() {
+        links
+    } else {
+        links.max(DIAL_H)
     }
-    let width = (area.width / all.len() as u16).clamp(18, 34);
-    let fit = (area.width / width) as usize;
-    for (i, (d, panel)) in all.iter().take(fit).enumerate() {
+}
+
+/// The full layout's row: the link gauges, then the memory dials on the right.
+pub fn draw_bandwidth(f: &mut Frame, area: Rect, app: &App) {
+    let memory = if hw_missing(app).is_some() {
+        Vec::new()
+    } else {
+        app.memory_dials()
+    };
+    // The dials take at most half the row.
+    let fit = memory.len().min(usize::from(area.width / 2 / DIAL_W));
+    let [links, dials] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(fit as u16 * DIAL_W)])
+            .areas(area);
+    draw_links(f, links, app);
+    for (i, d) in memory.iter().take(fit).enumerate() {
         let r = Rect {
-            x: area.x + i as u16 * width,
-            width,
-            ..area
+            x: dials.x + i as u16 * DIAL_W,
+            width: DIAL_W,
+            ..dials
         };
-        d.render(f, r, app.focus == *panel);
+        d.render(f, r, app.focus == Panel::Memory);
     }
-    if all.len() > fit {
-        let more = format!(" +{} more (Tab: Links) ", all.len() - fit);
+    if memory.len() > fit {
+        let more = format!(" +{} more (Tab: Memory) ", memory.len() - fit);
         let r = Rect {
             x: area.x + area.width.saturating_sub(more.len() as u16 + 1),
             y: area.y + area.height.saturating_sub(1),
-            width: more.len() as u16,
-            height: 1,
+            width: (more.len() as u16).min(area.width),
+            height: 1.min(area.height),
         };
         f.render_widget(Paragraph::new(Span::styled(more, dim())), r);
     }
 }
 
-/// The links (or the memory gauges) as bars, for the compact layout.
-pub fn draw_link_bars(f: &mut Frame, area: Rect, app: &App, memory: bool) {
-    let panel = if memory { Panel::Memory } else { Panel::Links };
-    let block = panel_block(app, panel, panel.title().into());
+/// The links panel: a gauge per link, one per row (both layouts).
+pub fn draw_links(f: &mut Frame, area: Rect, app: &App) {
+    let block = panel_block(app, Panel::Links, Panel::Links.title().into());
     let inner = block.inner(area);
     f.render_widget(block, area);
     if let Some(why) = hw_missing(app) {
@@ -1021,10 +1033,24 @@ pub fn draw_link_bars(f: &mut Frame, area: Rect, app: &App, memory: bool) {
         );
         return;
     }
-    let (links, mem) = app.dials();
-    let dials = if memory { mem } else { links };
+    gauge::render_stack(f, inner, &app.links());
+}
+
+/// The memory dials as bars, for the compact layout.
+pub fn draw_memory_bars(f: &mut Frame, area: Rect, app: &App) {
+    let block = panel_block(app, Panel::Memory, Panel::Memory.title().into());
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if let Some(why) = hw_missing(app) {
+        f.render_widget(
+            Paragraph::new(Line::styled(why, dim())).wrap(Wrap { trim: true }),
+            inner,
+        );
+        return;
+    }
+    let dials = app.memory_dials();
     let mut lines = Vec::new();
-    if dials.is_empty() && memory {
+    if dials.is_empty() {
         lines.push(Line::styled(
             "no gauge: needs GPM (Hopper and newer) or unified memory",
             dim(),
@@ -1043,7 +1069,7 @@ pub fn draw_link_bars(f: &mut Frame, area: Rect, app: &App, memory: bool) {
         lines.push(Line::styled(d.title.clone(), bold()));
         lines.extend(d.bar_lines(inner.width as usize));
     }
-    // The first GPU's links first: what does not fit is cut at the bottom.
+    // The first GPU's dial first: what does not fit is cut at the bottom.
     f.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -1385,13 +1411,15 @@ pub const HELP: &[&str] = &[
     "  1-5  log level (ERROR .. TRACE)   /  search logs   l  full-screen logs",
     "  Up/Down PgUp/PgDn Home/End  scroll the logs",
     "",
-    "Needles: TX cyan, RX magenta, Legion's own bytes yellow; ticks hold the 10 s peak.",
+    "Link bars: the busier of RX and TX over the link's per-direction full scale, green",
+    "  under 60%, yellow under 85%, red above; no counter: Legion's bytes. pk: 10 s peak.",
+    "Memory dial needles: measured cyan, Legion's own bytes yellow.",
     "Legion bytes are model bytes (what the steps must read), not measured traffic.",
     "",
     "Why n/a",
     "  hardware panels: NVML is missing or sees no GPU (the reason shows in place).",
     "  PCIe TX/RX: NVML has no PCIe throughput counter on this GPU (GB10).",
-    "  C2C TX/RX: no NVML C2C counter (GPM); the dial shows Legion's bytes and says so.",
+    "  C2C TX/RX: no NVML C2C counter (GPM); the bar shows Legion's bytes.",
     "  memory gauge: measured = GPM DRAM bandwidth x peak; without GPM NVML only",
     "    reports the time memory was busy, not its bandwidth. GB10: no GPM, and NVML's",
     "    memory busy reads 0 under any load (mem n/a); no CPU DRAM PMU either, so the",

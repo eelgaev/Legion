@@ -35,8 +35,9 @@ sends a snapshot.
 | `l` | the logs full screen |
 | arrows, PgUp/PgDn, Home/End | scroll the logs |
 
-Terminals of 120 x 46 and larger get the full layout (dials, sparklines); smaller ones a
-compact one with bars instead of dials. Under 36 rows the sparklines go, under 28 the step bar;
+Terminals of 120 x 46 and larger get the full layout (a row of link gauges and memory dials,
+sparklines); smaller ones a compact one where the links panel has the same gauges and the
+memory panel bars instead of dials. Under 36 rows the sparklines go, under 28 the step bar;
 80 x 24 works.
 
 ## Access
@@ -92,11 +93,29 @@ dashboard then shares. The sampler only queries NVML; it never touches the GPUs'
 
 ## The gauges
 
-Every link dial shows up to three needles per direction: TX (cyan) and RX (magenta) measured by
-the hardware counter, and Legion's own bytes (yellow): the model bytes the steps must move
-(weights and experts streamed from host memory, host-tier KV), counted by the engine, not
-measured. Ticks hold each direction's peak for 10 s. The full scale is the link's bandwidth per
-direction.
+Every link gets a one-line bar (a ratatui `LineGauge`), one row per link: the panel is as tall
+as the machine has links (one on a PCIe card, two per GPU on an AC922, one C2C on a GB10, plus
+TP net with two Sparks). The bar fills to the busier direction, max(RX, TX), over the link's
+per-direction full scale: green under 60%, yellow under 85%, red above, grey without a full
+scale. Its label carries the figures:
+
+```text
+GPU0 NVLink CPU  RX 14.5  TX 3.20  / 75.0 GB/s  pk 20.0  Legion 12.1  3 links NVLink 2
+```
+
+RX (magenta) and TX (cyan) are the hardware counter's; `pk` is the busier direction's peak over
+the last 10 s; Legion (yellow) is Legion's own bytes on the link: the model bytes the steps must
+move (weights and experts streamed from host memory, host-tier KV), counted by the engine, not
+measured. A link without a counter reads `RX n/a  TX n/a (<why>)` and its bar shows Legion's
+bytes instead. On narrow panels the label gets shorter instead of wrapping: the link's detail
+goes first, then the peak, then `Legion` becomes `L` and the kind its short name
+(`GPU0 CPU RX 14.5 TX 3.20 / 75.0 GB/s L 12.1`), then the unit, then the full scale (the bar
+still shows it); a link without a counter then reads `no counter`. All bars of a panel start in
+the same column. More links than rows go into side-by-side columns.
+
+The memory gauge is a speedometer (a Braille half dial) with a needle for the measured
+bandwidth (cyan) and one for Legion's bytes (yellow); the compact layout's memory panel shows
+the same as bars.
 
 | Gauge | Measured by | Full scale |
 |---|---|---|
@@ -110,19 +129,20 @@ direction.
 What each machine shows:
 
 - **An AC922 (4x V100):** an NVLink CPU and an NVLink peer gauge per GPU, both measured.
-  Legion's needle on the CPU link is the experts and KV it streams from host memory. No memory
+  Legion's figure on the CPU link is the experts and KV it streams from host memory. No memory
   dial: V100 has no GPM, and NVML's memory utilization is the share of time memory was busy,
   not bandwidth, so the GPU panel shows it as `mem %`.
 - **A DGX Spark (GB10):** one C2C gauge (full scale from NVML: 8 links x 43.1 GB/s) and a
-  memory gauge against 273 GB/s (LPDDR5X). Neither has a hardware needle: the GB10 has no GPM
+  memory dial against 273 GB/s (LPDDR5X). Neither has a hardware counter: the GB10 has no GPM
   (`nvidia-smi dmon --gpm-metrics 1,2,10` prints `-` for graphics activity, SM utilization and
   DRAM bandwidth under a full decode), no
   C2C counter, and NVML's memory utilization reads 0% while decode moves the whole bandwidth,
   so the dashboard shows it as n/a. GB10 has no CPU DRAM PMU either, so nothing counts the
   shared memory's traffic. What the memory dial does show is Legion's own bytes: the model
   bytes per step over the step time, which sits at about 270 GB/s during decode there. The
-  C2C dial's Legion needle counts host-tier bytes, which a single Spark does not have (it is
-  all one memory), so it stays at 0. VRAM is `unified`. With two Sparks a TP net gauge shows
+  C2C gauge reads `RX n/a  TX n/a (no C2C counter)` and its bar and Legion figure count
+  host-tier bytes, which a single Spark does not have (it is all one memory), so they stay at
+  0. VRAM is `unified`. With two Sparks a TP net gauge shows
   the exchange's bytes against the NIC's speed.
 - **A PCIe card (RTX 4090 and the like):** a PCIe gauge measured by NVML, with Legion's host
   bytes; no memory dial without GPM (Hopper and newer have it).
@@ -131,7 +151,8 @@ What each machine shows:
 
 - **Hardware panels:** NVML is missing or sees no GPU; the reason shows in place.
 - **PCIe TX/RX:** NVML has no PCIe throughput counter on this GPU.
-- **C2C TX/RX:** no GPM C2C counter; the dial shows Legion's bytes and says so in its title.
+- **C2C TX/RX:** no GPM C2C counter; the bar shows Legion's bytes and the label says
+  `no C2C counter`.
 - **Memory:** no GPM. NVML's memory utilization is time busy, not bandwidth; on a GB10 it
   reads 0 under any load, so the GPU panel's `mem` column is n/a there.
 - **VRAM:** unified memory has no VRAM of its own.

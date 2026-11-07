@@ -1,7 +1,7 @@
-//! A speedometer: a half dial whose full scale is the link's (or memory's) bandwidth per
-//! direction, with up to three needles (TX, RX, Legion's own bytes) and a peak-hold tick per
-//! direction. Where nothing gives a full scale the dial is not drawn; the figures still are.
-//! Small panels draw [`Speedo::bar_lines`] instead.
+//! The memory-bandwidth speedometer: a half dial whose full scale is the memory's peak
+//! bandwidth, with a needle for the measured bandwidth (GPM) and one for Legion's own bytes.
+//! Where nothing gives a full scale the dial is not drawn; the figures still are. Small panels
+//! draw [`Speedo::bar_lines`] instead. The links have [`super::gauge`] bars.
 
 use std::f64::consts::PI;
 
@@ -13,27 +13,18 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::{Canvas, Line as CLine};
 use ratatui::widgets::{Block, Paragraph};
 
-pub const TX: Color = Color::Cyan;
-pub const RX: Color = Color::Magenta;
-pub const LEGION: Color = Color::Yellow;
+use super::gauge::{LEGION, TX};
 
 /// One dial's data, in GB/s.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Speedo {
     pub title: String,
     pub full_scale: Option<f64>,
-    /// Measured sent / received; `None`: no hardware counter (the needle is left out).
-    pub tx: Option<f64>,
-    pub rx: Option<f64>,
-    /// Legion's own bytes; `None`: not counted for this link.
-    pub legion: Option<f64>,
-    /// The highest TX and RX over the last seconds.
-    pub peak_tx: Option<f64>,
-    pub peak_rx: Option<f64>,
-    /// The values' names (`TX`, `RX`; a memory dial has `meas` and no second, empty).
-    pub tx_label: &'static str,
-    pub rx_label: &'static str,
-    /// What the dial cannot show, in a few words (`no PCIe counter`).
+    /// Measured bandwidth; `None`: no hardware counter (the needle is left out).
+    pub measured: Option<f64>,
+    /// Legion's own bytes.
+    pub legion: f64,
+    /// What the dial cannot show, in a few words (`no GPM`).
     pub note: Option<String>,
 }
 
@@ -83,24 +74,16 @@ pub fn bar(v: Option<f64>, full: Option<f64>, width: usize) -> String {
 impl Speedo {
     fn values_line(&self) -> Line<'static> {
         let mut spans = Vec::new();
-        if self.tx.is_some() || self.rx.is_some() || self.legion.is_none() {
+        if let Some(m) = self.measured {
             spans.push(Span::styled(
-                format!("{} {} ", self.tx_label, opt_gb(self.tx)),
+                format!("meas {} ", gb(m)),
                 Style::default().fg(TX),
             ));
-            if !self.rx_label.is_empty() {
-                spans.push(Span::styled(
-                    format!("{} {} ", self.rx_label, opt_gb(self.rx)),
-                    Style::default().fg(RX),
-                ));
-            }
         }
-        if let Some(l) = self.legion {
-            spans.push(Span::styled(
-                format!("L {}", gb(l)),
-                Style::default().fg(LEGION),
-            ));
-        }
+        spans.push(Span::styled(
+            format!("L {}", gb(self.legion)),
+            Style::default().fg(LEGION),
+        ));
         Line::from(spans)
     }
 
@@ -109,9 +92,6 @@ impl Speedo {
             Some(f) => format!("/{} GB/s", gb(f)),
             None => "full scale n/a".into(),
         };
-        if let (Some(t), Some(r)) = (self.peak_tx, self.peak_rx) {
-            s.push_str(&format!(" pk {}/{}", gb(t), gb(r)));
-        }
         if let Some(n) = &self.note {
             s = format!("{s} {n}");
         }
@@ -141,7 +121,7 @@ impl Speedo {
         let [dial, text] =
             Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(inner);
         let full = self.full_scale.unwrap_or(1.0);
-        let me = self.clone();
+        let (measured, legion) = (self.measured, self.legion);
         let canvas = Canvas::default()
             .marker(Marker::Braille)
             .x_bounds([-1.15, 1.15])
@@ -182,26 +162,9 @@ impl Speedo {
                         color,
                     });
                 };
-                if let Some(v) = me.legion {
-                    needle(v, 0.6, LEGION);
-                }
-                if let Some(v) = me.rx {
-                    needle(v, 0.8, RX);
-                }
-                if let Some(v) = me.tx {
+                needle(legion, 0.6, LEGION);
+                if let Some(v) = measured {
                     needle(v, 0.92, TX);
-                }
-                for (p, color) in [(me.peak_tx, TX), (me.peak_rx, RX)] {
-                    if let Some(p) = p {
-                        let a = angle(p, full);
-                        ctx.draw(&CLine {
-                            x1: 0.95 * a.cos(),
-                            y1: 0.95 * a.sin(),
-                            x2: 1.1 * a.cos(),
-                            y2: 1.1 * a.sin(),
-                            color,
-                        });
-                    }
                 }
             });
         f.render_widget(canvas, dial);
@@ -211,7 +174,7 @@ impl Speedo {
         );
     }
 
-    /// Two or three lines of bars for small panels: `TX ███··· 12.3`, `RX ...`, the scale.
+    /// Two or three lines of bars for small panels: `meas ███··· 163`, `L ...`, the scale.
     pub fn bar_lines(&self, width: usize) -> Vec<Line<'static>> {
         let w = width.saturating_sub(12).clamp(4, 40);
         let row = |label: &str, v: Option<f64>, color: Color| {
@@ -222,15 +185,10 @@ impl Speedo {
             ])
         };
         let mut lines = Vec::new();
-        if self.tx.is_some() || self.rx.is_some() || self.legion.is_none() {
-            lines.push(row(self.tx_label, self.tx, TX));
-            if !self.rx_label.is_empty() {
-                lines.push(row(self.rx_label, self.rx, RX));
-            }
+        if self.measured.is_some() {
+            lines.push(row("meas", self.measured, TX));
         }
-        if self.legion.is_some() {
-            lines.push(row("L", self.legion, LEGION));
-        }
+        lines.push(row("L", Some(self.legion), LEGION));
         lines.push(self.scale_line());
         lines
     }
