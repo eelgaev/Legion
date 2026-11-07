@@ -7,6 +7,8 @@
 Bolt E4B is a Gemma 4 E4B (`gemma4`): 42 layers, sliding-window and global attention, per-layer token
 embeddings, the last 18 layers reading earlier layers' KV.
 
+Both files below come from `unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF` on Hugging Face.
+
 ```sh
 legion serve \
   --model NVIDIA-Nemotron-3.5-Bolt-E4B-UD-Q4_K_XL.gguf \
@@ -45,6 +47,9 @@ Bolt 74B-A9B is a Nemotron-H MoE (`nemotron_h_moe`, 88 layers: Mamba-2, 8 attent
 blocks differ: 240 to 496 experts and up to 9 picked per token, read from each block's router and the per-layer
 `expert_used_count`. The routed experts run in a 1024-wide latent space (`ffn_latent_down` before them,
 `ffn_latent_up` after); the router and the shared expert read the full 4096-wide input.
+
+The GGUF is the `UD-Q4_K_XL` folder of `unsloth/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-GGUF` on Hugging Face, in three
+parts: download all three into one directory and pass the first one to `--model`.
 
 ```sh
 legion serve \
