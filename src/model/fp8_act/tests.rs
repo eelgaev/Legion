@@ -141,6 +141,7 @@ fn rms_bf16_case(backend: &mut Backend, k: i64, n: i64) -> [Vec<u8>; 4] {
     outs.map(|t| t.bytes())
 }
 
+/// Asserts that [`rms_norm_bf16`]'s two parts are the bytes of the two ops it replaces.
 fn check_rms_bf16(backend: &mut Backend, k: i64, n: i64) {
     let [q, q1, b, b1] = rms_bf16_case(backend, k, n);
     compare(
