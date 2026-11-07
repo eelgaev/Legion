@@ -1791,10 +1791,14 @@ impl Model {
     pub fn set_nvfp4_a4(&mut self, a: Nvfp4A4) {
         self.linear.set_nvfp4_a4(a);
         if a != Nvfp4A4::Off {
-            // The FP4 probe (a kernel and a copy on the default stream) runs now, at load,
+            // The FP4 probe (a kernel and a copy on the default stream) runs now, at load, on
+            // every GPU holding a weight the W4A4 ops could take (as `linear` asks, per device),
             // rather than at the first W4A4 graph's build, which may come between stage-graph
             // captures (#1202).
-            crate::model::nvfp4_a4::device_supported();
+            let mtp = self.mtp.iter().flat_map(|w| w.tensors());
+            for w in self.weights.tensors().chain(mtp) {
+                crate::model::nvfp4_a4::supports(w);
+            }
         }
     }
 
