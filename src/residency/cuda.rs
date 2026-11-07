@@ -26,7 +26,9 @@ pub use host_register::{HostRegistration, register_host};
 mod kv_vmm;
 pub use kv_vmm::{kv_vmm_host_ok, kv_vmm_remap, kv_vmm_type, kv_vmm_unmap};
 mod tp_tier;
-pub use tp_tier::{LAZY_CHUNK_ROWS, tp_tier_back, tp_tier_devices, tp_tier_trim};
+pub use tp_tier::{
+    LAZY_CHUNK_ROWS, tp_tier_back, tp_tier_devices, tp_tier_granularity, tp_tier_lend, tp_tier_trim,
+};
 
 /// The driver and runtime API calls used here (`libcuda` and `libcudart` are linked with the
 /// `cuda` feature), with the struct layouts of CUDA 12's `cuda.h`.

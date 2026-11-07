@@ -30,6 +30,9 @@ struct TierType {
     /// Slots whose host rows are mapped as their sequences grow ([`tp_tier_back`]), not all
     /// at once: slots whose whole context the host could not hold (#1131).
     lazy: bool,
+    /// With `lazy`: VRAM chunks per tensor that the slots share past their own VRAM rows
+    /// ([`LazySlots::pool`], #1159).
+    lend: usize,
     gran: usize,
     name: CString,
     buft: ffi::ggml_backend_buffer_type,
@@ -63,18 +66,31 @@ pub const LAZY_CHUNK_ROWS: usize = 4096;
 /// zeroed piece of host memory: attention reads a batch's longest span in every sequence's slot
 /// (masked, by an exact 0 weight), so each slot's whole range must hold finite numbers, and
 /// nothing writes to rows past a sequence's own.
+///
+/// A chunk past a slot's own VRAM rows is backed by host memory or, while the pool has some, by
+/// one of the VRAM chunks the slots share (#1159): the running sequences' context then uses the
+/// VRAM that idle slots' fixed share would leave empty. Moving a chunk between VRAM and the host
+/// copies its rows, so only where the rows live changes, never their values.
 struct LazySlots {
     slot_rows: usize,
     node: u32,
     /// Per tensor: its offset in the range, its row bytes and each slot's VRAM bytes.
     tensors: Vec<(usize, usize, usize)>,
-    /// Per tensor and slot: the bytes from the slot's start backed so far (by VRAM or its own
-    /// host memory; the shared zeros past them).
-    backed: Vec<Vec<usize>>,
-    /// Per slot: the host pieces mapped for it (offset, bytes, handle).
-    pieces: Vec<Vec<(usize, usize, CUmemGenericAllocationHandle)>>,
+    /// Per tensor and slot: the chunks backed past the slot's VRAM rows, in order (the shared
+    /// zeros past them), each its own piece: its handle and whether it is a VRAM chunk of
+    /// `pool`'s (else pinned host memory of its own).
+    chunks: Vec<Vec<Vec<(CUmemGenericAllocationHandle, bool)>>>,
+    /// Per tensor: its VRAM chunks no slot holds.
+    pool: Vec<Vec<CUmemGenericAllocationHandle>>,
     /// The shared zeroed pieces: bytes, handle.
     zeros: Vec<(usize, CUmemGenericAllocationHandle)>,
+}
+
+impl LazySlots {
+    /// Tensor `t`'s slot `s`'s VRAM chunks of the pool.
+    fn in_vram(&self, t: usize, s: usize) -> usize {
+        self.chunks[t][s].iter().filter(|c| c.1).count()
+    }
 }
 
 /// The live lazy tier buffers (their [`TierBuffer`] boxes).
@@ -89,16 +105,19 @@ impl TierBuffer {
                 cuMemRelease(h);
             }
             if let Some(l) = &self.lazy {
-                for (t, &(off, row, _)) in l.tensors.iter().enumerate() {
+                for (t, &(off, row, vram)) in l.tensors.iter().enumerate() {
                     let (slot, chunk) = (l.slot_rows * row, LAZY_CHUNK_ROWS * row);
-                    for (s, &have) in l.backed[t].iter().enumerate() {
-                        for at in (have..slot).step_by(chunk) {
+                    for (s, held) in l.chunks[t].iter().enumerate() {
+                        // Its own chunks and the shared zeros past them, each mapped on its own.
+                        for at in (vram..slot).step_by(chunk) {
                             cuMemUnmap(self.va + (off + s * slot + at) as u64, chunk);
+                        }
+                        for &(h, _) in held {
+                            cuMemRelease(h);
                         }
                     }
                 }
-                for &(off, n, h) in l.pieces.iter().flatten() {
-                    cuMemUnmap(self.va + off as u64, n);
+                for &h in l.pool.iter().flatten() {
                     cuMemRelease(h);
                 }
                 for &(_, h) in &l.zeros {
@@ -223,8 +242,8 @@ unsafe extern "C" fn tier_alloc(
             slot_rows: ty.slot_rows,
             node: ty.node,
             tensors: Vec::new(),
-            backed: Vec::new(),
-            pieces: Vec::new(),
+            chunks: Vec::new(),
+            pool: Vec::new(),
             zeros: Vec::new(),
         }),
     });
@@ -366,16 +385,31 @@ fn lazy_init(
     for s in 0..n_slots {
         b.map(off + s * slot, vram, device)?;
         for at in (vram..slot).step_by(chunk) {
-            b.map_zero(off + s * slot + at, chunk, zero)?;
+            b.map_handle(off + s * slot + at, chunk, zero)?;
         }
     }
     let tail = n_slots * slot;
     b.map(off + tail, bytes - tail, host_location(ty.node))?;
     let l = b.lazy.as_mut().expect("a lazy buffer");
     l.tensors.push((off, row, vram));
-    l.backed.push(vec![vram; n_slots]);
-    if l.pieces.len() < n_slots {
-        l.pieces.resize_with(n_slots, Vec::new);
+    l.chunks.push(vec![Vec::new(); n_slots]);
+    l.pool.push(Vec::with_capacity(ty.lend));
+    // The VRAM chunks the slots share (#1159), mapped where a slot takes one.
+    let prop = alloc_prop(device.0, device.1);
+    for _ in 0..ty.lend {
+        let mut h: CUmemGenericAllocationHandle = 0;
+        // SAFETY: a new allocation, kept in the pool (released with the buffer).
+        cu(
+            unsafe { cuMemCreate(&mut h, chunk, &prop, 0) },
+            "cuMemCreate(KV tier VRAM chunk)",
+        )?;
+        b.lazy
+            .as_mut()
+            .expect("a lazy buffer")
+            .pool
+            .last_mut()
+            .expect("just pushed")
+            .push(h);
     }
     Ok(())
 }
@@ -437,7 +471,7 @@ impl TierBuffer {
     }
 
     /// Maps shared piece `h` (`n` bytes) at `off`, which the device may then read and write.
-    fn map_zero(
+    fn map_handle(
         &self,
         off: usize,
         n: usize,
@@ -462,9 +496,13 @@ impl TierBuffer {
 
 /// Backs sequence slot `slot` of every lazy tier buffer up to `rows` rows (#1131): each
 /// tensor's slot rows past those it has, up to `rows` rounded up to whole chunks
-/// ([`LAZY_CHUNK_ROWS`], at most the slot), in new pinned memory on the GPU's host node, zeroed
-/// (as the shared zeros it replaces). Rows backed before stay.
-pub fn tp_tier_back(slot: usize, rows: usize) -> Result<(), String> {
+/// ([`LAZY_CHUNK_ROWS`], at most the slot), zeroed (as the shared zeros they replace). Rows
+/// backed before stay. Of the slot's chunks past its own VRAM rows, `lent` rows' worth (whole
+/// chunks) are VRAM chunks of the shared pool while it has some (#1159), the rest pinned
+/// memory on the GPU's host node: new chunks take VRAM first, then the slot's chunks move
+/// between the two to match (the lowest host chunks into VRAM, the highest VRAM chunks out),
+/// their rows copied.
+pub fn tp_tier_back(slot: usize, rows: usize, lent: usize) -> Result<(), String> {
     let list = LAZY.lock().unwrap();
     for &p in list.iter() {
         // SAFETY: a live lazy buffer: `tier_free` takes it off the list before freeing it, under
@@ -474,102 +512,292 @@ pub fn tp_tier_back(slot: usize, rows: usize) -> Result<(), String> {
             continue;
         };
         let rows = rows.next_multiple_of(LAZY_CHUNK_ROWS).min(l.slot_rows);
-        let mut new = Vec::new();
-        for (t, &(off, row, _)) in l.tensors.iter().enumerate() {
-            let Some(&have) = l.backed[t].get(slot) else {
+        let lent = lent / LAZY_CHUNK_ROWS;
+        // Per tensor: the chunks it is to hold past its VRAM rows, and how many in VRAM.
+        let mut work = Vec::new();
+        for (t, &(_, row, vram)) in l.tensors.iter().enumerate() {
+            let Some(held) = l.chunks[t].get(slot) else {
                 continue;
             };
-            if rows * row > have {
-                new.push((t, off + slot * l.slot_rows * row, have, rows * row, row));
+            let want = (rows * row).saturating_sub(vram) / (LAZY_CHUNK_ROWS * row);
+            let n = want.max(held.len());
+            let in_vram = held.iter().filter(|c| c.1).count();
+            let target = lent.min(n).min(in_vram + l.pool[t].len());
+            if n > held.len() || target != in_vram {
+                work.push((t, n, target));
             }
         }
-        if new.is_empty() {
+        if work.is_empty() {
             continue;
         }
         use_device(b.device)?;
-        let node = l.node;
-        // SAFETY: waits for whatever may still read the shared zeros there.
+        // SAFETY: waits for whatever may still read the shared zeros or the chunks that move.
         rt(unsafe { cudaDeviceSynchronize() }, "cudaDeviceSynchronize")?;
-        for (t, base, have, want, row) in new {
-            let chunk = LAZY_CHUNK_ROWS * row;
-            // SAFETY: the shared zeros' mappings in the stretch, each mapped on its own.
-            unsafe {
-                for at in (have..want).step_by(chunk) {
-                    cuMemUnmap(b.va + (base + at) as u64, chunk);
-                }
-            }
-            let host = host_location(node);
-            let h = match b.map_piece(base + have, want - have, host) {
-                Ok(h) => h,
-                Err(e) => {
-                    // The zeros back in place: the range stays readable.
-                    let zero = b.zero_piece(chunk)?;
-                    for at in (have..want).step_by(chunk) {
-                        b.map_zero(base + at, chunk, zero)?;
-                    }
-                    return Err(e);
-                }
-            };
-            let l = b.lazy.as_mut().expect("a lazy buffer");
-            l.pieces[slot].push((base + have, want - have, h));
-            l.backed[t][slot] = want;
-            // SAFETY: the piece just mapped, which the device may access.
-            rt(
-                unsafe { cudaMemset((b.va + (base + have) as u64) as *mut c_void, 0, want - have) },
-                "cudaMemset(KV tier)",
-            )?;
+        for (t, n, target) in work {
+            b.place_chunks(t, slot, n, target)?;
         }
-        // The zeros land before any stream reads them (ggml's streams do not wait for the
-        // legacy stream's memset).
+        // The zeros and copies land before any stream reads them (ggml's streams do not wait
+        // for the legacy stream's memsets and copies).
         // SAFETY: a plain synchronization of the current device.
         rt(unsafe { cudaDeviceSynchronize() }, "cudaDeviceSynchronize")?;
     }
     Ok(())
 }
 
-/// Gives back the host memory [`tp_tier_back`] mapped for slot `slot` of every lazy tier
-/// buffer (no sequence is in the slot), once the GPUs finished what may still read it: the
-/// shared zeros take its place. Its VRAM rows stay.
+impl TierBuffer {
+    /// A lazy buffer's slots.
+    fn slots(&mut self) -> &mut LazySlots {
+        self.lazy.as_mut().expect("a lazy buffer")
+    }
+
+    /// Tensor `t`'s slot `slot` (see [`tp_tier_back`]): `n` chunks past its VRAM rows, `target`
+    /// of them VRAM chunks (the pool has them).
+    fn place_chunks(
+        &mut self,
+        t: usize,
+        slot: usize,
+        n: usize,
+        target: usize,
+    ) -> Result<(), String> {
+        let l = self.lazy.as_ref().expect("a lazy buffer");
+        let (off, row, vram) = l.tensors[t];
+        let chunk = LAZY_CHUNK_ROWS * row;
+        let base = off + slot * l.slot_rows * row + vram;
+        let host = host_location(l.node);
+        // VRAM chunks past the target out to the host, the highest first.
+        while self.slots().in_vram(t, slot) > target {
+            let held = &self.slots().chunks[t][slot];
+            let i = held.iter().rposition(|c| c.1).expect("a VRAM chunk");
+            let old = held[i].0;
+            let h = new_piece(chunk, host)?;
+            if let Err(e) = self.move_chunk(base + i * chunk, chunk, old, h) {
+                // SAFETY: the piece just made, mapped nowhere (the VRAM chunk stays in place).
+                unsafe { cuMemRelease(h) };
+                return Err(e);
+            }
+            let l = self.slots();
+            l.chunks[t][slot][i] = (h, false);
+            l.pool[t].push(old);
+        }
+        // New chunks: VRAM while under the target, else host memory. Those mapped are zeroed
+        // even when a later one fails, so no slot holds rows that were never written.
+        let have = self.slots().chunks[t][slot].len();
+        let mut failed = None;
+        for i in have..n {
+            let at = base + i * chunk;
+            let vram_chunk = if self.slots().in_vram(t, slot) < target {
+                self.slots().pool[t].pop()
+            } else {
+                None
+            };
+            let (h, lent) = match vram_chunk {
+                Some(h) => (h, true),
+                None => match new_piece(chunk, host) {
+                    Ok(h) => (h, false),
+                    Err(e) => {
+                        failed = Some(e);
+                        break;
+                    }
+                },
+            };
+            // SAFETY: the shared zeros' mapping there (each chunk mapped on its own).
+            unsafe { cuMemUnmap(self.va + at as u64, chunk) };
+            if let Err(e) = self.map_handle(at, chunk, h) {
+                if lent {
+                    self.slots().pool[t].push(h);
+                } else {
+                    // SAFETY: the piece just made, mapped nowhere.
+                    unsafe { cuMemRelease(h) };
+                }
+                // The zeros back in place: the range stays readable.
+                let zero = self.zero_piece(chunk)?;
+                self.map_handle(at, chunk, zero)?;
+                failed = Some(e);
+                break;
+            }
+            self.slots().chunks[t][slot].push((h, lent));
+        }
+        let added = self.slots().chunks[t][slot].len() - have;
+        if added > 0 {
+            let at = self.va + (base + have * chunk) as u64;
+            // SAFETY: the chunks just mapped, which the device may access.
+            rt(
+                unsafe { cudaMemset(at as *mut c_void, 0, added * chunk) },
+                "cudaMemset(KV tier)",
+            )?;
+        }
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        // Host chunks into VRAM, the lowest first, up to the target.
+        while self.slots().in_vram(t, slot) < target {
+            let Some(i) = self.slots().chunks[t][slot].iter().position(|c| !c.1) else {
+                break;
+            };
+            let Some(h) = self.slots().pool[t].pop() else {
+                break;
+            };
+            let old = self.slots().chunks[t][slot][i].0;
+            if let Err(e) = self.move_chunk(base + i * chunk, chunk, old, h) {
+                // The host chunk stays in place; the VRAM chunk goes back to the pool.
+                self.slots().pool[t].push(h);
+                return Err(e);
+            }
+            // SAFETY: the host piece just unmapped.
+            unsafe { cuMemRelease(old) };
+            self.slots().chunks[t][slot][i] = (h, true);
+        }
+        Ok(())
+    }
+
+    /// Copies the `n` bytes of `old`, mapped at `off`, into `new` and maps it there in its place
+    /// (both handles stay the caller's), the device idle. On an error `old` is mapped at `off`
+    /// again and `new` is mapped nowhere.
+    fn move_chunk(
+        &self,
+        off: usize,
+        n: usize,
+        old: CUmemGenericAllocationHandle,
+        new: CUmemGenericAllocationHandle,
+    ) -> Result<(), String> {
+        let mut scratch: CUdeviceptr = 0;
+        // SAFETY: `new` mapped at a range of its own for the copy, then in place of the old
+        // mapping at `off` (whose rows it then holds).
+        unsafe {
+            cu(
+                cuMemAddressReserve(&mut scratch, n, 0, 0, 0),
+                "cuMemAddressReserve(KV tier move)",
+            )?;
+            let copied = (|| {
+                cu(cuMemMap(scratch, n, 0, new, 0), "cuMemMap(KV tier move)")?;
+                let a = access(CU_MEM_LOCATION_TYPE_DEVICE, self.device as i32);
+                let r = cu(
+                    cuMemSetAccess(scratch, n, &a, 1),
+                    "cuMemSetAccess(KV tier move)",
+                )
+                .and_then(|_| {
+                    rt(
+                        cudaMemcpy(
+                            scratch as *mut c_void,
+                            (self.va + off as u64) as *const c_void,
+                            n,
+                            CUDA_MEMCPY_DEFAULT,
+                        ),
+                        "cudaMemcpy(KV tier move)",
+                    )
+                })
+                .and_then(|_| rt(cudaDeviceSynchronize(), "cudaDeviceSynchronize"));
+                cuMemUnmap(scratch, n);
+                r
+            })();
+            cuMemAddressFree(scratch, n);
+            copied?;
+            cuMemUnmap(self.va + off as u64, n);
+        }
+        self.map_handle(off, n, new).inspect_err(|_| {
+            // The old rows back in place (a mapping that just worked there); if that fails too
+            // the error already returned stops the engine.
+            let _ = self.map_handle(off, n, old);
+        })
+    }
+}
+
+/// Adds up to `more` VRAM chunks to every lazy buffer's shared pool (#1159), one chunk per
+/// tensor of every buffer at a time, so the pools stay alike: the chunks added (fewer where
+/// the GPUs run out of memory; that set's pieces are released).
+pub fn tp_tier_lend(more: usize) -> usize {
+    let list = LAZY.lock().unwrap();
+    for k in 0..more {
+        let mut made: Vec<(usize, usize, CUmemGenericAllocationHandle)> = Vec::new();
+        let mut short = false;
+        'all: for (bi, &p) in list.iter().enumerate() {
+            // SAFETY: as in `tp_tier_back`.
+            let b = unsafe { &*(p as *const TierBuffer) };
+            let Some(l) = b.lazy.as_ref() else {
+                continue;
+            };
+            for (t, &(_, row, _)) in l.tensors.iter().enumerate() {
+                match new_piece(
+                    LAZY_CHUNK_ROWS * row,
+                    (CU_MEM_LOCATION_TYPE_DEVICE, b.device as i32),
+                ) {
+                    Ok(h) => made.push((bi, t, h)),
+                    Err(_) => {
+                        short = true;
+                        break 'all;
+                    }
+                }
+            }
+        }
+        if short || made.is_empty() {
+            for (_, _, h) in made {
+                // SAFETY: a piece just made, mapped nowhere.
+                unsafe { cuMemRelease(h) };
+            }
+            return k;
+        }
+        for (bi, t, h) in made {
+            // SAFETY: as in `tp_tier_back`.
+            let b = unsafe { &mut *(list[bi] as *mut TierBuffer) };
+            b.slots().pool[t].push(h);
+        }
+    }
+    more
+}
+
+/// A new allocation of `n` bytes at `location`, mapped nowhere.
+fn new_piece(n: usize, location: (u32, i32)) -> Result<CUmemGenericAllocationHandle, String> {
+    let prop = alloc_prop(location.0, location.1);
+    let mut h: CUmemGenericAllocationHandle = 0;
+    // SAFETY: a new allocation; the caller maps and releases it.
+    cu(
+        unsafe { cuMemCreate(&mut h, n, &prop, 0) },
+        "cuMemCreate(KV tier)",
+    )?;
+    Ok(h)
+}
+
+/// Gives back the chunks [`tp_tier_back`] mapped for slot `slot` of every lazy tier buffer (no
+/// sequence is in the slot), once the GPUs finished what may still read them: host memory is
+/// released, VRAM chunks go back to the pool, and the shared zeros take their place. Its own
+/// VRAM rows stay.
 pub fn tp_tier_trim(slot: usize) -> Result<(), String> {
     let list = LAZY.lock().unwrap();
     for &p in list.iter() {
         // SAFETY: as in `tp_tier_back`.
         let b = unsafe { &mut *(p as *mut TierBuffer) };
-        let va = b.va;
-        if b.lazy
-            .as_ref()
-            .is_none_or(|l| l.pieces.get(slot).is_none_or(|p| p.is_empty()))
-        {
+        let held = |l: &LazySlots| {
+            l.chunks
+                .iter()
+                .any(|c| c.get(slot).is_some_and(|h| !h.is_empty()))
+        };
+        if b.lazy.as_ref().is_none_or(|l| !held(l)) {
             continue;
         }
         use_device(b.device)?;
-        let l = b.lazy.as_mut().expect("a lazy buffer");
-        let pieces = std::mem::take(&mut l.pieces[slot]);
-        // SAFETY: waits for the device, then unmaps and releases this slot's own pieces.
-        unsafe {
-            rt(cudaDeviceSynchronize(), "cudaDeviceSynchronize")?;
-            for (off, n, h) in pieces {
-                cuMemUnmap(va + off as u64, n);
-                cuMemRelease(h);
+        // SAFETY: a plain synchronization: nothing may still read the slot's chunks.
+        rt(unsafe { cudaDeviceSynchronize() }, "cudaDeviceSynchronize")?;
+        for t in 0..b.slots().tensors.len() {
+            let va = b.va;
+            let l = b.slots();
+            let (off, row, vram) = l.tensors[t];
+            let chunk = LAZY_CHUNK_ROWS * row;
+            let base = off + slot * l.slot_rows * row + vram;
+            let chunks = std::mem::take(&mut l.chunks[t][slot]);
+            for (i, &(h, lent)) in chunks.iter().enumerate() {
+                // SAFETY: the slot's own chunk, mapped on its own; a host one released.
+                unsafe { cuMemUnmap(va + (base + i * chunk) as u64, chunk) };
+                if lent {
+                    l.pool[t].push(h);
+                } else {
+                    // SAFETY: as above.
+                    unsafe { cuMemRelease(h) };
+                }
             }
-        }
-        let l = b.lazy.as_ref().expect("a lazy buffer");
-        let stretches: Vec<(usize, usize, usize, usize)> = l
-            .tensors
-            .iter()
-            .enumerate()
-            .map(|(t, &(off, row, vram))| {
-                (t, off + slot * l.slot_rows * row, vram, l.backed[t][slot])
-            })
-            .collect();
-        let rows: Vec<usize> = l.tensors.iter().map(|t| t.1).collect();
-        for (t, base, vram, have) in stretches {
-            let chunk = LAZY_CHUNK_ROWS * rows[t];
             let zero = b.zero_piece(chunk)?;
-            for at in (vram..have).step_by(chunk) {
-                b.map_zero(base + at, chunk, zero)?;
+            for i in 0..chunks.len() {
+                b.map_handle(base + i * chunk, chunk, zero)?;
             }
-            b.lazy.as_mut().expect("a lazy buffer").backed[t][slot] = vram;
         }
     }
     Ok(())
@@ -707,6 +935,13 @@ unsafe extern "C" fn tier_dev_buffer_type(
     }
 }
 
+/// The mapping granule of CUDA device `device`'s tier buffers ([`tp_tier_devices`]): a lazy
+/// slot's chunks must be whole granules.
+pub fn tp_tier_granularity(device: usize) -> Option<usize> {
+    let caps = caps(device)?;
+    Some(caps.device_granularity.max(caps.host_granularity).max(256))
+}
+
 /// The CUDA devices `devices` (ggml's indices) as devices whose buffer type keeps a tensor's
 /// first `hbm_rows` rows in the device's memory and the rest in pinned memory on its host NUMA
 /// node (with `slot_rows` > 0: each slot's of that many rows), for a meta device
@@ -715,12 +950,15 @@ unsafe extern "C" fn tier_dev_buffer_type(
 /// `alias`: devices of the alias type (see the module), for a second meta buffer over the
 /// cache allocated just before with the others. `lazy` (with slots): each slot's host rows are
 /// mapped only as [`tp_tier_back`] asks, for slots the host could not hold all at once.
+/// `lend` (lazy slots): VRAM chunks per tensor ([`LAZY_CHUNK_ROWS`] rows) the slots share past
+/// their own VRAM rows (#1159).
 pub fn tp_tier_devices(
     devices: &[usize],
     hbm_rows: usize,
     slot_rows: usize,
     alias: bool,
     lazy: bool,
+    lend: usize,
 ) -> Result<Vec<Device>, String> {
     devices
         .iter()
@@ -739,6 +977,7 @@ pub fn tp_tier_devices(
                     && t.slot_rows == slot_rows
                     && t.alias == alias
                     && t.lazy == lazy
+                    && t.lend == lend
             }) {
                 // SAFETY: a registered device, never freed.
                 return Ok(unsafe { Device::from_raw(NonNull::from(&mut t.dev)) });
@@ -758,10 +997,15 @@ pub fn tp_tier_devices(
                 slot_rows,
                 alias,
                 lazy,
+                lend,
                 gran,
                 name: CString::new(format!(
                     "CUDA{device}_KvTier{node}{}{}",
-                    if lazy { "Lazy" } else { "" },
+                    match (lazy, lend) {
+                        (false, _) => String::new(),
+                        (true, 0) => "Lazy".into(),
+                        (true, n) => format!("Lazy{n}"),
+                    },
                     if alias { "Alias" } else { "" }
                 ))
                 .unwrap(),

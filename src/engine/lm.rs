@@ -345,6 +345,10 @@ pub(crate) fn lazy_slot_cap(held: usize, n_seqs: usize) -> usize {
 
 /// [`crate::residency::cuda::LAZY_CHUNK_ROWS`] in blocks.
 pub(crate) const LAZY_CHUNK_BLOCKS: usize = 4096 / KV_BLOCK;
+
+/// VRAM per GPU kept free past the steps' measured buffers and their margin when the slots'
+/// shared chunks take what the load left (#1159).
+const LEND_SAFETY: usize = 512 << 20;
 #[cfg(feature = "cuda")]
 const _: () = assert!(LAZY_CHUNK_BLOCKS * KV_BLOCK == crate::residency::cuda::LAZY_CHUNK_ROWS);
 
@@ -1820,13 +1824,24 @@ fn fit_tp_slots(
         }
         device = room();
     }
-    let hbm_slot = (device / n_seqs / ROUND * ROUND).min(slot_blocks);
+    let fixed = (device / n_seqs / ROUND * ROUND).min(slot_blocks);
+    // #1159: where the slots do not all fit, the VRAM is not split into a fixed share per slot
+    // (idle slots' shares left empty while a long sequence reads most of its context over the
+    // link): the slots share it in whole chunks, the running sequences' first, idle warm ones
+    // giving theirs up to the host tier. Only where blocks live changes, never what is read.
+    let lend = if !spilled && fixed < slot_blocks && lend_fits(exec, layout) {
+        (device / ROUND * ROUND).min(n_seqs * slot_blocks)
+    } else {
+        0
+    };
+    exec.set_kv_slot_lend(lend, compute + margin);
+    let hbm_slot = if lend > 0 { 0 } else { fixed };
     let n_blocks = n_seqs * slot_blocks;
     let dev = n_seqs * hbm_slot;
     let host = n_blocks - dev;
     let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
     let n_dev = layout.tp_devices.len().max(1);
-    if hbm_slot == 0 && !(spilled && matches!(tier, TpTier::Auto(_))) {
+    if hbm_slot == 0 && lend == 0 && !(spilled && matches!(tier, TpTier::Auto(_))) {
         return Err(LoadError::Device(format!(
             "--kv-slots: no room for {ROUND} blocks of KV cache per sequence on the GPUs next to \
              {:.1} GiB of compute buffers per GPU; lower --max-seqs",
@@ -1876,8 +1891,10 @@ fn fit_tp_slots(
             TpTier::Blocks(_) => {}
         }
     }
-    exec.resize_kv(dev.max(1))
-        .map_err(|e| LoadError::Device(format!("cannot allocate {dev} KV blocks: {e}")))?;
+    // Shared: their VRAM held as the slots' would be until the tier takes it.
+    let held = if lend > 0 { lend } else { dev };
+    exec.resize_kv(held.max(1))
+        .map_err(|e| LoadError::Device(format!("cannot allocate {held} KV blocks: {e}")))?;
     exec.set_max_seq_tokens(asked + spec_k);
     // Nothing is gathered.
     exec.set_gather_budget(0);
@@ -1887,6 +1904,7 @@ fn fit_tp_slots(
         slots = n_seqs,
         slot_tokens = slot_blocks * KV_BLOCK,
         device_tokens_per_slot = hbm_slot * KV_BLOCK,
+        shared_device_tokens = lend * KV_BLOCK,
         mixed_mib = mixed >> 20,
         decode_mib = decode >> 20,
         mtp_decode_mib = mtp_decode >> 20,
@@ -1899,6 +1917,33 @@ fn fit_tp_slots(
         "tensor-parallel cache fitted in per-sequence slots"
     );
     Ok((dev, host))
+}
+
+/// Whether the sequence slots of a tensor-parallel cache can share VRAM in chunks (#1159):
+/// every cache tensor's chunk of [`LAZY_CHUNK_BLOCKS`] blocks on each GPU (its heads split
+/// evenly) is whole mapping granules (a q8_0 row's 17/16 of a power of two is not).
+#[cfg(feature = "cuda")]
+fn lend_fits(exec: &Executor, layout: &layout::Layout) -> bool {
+    let n = layout.tp_devices.len().max(1);
+    let Some(gran) = layout
+        .tp_devices
+        .first()
+        .and_then(|d| cuda_index(*d))
+        .and_then(crate::residency::cuda::tp_tier_granularity)
+    else {
+        return false;
+    };
+    let rows = LAZY_CHUNK_BLOCKS * KV_BLOCK;
+    let bytes = exec.kv_cell_tensor_bytes();
+    !bytes.is_empty()
+        && bytes
+            .iter()
+            .all(|&b| b % n == 0 && (b / n * rows) % gran == 0)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn lend_fits(_: &Executor, _: &layout::Layout) -> bool {
+    false
 }
 
 /// A tensor-parallel cache's host tier (#317), for [`fit_tp_cache`].
@@ -2054,13 +2099,14 @@ fn managed_tp_cache(
 /// The host tiers of a layout's KV pools (#352): per stage, its GPU's ordinal and NUMA node,
 /// the first `hbm_blocks` blocks in device memory. A tensor-parallel cache's one tier, over a
 /// meta device, keeps the first `slot.0` blocks of each `slot.1`-block sequence slot in VRAM
-/// (`slot.1` 0: no slots, the first `slot.0` of the whole cache).
+/// (`slot.1` 0: no slots, the first `slot.0` of the whole cache), backed as they fill with
+/// `slot.2`, sharing `slot.3` more VRAM blocks (#1159).
 fn kv_tiers(
     layout: &layout::Layout,
     hp: &crate::model::core::Hparams,
     hbm_blocks: usize,
     stage_blocks: usize,
-    slot: (usize, usize, bool),
+    slot: (usize, usize, bool, usize),
 ) -> Result<Vec<Option<crate::model::core::KvTier>>, String> {
     if !layout.tp_devices.is_empty() {
         let devices = layout
@@ -2120,7 +2166,7 @@ fn tp_tier_for(
     hp: &crate::model::core::Hparams,
     devices: &[usize],
     hbm_blocks: usize,
-    (slot_hbm, slot_blocks, lazy): (usize, usize, bool),
+    (slot_hbm, slot_blocks, lazy, lend): (usize, usize, bool, usize),
 ) -> Result<crate::model::core::KvTier, String> {
     let split = |alias| -> Result<crate::model::core::SplitTier, String> {
         let tiered = crate::residency::cuda::tp_tier_devices(
@@ -2129,6 +2175,7 @@ fn tp_tier_for(
             slot_blocks * KV_BLOCK,
             alias,
             lazy,
+            lend / LAZY_CHUNK_BLOCKS,
         )
         .map_err(|e| format!("--kv-host-tokens: {e}"))?;
         let meta = crate::ggml::meta::meta_device(
@@ -2159,7 +2206,7 @@ fn tp_tier_for(
     _: &crate::model::core::Hparams,
     _: &[usize],
     _: usize,
-    _: (usize, usize, bool),
+    _: (usize, usize, bool, usize),
 ) -> Result<crate::model::core::KvTier, String> {
     Err("--kv-host-tokens needs CUDA".into())
 }
@@ -3460,6 +3507,7 @@ fn log_memory_plan(
         }
     };
     let keep_tokens = f.kv_lend.map(|l| l.keep * KV_BLOCK);
+    let lent_tokens = exec.kv_slot_lend() * KV_BLOCK;
     let n_stages = exec.stage_layers().len();
     let mut gpus = Vec::new();
     for (si, ((d, _), s)) in layout.stages.iter().zip(&report.stages).enumerate() {
@@ -3475,7 +3523,8 @@ fn log_memory_plan(
         let at = |v: &[usize]| v.get(si).map_or(0, |&b| b as u64);
         let facts = plan::StageFacts {
             kv_lent: at(f.kv_lent_bytes),
-            kv_vram_tokens: keep_tokens.unwrap_or(s.kv_tokens),
+            // The slots' shared VRAM (#1159) with the tokens the load placed there.
+            kv_vram_tokens: keep_tokens.unwrap_or(s.kv_tokens + lent_tokens),
             compute_allocated: if si < n_stages {
                 exec.compute_bytes(si) as u64
             } else {
@@ -4552,7 +4601,12 @@ impl LmEngine {
                 &hp,
                 hbm_blocks,
                 stage_blocks,
-                (slot_hbm, slot_blocks, exec.kv_slot_host_budget().is_some()),
+                (
+                    slot_hbm,
+                    slot_blocks,
+                    exec.kv_slot_host_budget().is_some() || exec.kv_slot_lend() > 0,
+                    exec.kv_slot_lend(),
+                ),
             )
             .map_err(LoadError::Device)?;
             if slot_blocks > 0 {
@@ -5038,6 +5092,30 @@ impl LmEngine {
             hbm_blocks = hbm_blocks.min(blocks);
         }
 
+        // #1159: VRAM the fit could not see free (it measured the steps' buffers next to
+        // what the load held then) goes to the slots' shared chunks too, the steps' buffers,
+        // their margin and LEND_SAFETY left free.
+        if exec.kv_slot_lend() > 0 {
+            let least = (layout.tp_devices.iter())
+                .map(|d| d.memory().0)
+                .min()
+                .unwrap_or(0);
+            let keep = exec.kv_slot_lend_keep() + LEND_SAFETY;
+            let n_dev = layout.tp_devices.len().max(1);
+            let chunk = (LAZY_CHUNK_BLOCKS * exec.kv_block_bytes() / n_dev).max(1);
+            let most = (max_seqs * exec.kv_slot_blocks()).saturating_sub(exec.kv_slot_lend());
+            let want = (least.saturating_sub(keep) / chunk * LAZY_CHUNK_BLOCKS).min(most);
+            if want > 0 {
+                let added = exec.lend_kv_slots_more(want);
+                tracing::info!(
+                    added_tokens = added * KV_BLOCK,
+                    shared_device_tokens = exec.kv_slot_lend() * KV_BLOCK,
+                    free_mib = least >> 20,
+                    kept_free_mib = keep >> 20,
+                    "KV slots: more shared VRAM after the load"
+                );
+            }
+        }
         let load_report = load_report(
             &layout,
             &mut exec,
@@ -5182,6 +5260,7 @@ impl LmEngine {
             None => None,
         };
         let slot_host_budget = exec.kv_slot_host_budget();
+        let slot_lend = exec.kv_slot_lend();
         let ring_ckpt_slots = exec.ring_save_slots();
         let worker = Worker {
             exec,
@@ -5214,12 +5293,15 @@ impl LmEngine {
             } else {
                 Vec::new()
             },
-            slot_backing: slot_host_budget.map(|held| {
+            // Backed as they fill where the host cannot hold them all, or where they share
+            // VRAM (#1159).
+            slot_backing: (slot_host_budget.is_some() || slot_lend > 0).then(|| {
                 slot_backing::SlotBacking::new(
                     max_seqs,
                     slot_blocks,
                     hbm_blocks / max_seqs.max(1),
-                    held,
+                    slot_host_budget.unwrap_or(usize::MAX),
+                    slot_lend,
                 )
             }),
             warm: Vec::new(),
@@ -6402,6 +6484,17 @@ impl Worker {
         }
         if self.pool.slot_blocks() > 0 {
             self.free_kv_slots.push(kv_slot);
+            // Shared VRAM goes back at once, for the slots that run (#1159).
+            if self.slot_backing.as_ref().is_some_and(|b| b.lends()) {
+                match self.exec.trim_kv_slot(kv_slot as usize) {
+                    Ok(()) => {
+                        if let Some(b) = &mut self.slot_backing {
+                            b.trimmed(kv_slot);
+                        }
+                    }
+                    Err(e) => tracing::error!(kv_slot, "cannot give back a KV slot: {e}"),
+                }
+            }
         }
     }
 
@@ -6413,12 +6506,16 @@ impl Worker {
     }
 
     /// Backs slot `slot`'s first `blocks` blocks where its host tier is backed as it fills
-    /// ([`slot_backing`]), idle slots giving back their room first if needed.
+    /// ([`slot_backing`]), idle slots giving back their room first if needed; where the slots
+    /// share VRAM, as many of them in it as it has, warm slots' moved out if needed.
     fn back_slot(&mut self, slot: u32, blocks: usize) -> Result<(), String> {
         let Some(b) = &self.slot_backing else {
             return Ok(());
         };
-        let Some(plan) = b.plan(slot, blocks, &self.free_kv_slots)? else {
+        let mut warm: Vec<(u64, u32)> = self.warm.iter().map(|w| (w.stamp, w.kv_slot)).collect();
+        warm.sort_unstable();
+        let warm: Vec<u32> = warm.into_iter().map(|w| w.1).collect();
+        let Some(plan) = b.plan(slot, blocks, &self.free_kv_slots, &warm)? else {
             return Ok(());
         };
         for &s in &plan.trim {
@@ -6427,9 +6524,21 @@ impl Worker {
                 b.trimmed(s);
             }
         }
-        self.exec.back_kv_slot(slot as usize, plan.to * KV_BLOCK)?;
+        for &(w, keep) in &plan.demote {
+            let Some(b) = &mut self.slot_backing else {
+                break;
+            };
+            let (to, _) = b.held(w);
+            self.exec
+                .back_kv_slot(w as usize, to * KV_BLOCK, keep * KV_BLOCK)?;
+            if let Some(b) = &mut self.slot_backing {
+                b.backed(w, to, keep);
+            }
+        }
+        self.exec
+            .back_kv_slot(slot as usize, plan.to * KV_BLOCK, plan.lent * KV_BLOCK)?;
         if let Some(b) = &mut self.slot_backing {
-            b.backed(slot, plan.to);
+            b.backed(slot, plan.to, plan.lent);
         }
         Ok(())
     }
