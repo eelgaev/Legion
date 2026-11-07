@@ -257,13 +257,20 @@ impl Sampler {
     fn top_k_candidates(&self, logits: &[f32], k: usize) -> Vec<(u32, f64)> {
         let p = &self.params;
         let mut best: Vec<(f32, u32)> = Vec::with_capacity(k + 1);
-        for (id, &l) in logits.iter().enumerate() {
-            if best.len() == k && l.total_cmp(&best[k - 1].0).is_le() {
+        for (c, chunk) in logits.chunks(SCAN_CHUNK).enumerate() {
+            // Once k are kept, a chunk all strictly below the k-th best is skipped whole: the
+            // loop below would skip each of its values (a NaN or a tie goes through it).
+            if best.len() == k && all_below(chunk, best[k - 1].0) {
                 continue;
             }
-            let at = best.partition_point(|&(b, _)| b.total_cmp(&l).is_ge());
-            best.insert(at, (l, id as u32));
-            best.truncate(k);
+            for (j, &l) in chunk.iter().enumerate() {
+                if best.len() == k && l.total_cmp(&best[k - 1].0).is_le() {
+                    continue;
+                }
+                let at = best.partition_point(|&(b, _)| b.total_cmp(&l).is_ge());
+                best.insert(at, (l, (c * SCAN_CHUNK + j) as u32));
+                best.truncate(k);
+            }
         }
         let max = best[0].0 as f64;
         let prob = |l: f32| (l as f64 - max).exp();
@@ -444,6 +451,16 @@ fn sort_by_logit(ids: &mut [u32], logits: &[f32]) {
 /// Largest top-k taken by [`Sampler::top_k_candidates`]; beyond it the buffer's inserts cost
 /// more than the general path's selection.
 const SMALL_TOP_K: usize = 256;
+
+/// Logits per chunk of [`Sampler::top_k_candidates`]'s scan.
+const SCAN_CHUNK: usize = 64;
+
+/// Whether every value of `chunk` is strictly below `t` (false for a NaN in either): a
+/// comparison and an OR per value, no early exit, so it vectorizes. A value strictly below `t`
+/// is also below it by `total_cmp`.
+fn all_below(chunk: &[f32], t: f32) -> bool {
+    !chunk.iter().fold(false, |any, &l| any | !(l < t))
+}
 
 /// Index of the largest value (the first one on ties).
 pub fn argmax(x: &[f32]) -> usize {
