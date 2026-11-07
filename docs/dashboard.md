@@ -93,29 +93,53 @@ dashboard then shares. The sampler only queries NVML; it never touches the GPUs'
 
 ## The gauges
 
-Every link gets a one-line bar (a ratatui `LineGauge`), one row per link: the panel is as tall
-as the machine has links (one on a PCIe card, two per GPU on an AC922, one C2C on a GB10, plus
-TP net with two Sparks). The bar fills to the busier direction, max(RX, TX), over the link's
-per-direction full scale: green under 60%, yellow under 85%, red above, grey without a full
-scale. Its label carries the figures:
+Every link (one on a PCIe card, two per GPU on an AC922, one C2C on a GB10, plus TP net with
+two Sparks) gets a title line and two solid bars, RX over TX:
 
 ```text
-GPU0 NVLink CPU  RX 14.5  TX 3.20  / 75.0 GB/s  pk 20.0  Legion 12.1  3 links NVLink 2
+GPU0 NVLink CPU  / 75.0 GB/s  Legion 12.1  3 links NVLink 2
+RX █████████▋▓▓▓14.5 GB/s  19%  pk 22.0░░░░░░░░░░░░░░
+TX ██▏▓░░░░░░░░░░3.20 GB/s  4%  pk 6.10░░░░░░░░░░░░░░
 ```
 
-RX (magenta) and TX (cyan) are the hardware counter's; `pk` is the busier direction's peak over
-the last 10 s; Legion (yellow) is Legion's own bytes on the link: the model bytes the steps must
-move (weights and experts streamed from host memory, host-tier KV), counted by the engine, not
-measured. A link without a counter reads `RX n/a  TX n/a (<why>)` and its bar shows Legion's
-bytes instead. On narrow panels the label gets shorter instead of wrapping: the link's detail
-goes first, then the peak, then `Legion` becomes `L` and the kind its short name
-(`GPU0 CPU RX 14.5 TX 3.20 / 75.0 GB/s L 12.1`), then the unit, then the full scale (the bar
-still shows it); a link without a counter then reads `no counter`. All bars of a panel start in
-the same column. More links than rows go into side-by-side columns.
+(`░` stands for the empty part's dim background, which the terminal draws as a colour.)
+
+Each bar fills to its own direction over the link's per-direction full scale, with the value
+inside. Past the value a shaded "ghost" fill of the same hue, dimmer, runs on to the
+direction's peak over the last 10 s (`pk`), then the empty part. The fill follows the load on a gradient from green through yellow (60%) and orange
+(80%) to red (100%); terminals that announce 24-bit colour (`COLORTERM=truecolor`, or a `TERM`
+such as kitty, ghostty, alacritty, foot or wezterm) get it in RGB, `*-256color` terminals in the
+256-colour palette, others green under 60%, yellow under 85% and red above. Grey: no full
+scale. The empty part is a dim background; the value reads dark over the filled part and in the
+fill colour over the ghost and the empty part (16 colours: the ghost is the fill's colour,
+dim). RX is cyan and TX magenta; the title's colour says the link's
+type (NVLink green, PCIe blue, C2C red, TP net white).
+
+RX and TX are the hardware counter's; Legion (yellow) is Legion's own bytes on the link: the model bytes the steps must move (weights
+and experts streamed from host memory, host-tier KV), counted by the engine, not measured. A
+link without a counter gets one bar of Legion's bytes (`L`) and `RX/TX n/a (<why>)` under it.
+On narrow panels the title gets shorter instead of wrapping: the link's detail goes first, then
+`Legion` becomes `L` and the name its short form (`G0 CPU / 75.0 GB/s L 12.1`), then the
+unit, then the full scale; the value inside a bar drops `pk` first (the ghost fill stays),
+then its unit and then its percentage. The bars of a column start in the same cell. Links go into
+side-by-side columns where the width allows (a GPU's links stay together), and where they do
+not fit with their titles (the compact layout with four GPUs) the title goes and each row starts
+with a short name instead:
+
+```text
+G0 CPU RX  ▊8.00░░
+G0 CPU TX  ▏2.00░░
+```
 
 The memory gauge is a speedometer (a Braille half dial) with a needle for the measured
-bandwidth (cyan) and one for Legion's bytes (yellow); the compact layout's memory panel shows
-the same as bars.
+bandwidth (cyan) and one for Legion's bytes (yellow), and a red tick across the arc at the
+measured figure's 10 s peak (Legion's where nothing measures), also as `pk` after the figures;
+the compact layout's memory panel shows the same as bars.
+
+The same 10 s peak shows next to the throughput panel's decode and prefill tok/s
+(`decode 41.2 tok/s  pk 48.0`) and as the `pk` columns after the GPU table's SM utilization
+and power. A higher value takes the peak over at once and a lower one once the peak is 10 s
+old; a server restart clears them.
 
 | Gauge | Measured by | Full scale |
 |---|---|---|
@@ -140,7 +164,7 @@ What each machine shows:
   so the dashboard shows it as n/a. GB10 has no CPU DRAM PMU either, so nothing counts the
   shared memory's traffic. What the memory dial does show is Legion's own bytes: the model
   bytes per step over the step time, which sits at about 270 GB/s during decode there. The
-  C2C gauge reads `RX n/a  TX n/a (no C2C counter)` and its bar and Legion figure count
+  C2C gauge reads `RX/TX n/a (no C2C counter)` and its bar and Legion figure count
   host-tier bytes, which a single Spark does not have (it is all one memory), so they stay at
   0. VRAM is `unified`. With two Sparks a TP net gauge shows
   the exchange's bytes against the NIC's speed.

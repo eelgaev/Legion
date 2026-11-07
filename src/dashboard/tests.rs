@@ -1,6 +1,6 @@
 //! The dashboard without a terminal or a server: full-scale math, rates, latency windows, the
 //! log ring, the client's event parsing, the snapshot's JSON, the keys, and every widget drawn
-//! on ratatui's `TestBackend` at 80 x 24 and 200 x 60.
+//! on ratatui's `TestBackend` at 80 x 24, 120 x 46 and 200 x 60.
 
 use std::time::{Duration, Instant};
 
@@ -8,17 +8,22 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier};
+use ratatui::widgets::Widget;
 use tracing::Level;
 
 use super::client::{base_url, next_backoff, push_utf8, take_events};
-use super::gauge::{self, LEVELS, LinkGauge, MIN_BAR, load_color};
+use super::gauge::{
+    self, Bar, BarColors, BarRow, ColorDepth, Dir, GHOST, LEVELS, LinkGauge, Plan, VALUE_LEVELS,
+    cube, empty_color, gradient, kind_color, load_color, on_fill_color, value_label,
+};
 use super::latency::{BUCKETS, LatencyWindow, bucket, bucket_end, quantile};
 use super::logs::{CAPACITY, LogLine, LogRing, kept, level_rank};
 use super::scale::*;
 use super::snapshot::*;
 use super::speedo::{Speedo, angle, bar, gb};
 use super::term::{Feed, Inbox};
-use super::ui::{self, Action, App, Conn, Mode, PANELS, Panel};
+use super::ui::{self, Action, App, Conn, Mode, PANELS, Panel, PeakOf};
 
 fn close(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-6 * b.abs().max(1.0)
@@ -154,17 +159,19 @@ fn bar_lines_show_what_a_memory_dial_has() {
         measured: Some(163.8),
         legion: 120.0,
         note: None,
+        peak: Some(210.0),
     };
     let text: Vec<String> = d.bar_lines(40).iter().map(line_text).collect();
     assert_eq!(text.len(), 3);
     assert!(text[0].starts_with("meas") && text[0].ends_with("164"));
     assert!(text[1].starts_with('L') && text[1].ends_with("120"));
-    assert_eq!(text[2], "/273 GB/s");
+    assert_eq!(text[2], "/273 GB/s pk 210");
     // Unified memory without GPM: Legion's bytes only.
     let m = Speedo {
         measured: None,
         full_scale: None,
         note: Some("no GPM".into()),
+        peak: None,
         ..d
     };
     let text: Vec<String> = m.bar_lines(40).iter().map(line_text).collect();
@@ -175,181 +182,614 @@ fn bar_lines_show_what_a_memory_dial_has() {
 
 fn nvlink_cpu(rx: Option<f64>, tx: Option<f64>) -> LinkGauge {
     LinkGauge {
+        kind: LinkKind::NvlinkCpu,
+        gpu: Some(0),
         name: "GPU0 NVLink CPU".into(),
-        short: "GPU0 CPU".into(),
+        short: "G0 CPU".into(),
         full_scale: Some(75.0),
         rx,
         tx,
         legion: Some(12.1),
-        peak: Some(20.0),
+        rx_peak: Some(22.0),
+        tx_peak: Some(6.1),
+        legion_peak: Some(20.0),
         why: (rx.is_none() && tx.is_none()).then(|| "no NVML counter".into()),
         detail: Some("3 links NVLink 2".into()),
     }
 }
 
 #[test]
-fn a_link_gauge_fills_to_the_busier_direction_and_colours_by_load() {
+fn a_link_has_an_rx_and_a_tx_bar_each_over_the_full_scale() {
     let g = nvlink_cpu(Some(14.5), Some(3.2));
-    assert!(close(g.value().unwrap(), 14.5));
-    assert!(close(g.ratio(), 14.5 / 75.0));
-    assert!(close(nvlink_cpu(Some(1.0), Some(30.0)).ratio(), 0.4));
-    // Over the full scale clamps; no counter falls back to Legion's bytes.
-    assert_eq!(nvlink_cpu(Some(100.0), Some(1.0)).ratio(), 1.0);
-    assert!(close(nvlink_cpu(None, None).ratio(), 12.1 / 75.0));
-    // Nothing to show, no full scale, or NaN: an empty bar, never a panic in LineGauge.
-    let empty = LinkGauge {
-        legion: None,
-        ..nvlink_cpu(None, None)
-    };
-    assert_eq!(empty.value(), None);
-    assert_eq!(empty.ratio(), 0.0);
+    assert_eq!(
+        g.rows(),
+        vec![
+            BarRow::Bar(Dir::Rx, Some(14.5), Some(22.0)),
+            BarRow::Bar(Dir::Tx, Some(3.2), Some(6.1))
+        ]
+    );
+    assert!(close(g.ratio(g.rx), 14.5 / 75.0));
+    assert!(close(g.ratio(g.tx), 3.2 / 75.0));
+    // Over the full scale clamps; nothing, NaN, no full scale or a zero one read 0.
+    assert_eq!(g.ratio(Some(100.0)), 1.0);
+    assert_eq!(g.ratio(None), 0.0);
+    assert_eq!(g.ratio(Some(f64::NAN)), 0.0);
+    assert_eq!(g.ratio(Some(f64::INFINITY)), 0.0);
     let unscaled = LinkGauge {
         full_scale: None,
         ..g.clone()
     };
-    assert_eq!(unscaled.ratio(), 0.0);
-    assert_eq!(nvlink_cpu(Some(f64::NAN), None).ratio(), 0.0);
+    assert_eq!(unscaled.ratio(Some(10.0)), 0.0);
+    let zero = LinkGauge {
+        full_scale: Some(0.0),
+        ..g
+    };
+    assert_eq!(zero.ratio(Some(10.0)), 0.0);
+    // No counter: one bar of Legion's bytes and the reason; without Legion bytes the reason.
+    let n = nvlink_cpu(None, None);
     assert_eq!(
-        LinkGauge {
-            full_scale: Some(0.0),
-            ..g
-        }
-        .ratio(),
-        0.0
+        n.rows(),
+        vec![
+            BarRow::Bar(Dir::Legion, Some(12.1), Some(20.0)),
+            BarRow::Note("RX/TX n/a (no NVML counter)".into())
+        ]
     );
-    assert_eq!(load_color(0.0, true), ratatui::style::Color::Green);
-    assert_eq!(load_color(0.59, true), ratatui::style::Color::Green);
-    assert_eq!(load_color(0.6, true), ratatui::style::Color::Yellow);
-    assert_eq!(load_color(0.84, true), ratatui::style::Color::Yellow);
-    assert_eq!(load_color(0.85, true), ratatui::style::Color::Red);
-    assert_eq!(load_color(1.0, true), ratatui::style::Color::Red);
-    assert_eq!(load_color(0.9, false), ratatui::style::Color::DarkGray);
+    assert!(close(n.ratio(n.legion), 12.1 / 75.0));
+    let bare = LinkGauge {
+        legion: None,
+        why: None,
+        ..n
+    };
+    assert_eq!(
+        bare.rows(),
+        vec![BarRow::Note("RX/TX n/a (no counter)".into())]
+    );
 }
 
 #[test]
-fn link_labels_get_shorter_level_by_level() {
+fn the_fill_follows_a_gradient_with_a_16_colour_fallback() {
+    // The stops exactly; NaN and out-of-range clamp.
+    assert_eq!(gradient(0.0), (40, 200, 80));
+    assert_eq!(gradient(0.6), (235, 210, 40));
+    assert_eq!(gradient(0.8), (255, 140, 30));
+    assert_eq!(gradient(1.0), (235, 45, 45));
+    assert_eq!(gradient(f64::NAN), gradient(0.0));
+    assert_eq!(gradient(-1.0), gradient(0.0));
+    assert_eq!(gradient(7.0), gradient(1.0));
+    // Smooth: between the stops, red rises to orange and green falls after yellow.
+    let (r3, g3, _) = gradient(0.3);
+    assert!(r3 > 40 && r3 < 235 && g3 > 200 && g3 < 210, "{r3} {g3}");
+    let (_, g7, _) = gradient(0.7);
+    assert!(g7 > 140 && g7 < 210, "{g7}");
+    for i in 0..100 {
+        let (a, b) = (
+            gradient(f64::from(i) / 100.0),
+            gradient(f64::from(i + 1) / 100.0),
+        );
+        let step = |x: u8, y: u8| (i32::from(x) - i32::from(y)).abs();
+        assert!(step(a.0, b.0) <= 12 && step(a.1, b.1) <= 12 && step(a.2, b.2) <= 12);
+    }
+    // 16 colours: green under 60%, yellow under 85%, red above.
+    let basic = |r| load_color(r, true, ColorDepth::Ansi16);
+    assert_eq!(basic(0.0), Color::Green);
+    assert_eq!(basic(0.59), Color::Green);
+    assert_eq!(basic(0.6), Color::Yellow);
+    assert_eq!(basic(0.84), Color::Yellow);
+    assert_eq!(basic(0.85), Color::Red);
+    assert_eq!(basic(1.0), Color::Red);
+    assert_eq!(load_color(0.9, false, ColorDepth::Ansi16), Color::Gray);
+    // RGB and the 256-colour cube.
+    let (r, g, b) = gradient(0.3);
+    assert_eq!(load_color(0.3, true, ColorDepth::Rgb), Color::Rgb(r, g, b));
+    assert_eq!(
+        load_color(0.3, true, ColorDepth::Ansi256),
+        Color::Indexed(cube(r, g, b))
+    );
+    assert_eq!(cube(0, 0, 0), 16);
+    assert_eq!(cube(255, 255, 255), 231);
+    assert_eq!(cube(255, 0, 0), 196);
+    assert_eq!(cube(0, 255, 0), 46);
+    assert_eq!(cube(255, 135, 0), 208);
+    // The empty part is visible and differs from every fill; the text on the fill is dark.
+    for depth in [ColorDepth::Ansi16, ColorDepth::Ansi256, ColorDepth::Rgb] {
+        assert_ne!(empty_color(depth), Color::Reset);
+        assert_ne!(empty_color(depth), Color::Black);
+        for i in 0..=20 {
+            let r = f64::from(i) / 20.0;
+            assert_ne!(
+                load_color(r, true, depth),
+                empty_color(depth),
+                "{depth:?} {r}"
+            );
+        }
+        assert_ne!(load_color(0.0, false, depth), empty_color(depth));
+    }
+    assert_eq!(on_fill_color(ColorDepth::Ansi16), Color::Black);
+    // 256 colours: the empty part and the dark text from the grey ramp, not the cube.
+    assert_eq!(empty_color(ColorDepth::Ansi256), Color::Indexed(237));
+    assert_eq!(on_fill_color(ColorDepth::Ansi256), Color::Indexed(233));
+    // The ghost fill: the fill's hue, dimmer, apart from the fill and the empty part; in 16
+    // colours the fill's own colour, dim, over the empty part.
+    for depth in [ColorDepth::Ansi256, ColorDepth::Rgb] {
+        for i in 0..=20 {
+            let r = f64::from(i) / 20.0;
+            let c = BarColors::of(r, true, depth);
+            assert_ne!(c.ghost, c.fill, "{depth:?} {r}");
+            assert_ne!(c.ghost, c.empty, "{depth:?} {r}");
+            assert_eq!((c.ghost_bg, c.ghost_dim), (c.ghost, false));
+        }
+    }
+    let c = BarColors::of(0.3, true, ColorDepth::Rgb);
+    let ((fr, fg, fb), Color::Rgb(gr, gg, gb)) = (gradient(0.3), c.ghost) else {
+        panic!("{c:?}")
+    };
+    let sum = |r: u8, g: u8, b: u8| u32::from(r) + u32::from(g) + u32::from(b);
+    assert!(sum(gr, gg, gb) < sum(fr, fg, fb), "{c:?}");
+    let c = BarColors::of(0.9, true, ColorDepth::Ansi16);
+    assert_eq!(
+        (c.fill, c.ghost, c.ghost_dim),
+        (Color::Red, Color::Red, true)
+    );
+    assert_eq!(c.ghost_bg, Color::DarkGray);
+    // Link titles by type.
+    assert_eq!(
+        kind_color(LinkKind::NvlinkCpu),
+        kind_color(LinkKind::NvlinkPeer)
+    );
+    let kinds = [
+        LinkKind::NvlinkCpu,
+        LinkKind::Pcie,
+        LinkKind::C2c,
+        LinkKind::Network,
+    ];
+    for (i, a) in kinds.iter().enumerate() {
+        for b in &kinds[i + 1..] {
+            assert_ne!(kind_color(*a), kind_color(*b), "{a:?} {b:?}");
+        }
+    }
+}
+
+#[test]
+fn colour_depth_from_the_terminal() {
+    let d = |ct: Option<&str>, term: Option<&str>| ColorDepth::from_env(ct, term);
+    assert_eq!(
+        d(Some("truecolor"), Some("xterm-256color")),
+        ColorDepth::Rgb
+    );
+    assert_eq!(d(Some("24bit"), None), ColorDepth::Rgb);
+    assert_eq!(d(None, Some("xterm-kitty")), ColorDepth::Rgb);
+    assert_eq!(d(None, Some("xterm-ghostty")), ColorDepth::Rgb);
+    assert_eq!(d(None, Some("xterm-direct")), ColorDepth::Rgb);
+    assert_eq!(d(None, Some("tmux-256color")), ColorDepth::Ansi256);
+    assert_eq!(d(None, Some("xterm-256color")), ColorDepth::Ansi256);
+    assert_eq!(d(Some(""), Some("xterm")), ColorDepth::Ansi16);
+    assert_eq!(d(None, Some("linux")), ColorDepth::Ansi16);
+    assert_eq!(d(None, None), ColorDepth::Ansi16);
+}
+
+#[test]
+fn values_inside_a_bar_get_shorter_level_by_level() {
+    let r = 14.5 / 75.0;
+    let text: Vec<String> = (0..VALUE_LEVELS)
+        .map(|l| value_label(Some(14.5), Some(22.0), r, true, l))
+        .collect();
+    assert_eq!(
+        text,
+        [
+            "14.5 GB/s  19%  pk 22.0",
+            "14.5 GB/s  19%",
+            "14.5 GB/s 19%",
+            "14.5 19%",
+            "14.5",
+            ""
+        ]
+    );
+    // No peak yet: the first form without it.
+    assert_eq!(value_label(Some(14.5), None, r, true, 0), "14.5 GB/s  19%");
+    assert_eq!(
+        value_label(Some(14.5), Some(f64::NAN), r, true, 0),
+        "14.5 GB/s  19%"
+    );
+    // No full scale: no percentage.
+    assert_eq!(
+        value_label(Some(1.0), Some(2.0), 0.0, false, 0),
+        "1.00 GB/s  pk 2.00"
+    );
+    assert_eq!(
+        value_label(Some(1.0), Some(2.0), 0.0, false, 1),
+        "1.00 GB/s"
+    );
+    assert_eq!(value_label(Some(1.0), None, 0.0, false, 3), "1.00");
+    assert_eq!(
+        value_label(Some(70.0), Some(6.1), 70.0 / 75.0, true, 0),
+        "70.0 GB/s  93%  pk 6.10"
+    );
+    assert_eq!(value_label(None, Some(1.0), 0.0, true, 0), "n/a");
+    assert_eq!(value_label(Some(f64::NAN), None, 0.0, true, 1), "n/a");
+    assert_eq!(value_label(None, None, 0.0, true, VALUE_LEVELS - 1), "");
+}
+
+#[test]
+fn link_titles_get_shorter_level_by_level() {
     let g = nvlink_cpu(Some(14.5), Some(3.2));
-    let text: Vec<String> = (0..LEVELS).map(|l| line_text(&g.label(l))).collect();
+    let text: Vec<String> = (0..LEVELS).map(|l| line_text(&g.title(l))).collect();
     assert_eq!(
-        text[0],
-        "GPU0 NVLink CPU  RX 14.5  TX 3.20  / 75.0 GB/s  pk 20.0  Legion 12.1  3 links NVLink 2"
+        text,
+        [
+            "GPU0 NVLink CPU  / 75.0 GB/s  Legion 12.1  3 links NVLink 2",
+            "GPU0 NVLink CPU  / 75.0 GB/s  Legion 12.1",
+            "G0 CPU / 75.0 GB/s L 12.1",
+            "G0 CPU /75.0 L 12.1",
+            "G0 CPU L 12.1",
+        ]
     );
-    assert_eq!(
-        text[1],
-        "GPU0 NVLink CPU  RX 14.5  TX 3.20  / 75.0 GB/s  pk 20.0  Legion 12.1"
-    );
-    assert_eq!(
-        text[2],
-        "GPU0 NVLink CPU  RX 14.5  TX 3.20  / 75.0 GB/s  Legion 12.1"
-    );
-    assert_eq!(text[3], "GPU0 CPU RX 14.5 TX 3.20 / 75.0 GB/s L 12.1");
-    assert_eq!(text[4], "GPU0 CPU RX 14.5 TX 3.20 /75.0 L 12.1");
-    assert_eq!(text[5], "GPU0 CPU RX 14.5 TX 3.20 L 12.1");
     for w in text.windows(2) {
         assert!(w[1].chars().count() < w[0].chars().count(), "{w:?}");
     }
-    // No counter: n/a with the reason, then just `no counter`.
-    let n = nvlink_cpu(None, None);
-    let text: Vec<String> = (0..LEVELS).map(|l| line_text(&n.label(l))).collect();
-    assert!(
-        text[0].contains("RX n/a  TX n/a (no NVML counter)"),
-        "{}",
-        text[0]
-    );
-    assert!(text[3].contains("RX n/a TX n/a (no NVML counter)"));
-    assert_eq!(text[5], "GPU0 CPU no counter L 12.1");
+    // The name in the link type's colour, Legion's figure yellow.
+    let t = g.title(0);
+    assert_eq!(t.spans[0].style.fg, Some(kind_color(LinkKind::NvlinkCpu)));
+    assert!(t.spans[0].style.add_modifier.contains(Modifier::BOLD));
+    let legion = t
+        .spans
+        .iter()
+        .find(|s| s.content.starts_with("Legion"))
+        .unwrap();
+    assert_eq!(legion.style.fg, Some(gauge::LEGION));
     // Peer links have no Legion bytes; no full scale says so.
     let p = LinkGauge {
+        kind: LinkKind::NvlinkPeer,
+        gpu: Some(1),
         name: "GPU1 NVLink peer".into(),
-        short: "GPU1 peer".into(),
+        short: "G1 peer".into(),
         legion: None,
         full_scale: None,
-        peak: None,
         detail: None,
         ..nvlink_cpu(Some(1.0), Some(1.0))
     };
+    assert_eq!(line_text(&p.title(0)), "GPU1 NVLink peer  full scale n/a");
+    assert_eq!(line_text(&p.title(3)), "G1 peer /n/a");
+    // Row tags: `RX` under a title, the short name and `RX` without one.
+    let rx = BarRow::Bar(Dir::Rx, Some(1.0), None);
+    assert_eq!(line_text(&p.tag(&rx, true)), "RX");
+    assert_eq!(line_text(&p.tag(&rx, false)), "G1 peer RX");
+    assert_eq!(p.tag(&rx, true).spans[0].style.fg, Some(gauge::RX));
+    let tx = BarRow::Bar(Dir::Tx, Some(1.0), None);
+    assert_eq!(p.tag(&tx, true).spans[0].style.fg, Some(gauge::TX));
+    assert_ne!(gauge::RX, gauge::TX);
     assert_eq!(
-        line_text(&p.label(0)),
-        "GPU1 NVLink peer  RX 1.00  TX 1.00  full scale n/a"
+        line_text(&p.tag(&BarRow::Note("x".into()), false)),
+        "G1 peer"
     );
-    assert_eq!(line_text(&p.label(4)), "GPU1 peer RX 1.00 TX 1.00 /n/a");
 }
 
 #[test]
-fn a_stack_picks_the_longest_labels_that_leave_room_for_the_bar() {
+fn a_column_picks_the_longest_titles_and_values_that_fit() {
     let gauges = vec![nvlink_cpu(Some(14.5), Some(3.2)), nvlink_cpu(None, None)];
-    assert_eq!(gauge::fit(&gauges, 200).0, 0);
-    for width in [30u16, 38, 50, 70, 90, 120] {
-        let (level, label_w) = gauge::fit(&gauges, width);
-        let widest = gauges.iter().map(|g| g.label(level).width()).max().unwrap();
-        assert_eq!(usize::from(label_w), widest);
+    assert_eq!(gauge::fit_title(&gauges, 200), 0);
+    for width in [20u16, 30, 38, 50, 60, 70, 90] {
+        let level = gauge::fit_title(&gauges, width);
+        let widest = |l: usize| gauges.iter().map(|g| g.title(l).width()).max().unwrap();
         if level + 1 < LEVELS {
-            assert!(label_w + 1 + MIN_BAR <= width, "{width}: level {level}");
+            assert!(
+                widest(level) <= usize::from(width),
+                "{width}: level {level}"
+            );
         }
         if level > 0 {
             // The next longer form would not have fit.
-            let longer = gauges
-                .iter()
-                .map(|g| g.label(level - 1).width())
-                .max()
-                .unwrap() as u16;
-            assert!(longer + 1 + MIN_BAR > width, "{width}: level {level}");
+            assert!(
+                widest(level - 1) > usize::from(width),
+                "{width}: level {level}"
+            );
         }
     }
-    // Too narrow for any form: the shortest, clipped by the widget.
-    assert_eq!(gauge::fit(&gauges, 10).0, LEVELS - 1);
+    // Too narrow for any form: the shortest, clipped.
+    assert_eq!(gauge::fit_title(&gauges, 5), LEVELS - 1);
+    // Values keep a cell each side: `14.5 GB/s  19%  pk 22.0` needs 25 cells, and the peak
+    // goes first.
+    assert_eq!(gauge::fit_value(&gauges, 25), 0);
+    assert_eq!(gauge::fit_value(&gauges, 24), 1);
+    assert_eq!(gauge::fit_value(&gauges, 16), 1);
+    assert_eq!(gauge::fit_value(&gauges, 15), 2);
+    assert_eq!(gauge::fit_value(&gauges, 10), 3);
+    assert_eq!(gauge::fit_value(&gauges, 9), 4);
+    assert_eq!(gauge::fit_value(&gauges, 6), 4);
+    assert_eq!(gauge::fit_value(&gauges, 3), VALUE_LEVELS - 1);
 }
 
 #[test]
-fn line_gauges_stack_one_per_row_with_their_bars_aligned_and_coloured() {
-    use ratatui::style::Color;
-    let gauges = vec![
-        nvlink_cpu(Some(7.5), Some(1.0)),  // 10%: green
-        nvlink_cpu(Some(50.0), Some(1.0)), // 67%: yellow
-        nvlink_cpu(Some(70.0), Some(1.0)), // 93%: red
-    ];
-    let mut t = Terminal::new(TestBackend::new(60, 3)).unwrap();
+fn links_go_into_columns_and_drop_their_titles_when_short_of_room() {
+    let four = app_with(ac922_4, 2).links();
+    let two = app_with(ac922, 2).links();
+    let plan = |titled, cols, per_col| Plan {
+        titled,
+        cols,
+        per_col,
+    };
+    // Four V100s: a GPU's two links per column, two columns, titled where there is room.
+    assert_eq!(gauge::plan(&four, 198, 26), plan(true, 2, 4));
+    assert_eq!(gauge::plan(&four, 118, 12), plan(true, 2, 4));
+    assert_eq!(gauge::plan(&four, 118, 8), plan(false, 2, 4));
+    // The compact layout's links panel (80 x 24): no room for titles with four GPUs.
+    assert_eq!(gauge::plan(&four, 38, 14), plan(false, 2, 4));
+    assert_eq!(gauge::plan(&two, 198, 26), plan(true, 2, 2));
+    assert_eq!(gauge::plan(&two, 118, 12), plan(true, 2, 2));
+    assert_eq!(gauge::plan(&two, 38, 14), plan(true, 1, 4));
+    // No room at all: one column, cut at the bottom.
+    assert_eq!(gauge::plan(&four, 38, 1), plan(false, 1, 8));
+    assert_eq!(plan(true, 2, 4).rows(), 12);
+    assert_eq!(plan(false, 2, 4).rows(), 8);
+    // The GB10: C2C and TP net side by side.
+    assert_eq!(
+        gauge::plan(&app_with(gb10, 2).links(), 164, 10),
+        plan(true, 2, 1)
+    );
+}
+
+fn stack(gauges: &[LinkGauge], w: u16, h: u16, depth: ColorDepth) -> ratatui::buffer::Buffer {
+    let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
     t.draw(|f| {
         let area = f.area();
-        gauge::render_stack(f, area, &gauges);
+        gauge::render_stack(f, area, gauges, depth);
     })
     .unwrap();
-    let buf = t.backend().buffer().clone();
-    let s = screen(t.backend());
-    let starts: Vec<u16> = (0..3)
-        .map(|y| {
-            (0..60)
-                .find(|&x| buf.cell((x, y)).unwrap().symbol() == "━")
-                .unwrap_or_else(|| panic!("no bar in row {y}\n{s}"))
-        })
-        .collect();
-    assert!(starts.iter().all(|&x| x == starts[0]), "{starts:?}\n{s}");
-    // Every row ends in bar cells; the first is filled in the load's colour.
-    for (y, color) in [Color::Green, Color::Yellow, Color::Red]
-        .into_iter()
-        .enumerate()
-    {
-        let first = buf.cell((starts[y], y as u16)).unwrap();
-        assert_eq!(first.fg, color, "row {y}\n{s}");
-        let last = buf.cell((59, y as u16)).unwrap();
-        assert_eq!(last.symbol(), "━");
+    t.backend().buffer().clone()
+}
+
+fn row_text(buf: &ratatui::buffer::Buffer, y: u16, x0: u16, x1: u16) -> String {
+    (x0..x1)
+        .map(|x| buf.cell((x, y)).unwrap().symbol())
+        .collect()
+}
+
+#[test]
+fn block_gauges_fill_by_direction_with_the_value_readable_inside() {
+    // RX at 10% with a 40% peak, TX at 93% with a lower peak: a title row and two bars from
+    // column 3 (`RX `), 57 cells wide.
+    let g = LinkGauge {
+        rx_peak: Some(30.0),
+        ..nvlink_cpu(Some(7.5), Some(70.0))
+    };
+    for depth in [ColorDepth::Ansi16, ColorDepth::Ansi256, ColorDepth::Rgb] {
+        let buf = stack(std::slice::from_ref(&g), 60, 3, depth);
+        let all = (0..3)
+            .map(|y| row_text(&buf, y, 0, 60))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            row_text(&buf, 0, 0, 59),
+            "GPU0 NVLink CPU  / 75.0 GB/s  Legion 12.1  3 links NVLink 2",
+            "{all}"
+        );
+        assert!(row_text(&buf, 1, 0, 3).starts_with("RX"), "{all}");
+        assert!(row_text(&buf, 2, 0, 3).starts_with("TX"), "{all}");
+        assert_eq!(buf.cell((0, 1)).unwrap().fg, gauge::RX);
+        assert_eq!(buf.cell((0, 2)).unwrap().fg, gauge::TX);
+        assert_eq!(
+            buf.cell((0, 0)).unwrap().fg,
+            kind_color(LinkKind::NvlinkCpu)
+        );
+        let rx = BarColors::of(g.ratio(g.rx), true, depth);
+        let tx = BarColors::of(g.ratio(g.tx), true, depth);
+        assert_ne!(rx.fill, tx.fill, "{depth:?}");
+        let empty = empty_color(depth);
+        // RX: 57 x 0.1 = 5.7 cells: five full blocks (3..8) and a 3/4 block at 8.
+        for x in 3..8 {
+            let c = buf.cell((x, 1)).unwrap();
+            assert_eq!(
+                (c.symbol(), c.fg, c.bg),
+                ("█", rx.fill, empty),
+                "{x} {depth:?}"
+            );
+        }
+        let c = buf.cell((8, 1)).unwrap();
+        // The edge's eighths over the ghost fill.
+        assert_eq!(
+            (c.symbol(), c.fg, c.bg),
+            ("▊", rx.fill, rx.ghost_bg),
+            "{all}"
+        );
+        // The ghost fill to the 40% peak (57 x 0.4 = 22.8, so 23 cells: 9..26), the value
+        // over its end.
+        for x in 9..20 {
+            let c = buf.cell((x, 1)).unwrap();
+            assert_eq!(
+                (c.symbol(), c.fg, c.bg),
+                (GHOST, rx.ghost, empty),
+                "{x} {depth:?}"
+            );
+            assert_eq!(
+                c.modifier.contains(Modifier::DIM),
+                depth == ColorDepth::Ansi16
+            );
+        }
+        // The value, centred: 23 cells from 3 + (57 - 23) / 2 = 20, bold, in the fill's
+        // colour over the ghost (20..26) and the empty part (26..43).
+        assert_eq!(
+            row_text(&buf, 1, 20, 43),
+            "7.50 GB/s  10%  pk 30.0",
+            "{all}"
+        );
+        for x in 20..43 {
+            let c = buf.cell((x, 1)).unwrap();
+            let bg = if x < 26 { rx.ghost_bg } else { empty };
+            assert_eq!((c.fg, c.bg), (rx.fill, bg), "{x} {depth:?}");
+            assert!(c.modifier.contains(Modifier::BOLD));
+        }
+        // The rest is the dim background, to the panel's edge.
+        for x in 43..60 {
+            let c = buf.cell((x, 1)).unwrap();
+            assert_eq!((c.symbol(), c.bg), (" ", empty), "{x} {depth:?}");
+        }
+        // TX: 57 x 0.933 = 53.2 cells, so the value sits on the fill: dark text on it. The
+        // peak is below the value: no ghost.
+        assert_eq!(
+            row_text(&buf, 2, 20, 43),
+            "70.0 GB/s  93%  pk 6.10",
+            "{all}"
+        );
+        for x in 20..43 {
+            let c = buf.cell((x, 2)).unwrap();
+            assert_eq!(
+                (c.fg, c.bg),
+                (on_fill_color(depth), tx.fill),
+                "{x} {depth:?}"
+            );
+        }
+        let c = buf.cell((10, 2)).unwrap();
+        assert_eq!((c.symbol(), c.fg), ("█", tx.fill));
+        let c = buf.cell((56, 2)).unwrap();
+        assert_eq!((c.symbol(), c.bg), ("▎", empty), "{all}");
+        assert!(!row_text(&buf, 2, 0, 60).contains(GHOST), "{all}");
+        assert_eq!(buf.cell((57, 2)).unwrap().bg, empty);
     }
-    // 60 columns leave level 3 (43-cell labels) and a 16-cell bar from column 44: the red one
-    // fills 14 cells (44..58), the green one 1.
-    assert_eq!(starts[0], 44, "{s}");
-    assert_eq!(buf.cell((57, 2)).unwrap().fg, Color::Red, "{s}");
-    assert_eq!(buf.cell((58, 2)).unwrap().fg, Color::DarkGray, "{s}");
-    assert_eq!(buf.cell((45, 0)).unwrap().fg, Color::DarkGray, "{s}");
-    assert!(s.contains("GPU0 CPU RX 70.0 TX 1.00"), "{s}");
-    // More gauges than rows: side-by-side columns, none lost.
-    let mut t = Terminal::new(TestBackend::new(100, 2)).unwrap();
-    t.draw(|f| {
-        let area = f.area();
-        gauge::render_stack(f, area, &gauges);
-    })
-    .unwrap();
-    let s = screen(t.backend());
-    assert_eq!(s.matches("GPU0").count(), 3, "{s}");
+    // 16 colours: green and red, the ghost green and dim; RGB: the gradient.
+    let buf = stack(std::slice::from_ref(&g), 60, 3, ColorDepth::Ansi16);
+    assert_eq!(buf.cell((3, 1)).unwrap().fg, Color::Green);
+    assert_eq!(buf.cell((10, 1)).unwrap().fg, Color::Green);
+    assert_eq!(buf.cell((3, 2)).unwrap().fg, Color::Red);
+    assert_eq!(buf.cell((59, 2)).unwrap().bg, Color::DarkGray);
+    let buf = stack(std::slice::from_ref(&g), 60, 3, ColorDepth::Rgb);
+    let (r, gr, b) = gradient(0.1);
+    assert_eq!(buf.cell((3, 1)).unwrap().fg, Color::Rgb(r, gr, b));
+    assert_ne!(buf.cell((10, 1)).unwrap().fg, Color::Rgb(r, gr, b));
+    // A link without a counter: Legion's bar (`L`, yellow) and the reason.
+    let n = nvlink_cpu(None, None);
+    let buf = stack(std::slice::from_ref(&n), 60, 3, ColorDepth::Ansi16);
+    assert!(
+        row_text(&buf, 1, 0, 60).starts_with("L "),
+        "{}",
+        row_text(&buf, 1, 0, 60)
+    );
+    assert_eq!(buf.cell((0, 1)).unwrap().fg, gauge::LEGION);
+    assert!(row_text(&buf, 1, 0, 60).contains("12.1 GB/s  16%  pk 20.0"));
+    assert!(row_text(&buf, 2, 0, 60).starts_with("RX/TX n/a (no NVML counter)"));
+}
+
+#[test]
+fn a_bar_draws_its_fill_ghost_and_edge_like_a_gauge() {
+    let colors = BarColors::of(0.5, true, ColorDepth::Rgb);
+    let draw = |ratio: f64, peak: f64, label: &str| {
+        let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 10, 1));
+        Bar {
+            ratio,
+            peak,
+            label,
+            colors,
+        }
+        .render(buf.area, &mut buf);
+        buf
+    };
+    let text = |b: &ratatui::buffer::Buffer| row_text(b, 0, 0, 10);
+    assert_eq!(text(&draw(0.0, 0.0, "")), " ".repeat(10));
+    assert_eq!(text(&draw(1.0, 1.0, "")), "█".repeat(10));
+    // Half a cell is a half block; ratios outside 0..=1 and NaN clamp.
+    assert_eq!(text(&draw(0.05, 0.0, "")), format!("▌{}", " ".repeat(9)));
+    assert_eq!(text(&draw(7.0, f64::NAN, "")), "█".repeat(10));
+    assert_eq!(text(&draw(f64::NAN, -1.0, "")), " ".repeat(10));
+    // The ghost from the value to the peak.
+    assert_eq!(text(&draw(0.5, 0.8, "")), "█████▓▓▓  ");
+    // Over the ghost, the edge cell sits on the ghost's colour; without one, on the empty one.
+    let b = draw(0.25, 0.8, "");
+    assert_eq!(text(&b), "██▌▓▓▓▓▓  ");
+    assert_eq!(b.cell((2, 0)).unwrap().bg, colors.ghost_bg);
+    let b = draw(0.25, 0.0, "");
+    assert_eq!(text(&b), "██▌       ");
+    assert_eq!(b.cell((2, 0)).unwrap().bg, colors.empty);
+    // The label: dark on the fill, the fill's colour on the ghost and the empty part.
+    let fg_bg = |b: &ratatui::buffer::Buffer, x: u16| {
+        let c = b.cell((x, 0)).unwrap();
+        (c.fg, c.bg)
+    };
+    let b = draw(0.2, 0.6, "abcdef");
+    assert_eq!(text(&b), "██abcdef  ");
+    assert_eq!(fg_bg(&b, 2), (colors.fill, colors.ghost_bg));
+    assert_eq!(fg_bg(&b, 6), (colors.fill, colors.empty));
+    assert_eq!(
+        fg_bg(&draw(0.9, 0.9, "abcdef"), 2),
+        (colors.on_fill, colors.fill)
+    );
+    // A label wider than the bar is cut, never past it.
+    let b = draw(0.0, 0.0, "0123456789abc");
+    assert_eq!(text(&b), "0123456789");
+    // Drawing into a smaller area leaves the rest alone.
+    let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 10, 1));
+    Bar {
+        ratio: 1.0,
+        peak: 1.0,
+        label: "",
+        colors,
+    }
+    .render(Rect::new(2, 0, 4, 1), &mut buf);
+    assert_eq!(row_text(&buf, 0, 0, 10), "  ████    ");
+    assert_eq!(buf.cell((0, 0)).unwrap().bg, Color::Reset);
+}
+
+#[test]
+fn stacked_links_keep_their_bars_aligned_in_columns() {
+    // Four V100s in 118 x 12: two columns (GPU0-1, GPU2-3) of four titled links.
+    let links = app_with(ac922_4, 2).links();
+    let buf = stack(&links, 118, 12, ColorDepth::Ansi16);
+    let rows: Vec<String> = (0..12).map(|y| row_text(&buf, y, 0, 118)).collect();
+    let all = rows.join("\n");
+    for (y, name) in [
+        (0, "GPU0 NVLink CPU"),
+        (3, "GPU0 NVLink peer"),
+        (6, "GPU1 NVLink CPU"),
+    ] {
+        assert!(rows[y].starts_with(name), "{all}");
+    }
+    assert!(
+        row_text(&buf, 0, 59, 118).starts_with("GPU2 NVLink CPU"),
+        "{all}"
+    );
+    assert!(
+        row_text(&buf, 9, 59, 118).starts_with("GPU3 NVLink peer"),
+        "{all}"
+    );
+    // Both columns take the forms that fit the narrower one (58 cells): no link detail.
+    assert_eq!(
+        row_text(&buf, 0, 0, 58).trim_end(),
+        "GPU0 NVLink CPU  / 75.0 GB/s  Legion 5.00"
+    );
+    assert_eq!(
+        row_text(&buf, 0, 59, 118).trim_end(),
+        "GPU2 NVLink CPU  / 75.0 GB/s  Legion 5.00"
+    );
+    assert!(!all.contains("3 links"), "{all}");
+    assert!(rows[1].contains("8.00 GB/s  11%  pk 8.00"), "{all}");
+    // Every bar row starts with its tag and its bar in the column's same cell.
+    for y in [1u16, 2, 4, 5, 7, 8, 10, 11] {
+        let tag = if y % 3 == 1 { "RX" } else { "TX" };
+        for x0 in [0u16, 59] {
+            assert_eq!(row_text(&buf, y, x0, x0 + 2), tag, "{all}");
+            let c = buf.cell((x0 + 3, y)).unwrap();
+            assert_ne!(c.bg, Color::Reset, "{x0},{y}\n{all}");
+        }
+    }
+    // The blank cell between the columns.
+    assert_eq!(buf.cell((58, 1)).unwrap().bg, Color::Reset);
+    // Without room for titles: short names in the rows, still aligned.
+    let buf = stack(&links, 38, 14, ColorDepth::Ansi16);
+    let rows: Vec<String> = (0..14).map(|y| row_text(&buf, y, 0, 38)).collect();
+    let all = rows.join("\n");
+    assert!(rows[0].starts_with("G0 CPU RX"), "{all}");
+    assert!(rows[1].starts_with("G0 CPU TX"), "{all}");
+    assert!(rows[3].starts_with("G0 peer TX"), "{all}");
+    assert!(rows[7].starts_with("G1 peer TX"), "{all}");
+    assert!(row_text(&buf, 0, 19, 38).starts_with("G2 CPU RX"), "{all}");
+    assert!(row_text(&buf, 7, 19, 38).starts_with("G3 peer TX"), "{all}");
+    // The bars start after the widest tag (`G0 peer RX` and a blank).
+    for y in 0..8 {
+        assert_ne!(buf.cell((11, y)).unwrap().bg, Color::Reset, "{y}\n{all}");
+        assert_eq!(buf.cell((10, y)).unwrap().bg, Color::Reset, "{y}\n{all}");
+    }
+    assert!(!all.contains("NVLink"), "{all}");
+    // Seven-cell bars: the value alone (`G0 CPU RX  ▊8.00  `).
+    assert_eq!(row_text(&buf, 0, 0, 18), "G0 CPU RX  ▊8.00  ", "{all}");
+    assert_eq!(row_text(&buf, 1, 0, 18), "G0 CPU TX  ▏2.00  ", "{all}");
+    assert!(!all.contains("pk"), "{all}");
 }
 
 // ---- snapshots and rates ----
@@ -1023,23 +1463,43 @@ fn history_is_capped_and_a_restart_clears_it() {
 #[test]
 fn peaks_hold_then_fall() {
     let mut app = App::new("x", Conn::Local);
-    let at = |t: f64, tx_rate: f64| {
+    let at = |t: f64, tx: f64, rx: f64| {
         let mut s = pcie(t);
-        s.gpus[0].links[0].tx_bytes = Some(tx_rate);
-        // RX idle: the gauge's peak is the busier direction's.
-        s.gpus[0].links[0].rx_bytes = Some(0.0);
+        s.gpus[0].links[0].tx_bytes = Some(tx);
+        s.gpus[0].links[0].rx_bytes = Some(rx);
+        s.gpus[0].sm_busy_pct = Some(if t < 1.5 { 99.0 } else { 20.0 });
+        s.gpus[0].power_w = Some(if t < 1.5 { 300.0 } else { 90.0 });
         s
     };
-    // 0 -> 10 GB in one second, then flat.
-    app.push_snapshot(at(0.0, 0.0));
-    app.push_snapshot(at(1.0, 10e9));
-    app.push_snapshot(at(2.0, 10e9));
+    // TX: 0 -> 10 GB in one second, then flat; RX: 4 GB/s throughout. Each its own peak.
+    app.push_snapshot(at(0.0, 0.0, 0.0));
+    app.push_snapshot(at(1.0, 10e9, 4e9));
+    app.push_snapshot(at(2.0, 10e9, 8e9));
     let links = app.links();
     assert!(close(links[0].tx.unwrap(), 0.0));
-    assert!(close(links[0].peak.unwrap(), 10.0));
-    app.push_snapshot(at(2.0 + ui::PEAK_HOLD_S + 1.0, 10e9));
+    assert!(close(links[0].tx_peak.unwrap(), 10.0));
+    assert!(close(links[0].rx.unwrap(), 4.0));
+    assert!(close(links[0].rx_peak.unwrap(), 4.0));
+    assert!(close(links[0].legion_peak.unwrap(), 2.0));
+    assert_eq!(app.peak(PeakOf::Sm(0)), Some(99.0));
+    assert_eq!(app.peak(PeakOf::Power(0)), Some(300.0));
+    assert!(close(app.peak(PeakOf::Decode).unwrap(), 50.0));
+    // Still within the hold: the peaks stay.
+    app.push_snapshot(at(2.0 + ui::PEAK_HOLD_S - 1.0, 10e9, 8e9 + 4e9 * 9.0));
+    assert!(close(app.links()[0].tx_peak.unwrap(), 10.0));
+    assert_eq!(app.peak(PeakOf::Sm(0)), Some(99.0));
+    // Past it: the current value.
+    app.push_snapshot(at(2.0 + ui::PEAK_HOLD_S + 1.0, 10e9, 8e9 + 4e9 * 11.0));
     let links = app.links();
-    assert!(close(links[0].peak.unwrap(), 0.0));
+    assert!(close(links[0].tx_peak.unwrap(), 0.0));
+    assert!(close(links[0].rx_peak.unwrap(), 4.0));
+    assert_eq!(app.peak(PeakOf::Sm(0)), Some(20.0));
+    assert_eq!(app.peak(PeakOf::Power(0)), Some(90.0));
+    // A restart clears them (the first snapshot after it sets SM and power again).
+    app.push_snapshot(at(1.6, 0.0, 0.0));
+    assert_eq!(app.peak(PeakOf::Sm(0)), Some(20.0));
+    assert_eq!(app.links()[0].tx_peak, None);
+    assert_eq!(app.peak(PeakOf::Decode), None);
 }
 
 #[test]
@@ -1057,10 +1517,16 @@ fn link_gauges_and_memory_dials_per_machine() {
         ]
     );
     let short: Vec<&str> = links.iter().map(|d| d.short.as_str()).collect();
-    assert_eq!(short, ["GPU0 CPU", "GPU0 peer", "GPU1 CPU", "GPU1 peer"]);
+    assert_eq!(short, ["G0 CPU", "G0 peer", "G1 CPU", "G1 peer"]);
+    let gpus: Vec<Option<u32>> = links.iter().map(|d| d.gpu).collect();
+    assert_eq!(gpus, [Some(0), Some(0), Some(1), Some(1)]);
+    assert_eq!(links[0].kind, LinkKind::NvlinkCpu);
     assert!(close(links[0].rx.unwrap(), 8.0));
     assert!(close(links[0].tx.unwrap(), 2.0));
-    assert!(close(links[0].ratio(), 8.0 / 75.0));
+    assert!(close(links[0].ratio(links[0].rx), 8.0 / 75.0));
+    // Steady traffic: each peak is its own direction's value.
+    assert!(close(links[0].rx_peak.unwrap(), 8.0));
+    assert!(close(links[0].tx_peak.unwrap(), 2.0));
     assert!(links[0].legion.is_some());
     assert!(links[1].legion.is_none());
     assert_eq!(links[0].why, None);
@@ -1076,20 +1542,25 @@ fn link_gauges_and_memory_dials_per_machine() {
     assert_eq!(links[0].why.as_deref(), Some("no C2C counter"));
     assert!(close(links[0].legion.unwrap(), 1.0));
     assert_eq!(links[1].name, "TP net");
+    assert_eq!((links[1].kind, links[1].gpu), (LinkKind::Network, None));
     assert_eq!(links[1].why.as_deref(), Some("no NIC counter"));
     assert_eq!(links[1].full_scale, Some(25.0));
     // No counter: the bar shows Legion's bytes (2 GB/s of the NIC's 25).
-    assert!(close(links[1].ratio(), 2.0 / 25.0));
+    assert!(close(links[1].ratio(links[1].legion), 2.0 / 25.0));
+    assert!(close(links[1].legion_peak.unwrap(), 2.0));
+    assert_eq!((links[1].rx_peak, links[1].tx_peak), (None, None));
     let memory = app.memory_dials();
     assert_eq!(memory.len(), 1);
     assert_eq!(memory[0].title, "GPU0 memory (GPM)");
     assert!(close(memory[0].measured.unwrap(), 163.8));
+    // The dial's peak follows the measured figure.
+    assert!(close(memory[0].peak.unwrap(), 163.8));
 
     let app = app_with(pcie, 2);
     let links = app.links();
     assert_eq!(links.len(), 1);
     assert_eq!(links[0].name, "GPU0 PCIe");
-    assert_eq!(links[0].short, "GPU0 PCIe");
+    assert_eq!(links[0].short, "G0 PCIe");
     assert!(close(links[0].tx.unwrap(), 1.0));
     assert!(close(links[0].rx.unwrap(), 3.0));
     assert!(close(links[0].legion.unwrap(), 2.0));
@@ -1099,11 +1570,16 @@ fn link_gauges_and_memory_dials_per_machine() {
 
 #[test]
 fn the_link_row_follows_the_link_count() {
-    // Links + borders; a memory dial keeps its 12 rows.
-    assert_eq!(ui::bandwidth_height(&app_with(pcie, 2)), 3);
-    assert_eq!(ui::bandwidth_height(&app_with(ac922, 2)), 6);
-    assert_eq!(ui::bandwidth_height(&app_with(ac922_4, 2)), 10);
-    assert_eq!(ui::bandwidth_height(&app_with(gb10, 2)), ui::DIAL_H);
+    // The links' plan + borders; a memory dial keeps its 12 rows. At 200 x 60 and 120 x 46
+    // the row may take 28 and 14 rows.
+    let h = |app: &App, w, max| ui::bandwidth_height(app, w, max);
+    assert_eq!(h(&app_with(pcie, 2), 200, 28), 5);
+    assert_eq!(h(&app_with(ac922, 2), 200, 28), 8);
+    assert_eq!(h(&app_with(ac922_4, 2), 200, 28), 14);
+    assert_eq!(h(&app_with(ac922_4, 2), 120, 14), 14);
+    assert_eq!(h(&app_with(gb10, 2), 200, 28), ui::DIAL_H);
+    // Short of rows: the titles go.
+    assert_eq!(h(&app_with(ac922_4, 2), 120, 10), 10);
 }
 
 #[test]
@@ -1120,9 +1596,16 @@ fn a_link_without_counters_says_so() {
     let links = app.links();
     assert_eq!(links[0].tx, None);
     assert_eq!(links[0].rx, None);
-    assert_eq!(links[0].peak, None);
+    assert_eq!((links[0].rx_peak, links[0].tx_peak), (None, None));
     assert_eq!(links[0].why.as_deref(), Some("no NVML counter"));
-    assert!(line_text(&links[0].label(0)).contains("TX n/a (no NVML counter)"));
+    assert_eq!(
+        links[0].rows()[1],
+        BarRow::Note("RX/TX n/a (no NVML counter)".into())
+    );
+    let mut app = app;
+    app.focus = Panel::Links;
+    let s = render(&app, 80, 24);
+    assert!(s.contains("RX/TX n/a (no NVML counter)"), "{s}");
 }
 
 #[test]
@@ -1275,22 +1758,45 @@ fn screen(b: &TestBackend) -> String {
     out
 }
 
-const SIZES: [(u16, u16); 2] = [(80, 24), (200, 60)];
+const SIZES: [(u16, u16); 3] = [(80, 24), (120, 46), (200, 60)];
+
+/// The cell at `(x, y)` of a drawn screen.
+fn cell_at(t: &Terminal<TestBackend>, x: u16, y: u16) -> ratatui::buffer::Cell {
+    t.backend().buffer().cell((x, y)).unwrap().clone()
+}
+
+/// Where `want` starts on the drawn screen (column, row), by characters.
+fn find(s: &str, want: &str) -> Option<(u16, u16)> {
+    s.lines().enumerate().find_map(|(y, l)| {
+        l.find(want)
+            .map(|i| (l[..i].chars().count() as u16, y as u16))
+    })
+}
 
 #[test]
 fn the_full_layout_at_200_by_60() {
-    let s = render(&app_with(ac922, 3), 200, 60);
+    let app = app_with(ac922, 3);
+    let mut t = Terminal::new(TestBackend::new(200, 60)).unwrap();
+    t.draw(|f| ui::draw(f, &app)).unwrap();
+    let s = screen(t.backend());
     for want in [
         "gemma-4-31b-it-qat-q4_0",
         "QAT Q4_0",
         "Requests (2 active, 1 queued)",
         "Throughput",
+        "tok/s  pk ",
+        "per request",
         "Latency (5 min)",
         "Links",
-        "GPU0 NVLink CPU  RX 8.00  TX 2.00  / 75.0 GB/s  pk 8.00  Legion 5.00  3 links NVLink 2",
-        "GPU1 NVLink peer  RX 1.00  TX 1.00  / 75.0 GB/s  pk 1.00  3 links NVLink 2",
-        "━",
+        "GPU0 NVLink CPU  / 75.0 GB/s  Legion 5.00  3 links NVLink 2",
+        "GPU1 NVLink peer  / 75.0 GB/s  3 links NVLink 2",
+        "8.00 GB/s  11%  pk 8.00",
+        "2.00 GB/s  3%  pk 2.00",
+        "1.00 GB/s  1%  pk 1.00",
         "GPUs",
+        "87%  87  55%",
+        "240  240",
+        "SM MHz",
         "Speculative",
         "KV cache",
         "MoE experts",
@@ -1309,6 +1815,56 @@ fn the_full_layout_at_200_by_60() {
     // The ERROR and WARN lines show at INFO, DEBUG does not.
     assert!(s.contains("request failed: test"));
     assert!(!s.contains("admitted sequence"));
+    // A GPU's two links in one column, the second GPU's next to it; colours by link type,
+    // direction and load (16 colours before a terminal says more).
+    let (x, y) = find(&s, "GPU0 NVLink CPU").unwrap();
+    assert_eq!(find(&s, "GPU0 NVLink peer"), Some((x, y + 3)), "{s}");
+    let (x1, y1) = find(&s, "GPU1 NVLink CPU").unwrap();
+    assert!(y1 == y && x1 > x + 90, "{s}");
+    assert_eq!(cell_at(&t, x, y).fg, kind_color(LinkKind::NvlinkCpu));
+    assert_eq!(cell_at(&t, x, y + 1).fg, gauge::RX);
+    assert_eq!(cell_at(&t, x, y + 2).fg, gauge::TX);
+    let bar = cell_at(&t, x + 3, y + 1);
+    assert_eq!(
+        (bar.fg, bar.bg),
+        (Color::Green, empty_color(ColorDepth::Ansi16))
+    );
+    assert_eq!(cell_at(&t, x + 60, y + 1).bg, Color::DarkGray);
+}
+
+#[test]
+fn the_full_layout_at_120_by_46_holds_four_gpus() {
+    let app = app_with(ac922_4, 3);
+    let s = render(&app, 120, 46);
+    assert_eq!(s.lines().count(), 46);
+    for g in 0..4 {
+        for want in [
+            format!("GPU{g} NVLink CPU  / 75.0 GB/s  Legion 5.00"),
+            format!("GPU{g} NVLink peer  / 75.0 GB/s"),
+        ] {
+            assert!(s.contains(&want), "missing {want:?} in\n{s}");
+        }
+    }
+    // Two columns of four, titled; the details go.
+    let (x0, y0) = find(&s, "GPU0 NVLink CPU").unwrap();
+    assert_eq!(find(&s, "GPU1 NVLink peer"), Some((x0, y0 + 9)), "{s}");
+    let (x2, y2) = find(&s, "GPU2 NVLink CPU").unwrap();
+    assert!(y2 == y0 && x2 > x0 + 50, "{s}");
+    assert!(!s.contains("3 links"), "{s}");
+    assert_eq!(s.matches("8.00 GB/s  11%  pk 8.00").count(), 4, "{s}");
+    assert_eq!(s.matches("1.00 GB/s  1%  pk 1.00").count(), 8, "{s}");
+    // The rest of the layout still fits: GPUs (without the clocks), logs, footer.
+    for want in [
+        "GPUs",
+        "Speculative",
+        "Logs [INFO and up]",
+        "q quit",
+        "pk",
+        "VRAM GiB",
+    ] {
+        assert!(s.contains(want), "missing {want:?} in\n{s}");
+    }
+    assert!(!s.contains("SM MHz"), "{s}");
 }
 
 #[test]
@@ -1331,38 +1887,71 @@ fn the_compact_layout_at_80_by_24() {
 }
 
 #[test]
-fn every_link_gauge_fits_at_both_sizes() {
-    // Four V100s: eight gauges, all shown, one per row, short labels at 80 x 24.
+fn every_link_gauge_fits_at_every_size() {
+    // Four V100s at 80 x 24: eight links in two columns, two rows each with a short name.
     let mut app = app_with(ac922_4, 3);
     app.focus = Panel::Links;
-    let s = render(&app, 80, 24);
+    let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    t.draw(|f| ui::draw(f, &app)).unwrap();
+    let s = screen(t.backend());
     for g in 0..4 {
         for want in [
-            format!("GPU{g} CPU RX 8.00 TX 2.00 L 5.00"),
-            format!("GPU{g} peer RX 1.00 TX 1.00"),
+            format!("G{g} CPU RX "),
+            format!("G{g} CPU TX "),
+            format!("G{g} peer RX "),
+            format!("G{g} peer TX "),
         ] {
-            assert!(s.contains(&want), "missing {want:?} in\n{s}");
+            assert_eq!(s.matches(&want).count(), 1, "missing {want:?} in\n{s}");
         }
     }
+    // Bars of seven cells (left) and eight (right): the value alone, no `pk`.
+    assert!(s.contains("G0 CPU RX  ▊8.00   G2 CPU RX  ▉ 8.00  "), "{s}");
+    assert!(s.contains("G1 peer TX ▏1.00   G3 peer TX ▏ 1.00  "), "{s}");
     assert_eq!(s.lines().count(), 24);
     assert!(s.lines().all(|l| l.chars().count() == 80));
-    assert_eq!(s.lines().filter(|l| l.contains('━')).count(), 8, "{s}");
-    let s = render(&app, 200, 60);
-    for g in 0..4 {
-        assert!(s.contains(&format!("GPU{g} NVLink CPU  RX 8.00")), "{s}");
-        assert!(s.contains(&format!("GPU{g} NVLink peer  RX 1.00")), "{s}");
+    // The short names in the link type's colour, the tags in the direction's.
+    let (x, y) = find(&s, "G0 CPU RX").unwrap();
+    assert_eq!(cell_at(&t, x, y).fg, kind_color(LinkKind::NvlinkCpu));
+    assert_eq!(cell_at(&t, x + 7, y).fg, gauge::RX);
+    assert_eq!(cell_at(&t, x + 7, y + 1).fg, gauge::TX);
+    // The value over the empty part, in the fill's colour.
+    let v = cell_at(&t, x + 12, y);
+    assert_eq!(
+        (v.symbol(), v.fg, v.bg),
+        ("8", Color::Green, Color::DarkGray)
+    );
+    for (w, h) in [(120, 46), (200, 60)] {
+        let s = render(&app, w, h);
+        for g in 0..4 {
+            assert!(
+                s.contains(&format!("GPU{g} NVLink CPU  / 75.0 GB/s")),
+                "{s}"
+            );
+            assert!(
+                s.contains(&format!("GPU{g} NVLink peer  / 75.0 GB/s")),
+                "{s}"
+            );
+        }
+        assert_eq!(s.matches("RX ").count(), 8, "{w}x{h}\n{s}");
     }
-    // The two-GPU AC922 and the GB10 in the compact layout.
+    // The two-GPU AC922 in the compact layout: titled, short.
     let mut app = app_with(ac922, 3);
     app.focus = Panel::Links;
     let s = render(&app, 80, 24);
-    assert!(s.contains("GPU1 peer RX 1.00 TX 1.00"), "{s}");
+    assert!(s.contains("G0 CPU / 75.0 GB/s L 5.00"), "{s}");
+    assert!(s.contains("G1 peer / 75.0 GB/s"), "{s}");
+    assert!(s.contains("8.00 GB/s  11%  pk 8.00"), "{s}");
+    // The GB10: Legion's bars and the reasons.
     let mut app = app_with(gb10, 3);
     app.focus = Panel::Links;
     let s = render(&app, 80, 24);
-    // No full scale for the C2C fixture: `/n/a`.
-    assert!(s.contains("GPU0 C2C no counter /n/a L 1.00"), "{s}");
-    assert!(s.contains("TP net no counter /25.0 L 2.00"), "{s}");
+    // No full scale for the C2C fixture.
+    assert!(s.contains("GPU0 C2C  full scale n/a  Legion 1.00"), "{s}");
+    assert!(s.contains("TP net  / 25.0 GB/s  Legion 2.00"), "{s}");
+    assert!(s.contains("1.00 GB/s  pk 1.00"), "{s}");
+    assert!(s.contains("2.00 GB/s  8%  pk 2.00"), "{s}");
+    assert!(s.contains("RX/TX n/a (no C2C counter)"), "{s}");
+    assert!(s.contains("RX/TX n/a (no NIC counter)"), "{s}");
 }
 
 #[test]
@@ -1387,7 +1976,7 @@ fn every_panel_draws_in_the_compact_layout() {
 }
 
 #[test]
-fn each_widget_draws_alone_at_both_sizes() {
+fn each_widget_draws_alone_at_every_size() {
     let app = app_with(gb10, 2);
     for (w, h) in SIZES {
         for p in PANELS {
@@ -1409,7 +1998,9 @@ fn each_widget_draws_alone_at_both_sizes() {
         let s = screen(t.backend());
         assert!(s.contains("GPU0 C2C"), "{w}x{h}\n{s}");
         assert!(s.contains("GPU0 memory (GPM)"), "{w}x{h}\n{s}");
-        assert!(s.contains('━'), "{w}x{h}\n{s}");
+        assert!(s.contains('█'), "{w}x{h}\n{s}");
+        // The dial's peak: `pk` after its figures.
+        assert!(s.contains("meas 164 L 150 pk 164"), "{w}x{h}\n{s}");
     }
 }
 
@@ -1420,30 +2011,60 @@ fn a_gb10_at_200_by_60_shows_c2c_memory_and_the_network() {
         "Qwen3.8-Flash-Next-NVFP4",
         "NVFP4",
         "TP2",
-        "GPU0 C2C  RX n/a  TX n/a (no C2C counter)  full scale n/a  Legion 1.00",
-        "TP net  RX n/a  TX n/a (no NIC counter)  / 25.0 GB/s  pk 2.00  Legion 2.00",
-        "rocep1s0f0 200 Gb/sec (4X HDR)",
+        "GPU0 C2C  full scale n/a  Legion 1.00",
+        "TP net  / 25.0 GB/s  Legion 2.00  rocep1s0f0 200 Gb/sec (4X HDR)",
+        "RX/TX n/a (no C2C counter)",
+        "RX/TX n/a (no NIC counter)",
+        "1.00 GB/s  pk 1.00",
+        "2.00 GB/s  8%  pk 2.00",
         "GPU0 memory (GPM)",
+        "meas 164 L 150 pk 164",
         "unified",
     ] {
         assert!(s.contains(want), "missing {want:?} in\n{s}");
     }
+    // C2C and TP net side by side, the title in each link type's colour.
+    let mut t = Terminal::new(TestBackend::new(200, 60)).unwrap();
+    let app = app_with(gb10, 3);
+    t.draw(|f| ui::draw(f, &app)).unwrap();
+    let (x, y) = find(&s, "GPU0 C2C").unwrap();
+    let (xn, yn) = find(&s, "TP net  /").unwrap();
+    assert!(yn == y && xn > x + 60, "{s}");
+    assert_eq!(cell_at(&t, x, y).fg, kind_color(LinkKind::C2c));
+    assert_eq!(cell_at(&t, xn, yn).fg, kind_color(LinkKind::Network));
+    // Legion's bar: `L` in yellow; the C2C has no full scale, so its value is grey.
+    assert_eq!(cell_at(&t, x, y + 1).fg, gauge::LEGION);
+    assert_eq!(cell_at(&t, xn + 2, yn + 1).fg, Color::Green);
+    let (xv, yv) = find(&s, "1.00 GB/s  pk 1.00").unwrap();
+    assert_eq!(yv, y + 1);
+    assert_eq!(cell_at(&t, xv, yv).fg, Color::Gray);
 }
 
 #[test]
-fn a_pcie_card_at_both_sizes() {
+fn a_pcie_card_at_every_size() {
     let app = app_with(pcie, 3);
-    let s = render(&app, 200, 60);
-    assert!(
-        s.contains("GPU0 PCIe  RX 3.00  TX 1.00  / 31.5 GB/s  pk 3.00  Legion 2.00  PCIe 4.0 x16"),
-        "{s}"
-    );
-    assert!(s.contains("off (no --spec)"));
-    assert!(s.contains("dense model"));
+    for (w, h) in [(200, 60), (120, 46)] {
+        let s = render(&app, w, h);
+        for want in [
+            "GPU0 PCIe  / 31.5 GB/s  Legion 2.00  PCIe 4.0 x16",
+            "3.00 GB/s  10%  pk 3.00",
+            "1.00 GB/s  3%  pk 1.00",
+            "off (no --spec)",
+            "dense model",
+        ] {
+            assert!(s.contains(want), "missing {want:?} at {w}x{h} in\n{s}");
+        }
+    }
     let mut app = app;
     app.focus = Panel::Links;
-    let s = render(&app, 80, 24);
-    assert!(s.contains("GPU0 PCIe RX 3.00 TX 1.00 L 2.00"), "{s}");
+    let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    t.draw(|f| ui::draw(f, &app)).unwrap();
+    let s = screen(t.backend());
+    assert!(s.contains("GPU0 PCIe  / 31.5 GB/s  Legion 2.00"), "{s}");
+    assert!(!s.contains("PCIe 4.0 x16"), "{s}");
+    assert!(s.contains("3.00 GB/s  10%  pk 3.00"), "{s}");
+    let (x, y) = find(&s, "GPU0 PCIe").unwrap();
+    assert_eq!(cell_at(&t, x, y).fg, kind_color(LinkKind::Pcie));
 }
 
 #[test]
@@ -1530,22 +2151,49 @@ fn a_memory_dial_draws_on_a_canvas_when_it_fits() {
         measured: Some(160.0),
         legion: 120.0,
         note: None,
+        peak: Some(250.0),
     };
-    let mut t = Terminal::new(TestBackend::new(30, 11)).unwrap();
-    t.draw(|f| {
-        let area = f.area();
-        d.render(f, area, true);
-    })
-    .unwrap();
+    let draw = |d: &Speedo| {
+        let mut t = Terminal::new(TestBackend::new(30, 11)).unwrap();
+        t.draw(|f| {
+            let area = f.area();
+            d.render(f, area, true);
+        })
+        .unwrap();
+        t
+    };
+    let t = draw(&d);
     let s = screen(t.backend());
     assert!(s.contains("GPU0 memory (GPM)"));
-    assert!(s.contains("meas 160 L 120"), "{s}");
+    assert!(s.contains("meas 160 L 120 pk 250"), "{s}");
     assert!(s.contains("/273 GB/s"), "{s}");
     // Braille dots: the arc and the needles.
     assert!(
         s.chars().any(|c| ('\u{2801}'..='\u{28ff}').contains(&c)),
         "{s}"
     );
+    // The peak tick, in its own colour on the arc; none without a peak.
+    let peak_cells = |t: &Terminal<TestBackend>| {
+        let buf = t.backend().buffer();
+        (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .filter(|&p| {
+                let c = buf.cell(p).unwrap();
+                let braille = c
+                    .symbol()
+                    .chars()
+                    .all(|ch| ('\u{2801}'..='\u{28ff}').contains(&ch));
+                c.fg == super::speedo::PEAK && braille
+            })
+            .count()
+    };
+    assert!(peak_cells(&t) > 0, "{s}");
+    let none = draw(&Speedo {
+        peak: None,
+        ..d.clone()
+    });
+    assert_eq!(peak_cells(&none), 0);
+    assert!(!screen(none.backend()).contains("pk"));
     // Too small for a dial: the bars.
     let mut t = Terminal::new(TestBackend::new(14, 6)).unwrap();
     t.draw(|f| {

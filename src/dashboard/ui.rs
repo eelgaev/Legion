@@ -15,7 +15,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Sparkline, Table, Wrap};
 
-use super::gauge::{self, LinkGauge};
+use super::gauge::{self, ColorDepth, LinkGauge};
 use super::logs::{LogLine, level_rank};
 use super::snapshot::{LinkKind, Rates, Snapshot};
 use super::speedo::{Speedo, gb};
@@ -119,27 +119,37 @@ impl Anchor {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-struct Peak {
-    tx: f64,
-    tx_at: f64,
-    rx: f64,
-    rx_at: f64,
+/// A figure whose peak the dashboard shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PeakOf {
+    /// GPU index and link number (the snapshot's order).
+    Rx(u32, usize),
+    Tx(u32, usize),
+    Legion(u32, usize),
+    /// Legion's bytes over the TP exchange.
+    Net,
+    /// A GPU's memory dial: measured, Legion's bytes.
+    MemMeasured(u32),
+    MemLegion(u32),
+    Decode,
+    Prefill,
+    /// A GPU's SM utilization and power.
+    Sm(u32),
+    Power(u32),
 }
 
-impl Peak {
-    fn update(&mut self, tx: Option<f64>, rx: Option<f64>, now: f64) {
-        if let Some(v) = tx
-            && (v >= self.tx || now - self.tx_at > PEAK_HOLD_S)
-        {
-            self.tx = v;
-            self.tx_at = now;
-        }
-        if let Some(v) = rx
-            && (v >= self.rx || now - self.rx_at > PEAK_HOLD_S)
-        {
-            self.rx = v;
-            self.rx_at = now;
+/// A peak and when it was set (server uptime).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Hold {
+    v: f64,
+    at: f64,
+}
+
+impl Hold {
+    /// A higher value takes over at once; a lower one once the peak is [`PEAK_HOLD_S`] old.
+    fn update(&mut self, v: f64, now: f64) {
+        if v >= self.v || now - self.at > PEAK_HOLD_S {
+            *self = Self { v, at: now };
         }
     }
 }
@@ -197,7 +207,7 @@ pub struct App {
     pub prefill: PrefillRate,
     anchor: Option<Anchor>,
     pub history: VecDeque<Point>,
-    peaks: HashMap<(u32, usize), Peak>,
+    peaks: HashMap<PeakOf, Hold>,
     pub logs: VecDeque<LogLine>,
     pub conn: Conn,
     /// `serve --tui` or the URL `legion top` reads.
@@ -213,6 +223,8 @@ pub struct App {
     pub full_logs: bool,
     /// Lines up from the newest (0 follows the tail).
     pub scroll: usize,
+    /// The colours the terminal shows ([`ColorDepth::detect`] once the terminal is ours).
+    pub colors: ColorDepth,
 }
 
 impl App {
@@ -235,6 +247,7 @@ impl App {
             searching: false,
             full_logs: false,
             scroll: 0,
+            colors: ColorDepth::default(),
         }
     }
 
@@ -258,21 +271,28 @@ impl App {
             let now = snap.uptime_s;
             for (g, links) in snap.gpus.iter().zip(&rates.links) {
                 for (i, r) in links.iter().enumerate() {
-                    self.peaks
-                        .entry((g.index, i))
-                        .or_default()
-                        .update(r.tx_gb_s, r.rx_gb_s, now);
+                    self.hold(PeakOf::Rx(g.index, i), r.rx_gb_s, now);
+                    self.hold(PeakOf::Tx(g.index, i), r.tx_gb_s, now);
+                    self.hold(PeakOf::Legion(g.index, i), Some(r.legion_gb_s), now);
                 }
             }
-            if let Some(n) = &rates.network {
-                self.peaks
-                    .entry((u32::MAX, 0))
-                    .or_default()
-                    .update(Some(n.legion_gb_s), None, now);
+            for (g, m) in snap.gpus.iter().zip(&rates.memory) {
+                self.hold(PeakOf::MemMeasured(g.index), m.measured_gb_s, now);
+                self.hold(PeakOf::MemLegion(g.index), Some(m.legion_gb_s), now);
             }
+            if let Some(n) = &rates.network {
+                self.hold(PeakOf::Net, Some(n.legion_gb_s), now);
+            }
+            self.hold(PeakOf::Decode, Some(rates.decode_tok_s), now);
             self.rates = Some(rates);
         }
         self.prefill.update(&snap, self.snap.is_none());
+        let now = snap.uptime_s;
+        self.hold(PeakOf::Prefill, Some(self.prefill.tok_s), now);
+        for g in &snap.gpus {
+            self.hold(PeakOf::Sm(g.index), g.sm_busy_pct, now);
+            self.hold(PeakOf::Power(g.index), g.power_w, now);
+        }
         let cur = Anchor::of(&snap);
         match self.anchor {
             None => self.anchor = Some(cur),
@@ -293,6 +313,22 @@ impl App {
             Some(_) => {}
         }
         self.snap = Some(snap);
+    }
+
+    /// Feeds `v` (when there is one and it is a number) into `of`'s peak.
+    fn hold(&mut self, of: PeakOf, v: Option<f64>, now: f64) {
+        let Some(v) = v.filter(|v| v.is_finite()) else {
+            return;
+        };
+        self.peaks
+            .entry(of)
+            .and_modify(|h| h.update(v, now))
+            .or_insert(Hold { v, at: now });
+    }
+
+    /// `of`'s peak over the last [`PEAK_HOLD_S`] (at least); `None` before its first value.
+    pub fn peak(&self, of: PeakOf) -> Option<f64> {
+        self.peaks.get(&of).map(|h| h.v)
     }
 
     /// New log lines (`reset`: the source sends its whole ring again).
@@ -419,19 +455,22 @@ impl App {
         for (gi, g) in s.gpus.iter().enumerate() {
             for (i, l) in g.links.iter().enumerate() {
                 let r = rates.and_then(|r| r.links.get(gi)).and_then(|v| v.get(i));
-                let peak = self.peaks.get(&(g.index, i));
                 let measured = l.tx_bytes.is_some() || l.rx_bytes.is_some();
                 let rate = |v: Option<f64>| measured.then_some(v.unwrap_or(0.0));
                 links.push(LinkGauge {
+                    kind: l.kind,
+                    gpu: Some(g.index),
                     name: format!("GPU{} {}", g.index, l.kind.label()),
-                    short: format!("GPU{} {}", g.index, short_kind(l.kind)),
+                    short: format!("G{} {}", g.index, short_kind(l.kind)),
                     full_scale: l.full_scale_gb_s,
                     rx: rate(r.and_then(|r| r.rx_gb_s)),
                     tx: rate(r.and_then(|r| r.tx_gb_s)),
                     // Peer copies are not in Legion's model bytes.
                     legion: (l.kind != LinkKind::NvlinkPeer)
                         .then(|| r.map_or(0.0, |r| r.legion_gb_s)),
-                    peak: peak.filter(|_| measured).map(|p| p.tx.max(p.rx)),
+                    rx_peak: self.peak(PeakOf::Rx(g.index, i)),
+                    tx_peak: self.peak(PeakOf::Tx(g.index, i)),
+                    legion_peak: self.peak(PeakOf::Legion(g.index, i)),
                     why: (!measured).then(|| {
                         if l.kind == LinkKind::C2c {
                             "no C2C counter".to_string()
@@ -446,13 +485,17 @@ impl App {
         if let Some(n) = &s.network {
             let r = rates.and_then(|r| r.network);
             links.push(LinkGauge {
+                kind: LinkKind::Network,
+                gpu: None,
                 name: LinkKind::Network.label().into(),
                 short: short_kind(LinkKind::Network).into(),
                 full_scale: n.full_scale_gb_s,
                 rx: None,
                 tx: None,
                 legion: Some(r.map_or(0.0, |r| r.legion_gb_s)),
-                peak: self.peaks.get(&(u32::MAX, 0)).map(|p| p.tx),
+                rx_peak: None,
+                tx_peak: None,
+                legion_peak: self.peak(PeakOf::Net),
                 why: Some("no NIC counter".into()),
                 detail: (!n.detail.is_empty()).then(|| n.detail.clone()),
             });
@@ -481,6 +524,12 @@ impl App {
                     full_scale: m.peak_gb_s,
                     measured: mr.and_then(|r| r.measured_gb_s),
                     legion: mr.map_or(0.0, |r| r.legion_gb_s),
+                    // The tick follows the measured needle, or Legion's where nothing measures.
+                    peak: if gpm {
+                        self.peak(PeakOf::MemMeasured(g.index))
+                    } else {
+                        self.peak(PeakOf::MemLegion(g.index))
+                    },
                     note: (!gpm).then(|| match g.mem_busy_pct {
                         Some(p) => format!("busy {p:.0}%"),
                         None => "no GPM".into(),
@@ -615,12 +664,15 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 fn draw_full(f: &mut Frame, area: Rect, app: &App, mode: Mode) {
+    let steps_h = if mode.step_bar { 4 } else { 0 };
+    // What the other rows leave, logs at their minimum of 3.
+    let spare = area.height.saturating_sub(2 + 13 + 9 + steps_h + 3 + 1);
     let [h, row1, bandwidth, row3, steps, logs, foot] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Length(13),
-        Constraint::Length(bandwidth_height(app)),
+        Constraint::Length(bandwidth_height(app, area.width, spare)),
         Constraint::Length(9),
-        Constraint::Length(if mode.step_bar { 4 } else { 0 }),
+        Constraint::Length(steps_h),
         Constraint::Min(3),
         Constraint::Length(1),
     ])
@@ -877,21 +929,35 @@ pub fn draw_throughput(f: &mut Frame, area: Rect, app: &App, sparklines: bool) {
     let per_decode =
         (!decoding.is_empty()).then(|| decoding.iter().sum::<f64>() / decoding.len() as f64);
     let per_prefill = (e.prefilling > 0).then(|| prefill / f64::from(e.prefilling));
+    // `decode  123.4 tok/s  pk 150.2  41.1 per request`; a narrow panel drops the last part.
+    let rate = |name: &'static str, color: Color, v: String, pk: String, per: String| {
+        let head = format!("{v} tok/s");
+        let tail = format!("  {per} per request");
+        let mut spans = vec![
+            Span::styled(name, Style::default().fg(color)),
+            Span::raw(head),
+            Span::styled(format!("  pk {pk}"), dim()),
+        ];
+        if Line::from(spans.clone()).width() + tail.len() <= usize::from(inner.width) {
+            spans.push(Span::raw(tail));
+        }
+        Line::from(spans)
+    };
     let lines = vec![
-        Line::from(vec![
-            Span::styled("decode  ", Style::default().fg(Color::Green)),
-            Span::raw(format!(
-                "{decode:>8.1} tok/s  {} per request",
-                na(per_decode, |v| format!("{v:.1}"))
-            )),
-        ]),
-        Line::from(vec![
-            Span::styled("prefill ", Style::default().fg(Color::Cyan)),
-            Span::raw(format!(
-                "{prefill:>8.0} tok/s  {} per request",
-                na(per_prefill, |v| format!("{v:.0}"))
-            )),
-        ]),
+        rate(
+            "decode  ",
+            Color::Green,
+            format!("{decode:>8.1}"),
+            na(app.peak(PeakOf::Decode), |v| format!("{v:.1}")),
+            na(per_decode, |v| format!("{v:.1}")),
+        ),
+        rate(
+            "prefill ",
+            Color::Cyan,
+            format!("{prefill:>8.0}"),
+            na(app.peak(PeakOf::Prefill), |v| format!("{v:.0}")),
+            na(per_prefill, |v| format!("{v:.0}")),
+        ),
         Line::raw(format!(
             "active {} (prefill {}, decode {})  queued {}",
             e.running, e.prefilling, e.decoding, e.waiting
@@ -968,35 +1034,43 @@ fn hw_missing(app: &App) -> Option<String> {
     s.gpus.is_empty().then(|| "no GPU sampled".into())
 }
 
-/// Link gauges the full layout's row gives a row each; more go into columns.
-pub const LINK_ROWS: u16 = 10;
 /// A memory dial's size in the full layout.
 pub const DIAL_W: u16 = 34;
 pub const DIAL_H: u16 = 12;
 
-/// The full layout's link and memory row: one row per link gauge, as tall as a memory dial
-/// where there is one.
-pub fn bandwidth_height(app: &App) -> u16 {
-    if hw_missing(app).is_some() {
-        return 4;
-    }
-    let links = (app.links().len() as u16).clamp(1, LINK_ROWS) + 2;
-    if app.memory_dials().is_empty() {
-        links
-    } else {
-        links.max(DIAL_H)
-    }
-}
-
-/// The full layout's row: the link gauges, then the memory dials on the right.
-pub fn draw_bandwidth(f: &mut Frame, area: Rect, app: &App) {
+/// The memory dials of the full layout's row and how many fit `width` (at most half of it).
+fn dials_in(app: &App, width: u16) -> (Vec<Speedo>, usize) {
     let memory = if hw_missing(app).is_some() {
         Vec::new()
     } else {
         app.memory_dials()
     };
-    // The dials take at most half the row.
-    let fit = memory.len().min(usize::from(area.width / 2 / DIAL_W));
+    let fit = memory.len().min(usize::from(width / 2 / DIAL_W));
+    (memory, fit)
+}
+
+/// The full layout's link and memory row in `width` and at most `max` rows: as tall as the
+/// link gauges' plan (titles and two bars per link, columns when they do not fit), and as a
+/// memory dial where there is one.
+pub fn bandwidth_height(app: &App, width: u16, max: u16) -> u16 {
+    if hw_missing(app).is_some() {
+        return 4;
+    }
+    let links = app.links();
+    let (memory, fit) = dials_in(app, width);
+    let h = if links.is_empty() {
+        3
+    } else {
+        let inner_w = width.saturating_sub(fit as u16 * DIAL_W + 2);
+        let p = gauge::plan(&links, inner_w, max.saturating_sub(2));
+        (p.rows() + 2).min(max.max(3))
+    };
+    if memory.is_empty() { h } else { h.max(DIAL_H) }
+}
+
+/// The full layout's row: the link gauges, then the memory dials on the right.
+pub fn draw_bandwidth(f: &mut Frame, area: Rect, app: &App) {
+    let (memory, fit) = dials_in(app, area.width);
     let [links, dials] =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(fit as u16 * DIAL_W)])
             .areas(area);
@@ -1021,7 +1095,7 @@ pub fn draw_bandwidth(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-/// The links panel: a gauge per link, one per row (both layouts).
+/// The links panel: RX and TX bars per link (both layouts).
 pub fn draw_links(f: &mut Frame, area: Rect, app: &App) {
     let block = panel_block(app, Panel::Links, Panel::Links.title().into());
     let inner = block.inner(area);
@@ -1033,7 +1107,7 @@ pub fn draw_links(f: &mut Frame, area: Rect, app: &App) {
         );
         return;
     }
-    gauge::render_stack(f, inner, &app.links());
+    gauge::render_stack(f, inner, &app.links(), app.colors);
 }
 
 /// The memory dials as bars, for the compact layout.
@@ -1092,7 +1166,32 @@ pub fn draw_gpus(f: &mut Frame, area: Rect, app: &App) {
         f.render_widget(block, area);
         return;
     };
-    let header = Row::new(["GPU", "SM", "mem", "VRAM GiB", "W", "SM MHz", "mem MHz"]).style(dim());
+    // `pk`: the SM utilization's and the power's 10 s peaks. The clocks go first when the
+    // panel is narrow.
+    const COLUMNS: [(&str, u16); 9] = [
+        ("GPU", 3),
+        ("SM", 4),
+        ("pk", 3),
+        ("mem", 4),
+        ("VRAM GiB", 10),
+        ("W", 4),
+        ("pk", 4),
+        ("SM MHz", 6),
+        ("mem MHz", 7),
+    ];
+    let inner_w = usize::from(block.inner(area).width);
+    let mut n = COLUMNS.len();
+    while n > 7
+        && COLUMNS[..n]
+            .iter()
+            .map(|c| usize::from(c.1) + 1)
+            .sum::<usize>()
+            - 1
+            > inner_w
+    {
+        n -= 1;
+    }
+    let header = Row::new(COLUMNS[..n].iter().map(|c| c.0)).style(dim());
     let rows: Vec<Row> = s
         .gpus
         .iter()
@@ -1102,26 +1201,22 @@ pub fn draw_gpus(f: &mut Frame, area: Rect, app: &App) {
                 _ if g.unified => "unified".into(),
                 _ => "n/a".into(),
             };
-            Row::new(vec![
+            let cells = [
                 Cell::from(g.index.to_string()),
                 Cell::from(pct(g.sm_busy_pct)),
+                Cell::from(na(app.peak(PeakOf::Sm(g.index)), |v| format!("{v:.0}"))).style(dim()),
                 Cell::from(pct(g.mem_busy_pct)),
                 Cell::from(vram),
                 Cell::from(na(g.power_w, |w| format!("{w:.0}"))),
+                Cell::from(na(app.peak(PeakOf::Power(g.index)), |w| format!("{w:.0}")))
+                    .style(dim()),
                 Cell::from(na(g.sm_clock_mhz, |m| m.to_string())),
                 Cell::from(na(g.mem_clock_mhz, |m| m.to_string())),
-            ])
+            ];
+            Row::new(cells.into_iter().take(n))
         })
         .collect();
-    let widths = [
-        Constraint::Length(3),
-        Constraint::Length(4),
-        Constraint::Length(4),
-        Constraint::Length(10),
-        Constraint::Length(4),
-        Constraint::Length(6),
-        Constraint::Length(7),
-    ];
+    let widths = COLUMNS[..n].iter().map(|c| Constraint::Length(c.1));
     f.render_widget(Table::new(rows, widths).header(header).block(block), area);
 }
 
@@ -1411,9 +1506,11 @@ pub const HELP: &[&str] = &[
     "  1-5  log level (ERROR .. TRACE)   /  search logs   l  full-screen logs",
     "  Up/Down PgUp/PgDn Home/End  scroll the logs",
     "",
-    "Link bars: the busier of RX and TX over the link's per-direction full scale, green",
-    "  under 60%, yellow under 85%, red above; no counter: Legion's bytes. pk: 10 s peak.",
-    "Memory dial needles: measured cyan, Legion's own bytes yellow.",
+    "Link bars: RX and TX each over the link's per-direction full scale, green to yellow",
+    "  to orange to red with load (16 colours: green under 60%, yellow under 85%, red",
+    "  above); no counter: one bar of Legion's bytes. The shaded part runs on to the",
+    "  direction's peak (pk) over the last 10 s; throughput and GPU pk are the same.",
+    "Memory dial needles: measured cyan, Legion's own bytes yellow; the red tick: the peak.",
     "Legion bytes are model bytes (what the steps must read), not measured traffic.",
     "",
     "Why n/a",

@@ -35,8 +35,8 @@ HTTP clients ──► src/server ──► src/engine (trait Engine) ──► 
 | `src/dashboard/latency.rs` | TTFT / ITL percentiles over five minutes: per-minute log-spaced histograms of atomics. |
 | `src/dashboard/logs.rs` | The log ring (last 2,000 lines) behind `/v1/logs/stream` and the log panel, as a tracing layer; other crates' lines only at INFO and above. |
 | `src/dashboard/scale.rs` | Gauge full scales: PCIe generation x width, NVLink links x version, C2C, memory bus x clock, NIC speed. |
-| `src/dashboard/gauge.rs` | The link gauges: a ratatui `LineGauge` per link (the busier direction over the full scale, coloured by load), labels that shorten on narrow panels. |
-| `src/dashboard/speedo.rs` | The memory-bandwidth speedometer: a Braille half dial with measured and Legion needles, bars when small. |
+| `src/dashboard/gauge.rs` | The link gauges: two solid block bars per link drawn straight into the buffer (RX and TX over the per-direction full scale, a green-to-red load gradient, a dimmer ghost fill up to the 10 s peak), a title line that shortens on narrow panels, columns. |
+| `src/dashboard/speedo.rs` | The memory-bandwidth speedometer: a Braille half dial with measured and Legion needles and a peak tick, bars when small. |
 | `src/dashboard/ui.rs` | The dashboard's state (rates, history, peaks, keys) and its full and compact layouts. |
 | `src/dashboard/term.rs` | Raw mode and the alternate screen, restored on every exit (also on panic), and the draw / key loop. |
 | `src/dashboard/client.rs` | `legion top`'s two server-sent-event streams, reconnecting with backoff. |

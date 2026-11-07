@@ -166,6 +166,7 @@ pub fn request_stop() {
 pub fn run(app: &mut App, mut poll: impl FnMut(&mut App)) -> io::Result<Exit> {
     let mut session = Session::enter()?;
     session.terminal.clear()?;
+    app.colors = super::gauge::ColorDepth::detect();
     loop {
         if STOP.load(Ordering::Relaxed) {
             return Ok(Exit::Stopped);

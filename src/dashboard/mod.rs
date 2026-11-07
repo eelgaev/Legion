@@ -7,7 +7,8 @@
 //! - [`latency`]: TTFT and inter-token percentiles over five minutes, lock-free.
 //! - [`logs`]: the in-memory ring of the last 2,000 log lines.
 //! - [`scale`]: each gauge's full scale from what the hardware reports.
-//! - [`gauge`]: the link gauges (`LineGauge`); [`speedo`]: the memory speedometer.
+//! - [`gauge`]: the link gauges (RX and TX block bars with a peak); [`speedo`]: the memory
+//!   speedometer.
 //! - [`ui`]: the layout and panels.
 //! - [`term`]: the terminal (raw mode, restore on exit, error and panic) and the key loop.
 //! - [`client`]: `legion top`'s HTTP client (SSE, reconnect with backoff).
