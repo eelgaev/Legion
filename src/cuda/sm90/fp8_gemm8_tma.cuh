@@ -3,7 +3,7 @@
 //
 // Not a standalone header: fp8_mm.cu includes it inside its anonymous namespace, after
 // sm89/fp8_mm.cuh (a8::Cfg, gemm8_stage, gemm8_epilogue). The kernel body is built only where
-// __CUDA_ARCH__ >= 900 and is empty elsewhere.
+// __CUDA_ARCH__ >= 900 and traps elsewhere.
 //
 // fp8_gemm8 spends a large part of each K step issuing its copies: 12 cp.async of 16 bytes per
 // thread for the 256 x 128 tile, each with its own address and bounds check, then a CTA barrier.
@@ -116,5 +116,7 @@ __global__ void __launch_bounds__(256) fp8_gemm8_tma(const legion_fp8_mm8 p, con
         }
     }
     gemm8_epilogue<RES, C>(p, m0, n0, wm, wn, lane, acc);
+#else
+    __trap();  // launch_gemm8_tma checks the image is sm_90+ first
 #endif
 }

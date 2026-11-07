@@ -3,9 +3,9 @@
 //
 // Not a standalone header: fp8_mm.cu includes it inside its anonymous namespace, after the
 // legion_fp8_mm declaration and the E4M3 helpers it uses. The kernel bodies are built only where
-// __CUDA_ARCH__ >= 800 and are empty elsewhere, so the file compiles for every target
-// architecture; bf16_mma() in fp8_mm.cu (compute capability 8.0+) decides per device at run time
-// whether they run.
+// __CUDA_ARCH__ >= 800 and trap elsewhere, so the file compiles for every target architecture;
+// bf16_mma() in fp8_mm.cu (compute capability 8.0+) decides per device at run time whether they
+// run, and the engine refuses at load a GPU this binary has no code of its architecture for.
 
 // Tensor-core tile: W warps stacked along m, 16 weight rows each (BM = 16 W), every warp all BN
 // tokens of the tile; K steps of BK. mma.sync m16n8k16 BF16 -> F32 (sm_80+), operands from
@@ -137,6 +137,8 @@ __global__ void __launch_bounds__(32 * W) fp8_gemm(const legion_fp8_mm p) {
             }
         }
     }
+#else
+    __trap();
 #endif
 }
 
@@ -334,5 +336,7 @@ __global__ void __launch_bounds__(256) fp8_gemm_big(const legion_fp8_mm p) {
             }
         }
     }
+#else
+    __trap();
 #endif
 }

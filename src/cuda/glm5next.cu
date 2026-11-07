@@ -981,6 +981,8 @@ template <bool XH, bool OH = false> __global__ void __launch_bounds__(256) linea
             }
         }
     }
+#else
+    __trap();  // tc_device(): compute capability 8.0+ only
 #endif
 }
 

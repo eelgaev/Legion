@@ -203,6 +203,25 @@ fn cuda_index(dev: crate::ggml::Device) -> Option<usize> {
     dev.name().strip_prefix("CUDA")?.parse().ok()
 }
 
+/// Refuses a layout with a GPU this binary has no code of its architecture's level for
+/// ([`crate::hw::cuda_arch::check`]): the stages' devices and tensor parallelism's GPUs.
+#[cfg(feature = "cuda")]
+fn check_gpu_code(layout: &layout::Layout) -> Result<(), LoadError> {
+    let gpus = layout
+        .stages
+        .iter()
+        .filter_map(|s| s.0)
+        .chain(layout.tp_devices.iter().copied());
+    for dev in gpus {
+        if let Some(index) = cuda_index(dev)
+            && let Some(e) = crate::hw::cuda_arch::check(index, || dev.description())
+        {
+            return Err(LoadError::Device(e));
+        }
+    }
+    Ok(())
+}
+
 /// Whether any of `devs` (a meta device's GPUs) is a V100 (compute capability 7.0).
 #[cfg(feature = "cuda")]
 fn any_volta(devs: &[crate::ggml::Device]) -> bool {
@@ -3650,6 +3669,10 @@ impl LmEngine {
         let id = model_id(&cfg, &gguf);
 
         let layout = layout::Layout::plan(&cfg, &gguf)?;
+        // A GPU this binary has no code of its architecture for fails here, before any weight
+        // is read, not mid-serve (#1201).
+        #[cfg(feature = "cuda")]
+        check_gpu_code(&layout)?;
         let mode = layout.mode;
         let mut backends = layout.backends()?;
         for b in &mut backends {

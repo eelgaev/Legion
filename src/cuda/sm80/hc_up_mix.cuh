@@ -3,7 +3,7 @@
 //
 // Not a standalone header: hc_up_mix.cu includes it inside its anonymous namespace, after the
 // argument struct and the constants (HC, ROWS, WARPS, NT, CHUNK, PAD). The kernel body is built
-// only where __CUDA_ARCH__ >= 800 and is empty elsewhere; mma_code() in hc_up_mix.cu checks that
+// only where __CUDA_ARCH__ >= 800 and traps elsewhere; mma_code() in hc_up_mix.cu checks that
 // the binary has it for the device.
 //
 // A CTA owns ROWS mixed columns (i0 .. i0 + ROWS - 1) and CHUNK tokens. Its HC x ROWS up rows
@@ -162,5 +162,7 @@ __global__ void __launch_bounds__(WARPS * 32) up_mix_mma(const legion_hc_up_mix 
             }
         }
     }
+#else
+    __trap();
 #endif
 }

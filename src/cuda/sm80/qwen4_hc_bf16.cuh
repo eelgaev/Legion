@@ -119,6 +119,8 @@ __global__ void __launch_bounds__(GB_DOWN_THREADS) down_bf16_g(const legion_hc_m
             p.lo[(int64_t) t * p.rank + r0 + r] = v / (1.0f + expf(-v));
         }
     }
+#else
+    __trap();
 #endif
 }
 
@@ -177,5 +179,7 @@ __global__ void __launch_bounds__(UP_THREADS) up_mix_bf16_g(const legion_hc_mix 
         }
         p.mixed[(int64_t) t * p.n_embd + i] = sum * (1.0f / p.hc);
     }
+#else
+    __trap();
 #endif
 }

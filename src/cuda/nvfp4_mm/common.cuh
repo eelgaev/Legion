@@ -176,8 +176,10 @@ template <> int launch_mvg<2>(const legion_nvfp4_mm & p, bool glu, int rtw, int 
 template <> int launch_mvg<4>(const legion_nvfp4_mm & p, bool glu, int rtw, int rpt, int sb, int pft, cudaStream_t st);
 int launch_swiglu_mv(const legion_nvfp4_mm & p, int nt, cudaStream_t st);
 
-// pdl_code's answer for every part (defined once, in dispatch.cu): 0 unknown, 1 yes, 2 no.
-extern std::atomic<int> pdl_state;
+// pdl_code's answer for every part, per device (defined once, in dispatch.cu): 0 unknown, 1 yes,
+// 2 no. Per device, not per process: one box may hold GPUs of different architectures.
+constexpr int PDL_DEVICES = 64;
+extern std::atomic<int> pdl_state[PDL_DEVICES];
 
 }  // namespace legion_nvfp4
 
@@ -635,6 +637,8 @@ __global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p)
         }
     }
     }
+#else
+    __trap();  // device_supported() launches it on compute capability 8.0+ only
 #endif
 }
 
@@ -1095,6 +1099,8 @@ __global__ void __launch_bounds__(KW * 32) nvfp4_mvs(const legion_nvfp4_mm p) {
     }
     asm volatile("cp.async.wait_group 0;\n" ::);
     epilogue(ntile - 1);
+#else
+    __trap();  // device_supported() launches it on compute capability 8.0+ only
 #endif
 }
 
@@ -1180,11 +1186,19 @@ int gemm_nt(const legion_nvfp4_mm & p, int nt, int variant, cudaStream_t st) {
 
 // RPT: row tiles per CTA (`tiles_m` counts tiles of 16 * RTW * RPT rows).
 // Whether `kernel` was built with griddepcontrol (sm_90+ code for this device), so it may be a
-// programmatic dependent launch: asked once (these files' kernels are all built for the same
-// architectures, and a process uses one kind of GPU).
+// programmatic dependent launch: asked once per device (these files' kernels are all built for
+// the same architectures).
 template <typename K>
 bool pdl_code(K kernel) {
-    std::atomic<int> & state = legion_nvfp4::pdl_state;  // 0 unknown, 1 yes, 2 no
+    int dev = 0;
+    const cudaError_t was = cudaPeekAtLastError();
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= legion_nvfp4::PDL_DEVICES) {
+        if (was == cudaSuccess) {
+            cudaGetLastError();
+        }
+        return false;
+    }
+    std::atomic<int> & state = legion_nvfp4::pdl_state[dev];  // 0 unknown, 1 yes, 2 no
     int st = state.load(std::memory_order_relaxed);
     if (st == 0) {
         cudaFuncAttributes fa{};

@@ -2,10 +2,12 @@
 
 pub mod comm_bench;
 pub mod counters;
+pub mod cuda_arch;
 pub mod gpu;
 pub mod host_core;
 pub mod numa;
 pub mod numa_bind;
+pub mod per_device;
 pub mod roofline;
 
 use std::fmt::Write as _;

@@ -128,6 +128,18 @@ pub fn set_gpu(cc_major: Option<i32>, sms: i32) {
     );
 }
 
+/// The SMs of `up`'s GPU where the op runs there, else 0: the engine's GPU is one it is chosen
+/// for ([`set_gpu`]) and so is the weight's own device (asked once per device: a box may hold
+/// GPUs of different architectures, #1201), whose SM count the split is planned for.
+fn sms_for(up: Tensor<'_>) -> i32 {
+    let engine = GPU_SMS.load(Ordering::Relaxed);
+    if engine <= 0 {
+        return 0;
+    }
+    up.cuda_device()
+        .map_or(engine, crate::hw::per_device::sms_if_cc12)
+}
+
 /// ggml-cuda's MMQ tile widths for a Q8_0 weight whose rows are a multiple of 128
 /// (`mmq-config-ampere.cuh`, which Blackwell and Ampere take; no `fallback`).
 const MMQ_J: [i64; 11] = [8, 16, 24, 32, 40, 48, 64, 80, 96, 112, 128];
@@ -188,7 +200,7 @@ pub(super) fn fits(up: Tensor<'_>, lo: Tensor<'_>, xn: Tensor<'_>, hc: i64) -> b
 /// The part of [`fits`] about `up` and the step's `n` tokens, before `lo` and `xn` exist (as
 /// [`up_mix_rebuilt`] needs to know before the norm runs).
 pub(super) fn fits_up(up: Tensor<'_>, n: i64, hc: i64) -> bool {
-    let sms = GPU_SMS.load(Ordering::Relaxed) as i64;
+    let sms = sms_for(up) as i64;
     let [rank, rows, u2, u3] = up.ne();
     let e = rows / hc.max(1);
     ON.load(Ordering::Relaxed)
@@ -216,7 +228,7 @@ pub(super) fn fits_up(up: Tensor<'_>, n: i64, hc: i64) -> bool {
 /// `hc · e` rows) computes each output tile in one CTA, the products in K order: the sums the
 /// kernel adds.
 pub(super) fn fits_up_bf16(up: Tensor<'_>, n: i64, hc: i64) -> bool {
-    let sms = GPU_SMS.load(Ordering::Relaxed);
+    let sms = sms_for(up);
     let [rank, rows, u2, u3] = up.ne();
     let e = rows / hc.max(1);
     ON.load(Ordering::Relaxed)

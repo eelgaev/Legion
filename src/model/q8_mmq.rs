@@ -142,6 +142,18 @@ pub fn gpu_sms() -> i32 {
     GPU_SMS.load(Ordering::Relaxed)
 }
 
+/// The SMs of `w`'s GPU where the op runs there, else 0: the engine's GPU is one it runs on
+/// ([`gpu_sms`]) and so is the weight's own device (asked once per device: a box may hold GPUs
+/// of different architectures, #1201), whose SM count ggml's split is planned for.
+fn sms_for(w: Tensor<'_>) -> i32 {
+    let engine = gpu_sms();
+    if engine <= 0 {
+        return 0;
+    }
+    w.cuda_device()
+        .map_or(engine, crate::hw::per_device::sms_if_cc12)
+}
+
 /// ggml-cuda's MMQ tile width for a Q8_0 weight of `rows` rows times `n` columns
 /// (`ggml_cuda_mul_mat_q`): the first width, from 8 up, with the fewest column tiles.
 pub fn tile_width(rows: i64, n: i64) -> i64 {
@@ -408,7 +420,7 @@ pub fn fast_fits(p: &Plan, k: i64, w_ld: i64, warps: i64) -> bool {
 /// weight in one GPU's memory, shapes the op takes ([`fits`]) and a plan it runs faster than
 /// ggml's MMQ ([`beats_ggml`]; the others stay on ggml's, shared quantization included).
 pub fn takes(w: Tensor<'_>, x: Tensor<'_>) -> bool {
-    let sms = gpu_sms() as i64;
+    let sms = sms_for(w) as i64;
     ON.load(Ordering::Relaxed)
         && cfg!(feature = "cuda")
         && sms > 0
@@ -469,7 +481,7 @@ pub fn fits(
 
 /// `w @ x` (see [`takes`]) on the op: F32 `[rows, n]`, ggml's `mul_mat`'s shape, with its bits.
 pub fn mul_mat<'a>(ctx: &'a Context, w: Tensor<'a>, x: Tensor<'a>) -> Tensor<'a> {
-    let sms = gpu_sms() as i64;
+    let sms = sms_for(w) as i64;
     mul_mat_fast(ctx, w, x, sms, q8_mmq_fast(), q8_mmq_fixup())
 }
 

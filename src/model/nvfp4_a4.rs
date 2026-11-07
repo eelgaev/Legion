@@ -101,27 +101,43 @@ static A4_QUANT: ExternalOp = ExternalOp {
 /// Bytes per 64-weight NVFP4 block: four sub-block scales and 32 bytes of codes.
 const BLOCK_BYTES: i64 = 36;
 
-/// Whether this process's GPU runs the W4A4 kernels (probed once, on the current device).
+/// Whether the current device runs the W4A4 kernels (probed once per device).
 pub fn device_supported() -> bool {
     #[cfg(feature = "cuda")]
     {
-        static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *SUPPORTED.get_or_init(|| {
-            unsafe extern "C" {
-                fn legion_nvfp4_a4_supported() -> i32;
-            }
-            // SAFETY: a device query (one probe kernel).
-            unsafe { legion_nvfp4_a4_supported() != 0 }
-        })
+        let mut dev = 0;
+        // SAFETY: a plain query of the calling thread's device.
+        if unsafe { cuda::cudaGetDevice(&mut dev) } != 0 {
+            return false;
+        }
+        usize::try_from(dev).is_ok_and(supported_on)
     }
     #[cfg(not(feature = "cuda"))]
     false
 }
 
+/// Whether CUDA device `dev` runs the W4A4 kernels: this build has the FP4 code for it (one
+/// probe kernel on it, the first time a device is asked; kept per device, #1201).
+pub fn supported_on(dev: usize) -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        static SUPPORTED: crate::hw::per_device::PerDevice =
+            crate::hw::per_device::PerDevice::new();
+        SUPPORTED.get(dev, cuda::probe) == 1
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = dev;
+        false
+    }
+}
+
 /// Whether `w · x` can take these ops: an NVFP4 weight as [`super::nvfp4_mm::supports`]
-/// takes, on a GPU with the FP4 kernels.
+/// takes, on a GPU with the FP4 kernels (the weight's).
 pub fn supports(w: Tensor<'_>) -> bool {
-    super::nvfp4_mm::supports(w) && !w.is_host() && device_supported()
+    super::nvfp4_mm::supports(w)
+        && !w.is_host()
+        && w.cuda_device().map_or_else(device_supported, supported_on)
 }
 
 /// A quantized activation row (see the module docs).
@@ -1344,6 +1360,35 @@ mod cuda {
         act: i32,
         pw: *const f32,
         res: *const f32,
+    }
+
+    unsafe extern "C" {
+        pub(super) fn cudaGetDevice(device: *mut i32) -> i32;
+        fn cudaSetDevice(device: i32) -> i32;
+        fn legion_nvfp4_a4_supported() -> i32;
+    }
+
+    /// `legion_nvfp4_a4_supported` on device `dev` (1 when it runs the FP4 kernels, else 0),
+    /// the calling thread's device put back after.
+    pub(super) fn probe(dev: usize) -> i32 {
+        let Ok(dev) = i32::try_from(dev) else {
+            return 0;
+        };
+        let mut was = 0;
+        // SAFETY: device queries and one probe kernel (synchronous) on device `dev`.
+        unsafe {
+            if cudaGetDevice(&mut was) != 0 {
+                return 0;
+            }
+            if was != dev && cudaSetDevice(dev) != 0 {
+                return 0;
+            }
+            let ok = legion_nvfp4_a4_supported() != 0;
+            if was != dev {
+                cudaSetDevice(was);
+            }
+            i32::from(ok)
+        }
     }
 
     unsafe extern "C" {

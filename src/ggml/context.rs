@@ -787,6 +787,38 @@ impl<'a> Tensor<'a> {
             }
     }
 
+    /// The CUDA device ordinal of the device whose buffer holds the tensor (ggml's `CUDA<n>`;
+    /// spill buffers in host memory name the GPU they serve); `None` when it has no memory yet
+    /// or its buffer's device is not a CUDA device (CPU, meta). No driver call: three ggml
+    /// queries and the name.
+    pub fn cuda_device(self) -> Option<usize> {
+        if !self.is_allocated() {
+            return None;
+        }
+        // SAFETY: an allocated tensor's `buffer` is a live buffer; its type and device are
+        // static descriptors and the device name a NUL-terminated string they own.
+        let name = unsafe {
+            let buft = ffi::ggml_backend_buffer_get_type((*self.raw()).buffer);
+            if buft.is_null() {
+                return None;
+            }
+            let dev = ffi::ggml_backend_buft_get_device(buft);
+            if dev.is_null() {
+                return None;
+            }
+            let name = ffi::ggml_backend_dev_name(dev);
+            if name.is_null() {
+                return None;
+            }
+            std::ffi::CStr::from_ptr(name)
+        };
+        let digits = name.to_bytes().strip_prefix(b"CUDA")?;
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(digits).ok()?.parse().ok()
+    }
+
     /// The tensor's memory as a mutable byte slice, or `None` if it has no memory yet or lives
     /// in a buffer the host cannot address (device VRAM).
     ///
