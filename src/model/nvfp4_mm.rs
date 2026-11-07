@@ -1357,7 +1357,8 @@ pub const PREFETCH_RUN32: GemmPrefetch = GemmPrefetch {
     x: false,
 };
 
-/// Runs of 8 blocks, and an expert's first row tile prefetches its token rows too (#1183). GB10,
+/// Runs of 8 blocks, and an expert's first row tile prefetches its token rows too (#1183): a
+/// tuning variant, not a default (see [`GLU_PREFETCH`]). GB10,
 /// Qwen3.8-Flash-Next, `legion nvfp4-gemm-bench --rounds 3 --layers 4`, us per layer vs
 /// [`PREFETCH_RUN32`] (the same bits): SwiGLU 4096 tokens over 512 / 160 experts 9716 -> 8130 /
 /// 5609 -> 5337, 2048 tokens 6249 -> 5063 / 3405 -> 3277; down 5214 -> 5026 / 3885 -> 3662,
@@ -1369,11 +1370,13 @@ pub const PREFETCH_RUN8_X: GemmPrefetch = GemmPrefetch {
     x: true,
 };
 
-/// The grouped SwiGLU GEMM's prefetch.
-pub const GLU_PREFETCH: GemmPrefetch = PREFETCH_RUN8_X;
+/// The grouped SwiGLU GEMM's prefetch: still [`PREFETCH_RUN32`]. End to end (Flash-Next NVFP4 +
+/// MTP on one GB10, --deterministic, the same hashes) [`PREFETCH_RUN8_X`] for both GEMMs gave 8K
+/// 2019 -> 1984 and 32K 2108 -> 2069 prompt tok/s: the microbench gain does not carry over.
+pub const GLU_PREFETCH: GemmPrefetch = PREFETCH_RUN32;
 
 /// The other grouped GEMMs' prefetch (the down projections).
-pub const DOWN_PREFETCH: GemmPrefetch = PREFETCH_RUN8_X;
+pub const DOWN_PREFETCH: GemmPrefetch = PREFETCH_RUN32;
 
 /// Two stages, two CTAs per SM: [`pick_grouped`]'s 256-row by 64-token down projection tile.
 pub const GEMM_DOWN: GemmTune = GemmTune { stages: 2, ctas: 2 };
