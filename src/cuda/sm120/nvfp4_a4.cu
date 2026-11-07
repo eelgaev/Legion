@@ -11,7 +11,7 @@
 //   the weight's per-tensor or per-expert scale and the token's decode scale in the epilogue.
 // Built only for the architecture-specific targets (CMAKE_CUDA_ARCHITECTURES 120a / 121a): the
 // FP4 MMA and the E2M1 conversion do not exist elsewhere. Every other architecture compiles the
-// kernels empty and `legion_nvfp4_a4_supported` reports 0, so the W4A16 kernels run instead.
+// kernels to a trap and `legion_nvfp4_a4_supported` reports 0, so the W4A16 kernels run instead.
 //
 // Operand layout (PTX ISA, "Matrix fragments for mma.m16n8k64", g = lane / 4, t = lane % 4):
 // A a0 = (row g, k 8t..8t+7), a1 = (g + 8, 8t..), a2 = (g, 32 + 8t..), a3 = (g + 8, 32 + 8t..),
@@ -385,6 +385,8 @@ __global__ void __launch_bounds__(128) nvfp4_a4_quant(const T * x, int64_t x_ld,
     __syncthreads();
     amax = fmaxf(fmaxf(red[0], red[1]), fmaxf(red[2], red[3]));
     quant_row(xr, amax, k, row, q, q_ld, s, s_ld, d, threadIdx.x, 128);
+#else
+    __trap();  // launched only where nvfp4_a4_probe answers 1
 #endif
 }
 
@@ -460,6 +462,8 @@ __global__ void __launch_bounds__(RQ_THREADS) nvfp4_a4_rms_quant(const float * x
         amax = fmaxf(amax, red[i]);
     }
     quant_row(y, amax, k, row, q, q_ld, s, s_ld, d, threadIdx.x, RQ_THREADS);
+#else
+    __trap();  // launched only where nvfp4_a4_probe answers 1
 #endif
 }
 
@@ -839,6 +843,8 @@ __global__ void __launch_bounds__(256, T::MINB) nvfp4_a4_gemm(const legion_nvfp4
     }
     asm volatile("cp.async.wait_group 0;\n" ::);
     a4_epilogue<MI, NT, GROUPED, GLU, RES>(p, acc, m0, n0, n_tok, x_dec, d_off, sc, sc2, wm, wn, g, t);
+#else
+    __trap();  // launched only where nvfp4_a4_probe answers 1
 #endif
 }
 
@@ -1188,6 +1194,8 @@ __global__ void __launch_bounds__(KW * 32) nvfp4_a4_mv(const legion_nvfp4_a4 p) 
         }
         store(i / 32, i % 32, v, v2);
     }
+#else
+    __trap();  // launched only where nvfp4_a4_probe answers 1
 #endif
 }
 

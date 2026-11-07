@@ -233,6 +233,8 @@ __global__ void __launch_bounds__(256, 1) nvfp4_a4_gemm_tma(const legion_nvfp4_a
         }
     }
     a4_epilogue<MI, NT, false, GLU, RES>(p, acc, m0, n0, n_tok, x_dec, nullptr, sc, sc2, wm, wn, g, t);
+#else
+    __trap();  // launched only where nvfp4_a4_probe answers 1
 #endif
 }
 

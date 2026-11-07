@@ -61,8 +61,10 @@ include them anywhere else, and do not make them separate `.cu` files.
 Every file is compiled for every target architecture of the build (for example
 `70;80;89;121a` gives one binary for V100, A100, RTX 40 and GB10). So code that uses newer
 instructions keeps its `#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800` (or `>= 890`, or
-`__CUDA_ARCH_FEAT_SM120_ALL` / `SM121_ALL`) guard, with a `__trap()` stub or an empty body
-for older targets and the host pass. The launchers then pick a path per device, decided once per device:
+`__CUDA_ARCH_FEAT_SM120_ALL` / `SM121_ALL`) guard, and a kernel whose body is guarded ends in
+`#else __trap(); #endif`: a launch the host checks got wrong stops with an error instead of
+leaving its output unwritten (an empty body is silent garbage). Device functions may keep an
+older fallback. The launchers then pick a path per device, decided once per device:
 
 - `legion_device::compute_capability()` (`device_cache.cuh`): `fa::available()`, `use_m884()`
   (paged_attn), `bf16_mma()`, `fp8_mma()` (fp8_mm).
@@ -71,7 +73,17 @@ for older targets and the host pass. The launchers then pick a path per device, 
   (moe_gemm), `use_mma<HD>()` (qsa_attn), `gb10_device()` (qwen4_hc, together with compute
   capability 12.1).
 - `legion_nvfp4_a4_supported()`: a probe kernel that reports whether the current device runs
-  code built with the FP4 MMA.
+  code built with the FP4 MMA (`nvfp4_a4::supported_on` asks it once per device).
+
+Answers about the GPU are kept per device, never once per process: one box may hold GPUs of
+different architectures. On the Rust side `crate::hw::per_device` keeps them (compute
+capability, SM count, a probe's answer) by device ordinal, and an op picks by the device of
+the weight it multiplies (`Tensor::cuda_device`). Before any weight is read, the engine checks
+each GPU of the layout against the code the binary holds for it (`crate::hw::cuda_arch`: the
+`ptxVersion` of one kernel there, every file being built for the same architectures) and
+refuses one whose architecture level (7.0, 8.0, 8.9, 9.0+) the code is older than, with the
+`CMAKE_CUDA_ARCHITECTURES` target to build: the compute-capability checks above assume the
+binary has that architecture's code.
 
 When adding a kernel for one architecture: put it in the matching directory, keep the guard and
 stub so the other targets still compile, and add the run-time check to the launcher in the

@@ -4,7 +4,7 @@
 
 namespace legion_nvfp4 {
 
-std::atomic<int> pdl_state{0};
+std::atomic<int> pdl_state[PDL_DEVICES];  // zero-initialized: 0 unknown
 
 }  // namespace legion_nvfp4
 

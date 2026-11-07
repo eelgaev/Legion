@@ -3,9 +3,10 @@
 //
 // Not a standalone header: fp8_mm.cu includes it inside its anonymous namespace, after
 // sm80/fp8_mm.cuh (cp_async16) and a8_static / a8_scale (the epilogue's scale). The
-// kernel bodies are built only where __CUDA_ARCH__ >= 890 and are empty elsewhere, so the file
+// kernel bodies are built only where __CUDA_ARCH__ >= 890 and trap elsewhere, so the file
 // compiles for every target architecture; fp8_mma() in fp8_mm.cu (compute capability 8.9+)
-// decides per device at run time whether they run.
+// decides per device at run time whether they run, and the engine refuses at load a GPU this
+// binary has no code of its architecture for.
 
 // More tokens: 64 * WM rows x 128 tokens per CTA, 8 warps as WM x (8 / WM) of 64 rows x
 // 128 / (8 / WM) tokens, mma.sync m16n8k32 E4M3 x E4M3 -> F32 (sm_89+) straight from the raw
@@ -215,6 +216,8 @@ __global__ void __launch_bounds__(256) fp8_gemm8(const legion_fp8_mm8 p) {
     }
     asm volatile("cp.async.wait_group 0;\n" ::);
     gemm8_epilogue<RES, C>(p, m0, n0, wm, wn, lane, acc);
+#else
+    __trap();
 #endif
 }
 
@@ -349,5 +352,7 @@ __global__ void __launch_bounds__(32 * W) fp8_gemm8_skinny(const legion_fp8_mm8 
             }
         }
     }
+#else
+    __trap();
 #endif
 }

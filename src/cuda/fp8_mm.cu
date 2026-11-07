@@ -591,7 +591,7 @@ bool launch_gemm8_tma(const legion_fp8_mm8 & p, cudaStream_t st) {
         return false;
     }
     // The kernel image the device runs must be built for sm_90 or newer: one JIT-compiled from
-    // older PTX (a build without a 12.x target) has an empty body.
+    // older PTX (a build without a 12.x target) traps.
     static std::atomic<int8_t> image_ok[GGML_CUDA_MAX_DEVICES];
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= GGML_CUDA_MAX_DEVICES) {
