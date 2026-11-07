@@ -259,6 +259,78 @@ fn small_top_k_matches_the_general_path() {
     }
 }
 
+/// The chunked scan of the small top-k path keeps the tokens the plain one-by-one scan keeps,
+/// in the same order with the same probabilities: ties, zeros of both signs, infinities and
+/// NaNs, rows that are not whole chunks, and k past most of a row.
+#[test]
+fn chunked_top_k_scan_matches_the_plain_scan() {
+    let plain = |logits: &[f32], k: usize| -> Vec<(f32, u32)> {
+        let mut best: Vec<(f32, u32)> = Vec::new();
+        for (id, &l) in logits.iter().enumerate() {
+            if best.len() == k && l.total_cmp(&best[k - 1].0).is_le() {
+                continue;
+            }
+            let at = best.partition_point(|&(b, _)| b.total_cmp(&l).is_ge());
+            best.insert(at, (l, id as u32));
+            best.truncate(k);
+        }
+        best
+    };
+    let mut rng = Rng::new(11);
+    for (n, k, coarse) in [
+        (262_144, 64, false),
+        (5_000, 64, true),
+        (1_000, 256, true),
+        (130, 100, false),
+        (65, 64, true),
+        (300, 1, true),
+    ] {
+        let mut logits: Vec<f32> = (0..n)
+            .map(|_| {
+                let x = (rng.next_f64() * 30.0 - 15.0) as f32;
+                if coarse { x.round() } else { x }
+            })
+            .collect();
+        for (i, v) in [
+            (3, f32::NAN),
+            (n / 2, -f32::NAN),
+            (n / 3, f32::INFINITY),
+            (n / 4, f32::NEG_INFINITY),
+            (n / 5, 0.0),
+            (n / 6, -0.0),
+        ] {
+            logits[i] = v;
+        }
+        let s = Sampler::new(&SamplingParams {
+            top_k: k as u32,
+            ..params(1.0)
+        });
+        let want = plain(&logits, k);
+        let max = want[0].0 as f64;
+        let want: Vec<(u32, u64)> = want
+            .iter()
+            .map(|&(l, id)| (id, (l as f64 - max).exp().to_bits()))
+            .collect();
+        let got: Vec<(u32, u64)> = s
+            .top_k_candidates(&logits, k)
+            .iter()
+            .map(|&(id, p)| (id, p.to_bits()))
+            .collect();
+        assert_eq!(got, want, "n {n} k {k}");
+    }
+}
+
+/// [`all_below`] is strict and false for NaNs.
+#[test]
+fn all_below_is_strict() {
+    assert!(all_below(&[1.0, 2.0], 3.0));
+    assert!(!all_below(&[1.0, 3.0], 3.0));
+    assert!(!all_below(&[1.0, f32::NAN], 3.0));
+    assert!(!all_below(&[1.0], f32::NAN));
+    assert!(!all_below(&[0.0], -0.0));
+    assert!(all_below(&[], 0.0));
+}
+
 /// Ties at the top-k boundary keep the lower token ids.
 #[test]
 fn small_top_k_breaks_ties_by_token_id() {
