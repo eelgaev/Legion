@@ -1790,6 +1790,12 @@ impl Model {
     /// use it.
     pub fn set_nvfp4_a4(&mut self, a: Nvfp4A4) {
         self.linear.set_nvfp4_a4(a);
+        if a != Nvfp4A4::Off {
+            // The FP4 probe (a kernel and a copy on the default stream) runs now, at load,
+            // rather than at the first W4A4 graph's build, which may come between stage-graph
+            // captures (#1202).
+            crate::model::nvfp4_a4::device_supported();
+        }
     }
 
     /// Replaces every NVFP4 weight with an exact BF16 copy in buffers of `buft` (each E2M1 code

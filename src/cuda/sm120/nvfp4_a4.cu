@@ -24,6 +24,12 @@
 // weights and the quantized activations; the sum does not depend on the order. So a block's
 // scale word is the scale register as stored, and ldmatrix reads the code words straight (RAW
 // tiles read the weights' a word at a time from the blocks as stored).
+//
+// Stage graphs capture these launchers (src/model/core/stage_ops.rs, #1202): everything a
+// launch enqueues must follow from its parameters alone, on the given stream, with no host
+// waits (cudaMemcpy, cudaStreamSynchronize), allocations or side streams. Host-only calls
+// (cudaFuncSetAttribute, cuTensorMapEncodeTiled into a kernel parameter) are fine. Only the
+// probe, legion_nvfp4_a4_supported, which runs once before any capture, may do otherwise.
 
 #include <cuda.h>
 #include <cuda_bf16.h>
