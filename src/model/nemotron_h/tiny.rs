@@ -165,6 +165,153 @@ impl Builder {
     }
 }
 
+/// The latent projections of [`write_puzzle`]'s MoE layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Latent {
+    /// None: the experts run at the model width.
+    None,
+    /// Identity projections at the model width: the same logits as [`Latent::None`] bit for
+    /// bit (the other tensors are drawn alike).
+    Identity,
+    /// Random projections to [`PUZZLE_LATENT`].
+    Random,
+}
+
+/// Block kinds of [`write_puzzle`]: Mamba-2, MoE, Mamba-2, attention, MoE, Mamba-2, MoE.
+pub const PUZZLE_PATTERN: &str = "MEM*EME";
+/// `(routed experts, experts used, expert FFN size)` of [`write_puzzle`]'s MoE layers, in order:
+/// two expert counts, two top-ks, two expert sizes, as Bolt 74B-A9B's heterogeneous blocks.
+pub const PUZZLE_EXPERTS: [(i64, i64, i64); 3] = [(8, 2, 64), (12, 3, 96), (8, 3, 64)];
+/// The latent width of [`Latent::Random`].
+pub const PUZZLE_LATENT: i64 = 32;
+
+impl Builder {
+    /// A puzzle MoE layer: Q8_0 experts at `width` (`[width, n_ff, n_expert]` up, `[n_ff, width,
+    /// n_expert]` down), the router and shared expert at the model width, and the latent
+    /// projections.
+    fn puzzle_moe(
+        &mut self,
+        il: usize,
+        (n_expert, _, n_ff): (i64, i64, i64),
+        latent: Latent,
+    ) -> Result<(), GgufError> {
+        let t = |s: &str| format!("blk.{il}.{s}");
+        let q8 = types::Q8_0;
+        self.weight(&t("ffn_gate_inp.weight"), &[E, n_expert])?;
+        self.tensor(&t("exp_probs_b.bias"), types::F32, &[n_expert], 0.1, 0.0)?;
+        let width = if latent == Latent::Random {
+            PUZZLE_LATENT
+        } else {
+            E
+        };
+        self.typed_weight(&t("ffn_up_exps.weight"), q8, &[width, n_ff, n_expert])?;
+        self.typed_weight(&t("ffn_down_exps.weight"), q8, &[n_ff, width, n_expert])?;
+        self.typed_weight(&t("ffn_up_shexp.weight"), q8, &[E, N_FF_SHEXP])?;
+        self.typed_weight(&t("ffn_down_shexp.weight"), q8, &[N_FF_SHEXP, E])?;
+        match latent {
+            Latent::None => Ok(()),
+            Latent::Random => {
+                self.typed_weight(&t("ffn_latent_down.weight"), q8, &[E, width])?;
+                self.typed_weight(&t("ffn_latent_up.weight"), q8, &[width, E])
+            }
+            Latent::Identity => {
+                // Constants, not drawn: the rest stays as `Latent::None` draws it.
+                let eye: Vec<u8> = (0..E * E)
+                    .flat_map(|i| f32::from(u8::from(i / E == i % E)).to_ne_bytes())
+                    .collect();
+                for n in ["ffn_latent_down.weight", "ffn_latent_up.weight"] {
+                    self.g.add_tensor(&t(n), types::F32, &[E, E], &eye)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Writes a tiny Nemotron 3.5 Bolt 74B-A9B layout (`nemotron_h_moe` with heterogeneous
+/// "puzzle" blocks) to `path`: per-layer expert counts (each router's rows), per-layer top-k and
+/// expert sizes (arrays), `expert_count` their maximum, the latent MoE of `latent`, Q8_0 experts,
+/// no MTP head, and the `tekken` pre-tokenizer.
+pub fn write_puzzle(path: impl AsRef<Path>, seed: u64, latent: Latent) -> Result<(), GgufError> {
+    let mut b = Builder {
+        g: GgufWriter::new(),
+        rng: Rng::new(seed),
+    };
+    let n_layer = PUZZLE_PATTERN.len();
+    b.g.set("general.architecture", &Value::String(ARCH.into()))?;
+    b.g.set(
+        "general.name",
+        &Value::String("tiny-nemotron-h-puzzle".into()),
+    )?;
+    byte_tokenizer(&mut b.g)?;
+    b.g.set("tokenizer.ggml.pre", &Value::String("tekken".into()))?;
+    let u = Value::U32;
+    // Per layer: the MoE layers' (experts, used, size) in order, zeros elsewhere.
+    let moe: Vec<Option<(i64, i64, i64)>> = {
+        let mut next = PUZZLE_EXPERTS.iter();
+        PUZZLE_PATTERN
+            .chars()
+            .map(|c| (c == 'E').then(|| *next.next().unwrap()))
+            .collect()
+    };
+    let per_layer = |f: &dyn Fn(Option<(i64, i64, i64)>) -> i64| {
+        Value::Array(moe.iter().map(|&m| Value::U32(f(m) as u32)).collect())
+    };
+    b.key("block_count", u(n_layer as u32))?;
+    b.key("context_length", u(4096))?;
+    b.key("embedding_length", u(E as u32))?;
+    b.key("feed_forward_length", per_layer(&|m| m.map_or(0, |m| m.2)))?;
+    b.key("attention.head_count", u(N_HEAD as u32))?;
+    b.key(
+        "attention.head_count_kv",
+        Value::Array(
+            PUZZLE_PATTERN
+                .chars()
+                .map(|c| u(if c == '*' { N_HEAD_KV as u32 } else { 0 }))
+                .collect(),
+        ),
+    )?;
+    b.key("attention.key_length", u(HEAD_DIM as u32))?;
+    b.key("attention.value_length", u(HEAD_DIM as u32))?;
+    b.key("attention.layer_norm_rms_epsilon", Value::F32(1e-5))?;
+    b.key("attention.layer_norm_epsilon", Value::F32(1e-5))?;
+    let max_expert = PUZZLE_EXPERTS.iter().map(|e| e.0).max().unwrap();
+    b.key("expert_count", u(max_expert as u32))?;
+    b.key("expert_used_count", per_layer(&|m| m.map_or(0, |m| m.1)))?;
+    b.key(
+        "expert_feed_forward_length",
+        per_layer(&|m| m.map_or(0, |m| m.2)),
+    )?;
+    b.key("expert_shared_feed_forward_length", u(N_FF_SHEXP as u32))?;
+    b.key("expert_shared_count", u(1))?;
+    b.key("expert_weights_norm", Value::Bool(true))?;
+    b.key("expert_weights_scale", Value::F32(5.0))?;
+    match latent {
+        Latent::None => {}
+        Latent::Identity => b.key("moe_latent_size", u(E as u32))?,
+        Latent::Random => b.key("moe_latent_size", u(PUZZLE_LATENT as u32))?,
+    }
+    b.key("ssm.conv_kernel", u(D_CONV as u32))?;
+    b.key("ssm.state_size", u(SSM_STATE as u32))?;
+    b.key("ssm.group_count", u(SSM_GROUPS as u32))?;
+    b.key("ssm.time_step_rank", u(SSM_HEADS as u32))?;
+    b.key("ssm.inner_size", u((SSM_HEADS * SSM_HEAD_DIM) as u32))?;
+
+    let n_vocab = (256 + SPECIAL_TOKENS.len()) as i64;
+    b.tensor("token_embd.weight", types::F32, &[E, n_vocab], 1.0, 0.0)?;
+    b.norm("output_norm.weight", &[E])?;
+    b.typed_weight("output.weight", types::Q8_0, &[E, n_vocab])?;
+    for (il, kind) in PUZZLE_PATTERN.chars().enumerate() {
+        b.norm(&format!("blk.{il}.attn_norm.weight"), &[E])?;
+        match kind {
+            'M' => b.mamba(il)?,
+            '*' => b.attention(il)?,
+            _ => b.puzzle_moe(il, moe[il].unwrap(), latent)?,
+        }
+    }
+    b.g.write(path)
+}
+
 /// Writes the tiny model to `path`.
 pub fn write(path: impl AsRef<Path>, seed: u64) -> Result<(), GgufError> {
     let mut b = Builder {

@@ -27,6 +27,7 @@ binding removed; `--port 8090` added). All requests use temperature 0.
 - [Gemma 4 31B QAT UD-Q4_K_XL, 2x DGX Spark (tensor parallel)](spark/gemma-4-31b-qat-ud-q4-k-xl-2x-tp.md)
 - [Gemma 4 31B QAT UD-Q4_K_XL, 1x DGX Spark](spark/gemma-4-31b-qat-ud-q4-k-xl-1x.md)
 - [Gemma 4 31B NVFP4 (RedHatAI), 1x DGX Spark](spark/gemma-4-31b-nvfp4-1x.md)
+- [Nemotron 3.5 Bolt E4B and 74B-A9B UD-Q4_K_XL, 1x DGX Spark](spark/nemotron-35-bolt-1x.md)
 
 ## IBM AC922
 

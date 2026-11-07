@@ -58,6 +58,24 @@ pub struct NemotronParams {
     pub weights_scale: f32,
     /// Epsilon of the MTP head's final layer norm.
     pub norm_eps: f32,
+    /// Routed experts per layer, MTP layers included (0 for non-MoE layers). Uniform in
+    /// Lightning; Nemotron 3.5 Bolt 74B-A9B's heterogeneous ("puzzle") blocks vary it, read
+    /// from each router's shape as llama.cpp does.
+    pub n_expert: Vec<i64>,
+    /// Experts each token picks per layer, MTP layers included (`expert_used_count`, one
+    /// number or an array).
+    pub n_expert_used: Vec<i64>,
+    /// Width the routed experts run at (`moe_latent_size`, latent MoE): `ffn_latent_down`
+    /// projects the normed input down to it before the experts and `ffn_latent_up` their
+    /// weighted sum back up; 0: the experts run at `n_embd`.
+    pub moe_latent: i64,
+}
+
+impl NemotronParams {
+    /// `(routed experts, experts used)` of layer `il`.
+    pub fn experts(&self, il: usize) -> (i64, i64) {
+        (self.n_expert[il], self.n_expert_used[il])
+    }
 }
 
 /// Reads a per-layer key that is either one number for every layer or an array.
@@ -112,6 +130,40 @@ pub(super) fn parse(g: &GgufFile, arch: &str) -> Result<Hparams, ModelError> {
         .or(norm_eps)
         .ok_or_else(|| ModelError::Metadata(key("attention.layer_norm_rms_epsilon")))?;
     let flag = |k: &str| g.get(&key(k)).and_then(|v| v.as_bool());
+    // Per-layer expert counts (llama.cpp's `load_arch_tensors`: each router's rows, at most
+    // `expert_count`) and top-k (`expert_used_count`, an array in the puzzle models).
+    let (n_expert, n_expert_used) = if moe {
+        let n_max = u("expert_count")? as i64;
+        let used = per_layer(g, &key("expert_used_count"), n_all)?;
+        let mut experts = vec![0i64; n_all];
+        for (il, e) in experts.iter_mut().enumerate() {
+            let ffn = il >= n_layer || blocks[il] == Block::Ffn;
+            if !ffn {
+                continue;
+            }
+            let name = format!("blk.{il}.ffn_gate_inp.weight");
+            let n = g
+                .tensor(&name)
+                .and_then(|t| t.shape.get(1).copied())
+                .map_or(n_max, |n| n as i64);
+            if n > n_max || n < used[il] as i64 || used[il] == 0 {
+                return Err(ModelError::Layout(format!(
+                    "{name}: {n} experts, {} used, at most {n_max}",
+                    used[il]
+                )));
+            }
+            *e = n;
+        }
+        let used: Vec<i64> = used[..n_all]
+            .iter()
+            .zip(&experts)
+            .map(|(&k, &e)| if e > 0 { k as i64 } else { 0 })
+            .collect();
+        (experts, used)
+    } else {
+        (vec![0; n_all], vec![0; n_all])
+    };
+    let moe_latent = g.get_u64(&key("moe_latent_size")).unwrap_or(0) as i64;
     Ok(Hparams {
         n_layer,
         n_embd: u("embedding_length")? as i64,
@@ -126,11 +178,9 @@ pub(super) fn parse(g: &GgufFile, arch: &str) -> Result<Hparams, ModelError> {
         rms_eps,
         moe,
         n_expert: if moe { u("expert_count")? as i64 } else { 0 },
-        n_expert_used: if moe {
-            u("expert_used_count")? as i64
-        } else {
-            0
-        },
+        // The most any layer picks (every layer's, for a uniform MoE); the graph reads each
+        // layer's own from `NemotronParams::n_expert_used`.
+        n_expert_used: n_expert_used.iter().copied().max().unwrap_or(0),
         // Unused: `blocks` says which layers are which.
         full_attention_interval: 1,
         ssm_d_conv: u("ssm.conv_kernel")? as i64,
@@ -148,6 +198,9 @@ pub(super) fn parse(g: &GgufFile, arch: &str) -> Result<Hparams, ModelError> {
             weights_norm: flag("expert_weights_norm").unwrap_or(false),
             weights_scale: f("expert_weights_scale").unwrap_or(0.0),
             norm_eps: norm_eps.unwrap_or(rms_eps),
+            n_expert,
+            n_expert_used,
+            moe_latent,
         }),
     })
 }
@@ -461,8 +514,7 @@ impl Model {
     ) -> Result<Tensor<'a>, ModelError> {
         let hp = &self.hp;
         let nm = params(hp).expect("a Nemotron-H model");
-        let used = hp.n_expert_used;
-        let n_expert = hp.n_expert;
+        let (n_expert, used) = nm.experts(il);
 
         let logits = self.lmm(ctx, il, "ffn_gate_inp.weight", h)?;
         tap.tap("ffn_moe_logits", il, logits);
@@ -482,7 +534,16 @@ impl Model {
         }
         tap.tap("ffn_moe_weights_scaled", il, w);
 
-        let x = ctx.reshape_3d(h, hp.n_embd, 1, n);
+        // Latent MoE (Bolt 74B-A9B): the router reads the normed input, the experts its
+        // projection to the latent width (llama.cpp's `build_ffn_layer`).
+        let latent = self.w(&format!("blk.{il}.ffn_latent_down.weight")).is_ok();
+        let x = if latent {
+            self.lmm(ctx, il, "ffn_latent_down.weight", h)?
+        } else {
+            h
+        };
+        let width = x.ne()[0];
+        let x = ctx.reshape_3d(x, width, 1, n);
         let up_w = format!("blk.{il}.ffn_up_exps.weight");
         let down_w = format!("blk.{il}.ffn_down_exps.weight");
         let up_scale = self.w(&format!("blk.{il}.ffn_up_exps.scale")).ok();
@@ -527,12 +588,12 @@ impl Model {
                     let w = ctx.mul(w, ctx.get_rows(f, selected));
                     ctx.mul(routed(None)?, w)
                 }
-                _ => ctx.mul(routed(down_scale)?, w), // [n_embd, used, n]
+                _ => ctx.mul(routed(down_scale)?, w), // [width, used, n]
             };
             let nb = weighted.nb();
-            let mut out = ctx.view_2d(weighted, [hp.n_embd, n], nb[2], 0);
+            let mut out = ctx.view_2d(weighted, [width, n], nb[2], 0);
             for e in 1..used as usize {
-                out = ctx.add(out, ctx.view_2d(weighted, [hp.n_embd, n], nb[2], e * nb[1]));
+                out = ctx.add(out, ctx.view_2d(weighted, [width, n], nb[2], e * nb[1]));
             }
             // ggml-cuda's one-rounding fusion in every layer (`--stable-fusions`, #472).
             stable_fusions::pin_weighted_sum(graph, weighted, out);
@@ -542,6 +603,11 @@ impl Model {
             out
         };
         tap.tap("ffn_moe_out", il, out);
+        let out = if latent {
+            self.lmm(ctx, il, "ffn_latent_up.weight", out)?
+        } else {
+            out
+        };
 
         let sh = self.relu_sqr_ffn(ctx, il, "ffn_up_shexp", "ffn_down_shexp", h)?;
         tap.tap("ffn_shexp", il, sh);
@@ -718,3 +784,6 @@ impl Model {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests;
