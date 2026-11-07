@@ -1319,6 +1319,62 @@ pub fn gemm_tune_fits(mi: i32, nt: i32, tune: GemmTune) -> bool {
         && tune.ctas * (smem + 16 * 8 * nt + 16 + 1024) <= 100 * 1024
 }
 
+/// The grouped GEMM's L2 prefetch (`nvfp4_gemm`'s `pf_run`, `pf_ahead`, `pf_x`; #1183): bulk
+/// prefetches of `run` blocks of each weight row; `ahead`: near its last steps a CTA also
+/// prefetches the first `run` blocks of the tile that starts about when it ends (as many CTAs on
+/// as are resident at once), so the next CTA on an SM does not start on a cold L2; `x`: an
+/// expert's first row tile prefetches its token rows as well. Only prefetches: every variant gives
+/// the same bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GemmPrefetch {
+    pub run: i32,
+    pub ahead: bool,
+    pub x: bool,
+}
+
+impl GemmPrefetch {
+    /// [`force_gemm_prefetch`]'s encoding; 0 is none.
+    fn encode(pf: Option<Self>) -> u64 {
+        pf.map_or(0, |p| {
+            (1 << 32) | (p.run as u32 as u64) | ((p.ahead as u64) << 33) | ((p.x as u64) << 34)
+        })
+    }
+
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    fn decode(v: u64) -> Option<Self> {
+        ((v >> 32) & 1 == 1).then(|| Self {
+            run: v as u32 as i32,
+            ahead: (v >> 33) & 1 == 1,
+            x: (v >> 34) & 1 == 1,
+        })
+    }
+}
+
+/// The grouped GEMM's prefetch before #1183: runs of 32 blocks, nothing ahead.
+pub const PREFETCH_RUN32: GemmPrefetch = GemmPrefetch {
+    run: 32,
+    ahead: false,
+    x: false,
+};
+
+/// Runs of 8 blocks, and an expert's first row tile prefetches its token rows too (#1183). GB10,
+/// Qwen3.8-Flash-Next, `legion nvfp4-gemm-bench --rounds 3 --layers 4`, us per layer vs
+/// [`PREFETCH_RUN32`] (the same bits): SwiGLU 4096 tokens over 512 / 160 experts 9716 -> 8130 /
+/// 5609 -> 5337, 2048 tokens 6249 -> 5063 / 3405 -> 3277; down 5214 -> 5026 / 3885 -> 3662,
+/// 3610 -> 3513 / 2194 -> 2104. The lookahead (`ahead`) costs the down 5-50% and adds nothing to
+/// the SwiGLU on top of this.
+pub const PREFETCH_RUN8_X: GemmPrefetch = GemmPrefetch {
+    run: 8,
+    ahead: false,
+    x: true,
+};
+
+/// The grouped SwiGLU GEMM's prefetch.
+pub const GLU_PREFETCH: GemmPrefetch = PREFETCH_RUN8_X;
+
+/// The other grouped GEMMs' prefetch (the down projections).
+pub const DOWN_PREFETCH: GemmPrefetch = PREFETCH_RUN8_X;
+
 /// Two stages, two CTAs per SM: [`pick_grouped`]'s 256-row by 64-token down projection tile.
 pub const GEMM_DOWN: GemmTune = GemmTune { stages: 2, ctas: 2 };
 
@@ -1386,6 +1442,9 @@ mod cuda {
         sel_lo: i32,
         sel_hi: i32,
         unread_skips: i32,
+        pf_run: i32,
+        pf_ahead: i32,
+        pf_x: i32,
     }
 
     /// `Params::sel_lo`, `sel_hi` for every expert.
@@ -1484,6 +1543,9 @@ mod cuda {
                 .unwrap_or_else(|| grouped_gemm_tune(p.k, p.n_expert as i64, mi, nt, false)),
             _ => forced_tune().unwrap_or(GEMM_DEFAULT),
         };
+        if matches!(kernel, Kernel::Gemm { .. }) && !p.plan.is_null() {
+            set_prefetch(p, false, tune.ctas);
+        }
         // SAFETY: parameters checked by the callers; the node's stream.
         let code = unsafe {
             match kernel {
@@ -1498,6 +1560,26 @@ mod cuda {
             -1 => Err(format!("nvfp4: no kernel {kernel:?} {tune:?}")),
             e => Err(format!("nvfp4 {kernel:?} {tune:?}: CUDA error {e}")),
         }
+    }
+
+    /// The grouped GEMM prefetch forced by [`super::force_gemm_prefetch`], encoded; 0 is none.
+    pub(super) static FORCED_PF: AtomicU64 = AtomicU64::new(0);
+
+    /// A grouped GEMM's L2 prefetch ([`GemmPrefetch`]; `glu`: the fused SwiGLU's) for a launch
+    /// of `ctas` CTAs per SM.
+    fn set_prefetch(p: &mut Params, glu: bool, ctas: i32) {
+        let pf = GemmPrefetch::decode(FORCED_PF.load(Ordering::Relaxed)).unwrap_or(if glu {
+            GLU_PREFETCH
+        } else {
+            DOWN_PREFETCH
+        });
+        p.pf_run = pf.run;
+        p.pf_ahead = if pf.ahead {
+            (sms() * ctas.max(1) as i64) as i32
+        } else {
+            0
+        };
+        p.pf_x = pf.x as i32;
     }
 
     /// The GEMM variant forced by [`super::force_gemm_tune`] (`stages * 10 + ctas`), and the
@@ -1556,6 +1638,9 @@ mod cuda {
             sel_lo: ALL.0,
             sel_hi: ALL.1,
             unread_skips: 0,
+            pf_run: 0,
+            pf_ahead: 0,
+            pf_x: 0,
         };
         launch(&mut p, kernel, stream)
     }
@@ -1604,6 +1689,9 @@ mod cuda {
             sel_lo: ALL.0,
             sel_hi: ALL.1,
             unread_skips: 0,
+            pf_run: 0,
+            pf_ahead: 0,
+            pf_x: 0,
         };
         // SAFETY: parameters checked above; the node's stream.
         let code = unsafe {
@@ -1739,6 +1827,9 @@ mod cuda {
             sel_lo: ALL.0,
             sel_hi: split.map_or(ALL.1, |(cut, _)| cut),
             unread_skips: unread(dst) as i32,
+            pf_run: 0,
+            pf_ahead: 0,
+            pf_x: 0,
         };
         if let Some(t) = forced_tiles() {
             p.tiles_n = p.tiles_n.min(t);
@@ -1926,6 +2017,9 @@ mod cuda {
             sel_lo: ALL.0,
             sel_hi: split.unwrap_or(ALL.1),
             unread_skips: unread(dst) as i32,
+            pf_run: 0,
+            pf_ahead: 0,
+            pf_x: 0,
         };
         if let Some(cut) = split {
             // The experts of more than `cut` pairs on the GEMM first, so the grouped SwiGLU mv
@@ -1933,7 +2027,7 @@ mod cuda {
             let mv_tiles = p.tiles_n;
             p.tiles_n = split_tiles(pairs, 8 * g_nt as i64, n_expert, cut, true);
             (p.sel_lo, p.sel_hi) = (cut, ALL.1);
-            glu_gemm(&p, g_nt, tune_at(g_nt), stream)?;
+            glu_gemm(&mut p, g_nt, tune_at(g_nt), stream)?;
             p.tiles_n = mv_tiles;
             (p.sel_lo, p.sel_hi) = (ALL.0, cut);
         }
@@ -1955,11 +2049,17 @@ mod cuda {
         if let Some(t) = forced_tiles().filter(|_| split.is_none()) {
             p.tiles_n = p.tiles_n.min(t);
         }
-        glu_gemm(&p, nt, tune_at(nt), stream)
+        glu_gemm(&mut p, nt, tune_at(nt), stream)
     }
 
     /// The grouped SwiGLU GEMM at `8 * nt` tokens per tile.
-    fn glu_gemm(p: &Params, nt: i32, tune: GemmTune, stream: *mut c_void) -> Result<(), String> {
+    fn glu_gemm(
+        p: &mut Params,
+        nt: i32,
+        tune: GemmTune,
+        stream: *mut c_void,
+    ) -> Result<(), String> {
+        set_prefetch(p, true, tune.ctas);
         // SAFETY: parameters checked by the caller; the node's stream.
         match unsafe { legion_nvfp4_swiglu_gemm_launch(p, nt, tune.code(), stream) } {
             0 => Ok(()),
@@ -1995,6 +2095,19 @@ pub fn force_gemm_tune(tune: Option<GemmTune>, glu_nt: Option<i32>) {
     }
     #[cfg(not(feature = "cuda"))]
     let _ = (tune, glu_nt);
+}
+
+/// Launches every grouped NVFP4 GEMM from now on with the L2 prefetch `pf`, or the defaults
+/// ([`GLU_PREFETCH`], [`DOWN_PREFETCH`]) for `None`: for tuning (the same bits either way).
+#[doc(hidden)]
+pub fn force_gemm_prefetch(pf: Option<GemmPrefetch>) {
+    #[cfg(feature = "cuda")]
+    cuda::FORCED_PF.store(
+        GemmPrefetch::encode(pf),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    #[cfg(not(feature = "cuda"))]
+    let _ = GemmPrefetch::encode(pf);
 }
 
 /// Launches every grouped mv [`mul_mat_id`] from now on as the variant `g`, or the default for

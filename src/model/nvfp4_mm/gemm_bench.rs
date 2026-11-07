@@ -7,9 +7,9 @@
 
 use super::bench::routing_tiles;
 use super::{
-    GemmTune, Grouped, Kernel, MV_MAX_N, bf16_bits, force_gemm_tune, force_grouped_tiles,
-    force_kernel, glu_gemm_tile, mul_mat_id, pick_grouped, plan_grouped, set_expert_mv_max,
-    set_expert_mv_tile, swiglu_id,
+    GemmPrefetch, GemmTune, Grouped, Kernel, MV_MAX_N, bf16_bits, force_gemm_prefetch,
+    force_gemm_tune, force_grouped_tiles, force_kernel, glu_gemm_tile, mul_mat_id, pick_grouped,
+    plan_grouped, set_expert_mv_max, set_expert_mv_tile, swiglu_id,
 };
 use crate::ggml::{Backend, ComputeAllocator, Context, Graph, Tensor, types};
 
@@ -39,7 +39,8 @@ pub enum Family {
 /// One variant: the op, its tile (`mi`, `nt`; the SwiGLU's `mi` is always 2) and its stages and
 /// occupancy; `None`s are the defaults. A `tile` or `tune` is the GEMM's. `exact`: the default
 /// with a grid of the routing's own token tile count instead of the host's upper bound (#836:
-/// what the CTAs that find no tile cost).
+/// what the CTAs that find no tile cost). `pf`: the default's tile with another L2 prefetch
+/// (#1183).
 #[derive(Clone, Copy, Debug)]
 pub struct Variant {
     pub op: Op,
@@ -47,12 +48,17 @@ pub struct Variant {
     pub tune: Option<GemmTune>,
     pub family: Family,
     pub exact: bool,
+    pub pf: Option<GemmPrefetch>,
 }
 
 impl Variant {
     /// The op's default choice, the reference of the bit checks.
     pub fn is_default(&self) -> bool {
-        self.family == Family::Default && self.tile.is_none() && self.tune.is_none() && !self.exact
+        self.family == Family::Default
+            && self.tile.is_none()
+            && self.tune.is_none()
+            && !self.exact
+            && self.pf.is_none()
     }
 
     /// The kernel family this variant runs on at `per` pairs per expert.
@@ -72,6 +78,11 @@ impl Variant {
         if self.exact {
             return format!("{op} exact");
         }
+        if let Some(pf) = self.pf {
+            let ahead = if pf.ahead { " ahead" } else { "" };
+            let x = if pf.x { " x" } else { "" };
+            return format!("{op} pf{}{ahead}{x}", pf.run);
+        }
         match self.family {
             Family::Mv(nt) => return format!("{op} mv nt<={nt}"),
             Family::Gemm if self.tile.is_none() && self.tune.is_none() => {
@@ -90,6 +101,18 @@ impl Variant {
     }
 }
 
+/// The L2 prefetches tried (#1183): (run, ahead, x) of [`GemmPrefetch`].
+const PF_TRIED: [(i32, bool, bool); 8] = [
+    (32, false, false),
+    (8, false, false),
+    (16, false, false),
+    (8, true, false),
+    (8, true, true),
+    (16, true, true),
+    (32, true, true),
+    (8, false, true),
+];
+
 /// The stage counts and occupancies tried (the default first).
 const TUNES: [(i32, i32); 5] = [(3, 1), (2, 1), (2, 2), (3, 2), (4, 1)];
 
@@ -104,12 +127,20 @@ pub fn variants() -> Vec<Variant> {
         tune,
         family,
         exact: false,
+        pf: None,
     };
     let exact = |op| Variant {
         exact: true,
         ..v(op, None, None, Family::Default)
     };
+    let pf = |op, run, ahead, x| Variant {
+        pf: Some(GemmPrefetch { run, ahead, x }),
+        ..v(op, None, None, Family::Default)
+    };
     let mut out = vec![v(Op::Glu, None, None, Family::Default), exact(Op::Glu)];
+    for (run, ahead, x) in PF_TRIED {
+        out.push(pf(Op::Glu, run, ahead, x));
+    }
     for nt in [8, 16] {
         for t in TUNES {
             out.push(v(Op::Glu, Some((2, nt)), tune(t), Family::Default));
@@ -122,6 +153,9 @@ pub fn variants() -> Vec<Variant> {
     }
     out.push(v(Op::Down, None, None, Family::Default));
     out.push(exact(Op::Down));
+    for (run, ahead, x) in PF_TRIED {
+        out.push(pf(Op::Down, run, ahead, x));
+    }
     for (mi, nt) in [(1, 8), (1, 16), (2, 8), (2, 16)] {
         for t in TUNES {
             out.push(v(Op::Down, Some((mi, nt)), tune(t), Family::Default));
@@ -153,6 +187,8 @@ pub struct Config {
     /// Routings per round.
     pub sets: usize,
     pub rounds: usize,
+    /// Only the variants whose names contain one of these (and the defaults); empty: all.
+    pub only: Vec<String>,
 }
 
 impl Default for Config {
@@ -167,6 +203,7 @@ impl Default for Config {
             pools: vec![512, 160],
             sets: 2,
             rounds: 3,
+            only: Vec::new(),
         }
     }
 }
@@ -333,6 +370,7 @@ fn force(v: Option<&Variant>) {
     );
     let glu_nt = tile.filter(|_| !down).map(|(_, nt)| nt);
     force_gemm_tune(v.and_then(|v| v.tune), glu_nt);
+    force_gemm_prefetch(v.and_then(|v| v.pf));
 }
 
 /// Every variant at every chunk size and pool of `cfg` on `gpu`; the variants take turns within
@@ -361,7 +399,12 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
             .collect();
         s.set_f32(&v);
     }
-    let variants = variants();
+    let variants: Vec<Variant> = variants()
+        .into_iter()
+        .filter(|v| {
+            v.is_default() || cfg.only.is_empty() || cfg.only.iter().any(|s| v.name().contains(s))
+        })
+        .collect();
     let down0 = variants
         .iter()
         .position(|v| v.op == Op::Down)

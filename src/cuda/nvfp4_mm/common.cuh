@@ -84,6 +84,13 @@ struct legion_nvfp4_mm {
     // zeros stored, because nothing reads their rows (the down matmul skips them, and the MoE
     // tail of --tp-moe-ep does not read rows of zero router weights). 0: zeros, as before.
     int32_t unread_skips;
+    // Grouped GEMM (nvfp4_gemm) L2 prefetch, the same bits either way (#1183). pf_run: blocks of
+    // each weight row per bulk prefetch (0: 32, the dense GEMM's). pf_ahead, above 0: the CTAs
+    // resident at once, so the CTA pf_ahead on starts about when this one ends; near its last
+    // steps this CTA prefetches that tile's first pf_run blocks (weight rows, and its token rows
+    // when it is its expert's first row tile). pf_x: the first row tile's CTA prefetches its own
+    // token rows pf_run blocks at a time, as the weight rows.
+    int32_t pf_run, pf_ahead, pf_x;
 };
 
 // The GEMM: tiles_m * tiles_n CTAs of 256 threads; mi = 1 or 2 (128 * mi rows), nt = 1, 2, 4,
@@ -343,6 +350,8 @@ __global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p)
     extern __shared__ __align__(16) unsigned char smem[];
     __shared__ int64_t x_off[GROUPED ? BN : 1], d_off[GROUPED ? BN : 1];
     __shared__ int32_t tile_expert, tile_tokens;
+    // The tile pf_ahead CTAs on (legion_nvfp4_mm::pf_ahead): its expert (-1 none) and pairs.
+    __shared__ int32_t next_expert, next_first, next_count;
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
 
     int64_t m0, n0 = 0, n_tok;
@@ -463,8 +472,10 @@ __global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p)
 
     // Each row's next PF blocks in one L2 bulk prefetch, PF blocks ahead of the copies: the
     // copies read one block (36 bytes) of a row per step, too short a run for the LPDDR5X
-    // (see nvfp4_mvs).
-    constexpr int PF = 32;
+    // (see nvfp4_mvs). Grouped launches pick PF (pf_run) and may also prefetch their token rows
+    // (pf_x) and the first blocks of the tile that starts when this one ends (pf_ahead): the
+    // prefetches change no sum.
+    const int PF = GROUPED && p.pf_run > 0 ? p.pf_run : 32;
     auto prefetch = [&](int64_t step) {
 #if __CUDA_ARCH__ >= 900
         if (threadIdx.x < BM && step < steps) {
@@ -477,6 +488,46 @@ __global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p)
                 const uintptr_t a16 = a & ~(uintptr_t) 15;
                 asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(a16),
                              "r"((uint32_t) ((e - a16 + 15) & ~(uintptr_t) 15)));
+            }
+        }
+        if constexpr (GROUPED) {
+            // The token rows: 16-byte aligned (x and x_ld checked), BK * 2 bytes per block.
+            if (p.pf_x && m0 == 0 && threadIdx.x < n_tok && step < steps) {
+                const uintptr_t a = (uintptr_t) (p.x + x_off[threadIdx.x] + step * BK);
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(a),
+                             "r"((uint32_t) (min((int64_t) PF, steps - step) * BK * 2)));
+            }
+        }
+#endif
+    };
+    // The next tile's first PF blocks (its expert from next_expert, found below).
+    auto prefetch_next = [&]() {
+#if __CUDA_ARCH__ >= 900
+        if constexpr (GROUPED) {
+            const int e = next_expert;
+            if (e < 0) {
+                return;
+            }
+            const int64_t nm0 = (int64_t) (((int) blockIdx.x + p.pf_ahead) % p.tiles_m) * BM_OUT;
+            const int64_t run = min((int64_t) PF, steps);
+            if (threadIdx.x < BM) {
+                const int r = threadIdx.x;
+                const int64_t row = GLU ? nm0 + r / 32 * 16 + r % 16 : nm0 + r;
+                if (row < p.m) {
+                    const uint8_t * wt = (GLU && r / 16 % 2 ? p.w2 : p.w) + (int64_t) e * p.w_e;
+                    const uintptr_t a = (uintptr_t) (wt + row * p.w_ld);
+                    const uintptr_t end = a + run * 36;
+                    const uintptr_t a16 = a & ~(uintptr_t) 15;
+                    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(a16),
+                                 "r"((uint32_t) ((end - a16 + 15) & ~(uintptr_t) 15)));
+                }
+            }
+            if (nm0 == 0 && (int) threadIdx.x < next_count) {
+                const int q = p.plan[p.n_expert + 1 + next_first + threadIdx.x];
+                const int t = q / p.n_used, slot = q % p.n_used;
+                const int64_t xo = ((int64_t) t * p.n_x + (p.n_x == 1 ? 0 : slot)) * p.x_ld;
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"((uintptr_t) (p.x + xo)),
+                             "r"((uint32_t) (run * BK * 2)));
             }
         }
 #endif
@@ -577,6 +628,28 @@ __global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p)
         }
         asm volatile("cp.async.commit_group;\n" ::);
     }
+    // The tile pf_ahead CTAs on, found while the first stages load (read after the loop's first
+    // barrier), and the step that prefetches its first blocks: when this tile's own prefetches
+    // end.
+    const int64_t ahead_at = GROUPED && p.pf_ahead > 0 ? max(steps - (int64_t) PF, (int64_t) 0) : -1;
+    if constexpr (GROUPED) {
+        if (p.pf_ahead > 0 && warp == 0) {
+            constexpr int TI = legion_nvfp4::plan_tile_index(BN);
+            const int nb = (int) blockIdx.x + p.pf_ahead;
+            const int ntile = nb / p.tiles_m;
+            int e = -1, f = 0, c = 0;
+            if (nb < (int) gridDim.x && !legion_nvfp4::past_plan_tiles<TI>(p, ntile)) {
+                if (!find_tile(p.plan, p.n_expert, BN, ntile, lane, p.sel_lo, p.sel_hi, e, f, c)) {
+                    e = -1;
+                }
+            }
+            if (lane == 0) {
+                next_expert = e;
+                next_first = f;
+                next_count = c;
+            }
+        }
+    }
     for (int64_t step = 0; step < steps; step++) {
         asm volatile("cp.async.wait_group %0;\n" ::"n"(ST - 2));
         __syncthreads();
@@ -587,6 +660,9 @@ __global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p)
         asm volatile("cp.async.commit_group;\n" ::);
         if (step % PF == 0 && step > 0) {
             prefetch(step + PF);
+        }
+        if (step == ahead_at) {
+            prefetch_next();
         }
         const unsigned char * ws = smem + (step % ST) * STAGE;
         const __nv_bfloat16 * xs = (const __nv_bfloat16 *) (ws + W_STAGE);

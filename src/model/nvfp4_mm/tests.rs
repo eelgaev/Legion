@@ -436,6 +436,23 @@ fn every_grouped_token_tile_has_a_plan_count() {
 }
 
 #[test]
+fn gemm_prefetch_round_trips_its_encoding() {
+    assert_eq!(GemmPrefetch::encode(None), 0);
+    assert_eq!(GemmPrefetch::decode(0), None);
+    for run in [4, 8, 16, 32] {
+        for ahead in [false, true] {
+            for x in [false, true] {
+                let pf = GemmPrefetch { run, ahead, x };
+                assert_eq!(
+                    GemmPrefetch::decode(GemmPrefetch::encode(Some(pf))),
+                    Some(pf)
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn gemm_bench_times_each_default_on_its_exact_grid() {
     let variants = gemm_bench::variants();
     for op in [gemm_bench::Op::Glu, gemm_bench::Op::Down] {

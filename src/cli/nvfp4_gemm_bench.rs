@@ -22,6 +22,10 @@ pub struct Nvfp4GemmBenchArgs {
     /// Layers a graph holds (the same weights, other routings per layer).
     #[arg(long, default_value_t = 4)]
     layers: usize,
+    /// Only the variants whose names contain one of these, comma separated (the defaults always
+    /// run, as the bit checks' reference).
+    #[arg(long, value_delimiter = ',')]
+    only: Vec<String>,
 }
 
 pub fn run(args: Nvfp4GemmBenchArgs) -> anyhow::Result<()> {
@@ -31,6 +35,7 @@ pub fn run(args: Nvfp4GemmBenchArgs) -> anyhow::Result<()> {
         pools: args.pools,
         rounds: args.rounds,
         layers: args.layers,
+        only: args.only,
         ..Config::default()
     };
     let rows = gemm_bench::run(&mut gpu, &cfg).map_err(anyhow::Error::msg)?;
