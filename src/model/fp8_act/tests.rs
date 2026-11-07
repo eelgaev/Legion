@@ -112,6 +112,48 @@ fn rms_case(backend: &mut Backend, k: i64, n: i64) -> (Vec<u8>, Vec<u8>) {
     })
 }
 
+/// [`rms_norm_bf16`] against the two ops it replaces, in one graph on `backend`: (its packed
+/// activations, [`rms_norm`]'s, its BF16 rows, [`fused::rms_norm_bf16`]'s).
+///
+/// [`fused::rms_norm_bf16`]: crate::model::core::fused::rms_norm_bf16
+fn rms_bf16_case(backend: &mut Backend, k: i64, n: i64) -> [Vec<u8>; 4] {
+    let eps = 1e-6f32;
+    let ctx = Context::new(32, 32);
+    let x = ctx.new_tensor(types::F32, &[k, n]).as_input();
+    let w = ctx.new_tensor(types::F32, &[k]).as_input();
+    let (q, b) = rms_norm_bf16(&ctx, x, w, eps);
+    let outs = [
+        q,
+        rms_norm(&ctx, x, w, eps),
+        b,
+        crate::model::core::fused::rms_norm_bf16(&ctx, x, w, eps),
+    ]
+    .map(|t| ctx.cont(t).as_output());
+    let mut graph = ctx.new_graph(64);
+    for t in outs {
+        graph.expand(t);
+    }
+    ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+        .unwrap();
+    x.set_f32(&spread(k as usize, n as usize, 81));
+    w.set_f32(&noise(k as usize, 82));
+    backend.compute(&graph).unwrap();
+    outs.map(|t| t.bytes())
+}
+
+fn check_rms_bf16(backend: &mut Backend, k: i64, n: i64) {
+    let [q, q1, b, b1] = rms_bf16_case(backend, k, n);
+    compare(
+        &q,
+        &q1,
+        k as usize,
+        true,
+        &format!("rms_bf16 codes {k}x{n}"),
+    );
+    assert_eq!(b.len(), 2 * (k * n) as usize, "rms_bf16 {k}x{n}: BF16 size");
+    assert!(b == b1, "rms_bf16 {k}x{n}: BF16 rows differ");
+}
+
 /// `silu`: SwiGLU of a plain `[k, n]` gate; else `o * sigmoid(gate)` with the gate read from
 /// interleaved `[q | gate]` heads of `d`.
 fn gate_case(backend: &mut Backend, d: i64, n_head: i64, n: i64, silu: bool) -> (Vec<u8>, Vec<u8>) {
@@ -193,6 +235,33 @@ fn rms_norm_matches_the_chain_quantized() {
     for (k, n) in RMS_CASES {
         let (op, chain) = rms_case(&mut b, k, n);
         compare(&op, &chain, k as usize, false, &format!("rms {k}x{n}"));
+    }
+}
+
+/// The fused rows are the two ops' bytes (the CPU references share their arithmetic).
+#[test]
+fn rms_norm_bf16_is_both_ops() {
+    let mut b = cpu();
+    for (k, n) in [(256, 3), (1024, 5), (2056, 9)] {
+        check_rms_bf16(&mut b, k, n);
+    }
+}
+
+/// The fused node: BF16 rows `[k, n]`, then the packed activations, 16-byte aligned.
+#[test]
+fn rms_norm_bf16_layout() {
+    let ctx = Context::new(32, 0);
+    let x = ctx.new_tensor(types::F32, &[256, 71]);
+    let w = ctx.new_tensor(types::F32, &[256]);
+    let (q, b) = rms_norm_bf16(&ctx, x, w, 1e-6);
+    assert_eq!(q.elements(), fp8::dynamic_layout(256, 71).1);
+    assert_eq!((b.ty(), b.ne()), (types::BF16, [256, 71, 1, 1]));
+    // SAFETY: live nodes of `ctx`.
+    unsafe {
+        let node = &*(*q.raw()).view_src;
+        assert_eq!((*b.raw()).view_src, node as *const _ as *mut _);
+        assert_eq!(tokens(node), 71);
+        assert_eq!((*q.raw()).view_offs, 2 * 256 * 71);
     }
 }
 
@@ -300,6 +369,9 @@ fn cuda_ops_are_the_chain_quantized() {
     for (k, n) in RMS_CASES.into_iter().chain([(5120, 700)]) {
         let (op, chain) = rms_case(&mut g, k, n);
         compare(&op, &chain, k as usize, true, &format!("rms {k}x{n}"));
+    }
+    for (k, n) in [(256, 40), (1024, 33), (5120, 700)] {
+        check_rms_bf16(&mut g, k, n);
     }
     for (d, h, n, silu) in GATE_CASES.into_iter().chain([(256, 24, 500, false)]) {
         let (op, chain) = gate_case(&mut g, d, h, n, silu);
