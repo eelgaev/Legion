@@ -160,7 +160,9 @@ impl Arch for Qwen35 {
         // the W4A4 SwiGLU's quantization, each with ggml's bits (#749).
         let fuse = !pass.tap.on && !hp.moe && m.linear.residual_fusion(n);
         for il in layers {
-            let h = m.norm_mul(pass, x, m.lw(il, "attn_norm.weight")?);
+            // A gated DeltaNet layer's input feeds BF16 (beta / alpha) and FP8 matmuls.
+            let both = fuse && hp.is_recurrent(il);
+            let h = m.norm_mul_with(pass, x, m.lw(il, "attn_norm.weight")?, both);
             if fuse {
                 let x_attn = if hp.is_recurrent(il) {
                     m.delta_net_res(pass, il, h, Some(x))?

@@ -111,6 +111,43 @@ pub(crate) fn rms_norm_fits(x: Tensor<'_>, w: Tensor<'_>) -> bool {
     gpu_fits() && rows_fit(x) && vector_fits(w, x.ne()[0])
 }
 
+/// [`rms_norm`] and the same rows in BF16 from one op: `(q, b)`, `q` [`rms_norm`]'s packed
+/// activations and `b` BF16 `[k, n]` with the bits of
+/// [`crate::model::core::fused::rms_norm_bf16`], for an activation that both FP8 and BF16
+/// matmuls read (the row is read and normalized once instead of twice). The node holds `b`
+/// first, then `q`, so both start 16-byte aligned (`k` a multiple of 8, [`rms_norm_bf16_fits`]).
+pub(crate) fn rms_norm_bf16<'a>(
+    ctx: &'a Context,
+    x: Tensor<'a>,
+    w: Tensor<'a>,
+    eps: f32,
+) -> (Tensor<'a>, Tensor<'a>) {
+    let [k, n, _, _] = x.ne();
+    assert_eq!(
+        w.elements(),
+        k as usize,
+        "fp8_act::rms_norm_bf16: weight size"
+    );
+    assert_eq!(k % 8, 0, "fp8_act::rms_norm_bf16: row size");
+    let (_, total) = fp8::dynamic_layout(k, n);
+    let bf = 2 * (k * n) as usize;
+    let node = ctx.external_with(
+        &FP8_ACT,
+        types::I8,
+        [(bf + total) as i64, 1, 1, 1],
+        &[x, w],
+        &[Kind::RmsNorm as i32, k as i32, eps.to_bits() as i32, 1, 0],
+    );
+    let b = ctx.reinterpret(ctx.view_1d(node, bf as i64, 0), types::BF16, [k, n, 1, 1]);
+    (ctx.view_1d(node, total as i64, bf), b)
+}
+
+/// Whether [`rms_norm_bf16`] takes `x` and `w` on this GPU: [`rms_norm_fits`] with rows of a
+/// multiple of 8 values.
+pub(crate) fn rms_norm_bf16_fits(x: Tensor<'_>, w: Tensor<'_>) -> bool {
+    rms_norm_fits(x, w) && x.ne()[0] % 8 == 0
+}
+
 /// `quantize_dynamic` of `mul(g, sigmoid(x))` or (`silu`) `swiglu_split(x, g)`, as
 /// [`crate::model::core::fused::gate_bf16`] reads them: `x` F32 `[d, n_head, n]` (columns
 /// contiguous, any head and token strides) or `[d * n_head, n]`, `g` F32 `[d * n_head, n]`,
@@ -183,11 +220,18 @@ pub(crate) fn share<'a>(ctx: &'a Context, a: Tensor<'a>, q: Tensor<'a>) {
     ctx.set_shared_node(a, fp8::DYNAMIC_KEY, q);
 }
 
+/// Whether a node made by this module holds the BF16 rows too ([`rms_norm_bf16`]).
+fn with_bf16(dst: &ffi::ggml_tensor) -> bool {
+    let p = crate::ggml::external_params(dst);
+    p[0] == Kind::RmsNorm as i32 && p[3] != 0
+}
+
 /// The tokens of a node made by this module: its `k * n` codes and `n` scales hold `n (k + 4)`
-/// bytes.
+/// bytes, after `2 k n` bytes of BF16 rows in [`rms_norm_bf16`]'s.
 fn tokens(dst: &ffi::ggml_tensor) -> i64 {
     let k = crate::ggml::external_params(dst)[1] as i64;
-    dst.ne[0] / (k + 4)
+    let bf = if with_bf16(dst) { 2 * k } else { 0 };
+    dst.ne[0] / (bf + k + 4)
 }
 
 /// One token's activation row (`k` values) as the chain computes it on the CPU.
@@ -254,11 +298,17 @@ unsafe fn cpu_fp8_act(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
         let k = crate::ggml::external_params(dst)[1] as usize;
         let n = tokens(dst) as usize;
         let (codes, _) = fp8::dynamic_layout(k as i64, n as i64);
-        let out = dst.data as *mut u8;
+        let bf = with_bf16(dst).then_some(dst.data as *mut u16);
+        let out = (dst.data as *mut u8).add(if bf.is_some() { 2 * k * n } else { 0 });
         let scales = out.add(codes) as *mut f32;
         let mut row = vec![0f32; k];
         for t in (ith..n).step_by(nth) {
             cpu_row(dst, t, &mut row);
+            if let Some(bf) = bf {
+                for (i, v) in row.iter().enumerate() {
+                    *bf.add(t * k + i) = crate::model::nvfp4_mm::bf16_bits(*v);
+                }
+            }
             let (q, s) = fp8::quantize_token(&row);
             std::ptr::copy_nonoverlapping(q.as_ptr(), out.add(t * k), k);
             scales.add(t).write_unaligned(s);
@@ -283,6 +333,7 @@ struct Fp8Act {
     d: i32,
     silu: i32,
     eps: f32,
+    bf: *mut u16,
 }
 
 #[cfg(feature = "cuda")]
@@ -324,6 +375,7 @@ pub(crate) unsafe fn quantize_plain(
         d: 0,
         silu: 0,
         eps: 0.0,
+        bf: std::ptr::null_mut(),
     };
     // SAFETY: the caller's pointers, as documented.
     match unsafe { legion_fp8_act_launch(&p, stream) } {
@@ -340,7 +392,16 @@ unsafe fn cuda_fp8_act(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<()
         let x = &*dst.src[0];
         let (k, n) = (p[1], tokens(dst));
         let (codes, _) = fp8::dynamic_layout(k as i64, n);
-        let out = dst.data as *mut u8;
+        let bf = if with_bf16(dst) {
+            dst.data as *mut u16
+        } else {
+            std::ptr::null_mut()
+        };
+        let out = (dst.data as *mut u8).add(if bf.is_null() {
+            0
+        } else {
+            2 * k as usize * n as usize
+        });
         let mut a = Fp8Act {
             kind: p[0],
             x: x.data as *const f32,
@@ -356,6 +417,7 @@ unsafe fn cuda_fp8_act(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<()
             d: 0,
             silu: 0,
             eps: 0.0,
+            bf,
         };
         if p[0] == Kind::RmsNorm as i32 {
             a.w = (*dst.src[1]).data as *const f32;

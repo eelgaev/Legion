@@ -8,7 +8,9 @@
 // - plain:      y = x                                  (fp8_quant_dyn in one pass: the row
 //                                                       stays in registers between the amax and
 //                                                       the codes instead of being read twice)
-// - rms_norm:   y = mul(rms_norm(x, eps), w)            (the dense models' attn / ffn norms)
+// - rms_norm:   y = mul(rms_norm(x, eps), w)            (the dense models' attn / ffn norms;
+//                                                       optionally y's BF16 rows too, the bits
+//                                                       of fused.cu's rms_norm_bf16_kernel)
 // - gate:       y = op(x) * g, op sigmoid or SiLU       (the attention output gate, SwiGLU)
 // - gated_norm: y = rms_norm(o) * w * gate(z) per head  (a gated DeltaNet layer's output norm)
 //
@@ -22,6 +24,7 @@
 //
 // Launched on the stream of ggml's CUDA backend, between graph segments (src/ggml/external.rs).
 
+#include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
@@ -44,6 +47,7 @@ struct legion_fp8_act {
     int32_t d;         // gate: the head width; gated_norm: head_v
     int32_t silu;      // gate, gated_norm: SiLU instead of sigmoid
     float eps;         // rms_norm, gated_norm
+    uint16_t * bf;     // rms_norm: also y in BF16, [k, n] contiguous (null: not)
 };
 
 // 0 on success; 1 for a shape this file does not take (the caller builds the unfused ops);
@@ -128,6 +132,16 @@ __global__ void __launch_bounds__(BLOCK) fp8_act_kernel(const legion_fp8_act p) 
                 const int col = tid + i * BLOCK;
                 if (col < k) {
                     v[i] = scale * v[i] * p.w[col];
+                }
+            }
+            if (p.bf != nullptr) {
+                __nv_bfloat16 * bf = (__nv_bfloat16 *) p.bf + t * k;
+#pragma unroll
+                for (int i = 0; i < NV; i++) {
+                    const int col = tid + i * BLOCK;
+                    if (col < k) {
+                        bf[col] = __float2bfloat16(v[i]);
+                    }
                 }
             }
         }
