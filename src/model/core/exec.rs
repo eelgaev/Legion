@@ -358,12 +358,12 @@ fn spill_type(_: &Stage) -> Option<BufferType> {
 }
 
 #[cfg(feature = "cuda")]
-fn tier_back(slot: usize, tokens: usize) -> Result<(), String> {
-    crate::residency::cuda::tp_tier_back(slot, tokens)
+fn tier_back(slot: usize, tokens: usize, lent: usize) -> Result<(), String> {
+    crate::residency::cuda::tp_tier_back(slot, tokens, lent)
 }
 
 #[cfg(not(feature = "cuda"))]
-fn tier_back(_: usize, _: usize) -> Result<(), String> {
+fn tier_back(_: usize, _: usize, _: usize) -> Result<(), String> {
     Ok(())
 }
 
@@ -375,6 +375,16 @@ fn tier_trim(slot: usize) -> Result<(), String> {
 #[cfg(not(feature = "cuda"))]
 fn tier_trim(_: usize) -> Result<(), String> {
     Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn tier_lend(chunks: usize) -> usize {
+    crate::residency::cuda::tp_tier_lend(chunks)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn tier_lend(_: usize) -> usize {
+    0
 }
 
 fn lent_scratch(device: Device, held: usize, buffer: String) -> Result<(), GgmlError> {
@@ -513,6 +523,10 @@ pub struct Executor {
     kv_slot_blocks: usize,
     /// See [`Self::set_kv_slot_host_budget`].
     kv_slot_host_budget: Option<usize>,
+    /// See [`Self::set_kv_slot_lend`].
+    kv_slot_lend: usize,
+    /// See [`Self::set_kv_slot_lend`]: VRAM per GPU the steps still need past the load.
+    kv_slot_lend_keep: usize,
     /// See [`Self::enable_ring_saves`]: per stage, its rings' copies (empty: none).
     ring_saves: Vec<Option<crate::ggml::Context>>,
     /// Copies each stage's `ring_saves` hold.
@@ -793,6 +807,8 @@ impl Executor {
             gather_budget: 0,
             kv_slot_blocks: 0,
             kv_slot_host_budget: None,
+            kv_slot_lend: 0,
+            kv_slot_lend_keep: 0,
             ring_saves: Vec::new(),
             ring_save_slots: 0,
             deferred_target: None,
@@ -1012,6 +1028,17 @@ impl Executor {
             })
             .max()
             .unwrap_or(0)
+    }
+
+    /// Bytes per cell of every KV pool tensor whose rows are cells (the stages' and the MTP
+    /// head's own pools, the rings aside), over all the GPUs a tensor-parallel cache splits.
+    pub fn kv_cell_tensor_bytes(&self) -> Vec<usize> {
+        self.stages
+            .iter()
+            .map(|s| &s.kv)
+            .chain(self.mtp_kv.as_ref())
+            .flat_map(KvPool::cell_tensor_bytes)
+            .collect()
     }
 
     /// Bytes another KV block takes over every pool (the stages' and the MTP head's own),
@@ -1842,14 +1869,47 @@ impl Executor {
         self.kv_slot_host_budget
     }
 
-    /// Backs sequence slot `slot`'s first `tokens` (rounded up to whole chunks) with host
-    /// memory where its host tier has none yet ([`Self::set_kv_slot_host_budget`]).
-    pub fn back_kv_slot(&self, slot: usize, tokens: usize) -> Result<(), String> {
-        tier_back(slot, tokens)
+    /// Sequence slots that share `blocks` of VRAM (whole lazy chunks) past each slot's own
+    /// first blocks (#1159): the slots' host tier is then backed as they fill, and a slot's
+    /// chunks are VRAM while the shared ones last ([`Self::back_kv_slot`]'s `lent`). Takes
+    /// effect with the next tensor-parallel tier ([`Self::set_kv_tiers`]); 0: none.
+    /// `keep`: the VRAM per GPU the steps' buffers and their margin take, which
+    /// [`Self::lend_kv_slots_more`] leaves free.
+    pub fn set_kv_slot_lend(&mut self, blocks: usize, keep: usize) {
+        self.kv_slot_lend = blocks;
+        self.kv_slot_lend_keep = keep;
     }
 
-    /// Gives back the host memory [`Self::back_kv_slot`] gave slot `slot`, whose sequence left
-    /// it (waits for the GPUs first).
+    /// See [`Self::set_kv_slot_lend`].
+    pub fn kv_slot_lend(&self) -> usize {
+        self.kv_slot_lend
+    }
+
+    /// See [`Self::set_kv_slot_lend`].
+    pub fn kv_slot_lend_keep(&self) -> usize {
+        self.kv_slot_lend_keep
+    }
+
+    /// Adds up to `blocks` (whole lazy chunks) to the slots' shared VRAM (#1159), as far as
+    /// the GPUs have room: the blocks added.
+    pub fn lend_kv_slots_more(&mut self, blocks: usize) -> usize {
+        let chunk = crate::engine::lm::LAZY_CHUNK_BLOCKS;
+        let added = tier_lend(blocks / chunk) * chunk;
+        self.kv_slot_lend += added;
+        added
+    }
+
+    /// Backs sequence slot `slot`'s first `tokens` (rounded up to whole chunks) with host
+    /// memory where its host tier has none yet ([`Self::set_kv_slot_host_budget`]), or with
+    /// the slots' shared VRAM ([`Self::set_kv_slot_lend`]): `lent` tokens of the slot past its
+    /// own VRAM, as far as the shared chunks go, its chunks moving (copied) between VRAM and
+    /// the host to match. Only where the rows live changes.
+    pub fn back_kv_slot(&self, slot: usize, tokens: usize, lent: usize) -> Result<(), String> {
+        tier_back(slot, tokens, lent)
+    }
+
+    /// Gives back the host memory and shared VRAM [`Self::back_kv_slot`] gave slot `slot`,
+    /// whose sequence left it (waits for the GPUs first).
     pub fn trim_kv_slot(&self, slot: usize) -> Result<(), String> {
         tier_trim(slot)
     }
