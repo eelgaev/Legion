@@ -25,6 +25,7 @@
 // scale word is the scale register as stored, and ldmatrix reads the code words straight (RAW
 // tiles read the weights' a word at a time from the blocks as stored).
 
+#include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -477,6 +478,12 @@ __global__ void __launch_bounds__(RQ_THREADS) nvfp4_a4_rms_quant(const float * x
 // SH (CW 16): weight rows only 8-byte aligned (w_ld % 16 == 8, bases 16-byte aligned): each
 // row's copies take the aligned window around its stage, which starts 0 or 8 bytes in by the
 // row's parity (a lane's rows all have its g's parity).
+#ifdef LEGION_FP4_MMA
+template <int MI, int NT, bool GROUPED, bool GLU, bool RES>
+__device__ __forceinline__ void a4_epilogue(const legion_nvfp4_a4 & p, const float (&acc)[MI][NT][4], int64_t m0,
+                                            int64_t n0, int n_tok, const float * x_dec, const int64_t * d_off,
+                                            float sc, float sc2, int wm, int wn, int g, int t);
+#endif
 template <class T, bool GROUPED, bool GLU, int CW, bool RES = false, bool SH = false>
 __global__ void __launch_bounds__(256, T::MINB) nvfp4_a4_gemm(const legion_nvfp4_a4 p) {
 #ifdef LEGION_FP4_MMA
@@ -831,7 +838,18 @@ __global__ void __launch_bounds__(256, T::MINB) nvfp4_a4_gemm(const legion_nvfp4
         }
     }
     asm volatile("cp.async.wait_group 0;\n" ::);
+    a4_epilogue<MI, NT, GROUPED, GLU, RES>(p, acc, m0, n0, n_tok, x_dec, d_off, sc, sc2, wm, wn, g, t);
+#endif
+}
 
+#ifdef LEGION_FP4_MMA
+// The GEMM's epilogue: this warp's accumulators (MI row tiles x NT n8 token tiles of the tile
+// at m0, n0; SwiGLU: row tiles [0, MI / 2) of the gate, then the same rows of the up weight)
+// times the scales, through p.act (and RES: plus the residual) to p.dst.
+template <int MI, int NT, bool GROUPED, bool GLU, bool RES>
+__device__ __forceinline__ void a4_epilogue(const legion_nvfp4_a4 & p, const float (&acc)[MI][NT][4], int64_t m0,
+                                            int64_t n0, int n_tok, const float * x_dec, const int64_t * d_off,
+                                            float sc, float sc2, int wm, int wn, int g, int t) {
     if constexpr (GLU) {
 #pragma unroll
         for (int i = 0; i < MI / 2; i++) {
@@ -902,8 +920,8 @@ __global__ void __launch_bounds__(256, T::MINB) nvfp4_a4_gemm(const legion_nvfp4
             }
         }
     }
-#endif
 }
+#endif
 
 // The decode kernel: routed experts' grouped matmuls with a few tokens per expert (decode steps of
 // up to 64 tokens), where the matmul is bound by the weight stream. As nvfp4_mm/common.cuh's nvfp4_mvs
@@ -1215,6 +1233,10 @@ int status() {
     return e == cudaSuccess ? 0 : (int) e;
 }
 
+// The TMA-fed dense GEMM (nvfp4_a4_gemm_tma, dense_tma).
+#include "../sm90/tma.cuh"
+#include "nvfp4_a4_tma.cuh"
+
 // GROUPED_ONLY: the grouped kernels only (dense calls are -1).
 template <class T, bool GROUPED_ONLY = false>
 int gemm(const legion_nvfp4_a4 & p, cudaStream_t st) {
@@ -1387,6 +1409,13 @@ int legion_nvfp4_a4_rms_quant_launch(const float * x, int64_t x_ld, const float 
 // at 4096 tokens, 4-5% at 512 to 1024), but not for 16-byte aligned rows or the SwiGLU, which
 // stream the weights from DRAM as fast with 8-byte copies (16-byte ones: 2-8% slower at 4096
 // tokens). Every variant has the same MMAs in the same order (the same bits).
+// Dense nt 8 with k % 256 == 0 first takes the TMA-fed tile (nvfp4_a4_gemm_tma, #1133): one
+// bulk tensor copy per operand and stage instead of 16-byte cp.async, the same MMAs in the same
+// order. On the GB10 at Qwen3.8-27B's MLP against the 16-byte-copy tile above: the SwiGLU (k
+// 5120, 2 x 17408 rows) 128 x 128 x 2 stages, 219 -> 248 TFLOPS at 8192 tokens, 86 against 83
+// at 128; at 16384 tokens 128 x 96 x 3 stages (234 against 225 for 128 x 128). The down matmul
+// with its residual (k 17408, 5120 rows) 128 x 96 x 3 stages from 2048 tokens: 180 -> 233
+// TFLOPS at 8192 (128 x 128: 203), 128 x 128 below (81 against 72 at 128 tokens).
 int legion_nvfp4_a4_gemm_launch(const legion_nvfp4_a4 * p, int nt, void * stream) {
     const cudaStream_t st = (cudaStream_t) stream;
     switch (nt) {
@@ -1397,7 +1426,11 @@ int legion_nvfp4_a4_gemm_launch(const legion_nvfp4_a4 * p, int nt, void * stream
         case 2: return gemm<Tile<2, 2, 2, 4>>(*p, st);
         case 4: return gemm<Tile<2, 4, 2, 4>>(*p, st);
         case 8: {
-            int r = dense16<Tile<2, 8, 4, 2, 1, true>>(*p, st);
+            const bool deep = p->w2 ? p->n >= 16384 : p->k >= 8192 && p->n >= 2048;
+            int r = deep ? dense_tma<6, 3>(*p, st) : dense_tma<8, 2>(*p, st);
+            if (r == -1) {
+                r = dense16<Tile<2, 8, 4, 2, 1, true>>(*p, st);
+            }
             if (r == -1) {
                 r = grouped16<Tile<2, 8, 4, 2, 1, true>, false>(*p, st);
             }
