@@ -5,6 +5,7 @@ pub mod api;
 pub mod bench;
 pub mod chat_template;
 pub mod cpu;
+pub mod dashboard;
 pub mod engine;
 pub mod ggml;
 pub mod gguf;

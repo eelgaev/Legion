@@ -544,6 +544,9 @@ same batch unconstrained) has not been measured yet.
 | `POST` | `/v1/messages` | Anthropic-compatible messages |
 | `POST` | `/v1/messages/count_tokens` | Anthropic-compatible token counting |
 | `POST` | `/v1/responses` | Anthropic-compatible responses |
+| `GET` | `/v1/stats` | The live dashboard's snapshot (JSON, [dashboard.md](dashboard.md)) |
+| `GET` | `/v1/stats/stream` | The snapshot as server-sent events (`?interval_ms=` 100-5000, default 250) |
+| `GET` | `/v1/logs/stream` | The last 2,000 log lines and new ones as server-sent events (`?level=`) |
 
 ## Clients
 
@@ -718,6 +721,11 @@ A layer split, `--tp` and `--tp-rank` (rank 0 schedules) run whole steps and are
 they are.
 
 ## Monitoring
+
+### Live dashboard
+`legion serve --tui` draws a live dashboard in the server's terminal; `legion top --url ...`
+draws the same from another terminal or machine (`--api-key` or `LEGION_API_KEY` when the server
+has keys). See [dashboard.md](dashboard.md).
 
 ### Health Check
 The `/health` endpoint returns the server status and version.

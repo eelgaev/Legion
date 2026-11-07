@@ -29,6 +29,16 @@ HTTP clients ──► src/server ──► src/engine (trait Engine) ──► 
 | `src/bench.rs` | Concurrency benchmark client: drives an OpenAI- or Anthropic-compatible server. |
 | `src/bench/bandwidth.rs` | `/metrics` scrapes for #391: a window's model bytes by phase (device memory, host link, roofline share) and the GPUs' hardware counters. |
 | `src/chat_template.rs` | Chat template rendering: turns a conversation into the model's prompt text. |
+| `src/dashboard/` | The live dashboard of `serve --tui` and `legion top` (#1198, [dashboard.md](dashboard.md)). |
+| `src/dashboard/snapshot.rs` | The `/v1/stats` snapshot (schema version 1, cumulative counters), rates between two snapshots, the quant from a model's name. |
+| `src/dashboard/hub.rs` | The few counters the engine feeds the dashboard while one is attached (step phases, accepts per draft position) and the TP exchange's bytes. |
+| `src/dashboard/latency.rs` | TTFT / ITL percentiles over five minutes: per-minute log-spaced histograms of atomics. |
+| `src/dashboard/logs.rs` | The log ring (last 2,000 lines) behind `/v1/logs/stream` and the log panel, as a tracing layer; other crates' lines only at INFO and above. |
+| `src/dashboard/scale.rs` | Gauge full scales: PCIe generation x width, NVLink links x version, C2C, memory bus x clock, NIC speed. |
+| `src/dashboard/speedo.rs` | The speedometer widget: a Braille half dial with TX / RX / Legion needles and peak ticks, bars when small. |
+| `src/dashboard/ui.rs` | The dashboard's state (rates, history, peaks, keys) and its full and compact layouts. |
+| `src/dashboard/term.rs` | Raw mode and the alternate screen, restored on every exit (also on panic), and the draw / key loop. |
+| `src/dashboard/client.rs` | `legion top`'s two server-sent-event streams, reconnecting with backoff. |
 | `src/engine/` | The engine boundary. Front ends translate their wire formats into a `GenerateRequest`; an `Engine` turns it into a stream of `TokenEvent`s. |
 | `src/engine/mock.rs` | A GPU-free engine for tests and API work. |
 | `src/engine/replicas.rs` | `--tp-replicas`: several `--tp` copies of one model behind one `Engine`; routes each new request by load (or to the replica holding its prefix) and keeps it there. Knows replicas only through the `Replica` trait (`LmEngine` implements it). |
@@ -47,7 +57,7 @@ HTTP clients ──► src/server ──► src/engine (trait Engine) ──► 
 | `src/engine/lm/vram.rs` | What the load leaves each GPU: the KV fit with the MTP head's own pool and a given `--expert-cache-gib`, the cache's size check, the kept step graphs' budget with host experts (#433). |
 | `src/engine/lm/stream.rs` | Sequences' text (detokenizer, reasoning and tool-call parsers, log probabilities, the stream sends) on a thread of its own once `--stream-thread-seqs` sequences run (#47); stop-string and grammar requests keep theirs on the engine thread. |
 | `src/engine/lm/vision.rs` | `--mmproj` (#146): a request's images as `<|image_pad|>` tokens (one per merged patch), the vision tower's rows and M-RoPE positions (`src/model/core/media.rs`) and a prefix-cache key that tells images apart. |
-| `src/engine/lm/host_time.rs` | The engine thread's time per step by phase (plan, pack, step, sample, device calls, finish), logged at debug level as host microseconds per step (#47). |
+| `src/engine/lm/host_time.rs` | The engine thread's time per step by phase (plan, pack, step, sample, device calls, finish), logged at debug level as host microseconds per step (#47), and published to the dashboard per step while one is attached (#1198). |
 | `src/engine/reasoning.rs` | Streaming `<think>...</think>` splitter: turns model text into `TokenEvent::Reasoning` and `TokenEvent::Text` events. |
 | `src/engine/sampling.rs` | Token sampling from logits: penalties, temperature, top-k, top-p, min-p and a seeded RNG. |
 | `src/engine/saved_states.rs` | Bookkeeping for saved recurrent states, the half of prefix caching that hybrid models need. |
@@ -80,7 +90,8 @@ HTTP clients ──► src/server ──► src/engine (trait Engine) ──► 
 | `src/hw/` | Host hardware topology and placement helpers. |
 | `src/hw/gpu.rs` | NVIDIA GPU discovery through NVML. |
 | `src/hw/comm_bench.rs` | `legion comm-bench` (#668, development): latency of one all-reduce through GLM's parallel-decode exchange over the visible GPUs (graphs of chained reduces, next to as many adds; `--peer` picks the GPU-GPU writes as `serve --glm-exchange-peer` does, #671; the last sum is checked bit for bit), the `cudaMemcpyPeer` baseline per GPU pair, and each GPU's read bandwidth from each NUMA node's memory. GPUs by `CUDA_VISIBLE_DEVICES`, CPUs by `numactl`. |
-| `src/hw/counters.rs` | `legion serve --hw-counters`: a thread summing NVML's NVLink, PCIe and utilization counters per GPU. |
+| `src/hw/counters.rs` | `legion serve --hw-counters`: a thread summing NVML's NVLink, PCIe and utilization counters per GPU; NVLink split into links to the CPU and to peers, GPM DRAM bandwidth and C2C where NVML has them (the dashboard's sampler, #1198). |
+| `src/hw/counters/live.rs` | Each GPU's link layout and limits from NVML (PCIe max gen and width, NVLink classes and version, C2C, memory bus and clock) and the GPM sampler. |
 | `src/hw/numa.rs` | Linux NUMA discovery and CPU affinity for node-local first-touch work. |
 | `src/hw/host_core.rs` | #250: threads the placed engine thread starts (stage launches, n-gram/row gathers, PLE gather, expert cache refill) pin to their CPU set minus the engine's current core and its SMT siblings; no-op where the load placed nothing. |
 | `src/hw/numa_bind.rs` | `legion serve --numa` (#422): at startup, before the runtime's threads exist, binds the process's CPUs and memory (`MPOL_BIND`) to the GPUs' NUMA node (GPUs on several nodes: per-GPU threads and pinned buffers on each GPU's node); keeps an outer numactl/taskset/cpuset; no-op on one-node machines. |
@@ -180,7 +191,8 @@ HTTP clients ──► src/server ──► src/engine (trait Engine) ──► 
 | `src/server/middleware/body_limit.rs` | Request body size limit. |
 | `src/server/middleware/cors.rs` | CORS for browser frontends on another origin. |
 | `src/server/middleware/in_flight.rs` | Counts requests that are still being served. |
-| `src/server/middleware/metrics.rs` | Counts every HTTP request by matched route and status class, for `/metrics`. |
+| `src/server/middleware/metrics.rs` | Counts every HTTP request by matched route and status class, for `/metrics`; names the request's API for the dashboard. |
+| `src/server/stats.rs` | The dashboard's hub: requests in flight, latency windows, the on-demand NVML sampler (started by the first stats request, stopped 60 s after the last), and the snapshot. |
 | `src/server/middleware/request_id.rs` | Per-request id and tracing span. |
 | `src/server/routes/` | HTTP route handlers. |
 | `src/server/routes/chat.rs` | `POST /v1/chat/completions` |
@@ -191,6 +203,7 @@ HTTP clients ──► src/server ──► src/engine (trait Engine) ──► 
 | `src/server/routes/metrics.rs` | `GET /metrics`: Prometheus text exposition format. |
 | `src/server/routes/models.rs` | `GET /v1/models` (also at `/models`) |
 | `src/server/routes/responses.rs` | `POST /v1/responses` (stateless subset) |
+| `src/server/routes/stats.rs` | `GET /v1/stats`, `/v1/stats/stream` and `/v1/logs/stream`: the dashboard's snapshot and logs (#1198). |
 | `src/server/routes/webui.rs` | The built-in web UI. |
 | `src/spec/` | Speculative decoding: the `TokenDrafter` and `ModelDrafter` interfaces, settings, counters, and the verify / rollback design. |
 | `src/spec/accept.rs` | Exact acceptance: greedy prefix + bonus token, rejection sampling for temperature > 0. |
@@ -219,6 +232,8 @@ HTTP clients ──► src/server ──► src/engine (trait Engine) ──► 
 | `src/cli/logging.rs` | Log setup for the CLI. |
 | `src/cli/run.rs` | `legion run`: load a GGUF, generate once, print the answer. |
 | `src/cli/serve.rs` | `legion serve`: start the inference server. |
+| `src/cli/serve/tui.rs` | `legion serve --tui` (#1198): the dashboard in the server's terminal, and the snapshot's header. |
+| `src/cli/top.rs` | `legion top` (#1198): the dashboard of a running server, over `/v1/stats/stream` and `/v1/logs/stream`. |
 | `src/cli/serve/warmup.rs` | `--warmup-prompt` (#760): one greedy prompt before the server takes requests, so the first long prompt does not grow the step buffers (compute buffers, ggml-cuda's pool, TP exchange buffers). `--warmup-shapes` (#836, default `1024,256,128`, model engine): one short prompt per size first, so the first short request after start does not pay its first step's lazy kernel loads and buffer growth. |
 | `src/cli/st.rs` | `legion st`: internal state debugging tool. |
 | `src/cli/tokenize.rs` | `legion tokenize`: show how a model tokenizes text. |

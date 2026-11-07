@@ -14,22 +14,36 @@ pub(crate) enum LogFormat {
     Json,
 }
 
-/// Installs the global subscriber for `format`.
+/// Installs the global subscriber for `format`. Every event that passes the filter also goes
+/// into the dashboard's log ring ([`legion::dashboard::logs`]), and the normal output holds
+/// back while the dashboard owns the terminal (`serve --tui`, `legion top`).
 pub(crate) fn init(format: LogFormat, ansi: bool) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    let ring = legion::dashboard::logs::RingLayer;
     match format {
         // No module path on every line (`legion::server::middleware::request_id:`); RUST_LOG
         // still filters by it.
-        LogFormat::Pretty => tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(false)
-            .with_writer(super::statusline::stdout_writer)
-            .with_ansi(ansi)
+        LogFormat::Pretty => tracing_subscriber::registry()
+            .with(filter)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_target(false)
+                    .with_writer(super::statusline::stdout_writer)
+                    .with_ansi(ansi),
+            )
+            .with(ring)
             .init(),
-        LogFormat::Json => tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .json()
-            .with_ansi(false)
+        LogFormat::Json => tracing_subscriber::registry()
+            .with(filter)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(|| legion::dashboard::logs::MutableStdout)
+                    .with_ansi(false),
+            )
+            .with(ring)
             .init(),
     }
 }
