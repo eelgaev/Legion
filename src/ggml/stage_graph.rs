@@ -605,6 +605,12 @@ impl Drop for EarlyScope {
     }
 }
 
+/// Whether the graphs computed now belong to a small step ([`EarlyScope`]): for ops that a
+/// capture may hold in small steps only ([`SafeOp`]).
+pub fn small_step() -> bool {
+    SMALL_STEP.load(Ordering::Relaxed)
+}
+
 /// Whether a graph's first run after a change (run directly) also captures it at once, so that
 /// its second run launches the capture instead of capturing first (#827). The capture only
 /// records (the kernels the direct run queued keep the GPU busy meanwhile); captured on the

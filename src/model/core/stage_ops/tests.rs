@@ -42,13 +42,6 @@ fn decode_matmuls_are_listed() {
         "nvfp4_swiglu_id",
         "nvfp4_once",
         "nvfp4_once_glu",
-        "nvfp4_a4_mm",
-        "nvfp4_a4_mm_multi",
-        "nvfp4_a4_mm_id",
-        "nvfp4_a4_mm_id_weighted",
-        "nvfp4_a4_swiglu",
-        "nvfp4_a4_swiglu_id",
-        "nvfp4_a4_quant",
         "mmq_ids",
         "q8_mmq",
         "shared_q8_small",
@@ -79,4 +72,32 @@ fn the_commit_window_follows_its_switch() {
     // The listed ops do not depend on it.
     let gdn = ExternalOp { name: "gdn", ..op };
     assert!(capture_safe(&gdn, &node));
+}
+
+/// The W4A4 NVFP4 ops are captured in small steps (a 16-user verify step), not in prompt
+/// steps (#1202), and are in neither of the other lists.
+#[test]
+fn w4a4_ops_follow_the_small_step_mark() {
+    let names = [
+        "nvfp4_a4_mm",
+        "nvfp4_a4_mm_multi",
+        "nvfp4_a4_mm_id",
+        "nvfp4_a4_mm_id_weighted",
+        "nvfp4_a4_swiglu",
+        "nvfp4_a4_swiglu_id",
+        "nvfp4_a4_quant",
+    ];
+    assert_eq!(SMALL, &names[..]);
+    assert!(
+        SMALL
+            .iter()
+            .all(|n| !PURE.contains(n) && !COMMIT.contains(n))
+    );
+    for name in names {
+        assert!(listed(name, true), "{name}");
+        assert!(!listed(name, false), "{name}");
+    }
+    // The other listed ops do not depend on the step.
+    assert!(listed("nvfp4_mm", true) && listed("nvfp4_mm", false));
+    assert!(!listed("tp_all_reduce", true) && !listed("tp_all_reduce", false));
 }
