@@ -2274,10 +2274,14 @@ pub async fn run(
         .await?
         .next()
         .ok_or_else(|| anyhow::anyhow!("cannot resolve {}", args.listen.host))?;
-    if tui {
-        tui::start(&state);
+    let dashboard = if tui { tui::start(&state) } else { None };
+    let served = server::serve(addr, state).await;
+    if let Some(d) = dashboard {
+        // The dashboard may still own the terminal (raw mode, alternate screen, logs muted):
+        // give it back so the error or the shutdown lines show.
+        d.stop();
     }
-    server::serve(addr, state).await
+    served
 }
 
 /// `--tp-replicas`: loads `n` copies of the model, replica r on the --tp group from CUDA r×tp,

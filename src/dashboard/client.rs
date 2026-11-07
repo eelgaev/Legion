@@ -12,7 +12,8 @@ use super::snapshot::Snapshot;
 use super::term::Feed;
 use super::ui::Conn;
 
-pub const DEFAULT_URL: &str = "http://127.0.0.1:8080";
+/// `legion serve`'s default listen address.
+pub const DEFAULT_URL: &str = "http://127.0.0.1:8090";
 const BACKOFF_START: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(10);
 /// No snapshot for this long: the server is gone (it sends one every interval).
@@ -41,6 +42,21 @@ pub fn base_url(url: &str) -> String {
     } else {
         format!("http://{url}")
     }
+}
+
+/// Appends `chunk` to `buf` as UTF-8. A character split across two network chunks waits in
+/// `pending` for the rest of its bytes instead of turning into two U+FFFD; bytes that can
+/// never be valid are replaced as usual.
+pub fn push_utf8(buf: &mut String, pending: &mut Vec<u8>, chunk: &[u8]) {
+    pending.extend_from_slice(chunk);
+    let complete = match std::str::from_utf8(pending) {
+        Ok(_) => pending.len(),
+        // Only an unfinished character at the very end waits.
+        Err(e) if e.error_len().is_none() => e.valid_up_to(),
+        Err(_) => pending.len(),
+    };
+    buf.push_str(&String::from_utf8_lossy(&pending[..complete]));
+    pending.drain(..complete);
 }
 
 /// Splits complete server-sent events off the front of `buf`, returning each one's data
@@ -132,6 +148,7 @@ async fn stats_once(c: &reqwest::Client, opts: &Options, feed: &Feed) -> Result<
     let resp = open(c, opts, &path).await?;
     let mut body = resp.bytes_stream();
     let mut buf = String::new();
+    let mut pending = Vec::new();
     let mut connected = false;
     loop {
         let chunk = match tokio::time::timeout(STATS_SILENCE, body.next()).await {
@@ -140,7 +157,7 @@ async fn stats_once(c: &reqwest::Client, opts: &Options, feed: &Feed) -> Result<
             Ok(Some(Err(e))) => return Err(describe(&e)),
             Ok(Some(Ok(b))) => b,
         };
-        buf.push_str(&String::from_utf8_lossy(&chunk));
+        push_utf8(&mut buf, &mut pending, &chunk);
         for data in take_events(&mut buf) {
             match serde_json::from_str::<Snapshot>(&data) {
                 Ok(s) => {
@@ -161,11 +178,12 @@ async fn logs_once(c: &reqwest::Client, opts: &Options, feed: &Feed) -> Result<(
     let resp = open(c, opts, "/v1/logs/stream").await?;
     let mut body = resp.bytes_stream();
     let mut buf = String::new();
+    let mut pending = Vec::new();
     // A new connection sends the server's whole ring again.
     let mut reset = true;
     while let Some(chunk) = body.next().await {
         let chunk = chunk.map_err(|e| describe(&e))?;
-        buf.push_str(&String::from_utf8_lossy(&chunk));
+        push_utf8(&mut buf, &mut pending, &chunk);
         let lines: Vec<LogLine> = take_events(&mut buf)
             .iter()
             .filter_map(|d| serde_json::from_str(d).ok())

@@ -10,7 +10,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use tracing::Level;
 
-use super::client::{base_url, next_backoff, take_events};
+use super::client::{base_url, next_backoff, push_utf8, take_events};
 use super::latency::{BUCKETS, LatencyWindow, bucket, bucket_end, quantile};
 use super::logs::{CAPACITY, LogLine, LogRing, kept, level_rank};
 use super::scale::*;
@@ -679,6 +679,29 @@ fn server_sent_events_split_on_blank_lines() {
     assert!(take_events(&mut empty).is_empty());
     let mut no_space = String::from("data:z\n\n");
     assert_eq!(take_events(&mut no_space), vec!["z".to_string()]);
+}
+
+#[test]
+fn a_character_split_across_chunks_arrives_whole() {
+    let text = "data: {\"m\":\"GB10 – μ\"}\n\n".as_bytes();
+    let dash = text.iter().position(|&b| b == 0xE2).unwrap();
+    let (mut buf, mut pending) = (String::new(), Vec::new());
+    // Split inside the three-byte dash, then inside the two-byte mu.
+    push_utf8(&mut buf, &mut pending, &text[..dash + 1]);
+    assert_eq!(pending.len(), 1);
+    let mu = text.iter().position(|&b| b == 0xCE).unwrap();
+    push_utf8(&mut buf, &mut pending, &text[dash + 1..mu + 1]);
+    push_utf8(&mut buf, &mut pending, &text[mu + 1..]);
+    assert!(pending.is_empty());
+    assert_eq!(
+        take_events(&mut buf),
+        vec!["{\"m\":\"GB10 – μ\"}".to_string()]
+    );
+    // Bytes that can never be UTF-8 are replaced, not held.
+    let (mut buf, mut pending) = (String::new(), Vec::new());
+    push_utf8(&mut buf, &mut pending, b"a\xFFb");
+    assert_eq!(buf, "a\u{FFFD}b");
+    assert!(pending.is_empty());
 }
 
 #[test]

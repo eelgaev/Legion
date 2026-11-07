@@ -4,6 +4,7 @@
 //! the client's network tasks receive to the loop.
 
 use std::io::{self, Stdout};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
 
@@ -148,6 +149,16 @@ pub enum Exit {
     Quit,
     /// Ctrl-C (raw mode turns it into a key).
     Interrupt,
+    /// [`request_stop`]: the process is about to exit.
+    Stopped,
+}
+
+static STOP: AtomicBool = AtomicBool::new(false);
+
+/// Asks [`run`] to return before its next frame, e.g. when the server stops on its own (bind
+/// error, SIGTERM): the terminal must be back to normal before the process exits.
+pub fn request_stop() {
+    STOP.store(true, Ordering::Relaxed);
 }
 
 /// Draws `app` and reads keys until `q` or Ctrl-C. `poll` feeds the app before each frame
@@ -156,6 +167,9 @@ pub fn run(app: &mut App, mut poll: impl FnMut(&mut App)) -> io::Result<Exit> {
     let mut session = Session::enter()?;
     session.terminal.clear()?;
     loop {
+        if STOP.load(Ordering::Relaxed) {
+            return Ok(Exit::Stopped);
+        }
         let started = Instant::now();
         poll(app);
         session.terminal.draw(|f| ui::draw(f, app))?;

@@ -9,7 +9,8 @@ GPUs, speculative decoding, the KV and expert caches, the step breakdown, latenc
 legion serve -m model.gguf --tui
 
 # From another terminal or machine, against a running server.
-legion top --url http://192.0.2.10:8080
+legion top                                # a local server on the default port (8090)
+legion top --url http://192.0.2.10:8090
 legion top --url https://192.0.2.10:8443 --insecure    # self-signed certificate
 ```
 

@@ -85,16 +85,35 @@ pub(super) fn finish(
     h
 }
 
+/// The running dashboard. [`Dashboard::stop`] gives the terminal back when the server returns
+/// on its own (bind error, SIGTERM, shutdown timeout), so its last lines are visible.
+pub(super) struct Dashboard {
+    /// Disconnects when the dashboard thread has left the terminal.
+    gone: std::sync::mpsc::Receiver<()>,
+}
+
+impl Dashboard {
+    pub(super) fn stop(self) {
+        term::request_stop();
+        // The draw loop checks every frame (100 ms); wait for it so it cannot draw over the
+        // restored screen, but never hold up the exit for long.
+        let _ = self.gone.recv_timeout(Duration::from_secs(1));
+        term::restore();
+    }
+}
+
 /// Starts the dashboard on its own thread. `q` gives the terminal back to the plain logs and
 /// leaves the server running; Ctrl-C stops the server (as it does without --tui).
-pub(super) fn start(state: &AppState) {
+pub(super) fn start(state: &AppState) -> Option<Dashboard> {
     let hub = state.stats.clone();
     let engine = state.engine.clone();
     hub.pin();
     let rt = tokio::runtime::Handle::current();
+    let (tx, gone) = std::sync::mpsc::channel::<()>();
     let spawned = std::thread::Builder::new()
         .name("dashboard".into())
         .spawn(move || {
+            let _gone = tx;
             let _rt = rt.enter();
             let mut app = App::new("serve --tui", Conn::Local);
             let mut last: Option<Instant> = None;
@@ -120,13 +139,18 @@ pub(super) fn start(state: &AppState) {
                     // Raw mode made Ctrl-C a key: deliver it as the signal the server waits for.
                     let _ = nix::sys::signal::raise(nix::sys::signal::Signal::SIGINT);
                 }
+                Ok(Exit::Stopped) => hub.unpin(),
                 Err(e) => {
                     hub.unpin();
                     tracing::warn!(error = %e, "--tui: the dashboard stopped");
                 }
             }
         });
-    if let Err(e) = spawned {
-        tracing::warn!(error = %e, "--tui: cannot start the dashboard");
+    match spawned {
+        Ok(_) => Some(Dashboard { gone }),
+        Err(e) => {
+            tracing::warn!(error = %e, "--tui: cannot start the dashboard");
+            None
+        }
     }
 }
