@@ -570,13 +570,19 @@ impl TierBuffer {
             let i = held.iter().rposition(|c| c.1).expect("a VRAM chunk");
             let old = held[i].0;
             let h = new_piece(chunk, host)?;
-            self.move_chunk(base + i * chunk, chunk, h)?;
+            if let Err(e) = self.move_chunk(base + i * chunk, chunk, old, h) {
+                // SAFETY: the piece just made, mapped nowhere (the VRAM chunk stays in place).
+                unsafe { cuMemRelease(h) };
+                return Err(e);
+            }
             let l = self.slots();
             l.chunks[t][slot][i] = (h, false);
             l.pool[t].push(old);
         }
-        // New chunks: VRAM while under the target, else host memory.
+        // New chunks: VRAM while under the target, else host memory. Those mapped are zeroed
+        // even when a later one fails, so no slot holds rows that were never written.
         let have = self.slots().chunks[t][slot].len();
+        let mut failed = None;
         for i in have..n {
             let at = base + i * chunk;
             let vram_chunk = if self.slots().in_vram(t, slot) < target {
@@ -586,31 +592,42 @@ impl TierBuffer {
             };
             let (h, lent) = match vram_chunk {
                 Some(h) => (h, true),
-                None => (new_piece(chunk, host)?, false),
+                None => match new_piece(chunk, host) {
+                    Ok(h) => (h, false),
+                    Err(e) => {
+                        failed = Some(e);
+                        break;
+                    }
+                },
             };
             // SAFETY: the shared zeros' mapping there (each chunk mapped on its own).
             unsafe { cuMemUnmap(self.va + at as u64, chunk) };
             if let Err(e) = self.map_handle(at, chunk, h) {
-                // The zeros back in place: the range stays readable.
-                let zero = self.zero_piece(chunk)?;
-                self.map_handle(at, chunk, zero)?;
                 if lent {
                     self.slots().pool[t].push(h);
                 } else {
                     // SAFETY: the piece just made, mapped nowhere.
                     unsafe { cuMemRelease(h) };
                 }
-                return Err(e);
+                // The zeros back in place: the range stays readable.
+                let zero = self.zero_piece(chunk)?;
+                self.map_handle(at, chunk, zero)?;
+                failed = Some(e);
+                break;
             }
             self.slots().chunks[t][slot].push((h, lent));
         }
-        if n > have {
+        let added = self.slots().chunks[t][slot].len() - have;
+        if added > 0 {
             let at = self.va + (base + have * chunk) as u64;
             // SAFETY: the chunks just mapped, which the device may access.
             rt(
-                unsafe { cudaMemset(at as *mut c_void, 0, (n - have) * chunk) },
+                unsafe { cudaMemset(at as *mut c_void, 0, added * chunk) },
                 "cudaMemset(KV tier)",
             )?;
+        }
+        if let Some(e) = failed {
+            return Err(e);
         }
         // Host chunks into VRAM, the lowest first, up to the target.
         while self.slots().in_vram(t, slot) < target {
@@ -621,7 +638,11 @@ impl TierBuffer {
                 break;
             };
             let old = self.slots().chunks[t][slot][i].0;
-            self.move_chunk(base + i * chunk, chunk, h)?;
+            if let Err(e) = self.move_chunk(base + i * chunk, chunk, old, h) {
+                // The host chunk stays in place; the VRAM chunk goes back to the pool.
+                self.slots().pool[t].push(h);
+                return Err(e);
+            }
             // SAFETY: the host piece just unmapped.
             unsafe { cuMemRelease(old) };
             self.slots().chunks[t][slot][i] = (h, true);
@@ -629,12 +650,14 @@ impl TierBuffer {
         Ok(())
     }
 
-    /// Copies the `n` bytes mapped at `off` into `new` and maps it there in their place (the
-    /// old handle stays the caller's), the device idle.
+    /// Copies the `n` bytes of `old`, mapped at `off`, into `new` and maps it there in its place
+    /// (both handles stay the caller's), the device idle. On an error `old` is mapped at `off`
+    /// again and `new` is mapped nowhere.
     fn move_chunk(
         &self,
         off: usize,
         n: usize,
+        old: CUmemGenericAllocationHandle,
         new: CUmemGenericAllocationHandle,
     ) -> Result<(), String> {
         let mut scratch: CUdeviceptr = 0;
@@ -671,7 +694,11 @@ impl TierBuffer {
             copied?;
             cuMemUnmap(self.va + off as u64, n);
         }
-        self.map_handle(off, n, new)
+        self.map_handle(off, n, new).inspect_err(|_| {
+            // The old rows back in place (a mapping that just worked there); if that fails too
+            // the error already returned stops the engine.
+            let _ = self.map_handle(off, n, old);
+        })
     }
 }
 
