@@ -115,9 +115,13 @@ fill colour over the ghost and the empty part (16 colours: the ghost is the fill
 dim). RX is cyan and TX magenta; the title's colour says the link's
 type (NVLink green, PCIe blue, C2C red, TP net white).
 
-RX and TX are the hardware counter's; Legion (yellow) is Legion's own bytes on the link: the model bytes the steps must move (weights
-and experts streamed from host memory, host-tier KV), counted by the engine, not measured. A
-link without a counter gets one bar of Legion's bytes (`L`) and `RX/TX n/a (<why>)` under it.
+RX and TX are the hardware counter's; Legion (yellow) is Legion's own bytes on the link, both
+ways together: the model bytes the steps must move (weights and experts streamed from host
+memory, host-tier KV), counted by the engine, not measured. A GPU link without a counter gets
+one bar of Legion's bytes (`L`) and `RX/TX n/a (<why>)` under it. TP net has no NIC counter
+either, but there Legion's own exchange frames are all the traffic: its RX and TX bars are
+the frames received and sent, each against the NIC's per-direction speed, and its Legion
+figure is the two together.
 On narrow panels the title gets shorter instead of wrapping: the link's detail goes first, then
 `Legion` becomes `L` and the name its short form (`G0 CPU / 75.0 GB/s L 12.1`), then the
 unit, then the full scale; the value inside a bar drops `pk` first (the ghost fill stays),
@@ -138,8 +142,8 @@ the compact layout's memory panel shows the same as bars.
 
 The same 10 s peak shows next to the throughput panel's decode and prefill tok/s
 (`decode 41.2 tok/s  pk 48.0`) and as the `pk` columns after the GPU table's SM utilization
-and power. A higher value takes the peak over at once and a lower one once the peak is 10 s
-old; a server restart clears them.
+and power. The peak is the highest value of the last 10 s: a higher value takes over at once, a
+lower one once every higher sample is 10 s old; a server restart clears them.
 
 | Gauge | Measured by | Full scale |
 |---|---|---|
@@ -147,7 +151,7 @@ old; a server restart clears them.
 | NVLink CPU | NVML NVLink data counters over the links to the CPU | links x the NVLink version's speed (NVLink 2: 25 GB/s per link) |
 | NVLink peer | the same over the links to other GPUs | the same |
 | C2C | GPM C2C throughput where NVML has it | NVML's C2C links x speed, or the Grace parts' 450 GB/s |
-| TP net | Legion's own exchange frames (no NIC counter) | the fastest active RDMA port or network interface (sysfs) |
+| TP net | Legion's own exchange frames, received (RX) and sent (TX); no NIC counter | the fastest active RDMA port or network interface (sysfs) |
 | Memory | GPM DRAM bandwidth utilization x peak | bus width x max memory clock, or the part's spec |
 
 What each machine shows:
@@ -167,7 +171,7 @@ What each machine shows:
   C2C gauge reads `RX/TX n/a (no C2C counter)` and its bar and Legion figure count
   host-tier bytes, which a single Spark does not have (it is all one memory), so they stay at
   0. VRAM is `unified`. With two Sparks a TP net gauge shows
-  the exchange's bytes against the NIC's speed.
+  the exchange's bytes each way against the NIC's speed.
 - **A PCIe card (RTX 4090 and the like):** a PCIe gauge measured by NVML, with Legion's host
   bytes; no memory dial without GPM (Hopper and newer have it).
 
@@ -185,4 +189,4 @@ What each machine shows:
 - **Step bar:** the engine thread's time by phase. Attention and the TP exchange sit inside
   `step`: there are no device timers. While a long prompt prefills, a step is one prompt chunk,
   so the bar reads in seconds rather than milliseconds.
-- **TP net:** Legion's own frames only; no NIC counters.
+- **TP net:** Legion's own frames each way; no NIC counters.

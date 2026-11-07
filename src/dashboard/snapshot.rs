@@ -275,7 +275,10 @@ pub struct Rates {
 pub struct LinkRate {
     pub tx_gb_s: Option<f64>,
     pub rx_gb_s: Option<f64>,
+    /// Legion's own bytes both ways together, and each way.
     pub legion_gb_s: f64,
+    pub legion_rx_gb_s: f64,
+    pub legion_tx_gb_s: f64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -304,19 +307,20 @@ fn link_rate(cur: &LinkSnap, prev: Option<&LinkSnap>, seconds: f64) -> LinkRate 
     let (ptx, prx, plrx, pltx) = prev.map_or((None, None, 0.0, 0.0), |p| {
         (p.tx_bytes, p.rx_bytes, p.legion_rx_bytes, p.legion_tx_bytes)
     });
-    let legion = if prev.is_some() {
-        rate(
-            cur.legion_rx_bytes + cur.legion_tx_bytes,
-            plrx + pltx,
-            seconds,
-        ) / 1e9
+    let (legion_rx, legion_tx) = if prev.is_some() {
+        (
+            rate(cur.legion_rx_bytes, plrx, seconds) / 1e9,
+            rate(cur.legion_tx_bytes, pltx, seconds) / 1e9,
+        )
     } else {
-        0.0
+        (0.0, 0.0)
     };
     LinkRate {
         tx_gb_s: gb(cur.tx_bytes, ptx),
         rx_gb_s: gb(cur.rx_bytes, prx),
-        legion_gb_s: legion,
+        legion_gb_s: legion_rx + legion_tx,
+        legion_rx_gb_s: legion_rx,
+        legion_tx_gb_s: legion_tx,
     }
 }
 

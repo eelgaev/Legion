@@ -126,8 +126,9 @@ pub enum PeakOf {
     Rx(u32, usize),
     Tx(u32, usize),
     Legion(u32, usize),
-    /// Legion's bytes over the TP exchange.
-    Net,
+    /// The TP exchange's frames received and sent.
+    NetRx,
+    NetTx,
     /// A GPU's memory dial: measured, Legion's bytes.
     MemMeasured(u32),
     MemLegion(u32),
@@ -138,19 +139,32 @@ pub enum PeakOf {
     Power(u32),
 }
 
-/// A peak and when it was set (server uptime).
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// The maximum over the last [`PEAK_HOLD_S`] (server uptime): `(at, v)` samples with `v`
+/// falling from front to back, so the front is the peak.
+#[derive(Debug, Clone, Default, PartialEq)]
 struct Hold {
-    v: f64,
-    at: f64,
+    q: VecDeque<(f64, f64)>,
 }
 
 impl Hold {
-    /// A higher value takes over at once; a lower one once the peak is [`PEAK_HOLD_S`] old.
+    /// A higher value takes over at once; a lower one once every higher sample is
+    /// [`PEAK_HOLD_S`] old.
     fn update(&mut self, v: f64, now: f64) {
-        if v >= self.v || now - self.at > PEAK_HOLD_S {
-            *self = Self { v, at: now };
+        while self.q.back().is_some_and(|&(_, b)| b <= v) {
+            self.q.pop_back();
         }
+        self.q.push_back((now, v));
+        while self
+            .q
+            .front()
+            .is_some_and(|&(at, _)| now - at > PEAK_HOLD_S)
+        {
+            self.q.pop_front();
+        }
+    }
+
+    fn v(&self) -> Option<f64> {
+        self.q.front().map(|&(_, v)| v)
     }
 }
 
@@ -281,7 +295,8 @@ impl App {
                 self.hold(PeakOf::MemLegion(g.index), Some(m.legion_gb_s), now);
             }
             if let Some(n) = &rates.network {
-                self.hold(PeakOf::Net, Some(n.legion_gb_s), now);
+                self.hold(PeakOf::NetRx, Some(n.legion_rx_gb_s), now);
+                self.hold(PeakOf::NetTx, Some(n.legion_tx_gb_s), now);
             }
             self.hold(PeakOf::Decode, Some(rates.decode_tok_s), now);
             self.rates = Some(rates);
@@ -320,15 +335,12 @@ impl App {
         let Some(v) = v.filter(|v| v.is_finite()) else {
             return;
         };
-        self.peaks
-            .entry(of)
-            .and_modify(|h| h.update(v, now))
-            .or_insert(Hold { v, at: now });
+        self.peaks.entry(of).or_default().update(v, now);
     }
 
-    /// `of`'s peak over the last [`PEAK_HOLD_S`] (at least); `None` before its first value.
+    /// `of`'s peak over the last [`PEAK_HOLD_S`]; `None` before its first value.
     pub fn peak(&self, of: PeakOf) -> Option<f64> {
-        self.peaks.get(&of).map(|h| h.v)
+        self.peaks.get(&of).and_then(Hold::v)
     }
 
     /// New log lines (`reset`: the source sends its whole ring again).
@@ -490,13 +502,15 @@ impl App {
                 name: LinkKind::Network.label().into(),
                 short: short_kind(LinkKind::Network).into(),
                 full_scale: n.full_scale_gb_s,
-                rx: None,
-                tx: None,
+                // No NIC counter: Legion's own frames each way, against the per-direction
+                // NIC speed; the title's Legion figure is both together.
+                rx: Some(r.map_or(0.0, |r| r.legion_rx_gb_s)),
+                tx: Some(r.map_or(0.0, |r| r.legion_tx_gb_s)),
                 legion: Some(r.map_or(0.0, |r| r.legion_gb_s)),
-                rx_peak: None,
-                tx_peak: None,
-                legion_peak: self.peak(PeakOf::Net),
-                why: Some("no NIC counter".into()),
+                rx_peak: self.peak(PeakOf::NetRx),
+                tx_peak: self.peak(PeakOf::NetTx),
+                legion_peak: None,
+                why: None,
                 detail: (!n.detail.is_empty()).then(|| n.detail.clone()),
             });
         }
@@ -1525,7 +1539,7 @@ pub const HELP: &[&str] = &[
     "  quant: the model's file name does not say.",
     "  warm sequences: not counted by the engine yet.",
     "  step bar: attention and the TP exchange are inside `step` (no device timers).",
-    "  TP net: Legion's own frames only (no NIC counters); scale from the NIC speed.",
+    "  TP net: RX/TX are Legion's own frames each way (no NIC counters); scale from the NIC speed.",
 ];
 
 fn draw_help(f: &mut Frame, area: Rect) {

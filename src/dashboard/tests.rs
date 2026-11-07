@@ -1085,7 +1085,10 @@ fn gpm_memory_rate_is_utilization_times_peak() {
     // C2C has no counter: no TX/RX rate, Legion's bytes only.
     assert_eq!(r.links[0][0].tx_gb_s, None);
     assert!(close(r.links[0][0].legion_gb_s, 1.0));
-    assert!(close(r.network.unwrap().legion_gb_s, 2.0));
+    let net = r.network.unwrap();
+    assert!(close(net.legion_gb_s, 2.0));
+    assert!(close(net.legion_rx_gb_s, 1.0));
+    assert!(close(net.legion_tx_gb_s, 1.0));
 }
 
 #[test]
@@ -1503,6 +1506,25 @@ fn peaks_hold_then_fall() {
 }
 
 #[test]
+fn a_peak_is_the_max_over_the_window() {
+    let mut app = App::new("x", Conn::Local);
+    let mut sm = |t: f64, pct: f64| {
+        let mut s = pcie(t);
+        s.gpus[0].sm_busy_pct = Some(pct);
+        app.push_snapshot(s);
+        app.peak(PeakOf::Sm(0))
+    };
+    assert_eq!(sm(0.0, 10.0), Some(10.0));
+    assert_eq!(sm(5.0, 9.0), Some(10.0));
+    // 10 is out of the window, 9 (6 s old) is not.
+    assert_eq!(sm(11.0, 1.0), Some(9.0));
+    assert_eq!(sm(14.0, 3.0), Some(9.0));
+    // 9 is out too: the highest of the last 10 s.
+    assert_eq!(sm(16.0, 1.0), Some(3.0));
+    assert_eq!(sm(25.0, 2.0), Some(2.0));
+}
+
+#[test]
 fn link_gauges_and_memory_dials_per_machine() {
     let app = app_with(ac922, 2);
     let links = app.links();
@@ -1543,12 +1565,17 @@ fn link_gauges_and_memory_dials_per_machine() {
     assert!(close(links[0].legion.unwrap(), 1.0));
     assert_eq!(links[1].name, "TP net");
     assert_eq!((links[1].kind, links[1].gpu), (LinkKind::Network, None));
-    assert_eq!(links[1].why.as_deref(), Some("no NIC counter"));
+    assert_eq!(links[1].why, None);
     assert_eq!(links[1].full_scale, Some(25.0));
-    // No counter: the bar shows Legion's bytes (2 GB/s of the NIC's 25).
-    assert!(close(links[1].ratio(links[1].legion), 2.0 / 25.0));
-    assert!(close(links[1].legion_peak.unwrap(), 2.0));
-    assert_eq!((links[1].rx_peak, links[1].tx_peak), (None, None));
+    // No NIC counter: RX and TX are Legion's frames each way (1 GB/s of the NIC's 25 per
+    // direction), the title's Legion figure both together.
+    assert!(links[1].measured());
+    assert!(close(links[1].ratio(links[1].rx), 1.0 / 25.0));
+    assert!(close(links[1].ratio(links[1].tx), 1.0 / 25.0));
+    assert!(close(links[1].legion.unwrap(), 2.0));
+    assert!(close(links[1].rx_peak.unwrap(), 1.0));
+    assert!(close(links[1].tx_peak.unwrap(), 1.0));
+    assert_eq!(links[1].legion_peak, None);
     let memory = app.memory_dials();
     assert_eq!(memory.len(), 1);
     assert_eq!(memory[0].title, "GPU0 memory (GPM)");
@@ -1949,9 +1976,9 @@ fn every_link_gauge_fits_at_every_size() {
     assert!(s.contains("GPU0 C2C  full scale n/a  Legion 1.00"), "{s}");
     assert!(s.contains("TP net  / 25.0 GB/s  Legion 2.00"), "{s}");
     assert!(s.contains("1.00 GB/s  pk 1.00"), "{s}");
-    assert!(s.contains("2.00 GB/s  8%  pk 2.00"), "{s}");
+    assert_eq!(s.matches("1.00 GB/s  4%  pk 1.00").count(), 2, "{s}");
     assert!(s.contains("RX/TX n/a (no C2C counter)"), "{s}");
-    assert!(s.contains("RX/TX n/a (no NIC counter)"), "{s}");
+    assert!(!s.contains("NIC counter"), "{s}");
 }
 
 #[test]
@@ -2014,9 +2041,8 @@ fn a_gb10_at_200_by_60_shows_c2c_memory_and_the_network() {
         "GPU0 C2C  full scale n/a  Legion 1.00",
         "TP net  / 25.0 GB/s  Legion 2.00  rocep1s0f0 200 Gb/sec (4X HDR)",
         "RX/TX n/a (no C2C counter)",
-        "RX/TX n/a (no NIC counter)",
         "1.00 GB/s  pk 1.00",
-        "2.00 GB/s  8%  pk 2.00",
+        "1.00 GB/s  4%  pk 1.00",
         "GPU0 memory (GPM)",
         "meas 164 L 150 pk 164",
         "unified",
@@ -2032,9 +2058,15 @@ fn a_gb10_at_200_by_60_shows_c2c_memory_and_the_network() {
     assert!(yn == y && xn > x + 60, "{s}");
     assert_eq!(cell_at(&t, x, y).fg, kind_color(LinkKind::C2c));
     assert_eq!(cell_at(&t, xn, yn).fg, kind_color(LinkKind::Network));
-    // Legion's bar: `L` in yellow; the C2C has no full scale, so its value is grey.
+    // C2C: Legion's bar, `L` in yellow. TP net: RX and TX (Legion's frames each way) against
+    // the NIC's speed. The C2C has no full scale, so its value is grey.
     assert_eq!(cell_at(&t, x, y + 1).fg, gauge::LEGION);
-    assert_eq!(cell_at(&t, xn + 2, yn + 1).fg, Color::Green);
+    assert_eq!(cell_at(&t, xn, yn + 1).symbol(), "R");
+    assert_eq!(cell_at(&t, xn, yn + 1).fg, gauge::RX);
+    assert_eq!(cell_at(&t, xn, yn + 2).fg, gauge::TX);
+    assert_eq!(cell_at(&t, xn + 3, yn + 1).symbol(), "█");
+    assert_eq!(cell_at(&t, xn + 3, yn + 1).fg, Color::Green);
+    assert!(!s.contains("NIC counter"), "{s}");
     let (xv, yv) = find(&s, "1.00 GB/s  pk 1.00").unwrap();
     assert_eq!(yv, y + 1);
     assert_eq!(cell_at(&t, xv, yv).fg, Color::Gray);
