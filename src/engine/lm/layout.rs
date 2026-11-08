@@ -289,6 +289,8 @@ impl Layout {
             let counted = |t: &&TensorInfo| {
                 is_dev(t, host_exps)
                     || (host_exps && layer_of(&t.name).is_some_and(|l| l < hp.n_layer))
+                    // The MTP head's BF16 experts stay on the last stage's GPU.
+                    || device_exps.iter().any(|n| *n == t.name)
             };
             for t in tensors.iter().filter(counted).filter(|t| owned(t)) {
                 match layer_of(&t.name) {
