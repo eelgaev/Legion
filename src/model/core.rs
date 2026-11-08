@@ -1801,9 +1801,14 @@ impl Model {
         if self.linear.nvfp4_a4() == Nvfp4A4::Off {
             return;
         }
+        // Each NVFP4 weight's own GPU is probed (cached per device), whatever GPU is current,
+        // without changing which kernels any weight routes to.
         let mtp = self.mtp.iter().flat_map(|w| w.tensors());
         for w in self.weights.tensors().chain(mtp) {
-            crate::model::nvfp4_a4::supports(w);
+            if w.ty() == crate::ggml::types::NVFP4 && !w.is_host() {
+                use crate::model::nvfp4_a4::{device_supported, supported_on};
+                w.cuda_device().map_or_else(device_supported, supported_on);
+            }
         }
     }
 
