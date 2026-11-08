@@ -28,6 +28,7 @@ sends a snapshot.
 |---|---|
 | `q` | quit (`serve --tui`: the server keeps running) |
 | `p` | pause the screen (rates start over after it) |
+| `r` | reset every max (the bright tick and `max` figure on the gauges) |
 | `Tab` / `Shift-Tab` | focus the next panel; in the compact layout the focused panel shows next to the request table |
 | `?` | help, including why a value is n/a |
 | `1`-`5` | the log level shown: ERROR ... TRACE |
@@ -98,11 +99,12 @@ two Sparks) gets a title line and two solid bars, RX over TX:
 
 ```text
 GPU0 NVLink CPU  / 75.0 GB/s  Legion 12.1  3 links NVLink 2
-RX █████████▋▓▓▓14.5 GB/s  19%  pk 22.0░░░░░░░░░░░░░░
-TX ██▏▓░░░░░░░░░░3.20 GB/s  4%  pk 6.10░░░░░░░░░░░░░░
+RX █████████▋▓▓▓14.5 GB/s  19%  pk 22.0  max 31.8░░│░░░░░
+TX ██▏▓░░░░░░░░░░3.20 GB/s  4%  pk 6.10  max 12.4░│░░░░░░
 ```
 
-(`░` stands for the empty part's dim background, which the terminal draws as a colour.)
+(`░` stands for the empty part's dim background, which the terminal draws as a colour; `│`
+is the max tick.)
 
 Each bar fills to its own direction over the link's per-direction full scale, with the value
 inside. Past the value a shaded "ghost" fill of the same hue, dimmer, runs on to the
@@ -115,6 +117,12 @@ fill colour over the ghost and the empty part (16 colours: the ghost is the fill
 dim). RX is cyan and TX magenta; the title's colour says the link's
 type (NVLink green, PCIe blue, C2C red, TP net white).
 
+A bright tick `│` in each bar, in a light shade of the fill's hue (16 colours: light green,
+yellow or red), marks the direction's highest value since the dashboard started, with `max`
+after `pk` in the value. It is drawn over the fill, so it shows on the solid part, the ghost and
+the empty part alike (over the value text it becomes that cell's background). The max never
+decays and a server restart keeps it; `r` resets every max, and the next sample starts it again.
+
 RX and TX are the hardware counter's; Legion (yellow) is Legion's own bytes on the link, both
 ways together: the model bytes the steps must move (weights and experts streamed from host
 memory, host-tier KV), counted by the engine, not measured. A GPU link without a counter gets
@@ -124,26 +132,29 @@ the frames received and sent, each against the NIC's per-direction speed, and it
 figure is the two together.
 On narrow panels the title gets shorter instead of wrapping: the link's detail goes first, then
 `Legion` becomes `L` and the name its short form (`G0 CPU / 75.0 GB/s L 12.1`), then the
-unit, then the full scale; the value inside a bar drops `pk` first (the ghost fill stays),
-then its unit and then its percentage. The bars of a column start in the same cell. Links go into
+unit, then the full scale; the value inside a bar drops `max` first, then `pk` (the ghost
+fill and the max tick stay), then its unit and then its percentage. The bars of a column start in the same cell. Links go into
 side-by-side columns where the width allows (a GPU's links stay together), and where they do
 not fit with their titles (the compact layout with four GPUs) the title goes and each row starts
 with a short name instead:
 
 ```text
-G0 CPU RX  ▊8.00░░
-G0 CPU TX  ▏2.00░░
+G0 CPU RX  ▊8.00│░
+G0 CPU TX  │2.00░░
 ```
 
 The memory gauge is a speedometer (a Braille half dial) with a needle for the measured
 bandwidth (cyan) and one for Legion's bytes (yellow), and a red tick across the arc at the
-measured figure's 10 s peak (Legion's where nothing measures), also as `pk` after the figures;
-the compact layout's memory panel shows the same as bars.
+measured figure's 10 s peak (Legion's where nothing measures), also as `pk` after the figures,
+and a longer white tick at the same figure's max (`max`); the compact layout's memory panel
+shows the same as bars.
 
-The same 10 s peak shows next to the throughput panel's decode and prefill tok/s
-(`decode 41.2 tok/s  pk 48.0`) and as the `pk` columns after the GPU table's SM utilization
-and power. The peak is the highest value of the last 10 s: a higher value takes over at once, a
-lower one once every higher sample is 10 s old; a server restart clears them.
+The same 10 s peak and max show next to the throughput panel's decode and prefill tok/s
+(`decode 41.2 tok/s  pk 48.0  max 52.3`, `max` in white, cut before `pk` when the panel is
+narrow) and as the `pk` and `max` columns after the GPU table's SM utilization and power (a
+narrow table drops the clocks first, then the maxes). The peak is the highest value of the
+last 10 s: a higher value takes over at once, a lower one once every higher sample is 10 s
+old; a server restart clears the peaks but not the maxes, which only `r` resets.
 
 | Gauge | Measured by | Full scale |
 |---|---|---|

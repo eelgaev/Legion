@@ -18,7 +18,7 @@ use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Sparkline, Table, Wra
 use super::gauge::{self, ColorDepth, LinkGauge};
 use super::logs::{LogLine, level_rank};
 use super::snapshot::{LinkKind, Rates, Snapshot};
-use super::speedo::{Speedo, gb};
+use super::speedo::{MAX, Speedo, gb};
 
 /// Log lines kept on the client (the server's ring size).
 pub const LOG_LINES: usize = super::logs::CAPACITY;
@@ -222,6 +222,9 @@ pub struct App {
     anchor: Option<Anchor>,
     pub history: VecDeque<Point>,
     peaks: HashMap<PeakOf, Hold>,
+    /// The highest value of each figure since the dashboard started or `r` (a server restart
+    /// keeps them).
+    maxes: HashMap<PeakOf, f64>,
     pub logs: VecDeque<LogLine>,
     pub conn: Conn,
     /// `serve --tui` or the URL `legion top` reads.
@@ -250,6 +253,7 @@ impl App {
             anchor: None,
             history: VecDeque::new(),
             peaks: HashMap::new(),
+            maxes: HashMap::new(),
             logs: VecDeque::new(),
             conn,
             source: source.into(),
@@ -336,11 +340,18 @@ impl App {
             return;
         };
         self.peaks.entry(of).or_default().update(v, now);
+        let m = self.maxes.entry(of).or_insert(v);
+        *m = m.max(v);
     }
 
     /// `of`'s peak over the last [`PEAK_HOLD_S`]; `None` before its first value.
     pub fn peak(&self, of: PeakOf) -> Option<f64> {
         self.peaks.get(&of).and_then(Hold::v)
+    }
+
+    /// `of`'s highest value since the dashboard started or `r`; it never decays.
+    pub fn max(&self, of: PeakOf) -> Option<f64> {
+        self.maxes.get(&of).copied()
     }
 
     /// New log lines (`reset`: the source sends its whole ring again).
@@ -408,6 +419,7 @@ impl App {
                     self.anchor = None;
                 }
             }
+            KeyCode::Char('r') => self.maxes.clear(),
             KeyCode::Tab => self.cycle(1),
             KeyCode::BackTab => self.cycle(PANELS.len() - 1),
             KeyCode::Char('?') => self.help = !self.help,
@@ -483,6 +495,9 @@ impl App {
                     rx_peak: self.peak(PeakOf::Rx(g.index, i)),
                     tx_peak: self.peak(PeakOf::Tx(g.index, i)),
                     legion_peak: self.peak(PeakOf::Legion(g.index, i)),
+                    rx_max: self.max(PeakOf::Rx(g.index, i)),
+                    tx_max: self.max(PeakOf::Tx(g.index, i)),
+                    legion_max: self.max(PeakOf::Legion(g.index, i)),
                     why: (!measured).then(|| {
                         if l.kind == LinkKind::C2c {
                             "no C2C counter".to_string()
@@ -510,6 +525,9 @@ impl App {
                 rx_peak: self.peak(PeakOf::NetRx),
                 tx_peak: self.peak(PeakOf::NetTx),
                 legion_peak: None,
+                rx_max: self.max(PeakOf::NetRx),
+                tx_max: self.max(PeakOf::NetTx),
+                legion_max: None,
                 why: None,
                 detail: (!n.detail.is_empty()).then(|| n.detail.clone()),
             });
@@ -529,6 +547,11 @@ impl App {
             let mr = rates.and_then(|r| r.memory.get(gi));
             if g.unified || m.gpm_dram_pct.is_some() {
                 let gpm = m.gpm_dram_pct.is_some();
+                let mem_of: fn(u32) -> PeakOf = if gpm {
+                    PeakOf::MemMeasured
+                } else {
+                    PeakOf::MemLegion
+                };
                 memory.push(Speedo {
                     title: format!(
                         "GPU{} memory{}",
@@ -538,12 +561,9 @@ impl App {
                     full_scale: m.peak_gb_s,
                     measured: mr.and_then(|r| r.measured_gb_s),
                     legion: mr.map_or(0.0, |r| r.legion_gb_s),
-                    // The tick follows the measured needle, or Legion's where nothing measures.
-                    peak: if gpm {
-                        self.peak(PeakOf::MemMeasured(g.index))
-                    } else {
-                        self.peak(PeakOf::MemLegion(g.index))
-                    },
+                    // The ticks follow the measured needle, or Legion's where nothing measures.
+                    peak: self.peak(mem_of(g.index)),
+                    max: self.max(mem_of(g.index)),
                     note: (!gpm).then(|| match g.mem_busy_pct {
                         Some(p) => format!("busy {p:.0}%"),
                         None => "no GPM".into(),
@@ -943,26 +963,32 @@ pub fn draw_throughput(f: &mut Frame, area: Rect, app: &App, sparklines: bool) {
     let per_decode =
         (!decoding.is_empty()).then(|| decoding.iter().sum::<f64>() / decoding.len() as f64);
     let per_prefill = (e.prefilling > 0).then(|| prefill / f64::from(e.prefilling));
-    // `decode  123.4 tok/s  pk 150.2  41.1 per request`; a narrow panel drops the last part.
-    let rate = |name: &'static str, color: Color, v: String, pk: String, per: String| {
-        let head = format!("{v} tok/s");
-        let tail = format!("  {per} per request");
-        let mut spans = vec![
-            Span::styled(name, Style::default().fg(color)),
-            Span::raw(head),
-            Span::styled(format!("  pk {pk}"), dim()),
-        ];
-        if Line::from(spans.clone()).width() + tail.len() <= usize::from(inner.width) {
-            spans.push(Span::raw(tail));
-        }
-        Line::from(spans)
-    };
+    // `decode  123.4 tok/s  pk 150.2  max 160.0  41.1 per request`; a narrow panel drops the
+    // max first, then the per-request part.
+    let rate =
+        |name: &'static str, color: Color, v: String, pk: String, max: String, per: String| {
+            let mut spans = vec![
+                Span::styled(name, Style::default().fg(color)),
+                Span::raw(format!("{v} tok/s")),
+                Span::styled(format!("  pk {pk}"), dim()),
+            ];
+            let max = Span::styled(format!("  max {max}"), Style::default().fg(MAX));
+            let per = Span::raw(format!("  {per} per request"));
+            let room = usize::from(inner.width).saturating_sub(Line::from(spans.clone()).width());
+            if max.width() + per.width() <= room {
+                spans.extend([max, per]);
+            } else if per.width() <= room {
+                spans.push(per);
+            }
+            Line::from(spans)
+        };
     let lines = vec![
         rate(
             "decode  ",
             Color::Green,
             format!("{decode:>8.1}"),
             na(app.peak(PeakOf::Decode), |v| format!("{v:.1}")),
+            na(app.max(PeakOf::Decode), |v| format!("{v:.1}")),
             na(per_decode, |v| format!("{v:.1}")),
         ),
         rate(
@@ -970,6 +996,7 @@ pub fn draw_throughput(f: &mut Frame, area: Rect, app: &App, sparklines: bool) {
             Color::Cyan,
             format!("{prefill:>8.0}"),
             na(app.peak(PeakOf::Prefill), |v| format!("{v:.0}")),
+            na(app.max(PeakOf::Prefill), |v| format!("{v:.0}")),
             na(per_prefill, |v| format!("{v:.0}")),
         ),
         Line::raw(format!(
@@ -1180,32 +1207,53 @@ pub fn draw_gpus(f: &mut Frame, area: Rect, app: &App) {
         f.render_widget(block, area);
         return;
     };
-    // `pk`: the SM utilization's and the power's 10 s peaks. The clocks go first when the
-    // panel is narrow.
-    const COLUMNS: [(&str, u16); 9] = [
-        ("GPU", 3),
-        ("SM", 4),
-        ("pk", 3),
-        ("mem", 4),
-        ("VRAM GiB", 10),
-        ("W", 4),
-        ("pk", 4),
-        ("SM MHz", 6),
-        ("mem MHz", 7),
+    // `pk`: the SM utilization's and the power's 10 s peaks; `max`: their highest since the
+    // dashboard started (or `r`). The third field is the drop rank: when the panel is narrow
+    // the highest rank goes first (the clocks, then the maxes); rank 0 always stays.
+    const COLUMNS: [(&str, u16, u8); 11] = [
+        ("GPU", 3, 0),
+        ("SM", 4, 0),
+        ("pk", 3, 0),
+        ("max", 3, 1),
+        ("mem", 4, 0),
+        ("VRAM GiB", 10, 0),
+        ("W", 4, 0),
+        ("pk", 4, 0),
+        ("max", 4, 2),
+        ("SM MHz", 6, 3),
+        ("mem MHz", 7, 4),
     ];
     let inner_w = usize::from(block.inner(area).width);
-    let mut n = COLUMNS.len();
-    while n > 7
-        && COLUMNS[..n]
+    let mut keep = [true; COLUMNS.len()];
+    let width = |keep: &[bool]| {
+        COLUMNS
             .iter()
-            .map(|c| usize::from(c.1) + 1)
+            .zip(keep)
+            .filter(|(_, k)| **k)
+            .map(|(c, _)| usize::from(c.1) + 1)
             .sum::<usize>()
-            - 1
-            > inner_w
-    {
-        n -= 1;
+            .saturating_sub(1)
+    };
+    for rank in (1..=4).rev() {
+        if width(&keep) <= inner_w {
+            break;
+        }
+        for (k, c) in keep.iter_mut().zip(&COLUMNS) {
+            if c.2 == rank {
+                *k = false;
+            }
+        }
     }
-    let header = Row::new(COLUMNS[..n].iter().map(|c| c.0)).style(dim());
+    let kept = |i: usize| keep[i];
+    let header = Row::new(
+        COLUMNS
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| kept(*i))
+            .map(|(_, c)| c.0),
+    )
+    .style(dim());
+    let max_style = Style::default().fg(MAX);
     let rows: Vec<Row> = s
         .gpus
         .iter()
@@ -1219,18 +1267,32 @@ pub fn draw_gpus(f: &mut Frame, area: Rect, app: &App) {
                 Cell::from(g.index.to_string()),
                 Cell::from(pct(g.sm_busy_pct)),
                 Cell::from(na(app.peak(PeakOf::Sm(g.index)), |v| format!("{v:.0}"))).style(dim()),
+                Cell::from(na(app.max(PeakOf::Sm(g.index)), |v| format!("{v:.0}")))
+                    .style(max_style),
                 Cell::from(pct(g.mem_busy_pct)),
                 Cell::from(vram),
                 Cell::from(na(g.power_w, |w| format!("{w:.0}"))),
                 Cell::from(na(app.peak(PeakOf::Power(g.index)), |w| format!("{w:.0}")))
                     .style(dim()),
+                Cell::from(na(app.max(PeakOf::Power(g.index)), |w| format!("{w:.0}")))
+                    .style(max_style),
                 Cell::from(na(g.sm_clock_mhz, |m| m.to_string())),
                 Cell::from(na(g.mem_clock_mhz, |m| m.to_string())),
             ];
-            Row::new(cells.into_iter().take(n))
+            Row::new(
+                cells
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(i, _)| kept(*i))
+                    .map(|(_, c)| c),
+            )
         })
         .collect();
-    let widths = COLUMNS[..n].iter().map(|c| Constraint::Length(c.1));
+    let widths = COLUMNS
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| kept(*i))
+        .map(|(_, c)| Constraint::Length(c.1));
     f.render_widget(Table::new(rows, widths).header(header).block(block), area);
 }
 
@@ -1503,7 +1565,7 @@ pub fn draw_logs(f: &mut Frame, area: Rect, app: &App) {
 }
 
 pub fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
-    let keys = "q quit  p pause  Tab panel  ? help  1-5 level  / search  l logs";
+    let keys = "q quit  p pause  r reset max  Tab panel  ? help  1-5 level  / search  l logs";
     let line = Line::from(vec![
         Span::styled(keys, dim()),
         Span::raw("  "),
@@ -1516,7 +1578,8 @@ pub fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
 pub const HELP: &[&str] = &[
     "Keys",
     "  q  quit (serve --tui: the server keeps running, plain logs)   Ctrl-C  stop",
-    "  p  pause   Tab / Shift-Tab  cycle panels   ?  this help   Esc  close",
+    "  p  pause   r  reset every max   Tab / Shift-Tab  cycle panels   ?  this help",
+    "  Esc  close",
     "  1-5  log level (ERROR .. TRACE)   /  search logs   l  full-screen logs",
     "  Up/Down PgUp/PgDn Home/End  scroll the logs",
     "",
@@ -1524,7 +1587,10 @@ pub const HELP: &[&str] = &[
     "  to orange to red with load (16 colours: green under 60%, yellow under 85%, red",
     "  above); no counter: one bar of Legion's bytes. The shaded part runs on to the",
     "  direction's peak (pk) over the last 10 s; throughput and GPU pk are the same.",
-    "Memory dial needles: measured cyan, Legion's own bytes yellow; the red tick: the peak.",
+    "  The bright tick and max: the highest value since the dashboard started; it never",
+    "  decays (a server restart keeps it), r resets it. Narrow panels drop max before pk.",
+    "Memory dial needles: measured cyan, Legion's own bytes yellow; the red tick: the peak,",
+    "  the white tick: the max.",
     "Legion bytes are model bytes (what the steps must read), not measured traffic.",
     "",
     "Why n/a",

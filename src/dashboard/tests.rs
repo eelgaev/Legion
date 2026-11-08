@@ -14,8 +14,8 @@ use tracing::Level;
 
 use super::client::{base_url, next_backoff, push_utf8, take_events};
 use super::gauge::{
-    self, Bar, BarColors, BarRow, ColorDepth, Dir, GHOST, LEVELS, LinkGauge, Plan, VALUE_LEVELS,
-    cube, empty_color, gradient, kind_color, load_color, on_fill_color, value_label,
+    self, Bar, BarColors, BarRow, ColorDepth, Dir, GHOST, LEVELS, LinkGauge, Plan, TICK,
+    VALUE_LEVELS, cube, empty_color, gradient, kind_color, load_color, on_fill_color, value_label,
 };
 use super::latency::{BUCKETS, LatencyWindow, bucket, bucket_end, quantile};
 use super::logs::{CAPACITY, LogLine, LogRing, kept, level_rank};
@@ -160,18 +160,26 @@ fn bar_lines_show_what_a_memory_dial_has() {
         legion: 120.0,
         note: None,
         peak: Some(210.0),
+        max: Some(250.0),
     };
     let text: Vec<String> = d.bar_lines(40).iter().map(line_text).collect();
     assert_eq!(text.len(), 3);
     assert!(text[0].starts_with("meas") && text[0].ends_with("164"));
     assert!(text[1].starts_with('L') && text[1].ends_with("120"));
-    assert_eq!(text[2], "/273 GB/s pk 210");
+    assert_eq!(text[2], "/273 GB/s pk 210 max 250");
+    let lines = d.bar_lines(40);
+    let max = lines[2].spans.last().unwrap();
+    assert_eq!(
+        (max.content.as_ref(), max.style.fg),
+        (" max 250", Some(super::speedo::MAX))
+    );
     // Unified memory without GPM: Legion's bytes only.
     let m = Speedo {
         measured: None,
         full_scale: None,
         note: Some("no GPM".into()),
         peak: None,
+        max: None,
         ..d
     };
     let text: Vec<String> = m.bar_lines(40).iter().map(line_text).collect();
@@ -193,6 +201,9 @@ fn nvlink_cpu(rx: Option<f64>, tx: Option<f64>) -> LinkGauge {
         rx_peak: Some(22.0),
         tx_peak: Some(6.1),
         legion_peak: Some(20.0),
+        rx_max: None,
+        tx_max: None,
+        legion_max: None,
         why: (rx.is_none() && tx.is_none()).then(|| "no NVML counter".into()),
         detail: Some("3 links NVLink 2".into()),
     }
@@ -204,8 +215,20 @@ fn a_link_has_an_rx_and_a_tx_bar_each_over_the_full_scale() {
     assert_eq!(
         g.rows(),
         vec![
-            BarRow::Bar(Dir::Rx, Some(14.5), Some(22.0)),
-            BarRow::Bar(Dir::Tx, Some(3.2), Some(6.1))
+            BarRow::Bar(Dir::Rx, Some(14.5), Some(22.0), None),
+            BarRow::Bar(Dir::Tx, Some(3.2), Some(6.1), None)
+        ]
+    );
+    let with_max = LinkGauge {
+        rx_max: Some(31.8),
+        tx_max: Some(12.4),
+        ..g.clone()
+    };
+    assert_eq!(
+        with_max.rows(),
+        vec![
+            BarRow::Bar(Dir::Rx, Some(14.5), Some(22.0), Some(31.8)),
+            BarRow::Bar(Dir::Tx, Some(3.2), Some(6.1), Some(12.4))
         ]
     );
     assert!(close(g.ratio(g.rx), 14.5 / 75.0));
@@ -230,7 +253,7 @@ fn a_link_has_an_rx_and_a_tx_bar_each_over_the_full_scale() {
     assert_eq!(
         n.rows(),
         vec![
-            BarRow::Bar(Dir::Legion, Some(12.1), Some(20.0)),
+            BarRow::Bar(Dir::Legion, Some(12.1), Some(20.0), None),
             BarRow::Note("RX/TX n/a (no NVML counter)".into())
         ]
     );
@@ -371,11 +394,13 @@ fn colour_depth_from_the_terminal() {
 fn values_inside_a_bar_get_shorter_level_by_level() {
     let r = 14.5 / 75.0;
     let text: Vec<String> = (0..VALUE_LEVELS)
-        .map(|l| value_label(Some(14.5), Some(22.0), r, true, l))
+        .map(|l| value_label(Some(14.5), Some(22.0), Some(31.8), r, true, l))
         .collect();
+    // The max goes first, then the peak.
     assert_eq!(
         text,
         [
+            "14.5 GB/s  19%  pk 22.0  max 31.8",
             "14.5 GB/s  19%  pk 22.0",
             "14.5 GB/s  19%",
             "14.5 GB/s 19%",
@@ -384,29 +409,43 @@ fn values_inside_a_bar_get_shorter_level_by_level() {
             ""
         ]
     );
-    // No peak yet: the first form without it.
-    assert_eq!(value_label(Some(14.5), None, r, true, 0), "14.5 GB/s  19%");
+    // No max: the peak alone; no peak yet: neither.
     assert_eq!(
-        value_label(Some(14.5), Some(f64::NAN), r, true, 0),
+        value_label(Some(14.5), Some(22.0), None, r, true, 0),
+        "14.5 GB/s  19%  pk 22.0"
+    );
+    assert_eq!(
+        value_label(Some(14.5), None, None, r, true, 0),
+        "14.5 GB/s  19%"
+    );
+    assert_eq!(
+        value_label(Some(14.5), Some(f64::NAN), Some(f64::NAN), r, true, 0),
         "14.5 GB/s  19%"
     );
     // No full scale: no percentage.
     assert_eq!(
-        value_label(Some(1.0), Some(2.0), 0.0, false, 0),
+        value_label(Some(1.0), Some(2.0), Some(3.0), 0.0, false, 0),
+        "1.00 GB/s  pk 2.00  max 3.00"
+    );
+    assert_eq!(
+        value_label(Some(1.0), Some(2.0), Some(3.0), 0.0, false, 1),
         "1.00 GB/s  pk 2.00"
     );
     assert_eq!(
-        value_label(Some(1.0), Some(2.0), 0.0, false, 1),
+        value_label(Some(1.0), Some(2.0), Some(3.0), 0.0, false, 2),
         "1.00 GB/s"
     );
-    assert_eq!(value_label(Some(1.0), None, 0.0, false, 3), "1.00");
+    assert_eq!(value_label(Some(1.0), None, None, 0.0, false, 4), "1.00");
     assert_eq!(
-        value_label(Some(70.0), Some(6.1), 70.0 / 75.0, true, 0),
-        "70.0 GB/s  93%  pk 6.10"
+        value_label(Some(70.0), Some(6.1), Some(70.0), 70.0 / 75.0, true, 0),
+        "70.0 GB/s  93%  pk 6.10  max 70.0"
     );
-    assert_eq!(value_label(None, Some(1.0), 0.0, true, 0), "n/a");
-    assert_eq!(value_label(Some(f64::NAN), None, 0.0, true, 1), "n/a");
-    assert_eq!(value_label(None, None, 0.0, true, VALUE_LEVELS - 1), "");
+    assert_eq!(value_label(None, Some(1.0), Some(1.0), 0.0, true, 0), "n/a");
+    assert_eq!(value_label(Some(f64::NAN), None, None, 0.0, true, 1), "n/a");
+    assert_eq!(
+        value_label(None, None, None, 0.0, true, VALUE_LEVELS - 1),
+        ""
+    );
 }
 
 #[test]
@@ -450,11 +489,11 @@ fn link_titles_get_shorter_level_by_level() {
     assert_eq!(line_text(&p.title(0)), "GPU1 NVLink peer  full scale n/a");
     assert_eq!(line_text(&p.title(3)), "G1 peer /n/a");
     // Row tags: `RX` under a title, the short name and `RX` without one.
-    let rx = BarRow::Bar(Dir::Rx, Some(1.0), None);
+    let rx = BarRow::Bar(Dir::Rx, Some(1.0), None, None);
     assert_eq!(line_text(&p.tag(&rx, true)), "RX");
     assert_eq!(line_text(&p.tag(&rx, false)), "G1 peer RX");
     assert_eq!(p.tag(&rx, true).spans[0].style.fg, Some(gauge::RX));
-    let tx = BarRow::Bar(Dir::Tx, Some(1.0), None);
+    let tx = BarRow::Bar(Dir::Tx, Some(1.0), None, None);
     assert_eq!(p.tag(&tx, true).spans[0].style.fg, Some(gauge::TX));
     assert_ne!(gauge::RX, gauge::TX);
     assert_eq!(
@@ -486,15 +525,26 @@ fn a_column_picks_the_longest_titles_and_values_that_fit() {
     }
     // Too narrow for any form: the shortest, clipped.
     assert_eq!(gauge::fit_title(&gauges, 5), LEVELS - 1);
-    // Values keep a cell each side: `14.5 GB/s  19%  pk 22.0` needs 25 cells, and the peak
-    // goes first.
-    assert_eq!(gauge::fit_value(&gauges, 25), 0);
-    assert_eq!(gauge::fit_value(&gauges, 24), 1);
-    assert_eq!(gauge::fit_value(&gauges, 16), 1);
-    assert_eq!(gauge::fit_value(&gauges, 15), 2);
-    assert_eq!(gauge::fit_value(&gauges, 10), 3);
-    assert_eq!(gauge::fit_value(&gauges, 9), 4);
-    assert_eq!(gauge::fit_value(&gauges, 6), 4);
+    // Values keep a cell each side: `14.5 GB/s  19%  pk 22.0  max 31.8` needs 35 cells; the
+    // max goes first, then the peak.
+    let gauges: Vec<LinkGauge> = gauges
+        .into_iter()
+        .map(|g| LinkGauge {
+            rx_max: Some(31.8),
+            tx_max: Some(12.4),
+            legion_max: Some(25.0),
+            ..g
+        })
+        .collect();
+    assert_eq!(gauge::fit_value(&gauges, 35), 0);
+    assert_eq!(gauge::fit_value(&gauges, 34), 1);
+    assert_eq!(gauge::fit_value(&gauges, 25), 1);
+    assert_eq!(gauge::fit_value(&gauges, 24), 2);
+    assert_eq!(gauge::fit_value(&gauges, 16), 2);
+    assert_eq!(gauge::fit_value(&gauges, 15), 3);
+    assert_eq!(gauge::fit_value(&gauges, 10), 4);
+    assert_eq!(gauge::fit_value(&gauges, 9), 5);
+    assert_eq!(gauge::fit_value(&gauges, 6), 5);
     assert_eq!(gauge::fit_value(&gauges, 3), VALUE_LEVELS - 1);
 }
 
@@ -665,6 +715,20 @@ fn block_gauges_fill_by_direction_with_the_value_readable_inside() {
     assert_eq!(buf.cell((0, 1)).unwrap().fg, gauge::LEGION);
     assert!(row_text(&buf, 1, 0, 60).contains("12.1 GB/s  16%  pk 20.0"));
     assert!(row_text(&buf, 2, 0, 60).starts_with("RX/TX n/a (no NVML counter)"));
+    // A max: `max` in the value and the tick at its cell (half of 57 from column 3: 31,
+    // under the value, so the tick's colour behind the text).
+    let m = LinkGauge {
+        rx_max: Some(37.5),
+        ..g.clone()
+    };
+    let buf = stack(std::slice::from_ref(&m), 60, 3, ColorDepth::Ansi16);
+    let row = row_text(&buf, 1, 0, 60);
+    assert!(row.contains("7.50 GB/s  10%  pk 30.0  max 37.5"), "{row}");
+    assert_eq!(buf.cell((31, 1)).unwrap().bg, Color::LightGreen, "{row}");
+    assert_eq!(
+        buf.cell((31, 1)).unwrap().fg,
+        on_fill_color(ColorDepth::Ansi16)
+    );
 }
 
 #[test]
@@ -675,6 +739,7 @@ fn a_bar_draws_its_fill_ghost_and_edge_like_a_gauge() {
         Bar {
             ratio,
             peak,
+            max: 0.0,
             label,
             colors,
         }
@@ -718,12 +783,90 @@ fn a_bar_draws_its_fill_ghost_and_edge_like_a_gauge() {
     Bar {
         ratio: 1.0,
         peak: 1.0,
+        max: 0.0,
         label: "",
         colors,
     }
     .render(Rect::new(2, 0, 4, 1), &mut buf);
     assert_eq!(row_text(&buf, 0, 0, 10), "  ████    ");
     assert_eq!(buf.cell((0, 0)).unwrap().bg, Color::Reset);
+}
+
+#[test]
+fn the_max_tick_sits_over_the_fill_the_ghost_and_the_label() {
+    let colors = BarColors::of(0.5, true, ColorDepth::Rgb);
+    let draw = |ratio: f64, peak: f64, max: f64, label: &str| {
+        let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 10, 1));
+        Bar {
+            ratio,
+            peak,
+            max,
+            label,
+            colors,
+        }
+        .render(buf.area, &mut buf);
+        buf
+    };
+    let text = |b: &ratatui::buffer::Buffer| row_text(b, 0, 0, 10);
+    let cell = |b: &ratatui::buffer::Buffer, x: u16| {
+        let c = b.cell((x, 0)).unwrap().clone();
+        (c.symbol().to_string(), c.fg, c.bg, c.modifier)
+    };
+    // The last cell the max reaches: 0.75 of 10 is cell 7, 0.71 too, 1.0 the last one.
+    let tick = |max: f64| {
+        Bar {
+            ratio: 0.0,
+            peak: 0.0,
+            max,
+            label: "",
+            colors,
+        }
+        .tick(10)
+    };
+    assert_eq!(tick(0.75), Some(7));
+    assert_eq!(tick(0.71), Some(7));
+    assert_eq!(tick(1.0), Some(9));
+    assert_eq!(tick(0.01), Some(0));
+    assert_eq!(tick(0.0), None);
+    assert_eq!(tick(f64::NAN), None);
+    // Past the ghost, on the empty part: the tick's colour on the empty background, bold.
+    let b = draw(0.3, 0.5, 0.75, "");
+    assert_eq!(text(&b), "███▓▓  │  ");
+    let bold = Modifier::BOLD;
+    assert_eq!(cell(&b, 7), (TICK.into(), colors.tick, colors.empty, bold));
+    // On the ghost: the ghost's background; on the solid part: the fill's.
+    let b = draw(0.3, 0.8, 0.45, "");
+    assert_eq!(text(&b), "███▓│▓▓▓  ");
+    assert_eq!(
+        cell(&b, 4),
+        (TICK.into(), colors.tick, colors.ghost_bg, bold)
+    );
+    let b = draw(0.9, 0.9, 0.25, "");
+    assert_eq!(text(&b), "██│██████ ");
+    assert_eq!(cell(&b, 2), (TICK.into(), colors.tick, colors.fill, bold));
+    // Under the label the text stays, dark on the tick's colour.
+    let b = draw(0.0, 0.0, 0.45, "abcdef");
+    assert_eq!(text(&b), "  abcdef  ");
+    assert_eq!(cell(&b, 4), ("c".into(), colors.on_fill, colors.tick, bold));
+    assert_eq!(cell(&b, 3).2, colors.empty);
+    // The tick is bright and differs from the fill; 16 colours take the light variant.
+    assert_ne!(colors.tick, colors.fill);
+    assert_eq!(
+        BarColors::of(0.1, true, ColorDepth::Ansi16).tick,
+        Color::LightGreen
+    );
+    assert_eq!(
+        BarColors::of(0.7, true, ColorDepth::Ansi16).tick,
+        Color::LightYellow
+    );
+    assert_eq!(
+        BarColors::of(0.95, true, ColorDepth::Ansi16).tick,
+        Color::LightRed
+    );
+    assert_eq!(
+        BarColors::of(0.5, false, ColorDepth::Ansi16).tick,
+        Color::White
+    );
 }
 
 #[test]
@@ -786,9 +929,10 @@ fn stacked_links_keep_their_bars_aligned_in_columns() {
         assert_eq!(buf.cell((10, y)).unwrap().bg, Color::Reset, "{y}\n{all}");
     }
     assert!(!all.contains("NVLink"), "{all}");
-    // Seven-cell bars: the value alone (`G0 CPU RX  ▊8.00  `).
-    assert_eq!(row_text(&buf, 0, 0, 18), "G0 CPU RX  ▊8.00  ", "{all}");
-    assert_eq!(row_text(&buf, 1, 0, 18), "G0 CPU TX  ▏2.00  ", "{all}");
+    // Seven-cell bars: the value alone, and the max tick (steady, so at the fill's edge:
+    // `G0 CPU RX  │8.00  `).
+    assert_eq!(row_text(&buf, 0, 0, 18), "G0 CPU RX  │8.00  ", "{all}");
+    assert_eq!(row_text(&buf, 1, 0, 18), "G0 CPU TX  │2.00  ", "{all}");
     assert!(!all.contains("pk"), "{all}");
 }
 
@@ -1525,6 +1669,59 @@ fn a_peak_is_the_max_over_the_window() {
 }
 
 #[test]
+fn a_max_holds_past_the_window_and_r_resets_it() {
+    let mut app = App::new("x", Conn::Local);
+    let sm = |app: &mut App, t: f64, pct: f64| {
+        let mut s = pcie(t);
+        s.gpus[0].sm_busy_pct = Some(pct);
+        s.gpus[0].power_w = Some(pct * 3.0);
+        app.push_snapshot(s);
+        (app.peak(PeakOf::Sm(0)), app.max(PeakOf::Sm(0)))
+    };
+    assert_eq!(sm(&mut app, 0.0, 10.0), (Some(10.0), Some(10.0)));
+    assert_eq!(sm(&mut app, 5.0, 9.0), (Some(10.0), Some(10.0)));
+    // The peak falls once 10 is out of the window; the max does not.
+    assert_eq!(sm(&mut app, 11.0, 1.0), (Some(9.0), Some(10.0)));
+    assert_eq!(sm(&mut app, 16.0, 1.0), (Some(1.0), Some(10.0)));
+    assert_eq!(sm(&mut app, 60.0, 2.0), (Some(2.0), Some(10.0)));
+    assert_eq!(app.max(PeakOf::Power(0)), Some(30.0));
+    // A server restart clears the peaks but keeps the maxes.
+    assert_eq!(sm(&mut app, 1.0, 4.0), (Some(4.0), Some(10.0)));
+    assert_eq!(app.max(PeakOf::Power(0)), Some(30.0));
+    // `r` resets every max; the next sample starts it again, below the old one.
+    assert_eq!(app.handle_key(key(KeyCode::Char('r'))), Action::None);
+    assert_eq!(app.max(PeakOf::Sm(0)), None);
+    assert_eq!(app.max(PeakOf::Power(0)), None);
+    assert_eq!(app.peak(PeakOf::Sm(0)), Some(4.0));
+    assert_eq!(sm(&mut app, 2.0, 3.0), (Some(4.0), Some(3.0)));
+    assert_eq!(app.max(PeakOf::Power(0)), Some(9.0));
+    assert_eq!(sm(&mut app, 3.0, 5.0), (Some(5.0), Some(5.0)));
+}
+
+#[test]
+fn links_memory_and_throughput_carry_their_maxes() {
+    let mut app = App::new("x", Conn::Local);
+    let at = |t: f64, tx: f64| {
+        let mut s = pcie(t);
+        s.gpus[0].links[0].tx_bytes = Some(tx);
+        s
+    };
+    // TX: 10 GB/s for a second, then flat for longer than the window.
+    app.push_snapshot(at(0.0, 0.0));
+    app.push_snapshot(at(1.0, 10e9));
+    app.push_snapshot(at(2.0 + ui::PEAK_HOLD_S, 10e9));
+    let links = app.links();
+    assert!(close(links[0].tx_peak.unwrap(), 0.0));
+    assert!(close(links[0].tx_max.unwrap(), 10.0));
+    assert!(app.max(PeakOf::Decode).is_some());
+    assert!(app.max(PeakOf::Prefill).is_some());
+    // The GB10's dial (Legion's bytes): steady, so the max is the peak.
+    let dials = app_with(gb10, 3).memory_dials();
+    assert!(dials[0].max.is_some());
+    assert_eq!(dials[0].max, dials[0].peak);
+}
+
+#[test]
 fn link_gauges_and_memory_dials_per_machine() {
     let app = app_with(ac922, 2);
     let links = app.links();
@@ -1817,11 +2014,11 @@ fn the_full_layout_at_200_by_60() {
         "Links",
         "GPU0 NVLink CPU  / 75.0 GB/s  Legion 5.00  3 links NVLink 2",
         "GPU1 NVLink peer  / 75.0 GB/s  3 links NVLink 2",
-        "8.00 GB/s  11%  pk 8.00",
-        "2.00 GB/s  3%  pk 2.00",
-        "1.00 GB/s  1%  pk 1.00",
+        "8.00 GB/s  11%  pk 8.00  max 8.00",
+        "2.00 GB/s  3%  pk 2.00  max 2.00",
+        "1.00 GB/s  1%  pk 1.00  max 1.00",
         "GPUs",
-        "87%  87  55%",
+        "87%  87  87  55%",
         "240  240",
         "SM MHz",
         "Speculative",
@@ -1839,6 +2036,14 @@ fn the_full_layout_at_200_by_60() {
     ] {
         assert!(s.contains(want), "missing {want:?} in\n{s}");
     }
+    // Throughput: the max between the peak and the per-request rate.
+    let decode = s.lines().find(|l| l.contains("tok/s  pk ")).unwrap();
+    let (pk, max, per) = (
+        decode.find("  pk ").unwrap(),
+        decode.find("  max ").unwrap(),
+        decode.find("per request").unwrap(),
+    );
+    assert!(pk < max && max < per, "{decode}");
     // The ERROR and WARN lines show at INFO, DEBUG does not.
     assert!(s.contains("request failed: test"));
     assert!(!s.contains("admitted sequence"));
@@ -1931,9 +2136,11 @@ fn every_link_gauge_fits_at_every_size() {
             assert_eq!(s.matches(&want).count(), 1, "missing {want:?} in\n{s}");
         }
     }
-    // Bars of seven cells (left) and eight (right): the value alone, no `pk`.
-    assert!(s.contains("G0 CPU RX  ▊8.00   G2 CPU RX  ▉ 8.00  "), "{s}");
-    assert!(s.contains("G1 peer TX ▏1.00   G3 peer TX ▏ 1.00  "), "{s}");
+    // Bars of seven cells (left) and eight (right): the value alone, no `pk` or `max`, but
+    // the max tick (at the fill's edge: the rates are steady).
+    assert!(s.contains("G0 CPU RX  │8.00   G2 CPU RX  │ 8.00  "), "{s}");
+    assert!(s.contains("G1 peer TX │1.00   G3 peer TX │ 1.00  "), "{s}");
+    assert!(!s.contains("max 8.00") && !s.contains("max 1.00"), "{s}");
     assert_eq!(s.lines().count(), 24);
     assert!(s.lines().all(|l| l.chars().count() == 80));
     // The short names in the link type's colour, the tags in the direction's.
@@ -2184,9 +2391,10 @@ fn a_memory_dial_draws_on_a_canvas_when_it_fits() {
         legion: 120.0,
         note: None,
         peak: Some(250.0),
+        max: Some(273.0),
     };
     let draw = |d: &Speedo| {
-        let mut t = Terminal::new(TestBackend::new(30, 11)).unwrap();
+        let mut t = Terminal::new(TestBackend::new(32, 11)).unwrap();
         t.draw(|f| {
             let area = f.area();
             d.render(f, area, true);
@@ -2197,15 +2405,15 @@ fn a_memory_dial_draws_on_a_canvas_when_it_fits() {
     let t = draw(&d);
     let s = screen(t.backend());
     assert!(s.contains("GPU0 memory (GPM)"));
-    assert!(s.contains("meas 160 L 120 pk 250"), "{s}");
+    assert!(s.contains("meas 160 L 120 pk 250 max 273"), "{s}");
     assert!(s.contains("/273 GB/s"), "{s}");
     // Braille dots: the arc and the needles.
     assert!(
         s.chars().any(|c| ('\u{2801}'..='\u{28ff}').contains(&c)),
         "{s}"
     );
-    // The peak tick, in its own colour on the arc; none without a peak.
-    let peak_cells = |t: &Terminal<TestBackend>| {
+    // The peak and max ticks, each in its own colour on the arc; none without them.
+    let cells_in = |t: &Terminal<TestBackend>, color: Color| {
         let buf = t.backend().buffer();
         (0..buf.area.height)
             .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
@@ -2215,17 +2423,21 @@ fn a_memory_dial_draws_on_a_canvas_when_it_fits() {
                     .symbol()
                     .chars()
                     .all(|ch| ('\u{2801}'..='\u{28ff}').contains(&ch));
-                c.fg == super::speedo::PEAK && braille
+                c.fg == color && braille
             })
             .count()
     };
-    assert!(peak_cells(&t) > 0, "{s}");
+    assert!(cells_in(&t, super::speedo::PEAK) > 0, "{s}");
+    assert!(cells_in(&t, super::speedo::MAX) > 0, "{s}");
     let none = draw(&Speedo {
         peak: None,
+        max: None,
         ..d.clone()
     });
-    assert_eq!(peak_cells(&none), 0);
+    assert_eq!(cells_in(&none, super::speedo::PEAK), 0);
+    assert_eq!(cells_in(&none, super::speedo::MAX), 0);
     assert!(!screen(none.backend()).contains("pk"));
+    assert!(!screen(none.backend()).contains("max"));
     // Too small for a dial: the bars.
     let mut t = Terminal::new(TestBackend::new(14, 6)).unwrap();
     t.draw(|f| {

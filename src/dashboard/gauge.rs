@@ -1,8 +1,10 @@
 //! The link gauges: two solid block bars per link (PCIe, NVLink to the CPU and to the peer
 //! GPUs, NVLink-C2C, the TP exchange), RX over TX. Each bar fills to its direction's share of
 //! the link's per-direction full scale, coloured by load on a green, yellow, orange, red
-//! gradient; a dimmer "ghost" fill of the same hue runs on to the direction's 10 s peak; the
-//! value and the peak sit centred inside. A title line above the pair carries the link's name,
+//! gradient; a dimmer "ghost" fill of the same hue runs on to the direction's 10 s peak, and a
+//! bright tick marks the highest value since the dashboard started (the max, which never
+//! decays; `r` resets it); the value, the peak and the max sit centred inside. A title line
+//! above the pair carries the link's name,
 //! full scale and Legion bytes and gets shorter on narrow panels; where the panel has no room
 //! for it, the bars' rows carry a short name instead (`G0 CPU RX`). A link without a counter
 //! gets one bar of Legion's own bytes and the reason.
@@ -28,13 +30,15 @@ pub const LEGION: Color = Color::Yellow;
 /// Title forms, longest first (see [`LinkGauge::title`]).
 pub const LEVELS: usize = 5;
 /// Value forms inside a bar, longest first (see [`value_label`]).
-pub const VALUE_LEVELS: usize = 6;
+pub const VALUE_LEVELS: usize = 7;
 /// A column narrower than this gets the next link instead of another column.
 pub const MIN_COL: u16 = 56;
 /// Titles need at least this much width; narrower columns put short names in the bar rows.
 pub const MIN_TITLED_COL: u16 = 30;
 /// The ghost fill's glyph: shaded, between the solid fill and the empty background.
 pub const GHOST: &str = "▓";
+/// The max tick's glyph, drawn over whatever the bar has in that cell.
+pub const TICK: &str = "│";
 
 /// What colours the terminal shows: 24-bit, the 256-colour palette, or the 16 basic ones.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -186,6 +190,8 @@ pub struct BarColors {
     pub ghost_bg: Color,
     pub empty: Color,
     pub on_fill: Color,
+    /// The max tick: the fill's hue, bright (16 colours: the light variant).
+    pub tick: Color,
 }
 
 impl BarColors {
@@ -196,6 +202,12 @@ impl BarColors {
         let ghost = depth.pick(dim, fill);
         let empty = empty_color(depth);
         let basic = depth == ColorDepth::Ansi16;
+        let light = match load_color(ratio, scaled, ColorDepth::Ansi16) {
+            Color::Green => Color::LightGreen,
+            Color::Yellow => Color::LightYellow,
+            Color::Red => Color::LightRed,
+            _ => Color::White,
+        };
         Self {
             fill,
             ghost,
@@ -203,17 +215,20 @@ impl BarColors {
             ghost_bg: if basic { empty } else { ghost },
             empty,
             on_fill: on_fill_color(depth),
+            tick: depth.pick(mix(rgb, (255, 255, 255), 0.6), light),
         }
     }
 }
 
 /// One solid bar: filled to `ratio`, the ghost fill on to `peak`, then the empty background;
-/// `label` centred on the middle row, dark on the fill and in the fill's colour elsewhere.
-/// Ratios outside 0..=1 (and NaN) clamp.
+/// `label` centred on the middle row, dark on the fill and in the fill's colour elsewhere;
+/// then the [`TICK`] at `max` over all of it (under the label: the tick's colour behind the
+/// text). Ratios outside 0..=1 (and NaN) clamp; a `max` of 0 draws no tick.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Bar<'a> {
     pub ratio: f64,
     pub peak: f64,
+    pub max: f64,
     pub label: &'a str,
     pub colors: BarColors,
 }
@@ -256,6 +271,12 @@ impl Bar<'_> {
             .clamp(solid_end, width);
         (full, eighths, ghost_end)
     }
+
+    /// The max tick's cell: the last one `max` reaches; `None` for a max of 0.
+    pub fn tick(&self, width: u16) -> Option<u16> {
+        let m = unit(self.max);
+        (m > 0.0 && width > 0).then(|| ((f64::from(width) * m).ceil() as u16).clamp(1, width) - 1)
+    }
 }
 
 impl Widget for Bar<'_> {
@@ -266,6 +287,7 @@ impl Widget for Bar<'_> {
         }
         let c = self.colors;
         let (full, eighths, ghost_end) = self.cells(area.width);
+        let tick = self.tick(area.width);
         let label: Vec<char> = self.label.chars().collect();
         let lw = (label.len() as u16).min(area.width);
         let label_col = (area.width - lw) / 2;
@@ -278,7 +300,26 @@ impl Widget for Bar<'_> {
                 let edge = i == full && eighths > 0;
                 // The edge cell sits over the ghost fill only when the ghost runs past it.
                 let ghost = !solid && i < ghost_end && !(edge && ghost_end == full + 1);
-                if dy == label_row && i >= label_col && i < label_col + lw {
+                let in_label = dy == label_row && i >= label_col && i < label_col + lw;
+                if tick == Some(i) {
+                    // The max tick, over everything; under the label its colour goes behind
+                    // the text.
+                    if in_label {
+                        cell.set_char(label[usize::from(i - label_col)])
+                            .set_fg(c.on_fill)
+                            .set_bg(c.tick);
+                    } else {
+                        let bg = if solid || edge {
+                            c.fill
+                        } else if ghost {
+                            c.ghost_bg
+                        } else {
+                            c.empty
+                        };
+                        cell.set_symbol(TICK).set_fg(c.tick).set_bg(bg);
+                    }
+                    cell.modifier = Modifier::BOLD;
+                } else if in_label {
                     let (fg, bg) = if solid {
                         (c.on_fill, c.fill)
                     } else if ghost {
@@ -339,8 +380,8 @@ impl Dir {
 /// One row under a link's title.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BarRow {
-    /// A direction's value and its 10 s peak.
-    Bar(Dir, Option<f64>, Option<f64>),
+    /// A direction's value, its 10 s peak and its max.
+    Bar(Dir, Option<f64>, Option<f64>, Option<f64>),
     /// Why there is no RX and TX bar.
     Note(String),
 }
@@ -365,18 +406,23 @@ pub struct LinkGauge {
     pub rx_peak: Option<f64>,
     pub tx_peak: Option<f64>,
     pub legion_peak: Option<f64>,
+    /// Each figure's highest value since the dashboard started (or `r`).
+    pub rx_max: Option<f64>,
+    pub tx_max: Option<f64>,
+    pub legion_max: Option<f64>,
     /// Why RX and TX are n/a (`no NVML counter`).
     pub why: Option<String>,
     /// `PCIe 4.0 x16`, `3 links NVLink 2`: the first thing a narrow title drops.
     pub detail: Option<String>,
 }
 
-/// The text inside a bar at `level`, 0 the longest: `14.5 GB/s  19%  pk 22.0`, then without
-/// the peak `14.5 GB/s  19%`, `14.5 GB/s 19%`, `14.5 19%`, `14.5`, nothing. Without a full
-/// scale there is no percentage.
+/// The text inside a bar at `level`, 0 the longest: `14.5 GB/s  19%  pk 22.0  max 31.8`,
+/// then without the max, without the peak (`14.5 GB/s  19%`), `14.5 GB/s 19%`, `14.5 19%`,
+/// `14.5`, nothing. Without a full scale there is no percentage.
 pub fn value_label(
     v: Option<f64>,
     peak: Option<f64>,
+    max: Option<f64>,
     ratio: f64,
     scaled: bool,
     level: usize,
@@ -390,15 +436,21 @@ pub fn value_label(
     };
     let pct = (unit(ratio) * 100.0).round() as u32;
     let peak = peak.filter(|p| p.is_finite());
+    let max = max.filter(|m| m.is_finite());
     let v = gb(v);
-    match (level, scaled, peak) {
-        (0, true, Some(p)) => format!("{v} GB/s  {pct}%  pk {}", gb(p)),
-        (0, false, Some(p)) => format!("{v} GB/s  pk {}", gb(p)),
-        (0 | 1, true, _) => format!("{v} GB/s  {pct}%"),
-        (2, true, _) => format!("{v} GB/s {pct}%"),
-        (0..=2, false, _) => format!("{v} GB/s"),
-        (3, true, _) => format!("{v} {pct}%"),
-        (3 | 4, _, _) => v,
+    let head = if scaled {
+        format!("{v} GB/s  {pct}%")
+    } else {
+        format!("{v} GB/s")
+    };
+    match (level, scaled, peak, max) {
+        (0, _, Some(p), Some(m)) => format!("{head}  pk {}  max {}", gb(p), gb(m)),
+        (0 | 1, _, Some(p), _) => format!("{head}  pk {}", gb(p)),
+        (0..=2, _, _, _) => head,
+        (3, true, _, _) => format!("{v} GB/s {pct}%"),
+        (3, false, _, _) => format!("{v} GB/s"),
+        (4, true, _, _) => format!("{v} {pct}%"),
+        (4 | 5, _, _, _) => v,
         _ => String::new(),
     }
 }
@@ -424,13 +476,18 @@ impl LinkGauge {
     pub fn rows(&self) -> Vec<BarRow> {
         if self.measured() {
             return vec![
-                BarRow::Bar(Dir::Rx, self.rx, self.rx_peak),
-                BarRow::Bar(Dir::Tx, self.tx, self.tx_peak),
+                BarRow::Bar(Dir::Rx, self.rx, self.rx_peak, self.rx_max),
+                BarRow::Bar(Dir::Tx, self.tx, self.tx_peak, self.tx_max),
             ];
         }
         let mut rows = Vec::with_capacity(2);
         if self.legion.is_some() {
-            rows.push(BarRow::Bar(Dir::Legion, self.legion, self.legion_peak));
+            rows.push(BarRow::Bar(
+                Dir::Legion,
+                self.legion,
+                self.legion_peak,
+                self.legion_max,
+            ));
         }
         let why = self.why.as_deref().unwrap_or("no counter");
         rows.push(BarRow::Note(format!("RX/TX n/a ({why})")));
@@ -542,7 +599,7 @@ impl LinkGauge {
                     );
                 }
             }
-            BarRow::Bar(_, v, peak) => {
+            BarRow::Bar(_, v, peak, max) => {
                 let skip = look.tag_w.saturating_add(1).min(area.width);
                 let bar = Rect {
                     x: area.x + skip,
@@ -550,10 +607,11 @@ impl LinkGauge {
                     ..area
                 };
                 let ratio = self.ratio(*v);
-                let label = value_label(*v, *peak, ratio, self.scaled(), look.value_level);
+                let label = value_label(*v, *peak, *max, ratio, self.scaled(), look.value_level);
                 Bar {
                     ratio,
                     peak: self.ratio(*peak),
+                    max: self.ratio(*max),
                     label: &label,
                     colors: BarColors::of(ratio, self.scaled(), look.depth),
                 }
@@ -591,8 +649,8 @@ pub fn fit_value(gauges: &[LinkGauge], width: u16) -> usize {
         .find(|&level| {
             gauges.iter().all(|g| {
                 g.rows().iter().all(|r| match r {
-                    BarRow::Bar(_, v, peak) => {
-                        let label = value_label(*v, *peak, g.ratio(*v), g.scaled(), level);
+                    BarRow::Bar(_, v, peak, max) => {
+                        let label = value_label(*v, *peak, *max, g.ratio(*v), g.scaled(), level);
                         label.is_empty() || label.chars().count() + 2 <= usize::from(width)
                     }
                     BarRow::Note(_) => true,

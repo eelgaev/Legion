@@ -29,10 +29,15 @@ pub struct Speedo {
     /// The 10 s peak of the measured figure (Legion's where nothing measures): a tick on the
     /// arc and `pk` in the figures.
     pub peak: Option<f64>,
+    /// The same figure's highest value since the dashboard started (or `r`): a second tick
+    /// and `max`.
+    pub max: Option<f64>,
 }
 
 /// The peak tick's colour.
 pub const PEAK: Color = Color::LightRed;
+/// The max tick's colour.
+pub const MAX: Color = Color::White;
 
 /// A GB/s figure, short: `0.42`, `12.3`, `450`.
 pub fn gb(v: f64) -> String {
@@ -90,15 +95,21 @@ impl Speedo {
             format!("L {}", gb(self.legion)),
             Style::default().fg(LEGION),
         ));
-        spans.extend(self.peak_span());
+        spans.extend(self.peak_spans());
         Line::from(spans)
     }
 
-    /// ` pk 210`, when there is a peak.
-    fn peak_span(&self) -> Option<Span<'static>> {
-        self.peak
-            .filter(|p| p.is_finite())
-            .map(|p| Span::styled(format!(" pk {}", gb(p)), Style::default().fg(PEAK)))
+    /// ` pk 210` and ` max 250`, when there are a peak and a max (a narrow panel cuts the max
+    /// first).
+    fn peak_spans(&self) -> Vec<Span<'static>> {
+        let fig = |v: Option<f64>, name: &str, color: Color| {
+            v.filter(|v| v.is_finite())
+                .map(|v| Span::styled(format!(" {name} {}", gb(v)), Style::default().fg(color)))
+        };
+        fig(self.peak, "pk", PEAK)
+            .into_iter()
+            .chain(fig(self.max, "max", MAX))
+            .collect()
     }
 
     fn scale_line(&self) -> Line<'static> {
@@ -135,7 +146,7 @@ impl Speedo {
         let [dial, text] =
             Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(inner);
         let full = self.full_scale.unwrap_or(1.0);
-        let (measured, legion, peak) = (self.measured, self.legion, self.peak);
+        let (measured, legion, peak, max) = (self.measured, self.legion, self.peak, self.max);
         let canvas = Canvas::default()
             .marker(Marker::Braille)
             .x_bounds([-1.15, 1.15])
@@ -166,16 +177,19 @@ impl Speedo {
                         color: Color::Gray,
                     });
                 }
-                // The peak: a tick across the arc.
-                if let Some(p) = peak.filter(|p| p.is_finite()) {
-                    let a = angle(p, full);
-                    ctx.draw(&CLine {
-                        x1: 0.8 * a.cos(),
-                        y1: 0.8 * a.sin(),
-                        x2: 1.1 * a.cos(),
-                        y2: 1.1 * a.sin(),
-                        color: PEAK,
-                    });
+                // The max and the peak: ticks across the arc, the max's longer so it still
+                // shows where the peak sits on it.
+                for (v, r0, color) in [(max, 0.7, MAX), (peak, 0.8, PEAK)] {
+                    if let Some(v) = v.filter(|v| v.is_finite()) {
+                        let a = angle(v, full);
+                        ctx.draw(&CLine {
+                            x1: r0 * a.cos(),
+                            y1: r0 * a.sin(),
+                            x2: 1.1 * a.cos(),
+                            y2: 1.1 * a.sin(),
+                            color,
+                        });
+                    }
                 }
                 let mut needle = |v: f64, r: f64, color: Color| {
                     let a = angle(v, full);
@@ -215,7 +229,7 @@ impl Speedo {
         }
         lines.push(row("L", Some(self.legion), LEGION));
         let mut scale = self.scale_line();
-        scale.spans.extend(self.peak_span());
+        scale.spans.extend(self.peak_spans());
         lines.push(scale);
         lines
     }
