@@ -232,8 +232,9 @@ pub(in crate::cli) struct SwitchArgs {
     /// columns at once (the default: the same token and probability bits). For comparisons.
     #[arg(long, help_heading = HEADING)]
     no_draft_head_q4k_pick_cols: bool,
-    /// CUDA, compute capability 7.x-8.x (V100 to RTX 40) and 12.0 (RTX 50, without the mixer's
-    /// parts), steps of 1-8 tokens inside stage graphs, and with this flag a GB10 at 2-8 tokens (without the mixer's parts; ggml's bits
+    /// CUDA, compute capability 7.x-8.x (V100 to RTX 40), steps of 1-8 tokens inside stage
+    /// graphs, with this flag an RTX 50 (12.0) too, without the mixer's parts (unmeasured there),
+    /// and with this flag a GB10 at 2-8 tokens (without the mixer's parts; ggml's bits
     /// but flat decode there, #311 and #994, and at a verify of 8 tokens or fewer the DeltaNet
     /// pair's one launch moves the greedy text there): Q8_0 projections of one input (an
     /// attention layer's Q, K and V, a shared expert's gate and up with its SwiGLU, which also
@@ -796,7 +797,7 @@ pub(in crate::cli) struct SwitchArgs {
     #[arg(long, help_heading = HEADING)]
     expert_mmq: bool,
     /// NVFP4 expert FFNs of 2-8 tokens (MTP verify steps) on compute capability 12.x (GB10;
-    /// RTX 50, whose bits want a `legion nvfp4-once-bench --check` first; no effect elsewhere):
+    /// RTX 50, whose bits want a `legion nvfp4-once-bench` run first; no effect elsewhere):
     /// run Legion's ops that read each routed expert's weights once per step for all its tokens
     /// instead of ggml's MMVQ (once per token): gate and up with their per-expert scales and
     /// the SwiGLU in one op, then the down matmul. MMVQ's bits, with the scales too. Each

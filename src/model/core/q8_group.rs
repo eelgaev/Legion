@@ -22,9 +22,9 @@
 //! launch at 2-8 columns plus an L2 prefetch of the weights, which the kernels issue too, and a
 //! programmatic dependent launch, which the op's launches are on every 12.x; one column, where
 //! ggml widens the CTA, stays on ggml, [`device_takes_cols`]; on every 12.x the
-//! hyper-connection mixer's parts do too, [`GB10_NO_PARTS`]; on a GB10 only with `--q8-group`
-//! ([`Mode::All`]): its det decode was flat, so the default leaves it on ggml; #994: the default's
-//! parts there are bitwise but flat too, +0.4% at C=1 and +0.8% at C=4 under `--deterministic`, and
+//! hyper-connection mixer's parts do too, [`GB10_NO_PARTS`]; on 12.x only with `--q8-group`
+//! ([`Mode::All`]; an RTX 50 is unmeasured; on a GB10 its det decode was flat, so the default
+//! leaves it on ggml; #994: the default's parts there are bitwise but flat too, +0.4% at C=1 and +0.8% at C=4 under `--deterministic`, and
 //! `--q8-group`'s one DeltaNet qkv-and-gate node moves the greedy text once a verify step is 8
 //! tokens or fewer), inside stage graphs only (between ggml's CUDA graphs each op would add a
 //! graph split), where every weight has an even row count (ggml's
@@ -243,8 +243,7 @@ pub fn sm12x() -> bool {
 
 /// Whether the current GPU is a GB10 (compute capability 12.1), whose ggml mmvq the op copies
 /// at 2-8 columns ([`device_takes_cols`]: ggml's `MMVQ_PARAMETERS_GB10` is built for 12.1
-/// only; an RTX 50 takes its generic table, as 8.x does) and whose memory made the default
-/// flat ([`mode_on_device`]).
+/// only; an RTX 50 takes its generic table, as 8.x does).
 pub fn gb10() -> bool {
     #[cfg(feature = "cuda")]
     {
@@ -322,23 +321,25 @@ pub fn takes(ws: &[Tensor<'_>], x: Tensor<'_>) -> bool {
 }
 
 /// Whether graphs built now may take the op where the shapes fit (and [`part`] runs): not
-/// [`Mode::Off`], inside stage graphs, and a GPU of compute capability 7.x, 8.x or 12.0, or a
-/// GB10 under [`Mode::All`] ([`device_supported`], [`mode_on_device`]).
+/// [`Mode::Off`], inside stage graphs, and a GPU of compute capability 7.x or 8.x, or a 12.x
+/// (GB10, RTX 50) under [`Mode::All`] ([`device_supported`], [`mode_on_device`]).
 pub fn enabled() -> bool {
     cfg!(feature = "cuda")
         && crate::ggml::stage_graph::enabled()
         && device_supported()
-        && mode_on_device(mode(), gb10())
+        && mode_on_device(mode(), sm12x())
 }
 
-/// Whether `mode` runs the op on a device (`gb10` or not): never under [`Mode::Off`], and on a
-/// GB10 only under [`Mode::All`] (`--q8-group`; #311 and #994: the default's parts are bitwise
-/// there, but det decode was flat, so the default stays on ggml).
-pub fn mode_on_device(mode: Mode, gb10: bool) -> bool {
+/// Whether `mode` runs the op on a device (compute capability 12.x, `sm12x`, or not): never
+/// under [`Mode::Off`], and on 12.x only under [`Mode::All`] (`--q8-group`; #311 and #994: on a
+/// GB10 the default's parts are bitwise, but det decode was flat, so the default stays on
+/// ggml; #1200: an RTX 50 takes the op without the mixer's parts, a set whose speed and greedy
+/// text nobody has checked there, so it waits for the flag too).
+pub fn mode_on_device(mode: Mode, sm12x: bool) -> bool {
     match mode {
         Mode::Off => false,
         Mode::All => true,
-        Mode::Default => !gb10,
+        Mode::Default => !sm12x,
     }
 }
 
@@ -835,7 +836,8 @@ mod launch {
     /// Launches kernel `kernel` of the table on `p` (by value) on `stream`; on compute
     /// capability 12.x (GB10, RTX 50) as a programmatic dependent launch, as ggml-cuda launches
     /// its own kernels there (each kernel waits for the one ahead before it touches
-    /// activations, `src/cuda/q8_group.cu`).
+    /// activations, `src/cuda/q8_group.cu`; the wait is compiled in, since the load refuses a
+    /// 9.0+ GPU whose code here is older than sm_90, `crate::hw::cuda_arch`).
     fn launch(
         kernel: usize,
         grid: Dim3,

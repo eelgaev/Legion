@@ -949,7 +949,8 @@ mod launch {
     /// Launches kernel `kernel` of the table on `p` (by value) on `stream`; on compute
     /// capability 12.x (GB10, RTX 50) as a programmatic dependent launch, as ggml-cuda launches
     /// its own kernels there (each kernel waits for the one ahead before it reads activations,
-    /// `src/cuda/nvfp4_once.cu`).
+    /// `src/cuda/nvfp4_once.cu`; the wait is compiled in, since the load refuses a 9.0+ GPU
+    /// whose code here is older than sm_90, `crate::hw::cuda_arch`).
     pub(super) fn launch(
         kernel: usize,
         grid: Dim3,

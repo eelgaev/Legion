@@ -77,21 +77,26 @@ CMAKE_CUDA_ARCHITECTURES=121 cargo build --release --features cuda
 
 ## Desktop Blackwell (RTX 50, sm_120)
 
-- RTX 5090 / 5080 / 5070 = `sm_120`, so `CMAKE_CUDA_ARCHITECTURES=120`. CUDA 12.8 or newer.
+- RTX 5090 / 5080 / 5070 = `sm_120`, so `CMAKE_CUDA_ARCHITECTURES=120`. CUDA 12.8 or newer
+  (12.9 or newer when the list also has `121`).
 - `build.rs` turns any `12x` into the architecture-specific `12xa` (`120` builds `sm_120a`), as
   ggml does: the FP4 tensor-core kernels (`--nvfp4-a4`) exist only there. Do not add the `a`
   yourself.
 - An `sm_121a` (DGX Spark) binary does not run on an RTX 50, and an `sm_120a` one does not run
-  on a GB10. For one binary that runs on both, use `CMAKE_CUDA_ARCHITECTURES="120;121"`.
+  on a GB10. `CMAKE_CUDA_ARCHITECTURES="120;121"` puts both GPUs' code in one binary. The list
+  names GPU targets only: the host side is still built for the build machine's CPU, so an x86
+  RTX 50 PC and an aarch64 Spark each need their own build (with `GGML_NATIVE=OFF` if the
+  binary must run on other CPUs of the same architecture).
 - The two share the SM, so an RTX 50 takes the same kernels as the GB10 where the choice is
   about the instructions (the hyper-connection mixer, GLM's MLA prompt kernel, programmatic
   dependent launch). Choices tuned to the GB10's memory (unified LPDDR5X) stay GB10-only.
+- `--q8-group` is opt-in on an RTX 50 for now (unmeasured there).
 - If `--nvfp4-a4` is set and the binary has no FP4 code for the GPU, the load log says so and the
   NVFP4 matmuls stay W4A16.
 
 ```sh
 CMAKE_CUDA_ARCHITECTURES=120 cargo build --release --features cuda
-# RTX 50 and GB10 in one binary:
+# RTX 50 and GB10 code in one binary (one host architecture):
 CMAKE_CUDA_ARCHITECTURES="120;121" cargo build --release --features cuda
 ```
 
