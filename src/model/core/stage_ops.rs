@@ -103,6 +103,27 @@ pub(crate) const PURE: &[&str] = &[
     "cluster_argmax",
 ];
 
+/// Pure ops captured in small steps only ([`crate::ggml::stage_graph::small_step`]: decode,
+/// verify and draft passes): the W4A4 NVFP4 ops (`super::super::nvfp4_a4`, #1202). Each one
+/// quantizes the activations into the node's own scratch, plans the experts on the device (as
+/// `nvfp4_mm_id`), then runs the GEMM, matvec or combine, the kernels and tiles picked by the
+/// shapes, the weights' alignment and settings fixed at startup; the TMA tile's tensor maps
+/// are encoded on the host from the node's pointers and passed as kernel parameters. They take
+/// batches over 64 tokens under `--nvfp4-a4 prefill` (a 16-user verify step) and from 9 under
+/// `experts-decode`; left out, each one cut such a step's capture in two. A prompt step keeps
+/// them between its captures: its graph seldom runs twice, and a capture of it whole would
+/// hold its first kernel back until the whole step is recorded. Their launchers must stay
+/// free of host waits and allocations (see `nvfp4_a4.cu`).
+pub(crate) const SMALL: &[&str] = &[
+    "nvfp4_a4_mm",
+    "nvfp4_a4_mm_multi",
+    "nvfp4_a4_mm_id",
+    "nvfp4_a4_mm_id_weighted",
+    "nvfp4_a4_swiglu",
+    "nvfp4_a4_swiglu_id",
+    "nvfp4_a4_quant",
+];
+
 /// Pure ops captured only while [`set_commit_capture`] is on: a verify commit's conv window
 /// copy (`legion_spec_window_launch`, one kernel picked by the node's shape). Left out, it runs
 /// between captures, and since a commit graph alternates it with single `gdn` launches, no
@@ -127,6 +148,16 @@ pub fn capture_safe(op: &ExternalOp, node: &ffi::ggml_tensor) -> bool {
         // SAFETY: the node of an expert matvec op, which only its builders make.
         "expert_mv" | "expert_mv_glu" => unsafe { super::expert_mv::capture_safe(node) },
         name if COMMIT.contains(&name) => COMMIT_CAPTURE.load(Ordering::Relaxed),
-        name => PURE.contains(&name),
+        name => listed(name, crate::ggml::stage_graph::small_step()),
+    }
+}
+
+/// Whether a capture may hold an op `name` of [`PURE`] or [`SMALL`], in a small step (`small`)
+/// or a prompt step.
+fn listed(name: &str, small: bool) -> bool {
+    if SMALL.contains(&name) {
+        small
+    } else {
+        PURE.contains(&name)
     }
 }

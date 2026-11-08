@@ -214,6 +214,11 @@ impl Linear {
         self.nvfp4_a4 = a;
     }
 
+    /// Which NVFP4 matmuls take 4-bit activations.
+    pub fn nvfp4_a4(&self) -> Nvfp4A4 {
+        self.nvfp4_a4
+    }
+
     /// Whether [`Nvfp4A4`] gives a batch of `n` tokens 4-bit activations (`grouped`: routed
     /// experts).
     fn a4_batch(&self, n: i64, grouped: bool) -> bool {

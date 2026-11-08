@@ -1790,6 +1790,26 @@ impl Model {
     /// use it.
     pub fn set_nvfp4_a4(&mut self, a: Nvfp4A4) {
         self.linear.set_nvfp4_a4(a);
+        self.probe_nvfp4_a4();
+    }
+
+    /// With W4A4 on, runs the FP4 probe (a kernel and a copy on the default stream) now, at
+    /// load, on every GPU holding a weight the W4A4 ops could take (as `linear` asks, per
+    /// device), rather than at the first W4A4 graph's build, which may come between stage-graph
+    /// captures (#1202). Called again by [`Self::load_mtp`] for a head loaded afterwards.
+    pub(super) fn probe_nvfp4_a4(&self) {
+        if self.linear.nvfp4_a4() == Nvfp4A4::Off {
+            return;
+        }
+        // Each NVFP4 weight's own GPU is probed (cached per device), whatever GPU is current,
+        // without changing which kernels any weight routes to.
+        let mtp = self.mtp.iter().flat_map(|w| w.tensors());
+        for w in self.weights.tensors().chain(mtp) {
+            if w.ty() == crate::ggml::types::NVFP4 && !w.is_host() {
+                use crate::model::nvfp4_a4::{device_supported, supported_on};
+                w.cuda_device().map_or_else(device_supported, supported_on);
+            }
+        }
     }
 
     /// Replaces every NVFP4 weight with an exact BF16 copy in buffers of `buft` (each E2M1 code

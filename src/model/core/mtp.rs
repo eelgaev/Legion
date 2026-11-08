@@ -80,6 +80,8 @@ impl Model {
                 gguf.architecture().unwrap_or_default()
             )));
         }
+        // A head loaded after `set_nvfp4_a4` may sit on a GPU no other weight probed.
+        self.probe_nvfp4_a4();
         Ok(())
     }
 

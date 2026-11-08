@@ -709,6 +709,10 @@ pub(in crate::ggml) unsafe fn precapture(
     if super::cache_sets() == 0 || !super::EARLY.load(Ordering::Relaxed) {
         return false;
     }
+    // Planned under the step mark as it is now ([`super::small_step`]): the graph built ahead
+    // is the running step's shape a few positions on, so its first run gets the same mark (a
+    // verify step with a sequence over the decode limit counts as a prompt step, and keeps the
+    // ops a capture holds in small steps only between its pieces, as on main).
     // SAFETY: the caller's; node indices in range, sources live or null.
     unsafe {
         cuda::legion_cuda_set_device(raw);
