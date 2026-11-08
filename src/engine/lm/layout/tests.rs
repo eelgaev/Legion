@@ -43,3 +43,34 @@ fn split_ranges() {
     assert!(ranges(8, &[5, 5]).is_err());
     assert!(ranges(8, &[8]).is_err());
 }
+
+#[test]
+fn glm_mtp_bf16_experts_stay_on_the_device() {
+    use crate::ggml::types;
+    let t = |name: &str, ty| TensorInfo {
+        name: name.into(),
+        ggml_type: ty,
+        shape: vec![8, 4, 2],
+        file_index: 0,
+        offset: 0,
+        size: 128,
+    };
+    let tensors = [
+        t("blk.44.ffn_up_exps.weight", types::NVFP4),
+        t("blk.45.ffn_up_exps.weight", types::BF16),
+        t("blk.45.ffn_gate_exps.weight", types::BF16),
+        t("blk.45.ffn_down_exps.weight", types::BF16),
+        t("blk.45.ffn_down_shexp.weight", types::BF16),
+        t("blk.45.attn_q_a.weight", types::BF16),
+        // A quantized MTP block (a GGUF's) runs on the expert tier as before.
+        t("blk.46.ffn_up_exps.weight", types::Q4_K),
+    ];
+    assert_eq!(
+        mtp_bf16_experts(&tensors, 45),
+        [
+            "blk.45.ffn_up_exps.weight",
+            "blk.45.ffn_gate_exps.weight",
+            "blk.45.ffn_down_exps.weight"
+        ]
+    );
+}

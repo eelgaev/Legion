@@ -100,6 +100,7 @@ fn layout(ranges: &[Range<usize>], mode: ExpertMode) -> Layout {
         head_copy: false,
         node: None,
         glm_par: false,
+        device_exps: Vec::new(),
     }
 }
 

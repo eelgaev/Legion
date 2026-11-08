@@ -14,7 +14,11 @@
 //! ModelOpt NVFP4 weights (the routed experts, and the dense MLPs of the leading layers) are
 //! repacked as for Nemotron-H: the experts stacked with their per-expert scales
 //! ([`super::nemotron_h::stack_nvfp4`]), the dense MLPs as single NVFP4 matrices with their
-//! scale ([`Builder::quantized`]). The MTP block and the vision tower are not loaded.
+//! scale ([`Builder::quantized`]).
+//!
+//! The MTP block (`num_nextn_predict_layers`, the checkpoint's layer `num_hidden_layers`) is
+//! block `n_layer` of the GGUF, as the converter writes GLM's NextN layer ([`mtp_block`]): the
+//! loader leaves it out unless `--spec mtp` drafts with it. The vision tower is not loaded.
 
 use serde_json::Value as Json;
 
@@ -75,15 +79,21 @@ pub(super) fn build(b: &mut Builder, config: &Json) -> Result<(), String> {
     } else {
         "model."
     };
+    let nextn = nextn_layers(
+        tc,
+        b.has(&format!("{prefix}layers.{n_layer}.eh_proj.weight")),
+    );
+    let n_all = n_layer + nextn;
 
-    // Metadata: what llama.cpp's converter writes (the MTP block left out).
+    // Metadata: what llama.cpp's converter writes (the MTP block's layer in the per-layer
+    // arrays: a DSA layer).
     let u = |v: u64| Value::U32(v as u32);
     let f = |v: f64| Value::F32(v as f32);
     let k = |s: &str| format!("{ARCH}.{s}");
     let limit = num_f(tc, "swiglu_limit")?;
-    let per_layer = |v: f64| Value::Array((0..n_layer).map(|_| f(v)).collect());
+    let per_layer = |v: f64| Value::Array((0..n_all).map(|_| f(v)).collect());
     b.set("general.architecture", Value::String(ARCH.into()))?;
-    b.set(&k("block_count"), u(n_layer))?;
+    b.set(&k("block_count"), u(n_all))?;
     b.set(
         &k("context_length"),
         u(num_u(tc, "max_position_embeddings")?),
@@ -115,7 +125,13 @@ pub(super) fn build(b: &mut Builder, config: &Json) -> Result<(), String> {
     b.set(&k("vocab_size"), u(vocab_size))?;
     b.set(
         &k("attention.head_count_kv"),
-        Value::Array(mla.iter().map(|&m| Value::I32(m as i32)).collect()),
+        Value::Array(
+            mla.iter()
+                .copied()
+                .chain((0..nextn).map(|_| true))
+                .map(|m| Value::I32(m as i32))
+                .collect(),
+        ),
     )?;
     b.set(&k("attention.q_lora_rank"), u(num_u(tc, "q_lora_rank")?))?;
     b.set(&k("attention.kv_lora_rank"), u(kv_lora))?;
@@ -190,7 +206,7 @@ pub(super) fn build(b: &mut Builder, config: &Json) -> Result<(), String> {
     )?;
     b.set(&k("swiglu_clamp_exp"), per_layer(limit))?;
     b.set(&k("swiglu_clamp_shexp"), per_layer(limit))?;
-    b.set(&k("nextn_predict_layers"), u(0))?;
+    b.set(&k("nextn_predict_layers"), u(nextn))?;
 
     let dir = b.ckpt.dir().to_path_buf();
     super::vocab::gpt2(b, &dir, config, vocab_size, "glm4")?;
@@ -201,10 +217,6 @@ pub(super) fn build(b: &mut Builder, config: &Json) -> Result<(), String> {
     }
 
     // Tensors.
-    let widen = |b: &mut Builder, name: &str, src: &str| -> Result<(), String> {
-        let (_, t) = b.source(src)?;
-        b.computed_f32(name, src, super::ggml_shape(&t.shape), |x| x)
-    };
     b.direct(
         "token_embd.weight",
         &format!("{prefix}embed_tokens.weight"),
@@ -262,6 +274,77 @@ pub(super) fn build(b: &mut Builder, config: &Json) -> Result<(), String> {
         } else {
             moe(b, &s, &d, n_embd, n_expert, ff_exp)?;
         }
+    }
+    if nextn > 0 {
+        let dims = MtpDims {
+            n_embd,
+            n_head,
+            n_expert,
+            ff: ff_exp,
+            kv_lora,
+            k_dim: k_nope + k_rope,
+            v_dim,
+        };
+        mtp_block(b, prefix, n_layer, &dims)?;
+    }
+    Ok(())
+}
+
+/// The MTP blocks the GGUF holds: the checkpoint's `num_nextn_predict_layers` when its first
+/// MTP layer is there (`present`), at most one (the head drafts with block `n_layer` only).
+pub(super) fn nextn_layers(tc: &Json, present: bool) -> u64 {
+    let n = tc
+        .get("num_nextn_predict_layers")
+        .and_then(Json::as_u64)
+        .unwrap_or(0);
+    if present { n.min(1) } else { 0 }
+}
+
+/// `src` (a norm or bias) widened to F32 under `name`.
+fn widen(b: &mut Builder, name: &str, src: &str) -> Result<(), String> {
+    let (_, t) = b.source(src)?;
+    b.computed_f32(name, src, super::ggml_shape(&t.shape), |x| x)
+}
+
+/// The dimensions of the MTP block's attention and MoE.
+pub(super) struct MtpDims {
+    pub n_embd: u64,
+    pub n_head: u64,
+    pub n_expert: u64,
+    pub ff: u64,
+    pub kv_lora: u64,
+    pub k_dim: u64,
+    pub v_dim: u64,
+}
+
+/// The MTP block, the checkpoint's layer `il` (right after the decoder's), as block `il` of the
+/// GGUF the way llama.cpp's converter writes GLM's NextN layer: a DSA layer and a routed-expert
+/// MoE with its shared expert like the decoder's, without hyper-connections (no `hc_*`), plus
+/// `nextn.eh_proj` (BF16) and the `nextn.enorm` / `nextn.hnorm` / `nextn.shared_head_norm` norms
+/// (F32). Its embedding and output head are the model's: the checkpoint ships none of its own.
+/// As shipped: the block is BF16 in the NVFP4 release, its 288 routed experts too.
+pub(super) fn mtp_block(b: &mut Builder, prefix: &str, il: u64, m: &MtpDims) -> Result<(), String> {
+    let src = format!("{prefix}layers.{il}.");
+    let blk = format!("blk.{il}.");
+    let s = |t: &str| format!("{src}{t}");
+    let d = |t: &str| format!("{blk}{t}");
+    widen(b, &d("attn_norm.weight"), &s("input_layernorm.weight"))?;
+    widen(
+        b,
+        &d("ffn_norm.weight"),
+        &s("post_attention_layernorm.weight"),
+    )?;
+    let a = |t: &str| s(&format!("self_attn.{t}"));
+    mla_attention(b, &a, &d, m.n_head, m.kv_lora, m.k_dim, m.v_dim)?;
+    b.direct(&d("attn_output.weight"), &a("o_proj.weight"), None)?;
+    moe(b, &s, &d, m.n_embd, m.n_expert, m.ff)?;
+    b.direct(&d("nextn.eh_proj.weight"), &s("eh_proj.weight"), None)?;
+    for (g, h) in [
+        ("nextn.enorm.weight", "enorm.weight"),
+        ("nextn.hnorm.weight", "hnorm.weight"),
+        ("nextn.shared_head_norm.weight", "shared_head.norm.weight"),
+    ] {
+        widen(b, &d(g), &s(h))?;
     }
     Ok(())
 }
@@ -453,3 +536,6 @@ fn moe(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

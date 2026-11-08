@@ -42,6 +42,10 @@ pub(super) struct Layout {
     /// `--glm-parallel-decode` took: GLM over several GPUs, its experts in one arena split by
     /// the owning GPU's node, cached on the GPUs.
     pub glm_par: bool,
+    /// Routed-expert stacks in device memory whatever the mode: GLM-5.3-Flash's BF16 MTP
+    /// experts when the head drafts (#560), which the expert tier does not run. On an
+    /// integrated GPU that is the memory a host arena would take, without a cache copy.
+    pub device_exps: Vec<String>,
 }
 
 /// The tied head's device copy for a multi-stage layout: `(name, source)` for the loader
@@ -51,6 +55,20 @@ pub const HEAD_COPY: (&str, &str) = ("output.weight", "token_embd.weight");
 /// Tensors outside the layers that layers of any stage read: in memory every GPU reads when
 /// there are several stages.
 const SHARED: &[&str] = &["token_embd.weight", "rope_freqs.weight"];
+
+/// The BF16 routed-expert stacks of the blocks past the decoder's `n_layer` (GLM-5.3-Flash's
+/// MTP block as the NVFP4 release ships it, #560).
+pub(super) fn mtp_bf16_experts(tensors: &[TensorInfo], n_layer: usize) -> Vec<String> {
+    tensors
+        .iter()
+        .filter(|t| {
+            t.ggml_type == crate::ggml::types::BF16
+                && t.name.contains("_exps.")
+                && layer_of(&t.name).is_some_and(|il| il >= n_layer)
+        })
+        .map(|t| t.name.clone())
+        .collect()
+}
 
 /// The layer index of a tensor name (`blk.<il>.`), if it belongs to a layer.
 fn layer_of(name: &str) -> Option<usize> {
@@ -250,6 +268,14 @@ impl Layout {
             }
         }
         let host_exps = gpu && mode != ExpertMode::Device;
+        let device_exps = if host_exps
+            && super::drafts_with_mtp_head(&cfg.spec)
+            && crate::model::glm5next::params(&hp).is_some()
+        {
+            mtp_bf16_experts(&tensors, hp.n_layer)
+        } else {
+            Vec::new()
+        };
 
         // The layer split: given, or balanced by the bytes each layer puts on its device. With
         // host experts a layer's routed experts count too: a prompt step stages and multiplies
@@ -306,6 +332,7 @@ impl Layout {
             head_copy: head_copy.is_some(),
             node: node.clone(),
             glm_par: split.is_some() && mode == ExpertMode::Cache,
+            device_exps,
         };
         // Every device's weights must fit.
         for (i, (d, _)) in me.stages.iter().enumerate() {
@@ -433,6 +460,7 @@ impl Layout {
             head_copy: false,
             node: None,
             glm_par: false,
+            device_exps: Vec::new(),
         })
     }
 
@@ -473,6 +501,10 @@ impl Layout {
         // GLM's parallel decode: a GPU's own shard or mirror of a weight goes to that GPU.
         if let Some(d) = crate::model::glm5next::par::copy_device(name) {
             return Some(d.min(self.stages.len() - 1));
+        }
+        // The MTP head runs on the last stage.
+        if self.device_exps.iter().any(|n| n == name) {
+            return Some(self.stages.len() - 1);
         }
         let gpu = self.stages[0].0.is_some();
         let host_exps = gpu && self.mode != ExpertMode::Device;
