@@ -62,6 +62,8 @@ static SSD_PIECE_MEASURED: AtomicUsize = AtomicUsize::new(0);
 const SSD_TAIL_TENSORS: usize = 512;
 /// A step was too big for its graph to chunk (logged once).
 static SSD_CHUNK_NO_ROOM: AtomicBool = AtomicBool::new(false);
+/// Bit `k`: a step went through the slots in `k` pieces (logged once per count).
+static SSD_CHUNK_SEEN: AtomicU32 = AtomicU32::new(0);
 
 /// The GLM-5.3-Flash hyperparameters beyond [`Hparams`].
 #[derive(Debug, Clone, PartialEq)]
@@ -1081,6 +1083,13 @@ impl Model {
                 fits
             });
             if let Some(k) = chunks {
+                let bit = 1u32 << k.min(31);
+                if SSD_CHUNK_SEEN.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+                    tracing::info!(
+                        "SSD expert tier: a step of {n_step} tokens goes through the slots in {k} \
+                         pieces (layer {il})"
+                    );
+                }
                 let before = ctx.tensors_left();
                 // A decode or verify step of more pairs than slots (#1205): pieces of rows, each
                 // its experts in slots and its matmuls, one after the other (each fetch after the
