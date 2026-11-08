@@ -227,13 +227,19 @@ pub fn supports(w: Tensor<'_>) -> bool {
         && k % 64 == 0
         && w3 == 1
         && w.nb()[1] as i64 == k / 64 * BLOCK_BYTES
-        && (w.is_host() || device_supported())
+        && (w.is_host() || w.cuda_device().map_or_else(device_supported, supported_on))
 }
 
 /// Whether this process's GPU runs the kernels on device-resident weights (BF16 tensor cores,
 /// sm_80+; probed on the current device): [`supports`] is false for them elsewhere.
 pub fn device_supported() -> bool {
     crate::model::fp8::bf16_mma()
+}
+
+/// Whether CUDA device `dev` has BF16 tensor cores (sm_80+), asked of that device rather than
+/// the current one (one box can hold GPUs of different architectures, #1201).
+pub fn supported_on(dev: usize) -> bool {
+    crate::hw::per_device::compute_capability(dev).is_some_and(|cc| cc >= 80)
 }
 
 /// `x` (F32 or BF16) as contiguous BF16, the kernels' input (one cast shared by the matmuls of
