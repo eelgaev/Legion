@@ -952,6 +952,11 @@ pub struct LmConfig {
     /// until none arrived for this long, admits them in a fixed order, and holds later ones
     /// until it is idle again. `None`: admit requests as they arrive.
     pub deterministic_gather: Option<std::time::Duration>,
+    /// `--admit-gather-ms`: an idle engine that gets a request first takes what else arrives
+    /// until none has for this long ([`waves::gather`]), then admits them all in arrival
+    /// order, so a burst of requests starts its prompts in one step. Nothing is held while
+    /// requests run. `None`: admit requests as they arrive.
+    pub admit_gather: Option<std::time::Duration>,
     /// `--prefix-capture-cut` (debug): spaced save points end their prompt chunk even where
     /// the step could save the state inside it ([`Executor::can_capture_states`]), as before
     /// in-step saves; for exactness comparisons.
@@ -1324,6 +1329,7 @@ impl LmConfig {
             ring_checkpoint_span: RING_CHECKPOINT_SPAN,
             ring_checkpoint_log: false,
             deterministic_gather: None,
+            admit_gather: None,
             prefix_capture_cut: false,
             prefix_state_digests: false,
             max_waiting: 1024,
@@ -5390,6 +5396,7 @@ impl LmEngine {
             saved: SavedStates::new(saved_slots),
             prefix_interval: cfg.prefix_cache_interval,
             gather: cfg.deterministic_gather,
+            admit_gather: cfg.admit_gather,
             capture_cut: cfg.prefix_capture_cut,
             state_digests: cfg.prefix_state_digests,
             end_saves: saved_slots > 0 && ring.is_none() && slot_blocks == 0 && hp.has_slot_state(),
@@ -5726,6 +5733,8 @@ struct Worker {
     prefix_interval: usize,
     /// [`LmConfig::deterministic_gather`].
     gather: Option<std::time::Duration>,
+    /// [`LmConfig::admit_gather`].
+    admit_gather: Option<std::time::Duration>,
     /// [`LmConfig::prefix_capture_cut`].
     capture_cut: bool,
     /// [`LmConfig::prefix_state_digests`].
@@ -6047,6 +6056,15 @@ impl Worker {
                             // ([`first_rows`]).
                             self.prefetch_first(&job.prompt);
                             queue(&mut waiting, job);
+                            // `--admit-gather-ms`: the rest of a burst, admitted with it.
+                            if let Some(quiet) = self.admit_gather {
+                                let mut more = Vec::new();
+                                open &= waves::gather(&rx, quiet, &mut more);
+                                for job in more {
+                                    self.prefetch_first(&job.prompt);
+                                    queue(&mut waiting, job);
+                                }
+                            }
                         }
                         Err(_) => break,
                     }

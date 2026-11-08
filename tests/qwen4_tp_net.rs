@@ -281,6 +281,8 @@ async fn two_ranks_split_the_tokens_in_micro_batches() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("q4.gguf");
     tiny::write_tp(&path, None, 11).unwrap();
+    // The tiny prompt steps' micro-batches are a few tokens (#1176 leaves short steps whole).
+    legion::tp_net::micro::set_min_cols(1);
     for overlap in [Overlap::Mixers, Overlap::Ffn] {
         for wire in [Wire::F32, Wire::Bf16] {
             two_ranks_match_one_with(&path, SpecConfig::default(), wire, 4, false, overlap).await;

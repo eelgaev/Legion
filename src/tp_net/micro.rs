@@ -63,6 +63,31 @@ pub fn overlap(comm: i32) -> Overlap {
     super::comm(comm).map_or(Overlap::Off, |c| c.overlap())
 }
 
+/// Micro-batches of fewer columns than this leave a step whole ([`worth`]). On a GPU a
+/// micro-batch's matmuls may split K differently from the whole share's, and below about this
+/// size they did (#1176: a 1,536-token prompt's greedy text moved, a 4,096-token one's did
+/// not); such steps also have little wire time to hide.
+pub const MIN_COLS: usize = 1024;
+
+/// [`MIN_COLS`], or what [`set_min_cols`] set.
+static MIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(MIN_COLS);
+
+/// Sets the smallest micro-batch [`worth`] takes (tests: a tiny model's steps are short).
+#[doc(hidden)]
+pub fn set_min_cols(cols: usize) {
+    MIN.store(cols, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a step of `n` columns over `ranks` ranks runs in micro-batches under
+/// `--tp-overlap`: every rank's every micro-batch has at least [`MIN_COLS`] columns. The
+/// same answer on every rank.
+pub fn worth(n: usize, ranks: usize) -> bool {
+    let min = MIN.load(std::sync::atomic::Ordering::Relaxed);
+    (0..ranks)
+        .flat_map(|r| (0..MICRO).map(move |j| piece(n, r, ranks, j, false).1))
+        .all(|m| m >= min)
+}
+
 /// A micro-batch exchange node's parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Params {

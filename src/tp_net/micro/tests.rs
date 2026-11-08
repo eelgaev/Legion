@@ -49,3 +49,20 @@ fn params_round_trip() {
     };
     assert_eq!(p.list(), [3, 1, 4096, 1, 1]);
 }
+
+/// `--tp-overlap` splits only steps whose every micro-batch has at least `MIN_COLS` columns
+/// (#1176): a 1,536-token step stays whole, 4,096 and up split.
+#[test]
+fn short_steps_stay_whole() {
+    assert_eq!(MIN_COLS, 1024);
+    for (n, ranks, split) in [
+        (1536, 2, false),
+        (4095, 2, false),
+        (4096, 2, true),
+        (4608, 2, true),
+        (8192, 4, true),
+        (8191, 4, false),
+    ] {
+        assert_eq!(worth(n, ranks), split, "n {n} ranks {ranks}");
+    }
+}

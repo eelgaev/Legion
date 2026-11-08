@@ -754,10 +754,12 @@ pub(super) struct ModelArgs {
     /// tokens each): while one half's reduce-scatter or all-gather is on the wire the GPU runs
     /// the other half's work. off (default): one exchange at a time, the GPU waiting for each.
     /// mixers: the hyper-connection mixers run per half; ffn: the MoE too (each half reads the
-    /// expert weights again). Needs twice the pinned exchange buffers. Every rank must pass the
-    /// same value. Experimental: on a GPU the halves' matmuls split K differently from the
-    /// whole share's (MMQ stream-k), so long prompts' greedy output differs from off, and on
-    /// two DGX Sparks it was not faster (mixers: 4096-token step 1,646 -> 1,833 ms; ffn: 1,661).
+    /// expert weights again). Steps with a half under 1,024 tokens on any rank run whole. Needs
+    /// twice the pinned exchange buffers. Every rank must pass the same value. On a GPU smaller
+    /// halves' matmuls split K differently from the whole share's (MMQ stream-k) and moved long
+    /// prompts' greedy output; with the 1,024-token floor, greedy text at 1,536 and 4,096 prompt
+    /// tokens matched off on two DGX Sparks (Qwen3.8-Flash-Next NVFP4, mixers: prefill 8K /
+    /// 32K / 123K 2,872 / 3,013 / 2,825 -> 2,966 / 3,022 / 2,859 tok/s). Experimental.
     #[arg(long, value_name = "WHAT", value_enum, default_value_t = legion::tp_net::Overlap::Off)]
     pub tp_overlap: legion::tp_net::Overlap,
     /// With --tp-moe-ep: which rank holds each routed expert, per layer, from a JSON file
@@ -1474,6 +1476,22 @@ struct EngineArgs {
         requires = "deterministic"
     )]
     deterministic_gather_ms: u64,
+    /// An idle server that gets a request first waits until no other request has arrived for
+    /// this many milliseconds (at most 20 times as long), then admits them all in arrival
+    /// order, so requests sent together (a burst of users) start their prompts in the same
+    /// step instead of the first one alone and the rest a step later (up to --prefill-slots
+    /// per step). Unlike --deterministic it never holds a request that arrives while others
+    /// run. Costs each burst's first request up to that long; batches change, so with several
+    /// users greedy text can differ. Two DGX Sparks (Qwen3.8-Flash-Next NVFP4 TP, 5 ms): 16
+    /// users 231.5 / 234.0 -> 233.0 / 236.7 tok/s, 4 users 110.0 / 111.7 -> 111.5 / 113.9.
+    /// 0 (default): admit requests as they arrive.
+    #[arg(
+        long,
+        value_name = "MS",
+        default_value_t = 0,
+        conflicts_with = "deterministic"
+    )]
+    admit_gather_ms: u64,
     /// Model engine: speculative decoding; the drafter that proposes tokens for the model to
     /// verify in one step.
     #[arg(long, value_enum, default_value_t = SpecArg::None)]
@@ -1575,6 +1593,11 @@ impl EngineArgs {
     fn deterministic_gather(&self) -> Option<std::time::Duration> {
         (self.deterministic && self.deterministic_gather_ms > 0)
             .then(|| std::time::Duration::from_millis(self.deterministic_gather_ms))
+    }
+
+    /// `--admit-gather-ms`: the idle burst window, `None` at 0.
+    fn admit_gather(&self) -> Option<std::time::Duration> {
+        (self.admit_gather_ms > 0).then(|| std::time::Duration::from_millis(self.admit_gather_ms))
     }
 
     /// The expert cache's settings: the model's flags', plus `--deterministic` (with GLM's pair
@@ -1991,6 +2014,7 @@ pub async fn run(
             e.check_deterministic(&switches)?;
             let prefix_cache_states = e.prefix_cache_states();
             let deterministic_gather = e.deterministic_gather();
+            let admit_gather = e.admit_gather();
             if e.deterministic {
                 tracing::info!(
                     gather_ms = e.deterministic_gather_ms,
@@ -2066,6 +2090,7 @@ pub async fn run(
                 ring_checkpoint_span: e.ring_checkpoint_span,
                 ring_checkpoint_log: e.ring_checkpoint_log,
                 deterministic_gather,
+                admit_gather,
                 prefix_capture_cut: e.prefix_capture_cut,
                 prefix_state_digests: e.prefix_state_digests,
                 max_waiting: e.max_waiting,
