@@ -1071,7 +1071,20 @@ impl Model {
         if let Some(ssd) = self.ssd_experts().filter(|s| s.has_layer(il)) {
             let piece = SSD_PIECE_MEASURED.load(Ordering::Relaxed);
             let piece = if piece == 0 { SSD_PIECE_TENSORS } else { piece };
-            let chunks = ssd.pieces(n_step as usize, decoding);
+            // A piece (at most a pair per slot) always takes the grouped mv kernels; chunk only
+            // the steps whose staged matmuls take them too (a 4-bit step of more tokens than
+            // the mv kernel takes, or one past --nvfp4-expert-mv-max pairs per expert, is on
+            // the GEMM, other sums), so chunking keeps every step's bits.
+            let staged_mv = if self.linear.nvfp4_a4_batch(n_step, true) {
+                n_step <= crate::model::nvfp4_a4::MV_MAX_TOKENS
+            } else {
+                let pairs = hp.n_expert_used * n_step;
+                matches!(
+                    nvfp4_mm::pick_grouped(hp.n_embd, 0, pairs, hp.n_expert),
+                    nvfp4_mm::Kernel::Mv { .. }
+                )
+            };
+            let chunks = ssd.pieces(n_step as usize, decoding && staged_mv);
             let chunks = chunks.filter(|&k| {
                 let fits = k * piece <= room;
                 if !fits && !SSD_CHUNK_NO_ROOM.swap(true, Ordering::Relaxed) {
