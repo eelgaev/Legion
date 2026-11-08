@@ -96,9 +96,18 @@ impl std::fmt::Display for RamBudget {
         match *self {
             Self::Auto => f.write_str("auto"),
             Self::All => f.write_str("all"),
-            Self::Bytes(b) => write!(f, "{:.2} GiB", b as f64 / (1u64 << 30) as f64),
+            Self::Bytes(b) => f.write_str(&size(b)),
             Self::Percent(p) => write!(f, "{p}% of available memory"),
         }
+    }
+}
+
+/// `b` bytes for people: GiB from 1 GiB up, else MiB.
+fn size(b: u64) -> String {
+    if b >= 1 << 30 {
+        format!("{:.2} GiB", b as f64 / (1u64 << 30) as f64)
+    } else {
+        format!("{:.1} MiB", b as f64 / (1u64 << 20) as f64)
     }
 }
 
@@ -440,9 +449,9 @@ impl LookupTable {
             (_, Some(b)) => (
                 TableIo::Direct,
                 format!(
-                    "--ngram-ram {}: a {:.2} GiB RAM budget for the {:.1} GiB table",
+                    "--ngram-ram {}: a {} RAM budget for the {:.1} GiB table",
                     opts.ram,
-                    gib(b),
+                    size(b),
                     gib(file.bytes())
                 ),
             ),

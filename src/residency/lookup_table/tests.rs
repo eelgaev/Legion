@@ -560,6 +560,8 @@ fn parses_ram_budgets() {
     assert_eq!(RamBudget::Bytes(5).bytes(0), Some(5));
     assert_eq!(RamBudget::Auto.bytes(gib), None);
     assert_eq!(RamBudget::All.bytes(gib), None);
+    assert_eq!(RamBudget::Bytes(8 * gib).to_string(), "8.00 GiB");
+    assert_eq!(RamBudget::Bytes(16 << 20).to_string(), "16.0 MiB");
 }
 
 /// The tier `--ngram-io` and `--ngram-ram` pick together, and the pairs refused.
