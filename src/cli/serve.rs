@@ -637,8 +637,11 @@ pub(super) struct ModelArgs {
     /// HTTP API, rank 1 the layers from there on and the output head. Start rank 1 first;
     /// rank 0 connects to it (and waits up to 10 minutes for it). Only the residual stream
     /// and the steps' positions cross the link. Decode groups are in flight on both machines
-    /// (--pipeline-groups 2 unless given; 1 turns that off). Not with --tp, --spec, host
-    /// experts or a KV host tier. Off by default.
+    /// (--pipeline-groups 2 unless given; 1 turns that off). Speculative decoding: --spec mtp
+    /// only, the model's own MTP head, which runs on rank 1 (it loads the head and a copy of
+    /// the token embeddings, and the default split counts them); give both ranks the same
+    /// --spec flags. Not with --tp, other --spec modes, host experts or a KV host tier. Off
+    /// by default.
     #[arg(long, value_name = "RANK", value_parser = clap::value_parser!(u8).range(0..=1))]
     pub node_rank: Option<u8>,
     /// With --node-rank: rank 1's address, ip:port (e.g. a direct link's). Rank 1 listens

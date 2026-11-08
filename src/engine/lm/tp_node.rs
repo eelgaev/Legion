@@ -675,7 +675,10 @@ fn handle(
             exec.copy_states(&copies).map_err(|e| e.to_string())?;
             Reply::Done
         }
-        Request::Hello { .. } | Request::Step { .. } => {
+        Request::Hello { .. }
+        | Request::Step { .. }
+        | Request::Draft { .. }
+        | Request::DraftRelease { .. } => {
             return Err(
                 "a request of a model split by layers (--node-rank): this rank runs \
                         tensor parallelism over machines (--tp-rank)"
