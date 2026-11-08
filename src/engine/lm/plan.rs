@@ -114,6 +114,8 @@ pub(super) struct MemoryPlan {
     pub context: ContextPlan,
     pub gpus: Vec<GpuPlan>,
     pub host: HostPlan,
+    /// The GPUs whose expert slots the load shrank to the VRAM it found (#1208).
+    pub expert_shrunk: Vec<crate::residency::experts::Shrunk>,
 }
 
 /// Share `i` of `bytes` split evenly over `n` (the first ones take the remainder): a
@@ -233,6 +235,15 @@ pub(super) fn log(p: &MemoryPlan) {
             other_mib = mib(g.other()),
             free_mib = mib(g.free),
             "memory plan"
+        );
+    }
+    for s in &p.expert_shrunk {
+        tracing::warn!(
+            part = "expert cache",
+            planned_slots = s.planned,
+            "memory plan: expert cache: shrunk to {} slots on GPU {} to fit",
+            s.slots,
+            s.cuda
         );
     }
     let h = &p.host;

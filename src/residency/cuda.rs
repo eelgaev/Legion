@@ -44,6 +44,7 @@ mod sys {
     pub type cudaStream_t = *mut c_void;
     pub type cudaEvent_t = *mut c_void;
 
+    pub const CUDA_ERROR_OUT_OF_MEMORY: CUresult = 2;
     pub const CU_MEM_ALLOCATION_TYPE_PINNED: c_uint = 1;
     pub const CU_MEM_LOCATION_TYPE_DEVICE: c_uint = 1;
     pub const CU_MEM_LOCATION_TYPE_HOST: c_uint = 2;
@@ -1623,20 +1624,107 @@ pub fn tiered(
     n_slots: usize,
     keep: Option<usize>,
     name: &str,
-) -> Result<Context, GgmlError> {
-    let err = |msg: String| GgmlError::Alloc {
-        bytes: n_slots * host.nb()[2],
-        buffer: format!("tiered range on CUDA{device}: {msg}"),
+) -> Result<Context, TieredError> {
+    let err = |e: BufError| TieredError {
+        error: GgmlError::Alloc {
+            bytes: n_slots * host.nb()[2],
+            buffer: format!("tiered range on CUDA{device}: {}", e.msg),
+        },
+        no_vram: e.no_vram,
     };
-    let (buf, offset) = tiered_buffer(device, host, host.nb()[2], n_slots, keep).map_err(err)?;
+    let (buf, offset) =
+        tiered_buffer(device, host, host.nb()[2], n_slots, keep, true).map_err(err)?;
     let ne = host.ne();
     let ctx = Context::new(1, 0);
     let t = ctx
         .new_tensor(host.ty(), &[ne[0], ne[1], n_slots as i64 + ne[2]])
         .named(name);
     // SAFETY: the buffer is new and owned by ctx from here; the tensor fits from `offset`.
-    unsafe { ctx.adopt_buffer(t, buf, offset)? };
+    unsafe { ctx.adopt_buffer(t, buf, offset) }.map_err(|error| TieredError {
+        error,
+        no_vram: false,
+    })?;
     Ok(ctx)
+}
+
+/// Why [`tiered`] failed.
+#[derive(Debug)]
+pub struct TieredError {
+    pub error: GgmlError,
+    /// The slots' VRAM did not fit: `cuMemCreate` ran out of device memory (#1208: the expert
+    /// cache then shrinks to what fits). Any other failure is an error of the load.
+    pub no_vram: bool,
+}
+
+impl std::fmt::Display for TieredError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, f)
+    }
+}
+
+/// A [`tiered_buffer`] failure: the message, and whether a slot allocation ran out of VRAM.
+struct BufError {
+    msg: String,
+    no_vram: bool,
+}
+
+impl From<String> for BufError {
+    fn from(msg: String) -> Self {
+        Self {
+            msg,
+            no_vram: false,
+        }
+    }
+}
+
+impl From<&str> for BufError {
+    fn from(msg: &str) -> Self {
+        msg.to_string().into()
+    }
+}
+
+/// `cuMemCreate` of `bytes` of a tiered range's VRAM slots, out of device memory told apart.
+/// `hook`: the expert slots, which `LEGION_DEBUG_FAIL_CUMEMCREATE_AFTER` may fail.
+///
+/// # Safety
+/// As `cuMemCreate`: `h` receives the new handle.
+unsafe fn create_slots(
+    h: &mut CUmemGenericAllocationHandle,
+    bytes: usize,
+    prop: &CUmemAllocationProp,
+    what: &str,
+    hook: bool,
+) -> Result<(), BufError> {
+    let r = if hook && injected_no_vram() {
+        CUDA_ERROR_OUT_OF_MEMORY
+    } else {
+        // SAFETY: the caller's handle and a valid property struct.
+        unsafe { cuMemCreate(h, bytes, prop, 0) }
+    };
+    cu(r, what).map_err(|msg| BufError {
+        msg,
+        no_vram: r == CUDA_ERROR_OUT_OF_MEMORY,
+    })
+}
+
+/// Debug hook (docs/debug-env.md): `LEGION_DEBUG_FAIL_CUMEMCREATE_AFTER=<n>[,<count>]` makes
+/// the expert slots' `cuMemCreate` calls after the first `n` fail as out of memory, `count` of
+/// them in a row (1 if left out), to try the cache's shrink to fit (#1208).
+fn injected_no_vram() -> bool {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static FAIL: OnceLock<Option<(usize, usize)>> = OnceLock::new();
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let fail = FAIL.get_or_init(|| {
+        let v = std::env::var("LEGION_DEBUG_FAIL_CUMEMCREATE_AFTER").ok()?;
+        let (n, count) = v.split_once(',').unwrap_or((v.as_str(), "1"));
+        Some((n.trim().parse().ok()?, count.trim().parse().ok()?))
+    });
+    let Some((n, count)) = *fail else {
+        return false;
+    };
+    let call = CALLS.fetch_add(1, Ordering::Relaxed);
+    (n..n.saturating_add(count)).contains(&call)
 }
 
 /// [`tiered`] by rows: `n_rows` rows in VRAM, then the rows of the arena tensor `host` (2D
@@ -1653,7 +1741,8 @@ pub fn tiered_rows(
         bytes: n_rows * host.nb()[1],
         buffer: format!("tiered rows on CUDA{device}: {msg}"),
     };
-    let (buf, offset) = tiered_buffer(device, host, host.nb()[1], n_rows, None).map_err(err)?;
+    let (buf, offset) =
+        tiered_buffer(device, host, host.nb()[1], n_rows, None, false).map_err(|e| err(e.msg))?;
     // Written by the graphs (a cache), not weights.
     // SAFETY: a live buffer.
     unsafe {
@@ -1673,14 +1762,16 @@ pub fn tiered_rows(
 }
 
 /// A tiered buffer: `n_slots` slots of `slot_bytes` in VRAM right before the arena tensor
-/// `host`'s bytes; with the offset of the slots in it. `keep`: see [`tiered`].
+/// `host`'s bytes; with the offset of the slots in it. `keep`: see [`tiered`]. `hook`: expert
+/// slots ([`create_slots`]).
 fn tiered_buffer(
     device: usize,
     host: Tensor<'_>,
     slot_bytes: usize,
     n_slots: usize,
     keep: Option<usize>,
-) -> Result<(NonNull<ffi::ggml_backend_buffer>, usize), String> {
+    hook: bool,
+) -> Result<(NonNull<ffi::ggml_backend_buffer>, usize), BufError> {
     // SAFETY: reading the fields of a live tensor and of its buffer.
     let (arena_buf, data, view) = unsafe {
         let t = host.raw();
@@ -1748,21 +1839,15 @@ fn tiered_buffer(
             cuMemAddressReserve(&mut b.va, total, at.gran, 0, 0),
             "cuMemAddressReserve",
         )?;
-        let mut done = || -> Result<(), String> {
+        let mut done = || -> Result<(), BufError> {
             let prop = alloc_prop(CU_MEM_LOCATION_TYPE_DEVICE, device as i32);
             if split > 0 {
-                cu(
-                    cuMemCreate(&mut b.vram, split, &prop, 0),
-                    "cuMemCreate(VRAM slots)",
-                )?;
+                create_slots(&mut b.vram, split, &prop, "cuMemCreate(VRAM slots)", hook)?;
                 cu(cuMemMap(b.va, split, 0, b.vram, 0), "cuMemMap(VRAM slots)")?;
             }
             if split < vram_bytes {
                 let n = vram_bytes - split;
-                cu(
-                    cuMemCreate(&mut b.tail, n, &prop, 0),
-                    "cuMemCreate(VRAM slot tail)",
-                )?;
+                create_slots(&mut b.tail, n, &prop, "cuMemCreate(VRAM slot tail)", hook)?;
                 cu(
                     cuMemMap(b.va + split as u64, n, 0, b.tail, 0),
                     "cuMemMap(VRAM slot tail)",
@@ -1777,7 +1862,8 @@ fn tiered_buffer(
                 at += p.size as u64;
             }
             let a = access(CU_MEM_LOCATION_TYPE_DEVICE, device as i32);
-            cu(cuMemSetAccess(b.va, total, &a, 1), "cuMemSetAccess(tiered)")
+            cu(cuMemSetAccess(b.va, total, &a, 1), "cuMemSetAccess(tiered)")?;
+            Ok(())
         };
         if let Err(e) = done() {
             b.release();

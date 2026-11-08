@@ -700,3 +700,83 @@ fn layers_left_for_takes_the_last_candidates_until_the_need() {
     );
     assert!(layers_left_for(&[], 5).is_empty());
 }
+
+/// The bytes of a slot plan.
+fn plan_bytes(plan: &[Vec<u32>], slot_bytes: &[u64]) -> u64 {
+    plan.iter()
+        .zip(slot_bytes)
+        .map(|(e, &b)| e.len() as u64 * b)
+        .sum()
+}
+
+#[test]
+fn shrunk_budget_takes_the_drift_or_a_doubling_step() {
+    const MIB: u64 = 1 << 20;
+    // Others took 300 MiB: that and a granule go, more than one slot.
+    assert_eq!(shrunk_budget(1000 * MIB, 300 * MIB, 6 * MIB, 0), 698 * MIB);
+    // Nothing measured: one slot of the failed layer, then 2, 4, ... of them.
+    assert_eq!(shrunk_budget(1000 * MIB, 0, 6 * MIB, 0), 994 * MIB);
+    assert_eq!(shrunk_budget(1000 * MIB, 0, 6 * MIB, 1), 988 * MIB);
+    assert_eq!(shrunk_budget(1000 * MIB, 0, 6 * MIB, 3), 952 * MIB);
+    // The step outgrows a small drift.
+    assert_eq!(shrunk_budget(1000 * MIB, MIB, 6 * MIB, 2), 976 * MIB);
+    // At least a granule, even for tiny slots.
+    assert_eq!(shrunk_budget(1000 * MIB, 0, 1024, 0), 998 * MIB);
+    // Never below 0, never overflowing, however many failures.
+    assert_eq!(shrunk_budget(1000 * MIB, 0, 6 * MIB, 20), 0);
+    assert_eq!(
+        shrunk_budget(1000 * MIB, u64::MAX, u64::MAX, MAX_FIT_TRIES),
+        0
+    );
+    assert_eq!(shrunk_budget(0, 0, 6 * MIB, 0), 0);
+}
+
+#[test]
+fn a_replan_after_drift_keeps_the_room_beside_the_cache() {
+    const MIB: u64 = 1 << 20;
+    // 4 layers of 64 experts, 6 MiB a slot; the plan saw 1100 MiB free and left 100 MiB beside
+    // a 1000 MiB cache. Another process then took 300 MiB.
+    let slot_bytes = [6 * MIB; 4];
+    let margin = 100 * MIB;
+    let free_now = 800 * MIB;
+    let before = allocate_slots(&[], &slot_bytes, 64, 1000 * MIB);
+    assert!(plan_bytes(&before, &slot_bytes) > free_now - margin);
+    let b = shrunk_budget(1000 * MIB, 300 * MIB, 6 * MIB, 0);
+    let after = allocate_slots(&[], &slot_bytes, 64, b);
+    let bytes = plan_bytes(&after, &slot_bytes);
+    assert!(bytes <= free_now - margin, "{} MiB", bytes / MIB);
+    // Within a slot per layer of what fits, every layer keeps a share, and each layer's
+    // experts are the first ones of the bigger plan.
+    assert!(bytes + 4 * 6 * MIB > free_now - margin);
+    for (a, b) in after.iter().zip(&before) {
+        assert!(!a.is_empty());
+        assert_eq!(&b[..a.len()], &a[..]);
+    }
+}
+
+#[test]
+fn repeated_failures_without_a_drift_shrink_in_a_few_tries() {
+    const MIB: u64 = 1 << 20;
+    // A hidden limit (a GB10's shared memory: the free figure says it fits): 900 MiB of slots
+    // fit, the plan asks 1000 MiB.
+    let slot_bytes = [6 * MIB; 4];
+    let limit = 900 * MIB;
+    let ranked: Vec<(usize, u32)> = (0..64).flat_map(|e| (0..4).map(move |l| (l, e))).collect();
+    let mut b = 1000 * MIB;
+    let mut plan = allocate_slots(&ranked, &slot_bytes, 64, b);
+    let mut failures = 0;
+    while plan_bytes(&plan, &slot_bytes) > limit {
+        b = shrunk_budget(b, 0, 6 * MIB, failures);
+        failures += 1;
+        plan = allocate_slots(&ranked, &slot_bytes, 64, b);
+    }
+    let bytes = plan_bytes(&plan, &slot_bytes);
+    assert!(failures <= 6, "{failures} tries");
+    // The cut is at most twice the shortfall, plus a step of slack.
+    let short = 1000 * MIB - limit;
+    assert!(
+        1000 * MIB - bytes <= 2 * short + 6 * MIB,
+        "{} MiB",
+        bytes / MIB
+    );
+}
