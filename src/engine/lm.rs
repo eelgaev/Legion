@@ -7429,6 +7429,7 @@ impl Worker {
                     c.record(verified, o.accepted);
                 }
                 step_spec.record(verified, o.accepted);
+                crate::dashboard::hub::record_spec(verified, o.accepted);
                 // The n-gram's drafts teach the n-gram's estimates, not the head's.
                 if !seq.ngram_verified(drafts.tokens.len(), o.accepted) {
                     seq.adaptive.record(drafts.tokens.len(), o.accepted);

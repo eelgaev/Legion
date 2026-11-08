@@ -1,8 +1,9 @@
 //! The engine thread's time per step by phase (#47): what the host does between the device's
 //! steps (admission, the step's plan, packing its inputs, sampling and streaming, bookkeeping)
 //! next to the step itself and the other device calls. Summed over a window and logged at
-//! debug level (`RUST_LOG=legion::engine::lm::host_time=debug`) as microseconds per step, a
-//! few `Instant::now` calls per step otherwise.
+//! debug level (`RUST_LOG=legion::engine::lm::host_time=debug`) as microseconds per step, and
+//! published per step to the dashboard while one is attached (#1198, [`crate::dashboard::hub`]).
+//! Neither: one relaxed atomic load per step.
 
 use std::time::{Duration, Instant};
 
@@ -54,18 +55,28 @@ pub(super) struct HostClock {
     /// Decoding sequences summed over the window's steps.
     seqs: u64,
     since: Instant,
-    /// Whether the summary is logged at all (debug level on): otherwise nothing is summed.
+    /// Whether anything is timed: [`Self::debug`] or [`Self::dash`].
     on: bool,
+    /// Whether the summary is logged (debug level on): otherwise the window sums nothing.
+    debug: bool,
+    /// Whether a dashboard is attached: each step's phases go to it.
+    dash: bool,
+    /// The current step's phases, for the dashboard.
+    cur: [Duration; PHASES],
 }
 
 impl Default for HostClock {
     fn default() -> Self {
+        let debug = tracing::enabled!(tracing::Level::DEBUG);
         Self {
             sums: [Duration::ZERO; PHASES],
             steps: 0,
             seqs: 0,
             since: Instant::now(),
-            on: tracing::enabled!(tracing::Level::DEBUG),
+            on: debug,
+            debug,
+            dash: false,
+            cur: [Duration::ZERO; PHASES],
         }
     }
 }
@@ -83,14 +94,30 @@ impl HostClock {
 
     /// Adds `d` to `phase`.
     pub(super) fn add(&mut self, phase: Phase, d: Duration) {
-        if self.on {
+        if self.debug {
             self.sums[phase as usize] += d;
+        }
+        if self.dash {
+            self.cur[phase as usize] += d;
         }
     }
 
     /// A step of `seqs` decoding sequences ended; logs the window's summary when it is due.
     pub(super) fn step(&mut self, seqs: usize) {
-        if !self.on {
+        if self.dash {
+            let mut ns = [0u64; PHASES];
+            for (n, d) in ns.iter_mut().zip(&self.cur) {
+                *n = d.as_nanos() as u64;
+            }
+            crate::dashboard::hub::add_step(&ns);
+            self.cur = [Duration::ZERO; PHASES];
+        }
+        let dash = crate::dashboard::hub::wanted();
+        if dash != self.dash {
+            self.dash = dash;
+            self.on = self.debug || dash;
+        }
+        if !self.debug {
             return;
         }
         self.steps += 1;
@@ -114,6 +141,8 @@ impl HostClock {
         );
         *self = Self {
             on: self.on,
+            debug: self.debug,
+            dash: self.dash,
             ..Self::default()
         };
     }

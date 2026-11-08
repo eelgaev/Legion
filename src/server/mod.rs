@@ -11,6 +11,7 @@ mod middleware;
 pub mod registry;
 mod response_format;
 mod routes;
+pub mod stats;
 mod tls;
 
 use std::net::SocketAddr;
@@ -29,6 +30,8 @@ pub struct AppState {
     pub config: Arc<ServerConfig>,
     in_flight: middleware::InFlight,
     metrics: Arc<metrics::Metrics>,
+    /// The live dashboard's data (`/v1/stats`, `serve --tui`; #1198).
+    pub stats: Arc<stats::StatsHub>,
 }
 
 impl AppState {
@@ -42,12 +45,16 @@ impl AppState {
             metrics.add_hw_counters(c.clone());
         }
         let metrics = Arc::new(metrics);
+        let stats = Arc::new(stats::StatsHub::new(config.hw_counters.clone()));
         Self {
             // Every route sees the engine through the metering wrapper.
-            engine: Arc::new(metrics::MeteredEngine::new(engine, metrics.clone())),
+            engine: Arc::new(
+                metrics::MeteredEngine::new(engine, metrics.clone()).with_stats(stats.clone()),
+            ),
             config: Arc::new(config),
             in_flight: Default::default(),
             metrics,
+            stats,
         }
     }
 

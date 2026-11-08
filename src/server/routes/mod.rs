@@ -6,6 +6,7 @@ pub mod messages;
 pub mod metrics;
 pub mod models;
 pub mod responses;
+pub mod stats;
 pub mod webui;
 
 use axum::Router;
@@ -31,7 +32,11 @@ pub fn router(state: &AppState) -> Router<AppState> {
             "/v1/messages/count_tokens",
             post(count_tokens::count_tokens),
         )
-        .route("/v1/responses", post(responses::responses));
+        .route("/v1/responses", post(responses::responses))
+        // The live dashboard (`legion top`, #1198).
+        .route("/v1/stats", get(stats::stats))
+        .route("/v1/stats/stream", get(stats::stats_stream))
+        .route("/v1/logs/stream", get(stats::logs_stream));
     // Optional route groups, mounted by config.
     if state.config.webui {
         router.merge(webui::router())

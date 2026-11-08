@@ -43,6 +43,9 @@ rust-embed = "8"
 prometheus-client = "0.25"
 clap_complete = "4"
 unicode-normalization = "0.1"
+# The live dashboard (`legion serve --tui`, `legion top`, #1198). MIT.
+ratatui = "0.29"
+crossterm = "0.28"
 
 [build-dependencies]
 bindgen = "0.72"

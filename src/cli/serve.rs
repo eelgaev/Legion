@@ -33,6 +33,7 @@ mod adaptive_settings;
 mod draft_settings;
 mod pipe_split;
 mod switches;
+mod tui;
 mod warmup;
 
 #[derive(clap::Args)]
@@ -1713,6 +1714,14 @@ struct ServerArgs {
     /// TERM=dumb); on forces it; never with --log-format json.
     #[arg(long, value_enum, default_value_t)]
     status_line: StatusLineChoice,
+    /// The live dashboard in this terminal: requests, throughput, link and memory gauges,
+    /// GPUs, speculative decoding, KV and expert caches, latency, and the logs, which go into
+    /// its log panel instead of stdout (and the status line is off). `q` closes it and the
+    /// server keeps running with plain logs; Ctrl-C stops the server. Without a terminal on
+    /// stdout it logs a warning and serves without it. `legion top` shows the same from
+    /// another terminal or machine.
+    #[arg(long)]
+    tui: bool,
     /// Sample the GPUs' hardware counters while serving and export them in /metrics as
     /// legion_gpu_* (NVML: NVLink data bytes over every link, PCIe throughput, memory and SM
     /// busy time), next to the analytic model bytes (legion_engine_model_*), for profiling
@@ -1920,6 +1929,12 @@ pub async fn run(
     }
     let server_config = args.server.config()?;
     let e = args.engine;
+    let tui = tui::usable(args.server.tui);
+    let max_seqs_arg = e.max_seqs as u32;
+    // The dashboard header's layout part (the model's load report), its path and drafter.
+    let mut dash_layout = legion::dashboard::snapshot::Header::default();
+    let mut dash_path: Option<String> = None;
+    let mut dash_spec: (&'static str, u32) = ("none", 0);
     let kind = e.engine.unwrap_or(if e.model.is_named() {
         EngineKind::Model
     } else {
@@ -1928,7 +1943,8 @@ pub async fn run(
     let terminal = statusline::stdout_is_terminal();
     let term = TermEnv::from_env();
     let json = log_format.is_json();
-    let live_status = args.server.status_line.live(terminal, term, json);
+    // The dashboard draws the status line's figures itself.
+    let live_status = !tui && args.server.status_line.live(terminal, term, json);
     let interactive = !json && color_choice.show_report(terminal);
     let color = !json && color_choice.use_color(terminal, term);
     let mut reported = false;
@@ -2157,11 +2173,14 @@ pub async fn run(
                 statusline::write_report(&report.render(color))?;
             }
             let max_seqs = cfg.max_seqs;
+            dash_path = Some(cfg.model_path.display().to_string());
+            dash_spec = (cfg.spec.kind.name(), cfg.spec.k as u32);
             let mut engines = if replicas > 1 {
                 tokio::task::spawn_blocking(move || load_replicas(cfg, replicas)).await??
             } else {
                 vec![pipe_split::load(cfg).await?]
             };
+            dash_layout = tui::layout(engines[0].load_report());
             if interactive {
                 let engine = &engines[0];
                 let model = engine
@@ -2234,6 +2253,18 @@ pub async fn run(
         .map(Duration::from_secs);
     let _status = statusline::start(engine.clone(), live_status, stats_interval);
     let state = AppState::with_config(engine, server_config);
+    state.stats.set_header(tui::finish(
+        dash_layout,
+        state
+            .engine
+            .models()
+            .first()
+            .map_or_else(|| "unknown".into(), |m| m.id.clone()),
+        dash_path.as_deref(),
+        max_seqs_arg,
+        dash_spec,
+        version::full().to_string(),
+    ));
     for m in state.engine.models() {
         if let Ok(d) = state.sampling_defaults(&m.id) {
             tracing::info!(model = %m.id, "sampling defaults: {}", d.describe());
@@ -2243,7 +2274,14 @@ pub async fn run(
         .await?
         .next()
         .ok_or_else(|| anyhow::anyhow!("cannot resolve {}", args.listen.host))?;
-    server::serve(addr, state).await
+    let dashboard = if tui { tui::start(&state) } else { None };
+    let served = server::serve(addr, state).await;
+    if let Some(d) = dashboard {
+        // The dashboard may still own the terminal (raw mode, alternate screen, logs muted):
+        // give it back so the error or the shutdown lines show.
+        d.stop();
+    }
+    served
 }
 
 /// `--tp-replicas`: loads `n` copies of the model, replica r on the --tp group from CUDA r×tp,

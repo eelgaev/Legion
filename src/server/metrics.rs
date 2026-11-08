@@ -406,11 +406,23 @@ impl Default for Metrics {
 pub struct MeteredEngine {
     inner: Arc<dyn Engine>,
     metrics: Arc<Metrics>,
+    /// The dashboard's request table and latency windows (#1198).
+    stats: Option<Arc<super::stats::StatsHub>>,
 }
 
 impl MeteredEngine {
     pub fn new(inner: Arc<dyn Engine>, metrics: Arc<Metrics>) -> Self {
-        Self { inner, metrics }
+        Self {
+            inner,
+            metrics,
+            stats: None,
+        }
+    }
+
+    /// Also tracks every stream for the dashboard.
+    pub fn with_stats(mut self, stats: Arc<super::stats::StatsHub>) -> Self {
+        self.stats = Some(stats);
+        self
     }
 }
 
@@ -441,6 +453,9 @@ impl Engine for MeteredEngine {
     fn generate(&self, req: GenerateRequest) -> Result<TokenStream, EngineError> {
         let stream = self.inner.generate(req)?;
         let mut timing = StreamTiming::new(self.metrics.clone());
+        if let Some(stats) = &self.stats {
+            timing.live = Some((stats.clone(), stats.begin()));
+        }
         Ok(Box::pin(stream.inspect(move |ev| timing.observe(ev))))
     }
 }
@@ -451,6 +466,8 @@ struct StreamTiming {
     metrics: Arc<Metrics>,
     start: Instant,
     last_output: Option<Instant>,
+    /// The dashboard's hub and this request's row in it.
+    live: Option<(Arc<super::stats::StatsHub>, Arc<super::stats::LiveRequest>)>,
 }
 
 impl StreamTiming {
@@ -459,16 +476,34 @@ impl StreamTiming {
             metrics,
             start: Instant::now(),
             last_output: None,
+            live: None,
         }
     }
 
     fn observe(&mut self, ev: &TokenEvent) {
         match ev {
+            TokenEvent::Started { prompt_tokens } => {
+                if let Some((_, r)) = &self.live {
+                    r.started(*prompt_tokens);
+                }
+            }
             TokenEvent::Text(_) | TokenEvent::Reasoning(_) => {
                 let now = Instant::now();
-                match self.last_output.replace(now) {
-                    None => self.metrics.ttft.observe((now - self.start).as_secs_f64()),
-                    Some(prev) => self.metrics.inter_token.observe((now - prev).as_secs_f64()),
+                let (window, seconds) = match self.last_output.replace(now) {
+                    None => {
+                        let s = (now - self.start).as_secs_f64();
+                        self.metrics.ttft.observe(s);
+                        (0, s)
+                    }
+                    Some(prev) => {
+                        let s = (now - prev).as_secs_f64();
+                        self.metrics.inter_token.observe(s);
+                        (1, s)
+                    }
+                };
+                if let Some((hub, r)) = &self.live {
+                    r.output(now);
+                    if window == 0 { &hub.ttft } else { &hub.itl }.record(now, seconds);
                 }
             }
             TokenEvent::Finished { usage, .. } => {
@@ -487,6 +522,9 @@ impl StreamTiming {
 impl Drop for StreamTiming {
     fn drop(&mut self) {
         self.metrics.e2e.observe(self.start.elapsed().as_secs_f64());
+        if let Some((hub, r)) = &self.live {
+            hub.end(r);
+        }
     }
 }
 

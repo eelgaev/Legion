@@ -383,6 +383,7 @@ fn header(seq: u32, len: usize) -> [u8; 12] {
 
 fn write_frame(s: &mut TcpStream, seq: u32, data: &[u8]) -> std::io::Result<()> {
     let h = header(seq, data.len());
+    crate::dashboard::hub::tp_sent(h.len() + data.len());
     if data.len() <= 64 << 10 {
         // One segment for a small frame (a decode step's partials).
         let mut b = Vec::with_capacity(h.len() + data.len());
@@ -447,6 +448,7 @@ fn reader(mut s: TcpStream, rx: mpsc::Receiver<RecvJob>, sh: Arc<Shared>, peer: 
             let io = |e: std::io::Error| format!("reading all-reduce {seq} from rank {peer}: {e}");
             let mut h = [0u8; 12];
             s.read_exact(&mut h).map_err(io)?;
+            crate::dashboard::hub::tp_received(h.len() + len);
             let got_seq = u32::from_le_bytes(h[..4].try_into().expect("4 bytes"));
             let got_len = u64::from_le_bytes(h[4..].try_into().expect("8 bytes"));
             if got_seq != seq || got_len != len as u64 {
@@ -877,6 +879,8 @@ impl Comm {
         rails: usize,
     ) -> std::io::Result<Arc<Self>> {
         let n = data.len();
+        // The dashboard's network gauge (#1198) shows this exchange's bytes.
+        crate::dashboard::hub::tp_network_used();
         let shared = Arc::new(Shared {
             failed: AtomicBool::new(false),
             error: Mutex::new(None),

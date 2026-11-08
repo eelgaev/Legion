@@ -35,6 +35,7 @@ mod ssd_replay;
 mod st;
 mod statusline;
 mod tokenize;
+mod top;
 mod version;
 
 use clap::{Parser, Subcommand};
@@ -69,6 +70,8 @@ struct Cli {
 enum Command {
     /// Run the OpenAI- and Anthropic-compatible HTTP server.
     Serve(Box<serve::ServeArgs>),
+    /// Live dashboard of a running server: requests, throughput, links, memory, logs.
+    Top(top::TopArgs),
     /// Generate once from a local GGUF and print the result, without a server.
     Run(Box<run::RunArgs>),
     /// Benchmark a server: TTFT, inter-token latency and throughput per concurrency level.
@@ -198,6 +201,7 @@ async fn run(cli: Cli, numa: Option<legion::hw::numa_bind::Placement>) -> anyhow
         Command::Run(args) => run::run(*args).await,
         Command::Bench(args) => bench::run(args).await,
         Command::Chat(args) => chat::run(args).await,
+        Command::Top(args) => top::run(args).await,
         Command::Gguf(cmd) => gguf::run(cmd),
         Command::St(cmd) => st::run(cmd),
         Command::Info(args) => info::run(args),

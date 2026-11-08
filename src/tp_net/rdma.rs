@@ -942,7 +942,10 @@ impl Endpoint {
             f(self.qp, &mut wr, &mut bad)
         };
         match r {
-            0 => Ok(()),
+            0 => {
+                crate::dashboard::hub::tp_sent(len);
+                Ok(())
+            }
             e => Err(format!(
                 "posting an RDMA write: {}",
                 std::io::Error::from_raw_os_error(e)
@@ -986,6 +989,7 @@ impl Endpoint {
             ));
         }
         self.post_recv()?;
+        crate::dashboard::hub::tp_received(wc.byte_len as usize);
         Ok(Some((u32::from_be(wc.imm_data), wc.byte_len as usize)))
     }
 }

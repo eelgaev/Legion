@@ -3,6 +3,8 @@ use super::*;
 fn clock() -> HostClock {
     HostClock {
         on: true,
+        debug: true,
+        dash: false,
         ..HostClock::default()
     }
 }
@@ -41,6 +43,8 @@ fn a_lap_moves_the_mark() {
 fn an_off_clock_sums_nothing() {
     let mut c = HostClock {
         on: false,
+        debug: false,
+        dash: false,
         ..HostClock::default()
     };
     let start = Instant::now() - Duration::from_millis(3);

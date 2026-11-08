@@ -49,7 +49,8 @@ impl<W: Write> StatusWriter<W> {
 
     /// Writes `text` around the live line, holding its lock throughout.
     fn emit(&mut self, text: &[u8]) -> io::Result<()> {
-        if text.is_empty() {
+        // The dashboard owns the terminal: the line is in its log ring.
+        if text.is_empty() || legion::dashboard::logs::muted() {
             return Ok(());
         }
         let state = self
