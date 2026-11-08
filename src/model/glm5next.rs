@@ -1074,16 +1074,17 @@ impl Model {
             // A piece (at most a pair per slot) always takes the grouped mv kernels; chunk only
             // the steps whose staged matmuls take them too (a 4-bit step of more tokens than
             // the mv kernel takes, or one past --nvfp4-expert-mv-max pairs per expert, is on
-            // the GEMM, other sums), so chunking keeps every step's bits.
-            let staged_mv = if self.linear.nvfp4_a4_batch(n_step, true) {
-                n_step <= crate::model::nvfp4_a4::MV_MAX_TOKENS
-            } else {
-                let pairs = hp.n_expert_used * n_step;
-                matches!(
+            // the GEMM, other sums), so chunking keeps every step's bits. Pieces and the staged
+            // step share one buffer, so they take the same path (4-bit or W4A16); before a
+            // fetch the weight isn't at hand to say which, so both must be on mv.
+            let a4_mv = !self.linear.nvfp4_a4_batch(n_step, true)
+                || n_step <= crate::model::nvfp4_a4::MV_MAX_TOKENS;
+            let pairs = hp.n_expert_used * n_step;
+            let staged_mv = a4_mv
+                && matches!(
                     nvfp4_mm::pick_grouped(hp.n_embd, 0, pairs, hp.n_expert),
                     nvfp4_mm::Kernel::Mv { .. }
-                )
-            };
+                );
             let chunks = ssd.pieces(n_step as usize, decoding && staged_mv);
             let chunks = chunks.filter(|&k| {
                 let fits = k * piece <= room;
