@@ -15,6 +15,10 @@ const ALLOWED: &[(&str, &str)] = &[
     ("src/hf/deepseek41/hash/tests.rs", "LEGION_TEST_DS41_HF"),
     ("src/model/moe_ffn/tests.rs", "LEGION_MOE_SPEED_TYPES"),
     ("src/model/qwen4/qsa_attn/tests.rs", "LEGION_TINY"),
+    (
+        "src/residency/cuda.rs",
+        "LEGION_DEBUG_FAIL_CUMEMCREATE_AFTER",
+    ),
     ("src/residency/experts.rs", "LEGION_EXPERT_COUNTS"),
     ("src/residency/ssd_experts.rs", "LEGION_SSD_EXPERT_TRACE"),
 ];

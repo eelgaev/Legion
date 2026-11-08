@@ -60,6 +60,7 @@ without notice.
 |---|---|
 | `LEGION_OP_PROFILE=1` | Per-op GPU time profile (CUDA): every graph node timed between CUDA events, a table on stderr now and then. Disables ggml's CUDA graphs and fusions. |
 | `LEGION_META_DEBUG=1` | Tensor parallelism: print how each tensor is split over the GPUs. |
+| `LEGION_DEBUG_FAIL_CUMEMCREATE_AFTER=<n>[,<count>]` | The expert cache's slot allocations (CUDA): after the first `n` `cuMemCreate` calls for VRAM slots, the next `count` (1 if left out) fail as out of memory, to try the load's shrink to fit (#1208: the cache plans that GPU again in less and the memory plan says how many slots it kept). |
 | `LEGION_EXPERT_COUNTS=<file>` | On exit, write the raw routing counts per layer and expert as JSON, for offline expert-cache studies. |
 | `LEGION_SSD_EXPERT_TRACE=<file>` | The SSD expert tier: write every step's routed expert ids per layer and the router lookahead's predictions of them (GLM-5.3-Flash: the next layer's router on the post-attention and post-MoE states, and on the MTP draft's state under `--spec mtp`; binary, `src/residency/ssd_experts/trace.rs`), for `legion ssd-replay <file>` to compare slot policies, prediction recall and prefetches offline. Small steps run one extra router per layer while it is set. |
 | `LEGION_CPU_BENCH=<rows>,<columns>` | The shape of the ignored CPU kernel micro-benchmark (`cpu::bench`). |

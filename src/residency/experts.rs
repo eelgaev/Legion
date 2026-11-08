@@ -24,8 +24,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::policy::{
-    LayerSlots, LendLayer, SwapRule, allocate_slots_in, auto_keep_carved, layers_left_for,
-    lowest_experts, plan_swaps,
+    LayerSlots, LendLayer, MAX_FIT_TRIES, SwapRule, allocate_slots_in, auto_keep_carved,
+    layers_left_for, lowest_experts, plan_swaps, shrunk_budget,
 };
 use super::profile::Profile;
 use super::{Fetch, ResidencyConfig};
@@ -725,6 +725,17 @@ pub struct ExpertResidency {
     /// [`ResidencyConfig::ep_stage_all`].
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     ep_stage_all: bool,
+    /// The CUDA devices whose slots did not all fit at load (#1208), [`ExpertResidency::shrunk`].
+    shrunk: Vec<Shrunk>,
+}
+
+/// A CUDA device whose expert slots did not all find VRAM at load (#1208): the cache planned
+/// again in less and took `slots` of the `planned` ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shrunk {
+    pub cuda: usize,
+    pub planned: usize,
+    pub slots: usize,
 }
 
 /// The thread of [`ExpertResidency::restore`]: per layer, whether its slots came back.
@@ -1192,29 +1203,37 @@ impl ExpertResidency {
             _ => None,
         };
 
-        // Per device: which experts each of its layers caches first.
-        let mut first: Vec<Vec<u32>> = vec![Vec::new(); n_layers];
-        for (d, dev) in devices.iter().enumerate() {
+        // Per device: the bytes its slots may take.
+        let mut dev_budget: Vec<u64> = devices
+            .iter()
+            .enumerate()
+            .map(|(d, dev)| {
+                // Each tiered range rounds its VRAM part up to the mapping granule (2 MiB).
+                let rounding = match dev.place.cuda {
+                    Some(_) => 3 * (2u64 << 20) * dev.rows as u64,
+                    None => 0,
+                };
+                // Staging takes no VRAM of its own: long prompts borrow the slots' (see
+                // `Self::lend`).
+                // `--glm-prefetch`: its staging ring comes out of the cache's share, not the
+                // reserve's.
+                let ring = prefetch_ring(cfg, &found, &dev_of, d, dev.place.cuda, n_expert)
+                    .map_or(0, |r| r.bytes() as u64);
+                budget(dev.place.cuda)
+                    .saturating_sub(rounding)
+                    .saturating_sub(ring)
+            })
+            .collect();
+        // Which experts each of device d's layers caches first in `b` bytes of slots (empty
+        // lists for the other devices' layers).
+        let plan_first = |d: usize, b: u64| -> Vec<Vec<u32>> {
+            let dev = &devices[d];
             let slot_bytes: Vec<u64> = (0..n_layers)
                 .map(|il| match &found[il] {
                     Some((_, ts)) if dev_of[il] == d => ts.iter().map(|t| t.nb()[2] as u64).sum(),
                     _ => 0,
                 })
                 .collect();
-            // Each tiered range rounds its VRAM part up to the mapping granule (2 MiB).
-            let rounding = match dev.place.cuda {
-                Some(_) => 3 * (2u64 << 20) * dev.rows as u64,
-                None => 0,
-            };
-            // Staging takes no VRAM of its own: long prompts borrow the slots' (see
-            // `Self::lend`).
-            // `--glm-prefetch`: its staging ring comes out of the cache's share, not the
-            // reserve's.
-            let ring = prefetch_ring(cfg, &found, &dev_of, d, dev.place.cuda, n_expert)
-                .map_or(0, |r| r.bytes() as u64);
-            let b = budget(dev.place.cuda)
-                .saturating_sub(rounding)
-                .saturating_sub(ring);
             let mut alloc = allocate_slots_in(&ranked, &slot_bytes, &owned_all, n_expert, b);
             if cfg.profile_split_only && profile.is_some() {
                 alloc = lowest_experts(&alloc, &owned_all, n_expert);
@@ -1231,7 +1250,11 @@ impl ExpertResidency {
                     "expert cache: layers sized by the measured misses"
                 );
             }
-            for (il, experts) in alloc.into_iter().enumerate() {
+            alloc
+        };
+        let mut first: Vec<Vec<u32>> = vec![Vec::new(); n_layers];
+        for (d, &b) in dev_budget.iter().enumerate() {
+            for (il, experts) in plan_first(d, b).into_iter().enumerate() {
                 if !experts.is_empty() {
                     first[il] = experts;
                 }
@@ -1241,11 +1264,16 @@ impl ExpertResidency {
         // `lend_spread`: each staging layer keeps the same share of its slots, the device's
         // `lend_keep` bytes over all of its slots' bytes. Without a `lend_keep`, the most that
         // leaves the device's `lend_need` free ([`auto_keep_carved`]).
-        let mut keep_of: Vec<Option<usize>> = vec![None; n_layers];
         let auto = cfg.lend_keep.is_empty() && !cfg.lend_need.is_empty();
-        if (cfg.lend_spread || auto) && cfg.staging && cfg!(feature = "cuda") {
-            for (d, dev) in devices.iter().enumerate() {
-                let Some(c) = dev.place.cuda else { continue };
+        let spread = (cfg.lend_spread || auto) && cfg.staging && cfg!(feature = "cuda");
+        // Device d's (layer, slots kept) for the slots of `first`.
+        let plan_keep = |d: usize, first: &[Vec<u32>]| -> Vec<(usize, usize)> {
+            let mut out = Vec::new();
+            let dev = &devices[d];
+            {
+                let Some(c) = dev.place.cuda else {
+                    return out;
+                };
                 let mine: Vec<usize> = (0..n_layers)
                     .filter(|&il| dev_of[il] == d && found[il].is_some())
                     .collect();
@@ -1255,7 +1283,7 @@ impl ExpertResidency {
                 };
                 if auto {
                     let Some(&need) = cfg.lend_need.get(c) else {
-                        continue;
+                        return out;
                     };
                     let below = cfg.stage_below.unwrap_or(usize::MAX);
                     let reals = ep.map(|e| e.real.as_slice());
@@ -1314,11 +1342,9 @@ impl ExpertResidency {
                         "expert cache: long prompts keep the hottest cached experts"
                     );
                     if keep.iter().any(|&k| k > 0) {
-                        for (&il, k) in staged.iter().zip(keep) {
-                            keep_of[il] = Some(k);
-                        }
+                        out.extend(staged.iter().copied().zip(keep));
                     }
-                    continue;
+                    return out;
                 }
                 let want = cfg
                     .lend_keep
@@ -1330,7 +1356,16 @@ impl ExpertResidency {
                 let total: u128 = mine.iter().map(|&il| bytes(il)).sum();
                 for &il in &mine {
                     let n = first[il].len() as u128;
-                    keep_of[il] = Some((n * want as u128 / total.max(1)).min(n) as usize);
+                    out.push((il, (n * want as u128 / total.max(1)).min(n) as usize));
+                }
+            }
+            out
+        };
+        let mut keep_of: Vec<Option<usize>> = vec![None; n_layers];
+        if spread {
+            for d in 0..devices.len() {
+                for (il, k) in plan_keep(d, &first) {
+                    keep_of[il] = Some(k);
                 }
             }
         }
@@ -1340,20 +1375,91 @@ impl ExpertResidency {
             .map(|il| found[il].as_ref().map_or(usize::MAX, |_| dev_of[il]))
             .collect();
         let rows = run_rows(&present, ep.map(|e| e.real.as_slice()));
-        for il in 0..n_layers {
-            let Some((p, ts)) = &found[il] else { continue };
+        // #1208: a CUDA device whose slots find no VRAM (free memory drifted since the plan)
+        // drops its layers built so far and plans again in less. Per device: the free VRAM
+        // its plan was made against (read before its first layer), the failures so far, the
+        // slots first planned.
+        let mut free_at: Vec<Option<u64>> = vec![None; devices.len()];
+        let mut failures = vec![0u32; devices.len()];
+        let slots_on = |d: usize, first: &[Vec<u32>]| -> usize {
+            (0..n_layers)
+                .filter(|&il| dev_of[il] == d)
+                .map(|il| first[il].len())
+                .sum()
+        };
+        let planned: Vec<usize> = (0..devices.len()).map(|d| slots_on(d, &first)).collect();
+        let mut il = 0;
+        while il < n_layers {
+            let Some((p, ts)) = found[il].as_ref().filter(|_| layers[il].is_none()) else {
+                il += 1;
+                continue;
+            };
             let d = dev_of[il];
+            #[cfg(feature = "cuda")]
+            if let (Some(c), None) = (p.cuda, free_at[d]) {
+                free_at[d] = super::cuda::free_vram(c).ok().map(|f| f as u64);
+            }
             let n_slots = first[il].len();
             let mut tensors = Vec::with_capacity(3);
+            let mut no_vram = None;
             for (k, t) in ts.iter().enumerate() {
-                tensors.push(tiered_tensor(
-                    p,
-                    *t,
-                    n_slots,
-                    keep_of[il],
-                    KINDS[k],
-                    n_expert,
-                )?);
+                match tiered_tensor(p, *t, n_slots, keep_of[il], KINDS[k], n_expert) {
+                    Ok(c) => tensors.push(c),
+                    Err(e) if e.no_vram && n_slots > 0 && failures[d] < MAX_FIT_TRIES => {
+                        no_vram = Some(e.msg);
+                        break;
+                    }
+                    Err(e) => return Err(e.msg),
+                }
+            }
+            if let Some(msg) = no_vram {
+                // Every slot of the device given back, then what others took since the plan:
+                // the free VRAM the plan saw less what is free now.
+                drop(tensors);
+                for (l, _) in layers.iter_mut().zip(&dev_of).filter(|(_, o)| **o == d) {
+                    *l = None;
+                }
+                #[cfg(feature = "cuda")]
+                let free_now = p
+                    .cuda
+                    .and_then(|c| super::cuda::free_vram(c).ok())
+                    .map(|f| f as u64);
+                #[cfg(not(feature = "cuda"))]
+                let free_now: Option<u64> = None;
+                let drift = match (free_at[d], free_now) {
+                    (Some(was), Some(now)) => was.saturating_sub(now),
+                    _ => 0,
+                };
+                let slot: u64 = ts.iter().map(|t| t.nb()[2] as u64).sum();
+                let b = shrunk_budget(dev_budget[d], drift, slot, failures[d]);
+                tracing::warn!(
+                    device = ?p.cuda,
+                    layer = il,
+                    error = %msg,
+                    drift_mib = drift >> 20,
+                    budget_mib = dev_budget[d] >> 20,
+                    to_mib = b >> 20,
+                    "expert cache: slots found no VRAM, planning the device again in less"
+                );
+                failures[d] += 1;
+                dev_budget[d] = b;
+                free_at[d] = free_now;
+                for j in (0..n_layers).filter(|&j| dev_of[j] == d) {
+                    first[j].clear();
+                    keep_of[j] = None;
+                }
+                for (j, experts) in plan_first(d, b).into_iter().enumerate() {
+                    if !experts.is_empty() {
+                        first[j] = experts;
+                    }
+                }
+                if spread {
+                    for (j, k) in plan_keep(d, &first) {
+                        keep_of[j] = Some(k);
+                    }
+                }
+                il = (0..n_layers).find(|&j| dev_of[j] == d).unwrap_or(il);
+                continue;
             }
             // The slots wholly before every kind's tail, the matmuls' reads past them included.
             #[cfg(feature = "cuda")]
@@ -1412,7 +1518,19 @@ impl ExpertResidency {
                 ),
                 prev_chosen: Vec::new(),
             });
+            il += 1;
         }
+        // For the memory plan's line (`Self::shrunk`).
+        let shrunk: Vec<Shrunk> = (0..devices.len())
+            .filter(|&d| failures[d] > 0)
+            .filter_map(|d| {
+                Some(Shrunk {
+                    cuda: devices[d].place.cuda?,
+                    planned: planned[d],
+                    slots: slots_on(d, &first),
+                })
+            })
+            .collect();
 
         for (d, dev) in devices.iter_mut().enumerate() {
             let r = dev.rows as i64;
@@ -1538,6 +1656,7 @@ impl ExpertResidency {
             predict: Default::default(),
             cached_rows: Vec::new(),
             ep_stage_all: cfg.ep_stage_all,
+            shrunk,
         };
         #[cfg(feature = "cuda")]
         if super::cpu_share::threshold(cfg.cpu_share.share) > 0 {
@@ -1748,6 +1867,11 @@ impl ExpertResidency {
             }
         }
         out.into_iter().collect()
+    }
+
+    /// The CUDA devices whose slots the load shrank to fit the VRAM it found (#1208).
+    pub fn shrunk(&self) -> &[Shrunk] {
+        &self.shrunk
     }
 
     /// Per tiered layer: (layer id, slots, hits, misses).
@@ -3141,6 +3265,22 @@ fn share_setup(
     Ok(threshold(cfg.cpu_share.share))
 }
 
+/// Why [`tiered_tensor`] failed: `no_vram` when a CUDA layer's slots found no VRAM (the cache
+/// then shrinks to fit, #1208); any other failure ends the load.
+struct TierError {
+    msg: String,
+    no_vram: bool,
+}
+
+impl From<String> for TierError {
+    fn from(msg: String) -> Self {
+        Self {
+            msg,
+            no_vram: false,
+        }
+    }
+}
+
 /// The tiered tensor of `host` (an expert tensor) for a layer placed at `p`.
 #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
 fn tiered_tensor(
@@ -3150,13 +3290,18 @@ fn tiered_tensor(
     keep: Option<usize>,
     name: &str,
     n_expert: usize,
-) -> Result<Context, String> {
+) -> Result<Context, TierError> {
     match p.cuda {
         #[cfg(feature = "cuda")]
-        Some(dev) => super::cuda::tiered(dev, host, n_slots, keep, name).map_err(|e| e.to_string()),
+        Some(dev) => super::cuda::tiered(dev, host, n_slots, keep, name).map_err(|e| TierError {
+            msg: e.to_string(),
+            no_vram: e.no_vram,
+        }),
         #[cfg(not(feature = "cuda"))]
-        Some(_) => Err("tiered experts on a GPU need a CUDA build".into()),
-        None => host_copy(host, n_slots, name, n_expert, p.buft).map_err(|e| e.to_string()),
+        Some(_) => Err("tiered experts on a GPU need a CUDA build"
+            .to_string()
+            .into()),
+        None => host_copy(host, n_slots, name, n_expert, p.buft).map_err(|e| e.to_string().into()),
     }
 }
 

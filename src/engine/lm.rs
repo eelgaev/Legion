@@ -3515,6 +3515,10 @@ fn log_memory_plan(
         .experts_mut()
         .map(|r| r.slot_bytes_by_cuda())
         .unwrap_or_default();
+    let expert_shrunk = exec
+        .experts_mut()
+        .map(|r| r.shrunk().to_vec())
+        .unwrap_or_default();
     let gpu = |d: crate::ggml::Device| {
         let (free, total) = d.memory();
         plan::Gpu {
@@ -3571,6 +3575,7 @@ fn log_memory_plan(
         },
         gpus,
         host,
+        expert_shrunk,
     });
 }
 

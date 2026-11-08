@@ -542,6 +542,26 @@ pub fn allocate_slots(
     allocate_slots_in(ranked, slot_bytes, &[], n_expert, budget)
 }
 
+/// The VRAM mapping granule the slot plan rounds to (2 MiB).
+pub const SLOT_GRANULE: u64 = 2 << 20;
+
+/// How often a device's slots may fail to find VRAM at load before the load fails (#1208).
+/// [`shrunk_budget`] reaches 0 well before.
+pub const MAX_FIT_TRIES: u32 = 48;
+
+/// A device's slot budget after its slots found no VRAM at load (#1208): `budget` less what
+/// other processes took since the plan (`drift`: the free VRAM the plan saw less what is free
+/// with the device's slots given back) and a granule, so the room kept beside the cache stays
+/// free; and less at least one slot of the failed layer (`slot` bytes), doubled for each of the
+/// device's `failures` before, so repeated failures where the free figure tells nothing (a
+/// GB10's shared memory) still shrink the cache to 0 in a few tries.
+pub fn shrunk_budget(budget: u64, drift: u64, slot: u64, failures: u32) -> u64 {
+    let step = slot
+        .max(SLOT_GRANULE)
+        .saturating_mul(1u64 << failures.min(40));
+    budget.saturating_sub(step.max(drift.saturating_add(SLOT_GRANULE)))
+}
+
 /// [`allocate_slots`] with each layer's slots for its `owned` experts only (expert
 /// parallelism; a layer past `owned`'s end, or `None`, any): the others are never picked, nor
 /// counted in a layer's even share.
