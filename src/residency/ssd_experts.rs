@@ -57,14 +57,16 @@ pub const KINDS: [&str; 3] = ["ffn_up_exps", "ffn_gate_exps", "ffn_down_exps"];
 /// Slot-mode steps of the first layer between hit-rate reports.
 const REPORT_EVERY: u64 = 128;
 
-/// Decode and verify steps of more routed pairs than slots go through the slots in pieces
-/// while their pairs are at most this many times the layer's experts (#1205); bigger ones
-/// stage. A staged step moves every distinct routed expert once (a copy from its slot or a
-/// read), at most `n_expert`, and never updates the cache; a chunked one reads only its
-/// pieces' misses, at most its pairs, and keeps the hot experts cached. Twice `n_expert` caps a
-/// chunked step's worst case (no expert shared, nothing cached) at twice the staged one's,
-/// and covers 16 sequences of 4 verify rows at 288 experts and 8 used (512 pairs).
-const CHUNK_PAIRS_PER_EXPERT: usize = 2;
+/// Decode and verify steps of more routed pairs than slots go through the slots in at most
+/// this many pieces (#1205); bigger ones stage. A staged step moves every distinct routed
+/// expert once (a copy from its slot or a read), at most `n_expert`, and never updates the
+/// cache; a chunked one reads only its pieces' misses and keeps the hot experts cached, but
+/// each piece is a host round trip and, once the step's distinct experts pass the slots, a
+/// piece can evict what a later one reads again. Eight cover every decode or verify step of 16
+/// sequences at the default 4 drafts (80 rows: 7 pieces at 109 slots and 8 used), and keep the
+/// pairs of a chunked step under `8 * n_slots` (872 at 109 slots: the staged step's kernels too
+/// take one token at a time there, the same sums).
+const MAX_PIECES: usize = 8;
 
 /// When the tier is used (`--expert-ssd`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -569,16 +571,16 @@ impl SsdExperts {
     }
 
     /// The pieces a step of `n_tok` tokens takes through the slots when its routed pairs
-    /// exceed them (#1205): `decoding`, every sequence of the step decodes or verifies, and
-    /// at most [`CHUNK_PAIRS_PER_EXPERT`] pairs per expert. `None`: one [`Self::fetch`] (the
-    /// slots when the step fits them, else a staging buffer).
+    /// exceed them (#1205): `decoding`, every sequence of the step decodes or verifies, in at
+    /// most [`MAX_PIECES`] pieces. `None`: one [`Self::fetch`] (the slots when the step fits
+    /// them, else a staging buffer).
     pub fn pieces(&self, n_tok: usize, decoding: bool) -> Option<usize> {
         let i = &self.inner;
-        let pairs = i.n_used * n_tok;
-        if !decoding || pairs <= i.n_slots || pairs > CHUNK_PAIRS_PER_EXPERT * i.n_expert {
+        if !decoding || i.n_used * n_tok <= i.n_slots {
             return None;
         }
-        Some(n_tok.div_ceil(i.n_slots / i.n_used))
+        let k = n_tok.div_ceil(i.n_slots / i.n_used);
+        (k <= MAX_PIECES).then_some(k)
     }
 
     /// Layer `il`'s experts for rows `rows` of a step routing `ids` (`[n_used, n_tokens]`

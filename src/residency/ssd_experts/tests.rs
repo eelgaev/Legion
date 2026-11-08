@@ -1073,21 +1073,21 @@ fn piece_rows_split_evenly() {
     assert_eq!(piece_rows(5, 1), vec![0..5]);
 }
 
-/// Decode and verify steps of more pairs than slots, up to twice the experts, go in pieces of
-/// at most the slots' rows; smaller steps, prompt steps and bigger ones do not.
+/// Decode and verify steps of more pairs than slots go in pieces of at most the slots' rows,
+/// up to eight; smaller steps, prompt steps and bigger ones do not.
 #[test]
 fn decode_steps_past_the_slots_go_in_pieces() {
     let dir = scratch();
     let g = model(dir.path());
-    // 5 slots, 2 experts a token: 2 rows a piece; 6 experts: at most 12 pairs (6 rows).
+    // 5 slots, 2 experts a token: 2 rows a piece.
     let t = tier(&g, 5, true);
     assert_eq!(t.pieces(2, true), None);
     assert_eq!(t.pieces(3, true), Some(2));
     assert_eq!(t.pieces(5, true), Some(3));
-    assert_eq!(t.pieces(6, true), Some(3));
-    assert_eq!(t.pieces(7, true), None);
+    assert_eq!(t.pieces(16, true), Some(8));
+    assert_eq!(t.pieces(17, true), None);
     assert_eq!(t.pieces(3, false), None);
-    for n in 3..=6 {
+    for n in 3..=16 {
         let k = t.pieces(n, true).unwrap();
         for r in piece_rows(n, k) {
             assert!(r.len() * 2 <= t.n_slots(), "{n} rows: piece {r:?}");
