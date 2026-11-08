@@ -1790,15 +1790,20 @@ impl Model {
     /// use it.
     pub fn set_nvfp4_a4(&mut self, a: Nvfp4A4) {
         self.linear.set_nvfp4_a4(a);
-        if a != Nvfp4A4::Off {
-            // The FP4 probe (a kernel and a copy on the default stream) runs now, at load, on
-            // every GPU holding a weight the W4A4 ops could take (as `linear` asks, per device),
-            // rather than at the first W4A4 graph's build, which may come between stage-graph
-            // captures (#1202).
-            let mtp = self.mtp.iter().flat_map(|w| w.tensors());
-            for w in self.weights.tensors().chain(mtp) {
-                crate::model::nvfp4_a4::supports(w);
-            }
+        self.probe_nvfp4_a4();
+    }
+
+    /// With W4A4 on, runs the FP4 probe (a kernel and a copy on the default stream) now, at
+    /// load, on every GPU holding a weight the W4A4 ops could take (as `linear` asks, per
+    /// device), rather than at the first W4A4 graph's build, which may come between stage-graph
+    /// captures (#1202). Called again by [`Self::load_mtp`] for a head loaded afterwards.
+    pub(super) fn probe_nvfp4_a4(&self) {
+        if self.linear.nvfp4_a4() == Nvfp4A4::Off {
+            return;
+        }
+        let mtp = self.mtp.iter().flat_map(|w| w.tensors());
+        for w in self.weights.tensors().chain(mtp) {
+            crate::model::nvfp4_a4::supports(w);
         }
     }
 
