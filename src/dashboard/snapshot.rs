@@ -74,6 +74,14 @@ pub struct EngineSnap {
     pub expert_cache_misses: u64,
     pub expert_cache_slots: u32,
     pub expert_cache_layers: u32,
+    /// The n-gram (or Engram) table's SSD tier: rows asked of its RAM row cache, those it held,
+    /// and the rows its hot set pins now (`--ngram-ram SIZE`); 0 for the RAM tiers.
+    #[serde(default)]
+    pub ngram_rows: u64,
+    #[serde(default)]
+    pub ngram_cache_hits: u64,
+    #[serde(default)]
+    pub ngram_hot_rows: u64,
     pub spec: SpecSnap,
     /// Model bytes by kind of step (required traffic, not measured).
     pub prefill: PhaseBytes,
