@@ -16,6 +16,10 @@ const ALLOWED: &[(&str, &str)] = &[
     ("src/model/moe_ffn/tests.rs", "LEGION_MOE_SPEED_TYPES"),
     ("src/model/qwen4/qsa_attn/tests.rs", "LEGION_TINY"),
     ("src/residency/experts.rs", "LEGION_EXPERT_COUNTS"),
+    (
+        "src/residency/lookup_table.rs",
+        "LEGION_DEBUG_NGRAM_OLD_POLICY",
+    ),
     ("src/residency/ssd_experts.rs", "LEGION_SSD_EXPERT_TRACE"),
 ];
 

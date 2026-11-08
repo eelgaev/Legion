@@ -59,6 +59,7 @@ without notice.
 | Variable | Effect |
 |---|---|
 | `LEGION_OP_PROFILE=1` | Per-op GPU time profile (CUDA): every graph node timed between CUDA events, a table on stderr now and then. Disables ggml's CUDA graphs and fusions. |
+| `LEGION_DEBUG_NGRAM_OLD_POLICY=1` | An n-gram table read from the SSD with an `--ngram-ram` budget: the row cache replaces round-robin, without a hot set (the policy before #1209), for A/B runs. Output does not change. |
 | `LEGION_META_DEBUG=1` | Tensor parallelism: print how each tensor is split over the GPUs. |
 | `LEGION_EXPERT_COUNTS=<file>` | On exit, write the raw routing counts per layer and expert as JSON, for offline expert-cache studies. |
 | `LEGION_SSD_EXPERT_TRACE=<file>` | The SSD expert tier: write every step's routed expert ids per layer and the router lookahead's predictions of them (GLM-5.3-Flash: the next layer's router on the post-attention and post-MoE states, and on the MTP draft's state under `--spec mtp`; binary, `src/residency/ssd_experts/trace.rs`), for `legion ssd-replay <file>` to compare slot policies, prediction recall and prefetches offline. Small steps run one extra router per layer while it is set. |
