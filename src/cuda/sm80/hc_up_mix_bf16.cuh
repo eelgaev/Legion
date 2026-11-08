@@ -4,7 +4,7 @@
 //
 // Not a standalone header: hc_up_mix.cu includes it inside its anonymous namespace, after the
 // argument struct and the constants (HC, ROWS, WARPS, NT, CHUNK, PAD). The kernel bodies are
-// built only where __CUDA_ARCH__ >= 800 and are empty elsewhere; mma_code() in hc_up_mix.cu
+// built only where __CUDA_ARCH__ >= 800 and trap elsewhere; mma_code() in hc_up_mix.cu
 // checks that the binary has sm_80+ code for the device.
 //
 // What ggml runs instead: `mul_mat(up, lo)` on cuBLAS (ggml_cuda_mul_mat_cublas: lo converted
@@ -152,5 +152,7 @@ __global__ void __launch_bounds__(WARPS * 32) up_mix_bf16(const legion_hc_up_mix
             }
         }
     }
+#else
+    __trap();
 #endif
 }

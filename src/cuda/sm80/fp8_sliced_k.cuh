@@ -10,7 +10,8 @@
 //
 // Not a standalone header: fp8_mm.cu includes it inside its anonymous namespace, after
 // sm80/fp8_mm.cuh (pack_bf16, cp_async16) and the legion_fp8_mm declaration. The kernel body is
-// built only where __CUDA_ARCH__ >= 800; bf16_mma() decides per device at run time.
+// built only where __CUDA_ARCH__ >= 800 (a trap elsewhere); bf16_mma() decides per device at run
+// time.
 //
 // Why: a verify step's 5-64 tokens leave the prefill-shaped GEMM tiles (fp8_gemm: 16-128
 // weight rows per CTA, one K step of 32-64 at a time, register double buffering) short of
@@ -210,5 +211,7 @@ __global__ void __launch_bounds__(32 * KW, MINB) fp8_gemm_sliced(const legion_fp
         }
         p.dst[tok * p.m + row] = p.wscale ? s * p.wscale[row * p.wscale_stride] : s;
     }
+#else
+    __trap();
 #endif
 }

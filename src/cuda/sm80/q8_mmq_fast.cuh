@@ -4,7 +4,7 @@
 //
 // Not a standalone header: q8_mmq.cu includes it inside its anonymous namespace, after
 // `kstart` and the `legion_q8_fast` struct. The kernel bodies are built only where
-// __CUDA_ARCH__ >= 800 (empty elsewhere); src/model/q8_mmq.rs takes them on compute
+// __CUDA_ARCH__ >= 800 (a trap elsewhere); src/model/q8_mmq.rs takes them on compute
 // capability 12.x only.
 //
 // The bits. ggml's MMQ (mmq-vec-dot.cuh, ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma) sums, for every

@@ -15,7 +15,7 @@
 //
 // Not a standalone header: qwen4_hc.cu includes it inside its anonymous namespace, after the
 // legion_hc_mix declaration, the constants and block_sum / quantize_lane. The kernel bodies are
-// built only where __CUDA_ARCH__ >= 800 and are empty elsewhere; use_gb10() in qwen4_hc.cu
+// built only where __CUDA_ARCH__ >= 800 and trap elsewhere; use_gb10() in qwen4_hc.cu
 // decides per device at run time whether they run.
 
 constexpr int G_NORM_M      = 4;   // norm_g: elements per thread, n_embd <= NORM_THREADS * G_NORM_M
@@ -102,6 +102,8 @@ __global__ void __launch_bounds__(NORM_THREADS) norm_g(const legion_hc_mix p) {
             }
         }
     }
+#else
+    __trap();
 #endif
 }
 
@@ -210,6 +212,8 @@ __global__ void __launch_bounds__(DOWN_THREADS) down_g(const legion_hc_mix p, co
             p.lo[(int64_t) t * p.rank + r0 + r] = v / (1.0f + expf(-v));
         }
     }
+#else
+    __trap();
 #endif
 }
 
@@ -223,6 +227,8 @@ __global__ void quantize_lo_g(const legion_hc_mix p) {
         quantize_lane(p.lo[(int64_t) t * p.rank + b * QK8_1 + threadIdx.x % WARP_SIZE],
                       &p.lq[(int64_t) t * (p.rank / QK8_1) + b], threadIdx.x % WARP_SIZE);
     }
+#else
+    __trap();
 #endif
 }
 
@@ -297,5 +303,7 @@ __global__ void __launch_bounds__(UP_THREADS) up_mix_g(const legion_hc_mix p) {
         }
         p.mixed[(int64_t) t * p.n_embd + i] = sum * (1.0f / p.hc);
     }
+#else
+    __trap();
 #endif
 }

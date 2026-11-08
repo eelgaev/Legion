@@ -183,6 +183,8 @@ __global__ void __launch_bounds__(TcGb<XH, BM, BN, BK, S, WM, WN, MINB>::NT, MIN
             }
         }
     }
+#else
+    __trap();
 #endif
 }
 

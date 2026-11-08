@@ -2221,17 +2221,36 @@ impl Model {
         x: Tensor<'a>,
         w: Tensor<'a>,
     ) -> Tensor<'a> {
+        self.norm_mul_with(pass, x, w, false)
+    }
+
+    /// [`Self::norm_mul`] for a norm that both BF16 and FP8 matmuls read (`both`, e.g. a gated
+    /// DeltaNet layer's input: its beta / alpha projections in BF16, the rest in FP8): with
+    /// `--fp8-act a8-dynamic`, the BF16 rows and the FP8 codes come from one op
+    /// ([`fp8_act::rms_norm_bf16`]), with the same bits as the two ops.
+    pub(crate) fn norm_mul_with<'a>(
+        &'a self,
+        pass: &Pass<'a>,
+        x: Tensor<'a>,
+        w: Tensor<'a>,
+        both: bool,
+    ) -> Tensor<'a> {
         let (ctx, eps) = (pass.ctx, self.hp.rms_eps);
         let h = ctx.mul(ctx.rms_norm(x, eps), w);
-        if !pass.tap.on && !self.hp.moe && fused::rms_norm_bf16_fits(x, w) {
+        let plain = !pass.tap.on && !self.hp.moe;
+        let bf16 = plain && fused::rms_norm_bf16_fits(x, w);
+        // `--fp8-act a8-dynamic` prefill: the FP8 matmuls' per-token codes from one op too.
+        let fp8 = plain && self.linear.dynamic_batch(x.ne()[1]) && fp8_act::rms_norm_fits(x, w);
+        if both && bf16 && fp8 && fp8_act::rms_norm_bf16_fits(x, w) {
+            let (q, b) = fp8_act::rms_norm_bf16(ctx, x, w, eps);
+            ctx.set_shared_cast(h, types::BF16, b);
+            fp8_act::share(ctx, h, q);
+            return h;
+        }
+        if bf16 {
             ctx.set_shared_cast(h, types::BF16, fused::rms_norm_bf16(ctx, x, w, eps));
         }
-        // `--fp8-act a8-dynamic` prefill: the FP8 matmuls' per-token codes from one op too.
-        if !pass.tap.on
-            && !self.hp.moe
-            && self.linear.dynamic_batch(x.ne()[1])
-            && fp8_act::rms_norm_fits(x, w)
-        {
+        if fp8 {
             fp8_act::share(ctx, h, fp8_act::rms_norm(ctx, x, w, eps));
         }
         h
