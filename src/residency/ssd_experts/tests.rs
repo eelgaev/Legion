@@ -1134,3 +1134,230 @@ fn a_chunked_step_reads_each_piece_into_slots() {
         assert_slots(&u, 3, &all, &[0, 1]);
     }
 }
+
+/// A shard in memory for [`super::io::fill`]'s reads: each read returns at most `caps[call]`
+/// bytes (whole requests past the list), the calls in `eintr` fail with `EINTR`, and with
+/// `direct` an unaligned offset, length or buffer position fails with `EINVAL` (as `O_DIRECT`
+/// does). Every request is kept: (buffer position, offset, length).
+struct FakeShard {
+    data: Vec<u8>,
+    direct: bool,
+    caps: Vec<usize>,
+    eintr: Vec<usize>,
+    reqs: Vec<(usize, u64, usize)>,
+}
+
+impl FakeShard {
+    /// A shard of `len` bytes (a pattern that never repeats within a block).
+    fn new(len: usize, direct: bool) -> Self {
+        Self {
+            data: (0..len).map(|i| (i * 7 % 251) as u8).collect(),
+            direct,
+            caps: vec![],
+            eintr: vec![],
+            reqs: vec![],
+        }
+    }
+
+    fn read(&mut self, pos: usize, b: &mut [u8], at: u64) -> std::io::Result<usize> {
+        let call = self.reqs.len();
+        self.reqs.push((pos, at, b.len()));
+        if self.direct && !aligned(pos, at, b.len()) {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        if self.eintr.contains(&call) {
+            return Err(std::io::Error::from_raw_os_error(libc::EINTR));
+        }
+        let at = at as usize;
+        if at >= self.data.len() {
+            return Ok(0);
+        }
+        let cap = self.caps.get(call).copied().unwrap_or(usize::MAX);
+        let n = b.len().min(self.data.len() - at).min(cap);
+        b[..n].copy_from_slice(&self.data[at..at + n]);
+        Ok(n)
+    }
+
+    /// Reads `r` the way the tier's readers do (the aligned span when direct): its bytes.
+    fn read_range(&mut self, r: FileRange) -> Result<Vec<u8>, String> {
+        let (start, want, skip, align) = if self.direct {
+            let (start, len) = aligned_span(r);
+            (start, len, (r.offset - start) as usize, ALIGN as usize)
+        } else {
+            (r.offset, r.len as usize, 0, 1)
+        };
+        let need = skip + r.len as usize;
+        let mut buf = vec![0u8; want];
+        let base = buf.as_ptr() as usize;
+        super::io::fill(
+            |b, at| self.read(b.as_ptr() as usize - base, b, at),
+            &mut buf,
+            start,
+            need,
+            align,
+        )?;
+        Ok(buf[skip..need].to_vec())
+    }
+
+    fn bytes(&self, r: FileRange) -> &[u8] {
+        &self.data[r.offset as usize..(r.offset + r.len) as usize]
+    }
+}
+
+/// Whether a read request (buffer position, offset, length) suits a direct read.
+fn aligned(pos: usize, at: u64, len: usize) -> bool {
+    let a = ALIGN as usize;
+    pos.is_multiple_of(a) && at.is_multiple_of(ALIGN) && len.is_multiple_of(a)
+}
+
+fn range(offset: usize, len: usize) -> FileRange {
+    FileRange {
+        file: 0,
+        offset: offset as u64,
+        len: len as u64,
+    }
+}
+
+/// A shard whose size is not a multiple of the block.
+const ODD: usize = 3 * ALIGN as usize + 1234;
+
+/// #1206: after a short direct read the retry starts again at the last whole block (aligned
+/// offset, length and buffer position), never where the read stopped (`EINVAL`, then the
+/// server aborted).
+#[test]
+fn direct_reads_retry_short_reads_from_the_last_whole_block() {
+    let caps: [&[usize]; 4] = [
+        &[1000],
+        &[1, 4097, 5000],
+        &[4096, 3, 3, 3],
+        &[4095, 4095, 4095],
+    ];
+    let ranges = [
+        range(100, 9000),
+        range(4095, 2),
+        range(5000, ODD - 5000),
+        range(0, ODD),
+    ];
+    for caps in caps {
+        for r in ranges {
+            let mut f = FakeShard::new(ODD, true);
+            f.caps = caps.to_vec();
+            let got = f
+                .read_range(r)
+                .unwrap_or_else(|e| panic!("{caps:?} {r:?}: {e}"));
+            assert_eq!(got, f.bytes(r), "{caps:?} {r:?}");
+            for &(pos, at, len) in &f.reqs {
+                assert!(aligned(pos, at, len), "{caps:?} {r:?}");
+            }
+        }
+    }
+}
+
+/// A direct span that runs past the end of a shard whose size is not a block multiple: the
+/// range is complete once its own bytes are in, whatever the tail.
+#[test]
+fn direct_reads_end_inside_the_aligned_tail() {
+    for r in [
+        range(0, ODD),
+        range(ODD - 1, 1),
+        range(2 * ALIGN as usize + 7, 1000),
+    ] {
+        let mut f = FakeShard::new(ODD, true);
+        assert_eq!(f.read_range(r).unwrap(), f.bytes(r), "{r:?}");
+        assert_eq!(f.reqs.len(), 1, "{r:?}: one read");
+        // A short read first, then the rest from its last whole block up to the end.
+        let mut f = FakeShard::new(ODD, true);
+        f.caps = vec![ALIGN as usize + 10];
+        assert_eq!(f.read_range(r).unwrap(), f.bytes(r), "{r:?}");
+    }
+}
+
+/// Reads interrupted by a signal are asked again, direct or buffered.
+#[test]
+fn interrupted_reads_are_retried() {
+    for direct in [true, false] {
+        let mut f = FakeShard::new(ODD, direct);
+        f.eintr = vec![0, 2];
+        f.caps = vec![0, 5000];
+        let r = range(300, ODD - 300);
+        assert_eq!(f.read_range(r).unwrap(), f.bytes(r), "direct {direct}");
+        assert!(f.reqs.len() >= 4, "direct {direct}");
+    }
+}
+
+/// A range the shard does not hold to its end is an error with context, never a short buffer
+/// and never a loop without end.
+#[test]
+fn a_range_past_the_end_of_the_shard_is_an_error() {
+    for direct in [true, false] {
+        for r in [range(ODD - 10, 100), range(ODD, 10), range(ODD + 5000, 10)] {
+            let mut f = FakeShard::new(ODD, direct);
+            let e = f.read_range(r).unwrap_err();
+            assert!(e.contains("end of file"), "direct {direct} {r:?}: {e}");
+            let calls = f.reqs.len();
+            assert!(calls <= 1 + super::io::STALLS as usize, "{calls} reads");
+        }
+    }
+    // An I/O error comes back as it is.
+    let mut f = FakeShard::new(ODD, false);
+    let e = super::io::fill(
+        |_, _| Err(std::io::Error::from_raw_os_error(libc::EIO)),
+        &mut [0u8; 8],
+        0,
+        8,
+        1,
+    )
+    .unwrap_err();
+    assert!(e.contains("after 0 of 8 bytes"), "{e}");
+    assert_eq!(f.read_range(range(0, 8)).unwrap(), f.bytes(range(0, 8)));
+}
+
+/// Buffered reads keep their old loop: each retry asks for the rest where the last read
+/// stopped.
+#[test]
+fn buffered_retries_resume_where_the_last_read_stopped() {
+    let mut f = FakeShard::new(ODD, false);
+    f.caps = vec![1000, 1, 3000];
+    let r = range(17, 9000);
+    assert_eq!(f.read_range(r).unwrap(), f.bytes(r));
+    let want: Vec<(usize, u64, usize)> = [0, 1000, 1001, 4001]
+        .into_iter()
+        .map(|d| (d, 17 + d as u64, 9000 - d))
+        .collect();
+    assert_eq!(f.reqs, want);
+}
+
+/// The readers on a real shard of an odd size, direct where the file system allows it: an
+/// expert whose scales end at the end of the file reads exactly, and one cut short by the end
+/// of the file is an error for the caller (no abort).
+#[test]
+fn readers_read_up_to_the_end_of_an_odd_sized_shard() {
+    use super::io::{Job, Pool};
+    let (rows, k) = (64, 128);
+    let (w, s) = (rows * k / 2, rows * k / 16);
+    let at = 1000;
+    let f = FakeShard::new(at + w + s, false);
+    assert!(!(f.data.len() as u64).is_multiple_of(ALIGN));
+    let dir = scratch();
+    let path = dir.path().join("odd.bin");
+    std::fs::write(&path, &f.data).unwrap();
+    let job = |dst: &mut Vec<u8>, scale_len: usize| Job::Read {
+        src: Nvfp4Source {
+            weight: range(at, w),
+            scale: range(at + w, scale_len),
+            scale2: 1.0,
+        },
+        rows,
+        k,
+        dst: dst.as_mut_ptr() as usize,
+    };
+    for direct in [true, false] {
+        let pool = Pool::new(std::slice::from_ref(&path), 2, direct).unwrap();
+        let mut out = vec![0u8; rows * k / 64 * 36];
+        pool.run(vec![job(&mut out, s)]).unwrap();
+        let want = repack_nvfp4(f.bytes(range(at, w)), f.bytes(range(at + w, s)), rows, k);
+        assert_eq!(out, want, "direct {direct} (pool direct {})", pool.direct());
+        let e = pool.run(vec![job(&mut out, s + 1)]).unwrap_err();
+        assert!(e.contains("shard 0") && e.contains("end of file"), "{e}");
+    }
+}
