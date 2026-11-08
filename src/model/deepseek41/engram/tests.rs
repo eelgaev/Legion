@@ -34,6 +34,7 @@ fn backend() -> Backend {
 fn modes() -> Vec<TableOptions> {
     let opts = |io, ram_cache_bytes, aio_max| TableOptions {
         io,
+        ram: Default::default(),
         ram_cache_bytes,
         inflight: 4,
         aio_max,
@@ -231,6 +232,7 @@ fn a_prefetched_chunk_reads_its_rows_from_the_cache() {
     let mut b = backend();
     let opts = TableOptions {
         io: TableIo::Direct,
+        ram: Default::default(),
         ram_cache_bytes: Some(1 << 20),
         inflight: 4,
         aio_max: 0,

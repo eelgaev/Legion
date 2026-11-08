@@ -21,6 +21,7 @@ fn direct_table(dir: &std::path::Path, n_rows: u64) -> (LookupTable, Vec<u8>) {
     };
     let opts = TableOptions {
         io: TableIo::Direct,
+        ram: Default::default(),
         ram_cache_bytes: Some(0),
         inflight: 4,
         aio_max: 0,

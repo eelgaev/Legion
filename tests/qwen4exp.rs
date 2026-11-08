@@ -728,6 +728,7 @@ fn ngram_table_tiers_change_nothing() {
         let mut model = Model::load(&gguf, |_| backend.buffer_type()).unwrap();
         let opts = TableOptions {
             io,
+            ram: Default::default(),
             ram_cache_bytes: cache,
             inflight: 4,
             aio_max,

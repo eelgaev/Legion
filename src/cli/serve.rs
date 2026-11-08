@@ -15,7 +15,7 @@ use legion::hw::numa_bind::{NumaMode, Placement};
 use legion::model::core::{
     Attention, DraftHeadType, Fp8Act, MoeKernel, Nvfp4A4, Nvfp4Act, Nvfp4Mm,
 };
-use legion::residency::lookup_table::{self, TableIo};
+use legion::residency::lookup_table::{self, RamBudget, TableIo};
 use legion::residency::policy::SwapRule;
 use legion::residency::ssd_experts::{ExpertSsd, SsdArgs, SsdPrefetch};
 use legion::residency::{ExpertMode, Fetch, ResidencyConfig};
@@ -550,11 +550,22 @@ pub(super) struct ModelArgs {
     /// never fills the page cache), `mmap` (the page cache) or `auto` (`ram` when it fits with a
     /// margin and may be locked, else `direct`; always `direct` on a GPU that shares the
     /// host's memory, e.g. the GB10, whose KV cache and buffers come later out of that memory).
+    /// `mmap` takes no --ngram-ram; `ram` takes `all` or a size at least the table's.
     #[arg(long, value_enum, env = "LEGION_NGRAM_IO", default_value_t = TableIo::Auto)]
     pub ngram_io: TableIo,
-    /// `--ngram-io direct`: the RAM cache of rows already read, in GiB (default: a quarter of
-    /// the memory left free, at most 4; at most 1 on a GPU that shares the host's memory).
-    #[arg(long, env = "LEGION_NGRAM_RAM_GIB")]
+    /// How much of the n-gram (or Engram) table lives in RAM; the rest is read from the SSD.
+    /// `auto` (default): as --ngram-io decides (`direct` keeps a RAM cache of a quarter of the
+    /// memory left free, at most 4 GiB, at most 1 on a GPU that shares the host's memory).
+    /// `all`: the whole table, locked (--ngram-io ram). SIZE: a RAM budget, in binary units
+    /// with an optional K/M/G/T suffix (8G = 8 GiB; no suffix: GiB; decimals allowed) or a
+    /// percentage of the memory available at load (30%). A SIZE at least the table's takes
+    /// it whole; a smaller one reads it directly from the SSD with exactly that much RAM, half
+    /// of it pinning the rows hit most since start and the rest replacing by use, so rows read
+    /// once do not push out rows read again. The same rows either way: outputs do not change.
+    #[arg(long, value_name = "auto|all|SIZE", value_parser = lookup_table::parse_ram_budget)]
+    pub ngram_ram: Option<RamBudget>,
+    /// `--ngram-ram <N>G` (kept for old command lines).
+    #[arg(long, env = "LEGION_NGRAM_RAM_GIB", hide = true)]
     pub ngram_ram_gib: Option<f64>,
     /// `--ngram-io direct`: SSD reads in flight (I/O threads).
     #[arg(long, env = "LEGION_NGRAM_INFLIGHT", default_value_t = lookup_table::DEFAULT_INFLIGHT)]
@@ -894,27 +905,36 @@ pub(super) struct ModelArgs {
     pub switches: switches::SwitchArgs,
 }
 
-/// How the n-gram table is read (`--ngram-io`, `--ngram-ram-gib`, `--ngram-inflight`,
-/// `--ngram-aio-max`, `--ngram-keep-awake-ms`).
-pub(super) fn ngram_options(
-    io: TableIo,
-    ram_gib: Option<f64>,
-    inflight: usize,
-    aio_max: usize,
-    keep_awake_ms: u64,
-) -> lookup_table::TableOptions {
-    lookup_table::TableOptions {
-        io,
-        ram_cache_bytes: ram_gib.map(|g| (g.max(0.0) * (1u64 << 30) as f64) as u64),
-        inflight,
-        aio_max,
-        keep_awake_ms,
-        node: None,
-        unified: false,
-    }
-}
-
 impl ModelArgs {
+    /// How the n-gram table is read (`--ngram-io`, `--ngram-ram` or its old spelling
+    /// `--ngram-ram-gib`, `--ngram-inflight`, `--ngram-aio-max`, `--ngram-keep-awake-ms`).
+    /// Contradicting pairs are errors here, before the load; a size against the table's own
+    /// is checked when the table opens.
+    pub(super) fn ngram_options(&self) -> anyhow::Result<lookup_table::TableOptions> {
+        let ram = match (self.ngram_ram, self.ngram_ram_gib) {
+            (Some(_), Some(_)) => {
+                anyhow::bail!("--ngram-ram and --ngram-ram-gib (its old spelling) both given")
+            }
+            (Some(r), None) => r,
+            (None, Some(g)) => lookup_table::parse_ram_budget(&format!("{g}G"))
+                .map_err(|e| anyhow::anyhow!("--ngram-ram-gib: {e}"))?,
+            (None, None) => RamBudget::Auto,
+        };
+        if let Some(e) = lookup_table::ram_conflict(self.ngram_io, ram) {
+            anyhow::bail!(e);
+        }
+        Ok(lookup_table::TableOptions {
+            io: self.ngram_io,
+            ram,
+            ram_cache_bytes: None,
+            inflight: self.ngram_inflight,
+            aio_max: self.ngram_aio_max,
+            keep_awake_ms: self.ngram_keep_awake_ms,
+            node: None,
+            unified: false,
+        })
+    }
+
     /// The most sequences of a step the #723 overlap applies to: `--glm-mtp-overlap-seqs`, or
     /// every step with `--glm-mtp-overlap`.
     pub(super) fn glm_mtp_overlap_seqs(&self) -> usize {
@@ -2131,13 +2151,7 @@ pub async fn run(
                 glm_cross_balance: e.model.glm_cross_balance,
                 glm_prefetch: e.model.glm_prefetch,
                 glm_pair_split: e.model.glm_pair_split,
-                ngram: ngram_options(
-                    e.model.ngram_io,
-                    e.model.ngram_ram_gib,
-                    e.model.ngram_inflight,
-                    e.model.ngram_aio_max,
-                    e.model.ngram_keep_awake_ms,
-                ),
+                ngram: e.model.ngram_options()?,
                 expert_mv: e.model.expert_mv == ExpertMv::Legion,
                 paged_prefill_m884: e.model.paged_prefill_m884,
                 qsa_scores_ggml: e.model.qsa_scores_ggml,

@@ -172,8 +172,11 @@ pub struct NgramPlacement {
     /// The `ram` tier: locked in memory, not just faulted in.
     pub locked: bool,
     pub node: Option<u32>,
-    /// The `direct` tier's row cache.
+    /// The `direct` tier's row cache (with `--ngram-ram SIZE`: that RAM budget).
     pub ram_cache_bytes: u64,
+    /// Of the RAM budget, the hot set's most rows and their bytes (0: no hot set).
+    pub hot_rows: u64,
+    pub hot_bytes: u64,
     pub reason: String,
 }
 

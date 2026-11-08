@@ -262,6 +262,8 @@ fn load_fixture() -> LoadReport {
             locked: true,
             node: Some(0),
             ram_cache_bytes: 0,
+            hot_rows: 0,
+            hot_bytes: 0,
             reason: "fits in node 0's free memory".into(),
         }),
         engram: None,
@@ -324,6 +326,8 @@ fn unknown_and_absent_values_are_said_so_or_left_out() {
         locked: false,
         node: None,
         ram_cache_bytes: 4 * GIB,
+        hot_rows: 0,
+        hot_bytes: 0,
         reason: "not enough free memory to lock it".into(),
     });
     for s in &mut load.stages {
@@ -395,6 +399,8 @@ fn engram_tables_get_their_own_section_and_host_memory() {
         locked: false,
         node: Some(8),
         ram_cache_bytes: 8 * GIB,
+        hot_rows: 0,
+        hot_bytes: 0,
         reason: "unified GPU memory: read rows from the SSD".into(),
     });
     let numa = [node(0, 256, 120), node(8, 256, 200)];

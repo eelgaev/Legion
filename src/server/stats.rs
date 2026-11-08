@@ -360,6 +360,9 @@ fn engine_snap(s: &EngineStats) -> EngineSnap {
         expert_cache_misses: s.expert_cache_misses,
         expert_cache_slots: s.expert_cache_slots,
         expert_cache_layers: s.expert_cache_layers,
+        ngram_rows: s.ngram_rows,
+        ngram_cache_hits: s.ngram_cache_hits,
+        ngram_hot_rows: s.ngram_hot_rows,
         spec: SpecSnap {
             drafted: s.spec.drafted,
             accepted: s.spec.accepted,

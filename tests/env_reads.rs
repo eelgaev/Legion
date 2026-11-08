@@ -20,6 +20,10 @@ const ALLOWED: &[(&str, &str)] = &[
         "LEGION_DEBUG_FAIL_CUMEMCREATE_AFTER",
     ),
     ("src/residency/experts.rs", "LEGION_EXPERT_COUNTS"),
+    (
+        "src/residency/lookup_table.rs",
+        "LEGION_DEBUG_NGRAM_OLD_POLICY",
+    ),
     ("src/residency/ssd_experts.rs", "LEGION_SSD_EXPERT_TRACE"),
 ];
 

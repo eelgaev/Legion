@@ -398,6 +398,9 @@ pub(super) fn memory_lines(load: &LoadReport, numa: &[NumaNodeInfo]) -> Vec<Stri
             held.push(match n.io.as_str() {
                 "ram" if n.locked => format!("{what} {table} {} (locked)", gib(n.bytes)),
                 "ram" => format!("{what} {table} {} (not locked)", gib(n.bytes)),
+                "direct" if n.hot_rows > 0 => {
+                    format!("{what} RAM budget {}", gib(n.ram_cache_bytes))
+                }
                 "direct" => format!("{what} row cache {}", gib(n.ram_cache_bytes)),
                 _ => format!("{what} {table} {} ({})", gib(n.bytes), n.io),
             });
@@ -539,6 +542,13 @@ pub(super) fn table_lines(table: Option<&NgramPlacement>) -> Vec<String> {
     let tier = match n.io.as_str() {
         "ram" if n.locked => format!("RAM, locked, {node}"),
         "ram" => format!("RAM, not locked, {node}"),
+        "direct" if n.hot_rows > 0 => format!(
+            "direct SSD reads, {} RAM budget on {node}: hot set up to {} ({} rows, the rows \
+             hit most), the rest a row cache",
+            gib(n.ram_cache_bytes),
+            gib(n.hot_bytes),
+            count(n.hot_rows as usize)
+        ),
         "direct" => format!(
             "direct SSD reads, {} RAM row cache on {node}",
             gib(n.ram_cache_bytes)

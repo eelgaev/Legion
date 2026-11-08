@@ -2995,6 +2995,7 @@ fn open_lookup_table(
         node = opts.node,
         locked = c.locked,
         ram_cache_gib = c.ram_cache_bytes as f64 / (1u64 << 30) as f64,
+        hot_rows = c.hot_rows,
         seconds = c.seconds,
         "{what}"
     );
@@ -3004,6 +3005,8 @@ fn open_lookup_table(
         locked: c.locked,
         node: opts.node,
         ram_cache_bytes: c.ram_cache_bytes,
+        hot_rows: c.hot_rows,
+        hot_bytes: c.hot_bytes,
         reason: c.reason.clone(),
     };
     model.set_ngram_table(table);
@@ -6133,7 +6136,11 @@ impl Worker {
             let expert_stats = (experts_at.elapsed() >= EXPERT_STATS_EVERY)
                 .then(|| self.exec.experts_mut().map(|experts| experts.stats()))
                 .flatten();
-            if expert_stats.is_some() {
+            // The n-gram table's row cache counters, at the same pace.
+            let ngram_stats = (experts_at.elapsed() >= EXPERT_STATS_EVERY)
+                .then(|| self.exec.model().ngram_table().map(|t| t.stats()))
+                .flatten();
+            if expert_stats.is_some() || ngram_stats.is_some() {
                 experts_at = Instant::now();
             }
             if let Ok(mut s) = self.stats.lock() {
@@ -6148,6 +6155,11 @@ impl Worker {
                 if let Some(experts) = expert_stats {
                     s.expert_cache_hits = experts.hits;
                     s.expert_cache_misses = experts.misses;
+                }
+                if let Some(t) = ngram_stats {
+                    s.ngram_rows = t.rows;
+                    s.ngram_cache_hits = t.cache_hits;
+                    s.ngram_hot_rows = t.hot_rows;
                 }
             }
             self.outbox.flush();

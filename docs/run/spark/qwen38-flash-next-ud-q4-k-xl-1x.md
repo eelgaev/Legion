@@ -32,3 +32,7 @@ legion serve \
 - `--spec` (`mtp`): Speculative decoding drafter. `mtp` uses the model's own multi-token-prediction head to draft tokens that one verify step then checks, which raises decode speed without changing greedy output.
 - `--spec-draft` (`mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`): The MTP head's weights, for models whose main GGUF does not include it (the `mtp-*.gguf` file in the same Hugging Face repo).
 - `--spec-draft-vocab` (`65536`): The MTP head scores only the first N vocabulary entries while drafting, reading N rows of the output head instead of all of them. Drafting gets cheaper; the verify step still checks against the full vocabulary, so output does not change.
+
+## Optional
+
+- `--ngram-ram <auto|all|SIZE>` (not set: `auto`): How much of the 26.8 GiB n-gram table stays in RAM. On a Spark `auto` reads it from the SSD with a row cache of up to 1 GiB (less when little memory is free at load), because the GPU needs the rest of the shared memory. A SIZE such as `4G` sets that RAM exactly, with its most-hit rows pinned ([docs/serving.md](../../serving.md)). These benchmarks touch about 21 MB of distinct rows, so the 1 GiB cache these runs had already holds every row read twice: 2G, 4G and 8G gave the same hit rate (87.2%), the same speed and the same output as the default. A bigger budget only helps traffic whose distinct rows outgrow the default cache, and it takes KV-cache room.
