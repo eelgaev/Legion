@@ -15,6 +15,10 @@
 //!   slot ([`cache::SlotCache`], least recently used out), the missing ones are read from the
 //!   checkpoint into their slots, and the op outputs the ids mapped to slots. The layer's
 //!   matmuls read the slot tensors.
+//! - **Chunked steps** (decode and verify steps of more pairs than slots, #1205): the model
+//!   splits the step's rows into pieces of at most `n_slots` pairs ([`SsdExperts::pieces`]),
+//!   each a fetch in slot mode and its own matmuls, one after the other. A piece's fetch sees
+//!   the whole step's ids and evicts the experts the later pieces need last.
 //! - **Big steps** (prompts): the layer's routed experts go into a staging buffer of all
 //!   `n_expert` experts: the cached ones copied from their slots, the others read from the
 //!   checkpoint; slots no expert holds yet take a copy. The op outputs the ids unchanged and the
@@ -52,6 +56,15 @@ pub const KINDS: [&str; 3] = ["ffn_up_exps", "ffn_gate_exps", "ffn_down_exps"];
 
 /// Slot-mode steps of the first layer between hit-rate reports.
 const REPORT_EVERY: u64 = 128;
+
+/// Decode and verify steps of more routed pairs than slots go through the slots in pieces
+/// while their pairs are at most this many times the layer's experts (#1205); bigger ones
+/// stage. A staged step moves every distinct routed expert once (a copy from its slot or a
+/// read), at most `n_expert`, and never updates the cache; a chunked one reads only its
+/// pieces' misses, at most its pairs, and keeps the hot experts cached. Twice `n_expert` caps a
+/// chunked step's worst case (no expert shared, nothing cached) at twice the staged one's,
+/// and covers 16 sequences of 4 verify rows at 288 experts and 8 used (512 pairs).
+const CHUNK_PAIRS_PER_EXPERT: usize = 2;
 
 /// When the tier is used (`--expert-ssd`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -547,29 +560,102 @@ impl SsdExperts {
         let ord = self.ord[il].ok_or_else(|| format!("layer {il} is not in the SSD tier"))?;
         let [n_used, n_tok, _, _] = ids.ne();
         let pairs = (n_used * n_tok) as usize;
+        let mode = if pairs <= self.inner.n_slots {
+            Mode::Slots
+        } else {
+            Mode::Stage(ord % 2)
+        };
+        self.fetch_op(ctx, il, ord, ids, mode, None)
+    }
+
+    /// The pieces a step of `n_tok` tokens takes through the slots when its routed pairs
+    /// exceed them (#1205): `decoding`, every sequence of the step decodes or verifies, and
+    /// at most [`CHUNK_PAIRS_PER_EXPERT`] pairs per expert. `None`: one [`Self::fetch`] (the
+    /// slots when the step fits them, else a staging buffer).
+    pub fn pieces(&self, n_tok: usize, decoding: bool) -> Option<usize> {
+        let i = &self.inner;
+        let pairs = i.n_used * n_tok;
+        if !decoding || pairs <= i.n_slots || pairs > CHUNK_PAIRS_PER_EXPERT * i.n_expert {
+            return None;
+        }
+        Some(n_tok.div_ceil(i.n_slots / i.n_used))
+    }
+
+    /// Layer `il`'s experts for rows `rows` of a step routing `ids` (`[n_used, n_tokens]`
+    /// I32), at most `n_slots` pairs, in slot mode: a piece of a chunked step
+    /// ([`Self::pieces`], [`piece_rows`]). `after`: the previous piece's result, so this
+    /// fetch runs once its matmuls have read their slots. The fetch sees every row of `ids`
+    /// and keeps the experts of the rows after `rows` cached where it can.
+    pub fn fetch_rows<'a>(
+        &'a self,
+        ctx: &'a Context,
+        il: usize,
+        ids: Tensor<'a>,
+        rows: std::ops::Range<usize>,
+        after: Option<Tensor<'a>>,
+    ) -> Result<SsdLayer<'a>, String> {
+        let ord = self.ord[il].ok_or_else(|| format!("layer {il} is not in the SSD tier"))?;
+        let [_, n_tok, _, _] = ids.ne();
+        if rows.is_empty() || rows.end > n_tok as usize || rows.len() * self.n_used > self.n_slots()
+        {
+            return Err(format!(
+                "rows {rows:?} of {n_tok}: a piece takes 1 to {} rows",
+                self.n_slots() / self.n_used
+            ));
+        }
+        self.fetch_op(ctx, il, ord, ids, Mode::Slots, Some((rows, after)))
+    }
+
+    /// The fetch op of layer `il` (ordinal `ord`) in `mode` for `ids`, or for `piece`'s rows
+    /// of them, after its tensor if given.
+    fn fetch_op<'a>(
+        &'a self,
+        ctx: &'a Context,
+        il: usize,
+        ord: usize,
+        ids: Tensor<'a>,
+        mode: Mode,
+        piece: Option<(std::ops::Range<usize>, Option<Tensor<'a>>)>,
+    ) -> Result<SsdLayer<'a>, String> {
+        let [n_used, n_tok, _, _] = ids.ne();
+        let pairs = (n_used * n_tok) as usize;
         if self.inner.xchg.is_some() && pairs > self.inner.cap {
             return Err(format!(
                 "a step of {n_tok} tokens: the SSD expert tier takes at most {}",
                 self.inner.cap / self.n_used
             ));
         }
-        let mode = if pairs <= self.inner.n_slots {
-            Mode::Slots
-        } else {
-            Mode::Stage(ord % 2)
-        };
         let ids = if ids.is_contiguous() {
             ids
         } else {
             ctx.cont(ids)
         };
-        let out = ctx.external_with(
-            &FETCH,
-            types::I32,
-            ids.ne(),
-            &[ids],
-            &[self.id, ord as i32, mode.param()],
-        );
+        let out = match piece {
+            None => ctx.external_with(
+                &FETCH,
+                types::I32,
+                ids.ne(),
+                &[ids],
+                &[self.id, ord as i32, mode.param()],
+            ),
+            Some((rows, after)) => {
+                let mut src = vec![ids];
+                src.extend(after);
+                ctx.external_with(
+                    &FETCH,
+                    types::I32,
+                    [n_used, rows.len() as i64, 1, 1],
+                    &src,
+                    &[
+                        self.id,
+                        ord as i32,
+                        mode.param(),
+                        rows.start as i32,
+                        rows.len() as i32,
+                    ],
+                )
+            }
+        };
         let name = |kind: &str, scale: bool| match mode {
             Mode::Slots if scale => format!("ssd.{il}.{kind}.scale"),
             Mode::Slots => format!("ssd.{il}.{kind}"),
@@ -693,9 +779,58 @@ impl SsdExperts {
             Mode::Stage(ord % 2)
         };
         let mut out = vec![0; ids.len()];
-        self.inner.fetch(ord, mode, ids, &mut out, n_tokens)?;
+        self.inner.fetch(ord, mode, ids, &[], &mut out, n_tokens)?;
         Ok(out)
     }
+
+    /// The fetch of a piece on the host ([`Self::fetch_rows`]): rows `rows` of a step routing
+    /// `ids` (`n_used` per row), in slot mode. For tests.
+    pub fn fetch_host_rows(
+        &self,
+        il: usize,
+        ids: &[i32],
+        rows: std::ops::Range<usize>,
+    ) -> Result<Vec<i32>, String> {
+        let ord = self.ord[il].ok_or("not a tier layer")?;
+        if rows.is_empty() || rows.len() * self.n_used > self.n_slots() {
+            return Err(format!("rows {rows:?}: more pairs than slots"));
+        }
+        let (mine, later) = piece_ids(ids, self.n_used, rows.start, rows.len())?;
+        let mut out = vec![0; mine.len()];
+        self.inner
+            .fetch(ord, Mode::Slots, mine, later, &mut out, rows.len())?;
+        Ok(out)
+    }
+}
+
+/// `n` rows split into `k` pieces of consecutive rows, as even as they go (the first `n % k`
+/// one row longer): the rows of a chunked step's pieces ([`SsdExperts::pieces`]).
+pub fn piece_rows(n: usize, k: usize) -> Vec<std::ops::Range<usize>> {
+    let k = k.clamp(1, n.max(1));
+    let (base, extra) = (n / k, n % k);
+    let mut at = 0;
+    (0..k)
+        .map(|i| {
+            let len = base + usize::from(i < extra);
+            at += len;
+            at - len..at
+        })
+        .collect()
+}
+
+/// The ids of rows `row0..row0 + rows` of a step's `ids` (`n_used` per row), and those of the
+/// rows after them.
+fn piece_ids(
+    ids: &[i32],
+    n_used: usize,
+    row0: usize,
+    rows: usize,
+) -> Result<(&[i32], &[i32]), String> {
+    let (a, b) = (row0 * n_used, (row0 + rows) * n_used);
+    if b > ids.len() {
+        return Err(format!("rows {row0}..{} of {} ids", row0 + rows, ids.len()));
+    }
+    Ok((&ids[a..b], &ids[b..]))
 }
 
 impl Drop for SsdExperts {
@@ -718,12 +853,14 @@ impl Drop for SsdExperts {
 
 impl Inner {
     /// The work of one fetch: makes every expert of `ids` readable where `mode` puts it and
-    /// writes the ids the matmuls read into `out`.
+    /// writes the ids the matmuls read into `out`. `later`: a chunked step's ids of the pieces
+    /// after this one (slot mode), whose experts are the last this fetch evicts.
     fn fetch(
         &self,
         ord: usize,
         mode: Mode,
         ids: &[i32],
+        later: &[i32],
         out: &mut [i32],
         n_tokens: usize,
     ) -> Result<(), String> {
@@ -764,7 +901,18 @@ impl Inner {
                     // Pinned slots could leave the step short of victims.
                     self.reap(&mut st, ord, true);
                 }
-                let plan = st.caches[ord].plan(&distinct);
+                let plan = if later.is_empty() {
+                    st.caches[ord].plan(&distinct)
+                } else {
+                    // Each expert's first row among the later pieces': the furthest go first.
+                    let mut next = vec![u32::MAX; self.n_expert];
+                    for (i, &e) in later.iter().enumerate() {
+                        if let Some(n) = usize::try_from(e).ok().and_then(|e| next.get_mut(e)) {
+                            *n = (*n).min((i / self.n_used) as u32);
+                        }
+                    }
+                    st.caches[ord].plan_ahead(&distinct, &next)
+                };
                 let mut jobs = Vec::with_capacity(plan.loads.len() * 3);
                 let mut bytes = 0;
                 for &(e, s) in &plan.loads {
@@ -1221,7 +1369,9 @@ fn open_trace(layers: &[usize], n_expert: usize, n_slots: usize) -> Option<trace
 }
 
 /// The fetch op: `src[0]` the step's ids (`[n_used, n_tokens]` I32), out the ids the matmuls
-/// read; params `[tier id, layer ordinal, mode]`.
+/// read; params `[tier id, layer ordinal, mode]`, and for a piece of a chunked step
+/// ([`SsdExperts::fetch_rows`]) its first row and rows (out `[n_used, rows]`; `src[1]` the
+/// node it runs after).
 pub static FETCH: ExternalOp = ExternalOp {
     name: "ssd_expert_fetch",
     cpu: fetch_cpu,
@@ -1240,22 +1390,39 @@ unsafe fn fetch_cpu(dst: &ffi::ggml_tensor, ith: usize, _nth: usize) {
     let p = external_params(dst);
     let inner = lookup(p[0]);
     let n = (dst.ne[0] * dst.ne[1]) as usize;
-    // SAFETY: the op's I32 source and output, `n` contiguous ids each, in host memory.
-    let (ids, out) = unsafe {
+    // SAFETY: the op's I32 source (the step's ids, contiguous) and output (`n` ids), in host
+    // memory.
+    let (all, out) = unsafe {
+        let s = &*dst.src[0];
         (
-            std::slice::from_raw_parts((*dst.src[0]).data as *const i32, n),
+            std::slice::from_raw_parts(s.data as *const i32, (s.ne[0] * s.ne[1]) as usize),
             std::slice::from_raw_parts_mut(dst.data as *mut i32, n),
         )
     };
-    if let Err(e) = inner.fetch(
-        p[1] as usize,
-        Mode::from_param(p[2]),
-        ids,
-        out,
-        dst.ne[1] as usize,
-    ) {
+    if let Err(e) = run_fetch(&inner, &p, dst.ne[0] as usize, all, out) {
         fatal(&e);
     }
+}
+
+/// A fetch op's work ([`FETCH`], params `p`) on the step's ids `all` (`n_used` per row) into
+/// `out`: the whole step, or the piece its params name.
+fn run_fetch(
+    inner: &Inner,
+    p: &[i32],
+    n_used: usize,
+    all: &[i32],
+    out: &mut [i32],
+) -> Result<(), String> {
+    let (ord, mode) = (p[1] as usize, Mode::from_param(p[2]));
+    let rows = out.len() / n_used.max(1);
+    if p[4] == 0 {
+        return inner.fetch(ord, mode, all, &[], out, rows);
+    }
+    let (mine, later) = piece_ids(all, n_used, p[3] as usize, p[4] as usize)?;
+    if mine.len() != out.len() {
+        return Err(format!("a piece of {} ids into {}", mine.len(), out.len()));
+    }
+    inner.fetch(ord, mode, mine, later, out, rows)
 }
 
 /// The prediction op: `src[0]` a prediction's ids (`[width, n_tokens]` I32, best first),
@@ -1307,8 +1474,8 @@ mod cuda {
     use std::sync::Arc;
 
     use super::trace::Predictor;
-    use super::{Inner, Mode, external_params, fatal, lookup};
-    use crate::ggml::ffi;
+    use super::{Inner, external_params, fatal, lookup, run_fetch};
+    use crate::ggml::{EXTERNAL_PARAMS, ffi};
 
     unsafe extern "C" {
         fn cudaMemcpyAsync(
@@ -1330,9 +1497,13 @@ mod cuda {
 
     struct Job {
         inner: Arc<Inner>,
-        ord: usize,
-        mode: Mode,
+        /// The op's params.
+        p: [i32; EXTERNAL_PARAMS],
+        /// Ids out (a fetch) or in (a prediction).
         n: usize,
+        /// A fetch: the step's ids in, `n_used` per row.
+        n_in: usize,
+        n_used: usize,
         n_tokens: usize,
         /// A prediction's ([`super::PREDICT`]), not a fetch.
         predictor: Option<Predictor>,
@@ -1346,21 +1517,21 @@ mod cuda {
             // SAFETY: the pinned prediction buffer, `pcap >= n` ids; the stream orders this
             // after the copy in.
             let ids = unsafe { std::slice::from_raw_parts(at as *const i32, job.n) };
-            if let Err(e) = job.inner.predict(job.ord, p, ids, job.n_tokens) {
+            if let Err(e) = job.inner.predict(job.p[1] as usize, p, ids, job.n_tokens) {
                 fatal(&e);
             }
             return;
         }
         let (ids_in, ids_out) = job.inner.xchg.expect("exchange buffers");
-        // SAFETY: the pinned exchange buffers, `cap >= n` ids each; the stream orders this
-        // between the copy in and the copy out.
+        // SAFETY: the pinned exchange buffers, `cap >= n_in >= n` ids each; the stream orders
+        // this between the copy in and the copy out.
         let (ids, out) = unsafe {
             (
-                std::slice::from_raw_parts(ids_in as *const i32, job.n),
+                std::slice::from_raw_parts(ids_in as *const i32, job.n_in),
                 std::slice::from_raw_parts_mut(ids_out as *mut i32, job.n),
             )
         };
-        if let Err(e) = job.inner.fetch(job.ord, job.mode, ids, out, job.n_tokens) {
+        if let Err(e) = run_fetch(&job.inner, &job.p, job.n_used, ids, out) {
             fatal(&e);
         }
     }
@@ -1371,27 +1542,26 @@ mod cuda {
         let p = external_params(dst);
         let inner = lookup(p[0]);
         let n = (dst.ne[0] * dst.ne[1]) as usize;
+        // SAFETY: the op's source, made by `SsdExperts::fetch_op`: the step's ids (a piece's
+        // fetch sees every row).
+        let src = unsafe { &*dst.src[0] };
+        let n_in = (src.ne[0] * src.ne[1]) as usize;
         let (ids_in, ids_out) = inner.xchg.ok_or("no exchange buffers")?;
-        if n > inner.cap {
-            return Err(format!("{n} ids, room for {}", inner.cap));
+        if n_in > inner.cap || n > n_in {
+            return Err(format!("{n_in} ids in, {n} out, room for {}", inner.cap));
         }
         let job = Box::into_raw(Box::new(Job {
             inner: inner.clone(),
-            ord: p[1] as usize,
-            mode: Mode::from_param(p[2]),
+            p,
             n,
+            n_in,
+            n_used: dst.ne[0] as usize,
             n_tokens: dst.ne[1] as usize,
             predictor: None,
         }));
-        // SAFETY: device and pinned buffers of `n` ids; the host function owns `job`.
+        // SAFETY: device and pinned buffers of `n_in` ids; the host function owns `job`.
         unsafe {
-            let e = cudaMemcpyAsync(
-                ids_in as *mut c_void,
-                (*dst.src[0]).data,
-                n * 4,
-                DEFAULT,
-                stream,
-            );
+            let e = cudaMemcpyAsync(ids_in as *mut c_void, src.data, n_in * 4, DEFAULT, stream);
             if e != 0 {
                 drop(Box::from_raw(job));
                 return Err(format!("ids to host: CUDA error {e}"));
@@ -1428,9 +1598,10 @@ mod cuda {
             Predictor::from_code(p[2] as u8).ok_or_else(|| format!("predictor {}", p[2]))?;
         let job = Box::into_raw(Box::new(Job {
             inner: inner.clone(),
-            ord: p[1] as usize,
-            mode: Mode::Slots,
+            p,
             n,
+            n_in: n,
+            n_used: src.ne[0] as usize,
             n_tokens: src.ne[1] as usize,
             predictor: Some(predictor),
         }));

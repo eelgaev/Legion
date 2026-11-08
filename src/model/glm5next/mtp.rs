@@ -120,7 +120,9 @@ impl Model {
         for l in 0..hp.n_layer {
             self.glm_ssd_predict(&pass, l, x, Predictor::Mtp, None)?;
         }
-        let moe = self.glm_moe(&pass, il, x)?;
+        // A chunked SSD step's room (#1205): what the context holds past the head's rest.
+        let room = ctx.tensors_left().saturating_sub(super::SSD_TAIL_TENSORS);
+        let moe = self.glm_moe(&pass, il, x, room)?;
         let sh = self.glm_ffn(ctx, il, "_shexp", p.clamp_shexp[il], x)?;
         let out = ops::add(ctx, ops::add(ctx, moe, sh), ffn_inp);
         let hn = ops::rms_norm(
