@@ -81,6 +81,11 @@ pub struct Metrics {
     spec_acceptance_rate: Gauge<f64, AtomicU64>,
     spec_mean_accepted_length: Gauge<f64, AtomicU64>,
     spec_mean_k: Gauge<f64, AtomicU64>,
+    ngram_rows: Gauge,
+    ngram_cache_hits: Gauge,
+    ngram_cache_misses: Gauge,
+    ngram_cache_hit_rate: F64Gauge,
+    ngram_hot_rows: Gauge,
     model_bytes: Family<PhaseLabels, F64Gauge>,
     model_seconds: Family<PhaseLabels, F64Gauge>,
     model_gb_s: Family<PhaseLabels, F64Gauge>,
@@ -218,6 +223,33 @@ impl Metrics {
             "Mean selected draft depth of decoding sequences in the last drafting step",
             spec_mean_k.clone(),
         );
+        // The n-gram (or Engram) table's RAM row cache when its rows come from the SSD.
+        let ngram_rows = gauge(
+            &mut registry,
+            "legion_engine_ngram_rows",
+            "N-gram table rows asked of the SSD tier's RAM row cache since start (fetches and prefetches; 0 for the RAM tiers)",
+        );
+        let ngram_cache_hits = gauge(
+            &mut registry,
+            "legion_engine_ngram_cache_hits",
+            "Of legion_engine_ngram_rows, rows the RAM row cache held",
+        );
+        let ngram_cache_misses = gauge(
+            &mut registry,
+            "legion_engine_ngram_cache_misses",
+            "Of legion_engine_ngram_rows, rows read from the SSD",
+        );
+        let ngram_cache_hit_rate = F64Gauge::default();
+        registry.register(
+            "legion_engine_ngram_cache_hit_rate",
+            "legion_engine_ngram_cache_hits over legion_engine_ngram_rows since start (0 before any)",
+            ngram_cache_hit_rate.clone(),
+        );
+        let ngram_hot_rows = gauge(
+            &mut registry,
+            "legion_engine_ngram_hot_rows",
+            "N-gram table rows the RAM budget's hot set pins now (--ngram-ram SIZE)",
+        );
         // Model bytes (#391): what the steps must read of the weights, the routed experts and
         // the KV cache, not measured traffic.
         let model_bytes = Family::<PhaseLabels, F64Gauge>::default();
@@ -301,6 +333,11 @@ impl Metrics {
             spec_verify_steps,
             spec_acceptance_rate,
             spec_mean_accepted_length,
+            ngram_rows,
+            ngram_cache_hits,
+            ngram_cache_misses,
+            ngram_cache_hit_rate,
+            ngram_hot_rows,
         }
     }
 
@@ -378,6 +415,16 @@ impl Metrics {
             .set(spec.acceptance_rate().unwrap_or(0.0));
         self.spec_mean_accepted_length
             .set(spec.mean_accepted_length().unwrap_or(0.0));
+        self.ngram_rows.set(stats.ngram_rows as i64);
+        self.ngram_cache_hits.set(stats.ngram_cache_hits as i64);
+        self.ngram_cache_misses
+            .set(stats.ngram_rows.saturating_sub(stats.ngram_cache_hits) as i64);
+        self.ngram_cache_hit_rate.set(if stats.ngram_rows > 0 {
+            stats.ngram_cache_hits as f64 / stats.ngram_rows as f64
+        } else {
+            0.0
+        });
+        self.ngram_hot_rows.set(stats.ngram_hot_rows as i64);
         let mb = stats.model_bytes;
         for (phase, p) in [
             ("prefill", mb.prefill),

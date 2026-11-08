@@ -300,6 +300,11 @@ pub struct EngineStats {
     pub expert_cache_misses: u64,
     pub expert_cache_slots: u32,
     pub expert_cache_layers: u32,
+    /// N-gram (or Engram) table rows asked of the SSD tier's RAM row cache since start, those
+    /// it held, and the rows its hot set pins now (`--ngram-ram SIZE`); 0 for the RAM tiers.
+    pub ngram_rows: u64,
+    pub ngram_cache_hits: u64,
+    pub ngram_hot_rows: u64,
     /// Prompt tokens served from the prefix cache since start.
     pub prefix_cache_hit_tokens: u64,
     /// Sequences preempted for KV blocks since start (`--kv-admission on-demand`, #627).

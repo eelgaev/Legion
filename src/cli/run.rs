@@ -87,13 +87,7 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     cfg.split_batches = m.split_batches;
     cfg.pipeline_groups = m.pipeline_groups;
     cfg.pipeline_min_group = m.pipeline_min_group;
-    cfg.ngram = super::serve::ngram_options(
-        m.ngram_io,
-        m.ngram_ram_gib,
-        m.ngram_inflight,
-        m.ngram_aio_max,
-        m.ngram_keep_awake_ms,
-    );
+    cfg.ngram = m.ngram_options()?;
     cfg.residency = residency;
     cfg.mmproj = m.mmproj.clone();
     cfg.gpus = m.gpus;

@@ -874,6 +874,7 @@ fn nvfp4_qwen4_runs_the_same_with_any_shard_order() {
         let mut model = Model::load(g, |_| backend.buffer_type()).unwrap();
         let opts = TableOptions {
             io,
+            ram: Default::default(),
             ram_cache_bytes: Some(0),
             inflight: 4,
             aio_max: lookup_table::DEFAULT_AIO_MAX,
@@ -1223,6 +1224,7 @@ fn real_checkpoint_matches_the_gguf() {
     let (pa, pb) = (params(&ours), params(&want));
     let opts = TableOptions {
         io: TableIo::Direct,
+        ram: Default::default(),
         ram_cache_bytes: Some(0),
         inflight: 8,
         aio_max: lookup_table::DEFAULT_AIO_MAX,
@@ -1339,6 +1341,7 @@ fn gpu_logits(g: &GgufFile, prompts: &[Vec<u32>]) -> Vec<Vec<f32>> {
     .unwrap();
     let opts = TableOptions {
         io: TableIo::Direct,
+        ram: Default::default(),
         ram_cache_bytes: Some(1 << 30),
         inflight: 32,
         aio_max: lookup_table::DEFAULT_AIO_MAX,

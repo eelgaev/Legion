@@ -789,3 +789,70 @@ fn uma_free_gib_flag() {
         assert!(parse(&["--uma-free-gib", bad]).is_err(), "{bad}");
     }
 }
+
+fn ngram(argv: &[&str]) -> anyhow::Result<lookup_table::TableOptions> {
+    let argv = ["legion", "serve"].into_iter().chain(argv.iter().copied());
+    match Cli::try_parse_from(argv).unwrap().command {
+        Command::Serve(args) => args.engine.model.ngram_options(),
+        _ => unreachable!("the parser returned a command other than serve"),
+    }
+}
+
+/// `--ngram-ram` (#1209): auto by default, sizes in binary units, `--ngram-ram-gib N` as
+/// `--ngram-ram NG`, and the pairs with `--ngram-io` that contradict themselves refused.
+#[test]
+fn ngram_ram_flag() {
+    let gib = 1u64 << 30;
+    let o = ngram(&[]).unwrap();
+    assert_eq!(
+        (o.io, o.ram, o.ram_cache_bytes),
+        (TableIo::Auto, RamBudget::Auto, None)
+    );
+    assert_eq!(
+        ngram(&["--ngram-ram", "8G"]).unwrap().ram,
+        RamBudget::Bytes(8 * gib)
+    );
+    assert_eq!(
+        ngram(&["--ngram-ram", "512M"]).unwrap().ram,
+        RamBudget::Bytes(512 << 20)
+    );
+    assert_eq!(
+        ngram(&["--ngram-ram", "1.5"]).unwrap().ram,
+        RamBudget::Bytes(3 * gib / 2)
+    );
+    assert_eq!(
+        ngram(&["--ngram-ram", "30%"]).unwrap().ram,
+        RamBudget::Percent(30.0)
+    );
+    assert_eq!(ngram(&["--ngram-ram", "all"]).unwrap().ram, RamBudget::All);
+    // The old spelling, in GiB.
+    let old = ngram(&["--ngram-ram-gib", "2"]).unwrap();
+    assert_eq!(
+        (old.ram, old.ram_cache_bytes),
+        (RamBudget::Bytes(2 * gib), None)
+    );
+    assert_eq!(
+        ngram(&["--ngram-ram-gib", "0.5"]).unwrap().ram,
+        RamBudget::Bytes(gib / 2)
+    );
+    // A size with direct, all with ram.
+    let d = ngram(&["--ngram-io", "direct", "--ngram-ram", "2G"]).unwrap();
+    assert_eq!((d.io, d.ram), (TableIo::Direct, RamBudget::Bytes(2 * gib)));
+    let r = ngram(&["--ngram-io", "ram", "--ngram-ram", "all"]).unwrap();
+    assert_eq!((r.io, r.ram), (TableIo::Ram, RamBudget::All));
+    // Contradictions.
+    for bad in [
+        &["--ngram-io", "mmap", "--ngram-ram", "2G"][..],
+        &["--ngram-io", "mmap", "--ngram-ram", "all"],
+        &["--ngram-io", "direct", "--ngram-ram", "all"],
+        &["--ngram-ram", "2G", "--ngram-ram-gib", "2"],
+        &["--ngram-ram-gib", "0"],
+    ] {
+        assert!(ngram(bad).is_err(), "{bad:?}");
+    }
+    // Not sizes.
+    for bad in ["0", "0G", "-1G", "0%", "101%", "8X", "lots"] {
+        let argv = ["legion", "serve", "--ngram-ram", bad];
+        assert!(Cli::try_parse_from(argv).is_err(), "{bad}");
+    }
+}

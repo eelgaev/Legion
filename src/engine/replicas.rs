@@ -329,6 +329,9 @@ pub fn merge_stats(all: &[EngineStats]) -> EngineStats {
         out.expert_cache_hits += s.expert_cache_hits;
         out.expert_cache_misses += s.expert_cache_misses;
         out.expert_cache_slots += s.expert_cache_slots;
+        out.ngram_rows += s.ngram_rows;
+        out.ngram_cache_hits += s.ngram_cache_hits;
+        out.ngram_hot_rows += s.ngram_hot_rows;
         out.prefix_cache_hit_tokens += s.prefix_cache_hit_tokens;
         out.preemptions += s.preemptions;
         out.spec.drafted += s.spec.drafted;
