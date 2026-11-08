@@ -1341,10 +1341,12 @@ fn readers_read_up_to_the_end_of_an_odd_sized_shard() {
     let dir = scratch();
     let path = dir.path().join("odd.bin");
     std::fs::write(&path, &f.data).unwrap();
-    let job = |dst: &mut Vec<u8>, scale_len: usize| Job::Read {
+    // `split` sizes each piece's scales from its rows, so the cut-short read shifts the scales
+    // one byte later (their length stays) to end a byte past the end of the file.
+    let job = |dst: &mut Vec<u8>, scale_shift: usize| Job::Read {
         src: Nvfp4Source {
             weight: range(at, w),
-            scale: range(at + w, scale_len),
+            scale: range(at + w + scale_shift, s),
             scale2: 1.0,
         },
         rows,
@@ -1354,10 +1356,10 @@ fn readers_read_up_to_the_end_of_an_odd_sized_shard() {
     for direct in [true, false] {
         let pool = Pool::new(std::slice::from_ref(&path), 2, direct).unwrap();
         let mut out = vec![0u8; rows * k / 64 * 36];
-        pool.run(vec![job(&mut out, s)]).unwrap();
+        pool.run(vec![job(&mut out, 0)]).unwrap();
         let want = repack_nvfp4(f.bytes(range(at, w)), f.bytes(range(at + w, s)), rows, k);
         assert_eq!(out, want, "direct {direct} (pool direct {})", pool.direct());
-        let e = pool.run(vec![job(&mut out, s + 1)]).unwrap_err();
+        let e = pool.run(vec![job(&mut out, 1)]).unwrap_err();
         assert!(e.contains("shard 0") && e.contains("end of file"), "{e}");
     }
 }
