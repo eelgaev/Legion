@@ -1,6 +1,7 @@
 //! Model implementations: each turns loaded weights into ggml graphs. [`core`] holds what every
 //! architecture shares; each architecture module plugs into it through [`core::Arch`].
 
+pub mod bf16_experts;
 pub mod cluster_select;
 pub mod core;
 pub mod deepseek41;

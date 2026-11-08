@@ -95,10 +95,9 @@ fn real_checkpoint_matches_the_gguf() {
     let ours = GgufFile::open(&hf).unwrap();
     let want = GgufFile::open(&gguf).unwrap();
     let mut problems = Vec::new();
-    let n_layer = ours
-        .get("glm5-next.block_count")
-        .and_then(|v| v.as_f64())
-        .unwrap() as usize;
+    let key = |k: &str| ours.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0) as usize;
+    // The decoder's layers (the checkpoint's MTP block, when it has one, after them).
+    let n_layer = key("glm5-next.block_count") - key("glm5-next.nextn_predict_layers");
 
     // Metadata: every architecture key of the GGUF (per-layer arrays cut to the checkpoint's
     // layers), numbers compared as numbers.
@@ -119,7 +118,7 @@ fn real_checkpoint_matches_the_gguf() {
         }
         match ours.get(&key) {
             None => problems.push(format!("missing key {key}")),
-            Some(v) if num(&v, false) != num(&value, true) || v.as_str() != value.as_str() => {
+            Some(v) if num(&v, true) != num(&value, true) || v.as_str() != value.as_str() => {
                 problems.push(format!("key {key}: {v} vs GGUF {value}"))
             }
             Some(_) => {}
@@ -154,6 +153,9 @@ fn real_checkpoint_matches_the_gguf() {
         .collect();
     let mut mine = std::collections::BTreeMap::new();
     for t in ours.tensors() {
+        if layer(&t.name).is_some_and(|il| il >= n_layer) {
+            continue;
+        }
         match theirs.remove(&t.name) {
             None if t.name.ends_with(".scale") || t.name.ends_with(".input_scale") => {}
             None => problems.push(format!("extra tensor {}", t.name)),

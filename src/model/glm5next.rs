@@ -1172,6 +1172,23 @@ impl Model {
                 w,
             ));
         }
+        // BF16 experts as shipped (the NVFP4 release's MTP layer, #560): a grouped GEMV over the
+        // pass's few rows (an MTP pass's MoE takes its output rows only).
+        if self.expert_tier(il).is_none()
+            && [up, gate, down]
+                .iter()
+                .all(|w| crate::model::bf16_experts::takes(*w))
+        {
+            use crate::model::bf16_experts;
+            let n = x.ne()[1];
+            let x = if x.is_contiguous() { x } else { ctx.cont(x) };
+            let xf = ctx.reshape_3d(x, hp.n_embd, 1, n);
+            let g = bf16_experts::mul_mat_id(ctx, gate, xf, ids);
+            let u = bf16_experts::mul_mat_id(ctx, up, xf, ids);
+            let h = ops::glu(ctx, g, u, limit);
+            let y = bf16_experts::mul_mat_id(ctx, down, h, ids);
+            return Ok(ops::weighted_sum(ctx, y, w));
+        }
         let refs = |[up, gate, down]: [Tensor<'a>; 3]| moe_ffn::ExpertRefs {
             up,
             gate,
