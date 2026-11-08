@@ -283,6 +283,9 @@ pub(super) struct Follower {
 }
 
 impl Follower {
+    /// Rank 1 over `exec` (its layers from the split on), drafting with `drafter` under
+    /// `--spec mtp`; `mine` is (layer count, split) as rank 0's hello must say, `n_blocks` the
+    /// KV blocks it has.
     pub fn new(
         exec: Executor,
         drafter: Option<MtpDrafter>,
@@ -358,6 +361,7 @@ impl Follower {
         })
     }
 
+    /// Runs one of rank 0's requests; an error goes back as [`Reply::Error`].
     pub fn handle(&mut self, req: Request) -> Result<Reply, String> {
         let exec = &mut self.exec;
         let blocks = &mut self.blocks;
