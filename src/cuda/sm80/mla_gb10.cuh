@@ -5,7 +5,8 @@
 // Not a standalone header: glm5next.cu includes it inside its anonymous namespace, after
 // mla_tiled_kernel (MD, MC, MT_H) and the cp.async helpers (xcp16, xcp_commit, xcp_wait_all).
 // The body is behind a __CUDA_ARCH__ >= 800 guard (a __trap() stub below), so the file compiles
-// for every target; the launcher takes it on compute capability 12.1 only (gb10_device).
+// for every target; the launcher takes it on compute capability 12.x (GB10, RTX 50) by
+// legion_device::sm12x_device, or on any sm_80+ when asked (ops::MlaKernel).
 //
 // mla_tiled (one CTA of 8 warps per SM, every warp scoring and then summing values in turn) is
 // bound by shared-memory loads: each warp-step of its score loop takes 4 wavefronts for 64

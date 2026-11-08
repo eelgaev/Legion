@@ -17,11 +17,12 @@
 //! ggml's row split does not depend on the other rows, so CTAs of several weights side by side
 //! compute what each weight's own launch would.
 //!
-//! Taken on NVIDIA compute capability 7.x and 8.x and on a GB10 ([`device_supported`]; #311:
-//! ggml's GB10 mmvq is the same launch at 2-8 columns plus an L2 prefetch of the weights, which
-//! the kernels issue too, and a programmatic dependent launch, which the op's launches are there;
-//! one column, where ggml widens the CTA, stays on ggml, [`device_takes_cols`], and so do the
-//! hyper-connection mixer's parts, [`GB10_NO_PARTS`]; on a GB10 only with `--q8-group`
+//! Taken on NVIDIA compute capability 7.x and 8.x, on an RTX 50 (12.0, ggml's generic table as
+//! on 8.x; #1200) and on a GB10 ([`device_supported`]; #311: ggml's GB10 mmvq is the same
+//! launch at 2-8 columns plus an L2 prefetch of the weights, which the kernels issue too, and a
+//! programmatic dependent launch, which the op's launches are on every 12.x; one column, where
+//! ggml widens the CTA, stays on ggml, [`device_takes_cols`]; on every 12.x the
+//! hyper-connection mixer's parts do too, [`GB10_NO_PARTS`]; on a GB10 only with `--q8-group`
 //! ([`Mode::All`]): its det decode was flat, so the default leaves it on ggml; #994: the default's
 //! parts there are bitwise but flat too, +0.4% at C=1 and +0.8% at C=4 under `--deterministic`, and
 //! `--q8-group`'s one DeltaNet qkv-and-gate node moves the greedy text once a verify step is 8
@@ -215,20 +216,35 @@ pub fn part_in(mode: Mode, mask: u8, arch: &str, bit: u8) -> bool {
 }
 
 /// Whether part `bit` of the op runs in a model of architecture `arch` ([`part_in`] with the
-/// current [`Mode`] and mask), on a GB10 without [`GB10_NO_PARTS`].
+/// current [`Mode`] and mask), on compute capability 12.x without [`GB10_NO_PARTS`].
 pub fn part(arch: &str, bit: u8) -> bool {
     part_in(mode(), PARTS.load(Ordering::Relaxed), arch, bit)
-        && !((bit & GB10_NO_PARTS) != 0 && gb10())
+        && !((bit & GB10_NO_PARTS) != 0 && sm12x())
 }
 
-/// The parts a GB10 never runs (#311): its hyper-connection mixer has kernels of its own, which
-/// do not write the block input's Q8_1 blocks ([`PART_HC`]), so neither can the routed experts
-/// read them ([`PART_EXPERTS`]); a DeltaNet layer's qkv and gate then take the op only as one
-/// node ([`PART_DELTA`] under [`Mode::All`]).
+/// The parts compute capability 12.x (the GB10, #311; RTX 50, #1200) never runs: its
+/// hyper-connection mixer has kernels of its own, which do not write the block input's Q8_1
+/// blocks ([`PART_HC`]), so neither can the routed experts read them ([`PART_EXPERTS`]); a
+/// DeltaNet layer's qkv and gate then take the op only as one node ([`PART_DELTA`] under
+/// [`Mode::All`]).
 pub const GB10_NO_PARTS: u8 = PART_HC | PART_EXPERTS;
 
+/// Whether the current GPU is compute capability 12.x (GB10, RTX 50: one SM design): where
+/// qwen4exp's hyper-connection mixer takes its GB10 kernels (`src/cuda/qwen4_hc.cu`'s
+/// `use_gb10`, [`GB10_NO_PARTS`]) and the op's launches are programmatic dependent launches.
+pub fn sm12x() -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        launch::compute_capability().is_some_and(|cc| cc / 10 == 12)
+    }
+    #[cfg(not(feature = "cuda"))]
+    false
+}
+
 /// Whether the current GPU is a GB10 (compute capability 12.1), whose ggml mmvq the op copies
-/// at 2-8 columns ([`device_takes_cols`]).
+/// at 2-8 columns ([`device_takes_cols`]: ggml's `MMVQ_PARAMETERS_GB10` is built for 12.1
+/// only; an RTX 50 takes its generic table, as 8.x does) and whose memory made the default
+/// flat ([`mode_on_device`]).
 pub fn gb10() -> bool {
     #[cfg(feature = "cuda")]
     {
@@ -306,8 +322,8 @@ pub fn takes(ws: &[Tensor<'_>], x: Tensor<'_>) -> bool {
 }
 
 /// Whether graphs built now may take the op where the shapes fit (and [`part`] runs): not
-/// [`Mode::Off`], inside stage graphs, and a GPU of compute capability 7.x or 8.x, or a GB10
-/// under [`Mode::All`] ([`device_supported`], [`mode_on_device`]).
+/// [`Mode::Off`], inside stage graphs, and a GPU of compute capability 7.x, 8.x or 12.0, or a
+/// GB10 under [`Mode::All`] ([`device_supported`], [`mode_on_device`]).
 pub fn enabled() -> bool {
     cfg!(feature = "cuda")
         && crate::ggml::stage_graph::enabled()
@@ -332,15 +348,21 @@ pub fn fits_all(ws: &[Tensor<'_>], x: Tensor<'_>) -> bool {
 }
 
 /// Whether the current GPU runs the op as ggml's mmvq: NVIDIA compute capability 7.x or 8.x
-/// (Volta to Ada, whose Q8_0 mmvq launch it copies), or a GB10 (12.1, #311: the same launch at
-/// 2-8 columns, with ggml's L2 prefetch, [`device_takes_cols`]).
+/// (Volta to Ada, whose Q8_0 mmvq launch it copies), 12.0 (RTX 50, #1200: ggml's generic Q8_0
+/// table, as 8.x, at 1-8 columns) or a GB10 (12.1, #311: the same launch at 2-8 columns, with
+/// ggml's L2 prefetch, [`device_takes_cols`]).
 pub fn device_supported() -> bool {
     #[cfg(feature = "cuda")]
     {
-        launch::compute_capability().is_some_and(|cc| (70..90).contains(&cc) || cc == 121)
+        launch::compute_capability().is_some_and(cc_supported)
     }
     #[cfg(not(feature = "cuda"))]
     false
+}
+
+/// [`device_supported`] for compute capability `cc` (`10 * major + minor`).
+pub fn cc_supported(cc: i32) -> bool {
+    (70..90).contains(&cc) || cc == 120 || cc == 121
 }
 
 /// Bytes of the quantized input of `n` columns of `k` values (Q8_1 blocks, `k / 32` a column,
@@ -810,9 +832,10 @@ mod launch {
         }
     }
 
-    /// Launches kernel `kernel` of the table on `p` (by value) on `stream`; on a GB10 as a
-    /// programmatic dependent launch, as ggml-cuda launches its own kernels there (each kernel
-    /// waits for the one ahead before it touches activations, `src/cuda/q8_group.cu`).
+    /// Launches kernel `kernel` of the table on `p` (by value) on `stream`; on compute
+    /// capability 12.x (GB10, RTX 50) as a programmatic dependent launch, as ggml-cuda launches
+    /// its own kernels there (each kernel waits for the one ahead before it touches
+    /// activations, `src/cuda/q8_group.cu`).
     fn launch(
         kernel: usize,
         grid: Dim3,
@@ -833,7 +856,7 @@ mod launch {
             dynamic_smem: 0,
             stream,
             attrs: &mut attr,
-            num_attrs: u32::from(compute_capability() == Some(121)),
+            num_attrs: u32::from(compute_capability().is_some_and(|cc| cc / 10 == 12)),
         };
         // SAFETY: a kernel of the table taking `legion_q8_group` by value, from the launch's
         // copy of `p`; its pointers are device memory of the stream's device (the nodes).

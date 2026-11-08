@@ -36,16 +36,16 @@
 // `l2_ahead` (`legion serve --hc-l2-prefetch`) adds CTAs to the kernel before each reader that
 // read its weights into L2 meanwhile: the norm's for down's matrix, down_ahead's for up's.
 //
-// On the GB10 (compute capability 12.1) the same four steps run as `norm_g`, `down_g`,
-// `quantize_lo_g` and `up_mix_g` (sm80/qwen4_hc.cuh): the same bits, the weights staged in
-// shared memory and each kernel launched early (PDL) to stage its weights while the previous
-// one runs. use_gb10() picks them per device. Where its shared memory has room (always for
+// On the GB10 (compute capability 12.1; since #1200 any 12.x, RTX 50 too) the same four steps
+// run as `norm_g`, `down_g`, `quantize_lo_g` and `up_mix_g` (sm80/qwen4_hc.cuh): the same bits,
+// the weights staged in shared memory and each kernel launched early (PDL) to stage its weights
+// while the previous one runs. use_gb10() picks them per device. Where its shared memory has room (always for
 // Flash-Next), `up_mix_g` makes lo's Q8_1 itself and `quantize_lo_g` is not launched (#827).
 //
 // BF16 down and up matrices (`bf16`: Qwen3.8-Flash-Next-NVFP4 ships its mixers in BF16; opt-in,
 // `legion serve --hc-mix-bf16`, #748): `norm`, then `down` and `up_mix` with V-wide BF16 loads
 // against the F32 xn and lo (as ggml's mmvf takes F32 activations; no Q8_1, no quantize_lo).
-// On the GB10 they run as `norm_g` (no Q8_1), `down_bf16_g` and `up_mix_bf16_g`
+// On compute capability 12.x they run as `norm_g` (no Q8_1), `down_bf16_g` and `up_mix_bf16_g`
 // (sm80/qwen4_hc_bf16.cuh): the weights loaded into registers ahead of the PDL wait.
 
 #include "device_cache.cuh"
@@ -999,14 +999,15 @@ void launch_rows_g(const legion_hc_mix & p, cudaStream_t s) {
     launch_pdl(up_mix_g<NT, G_COLS, false>, dim3(p.n_embd / G_COLS), UP_THREADS, rows, s, p);
 }
 
-// Whether the GB10 kernels take this mixer: on a GB10, the weights 16-byte aligned for the
-// copies (rows and the CTAs' runs of them), gamma and the stream in norm_g's registers.
+// Whether the GB10 kernels take this mixer: on compute capability 12.x (GB10, RTX 50;
+// legion_device::sm12x_device), the weights 16-byte aligned for the copies (rows and the CTAs'
+// runs of them), gamma and the stream in norm_g's registers.
 bool use_gb10(const legion_hc_mix & p) {
     const int64_t chunk = G_COLS * p.up_nb1;
     return (uintptr_t) p.down % 16 == 0 && p.down_nb1 % 16 == 0 && G_ROWS * p.down_nb1 <= 48 * 1024 &&
            p.rank % G_ROWS == 0 && (uintptr_t) p.up % 16 == 0 && chunk % 16 == 0 &&
            (p.n_embd * p.up_nb1) % 16 == 0 && p.hc * chunk <= 48 * 1024 && p.n_embd % G_COLS == 0 &&
-           p.n_embd <= NORM_THREADS * G_NORM_M && gb10_device(up_mix_g<1, G_COLS, false>);
+           p.n_embd <= NORM_THREADS * G_NORM_M && legion_device::sm12x_device(up_mix_g<1, G_COLS, false>);
 }
 
 template <int NT>
@@ -1016,13 +1017,15 @@ void launch_rows_bf16_g(const legion_hc_mix & p, cudaStream_t s) {
     launch_pdl(up_mix_bf16_g<NT>, dim3(p.n_embd / G_COLS), UP_THREADS, 0, s, p);
 }
 
-// Whether the GB10 BF16 kernels take this mixer: on a GB10, the 16-byte loads aligned
-// (bf16_wide), a down row in GB_DOWN_U loads per thread, an up row in GB_UP_U per lane, the
-// CTA's hc x G_COLS up rows in GB_UP_PASSES passes, gamma and the stream in norm_g's registers.
+// Whether the GB10 BF16 kernels take this mixer: on compute capability 12.x, the 16-byte loads
+// aligned (bf16_wide), a down row in GB_DOWN_U loads per thread, an up row in GB_UP_U per lane,
+// the CTA's hc x G_COLS up rows in GB_UP_PASSES passes, gamma and the stream in norm_g's
+// registers.
 bool use_gb10_bf16(const legion_hc_mix & p) {
     return bf16_wide(p) && p.hc * p.n_embd <= GB_DOWN_THREADS * 8 * GB_DOWN_U && p.rank % GB_DOWN_ROWS == 0 &&
            p.rank <= UP_LANES * 8 * GB_UP_U && p.hc * G_COLS <= GB_UP_PASSES * (UP_THREADS / UP_LANES) &&
-           p.n_embd % G_COLS == 0 && p.n_embd <= NORM_THREADS * G_NORM_M && gb10_device(up_mix_bf16_g<1>);
+           p.n_embd % G_COLS == 0 && p.n_embd <= NORM_THREADS * G_NORM_M &&
+           legion_device::sm12x_device(up_mix_bf16_g<1>);
 }
 
 }  // namespace

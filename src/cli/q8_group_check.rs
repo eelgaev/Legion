@@ -77,9 +77,10 @@ pub fn run(args: Q8GroupCheckArgs) -> anyhow::Result<()> {
                 println!("hc mixer q8_1      {n:>5} bytes {bytes:>9} {d:>10}");
                 bad += usize::from(d > 0);
             }
-            // The GB10 has its own mixer kernels, which write no Q8_1 blocks (#311).
-            None if legion::model::core::q8_group::gb10() => {
-                println!("hc mixer q8_1      {n:>5} not written (GB10)");
+            // Compute capability 12.x (GB10, RTX 50) has its own mixer kernels, which write no
+            // Q8_1 blocks (#311, #1200).
+            None if legion::model::core::q8_group::sm12x() => {
+                println!("hc mixer q8_1      {n:>5} not written (12.x)");
             }
             None => {
                 println!("hc mixer q8_1      {n:>5} not written");

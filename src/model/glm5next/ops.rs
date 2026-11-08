@@ -1135,7 +1135,7 @@ pub fn mla_attn<'a>(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MlaKernel {
-    /// The launcher's choice: [`MlaKernel::Gb`] on compute capability 12.1 (the GB10),
+    /// The launcher's choice: [`MlaKernel::Gb`] on compute capability 12.x (the GB10, RTX 50),
     /// [`MlaKernel::Tiled`] on the others.
     Auto = 0,
     /// `mla_tiled_kernel`: 8 warps a block, each scoring 2 heads and then summing values.

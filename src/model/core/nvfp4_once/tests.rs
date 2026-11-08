@@ -39,6 +39,17 @@ fn fits_shape_takes_the_mmvq_verify_steps() {
 }
 
 #[test]
+fn compute_capability_12_takes_the_ops() {
+    // The GB10 and the RTX 50 (#1200); nothing else, and no GPU.
+    assert!(gpu_takes(Some((12, 1))));
+    assert!(gpu_takes(Some((12, 0))));
+    for cc in [(7, 0), (8, 9), (9, 0), (10, 0), (11, 0)] {
+        assert!(!gpu_takes(Some(cc)), "{cc:?}");
+    }
+    assert!(!gpu_takes(None));
+}
+
+#[test]
 fn the_scratch_holds_every_fitting_step() {
     // Flash-Next's down projection at 8 tokens, the biggest activations the op takes there.
     const { assert!(10 * 8 * 640 / 32 <= SCRATCH_BLOCKS) };
