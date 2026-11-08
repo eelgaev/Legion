@@ -209,11 +209,15 @@ impl Layout {
         };
         let n_stages = devs.len();
         let tensors = gguf.tensors();
-        // Over two machines: this one's share of the layers, and its tensors only.
+        // Over two machines: this one's share of the layers, and its tensors only (the MTP
+        // head's on rank 1, when it drafts).
         let node = match &cfg.node {
             Some(n) => {
                 let free = devs.iter().flatten().map(|d| d.memory().0 as u64).sum();
-                Some(super::node::Share::plan(n, &hp, &tensors, free, n_stages)?)
+                let mtp = super::drafts_with_mtp_head(&cfg.spec);
+                Some(super::node::Share::plan(
+                    n, &hp, &tensors, free, n_stages, mtp,
+                )?)
             }
             None => None,
         };

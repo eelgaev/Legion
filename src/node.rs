@@ -3,7 +3,10 @@
 //! the output head. Rank 0 serves the HTTP API and drives the step loop; for each step it sends
 //! rank 1 the step's sequences (positions, KV block tables, which logits) and the residual
 //! stream its last layer wrote, and rank 1 answers with the logits rows or argmaxes. State
-//! changes rank 1 must mirror (a slot cleared, states copied) go the same way, in order.
+//! changes rank 1 must mirror (a slot cleared, states copied, a verify step's commit) go the
+//! same way, in order. With `--spec mtp` (#560) the MTP head is rank 1's: after a step rank 0
+//! sends the sequences to draft for ([`Request::Draft`]) and rank 1 answers with their drafts,
+//! made from the rows its last layer wrote in that step.
 //!
 //! The transport is plain TCP (`std::net`) with `TCP_NODELAY`, one connection, frames of
 //! `[kind u32][length u64][payload]`, little-endian. Rank 0 queues its frames to a writer
@@ -23,7 +26,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// Frames before this version are refused: both ranks must run the same build.
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 
 /// The node settings of a `legion serve` (`--node-rank`, `--node-peer`, `--node-split`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,10 +156,40 @@ pub enum Request {
         h: Vec<f32>,
     },
     /// The same commit of the recurrent states as rank 0's after a verify step: `(slot,
-    /// keep)` pairs ([`crate::model::core::exec::Executor::commit`]).
+    /// keep)` pairs ([`crate::model::core::exec::Executor::commit`]). Rank 1 of a model split
+    /// by layers commits its layers' states with it too (#560).
     TpCommit {
         commits: Vec<(u32, u32)>,
     },
+    /// The MTP drafts after the last step (`--spec mtp` over two nodes, #560): rank 1 holds the
+    /// head and the residual rows the step captured, so only the sequences go over the link.
+    /// `p_min` (as bits): the head confidence under which a sequence stops drafting.
+    Draft {
+        reqs: Vec<WireDraft>,
+        p_min: u32,
+    },
+    /// A sequence has ended: rank 1 forgets its drafting state.
+    DraftRelease {
+        seq: u64,
+    },
+}
+
+/// One sequence of a [`Request::Draft`] (see [`crate::spec::DraftRequest`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireDraft {
+    pub seq: u64,
+    /// `tokens` are the sequence's tokens from position `base` on.
+    pub base: u32,
+    pub tokens: Vec<u32>,
+    /// The positions the step ran: `start..start + ran`.
+    pub start: u32,
+    pub ran: u32,
+    /// The first of those positions' rows among the step's captured rows.
+    pub off: u32,
+    /// Drafts wanted, at most (0: only take the step in).
+    pub max: u32,
+    pub blocks: Vec<u32>,
+    pub ring: u32,
 }
 
 /// A piece of an MTP pass's residual rows ([`Request::TpMtpRows`]).
@@ -200,6 +233,13 @@ pub enum Reply {
         rows: Vec<Vec<f32>>,
         ms: f32,
     },
+    /// The drafts of a [`Request::Draft`], per sequence `(token, head confidence)`, the head
+    /// passes it ran and rank 1's milliseconds on it.
+    Drafts {
+        drafts: Vec<Vec<(u32, f32)>>,
+        passes: u32,
+        ms: f32,
+    },
     Error(String),
 }
 
@@ -216,10 +256,13 @@ const K_TP_MTP: u32 = 10;
 const K_TP_COMMIT: u32 = 11;
 const K_TP_MTP_CHAIN: u32 = 12;
 const K_TP_MTP_ROWS: u32 = 13;
+const K_DRAFT: u32 = 14;
+const K_DRAFT_RELEASE: u32 = 15;
 const R_HELLO: u32 = 101;
 const R_DONE: u32 = 102;
 const R_STEP: u32 = 103;
 const R_ERROR: u32 = 104;
+const R_DRAFTS: u32 = 105;
 
 /// A frame being built: its kind, a header and an optional bulk of floats sent as is.
 pub struct Frame {
@@ -430,6 +473,25 @@ impl Request {
                 }
                 K_TP_COMMIT
             }
+            Request::Draft { reqs, p_min } => {
+                put_u32(&mut head, p_min);
+                put_u32(&mut head, reqs.len() as u32);
+                for d in reqs {
+                    head.extend_from_slice(&d.seq.to_le_bytes());
+                    put_u32(&mut head, d.base);
+                    put_u32s(&mut head, &d.tokens);
+                    for v in [d.start, d.ran, d.off, d.max] {
+                        put_u32(&mut head, v);
+                    }
+                    put_u32s(&mut head, &d.blocks);
+                    put_u32(&mut head, d.ring);
+                }
+                K_DRAFT
+            }
+            Request::DraftRelease { seq } => {
+                head.extend_from_slice(&seq.to_le_bytes());
+                K_DRAFT_RELEASE
+            }
         };
         Frame { kind, head, bulk }
     }
@@ -522,6 +584,26 @@ impl Request {
                 }
                 Request::TpCommit { commits }
             }
+            K_DRAFT => {
+                let p_min = r.u32()?;
+                let n = r.u32()? as usize;
+                let mut reqs = Vec::with_capacity(n.min(1 << 16));
+                for _ in 0..n {
+                    reqs.push(WireDraft {
+                        seq: r.u64()?,
+                        base: r.u32()?,
+                        tokens: r.u32s()?,
+                        start: r.u32()?,
+                        ran: r.u32()?,
+                        off: r.u32()?,
+                        max: r.u32()?,
+                        blocks: r.u32s()?,
+                        ring: r.u32()?,
+                    });
+                }
+                Request::Draft { reqs, p_min }
+            }
+            K_DRAFT_RELEASE => Request::DraftRelease { seq: r.u64()? },
             k => return Err(format!("unknown request kind {k}")),
         };
         r.end()?;
@@ -548,6 +630,19 @@ impl Reply {
                 }
                 bulk = rows.concat();
                 R_STEP
+            }
+            Reply::Drafts { drafts, passes, ms } => {
+                put_u32(&mut head, passes);
+                head.extend_from_slice(&ms.to_le_bytes());
+                put_u32(&mut head, drafts.len() as u32);
+                for d in drafts {
+                    put_u32(&mut head, d.len() as u32);
+                    for (t, p) in d {
+                        put_u32(&mut head, t);
+                        head.extend_from_slice(&p.to_le_bytes());
+                    }
+                }
+                R_DRAFTS
             }
             Reply::Error(e) => {
                 head.extend_from_slice(e.as_bytes());
@@ -580,6 +675,21 @@ impl Reply {
                     at += l;
                 }
                 Reply::Step { argmax, rows, ms }
+            }
+            R_DRAFTS => {
+                let passes = r.u32()?;
+                let ms = r.f32()?;
+                let n = r.u32()? as usize;
+                let mut drafts = Vec::with_capacity(n.min(1 << 16));
+                for _ in 0..n {
+                    let k = r.u32()? as usize;
+                    let mut d = Vec::with_capacity(k.min(1 << 16));
+                    for _ in 0..k {
+                        d.push((r.u32()?, r.f32()?));
+                    }
+                    drafts.push(d);
+                }
+                Reply::Drafts { drafts, passes, ms }
             }
             R_ERROR => {
                 let e = String::from_utf8_lossy(head).into_owned();
@@ -620,6 +730,11 @@ impl Cursor<'_> {
     fn u64(&mut self) -> Result<u64, String> {
         Ok(u64::from_le_bytes(
             self.take(8)?.try_into().expect("8 bytes"),
+        ))
+    }
+    fn f32(&mut self) -> Result<f32, String> {
+        Ok(f32::from_le_bytes(
+            self.take(4)?.try_into().expect("4 bytes"),
         ))
     }
     fn u32s(&mut self) -> Result<Vec<u32>, String> {
@@ -696,6 +811,11 @@ pub struct LinkTimes {
     /// From the request queued to its reply read, less rank 1's own time: the wire, the
     /// (de)serialization and any earlier requests still queued.
     pub link_ms: f64,
+    /// MTP draft rounds waited for ([`Request::Draft`]), rank 1's milliseconds on them and
+    /// the rest of their wait, as for the steps.
+    pub drafts: u64,
+    pub draft_remote_ms: f64,
+    pub draft_link_ms: f64,
 }
 
 /// Rank 0's end of the connection.
@@ -794,13 +914,19 @@ impl Link {
         let mut err = None;
         while let Some(sent) = self.pending.pop_front() {
             let r = self.read_reply()?;
-            if let Reply::Step { ms, .. } = &r
-                && self.pending.is_empty()
-            {
-                self.times.steps += 1;
-                self.times.remote_ms += f64::from(*ms);
-                self.times.link_ms +=
-                    (sent.elapsed().as_secs_f64() * 1e3 - f64::from(*ms)).max(0.0);
+            let waited = |ms: f32| (sent.elapsed().as_secs_f64() * 1e3 - f64::from(ms)).max(0.0);
+            match &r {
+                Reply::Step { ms, .. } if self.pending.is_empty() => {
+                    self.times.steps += 1;
+                    self.times.remote_ms += f64::from(*ms);
+                    self.times.link_ms += waited(*ms);
+                }
+                Reply::Drafts { ms, .. } if self.pending.is_empty() => {
+                    self.times.drafts += 1;
+                    self.times.draft_remote_ms += f64::from(*ms);
+                    self.times.draft_link_ms += waited(*ms);
+                }
+                _ => {}
             }
             match r {
                 Reply::Error(e) => err = err.or(Some(e)),

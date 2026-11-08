@@ -2438,12 +2438,17 @@ impl Executor {
         if !model.hp.has_slot_state() {
             return Ok(());
         }
-        self.tp_mirror_states(|| crate::node::Request::TpCommit {
+        let wire = || crate::node::Request::TpCommit {
             commits: commits
                 .iter()
                 .map(|&(slot, keep)| (slot as u32, keep as u32))
                 .collect(),
-        });
+        };
+        // Rank 1 of a split model commits its layers' states the same way (#560).
+        if let Some(r) = self.remote.as_mut() {
+            r.mirror(wire());
+        }
+        self.tp_mirror_states(wire);
         // Not waited for: every stage's commit runs at once on its own device, and the next
         // step (or MTP pass) runs after it on the same stream. Anything that touches the states
         // another way waits first (`wait_commit`). Pending from the first launch on, so a later

@@ -465,6 +465,65 @@ impl MtpDrafter {
         Ok(passes)
     }
 
+    /// [`Self::step`] on rank 0 of a model split over two nodes (#560): the head runs on rank
+    /// 1, which drafts from the rows its share of the step captured (`offs[i]`: request `i`'s
+    /// first row among them) with its own drafter. When no request drafts (they only take the
+    /// step in) the round is not waited for: rank 1 runs it beside this rank's next step.
+    pub(super) fn step_remote(
+        &mut self,
+        exec: &mut Executor,
+        batch: &mut [DraftRequest<'_>],
+        blocks: &[&[u32]],
+        rings: &[usize],
+        offs: &[usize],
+    ) -> Result<usize, String> {
+        let reqs = batch
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                // Its positions from the take-in's on (the head reads the tokens it takes in,
+                // the bonus token after them, and the 8 before for an n-gram row's hint).
+                let base = r.start.saturating_sub(8);
+                let end = (r.start + r.ran + usize::from(r.max > 0)).min(r.tokens.len());
+                crate::node::WireDraft {
+                    seq: r.seq,
+                    base: base as u32,
+                    tokens: r.tokens[base..end].to_vec(),
+                    start: r.start as u32,
+                    ran: r.ran as u32,
+                    off: offs[i] as u32,
+                    max: r.max as u32,
+                    blocks: blocks[i].to_vec(),
+                    ring: rings[i] as u32,
+                }
+            })
+            .collect();
+        let wait = batch.iter().any(|r| r.max > 0);
+        let remote = exec
+            .remote_mut()
+            .expect("remote MTP drafts on rank 0 of a split model");
+        let Some((drafts, passes)) = remote
+            .drafts(reqs, self.p_min, wait)
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(0);
+        };
+        if drafts.len() != batch.len() {
+            return Err(format!(
+                "node rank 1 drafted for {} sequences of {}",
+                drafts.len(),
+                batch.len()
+            ));
+        }
+        for (r, d) in batch.iter_mut().zip(drafts) {
+            for (t, p) in d.into_iter().take(r.max) {
+                r.out.tokens.push(t);
+                r.out.confidence.push(p);
+            }
+        }
+        Ok(passes)
+    }
+
     /// [`Self::step`]'s first pass (over `groups`, residual rows `h`) and further drafts as one
     /// draft round on every rank of tensor parallelism over machines (`--tp-mtp-chain`,
     /// [`Executor::mtp_chain`]): the same passes, sent as one request. `order`: the batch

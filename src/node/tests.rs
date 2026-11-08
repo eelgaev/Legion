@@ -115,6 +115,38 @@ fn requests_round_trip() {
             ],
             h: vec![1.5, -0.0],
         },
+        Request::Draft {
+            reqs: vec![
+                WireDraft {
+                    seq: u64::MAX - 3,
+                    base: 9,
+                    tokens: vec![11, 12, 13],
+                    start: 17,
+                    ran: 1,
+                    off: 4,
+                    max: 3,
+                    blocks: vec![2, 7],
+                    ring: 1,
+                },
+                WireDraft {
+                    seq: 0,
+                    base: 0,
+                    tokens: Vec::new(),
+                    start: 0,
+                    ran: 8192,
+                    off: 0,
+                    max: 0,
+                    blocks: Vec::new(),
+                    ring: 0,
+                },
+            ],
+            p_min: 0.125f32.to_bits(),
+        },
+        Request::Draft {
+            reqs: Vec::new(),
+            p_min: 0,
+        },
+        Request::DraftRelease { seq: 1 << 40 },
     ] {
         assert_eq!(round_trip_request(r.clone()), r);
     }
@@ -154,6 +186,16 @@ fn replies_round_trip() {
             argmax: vec![4, 5],
             rows: vec![vec![1.0, 2.0], vec![], vec![-3.5]],
             ms: 12.5,
+        },
+        Reply::Drafts {
+            drafts: vec![vec![(5, 0.75), (9, 0.5)], Vec::new(), vec![(0, 1.0)]],
+            passes: 3,
+            ms: 4.25,
+        },
+        Reply::Drafts {
+            drafts: Vec::new(),
+            passes: 0,
+            ms: 0.0,
         },
         Reply::Error("out of memory".into()),
     ] {

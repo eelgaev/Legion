@@ -3925,6 +3925,9 @@ impl LmEngine {
         }
         model.set_moe_kernel(moe_kernel);
         let mtp = drafting_mtp;
+        // Rank 0 of a model over two nodes: the MTP head runs on rank 1 (#560), which loads it,
+        // keeps its cache and drafts there; this rank drafts through the link.
+        let head_on_peer = layout.node.as_ref().is_some_and(|s| s.head_on_peer());
         if cfg.mtp_window.is_some_and(|n| n > 0) && !mtp {
             tracing::warn!(
                 mtp_window = cfg.mtp_window,
@@ -3960,7 +3963,7 @@ impl LmEngine {
             None if dflash => dflash_vocab = cfg.draft_vocab,
             None => model.set_draft_vocab(cfg.draft_vocab),
         }
-        if mtp && !model.has_mtp() {
+        if mtp && !head_on_peer && !model.has_mtp() {
             // The head's GGUF, else a safetensors checkpoint's own head (`mtp.*`), as shipped.
             let head = match cfg.spec.draft.as_ref() {
                 Some(path) => GgufFile::open(path)?,
@@ -4127,7 +4130,7 @@ impl LmEngine {
         };
         // The MTP head's own KV pool, on the last stage, has as many blocks as the stages'.
         let mtp_block = match drafting {
-            Drafting::Mtp(_) if !hp.arch.mtp_shares_kv() => {
+            Drafting::Mtp(_) if !hp.arch.mtp_shares_kv() && !head_on_peer => {
                 let head =
                     crate::model::core::paged::mtp_head_types(types, device.is_some(), sparse);
                 KvPool::layer_block_bytes(&hp, hp.n_layer, head)
@@ -4506,6 +4509,8 @@ impl LmEngine {
         exec.set_glm_mtp_overlap(cfg.glm_mtp_overlap_seqs);
         match &drafting {
             Drafting::Model(d) => exec.capture_hidden(d.hidden_layers()),
+            // Rank 1 holds the head and the last layer: nothing of it here.
+            Drafting::Mtp(_) if head_on_peer => {}
             Drafting::Mtp(_) => {
                 let wide_head = mtp_head_wide(exec.model());
                 exec.set_mtp_head_copy(draft_head_copy(
@@ -4807,7 +4812,7 @@ impl LmEngine {
             // The MTP head's passes at a full batch, on the last stage, when nothing gates its
             // drafts there (`vram::mtp_full_batch`): its draft and take-in buffers, measured.
             let mtp_head = match vram::mtp_full_batch(
-                gpu && matches!(drafting, Drafting::Mtp(_)) && spec_k > 0,
+                gpu && matches!(drafting, Drafting::Mtp(_)) && !head_on_peer && spec_k > 0,
                 !crate::spec::adaptive::cost_model_ungated_large(max_seqs, &cfg.spec),
                 max_seqs,
             ) {
@@ -5104,7 +5109,12 @@ impl LmEngine {
                 ));
             }
             if share.rank == 1 {
-                return Err(node::follow(exec, share, &peer, n_blocks));
+                // The MTP head drafts here, for rank 0 (#560).
+                let drafter = match drafting {
+                    Drafting::Mtp(d) => Some(d),
+                    _ => None,
+                };
+                return Err(node::follow(exec, drafter, share, &peer, n_blocks));
             }
             let link = crate::node::Link::connect(&peer, std::time::Duration::from_secs(600))
                 .map_err(|e| LoadError::Device(format!("--node-peer {peer}: {e}")))?;
@@ -6681,7 +6691,11 @@ impl Worker {
         seq.reserved = 0;
         match &mut self.drafting {
             Drafting::Model(d) => d.release(seq.id),
-            Drafting::Mtp(d) => d.release(seq.id),
+            Drafting::Mtp(d) => {
+                d.release(seq.id);
+                // The head's drafter on node rank 1 (#560).
+                self.exec.release_remote_drafts(seq.id);
+            }
             _ => {}
         }
     }
@@ -7732,8 +7746,11 @@ impl Worker {
                 }
             }
             // A chunk that leaves at most a KV block of its prompt is taken in by the next step
-            // ([`DeferredTakeIn`]); a head reading the target's cache takes nothing in.
-            let defer = matches!(self.drafting, Drafting::Mtp(_)) && !self.exec.mtp_shares_kv();
+            // ([`DeferredTakeIn`]); a head reading the target's cache takes nothing in. Not with
+            // the head on node rank 1, which keeps only the last step's rows (#560).
+            let defer = matches!(self.drafting, Drafting::Mtp(_))
+                && !self.exec.mtp_shares_kv()
+                && !self.exec.has_remote();
             let mut off = decoding.len() * n_tok;
             let ngram_step = mtp_ngram::NgramStep {
                 depth: self.depth.as_ref(),
@@ -7750,6 +7767,9 @@ impl Worker {
             // Each request's KV blocks (the MTP head's cache uses the target's layout).
             let mut blocks: Vec<&[u32]> = Vec::new();
             let mut rings: Vec<usize> = Vec::new();
+            // Each request's first row among the step's (the head on node rank 1 reads them
+            // there, #560).
+            let mut offs: Vec<usize> = Vec::new();
             for (i, seq) in decoding.iter_mut().enumerate() {
                 if done.contains(&i) {
                     continue;
@@ -7765,6 +7785,7 @@ impl Worker {
                 ngram_drafts |= seq.draft_ngram.is_some();
                 blocks.push(&seq.blocks);
                 rings.push(seq.ring);
+                offs.push(i * n_tok);
                 batch.push(DraftRequest {
                     seq: seq.id,
                     tokens: &seq.history,
@@ -7814,6 +7835,7 @@ impl Worker {
                 ngram_drafts |= seq.draft_ngram.is_some();
                 blocks.push(&seq.blocks);
                 rings.push(seq.ring);
+                offs.push(off);
                 batch.push(DraftRequest {
                     seq: seq.id,
                     tokens: &seq.history,
@@ -7840,7 +7862,11 @@ impl Worker {
                     }
                     Drafting::Mtp(d) => {
                         let t = Instant::now();
-                        let passes = d.step(&mut self.exec, &mut batch, &blocks, &rings)?;
+                        let passes = if self.exec.has_remote() {
+                            d.step_remote(&mut self.exec, &mut batch, &blocks, &rings, &offs)?
+                        } else {
+                            d.step(&mut self.exec, &mut batch, &blocks, &rings)?
+                        };
                         let ms = t.elapsed().as_secs_f64() * 1e3;
                         tracing::debug!(ms, passes, "mtp drafts");
                         // Without a prompt's take-in, the passes time the head alone (and

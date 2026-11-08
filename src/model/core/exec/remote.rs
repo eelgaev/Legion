@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 
 use super::Executor;
 use crate::model::core::{Group, Logits, ModelError, SeqInput, StepOutput, batch_shape};
-use crate::node::{Link, Reply, Request, WireGroup, WireSeq};
+use crate::node::{Link, Reply, Request, WireDraft, WireGroup, WireSeq};
 
 /// Rank 0's link to the layers on rank 1.
 pub struct Remote {
@@ -171,12 +171,25 @@ impl Remote {
         if self.logged >= 256 {
             let t = std::mem::take(&mut self.link.times);
             let n = t.steps.max(1) as f64;
-            tracing::info!(
-                steps = t.steps,
-                rank1_ms = t.remote_ms / n,
-                link_ms = t.link_ms / n,
-                "node link: per step waited for"
-            );
+            if t.drafts > 0 {
+                let d = t.drafts as f64;
+                tracing::info!(
+                    steps = t.steps,
+                    rank1_ms = t.remote_ms / n,
+                    link_ms = t.link_ms / n,
+                    drafts = t.drafts,
+                    rank1_draft_ms = t.draft_remote_ms / d,
+                    draft_link_ms = t.draft_link_ms / d,
+                    "node link: per step and MTP draft round waited for"
+                );
+            } else {
+                tracing::info!(
+                    steps = t.steps,
+                    rank1_ms = t.remote_ms / n,
+                    link_ms = t.link_ms / n,
+                    "node link: per step waited for"
+                );
+            }
             self.logged = 0;
         }
         Ok(out)
@@ -201,6 +214,32 @@ impl Remote {
     pub fn call(&mut self, req: Request) -> Result<Reply, ModelError> {
         self.link.call(req).map_err(link_err)
     }
+
+    /// `--spec mtp` over two nodes (#560): rank 1's MTP drafts for `reqs` after the last step
+    /// sent, from the rows that step captured there, with the head passes they took. Without
+    /// `wait` (no sequence drafts: they only take the step in) the round is queued and its
+    /// reply read with the next one's: `None`.
+    pub fn drafts(
+        &mut self,
+        reqs: Vec<WireDraft>,
+        p_min: f32,
+        wait: bool,
+    ) -> Result<Option<(Vec<Vec<(u32, f32)>>, usize)>, ModelError> {
+        let req = Request::Draft {
+            reqs,
+            p_min: p_min.to_bits(),
+        };
+        if !wait {
+            self.link.send(req).map_err(link_err)?;
+            return Ok(None);
+        }
+        match self.link.call(req).map_err(link_err)? {
+            Reply::Drafts { drafts, passes, .. } => Ok(Some((drafts, passes as usize))),
+            r => Err(ModelError::Node(format!(
+                "a draft round answered with {r:?}"
+            ))),
+        }
+    }
 }
 
 impl Executor {
@@ -219,6 +258,19 @@ impl Executor {
     /// The link to rank 1, when this is rank 0 of a split model.
     pub fn remote_mut(&mut self) -> Option<&mut Remote> {
         self.remote.as_mut()
+    }
+
+    /// Whether this is rank 0 of a split model (the layers past its stages on rank 1).
+    pub fn has_remote(&self) -> bool {
+        self.remote.is_some()
+    }
+
+    /// Rank 0 of a split model: sequence `seq` has ended, so rank 1's MTP drafter forgets it
+    /// (#560); its reply is read with the next step's. Nothing on one machine.
+    pub fn release_remote_drafts(&mut self, seq: u64) {
+        if let Some(r) = self.remote.as_mut() {
+            r.mirror(Request::DraftRelease { seq });
+        }
     }
 
     /// Rank 1 of a split model: a step of `groups` whose first stage starts from `rows`, the

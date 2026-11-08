@@ -1,6 +1,13 @@
 //! A model split over two machines (#562, [`crate::node`]): each rank's share of the layers
 //! and tensors, the fit check that names a split that would fit, and rank 1's side (it runs
 //! its executor for rank 0 instead of serving HTTP).
+//!
+//! With `--spec mtp` (#560) the MTP head runs on rank 1, next to the last layer whose rows it
+//! reads and the output head it shares: rank 1 keeps the rows its last step captured and
+//! drafts from them when rank 0 asks ([`Follower`]), so a draft round sends only the
+//! sequences' positions and gets back their drafts. Rank 0 commits a verify step's states on
+//! both ranks and runs the rest of speculative decoding (acceptance, the depth policy) as on
+//! one machine.
 
 #[cfg(test)]
 mod tests;
@@ -8,10 +15,12 @@ mod tests;
 use std::net::TcpListener;
 use std::ops::Range;
 
+use super::spec::MtpDrafter;
 use super::{COMPUTE_HEADROOM, LmConfig, LoadError};
 use crate::gguf::TensorInfo;
 use crate::model::core::{Executor, Hparams, Model, Placement, Pool};
-use crate::node::{NodeConfig, Reply, Request};
+use crate::node::{NodeConfig, Reply, Request, WireDraft};
+use crate::spec::{Draft, DraftRequest};
 
 /// This machine's part of a model split over two.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +30,8 @@ pub(super) struct Share {
     pub split: usize,
     /// This rank's layers.
     pub layers: Range<usize>,
+    /// The model's MTP head drafts (`--spec mtp`): it runs on rank 1 (#560).
+    pub mtp: bool,
 }
 
 /// The layer index of a tensor name (`blk.<il>.`), if it belongs to a layer.
@@ -29,20 +40,27 @@ fn layer_of(name: &str) -> Option<usize> {
 }
 
 /// Whether rank `rank` of a split at `split` loads tensor `name`: a layer's tensors on the
-/// rank running it (the layers past the last, an MTP head's, nowhere: no MTP over two nodes
-/// yet), the token embeddings on rank 0, the RoPE factors on both, the rest (the output norm
-/// and head) on rank 1.
-pub(super) fn owns(rank: usize, split: usize, n_layer: usize, name: &str) -> bool {
+/// rank running it, the token embeddings on rank 0, the RoPE factors on both, the rest (the
+/// output norm and head) on rank 1. The layers past the last (an MTP head's) go to rank 1 when
+/// the head drafts (`mtp`), with a copy of the token embeddings, which the head reads for the
+/// tokens it drafts from; else nowhere.
+pub(super) fn owns(rank: usize, split: usize, n_layer: usize, mtp: bool, name: &str) -> bool {
     match layer_of(name) {
-        Some(il) => il < n_layer && (il < split) == (rank == 0),
-        None if name == "token_embd.weight" => rank == 0,
+        Some(il) if il >= n_layer => mtp && rank == 1,
+        Some(il) => (il < split) == (rank == 0),
+        None if name == "token_embd.weight" => rank == 0 || mtp,
         None if name == "rope_freqs.weight" => true,
         None => rank == 1,
     }
 }
 
-/// Device bytes per layer, and those of rank 0's and rank 1's tensors outside the layers.
-pub(super) fn byte_shares(tensors: &[TensorInfo], n_layer: usize) -> (Vec<u64>, u64, u64) {
+/// Device bytes per layer, and those of rank 0's and rank 1's tensors outside the layers (with
+/// `mtp`, rank 1's include the MTP head's layer and its copy of the embeddings).
+pub(super) fn byte_shares(
+    tensors: &[TensorInfo],
+    n_layer: usize,
+    mtp: bool,
+) -> (Vec<u64>, u64, u64) {
     let mut bytes = vec![0u64; n_layer];
     let (mut first, mut last) = (0u64, 0u64);
     for t in tensors {
@@ -51,12 +69,16 @@ pub(super) fn byte_shares(tensors: &[TensorInfo], n_layer: usize) -> (Vec<u64>, 
         }
         match layer_of(&t.name) {
             Some(il) if il < n_layer => bytes[il] += t.size,
-            Some(_) => {}
+            Some(_) => {
+                if owns(1, 0, n_layer, mtp, &t.name) {
+                    last += t.size;
+                }
+            }
             None => {
-                if owns(0, n_layer, n_layer, &t.name) {
+                if owns(0, n_layer, n_layer, mtp, &t.name) {
                     first += t.size;
                 }
-                if owns(1, 0, n_layer, &t.name) {
+                if owns(1, 0, n_layer, mtp, &t.name) {
                     last += t.size;
                 }
             }
@@ -105,12 +127,15 @@ impl Share {
     /// This rank's share of the model's layers: at `--node-split`, else balanced by the
     /// layers' bytes. Every tensor of the share must fit in `free` bytes of device memory
     /// (no SSD or host tier over two nodes): if not, the error names a split that would fit.
+    /// With `mtp` (the MTP head drafts) rank 1's share counts the head's layer and its copy of
+    /// the embeddings.
     pub fn plan(
         node: &NodeConfig,
         hp: &Hparams,
         tensors: &[TensorInfo],
         free: u64,
         n_stages: usize,
+        mtp: bool,
     ) -> Result<Self, LoadError> {
         let n = hp.n_layer;
         if node.rank > 1 {
@@ -119,7 +144,7 @@ impl Share {
                 node.rank
             )));
         }
-        let (bytes, first, last) = byte_shares(tensors, n);
+        let (bytes, first, last) = byte_shares(tensors, n, mtp);
         let split = match node.split {
             Some(s) if s == 0 || s >= n => {
                 return Err(LoadError::Device(format!(
@@ -163,11 +188,17 @@ impl Share {
             rank: node.rank,
             split,
             layers: node.share(n, split),
+            mtp,
         })
     }
 
     pub fn owns(&self, name: &str, n_layer: usize) -> bool {
-        owns(self.rank, self.split, n_layer, name)
+        owns(self.rank, self.split, n_layer, self.mtp, name)
+    }
+
+    /// Rank 0 with the MTP head drafting: the head runs on rank 1 ([`Follower`]).
+    pub fn head_on_peer(&self) -> bool {
+        self.mtp && self.rank == 0
     }
 }
 
@@ -179,7 +210,7 @@ pub(super) fn check_config(cfg: &LmConfig) -> Result<(), LoadError> {
     let no = |what: &str| {
         Err(LoadError::Device(format!(
             "--node-rank {}: not with {what} (a model over two nodes runs every weight in device \
-             memory, without drafting)",
+             memory, and drafts with the model's own MTP head only)",
             node.rank
         )))
     };
@@ -189,8 +220,9 @@ pub(super) fn check_config(cfg: &LmConfig) -> Result<(), LoadError> {
     if cfg.tp > 1 {
         return no("--tp");
     }
-    if cfg.spec.enabled() {
-        return no("speculative decoding (--spec)");
+    // The MTP head runs on rank 1 beside the head's inputs (#560); no other drafter is wired.
+    if cfg.spec.enabled() && !super::drafts_with_mtp_head(&cfg.spec) {
+        return no(&format!("--spec {}", cfg.spec.kind.name()));
     }
     if cfg.kv_host_tokens.is_some_and(|t| t > 0) {
         return no("--kv-host-tokens");
@@ -212,94 +244,210 @@ pub(super) fn check_config(cfg: &LmConfig) -> Result<(), LoadError> {
 }
 
 /// Rank 1: answers rank 0's requests with `exec`, one connection after another; returns only
-/// when it cannot listen.
-pub(super) fn follow(mut exec: Executor, share: &Share, peer: &str, n_blocks: usize) -> LoadError {
+/// when it cannot listen. `drafter`: the MTP head's driver when it drafts (`--spec mtp`).
+pub(super) fn follow(
+    exec: Executor,
+    drafter: Option<MtpDrafter>,
+    share: &Share,
+    peer: &str,
+    n_blocks: usize,
+) -> LoadError {
     let listener = match TcpListener::bind(peer) {
         Ok(l) => l,
         Err(e) => return LoadError::Device(format!("--node-peer {peer}: cannot listen: {e}")),
     };
     let n_layer = exec.model().hp.n_layer;
-    let mut blocks = n_blocks;
     tracing::info!(
         peer,
         layers = ?share.layers,
-        kv_cache_tokens = blocks * crate::model::core::KV_BLOCK,
+        kv_cache_tokens = n_blocks * crate::model::core::KV_BLOCK,
+        mtp = drafter.is_some(),
         "node rank 1: waiting for rank 0"
     );
-    let r = crate::node::serve(listener, |req| {
-        let out = handle(&mut exec, req, (n_layer, share.split), &mut blocks);
-        out.unwrap_or_else(Reply::Error)
-    });
+    let mut f = Follower::new(exec, drafter, (n_layer, share.split), n_blocks);
+    let r = crate::node::serve(listener, |req| f.handle(req).unwrap_or_else(Reply::Error));
     LoadError::Device(format!("node rank 1 stopped listening: {r:?}"))
 }
 
-fn handle(
-    exec: &mut Executor,
-    req: Request,
+/// Rank 1's executor and what it keeps between rank 0's requests.
+pub(super) struct Follower {
+    pub exec: Executor,
+    /// The MTP head's driver (`--spec mtp`, #560): it drafts here, from the rows the last step
+    /// captured, so neither those rows nor the head cross the link.
+    drafter: Option<MtpDrafter>,
+    /// The captured rows of the last step ([`crate::model::core::StepOutput::hidden`]).
+    last_hidden: Vec<Vec<f32>>,
+    /// The model's layer count and the split.
     mine: (usize, usize),
-    blocks: &mut usize,
-) -> Result<Reply, String> {
-    Ok(match req {
-        Request::Hello {
-            version,
-            n_layer,
-            split,
-            n_blocks,
-        } => {
-            crate::node::check_hello(version, n_layer, split, mine)?;
-            let n = (*blocks).min(n_blocks as usize);
-            if n < *blocks {
-                exec.resize_kv(n).map_err(|e| e.to_string())?;
-                *blocks = n;
+    blocks: usize,
+}
+
+impl Follower {
+    /// Rank 1 over `exec` (its layers from the split on), drafting with `drafter` under
+    /// `--spec mtp`; `mine` is (layer count, split) as rank 0's hello must say, `n_blocks` the
+    /// KV blocks it has.
+    pub fn new(
+        exec: Executor,
+        drafter: Option<MtpDrafter>,
+        mine: (usize, usize),
+        n_blocks: usize,
+    ) -> Self {
+        Self {
+            exec,
+            drafter,
+            last_hidden: Vec::new(),
+            mine,
+            blocks: n_blocks,
+        }
+    }
+
+    /// The MTP drafts of `reqs` from the last step's rows.
+    fn drafts(&mut self, reqs: Vec<WireDraft>, p_min: f32) -> Result<Reply, String> {
+        let t = std::time::Instant::now();
+        let d = self.drafter.as_mut().ok_or(
+            "MTP drafts asked for, but this rank does not draft: give both ranks --spec mtp",
+        )?;
+        d.set_p_min(p_min);
+        let w = self.exec.mtp_width();
+        let rows = self.last_hidden.first().map_or(&[][..], Vec::as_slice);
+        // Each sequence's tokens at their positions (none needed before `base`).
+        let tokens: Vec<Vec<u32>> = reqs
+            .iter()
+            .map(|r| {
+                let mut v = vec![0u32; r.base as usize];
+                v.extend_from_slice(&r.tokens);
+                v
+            })
+            .collect();
+        let mut outs = vec![Draft::default(); reqs.len()];
+        let mut batch = Vec::with_capacity(reqs.len());
+        for ((r, tokens), out) in reqs.iter().zip(&tokens).zip(&mut outs) {
+            let (start, ran, off) = (r.start as usize, r.ran as usize, r.off as usize);
+            let fed = start + ran + usize::from(r.max > 0);
+            let hidden = rows.get(off * w..(off + ran) * w);
+            let (Some(hidden), true) = (hidden, r.base as usize <= start && fed <= tokens.len())
+            else {
+                return Err(format!(
+                    "a draft request for rows {off}..{} of {} (positions {start}..{} of {}): \
+                     not what the last step ran",
+                    off + ran,
+                    rows.len() / w.max(1),
+                    start + ran,
+                    tokens.len()
+                ));
+            };
+            batch.push(DraftRequest {
+                seq: r.seq,
+                tokens: tokens.as_slice(),
+                start,
+                ran,
+                hidden: vec![hidden],
+                max: r.max as usize,
+                out,
+            });
+        }
+        let blocks: Vec<&[u32]> = reqs.iter().map(|r| r.blocks.as_slice()).collect();
+        let rings: Vec<usize> = reqs.iter().map(|r| r.ring as usize).collect();
+        let passes = d.step(&mut self.exec, &mut batch, &blocks, &rings)?;
+        drop(batch);
+        let drafts = outs
+            .into_iter()
+            .map(|o| o.tokens.into_iter().zip(o.confidence).collect())
+            .collect();
+        Ok(Reply::Drafts {
+            drafts,
+            passes: passes as u32,
+            ms: t.elapsed().as_secs_f32() * 1e3,
+        })
+    }
+
+    /// Runs one of rank 0's requests; an error goes back as [`Reply::Error`].
+    pub fn handle(&mut self, req: Request) -> Result<Reply, String> {
+        let exec = &mut self.exec;
+        let blocks = &mut self.blocks;
+        let mine = self.mine;
+        Ok(match req {
+            Request::Hello {
+                version,
+                n_layer,
+                split,
+                n_blocks,
+            } => {
+                crate::node::check_hello(version, n_layer, split, mine)?;
+                let n = (*blocks).min(n_blocks as usize);
+                if n < *blocks {
+                    exec.resize_kv(n).map_err(|e| e.to_string())?;
+                    *blocks = n;
+                }
+                tracing::info!(
+                    kv_cache_tokens = n * crate::model::core::KV_BLOCK,
+                    "node rank 0 says hello"
+                );
+                Reply::Hello { n_blocks: n as u32 }
             }
-            tracing::info!(
-                kv_cache_tokens = n * crate::model::core::KV_BLOCK,
-                "node rank 0 says hello"
-            );
-            Reply::Hello { n_blocks: n as u32 }
-        }
-        Request::Resize { n_blocks } => {
-            exec.resize_kv(n_blocks as usize)
-                .map_err(|e| e.to_string())?;
-            *blocks = n_blocks as usize;
-            Reply::Done
-        }
-        Request::Step { groups, rows } => {
-            let t = std::time::Instant::now();
-            let groups = crate::model::core::from_wire(&groups)?;
-            let out = exec.step_from(&groups, rows).map_err(|e| e.to_string())?;
-            Reply::Step {
-                argmax: out.argmax,
-                rows: out.rows,
-                ms: t.elapsed().as_secs_f32() * 1e3,
+            Request::Resize { n_blocks } => {
+                exec.resize_kv(n_blocks as usize)
+                    .map_err(|e| e.to_string())?;
+                *blocks = n_blocks as usize;
+                Reply::Done
             }
-        }
-        Request::ClearSlot { slot } => {
-            exec.clear_slot(slot as usize);
-            Reply::Done
-        }
-        Request::CopyStates { copies } => {
-            let pool = |p: u8| if p == 1 { Pool::Saved } else { Pool::Seq };
-            let copies: Vec<_> = copies
-                .into_iter()
-                .map(|(a, i, b, j)| (pool(a), i as usize, pool(b), j as usize))
-                .collect();
-            exec.copy_states(&copies).map_err(|e| e.to_string())?;
-            Reply::Done
-        }
-        Request::TpHello { .. }
-        | Request::TpStep { .. }
-        | Request::SaveRing { .. }
-        | Request::EnableRingSaves { .. }
-        | Request::TpMtp { .. }
-        | Request::TpMtpChain { .. }
-        | Request::TpMtpRows { .. }
-        | Request::TpCommit { .. } => {
-            return Err(
-                "a request of tensor parallelism over machines (--tp-rank): this rank \
+            Request::Step { groups, rows } => {
+                let t = std::time::Instant::now();
+                let groups = crate::model::core::from_wire(&groups)?;
+                let out = exec.step_from(&groups, rows).map_err(|e| e.to_string())?;
+                // The rows it captured (with the MTP head) for the drafts that follow; the last
+                // step's go back to the executor.
+                let old = std::mem::replace(&mut self.last_hidden, out.hidden);
+                if !old.is_empty() {
+                    exec.recycle_rows(old);
+                }
+                Reply::Step {
+                    argmax: out.argmax,
+                    rows: out.rows,
+                    ms: t.elapsed().as_secs_f32() * 1e3,
+                }
+            }
+            Request::TpCommit { commits } => {
+                let commits: Vec<_> = commits
+                    .into_iter()
+                    .map(|(slot, keep)| (slot as usize, keep as usize))
+                    .collect();
+                exec.commit(&commits).map_err(|e| e.to_string())?;
+                Reply::Done
+            }
+            Request::Draft { reqs, p_min } => return self.drafts(reqs, f32::from_bits(p_min)),
+            Request::DraftRelease { seq } => {
+                if let Some(d) = self.drafter.as_mut() {
+                    d.release(seq);
+                }
+                Reply::Done
+            }
+            Request::ClearSlot { slot } => {
+                exec.clear_slot(slot as usize);
+                Reply::Done
+            }
+            Request::CopyStates { copies } => {
+                let pool = |p: u8| if p == 1 { Pool::Saved } else { Pool::Seq };
+                let copies: Vec<_> = copies
+                    .into_iter()
+                    .map(|(a, i, b, j)| (pool(a), i as usize, pool(b), j as usize))
+                    .collect();
+                exec.copy_states(&copies).map_err(|e| e.to_string())?;
+                Reply::Done
+            }
+            Request::TpHello { .. }
+            | Request::TpStep { .. }
+            | Request::SaveRing { .. }
+            | Request::EnableRingSaves { .. }
+            | Request::TpMtp { .. }
+            | Request::TpMtpChain { .. }
+            | Request::TpMtpRows { .. } => {
+                return Err(
+                    "a request of tensor parallelism over machines (--tp-rank): this rank \
                         runs a model split by layers (--node-rank)"
-                    .into(),
-            );
-        }
-    })
+                        .into(),
+                );
+            }
+        })
+    }
 }
