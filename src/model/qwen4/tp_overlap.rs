@@ -70,6 +70,10 @@ impl Model {
             Overlap::Ffn => true,
         };
         let n = n as usize;
+        // Short steps stay whole (the same choice on every rank).
+        if !micro::worth(n, ranks) {
+            return None;
+        }
         let (a, _) = share(n, rank, ranks);
         let [e, hc, ..] = res.ne();
         let flat = ctx.reshape_2d(res, e * hc, res.ne()[2]);

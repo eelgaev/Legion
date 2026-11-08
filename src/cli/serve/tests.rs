@@ -652,6 +652,35 @@ fn deterministic_gather_flag() {
 }
 
 #[test]
+fn admit_gather_flag() {
+    // Off by default: requests are admitted as they arrive.
+    assert_eq!(serve_args(&[]).engine.admit_gather(), None);
+    assert_eq!(
+        serve_args(&["--admit-gather-ms", "5"])
+            .engine
+            .admit_gather(),
+        Some(Duration::from_millis(5))
+    );
+    assert_eq!(
+        serve_args(&["--admit-gather-ms", "0"])
+            .engine
+            .admit_gather(),
+        None
+    );
+    // --deterministic gathers its waves itself.
+    assert!(
+        Cli::try_parse_from([
+            "legion",
+            "serve",
+            "--deterministic",
+            "--admit-gather-ms",
+            "5"
+        ])
+        .is_err()
+    );
+}
+
+#[test]
 fn registry_flags() {
     // Off by default.
     let r = serve_args(&[]).server.config().unwrap().registry;
