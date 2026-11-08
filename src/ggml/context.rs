@@ -210,6 +210,16 @@ impl Context {
         self.raw.as_ptr()
     }
 
+    /// How many more tensors this context's metadata memory holds (#1205: whether a step's
+    /// graph has room for more nodes).
+    pub fn tensors_left(&self) -> usize {
+        // SAFETY: size queries of a live context.
+        unsafe {
+            let left = ffi::ggml_get_mem_size(self.raw()) - ffi::ggml_used_mem(self.raw());
+            left / ffi::ggml_tensor_overhead()
+        }
+    }
+
     pub(crate) fn wrap(&self, t: *mut ffi::ggml_tensor) -> Tensor<'_> {
         Tensor {
             raw: NonNull::new(t).expect("ggml returned a null tensor (context full?)"),

@@ -1031,3 +1031,106 @@ fn tiers_created_and_dropped_in_a_row_never_hang() {
         }
     });
 }
+
+/// #1205: a piece of a chunked step evicts the experts its later pieces need last; with no
+/// later pieces it plans the slots [`SlotCache::plan`] does.
+#[test]
+fn pieces_keep_the_experts_later_pieces_need() {
+    let mut c = SlotCache::new(8, 3);
+    c.plan(&[0, 1, 2]);
+    // All three tie on use: plain LRU would take slot 0 (expert 0, needed next), this takes
+    // expert 1 (never needed again).
+    let mut next = vec![u32::MAX; 8];
+    (next[0], next[2]) = (1, 4);
+    let p = c.plan_ahead(&[3], &next);
+    assert_eq!((p.hits, p.loads), (0, vec![(3, 1)]));
+    // Expert 2 is needed later than 0 and 3.
+    next[3] = 2;
+    let p = c.plan_ahead(&[5], &next);
+    assert_eq!(p.loads, vec![(5, 2)]);
+    assert_eq!(
+        (c.slot(0), c.slot(3), c.slot(5)),
+        (Some(0), Some(1), Some(2))
+    );
+
+    let (mut a, mut b) = (SlotCache::new(16, 4), SlotCache::new(16, 4));
+    let never = vec![u32::MAX; 16];
+    for step in 0..40usize {
+        let want: Vec<usize> = (0..3).map(|i| (step * 5 + i * 7) % 16).collect();
+        assert_eq!(a.plan(&want), b.plan_ahead(&want, &never), "step {step}");
+    }
+}
+
+#[test]
+fn piece_rows_split_evenly() {
+    assert_eq!(piece_rows(14, 2), vec![0..7, 7..14]);
+    assert_eq!(piece_rows(27, 3), vec![0..9, 9..18, 18..27]);
+    assert_eq!(
+        piece_rows(64, 5),
+        vec![0..13, 13..26, 26..39, 39..52, 52..64]
+    );
+    assert_eq!(piece_rows(3, 5), vec![0..1, 1..2, 2..3]);
+    assert_eq!(piece_rows(5, 1), vec![0..5]);
+}
+
+/// Decode and verify steps of more pairs than slots go in pieces of at most the slots' rows,
+/// up to eight; smaller steps, prompt steps and bigger ones do not.
+#[test]
+fn decode_steps_past_the_slots_go_in_pieces() {
+    let dir = scratch();
+    let g = model(dir.path());
+    // 5 slots, 2 experts a token: 2 rows a piece.
+    let t = tier(&g, 5, true);
+    assert_eq!(t.pieces(2, true), None);
+    assert_eq!(t.pieces(3, true), Some(2));
+    assert_eq!(t.pieces(5, true), Some(3));
+    assert_eq!(t.pieces(16, true), Some(8));
+    assert_eq!(t.pieces(17, true), None);
+    assert_eq!(t.pieces(3, false), None);
+    for n in 3..=16 {
+        let k = t.pieces(n, true).unwrap();
+        for r in piece_rows(n, k) {
+            assert!(r.len() * 2 <= t.n_slots(), "{n} rows: piece {r:?}");
+        }
+    }
+}
+
+/// A chunked step's pieces read their rows' experts into slots, one after the other, each
+/// keeping the experts the rows after it route to; the op's params give the same slots.
+#[test]
+fn a_chunked_step_reads_each_piece_into_slots() {
+    for direct in [true, false] {
+        let dir = scratch();
+        let g = model(dir.path());
+        let t = tier(&g, 3, direct);
+        let ids = [0, 1, 2, 3, 0, 4];
+        assert!(t.fetch_host_rows(3, &ids, 0..2).is_err());
+        assert!(t.fetch_host_rows(3, &ids, 2..4).is_err());
+        let out = t.fetch_host_rows(3, &ids, 0..1).unwrap();
+        assert_eq!(out, vec![0, 1]);
+        assert_slots(&t, 3, &out, &[0, 1]);
+        // Expert 3 evicts 1 (never needed again), not 0 (the last row's).
+        let out = t.fetch_host_rows(3, &ids, 1..2).unwrap();
+        assert_eq!(out, vec![2, 1]);
+        assert_slots(&t, 3, &out, &[2, 3]);
+        let out = t.fetch_host_rows(3, &ids, 2..3).unwrap();
+        assert_eq!(out[0], 0);
+        assert_slots(&t, 3, &out, &[0, 4]);
+        let s = t.stats();
+        assert_eq!((s.hits, s.misses), (1, 5));
+        assert_eq!(s.stage_bytes, 0);
+
+        // The fetch op's work on the same step: a piece by its params, then the whole step.
+        let u = tier(&g, 3, direct);
+        let inner = lookup(u.id);
+        let mut out = vec![0; 2];
+        for (row, want) in [(0, [0, 1]), (1, [2, 1])] {
+            run_fetch(&inner, &[u.id, 1, 0, row, 1], 2, &ids, &mut out).unwrap();
+            assert_eq!(out, want, "row {row}");
+        }
+        assert!(run_fetch(&inner, &[u.id, 1, 0, 2, 2], 2, &ids, &mut out).is_err());
+        let mut all = vec![0; 2];
+        run_fetch(&inner, &[u.id, 1, 0, 0, 0], 2, &ids[..2], &mut all).unwrap();
+        assert_slots(&u, 3, &all, &[0, 1]);
+    }
+}

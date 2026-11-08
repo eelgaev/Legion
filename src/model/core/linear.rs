@@ -274,6 +274,12 @@ impl Linear {
         self.w4a4(w, n, grouped)
     }
 
+    /// Whether [`Nvfp4A4`] gives a batch of `n` tokens 4-bit activations where the weight
+    /// supports them ([`Self::nvfp4_a4_takes`] before the weight is at hand).
+    pub(crate) fn nvfp4_a4_batch(&self, n: i64, grouped: bool) -> bool {
+        self.a4_batch(n, grouped)
+    }
+
     /// Marks `res = w @ x` (`w` is the weight `name`) with the activation and accumulator
     /// precision its weight takes.
     pub(crate) fn hint(&self, ctx: &Context, name: &str, w: Tensor<'_>, res: Tensor<'_>) {

@@ -79,6 +79,39 @@ impl SlotCache {
         plan
     }
 
+    /// [`Self::plan`] for a piece of a chunked step (#1205), `next` per expert the first row of
+    /// the step's later pieces that routes to it (`u32::MAX`: none): an empty slot first, else
+    /// the expert the step needs again latest or never, the least recently used of those (the
+    /// lowest slot on ties). With every `next` at `u32::MAX` the same slots as [`Self::plan`].
+    pub fn plan_ahead(&mut self, experts: &[usize], next: &[u32]) -> Plan {
+        assert!(
+            experts.len() <= self.n_slots(),
+            "{} experts for {} slots",
+            experts.len(),
+            self.n_slots()
+        );
+        self.tick += 1;
+        let mut plan = Plan::default();
+        let mut missing = Vec::new();
+        for &e in experts {
+            match self.slot(e) {
+                Some(s) => {
+                    self.used[s] = self.tick;
+                    plan.hits += 1;
+                }
+                None => missing.push(e),
+            }
+        }
+        for e in missing {
+            let s = self
+                .victim_ahead(next)
+                .expect("a slot this step does not use");
+            self.assign(e, s);
+            plan.loads.push((e, s));
+        }
+        plan
+    }
+
     /// A prefetch of `experts` (distinct, best first) for the layer's next step: marks the
     /// cached ones used, then gives each other one, while `budget` lasts, an empty slot or the
     /// least recently used one the prediction does not keep. Returns the `(expert, slot)` loads.
@@ -134,6 +167,22 @@ impl SlotCache {
         (0..self.n_slots())
             .filter(|&s| self.used[s] < self.tick && !self.pinned[s])
             .min_by_key(|&s| self.used[s])
+    }
+
+    /// [`Self::victim`] that keeps the experts needed soonest (`next`, [`Self::plan_ahead`]).
+    fn victim_ahead(&self, next: &[u32]) -> Option<usize> {
+        if let Some(s) = (0..self.n_slots()).find(|&s| self.owner[s] < 0 && !self.pinned[s]) {
+            return Some(s);
+        }
+        (0..self.n_slots())
+            .filter(|&s| self.used[s] < self.tick && !self.pinned[s])
+            .min_by_key(|&s| {
+                let e = self.owner[s] as usize;
+                (
+                    std::cmp::Reverse(next.get(e).copied().unwrap_or(u32::MAX)),
+                    self.used[s],
+                )
+            })
     }
 
     fn assign(&mut self, expert: usize, s: usize) {

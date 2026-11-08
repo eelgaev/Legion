@@ -41,7 +41,7 @@ use crate::model::core::expert_mv::ahead as expert_mv_ahead;
 use crate::model::core::state::KvPool;
 use crate::model::core::{
     Arch, ArchRef, AttnInputs, Group, GroupShape, Hparams, InputSink, Inputs, Model, ModelError,
-    Pass, Recurrent, SpecPool, StatePool, cols,
+    Pass, Recurrent, SpecPool, StatePool, cols, concat_tree,
 };
 use crate::model::qwen4::{QsaInputs, pools_listed, pools_new, qsa_attn};
 use crate::model::{fp8, moe_ffn, nvfp4_mm};
@@ -51,6 +51,19 @@ use crate::residency::ssd_experts::trace::Predictor;
 /// of tokens, 8 of rows).
 const XH_MIN_TOKENS: i64 = 256;
 const XH_MIN_ROWS: i64 = 1024;
+
+/// A chunked SSD step's pieces (#1205) only go into a graph with room for them and for what
+/// is left to build: tensors a piece is taken to add until one has been measured (about
+/// three times what one builds) ...
+const SSD_PIECE_TENSORS: usize = 48;
+/// ... the most a piece has added (0: none built yet) ...
+static SSD_PIECE_MEASURED: AtomicUsize = AtomicUsize::new(0);
+/// ... and the tensors kept for what comes after the layers (the head, the MTP layer's rest).
+const SSD_TAIL_TENSORS: usize = 512;
+/// A step was too big for its graph to chunk (logged once).
+static SSD_CHUNK_NO_ROOM: AtomicBool = AtomicBool::new(false);
+/// Bit `k`: a step went through the slots in `k` pieces (logged once per count).
+static SSD_CHUNK_SEEN: AtomicU32 = AtomicU32::new(0);
 
 /// The GLM-5.3-Flash hyperparameters beyond [`Hparams`].
 #[derive(Debug, Clone, PartialEq)]
@@ -863,7 +876,10 @@ impl Model {
         let hp = &self.hp;
         let e = hp.n_embd;
         let mut res = ctx.reshape_3d(x, e, p.hc, pass.n);
+        // The most tensors a layer has taken, for the room a chunked SSD step may use (#1205).
+        let mut most = 0;
         for il in layers.clone() {
+            let start = ctx.tensors_left();
             let (pre, h) = self.glm_hc_pre(ctx, il, "attn", res)?;
             tap.tap("hc_attn_pre", il, pre.y);
             tap.tap("attn_norm", il, h);
@@ -885,7 +901,13 @@ impl Model {
                 tap.tap("ffn_out", il, out);
                 ops::hc_post(ctx, out, None, res, &pre)
             } else {
-                let moe = self.glm_moe(pass, il, h)?;
+                // Room for this layer's pieces: what is left once the rest of this layer and
+                // each later one (as many as the most a layer took, or twice this one's so
+                // far) and the tail have theirs.
+                let left = ctx.tensors_left();
+                let part = start - left;
+                let rest = most.max(2 * part) * (layers.end - il) - part + SSD_TAIL_TENSORS;
+                let moe = self.glm_moe(pass, il, h, left.saturating_sub(rest))?;
                 tap.tap("ffn_moe_out", il, moe);
                 let sh = self.glm_ffn(ctx, il, "_shexp", p.clamp_shexp[il], h)?;
                 tap.tap("ffn_shexp", il, sh);
@@ -904,6 +926,7 @@ impl Model {
                 let (_, h) = self.glm_hc_pre(ctx, il + 1, "ffn", res)?;
                 self.glm_ssd_predict(pass, il + 1, h, Predictor::PostMoe, None)?;
             }
+            most = most.max(start - ctx.tensors_left());
         }
         if layers.end != hp.n_layer {
             // The next stage's input is [n_embd · hc, n].
@@ -967,12 +990,14 @@ impl Model {
 
     /// The routed experts of layer `il`: sigmoid router with the selection bias, the chosen
     /// weights normalized and scaled; GGUF experts through [`moe_ffn`], NVFP4 experts through
-    /// [`nvfp4_mm::mul_mat_id`].
+    /// [`nvfp4_mm::mul_mat_id`]. `room`: the tensors a step chunked through the SSD tier's
+    /// slots may add to the graph (#1205; a step that needs more stages its experts).
     fn glm_moe<'a>(
         &'a self,
         pass: &Pass<'a>,
         il: usize,
         x: Tensor<'a>,
+        room: usize,
     ) -> Result<Tensor<'a>, ModelError> {
         let (ctx, tap) = (pass.ctx, &pass.tap);
         let p = self.glm();
@@ -998,12 +1023,17 @@ impl Model {
         let w = ops::router_w(ctx, logits, ids, p.weights_norm, p.weights_scale);
         tap.tap("ffn_moe_weights_scaled", il, w);
         let limit = p.clamp_exp[il];
-        // Routed SwiGLU over NVFP4 experts `[up, gate, down]` with per-expert scales.
+        // Routed SwiGLU over NVFP4 experts `[up, gate, down]` with per-expert scales, for the
+        // tokens of `x` (all of the step's, or a piece's: `w` their router weights).
+        let n_step = x.ne()[1];
         let nvfp4 = |[up, gate, down]: [Tensor<'a>; 3],
                      [su, sg, sd]: [Option<Tensor<'a>>; 3],
-                     ids: Tensor<'a>| {
+                     ids: Tensor<'a>,
+                     x: Tensor<'a>,
+                     w: Tensor<'a>| {
             let n = x.ne()[1];
-            if self.linear.nvfp4_a4_takes(gate, n, true) {
+            // A piece of a chunked step takes 4-bit activations as its whole step would.
+            if self.linear.nvfp4_a4_takes(gate, n_step, true) {
                 // --nvfp4-a4: 4-bit activations, the gate, up and down matmuls quantizing F32
                 // inputs, GLM's clamped GLU between (#575)
                 use crate::model::nvfp4_a4;
@@ -1039,6 +1069,77 @@ impl Model {
             ops::weighted_sum(ctx, y, w)
         };
         if let Some(ssd) = self.ssd_experts().filter(|s| s.has_layer(il)) {
+            let piece = SSD_PIECE_MEASURED.load(Ordering::Relaxed);
+            let piece = if piece == 0 { SSD_PIECE_TENSORS } else { piece };
+            // A piece (at most a pair per slot) always takes the grouped mv kernels; chunk only
+            // the steps whose staged matmuls take them too (a 4-bit step of more tokens than
+            // the mv kernel takes, or one past --nvfp4-expert-mv-max pairs per expert, is on
+            // the GEMM, other sums), so chunking keeps every step's bits. Pieces and the staged
+            // step share one buffer, so they take the same path (4-bit or W4A16); before a
+            // fetch the weight isn't at hand to say which, so both must be on mv.
+            let a4_mv = !self.linear.nvfp4_a4_batch(n_step, true)
+                || n_step <= crate::model::nvfp4_a4::MV_MAX_TOKENS;
+            let pairs = hp.n_expert_used * n_step;
+            let staged_mv = a4_mv
+                && matches!(
+                    nvfp4_mm::pick_grouped(hp.n_embd, 0, pairs, hp.n_expert),
+                    nvfp4_mm::Kernel::Mv { .. }
+                );
+            let chunks = ssd.pieces(n_step as usize, decoding && staged_mv);
+            let chunks = chunks.filter(|&k| {
+                let fits = k * piece <= room;
+                if !fits && !SSD_CHUNK_NO_ROOM.swap(true, Ordering::Relaxed) {
+                    tracing::info!(
+                        "SSD expert tier: a step of {n_step} tokens has no room in its graph for \
+                         {k} pieces at layer {il}; its experts go through a staging buffer"
+                    );
+                }
+                fits
+            });
+            if let Some(k) = chunks {
+                let bit = 1u32 << k.min(31);
+                if SSD_CHUNK_SEEN.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+                    tracing::info!(
+                        "SSD expert tier: a step of {n_step} tokens goes through the slots in {k} \
+                         pieces (layer {il})"
+                    );
+                }
+                let before = ctx.tensors_left();
+                // A decode or verify step of more pairs than slots (#1205): pieces of rows, each
+                // its experts in slots and its matmuls, one after the other (each fetch after the
+                // previous piece's result), instead of a staging buffer. Each row's sums are the
+                // ones the whole step gives it (the same kernels, one token at a time).
+                let ids = if ids.is_contiguous() {
+                    ids
+                } else {
+                    ctx.cont(ids)
+                };
+                let mut outs = Vec::with_capacity(k);
+                let mut after = None;
+                for r in crate::residency::ssd_experts::piece_rows(n_step as usize, k) {
+                    let (r0, nr) = (r.start as i64, r.len() as i64);
+                    let l = ssd
+                        .fetch_rows(ctx, il, ids, r, after)
+                        .map_err(|e| ModelError::Unsupported(format!("layer {il}: {e}")))?;
+                    let scales = match l.scales {
+                        Some([u, g, d]) => [Some(u), Some(g), Some(d)],
+                        None => [None; 3],
+                    };
+                    let y = nvfp4(
+                        l.weights,
+                        scales,
+                        l.ids,
+                        cols(ctx, x, r0, nr),
+                        cols(ctx, w, r0, nr),
+                    );
+                    after = Some(y);
+                    outs.push(y);
+                }
+                let y = concat_tree(ctx, outs);
+                let each = (before - ctx.tensors_left()).div_ceil(k);
+                SSD_PIECE_MEASURED.fetch_max(each, Ordering::Relaxed);
+                return Ok(y);
+            }
             // The router lookahead (#611): the next layer's router on this layer's input, after
             // this layer's fetch (trace, --ssd-prefetch router), or before it with
             // --ssd-prefetch-early (#615: its reads queue behind the fetch's own).
@@ -1057,7 +1158,7 @@ impl Model {
                 Some([u, g, d]) => [Some(u), Some(g), Some(d)],
                 None => [None; 3],
             };
-            return Ok(nvfp4(l.weights, scales, l.ids));
+            return Ok(nvfp4(l.weights, scales, l.ids, x, w));
         }
         let lw = |s: &str| self.lw(il, &format!("ffn_{s}_exps.weight"));
         let (up, gate, down) = (lw("up")?, lw("gate")?, lw("down")?);
@@ -1067,6 +1168,8 @@ impl Model {
                 [up, gate, down],
                 [scale("up"), scale("gate"), scale("down")],
                 ids,
+                x,
+                w,
             ));
         }
         let refs = |[up, gate, down]: [Tensor<'a>; 3]| moe_ffn::ExpertRefs {
