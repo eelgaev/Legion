@@ -380,43 +380,88 @@ pub fn aligned_span(r: FileRange) -> (u64, usize) {
     (start, (end - start) as usize)
 }
 
+/// Reads in a row that may bring no new bytes before [`fill`] gives up on a range (the file
+/// ends inside it).
+pub(super) const STALLS: u32 = 4;
+
+/// Fills `buf[..need]` through `pread` (`pread(b, at)` reads up to `b.len()` bytes at file
+/// offset `at`; `buf[0]` is the file's byte `start`), retrying after a short read or `EINTR`
+/// until `need` bytes are in. Every read asks for the rest of `buf` from the last multiple of
+/// `align` read so far: with 1 that is where the last read stopped; direct reads take only
+/// aligned offsets, lengths and buffers, so with [`ALIGN`] a partly read block is read again
+/// (#1206: a retry at the unaligned point failed with `EINVAL`). `start` and `buf.len()` must
+/// be multiples of `align`, and so must `buf`'s address for direct reads. Bytes past `need` (a
+/// direct span's tail, which may lie past the end of the file) may stay unread.
+pub(super) fn fill(
+    mut pread: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+    buf: &mut [u8],
+    start: u64,
+    need: usize,
+    align: usize,
+) -> Result<(), String> {
+    debug_assert!(
+        need <= buf.len() && buf.len().is_multiple_of(align) && start.is_multiple_of(align as u64)
+    );
+    let (mut got, mut stalls) = (0, 0);
+    while got < need {
+        let at = got / align * align;
+        let n = match pread(&mut buf[at..], start + at as u64) {
+            Ok(0) => return Err(format!("end of file after {got} of {need} bytes")),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("{e} (after {got} of {need} bytes)")),
+        };
+        if at + n > got {
+            (got, stalls) = (at + n, 0);
+        } else {
+            // Only the partly read block again: the file ends inside it (or the reads stall).
+            stalls += 1;
+            if stalls == STALLS {
+                return Err(format!(
+                    "end of file after {got} of {need} bytes ({STALLS} reads brought no more)"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reads `r` into `buf`, returning the range's bytes.
 fn read_range<'b>(s: &Shared, r: FileRange, buf: &'b mut Aligned) -> Result<&'b [u8], String> {
     let f = &s.files[r.file];
-    let (start, want, skip) = if s.direct {
+    let (start, want, skip, align) = if s.direct {
         let (start, len) = aligned_span(r);
-        (start, len, (r.offset - start) as usize)
+        (start, len, (r.offset - start) as usize, ALIGN as usize)
     } else {
-        (r.offset, r.len as usize, 0)
+        (r.offset, r.len as usize, 0, 1)
     };
     let need = skip + r.len as usize;
     let b = buf.get(want);
-    let mut got = 0;
-    while got < need {
-        // SAFETY: `b[got..]` is writable; the fd is open.
+    let pread = |b: &mut [u8], at: u64| {
+        // SAFETY: `b` is writable for `b.len()` bytes; the fd is open.
         let n = unsafe {
             libc::pread(
                 f.as_raw_fd(),
-                b[got..].as_mut_ptr().cast(),
-                want - got,
-                (start + got as u64) as libc::off_t,
+                b.as_mut_ptr().cast(),
+                b.len(),
+                at as libc::off_t,
             )
         };
         if n < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(format!("expert read at {}+{}: {e}", r.offset, r.len));
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
         }
-        if n == 0 {
-            return Err(format!(
-                "expert read at {}+{}: end of file",
-                r.offset, r.len
-            ));
-        }
-        got += n as usize;
-    }
+    };
+    fill(pread, b, start, need, align).map_err(|e| {
+        format!(
+            "expert read of shard {} at {}+{}{}: {e}",
+            r.file,
+            r.offset,
+            r.len,
+            if s.direct { " (direct)" } else { "" }
+        )
+    })?;
     s.read.fetch_add(r.len, Ordering::Relaxed);
     if !s.direct {
         let _ = nix::fcntl::posix_fadvise(

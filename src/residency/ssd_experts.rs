@@ -1463,7 +1463,10 @@ unsafe fn predict_cpu(dst: &ffi::ggml_tensor, ith: usize, _nth: usize) {
     }
 }
 
-/// A read the model cannot do without: the step's output would be garbage.
+/// A read the model cannot do without: the step's output would be garbage. Only a fetch's or
+/// a prediction's own error ends here, after the readers' retries (short reads, `EINTR`,
+/// [`io::fill`]): an I/O error, or a shard that ends inside an expert's range. A read ahead
+/// that fails is dropped and read again on demand; this op has no way to fail the step.
 fn fatal(e: &str) -> ! {
     tracing::error!(error = e, "SSD expert tier: a read failed");
     eprintln!("SSD expert tier: {e}");
