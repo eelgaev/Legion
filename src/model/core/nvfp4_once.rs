@@ -17,10 +17,10 @@
 //! nodes they replace (`mul_mat_id`, the scale chain `reshape`, `repeat`, `get_rows`, `mul`,
 //! and `silu` and `mul`).
 //!
-//! Opt-in on a GB10 (compute capability 12.1, [`set_gpu`]) with `legion serve --nvfp4-once`
-//! ([`set_nvfp4_once`]). `legion nvfp4-once-bench` times the ops against ggml's pair and checks
-//! their bits ([`bench`]). The CPU implementation is a plain f32 reference, for tests of the
-//! wiring.
+//! Opt-in on compute capability 12.x (GB10, RTX 50; [`set_gpu`]) with
+//! `legion serve --nvfp4-once` ([`set_nvfp4_once`]). `legion nvfp4-once-bench` times the ops
+//! against ggml's pair and checks their bits ([`bench`]). The CPU implementation is a plain f32
+//! reference, for tests of the wiring.
 
 #[cfg(feature = "cuda")]
 use std::os::raw::c_void;
@@ -84,10 +84,17 @@ pub fn set_nvfp4_once(on: bool) {
     ON.store(on, Ordering::Relaxed);
 }
 
-/// The engine's GPU: the ops are used on compute capability 12.1 (GB10), where their bits were
-/// checked against ggml's MMVQ and where they were measured.
+/// The engine's GPU: the ops are used on compute capability 12.x (#1200: the GB10, where their
+/// bits were checked against ggml's MMVQ and where they were measured, and the RTX 50, whose SM
+/// is the GB10's; its bits there want a `legion nvfp4-once-bench` check before anyone relies
+/// on them). Opt-in either way ([`set_nvfp4_once`]).
 pub fn set_gpu(cc: Option<(i32, i32)>) {
-    GPU.store(cc == Some((12, 1)), Ordering::Relaxed);
+    GPU.store(gpu_takes(cc), Ordering::Relaxed);
+}
+
+/// Whether compute capability `cc` (major, minor) takes the ops ([`set_gpu`]).
+pub fn gpu_takes(cc: Option<(i32, i32)>) -> bool {
+    cc.is_some_and(|(major, _)| major == 12)
 }
 
 pub(crate) fn on() -> bool {
@@ -939,9 +946,11 @@ mod launch {
         n as usize
     }
 
-    /// Launches kernel `kernel` of the table on `p` (by value) on `stream`; on a GB10 as a
-    /// programmatic dependent launch, as ggml-cuda launches its own kernels there (each kernel
-    /// waits for the one ahead before it reads activations, `src/cuda/nvfp4_once.cu`).
+    /// Launches kernel `kernel` of the table on `p` (by value) on `stream`; on compute
+    /// capability 12.x (GB10, RTX 50) as a programmatic dependent launch, as ggml-cuda launches
+    /// its own kernels there (each kernel waits for the one ahead before it reads activations,
+    /// `src/cuda/nvfp4_once.cu`; the wait is compiled in, since the load refuses a 9.0+ GPU
+    /// whose code here is older than sm_90, `crate::hw::cuda_arch`).
     pub(super) fn launch(
         kernel: usize,
         grid: Dim3,
@@ -962,7 +971,7 @@ mod launch {
             dynamic_smem: 0,
             stream,
             attrs: &mut attr,
-            num_attrs: u32::from(compute_capability() == Some(121)),
+            num_attrs: u32::from(compute_capability().is_some_and(|cc| cc / 10 == 12)),
         };
         // SAFETY: a kernel of the table taking `legion_nvfp4_once` by value, from the launch's
         // copy of `p`; its pointers are device memory of the stream's device (the node's).

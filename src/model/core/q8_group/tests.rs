@@ -64,8 +64,9 @@ fn gb10_takes_2_to_8_columns() {
     assert!(!cols_on(false, 0));
     assert!(!cols_on(false, MAX_TOKENS + 1));
     assert!(!cols_on(true, MAX_TOKENS + 1));
-    // Without a GPU this is not a GB10, and every column count is the device's.
+    // Without a GPU this is not a GB10 nor any 12.x, and every column count is the device's.
     assert!(!gb10());
+    assert!(!sm12x());
     assert!(device_takes_cols(1));
     // A GB10 keeps the mixer's Q8_1 blocks and the experts reading them off.
     assert_eq!(GB10_NO_PARTS, PART_HC | PART_EXPERTS);
@@ -73,6 +74,18 @@ fn gb10_takes_2_to_8_columns() {
         GB10_NO_PARTS & (PART_ATTN | PART_SHEXP | PART_SHEXP_DOWN),
         0
     );
+}
+
+#[test]
+fn compute_capabilities_with_ggml_mmvq_launches() {
+    // Volta to Ada (ggml's Turing and generic tables), the RTX 50 (generic, #1200) and the GB10.
+    for cc in [70, 75, 80, 86, 87, 89, 120, 121] {
+        assert!(cc_supported(cc), "{cc}");
+    }
+    // Hopper and others: not checked against ggml there.
+    for cc in [0, 61, 90, 100, 103, 110, 122] {
+        assert!(!cc_supported(cc), "{cc}");
+    }
 }
 
 #[test]

@@ -207,12 +207,7 @@ fn cuda_index(dev: crate::ggml::Device) -> Option<usize> {
 /// ([`crate::hw::cuda_arch::check`]): the stages' devices and tensor parallelism's GPUs.
 #[cfg(feature = "cuda")]
 fn check_gpu_code(layout: &layout::Layout) -> Result<(), LoadError> {
-    let gpus = layout
-        .stages
-        .iter()
-        .filter_map(|s| s.0)
-        .chain(layout.tp_devices.iter().copied());
-    for dev in gpus {
+    for dev in layout_gpus(layout) {
         if let Some(index) = cuda_index(dev)
             && let Some(e) = crate::hw::cuda_arch::check(index, || dev.description())
         {
@@ -220,6 +215,39 @@ fn check_gpu_code(layout: &layout::Layout) -> Result<(), LoadError> {
         }
     }
     Ok(())
+}
+
+/// The layout's GPUs: the stages' devices and tensor parallelism's.
+#[cfg(feature = "cuda")]
+fn layout_gpus(layout: &layout::Layout) -> impl Iterator<Item = crate::ggml::Device> + '_ {
+    layout
+        .stages
+        .iter()
+        .filter_map(|s| s.0)
+        .chain(layout.tp_devices.iter().copied())
+}
+
+/// Warns, once per GPU of the layout, when `--nvfp4-a4` asks for the W4A4 kernels and this
+/// build has no FP4 code for that GPU ([`crate::model::nvfp4_a4::supported_on`]; an sm_121a
+/// binary on an RTX 50, say, #1200): its NVFP4 matmuls stay W4A16 there.
+#[cfg(feature = "cuda")]
+fn warn_nvfp4_a4(layout: &layout::Layout, a4: crate::model::core::Nvfp4A4) {
+    if a4 == crate::model::core::Nvfp4A4::Off {
+        return;
+    }
+    let mut warned = std::collections::BTreeSet::new();
+    for dev in layout_gpus(layout) {
+        if let Some(index) = cuda_index(dev)
+            && warned.insert(index)
+            && !crate::model::nvfp4_a4::supported_on(index)
+        {
+            tracing::warn!(
+                gpu = index,
+                device = %dev.description(),
+                "--nvfp4-a4: W4A4 kernels not in this build for this GPU, using W4A16"
+            );
+        }
+    }
 }
 
 /// Whether any of `devs` (a meta device's GPUs) is a V100 (compute capability 7.0).
@@ -3857,6 +3885,8 @@ impl LmEngine {
         model.set_fp8_act(cfg.fp8_act);
         model.set_nvfp4_mm(cfg.nvfp4_mm);
         model.set_nvfp4_a4(cfg.nvfp4_a4);
+        #[cfg(feature = "cuda")]
+        warn_nvfp4_a4(&layout, cfg.nvfp4_a4);
         #[cfg(feature = "cuda")]
         let caps = device
             .and_then(cuda_index)

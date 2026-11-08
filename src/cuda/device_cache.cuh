@@ -72,6 +72,35 @@ inline int compute_capability() {
     return v;
 }
 
+// Whether the current device is compute capability 12.x (GB10 and RTX 50: the same SM, the same
+// mma / ldmatrix / cp.async / PDL and 99 KB of shared memory a block) and this binary has the
+// sm_80+ code of `probe` (one of the caller's kernels; every file is built for the same targets)
+// for it: `binaryVersion` and `ptxVersion` >= 80, so a binary without that code never takes a
+// path that would JIT to a trap. Compute-shaped picks key on it (#1200): the kernels written for
+// the GB10 and programmatic dependent launch (launch_pdl.cuh). Choices measured against the
+// GB10's memory (its bandwidth, its 48 SMs) key on the device itself, not on this.
+template <typename... KArgs>
+bool sm12x_device(void (*probe)(KArgs...)) {
+    static std::atomic<int> state[GGML_CUDA_MAX_DEVICES];  // 0 unknown, 1 yes, 2 no
+    const int dev = current();
+    if (dev < 0) {
+        return false;
+    }
+    int st = state[dev].load(std::memory_order_relaxed);
+    if (st == 0) {
+        cudaFuncAttributes fa{};
+        const cudaError_t before = cudaPeekAtLastError();
+        const bool code = cudaFuncGetAttributes(&fa, probe) == cudaSuccess && fa.binaryVersion >= 80 &&
+                          fa.ptxVersion >= 80;
+        if (!code) {
+            clear_own_error(before);
+        }
+        st = compute_capability() / 10 == 12 && code ? 1 : 2;
+        state[dev].store(st, std::memory_order_relaxed);
+    }
+    return st == 1;
+}
+
 // Streaming multiprocessors of the current device; 0 when unknown.
 inline int sm_count() {
     static std::atomic<int> n[GGML_CUDA_MAX_DEVICES];

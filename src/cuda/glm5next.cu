@@ -31,8 +31,8 @@
 // - mla_attn: a block per (token, 4 heads); the selected latents staged 32 rows at a time in
 //   shared memory, online softmax. On the GB10 (#571) steps of 64+ tokens take mla_tiled
 //   (16 heads a block, a warp's lanes over the positions; the same chunks and order), and on
-//   compute capability 12.1 (#862) mla_gb (sm80/mla_gb10.cuh: its bits, with 4 score warps and 4
-//   value warps working a chunk apart, ~3x fewer shared-memory wavefronts).
+//   compute capability 12.x (#862, #1200) mla_gb (sm80/mla_gb10.cuh: its bits, with 4 score
+//   warps and 4 value warps working a chunk apart, ~3x fewer shared-memory wavefronts).
 //   Opt-in only (`--glm-mla-tc`, #575, not the default bits): sm_80+ steps of 64+ tokens take
 //   mla_tc, a block per (token, 32 heads) with q and the softmax weights rounded to F16 and
 //   the scores and the weighted latents on mma.sync m16n8k16 (~3.4x mla_tiled on the GB10).
@@ -81,9 +81,9 @@ constexpr int T_Q5_K = 13;                // DeepSeek-V4.1-Flash's dense weights
 
 using A = legion_glm_args;
 
-// Programmatic dependent launch (#594): on the GB10 every kernel here is launched through
-// launch_pdl (launch_pdl.cuh, shared with qwen4_hc.cu), so the GPU sets a kernel up while the
-// previous one in the stream is still running (~2.4 us of idle per kernel boundary otherwise,
+// Programmatic dependent launch (#594): on compute capability 12.x (the GB10; RTX 50 since
+// #1200) every kernel here is launched through launch_pdl (launch_pdl.cuh, shared with
+// qwen4_hc.cu), so the GPU sets a kernel up while the previous one in the stream is still running (~2.4 us of idle per kernel boundary otherwise,
 // ~1700 boundaries per Maya-S decode token), and each kernel's first act is pdl_wait: it waits for
 // the previous kernel to complete and its writes to be visible, as a plain launch does. No kernel
 // triggers its dependents early, so nothing runs in a different order: the same bits. Other GPUs
@@ -4084,10 +4084,11 @@ extern "C" int legion_glm_launch(int op, const legion_glm_args * ap, void * stre
             } else if (a.params[3] && a.params[5] != 1 && a.ne[1] % MT_H == 0 && a.ne[2] >= 64 &&
                        ((uintptr_t) a.src[1] | (uintptr_t) a.src_nb[1][1] | (uintptr_t) a.dst) % 16 == 0 &&
                        a.nb[1] == MD * 4 && a.nb[2] == a.ne[1] * MD * 4 &&
-                       (a.params[5] == 2 ? dev_sm80() : gb10_device(mla_gb_kernel))) {
-                // params[5]: the prompt kernel (ops::MlaKernel): 0 mla_gb_kernel on the GB10 and
-                // mla_tiled_kernel elsewhere, 1 mla_tiled_kernel, 2 mla_gb_kernel on any sm_80+
-                // (the same bits); 3 comes with params[4] (mla_tc_kernel above, else as 0)
+                       (a.params[5] == 2 ? dev_sm80() : legion_device::sm12x_device(mla_gb_kernel))) {
+                // params[5]: the prompt kernel (ops::MlaKernel): 0 mla_gb_kernel on compute
+                // capability 12.x (GB10, RTX 50; #1200) and mla_tiled_kernel elsewhere, 1
+                // mla_tiled_kernel, 2 mla_gb_kernel on any sm_80+ (the same bits); 3 comes with
+                // params[4] (mla_tc_kernel above, else as 0)
                 constexpr int smem = mla_gb_smem();
                 const cudaError_t e =
                     cudaFuncSetAttribute(mla_gb_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);

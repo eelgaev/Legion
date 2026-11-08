@@ -225,7 +225,7 @@ The exact `legion serve` command behind every row of the tables, and how it was 
 ```sh
 git submodule update --init third_party/ggml
 cargo build --release                          # CPU ggml
-CMAKE_CUDA_ARCHITECTURES=121 cargo build --release --features cuda  # GB10; 70 = V100
+CMAKE_CUDA_ARCHITECTURES=121 cargo build --release --features cuda  # GB10; 120 = RTX 50, 70 = V100
 ```
 
 Requirements: Rust (the version pinned in `rust-toolchain.toml`), cmake, a C/C++ compiler, and libclang (for bindgen); CUDA builds require nvcc. V100 (sm_70) builds need CUDA 12.x (12.2+): CUDA 13 dropped sm_70.
