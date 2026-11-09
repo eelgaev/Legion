@@ -1069,9 +1069,10 @@ pub(in crate::cli) struct SwitchArgs {
     #[arg(long, help_heading = HEADING)]
     glm_decode_mv: bool,
     /// GLM-5.3-Flash, CUDA: the plain dense-weight kernels instead of the GB10-tuned ones (the
-    /// default on integrated GPUs such as the GB10 and on V100s; other GPUs run the plain ones): a
-    /// Q6_K decode GEMV staging its weight rows through shared memory with 16-byte loads (~165 ->
-    /// ~220 GB/s; not on V100s, where it is slower), a prompt GEMM on 128 x 128 tiles (~2x; on
+    /// default on integrated GPUs such as the GB10, on V100s and on Ampere GPUs (compute
+    /// capability 8.0 to 8.7); other GPUs run the plain ones): a Q6_K decode GEMV staging its
+    /// weight rows through shared memory with 16-byte loads (~165 -> ~220 GB/s; not on V100s,
+    /// where it is slower, nor on Ampere GPUs), a prompt GEMM on 128 x 128 tiles (~2x; on
     /// sm_80+ Q6_K weights of 1024+ rows on mma.sync, ~1.3x more, reading the input once rounded
     /// to F16 when 2+ share it), prompt MLA attention with 16 heads a block (each staged cache row
     /// read by 4x the heads), the prompt hyper-connection mix 4 tokens a block, the prompt

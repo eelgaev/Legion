@@ -53,3 +53,13 @@ fn without_cuda_no_device_answers() {
     assert_eq!(sm_count(0), 0);
     assert_eq!(sms_if_cc12(0), 0);
 }
+
+#[test]
+fn ampere_is_8_0_to_8_7() {
+    for cc in [(8, 0), (8, 6), (8, 7)] {
+        assert!(ampere(cc), "{cc:?}");
+    }
+    for cc in [(7, 0), (7, 5), (8, 9), (9, 0), (12, 0), (12, 1)] {
+        assert!(!ampere(cc), "{cc:?}");
+    }
+}

@@ -570,8 +570,8 @@ static CHAIN_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PromptKernel {
-    /// The launcher's choice: [`PromptKernel::Gb`] on compute capability 12.x (the GB10),
-    /// [`PromptKernel::Mma`] on the others.
+    /// The launcher's choice: [`PromptKernel::Gb`] on compute capability 12.x (the GB10) and
+    /// Ampere (8.0 to 8.7, #1212), [`PromptKernel::Mma`] on the others.
     Auto = 0,
     /// `attn_mma_kernel`: one CTA of 4 warps per SM (two stages of K and V, q in shared memory).
     Mma = 1,
