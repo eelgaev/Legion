@@ -265,6 +265,149 @@ pub fn split_ok() -> bool {
     false
 }
 
+/// Whether graphs built from now on give groups of 2 to [`VERIFY_SPLIT_TOKENS`] tokens per
+/// sequence (speculative verify steps, short prompt chunks) the scratch that splits all their
+/// rows over the key blocks on sm_70 / sm_75 ([`split_ok`]; `src/cuda/sm70/paged_vsplit.cuh`,
+/// #1211): the WMMA kernel's result, bit for bit, from CTAs spread over the whole GPU instead
+/// of one per query tile and kv head walking the whole context twice. On by default
+/// (`legion serve --no-paged-verify-split-wmma` turns it off).
+static WMMA_SPLIT: AtomicBool = AtomicBool::new(true);
+
+/// Sets [`WMMA_SPLIT`].
+pub fn set_verify_split_wmma(on: bool) {
+    WMMA_SPLIT.store(on, Ordering::Relaxed);
+}
+
+/// The weights of at least this many key blocks at a time (or the whole table) in a scratch
+/// of [`wmma_split_floats`]: fewer would take more launches than the split saves.
+const WMMA_SPLIT_MIN_CHUNK: usize = 64;
+
+/// F32 elements a group's scratch for [`WMMA_SPLIT`] takes at most when its sequences' whole
+/// tables do not fit (64 MiB: one sequence of Qwen3.8-27B's verify step at a 256K context in two
+/// chunks of weights); a group of more then runs its sequences in turns or its weights in chunks
+/// ([`wmma_split_plan`]).
+const WMMA_SPLIT_BUDGET: usize = 16 << 20;
+
+/// Most CTAs (query tiles times kv heads times sequences) of the WMMA kernel a group may have
+/// to take [`WMMA_SPLIT`]: more already spread over a V100's 80 SMs, and the split would run in
+/// more turns than it saves.
+const WMMA_SPLIT_MAX_CTAS: usize = 32;
+
+/// Query tiles of a group of `n_tok` tokens per sequence with `g` query heads per kv head
+/// (the WMMA kernel's CTAs per sequence and kv head: 64 / g tokens each), and the rows of the
+/// largest, padded to whole 16-row WMMA tiles (`vsplit::tiles`, `vsplit::rows16`).
+fn wmma_rows(g: usize, n_tok: usize) -> (usize, usize) {
+    let qt = 64 / g;
+    (n_tok.div_ceil(qt), (n_tok.min(qt) * g).next_multiple_of(16))
+}
+
+/// F32 elements of one (sequence, query tile, kv head) lane of the [`WMMA_SPLIT`] scratch: per
+/// table entry each row's max and sum, each row's final max and 1 / sum, the output fragments
+/// carried between chunks, and `chunk` blocks of F16 weights (`vsplit::lane`).
+fn wmma_lane_floats(d: usize, nr: usize, table_width: usize, chunk: usize) -> usize {
+    2 * table_width * nr + 2 * nr + nr * d + chunk * nr * KV_BLOCK / 2
+}
+
+/// F32 elements of the [`WMMA_SPLIT`] scratch for a layer of head size `d` and `n_head` query
+/// heads over `n_head_kv` kv heads, for a group of `n_tok` tokens per sequence of `n_seqs`
+/// sequences with `table_width`-entry tables: all of it at once if that fits in
+/// [`WMMA_SPLIT_BUDGET`], else that budget or (if more) one sequence's room with the smallest
+/// chunk. 0 when the group does not take the split.
+pub fn wmma_split_floats(
+    d: usize,
+    n_head: usize,
+    n_head_kv: usize,
+    n_tok: usize,
+    n_seqs: usize,
+    table_width: usize,
+) -> usize {
+    if !(2..=VERIFY_SPLIT_TOKENS).contains(&n_tok) || n_head_kv == 0 || n_head % n_head_kv != 0 {
+        return 0;
+    }
+    let (tiles, nr) = wmma_rows(n_head / n_head_kv, n_tok);
+    let units = tiles * n_head_kv;
+    if n_seqs * units > WMMA_SPLIT_MAX_CTAS {
+        return 0;
+    }
+    let full = n_seqs * units * wmma_lane_floats(d, nr, table_width, table_width);
+    let least = units * wmma_lane_floats(d, nr, table_width, WMMA_SPLIT_MIN_CHUNK.min(table_width));
+    full.min(WMMA_SPLIT_BUDGET.max(least))
+}
+
+/// The [`WMMA_SPLIT`] scratch a group's attention layers share (the most any of them, of head
+/// size and kv heads `dims`, needs; [`wmma_split_floats`]), or 0 when the group does not take
+/// the split: off, not 2 to [`VERIFY_SPLIT_TOKENS`] tokens per sequence, or a device that does
+/// not run the WMMA kernel.
+pub fn wmma_split_len(
+    dims: &[(i64, i64)],
+    n_head: i64,
+    n_tok: usize,
+    n_seqs: usize,
+    table_width: usize,
+) -> usize {
+    if !(2..=VERIFY_SPLIT_TOKENS).contains(&n_tok)
+        || !WMMA_SPLIT.load(Ordering::Relaxed)
+        || !split_ok()
+    {
+        return 0;
+    }
+    dims.iter()
+        .map(|&(d, kv)| {
+            wmma_split_floats(
+                d as usize,
+                n_head as usize,
+                kv as usize,
+                n_tok,
+                n_seqs,
+                table_width,
+            )
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// How a launch uses a [`WMMA_SPLIT`] scratch of `len` elements: (sequences per run, key blocks
+/// of weights per chunk), the pair with the fewest kernel launches (each run takes 4 plus 2 per
+/// chunk), or `None` when not even one sequence with the smallest chunk fits (the op then runs
+/// the WMMA kernel).
+pub fn wmma_split_plan(
+    len: usize,
+    d: usize,
+    n_head: usize,
+    n_head_kv: usize,
+    n_tok: usize,
+    n_seqs: usize,
+    table_width: usize,
+) -> Option<(usize, usize)> {
+    if !(2..=VERIFY_SPLIT_TOKENS).contains(&n_tok)
+        || n_head_kv == 0
+        || n_head % n_head_kv != 0
+        || table_width == 0
+    {
+        return None;
+    }
+    let (tiles, nr) = wmma_rows(n_head / n_head_kv, n_tok);
+    let units = tiles * n_head_kv;
+    if n_seqs * units > WMMA_SPLIT_MAX_CTAS {
+        return None;
+    }
+    let fixed = wmma_lane_floats(d, nr, table_width, 0);
+    let per_block = nr * KV_BLOCK / 2;
+    let min_chunk = WMMA_SPLIT_MIN_CHUNK.min(table_width);
+    (1..=n_seqs)
+        .filter_map(|s| {
+            let lane = len / (s * units);
+            let chunk = (lane.checked_sub(fixed)? / per_block).min(table_width);
+            (chunk >= min_chunk).then_some((s, chunk))
+        })
+        .min_by_key(|&(s, chunk)| {
+            (
+                n_seqs.div_ceil(s) * (4 + 2 * table_width.div_ceil(chunk)),
+                s,
+            )
+        })
+}
+
 /// F32 elements of a prefill group's scratch over a tiered pool with `stage_blocks` staging
 /// slots: the rows' running (max, sum), then the pieces' I32 walk arrays (blocks and entries
 /// per table entry, a count per sequence, the staged count) and the slots' pool blocks.
@@ -554,6 +697,9 @@ struct LaunchParams {
     compact: i32,
     /// Elements from one kv head to the next in a compact cache's cell.
     head_stride: i64,
+    /// With `split`: every row of a 2-16-token group split over the key blocks, the weights of
+    /// this many blocks at a time ([`wmma_split_plan`]); 0: the last token's rows only.
+    vsplit_chunk: i32,
 }
 
 /// The kernels' code for a cache type (`LEGION_KV_*` in paged_attn.cu), if they read it.
@@ -661,6 +807,7 @@ unsafe fn cuda_paged_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
         split_seqs: 0,
         compact: i32::from(o.compact),
         head_stride: o.head_stride as i64,
+        vsplit_chunk: 0,
     };
     // A multi-token group runs split over the key blocks (sm_80+) only with a scratch made for
     // it (split_scratch_shape); the placeholder and a tier's scratch have one split.
@@ -676,6 +823,23 @@ unsafe fn cuda_paged_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
             p.split = ptr;
             p.split_seqs = fit.min(o.n_seqs) as i32;
         }
+    } else if WMMA_SPLIT.load(Ordering::Relaxed)
+        && !(o.tier.is_some() && staged(&o))
+        && let Some((seqs, chunk)) = wmma_split_plan(
+            o.scratch_len,
+            o.d,
+            o.n_head,
+            o.n_head_kv,
+            o.n_tok,
+            o.n_seqs,
+            o.table_width,
+        )
+    {
+        // Every row of a 2-16-token group split over the key blocks (sm_70 / sm_75's WMMA path
+        // only; the other kernels ignore it), given a scratch made for it (wmma_split_len).
+        p.split = o.scratch;
+        p.split_seqs = seqs as i32;
+        p.vsplit_chunk = chunk as i32;
     }
     let check = |rc: i32| match rc {
         0 => Ok(()),
@@ -805,3 +969,6 @@ mod tier_tests;
 pub mod tq;
 #[cfg(test)]
 mod vsplit_tests;
+pub mod wmma_bench;
+#[cfg(test)]
+mod wmma_split_tests;
