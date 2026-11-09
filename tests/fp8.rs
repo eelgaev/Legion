@@ -418,12 +418,10 @@ fn cuda_verify_timings() {
 /// at k 2,688, ~4e-3 at 5,120, an order of magnitude under what E4M3 activations themselves
 /// cost (W8A8 against W8A16 on the CPU: up to 0.1).
 #[cfg(feature = "cuda")]
-fn a8_tolerance(n: usize) -> f64 {
-    if n > 8 && legion::hw::per_device::compute_capability(0) == Some(89) {
-        1e-2
-    } else {
-        1e-5
-    }
+fn a8_tolerance(gpu: &Backend, n: usize) -> f64 {
+    let ordinal = gpu.name().strip_prefix("CUDA").and_then(|i| i.parse().ok());
+    let cc = ordinal.and_then(legion::hw::per_device::compute_capability);
+    if n > 8 && cc == Some(89) { 1e-2 } else { 1e-5 }
 }
 
 /// W8A8 on `backend`: quantize `x` with `scale`, then the E4M3 x E4M3 matmul.
@@ -504,7 +502,7 @@ fn cuda_a8_matches_cpu() {
         let want: Vec<f64> = yc.iter().map(|&v| v as f64).collect();
         let e = rel_err(&yg, &want);
         println!("a8 k {k} m {m} n {n}: relative error {e:.2e}");
-        let tol = a8_tolerance(n);
+        let tol = a8_tolerance(&gpu, n);
         assert!(e < tol, "k {k}, m {m}, n {n}: relative error {e}");
     }
 }
@@ -873,7 +871,7 @@ fn cuda_a8_dynamic_matches_cpu() {
             }
             // Each token against its own scale: magnitudes span 256x, so a batch-wide scale
             // would hide a broken small token.
-            let tol = a8_tolerance(n);
+            let tol = a8_tolerance(&gpu, n);
             for (t, (g, c)) in yg.chunks(m).zip(yc.chunks(m)).enumerate() {
                 if t == 1 {
                     continue;
