@@ -3906,12 +3906,15 @@ impl LmEngine {
         let cc = caps.map(|c| (c.0, c.1));
         let cc_major = cc.map(|c| c.0);
         // V100 (#574): the GB10 prompt kernels too (Maya-S, 8K-token prompt 565 -> 804 tok/s), but
-        // the plain Q6_K decode GEMV (the staged one ~11% slower there). The same bits.
+        // the plain Q6_K decode GEMV (the staged one ~11% slower there). Ampere (8.0 to 8.7,
+        // #1212) likewise: without them its prompt products run linear_mm, no tensor cores; the
+        // decode GEMV stays the plain one. The same bits.
         let volta = cc == Some((7, 0));
-        if volta && cfg.switches.glm_gb10_linear.is_none() {
+        let ampere = cc.is_some_and(crate::hw::per_device::ampere);
+        if (volta || ampere) && cfg.switches.glm_gb10_linear.is_none() {
             crate::model::glm5next::ops::set_gb10_linear(true);
         }
-        crate::model::glm5next::ops::set_gb10_gemv(!volta);
+        crate::model::glm5next::ops::set_gb10_gemv(!(volta || ampere));
         // #594: long prompt steps' Q6_K products through F16 weights and linear_tc (sm_80+, the
         // same bits)
         crate::model::glm5next::ops::set_q6k_f16(cc_major.is_some_and(|m| m >= 8));

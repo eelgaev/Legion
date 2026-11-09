@@ -72,13 +72,27 @@ inline int compute_capability() {
     return v;
 }
 
+// Whether this binary has the sm_80+ code of `probe` (one of the caller's kernels; every file is
+// built for the same targets) for the current device: `binaryVersion` and `ptxVersion` >= 80, so
+// a binary without that code never takes a path that would JIT to a trap. Not cached: the callers
+// below cache their answer per device.
+template <typename... KArgs>
+bool sm80_code(void (*probe)(KArgs...)) {
+    cudaFuncAttributes fa{};
+    const cudaError_t before = cudaPeekAtLastError();
+    const bool code = cudaFuncGetAttributes(&fa, probe) == cudaSuccess && fa.binaryVersion >= 80 &&
+                      fa.ptxVersion >= 80;
+    if (!code) {
+        clear_own_error(before);
+    }
+    return code;
+}
+
 // Whether the current device is compute capability 12.x (GB10 and RTX 50: the same SM, the same
 // mma / ldmatrix / cp.async / PDL and 99 KB of shared memory a block) and this binary has the
-// sm_80+ code of `probe` (one of the caller's kernels; every file is built for the same targets)
-// for it: `binaryVersion` and `ptxVersion` >= 80, so a binary without that code never takes a
-// path that would JIT to a trap. Compute-shaped picks key on it (#1200): the kernels written for
-// the GB10 and programmatic dependent launch (launch_pdl.cuh). Choices measured against the
-// GB10's memory (its bandwidth, its 48 SMs) key on the device itself, not on this.
+// sm_80+ code of `probe` for it (sm80_code). Compute-shaped picks key on it (#1200): the kernels
+// written for the GB10 and programmatic dependent launch (launch_pdl.cuh). Choices measured
+// against the GB10's memory (its bandwidth, its 48 SMs) key on the device itself, not on this.
 template <typename... KArgs>
 bool sm12x_device(void (*probe)(KArgs...)) {
     static std::atomic<int> state[GGML_CUDA_MAX_DEVICES];  // 0 unknown, 1 yes, 2 no
@@ -88,14 +102,33 @@ bool sm12x_device(void (*probe)(KArgs...)) {
     }
     int st = state[dev].load(std::memory_order_relaxed);
     if (st == 0) {
-        cudaFuncAttributes fa{};
-        const cudaError_t before = cudaPeekAtLastError();
-        const bool code = cudaFuncGetAttributes(&fa, probe) == cudaSuccess && fa.binaryVersion >= 80 &&
-                          fa.ptxVersion >= 80;
-        if (!code) {
-            clear_own_error(before);
-        }
+        const bool code = sm80_code(probe);
         st = compute_capability() / 10 == 12 && code ? 1 : 2;
+        state[dev].store(st, std::memory_order_relaxed);
+    }
+    return st == 1;
+}
+
+// Whether compute capability `cc` (10 * major + minor) is Ampere: 8.0 to 8.7 (A100 and A30 with
+// 164 KB of shared memory per SM; RTX 30, the A-series workstation cards, A10 / A40 and Orin
+// with 100 KB, 99 KB a block). Not 8.9 (Ada: sm_89 code of its own).
+inline bool ampere_cc(int cc) {
+    return cc >= 80 && cc <= 87;
+}
+
+// Whether the current device is Ampere (ampere_cc) and this binary has the sm_80+ code of `probe`
+// for it (sm80_code): the kernels written for the GB10 whose 99 KB a block fits these SMs too,
+// where they were measured faster (#1212), take them.
+template <typename... KArgs>
+bool ampere_device(void (*probe)(KArgs...)) {
+    static std::atomic<int> state[GGML_CUDA_MAX_DEVICES];  // 0 unknown, 1 yes, 2 no
+    const int dev = current();
+    if (dev < 0) {
+        return false;
+    }
+    int st = state[dev].load(std::memory_order_relaxed);
+    if (st == 0) {
+        st = ampere_cc(compute_capability()) && sm80_code(probe) ? 1 : 2;
         state[dev].store(st, std::memory_order_relaxed);
     }
     return st == 1;

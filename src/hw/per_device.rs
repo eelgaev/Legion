@@ -66,6 +66,13 @@ pub fn sms_if_cc12(dev: usize) -> i32 {
     }
 }
 
+/// Whether compute capability `(major, minor)` is Ampere: 8.0 to 8.7 (A100 and A30, RTX 30, the
+/// A-series cards, Orin), not 8.9 (Ada). The CUDA launchers ask the same of the current device
+/// (`legion_device::ampere_cc`, #1212).
+pub fn ampere((major, minor): (i32, i32)) -> bool {
+    major == 8 && (0..=7).contains(&minor)
+}
+
 #[cfg(feature = "cuda")]
 mod cuda {
     use std::ffi::c_int;
