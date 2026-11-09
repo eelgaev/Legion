@@ -7,6 +7,12 @@
 // compiles for every target architecture; fp8_mma() in fp8_mm.cu (compute capability 8.9+)
 // decides per device at run time whether they run, and the engine refuses at load a GPU this
 // binary has no code of its architecture for.
+//
+// Ada's E4M3 MMAs (an RTX 4090, #1213) add C and their 32 products in a window of ~14 bits under
+// the largest exponent among them and truncate the rest, so over k the sums drift from F32 ones
+// (relative to the largest output, 1.3e-3 at k 2,688, 4.3e-3 at 5,120); the GB10 sums in F32.
+// Starting every MMA from zero and adding in F32 cuts that to ~8e-5 but cost the big GEMM 6-7%
+// there, under E4M3 activations' own rounding, so the MMAs accumulate in place everywhere.
 
 // More tokens: 64 * WM rows x 128 tokens per CTA, 8 warps as WM x (8 / WM) of 64 rows x
 // 128 / (8 / WM) tokens, mma.sync m16n8k32 E4M3 x E4M3 -> F32 (sm_89+) straight from the raw
@@ -221,7 +227,8 @@ __global__ void __launch_bounds__(256) fp8_gemm8(const legion_fp8_mm8 p) {
 #endif
 }
 
-// Few tokens past the GEMV (9..64): memory-bound, so a CTA is W warps of 16 weight rows each
+// Few tokens past the GEMV (9..64, and on Ada mid-size batches the big GEMM's tiles would not
+// fill the SMs with, over 64-token column tiles): memory-bound, so a CTA is W warps of 16 weight rows each
 // over all of its BN tokens, so there are enough CTAs (weight streams) to keep the bus busy; K
 // steps of 128 bytes through four cp.async stages (three where four would not fit in the 99 KiB
 // of shared memory a block gets on sm_86/89/12x), mma.sync m16n8k32 E4M3 as above.
@@ -231,17 +238,28 @@ template <int BN, int W>
 __host__ __device__ constexpr int stages() {
     return (size_t) 4 * (16 * W + BN) * LD <= 96 * 1024 ? 4 : 3;
 }
+// Ada's mid-size batches (fp8_mm.cu, gemm8_ada_skinny): the most stages (4 to 2) that still
+// let two CTAs share an SM's 100 KB of shared memory (48 KiB each), else stages<BN, W>(). The
+// same bits.
 template <int BN, int W>
+__host__ __device__ constexpr int stages_ada() {
+    return (size_t) 4 * (16 * W + BN) * LD <= 48 * 1024   ? 4
+           : (size_t) 3 * (16 * W + BN) * LD <= 48 * 1024 ? 3
+           : (size_t) 2 * (16 * W + BN) * LD <= 48 * 1024 ? 2
+                                                           : stages<BN, W>();
+}
+template <int BN, int W, int STAGES = stages<BN, W>()>
 __host__ __device__ constexpr size_t smem() {
-    return (size_t) stages<BN, W>() * (16 * W + BN) * LD;
+    return (size_t) STAGES * (16 * W + BN) * LD;
 }
 }  // namespace a8s
 
-template <int BN, int W>
+// RES: p.res added to every output, as fp8_gemm8<true> does (only Ada's mid-size batches).
+template <int BN, int W, bool RES = false, int STAGES = a8s::stages<BN, W>()>
 __global__ void __launch_bounds__(32 * W) fp8_gemm8_skinny(const legion_fp8_mm8 p) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
     using namespace a8s;
-    constexpr int BM = 16 * W, T = 32 * W, NT = BN / 8, STAGES = stages<BN, W>();
+    constexpr int BM = 16 * W, T = 32 * W, NT = BN / 8;
     constexpr size_t STAGE = (size_t) (BM + BN) * LD;
     constexpr int WCH = BM * BK / 16 / T, XCH = (BN * BK / 16 + T - 1) / T;
     extern __shared__ __align__(16) unsigned char smem[];
@@ -348,7 +366,8 @@ __global__ void __launch_bounds__(32 * W) fp8_gemm8_skinny(const legion_fp8_mm8 
         for (int e = 0; e < 4; e++) {
             const int64_t row = r0 + (e / 2) * 8, tok = t0 + e % 2;
             if (row < p.m && tok < p.n) {
-                p.dst[tok * p.m + row] = acc[j][e] * a8_scale(p, s, row, tok);
+                const float v = acc[j][e] * a8_scale(p, s, row, tok);
+                p.dst[tok * p.m + row] = RES ? __fadd_rn(v, p.res[tok * p.m + row]) : v;
             }
         }
     }

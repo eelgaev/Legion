@@ -525,27 +525,39 @@ __global__ void __launch_bounds__(128) fp8_gemv8(const legion_fp8_mm8 p) {
 // sm_90 and newer: fp8_gemm8 fed by TMA (fp8_gemm8_tma).
 #include "sm90/fp8_gemm8_tma.cuh"
 
-template <int BN, int W>
+template <int BN, int W, bool RES, int STAGES>
 void launch_gemm8_skinny_w(const legion_fp8_mm8 & p, cudaStream_t st) {
-    constexpr size_t SMEM = a8s::smem<BN, W>();
+    constexpr size_t SMEM = a8s::smem<BN, W, STAGES>();
     static_assert(SMEM <= 96 * 1024, "shared memory");
     static std::atomic<int8_t> opted_in[GGML_CUDA_MAX_DEVICES];
-    legion_device::smem_opt_in(opted_in, fp8_gemm8_skinny<BN, W>, (int) SMEM);
+    legion_device::smem_opt_in(opted_in, fp8_gemm8_skinny<BN, W, RES, STAGES>, (int) SMEM);
     const dim3 grid((unsigned) ((p.m + 16 * W - 1) / (16 * W)), (unsigned) ((p.n + BN - 1) / BN));
-    fp8_gemm8_skinny<BN, W><<<grid, 32 * W, SMEM, st>>>(p);
+    fp8_gemm8_skinny<BN, W, RES, STAGES><<<grid, 32 * W, SMEM, st>>>(p);
 }
 
-// As many CTAs as two per SM, with the tallest tiles that still give that many.
-template <int BN>
+// As many CTAs as two per SM, with the tallest tiles that still give that many. ADA: the stage
+// counts that fit two CTAs in an Ada SM (a8s::stages_ada).
+template <int BN, bool RES = false, bool ADA = false>
 void launch_gemm8_skinny(const legion_fp8_mm8 & p, cudaStream_t st) {
     const int64_t cols = (p.n + BN - 1) / BN, want = 2 * (int64_t) sm_count();
     if ((p.m + 127) / 128 * cols >= want) {
-        launch_gemm8_skinny_w<BN, 8>(p, st);
+        launch_gemm8_skinny_w<BN, 8, RES, ADA ? a8s::stages_ada<BN, 8>() : a8s::stages<BN, 8>()>(p, st);
     } else if ((p.m + 63) / 64 * cols >= want) {
-        launch_gemm8_skinny_w<BN, 4>(p, st);
+        launch_gemm8_skinny_w<BN, 4, RES, ADA ? a8s::stages_ada<BN, 4>() : a8s::stages<BN, 4>()>(p, st);
     } else {
-        launch_gemm8_skinny_w<BN, 2>(p, st);
+        launch_gemm8_skinny_w<BN, 2, RES, ADA ? a8s::stages_ada<BN, 2>() : a8s::stages<BN, 2>()>(p, st);
     }
+}
+
+// Ada (compute capability 8.9: an RTX 4090 has 128 SMs where the GB10 has 48), more than 64
+// tokens: the big GEMM's 128 x 128 tiles leave most SMs idle while they number under a quarter
+// of the SMs, so there the skinny kernel runs over 64-token column tiles instead (#1213, an
+// RTX 4090, k 4,096, 2,688 rows, 128 tokens: 21 tiles, 62 -> 29 us; with 40 to 80 tiles it
+// measured from 0.9x to 1.2x the GEMM's time, so those stay). The same bits: every output takes
+// the same MMAs in the same k order.
+bool gemm8_ada_skinny(const legion_fp8_mm8 & p) {
+    const int64_t tiles = (p.m + 127) / 128 * ((p.n + a8::BN - 1) / a8::BN);
+    return p.k % a8s::BK == 0 && tiles * 4 < sm_count() && legion_device::compute_capability() == 89;
 }
 
 template <bool RES, class C>
@@ -794,6 +806,12 @@ int legion_fp8_mm8_launch(const legion_fp8_mm8 * p, void * stream) {
         launch_gemm8_skinny<32>(*p, st);
     } else if (p->n <= 64 && p->k % a8s::BK == 0) {
         launch_gemm8_skinny<64>(*p, st);
+    } else if (gemm8_ada_skinny(*p)) {
+        if (p->res) {
+            launch_gemm8_skinny<64, true, true>(*p, st);
+        } else {
+            launch_gemm8_skinny<64, false, true>(*p, st);
+        }
     } else if (p->res) {
         launch_gemm8<true>(*p, st);
     } else {
