@@ -71,12 +71,9 @@ pub fn run(args: PagedSplitBenchArgs) -> anyhow::Result<()> {
     // Block i of every sequence in pool block i * 37 mod n_blocks.
     let table: Vec<u32> = (0..n_blocks).map(|i| (i * 37 % n_blocks) as u32).collect();
     println!(
-        "{:>7} {:>6} {:>4} {:>10} {:>10} {:>7} {:>6} {:>6}",
-        "ctx", "tokens", "seqs", "wmma ms", "split ms", "speedup", "bits", "first"
+        "{:>7} {:>6} {:>4} {:>10} {:>10} {:>7} {:>6}",
+        "ctx", "tokens", "seqs", "wmma ms", "split ms", "speedup", "bits"
     );
-    // Which kernel is timed first alternates per case, so warm-up and clock drift do not
-    // favour one side in every row.
-    let mut case = 0usize;
     for &n_ctx in &args.ctx {
         for &n_tok in &args.tokens {
             for &ns in &args.seqs {
@@ -99,22 +96,15 @@ pub fn run(args: PagedSplitBenchArgs) -> anyhow::Result<()> {
                 }
                 let (bad, _) = bench::compare(&mut gpu, &kv, &g, None);
                 differ += bad;
-                let split_first = case % 2 == 1;
-                case += 1;
-                let (wmma, split) = if split_first {
-                    let split = bench::time(&mut gpu, &kv, &g, true, args.reps, args.rounds);
-                    let wmma = bench::time(&mut gpu, &kv, &g, false, args.reps, args.rounds);
-                    (wmma, split)
-                } else {
-                    let wmma = bench::time(&mut gpu, &kv, &g, false, args.reps, args.rounds);
-                    let split = bench::time(&mut gpu, &kv, &g, true, args.reps, args.rounds);
-                    (wmma, split)
-                };
+                // Both orders (wmma, split, split, wmma), each kernel's faster run kept, so warm-up
+                // and clock drift do not favour the side that runs second.
+                let mut t = |split| bench::time(&mut gpu, &kv, &g, split, args.reps, args.rounds);
+                let (w1, s1, s2, w2) = (t(false), t(true), t(true), t(false));
+                let (wmma, split) = (w1.min(w2), s1.min(s2));
                 println!(
-                    "{n_ctx:>7} {n_tok:>6} {ns:>4} {wmma:>10.4} {split:>10.4} {:>7.2} {:>6} {:>6}",
+                    "{n_ctx:>7} {n_tok:>6} {ns:>4} {wmma:>10.4} {split:>10.4} {:>7.2} {:>6}",
                     wmma / split,
-                    if bad == 0 { "same" } else { "DIFFER" },
-                    if split_first { "split" } else { "wmma" }
+                    if bad == 0 { "same" } else { "DIFFER" }
                 );
             }
         }
