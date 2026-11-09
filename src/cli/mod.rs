@@ -22,6 +22,7 @@ mod model_path;
 mod nvfp4_gemm_bench;
 mod nvfp4_mv_bench;
 mod nvfp4_once_bench;
+mod paged_split_bench;
 mod q4k_head_bench;
 mod q8_group_check;
 mod q8_head_bench;
@@ -151,6 +152,10 @@ enum Command {
     /// Check and time GLM's sparse MLA prompt kernels against each other (development).
     #[command(hide = true)]
     MlaBench(mla_bench::MlaBenchArgs),
+    /// Check and time the sm_70 / sm_75 paged attention split of verify steps against the WMMA
+    /// kernel (development).
+    #[command(hide = true)]
+    PagedSplitBench(paged_split_bench::PagedSplitBenchArgs),
 }
 
 /// The parsed `Cli` as a bare `clap::Command`, so `completions` can generate from it
@@ -227,5 +232,6 @@ async fn run(cli: Cli, numa: Option<legion::hw::numa_bind::Placement>) -> anyhow
         Command::LinBench(args) => lin_bench::run(args),
         Command::QsaBench(args) => qsa_bench::run(args),
         Command::MlaBench(args) => mla_bench::run(args),
+        Command::PagedSplitBench(args) => paged_split_bench::run(args),
     }
 }

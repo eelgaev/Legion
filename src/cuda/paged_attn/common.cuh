@@ -32,7 +32,9 @@
 //   per-row rescaling of WMMA accumulators, whose element layout the API does not expose.
 //   Given a split scratch (an MTP head's take-in pass, whose last rows alone are read), the
 //   last token's rows of the same kernel come split over the key blocks instead, the same bits
-//   (sm70/paged_split.cuh).
+//   (sm70/paged_split.cuh); given one for all rows (vsplit_chunk > 0: speculative verify steps
+//   and other groups of 2 to 16 tokens per sequence), every row of the same kernel split over the
+//   key blocks, the same bits (sm70/paged_vsplit.cuh, #1211).
 //
 // Both prefill kernels round Q and P to F16 for the MMA (as cuBLAS does for the plain mul_mat
 // path); scores, softmax and the output accumulate in F32. On Volta, Turing and consumer
@@ -108,6 +110,11 @@ struct legion_paged_attn {
     // (v_stage points into k_stage at V's offset). 0 for every other cache.
     int32_t compact;
     int64_t head_stride;
+    // > 0 with `split` (2 to 16 tokens per sequence): every row of the group comes split over
+    // the key blocks instead of the last token's (sm70/paged_vsplit.cuh, #1211), the WMMA
+    // kernel's bits, with the weights of this many key blocks at a time in the scratch (its size
+    // is paged::wmma_split_plan on the Rust side).
+    int32_t vsplit_chunk;
 };
 
 enum { LEGION_KV_F16 = 0, LEGION_KV_Q8_0 = 1, LEGION_KV_Q4_0 = 2 };
@@ -126,6 +133,9 @@ void legion_paged_attn_set_prefill(int kernel, int this_thread);
 
 // Prefill launches of the m8n8k4 kernel from the calling thread so far (tests).
 int64_t legion_paged_attn_m884_launches(void);
+
+// Launches of the WMMA kernel's all-row split (vsplit, #1211) from the calling thread so far.
+int64_t legion_paged_attn_vsplit_launches(void);
 
 // Whether prefill launches on the current device take the WMMA kernel, which a split scratch
 // (legion_paged_attn::split) replaces for the last token's rows: sm_70 / sm_75 without the
@@ -151,6 +161,7 @@ namespace legion_paged {
 extern int g_prefill;
 extern thread_local int t_prefill;
 extern thread_local int64_t t_m884_launches;
+extern thread_local int64_t t_vsplit_launches;
 }  // namespace legion_paged
 
 namespace {
@@ -160,6 +171,7 @@ constexpr int BLK = 64;  // positions per KV block (KV_BLOCK on the Rust side)
 using legion_paged::g_prefill;
 using legion_paged::t_prefill;
 using legion_paged::t_m884_launches;
+using legion_paged::t_vsplit_launches;
 
 // Whether the current device is sm_70 (cached per device).
 bool device_is_sm70() {
@@ -776,6 +788,9 @@ __global__ void __launch_bounds__(256) paged_prefill(const legion_paged_attn p) 
 // The WMMA kernel's last-token rows split over the key blocks, namespace split (#436).
 #include "../sm70/paged_split.cuh"
 
+// The WMMA kernel's rows of a 2-16-token group split over the key blocks, namespace vsplit (#1211).
+#include "../sm70/paged_vsplit.cuh"
+
 template <int D, int G, bool C = false>
 int launch(const legion_paged_attn & p, cudaStream_t st) {
     if (p.n_tok == 1) {
@@ -796,8 +811,13 @@ int launch(const legion_paged_attn & p, cudaStream_t st) {
         return fa::launch<D, G, C>(p, st);
     } else if (p.k_type != LEGION_KV_F16 || p.v_type != LEGION_KV_F16) {
         return 1;  // the WMMA kernel reads F16 only (legion_paged_attn_quant_ok)
-    } else if (p.split && p.split_seqs > 0 && !p.piece_blk) {
+    } else if (p.split && p.split_seqs > 0 && !p.piece_blk && p.vsplit_chunk == 0) {
         return split::launch<D, G, C>(p, st);
+    } else if (const int rc = p.split && p.split_seqs > 0 && !p.piece_blk && !p.ml && p.vsplit_chunk > 0
+                                  ? vsplit::launch<D, G, C>(p, st)
+                                  : -1;
+               rc >= 0) {
+        return rc;  // -1: the device lacks the kernels' shared memory, the WMMA kernel instead
     } else {
         constexpr size_t smem = PrefillSmem<D>::SIZE;
         // Per device, once (the attribute is per function and device).

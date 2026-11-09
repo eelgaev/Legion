@@ -482,6 +482,16 @@ pub(in crate::cli) struct SwitchArgs {
     /// Not used over a pool with a host tier. Off by default.
     #[arg(long, help_heading = HEADING)]
     paged_verify_split: bool,
+    /// CUDA, compute capability 7.0 / 7.5 (V100, Turing): split the paged attention of groups
+    /// of 2-16 tokens per sequence (speculative verify steps, short prompt chunks) over the key
+    /// blocks across the GPU, at up to 32 CTAs of the WMMA kernel (one per query tile and kv
+    /// head, each walking the whole context twice). The attention's output bits are the same,
+    /// up to 11x faster at a 64K context, but slower at a short one with several sequences
+    /// (more launches). With --spec, cheaper verify steps change how much the adaptive draft
+    /// length drafts, and with it which steps compute each token, so greedy text can differ
+    /// from the default's. Off by default.
+    #[arg(long, help_heading = HEADING)]
+    paged_verify_split_wmma: bool,
     /// CUDA, MoE layers: the shared expert's gate (sigmoid, scaling and sum) as one op instead of
     /// ggml's three, and on steps of up to 3 tokens the router's and the gate's logits from one
     /// matmul (one matmul and two kernels fewer per layer). Each op gives ggml's bits, but the
@@ -1413,6 +1423,7 @@ impl SwitchArgs {
             moe_pad_skip: self.no_moe_pad_skip.then_some(false),
             tp_moe_ep_skip: self.no_tp_moe_ep_skip.then_some(false),
             paged_verify_split: self.paged_verify_split.then_some(true),
+            paged_verify_split_wmma: self.paged_verify_split_wmma.then_some(true),
             shexp_gate: self.shexp_gate.then_some(true),
             decode_fuse: self.decode_fuse.then_some(true),
             node_fuse: self.node_fuse_ggml.then_some(false),
