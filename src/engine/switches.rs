@@ -404,7 +404,7 @@ pub struct Switches {
     pub glm_decode_mv: Option<bool>,
     /// GLM-5.3-Flash: the GB10-tuned linear kernels
     /// ([`crate::model::glm5next::ops::set_gb10_linear`]; `None`: the engine's choice, on for
-    /// integrated GPUs and V100s).
+    /// integrated GPUs, V100s and Ampere GPUs).
     pub glm_gb10_linear: Option<bool>,
     /// GLM-5.3-Flash: prompt MLA attention on tensor cores
     /// ([`crate::model::glm5next::ops::set_mla_tc`]; off by default).

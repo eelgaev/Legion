@@ -14,7 +14,8 @@
 //
 // The prompt kernels per architecture live in sm70/qsa_attn.cuh (mma.sync.m8n8k4, attn_kernel),
 // sm80/qsa_attn.cuh (mma.sync.m16n8k16, attn_mma_kernel) and sm80/qsa_attn_gb10.cuh
-// (attn_gb_kernel: attn_mma_kernel's bits, two CTAs per SM, on compute capability 12.x),
+// (attn_gb_kernel: attn_mma_kernel's bits, two CTAs per SM, on compute capability 12.x and
+// 8.0-8.7),
 // included below; launch_attn picks one per device at run time (use_mma, use_gb). The other
 // kernels are portable and stay here.
 
@@ -472,8 +473,10 @@ bool use_mma() {
 }
 
 // Whether the current device takes attn_gb_kernel<HD> by default: compute capability 12.x (the
-// GB10 and the other consumer Blackwell GPUs, 100 KB of shared memory per SM) running
-// attn_mma_kernel (use_mma). `forced` (legion_qsa_attn::mma_kernel 2) takes it on any sm_80+.
+// GB10 and the other consumer Blackwell GPUs, 100 KB of shared memory per SM) or Ampere, 8.0 to
+// 8.7 (#1212: the sm_86 code took 0.48-0.51x attn_mma_kernel's time at 8K-32K, 4096-token
+// steps; not 8.9), running attn_mma_kernel (use_mma). `forced` (legion_qsa_attn::mma_kernel 2)
+// takes it on any sm_80+.
 template <int HD>
 bool use_gb(bool forced) {
     if (!use_mma<HD>()) {
@@ -489,10 +492,11 @@ bool use_gb(bool forced) {
     }
     int s = state[dev].load(std::memory_order_acquire);
     if (s == 0) {
-        int major = 0;
+        int major = 0, minor = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
         (void) cudaGetLastError();
-        s = major == 12 ? 1 : 2;
+        s = major == 12 || (major == 8 && minor <= 7) ? 1 : 2;
         state[dev].store(s, std::memory_order_release);
     }
     return s == 1;
