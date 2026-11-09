@@ -32,6 +32,7 @@ end up running the code: the sm70 kernels also run on newer GPUs when the dispat
 | `glm5next.cu` | `sm80/mla_gb10.cuh` (GLM's sparse MLA prompt kernel as the GB10 runs it: score warps and value warps a chunk apart on named barriers, swizzled `cp.async` chunk buffers; `mla_tiled_kernel`'s bits, picked on compute capability 12.x by `legion_device::sm12x_device()`, #862), `sm80/linear_tc_gb10.cuh` (`linear_tc_gb`: linear_tc's F16 prompt GEMM and bits on other tile shapes; F16-row products on compute capability 12.x by `tc_gb_auto`, #862). |
 | `sm120/nvfp4_a4.cu` | The whole file (its own translation unit, listed in build.rs). |
 | `sm90/cluster_select.cu` | The whole file: decode-sized top-k (`qsa_attn.cu`'s `topk_kernel` bits) and argmax (ggml-cuda's `argmax_f32` bits) on clusters of 8 CTAs a row (`src/model/cluster_select.rs`). |
+| `sm90/wgmma_gemm.cu` | The whole file, sm_90a only (`__CUDA_ARCH_FEAT_SM90_ALL`; every other target, plain sm_90 included, compiles a trap): BF16 and E4M3 prompt GEMMs on `wgmma` fed by the TMA, a producer warpgroup and two consumer warpgroups (`src/model/wgmma_gemm.rs`, `--hopper-gemm`, #1215). Untested on hardware. A probe kernel with static shared memory only in its sm_90a body tells the host the binary has them. |
 
 The other files have no architecture-specific code (`fused.cu`, `expert_mv/` (split by weight type into its own translation units, #955),
 `dequant.cu`, `shim.cu`, `gdn_scan.cu`) or one family only (`nvfp4_mm/` (split into the GEMM,

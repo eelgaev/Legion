@@ -288,9 +288,9 @@ pub(in crate::cli) struct SwitchArgs {
     dense_mv_f32: bool,
     /// Keep a GDN layer's alpha and beta projections (BF16, 48 rows each: NVFP4 checkpoints of
     /// Qwen3.8-Flash-Next) on ggml's cuBLAS GEMM in decode steps of 9-16 tokens. By default
-    /// (CUDA, compute capability 9.0+) they ride along in the layer's qkv+z dense op, computed
-    /// in cuBLAS's order: the same bits, without the two ~18 us latency-bound cuBLAS launches
-    /// per layer (#836). For comparisons.
+    /// (CUDA, compute capability 10.0+; Hopper keeps cuBLAS) they ride along in the layer's
+    /// qkv+z dense op, computed in cuBLAS's order: the same bits, without the two ~18 us
+    /// latency-bound cuBLAS launches per layer (#836). For comparisons.
     #[arg(long, help_heading = HEADING)]
     no_dense_mv_ab: bool,
     /// CUDA, compute capability 9.0+: a dense BF16 matmul of 2-16 tokens with fewer row tiles
@@ -371,6 +371,15 @@ pub(in crate::cli) struct SwitchArgs {
     /// can differ from the default's where such steps occur. Off by default.
     #[arg(long, help_heading = HEADING)]
     fp8_sliced_k: bool,
+    /// CUDA, compute capability 9.0 only (H100, H200, GH200) with a binary built for sm_90a
+    /// (CMAKE_CUDA_ARCHITECTURES=90a): W8A8 FP8 prompt matmuls (more than 64 tokens) on the
+    /// Hopper GEMM (warpgroup MMA fed by the TMA, a warp-specialized pipeline of 128 x 128 tiles,
+    /// each 128-deep FP8 sum promoted to F32) instead of the mma.sync GEMM. UNTESTED ON HARDWARE:
+    /// written and compiled without a Hopper GPU, never run or measured. The sums round in
+    /// another order, so greedy text can differ from the default's. Elsewhere (other GPUs, a
+    /// binary without sm_90a) it does nothing. Off by default.
+    #[arg(long, help_heading = HEADING)]
+    hopper_gemm: bool,
     /// CUDA, compute capability 8.0+, dense NVFP4 weights on Legion's W4A16 kernels
     /// (--nvfp4-mm auto or legion; e.g. the MLPs of unsloth's Qwen3.8-27B-NVFP4): matmuls and
     /// fused SwiGLUs of 33-64 tokens (MTP or DFlash verify steps at 4-8 users, short prompt
@@ -1409,6 +1418,7 @@ impl SwitchArgs {
             nvfp4_mmvq_glu: self.nvfp4_mmvq_glu.then_some(true),
             fp8_small_batch_gemv: self.fp8_small_batch_gemv.then_some(true),
             fp8_sliced_k: self.fp8_sliced_k.then_some(true),
+            hopper_gemm: self.hopper_gemm.then_some(true),
             nvfp4_wide_mv: self.nvfp4_wide_mv.then_some(true),
             nvfp4_expert_pdl: self.no_nvfp4_expert_pdl.then_some(false),
             nvfp4_expert_tile_prefetch: self.no_nvfp4_expert_tile_prefetch.then_some(false),

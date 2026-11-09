@@ -163,9 +163,16 @@ static CHAIN: AtomicBool = AtomicBool::new(true);
 /// along in a dense op of larger weights with the same input ([`fits_chain`], #836): a GDN
 /// layer's alpha and beta (48 rows each) in its `qkv` and `z` launch at 9-16 tokens, in
 /// cuBLAS's order, so with its bits. On by default; `legion serve --no-dense-mv-ab` keeps them
-/// on cuBLAS (for comparisons).
+/// on cuBLAS (for comparisons). Never on compute capability 9.x ([`chain_cc`]).
 pub fn set_chain(on: bool) {
     CHAIN.store(on, Ordering::Relaxed);
+}
+
+/// Whether chain weights run on a device of compute capability `cc` (#1215): not on 9.x
+/// (Hopper), whose cuBLAS picks other kernels than the GB10's, against which the chain's order
+/// was matched, so a chain there would not give cuBLAS's bits; those weights stay on cuBLAS.
+pub fn chain_cc(cc: Option<i32>) -> bool {
+    !cc.is_some_and(|cc| cc / 10 == 9)
 }
 
 /// Whether launches from now on that have fewer tiles of rows than the GPU has SMs spread each
@@ -253,7 +260,9 @@ fn takes_any(ws: &[Tensor<'_>], x: Tensor<'_>) -> bool {
     ON.load(Ordering::Relaxed)
         && cfg!(feature = "cuda")
         && (1..=MAX_WEIGHTS).contains(&ws.len())
-        && chain_count(ws, x).is_some_and(|c| c == 0 || CHAIN.load(Ordering::Relaxed))
+        && chain_count(ws, x).is_some_and(|c| {
+            c == 0 || (CHAIN.load(Ordering::Relaxed) && chain_cc(compute_capability()))
+        })
         && ws
             .iter()
             .all(|&w| w.ty() == ws[0].ty() && !w.is_host() && !w.is_meta())

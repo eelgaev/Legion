@@ -143,6 +143,9 @@ pub struct Switches {
     /// W8A16 FP8 matmuls of 5-64 tokens on the sliced-K GEMM
     /// ([`crate::model::fp8::set_sliced_k`]).
     pub fp8_sliced_k: Option<bool>,
+    /// W8A8 FP8 prompt matmuls on the Hopper wgmma GEMM, untested on hardware
+    /// ([`crate::model::wgmma_gemm::set_enabled`]).
+    pub hopper_gemm: Option<bool>,
     /// Dense NVFP4 matmuls of 33-64 tokens on the mv kernel
     /// ([`crate::model::nvfp4_mm::set_wide_mv`]).
     pub nvfp4_wide_mv: Option<bool>,
@@ -582,6 +585,7 @@ impl Switches {
             crate::model::fp8::set_small_batch_gemv,
         );
         set(self.fp8_sliced_k, crate::model::fp8::set_sliced_k);
+        set(self.hopper_gemm, crate::model::wgmma_gemm::set_enabled);
         set(self.nvfp4_wide_mv, crate::model::nvfp4_mm::set_wide_mv);
         set(
             self.nvfp4_expert_pdl,
