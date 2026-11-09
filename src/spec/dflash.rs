@@ -143,6 +143,9 @@ pub struct DflashDrafter {
     model: Model,
     backend: Backend,
     alloc: Option<ComputeAllocator>,
+    /// DFlash 2's batched draft pass's allocator: built while the take-in graph, from
+    /// `alloc`, still runs (#1181).
+    draft_alloc: Option<ComputeAllocator>,
     opts: DflashOptions,
     rng: Rng,
     n_embd: usize,
@@ -342,6 +345,7 @@ impl DflashDrafter {
             model,
             backend,
             alloc: None,
+            draft_alloc: None,
             opts,
             caches: HashMap::new(),
             spare: Vec::new(),
@@ -460,12 +464,14 @@ impl DflashDrafter {
             .collect();
         let positions: Vec<&[usize]> = positions.iter().map(Vec::as_slice).collect();
         let mut refs: Vec<&mut cache::SeqCache> = caches.iter_mut().collect();
+        // The draft pass that follows (`step`) is built while this runs.
         let result = self.model.ingest_many(
             &mut self.backend,
             &mut self.alloc,
             &mut refs,
             &feats,
             &positions,
+            false,
         );
         for (r, c) in take.iter().zip(caches) {
             self.caches.insert(r.seq, c);
@@ -492,7 +498,7 @@ impl DflashDrafter {
             .collect();
         let rows = self.model.draft_many(
             &mut self.backend,
-            &mut self.alloc,
+            &mut self.draft_alloc,
             &seqs,
             self.model.cfg.block_size,
             false,
@@ -722,8 +728,10 @@ impl ModelDrafter for DflashDrafter {
             for r in batch.iter() {
                 self.cache_for(r.seq)?;
             }
-            self.ingest_all(batch)?;
-            return self.draft_all(batch);
+            let result = self.ingest_all(batch).and_then(|()| self.draft_all(batch));
+            // The take-in graph may still run when a step fails before the draft pass.
+            self.backend.synchronize();
+            return result;
         }
         for r in batch.iter_mut() {
             self.cache_for(r.seq)?;
