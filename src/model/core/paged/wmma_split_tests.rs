@@ -116,8 +116,12 @@ fn cuda_long_context_bitwise_and_timing() {
         };
         let (differ, total) = wmma_bench::compare(&mut backend, &kv, &g, None);
         assert_eq!(differ, 0, "{n_ctx} keys: {differ} of {total} values differ");
-        let wmma = wmma_bench::time(&mut backend, &kv, &g, false, 10, 2);
-        let split = wmma_bench::time(&mut backend, &kv, &g, true, 10, 2);
+        // Time both orders and keep each kernel's faster run, so neither side always runs warm.
+        let w1 = wmma_bench::time(&mut backend, &kv, &g, false, 10, 2);
+        let s1 = wmma_bench::time(&mut backend, &kv, &g, true, 10, 2);
+        let s2 = wmma_bench::time(&mut backend, &kv, &g, true, 10, 2);
+        let w2 = wmma_bench::time(&mut backend, &kv, &g, false, 10, 2);
+        let (wmma, split) = (w1.min(w2), s1.min(s2));
         println!("{n_ctx} keys, 4 tokens: {wmma:.3} ms -> {split:.3} ms");
     }
 }
