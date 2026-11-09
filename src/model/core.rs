@@ -43,6 +43,7 @@ pub use gdn_mma::set_gdn_mma;
 pub use gdn_scan::set_gdn_scan;
 pub(crate) use graph_size::graph_size;
 pub use norm_rope::{set_kv_append, set_norm_rope};
+pub use paged::wmma_bench as paged_split_bench;
 pub(crate) mod shape_diff;
 pub(crate) mod shared_q8;
 pub use shared_q8::set_shared_q8;
@@ -2697,6 +2698,9 @@ impl Model {
                             .collect();
                         let d = dims.iter().map(|x| x.0).max().unwrap_or(hp.head_dim);
                         let min_kv = dims.iter().map(|x| x.1).min().unwrap_or(hp.n_head_kv);
+                        // A verify step's rows split over the key blocks (sm_70 / sm_75).
+                        let wmma =
+                            paged::wmma_split_len(&dims, hp.n_head, g.n_tok, g.n_seqs, g.table);
                         let scratch = if self.kv_stage_blocks > 0 && g.n_tok > 1 {
                             let n = paged::tier_scratch_len(
                                 hp.n_head as usize,
@@ -2705,7 +2709,9 @@ impl Model {
                                 g.table,
                                 self.kv_stage_blocks,
                             );
-                            [n as i64, 1, 1, 1]
+                            [n.max(wmma) as i64, 1, 1, 1]
+                        } else if wmma > 0 {
+                            [wmma as i64, 1, 1, 1]
                         } else {
                             paged::scratch_shape(d, hp.n_head, min_kv, g.n_tok, g.n_seqs)
                         };

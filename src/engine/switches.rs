@@ -185,6 +185,9 @@ pub struct Switches {
     /// Paged attention of 2-16-token groups split over the key blocks
     /// ([`crate::model::core::paged::set_verify_split`]).
     pub paged_verify_split: Option<bool>,
+    /// sm_70 / sm_75: 2-16-token groups' rows split over the key blocks, the WMMA kernel's bits
+    /// ([`crate::model::core::paged::set_verify_split_wmma`]).
+    pub paged_verify_split_wmma: Option<bool>,
     /// MoE layers' shared-expert gate, scaling and sum as one op
     /// ([`crate::model::core::set_shexp_gate`]).
     pub shexp_gate: Option<bool>,
@@ -621,6 +624,10 @@ impl Switches {
         set(
             self.paged_verify_split,
             crate::model::core::paged::set_verify_split,
+        );
+        set(
+            self.paged_verify_split_wmma,
+            crate::model::core::paged::set_verify_split_wmma,
         );
         set(self.shexp_gate, core::set_shexp_gate);
         set(self.decode_fuse, core::set_decode_fuse);
