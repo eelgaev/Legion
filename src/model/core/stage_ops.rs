@@ -91,6 +91,11 @@ pub(crate) const PURE: &[&str] = &[
     // device-global scratch, the grid from the device's occupancy (fixed per kernel).
     "nvfp4_once",
     "nvfp4_once_glu",
+    // GGUF-quantized matmuls of 2-8 tokens on a V100 (#1210): ggml's quantization into the
+    // node's own memory, then the matvec, one kernel each on the compute stream, picked by the
+    // weight's type, the column count and the variant fixed in the node at build time.
+    "q_small_m_quantize",
+    "q_small_m",
     // Paged attention and the KV writes.
     "paged_attn",
     "norm_rope",

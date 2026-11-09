@@ -299,6 +299,7 @@ fn build_cuda_kernels(ggml: &Path) {
         .file("src/cuda/nvfp4_once.cu")
         .file("src/cuda/q8_head.cu")
         .file("src/cuda/q4k_head.cu")
+        .file("src/cuda/q_small_m.cu")
         .file("src/cuda/q8_mmq.cu")
         .file("src/cuda/sm90/cluster_select.cu")
         .file("src/cuda/glm5next.cu")

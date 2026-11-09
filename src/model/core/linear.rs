@@ -374,6 +374,10 @@ impl Linear {
             // Q8_0 weights in verify steps of 9-255 tokens: ggml's MMQ bits without its
             // stream-k fixup launch (#836).
             crate::model::q8_mmq::mul_mat(ctx, w, x)
+        } else if crate::model::core::q_small_m::takes(w, x) {
+            // GGUF-quantized weights in steps of 2-8 tokens on a V100: ggml's quantize + MMVQ
+            // bits, opt-in (--q-small-m, #1210).
+            crate::model::core::q_small_m::mul_mat(ctx, w, x)
         } else {
             let x = bf16_cast_joined(ctx, w, x).unwrap_or(x);
             let res = ctx.mul_mat(w, x);

@@ -41,7 +41,12 @@ picks the schedule, gives the kernels their shared memory and launches them from
 `legion_gdn_mma_kernels` table. `gdn_scan.cu` is plain SIMT code that the Rust side picks on 7.x GPUs only (ggml's bits
 there). `deepseek41.cu` (DeepSeek-V4.1-Flash's own ops, `src/model/deepseek41/ops.rs`) is
 plain SIMT code too, kernels only: Rust launches them with `cudaLaunchKernel` from the
-`legion_ds4_kernels` table.
+`legion_ds4_kernels` table. `q_small_m.cu` (GGUF-quantized matmuls of 2-8 tokens on a V100,
+#1210, `src/model/core/q_small_m.rs`) is kernels only too, launched from the
+`legion_q_small_m_kernels` table; it includes ggml-cuda's `common.cuh` and `vecdotq.cuh` and calls
+ggml's own `quantize_q8_1` arithmetic and `vec_dot_*_q8_1` functions, so its outputs keep MMVQ's
+bits. Its bodies are compiled for 7.x targets only (the Rust side takes compute capability 7.0
+alone) and trap elsewhere.
 
 `mmq_preq.cu` has no kernel: it is the one piece of C++ host code the owner allowed for #363,
 the glue that runs ggml-cuda's MMQ (`mul_mat_q_case`, which has no C API) on activations that

@@ -187,6 +187,19 @@ pub(in crate::cli) struct SwitchArgs {
     /// GB10); for comparisons and further work.
     #[arg(long, help_heading = HEADING)]
     draft_head_q8_mv: bool,
+    /// Compute capability 7.0 GPUs (V100; no effect elsewhere): run GGUF-quantized matmuls of
+    /// 2-8 tokens (MTP verify steps, small decode batches; Q4_K, Q5_K, Q6_K, IQ4_XS, Q8_0,
+    /// IQ4_NL, Q3_K weights) on Legion's small-M op instead of ggml's mul_mat (quantize + mmvq),
+    /// where ggml runs mmvq. Same bits as ggml. Off by default: faster than mmvq only on IQ4_XS
+    /// (up to ~20% at 5-8 tokens), 0-15% slower on the K-quants.
+    #[arg(long, help_heading = HEADING)]
+    q_small_m: bool,
+    /// Compute capability 7.0 GPUs (V100), with --q-small-m: also run the steps of up to 8
+    /// tokens that ggml runs on MMQ (Q4_K above 5 tokens, Q5_K and Q3_K above 6, Q6_K above 7)
+    /// on Legion's small-M op. Changes outputs (mmvq's sums instead of MMQ's), so greedy text
+    /// can differ from the default.
+    #[arg(long, help_heading = HEADING)]
+    q_small_m_wide: bool,
     /// Compute capability 7.x GPUs (V100; no effect elsewhere), MTP draft passes of one
     /// sequence with a Q8_0 draft LM head: keep the head on ggml's mul_mat (quantize + mmvq)
     /// instead of Legion's one-column Q8_0 matvec op (the default there: ggml's bits, the head
@@ -1365,6 +1378,8 @@ impl SwitchArgs {
             joined_prompt_qkv: self.no_joined_prompt_qkv.then_some(false),
             dense_mv: self.dense_mv_ggml.then_some(false),
             q8_mv: self.draft_head_q8_mv.then_some(true),
+            q_small_m: self.q_small_m.then_some(true),
+            q_small_m_wide: self.q_small_m_wide.then_some(true),
             q8_head: self.no_draft_head_mv.then_some(false),
             q8_head_pick: self.no_draft_head_pick.then_some(false),
             q8_row_mv: self.no_q8_group_row_mv.then_some(false),
