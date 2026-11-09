@@ -112,7 +112,7 @@ CMAKE_CUDA_ARCHITECTURES="120;121" cargo build --release --features cuda
 
 ```sh
 CMAKE_CUDA_ARCHITECTURES=75 cargo build --release --features cuda
-# a binary for an AVX-only host CPU:
+# a binary for an AVX-only host CPU (Ivy Bridge; on Sandy Bridge, which has no F16C, add GGML_F16C=OFF):
 GGML_NATIVE=OFF GGML_AVX2=OFF GGML_FMA=OFF GGML_BMI2=OFF CMAKE_CUDA_ARCHITECTURES=75 \
   cargo build --release --features cuda
 ```

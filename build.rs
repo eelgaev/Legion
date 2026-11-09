@@ -99,7 +99,8 @@ fn main() {
     );
     // With GGML_NATIVE=OFF, ggml's x86 build turns AVX2, FMA and BMI2 on by default, which an
     // AVX-only CPU (Sandy/Ivy Bridge) cannot run. Its instruction-set switches pass through when
-    // set (e.g. GGML_AVX2=OFF GGML_FMA=OFF GGML_BMI2=OFF for such a CPU).
+    // set (e.g. GGML_AVX2=OFF GGML_FMA=OFF GGML_BMI2=OFF for such a CPU, plus GGML_F16C=OFF on
+    // Sandy Bridge, which has no F16C).
     for var in X86_ISA_OPTIONS {
         if let Some(v) = env::var_os(var).filter(|v| !v.is_empty()) {
             let v = v.to_string_lossy();
