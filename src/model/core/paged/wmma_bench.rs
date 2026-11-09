@@ -100,7 +100,15 @@ pub fn compare(
     fill(q, tab, past, g);
     // Garbage in the scratch: every value the split reads it writes first.
     scratch.set_f32(&vec![f32::NAN; len]);
+    let launches = vsplit_launches();
     backend.compute(&graph).expect("compute");
+    // A GPU that runs the WMMA kernel must have taken the split, not fallen back to that kernel
+    // (no shared memory for it), or both outputs would be the WMMA kernel's.
+    let gpu = backend.device().kind() != crate::ggml::DeviceKind::Cpu;
+    assert!(
+        !gpu || !split_ok() || vsplit_launches() > launches,
+        "the split kernel did not run"
+    );
     let (a, b) = (full.to_f32(), split.to_f32());
     assert!(
         a.iter().chain(&b).all(|v| v.is_finite()),

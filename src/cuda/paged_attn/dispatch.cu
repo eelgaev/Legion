@@ -7,6 +7,7 @@ namespace legion_paged {
 int g_prefill = LEGION_PREFILL_AUTO;
 thread_local int t_prefill = -1;
 thread_local int64_t t_m884_launches = 0;
+thread_local int64_t t_vsplit_launches = 0;
 
 }  // namespace legion_paged
 
@@ -130,6 +131,10 @@ int legion_paged_attn_split_ok(void) {
 
 int64_t legion_paged_attn_m884_launches(void) {
     return t_m884_launches;
+}
+
+int64_t legion_paged_attn_vsplit_launches(void) {
+    return t_vsplit_launches;
 }
 
 void legion_paged_attn_set_prefill(int kernel, int this_thread) {

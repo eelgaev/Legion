@@ -733,6 +733,7 @@ unsafe extern "C" {
     fn legion_paged_attn_set_prefill(kernel: i32, this_thread: i32);
     #[cfg(test)]
     fn legion_paged_attn_m884_launches() -> i64;
+    fn legion_paged_attn_vsplit_launches() -> i64;
 }
 
 /// Prefill chunks (and speculative verify steps, several tokens per sequence) on sm_70 devices
@@ -753,6 +754,16 @@ pub fn set_m884_prefill(on: bool) {
 fn set_m884_prefill_here(on: bool) {
     // SAFETY: sets a thread-local flag the launches read.
     unsafe { legion_paged_attn_set_prefill(i32::from(on), 1) };
+}
+
+/// Launches of the WMMA kernel's all-row split ([`WMMA_SPLIT`]) from the calling thread so far
+/// (0 without CUDA).
+pub(crate) fn vsplit_launches() -> i64 {
+    #[cfg(feature = "cuda")]
+    // SAFETY: reads a thread-local counter.
+    return unsafe { legion_paged_attn_vsplit_launches() };
+    #[cfg(not(feature = "cuda"))]
+    0
 }
 
 /// Launches of the m8n8k4 prefill kernel from the calling thread so far (tests).

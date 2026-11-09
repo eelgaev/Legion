@@ -443,6 +443,7 @@ int launch(const legion_paged_attn & p, cudaStream_t st) {
         !legion_device::smem_opt_in(opted[2], vs_probs<D, G, C>, SMEM_MAX)) {
         return -1;
     }
+    t_vsplit_launches++;
     const int nr = rows16<G>(p.n_tok), units = tiles<G>(p.n_tok) * p.n_head_kv;
     const int smem = smem_bytes<D>(nr);
     const int nb = p.table_width, ch = p.vsplit_chunk;

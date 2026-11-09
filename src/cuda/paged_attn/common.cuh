@@ -134,6 +134,9 @@ void legion_paged_attn_set_prefill(int kernel, int this_thread);
 // Prefill launches of the m8n8k4 kernel from the calling thread so far (tests).
 int64_t legion_paged_attn_m884_launches(void);
 
+// Launches of the WMMA kernel's all-row split (vsplit, #1211) from the calling thread so far.
+int64_t legion_paged_attn_vsplit_launches(void);
+
 // Whether prefill launches on the current device take the WMMA kernel, which a split scratch
 // (legion_paged_attn::split) replaces for the last token's rows: sm_70 / sm_75 without the
 // m8n8k4 opt-in.
@@ -158,6 +161,7 @@ namespace legion_paged {
 extern int g_prefill;
 extern thread_local int t_prefill;
 extern thread_local int64_t t_m884_launches;
+extern thread_local int64_t t_vsplit_launches;
 }  // namespace legion_paged
 
 namespace {
@@ -167,6 +171,7 @@ constexpr int BLK = 64;  // positions per KV block (KV_BLOCK on the Rust side)
 using legion_paged::g_prefill;
 using legion_paged::t_prefill;
 using legion_paged::t_m884_launches;
+using legion_paged::t_vsplit_launches;
 
 // Whether the current device is sm_70 (cached per device).
 bool device_is_sm70() {
