@@ -494,7 +494,6 @@ pub struct Switches {
 fn apply_stage_graphs(on: bool) {
     use crate::ggml::stage_graph;
     stage_graph::set_safe_ops(crate::model::core::stage_ops::capture_safe);
-    stage_graph::set_direct_prompt_ops(crate::model::core::stage_ops::direct_in_prompt);
     let ggml_off = std::env::var_os("GGML_CUDA_DISABLE_GRAPHS").is_some();
     if on && !ggml_off {
         tracing::warn!("--stage-graphs needs GGML_CUDA_DISABLE_GRAPHS set before CUDA starts; off");
