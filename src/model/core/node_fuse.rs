@@ -968,6 +968,7 @@ unsafe fn cuda_moe_sum_gate(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
 /// # Safety
 /// `dst` is such a node of an allocated graph, its sources' memory still holding their values
 /// (the exchange reads them too); `out16` device-writable for the node's values.
+#[cfg(feature = "cuda")]
 pub(crate) unsafe fn launch_tail(
     dst: &ffi::ggml_tensor,
     out16: Option<u64>,
@@ -980,6 +981,7 @@ pub(crate) unsafe fn launch_tail(
 /// # Safety
 /// `dst` is a [`MOE_SUM_GATE`] node of an allocated graph whose sources hold their values;
 /// `out16` (fused-sum form only) as [`launch_tail`]'s.
+#[cfg(feature = "cuda")]
 unsafe fn launch_sum_gate(
     dst: &ffi::ggml_tensor,
     out16: Option<u64>,
