@@ -9,7 +9,7 @@ use super::bench::routing_tiles;
 use super::{
     GemmTune, Grouped, Kernel, MV_MAX_N, bf16_bits, force_gemm_tune, force_grouped_tiles,
     force_kernel, glu_gemm_tile, mul_mat_id, pick_grouped, plan_grouped, set_expert_mv_max,
-    set_expert_mv_tile, swiglu_id,
+    set_expert_mv_tile, set_expert_tma, swiglu_id,
 };
 use crate::ggml::{Backend, ComputeAllocator, Context, Graph, Tensor, types};
 
@@ -39,7 +39,8 @@ pub enum Family {
 /// One variant: the op, its tile (`mi`, `nt`; the SwiGLU's `mi` is always 2) and its stages and
 /// occupancy; `None`s are the defaults. A `tile` or `tune` is the GEMM's. `exact`: the default
 /// with a grid of the routing's own token tile count instead of the host's upper bound (#836:
-/// what the CTAs that find no tile cost).
+/// what the CTAs that find no tile cost). `tma`: the default with the SwiGLU GEMM's stages filled
+/// by the TMA ([`super::set_expert_tma`], #1183).
 #[derive(Clone, Copy, Debug)]
 pub struct Variant {
     pub op: Op,
@@ -47,12 +48,17 @@ pub struct Variant {
     pub tune: Option<GemmTune>,
     pub family: Family,
     pub exact: bool,
+    pub tma: bool,
 }
 
 impl Variant {
     /// The op's default choice, the reference of the bit checks.
     pub fn is_default(&self) -> bool {
-        self.family == Family::Default && self.tile.is_none() && self.tune.is_none() && !self.exact
+        self.family == Family::Default
+            && self.tile.is_none()
+            && self.tune.is_none()
+            && !self.exact
+            && !self.tma
     }
 
     /// The kernel family this variant runs on at `per` pairs per expert.
@@ -71,6 +77,9 @@ impl Variant {
         };
         if self.exact {
             return format!("{op} exact");
+        }
+        if self.tma {
+            return format!("{op} tma");
         }
         match self.family {
             Family::Mv(nt) => return format!("{op} mv nt<={nt}"),
@@ -104,12 +113,17 @@ pub fn variants() -> Vec<Variant> {
         tune,
         family,
         exact: false,
+        tma: false,
     };
     let exact = |op| Variant {
         exact: true,
         ..v(op, None, None, Family::Default)
     };
-    let mut out = vec![v(Op::Glu, None, None, Family::Default), exact(Op::Glu)];
+    let tma = Variant {
+        tma: true,
+        ..v(Op::Glu, None, None, Family::Default)
+    };
+    let mut out = vec![v(Op::Glu, None, None, Family::Default), exact(Op::Glu), tma];
     for nt in [8, 16] {
         for t in TUNES {
             out.push(v(Op::Glu, Some((2, nt)), tune(t), Family::Default));
@@ -153,6 +167,8 @@ pub struct Config {
     /// Routings per round.
     pub sets: usize,
     pub rounds: usize,
+    /// Variants to run by [`Variant::name`] besides each op's default; empty runs them all.
+    pub only: Vec<String>,
 }
 
 impl Default for Config {
@@ -167,6 +183,7 @@ impl Default for Config {
             pools: vec![512, 160],
             sets: 2,
             rounds: 3,
+            only: Vec::new(),
         }
     }
 }
@@ -313,6 +330,7 @@ fn hash(bytes: &[u8]) -> u64 {
 
 fn force(v: Option<&Variant>) {
     force_grouped_tiles(None, None);
+    set_expert_tma(v.is_some_and(|v| v.tma));
     // A GEMM tile or tune, or the GEMM family: the GEMM at any size; the mv family: the mv
     // kernel at any size.
     let (mv_max, mv_nt) = match v {
@@ -361,7 +379,10 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
             .collect();
         s.set_f32(&v);
     }
-    let variants = variants();
+    let variants: Vec<Variant> = variants()
+        .into_iter()
+        .filter(|v| v.is_default() || cfg.only.is_empty() || cfg.only.contains(&v.name()))
+        .collect();
     let down0 = variants
         .iter()
         .position(|v| v.op == Op::Down)

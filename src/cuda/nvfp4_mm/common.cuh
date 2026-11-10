@@ -117,6 +117,11 @@ int legion_nvfp4_swiglu_mv_launch(const legion_nvfp4_mm * p, int nt, void * stre
 // BF16 rows of m per (token, slot) pair). variant: as legion_nvfp4_gemm_launch's (grouped, nt
 // 8 or 16).
 int legion_nvfp4_swiglu_gemm_launch(const legion_nvfp4_mm * p, int nt, int variant, void * stream);
+// The grouped fused SwiGLU GEMM's default variant (three stages, one CTA per SM) with its
+// stages filled by the TMA (gemm_glu.cu, #1183): the same bits. nt = 8 or 16; -1 where it does
+// not apply (no sm_90+ code for the device, rows not 16-byte aligned, no plan), nothing
+// launched.
+int legion_nvfp4_swiglu_gemm_tma_launch(const legion_nvfp4_mm * p, int nt, void * stream);
 
 // The grouped plan from ids (I32 [n_used, n_tokens], rows ids_ld apart): n_expert <= 1024.
 // rows (I32 [n_tokens], or null): token t's pairs are grouped by token rows[t]'s experts; with
