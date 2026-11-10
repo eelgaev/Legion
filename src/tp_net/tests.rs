@@ -326,6 +326,38 @@ fn stats_count_the_all_reduces_and_the_steps_first() {
     }
 }
 
+#[test]
+fn step_marks_fall_before_the_first_and_after_the_last_all_reduce() {
+    let cs = comms(2, Duration::from_secs(20));
+    let threads: Vec<_> = cs
+        .into_iter()
+        .enumerate()
+        .map(|(r, c)| {
+            std::thread::spawn(move || {
+                let mut dst = [0f32; 16];
+                assert_eq!(c.step_marks().before_first, None);
+                c.mark_step();
+                std::thread::sleep(Duration::from_millis(20));
+                for _ in 0..3 {
+                    c.all_reduce_host(&[r as f32; 16], &mut dst).unwrap();
+                }
+                std::thread::sleep(Duration::from_millis(20));
+                c.step_marks()
+            })
+        })
+        .collect();
+    for t in threads {
+        let m = t.join().unwrap();
+        let (a, b) = (
+            m.before_first.expect("a first"),
+            m.after_last.expect("a last"),
+        );
+        assert!(a >= Duration::from_millis(20), "{m:?}");
+        assert!(b >= Duration::from_millis(20), "{m:?}");
+        assert!(m.tx_cpu.is_some() && m.rx_cpu.is_some(), "{m:?}");
+    }
+}
+
 /// Free loopback ports (bound and released: another process could take one meanwhile, which
 /// these tests accept).
 fn free_ports(n: usize) -> Vec<String> {

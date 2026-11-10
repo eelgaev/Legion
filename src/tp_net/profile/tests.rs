@@ -42,3 +42,38 @@ fn an_empty_window_is_zero() {
     assert_eq!(w.first_stall_us, 0.0);
     assert_eq!(w.own_ms, 0.0);
 }
+
+#[test]
+fn laps_log_per_step_in_order() {
+    let ms = Duration::from_millis;
+    let mut l = StepLaps::default();
+    let one = StepLaps {
+        before: ms(1),
+        prepare: ms(2),
+        fill: ms(3),
+        launch: ms(4),
+        ahead: ms(5),
+        beside: ms(6),
+        wait: ms(7),
+        output: ms(8),
+    };
+    l.add(&one);
+    l.add(&one);
+    assert_eq!(l.per_step(2), "1.00/2.00/3.00/4.00/5.00/6.00/7.00/8.00");
+}
+
+#[test]
+fn thread_counts_count_up() {
+    let a = ThreadCounts::now();
+    // Touch fresh pages and give up the CPU: the counters only grow.
+    let v = vec![1u8; 1 << 22];
+    std::thread::sleep(Duration::from_millis(2));
+    let b = ThreadCounts::now();
+    assert_eq!(v.iter().map(|&x| x as usize).sum::<usize>(), 1 << 22);
+    let d = b.since(&a);
+    assert_eq!(a.since(&b), ThreadCounts::default());
+    assert!(
+        d.forced + d.yielded >= 1 || cfg!(not(target_os = "linux")),
+        "{d:?}"
+    );
+}
