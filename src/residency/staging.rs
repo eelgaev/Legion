@@ -219,7 +219,9 @@ impl Drop for Staging {
 }
 
 impl Staging {
-    /// Buffers of `bytes[k]` per kind (`ring` each, at least two) on `device`, for `rows` rows.
+    /// `ring` buffers per kind (at least two) on `device`, for `rows` rows: buffer `i` of
+    /// `need` (kind `i / ring`'s buffer `i % ring`) takes `need[i]` bytes
+    /// ([`super::experts::ring_bytes`]).
     ///
     /// The buffers map the allocations of `pool` where they fit (the lent slots' VRAM,
     /// [`super::cuda::unback_keep`]; [`super::experts::pick_parts`] chooses), the biggest
@@ -229,15 +231,21 @@ impl Staging {
     /// the pool only can be kept ([`Self::keep`]).
     pub fn new(
         device: usize,
-        bytes: [usize; 3],
+        need: &[usize],
         rows: usize,
         ring: usize,
         pool: Vec<DeviceMem>,
         cover: bool,
     ) -> Result<Self, String> {
         let ring = ring.max(super::PREFILL_RING);
+        if need.len() != 3 * ring {
+            return Err(format!(
+                "staging: {} buffer sizes for a ring of {ring}",
+                need.len()
+            ));
+        }
         let sizes: Vec<usize> = pool.iter().map(DeviceMem::size).collect();
-        let plan = super::experts::plan_staging(&sizes, bytes, ring, cover);
+        let plan = super::experts::plan_staging_sized(&sizes, need, cover);
         let mut pool: Vec<Option<DeviceMem>> = pool.into_iter().map(Some).collect();
         let mut made: Vec<Option<DeviceMem>> = (0..3 * ring).map(|_| None).collect();
         for (i, picked) in plan {
@@ -245,7 +253,7 @@ impl Staging {
                 .into_iter()
                 .map(|p| pool[p].take().expect("each part once"))
                 .collect();
-            made[i] = Some(DeviceMem::from_parts(device, bytes[i / ring], parts)?);
+            made[i] = Some(DeviceMem::from_parts(device, need[i], parts)?);
         }
         drop(pool);
         let mut made = made.into_iter().map(|m| m.expect("every buffer made"));
@@ -291,12 +299,10 @@ impl Staging {
             .map(PeerPuller::peer)
     }
 
-    /// Whether its buffers hold `bytes` per kind.
-    pub fn fits(&self, bytes: [usize; 3]) -> bool {
-        self.bufs
-            .iter()
-            .zip(bytes)
-            .all(|(b, n)| b.iter().all(|m| m.size() >= n))
+    /// Whether its buffers hold `need[i]` bytes each (as [`Self::new`] takes them).
+    pub fn fits(&self, need: &[usize]) -> bool {
+        let bufs: Vec<&DeviceMem> = self.bufs.iter().flatten().collect();
+        bufs.len() == need.len() && bufs.iter().zip(need).all(|(m, &n)| m.size() >= n)
     }
 
     /// The allocations its buffers are made of, with their sizes.

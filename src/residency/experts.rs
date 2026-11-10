@@ -2661,6 +2661,15 @@ impl ExpertResidency {
             // device on a thread of its own: the driver runs most VMM calls one at a time,
             // but each device's memsets and syncs overlap the others' calls. Every device
             // only unmaps and maps its own VRAM, in the same order.
+            // Per device: its staged layers' rows and bytes per kind ([`ring_bytes`]).
+            let (ring, n_expert) = (self.ring, self.n_expert);
+            let mut ring_rows: Vec<Vec<(usize, [usize; 3])>> = vec![Vec::new(); n_dev];
+            for (il, l) in self.layers.iter().enumerate() {
+                if let Some(l) = l.as_ref().filter(|_| staged[il]) {
+                    let b = l.expert_bytes.map(|e| (n_expert + 1) * e);
+                    ring_rows[l.dev].push((l.row, b));
+                }
+            }
             let mut work: Vec<(usize, LendWork<'_>)> = self
                 .devices
                 .iter_mut()
@@ -2673,8 +2682,12 @@ impl ExpertResidency {
                     } else {
                         dev.lend_bytes
                     };
-                    let stage = dev.place.cuda.zip(bytes);
-                    let stage = stage.map(|(c, bytes)| (c, bytes, dev.rows));
+                    // #1216: each buffer sized for the layers whose rows use it (packed
+                    // staging: every buffer its most uncached layer's size, as before).
+                    let need = bytes
+                        .map(|b| ring_bytes(b, ring, if spread { &[] } else { &ring_rows[d][..] }));
+                    let stage = dev.place.cuda.zip(need);
+                    let stage = stage.map(|(c, need)| (c, need, dev.rows));
                     let layers = Vec::new();
                     tracing::debug!(
                         device = ?dev.place.cuda,
@@ -3436,6 +3449,35 @@ fn staging_bytes(
     (bytes.iter().sum::<usize>() > 0).then_some(bytes)
 }
 
+/// Each of a device's staging buffers' bytes (#1216), for [`plan_staging_sized`]: buffer `i`
+/// is kind `i / ring`'s buffer `i % ring`, which only rows `row % ring == i % ring` use
+/// ([`super::staging::Staging::buffer`]), so it takes the biggest of those rows' layers
+/// (`rows`: per staged layer, its row and its bytes per kind, as [`staging_bytes`] counts
+/// them), never more than `bytes`. A buffer no row uses keeps `bytes`. With one layer much
+/// bigger than the rest (a GLM layer of higher quants on an AC922 with 3 GPUs: 5 GiB against
+/// 4.2), the other buffers no longer take its size.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(super) fn ring_bytes(
+    bytes: [usize; 3],
+    ring: usize,
+    rows: &[(usize, [usize; 3])],
+) -> Vec<usize> {
+    let mut at: Vec<Option<[usize; 3]>> = vec![None; ring.max(1)];
+    for &(row, b) in rows {
+        let n = at.len();
+        let a = at[row % n].get_or_insert([0; 3]);
+        for (x, y) in a.iter_mut().zip(b) {
+            *x = (*x).max(y);
+        }
+    }
+    (0..3 * at.len())
+        .map(|i| {
+            let k = i / at.len();
+            at[i % at.len()].map_or(bytes[k], |a| a[k].min(bytes[k]))
+        })
+        .collect()
+}
+
 /// VRAM a device's staging buffers take (`ring` per kind, each rounded to the 2 MiB granule).
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn stage_footprint(bytes: [usize; 3], ring: usize) -> u64 {
@@ -3656,13 +3698,24 @@ pub(super) fn plan_staging(
     ring: usize,
     cover: bool,
 ) -> Vec<(usize, Vec<usize>)> {
-    let mut order: Vec<usize> = (0..3 * ring).collect();
-    order.sort_by_key(|&i| std::cmp::Reverse(bytes[i / ring]));
+    let need: Vec<usize> = (0..3 * ring).map(|i| bytes[i / ring]).collect();
+    plan_staging_sized(sizes, &need, cover)
+}
+
+/// [`plan_staging`] for buffers of their own sizes: `need[i]` bytes for buffer `i` (kind
+/// `i / ring`'s buffer `i % ring`, [`ring_bytes`]).
+pub(super) fn plan_staging_sized(
+    sizes: &[usize],
+    need: &[usize],
+    cover: bool,
+) -> Vec<(usize, Vec<usize>)> {
+    let mut order: Vec<usize> = (0..need.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(need[i]));
     let mut pool: Vec<usize> = (0..sizes.len()).collect();
     order
         .into_iter()
         .map(|i| {
-            let need = bytes[i / ring];
+            let need = need[i];
             let left: Vec<usize> = pool.iter().map(|&p| sizes[p]).collect();
             let mut picked = if cover {
                 pick_cover(&left, need)
@@ -3719,12 +3772,13 @@ fn per_device_thread<T: Send, R: Send>(
 #[cfg(feature = "cuda")]
 type SlotWork = (Vec<super::cuda::Slots>, Vec<(usize, usize, usize)>);
 
-/// The lend of one device ([`ExpertResidency::lend`]): `(CUDA index, staging bytes per kind,
-/// table rows)` if it stages, and its layers, each with whether it stages (below the stage limit)
-/// and whether it keeps its slots ([`ResidencyConfig::lend_keep`]).
+/// The lend of one device ([`ExpertResidency::lend`]): `(CUDA index, each staging buffer's
+/// bytes ([`ring_bytes`]), table rows)` if it stages, and its layers, each with whether it
+/// stages (below the stage limit) and whether it keeps its slots
+/// ([`ResidencyConfig::lend_keep`]).
 #[cfg(feature = "cuda")]
 struct LendWork<'a> {
-    stage: Option<(usize, [usize; 3], usize)>,
+    stage: Option<(usize, Vec<usize>, usize)>,
     layers: Vec<(bool, Lend, &'a mut Layer)>,
     /// The device's staging kept from the last lend ([`Device::kept`]).
     parked: Option<super::staging::Staging>,
@@ -3793,10 +3847,11 @@ impl LendWork<'_> {
             };
         }
         let reused = reuse
-            && match (&parked, stage) {
-                (Some(st), Some((_, bytes, _))) => st.fits(bytes),
+            && match (&parked, &stage) {
+                (Some(st), Some((_, need, _))) => st.fits(need),
                 _ => false,
             };
+        let stages = stage.is_some();
         let t = std::time::Instant::now();
         // The slots' VRAM, kept for the staging buffers (freed at once without staging).
         let mut pool = Vec::new();
@@ -3818,7 +3873,7 @@ impl LendWork<'_> {
                     } else {
                         super::cuda::unback_keep(l.tensor(k))?
                     };
-                    if stage.is_some() && !reused {
+                    if stages && !reused {
                         pool.extend(mem);
                     }
                     Ok::<(), String>(())
@@ -3827,7 +3882,7 @@ impl LendWork<'_> {
         let unback_ms = ms(t);
         let mut alloc_ms = 0.0;
         let staging = unback.and_then(|()| {
-            let Some((c, bytes, rows)) = stage else {
+            let Some((c, need, rows)) = stage else {
                 return Ok((None, false));
             };
             let t = std::time::Instant::now();
@@ -3843,7 +3898,7 @@ impl LendWork<'_> {
                 drop(parked.take());
                 let pooled: std::collections::HashSet<u64> =
                     pool.iter().flat_map(|m| m.handles()).map(|h| h.0).collect();
-                let st = super::staging::Staging::new(c, bytes, rows, ring, pool, reuse)?;
+                let st = super::staging::Staging::new(c, &need, rows, ring, pool, reuse)?;
                 (st, true, pooled)
             };
             alloc_ms = ms(t);
@@ -3921,7 +3976,7 @@ impl LendWork<'_> {
             );
             Ok((Some(st), kept))
         });
-        if staging.is_err() || stage.is_none() {
+        if staging.is_err() || !stages {
             for (_, _, l) in layers.iter_mut() {
                 l.shared = [None; 3];
             }

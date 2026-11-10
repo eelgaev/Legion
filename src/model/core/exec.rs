@@ -339,7 +339,7 @@ const LENT_MIXED_KEPT: usize = 1;
 /// grew 8-58 MiB in 3-12K-token steps on top of what earlier steps had mapped, and an 11.8K-token
 /// step with 148 MiB left aborted. Before, a graph over 1.8 GiB that leaves less than this
 /// was padded past the free memory (`ComputeAllocator::padded`) and failed anyway.
-const LENT_SCRATCH: usize = 512 << 20;
+pub const LENT_SCRATCH: usize = 512 << 20;
 
 /// While the expert cache is lent, after a step graph's compute buffer (`held` bytes on
 /// `device`) was allocated: the out-of-memory error the allocation would have been, should it

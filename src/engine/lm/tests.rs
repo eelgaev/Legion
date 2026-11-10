@@ -996,3 +996,26 @@ fn ring_checkpoints_come_out_of_a_lazy_host_tier() {
         (16, Some(1024))
     );
 }
+
+#[test]
+fn long_step_buffer_grows_with_the_past_up_to_its_measurement() {
+    let mib = 1usize << 20;
+    let s = LongStep {
+        device: None,
+        first: 1000 * mib,
+        last: 2000 * mib,
+    };
+    let past = 100_000;
+    assert_eq!(s.at(0, past), 1000 * mib);
+    assert_eq!(s.at(50_000, past), 1500 * mib);
+    assert_eq!(s.at(past, past), 2000 * mib);
+    // Past the measurement (or an unknown end): the measured longest.
+    assert_eq!(s.at(usize::MAX, past), 2000 * mib);
+    // A buffer measured no bigger after a long past stays flat.
+    let flat = LongStep {
+        device: None,
+        first: 700 * mib,
+        last: 700 * mib,
+    };
+    assert_eq!(flat.at(12_345, past), 700 * mib);
+}
