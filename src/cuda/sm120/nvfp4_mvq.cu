@@ -83,6 +83,7 @@ struct legion_nvfp4_mvq {
     int32_t       n;        // 1-8
     int32_t       ns;       // piece slots of the ring (more than 16)
     int32_t       chunks;   // pieces a row (each whole 16-byte units)
+    int32_t       exp;      // EXPERIMENT knobs (temporary)
 };
 }
 
@@ -197,6 +198,10 @@ __device__ __forceinline__ uint32_t lds_u16(uint32_t addr) {
     return v;
 }
 
+__device__ __forceinline__ void bulk_pf_l2(const void * src, uint32_t bytes) {
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(src), "r"(bytes) : "memory");
+}
+
 // `bytes` (a multiple of 16) from global `src` to shared `dst` (both 16-byte aligned) by the
 // TMA unit, completing on `bar`.
 __device__ __forceinline__ void bulk_g2s(void * dst, const void * src, uint32_t bytes, uint64_t * bar) {
@@ -257,15 +262,30 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
 
     // Regions: rounds of G R rows, region j of CTA b at rows (j G + b) R, so the CTAs stream
     // neighbouring rows; the last, partial round in nearly equal runs of whole groups.
-    const int G     = gridDim.x;
-    const int whole = p.rows / (G * R);
-    const int tail  = whole * G * R;
-    const int gl    = (p.rows - tail) >> 2;
-    const int t0    = tail + 4 * (int) (((int64_t) blockIdx.x * gl) / G);
-    const int t1    = tail + 4 * (int) (((int64_t) (blockIdx.x + 1) * gl) / G);
-    const int nreg  = whole + (t1 > t0);
-    auto      start = [&](int j) { return j < whole ? (j * G + (int) blockIdx.x) * R : t0; };
-    auto      rows  = [&](int j) { return j < whole ? R : t1 - t0; };
+    const int  G      = gridDim.x;
+    const bool contig = p.exp & 16;
+    const int  whole  = contig ? 0 : p.rows / (G * R);
+    const int  tail   = whole * G * R;
+    const int  gl     = (p.rows - tail) >> 2;
+    const int  t0     = tail + 4 * (int) (((int64_t) blockIdx.x * gl) / G);
+    const int  t1     = tail + 4 * (int) (((int64_t) (blockIdx.x + 1) * gl) / G);
+    const int  nreg   = contig ? (t1 - t0 + R - 1) / R : whole + (t1 > t0);
+    auto start = [&](int j) { return contig ? t0 + j * R : j < whole ? (j * G + (int) blockIdx.x) * R : t0; };
+    auto rows  = [&](int j) { return contig ? min(R, t1 - t0 - j * R) : j < whole ? R : t1 - t0; };
+    const int pfd = p.exp & 15;
+    auto prefetch_region = [&](int j) {
+        if (pfd == 0 || j >= nreg) {
+            return;
+        }
+        const int s = start(j), n = rows(j);
+        if (p.exp & 128) {
+            for (int i = 0; i < n; ++i) {
+                bulk_pf_l2((const uint8_t *) p.w + (int64_t) (s + i) * p.w_nb1, (uint32_t) bpr * 36);
+            }
+        } else {
+            bulk_pf_l2((const uint8_t *) p.w + (int64_t) s * p.w_nb1, (uint32_t) ((n - 1) * p.w_nb1 + bpr * 36));
+        }
+    };
 
     // The producer (thread 0): the next piece to issue, as (region, its start and rows, chunk,
     // row).
@@ -283,6 +303,7 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
                 ++pj;
                 preg = start(pj);
                 prr  = rows(pj);
+                prefetch_region(pj + pfd);
             }
         }
     };
@@ -295,6 +316,9 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
     }
     __syncthreads();
     if (threadIdx.x == 0) {
+        for (int d = 1; d <= pfd; ++d) {
+            prefetch_region(d);
+        }
         while (pq < ns && pj < nreg) {
             issue_next();
         }
@@ -346,6 +370,17 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
                     }
                 }
             }
+            if ((p.exp & 32) && p.chunks > 1) {
+                const int lo2 = ((ch + 1) % p.chunks) * cb;
+                const int nl  = cb / 2;  // 128-byte lines of a column's chunk
+                for (int l = threadIdx.x; l < (p.n + 1) * nl; l += MV_THREADS) {
+                    const int col = l / nl, li = l % nl;
+                    const char * a = col < p.n
+                        ? (const char *) (scratch_xq + ((int64_t) col * bpr + lo2) * 4) + li * 128
+                        : (const char *) (scratch_yd + lo2 * 2 * MAX_N) + li * 128;
+                    asm volatile("prefetch.global.L1 [%0];" ::"l"(a));
+                }
+            }
             for (int i = 0; i < rr; ++i) {
                 bar_wait(full + (q0 + i) % ns, (uint32_t) ((q0 + i) / ns) & 1);
             }
@@ -364,7 +399,7 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
 #pragma unroll
                 for (int P = 0; P < NP; ++P) {
                     const int kbx = base + BPI * it + w + MV_WARPS * P;
-                    if (kbx < lo || kbx >= hi) {
+                    if (kbx < lo || kbx >= hi || (p.exp & 64)) {
                         continue;
                     }
                     // A: sub-block s's values 2t, 2t + 8 (k 2t, 2t + 1) in a[s][0], 2t + 1,
