@@ -6,7 +6,7 @@
 //! the hidden `legion nvfp4-mvq-bench` subcommand (a build tree's binary on the GPU box) and by
 //! `tests/nvfp4_mvq.rs`.
 
-use super::mul_mat;
+use super::{fits, mul_mat};
 use crate::ggml::{Backend, ComputeAllocator, Context, Tensor, ffi, types};
 
 /// Shapes and runs.
@@ -161,6 +161,18 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
                 let x = ctx.new_tensor(types::F32, &[k as i64, n as i64]).as_input();
                 let mut graph = ctx.new_graph(4 * cfg.layers + 16);
                 let scale = cfg.scale.then_some(s);
+                if vi == 1
+                    && !(fits(w[0], x, scale)
+                        && w[0]
+                            .cuda_device()
+                            .is_some_and(crate::model::nvfp4_a4::supported_on))
+                {
+                    return Err(format!(
+                        "the op does not take {k}x{m} at {n} cols on this GPU (see `fits`: k a \
+                         multiple of 256 up to 65536, rows a multiple of 4, 1-8 cols, an \
+                         sm_120a/sm_121a device)"
+                    ));
+                }
                 let outs: Vec<Tensor<'_>> = w
                     .iter()
                     .map(|&wl| {
@@ -191,8 +203,13 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
                     .chain((0..2).flat_map(|vi| (1..=rounds).map(move |r| (r, vi))))
                     .collect()
             } else {
+                // Round 0 runs ggml first (its outputs are the reference); odd rounds run the
+                // op first, so neither variant always follows the other.
                 (0..=rounds)
-                    .flat_map(|r| (0..2).map(move |vi| (r, vi)))
+                    .flat_map(|r| {
+                        let lead = r % 2;
+                        [lead, 1 - lead].map(move |vi| (r, vi))
+                    })
                     .collect()
             };
             for &(round, vi) in &order {

@@ -43,7 +43,12 @@
 // - `quantize` is ggml's quantize_q8_1 value for value (one thread per value, a warp per
 //   32-value block, amax by ggml's warp reduction, d = amax / 127, q = roundf(x / d)) into
 //   device-global scratch in the layout above: the op's two kernels run back to back on the
-//   compute stream, as ggml's pair shares its pool buffer.
+//   compute stream, as ggml's pair shares its pool buffer. One scratch per device is enough
+//   because only one stream of a device ever runs the op: it takes NVFP4 weights, which only
+//   the target model's backend holds (drafters are BF16, Q8_0 or Q4 and run on their own
+//   backend between the target's graphs), ggml's concurrent branch streams
+//   (GGML_CUDA_GRAPH_OPT) stay off, and tensor parallelism runs one rank per device. A second
+//   stream running it at the same time would need its own scratch.
 // - On sm_90+ every kernel waits for the kernel ahead of it (griddepcontrol.wait, ggml's
 //   ggml_cuda_pdl_sync) before it reads activations, and lets the next one launch early
 //   (ggml_cuda_pdl_lc), as ggml-cuda launches its kernels on a GB10. The weights are no other
