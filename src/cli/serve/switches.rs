@@ -818,6 +818,16 @@ pub(in crate::cli) struct SwitchArgs {
     /// by default.
     #[arg(long, help_heading = HEADING)]
     nvfp4_once: bool,
+    /// The default since #1133 round 2; accepted for older command lines (see --no-nvfp4-mvq).
+    #[arg(long, hide = true, conflicts_with = "no_nvfp4_mvq")]
+    nvfp4_mvq: bool,
+    /// NVFP4 dense matmuls of 5-8 tokens (verify steps, decode of 5-8 users) on compute capability 12.x
+    /// (GB10, RTX 50; no effect elsewhere): keep them on ggml's MMVQ instead of Legion's op
+    /// (the default: the sub-block sums on tensor cores, then ggml's float order, so the same
+    /// bits as MMVQ; `legion nvfp4-mvq-bench` checks them and times both). The same output
+    /// either way; for comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_nvfp4_mvq: bool,
     /// The default since #858; accepted for older command lines (see --q8-mmq-ggml).
     #[arg(long, hide = true, conflicts_with = "q8_mmq_ggml")]
     q8_mmq: bool,
@@ -1478,6 +1488,11 @@ impl SwitchArgs {
             hc_quant: self.hc_quant_ggml.then_some(false),
             mmq_ids: self.expert_mmq.then_some(true),
             nvfp4_once: self.nvfp4_once.then_some(true),
+            nvfp4_mvq: if self.no_nvfp4_mvq {
+                Some(false)
+            } else {
+                self.nvfp4_mvq.then_some(true)
+            },
             q8_mmq: if self.q8_mmq_ggml {
                 Some(false)
             } else {

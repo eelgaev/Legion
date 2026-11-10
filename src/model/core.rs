@@ -64,6 +64,8 @@ pub use mmq_preq::set_mmq_preq;
 pub(crate) mod norm_rope;
 pub mod nvfp4_once;
 pub use nvfp4_once::set_nvfp4_once;
+pub mod nvfp4_mvq;
+pub use nvfp4_mvq::set_nvfp4_mvq;
 pub mod q4k_head;
 pub use q4k_head::set_q4k_head;
 pub mod q8_group;
