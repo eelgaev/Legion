@@ -666,15 +666,20 @@ const P_SKIP: usize = 14;
 /// a rank computes only the pairs of the experts it holds instead of the others' on its first
 /// expert. The other pairs' bits are the same: each tile's sums do not depend on the other
 /// tiles. On CUDA such a node keeps the step-wide kernel choice (not a split's) and one spare
-/// token tile, whose CTAs store the zeros.
+/// token tile, whose CTAs store the zeros. The W4A4 grouped ops (`nvfp4_a4::mul_mat_id_act`,
+/// `nvfp4_a4::swiglu_id`) take the mark too: they run the GEMM then, never the mv.
 pub fn skips<'a>(t: Tensor<'a>) -> Tensor<'a> {
-    // SAFETY: a view made by `mul_mat_id_act` or `swiglu_id_full`; flags its fresh node.
+    // SAFETY: a view made by `mul_mat_id_act` or `swiglu_id_full` (or their W4A4 twins);
+    // flags its fresh node.
     unsafe {
         let node = (*t.raw()).view_src;
         assert!(
             !node.is_null()
                 && crate::ggml::op_of(node).is_some_and(|op| {
-                    std::ptr::eq(op, &NVFP4_MM_ID) || std::ptr::eq(op, &NVFP4_SWIGLU_ID)
+                    std::ptr::eq(op, &NVFP4_MM_ID)
+                        || std::ptr::eq(op, &NVFP4_SWIGLU_ID)
+                        || super::nvfp4_a4::is_grouped(op, false)
+                        || super::nvfp4_a4::is_grouped(op, true)
                 }),
             "nvfp4 skips: not a grouped NVFP4 result"
         );
@@ -685,7 +690,7 @@ pub fn skips<'a>(t: Tensor<'a>) -> Tensor<'a> {
 
 /// Whether [`skips`] marked the node `dst`.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-fn skipping(dst: &ffi::ggml_tensor) -> bool {
+pub(crate) fn skipping(dst: &ffi::ggml_tensor) -> bool {
     dst.op_params[P_SKIP] != 0
 }
 
@@ -694,7 +699,7 @@ const P_UNREAD: usize = 15;
 
 /// Whether [`leave_unread`] marked the node `dst`.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-fn unread(dst: &ffi::ggml_tensor) -> bool {
+pub(crate) fn unread(dst: &ffi::ggml_tensor) -> bool {
     dst.op_params[P_UNREAD] != 0
 }
 
@@ -706,7 +711,8 @@ fn unread(dst: &ffi::ggml_tensor) -> bool {
 /// by `down` alone.
 /// Without a row map the only skipped pairs are the ids of -1 (the other ranks' experts),
 /// whose router weights are zero; their zeros need not be stored. Empty when `down` is not
-/// such a node, or when its plan has padding rows.
+/// such a node, or when its plan has padding rows. The W4A4 twins (`nvfp4_a4`) likewise, the
+/// SwiGLU when it routes by the down matmul's ids.
 ///
 /// # Safety
 /// `down` is a valid tensor whose sources are valid tensors.
@@ -720,12 +726,25 @@ pub(crate) unsafe fn unread_nodes(
     };
     // SAFETY: the caller's; a node of `NVFP4_MM_ID` has its sources (`mul_mat_id_act`).
     unsafe {
-        if !is(down, &NVFP4_MM_ID) || !skipping(&*down) {
+        let a4 = crate::ggml::op_of(down).is_some_and(|o| super::nvfp4_a4::is_grouped(o, false));
+        if !(a4 || is(down, &NVFP4_MM_ID)) || !skipping(&*down) {
             return Vec::new();
         }
         let mut x = (*down).src[1];
         while !(*x).view_src.is_null() {
             x = (*x).view_src;
+        }
+        if a4 {
+            // The W4A4 ops: each runs its own plan of its ids (sources 2 and 3), and the down
+            // matmul's GEMM reads no skipped pair's input row (its quantization reads them all,
+            // whatever they hold, and nothing uses their codes).
+            let glu = crate::ggml::op_of(x)
+                .is_some_and(|o| super::nvfp4_a4::is_grouped(o, true))
+                .then_some(x)
+                .filter(|&g| skipping(&*g) && (*g).src[3] == (*down).src[2]);
+            let mut out = vec![down];
+            out.extend(glu.filter(|&g| read_only_by_down(g)));
+            return out;
         }
         let glu = (is(x, &NVFP4_SWIGLU_ID) && skipping(&*x)).then_some(x);
         // A down matmul on a SwiGLU's plan has its padding pairs too.

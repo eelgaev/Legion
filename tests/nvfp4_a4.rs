@@ -660,6 +660,88 @@ fn cpu_grouped_swiglu_matches_exact_products() {
     }
 }
 
+/// The experts' SwiGLU and down matmul on the W4A4 grouped ops on `backend` (gate, up and down
+/// experts `w`, `x` `[k, 1, n_tok]`), the ids marked by `nvfp4_mm::skips` when `skip`: the
+/// SwiGLU's rows `[m, n_used, n_tok]` and the down rows `[k, n_used, n_tok]`.
+fn run_ffn_id(
+    backend: &mut Backend,
+    w: (&[u8], &[u8], &[u8]),
+    xs: &[f32],
+    ids: &[i32],
+    skip: bool,
+    (k, m, n_expert): (usize, usize, usize),
+    (n_used, n_tok): (usize, usize),
+) -> (Vec<f32>, Vec<f32>) {
+    use legion::model::nvfp4_mm::skips;
+    let weights = Context::new(4, 0);
+    let ne = |k: usize, m: usize| [k as i64, m as i64, n_expert as i64];
+    let g = weights.new_tensor(types::NVFP4, &ne(k, m));
+    let u = weights.new_tensor(types::NVFP4, &ne(k, m));
+    let d = weights.new_tensor(types::NVFP4, &ne(m, k));
+    weights.alloc_tensors(backend.buffer_type()).unwrap();
+    g.set_bytes(w.0);
+    u.set_bytes(w.1);
+    d.set_bytes(w.2);
+    let ctx = Context::new(16, 32);
+    let x = ctx
+        .new_tensor(types::F32, &[k as i64, 1, n_tok as i64])
+        .as_input();
+    let id = ctx
+        .new_tensor(types::I32, &[n_used as i64, n_tok as i64])
+        .as_input();
+    let mark = |t| if skip { skips(t) } else { t };
+    let act = mark(nvfp4_a4::swiglu_id(&ctx, g, u, x, id, None, None));
+    let down = mark(nvfp4_a4::mul_mat_id(&ctx, d, act, id, None));
+    let (act, down) = (ctx.cont(act).as_output(), ctx.cont(down).as_output());
+    let mut graph = ctx.new_graph(32);
+    graph.expand(act);
+    graph.expand(down);
+    ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+        .unwrap();
+    x.set_f32(xs);
+    id.set_i32(ids);
+    backend.compute(&graph).unwrap();
+    (read(act), read(down))
+}
+
+/// `--tp-moe-ep`'s skipped pairs on the W4A4 grouped ops (#1176) on `backend`: a rank holding
+/// experts `0..n_expert / 2` gets ids of -1 for the others; those pairs' SwiGLU and down rows
+/// are zeros, and every other pair's are the bits of the full routing.
+fn check_skips(backend: &mut Backend, (k, m, n_expert): (usize, usize, usize), n_tok: usize) {
+    let n_used = 4;
+    let w = (
+        weights(k, m * n_expert, 31),
+        weights(k, m * n_expert, 32),
+        weights(m, k * n_expert, 33),
+    );
+    let w = (&w.0[..], &w.1[..], &w.2[..]);
+    let xs = activations(k, n_tok, 34);
+    let ids = routing(n_used, n_tok, n_expert, n_tok as u64);
+    let held = (n_expert / 2) as i32;
+    let slots: Vec<i32> = ids.iter().map(|&e| if e < held { e } else { -1 }).collect();
+    let shape = (k, m, n_expert);
+    let (a, d) = run_ffn_id(backend, w, &xs, &ids, false, shape, (n_used, n_tok));
+    let (a_s, d_s) = run_ffn_id(backend, w, &xs, &slots, true, shape, (n_used, n_tok));
+    for (q, &e) in slots.iter().enumerate() {
+        let (ra, rd) = (q * m..(q + 1) * m, q * k..(q + 1) * k);
+        if e < 0 {
+            assert!(a_s[ra].iter().all(|&v| v == 0.0), "pair {q}: SwiGLU row");
+            assert!(d_s[rd].iter().all(|&v| v == 0.0), "pair {q}: down row");
+        } else {
+            assert!(same_bits(&a_s[ra.clone()], &a[ra]), "pair {q}: SwiGLU bits");
+            assert!(same_bits(&d_s[rd.clone()], &d[rd]), "pair {q}: down bits");
+        }
+    }
+    assert!(slots.contains(&-1) && slots.iter().any(|&e| e >= 0));
+}
+
+#[test]
+fn cpu_skipped_ids_give_zero_rows_and_keep_the_others() {
+    let mut cpu = Backend::cpu().unwrap();
+    cpu.set_threads(4);
+    check_skips(&mut cpu, (128, 64, 8), 6);
+}
+
 #[cfg(feature = "cuda")]
 mod cuda {
     use super::*;
@@ -800,6 +882,23 @@ mod cuda {
                 assert!(e < tol, "k {k} m {m} n {n} {act:?}: relative error {e}");
             }
             println!("dense k {k} m {m} n {n}: matches");
+        }
+    }
+
+    /// [`check_skips`] on the GEMM (batches of more than `nvfp4_a4::MV_MAX_TOKENS` tokens, as
+    /// `--tp-moe-ep` gives the W4A4 ops skips only there): the zeros stored by the CTAs past
+    /// the last tile.
+    #[test]
+    #[ignore = "needs a GPU with the FP4 kernels"]
+    fn cuda_skipped_ids_give_zero_rows_and_keep_the_others() {
+        let Some(mut gpu) = gpu() else { return };
+        for (shape, n_tok) in [
+            ((256, 128, 16), 100),
+            ((640, 192, 32), 300),
+            ((128, 64, 8), 70),
+        ] {
+            check_skips(&mut gpu, shape, n_tok);
+            println!("skips {shape:?} tokens {n_tok}: zeros and bit-exact");
         }
     }
 

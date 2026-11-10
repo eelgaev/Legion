@@ -125,6 +125,47 @@ fn safe_op(op: &ExternalOp, node: &ffi::ggml_tensor) -> bool {
     SAFE.get().is_some_and(|f| f(op, node))
 }
 
+/// Which external ops make a prompt step's graph run all its units directly (see
+/// [`set_direct_prompt_ops`]).
+static DIRECT_PROMPT: OnceLock<fn(&ExternalOp) -> bool> = OnceLock::new();
+
+/// Sets the external ops (the first call wins; until then, none) that a capture may hold in
+/// small steps only and that make a prompt step's graph holding one run all its units
+/// directly, no piece captured (#1176). Captured around such ops, launched between the
+/// pieces, a long prompt of Qwen3.8-Flash-Next with `--nvfp4-a4 prefill` over two GB10s
+/// faulted (an illegal address in a piece near the graph's end, replayed in the 14th
+/// 4,608-token chunk at 60K tokens); run directly it does not. A prompt chunk's graph seldom
+/// runs twice, so its pieces gained little. The same kernels with the same arguments either
+/// way, so the same bits.
+pub fn set_direct_prompt_ops(f: fn(&ExternalOp) -> bool) {
+    let _ = DIRECT_PROMPT.set(f);
+}
+
+/// Whether graph `g` with external ops at `ext` runs all its units directly now: a prompt
+/// step's graph (not [`small_step`]) holding an op of [`set_direct_prompt_ops`].
+///
+/// # Safety
+/// As for [`props`]; `ext` are node indices of `g`.
+pub(crate) unsafe fn prompt_direct(g: *mut ffi::ggml_cgraph, ext: &[i32]) -> bool {
+    // SAFETY: the caller's.
+    unsafe { direct_in(small_step(), g, ext) }
+}
+
+/// [`prompt_direct`] in a small step (`small`) or a prompt step.
+///
+/// # Safety
+/// As for [`prompt_direct`].
+unsafe fn direct_in(small: bool, g: *mut ffi::ggml_cgraph, ext: &[i32]) -> bool {
+    let Some(f) = DIRECT_PROMPT.get() else {
+        return false;
+    };
+    // SAFETY: the caller's.
+    !small
+        && ext
+            .iter()
+            .any(|&i| unsafe { op_of(ffi::ggml_graph_node(g, i)) }.is_some_and(f))
+}
+
 /// One step of a graph's compute on CUDA, in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Unit {
