@@ -288,14 +288,39 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
         }
     };
 
+    // EXPERIMENT (exp 4): every thread copies 16-byte units of each piece by cp.async (LDGSTS),
+    // the piece's mbarrier completing once all threads' copies land.
+    const bool ldg   = p.exp & 4;
+    const int  total = (nreg - 1) * p.chunks * R + p.chunks * rows(nreg - 1);
+    auto issue_all = [&](int lim) {
+        const int hi = min(lim, total);
+        for (int q = pq; q < hi; ++q) {
+            const int j   = min(q / (p.chunks * R), nreg - 1);
+            const int rem = q - j * p.chunks * R;
+            const int rj  = rows(j);
+            const int c   = rem / rj;
+            const int i   = rem - c * rj;
+            const uint8_t * src = (const uint8_t *) p.w + (int64_t) (start(j) + i) * p.w_nb1 + c * pbytes;
+            const uint32_t  dst = saddr(ring + (q % ns) * pitch);
+            for (int u = threadIdx.x; u < pbytes / 16; u += MV_THREADS) {
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst + 16 * u), "l"(src + 16 * u)
+                             : "memory");
+            }
+            asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" ::"r"(saddr(full + q % ns))
+                         : "memory");
+        }
+        pq = max(pq, hi);
+    };
     if (threadIdx.x == 0) {
         for (int s = 0; s < ns; ++s) {
-            bar_init(full + s, 1);
+            bar_init(full + s, ldg ? MV_THREADS : 1);
         }
         bar_init_fence();
     }
     __syncthreads();
-    if (threadIdx.x == 0) {
+    if (ldg) {
+        issue_all(ns);
+    } else if (threadIdx.x == 0) {
         while (pq < ns && pj < nreg) {
             issue_next();
         }
@@ -366,7 +391,7 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
 #pragma unroll
                 for (int P = 0; P < NP; ++P) {
                     const int kbx = base + BPI * it + w + MV_WARPS * P;
-                    if (kbx >= lo && kbx < hi) {
+                    if (kbx >= lo && kbx < hi && !(p.exp & 64)) {
                     // A: sub-block s's values 2t, 2t + 8 (k 2t, 2t + 1) in a[s][0], 2t + 1,
                     // 2t + 9 (k 2t + 8, 2t + 9) in a[s][1].
                     uint32_t    a[4][2];
@@ -433,7 +458,9 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
             // Every warp's reads of the chunk's slots are done (and, at the region's first
             // chunk, the previous region's outputs are read out of the partial sums).
             __syncthreads();
-            if (threadIdx.x == 0) {
+            if (ldg) {
+                issue_all(q0 + rr + ns);
+            } else if (threadIdx.x == 0) {
                 const int lim = q0 + rr + ns;
                 while (pq < lim && pj < nreg) {
                     issue_next();
