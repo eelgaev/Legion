@@ -537,10 +537,7 @@ pub(in crate::ggml) unsafe fn compute(
         };
         e.units = units(n, &ext, late_at);
         e.same = 0;
-        // A prompt step holding an op that makes it run directly (#1176): as a refused capture,
-        // directly until its words change.
-        // SAFETY: the caller's; `ext` are nodes of `g`.
-        e.refused = unsafe { super::prompt_direct(g, &ext) };
+        e.refused = false;
         // The last words' captures stay kept under them; these words' own, made by a graph
         // with the same words before (a kept step graph built again), are launched from this
         // run on.
@@ -740,10 +737,6 @@ pub(in crate::ggml) unsafe fn precapture(
         let ext: Vec<i32> = (0..n)
             .filter(|&i| op_of(ffi::ggml_graph_node(g, i)).is_some())
             .collect();
-        // Its first run goes directly (#1176): nothing to capture for it.
-        if super::prompt_direct(g, &ext) {
-            return false;
-        }
         let units = units(n, &ext, late_at);
         let pieces = plan(g, &units, true);
         let mut val = Captured {
