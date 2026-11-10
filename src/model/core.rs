@@ -71,7 +71,7 @@ pub use q4k_head::set_q4k_head;
 pub mod q8_group;
 pub mod q8_head;
 pub mod q8_mv;
-pub(crate) use linear::{f16_joined, has_precision_hint};
+pub(crate) use linear::{bf16_cast_joined, bf16_join_fits, f16_joined, has_precision_hint};
 pub use q8_group::set_q8_group;
 pub use q8_head::set_q8_head;
 pub use q8_mv::set_q8_mv;

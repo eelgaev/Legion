@@ -359,3 +359,59 @@ fn a_deferred_sum_read_after_another_exchange_is_written_after_all() {
     });
     assert_eq!(got, [(2, [true, false, false]); 2]);
 }
+
+#[test]
+fn a_bf16_gather_holds_the_f32_gathers_values() {
+    // #1176: with BF16 on the wire, the BF16 gather's values (and their widening) are the F32
+    // gather's exactly; with F32 on the wire there is no BF16 gather.
+    let (row, cols) = (4usize, 7usize);
+    let got = on_ranks(2, Wire::Bf16, move |r, c| {
+        let handle = register(c.clone());
+        let mut backend = Backend::cpu().unwrap();
+        backend.set_threads(3);
+        let ctx = Context::new(16, 16);
+        let (a, m) = share(cols, r, 2);
+        let x = ctx
+            .new_tensor(types::F32, &[row as i64, m as i64])
+            .as_input();
+        let g = all_gather_bf16(&ctx, handle.id(), x, cols as i64)
+            .expect("BF16 on the wire")
+            .as_output();
+        let wide = ctx.cast(g, types::F32).as_output();
+        let f = all_gather(&ctx, handle.id(), x, cols as i64).as_output();
+        let mut graph = ctx.new_graph(16);
+        for t in [g, wide, f] {
+            graph.expand(t);
+        }
+        ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+            .unwrap();
+        x.set_f32(&values(r, 0, row * cols)[a * row..(a + m) * row]);
+        backend.compute(&graph).unwrap();
+        assert!(handle.comm().error().is_none());
+        let g16: Vec<u16> = g
+            .bytes()
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        c.set_bf16_min(usize::MAX);
+        let f32_wire = all_gather_bf16(&ctx, handle.id(), x, cols as i64).is_none();
+        (g.ty(), g16, wide.to_f32(), f.to_f32(), f32_wire)
+    });
+    let want: Vec<f32> = (0..2)
+        .flat_map(|r| {
+            let (a, m) = share(cols, r, 2);
+            wired(
+                &values(r, 0, row * cols)[a * row..(a + m) * row],
+                Wire::Bf16,
+            )
+        })
+        .collect();
+    let want16: Vec<u16> = want.iter().map(|&v| bf16_bits(v)).collect();
+    for (r, (ty, g16, wide, f, f32_wire)) in got.into_iter().enumerate() {
+        assert_eq!(ty, types::BF16, "rank {r}");
+        assert_eq!(g16, want16, "rank {r}");
+        assert_eq!(bits(&wide), bits(&want), "rank {r}");
+        assert_eq!(bits(&f), bits(&want), "rank {r}");
+        assert!(f32_wire, "rank {r}");
+    }
+}
