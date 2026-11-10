@@ -559,7 +559,7 @@ impl Executor {
             let inputs = Inputs::from_parts(&p.shape, parts, |j| kept.tensor(j));
             let groups = view(&p.groups);
             let spare = &mut self.spare_rows;
-            let ids = bounce_for(ids_pin, backend, inputs.out_pin_bytes(n_vocab));
+            let ids = bounce_for(ids_pin, backend, inputs.argmax_bytes());
             let o = inputs.output_with(&groups, n_vocab, ids, |t| {
                 read_rows(bounce, bounce_small, spare, backend, t)
             });

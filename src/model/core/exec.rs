@@ -126,8 +126,7 @@ struct Stage {
     /// Pinned host memory a step's smaller captured rows (a decode or verify step's) are read
     /// back through ([`read_rows`]).
     bounce_small: Option<Context>,
-    /// Pinned host memory a step's argmaxes and logits rows are read back through
-    /// ([`Inputs::output_with`]).
+    /// Pinned host memory a step's argmaxes are read back through ([`Inputs::output_with`]).
     ids_pin: Option<Context>,
     /// Pinned host memory the MTP passes' inputs and outputs go through (the last stage's,
     /// [`mtp_window`]), and a decode or verify step's inputs ([`step_fill`]).
@@ -3920,7 +3919,7 @@ impl Executor {
         let spare = &mut self.spare_rows;
         let kept = kept_in(decode, mixed, shape).expect("prepared");
         let inputs = Inputs::from_parts(shape, parts, |i| kept.tensor(i));
-        let ids = bounce_for(ids_pin, backend, inputs.out_pin_bytes(n_vocab));
+        let ids = bounce_for(ids_pin, backend, inputs.argmax_bytes());
         // Every captured layer an F32 matrix on that device, or all are read back.
         let on_device = stay_on.and_then(|dev| {
             (inputs.hidden.iter())

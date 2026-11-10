@@ -1036,16 +1036,8 @@ impl<'a> Inputs<'a> {
         self.argmax.map_or(0, |t| t.nbytes())
     }
 
-    /// The bytes [`Self::output_with`] reads the argmaxes and then each logits row through: the
-    /// bigger of [`Self::argmax_bytes`] and one row of `n_vocab` F32s (0 without them).
-    fn out_pin_bytes(&self, n_vocab: usize) -> usize {
-        let row = self.logits.map_or(0, |_| n_vocab * 4);
-        self.argmax_bytes().max(row)
-    }
-
-    /// [`Self::output`], reading the captured rows with `read`, and the argmaxes and logits rows
-    /// through host tensor `ids` (pinned memory, [`Tensor::to_i32_via`],
-    /// [`Tensor::f32_range_via`]) when it has room for them ([`Self::out_pin_bytes`]).
+    /// [`Self::output`], reading the captured rows with `read`, and the argmaxes through host
+    /// tensor `ids` (pinned memory, [`Tensor::to_i32_via`]) when it has room for them.
     fn output_with(
         &self,
         groups: &[Group<'_>],
@@ -1065,15 +1057,13 @@ impl<'a> Inputs<'a> {
             None => argmax.to_i32(),
         };
         let argmax = argmax.into_iter().map(|t| t as u32).collect();
-        let row_via = ids.filter(|v| v.nbytes() >= n_vocab * 4);
         let mut rows = Vec::new();
         for s in groups.iter().flat_map(|g| &g.seqs) {
             for _ in 0..s.logits.rows(s.tokens.len()) {
-                let start = rows.len() * n_vocab;
-                rows.push(match row_via {
-                    _ if s.logits.greedy() => Vec::new(),
-                    Some(via) => logits.f32_range_via(via, start, n_vocab),
-                    None => logits.f32_range(start, n_vocab),
+                rows.push(if s.logits.greedy() {
+                    Vec::new()
+                } else {
+                    logits.f32_range(rows.len() * n_vocab, n_vocab)
                 });
             }
         }

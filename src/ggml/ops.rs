@@ -4,6 +4,9 @@
 use super::context::{Context, Tensor};
 use super::ffi;
 
+/// F32s per 4 KiB, the smallest page size: [`Tensor::f32_range`] writes one per page.
+const PAGE_F32: usize = 1024;
+
 impl Context {
     pub fn reshape_2d<'a>(&'a self, a: Tensor<'a>, ne0: i64, ne1: i64) -> Tensor<'a> {
         self.wrap(unsafe { ffi::ggml_reshape_2d(self.raw(), a.raw(), ne0, ne1) })
@@ -550,10 +553,21 @@ impl<'a> Tensor<'a> {
             "f32_range on a non-F32 tensor"
         );
         assert!((start + n) * 4 <= self.nbytes(), "f32_range out of bounds");
-        let mut out = vec![0f32; n];
+        let mut out = Vec::<f32>::with_capacity(n);
+        // The pages are mapped by the CPU before the device writes them (#1176). A new vector's
+        // memory is often fresh (malloc grows a thread's arena without touching it, and calloc
+        // skips zeroing such memory), and on a GB10 (ATS) a device copy into unmapped pages
+        // faults page by page: a 1 MB logits row then took 3-20 ms instead of ~20 µs.
+        // SAFETY: the writes stay within the capacity; the read fills all `n` values (any bytes
+        // are valid f32s) before the length is set.
         unsafe {
-            ffi::ggml_backend_tensor_get(self.raw(), out.as_mut_ptr().cast(), start * 4, n * 4)
-        };
+            let p = out.as_mut_ptr();
+            for i in (0..n).step_by(PAGE_F32).chain(n.checked_sub(1)) {
+                p.add(i).write_volatile(0.0);
+            }
+            ffi::ggml_backend_tensor_get(self.raw(), p.cast(), start * 4, n * 4);
+            out.set_len(n);
+        }
         out
     }
 
