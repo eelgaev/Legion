@@ -29,7 +29,9 @@ pub use hc_chain::set_hc_chain;
 mod hc_mix16;
 pub use hc_mix16::{set_hc_pre, set_mix16, set_rebuild_bf16 as set_mix_rebuild_bf16};
 mod hc_norm;
-pub(crate) use hc_norm::{FoldSum, fold_moe, fold_target, moe_fold};
+pub(crate) use hc_norm::{
+    FoldSum, capture_safe as post_norm_capture_safe, fold_moe, fold_target, moe_fold,
+};
 pub use hc_norm::{
     hc_fuse, set_fused_post_norm, set_generic_post_norm, set_hc_fuse, set_moe_fold, set_norm_fma,
     set_streams_bf16, set_xn16, set_xn16_gpu,
