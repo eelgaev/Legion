@@ -353,6 +353,11 @@ impl Linear {
             }
             return Ok(crate::model::nvfp4_mm::mul_mat(ctx, w, x, scale));
         }
+        if super::nvfp4_mvq::takes(w, x, scale) {
+            // NVFP4 weights in steps of 2-8 tokens on a GB10: ggml's MMVQ bits with the
+            // sub-block sums on tensor cores, the scale in its epilogue (#1133).
+            return Ok(super::nvfp4_mvq::mul_mat(ctx, w, x, scale));
+        }
         // BF16 weights in steps of 2-16 tokens: ggml-cuda's bits from faster kernels.
         let res = if crate::model::dense_mv::takes(w, x) {
             crate::model::dense_mv::mul_mat(ctx, &[w], x)[0]

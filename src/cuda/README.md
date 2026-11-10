@@ -31,6 +31,7 @@ end up running the code: the sm70 kernels also run on newer GPUs when the dispat
 | `dense_mv.cu` | `sm80/dense_mv.cuh` (the kernel on m16n8k16 and ldmatrix; `mma_code()` checks the binary has it). |
 | `glm5next.cu` | `sm80/mla_gb10.cuh` (GLM's sparse MLA prompt kernel as the GB10 runs it: score warps and value warps a chunk apart on named barriers, swizzled `cp.async` chunk buffers; `mla_tiled_kernel`'s bits, picked on compute capability 12.x by `legion_device::sm12x_device()`, #862, and on Ampere by `legion_device::ampere_device()`, #1212), `sm80/linear_tc_gb10.cuh` (`linear_tc_gb`: linear_tc's F16 prompt GEMM and bits on other tile shapes; F16-row products on compute capability 12.x by `tc_gb_auto`, #862; Ampere's own picks by `tc_gb_auto_ampere`, #1212). |
 | `sm120/nvfp4_a4.cu` | The whole file (its own translation unit, listed in build.rs). |
+| `sm120/nvfp4_mvq.cu` | The matvec kernels (`cvt.rn.f16x2.e2m1x2`, sm_120a/sm_121a; the weights by `cp.async.bulk` into an mbarrier ring; a trap elsewhere, and `nvfp4_mvq::takes` asks `nvfp4_a4::supported_on` first); its activation quantization is plain SIMT code. |
 | `sm90/cluster_select.cu` | The whole file: decode-sized top-k (`qsa_attn.cu`'s `topk_kernel` bits) and argmax (ggml-cuda's `argmax_f32` bits) on clusters of 8 CTAs a row (`src/model/cluster_select.rs`). |
 
 The other files have no architecture-specific code (`fused.cu`, `expert_mv/` (split by weight type into its own translation units, #955),
