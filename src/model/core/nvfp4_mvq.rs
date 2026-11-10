@@ -114,7 +114,21 @@ pub fn plan(k: usize, rows: usize, smem: usize) -> Option<Plan> {
     }
     [1, 2, 4, 8, 16]
         .into_iter()
-        .find_map(|c| Plan::with(k, c, REGION + AHEAD, smem))
+        .find_map(|c| Plan::with(k, c, REGION + exp_env("LEGION_MVQ_AHEAD", AHEAD), smem))
+}
+
+/// EXPERIMENT (temporary): an env knob read once per name.
+fn exp_env(name: &'static str, default: usize) -> usize {
+    use std::sync::OnceLock;
+    static A: OnceLock<usize> = OnceLock::new();
+    static E: OnceLock<usize> = OnceLock::new();
+    let cell = if name == "LEGION_MVQ_AHEAD" { &A } else { &E };
+    *cell.get_or_init(|| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    })
 }
 
 static ON: AtomicBool = AtomicBool::new(true);
@@ -289,6 +303,7 @@ struct Params {
     n: i32,
     ns: i32,
     chunks: i32,
+    exp: i32,
 }
 
 /// # Safety
@@ -317,6 +332,7 @@ unsafe fn cuda_nvfp4_mvq(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
         n: o.n as i32,
         ns: plan.ns as i32,
         chunks: plan.chunks as i32,
+        exp: exp_env("LEGION_MVQ_EXP", 0) as i32,
     };
     let quantize = launch::Dim3 {
         x: o.k.div_ceil(256) as u32,

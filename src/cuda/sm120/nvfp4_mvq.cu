@@ -83,6 +83,7 @@ struct legion_nvfp4_mvq {
     int32_t       n;        // 1-8
     int32_t       ns;       // piece slots of the ring (more than 16)
     int32_t       chunks;   // pieces a row (each whole 16-byte units)
+    int32_t       exp;      // EXPERIMENT knobs
 };
 }
 
@@ -307,6 +308,7 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
     const float * yd     = scratch_yd + hp * MAX_N + g;
     const bool    scaled = p.scale != nullptr;
     const float   sc     = scaled ? *p.scale : 1.0f;
+    const bool    xpf    = (p.exp & 1) && p.chunks > 1;
 
     uint4 xv[IT][NP];  // a chunk's activations (below)
     float yv[IT][NP];
@@ -334,7 +336,7 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
             // The chunk's activations, loaded before its weights are waited for (the warp's
             // blocks of the chunk: kbx = base + BPI it + w + 8P; bytes 128 are zeros); whole
             // rows once.
-            if (p.chunks > 1 || j == 0) {
+            if ((xpf || (p.exp & 2)) ? (j == 0 && ch == 0) : (p.chunks > 1 || j == 0)) {
 #pragma unroll
                 for (int it = 0; it < IT; ++it) {
 #pragma unroll
@@ -364,9 +366,7 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
 #pragma unroll
                 for (int P = 0; P < NP; ++P) {
                     const int kbx = base + BPI * it + w + MV_WARPS * P;
-                    if (kbx < lo || kbx >= hi) {
-                        continue;
-                    }
+                    if (kbx >= lo && kbx < hi) {
                     // A: sub-block s's values 2t, 2t + 8 (k 2t, 2t + 1) in a[s][0], 2t + 1,
                     // 2t + 9 (k 2t + 8, 2t + 9) in a[s][1].
                     uint32_t    a[4][2];
@@ -417,6 +417,16 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
                             }
                             acc[P][c][rr2] += sum;
                         }
+                    }
+                    }
+                    // EXPERIMENT (exp 1): this slot's activations of the next chunk (or of the
+                    // next region's first chunk), loaded once its last use is issued.
+                    if (xpf && (ch + 1 < p.chunks || j + 1 < nreg)) {
+                        const int  lo2  = ch + 1 < p.chunks ? lo + cb : 0;
+                        const int  kbx2 = lo2 - lo2 % BPI + BPI * it + w + MV_WARPS * P;
+                        const bool ok2  = col_ok && kbx2 >= lo2 && kbx2 < lo2 + cb;
+                        xv[it][P]       = ok2 ? xq[(int64_t) kbx2 * 4] : make_uint4(0x80808080u, 0x80808080u, 0x80808080u, 0x80808080u);
+                        yv[it][P]       = ok2 ? yd[kbx2 * 2 * MAX_N] : 0.0f;
                     }
                 }
             }
