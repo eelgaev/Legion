@@ -353,12 +353,13 @@ unsafe fn cuda_nvfp4_mvq(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
         y: 1,
         z: 1,
     };
+    let ws = exp_env("LEGION_MVQ_EXP", 0) & 1024 != 0;
     let block = launch::Dim3 {
-        x: (WARPS * 32) as u32,
+        x: (WARPS * 32 + if ws { 32 } else { 0 }) as u32,
         y: 1,
         z: 1,
     };
-    launch::launch(kernel_index(o.n), grid, block, plan.smem, &mut p, stream)
+    launch::launch(kernel_index(o.n), grid, block, plan.smem + if ws { plan.ns * 8 } else { 0 }, &mut p, stream)
 }
 
 #[cfg(feature = "cuda")]

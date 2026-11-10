@@ -232,7 +232,7 @@ constexpr int MV_ITERS   = 8;   // a chunk spans at most MV_ITERS / NWG steps of
 // different banks), the partial sums [warp][h][MV_R][column], p.ns mbarriers. Pieces are read
 // in order (region, chunk, row), piece q into slot q % ns.
 template <int NWG>
-__global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
+__global__ void __launch_bounds__(MV_THREADS + 32, 1) mv(const legion_nvfp4_mvq p) {
     pdl_launch_dependents();
 #ifdef LEGION_MVQ_MMA
     using namespace legion_tma;
@@ -252,6 +252,8 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
     uint8_t *  ring = smem;
     float *    part = reinterpret_cast<float *>(smem + ns * pitch);
     uint64_t * full = reinterpret_cast<uint64_t *>(part + MV_WARPS * 2 * R * 8);
+    const bool ws    = p.exp & 1024;  // a producer warp (8), slots freed by empty barriers
+    uint64_t * empty = full + ns;
 
     const int w    = threadIdx.x / WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
@@ -311,11 +313,25 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
     if (threadIdx.x == 0) {
         for (int s = 0; s < ns; ++s) {
             bar_init(full + s, 1);
+            if (ws) {
+                bar_init(empty + s, MV_WARPS);
+            }
         }
         bar_init_fence();
     }
     __syncthreads();
-    if (threadIdx.x == 0) {
+    if (ws && threadIdx.x >= MV_THREADS) {
+        if (threadIdx.x == MV_THREADS) {
+            while (pj < nreg) {
+                if (pq >= ns) {
+                    bar_wait(empty + pq % ns, (uint32_t) (pq / ns - 1) & 1);
+                }
+                issue_next();
+            }
+        }
+        return;
+    }
+    if (!ws && threadIdx.x == 0) {
         for (int d = 1; d <= pfd; ++d) {
             prefetch_region(d);
         }
@@ -466,9 +482,18 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
                     }
                 }
             }
+            if (ws) {
+                __syncwarp();
+                if (lane == 0) {
+                    for (int i = 4 * c_lo; i < r_hi; ++i) {
+                        bar_arrive(empty + (q0 + i) % ns);
+                    }
+                }
+                continue;
+            }
             // Every warp's reads of the chunk's slots are done (and, at the region's first
             // chunk, the previous region's outputs are read out of the partial sums).
-            __syncthreads();
+            asm volatile("bar.sync 1, 256;\n" ::: "memory");
             if (threadIdx.x == 0) {
                 const int lim = q0 + r_hi + ns;
                 while (pq < lim && pj < nreg) {
@@ -500,7 +525,7 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
                 part[((w * 2 + hp) * R + 4 * c + ra + rr2) * 8 + g] = v[0] + v[1];
             }
         }
-        __syncthreads();
+        asm volatile("bar.sync 1, 256;\n" ::: "memory");
         if (threadIdx.x < rr * 8) {
             const int row = threadIdx.x >> 3;
             const int col = threadIdx.x & 7;
@@ -523,6 +548,9 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
                 }
                 p.dst[col * p.dst_nb1 + reg + row] = v;
             }
+        }
+        if (ws) {
+            asm volatile("bar.sync 1, 256;\n" ::: "memory");
         }
     }
 #else
