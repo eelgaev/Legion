@@ -96,6 +96,14 @@ pub(super) fn floats(ty: ffi::ggml_type, bytes: &[u8], n: usize) -> Vec<f32> {
     }
 }
 
+/// The drafter's compute allocator, with a little headroom. Its graphs each need a few KiB more
+/// than the one before (every sequence's cache grows by its accepted tokens per step), and a
+/// plain allocator freed and allocated its buffer again nearly every step: a `cudaFree` and a
+/// `cudaMalloc` of ~5 ms in a step of ~177 ms (Gemma 4 31B, DFlash 2, 16 users, a DGX Spark).
+fn drafter_allocator(backend: &Backend) -> ComputeAllocator {
+    ComputeAllocator::headroom(backend.buffer_type())
+}
+
 /// Part `s` of `n` equal parts of `v` (one sequence's rows of a batched pass's output).
 fn part<T: Clone>(v: &[T], n: usize, s: usize) -> Vec<T> {
     let len = v.len() / n;
@@ -545,12 +553,16 @@ impl Model {
         feats: &[f32],
         positions: &[usize],
     ) -> Result<(), String> {
-        self.ingest_many(backend, alloc, &mut [cache], feats, &[positions])
+        self.ingest_many(backend, alloc, &mut [cache], feats, &[positions], true)
     }
 
     /// [`Self::ingest`] for several sequences in one graph (#521): `feats` holds their rows in
     /// order, `positions[s]` sequence `s`'s positions (at most a window each). One sequence is
     /// exactly [`Self::ingest`]'s graph.
+    ///
+    /// Without `wait` the graph may still run on the backend's stream when this returns: the
+    /// next graph on that stream runs after it, and `alloc`'s buffer stays its own until the
+    /// backend is synchronized (a graph built meanwhile takes another allocator).
     pub fn ingest_many(
         &self,
         backend: &mut Backend,
@@ -558,6 +570,7 @@ impl Model {
         caches: &mut [&mut SeqCache],
         feats: &[f32],
         positions: &[&[usize]],
+        wait: bool,
     ) -> Result<(), String> {
         let c = &self.cfg;
         assert_eq!(caches.len(), positions.len());
@@ -598,9 +611,7 @@ impl Model {
                 }
             }
         }
-        let allocator = alloc
-            .take()
-            .unwrap_or_else(|| ComputeAllocator::new(backend.buffer_type()));
+        let allocator = alloc.take().unwrap_or_else(|| drafter_allocator(backend));
         ctx.alloc_graph(&graph, allocator)
             .map_err(|e| e.to_string())?;
         x_in.set_f32(feats);
@@ -613,7 +624,12 @@ impl Model {
         for ((cache, p), cells) in caches.iter().zip(positions).zip(&cells) {
             cells.set_i32(&p.iter().map(|&p| cache.cell(p) as i32).collect::<Vec<_>>());
         }
-        backend.compute(&graph).map_err(|e| e.to_string())?;
+        if wait {
+            backend.compute(&graph)
+        } else {
+            backend.compute_async(&graph)
+        }
+        .map_err(|e| e.to_string())?;
         *alloc = ctx.into_allocator();
         for (cache, p) in caches.iter_mut().zip(positions) {
             for &p in p.iter() {
@@ -714,6 +730,10 @@ impl Model {
             let q_all = rope(&ctx, q, pos, c.n_rot, c.rope_base);
             let (k_all, v_all) = self.kv(&ctx, il, x, pos);
             let mut out = None;
+            // Several sequences: each one's attention output is copied into its columns of one
+            // tensor (a chain of concats copied everything before it again, ~0.9 ms a step at 16
+            // sequences). The values are the same.
+            let out_all = (n_seq > 1).then(|| ctx.new_tensor(types::F32, &[d * nh, total as i64]));
             for (s, seq) in seqs.iter().enumerate() {
                 let cache = seq.cache;
                 let n_att = cache.used_cells();
@@ -755,13 +775,17 @@ impl Model {
                     unsafe { ffi::ggml_soft_max_add_sinks(kq.raw(), sinks.raw()) };
                 }
                 let o = ctx.mul_mat(va, kq); // [d, n, nh]
-                let o = ctx.cont_2d(ctx.permute(o, [0, 2, 1, 3]), d * nh, nb);
-                out = Some(match out {
-                    Some(prev) => ctx.concat(prev, o, 1),
-                    None => o,
-                });
+                let o = ctx.permute(o, [0, 2, 1, 3]);
+                match out_all {
+                    Some(all) => {
+                        let row = all.nb()[1];
+                        let cols = ctx.view_2d(all, [d * nh, nb], row, s * n * row);
+                        graph.expand(ctx.cpy(o, cols));
+                    }
+                    None => out = Some(ctx.cont_2d(o, d * nh, nb)),
+                }
             }
-            let o = out.expect("at least one sequence");
+            let o = out_all.or(out).expect("at least one sequence");
             let o = if c.value_scale != 1.0 {
                 ctx.scale(o, c.value_scale)
             } else {
@@ -841,9 +865,7 @@ impl Model {
             graph.expand(h);
         }
 
-        let allocator = alloc
-            .take()
-            .unwrap_or_else(|| ComputeAllocator::new(backend.buffer_type()));
+        let allocator = alloc.take().unwrap_or_else(|| drafter_allocator(backend));
         ctx.alloc_graph(&graph, allocator)
             .map_err(|e| e.to_string())?;
         let mut ids = Vec::with_capacity(total);
@@ -923,9 +945,7 @@ impl Model {
         let bias = bias.as_output();
         let mut graph = ctx.new_graph(64);
         graph.expand(bias);
-        let allocator = alloc
-            .take()
-            .unwrap_or_else(|| ComputeAllocator::new(backend.buffer_type()));
+        let allocator = alloc.take().unwrap_or_else(|| drafter_allocator(backend));
         ctx.alloc_graph(&graph, allocator)
             .map_err(|e| e.to_string())?;
         input.set_f32(&row);
