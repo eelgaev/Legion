@@ -205,6 +205,7 @@ __device__ __forceinline__ void bulk_g2s(void * dst, const void * src, uint32_t 
 constexpr int MV_WARPS   = 8;
 constexpr int MV_THREADS = MV_WARPS * WARP_SIZE;
 constexpr int MV_R       = 16;  // rows of a region
+constexpr int MV_ITERS   = 8;   // a chunk spans at most MV_ITERS / NWG steps of blocks_per_iter
 
 // `w @ x` with ggml's MMVQ order for NWG of its warps (4: 1-4 columns, 2: 5-8). CTA b takes the
 // rows [4 (b G4s / G), 4 ((b + 1) G4s / G)) of the G4s groups of 4 (G CTAs, one per SM), in
@@ -228,6 +229,7 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
     constexpr int BPI = 16 * NWG;
     constexpr int NP  = BPI / MV_WARPS;
     constexpr int G4  = R / 4;
+    constexpr int IT  = MV_ITERS / NWG;  // BPI steps a chunk spans at most (the host's plan)
     static_assert(NP % 2 == 0, "residues in pairs of ggml lanes 16 apart");
     extern __shared__ __align__(16) uint8_t smem[];
 
@@ -310,7 +312,24 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
         }
 
         for (int ch = 0; ch < p.chunks; ++ch) {
-            const int q0 = qb + ch * rr;
+            const int q0   = qb + ch * rr;
+            const int lo   = ch * cb;
+            const int hi   = lo + cb;
+            const int base = lo - lo % BPI;
+            // The chunk's activations, loaded before its weights are waited for (the warp's
+            // blocks of the chunk: kbx = base + BPI it + w + 8P; bytes 128 are zeros).
+            uint4 xv[IT][NP];
+            float yv[IT][NP];
+#pragma unroll
+            for (int it = 0; it < IT; ++it) {
+#pragma unroll
+                for (int P = 0; P < NP; ++P) {
+                    const int  kbx = base + BPI * it + w + MV_WARPS * P;
+                    const bool ok  = col_ok && kbx >= lo && kbx < hi;
+                    xv[it][P]      = ok ? xq[(int64_t) kbx * 4] : make_uint4(0x80808080u, 0x80808080u, 0x80808080u, 0x80808080u);
+                    yv[it][P]      = ok ? yd[kbx * 2 * MAX_N] : 0.0f;
+                }
+            }
             for (int i = 0; i < rr; ++i) {
                 bar_wait(full + (q0 + i) % ns, (uint32_t) ((q0 + i) / ns) & 1);
             }
@@ -324,30 +343,22 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
                 rs0[c] = saddr(ring + ((q0 + 4 * c + ra) % ns) * pitch) + 2 * hp;
                 rs1[c] = saddr(ring + ((q0 + 4 * c + ra + 1) % ns) * pitch) + 2 * hp;
             }
-            const int lo = ch * cb;
-            const int hi = lo + cb;
-            for (int it0 = lo - lo % BPI; compute && it0 < hi; it0 += BPI) {
+#pragma unroll
+            for (int it = 0; it < IT; ++it) {
 #pragma unroll
                 for (int P = 0; P < NP; ++P) {
-                    const int kbx = it0 + w + MV_WARPS * P;
-                    if (kbx < lo) {
+                    const int kbx = base + BPI * it + w + MV_WARPS * P;
+                    if (!compute || kbx < lo || kbx >= hi) {
                         continue;
-                    }
-                    if (kbx >= hi) {
-                        break;
                     }
                     // A: sub-block s's values 2t, 2t + 8 (k 2t, 2t + 1) in a[s][0], 2t + 1,
                     // 2t + 9 (k 2t + 8, 2t + 9) in a[s][1].
-                    uint32_t a[4][2] = {};
-                    float    y       = 0.0f;
-                    if (col_ok) {
-                        const uint4 v = xq[(int64_t) kbx * 4];
-                        q8x4(v.x, a[0][0], a[0][1]);
-                        q8x4(v.y, a[1][0], a[1][1]);
-                        q8x4(v.z, a[2][0], a[2][1]);
-                        q8x4(v.w, a[3][0], a[3][1]);
-                        y = yd[kbx * 2 * MAX_N];
-                    }
+                    uint32_t    a[4][2];
+                    const float y = yv[it][P];
+                    q8x4(xv[it][P].x, a[0][0], a[0][1]);
+                    q8x4(xv[it][P].y, a[1][0], a[1][1]);
+                    q8x4(xv[it][P].z, a[2][0], a[2][1]);
+                    q8x4(xv[it][P].w, a[3][0], a[3][1]);
                     const uint32_t o = (kbx - lo) * 36;
 #pragma unroll
                     for (int c = 0; c < G4; ++c) {

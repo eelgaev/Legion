@@ -78,11 +78,15 @@ fn plans_fit_the_shared_memory() {
         let p = plan(k, rows, SMEM_12X).unwrap();
         assert!(p.smem <= SMEM_12X && p.ns > REGION, "{k} {rows}");
     }
-    // Rows not in whole groups; rows too long for quarter pieces; pieces not of whole 16-byte
-    // units.
+    // Rows not in whole groups; pieces not of whole 16-byte units; pieces over two 64-block
+    // steps.
     assert_eq!(plan(5120, 1030, SMEM_12X), None);
-    assert_eq!(plan(MAX_K as usize, 1024, SMEM_12X), None);
     assert_eq!(Plan::with(17408, 8, 20, SMEM_12X), None);
+    assert_eq!(Plan::with(17408, 2, 18, SMEM_12X), None);
+    assert_eq!(
+        plan(MAX_K as usize, 1024, SMEM_12X).map(|p| p.chunks),
+        Some(8)
+    );
 }
 
 /// The op on the CPU is the dequantized product, column by column, times the scale.

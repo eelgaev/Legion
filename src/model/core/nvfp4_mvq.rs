@@ -81,10 +81,15 @@ pub struct Plan {
 
 impl Plan {
     /// The plan for rows of `k` values in `chunks` pieces with `ns` slots, if it fits in `smem`
-    /// bytes (and the pieces are whole 16-byte units).
+    /// bytes, the pieces are whole 16-byte units and each spans at most two of ggml's 64-block
+    /// steps (the kernel holds a piece's activations in registers: `MV_ITERS`).
     pub fn with(k: usize, chunks: usize, ns: usize, smem: usize) -> Option<Plan> {
         let bpr = k / 64;
         if chunks == 0 || !bpr.is_multiple_of(4 * chunks) || ns <= REGION {
+            return None;
+        }
+        let cb = bpr / chunks;
+        if (0..chunks).any(|c| c * cb % 64 + cb > 128) {
             return None;
         }
         let pitch = bpr / chunks * BLOCK_BYTES + 16;
@@ -99,13 +104,13 @@ impl Plan {
 }
 
 /// The kernel's shape for rows of `k` values on a device with `smem` bytes of shared memory a
-/// CTA: the fewest pieces a row (1, 2 or 4) whose ring holds a chunk of a region and [`AHEAD`]
-/// more pieces; `None` when none fits (or the rows are not whole groups).
+/// CTA: the fewest pieces a row (1, 2, 4, 8 or 16) whose ring holds a chunk of a region and
+/// [`AHEAD`] more pieces; `None` when none fits (or the rows are not whole groups).
 pub fn plan(k: usize, rows: usize, smem: usize) -> Option<Plan> {
     if !rows.is_multiple_of(ROW_MULTIPLE as usize) {
         return None;
     }
-    [1, 2, 4]
+    [1, 2, 4, 8, 16]
         .into_iter()
         .find_map(|c| Plan::with(k, c, REGION + AHEAD, smem))
 }
