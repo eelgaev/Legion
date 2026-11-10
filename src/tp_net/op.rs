@@ -525,6 +525,13 @@ pub(super) mod cuda {
         micro: bool,
         tail: Option<&ffi::ggml_tensor>,
     ) -> Result<u32, String> {
+        // Only the BF16 whole-source pack below runs a tail; anywhere else its node (a no-op
+        // now) would leave stale values to send. Checked before the sequence number moves.
+        if tail.is_some()
+            && !(plan.wire == Wire::Bf16 && plan.kind == Kind::ReduceScatter && plan.pack_whole)
+        {
+            return Err("tp exchange: a tail needs a BF16 whole-source reduce-scatter".into());
+        }
         let (rank, n_ranks) = (comm.rank(), comm.n_ranks());
         let kind = plan.kind;
         let eb = plan.wire.bytes();
