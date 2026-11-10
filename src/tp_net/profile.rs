@@ -71,6 +71,9 @@ pub struct StepLaps {
     pub fill: Duration,
     /// Its launches queued.
     pub launch: Duration,
+    /// Of `launch`, the late n-gram rows' write (read from the store while the first layers
+    /// run).
+    pub rows: Duration,
     /// The next verify shape's graph built while this one computes (`verify_ahead`).
     pub ahead: Duration,
     /// Other host work beside the GPU, up to the stage's sync.
@@ -87,21 +90,24 @@ impl StepLaps {
         self.prepare += o.prepare;
         self.fill += o.fill;
         self.launch += o.launch;
+        self.rows += o.rows;
         self.ahead += o.ahead;
         self.beside += o.beside;
         self.wait += o.wait;
         self.output += o.output;
     }
 
-    /// Per step of `n`, in ms, as logged: `before/prepare/fill/launch/ahead/beside/wait/output`.
+    /// Per step of `n`, in ms, as logged:
+    /// `before/prepare/fill/launch/rows/ahead/beside/wait/output`.
     pub fn per_step(&self, n: u64) -> String {
         let ms = |d: Duration| d.as_secs_f64() * 1e3 / n.max(1) as f64;
         format!(
-            "{:.2}/{:.2}/{:.2}/{:.2}/{:.2}/{:.2}/{:.2}/{:.2}",
+            "{:.2}/{:.2}/{:.2}/{:.2}/{:.2}/{:.2}/{:.2}/{:.2}/{:.2}",
             ms(self.before),
             ms(self.prepare),
             ms(self.fill),
             ms(self.launch),
+            ms(self.rows),
             ms(self.ahead),
             ms(self.beside),
             ms(self.wait),

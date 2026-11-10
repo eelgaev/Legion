@@ -52,14 +52,18 @@ fn laps_log_per_step_in_order() {
         prepare: ms(2),
         fill: ms(3),
         launch: ms(4),
-        ahead: ms(5),
-        beside: ms(6),
-        wait: ms(7),
-        output: ms(8),
+        rows: ms(5),
+        ahead: ms(6),
+        beside: ms(7),
+        wait: ms(8),
+        output: ms(9),
     };
     l.add(&one);
     l.add(&one);
-    assert_eq!(l.per_step(2), "1.00/2.00/3.00/4.00/5.00/6.00/7.00/8.00");
+    assert_eq!(
+        l.per_step(2),
+        "1.00/2.00/3.00/4.00/5.00/6.00/7.00/8.00/9.00"
+    );
 }
 
 #[test]

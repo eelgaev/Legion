@@ -555,6 +555,8 @@ pub struct Executor {
     front_clock: step_front::FrontClock,
     /// The last step's host laps, for `--tp-profile` ([`Self::take_step_laps`]).
     step_laps: Option<crate::tp_net::StepLaps>,
+    /// The host time the last stage launch spent writing its late n-gram rows (`launch_stage`).
+    late_rows_took: std::time::Duration,
     /// See [`Self::set_mtp_ahead`].
     mtp_ahead: bool,
     /// The inputs the last MTP pass queued for the next one ([`mtp_ahead`]), until the next
@@ -827,6 +829,7 @@ impl Executor {
             held_commit: Default::default(),
             front_clock: Default::default(),
             step_laps: None,
+            late_rows_took: std::time::Duration::ZERO,
             mtp_ahead: false,
             mtp_staged: None,
             mtp_pipe_rows: 0,
@@ -3219,6 +3222,7 @@ impl Executor {
                         prepare: t_prepare,
                         fill: t_inputs,
                         launch: t_launched.saturating_sub(t_inputs + t_prepare),
+                        rows: self.late_rows_took,
                         ahead: t_ahead - t_launched,
                         beside: t_launch.saturating_sub(t_ahead + ahead_wait),
                         wait: ahead_wait + synced.saturating_sub(t_launch),
