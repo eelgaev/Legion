@@ -881,7 +881,11 @@ fn down_res_fits(w: Tensor<'_>, act: Tensor<'_>, r: Tensor<'_>) -> bool {
     r.ty() == types::F32 && r.is_contiguous() && r.ne() == [m, n1, n2, n3]
 }
 
-fn bf16_cast_joined<'a>(ctx: &'a Context, w: Tensor<'a>, x: Tensor<'a>) -> Option<Tensor<'a>> {
+pub(crate) fn bf16_cast_joined<'a>(
+    ctx: &'a Context,
+    w: Tensor<'a>,
+    x: Tensor<'a>,
+) -> Option<Tensor<'a>> {
     if !bf16_join_fits(w, x) {
         return None;
     }

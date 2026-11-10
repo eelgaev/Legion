@@ -1305,6 +1305,30 @@ impl Model {
             let res = crate::tp_net::seq_par::all_gather(ctx, c, res, n_all);
             ctx.reshape_3d(res, e, hc.n, n_all)
         };
+        // A block input `h` gathered from every rank's share for layer `il`'s projection
+        // `name` (its first; the others are of the same kind). Where its columns travel in BF16
+        // and that projection takes a BF16 cast of its input (the NVFP4 checkpoints' BF16
+        // projections, #469), the gather stays BF16 (#1176): the BF16 projections and the
+        // experts read it as that cast, the values they would get from the F32 gather, and only
+        // the F32 readers (the router) widen it, exactly.
+        let gather_in = |h: Tensor<'a>, il: usize, name: &str| {
+            let (c, ..) = sp.expect("sequence parallel");
+            // (This rank's share of `h` has the gathered input's type and rows.)
+            let takes = self
+                .lw(il, name)
+                .is_ok_and(|w| crate::model::core::bf16_join_fits(w, h));
+            let bf16 = takes
+                .then(|| crate::tp_net::seq_par::all_gather_bf16(ctx, c, h, n_all))
+                .flatten();
+            match bf16 {
+                Some(g) => {
+                    let h = ctx.cast(g, types::F32);
+                    ctx.set_shared_cast(h, types::BF16, g);
+                    h
+                }
+                None => crate::tp_net::seq_par::all_gather(ctx, c, h, n_all),
+            }
+        };
         for il in layers {
             let want = sp.is_some() && il + 1 < hp.n_layer && ple_layer.is_none_or(|p| p < il);
             if split && !want {
@@ -1342,9 +1366,12 @@ impl Model {
             let pre = format!("blk.{il}.hc_attn");
             let (r, h, mut inject) = self.hc_mix_after(ctx, res, pending.take(), &pre)?;
             res = r;
-            let h = match sp {
-                Some((c, ..)) if split => crate::tp_net::seq_par::all_gather(ctx, c, h, n),
-                _ => h,
+            let h = if !split {
+                h
+            } else if hp.is_recurrent(il) {
+                gather_in(h, il, "attn_qkv.weight")
+            } else {
+                gather_in(h, il, "attn_q.weight")
             };
             let mut attn = if hp.is_recurrent(il) {
                 self.delta_net(pass, il, h)?
@@ -1369,9 +1396,10 @@ impl Model {
             let pre = format!("blk.{il}.hc_ffn");
             let (r, h, inject) = self.hc_mix_after(ctx, res, pending.take(), &pre)?;
             res = r;
-            let h = match sp {
-                Some((c, ..)) if split => crate::tp_net::seq_par::all_gather(ctx, c, h, n),
-                _ => h,
+            let h = if split {
+                gather_in(h, il, "ffn_up_shexp.weight")
+            } else {
+                h
             };
             // A paired step's layer shares its experts with the stage GPU's pair (`--pair-tp`).
             let ffn = match self.pair_moe(pass, il, h, n)? {
@@ -1851,10 +1879,15 @@ impl Model {
         };
         let (ctx, n) = (pass.ctx, pass.n);
         let d = q.head_dim;
-        // ggml's matmuls; from the F16 copy of `h` the mixer wrote, where it did (#774).
+        // ggml's matmuls; from the F16 copy of `h` the mixer wrote, where it did (#774), or the
+        // BF16 cast of `h` the step's projections share, where there is one (#1176: a BF16
+        // all-gather of `h`, so the widened `h` need not be written for these).
         let mm = |w: Tensor<'a>| match crate::model::core::f16_joined(ctx, w, h) {
             Some((w16, h16)) => ctx.mul_mat(w16, h16),
-            None => ctx.mul_mat(w, h),
+            None => match crate::model::core::bf16_cast_joined(ctx, w, h) {
+                Some(hb) => ctx.mul_mat(w, hb),
+                None => ctx.mul_mat(w, h),
+            },
         };
         let k_raw = mm(self.lw(il, "indexer.k_proj.weight")?);
         let direct = pass
