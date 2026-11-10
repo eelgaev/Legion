@@ -4435,6 +4435,10 @@ impl LmEngine {
                     buft.name()
                 ))
             })?;
+        // The stop tokens a pick below `min_tokens` may not take (#1176). Set before the node
+        // and TP followers branch off: a layer split's rank 1 makes the step's picks.
+        let stop_tokens = chat_format.stop_tokens(&tokenizer);
+        exec.set_stop_tokens(&stop_tokens);
         let mut saved_host_bytes = 0u64;
         if saved_host {
             let moved = exec.saved_states_to_host().map_err(|e| {
@@ -5269,8 +5273,6 @@ impl LmEngine {
             },
         );
 
-        let stop_tokens = chat_format.stop_tokens(&tokenizer);
-        exec.set_stop_tokens(&stop_tokens);
         let (submit, rx) = std::sync::mpsc::channel();
         let expert_stats = exec.experts_mut().map(|experts| experts.stats());
         let stats = Arc::new(Mutex::new(EngineStats {
