@@ -86,7 +86,9 @@ use crate::model::core::{
 use crate::residency::ExpertMode;
 use crate::residency::fallback::known_node;
 use crate::spec::accept;
-use crate::spec::{Draft, DraftRequest, SeqId, SpecConfig, SpecCounters, TargetInfo, TokenDrafter};
+use crate::spec::{
+    DeviceHidden, Draft, DraftRequest, SeqId, SpecConfig, SpecCounters, TargetInfo, TokenDrafter,
+};
 use crate::tokenizer::Tokenizer;
 pub use pipe::DEFAULT_MIN_GROUP as DEFAULT_PIPELINE_MIN_GROUP;
 pub use preempt::KvAdmission;
@@ -7265,6 +7267,13 @@ impl Worker {
             _ => 0,
         };
         self.exec.set_hidden_from(from);
+        // A decode or verify step: a drafter that gathers its take-in on the device reads the
+        // captured rows where the step left them, not a copy of all of them on the host (#1181).
+        let on_device = match &self.drafting {
+            Drafting::Model(d) if plan.chunks.is_empty() => d.reads_device_rows(),
+            _ => None,
+        };
+        self.exec.set_hidden_on_device(on_device);
         self.clock.lap(host_time::Phase::Pack, &mut at);
         let t_step = Instant::now();
         let out = self.exec.step(&groups).map_err(|e| e.to_string());
@@ -7574,6 +7583,8 @@ impl Worker {
 
         // Shared with the take-ins left for the next step ([`DeferredTakeIn`]).
         let hidden = std::sync::Arc::new(out.hidden);
+        // Or the same rows still on the device ([`ModelDrafter::step_device`]).
+        let hidden_dev = out.hidden_dev;
         let mut rows = out.argmax.into_iter().zip(out.rows);
         let mut copies = Vec::new();
         let mut commits = Vec::new();
@@ -8008,7 +8019,15 @@ impl Worker {
                 match &mut self.drafting {
                     Drafting::Model(d) => {
                         let t = Instant::now();
-                        d.step(&mut batch)?;
+                        if hidden_dev.is_empty() {
+                            d.step(&mut batch)?;
+                        } else {
+                            let rows = DeviceHidden {
+                                layers: &hidden_dev,
+                                first: &offs,
+                            };
+                            d.step_device(&mut batch, &rows)?;
+                        }
                         let ms = t.elapsed().as_secs_f64() * 1e3;
                         tracing::debug!(ms, seqs = batch.len(), "model drafts");
                         // A block drafter's pass, timed without a prompt's take-in.

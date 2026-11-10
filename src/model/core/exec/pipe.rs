@@ -482,7 +482,7 @@ impl Executor {
                 StepOutput {
                     argmax: o.argmax,
                     rows: o.rows,
-                    hidden: Vec::new(),
+                    ..Default::default()
                 },
             ));
         }
@@ -589,7 +589,7 @@ impl Executor {
                     StepOutput {
                         argmax: o.argmax,
                         rows: o.rows,
-                        hidden: Vec::new(),
+                        ..Default::default()
                     },
                 ));
             } else if s + 1 == n_local

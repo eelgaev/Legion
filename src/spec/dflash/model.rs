@@ -17,7 +17,7 @@
 //! RoPE, SwiGLU FFN. Adapted from llama.cpp's `src/models/dflash.cpp` (MIT) and the DFlash
 //! paper, <https://arxiv.org/abs/2602.06036>.
 
-use crate::ggml::{Backend, ComputeAllocator, Context, Tensor, ffi, types};
+use crate::ggml::{Backend, ComputeAllocator, Context, RowsAt, Tensor, ffi, types};
 
 use super::cache::{CachePool, SeqCache};
 use super::config::{Config, Flavor};
@@ -45,6 +45,44 @@ pub struct Rows {
     /// DFlash 2: the selector's inputs, `[position][top_k]` candidates and their logits, and
     /// `[position][rank]` hidden projections.
     pub selector: Option<(Vec<u32>, Vec<f32>, Vec<f32>)>,
+}
+
+/// Where an ingest's fused target features come from.
+#[derive(Clone, Copy)]
+pub enum Feats<'f> {
+    /// `[row][n_layers × n_embd]` floats on the host.
+    Host(&'f [f32]),
+    /// A target step's captured layers left on the drafter's device (#1181): the ingest's row
+    /// `j` is row `rows[j]` of every layer, side by side. Those rows must stay in place until
+    /// the ingest's graph is done.
+    Device {
+        layers: &'f [RowsAt],
+        rows: &'f [i32],
+    },
+}
+
+/// The fused features of rows `idx` (`[n]`) of a target step's captured `layers` on the
+/// device: every layer's rows (`get_rows`) side by side per row, `[n_layers × n_embd, n]`, the
+/// layout and bits of [`Feats::Host`]'s floats. One small copy per layer and a concat per layer
+/// after the first, instead of reading the step's rows back and uploading the chosen ones.
+///
+/// # Safety
+/// As [`Context::over_rows`]: `layers` stay allocated and unchanged while the graph runs.
+unsafe fn gather_features<'a>(ctx: &'a Context, layers: &[RowsAt], idx: Tensor<'a>) -> Tensor<'a> {
+    let n = idx.ne()[0];
+    let mut x: Option<Tensor<'a>> = None;
+    for at in layers {
+        // SAFETY: the caller's.
+        let rows = unsafe { ctx.over_rows(at) };
+        let g = ctx.reshape_3d(ctx.get_rows(rows, idx), at.width as i64, 1, n);
+        x = Some(match x {
+            None => g,
+            Some(x) => ctx.concat(x, g, 1),
+        });
+    }
+    let x = x.expect("a captured layer");
+    let [w, k, _, _] = x.ne();
+    ctx.reshape_2d(x, w * k, n)
 }
 
 /// One sequence of a draft pass: its cache, and its last token at `anchor_pos`.
@@ -655,7 +693,7 @@ impl Model {
         backend: &mut Backend,
         alloc: &mut Option<ComputeAllocator>,
         cache: &mut SeqCache,
-        feats: &[f32],
+        feats: Feats<'_>,
         positions: &[usize],
     ) -> Result<(), String> {
         self.ingest_many(
@@ -685,15 +723,18 @@ impl Model {
         alloc: &mut Option<ComputeAllocator>,
         caches: &mut [&mut SeqCache],
         pool: Option<&CachePool>,
-        feats: &[f32],
+        feats: Feats<'_>,
         positions: &[&[usize]],
         wait: bool,
     ) -> Result<(), String> {
         let c = &self.cfg;
         assert_eq!(caches.len(), positions.len());
         let n: usize = positions.iter().map(|p| p.len()).sum();
-        let n_in = feats.len() / n.max(1);
-        assert!(n > 0 && feats.len() == n * n_in);
+        assert!(n > 0);
+        match feats {
+            Feats::Host(f) => assert!(!f.is_empty() && f.len() % n == 0),
+            Feats::Device { layers, rows } => assert!(!layers.is_empty() && rows.len() == n),
+        }
         for (cache, p) in caches.iter().zip(positions) {
             assert!(!p.is_empty() && p.len() <= cache.window());
         }
@@ -701,7 +742,24 @@ impl Model {
         let size = GRAPH_SIZE + GRAPH_PER_SEQ * (n_seq - 1);
         let ctx = Context::new(size, size);
         let input = |ty, ne: &[i64], name: &str| ctx.new_tensor(ty, ne).named(name).as_input();
-        let x_in = input(types::F32, &[n_in as i64, n as i64], "features");
+        let (x_in, rows_in) = match feats {
+            Feats::Host(f) => {
+                let n_in = f.len() / n;
+                (
+                    input(types::F32, &[n_in as i64, n as i64], "features"),
+                    None,
+                )
+            }
+            Feats::Device { layers, rows } => {
+                let idx = input(types::I32, &[n as i64], "feature_rows");
+                // SAFETY: the caller keeps the step's rows in place until this graph is done
+                // (`Feats::Device`).
+                (
+                    unsafe { gather_features(&ctx, layers, idx) },
+                    Some((idx, rows)),
+                )
+            }
+        };
         let pos = input(types::I32, &[n as i64], "pos");
         // A sequence without a slot (every slot taken) has its cache apart: one write each.
         let pool = pool.filter(|_| n_seq > 1 && caches.iter().all(|c| c.slot().is_some()));
@@ -740,7 +798,11 @@ impl Model {
         let allocator = alloc.take().unwrap_or_else(|| drafter_allocator(backend));
         ctx.alloc_graph(&graph, allocator)
             .map_err(|e| e.to_string())?;
-        x_in.set_f32(feats);
+        match (feats, rows_in) {
+            (Feats::Host(f), _) => x_in.set_f32(f),
+            (_, Some((idx, rows))) => idx.set_i32(rows),
+            (Feats::Device { .. }, None) => unreachable!("an index input for device rows"),
+        }
         let all: Vec<i32> = positions
             .iter()
             .flat_map(|p| p.iter())

@@ -20,6 +20,7 @@ mod ops_vision;
 mod padded;
 pub mod pinned_io;
 pub mod post_alloc;
+mod rows_at;
 pub mod stage_graph;
 mod uma_memory;
 
@@ -39,6 +40,7 @@ pub use external::{EXTERNAL_PARAMS, ExternalOp, external_params};
 pub(crate) use external::{make_external, op_of, set_external_param};
 pub use ops_gemma4::ROPE_NEOX;
 pub use ops_vision::{ROPE_VISION, SCALE_ALIGN_CORNERS, SCALE_BILINEAR};
+pub use rows_at::RowsAt;
 
 #[allow(
     non_upper_case_globals,

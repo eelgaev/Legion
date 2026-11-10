@@ -163,7 +163,7 @@ impl Remote {
             Reply::Step { argmax, rows, .. } => StepOutput {
                 argmax,
                 rows,
-                hidden: Vec::new(),
+                ..Default::default()
             },
             r => return Err(ModelError::Node(format!("a step answered with {r:?}"))),
         };

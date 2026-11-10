@@ -498,6 +498,9 @@ pub struct Executor {
     prompt_next: Option<PromptNext>,
     /// The next step's first captured row read back ([`Self::set_hidden_from`]).
     hidden_from: usize,
+    /// The CUDA device the next step leaves its captured rows on
+    /// ([`Self::set_hidden_on_device`]).
+    hidden_on_device: Option<usize>,
     /// See [`Self::set_stage_cpus`].
     stage_cpus: Vec<Vec<u32>>,
     /// GLM's parallel decode steps ([`par_step`]).
@@ -795,6 +798,7 @@ impl Executor {
             mixed_aside: 0,
             prompt_next: None,
             hidden_from: 0,
+            hidden_on_device: None,
             stage_cpus: Vec::new(),
             par: Default::default(),
             pair: Default::default(),
@@ -2722,12 +2726,25 @@ impl Executor {
         if self.tp.is_some() {
             self.prompt_next = None;
             self.hidden_from = 0;
+            self.hidden_on_device = None;
             self.captures.clear();
             return self.tp_step(groups);
         }
         let out = self.step_here(groups);
         self.hidden_from = 0;
+        self.hidden_on_device = None;
         out
+    }
+
+    /// The next [`Self::step`] may leave its captured rows on the device
+    /// ([`StepOutput::hidden_dev`], #1181) instead of reading them back: a drafter that gathers
+    /// the rows it takes in on the device (DFlash) reads them there before anything runs on
+    /// the executor again. Applied by a step of one micro-chunk on one stage on this machine
+    /// whose captured layers are F32 matrices in a buffer of CUDA device `device` (the
+    /// drafter's); any other step reads them back as without (`None`: always). Only the next
+    /// step reads it.
+    pub fn set_hidden_on_device(&mut self, device: Option<usize>) {
+        self.hidden_on_device = device;
     }
 
     /// The next [`Self::step`] reads its captured rows ([`StepOutput::hidden`]) back from row
@@ -3844,6 +3861,11 @@ impl Executor {
         let parts = self.parts(s);
         let captured = self.captured(s);
         let n_vocab = self.model.hp.n_vocab as usize;
+        // The step's captured rows may stay where the graph wrote them
+        // ([`Executor::set_hidden_on_device`]): one stage, one micro-chunk, nothing read ahead.
+        let stay_on = self
+            .hidden_on_device
+            .filter(|_| n_micro == 1 && n_stages == 1 && read.is_none() && self.remote.is_none());
         let Stage {
             decode,
             mixed,
@@ -3856,12 +3878,21 @@ impl Executor {
         let spare = &mut self.spare_rows;
         let kept = kept_in(decode, mixed, shape).expect("prepared");
         let inputs = Inputs::from_parts(shape, parts, |i| kept.tensor(i));
+        // Every captured layer an F32 matrix on that device, or all are read back.
+        let on_device = stay_on.and_then(|dev| {
+            (inputs.hidden.iter())
+                .map(|t| t.rows_at().filter(|r| r.device == Some(dev)))
+                .collect::<Option<Vec<_>>>()
+        });
         let defer = n_micro > 1 && captured.len() == 1;
         // The one micro-chunk's rows are the step's ([`Executor::set_hidden_from`]).
         let from = if n_micro == 1 { self.hidden_from } else { 0 };
         let parity = round % 2;
         let mut started = Vec::new();
         let mut o = inputs.output_with(group, n_vocab, |t| {
+            if on_device.is_some() {
+                return Vec::new();
+            }
             let n = t.nbytes();
             if defer && n >= BOUNCE_MIN_BYTES {
                 // Already in the round's bounce buffer (the dataflow stage thread read it).
@@ -3888,6 +3919,9 @@ impl Executor {
             deferred.start(k, layer, parity, src, n);
         }
         hidden[k].extend(captured.into_iter().zip(std::mem::take(&mut o.hidden)));
+        if let Some(rows) = on_device {
+            out.hidden_dev = rows;
+        }
         // Rank 0 of a split model: the residual for rank 1 ([`remote`]).
         if s + 1 == n_stages
             && let Some(r) = self.remote.as_mut()
