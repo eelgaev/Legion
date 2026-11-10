@@ -1012,6 +1012,11 @@ impl<'a> Tensor<'a> {
                 && n.checked_mul(4).is_some_and(|b| via.nbytes() >= b),
             "f32_range_via needs allocated tensors and a big enough host one to read through"
         );
+        assert!(
+            // SAFETY: `via` is a live tensor; only its data address is read.
+            unsafe { (*via.raw()).data }.cast::<f32>().is_aligned(),
+            "f32_range_via needs an F32-aligned host tensor to read through"
+        );
         // SAFETY: `via` is allocated host memory of at least `n * 4` bytes (aligned for its
         // buffer), which the read fills before the slice is taken; any bytes are valid f32s.
         unsafe {
@@ -1020,6 +1025,56 @@ impl<'a> Tensor<'a> {
                 ffi::ggml_backend_tensor_get(self.raw(), data, start * 4, n * 4);
             }
             std::slice::from_raw_parts(data.cast::<f32>(), n).to_vec()
+        }
+    }
+
+    /// [`Self::f32_range_via`] without the copy out: `f` gets the `n` F32s where they landed in
+    /// host tensor `via` (one DMA for a whole span of rows that are then used in place).
+    ///
+    /// # Safety
+    ///
+    /// Nothing may write `via`'s memory while `f` runs (not `f` itself through a copy of `via`,
+    /// and not another thread): `f` holds a shared slice of it.
+    pub unsafe fn with_f32_range_via<R>(
+        self,
+        via: Tensor<'_>,
+        start: usize,
+        n: usize,
+        f: impl FnOnce(&[f32]) -> R,
+    ) -> R {
+        assert_eq!(
+            self.ty(),
+            ffi::ggml_type_GGML_TYPE_F32,
+            "with_f32_range_via on a non-F32 tensor"
+        );
+        assert!(
+            start
+                .checked_add(n)
+                .and_then(|e| e.checked_mul(4))
+                .is_some_and(|b| b <= self.nbytes()),
+            "with_f32_range_via out of bounds"
+        );
+        assert!(
+            self.is_allocated()
+                && via.is_allocated()
+                && via.is_host()
+                && n.checked_mul(4).is_some_and(|b| via.nbytes() >= b),
+            "with_f32_range_via needs allocated tensors and a big enough host one to read through"
+        );
+        assert!(
+            // SAFETY: `via` is a live tensor; only its data address is read.
+            unsafe { (*via.raw()).data }.cast::<f32>().is_aligned(),
+            "with_f32_range_via needs an F32-aligned host tensor to read through"
+        );
+        // SAFETY: `via` is allocated host memory of at least `n * 4` bytes (aligned for its
+        // buffer, checked above), which the read fills before the slice is taken and which the
+        // caller keeps unwritten while `f` runs; any bytes are valid f32s.
+        unsafe {
+            let data = (*via.raw()).data;
+            if n > 0 {
+                ffi::ggml_backend_tensor_get(self.raw(), data, start * 4, n * 4);
+            }
+            f(std::slice::from_raw_parts(data.cast::<f32>(), n))
         }
     }
 

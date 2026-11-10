@@ -537,6 +537,7 @@ impl Executor {
         let n_local = self.stages.len();
         let n_stages = n_local + usize::from(self.remote.is_some());
         let n_vocab = self.model.hp.n_vocab as usize;
+        let exact = self.model.hp.arch.argmax_first_of_ties();
         let mut exited = None;
         {
             let i = (self.pipe.iter())
@@ -559,8 +560,12 @@ impl Executor {
             let inputs = Inputs::from_parts(&p.shape, parts, |j| kept.tensor(j));
             let groups = view(&p.groups);
             let spare = &mut self.spare_rows;
-            let ids = bounce_for(ids_pin, backend, inputs.out_pin_bytes(n_vocab));
-            let o = inputs.output_with(&groups, n_vocab, ids, |t| {
+            let ids = bounce_for(ids_pin, backend, inputs.out_pin_bytes(&groups, n_vocab));
+            let picks = super::super::Picks {
+                stop: &self.stop_tokens,
+                exact,
+            };
+            let o = inputs.output_with(&groups, n_vocab, ids, picks, |t| {
                 read_rows(bounce, bounce_small, spare, backend, t)
             });
             // Model bytes (#391): the piece's graph on this stage and the KV it read; the

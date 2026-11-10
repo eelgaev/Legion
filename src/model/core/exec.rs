@@ -505,6 +505,8 @@ pub struct Executor {
     /// The CUDA device the next step leaves its captured rows on
     /// ([`Self::set_hidden_on_device`]).
     hidden_on_device: Option<usize>,
+    /// The stop tokens a greedy pick below `min_tokens` may not pick ([`Self::set_stop_tokens`]).
+    stop_tokens: Vec<u32>,
     /// See [`Self::set_stage_cpus`].
     stage_cpus: Vec<Vec<u32>>,
     /// GLM's parallel decode steps ([`par_step`]).
@@ -807,6 +809,7 @@ impl Executor {
             prompt_next: None,
             hidden_from: 0,
             hidden_on_device: None,
+            stop_tokens: Vec::new(),
             stage_cpus: Vec::new(),
             par: Default::default(),
             pair: Default::default(),
@@ -2757,6 +2760,12 @@ impl Executor {
         self.hidden_on_device = device;
     }
 
+    /// The stop tokens a greedy pick below `min_tokens` ([`Logits::Pick`],
+    /// [`Logits::FirstPick`]) may not pick: the engine's.
+    pub fn set_stop_tokens(&mut self, stop: &[u32]) {
+        self.stop_tokens = stop.to_vec();
+    }
+
     /// The next [`Self::step`] reads its captured rows ([`StepOutput::hidden`]) back from row
     /// `row` on only: the rows before it keep their length in the output but hold anything (an
     /// earlier step's rows, or zeros). For a drafter that reads only a prompt chunk's last rows
@@ -3356,7 +3365,7 @@ impl Executor {
             && micro > 0
             && seq.tokens.len() > micro
             && !lead.verify
-            && matches!(seq.logits, Logits::None | Logits::Last | Logits::Greedy)
+            && seq.logits.last_only()
         {
             let mut out = vec![riders.to_vec()];
             out.extend(self.micro_chunks(std::slice::from_ref(lead)));
@@ -3391,7 +3400,7 @@ impl Executor {
         }
         let [seq] = &g.seqs[..] else { return whole };
         let n = seq.tokens.len();
-        let last_only = matches!(seq.logits, Logits::None | Logits::Last | Logits::Greedy);
+        let last_only = seq.logits.last_only();
         if self.stages.len() < 2 || micro == 0 || n <= micro || g.verify || !last_only {
             return whole;
         }
@@ -3902,6 +3911,7 @@ impl Executor {
         let parts = self.parts(s);
         let captured = self.captured(s);
         let n_vocab = self.model.hp.n_vocab as usize;
+        let exact = self.model.hp.arch.argmax_first_of_ties();
         // The step's captured rows may stay where the graph wrote them
         // ([`Executor::set_hidden_on_device`]): one stage, one micro-chunk, nothing read ahead.
         let stay_on = self
@@ -3920,7 +3930,11 @@ impl Executor {
         let spare = &mut self.spare_rows;
         let kept = kept_in(decode, mixed, shape).expect("prepared");
         let inputs = Inputs::from_parts(shape, parts, |i| kept.tensor(i));
-        let ids = bounce_for(ids_pin, backend, inputs.out_pin_bytes(n_vocab));
+        let ids = bounce_for(ids_pin, backend, inputs.out_pin_bytes(group, n_vocab));
+        let picks = super::Picks {
+            stop: &self.stop_tokens,
+            exact,
+        };
         // Every captured layer an F32 matrix on that device, or all are read back.
         let on_device = stay_on.and_then(|dev| {
             (inputs.hidden.iter())
@@ -3932,7 +3946,7 @@ impl Executor {
         let from = if n_micro == 1 { self.hidden_from } else { 0 };
         let parity = round % 2;
         let mut started = Vec::new();
-        let mut o = inputs.output_with(group, n_vocab, ids, |t| {
+        let mut o = inputs.output_with(group, n_vocab, ids, picks, |t| {
             if on_device.is_some() {
                 return Vec::new();
             }

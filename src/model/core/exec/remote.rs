@@ -29,6 +29,8 @@ fn link_err(e: String) -> ModelError {
     ModelError::Node(e)
 }
 
+/// `l` as it goes over the link: a tag and a count (`Logits::FirstPick`'s two counts, verify
+/// rows, in 16 bits each).
 pub fn logits_tag(l: Logits) -> (u8, u32) {
     match l {
         Logits::None => (0, 0),
@@ -37,6 +39,11 @@ pub fn logits_tag(l: Logits) -> (u8, u32) {
         Logits::All => (3, 0),
         Logits::First(n) => (4, n as u32),
         Logits::FirstGreedy(n) => (5, n as u32),
+        Logits::Pick => (6, 0),
+        Logits::FirstPick(n, m) => {
+            let n = n.min(0xffff) as u32;
+            (7, n | ((m as u32).min(n) << 16))
+        }
     }
 }
 
@@ -48,6 +55,8 @@ pub fn logits_of(tag: (u8, u32)) -> Result<Logits, String> {
         (3, _) => Logits::All,
         (4, n) => Logits::First(n as usize),
         (5, n) => Logits::FirstGreedy(n as usize),
+        (6, _) => Logits::Pick,
+        (7, nm) => Logits::FirstPick((nm & 0xffff) as usize, (nm >> 16) as usize),
         (t, _) => return Err(format!("unknown logits tag {t}")),
     })
 }
