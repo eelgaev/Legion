@@ -126,6 +126,8 @@ struct Stage {
     /// Pinned host memory a step's smaller captured rows (a decode or verify step's) are read
     /// back through ([`read_rows`]).
     bounce_small: Option<Context>,
+    /// Pinned host memory a step's argmaxes are read back through ([`Inputs::output_with`]).
+    ids_pin: Option<Context>,
     /// Pinned host memory the MTP passes' inputs and outputs go through (the last stage's,
     /// [`mtp_window`]), and a decode or verify step's inputs ([`step_fill`]).
     mtp_io: PinnedIo,
@@ -175,6 +177,7 @@ impl Stage {
             bounce: None,
             bounce_b: None,
             bounce_small: None,
+            ids_pin: None,
             mtp_io: PinnedIo::default(),
             flow_io: PinnedIo::default(),
             flow_io_b: PinnedIo::default(),
@@ -553,6 +556,10 @@ pub struct Executor {
     held_commit: commit_hold::HeldCommit,
     /// The host time from an MTP pass's picks to the next step's first launch ([`step_front`]).
     front_clock: step_front::FrontClock,
+    /// The last step's host laps, for `--tp-profile` ([`Self::take_step_laps`]).
+    step_laps: Option<crate::tp_net::StepLaps>,
+    /// The host time the last stage launch spent writing its late n-gram rows (`launch_stage`).
+    late_rows_took: std::time::Duration,
     /// See [`Self::set_mtp_ahead`].
     mtp_ahead: bool,
     /// The inputs the last MTP pass queued for the next one ([`mtp_ahead`]), until the next
@@ -824,6 +831,8 @@ impl Executor {
             commit_last_late: false,
             held_commit: Default::default(),
             front_clock: Default::default(),
+            step_laps: None,
+            late_rows_took: std::time::Duration::ZERO,
             mtp_ahead: false,
             mtp_staged: None,
             mtp_pipe_rows: 0,
@@ -2756,9 +2765,18 @@ impl Executor {
         self.hidden_from = row;
     }
 
+    /// The last step's host laps (`--tp-profile`), if it ran as one round of one stage (a
+    /// decode or verify step on a tensor-parallel rank); taken, so a later step without them
+    /// gives `None`.
+    pub fn take_step_laps(&mut self) -> Option<crate::tp_net::StepLaps> {
+        self.step_laps.take()
+    }
+
     /// [`Self::step`] on this machine.
     fn step_here(&mut self, groups: &[Group<'_>]) -> Result<StepOutput, ModelError> {
         debug_assert!(self.pipe.is_empty(), "a whole step with groups in flight");
+        let t_entry = std::time::Instant::now();
+        self.step_laps = None;
         // Read by this step only (`prompt_ahead`).
         let prompt_next = self.prompt_next.take();
         let mut front = self.front_clock.step();
@@ -3114,9 +3132,14 @@ impl Executor {
                     }
                 }
                 front.done();
+                let t_launched = t0.elapsed();
+                // `--tp-profile`'s laps: the next verify graph built, then the GPU waited for.
+                let (mut t_ahead, mut ahead_wait) = (t_launched, std::time::Duration::ZERO);
                 if let Some(next) = &ahead {
                     self.build_ahead(0, &shapes[0], next, late);
+                    t_ahead = t0.elapsed();
                     self.stages[0].backend.synchronize();
+                    ahead_wait = t0.elapsed() - t_ahead;
                 }
                 if let Some(next) = &prompt_ahead {
                     let t = std::time::Instant::now();
@@ -3191,6 +3214,23 @@ impl Executor {
                         None,
                     );
                     output_ms += t_out.elapsed().as_secs_f64() * 1e3;
+                }
+                if let [(_, _)] = active[..]
+                    && n_rounds == 1
+                {
+                    let out_d = std::time::Duration::from_secs_f64(output_ms / 1e3);
+                    let synced = t0.elapsed().saturating_sub(out_d);
+                    self.step_laps = Some(crate::tp_net::StepLaps {
+                        before: t0 - t_entry,
+                        prepare: t_prepare,
+                        fill: t_inputs,
+                        launch: t_launched.saturating_sub(t_inputs + t_prepare),
+                        rows: self.late_rows_took,
+                        ahead: t_ahead - t_launched,
+                        beside: t_launch.saturating_sub(t_ahead + ahead_wait),
+                        wait: ahead_wait + synced.saturating_sub(t_launch),
+                        output: out_d,
+                    });
                 }
             }
             // The cache learns each micro-batch's routing (its graph's route log holds it until
@@ -3872,12 +3912,14 @@ impl Executor {
             bounce,
             bounce_b,
             bounce_small,
+            ids_pin,
             backend,
             ..
         } = &mut self.stages[s];
         let spare = &mut self.spare_rows;
         let kept = kept_in(decode, mixed, shape).expect("prepared");
         let inputs = Inputs::from_parts(shape, parts, |i| kept.tensor(i));
+        let ids = bounce_for(ids_pin, backend, inputs.argmax_bytes());
         // Every captured layer an F32 matrix on that device, or all are read back.
         let on_device = stay_on.and_then(|dev| {
             (inputs.hidden.iter())
@@ -3889,7 +3931,7 @@ impl Executor {
         let from = if n_micro == 1 { self.hidden_from } else { 0 };
         let parity = round % 2;
         let mut started = Vec::new();
-        let mut o = inputs.output_with(group, n_vocab, |t| {
+        let mut o = inputs.output_with(group, n_vocab, ids, |t| {
             if on_device.is_some() {
                 return Vec::new();
             }

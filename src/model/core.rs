@@ -1027,14 +1027,22 @@ impl<'a> Inputs<'a> {
 
     /// Reads the step's results back: every row's argmax, and the rows that want logits.
     fn output(&self, groups: &[Group<'_>], n_vocab: usize) -> StepOutput {
-        self.output_with(groups, n_vocab, |t| t.to_f32())
+        self.output_with(groups, n_vocab, None, |t| t.to_f32())
     }
 
-    /// [`Self::output`], reading the captured rows with `read`.
+    /// The bytes of the step's argmaxes (0 without them): what [`Self::output_with`] reads
+    /// them through needs this much room.
+    fn argmax_bytes(&self) -> usize {
+        self.argmax.map_or(0, |t| t.nbytes())
+    }
+
+    /// [`Self::output`], reading the captured rows with `read`, and the argmaxes through host
+    /// tensor `ids` (pinned memory, [`Tensor::to_i32_via`]) when it has room for them.
     fn output_with(
         &self,
         groups: &[Group<'_>],
         n_vocab: usize,
+        ids: Option<Tensor<'_>>,
         mut read: impl FnMut(Tensor<'a>) -> Vec<f32>,
     ) -> StepOutput {
         let hidden = self.hidden.iter().map(|&t| read(t)).collect();
@@ -1044,7 +1052,11 @@ impl<'a> Inputs<'a> {
                 ..Default::default()
             };
         };
-        let argmax = argmax.to_i32().into_iter().map(|t| t as u32).collect();
+        let argmax = match ids.filter(|v| v.nbytes() >= argmax.nbytes()) {
+            Some(via) => argmax.to_i32_via(via),
+            None => argmax.to_i32(),
+        };
+        let argmax = argmax.into_iter().map(|t| t as u32).collect();
         let mut rows = Vec::new();
         for s in groups.iter().flat_map(|g| &g.seqs) {
             for _ in 0..s.logits.rows(s.tokens.len()) {

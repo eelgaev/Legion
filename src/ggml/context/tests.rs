@@ -432,3 +432,17 @@ fn indexed_names_find_what_the_search_finds() {
     assert_eq!(ctx.tensor("late").unwrap().raw(), late.raw());
     assert_eq!(ctx.tensor("cache_k-5").unwrap().raw(), ts[5].raw());
 }
+
+/// #1176: an I32 tensor read through a host tensor (pinned memory on a GPU) gives what a plain
+/// read gives.
+#[test]
+fn to_i32_via_reads_what_to_i32_reads() {
+    let cpu = Backend::cpu().unwrap();
+    let ctx = Context::new(2, 0);
+    let t = ctx.new_tensor(types::I32, &[5]);
+    let via = ctx.new_tensor(types::F32, &[8]);
+    ctx.alloc_tensors(cpu.buffer_type()).unwrap();
+    t.set_i32(&[3, -1, 7, 0, 151_000]);
+    assert_eq!(t.to_i32_via(via), [3, -1, 7, 0, 151_000]);
+    assert_eq!(t.to_i32_via(via), t.to_i32());
+}
