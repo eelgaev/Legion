@@ -37,7 +37,7 @@ build before `--head-rope-fused`
 (and the captured-rows change that came with it), same session, without the flag: 21.9-40.2 at 1 user (28.3
 median), 81.9 at 4 users, 221.9 at 16, prefill 8K 1,727, 32K 1,458, 123K 848.
 
-An earlier session (2026-11-03) without the last four flags (all of them opt-in): 18-33 tok/s at 1 user (24.4 median,
+An earlier session (2026-11-03) without the last five flags (all of them opt-in): 18-33 tok/s at 1 user (24.4 median,
 accepted length 3.36), 70.2 at 4 users, 154.3 at 16, prefill 8K 897 and 32K 710 (123K 587). `--nvfp4-a4 prefill` alone
 gives most of the prefill and 16-user gain (16 users ~187); the 8-bit drafter and its 4-bit head make each
 draft pass cheaper (16 users ~212 with both). `--spec-draft-vocab 131072` on top cuts the accepted length
@@ -55,4 +55,4 @@ to ~2.3 and is slower at every concurrency.
 - `--spec-draft-weights` (`q8_0`, opt-in): the drafter's BF16 layers (~4.8 GB read per draft pass) quantized to Q8_0 at load. Drafts only, every token is still verified by the full model; at 4 and 16 users the drafts shape the verify batches, so the text can move.
 - `--spec-draft-lm-head` (`q4`, opt-in): the drafter reads a 4-bit copy of Gemma's tied 262,144-row head (2.8 GB in BF16) made at load. Drafts only, as above.
 - `--head-rope-fused` (opt-in): every layer's RoPE reads one shared view of the positions, so ggml-cuda runs the q and k heads' norm, weight and RoPE as its one fused kernel instead of two. Prefill ~4% faster at 8K and 32K, 16 users a few percent. Output-moving: the fused kernel rounds differently.
-- `--spec-draft-batched-attn` (opt-in): when several sequences draft together, every drafter layer attends all of them in one flash attention over a shared pool of their drafter caches, instead of a few small kernels per sequence (about 800 a step at 16 users). 16 users ~3.5% faster. Drafts only, as above; one sequence drafts exactly as without it.
+- `--spec-draft-batched-attn` (opt-in): when several sequences draft together, every drafter layer attends all of them in one flash attention over a shared pool of their drafter caches, instead of a few small kernels per sequence (about 800 a step at 16 users). 16 users ~3.5% faster. Drafts only, as above; one sequence drafts exactly as without it. The pool is allocated once, when the first sequence drafts: one slot per sequence the server can hold, each sized for a full drafter cache (here 20 slots, ~3.8 GB, about what the per-sequence caches would use at full load). If it can't be allocated, or its slots run out, the server warns and falls back to per-sequence caches.
