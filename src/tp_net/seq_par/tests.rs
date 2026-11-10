@@ -294,3 +294,33 @@ fn an_f32_wire_sum_is_not_deferred() {
     });
     assert_eq!(got, [false, false]);
 }
+
+#[test]
+fn a_reduce_scatter_takes_over_only_the_tail_it_reads() {
+    let got = on_ranks(2, Wire::F32, |_, c| {
+        let handle = register(c);
+        let ctx = Context::new(16, 16);
+        let x = ctx.new_tensor(types::F32, &[4, 6]).as_input();
+        let w = ctx.new_tensor(types::F32, &[1, 6]).as_input();
+        // External nodes standing in for the tail and for another node.
+        let tail = all_gather(&ctx, handle.id(), x, 6);
+        let other = all_gather(&ctx, handle.id(), x, 6);
+        let rs = reduce_scatter(&ctx, handle.id(), tail);
+        let ins = [x.raw(), w.raw()];
+        // SAFETY: nodes of `ctx`, never run.
+        unsafe {
+            let not_rs = take_tail(other.raw(), tail.raw(), &ins);
+            let not_its_source = take_tail(rs.raw(), other.raw(), &ins);
+            let untouched =
+                external_params(&*other.raw())[crate::model::core::node_fuse::P_BY_EXCHANGE] == 0
+                    && (*rs.raw()).src[1].is_null();
+            let took = take_tail(rs.raw(), tail.raw(), &ins);
+            let again = take_tail(rs.raw(), tail.raw(), &ins);
+            let t = &*rs.raw();
+            let srcs = t.src[1] == x.raw() && t.src[2] == w.raw() && t.src[3].is_null();
+            let by = external_params(&*tail.raw())[crate::model::core::node_fuse::P_BY_EXCHANGE];
+            (not_rs, not_its_source, untouched, took, again, srcs, by)
+        }
+    });
+    assert_eq!(got, [(false, false, true, true, false, true, 1); 2]);
+}
