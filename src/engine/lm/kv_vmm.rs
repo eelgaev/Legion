@@ -81,6 +81,9 @@ pub(super) struct KvLend {
     pub(super) host_budget: usize,
     /// Host bytes the pieces of the last shrink kept (0 while grown).
     pub(super) host_held: usize,
+    /// Whether the GPUs can map host memory into the pools: then a grow with no VRAM left
+    /// for a piece backs it with host memory instead of failing (#1216).
+    host_ok: bool,
 }
 
 /// A cache tensor's lent pieces.
@@ -191,6 +194,7 @@ impl KvLend {
             tails: Vec::new(),
             host_budget: 0,
             host_held: 0,
+            host_ok: false,
         };
         let (bytes, tails) = lend
             .unmap(exec, None)
@@ -203,6 +207,7 @@ impl KvLend {
         let available = crate::residency::lookup_table::MemInfo::read().available;
         let host_budget = default_host_budget(bytes.iter().sum(), available);
         lend.host_budget = if host_ok { host_budget } else { 0 };
+        lend.host_ok = host_ok;
         if host_budget > 0 && !host_ok {
             tracing::warn!(
                 "the GPUs cannot map host memory into the KV pools; cached chats past the kept \
@@ -266,18 +271,29 @@ impl KvLend {
     }
 
     /// Maps the blocks past `keep` again: zeroed, or with the bytes a shrink kept in host
-    /// memory. Returns the bytes mapped, and of them those copied back from host memory. No
-    /// step may have been built over the blocks without memory yet.
-    pub(super) fn grow(&mut self, exec: &Executor) -> Result<(usize, usize), String> {
-        let (mut bytes, mut restored) = (0, 0);
+    /// memory. Returns the bytes mapped into VRAM, of them those copied back from host
+    /// memory, and the bytes left in (or mapped from) host memory because the GPU had no
+    /// VRAM left for them (#1216: where the GPUs can map host memory, a piece goes there
+    /// instead of failing the request; the blocks keep their address either way). No step
+    /// may have been built over the blocks without memory yet. `reserve`: VRAM a piece must
+    /// leave free to be mapped there rather than in host memory (a lent cache's long prompt
+    /// step buffers); 0 maps as before wherever VRAM is not out.
+    pub(super) fn grow(
+        &mut self,
+        exec: &Executor,
+        reserve: usize,
+    ) -> Result<(usize, usize, usize), String> {
+        let (mut bytes, mut restored, mut host) = (0, 0, 0);
+        let fallback = self.host_ok.then_some(reserve);
         for t in exec.kv_block_tensors().into_iter().flatten() {
-            let (b, r) = remap(t)?;
+            let (b, r, h) = remap(t, fallback)?;
             bytes += b;
             restored += r;
+            host += h;
         }
         self.grown = true;
         self.host_held = 0;
-        Ok((bytes, restored))
+        Ok((bytes, restored, host))
     }
 
     /// Unmaps the blocks past `keep` again once no step runs: none of them may be in use but
@@ -318,13 +334,17 @@ fn unmap(
 }
 
 #[cfg(feature = "cuda")]
-fn remap(t: crate::ggml::Tensor<'_>) -> Result<(usize, usize), String> {
-    crate::residency::cuda::kv_vmm_remap(t)
+fn remap(
+    t: crate::ggml::Tensor<'_>,
+    host_below: Option<usize>,
+) -> Result<(usize, usize, usize), String> {
+    let r = crate::residency::cuda::kv_vmm_remap(t, host_below)?;
+    Ok((r.vram, r.restored, r.host))
 }
 
 #[cfg(not(feature = "cuda"))]
-fn remap(_: crate::ggml::Tensor<'_>) -> Result<(usize, usize), String> {
-    Ok((0, 0))
+fn remap(_: crate::ggml::Tensor<'_>, _: Option<usize>) -> Result<(usize, usize, usize), String> {
+    Ok((0, 0, 0))
 }
 
 #[cfg(feature = "cuda")]

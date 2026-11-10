@@ -305,6 +305,52 @@ fn staging_plan_takes_the_biggest_buffers_first() {
 }
 
 #[test]
+fn ring_buffers_take_their_own_rows_biggest_layer() {
+    use super::{plan_staging_sized, ring_bytes};
+    // The device's biggest layer per kind, and four rows: row 2 (even) is the big one.
+    let bytes = [1584 * MIB, 1584 * MIB, 1890 * MIB];
+    let small = [1296 * MIB, 1296 * MIB, 1584 * MIB];
+    let rows = [
+        (0, small),
+        (1, [1296 * MIB, 1296 * MIB, 1890 * MIB]),
+        (2, bytes),
+        (3, small),
+    ];
+    let need = ring_bytes(bytes, 2, &rows);
+    // Kind k's buffer j at k * 2 + j: the even rows' biggest, then the odd rows'.
+    assert_eq!(
+        need,
+        vec![
+            1584 * MIB,
+            1296 * MIB,
+            1584 * MIB,
+            1296 * MIB,
+            1890 * MIB,
+            1890 * MIB
+        ]
+    );
+    // One size for all without rows (packed staging), and for a buffer no row uses.
+    assert_eq!(
+        ring_bytes(bytes, 2, &[]),
+        vec![bytes[0], bytes[0], bytes[1], bytes[1], bytes[2], bytes[2]]
+    );
+    let need3 = ring_bytes(bytes, 3, &rows[..2]);
+    assert_eq!(need3[2], bytes[0]);
+    assert_eq!(need3[0], small[0]);
+    // Never more than the biggest layer.
+    let big = [(0, [2 * bytes[0], 0, 0])];
+    assert_eq!(ring_bytes(bytes, 2, &big)[0], bytes[0]);
+    // Uniform sizes plan as before.
+    let sizes = [60 * MIB, 50 * MIB, 50 * MIB, 40 * MIB, 20 * MIB, 800 * MIB];
+    let b = [40 * MIB, 100 * MIB, 20 * MIB];
+    let uniform: Vec<usize> = (0..6).map(|i| b[i / 2]).collect();
+    assert_eq!(
+        plan_staging_sized(&sizes, &uniform, true),
+        plan_staging(&sizes, b, 2, true)
+    );
+}
+
+#[test]
 fn staging_cover_fallback_still_covers() {
     let sizes = [300 * MIB + 1, 200 * MIB + 7, 100 * MIB + 3];
     let picked = pick_cover(&sizes, 320 * MIB);

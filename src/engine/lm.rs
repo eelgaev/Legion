@@ -1241,6 +1241,33 @@ impl Default for LongPrompts {
 /// The smallest adaptive micro-chunk ([`LongPrompts::micro_for`]).
 const MIN_MICRO: usize = 2048;
 
+/// The smallest micro-chunk a lend caps long prompts to (#1216, [`Worker::long_micro_cap`]):
+/// below it, staging every expert per micro-chunk costs more than a spilled step buffer.
+const MIN_LENT_MICRO: usize = 512;
+
+/// VRAM a lend's micro-chunk cap leaves free beside the long step buffer and
+/// [`crate::model::core::LENT_SCRATCH`] (#1216).
+const LENT_MICRO_MARGIN: usize = 64 << 20;
+
+/// #1216: a stage's long prompt step compute buffer at [`LongPrompts::micro`] tokens, as
+/// measured at load after no past and after the longest ([`Worker::long_past`]).
+#[derive(Debug, Clone, Copy)]
+struct LongStep {
+    device: Option<crate::ggml::Device>,
+    first: usize,
+    last: usize,
+}
+
+impl LongStep {
+    /// The buffer for a micro-chunk ending at most `end` tokens in: linear in the past
+    /// between the two measurements (an indexer's scores grow with it), at most `last`.
+    fn at(&self, end: usize, long_past: usize) -> usize {
+        let grow = self.last.saturating_sub(self.first) as u128;
+        let past = end.min(long_past) as u128;
+        self.first + (grow * past / long_past.max(1) as u128) as usize
+    }
+}
+
 /// [`LongPrompts::even_micro`]'s micro-chunks are whole KV blocks.
 const EVEN_STEP: usize = KV_BLOCK;
 
@@ -4742,6 +4769,8 @@ impl LmEngine {
         }
         // The measured step compute buffers per stage (for the startup report).
         let mut measured_compute: Vec<usize> = Vec::new();
+        // Per stage: a long prompt's micro-chunk step buffer as measured (#1216).
+        let mut measured_long: Vec<usize> = Vec::new();
         // Per stage, for the memory plan: the VRAM kept free of the expert cache for step
         // compute buffers, and the prompt steps' room the cache took (may spill to host).
         let mut planned_compute: Vec<usize> = Vec::new();
@@ -4939,6 +4968,7 @@ impl LmEngine {
             // `--kv-vmm-keep` (#814): the pools' blocks past the kept ones give their VRAM to
             // the cache, and a lend must free it again beside a long step's buffers (the
             // blocks are mapped while the cache is lent).
+            measured_long.clone_from(&long);
             let mut long = long;
             if let Some(tokens) = kv_keep {
                 let plain = hbm_blocks == n_blocks
@@ -5342,6 +5372,31 @@ impl LmEngine {
         let slot_host_budget = exec.kv_slot_host_budget();
         let slot_lend = exec.kv_slot_lend();
         let ring_ckpt_slots = exec.ring_save_slots();
+        // #1216: a lend caps the long prompt's micro-chunks to what each stage's GPU has left
+        // free. GLM-5.3-Flash over a layer split only (not its parallel decode). Its step
+        // buffer grows with the past (the indexer's scores): measured once more at none.
+        let long_micro = cfg.long_prompts.micro;
+        let long_step = if crate::model::glm5next::params(exec.hp()).is_some()
+            && exec.model().glm_par.is_none()
+            && measured_long.len() == layout.stages.len()
+            && long_micro > 0
+        {
+            match exec.measure_prompt_step(long_micro, 0) {
+                Ok(first) if first.len() == measured_long.len() => {
+                    (layout.stages.iter().zip(first).zip(&measured_long))
+                        .map(|(((d, _), b0), &b)| LongStep {
+                            device: *d,
+                            first: b0.min(b),
+                            last: b,
+                        })
+                        .collect()
+                }
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        let long_past = cfg.ctx_size.saturating_sub(long_micro).max(1);
         let worker = Worker {
             exec,
             tokenizer: tokenizer.clone(),
@@ -5431,6 +5486,10 @@ impl LmEngine {
             lent: false,
             lent_short: false,
             can_lend: cfg.long_prompts.min_tokens > 0,
+            long_step,
+            long_past,
+            long_cap: 0,
+            long_reserve: 0,
             clock: Default::default(),
             outbox: stream::Outbox::new(tokenizer.clone(), cfg.stream_thread_seqs),
         };
@@ -5824,6 +5883,15 @@ struct Worker {
     lent_short: bool,
     /// Whether lending is possible (cleared after a failure).
     can_lend: bool,
+    /// #1216: per stage, its long prompt step's compute buffers as measured at load (empty:
+    /// no cap, see [`Self::long_micro_cap`]).
+    long_step: Vec<LongStep>,
+    /// The past [`LongStep::last`] was measured after.
+    long_past: usize,
+    /// The micro-chunk cap of the current lend (0: none).
+    long_cap: usize,
+    /// VRAM a KV tail mapped during the current lend leaves free for its step buffers.
+    long_reserve: usize,
     /// `--kv-vmm-keep` (#814): the KV pools' tail, lent to the expert cache while no sequence
     /// needs it ([`kv_vmm::KvLend`]).
     kv_lend: Option<kv_vmm::KvLend>,
@@ -6824,7 +6892,7 @@ impl Worker {
         }
         let t = Instant::now();
         if !self.lent && self.can_lend {
-            self.lend_cache(0);
+            self.lend_cache(0, usize::MAX);
             if self.lent {
                 self.lent_short = true;
                 self.exec.set_pipeline_micro(self.micro);
@@ -6833,7 +6901,8 @@ impl Worker {
         }
         let lend = self.kv_lend.as_mut().expect("a lent KV tail");
         let host_held = lend.host_held;
-        let (bytes, restored) = match lend.grow(&self.exec) {
+        let reserve = self.long_reserve;
+        let (bytes, restored, host) = match lend.grow(&self.exec, reserve) {
             Ok(b) => b,
             Err(e) => {
                 // Blocks kept in host memory may have lost their bytes: nothing resumes them.
@@ -6848,10 +6917,18 @@ impl Worker {
             ms = t.elapsed().as_secs_f64() * 1e3,
             mib = bytes >> 20,
             from_host_mib = restored >> 20,
+            host_mib = host >> 20,
             cache_lent = self.lent,
             resume,
             "KV pools' tail mapped for a sequence past the kept blocks (--kv-vmm-keep)"
         );
+        if host > 0 {
+            tracing::warn!(
+                host_mib = host >> 20,
+                "no VRAM left for part of the KV pools' tail: it is served from host memory \
+                 (slower attention past the kept blocks) instead of failing the request"
+            );
+        }
         Ok(())
     }
 
@@ -6963,7 +7040,7 @@ impl Worker {
             shrunk = if self.pool.slow_in_use() == 0 {
                 lend.shrink(&mut self.exec, None)
             } else {
-                lend.grow(&self.exec).and(Err(e))
+                lend.grow(&self.exec, 0).and(Err(e))
             };
         }
         match shrunk {
@@ -6994,12 +7071,13 @@ impl Worker {
     /// Lends the expert cache's VRAM to the long prompt about to be read (see [`LongPrompts`]);
     /// on failure the cache keeps it and lending stays off. `tokens`: the longest prompt's
     /// tokens still to read.
-    fn lend_cache(&mut self, tokens: usize) {
+    fn lend_cache(&mut self, tokens: usize, end: usize) {
         let t = Instant::now();
         match self.exec.lend_experts(tokens) {
             Ok(true) => {
                 self.lent = true;
-                self.exec.set_pipeline_micro(self.long.micro);
+                (self.long_cap, self.long_reserve) = self.long_micro_cap(end);
+                self.exec.set_pipeline_micro(self.capped(self.long.micro));
                 self.exec.set_micro_taper(self.long.taper);
                 tracing::info!(
                     ms = t.elapsed().as_secs_f64() * 1e3,
@@ -7036,6 +7114,8 @@ impl Worker {
         }
         self.lent = false;
         self.lent_short = false;
+        self.long_cap = 0;
+        self.long_reserve = 0;
         self.exec.set_pipeline_micro(self.micro);
         self.exec.set_micro_taper(0);
         tracing::info!(
@@ -7043,6 +7123,60 @@ impl Worker {
             kv_tail,
             "expert cache restored, refilling"
         );
+    }
+
+    /// #1216: the longest micro-chunk (in whole KV blocks, at least [`MIN_LENT_MICRO`]) whose
+    /// long step buffer for a prompt ending `end` tokens in fits each stage GPU's free VRAM
+    /// now (just after a lend) beside [`crate::model::core::LENT_SCRATCH`], and the VRAM a KV
+    /// tail mapped during the lend must leave for it; `(0, 0)` (no cap) when the full
+    /// [`LongPrompts::micro`] fits, nothing was measured, or not even [`MIN_LENT_MICRO`] fits
+    /// (the step then spills as before). The buffer grows about linearly with the micro-chunk
+    /// and with the past ([`LongStep::at`]).
+    /// Smaller micro-chunks stage every expert more often, but a long step's buffer in host
+    /// memory ran prompts ~10x slower (an AC922 with 3 GPUs: GLM's staging ring takes nearly
+    /// all of a GPU's lent cache).
+    fn long_micro_cap(&self, end: usize) -> (usize, usize) {
+        let micro = self.long.micro;
+        let mut cap = micro;
+        for s in &self.long_step {
+            let bytes = s.at(end, self.long_past);
+            let Some(d) = s.device.filter(|_| bytes > 0) else {
+                continue;
+            };
+            let keep = crate::model::core::LENT_SCRATCH + LENT_MICRO_MARGIN;
+            let free = d.memory().0.saturating_sub(keep);
+            let fits = (free as u128 * micro as u128 / bytes as u128) as usize;
+            cap = cap.min(fits / KV_BLOCK * KV_BLOCK);
+        }
+        if cap >= micro || cap < MIN_LENT_MICRO {
+            return (0, 0);
+        }
+        let step = (self.long_step.iter())
+            .map(|s| (s.at(end, self.long_past) as u128 * cap as u128 / micro as u128) as usize)
+            .max()
+            .unwrap_or(0);
+        let reserve = step + crate::model::core::LENT_SCRATCH + LENT_MICRO_MARGIN;
+        tracing::info!(
+            micro = cap,
+            prompt_end = end.min(self.long_past),
+            reserve_mib = reserve >> 20,
+            free_mib = ?self
+                .long_step
+                .iter()
+                .map(|s| s.device.map_or(0, |d| d.memory().0 >> 20))
+                .collect::<Vec<_>>(),
+            "long prompt micro-chunks capped to what the lend left free (step buffers stay in VRAM)"
+        );
+        (cap, reserve)
+    }
+
+    /// `micro` within the current lend's cap ([`Self::long_micro_cap`]).
+    fn capped(&self, micro: usize) -> usize {
+        if self.long_cap > 0 {
+            micro.min(self.long_cap)
+        } else {
+            micro
+        }
     }
 
     /// One forward pass: a token for every decoding sequence plus prefill chunks within the
@@ -7237,7 +7371,8 @@ impl Worker {
                 .short_from()
                 .is_some_and(|n| prefilling.iter().any(|s| left(s) >= n));
         if (long || short) && !self.lent {
-            self.lend_cache(prefilling.iter().map(left).max().unwrap_or(0));
+            let end = prefilling.iter().map(|s| s.prompt.len()).max().unwrap_or(0);
+            self.lend_cache(prefilling.iter().map(left).max().unwrap_or(0), end);
             self.lent_short = !long;
             // `--kv-vmm-keep` with `--glm-parallel-decode` (#1174): a long prompt that will
             // pass the kept blocks maps the KV pools' tail now, while the VRAM the lend just
@@ -7304,9 +7439,10 @@ impl Worker {
                 Some(lead) if riders => lead.prompt.len() - lead.n_past,
                 _ => prefilling.iter().map(|s| s.prompt.len() - s.n_past).sum(),
             };
-            micro = self
-                .long
-                .micro_for(left.min(max_batch), self.exec.n_stages());
+            micro = self.capped(
+                self.long
+                    .micro_for(left.min(max_batch), self.exec.n_stages()),
+            );
             self.exec.set_pipeline_micro(micro);
         }
         // What the riders may take besides the decoding sequences' rows.
@@ -7387,7 +7523,7 @@ impl Worker {
             && self.long.even
             && let [(_, len)] = chunks[..]
         {
-            let micro = self.long.even_micro(len, self.exec.n_stages());
+            let micro = self.capped(self.long.even_micro(len, self.exec.n_stages()));
             self.exec.set_pipeline_micro(micro);
         }
         if self.slo.is_some() {
