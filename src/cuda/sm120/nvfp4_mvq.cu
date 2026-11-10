@@ -76,7 +76,7 @@ struct legion_nvfp4_mvq {
     int32_t       n;        // 1-8
     int32_t       ns;       // piece slots of the ring (more than 16)
     int32_t       chunks;   // pieces a row (each whole 16-byte units)
-    int32_t       mode;     // EXPERIMENT: bit 0 load only, bit 1 regions interleaved across CTAs
+    int32_t       mode;     // EXPERIMENT: bit 0 load only
 };
 }
 
@@ -207,10 +207,10 @@ constexpr int MV_THREADS = MV_WARPS * WARP_SIZE;
 constexpr int MV_R       = 16;  // rows of a region
 constexpr int MV_ITERS   = 8;   // a chunk spans at most MV_ITERS / NWG steps of blocks_per_iter
 
-// `w @ x` with ggml's MMVQ order for NWG of its warps (4: 1-4 columns, 2: 5-8). CTA b takes the
-// rows [4 (b G4s / G), 4 ((b + 1) G4s / G)) of the G4s groups of 4 (G CTAs, one per SM), in
-// regions of up to MV_R rows, each row in p.chunks pieces along K (a chunk of the region's rows
-// at a time, the partial sums carried from chunk to chunk: every chain keeps its K order).
+// `w @ x` with ggml's MMVQ order for NWG of its warps (4: 1-4 columns, 2: 5-8). G CTAs (one per
+// SM) take regions of up to MV_R rows (see `start` below), each row in p.chunks pieces along K
+// (a chunk of the region's rows at a time, the partial sums carried from chunk to chunk: every
+// chain keeps its K order).
 // Thread (g, t) of a warp (lane 4g + t) takes column g, the rows 2 (t % 2) and 2 (t % 2) + 1 of
 // each group, and half h = t / 2 of each block: the C entries of its own sub-block parity, then
 // the other parity's from lane t ^ 2. ggml's warp l (of NWG) walks the residues 16 l + 0..15
@@ -249,15 +249,21 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
     const int hp   = t >> 1;        // the thread's half and sub-block parity
     const int ra   = 2 * (t & 1);   // its first row of a group
 
-    const int  G     = gridDim.x;
-    const int  g4s   = p.rows >> 2;
-    const bool inter = (p.mode & 2) != 0;
-    const int  r0    = inter ? (int) blockIdx.x * R : 4 * (int) (((int64_t) blockIdx.x * g4s) / G);
-    const int  r1    = inter ? p.rows : 4 * (int) (((int64_t) (blockIdx.x + 1) * g4s) / G);
-    const int  step  = inter ? G * R : R;
+    // Regions: rounds of G R rows, region j of CTA b at rows (j G + b) R, so the CTAs stream
+    // neighbouring rows; the last, partial round in nearly equal runs of whole groups.
+    const int G     = gridDim.x;
+    const int full  = p.rows / (G * R);
+    const int tail  = full * G * R;
+    const int gl    = (p.rows - tail) >> 2;
+    const int t0    = tail + 4 * (int) (((int64_t) blockIdx.x * gl) / G);
+    const int t1    = tail + 4 * (int) (((int64_t) (blockIdx.x + 1) * gl) / G);
+    const int nreg  = full + (t1 > t0);
+    auto      start = [&](int j) { return j < full ? (j * G + (int) blockIdx.x) * R : t0; };
+    auto      rows  = [&](int j) { return j < full ? R : t1 - t0; };
 
-    // The producer (thread 0): the next piece to issue, as (region start, rows, chunk, row).
-    int pq = 0, preg = r0, prr = min(R, r1 - r0), pc = 0, pi = 0;
+    // The producer (thread 0): the next piece to issue, as (region, its start and rows, chunk,
+    // row).
+    int pq = 0, pj = 0, preg = start(0), prr = rows(0), pc = 0, pi = 0;
     auto issue_next = [&]() {
         const int s = pq % ns;
         bar_expect_tx(full + s, pbytes);
@@ -268,8 +274,9 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
             pi = 0;
             if (++pc == p.chunks) {
                 pc = 0;
-                preg += step;
-                prr = min(R, r1 - preg);
+                ++pj;
+                preg = start(pj);
+                prr  = rows(pj);
             }
         }
     };
@@ -282,7 +289,7 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-        while (pq < ns && preg < r1) {
+        while (pq < ns && pj < nreg) {
             issue_next();
         }
     }
@@ -299,8 +306,9 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
     float yv[IT][NP];
     int   qb = 0;      // the region's first piece
     const bool compute = (p.mode & 1) == 0;
-    for (int reg = r0; reg < r1; reg += step) {
-        const int rr = min(R, r1 - reg);
+    for (int j = 0; j < nreg; ++j) {
+        const int reg = start(j);
+        const int rr  = rows(j);
         const int ng = rr >> 2;
 
         float acc[NP][G4][2];
@@ -321,7 +329,7 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
             // The chunk's activations, loaded before its weights are waited for (the warp's
             // blocks of the chunk: kbx = base + BPI it + w + 8P; bytes 128 are zeros); whole
             // rows once.
-            if (p.chunks > 1 || reg == r0) {
+            if (p.chunks > 1 || j == 0) {
 #pragma unroll
                 for (int it = 0; it < IT; ++it) {
 #pragma unroll
@@ -412,7 +420,7 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
             __syncthreads();
             if (threadIdx.x == 0) {
                 const int lim = q0 + rr + ns;
-                while (pq < lim && preg < r1) {
+                while (pq < lim && pj < nreg) {
                     issue_next();
                 }
             }
