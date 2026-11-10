@@ -232,6 +232,13 @@ pub(in crate::cli) struct SwitchArgs {
     /// columns at once (the default: the same token and probability bits). For comparisons.
     #[arg(long, help_heading = HEADING)]
     no_draft_head_q4k_pick_cols: bool,
+    /// Verify steps of 49-128 rows (7-16 sequences drafting 8 tokens) with a BF16 LM head
+    /// (Gemma 4 31B on a GB10): keep the head on ggml's matmul (cuBLAS), soft-cap and argmax
+    /// instead of Legion's head op (the default where it gives cuBLAS's bits: the matmul, the
+    /// soft-cap and every row's argmax in one pass over the weights, the logits written once).
+    /// For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_head_mm: bool,
     /// CUDA, compute capability 7.x-8.x (V100 to RTX 40), steps of 1-8 tokens inside stage
     /// graphs, with this flag an RTX 50 (12.0) too, without the mixer's parts (unmeasured there),
     /// and with this flag a GB10 at 2-8 tokens (without the mixer's parts; ggml's bits
@@ -1383,6 +1390,7 @@ impl SwitchArgs {
             q8_out_mv: self.q8_out_row_mv.then_some(true),
             q4k_head_pick: self.no_draft_head_q4k_pick.then_some(false),
             q4k_head_pick_cols: self.no_draft_head_q4k_pick_cols.then_some(false),
+            head_mm: self.no_head_mm.then_some(false),
             q8_group: if self.no_q8_group {
                 Some(false)
             } else {

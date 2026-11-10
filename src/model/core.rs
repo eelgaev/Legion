@@ -64,6 +64,8 @@ pub use mmq_preq::set_mmq_preq;
 pub(crate) mod norm_rope;
 pub mod nvfp4_once;
 pub use nvfp4_once::set_nvfp4_once;
+pub mod head_mm;
+pub use head_mm::set_head_mm;
 pub mod q4k_head;
 pub use q4k_head::set_q4k_head;
 pub mod q8_group;
@@ -2293,6 +2295,16 @@ impl Model {
         self.linear.mul_mat(ctx, name, w, scale, input_scale, x)
     }
 
+    /// Whether the LM head `name` (`w`) for `x` runs on [`head_mm`]: [`head_mm::takes`], and
+    /// [`Self::mm`] would be a plain matmul of it (no scale, no FP8 activation scale).
+    fn head_mm_takes(&self, name: &str, w: Tensor<'_>, x: Tensor<'_>) -> bool {
+        head_mm::takes(w, x)
+            && linear::scale_name(name).is_none_or(|s| self.w(&s).is_err())
+            && name
+                .strip_suffix(".weight")
+                .is_none_or(|b| self.w(&format!("{b}.input_scale")).is_err())
+    }
+
     /// [`Self::mm`] over the first `rows` rows of `name` only (an MTP head drafting over part
     /// of the vocabulary), or `None` where that cannot be: a scale that is neither per tensor
     /// nor per row ([`linear::first_rows_scale`]).
@@ -3002,11 +3014,20 @@ impl Model {
                         Ok(_) => "output.weight",
                         Err(_) => "token_embd.weight",
                     };
-                    let logits = self.mm(ctx, head, x)?;
-                    let logits = arch.logits(ctx, logits);
-                    let argmax =
-                        crate::model::cluster_select::argmax_of(ctx, logits, self.w(head)?);
-                    (logits, argmax)
+                    let w = self.w(head)?;
+                    match arch.logit_softcap() {
+                        // A BF16 head of verify steps of many sequences, matmul, soft-cap and
+                        // argmax in one pass with ggml's bits (#1181).
+                        Some(cap) if self.head_mm_takes(head, w, x) => {
+                            head_mm::head(ctx, w, x, cap)
+                        }
+                        _ => {
+                            let logits = self.mm(ctx, head, x)?;
+                            let logits = arch.logits(ctx, logits);
+                            let argmax = crate::model::cluster_select::argmax_of(ctx, logits, w);
+                            (logits, argmax)
+                        }
+                    }
                 }
             };
             let (logits, argmax) = (logits.as_output(), argmax.as_output());

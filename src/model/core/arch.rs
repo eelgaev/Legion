@@ -380,6 +380,14 @@ pub trait Arch: Debug + Send + Sync + Any {
         logits
     }
 
+    /// `Some(c)` when [`Self::logits`] is exactly the soft-cap `c · tanh(logits / c)` built as
+    /// `scale(tanh(scale(logits, 1 / c)), c)` (`c` 0: the logits as they are), so the BF16 head
+    /// of verify steps may run on [`crate::model::core::head_mm`]; `None` (the default) keeps
+    /// the core's matmul and [`Self::logits`].
+    fn logit_softcap(&self) -> Option<f32> {
+        None
+    }
+
     // MTP.
 
     /// Whether the architecture has an MTP head implementation ([`Self::build_mtp`]).

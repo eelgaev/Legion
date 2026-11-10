@@ -99,6 +99,9 @@ pub struct Switches {
     pub q4k_head_pick: Option<bool>,
     /// That pick at 2-7 columns ([`crate::model::core::q4k_head::set_pick_cols`]).
     pub q4k_head_pick_cols: Option<bool>,
+    /// The BF16 LM head of verify steps of 49-128 rows as Legion's op (matmul, soft-cap and
+    /// argmax in one pass) where that has cuBLAS's bits ([`crate::model::core::set_head_mm`]).
+    pub head_mm: Option<bool>,
     /// Q8_0 matvecs of one input on Legion's op that quantizes it once
     /// ([`crate::model::core::set_q8_group`]).
     pub q8_group: Option<bool>,
@@ -553,6 +556,7 @@ impl Switches {
         set(self.q8_out_mv, core::q8_head::set_out_mv);
         set(self.q4k_head_pick, core::q4k_head::set_pick);
         set(self.q4k_head_pick_cols, core::q4k_head::set_pick_cols);
+        set(self.head_mm, core::set_head_mm);
         set(self.q8_group, core::set_q8_group);
         if let Some(m) = self.q8_group_parts {
             core::q8_group::set_parts(m);
