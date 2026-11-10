@@ -282,6 +282,7 @@ struct Params {
     n: i32,
     ns: i32,
     chunks: i32,
+    mode: i32,
 }
 
 /// # Safety
@@ -304,6 +305,7 @@ unsafe fn cuda_nvfp4_mvq(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
         n: o.n as i32,
         ns: 0,
         chunks: 0,
+        mode: 0,
     };
     if !(o.w as usize).is_multiple_of(16) {
         return Err("nvfp4_mvq: weight not 16-byte aligned".into());
@@ -311,10 +313,12 @@ unsafe fn cuda_nvfp4_mvq(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
     let dev = launch::device()?;
     let mut plan = plan(o.k, o.rows, dev.smem.min(SMEM_12X))
         .ok_or_else(|| format!("nvfp4_mvq: no ring for k {} rows {}", o.k, o.rows))?;
-    // EXPERIMENT (debug knob, not for the PR): LEGION_MVQ_X=chunks,ns.
+    // EXPERIMENT (debug knob, not for the PR): LEGION_MVQ_X=chunks,ns[,mode].
     if let Ok(v) = std::env::var("LEGION_MVQ_X") {
         let mut it = v.split(',').map(|s| s.parse::<usize>().unwrap_or(0));
         let (c, ns) = (it.next().unwrap_or(0), it.next().unwrap_or(0));
+        p.mode = it.next().unwrap_or(0) as i32;
+        let ns = if ns == 0 { plan.ns } else { ns };
         let c = if c == 0 { plan.chunks } else { c };
         if let Some(q) = Plan::with(o.k, c, ns, dev.smem.min(SMEM_12X)) {
             plan = q;
