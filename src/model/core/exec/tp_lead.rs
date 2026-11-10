@@ -394,7 +394,8 @@ impl Executor {
         let lead = self.tp.as_mut().expect("tensor-parallel lead");
         if profiling && let Some(c) = lead.comm.net() {
             let comm = c.comm().clone();
-            lead.profile.record(&comm, t0.elapsed(), send);
+            let laps = self.step_laps.take();
+            lead.profile.record(&comm, t0.elapsed(), send, laps);
         }
         lead.failed()?;
         out

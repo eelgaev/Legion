@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::par_step::pool::{Launch as PoolLaunch, LaunchPool};
-use super::{Executor, Kept, Stage, read_rows};
+use super::{Executor, Kept, Stage, bounce_for, read_rows};
 use crate::ggml::model_bytes::{Kind, Phase};
 use crate::ggml::{ComputeAllocator, Context, GgmlError, KeptGraph, KeptParts};
 use crate::model::core::{
@@ -548,6 +548,7 @@ impl Executor {
                 piped,
                 bounce,
                 bounce_small,
+                ids_pin,
                 backend,
                 kv,
                 ..
@@ -558,7 +559,8 @@ impl Executor {
             let inputs = Inputs::from_parts(&p.shape, parts, |j| kept.tensor(j));
             let groups = view(&p.groups);
             let spare = &mut self.spare_rows;
-            let o = inputs.output_with(&groups, n_vocab, |t| {
+            let ids = bounce_for(ids_pin, backend, inputs.out_pin_bytes(n_vocab));
+            let o = inputs.output_with(&groups, n_vocab, ids, |t| {
                 read_rows(bounce, bounce_small, spare, backend, t)
             });
             // Model bytes (#391): the piece's graph on this stage and the KV it read; the
