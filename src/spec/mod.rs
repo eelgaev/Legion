@@ -174,6 +174,15 @@ pub struct DraftRequest<'a> {
     pub out: &'a mut Draft,
 }
 
+/// A step's captured rows left on the device ([`ModelDrafter::step_device`], #1181): per layer
+/// of [`ModelDrafter::hidden_layers`], the step graph's output for all its rows, and per
+/// request of the batch the row its positions start at (`ran` rows from `first[i]` on).
+#[derive(Clone, Copy)]
+pub struct DeviceHidden<'a> {
+    pub layers: &'a [crate::ggml::RowsAt],
+    pub first: &'a [usize],
+}
+
 /// A drafter with a forward pass of its own (MTP #38, draft model #184, EAGLE-3 #185, DFlash
 /// #186, DSpark #187). The engine calls [`Self::step`] after every target step that ran any
 /// position of a sequence the drafter follows: prefill chunks (to build its own caches from
@@ -219,6 +228,23 @@ pub trait ModelDrafter: Send {
     /// is safe. 0 (the default): every row.
     fn rows_read_from(&self, _n_tokens: usize, _start: usize, _ran: usize) -> usize {
         0
+    }
+
+    /// The CUDA device this drafter can read a step's captured rows on, where the step graph
+    /// wrote them ([`Self::step_device`]); `None` (the default): only on the host.
+    fn reads_device_rows(&self) -> Option<usize> {
+        None
+    }
+
+    /// [`Self::step`] with the step's rows still on the device: every request's `hidden` is
+    /// empty and its rows are in `rows`, valid until the target runs anything again. Called
+    /// only when [`Self::reads_device_rows`] named that device.
+    fn step_device(
+        &mut self,
+        _batch: &mut [DraftRequest<'_>],
+        _rows: &DeviceHidden<'_>,
+    ) -> Result<(), String> {
+        Err("this drafter reads hidden states on the host only".into())
     }
 }
 

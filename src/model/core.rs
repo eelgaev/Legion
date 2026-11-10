@@ -837,6 +837,11 @@ pub struct StepOutput {
     /// Per captured layer ([`Executor::capture_hidden`]): its output for every token of the
     /// step, `[tokens][n_embd]` in the order of groups, sequences, tokens.
     pub hidden: Vec<Vec<f32>>,
+    /// The same rows left on the device instead ([`Executor::set_hidden_on_device`], #1181):
+    /// per captured layer, its `[n_embd, tokens]` output in the step graph's buffer, valid
+    /// until the executor runs anything again. `hidden` then holds empty vectors. Empty when
+    /// the rows were read back.
+    pub hidden_dev: Vec<crate::ggml::RowsAt>,
 }
 
 impl StepOutput {
@@ -1052,6 +1057,7 @@ impl<'a> Inputs<'a> {
             argmax,
             rows,
             hidden,
+            hidden_dev: Vec::new(),
         }
     }
 
