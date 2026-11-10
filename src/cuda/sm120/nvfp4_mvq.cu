@@ -232,7 +232,7 @@ constexpr int MV_ITERS   = 8;   // a chunk spans at most MV_ITERS / NWG steps of
 // different banks), the partial sums [warp][h][MV_R][column], p.ns mbarriers. Pieces are read
 // in order (region, chunk, row), piece q into slot q % ns.
 template <int NWG>
-__global__ void __launch_bounds__(MV_THREADS + 32, 1) mv(const legion_nvfp4_mvq p) {
+__global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
     pdl_launch_dependents();
 #ifdef LEGION_MVQ_MMA
     using namespace legion_tma;
@@ -331,7 +331,33 @@ __global__ void __launch_bounds__(MV_THREADS + 32, 1) mv(const legion_nvfp4_mvq 
         }
         return;
     }
-    if (!ws && threadIdx.x == 0) {
+    // Warp-parallel issue (exp 2048): warp 0's lanes issue pieces [pq, lim) at once, each piece
+    // from its index (every region but the last has R rows).
+    const bool wpi   = p.exp & 2048;
+    const int  total = (nreg - 1) * p.chunks * R + p.chunks * rows(nreg - 1);
+    auto issue_piece = [&](int q) {
+        const int j   = min(q / (p.chunks * R), nreg - 1);
+        const int rem = q - j * p.chunks * R;
+        const int rj  = rows(j);
+        const int c   = rem / rj;
+        const int i   = rem - c * rj;
+        const int s   = q % ns;
+        bar_expect_tx(full + s, pbytes);
+        bulk_g2s(ring + s * pitch, (const uint8_t *) p.w + (int64_t) (start(j) + i) * p.w_nb1 + c * pbytes,
+                 pbytes, full + s);
+    };
+    auto issue_upto = [&](int lim) {
+        const int hi = min(lim, total);
+        for (int q = pq + lane; q < hi; q += WARP_SIZE) {
+            issue_piece(q);
+        }
+        pq = max(pq, hi);
+    };
+    if (wpi) {
+        if (w == 0) {
+            issue_upto(ns);
+        }
+    } else if (!ws && threadIdx.x == 0) {
         for (int d = 1; d <= pfd; ++d) {
             prefetch_region(d);
         }
@@ -494,7 +520,11 @@ __global__ void __launch_bounds__(MV_THREADS + 32, 1) mv(const legion_nvfp4_mvq 
             // Every warp's reads of the chunk's slots are done (and, at the region's first
             // chunk, the previous region's outputs are read out of the partial sums).
             asm volatile("bar.sync 1, 256;\n" ::: "memory");
-            if (threadIdx.x == 0) {
+            if (wpi) {
+                if (w == 0) {
+                    issue_upto(q0 + r_hi + ns);
+                }
+            } else if (threadIdx.x == 0) {
                 const int lim = q0 + r_hi + ns;
                 while (pq < lim && pj < nreg) {
                     issue_next();

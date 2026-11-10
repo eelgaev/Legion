@@ -353,7 +353,7 @@ unsafe fn cuda_nvfp4_mvq(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
         y: 1,
         z: 1,
     };
-    let ws = exp_env("LEGION_MVQ_EXP", 0) & 1024 != 0;
+    let ws = false; // exp 1024 needs launch bounds of 288 threads (spills): off
     let block = launch::Dim3 {
         x: (WARPS * 32 + if ws { 32 } else { 0 }) as u32,
         y: 1,
