@@ -402,6 +402,9 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, Shape<D>::MINB) paged_prefi
 #endif
 }
 
+// The same kernel for 256-wide heads on consumer Blackwell with warp pairs (namespace pair).
+#include "paged_attn_pair.cuh"
+
 // Whether the current device runs paged_prefill_mma (mma.sync m16n8k16, cp.async: sm_80+).
 bool available() {
     return legion_device::compute_capability() >= 80;
@@ -409,6 +412,13 @@ bool available() {
 
 template <int D, int G, bool C = false>
 int launch(const legion_paged_attn & p, cudaStream_t st) {
+    if constexpr (D == 256) {
+        if (pair::takes(p)) {
+            if (const int rc = pair::launch<D, G, C>(p, st); rc != 1) {
+                return rc;
+            }
+        }
+    }
     static std::atomic<int8_t> opted_in[GGML_CUDA_MAX_DEVICES];
     if (!legion_device::smem_opt_in(opted_in, paged_prefill_mma<D, G, C>, (int) Shape<D>::SMEM)) {
         return 2;
