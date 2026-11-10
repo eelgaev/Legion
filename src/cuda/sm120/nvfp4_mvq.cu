@@ -252,14 +252,14 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
     // Regions: rounds of G R rows, region j of CTA b at rows (j G + b) R, so the CTAs stream
     // neighbouring rows; the last, partial round in nearly equal runs of whole groups.
     const int G     = gridDim.x;
-    const int full  = p.rows / (G * R);
-    const int tail  = full * G * R;
+    const int whole = p.rows / (G * R);
+    const int tail  = whole * G * R;
     const int gl    = (p.rows - tail) >> 2;
     const int t0    = tail + 4 * (int) (((int64_t) blockIdx.x * gl) / G);
     const int t1    = tail + 4 * (int) (((int64_t) (blockIdx.x + 1) * gl) / G);
-    const int nreg  = full + (t1 > t0);
-    auto      start = [&](int j) { return j < full ? (j * G + (int) blockIdx.x) * R : t0; };
-    auto      rows  = [&](int j) { return j < full ? R : t1 - t0; };
+    const int nreg  = whole + (t1 > t0);
+    auto      start = [&](int j) { return j < whole ? (j * G + (int) blockIdx.x) * R : t0; };
+    auto      rows  = [&](int j) { return j < whole ? R : t1 - t0; };
 
     // The producer (thread 0): the next piece to issue, as (region, its start and rows, chunk,
     // row).
