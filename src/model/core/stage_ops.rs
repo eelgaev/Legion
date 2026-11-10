@@ -147,16 +147,12 @@ pub fn capture_safe(op: &ExternalOp, node: &ffi::ggml_tensor) -> bool {
     match op.name {
         // SAFETY: the node of an expert matvec op, which only its builders make.
         "expert_mv" | "expert_mv_glu" => unsafe { super::expert_mv::capture_safe(node) },
+        // Not the reader of a deferred reduce-scatter (#1176): it takes the exchange's buffers
+        // from the communicator.
+        "hc_post_norm" => crate::model::qwen4::post_norm_capture_safe(node),
         name if COMMIT.contains(&name) => COMMIT_CAPTURE.load(Ordering::Relaxed),
         name => listed(name, crate::ggml::stage_graph::small_step()),
     }
-}
-
-/// Whether `op` makes a prompt step's graph run all its units directly
-/// ([`crate::ggml::stage_graph::set_direct_prompt_ops`], #1176): the ops of [`SMALL`], which
-/// such a step launches between its captures otherwise.
-pub fn direct_in_prompt(op: &ExternalOp) -> bool {
-    SMALL.contains(&op.name)
 }
 
 /// Whether a capture may hold an op `name` of [`PURE`] or [`SMALL`], in a small step (`small`)
