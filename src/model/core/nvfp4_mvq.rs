@@ -48,9 +48,8 @@ pub const MAX_N: i64 = 8;
 /// Longest rows (values) of the device-global activation scratch (the kernel's `MAX_K`).
 pub const MAX_K: i64 = 65536;
 
-/// The weights' rows are a multiple of this: the rows a CTA works on at once (16 where they
-/// fit, else 8; [`plan`]).
-pub const ROW_MULTIPLE: i64 = 8;
+/// The weights' rows are a multiple of this: the kernel's groups of rows (one MMA's weights).
+pub const ROW_MULTIPLE: i64 = 4;
 
 /// The weights' rows (values) are a multiple of this: 4 NVFP4 blocks, so a row is whole
 /// 16-byte pieces (the bulk copies' unit).
@@ -65,30 +64,50 @@ const SMEM_12X: usize = 99 * 1024;
 /// The kernel's warps (`MV_WARPS`).
 const WARPS: usize = 8;
 
-/// A launch's shape: regions of `r` rows a CTA, `ns` row slots in its ring, `smem` bytes of
-/// dynamic shared memory.
+/// Rows of a CTA's region (`MV_R`).
+const REGION: usize = 16;
+
+/// Pieces the ring holds beyond a chunk of a region (the next chunk's first rows in flight).
+const AHEAD: usize = 4;
+
+/// A launch's shape: each row in `chunks` pieces along K, `ns` piece slots in a CTA's ring,
+/// `smem` bytes of dynamic shared memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Plan {
-    pub r: usize,
+    pub chunks: usize,
     pub ns: usize,
     pub smem: usize,
 }
 
-/// The kernel's shape for rows of `k` values on a device with `smem` bytes of shared memory a
-/// CTA: 16-row regions where the ring holds a region and 4 rows of the next one, else 8-row
-/// regions and one row of the next; `None` when not even that fits (or the rows are not whole
-/// regions). The ring takes all the shared memory there is, up to 64 rows.
-pub fn plan(k: usize, rows: usize, smem: usize) -> Option<Plan> {
-    let pitch = k / 64 * BLOCK_BYTES + 16;
-    [(16, 4), (8, 1)].into_iter().find_map(|(r, ahead)| {
-        let part = WARPS * 2 * r * 8 * 4;
-        let ns = (smem.checked_sub(part)? / (pitch + 8)).min(64);
-        (rows.is_multiple_of(r) && ns >= r + ahead).then_some(Plan {
-            r,
+impl Plan {
+    /// The plan for rows of `k` values in `chunks` pieces with `ns` slots, if it fits in `smem`
+    /// bytes (and the pieces are whole 16-byte units).
+    pub fn with(k: usize, chunks: usize, ns: usize, smem: usize) -> Option<Plan> {
+        let bpr = k / 64;
+        if chunks == 0 || !bpr.is_multiple_of(4 * chunks) || ns <= REGION {
+            return None;
+        }
+        let pitch = bpr / chunks * BLOCK_BYTES + 16;
+        let part = WARPS * 2 * REGION * 8 * 4;
+        let bytes = ns * (pitch + 8) + part;
+        (bytes <= smem).then_some(Plan {
+            chunks,
             ns,
-            smem: ns * pitch + part + ns * 8,
+            smem: bytes,
         })
-    })
+    }
+}
+
+/// The kernel's shape for rows of `k` values on a device with `smem` bytes of shared memory a
+/// CTA: the fewest pieces a row (1, 2 or 4) whose ring holds a chunk of a region and [`AHEAD`]
+/// more pieces; `None` when none fits (or the rows are not whole groups).
+pub fn plan(k: usize, rows: usize, smem: usize) -> Option<Plan> {
+    if !rows.is_multiple_of(ROW_MULTIPLE as usize) {
+        return None;
+    }
+    [1, 2, 4]
+        .into_iter()
+        .find_map(|c| Plan::with(k, c, REGION + AHEAD, smem))
 }
 
 static ON: AtomicBool = AtomicBool::new(false);
@@ -240,11 +259,11 @@ unsafe fn cpu_nvfp4_mvq(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
     }
 }
 
-/// The matvec of the kernel table for `n` columns and regions of `r` rows: ggml's warps for the
-/// column count (4 up to 4 columns, 2 above), 16-row regions first.
+/// The matvec of the kernel table for `n` columns: ggml's warps for the column count (4 up to
+/// 4 columns, 2 above).
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-fn kernel_index(n: usize, r: usize) -> usize {
-    1 + usize::from(n > 4) + 2 * usize::from(r != 16)
+fn kernel_index(n: usize) -> usize {
+    1 + usize::from(n > 4)
 }
 
 /// `legion_nvfp4_mvq` of `src/cuda/sm120/nvfp4_mvq.cu`.
@@ -262,6 +281,7 @@ struct Params {
     rows: i32,
     n: i32,
     ns: i32,
+    chunks: i32,
 }
 
 /// # Safety
@@ -283,6 +303,7 @@ unsafe fn cuda_nvfp4_mvq(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
         rows: o.rows as i32,
         n: o.n as i32,
         ns: 0,
+        chunks: 0,
     };
     if !(o.w as usize).is_multiple_of(16) {
         return Err("nvfp4_mvq: weight not 16-byte aligned".into());
@@ -290,24 +311,19 @@ unsafe fn cuda_nvfp4_mvq(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
     let dev = launch::device()?;
     let mut plan = plan(o.k, o.rows, dev.smem.min(SMEM_12X))
         .ok_or_else(|| format!("nvfp4_mvq: no ring for k {} rows {}", o.k, o.rows))?;
-    // EXPERIMENT (debug knobs, not for the PR): force 8-row regions, cap the ring.
+    // EXPERIMENT (debug knob, not for the PR): LEGION_MVQ_X=chunks,ns.
     if let Ok(v) = std::env::var("LEGION_MVQ_X") {
         let mut it = v.split(',').map(|s| s.parse::<usize>().unwrap_or(0));
-        let (r, ns) = (it.next().unwrap_or(0), it.next().unwrap_or(0));
-        let pitch = o.k / 64 * BLOCK_BYTES + 16;
-        if r == 8 || r == 16 {
-            plan.r = r;
-        }
-        let part = WARPS * 2 * plan.r * 8 * 4;
-        let max_ns = ((dev.smem.min(SMEM_12X) - part) / (pitch + 8)).min(64);
-        if ns > plan.r && ns <= max_ns {
-            plan.ns = ns;
+        let (c, ns) = (it.next().unwrap_or(0), it.next().unwrap_or(0));
+        let c = if c == 0 { plan.chunks } else { c };
+        if let Some(q) = Plan::with(o.k, c, ns, dev.smem.min(SMEM_12X)) {
+            plan = q;
         } else {
-            plan.ns = max_ns;
+            return Err(format!("nvfp4_mvq: LEGION_MVQ_X={v} does not fit"));
         }
-        plan.smem = plan.ns * pitch + part + plan.ns * 8;
     }
     p.ns = plan.ns as i32;
+    p.chunks = plan.chunks as i32;
     let quantize = launch::Dim3 {
         x: o.k.div_ceil(256) as u32,
         y: o.n as u32,
@@ -321,9 +337,9 @@ unsafe fn cuda_nvfp4_mvq(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
         &mut p,
         stream,
     )?;
-    // One CTA per SM, each walking its regions.
+    // One CTA per SM, each taking a run of rows.
     let grid = launch::Dim3 {
-        x: (o.rows / plan.r).min(dev.sms) as u32,
+        x: (o.rows / ROW_MULTIPLE as usize).min(dev.sms) as u32,
         y: 1,
         z: 1,
     };
@@ -332,14 +348,7 @@ unsafe fn cuda_nvfp4_mvq(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
         y: 1,
         z: 1,
     };
-    launch::launch(
-        kernel_index(o.n, plan.r),
-        grid,
-        block,
-        plan.smem,
-        &mut p,
-        stream,
-    )
+    launch::launch(kernel_index(o.n), grid, block, plan.smem, &mut p, stream)
 }
 
 #[cfg(feature = "cuda")]
@@ -393,7 +402,7 @@ mod launch {
     }
 
     /// Entries of the kernel table.
-    const KERNELS: usize = 5;
+    const KERNELS: usize = 3;
     const DEV_ATTR_SM_COUNT: c_int = 16;
     const DEV_ATTR_SMEM_OPTIN: c_int = 97;
     const DEV_ATTR_CC_MAJOR: c_int = 75;

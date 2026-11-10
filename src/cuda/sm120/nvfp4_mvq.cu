@@ -71,9 +71,10 @@ struct legion_nvfp4_mvq {
     int64_t       dst_nb1;  // floats between dst's columns
     const float * scale;    // F32 [1], or null
     int32_t       k;        // a multiple of 256, at most MAX_K
-    int32_t       rows;     // a multiple of the variant's R
+    int32_t       rows;     // a multiple of 4
     int32_t       n;        // 1-8
-    int32_t       ns;       // row slots of the ring (more than R)
+    int32_t       ns;       // piece slots of the ring (more than 16)
+    int32_t       chunks;   // pieces a row (each whole 16-byte units)
 };
 }
 
@@ -190,32 +191,38 @@ __device__ __forceinline__ void bulk_g2s(void * dst, const void * src, uint32_t 
 
 constexpr int MV_WARPS   = 8;
 constexpr int MV_THREADS = MV_WARPS * WARP_SIZE;
+constexpr int MV_R       = 16;  // rows of a region
 
-// `w @ x` for regions of R rows (R / 4 groups of 4) with ggml's MMVQ order for NWG of its warps
-// (4: 1-4 columns, 2: 5-8). Thread (g, t) of a warp (lane 4g + t) takes column g, the rows
-// 2 (t % 2) and 2 (t % 2) + 1 of each group, and half h = t / 2 of each block: the C entries
-// of its own sub-block parity, then the other parity's from lane t ^ 2. ggml's warp l (of NWG)
-// walks the residues 16 l + 0..15 (its lane 2 (r % 16) + h), each over the blocks r + BPI i
-// (BPI = 16 NWG, ggml's blocks_per_iter); warp w here holds the residues r = w + 8P, a partial
-// sum for each.
+// `w @ x` with ggml's MMVQ order for NWG of its warps (4: 1-4 columns, 2: 5-8). CTA b takes the
+// rows [4 (b G4s / G), 4 ((b + 1) G4s / G)) of the G4s groups of 4 (G CTAs, one per SM), in
+// regions of up to MV_R rows, each row in p.chunks pieces along K (a chunk of the region's rows
+// at a time, the partial sums carried from chunk to chunk: every chain keeps its K order).
+// Thread (g, t) of a warp (lane 4g + t) takes column g, the rows 2 (t % 2) and 2 (t % 2) + 1 of
+// each group, and half h = t / 2 of each block: the C entries of its own sub-block parity, then
+// the other parity's from lane t ^ 2. ggml's warp l (of NWG) walks the residues 16 l + 0..15
+// (its lane 2 (r % 16) + h), each over the blocks r + BPI i (BPI = 16 NWG, ggml's
+// blocks_per_iter); warp w here holds the residues r = w + 8P, a partial sum for each.
 //
-// Dynamic shared memory: NS row slots of row_bytes + 16 (the 4 rows of a group land in
-// different banks), the partial sums [warp][h][R][column], NS mbarriers.
-template <int NWG, int R>
+// Dynamic shared memory: p.ns piece slots of piece_bytes + 16 (the 4 rows of a group land in
+// different banks), the partial sums [warp][h][MV_R][column], p.ns mbarriers. Pieces are read
+// in order (region, chunk, row), piece q into slot q % ns.
+template <int NWG>
 __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
     pdl_launch_dependents();
 #ifdef LEGION_MVQ_MMA
     using namespace legion_tma;
+    constexpr int R   = MV_R;
     constexpr int BPI = 16 * NWG;
     constexpr int NP  = BPI / MV_WARPS;
     constexpr int G4  = R / 4;
-    static_assert(NP % 2 == 0 && R % 4 == 0, "residues in pairs of ggml lanes 16 apart, whole groups");
+    static_assert(NP % 2 == 0, "residues in pairs of ggml lanes 16 apart");
     extern __shared__ __align__(16) uint8_t smem[];
 
-    const int bpr       = p.k >> 6;
-    const int row_bytes = bpr * 36;
-    const int pitch     = row_bytes + 16;
-    const int ns        = p.ns;
+    const int bpr    = p.k >> 6;
+    const int cb     = bpr / p.chunks;  // blocks of a piece
+    const int pbytes = cb * 36;
+    const int pitch  = pbytes + 16;
+    const int ns     = p.ns;
     uint8_t *  ring = smem;
     float *    part = reinterpret_cast<float *>(smem + ns * pitch);
     uint64_t * full = reinterpret_cast<uint64_t *>(part + MV_WARPS * 2 * R * 8);
@@ -227,17 +234,28 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
     const int hp   = t >> 1;        // the thread's half and sub-block parity
     const int ra   = 2 * (t & 1);   // its first row of a group
 
-    const int G       = gridDim.x;
-    const int regions = (p.rows / R - (int) blockIdx.x + G - 1) / G;
-    const int total   = regions * R;  // rows this CTA reads, in order
+    const int G   = gridDim.x;
+    const int g4s = p.rows >> 2;
+    const int r0  = 4 * (int) (((int64_t) blockIdx.x * g4s) / G);
+    const int r1  = 4 * (int) (((int64_t) (blockIdx.x + 1) * g4s) / G);
+    const int total = (r1 - r0) * p.chunks;  // pieces this CTA reads
 
-    // Row q of this CTA (region q / R, row q % R of it) into slot q % NS.
-    auto issue = [&](int q) {
-        const int     j    = q / R;
-        const int64_t grow = (int64_t) ((int) blockIdx.x + j * G) * R + (q - j * R);
-        const int     s    = q % ns;
-        bar_expect_tx(full + s, row_bytes);
-        bulk_g2s(ring + s * pitch, (const uint8_t *) p.w + grow * p.w_nb1, row_bytes, full + s);
+    // The producer (thread 0): the next piece to issue, as (region start, rows, chunk, row).
+    int pq = 0, preg = r0, prr = min(R, r1 - r0), pc = 0, pi = 0;
+    auto issue_next = [&]() {
+        const int s = pq % ns;
+        bar_expect_tx(full + s, pbytes);
+        bulk_g2s(ring + s * pitch, (const uint8_t *) p.w + (int64_t) (preg + pi) * p.w_nb1 + pc * pbytes,
+                 pbytes, full + s);
+        ++pq;
+        if (++pi == prr) {
+            pi = 0;
+            if (++pc == p.chunks) {
+                pc = 0;
+                preg += R;
+                prr = min(R, r1 - preg);
+            }
+        }
     };
 
     if (threadIdx.x == 0) {
@@ -248,8 +266,8 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-        for (int q = 0; q < min(ns, total); ++q) {
-            issue(q);
+        while (pq < min(ns, total)) {
+            issue_next();
         }
     }
 
@@ -261,21 +279,10 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
     const bool    scaled = p.scale != nullptr;
     const float   sc     = scaled ? *p.scale : 1.0f;
 
-    for (int j = 0; j < regions; ++j) {
-        const int q0 = j * R;
-        for (int i = 0; i < R; ++i) {
-            bar_wait(full + (q0 + i) % ns, (uint32_t) ((q0 + i) / ns) & 1);
-        }
-        // Shared addresses: the B fragment's row (g % 4 of each group) at its sub-block
-        // (g / 4: the parity) and bytes 2t, 2t + 1; the scale words' rows ra, ra + 1 at the
-        // half's two scales.
-        uint32_t rb[G4], rs0[G4], rs1[G4];
-#pragma unroll
-        for (int c = 0; c < G4; ++c) {
-            rb[c]  = saddr(ring + ((q0 + 4 * c + (g & 3)) % ns) * pitch) + 4 + 8 * (g >> 2) + 2 * t;
-            rs0[c] = saddr(ring + ((q0 + 4 * c + ra) % ns) * pitch) + 2 * hp;
-            rs1[c] = saddr(ring + ((q0 + 4 * c + ra + 1) % ns) * pitch) + 2 * hp;
-        }
+    int qb = 0;  // the region's first piece
+    for (int reg = r0; reg < r1; reg += R) {
+        const int rr = min(R, r1 - reg);
+        const int ng = rr >> 2;
 
         float acc[NP][G4][2];
 #pragma unroll
@@ -287,94 +294,121 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
             }
         }
 
-        for (int it0 = 0; it0 < bpr; it0 += BPI) {
+        for (int ch = 0; ch < p.chunks; ++ch) {
+            const int q0 = qb + ch * rr;
+            for (int i = 0; i < rr; ++i) {
+                bar_wait(full + (q0 + i) % ns, (uint32_t) ((q0 + i) / ns) & 1);
+            }
+            // Shared addresses: the B fragment's row (g % 4 of each group) at its sub-block
+            // (g / 4: the parity) and bytes 2t, 2t + 1; the scale words' rows ra, ra + 1 at the
+            // half's two scales.
+            uint32_t rb[G4], rs0[G4], rs1[G4];
 #pragma unroll
-            for (int P = 0; P < NP; ++P) {
-                const int kbx = it0 + w + MV_WARPS * P;
-                if (kbx >= bpr) {
-                    break;
-                }
-                uint4 x01 = make_uint4(0, 0, 0, 0);
-                uint4 x23 = make_uint4(0, 0, 0, 0);
-                float y   = 0.0f;
-                if (col_ok) {
-                    x01 = xh[(int64_t) kbx * 8];
-                    x23 = xh[(int64_t) kbx * 8 + 1];
-                    y   = yd[kbx * 2 * MAX_N];
-                }
+            for (int c = 0; c < G4; ++c) {
+                rb[c]  = saddr(ring + ((q0 + 4 * c + (g & 3)) % ns) * pitch) + 4 + 8 * (g >> 2) + 2 * t;
+                rs0[c] = saddr(ring + ((q0 + 4 * c + ra) % ns) * pitch) + 2 * hp;
+                rs1[c] = saddr(ring + ((q0 + 4 * c + ra + 1) % ns) * pitch) + 2 * hp;
+            }
+            const int lo = ch * cb;
+            const int hi = lo + cb;
+            for (int it0 = lo - lo % BPI; it0 < hi; it0 += BPI) {
 #pragma unroll
-                for (int c = 0; c < G4; ++c) {
-                    const uint32_t o = kbx * 36;
-                    // MMA 0: sub-blocks 0 and 1; MMA 1: 2 and 3.
-                    uint32_t b00, b01, b10, b11;
-                    e2m1x4(lds_u16(rb[c] + o), b00, b01);
-                    e2m1x4(lds_u16(rb[c] + o + 16), b10, b11);
-                    float c0[4], c1[4];
-                    mma16816(c0, x01.x, x01.z, x01.y, x01.w, b00, b01);
-                    mma16816(c1, x23.x, x23.z, x23.y, x23.w, b10, b11);
-                    // Own parity: rows ra, ra + 1 of sub-block 2 * MMA + hp (C rows g or
-                    // g + 8, columns 2t, 2t + 1). The half's MMA is hp; the other one goes to
-                    // lane t ^ 2, whose half it is.
-                    const float mine0 = hp ? c1[2] : c0[0];
-                    const float mine1 = hp ? c1[3] : c0[1];
-                    const float send0 = hp ? c0[2] : c1[0];
-                    const float send1 = hp ? c0[3] : c1[1];
-                    const float recv0 = __shfl_xor_sync(0xffffffffu, send0, 2);
-                    const float recv1 = __shfl_xor_sync(0xffffffffu, send1, 2);
-                    // Sub-blocks 2 hp (even: lane t & 1's) and 2 hp + 1.
-                    const float s_lo[2] = {hp ? recv0 : mine0, hp ? recv1 : mine1};
-                    const float s_hi[2] = {hp ? mine0 : recv0, hp ? mine1 : recv1};
-                    float dw[2][2];
-                    ue4m3x2(lds_u16(rs0[c] + o), dw[0][0], dw[0][1]);
-                    ue4m3x2(lds_u16(rs1[c] + o), dw[1][0], dw[1][1]);
+                for (int P = 0; P < NP; ++P) {
+                    const int kbx = it0 + w + MV_WARPS * P;
+                    if (kbx < lo) {
+                        continue;
+                    }
+                    if (kbx >= hi) {
+                        break;
+                    }
+                    uint4 x01 = make_uint4(0, 0, 0, 0);
+                    uint4 x23 = make_uint4(0, 0, 0, 0);
+                    float y   = 0.0f;
+                    if (col_ok) {
+                        x01 = xh[(int64_t) kbx * 8];
+                        x23 = xh[(int64_t) kbx * 8 + 1];
+                        y   = yd[kbx * 2 * MAX_N];
+                    }
+                    const uint32_t o = (kbx - lo) * 36;
 #pragma unroll
-                    for (int rr = 0; rr < 2; ++rr) {
-                        // vec_dot_nvfp4_q8_1's half hp: sub-blocks 2 hp and 2 hp + 1.
-                        float sum = 0.0f;
-                        {
-                            const float d = dw[rr][0] * y;
-                            sum += d * s_lo[rr];
+                    for (int c = 0; c < G4; ++c) {
+                        if (c >= ng) {
+                            break;
                         }
-                        {
-                            const float d = dw[rr][1] * y;
-                            sum += d * s_hi[rr];
+                        // MMA 0: sub-blocks 0 and 1; MMA 1: 2 and 3.
+                        uint32_t b00, b01, b10, b11;
+                        e2m1x4(lds_u16(rb[c] + o), b00, b01);
+                        e2m1x4(lds_u16(rb[c] + o + 16), b10, b11);
+                        float c0[4], c1[4];
+                        mma16816(c0, x01.x, x01.z, x01.y, x01.w, b00, b01);
+                        mma16816(c1, x23.x, x23.z, x23.y, x23.w, b10, b11);
+                        // Own parity: rows ra, ra + 1 of sub-block 2 * MMA + hp (C rows g or
+                        // g + 8, columns 2t, 2t + 1). The half's MMA is hp; the other one goes
+                        // to lane t ^ 2, whose half it is.
+                        const float mine0 = hp ? c1[2] : c0[0];
+                        const float mine1 = hp ? c1[3] : c0[1];
+                        const float send0 = hp ? c0[2] : c1[0];
+                        const float send1 = hp ? c0[3] : c1[1];
+                        const float recv0 = __shfl_xor_sync(0xffffffffu, send0, 2);
+                        const float recv1 = __shfl_xor_sync(0xffffffffu, send1, 2);
+                        // Sub-blocks 2 hp (even: lane t & 1's) and 2 hp + 1.
+                        const float s_lo[2] = {hp ? recv0 : mine0, hp ? recv1 : mine1};
+                        const float s_hi[2] = {hp ? mine0 : recv0, hp ? mine1 : recv1};
+                        float dw[2][2];
+                        ue4m3x2(lds_u16(rs0[c] + o), dw[0][0], dw[0][1]);
+                        ue4m3x2(lds_u16(rs1[c] + o), dw[1][0], dw[1][1]);
+#pragma unroll
+                        for (int rr2 = 0; rr2 < 2; ++rr2) {
+                            // vec_dot_nvfp4_q8_1's half hp: sub-blocks 2 hp and 2 hp + 1.
+                            float sum = 0.0f;
+                            {
+                                const float d = dw[rr2][0] * y;
+                                sum += d * s_lo[rr2];
+                            }
+                            {
+                                const float d = dw[rr2][1] * y;
+                                sum += d * s_hi[rr2];
+                            }
+                            acc[P][c][rr2] += sum;
                         }
-                        acc[P][c][rr] += sum;
                     }
                 }
             }
+            // Every warp's reads of the chunk's slots are done (and, at the region's first
+            // chunk, the previous region's outputs are read out of the partial sums).
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                const int lim = min(q0 + rr + ns, total);
+                while (pq < lim) {
+                    issue_next();
+                }
+            }
         }
+        qb += p.chunks * rr;
 
-        // The previous region's outputs are read out before its partial sums are overwritten.
-        __syncthreads();
 #pragma unroll
         for (int c = 0; c < G4; ++c) {
+            if (c >= ng) {
+                break;
+            }
 #pragma unroll
-            for (int rr = 0; rr < 2; ++rr) {
+            for (int rr2 = 0; rr2 < 2; ++rr2) {
                 // ggml's cross-warp adds (warp l = P / 2: warp 0's sum, then 1.., in order),
                 // then the butterfly's lanes 16 apart (P's low bit).
                 float v[2];
 #pragma unroll
                 for (int b = 0; b < 2; ++b) {
-                    v[b] = acc[b][c][rr];
+                    v[b] = acc[b][c][rr2];
 #pragma unroll
                     for (int l = 1; l < NWG; ++l) {
-                        v[b] += acc[2 * l + b][c][rr];
+                        v[b] += acc[2 * l + b][c][rr2];
                     }
                 }
-                part[((w * 2 + hp) * R + 4 * c + ra + rr) * 8 + g] = v[0] + v[1];
+                part[((w * 2 + hp) * R + 4 * c + ra + rr2) * 8 + g] = v[0] + v[1];
             }
         }
-        // Every warp's reads of the region's slots and its partial sums are done.
         __syncthreads();
-        if (threadIdx.x == 0) {
-            for (int i = 0; i < R; ++i) {
-                if (ns + q0 + i < total) {
-                    issue(ns + q0 + i);
-                }
-            }
-        }
-        if (threadIdx.x < R * 8) {
+        if (threadIdx.x < rr * 8) {
             const int row = threadIdx.x >> 3;
             const int col = threadIdx.x & 7;
             if (col < p.n) {
@@ -394,7 +428,7 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
                 if (scaled) {
                     v *= sc;
                 }
-                p.dst[col * p.dst_nb1 + (int64_t) ((int) blockIdx.x + j * G) * R + row] = v;
+                p.dst[col * p.dst_nb1 + reg + row] = v;
             }
         }
     }
@@ -405,10 +439,10 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
 
 }  // namespace
 
-// The kernels for the host stubs: the quantization, then mv<NWG, R> for (NWG, R) = (4, 16),
-// (2, 16), (4, 8), (2, 8) (src/model/core/nvfp4_mvq.rs's kernel index).
-extern "C" const void * const legion_nvfp4_mvq_kernels[5] = {
-    reinterpret_cast<const void *>(&quantize),  reinterpret_cast<const void *>(&mv<4, 16>),
-    reinterpret_cast<const void *>(&mv<2, 16>), reinterpret_cast<const void *>(&mv<4, 8>),
-    reinterpret_cast<const void *>(&mv<2, 8>),
+// The kernels for the host stubs: the quantization, then mv<NWG> for NWG = 4, 2
+// (src/model/core/nvfp4_mvq.rs's kernel index).
+extern "C" const void * const legion_nvfp4_mvq_kernels[3] = {
+    reinterpret_cast<const void *>(&quantize),
+    reinterpret_cast<const void *>(&mv<4>),
+    reinterpret_cast<const void *>(&mv<2>),
 };
