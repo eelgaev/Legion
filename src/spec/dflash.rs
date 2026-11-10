@@ -162,6 +162,8 @@ pub struct DflashDrafter {
     pool: Option<cache::CachePool>,
     /// The most sequences the engine runs at once: the pool's slots.
     max_seqs: usize,
+    /// The pool could not be allocated: every sequence has a cache of its own.
+    pool_failed: bool,
 }
 
 /// Most idle caches kept for the next sequences.
@@ -360,6 +362,7 @@ impl DflashDrafter {
             spare: Vec::new(),
             pool: None,
             max_seqs: target.max_seqs.max(1),
+            pool_failed: false,
         })
     }
 
@@ -402,22 +405,32 @@ impl DflashDrafter {
     }
 
     /// `--spec-draft-batched-attn`: a fresh cache in a free slot of the pool (made on first
-    /// use, a slot for each of the engine's sequences); `None` without the flag or with every
-    /// slot taken (that sequence then has a cache of its own and attends alone).
+    /// use, a slot for each of the engine's sequences); `None` without the flag, for a drafter
+    /// without DFlash 2's batched pass, when the pool could not be allocated or with every slot
+    /// taken (that sequence then has a cache of its own and attends alone).
     fn pooled_cache(&mut self) -> Result<Option<cache::SeqCache>, String> {
-        if !self.opts.batched_attn {
+        if !self.opts.batched_attn || self.model.selector().is_none() || self.pool_failed {
             return Ok(None);
         }
         let cfg = &self.model.cfg;
         if self.pool.is_none() {
-            let pool = cache::CachePool::new(
+            let pool = match cache::CachePool::new(
                 cfg,
                 self.backend.buffer_type(),
                 cfg.block_size,
                 self.model.window,
                 self.max_seqs,
-            )
-            .map_err(|e| format!("cannot allocate the drafter's cache pool: {e}"))?;
+            ) {
+                Ok(pool) => pool,
+                Err(e) => {
+                    tracing::warn!(
+                        "cannot allocate the drafter's cache pool ({e}): drafting attends per \
+                         sequence"
+                    );
+                    self.pool_failed = true;
+                    return Ok(None);
+                }
+            };
             tracing::info!(
                 slots = pool.slots(),
                 cells = pool.cells(),

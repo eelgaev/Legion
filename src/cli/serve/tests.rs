@@ -386,6 +386,11 @@ fn spec_draft_batched_attn_flag() {
     assert!(!spec(&base).unwrap().draft_batched_attn);
     let on = [&base[..], &["--spec-draft-batched-attn"]].concat();
     assert!(spec(&on).unwrap().draft_batched_attn);
+    for other in [&[][..], &["--spec", "dspark", "--spec-draft", "d"]] {
+        let argv = [other, &["--spec-draft-batched-attn"]].concat();
+        let e = spec(&argv).unwrap_err().to_string();
+        assert!(e.contains("--spec-draft-batched-attn needs"), "{e}");
+    }
 }
 
 fn serve_args(argv: &[&str]) -> Box<ServeArgs> {

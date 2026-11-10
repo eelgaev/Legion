@@ -1638,6 +1638,10 @@ impl EngineArgs {
                 || matches!(kind, SpecKind::Dflash | SpecKind::Mtp),
             "--spec-draft-lm-head needs --spec dflash|mtp"
         );
+        anyhow::ensure!(
+            !self.draft_settings.spec_draft_batched_attn || kind == SpecKind::Dflash,
+            "--spec-draft-batched-attn needs --spec dflash"
+        );
         if kind == SpecKind::None {
             anyhow::ensure!(
                 self.spec_draft.is_none(),
