@@ -48,15 +48,48 @@ pub const MAX_N: i64 = 8;
 /// Longest rows (values) of the device-global activation scratch (the kernel's `MAX_K`).
 pub const MAX_K: i64 = 65536;
 
-/// The weights' rows are a multiple of this: a CTA's rows.
-pub const ROW_MULTIPLE: i64 = 16;
+/// The weights' rows are a multiple of this: the rows a CTA works on at once (16 where they
+/// fit, else 8; [`plan`]).
+pub const ROW_MULTIPLE: i64 = 8;
 
-/// The weights' rows (values) are a multiple of this: 4 NVFP4 blocks, so the kernel's
-/// stages of 16 blocks end on whole 16-byte loads.
+/// The weights' rows (values) are a multiple of this: 4 NVFP4 blocks, so a row is whole
+/// 16-byte pieces (the bulk copies' unit).
 const K_MULTIPLE: i64 = 256;
 
 /// Bytes per NVFP4 block.
 const BLOCK_BYTES: usize = 36;
+
+/// Shared memory a CTA may take on compute capability 12.x (99 KiB; the launch asks the device).
+const SMEM_12X: usize = 99 * 1024;
+
+/// The kernel's warps (`MV_WARPS`).
+const WARPS: usize = 8;
+
+/// A launch's shape: regions of `r` rows a CTA, `ns` row slots in its ring, `smem` bytes of
+/// dynamic shared memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Plan {
+    pub r: usize,
+    pub ns: usize,
+    pub smem: usize,
+}
+
+/// The kernel's shape for rows of `k` values on a device with `smem` bytes of shared memory a
+/// CTA: 16-row regions where the ring holds a region and 4 rows of the next one, else 8-row
+/// regions and one row of the next; `None` when not even that fits (or the rows are not whole
+/// regions). The ring takes all the shared memory there is, up to 64 rows.
+pub fn plan(k: usize, rows: usize, smem: usize) -> Option<Plan> {
+    let pitch = k / 64 * BLOCK_BYTES + 16;
+    [(16, 4), (8, 1)].into_iter().find_map(|(r, ahead)| {
+        let part = WARPS * 2 * r * 8 * 4;
+        let ns = (smem.checked_sub(part)? / (pitch + 8)).min(64);
+        (rows.is_multiple_of(r) && ns >= r + ahead).then_some(Plan {
+            r,
+            ns,
+            smem: ns * pitch + part + ns * 8,
+        })
+    })
+}
 
 static ON: AtomicBool = AtomicBool::new(false);
 static GPU: AtomicBool = AtomicBool::new(false);
@@ -108,6 +141,7 @@ pub fn fits(w: Tensor<'_>, x: Tensor<'_>, scale: Option<Tensor<'_>>) -> bool {
         && rows > 0
         && rows % ROW_MULTIPLE == 0
         && rows <= i32::MAX as i64
+        && plan(k as usize, rows as usize, SMEM_12X).is_some()
         && w2 == 1
         && w3 == 1
         && (1..=MAX_N).contains(&n)
@@ -206,11 +240,11 @@ unsafe fn cpu_nvfp4_mvq(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
     }
 }
 
-/// The matvec of the kernel table for `n` columns: ggml's warps for the column count (4 up to
-/// 4 columns, 2 above).
+/// The matvec of the kernel table for `n` columns and regions of `r` rows: ggml's warps for the
+/// column count (4 up to 4 columns, 2 above), 16-row regions first.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-fn kernel_index(n: usize) -> usize {
-    1 + usize::from(n > 4)
+fn kernel_index(n: usize, r: usize) -> usize {
+    1 + usize::from(n > 4) + 2 * usize::from(r != 16)
 }
 
 /// `legion_nvfp4_mvq` of `src/cuda/sm120/nvfp4_mvq.cu`.
@@ -227,6 +261,7 @@ struct Params {
     k: i32,
     rows: i32,
     n: i32,
+    ns: i32,
 }
 
 /// # Safety
@@ -247,7 +282,15 @@ unsafe fn cuda_nvfp4_mvq(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
         k: o.k as i32,
         rows: o.rows as i32,
         n: o.n as i32,
+        ns: 0,
     };
+    if !(o.w as usize).is_multiple_of(16) {
+        return Err("nvfp4_mvq: weight not 16-byte aligned".into());
+    }
+    let dev = launch::device()?;
+    let plan = plan(o.k, o.rows, dev.smem.min(SMEM_12X))
+        .ok_or_else(|| format!("nvfp4_mvq: no ring for k {} rows {}", o.k, o.rows))?;
+    p.ns = plan.ns as i32;
     let quantize = launch::Dim3 {
         x: o.k.div_ceil(256) as u32,
         y: o.n as u32,
@@ -257,19 +300,29 @@ unsafe fn cuda_nvfp4_mvq(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
         0,
         quantize,
         launch::Dim3 { x: 256, y: 1, z: 1 },
+        0,
         &mut p,
         stream,
     )?;
-    if !(o.w as usize).is_multiple_of(16) {
-        return Err("nvfp4_mvq: weight not 16-byte aligned".into());
-    }
+    // One CTA per SM, each walking its regions.
     let grid = launch::Dim3 {
-        x: (o.rows / ROW_MULTIPLE as usize) as u32,
+        x: (o.rows / plan.r).min(dev.sms) as u32,
         y: 1,
         z: 1,
     };
-    let block = launch::Dim3 { x: 128, y: 1, z: 1 };
-    launch::launch(kernel_index(o.n), grid, block, &mut p, stream)
+    let block = launch::Dim3 {
+        x: (WARPS * 32) as u32,
+        y: 1,
+        z: 1,
+    };
+    launch::launch(
+        kernel_index(o.n, plan.r),
+        grid,
+        block,
+        plan.smem,
+        &mut p,
+        stream,
+    )
 }
 
 #[cfg(feature = "cuda")]
@@ -310,7 +363,7 @@ mod launch {
     unsafe extern "C" {
         /// The kernels as the CUDA runtime knows them (their host stubs): the quantization,
         /// then the matvecs (`super::kernel_index`).
-        static legion_nvfp4_mvq_kernels: [*const c_void; 3];
+        static legion_nvfp4_mvq_kernels: [*const c_void; KERNELS];
         fn cudaLaunchKernelExC(
             config: *const LaunchConfig,
             func: *const c_void,
@@ -318,51 +371,106 @@ mod launch {
         ) -> c_int;
         fn cudaGetDevice(device: *mut c_int) -> c_int;
         fn cudaDeviceGetAttribute(value: *mut c_int, attr: c_int, device: c_int) -> c_int;
+        fn cudaFuncSetAttribute(func: *const c_void, attr: c_int, value: c_int) -> c_int;
         fn cudaGetLastError() -> c_int;
     }
 
+    /// Entries of the kernel table.
+    const KERNELS: usize = 5;
+    const DEV_ATTR_SM_COUNT: c_int = 16;
+    const DEV_ATTR_SMEM_OPTIN: c_int = 97;
     const DEV_ATTR_CC_MAJOR: c_int = 75;
+    const FUNC_ATTR_MAX_DYNAMIC_SMEM: c_int = 8;
 
-    /// Devices the cache below covers.
+    /// Devices the caches below cover.
     const DEVICES: usize = 64;
 
-    /// Each device's compute capability major; 0 not yet read, -1 unknown.
+    /// Each device's compute capability major, SM count and opt-in shared memory per
+    /// block; 0 not yet read, -1 unknown.
     static MAJOR: [AtomicI32; DEVICES] = [const { AtomicI32::new(0) }; DEVICES];
+    static SMS: [AtomicI32; DEVICES] = [const { AtomicI32::new(0) }; DEVICES];
+    static SMEM: [AtomicI32; DEVICES] = [const { AtomicI32::new(0) }; DEVICES];
+    /// The dynamic shared memory each kernel was opted into per device.
+    static OPTED: [[AtomicI32; KERNELS]; DEVICES] =
+        [const { [const { AtomicI32::new(0) }; KERNELS] }; DEVICES];
 
-    /// The current device's compute capability major, read once per device.
-    fn major() -> Option<i32> {
+    /// What the launch needs of the current device.
+    pub(super) struct Device {
+        pub id: usize,
+        pub major: i32,
+        pub sms: usize,
+        pub smem: usize,
+    }
+
+    /// Reads `attr` of `dev` once into `slot`.
+    ///
+    /// # Safety
+    /// `dev` is a valid device ordinal.
+    unsafe fn cached(slot: &AtomicI32, attr: c_int, dev: c_int) -> i32 {
+        let mut m = slot.load(Ordering::Relaxed);
+        if m == 0 {
+            // SAFETY: a plain attribute query.
+            m = if unsafe { cudaDeviceGetAttribute(&mut m, attr, dev) } == 0 && m > 0 {
+                m
+            } else {
+                // SAFETY: clears the error the failed query left.
+                unsafe { cudaGetLastError() };
+                -1
+            };
+            slot.store(m, Ordering::Relaxed);
+        }
+        m
+    }
+
+    /// The current device, its attributes read once per device.
+    pub(super) fn device() -> Result<Device, String> {
         let mut dev: c_int = 0;
         // SAFETY: plain queries of the current device.
         unsafe {
             if cudaGetDevice(&mut dev) != 0 || !(0..DEVICES as c_int).contains(&dev) {
                 cudaGetLastError();
-                return None;
+                return Err("nvfp4_mvq: no current device".into());
             }
-            let slot = &MAJOR[dev as usize];
-            let mut m = slot.load(Ordering::Relaxed);
-            if m == 0 {
-                m = if cudaDeviceGetAttribute(&mut m, DEV_ATTR_CC_MAJOR, dev) == 0 {
-                    m
-                } else {
-                    cudaGetLastError();
-                    -1
-                };
-                slot.store(m, Ordering::Relaxed);
+            let i = dev as usize;
+            let major = cached(&MAJOR[i], DEV_ATTR_CC_MAJOR, dev);
+            let sms = cached(&SMS[i], DEV_ATTR_SM_COUNT, dev);
+            let smem = cached(&SMEM[i], DEV_ATTR_SMEM_OPTIN, dev);
+            if sms <= 0 || smem <= 0 {
+                return Err("nvfp4_mvq: device attributes unknown".into());
             }
-            (m > 0).then_some(m)
+            Ok(Device {
+                id: i,
+                major,
+                sms: sms as usize,
+                smem: smem as usize,
+            })
         }
     }
 
-    /// Launches kernel `kernel` of the table on `p` (by value) on `stream`; on compute
-    /// capability 12.x as a programmatic dependent launch, as ggml-cuda launches its own
-    /// kernels there (each kernel waits for the one ahead before it reads activations).
+    /// Launches kernel `kernel` of the table on `p` (by value) on `stream` with `smem` bytes
+    /// of dynamic shared memory; on compute capability 12.x as a programmatic dependent
+    /// launch, as ggml-cuda launches its own kernels there (each kernel waits for the one
+    /// ahead before it reads activations).
     pub(super) fn launch(
         kernel: usize,
         grid: Dim3,
         block: Dim3,
+        smem: usize,
         p: &mut super::Params,
         stream: *mut c_void,
     ) -> Result<(), String> {
+        let dev = device()?;
+        let func = unsafe { legion_nvfp4_mvq_kernels[kernel] };
+        let opted = &OPTED[dev.id][kernel];
+        if smem as i32 > opted.load(Ordering::Relaxed) {
+            // SAFETY: an attribute of a kernel of the table, within the device's opt-in.
+            if unsafe { cudaFuncSetAttribute(func, FUNC_ATTR_MAX_DYNAMIC_SMEM, smem as c_int) } != 0
+            {
+                unsafe { cudaGetLastError() };
+                return Err(format!("nvfp4_mvq: cannot opt into {smem} B shared memory"));
+            }
+            opted.store(smem as i32, Ordering::Relaxed);
+        }
         let mut argv = [(p as *mut super::Params).cast::<c_void>()];
         let mut attr = LaunchAttribute {
             id: ATTR_PROGRAMMATIC_STREAM_SERIALIZATION,
@@ -373,16 +481,14 @@ mod launch {
         let config = LaunchConfig {
             grid,
             block,
-            dynamic_smem: 0,
+            dynamic_smem: smem,
             stream,
             attrs: &mut attr,
-            num_attrs: u32::from(major() == Some(12)),
+            num_attrs: u32::from(dev.major == 12),
         };
         // SAFETY: a kernel of the table taking `legion_nvfp4_mvq` by value, from the launch's
         // copy of `p`; its pointers are device memory of the stream's device (the node's).
-        match unsafe {
-            cudaLaunchKernelExC(&config, legion_nvfp4_mvq_kernels[kernel], argv.as_mut_ptr())
-        } {
+        match unsafe { cudaLaunchKernelExC(&config, func, argv.as_mut_ptr()) } {
             0 => Ok(()),
             e => Err(format!("nvfp4_mvq: CUDA error {e}")),
         }

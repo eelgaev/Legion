@@ -46,13 +46,43 @@ fn compute_capability_12_takes_the_op() {
 
 #[test]
 fn kernels_follow_ggmls_warps() {
-    // The table: the quantization, then ggml's 4 warps (1-4 columns), then its 2 (5-8).
-    assert_eq!(
-        (1..=8).map(kernel_index).collect::<Vec<_>>(),
-        [1, 1, 1, 1, 2, 2, 2, 2]
-    );
-    const { assert!(ROW_MULTIPLE == 16) };
+    // The table: the quantization, then ggml's 4 warps (1-4 columns) and its 2 (5-8), for
+    // 16-row regions, then for 8-row ones.
+    let idx = |r| (1..=8).map(|n| kernel_index(n, r)).collect::<Vec<_>>();
+    assert_eq!(idx(16), [1, 1, 1, 1, 2, 2, 2, 2]);
+    assert_eq!(idx(8), [3, 3, 3, 3, 4, 4, 4, 4]);
     const { assert!(MAX_N == crate::model::core::linear::NVFP4_GGML_MAX_N) };
+}
+
+#[test]
+fn plans_fit_the_shared_memory() {
+    // Qwen3.8-27B's MLP on a 12.x GPU: 16-row regions at k 5120, 8-row ones at 17408.
+    assert_eq!(
+        plan(5120, 17408, SMEM_12X),
+        Some(Plan {
+            r: 16,
+            ns: 32,
+            smem: 101120
+        })
+    );
+    assert_eq!(
+        plan(17408, 5120, SMEM_12X),
+        Some(Plan {
+            r: 8,
+            ns: 9,
+            smem: 92440
+        })
+    );
+    for (k, rows) in [(256, 8), (5120, 17408), (17408, 5120), (18176, 1024)] {
+        let p = plan(k, rows, SMEM_12X).unwrap();
+        assert!(
+            p.smem <= SMEM_12X && p.ns > p.r && rows % p.r == 0,
+            "{k} {rows}"
+        );
+    }
+    // Rows of 8 but not 16 take 8-row regions; too long a row has no ring.
+    assert_eq!(plan(5120, 1032, SMEM_12X).map(|p| p.r), Some(8));
+    assert_eq!(plan(MAX_K as usize, 1024, SMEM_12X), None);
 }
 
 /// The op on the CPU is the dequantized product, column by column, times the scale.
