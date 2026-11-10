@@ -42,6 +42,14 @@ pub(super) struct DraftSettings {
     /// head.
     #[arg(long, value_enum, default_value_t = legion::spec::DraftLmHead::Auto)]
     pub spec_draft_lm_head: legion::spec::DraftLmHead,
+    /// DFlash 2 (opt-in): the draft pass over several sequences attends all of them in one
+    /// flash attention per drafter layer, their caches slots of one pool (a slot for each of
+    /// --max-seqs, made when the first sequence drafts), instead of one small attention per
+    /// sequence and layer. Drafts only: every token is verified by the target, but the drafts'
+    /// numerics differ slightly, so with 2 or more sequences drafting at once acceptance (and
+    /// under --deterministic the text) can move. One sequence drafts as without it.
+    #[arg(long)]
+    pub spec_draft_batched_attn: bool,
 }
 
 fn temperature(value: &str) -> Result<f32, String> {

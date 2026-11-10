@@ -19,7 +19,7 @@
 
 use crate::ggml::{Backend, ComputeAllocator, Context, Tensor, ffi, types};
 
-use super::cache::SeqCache;
+use super::cache::{CachePool, SeqCache};
 use super::config::{Config, Flavor};
 use super::v2::{self, Selector};
 use super::weights::{HostTensor, Store};
@@ -52,6 +52,111 @@ pub struct BlockSeq<'c> {
     pub cache: &'c SeqCache,
     pub last: u32,
     pub anchor_pos: usize,
+}
+
+/// A draft pass's attention over a [`CachePool`] (`--spec-draft-batched-attn`): per layer, one
+/// write of every block's K/V to its slot's scratch cells and one flash attention over the
+/// slots `0..n_view` (`n_view`: the highest slot in the pass, plus one), each slot's first
+/// `n_kv` cells (the longest cache's, rounded up to whole 256-cell tiles; the rest of a slot's
+/// are masked, and ggml-cuda skips its fully masked tiles). Slots the pass does not use attend
+/// to their first cell only and are dropped. The queries are gathered into slot order and the
+/// outputs back into the pass's order, unless the sequences hold slots `0..n_seq` in order.
+struct Pooled<'a> {
+    pool: &'a CachePool,
+    n_kv: usize,
+    n_view: usize,
+    /// `[n_seq · n]`: where each block row goes in the pool.
+    block_cells: Tensor<'a>,
+    /// `[n_view]`: the pass's sequence of each slot (gather of the queries).
+    q_idx: Option<Tensor<'a>>,
+    /// `[n_seq]`: each sequence's slot (gather of the outputs).
+    o_idx: Option<Tensor<'a>>,
+    /// The masks as they are set, F32 `[n_kv, n, 1, n_view]` (full attention, sliding), and
+    /// the F16 copies flash attention reads.
+    masks_f32: (Option<Tensor<'a>>, Option<Tensor<'a>>),
+    mask_full: Option<Tensor<'a>>,
+    mask_swa: Option<Tensor<'a>>,
+}
+
+impl<'a> Pooled<'a> {
+    fn new(
+        ctx: &'a Context,
+        pool: &'a CachePool,
+        seqs: &[BlockSeq<'_>],
+        n: usize,
+        any_full: bool,
+        any_swa: bool,
+    ) -> Self {
+        let slots: Vec<usize> = seqs
+            .iter()
+            .map(|s| s.cache.slot().expect("pooled"))
+            .collect();
+        let n_view = slots.iter().max().expect("a sequence") + 1;
+        let used = seqs
+            .iter()
+            .map(|s| s.cache.used_cells())
+            .max()
+            .expect("a sequence");
+        let n_kv = used
+            .next_multiple_of(super::cache::POOL_CELLS)
+            .min(pool.cells());
+        let in_order = n_view == seqs.len() && slots.iter().enumerate().all(|(i, &s)| i == s);
+        let input = |ty, ne: &[i64], name: &str| ctx.new_tensor(ty, ne).named(name).as_input();
+        let block_cells = input(types::I32, &[(n * seqs.len()) as i64], "pool_cells");
+        let q_idx = (!in_order).then(|| input(types::I32, &[n_view as i64], "pool_q"));
+        let o_idx = (!in_order).then(|| input(types::I32, &[seqs.len() as i64], "pool_o"));
+        let ne = [n_kv as i64, n as i64, 1, n_view as i64];
+        let f32_mask = |name: &str| input(types::F32, &ne, name);
+        let masks_f32 = (
+            any_full.then(|| f32_mask("pool_mask")),
+            any_swa.then(|| f32_mask("pool_mask_swa")),
+        );
+        Self {
+            pool,
+            n_kv,
+            n_view,
+            block_cells,
+            q_idx,
+            o_idx,
+            mask_full: masks_f32.0.map(|m| ctx.cast(m, types::F16)),
+            mask_swa: masks_f32.1.map(|m| ctx.cast(m, types::F16)),
+            masks_f32,
+        }
+    }
+
+    /// Sets the inputs, after the graph is allocated.
+    fn set_inputs(&self, model: &Model, seqs: &[BlockSeq<'_>], n: usize) {
+        let cells = self.pool.cells();
+        let slot = |s: &BlockSeq<'_>| s.cache.slot().expect("pooled");
+        let at: Vec<i32> = seqs
+            .iter()
+            .flat_map(|s| (0..n).map(move |j| (slot(s) * cells + j) as i32))
+            .collect();
+        self.block_cells.set_i32(&at);
+        if let (Some(q), Some(o)) = (self.q_idx, self.o_idx) {
+            let mut of_slot = vec![0i32; self.n_view];
+            for (i, s) in seqs.iter().enumerate() {
+                of_slot[slot(s)] = i as i32;
+            }
+            q.set_i32(&of_slot);
+            o.set_i32(&seqs.iter().map(|s| slot(s) as i32).collect::<Vec<_>>());
+        }
+        let window = model.cfg.sliding_window.as_ref().map(|(w, _)| *w);
+        for (t, window) in [(self.masks_f32.0, None), (self.masks_f32.1, window)] {
+            let Some(t) = t else { continue };
+            // A slot no sequence of the pass holds sees its first cell (no row without keys).
+            let mut idle = vec![f32::NEG_INFINITY; self.n_kv * n];
+            idle.iter_mut().step_by(self.n_kv).for_each(|x| *x = 0.0);
+            let mut all = Vec::with_capacity(self.n_kv * n * self.n_view);
+            for v in 0..self.n_view {
+                match seqs.iter().find(|s| slot(s) == v) {
+                    Some(s) => all.extend(model.mask(s.cache, s.anchor_pos, n, self.n_kv, window)),
+                    None => all.extend_from_slice(&idle),
+                }
+            }
+            t.set_f32(&all);
+        }
+    }
 }
 
 /// DSpark's Markov head: the logits of a draft position get the bias
@@ -553,21 +658,33 @@ impl Model {
         feats: &[f32],
         positions: &[usize],
     ) -> Result<(), String> {
-        self.ingest_many(backend, alloc, &mut [cache], feats, &[positions], true)
+        self.ingest_many(
+            backend,
+            alloc,
+            &mut [cache],
+            None,
+            feats,
+            &[positions],
+            true,
+        )
     }
 
     /// [`Self::ingest`] for several sequences in one graph (#521): `feats` holds their rows in
     /// order, `positions[s]` sequence `s`'s positions (at most a window each). One sequence is
-    /// exactly [`Self::ingest`]'s graph.
+    /// exactly [`Self::ingest`]'s graph. With `pool`, when the caches are all its slots, several
+    /// sequences' K/V go to it in one write per layer and kind, the same values to the same
+    /// cells.
     ///
     /// Without `wait` the graph may still run on the backend's stream when this returns: the
     /// next graph on that stream runs after it, and `alloc`'s buffer stays its own until the
     /// backend is synchronized (a graph built meanwhile takes another allocator).
+    #[allow(clippy::too_many_arguments)]
     pub fn ingest_many(
         &self,
         backend: &mut Backend,
         alloc: &mut Option<ComputeAllocator>,
         caches: &mut [&mut SeqCache],
+        pool: Option<&CachePool>,
         feats: &[f32],
         positions: &[&[usize]],
         wait: bool,
@@ -586,8 +703,13 @@ impl Model {
         let input = |ty, ne: &[i64], name: &str| ctx.new_tensor(ty, ne).named(name).as_input();
         let x_in = input(types::F32, &[n_in as i64, n as i64], "features");
         let pos = input(types::I32, &[n as i64], "pos");
+        // A sequence without a slot (every slot taken) has its cache apart: one write each.
+        let pool = pool.filter(|_| n_seq > 1 && caches.iter().all(|c| c.slot().is_some()));
+        // Pooled: every row's cell in the pool. Else each sequence's cells in its cache.
+        let pool_cells = pool.map(|_| input(types::I32, &[n as i64], "pool_cells"));
         let cells: Vec<_> = positions
             .iter()
+            .filter(|_| pool.is_none())
             .map(|p| input(types::I32, &[p.len() as i64], "cells"))
             .collect();
         let mut graph = ctx.new_graph(size);
@@ -599,6 +721,10 @@ impl Model {
             let row = (c.head_dim * c.n_head_kv) as i64;
             for (kind, x) in [("k", k), ("v", v)] {
                 let x = ctx.reshape_2d(x, row, n as i64);
+                if let (Some(pool), Some(pc)) = (pool, pool_cells) {
+                    graph.expand(ctx.set_rows(pool.tensor(kind, il), x, pc));
+                    continue;
+                }
                 let mut at = 0;
                 for ((cache, p), &cells) in caches.iter().zip(positions).zip(&cells) {
                     let rows = if n_seq == 1 {
@@ -621,6 +747,17 @@ impl Model {
             .map(|&p| p as i32)
             .collect();
         pos.set_i32(&all);
+        if let (Some(pool), Some(pc)) = (pool, pool_cells) {
+            let at: Vec<i32> = caches
+                .iter()
+                .zip(positions)
+                .flat_map(|(cache, p)| {
+                    let base = cache.slot().expect("checked above") * pool.cells();
+                    p.iter().map(move |&p| (base + cache.cell(p)) as i32)
+                })
+                .collect();
+            pc.set_i32(&at);
+        }
         for ((cache, p), cells) in caches.iter().zip(positions).zip(&cells) {
             cells.set_i32(&p.iter().map(|&p| cache.cell(p) as i32).collect::<Vec<_>>());
         }
@@ -658,7 +795,7 @@ impl Model {
             last,
             anchor_pos,
         }];
-        let mut rows = self.draft_many(backend, alloc, &one, n, want_logits, want_hidden)?;
+        let mut rows = self.draft_many(backend, alloc, &one, None, n, want_logits, want_hidden)?;
         Ok(rows.pop().expect("one sequence"))
     }
 
@@ -666,11 +803,17 @@ impl Model {
     /// matmuls read the weights once for all of them; the attention is per sequence (each reads
     /// its own cache). One sequence is exactly [`Self::draft`]'s graph. Returns one [`Rows`] per
     /// sequence, in order.
+    ///
+    /// With `pool` (`--spec-draft-batched-attn`), when every cache is one of its slots, each
+    /// layer's attention is one flash attention over all the sequences ([`Pooled`]) instead of
+    /// a few small kernels per sequence; its sums round differently (drafts only).
+    #[allow(clippy::too_many_arguments)]
     pub fn draft_many(
         &self,
         backend: &mut Backend,
         alloc: &mut Option<ComputeAllocator>,
         seqs: &[BlockSeq<'_>],
+        pool: Option<&CachePool>,
         n: usize,
         want_logits: bool,
         want_hidden: bool,
@@ -688,14 +831,20 @@ impl Model {
         let input = |ty, ne: &[i64], name: &str| ctx.new_tensor(ty, ne).named(name).as_input();
         let tokens = input(types::I32, &[total as i64], "tokens");
         let pos = input(types::I32, &[total as i64], "pos");
-        // Every sequence's block goes to the same scratch cells of its own cache.
-        let cells = input(types::I32, &[n as i64], "cells");
-        // A mask that no layer uses is not part of the graph and has no memory.
         let is_swa = |il: usize| c.sliding_window.as_ref().is_some_and(|(_, p)| p[il]);
         let any_full = (0..c.n_layer).any(|il| !is_swa(il));
         let any_swa = (0..c.n_layer).any(is_swa);
+        let pooled = pool
+            .filter(|_| n_seq > 1 && seqs.iter().all(|s| s.cache.slot().is_some()))
+            .map(|pool| Pooled::new(&ctx, pool, seqs, n, any_full, any_swa));
+        // Every sequence's block goes to the same scratch cells of its own cache.
+        let cells = pooled
+            .is_none()
+            .then(|| input(types::I32, &[n as i64], "cells"));
+        // A mask that no layer uses is not part of the graph and has no memory.
         let masks: Vec<_> = seqs
             .iter()
+            .filter(|_| pooled.is_none())
             .map(|s| {
                 let n_att = s.cache.used_cells() as i64;
                 (
@@ -733,8 +882,19 @@ impl Model {
             // Several sequences: each one's attention output is copied into its columns of one
             // tensor (a chain of concats copied everything before it again, ~0.9 ms a step at 16
             // sequences). The values are the same.
-            let out_all = (n_seq > 1).then(|| ctx.new_tensor(types::F32, &[d * nh, total as i64]));
-            for (s, seq) in seqs.iter().enumerate() {
+            let out_all = (n_seq > 1 && pooled.is_none())
+                .then(|| ctx.new_tensor(types::F32, &[d * nh, total as i64]));
+            if let Some(pa) = &pooled {
+                let mask = if is_swa(il) {
+                    pa.mask_swa
+                } else {
+                    pa.mask_full
+                };
+                let o = self.pooled_attention(&ctx, il, pa, [q_all, k_all, v_all], mask, scale);
+                out = Some(o);
+            }
+            for (s, seq) in seqs.iter().enumerate().filter(|_| pooled.is_none()) {
+                let cells = cells.expect("made above");
                 let cache = seq.cache;
                 let n_att = cache.used_cells();
                 let (q, k, v) = if n_seq == 1 {
@@ -877,7 +1037,12 @@ impl Model {
         }
         tokens.set_i32(&ids);
         pos.set_i32(&positions);
-        cells.set_i32(&(0..n as i32).collect::<Vec<_>>());
+        if let Some(cells) = cells {
+            cells.set_i32(&(0..n as i32).collect::<Vec<_>>());
+        }
+        if let Some(pa) = &pooled {
+            pa.set_inputs(self, seqs, n);
+        }
         for (s, &(mask_full, mask_swa)) in seqs.iter().zip(&masks) {
             let n_att = s.cache.used_cells();
             if let Some(t) = mask_full {
@@ -968,7 +1133,62 @@ impl Model {
         1.0 / (1.0 + (-z).exp())
     }
 
-    /// The attention mask of the block queries `[n_att, n]` (0 or -inf).
+    /// Layer `il`'s attention over the pool ([`Pooled`]): `[q, k, v]` are the pass's
+    /// `[d, n_head(_kv), n_seq · n]` projections, `mask` the F16 mask of the layer's kind.
+    /// Returns `[d · n_head, n_seq · n]`, as the per-sequence attentions' outputs side by side.
+    fn pooled_attention<'a>(
+        &'a self,
+        ctx: &'a Context,
+        il: usize,
+        pa: &Pooled<'a>,
+        [q, k, v]: [Tensor<'a>; 3],
+        mask: Option<Tensor<'a>>,
+        scale: f32,
+    ) -> Tensor<'a> {
+        let c = &self.cfg;
+        let (d, nh, kvh) = (c.head_dim as i64, c.n_head as i64, c.n_head_kv as i64);
+        let row = d * kvh;
+        let total = q.ne()[2];
+        let n_view = pa.n_view as i64;
+        let n_seq = pa.o_idx.map_or(n_view, |o| o.ne()[0]);
+        let n = total / n_seq;
+        let es = 2usize; // F16
+        let slot_bytes = pa.pool.cells() * row as usize * es;
+        // The blocks' K/V go to their slots' scratch cells; the attention reads them there.
+        let read = |kind: &str, t: Tensor<'a>| {
+            let t = ctx.reshape_2d(t, row, total);
+            let all = ctx.set_rows(pa.pool.tensor(kind, il), t, pa.block_cells);
+            let t = ctx.view_4d(
+                all,
+                [d, kvh, pa.n_kv as i64, n_view],
+                [d as usize * es, row as usize * es, slot_bytes],
+                0,
+            );
+            ctx.permute(t, [0, 2, 1, 3]) // [d, n_kv, kvh, n_view]
+        };
+        let (k, v) = (read("k", k), read("v", v));
+        let block = d * nh * n;
+        let q = match pa.q_idx {
+            Some(idx) => ctx.get_rows(ctx.reshape_2d(q, block, n_seq), idx),
+            None => q,
+        };
+        let q = ctx.permute(ctx.reshape_4d(q, [d, nh, n, n_view]), [0, 2, 1, 3]); // [d, n, nh, n_view]
+        let o = ctx.flash_attn_ext(q, k, v, mask.expect("made for this kind"), scale);
+        if let Some(sinks) = Self::sinks_of(&self.store, il) {
+            let sinks = ctx.cast(self.w(&sinks), types::F32);
+            // SAFETY: `o` is a flash_attn_ext node of this context, `sinks` an F32 `[n_head]`.
+            unsafe { ffi::ggml_flash_attn_ext_add_sinks(o.raw(), sinks.raw()) };
+        }
+        // [d, n_head, n, n_view]: a slot's block is a sequence's columns.
+        let o = match pa.o_idx {
+            Some(idx) => ctx.get_rows(ctx.reshape_2d(o, block, n_view), idx),
+            None => o,
+        };
+        ctx.reshape_2d(o, d * nh, total)
+    }
+
+    /// The attention mask of the block queries `[n_att, n]` (0 or -inf). `n_att` may exceed the
+    /// cache's cells (a pooled attention's padding).
     fn mask(
         &self,
         cache: &SeqCache,
@@ -990,7 +1210,9 @@ impl Model {
                     *cell = 0.0;
                 }
             }
-            for i in 0..n_att - scratch {
+            // A pooled attention reads past the slot's ring (`n_att` above `scratch + window`):
+            // those cells stay masked.
+            for i in 0..(n_att - scratch).min(cache.window()) {
                 if let Some(p) = cache.held(i)
                     && p < anchor_pos
                     && in_window(p)

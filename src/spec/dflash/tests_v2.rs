@@ -326,6 +326,76 @@ fn sequences_drafted_together_draft_what_they_draft_alone() {
 }
 
 #[test]
+fn batched_attention_drafts_what_sequences_draft_alone() {
+    // `--spec-draft-batched-attn`: one flash attention per layer over the pool's slots, whose
+    // sums round differently (the CPU kernel accumulates in F16): the distributions match
+    // closely. Then slots out of order with an idle one (gathered queries), a released slot
+    // taken again, one sequence exactly as without the flag, a sequence past the slots alone.
+    let fx = Fixture::new();
+    let path = fx.gguf("d.gguf", &v2_draft());
+    let (a, b, e) = (tokens_to(16), tokens_to(12), tokens_to(10));
+    let batched = DflashOptions {
+        batched_attn: true,
+        ..sampling(64)
+    };
+    let load = |opts: &DflashOptions, max_seqs: usize| {
+        let info = TargetInfo {
+            max_seqs,
+            ..fx.info(&path)
+        };
+        DflashDrafter::load(&info, opts.clone()).unwrap()
+    };
+    let first_reqs: [Req<'_>; 3] = [
+        (1, &a[..13], 0, 13, 7, 0),
+        (2, &b[..10], 0, 10, 7, 1),
+        (3, &e[..7], 0, 7, 7, 2),
+    ];
+    let second_reqs: [Req<'_>; 2] = [(2, &b, 10, 2, 5, 1), (3, &e, 7, 3, 7, 2)];
+    let mut alone = load(&sampling(64), 4);
+    let want: Vec<Draft> = first_reqs
+        .iter()
+        .chain(&second_reqs)
+        .map(|&(seq, t, start, ran, max, salt)| step(&mut alone, seq, t, start, ran, max, salt))
+        .collect();
+    const TOL: f32 = 5e-3;
+    // The tolerance tells sequences apart: theirs differ by far more.
+    assert!(max_diff(&want[0].probs[0], &want[1].probs[0]) > 2.0 * TOL);
+
+    let mut together = load(&batched, 4);
+    let first = step_many(&mut together, &first_reqs);
+    let second = step_many(&mut together, &second_reqs);
+    for (i, (got, want)) in first.iter().chain(&second).zip(&want).enumerate() {
+        assert_eq!(got.tokens.len(), want.tokens.len(), "request {i}");
+        let diff = max_diff(&got.probs[0], &want.probs[0]);
+        assert!(diff < TOL, "request {i}: {diff}");
+    }
+    assert_eq!(
+        [1, 2, 3].map(|s| together.caches[&s].slot()),
+        [Some(0), Some(1), Some(2)]
+    );
+    together.release(1);
+    step(&mut together, 4, &a[..5], 0, 5, 0, 3);
+    assert_eq!(together.caches[&4].slot(), Some(0));
+
+    // One sequence: the same graph as without the flag, over a view of its slot.
+    let mut one = load(&batched, 4);
+    let got = step(&mut one, 1, &a[..13], 0, 13, 7, 0);
+    assert_eq!(max_diff(&got.probs[0], &want[0].probs[0]), 0.0);
+
+    // Two slots for three sequences: the third has its own cache, and the pass attends per
+    // sequence as without the flag.
+    let mut short = load(&batched, 2);
+    let first = step_many(&mut short, &first_reqs);
+    assert_eq!(short.caches[&3].slot(), None);
+    for (i, (got, want)) in first.iter().zip(&want).enumerate() {
+        assert!(
+            max_diff(&got.probs[0], &want.probs[0]) < 1e-5,
+            "request {i}"
+        );
+    }
+}
+
+#[test]
 fn ties_resolve_by_logit_then_token() {
     // Rank 1, codebooks all ones, a zero hidden projection: the scores are the logits.
     let ones: Vec<u8> = (0..4).flat_map(|_| 1f32.to_ne_bytes()).collect();

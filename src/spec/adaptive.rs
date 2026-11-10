@@ -183,6 +183,7 @@ impl Default for SpecConfig {
             draft_window: 0,
             draft_weights: Default::default(),
             draft_lm_head: Default::default(),
+            draft_batched_attn: false,
             mtp_ngram: 0,
             mtp_ngram_k: 0,
         }
