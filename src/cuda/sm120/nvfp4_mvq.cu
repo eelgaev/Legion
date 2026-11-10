@@ -11,7 +11,8 @@
 //
 // - The integer sum of each 16-value sub-block, row and column (ggml's `sumi`, four dp4a) comes
 //   from an F16 mma.sync m16n8k16: the weights as F16 E2M1 values (cvt.rn.f16x2.e2m1x2, one
-//   instruction per byte), the activations as F16 2 * q of their Q8_1 values (exact). Every
+//   instruction per byte), the activations as F16 2 * q of their Q8_1 values (exact; stored as
+//   bytes, expanded in registers: the activations are read again for every region). Every
 //   product is an integer of at most 1524 in magnitude and every sum one of at most 24384, so
 //   the F32 accumulation is exact: C is ggml's `sumi`, as a float. Inside an MMA the K order is
 //   free when A and B agree, so a thread takes bytes 2t and 2t + 1 of a sub-block (values 2t,
@@ -88,9 +89,9 @@ constexpr int QUANTIZE_THREADS = 256;  // ggml's CUDA_QUANTIZE_BLOCK_SIZE
 constexpr int MAX_K = 65536;
 constexpr int MAX_N = 8;
 
-// The activations as F16 2 * q: [column][kbx][MMA thread t of 4][sub-block][4 values], 32
-// bytes a (column, kbx, t): two uint4 loads.
-__device__ uint4 scratch_xh[MAX_N * MAX_K * 2 / 16];
+// The activations as bytes q + 128: [column][kbx][MMA thread t of 4][sub-block][4 values], 16
+// bytes a (column, kbx, t): one uint4 load (expanded to F16 2 * q in registers).
+__device__ uint4 scratch_xq[MAX_N * MAX_K / 16];
 // The Q8_1 scales yd / 2: [kbx][Q8 block of the kbx][column].
 __device__ float scratch_yd[MAX_K / 64 * 2 * MAX_N];
 
@@ -130,8 +131,8 @@ __global__ void __launch_bounds__(QUANTIZE_THREADS) quantize(const legion_nvfp4_
     const int e   = i0 & 15;
     const int th  = (e & 7) >> 1;
     const int pos = ((e & 1) << 1) | (e >> 3);
-    __half * xh = reinterpret_cast<__half *>(scratch_xh);
-    xh[(((int64_t) t * (p.k >> 6) + kbx) * 4 + th) * 16 + s * 4 + pos] = __int2half_rn(2 * q);
+    uint8_t * xq = reinterpret_cast<uint8_t *>(scratch_xq);
+    xq[(((int64_t) t * (p.k >> 6) + kbx) * 4 + th) * 16 + s * 4 + pos] = (uint8_t) (q + 128);
 
     if ((i0 & (QK8_1 - 1)) > 0) {
         return;
@@ -162,6 +163,17 @@ __device__ __forceinline__ void e2m1x4(uint32_t v, uint32_t & lo, uint32_t & hi)
         "cvt.rn.f16x2.e2m1x2 %1, b1;\n}"
         : "=r"(lo), "=r"(hi)
         : "r"(v));
+}
+
+// Four bytes q + 128 (q in -127..127) as F16 pairs 2 q: bytes 0, 1 into `lo`, 2, 3 into `hi`
+// (exact: 0x68 above a byte b is the F16 2048 + 2 b, less 2304).
+__device__ __forceinline__ void q8x4(uint32_t v, uint32_t & lo, uint32_t & hi) {
+    const uint32_t e = 0x68686868u, bias = 0x68806880u;
+    uint32_t       a, b;
+    asm("prmt.b32 %0, %1, %2, 0x4140;" : "=r"(a) : "r"(v), "r"(e));
+    asm("prmt.b32 %0, %1, %2, 0x4342;" : "=r"(b) : "r"(v), "r"(e));
+    asm("sub.rn.f16x2 %0, %1, %2;" : "=r"(lo) : "r"(a), "r"(bias));
+    asm("sub.rn.f16x2 %0, %1, %2;" : "=r"(hi) : "r"(b), "r"(bias));
 }
 
 __device__ __forceinline__ void mma16816(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
@@ -274,7 +286,7 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
     pdl_wait();
 
     const bool    col_ok = g < p.n;
-    const uint4 * xh     = scratch_xh + ((int64_t) g * bpr * 4 + t) * 2;
+    const uint4 * xq     = scratch_xq + (int64_t) g * bpr * 4 + t;
     const float * yd     = scratch_yd + hp * MAX_N + g;
     const bool    scaled = p.scale != nullptr;
     const float   sc     = scaled ? *p.scale : 1.0f;
@@ -321,13 +333,17 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
                     if (kbx >= hi) {
                         break;
                     }
-                    uint4 x01 = make_uint4(0, 0, 0, 0);
-                    uint4 x23 = make_uint4(0, 0, 0, 0);
-                    float y   = 0.0f;
+                    // A: sub-block s's values 2t, 2t + 8 (k 2t, 2t + 1) in a[s][0], 2t + 1,
+                    // 2t + 9 (k 2t + 8, 2t + 9) in a[s][1].
+                    uint32_t a[4][2] = {};
+                    float    y       = 0.0f;
                     if (col_ok) {
-                        x01 = xh[(int64_t) kbx * 8];
-                        x23 = xh[(int64_t) kbx * 8 + 1];
-                        y   = yd[kbx * 2 * MAX_N];
+                        const uint4 v = xq[(int64_t) kbx * 4];
+                        q8x4(v.x, a[0][0], a[0][1]);
+                        q8x4(v.y, a[1][0], a[1][1]);
+                        q8x4(v.z, a[2][0], a[2][1]);
+                        q8x4(v.w, a[3][0], a[3][1]);
+                        y = yd[kbx * 2 * MAX_N];
                     }
                     const uint32_t o = (kbx - lo) * 36;
 #pragma unroll
@@ -340,8 +356,8 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
                         e2m1x4(lds_u16(rb[c] + o), b00, b01);
                         e2m1x4(lds_u16(rb[c] + o + 16), b10, b11);
                         float c0[4], c1[4];
-                        mma16816(c0, x01.x, x01.z, x01.y, x01.w, b00, b01);
-                        mma16816(c1, x23.x, x23.z, x23.y, x23.w, b10, b11);
+                        mma16816(c0, a[0][0], a[1][0], a[0][1], a[1][1], b00, b01);
+                        mma16816(c1, a[2][0], a[3][0], a[2][1], a[3][1], b10, b11);
                         // Own parity: rows ra, ra + 1 of sub-block 2 * MMA + hp (C rows g or
                         // g + 8, columns 2t, 2t + 1). The half's MMA is hp; the other one goes
                         // to lane t ^ 2, whose half it is.
