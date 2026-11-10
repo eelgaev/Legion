@@ -288,8 +288,25 @@ unsafe fn cuda_nvfp4_mvq(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
         return Err("nvfp4_mvq: weight not 16-byte aligned".into());
     }
     let dev = launch::device()?;
-    let plan = plan(o.k, o.rows, dev.smem.min(SMEM_12X))
+    let mut plan = plan(o.k, o.rows, dev.smem.min(SMEM_12X))
         .ok_or_else(|| format!("nvfp4_mvq: no ring for k {} rows {}", o.k, o.rows))?;
+    // EXPERIMENT (debug knobs, not for the PR): force 8-row regions, cap the ring.
+    if let Ok(v) = std::env::var("LEGION_MVQ_X") {
+        let mut it = v.split(',').map(|s| s.parse::<usize>().unwrap_or(0));
+        let (r, ns) = (it.next().unwrap_or(0), it.next().unwrap_or(0));
+        let pitch = o.k / 64 * BLOCK_BYTES + 16;
+        if r == 8 || r == 16 {
+            plan.r = r;
+        }
+        let part = WARPS * 2 * plan.r * 8 * 4;
+        let max_ns = ((dev.smem.min(SMEM_12X) - part) / (pitch + 8)).min(64);
+        if ns > plan.r && ns <= max_ns {
+            plan.ns = ns;
+        } else {
+            plan.ns = max_ns;
+        }
+        plan.smem = plan.ns * pitch + part + plan.ns * 8;
+    }
     p.ns = plan.ns as i32;
     let quantize = launch::Dim3 {
         x: o.k.div_ceil(256) as u32,
