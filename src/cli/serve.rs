@@ -1678,6 +1678,7 @@ impl EngineArgs {
                 .map_or(0, |w| w as usize),
             draft_weights: self.draft_settings.spec_draft_weights,
             draft_lm_head: self.draft_settings.spec_draft_lm_head,
+            draft_batched_attn: self.draft_settings.spec_draft_batched_attn,
             p_min: self.spec_p_min,
             mtp_ngram: self.spec_mtp_ngram,
             mtp_ngram_k: self.spec_mtp_ngram_k.map_or(0, usize::from),
