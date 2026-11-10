@@ -56,6 +56,12 @@ type Node = *mut ffi::ggml_tensor;
 /// weights (`1` reads them all).
 pub(crate) const FMA_SKIP: i32 = 2;
 
+/// The parameter of a [`MOE_SUM_GATE`] in its fused-sum form that the reduce-scatter reading
+/// it sets ([`crate::tp_net::seq_par::take_tail`], #1176): the node launches nothing, and the
+/// exchange runs the tail itself ([`launch_tail`]), its values rounded to BF16 straight into
+/// the send buffer.
+pub(crate) const P_BY_EXCHANGE: usize = 4;
+
 pub(crate) static MOE_SUM_GATE: ExternalOp = ExternalOp {
     name: "moe_sum_gate",
     cpu: cpu_moe_sum_gate,
@@ -896,6 +902,7 @@ struct SumGate {
     k: i32,
     n_tok: i32,
     skip_zero: i32,
+    out16: *mut u16,
 }
 
 /// `legion_ids_remap` (src/cuda/node_fuse.cu).
@@ -945,10 +952,46 @@ const THREADS: u32 = 256;
 
 #[cfg(feature = "cuda")]
 unsafe fn cuda_moe_sum_gate(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
+    // The reduce-scatter reading it runs it (#1176).
+    if external_params(dst)[P_BY_EXCHANGE] != 0 {
+        return Ok(());
+    }
+    // SAFETY: the caller's.
+    unsafe { launch_sum_gate(dst, None, stream) }
+}
+
+/// For the reduce-scatter that took over the [`MOE_SUM_GATE`] node `dst` (#1176, see
+/// [`P_BY_EXCHANGE`]): runs it on `stream`, into its own output (`out16` `None`, an F32
+/// exchange) or with its values rounded to BF16 at the device address `out16` instead,
+/// `[n_embd, n_tok]` contiguous (the send buffer).
+///
+/// # Safety
+/// `dst` is such a node of an allocated graph, its sources' memory still holding their values
+/// (the exchange reads them too); `out16` device-writable for the node's values.
+pub(crate) unsafe fn launch_tail(
+    dst: &ffi::ggml_tensor,
+    out16: Option<u64>,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    // SAFETY: the caller's.
+    unsafe { launch_sum_gate(dst, out16, stream) }
+}
+
+/// # Safety
+/// `dst` is a [`MOE_SUM_GATE`] node of an allocated graph whose sources hold their values;
+/// `out16` (fused-sum form only) as [`launch_tail`]'s.
+unsafe fn launch_sum_gate(
+    dst: &ffi::ggml_tensor,
+    out16: Option<u64>,
+    stream: *mut c_void,
+) -> Result<(), String> {
     // SAFETY: a node made by the rewrite, device tensors of the stream's device; the kernel
     // reads `p` from the launch's copy of its argument.
     unsafe {
         let [weights, gated, k, fma, ..] = external_params(dst);
+        if out16.is_some() && fma == 0 {
+            return Err("moe_sum_gate: BF16 values from the fused sum only".into());
+        }
         let x = &*dst.src[0];
         let w = (weights != 0).then(|| &*dst.src[1]);
         let at = 1 + usize::from(weights != 0);
@@ -971,11 +1014,16 @@ unsafe fn cuda_moe_sum_gate(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
             k,
             n_tok: n as i32,
             skip_zero: i32::from(fma == FMA_SKIP),
+            out16: out16.map_or(std::ptr::null_mut(), |a| a as *mut u16),
         };
-        // The fused sum's kernel: 4 columns a thread where every row is 16-byte aligned.
+        // The fused sum's kernel: 4 columns a thread where every row is 16-byte aligned (the
+        // BF16 values' rows 8-byte aligned).
         let aligned = |t: *const f32| (t as usize).is_multiple_of(16);
-        let v4 =
-            fma != 0 && e % 4 == 0 && aligned(p.x) && aligned(p.sh) && aligned(p.out.cast_const());
+        let out_aligned = match out16 {
+            Some(a) => a.is_multiple_of(8),
+            None => aligned(p.out.cast_const()),
+        };
+        let v4 = fma != 0 && e % 4 == 0 && aligned(p.x) && aligned(p.sh) && out_aligned;
         let (kernel, cols) = match (fma != 0, v4) {
             (false, _) => (legion_moe_sum_gate_kernel, 1),
             (true, false) => (legion_moe_tail_fma_kernel, 1),
