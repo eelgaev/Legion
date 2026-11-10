@@ -34,6 +34,7 @@ use crate::ggml::post_alloc::{Relaid, Relayout};
 use crate::ggml::{ffi, make_external};
 use crate::model::nvfp4_mm;
 use crate::model::qwen4::{FoldSum, fold_moe, fold_target, moe_fold};
+use crate::tp_net::seq_par;
 
 /// The fold as a relayout (`crate::ggml::post_alloc::set_relayout`): only graphs holding a norm
 /// a tail may fold into ([`fold_target`]) take it, with [`crate::model::qwen4::set_moe_fold`]
@@ -49,6 +50,10 @@ static UNDONE: AtomicUsize = AtomicUsize::new(0);
 /// Grouped NVFP4 nodes left without their skipped pairs' zeros so far (#1176; logged with the
 /// first relayouts).
 static UNREAD: AtomicUsize = AtomicUsize::new(0);
+
+/// Tails run by the reduce-scatter reading them so far (#1176; logged with the first
+/// relayouts).
+static TAKEN: AtomicUsize = AtomicUsize::new(0);
 
 /// [`Relayout::wants`].
 ///
@@ -86,6 +91,7 @@ unsafe fn rewrite(graph: *mut ffi::ggml_cgraph, cuda: bool) -> Option<Box<dyn Re
             fma,
             left = undo.left.len(),
             unread = UNREAD.load(Ordering::Relaxed),
+            by_exchange = TAKEN.load(Ordering::Relaxed),
             "hc moe fold: MoE tails made by the next hyper-connection norm, or as one op at \
              the gate's add where no such norm reads them (the first graphs; --hc-moe-fold)"
         );
@@ -302,6 +308,25 @@ impl Graph {
             }
             make_external(a, &MOE_SUM_GATE, &srcs, &[1, 1, s.k as i32, fma]);
             self.retire(&dead, root(s.experts));
+            // The reduce-scatter reading the tail runs it, its values rounded to BF16 straight
+            // into the send buffer (#1176; the graph is planned again after this rewrite).
+            let rs = match *self.users(a) {
+                [u] if is_view_op((*self.nodes[u]).op) => match *self.users(self.nodes[u]) {
+                    [r] => Some(r),
+                    _ => None,
+                },
+                [u] => Some(u),
+                _ => None,
+            };
+            if let Some(r) = rs.filter(|&r| !self.none[r] && self.only_read_by(a, &[r])) {
+                // (`a` is saved as built above, which an undo puts back whole.)
+                let rs = self.nodes[r];
+                let was = std::ptr::read(rs);
+                if seq_par::take_tail(rs, a, &srcs) {
+                    saved.push((rs, was));
+                    TAKEN.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             true
         }
     }

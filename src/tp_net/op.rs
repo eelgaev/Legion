@@ -267,7 +267,7 @@ pub(super) mod cuda {
         let src = unsafe { &*dst.src[0] };
         let plan = micro_plan(&comm, &m, src);
         // SAFETY: the caller's.
-        let r = unsafe { start(&comm, &plan, src.data as usize, stream, true) };
+        let r = unsafe { start(&comm, &plan, src.data as usize, stream, true, None) };
         if let Err(e) = &r {
             comm.fail(e.clone());
         }
@@ -417,7 +417,20 @@ pub(super) mod cuda {
                 && crate::tp_net::seq_par::deferred(dst)
                 && plan.wire == Wire::Bf16
                 && comm.n_ranks() == 2;
-            start(&comm, &plan, src, stream, false).and_then(|seq| {
+            // A MoE tail this reduce-scatter runs itself (#1176): its BF16 values straight
+            // into the send buffer, or with F32 on the wire into its own output first.
+            let tail = match kind {
+                Kind::ReduceScatter => crate::tp_net::seq_par::tail_of(dst),
+                _ => None,
+            };
+            let tail = match tail {
+                Some(t) if plan.wire != Wire::Bf16 => {
+                    crate::model::core::node_fuse::launch_tail(t, None, stream).map(|_| None)
+                }
+                t => Ok(t),
+            };
+            let started = tail.and_then(|tail| start(&comm, &plan, src, stream, false, tail));
+            started.and_then(|seq| {
                 if defer {
                     hand_over(&comm, &plan, seq, dst.data as usize, stream)
                 } else {
@@ -497,17 +510,28 @@ pub(super) mod cuda {
     /// The first half of an exchange on a working communicator: the buffers (grown if needed),
     /// this rank's values into the send buffer, "ready" raised, the writers' and readers' jobs
     /// queued. Returns the exchange's sequence number; `micro`: it stays in flight (for
-    /// [`launch_micro_finish`]).
+    /// [`launch_micro_finish`]). `tail` (a plain BF16 reduce-scatter's, see
+    /// [`crate::tp_net::seq_par::take_tail`]): the MoE tail node whose values `src` holds,
+    /// not run yet; it runs here with its values rounded straight into the send buffer.
     ///
     /// # Safety
-    /// `src` is the device address of the plan's source on `stream`'s device.
+    /// `src` is the device address of the plan's source on `stream`'s device; `tail` as
+    /// [`crate::model::core::node_fuse::launch_tail`]'s node.
     unsafe fn start(
         comm: &super::super::Comm,
         plan: &Plan,
         src: usize,
         stream: *mut c_void,
         micro: bool,
+        tail: Option<&ffi::ggml_tensor>,
     ) -> Result<u32, String> {
+        // Only the BF16 whole-source pack below runs a tail; anywhere else its node (a no-op
+        // now) would leave stale values to send. Checked before the sequence number moves.
+        if tail.is_some()
+            && !(plan.wire == Wire::Bf16 && plan.kind == Kind::ReduceScatter && plan.pack_whole)
+        {
+            return Err("tp exchange: a tail needs a BF16 whole-source reduce-scatter".into());
+        }
         let (rank, n_ranks) = (comm.rank(), comm.n_ranks());
         let kind = plan.kind;
         let eb = plan.wire.bytes();
@@ -519,6 +543,25 @@ pub(super) mod cuda {
         // output written and this exchange may reuse the buffers.
         let left = comm.deferred.lock().expect("deferred lock").take();
         if let Some(d) = left {
+            static NOTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            // The first few, with the exchange that came first (#1176: which one the graph
+            // orders between a reduce-scatter and its norm).
+            if NOTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+                let what = match kind {
+                    Kind::AllReduce => "all-reduce",
+                    Kind::ReduceScatter => "reduce-scatter",
+                    Kind::AllGather => "all-gather",
+                };
+                tracing::info!(
+                    deferred_seq = d.seq,
+                    deferred_values = d.n,
+                    seq,
+                    by = what,
+                    values = plan.span,
+                    micro,
+                    "tp reduce-scatter: a deferred sum made by the next exchange (the first 3)"
+                );
+            }
             // SAFETY: as in `finish`; the buffers are held until "consumed" below.
             unsafe { complete_deferred(comm, &d, stream)? };
         }
@@ -587,7 +630,11 @@ pub(super) mod cuda {
         // SAFETY: device tensors of the stream's device; the pinned buffers are mapped for it
         // and live as long as the communicator.
         unsafe {
-            if bf16 {
+            if bf16 && let Some(t) = tail.filter(|_| kind == Kind::ReduceScatter && plan.pack_whole)
+            {
+                // The whole source as the pack below rounds it (#1176).
+                crate::model::core::node_fuse::launch_tail(t, Some(dd + send as u64), stream)?;
+            } else if bf16 {
                 let packs: Vec<(usize, usize)> = match kind {
                     Kind::AllGather => vec![(0, mine.1)],
                     _ if plan.pack_whole => vec![(0, plan.span)],
@@ -714,13 +761,6 @@ pub(super) mod cuda {
         d: &Deferred,
         stream: *mut c_void,
     ) -> Result<(), String> {
-        static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            tracing::info!(
-                seq = d.seq,
-                "tp reduce-scatter: a deferred sum made by the next exchange (once per process)"
-            );
-        }
         let srcs = d.srcs.map(|a| a as *const f32);
         // SAFETY: the caller's; `srcs` are the exchange's held BF16 buffers, `dst` its output.
         unsafe {

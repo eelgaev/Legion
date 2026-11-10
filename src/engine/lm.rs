@@ -6715,6 +6715,28 @@ impl Worker {
     }
 
     /// Grows `seq`'s block table to hold `n` tokens, from its reservation.
+    /// Room for `k` drafted tokens past the kept positions of every decoding sequence not in
+    /// `done` and every prompt in `joined` ([`Self::grow`]).
+    fn grow_for_drafts(
+        &mut self,
+        decoding: &mut [Seq<'_>],
+        done: &[usize],
+        prefilling: &mut [Seq<'_>],
+        joined: &[usize],
+        k: usize,
+    ) -> Result<(), String> {
+        for (i, seq) in decoding.iter_mut().enumerate() {
+            if !done.contains(&i) {
+                self.grow(seq, seq.n_past + k)?;
+            }
+        }
+        for &i in joined {
+            let seq = &mut prefilling[i];
+            self.grow(seq, seq.n_past + k)?;
+        }
+        Ok(())
+    }
+
     fn grow(&mut self, seq: &mut Seq<'_>, n: usize) -> Result<(), String> {
         let have = seq.table.num_tokens() as usize;
         if n <= have {
@@ -7831,15 +7853,12 @@ impl Worker {
             // that just finished and excluding sequences that have ended.
             let draft_batch = batch - done.len() + joined.len();
             // Drafts sit past the kept positions: room for them in the block tables (the
-            // next step takes those blocks anyway).
-            for (i, seq) in decoding.iter_mut().enumerate() {
-                if !done.contains(&i) {
-                    self.grow(seq, seq.n_past + k)?;
-                }
-            }
-            for &i in &joined {
-                let seq = &mut prefilling[i];
-                self.grow(seq, seq.n_past + k)?;
+            // next step takes those blocks anyway). A drafter reading the step's rows on the
+            // device (#1181) reads them first: growing can lend the expert cache, which drops
+            // the kept graphs and with them the buffer those rows are in.
+            let grow_after = !hidden_dev.is_empty();
+            if !grow_after {
+                self.grow_for_drafts(decoding, &done, prefilling, &joined, k)?;
             }
             let max_ctx = self.max_ctx;
             let draft_span = (joined.iter())
@@ -8057,6 +8076,9 @@ impl Worker {
                     _ => unreachable!(),
                 }
                 self.clock.lap(host_time::Phase::Device, &mut at);
+            }
+            if grow_after {
+                self.grow_for_drafts(decoding, &done, prefilling, &joined, k)?;
             }
         }
         // Read: the next step copies its captured rows into them (#363), unless a take-in left

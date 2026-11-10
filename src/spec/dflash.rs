@@ -473,6 +473,15 @@ impl DflashDrafter {
         }
         let pool = self.pool.as_mut().expect("made above");
         let Some(slot) = pool.take() else {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    slots = pool.slots(),
+                    "the drafter's cache pool is full: more sequences draft with a cache of \
+                     their own and attend alone (warned once)"
+                );
+            }
             return Ok(None);
         };
         match cache::SeqCache::in_pool(cfg, pool, slot, cfg.block_size, self.model.window) {

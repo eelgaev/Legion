@@ -837,6 +837,17 @@ fn fold_code(f: FoldSum) -> i32 {
     }
 }
 
+/// Whether a stage graph may capture the launch of the `hc_post_norm` node `node`
+/// ([`crate::model::core::stage_ops::capture_safe`]): not when its `out` is a deferred
+/// reduce-scatter ([`P_RS`], #1176). That launch takes the exchange's buffers and sequence
+/// number from the communicator, which change every exchange, and hands the sum back there. A
+/// replay would read the captured exchange's buffers and leave the communicator's sum to the
+/// next exchange, which then writes it into `out` after this node read it, when `out`'s memory
+/// may belong to another tensor already (an illegal address in a long prompt over two GB10s).
+pub(crate) fn capture_safe(node: &ffi::ggml_tensor) -> bool {
+    crate::ggml::external_params(node)[P_RS] == 0
+}
+
 /// Whether `node` is an unfolded [`hc_post_norm_rebuilt_xnb`] node a MoE tail may be folded
 /// into ([`fold_moe`]): F32 streams, a BF16 down weight, and on CUDA (`cuda`) qwen4exp's 4 x
 /// 2560 streams with 4 inject outputs (the fold kernel's shape).
