@@ -1449,10 +1449,12 @@ fn moe_tail_read_elsewhere_is_not_folded() {
     assert!(got == want);
 }
 
-/// #1176: a stage graph captures an `hc_post_norm` node, but not one that reads a deferred
-/// reduce-scatter's partials (its launch takes the exchange's buffers from the communicator).
+/// #1176: a stage graph captures an `hc_post_norm` node, also one that reads a deferred
+/// reduce-scatter's partials: its kernel reads their addresses from the communicator's device
+/// slot, which the exchange writes on the stream, so the launch takes no per-exchange host
+/// state.
 #[test]
-fn a_deferred_reduce_scatter_reader_is_not_captured() {
+fn a_deferred_reduce_scatter_reader_is_captured() {
     let (e, n) = (64, 4);
     let kk = e * FOLD_HC;
     let ctx = Context::new(64, 64);
@@ -1470,11 +1472,8 @@ fn a_deferred_reduce_scatter_reader_is_not_captured() {
             let op = crate::ggml::op_of(node).expect("an external op node");
             crate::model::core::stage_ops::capture_safe(op, &*node)
         };
-        assert!(capture_safe(&*node) && safe(), "a plain input sum");
+        assert!(safe(), "a plain input sum");
         crate::ggml::set_external_param(node, P_RS, 1);
-        assert!(
-            !capture_safe(&*node) && !safe(),
-            "a deferred reduce-scatter"
-        );
+        assert!(safe(), "a deferred reduce-scatter");
     }
 }

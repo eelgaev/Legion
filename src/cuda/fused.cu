@@ -119,11 +119,13 @@ struct legion_hc_post_norm {
     // F32 -> BF16 conversion before a cuBLAS BF16 GEMM), for the BF16 down weight's matmul
     // (#469). sm_80+, neither xn16 nor xq; with scale_at only at qwen4exp's shape (#836).
     __nv_bfloat16 * xnb;
-    // legion_hc_post_norm_rs_launch only (#1176): rank 0's and rank 1's BF16 partials of a
-    // tensor-parallel reduce-scatter laid out as out (token t at rs[r] + t * out_ld), whose sum
-    // out is, added here as src/cuda/tp_net.cu's tp_sum_bf16 adds them; out is not read. At the
-    // end: every other field keeps its place.
-    const __nv_bfloat16 * rs[2];
+    // legion_hc_post_norm_rs_launch only (#1176): device memory holding the addresses of rank
+    // 0's and rank 1's BF16 partials of a tensor-parallel reduce-scatter laid out as out (token
+    // t at rs[r] + t * out_ld), whose sum out is, added here as src/cuda/tp_net.cu's
+    // tp_sum_bf16 adds them; out is not read. The exchange writes the two addresses there on
+    // the stream before this kernel, so a captured launch reads the current exchange's buffers.
+    // At the end: every other field keeps its place.
+    const __nv_bfloat16 * const * rs;
 };
 
 int legion_hc_post_norm_launch(const legion_hc_post_norm * p, void * stream);
@@ -995,8 +997,9 @@ __global__ void __launch_bounds__(HC_THREADS) hc_post_norm_reg_kernel(legion_hc_
 // it keep their code).
 // RB (#774): the streams' norm scales at p.scale_at instead of xn (with xn16, no xq; or, #836,
 // with B16 on sm_80+), for a reader that rebuilds xn (hc_mix16.cu).
-// RS (#1176, legion_hc_post_norm_rs_launch): out made from the two ranks' BF16 partials p.rs,
-// rank 0's first, as tp_sum_bf16 makes it (each widened to F32, one rounded add): out's bits.
+// RS (#1176, legion_hc_post_norm_rs_launch): out made from the two ranks' BF16 partials at the
+// addresses p.rs holds, rank 0's first, as tp_sum_bf16 makes it (each widened to F32, one
+// rounded add): out's bits.
 template <int HC, int NINJ, int PS, bool SM80 = false, bool Q = false, bool B16 = false, bool RB = false,
           bool RS = false>
 __global__ void __launch_bounds__(HC_THREADS, 4) hc_post_norm_v70_kernel(legion_hc_post_norm p) {
@@ -1022,11 +1025,18 @@ __global__ void __launch_bounds__(HC_THREADS, 4) hc_post_norm_v70_kernel(legion_
         }
     }
     float ov[PS];
+    // RS: the partials' addresses, read once from the exchange's slot.
+    [[maybe_unused]] const __nv_bfloat16 * rs0 = nullptr;
+    [[maybe_unused]] const __nv_bfloat16 * rs1 = nullptr;
+    if constexpr (RS) {
+        rs0 = p.rs[0];
+        rs1 = p.rs[1];
+    }
 #pragma unroll
     for (int r = 0; r < PS; r++) {
         if constexpr (RS) {
             const int64_t i = t * p.out_ld + threadIdx.x + r * HC_THREADS;
-            ov[r] = __fadd_rn(__bfloat162float(p.rs[0][i]), __bfloat162float(p.rs[1][i]));
+            ov[r] = __fadd_rn(__bfloat162float(rs0[i]), __bfloat162float(rs1[i]));
         } else {
             ov[r] = out[threadIdx.x + r * HC_THREADS];
         }
@@ -1712,8 +1722,7 @@ int legion_hc_post_norm_rs_launch(const legion_hc_post_norm * p, void * stream) 
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
     // The rebuilt BF16-xn form legion_hc_post_norm_launch takes for xnb with scale_at.
     if (major < 8 || p->hc != 4 || p->n_inj != 4 || p->e != 10 * HC_THREADS || p->xnb == nullptr ||
-        p->scale_at == 0 || p->xq != nullptr || p->xn16 != nullptr || p->rs[0] == nullptr ||
-        p->rs[1] == nullptr || p->n_tok < 1) {
+        p->scale_at == 0 || p->xq != nullptr || p->xn16 != nullptr || p->rs == nullptr || p->n_tok < 1) {
         return -1;
     }
     hc_post_norm_v70_kernel<4, 4, 10, true, false, true, true, true>

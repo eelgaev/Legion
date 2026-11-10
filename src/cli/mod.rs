@@ -22,6 +22,7 @@ mod mmq_ids_bench;
 mod model_path;
 mod nvfp4_gemm_bench;
 mod nvfp4_mv_bench;
+mod nvfp4_mvq_bench;
 mod nvfp4_once_bench;
 mod paged_split_bench;
 mod q4k_head_bench;
@@ -135,6 +136,9 @@ enum Command {
     /// (development).
     #[command(hide = true)]
     Nvfp4OnceBench(nvfp4_once_bench::Nvfp4OnceBenchArgs),
+    /// Check and time the tensor-core NVFP4 dense matvec op against ggml's mmvq (development).
+    #[command(hide = true)]
+    Nvfp4MvqBench(nvfp4_mvq_bench::Nvfp4MvqBenchArgs),
     /// Check and time the GB10 Q4_K draft LM head op against ggml's mmvq (development).
     #[command(hide = true)]
     Q4kHeadBench(q4k_head_bench::Q4kHeadBenchArgs),
@@ -231,6 +235,7 @@ async fn run(cli: Cli, numa: Option<legion::hw::numa_bind::Placement>) -> anyhow
         Command::Q8HeadBench(args) => q8_head_bench::run(args),
         Command::HcMixBench(args) => hc_mix_bench::run(args),
         Command::Nvfp4OnceBench(args) => nvfp4_once_bench::run(args),
+        Command::Nvfp4MvqBench(args) => nvfp4_mvq_bench::run(args),
         Command::Q4kHeadBench(args) => q4k_head_bench::run(args),
         Command::HeadMmBench(args) => head_mm_bench::run(args),
         Command::Q8GroupCheck(args) => q8_group_check::run(args),

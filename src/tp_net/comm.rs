@@ -838,9 +838,13 @@ pub struct Comm {
     #[cfg(feature = "cuda")]
     pub(super) in_flight: Mutex<std::collections::VecDeque<u32>>,
     /// The CUDA path's reduce-scatter whose sum its reader makes ([`super::seq_par::defer_sum`]),
-    /// until that reader ran.
+    /// until the next exchange frees its buffers.
     #[cfg(feature = "cuda")]
     pub(super) deferred: Mutex<Option<super::op::cuda::Deferred>>,
+    /// Where that reduce-scatter leaves its partials' addresses for the reader (made by the
+    /// first one, kept at the same address).
+    #[cfg(feature = "cuda")]
+    pub(super) sum_slot: Mutex<Option<super::op::cuda::SumSlot>>,
 }
 
 impl Comm {
@@ -961,6 +965,8 @@ impl Comm {
             in_flight: Mutex::new(std::collections::VecDeque::new()),
             #[cfg(feature = "cuda")]
             deferred: Mutex::new(None),
+            #[cfg(feature = "cuda")]
+            sum_slot: Mutex::new(None),
         }))
     }
 

@@ -319,6 +319,7 @@ fn build_cuda_kernels(ggml: &Path) {
         .file("src/cuda/gdn.cu")
         .file("src/cuda/norm_rope.cu")
         .file("src/cuda/sm120/nvfp4_a4.cu")
+        .file("src/cuda/sm120/nvfp4_mvq.cu")
         .file("src/cuda/dequant.cu")
         .file("src/cuda/cpu_share.cu")
         .file("src/cuda/dense_mv.cu")

@@ -16,6 +16,9 @@ mod tests;
 /// matvecs are checked per node ([`super::expert_mv::capture_safe`]).
 pub(crate) const PURE: &[&str] = &[
     // qwen4 (Qwen3.8-Flash-Next): the hyper-connection mixers, per-layer embeddings, QSA.
+    // The reader of a deferred reduce-scatter's partials too (#1176): its kernel reads their
+    // addresses from the communicator's device slot (`crate::tp_net::seq_par::sum_slot`, fixed
+    // for the communicator's life), which the exchange writes on the stream before it.
     "hc_post_norm",
     "hc_norm",
     "qwen4_hc_mix",
@@ -147,9 +150,6 @@ pub fn capture_safe(op: &ExternalOp, node: &ffi::ggml_tensor) -> bool {
     match op.name {
         // SAFETY: the node of an expert matvec op, which only its builders make.
         "expert_mv" | "expert_mv_glu" => unsafe { super::expert_mv::capture_safe(node) },
-        // Not the reader of a deferred reduce-scatter (#1176): it takes the exchange's buffers
-        // from the communicator.
-        "hc_post_norm" => crate::model::qwen4::post_norm_capture_safe(node),
         name if COMMIT.contains(&name) => COMMIT_CAPTURE.load(Ordering::Relaxed),
         name => listed(name, crate::ggml::stage_graph::small_step()),
     }
