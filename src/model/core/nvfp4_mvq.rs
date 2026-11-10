@@ -38,8 +38,9 @@ static NVFP4_MVQ: ExternalOp = ExternalOp {
 };
 
 /// Fewest columns the model's matmuls take the op at: at one column every MMA would carry one
-/// useful column of 8, and ggml's one-column MMVQ is cheaper.
-pub const MIN_N: i64 = 2;
+/// useful column of 8, and ggml's one-column MMVQ is cheaper; at 2-4 the op is still 4-7%
+/// slower per matmul on a GB10, so those stay on MMVQ too.
+pub const MIN_N: i64 = 5;
 
 /// Most columns: ggml-cuda runs NVFP4 matmuls on MMVQ up to 8 ([`super::linear::NVFP4_GGML_MAX_N`]),
 /// one MMA's columns.

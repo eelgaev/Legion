@@ -306,7 +306,7 @@ pub struct Switches {
     /// NVFP4 expert matmuls of 2-8 tokens reading each routed expert once, with ggml's MMVQ bits
     /// ([`crate::model::core::set_nvfp4_once`]).
     pub nvfp4_once: Option<bool>,
-    /// NVFP4 dense matmuls of 2-8 tokens on Legion's tensor-core op with ggml's MMVQ bits
+    /// NVFP4 dense matmuls of 5-8 tokens on Legion's tensor-core op with ggml's MMVQ bits
     /// ([`crate::model::core::set_nvfp4_mvq`]).
     pub nvfp4_mvq: Option<bool>,
     /// Q8_0 matmuls of 9-255 tokens on Legion's two-launch op with MMQ's bits

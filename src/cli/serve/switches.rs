@@ -821,7 +821,7 @@ pub(in crate::cli) struct SwitchArgs {
     /// The default since #1133 round 2; accepted for older command lines (see --no-nvfp4-mvq).
     #[arg(long, hide = true, conflicts_with = "no_nvfp4_mvq")]
     nvfp4_mvq: bool,
-    /// NVFP4 dense matmuls of 2-8 tokens (decode and verify steps) on compute capability 12.x
+    /// NVFP4 dense matmuls of 5-8 tokens (verify steps, decode of 5-8 users) on compute capability 12.x
     /// (GB10, RTX 50; no effect elsewhere): keep them on ggml's MMVQ instead of Legion's op
     /// (the default: the sub-block sums on tensor cores, then ggml's float order, so the same
     /// bits as MMVQ; `legion nvfp4-mvq-bench` checks them and times both). The same output
