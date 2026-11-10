@@ -999,11 +999,17 @@ impl<'a> Tensor<'a> {
             "f32_range_via on a non-F32 tensor"
         );
         assert!(
-            (start + n) * 4 <= self.nbytes(),
+            start
+                .checked_add(n)
+                .and_then(|e| e.checked_mul(4))
+                .is_some_and(|b| b <= self.nbytes()),
             "f32_range_via out of bounds"
         );
         assert!(
-            self.is_allocated() && via.is_allocated() && via.is_host() && via.nbytes() >= n * 4,
+            self.is_allocated()
+                && via.is_allocated()
+                && via.is_host()
+                && n.checked_mul(4).is_some_and(|b| via.nbytes() >= b),
             "f32_range_via needs allocated tensors and a big enough host one to read through"
         );
         // SAFETY: `via` is allocated host memory of at least `n * 4` bytes (aligned for its
