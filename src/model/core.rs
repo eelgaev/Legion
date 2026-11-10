@@ -1144,12 +1144,15 @@ impl<'a> Inputs<'a> {
                 }
             };
             match ids.filter(|v| v.nbytes() >= n * 4) {
-                Some(via) => logits.with_f32_range_via(via, start, n, |v| {
-                    for &r in rs {
-                        let at = r * n_vocab - start;
-                        take(r, &v[at..at + needs[r].len(n_vocab)]);
-                    }
-                }),
+                // SAFETY: the closure only reads the slice; nothing writes `via` meanwhile.
+                Some(via) => unsafe {
+                    logits.with_f32_range_via(via, start, n, |v| {
+                        for &r in rs {
+                            let at = r * n_vocab - start;
+                            take(r, &v[at..at + needs[r].len(n_vocab)]);
+                        }
+                    })
+                },
                 None => {
                     for &r in rs {
                         take(r, &logits.f32_range(r * n_vocab, needs[r].len(n_vocab)));

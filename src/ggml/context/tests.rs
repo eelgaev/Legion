@@ -472,10 +472,13 @@ fn with_f32_range_via_sees_what_f32_range_reads() {
     let via = ctx.new_tensor(types::F32, &[4]);
     ctx.alloc_tensors(cpu.buffer_type()).unwrap();
     t.set_f32(&[0.5, -1.0, 2.25, 3.0, -0.0, 1e30]);
-    assert_eq!(
-        t.with_f32_range_via(via, 1, 4, |s| s.to_vec()),
-        t.f32_range(1, 4)
-    );
-    assert_eq!(t.with_f32_range_via(via, 5, 1, |s| s[0]), 1e30);
-    assert_eq!(t.with_f32_range_via(via, 6, 0, |s| s.len()), 0);
+    // SAFETY: the closures only read the slice; nothing writes `via` meanwhile.
+    unsafe {
+        assert_eq!(
+            t.with_f32_range_via(via, 1, 4, |s| s.to_vec()),
+            t.f32_range(1, 4)
+        );
+        assert_eq!(t.with_f32_range_via(via, 5, 1, |s| s[0]), 1e30);
+        assert_eq!(t.with_f32_range_via(via, 6, 0, |s| s.len()), 0);
+    }
 }
