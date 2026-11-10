@@ -116,6 +116,10 @@ static LOGGED: AtomicUsize = AtomicUsize::new(0);
 /// # Safety
 /// As [`crate::ggml::post_alloc::Rewrite`].
 pub unsafe fn rewrite(graph: *mut ffi::ggml_cgraph) {
+    // First, whatever the settings: a deferred reduce-scatter's reader must run before the next
+    // exchange (#1176), the order every run of the graph keeps.
+    // SAFETY: the caller's.
+    unsafe { crate::tp_net::seq_par::check_order(graph) };
     // With ggml-cuda's fusions off, every sum runs unfused; left alone rather than modelled.
     if !ON.load(Ordering::Relaxed) || std::env::var_os("GGML_CUDA_DISABLE_FUSION").is_some() {
         return;
