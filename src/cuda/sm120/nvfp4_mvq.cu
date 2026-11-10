@@ -226,14 +226,14 @@ constexpr int MV_ITERS   = 8;   // a chunk spans at most MV_ITERS / NWG steps of
 // Dynamic shared memory: p.ns piece slots of piece_bytes + 16 (the 4 rows of a group land in
 // different banks), the partial sums [warp][h][MV_R][column], p.ns mbarriers. Pieces are read
 // in order (region, chunk, row), piece q into slot q % ns.
-template <int NWG>
-__global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
+template <int NWG, int WG = 1>
+__global__ void __launch_bounds__(MV_THREADS * WG, 1) mv(const legion_nvfp4_mvq p) {
     pdl_launch_dependents();
 #ifdef LEGION_MVQ_MMA
     using namespace legion_tma;
     constexpr int R   = MV_R;
     constexpr int BPI = 16 * NWG;
-    constexpr int NP  = BPI / MV_WARPS;
+    constexpr int NP  = BPI / MV_WARPS / WG;  // WG 2: warps w and w + 8 split the residues
     constexpr int G4  = R / 4;
     constexpr int IT  = MV_ITERS / NWG;  // BPI steps a chunk spans at most (the host's plan)
     static_assert(NP % 2 == 0, "residues in pairs of ggml lanes 16 apart");
@@ -246,9 +246,11 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
     const int ns     = p.ns;
     uint8_t *  ring = smem;
     float *    part = reinterpret_cast<float *>(smem + ns * pitch);
-    uint64_t * full = reinterpret_cast<uint64_t *>(part + MV_WARPS * 2 * R * 8);
+    float *    xch  = part + MV_WARPS * 2 * R * 8;
+    uint64_t * full = reinterpret_cast<uint64_t *>(xch + (WG > 1 ? MV_THREADS * 16 : 0));
 
-    const int w    = threadIdx.x / WARP_SIZE;
+    const int w    = (threadIdx.x / WARP_SIZE) % MV_WARPS;
+    const int hg   = threadIdx.x / MV_THREADS;
     const int lane = threadIdx.x % WARP_SIZE;
     const int g    = lane >> 2;
     const int t    = lane & 3;
@@ -339,7 +341,7 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
                 for (int it = 0; it < IT; ++it) {
 #pragma unroll
                     for (int P = 0; P < NP; ++P) {
-                        const int  kbx = base + BPI * it + w + MV_WARPS * P;
+                        const int  kbx = base + BPI * it + w + MV_WARPS * (P + NP * hg);
                         const bool ok  = col_ok && kbx >= lo && kbx < hi;
                         xv[it][P]      = ok ? xq[(int64_t) kbx * 4] : make_uint4(0x80808080u, 0x80808080u, 0x80808080u, 0x80808080u);
                         yv[it][P]      = ok ? yd[kbx * 2 * MAX_N] : 0.0f;
@@ -363,7 +365,7 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
             for (int it = 0; it < IT; ++it) {
 #pragma unroll
                 for (int P = 0; P < NP; ++P) {
-                    const int kbx = base + BPI * it + w + MV_WARPS * P;
+                    const int kbx = base + BPI * it + w + MV_WARPS * (P + NP * hg);
                     if (kbx < lo || kbx >= hi) {
                         continue;
                     }
@@ -446,11 +448,41 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
                 for (int b = 0; b < 2; ++b) {
                     v[b] = acc[b][c][rr2];
 #pragma unroll
-                    for (int l = 1; l < NWG; ++l) {
+                    for (int l = 1; l < NP / 2; ++l) {
                         v[b] += acc[2 * l + b][c][rr2];
                     }
                 }
-                part[((w * 2 + hp) * R + 4 * c + ra + rr2) * 8 + g] = v[0] + v[1];
+                if (WG == 1) {
+                    part[((w * 2 + hp) * R + 4 * c + ra + rr2) * 8 + g] = v[0] + v[1];
+                } else if (hg == 0) {
+                    xch[((c * 2 + rr2) * 2 + 0) * MV_THREADS + threadIdx.x] = v[0];
+                    xch[((c * 2 + rr2) * 2 + 1) * MV_THREADS + threadIdx.x] = v[1];
+                }
+            }
+        }
+        if constexpr (WG > 1) {
+            // Warp w's ggml warps 0.. NP / 2 - 1 first, then warp w + 8's, one at a time.
+            __syncthreads();
+            if (hg == 1) {
+#pragma unroll
+                for (int c = 0; c < G4; ++c) {
+                    if (c >= ng) {
+                        break;
+                    }
+#pragma unroll
+                    for (int rr2 = 0; rr2 < 2; ++rr2) {
+                        float v[2];
+#pragma unroll
+                        for (int b = 0; b < 2; ++b) {
+                            v[b] = xch[((c * 2 + rr2) * 2 + b) * MV_THREADS + threadIdx.x - MV_THREADS];
+#pragma unroll
+                            for (int l = 0; l < NP / 2; ++l) {
+                                v[b] += acc[2 * l + b][c][rr2];
+                            }
+                        }
+                        part[((w * 2 + hp) * R + 4 * c + ra + rr2) * 8 + g] = v[0] + v[1];
+                    }
+                }
             }
         }
         __syncthreads();
@@ -487,8 +519,9 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
 
 // The kernels for the host stubs: the quantization, then mv<NWG> for NWG = 4, 2
 // (src/model/core/nvfp4_mvq.rs's kernel index).
-extern "C" const void * const legion_nvfp4_mvq_kernels[3] = {
+extern "C" const void * const legion_nvfp4_mvq_kernels[4] = {
     reinterpret_cast<const void *>(&quantize),
     reinterpret_cast<const void *>(&mv<4>),
     reinterpret_cast<const void *>(&mv<2>),
+    reinterpret_cast<const void *>(&mv<4, 2>),
 };

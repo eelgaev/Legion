@@ -270,7 +270,16 @@ unsafe fn cpu_nvfp4_mvq(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
 /// 4 columns, 2 above).
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn kernel_index(n: usize) -> usize {
+    if n <= 4 && wg2() {
+        return 3;
+    }
     1 + usize::from(n > 4)
+}
+
+/// Experiment: 16 warps (two groups of 8) for 1-4 columns.
+fn wg2() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("LEGION_MVQ_WG").is_ok_and(|v| v == "2"))
 }
 
 /// `legion_nvfp4_mvq` of `src/cuda/sm120/nvfp4_mvq.cu`.
@@ -302,7 +311,9 @@ unsafe fn cuda_nvfp4_mvq(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
         return Err("nvfp4_mvq: weight not 16-byte aligned".into());
     }
     let dev = launch::device()?;
-    let plan = plan(o.k, o.rows, dev.smem.min(SMEM_12X))
+    let wg = o.n <= 4 && wg2();
+    let xch = if wg { 16 * 1024 } else { 0 };
+    let plan = plan(o.k, o.rows, dev.smem.min(SMEM_12X) - xch)
         .ok_or_else(|| format!("nvfp4_mvq: no ring for k {} rows {}", o.k, o.rows))?;
     let mut p = Params {
         x: o.x as *const f32,
@@ -338,11 +349,11 @@ unsafe fn cuda_nvfp4_mvq(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
         z: 1,
     };
     let block = launch::Dim3 {
-        x: (WARPS * 32) as u32,
+        x: (WARPS * 32 * if wg { 2 } else { 1 }) as u32,
         y: 1,
         z: 1,
     };
-    launch::launch(kernel_index(o.n), grid, block, plan.smem, &mut p, stream)
+    launch::launch(kernel_index(o.n), grid, block, plan.smem + xch, &mut p, stream)
 }
 
 #[cfg(feature = "cuda")]
@@ -396,7 +407,7 @@ mod launch {
     }
 
     /// Entries of the kernel table.
-    const KERNELS: usize = 3;
+    const KERNELS: usize = 4;
     const DEV_ATTR_SM_COUNT: c_int = 16;
     const DEV_ATTR_SMEM_OPTIN: c_int = 97;
     const DEV_ATTR_CC_MAJOR: c_int = 75;
