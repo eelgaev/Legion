@@ -96,6 +96,18 @@ pub fn set_expert_tile_prefetch(on: bool) {
     EXPERT_TILE_PREFETCH.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+static EXPERT_TMA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the routed experts' fused SwiGLU GEMM at prompt steps ([`swiglu_id`] on the grouped
+/// GEMM, default stages) fills its stages with the TMA (one tensor copy per 128 weight rows, one
+/// bulk copy per token, mbarrier stages, the last warp out of a stage refilling it) instead of
+/// per-thread cp.async copies and a CTA barrier per block of k, on GPUs with sm_90+ code (the
+/// GB10) and 16-byte aligned weight rows (k a multiple of 256). The same MMAs in the same order:
+/// the same bits either way. `legion serve --nvfp4-expert-tma` (#1183).
+pub fn set_expert_tma(on: bool) {
+    EXPERT_TMA.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 static PAD_SKIP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Whether a routed SwiGLU FFN on the grouped mv kernels ([`swiglu_id_rows`] with a row map,
@@ -1444,6 +1456,11 @@ mod cuda {
             variant: i32,
             stream: *mut c_void,
         ) -> i32;
+        fn legion_nvfp4_swiglu_gemm_tma_launch(
+            p: *const Params,
+            nt: i32,
+            stream: *mut c_void,
+        ) -> i32;
         fn legion_nvfp4_mvg_launch(
             p: *const Params,
             nt: i32,
@@ -1979,6 +1996,14 @@ mod cuda {
 
     /// The grouped SwiGLU GEMM at `8 * nt` tokens per tile.
     fn glu_gemm(p: &Params, nt: i32, tune: GemmTune, stream: *mut c_void) -> Result<(), String> {
+        if tune == GEMM_DEFAULT && EXPERT_TMA.load(Ordering::Relaxed) {
+            // SAFETY: as below; -1 (nothing launched) where the TMA kernel does not apply.
+            match unsafe { legion_nvfp4_swiglu_gemm_tma_launch(p, nt, stream) } {
+                0 => return Ok(()),
+                -1 => {}
+                e => return Err(format!("nvfp4 swiglu_id (TMA): CUDA error {e}")),
+            }
+        }
         // SAFETY: parameters checked by the caller; the node's stream.
         match unsafe { legion_nvfp4_swiglu_gemm_launch(p, nt, tune.code(), stream) } {
             0 => Ok(()),

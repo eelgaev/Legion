@@ -393,6 +393,18 @@ pub(in crate::cli) struct SwitchArgs {
     /// ~3% faster expert FFNs). The same bits either way. For comparisons.
     #[arg(long, help_heading = HEADING)]
     no_nvfp4_expert_tile_prefetch: bool,
+    /// CUDA, GB10 (sm_90+ code), NVFP4 routed experts at prompt steps: fill the fused
+    /// gate/up/SwiGLU GEMM's stages with the tensor memory accelerator (one tensor copy per 128
+    /// weight rows, one bulk copy per token, the last warp done with a stage refilling it)
+    /// instead of per-thread copies and a CTA barrier per block of k. Needs weight rows of a
+    /// multiple of 256 values (Qwen3.8-Flash-Next's 2560). The same bits either way. Off by
+    /// default.
+    #[arg(long, help_heading = HEADING, conflicts_with = "no_nvfp4_expert_tma")]
+    nvfp4_expert_tma: bool,
+    /// Keep the fused gate/up/SwiGLU expert GEMM on per-thread copies (see
+    /// --nvfp4-expert-tma). For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_nvfp4_expert_tma: bool,
     /// CUDA, NVFP4 routed experts on Legion's W4A16 kernels: matmuls of up to this many (token,
     /// expert) pairs per used expert (if the routing were even) take the grouped mv kernel,
     /// more the grouped GEMM. Default 32: prompt steps of up to ~1,600 tokens on
@@ -1423,6 +1435,11 @@ impl SwitchArgs {
             nvfp4_wide_mv: self.nvfp4_wide_mv.then_some(true),
             nvfp4_expert_pdl: self.no_nvfp4_expert_pdl.then_some(false),
             nvfp4_expert_tile_prefetch: self.no_nvfp4_expert_tile_prefetch.then_some(false),
+            nvfp4_expert_tma: if self.no_nvfp4_expert_tma {
+                Some(false)
+            } else {
+                self.nvfp4_expert_tma.then_some(true)
+            },
             nvfp4_expert_mv_max: self.nvfp4_expert_mv_max.map(i64::from),
             nvfp4_expert_mv_tile: self.nvfp4_expert_mv_tile.map(i32::from),
             nvfp4_expert_mv_split: self.nvfp4_expert_mv_split,
