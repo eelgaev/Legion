@@ -79,6 +79,12 @@ pub struct Switches {
     /// A Q8_0 MTP draft LM head of 9-16 sequences on Legion's Q8_0 matvec op
     /// ([`crate::model::core::set_q8_mv`]).
     pub q8_mv: Option<bool>,
+    /// GGUF-quantized matmuls of 2-8 columns on a V100 on Legion's small-M op (opt-in)
+    /// ([`crate::model::core::set_q_small_m`]).
+    pub q_small_m: Option<bool>,
+    /// That op also for the steps ggml runs on MMQ, up to 8 columns
+    /// ([`crate::model::core::q_small_m::set_wide`]).
+    pub q_small_m_wide: Option<bool>,
     /// A one-column Q8_0 MTP draft LM head on Legion's one-column Q8_0 matvec op
     /// ([`crate::model::core::set_q8_head`]).
     pub q8_head: Option<bool>,
@@ -547,6 +553,8 @@ impl Switches {
         );
         set(self.dense_mv, crate::model::dense_mv::set_dense_mv);
         set(self.q8_mv, core::set_q8_mv);
+        set(self.q_small_m, core::set_q_small_m);
+        set(self.q_small_m_wide, core::q_small_m::set_wide);
         set(self.q8_head, core::set_q8_head);
         set(self.q8_head_pick, core::q8_head::pick::set_pick);
         set(self.q8_row_mv, core::q8_head::set_row_mv);
