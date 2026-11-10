@@ -111,6 +111,71 @@ pub(crate) fn deferred(dst: &ffi::ggml_tensor) -> bool {
     external_params(dst)[P_DEFERRED] != 0
 }
 
+/// The parameter of a [`reduce_scatter`] node that [`take_tail`] sets.
+const P_TAIL: usize = 2;
+
+/// A post-allocation rewrite on CUDA (#1176): the [`reduce_scatter`] node `rs` whose source
+/// is `tail` (a MoE tail made one op in its fused-sum form,
+/// [`crate::model::core::node_fuse::MOE_SUM_GATE`], which only `rs` reads, directly or
+/// through a view of all of it) runs that tail itself: with `--tp-wire bf16` at its size the
+/// tail's values go rounded to BF16 straight into the send buffer (the values the exchange's
+/// rounding of `tail` would put there, without `tail` written and read back), else into
+/// `tail` first as before. `inputs` (the tail's sources) become `rs`'s sources too, so the
+/// graph, planned again after the rewrite, keeps them until `rs`; `tail` launches nothing.
+/// Whether it did (not for a micro-batch exchange or one already rewritten).
+///
+/// # Safety
+/// Valid nodes of a graph not yet run; the caller plans the graph again and saves `rs` and
+/// `tail` first if it may undo this.
+pub(crate) unsafe fn take_tail(
+    rs: *mut ffi::ggml_tensor,
+    tail: *mut ffi::ggml_tensor,
+    inputs: &[*mut ffi::ggml_tensor],
+) -> bool {
+    // SAFETY: the caller's.
+    unsafe {
+        let t = &mut *rs;
+        if !crate::ggml::op_of(t).is_some_and(|op| std::ptr::eq(op, &REDUCE_SCATTER))
+            || external_params(t)[P_TAIL] != 0
+            || inputs.len() + 1 > ffi::GGML_MAX_SRC as usize
+            || t.src[1..].iter().any(|s| !s.is_null())
+        {
+            return false;
+        }
+        let src = t.src[0];
+        let whole = src == tail
+            || (!(*src).view_src.is_null()
+                && (*src).view_src == tail
+                && (*src).view_offs == 0
+                && ffi::ggml_is_contiguous(src)
+                && ffi::ggml_nelements(src) == ffi::ggml_nelements(tail));
+        if !whole || !ffi::ggml_is_contiguous(tail) {
+            return false;
+        }
+        t.src[1..1 + inputs.len()].copy_from_slice(inputs);
+        crate::ggml::set_external_param(rs, P_TAIL, 1);
+        crate::ggml::set_external_param(tail, crate::model::core::node_fuse::P_BY_EXCHANGE, 1);
+        true
+    }
+}
+
+/// The MoE tail node the [`reduce_scatter`] node `dst` runs itself ([`take_tail`]), if any.
+#[cfg(feature = "cuda")]
+pub(crate) fn tail_of(dst: &ffi::ggml_tensor) -> Option<&ffi::ggml_tensor> {
+    if external_params(dst)[P_TAIL] == 0 {
+        return None;
+    }
+    // SAFETY: a node of `reduce_scatter`: its source is the tail or a view of all of it.
+    unsafe {
+        let src = &*dst.src[0];
+        Some(if src.view_src.is_null() {
+            src
+        } else {
+            &*src.view_src
+        })
+    }
+}
+
 /// For the reader of the deferred reduce-scatter node `rs` ([`defer_sum`]), on CUDA: the device
 /// addresses of rank 0's and rank 1's BF16 partials of this rank's columns (`[row, share]`
 /// each) and the exchange's sequence number, for [`release_deferred`]. `None`: the node summed
