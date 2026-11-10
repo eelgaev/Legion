@@ -421,6 +421,9 @@ pub struct SpecConfig {
     /// DFlash and the MTP heads: the output head rows they draft with, as stored or as a 4-bit
     /// copy (`--spec-draft-lm-head`).
     pub draft_lm_head: DraftLmHead,
+    /// DFlash 2: one flash attention per drafter layer over every sequence of a draft pass
+    /// (`--spec-draft-batched-attn`).
+    pub draft_batched_attn: bool,
     /// MTP: draft the continuation of an earlier occurrence of the sequence's last this many
     /// tokens or more, instead of the head's drafts, where that pays ([`mtp_ngram`],
     /// `--spec-mtp-ngram`; 0: off).
@@ -454,6 +457,7 @@ impl std::fmt::Debug for SpecConfig {
             .field("draft_window", &self.draft_window)
             .field("draft_weights", &self.draft_weights)
             .field("draft_lm_head", &self.draft_lm_head)
+            .field("draft_batched_attn", &self.draft_batched_attn)
             .field("mtp_ngram", &self.mtp_ngram)
             .field("mtp_ngram_k", &self.mtp_ngram_k)
             .finish()

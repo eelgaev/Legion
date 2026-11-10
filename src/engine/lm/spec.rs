@@ -63,6 +63,7 @@ impl Drafting {
                 weights: cfg.draft_weights,
                 draft_vocab: dflash_vocab,
                 lm_head: cfg.draft_lm_head,
+                batched_attn: cfg.draft_batched_attn,
                 ..Default::default()
             };
             if cfg.draft_window > 0 {

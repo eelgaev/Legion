@@ -116,6 +116,9 @@ pub struct DflashOptions {
     /// DFlash with the target's output head: those rows as stored or as a 4-bit copy
     /// (`--spec-draft-lm-head`).
     pub lm_head: crate::spec::DraftLmHead,
+    /// DFlash 2: the batched draft pass attends every sequence in one flash attention per
+    /// layer, over caches that share one pool (`--spec-draft-batched-attn`).
+    pub batched_attn: bool,
 }
 
 impl Default for DflashOptions {
@@ -128,6 +131,7 @@ impl Default for DflashOptions {
             weights: Default::default(),
             draft_vocab: 0,
             lm_head: Default::default(),
+            batched_attn: false,
         }
     }
 }
@@ -153,6 +157,13 @@ pub struct DflashDrafter {
     caches: HashMap<SeqId, cache::SeqCache>,
     /// Caches of finished sequences, to reuse.
     spare: Vec<cache::SeqCache>,
+    /// `--spec-draft-batched-attn`: the slots the sequences' caches live in, made on first use.
+    /// Declared after `caches`: their tensors are views of it.
+    pool: Option<cache::CachePool>,
+    /// The most sequences the engine runs at once: the pool's slots.
+    max_seqs: usize,
+    /// The pool could not be allocated: every sequence has a cache of its own.
+    pool_failed: bool,
 }
 
 /// Most idle caches kept for the next sequences.
@@ -349,6 +360,9 @@ impl DflashDrafter {
             opts,
             caches: HashMap::new(),
             spare: Vec::new(),
+            pool: None,
+            max_seqs: target.max_seqs.max(1),
+            pool_failed: false,
         })
     }
 
@@ -368,6 +382,10 @@ impl DflashDrafter {
 
     fn cache_for(&mut self, seq: SeqId) -> Result<&mut cache::SeqCache, String> {
         if !self.caches.contains_key(&seq) {
+            if let Some(c) = self.pooled_cache()? {
+                self.caches.insert(seq, c);
+                return Ok(self.caches.get_mut(&seq).expect("inserted"));
+            }
             let c = match self.spare.pop() {
                 Some(mut c) => {
                     c.clear();
@@ -384,6 +402,62 @@ impl DflashDrafter {
             self.caches.insert(seq, c);
         }
         Ok(self.caches.get_mut(&seq).expect("inserted"))
+    }
+
+    /// `--spec-draft-batched-attn`: a fresh cache in a free slot of the pool (made on first
+    /// use, a slot for each of the engine's sequences); `None` without the flag, for a drafter
+    /// without DFlash 2's batched pass, when the pool could not be allocated or with every slot
+    /// taken (that sequence then has a cache of its own and attends alone).
+    fn pooled_cache(&mut self) -> Result<Option<cache::SeqCache>, String> {
+        if !self.opts.batched_attn || self.model.selector().is_none() || self.pool_failed {
+            return Ok(None);
+        }
+        let cfg = &self.model.cfg;
+        if self.pool.is_none() {
+            let pool = match cache::CachePool::new(
+                cfg,
+                self.backend.buffer_type(),
+                cfg.block_size,
+                self.model.window,
+                self.max_seqs,
+            ) {
+                Ok(pool) => pool,
+                Err(e) => {
+                    tracing::warn!(
+                        "cannot allocate the drafter's cache pool ({e}): drafting attends per \
+                         sequence"
+                    );
+                    self.pool_failed = true;
+                    return Ok(None);
+                }
+            };
+            tracing::info!(
+                slots = pool.slots(),
+                cells = pool.cells(),
+                "drafter cache pool for batched attention"
+            );
+            self.pool = Some(pool);
+        }
+        let pool = self.pool.as_mut().expect("made above");
+        let Some(slot) = pool.take() else {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    slots = pool.slots(),
+                    "the drafter's cache pool is full: more sequences draft with a cache of \
+                     their own and attend alone (warned once)"
+                );
+            }
+            return Ok(None);
+        };
+        match cache::SeqCache::in_pool(cfg, pool, slot, cfg.block_size, self.model.window) {
+            Ok(c) => Ok(Some(c)),
+            Err(e) => {
+                pool.give(slot);
+                Err(format!("cannot place the drafter's cache in its pool: {e}"))
+            }
+        }
     }
 
     /// Whether `r` hands over the hidden states of its `ran` rows of every fused layer.
@@ -469,6 +543,7 @@ impl DflashDrafter {
             &mut self.backend,
             &mut self.alloc,
             &mut refs,
+            self.pool.as_ref(),
             &feats,
             &positions,
             false,
@@ -500,6 +575,7 @@ impl DflashDrafter {
             &mut self.backend,
             &mut self.draft_alloc,
             &seqs,
+            self.pool.as_ref(),
             self.model.cfg.block_size,
             false,
             self.opts.min_confidence > 0.0,
@@ -746,9 +822,17 @@ impl ModelDrafter for DflashDrafter {
     }
 
     fn release(&mut self, seq: SeqId) {
-        if let Some(c) = self.caches.remove(&seq)
-            && self.spare.len() < SPARE_CACHES
-        {
+        let Some(c) = self.caches.remove(&seq) else {
+            return;
+        };
+        if let Some(slot) = c.slot() {
+            // Its views go; the slot takes the next sequence.
+            drop(c);
+            self.pool
+                .as_mut()
+                .expect("a slot is of the pool")
+                .give(slot);
+        } else if self.spare.len() < SPARE_CACHES {
             self.spare.push(c);
         }
     }
