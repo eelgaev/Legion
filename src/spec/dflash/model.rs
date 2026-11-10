@@ -247,6 +247,26 @@ fn drafter_allocator(backend: &Backend) -> ComputeAllocator {
     ComputeAllocator::headroom(backend.buffer_type())
 }
 
+/// One side of DFlash 2's convolution around layer weight `w` (the kernel projection): one op
+/// on a GPU where it fits ([`super::fused::conv`]), else ggml's ops; the same bits.
+#[allow(clippy::too_many_arguments)]
+fn conv<'a>(
+    ctx: &'a Context,
+    w: Tensor<'_>,
+    x: Tensor<'a>,
+    dynamic: Tensor<'a>,
+    base: Tensor<'a>,
+    side: usize,
+    v2: &v2::Dflash2,
+    block: i64,
+) -> Tensor<'a> {
+    if super::fused::takes_conv(w, x, dynamic, base, v2, block) {
+        super::fused::conv(ctx, x, dynamic, base, side, v2, block)
+    } else {
+        v2::conv(ctx, x, dynamic, base, side, v2, block)
+    }
+}
+
 /// Part `s` of `n` equal parts of `v` (one sequence's rows of a batched pass's output).
 fn part<T: Clone>(v: &[T], n: usize, s: usize) -> Vec<T> {
     let len = v.len() / n;
@@ -624,9 +644,10 @@ impl Model {
     ) -> (Tensor<'a>, Option<Tensor<'a>>) {
         match &self.cfg.v2 {
             Some(v2) => {
-                let dynamic = ctx.mul_mat(self.lw(il, &format!("{part}_conv_proj.weight")), x);
+                let w = self.lw(il, &format!("{part}_conv_proj.weight"));
+                let dynamic = ctx.mul_mat(w, x);
                 let base = self.conv_base(ctx, il, part);
-                (v2::conv(ctx, x, dynamic, base, 0, v2, block), Some(dynamic))
+                (conv(ctx, w, x, dynamic, base, 0, v2, block), Some(dynamic))
             }
             None => (x, None),
         }
@@ -645,8 +666,9 @@ impl Model {
     ) -> Tensor<'a> {
         match (&self.cfg.v2, dynamic) {
             (Some(v2), Some(dynamic)) => {
+                let w = self.lw(il, &format!("{part}_conv_proj.weight"));
                 let base = self.conv_base(ctx, il, part);
-                v2::conv(ctx, y, dynamic, base, 1, v2, block)
+                conv(ctx, w, y, dynamic, base, 1, v2, block)
             }
             _ => y,
         }
@@ -1063,7 +1085,7 @@ impl Model {
         // DFlash 2: the head's top-k tokens of every position, their logits and the selector's
         // hidden projection; the selector itself runs on the host (`Selector::walk`).
         let selector = self.selector.as_ref().map(|s| {
-            let top = ctx.top_k(logits, s.top_k as i32);
+            let top = super::fused::top_k(&ctx, logits, s.top_k as i64, head);
             let unary = ctx.get_rows(ctx.reshape_3d(logits, 1, self.n_vocab as i64, n_out), top);
             let proj = ctx.mul_mat(self.w("selector_hidden.weight"), x);
             (top.as_output(), unary.as_output(), proj.as_output())

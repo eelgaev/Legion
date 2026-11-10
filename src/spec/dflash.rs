@@ -67,6 +67,7 @@
 
 mod cache;
 mod config;
+mod fused;
 mod head;
 mod model;
 pub mod tiny;

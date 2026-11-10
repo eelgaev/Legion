@@ -34,7 +34,7 @@ end up running the code: the sm70 kernels also run on newer GPUs when the dispat
 | `sm120/nvfp4_mvq.cu` | The matvec kernels (`cvt.rn.f16x2.e2m1x2`, sm_120a/sm_121a; the weights by `cp.async.bulk` into an mbarrier ring; a trap elsewhere, and `nvfp4_mvq::takes` asks `nvfp4_a4::supported_on` first); its activation quantization is plain SIMT code. |
 | `sm90/cluster_select.cu` | The whole file: decode-sized top-k (`qsa_attn.cu`'s `topk_kernel` bits) and argmax (ggml-cuda's `argmax_f32` bits) on clusters of 8 CTAs a row (`src/model/cluster_select.rs`). |
 
-The other files have no architecture-specific code (`fused.cu`, `expert_mv/` (split by weight type into its own translation units, #955),
+The other files have no architecture-specific code (`fused.cu`, `dflash_draft.cu`, `expert_mv/` (split by weight type into its own translation units, #955),
 `dequant.cu`, `shim.cu`, `gdn_scan.cu`) or one family only (`nvfp4_mm/` (split into the GEMM,
 mv and grouped-mv parts by tile width, #955), `gdn_mma.cu`, sm_80+), and stay whole. `gdn_mma.cu` is Legion's port of ggml-cuda's chunked gated delta rule
 (`--gdn-mma`), kernels only and without any ggml-cuda header: `src/model/core/gdn_mma.rs`
