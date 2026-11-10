@@ -114,8 +114,14 @@ fn check_shape(cfg: &Config, n: usize) -> Result<(), String> {
     if !fits(w, x) {
         return Err(format!(
             "k {}, m {}, cols {n}: the op does not take it ({MIN_COLS}-{MAX_COLS} columns, k a \
-             multiple of 32, m of 256)",
-            cfg.k, cfg.m
+             multiple of {} up to {}, m a multiple of {} from {} up to {})",
+            cfg.k,
+            cfg.m,
+            super::BK,
+            super::MAX_K,
+            super::ROWS,
+            super::MIN_ROWS,
+            super::ROWS * super::MAX_PARTS
         ));
     }
     if !super::device_supported() {

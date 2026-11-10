@@ -122,9 +122,8 @@ pub fn bitwise(k: i64, m: i64, n: i64) -> bool {
 }
 
 /// Whether the head `w @ x` (then the soft-cap and the argmax) takes the op: [`fits`], a
-/// weight in one GPU's memory on a CUDA engine whose GPU runs the kernels
-/// ([`device_supported`]), and by default a shape and column count of cuBLAS's bits on a GB10
-/// ([`bitwise`]).
+/// weight in one GPU's memory on a CUDA engine, that GPU running the kernels ([`supported_on`]),
+/// and by default a shape and column count of cuBLAS's bits on a GB10 ([`bitwise`]) as that GPU.
 pub fn takes(w: Tensor<'_>, x: Tensor<'_>) -> bool {
     let mode = MODE.load(Ordering::Relaxed);
     let [k, m, ..] = w.ne();
@@ -134,10 +133,12 @@ pub fn takes(w: Tensor<'_>, x: Tensor<'_>) -> bool {
         && !w.is_host()
         && !w.is_meta()
         && crate::model::cluster_select::on_cuda()
-        && device_supported()
-        && (mode == MODE_ALL
-            || (bitwise(k, m, x.ne()[1])
-                && crate::model::dense_mv::compute_capability() == Some(BITWISE_CC)))
+        && w.cuda_device().is_some_and(|dev| {
+            supported_on(dev)
+                && (mode == MODE_ALL
+                    || (bitwise(k, m, x.ne()[1])
+                        && crate::hw::per_device::compute_capability(dev) == Some(BITWISE_CC)))
+        })
 }
 
 /// Whether the kernels compute `w @ x`: a BF16 matrix `w` (`[k, m]`, rows 16-byte aligned,
@@ -184,6 +185,20 @@ pub fn device_supported() -> bool {
     }
     #[cfg(not(feature = "cuda"))]
     false
+}
+
+/// Whether CUDA device `dev` runs the kernels ([`device_supported`] asked of that device): the
+/// head weight's GPU, which need not be the current one when graphs are built.
+pub fn supported_on(dev: usize) -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        cuda::supported_on(dev)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = dev;
+        false
+    }
 }
 
 /// The logits of the head `w` (BF16 `[k, m]`) for `x` (F32 `[k, n]`) soft-capped by `cap`
@@ -365,6 +380,7 @@ mod cuda {
             args: *mut *mut c_void,
         ) -> c_int;
         fn cudaGetDevice(device: *mut c_int) -> c_int;
+        fn cudaSetDevice(device: c_int) -> c_int;
         fn cudaGetLastError() -> c_int;
         fn cudaMalloc(p: *mut *mut c_void, bytes: usize) -> c_int;
         fn cudaDeviceGetAttribute(value: *mut c_int, attr: c_int, device: c_int) -> c_int;
@@ -411,6 +427,31 @@ mod cuda {
                 cudaGetLastError();
             }
             slot.store(if ok { 1 } else { 2 }, Ordering::Relaxed);
+            ok
+        }
+    }
+
+    /// [`supported`] asked of device `dev`, made current for the queries and switched back.
+    pub(super) fn supported_on(dev: usize) -> bool {
+        let Ok(dev) = c_int::try_from(dev) else {
+            return false;
+        };
+        let mut was = 0;
+        // SAFETY: device queries; the current device is put back before returning.
+        unsafe {
+            if cudaGetDevice(&mut was) != 0 {
+                cudaGetLastError();
+                return false;
+            }
+            if was == dev {
+                return supported();
+            }
+            if cudaSetDevice(dev) != 0 {
+                cudaGetLastError();
+                return false;
+            }
+            let ok = supported();
+            cudaSetDevice(was);
             ok
         }
     }

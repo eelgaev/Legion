@@ -8,7 +8,8 @@ use crate::model::core::mmq_preq::tests::noise;
 
 #[test]
 fn fits_takes_bf16_heads_of_49_to_128_columns() {
-    let ctx = Context::new(64, 0);
+    // One tensor per column count plus the odd shapes below.
+    let ctx = Context::new(128, 0);
     let w = ctx.new_tensor(types::BF16, &[5376, 262144]);
     let col = |n: i64| ctx.new_tensor(types::F32, &[5376, n]);
     for n in MIN_COLS..=MAX_COLS {
