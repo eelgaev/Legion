@@ -462,3 +462,20 @@ fn f32_range_via_reads_what_f32_range_reads() {
     assert_eq!(t.f32_range_via(via, 5, 1), [1e30]);
     assert!(t.f32_range_via(via, 6, 0).is_empty());
 }
+
+/// #1176: a span read through a host tensor and used in place holds what a plain read gives.
+#[test]
+fn with_f32_range_via_sees_what_f32_range_reads() {
+    let cpu = Backend::cpu().unwrap();
+    let ctx = Context::new(2, 0);
+    let t = ctx.new_tensor(types::F32, &[6]);
+    let via = ctx.new_tensor(types::F32, &[4]);
+    ctx.alloc_tensors(cpu.buffer_type()).unwrap();
+    t.set_f32(&[0.5, -1.0, 2.25, 3.0, -0.0, 1e30]);
+    assert_eq!(
+        t.with_f32_range_via(via, 1, 4, |s| s.to_vec()),
+        t.f32_range(1, 4)
+    );
+    assert_eq!(t.with_f32_range_via(via, 5, 1, |s| s[0]), 1e30);
+    assert_eq!(t.with_f32_range_via(via, 6, 0, |s| s.len()), 0);
+}

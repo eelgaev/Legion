@@ -5270,6 +5270,7 @@ impl LmEngine {
         );
 
         let stop_tokens = chat_format.stop_tokens(&tokenizer);
+        exec.set_stop_tokens(&stop_tokens);
         let (submit, rx) = std::sync::mpsc::channel();
         let expert_stats = exec.experts_mut().map(|experts| experts.stats());
         let stats = Arc::new(Mutex::new(EngineStats {
@@ -8316,6 +8317,33 @@ enum StepRow<'a> {
     Picked(u32, Option<Vec<f32>>),
 }
 
+/// What a step returns for a sequence that has `generated` of its `min_tokens` tokens:
+/// `greedy` (no grammar, greedy sampling, no log probabilities) only its greedy pick, the
+/// device argmax ([`Logits::Greedy`]), or below `min_tokens` the pick with the stop tokens
+/// masked ([`Logits::Pick`]: the executor reads back only what that needs, often nothing, #1176);
+/// otherwise the full row.
+fn logits_kind(greedy: bool, generated: u32, min_tokens: u32) -> Logits {
+    if !greedy {
+        Logits::Last
+    } else if generated >= min_tokens {
+        Logits::Greedy
+    } else {
+        Logits::Pick
+    }
+}
+
+/// What a verify step returns for `n` rows of a sequence whose [`logits_kind`] is `kind`: rows
+/// `0..min_tokens - generated` of a [`Logits::Pick`] sequence are below `min_tokens`.
+fn verify_logits(kind: Logits, n: usize, generated: u32, min_tokens: u32) -> Logits {
+    match kind {
+        Logits::Greedy => Logits::FirstGreedy(n),
+        Logits::Pick => {
+            Logits::FirstPick(n, (min_tokens.saturating_sub(generated) as usize).min(n))
+        }
+        _ => Logits::First(n),
+    }
+}
+
 /// One sequence being generated: everything but the model state.
 struct Active<'t> {
     sampler: Sampler,
@@ -8400,19 +8428,13 @@ impl<'t> Active<'t> {
         }
     }
 
-    /// What the step must return for this sequence: only the argmax when that is the whole
-    /// sampling decision and no log probabilities are asked for. While `min_tokens` masking
-    /// is still needed the full row is required, because the argmax-only path cannot mask.
+    /// What the step must return for this sequence ([`logits_kind`]).
     fn logits_kind(&self) -> Logits {
-        if !self.constrained()
-            && self.sampler.is_greedy()
-            && self.logprobs.is_none()
-            && self.generated >= self.min_tokens
-        {
-            Logits::Greedy
-        } else {
-            Logits::Last
-        }
+        logits_kind(
+            !self.constrained() && self.sampler.is_greedy() && self.logprobs.is_none(),
+            self.generated,
+            self.min_tokens,
+        )
     }
 
     /// What [`Self::advance`] samples from, for a step row with device argmax `t` and `logits`
@@ -8462,13 +8484,9 @@ impl<'t> Active<'t> {
         }
     }
 
-    /// What a verify step must return for this sequence's `n` real rows.
+    /// What a verify step must return for this sequence's `n` rows ([`verify_logits`]).
     fn verify_logits(&self, n: usize) -> Logits {
-        if self.logits_kind() == Logits::Greedy {
-            Logits::FirstGreedy(n)
-        } else {
-            Logits::First(n)
-        }
+        verify_logits(self.logits_kind(), n, self.generated, self.min_tokens)
     }
 
     /// When the request arrived (queued, before admission).

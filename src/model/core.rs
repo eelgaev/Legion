@@ -82,6 +82,7 @@ pub mod mtp_moe;
 pub mod pad_rows;
 pub(crate) mod paged;
 pub mod pair;
+pub(crate) mod picks;
 mod spec;
 pub(crate) mod stable_fusions;
 pub mod stage_ops;
@@ -125,6 +126,7 @@ use crate::model::fp8_act;
 use crate::model::moe_ffn;
 use crate::residency::cpu_share;
 use crate::weights::{LoadError, Weights};
+use picks::{Need, Picks, took};
 
 /// `GGML_ROPE_TYPE_IMROPE`: interleaved multi-section RoPE.
 pub(crate) const ROPE_IMROPE: i32 = 40;
@@ -136,6 +138,11 @@ pub(crate) const ROPE_IMROPE: i32 = 40;
 /// flip an F16 rounding of a softmax weight and, through Q8_0 activation quantization, grow
 /// into ~1 logit of drift over 40 layers.
 const ATTN_KV_PAD: i64 = 256;
+
+/// Most bytes of logits rows [`Inputs::out_pin_bytes`] sizes the pinned output buffer for, so
+/// that [`Inputs::output_with`] reads runs of rows in one DMA ([`picks::spans`]; a 16-user verify
+/// step's 48 rows of a 248K vocabulary are ~48 MB); rows further apart come back in more reads.
+const OUT_SPAN_BYTES: usize = 64 << 20;
 
 /// Tensors and nodes a step's graph of up to [`graph_size::GRAPH_SIZE_GROUPS`] groups may hold
 /// ([`graph_size()`] sizes bigger steps' graphs).
@@ -496,26 +503,44 @@ pub enum Logits {
     First(usize),
     /// Only the argmaxes of the first `n` tokens' (a greedy verify step).
     FirstGreedy(usize),
+    /// Only the greedy pick of the last token's with the stop tokens masked (a greedy sequence
+    /// below `min_tokens`, [`picks`]): the argmax, or the host's pick where it may differ.
+    Pick,
+    /// Only the greedy picks of the first `n` tokens' (a greedy verify step below `min_tokens`,
+    /// [`picks`]), the first `m` with the stop tokens masked.
+    FirstPick(usize, usize),
 }
 
 impl Logits {
     fn rows(self, n_tok: usize) -> usize {
         match self {
             Logits::None => 0,
-            Logits::Last | Logits::Greedy => 1,
+            Logits::Last | Logits::Greedy | Logits::Pick => 1,
             Logits::All => n_tok,
-            Logits::First(n) | Logits::FirstGreedy(n) => n.min(n_tok),
+            Logits::First(n) | Logits::FirstGreedy(n) | Logits::FirstPick(n, _) => n.min(n_tok),
         }
     }
 
-    /// Whether only argmaxes come back.
-    fn greedy(self) -> bool {
-        matches!(self, Logits::Greedy | Logits::FirstGreedy(_))
+    /// Whether the rows come back whole (for the engine to sample from), not as argmaxes or
+    /// picks.
+    fn sampled(self) -> bool {
+        matches!(self, Logits::Last | Logits::All | Logits::First(_))
     }
 
     /// Whether the rows are the first tokens' rather than the last ones'.
     fn leading(self) -> bool {
-        matches!(self, Logits::First(_) | Logits::FirstGreedy(_))
+        matches!(
+            self,
+            Logits::First(_) | Logits::FirstGreedy(_) | Logits::FirstPick(..)
+        )
+    }
+
+    /// Whether only the last token's row is asked for (or none).
+    fn last_only(self) -> bool {
+        matches!(
+            self,
+            Logits::None | Logits::Last | Logits::Greedy | Logits::Pick
+        )
     }
 }
 
@@ -622,10 +647,7 @@ impl GroupShape {
             table: table.unwrap_or(0),
             ring: 0,
             logits: g.seqs.iter().map(|s| s.logits.rows(n_tok)).collect(),
-            last_only: g
-                .seqs
-                .iter()
-                .all(|s| matches!(s.logits, Logits::None | Logits::Last | Logits::Greedy)),
+            last_only: g.seqs.iter().all(|s| s.logits.last_only()),
             verify: g.verify,
             n_pool,
             n_new,
@@ -1027,7 +1049,7 @@ impl<'a> Inputs<'a> {
 
     /// Reads the step's results back: every row's argmax, and the rows that want logits.
     fn output(&self, groups: &[Group<'_>], n_vocab: usize) -> StepOutput {
-        self.output_with(groups, n_vocab, None, |t| t.to_f32())
+        self.output_with(groups, n_vocab, None, Picks::default(), |t| t.to_f32())
     }
 
     /// The bytes of the step's argmaxes (0 without them): what [`Self::output_with`] reads
@@ -1036,21 +1058,42 @@ impl<'a> Inputs<'a> {
         self.argmax.map_or(0, |t| t.nbytes())
     }
 
-    /// The bytes [`Self::output_with`] reads the argmaxes and then each logits row through: the
-    /// bigger of [`Self::argmax_bytes`] and one row of `n_vocab` F32s (0 without them).
-    fn out_pin_bytes(&self, n_vocab: usize) -> usize {
-        let row = self.logits.map_or(0, |_| n_vocab * 4);
-        self.argmax_bytes().max(row)
+    /// The bytes [`Self::output_with`] reads the argmaxes and then the logits rows of `groups`
+    /// through: the biggest of [`Self::argmax_bytes`], one row of `n_vocab` F32s and the span
+    /// from the first to the last row that comes back whole ([`Logits::sampled`]), when that is
+    /// at most [`OUT_SPAN_BYTES`] (0 without logits).
+    fn out_pin_bytes(&self, groups: &[Group<'_>], n_vocab: usize) -> usize {
+        let Some(_) = self.logits else {
+            return self.argmax_bytes();
+        };
+        let row = n_vocab * 4;
+        let (mut first, mut end, mut i) = (None, 0, 0);
+        for s in groups.iter().flat_map(|g| &g.seqs) {
+            let n = s.logits.rows(s.tokens.len());
+            if n > 0 && s.logits.sampled() {
+                first.get_or_insert(i);
+                end = i + n;
+            }
+            i += n;
+        }
+        let span = first.map_or(0, |f| (end - f) * row);
+        let span = if span <= OUT_SPAN_BYTES { span } else { 0 };
+        self.argmax_bytes().max(row).max(span)
     }
 
     /// [`Self::output`], reading the captured rows with `read`, and the argmaxes and logits rows
     /// through host tensor `ids` (pinned memory, [`Tensor::to_i32_via`],
-    /// [`Tensor::f32_range_via`]) when it has room for them ([`Self::out_pin_bytes`]).
+    /// [`Tensor::with_f32_range_via`]) when it has room for them ([`Self::out_pin_bytes`]).
+    /// Of a greedy pick row ([`Logits::Pick`], [`Logits::FirstPick`]) only what `picks` needs comes
+    /// back ([`picks::Need`]): the pick then stands in its argmax's place and its row stays empty.
+    /// Rows next to each other come back in one read when they fit ([`picks::spans`]: one DMA,
+    /// not one per row).
     fn output_with(
         &self,
         groups: &[Group<'_>],
         n_vocab: usize,
         ids: Option<Tensor<'_>>,
+        picks: Picks<'_>,
         mut read: impl FnMut(Tensor<'a>) -> Vec<f32>,
     ) -> StepOutput {
         let hidden = self.hidden.iter().map(|&t| read(t)).collect();
@@ -1064,18 +1107,69 @@ impl<'a> Inputs<'a> {
             Some(via) => argmax.to_i32_via(via),
             None => argmax.to_i32(),
         };
-        let argmax = argmax.into_iter().map(|t| t as u32).collect();
-        let row_via = ids.filter(|v| v.nbytes() >= n_vocab * 4);
-        let mut rows = Vec::new();
+        let mut argmax: Vec<u32> = argmax.into_iter().map(|t| t as u32).collect();
+        let mut needs = Vec::with_capacity(argmax.len());
         for s in groups.iter().flat_map(|g| &g.seqs) {
-            for _ in 0..s.logits.rows(s.tokens.len()) {
-                let start = rows.len() * n_vocab;
-                rows.push(match row_via {
-                    _ if s.logits.greedy() => Vec::new(),
-                    Some(via) => logits.f32_range_via(via, start, n_vocab),
-                    None => logits.f32_range(start, n_vocab),
-                });
+            for i in 0..s.logits.rows(s.tokens.len()) {
+                let t = argmax.get(needs.len()).copied().unwrap_or(u32::MAX);
+                needs.push(Need::of(s.logits, i, t, n_vocab, picks));
             }
+        }
+        let mut rows = vec![Vec::new(); needs.len()];
+        let wanted: Vec<usize> = (0..needs.len())
+            .filter(|&r| needs[r].len(n_vocab) > 0)
+            .collect();
+        // Each read brings back a run of rows' parts (one DMA through `ids`, [`picks::spans`]).
+        let parts: Vec<(usize, usize)> = (wanted.iter())
+            .map(|&r| (r * n_vocab, needs[r].len(n_vocab)))
+            .collect();
+        let cap = ids.map_or(0, |v| v.nbytes() / 4);
+        // Picks that need their whole row after all.
+        let mut whole = Vec::new();
+        for span in picks::spans(&parts, picks::SPAN_GAP, cap) {
+            let rs = &wanted[span.clone()];
+            let start = parts[span.start].0;
+            let (last, len) = parts[span.end - 1];
+            let n = last + len - start;
+            let mut take = |r: usize, values: &[f32]| {
+                if !took(
+                    needs[r],
+                    values,
+                    &mut argmax[r],
+                    &mut rows[r],
+                    n_vocab,
+                    picks,
+                ) {
+                    whole.push(r);
+                }
+            };
+            match ids.filter(|v| v.nbytes() >= n * 4) {
+                Some(via) => logits.with_f32_range_via(via, start, n, |v| {
+                    for &r in rs {
+                        let at = r * n_vocab - start;
+                        take(r, &v[at..at + needs[r].len(n_vocab)]);
+                    }
+                }),
+                None => {
+                    for &r in rs {
+                        take(r, &logits.f32_range(r * n_vocab, needs[r].len(n_vocab)));
+                    }
+                }
+            }
+        }
+        for r in whole {
+            let Need::Pick { masked, .. } = needs[r] else {
+                continue;
+            };
+            let need = Need::Pick {
+                len: n_vocab,
+                masked,
+            };
+            let v = match ids.filter(|v| v.nbytes() >= n_vocab * 4) {
+                Some(via) => logits.f32_range_via(via, r * n_vocab, n_vocab),
+                None => logits.f32_range(r * n_vocab, n_vocab),
+            };
+            took(need, &v, &mut argmax[r], &mut rows[r], n_vocab, picks);
         }
         StepOutput {
             argmax,
