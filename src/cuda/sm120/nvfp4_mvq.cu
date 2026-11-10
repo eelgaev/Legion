@@ -295,7 +295,9 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
     const bool    scaled = p.scale != nullptr;
     const float   sc     = scaled ? *p.scale : 1.0f;
 
-    int qb = 0;  // the region's first piece
+    uint4 xv[IT][NP];  // a chunk's activations (below)
+    float yv[IT][NP];
+    int   qb = 0;      // the region's first piece
     const bool compute = (p.mode & 1) == 0;
     for (int reg = r0; reg < r1; reg += step) {
         const int rr = min(R, r1 - reg);
@@ -317,17 +319,18 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
             const int hi   = lo + cb;
             const int base = lo - lo % BPI;
             // The chunk's activations, loaded before its weights are waited for (the warp's
-            // blocks of the chunk: kbx = base + BPI it + w + 8P; bytes 128 are zeros).
-            uint4 xv[IT][NP];
-            float yv[IT][NP];
+            // blocks of the chunk: kbx = base + BPI it + w + 8P; bytes 128 are zeros); whole
+            // rows once.
+            if (p.chunks > 1 || reg == r0) {
 #pragma unroll
-            for (int it = 0; it < IT; ++it) {
+                for (int it = 0; it < IT; ++it) {
 #pragma unroll
-                for (int P = 0; P < NP; ++P) {
-                    const int  kbx = base + BPI * it + w + MV_WARPS * P;
-                    const bool ok  = col_ok && kbx >= lo && kbx < hi;
-                    xv[it][P]      = ok ? xq[(int64_t) kbx * 4] : make_uint4(0x80808080u, 0x80808080u, 0x80808080u, 0x80808080u);
-                    yv[it][P]      = ok ? yd[kbx * 2 * MAX_N] : 0.0f;
+                    for (int P = 0; P < NP; ++P) {
+                        const int  kbx = base + BPI * it + w + MV_WARPS * P;
+                        const bool ok  = col_ok && kbx >= lo && kbx < hi;
+                        xv[it][P]      = ok ? xq[(int64_t) kbx * 4] : make_uint4(0x80808080u, 0x80808080u, 0x80808080u, 0x80808080u);
+                        yv[it][P]      = ok ? yd[kbx * 2 * MAX_N] : 0.0f;
+                    }
                 }
             }
             for (int i = 0; i < rr; ++i) {
