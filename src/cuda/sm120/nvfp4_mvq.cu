@@ -247,7 +247,9 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
     const int bpr    = p.k >> 6;
     const int cb     = bpr / p.chunks;  // blocks of a piece
     const int pbytes = cb * 36;
-    const int pitch  = pbytes + 16;
+    const bool grp   = (p.exp & 8192) && p.chunks == 1 && p.w_nb1 == pbytes && !(p.exp & 4096);
+    const int  pitch = pbytes + (grp ? 0 : 16);  // 8192: unpadded, CR-row copies
+    const int  CR    = grp ? 2 << ((p.exp >> 14) & 1) : 1;
     const int ns     = p.ns;
     uint8_t *  ring = smem;
     float *    part = reinterpret_cast<float *>(smem + ns * pitch);
@@ -272,7 +274,11 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
     const int  t0     = tail + 4 * (int) (((int64_t) blockIdx.x * gl) / G);
     const int  t1     = tail + 4 * (int) (((int64_t) (blockIdx.x + 1) * gl) / G);
     const int  nreg   = contig ? (t1 - t0 + R - 1) / R : whole + (t1 > t0);
-    auto start = [&](int j) { return contig ? t0 + j * R : j < whole ? (j * G + (int) blockIdx.x) * R : t0; };
+    const bool strided = p.exp & 4096;  // region rows G apart: the CTAs sweep neighbouring rows
+    auto start = [&](int j) {
+        return contig ? t0 + j * R : j < whole ? (strided ? j * G * R + (int) blockIdx.x : (j * G + (int) blockIdx.x) * R) : t0;
+    };
+    auto rstride = [&](int j) { return strided && j < whole ? G : 1; };
     auto rows  = [&](int j) { return contig ? min(R, t1 - t0 - j * R) : j < whole ? R : t1 - t0; };
     const int pfd = p.exp & 15;
     auto prefetch_region = [&](int j) {
@@ -342,13 +348,14 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
         const int c   = rem / rj;
         const int i   = rem - c * rj;
         const int s   = q % ns;
-        bar_expect_tx(full + s, pbytes);
-        bulk_g2s(ring + s * pitch, (const uint8_t *) p.w + (int64_t) (start(j) + i) * p.w_nb1 + c * pbytes,
-                 pbytes, full + s);
+        bar_expect_tx(full + s, CR * pbytes);
+        bulk_g2s(ring + s * pitch,
+                 (const uint8_t *) p.w + (int64_t) (start(j) + i * rstride(j)) * p.w_nb1 + c * pbytes,
+                 CR * pbytes, full + s);
     };
     auto issue_upto = [&](int lim) {
         const int hi = min(lim, total);
-        for (int q = pq + lane; q < hi; q += WARP_SIZE) {
+        for (int q = pq + lane * CR; q < hi; q += WARP_SIZE * CR) {
             issue_piece(q);
         }
         pq = max(pq, hi);
@@ -379,6 +386,7 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
     int   qb = 0;      // the region's first piece
     for (int j = 0; j < nreg; ++j) {
         const int reg = start(j);
+        const int rs  = rstride(j);
         const int rr  = rows(j);
         const int ng = rr >> 2;
 
@@ -442,7 +450,7 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
             }
             const int r_hi = min(rr, 4 * c_hi);
             for (int i = 4 * c_lo; i < r_hi; ++i) {
-                bar_wait(full + (q0 + i) % ns, (uint32_t) ((q0 + i) / ns) & 1);
+                bar_wait(full + ((q0 + i) & -CR) % ns, (uint32_t) ((q0 + i) / ns) & 1);
             }
 #pragma unroll
             for (int it = 0; it < IT; ++it) {
@@ -576,7 +584,7 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
                 if (scaled) {
                     v *= sc;
                 }
-                p.dst[col * p.dst_nb1 + reg + row] = v;
+                p.dst[col * p.dst_nb1 + reg + row * rs] = v;
             }
         }
         if (ws) {
