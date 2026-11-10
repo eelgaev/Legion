@@ -94,7 +94,7 @@ off. llama.cpp runs across two DGX Sparks with its RPC backend (layer split).
 | DGX Spark | vLLM 0.33.0 | NVFP4 | MTP ³ | 28-39 | 72.9 | 150.3 | 1,797 | 2,381 | 1,663 |
 | 2x DGX Spark | Legion | UD-Q4_K_XL GGUF | MTP ⁴ | **55-70** | **112.6** | **216.9** | **2,933** | **2,940** | **2,758** |
 | 2x DGX Spark | llama.cpp b12062 | UD-Q4_K_XL GGUF | none ⁵ | 23-26 | 47.4 | 75.0 | 1,066 | 1,064 | 1,014 |
-| 2x DGX Spark | Legion | NVFP4 | MTP ⁴ | 38-50 | 112.0 | 231.4 | 2,974 | 3,037 | 2,886 |
+| 2x DGX Spark | Legion | NVFP4 | MTP ⁴ | 38-50 | 112.0 | 231.4 | 2,990 | 3,122 | 2,956 |
 | 2x DGX Spark | vLLM 0.33.0 | NVFP4 | MTP ⁶ | 43-58 | 116.8 | 248.5 | 3,174 | 3,257 | 3,135 |
 | AC922, 2x V100 | Legion | UD-Q4_K_XL GGUF | MTP ⁷ | **70-90** | **86.4** | 88.5 | **2,789** | 4,094 | 4,302 |
 | AC922, 2x V100 | llama.cpp b12062 | UD-Q4_K_XL GGUF | MTP ⁸ | 11-13 | 7.3 | — | 120 | — | — |

@@ -93,12 +93,22 @@ pub(super) mod cuda {
         n: i64,
     }
 
+    /// `tp_copy_args` of `src/cuda/tp_net.cu`.
+    #[repr(C)]
+    struct CopyArgs {
+        src: *const u16,
+        dst: *mut u16,
+        n: i64,
+    }
+
     unsafe extern "C" {
         /// The kernels as the CUDA runtime knows them (their host stubs): the F32 sum, the sum
         /// of BF16 partials (also the BF16 to F32 copy, with one source) and the BF16 rounding.
         static legion_tp_net_sum_kernel: *const c_void;
         static legion_tp_net_sum_bf16_kernel: *const c_void;
         static legion_tp_net_pack_bf16_kernel: *const c_void;
+        /// The BF16 copy of an all-gather with a BF16 output (#1176).
+        static legion_tp_net_copy_bf16_kernel: *const c_void;
         fn cudaLaunchKernel(
             func: *const c_void,
             grid: Dim3,
@@ -371,6 +381,9 @@ pub(super) mod cuda {
         /// BF16: the whole source rounded into the send buffer (the plain all-reduce and
         /// reduce-scatter), not only the pieces (a micro-batch's).
         pack_whole: bool,
+        /// An all-gather with a BF16 output (`seq_par::all_gather_bf16`): the BF16 values
+        /// copied as they travelled, not widened to F32.
+        out_bf16: bool,
     }
 
     /// The plan of a plain exchange node.
@@ -406,6 +419,7 @@ pub(super) mod cuda {
             wire: comm.wire(full),
             pieces,
             pack_whole: true,
+            out_bf16: kind == Kind::AllGather && dst.type_ == crate::ggml::types::BF16,
         }
     }
 
@@ -435,6 +449,7 @@ pub(super) mod cuda {
             wire: comm.wire(row * m.n),
             pieces,
             pack_whole: false,
+            out_bf16: false,
         }
     }
 
@@ -455,6 +470,11 @@ pub(super) mod cuda {
             let defer = kind == Kind::ReduceScatter && crate::tp_net::seq_par::deferred(dst);
             if defer && (plan.wire != Wire::Bf16 || comm.n_ranks() != 2) {
                 let e = "tp reduce-scatter: a deferred sum needs two ranks and BF16 partials";
+                comm.fail(e.to_string());
+                return Err(e.to_string());
+            }
+            if plan.out_bf16 && plan.wire != Wire::Bf16 {
+                let e = "tp all-gather: a BF16 output needs BF16 on the wire";
                 comm.fail(e.to_string());
                 return Err(e.to_string());
             }
@@ -531,6 +551,21 @@ pub(super) mod cuda {
                 stream,
             )
         })
+    }
+
+    /// Copies `n` BF16 values from `src` to `dst` on `stream`.
+    ///
+    /// # Safety
+    /// Device-readable `src`, device-writable `dst`, `n` values each.
+    unsafe fn copy_bf16(src: u64, dst: usize, n: usize, stream: *mut c_void) -> Result<(), String> {
+        let mut args = CopyArgs {
+            src: src as *const u16,
+            dst: dst as *mut u16,
+            n: n as i64,
+        };
+        let mut argv = [(&raw mut args).cast::<c_void>()];
+        // SAFETY: the caller's.
+        unsafe { launch_1d(legion_tp_net_copy_bf16_kernel, &mut argv, n, stream) }
     }
 
     /// Rounds `n` F32 values at `src` to BF16 at `dst` on `stream`.
@@ -825,11 +860,15 @@ pub(super) mod cuda {
         let recv_dev = |r: usize| (dd + p.recv(r, k) as u64) as *const f32;
         let send_dev = |i: usize| (dd + (send + i * eb) as u64) as *const f32;
         let dst_at = |i: usize| (dst + i * 4) as *mut f32;
+        // A BF16 output: the shares as they travelled, at 2 bytes a value.
+        let dst16 = |i: usize| dst + i * 2;
         // SAFETY: as in `start`.
         unsafe {
             // An all-gather's own share needs nothing from the peers.
             if kind == Kind::AllGather {
-                if bf16 {
+                if plan.out_bf16 {
+                    copy_bf16(dd + send as u64, dst16(mine.0), mine.1, stream)?;
+                } else if bf16 {
                     let one = [send_dev(0)];
                     sum(
                         legion_tp_net_sum_bf16_kernel,
@@ -860,7 +899,9 @@ pub(super) mod cuda {
             if kind == Kind::AllGather {
                 for r in (0..n_ranks).filter(|&q| q != rank) {
                     let (i, c) = plan.pieces[r];
-                    if bf16 {
+                    if plan.out_bf16 {
+                        copy_bf16(recv_dev(r) as u64, dst16(i), c, stream)?;
+                    } else if bf16 {
                         sum(
                             legion_tp_net_sum_bf16_kernel,
                             &[recv_dev(r)],

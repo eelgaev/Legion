@@ -5,7 +5,7 @@
 `--model` is the downloaded snapshot of `nvidia/Qwen3.8-Flash-Next-NVFP4` on each Spark. One process per Spark.
 Rank 0 serves HTTP; `--tp-peers` lists the two ranks' addresses on the QSFP link (rank 0 first) and is the same on
 both. MTP uses the checkpoint's own head, so there is no `--spec-draft` file. Decode (38-50 tok/s at 1 user, 112.0 at 4,
-231.4 at 16) and prefill (2,974 / 3,037 / 2,886 tok/s at 8K / 32K / 123K):
+231.4 at 16) and prefill (2,990 / 3,122 / 2,956 tok/s at 8K / 32K / 123K):
 
 ```sh
 # rank 0
