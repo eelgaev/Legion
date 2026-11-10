@@ -959,6 +959,64 @@ impl<'a> Tensor<'a> {
         }
     }
 
+    /// For I32 tensors: like [`Self::to_i32`], through host tensor `via` (see
+    /// [`Self::to_f32_via`]). A step's argmaxes, like its captured rows.
+    pub fn to_i32_via(self, via: Tensor<'_>) -> Vec<i32> {
+        assert_eq!(
+            self.ty(),
+            ffi::ggml_type_GGML_TYPE_I32,
+            "to_i32_via on a non-I32 tensor"
+        );
+        assert!(
+            self.is_allocated() && via.is_allocated() && via.is_host(),
+            "to_i32_via needs allocated tensors and a host one to read through"
+        );
+        let n = self.nbytes();
+        assert!(
+            via.nbytes() >= n,
+            "to_i32_via: `{}` is too small",
+            via.name()
+        );
+        // SAFETY: `via` is allocated host memory of at least `n` bytes (aligned for its
+        // buffer), which the read fills before the slice is taken; any bytes are valid i32s.
+        unsafe {
+            let data = (*via.raw()).data;
+            if n > 0 {
+                ffi::ggml_backend_tensor_get(self.raw(), data, 0, n);
+            }
+            std::slice::from_raw_parts(data.cast::<i32>(), n / 4).to_vec()
+        }
+    }
+
+    /// [`Self::f32_range`] through host tensor `via` (pinned memory, room for `n` F32s): one DMA
+    /// into memory the device can always write, then a copy out on the CPU. A fresh vector's
+    /// pages are often not mapped yet, and on a GB10 (ATS) a copy into them faults page by
+    /// page on the GPU: a 1 MB logits row then took 3-20 ms instead of ~20 µs (#1176).
+    pub fn f32_range_via(self, via: Tensor<'_>, start: usize, n: usize) -> Vec<f32> {
+        assert_eq!(
+            self.ty(),
+            ffi::ggml_type_GGML_TYPE_F32,
+            "f32_range_via on a non-F32 tensor"
+        );
+        assert!(
+            (start + n) * 4 <= self.nbytes(),
+            "f32_range_via out of bounds"
+        );
+        assert!(
+            self.is_allocated() && via.is_allocated() && via.is_host() && via.nbytes() >= n * 4,
+            "f32_range_via needs allocated tensors and a big enough host one to read through"
+        );
+        // SAFETY: `via` is allocated host memory of at least `n * 4` bytes (aligned for its
+        // buffer), which the read fills before the slice is taken; any bytes are valid f32s.
+        unsafe {
+            let data = (*via.raw()).data;
+            if n > 0 {
+                ffi::ggml_backend_tensor_get(self.raw(), data, start * 4, n * 4);
+            }
+            std::slice::from_raw_parts(data.cast::<f32>(), n).to_vec()
+        }
+    }
+
     /// For F32 tensors: the DMA half of [`Self::to_f32_via`] only: the bytes land in host tensor
     /// `via` (pinned memory), which the caller then copies out (returns `via`'s address and the
     /// byte count).

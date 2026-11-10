@@ -1027,14 +1027,30 @@ impl<'a> Inputs<'a> {
 
     /// Reads the step's results back: every row's argmax, and the rows that want logits.
     fn output(&self, groups: &[Group<'_>], n_vocab: usize) -> StepOutput {
-        self.output_with(groups, n_vocab, |t| t.to_f32())
+        self.output_with(groups, n_vocab, None, |t| t.to_f32())
     }
 
-    /// [`Self::output`], reading the captured rows with `read`.
+    /// The bytes of the step's argmaxes (0 without them): what [`Self::output_with`] reads
+    /// them through needs this much room.
+    fn argmax_bytes(&self) -> usize {
+        self.argmax.map_or(0, |t| t.nbytes())
+    }
+
+    /// The bytes [`Self::output_with`] reads the argmaxes and then each logits row through: the
+    /// bigger of [`Self::argmax_bytes`] and one row of `n_vocab` F32s (0 without them).
+    fn out_pin_bytes(&self, n_vocab: usize) -> usize {
+        let row = self.logits.map_or(0, |_| n_vocab * 4);
+        self.argmax_bytes().max(row)
+    }
+
+    /// [`Self::output`], reading the captured rows with `read`, and the argmaxes and logits rows
+    /// through host tensor `ids` (pinned memory, [`Tensor::to_i32_via`],
+    /// [`Tensor::f32_range_via`]) when it has room for them ([`Self::out_pin_bytes`]).
     fn output_with(
         &self,
         groups: &[Group<'_>],
         n_vocab: usize,
+        ids: Option<Tensor<'_>>,
         mut read: impl FnMut(Tensor<'a>) -> Vec<f32>,
     ) -> StepOutput {
         let hidden = self.hidden.iter().map(|&t| read(t)).collect();
@@ -1044,14 +1060,20 @@ impl<'a> Inputs<'a> {
                 ..Default::default()
             };
         };
-        let argmax = argmax.to_i32().into_iter().map(|t| t as u32).collect();
+        let argmax = match ids.filter(|v| v.nbytes() >= argmax.nbytes()) {
+            Some(via) => argmax.to_i32_via(via),
+            None => argmax.to_i32(),
+        };
+        let argmax = argmax.into_iter().map(|t| t as u32).collect();
+        let row_via = ids.filter(|v| v.nbytes() >= n_vocab * 4);
         let mut rows = Vec::new();
         for s in groups.iter().flat_map(|g| &g.seqs) {
             for _ in 0..s.logits.rows(s.tokens.len()) {
-                rows.push(if s.logits.greedy() {
-                    Vec::new()
-                } else {
-                    logits.f32_range(rows.len() * n_vocab, n_vocab)
+                let start = rows.len() * n_vocab;
+                rows.push(match row_via {
+                    _ if s.logits.greedy() => Vec::new(),
+                    Some(via) => logits.f32_range_via(via, start, n_vocab),
+                    None => logits.f32_range(start, n_vocab),
                 });
             }
         }
