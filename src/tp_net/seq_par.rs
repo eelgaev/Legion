@@ -216,6 +216,16 @@ fn reads(t: &ffi::ggml_tensor) -> bool {
     )
 }
 
+/// [`check_order`] as the check run on every allocated graph
+/// ([`crate::ggml::post_alloc::set_order`]), whatever memory it got.
+///
+/// # Safety
+/// As [`check_order`].
+pub(crate) unsafe fn order_pass(graph: *mut ffi::ggml_cgraph) {
+    // SAFETY: the caller's.
+    unsafe { check_order(graph) };
+}
+
 /// A deferred sum made by its node after all ([`check_order`]), for the log.
 static WRITTEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
