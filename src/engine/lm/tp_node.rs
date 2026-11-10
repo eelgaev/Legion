@@ -16,7 +16,7 @@ use crate::gguf::GgufFile;
 use crate::model::core::pair::sum::PairSum;
 use crate::model::core::{Executor, Model, Pool, TpLead};
 use crate::node::{Link, Reply, Request, RowsPart};
-use crate::tp_net::{self, CommHandle, ControlListener, StepProfile, TpNetConfig};
+use crate::tp_net::{self, CommHandle, ControlListener, StepLaps, StepProfile, TpNetConfig};
 
 #[cfg(test)]
 mod tests;
@@ -66,9 +66,9 @@ impl Sums<'_> {
         }
     }
 
-    fn record(&self, profile: &mut StepProfile, took: Duration) {
+    fn record(&self, profile: &mut StepProfile, took: Duration, laps: Option<StepLaps>) {
         if let Self::Net(c) = self {
-            profile.record(c.comm(), took, Duration::ZERO);
+            profile.record(c.comm(), took, Duration::ZERO, laps);
         }
     }
 }
@@ -559,7 +559,7 @@ fn handle(
             rows.swap(0, 1);
             exec.recycle_rows(std::mem::take(&mut rows[0]));
             rows[0] = exec.step(&groups).map_err(|e| e.to_string())?.hidden;
-            comm.record(profile, t0.elapsed());
+            comm.record(profile, t0.elapsed(), exec.take_step_laps());
             if let Some(e) = comm.error() {
                 return Err(e);
             }
@@ -575,7 +575,7 @@ fn handle(
             let t0 = std::time::Instant::now();
             comm.mark_step(profile);
             exec.mtp_step(&groups, &h).map_err(|e| e.to_string())?;
-            comm.record(profile, t0.elapsed());
+            comm.record(profile, t0.elapsed(), None);
             if let Some(e) = comm.error() {
                 return Err(e);
             }
@@ -595,7 +595,7 @@ fn handle(
             comm.mark_step(profile);
             exec.mtp_step_parts(&groups, &parts)
                 .map_err(|e| e.to_string())?;
-            comm.record(profile, t0.elapsed());
+            comm.record(profile, t0.elapsed(), None);
             if let Some(e) = comm.error() {
                 return Err(e);
             }
@@ -623,7 +623,7 @@ fn handle(
                 |_, _, _| {},
             )
             .map_err(|e| e.to_string())?;
-            comm.record(profile, t0.elapsed());
+            comm.record(profile, t0.elapsed(), None);
             if let Some(e) = comm.error() {
                 return Err(e);
             }

@@ -31,9 +31,9 @@ mod rdma;
 pub mod seq_par;
 pub mod shard;
 
-pub use profile::StepProfile;
+pub use profile::{StepLaps, StepProfile};
 
-pub use comm::{ArStats, Comm};
+pub use comm::{ArStats, Comm, StepMarks};
 pub use op::all_reduce;
 
 use std::io::{Read, Write};
