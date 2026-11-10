@@ -312,7 +312,7 @@ unsafe fn cuda_nvfp4_mvq(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
     }
     let dev = launch::device()?;
     let wg = o.n <= 4 && wg2();
-    let xch = if wg { 16 * 1024 } else { 0 };
+    let xch = if wg { 8 * 1024 } else { 0 };
     let plan = plan(o.k, o.rows, dev.smem.min(SMEM_12X) - xch)
         .ok_or_else(|| format!("nvfp4_mvq: no ring for k {} rows {}", o.k, o.rows))?;
     let mut p = Params {

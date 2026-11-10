@@ -247,7 +247,7 @@ __global__ void __launch_bounds__(MV_THREADS * WG, 1) mv(const legion_nvfp4_mvq 
     uint8_t *  ring = smem;
     float *    part = reinterpret_cast<float *>(smem + ns * pitch);
     float *    xch  = part + MV_WARPS * 2 * R * 8;
-    uint64_t * full = reinterpret_cast<uint64_t *>(xch + (WG > 1 ? MV_THREADS * 16 : 0));
+    uint64_t * full = reinterpret_cast<uint64_t *>(xch + (WG > 1 ? MV_WARPS * 2 * R * 8 : 0));
 
     const int w    = (threadIdx.x / WARP_SIZE) % MV_WARPS;
     const int hg   = threadIdx.x / MV_THREADS;
@@ -455,8 +455,8 @@ __global__ void __launch_bounds__(MV_THREADS * WG, 1) mv(const legion_nvfp4_mvq 
                 if (WG == 1) {
                     part[((w * 2 + hp) * R + 4 * c + ra + rr2) * 8 + g] = v[0] + v[1];
                 } else if (hg == 0) {
-                    xch[((c * 2 + rr2) * 2 + 0) * MV_THREADS + threadIdx.x] = v[0];
-                    xch[((c * 2 + rr2) * 2 + 1) * MV_THREADS + threadIdx.x] = v[1];
+                    part[((w * 2 + hp) * R + 4 * c + ra + rr2) * 8 + g] = v[0];
+                    xch[((w * 2 + hp) * R + 4 * c + ra + rr2) * 8 + g]  = v[1];
                 }
             }
         }
@@ -474,7 +474,7 @@ __global__ void __launch_bounds__(MV_THREADS * WG, 1) mv(const legion_nvfp4_mvq 
                         float v[2];
 #pragma unroll
                         for (int b = 0; b < 2; ++b) {
-                            v[b] = xch[((c * 2 + rr2) * 2 + b) * MV_THREADS + threadIdx.x - MV_THREADS];
+                            v[b] = (b ? xch : part)[((w * 2 + hp) * R + 4 * c + ra + rr2) * 8 + g];
 #pragma unroll
                             for (int l = 0; l < NP / 2; ++l) {
                                 v[b] += acc[2 * l + b][c][rr2];
