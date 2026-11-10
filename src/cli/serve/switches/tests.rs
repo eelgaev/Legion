@@ -148,6 +148,7 @@ fn flags_set_their_switches() {
         "--hc-quant-ggml",
         "--expert-mmq",
         "--nvfp4-once",
+        "--nvfp4-mvq",
         "--q8-mmq",
         "--q8-mmq-stream",
         "--q8-mmq-fixup",
@@ -325,6 +326,7 @@ fn flags_set_their_switches() {
             hc_quant: Some(false),
             mmq_ids: Some(true),
             nvfp4_once: Some(true),
+            nvfp4_mvq: Some(true),
             q8_mmq: Some(true),
             q8_mmq_stream: Some(true),
             q8_mmq_fixup: Some(legion::model::q8_mmq::Fixup::Launch),
@@ -498,6 +500,16 @@ fn glm_mla_tc_is_opt_in() {
     assert_eq!(switches(&["--glm-mla-tc"]).glm_mla_tc, Some(true));
     // it runs with the GB10 kernels only
     let argv = ["legion", "serve", "--glm-mla-tc", "--glm-linear-plain"];
+    assert!(Cli::try_parse_from(argv).is_err());
+}
+
+#[test]
+fn nvfp4_mvq_either_way() {
+    // No flag: the default (on, on 12.x); the old opt-in flag is still accepted.
+    assert_eq!(switches(&[]).nvfp4_mvq, None);
+    assert_eq!(switches(&["--nvfp4-mvq"]).nvfp4_mvq, Some(true));
+    assert_eq!(switches(&["--no-nvfp4-mvq"]).nvfp4_mvq, Some(false));
+    let argv = ["legion", "serve", "--nvfp4-mvq", "--no-nvfp4-mvq"];
     assert!(Cli::try_parse_from(argv).is_err());
 }
 
@@ -726,6 +738,8 @@ fn help_lists_the_switches_under_their_heading() {
         "--hc-quant-ggml",
         "--expert-mmq",
         "--nvfp4-once",
+        // --nvfp4-mvq is hidden since it became the default (#1133).
+        "--no-nvfp4-mvq",
         // --q8-mmq is hidden since it became the default (#858).
         "--q8-mmq-ggml",
         "--q8-mmq-stream",
