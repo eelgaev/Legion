@@ -110,6 +110,8 @@ pub(super) mod cuda {
         fn cudaHostAlloc(p: *mut *mut c_void, size: usize, flags: c_uint) -> c_int;
         fn cudaHostGetDevicePointer(d: *mut *mut c_void, h: *mut c_void, flags: c_uint) -> c_int;
         fn cudaFreeHost(p: *mut c_void) -> c_int;
+        fn cudaMalloc(p: *mut *mut c_void, bytes: usize) -> c_int;
+        fn cudaFree(p: *mut c_void) -> c_int;
         fn cudaMemcpyAsync(
             dst: *mut c_void,
             src: *const c_void,
@@ -168,6 +170,42 @@ pub(super) mod cuda {
                 cudaFreeHost(self.host as *mut c_void);
             }
         }
+    }
+
+    /// The sum slot of a communicator ([`crate::tp_net::seq_par::sum_slot`], #1176): device
+    /// memory for two `u64`s, the addresses of the two ranks' BF16 partials of the latest
+    /// deferred reduce-scatter, written on the stream by [`hand_over`] and read by its reader's
+    /// kernel. Made once, at the first deferred sum, and kept at the same address while the
+    /// communicator lives, so a captured reader's launch stays valid.
+    pub(crate) struct SumSlot {
+        dev: u64,
+    }
+
+    impl SumSlot {
+        fn new() -> Result<Self, String> {
+            let mut d = std::ptr::null_mut();
+            // SAFETY: a plain allocation; written on the stream before anything reads it.
+            check("cudaMalloc", unsafe { cudaMalloc(&mut d, 64) })?;
+            Ok(Self { dev: d as u64 })
+        }
+    }
+
+    impl Drop for SumSlot {
+        fn drop(&mut self) {
+            // SAFETY: memory from `cudaMalloc`, freed once, when the communicator goes.
+            unsafe {
+                cudaFree(self.dev as *mut c_void);
+            }
+        }
+    }
+
+    /// The device address of `comm`'s sum slot ([`SumSlot`]), once a deferred sum made it.
+    pub(crate) fn sum_slot(comm: &super::super::Comm) -> Option<u64> {
+        comm.sum_slot
+            .lock()
+            .expect("sum slot lock")
+            .as_ref()
+            .map(|s| s.dev)
     }
 
     /// The CUDA path's buffers: the flags, and per buffer set (`nbuf` of them: an exchange
@@ -412,11 +450,14 @@ pub(super) mod cuda {
         let r = unsafe {
             let src = (*dst.src[0]).data as usize;
             let plan = plain_plan(&comm, kind, dst);
-            // A reduce-scatter whose reader adds the partials itself (#1176).
-            let defer = kind == Kind::ReduceScatter
-                && crate::tp_net::seq_par::deferred(dst)
-                && plan.wire == Wire::Bf16
-                && comm.n_ranks() == 2;
+            // A reduce-scatter whose reader adds the partials itself (#1176). Its reader reads
+            // them whatever this node does, so it must hand them over.
+            let defer = kind == Kind::ReduceScatter && crate::tp_net::seq_par::deferred(dst);
+            if defer && (plan.wire != Wire::Bf16 || comm.n_ranks() != 2) {
+                let e = "tp reduce-scatter: a deferred sum needs two ranks and BF16 partials";
+                comm.fail(e.to_string());
+                return Err(e.to_string());
+            }
             // A MoE tail this reduce-scatter runs itself (#1176): its BF16 values straight
             // into the send buffer, or with F32 on the wire into its own output first.
             let tail = match kind {
@@ -432,7 +473,7 @@ pub(super) mod cuda {
             let started = tail.and_then(|tail| start(&comm, &plan, src, stream, false, tail));
             started.and_then(|seq| {
                 if defer {
-                    hand_over(&comm, &plan, seq, dst.data as usize, stream)
+                    hand_over(&comm, &plan, seq, stream)
                 } else {
                     finish(&comm, &plan, seq, src, dst.data as usize, stream)
                 }
@@ -538,32 +579,12 @@ pub(super) mod cuda {
         let mine = plan.pieces[rank];
         let bytes = plan.span * eb;
         let seq = comm.next_seq();
-        // A deferred sum whose reader has not run yet (the graph's order put this exchange
-        // first, or nothing read it): made here as `finish` makes it, so the reader finds its
-        // output written and this exchange may reuse the buffers.
+        // The deferred sum before this exchange (#1176): its reader ran before it on the stream
+        // (`seq_par::check_order`), so its buffers free now, ahead of this exchange's.
         let left = comm.deferred.lock().expect("deferred lock").take();
         if let Some(d) = left {
-            static NOTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            // The first few, with the exchange that came first (#1176: which one the graph
-            // orders between a reduce-scatter and its norm).
-            if NOTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
-                let what = match kind {
-                    Kind::AllReduce => "all-reduce",
-                    Kind::ReduceScatter => "reduce-scatter",
-                    Kind::AllGather => "all-gather",
-                };
-                tracing::info!(
-                    deferred_seq = d.seq,
-                    deferred_values = d.n,
-                    seq,
-                    by = what,
-                    values = plan.span,
-                    micro,
-                    "tp reduce-scatter: a deferred sum made by the next exchange (the first 3)"
-                );
-            }
-            // SAFETY: as in `finish`; the buffers are held until "consumed" below.
-            unsafe { complete_deferred(comm, &d, stream)? };
+            // SAFETY: the stream the exchanges run on.
+            unsafe { release_deferred(comm, d.seq, stream)? };
         }
         let mut in_flight = comm.in_flight.lock().expect("in-flight lock");
         if in_flight.len() > 1 {
@@ -699,20 +720,16 @@ pub(super) mod cuda {
     }
 
     /// A reduce-scatter's sum handed to its reader ([`crate::tp_net::seq_par::defer_sum`]):
-    /// where the two ranks' BF16 partials of this rank's columns are, in rank order.
+    /// the exchange whose buffers stay held until the next exchange starts.
     pub(crate) struct Deferred {
-        pub(crate) seq: u32,
-        /// The node's output (left unwritten), which the reader names.
-        dst: usize,
-        /// Its values (this rank's share).
-        n: usize,
-        /// Device addresses of rank 0's and rank 1's BF16 partials, `[row, share]` each.
-        pub(crate) srcs: [u64; 2],
+        seq: u32,
     }
 
     /// The second half of a deferred reduce-scatter `seq` ([`start`]): waits for the peer's
-    /// share, then leaves the sum to the node's reader ([`take_deferred`]); "consumed" is
-    /// raised after that reader ([`release_deferred`]). Two ranks, BF16 partials.
+    /// share, then leaves the sum to the node's reader, the addresses of the two ranks' BF16
+    /// partials (rank order) written to the sum slot on the stream ([`SumSlot`]); "consumed"
+    /// is raised when the next exchange starts, after that reader ([`release_deferred`]). Two
+    /// ranks, BF16 partials.
     ///
     /// # Safety
     /// As [`finish`].
@@ -720,7 +737,6 @@ pub(super) mod cuda {
         comm: &super::super::Comm,
         plan: &Plan,
         seq: u32,
-        dst: usize,
         stream: *mut c_void,
     ) -> Result<(), String> {
         let rank = comm.rank();
@@ -742,56 +758,33 @@ pub(super) mod cuda {
         } else {
             [theirs, own]
         };
-        *comm.deferred.lock().expect("deferred lock") = Some(Deferred {
-            seq,
-            dst,
-            n: mine.1,
-            srcs,
-        });
+        let mut slot = comm.sum_slot.lock().expect("sum slot lock");
+        if slot.is_none() {
+            *slot = Some(SumSlot::new()?);
+        }
+        let at = slot.as_ref().map_or(0, |s| s.dev);
+        // Each address as two 32-bit words, low first (little-endian), ordered after the wait
+        // and before the reader's kernel on the stream.
+        for (i, a) in srcs.into_iter().enumerate() {
+            for (j, w) in [a as u32, (a >> 32) as u32].into_iter().enumerate() {
+                let addr = at + (8 * i + 4 * j) as u64;
+                // SAFETY: the slot is device memory of the stream's device, live as long as the
+                // communicator.
+                check("cuStreamWriteValue32", unsafe {
+                    cuStreamWriteValue32_v2(stream, addr, w, 0)
+                })?;
+            }
+        }
+        *comm.deferred.lock().expect("deferred lock") = Some(Deferred { seq });
         Ok(())
     }
 
-    /// The deferred sum `d` made by the exchange itself, as [`finish`] makes it (rank order,
-    /// the BF16 sum kernel), into its node's output, and its buffers freed.
-    ///
-    /// # Safety
-    /// As [`finish`]; `stream` is the stream the exchange ran on.
-    unsafe fn complete_deferred(
-        comm: &super::super::Comm,
-        d: &Deferred,
-        stream: *mut c_void,
-    ) -> Result<(), String> {
-        let srcs = d.srcs.map(|a| a as *const f32);
-        // SAFETY: the caller's; `srcs` are the exchange's held BF16 buffers, `dst` its output.
-        unsafe {
-            sum(
-                legion_tp_net_sum_bf16_kernel,
-                &srcs,
-                d.dst as *mut f32,
-                d.n,
-                stream,
-            )?;
-            release_deferred(comm, d.seq, stream)
-        }
-    }
-
-    /// The deferred sum whose node's output is at `dst` (device address), for its reader to
-    /// add; `None` if that node summed itself. The reader then calls [`release_deferred`]
-    /// after its kernel.
-    pub(crate) fn take_deferred(comm: &super::super::Comm, dst: usize) -> Option<Deferred> {
-        let mut d = comm.deferred.lock().expect("deferred lock");
-        if d.as_ref().is_some_and(|x| x.dst == dst) {
-            d.take()
-        } else {
-            None
-        }
-    }
-
-    /// Raises "consumed" for the deferred sum `seq` on `stream`, after its reader's kernel.
+    /// Raises "consumed" for the deferred sum `seq` on `stream`, after its reader's kernel
+    /// (the next exchange's [`start`]).
     ///
     /// # Safety
     /// `stream` is the stream the exchange ran on.
-    pub(crate) unsafe fn release_deferred(
+    unsafe fn release_deferred(
         comm: &super::super::Comm,
         seq: u32,
         stream: *mut c_void,
@@ -799,13 +792,9 @@ pub(super) mod cuda {
         let guard = comm.pinned.lock().expect("pinned lock");
         let p = guard.as_ref().ok_or("tp exchange: no buffers")?;
         // SAFETY: the flags are mapped for the stream's device and live with the communicator.
-        let r = check("cuStreamWriteValue32", unsafe {
+        check("cuStreamWriteValue32", unsafe {
             cuStreamWriteValue32_v2(stream, p.flags.dev + CONSUMED as u64, seq, 0)
-        });
-        if let Err(e) = &r {
-            comm.fail(e.clone());
-        }
-        r
+        })
     }
 
     /// The second half of exchange `seq` ([`start`]): waits for every peer's share, adds them

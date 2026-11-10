@@ -324,3 +324,38 @@ fn a_reduce_scatter_takes_over_only_the_tail_it_reads() {
     });
     assert_eq!(got, [(false, false, true, true, false, true, 1); 2]);
 }
+
+#[test]
+fn a_deferred_sum_read_after_another_exchange_is_written_after_all() {
+    // #1176: the exchange after a deferred reduce-scatter frees its buffers and its reader
+    // reads the partials' addresses from the communicator's slot, so the reader must come
+    // first; otherwise `check_order` makes the node write its sum as before.
+    let got = on_ranks(2, Wire::Bf16, |_, c| {
+        let handle = register(c);
+        let ctx = Context::new(32, 32);
+        let x = ctx.new_tensor(types::F32, &[4, 6]).as_input();
+        // Read right after (a view in between reads nothing).
+        let good = reduce_scatter(&ctx, handle.id(), x);
+        defer_sum(good);
+        let read = ctx.scale(ctx.view_2d(good, [4, 3], 16, 0), 2.0).as_output();
+        // Another exchange before the reader.
+        let late = reduce_scatter(&ctx, handle.id(), x);
+        defer_sum(late);
+        let other = all_gather(&ctx, handle.id(), x, 12).as_output();
+        let after = ctx.scale(late, 2.0).as_output();
+        // No reader at all.
+        let unread = reduce_scatter(&ctx, handle.id(), x).as_output();
+        // SAFETY: a node of `ctx`, never run.
+        unsafe { crate::ggml::set_external_param(unread.raw(), P_DEFERRED, 1) };
+        let mut graph = ctx.new_graph(32);
+        for t in [read, late, other, after, unread] {
+            graph.expand(t);
+        }
+        // SAFETY: nodes of `ctx`, never run.
+        let changed = unsafe { check_order(graph.raw()) };
+        // SAFETY: as above.
+        let flags = unsafe { [good, late, unread].map(|t| deferred(&*t.raw())) };
+        (changed, flags)
+    });
+    assert_eq!(got, [(2, [true, false, false]); 2]);
+}

@@ -635,6 +635,7 @@ impl Switches {
         set(self.shexp_gate, core::set_shexp_gate);
         set(self.decode_fuse, core::set_decode_fuse);
         set(self.node_fuse, core::set_node_fuse);
+        crate::ggml::post_alloc::set_order(crate::tp_net::seq_par::order_pass);
         crate::ggml::post_alloc::set_rewrite(core::node_fuse::rewrite);
         crate::ggml::post_alloc::set_relayout(core::node_fuse::fold::RELAYOUT);
         if let Some(p) = self.moe_pair_out {
