@@ -103,6 +103,11 @@ pub fn set_cuda(on: bool) {
     CUDA.store(on, Ordering::Relaxed);
 }
 
+/// Whether the engine's graphs compute on CUDA ([`set_cuda`]).
+pub(crate) fn on_cuda() -> bool {
+    CUDA.load(Ordering::Relaxed)
+}
+
 /// Whether the ops are on, the engine on CUDA, and the current GPU runs them
 /// ([`device_supported`]).
 fn active() -> bool {

@@ -27,9 +27,15 @@ Deterministic client: 8 fixed prompts (prose, code, lists, chats, a story; think
 256 tokens each, 2 rounds at 1, 4 and 16 users (2026-11-10). At 1 user the speed depends on how many drafts
 the prompt accepts: 22.0 tok/s (story) to 39.4 (code), 28.7 in all (median), mean accepted length 3.30, the
 same tokens in both rounds (the same as without `--spec-draft-batched-attn`). 83.9 tok/s at 4 users. 16 users
-swing a few percent between rounds: 243.8 is the median of 8 rounds in three sessions that day (234.1-247.0);
+swing a few percent between rounds: 243.8 was the median of 8 rounds in three sessions that day (234.1-247.0);
 without `--spec-draft-batched-attn`, same sessions, 235.4 (231.2-240.5). Prefill 8K 2,041, 32K
 1,630 and 123K (122,880 tokens) 907 tok/s, one request each, from the same server.
+
+Later the same day, after the drafter changes (take-in gathered on the GPU, the draft pass's top-k and
+convolutions as single kernels) and with the target's BF16 LM head of verify steps as one pass (matmul, soft-cap
+and argmax, same bits): 16 users 252.4, the median of 16 rounds in two sessions (240.3-257.7, 14 of 16 above
+vLLM's 244.3), against 250.9 (235.8-254.5) for the build before the head change in the same sessions. 1 user
+the same tokens and speed, 4 users ~83, prefill 8K 1,965, 32K 1,643, 123K 916.
 
 The 2026-11-06 session, before `--spec-draft-batched-attn` and the drafter step changes that came with it:
 22.1-39.5 at 1 user (29.0 median), 81.0 at 4 users, 235.1 at 16, prefill 8K 1,845, 32K 1,540, 123K 874. The
