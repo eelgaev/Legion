@@ -537,7 +537,10 @@ pub(in crate::ggml) unsafe fn compute(
         };
         e.units = units(n, &ext, late_at);
         e.same = 0;
-        e.refused = false;
+        // A prompt step holding an op that makes it run directly (#1176): as a refused capture,
+        // directly until its words change.
+        // SAFETY: the caller's; `ext` are nodes of `g`.
+        e.refused = unsafe { super::prompt_direct(g, &ext) };
         // The last words' captures stay kept under them; these words' own, made by a graph
         // with the same words before (a kept step graph built again), are launched from this
         // run on.
@@ -737,6 +740,10 @@ pub(in crate::ggml) unsafe fn precapture(
         let ext: Vec<i32> = (0..n)
             .filter(|&i| op_of(ffi::ggml_graph_node(g, i)).is_some())
             .collect();
+        // Its first run goes directly (#1176): nothing to capture for it.
+        if super::prompt_direct(g, &ext) {
+            return false;
+        }
         let units = units(n, &ext, late_at);
         let pieces = plan(g, &units, true);
         let mut val = Captured {
@@ -809,8 +816,14 @@ impl Run<'_> {
                     let launch = op.cuda.ok_or_else(|| {
                         GgmlError::External(format!("{}: no CUDA kernel", op.name))
                     })?;
-                    launch(&*node, self.stream)
-                        .map_err(|e| GgmlError::External(format!("{}: {e}", op.name)))
+                    launch(&*node, self.stream).map_err(|e| {
+                        let name = std::ffi::CStr::from_ptr((*node).name.as_ptr());
+                        let e = format!("{} (node {i} `{}`): {e}", op.name, name.to_string_lossy());
+                        // A sticky CUDA error (an illegal address) aborts the sync that
+                        // follows before this error is seen: name the op first.
+                        tracing::error!("stage graph: {e}");
+                        GgmlError::External(e)
+                    })
                 }
                 Unit::Fill => {
                     // Its write returns once the bytes are on the device, before the reader
@@ -822,6 +835,31 @@ impl Run<'_> {
                 }
             }
         }
+    }
+
+    /// Units `us`' node range and its first and last nodes' names, for an error.
+    ///
+    /// # Safety
+    /// As for [`Self::unit`].
+    unsafe fn describe(&self, us: &[Unit]) -> String {
+        let node = |u: &Unit, last: bool| match *u {
+            Unit::Segment(i0, i1) => Some(if last { i1 - 1 } else { i0 }),
+            Unit::External(i) => Some(i),
+            Unit::Fill => None,
+        };
+        let i0 = us.iter().find_map(|u| node(u, false));
+        let i1 = us.iter().rev().find_map(|u| node(u, true));
+        let (Some(i0), Some(i1)) = (i0, i1) else {
+            return "no nodes".into();
+        };
+        // SAFETY: the caller's; node indices in range.
+        let name = |i| unsafe {
+            let n = ffi::ggml_graph_node(self.g, i);
+            std::ffi::CStr::from_ptr((*n).name.as_ptr())
+                .to_string_lossy()
+                .into_owned()
+        };
+        format!("nodes {i0}..={i1} `{}`..`{}`", name(i0), name(i1))
     }
 
     /// Runs the planned pieces: each capture launched (captured first if it is not yet), the
@@ -859,7 +897,14 @@ impl Run<'_> {
             let launched = match &e.execs[k] {
                 // SAFETY: a capture of this device's kernels; its stream.
                 Some(x) => unsafe { x.launch(self.stream) }.map_err(|status| {
-                    GgmlError::External(format!("stage graph launch: CUDA error {status}"))
+                    // SAFETY: the caller's; node indices in range.
+                    let e = format!(
+                        "stage graph launch (piece {k}, {}): CUDA error {status}",
+                        unsafe { self.describe(&self.units[range.clone()]) }
+                    );
+                    // Named before the sync that follows aborts on a sticky error.
+                    tracing::error!("{e}");
+                    GgmlError::External(e)
                 })?,
                 None => false,
             };

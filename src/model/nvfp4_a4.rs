@@ -89,6 +89,12 @@ static A4_SWIGLU_ID: ExternalOp = ExternalOp {
     cuda: None,
 };
 
+/// Whether `op` is the grouped W4A4 experts' matmul ([`mul_mat_id_act`]; `glu`: the grouped
+/// SwiGLU, [`swiglu_id`]), whose ids may be -1 under [`super::nvfp4_mm::skips`] (#1176).
+pub(crate) fn is_grouped(op: &ExternalOp, glu: bool) -> bool {
+    std::ptr::eq(op, if glu { &A4_SWIGLU_ID } else { &A4_MM_ID })
+}
+
 static A4_QUANT: ExternalOp = ExternalOp {
     name: "nvfp4_a4_quant",
     cpu: cpu_quant,
@@ -1092,7 +1098,12 @@ unsafe fn cpu_mm_id(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
         for j in (ith..m).step_by(nth) {
             for t in 0..n_tok {
                 for s in 0..n_used {
-                    let e = *(ids.data as *const i32).add(t * n_used + s) as usize;
+                    // An id of -1 (`nvfp4_mm::skips`): no expert, a zero.
+                    let Ok(e) = usize::try_from(*(ids.data as *const i32).add(t * n_used + s))
+                    else {
+                        store(out, (t * n_used + s) * m + j, 0.0, act);
+                        continue;
+                    };
                     let sc = scale.map_or(1.0, |p| *p.add(e));
                     let xr = &xq[t * n_x + if n_x == 1 { 0 } else { s }];
                     let v = dot(&weight_row(w, e, j), xr) * sc;
@@ -1194,7 +1205,11 @@ unsafe fn cpu_swiglu_id(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
             for t in 0..n_tok {
                 for s in 0..n_used {
                     let q = t * n_used + s;
-                    let e = *(ids.data as *const i32).add(q) as usize;
+                    // An id of -1 (`nvfp4_mm::skips`): no expert, a zero.
+                    let Ok(e) = usize::try_from(*(ids.data as *const i32).add(q)) else {
+                        *out.add(q * m + j) = 0.0;
+                        continue;
+                    };
                     let xr = &xq[t * n_x + if n_x == 1 { 0 } else { s }];
                     let g = dot(&weight_row(wg, e, j), xr) * sg.map_or(1.0, |p| *p.add(e));
                     let u = dot(&weight_row(wu, e, j), xr) * su.map_or(1.0, |p| *p.add(e));
@@ -1360,6 +1375,7 @@ mod cuda {
         act: i32,
         pw: *const f32,
         res: *const f32,
+        unread_skips: i32,
     }
 
     unsafe extern "C" {
@@ -1548,6 +1564,7 @@ mod cuda {
             act,
             pw: std::ptr::null(),
             res: std::ptr::null(),
+            unread_skips: 0,
         }
     }
 
@@ -1795,7 +1812,15 @@ mod cuda {
         }
         let pairs = n_used * n_tok;
         let per = pairs / pairs.min(n_expert).max(1);
-        if let Grouped::Mv { rt, kw } = pick_grouped(n_tok, k, w2.is_some()) {
+        // Ids that may be -1 (`nvfp4_mm::skips`, #1176): the GEMM, whose CTAs past the last tile
+        // store those pairs' zeros (the mv stores none).
+        let skip = crate::model::nvfp4_mm::skipping(dst);
+        let shape = if skip {
+            Grouped::Gemm
+        } else {
+            pick_grouped(n_tok, k, w2.is_some())
+        };
+        if let Grouped::Mv { rt, kw } = shape {
             let nt = mv_tokens_tile(per);
             let rows = if w2.is_some() { 8 } else { 16 } * rt as i64;
             let tiles = (
@@ -1821,11 +1846,17 @@ mod cuda {
         }
         let nt = grouped_tile(tokens_tile(per), w2.is_some(), k);
         let cols = 16 * (nt & 0xff) as i64;
-        // The full tiles, plus at most one partial tile per expert; SwiGLU tiles are half as
-        // many output rows.
+        // The full tiles, plus at most one partial tile per expert (and with skips one spare
+        // tile, whose CTAs store the skipped pairs' zeros); SwiGLU tiles are half as many output
+        // rows.
         let bm = if w2.is_some() { BM / 2 } else { BM };
-        let tiles = ((m + bm - 1) / bm, pairs / cols + pairs.min(n_expert));
+        let spare = i64::from(skip);
+        let tiles = (
+            (m + bm - 1) / bm,
+            pairs / cols + pairs.min(n_expert) + spare,
+        );
         let mut p = params(w, xq, scale, out, (k, m, pairs), tiles, act);
+        p.unread_skips = (skip && crate::model::nvfp4_mm::unread(dst)) as i32;
         if let Some(w2) = w2 {
             p.w2 = w2.data as *const u8;
             p.scale2 = scale2;

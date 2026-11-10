@@ -152,6 +152,13 @@ pub fn capture_safe(op: &ExternalOp, node: &ffi::ggml_tensor) -> bool {
     }
 }
 
+/// Whether `op` makes a prompt step's graph run all its units directly
+/// ([`crate::ggml::stage_graph::set_direct_prompt_ops`], #1176): the ops of [`SMALL`], which
+/// such a step launches between its captures otherwise.
+pub fn direct_in_prompt(op: &ExternalOp) -> bool {
+    SMALL.contains(&op.name)
+}
+
 /// Whether a capture may hold an op `name` of [`PURE`] or [`SMALL`], in a small step (`small`)
 /// or a prompt step.
 fn listed(name: &str, small: bool) -> bool {
