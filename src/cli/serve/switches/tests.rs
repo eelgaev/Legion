@@ -148,6 +148,7 @@ fn flags_set_their_switches() {
         "--hc-quant-ggml",
         "--expert-mmq",
         "--nvfp4-once",
+        "--nvfp4-mvq",
         "--q8-mmq",
         "--q8-mmq-stream",
         "--q8-mmq-fixup",
@@ -325,6 +326,7 @@ fn flags_set_their_switches() {
             hc_quant: Some(false),
             mmq_ids: Some(true),
             nvfp4_once: Some(true),
+            nvfp4_mvq: Some(true),
             q8_mmq: Some(true),
             q8_mmq_stream: Some(true),
             q8_mmq_fixup: Some(legion::model::q8_mmq::Fixup::Launch),
@@ -726,6 +728,7 @@ fn help_lists_the_switches_under_their_heading() {
         "--hc-quant-ggml",
         "--expert-mmq",
         "--nvfp4-once",
+        "--nvfp4-mvq",
         // --q8-mmq is hidden since it became the default (#858).
         "--q8-mmq-ggml",
         "--q8-mmq-stream",

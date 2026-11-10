@@ -818,6 +818,13 @@ pub(in crate::cli) struct SwitchArgs {
     /// by default.
     #[arg(long, help_heading = HEADING)]
     nvfp4_once: bool,
+    /// NVFP4 dense matmuls of 2-8 tokens (decode and verify steps) on compute capability 12.x
+    /// (GB10, RTX 50; no effect elsewhere): run them on a Legion op instead of ggml's MMVQ (the
+    /// sub-block sums on tensor cores, then ggml's float order: the same bits as MMVQ, `legion
+    /// nvfp4-mvq-bench` checks them). On a GB10 it is 1.17-1.25x slower per matmul but draws
+    /// 48 W instead of 79-91 W at 8 tokens, so off by default.
+    #[arg(long, help_heading = HEADING)]
+    nvfp4_mvq: bool,
     /// The default since #858; accepted for older command lines (see --q8-mmq-ggml).
     #[arg(long, hide = true, conflicts_with = "q8_mmq_ggml")]
     q8_mmq: bool,
@@ -1478,6 +1485,7 @@ impl SwitchArgs {
             hc_quant: self.hc_quant_ggml.then_some(false),
             mmq_ids: self.expert_mmq.then_some(true),
             nvfp4_once: self.nvfp4_once.then_some(true),
+            nvfp4_mvq: self.nvfp4_mvq.then_some(true),
             q8_mmq: if self.q8_mmq_ggml {
                 Some(false)
             } else {

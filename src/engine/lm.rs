@@ -3952,6 +3952,7 @@ impl LmEngine {
         crate::model::core::mmq_preq::set_gpu(cc_major);
         crate::model::core::mmq_ids::set_gpu(cc);
         crate::model::core::nvfp4_once::set_gpu(cc);
+        crate::model::core::nvfp4_mvq::set_gpu(cc);
         crate::model::qwen4::set_up_mix_gpu(cc_major, caps.map_or(0, |c| c.2));
         crate::model::q8_mmq::set_gpu(cc_major, caps.map_or(0, |c| c.2));
         let mma16 = device.is_some() && crate::model::moe_ffn::mma16();
