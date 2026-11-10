@@ -381,9 +381,6 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
                     asm volatile("prefetch.global.L1 [%0];" ::"l"(a));
                 }
             }
-            for (int i = 0; i < rr; ++i) {
-                bar_wait(full + (q0 + i) % ns, (uint32_t) ((q0 + i) / ns) & 1);
-            }
             // Shared addresses: the B fragment's row (g % 4 of each group) at its sub-block
             // (g / 4: the parity) and bytes 2t, 2t + 1; the scale words' rows ra, ra + 1 at the
             // half's two scales.
@@ -393,6 +390,17 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
                 rb[c]  = saddr(ring + ((q0 + 4 * c + (g & 3)) % ns) * pitch) + 4 + 8 * (g >> 2) + 2 * t;
                 rs0[c] = saddr(ring + ((q0 + 4 * c + ra) % ns) * pitch) + 2 * hp;
                 rs1[c] = saddr(ring + ((q0 + 4 * c + ra + 1) % ns) * pitch) + 2 * hp;
+            }
+            const int S   = 1 << ((p.exp >> 8) & 3);
+            const int gps = G4 / S;
+            for (int sub = 0; sub < S; ++sub) {
+            const int c_lo = sub * gps, c_hi = c_lo + gps;
+            if (c_lo >= ng) {
+                break;
+            }
+            const int r_hi = min(rr, 4 * c_hi);
+            for (int i = 4 * c_lo; i < r_hi; ++i) {
+                bar_wait(full + (q0 + i) % ns, (uint32_t) ((q0 + i) / ns) & 1);
             }
 #pragma unroll
             for (int it = 0; it < IT; ++it) {
@@ -415,6 +423,9 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
                     for (int c = 0; c < G4; ++c) {
                         if (c >= ng) {
                             break;
+                        }
+                        if (c < c_lo || c >= c_hi) {
+                            continue;
                         }
                         // MMA 0: sub-blocks 0 and 1; MMA 1: 2 and 3.
                         uint32_t b00, b01, b10, b11;
@@ -459,10 +470,11 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
             // chunk, the previous region's outputs are read out of the partial sums).
             __syncthreads();
             if (threadIdx.x == 0) {
-                const int lim = q0 + rr + ns;
+                const int lim = q0 + r_hi + ns;
                 while (pq < lim && pj < nreg) {
                     issue_next();
                 }
+            }
             }
         }
         qb += p.chunks * rr;
