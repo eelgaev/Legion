@@ -16,7 +16,9 @@ group has an `#else` with work, or one whose `#else` does no work, is an offende
 do no work on their own count as no code: declarations and `static_assert`s (setup), `return;`
 and `if (...) return;`, `__syncthreads();`, `(void) x;`, calls of the `pdl_*` helpers (they
 wait or trigger only) and block delimiters or control headers on their own. Work under a nested
-arch `#if` counts only when all its branches, an `#else` included, do work. `__device__` helpers are not checked: they may keep an older fallback or
+arch `#if` counts only when all its branches, an `#else` included, do work; inside a group
+whose own condition does not name the architecture, such a guard with a gap is checked like a
+top-level one. `__device__` helpers are not checked: they may keep an older fallback or
 be no-ops elsewhere, and the kernels calling them carry the guard. No compiler and no GPU needed
 (a CI step).
 
@@ -57,7 +59,11 @@ BLOCK_RE = re.compile(r"^(\}\s*)*([^;{}]*\{\s*)?(\}\s*)*$")
 def does_work(line):
     """Whether a code line (stripped) is more than setup, a block delimiter or a statement that
     does no work."""
-    return not (NO_WORK_RE.match(line) or DECL_RE.match(line) or BLOCK_RE.match(line))
+    if BLOCK_RE.match(line):
+        return False
+    # A block on one line (`{ return; }`): its statement decides.
+    inner = line.strip("{} \t")
+    return bool(inner) and not (NO_WORK_RE.match(inner) or DECL_RE.match(inner))
 
 
 def strip_comments(text):
@@ -227,6 +233,8 @@ def offenders(text, macros):
                             "else": False,
                             "else_code": False,
                             "code": 0,
+                            "nested_gap": False,
+                            "plain_work": False,
                         })
                     stack.append({"arch": is_arch(rest, macros), "else": False, "branches": [False]})
                     if len(stack) == 1:
@@ -245,9 +253,13 @@ def offenders(text, macros):
                     lvl = stack.pop()
                     if not stack:
                         groups[-1]["else_code"] = lvl["else"] and lvl["branches"][-1]
+                        groups[-1]["plain_work"] = any(lvl["branches"])
                     else:
                         if lvl["arch"]:
                             work = lvl["else"] and all(lvl["branches"])
+                            # An arch guard inside a group whose own condition does not name
+                            # the architecture (`#ifdef FOO` around `#if __CUDA_ARCH__ >= 800`).
+                            groups[-1]["nested_gap"] |= not work
                         else:
                             work = any(lvl["branches"])
                         stack[-1]["branches"][-1] = stack[-1]["branches"][-1] or work
@@ -264,6 +276,9 @@ def offenders(text, macros):
         covered = any(g["arch"] and g["else_code"] for g in groups)
         for g in groups:
             if not g["arch"]:
+                # Its only work under a nested arch guard that leaves some targets empty.
+                if g["nested_gap"] and not g["plain_work"] and outside == 0 and not covered:
+                    found.append((g["line"], name))
                 continue
             if g["else"] and not g["else_code"]:
                 found.append((g["line"], name))
