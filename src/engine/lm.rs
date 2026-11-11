@@ -3957,6 +3957,11 @@ impl LmEngine {
         crate::model::core::nvfp4_mvq::set_gpu(cc);
         crate::model::qwen4::set_up_mix_gpu(cc_major, caps.map_or(0, |c| c.2));
         crate::model::q8_mmq::set_gpu(cc_major, caps.map_or(0, |c| c.2));
+        // #1214: a GTX 16xx's prompt matmuls on dp4a (no tensor cores to run MMQ's MMA on).
+        let tu11x = device
+            .and_then(cuda_index)
+            .is_some_and(crate::hw::per_device::turing_without_tensor_cores);
+        crate::model::tu_mmq::set_gpu(if tu11x { caps.map_or(0, |c| c.2) } else { 0 });
         let mma16 = device.is_some() && crate::model::moe_ffn::mma16();
         let moe_kernel = resolve_moe_kernel(cfg.moe_kernel, mode, integrated, cc_major, mma16);
         if moe_kernel != cfg.moe_kernel {

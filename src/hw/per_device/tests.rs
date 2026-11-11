@@ -89,3 +89,14 @@ fn sms_follow_the_device_they_are_asked_for() {
         assert_eq!(sms_if_cc12_by(None, engine, test_cc, sms_of), engine);
     }
 }
+
+#[test]
+fn tu11x_names_have_no_tensor_cores() {
+    assert!(no_tensor_cores_name("NVIDIA GeForce GTX 1660 Ti"));
+    assert!(no_tensor_cores_name("NVIDIA GeForce GTX 1650"));
+    assert!(no_tensor_cores_name("NVIDIA GeForce MX450"));
+    assert!(no_tensor_cores_name("NVIDIA GeForce MX550"));
+    assert!(!no_tensor_cores_name("NVIDIA GeForce RTX 2080 Ti"));
+    assert!(!no_tensor_cores_name("Tesla T4"));
+    assert!(!no_tensor_cores_name("NVIDIA GeForce RTX 4090"));
+}
