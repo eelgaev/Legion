@@ -50,3 +50,37 @@ fn rows_at_needs_an_allocated_f32_matrix() {
     assert!(cube.rows_at().is_none());
     assert!(none.rows_at().is_none());
 }
+
+/// A range of one matrix's rows copied into a range of another's ([`Backend::copy_rows`]):
+/// those floats move, the rest of both stay.
+#[test]
+fn copy_rows_moves_a_slice_of_rows() {
+    let backend = Backend::cpu().unwrap();
+    let width = 4usize;
+    let ctx = Context::new(2, 0);
+    let src = ctx.new_tensor(types::F32, &[width as i64, 5]);
+    let dst = ctx.new_tensor(types::F32, &[width as i64, 3]);
+    ctx.alloc_tensors(backend.buffer_type()).unwrap();
+    let vals: Vec<f32> = (0..width * 5).map(|i| i as f32 + 0.5).collect();
+    src.set_f32(&vals);
+    dst.set_f32(&vec![-1.0; width * 3]);
+    let (s, d) = (src.rows_at().unwrap(), dst.rows_at().unwrap());
+    assert_eq!(s.slice(2, 2).nbytes(), 2 * width * 4);
+    // SAFETY: both tensors stay allocated; the CPU copy is done when it returns.
+    unsafe { backend.copy_rows(&s.slice(2, 2), &d.slice(1, 2)) };
+    let mut want = vec![-1.0; width];
+    want.extend_from_slice(&vals[2 * width..4 * width]);
+    assert_eq!(dst.to_f32(), want);
+    assert_eq!(src.to_f32(), vals);
+}
+
+/// A slice past the rows is a bug.
+#[test]
+#[should_panic(expected = "rows 4+2 of 5 rows")]
+fn a_slice_past_the_rows_panics() {
+    let backend = Backend::cpu().unwrap();
+    let ctx = Context::new(1, 0);
+    let t = ctx.new_tensor(types::F32, &[3, 5]);
+    ctx.alloc_tensors(backend.buffer_type()).unwrap();
+    let _ = t.rows_at().unwrap().slice(4, 2);
+}

@@ -120,3 +120,16 @@ fn device_picks_equal_the_masked_host_argmax() {
         assert_eq!(fast.dist(0), want);
     }
 }
+
+#[test]
+fn device_take_in_reads_the_tail_and_its_pending_row() {
+    // The pieces end TAKE_IN_TAIL rows before the end; the last piece's last row is pending.
+    let ran = 4096;
+    let mut skip = 0;
+    while ran - skip > TAKE_IN_TAIL {
+        skip += TAKE_IN_PIECE.min(ran - skip - TAKE_IN_TAIL);
+    }
+    assert_eq!(take_in_host_from(ran), skip - 1);
+    assert_eq!(take_in_host_from(TAKE_IN_TAIL + 2), 1);
+    assert_eq!(take_in_host_from(3), 0);
+}

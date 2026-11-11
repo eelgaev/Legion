@@ -12,7 +12,7 @@ use crate::spec::dflash::{DflashDrafter, DflashOptions};
 use crate::spec::draft::DraftModel;
 use crate::spec::dspark::{DsparkDrafter, DsparkOptions};
 use crate::spec::eagle3::{Eagle3Drafter, Eagle3Options};
-use crate::spec::{DraftRequest, SeqId};
+use crate::spec::{DeviceHidden, DraftRequest, SeqId};
 use crate::spec::{
     ModelDrafter, SpecConfig, SpecKind, TargetInfo, TokenDrafter, TokenDrafterFactory,
 };
@@ -186,6 +186,13 @@ pub(super) const TAKE_IN_PIECE: usize = 1024;
 /// See [`TAKE_IN_PIECE`].
 pub(super) const TAKE_IN_TAIL: usize = 8;
 
+/// The first of a take-in's `ran` rows the host needs when its pieces copy theirs on the
+/// device ([`MtpDrafter::step_rows`], #1183): the last piece's last row (the tail's pending
+/// row) and the tail's rows.
+pub(super) fn take_in_host_from(ran: usize) -> usize {
+    ran.saturating_sub(TAKE_IN_TAIL + 1)
+}
+
 /// [`MtpDrafter::prefetch_rows`] for a sequence fed `fed` (up to its bonus token) and drafted
 /// `drafts` so far.
 fn prefetch_after(exec: &Executor, fed: &[u32], drafts: &[(u32, f32)]) {
@@ -272,6 +279,22 @@ impl MtpDrafter {
         blocks: &[&[u32]],
         rings: &[usize],
     ) -> Result<usize, String> {
+        self.step_rows(exec, batch, blocks, rings, None)
+    }
+
+    /// [`Self::step`] with the step's captured rows also left on the device (`dev`: request
+    /// `i`'s rows from `dev.first[i]` on, valid until the executor runs a step again, #1183):
+    /// a long take-in's pieces copy their rows from there into the head's input
+    /// ([`Executor::mtp_step_rows`]), and each request's `hidden` needs to hold only its last
+    /// [`TAKE_IN_TAIL`] + 1 rows ([`take_in_host_from`]). The same rows, so the same passes.
+    pub(super) fn step_rows(
+        &mut self,
+        exec: &mut Executor,
+        batch: &mut [DraftRequest<'_>],
+        blocks: &[&[u32]],
+        rings: &[usize],
+        dev: Option<&DeviceHidden<'_>>,
+    ) -> Result<usize, String> {
         if exec.mtp_shares_kv() {
             return self.step_shared(exec, batch, blocks, rings);
         }
@@ -288,6 +311,52 @@ impl MtpDrafter {
         let t0 = std::time::Instant::now();
         for (i, r) in batch.iter().enumerate() {
             let hidden = r.hidden[0];
+            // Its rows on the device, if the step left them there whole.
+            let on_dev = dev
+                .and_then(|d| Some((d.layers.first()?, *d.first.get(i)?)))
+                .filter(|(rows, first)| rows.width == w && first + r.ran <= rows.rows);
+            if let Some((rows, first)) = on_dev {
+                while r.ran - skip[i] > TAKE_IN_TAIL {
+                    let at = skip[i];
+                    let n = TAKE_IN_PIECE.min(r.ran - at - TAKE_IN_TAIL);
+                    let group = Group {
+                        slot: 0,
+                        seqs: vec![SeqInput {
+                            tokens: &r.tokens[r.start + at..r.start + at + n],
+                            n_past: r.start + at,
+                            blocks: blocks[i],
+                            ring: rings[i],
+                            logits: Logits::None,
+                            media: None,
+                        }],
+                        verify: false,
+                    };
+                    // The pending row, then the piece's rows but its last; past the first
+                    // piece the pending row is the step's row before the piece, so one copy.
+                    if at == 0 {
+                        let zeros;
+                        let pending: &[f32] = match self.pending.get(&r.seq) {
+                            Some(p) => p,
+                            None => {
+                                zeros = vec![0.0; w];
+                                &zeros
+                            }
+                        };
+                        exec.mtp_step_rows(&[group], pending, rows.slice(first, n - 1))
+                    } else {
+                        exec.mtp_step_rows(&[group], &[], rows.slice(first + at - 1, n))
+                    }
+                    .map_err(|e| e.to_string())?;
+                    skip[i] += n;
+                }
+                // The last piece's last row, which the host has (`take_in_host_from`).
+                if skip[i] > 0 {
+                    let at = skip[i];
+                    self.pending
+                        .insert(r.seq, hidden[(at - 1) * w..at * w].to_vec());
+                }
+                continue;
+            }
             while r.ran - skip[i] > TAKE_IN_TAIL {
                 let at = skip[i];
                 let n = TAKE_IN_PIECE.min(r.ran - at - TAKE_IN_TAIL);
