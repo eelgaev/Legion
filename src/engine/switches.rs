@@ -152,8 +152,8 @@ pub struct Switches {
     /// Paged attention prefill on the Hopper wgmma kernel, untested on hardware
     /// (`model::core::paged::hopper::set_enabled`).
     pub hopper_attn: Option<bool>,
-    /// Paged attention prefill with heads of 256 on compute capability 12.x through the
-    /// queries-as-M kernel, the same bits (`model::core::paged::set_qm_prefill`).
+    /// Paged attention prefill with heads of 256 or 512 on compute capability 12.x through the
+    /// queries-as-M kernels, the same bits (`model::core::paged::set_qm_prefill`).
     pub paged_prefill_qm: Option<bool>,
     /// Programmatic dependent launch on compute capability 9.0 too, untested on hardware
     /// (`model::core::router_mv::set_hopper_pdl`).

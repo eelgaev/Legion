@@ -846,7 +846,7 @@ __global__ void __launch_bounds__(256) paged_prefill(const legion_paged_attn p) 
 // Prefill on sm_80+: mma.sync m16n8k16 + cp.async, namespace fa.
 #include "../sm80/paged_attn.cuh"
 
-// Prefill on compute capability 12.x, queries as the MMA's M: namespace fa_qm (#1133).
+// Prefill on compute capability 12.x, queries as the MMA's M: namespace fa_qm (#1133, #1181).
 #include "../sm80/paged_attn_qm.cuh"
 
 // Prefill on sm_70 (Volta): mma.sync m8n8k4, namespace v70.
@@ -883,9 +883,9 @@ int launch(const legion_paged_attn & p, cudaStream_t st) {
         if (p.max_split > 1 && !p.piece_blk && !p.ml) {
             return fa::launch_split<D, G, C>(p, st);
         }
-        // Heads of 256 on compute capability 12.x: queries as M where it covers the op, the same
-        // bits (-1: no shared memory for it, paged_prefill_mma instead).
-        if constexpr (D == 256 && !C) {
+        // Heads of 256 and 512 on compute capability 12.x: queries as M where it covers the op,
+        // the same bits (-1: no shared memory for it, paged_prefill_mma instead).
+        if constexpr ((D == 256 || D == 512) && !C) {
             if (fa_qm::takes<D, G>(p)) {
                 if (const int rc = fa_qm::launch<D, G>(p, st); rc >= 0) {
                     return rc;

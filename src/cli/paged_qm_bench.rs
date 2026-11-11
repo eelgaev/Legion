@@ -1,5 +1,5 @@
-//! `legion paged-qm-bench`: paged attention prefill with heads of 256 on compute capability 12.x
-//! through the queries-as-M kernel (#1133) against `paged_prefill_mma`: the edge cases bit for
+//! `legion paged-qm-bench`: paged attention prefill with heads of 256 or 512 on compute capability
+//! 12.x through the queries-as-M kernels (#1133, #1181) against `paged_prefill_mma`: the edge cases bit for
 //! bit, then both timed at a model's shape over prompt chunks at several depths and checked for
 //! the same bits there too (a development tool, so a build tree's release binary can check the
 //! GPU it runs on; pick it with `CUDA_VISIBLE_DEVICES`).
@@ -16,7 +16,10 @@ pub struct PagedQmBenchArgs {
         default_value = "0:2048,6144:2048,30720:2048,0:4096,28672:4096,0:8192,0:16384,16384:16384"
     )]
     chunks: Vec<String>,
-    /// Query heads, kv heads (heads of 256; default: Qwen3.8-27B's).
+    /// Head size: 256, or 512 (Gemma 4's global layers, e.g. with `--heads 32,4`).
+    #[arg(long, default_value_t = 256)]
+    dim: usize,
+    /// Query heads, kv heads (default: Qwen3.8-27B's).
     #[arg(long, value_delimiter = ',', default_values_t = [24, 4])]
     heads: Vec<usize>,
     /// Sliding window (0: none).
@@ -38,9 +41,12 @@ pub fn run(args: PagedQmBenchArgs) -> anyhow::Result<()> {
     use legion::model::core::paged_qm_bench as bench;
     use legion::model::core::paged_split_bench::{Group, pool};
     let mut gpu = legion::ggml::backend_by_name("CUDA0")?;
+    if args.dim != 256 && args.dim != 512 {
+        anyhow::bail!("--dim takes 256 or 512");
+    }
     let mut differ = 0;
     if !args.no_edges {
-        let (cases, ran, total, bad) = bench::edges(&mut gpu);
+        let (cases, ran, total, bad) = bench::edges(&mut gpu, args.dim);
         println!(
             "edges: {cases} cases ({ran} on the queries-as-M kernel), {bad} of {total} values differ"
         );
@@ -49,7 +55,7 @@ pub fn run(args: PagedQmBenchArgs) -> anyhow::Result<()> {
     let [n_head, n_head_kv] = args.heads[..] else {
         anyhow::bail!("--heads takes query heads, kv heads");
     };
-    let heads = (256, n_head, n_head_kv);
+    let heads = (args.dim, n_head, n_head_kv);
     let mut chunks = Vec::new();
     for c in &args.chunks {
         let (p, t) = c
@@ -78,7 +84,7 @@ pub fn run(args: PagedQmBenchArgs) -> anyhow::Result<()> {
             width: len,
             window: args.window,
             ring: 0,
-            scale: 1.0 / 16.0,
+            scale: 1.0 / (args.dim as f32).sqrt(),
         };
         // Both orders (mma, qm, qm, mma), each kernel's faster run kept, so warm-up and clock
         // drift do not favour the side that runs second.

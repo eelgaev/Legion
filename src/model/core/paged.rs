@@ -740,9 +740,9 @@ unsafe extern "C" {
     fn legion_paged_attn_qm_launches() -> i64;
 }
 
-/// Prefill groups with heads of 256 on compute capability 12.x devices (a DGX Spark's GB10, RTX
-/// 50) through the kernel that takes the queries as the MMA's M dimension
-/// (`src/cuda/sm80/paged_attn_qm.cuh`, #1133) where it covers them, or (`false`) through
+/// Prefill groups with heads of 256 or 512 on compute capability 12.x devices (a DGX Spark's
+/// GB10, RTX 50) through the kernels that take the queries as the MMA's M dimension
+/// (`src/cuda/sm80/paged_attn_qm.cuh`, #1133, #1181) where they cover them, or (`false`) through
 /// `paged_prefill_mma` as before. The same bits either way; on by default (`legion serve
 /// --no-paged-prefill-qm` turns it off). Other GPUs and ops keep their kernels. For every thread.
 pub fn set_qm_prefill(on: bool) {

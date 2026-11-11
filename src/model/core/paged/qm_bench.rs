@@ -103,12 +103,12 @@ pub fn macs(g: &Group) -> f64 {
     2.0 * (d * n_head) as f64 * keys as f64
 }
 
-/// The edge cases for heads of 256: every GQA ratio, prompt chunks from just past the kernel's
-/// smallest group to more than one 128-row tile per token run, several sequences over shuffled
+/// The edge cases for heads of `d` (256 or 512): every GQA ratio, prompt chunks from just past
+/// the kernel's smallest group to more than one row tile per token run, several sequences over shuffled
 /// tables, contexts that end before, on and after block boundaries, windows that start inside
 /// blocks (Gemma 4's sliding window of 1,024 among them), a ring. Returns (cases, cases the
 /// kernel ran, values compared, values that differ), printing each failing case.
-pub fn edges(backend: &mut Backend) -> (usize, usize, usize, usize) {
+pub fn edges(backend: &mut Backend, d: usize) -> (usize, usize, usize, usize) {
     let (mut cases, mut ran_cases, mut total, mut differ) = (0, 0, 0, 0);
     let n_blocks = 160;
     for (n_head, n_head_kv) in [
@@ -120,10 +120,10 @@ pub fn edges(backend: &mut Backend) -> (usize, usize, usize, usize) {
         (24, 2),
         (32, 2),
     ] {
-        let heads = (256, n_head, n_head_kv);
+        let heads = (d, n_head, n_head_kv);
         let kv = super::wmma_bench::pool(backend, heads, n_blocks);
         let g_ratio = n_head / n_head_kv;
-        let rsd = 1.0 / 16.0;
+        let rsd = 1.0 / (d as f32).sqrt();
         for n_tok in [256 / g_ratio, 256 / g_ratio + 5, 129, 300, 1000] {
             for (n_past, window, scale) in [
                 (vec![0], 0, rsd),
