@@ -131,7 +131,9 @@ int legion_paged_attn_quant_ok(void);
 // for all threads (`this_thread` 0), M884 applies on sm_70 devices only, FFMA on sm_75 ones
 // only (the caller sets it for those without tensor cores), AUTO elsewhere (sm_75 lacks M884's
 // shared memory, sm_80+ would run m8n8k4 emulated). Set for the calling thread (`this_thread`
-// > 0, tests), it applies on any GPU from sm_70.
+// 1, tests), it applies on any GPU from sm_70. `this_thread` 2 (tests of the all-threads
+// choice): the calling thread reads `kernel` in place of the all-threads choice, with its
+// per-architecture limits, and the other threads keep theirs (-1 ends it).
 enum { LEGION_PREFILL_AUTO = 0, LEGION_PREFILL_M884 = 1, LEGION_PREFILL_FFMA = 2 };
 void legion_paged_attn_set_prefill(int kernel, int this_thread);
 
@@ -167,6 +169,7 @@ int legion_paged_attn_piece(const legion_paged_attn * p, int32_t hbm_blocks, int
 namespace legion_paged {
 extern int g_prefill;
 extern thread_local int t_prefill;
+extern thread_local int t_prefill_all;
 extern thread_local int64_t t_m884_launches;
 extern thread_local int64_t t_ffma_launches;
 extern thread_local int64_t t_vsplit_launches;
@@ -178,6 +181,7 @@ constexpr int BLK = 64;  // positions per KV block (KV_BLOCK on the Rust side)
 
 using legion_paged::g_prefill;
 using legion_paged::t_prefill;
+using legion_paged::t_prefill_all;
 using legion_paged::t_m884_launches;
 using legion_paged::t_ffma_launches;
 using legion_paged::t_vsplit_launches;
@@ -187,12 +191,18 @@ bool device_is_sm70() {
     return legion_device::compute_capability() == 70;
 }
 
+// The all-threads prefill choice as the calling thread reads it (see
+// legion_paged_attn_set_prefill).
+int prefill_for_all() {
+    return t_prefill_all >= 0 ? t_prefill_all : __atomic_load_n(&g_prefill, __ATOMIC_RELAXED);
+}
+
 // Whether prefill launches take the m8n8k4 kernel (see legion_paged_attn_set_prefill).
 bool use_m884() {
     if (t_prefill >= 0) {
         return t_prefill == LEGION_PREFILL_M884;
     }
-    return __atomic_load_n(&g_prefill, __ATOMIC_RELAXED) == LEGION_PREFILL_M884 && device_is_sm70();
+    return prefill_for_all() == LEGION_PREFILL_M884 && device_is_sm70();
 }
 
 // Whether prefill launches take the FP32 FMA kernel (see legion_paged_attn_set_prefill).
@@ -200,8 +210,7 @@ bool use_ffma() {
     if (t_prefill >= 0) {
         return t_prefill == LEGION_PREFILL_FFMA;
     }
-    return __atomic_load_n(&g_prefill, __ATOMIC_RELAXED) == LEGION_PREFILL_FFMA &&
-           legion_device::compute_capability() == 75;
+    return prefill_for_all() == LEGION_PREFILL_FFMA && legion_device::compute_capability() == 75;
 }
 
 // The first cell of the block holding positions b * BLK .. of a sequence whose table is `tab`.

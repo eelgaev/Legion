@@ -81,14 +81,15 @@ fn ffma_ring_matches_full_cache_and_oracle() {
 #[ignore = "needs a GPU"]
 fn ffma_flag_for_all_threads_skips_other_gpus() {
     let mut backend = gpu();
-    // Off again however the test ends: other tests of this process read the flag.
+    // The choice for every thread as this thread alone reads it: the GPU tests running beside
+    // this one keep their default kernel. Off again however the test ends.
     struct Off;
     impl Drop for Off {
         fn drop(&mut self) {
-            set_ffma_prefill(false);
+            set_prefill_for_all_here(-1);
         }
     }
-    set_ffma_prefill(true);
+    set_prefill_for_all_here(2);
     let _off = Off;
     let before = ffma_launches();
     ring_case(&mut backend, 256, 16, 8, 100, 37, &[190], 37, 5e-4);

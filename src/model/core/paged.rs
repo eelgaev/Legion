@@ -779,6 +779,15 @@ fn ffma_launches() -> i64 {
     unsafe { legion_paged_attn_ffma_launches() }
 }
 
+/// The calling thread reads `kernel` (`LEGION_PREFILL_*`, -1 to stop) in place of the choice
+/// for every thread, with its per-architecture limits; other threads keep theirs (tests of
+/// [`set_m884_prefill`] and [`set_ffma_prefill`] that run beside other GPU tests).
+#[cfg(all(test, feature = "cuda"))]
+fn set_prefill_for_all_here(kernel: i32) {
+    // SAFETY: sets a thread-local flag the launches read.
+    unsafe { legion_paged_attn_set_prefill(kernel, 2) };
+}
+
 /// [`set_m884_prefill`] for launches from the calling thread only (tests).
 #[cfg(all(test, feature = "cuda"))]
 fn set_m884_prefill_here(on: bool) {

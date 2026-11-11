@@ -234,6 +234,8 @@ fn cuda_tu_mmq_is_ggml_bit_for_bit() {
         (9216, 2560, 1024),
         (2560, 4096, 256),
         (1536, 512, 384),
+        // A partial column tile; also the fourth stream-k shape on a 14-SM GTX 1650.
+        (2560, 1024, 255),
     ];
     let mut checked = 0;
     let mut split = 0;

@@ -6,6 +6,7 @@ namespace legion_paged {
 
 int g_prefill = LEGION_PREFILL_AUTO;
 thread_local int t_prefill = -1;
+thread_local int t_prefill_all = -1;
 thread_local int64_t t_m884_launches = 0;
 thread_local int64_t t_ffma_launches = 0;
 thread_local int64_t t_vsplit_launches = 0;
@@ -143,7 +144,9 @@ int64_t legion_paged_attn_vsplit_launches(void) {
 }
 
 void legion_paged_attn_set_prefill(int kernel, int this_thread) {
-    if (this_thread > 0) {
+    if (this_thread == 2) {
+        t_prefill_all = kernel;
+    } else if (this_thread > 0) {
         t_prefill = kernel;
     } else {
         __atomic_store_n(&g_prefill, kernel, __ATOMIC_RELAXED);
