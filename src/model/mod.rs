@@ -19,6 +19,7 @@ pub mod nvfp4_mm;
 pub mod q8_mmq;
 pub mod qwen35;
 pub mod qwen4;
+pub mod tu_mmq;
 pub mod wgmma_gemm;
 
 use self::core::{Hparams, ModelError};

@@ -330,6 +330,9 @@ pub struct Switches {
     /// How the op adds up split tiles' pieces, all with MMQ's bits
     /// ([`crate::model::q8_mmq::set_q8_mmq_fixup`]).
     pub q8_mmq_fixup: Option<crate::model::q8_mmq::Fixup>,
+    /// Prompt matmuls on Turing GPUs without tensor cores on Legion's dp4a op with MMQ's bits
+    /// ([`crate::model::tu_mmq::set_tu_mmq`]).
+    pub tu_mmq: Option<bool>,
     /// qwen4exp's mixer up matmul and gated mix as one op ([`crate::model::qwen4::set_up_mix`]).
     pub hc_up_mix: Option<bool>,
     /// The same op for BF16 mixer up weights ([`crate::model::qwen4::set_up_mix_bf16`], on by
@@ -727,6 +730,7 @@ impl Switches {
         if let Some(f) = self.q8_mmq_fixup {
             crate::model::q8_mmq::set_q8_mmq_fixup(f);
         }
+        set(self.tu_mmq, crate::model::tu_mmq::set_tu_mmq);
         set(self.hc_up_mix, qwen4::set_up_mix);
         set(self.hc_up_mix_bf16, qwen4::set_up_mix_bf16);
         set(self.hc_xn_rebuild, qwen4::set_up_mix_rebuild);

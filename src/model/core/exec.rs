@@ -318,6 +318,47 @@ fn write_rows(bounce: &mut Option<Context>, backend: &Backend, t: Tensor<'_>, pa
     }
 }
 
+/// Writes `host` and then the device rows `rows` one after another into input `t` (F32, as
+/// many bytes) of a graph on `backend` (#1183): the host part set right away (a row or so),
+/// the rows copied on the backend's stream, ahead of the graph queued after. A `t` that is not
+/// a plain F32 matrix takes the rows through the host.
+fn write_rows_dev(backend: &Backend, t: Tensor<'_>, host: &[&[f32]], rows: &crate::ggml::RowsAt) {
+    let host_bytes: usize = host.iter().map(|p| std::mem::size_of_val(*p)).sum();
+    assert_eq!(
+        host_bytes + rows.nbytes(),
+        t.nbytes(),
+        "input `{}`: host and device rows",
+        t.name()
+    );
+    let mut at = 0;
+    for p in host {
+        t.set_bytes_at(at, as_bytes_f32(p));
+        at += std::mem::size_of_val(*p);
+    }
+    let row_bytes = rows.width * std::mem::size_of::<f32>();
+    match t.rows_at() {
+        Some(dst) if dst.width == rows.width && at % row_bytes == 0 => {
+            let dst = dst.slice(at / row_bytes, rows.rows);
+            // SAFETY: the caller keeps the step's buffer and its rows until the pass is done
+            // (`Executor::mtp_step_rows`); `t` is this pass's input, read only by its graph,
+            // which is queued after the copy on the same stream.
+            unsafe { backend.copy_rows(rows, &dst) };
+        }
+        _ => {
+            let ctx = Context::new(1, 0);
+            // SAFETY: as above.
+            let v = unsafe { ctx.over_rows(rows) }.to_f32();
+            t.set_bytes_at(at, as_bytes_f32(&v));
+        }
+    }
+}
+
+/// `values`' bytes.
+fn as_bytes_f32(values: &[f32]) -> &[u8] {
+    // SAFETY: any f32 is 4 plain bytes; the slice covers exactly `values`.
+    unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) }
+}
+
 type Kept = (Vec<GroupShape>, KeptGraph);
 
 fn kept_in<'k>(
@@ -505,6 +546,12 @@ pub struct Executor {
     /// The CUDA device the next step leaves its captured rows on
     /// ([`Self::set_hidden_on_device`]).
     hidden_on_device: Option<usize>,
+    /// The first captured row the next step still reads back when it leaves them on the
+    /// device ([`Self::set_hidden_on_device_from`]).
+    hidden_dev_from: Option<usize>,
+    /// The device rows the next MTP pass copies into its input after the host rows
+    /// ([`Self::mtp_step_rows`]).
+    mtp_rows_in: Option<crate::ggml::RowsAt>,
     /// The stop tokens a greedy pick below `min_tokens` may not pick ([`Self::set_stop_tokens`]).
     stop_tokens: Vec<u32>,
     /// See [`Self::set_stage_cpus`].
@@ -809,6 +856,8 @@ impl Executor {
             prompt_next: None,
             hidden_from: 0,
             hidden_on_device: None,
+            hidden_dev_from: None,
+            mtp_rows_in: None,
             stop_tokens: Vec::new(),
             stage_cpus: Vec::new(),
             par: Default::default(),
@@ -1617,6 +1666,12 @@ impl Executor {
         }
     }
 
+    /// Whether steps return captured rows ([`Self::capture_hidden`]): then every layer runs
+    /// on all of a step's rows, whatever its logits rows.
+    pub fn captures_hidden(&self) -> bool {
+        !self.hidden.is_empty()
+    }
+
     /// Hands a step's captured rows ([`StepOutput::hidden`]) back once read: the next step
     /// copies its rows into one of them instead of a new vector (#363).
     pub fn recycle_rows(&mut self, rows: Vec<Vec<f32>>) {
@@ -1734,6 +1789,30 @@ impl Executor {
             return self.tp_mtp(groups, parts);
         }
         self.mtp_step_here(groups, parts)
+    }
+
+    /// [`Self::mtp_step_parts`] of a take-in pass whose input rows are `first` (on the host,
+    /// may be empty) and then `rows`: rows of a step's captured output it left on the device
+    /// ([`StepOutput::hidden_dev`], [`Self::set_hidden_on_device`]), which must still hold
+    /// them. They are copied into the head's input on the device (#1183) instead of being read
+    /// back, gathered on the host and uploaded again: the same floats, so the same pass.
+    pub fn mtp_step_rows(
+        &mut self,
+        groups: &[Group<'_>],
+        first: &[f32],
+        rows: crate::ggml::RowsAt,
+    ) -> Result<MtpOutput, ModelError> {
+        if self.tp.is_some() || self.mtp_runs_par(groups) || self.budget_chunks(groups).len() > 1 {
+            // Not one pass on this machine: the rows on the host, as before.
+            let ctx = Context::new(1, 0);
+            // SAFETY: the caller keeps the step's buffer and its rows (see above).
+            let host = unsafe { ctx.over_rows(&rows) }.to_f32();
+            return self.mtp_step_parts(groups, &[first, &host]);
+        }
+        self.mtp_rows_in = Some(rows);
+        let out = self.mtp_pass(groups, &[first], Ahead::default());
+        self.mtp_rows_in = None;
+        out
     }
 
     /// [`Self::mtp_step_parts`] on this machine.
@@ -2033,6 +2112,8 @@ impl Executor {
     ) -> Result<Pass, ModelError> {
         // What the last pass staged is this pass's or no one's (`mtp_ahead`).
         let staged = self.mtp_staged.take().filter(|_| ahead.staged);
+        // The input rows past `h` still on the device ([`Self::mtp_step_rows`]).
+        let dev_rows = self.mtp_rows_in.take();
         // Queued ahead (`ahead.spec`), the pass runs on the GPU only if the round went on up
         // to it: the device's flag, which the pass that staged it updated from its picks.
         let behind = ahead.spec && staged.as_ref().is_some_and(|s| s.decided);
@@ -2242,7 +2323,9 @@ impl Executor {
             }
             let h_in = kept.tensor(n_in);
             let h_bytes: usize = h.iter().map(|p| std::mem::size_of_val(*p)).sum();
-            if h_bytes >= BOUNCE_MIN_BYTES {
+            if let Some(rows) = &dev_rows {
+                write_rows_dev(backend, h_in, h, rows);
+            } else if h_bytes >= BOUNCE_MIN_BYTES {
                 write_rows(bounce, backend, h_in, h);
             } else {
                 mtp_io.write_f32_parts(backend, h_in, h);
@@ -2740,12 +2823,14 @@ impl Executor {
             self.prompt_next = None;
             self.hidden_from = 0;
             self.hidden_on_device = None;
+            self.hidden_dev_from = None;
             self.captures.clear();
             return self.tp_step(groups);
         }
         let out = self.step_here(groups);
         self.hidden_from = 0;
         self.hidden_on_device = None;
+        self.hidden_dev_from = None;
         out
     }
 
@@ -2758,6 +2843,37 @@ impl Executor {
     /// step reads it.
     pub fn set_hidden_on_device(&mut self, device: Option<usize>) {
         self.hidden_on_device = device;
+    }
+
+    /// With [`Self::set_hidden_on_device`] applied, the next step still reads its captured
+    /// rows back from row `row` on ([`StepOutput::hidden`], the rows before keep their length
+    /// and hold anything), beside leaving them all on the device: the MTP head's take-in of a
+    /// prompt chunk copies its pieces' rows on the device and reads only its last few rows on
+    /// the host (#1183). A step that does not leave them on the device reads every row back.
+    /// Only the next step reads it.
+    pub fn set_hidden_on_device_from(&mut self, row: usize) {
+        self.hidden_dev_from = Some(row);
+    }
+
+    /// The CUDA device a step's captured rows may stay on for the MTP head's take-in
+    /// ([`Self::set_hidden_on_device`], [`Self::mtp_step_rows`], #1183): the last stage's, when
+    /// the model runs as one stage on this machine with a head of its own cache (the head
+    /// runs on that stage's backend). `None` otherwise.
+    pub fn mtp_rows_device(&self) -> Option<usize> {
+        if !self.mtp_enabled
+            || self.mtp_shares_kv()
+            || self.tp.is_some()
+            || self.remote.is_some()
+            || self.stages.len() != 1
+        {
+            return None;
+        }
+        let backend = &self.last().backend;
+        if backend.is_meta() {
+            return None;
+        }
+        let name = backend.device().name();
+        name.strip_prefix("CUDA")?.parse().ok()
     }
 
     /// The stop tokens a greedy pick below `min_tokens` ([`Logits::Pick`],
@@ -3826,7 +3942,9 @@ impl Executor {
         let stage = &self.stages[s];
         let kept = stage.kept(shape).expect("prepared");
         let inputs = Inputs::from_parts(shape, self.parts(s), |i| kept.tensor(i));
+        let t0 = std::time::Instant::now();
         inputs.fill(groups, shape);
+        let filled = t0.elapsed();
         self.model.fill_extra(
             &inputs,
             groups,
@@ -3836,6 +3954,16 @@ impl Executor {
             stage.spec.as_ref(),
             &mut super::SetNow,
         );
+        let tokens: usize = shape.iter().map(|g| g.n_seqs * g.n_tok).sum();
+        if tokens >= 1024 {
+            tracing::debug!(
+                stage = s,
+                tokens,
+                common_ms = filled.as_secs_f64() * 1e3,
+                extra_ms = (t0.elapsed() - filled).as_secs_f64() * 1e3,
+                "step inputs"
+            );
+        }
     }
 
     /// Copies the residual stage `s - 1` handed over into stage `s`'s input (none for the
@@ -3945,10 +4073,16 @@ impl Executor {
         // The one micro-chunk's rows are the step's ([`Executor::set_hidden_from`]).
         let from = if n_micro == 1 { self.hidden_from } else { 0 };
         let parity = round % 2;
+        // Left on the device, its last rows read back all the same
+        // ([`Executor::set_hidden_on_device_from`]).
+        let dev_from = self.hidden_dev_from;
         let mut started = Vec::new();
         let mut o = inputs.output_with(group, n_vocab, ids, picks, |t| {
             if on_device.is_some() {
-                return Vec::new();
+                return match dev_from {
+                    Some(row) => read_rows_from(bounce, bounce_small, spare, backend, t, row),
+                    None => Vec::new(),
+                };
             }
             let n = t.nbytes();
             if defer && n >= BOUNCE_MIN_BYTES {

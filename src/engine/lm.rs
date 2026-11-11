@@ -1133,6 +1133,10 @@ pub struct LmConfig {
     /// differs from the default by rounding order (P rounded to F16 against the running max,
     /// one pass, 64-wide MMA chains against WMMA's 16-wide).
     pub paged_prefill_m884: bool,
+    /// Prompt attention on Turing GPUs without tensor cores through the one-pass FP32 FMA
+    /// kernel instead of the WMMA one (other GPUs keep their default). Greedy output can differ
+    /// from the default (no F16 rounding of Q and P, one pass, another summation order).
+    pub tu_attn_ffma: bool,
     /// qwen4exp prompt steps: ggml's indexer chain (pool mask, lightning indexer, bias add)
     /// instead of Legion's one-op scores (the same bits), for comparisons.
     pub qsa_scores_ggml: bool,
@@ -1421,6 +1425,7 @@ impl LmConfig {
             glm_route_bias: 0.0,
             glm_prune: None,
             paged_prefill_m884: false,
+            tu_attn_ffma: false,
             long_prompts: LongPrompts::default(),
             swa_full: false,
             swa_ring: false,
@@ -3985,6 +3990,16 @@ impl LmEngine {
         crate::model::core::nvfp4_mvq::set_gpu(cc);
         crate::model::qwen4::set_up_mix_gpu(cc_major, caps.map_or(0, |c| c.2));
         crate::model::q8_mmq::set_gpu(cc_major, caps.map_or(0, |c| c.2));
+        // #1214: a GTX 16xx's prompt matmuls on dp4a (no tensor cores to run MMQ's MMA on).
+        let tu11x = device
+            .and_then(cuda_index)
+            .is_some_and(crate::hw::per_device::turing_without_tensor_cores);
+        crate::model::tu_mmq::set_gpu(if tu11x { caps.map_or(0, |c| c.2) } else { 0 });
+        if tu11x && cfg.tu_attn_ffma {
+            // After set_m884_prefill above (one prefill choice for the process; m8n8k4 is
+            // sm_70's).
+            crate::model::core::paged::set_ffma_prefill(true);
+        }
         let mma16 = device.is_some() && crate::model::moe_ffn::mma16();
         let moe_kernel = resolve_moe_kernel(cfg.moe_kernel, mode, integrated, cc_major, mma16);
         if moe_kernel != cfg.moe_kernel {
@@ -7249,6 +7264,23 @@ impl Worker {
             return Ok(());
         };
         self.clock.lap(host_time::Phase::Plan, &mut at);
+        // A step of one prompt's chunk alone that the MTP head takes in right after (not left
+        // for the next step, [`DeferredTakeIn`]): its rows stay on the device for the head's
+        // pieces, and only the last few are read back (#1183). A chunk that ends the prompt gets
+        // the blocks of its bonus token and drafts now: after the step, growing waits until the
+        // head has read those rows (`grow_after`), and the head's first pass writes past them.
+        let mtp_device = match (&self.drafting, &plan.chunks[..]) {
+            (Drafting::Mtp(_), &[(i, len)]) if decoding.is_empty() => {
+                let s = &prefilling[i];
+                let room = spec::device_take_in_room(s.prompt.len(), s.n_past, len, self.spec_k);
+                room.zip(self.exec.mtp_rows_device())
+                    .map(|(n, d)| (i, len, n, d))
+            }
+            _ => None,
+        };
+        if let Some((i, _, n, _)) = mtp_device {
+            self.grow(&mut prefilling[i], n)?;
+        }
         let asked = self.ask_captures(prefilling, &plan.chunks);
         let fed = fed_tokens(decoding, &plan);
         // Which rows are padding, for the MoE layers' expert kernels (`pad_rows`).
@@ -7281,13 +7313,16 @@ impl Worker {
             });
         }
         // A prompt's next chunk: its n-gram table rows are read (from the SSD with
-        // `--ngram-io direct`) while this step computes.
+        // `--ngram-io direct`) while this step computes; this step's fill does not wait for
+        // them (#1183).
         for &(i, len) in &plan.chunks {
             let s = &prefilling[i];
             let end = s.n_past + len;
             let next = &s.prompt[end..(end + len).min(s.prompt.len())];
             if !next.is_empty() {
-                self.exec.model().prefetch_ngram(&s.prompt[..end], next);
+                self.exec
+                    .model()
+                    .prefetch_ngram_next(&s.prompt[..end], next);
                 self.exec.model().prefetch_engram(&s.prompt[..end], next);
             }
         }
@@ -7329,6 +7364,12 @@ impl Worker {
             _ => None,
         };
         self.exec.set_hidden_on_device(on_device);
+        // The MTP head's take-in from the device (see `mtp_device` above).
+        if let Some((_, len, _, device)) = mtp_device {
+            self.exec.set_hidden_on_device(Some(device));
+            self.exec
+                .set_hidden_on_device_from(spec::take_in_host_from(len));
+        }
         self.clock.lap(host_time::Phase::Pack, &mut at);
         let t_step = Instant::now();
         let out = self.exec.step(&groups).map_err(|e| e.to_string());
@@ -8025,7 +8066,12 @@ impl Worker {
                 let (Some((off, len)), false) = (chunk_of[i], ended.contains(&i)) else {
                     continue;
                 };
-                if defer && !joined.contains(&i) && seq.prompt.len() - seq.n_past <= KV_BLOCK {
+                // Not with its rows left on the device: those are gone by the next step.
+                if defer
+                    && hidden_dev.is_empty()
+                    && !joined.contains(&i)
+                    && seq.prompt.len() - seq.n_past <= KV_BLOCK
+                {
                     seq.draft = Draft::default();
                     seq.draft_cap = 0;
                     seq.take_in = Some(DeferredTakeIn {
@@ -8093,7 +8139,12 @@ impl Worker {
                         let passes = if self.exec.has_remote() {
                             d.step_remote(&mut self.exec, &mut batch, &blocks, &rings, &offs)?
                         } else {
-                            d.step(&mut self.exec, &mut batch, &blocks, &rings)?
+                            let rows = DeviceHidden {
+                                layers: &hidden_dev,
+                                first: &offs,
+                            };
+                            let dev = (!hidden_dev.is_empty()).then_some(&rows);
+                            d.step_rows(&mut self.exec, &mut batch, &blocks, &rings, dev)?
                         };
                         let ms = t.elapsed().as_secs_f64() * 1e3;
                         tracing::debug!(ms, passes, "mtp drafts");

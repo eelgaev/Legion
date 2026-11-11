@@ -1617,10 +1617,20 @@ impl Model {
     }
 
     /// Starts reading the n-gram rows of `tokens`, which follow `before` in a sequence (its
-    /// prompt so far; empty at its start), so that their step finds them read: called with a
-    /// prompt's next chunk while the current one computes. A hint (see
-    /// [`crate::residency::lookup_table::LookupTable::prefetch`]).
+    /// prompt so far; empty at its start), so that their step finds them read: the next step's
+    /// tokens. A hint (see [`crate::residency::lookup_table::LookupTable::prefetch`]).
     pub fn prefetch_ngram(&self, before: &[u32], tokens: &[u32]) {
+        self.prefetch_ngram_for(before, tokens, false);
+    }
+
+    /// [`Self::prefetch_ngram`] of a prompt's next chunk, before the step of its current one:
+    /// that step's fill does not wait for these reads, they run while it computes (see
+    /// [`crate::residency::lookup_table::LookupTable::prefetch_next`]).
+    pub fn prefetch_ngram_next(&self, before: &[u32], tokens: &[u32]) {
+        self.prefetch_ngram_for(before, tokens, true);
+    }
+
+    fn prefetch_ngram_for(&self, before: &[u32], tokens: &[u32], next: bool) {
         let ple = params(&self.hp).and_then(|p| p.ple.as_ref());
         let (Some(ple), Some(store)) = (ple, &self.ngram) else {
             return;
@@ -1641,7 +1651,11 @@ impl Model {
             prev.push(tok);
         }
         let rows: Vec<u32> = rows.iter().map(|&r| r as u32).collect();
-        store.prefetch(&rows);
+        if next {
+            store.prefetch_next(&rows);
+        } else {
+            store.prefetch(&rows);
+        }
     }
 
     /// The store the n-gram rows come from, if one is set.

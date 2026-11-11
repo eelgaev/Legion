@@ -12,7 +12,7 @@ use crate::spec::dflash::{DflashDrafter, DflashOptions};
 use crate::spec::draft::DraftModel;
 use crate::spec::dspark::{DsparkDrafter, DsparkOptions};
 use crate::spec::eagle3::{Eagle3Drafter, Eagle3Options};
-use crate::spec::{DraftRequest, SeqId};
+use crate::spec::{DeviceHidden, DraftRequest, SeqId};
 use crate::spec::{
     ModelDrafter, SpecConfig, SpecKind, TargetInfo, TokenDrafter, TokenDrafterFactory,
 };
@@ -186,10 +186,42 @@ pub(super) const TAKE_IN_PIECE: usize = 1024;
 /// See [`TAKE_IN_PIECE`].
 pub(super) const TAKE_IN_TAIL: usize = 8;
 
+/// The first of a take-in's `ran` rows the host needs when its pieces copy theirs on the
+/// device ([`MtpDrafter::step_rows`], #1183): the last piece's last row (the tail's pending
+/// row) and the tail's rows.
+pub(super) fn take_in_host_from(ran: usize) -> usize {
+    ran.saturating_sub(TAKE_IN_TAIL + 1)
+}
+
+/// Whether a step of one prompt's chunk alone (`len` tokens from `n_past`, of a `prompt`-token
+/// prompt) leaves its rows on the device for the MTP head's take-in (#1183), and if so the
+/// tokens the prompt's block table must hold before the step: a chunk that ends the prompt
+/// is followed by the head's bonus-token pass and up to `k` drafts, whose blocks are taken
+/// before the step because growing the table after it can drop the buffer those rows are in.
+/// `None`: the chunk's take-in is short, or left for the next step (`DeferredTakeIn`).
+pub(super) fn device_take_in_room(
+    prompt: usize,
+    n_past: usize,
+    len: usize,
+    k: usize,
+) -> Option<usize> {
+    let rest = prompt - (n_past + len);
+    if len <= TAKE_IN_TAIL + 1 || (rest > 0 && rest <= crate::model::core::KV_BLOCK) {
+        return None;
+    }
+    Some(if rest == 0 { prompt + k } else { n_past + len })
+}
+
+/// The tokens of `fed` (a sequence's tokens up to its bonus token) an n-gram row after it
+/// reads: its last 8.
+pub(super) fn ngram_tail(fed: &[u32]) -> &[u32] {
+    &fed[fed.len().saturating_sub(8)..]
+}
+
 /// [`MtpDrafter::prefetch_rows`] for a sequence fed `fed` (up to its bonus token) and drafted
 /// `drafts` so far.
-fn prefetch_after(exec: &Executor, fed: &[u32], drafts: &[(u32, f32)]) {
-    let all: Vec<u32> = fed[fed.len().saturating_sub(8)..]
+pub(super) fn prefetch_after(exec: &Executor, fed: &[u32], drafts: &[(u32, f32)]) {
+    let all: Vec<u32> = ngram_tail(fed)
         .iter()
         .copied()
         .chain(drafts.iter().map(|d| d.0))
@@ -272,6 +304,22 @@ impl MtpDrafter {
         blocks: &[&[u32]],
         rings: &[usize],
     ) -> Result<usize, String> {
+        self.step_rows(exec, batch, blocks, rings, None)
+    }
+
+    /// [`Self::step`] with the step's captured rows also left on the device (`dev`: request
+    /// `i`'s rows from `dev.first[i]` on, valid until the executor runs a step again, #1183):
+    /// a long take-in's pieces copy their rows from there into the head's input
+    /// ([`Executor::mtp_step_rows`]), and each request's `hidden` needs to hold only its last
+    /// [`TAKE_IN_TAIL`] + 1 rows ([`take_in_host_from`]). The same rows, so the same passes.
+    pub(super) fn step_rows(
+        &mut self,
+        exec: &mut Executor,
+        batch: &mut [DraftRequest<'_>],
+        blocks: &[&[u32]],
+        rings: &[usize],
+        dev: Option<&DeviceHidden<'_>>,
+    ) -> Result<usize, String> {
         if exec.mtp_shares_kv() {
             return self.step_shared(exec, batch, blocks, rings);
         }
@@ -288,6 +336,52 @@ impl MtpDrafter {
         let t0 = std::time::Instant::now();
         for (i, r) in batch.iter().enumerate() {
             let hidden = r.hidden[0];
+            // Its rows on the device, if the step left them there whole.
+            let on_dev = dev
+                .and_then(|d| Some((d.layers.first()?, *d.first.get(i)?)))
+                .filter(|(rows, first)| rows.width == w && first + r.ran <= rows.rows);
+            if let Some((rows, first)) = on_dev {
+                while r.ran - skip[i] > TAKE_IN_TAIL {
+                    let at = skip[i];
+                    let n = TAKE_IN_PIECE.min(r.ran - at - TAKE_IN_TAIL);
+                    let group = Group {
+                        slot: 0,
+                        seqs: vec![SeqInput {
+                            tokens: &r.tokens[r.start + at..r.start + at + n],
+                            n_past: r.start + at,
+                            blocks: blocks[i],
+                            ring: rings[i],
+                            logits: Logits::None,
+                            media: None,
+                        }],
+                        verify: false,
+                    };
+                    // The pending row, then the piece's rows but its last; past the first
+                    // piece the pending row is the step's row before the piece, so one copy.
+                    if at == 0 {
+                        let zeros;
+                        let pending: &[f32] = match self.pending.get(&r.seq) {
+                            Some(p) => p,
+                            None => {
+                                zeros = vec![0.0; w];
+                                &zeros
+                            }
+                        };
+                        exec.mtp_step_rows(&[group], pending, rows.slice(first, n - 1))
+                    } else {
+                        exec.mtp_step_rows(&[group], &[], rows.slice(first + at - 1, n))
+                    }
+                    .map_err(|e| e.to_string())?;
+                    skip[i] += n;
+                }
+                // The last piece's last row, which the host has (`take_in_host_from`).
+                if skip[i] > 0 {
+                    let at = skip[i];
+                    self.pending
+                        .insert(r.seq, hidden[(at - 1) * w..at * w].to_vec());
+                }
+                continue;
+            }
             while r.ran - skip[i] > TAKE_IN_TAIL {
                 let at = skip[i];
                 let n = TAKE_IN_PIECE.min(r.ran - at - TAKE_IN_TAIL);
@@ -349,19 +443,28 @@ impl MtpDrafter {
         }
         let mut fed: Vec<&[u32]> = Vec::with_capacity(batch.len());
         let mut h = Vec::new();
+        // A round sent to other machines takes the step's rows as they lie (`rests`, after
+        // each sequence's row of `h`): with `--tp-mtp-local-rows` those ranks read their own
+        // copies of them instead of receiving them.
+        let mut rests: Vec<&[f32]> = Vec::new();
         for &i in &order {
             let r = &batch[i];
             let start = r.start + skip[i];
             let rows = rows_of(i);
             let tokens = r.tokens;
             fed.push(&tokens[start..start + rows]);
-            let hidden = &r.hidden[0][skip[i] * w..];
+            let hidden: &[f32] = r.hidden[0];
+            let hidden = &hidden[skip[i] * w..];
             match self.pending.get(&r.seq) {
                 Some(p) => h.extend_from_slice(p),
                 // A new sequence (or one resumed from the prefix cache): nothing before.
                 None => h.resize(h.len() + w, 0.0),
             }
-            h.extend_from_slice(&hidden[..(rows - 1) * w]);
+            if tp_chain {
+                rests.push(&hidden[..(rows - 1) * w]);
+            } else {
+                h.extend_from_slice(&hidden[..(rows - 1) * w]);
+            }
         }
         let groups: Vec<Group<'_>> = order
             .iter()
@@ -388,7 +491,14 @@ impl MtpDrafter {
             .collect();
         // The same passes as below, each staging the next one where it can (#827).
         if chained {
-            return self.chain(exec, batch, &groups, &order, &h);
+            let parts: Vec<&[f32]> = if tp_chain {
+                (h.chunks_exact(w).zip(&rests))
+                    .flat_map(|(first, &rest)| [first, rest])
+                    .collect()
+            } else {
+                vec![&h]
+            };
+            return self.chain(exec, batch, &groups, &order, &parts);
         }
         let out = exec.mtp_step(&groups, &h).map_err(|e| e.to_string())?;
         let mut passes = 1;
@@ -525,17 +635,17 @@ impl MtpDrafter {
         Ok(passes)
     }
 
-    /// [`Self::step`]'s first pass (over `groups`, residual rows `h`) and further drafts as one
-    /// draft round on every rank of tensor parallelism over machines (`--tp-mtp-chain`,
-    /// [`Executor::mtp_chain`]): the same passes, sent as one request. `order`: the batch
-    /// index of each of `groups`' sequences.
+    /// [`Self::step`]'s first pass (over `groups`, residual rows `parts`, one after another)
+    /// and further drafts as one draft round on every rank of tensor parallelism over machines
+    /// (`--tp-mtp-chain`, [`Executor::mtp_chain`]): the same passes, sent as one request.
+    /// `order`: the batch index of each of `groups`' sequences.
     fn chain(
         &mut self,
         exec: &mut Executor,
         batch: &mut [DraftRequest<'_>],
         groups: &[Group<'_>],
         order: &[usize],
-        h: &[f32],
+        parts: &[&[f32]],
     ) -> Result<usize, String> {
         let w = exec.mtp_width();
         // The drafting requests, in batch order: the rows of the round, whose further passes
@@ -554,13 +664,20 @@ impl MtpDrafter {
         let fed: Vec<&[u32]> = (drafting.iter())
             .map(|&i| &batch[i].tokens[..batch[i].start + batch[i].ran + 1])
             .collect();
+        // The other ranks read the n-gram rows of the round's tokens as this one does (#1176).
+        let tails: Vec<&[u32]> = if exec.mtp_chains() {
+            fed.iter().map(|f| ngram_tail(f)).collect()
+        } else {
+            Vec::new()
+        };
         let out = exec
             .mtp_chain(
                 groups,
-                &[h],
+                parts,
                 &caps,
                 &first,
                 self.p_min,
+                &tails,
                 |exec, k, drafts| prefetch_after(exec, fed[k], drafts),
             )
             .map_err(|e| e.to_string())?;

@@ -24,7 +24,7 @@ end up running the code: the sm70 kernels also run on newer GPUs when the dispat
 | File | Arch-specific parts |
 |---|---|
 | `moe_gemm.cu` | `sm70/moe_gemm.cuh` (m8n8k4 K step), `sm80/moe_gemm.cuh` (m16n8k16 K step), `sm80/moe_gemm_raw.cuh` (cp.async raw-staged kernel), `sm80/moe_gemm_frag.cuh` (Q4_K / Q5_K gate/up and Q5_1 / Q8_0 down with B fragments dequantized into registers; picked on compute capability 12.x; their L2 bulk prefetch is sm_90 PTX behind its own guard, a no-op on older targets). `gemm_kernel` itself stays in `moe_gemm.cu`: one template holds both K-step paths. |
-| `paged_attn/` | Split by head size (`d128.cu`, `d256.cu`, `d512.cu`, `d512_compact.cu`, `dispatch.cu`; #955); `common.cuh` includes `sm80/paged_attn.cuh` (prefill on m16n8k16, and split over the key blocks with a combine kernel for `--paged-verify-split`, `namespace fa`), `sm70/paged_attn.cuh` (prefill on m8n8k4, `namespace v70`), `sm70/paged_split.cuh` (the WMMA prefill's last-token rows split over the key blocks, `namespace split`), `sm70/paged_vsplit.cuh` (every row of a 2-16-token group, e.g. a verify step, split over the key blocks with the WMMA prefill's bits, `namespace vsplit`, #1211). The WMMA prefill (`paged_prefill`, `common.cuh`) takes 32 query rows a CTA instead of 64 where 64 rows' tiles pass the device's shared memory a block (head size 512 on Turing's 64 KB; #1214), with the same bits. |
+| `paged_attn/` | Split by head size (`d128.cu`, `d256.cu`, `d512.cu`, `d512_compact.cu`, `dispatch.cu`; #955); `common.cuh` includes `sm80/paged_attn.cuh` (prefill on m16n8k16, and split over the key blocks with a combine kernel for `--paged-verify-split`, `namespace fa`), `sm70/paged_attn.cuh` (prefill on m8n8k4, `namespace v70`), `sm75/paged_attn.cuh` (prefill on FP32 FMAs for Turing without tensor cores, `--tu-attn-ffma`, `namespace tu75`, #1214), `sm70/paged_split.cuh` (the WMMA prefill's last-token rows split over the key blocks, `namespace split`), `sm70/paged_vsplit.cuh` (every row of a 2-16-token group, e.g. a verify step, split over the key blocks with the WMMA prefill's bits, `namespace vsplit`, #1211). The WMMA prefill (`paged_prefill`, `common.cuh`) takes 32 query rows a CTA instead of 64 where 64 rows' tiles pass the device's shared memory a block (head size 512 on Turing's 64 KB; #1214), with the same bits. |
 | `qsa_attn.cu` | `sm70/qsa_attn.cuh` (prompt kernel on m8n8k4), `sm80/qsa_attn.cuh` (prompt kernel on m16n8k16), `sm80/qsa_attn_gb10.cuh` (the same kernel's bits from ~39 KB of shared memory, two CTAs per SM; picked on compute capability 12.x and Ampere (8.0-8.7, #1212) by `use_gb()`, #828). |
 | `fp8_mm.cu` | `sm80/fp8_mm.cuh` (BF16 W8A16 GEMMs), `sm89/fp8_mm.cuh` (E4M3 W8A8 GEMMs). |
 | `qwen4_hc.cu` | `sm80/qwen4_hc.cuh` (the hyper-connection mixer as the GB10 runs it: weights staged by `cp.async`, kernels chained by PDL; same bits as the portable kernels, picked on compute capability 12.x (GB10, RTX 50) by `use_gb10()`). |
@@ -45,7 +45,10 @@ picks the schedule, gives the kernels their shared memory and launches them from
 `legion_gdn_mma_kernels` table. `gdn_scan.cu` is plain SIMT code that the Rust side picks on 7.x GPUs only (ggml's bits
 there). `deepseek41.cu` (DeepSeek-V4.1-Flash's own ops, `src/model/deepseek41/ops.rs`) is
 plain SIMT code too, kernels only: Rust launches them with `cudaLaunchKernel` from the
-`legion_ds4_kernels` table.
+`legion_ds4_kernels` table. `tu_mmq.cu` is dp4a code built for Turing only (other
+architectures get `NO_DEVICE_CODE`): ggml-cuda's MMQ chain for GPUs without tensor cores, using
+ggml's tile loaders from `mmq.cuh`, launched from the `legion_tu_mmq_kernels` table by
+`src/model/tu_mmq.rs`.
 
 `mmq_preq.cu` has no kernel: it is the one piece of C++ host code the owner allowed for #363,
 the glue that runs ggml-cuda's MMQ (`mul_mat_q_case`, which has no C API) on activations that

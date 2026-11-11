@@ -73,12 +73,52 @@ pub fn ampere((major, minor): (i32, i32)) -> bool {
     major == 8 && (0..=7).contains(&minor)
 }
 
+/// Whether CUDA device `dev` is a Turing GPU without tensor cores (compute capability 7.5 and
+/// a TU11x name, [`no_tensor_cores_name`]), asked once.
+pub fn turing_without_tensor_cores(dev: usize) -> bool {
+    static TU11X: PerDevice = PerDevice::new();
+    TU11X.get(dev, |d| {
+        (compute_capability(d) == Some(75)
+            && cuda::name(d).is_some_and(|n| no_tensor_cores_name(&n))) as i32
+    }) == 1
+}
+
+/// Whether a compute capability 7.5 device named `name` has no tensor cores: the GTX 16 series
+/// (TU116, TU117), the MX450 and the MX550, the names ggml-cuda's own check lists.
+pub fn no_tensor_cores_name(name: &str) -> bool {
+    name.starts_with("NVIDIA GeForce GTX 16")
+        || name.starts_with("NVIDIA GeForce MX450")
+        || name.starts_with("NVIDIA GeForce MX550")
+}
+
 #[cfg(feature = "cuda")]
 mod cuda {
-    use std::ffi::c_int;
+    use std::ffi::{c_char, c_int};
 
     unsafe extern "C" {
         fn cudaDeviceGetAttribute(value: *mut c_int, attr: c_int, device: c_int) -> c_int;
+        fn cuDeviceGet(device: *mut c_int, ordinal: c_int) -> c_int;
+        fn cuDeviceGetName(name: *mut c_char, len: c_int, device: c_int) -> c_int;
+    }
+
+    /// Device `dev`'s name (the driver API's, as ggml-cuda reads it), `None` when unknown.
+    pub(super) fn name(dev: usize) -> Option<String> {
+        let ordinal = c_int::try_from(dev).ok()?;
+        let (mut d, mut buf) = (0, [0 as c_char; 256]);
+        // SAFETY: plain queries of an initialised driver (the engine's CUDA backend is up) into
+        // a buffer of the length passed.
+        unsafe {
+            if cuDeviceGet(&mut d, ordinal) != 0
+                || cuDeviceGetName(buf.as_mut_ptr(), buf.len() as c_int - 1, d) != 0
+            {
+                return None;
+            }
+            Some(
+                std::ffi::CStr::from_ptr(buf.as_ptr())
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        }
     }
 
     const DEV_ATTR_SM_COUNT: c_int = 16;
@@ -109,6 +149,10 @@ mod cuda {
 
 #[cfg(not(feature = "cuda"))]
 mod cuda {
+    pub(super) fn name(_: usize) -> Option<String> {
+        None
+    }
+
     pub(super) fn compute_capability(_: usize) -> i32 {
         0
     }
