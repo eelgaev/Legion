@@ -913,11 +913,11 @@ pub(in crate::cli) struct SwitchArgs {
     #[arg(long, help_heading = HEADING)]
     hc_streams_bf16: bool,
     /// Opt-in, moves output. qwen4exp passes where every sequence is in its prompt (steps of
-    /// 256+ tokens), on compute capability 8.0+ GPUs with BF16 mixer weights (the NVFP4
-    /// checkpoints; no effect elsewhere, with --hc-xn-written, or with --tp-seq-par splitting
-    /// the step): keep the hyper-connection residual streams in BF16 between the mixers instead
-    /// of F32, so the combine-and-norm (with the MoE output folded in) and the up-mix kernel
-    /// move half the stream bytes. Math stays F32 inside each kernel; each new stream value is
+    /// 256+ tokens), on compute capability 12.x GPUs (GB10, RTX 50, where the BF16 up-mix kernel
+    /// runs) with BF16 mixer weights (the NVFP4 checkpoints; no effect elsewhere, with
+    /// --hc-xn-written, or with --tp-seq-par splitting the step): keep the hyper-connection
+    /// residual streams in BF16 between the mixers instead of F32, so the combine-and-norm (with
+    /// the MoE output folded in) and the up-mix kernel move half the stream bytes. Math stays F32 inside each kernel; each new stream value is
     /// rounded to BF16. Decode, verify and mixed steps keep F32 streams (off by default).
     #[arg(long, help_heading = HEADING)]
     hc_bf16: bool,
