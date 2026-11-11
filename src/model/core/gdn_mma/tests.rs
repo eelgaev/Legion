@@ -108,7 +108,7 @@ fn op_matches_ggml_on_the_cpu() {
 }
 
 #[test]
-fn shapes_fit_only_head_counts_ggml_keeps_per_token() {
+fn shapes_fit_prompt_groups_of_any_head_counts() {
     let ctx = Context::new(32, 32);
     let s = HEAD;
     let fit = |n_k: i64, n_v: i64, nt: i64| {
@@ -121,12 +121,80 @@ fn shapes_fit_only_head_counts_ggml_keeps_per_token() {
     // A tensor parallel rank of Qwen3.8-Flash-Next (8 of 16 key, 24 of 48 value heads).
     assert!(fit(8, 24, 64));
     assert!(fit(8, 24, 4096));
-    // One GPU's layer: ggml-cuda runs its chunked kernel itself.
-    assert!(!fit(16, 48, 4096));
-    assert!(!fit(16, 32, 4096));
+    // One GPU's layer (ggml-cuda's own chunked kernel's head counts; `takes` decides).
+    assert!(fit(16, 48, 4096));
+    assert!(fit(16, 32, 4096));
     // Too few tokens (decode, verify), value heads not a multiple of the key heads.
     assert!(!fit(8, 24, 63));
+    assert!(!fit(16, 48, 63));
     assert!(!fit(16, 24, 4096));
+}
+
+/// The head counts the op takes: a rank's share with `--gdn-mma`, ggml-cuda's own groups with
+/// the staged kernel on compute capability 12.0 and 12.1 only. Restores the switches.
+#[test]
+fn takes_ggmls_groups_staged_on_consumer_blackwell_only() {
+    assert!(staged_gpu(Some((12, 1))));
+    assert!(staged_gpu(Some((12, 0))));
+    for cc in [
+        None,
+        Some((8, 6)),
+        Some((8, 9)),
+        Some((9, 0)),
+        Some((10, 0)),
+        Some((12, 2)),
+    ] {
+        assert!(!staged_gpu(cc), "{cc:?}");
+    }
+    let (on, staged, gpu) = (
+        ON.load(Ordering::Relaxed),
+        STAGED.load(Ordering::Relaxed),
+        STAGED_GPU.load(Ordering::Relaxed),
+    );
+    assert!(staged, "on by default");
+    for (o, st, g) in [
+        (false, true, true),
+        (true, false, true),
+        (true, true, false),
+    ] {
+        ON.store(o, Ordering::Relaxed);
+        STAGED.store(st, Ordering::Relaxed);
+        STAGED_GPU.store(g, Ordering::Relaxed);
+        assert_eq!(takes(16, 48, None), st && g, "{:?}", (o, st, g));
+        assert_eq!(takes(16, 64, None), st && g);
+        assert_eq!(takes(8, 24, None), o);
+    }
+    ON.store(on, Ordering::Relaxed);
+    STAGED.store(staged, Ordering::Relaxed);
+    STAGED_GPU.store(gpu, Ordering::Relaxed);
+}
+
+/// `gdn_staged` copies 16-byte pieces: aligned pointers and strides of whole 4-float groups.
+#[test]
+fn staged_needs_aligned_rows() {
+    let base = std::ptr::without_provenance::<f32>(0x1000);
+    let args = |off: usize, sq1: i64| Args {
+        q: base,
+        k: base.wrapping_add(off),
+        v: base.wrapping_add(2 * off),
+        g: base,
+        beta: base,
+        state: base,
+        dst: std::ptr::null_mut(),
+        state_out: std::ptr::null_mut(),
+        h: 48,
+        h_k: 16,
+        n_tokens: 4096,
+        n_seqs: 1,
+        rq3: 1,
+        sq: [sq1, 10240, 10240 * 4096],
+        sv: [128, 10240, 10240 * 4096],
+        sb: [1, 48, 48 * 4096],
+        scale: 1.0,
+    };
+    assert!(args(2048, 128).staged_aligned());
+    assert!(!args(2049, 128).staged_aligned());
+    assert!(!args(2048, 130).staged_aligned());
 }
 
 #[test]
@@ -171,6 +239,8 @@ fn launch_sizes_match_the_kernels() {
     assert_eq!(Schedule::Slices.smem(), 38016);
     assert_eq!(Schedule::SlicesTwo.smem(), 38016);
     assert_eq!(Schedule::Heads.smem(), 93312);
+    assert_eq!(Schedule::Staged.smem(), 85376);
+    assert_eq!(Schedule::Staged.grid(48, 2), 96);
     assert_eq!(std::mem::size_of::<Args>(), 184);
     assert_eq!(std::mem::offset_of!(Args, h), 64);
     assert_eq!(std::mem::offset_of!(Args, sq), 104);
@@ -237,4 +307,22 @@ fn each_gpu_of_a_mixed_box_answers_for_itself() {
         assert_eq!(gpu_for_by(None, engine, test_cc), engine);
     }
     assert!(gpu_takes(Some(8)) && gpu_takes(Some(12)) && !gpu_takes(Some(7)) && !gpu_takes(None));
+}
+
+/// The staged kernel takes ggml-cuda's groups on the GB10 and the 5090 of a mixed box only,
+/// whatever the engine's GPU is; the engine's answer where the state names no device.
+#[test]
+fn staged_answers_per_device_of_a_mixed_box() {
+    use crate::hw::per_device::test_cc;
+    for engine in [false, true] {
+        let picks: Vec<bool> = (0..6)
+            .map(|d| staged_for_by(Some(d), engine, test_cc))
+            .collect();
+        assert_eq!(
+            picks,
+            [true, false, false, false, true, false],
+            "engine {engine}"
+        );
+        assert_eq!(staged_for_by(None, engine, test_cc), engine);
+    }
 }

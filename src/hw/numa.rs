@@ -165,6 +165,54 @@ pub fn memory_only_page_cache_in(root: &Path, topo: &Topology, min: u64) -> Vec<
         .collect()
 }
 
+/// The node a GPU's host-side work should use for `node` (a GPU's host NUMA node as the driver
+/// or sysfs gives it): `node` itself unless sysfs lists it with no CPUs, then the nearest node
+/// with CPUs ([`nearest_cpu_node`]). A GH200's HBM is a CPU-less node: pinned host memory and
+/// the workers that fill it belong on the Grace node. Where every node has CPUs (an AC922's
+/// nodes 0 and 8, a GB10's node 0), or sysfs says nothing, `node` as given.
+pub fn cpu_node_near(node: u32) -> u32 {
+    cpu_node_near_in(Path::new("/sys/devices/system/node"), node)
+}
+
+/// [`cpu_node_near`] under a fixture directory of `node<N>` directories.
+pub fn cpu_node_near_in(root: &Path, node: u32) -> u32 {
+    let dir = root.join(format!("node{node}"));
+    match fs::read_to_string(dir.join("cpulist")) {
+        Ok(s) if parse_cpulist(&s).is_empty() => {}
+        _ => return node,
+    }
+    let Ok(topo) = Topology::from_sysfs(root) else {
+        return node;
+    };
+    let distance = fs::read_to_string(dir.join("distance"))
+        .map(|s| parse_distances(&s))
+        .unwrap_or_default();
+    nearest_cpu_node(node, &topo, &distance).unwrap_or(node)
+}
+
+/// A node's sysfs `distance` line (`10 20 40 ...`, one entry per node of the topology in
+/// ascending order); unparsable entries end the list.
+pub fn parse_distances(s: &str) -> Vec<u32> {
+    s.split_whitespace().map_while(|w| w.parse().ok()).collect()
+}
+
+/// `node` when `topo` gives it CPUs or does not know it; else the node with CPUs at the
+/// smallest `distance` (from `node`'s distance line, indexed as `topo.nodes`; ties and missing
+/// entries go to the lowest id); `None` when no node has CPUs.
+pub fn nearest_cpu_node(node: u32, topo: &Topology, distance: &[u32]) -> Option<u32> {
+    match topo.nodes.iter().find(|n| n.id == node) {
+        None => return Some(node),
+        Some(n) if !n.cpus.is_empty() => return Some(node),
+        Some(_) => {}
+    }
+    topo.nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| !n.cpus.is_empty())
+        .min_by_key(|&(i, n)| (distance.get(i).copied().unwrap_or(u32::MAX), n.id))
+        .map(|(_, n)| n.id)
+}
+
 pub fn pci_numa_node(bdf: &str) -> Option<u32> {
     pci_numa_node_in(Path::new("/sys/bus/pci/devices"), bdf)
 }

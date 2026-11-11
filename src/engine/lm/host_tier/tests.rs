@@ -278,3 +278,21 @@ fn the_margin_applies_to_free_plus_cache() {
     let cap = ((140 * GIB - margin) >> 20) as usize;
     assert_eq!(auto_host_blocks(1000, 4096, 1_000_000, 1000, &[n]), Ok(cap));
 }
+
+#[test]
+fn speed_note_per_link() {
+    let nvlink = speed_note(TierLink::Nvlink);
+    assert!(nvlink.starts_with("host blocks are read over the GPU's NVLink to the CPU (~68.5 GB/s measured on an AC922)"), "{nvlink}");
+    let pcie = speed_note(TierLink::Pcie);
+    assert!(
+        pcie.starts_with("host blocks are read over PCIe (~25 GB/s"),
+        "{pcie}"
+    );
+    // A GH200 never gets the AC922's figure.
+    let c2c = speed_note(TierLink::C2c);
+    assert!(
+        c2c.contains("NVLink-C2C") && c2c.contains("~375 GB/s"),
+        "{c2c}"
+    );
+    assert!(!c2c.contains("68.5"), "{c2c}");
+}

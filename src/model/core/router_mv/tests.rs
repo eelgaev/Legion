@@ -257,3 +257,19 @@ fn cuda_router_mv_is_ggml_bit_for_bit() {
         assert_eq!(bits(&c.w), bits(&c.ref_w), "{at}: weights");
     }
 }
+
+/// Programmatic dependent launch: compute capability 12.x always, 9.0 only under `--hopper-pdl`
+/// (off by default), nothing else either way.
+#[test]
+fn pdl_on_12x_and_opt_in_hopper_only() {
+    assert!(!hopper_pdl());
+    for hopper in [false, true] {
+        for cc in [120, 121] {
+            assert!(pdl_cc_with(cc, hopper));
+        }
+        for cc in [70, 75, 80, 86, 87, 89, 100, 103, 110] {
+            assert!(!pdl_cc_with(cc, hopper), "cc {cc}");
+        }
+        assert_eq!(pdl_cc_with(90, hopper), hopper);
+    }
+}

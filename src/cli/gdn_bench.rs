@@ -27,18 +27,64 @@ pub struct GdnBenchArgs {
     /// pair run twice, and the packed rows the fused step stores, "d.store") and time per layer.
     #[arg(long, conflicts_with = "commit")]
     replay: bool,
+    /// Prompt groups (#1183): ggml's op against the chunked kernels of `--gdn-mma` and the
+    /// default staged one (whole heads, value slices) at one GPU's head counts, for bits (rows
+    /// and final states, for each of --tokens and a two-sequence group) and time per layer (the
+    /// first of --tokens, at most 8 layers).
+    #[arg(long, conflicts_with_all = ["commit", "replay"])]
+    prompt: bool,
+    /// Tokens of the prompt groups (--prompt), each at least 64 (the chunked kernels' floor).
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_values_t = [4096, 1030],
+        value_parser = clap::value_parser!(i64).range(64..)
+    )]
+    tokens: Vec<i64>,
 }
 
 #[cfg(feature = "cuda")]
 pub fn run(args: GdnBenchArgs) -> anyhow::Result<()> {
-    use legion::model::core::gdn_bench::{self as bench, Config, REPLAY_VARIANTS, VARIANTS};
+    use legion::model::core::gdn_bench::{
+        self as bench, Config, PROMPT_KERNELS, REPLAY_VARIANTS, VARIANTS,
+    };
     let mut gpu = legion::ggml::backend_by_name("CUDA0")?;
     let cfg = Config {
         seqs: args.seqs,
         rounds: args.rounds,
-        layers: args.layers,
+        // A prompt layer's rows are ~100 MB at 4096 tokens.
+        layers: if args.prompt {
+            args.layers.min(8)
+        } else {
+            args.layers
+        },
         ..Config::default()
     };
+    if args.prompt {
+        let rows = bench::run_prompt(&mut gpu, &cfg, &args.tokens).map_err(anyhow::Error::msg)?;
+        print!("{:>6} {:>4} {:>12}", "tokens", "seqs", "ggml µs/l");
+        for name in PROMPT_KERNELS {
+            print!(" {:>24}", format!("{name} µs/l ratio differ"));
+        }
+        println!();
+        let mut differ = 0;
+        for r in &rows {
+            print!("{:>6} {:>4} {:>12.1}", r.tokens, r.seqs, r.secs[0] * 1e6);
+            for (i, d) in r.differ.iter().enumerate() {
+                let s = r.secs[i + 1];
+                print!(
+                    " {:>24}",
+                    format!("{:.1} {:.3} {d}", s * 1e6, s / r.secs[0].max(1e-12))
+                );
+            }
+            println!();
+            differ += r.differ.iter().sum::<usize>();
+        }
+        if differ > 0 {
+            anyhow::bail!("{differ} values differ from ggml's bits");
+        }
+        return Ok(());
+    }
     if args.replay {
         let rows = bench::run_replay(&mut gpu, &cfg).map_err(anyhow::Error::msg)?;
         println!(

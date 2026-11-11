@@ -131,6 +131,47 @@ unsafe fn weight_at(w: &ffi::ggml_tensor, e: usize, c: usize) -> f32 {
     }
 }
 
+/// `--hopper-pdl` ([`set_hopper_pdl`]).
+static HOPPER_PDL: AtomicBool = AtomicBool::new(false);
+
+/// Whether Legion's programmatic dependent launches (each kernel set up while the one ahead of
+/// it still runs, then waiting for it in `griddepcontrol.wait`; this op, the GLM and Qwen4 decode
+/// kernels of `src/cuda/launch_pdl.cuh`, and the [`super::q8_group`] chain, which 9.0 does not
+/// run today: [`super::q8_group::cc_supported`]) take compute capability
+/// 9.0 (H100, H200, GH200) too, as they take 12.x (`legion serve --hopper-pdl`, #1215). Off by
+/// default: untested on hardware. The CUDA side launches early only kernels whose binary code is
+/// sm_90+ (the wait is compiled for sm_90+ only); other GPUs never change.
+pub fn set_hopper_pdl(on: bool) {
+    HOPPER_PDL.store(on, Ordering::Relaxed);
+    #[cfg(feature = "cuda")]
+    {
+        unsafe extern "C" {
+            fn legion_set_hopper_pdl(on: i32);
+        }
+        // SAFETY: stores a flag.
+        unsafe { legion_set_hopper_pdl(i32::from(on)) }
+    }
+}
+
+/// [`set_hopper_pdl`]'s state.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub fn hopper_pdl() -> bool {
+    HOPPER_PDL.load(Ordering::Relaxed)
+}
+
+/// Whether a programmatic dependent launch takes a device of compute capability `cc` (`10 *
+/// major + minor`): 12.x, and 9.0 under [`set_hopper_pdl`].
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub fn pdl_cc(cc: i32) -> bool {
+    pdl_cc_with(cc, hopper_pdl())
+}
+
+/// [`pdl_cc`] with `--hopper-pdl` given as `hopper`.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn pdl_cc_with(cc: i32, hopper: bool) -> bool {
+    cc / 10 == 12 || (cc == 90 && hopper)
+}
+
 /// Whether the current GPU runs the op: compute capability 9.0 or newer (false without CUDA).
 pub fn device_supported() -> bool {
     #[cfg(feature = "cuda")]

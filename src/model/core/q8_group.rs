@@ -834,8 +834,9 @@ mod launch {
     }
 
     /// Launches kernel `kernel` of the table on `p` (by value) on `stream`; on compute
-    /// capability 12.x (GB10, RTX 50) as a programmatic dependent launch, as ggml-cuda launches
-    /// its own kernels there (each kernel waits for the one ahead before it touches
+    /// capability 12.x (GB10, RTX 50), and 9.0 under `--hopper-pdl`
+    /// ([`crate::model::core::router_mv::pdl_cc`]), as a programmatic dependent launch, as
+    /// ggml-cuda launches its own kernels there (each kernel waits for the one ahead before it touches
     /// activations, `src/cuda/q8_group.cu`; the wait is compiled in, since the load refuses a
     /// 9.0+ GPU whose code here is older than sm_90, `crate::hw::cuda_arch`).
     fn launch(
@@ -858,7 +859,7 @@ mod launch {
             dynamic_smem: 0,
             stream,
             attrs: &mut attr,
-            num_attrs: u32::from(compute_capability().is_some_and(|cc| cc / 10 == 12)),
+            num_attrs: u32::from(compute_capability().is_some_and(super::super::router_mv::pdl_cc)),
         };
         // SAFETY: a kernel of the table taking `legion_q8_group` by value, from the launch's
         // copy of `p`; its pointers are device memory of the stream's device (the nodes).

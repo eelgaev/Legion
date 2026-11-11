@@ -2377,25 +2377,41 @@ fn tier_node(_: usize) -> Option<u32> {
     None
 }
 
-/// Whether the layout's GPUs reach host memory over NVLink (they use the host's page tables:
-/// an AC922, a Grace Hopper), not PCIe.
+/// The link the layout's GPUs read host memory over: NVLink when they use the host's page
+/// tables (an AC922), NVLink-C2C when they also are a Grace Hopper's
+/// ([`crate::residency::unified::c2c`]), else PCIe.
 #[cfg(feature = "cuda")]
-fn tier_link_nvlink(layout: &layout::Layout) -> bool {
-    let nvlink = |d: Option<crate::ggml::Device>| {
+fn tier_link(layout: &layout::Layout) -> host_tier::TierLink {
+    use crate::residency::unified::{LinkAttrs, c2c};
+    let caps = |d: Option<crate::ggml::Device>| {
         d.and_then(cuda_index)
             .and_then(crate::residency::cuda::caps)
-            .is_some_and(|c| c.pageable_uses_host_page_tables)
     };
     // Tensor parallelism: the GPUs under the meta device (which has no CUDA index).
-    if !layout.tp_devices.is_empty() {
-        return layout.tp_devices.iter().all(|&d| nvlink(Some(d)));
+    let caps: Vec<_> = if !layout.tp_devices.is_empty() {
+        layout.tp_devices.iter().map(|&d| caps(Some(d))).collect()
+    } else {
+        layout.stages.iter().map(|(d, _)| caps(*d)).collect()
+    };
+    let nvlink = caps
+        .iter()
+        .all(|c| c.is_some_and(|c| c.pageable_uses_host_page_tables));
+    if !nvlink {
+        host_tier::TierLink::Pcie
+    } else if caps
+        .iter()
+        .flatten()
+        .all(|c| c2c(std::env::consts::ARCH, LinkAttrs::from(c)))
+    {
+        host_tier::TierLink::C2c
+    } else {
+        host_tier::TierLink::Nvlink
     }
-    layout.stages.iter().all(|(d, _)| nvlink(*d))
 }
 
 #[cfg(not(feature = "cuda"))]
-fn tier_link_nvlink(_: &layout::Layout) -> bool {
-    false
+fn tier_link(_: &layout::Layout) -> host_tier::TierLink {
+    host_tier::TierLink::Pcie
 }
 
 /// Per stage, where its rings are saved ([`Executor::enable_ring_saves`]): pinned memory on
@@ -3931,12 +3947,24 @@ impl LmEngine {
         #[cfg(feature = "cuda")]
         warn_nvfp4_a4(&layout, cfg.nvfp4_a4);
         #[cfg(feature = "cuda")]
-        let caps = device
+        let dev_caps = device
             .and_then(cuda_index)
-            .and_then(crate::residency::cuda::caps)
-            .map(|c| (c.cc_major, c.cc_minor, c.sms));
+            .and_then(crate::residency::cuda::caps);
+        #[cfg(feature = "cuda")]
+        let caps = dev_caps.map(|c| (c.cc_major, c.cc_minor, c.sms));
         #[cfg(not(feature = "cuda"))]
         let caps: Option<(i32, i32, i32)> = None;
+        // The defaults that let step buffers spill into host memory (the expert cache taking
+        // the prompt room, `--kv-vmm` on a 2-GPU split): a V100's, and a GH200's (#1215,
+        // `unified::spill_default`; an AC922 and a GB10 as before).
+        #[cfg(feature = "cuda")]
+        let spill_default = crate::residency::unified::spill_default_here(
+            dev_caps
+                .as_ref()
+                .map(crate::residency::unified::LinkAttrs::from),
+        );
+        #[cfg(not(feature = "cuda"))]
+        let spill_default = false;
         let cc = caps.map(|c| (c.0, c.1));
         let cc_major = cc.map(|c| c.0);
         // V100 (#574): the GB10 prompt kernels too (Maya-S, 8K-token prompt 565 -> 804 tok/s), but
@@ -3953,7 +3981,7 @@ impl LmEngine {
         // same bits)
         crate::model::glm5next::ops::set_q6k_f16(cc_major.is_some_and(|m| m >= 8));
         crate::model::core::gdn_scan::set_gpu(cc_major);
-        crate::model::core::gdn_mma::set_gpu(cc_major);
+        crate::model::core::gdn_mma::set_gpu(cc);
         crate::model::core::gdn::set_gpu(cc_major);
         crate::model::qwen4::set_xn16_gpu(cc);
         crate::model::core::mmq_preq::set_gpu(cc_major);
@@ -4646,9 +4674,10 @@ impl LmEngine {
             };
         }
         // `--kv-vmm` (#814): the pools in reserved virtual ranges, before the cache is sized.
-        // The default on a V100 with the expert cache over a layer split of 2 GPUs (as measured,
-        // the same bits): the pools past the first KV_VMM_KEEP_DEFAULT tokens go to the cache.
-        let kv_auto = volta
+        // The default on a V100 (and a GH200, unmeasured: `spill_default`) with the expert cache
+        // over a layer split of 2 GPUs (as measured on V100s, the same bits): the pools past the
+        // first KV_VMM_KEEP_DEFAULT tokens go to the cache.
+        let kv_auto = spill_default
             && cfg.switches.kv_vmm.is_none()
             && mode == ExpertMode::Cache
             && layout.stages.len() == 2
@@ -4761,7 +4790,7 @@ impl LmEngine {
                     "KV cache: a host tier past the device blocks"
                 );
                 if let Some(budget) = exec.kv_slot_host_budget() {
-                    let nvlink = tier_link_nvlink(&layout);
+                    let link = tier_link(&layout);
                     let held = (budget * exec.kv_block_bytes()) as f64 / (1u64 << 30) as f64;
                     tracing::warn!(
                         "{max_seqs} sequences of {} tokens do not fit in GPU or host memory: \
@@ -4773,10 +4802,10 @@ impl LmEngine {
                         cfg.ctx_size,
                         slot_hbm * KV_BLOCK,
                         budget * KV_BLOCK,
-                        host_tier::speed_note(nvlink)
+                        host_tier::speed_note(link)
                     );
                 } else if auto_tier {
-                    let nvlink = tier_link_nvlink(&layout);
+                    let link = tier_link(&layout);
                     tracing::warn!(
                         "the {}-token context does not fit in GPU memory: a KV host tier of {} \
                         tokens ({gib:.1} GiB of pinned memory on NUMA node(s) {nodes:?}) is on, \
@@ -4784,7 +4813,7 @@ impl LmEngine {
                         cfg.ctx_size,
                         host_blocks * KV_BLOCK,
                         hbm_blocks * KV_BLOCK,
-                        host_tier::speed_note(nvlink)
+                        host_tier::speed_note(link)
                     );
                 }
             }
@@ -4945,8 +4974,8 @@ impl LmEngine {
                 );
             }
             // `--expert-cache-fill-prompt-room`: the prompt steps' room goes to the cache where
-            // their buffers can spill into host memory. The default on V100s (an AC922).
-            let fill_prompt_room = cfg.residency.fills_prompt_room(volta);
+            // their buffers can spill into host memory. The default on V100s (an AC922) and a GH200.
+            let fill_prompt_room = cfg.residency.fills_prompt_room(spill_default);
             if fill_prompt_room && layout.stages.iter().any(|(d, _)| d.is_some_and(spills)) {
                 tracing::info!(
                     "expert cache takes the prompt steps' compute room (prompt buffers may spill \

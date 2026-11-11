@@ -26,6 +26,9 @@ pub struct Switches {
     /// Gated DeltaNet prompt steps whose head counts ggml-cuda keeps on its per-token kernel (a
     /// tensor parallel rank's share) on its chunked kernel ([`crate::model::core::set_gdn_mma`]).
     pub gdn_mma: Option<bool>,
+    /// Gated DeltaNet prompt groups' whole-head chunked kernel staged through shared memory
+    /// ([`crate::model::core::set_gdn_staged`]).
+    pub gdn_staged: Option<bool>,
     /// Gated DeltaNet verify and commit steps' delta rule as Legion's op
     /// ([`crate::model::core::set_gdn`]).
     pub gdn: Option<bool>,
@@ -146,6 +149,15 @@ pub struct Switches {
     /// W8A16 FP8 matmuls of 5-64 tokens on the sliced-K GEMM
     /// ([`crate::model::fp8::set_sliced_k`]).
     pub fp8_sliced_k: Option<bool>,
+    /// W8A8 FP8 prompt matmuls on the Hopper wgmma GEMM, untested on hardware
+    /// ([`crate::model::wgmma_gemm::set_enabled`]).
+    pub hopper_gemm: Option<bool>,
+    /// Paged attention prefill on the Hopper wgmma kernel, untested on hardware
+    /// (`model::core::paged::hopper::set_enabled`).
+    pub hopper_attn: Option<bool>,
+    /// Programmatic dependent launch on compute capability 9.0 too, untested on hardware
+    /// (`model::core::router_mv::set_hopper_pdl`).
+    pub hopper_pdl: Option<bool>,
     /// Dense NVFP4 matmuls of 33-64 tokens on the mv kernel
     /// ([`crate::model::nvfp4_mm::set_wide_mv`]).
     pub nvfp4_wide_mv: Option<bool>,
@@ -338,8 +350,9 @@ pub struct Switches {
     /// qwen4exp's residual streams kept in BF16 between the GB10 prompt mixers
     /// ([`crate::model::qwen4::set_streams_bf16`], opt-in, moves output).
     pub hc_streams_bf16: Option<bool>,
-    /// qwen4exp's residual streams kept in BF16 between the sm_80+ BF16 prompt mixers (the
-    /// NVFP4 checkpoints, [`crate::model::qwen4::set_hc_bf16`], opt-in, moves output).
+    /// qwen4exp's residual streams kept in BF16 between the compute capability 12.x BF16 prompt
+    /// mixers (the NVFP4 checkpoints, [`crate::model::qwen4::set_hc_bf16`], opt-in, moves
+    /// output).
     pub hc_bf16: Option<bool>,
     /// qwen4exp's mixer gated mix also writing the block input as F16 for its Q8_0 projections
     /// on a V100 ([`crate::model::qwen4::set_mix16`]).
@@ -528,6 +541,7 @@ impl Switches {
         set(self.delta_prep, core::set_delta_prep);
         set(self.gdn_scan, core::set_gdn_scan);
         set(self.gdn_mma, core::set_gdn_mma);
+        set(self.gdn_staged, core::set_gdn_staged);
         set(self.gdn, core::set_gdn);
         set(self.gdn_decode, core::set_gdn_decode);
         set(self.gdn_replay_staged, core::set_gdn_replay_staged);
@@ -598,6 +612,15 @@ impl Switches {
             crate::model::fp8::set_small_batch_gemv,
         );
         set(self.fp8_sliced_k, crate::model::fp8::set_sliced_k);
+        set(self.hopper_gemm, crate::model::wgmma_gemm::set_enabled);
+        set(
+            self.hopper_attn,
+            crate::model::core::paged::hopper::set_enabled,
+        );
+        set(
+            self.hopper_pdl,
+            crate::model::core::router_mv::set_hopper_pdl,
+        );
         set(self.nvfp4_wide_mv, crate::model::nvfp4_mm::set_wide_mv);
         set(
             self.nvfp4_expert_pdl,
