@@ -4126,7 +4126,8 @@ impl Model {
         } else {
             // With `--nvfp4-once` the top-k kernel also writes the routing plan of the NVFP4
             // expert ops (#836), which then launch without building one.
-            let plan = ep.is_none() && self.experts.is_none() && nvfp4_once::plan_fits(used, n);
+            let plan =
+                ep.is_none() && self.experts.is_none() && nvfp4_once::plan_fits(gate_w, used, n);
             // Joined top-k and weights (#814): the weights go into the graph below, before
             // the experts pull the ids in (not with `--decode-fuse`, which adds the ids).
             fused::router_planned(ctx, logits, used, plan, !df)

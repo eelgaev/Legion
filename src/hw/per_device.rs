@@ -51,6 +51,47 @@ pub fn compute_capability(dev: usize) -> Option<i32> {
     (cc > 0).then_some(cc)
 }
 
+/// CUDA device `dev`'s compute capability as `(major, minor)` ((12, 1) on a GB10), asked once;
+/// `None` when it cannot be asked.
+pub fn cc(dev: usize) -> Option<(i32, i32)> {
+    compute_capability(dev).map(|c| (c / 10, c % 10))
+}
+
+/// What a switch chosen by compute capability answers for an op on CUDA device `dev` (the
+/// device of the weight it multiplies, or of the state it updates): `rule` of that device's
+/// compute capability (asked once per device). Where the op's tensors name no CUDA device
+/// (`None`: not placed yet, or host memory), `engine`: the answer for the GPU the engine loaded
+/// on. On a box of one kind of GPU the two are the same answer.
+pub fn pick<T>(dev: Option<usize>, engine: T, rule: impl FnOnce(Option<(i32, i32)>) -> T) -> T {
+    pick_by(dev, engine, rule, cc)
+}
+
+/// [`pick`] with the compute capabilities `cc_of` gives (the tests' fake boxes).
+pub fn pick_by<T>(
+    dev: Option<usize>,
+    engine: T,
+    rule: impl FnOnce(Option<(i32, i32)>) -> T,
+    cc_of: impl FnOnce(usize) -> Option<(i32, i32)>,
+) -> T {
+    match dev {
+        Some(dev) => rule(cc_of(dev)),
+        None => engine,
+    }
+}
+
+/// The tests' fake mixed box for [`pick_by`]: a GB10 (device 0), an RTX 4090 (1), a V100 (2),
+/// an A100 (3), an RTX 5090 (4); none from device 5 on.
+#[cfg(test)]
+pub fn test_cc(dev: usize) -> Option<(i32, i32)> {
+    [(12, 1), (8, 9), (7, 0), (8, 0), (12, 0)].get(dev).copied()
+}
+
+/// The CUDA device current on the calling thread (a launcher's: the stream's device), `None`
+/// when it cannot be asked.
+pub fn current() -> Option<usize> {
+    cuda::current()
+}
+
 /// CUDA device `dev`'s streaming multiprocessors, asked once; 0 when unknown.
 pub fn sm_count(dev: usize) -> i32 {
     static SMS: PerDevice = PerDevice::new();
@@ -60,9 +101,29 @@ pub fn sm_count(dev: usize) -> i32 {
 /// Device `dev`'s SM count when its compute capability is 12.x (GB10, RTX 50), else 0: the GPUs
 /// the ops tuned on a GB10 are chosen for.
 pub fn sms_if_cc12(dev: usize) -> i32 {
-    match compute_capability(dev) {
-        Some(cc) if cc / 10 == 12 => sm_count(dev),
-        _ => 0,
+    sms_if_cc12_on(Some(dev), 0)
+}
+
+/// [`sms_if_cc12`] for an op on device `dev` (the weight's); `engine` (the engine's GPU's
+/// answer) where the op's tensors name no CUDA device, as [`pick`].
+pub fn sms_if_cc12_on(dev: Option<usize>, engine: i32) -> i32 {
+    sms_if_cc12_by(dev, engine, cc, sm_count)
+}
+
+/// [`sms_if_cc12_on`] with the compute capabilities `cc_of` and SM counts `sms_of` give (the
+/// tests' fake boxes).
+pub fn sms_if_cc12_by(
+    dev: Option<usize>,
+    engine: i32,
+    cc_of: impl FnOnce(usize) -> Option<(i32, i32)>,
+    sms_of: impl FnOnce(usize) -> i32,
+) -> i32 {
+    match dev {
+        Some(dev) => match cc_of(dev) {
+            Some((12, _)) => sms_of(dev).max(0),
+            _ => 0,
+        },
+        None => engine,
     }
 }
 
@@ -79,6 +140,16 @@ mod cuda {
 
     unsafe extern "C" {
         fn cudaDeviceGetAttribute(value: *mut c_int, attr: c_int, device: c_int) -> c_int;
+        fn cudaGetDevice(device: *mut c_int) -> c_int;
+    }
+
+    pub(super) fn current() -> Option<usize> {
+        let mut dev = 0;
+        // SAFETY: a plain query of the calling thread's device.
+        if unsafe { cudaGetDevice(&mut dev) } != 0 {
+            return None;
+        }
+        usize::try_from(dev).ok()
     }
 
     const DEV_ATTR_SM_COUNT: c_int = 16;
@@ -109,6 +180,10 @@ mod cuda {
 
 #[cfg(not(feature = "cuda"))]
 mod cuda {
+    pub(super) fn current() -> Option<usize> {
+        None
+    }
+
     pub(super) fn compute_capability(_: usize) -> i32 {
         0
     }

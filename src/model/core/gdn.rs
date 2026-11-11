@@ -90,7 +90,7 @@ pub fn set_gdn_decode(on: bool) {
     DECODE_ON.store(on, Ordering::Relaxed);
 }
 
-/// Whether [`rows_replay`] stages its tokens' inputs through shared memory on a GPU [`set_gpu`]
+/// Whether [`rows_replay`] stages its tokens' inputs through shared memory on a GPU [`gpu_for`]
 /// chose (the same bits as the per-lane kernel).
 static REPLAY_STAGED: AtomicBool = AtomicBool::new(false);
 
@@ -131,11 +131,36 @@ pub(super) fn pad_fits(pad: Tensor<'_>, v: Tensor<'_>) -> bool {
 /// used on compute capability 9.0+ (`cc_major`), where they were measured (GB10, #836); other GPUs
 /// keep ggml's op and the per-lane replay kernel.
 pub fn set_gpu(cc_major: Option<i32>) {
-    DECODE_GPU.store(cc_major.is_some_and(|m| m >= 9), Ordering::Relaxed);
+    DECODE_GPU.store(gpu_takes(cc_major), Ordering::Relaxed);
+}
+
+/// Whether a GPU of compute capability major `cc_major` takes [`decode`] ([`set_gpu`]).
+pub(super) fn gpu_takes(cc_major: Option<i32>) -> bool {
+    cc_major.is_some_and(|m| m >= 9)
+}
+
+/// Whether the GPU of device `dev` (the state's, or a launch's) takes [`decode`] and the staged
+/// replay, asked per device (#1201: a box may hold GPUs of different architectures); the
+/// engine's answer ([`set_gpu`]) where `dev` is unknown.
+fn gpu_for(dev: Option<usize>) -> bool {
+    gpu_for_by(
+        dev,
+        DECODE_GPU.load(Ordering::Relaxed),
+        crate::hw::per_device::cc,
+    )
+}
+
+/// [`gpu_for`] with the engine's answer `engine` and the compute capabilities `cc_of` gives.
+pub(super) fn gpu_for_by(
+    dev: Option<usize>,
+    engine: bool,
+    cc_of: impl FnOnce(usize) -> Option<(i32, i32)>,
+) -> bool {
+    crate::hw::per_device::pick_by(dev, engine, |cc| gpu_takes(cc.map(|c| c.0)), cc_of)
 }
 
 /// Whether [`decode`] takes ggml's `gated_delta_net(q, k, v, g, beta, state, 1)`: as [`fits`],
-/// for one token per sequence, on a GPU [`set_gpu`] chose.
+/// for one token per sequence, the state on a GPU it is chosen for ([`gpu_for`]).
 pub(super) fn decode_fits(
     q: Tensor<'_>,
     k: Tensor<'_>,
@@ -145,13 +170,13 @@ pub(super) fn decode_fits(
     state: Tensor<'_>,
 ) -> bool {
     DECODE_ON.load(Ordering::Relaxed)
-        && DECODE_GPU.load(Ordering::Relaxed)
         && cfg!(feature = "cuda")
         && v.ne()[2] == 1
         && [q, k, v, g, beta, state]
             .iter()
             .all(|t| !t.is_host() && !t.is_meta())
         && shapes_fit(q, k, v, g, beta, state)
+        && gpu_for(state.cuda_device())
 }
 
 /// Whether the op takes ggml's `gated_delta_net(q, k, v, g, beta, state, 1)`: on a GPU only (the
@@ -823,13 +848,14 @@ pub(crate) fn set_replay_variant(v: i32) {
 }
 
 /// The variant a [`rows_replay`] launch passes: the forced one, else the kernel's default (-1)
-/// where staging is on and the GPU chosen, else the per-lane kernel (0).
+/// where staging is on and the launch's GPU (the current device) chosen, else the per-lane
+/// kernel (0).
 #[cfg(feature = "cuda")]
 fn replay_variant() -> i32 {
     let v = REPLAY_VARIANT.load(Ordering::Relaxed);
     if v >= 0 {
         v
-    } else if REPLAY_STAGED.load(Ordering::Relaxed) && DECODE_GPU.load(Ordering::Relaxed) {
+    } else if REPLAY_STAGED.load(Ordering::Relaxed) && gpu_for(crate::hw::per_device::current()) {
         -1
     } else {
         0

@@ -112,7 +112,8 @@ impl Schedule {
 static ON: AtomicBool = AtomicBool::new(false);
 
 /// Whether the engine's GPU has the kernel's tensor cores (compute capability 8.0 or later),
-/// set when the engine loads ([`set_gpu`]).
+/// set when the engine loads ([`set_gpu`]): the answer for a group whose state names no device
+/// ([`gpu_for`]).
 static GPU: AtomicBool = AtomicBool::new(false);
 
 /// Sets whether graphs built from now on use [`gdn_mma`] where it fits (off by default; `legion
@@ -123,7 +124,27 @@ pub fn set_gdn_mma(on: bool) {
 
 /// The engine's GPU: the kernel needs compute capability 8.0 or later (`cc_major`).
 pub fn set_gpu(cc_major: Option<i32>) {
-    GPU.store(cc_major.is_some_and(|m| m >= 8), Ordering::Relaxed);
+    GPU.store(gpu_takes(cc_major), Ordering::Relaxed);
+}
+
+/// Whether a GPU of compute capability major `cc_major` has the kernel's tensor cores.
+pub(super) fn gpu_takes(cc_major: Option<i32>) -> bool {
+    cc_major.is_some_and(|m| m >= 8)
+}
+
+/// Whether the GPU of device `dev` (the state's) runs the kernel, asked per device (#1201: a box
+/// may hold GPUs of different architectures); the engine's answer where `dev` is unknown.
+fn gpu_for(dev: Option<usize>) -> bool {
+    gpu_for_by(dev, GPU.load(Ordering::Relaxed), crate::hw::per_device::cc)
+}
+
+/// [`gpu_for`] with the engine's answer `engine` and the compute capabilities `cc_of` gives.
+pub(super) fn gpu_for_by(
+    dev: Option<usize>,
+    engine: bool,
+    cc_of: impl FnOnce(usize) -> Option<(i32, i32)>,
+) -> bool {
+    crate::hw::per_device::pick_by(dev, engine, |cc| gpu_takes(cc.map(|c| c.0)), cc_of)
 }
 
 /// Whether ggml-cuda gives a group of `n_k` key and `n_v` value heads its chunked kernel itself.
@@ -169,9 +190,9 @@ pub(super) fn shapes_fit(
         && state.ne() == [HEAD, HEAD, n_v, ns]
 }
 
-/// Whether [`gdn_mma`] takes this prompt group: switched on, a CUDA build on a GPU with the
-/// kernel's tensor cores ([`set_gpu`]), the state in one device's memory (the CPU graph is the
-/// reference and keeps ggml's op), and [`shapes_fit`].
+/// Whether [`gdn_mma`] takes this prompt group: switched on, a CUDA build, the state in the
+/// memory of one GPU with the kernel's tensor cores ([`gpu_for`]; the CPU graph is the reference
+/// and keeps ggml's op), and [`shapes_fit`].
 pub(super) fn fits(
     q: Tensor<'_>,
     k: Tensor<'_>,
@@ -181,11 +202,11 @@ pub(super) fn fits(
     state: Tensor<'_>,
 ) -> bool {
     ON.load(Ordering::Relaxed)
-        && GPU.load(Ordering::Relaxed)
         && cfg!(feature = "cuda")
         && !state.is_host()
         && !state.is_meta()
         && shapes_fit(q, k, v, g, beta, state)
+        && gpu_for(state.cuda_device())
 }
 
 /// ggml's `gated_delta_net(q, k, v, g, beta, state, 1)` on its chunked kernel: the same shape
