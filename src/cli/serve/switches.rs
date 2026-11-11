@@ -411,10 +411,11 @@ pub(in crate::cli) struct SwitchArgs {
     #[arg(long, help_heading = HEADING)]
     hopper_attn: bool,
     /// CUDA, compute capability 12.x (DGX Spark's GB10, RTX 50), paged attention with heads of
-    /// 256 (Qwen3.5+ and Gemma 4's sliding layers): prompt chunks of 256 query rows or more
-    /// (tokens x query heads per kv head) over an F16 cache on the default kernel that takes 8
-    /// query columns per warp, instead of the one that takes 16 query rows per warp with Q in
-    /// shared memory (the default there). The same bits. For comparisons.
+    /// 256 (Qwen3.5+ and Gemma 4's sliding layers): prompt chunks over an F16 cache whose CTAs
+    /// fill the GPU (the default picks by waves of CTAs over the SMs; verify steps and short
+    /// chunks keep the old kernel either way) on the default kernel that takes 8 query columns
+    /// per warp, instead of the one that takes 16 query rows per warp with Q in shared memory
+    /// (the default there). The same bits. For comparisons.
     #[arg(long, help_heading = HEADING)]
     no_paged_prefill_qm: bool,
     /// CUDA, compute capability 9.0 only (H100, H200, GH200) with a binary built for sm_90

@@ -742,7 +742,9 @@ unsafe extern "C" {
 
 /// Prefill groups with heads of 256 on compute capability 12.x devices (a DGX Spark's GB10, RTX
 /// 50) through the kernel that takes the queries as the MMA's M dimension
-/// (`src/cuda/sm80/paged_attn_qm.cuh`, #1133) where it covers them, or (`false`) through
+/// (`src/cuda/sm80/paged_attn_qm.cuh`, #1133) where it covers them and its grid of CTAs is the
+/// faster one (prompt chunks; verify steps and short chunks over a long context are not), or
+/// (`false`) through
 /// `paged_prefill_mma` as before. The same bits either way; on by default (`legion serve
 /// --no-paged-prefill-qm` turns it off). Other GPUs and ops keep their kernels. For every thread.
 pub fn set_qm_prefill(on: bool) {
@@ -765,6 +767,18 @@ pub fn set_qm_prefill_here(on: Option<bool>) {
     };
     #[cfg(not(feature = "cuda"))]
     let _ = on;
+}
+
+/// [`set_qm_prefill_here`] by mode (benches): 0 off, 1 on where its grid is the faster one (the
+/// default), 2 on for every multi-token group it covers.
+pub fn set_qm_mode_here(mode: i32) {
+    #[cfg(feature = "cuda")]
+    // SAFETY: sets a thread-local flag the launches read.
+    unsafe {
+        legion_paged_attn_set_qm(mode, 1)
+    };
+    #[cfg(not(feature = "cuda"))]
+    let _ = mode;
 }
 
 /// Launches of the queries-as-M prefill kernel ([`set_qm_prefill`]) from the calling thread so

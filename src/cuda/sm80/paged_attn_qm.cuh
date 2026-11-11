@@ -29,7 +29,7 @@
 // larger tile (more key blocks for its first and last rows) leaves the bits alone.
 //
 // Not covered (paged_prefill_mma instead): quantized caches, the compact cache, a host tier's
-// pieces, key-block splits, other head sizes, short groups (takes()).
+// pieces, key-block splits, other head sizes, groups whose grid is faster there (pays()).
 
 namespace fa_qm {
 
@@ -45,9 +45,28 @@ template <int D> struct Shape {
     static constexpr size_t SMEM = (size_t) QBYTES + (size_t) NS * CHUNK;
 };
 
-// The fewest query rows (n_tok * G) a launch takes the kernel at: below, the old kernel's 64-row
-// tiles give more CTAs (verify steps), and the bits are the same either way.
-constexpr int MIN_ROWS = 256;
+// Whether a group's grid runs faster here than on paged_prefill_mma (the bits are the same either
+// way; measured on a GB10, #1133). Both kernels run one CTA per SM, ROWS query rows here against
+// its 64. With few CTAs (verify steps of 2 to 64 tokens a sequence, short chunks over a long
+// context) a CTA takes about as long as its keys whatever its rows, here about 1.25x as long, so
+// the old kernel's twice as many smaller CTAs win while the SMs have room for them: 0.55-0.95x
+// here. With full warps (prompt chunks) a row costs about 8 / 9 of the old kernel's. So both
+// grids are costed as waves of CTAs over the SMs times a CTA's tokens, and this kernel takes the
+// group up to 7 / 6 of the old grid's cost: there it measured 0.97-1.02x over a long context and
+// 1.05-1.29x over a short one, whose causal tiles even out the waves (the context length is on
+// the device only, and the choice has to hold for every step of a shape).
+template <int D, int G>
+bool pays(const legion_paged_attn & p) {
+    constexpr int QT = Shape<D>::ROWS / G, QT_MMA = fa::Shape<D>::COLS / G;
+    const int64_t sms = legion_device::sm_count();
+    if (sms <= 0) {
+        return false;
+    }
+    const int64_t per = (int64_t) p.n_head_kv * p.n_seqs;
+    const int64_t waves    = ((p.n_tok + QT - 1) / QT * per + sms - 1) / sms;
+    const int64_t waves_mm = ((p.n_tok + QT_MMA - 1) / QT_MMA * per + sms - 1) / sms;
+    return waves * QT * 6 <= waves_mm * QT_MMA * 7;
+}
 
 template <int D, int G>
 __global__ void __launch_bounds__(Shape<D>::NW * 32, 1) paged_prefill_qm(const legion_paged_attn p) {
@@ -298,12 +317,13 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, 1) paged_prefill_qm(const l
 }
 
 // Whether a launch takes paged_prefill_qm: on (legion_paged_attn_set_qm), a compute capability
-// 12.x device with this binary's sm_80+ code, a prefill group of MIN_ROWS rows or more over F16
-// caches, no compact cache, no host tier's pieces, no key-block split.
+// 12.x device with this binary's sm_80+ code, a multi-token group over F16 caches whose grid pays
+// (or any, in mode 2: benches), no compact cache, no host tier's pieces, no key-block split.
 template <int D, int G>
 bool takes(const legion_paged_attn & p) {
-    return qm_on() && p.n_tok * G >= MIN_ROWS && p.k_type == LEGION_KV_F16 && p.v_type == LEGION_KV_F16 &&
-           !p.compact && !p.piece_blk && !p.ml && legion_device::sm12x_device(paged_prefill_qm<D, G>);
+    const int mode = qm_mode();
+    return mode > 0 && p.k_type == LEGION_KV_F16 && p.v_type == LEGION_KV_F16 && !p.compact && !p.piece_blk && !p.ml &&
+           legion_device::sm12x_device(paged_prefill_qm<D, G>) && (mode >= 2 || pays<D, G>(p));
 }
 
 template <int D, int G>

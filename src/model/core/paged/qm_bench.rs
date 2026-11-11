@@ -10,18 +10,19 @@ use super::*;
 use crate::ggml::{Backend, ComputeAllocator};
 use crate::model::core::KvPool;
 
-/// One run of the op for `g` over `kv` with the kernel on or off for this thread: its output,
+/// One run of the op for `g` over `kv` with the kernel in mode `mode` for this thread (0 off, 1
+/// the default, 2 on for every group it covers, [`set_qm_mode_here`]): its output,
 /// its milliseconds (best of `rounds` rounds of `reps` runs after the first; 0 without), and
 /// whether the queries-as-M kernel ran.
 pub fn run(
     backend: &mut Backend,
     kv: &KvPool,
     g: &Group,
-    qm: bool,
+    mode: i32,
     reps: usize,
     rounds: usize,
 ) -> (Vec<f32>, f64, bool) {
-    set_qm_prefill_here(Some(qm));
+    set_qm_mode_here(mode);
     let (kp, vp) = kv.pools(0);
     let (d, n_head, _) = g.heads;
     let ns = g.n_past.len();
@@ -69,10 +70,11 @@ pub fn run(
 }
 
 /// Values of the op's output (rows the kernels write) whose bits differ between the kernel off
-/// and on, of how many, and whether the queries-as-M kernel ran. Panics on a non-finite output.
-pub fn compare(backend: &mut Backend, kv: &KvPool, g: &Group) -> (usize, usize, bool) {
-    let (a, _, _) = run(backend, kv, g, false, 0, 0);
-    let (b, _, ran) = run(backend, kv, g, true, 0, 0);
+/// and in mode `mode`, of how many, and whether the queries-as-M kernel ran. Panics on a
+/// non-finite output.
+pub fn compare(backend: &mut Backend, kv: &KvPool, g: &Group, mode: i32) -> (usize, usize, bool) {
+    let (a, _, _) = run(backend, kv, g, 0, 0, 0);
+    let (b, _, ran) = run(backend, kv, g, mode, 0, 0);
     assert!(
         a.iter().chain(&b).all(|v| v.is_finite()),
         "non-finite output"
@@ -85,30 +87,12 @@ pub fn compare(backend: &mut Backend, kv: &KvPool, g: &Group) -> (usize, usize, 
     (differ, a.len(), ran)
 }
 
-/// Multiply-adds of the op's two products (Q K^T and P V) over the keys each row sees.
-pub fn macs(g: &Group) -> f64 {
-    let (d, n_head, _) = g.heads;
-    let mut keys = 0usize;
-    for &n_past in g.n_past {
-        for t in 0..g.n_tok {
-            let pos = n_past + t;
-            let first = if g.window > 0 {
-                (pos + 1).saturating_sub(g.window)
-            } else {
-                0
-            };
-            keys += pos + 1 - first;
-        }
-    }
-    2.0 * (d * n_head) as f64 * keys as f64
-}
-
-/// The edge cases for heads of 256: every GQA ratio, prompt chunks from just past the kernel's
-/// smallest group to more than one 128-row tile per token run, several sequences over shuffled
-/// tables, contexts that end before, on and after block boundaries, windows that start inside
-/// blocks (Gemma 4's sliding window of 1,024 among them), a ring. Returns (cases, cases the
-/// kernel ran, values compared, values that differ), printing each failing case.
-pub fn edges(backend: &mut Backend) -> (usize, usize, usize, usize) {
+/// The edge cases for heads of 256 with the kernel in mode `mode`: every GQA ratio, groups from
+/// 2 tokens (verify steps) to more than one 128-row tile per token run, several sequences over
+/// shuffled tables, contexts that end before, on and after block boundaries, windows that start
+/// inside blocks (Gemma 4's sliding window of 1,024 among them), a ring. Returns (cases, cases
+/// the kernel ran, values compared, values that differ), printing each failing case.
+pub fn edges(backend: &mut Backend, mode: i32) -> (usize, usize, usize, usize) {
     let (mut cases, mut ran_cases, mut total, mut differ) = (0, 0, 0, 0);
     let n_blocks = 160;
     for (n_head, n_head_kv) in [
@@ -124,7 +108,10 @@ pub fn edges(backend: &mut Backend) -> (usize, usize, usize, usize) {
         let kv = super::wmma_bench::pool(backend, heads, n_blocks);
         let g_ratio = n_head / n_head_kv;
         let rsd = 1.0 / 16.0;
-        for n_tok in [256 / g_ratio, 256 / g_ratio + 5, 129, 300, 1000] {
+        // Verify-sized groups (2 to 64 tokens), then prompt chunks around the old threshold of
+        // 256 rows and past one 128-row tile per token run.
+        let sizes = [2, 3, 8, 11, 16, 21, 33, 64, 256 / g_ratio + 5, 300];
+        for n_tok in sizes {
             for (n_past, window, scale) in [
                 (vec![0], 0, rsd),
                 (vec![447, 3, 190], 0, rsd),
@@ -154,7 +141,7 @@ pub fn edges(backend: &mut Backend) -> (usize, usize, usize, usize) {
                     ring: 0,
                     scale,
                 };
-                let (x, n, ran) = compare(backend, &kv, &g);
+                let (x, n, ran) = compare(backend, &kv, &g, mode);
                 cases += 1;
                 ran_cases += usize::from(ran);
                 total += n;
@@ -186,7 +173,7 @@ pub fn edges(backend: &mut Backend) -> (usize, usize, usize, usize) {
                 ring,
                 scale: rsd,
             };
-            let (x, n, ran) = compare(backend, &kv, &g);
+            let (x, n, ran) = compare(backend, &kv, &g, mode);
             cases += 1;
             ran_cases += usize::from(ran);
             total += n;
