@@ -736,6 +736,45 @@ unsafe extern "C" {
     #[cfg(test)]
     fn legion_paged_attn_ffma_launches() -> i64;
     fn legion_paged_attn_vsplit_launches() -> i64;
+    fn legion_paged_attn_set_qm(on: i32, this_thread: i32);
+    fn legion_paged_attn_qm_launches() -> i64;
+}
+
+/// Prefill groups with heads of 256 on compute capability 12.x devices (a DGX Spark's GB10, RTX
+/// 50) through the kernel that takes the queries as the MMA's M dimension
+/// (`src/cuda/sm80/paged_attn_qm.cuh`, #1133) where it covers them, or (`false`) through
+/// `paged_prefill_mma` as before. The same bits either way; on by default (`legion serve
+/// --no-paged-prefill-qm` turns it off). Other GPUs and ops keep their kernels. For every thread.
+pub fn set_qm_prefill(on: bool) {
+    #[cfg(feature = "cuda")]
+    // SAFETY: sets a flag the launches read.
+    unsafe {
+        legion_paged_attn_set_qm(i32::from(on), 0)
+    };
+    #[cfg(not(feature = "cuda"))]
+    let _ = on;
+}
+
+/// [`set_qm_prefill`] for launches from the calling thread only (benches and tests); `None`
+/// follows the setting for every thread again.
+pub fn set_qm_prefill_here(on: Option<bool>) {
+    #[cfg(feature = "cuda")]
+    // SAFETY: sets a thread-local flag the launches read.
+    unsafe {
+        legion_paged_attn_set_qm(on.map_or(-1, i32::from), 1)
+    };
+    #[cfg(not(feature = "cuda"))]
+    let _ = on;
+}
+
+/// Launches of the queries-as-M prefill kernel ([`set_qm_prefill`]) from the calling thread so
+/// far (0 without CUDA).
+pub fn qm_launches() -> i64 {
+    #[cfg(feature = "cuda")]
+    // SAFETY: reads a thread-local counter.
+    return unsafe { legion_paged_attn_qm_launches() };
+    #[cfg(not(feature = "cuda"))]
+    0
 }
 
 /// Prefill chunks (and speculative verify steps, several tokens per sequence) on sm_70 devices
@@ -1033,6 +1072,7 @@ mod granule_tests;
 pub mod hopper;
 #[cfg(all(test, feature = "cuda"))]
 mod m884_tests;
+pub mod qm_bench;
 #[cfg(test)]
 mod quant_tests;
 #[cfg(test)]

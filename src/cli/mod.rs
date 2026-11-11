@@ -24,6 +24,7 @@ mod nvfp4_gemm_bench;
 mod nvfp4_mv_bench;
 mod nvfp4_mvq_bench;
 mod nvfp4_once_bench;
+mod paged_qm_bench;
 mod paged_split_bench;
 mod q4k_head_bench;
 mod q8_group_check;
@@ -165,6 +166,10 @@ enum Command {
     /// kernel (development).
     #[command(hide = true)]
     PagedSplitBench(paged_split_bench::PagedSplitBenchArgs),
+    /// Check and time the queries-as-M paged attention prefill kernel against paged_prefill_mma
+    /// on compute capability 12.x (development).
+    #[command(hide = true)]
+    PagedQmBench(paged_qm_bench::PagedQmBenchArgs),
 }
 
 /// The parsed `Cli` as a bare `clap::Command`, so `completions` can generate from it
@@ -244,5 +249,6 @@ async fn run(cli: Cli, numa: Option<legion::hw::numa_bind::Placement>) -> anyhow
         Command::QsaBench(args) => qsa_bench::run(args),
         Command::MlaBench(args) => mla_bench::run(args),
         Command::PagedSplitBench(args) => paged_split_bench::run(args),
+        Command::PagedQmBench(args) => paged_qm_bench::run(args),
     }
 }
