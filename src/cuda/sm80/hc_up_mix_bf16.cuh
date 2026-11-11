@@ -59,8 +59,11 @@ __global__ void lo_bf16(const legion_hc_up_mix p) {
     ((__nv_bfloat162 *) p.lob)[i] = r;
 }
 
-template <bool RB>
+// S16 (with RB; #1183, `legion serve --hc-bf16`): the streams are BF16 (hc_post_norm_b16_kernel's),
+// each widened to F32 before the rebuild.
+template <bool RB, bool S16 = false>
 __global__ void __launch_bounds__(WARPS * 32) up_mix_bf16(const legion_hc_up_mix p) {
+    static_assert(RB || !S16, "up_mix_bf16: BF16 streams in the rebuilt form only");
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     extern __shared__ int smem[];
     const int  stride = p.rank / 2 + PAD / 4;  // 32-bit words per staged row
@@ -86,10 +89,11 @@ __global__ void __launch_bounds__(WARPS * 32) up_mix_bf16(const legion_hc_up_mix
         // The epilogue's xn values (ROWS floats, 64 bytes, per token and stream; RB: the
         // streams') into L2 while the matmul runs: a lane per token.
         if (t0 + lane < end && lane < NT * 8) {
-            const float * x = (RB ? p.res : p.xn) + (int64_t) (t0 + lane) * K + i0;
+            constexpr int es = S16 ? 2 : 4;
+            const char * x = (const char *) (RB ? p.res : p.xn) + ((int64_t) (t0 + lane) * K + i0) * es;
 #pragma unroll
             for (int c = 0; c < HC; c++) {
-                asm volatile("prefetch.global.L2 [%0];" ::"l"(x + (int64_t) c * p.e));
+                asm volatile("prefetch.global.L2 [%0];" ::"l"(x + (int64_t) c * p.e * es));
             }
         }
         float acc[HC][NT][4];
@@ -136,11 +140,17 @@ __global__ void __launch_bounds__(WARPS * 32) up_mix_bf16(const legion_hc_up_mix
                 const int tok = t0 + t * 8 + 2 * q + (l & 1);
                 if (tok < p.n) {
                     const int     i   = i0 + g + (l >> 1) * 8;
-                    const float * x   = (RB ? p.res : p.xn) + (int64_t) tok * K + i;
+                    const int64_t at  = (int64_t) tok * K + i;
+                    const float * x   = (RB ? p.res : p.xn) + at;
                     float         sum = 0.0f;
 #pragma unroll
                     for (int c = 0; c < HC; c++) {
-                        float xv = x[(int64_t) c * p.e];
+                        float xv;
+                        if constexpr (S16) {
+                            xv = __bfloat162float(((const __nv_bfloat16 *) p.res)[at + (int64_t) c * p.e]);
+                        } else {
+                            xv = x[(int64_t) c * p.e];
+                        }
                         if constexpr (RB) {
                             xv = __fmul_rn(__fmul_rn(xv, p.sc[(int64_t) tok * HC + c]), p.g[c * p.e + i]);
                         }
