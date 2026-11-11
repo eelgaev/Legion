@@ -1395,6 +1395,13 @@ pub trait InputSink {
     fn f32(&mut self, t: Tensor<'_>, values: &[f32]);
     /// All of `t`, any type.
     fn bytes(&mut self, t: Tensor<'_>, bytes: &[u8]);
+    /// All of F32 `t`, `n` values that `fill` writes (every one of them): into a new vector
+    /// for [`Self::f32`], or straight into pinned memory where the sink has some (#1183).
+    fn f32_with(&mut self, t: Tensor<'_>, n: usize, fill: &mut dyn FnMut(&mut [f32])) {
+        let mut values = vec![0f32; n];
+        fill(&mut values);
+        self.f32(t, &values);
+    }
 }
 
 /// Sets every input right away ([`Tensor::set_i32`], [`Tensor::set_f32`]).

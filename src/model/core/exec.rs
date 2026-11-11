@@ -129,6 +129,8 @@ struct Stage {
     /// Pinned host memory a step's argmaxes and logits rows are read back through
     /// ([`Inputs::output_with`]).
     ids_pin: Option<Context>,
+    /// Pinned host memory a prompt step's big inputs are filled through ([`SetPinned`]).
+    fill_pin: Option<Context>,
     /// Pinned host memory the MTP passes' inputs and outputs go through (the last stage's,
     /// [`mtp_window`]), and a decode or verify step's inputs ([`step_fill`]).
     mtp_io: PinnedIo,
@@ -179,6 +181,7 @@ impl Stage {
             bounce_b: None,
             bounce_small: None,
             ids_pin: None,
+            fill_pin: None,
             mtp_io: PinnedIo::default(),
             flow_io: PinnedIo::default(),
             flow_io_b: PinnedIo::default(),
@@ -315,6 +318,43 @@ fn write_rows(bounce: &mut Option<Context>, backend: &Backend, t: Tensor<'_>, pa
         Some(via) => t.fill_f32_via(via, |dst| rows::gather(parts, dst)),
         None if parts.len() == 1 => t.set_f32(parts[0]),
         None => t.set_f32(&parts.concat()),
+    }
+}
+
+/// Sets every input right away like [`super::SetNow`], but fills big F32 ones built in place
+/// ([`super::InputSink::f32_with`]: a Flash-Next prompt step's ~42 MB of n-gram embedding rows)
+/// straight into pinned memory `pin` instead of a new pageable vector (#1183).
+struct SetPinned<'a> {
+    pin: &'a mut Option<Context>,
+    backend: &'a Backend,
+}
+
+impl super::InputSink for SetPinned<'_> {
+    fn i32(&mut self, t: Tensor<'_>, values: &[i32]) {
+        t.set_i32(values);
+    }
+
+    fn f32(&mut self, t: Tensor<'_>, values: &[f32]) {
+        t.set_f32(values);
+    }
+
+    fn bytes(&mut self, t: Tensor<'_>, bytes: &[u8]) {
+        t.set_bytes(bytes);
+    }
+
+    fn f32_with(&mut self, t: Tensor<'_>, n: usize, fill: &mut dyn FnMut(&mut [f32])) {
+        let bytes = n * 4;
+        let via = (bytes >= BOUNCE_MIN_BYTES && t.nbytes() == bytes)
+            .then(|| bounce_for(self.pin, self.backend, bytes))
+            .flatten();
+        match via {
+            Some(via) => t.fill_f32_via(via, |dst| fill(dst)),
+            None => {
+                let mut values = vec![0f32; n];
+                fill(&mut values);
+                t.set_f32(&values);
+            }
+        }
     }
 }
 
@@ -3932,19 +3972,33 @@ impl Executor {
     }
 
     /// Stage `s`'s own inputs for `groups` (all but the residual from the stage before).
-    fn fill_inputs(&self, s: usize, groups: &[Group<'_>], shape: &[GroupShape]) {
-        let stage = &self.stages[s];
-        let kept = stage.kept(shape).expect("prepared");
-        let inputs = Inputs::from_parts(shape, self.parts(s), |i| kept.tensor(i));
+    fn fill_inputs(&mut self, s: usize, groups: &[Group<'_>], shape: &[GroupShape]) {
+        let parts = self.parts(s);
+        let model = &self.model;
+        let Stage {
+            decode,
+            mixed,
+            rec,
+            kv,
+            spec,
+            backend,
+            fill_pin,
+            ..
+        } = &mut self.stages[s];
+        let kept = kept_in(decode, mixed, shape).expect("prepared");
+        let inputs = Inputs::from_parts(shape, parts, |i| kept.tensor(i));
         inputs.fill(groups, shape);
-        self.model.fill_extra(
+        model.fill_extra(
             &inputs,
             groups,
             shape,
-            &stage.rec,
-            &stage.kv,
-            stage.spec.as_ref(),
-            &mut super::SetNow,
+            rec,
+            kv,
+            spec.as_ref(),
+            &mut SetPinned {
+                pin: fill_pin,
+                backend,
+            },
         );
     }
 

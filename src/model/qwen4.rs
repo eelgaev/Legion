@@ -1665,6 +1665,7 @@ impl Model {
         let (Some(ple), Some(t)) = (ple, inputs.ple) else {
             return;
         };
+        let started = std::time::Instant::now();
         let rows = ngram_rows(ple, groups, |g, slot, tokens| {
             if g.verify {
                 let spec = spec.expect("a verify group needs the replay pool");
@@ -1674,6 +1675,7 @@ impl Model {
                 rec.push_tokens(slot, tokens)
             }
         });
+        let hashed = started.elapsed();
         // Rows read through a store (the SSD, on a GPU sharing the host's memory) wait for the
         // step's compute when it asked for them late (`Self::set_ple_late`); their reads are
         // issued now (`ple_late`).
@@ -1693,7 +1695,27 @@ impl Model {
             .take(&rows);
         match ahead {
             Some(values) => sink.f32(t, &values),
-            None => sink.f32(t, &self.gather_ple(&rows)),
+            None => {
+                // Straight into the sink's pinned memory where it has some (a prompt step's
+                // ~40 MB per 4,096 tokens, #1183): no new vector to fault in, no pageable copy.
+                let t0 = std::time::Instant::now();
+                let mut gathered = std::time::Duration::ZERO;
+                let n = rows.len() * ple.head_dim as usize;
+                sink.f32_with(t, n, &mut |out| {
+                    let t1 = std::time::Instant::now();
+                    self.gather_ple_into(&rows, None, out);
+                    gathered = t1.elapsed();
+                });
+                if rows.len() >= PLE_LOG_ROWS {
+                    tracing::debug!(
+                        rows = rows.len(),
+                        hash_ms = hashed.as_secs_f64() * 1e3,
+                        gather_ms = gathered.as_secs_f64() * 1e3,
+                        set_ms = (t0.elapsed() - gathered).as_secs_f64() * 1e3,
+                        "ple fill"
+                    );
+                }
+            }
         }
     }
 
@@ -1781,6 +1803,16 @@ impl Model {
         let ple = params(&self.hp)
             .and_then(|p| p.ple.as_ref())
             .expect("per-layer embedding");
+        let mut out = vec![0f32; rows.len() * ple.head_dim as usize];
+        self.gather_ple_into(rows, late, &mut out);
+        out
+    }
+
+    /// [`Self::gather_ple_rows`] into `out` (`rows.len()` rows), every value of it written.
+    fn gather_ple_into(&self, rows: &[i32], late: Option<LateRows>, out: &mut [f32]) {
+        let ple = params(&self.hp)
+            .and_then(|p| p.ple.as_ref())
+            .expect("per-layer embedding");
         let table = self
             .weights
             .get("per_layer_token_embd.weight")
@@ -1793,6 +1825,12 @@ impl Model {
             rows.iter().all(|&r| (r as usize) < n_rows),
             "n-gram row outside the {n_rows}-row table"
         );
+        assert_eq!(
+            out.len(),
+            rows.len() * dim,
+            "one {dim}-value row per n-gram row"
+        );
+        let t0 = std::time::Instant::now();
         // The rows' bytes: from the store (RAM, page cache or the SSD), or straight from the
         // weights' host memory.
         let fetched;
@@ -1812,9 +1850,9 @@ impl Model {
                 rows.iter().map(|&r| r as usize).collect(),
             ),
         };
+        let fetch = t0.elapsed();
         // Big steps dequantize on several threads; with the weights' own memory they also wait
         // on page faults at once.
-        let mut out = vec![0f32; rows.len() * dim];
         let threads = ple_gather_threads(rows.len(), self.ngram.is_some());
         let per = rows.len().div_ceil(threads).max(1);
         let fp8 = ple.fp8_scale;
@@ -1826,7 +1864,7 @@ impl Model {
         };
         if threads == 1 {
             // A decode step's few rows: starting a thread costs more than the work.
-            gather(&at, &mut out);
+            gather(&at, out);
         } else {
             // Off the engine thread's core (#250).
             let pin = &crate::hw::host_core::off_host_core(&[]);
@@ -1839,9 +1877,20 @@ impl Model {
                 }
             });
         }
-        out
+        if rows.len() >= PLE_LOG_ROWS {
+            tracing::debug!(
+                rows = rows.len(),
+                threads,
+                fetch_ms = fetch.as_secs_f64() * 1e3,
+                dequant_ms = (t0.elapsed() - fetch).as_secs_f64() * 1e3,
+                "ple gather"
+            );
+        }
     }
 }
+
+/// Prompt-sized n-gram gathers and fills log their times (`ple gather`, `ple fill`, #1183).
+const PLE_LOG_ROWS: usize = 1 << 14;
 
 /// The n-gram table rows of `groups`' tokens, in order: each sequence's tokens hashed with the
 /// predecessors `history(group, slot, tokens)` returns for its slot (oldest first).
