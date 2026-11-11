@@ -160,9 +160,9 @@ fn takes_ggmls_groups_staged_on_consumer_blackwell_only() {
         ON.store(o, Ordering::Relaxed);
         STAGED.store(st, Ordering::Relaxed);
         STAGED_GPU.store(g, Ordering::Relaxed);
-        assert_eq!(takes(16, 48), st && g, "{:?}", (o, st, g));
-        assert_eq!(takes(16, 64), st && g);
-        assert_eq!(takes(8, 24), o);
+        assert_eq!(takes(16, 48, None), st && g, "{:?}", (o, st, g));
+        assert_eq!(takes(16, 64, None), st && g);
+        assert_eq!(takes(8, 24, None), o);
     }
     ON.store(on, Ordering::Relaxed);
     STAGED.store(staged, Ordering::Relaxed);
@@ -297,5 +297,42 @@ fn cuda_gdn_mma_matches_ggml() {
         }
         let r = rel(&op, &reference);
         assert!(r < 1e-3, "{c:?}: {r:e}");
+    }
+}
+
+#[test]
+fn each_gpu_of_a_mixed_box_answers_for_itself() {
+    use crate::hw::per_device::test_cc;
+    // The GB10, the 4090, the A100 and the 5090 have the tensor cores; the V100 and an unknown
+    // device do not, whatever the engine's GPU is.
+    for engine in [false, true] {
+        let picks: Vec<bool> = (0..6)
+            .map(|d| gpu_for_by(Some(d), engine, test_cc))
+            .collect();
+        assert_eq!(
+            picks,
+            [true, true, false, true, true, false],
+            "engine {engine}"
+        );
+        assert_eq!(gpu_for_by(None, engine, test_cc), engine);
+    }
+    assert!(gpu_takes(Some(8)) && gpu_takes(Some(12)) && !gpu_takes(Some(7)) && !gpu_takes(None));
+}
+
+/// The staged kernel takes ggml-cuda's groups on the GB10 and the 5090 of a mixed box only,
+/// whatever the engine's GPU is; the engine's answer where the state names no device.
+#[test]
+fn staged_answers_per_device_of_a_mixed_box() {
+    use crate::hw::per_device::test_cc;
+    for engine in [false, true] {
+        let picks: Vec<bool> = (0..6)
+            .map(|d| staged_for_by(Some(d), engine, test_cc))
+            .collect();
+        assert_eq!(
+            picks,
+            [true, false, false, false, true, false],
+            "engine {engine}"
+        );
+        assert_eq!(staged_for_by(None, engine, test_cc), engine);
     }
 }

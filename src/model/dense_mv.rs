@@ -163,7 +163,8 @@ static CHAIN: AtomicBool = AtomicBool::new(true);
 /// along in a dense op of larger weights with the same input ([`fits_chain`], #836): a GDN
 /// layer's alpha and beta (48 rows each) in its `qkv` and `z` launch at 9-16 tokens, in
 /// cuBLAS's order, so with its bits. On by default; `legion serve --no-dense-mv-ab` keeps them
-/// on cuBLAS (for comparisons).
+/// on cuBLAS (for comparisons, and on compute capability 9.x, whose cuBLAS the order was not
+/// matched against, #1215).
 pub fn set_chain(on: bool) {
     CHAIN.store(on, Ordering::Relaxed);
 }

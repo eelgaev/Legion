@@ -20,6 +20,17 @@ concurrency:
 permissions:
   contents: read
 jobs:
+  kernel-traps:
+    # src/cuda/README.md's rule, checked without a compiler or a GPU: every arch-guarded kernel
+    # body ends in `#else __trap();` (or NO_DEVICE_CODE), so a launch on a target without that
+    # code stops with an error instead of leaving its output unwritten. Prints file:line of an
+    # offender.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - name: arch-guarded kernel bodies trap elsewhere
+        run: python3 scripts/check_kernel_traps.py
   build:
     name: aarch64 CUDA 13 sm_121a (Spark-like)
     # Self-hosted aarch64 box with the CUDA 13.0 toolkit and no GPU. Pull requests from forks

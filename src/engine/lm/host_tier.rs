@@ -15,6 +15,21 @@ const MARGIN_SHARE: f64 = 0.10;
 pub(crate) const NVLINK_GBS: f64 = 68.5;
 /// A PCIe 4.0 x16 link's practical rate, GB/s (no PCIe machine measured).
 pub(crate) const PCIE_GBS: f64 = 25.0;
+/// What a GH200's GPU reads Grace's memory at over NVLink-C2C, GB/s: the nominal figure of
+/// `crate::residency::Platform::NvlinkC2c` (vendor figures, unmeasured).
+pub(crate) const C2C_GBS: f64 = 375.0;
+
+/// The link a KV host tier's blocks are read over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) enum TierLink {
+    /// PCIe (a discrete card).
+    Pcie,
+    /// NVLink 2.0 to a POWER9 CPU with ATS (an AC922).
+    Nvlink,
+    /// NVLink-C2C to a Grace CPU with ATS (a GH200).
+    C2c,
+}
 
 /// One NUMA node the tier would use: the bytes each host block takes there (summed over the
 /// stages whose GPU is on it) and the node's memory.
@@ -159,21 +174,25 @@ pub(crate) fn node_memory(node: u32) -> Option<NodeMemory> {
 }
 
 /// The startup line's speed note: what the link reads host blocks at, and what that costs.
-pub(crate) fn speed_note(nvlink: bool) -> String {
-    if nvlink {
-        format!(
+pub(crate) fn speed_note(link: TierLink) -> String {
+    match link {
+        TierLink::Nvlink => format!(
             "host blocks are read over the GPU's NVLink to the CPU (~{NVLINK_GBS} GB/s measured \
              on an AC922): decode reads every host block once per token, so a long context's \
              decode slows by about (host GB per GPU) / {NVLINK_GBS} s per token, and prompts \
              reaching the tier slow down too"
-        )
-    } else {
-        format!(
+        ),
+        TierLink::C2c => format!(
+            "host blocks are read over the GPU's NVLink-C2C to the Grace CPU (~{C2C_GBS} GB/s \
+             nominal on a GH200, unmeasured): decode reads every host block once per token, so \
+             a long context's decode slows by about (host GB per GPU) / {C2C_GBS} s per token"
+        ),
+        TierLink::Pcie => format!(
             "host blocks are read over PCIe (~{PCIE_GBS} GB/s, about 3x slower than an AC922's \
              NVLink; untested on a PCIe machine): decode reads every host block once per token, \
              so a long context's decode slows by about (host GB per GPU) / {PCIE_GBS} s per \
              token"
-        )
+        ),
     }
 }
 

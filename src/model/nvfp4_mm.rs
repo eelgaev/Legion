@@ -111,6 +111,28 @@ pub fn set_pad_skip(on: bool) {
     PAD_SKIP.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+static EXPERT_ROWS_BF16: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Prompt steps of more tokens than this take [`set_expert_rows_bf16`]'s BF16 rows (decode and
+/// verify steps, and steps that batch a prompt with them, stay F32).
+pub const EXPERT_ROWS_BF16_MIN_N: i64 = 64;
+
+/// `legion serve --nvfp4-expert-rows-bf16` (#1183; off by default): the routed experts' down
+/// matmul of prompt steps of more than [`EXPERT_ROWS_BF16_MIN_N`] tokens on Legion's W4A16
+/// kernels stores its per-pair rows as BF16 ([`Act::Bf16`]) instead of F32, and the weighted
+/// sum reads them back as F32 (the hyper-connection norm a qwen4exp MoE tail folds into reads
+/// the BF16 rows itself). Half the bytes of those rows written and read; each row value is
+/// rounded to BF16 before the sum, so output moves (opt-in).
+pub fn set_expert_rows_bf16(on: bool) {
+    EXPERT_ROWS_BF16.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a routed-expert down matmul of `n_tok` tokens stores BF16 rows
+/// ([`set_expert_rows_bf16`]).
+pub fn expert_rows_bf16(n_tok: i64) -> bool {
+    n_tok > EXPERT_ROWS_BF16_MIN_N && EXPERT_ROWS_BF16.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 static EXPERT_MV_MAX: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(MV_MAX_N);
 
 /// `legion serve --nvfp4-expert-mv-max <N>`: routed-expert matmuls ([`mul_mat_id`],
@@ -255,13 +277,26 @@ pub enum Act {
     /// down matmul's input, which it would round to BF16 anyway. Replaces the graph's relu, sqr
     /// and cast and their passes over the hidden activations.
     ReluSqr,
+    /// Nothing, BF16 out (each value rounded to nearest): the routed experts' down matmul of
+    /// prompt steps under `legion serve --nvfp4-expert-rows-bf16` (#1183), half the bytes of the
+    /// per-pair rows written and read back.
+    Bf16,
 }
 
 impl Act {
     fn out_type(self) -> ffi::ggml_type {
         match self {
             Act::None => types::F32,
-            Act::ReluSqr => types::BF16,
+            Act::ReluSqr | Act::Bf16 => types::BF16,
+        }
+    }
+
+    /// `legion_nvfp4_mm::act` (2 is the GLU launches' GELU, [`GLU_GELU`]).
+    fn code(self) -> i32 {
+        match self {
+            Act::None => 0,
+            Act::ReluSqr => 1,
+            Act::Bf16 => 3,
         }
     }
 }
@@ -272,6 +307,7 @@ const P_ACT: usize = 10;
 fn act_of(dst: &ffi::ggml_tensor) -> Act {
     match dst.op_params[P_ACT] {
         1 => Act::ReluSqr,
+        3 => Act::Bf16,
         _ => Act::None,
     }
 }
@@ -286,6 +322,7 @@ unsafe fn store_act(out: *mut u8, i: usize, v: f32, act: Act) {
         match act {
             Act::None => *(out as *mut f32).add(i) = v,
             Act::ReluSqr => *(out as *mut u16).add(i) = bf16_bits(v.max(0.0) * v.max(0.0)),
+            Act::Bf16 => *(out as *mut u16).add(i) = bf16_bits(v),
         }
     }
 }
@@ -335,7 +372,7 @@ pub fn mul_mat_act<'a>(
     args.extend(scale);
     let node = ctx.external(&NVFP4_MM, act.out_type(), [m, n1, n2, n3], &args);
     // SAFETY: a fresh node; an index past the custom op's own parameters (see P_SCALE).
-    unsafe { (*node.raw()).op_params[P_ACT] = (act == Act::ReluSqr) as i32 };
+    unsafe { (*node.raw()).op_params[P_ACT] = act.code() };
     node
 }
 
@@ -473,7 +510,7 @@ pub fn mul_mat_id_act<'a>(
     // SAFETY: a fresh node; indices past the custom op's own parameters (see P_SCALE).
     unsafe {
         (*node.raw()).op_params[P_SCALE] = scale.is_some() as i32;
-        (*node.raw()).op_params[P_ACT] = (act == Act::ReluSqr) as i32;
+        (*node.raw()).op_params[P_ACT] = act.code();
         (*node.raw()).op_params[P_PLAN] = shared as i32;
     }
     ctx.view_3d(

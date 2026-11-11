@@ -1175,6 +1175,9 @@ struct FoldIn {
     gamma: Vec<f32>,
     wi: Vec<f32>,
     down: Vec<u8>,
+    /// The experts' rows as BF16 cast to F32 (`--nvfp4-expert-rows-bf16`, #1183): `experts`
+    /// then holds BF16 values.
+    bf16: bool,
 }
 
 const FOLD_HC: i64 = 4;
@@ -1205,6 +1208,7 @@ fn fold_in(e: i64, k: i64, n: i64) -> FoldIn {
             .iter()
             .flat_map(|&v| crate::model::nvfp4_mm::bf16_bits(0.05 * v).to_ne_bytes())
             .collect(),
+        bf16: false,
     }
 }
 
@@ -1241,7 +1245,12 @@ fn fold_case(c: &FoldIn, tail: Tail) -> ([Vec<u8>; 4], bool) {
     let mut backend = Backend::cpu().unwrap();
     backend.set_threads(4);
     let ctx = Context::new(256, 256);
-    let experts = ctx.new_tensor(types::F32, &[e, k, n]).as_input();
+    let rows16 = ctx.new_tensor(types::BF16, &[e, k, n]).as_input();
+    let experts = if c.bf16 {
+        ctx.cast(rows16, types::F32)
+    } else {
+        ctx.new_tensor(types::F32, &[e, k, n]).as_input()
+    };
     let wr = ctx.new_tensor(types::F32, &[1, k, n]).as_input();
     let sh = ctx.new_tensor(types::F32, &[e, n]).as_input();
     let joined = ctx.new_tensor(types::F32, &[3, n]).as_input();
@@ -1304,7 +1313,11 @@ fn fold_case(c: &FoldIn, tail: Tail) -> ([Vec<u8>; 4], bool) {
     if let Tail::Given(v) = &tail {
         out.set_f32(v);
     } else {
-        experts.set_f32(&c.experts);
+        if c.bf16 {
+            rows16.set_bytes(&bf16_bytes(&c.experts));
+        } else {
+            experts.set_f32(&c.experts);
+        }
         wr.set_f32(&c.weights);
         sh.set_f32(&c.sh);
         joined.set_f32(&c.joined);
@@ -1350,6 +1363,27 @@ fn tail_ref(c: &FoldIn, sum: FoldSum) -> Vec<f32> {
 fn moe_tail_folds_into_the_norm_with_its_bits() {
     for (e, k, n) in [(64, 4, 3), (32, 10, 5), (64, 2, 1)] {
         let c = fold_in(e, k, n);
+        let planned = |fold| Tail::Planned {
+            fold,
+            out_read: false,
+        };
+        let (want, plain) = fold_case(&c, planned(false));
+        let (got, folded) = fold_case(&c, planned(true));
+        assert!(!plain && folded, "{e}x{k}x{n}: {plain} {folded}");
+        assert!(got == want, "{e}x{k}x{n}: the norm's outputs moved");
+        let (given, _) = fold_case(&c, Tail::Given(tail_ref(&c, FoldSum::Plain)));
+        assert!(got == given, "{e}x{k}x{n}: not the tail's values");
+    }
+}
+
+/// BF16 expert rows read back as F32 (`--nvfp4-expert-rows-bf16`, #1183): the fold reads the
+/// BF16 rows itself and the cast goes too, with the unfolded graph's bits.
+#[test]
+fn moe_tail_of_bf16_rows_folds_with_its_bits() {
+    for (e, k, n) in [(64, 4, 3), (32, 10, 5)] {
+        let mut c = fold_in(e, k, n);
+        c.experts = c.experts.iter().map(|&v| bf16_round(v)).collect();
+        c.bf16 = true;
         let planned = |fold| Tail::Planned {
             fold,
             out_read: false,
@@ -1475,5 +1509,37 @@ fn a_deferred_reduce_scatter_reader_is_captured() {
         assert!(safe(), "a plain input sum");
         crate::ggml::set_external_param(node, P_RS, 1);
         assert!(safe(), "a deferred reduce-scatter");
+    }
+}
+
+#[test]
+fn each_gpu_of_a_mixed_box_answers_for_itself() {
+    use crate::hw::per_device::test_cc;
+    for engine in [false, true] {
+        // The F16 `xn`: the V100 only; the BF16 one: the sm_80+ GPUs. Whatever the engine's GPU.
+        let xn16: Vec<bool> = (0..6)
+            .map(|d| gpu_for_by(Some(d), engine, xn16_takes, true, test_cc))
+            .collect();
+        assert_eq!(
+            xn16,
+            [false, false, true, false, false, false],
+            "engine {engine}"
+        );
+        let xnb: Vec<bool> = (0..6)
+            .map(|d| gpu_for_by(Some(d), engine, xnb_takes, true, test_cc))
+            .collect();
+        assert_eq!(
+            xnb,
+            [true, true, false, true, true, false],
+            "engine {engine}"
+        );
+        // A changed cuBLAS compute type keeps ggml's conversion on every GPU.
+        for d in 0..6 {
+            assert!(!gpu_for_by(Some(d), engine, xn16_takes, false, test_cc));
+            assert!(!gpu_for_by(Some(d), engine, xnb_takes, false, test_cc));
+        }
+        // A weight that names no device: the engine's answer.
+        assert_eq!(gpu_for_by(None, engine, xn16_takes, true, test_cc), engine);
+        assert_eq!(gpu_for_by(None, engine, xnb_takes, false, test_cc), engine);
     }
 }

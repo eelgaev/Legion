@@ -149,6 +149,15 @@ pub struct Switches {
     /// W8A16 FP8 matmuls of 5-64 tokens on the sliced-K GEMM
     /// ([`crate::model::fp8::set_sliced_k`]).
     pub fp8_sliced_k: Option<bool>,
+    /// W8A8 FP8 prompt matmuls on the Hopper wgmma GEMM, untested on hardware
+    /// ([`crate::model::wgmma_gemm::set_enabled`]).
+    pub hopper_gemm: Option<bool>,
+    /// Paged attention prefill on the Hopper wgmma kernel, untested on hardware
+    /// (`model::core::paged::hopper::set_enabled`).
+    pub hopper_attn: Option<bool>,
+    /// Programmatic dependent launch on compute capability 9.0 too, untested on hardware
+    /// (`model::core::router_mv::set_hopper_pdl`).
+    pub hopper_pdl: Option<bool>,
     /// Dense NVFP4 matmuls of 33-64 tokens on the mv kernel
     /// ([`crate::model::nvfp4_mm::set_wide_mv`]).
     pub nvfp4_wide_mv: Option<bool>,
@@ -167,6 +176,9 @@ pub struct Switches {
     /// How the mv/GEMM cutoff applies: per step, per expert, the down projection only
     /// ([`crate::model::nvfp4_mm::set_expert_mv_split`]).
     pub nvfp4_expert_mv_split: Option<crate::model::nvfp4_mm::MvSplit>,
+    /// The routed experts' down matmul of prompt steps storing BF16 per-pair rows
+    /// ([`crate::model::nvfp4_mm::set_expert_rows_bf16`]; off by default).
+    pub nvfp4_expert_rows_bf16: Option<bool>,
     /// Verify steps routing their padding rows' experts as their sequences' first rows
     /// ([`crate::model::core::pad_rows::set_pad_remap`]).
     pub moe_pad_remap: Option<bool>,
@@ -596,6 +608,15 @@ impl Switches {
             crate::model::fp8::set_small_batch_gemv,
         );
         set(self.fp8_sliced_k, crate::model::fp8::set_sliced_k);
+        set(self.hopper_gemm, crate::model::wgmma_gemm::set_enabled);
+        set(
+            self.hopper_attn,
+            crate::model::core::paged::hopper::set_enabled,
+        );
+        set(
+            self.hopper_pdl,
+            crate::model::core::router_mv::set_hopper_pdl,
+        );
         set(self.nvfp4_wide_mv, crate::model::nvfp4_mm::set_wide_mv);
         set(
             self.nvfp4_expert_pdl,
@@ -614,6 +635,10 @@ impl Switches {
         if let Some(mode) = self.nvfp4_expert_mv_split {
             crate::model::nvfp4_mm::set_expert_mv_split(mode);
         }
+        set(
+            self.nvfp4_expert_rows_bf16,
+            crate::model::nvfp4_mm::set_expert_rows_bf16,
+        );
         set(
             self.moe_pad_remap,
             crate::model::core::pad_rows::set_pad_remap,

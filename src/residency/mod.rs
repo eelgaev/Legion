@@ -40,6 +40,7 @@ pub mod split;
 pub mod ssd_experts;
 #[cfg(feature = "cuda")]
 pub mod staging;
+pub mod unified;
 
 use std::fmt::Write as _;
 
@@ -97,7 +98,8 @@ pub enum Platform {
     /// POWER9 + V100 over NVLink 2.0 with ATS (IBM AC922): coherent host memory, ~68 GB/s per
     /// GPU from its own socket's memory.
     CoherentNvlink,
-    /// Grace + Hopper over NVLink-C2C (GH200): coherent, ~450 GB/s each way.
+    /// Grace + Hopper over NVLink-C2C (GH200): coherent (ATS), 900 GB/s in all, ~450 GB/s each
+    /// way. Told apart by the GPUs' attributes ([`unified::c2c`]).
     NvlinkC2c,
     /// One memory for CPU and GPU (GB10, DGX Spark): VRAM is host memory.
     Integrated,
@@ -122,7 +124,10 @@ pub struct LinkParams {
 impl Platform {
     /// Nominal link figures. AC922: measured on V100s over NVLink 2.0 (pinned in place 68.7,
     /// DMA 67.8, pageable mmap 4-10 GB/s; see `cuda::probe`); the others from the vendors'
-    /// figures, to be replaced by the probe.
+    /// figures, to be replaced by the probe. GH200 (unmeasured): NVLink-C2C carries ~450 GB/s
+    /// each way, but Grace's LPDDR5X (up to ~500 GB/s for all its readers) caps a GPU's reads
+    /// of host memory below that, so 375 for pinned and pageable (ATS) reads alike; HBM3 of an
+    /// H100 3,350 GB/s (an H200's HBM3e 4,800).
     pub fn nominal(self) -> LinkParams {
         match self {
             Platform::DiscretePcie => LinkParams {
@@ -140,10 +145,10 @@ impl Platform {
                 latency_us: 1.0,
             },
             Platform::NvlinkC2c => LinkParams {
-                in_place_gbs: 400.0,
-                copy_gbs: 400.0,
-                pageable_gbs: 400.0,
-                vram_gbs: 3500.0,
+                in_place_gbs: 375.0,
+                copy_gbs: 375.0,
+                pageable_gbs: 375.0,
+                vram_gbs: 3350.0,
                 latency_us: 0.8,
             },
             Platform::Integrated => LinkParams {
@@ -156,19 +161,20 @@ impl Platform {
         }
     }
 
-    /// The platform of a machine, from `legion info`'s classification and GPU names.
+    /// The platform of a machine, from `legion info`'s classification ([`unified::platform`]):
+    /// a discrete GPU on an Arm host is told apart by the GPUs' attributes (the driver alone,
+    /// no context), a GH200 being one that reads pageable memory through the host's page
+    /// tables; the NVML name only where no attributes can be read. Other hosts never ask the
+    /// driver.
     pub fn of(hw: &HardwareInfo) -> Self {
-        let gh200 = hw.arch == "aarch64"
-            && hw
-                .gpu
-                .as_ref()
-                .is_some_and(|r| r.gpus.iter().any(|g| g.name.contains("GH200")));
-        match hw.unified_memory.kind {
-            MemoryKind::IntegratedShared => Platform::Integrated,
-            MemoryKind::CoherentNvlink => Platform::CoherentNvlink,
-            MemoryKind::Discrete if gh200 => Platform::NvlinkC2c,
-            MemoryKind::Discrete => Platform::DiscretePcie,
-        }
+        let gh200 = hw
+            .gpu
+            .as_ref()
+            .is_some_and(|r| r.gpus.iter().any(|g| g.name.contains("GH200")));
+        let attrs = (hw.unified_memory.kind == MemoryKind::Discrete && hw.arch == "aarch64")
+            .then(link_attrs)
+            .flatten();
+        unified::platform(hw.unified_memory.kind, &hw.arch, attrs.as_deref(), gh200)
     }
 
     /// Whether VRAM is faster than reading host memory in place by enough for an expert cache
@@ -177,6 +183,19 @@ impl Platform {
         let l = self.nominal();
         l.vram_gbs > 2.0 * l.in_place_gbs
     }
+}
+
+/// Every visible CUDA device's [`unified::LinkAttrs`], from the driver alone; `None` without a
+/// driver or devices.
+fn link_attrs() -> Option<Vec<unified::LinkAttrs>> {
+    #[cfg(feature = "cuda")]
+    {
+        let n = cuda::device_count();
+        let a: Option<Vec<_>> = (0..n).map(cuda::link_attrs).collect();
+        a.filter(|a| !a.is_empty())
+    }
+    #[cfg(not(feature = "cuda"))]
+    None
 }
 
 /// Where the routed experts go.
@@ -249,7 +268,7 @@ pub struct ResidencyConfig {
     /// free, on GPUs whose step buffers can spill into host memory (unified memory); a prompt
     /// step's buffer then takes what VRAM is free and the rest from host memory
     /// (`--expert-cache-fill-prompt-room`, `--no-expert-cache-fill-prompt-room`). `None`: on
-    /// for V100s ([`Self::fills_prompt_room`]).
+    /// for V100s and a GH200 ([`Self::fills_prompt_room`]).
     pub fill_prompt_room: Option<bool>,
     /// Profile to seed the cache from (and to save the learned one to).
     pub profile: Option<std::path::PathBuf>,
@@ -424,11 +443,12 @@ impl Default for ResidencyConfig {
 
 impl ResidencyConfig {
     /// Whether the cache takes the prompt steps' compute room ([`Self::fill_prompt_room`]):
-    /// as given, else on V100s (`volta`: compute capability 7.0). It applies only on GPUs whose
-    /// step buffers can spill into host memory, so by default an AC922 (V100s with ATS over
-    /// NVLink): its 2-GPU cache gets ~5% more slots (~440 MiB a GPU), the same outputs.
-    pub fn fills_prompt_room(&self, volta: bool) -> bool {
-        self.fill_prompt_room.unwrap_or(volta)
+    /// as given, else `spill_default` ([`unified::spill_default`]: V100s, compute capability
+    /// 7.0, and a GH200). It applies only on GPUs whose step buffers can spill into host memory,
+    /// so by default an AC922 (V100s with ATS over NVLink): its 2-GPU cache gets ~5% more slots
+    /// (~440 MiB a GPU), the same outputs; and a GH200 (unmeasured).
+    pub fn fills_prompt_room(&self, spill_default: bool) -> bool {
+        self.fill_prompt_room.unwrap_or(spill_default)
     }
 
     /// Whether every step's bookkeeping waits for the cache's own work (#1165): the next

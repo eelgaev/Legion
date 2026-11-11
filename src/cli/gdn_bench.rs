@@ -35,8 +35,13 @@ pub struct GdnBenchArgs {
     /// layer (the first of --tokens, at most 8 layers).
     #[arg(long, conflicts_with_all = ["commit", "replay"])]
     prompt: bool,
-    /// Tokens of the prompt groups (--prompt).
-    #[arg(long, value_delimiter = ',', default_values_t = [4096, 1030])]
+    /// Tokens of the prompt groups (--prompt), each at least 64 (the chunked kernels' floor).
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_values_t = [4096, 1030],
+        value_parser = clap::value_parser!(i64).range(64..)
+    )]
     tokens: Vec<i64>,
 }
 

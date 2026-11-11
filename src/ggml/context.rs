@@ -799,16 +799,26 @@ impl<'a> Tensor<'a> {
 
     /// The CUDA device ordinal of the device whose buffer holds the tensor (ggml's `CUDA<n>`;
     /// spill buffers in host memory name the GPU they serve); `None` when it has no memory yet
-    /// or its buffer's device is not a CUDA device (CPU, meta). No driver call: three ggml
-    /// queries and the name.
+    /// or its buffer's device is not a CUDA device (CPU, meta). A view the graph allocator has
+    /// not placed yet answers for the tensor it views (its memory is that tensor's). No driver
+    /// call: three ggml queries and the name.
     pub fn cuda_device(self) -> Option<usize> {
-        if !self.is_allocated() {
+        // SAFETY: a live tensor; `view_src` is null or a live tensor of the same context.
+        let buffer = unsafe {
+            let t = &*self.raw();
+            if t.buffer.is_null() && !t.view_src.is_null() {
+                (*t.view_src).buffer
+            } else {
+                t.buffer
+            }
+        };
+        if buffer.is_null() {
             return None;
         }
-        // SAFETY: an allocated tensor's `buffer` is a live buffer; its type and device are
-        // static descriptors and the device name a NUL-terminated string they own.
+        // SAFETY: a non-null `buffer` is a live buffer; its type and device are static
+        // descriptors and the device name a NUL-terminated string they own.
         let name = unsafe {
-            let buft = ffi::ggml_backend_buffer_get_type((*self.raw()).buffer);
+            let buft = ffi::ggml_backend_buffer_get_type(buffer);
             if buft.is_null() {
                 return None;
             }
