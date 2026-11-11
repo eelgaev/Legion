@@ -109,6 +109,48 @@ bool sm12x_device(void (*probe)(KArgs...)) {
     return st == 1;
 }
 
+// `legion serve --hopper-pdl` (#1215, legion_set_hopper_pdl in router_mv.cu): whether
+// programmatic dependent launch (launch_pdl.cuh) takes compute capability 9.0 too. Off by
+// default: untested on hardware. One flag for the whole program (an inline function's static).
+inline std::atomic<bool> & hopper_pdl_flag() {
+    static std::atomic<bool> on{ false };
+    return on;
+}
+
+// Whether the current device is compute capability 9.0 (H100, H200, GH200) and this binary has
+// sm_90+ code of `probe` for it (binaryVersion and ptxVersion >= 90): the kernels' wait for the
+// kernel ahead (griddepcontrol.wait) is compiled for sm_90+ only, so code older than that must
+// never be launched early.
+template <typename... KArgs>
+bool hopper_pdl_device(void (*probe)(KArgs...)) {
+    static std::atomic<int> state[GGML_CUDA_MAX_DEVICES];  // 0 unknown, 1 yes, 2 no
+    const int dev = current();
+    if (dev < 0) {
+        return false;
+    }
+    int st = state[dev].load(std::memory_order_relaxed);
+    if (st == 0) {
+        cudaFuncAttributes fa{};
+        const cudaError_t before = cudaPeekAtLastError();
+        const bool code = cudaFuncGetAttributes(&fa, probe) == cudaSuccess && fa.binaryVersion >= 90 &&
+                          fa.ptxVersion >= 90;
+        if (!code) {
+            clear_own_error(before);
+        }
+        st = compute_capability() == 90 && code ? 1 : 2;
+        state[dev].store(st, std::memory_order_relaxed);
+    }
+    return st == 1;
+}
+
+// Whether `probe` launches as a programmatic dependent launch on the current device: compute
+// capability 12.x (sm12x_device), and 9.0 under --hopper-pdl (hopper_pdl_device).
+template <typename... KArgs>
+bool pdl_device(void (*probe)(KArgs...)) {
+    return sm12x_device(probe) ||
+           (hopper_pdl_flag().load(std::memory_order_relaxed) && hopper_pdl_device(probe));
+}
+
 // Whether compute capability `cc` (10 * major + minor) is Ampere: 8.0 to 8.7 (A100 and A30 with
 // 164 KB of shared memory per SM; RTX 30, the A-series workstation cards, A10 / A40 and Orin
 // with 100 KB, 99 KB a block). Not 8.9 (Ada: sm_89 code of its own).
