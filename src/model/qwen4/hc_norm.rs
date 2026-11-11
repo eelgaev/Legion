@@ -758,6 +758,8 @@ struct MoeFold {
     g_ld: i64,
     k: i32,
     fma: i32,
+    /// Null, or the experts' rows as BF16 (`x` null; `--nvfp4-expert-rows-bf16`, #1183).
+    x16: *const u16,
 }
 
 #[cfg(feature = "cuda")]
@@ -911,12 +913,22 @@ unsafe fn cpu_fold_row(dst: &ffi::ggml_tensor, t: usize, out: &mut [f32]) {
         let w = (*dst.src[8]).data as *const f32;
         let fma = params[7] == 2;
         let (e, k) = (out.len(), params[8] as usize);
+        // BF16 rows (`--nvfp4-expert-rows-bf16`, #1183): read as F32, exactly.
+        let x16 = x.type_ == types::BF16;
         let xp = x.data as *const f32;
+        let xh = x.data as *const u16;
         let gv = *((g.data as *const u8).add(t * g.nb[1]) as *const f32);
         let s = 1.0 / (1.0 + (-gv).exp());
         let shp = (sh.data as *const f32).add(t * e);
         for (col, o) in out.iter_mut().enumerate() {
-            let v = |j: usize| *xp.add((t * k + j) * e + col);
+            let v = |j: usize| {
+                let i = (t * k + j) * e + col;
+                if x16 {
+                    f32::from_bits((*xh.add(i) as u32) << 16)
+                } else {
+                    *xp.add(i)
+                }
+            };
             let mut sum = v(0) * *w.add(t * k);
             for j in 1..k {
                 sum = if fma {
@@ -1195,8 +1207,18 @@ unsafe fn cuda_hc_post_norm(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
         } else if params[7] != 0 {
             // A folded MoE tail (#836): `out` (the experts' rows) is not read as a row.
             let (sh, g) = (&*dst.src[6], &*dst.src[7]);
+            let x16 = out.type_ == types::BF16;
             let f = MoeFold {
-                x: out.data as *const f32,
+                x: if x16 {
+                    std::ptr::null()
+                } else {
+                    out.data as *const f32
+                },
+                x16: if x16 {
+                    out.data as *const u16
+                } else {
+                    std::ptr::null()
+                },
                 w: (*dst.src[8]).data as *const f32,
                 sh: sh.data as *const f32,
                 g: g.data as *const f32,

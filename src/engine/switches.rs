@@ -164,6 +164,9 @@ pub struct Switches {
     /// How the mv/GEMM cutoff applies: per step, per expert, the down projection only
     /// ([`crate::model::nvfp4_mm::set_expert_mv_split`]).
     pub nvfp4_expert_mv_split: Option<crate::model::nvfp4_mm::MvSplit>,
+    /// The routed experts' down matmul of prompt steps storing BF16 per-pair rows
+    /// ([`crate::model::nvfp4_mm::set_expert_rows_bf16`]; off by default).
+    pub nvfp4_expert_rows_bf16: Option<bool>,
     /// Verify steps routing their padding rows' experts as their sequences' first rows
     /// ([`crate::model::core::pad_rows::set_pad_remap`]).
     pub moe_pad_remap: Option<bool>,
@@ -610,6 +613,10 @@ impl Switches {
         if let Some(mode) = self.nvfp4_expert_mv_split {
             crate::model::nvfp4_mm::set_expert_mv_split(mode);
         }
+        set(
+            self.nvfp4_expert_rows_bf16,
+            crate::model::nvfp4_mm::set_expert_rows_bf16,
+        );
         set(
             self.moe_pad_remap,
             crate::model::core::pad_rows::set_pad_remap,

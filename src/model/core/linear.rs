@@ -611,7 +611,9 @@ impl Linear {
         ids: Tensor<'a>,
         rows: Option<Tensor<'a>>,
     ) -> Option<Tensor<'a>> {
-        use crate::model::nvfp4_mm::{mul_mat_id, swiglu_id_rows};
+        use crate::model::nvfp4_mm::{
+            Act, expert_rows_bf16, mul_mat_id, mul_mat_id_act, swiglu_id_rows,
+        };
         let n = x.ne()[2];
         let m = gate.1.ne()[1];
         let shapes = gate.1.ne() == up.1.ne() && gate.1.nb() == up.1.nb() && down.1.ne()[0] == m;
@@ -628,6 +630,11 @@ impl Linear {
         };
         (shapes && fits(gate) && fits(up) && fits(down)).then(|| {
             let act = swiglu_id_rows(ctx, gate.1, up.1, x, ids, gate.2, up.2, rows);
+            if expert_rows_bf16(n) {
+                // BF16 per-pair rows, read back as F32 (#1183, opt-in).
+                let rows = mul_mat_id_act(ctx, down.1, act, ids, down.2, Act::Bf16);
+                return ctx.cast(rows, types::F32);
+            }
             mul_mat_id(ctx, down.1, act, ids, down.2)
         })
     }
