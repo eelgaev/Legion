@@ -171,7 +171,7 @@ impl Model {
         if !st.ffn {
             let h = Self::micro_input(pass, g);
             let n = h.ne()[1];
-            let ffn = self.moe(ctx, &pass.tap, &pass.graph, il, h, n)?;
+            let ffn = self.moe(ctx, &pass.tap, &pass.graph, il, h, n, pass.prompt_only())?;
             st.pending = Pending::Started(Self::micro_scatter(pass, st, ffn), inject);
             return Ok(());
         }
@@ -180,7 +180,7 @@ impl Model {
             let h = micro::finish(ctx, g, None);
             Self::add(pass, h);
             let n = h.ne()[1];
-            let ffn = self.moe(ctx, &pass.tap, &pass.graph, il, h, n)?;
+            let ffn = self.moe(ctx, &pass.tap, &pass.graph, il, h, n, pass.prompt_only())?;
             let s = micro::reduce_scatter_start(ctx, st.comm, ffn, st.n, j, true);
             Self::add(pass, s.node);
             scatters.push(s);
