@@ -43,6 +43,7 @@ pub use gdn_mma::set_gdn_mma;
 pub use gdn_scan::set_gdn_scan;
 pub(crate) use graph_size::graph_size;
 pub use norm_rope::{set_kv_append, set_norm_rope};
+pub use paged::qm_bench as paged_qm_bench;
 pub use paged::wmma_bench as paged_split_bench;
 pub(crate) mod shape_diff;
 pub(crate) mod shared_q8;

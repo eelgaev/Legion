@@ -400,6 +400,13 @@ pub(in crate::cli) struct SwitchArgs {
     /// default.
     #[arg(long, help_heading = HEADING)]
     hopper_attn: bool,
+    /// CUDA, compute capability 12.x (DGX Spark's GB10, RTX 50), paged attention with heads of
+    /// 256 (Qwen3.5+ and Gemma 4's sliding layers): prompt chunks of 256 query rows or more
+    /// (tokens x query heads per kv head) over an F16 cache on the default kernel that takes 8
+    /// query columns per warp, instead of the one that takes 16 query rows per warp with Q in
+    /// shared memory (the default there). The same bits. For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_paged_prefill_qm: bool,
     /// CUDA, compute capability 9.0 only (H100, H200, GH200) with a binary built for sm_90
     /// or sm_90a: programmatic dependent launch (each kernel set up while the one ahead of it
     /// still runs, then waiting for it on the GPU) for Legion's decode kernels that take it on
@@ -1477,6 +1484,7 @@ impl SwitchArgs {
             fp8_sliced_k: self.fp8_sliced_k.then_some(true),
             hopper_gemm: self.hopper_gemm.then_some(true),
             hopper_attn: self.hopper_attn.then_some(true),
+            paged_prefill_qm: self.no_paged_prefill_qm.then_some(false),
             hopper_pdl: self.hopper_pdl.then_some(true),
             nvfp4_wide_mv: self.nvfp4_wide_mv.then_some(true),
             nvfp4_expert_pdl: self.no_nvfp4_expert_pdl.then_some(false),
