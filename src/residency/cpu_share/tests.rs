@@ -266,10 +266,11 @@ fn pool_waits_for_a_late_publish() {
 
     let (n_embd, n_ff, n_expert, n_used, n_tok) = (512, 256, 6, 4, 2);
     let (_kinds, he) = experts(n_embd, n_ff, n_expert);
-    let pool = Pool::new(&[], 3);
-    let queue = pool.add_queue();
     let (ready, done) = (AtomicU32::new(0), AtomicU32::new(0));
     let (ids, x, mut out) = step_buffers(n_tok, n_used, n_embd);
+    // After the buffers: dropped (stopped) first, also when an assert fails.
+    let pool = Pool::new(&[], 3);
+    let queue = pool.add_queue();
     let job = Job {
         seq: 1,
         layer: 0,
