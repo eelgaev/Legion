@@ -35,6 +35,7 @@ pub use hc_norm::{
     set_norm_fma, set_streams_bf16, set_xn16, set_xn16_gpu,
 };
 mod hc_up_mix;
+pub(crate) use hc_up_mix::{mix_cast_reads, set_mix_cast};
 pub use hc_up_mix::{
     set_gpu as set_up_mix_gpu, set_rebuild as set_up_mix_rebuild, set_up_mix, set_up_mix_bf16,
 };

@@ -310,6 +310,92 @@ pub(super) fn up_mix<'a>(
     node(ctx, &[up, lo, xn], e, rank, n, hc, scale)
 }
 
+/// Where `lo` as BF16 (`rank · n` values) sits in its `hc_up_lob` node of `node_bytes` bytes:
+/// at the node's end, 256-byte aligned. The node has the gate's size (see [`HC_UP_LOB`]), far
+/// more than `lo` needs; whatever the allocator puts first in its memory once the mix has run
+/// (usually the BF16 copy of the mixed values, the next node) then shares none of it with the
+/// part the mix reads, so the mix may write that copy itself (#1183, [`mix_cast_reads`]).
+pub(super) fn lob_offset(node_bytes: usize, rank: usize, n: usize) -> usize {
+    (node_bytes - rank * n * 2) / 256 * 256
+}
+
+/// The BF16 `lo` of the `hc_up_lob` node `lob` ([`lob_offset`]).
+///
+/// # Safety
+/// `lob` is a node made by [`up_mix`] or [`up_mix_rebuilt`] with memory; `rank` and `n` its
+/// `lo`'s.
+unsafe fn lob_data(lob: &ffi::ggml_tensor, rank: usize, n: usize) -> *mut u16 {
+    // SAFETY: the caller's; the offset stays within the node.
+    unsafe {
+        let bytes = ffi::ggml_nbytes(lob);
+        (lob.data as *mut u8).add(lob_offset(bytes, rank, n)) as *mut u16
+    }
+}
+
+/// For a BF16 mix node (`up_mix` or `up_mix_rebuilt` with a BF16 `up`) that writes no BF16
+/// copy yet: the bytes it reads (`up`, the part of its `hc_up_lob` node holding `lo`, `xn` or
+/// the streams, and the scales and gamma), as `(start, end)` ranges. `None` for any other
+/// node. The node fusion asks it before the mix writes a cast's values ([`set_mix_cast`]).
+///
+/// # Safety
+/// `node` is a valid tensor of an allocated graph; its sources valid tensors.
+pub(crate) unsafe fn mix_cast_reads(node: *const ffi::ggml_tensor) -> Option<Vec<(usize, usize)>> {
+    // SAFETY: the caller's.
+    unsafe {
+        let op = crate::ggml::op_of(node)?;
+        let t = &*node;
+        if !std::ptr::eq(op, &HC_UP_MIX)
+            || t.src[0].is_null()
+            || (*t.src[0]).type_ != types::BF16
+            || t.src[1].is_null()
+            || t.src[2].is_null()
+            || !t.src[MIX_CAST_SRC].is_null()
+            || t.data.is_null()
+        {
+            return None;
+        }
+        let lob = &*t.src[1];
+        let lo = &*lob.src[0];
+        let (rank, n) = (lo.ne[0] as usize, lo.ne[1] as usize);
+        let whole = |s: *const ffi::ggml_tensor| {
+            let p = (*s).data as usize;
+            (p, p + ffi::ggml_nbytes(s))
+        };
+        let l = lob_data(lob, rank, n) as usize;
+        let mut reads = vec![whole(t.src[0]), (l, l + rank * n * 2)];
+        for &s in &t.src[2..5] {
+            if !s.is_null() {
+                reads.push(whole(s));
+            }
+        }
+        Some(reads)
+    }
+}
+
+/// The source slot of a BF16 mix node's BF16 copy ([`set_mix_cast`]).
+const MIX_CAST_SRC: usize = 5;
+
+/// The parameter of a BF16 mix node set when it does not write the F32 mixed values.
+const P_SKIP_F32: usize = 2;
+
+/// Makes the BF16 mix node `node` ([`mix_cast_reads`]) also write its mixed values rounded to
+/// BF16 into `cast` (contiguous BF16, as many values), as ggml's F32 -> BF16 copy rounds them
+/// (#1183); with `skip_f32`, not the F32 values themselves (nothing reads them).
+///
+/// # Safety
+/// As [`crate::ggml::make_external`]: valid nodes of an allocated graph that has not run.
+pub(crate) unsafe fn set_mix_cast(
+    node: *mut ffi::ggml_tensor,
+    cast: *mut ffi::ggml_tensor,
+    skip_f32: bool,
+) {
+    // SAFETY: the caller's.
+    unsafe {
+        (*node).src[MIX_CAST_SRC] = cast;
+        crate::ggml::set_external_param(node, P_SKIP_F32, i32::from(skip_f32));
+    }
+}
+
 /// The F32 `lo` (`[rank, n]`) a BF16 mix node reads: its `lob` node's source.
 ///
 /// # Safety
@@ -328,7 +414,8 @@ unsafe fn cpu_hc_up_lob(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
     unsafe {
         let lo = &*dst.src[0];
         let m = ffi::ggml_nelements(lo) as usize;
-        let (x, y) = (lo.data as *const f32, dst.data as *mut u16);
+        let y = lob_data(dst, lo.ne[0] as usize, lo.ne[1] as usize);
+        let x = lo.data as *const f32;
         for i in (ith..m).step_by(nth) {
             *y.add(i) = crate::model::nvfp4_mm::bf16_bits(*x.add(i));
         }
@@ -343,7 +430,7 @@ unsafe fn cuda_hc_up_lob(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
         let mut p = HcUpMix::empty();
         p.lo = lo.data as *const f32;
         (p.rank, p.n) = (lo.ne[0] as i32, lo.ne[1] as i32);
-        p.lob = dst.data as *mut u16;
+        p.lob = lob_data(dst, lo.ne[0] as usize, lo.ne[1] as usize);
         match legion_hc_up_lob_launch(&p, stream) {
             0 => Ok(()),
             e => Err(format!("hc_up_lob: error {e}")),
@@ -471,7 +558,15 @@ unsafe fn cpu_hc_up_mix(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
         let bf16 = |b: u16| f32::from_bits(u32::from(b) << 16);
         // BF16: `lo` as BF16 from the `hc_up_lob` node (src[1]), as on CUDA. The F32 `lo` is
         // no source of this node: the allocator may have handed its memory on (to `dst`).
-        let lob = (*dst.src[1]).data as *const u16;
+        let lob = if up_bf16 {
+            lob_data(&*dst.src[1], rank, n) as *const u16
+        } else {
+            std::ptr::null()
+        };
+        // The node fusion's BF16 copy of the mixed values (#1183), and whether the F32 ones go.
+        let mixedb = dst.src[MIX_CAST_SRC];
+        let mixedb = (!mixedb.is_null()).then(|| (*mixedb).data as *mut u16);
+        let skip_f32 = params[P_SKIP_F32] != 0;
         let mut q = vec![0i8; rank];
         let mut d = vec![0f32; nkb];
         let mut xb = vec![0f32; rank];
@@ -519,7 +614,13 @@ unsafe fn cpu_hc_up_mix(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
                     }
                     sum += xv * (1.0 / (1.0 + (-gate[c * e + i]).exp()));
                 }
-                *out.add(t * e + i) = scale * sum;
+                let v = scale * sum;
+                if !skip_f32 {
+                    *out.add(t * e + i) = v;
+                }
+                if let Some(b) = mixedb {
+                    *b.add(t * e + i) = crate::model::nvfp4_mm::bf16_bits(v);
+                }
             }
         }
     }
@@ -557,6 +658,10 @@ struct HcUpMix {
     lob: *mut u16,
     /// Nonzero: `lob` already holds `lo` as BF16 (the `hc_up_lob` node).
     lob_ready: i32,
+    /// BF16 `up` only: null, or where the mixed values rounded to BF16 go ([`set_mix_cast`]).
+    mixedb: *mut u16,
+    /// Nonzero: the F32 mixed values are not written.
+    skip_f32: i32,
 }
 
 #[cfg(feature = "cuda")]
@@ -582,6 +687,8 @@ impl HcUpMix {
             up_bf16: 0,
             lob: std::ptr::null_mut(),
             lob_ready: 0,
+            mixedb: std::ptr::null_mut(),
+            skip_f32: 0,
         }
     }
 }
@@ -647,11 +754,17 @@ unsafe fn cuda_hc_up_mix(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
             up_bf16: i32::from(up_bf16),
             // BF16: the `hc_up_lob` node (src[1]) holds `lo` as BF16 already.
             lob: if up_bf16 {
-                (*dst.src[1]).data as *mut u16
+                lob_data(&*dst.src[1], rank as usize, n as usize)
             } else {
                 std::ptr::null_mut()
             },
             lob_ready: i32::from(up_bf16),
+            // The node fusion's BF16 copy of the mixed values, if it made one (#1183).
+            mixedb: match dst.src[MIX_CAST_SRC] {
+                c if c.is_null() => std::ptr::null_mut(),
+                c => (*c).data as *mut u16,
+            },
+            skip_f32: params[P_SKIP_F32],
         };
         match legion_hc_up_mix_launch(&p, stream) {
             0 => Ok(()),
