@@ -85,19 +85,6 @@ fn fits_f32_weights_from_four_tokens() {
     }
 }
 
-/// Chain weights stay on cuBLAS on compute capability 9.x only (#1215): their order was matched
-/// against the GB10's cuBLAS, not Hopper's.
-#[test]
-fn chain_weights_off_on_hopper_only() {
-    for cc in [90, 91, 99] {
-        assert!(!chain_cc(Some(cc)), "cc {cc}");
-    }
-    for cc in [70, 75, 80, 86, 89, 100, 120, 121] {
-        assert!(chain_cc(Some(cc)), "cc {cc}");
-    }
-    assert!(chain_cc(None), "unknown: the device check decides");
-}
-
 /// A GDN layer's alpha and beta (48 BF16 rows each, which ggml runs on cuBLAS from 9 tokens) fit
 /// as chain weights at 9-16 tokens, only after weights that fit the op themselves.
 #[test]

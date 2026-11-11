@@ -295,9 +295,10 @@ pub(in crate::cli) struct SwitchArgs {
     dense_mv_f32: bool,
     /// Keep a GDN layer's alpha and beta projections (BF16, 48 rows each: NVFP4 checkpoints of
     /// Qwen3.8-Flash-Next) on ggml's cuBLAS GEMM in decode steps of 9-16 tokens. By default
-    /// (CUDA, compute capability 10.0+; Hopper keeps cuBLAS) they ride along in the layer's
-    /// qkv+z dense op, computed in cuBLAS's order: the same bits, without the two ~18 us
-    /// latency-bound cuBLAS launches per layer (#836). For comparisons.
+    /// (CUDA, compute capability 9.0+) they ride along in the layer's qkv+z dense op, computed
+    /// in cuBLAS's order: the same bits, without the two ~18 us latency-bound cuBLAS launches
+    /// per layer (#836). For comparisons, and on Hopper (9.x), whose cuBLAS the order was not
+    /// matched against.
     #[arg(long, help_heading = HEADING)]
     no_dense_mv_ab: bool,
     /// CUDA, compute capability 9.0+: a dense BF16 matmul of 2-16 tokens with fewer row tiles
