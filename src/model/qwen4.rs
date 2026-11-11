@@ -31,8 +31,8 @@ pub use hc_mix16::{set_hc_pre, set_mix16, set_rebuild_bf16 as set_mix_rebuild_bf
 mod hc_norm;
 pub(crate) use hc_norm::{FoldSum, fold_moe, fold_target, moe_fold};
 pub use hc_norm::{
-    hc_fuse, set_fused_post_norm, set_generic_post_norm, set_hc_fuse, set_moe_fold, set_norm_fma,
-    set_streams_bf16, set_xn16, set_xn16_gpu,
+    hc_fuse, set_fused_post_norm, set_generic_post_norm, set_hc_bf16, set_hc_fuse, set_moe_fold,
+    set_norm_fma, set_streams_bf16, set_xn16, set_xn16_gpu,
 };
 mod hc_up_mix;
 pub use hc_up_mix::{
@@ -960,13 +960,15 @@ impl Model {
 
     /// [`Self::hc_combine`] of `pending` (the previous block's output and inject, if any) into
     /// the streams `res`, then the `prefix` mixer with its inject: `(streams, mixed, inject)`.
-    /// On a GPU, in a small step, one op does both (see [`hc`]).
+    /// On a GPU, in a small step, one op does both (see [`hc`]). `bf16`: the step may keep the
+    /// streams in BF16 ([`set_hc_bf16`], #1183; a prompt-only pass).
     fn hc_mix_after<'a>(
         &'a self,
         ctx: &'a Context,
         res: Tensor<'a>,
         pending: Option<(Tensor<'a>, Tensor<'a>)>,
         prefix: &str,
+        bf16: bool,
     ) -> Result<(Tensor<'a>, Tensor<'a>, Tensor<'a>), ModelError> {
         let w = |s: &str| self.w(&format!("{prefix}_{s}.weight"));
         let (norm, down, up, inj) = (w("norm")?, w("down")?, w("up")?, w("inject")?);
@@ -1035,7 +1037,15 @@ impl Model {
                     hc_up_mix::up_mix_rebuilt(ctx, up, lo, p.res, p.scales, norm, hc_n, scale);
                 return Ok((p.res, mixed, p.inject));
             }
-            let res = f32_streams(res);
+            // The BF16 mixers' rebuilt norm below takes this step (sm_80+, the NVFP4
+            // checkpoints): with `bf16` (`--hc-bf16`, #1183) it reads and writes BF16 streams.
+            let xnb_rebuilt = f16.is_some_and(|d| d.ty() == types::BF16)
+                && !hc_mix16::on()
+                && hc_up_mix::rebuild()
+                && hc_up_mix::fits_up_bf16(up, n, hc_n)
+                && hc_norm::rebuild_xnb_fits(res.ne()[0], hc_n, inj.ne()[1], n);
+            let streams16 = bf16 && xnb_rebuilt;
+            let res = if streams16 { res } else { f32_streams(res) };
             // On a V100, the gated mix as one op that also writes the block input as F16, the
             // operand ggml-cuda's cuBLAS GEMMs convert it to in each of its Q8_0 projections, so
             // they take it instead (#774); and, where the norm can write the streams' scales
@@ -1098,10 +1108,7 @@ impl Model {
             // and none more read by the up-mix (the streams in place of xn). `legion serve
             // --hc-xn-written` keeps xn written and read.
             if let Some(down) = f16
-                && down.ty() == types::BF16
-                && hc_up_mix::rebuild()
-                && hc_up_mix::fits_up_bf16(up, n, hc_n)
-                && hc_norm::rebuild_xnb_fits(res.ne()[0], hc_n, inj.ne()[1], n)
+                && xnb_rebuilt
             {
                 let scale = 1.0 / hc_n as f32;
                 let p = hc_norm::hc_post_norm_rebuilt_xnb(
@@ -1113,6 +1120,7 @@ impl Model {
                     inj,
                     self.hp.rms_eps,
                     down,
+                    streams16,
                 );
                 let lo =
                     hc_chain::lo_act(ctx, ctx.mul_mat(down, p.xnb), scale, hc_chain::on_gpu(up));
@@ -1144,6 +1152,7 @@ impl Model {
                     inj,
                     self.hp.rms_eps,
                     down,
+                    false,
                 );
                 let lo =
                     hc_chain::lo_act(ctx, ctx.mul_mat(down, p.xnb), scale, hc_chain::on_gpu(up));
@@ -1294,6 +1303,9 @@ impl Model {
         // the mixers and combines on those only; each block's input is gathered from every
         // rank's share and its partial output reduce-scattered to them.
         let sp = if tap.on { None } else { self.tp_seq_par(n) };
+        // `--hc-bf16` (#1183): BF16 streams between the mixers, in prompt-only passes without
+        // the sequence-parallel split.
+        let bf16 = hc_norm::hc_bf16() && pass.prompt_only() && sp.is_none() && !tap.on;
         let ple_layer = q4.ple.as_ref().map(|p| p.layer);
         let (mut split, n_all) = (false, n);
         // `--tp-overlap` (#758): the split layers in two micro-batches.
@@ -1364,7 +1376,7 @@ impl Model {
                 continue;
             }
             let pre = format!("blk.{il}.hc_attn");
-            let (r, h, mut inject) = self.hc_mix_after(ctx, res, pending.take(), &pre)?;
+            let (r, h, mut inject) = self.hc_mix_after(ctx, res, pending.take(), &pre, bf16)?;
             res = r;
             let h = if !split {
                 h
@@ -1394,7 +1406,7 @@ impl Model {
             let attn = self.tp_sum_split(ctx, attn, sp.filter(|_| split));
             pending = Some((attn, inject));
             let pre = format!("blk.{il}.hc_ffn");
-            let (r, h, inject) = self.hc_mix_after(ctx, res, pending.take(), &pre)?;
+            let (r, h, inject) = self.hc_mix_after(ctx, res, pending.take(), &pre, bf16)?;
             res = r;
             let h = if split {
                 gather_in(h, il, "ffn_up_shexp.weight")

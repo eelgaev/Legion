@@ -823,6 +823,120 @@ fn cuda_hc_post_norm_rebuilt_bf16_streams() {
     check_rebuilt_bf16(&mut gpu, 2560);
 }
 
+/// The rebuilt BF16-xn op (#836) with BF16 streams (`--hc-bf16`, #1183) next to the F32 one on
+/// `n` tokens, from F32 streams (`res16` false) or BF16 ones holding the same values: the new
+/// streams (widened to F32), scales, inject weights and BF16 xn of both, as F32 values.
+fn rebuilt_xnb_bf16_case(
+    backend: &mut Backend,
+    e: i64,
+    n: i64,
+    res16: bool,
+    zero_out: bool,
+) -> [[Vec<f32>; 4]; 2] {
+    let (hc, n_inj, m) = (4i64, 4i64, 32i64);
+    let ctx = Context::new(64, 64);
+    let res = ctx.new_tensor(types::F32, &[e, hc, n]).as_input();
+    let res16_in = ctx.new_tensor(types::BF16, &[e, hc, n]).as_input();
+    let out = ctx.new_tensor(types::F32, &[e, n]).as_input();
+    let inj = ctx.new_tensor(types::F32, &[hc, n]).as_input();
+    let g = ctx.new_tensor(types::F32, &[e * hc]).as_input();
+    let w = ctx.new_tensor(types::F32, &[e * hc, n_inj]).as_input();
+    let down = ctx.new_tensor(types::BF16, &[e * hc, m]).as_input();
+    let streams = if res16 { res16_in } else { res };
+    let f = hc_post_norm_rebuilt_xnb(&ctx, res, out, inj, g, w, 1e-6, down, false);
+    let b = hc_post_norm_rebuilt_xnb(&ctx, streams, out, inj, g, w, 1e-6, down, true);
+    assert_eq!(b.res.ty(), types::BF16);
+    let outs = [f, b].map(|p| {
+        [p.res, p.scales, p.inject, p.xnb].map(|t| ctx.cont(ctx.cast(t, types::F32)).as_output())
+    });
+    let mut graph = ctx.new_graph(64);
+    for t in outs.iter().flatten() {
+        graph.expand(*t);
+    }
+    ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+        .unwrap();
+    let r: Vec<f32> = noise((e * hc * n) as usize, 61)
+        .into_iter()
+        .map(bf16_round)
+        .collect();
+    res.set_f32(&r);
+    if res16 {
+        res16_in.set_bytes(&bf16_bytes(&r));
+    }
+    let o = noise((e * n) as usize, 62);
+    out.set_f32(&if zero_out { vec![0.0; o.len()] } else { o });
+    inj.set_f32(&noise((hc * n) as usize, 63));
+    g.set_f32(&noise((e * hc) as usize, 64));
+    w.set_f32(&noise((e * hc * n_inj) as usize, 65));
+    down.set_bytes(&bf16_bytes(&noise((e * hc * m) as usize, 66)));
+    backend.compute(&graph).unwrap();
+    outs.map(|o| o.map(|t| t.to_f32()))
+}
+
+/// With BF16 streams the new streams are the F32 op's rounded to BF16 (the same FMA, then
+/// RNE), from F32 or BF16 streams alike. `exact`: the other outputs from the same streams
+/// (nothing added) are the F32 op's bit for bit (the CPU reference, one sum order); else
+/// within F32 rounding of the sum order (the CUDA kernel's pair layout).
+fn check_rebuilt_xnb_bf16(backend: &mut Backend, e: i64, ns: &[i64], exact: bool) {
+    for &n in ns {
+        for res16 in [false, true] {
+            let at = format!("{n} tokens, res16 {res16}");
+            let [f, b] = rebuilt_xnb_bf16_case(backend, e, n, res16, false);
+            let rounded: Vec<f32> = f[0].iter().map(|&x| bf16_round(x)).collect();
+            assert!(
+                b[0].iter()
+                    .zip(&rounded)
+                    .all(|(x, y)| x.to_bits() == y.to_bits()),
+                "{at}: streams not the F32 ones rounded"
+            );
+            assert!(b[0] != f[0], "{at}: nothing rounded");
+            let [f, b] = rebuilt_xnb_bf16_case(backend, e, n, res16, true);
+            for (i, name) in ["streams", "scales", "inject", "xnb"].iter().enumerate() {
+                if exact || i == 0 {
+                    assert!(
+                        f[i].iter()
+                            .zip(&b[i])
+                            .all(|(x, y)| x.to_bits() == y.to_bits()),
+                        "{at}: {name} moved"
+                    );
+                } else {
+                    // xnb: a scale's last bit may flip a BF16 rounding (2^-8 relative).
+                    let tol = if i == 3 { 1e-2 } else { 1e-5 };
+                    let r = rel(&b[i], &f[i]);
+                    assert!(r < tol, "{at}: {name} off by {r}");
+                }
+            }
+        }
+    }
+}
+
+/// [`check_rebuilt_xnb_bf16`] on the CPU (the reference).
+#[test]
+fn hc_post_norm_rebuilt_xnb_bf16_streams_on_the_cpu() {
+    let mut cpu = Backend::cpu().unwrap();
+    cpu.set_threads(4);
+    check_rebuilt_xnb_bf16(&mut cpu, 256, &[9], true);
+}
+
+/// [`check_rebuilt_xnb_bf16`] on CUDA (sm_80+) at qwen4exp's shape: `hc_post_norm_b16_kernel`
+/// against the default kernel.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_hc_post_norm_rebuilt_xnb_bf16_streams() {
+    use crate::ggml::{DeviceKind, device_by_kind};
+    let mut gpu = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU device")
+        .init()
+        .unwrap();
+    if !crate::model::fp8::bf16_mma() {
+        println!("no BF16 tensor cores: skipped");
+        return;
+    }
+    check_rebuilt_xnb_bf16(&mut gpu, 2560, &[1, 9, 300], false);
+}
+
 /// F32 values from their bytes.
 fn floats(b: &[u8]) -> Vec<f32> {
     b.as_chunks::<4>()
@@ -1178,6 +1292,8 @@ struct FoldIn {
     /// The experts' rows as BF16 cast to F32 (`--nvfp4-expert-rows-bf16`, #1183): `experts`
     /// then holds BF16 values.
     bf16: bool,
+    /// BF16 streams in and out (`--hc-bf16`, #1183): `res` then holds BF16 values.
+    streams16: bool,
 }
 
 const FOLD_HC: i64 = 4;
@@ -1209,6 +1325,7 @@ fn fold_in(e: i64, k: i64, n: i64) -> FoldIn {
             .flat_map(|&v| crate::model::nvfp4_mm::bf16_bits(0.05 * v).to_ne_bytes())
             .collect(),
         bf16: false,
+        streams16: false,
     }
 }
 
@@ -1240,10 +1357,15 @@ fn fold_relayout() -> crate::ggml::post_alloc::Relayout {
 /// The norm's outputs (streams, scales, inject weights, BF16 xn) as bytes, and whether the
 /// tail was folded (its gate's add gone).
 fn fold_case(c: &FoldIn, tail: Tail) -> ([Vec<u8>; 4], bool) {
-    let (e, k, n) = (c.e, c.k, c.n);
-    let kk = e * FOLD_HC;
     let mut backend = Backend::cpu().unwrap();
     backend.set_threads(4);
+    fold_case_on(&mut backend, c, tail)
+}
+
+/// [`fold_case`] on `backend`.
+fn fold_case_on(backend: &mut Backend, c: &FoldIn, tail: Tail) -> ([Vec<u8>; 4], bool) {
+    let (e, k, n) = (c.e, c.k, c.n);
+    let kk = e * FOLD_HC;
     let ctx = Context::new(256, 256);
     let rows16 = ctx.new_tensor(types::BF16, &[e, k, n]).as_input();
     let experts = if c.bf16 {
@@ -1272,12 +1394,13 @@ fn fold_case(c: &FoldIn, tail: Tail) -> ([Vec<u8>; 4], bool) {
             _ => out,
         }
     };
-    let res = ctx.new_tensor(types::F32, &[e, FOLD_HC, n]).as_input();
+    let res_ty = if c.streams16 { types::BF16 } else { types::F32 };
+    let res = ctx.new_tensor(res_ty, &[e, FOLD_HC, n]).as_input();
     let inj = ctx.new_tensor(types::F32, &[FOLD_HC, n]).as_input();
     let gamma = ctx.new_tensor(types::F32, &[kk]).as_input();
     let wi = ctx.new_tensor(types::F32, &[kk, FOLD_INJ]).as_input();
     let down = ctx.new_tensor(types::BF16, &[kk, FOLD_M]).as_input();
-    let p = hc_post_norm_rebuilt_xnb(&ctx, res, out, inj, gamma, wi, 1e-6, down);
+    let p = hc_post_norm_rebuilt_xnb(&ctx, res, out, inj, gamma, wi, 1e-6, down, c.streams16);
     let outs = [p.res, p.scales, p.inject, p.xnb].map(|t| ctx.cont(t).as_output());
     let mut graph = ctx.new_graph(256);
     for t in outs {
@@ -1322,7 +1445,11 @@ fn fold_case(c: &FoldIn, tail: Tail) -> ([Vec<u8>; 4], bool) {
         sh.set_f32(&c.sh);
         joined.set_f32(&c.joined);
     }
-    res.set_f32(&c.res);
+    if c.streams16 {
+        res.set_bytes(&bf16_bytes(&c.res));
+    } else {
+        res.set_f32(&c.res);
+    }
     inj.set_f32(&c.inj);
     gamma.set_f32(&c.gamma);
     wi.set_f32(&c.wi);
@@ -1397,6 +1524,44 @@ fn moe_tail_of_bf16_rows_folds_with_its_bits() {
     }
 }
 
+/// BF16 streams (`--hc-bf16`, #1183), with F32 or BF16 expert rows: the tail folds into the
+/// BF16-stream norm with the unfolded graph's bits, and the new streams are BF16.
+fn check_tail_folds_into_bf16_streams(backend: &mut Backend, shapes: &[(i64, i64, i64)]) {
+    for &(e, k, n) in shapes {
+        for rows16 in [false, true] {
+            let mut c = fold_in(e, k, n);
+            c.res = c.res.iter().map(|&v| bf16_round(v)).collect();
+            c.streams16 = true;
+            if rows16 {
+                c.experts = c.experts.iter().map(|&v| bf16_round(v)).collect();
+                c.bf16 = true;
+            }
+            let planned = |fold| Tail::Planned {
+                fold,
+                out_read: false,
+            };
+            let (want, plain) = fold_case_on(backend, &c, planned(false));
+            let (got, folded) = fold_case_on(backend, &c, planned(true));
+            let at = format!("{e}x{k}x{n} rows16 {rows16}");
+            assert!(!plain && folded, "{at}: {plain} {folded}");
+            assert_eq!(
+                want[0].len(),
+                (e * FOLD_HC * n * 2) as usize,
+                "{at}: BF16 streams"
+            );
+            assert!(got == want, "{at}: the norm's outputs moved");
+        }
+    }
+}
+
+/// [`check_tail_folds_into_bf16_streams`] on the CPU (the reference).
+#[test]
+fn moe_tail_folds_into_bf16_streams_with_its_bits() {
+    let mut cpu = Backend::cpu().unwrap();
+    cpu.set_threads(4);
+    check_tail_folds_into_bf16_streams(&mut cpu, &[(64, 4, 3), (32, 10, 5)]);
+}
+
 /// [`crate::model::core::node_fuse::fold::fold_graph`] turns the tail's nodes into views
 /// without sources, and its undo puts the graph back as built.
 #[test]
@@ -1423,7 +1588,7 @@ fn moe_fold_undoes() {
     let gamma = ctx.new_tensor(types::F32, &[kk]).as_input();
     let wi = ctx.new_tensor(types::F32, &[kk, FOLD_INJ]).as_input();
     let down = ctx.new_tensor(types::BF16, &[kk, FOLD_M]).as_input();
-    let p = hc_post_norm_rebuilt_xnb(&ctx, res, out, inj, gamma, wi, 1e-6, down);
+    let p = hc_post_norm_rebuilt_xnb(&ctx, res, out, inj, gamma, wi, 1e-6, down, false);
     let mut graph = ctx.new_graph(256);
     for t in [p.res, p.scales, p.inject, p.xnb] {
         graph.expand(ctx.cont(t).as_output());
@@ -1498,7 +1663,7 @@ fn a_deferred_reduce_scatter_reader_is_captured() {
     let gamma = ctx.new_tensor(types::F32, &[kk]).as_input();
     let wi = ctx.new_tensor(types::F32, &[kk, FOLD_INJ]).as_input();
     let down = ctx.new_tensor(types::BF16, &[kk, FOLD_M]).as_input();
-    let p = hc_post_norm_rebuilt_xnb(&ctx, res, out, inj, gamma, wi, 1e-6, down);
+    let p = hc_post_norm_rebuilt_xnb(&ctx, res, out, inj, gamma, wi, 1e-6, down, false);
     // SAFETY: the norm's node, just made; its params are the op's own.
     unsafe {
         let node = (*p.res.raw()).view_src;

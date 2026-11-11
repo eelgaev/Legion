@@ -251,7 +251,7 @@ fn xnb_chain_case(backend: &mut Backend, rebuilt: bool, e: i64, rank: i64, n: i6
     let scale = 1.0 / hc as f32;
     let gate = |xnb| ctx.mul_mat(up, ctx.silu(ctx.scale(ctx.mul_mat(down, xnb), scale)));
     let (r, ij, m) = if rebuilt {
-        let p = hc_post_norm_rebuilt_xnb(&ctx, res, out, inj, g, w, 1e-6, down);
+        let p = hc_post_norm_rebuilt_xnb(&ctx, res, out, inj, g, w, 1e-6, down, false);
         let mixed = mix_rebuilt_f32(&ctx, gate(p.xnb), p.res, p.scales, g, hc, scale);
         assert_eq!((mixed.ty(), mixed.ne()), (types::F32, [e, n, 1, 1]));
         (p.res, p.inject, mixed)
