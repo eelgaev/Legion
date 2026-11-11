@@ -1049,27 +1049,85 @@ pub fn set_xn16_gpu(cc: Option<(i32, i32)>) {
     let ggml_default = std::env::var("GGML_CUDA_CUBLAS_COMPUTE_TYPE").map_or(true, |v| {
         matches!(v.to_lowercase().as_str(), "auto" | "f16" | "fp16")
     });
+    XN16_CUBLAS.store(ggml_default, std::sync::atomic::Ordering::Relaxed);
     XN16_GPU.store(
-        cc == Some((7, 0)) && ggml_default,
+        xn16_takes(cc, ggml_default),
         std::sync::atomic::Ordering::Relaxed,
     );
     // A BF16 weight's GEMM computes in BF16 unless the variable asks for F32 or F16.
     let bf16_default = std::env::var("GGML_CUDA_CUBLAS_COMPUTE_TYPE").map_or(true, |v| {
         matches!(v.to_lowercase().as_str(), "auto" | "bf16")
     });
+    XNB_CUBLAS.store(bf16_default, std::sync::atomic::Ordering::Relaxed);
     XNB_GPU.store(
-        cc.is_some_and(|(major, _)| major >= 8) && bf16_default,
+        xnb_takes(cc, bf16_default),
         std::sync::atomic::Ordering::Relaxed,
     );
 }
 
+/// Whether `GGML_CUDA_CUBLAS_COMPUTE_TYPE` leaves the F16 GEMM [`xn16_fits`] replaces as it is
+/// (set with [`set_xn16_gpu`]).
+static XN16_CUBLAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether `GGML_CUDA_CUBLAS_COMPUTE_TYPE` leaves the BF16 GEMM [`xnb_fits`] feeds as it is (set
+/// with [`set_xn16_gpu`]).
+static XNB_CUBLAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a GPU of compute capability `cc` takes [`xn16_fits`] (a V100), the cuBLAS compute
+/// type ggml's (`cublas`).
+fn xn16_takes(cc: Option<(i32, i32)>, cublas: bool) -> bool {
+    cc == Some((7, 0)) && cublas
+}
+
+/// Whether a GPU of compute capability `cc` takes [`xnb_fits`] (sm_80+), the cuBLAS compute type
+/// ggml's (`cublas`).
+fn xnb_takes(cc: Option<(i32, i32)>, cublas: bool) -> bool {
+    cc.is_some_and(|(major, _)| major >= 8) && cublas
+}
+
+/// The answer of `takes` (with the cuBLAS setting `cublas`) for the GPU of device `dev` (the
+/// down weight's), asked per device (#1201: a box may hold GPUs of different architectures);
+/// `engine` (the engine's GPU's, [`set_xn16_gpu`]) where `dev` is unknown.
+fn gpu_for_by(
+    dev: Option<usize>,
+    engine: bool,
+    takes: fn(Option<(i32, i32)>, bool) -> bool,
+    cublas: bool,
+    cc_of: impl FnOnce(usize) -> Option<(i32, i32)>,
+) -> bool {
+    crate::hw::per_device::pick_by(dev, engine, |cc| takes(cc, cublas), cc_of)
+}
+
+/// [`xn16_fits`]'s GPU check for the down weight `down`.
+fn xn16_gpu(down: Tensor<'_>) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    gpu_for_by(
+        down.cuda_device(),
+        XN16_GPU.load(Relaxed),
+        xn16_takes,
+        XN16_CUBLAS.load(Relaxed),
+        crate::hw::per_device::cc,
+    )
+}
+
+/// [`xnb_fits`]'s GPU check for the down weight `down`.
+fn xnb_gpu(down: Tensor<'_>) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    gpu_for_by(
+        down.cuda_device(),
+        XNB_GPU.load(Relaxed),
+        xnb_takes,
+        XNB_CUBLAS.load(Relaxed),
+        crate::hw::per_device::cc,
+    )
+}
+
 /// Whether a prompt step of `n` tokens hands `mul_mat(down, xn)` an F16 `xn` from
-/// [`hc_post_norm`] (with `down` as F16 from it too): switched on, a V100
-/// ([`set_xn16_gpu`]), at least [`XN16_MIN_TOKENS`] tokens and Q8_0 down weights in one
-/// device's memory, so ggml-cuda would run the same GEMM on the same F16 inputs.
+/// [`hc_post_norm`] (with `down` as F16 from it too): switched on, at least [`XN16_MIN_TOKENS`]
+/// tokens and Q8_0 down weights in the memory of one V100 ([`xn16_gpu`]), so ggml-cuda would
+/// run the same GEMM on the same F16 inputs.
 pub(super) fn xn16_fits(down: Tensor<'_>, n: i64) -> bool {
     XN16.load(std::sync::atomic::Ordering::Relaxed)
-        && XN16_GPU.load(std::sync::atomic::Ordering::Relaxed)
         && cfg!(feature = "cuda")
         && n >= XN16_MIN_TOKENS
         && down.ty() == types::Q8_0
@@ -1079,6 +1137,7 @@ pub(super) fn xn16_fits(down: Tensor<'_>, n: i64) -> bool {
         && down.ne()[0] % 2 == 0
         && !down.is_host()
         && !down.is_meta()
+        && xn16_gpu(down)
 }
 
 /// Whether the engine's GPU runs ggml-cuda's BF16 `mul_mat` as a cuBLAS BF16 GEMM that reads a
@@ -1092,13 +1151,12 @@ static XNB_GPU: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 pub(super) const XNB_MIN_TOKENS: i64 = 128;
 
 /// Whether a prompt step of `n` tokens hands `mul_mat(down, xn)` a BF16 `xn` from
-/// [`hc_post_norm`] (#469): switched on ([`set_xn16`]), an sm_80+ GPU ([`XNB_GPU`]), at least
-/// [`XNB_MIN_TOKENS`] tokens and a BF16 down weight (the NVFP4 checkpoints' mixers) in one
-/// device's memory. ggml-cuda would round `xn` to BF16 as the op does (`__float2bfloat16`) and
+/// [`hc_post_norm`] (#469): switched on ([`set_xn16`]), at least [`XNB_MIN_TOKENS`] tokens and a
+/// BF16 down weight (the NVFP4 checkpoints' mixers) in the memory of one sm_80+ GPU
+/// ([`xnb_gpu`]). ggml-cuda would round `xn` to BF16 as the op does (`__float2bfloat16`) and
 /// run the same cuBLAS GEMM on it, so the result has the same bits, minus the conversion pass.
 pub(super) fn xnb_fits(down: Tensor<'_>, n: i64) -> bool {
     XN16.load(std::sync::atomic::Ordering::Relaxed)
-        && XNB_GPU.load(std::sync::atomic::Ordering::Relaxed)
         && cfg!(feature = "cuda")
         && n >= XNB_MIN_TOKENS
         && down.ty() == types::BF16
@@ -1108,6 +1166,7 @@ pub(super) fn xnb_fits(down: Tensor<'_>, n: i64) -> bool {
         && down.ne()[0] % 2 == 0
         && !down.is_host()
         && !down.is_meta()
+        && xnb_gpu(down)
 }
 
 /// Whether the engine's GPU is a V100 (compute capability 7.0; set with [`set_xn16_gpu`]).

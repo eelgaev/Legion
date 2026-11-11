@@ -958,3 +958,21 @@ fn cuda_bench() {
     }
     force_warps(0);
 }
+
+#[test]
+fn each_gpu_of_a_mixed_box_answers_for_itself() {
+    use crate::hw::per_device::test_cc;
+    // The GB10 and the 5090 (9.0+) take the decode kernel; the 4090, the V100, the A100 and an
+    // unknown device keep ggml's op, whatever the engine's GPU is.
+    for engine in [false, true] {
+        let picks: Vec<bool> = (0..6)
+            .map(|d| gpu_for_by(Some(d), engine, test_cc))
+            .collect();
+        assert_eq!(
+            picks,
+            [true, false, false, false, true, false],
+            "engine {engine}"
+        );
+        assert_eq!(gpu_for_by(None, engine, test_cc), engine);
+    }
+}

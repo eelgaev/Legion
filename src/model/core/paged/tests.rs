@@ -63,9 +63,15 @@ pub(super) struct Shape {
     pub(super) window: usize,
 }
 
+thread_local! {
+    /// Whether [`oracle`] on this thread leaves the query and the softmax weights in full
+    /// precision: for kernels that round neither (the FP32 FMA prefill, `ffma_tests.rs`).
+    pub(super) static EXACT_ORACLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The op's result in f64, from the F16-rounded cache and query: scores and the weighted sum
 /// accumulate exactly (as far as f32 output shows), so only the two F16 roundings the gather
-/// path also makes (the query and the softmax weights) remain.
+/// path also makes (the query and the softmax weights) remain; none with [`EXACT_ORACLE`].
 pub(super) fn oracle(
     sh: &Shape,
     q: &[f32],
@@ -89,8 +95,11 @@ pub(super) fn oracle(
         for t in 0..n_tok {
             for h in 0..n_head {
                 let at = ((s * n_tok + t) * n_head + h) * d;
+                let exact = EXACT_ORACLE.get();
                 let mut qr = q[at..at + d].to_vec();
-                round_f16(&mut qr);
+                if !exact {
+                    round_f16(&mut qr);
+                }
                 let cell = |p: usize| {
                     (tab[p / KV_BLOCK] as usize * KV_BLOCK + p % KV_BLOCK) * kv_row + h / g * d
                 };
@@ -110,11 +119,18 @@ pub(super) fn oracle(
                 let exp: Vec<f64> = scores.iter().map(|x| (x - max).exp()).collect();
                 let sum: f64 = exp.iter().sum();
                 let mut w: Vec<f32> = exp.iter().map(|x| (x / sum) as f32).collect();
-                round_f16(&mut w);
+                if !exact {
+                    round_f16(&mut w);
+                }
+                let w: Vec<f64> = if exact {
+                    exp.iter().map(|x| x / sum).collect()
+                } else {
+                    w.iter().map(|&x| x as f64).collect()
+                };
                 for i in 0..d {
                     let acc: f64 = (first..visible)
                         .zip(&w)
-                        .map(|(p, &w)| w as f64 * v[cell(p) + i] as f64)
+                        .map(|(p, &w)| w * v[cell(p) + i] as f64)
                         .sum();
                     out.push(acc as f32);
                 }

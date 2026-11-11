@@ -25,6 +25,8 @@
 //   same kernel split over the key blocks as decode is, and a combine kernel (#697).
 // - prefill with LEGION_PREFILL_M884 (opt-in; meant for sm_70): one pass with an online softmax
 //   on mma.sync m8n8k4 (paged_prefill_m884, described where it is defined).
+// - prefill with LEGION_PREFILL_FFMA (opt-in; meant for Turing without tensor cores): one pass
+//   with an online softmax on FP32 FMAs (paged_prefill_ffma, described where it is defined).
 // - prefill on sm_70 and sm_75 otherwise: tensor cores through the portable WMMA API. A CTA takes 64
 //   query rows (64 / G tokens times the G query heads of one kv head) and walks the key blocks
 //   twice: first for each row's softmax max and sum, then to accumulate exp(s - max) / sum
@@ -45,7 +47,7 @@
 // mma.sync kernel keeps its chains to 16 K steps or fewer the same way.
 //
 // The per-architecture prefill kernels live in sm80/paged_attn.cuh (paged_prefill_mma) and
-// sm70/paged_attn.cuh (paged_prefill_m884), included below; `launch` picks one per device at run
+// sm70/paged_attn.cuh (paged_prefill_m884) and sm75/paged_attn.cuh (paged_prefill_ffma), included below; `launch` picks one per device at run
 // time. Decode and the WMMA prefill are portable and stay here, the tiered-pool pieces in
 // dispatch.cu.
 //
@@ -124,15 +126,22 @@ enum { LEGION_KV_F16 = 0, LEGION_KV_Q8_0 = 1, LEGION_KV_Q4_0 = 2 };
 int legion_paged_attn_quant_ok(void);
 
 // Prefill kernel choice: LEGION_PREFILL_AUTO (sm_80+: paged_prefill_mma; sm_70/75: the WMMA
-// kernel) or LEGION_PREFILL_M884 (the m8n8k4 one-pass kernel, F16 caches). Set for all threads
-// (`this_thread` 0), M884 applies on sm_70 devices only, AUTO elsewhere (sm_75 lacks its shared
-// memory, sm_80+ would run m8n8k4 emulated). Set for the calling thread (`this_thread` > 0,
-// tests), it applies on any GPU from sm_70.
-enum { LEGION_PREFILL_AUTO = 0, LEGION_PREFILL_M884 = 1 };
+// kernel), LEGION_PREFILL_M884 (the m8n8k4 one-pass kernel, F16 caches) or LEGION_PREFILL_FFMA
+// (the FP32 FMA one-pass kernel, F16 caches, prefill launches without a split scratch). Set
+// for all threads (`this_thread` 0), M884 applies on sm_70 devices only, FFMA on sm_75 ones
+// only (the caller sets it for those without tensor cores), AUTO elsewhere (sm_75 lacks M884's
+// shared memory, sm_80+ would run m8n8k4 emulated). Set for the calling thread (`this_thread`
+// 1, tests), it applies on any GPU from sm_70. `this_thread` 2 (tests of the all-threads
+// choice): the calling thread reads `kernel` in place of the all-threads choice, with its
+// per-architecture limits, and the other threads keep theirs (-1 ends it).
+enum { LEGION_PREFILL_AUTO = 0, LEGION_PREFILL_M884 = 1, LEGION_PREFILL_FFMA = 2 };
 void legion_paged_attn_set_prefill(int kernel, int this_thread);
 
 // Prefill launches of the m8n8k4 kernel from the calling thread so far (tests).
 int64_t legion_paged_attn_m884_launches(void);
+
+// Prefill launches of the FP32 FMA kernel from the calling thread so far (tests).
+int64_t legion_paged_attn_ffma_launches(void);
 
 // Launches of the WMMA kernel's all-row split (vsplit, #1211) from the calling thread so far.
 int64_t legion_paged_attn_vsplit_launches(void);
@@ -155,12 +164,14 @@ int legion_paged_attn_piece(const legion_paged_attn * p, int32_t hbm_blocks, int
 
 }  // extern "C"
 
-// The prefill kernel choice and the m8n8k4 launch count (legion_paged_attn_set_prefill), one
-// copy for every translation unit: defined in dispatch.cu.
+// The prefill kernel choice and the m8n8k4 and FFMA launch counts (legion_paged_attn_set_prefill),
+// one copy for every translation unit: defined in dispatch.cu.
 namespace legion_paged {
 extern int g_prefill;
 extern thread_local int t_prefill;
+extern thread_local int t_prefill_all;
 extern thread_local int64_t t_m884_launches;
+extern thread_local int64_t t_ffma_launches;
 extern thread_local int64_t t_vsplit_launches;
 }  // namespace legion_paged
 
@@ -170,7 +181,9 @@ constexpr int BLK = 64;  // positions per KV block (KV_BLOCK on the Rust side)
 
 using legion_paged::g_prefill;
 using legion_paged::t_prefill;
+using legion_paged::t_prefill_all;
 using legion_paged::t_m884_launches;
+using legion_paged::t_ffma_launches;
 using legion_paged::t_vsplit_launches;
 
 // Whether the current device is sm_70 (cached per device).
@@ -178,12 +191,26 @@ bool device_is_sm70() {
     return legion_device::compute_capability() == 70;
 }
 
+// The all-threads prefill choice as the calling thread reads it (see
+// legion_paged_attn_set_prefill).
+int prefill_for_all() {
+    return t_prefill_all >= 0 ? t_prefill_all : __atomic_load_n(&g_prefill, __ATOMIC_RELAXED);
+}
+
 // Whether prefill launches take the m8n8k4 kernel (see legion_paged_attn_set_prefill).
 bool use_m884() {
     if (t_prefill >= 0) {
         return t_prefill == LEGION_PREFILL_M884;
     }
-    return __atomic_load_n(&g_prefill, __ATOMIC_RELAXED) == LEGION_PREFILL_M884 && device_is_sm70();
+    return prefill_for_all() == LEGION_PREFILL_M884 && device_is_sm70();
+}
+
+// Whether prefill launches take the FP32 FMA kernel (see legion_paged_attn_set_prefill).
+bool use_ffma() {
+    if (t_prefill >= 0) {
+        return t_prefill == LEGION_PREFILL_FFMA;
+    }
+    return prefill_for_all() == LEGION_PREFILL_FFMA && legion_device::compute_capability() == 75;
 }
 
 // The first cell of the block holding positions b * BLK .. of a sequence whose table is `tab`.
@@ -804,6 +831,9 @@ __global__ void __launch_bounds__(256) paged_prefill(const legion_paged_attn p) 
 // Prefill on sm_70 (Volta): mma.sync m8n8k4, namespace v70.
 #include "../sm70/paged_attn.cuh"
 
+// Prefill on Turing without tensor cores: FP32 FMAs, namespace tu75 (#1214).
+#include "../sm75/paged_attn.cuh"
+
 // The WMMA kernel's last-token rows split over the key blocks, namespace split (#436).
 #include "../sm70/paged_split.cuh"
 
@@ -822,6 +852,11 @@ int launch(const legion_paged_attn & p, cudaStream_t st) {
                                   : -1;
                rc >= 0) {
         return rc;
+    } else if (const int rc = use_ffma() && p.k_type == LEGION_KV_F16 && p.v_type == LEGION_KV_F16 && !p.split
+                                  ? tu75::launch<D, G, C>(p, st)
+                                  : -1;
+               rc >= 0) {
+        return rc;  // -1: Q's rows unaligned, the default kernels instead
     } else if (fa::available()) {
         // A split scratch (--paged-verify-split): small groups split over the key blocks.
         if (p.max_split > 1 && !p.piece_blk && !p.ml) {

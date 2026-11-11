@@ -855,7 +855,7 @@ impl Linear {
         if self.fp8.contains(name) || w.ty() != types::NVFP4 || w.is_host() {
             return false;
         }
-        self.w4a16(name, w, scale, n) || (n <= NVFP4_GGML_MAX_N && !super::nvfp4_once::on())
+        self.w4a16(name, w, scale, n) || (n <= NVFP4_GGML_MAX_N && !super::nvfp4_once::on(w))
     }
 }
 

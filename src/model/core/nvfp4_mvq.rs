@@ -137,18 +137,31 @@ pub fn gpu_takes(cc: Option<(i32, i32)>) -> bool {
     cc.is_some_and(|(major, _)| major == 12)
 }
 
-fn on() -> bool {
-    ON.load(Ordering::Relaxed) && GPU.load(Ordering::Relaxed) && cfg!(feature = "cuda")
+/// Whether the GPU of device `dev` (the weight's) takes the op, asked per device (#1201: a box
+/// may hold GPUs of different architectures); the engine's answer where `dev` is unknown.
+fn gpu_for(dev: Option<usize>) -> bool {
+    gpu_for_by(dev, GPU.load(Ordering::Relaxed), crate::hw::per_device::cc)
+}
+
+/// [`gpu_for`] with the engine's answer `engine` and the compute capabilities `cc_of` gives.
+fn gpu_for_by(
+    dev: Option<usize>,
+    engine: bool,
+    cc_of: impl FnOnce(usize) -> Option<(i32, i32)>,
+) -> bool {
+    crate::hw::per_device::pick_by(dev, engine, gpu_takes, cc_of)
 }
 
 /// Whether [`super::linear::Linear::mul_mat`] takes `w @ x` times `scale` on the op: switched
-/// on, a 12.x GPU whose code here has the FP4 conversions, [`MIN_N`]..=[`MAX_N`] columns and
-/// [`fits`].
+/// on, [`MIN_N`]..=[`MAX_N`] columns, [`fits`], and the weight on a 12.x GPU ([`gpu_for`])
+/// whose code here has the FP4 conversions.
 pub fn takes(w: Tensor<'_>, x: Tensor<'_>, scale: Option<Tensor<'_>>) -> bool {
-    on() && (MIN_N..=MAX_N).contains(&x.ne()[1])
+    ON.load(Ordering::Relaxed)
+        && cfg!(feature = "cuda")
+        && (MIN_N..=MAX_N).contains(&x.ne()[1])
         && fits(w, x, scale)
         && w.cuda_device()
-            .is_some_and(crate::model::nvfp4_a4::supported_on)
+            .is_some_and(|dev| gpu_for(Some(dev)) && crate::model::nvfp4_a4::supported_on(dev))
 }
 
 /// Whether the op can compute `w @ x` (times `scale`) with ggml's MMVQ bits: a 2D NVFP4 weight

@@ -1676,3 +1676,35 @@ fn a_deferred_reduce_scatter_reader_is_captured() {
         assert!(safe(), "a deferred reduce-scatter");
     }
 }
+
+#[test]
+fn each_gpu_of_a_mixed_box_answers_for_itself() {
+    use crate::hw::per_device::test_cc;
+    for engine in [false, true] {
+        // The F16 `xn`: the V100 only; the BF16 one: the sm_80+ GPUs. Whatever the engine's GPU.
+        let xn16: Vec<bool> = (0..6)
+            .map(|d| gpu_for_by(Some(d), engine, xn16_takes, true, test_cc))
+            .collect();
+        assert_eq!(
+            xn16,
+            [false, false, true, false, false, false],
+            "engine {engine}"
+        );
+        let xnb: Vec<bool> = (0..6)
+            .map(|d| gpu_for_by(Some(d), engine, xnb_takes, true, test_cc))
+            .collect();
+        assert_eq!(
+            xnb,
+            [true, true, false, true, true, false],
+            "engine {engine}"
+        );
+        // A changed cuBLAS compute type keeps ggml's conversion on every GPU.
+        for d in 0..6 {
+            assert!(!gpu_for_by(Some(d), engine, xn16_takes, false, test_cc));
+            assert!(!gpu_for_by(Some(d), engine, xnb_takes, false, test_cc));
+        }
+        // A weight that names no device: the engine's answer.
+        assert_eq!(gpu_for_by(None, engine, xn16_takes, true, test_cc), engine);
+        assert_eq!(gpu_for_by(None, engine, xnb_takes, false, test_cc), engine);
+    }
+}
