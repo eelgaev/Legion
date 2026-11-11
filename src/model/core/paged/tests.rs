@@ -52,6 +52,15 @@ pub(super) fn f16_bytes(v: &[f32]) -> Vec<u8> {
     h.iter().flat_map(|x| x.to_ne_bytes()).collect()
 }
 
+/// The largest |a - b|, or NaN if any difference is NaN: `f32::max` skips a NaN, so a fold
+/// with it would let an all-NaN output pass as a difference of 0.
+pub(super) fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0f32, |m, e| if e.is_nan() || e > m { e } else { m })
+}
+
 pub(super) struct Shape {
     pub(super) d: usize,
     pub(super) n_head: usize,
@@ -241,12 +250,7 @@ fn check_with(
 
     let (a, b) = (paged.to_f32(), gathered.to_f32());
     assert_eq!(a.len(), b.len());
-    let max_diff = |x: &[f32], y: &[f32]| {
-        x.iter()
-            .zip(y)
-            .map(|(x, y)| (x - y).abs())
-            .fold(0f32, f32::max)
-    };
+    let max_diff = max_abs_diff;
 
     let shape = Shape {
         d: d as usize,
@@ -601,11 +605,7 @@ pub(super) fn cuda_check_with(
     let want = oracle(&sh, &qv, &kdat, &vdat, n_past, tables);
     let got = out.to_f32();
     assert_eq!(got.len(), want.len());
-    let max_diff = got
-        .iter()
-        .zip(&want)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0f32, f32::max);
+    let max_diff = max_abs_diff(&got, &want);
     println!(
         "d {d}, heads {n_head}/{n_head_kv}, {n_tok} tokens, window {window}: max |diff| \
          {max_diff:.2e}"

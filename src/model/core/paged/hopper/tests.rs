@@ -202,7 +202,7 @@ fn off_by_default() {
 mod gpu {
     use super::super::super::ring_tests::{ring_case, seams};
     use super::super::super::tests::{
-        cuda_long_context, cuda_prefill_edges, f16_bytes, hparams, noise,
+        cuda_long_context, cuda_prefill_edges, f16_bytes, hparams, max_abs_diff, noise,
     };
     use super::super::super::*;
     use super::super::{launches, set_enabled_here};
@@ -395,11 +395,7 @@ mod gpu {
                     window,
                 );
                 assert!(launches() > before, "the Hopper kernel did not run");
-                let max_diff = got
-                    .iter()
-                    .zip(&want)
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0f32, f32::max);
+                let max_diff = max_abs_diff(&got, &want);
                 println!(
                     "d {d}, heads {n_head}/{n_head_kv}, {n_tok} tokens, window {window}: max \
                      |hopper - default| {max_diff:.2e}"
