@@ -19,11 +19,29 @@ mod tests;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct PleAhead {
     held: Option<(Vec<i32>, Vec<f32>)>,
+    /// The values a fill wrote, kept for the next gather to write into (#1183): a new ~40 MB
+    /// vector per 4,096-token step faulted all its pages in again, and freeing it unmapped them.
+    spare: Vec<f32>,
     /// Fills that took held values.
     hits: u64,
 }
 
 impl PleAhead {
+    /// A vector of `n` values to gather into: the spare one when there is one (its old values
+    /// left in it, for the gather to overwrite).
+    pub(crate) fn buffer(&mut self, n: usize) -> Vec<f32> {
+        let mut v = std::mem::take(&mut self.spare);
+        v.resize(n, 0.0);
+        v
+    }
+
+    /// Keeps `values` (written) as the spare vector for [`Self::buffer`].
+    pub(crate) fn recycle(&mut self, values: Vec<f32>) {
+        if values.capacity() >= self.spare.capacity() {
+            self.spare = values;
+        }
+    }
+
     /// Holds `values`, the gather of `rows`, for the next fill (replacing any held ones).
     pub(crate) fn put(&mut self, rows: Vec<i32>, values: Vec<f32>) {
         self.held = Some((rows, values));

@@ -21,6 +21,24 @@ fn held_values_go_to_the_same_rows_only() {
     assert_eq!(a.hits(), 2);
 }
 
+#[test]
+fn recycled_values_are_the_next_buffer() {
+    let mut a = PleAhead::default();
+    assert_eq!(a.buffer(3), vec![0.0; 3]);
+    let v = vec![1.0f32; 1000];
+    let at = v.as_ptr();
+    a.recycle(v);
+    // The same allocation, at the asked length.
+    let b = a.buffer(500);
+    assert_eq!((b.len(), b.as_ptr()), (500, at));
+    // A smaller one does not replace a bigger spare.
+    a.recycle(b);
+    a.recycle(vec![2.0; 10]);
+    assert_eq!(a.buffer(1000).as_ptr(), at);
+    // Taken: the next one is new.
+    assert_eq!(a.buffer(2), vec![0.0; 2]);
+}
+
 /// The tiny qwen4exp over two CPU stages, the per-layer n-gram embedding in the first, a
 /// prompt in micro-chunks: rounds of both stages gather the next micro-chunk's rows ahead,
 /// and the logits are bit-identical to the same steps without it.

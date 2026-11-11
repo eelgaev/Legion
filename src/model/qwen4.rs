@@ -1694,7 +1694,25 @@ impl Model {
             .unwrap_or_else(|e| e.into_inner())
             .take(&rows);
         match ahead {
-            Some(values) => sink.f32(t, &values),
+            // Through the sink's pinned memory too, and the vector kept for the next gather:
+            // with a new pageable vector per step the ~40 MB fill of a prompt step took ~39 ms
+            // instead of ~4 on about a third of the GB10's steps (#1183).
+            Some(values) => {
+                let t0 = std::time::Instant::now();
+                sink.f32_with(t, values.len(), &mut |out| out.copy_from_slice(&values));
+                self.ple_ahead
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .recycle(values);
+                if rows.len() >= PLE_LOG_ROWS {
+                    tracing::debug!(
+                        rows = rows.len(),
+                        hash_ms = hashed.as_secs_f64() * 1e3,
+                        set_ms = t0.elapsed().as_secs_f64() * 1e3,
+                        "ple fill ahead"
+                    );
+                }
+            }
             None => {
                 // Straight into the sink's pinned memory where it has some (a prompt step's
                 // ~40 MB per 4,096 tokens, #1183): no new vector to fault in, no pageable copy.
@@ -1732,11 +1750,10 @@ impl Model {
         }
         // The history the fill's `push_tokens` will return: the fill before it already ran.
         let rows = ngram_rows(ple, groups, |_, slot, _| rec.peek_tokens(slot));
-        let values = self.gather_ple(&rows);
-        self.ple_ahead
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .put(rows, values);
+        let ahead = || self.ple_ahead.lock().unwrap_or_else(|e| e.into_inner());
+        let mut values = ahead().buffer(rows.len() * ple.head_dim as usize);
+        self.gather_ple_into(&rows, None, &mut values);
+        ahead().put(rows, values);
     }
 
     /// Fills so far that wrote rows gathered ahead ([`Self::gather_ple_ahead`]).
