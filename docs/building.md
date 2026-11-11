@@ -108,8 +108,10 @@ CMAKE_CUDA_ARCHITECTURES="120;121" cargo build --release --features cuda
   rows a CTA where 64 do not fit (head size 512, Gemma 4's global layers), with the same bits.
 - GTX 16 cards (TU11x) have no tensor cores, but the WMMA and ggml's MMA kernels still run on them
   (checked on a GTX 1660 Ti), slowly: int8 MMA runs at about a seventh of dp4a's rate there. Prompt
-  matmuls of Q4_K, Q5_K, Q6_K and Q8_0 weights run on Legion's dp4a op instead, with ggml's bits,
-  where ggml gives every CTA a whole tile (`--tu-mmq-ggml` keeps ggml's MMQ).
+  matmuls of Q4_K, Q5_K, Q6_K and Q8_0 weights run on Legion's dp4a op instead, with ggml's bits
+  (`--tu-mmq-ggml` keeps ggml's MMQ). `--tu-attn-ffma` runs prompt attention on FP32 FMAs
+  instead of the WMMA kernel (3.3x faster attention there, an 8K-token Qwen3.5-4B prompt
+  15.3 -> 10.7 s; not the default's bits, so opt-in).
 - Quantized KV caches need compute capability 8.0+, as on the V100.
 
 ```sh

@@ -898,3 +898,19 @@ fn ngram_ram_flag() {
         assert!(Cli::try_parse_from(argv).is_err(), "{bad}");
     }
 }
+
+#[test]
+fn tu_attn_ffma_flag() {
+    let model = |argv: &[&str]| {
+        let argv = ["legion", "serve"].into_iter().chain(argv.iter().copied());
+        match Cli::try_parse_from(argv).unwrap().command {
+            Command::Serve(args) => args.engine.model.tu_attn_ffma,
+            _ => unreachable!("the parser returned a command other than serve"),
+        }
+    };
+    assert!(!model(&[]));
+    assert!(model(&["--tu-attn-ffma"]));
+    assert!(
+        !legion::engine::lm::LmConfig::new("m", legion::engine::lm::DeviceChoice::Cpu).tu_attn_ffma
+    );
+}

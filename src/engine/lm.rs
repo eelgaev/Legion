@@ -1133,6 +1133,10 @@ pub struct LmConfig {
     /// differs from the default by rounding order (P rounded to F16 against the running max,
     /// one pass, 64-wide MMA chains against WMMA's 16-wide).
     pub paged_prefill_m884: bool,
+    /// Prompt attention on Turing GPUs without tensor cores through the one-pass FP32 FMA
+    /// kernel instead of the WMMA one (other GPUs keep their default). Greedy output can differ
+    /// from the default (no F16 rounding of Q and P, one pass, another summation order).
+    pub tu_attn_ffma: bool,
     /// qwen4exp prompt steps: ggml's indexer chain (pool mask, lightning indexer, bias add)
     /// instead of Legion's one-op scores (the same bits), for comparisons.
     pub qsa_scores_ggml: bool,
@@ -1421,6 +1425,7 @@ impl LmConfig {
             glm_route_bias: 0.0,
             glm_prune: None,
             paged_prefill_m884: false,
+            tu_attn_ffma: false,
             long_prompts: LongPrompts::default(),
             swa_full: false,
             swa_ring: false,
@@ -3962,6 +3967,11 @@ impl LmEngine {
             .and_then(cuda_index)
             .is_some_and(crate::hw::per_device::turing_without_tensor_cores);
         crate::model::tu_mmq::set_gpu(if tu11x { caps.map_or(0, |c| c.2) } else { 0 });
+        if tu11x && cfg.tu_attn_ffma {
+            // After set_m884_prefill above (one prefill choice for the process; m8n8k4 is
+            // sm_70's).
+            crate::model::core::paged::set_ffma_prefill(true);
+        }
         let mma16 = device.is_some() && crate::model::moe_ffn::mma16();
         let moe_kernel = resolve_moe_kernel(cfg.moe_kernel, mode, integrated, cc_major, mma16);
         if moe_kernel != cfg.moe_kernel {

@@ -10,7 +10,10 @@
 //! quantization of the input, ggml's tile loader for the weight, the chunks' exact int dots,
 //! and ggml's float operations on them in ggml's order. That chain is an output's whole value
 //! where ggml's stream-k grid gives every CTA one whole tile (no partial sums to add up:
-//! [`ggml_unsplit`]), so the op takes only those plans; the others stay on ggml's MMQ. The same
+//! [`ggml_unsplit`]). Where ggml splits the tiles' K blocks over its SMs instead (short prompt
+//! chunks, 1024-row K/V projections), the op runs ggml's stream-k grid itself: the same runs of
+//! K blocks per CTA and ggml's fixup, which adds the parts in ggml's order ([`plan`]; for
+//! ggml's 128-column tiles only, [`ggml_tile_width`]); other plans stay on ggml's MMQ. The same
 //! bits, so it is on by default on these GPUs (`legion serve --tu-mmq-ggml` keeps ggml's MMQ).
 //!
 //! The node is ggml's `mul_mat`'s shape (`[rows, n]` F32, the input and the weight its sources).
@@ -54,6 +57,12 @@ const Q8_1_MMQ_VALUES: i64 = 128;
 
 /// Bytes of the quantized input the scratch holds.
 pub const MAX_QUANT_BYTES: usize = 16 << 20;
+
+/// Most SMs a stream-k plan runs on (the fixup scratch holds a 128 x 128 tile per SM).
+pub const MAX_STREAM_K_SMS: i64 = 64;
+
+/// Bytes of the stream-k fixup scratch: a 128 x 128 F32 tile per CTA.
+const FIXUP_BYTES: usize = MAX_STREAM_K_SMS as usize * (TILE_ROWS * TILE_ROWS) as usize * 4;
 
 /// ggml-cuda's MMQ tile widths for rows a multiple of 128 (`mmq-config-ampere.cuh`, which
 /// compute capability 7.5 takes, the same for the four types).
@@ -126,6 +135,22 @@ pub fn ggml_unsplit(rows: i64, n: i64, sms: i64) -> bool {
     100 * ntiles / (sms * waves) >= 90
 }
 
+/// How the op runs `rows` times `n` columns on `sms` SMs: `(tile width, stream_k)`. Where
+/// ggml runs the plan unsplit, a CTA per tile of [`tile_width`] (the chains don't depend on the
+/// tiling); else ggml's stream-k grid of `sms` CTAs on its 128-column tiles, which only mirrors
+/// ggml where ggml's tiles are 128 wide (`None` otherwise, or past [`MAX_STREAM_K_SMS`]).
+pub fn plan(rows: i64, n: i64, sms: i64) -> Option<(i64, bool)> {
+    if sms <= 0 {
+        None
+    } else if ggml_unsplit(rows, n, sms) {
+        Some((tile_width(rows, n, sms), false))
+    } else if ggml_tile_width(n) == TILE_ROWS && sms <= MAX_STREAM_K_SMS {
+        Some((TILE_ROWS, true))
+    } else {
+        None
+    }
+}
+
 /// The op's tile width for `rows` times `n` columns on `sms` SMs: 128 or 64 columns, the one
 /// with the fewest column-waves (waves of CTAs times the width), 128 on a tie.
 pub fn tile_width(rows: i64, n: i64, sms: i64) -> i64 {
@@ -182,7 +207,7 @@ pub fn takes(w: Tensor<'_>, x: Tensor<'_>) -> bool {
 
 /// [`takes`] on shapes: a Q4_K, Q5_K, Q6_K or Q8_0 weight `[k, rows]` with contiguous rows,
 /// `k` a multiple of 256 and `rows` of 128; an F32 `x` `[k, n]`, [`MIN_TOKENS`] to
-/// [`MAX_TOKENS`] columns, contiguous values; a plan ggml runs unsplit on `sms` SMs; at most
+/// [`MAX_TOKENS`] columns, contiguous values; a [`plan`] on `sms` SMs; at most
 /// [`MAX_QUANT_BYTES`] of quantized input.
 pub fn fits(
     w: (ffi::ggml_type, [i64; 4], [usize; 4]),
@@ -211,9 +236,7 @@ pub fn fits(
         && xnb[0] == 4
         && xnb[1] % 4 == 0
         && (MIN_TOKENS..=MAX_TOKENS).contains(&n)
-        && sms > 0
-        && ggml_unsplit(rows, n, sms)
-        && quant_bytes(k, n, tile_width(rows, n, sms)) <= MAX_QUANT_BYTES
+        && plan(rows, n, sms).is_some_and(|(j, _)| quant_bytes(k, n, j) <= MAX_QUANT_BYTES)
 }
 
 /// `w @ x` (see [`takes`]) on the op: F32 `[rows, n]`, ggml's `mul_mat`'s shape, with its bits.
@@ -229,12 +252,13 @@ pub fn mul_mat_sms<'a>(ctx: &'a Context, w: Tensor<'a>, x: Tensor<'a>, sms: i64)
         "tu_mmq: shapes"
     );
     let (rows, n) = (w.ne()[1], x.ne()[1]);
+    let (j, stream_k) = plan(rows, n, sms).expect("tu_mmq: plan");
     ctx.external_with(
         &TU_MMQ,
         types::F32,
         [rows, n, 1, 1],
         &[x, w],
-        &[tile_width(rows, n, sms) as i32],
+        &[j as i32, i32::from(stream_k), sms as i32],
     )
 }
 
@@ -273,6 +297,7 @@ mod cuda {
         x: *const f32,
         yq: *mut c_void,
         dst: *mut f32,
+        fixup: *mut f32,
         x_ld: i64,
         dst_ld: i64,
         w_ld: i32,
@@ -291,8 +316,8 @@ mod cuda {
     }
 
     /// Kernels in `legion_tu_mmq_kernels`: the quantization (D4, DS4), then per weight type
-    /// the matmul with tiles 128 and 64 columns wide.
-    const KERNELS: usize = 10;
+    /// the matmul with tiles 128 and 64 columns wide, the stream-k matmul and its fixup.
+    const KERNELS: usize = 18;
 
     unsafe extern "C" {
         static legion_tu_mmq_kernels: [*const c_void; KERNELS];
@@ -320,8 +345,9 @@ mod cuda {
         [const { [const { AtomicI8::new(0) }; KERNELS] }; DEVICES];
 
     /// The quantized input of each (device, stream), allocated on first use at
-    /// [`MAX_QUANT_BYTES`] and kept: graphs captured with the pointer replay it. Ops on one
-    /// stream run one after the other, so they share it as ggml's MMQ shares its pool.
+    /// [`MAX_QUANT_BYTES`] (then the stream-k fixup's [`FIXUP_BYTES`]) and kept: graphs
+    /// captured with the pointer replay it. Ops on one stream run one after the other, so they
+    /// share it as ggml's MMQ shares its pool.
     static SCRATCH: Mutex<Option<HashMap<(c_int, usize), usize>>> = Mutex::new(None);
 
     fn scratch(dev: c_int, stream: *mut c_void) -> Result<usize, String> {
@@ -332,10 +358,13 @@ mod cuda {
         }
         let mut q = std::ptr::null_mut();
         // SAFETY: a plain allocation on the current device.
-        if unsafe { cudaMalloc(&mut q, MAX_QUANT_BYTES) } != 0 {
+        if unsafe { cudaMalloc(&mut q, MAX_QUANT_BYTES + FIXUP_BYTES) } != 0 {
             // SAFETY: clears the error the failed call left.
             unsafe { cudaGetLastError() };
-            return Err(format!("tu_mmq: cudaMalloc of {MAX_QUANT_BYTES} bytes"));
+            return Err(format!(
+                "tu_mmq: cudaMalloc of {} bytes",
+                MAX_QUANT_BYTES + FIXUP_BYTES
+            ));
         }
         map.insert((dev, stream as usize), q as usize);
         Ok(q as usize)
@@ -404,7 +433,8 @@ mod cuda {
         // stream's device, the current one.
         unsafe {
             let (x, w) = (&*dst.src[0], &*dst.src[1]);
-            let j = crate::ggml::external_params(dst)[0] as i64;
+            let params = crate::ggml::external_params(dst);
+            let (j, stream_k, sms) = (params[0] as i64, params[1] != 0, params[2] as u32);
             let mut dev: c_int = 0;
             if cudaGetDevice(&mut dev) != 0 || !(0..DEVICES as c_int).contains(&dev) {
                 return Err("tu_mmq: no current device".into());
@@ -418,6 +448,7 @@ mod cuda {
                 x: x.data as *const f32,
                 yq: yq as *mut c_void,
                 dst: dst.data as *mut f32,
+                fixup: (yq + MAX_QUANT_BYTES) as *mut f32,
                 x_ld: (x.nb[1] / 4) as i64,
                 dst_ld: (dst.nb[1] / 4) as i64,
                 w_ld: (w.nb[1] / bytes) as i32,
@@ -440,16 +471,29 @@ mod cuda {
                 &mut a,
                 stream,
             )?;
-            let kernel = 2 + 2 * type_index(w.type_) + (j == 64) as usize;
+            let base = 2 + 4 * type_index(w.type_);
+            let kernel = base + if stream_k { 2 } else { (j == 64) as usize };
             let shared = smem(j);
             opt_in(dev, kernel, shared)?;
+            let block = Dim3 { x: 32, y: 8, z: 1 };
+            if !stream_k {
+                let grid = Dim3 {
+                    x: (rows / TILE_ROWS) as u32,
+                    y: (n_pad / j) as u32,
+                    z: 1,
+                };
+                return launch(kernel, grid, block, shared, &mut a, stream);
+            }
+            // ggml's stream-k grid: a CTA per SM, then the fixup (a CTA per SM and 32 rows).
+            let grid = Dim3 { x: sms, y: 1, z: 1 };
+            launch(kernel, grid, block, shared, &mut a, stream)?;
             let grid = Dim3 {
-                x: (rows / TILE_ROWS) as u32,
-                y: (n_pad / j) as u32,
+                x: sms,
+                y: (TILE_ROWS / 32) as u32,
                 z: 1,
             };
-            let block = Dim3 { x: 32, y: 8, z: 1 };
-            launch(kernel, grid, block, shared, &mut a, stream)
+            let block = Dim3 { x: 32, y: 4, z: 1 };
+            launch(base + 3, grid, block, 0, &mut a, stream)
         }
     }
 }
