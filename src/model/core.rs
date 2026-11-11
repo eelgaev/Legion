@@ -39,7 +39,7 @@ pub use gdn::set_gdn;
 pub use gdn::set_gdn_decode;
 pub use gdn::set_gdn_pad_skip;
 pub use gdn::set_gdn_replay_staged;
-pub use gdn_mma::set_gdn_mma;
+pub use gdn_mma::{set_gdn_mma, set_gdn_staged};
 pub use gdn_scan::set_gdn_scan;
 pub(crate) use graph_size::graph_size;
 pub use norm_rope::{set_kv_append, set_norm_rope};

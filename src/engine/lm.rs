@@ -3981,7 +3981,7 @@ impl LmEngine {
         // same bits)
         crate::model::glm5next::ops::set_q6k_f16(cc_major.is_some_and(|m| m >= 8));
         crate::model::core::gdn_scan::set_gpu(cc_major);
-        crate::model::core::gdn_mma::set_gpu(cc_major);
+        crate::model::core::gdn_mma::set_gpu(cc);
         crate::model::core::gdn::set_gpu(cc_major);
         crate::model::qwen4::set_xn16_gpu(cc);
         crate::model::core::mmq_preq::set_gpu(cc_major);

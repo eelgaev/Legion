@@ -26,6 +26,9 @@ pub struct Switches {
     /// Gated DeltaNet prompt steps whose head counts ggml-cuda keeps on its per-token kernel (a
     /// tensor parallel rank's share) on its chunked kernel ([`crate::model::core::set_gdn_mma`]).
     pub gdn_mma: Option<bool>,
+    /// Gated DeltaNet prompt groups' whole-head chunked kernel staged through shared memory
+    /// ([`crate::model::core::set_gdn_staged`]).
+    pub gdn_staged: Option<bool>,
     /// Gated DeltaNet verify and commit steps' delta rule as Legion's op
     /// ([`crate::model::core::set_gdn`]).
     pub gdn: Option<bool>,
@@ -534,6 +537,7 @@ impl Switches {
         set(self.delta_prep, core::set_delta_prep);
         set(self.gdn_scan, core::set_gdn_scan);
         set(self.gdn_mma, core::set_gdn_mma);
+        set(self.gdn_staged, core::set_gdn_staged);
         set(self.gdn, core::set_gdn);
         set(self.gdn_decode, core::set_gdn_decode);
         set(self.gdn_replay_staged, core::set_gdn_replay_staged);

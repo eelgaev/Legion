@@ -57,6 +57,16 @@ pub(in crate::cli) struct SwitchArgs {
     /// tok/s, 32K 2,493/2,503 -> 2,590/2,600; TP+MTP 32K 2,432/2,447 -> 2,510/2,513).
     #[arg(long, help_heading = HEADING)]
     gdn_mma: bool,
+    /// CUDA, gated DeltaNet layers, prompt groups of 64+ tokens that run a chunked kernel with
+    /// one CTA per head: ggml-cuda's chunked kernel for the groups it runs itself, and Legion's
+    /// port of it for the groups --gdn-mma brings, instead of Legion's staged one (the default:
+    /// the same arithmetic and bits; the next
+    /// chunk's inputs are copied into shared memory while the current one computes, and the
+    /// state's MMA operands come from registers; on a DGX Spark (GB10) a Qwen3.8-Flash-Next layer
+    /// of 4K prompt tokens takes 1.45 ms instead of 2.41). The default takes ggml-cuda's own
+    /// groups on compute capability 12.0 and 12.1 only. For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    gdn_prompt_ggml: bool,
     /// CUDA, gated DeltaNet layers in MTP verify and commit steps: ggml's gated_delta_net
     /// instead of Legion's op (the default: the same bits; the verify step skips the final
     /// states it never reads, the commit writes them in place instead of computing the rows and
@@ -1414,6 +1424,7 @@ impl SwitchArgs {
             delta_prep: self.delta_prep_ggml.then_some(false),
             gdn_scan: self.gdn_scan_ggml.then_some(false),
             gdn_mma: self.gdn_mma.then_some(true),
+            gdn_staged: self.gdn_prompt_ggml.then_some(false),
             gdn: self.gdn_ggml.then_some(false),
             gdn_decode: self.gdn_decode_ggml.then_some(false),
             gdn_replay_staged: self.gdn_replay_smem.then_some(true),

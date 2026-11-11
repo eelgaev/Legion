@@ -6,7 +6,9 @@
 use super::*;
 use crate::ggml::{Backend, ComputeAllocator};
 
+mod prompt;
 mod replay;
+pub use prompt::{PROMPT_KERNELS, PromptRow, run_prompt};
 pub use replay::{REPLAY_VARIANTS, REPLAY_VERIFY, ReplayRow, run_replay};
 
 /// The kernel variants compared (`src/cuda/gdn.cu`'s `GDN_DECODE_*` bits), the default (-1) first.
