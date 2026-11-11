@@ -37,15 +37,8 @@ pub struct PagedQmBenchArgs {
 pub fn run(args: PagedQmBenchArgs) -> anyhow::Result<()> {
     use legion::model::core::paged_qm_bench as bench;
     use legion::model::core::paged_split_bench::{Group, pool};
-    let mut gpu = legion::ggml::backend_by_name("CUDA0")?;
-    let mut differ = 0;
-    if !args.no_edges {
-        let (cases, ran, total, bad) = bench::edges(&mut gpu);
-        println!(
-            "edges: {cases} cases ({ran} on the queries-as-M kernel), {bad} of {total} values differ"
-        );
-        differ += bad;
-    }
+    // Bad arguments fail before the edge cases run.
+    anyhow::ensure!(args.reps > 0, "--reps takes 1 or more timed runs");
     let [n_head, n_head_kv] = args.heads[..] else {
         anyhow::bail!("--heads takes query heads, kv heads");
     };
@@ -56,6 +49,15 @@ pub fn run(args: PagedQmBenchArgs) -> anyhow::Result<()> {
             .split_once(':')
             .ok_or_else(|| anyhow::anyhow!("--chunks takes n_past:n_tok, not {c}"))?;
         chunks.push((p.trim().parse::<usize>()?, t.trim().parse::<usize>()?));
+    }
+    let mut gpu = legion::ggml::backend_by_name("CUDA0")?;
+    let mut differ = 0;
+    if !args.no_edges {
+        let (cases, ran, total, bad) = bench::edges(&mut gpu);
+        println!(
+            "edges: {cases} cases ({ran} on the queries-as-M kernel), {bad} of {total} values differ"
+        );
+        differ += bad;
     }
     let max_ctx = chunks.iter().map(|(p, t)| p + t).max().unwrap_or(0);
     let n_blocks = max_ctx.div_ceil(64).max(1);
