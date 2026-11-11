@@ -131,7 +131,7 @@ impl Model {
             w("post_attention_norm.weight")?,
         );
         let ffn = if hp.moe {
-            self.moe(ctx, &pass.tap, &pass.graph, il, x, n)?
+            self.moe(ctx, &pass.tap, &pass.graph, il, x, n, pass.verify())?
         } else {
             self.ffn(ctx, il, x)?
         };
