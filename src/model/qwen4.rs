@@ -1406,7 +1406,7 @@ impl Model {
                 Some(ffn) => ffn,
                 None => {
                     let rows = self.qwen4().moe_rows(pass);
-                    self.moe_rows(ctx, tap, &pass.graph, il, h, n, rows)?
+                    self.moe_rows(ctx, tap, &pass.graph, il, h, n, rows, pass.prompt_only())?
                 }
             };
             let ffn = self.tp_sum_split(ctx, ffn, sp.filter(|_| split));

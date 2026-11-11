@@ -1451,6 +1451,13 @@ pub struct Pass<'a> {
 }
 
 impl<'a> Pass<'a> {
+    /// Whether every group of this pass is a prompt step: more than one token per sequence and
+    /// no speculative verify ([`GroupShape::verify`]). Decode and verify groups, also in a
+    /// mixed pass, make it false.
+    pub(crate) fn prompt_only(&self) -> bool {
+        self.shape.iter().all(|g| !g.verify && g.n_tok > 1)
+    }
+
     /// The cells this step's tokens take in layer `il`'s cache: their ring cells if it is a
     /// ring ([`KvRing`]).
     pub(crate) fn write_cells(&self, il: usize) -> Tensor<'a> {
@@ -4017,8 +4024,9 @@ impl Model {
         il: usize,
         h: Tensor<'a>,
         n: i64,
+        prompt: bool,
     ) -> Result<Tensor<'a>, ModelError> {
-        self.moe_rows(ctx, tap, graph, il, h, n, None)
+        self.moe_rows(ctx, tap, graph, il, h, n, None, prompt)
     }
 
     /// [`Self::moe`] with a verify step's row map (I32 `[n]`, [`pad_rows::map`]): Legion's
@@ -4027,6 +4035,9 @@ impl Model {
     /// Legion's expert matvec over an expert cache with `--moe-pad-remap-tiered` (opt-in, not
     /// byte-identical end to end). With `--moe-pad-skip-tiered` (opt-in) that matvec skips the
     /// padding rows' pairs of experts no real row chose instead (`pad_rows::skip_tiered`).
+    /// `prompt` ([`Pass::prompt_only`]): every group of the pass is a prompt step, the only
+    /// passes `--nvfp4-expert-rows-bf16` gives BF16 expert rows (decode and verify rows stay
+    /// F32, #1183).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn moe_rows<'a>(
         &'a self,
@@ -4037,6 +4048,7 @@ impl Model {
         h: Tensor<'a>,
         n: i64,
         rows: Option<Tensor<'a>>,
+        prompt: bool,
     ) -> Result<Tensor<'a>, ModelError> {
         let hp = &self.hp;
         let used = hp.n_expert_used;
@@ -4126,7 +4138,8 @@ impl Model {
         } else {
             // With `--nvfp4-once` the top-k kernel also writes the routing plan of the NVFP4
             // expert ops (#836), which then launch without building one.
-            let plan = ep.is_none() && self.experts.is_none() && nvfp4_once::plan_fits(used, n);
+            let plan =
+                ep.is_none() && self.experts.is_none() && nvfp4_once::plan_fits(gate_w, used, n);
             // Joined top-k and weights (#814): the weights go into the graph below, before
             // the experts pull the ids in (not with `--decode-fuse`, which adds the ids).
             fused::router_planned(ctx, logits, used, plan, !df)
@@ -4459,7 +4472,9 @@ impl Model {
                     let l = &self.linear;
                     l.swiglu_ffn_id_skips(ctx, g, u, d, x, selected, rows)
                 } else {
-                    self.linear.swiglu_ffn_id(ctx, g, u, d, x, selected, rows)
+                    let bf16 = prompt && crate::model::nvfp4_mm::expert_rows_bf16(n);
+                    self.linear
+                        .swiglu_ffn_id(ctx, g, u, d, x, selected, rows, bf16)
                 }
             } {
                 Some(out)

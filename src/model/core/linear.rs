@@ -599,7 +599,9 @@ impl Linear {
     /// [`Nvfp4A4`] gives 4-bit activations take the grouped W4A4 SwiGLU
     /// ([`crate::model::nvfp4_a4::swiglu_id`], F32 out, the same bits as its unfused ops) and the
     /// W4A4 down matmul instead, at any batch size. `rows` (W4A16 only): a verify step's row map
-    /// ([`crate::model::core::pad_rows`]), which the plan of the pairs routes by.
+    /// ([`crate::model::core::pad_rows`]), which the plan of the pairs routes by. `bf16_rows`
+    /// (W4A16 only): the down matmul stores its per-pair rows as BF16, read back as F32
+    /// ([`crate::model::nvfp4_mm::expert_rows_bf16`]; prompt steps only, the caller decides).
     #[allow(clippy::too_many_arguments)]
     pub fn swiglu_ffn_id<'a>(
         &self,
@@ -610,8 +612,9 @@ impl Linear {
         x: Tensor<'a>,
         ids: Tensor<'a>,
         rows: Option<Tensor<'a>>,
+        bf16_rows: bool,
     ) -> Option<Tensor<'a>> {
-        use crate::model::nvfp4_mm::{mul_mat_id, swiglu_id_rows};
+        use crate::model::nvfp4_mm::{Act, mul_mat_id, mul_mat_id_act, swiglu_id_rows};
         let n = x.ne()[2];
         let m = gate.1.ne()[1];
         let shapes = gate.1.ne() == up.1.ne() && gate.1.nb() == up.1.nb() && down.1.ne()[0] == m;
@@ -628,6 +631,11 @@ impl Linear {
         };
         (shapes && fits(gate) && fits(up) && fits(down)).then(|| {
             let act = swiglu_id_rows(ctx, gate.1, up.1, x, ids, gate.2, up.2, rows);
+            if bf16_rows {
+                // BF16 per-pair rows, read back as F32 (#1183, opt-in).
+                let rows = mul_mat_id_act(ctx, down.1, act, ids, down.2, Act::Bf16);
+                return ctx.cast(rows, types::F32);
+            }
             mul_mat_id(ctx, down.1, act, ids, down.2)
         })
     }
@@ -847,7 +855,7 @@ impl Linear {
         if self.fp8.contains(name) || w.ty() != types::NVFP4 || w.is_host() {
             return false;
         }
-        self.w4a16(name, w, scale, n) || (n <= NVFP4_GGML_MAX_N && !super::nvfp4_once::on())
+        self.w4a16(name, w, scale, n) || (n <= NVFP4_GGML_MAX_N && !super::nvfp4_once::on(w))
     }
 }
 

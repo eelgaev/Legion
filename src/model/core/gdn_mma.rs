@@ -133,7 +133,8 @@ impl Schedule {
 static ON: AtomicBool = AtomicBool::new(false);
 
 /// Whether the engine's GPU has the kernel's tensor cores (compute capability 8.0 or later),
-/// set when the engine loads ([`set_gpu`]).
+/// set when the engine loads ([`set_gpu`]): the answer for a group whose state names no device
+/// ([`gpu_for`]).
 static GPU: AtomicBool = AtomicBool::new(false);
 
 /// Sets whether graphs built from now on use [`gdn_mma`] where it fits (off by default; `legion
@@ -143,16 +144,57 @@ pub fn set_gdn_mma(on: bool) {
 }
 
 /// The engine's GPU's compute capability (`cc`, major and minor): the kernel needs 8.0 or later,
-/// and the groups ggml-cuda keeps come here on 12.0 and 12.1 only ([`STAGED_GPU`]).
+/// and the groups ggml-cuda keeps come here on 12.0 and 12.1 only ([`STAGED_GPU`]). These are the
+/// answers for a group whose state names no device ([`gpu_for`], [`staged_for`]).
 pub fn set_gpu(cc: Option<(i32, i32)>) {
-    GPU.store(cc.is_some_and(|(m, _)| m >= 8), Ordering::Relaxed);
+    GPU.store(gpu_takes(cc.map(|c| c.0)), Ordering::Relaxed);
     STAGED_GPU.store(staged_gpu(cc), Ordering::Relaxed);
+}
+
+/// Whether a GPU of compute capability major `cc_major` has the kernel's tensor cores.
+pub(super) fn gpu_takes(cc_major: Option<i32>) -> bool {
+    cc_major.is_some_and(|m| m >= 8)
+}
+
+/// Whether the GPU of device `dev` (the state's) runs the kernel, asked per device (#1201: a box
+/// may hold GPUs of different architectures); the engine's answer where `dev` is unknown.
+fn gpu_for(dev: Option<usize>) -> bool {
+    gpu_for_by(dev, GPU.load(Ordering::Relaxed), crate::hw::per_device::cc)
+}
+
+/// [`gpu_for`] with the engine's answer `engine` and the compute capabilities `cc_of` gives.
+pub(super) fn gpu_for_by(
+    dev: Option<usize>,
+    engine: bool,
+    cc_of: impl FnOnce(usize) -> Option<(i32, i32)>,
+) -> bool {
+    crate::hw::per_device::pick_by(dev, engine, |cc| gpu_takes(cc.map(|c| c.0)), cc_of)
 }
 
 /// Compute capability 12.0 (RTX 50) and 12.1 (the GB10): the consumer Blackwell GPUs ggml-cuda
 /// gives its chunked kernel to (`GGML_CUDA_CC_BLACKWELL`, `GGML_CUDA_CC_DGX_SPARK`).
 fn staged_gpu(cc: Option<(i32, i32)>) -> bool {
     matches!(cc, Some((12, 0 | 1)))
+}
+
+/// Whether device `dev` (the state's, or the launch's) is one [`STAGED`] takes ggml-cuda's
+/// groups on ([`staged_gpu`]), asked per device like [`gpu_for`]; the engine's answer
+/// ([`STAGED_GPU`]) where `dev` is unknown.
+fn staged_for(dev: Option<usize>) -> bool {
+    staged_for_by(
+        dev,
+        STAGED_GPU.load(Ordering::Relaxed),
+        crate::hw::per_device::cc,
+    )
+}
+
+/// [`staged_for`] with the engine's answer `engine` and the compute capabilities `cc_of` gives.
+pub(super) fn staged_for_by(
+    dev: Option<usize>,
+    engine: bool,
+    cc_of: impl FnOnce(usize) -> Option<(i32, i32)>,
+) -> bool {
+    crate::hw::per_device::pick_by(dev, engine, staged_gpu, cc_of)
 }
 
 /// Whether whole heads run `gdn_staged` and the groups ggml-cuda runs on its own chunked kernel
@@ -190,10 +232,10 @@ fn ggml_takes(n_k: i64, n_v: i64) -> bool {
 
 /// Whether [`gdn_mma`] takes a group of `n_k` key and `n_v` value heads: the ones ggml-cuda keeps
 /// on its per-token kernel with `--gdn-mma`; ggml-cuda's own with [`set_gdn_staged`] on a
-/// compute capability 12.x GPU.
-fn takes(n_k: i64, n_v: i64) -> bool {
+/// compute capability 12.x GPU (device `dev`'s, [`staged_for`]).
+fn takes(n_k: i64, n_v: i64, dev: Option<usize>) -> bool {
     if ggml_takes(n_k, n_v) {
-        STAGED.load(Ordering::Relaxed) && STAGED_GPU.load(Ordering::Relaxed)
+        STAGED.load(Ordering::Relaxed) && staged_for(dev)
     } else {
         ON.load(Ordering::Relaxed)
     }
@@ -238,8 +280,8 @@ pub(super) fn shapes_fit(
 }
 
 /// Whether [`gdn_mma`] takes this prompt group: switched on for its head counts ([`takes`]), a
-/// CUDA build on a GPU with the kernel's tensor cores ([`set_gpu`]), the state in one device's
-/// memory (the CPU graph is the reference and keeps ggml's op), and [`shapes_fit`].
+/// CUDA build, the state in the memory of one GPU with the kernel's tensor cores ([`gpu_for`];
+/// the CPU graph is the reference and keeps ggml's op), and [`shapes_fit`].
 pub(super) fn fits(
     q: Tensor<'_>,
     k: Tensor<'_>,
@@ -248,12 +290,12 @@ pub(super) fn fits(
     beta: Tensor<'_>,
     state: Tensor<'_>,
 ) -> bool {
-    takes(q.ne()[1], v.ne()[1])
-        && GPU.load(Ordering::Relaxed)
+    takes(q.ne()[1], v.ne()[1], state.cuda_device())
         && cfg!(feature = "cuda")
         && !state.is_host()
         && !state.is_meta()
         && shapes_fit(q, k, v, g, beta, state)
+        && gpu_for(state.cuda_device())
 }
 
 /// ggml's `gated_delta_net(q, k, v, g, beta, state, 1)` on its chunked kernel: the same shape
@@ -325,7 +367,7 @@ mod launch {
     use std::os::raw::{c_int, c_void};
     use std::sync::atomic::{AtomicI8, AtomicI32, Ordering};
 
-    use super::{Args, BLOCK_THREADS, FORCE, KERNELS, STAGED, STAGED_GPU, Schedule};
+    use super::{Args, BLOCK_THREADS, FORCE, KERNELS, STAGED, Schedule, staged_for};
 
     /// `dim3`.
     #[repr(C)]
@@ -437,7 +479,8 @@ mod launch {
     }
 
     /// Launches `a` on `stream` with ggml's schedule for the current device; whole heads on
-    /// `gdn_staged` where [`STAGED`] is on, on a [`STAGED_GPU`], and [`Args::staged_aligned`].
+    /// `gdn_staged` where [`STAGED`] is on, on a device [`staged_for`] picks, and
+    /// [`Args::staged_aligned`].
     pub(super) fn run(a: &mut Args, stream: *mut c_void) -> Result<(), String> {
         let (dev, sms) = device()?;
         let s = match forced() {
@@ -445,7 +488,7 @@ mod launch {
             None => match Schedule::pick(a.h, a.n_seqs, sms) {
                 Schedule::Heads
                     if STAGED.load(Ordering::Relaxed)
-                        && STAGED_GPU.load(Ordering::Relaxed)
+                        && staged_for(Some(dev))
                         && a.staged_aligned() =>
                 {
                     Schedule::Staged
