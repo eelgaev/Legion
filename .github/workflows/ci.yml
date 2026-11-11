@@ -113,6 +113,11 @@ jobs:
     steps:
       - name: build tools
         run: |
+          # The container's DNS on GitHub's runners failed to resolve archive.ubuntu.com and
+          # security.ubuntu.com for hours (2026-11-11); GitHub's runner images use the Azure
+          # mirror, which keeps resolving.
+          sed -i -E 's#http://(archive|security)\.ubuntu\.com/ubuntu#http://azure.archive.ubuntu.com/ubuntu#' \
+            /etc/apt/sources.list
           apt-get update
           apt-get install -y --no-install-recommends git ca-certificates curl cmake \
             build-essential pkg-config clang libclang-dev
