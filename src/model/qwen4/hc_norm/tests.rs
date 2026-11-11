@@ -1448,3 +1448,32 @@ fn moe_tail_read_elsewhere_is_not_folded() {
     );
     assert!(got == want);
 }
+
+/// #1176: a stage graph captures an `hc_post_norm` node, also one that reads a deferred
+/// reduce-scatter's partials: its kernel reads their addresses from the communicator's device
+/// slot, which the exchange writes on the stream, so the launch takes no per-exchange host
+/// state.
+#[test]
+fn a_deferred_reduce_scatter_reader_is_captured() {
+    let (e, n) = (64, 4);
+    let kk = e * FOLD_HC;
+    let ctx = Context::new(64, 64);
+    let out = ctx.new_tensor(types::F32, &[e, n]).as_input();
+    let res = ctx.new_tensor(types::F32, &[e, FOLD_HC, n]).as_input();
+    let inj = ctx.new_tensor(types::F32, &[FOLD_HC, n]).as_input();
+    let gamma = ctx.new_tensor(types::F32, &[kk]).as_input();
+    let wi = ctx.new_tensor(types::F32, &[kk, FOLD_INJ]).as_input();
+    let down = ctx.new_tensor(types::BF16, &[kk, FOLD_M]).as_input();
+    let p = hc_post_norm_rebuilt_xnb(&ctx, res, out, inj, gamma, wi, 1e-6, down);
+    // SAFETY: the norm's node, just made; its params are the op's own.
+    unsafe {
+        let node = (*p.res.raw()).view_src;
+        let safe = || {
+            let op = crate::ggml::op_of(node).expect("an external op node");
+            crate::model::core::stage_ops::capture_safe(op, &*node)
+        };
+        assert!(safe(), "a plain input sum");
+        crate::ggml::set_external_param(node, P_RS, 1);
+        assert!(safe(), "a deferred reduce-scatter");
+    }
+}

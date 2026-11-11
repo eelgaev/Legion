@@ -99,6 +99,9 @@ pub struct Switches {
     pub q4k_head_pick: Option<bool>,
     /// That pick at 2-7 columns ([`crate::model::core::q4k_head::set_pick_cols`]).
     pub q4k_head_pick_cols: Option<bool>,
+    /// The BF16 LM head of verify steps of 49-128 rows as Legion's op (matmul, soft-cap and
+    /// argmax in one pass) where that has cuBLAS's bits ([`crate::model::core::set_head_mm`]).
+    pub head_mm: Option<bool>,
     /// Q8_0 matvecs of one input on Legion's op that quantizes it once
     /// ([`crate::model::core::set_q8_group`]).
     pub q8_group: Option<bool>,
@@ -309,6 +312,9 @@ pub struct Switches {
     /// NVFP4 expert matmuls of 2-8 tokens reading each routed expert once, with ggml's MMVQ bits
     /// ([`crate::model::core::set_nvfp4_once`]).
     pub nvfp4_once: Option<bool>,
+    /// NVFP4 dense matmuls of 5-8 tokens on Legion's tensor-core op with ggml's MMVQ bits
+    /// ([`crate::model::core::set_nvfp4_mvq`]).
+    pub nvfp4_mvq: Option<bool>,
     /// Q8_0 matmuls of 9-255 tokens on Legion's two-launch op with MMQ's bits
     /// ([`crate::model::q8_mmq::set_q8_mmq`]).
     pub q8_mmq: Option<bool>,
@@ -407,7 +413,7 @@ pub struct Switches {
     pub glm_decode_mv: Option<bool>,
     /// GLM-5.3-Flash: the GB10-tuned linear kernels
     /// ([`crate::model::glm5next::ops::set_gb10_linear`]; `None`: the engine's choice, on for
-    /// integrated GPUs and V100s).
+    /// integrated GPUs, V100s and Ampere GPUs).
     pub glm_gb10_linear: Option<bool>,
     /// GLM-5.3-Flash: prompt MLA attention on tensor cores
     /// ([`crate::model::glm5next::ops::set_mla_tc`]; off by default).
@@ -556,6 +562,7 @@ impl Switches {
         set(self.q8_out_mv, core::q8_head::set_out_mv);
         set(self.q4k_head_pick, core::q4k_head::set_pick);
         set(self.q4k_head_pick_cols, core::q4k_head::set_pick_cols);
+        set(self.head_mm, core::set_head_mm);
         set(self.q8_group, core::set_q8_group);
         if let Some(m) = self.q8_group_parts {
             core::q8_group::set_parts(m);
@@ -636,6 +643,7 @@ impl Switches {
         set(self.shexp_gate, core::set_shexp_gate);
         set(self.decode_fuse, core::set_decode_fuse);
         set(self.node_fuse, core::set_node_fuse);
+        crate::ggml::post_alloc::set_order(crate::tp_net::seq_par::order_pass);
         crate::ggml::post_alloc::set_rewrite(core::node_fuse::rewrite);
         crate::ggml::post_alloc::set_relayout(core::node_fuse::fold::RELAYOUT);
         if let Some(p) = self.moe_pair_out {
@@ -697,6 +705,7 @@ impl Switches {
         set(self.hc_quant, core::set_mmq_preq);
         set(self.mmq_ids, core::set_mmq_ids);
         set(self.nvfp4_once, core::set_nvfp4_once);
+        set(self.nvfp4_mvq, core::set_nvfp4_mvq);
         set(self.q8_mmq, crate::model::q8_mmq::set_q8_mmq);
         set(self.q8_mmq_stream, |on| {
             crate::model::q8_mmq::set_q8_mmq_fast(if on { 8 } else { 0 })

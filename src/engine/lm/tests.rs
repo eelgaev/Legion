@@ -996,3 +996,60 @@ fn ring_checkpoints_come_out_of_a_lazy_host_tier() {
         (16, Some(1024))
     );
 }
+
+#[test]
+fn long_step_buffer_grows_with_the_past_up_to_its_measurement() {
+    let mib = 1usize << 20;
+    let s = LongStep {
+        device: None,
+        first: 1000 * mib,
+        last: 2000 * mib,
+    };
+    let past = 100_000;
+    assert_eq!(s.at(0, past), 1000 * mib);
+    assert_eq!(s.at(50_000, past), 1500 * mib);
+    assert_eq!(s.at(past, past), 2000 * mib);
+    // Past the measurement (or an unknown end): the measured longest.
+    assert_eq!(s.at(usize::MAX, past), 2000 * mib);
+    // A buffer measured no bigger after a long past stays flat.
+    let flat = LongStep {
+        device: None,
+        first: 700 * mib,
+        last: 700 * mib,
+    };
+    assert_eq!(flat.at(12_345, past), 700 * mib);
+}
+
+#[test]
+fn greedy_rows_below_min_tokens_are_picks() {
+    // Sampled rows come back whole; greedy ones as argmaxes, below `min_tokens` as picks with
+    // the stop tokens masked (#1176), so a stop token argmax is never taken there.
+    assert_eq!(logits_kind(false, 0, 8), Logits::Last);
+    assert_eq!(logits_kind(false, 9, 8), Logits::Last);
+    assert_eq!(logits_kind(true, 0, 0), Logits::Greedy);
+    assert_eq!(logits_kind(true, 8, 8), Logits::Greedy);
+    assert_eq!(logits_kind(true, 7, 8), Logits::Pick);
+    assert_eq!(logits_kind(true, 0, 8), Logits::Pick);
+}
+
+#[test]
+fn verify_rows_mask_only_up_to_min_tokens() {
+    assert_eq!(verify_logits(Logits::Last, 3, 0, 8), Logits::First(3));
+    assert_eq!(
+        verify_logits(Logits::Greedy, 3, 8, 8),
+        Logits::FirstGreedy(3)
+    );
+    // Two tokens left below `min_tokens`: the first two of three rows are masked.
+    assert_eq!(
+        verify_logits(Logits::Pick, 3, 6, 8),
+        Logits::FirstPick(3, 2)
+    );
+    assert_eq!(
+        verify_logits(Logits::Pick, 3, 0, 8),
+        Logits::FirstPick(3, 3)
+    );
+    assert_eq!(
+        verify_logits(Logits::Pick, 3, 7, 8),
+        Logits::FirstPick(3, 1)
+    );
+}

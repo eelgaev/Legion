@@ -16,6 +16,9 @@ mod tests;
 /// matvecs are checked per node ([`super::expert_mv::capture_safe`]).
 pub(crate) const PURE: &[&str] = &[
     // qwen4 (Qwen3.8-Flash-Next): the hyper-connection mixers, per-layer embeddings, QSA.
+    // The reader of a deferred reduce-scatter's partials too (#1176): its kernel reads their
+    // addresses from the communicator's device slot (`crate::tp_net::seq_par::sum_slot`, fixed
+    // for the communicator's life), which the exchange writes on the stream before it.
     "hc_post_norm",
     "hc_norm",
     "qwen4_hc_mix",

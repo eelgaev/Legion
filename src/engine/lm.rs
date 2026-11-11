@@ -86,7 +86,9 @@ use crate::model::core::{
 use crate::residency::ExpertMode;
 use crate::residency::fallback::known_node;
 use crate::spec::accept;
-use crate::spec::{Draft, DraftRequest, SeqId, SpecConfig, SpecCounters, TargetInfo, TokenDrafter};
+use crate::spec::{
+    DeviceHidden, Draft, DraftRequest, SeqId, SpecConfig, SpecCounters, TargetInfo, TokenDrafter,
+};
 use crate::tokenizer::Tokenizer;
 pub use pipe::DEFAULT_MIN_GROUP as DEFAULT_PIPELINE_MIN_GROUP;
 pub use preempt::KvAdmission;
@@ -1240,6 +1242,33 @@ impl Default for LongPrompts {
 
 /// The smallest adaptive micro-chunk ([`LongPrompts::micro_for`]).
 const MIN_MICRO: usize = 2048;
+
+/// The smallest micro-chunk a lend caps long prompts to (#1216, [`Worker::long_micro_cap`]):
+/// below it, staging every expert per micro-chunk costs more than a spilled step buffer.
+const MIN_LENT_MICRO: usize = 512;
+
+/// VRAM a lend's micro-chunk cap leaves free beside the long step buffer and
+/// [`crate::model::core::LENT_SCRATCH`] (#1216).
+const LENT_MICRO_MARGIN: usize = 64 << 20;
+
+/// #1216: a stage's long prompt step compute buffer at [`LongPrompts::micro`] tokens, as
+/// measured at load after no past and after the longest ([`Worker::long_past`]).
+#[derive(Debug, Clone, Copy)]
+struct LongStep {
+    device: Option<crate::ggml::Device>,
+    first: usize,
+    last: usize,
+}
+
+impl LongStep {
+    /// The buffer for a micro-chunk ending at most `end` tokens in: linear in the past
+    /// between the two measurements (an indexer's scores grow with it), at most `last`.
+    fn at(&self, end: usize, long_past: usize) -> usize {
+        let grow = self.last.saturating_sub(self.first) as u128;
+        let past = end.min(long_past) as u128;
+        self.first + (grow * past / long_past.max(1) as u128) as usize
+    }
+}
 
 /// [`LongPrompts::even_micro`]'s micro-chunks are whole KV blocks.
 const EVEN_STEP: usize = KV_BLOCK;
@@ -3906,12 +3935,15 @@ impl LmEngine {
         let cc = caps.map(|c| (c.0, c.1));
         let cc_major = cc.map(|c| c.0);
         // V100 (#574): the GB10 prompt kernels too (Maya-S, 8K-token prompt 565 -> 804 tok/s), but
-        // the plain Q6_K decode GEMV (the staged one ~11% slower there). The same bits.
+        // the plain Q6_K decode GEMV (the staged one ~11% slower there). Ampere (8.0 to 8.7,
+        // #1212) likewise: without them its prompt products run linear_mm, no tensor cores; the
+        // decode GEMV stays the plain one. The same bits.
         let volta = cc == Some((7, 0));
-        if volta && cfg.switches.glm_gb10_linear.is_none() {
+        let ampere = cc.is_some_and(crate::hw::per_device::ampere);
+        if (volta || ampere) && cfg.switches.glm_gb10_linear.is_none() {
             crate::model::glm5next::ops::set_gb10_linear(true);
         }
-        crate::model::glm5next::ops::set_gb10_gemv(!volta);
+        crate::model::glm5next::ops::set_gb10_gemv(!(volta || ampere));
         // #594: long prompt steps' Q6_K products through F16 weights and linear_tc (sm_80+, the
         // same bits)
         crate::model::glm5next::ops::set_q6k_f16(cc_major.is_some_and(|m| m >= 8));
@@ -3922,6 +3954,7 @@ impl LmEngine {
         crate::model::core::mmq_preq::set_gpu(cc_major);
         crate::model::core::mmq_ids::set_gpu(cc);
         crate::model::core::nvfp4_once::set_gpu(cc);
+        crate::model::core::nvfp4_mvq::set_gpu(cc);
         crate::model::qwen4::set_up_mix_gpu(cc_major, caps.map_or(0, |c| c.2));
         crate::model::q8_mmq::set_gpu(cc_major, caps.map_or(0, |c| c.2));
         let mma16 = device.is_some() && crate::model::moe_ffn::mma16();
@@ -4402,6 +4435,10 @@ impl LmEngine {
                     buft.name()
                 ))
             })?;
+        // The stop tokens a pick below `min_tokens` may not take (#1176). Set before the node
+        // and TP followers branch off: a layer split's rank 1 makes the step's picks.
+        let stop_tokens = chat_format.stop_tokens(&tokenizer);
+        exec.set_stop_tokens(&stop_tokens);
         let mut saved_host_bytes = 0u64;
         if saved_host {
             let moved = exec.saved_states_to_host().map_err(|e| {
@@ -4739,6 +4776,8 @@ impl LmEngine {
         }
         // The measured step compute buffers per stage (for the startup report).
         let mut measured_compute: Vec<usize> = Vec::new();
+        // Per stage: a long prompt's micro-chunk step buffer as measured (#1216).
+        let mut measured_long: Vec<usize> = Vec::new();
         // Per stage, for the memory plan: the VRAM kept free of the expert cache for step
         // compute buffers, and the prompt steps' room the cache took (may spill to host).
         let mut planned_compute: Vec<usize> = Vec::new();
@@ -4936,6 +4975,7 @@ impl LmEngine {
             // `--kv-vmm-keep` (#814): the pools' blocks past the kept ones give their VRAM to
             // the cache, and a lend must free it again beside a long step's buffers (the
             // blocks are mapped while the cache is lent).
+            measured_long.clone_from(&long);
             let mut long = long;
             if let Some(tokens) = kv_keep {
                 let plain = hbm_blocks == n_blocks
@@ -5233,7 +5273,6 @@ impl LmEngine {
             },
         );
 
-        let stop_tokens = chat_format.stop_tokens(&tokenizer);
         let (submit, rx) = std::sync::mpsc::channel();
         let expert_stats = exec.experts_mut().map(|experts| experts.stats());
         let stats = Arc::new(Mutex::new(EngineStats {
@@ -5339,6 +5378,31 @@ impl LmEngine {
         let slot_host_budget = exec.kv_slot_host_budget();
         let slot_lend = exec.kv_slot_lend();
         let ring_ckpt_slots = exec.ring_save_slots();
+        // #1216: a lend caps the long prompt's micro-chunks to what each stage's GPU has left
+        // free. GLM-5.3-Flash over a layer split only (not its parallel decode). Its step
+        // buffer grows with the past (the indexer's scores): measured once more at none.
+        let long_micro = cfg.long_prompts.micro;
+        let long_step = if crate::model::glm5next::params(exec.hp()).is_some()
+            && exec.model().glm_par.is_none()
+            && measured_long.len() == layout.stages.len()
+            && long_micro > 0
+        {
+            match exec.measure_prompt_step(long_micro, 0) {
+                Ok(first) if first.len() == measured_long.len() => {
+                    (layout.stages.iter().zip(first).zip(&measured_long))
+                        .map(|(((d, _), b0), &b)| LongStep {
+                            device: *d,
+                            first: b0.min(b),
+                            last: b,
+                        })
+                        .collect()
+                }
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        let long_past = cfg.ctx_size.saturating_sub(long_micro).max(1);
         let worker = Worker {
             exec,
             tokenizer: tokenizer.clone(),
@@ -5428,6 +5492,10 @@ impl LmEngine {
             lent: false,
             lent_short: false,
             can_lend: cfg.long_prompts.min_tokens > 0,
+            long_step,
+            long_past,
+            long_cap: 0,
+            long_reserve: 0,
             clock: Default::default(),
             outbox: stream::Outbox::new(tokenizer.clone(), cfg.stream_thread_seqs),
         };
@@ -5821,6 +5889,15 @@ struct Worker {
     lent_short: bool,
     /// Whether lending is possible (cleared after a failure).
     can_lend: bool,
+    /// #1216: per stage, its long prompt step's compute buffers as measured at load (empty:
+    /// no cap, see [`Self::long_micro_cap`]).
+    long_step: Vec<LongStep>,
+    /// The past [`LongStep::last`] was measured after.
+    long_past: usize,
+    /// The micro-chunk cap of the current lend (0: none).
+    long_cap: usize,
+    /// VRAM a KV tail mapped during the current lend leaves free for its step buffers.
+    long_reserve: usize,
     /// `--kv-vmm-keep` (#814): the KV pools' tail, lent to the expert cache while no sequence
     /// needs it ([`kv_vmm::KvLend`]).
     kv_lend: Option<kv_vmm::KvLend>,
@@ -6642,6 +6719,28 @@ impl Worker {
     }
 
     /// Grows `seq`'s block table to hold `n` tokens, from its reservation.
+    /// Room for `k` drafted tokens past the kept positions of every decoding sequence not in
+    /// `done` and every prompt in `joined` ([`Self::grow`]).
+    fn grow_for_drafts(
+        &mut self,
+        decoding: &mut [Seq<'_>],
+        done: &[usize],
+        prefilling: &mut [Seq<'_>],
+        joined: &[usize],
+        k: usize,
+    ) -> Result<(), String> {
+        for (i, seq) in decoding.iter_mut().enumerate() {
+            if !done.contains(&i) {
+                self.grow(seq, seq.n_past + k)?;
+            }
+        }
+        for &i in joined {
+            let seq = &mut prefilling[i];
+            self.grow(seq, seq.n_past + k)?;
+        }
+        Ok(())
+    }
+
     fn grow(&mut self, seq: &mut Seq<'_>, n: usize) -> Result<(), String> {
         let have = seq.table.num_tokens() as usize;
         if n <= have {
@@ -6821,7 +6920,7 @@ impl Worker {
         }
         let t = Instant::now();
         if !self.lent && self.can_lend {
-            self.lend_cache(0);
+            self.lend_cache(0, usize::MAX);
             if self.lent {
                 self.lent_short = true;
                 self.exec.set_pipeline_micro(self.micro);
@@ -6830,7 +6929,8 @@ impl Worker {
         }
         let lend = self.kv_lend.as_mut().expect("a lent KV tail");
         let host_held = lend.host_held;
-        let (bytes, restored) = match lend.grow(&self.exec) {
+        let reserve = self.long_reserve;
+        let (bytes, restored, host) = match lend.grow(&self.exec, reserve) {
             Ok(b) => b,
             Err(e) => {
                 // Blocks kept in host memory may have lost their bytes: nothing resumes them.
@@ -6845,10 +6945,18 @@ impl Worker {
             ms = t.elapsed().as_secs_f64() * 1e3,
             mib = bytes >> 20,
             from_host_mib = restored >> 20,
+            host_mib = host >> 20,
             cache_lent = self.lent,
             resume,
             "KV pools' tail mapped for a sequence past the kept blocks (--kv-vmm-keep)"
         );
+        if host > 0 {
+            tracing::warn!(
+                host_mib = host >> 20,
+                "no VRAM left for part of the KV pools' tail: it is served from host memory \
+                 (slower attention past the kept blocks) instead of failing the request"
+            );
+        }
         Ok(())
     }
 
@@ -6960,7 +7068,7 @@ impl Worker {
             shrunk = if self.pool.slow_in_use() == 0 {
                 lend.shrink(&mut self.exec, None)
             } else {
-                lend.grow(&self.exec).and(Err(e))
+                lend.grow(&self.exec, 0).and(Err(e))
             };
         }
         match shrunk {
@@ -6991,12 +7099,13 @@ impl Worker {
     /// Lends the expert cache's VRAM to the long prompt about to be read (see [`LongPrompts`]);
     /// on failure the cache keeps it and lending stays off. `tokens`: the longest prompt's
     /// tokens still to read.
-    fn lend_cache(&mut self, tokens: usize) {
+    fn lend_cache(&mut self, tokens: usize, end: usize) {
         let t = Instant::now();
         match self.exec.lend_experts(tokens) {
             Ok(true) => {
                 self.lent = true;
-                self.exec.set_pipeline_micro(self.long.micro);
+                (self.long_cap, self.long_reserve) = self.long_micro_cap(end);
+                self.exec.set_pipeline_micro(self.capped(self.long.micro));
                 self.exec.set_micro_taper(self.long.taper);
                 tracing::info!(
                     ms = t.elapsed().as_secs_f64() * 1e3,
@@ -7033,6 +7142,8 @@ impl Worker {
         }
         self.lent = false;
         self.lent_short = false;
+        self.long_cap = 0;
+        self.long_reserve = 0;
         self.exec.set_pipeline_micro(self.micro);
         self.exec.set_micro_taper(0);
         tracing::info!(
@@ -7040,6 +7151,60 @@ impl Worker {
             kv_tail,
             "expert cache restored, refilling"
         );
+    }
+
+    /// #1216: the longest micro-chunk (in whole KV blocks, at least [`MIN_LENT_MICRO`]) whose
+    /// long step buffer for a prompt ending `end` tokens in fits each stage GPU's free VRAM
+    /// now (just after a lend) beside [`crate::model::core::LENT_SCRATCH`], and the VRAM a KV
+    /// tail mapped during the lend must leave for it; `(0, 0)` (no cap) when the full
+    /// [`LongPrompts::micro`] fits, nothing was measured, or not even [`MIN_LENT_MICRO`] fits
+    /// (the step then spills as before). The buffer grows about linearly with the micro-chunk
+    /// and with the past ([`LongStep::at`]).
+    /// Smaller micro-chunks stage every expert more often, but a long step's buffer in host
+    /// memory ran prompts ~10x slower (an AC922 with 3 GPUs: GLM's staging ring takes nearly
+    /// all of a GPU's lent cache).
+    fn long_micro_cap(&self, end: usize) -> (usize, usize) {
+        let micro = self.long.micro;
+        let mut cap = micro;
+        for s in &self.long_step {
+            let bytes = s.at(end, self.long_past);
+            let Some(d) = s.device.filter(|_| bytes > 0) else {
+                continue;
+            };
+            let keep = crate::model::core::LENT_SCRATCH + LENT_MICRO_MARGIN;
+            let free = d.memory().0.saturating_sub(keep);
+            let fits = (free as u128 * micro as u128 / bytes as u128) as usize;
+            cap = cap.min(fits / KV_BLOCK * KV_BLOCK);
+        }
+        if cap >= micro || cap < MIN_LENT_MICRO {
+            return (0, 0);
+        }
+        let step = (self.long_step.iter())
+            .map(|s| (s.at(end, self.long_past) as u128 * cap as u128 / micro as u128) as usize)
+            .max()
+            .unwrap_or(0);
+        let reserve = step + crate::model::core::LENT_SCRATCH + LENT_MICRO_MARGIN;
+        tracing::info!(
+            micro = cap,
+            prompt_end = end.min(self.long_past),
+            reserve_mib = reserve >> 20,
+            free_mib = ?self
+                .long_step
+                .iter()
+                .map(|s| s.device.map_or(0, |d| d.memory().0 >> 20))
+                .collect::<Vec<_>>(),
+            "long prompt micro-chunks capped to what the lend left free (step buffers stay in VRAM)"
+        );
+        (cap, reserve)
+    }
+
+    /// `micro` within the current lend's cap ([`Self::long_micro_cap`]).
+    fn capped(&self, micro: usize) -> usize {
+        if self.long_cap > 0 {
+            micro.min(self.long_cap)
+        } else {
+            micro
+        }
     }
 
     /// One forward pass: a token for every decoding sequence plus prefill chunks within the
@@ -7128,6 +7293,13 @@ impl Worker {
             _ => 0,
         };
         self.exec.set_hidden_from(from);
+        // A decode or verify step: a drafter that gathers its take-in on the device reads the
+        // captured rows where the step left them, not a copy of all of them on the host (#1181).
+        let on_device = match &self.drafting {
+            Drafting::Model(d) if plan.chunks.is_empty() => d.reads_device_rows(),
+            _ => None,
+        };
+        self.exec.set_hidden_on_device(on_device);
         self.clock.lap(host_time::Phase::Pack, &mut at);
         let t_step = Instant::now();
         let out = self.exec.step(&groups).map_err(|e| e.to_string());
@@ -7234,7 +7406,8 @@ impl Worker {
                 .short_from()
                 .is_some_and(|n| prefilling.iter().any(|s| left(s) >= n));
         if (long || short) && !self.lent {
-            self.lend_cache(prefilling.iter().map(left).max().unwrap_or(0));
+            let end = prefilling.iter().map(|s| s.prompt.len()).max().unwrap_or(0);
+            self.lend_cache(prefilling.iter().map(left).max().unwrap_or(0), end);
             self.lent_short = !long;
             // `--kv-vmm-keep` with `--glm-parallel-decode` (#1174): a long prompt that will
             // pass the kept blocks maps the KV pools' tail now, while the VRAM the lend just
@@ -7301,9 +7474,10 @@ impl Worker {
                 Some(lead) if riders => lead.prompt.len() - lead.n_past,
                 _ => prefilling.iter().map(|s| s.prompt.len() - s.n_past).sum(),
             };
-            micro = self
-                .long
-                .micro_for(left.min(max_batch), self.exec.n_stages());
+            micro = self.capped(
+                self.long
+                    .micro_for(left.min(max_batch), self.exec.n_stages()),
+            );
             self.exec.set_pipeline_micro(micro);
         }
         // What the riders may take besides the decoding sequences' rows.
@@ -7384,7 +7558,7 @@ impl Worker {
             && self.long.even
             && let [(_, len)] = chunks[..]
         {
-            let micro = self.long.even_micro(len, self.exec.n_stages());
+            let micro = self.capped(self.long.even_micro(len, self.exec.n_stages()));
             self.exec.set_pipeline_micro(micro);
         }
         if self.slo.is_some() {
@@ -7435,6 +7609,8 @@ impl Worker {
 
         // Shared with the take-ins left for the next step ([`DeferredTakeIn`]).
         let hidden = std::sync::Arc::new(out.hidden);
+        // Or the same rows still on the device ([`ModelDrafter::step_device`]).
+        let hidden_dev = out.hidden_dev;
         let mut rows = out.argmax.into_iter().zip(out.rows);
         let mut copies = Vec::new();
         let mut commits = Vec::new();
@@ -7681,15 +7857,12 @@ impl Worker {
             // that just finished and excluding sequences that have ended.
             let draft_batch = batch - done.len() + joined.len();
             // Drafts sit past the kept positions: room for them in the block tables (the
-            // next step takes those blocks anyway).
-            for (i, seq) in decoding.iter_mut().enumerate() {
-                if !done.contains(&i) {
-                    self.grow(seq, seq.n_past + k)?;
-                }
-            }
-            for &i in &joined {
-                let seq = &mut prefilling[i];
-                self.grow(seq, seq.n_past + k)?;
+            // next step takes those blocks anyway). A drafter reading the step's rows on the
+            // device (#1181) reads them first: growing can lend the expert cache, which drops
+            // the kept graphs and with them the buffer those rows are in.
+            let grow_after = !hidden_dev.is_empty();
+            if !grow_after {
+                self.grow_for_drafts(decoding, &done, prefilling, &joined, k)?;
             }
             let max_ctx = self.max_ctx;
             let draft_span = (joined.iter())
@@ -7869,7 +8042,15 @@ impl Worker {
                 match &mut self.drafting {
                     Drafting::Model(d) => {
                         let t = Instant::now();
-                        d.step(&mut batch)?;
+                        if hidden_dev.is_empty() {
+                            d.step(&mut batch)?;
+                        } else {
+                            let rows = DeviceHidden {
+                                layers: &hidden_dev,
+                                first: &offs,
+                            };
+                            d.step_device(&mut batch, &rows)?;
+                        }
                         let ms = t.elapsed().as_secs_f64() * 1e3;
                         tracing::debug!(ms, seqs = batch.len(), "model drafts");
                         // A block drafter's pass, timed without a prompt's take-in.
@@ -7899,6 +8080,9 @@ impl Worker {
                     _ => unreachable!(),
                 }
                 self.clock.lap(host_time::Phase::Device, &mut at);
+            }
+            if grow_after {
+                self.grow_for_drafts(decoding, &done, prefilling, &joined, k)?;
             }
         }
         // Read: the next step copies its captured rows into them (#363), unless a take-in left
@@ -8135,6 +8319,33 @@ enum StepRow<'a> {
     Picked(u32, Option<Vec<f32>>),
 }
 
+/// What a step returns for a sequence that has `generated` of its `min_tokens` tokens:
+/// `greedy` (no grammar, greedy sampling, no log probabilities) only its greedy pick, the
+/// device argmax ([`Logits::Greedy`]), or below `min_tokens` the pick with the stop tokens
+/// masked ([`Logits::Pick`]: the executor reads back only what that needs, often nothing, #1176);
+/// otherwise the full row.
+fn logits_kind(greedy: bool, generated: u32, min_tokens: u32) -> Logits {
+    if !greedy {
+        Logits::Last
+    } else if generated >= min_tokens {
+        Logits::Greedy
+    } else {
+        Logits::Pick
+    }
+}
+
+/// What a verify step returns for `n` rows of a sequence whose [`logits_kind`] is `kind`: rows
+/// `0..min_tokens - generated` of a [`Logits::Pick`] sequence are below `min_tokens`.
+fn verify_logits(kind: Logits, n: usize, generated: u32, min_tokens: u32) -> Logits {
+    match kind {
+        Logits::Greedy => Logits::FirstGreedy(n),
+        Logits::Pick => {
+            Logits::FirstPick(n, (min_tokens.saturating_sub(generated) as usize).min(n))
+        }
+        _ => Logits::First(n),
+    }
+}
+
 /// One sequence being generated: everything but the model state.
 struct Active<'t> {
     sampler: Sampler,
@@ -8219,19 +8430,13 @@ impl<'t> Active<'t> {
         }
     }
 
-    /// What the step must return for this sequence: only the argmax when that is the whole
-    /// sampling decision and no log probabilities are asked for. While `min_tokens` masking
-    /// is still needed the full row is required, because the argmax-only path cannot mask.
+    /// What the step must return for this sequence ([`logits_kind`]).
     fn logits_kind(&self) -> Logits {
-        if !self.constrained()
-            && self.sampler.is_greedy()
-            && self.logprobs.is_none()
-            && self.generated >= self.min_tokens
-        {
-            Logits::Greedy
-        } else {
-            Logits::Last
-        }
+        logits_kind(
+            !self.constrained() && self.sampler.is_greedy() && self.logprobs.is_none(),
+            self.generated,
+            self.min_tokens,
+        )
     }
 
     /// What [`Self::advance`] samples from, for a step row with device argmax `t` and `logits`
@@ -8281,13 +8486,9 @@ impl<'t> Active<'t> {
         }
     }
 
-    /// What a verify step must return for this sequence's `n` real rows.
+    /// What a verify step must return for this sequence's `n` rows ([`verify_logits`]).
     fn verify_logits(&self, n: usize) -> Logits {
-        if self.logits_kind() == Logits::Greedy {
-            Logits::FirstGreedy(n)
-        } else {
-            Logits::First(n)
-        }
+        verify_logits(self.logits_kind(), n, self.generated, self.min_tokens)
     }
 
     /// When the request arrived (queued, before admission).

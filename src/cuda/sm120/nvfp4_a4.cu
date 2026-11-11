@@ -68,6 +68,9 @@ struct legion_nvfp4_a4 {
     // Dense, act 0: a residual (F32, the dst's layout) added to each output with __fadd_rn (never
     // contracted into an FMA), so dst holds the bits of the plain GEMM followed by ggml's add.
     const float * res;
+    // Grouped GEMM, nonzero (#1176): the plan's skipped pairs (ids of -1) get no zeros stored
+    // (nothing reads their rows); zero: the CTAs past the last tile store them.
+    int32_t unread_skips;
 };
 
 // Quantizes `rows` rows of k (F32 if x_bf16 is 0, else BF16; x_ld elements apart) to the layout
@@ -561,6 +564,30 @@ __global__ void __launch_bounds__(256, T::MINB) nvfp4_a4_gemm(const legion_nvfp4
         }
         __syncthreads();
         if (tile_expert < 0) {
+            // Past the routing's last tile: first store zeros for the plan's skipped pairs (ids of
+            // -1, listed after the experts' pairs, nvfp4_plan), which no tile holds (#1176): the
+            // CTAs past the last tile split them, BM_OUT rows each (as nvfp4_mm/common.cuh's
+            // grouped GEMM), so a skipped pair's result is zero without reading any expert. A
+            // plan without such pairs stores nothing here.
+            static_assert(BN == 32 || BN == 64 || BN == 128, "a plan tile count");
+            constexpr int TI = BN == 32 ? 2 : BN == 64 ? 3 : 4;  // the plan's count of BN-pair tiles
+            const int routed = p.plan[p.n_expert];
+            const int skipped = (int) p.n - routed;
+            if (skipped > 0 && !p.unread_skips) {
+                const int tiles = p.plan[p.n_expert + 1 + p.n + TI];
+                const int spare = tile - tiles, n_spare = (int) (gridDim.x / p.tiles_m) - tiles;
+                const int64_t rows = min((int64_t) BM_OUT, p.m - m0);
+                for (int j = spare; j < skipped; j += n_spare) {
+                    const int64_t off = (int64_t) p.plan[p.n_expert + 1 + routed + j] * p.m + m0;
+                    for (int64_t r = threadIdx.x; r < rows; r += 256) {
+                        if (p.act == 0) {
+                            ((float *) p.dst)[off + r] = 0.0f;
+                        } else {
+                            ((__nv_bfloat16 *) p.dst)[off + r] = __float2bfloat16_rn(0.0f);
+                        }
+                    }
+                }
+            }
             return;
         }
         w += (int64_t) tile_expert * p.w_e;

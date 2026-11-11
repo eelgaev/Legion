@@ -353,6 +353,11 @@ impl Linear {
             }
             return Ok(crate::model::nvfp4_mm::mul_mat(ctx, w, x, scale));
         }
+        if super::nvfp4_mvq::takes(w, x, scale) {
+            // NVFP4 weights in steps of 5-8 tokens on a GB10: ggml's MMVQ bits with the
+            // sub-block sums on tensor cores, the scale in its epilogue (#1133).
+            return Ok(super::nvfp4_mvq::mul_mat(ctx, w, x, scale));
+        }
         // BF16 weights in steps of 2-16 tokens: ggml-cuda's bits from faster kernels.
         let res = if crate::model::dense_mv::takes(w, x) {
             crate::model::dense_mv::mul_mat(ctx, &[w], x)[0]
@@ -624,7 +629,8 @@ impl Linear {
     }
 
     /// Whether [`Self::swiglu_ffn_id_skips`] takes these experts (each `(name, weight,
-    /// scale)`) at a batch of `n` tokens: all three on Legion's W4A16 grouped kernels.
+    /// scale)`) at a batch of `n` tokens: all three on Legion's W4A16 grouped kernels, or all
+    /// three on the W4A4 grouped GEMM ([`Self::skips_a4`]).
     pub(crate) fn takes_skips(
         &self,
         gate: (&str, Tensor<'_>, Option<Tensor<'_>>),
@@ -638,13 +644,33 @@ impl Linear {
         let fits = |(name, w, s): (&str, Tensor<'_>, Option<Tensor<'_>>)| {
             self.w4a16(name, w, s, n) && !self.w4a4(w, n, true)
         };
-        shapes && fits(gate) && fits(up) && fits(down)
+        shapes && ((fits(gate) && fits(up) && fits(down)) || self.skips_a4(gate, up, down, n))
     }
 
-    /// [`Self::swiglu_ffn_id`]'s W4A16 ops with `ids` that may be -1
-    /// ([`crate::model::nvfp4_mm::skips`]): those pairs go to no expert and their rows of the
-    /// out are zeros. `--tp-moe-ep` (#1176): a rank's slot table, so it computes only its own
-    /// experts' pairs. `None` unless [`Self::takes_skips`].
+    /// Whether [`Self::swiglu_ffn_id_skips`] takes these experts on the W4A4 grouped ops
+    /// ([`Self::swiglu_ffn_id`]'s 4-bit path, #1176): all three 4-bit at this batch, and a
+    /// batch on the GEMM (more than [`crate::model::nvfp4_a4::MV_MAX_TOKENS`] tokens), so the
+    /// rank's own pairs get the bits of that path's GEMM.
+    fn skips_a4(
+        &self,
+        gate: (&str, Tensor<'_>, Option<Tensor<'_>>),
+        up: (&str, Tensor<'_>, Option<Tensor<'_>>),
+        down: (&str, Tensor<'_>, Option<Tensor<'_>>),
+        n: i64,
+    ) -> bool {
+        let a4 = |(name, w, s): (&str, Tensor<'_>, Option<Tensor<'_>>)| {
+            self.w4a16(name, w, s, n) && self.w4a4(w, n, true)
+        };
+        let shapes = gate.1.ne() == up.1.ne()
+            && gate.1.nb() == up.1.nb()
+            && down.1.ne()[0] == gate.1.ne()[1];
+        shapes && n > crate::model::nvfp4_a4::MV_MAX_TOKENS && a4(gate) && a4(up) && a4(down)
+    }
+
+    /// [`Self::swiglu_ffn_id`]'s W4A16 ops (or its W4A4 ops, [`Self::skips_a4`]) with `ids` that
+    /// may be -1 ([`crate::model::nvfp4_mm::skips`]): those pairs go to no expert and their rows
+    /// of the out are zeros. `--tp-moe-ep` (#1176): a rank's slot table, so it computes only its
+    /// own experts' pairs. `None` unless [`Self::takes_skips`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn swiglu_ffn_id_skips<'a>(
         &self,
@@ -658,6 +684,12 @@ impl Linear {
     ) -> Option<Tensor<'a>> {
         use crate::model::nvfp4_mm::{mul_mat_id, skips, swiglu_id_rows};
         let n = x.ne()[2];
+        if self.skips_a4(gate, up, down, n) {
+            // As the 4-bit path of `swiglu_ffn_id`, which routes by `ids` alone (no row map).
+            use crate::model::nvfp4_a4;
+            let act = skips(nvfp4_a4::swiglu_id(ctx, gate.1, up.1, x, ids, gate.2, up.2));
+            return Some(skips(nvfp4_a4::mul_mat_id(ctx, down.1, act, ids, down.2)));
+        }
         self.takes_skips(gate, up, down, n).then(|| {
             let act = skips(swiglu_id_rows(
                 ctx, gate.1, up.1, x, ids, gate.2, up.2, rows,
@@ -849,7 +881,11 @@ fn down_res_fits(w: Tensor<'_>, act: Tensor<'_>, r: Tensor<'_>) -> bool {
     r.ty() == types::F32 && r.is_contiguous() && r.ne() == [m, n1, n2, n3]
 }
 
-fn bf16_cast_joined<'a>(ctx: &'a Context, w: Tensor<'a>, x: Tensor<'a>) -> Option<Tensor<'a>> {
+pub(crate) fn bf16_cast_joined<'a>(
+    ctx: &'a Context,
+    w: Tensor<'a>,
+    x: Tensor<'a>,
+) -> Option<Tensor<'a>> {
     if !bf16_join_fits(w, x) {
         return None;
     }

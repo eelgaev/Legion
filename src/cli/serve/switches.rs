@@ -232,6 +232,13 @@ pub(in crate::cli) struct SwitchArgs {
     /// columns at once (the default: the same token and probability bits). For comparisons.
     #[arg(long, help_heading = HEADING)]
     no_draft_head_q4k_pick_cols: bool,
+    /// Verify steps of 49-128 rows (7-16 sequences drafting 8 tokens) with a BF16 LM head
+    /// (Gemma 4 31B on a GB10): keep the head on ggml's matmul (cuBLAS), soft-cap and argmax
+    /// instead of Legion's head op (the default where it gives cuBLAS's bits: the matmul, the
+    /// soft-cap and every row's argmax in one pass over the weights, the logits written once).
+    /// For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_head_mm: bool,
     /// CUDA, compute capability 7.x-8.x (V100 to RTX 40), steps of 1-8 tokens inside stage
     /// graphs, with this flag an RTX 50 (12.0) too, without the mixer's parts (unmeasured there),
     /// and with this flag a GB10 at 2-8 tokens (without the mixer's parts; ggml's bits
@@ -827,6 +834,16 @@ pub(in crate::cli) struct SwitchArgs {
     /// by default.
     #[arg(long, help_heading = HEADING)]
     nvfp4_once: bool,
+    /// The default since #1133 round 2; accepted for older command lines (see --no-nvfp4-mvq).
+    #[arg(long, hide = true, conflicts_with = "no_nvfp4_mvq")]
+    nvfp4_mvq: bool,
+    /// NVFP4 dense matmuls of 5-8 tokens (verify steps, decode of 5-8 users) on compute capability 12.x
+    /// (GB10, RTX 50; no effect elsewhere): keep them on ggml's MMVQ instead of Legion's op
+    /// (the default: the sub-block sums on tensor cores, then ggml's float order, so the same
+    /// bits as MMVQ; `legion nvfp4-mvq-bench` checks them and times both). The same output
+    /// either way; for comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_nvfp4_mvq: bool,
     /// The default since #858; accepted for older command lines (see --q8-mmq-ggml).
     #[arg(long, hide = true, conflicts_with = "q8_mmq_ggml")]
     q8_mmq: bool,
@@ -1078,9 +1095,10 @@ pub(in crate::cli) struct SwitchArgs {
     #[arg(long, help_heading = HEADING)]
     glm_decode_mv: bool,
     /// GLM-5.3-Flash, CUDA: the plain dense-weight kernels instead of the GB10-tuned ones (the
-    /// default on integrated GPUs such as the GB10 and on V100s; other GPUs run the plain ones): a
-    /// Q6_K decode GEMV staging its weight rows through shared memory with 16-byte loads (~165 ->
-    /// ~220 GB/s; not on V100s, where it is slower), a prompt GEMM on 128 x 128 tiles (~2x; on
+    /// default on integrated GPUs such as the GB10, on V100s and on Ampere GPUs (compute
+    /// capability 8.0 to 8.7); other GPUs run the plain ones): a Q6_K decode GEMV staging its
+    /// weight rows through shared memory with 16-byte loads (~165 -> ~220 GB/s; not on V100s,
+    /// where it is slower, nor on Ampere GPUs), a prompt GEMM on 128 x 128 tiles (~2x; on
     /// sm_80+ Q6_K weights of 1024+ rows on mma.sync, ~1.3x more, reading the input once rounded
     /// to F16 when 2+ share it), prompt MLA attention with 16 heads a block (each staged cache row
     /// read by 4x the heads), the prompt hyper-connection mix 4 tokens a block, the prompt
@@ -1391,6 +1409,7 @@ impl SwitchArgs {
             q8_out_mv: self.q8_out_row_mv.then_some(true),
             q4k_head_pick: self.no_draft_head_q4k_pick.then_some(false),
             q4k_head_pick_cols: self.no_draft_head_q4k_pick_cols.then_some(false),
+            head_mm: self.no_head_mm.then_some(false),
             q8_group: if self.no_q8_group {
                 Some(false)
             } else {
@@ -1487,6 +1506,11 @@ impl SwitchArgs {
             hc_quant: self.hc_quant_ggml.then_some(false),
             mmq_ids: self.expert_mmq.then_some(true),
             nvfp4_once: self.nvfp4_once.then_some(true),
+            nvfp4_mvq: if self.no_nvfp4_mvq {
+                Some(false)
+            } else {
+                self.nvfp4_mvq.then_some(true)
+            },
             q8_mmq: if self.q8_mmq_ggml {
                 Some(false)
             } else {

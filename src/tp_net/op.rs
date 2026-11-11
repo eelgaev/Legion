@@ -93,12 +93,22 @@ pub(super) mod cuda {
         n: i64,
     }
 
+    /// `tp_copy_args` of `src/cuda/tp_net.cu`.
+    #[repr(C)]
+    struct CopyArgs {
+        src: *const u16,
+        dst: *mut u16,
+        n: i64,
+    }
+
     unsafe extern "C" {
         /// The kernels as the CUDA runtime knows them (their host stubs): the F32 sum, the sum
         /// of BF16 partials (also the BF16 to F32 copy, with one source) and the BF16 rounding.
         static legion_tp_net_sum_kernel: *const c_void;
         static legion_tp_net_sum_bf16_kernel: *const c_void;
         static legion_tp_net_pack_bf16_kernel: *const c_void;
+        /// The BF16 copy of an all-gather with a BF16 output (#1176).
+        static legion_tp_net_copy_bf16_kernel: *const c_void;
         fn cudaLaunchKernel(
             func: *const c_void,
             grid: Dim3,
@@ -110,6 +120,8 @@ pub(super) mod cuda {
         fn cudaHostAlloc(p: *mut *mut c_void, size: usize, flags: c_uint) -> c_int;
         fn cudaHostGetDevicePointer(d: *mut *mut c_void, h: *mut c_void, flags: c_uint) -> c_int;
         fn cudaFreeHost(p: *mut c_void) -> c_int;
+        fn cudaMalloc(p: *mut *mut c_void, bytes: usize) -> c_int;
+        fn cudaFree(p: *mut c_void) -> c_int;
         fn cudaMemcpyAsync(
             dst: *mut c_void,
             src: *const c_void,
@@ -168,6 +180,42 @@ pub(super) mod cuda {
                 cudaFreeHost(self.host as *mut c_void);
             }
         }
+    }
+
+    /// The sum slot of a communicator ([`crate::tp_net::seq_par::sum_slot`], #1176): device
+    /// memory for two `u64`s, the addresses of the two ranks' BF16 partials of the latest
+    /// deferred reduce-scatter, written on the stream by [`hand_over`] and read by its reader's
+    /// kernel. Made once, at the first deferred sum, and kept at the same address while the
+    /// communicator lives, so a captured reader's launch stays valid.
+    pub(crate) struct SumSlot {
+        dev: u64,
+    }
+
+    impl SumSlot {
+        fn new() -> Result<Self, String> {
+            let mut d = std::ptr::null_mut();
+            // SAFETY: a plain allocation; written on the stream before anything reads it.
+            check("cudaMalloc", unsafe { cudaMalloc(&mut d, 64) })?;
+            Ok(Self { dev: d as u64 })
+        }
+    }
+
+    impl Drop for SumSlot {
+        fn drop(&mut self) {
+            // SAFETY: memory from `cudaMalloc`, freed once, when the communicator goes.
+            unsafe {
+                cudaFree(self.dev as *mut c_void);
+            }
+        }
+    }
+
+    /// The device address of `comm`'s sum slot ([`SumSlot`]), once a deferred sum made it.
+    pub(crate) fn sum_slot(comm: &super::super::Comm) -> Option<u64> {
+        comm.sum_slot
+            .lock()
+            .expect("sum slot lock")
+            .as_ref()
+            .map(|s| s.dev)
     }
 
     /// The CUDA path's buffers: the flags, and per buffer set (`nbuf` of them: an exchange
@@ -267,7 +315,7 @@ pub(super) mod cuda {
         let src = unsafe { &*dst.src[0] };
         let plan = micro_plan(&comm, &m, src);
         // SAFETY: the caller's.
-        let r = unsafe { start(&comm, &plan, src.data as usize, stream, true) };
+        let r = unsafe { start(&comm, &plan, src.data as usize, stream, true, None) };
         if let Err(e) = &r {
             comm.fail(e.clone());
         }
@@ -333,6 +381,9 @@ pub(super) mod cuda {
         /// BF16: the whole source rounded into the send buffer (the plain all-reduce and
         /// reduce-scatter), not only the pieces (a micro-batch's).
         pack_whole: bool,
+        /// An all-gather with a BF16 output (`seq_par::all_gather_bf16`): the BF16 values
+        /// copied as they travelled, not widened to F32.
+        out_bf16: bool,
     }
 
     /// The plan of a plain exchange node.
@@ -368,6 +419,7 @@ pub(super) mod cuda {
             wire: comm.wire(full),
             pieces,
             pack_whole: true,
+            out_bf16: kind == Kind::AllGather && dst.type_ == crate::ggml::types::BF16,
         }
     }
 
@@ -397,6 +449,7 @@ pub(super) mod cuda {
             wire: comm.wire(row * m.n),
             pieces,
             pack_whole: false,
+            out_bf16: false,
         }
     }
 
@@ -412,14 +465,35 @@ pub(super) mod cuda {
         let r = unsafe {
             let src = (*dst.src[0]).data as usize;
             let plan = plain_plan(&comm, kind, dst);
-            // A reduce-scatter whose reader adds the partials itself (#1176).
-            let defer = kind == Kind::ReduceScatter
-                && crate::tp_net::seq_par::deferred(dst)
-                && plan.wire == Wire::Bf16
-                && comm.n_ranks() == 2;
-            start(&comm, &plan, src, stream, false).and_then(|seq| {
+            // A reduce-scatter whose reader adds the partials itself (#1176). Its reader reads
+            // them whatever this node does, so it must hand them over.
+            let defer = kind == Kind::ReduceScatter && crate::tp_net::seq_par::deferred(dst);
+            if defer && (plan.wire != Wire::Bf16 || comm.n_ranks() != 2) {
+                let e = "tp reduce-scatter: a deferred sum needs two ranks and BF16 partials";
+                comm.fail(e.to_string());
+                return Err(e.to_string());
+            }
+            if plan.out_bf16 && plan.wire != Wire::Bf16 {
+                let e = "tp all-gather: a BF16 output needs BF16 on the wire";
+                comm.fail(e.to_string());
+                return Err(e.to_string());
+            }
+            // A MoE tail this reduce-scatter runs itself (#1176): its BF16 values straight
+            // into the send buffer, or with F32 on the wire into its own output first.
+            let tail = match kind {
+                Kind::ReduceScatter => crate::tp_net::seq_par::tail_of(dst),
+                _ => None,
+            };
+            let tail = match tail {
+                Some(t) if plan.wire != Wire::Bf16 => {
+                    crate::model::core::node_fuse::launch_tail(t, None, stream).map(|_| None)
+                }
+                t => Ok(t),
+            };
+            let started = tail.and_then(|tail| start(&comm, &plan, src, stream, false, tail));
+            started.and_then(|seq| {
                 if defer {
-                    hand_over(&comm, &plan, seq, dst.data as usize, stream)
+                    hand_over(&comm, &plan, seq, stream)
                 } else {
                     finish(&comm, &plan, seq, src, dst.data as usize, stream)
                 }
@@ -479,6 +553,21 @@ pub(super) mod cuda {
         })
     }
 
+    /// Copies `n` BF16 values from `src` to `dst` on `stream`.
+    ///
+    /// # Safety
+    /// Device-readable `src`, device-writable `dst`, `n` values each.
+    unsafe fn copy_bf16(src: u64, dst: usize, n: usize, stream: *mut c_void) -> Result<(), String> {
+        let mut args = CopyArgs {
+            src: src as *const u16,
+            dst: dst as *mut u16,
+            n: n as i64,
+        };
+        let mut argv = [(&raw mut args).cast::<c_void>()];
+        // SAFETY: the caller's.
+        unsafe { launch_1d(legion_tp_net_copy_bf16_kernel, &mut argv, n, stream) }
+    }
+
     /// Rounds `n` F32 values at `src` to BF16 at `dst` on `stream`.
     ///
     /// # Safety
@@ -497,30 +586,40 @@ pub(super) mod cuda {
     /// The first half of an exchange on a working communicator: the buffers (grown if needed),
     /// this rank's values into the send buffer, "ready" raised, the writers' and readers' jobs
     /// queued. Returns the exchange's sequence number; `micro`: it stays in flight (for
-    /// [`launch_micro_finish`]).
+    /// [`launch_micro_finish`]). `tail` (a plain BF16 reduce-scatter's, see
+    /// [`crate::tp_net::seq_par::take_tail`]): the MoE tail node whose values `src` holds,
+    /// not run yet; it runs here with its values rounded straight into the send buffer.
     ///
     /// # Safety
-    /// `src` is the device address of the plan's source on `stream`'s device.
+    /// `src` is the device address of the plan's source on `stream`'s device; `tail` as
+    /// [`crate::model::core::node_fuse::launch_tail`]'s node.
     unsafe fn start(
         comm: &super::super::Comm,
         plan: &Plan,
         src: usize,
         stream: *mut c_void,
         micro: bool,
+        tail: Option<&ffi::ggml_tensor>,
     ) -> Result<u32, String> {
+        // Only the BF16 whole-source pack below runs a tail; anywhere else its node (a no-op
+        // now) would leave stale values to send. Checked before the sequence number moves.
+        if tail.is_some()
+            && !(plan.wire == Wire::Bf16 && plan.kind == Kind::ReduceScatter && plan.pack_whole)
+        {
+            return Err("tp exchange: a tail needs a BF16 whole-source reduce-scatter".into());
+        }
         let (rank, n_ranks) = (comm.rank(), comm.n_ranks());
         let kind = plan.kind;
         let eb = plan.wire.bytes();
         let mine = plan.pieces[rank];
         let bytes = plan.span * eb;
         let seq = comm.next_seq();
-        // A deferred sum whose reader has not run yet (the graph's order put this exchange
-        // first, or nothing read it): made here as `finish` makes it, so the reader finds its
-        // output written and this exchange may reuse the buffers.
+        // The deferred sum before this exchange (#1176): its reader ran before it on the stream
+        // (`seq_par::check_order`), so its buffers free now, ahead of this exchange's.
         let left = comm.deferred.lock().expect("deferred lock").take();
         if let Some(d) = left {
-            // SAFETY: as in `finish`; the buffers are held until "consumed" below.
-            unsafe { complete_deferred(comm, &d, stream)? };
+            // SAFETY: the stream the exchanges run on.
+            unsafe { release_deferred(comm, d.seq, stream)? };
         }
         let mut in_flight = comm.in_flight.lock().expect("in-flight lock");
         if in_flight.len() > 1 {
@@ -587,7 +686,11 @@ pub(super) mod cuda {
         // SAFETY: device tensors of the stream's device; the pinned buffers are mapped for it
         // and live as long as the communicator.
         unsafe {
-            if bf16 {
+            if bf16 && let Some(t) = tail.filter(|_| kind == Kind::ReduceScatter && plan.pack_whole)
+            {
+                // The whole source as the pack below rounds it (#1176).
+                crate::model::core::node_fuse::launch_tail(t, Some(dd + send as u64), stream)?;
+            } else if bf16 {
                 let packs: Vec<(usize, usize)> = match kind {
                     Kind::AllGather => vec![(0, mine.1)],
                     _ if plan.pack_whole => vec![(0, plan.span)],
@@ -652,20 +755,16 @@ pub(super) mod cuda {
     }
 
     /// A reduce-scatter's sum handed to its reader ([`crate::tp_net::seq_par::defer_sum`]):
-    /// where the two ranks' BF16 partials of this rank's columns are, in rank order.
+    /// the exchange whose buffers stay held until the next exchange starts.
     pub(crate) struct Deferred {
-        pub(crate) seq: u32,
-        /// The node's output (left unwritten), which the reader names.
-        dst: usize,
-        /// Its values (this rank's share).
-        n: usize,
-        /// Device addresses of rank 0's and rank 1's BF16 partials, `[row, share]` each.
-        pub(crate) srcs: [u64; 2],
+        seq: u32,
     }
 
     /// The second half of a deferred reduce-scatter `seq` ([`start`]): waits for the peer's
-    /// share, then leaves the sum to the node's reader ([`take_deferred`]); "consumed" is
-    /// raised after that reader ([`release_deferred`]). Two ranks, BF16 partials.
+    /// share, then leaves the sum to the node's reader, the addresses of the two ranks' BF16
+    /// partials (rank order) written to the sum slot on the stream ([`SumSlot`]); "consumed"
+    /// is raised when the next exchange starts, after that reader ([`release_deferred`]). Two
+    /// ranks, BF16 partials.
     ///
     /// # Safety
     /// As [`finish`].
@@ -673,7 +772,6 @@ pub(super) mod cuda {
         comm: &super::super::Comm,
         plan: &Plan,
         seq: u32,
-        dst: usize,
         stream: *mut c_void,
     ) -> Result<(), String> {
         let rank = comm.rank();
@@ -695,63 +793,33 @@ pub(super) mod cuda {
         } else {
             [theirs, own]
         };
-        *comm.deferred.lock().expect("deferred lock") = Some(Deferred {
-            seq,
-            dst,
-            n: mine.1,
-            srcs,
-        });
+        let mut slot = comm.sum_slot.lock().expect("sum slot lock");
+        if slot.is_none() {
+            *slot = Some(SumSlot::new()?);
+        }
+        let at = slot.as_ref().map_or(0, |s| s.dev);
+        // Each address as two 32-bit words, low first (little-endian), ordered after the wait
+        // and before the reader's kernel on the stream.
+        for (i, a) in srcs.into_iter().enumerate() {
+            for (j, w) in [a as u32, (a >> 32) as u32].into_iter().enumerate() {
+                let addr = at + (8 * i + 4 * j) as u64;
+                // SAFETY: the slot is device memory of the stream's device, live as long as the
+                // communicator.
+                check("cuStreamWriteValue32", unsafe {
+                    cuStreamWriteValue32_v2(stream, addr, w, 0)
+                })?;
+            }
+        }
+        *comm.deferred.lock().expect("deferred lock") = Some(Deferred { seq });
         Ok(())
     }
 
-    /// The deferred sum `d` made by the exchange itself, as [`finish`] makes it (rank order,
-    /// the BF16 sum kernel), into its node's output, and its buffers freed.
-    ///
-    /// # Safety
-    /// As [`finish`]; `stream` is the stream the exchange ran on.
-    unsafe fn complete_deferred(
-        comm: &super::super::Comm,
-        d: &Deferred,
-        stream: *mut c_void,
-    ) -> Result<(), String> {
-        static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            tracing::info!(
-                seq = d.seq,
-                "tp reduce-scatter: a deferred sum made by the next exchange (once per process)"
-            );
-        }
-        let srcs = d.srcs.map(|a| a as *const f32);
-        // SAFETY: the caller's; `srcs` are the exchange's held BF16 buffers, `dst` its output.
-        unsafe {
-            sum(
-                legion_tp_net_sum_bf16_kernel,
-                &srcs,
-                d.dst as *mut f32,
-                d.n,
-                stream,
-            )?;
-            release_deferred(comm, d.seq, stream)
-        }
-    }
-
-    /// The deferred sum whose node's output is at `dst` (device address), for its reader to
-    /// add; `None` if that node summed itself. The reader then calls [`release_deferred`]
-    /// after its kernel.
-    pub(crate) fn take_deferred(comm: &super::super::Comm, dst: usize) -> Option<Deferred> {
-        let mut d = comm.deferred.lock().expect("deferred lock");
-        if d.as_ref().is_some_and(|x| x.dst == dst) {
-            d.take()
-        } else {
-            None
-        }
-    }
-
-    /// Raises "consumed" for the deferred sum `seq` on `stream`, after its reader's kernel.
+    /// Raises "consumed" for the deferred sum `seq` on `stream`, after its reader's kernel
+    /// (the next exchange's [`start`]).
     ///
     /// # Safety
     /// `stream` is the stream the exchange ran on.
-    pub(crate) unsafe fn release_deferred(
+    unsafe fn release_deferred(
         comm: &super::super::Comm,
         seq: u32,
         stream: *mut c_void,
@@ -759,13 +827,9 @@ pub(super) mod cuda {
         let guard = comm.pinned.lock().expect("pinned lock");
         let p = guard.as_ref().ok_or("tp exchange: no buffers")?;
         // SAFETY: the flags are mapped for the stream's device and live with the communicator.
-        let r = check("cuStreamWriteValue32", unsafe {
+        check("cuStreamWriteValue32", unsafe {
             cuStreamWriteValue32_v2(stream, p.flags.dev + CONSUMED as u64, seq, 0)
-        });
-        if let Err(e) = &r {
-            comm.fail(e.clone());
-        }
-        r
+        })
     }
 
     /// The second half of exchange `seq` ([`start`]): waits for every peer's share, adds them
@@ -796,11 +860,15 @@ pub(super) mod cuda {
         let recv_dev = |r: usize| (dd + p.recv(r, k) as u64) as *const f32;
         let send_dev = |i: usize| (dd + (send + i * eb) as u64) as *const f32;
         let dst_at = |i: usize| (dst + i * 4) as *mut f32;
+        // A BF16 output: the shares as they travelled, at 2 bytes a value.
+        let dst16 = |i: usize| dst + i * 2;
         // SAFETY: as in `start`.
         unsafe {
             // An all-gather's own share needs nothing from the peers.
             if kind == Kind::AllGather {
-                if bf16 {
+                if plan.out_bf16 {
+                    copy_bf16(dd + send as u64, dst16(mine.0), mine.1, stream)?;
+                } else if bf16 {
                     let one = [send_dev(0)];
                     sum(
                         legion_tp_net_sum_bf16_kernel,
@@ -831,7 +899,9 @@ pub(super) mod cuda {
             if kind == Kind::AllGather {
                 for r in (0..n_ranks).filter(|&q| q != rank) {
                     let (i, c) = plan.pieces[r];
-                    if bf16 {
+                    if plan.out_bf16 {
+                        copy_bf16(recv_dev(r) as u64, dst16(i), c, stream)?;
+                    } else if bf16 {
                         sum(
                             legion_tp_net_sum_bf16_kernel,
                             &[recv_dev(r)],

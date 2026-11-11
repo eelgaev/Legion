@@ -15,6 +15,18 @@ mod cuda_wrap;
 #[path = "build/stb.rs"]
 mod stb;
 
+/// ggml's x86 instruction-set switches, passed to its CMake build when set in the environment.
+const X86_ISA_OPTIONS: [&str; 8] = [
+    "GGML_SSE42",
+    "GGML_AVX",
+    "GGML_AVX_VNNI",
+    "GGML_AVX2",
+    "GGML_BMI2",
+    "GGML_AVX512",
+    "GGML_FMA",
+    "GGML_F16C",
+];
+
 /// Short git commit of the checkout at `dir`, or `unknown` when there is no git
 /// metadata (tarball builds, no git on PATH, empty repo), so `--version` always
 /// prints an honest build identity.
@@ -85,6 +97,19 @@ fn main() {
         "GGML_NATIVE",
         cmake_env::cmake_bool(&native).unwrap_or_else(|e| panic!("GGML_NATIVE: {e}")),
     );
+    // With GGML_NATIVE=OFF, ggml's x86 build turns AVX2, FMA and BMI2 on by default, which an
+    // AVX-only CPU (Sandy/Ivy Bridge) cannot run. Its instruction-set switches pass through when
+    // set (e.g. GGML_AVX2=OFF GGML_FMA=OFF GGML_BMI2=OFF for such a CPU, plus GGML_F16C=OFF on
+    // Sandy Bridge, which has no F16C).
+    for var in X86_ISA_OPTIONS {
+        if let Some(v) = env::var_os(var).filter(|v| !v.is_empty()) {
+            let v = v.to_string_lossy();
+            cfg.define(
+                var,
+                cmake_env::cmake_bool(&v).unwrap_or_else(|e| panic!("{var}: {e}")),
+            );
+        }
+    }
     // A newer host toolchain (e.g. a gcc-toolset on RHEL) is selected with CC/CXX/CUDAHOSTCXX.
     for (var, define) in [
         ("CC", "CMAKE_C_COMPILER"),
@@ -183,7 +208,10 @@ fn main() {
         "CUDAHOSTCXX",
         "CUDA_PATH",
         "CUDA_HOME",
-    ] {
+    ]
+    .into_iter()
+    .chain(X86_ISA_OPTIONS)
+    {
         println!("cargo:rerun-if-env-changed={var}");
     }
 }
@@ -291,6 +319,7 @@ fn build_cuda_kernels(ggml: &Path) {
         .file("src/cuda/gdn.cu")
         .file("src/cuda/norm_rope.cu")
         .file("src/cuda/sm120/nvfp4_a4.cu")
+        .file("src/cuda/sm120/nvfp4_mvq.cu")
         .file("src/cuda/dequant.cu")
         .file("src/cuda/cpu_share.cu")
         .file("src/cuda/dense_mv.cu")
@@ -299,7 +328,9 @@ fn build_cuda_kernels(ggml: &Path) {
         .file("src/cuda/nvfp4_once.cu")
         .file("src/cuda/q8_head.cu")
         .file("src/cuda/q4k_head.cu")
+        .file("src/cuda/head_mm.cu")
         .file("src/cuda/q8_mmq.cu")
+        .file("src/cuda/dflash_draft.cu")
         .file("src/cuda/sm90/cluster_select.cu")
         .file("src/cuda/sm90/wgmma_gemm.cu")
         .file("src/cuda/glm5next.cu")

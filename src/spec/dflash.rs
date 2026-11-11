@@ -67,6 +67,7 @@
 
 mod cache;
 mod config;
+mod fused;
 mod head;
 mod model;
 pub mod tiny;
@@ -75,6 +76,8 @@ mod weights;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_device;
 #[cfg(test)]
 mod tests_dspark;
 #[cfg(test)]
@@ -87,11 +90,32 @@ use std::sync::Arc;
 
 use crate::engine::sampling::Rng;
 use crate::ggml::{Backend, ComputeAllocator, gpu_device};
-use crate::spec::{Draft, DraftRequest, ModelDrafter, ModelDrafterFactory, SeqId, TargetInfo};
+use crate::spec::{
+    DeviceHidden, Draft, DraftRequest, ModelDrafter, ModelDrafterFactory, SeqId, TargetInfo,
+};
 
 pub use config::{Config, ConfigError, Dflash2, Flavor};
-use model::{BlockSeq, INGEST_CHUNK, Model, Rows};
+use model::{BlockSeq, Feats, INGEST_CHUNK, Model, Rows};
 use weights::{Source, load_from_gguf};
+
+/// The take-in's features: `feats` on the host, or rows `idx` of the step's rows on the device.
+fn feats_of<'f>(src: Src<'f>, feats: &'f [f32], idx: &'f [i32]) -> Feats<'f> {
+    match src {
+        Src::Host => Feats::Host(feats),
+        Src::Device(d) => Feats::Device {
+            layers: d.layers,
+            rows: idx,
+        },
+    }
+}
+
+/// Where a step's captured rows are: in the requests' [`DraftRequest::hidden`], or left on the
+/// device ([`ModelDrafter::step_device`], #1181).
+#[derive(Clone, Copy)]
+enum Src<'s> {
+    Host,
+    Device(&'s DeviceHidden<'s>),
+}
 
 /// Settings of a [`DflashDrafter`] beyond the checkpoint.
 #[derive(Debug, Clone, PartialEq)]
@@ -116,6 +140,9 @@ pub struct DflashOptions {
     /// DFlash with the target's output head: those rows as stored or as a 4-bit copy
     /// (`--spec-draft-lm-head`).
     pub lm_head: crate::spec::DraftLmHead,
+    /// DFlash 2: the batched draft pass attends every sequence in one flash attention per
+    /// layer, over caches that share one pool (`--spec-draft-batched-attn`).
+    pub batched_attn: bool,
 }
 
 impl Default for DflashOptions {
@@ -128,6 +155,7 @@ impl Default for DflashOptions {
             weights: Default::default(),
             draft_vocab: 0,
             lm_head: Default::default(),
+            batched_attn: false,
         }
     }
 }
@@ -143,6 +171,9 @@ pub struct DflashDrafter {
     model: Model,
     backend: Backend,
     alloc: Option<ComputeAllocator>,
+    /// DFlash 2's batched draft pass's allocator: built while the take-in graph, from
+    /// `alloc`, still runs (#1181).
+    draft_alloc: Option<ComputeAllocator>,
     opts: DflashOptions,
     rng: Rng,
     n_embd: usize,
@@ -150,6 +181,16 @@ pub struct DflashDrafter {
     caches: HashMap<SeqId, cache::SeqCache>,
     /// Caches of finished sequences, to reuse.
     spare: Vec<cache::SeqCache>,
+    /// `--spec-draft-batched-attn`: the slots the sequences' caches live in, made on first use.
+    /// Declared after `caches`: their tensors are views of it.
+    pool: Option<cache::CachePool>,
+    /// The most sequences the engine runs at once: the pool's slots.
+    max_seqs: usize,
+    /// The pool could not be allocated: every sequence has a cache of its own.
+    pool_failed: bool,
+    /// The CUDA device its backend runs on (`None`: the CPU): a step's rows left in that
+    /// device's memory are gathered by its take-in graph ([`ModelDrafter::step_device`]).
+    device: Option<usize>,
 }
 
 /// Most idle caches kept for the next sequences.
@@ -335,16 +376,26 @@ impl DflashDrafter {
             confidence = model.has_confidence(),
             "{name} drafter loaded"
         );
+        // ggml-cuda names its devices `CUDA<n>`.
+        let device = target
+            .gpu
+            .then(|| backend.device().name())
+            .and_then(|n| n.strip_prefix("CUDA")?.parse().ok());
         Ok(Self {
             n_embd: target.n_embd,
             n_target_vocab: target.n_vocab,
             rng: Rng::new(opts.seed),
             model,
+            device,
             backend,
             alloc: None,
+            draft_alloc: None,
             opts,
             caches: HashMap::new(),
             spare: Vec::new(),
+            pool: None,
+            max_seqs: target.max_seqs.max(1),
+            pool_failed: false,
         })
     }
 
@@ -364,6 +415,10 @@ impl DflashDrafter {
 
     fn cache_for(&mut self, seq: SeqId) -> Result<&mut cache::SeqCache, String> {
         if !self.caches.contains_key(&seq) {
+            if let Some(c) = self.pooled_cache()? {
+                self.caches.insert(seq, c);
+                return Ok(self.caches.get_mut(&seq).expect("inserted"));
+            }
             let c = match self.spare.pop() {
                 Some(mut c) => {
                     c.clear();
@@ -382,10 +437,81 @@ impl DflashDrafter {
         Ok(self.caches.get_mut(&seq).expect("inserted"))
     }
 
-    /// Whether `r` hands over the hidden states of its `ran` rows of every fused layer.
-    fn check_hidden(&self, r: &DraftRequest<'_>) -> Result<(), String> {
+    /// `--spec-draft-batched-attn`: a fresh cache in a free slot of the pool (made on first
+    /// use, a slot for each of the engine's sequences); `None` without the flag, for a drafter
+    /// without DFlash 2's batched pass, when the pool could not be allocated or with every slot
+    /// taken (that sequence then has a cache of its own and attends alone).
+    fn pooled_cache(&mut self) -> Result<Option<cache::SeqCache>, String> {
+        if !self.opts.batched_attn || self.model.selector().is_none() || self.pool_failed {
+            return Ok(None);
+        }
+        let cfg = &self.model.cfg;
+        if self.pool.is_none() {
+            let pool = match cache::CachePool::new(
+                cfg,
+                self.backend.buffer_type(),
+                cfg.block_size,
+                self.model.window,
+                self.max_seqs,
+            ) {
+                Ok(pool) => pool,
+                Err(e) => {
+                    tracing::warn!(
+                        "cannot allocate the drafter's cache pool ({e}): drafting attends per \
+                         sequence"
+                    );
+                    self.pool_failed = true;
+                    return Ok(None);
+                }
+            };
+            tracing::info!(
+                slots = pool.slots(),
+                cells = pool.cells(),
+                "drafter cache pool for batched attention"
+            );
+            self.pool = Some(pool);
+        }
+        let pool = self.pool.as_mut().expect("made above");
+        let Some(slot) = pool.take() else {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    slots = pool.slots(),
+                    "the drafter's cache pool is full: more sequences draft with a cache of \
+                     their own and attend alone (warned once)"
+                );
+            }
+            return Ok(None);
+        };
+        match cache::SeqCache::in_pool(cfg, pool, slot, cfg.block_size, self.model.window) {
+            Ok(c) => Ok(Some(c)),
+            Err(e) => {
+                pool.give(slot);
+                Err(format!("cannot place the drafter's cache in its pool: {e}"))
+            }
+        }
+    }
+
+    /// Whether request `i` (`r`) hands over the hidden states of its `ran` rows of every fused
+    /// layer: in `r.hidden`, or on this drafter's device.
+    fn check_hidden(&self, r: &DraftRequest<'_>, i: usize, src: Src<'_>) -> Result<(), String> {
         let n_layers = self.model.cfg.target_layers.len();
-        if r.hidden.len() != n_layers || r.hidden.iter().any(|h| h.len() != r.ran * self.n_embd) {
+        let ok = match src {
+            Src::Host => {
+                r.hidden.len() == n_layers
+                    && r.hidden.iter().all(|h| h.len() == r.ran * self.n_embd)
+            }
+            Src::Device(d) => {
+                d.layers.len() == n_layers
+                    && d.first.get(i).is_some_and(|&f| {
+                        d.layers.iter().all(|l| {
+                            l.width == self.n_embd && f + r.ran <= l.rows && l.device == self.device
+                        })
+                    })
+            }
+        };
+        if !ok {
             return Err(format!(
                 "sequence {}: expected {n_layers} hidden-state layers of {} rows of {}",
                 r.seq, r.ran, self.n_embd
@@ -394,33 +520,48 @@ impl DflashDrafter {
         Ok(())
     }
 
-    /// Appends rows `rows` of `r`'s fused hidden states to `feats` (`n_layers × n_embd` a row).
-    fn features(&self, r: &DraftRequest<'_>, rows: std::ops::Range<usize>, feats: &mut Vec<f32>) {
-        for row in rows {
-            for h in &r.hidden {
-                feats.extend_from_slice(&h[row * self.n_embd..(row + 1) * self.n_embd]);
+    /// Appends rows `rows` of request `i`'s (`r`) fused hidden states: on the host to `feats`
+    /// (`n_layers × n_embd` a row), on the device their indices in the step's rows to `idx`.
+    fn features(
+        &self,
+        r: &DraftRequest<'_>,
+        i: usize,
+        src: Src<'_>,
+        rows: std::ops::Range<usize>,
+        feats: &mut Vec<f32>,
+        idx: &mut Vec<i32>,
+    ) {
+        match src {
+            Src::Host => {
+                for row in rows {
+                    for h in &r.hidden {
+                        feats.extend_from_slice(&h[row * self.n_embd..(row + 1) * self.n_embd]);
+                    }
+                }
             }
+            Src::Device(d) => idx.extend(rows.map(|row| (d.first[i] + row) as i32)),
         }
     }
 
-    /// Takes in the target step's rows of one sequence.
-    fn ingest(&mut self, r: &DraftRequest<'_>) -> Result<(), String> {
-        self.check_hidden(r)?;
+    /// Takes in the target step's rows of request `i` (`r`), one sequence.
+    fn ingest(&mut self, r: &DraftRequest<'_>, i: usize, src: Src<'_>) -> Result<(), String> {
+        self.check_hidden(r, i, src)?;
         let mut cache = self.caches.remove(&r.seq).expect("made by cache_for");
         cache.rollback(r.start);
-        let mut feats = Vec::new();
+        let (mut feats, mut idx) = (Vec::new(), Vec::new());
         let mut at = ingest_from(r.tokens.len(), r.start, r.ran, cache.window());
         let mut result = Ok(());
         while at < r.ran {
             let n = INGEST_CHUNK.min(r.ran - at);
             feats.clear();
-            self.features(r, at..at + n, &mut feats);
+            idx.clear();
+            self.features(r, i, src, at..at + n, &mut feats, &mut idx);
             let positions: Vec<usize> = (r.start + at..r.start + at + n).collect();
             result = self.model.ingest(
                 &mut self.backend,
                 &mut self.alloc,
                 &mut cache,
-                &feats,
+                feats_of(src, &feats, &idx),
                 &positions,
             );
             if result.is_err() {
@@ -434,21 +575,31 @@ impl DflashDrafter {
 
     /// Takes in the target step's rows of every sequence of `batch`: in one graph when they fit
     /// one (a decode step's few rows each), else one by one.
-    fn ingest_all(&mut self, batch: &[DraftRequest<'_>]) -> Result<(), String> {
-        let take: Vec<&DraftRequest<'_>> = batch.iter().filter(|r| r.ran > 0).collect();
-        let rows: usize = take.iter().map(|r| r.ran).sum();
+    fn ingest_all(&mut self, batch: &[DraftRequest<'_>], src: Src<'_>) -> Result<(), String> {
+        let take: Vec<usize> = (0..batch.len()).filter(|&i| batch[i].ran > 0).collect();
+        let rows: usize = take.iter().map(|&i| batch[i].ran).sum();
         let window = self.model.window;
-        if take.len() < 2 || rows > INGEST_CHUNK || take.iter().any(|r| r.ran > window) {
-            return take.into_iter().try_for_each(|r| self.ingest(r));
+        if take.len() < 2 || rows > INGEST_CHUNK || take.iter().any(|&i| batch[i].ran > window) {
+            return take
+                .into_iter()
+                .try_for_each(|i| self.ingest(&batch[i], i, src));
         }
-        let mut feats = Vec::with_capacity(rows * self.n_embd * self.model.cfg.target_layers.len());
-        for r in &take {
-            self.check_hidden(r)?;
-            self.features(r, 0..r.ran, &mut feats);
+        let mut feats = match src {
+            Src::Host => {
+                Vec::with_capacity(rows * self.n_embd * self.model.cfg.target_layers.len())
+            }
+            Src::Device(_) => Vec::new(),
+        };
+        let mut idx = Vec::with_capacity(rows);
+        for &i in &take {
+            let r = &batch[i];
+            self.check_hidden(r, i, src)?;
+            self.features(r, i, src, 0..r.ran, &mut feats, &mut idx);
         }
         let mut caches: Vec<cache::SeqCache> = take
             .iter()
-            .map(|r| {
+            .map(|&i| {
+                let r = &batch[i];
                 let mut c = self.caches.remove(&r.seq).expect("made by cache_for");
                 c.rollback(r.start);
                 c
@@ -456,21 +607,59 @@ impl DflashDrafter {
             .collect();
         let positions: Vec<Vec<usize>> = take
             .iter()
-            .map(|r| (r.start..r.start + r.ran).collect())
+            .map(|&i| (batch[i].start..batch[i].start + batch[i].ran).collect())
             .collect();
         let positions: Vec<&[usize]> = positions.iter().map(Vec::as_slice).collect();
         let mut refs: Vec<&mut cache::SeqCache> = caches.iter_mut().collect();
+        // The draft pass that follows (`step`) is built while this runs.
         let result = self.model.ingest_many(
             &mut self.backend,
             &mut self.alloc,
             &mut refs,
-            &feats,
+            self.pool.as_ref(),
+            feats_of(src, &feats, &idx),
             &positions,
+            false,
         );
-        for (r, c) in take.iter().zip(caches) {
-            self.caches.insert(r.seq, c);
+        for (&i, c) in take.iter().zip(caches) {
+            self.caches.insert(batch[i].seq, c);
         }
         result
+    }
+
+    /// [`ModelDrafter::step`] with the step's rows where `src` says.
+    fn step_from(&mut self, batch: &mut [DraftRequest<'_>], src: Src<'_>) -> Result<(), String> {
+        // DFlash 2 runs the same block length for every sequence: several sequences share one
+        // take-in graph and one draft pass, which read the drafter's weights once.
+        let asking = batch
+            .iter()
+            .filter(|r| r.max > 0 && !r.tokens.is_empty())
+            .count();
+        if self.model.selector().is_some() && asking > 1 {
+            for r in batch.iter() {
+                self.cache_for(r.seq)?;
+            }
+            let result = self
+                .ingest_all(batch, src)
+                .and_then(|()| self.draft_all(batch));
+            // The take-in graph may still run when a step fails before the draft pass.
+            self.backend.synchronize();
+            return result;
+        }
+        for (i, r) in batch.iter_mut().enumerate() {
+            self.cache_for(r.seq)?;
+            if r.ran > 0 {
+                self.ingest(r, i, src)?;
+            }
+            if r.max > 0 {
+                self.draft(r)?;
+            }
+        }
+        // A lone take-in reads the step's rows on the device: done before they may change.
+        if matches!(src, Src::Device(_)) {
+            self.backend.synchronize();
+        }
+        Ok(())
     }
 
     /// DFlash 2: the drafts of every sequence of `batch` that asks for some, from one pass over
@@ -492,8 +681,9 @@ impl DflashDrafter {
             .collect();
         let rows = self.model.draft_many(
             &mut self.backend,
-            &mut self.alloc,
+            &mut self.draft_alloc,
             &seqs,
+            self.pool.as_ref(),
             self.model.cfg.block_size,
             false,
             self.opts.min_confidence > 0.0,
@@ -712,35 +902,42 @@ impl ModelDrafter for DflashDrafter {
     }
 
     fn step(&mut self, batch: &mut [DraftRequest<'_>]) -> Result<(), String> {
-        // DFlash 2 runs the same block length for every sequence: several sequences share one
-        // take-in graph and one draft pass, which read the drafter's weights once.
-        let asking = batch
-            .iter()
-            .filter(|r| r.max > 0 && !r.tokens.is_empty())
-            .count();
-        if self.model.selector().is_some() && asking > 1 {
-            for r in batch.iter() {
-                self.cache_for(r.seq)?;
-            }
-            self.ingest_all(batch)?;
-            return self.draft_all(batch);
+        self.step_from(batch, Src::Host)
+    }
+
+    /// The take-in graph gathers the rows it needs where the target's step left them: the
+    /// same floats as from the host, without reading every captured row back (#1181).
+    fn reads_device_rows(&self) -> Option<usize> {
+        self.device
+    }
+
+    fn step_device(
+        &mut self,
+        batch: &mut [DraftRequest<'_>],
+        rows: &DeviceHidden<'_>,
+    ) -> Result<(), String> {
+        if rows.first.len() != batch.len() {
+            return Err(format!(
+                "{} first rows for {} requests",
+                rows.first.len(),
+                batch.len()
+            ));
         }
-        for r in batch.iter_mut() {
-            self.cache_for(r.seq)?;
-            if r.ran > 0 {
-                self.ingest(r)?;
-            }
-            if r.max > 0 {
-                self.draft(r)?;
-            }
-        }
-        Ok(())
+        self.step_from(batch, Src::Device(rows))
     }
 
     fn release(&mut self, seq: SeqId) {
-        if let Some(c) = self.caches.remove(&seq)
-            && self.spare.len() < SPARE_CACHES
-        {
+        let Some(c) = self.caches.remove(&seq) else {
+            return;
+        };
+        if let Some(slot) = c.slot() {
+            // Its views go; the slot takes the next sequence.
+            drop(c);
+            self.pool
+                .as_mut()
+                .expect("a slot is of the pool")
+                .give(slot);
+        } else if self.spare.len() < SPARE_CACHES {
             self.spare.push(c);
         }
     }

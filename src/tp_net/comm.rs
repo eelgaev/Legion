@@ -15,7 +15,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -182,6 +182,28 @@ struct Timing {
     totals: Mutex<ArStats>,
     /// The sequence number of the marked step's first all-reduce (0: none marked).
     first: AtomicU32,
+    /// The marked step's start, when its first all-reduce's partial was ready (0: not yet)
+    /// and when the last all-reduce finished (ns since `epoch`, see [`StepMarks`]).
+    step_start: AtomicU64,
+    first_ready: AtomicU64,
+    last_done: AtomicU64,
+    /// The CPUs the writers and readers reported a marked step's first all-reduce from
+    /// (`u32::MAX`: none yet).
+    tx_cpu: AtomicU32,
+    rx_cpu: AtomicU32,
+}
+
+/// Where the marked step's all-reduces fell ([`Comm::step_marks`], `--tp-profile`): from the
+/// step's start to its first partial ready (this rank's work before the first sum: preparing,
+/// launching and computing up to it), and from the last all-reduce finished to now (the work
+/// after the last sum: the rest of the graph, the sync and the output).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct StepMarks {
+    pub before_first: Option<Duration>,
+    pub after_last: Option<Duration>,
+    /// The CPUs the writer and the reader ran on at a marked step's first all-reduce.
+    pub tx_cpu: Option<u32>,
+    pub rx_cpu: Option<u32>,
 }
 
 impl Timing {
@@ -192,6 +214,11 @@ impl Timing {
             slots: Mutex::new([TimeSlot::default(); 4]),
             totals: Mutex::new(ArStats::default()),
             first: AtomicU32::new(0),
+            step_start: AtomicU64::new(0),
+            first_ready: AtomicU64::new(0),
+            last_done: AtomicU64::new(0),
+            tx_cpu: AtomicU32::new(u32::MAX),
+            rx_cpu: AtomicU32::new(u32::MAX),
         }
     }
 
@@ -202,6 +229,19 @@ impl Timing {
     /// A report for all-reduce `seq`: its partial ready (`ready`) or a peer's arrived.
     fn report(&self, seq: u32, ready: bool) {
         let t = self.now();
+        // Only with `--tp-profile` (steps marked), at a step's first all-reduce: sched_getcpu
+        // may be a system call.
+        if seq != 0
+            && self.first.load(Ordering::Acquire) == seq
+            && self.step_start.load(Ordering::Relaxed) != 0
+            && let Ok(cpu) = nix::sched::sched_getcpu()
+        {
+            let at = if ready { &self.tx_cpu } else { &self.rx_cpu };
+            at.store(cpu as u32, Ordering::Relaxed);
+        }
+        if ready && seq != 0 && self.first.load(Ordering::Acquire) == seq {
+            self.first_ready.store(t.max(1), Ordering::Release);
+        }
         let done = {
             let mut slots = self.slots.lock().expect("timing lock");
             let s = &mut slots[seq as usize % 4];
@@ -222,7 +262,31 @@ impl Timing {
             (s.left == 0).then(|| s.recv as i64 - s.ready.unwrap_or(s.recv) as i64)
         };
         if let Some(w) = done {
+            self.last_done.store(t, Ordering::Release);
             self.add(seq, w);
+        }
+    }
+
+    /// Marks a step's start (see [`StepMarks`]).
+    fn mark(&self, first: u32) {
+        self.first_ready.store(0, Ordering::Release);
+        self.step_start.store(self.now().max(1), Ordering::Release);
+        self.first.store(first, Ordering::Release);
+    }
+
+    /// The marked step's [`StepMarks`], now.
+    fn marks(&self) -> StepMarks {
+        let now = self.now();
+        let start = self.step_start.load(Ordering::Acquire);
+        let first = self.first_ready.load(Ordering::Acquire);
+        let last = self.last_done.load(Ordering::Acquire);
+        let ns = Duration::from_nanos;
+        let cpu = |c: &AtomicU32| Some(c.load(Ordering::Relaxed)).filter(|&c| c != u32::MAX);
+        StepMarks {
+            before_first: (first >= start && first > 0).then(|| ns(first - start)),
+            after_last: (last >= start && last > 0).then(|| ns(now.saturating_sub(last))),
+            tx_cpu: cpu(&self.tx_cpu),
+            rx_cpu: cpu(&self.rx_cpu),
         }
     }
 
@@ -838,9 +902,13 @@ pub struct Comm {
     #[cfg(feature = "cuda")]
     pub(super) in_flight: Mutex<std::collections::VecDeque<u32>>,
     /// The CUDA path's reduce-scatter whose sum its reader makes ([`super::seq_par::defer_sum`]),
-    /// until that reader ran.
+    /// until the next exchange frees its buffers.
     #[cfg(feature = "cuda")]
     pub(super) deferred: Mutex<Option<super::op::cuda::Deferred>>,
+    /// Where that reduce-scatter leaves its partials' addresses for the reader (made by the
+    /// first one, kept at the same address).
+    #[cfg(feature = "cuda")]
+    pub(super) sum_slot: Mutex<Option<super::op::cuda::SumSlot>>,
 }
 
 impl Comm {
@@ -961,6 +1029,8 @@ impl Comm {
             in_flight: Mutex::new(std::collections::VecDeque::new()),
             #[cfg(feature = "cuda")]
             deferred: Mutex::new(None),
+            #[cfg(feature = "cuda")]
+            sum_slot: Mutex::new(None),
         }))
     }
 
@@ -1045,7 +1115,13 @@ impl Comm {
     /// Marks the start of a step: the next all-reduce issued counts as the step's first.
     pub fn mark_step(&self) {
         let next = self.all_reduces().wrapping_add(1);
-        self.shared.timing.first.store(next, Ordering::Release);
+        self.shared.timing.mark(next);
+    }
+
+    /// Where the step marked last ([`Comm::mark_step`]) had its all-reduces, measured now (at
+    /// its end; see [`StepMarks`]).
+    pub fn step_marks(&self) -> StepMarks {
+        self.shared.timing.marks()
     }
 
     pub fn rank(&self) -> usize {

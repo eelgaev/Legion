@@ -432,3 +432,53 @@ fn indexed_names_find_what_the_search_finds() {
     assert_eq!(ctx.tensor("late").unwrap().raw(), late.raw());
     assert_eq!(ctx.tensor("cache_k-5").unwrap().raw(), ts[5].raw());
 }
+
+/// #1176: an I32 tensor read through a host tensor (pinned memory on a GPU) gives what a plain
+/// read gives.
+#[test]
+fn to_i32_via_reads_what_to_i32_reads() {
+    let cpu = Backend::cpu().unwrap();
+    let ctx = Context::new(2, 0);
+    let t = ctx.new_tensor(types::I32, &[5]);
+    let via = ctx.new_tensor(types::F32, &[8]);
+    ctx.alloc_tensors(cpu.buffer_type()).unwrap();
+    t.set_i32(&[3, -1, 7, 0, 151_000]);
+    assert_eq!(t.to_i32_via(via), [3, -1, 7, 0, 151_000]);
+    assert_eq!(t.to_i32_via(via), t.to_i32());
+}
+
+/// #1176: F32 rows read through a host tensor (pinned memory on a GPU) give what a plain read
+/// gives, from any start and also when the host tensor is bigger than the range.
+#[test]
+fn f32_range_via_reads_what_f32_range_reads() {
+    let cpu = Backend::cpu().unwrap();
+    let ctx = Context::new(2, 0);
+    let t = ctx.new_tensor(types::F32, &[6]);
+    let via = ctx.new_tensor(types::F32, &[4]);
+    ctx.alloc_tensors(cpu.buffer_type()).unwrap();
+    t.set_f32(&[0.5, -1.0, 2.25, 3.0, -0.0, 1e30]);
+    assert_eq!(t.f32_range_via(via, 0, 3), [0.5, -1.0, 2.25]);
+    assert_eq!(t.f32_range_via(via, 3, 3), t.f32_range(3, 3));
+    assert_eq!(t.f32_range_via(via, 5, 1), [1e30]);
+    assert!(t.f32_range_via(via, 6, 0).is_empty());
+}
+
+/// #1176: a span read through a host tensor and used in place holds what a plain read gives.
+#[test]
+fn with_f32_range_via_sees_what_f32_range_reads() {
+    let cpu = Backend::cpu().unwrap();
+    let ctx = Context::new(2, 0);
+    let t = ctx.new_tensor(types::F32, &[6]);
+    let via = ctx.new_tensor(types::F32, &[4]);
+    ctx.alloc_tensors(cpu.buffer_type()).unwrap();
+    t.set_f32(&[0.5, -1.0, 2.25, 3.0, -0.0, 1e30]);
+    // SAFETY: the closures only read the slice; nothing writes `via` meanwhile.
+    unsafe {
+        assert_eq!(
+            t.with_f32_range_via(via, 1, 4, |s| s.to_vec()),
+            t.f32_range(1, 4)
+        );
+        assert_eq!(t.with_f32_range_via(via, 5, 1, |s| s[0]), 1e30);
+        assert_eq!(t.with_f32_range_via(via, 6, 0, |s| s.len()), 0);
+    }
+}

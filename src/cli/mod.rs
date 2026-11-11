@@ -12,6 +12,7 @@ mod expert_mv_ptx_bench;
 mod gdn_bench;
 mod gguf;
 mod hc_mix_bench;
+mod head_mm_bench;
 mod hfmodel;
 mod info;
 mod lin_bench;
@@ -21,6 +22,7 @@ mod mmq_ids_bench;
 mod model_path;
 mod nvfp4_gemm_bench;
 mod nvfp4_mv_bench;
+mod nvfp4_mvq_bench;
 mod nvfp4_once_bench;
 mod paged_split_bench;
 mod q4k_head_bench;
@@ -134,9 +136,16 @@ enum Command {
     /// (development).
     #[command(hide = true)]
     Nvfp4OnceBench(nvfp4_once_bench::Nvfp4OnceBenchArgs),
+    /// Check and time the tensor-core NVFP4 dense matvec op against ggml's mmvq (development).
+    #[command(hide = true)]
+    Nvfp4MvqBench(nvfp4_mvq_bench::Nvfp4MvqBenchArgs),
     /// Check and time the GB10 Q4_K draft LM head op against ggml's mmvq (development).
     #[command(hide = true)]
     Q4kHeadBench(q4k_head_bench::Q4kHeadBenchArgs),
+    /// Check and time the BF16 verify-step LM head op against ggml's matmul, soft-cap and
+    /// argmax (development).
+    #[command(hide = true)]
+    HeadMmBench(head_mm_bench::HeadMmBenchArgs),
     /// Compare the grouped Q8_0 matvec op's bits with ggml's `mul_mat` (development).
     #[command(hide = true)]
     Q8GroupCheck(q8_group_check::Q8GroupCheckArgs),
@@ -226,7 +235,9 @@ async fn run(cli: Cli, numa: Option<legion::hw::numa_bind::Placement>) -> anyhow
         Command::Q8HeadBench(args) => q8_head_bench::run(args),
         Command::HcMixBench(args) => hc_mix_bench::run(args),
         Command::Nvfp4OnceBench(args) => nvfp4_once_bench::run(args),
+        Command::Nvfp4MvqBench(args) => nvfp4_mvq_bench::run(args),
         Command::Q4kHeadBench(args) => q4k_head_bench::run(args),
+        Command::HeadMmBench(args) => head_mm_bench::run(args),
         Command::Q8GroupCheck(args) => q8_group_check::run(args),
         Command::Q8MmqCheck(args) => q8_mmq_check::run(args),
         Command::LinBench(args) => lin_bench::run(args),

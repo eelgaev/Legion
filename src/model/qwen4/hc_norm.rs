@@ -741,9 +741,10 @@ struct HcPostNorm {
     xq: *mut i8,
     /// Null, or where `xn` rounded to BF16 goes (a BF16 down weight, #469).
     xnb: *mut u16,
-    /// Null, or (`legion_hc_post_norm_rs_launch`, #1176) rank 0's and rank 1's BF16 partials
-    /// whose sum is `out`, laid out as `out` (`out_ld`).
-    rs: [*const u16; 2],
+    /// Null, or (`legion_hc_post_norm_rs_launch`, #1176) device memory holding the addresses of
+    /// rank 0's and rank 1's BF16 partials whose sum is `out`, laid out as `out` (`out_ld`),
+    /// which the exchange writes there on the stream ([`crate::tp_net::seq_par::sum_slot`]).
+    rs: *const u64,
 }
 
 /// `legion_moe_fold` (src/cuda/fused.cu): a folded MoE tail's inputs ([`fold_moe`]).
@@ -1183,14 +1184,13 @@ unsafe fn cuda_hc_post_norm(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
             } else {
                 std::ptr::null_mut()
             },
-            rs: [std::ptr::null(); 2],
+            rs: std::ptr::null(),
         };
-        // `out` a deferred reduce-scatter (#1176): the two ranks' BF16 partials added here.
-        let rs = (params[P_RS] != 0)
-            .then(|| crate::tp_net::seq_par::take_deferred(out))
-            .flatten();
-        let code = if let Some((srcs, _)) = rs {
-            p.rs = srcs.map(|a| a as *const u16);
+        // `out` a deferred reduce-scatter (#1176): the two ranks' BF16 partials added here,
+        // their addresses read on the GPU from the slot the exchange wrote them to, so a
+        // stage graph may capture this launch. The exchange frees its buffers later.
+        let code = if params[P_RS] != 0 && crate::tp_net::seq_par::deferred(out) {
+            p.rs = crate::tp_net::seq_par::sum_slot(out)? as *const u64;
             legion_hc_post_norm_rs_launch(&p, stream)
         } else if params[7] != 0 {
             // A folded MoE tail (#836): `out` (the experts' rows) is not read as a row.
@@ -1215,16 +1215,8 @@ unsafe fn cuda_hc_post_norm(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
         } else {
             legion_hc_post_norm_launch(&p, stream)
         };
-        match code {
-            0 => {}
-            e => {
-                let e = format!("hc_post_norm: error {e}");
-                if rs.is_some() {
-                    // The exchange's buffers stay held: no later exchange may wait on them.
-                    crate::tp_net::seq_par::fail_deferred(out, &e);
-                }
-                return Err(e);
-            }
+        if code != 0 {
+            return Err(format!("hc_post_norm: error {code}"));
         }
         if let Some(d) = down {
             // The converter ggml-cuda's cuBLAS matmul path dequantizes the weight with.
@@ -1234,11 +1226,7 @@ unsafe fn cuda_hc_post_norm(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
             let values = d.ne[0] * d.ne[1];
             to_f16(d.data, rn.add(at.down16) as *mut u16, values, stream);
         }
-        match rs {
-            // The exchange's buffers free once the partials were read.
-            Some((_, seq)) => crate::tp_net::seq_par::release_deferred(out, seq, stream),
-            None => Ok(()),
-        }
+        Ok(())
     }
 }
 

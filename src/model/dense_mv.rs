@@ -377,7 +377,7 @@ pub fn takes_wide_chain(w: Tensor<'_>, x: Tensor<'_>) -> bool {
 
 /// The current device's compute capability (10 * major + minor), read once per device; `None`
 /// without CUDA or when the queries fail.
-fn compute_capability() -> Option<i32> {
+pub(crate) fn compute_capability() -> Option<i32> {
     #[cfg(feature = "cuda")]
     {
         cuda::compute_capability()

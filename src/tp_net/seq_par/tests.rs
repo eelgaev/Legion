@@ -294,3 +294,124 @@ fn an_f32_wire_sum_is_not_deferred() {
     });
     assert_eq!(got, [false, false]);
 }
+
+#[test]
+fn a_reduce_scatter_takes_over_only_the_tail_it_reads() {
+    let got = on_ranks(2, Wire::F32, |_, c| {
+        let handle = register(c);
+        let ctx = Context::new(16, 16);
+        let x = ctx.new_tensor(types::F32, &[4, 6]).as_input();
+        let w = ctx.new_tensor(types::F32, &[1, 6]).as_input();
+        // External nodes standing in for the tail and for another node.
+        let tail = all_gather(&ctx, handle.id(), x, 6);
+        let other = all_gather(&ctx, handle.id(), x, 6);
+        let rs = reduce_scatter(&ctx, handle.id(), tail);
+        let ins = [x.raw(), w.raw()];
+        // SAFETY: nodes of `ctx`, never run.
+        unsafe {
+            let not_rs = take_tail(other.raw(), tail.raw(), &ins);
+            let not_its_source = take_tail(rs.raw(), other.raw(), &ins);
+            let untouched =
+                external_params(&*other.raw())[crate::model::core::node_fuse::P_BY_EXCHANGE] == 0
+                    && (*rs.raw()).src[1].is_null();
+            let took = take_tail(rs.raw(), tail.raw(), &ins);
+            let again = take_tail(rs.raw(), tail.raw(), &ins);
+            let t = &*rs.raw();
+            let srcs = t.src[1] == x.raw() && t.src[2] == w.raw() && t.src[3].is_null();
+            let by = external_params(&*tail.raw())[crate::model::core::node_fuse::P_BY_EXCHANGE];
+            (not_rs, not_its_source, untouched, took, again, srcs, by)
+        }
+    });
+    assert_eq!(got, [(false, false, true, true, false, true, 1); 2]);
+}
+
+#[test]
+fn a_deferred_sum_read_after_another_exchange_is_written_after_all() {
+    // #1176: the exchange after a deferred reduce-scatter frees its buffers and its reader
+    // reads the partials' addresses from the communicator's slot, so the reader must come
+    // first; otherwise `check_order` makes the node write its sum as before.
+    let got = on_ranks(2, Wire::Bf16, |_, c| {
+        let handle = register(c);
+        let ctx = Context::new(32, 32);
+        let x = ctx.new_tensor(types::F32, &[4, 6]).as_input();
+        // Read right after (a view in between reads nothing).
+        let good = reduce_scatter(&ctx, handle.id(), x);
+        defer_sum(good);
+        let read = ctx.scale(ctx.view_2d(good, [4, 3], 16, 0), 2.0).as_output();
+        // Another exchange before the reader.
+        let late = reduce_scatter(&ctx, handle.id(), x);
+        defer_sum(late);
+        let other = all_gather(&ctx, handle.id(), x, 12).as_output();
+        let after = ctx.scale(late, 2.0).as_output();
+        // No reader at all.
+        let unread = reduce_scatter(&ctx, handle.id(), x).as_output();
+        // SAFETY: a node of `ctx`, never run.
+        unsafe { crate::ggml::set_external_param(unread.raw(), P_DEFERRED, 1) };
+        let mut graph = ctx.new_graph(32);
+        for t in [read, late, other, after, unread] {
+            graph.expand(t);
+        }
+        // SAFETY: nodes of `ctx`, never run.
+        let changed = unsafe { check_order(graph.raw()) };
+        // SAFETY: as above.
+        let flags = unsafe { [good, late, unread].map(|t| deferred(&*t.raw())) };
+        (changed, flags)
+    });
+    assert_eq!(got, [(2, [true, false, false]); 2]);
+}
+
+#[test]
+fn a_bf16_gather_holds_the_f32_gathers_values() {
+    // #1176: with BF16 on the wire, the BF16 gather's values (and their widening) are the F32
+    // gather's exactly; with F32 on the wire there is no BF16 gather.
+    let (row, cols) = (4usize, 7usize);
+    let got = on_ranks(2, Wire::Bf16, move |r, c| {
+        let handle = register(c.clone());
+        let mut backend = Backend::cpu().unwrap();
+        backend.set_threads(3);
+        let ctx = Context::new(16, 16);
+        let (a, m) = share(cols, r, 2);
+        let x = ctx
+            .new_tensor(types::F32, &[row as i64, m as i64])
+            .as_input();
+        let g = all_gather_bf16(&ctx, handle.id(), x, cols as i64)
+            .expect("BF16 on the wire")
+            .as_output();
+        let wide = ctx.cast(g, types::F32).as_output();
+        let f = all_gather(&ctx, handle.id(), x, cols as i64).as_output();
+        let mut graph = ctx.new_graph(16);
+        for t in [g, wide, f] {
+            graph.expand(t);
+        }
+        ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+            .unwrap();
+        x.set_f32(&values(r, 0, row * cols)[a * row..(a + m) * row]);
+        backend.compute(&graph).unwrap();
+        assert!(handle.comm().error().is_none());
+        let g16: Vec<u16> = g
+            .bytes()
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        c.set_bf16_min(usize::MAX);
+        let f32_wire = all_gather_bf16(&ctx, handle.id(), x, cols as i64).is_none();
+        (g.ty(), g16, wide.to_f32(), f.to_f32(), f32_wire)
+    });
+    let want: Vec<f32> = (0..2)
+        .flat_map(|r| {
+            let (a, m) = share(cols, r, 2);
+            wired(
+                &values(r, 0, row * cols)[a * row..(a + m) * row],
+                Wire::Bf16,
+            )
+        })
+        .collect();
+    let want16: Vec<u16> = want.iter().map(|&v| bf16_bits(v)).collect();
+    for (r, (ty, g16, wide, f, f32_wire)) in got.into_iter().enumerate() {
+        assert_eq!(ty, types::BF16, "rank {r}");
+        assert_eq!(g16, want16, "rank {r}");
+        assert_eq!(bits(&wide), bits(&want), "rank {r}");
+        assert_eq!(bits(&f), bits(&want), "rank {r}");
+        assert!(f32_wire, "rank {r}");
+    }
+}

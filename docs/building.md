@@ -28,6 +28,7 @@ Extra arguments go to `cargo build`. Variables you export beforehand override th
 |---|---|
 | `CMAKE_CUDA_ARCHITECTURES` | GPU architectures to compile for (e.g. `70`, `120` or `121`; a `12x` gets its `a` suffix automatically). Always set it explicitly: without it ggml uses `native`, which needs a visible GPU at build time, or falls back to a long list of architectures. |
 | `GGML_NATIVE` | `ON` (default) tunes the CPU backend for the build machine. Set `OFF` for binaries that must run on other CPUs. |
+| `GGML_SSE42`, `GGML_AVX`, `GGML_AVX2`, `GGML_FMA`, `GGML_F16C`, `GGML_BMI2`, `GGML_AVX_VNNI`, `GGML_AVX512` | ggml's x86 instruction sets, passed through when set (`ON`/`OFF`). With `GGML_NATIVE=OFF` ggml turns AVX2, FMA and BMI2 on by default; an AVX-only CPU (Sandy/Ivy Bridge) needs `GGML_AVX2=OFF GGML_FMA=OFF GGML_BMI2=OFF`. |
 | `CC`, `CXX` | C and C++ compiler for ggml. |
 | `CUDAHOSTCXX` | Host compiler nvcc uses (cmake `CMAKE_CUDA_HOST_COMPILER`). Must be compatible with the CUDA version. |
 | `CUDA_PATH` / `CUDA_HOME` | CUDA toolkit root used for linking (default `/opt/cuda`). The `lib64`, `lib` and `targets/{x86_64,sbsa,ppc64le}-linux/lib` directories are searched. |
@@ -98,6 +99,22 @@ CMAKE_CUDA_ARCHITECTURES=121 cargo build --release --features cuda
 CMAKE_CUDA_ARCHITECTURES=120 cargo build --release --features cuda
 # RTX 50 and GB10 code in one binary (one host architecture):
 CMAKE_CUDA_ARCHITECTURES="120;121" cargo build --release --features cuda
+```
+
+## Turing (sm_75: RTX 20, GTX 16, T4)
+
+- `CMAKE_CUDA_ARCHITECTURES=75`. Turing runs the V100's kernels (an `sm_70` binary runs too),
+  with 64 KB of shared memory a block instead of 96: the WMMA prompt attention takes 32 query
+  rows a CTA where 64 do not fit (head size 512, Gemma 4's global layers), with the same bits.
+- GTX 16 cards (TU11x) have no tensor cores, but the WMMA and ggml's MMA kernels still run on them
+  (checked on a GTX 1660 Ti).
+- Quantized KV caches need compute capability 8.0+, as on the V100.
+
+```sh
+CMAKE_CUDA_ARCHITECTURES=75 cargo build --release --features cuda
+# a binary for an AVX-only host CPU (Ivy Bridge; on Sandy Bridge, which has no F16C, add GGML_F16C=OFF):
+GGML_NATIVE=OFF GGML_AVX2=OFF GGML_FMA=OFF GGML_BMI2=OFF CMAKE_CUDA_ARCHITECTURES=75 \
+  cargo build --release --features cuda
 ```
 
 ## Status

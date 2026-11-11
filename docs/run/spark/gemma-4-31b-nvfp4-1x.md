@@ -19,18 +19,31 @@ legion serve \
   --nvfp4-a4 prefill \
   --spec-draft-weights q8_0 \
   --spec-draft-lm-head q4 \
-  --head-rope-fused
+  --head-rope-fused \
+  --spec-draft-batched-attn
 ```
 
 Deterministic client: 8 fixed prompts (prose, code, lists, chats, a story; thinking off and on), temperature 0,
-256 tokens each, 2 rounds at 1, 4 and 16 users (2026-11-06). At 1 user the speed depends on how many drafts
-the prompt accepts: 22.1 tok/s (story) to 39.5 (code), 29.0 in all (median), mean accepted length 3.34, the
-same tokens in both rounds. 81.0 tok/s at 4 users, 235.1 at 16 users. Prefill 8K 1,845, 32K 1,540 and 123K
-(122,880 tokens) 874 tok/s, one request each, from the same server. The build before `--head-rope-fused`
+256 tokens each, 2 rounds at 1, 4 and 16 users (2026-11-10). At 1 user the speed depends on how many drafts
+the prompt accepts: 22.0 tok/s (story) to 39.4 (code), 28.7 in all (median), mean accepted length 3.30, the
+same tokens in both rounds (the same as without `--spec-draft-batched-attn`). 83.9 tok/s at 4 users. 16 users
+swing a few percent between rounds: 243.8 was the median of 8 rounds in three sessions that day (234.1-247.0);
+without `--spec-draft-batched-attn`, same sessions, 235.4 (231.2-240.5). Prefill 8K 2,041, 32K
+1,630 and 123K (122,880 tokens) 907 tok/s, one request each, from the same server.
+
+Later the same day, after the drafter changes (take-in gathered on the GPU, the draft pass's top-k and
+convolutions as single kernels) and with the target's BF16 LM head of verify steps as one pass (matmul, soft-cap
+and argmax, same bits): 16 users 252.4, the median of 16 rounds in two sessions (240.3-257.7, 14 of 16 above
+vLLM's 244.3), against 250.9 (235.8-254.5) for the build before the head change in the same sessions. 1 user
+the same tokens and speed, 4 users ~83, prefill 8K 1,965, 32K 1,643, 123K 916.
+
+The 2026-11-06 session, before `--spec-draft-batched-attn` and the drafter step changes that came with it:
+22.1-39.5 at 1 user (29.0 median), 81.0 at 4 users, 235.1 at 16, prefill 8K 1,845, 32K 1,540, 123K 874. The
+build before `--head-rope-fused`
 (and the captured-rows change that came with it), same session, without the flag: 21.9-40.2 at 1 user (28.3
 median), 81.9 at 4 users, 221.9 at 16, prefill 8K 1,727, 32K 1,458, 123K 848.
 
-An earlier session (2026-11-03) without the last four flags (all of them opt-in): 18-33 tok/s at 1 user (24.4 median,
+An earlier session (2026-11-03) without the last five flags (all of them opt-in): 18-33 tok/s at 1 user (24.4 median,
 accepted length 3.36), 70.2 at 4 users, 154.3 at 16, prefill 8K 897 and 32K 710 (123K 587). `--nvfp4-a4 prefill` alone
 gives most of the prefill and 16-user gain (16 users ~187); the 8-bit drafter and its 4-bit head make each
 draft pass cheaper (16 users ~212 with both). `--spec-draft-vocab 131072` on top cuts the accepted length
@@ -48,3 +61,4 @@ to ~2.3 and is slower at every concurrency.
 - `--spec-draft-weights` (`q8_0`, opt-in): the drafter's BF16 layers (~4.8 GB read per draft pass) quantized to Q8_0 at load. Drafts only, every token is still verified by the full model; at 4 and 16 users the drafts shape the verify batches, so the text can move.
 - `--spec-draft-lm-head` (`q4`, opt-in): the drafter reads a 4-bit copy of Gemma's tied 262,144-row head (2.8 GB in BF16) made at load. Drafts only, as above.
 - `--head-rope-fused` (opt-in): every layer's RoPE reads one shared view of the positions, so ggml-cuda runs the q and k heads' norm, weight and RoPE as its one fused kernel instead of two. Prefill ~4% faster at 8K and 32K, 16 users a few percent. Output-moving: the fused kernel rounds differently.
+- `--spec-draft-batched-attn` (opt-in): when several sequences draft together, every drafter layer attends all of them in one flash attention over a shared pool of their drafter caches, instead of a few small kernels per sequence (about 800 a step at 16 users). 16 users ~3.5% faster. Drafts only, as above; one sequence drafts exactly as without it. The pool is allocated once, when the first sequence drafts: one slot per sequence the server can hold, each sized for a full drafter cache (here 20 slots, ~3.8 GB, about what the per-sequence caches would use at full load). If it can't be allocated, or its slots run out, the server warns and falls back to per-sequence caches.
