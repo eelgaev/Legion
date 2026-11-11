@@ -246,3 +246,121 @@ fn pool_matches_the_reference() {
     }
     drop(pool);
 }
+
+/// One step's host-side buffers (ids, x, out) with some pairs the host's.
+fn step_buffers(n_tok: usize, n_used: usize, n_embd: usize) -> (Vec<i32>, Vec<f32>, Vec<f32>) {
+    let mut rng = Rng(3);
+    let ids = (0..n_tok * n_used)
+        .map(|i| if i % 3 == 2 { -1 } else { (i % 4) as i32 })
+        .collect();
+    let x = (0..n_tok * n_embd).map(|_| rng.f()).collect();
+    (ids, x, vec![-7.0; n_tok * n_used * n_embd])
+}
+
+/// A publish that comes long after the job was queued (many warning intervals; the old 10 s
+/// timeout raised "done" here without the rows): "done" stays put until the GPU publishes,
+/// then follows the computed rows.
+#[test]
+fn pool_waits_for_a_late_publish() {
+    use std::sync::atomic::Ordering;
+
+    let (n_embd, n_ff, n_expert, n_used, n_tok) = (512, 256, 6, 4, 2);
+    let (_kinds, he) = experts(n_embd, n_ff, n_expert);
+    let (ready, done) = (AtomicU32::new(0), AtomicU32::new(0));
+    let (ids, x, mut out) = step_buffers(n_tok, n_used, n_embd);
+    // After the buffers: dropped (stopped) first, also when an assert fails.
+    let pool = Pool::new(&[], 3);
+    let queue = pool.add_queue();
+    let job = Job {
+        seq: 1,
+        layer: 0,
+        n_tok,
+        n_used,
+        experts: he,
+        exchange: Exchange {
+            ready: &ready,
+            done: &done,
+            arrived: std::ptr::null(),
+            ids: ids.as_ptr(),
+            x: x.as_ptr(),
+            out: out.as_mut_ptr(),
+            max_tok: n_tok,
+            max_used: n_used,
+            n_embd,
+        },
+    };
+    pool.submit(queue, job);
+    std::thread::sleep(super::pool::READY_WARN_EVERY * 10);
+    assert_eq!(
+        done.load(Ordering::Acquire),
+        0,
+        "done raised before the publish"
+    );
+    // The "GPU" publishes; the pool computes the step, then raises "done".
+    ready.store(1, Ordering::Release);
+    let start = std::time::Instant::now();
+    while done.load(Ordering::Acquire) != 1 {
+        assert!(start.elapsed().as_secs() < 30, "pool stuck");
+        std::hint::spin_loop();
+    }
+    let mut want = vec![-7.0f32; out.len()];
+    // SAFETY: the experts live in `_kinds`.
+    unsafe { reference(&he, n_used, &ids, &x, &mut want) };
+    assert!(want.iter().any(|&v| v != -7.0));
+    assert!(
+        out.iter()
+            .zip(&want)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "the rows before done differ from the reference"
+    );
+    drop(pool);
+}
+
+/// A stopped pool raises "done" for the jobs still queued (a GPU stream still waiting at
+/// teardown drains), without computing them.
+#[test]
+fn stopping_the_pool_releases_queued_jobs() {
+    use std::sync::atomic::Ordering;
+
+    let (n_embd, n_ff, n_expert, n_used, n_tok) = (512, 256, 6, 4, 2);
+    let (_kinds, he) = experts(n_embd, n_ff, n_expert);
+    let (ready, done) = (AtomicU32::new(0), AtomicU32::new(0));
+    let (ids, x, mut out) = step_buffers(n_tok, n_used, n_embd);
+    let pool = Pool::new(&[], 2);
+    let queue = pool.add_queue();
+    for seq in [1, 2] {
+        pool.submit(
+            queue,
+            Job {
+                seq,
+                layer: seq,
+                n_tok,
+                n_used,
+                experts: he,
+                exchange: Exchange {
+                    ready: &ready,
+                    done: &done,
+                    arrived: std::ptr::null(),
+                    ids: ids.as_ptr(),
+                    x: x.as_ptr(),
+                    out: out.as_mut_ptr(),
+                    max_tok: n_tok,
+                    max_used: n_used,
+                    n_embd,
+                },
+            },
+        );
+    }
+    std::thread::sleep(super::pool::READY_WARN_EVERY * 2);
+    assert_eq!(done.load(Ordering::Acquire), 0);
+    pool.stop();
+    assert_eq!(done.load(Ordering::Acquire), 2);
+    assert!(
+        out.iter().all(|&v| v == -7.0),
+        "a released job was computed"
+    );
+    // Stopping again (and the drop) changes nothing.
+    pool.stop();
+    drop(pool);
+    assert_eq!(done.load(Ordering::Acquire), 2);
+}

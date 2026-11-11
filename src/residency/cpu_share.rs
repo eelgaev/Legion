@@ -28,8 +28,9 @@
 //! 2. The expert matvecs (`crate::model::core::expert_mv`) compute the other pairs.
 //! 3. The pool waits for "ready", computes gate, up, SwiGLU and down of its experts with the
 //!    host kernels (each expert once for all its tokens), writes the rows into the exchange
-//!    buffer and sets "done". A layer whose split gives the host nothing sets "done" in the
-//!    publish kernel already.
+//!    buffer and sets "done", never before the rows are written (it waits for "ready" as long
+//!    as it takes, warning now and then). A layer whose split gives the host nothing is done
+//!    as soon as the pool sees "ready".
 //! 4. `collect` (an external op on the down projection's output): the stream waits for "done"
 //!    to equal the sequence number (a stream memory operation: the GPU stalls, it does not
 //!    spin), then copies the host's rows into the output.
