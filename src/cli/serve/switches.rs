@@ -58,8 +58,9 @@ pub(in crate::cli) struct SwitchArgs {
     #[arg(long, help_heading = HEADING)]
     gdn_mma: bool,
     /// CUDA, gated DeltaNet layers, prompt groups of 64+ tokens that run a chunked kernel with
-    /// one CTA per head: ggml-cuda's chunked kernel (and, with --gdn-mma, Legion's port of it)
-    /// instead of Legion's staged one (the default: the same arithmetic and bits; the next
+    /// one CTA per head: ggml-cuda's chunked kernel for the groups it runs itself, and Legion's
+    /// port of it for the groups --gdn-mma brings, instead of Legion's staged one (the default:
+    /// the same arithmetic and bits; the next
     /// chunk's inputs are copied into shared memory while the current one computes, and the
     /// state's MMA operands come from registers; on a DGX Spark (GB10) a Qwen3.8-Flash-Next layer
     /// of 4K prompt tokens takes 1.45 ms instead of 2.41). The default takes ggml-cuda's own
