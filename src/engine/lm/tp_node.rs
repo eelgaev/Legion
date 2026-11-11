@@ -551,7 +551,14 @@ fn handle(
             exec.set_pipeline_micro(micro as usize);
             exec.set_micro_taper(taper as usize);
             exec.set_gather_budget(gather_budget as usize);
-            let groups = crate::model::core::from_wire(&groups)?;
+            let mut groups = crate::model::core::from_wire(&groups)?;
+            // Rank 0 samples, this rank only keeps the captured rows: no output head here when
+            // the layers run on all rows anyway (#1176).
+            if exec.captures_hidden() {
+                for s in groups.iter_mut().flat_map(|g| &mut g.seqs) {
+                    s.logits = crate::model::core::Logits::None;
+                }
+            }
             let t0 = std::time::Instant::now();
             comm.mark_step(profile);
             // The rows of the step before the last are not read any more (rank 0 names at most
@@ -604,23 +611,37 @@ fn handle(
         Request::TpMtpChain {
             groups,
             gather_budget,
+            parts,
             h,
             caps,
             p_min,
+            tails,
         } => {
-            // Rank 0's whole draft round: the same passes from the same picks (#771).
+            // Rank 0's whole draft round: the same passes from the same picks (#771), reading
+            // this rank's copy of the step's rows where rank 0 names them (#780).
             exec.set_gather_budget(gather_budget as usize);
             let groups = crate::model::core::from_wire(&groups)?;
+            let parts = rows_of(&parts, &h, &rows[..])?;
             let t0 = std::time::Instant::now();
             comm.mark_step(profile);
+            // The n-gram rows the verify step after the round reads, started as rank 0 starts
+            // its own (#1176): the bonus tokens' now, each draft's once drafted.
+            for t in tails.iter().filter(|t| !t.is_empty()) {
+                super::spec::prefetch_after(exec, t, &[]);
+            }
             let first: Vec<usize> = (0..caps.len()).collect();
             exec.mtp_chain(
                 &groups,
-                &[&h],
+                &parts,
                 &caps,
                 &first,
                 f32::from_bits(p_min),
-                |_, _, _| {},
+                &[],
+                |exec, k, drafts| {
+                    if let Some(t) = tails.get(k) {
+                        super::spec::prefetch_after(exec, t, drafts);
+                    }
+                },
             )
             .map_err(|e| e.to_string())?;
             comm.record(profile, t0.elapsed(), None);

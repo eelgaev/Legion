@@ -4,8 +4,8 @@
 
 `--model` is the downloaded snapshot of `nvidia/Qwen3.8-Flash-Next-NVFP4` on each Spark. One process per Spark.
 Rank 0 serves HTTP; `--tp-peers` lists the two ranks' addresses on the QSFP link (rank 0 first) and is the same on
-both. MTP uses the checkpoint's own head, so there is no `--spec-draft` file. Decode (38-50 tok/s at 1 user, 112.0 at 4,
-231.4 at 16) and prefill (2,990 / 3,122 / 2,956 tok/s at 8K / 32K / 123K):
+both. MTP uses the checkpoint's own head, so there is no `--spec-draft` file. Decode (39-52 tok/s at 1 user, 113.7 at 4,
+240.5 at 16) and prefill (2,990 / 3,122 / 2,956 tok/s at 8K / 32K / 123K):
 
 ```sh
 # rank 0
@@ -59,7 +59,9 @@ Measured against vLLM 0.33.0 with tensor parallel 2, MTP and CUDA graphs on the 
 - `--spec-draft-vocab` (`65536`): The MTP head scores only the first N vocabulary entries while drafting, reading N rows of the output head instead of all of them. Drafting gets cheaper; the verify step still checks against the full vocabulary, so output does not change.
 - `--spec-k` (`2`): Maximum draft tokens per sequence and step.
 - `--tp-mtp-chain`: Rank 0 sends a whole draft round as one request and every rank runs the round's further MTP passes on its own, instead of one network round trip per pass.
-- `--tp-mtp-local-rows`: The other ranks read the MTP head's input rows from their own copy of the step output instead of receiving them from rank 0.
+- `--tp-mtp-local-rows`: The other ranks read the MTP head's input rows from their own copy of the step output instead of receiving them from rank 0 (for prompt chunks and, with `--tp-mtp-chain`, for decode draft rounds too). Draft rounds also let the other
+  ranks start their n-gram reads early, and the other ranks skip the output head (rank 0 samples): 16 users
+  231.7 -> 240.5 tok/s, 4 users 111.7 -> 113.7, same output.
 - `--spec-fixed`: Always drafts `--spec-k` tokens: turns off the depth policy's acceptance adaptation and its batch gate.
 - `--tp-moe-ep`: Expert parallelism inside tensor parallelism: each expert lives on one rank, so its fixed cost is paid once instead of on both Sparks. Each rank reads and repacks only its own NVFP4 experts at load. The checkpoint's per-expert scales keep its experts
   on Legion's grouped NVFP4 kernels, which skip the other rank's (token, expert) pairs, so each rank computes only

@@ -92,9 +92,21 @@ fn requests_round_trip() {
                 _ => unreachable!(),
             },
             gather_budget: 0,
+            parts: vec![
+                RowsPart::Sent { len: 1 },
+                RowsPart::Step {
+                    back: 0,
+                    layer: 2,
+                    start: 30,
+                    len: 10,
+                    check: 0,
+                },
+                RowsPart::Sent { len: 1 },
+            ],
             h: vec![0.25, -7.5],
             caps: vec![8, 1, 0],
             p_min: 0.35f32.to_bits(),
+            tails: vec![vec![5, 6, 7], vec![], vec![u32::MAX]],
         },
         Request::TpMtpRows {
             groups: match step() {

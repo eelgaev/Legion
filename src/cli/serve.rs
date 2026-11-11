@@ -734,6 +734,7 @@ pub(super) struct ModelArgs {
     /// about 42 MB per 1024 prompt tokens of Qwen3.8-Flash-Next over the control connection.
     /// Two DGX Sparks, --spec-k 2: the gap between 4096-token prompt steps 208 -> 35 ms, 32K
     /// prefill 2,237 -> 2,436 tok/s, 8K 2,309 -> 2,364; same drafts and output either way.
+    /// With --tp-mtp-chain, a decode draft round's rows from the verify step too (#1176).
     #[arg(long)]
     pub tp_mtp_local_rows: bool,
     /// With --tp-rank, Qwen3.8-Flash-Next (qwen4exp): expert parallelism for the routed

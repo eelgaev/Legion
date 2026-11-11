@@ -356,8 +356,7 @@ impl Executor {
     ) -> Result<MtpOutput, ModelError> {
         let lead = self.tp.as_ref().expect("tensor-parallel lead");
         let req = if lead.local_rows {
-            let mut h = Vec::new();
-            let parts = rows_parts(&[&lead.step_rows, &lead.prev_rows], parts, &mut h);
+            let (parts, h) = self.tp_rows_wire(parts);
             Request::TpMtpRows {
                 groups: super::remote::to_wire(groups),
                 gather_budget: self.gather_budget as u64,
@@ -372,6 +371,24 @@ impl Executor {
             }
         };
         self.tp_run(&req, |e| e.mtp_step_here(groups, parts))
+    }
+
+    /// An MTP pass's residual rows `parts` as the other ranks read them: with
+    /// `--tp-mtp-local-rows` the ones within the last two steps' rows as ranges of their own
+    /// copies, the rest sent (the floats to send second); else all sent, as one part.
+    pub(super) fn tp_rows_wire(&self, parts: &[&[f32]]) -> (Vec<RowsPart>, Vec<f32>) {
+        let lead = self.tp.as_ref().expect("tensor-parallel lead");
+        if lead.local_rows {
+            let mut h = Vec::new();
+            let parts = rows_parts(&[&lead.step_rows, &lead.prev_rows], parts, &mut h);
+            (parts, h)
+        } else {
+            let h = parts.concat();
+            let parts = vec![RowsPart::Sent {
+                len: h.len() as u64,
+            }];
+            (parts, h)
+        }
     }
 
     /// Sends `req` to the other ranks, then runs it here with `run` (a pass of `--tp-profile`).
