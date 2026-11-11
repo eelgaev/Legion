@@ -133,3 +133,36 @@ fn device_take_in_reads_the_tail_and_its_pending_row() {
     assert_eq!(take_in_host_from(TAKE_IN_TAIL + 2), 1);
     assert_eq!(take_in_host_from(3), 0);
 }
+
+#[test]
+fn device_take_in_room_covers_the_bonus_token_and_drafts() {
+    use crate::model::core::KV_BLOCK;
+    let k = 3;
+    // A block-aligned prompt read in one chunk: the bonus token and the drafts sit in a block
+    // past the prompt's, taken before the step.
+    let prompt = 4 * KV_BLOCK;
+    let room = device_take_in_room(prompt, 0, prompt, k).unwrap();
+    assert_eq!(room, prompt + k);
+    assert_eq!(room.div_ceil(KV_BLOCK), 5);
+    // The last chunk of a longer one, and of one ending a token before its last block's end.
+    assert_eq!(
+        device_take_in_room(prompt, KV_BLOCK, prompt - KV_BLOCK, k),
+        Some(prompt + k)
+    );
+    assert_eq!(
+        device_take_in_room(prompt - 1, KV_BLOCK, prompt - 1 - KV_BLOCK, k),
+        Some(prompt - 1 + k)
+    );
+    // A chunk with more than a block after it: its own tokens, which the plan already holds.
+    assert_eq!(
+        device_take_in_room(prompt, 0, 2 * KV_BLOCK, k),
+        Some(2 * KV_BLOCK)
+    );
+    // At most a block after it: left for the next step; a short chunk: on the host.
+    assert_eq!(device_take_in_room(prompt, 0, 3 * KV_BLOCK, k), None);
+    assert_eq!(
+        device_take_in_room(prompt, prompt - TAKE_IN_TAIL - 1, TAKE_IN_TAIL + 1, k),
+        None
+    );
+    assert!(device_take_in_room(prompt, prompt - TAKE_IN_TAIL - 2, TAKE_IN_TAIL + 2, k).is_some());
+}

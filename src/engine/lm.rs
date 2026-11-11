@@ -7225,6 +7225,23 @@ impl Worker {
             return Ok(());
         };
         self.clock.lap(host_time::Phase::Plan, &mut at);
+        // A step of one prompt's chunk alone that the MTP head takes in right after (not left
+        // for the next step, [`DeferredTakeIn`]): its rows stay on the device for the head's
+        // pieces, and only the last few are read back (#1183). A chunk that ends the prompt gets
+        // the blocks of its bonus token and drafts now: after the step, growing waits until the
+        // head has read those rows (`grow_after`), and the head's first pass writes past them.
+        let mtp_device = match (&self.drafting, &plan.chunks[..]) {
+            (Drafting::Mtp(_), &[(i, len)]) if decoding.is_empty() => {
+                let s = &prefilling[i];
+                let room = spec::device_take_in_room(s.prompt.len(), s.n_past, len, self.spec_k);
+                room.zip(self.exec.mtp_rows_device())
+                    .map(|(n, d)| (i, len, n, d))
+            }
+            _ => None,
+        };
+        if let Some((i, _, n, _)) = mtp_device {
+            self.grow(&mut prefilling[i], n)?;
+        }
         let asked = self.ask_captures(prefilling, &plan.chunks);
         let fed = fed_tokens(decoding, &plan);
         // Which rows are padding, for the MoE layers' expert kernels (`pad_rows`).
@@ -7308,21 +7325,11 @@ impl Worker {
             _ => None,
         };
         self.exec.set_hidden_on_device(on_device);
-        // A step of one prompt's chunk alone that the MTP head takes in right after (not left
-        // for the next step, [`DeferredTakeIn`]): its rows stay on the device for the head's
-        // pieces, and only the last few are read back (#1183).
-        if let (Drafting::Mtp(_), &[(i, len)]) = (&self.drafting, &plan.chunks[..])
-            && decoding.is_empty()
-            && len > spec::TAKE_IN_TAIL + 1
-        {
-            let s = &prefilling[i];
-            let rest = s.prompt.len() - (s.n_past + len);
-            let device = self.exec.mtp_rows_device();
-            if (rest == 0 || rest > KV_BLOCK) && device.is_some() {
-                self.exec.set_hidden_on_device(device);
-                self.exec
-                    .set_hidden_on_device_from(spec::take_in_host_from(len));
-            }
+        // The MTP head's take-in from the device (see `mtp_device` above).
+        if let Some((_, len, _, device)) = mtp_device {
+            self.exec.set_hidden_on_device(Some(device));
+            self.exec
+                .set_hidden_on_device_from(spec::take_in_host_from(len));
         }
         self.clock.lap(host_time::Phase::Pack, &mut at);
         let t_step = Instant::now();

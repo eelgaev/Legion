@@ -193,6 +193,25 @@ pub(super) fn take_in_host_from(ran: usize) -> usize {
     ran.saturating_sub(TAKE_IN_TAIL + 1)
 }
 
+/// Whether a step of one prompt's chunk alone (`len` tokens from `n_past`, of a `prompt`-token
+/// prompt) leaves its rows on the device for the MTP head's take-in (#1183), and if so the
+/// tokens the prompt's block table must hold before the step: a chunk that ends the prompt
+/// is followed by the head's bonus-token pass and up to `k` drafts, whose blocks are taken
+/// before the step because growing the table after it can drop the buffer those rows are in.
+/// `None`: the chunk's take-in is short, or left for the next step (`DeferredTakeIn`).
+pub(super) fn device_take_in_room(
+    prompt: usize,
+    n_past: usize,
+    len: usize,
+    k: usize,
+) -> Option<usize> {
+    let rest = prompt - (n_past + len);
+    if len <= TAKE_IN_TAIL + 1 || (rest > 0 && rest <= crate::model::core::KV_BLOCK) {
+        return None;
+    }
+    Some(if rest == 0 { prompt + k } else { n_past + len })
+}
+
 /// The tokens of `fed` (a sequence's tokens up to its bonus token) an n-gram row after it
 /// reads: its last 8.
 pub(super) fn ngram_tail(fed: &[u32]) -> &[u32] {
