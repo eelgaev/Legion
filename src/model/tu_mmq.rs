@@ -72,7 +72,8 @@ pub fn set_tu_mmq(on: bool) {
 }
 
 /// The engine's GPU: `sms` streaming multiprocessors when it is a Turing GPU without tensor
-/// cores ([`crate::hw::per_device::turing_without_tensor_cores`]), else 0 (the op is off).
+/// cores ([`crate::hw::per_device::turing_without_tensor_cores`]), else 0. Only weights whose
+/// device a tensor doesn't name go by it; the rest ask their own device.
 pub fn set_gpu(sms: i32) {
     GPU_SMS.store(sms.max(0), Ordering::Relaxed);
 }
@@ -82,14 +83,11 @@ pub fn gpu_sms() -> i32 {
     GPU_SMS.load(Ordering::Relaxed)
 }
 
-/// The SMs of `w`'s GPU where the op runs there, else 0: the engine's GPU is one ([`gpu_sms`])
-/// and so is the weight's own device (a box may hold GPUs of different kinds).
+/// The SMs of `w`'s GPU where the op runs there, else 0: asked of the weight's own device (a
+/// process may hold engines on GPUs of different kinds, so the last engine loaded doesn't
+/// decide for the others); the engine's GPU ([`gpu_sms`]) only where the device is unknown.
 fn sms_for(w: Tensor<'_>) -> i32 {
-    let engine = gpu_sms();
-    if engine <= 0 {
-        return 0;
-    }
-    w.cuda_device().map_or(engine, |d| {
+    w.cuda_device().map_or_else(gpu_sms, |d| {
         if crate::hw::per_device::turing_without_tensor_cores(d) {
             crate::hw::per_device::sm_count(d)
         } else {
@@ -172,17 +170,14 @@ fn ds4(ty: ffi::ggml_type) -> bool {
     ty == types::Q4_K || ty == types::Q5_K
 }
 
-/// Whether `w @ x` takes the op: switched on, a TU11x GPU ([`set_gpu`]) holding the weight in
-/// its memory, shapes the op takes ([`fits`]) and a plan ggml runs unsplit ([`ggml_unsplit`]).
+/// Whether `w @ x` takes the op: switched on, a TU11x GPU holding the weight in its memory,
+/// shapes the op takes ([`fits`]) and a plan ggml runs unsplit ([`ggml_unsplit`]).
 pub fn takes(w: Tensor<'_>, x: Tensor<'_>) -> bool {
-    if !ON.load(Ordering::Relaxed) || !cfg!(feature = "cuda") || gpu_sms() <= 0 {
+    if !ON.load(Ordering::Relaxed) || !cfg!(feature = "cuda") || w.is_host() || w.is_meta() {
         return false;
     }
     let sms = sms_for(w) as i64;
-    sms > 0
-        && !w.is_host()
-        && !w.is_meta()
-        && fits((w.ty(), w.ne(), w.nb()), (x.ty(), x.ne(), x.nb()), sms)
+    sms > 0 && fits((w.ty(), w.ne(), w.nb()), (x.ty(), x.ne(), x.nb()), sms)
 }
 
 /// [`takes`] on shapes: a Q4_K, Q5_K, Q6_K or Q8_0 weight `[k, rows]` with contiguous rows,
