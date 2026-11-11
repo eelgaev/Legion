@@ -843,15 +843,368 @@ template <int C> static __global__ __launch_bounds__(256, 1) void gdn_staged(leg
 #endif  // LEGION_GDN_MMA_AVAILABLE
 }
 
+// gdn_split (#1183 round 9): gdn_staged's arithmetic in the same order (so ggml's bits), with
+// COLS value columns a CTA (D / COLS CTAs a head; the state is independent per value column, so
+// a CTA recomputes the chunk's Gram, P and inverse it shares with the head's other CTAs) and
+// every warp owning CB 8-column blocks (warp + WARPS * cb) of every row block of the state:
+// - <64, 8, 1, 2, 1>: two CTAs a head at 128 registers, so two CTAs an SM (96 CTAs for one
+//   GPU's 48 heads on the GB10's 48 SMs);
+// - <128, 16, 1, 1, S>: one CTA a head of 16 warps at 128 registers; with two input buffers
+//   (S = 2) the default for whole heads on compute capability 12.x (GB10, 4K tokens: 1.33 ms a
+//   layer, gdn_staged 1.45, ggml 2.41);
+// - <128, 8, 2, 1, 1>: gdn_staged's layout.
+// A warp's solve, output, decayed delta and state update read only its own columns of delta and
+// solved, so those steps need warp barriers only. With one input buffer (STAGES 1) the inputs
+// come in two cp.async groups: the next chunk's q, k, g and beta once this chunk's are
+// converted, its v once this chunk's projection has read them; with two, the next chunk's whole
+// inputs at the top of the chunk.
+template <int COLS, int STAGES> struct alignas(128) split_shared {
+    matrix<16, D>    q, k;
+    matrix<16, 16>   p, inverse;
+    matrix<16, COLS> delta, solved;
+    float            lower[16 * 16], prefix[16], beta[16];
+
+    static __device__ __forceinline__ int lower_index(int r, int c) { return r * 16 + c; }
+
+    struct alignas(16) stage_t {
+        float q[16 * D], k[16 * D], v[16 * COLS], g[16], beta[16];
+    } stage[STAGES];
+};
+
+// gdn_mma.rs's `Schedule::smem()` for the split kernels.
+static_assert(sizeof(split_shared<64, 1>) == 48384, "gdn_mma.rs's split smem(64, 1)");
+static_assert(sizeof(split_shared<128, 1>) == 60672, "gdn_mma.rs's split smem(128, 1)");
+static_assert(sizeof(split_shared<128, 2>) == 85376, "gdn_mma.rs's split smem(128, 2)");
+
+template <int COLS, int WARPS, int CB, int MINB, int STAGES>
+static __global__ __launch_bounds__(32 * WARPS, MINB) void gdn_split(legion_gdn_mma_args a) {
+#ifdef LEGION_GDN_MMA_AVAILABLE
+    constexpr int C       = 16;
+    constexpr int N       = 8;
+    constexpr int THREADS = 32 * WARPS;
+    constexpr int SLICES  = D / COLS;
+    static_assert(COLS == N * WARPS * CB && D % COLS == 0, "warps own whole 8-column blocks");
+    extern __shared__ __align__(128) unsigned char bytes[];
+    auto & s = *reinterpret_cast<split_shared<COLS, STAGES> *>(bytes);
+    static_assert(STAGES == 1 || STAGES == 2, "one buffer in two groups, or two buffers");
+    const int                                      lane = threadIdx.x, warp = threadIdx.y, tid = warp * 32 + lane;
+    const int                                      slice = blockIdx.x % SLICES;
+    const int                                      h     = (blockIdx.x / SLICES) % a.H;
+    const int                                      seq   = blockIdx.x / (SLICES * a.H);
+    const int                                      v0    = slice * COLS;
+    const int64_t                                  soff  = ((int64_t) seq * a.H + h) * D * D;
+    const int64_t                                  qoff  = (seq / a.rq3) * a.sq3 + (h % a.H_k) * a.sq1;
+    const int64_t                                  voff  = seq * a.sv3 + h * a.sv1 + v0;
+    const int64_t                                  goff  = seq * a.sb3 + h * a.sb1;
+    float *                                        out   = a.dst + ((int64_t) seq * a.n_tokens * a.H + h) * D + v0;
+    // State tile kb * CB + cb: rows 16 * kb, the CTA's columns 8 * (warp + WARPS * cb).
+    acc state[(D / 16) * CB];
+#pragma unroll
+    for (int kb = 0; kb < D / 16; ++kb) {
+#pragma unroll
+        for (int cb = 0; cb < CB; ++cb) {
+            const int c = (warp + WARPS * cb) * N;
+#pragma unroll
+            for (int i = 0; i < acc::ne; ++i) {
+                state[kb * CB + cb].x[i] = a.state[soff + (v0 + c + acc::get_j(i)) * D + 16 * kb + acc::get_i(i)];
+            }
+        }
+    }
+    // Tokens past the end are zeros (cp.async's zero fill), as gdn_single reads them.
+    auto issue_qk = [&](int buf, int64_t t0) {
+        auto & st = s.stage[buf];
+        for (int i = tid; i < C * (D / 4); i += THREADS) {
+            const int     t = i / (D / 4), d = 4 * (i % (D / 4));
+            const bool    ok = t0 + t < a.n_tokens;
+            const int64_t tt = ok ? t0 + t : 0;
+            cp_async16(st.q + t * D + d, a.q + qoff + tt * a.sq2 + d, ok);
+            cp_async16(st.k + t * D + d, a.k + qoff + tt * a.sq2 + d, ok);
+        }
+        if (tid < 2 * C) {
+            const int     t  = tid % C;
+            const bool    ok = t0 + t < a.n_tokens;
+            const int64_t tt = ok ? t0 + t : 0;
+            if (tid < C) {
+                cp_async4(st.g + t, a.g + goff + tt * a.sb2, ok);
+            } else {
+                cp_async4(st.beta + t, a.beta + goff + tt * a.sb2, ok);
+            }
+        }
+        if constexpr (STAGES == 1) {
+            asm volatile("cp.async.commit_group;" ::: "memory");
+        }
+    };
+    auto issue_v = [&](int buf, int64_t t0) {
+        auto & st = s.stage[buf];
+        for (int i = tid; i < C * (COLS / 4); i += THREADS) {
+            const int     t = i / (COLS / 4), d = 4 * (i % (COLS / 4));
+            const bool    ok = t0 + t < a.n_tokens;
+            const int64_t tt = ok ? t0 + t : 0;
+            cp_async16(st.v + t * COLS + d, a.v + voff + tt * a.sv2 + d, ok);
+        }
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    };
+    // STAGES 1: q, k, g, beta in one group and v in the next; STAGES 2: a chunk in one group.
+    issue_qk(0, 0);
+    issue_v(0, 0);
+    int buf = 0;
+    for (int64_t t0 = 0; t0 < a.n_tokens; t0 += C, buf ^= STAGES - 1) {
+        const int  valid = min((int64_t) C, a.n_tokens - t0);
+        const bool more  = t0 + C < a.n_tokens;
+        if constexpr (STAGES == 2) {
+            // The other buffer was last read before the previous chunk's solve.
+            if (more) {
+                issue_qk(buf ^ 1, t0 + C);
+                issue_v(buf ^ 1, t0 + C);
+            } else {
+                asm volatile("cp.async.commit_group;" ::: "memory");
+            }
+        }
+        // In flight: this chunk's q/k group, then its v group (STAGES 1); this chunk's group,
+        // then the next one's (STAGES 2).
+        asm volatile("cp.async.wait_group 1;" ::: "memory");
+        // Also orders the previous chunk's state update reads of k before the writes below.
+        __syncthreads();
+        const auto & st = s.stage[buf];
+        for (int t = warp; t < C; t += WARPS) {
+            const int    d = 4 * lane;
+            const float4 q = *reinterpret_cast<const float4 *>(st.q + t * D + d);
+            const float4 k = *reinterpret_cast<const float4 *>(st.k + t * D + d);
+            s.q.store2(t, d, make_float2(q.x * a.scale, q.y * a.scale));
+            s.q.store2(t, d + 2, make_float2(q.z * a.scale, q.w * a.scale));
+            s.k.store2(t, d, make_float2(k.x, k.y));
+            s.k.store2(t, d + 2, make_float2(k.z, k.w));
+        }
+        if (warp == 0) {
+            float carry = 0.f;
+            for (int base = 0; base < C; base += 32) {
+                const int   t    = base + lane;
+                float       g    = t < valid ? st.g[t] : 0.f;
+                const float beta = t < valid ? st.beta[t] : 0.f;
+#pragma unroll
+                for (int offset = 1; offset < 32; offset *= 2) {
+                    const float previous = __shfl_up_sync(0xffffffff, g, offset, 32);
+                    if (lane >= offset) {
+                        g += previous;
+                    }
+                }
+                g += carry;
+                if (t < C) {
+                    s.prefix[t] = g;
+                    s.beta[t]   = beta;
+                }
+                carry = __shfl_sync(0xffffffff, g, 31, 32);
+            }
+        }
+        __syncthreads();
+        // The q/k stage is read; the next chunk's q, k, g and beta land while this one computes.
+        if constexpr (STAGES == 1) {
+            if (more) {
+                issue_qk(0, t0 + C);
+            } else {
+                asm volatile("cp.async.commit_group;" ::: "memory");
+            }
+        }
+        // A = beta * strict_tril(K K^T * decay), P = tril(Q K^T * decay)
+        for (int ti = warp; ti < 2 * (C / 16) * (C / N); ti += WARPS) {
+            const bool gram = ti < (C / 16) * (C / N);
+            const int  t = ti % ((C / 16) * (C / N)), r = (t / (C / N)) * 16, c = (t % (C / N)) * N;
+            acc        x;
+            if (gram) {
+                product<D>(x, s.k, s.k, r, c);
+            } else {
+                product<D>(x, s.q, s.k, r, c);
+            }
+#pragma unroll
+            for (int i = 0; i < acc::ne; ++i) {
+                const int   rr = r + acc::get_i(i), cc = c + acc::get_j(i);
+                const float v  = rr < valid && cc <= rr ? x.x[i] * expf(s.prefix[rr] - s.prefix[cc]) : 0.f;
+                if (gram) {
+                    if (cc < rr) {
+                        s.lower[s.lower_index(rr, cc)] = v * s.beta[rr];
+                    }
+                } else {
+                    s.p.store(rr, cc, v);
+                }
+            }
+        }
+        if constexpr (STAGES == 1) {
+            // In flight: this chunk's v group, then the next chunk's q/k group.
+            asm volatile("cp.async.wait_group 1;" ::: "memory");
+        }
+        __syncthreads();
+        // inverse = (I + A)^-1 by forward substitution
+        for (int row = warp; row < C; row += WARPS) {
+            float x;
+            {
+                const int col = lane;
+                x             = col == row ? 1.f : (col < row ? -s.lower[s.lower_index(row, col)] : 0.f);
+            }
+            for (int pivot = row - 1; pivot > 0; --pivot) {
+                const float xp = __shfl_sync(0xffffffff, x, pivot, 32);
+                if (lane < pivot) {
+                    x -= xp * s.lower[s.lower_index(pivot, lane)];
+                }
+            }
+            if (lane < C) {
+                s.inverse.store(row, lane, x);
+            }
+        }
+        // delta = beta * (v - decay * K S), base output = decay * Q S, for the warp's columns.
+        acc base_output[CB];
+        {
+            acc qs[CB], ks[CB];
+#pragma unroll
+            for (int kb = 0; kb < D / 16; ++kb) {
+                const auto qh = load<a_tile, false>(s.q, 0, 16 * kb, false);
+                const auto ql = load<a_tile, false>(s.q, 0, 16 * kb, true);
+                const auto kh = load<a_tile, false>(s.k, 0, 16 * kb, false);
+                const auto kl = load<a_tile, false>(s.k, 0, 16 * kb, true);
+#pragma unroll
+                for (int cb = 0; cb < CB; ++cb) {
+                    b_tile bh, bl;
+                    state_b(state[kb * CB + cb], bh, bl);
+                    mma::mma(qs[cb], ql, bh);
+                    mma::mma(qs[cb], qh, bl);
+                    mma::mma(qs[cb], qh, bh);
+                    mma::mma(ks[cb], kl, bh);
+                    mma::mma(ks[cb], kh, bl);
+                    mma::mma(ks[cb], kh, bh);
+                }
+            }
+#pragma unroll
+            for (int cb = 0; cb < CB; ++cb) {
+                const int c = (warp + WARPS * cb) * N;
+#pragma unroll
+                for (int i = 0; i < acc::ne; ++i) {
+                    const int   t = acc::get_i(i), v = c + acc::get_j(i);
+                    const float decay = expf(s.prefix[t]);
+                    const float vv    = t < valid ? st.v[t * COLS + v] : 0.f;
+                    s.delta.store(t, v, s.beta[t] * (vv - decay * ks[cb].x[i]));
+                    base_output[cb].x[i] = decay * qs[cb].x[i];
+                }
+            }
+        }
+        // Orders the inverse's stores before the solves' reads, and the projections' reads of
+        // the v stage before the next chunk's v lands there.
+        __syncthreads();
+        if constexpr (STAGES == 1) {
+            if (more) {
+                issue_v(0, t0 + C);
+            } else {
+                asm volatile("cp.async.commit_group;" ::: "memory");
+            }
+        }
+        // solved = inverse * delta
+        {
+            const auto ih = load<a_tile, false>(s.inverse, 0, 0, false);
+            const auto il = load<a_tile, false>(s.inverse, 0, 0, true);
+#pragma unroll
+            for (int cb = 0; cb < CB; ++cb) {
+                const int  c  = (warp + WARPS * cb) * N;
+                const auto bh = load<b_tile, true>(s.delta, c, 0, false);
+                const auto bl = load<b_tile, true>(s.delta, c, 0, true);
+                acc        x;
+                mma::mma(x, il, bh);
+                mma::mma(x, ih, bl);
+                mma::mma(x, ih, bh);
+                store(s.solved, x, 0, c);
+            }
+        }
+        __syncwarp();
+        // out = base output + P * solved
+        {
+            const auto ph = load<a_tile, false>(s.p, 0, 0, false);
+            const auto pl = load<a_tile, false>(s.p, 0, 0, true);
+#pragma unroll
+            for (int cb = 0; cb < CB; ++cb) {
+                const int  c  = (warp + WARPS * cb) * N;
+                const auto bh = load<b_tile, true>(s.solved, c, 0, false);
+                const auto bl = load<b_tile, true>(s.solved, c, 0, true);
+                acc        x;
+                mma::mma(x, pl, bh);
+                mma::mma(x, ph, bl);
+                mma::mma(x, ph, bh);
+#pragma unroll
+                for (int i = 0; i < acc::ne; ++i) {
+                    const int t = acc::get_i(i), v = c + acc::get_j(i);
+                    if (t < valid) {
+                        out[(t0 + t) * a.H * D + v] = base_output[cb].x[i] + x.x[i];
+                    }
+                }
+            }
+        }
+        // delta = solved * decay to chunk end, the warp's columns (gdn_single's values).
+        const float end = s.prefix[valid - 1];
+#pragma unroll
+        for (int cb = 0; cb < CB; ++cb) {
+            const int c = (warp + WARPS * cb) * N;
+#pragma unroll
+            for (int e = lane; e < C * N; e += 32) {
+                const int   t = e / N, v = c + e % N, j = s.solved.index(t, v);
+                const float x = __bfloat162float(s.solved.hi[j]) + __bfloat162float(s.solved.lo[j]);
+                s.delta.store(t, v, x * expf(end - s.prefix[t]));
+            }
+        }
+        __syncwarp();
+        // S = decay(chunk) * S + K^T * delta
+        const float decay = expf(end);
+        b_tile      dh[CB], dl[CB];
+#pragma unroll
+        for (int cb = 0; cb < CB; ++cb) {
+            const int c = (warp + WARPS * cb) * N;
+            dh[cb]      = load<b_tile, true>(s.delta, c, 0, false);
+            dl[cb]      = load<b_tile, true>(s.delta, c, 0, true);
+        }
+#pragma unroll
+        for (int kb = 0; kb < D / 16; ++kb) {
+            const auto kh = load<a_tile, true>(s.k, 16 * kb, 0, false);
+            const auto kl = load<a_tile, true>(s.k, 16 * kb, 0, true);
+#pragma unroll
+            for (int cb = 0; cb < CB; ++cb) {
+                acc & x = state[kb * CB + cb];
+#pragma unroll
+                for (int i = 0; i < acc::ne; ++i) {
+                    x.x[i] *= decay;
+                }
+                mma::mma(x, kl, dh[cb]);
+                mma::mma(x, kh, dl[cb]);
+                mma::mma(x, kh, dh[cb]);
+            }
+        }
+    }
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+#pragma unroll
+    for (int kb = 0; kb < D / 16; ++kb) {
+#pragma unroll
+        for (int cb = 0; cb < CB; ++cb) {
+            const int c = (warp + WARPS * cb) * N;
+#pragma unroll
+            for (int i = 0; i < acc::ne; ++i) {
+                a.state_out[soff + (v0 + c + acc::get_j(i)) * D + 16 * kb + acc::get_i(i)] = state[kb * CB + cb].x[i];
+            }
+        }
+    }
+#else
+    (void) a;
+    __trap();  // gdn_mma.rs launches it on compute capability 8.0+ only
+#endif  // LEGION_GDN_MMA_AVAILABLE
+}
+
 }  // namespace
 
 // The kernels as the CUDA runtime knows them (their host stubs), for Rust's cudaLaunchKernel, in
 // the order of gdn_mma.rs's `Schedule`: value slices of 32 at one and two blocks an SM, whole
-// heads, whole heads staged. They sit in an anonymous namespace: with relocatable device code the
-// device link left extern "C" kernels out of the linked image.
-extern "C" const void * const legion_gdn_mma_kernels[4] = {
+// heads, whole heads staged, then the split kernels (two CTAs a head, 16 warps a head, 8 warps
+// a head, 16 warps a head with two input buffers). They sit in an anonymous namespace: with relocatable device code the device link left
+// extern "C" kernels out of the linked image.
+extern "C" const void * const legion_gdn_mma_kernels[8] = {
     reinterpret_cast<const void *>(&gdn_single<16, 32, 1>),
     reinterpret_cast<const void *>(&gdn_single<16, 32, 2>),
     reinterpret_cast<const void *>(&gdn_single<16, 128>),
     reinterpret_cast<const void *>(&gdn_staged<16>),
+    reinterpret_cast<const void *>(&gdn_split<64, 8, 1, 2, 1>),
+    reinterpret_cast<const void *>(&gdn_split<128, 16, 1, 1, 1>),
+    reinterpret_cast<const void *>(&gdn_split<128, 8, 2, 1, 1>),
+    reinterpret_cast<const void *>(&gdn_split<128, 16, 1, 1, 2>),
 };

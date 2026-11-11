@@ -18,9 +18,11 @@
 //! SM count, read once per device) and the launch (`cudaLaunchKernel` with the grid, block and
 //! shared memory chosen here).
 //!
-//! #1183: whole heads run `gdn_staged`, ggml's whole-head kernel with the same arithmetic in the
-//! same order (its bits) that copies the next chunk's inputs into shared memory while the current
-//! one computes and takes the state's MMA operands from registers. On compute capability 12.x
+//! #1183: whole heads run `gdn_split<128, 16, 1, 1, 2>` ([`Schedule::WideTwo`]), ggml's
+//! whole-head kernel with the same arithmetic in the same order (its bits) on 16 warps, each
+//! owning one 8-column block of the state in registers (the MMA operands come from there), with
+//! the next chunk's inputs copied into shared memory while the current one computes and warp
+//! barriers only for the per-column steps. On compute capability 12.x
 //! (the GB10, RTX 50) the groups ggml-cuda gives its own chunked kernel (one GPU's 16 key and 48
 //! value heads of Qwen3.8-Flash-Next) come here by default for it ([`set_gdn_staged`]; `legion
 //! serve --gdn-prompt-ggml` keeps ggml's op).
@@ -55,10 +57,6 @@ pub(super) const MIN_TOKENS: i64 = 64;
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 const CHUNK: i64 = 16;
 
-/// Threads of a CTA: 8 warps (`dim3(32, 8)`).
-#[cfg(feature = "cuda")]
-const BLOCK_THREADS: [u32; 3] = [32, 8, 1];
-
 /// How [`gdn_mma`] spreads a group over the GPU: ggml's `select_gdn_mma_path` for NVIDIA GPUs.
 /// The discriminants index `legion_gdn_mma_kernels` (`src/cuda/gdn_mma.cu`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,14 +69,26 @@ pub(super) enum Schedule {
     /// One CTA a head (`gdn_single<16, 128>`).
     Heads = 2,
     /// As [`Schedule::Heads`], the inputs staged through shared memory (`gdn_staged<16>`, the
-    /// same bits): what [`Schedule::Heads`] runs when [`set_gdn_staged`] is on and the inputs
-    /// are 16-byte aligned.
+    /// same bits; #1183 round 8).
     Staged = 3,
+    /// Two CTAs a head, 64 value columns each, two CTAs an SM (`gdn_split<64, 8, 1, 2>`): the
+    /// staged kernel's bits, each CTA recomputing the chunk's Gram, P and inverse.
+    Pair = 4,
+    /// One CTA of 16 warps a head (`gdn_split<128, 16, 1, 1>`), the same bits.
+    Wide = 5,
+    /// One CTA of 8 warps a head (`gdn_split<128, 8, 2, 1>`, the staged kernel's layout with
+    /// warp barriers for the per-column steps), the same bits.
+    Lean = 6,
+    /// [`Schedule::Wide`] with two input buffers, the next chunk's whole inputs copied while
+    /// the current one computes (`gdn_split<128, 16, 1, 1, 2>`), the same bits: what
+    /// [`Schedule::Heads`] runs when [`set_gdn_staged`] is on, on a [`STAGED_GPU`], and the
+    /// inputs are 16-byte aligned (a GB10 layer of 4K prompt tokens: 1.45 ms staged, 1.33 ms).
+    WideTwo = 7,
 }
 
 /// Kernels in `legion_gdn_mma_kernels`.
 #[cfg(feature = "cuda")]
-const KERNELS: usize = 4;
+const KERNELS: usize = 8;
 
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 impl Schedule {
@@ -102,8 +112,31 @@ impl Schedule {
     pub(super) fn cols(self) -> i64 {
         match self {
             Schedule::Slices | Schedule::SlicesTwo => 32,
-            Schedule::Heads | Schedule::Staged => HEAD,
+            Schedule::Pair => 64,
+            Schedule::Heads
+            | Schedule::Staged
+            | Schedule::Wide
+            | Schedule::Lean
+            | Schedule::WideTwo => HEAD,
         }
+    }
+
+    /// Warps of a CTA (`dim3(32, warps)`).
+    pub(super) fn warps(self) -> u32 {
+        if matches!(self, Schedule::Wide | Schedule::WideTwo) {
+            16
+        } else {
+            8
+        }
+    }
+
+    /// Whether the kernel copies its inputs with cp.async (16-byte aligned q, k and v rows,
+    /// [`Args::staged_aligned`]).
+    pub(super) fn staged(self) -> bool {
+        matches!(
+            self,
+            Schedule::Staged | Schedule::Pair | Schedule::Wide | Schedule::Lean | Schedule::WideTwo
+        )
     }
 
     /// CTAs for `heads` value heads of `seqs` sequences.
@@ -116,14 +149,25 @@ impl Schedule {
     /// the inverse (C x C), delta (C x V) and the state (128 x V); C x C + 2 C floats; rounded up
     /// to 128 bytes. [`Schedule::Staged`] (`staged_shared<16>`): q, k, delta and the solved
     /// rows (C x 128), p and the inverse, the same floats, and two buffers of a chunk's F32 q, k
-    /// and v rows, g and beta.
+    /// and v rows, g and beta. The split kernels (`split_shared<V>`): q and k (C x 128), p and
+    /// the inverse, delta and the solved rows (C x V), the same floats, and one buffer of a
+    /// chunk's F32 q and k rows, g, beta and v rows (C x V).
     pub(super) fn smem(self) -> usize {
         let (c, v, d) = (CHUNK as usize, self.cols() as usize, HEAD as usize);
-        let bytes = if self == Schedule::Staged {
-            2 * 2 * (4 * c * d + 2 * c * c) + 4 * (c * c + 2 * c) + 2 * 4 * (3 * c * d + 2 * c)
-        } else {
-            let bf16s = 2 * c * d + 2 * c * c + c * v + d * v;
-            2 * 2 * bf16s + 4 * (c * c + 2 * c)
+        let bytes = match self {
+            Schedule::Staged => {
+                2 * 2 * (4 * c * d + 2 * c * c) + 4 * (c * c + 2 * c) + 2 * 4 * (3 * c * d + 2 * c)
+            }
+            Schedule::Pair | Schedule::Wide | Schedule::Lean | Schedule::WideTwo => {
+                let stages = if self == Schedule::WideTwo { 2 } else { 1 };
+                2 * 2 * (2 * c * d + 2 * c * c + 2 * c * v)
+                    + 4 * (c * c + 2 * c)
+                    + stages * 4 * (2 * c * d + 2 * c + c * v)
+            }
+            Schedule::Slices | Schedule::SlicesTwo | Schedule::Heads => {
+                let bf16s = 2 * c * d + 2 * c * c + c * v + d * v;
+                2 * 2 * bf16s + 4 * (c * c + 2 * c)
+            }
         };
         bytes.div_ceil(128) * 128
     }
@@ -197,16 +241,17 @@ pub(super) fn staged_for_by(
     crate::hw::per_device::pick_by(dev, engine, staged_gpu, cc_of)
 }
 
-/// Whether whole heads run `gdn_staged` and the groups ggml-cuda runs on its own chunked kernel
+/// Whether whole heads run [`Schedule::WideTwo`] and the groups ggml-cuda runs on its own chunked kernel
 /// come to [`gdn_mma`] for it (on by default; `legion serve --gdn-prompt-ggml` turns it off).
 static STAGED: AtomicBool = AtomicBool::new(true);
 
 /// Whether the engine's GPU is one [`STAGED`] takes ggml-cuda's groups on ([`staged_gpu`]):
-/// ggml-cuda runs its chunked kernel for them there, and `gdn_staged` was measured on the GB10
+/// ggml-cuda runs its chunked kernel for them there, and the staged kernels were measured on the GB10
 /// (#1183).
 static STAGED_GPU: AtomicBool = AtomicBool::new(false);
 
-/// Sets whether whole heads run `gdn_staged` (the same bits as ggml's whole-head kernel) and,
+/// Sets whether whole heads run [`Schedule::WideTwo`] (the same bits as ggml's whole-head
+/// kernel) and,
 /// on compute capability 12.x, whether the prompt groups ggml-cuda gives its own chunked kernel
 /// run it here instead (on by default; `legion serve --gdn-prompt-ggml` turns it off).
 pub fn set_gdn_staged(on: bool) {
@@ -352,7 +397,7 @@ pub(super) struct Args {
 #[cfg(any(feature = "cuda", test))]
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 impl Args {
-    /// Whether `gdn_staged` can copy the q, k and v rows in 16-byte pieces: the pointers 16-byte
+    /// Whether the staged kernels ([`Schedule::staged`]) can copy the q, k and v rows in 16-byte pieces: the pointers 16-byte
     /// aligned and the strides whole multiples of 4 floats.
     fn staged_aligned(&self) -> bool {
         [self.q, self.k, self.v]
@@ -367,7 +412,7 @@ mod launch {
     use std::os::raw::{c_int, c_void};
     use std::sync::atomic::{AtomicI8, AtomicI32, Ordering};
 
-    use super::{Args, BLOCK_THREADS, FORCE, KERNELS, STAGED, Schedule, staged_for};
+    use super::{Args, FORCE, KERNELS, STAGED, Schedule, staged_for};
 
     /// `dim3`.
     #[repr(C)]
@@ -398,6 +443,9 @@ mod launch {
     const DEV_ATTR_SMS: c_int = 16;
     const DEV_ATTR_CC_MAJOR: c_int = 75;
     const FUNC_ATTR_MAX_DYNAMIC_SHARED: c_int = 8;
+    /// `cudaFuncAttributePreferredSharedMemoryCarveout` and `cudaSharedmemCarveoutMaxShared`.
+    const FUNC_ATTR_CARVEOUT: c_int = 9;
+    const CARVEOUT_MAX_SHARED: c_int = 100;
 
     /// Devices the caches below cover.
     const DEVICES: usize = 64;
@@ -443,18 +491,18 @@ mod launch {
         }
     }
 
-    /// Gives kernel `s` its dynamic shared memory on device `dev`, once (ggml's `init`).
+    /// Gives kernel `s` its dynamic shared memory on device `dev`, once (ggml's `init`); the
+    /// two-CTAs-an-SM kernel also asks for the whole shared-memory carveout.
     fn opt_in(dev: usize, s: Schedule) -> bool {
         let slot = &SMEM[dev][s as usize];
         let mut state = slot.load(Ordering::Relaxed);
         if state == 0 {
             // SAFETY: a kernel of the table and its shared memory size.
             state = unsafe {
-                if cudaFuncSetAttribute(
-                    legion_gdn_mma_kernels[s as usize],
-                    FUNC_ATTR_MAX_DYNAMIC_SHARED,
-                    s.smem() as c_int,
-                ) == 0
+                let func = legion_gdn_mma_kernels[s as usize];
+                if cudaFuncSetAttribute(func, FUNC_ATTR_MAX_DYNAMIC_SHARED, s.smem() as c_int) == 0
+                    && (s != Schedule::Pair
+                        || cudaFuncSetAttribute(func, FUNC_ATTR_CARVEOUT, CARVEOUT_MAX_SHARED) == 0)
                 {
                     1
                 } else {
@@ -474,12 +522,16 @@ mod launch {
             1 => Some(Schedule::SlicesTwo),
             2 => Some(Schedule::Heads),
             3 => Some(Schedule::Staged),
+            4 => Some(Schedule::Pair),
+            5 => Some(Schedule::Wide),
+            6 => Some(Schedule::Lean),
+            7 => Some(Schedule::WideTwo),
             _ => None,
         }
     }
 
     /// Launches `a` on `stream` with ggml's schedule for the current device; whole heads on
-    /// `gdn_staged` where [`STAGED`] is on, on a device [`staged_for`] picks, and
+    /// [`Schedule::WideTwo`] where [`STAGED`] is on, on a device [`staged_for`] picks, and
     /// [`Args::staged_aligned`].
     pub(super) fn run(a: &mut Args, stream: *mut c_void) -> Result<(), String> {
         let (dev, sms) = device()?;
@@ -491,13 +543,15 @@ mod launch {
                         && staged_for(Some(dev))
                         && a.staged_aligned() =>
                 {
-                    Schedule::Staged
+                    Schedule::WideTwo
                 }
                 s => s,
             },
         };
-        if s == Schedule::Staged && !a.staged_aligned() {
-            return Err("gdn_mma: gdn_staged needs 16-byte aligned q, k and v rows".into());
+        if s.staged() && !a.staged_aligned() {
+            return Err(format!(
+                "gdn_mma: {s:?} needs 16-byte aligned q, k and v rows"
+            ));
         }
         if !opt_in(dev, s) {
             return Err(format!(
@@ -510,8 +564,11 @@ mod launch {
             y: 1,
             z: 1,
         };
-        let [x, y, z] = BLOCK_THREADS;
-        let block = Dim3 { x, y, z };
+        let block = Dim3 {
+            x: 32,
+            y: s.warps(),
+            z: 1,
+        };
         let mut argv = [(a as *mut Args).cast::<c_void>()];
         // SAFETY: the kernel reads `a` from the launch's copy of it; the pointers in it are
         // device memory of the stream's device (the caller's node).
