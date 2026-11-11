@@ -701,11 +701,15 @@ fn mix_cast_case(fuse: bool, keep_f32: bool) -> (Vec<u8>, Option<Vec<u8>>, Count
     let (e, rank, n, hc) = (128i64, 64i64, 9i64, 4i64);
     let k = hc * e;
     let ctx = Context::new(64, 64);
-    let up = ctx.new_tensor(types::BF16, &[rank, k]).as_input();
-    let lo = ctx.new_tensor(types::F32, &[rank, n]).as_input();
-    let res = ctx.new_tensor(types::F32, &[e, hc, n]).as_input();
-    let sc = ctx.new_tensor(types::F32, &[hc, n]).as_input();
-    let g = ctx.new_tensor(types::F32, &[k]).as_input();
+    // Inputs kept for the whole graph (outputs too), as weights and earlier layers' tensors are:
+    // otherwise the allocator may put the cast in their memory once the mix has read them, and
+    // the fusion rightly refuses a cast over what the mix reads.
+    let kept = |ty, ne: &[i64]| ctx.new_tensor(ty, ne).as_input().as_output();
+    let up = kept(types::BF16, &[rank, k]);
+    let lo = kept(types::F32, &[rank, n]);
+    let res = kept(types::F32, &[e, hc, n]);
+    let sc = kept(types::F32, &[hc, n]);
+    let g = kept(types::F32, &[k]);
     // `lo` made in the graph, as the down projection's output is.
     let lo2 = ctx.scale(lo, 1.5);
     let mixed = up_mix_rebuilt(&ctx, up, lo2, res, sc, g, hc, 0.25);
