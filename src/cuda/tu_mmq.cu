@@ -16,8 +16,12 @@
 // - Q6_K (vec_dot_q6_K_q8_1_mma): per 128 values tmp = 0, per 32 tmp += (C0 * sc0 + C1 * sc1)
 //   * dB (C0, C1 the dots of the two 16-value halves), then sum += tmp * dA.
 // When every CTA of ggml's grid holds a whole tile (ggml's stream-k grid of one CTA per tile,
-// taken when the tiles fill 90% of the SMs' waves; the host side takes only those plans), no
-// partial sums are added up, so each output is that chain alone whatever the tiling. Here:
+// taken when the tiles fill 90% of the SMs' waves), no partial sums are added up, so each
+// output is that chain alone whatever the tiling. Otherwise ggml runs one CTA per SM, each on
+// an even run of the (tile, K block) sequence, and a fixup kernel adds the parts of the tiles
+// that CTAs share; for those plans (128-column tiles only, the host side checks) the op runs
+// the same grid, the same runs and the same fixup, so the parts and their sum order are
+// ggml's. Here:
 // - `quantize<ds4>`: ggml's quantize_mmq_q8_1 (quantize.cu) for MMQ_Q8_1_DS_LAYOUT_D4 (Q6_K,
 //   Q8_0) or _DS4 (Q4_K, Q5_K), value for value.
 // - `mm<type, JT>`: a CTA per 128 x JT output tile; ggml's own tile loader (the MMA layout) and
@@ -27,6 +31,11 @@
 //   a float minus 1.5 * 2^23 is C exactly while |C| < 2^22 (32-value chunks of 8-bit values:
 //   |C| <= 32 * 127 * 127 < 2^19), the same value as the int converted. Q6_K's combined
 //   int is converted as ggml converts it.
+// - `mm_sk<type>`: ggml's stream-k loop (mul_mat_q's, mmq.cuh) over the same tile code: a CTA
+//   per SM, its run of K blocks across tiles; a finished tile goes to dst, the CTA's last,
+//   unfinished one to its fixup slot.
+// - `fixup<type>`: ggml's mul_mat_q_stream_k_fixup: per CTA ending inside a tile, the earlier
+//   CTAs' parts of that tile summed nearest first from 0, then added to dst.
 
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/mmq.cuh"
@@ -39,6 +48,7 @@ struct legion_tu_mmq {
     const float * x;     // F32 [n][x_ld]
     int * yq;            // block_q8_1_mmq [k / 128][n_pad]
     float * dst;         // F32 [n][dst_ld]
+    float * fixup;       // stream-k: [ctas][128 * 128], the CTAs' unfinished tiles
     int64_t x_ld;
     int64_t dst_ld;
     int32_t w_ld;        // blocks between weight rows
@@ -256,12 +266,16 @@ __device__ __forceinline__ void dot(
 
 #endif // defined(TURING_MMA_AVAILABLE) && !defined(AMPERE_MMA_AVAILABLE)
 
-// The matmul: grid (rows / 128, n_pad / JT), 32 x 8 threads (ggml's tile loader's layout).
-// Shared memory: the input tile (JT columns of 128 values), then the weight tile (128 rows of
-// 256 values in ggml's MMA layout).
-template <ggml_type type, int JT>
-__global__ void __launch_bounds__(THREADS, 1) mm(const legion_tu_mmq p) {
 #if defined(TURING_MMA_AVAILABLE) && !defined(AMPERE_MMA_AVAILABLE)
+
+// One output tile's chain over the weight's K blocks [kb0_start, kb0_stop) from zero (ggml's
+// mul_mat_q_process_tile): rows it * 128.., columns jt * JT... Shared memory: the input tile (JT
+// columns of 128 values), then the weight tile (128 rows of 256 values in ggml's MMA layout).
+// The 128 x JT sums go to `out` (column j at j * out_ld), columns from `max_j` on skipped.
+template <ggml_type type, int JT>
+__device__ __forceinline__ void tile(
+        const legion_tu_mmq & p, const int it, const int jt, const int kb0_start, const int kb0_stop,
+        float * __restrict__ out, const int64_t out_ld, const int max_j) {
     constexpr int qk = ggml_cuda_type_traits<type>::qk;
     constexpr int blocks_per_iter = MMQ_ITER_K / qk;
     constexpr ggml_cuda_mmq_load_tiles_t load_tiles =
@@ -276,11 +290,8 @@ __global__ void __launch_bounds__(THREADS, 1) mm(const legion_tu_mmq p) {
     const int tid = threadIdx.y*WARP_SIZE + threadIdx.x;
     const int tr = tid % 16;
     const int tc = tid / 16;
-    const int it = blockIdx.x;
-    const int jt = blockIdx.y;
     const int offset_x = it*TILE_ROWS*p.w_ld;
     const int * y = p.yq + (int64_t) jt*JT*YK;
-    const int nblocks = p.k / qk;
 
     float sum[8][NC];
 #pragma unroll
@@ -291,7 +302,7 @@ __global__ void __launch_bounds__(THREADS, 1) mm(const legion_tu_mmq p) {
         }
     }
 
-    for (int kb0 = 0; kb0 < nblocks; kb0 += blocks_per_iter) {
+    for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
         load_tiles(p.w, tile_x, offset_x + kb0, p.rows - it*TILE_ROWS - 1, p.w_ld);
 #pragma unroll
         for (int half = 0; half < 2; ++half) {
@@ -308,29 +319,161 @@ __global__ void __launch_bounds__(THREADS, 1) mm(const legion_tu_mmq p) {
 
 #pragma unroll
     for (int c = 0; c < NC; ++c) {
-        const int j = jt*JT + tc + 16*c;
-        if (j >= p.n) {
+        const int j = tc + 16*c;
+        if (j >= max_j) {
             continue;
         }
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
-            p.dst[j*p.dst_ld + it*TILE_ROWS + tr + 16*r] = sum[r][c];
+            out[j*out_ld + tr + 16*r] = sum[r][c];
         }
     }
+}
+
+#endif // defined(TURING_MMA_AVAILABLE) && !defined(AMPERE_MMA_AVAILABLE)
+
+// The matmul where ggml gives every CTA a whole tile: grid (rows / 128, n_pad / JT), 32 x 8
+// threads (ggml's tile loader's layout).
+template <ggml_type type, int JT>
+__global__ void __launch_bounds__(THREADS, 1) mm(const legion_tu_mmq p) {
+#if defined(TURING_MMA_AVAILABLE) && !defined(AMPERE_MMA_AVAILABLE)
+    constexpr int qk = ggml_cuda_type_traits<type>::qk;
+    const int it = blockIdx.x;
+    const int jt = blockIdx.y;
+    tile<type, JT>(p, it, jt, 0, p.k / qk, p.dst + (int64_t) jt*JT*p.dst_ld + it*TILE_ROWS, p.dst_ld,
+                   p.n - jt*JT);
 #else
     NO_DEVICE_CODE;
 #endif // defined(TURING_MMA_AVAILABLE) && !defined(AMPERE_MMA_AVAILABLE)
+}
+
+// Where ggml splits the tiles' K blocks over its SMs (stream-k, ggml's tiles 128 x 128): ggml's
+// mul_mat_q grid of one CTA per SM, each walking the same run of K blocks as ggml's CTA of that
+// index over the tiles in ggml's order (columns fastest). A tile's last part goes to `dst`,
+// a CTA's unfinished last tile to its slot of `fixup` (128 x 128, a column at j * 128), and
+// `fixup` (ggml's mul_mat_q_stream_k_fixup) then adds the earlier parts into `dst` in ggml's order.
+template <ggml_type type>
+__global__ void __launch_bounds__(THREADS, 1) mm_sk(const legion_tu_mmq p) {
+#if defined(TURING_MMA_AVAILABLE) && !defined(AMPERE_MMA_AVAILABLE)
+    constexpr int qk = ggml_cuda_type_traits<type>::qk;
+    constexpr int blocks_per_iter = MMQ_ITER_K / qk;
+    constexpr int J = 128;
+    const int bpn = p.k / qk;
+    const int ntx = p.n_pad / J;
+    const int nty = p.rows / TILE_ROWS;
+
+    // kbc == k block continuous, current index in continuous ijk space (ggml's arithmetic).
+    int kbc      = int64_t(blockIdx.x)    *(ntx*nty*bpn) / gridDim.x;
+    int kbc_stop = int64_t(blockIdx.x + 1)*(ntx*nty*bpn) / gridDim.x;
+    kbc      -= (kbc      % bpn) % blocks_per_iter;
+    kbc_stop -= (kbc_stop % bpn) % blocks_per_iter;
+
+    int kb0_start = kbc % bpn;
+    int kb0_stop  = min(bpn, kb0_start + kbc_stop - kbc);
+    while (kbc < kbc_stop && kb0_stop == bpn) {
+        const int t = kbc / bpn;
+        const int jt = t % ntx;
+        const int it = t / ntx;
+        tile<type, J>(p, it, jt, kb0_start, kb0_stop, p.dst + (int64_t) jt*J*p.dst_ld + it*TILE_ROWS,
+                      p.dst_ld, p.n - jt*J);
+        kbc += bpn;
+        kbc -= kbc % bpn;
+        kb0_start = 0;
+        kb0_stop  = min(bpn, kbc_stop - kbc);
+    }
+    if (kbc >= kbc_stop) {
+        return;
+    }
+    const int t = kbc / bpn;
+    const int jt = t % ntx;
+    const int it = t / ntx;
+    tile<type, J>(p, it, jt, kb0_start, kb0_stop, p.fixup + (int64_t) blockIdx.x*(J*TILE_ROWS), TILE_ROWS, J);
+#else
+    NO_DEVICE_CODE;
+#endif // defined(TURING_MMA_AVAILABLE) && !defined(AMPERE_MMA_AVAILABLE)
+}
+
+// ggml's mul_mat_q_stream_k_fixup for mm_sk's grid (dense, I = J = 128, 8 warps): grid
+// (CTAs of mm_sk, 128 / 32), 32 x 4 threads. A CTA that finished a tile some earlier CTAs began
+// adds their parts, the nearest first, into its column of `dst`.
+template <ggml_type type>
+__global__ void __launch_bounds__(THREADS / 2, 1) fixup(const legion_tu_mmq p) {
+    constexpr int qk = ggml_cuda_type_traits<type>::qk;
+    constexpr int blocks_per_iter = MMQ_ITER_K / qk;
+    constexpr int J = 128, I = TILE_ROWS, nwarps = THREADS / 2 / WARP_SIZE;
+    const int bpn = p.k / qk;
+    const int ntx = p.n_pad / J;
+    const int nty = p.rows / I;
+    const int64_t work = (int64_t) ntx*nty*bpn;
+
+    float sum[J / nwarps] = {0.0f};
+    const int i = blockIdx.y*WARP_SIZE + threadIdx.x;
+
+    int kbc0      = int64_t(blockIdx.x)    *work / gridDim.x;
+    int kbc0_stop = int64_t(blockIdx.x + 1)*work / gridDim.x;
+    kbc0      -= (kbc0      % bpn) % blocks_per_iter;
+    kbc0_stop -= (kbc0_stop % bpn) % blocks_per_iter;
+
+    const bool did_not_have_any_data   = kbc0 == kbc0_stop;
+    const bool wrote_beginning_of_tile = kbc0 % bpn == 0;
+    const bool did_not_write_last      = kbc0 / bpn == kbc0_stop / bpn && kbc0_stop % bpn != 0;
+    if (did_not_have_any_data || wrote_beginning_of_tile || did_not_write_last) {
+        return;
+    }
+
+    bool any_fixup = false;
+    int bidx = blockIdx.x - 1;
+    int kbc_stop = kbc0;
+    while (true) {
+        int kbc = int64_t(bidx)*work / gridDim.x;
+        kbc -= (kbc % bpn) % blocks_per_iter;
+        if (kbc == kbc_stop) {  // did not have any data
+            bidx--;
+            kbc_stop = kbc;
+            continue;
+        }
+        any_fixup = true;
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += nwarps) {
+            const int j = j0 + threadIdx.y;
+            sum[j0/nwarps] += p.fixup[bidx*(J*I) + j*I + i];
+        }
+        if (kbc % bpn == 0 || kbc / bpn < kbc0 / bpn) {
+            break;
+        }
+        bidx--;
+        kbc_stop = kbc;
+    }
+    if (!any_fixup) {
+        return;
+    }
+
+    const int t = kbc0 / bpn;
+    const int jt = t % ntx;
+    const int it = t / ntx;
+    float * dst = p.dst + (int64_t) jt*J*p.dst_ld + it*I;
+    const int j_max = p.n - jt*J - 1;
+#pragma unroll
+    for (int j0 = 0; j0 < J; j0 += nwarps) {
+        const int j = j0 + threadIdx.y;
+        if (j > j_max) {
+            return;
+        }
+        dst[j*p.dst_ld + i] += sum[j0/nwarps];
+    }
 }
 
 } // namespace
 
 #define LEGION_TU_MMQ_KERNELS(type) \
     reinterpret_cast<const void *>(&mm<type, 128>), \
-    reinterpret_cast<const void *>(&mm<type, 64>)
+    reinterpret_cast<const void *>(&mm<type, 64>), \
+    reinterpret_cast<const void *>(&mm_sk<type>), \
+    reinterpret_cast<const void *>(&fixup<type>)
 
 // 0, 1: quantize (D4, DS4); then by weight type (Q4_K, Q5_K, Q6_K, Q8_0) the matmul with
-// tiles 128 and 64 columns wide.
-extern "C" const void * const legion_tu_mmq_kernels[10] = {
+// tiles 128 and 64 columns wide, the stream-k matmul and its fixup.
+extern "C" const void * const legion_tu_mmq_kernels[18] = {
     reinterpret_cast<const void *>(&quantize<false>),
     reinterpret_cast<const void *>(&quantize<true>),
     LEGION_TU_MMQ_KERNELS(GGML_TYPE_Q4_K),

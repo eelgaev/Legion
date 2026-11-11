@@ -54,6 +54,24 @@ fn tile_width_fills_the_waves() {
 }
 
 #[test]
+fn plans_mirror_ggml_grids() {
+    // Unsplit: a CTA per tile of the op's width.
+    assert_eq!(plan(9216, 512, 24), Some((128, false)));
+    assert_eq!(plan(9216, 128, 24), Some((128, false)));
+    // ggml splits these over its 24 SMs on 128-column tiles: ggml's stream-k grid.
+    assert_eq!(plan(2560, 512, 24), Some((128, true)));
+    assert_eq!(plan(1024, 1024, 24), Some((128, true)));
+    assert_eq!(plan(2560, 256, 24), Some((128, true)));
+    assert_eq!(plan(1024, 128, 24), Some((128, true)));
+    // ggml's tiles 112 wide (200 columns), split: not mirrored.
+    assert!(!ggml_unsplit(2560, 200, 24));
+    assert_eq!(plan(2560, 200, 24), None);
+    // More SMs than the fixup scratch holds; no GPU.
+    assert_eq!(plan(2560, 512, MAX_STREAM_K_SMS + 1), None);
+    assert_eq!(plan(2560, 512, 0), None);
+}
+
+#[test]
 fn quant_bytes_pad_to_tiles() {
     assert_eq!(quant_bytes(2560, 512, 128), 20 * 512 * 144);
     assert_eq!(quant_bytes(2560, 500, 128), 20 * 512 * 144);
@@ -80,7 +98,7 @@ fn input(k: i64, n: i64) -> (ffi::ggml_type, [i64; 4], [usize; 4]) {
 }
 
 #[test]
-fn fits_takes_the_unsplit_quant_shapes_only() {
+fn fits_takes_the_mirrored_quant_shapes_only() {
     for ty in [types::Q4_K, types::Q5_K, types::Q6_K, types::Q8_0] {
         assert!(fits(shape(ty, 2560, 9216), input(2560, 512), 24));
         assert!(fits(shape(ty, 256, 9216), input(256, MAX_TOKENS), 24));
@@ -96,8 +114,10 @@ fn fits_takes_the_unsplit_quant_shapes_only() {
             input(2560, MAX_TOKENS + 1),
             24
         ));
-        // a plan ggml splits
-        assert!(!fits(shape(ty, 9216, 2560), input(9216, 512), 24));
+        // plans ggml splits: on 128-column tiles (stream-k), on 112-column ones
+        assert!(fits(shape(ty, 9216, 2560), input(9216, 512), 24));
+        assert!(fits(shape(ty, 2560, 1024), input(2560, 1024), 24));
+        assert!(!fits(shape(ty, 9216, 2560), input(9216, 200), 24));
         // rows not whole tiles, K not whole iterations
         assert!(!fits(shape(ty, 2560, 9200), input(2560, 512), 24));
         assert!(!fits(shape(ty, 2336, 9216), input(2336, 512), 24));
@@ -196,7 +216,8 @@ fn cuda_tu_mmq_is_ggml_bit_for_bit() {
         return;
     }
     let sms = crate::hw::per_device::sm_count(0) as i64;
-    // Qwen3.5-4B and Gemma-4-E2B prompt shapes, then odd column counts.
+    // Qwen3.5-4B and Gemma-4-E2B prompt shapes, then odd column counts; the rest ggml splits
+    // over its SMs (stream-k): chunk tails, the 1024-row K/V projections, a long K.
     let shapes = [
         (2560, 9216, 512),
         (2560, 9216, 1024),
@@ -205,14 +226,24 @@ fn cuda_tu_mmq_is_ggml_bit_for_bit() {
         (1536, 6144, 300),
         (2560, 9216, 1000),
         (2560, 9216, 4096),
+        (2560, 1024, 1024),
+        (2560, 1024, 128),
+        (2560, 2560, 256),
+        (2560, 9216, 128),
+        (9216, 2560, 256),
+        (9216, 2560, 1024),
+        (2560, 4096, 256),
+        (1536, 512, 384),
     ];
     let mut checked = 0;
+    let mut split = 0;
     for ty in [types::Q4_K, types::Q5_K, types::Q6_K, types::Q8_0] {
         for (k, rows, n) in shapes {
             if !fits(shape(ty, k, rows), input(k, n), sms) {
                 eprintln!("{ty} {k}x{rows} n={n}: ggml splits it on {sms} SMs, skipped");
                 continue;
             }
+            split += usize::from(plan(rows, n, sms).is_some_and(|p| p.1));
             let (ours, theirs) = case(&mut gpu, ty, k, rows, n, sms);
             let diff = ours
                 .iter()
@@ -223,5 +254,6 @@ fn cuda_tu_mmq_is_ggml_bit_for_bit() {
             checked += 1;
         }
     }
-    assert!(checked >= 16, "only {checked} cases ran");
+    assert!(checked >= 32, "only {checked} cases ran");
+    assert!(split >= 16, "only {split} stream-k cases ran");
 }

@@ -501,6 +501,14 @@ pub(super) struct ModelArgs {
     /// F16 caches only; other GPUs ignore it.
     #[arg(long, env = "LEGION_PAGED_PREFILL_M884")]
     pub paged_prefill_m884: bool,
+    /// On Turing GPUs without tensor cores (GTX 16xx, MX450, MX550): prompt attention through a
+    /// one-pass kernel on FP32 FMAs instead of the WMMA kernel, whose matrix instructions these
+    /// GPUs emulate slowly (a GTX 1660 Ti: attention 3.3x faster, an 8K-token Qwen3.5-4B prompt
+    /// 15.3 -> 10.7 s). Not the default's bits: greedy output can differ from it (no F16
+    /// rounding of Q and P, one pass, a different summation order). F16 caches only; other GPUs
+    /// ignore it.
+    #[arg(long)]
+    pub tu_attn_ffma: bool,
     /// qwen4exp prompt steps: score the sparse-attention indexer's pools with ggml's ops (pool
     /// mask, lightning indexer, bias add) instead of Legion's one-op kernel, which computes the
     /// same bits faster. For comparisons.
@@ -2188,6 +2196,7 @@ pub async fn run(
                 ngram: e.model.ngram_options()?,
                 expert_mv: e.model.expert_mv == ExpertMv::Legion,
                 paged_prefill_m884: e.model.paged_prefill_m884,
+                tu_attn_ffma: e.model.tu_attn_ffma,
                 qsa_scores_ggml: e.model.qsa_scores_ggml,
                 qsa_topk_ggml: e.model.qsa_topk_ggml,
                 hc_post_norm_generic: e.model.hc_post_norm_generic,

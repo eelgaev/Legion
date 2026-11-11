@@ -151,7 +151,7 @@ fn tiered_pool_reads_like_device_memory() {
 /// Prefill over a tiered pool through staging slots: one piece (every host block of the step
 /// staged at once) matches the device pool bit for bit; pieces of 3 and of 1 host block (the
 /// rows merged across launches) match it to the F16 rounding of the weights. On the device's default prefill
-/// kernel and on the m8n8k4 one (sm_70's, run emulated past it).
+/// kernel, on the m8n8k4 one (sm_70's, run emulated past it) and on the FP32 FMA one.
 #[test]
 #[ignore = "needs a GPU whose driver maps host NUMA memory"]
 fn staged_prefill_reads_like_device_memory() {
@@ -205,16 +205,24 @@ fn staged_prefill_reads_like_device_memory() {
         .iter()
         .map(|x| 0.5 * x)
         .collect();
-    for m884 in [false, true] {
+    for (m884, ffma) in [(false, false), (true, false), (false, true)] {
         super::set_m884_prefill_here(m884);
+        if ffma {
+            super::set_ffma_prefill_here(true);
+        }
         let launches = super::m884_launches();
+        let ffma_launches = super::ffma_launches();
         let go = |backend: &mut Backend, kv: &KvPool| {
             run(
                 backend, kv, d, n_head, n_head_kv, n_tok, &n_past, &tables, &qv,
             )
         };
         let want = go(&mut backend, &plain);
-        assert_eq!(go(&mut backend, &pools[0]), want, "one piece, m884 {m884}");
+        assert_eq!(
+            go(&mut backend, &pools[0]),
+            want,
+            "one piece, m884 {m884}, ffma {ffma}"
+        );
         for kv in &pools[1..] {
             let got = go(&mut backend, kv);
             let worst = got
@@ -224,18 +232,20 @@ fn staged_prefill_reads_like_device_memory() {
                 .fold(0.0f32, f32::max);
             // P is rounded to F16 against each piece's own running max.
             eprintln!(
-                "{} staging blocks, m884 {m884}: worst {worst}",
+                "{} staging blocks, m884 {m884}, ffma {ffma}: worst {worst}",
                 kv.stage_blocks()
             );
             assert!(
                 worst < 2e-3,
-                "{} staging blocks, m884 {m884}: off by {worst}",
+                "{} staging blocks, m884 {m884}, ffma {ffma}: off by {worst}",
                 kv.stage_blocks()
             );
         }
         assert_eq!(super::m884_launches() > launches, m884);
+        assert_eq!(super::ffma_launches() > ffma_launches, ffma);
     }
     super::set_m884_prefill_here(false);
+    super::set_ffma_prefill_here(false);
 }
 
 /// `--kv-vmm` (#814): a pool in a reserved virtual range (each cache tensor on a granule of its

@@ -733,6 +733,8 @@ unsafe extern "C" {
     fn legion_paged_attn_set_prefill(kernel: i32, this_thread: i32);
     #[cfg(test)]
     fn legion_paged_attn_m884_launches() -> i64;
+    #[cfg(test)]
+    fn legion_paged_attn_ffma_launches() -> i64;
     fn legion_paged_attn_vsplit_launches() -> i64;
 }
 
@@ -747,6 +749,34 @@ pub fn set_m884_prefill(on: bool) {
     };
     #[cfg(not(feature = "cuda"))]
     let _ = on;
+}
+
+/// Prefill chunks on sm_75 devices through the one-pass FP32 FMA kernel (F16 caches; the
+/// caller sets it for Turing GPUs without tensor cores, whose emulated HMMA runs the default
+/// WMMA kernel slowly), or (`false`) the default. Not the WMMA kernel's bits. Overrides
+/// [`set_m884_prefill`] (one choice for every thread; m8n8k4 applies on sm_70 only anyway).
+pub fn set_ffma_prefill(on: bool) {
+    #[cfg(feature = "cuda")]
+    // SAFETY: sets a flag the launches read.
+    unsafe {
+        legion_paged_attn_set_prefill(if on { 2 } else { 0 }, 0)
+    };
+    #[cfg(not(feature = "cuda"))]
+    let _ = on;
+}
+
+/// [`set_ffma_prefill`] for launches from the calling thread only, on any GPU (tests).
+#[cfg(all(test, feature = "cuda"))]
+fn set_ffma_prefill_here(on: bool) {
+    // SAFETY: sets a thread-local flag the launches read.
+    unsafe { legion_paged_attn_set_prefill(if on { 2 } else { 0 }, 1) };
+}
+
+/// Launches of the FP32 FMA prefill kernel from the calling thread so far (tests).
+#[cfg(all(test, feature = "cuda"))]
+fn ffma_launches() -> i64 {
+    // SAFETY: reads a thread-local counter.
+    unsafe { legion_paged_attn_ffma_launches() }
 }
 
 /// [`set_m884_prefill`] for launches from the calling thread only (tests).
@@ -967,6 +997,8 @@ pub fn supported(head_dim: i64, n_head: i64, n_head_kv: i64) -> bool {
         && matches!(n_head / n_head_kv, 1 | 2 | 4 | 6 | 8 | 12 | 16)
 }
 
+#[cfg(all(test, feature = "cuda"))]
+mod ffma_tests;
 #[cfg(test)]
 mod granule_tests;
 #[cfg(all(test, feature = "cuda"))]
