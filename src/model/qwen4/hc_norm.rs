@@ -256,6 +256,11 @@ pub(super) fn hc_post_norm_rebuilt16<'a>(
 /// for a reader that rebuilds `xn` itself ([`super::hc_mix16::mix_rebuilt_f32`]): each stream's
 /// norm scale instead of the F32 `xn`, as [`hc_post_norm_rebuilt16`] (#836). On CUDA, needs
 /// [`rebuild16_fits`]'s shape (the register kernel's).
+///
+/// `bf16` ([`set_hc_bf16`], opt-in, #1183): the new streams are rounded to BF16 and written as
+/// BF16 (half the bytes) where the F32 ones would start, and the rounded values are the ones
+/// normed, rounded into `xnb` and injected; `res` may then be BF16 too (the previous norm's
+/// streams). The node keeps its size and every other part its place. Moves output.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn hc_post_norm_rebuilt_xnb<'a>(
     ctx: &'a Context,
@@ -266,11 +271,14 @@ pub(super) fn hc_post_norm_rebuilt_xnb<'a>(
     w: Tensor<'a>,
     eps: f32,
     down: Tensor<'a>,
+    bf16: bool,
 ) -> PostNormRebuiltXnb<'a> {
     let [e, hc, n, _] = res.ne();
     let [k, n_inj, _, _] = w.ne();
     assert_eq!(down.ty(), types::BF16, "hc_post_norm: BF16 down");
     assert!(rebuild_fits(k, hc, n), "hc_post_norm: {n} tokens");
+    // (The BF16 streams' kernel adds no reduce-scatter's partials: no deferred `out` then.)
+    let defer = !bf16 && crate::tp_net::seq_par::deferrable(out);
     let (node, at) = post_norm_node(
         ctx,
         res,
@@ -284,7 +292,7 @@ pub(super) fn hc_post_norm_rebuilt_xnb<'a>(
             quant: false,
             rebuild: true,
             moe: false,
-            streams16: false,
+            streams16: bf16,
             // xn's whole place kept: every part of the node where hc_post_norm has it (#836).
             padded: true,
         },
@@ -292,14 +300,23 @@ pub(super) fn hc_post_norm_rebuilt_xnb<'a>(
     // `out` the reduce-scatter of a `--tp-seq-par` step with BF16 partials (#1176): the norm
     // adds the two ranks' partials itself, as the exchange's sum kernel adds them, so the sum
     // is not written and read back.
-    if crate::tp_net::seq_par::deferrable(out) {
+    if defer {
         crate::tp_net::seq_par::defer_sum(out);
         // SAFETY: the node just made, an external op node.
         unsafe { crate::ggml::set_external_param(node.raw(), P_RS, 1) };
     }
     let xnb = ctx.view_1d(node, (k * n) / 2, at.xn16 * 4);
+    let res_new = if bf16 {
+        ctx.reinterpret(
+            ctx.view_1d(node, (k * n) / 2, 0),
+            types::BF16,
+            [e, hc, n, 1],
+        )
+    } else {
+        ctx.view_3d(node, [e, hc, n], [e as usize * 4, k as usize * 4], 0)
+    };
     PostNormRebuiltXnb {
-        res: ctx.view_3d(node, [e, hc, n], [e as usize * 4, k as usize * 4], 0),
+        res: res_new,
         scales: ctx.view_2d(node, [hc, n], hc as usize * 4, at.xn * 4),
         xnb: ctx.reinterpret(xnb, types::BF16, [k, n, 1, 1]),
         inject: ctx.view_2d(node, [n_inj, n], n_inj as usize * 4, at.inject * 4),
@@ -308,7 +325,7 @@ pub(super) fn hc_post_norm_rebuilt_xnb<'a>(
 
 /// [`hc_post_norm_rebuilt_xnb`]'s outputs.
 pub(super) struct PostNormRebuiltXnb<'a> {
-    /// The new streams, F32 `[e, hc, n]`.
+    /// The new streams, F32 `[e, hc, n]` (BF16 with `bf16`).
     pub res: Tensor<'a>,
     /// Each stream's norm scale, F32 `[hc, n]`.
     pub scales: Tensor<'a>,
@@ -468,7 +485,7 @@ fn post_norm_node<'a>(
         down16_values(down.map(|d| d.ty()), (k * m) as usize),
         down.is_some(),
         quant,
-        rebuild.then_some((if padded { k as usize } else { hc as usize }, streams16)),
+        rebuild.then_some(scales_place(k as usize, hc as usize, padded, streams16)),
     );
     if moe {
         moe_ffn::defer_sum(out);
@@ -554,6 +571,14 @@ impl PostNormLayout {
     }
 }
 
+/// [`PostNormLayout::new`]'s `scales` for a rebuilt node of `k` values in `hc` streams a token:
+/// the padded form ([`PostNormKind::padded`]) keeps all of `xn`'s place and, with BF16 streams
+/// (#1183), the F32 streams' place too (the BF16 ones take its first half), so every other part
+/// sits where it does with F32 streams; the unpadded form packs both (#826).
+fn scales_place(k: usize, hc: usize, padded: bool, streams16: bool) -> (usize, bool) {
+    if padded { (k, false) } else { (hc, streams16) }
+}
+
 /// How many values of the down weight `down` (of type `ty`, `values` in all) [`hc_post_norm`]'s
 /// node holds as F16: all of a Q8_0 one, none of a BF16 one (its matmul reads it as it is; only
 /// `xn` is rounded, to BF16, #469) or of none.
@@ -608,7 +633,7 @@ unsafe fn cpu_hc_post_norm(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
             down16_values(down.map(|d| d.type_), k * m),
             down.is_some(),
             quant,
-            rebuild.then_some((if params[6] != 0 { k } else { hc }, streams16)),
+            rebuild.then_some(scales_place(k, hc, params[6] != 0, streams16)),
         );
         let rn = dst.data as *mut f32;
         let rn16 = dst.data as *mut u16;
@@ -772,6 +797,12 @@ unsafe extern "C" {
     fn legion_hc_post_norm_launch(p: *const HcPostNorm, stream: *mut c_void) -> i32;
     fn legion_hc_post_norm_rs_launch(p: *const HcPostNorm, stream: *mut c_void) -> i32;
     fn legion_hc_post_norm_s16_launch(p: *const HcPostNorm, in16: i32, stream: *mut c_void) -> i32;
+    fn legion_hc_post_norm_b16_launch(
+        p: *const HcPostNorm,
+        f: *const MoeFold,
+        in16: i32,
+        stream: *mut c_void,
+    ) -> i32;
     fn legion_hc_post_norm_moe_launch(
         p: *const HcPostNorm,
         s: *const moe_ffn::PairSum,
@@ -841,7 +872,8 @@ fn fold_code(f: FoldSum) -> i32 {
 }
 
 /// Whether `node` is an unfolded [`hc_post_norm_rebuilt_xnb`] node a MoE tail may be folded
-/// into ([`fold_moe`]): F32 streams, a BF16 down weight, and on CUDA (`cuda`) qwen4exp's 4 x
+/// into ([`fold_moe`]): F32 streams (or BF16 ones into BF16, [`set_hc_bf16`]), a BF16 down
+/// weight, and on CUDA (`cuda`) qwen4exp's 4 x
 /// 2560 streams with 4 inject outputs (the fold kernel's shape).
 ///
 /// # Safety
@@ -854,8 +886,11 @@ pub(crate) unsafe fn fold_target(node: *const ffi::ggml_tensor, cuda: bool) -> b
         }
         let n = &*node;
         let p = crate::ggml::external_params(n);
-        // eps, down, quant, rebuild, moe, streams16, padded, fold
-        if p[1..8] != [1, 0, 1, 0, 0, 1, 0]
+        // eps, down, quant, rebuild, moe, streams16, padded, fold; BF16 streams (`--hc-bf16`,
+        // #1183) or not
+        if p[1..5] != [1, 0, 1, 0]
+            || !(0..=1).contains(&p[5])
+            || p[6..8] != [1, 0]
             || p[P_RS] != 0
             || n.src[5].is_null()
             || n.src[6..].iter().any(|s| !s.is_null())
@@ -863,7 +898,7 @@ pub(crate) unsafe fn fold_target(node: *const ffi::ggml_tensor, cuda: bool) -> b
             return false;
         }
         let (res, w, down) = (&*n.src[0], &*n.src[4], &*n.src[5]);
-        res.type_ == types::F32
+        (res.type_ == types::F32 || (p[5] == 1 && res.type_ == types::BF16))
             && down.type_ == types::BF16
             && (!cuda || (res.ne[0] == 2560 && res.ne[1] == 4 && w.ne[1] == 4))
     }
@@ -961,6 +996,25 @@ pub(super) fn streams_bf16_fits(res: Tensor<'_>, w: Tensor<'_>) -> bool {
     STREAMS_BF16.load(std::sync::atomic::Ordering::Relaxed)
         && res.ne()[..2] == [2560, 4]
         && w.ne()[1] == 4
+}
+
+/// `legion serve --hc-bf16` ([`set_hc_bf16`]; off by default).
+static HC_BF16: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Sets whether graphs built from now on keep qwen4exp's residual streams in BF16 between the
+/// mixers that take [`hc_post_norm_rebuilt_xnb`] (BF16 mixers, the NVFP4 checkpoints, on
+/// sm_80+ GPUs such as the GB10), in passes whose every sequence is in its prompt (#1183): the
+/// combine-and-norm (or the MoE tail folded into it) writes them as BF16 and the next one and
+/// the up-mix read them so, half the stream bytes. Each new stream value is rounded to BF16,
+/// so output moves (opt-in); decode, verify and mixed passes keep F32 streams, and every other
+/// reader of the streams gets them converted back to F32.
+pub fn set_hc_bf16(on: bool) {
+    HC_BF16.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`set_hc_bf16`] is on.
+pub(super) fn hc_bf16() -> bool {
+    HC_BF16.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Whether [`hc_post_norm`] also writes `xn` as F16 for the mixer's down projection where
@@ -1148,12 +1202,10 @@ unsafe fn cuda_hc_post_norm(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
             down16_values(down.map(|d| d.type_), (e * hc * m) as usize),
             down.is_some(),
             quant,
-            rebuild.then_some((
-                if params[6] != 0 {
-                    (e * hc) as usize
-                } else {
-                    hc as usize
-                },
+            rebuild.then_some(scales_place(
+                (e * hc) as usize,
+                hc as usize,
+                params[6] != 0,
                 streams16,
             )),
         );
@@ -1201,14 +1253,11 @@ unsafe fn cuda_hc_post_norm(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
         // `out` a deferred reduce-scatter (#1176): the two ranks' BF16 partials added here,
         // their addresses read on the GPU from the slot the exchange wrote them to, so a
         // stage graph may capture this launch. The exchange frees its buffers later.
-        let code = if params[P_RS] != 0 && crate::tp_net::seq_par::deferred(out) {
-            p.rs = crate::tp_net::seq_par::sum_slot(out)? as *const u64;
-            legion_hc_post_norm_rs_launch(&p, stream)
-        } else if params[7] != 0 {
-            // A folded MoE tail (#836): `out` (the experts' rows) is not read as a row.
+        // A folded MoE tail (#836): `out` (the experts' rows) is not read as a row.
+        let fold = (params[7] != 0).then(|| {
             let (sh, g) = (&*dst.src[6], &*dst.src[7]);
             let x16 = out.type_ == types::BF16;
-            let f = MoeFold {
+            MoeFold {
                 x: if x16 {
                     std::ptr::null()
                 } else {
@@ -1225,8 +1274,19 @@ unsafe fn cuda_hc_post_norm(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
                 g_ld: (g.nb[1] / 4) as i64,
                 k: params[8],
                 fma: i32::from(params[7] == 2),
-            };
-            legion_hc_post_norm_fold_launch(&p, &f, stream)
+            }
+        });
+        let code = if params[P_RS] != 0 && crate::tp_net::seq_par::deferred(out) {
+            p.rs = crate::tp_net::seq_par::sum_slot(out)? as *const u64;
+            legion_hc_post_norm_rs_launch(&p, stream)
+        } else if streams16 && bf16 {
+            // BF16 streams for BF16 mixers (#1183), with or without a folded tail.
+            let f = fold
+                .as_ref()
+                .map_or(std::ptr::null(), |f| f as *const MoeFold);
+            legion_hc_post_norm_b16_launch(&p, f, i32::from(res16), stream)
+        } else if let Some(f) = &fold {
+            legion_hc_post_norm_fold_launch(&p, f, stream)
         } else if streams16 {
             // BF16 streams (#826).
             legion_hc_post_norm_s16_launch(&p, i32::from(res16), stream)

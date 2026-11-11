@@ -49,12 +49,13 @@ struct legion_hc_up_mix {
     const float * sc;
     const float * g;
     // Nonzero: res holds BF16 values ([n][hc][e] __nv_bfloat16, hc_post_norm's BF16 streams,
-    // #826 `legion serve --hc-streams-bf16`), each widened to F32 before the rebuild.
+    // #826 `legion serve --hc-streams-bf16`, #1183 `--hc-bf16` for BF16 up rows), each widened
+    // to F32 before the rebuild.
     int32_t       res_bf16;
     // Nonzero: up holds BF16 rows ([hc * e rows][rank] __nv_bfloat16, the NVFP4 checkpoints'
     // mixers, #836) and the matmul is a BF16 MMA GEMM (sm80/hc_up_mix_bf16.cuh): lo is
-    // rounded into lob, lq / ld are unused, and xn is read or rebuilt from F32 streams (res,
-    // sc, g; res_bf16 must be 0).
+    // rounded into lob, lq / ld are unused, and xn is read or rebuilt from the streams (res,
+    // sc, g; F32, or BF16 with res_bf16: `legion serve --hc-bf16`, #1183).
     int32_t       up_bf16;
     void *        lob;     // scratch: lo as BF16, [n][rank]
     // Nonzero: lob already holds lo as BF16 (written by legion_hc_up_lob_launch in a node of
@@ -140,7 +141,7 @@ extern "C" int legion_hc_up_mix_launch(const legion_hc_up_mix * p, void * stream
     if (p->up_bf16 != 0) {
         const bool aligned = (uintptr_t) p->up % 16 == 0 && p->up_nb1 % 16 == 0 && (uintptr_t) p->lob % 16 == 0;
         if (p->hc != HC || p->rank % 16 != 0 || p->rank < 16 || p->rank > MAX_RANK_BF16 || p->e % ROWS != 0 ||
-            p->n < 1 || (p->res != nullptr && p->res_bf16 != 0) || !aligned) {
+            p->n < 1 || (p->res == nullptr && p->res_bf16 != 0) || !aligned) {
             return cudaErrorInvalidValue;
         }
         if (!mma_code()) {
@@ -152,7 +153,9 @@ extern "C" int legion_hc_up_mix_launch(const legion_hc_up_mix * p, void * stream
         }
         const int  smem = HC * ROWS * (p->rank / 2 + PAD / 4) * (int) sizeof(uint32_t);
         const dim3 grid(p->e / ROWS, (p->n + CHUNK - 1) / CHUNK);
-        if (p->res != nullptr) {
+        if (p->res != nullptr && p->res_bf16 != 0) {
+            up_mix_bf16<true, true><<<grid, WARPS * 32, smem, s>>>(*p);
+        } else if (p->res != nullptr) {
             up_mix_bf16<true><<<grid, WARPS * 32, smem, s>>>(*p);
         } else {
             up_mix_bf16<false><<<grid, WARPS * 32, smem, s>>>(*p);

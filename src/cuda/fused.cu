@@ -188,6 +188,18 @@ struct legion_moe_fold {
 
 int legion_hc_post_norm_fold_launch(const legion_hc_post_norm * p, const legion_moe_fold * f, void * stream);
 
+// hc_post_norm with BF16 residual streams for BF16 mixers (#1183, `legion serve --hc-bf16`,
+// opt-in: it moves output): the rebuilt BF16-xn form (sm_80+, qwen4exp's 4 x 2560 streams, 4
+// inject outputs, xnb and scale_at, no xq / xn16), with res' = out * w + res rounded to BF16
+// (__float2bfloat16_rn) and written as BF16 [e, hc, n_tok] at res_new (viewed as
+// __nv_bfloat16 *); the rounded values are the ones normed, rounded into xnb and injected, so
+// up_mix_bf16 rebuilding xn from the BF16 streams and the scales sees what the norm saw. in16:
+// res is BF16 too (res_ld in BF16 values), else F32. f: null, or a folded MoE tail (as
+// legion_hc_post_norm_fold_launch; p->out is then not read). Each thread takes pairs of
+// adjacent values (4-byte BF16 and 8-byte F32 accesses), so the sums run in another order
+// than the F32 kernels'. -1 if the step does not fit.
+int legion_hc_post_norm_b16_launch(const legion_hc_post_norm * p, const legion_moe_fold * f, int in16, void * stream);
+
 // delta_prep: a gated DeltaNet layer's delta-rule inputs from its conv output, per token:
 // q, k = l2_norm of each head_k-wide head (ggml's rms_norm with eps / head_k and then a scale
 // of 1 / sqrt(head_k), with the same reduction order as ggml-cuda's 256-thread rms_norm block),
@@ -1557,6 +1569,203 @@ __global__ void __launch_bounds__(HC_THREADS, 4) hc_post_norm_fold_kernel(legion
     }
 }
 
+// The BF16-stream kernels' layout (#1183): qwen4exp's 4 x 2560 values a token as pairs, thread
+// x taking pairs x + m * HC_THREADS (m < B16_PAIRS, B16_PS of them per stream). Pair q holds
+// values 2q and 2q + 1 of the token.
+constexpr int B16_PS = 5, B16_HC = 4, B16_PAIRS = B16_HC * B16_PS;
+
+// One column of a folded MoE tail: moe_fold_row's arithmetic for the expert at slot j (j0 the
+// first) of value v with router weight w.
+template <bool FMA, bool W>
+__device__ __forceinline__ float moe_fold_step(float o, float v, float w, bool first) {
+    if constexpr (!W) {
+        return first ? v : __fadd_rn(o, v);
+    } else if (first) {
+        return __fmul_rn(v, w);
+    } else if constexpr (FMA) {
+        return __fmaf_rn(v, w, o);
+    } else {
+        return __fadd_rn(o, __fmul_rn(v, w));
+    }
+}
+
+// moe_fold_row for the pair layout: token t's MoE tail for this thread's B16_PS column pairs of
+// the e = 2560 columns into ov. Each column's value is moe_fold_row's (the same experts in the
+// same order, the same roundings), loaded two columns at a time.
+template <bool FMA, bool W, bool X16>
+__device__ __forceinline__ void moe_fold_pairs(const legion_moe_fold & f, int64_t t, float2 * ov) {
+    constexpr int E = 2 * B16_PS * HC_THREADS;
+    const float2 * x = (const float2 *) (f.x + t * (int64_t) f.k * E);
+    const __nv_bfloat162 * x16 = (const __nv_bfloat162 *) (f.x16 + t * (int64_t) f.k * E);
+    const float sgate = 1.0f / (1.0f + expf(-f.g[t * f.g_ld]));
+    for (int j0 = 0; j0 < f.k; j0 += MOE_GROUP) {
+        float2 v[MOE_GROUP][B16_PS];
+        float wj[MOE_GROUP];
+#pragma unroll
+        for (int q = 0; q < MOE_GROUP; q++) {
+            if (j0 + q < f.k) {
+                const int64_t row = (int64_t) (j0 + q) * (E / 2);
+                wj[q] = W ? f.w[t * f.k + j0 + q] : 1.0f;
+#pragma unroll
+                for (int r = 0; r < B16_PS; r++) {
+                    const int64_t at = row + threadIdx.x + r * HC_THREADS;
+                    v[q][r] = X16 ? __bfloat1622float2(x16[at]) : x[at];
+                }
+            }
+        }
+#pragma unroll
+        for (int q = 0; q < MOE_GROUP; q++) {
+            if (j0 + q < f.k) {
+#pragma unroll
+                for (int r = 0; r < B16_PS; r++) {
+                    ov[r].x = moe_fold_step<FMA, W>(ov[r].x, v[q][r].x, wj[q], j0 + q == 0);
+                    ov[r].y = moe_fold_step<FMA, W>(ov[r].y, v[q][r].y, wj[q], j0 + q == 0);
+                }
+            }
+        }
+    }
+    const float2 * sh = (const float2 *) (f.sh + t * E);
+#pragma unroll
+    for (int r = 0; r < B16_PS; r++) {
+        const float2 s = sh[threadIdx.x + r * HC_THREADS];
+        ov[r].x = __fadd_rn(ov[r].x, __fmul_rn(s.x, sgate));
+        ov[r].y = __fadd_rn(ov[r].y, __fmul_rn(s.y, sgate));
+    }
+}
+
+// hc_post_norm_v70_kernel<4, 4, 10, true, false, true, true> (the rebuilt BF16-xn form, sm_80+)
+// with BF16 streams (#1183, legion_hc_post_norm_b16_launch): res' = out * w + res rounded to
+// BF16 and written as BF16, the rounded values normed, rounded to BF16 into xnb and injected.
+// Half the bytes of the streams written (and with IN16 read); the pair layout makes every
+// access a full 128-byte line per warp (a BF16 one per value would move 64). FOLD: out is a
+// folded MoE tail (moe_fold_pairs), as hc_post_norm_fold_kernel makes it.
+template <bool IN16, bool FOLD, bool FMA = false, bool W = false, bool X16 = false>
+__global__ void __launch_bounds__(HC_THREADS, 4) hc_post_norm_b16_kernel(legion_hc_post_norm p, legion_moe_fold f) {
+    constexpr int HC = B16_HC, NINJ = 4, PS = B16_PS, PAIRS = B16_PAIRS;
+    constexpr int n = 2 * PAIRS * HC_THREADS;
+    __shared__ float red[HC_MAX][HC_THREADS / 32];
+    const int64_t t = blockIdx.x;
+    {
+        // As hc_post_norm_v70_kernel's SM80 hint: a hint, no value changes.
+        const int64_t gl = n / 32, lines = gl + (int64_t) n * NINJ / 32;
+        for (int64_t u = blockIdx.x * (int64_t) HC_THREADS + threadIdx.x; u < lines;
+             u += (int64_t) gridDim.x * HC_THREADS) {
+            const float * a = u < gl ? p.g + u * 32 : p.w + (u - gl) * 32;
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(a));
+        }
+    }
+    float2 ov[PS];
+    if constexpr (FOLD) {
+        moe_fold_pairs<FMA, W, X16>(f, t, ov);
+    } else {
+        const float * out = p.out + t * p.out_ld;
+        if ((((uintptr_t) out) & 7) == 0) {
+#pragma unroll
+            for (int r = 0; r < PS; r++) {
+                ov[r] = ((const float2 *) out)[threadIdx.x + r * HC_THREADS];
+            }
+        } else {
+#pragma unroll
+            for (int r = 0; r < PS; r++) {
+                const int c = 2 * (threadIdx.x + r * HC_THREADS);
+                ov[r] = make_float2(out[c], out[c + 1]);
+            }
+        }
+    }
+    // The streams as BF16 pairs: the old ones (IN16), then the rounded new ones for pass 2.
+    __nv_bfloat162 vb[PAIRS];
+    float2 vf[IN16 ? 1 : PAIRS];
+    if constexpr (IN16) {
+        const __nv_bfloat162 * res = (const __nv_bfloat162 *) ((const __nv_bfloat16 *) p.res + t * p.res_ld);
+#pragma unroll
+        for (int i = 0; i < PAIRS; i++) {
+            vb[i] = res[threadIdx.x + i * HC_THREADS];
+        }
+    } else {
+        const float2 * res = (const float2 *) (p.res + t * p.res_ld);
+#pragma unroll
+        for (int i = 0; i < PAIRS; i++) {
+            vf[i] = res[threadIdx.x + i * HC_THREADS];
+        }
+    }
+    float wpost[HC];
+#pragma unroll
+    for (int h = 0; h < HC; h++) {
+        // ggml: scale(inject, 1 / hc), sigmoid, scale(2)
+        const float v = p.inj[t * p.inj_ld + h] * (1.0f / (float) p.hc);
+        const float s = 1.0f / (1.0f + expf(-v));
+        wpost[h] = s * 2.0f;
+    }
+    __nv_bfloat162 * rn = (__nv_bfloat162 *) ((__nv_bfloat16 *) p.res_new + t * n);
+    float sq[HC];
+#pragma unroll
+    for (int h = 0; h < HC; h++) {
+        sq[h] = 0.0f;
+#pragma unroll
+        for (int r = 0; r < PS; r++) {
+            const int i = h * PS + r;
+            float2 old;
+            if constexpr (IN16) {
+                old = __bfloat1622float2(vb[i]);
+            } else {
+                old = vf[i];
+            }
+            // dsv4_hc_post_f32: sum = x * post; sum += residual; then rounded to BF16
+            const __nv_bfloat162 b = __floats2bfloat162_rn(__fmaf_rn(ov[r].x, wpost[h], old.x),
+                                                          __fmaf_rn(ov[r].y, wpost[h], old.y));
+            rn[threadIdx.x + i * HC_THREADS] = b;
+            vb[i] = b;
+            const float2 v = __bfloat1622float2(b);
+            sq[h] = __fadd_rn(sq[h], __fmul_rn(v.x, v.x));
+            sq[h] = __fadd_rn(sq[h], __fmul_rn(v.y, v.y));
+        }
+    }
+    block_sums(sq, red);
+    float scale[HC];
+#pragma unroll
+    for (int h = 0; h < HC; h++) {
+        scale[h] = 1.0f / sqrtf(sq[h] / p.e + p.eps);
+    }
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int h = 0; h < HC; h++) {
+            p.res_new[p.scale_at + t * HC + h] = scale[h];
+        }
+    }
+    float acc[NINJ];
+#pragma unroll
+    for (int j = 0; j < NINJ; j++) {
+        acc[j] = 0.0f;
+    }
+    const float2 * g = (const float2 *) p.g;
+    __nv_bfloat162 * xnb = (__nv_bfloat162 *) ((__nv_bfloat16 *) p.xnb + t * n);
+#pragma unroll
+    for (int i = 0; i < PAIRS; i++) {
+        const int k = threadIdx.x + i * HC_THREADS;
+        const float2 v = __bfloat1622float2(vb[i]);
+        const float2 gk = g[k];
+        // (rn * scale) * gamma, as up_mix_bf16 rebuilds it from the BF16 streams
+        const float y0 = __fmul_rn(__fmul_rn(v.x, scale[i / PS]), gk.x);
+        const float y1 = __fmul_rn(__fmul_rn(v.y, scale[i / PS]), gk.y);
+        xnb[k] = __floats2bfloat162_rn(y0, y1);
+#pragma unroll
+        for (int j = 0; j < NINJ; j++) {
+            const float2 wk = ((const float2 *) (p.w + (int64_t) n * j))[k];
+            acc[j] = __fmaf_rn(y0, wk.x, acc[j]);
+            acc[j] = __fmaf_rn(y1, wk.y, acc[j]);
+        }
+    }
+    block_sums(acc, red);
+    if (threadIdx.x < NINJ) {
+#pragma unroll
+        for (int j = 0; j < NINJ; j++) {
+            if (j == (int) threadIdx.x) {
+                p.inject[t * NINJ + j] = acc[j];
+            }
+        }
+    }
+}
+
 }  // namespace
 
 int legion_moe_combine_launch(const legion_moe_combine * p, void * stream) {
@@ -1803,6 +2012,62 @@ int legion_hc_post_norm_fold_launch(const legion_hc_post_norm * p, const legion_
         hc_post_norm_fold_kernel<true, true><<<p->n_tok, HC_THREADS, 0, st>>>(*p, *f);
     } else {
         hc_post_norm_fold_kernel<false, true><<<p->n_tok, HC_THREADS, 0, st>>>(*p, *f);
+    }
+    return (int) cudaGetLastError();
+}
+
+// hc_post_norm_b16_kernel of a folded MoE tail, the fold's variant picked as
+// legion_hc_post_norm_fold_launch picks it.
+template <bool IN16>
+static void hc_post_norm_b16_fold(const legion_hc_post_norm * p, const legion_moe_fold * f, cudaStream_t st) {
+    const unsigned grid = (unsigned) p->n_tok;
+    if (f->x16 != nullptr) {
+        if (f->fma != 0) {
+            hc_post_norm_b16_kernel<IN16, true, true, true, true><<<grid, HC_THREADS, 0, st>>>(*p, *f);
+        } else {
+            hc_post_norm_b16_kernel<IN16, true, false, true, true><<<grid, HC_THREADS, 0, st>>>(*p, *f);
+        }
+    } else if (f->w == nullptr) {
+        hc_post_norm_b16_kernel<IN16, true, false, false><<<grid, HC_THREADS, 0, st>>>(*p, *f);
+    } else if (f->fma != 0) {
+        hc_post_norm_b16_kernel<IN16, true, true, true><<<grid, HC_THREADS, 0, st>>>(*p, *f);
+    } else {
+        hc_post_norm_b16_kernel<IN16, true, false, true><<<grid, HC_THREADS, 0, st>>>(*p, *f);
+    }
+}
+
+int legion_hc_post_norm_b16_launch(const legion_hc_post_norm * p, const legion_moe_fold * f, int in16, void * stream) {
+    int dev = 0, major = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+    constexpr int E = 2 * B16_PS * HC_THREADS;
+    // The pair layout's 4- and 8-byte accesses: every row starts on a pair.
+    const bool aligned = (uintptr_t) p->res % (in16 ? 4 : 8) == 0 && p->res_ld % 2 == 0 &&
+                         (uintptr_t) p->res_new % 4 == 0 && (uintptr_t) p->xnb % 4 == 0 &&
+                         (uintptr_t) p->g % 8 == 0 && (uintptr_t) p->w % 8 == 0;
+    if (major < 8 || p->hc != B16_HC || p->n_inj != 4 || p->e != E || p->xnb == nullptr || p->scale_at == 0 ||
+        p->xq != nullptr || p->xn16 != nullptr || p->rs != nullptr || p->n_tok < 1 || !aligned) {
+        return -1;
+    }
+    const cudaStream_t st = (cudaStream_t) stream;
+    if (f == nullptr) {
+        if (in16) {
+            hc_post_norm_b16_kernel<true, false><<<p->n_tok, HC_THREADS, 0, st>>>(*p, legion_moe_fold{});
+        } else {
+            hc_post_norm_b16_kernel<false, false><<<p->n_tok, HC_THREADS, 0, st>>>(*p, legion_moe_fold{});
+        }
+        return (int) cudaGetLastError();
+    }
+    // As legion_hc_post_norm_fold_launch, the rows read in pairs.
+    if (f->k < 1 || f->sh == nullptr || (f->w == nullptr && f->fma != 0) || (f->x == nullptr) == (f->x16 == nullptr) ||
+        (f->x16 != nullptr && f->w == nullptr) || (uintptr_t) f->sh % 8 != 0 ||
+        (f->x != nullptr && (uintptr_t) f->x % 8 != 0) || (f->x16 != nullptr && (uintptr_t) f->x16 % 4 != 0)) {
+        return -1;
+    }
+    if (in16) {
+        hc_post_norm_b16_fold<true>(p, f, st);
+    } else {
+        hc_post_norm_b16_fold<false>(p, f, st);
     }
     return (int) cudaGetLastError();
 }

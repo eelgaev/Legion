@@ -361,7 +361,8 @@ unsafe fn cuda_hc_up_lob(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
 /// `res` the new streams (F32 `[e, hc, n]`), `scales` each stream's norm scale (F32 `[hc, n]`),
 /// `gamma` the norm's weight (F32 `[e · hc]`), all contiguous. Saves the norm writing `xn` and
 /// this op reading it back: `res` is read instead (#526). `res` may also be BF16, the streams
-/// of `legion serve --hc-streams-bf16` (#826): each value is widened to F32 first.
+/// of `legion serve --hc-streams-bf16` (#826) or, for a BF16 `up`, `--hc-bf16` (#1183): each
+/// value is widened to F32 first.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn up_mix_rebuilt<'a>(
     ctx: &'a Context,
@@ -395,11 +396,10 @@ pub(super) fn up_mix_rebuilt<'a>(
         assert!(t.is_contiguous(), "hc_up_mix: contiguous operands");
     }
     if bf16 {
-        // F32 streams only (the BF16 kernel's rebuild); the two nodes of `up_mix`'s BF16 form,
-        // the mix node reading the streams, scales and gamma in place of `xn`. `res` and the
-        // scales are views of the norm's node, as `xn` is, so ggml's allocator frees and
-        // places every tensor as it does for `up_mix` (#836).
-        assert_eq!(res.ty(), types::F32, "hc_up_mix: F32 streams for a BF16 up");
+        // The two nodes of `up_mix`'s BF16 form, the mix node reading the streams, scales and
+        // gamma in place of `xn`. `res` and the scales are views of the norm's node, as `xn`
+        // is, so ggml's allocator frees and places every tensor as it does for `up_mix` (#836).
+        // BF16 streams: `legion serve --hc-bf16` (#1183).
         let lob = ctx.external(&HC_UP_LOB, types::F32, [rows, n, 1, 1], &[lo]);
         return ctx.external_with(
             &HC_UP_MIX,

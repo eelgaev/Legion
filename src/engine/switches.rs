@@ -338,6 +338,9 @@ pub struct Switches {
     /// qwen4exp's residual streams kept in BF16 between the GB10 prompt mixers
     /// ([`crate::model::qwen4::set_streams_bf16`], opt-in, moves output).
     pub hc_streams_bf16: Option<bool>,
+    /// qwen4exp's residual streams kept in BF16 between the sm_80+ BF16 prompt mixers (the
+    /// NVFP4 checkpoints, [`crate::model::qwen4::set_hc_bf16`], opt-in, moves output).
+    pub hc_bf16: Option<bool>,
     /// qwen4exp's mixer gated mix also writing the block input as F16 for its Q8_0 projections
     /// on a V100 ([`crate::model::qwen4::set_mix16`]).
     pub hc_mix16: Option<bool>,
@@ -724,6 +727,7 @@ impl Switches {
         set(self.hc_up_mix_bf16, qwen4::set_up_mix_bf16);
         set(self.hc_xn_rebuild, qwen4::set_up_mix_rebuild);
         set(self.hc_streams_bf16, qwen4::set_streams_bf16);
+        set(self.hc_bf16, qwen4::set_hc_bf16);
         set(self.hc_mix16, qwen4::set_mix16);
         set(self.hc_mix_rebuild_bf16, qwen4::set_mix_rebuild_bf16);
         set(self.hc_chain, qwen4::set_hc_chain);

@@ -912,6 +912,15 @@ pub(in crate::cli) struct SwitchArgs {
     /// half the stream bytes. Each new stream value is rounded to BF16 (off by default).
     #[arg(long, help_heading = HEADING)]
     hc_streams_bf16: bool,
+    /// Opt-in, moves output. qwen4exp passes where every sequence is in its prompt (steps of
+    /// 256+ tokens), on compute capability 8.0+ GPUs with BF16 mixer weights (the NVFP4
+    /// checkpoints; no effect elsewhere, with --hc-xn-written, or with --tp-seq-par splitting
+    /// the step): keep the hyper-connection residual streams in BF16 between the mixers instead
+    /// of F32, so the combine-and-norm (with the MoE output folded in) and the up-mix kernel
+    /// move half the stream bytes. Math stays F32 inside each kernel; each new stream value is
+    /// rounded to BF16. Decode, verify and mixed steps keep F32 streams (off by default).
+    #[arg(long, help_heading = HEADING)]
+    hc_bf16: bool,
     /// qwen4exp prompt steps of 64+ tokens on a V100 (compute capability 7.0; no effect
     /// elsewhere): the hyper-connection mix as one op that also writes the block input as F16,
     /// which its Q8_0 projections (cuBLAS F16 GEMMs) then take with an F16 copy of their weight
@@ -1530,6 +1539,7 @@ impl SwitchArgs {
             hc_up_mix_bf16: self.no_hc_up_mix_bf16.then_some(false),
             hc_xn_rebuild: self.hc_xn_written.then_some(false),
             hc_streams_bf16: self.hc_streams_bf16.then_some(true),
+            hc_bf16: self.hc_bf16.then_some(true),
             hc_mix16: self.hc_mix_f16.then_some(true),
             hc_mix_rebuild_bf16: self.hc_mix_rebuild_bf16.then_some(true),
             hc_chain: self.hc_chain_ggml.then_some(false),
