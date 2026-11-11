@@ -330,7 +330,7 @@ fn reached(flag: &AtomicU32, seq: u32) -> bool {
 /// Spins (at low priority) while recently busy, naps otherwise, until `ready` says go; false
 /// when `stop` is raised first.
 fn wait_for(stop: &AtomicBool, mut ready: impl FnMut() -> bool) -> bool {
-    let mut busy = Instant::now();
+    let busy = Instant::now();
     let mut spins = 0u32;
     loop {
         if ready() {
@@ -345,8 +345,10 @@ fn wait_for(stop: &AtomicBool, mut ready: impl FnMut() -> bool) -> bool {
             }
             if busy.elapsed() >= SPIN_FOR {
                 std::thread::sleep(NAP);
+                // `ready` may have acted (taken a job), so a yes here is final.
                 if ready() {
-                    busy = Instant::now();
+                    spin_done();
+                    return true;
                 }
                 continue;
             }
