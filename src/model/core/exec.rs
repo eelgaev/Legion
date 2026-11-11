@@ -3987,7 +3987,9 @@ impl Executor {
         } = &mut self.stages[s];
         let kept = kept_in(decode, mixed, shape).expect("prepared");
         let inputs = Inputs::from_parts(shape, parts, |i| kept.tensor(i));
+        let t0 = std::time::Instant::now();
         inputs.fill(groups, shape);
+        let filled = t0.elapsed();
         model.fill_extra(
             &inputs,
             groups,
@@ -4000,6 +4002,16 @@ impl Executor {
                 backend,
             },
         );
+        let tokens: usize = shape.iter().map(|g| g.n_seqs * g.n_tok).sum();
+        if tokens >= 1024 {
+            tracing::debug!(
+                stage = s,
+                tokens,
+                common_ms = filled.as_secs_f64() * 1e3,
+                extra_ms = (t0.elapsed() - filled).as_secs_f64() * 1e3,
+                "step inputs"
+            );
+        }
     }
 
     /// Copies the residual stage `s - 1` handed over into stage `s`'s input (none for the
