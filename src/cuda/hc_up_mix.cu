@@ -61,6 +61,11 @@ struct legion_hc_up_mix {
     // Nonzero: lob already holds lo as BF16 (written by legion_hc_up_lob_launch in a node of
     // its own, the place ggml's gate takes, #836), so the launch does not round lo again.
     int32_t       lob_ready;
+    // BF16 up only (#1183, the node fusion's mix cast): null, or mixed rounded to BF16 as
+    // ggml-cuda's F32 -> BF16 copy rounds it (__float2bfloat16), [n][e] __nv_bfloat16, written
+    // beside mixed; with skip_f32 nonzero mixed itself is not written (nothing reads it).
+    void *        mixedb;
+    int32_t       skip_f32;
 };
 
 // Launches the kernels on `stream`; returns a cudaError_t (cudaErrorInvalidValue for shapes the
@@ -161,6 +166,10 @@ extern "C" int legion_hc_up_mix_launch(const legion_hc_up_mix * p, void * stream
             up_mix_bf16<false><<<grid, WARPS * 32, smem, s>>>(*p);
         }
         return (int) cudaGetLastError();
+    }
+    // (The BF16 copy of mixed is the BF16 kernel's only.)
+    if (p->mixedb != nullptr || p->skip_f32 != 0) {
+        return cudaErrorInvalidValue;
     }
     if (p->hc != HC || p->rank % 32 != 0 || p->rank < 32 || p->rank > 32 * MAX_KB || p->e % ROWS != 0 || p->n < 1) {
         return cudaErrorInvalidValue;

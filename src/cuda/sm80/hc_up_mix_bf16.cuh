@@ -29,7 +29,9 @@
 // the streams in order, then scale * sum. RB: xn[c] is rebuilt as hc_post_norm computes it,
 // __fmul_rn(__fmul_rn(res[c], sc[c]), g[c]) (the new streams, the stream's norm scale, gamma),
 // not read, as up_mix_mma<true> does: the norm then skips writing the F32 xn (40 KB a token at
-// qwen4exp's shape), the same bits.
+// qwen4exp's shape), the same bits. With mixedb (#1183) the epilogue also writes mixed rounded
+// to BF16 with __float2bfloat16, the rounding of ggml-cuda's F32 -> BF16 copy the BF16
+// projections read, and with skip_f32 not mixed itself (the node fusion's mix cast).
 //
 // MMA fragments (PTX ISA, m16n8k16 .bf16): with g = lane / 4 and q = lane % 4, A holds rows g
 // and g + 8 at K values 2q, 2q + 1 and 2q + 8, 2q + 9 (a register each, the lower K in the low
@@ -157,7 +159,15 @@ __global__ void __launch_bounds__(WARPS * 32) up_mix_bf16(const legion_hc_up_mix
                         const float wv = 1.0f / (1.0f + expf(-acc[c][t][l]));
                         sum += xv * wv;
                     }
-                    p.mixed[(int64_t) tok * p.e + i] = p.scale * sum;
+                    const float   v  = p.scale * sum;
+                    const int64_t mo = (int64_t) tok * p.e + i;
+                    if (p.skip_f32 == 0) {
+                        p.mixed[mo] = v;
+                    }
+                    // The BF16 copy (#1183): ggml-cuda's F32 -> BF16 copy of mixed, made here.
+                    if (p.mixedb != nullptr) {
+                        ((__nv_bfloat16 *) p.mixedb)[mo] = __float2bfloat16(v);
+                    }
                 }
             }
         }

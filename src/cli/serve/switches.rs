@@ -958,8 +958,9 @@ pub(in crate::cli) struct SwitchArgs {
     /// runs) with BF16 mixer weights (the NVFP4 checkpoints; no effect elsewhere, with
     /// --hc-xn-written, or with --tp-seq-par splitting the step): keep the hyper-connection
     /// residual streams in BF16 between the mixers instead of F32, so the combine-and-norm (with
-    /// the MoE output folded in) and the up-mix kernel move half the stream bytes. Math stays F32 inside each kernel; each new stream value is
-    /// rounded to BF16. Decode, verify and mixed steps keep F32 streams (off by default).
+    /// the MoE output folded in) and the up-mix kernel move half the stream bytes. Math stays F32
+    /// inside each kernel; each new stream value is rounded to BF16. Decode, verify and mixed
+    /// steps keep F32 streams (off by default).
     #[arg(long, help_heading = HEADING)]
     hc_bf16: bool,
     /// qwen4exp prompt steps of 64+ tokens on a V100 (compute capability 7.0; no effect

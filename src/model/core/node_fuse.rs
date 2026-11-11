@@ -21,6 +21,10 @@
 //!   after it (`crate::ggml::post_alloc::set_relayout`), before this pass runs.
 //! - The routed expert ids through the layer's expert table (the expert cache's remap: a `cont`
 //!   and a `get_rows` of I32 ids): one op ([`IDS_REMAP`]).
+//! - qwen4exp's hyper-connection mix of BF16 `up` weights (prompt steps) writes the cast of its
+//!   values to BF16 (ggml's `cpy`, which the BF16 projections read) itself, rounded as
+//!   ggml-cuda's copy rounds them, into the cast's memory, and skips its F32 values where only
+//!   the cast reads them (#1183): a copy kernel per mixer gone ([`Graph::mix_cast`]).
 //!
 //! An op runs at the position of the chain's last node, into that node's memory; the chain's
 //! other nodes become `GGML_OP_NONE`. An op reading a tensor later than the chain did is only
@@ -104,6 +108,10 @@ pub(crate) struct Counts {
     pub gate: usize,
     /// Expert id remaps.
     pub remap: usize,
+    /// BF16 hyper-connection mixes writing their cast to BF16 themselves.
+    pub mix_cast: usize,
+    /// Of those, mixes whose F32 values nothing else reads, so not written.
+    pub mix_f32_skipped: usize,
     /// Nodes turned into `GGML_OP_NONE`.
     pub none: usize,
 }
@@ -129,6 +137,8 @@ pub unsafe fn rewrite(graph: *mut ffi::ggml_cgraph) {
             sum = c.sum,
             gate = c.gate,
             remap = c.remap,
+            mix_cast = c.mix_cast,
+            mix_f32_skipped = c.mix_f32_skipped,
             none = c.none,
             "node fuse: small ggml chains as Legion ops (the first graphs; --node-fuse-ggml off)"
         );
@@ -154,6 +164,7 @@ pub(crate) unsafe fn rewrite_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> 
             match (*g.nodes[i]).op {
                 ffi::ggml_op_GGML_OP_MUL => g.moe(i, cuda, &mut c),
                 ffi::ggml_op_GGML_OP_GET_ROWS => g.remap(i, &mut c),
+                ffi::ggml_op_GGML_OP_CUSTOM => g.mix_cast(i, &mut c),
                 _ => {}
             }
         }
@@ -821,6 +832,89 @@ impl Graph {
             (*cont).op = ffi::ggml_op_GGML_OP_NONE;
             self.none[ci] = true;
             c.remap += 1;
+        }
+    }
+
+    /// The cast to BF16 (`ggml_cast`: a `cpy` into a new contiguous tensor) of all of `mix`'s
+    /// values, read directly or through a reshape or view of all of them, by index.
+    ///
+    /// # Safety
+    /// `mix` is a node of the graph.
+    unsafe fn bf16_cast_of(&self, mix: Node) -> Option<usize> {
+        // SAFETY: the caller's; users are valid nodes.
+        unsafe {
+            let whole = |t: Node| {
+                t == mix
+                    || (is_view_op((*t).op)
+                        && (*t).view_src == mix
+                        && (*t).view_offs == 0
+                        && ffi::ggml_is_contiguous(t)
+                        && ffi::ggml_nelements(t) == ffi::ggml_nelements(mix))
+            };
+            let mut readers: Vec<usize> = self.users(mix).to_vec();
+            for &u in self.users(mix) {
+                if is_view_op((*self.nodes[u]).op) {
+                    readers.extend(self.users(self.nodes[u]));
+                }
+            }
+            readers.sort_unstable();
+            readers.into_iter().find(|&j| {
+                let t = self.nodes[j];
+                !self.none[j]
+                    && (*t).op == ffi::ggml_op_GGML_OP_CPY
+                    && (*t).type_ == ffi::ggml_type_GGML_TYPE_BF16
+                    && (*t).src[1] == t
+                    && (*t).view_src.is_null()
+                    && !(*t).data.is_null()
+                    && ffi::ggml_is_contiguous(t)
+                    && ffi::ggml_nelements(t) == ffi::ggml_nelements(mix)
+                    && !(*t).src[0].is_null()
+                    && whole((*t).src[0])
+            })
+        }
+    }
+
+    /// qwen4exp's BF16 hyper-connection mix at `at` ([`crate::model::qwen4::mix_cast_reads`])
+    /// and the cast of its values to BF16: the mix writes the cast's values itself, rounded as
+    /// ggml-cuda's copy rounds them (`__float2bfloat16`; the CPU's as ggml's CPU copy), into the
+    /// cast's memory, and the cast becomes `GGML_OP_NONE`. Its memory is written earlier than
+    /// the cast did, so only where none of it is what the mix reads or writes, and no node in
+    /// between writes or reads it. Where the cast is the only reader of the F32 values (the
+    /// attention's mix), the mix does not write them.
+    ///
+    /// # Safety
+    /// `at` is a node index.
+    unsafe fn mix_cast(&mut self, at: usize, c: &mut Counts) {
+        // SAFETY: the caller's; nodes and sources are valid tensors.
+        unsafe {
+            let mix = self.nodes[at];
+            let Some(reads) = crate::model::qwen4::mix_cast_reads(mix) else {
+                return;
+            };
+            let Some(j) = self.bf16_cast_of(mix) else {
+                return;
+            };
+            let cast = self.nodes[j];
+            let (c0, c1) = span(cast);
+            let hits = |(a, b): (usize, usize)| a < b && a < c1 && c0 < b;
+            if c0 >= c1 || hits(span(mix)) || reads.iter().any(|&r| hits(r)) {
+                return;
+            }
+            for k in at + 1..j {
+                let n = self.nodes[k];
+                if self.none[k] || is_view_op((*n).op) || (*n).op == ffi::ggml_op_GGML_OP_NONE {
+                    continue;
+                }
+                if overlap(n, cast) || (*n).src.iter().any(|&s| !s.is_null() && overlap(s, cast)) {
+                    return;
+                }
+            }
+            let skip_f32 = self.only_read_by(mix, &[j]);
+            crate::model::qwen4::set_mix_cast(mix, cast, skip_f32);
+            (*cast).op = ffi::ggml_op_GGML_OP_NONE;
+            self.none[j] = true;
+            c.mix_cast += 1;
+            c.mix_f32_skipped += usize::from(skip_f32);
         }
     }
 }
