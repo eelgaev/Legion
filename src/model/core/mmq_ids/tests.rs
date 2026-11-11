@@ -138,3 +138,20 @@ fn cpu_op_is_the_dequantized_product() {
         }
     }
 }
+
+#[test]
+fn each_gpu_of_a_mixed_box_answers_for_itself() {
+    use crate::hw::per_device::test_cc;
+    // The GB10 and the 5090 MMQ's tensor-core chain, the V100 its dp4a chain, the 4090, the
+    // A100 and an unknown device neither, whatever the engine's GPU is.
+    let want = [
+        CHAIN_MMA, CHAIN_NONE, CHAIN_DP4A, CHAIN_NONE, CHAIN_MMA, CHAIN_NONE,
+    ];
+    for engine in [CHAIN_NONE, CHAIN_MMA, CHAIN_DP4A] {
+        let picks: Vec<u8> = (0..6)
+            .map(|d| chain_on_by(Some(d), engine, test_cc))
+            .collect();
+        assert_eq!(picks, want, "engine {engine}");
+        assert_eq!(chain_on_by(None, engine, test_cc), engine);
+    }
+}

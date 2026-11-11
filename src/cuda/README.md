@@ -92,7 +92,10 @@ older fallback. The launchers then pick a path per device, decided once per devi
 Answers about the GPU are kept per device, never once per process: one box may hold GPUs of
 different architectures. On the Rust side `crate::hw::per_device` keeps them (compute
 capability, SM count, a probe's answer) by device ordinal, and an op picks by the device of
-the weight it multiplies (`Tensor::cuda_device`). Before any weight is read, the engine checks
+the weight it multiplies or the state it updates (`Tensor::cuda_device`; a launcher by its
+current device). A switch the engine sets from its GPU when it loads (`set_gpu`) is only the
+answer for tensors that name no device yet: `per_device::pick` asks the tensor's own device
+first. Before any weight is read, the engine checks
 each GPU of the layout against the code the binary holds for it (`crate::hw::cuda_arch`: the
 `ptxVersion` of one kernel there, every file being built for the same architectures) and
 refuses one whose architecture level (7.0, 8.0, 8.9, 9.0+) the code is older than, with the
