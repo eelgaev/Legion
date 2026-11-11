@@ -326,6 +326,8 @@ pub struct LookupTable {
     cpus: Vec<u32>,
     /// [`Self::prefetch`]es not yet taken into the direct tier's cache.
     prefetched: Mutex<Vec<Ticket>>,
+    /// [`Self::prefetch_next`]es that the next [`Self::issue`] leaves for the one after.
+    next: Mutex<Vec<Ticket>>,
 }
 
 enum Tier {
@@ -569,6 +571,7 @@ impl LookupTable {
             choice,
             cpus,
             prefetched: Mutex::new(Vec::new()),
+            next: Mutex::new(Vec::new()),
         })
     }
 
@@ -622,6 +625,20 @@ impl LookupTable {
     /// the direct tier's row cache, so that issue finds them there. A hint: the RAM tiers and a
     /// direct tier without a cache ignore it.
     pub fn prefetch(&self, rows: &[u32]) {
+        self.prefetch_into(rows, &self.prefetched);
+    }
+
+    /// [`Self::prefetch`] of rows that the issue after the next one asks for (the next prompt
+    /// chunk's, issued before the current chunk's step fills): the next issue does not wait
+    /// for them, it leaves them for the one after. Waiting there held a Flash-Next prompt
+    /// step's fill (with the GPU idle) for ~35 ms on about a third of the 4,096-token steps of
+    /// a 123K prompt on a DGX Spark (GB10), the steps whose next chunk read from the SSD
+    /// (#1183).
+    pub fn prefetch_next(&self, rows: &[u32]) {
+        self.prefetch_into(rows, &self.next);
+    }
+
+    fn prefetch_into(&self, rows: &[u32], into: &Mutex<Vec<Ticket>>) {
         let Tier::Direct(d) = &self.tier else {
             return;
         };
@@ -636,16 +653,17 @@ impl LookupTable {
         rows.sort_unstable();
         rows.dedup();
         let t = d.issue(&self.parts, &rows, true);
-        self.prefetched
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(t);
+        into.lock().unwrap_or_else(|e| e.into_inner()).push(t);
     }
 
-    /// Waits for the prefetches still out and puts their rows in the cache.
+    /// Waits for the prefetches still out and puts their rows in the cache; the
+    /// [`Self::prefetch_next`]es become prefetches the next call waits for.
     fn take_prefetched(&self, d: &Direct) {
-        let tickets =
-            std::mem::take(&mut *self.prefetched.lock().unwrap_or_else(|e| e.into_inner()));
+        let next = std::mem::take(&mut *self.next.lock().unwrap_or_else(|e| e.into_inner()));
+        let tickets = std::mem::replace(
+            &mut *self.prefetched.lock().unwrap_or_else(|e| e.into_inner()),
+            next,
+        );
         for t in tickets {
             // A failed prefetch only leaves rows uncached: their own read reports the error.
             let _ = d.collect(t, self.file.row_bytes);

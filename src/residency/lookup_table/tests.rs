@@ -127,6 +127,46 @@ fn prefetched_rows_come_from_the_cache() {
     assert_eq!(s.cache_hits, picks.len() as u64, "{s:?}");
 }
 
+/// Rows prefetched for the issue after the next one: the next issue leaves them in flight, the
+/// one after takes them into the cache and serves them from it, exactly.
+#[test]
+fn rows_prefetched_next_wait_for_the_issue_after() {
+    let base = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"));
+    std::fs::create_dir_all(&base).unwrap();
+    let dir = tempfile::tempdir_in(&base).unwrap();
+    let (file, rows) = table(dir.path(), 5000);
+    let t = LookupTable::open(
+        file,
+        &TableOptions {
+            io: TableIo::Direct,
+            ram: Default::default(),
+            ram_cache_bytes: Some(4 << 20),
+            inflight: 4,
+            aio_max: 0,
+            keep_awake_ms: 0,
+            node: None,
+            unified: false,
+        },
+        None,
+    )
+    .unwrap();
+    let picks: Vec<u32> = (0..500u32).map(|i| i * 7 % 5000).collect();
+    let now = [4999u32];
+    t.prefetch(&now);
+    t.prefetch_next(&picks);
+    // The current step's rows: from the plain prefetch; the next ones stay in flight.
+    assert!(t.fetch(&now).unwrap() == want(&rows, &now));
+    assert_eq!(t.stats().cache_hits, 1);
+    assert_eq!(t.prefetched.lock().unwrap().len(), 1);
+    assert!(t.next.lock().unwrap().is_empty());
+    // The next step's: taken in by its own issue, all from the cache.
+    assert!(t.fetch(&picks).unwrap() == want(&rows, &picks));
+    assert_eq!(t.stats().cache_hits, 1 + picks.len() as u64);
+    assert!(t.prefetched.lock().unwrap().is_empty());
+}
+
 #[test]
 fn auto_takes_ram_only_when_the_table_fits_and_may_be_locked() {
     let gib = 1u64 << 30;
