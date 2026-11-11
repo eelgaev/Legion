@@ -6,7 +6,10 @@
 //! take-in uploaded those again. [`RowsAt`] names a captured output where it is (its buffer and
 //! address), so the drafter's graph gathers the rows it needs on the device instead. Its bytes
 //! are the target graph's until that graph runs again: the reader uses them before then.
+//! The MTP head's take-in of a prompt chunk copies them into its input on the device
+//! ([`Backend::copy_rows`], #1183).
 
+use super::backend::Backend;
 use super::context::{Context, Tensor};
 use super::ffi;
 
@@ -53,6 +56,87 @@ impl<'a> Tensor<'a> {
             device: self.cuda_device(),
         })
     }
+}
+
+impl RowsAt {
+    /// `n` of its rows from row `first` on, where they are.
+    pub fn slice(&self, first: usize, n: usize) -> RowsAt {
+        assert!(
+            first + n <= self.rows,
+            "rows {first}+{n} of {} rows",
+            self.rows
+        );
+        RowsAt {
+            data: self.data + first * self.width * std::mem::size_of::<f32>(),
+            rows: n,
+            ..*self
+        }
+    }
+
+    /// Its bytes.
+    pub fn nbytes(&self) -> usize {
+        self.width * self.rows * std::mem::size_of::<f32>()
+    }
+}
+
+impl Backend {
+    /// Queues a copy of the rows `src` names into the rows `dst` names (the same size) on this
+    /// backend's stream, after the work queued there (#1183): device to device on CUDA, and
+    /// the host waits for nothing. Where no CUDA stream queues it, ggml copies it (waiting for
+    /// the backend first). The bytes are the same either way.
+    ///
+    /// # Safety
+    /// Both buffers must hold those rows until the copy has run (the backend's next
+    /// synchronize), and nothing may write `src` or read or write `dst` meanwhile, but the
+    /// work queued on this backend after it.
+    pub unsafe fn copy_rows(&self, src: &RowsAt, dst: &RowsAt) {
+        assert_eq!(
+            (src.width, src.rows),
+            (dst.width, dst.rows),
+            "copy_rows: shapes differ"
+        );
+        if src.rows == 0 {
+            return;
+        }
+        #[cfg(feature = "cuda")]
+        if let Some(stream) = self.cuda_launch_stream() {
+            // SAFETY: two ranges of `nbytes` in live buffers (the caller's contract), copied in
+            // order on the backend's stream.
+            let e = unsafe {
+                cuda::cudaMemcpyAsync(
+                    dst.data as *mut std::ffi::c_void,
+                    src.data as *const std::ffi::c_void,
+                    src.nbytes(),
+                    cuda::DEFAULT,
+                    stream,
+                )
+            };
+            assert_eq!(e, 0, "copy_rows: cudaMemcpyAsync failed (CUDA error {e})");
+            return;
+        }
+        let ctx = Context::new(2, 0);
+        // SAFETY: the caller keeps both buffers and their rows (see above).
+        let (s, d) = unsafe { (ctx.over_rows(src), ctx.over_rows(dst)) };
+        self.copy_to(self, s, d);
+    }
+}
+
+#[cfg(feature = "cuda")]
+mod cuda {
+    use std::os::raw::{c_int, c_void};
+
+    unsafe extern "C" {
+        pub(super) fn cudaMemcpyAsync(
+            dst: *mut c_void,
+            src: *const c_void,
+            n: usize,
+            kind: c_int,
+            s: *mut c_void,
+        ) -> c_int;
+    }
+
+    /// `cudaMemcpyDefault`: the direction from the pointers (unified addressing).
+    pub(super) const DEFAULT: c_int = 4;
 }
 
 impl Context {

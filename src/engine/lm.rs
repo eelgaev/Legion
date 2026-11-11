@@ -7300,6 +7300,22 @@ impl Worker {
             _ => None,
         };
         self.exec.set_hidden_on_device(on_device);
+        // A step of one prompt's chunk alone that the MTP head takes in right after (not left
+        // for the next step, [`DeferredTakeIn`]): its rows stay on the device for the head's
+        // pieces, and only the last few are read back (#1183).
+        if let (Drafting::Mtp(_), &[(i, len)]) = (&self.drafting, &plan.chunks[..])
+            && decoding.is_empty()
+            && len > spec::TAKE_IN_TAIL + 1
+        {
+            let s = &prefilling[i];
+            let rest = s.prompt.len() - (s.n_past + len);
+            let device = self.exec.mtp_rows_device();
+            if (rest == 0 || rest > KV_BLOCK) && device.is_some() {
+                self.exec.set_hidden_on_device(device);
+                self.exec
+                    .set_hidden_on_device_from(spec::take_in_host_from(len));
+            }
+        }
         self.clock.lap(host_time::Phase::Pack, &mut at);
         let t_step = Instant::now();
         let out = self.exec.step(&groups).map_err(|e| e.to_string());
@@ -7996,7 +8012,12 @@ impl Worker {
                 let (Some((off, len)), false) = (chunk_of[i], ended.contains(&i)) else {
                     continue;
                 };
-                if defer && !joined.contains(&i) && seq.prompt.len() - seq.n_past <= KV_BLOCK {
+                // Not with its rows left on the device: those are gone by the next step.
+                if defer
+                    && hidden_dev.is_empty()
+                    && !joined.contains(&i)
+                    && seq.prompt.len() - seq.n_past <= KV_BLOCK
+                {
                     seq.draft = Draft::default();
                     seq.draft_cap = 0;
                     seq.take_in = Some(DeferredTakeIn {
@@ -8064,7 +8085,12 @@ impl Worker {
                         let passes = if self.exec.has_remote() {
                             d.step_remote(&mut self.exec, &mut batch, &blocks, &rings, &offs)?
                         } else {
-                            d.step(&mut self.exec, &mut batch, &blocks, &rings)?
+                            let rows = DeviceHidden {
+                                layers: &hidden_dev,
+                                first: &offs,
+                            };
+                            let dev = (!hidden_dev.is_empty()).then_some(&rows);
+                            d.step_rows(&mut self.exec, &mut batch, &blocks, &rings, dev)?
                         };
                         let ms = t.elapsed().as_secs_f64() * 1e3;
                         tracing::debug!(ms, passes, "mtp drafts");
