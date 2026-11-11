@@ -198,7 +198,7 @@ impl Model {
         let (x, inject) = self.hc_mix(ctx, res, &format!("blk.{il}.hc_ffn"), true, true)?;
         let ffn = self.tp_sum(
             ctx,
-            self.moe(ctx, &pass.tap, &pass.graph, il, x, n, pass.verify())?,
+            self.moe(ctx, &pass.tap, &pass.graph, il, x, n, pass.prompt_only())?,
         );
         let res = self.hc_combine(ctx, res, ffn, inject.expect("inject"), gpu);
 

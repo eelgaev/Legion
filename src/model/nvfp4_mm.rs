@@ -114,7 +114,7 @@ pub fn set_pad_skip(on: bool) {
 static EXPERT_ROWS_BF16: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Prompt steps of more tokens than this take [`set_expert_rows_bf16`]'s BF16 rows (decode and
-/// verify steps stay F32).
+/// verify steps, and steps that batch a prompt with them, stay F32).
 pub const EXPERT_ROWS_BF16_MIN_N: i64 = 64;
 
 /// `legion serve --nvfp4-expert-rows-bf16` (#1183; off by default): the routed experts' down

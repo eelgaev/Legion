@@ -1451,9 +1451,11 @@ pub struct Pass<'a> {
 }
 
 impl<'a> Pass<'a> {
-    /// Whether any group of this pass is a speculative verify step ([`GroupShape::verify`]).
-    pub(crate) fn verify(&self) -> bool {
-        self.shape.iter().any(|g| g.verify)
+    /// Whether every group of this pass is a prompt step: more than one token per sequence and
+    /// no speculative verify ([`GroupShape::verify`]). Decode and verify groups, also in a
+    /// mixed pass, make it false.
+    pub(crate) fn prompt_only(&self) -> bool {
+        self.shape.iter().all(|g| !g.verify && g.n_tok > 1)
     }
 
     /// The cells this step's tokens take in layer `il`'s cache: their ring cells if it is a
@@ -4022,9 +4024,9 @@ impl Model {
         il: usize,
         h: Tensor<'a>,
         n: i64,
-        verify: bool,
+        prompt: bool,
     ) -> Result<Tensor<'a>, ModelError> {
-        self.moe_rows(ctx, tap, graph, il, h, n, None, verify)
+        self.moe_rows(ctx, tap, graph, il, h, n, None, prompt)
     }
 
     /// [`Self::moe`] with a verify step's row map (I32 `[n]`, [`pad_rows::map`]): Legion's
@@ -4033,8 +4035,9 @@ impl Model {
     /// Legion's expert matvec over an expert cache with `--moe-pad-remap-tiered` (opt-in, not
     /// byte-identical end to end). With `--moe-pad-skip-tiered` (opt-in) that matvec skips the
     /// padding rows' pairs of experts no real row chose instead (`pad_rows::skip_tiered`).
-    /// `verify` ([`Pass::verify`]): the pass has a verify group, whose expert rows stay F32
-    /// (`--nvfp4-expert-rows-bf16` is for prompt steps only, #1183).
+    /// `prompt` ([`Pass::prompt_only`]): every group of the pass is a prompt step, the only
+    /// passes `--nvfp4-expert-rows-bf16` gives BF16 expert rows (decode and verify rows stay
+    /// F32, #1183).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn moe_rows<'a>(
         &'a self,
@@ -4045,7 +4048,7 @@ impl Model {
         h: Tensor<'a>,
         n: i64,
         rows: Option<Tensor<'a>>,
-        verify: bool,
+        prompt: bool,
     ) -> Result<Tensor<'a>, ModelError> {
         let hp = &self.hp;
         let used = hp.n_expert_used;
@@ -4468,7 +4471,7 @@ impl Model {
                     let l = &self.linear;
                     l.swiglu_ffn_id_skips(ctx, g, u, d, x, selected, rows)
                 } else {
-                    let bf16 = !verify && crate::model::nvfp4_mm::expert_rows_bf16(n);
+                    let bf16 = prompt && crate::model::nvfp4_mm::expert_rows_bf16(n);
                     self.linear
                         .swiglu_ffn_id(ctx, g, u, d, x, selected, rows, bf16)
                 }

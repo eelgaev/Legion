@@ -191,7 +191,7 @@ impl Arch for Qwen35 {
             let h = m.norm_mul(pass, x_attn, m.lw(il, "post_attention_norm.weight")?);
             pass.tap.tap("attn_post_norm", il, h);
             let ffn = if hp.moe {
-                m.moe(ctx, &pass.tap, &pass.graph, il, h, n, pass.verify())?
+                m.moe(ctx, &pass.tap, &pass.graph, il, h, n, pass.prompt_only())?
             } else {
                 m.ffn(ctx, il, h)?
             };

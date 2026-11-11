@@ -433,8 +433,8 @@ pub(in crate::cli) struct SwitchArgs {
     /// the weighted sum reads it back (on qwen4exp the hyper-connection norm the MoE tail folds
     /// into reads the BF16 rows itself). Half the bytes of those rows written and read: on a
     /// DGX Spark (GB10), Qwen3.8-Flash-Next NVFP4 prefill is a few percent faster. Each row is
-    /// rounded to BF16 before the sum, so output moves (opt-in); decode and verify steps keep
-    /// F32 rows.
+    /// rounded to BF16 before the sum, so output moves (opt-in); decode and verify steps, and
+    /// steps that batch a prompt with them, keep F32 rows.
     #[arg(long, help_heading = HEADING)]
     nvfp4_expert_rows_bf16: bool,
     /// qwen4exp speculative verify steps with NVFP4 routed experts on Legion's kernels: read
