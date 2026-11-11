@@ -193,10 +193,16 @@ pub(super) fn take_in_host_from(ran: usize) -> usize {
     ran.saturating_sub(TAKE_IN_TAIL + 1)
 }
 
+/// The tokens of `fed` (a sequence's tokens up to its bonus token) an n-gram row after it
+/// reads: its last 8.
+pub(super) fn ngram_tail(fed: &[u32]) -> &[u32] {
+    &fed[fed.len().saturating_sub(8)..]
+}
+
 /// [`MtpDrafter::prefetch_rows`] for a sequence fed `fed` (up to its bonus token) and drafted
 /// `drafts` so far.
-fn prefetch_after(exec: &Executor, fed: &[u32], drafts: &[(u32, f32)]) {
-    let all: Vec<u32> = fed[fed.len().saturating_sub(8)..]
+pub(super) fn prefetch_after(exec: &Executor, fed: &[u32], drafts: &[(u32, f32)]) {
+    let all: Vec<u32> = ngram_tail(fed)
         .iter()
         .copied()
         .chain(drafts.iter().map(|d| d.0))
@@ -418,19 +424,28 @@ impl MtpDrafter {
         }
         let mut fed: Vec<&[u32]> = Vec::with_capacity(batch.len());
         let mut h = Vec::new();
+        // A round sent to other machines takes the step's rows as they lie (`rests`, after
+        // each sequence's row of `h`): with `--tp-mtp-local-rows` those ranks read their own
+        // copies of them instead of receiving them.
+        let mut rests: Vec<&[f32]> = Vec::new();
         for &i in &order {
             let r = &batch[i];
             let start = r.start + skip[i];
             let rows = rows_of(i);
             let tokens = r.tokens;
             fed.push(&tokens[start..start + rows]);
-            let hidden = &r.hidden[0][skip[i] * w..];
+            let hidden: &[f32] = r.hidden[0];
+            let hidden = &hidden[skip[i] * w..];
             match self.pending.get(&r.seq) {
                 Some(p) => h.extend_from_slice(p),
                 // A new sequence (or one resumed from the prefix cache): nothing before.
                 None => h.resize(h.len() + w, 0.0),
             }
-            h.extend_from_slice(&hidden[..(rows - 1) * w]);
+            if tp_chain {
+                rests.push(&hidden[..(rows - 1) * w]);
+            } else {
+                h.extend_from_slice(&hidden[..(rows - 1) * w]);
+            }
         }
         let groups: Vec<Group<'_>> = order
             .iter()
@@ -457,7 +472,14 @@ impl MtpDrafter {
             .collect();
         // The same passes as below, each staging the next one where it can (#827).
         if chained {
-            return self.chain(exec, batch, &groups, &order, &h);
+            let parts: Vec<&[f32]> = if tp_chain {
+                (h.chunks_exact(w).zip(&rests))
+                    .flat_map(|(first, &rest)| [first, rest])
+                    .collect()
+            } else {
+                vec![&h]
+            };
+            return self.chain(exec, batch, &groups, &order, &parts);
         }
         let out = exec.mtp_step(&groups, &h).map_err(|e| e.to_string())?;
         let mut passes = 1;
@@ -594,17 +616,17 @@ impl MtpDrafter {
         Ok(passes)
     }
 
-    /// [`Self::step`]'s first pass (over `groups`, residual rows `h`) and further drafts as one
-    /// draft round on every rank of tensor parallelism over machines (`--tp-mtp-chain`,
-    /// [`Executor::mtp_chain`]): the same passes, sent as one request. `order`: the batch
-    /// index of each of `groups`' sequences.
+    /// [`Self::step`]'s first pass (over `groups`, residual rows `parts`, one after another)
+    /// and further drafts as one draft round on every rank of tensor parallelism over machines
+    /// (`--tp-mtp-chain`, [`Executor::mtp_chain`]): the same passes, sent as one request.
+    /// `order`: the batch index of each of `groups`' sequences.
     fn chain(
         &mut self,
         exec: &mut Executor,
         batch: &mut [DraftRequest<'_>],
         groups: &[Group<'_>],
         order: &[usize],
-        h: &[f32],
+        parts: &[&[f32]],
     ) -> Result<usize, String> {
         let w = exec.mtp_width();
         // The drafting requests, in batch order: the rows of the round, whose further passes
@@ -623,13 +645,20 @@ impl MtpDrafter {
         let fed: Vec<&[u32]> = (drafting.iter())
             .map(|&i| &batch[i].tokens[..batch[i].start + batch[i].ran + 1])
             .collect();
+        // The other ranks read the n-gram rows of the round's tokens as this one does (#1176).
+        let tails: Vec<&[u32]> = if exec.mtp_chains() {
+            fed.iter().map(|f| ngram_tail(f)).collect()
+        } else {
+            Vec::new()
+        };
         let out = exec
             .mtp_chain(
                 groups,
-                &[h],
+                parts,
                 &caps,
                 &first,
                 self.p_min,
+                &tails,
                 |exec, k, drafts| prefetch_after(exec, fed[k], drafts),
             )
             .map_err(|e| e.to_string())?;

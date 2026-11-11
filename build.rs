@@ -331,6 +331,7 @@ fn build_cuda_kernels(ggml: &Path) {
         .file("src/cuda/head_mm.cu")
         .file("src/cuda/q8_mmq.cu")
         .file("src/cuda/dflash_draft.cu")
+        .file("src/cuda/tu_mmq.cu")
         .file("src/cuda/sm90/cluster_select.cu")
         .file("src/cuda/glm5next.cu")
         .file("src/cuda/deepseek41.cu")

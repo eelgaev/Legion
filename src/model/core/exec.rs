@@ -1666,6 +1666,12 @@ impl Executor {
         }
     }
 
+    /// Whether steps return captured rows ([`Self::capture_hidden`]): then every layer runs
+    /// on all of a step's rows, whatever its logits rows.
+    pub fn captures_hidden(&self) -> bool {
+        !self.hidden.is_empty()
+    }
+
     /// Hands a step's captured rows ([`StepOutput::hidden`]) back once read: the next step
     /// copies its rows into one of them instead of a new vector (#363).
     pub fn recycle_rows(&mut self, rows: Vec<Vec<f32>>) {
