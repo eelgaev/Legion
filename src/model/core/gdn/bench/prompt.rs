@@ -150,10 +150,19 @@ fn outputs(
     Ok((r, outs))
 }
 
-/// Largest difference relative to `a`'s largest magnitude.
+/// Largest difference relative to `a`'s largest magnitude; NaN where any difference is not
+/// finite (`f32::max` would drop a NaN).
 fn rel(a: &[f32], b: &[f32]) -> f32 {
     let top = a.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-30);
-    a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs())) / top
+    let mut worst = 0f32;
+    for (x, y) in a.iter().zip(b) {
+        let d = (x - y).abs();
+        if !d.is_finite() {
+            return f32::NAN;
+        }
+        worst = worst.max(d);
+    }
+    worst / top
 }
 
 fn differ(a: &[f32], b: &[f32]) -> usize {
