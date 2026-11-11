@@ -1654,7 +1654,7 @@ __global__ void __launch_bounds__(HC_THREADS, 4) hc_post_norm_b16_kernel(legion_
             asm volatile("prefetch.global.L2 [%0];" ::"l"(a));
         }
     }
-    float2 ov[PS];
+    float2 ov[PS] = {};
     if constexpr (FOLD) {
         moe_fold_pairs<FMA, W, X16>(f, t, ov);
     } else {
