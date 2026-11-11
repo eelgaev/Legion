@@ -14,8 +14,9 @@ group with no `#else` that holds code while the rest of the body does no work an
 group has an `#else` with work, or one whose `#else` does no work, is an offender: printed as
 `file:line: kernel name` (the `#if` line), and the script exits with status 1. Statements that
 do no work on their own count as no code: declarations and `static_assert`s (setup), `return;`
-and `if (...) return;`, `__syncthreads();`, `(void) x;` and calls of the `pdl_*` helpers (they
-wait or trigger only). `__device__` helpers are not checked: they may keep an older fallback or
+and `if (...) return;`, `__syncthreads();`, `(void) x;`, calls of the `pdl_*` helpers (they
+wait or trigger only) and block delimiters or control headers on their own. Work under a nested
+arch `#if` counts only when all its branches, an `#else` included, do work. `__device__` helpers are not checked: they may keep an older fallback or
 be no-ops elsewhere, and the kernels calling them carry the guard. No compiler and no GPU needed
 (a CI step).
 
@@ -48,9 +49,15 @@ DECL_RE = re.compile(
 )
 
 
+# Block delimiters and control headers (`{`, `}`, `} else {`, `if (x) {`): the statements inside
+# the block decide whether it does work.
+BLOCK_RE = re.compile(r"^(\}\s*)*([^;{}]*\{\s*)?(\}\s*)*$")
+
+
 def does_work(line):
-    """Whether a code line (stripped) is more than setup or a statement that does no work."""
-    return not (NO_WORK_RE.match(line) or DECL_RE.match(line))
+    """Whether a code line (stripped) is more than setup, a block delimiter or a statement that
+    does no work."""
+    return not (NO_WORK_RE.match(line) or DECL_RE.match(line) or BLOCK_RE.match(line))
 
 
 def strip_comments(text):
@@ -85,8 +92,8 @@ def strip_comments(text):
 
 def arch_macros(files):
     """Macros `#define`d only under an architecture condition (LEGION_FP4_MMA and the like),
-    including a condition on another such macro: a condition on them is a condition on the
-    architecture. Collected until no pass adds one (a macro may be defined before or in
+    including a condition on another such macro, or with a value that names the architecture or
+    such a macro: a condition on them is a condition on the architecture. Collected until no pass adds one (a macro may be defined before or in
     another file than the one it depends on)."""
     names = set()
     while True:
@@ -104,10 +111,13 @@ def arch_macros(files):
                     stack[-1] = stack[-1] or is_arch(rest, names)
                 elif kind == "endif" and stack:
                     stack.pop()
-                elif kind == "define" and any(stack):
+                elif kind == "define":
+                    # Under an arch condition, or with a value that names the architecture
+                    # (`#define USE_SM80 (__CUDA_ARCH__ >= 800)`).
                     name = rest.split()[0] if rest.split() else ""
+                    value = rest.strip()[len(name):]
                     name = name.split("(")[0]
-                    if name:
+                    if name and (any(stack) or is_arch(value, names)):
                         names.add(name)
         if len(names) == before:
             return names
@@ -180,12 +190,17 @@ def offenders(text, macros):
             body[0] = body[0].split("{", 1)[1] if "{" in body[0] else ""
             if first != last:
                 body[-1] = body[-1].rsplit("}", 1)[0] if "}" in body[-1] else body[-1]
-        # The body's top-level groups, and its statements outside them that do some work.
+        # The body's top-level groups, and its statements outside them that do some work. `stack`
+        # holds one level per open `#if`: whether its condition names the architecture, whether
+        # it reached `#else`, and per branch whether that branch does work. A nested level's
+        # work reaches the branch around it when it runs on every target: a plain `#if` with
+        # work, or an arch `#if` whose branches, `#else` included, all do work (a write under
+        # `#if __CUDA_ARCH__ >= 800` inside an sm_90 group's `#else` leaves sm_70 empty).
         groups, stack = [], []
         outside = 0
-        # A statement over several lines counts once it ends (or a directive cuts it), where its
-        # first line is: outside the groups, in a group, or in a group's `#else`.
-        pending, where = [], None
+        # Statements are judged once they end (or a directive cuts them); directives flush the
+        # pending one, so the stack is the same for all its lines.
+        pending = []
 
         def flush():
             nonlocal outside, pending
@@ -193,13 +208,11 @@ def offenders(text, macros):
                 return
             work = does_work(" ".join(pending))
             pending = []
-            g, in_else = where
-            if g is None:
+            if not stack:
                 outside += work
             else:
-                g["code"] += 1
-                if in_else:
-                    g["else_code"] = g["else_code"] or work
+                groups[-1]["code"] += 1
+                stack[-1]["branches"][-1] = stack[-1]["branches"][-1] or work
 
         for k, line in enumerate(body):
             m = DIRECTIVE_RE.match(line)
@@ -210,24 +223,38 @@ def offenders(text, macros):
                     if not stack:
                         groups.append({
                             "line": first + k,
-                            "arch": is_arch(rest, macros),
+                            "arch": False,
                             "else": False,
                             "else_code": False,
                             "code": 0,
                         })
-                    stack.append(kind)
-                elif kind == "elif" and len(stack) == 1:
-                    groups[-1]["arch"] = groups[-1]["arch"] or is_arch(rest, macros)
-                elif kind == "else" and len(stack) == 1:
-                    groups[-1]["else"] = True
+                    stack.append({"arch": is_arch(rest, macros), "else": False, "branches": [False]})
+                    if len(stack) == 1:
+                        groups[-1]["arch"] = stack[0]["arch"]
+                elif kind == "elif" and stack:
+                    stack[-1]["arch"] = stack[-1]["arch"] or is_arch(rest, macros)
+                    stack[-1]["branches"].append(False)
+                    if len(stack) == 1:
+                        groups[-1]["arch"] = stack[0]["arch"]
+                elif kind == "else" and stack:
+                    stack[-1]["else"] = True
+                    stack[-1]["branches"].append(False)
+                    if len(stack) == 1:
+                        groups[-1]["else"] = True
                 elif kind == "endif" and stack:
-                    stack.pop()
+                    lvl = stack.pop()
+                    if not stack:
+                        groups[-1]["else_code"] = lvl["else"] and lvl["branches"][-1]
+                    else:
+                        if lvl["arch"]:
+                            work = lvl["else"] and all(lvl["branches"])
+                        else:
+                            work = any(lvl["branches"])
+                        stack[-1]["branches"][-1] = stack[-1]["branches"][-1] or work
                 continue
             code = line.strip()
             if not code or code.startswith("#"):
                 continue
-            if not pending:
-                where = (groups[-1], groups[-1]["else"]) if stack else (None, False)
             pending.append(code)
             if code.endswith((";", "{", "}")):
                 flush()
