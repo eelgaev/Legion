@@ -865,6 +865,26 @@ unsafe fn cuda_paged_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
         e => Err(format!("CUDA launch failed ({e})")),
     };
     let Some((hbm, cap, k_stage, v_stage)) = o.tier.filter(|_| staged(&o)) else {
+        // `--hopper-attn` (#1215): prefill on Hopper's wgmma kernel where it covers the op.
+        let shape = hopper::Shape {
+            d: o.d,
+            n_head: o.n_head,
+            n_head_kv: o.n_head_kv,
+            n_tok: o.n_tok,
+            f16: k_type == 0 && v_type == 0,
+            compact: o.compact,
+            tiered: o.tier.is_some(),
+            max_split: p.max_split.max(1) as usize,
+            k_cell: o.k_cell,
+            v_cell: o.v_cell,
+            // SAFETY: the op's K and V pools.
+            k_cells: unsafe { (*dst.src[1]).ne[1] } as usize,
+            v_cells: unsafe { (*dst.src[2]).ne[1] } as usize,
+        };
+        // SAFETY: the op's parameters and pools, on the stream's device.
+        if unsafe { hopper::run(&p, &shape, stream) }? {
+            return Ok(());
+        }
         return check(unsafe { legion_paged_attn_launch(&p, stream) });
     };
     // Pieces (#352): at most `cap` host blocks each, as many as the step can reach.
@@ -969,6 +989,7 @@ pub fn supported(head_dim: i64, n_head: i64, n_head_kv: i64) -> bool {
 
 #[cfg(test)]
 mod granule_tests;
+pub mod hopper;
 #[cfg(all(test, feature = "cuda"))]
 mod m884_tests;
 #[cfg(test)]

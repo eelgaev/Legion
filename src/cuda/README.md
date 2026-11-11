@@ -34,7 +34,8 @@ end up running the code: the sm70 kernels also run on newer GPUs when the dispat
 | `sm120/nvfp4_a4.cu` | The whole file (its own translation unit, listed in build.rs). |
 | `sm120/nvfp4_mvq.cu` | The matvec kernels (`cvt.rn.f16x2.e2m1x2`, sm_120a/sm_121a; the weights by `cp.async.bulk` into an mbarrier ring; a trap elsewhere, and `nvfp4_mvq::takes` asks `nvfp4_a4::supported_on` first); its activation quantization is plain SIMT code. |
 | `sm90/cluster_select.cu` | The whole file: decode-sized top-k (`qsa_attn.cu`'s `topk_kernel` bits) and argmax (ggml-cuda's `argmax_f32` bits) on clusters of 8 CTAs a row (`src/model/cluster_select.rs`). |
-| `sm90/wgmma_gemm.cu` | The whole file, sm_90a only (`__CUDA_ARCH_FEAT_SM90_ALL`; every other target, plain sm_90 included, compiles a trap): BF16 and E4M3 prompt GEMMs on `wgmma` fed by the TMA, a producer warpgroup and two consumer warpgroups (`src/model/wgmma_gemm.rs`, `--hopper-gemm`, #1215). Untested on hardware. A probe kernel with static shared memory only in its sm_90a body tells the host the binary has them. |
+| `sm90/wgmma_gemm.cu` | The whole file, sm_90a only (`__CUDA_ARCH_FEAT_SM90_ALL`; every other target, plain sm_90 included, compiles a trap): BF16 and E4M3 prompt GEMMs on `wgmma` fed by the TMA, a producer warpgroup and two consumer warpgroups (`src/model/wgmma_gemm.rs`, `--hopper-gemm`, #1215). Untested on hardware. A probe kernel with static shared memory only in its sm_90a body tells the host the binary has them. Built as a library of its own, like `paged_attn_wgmma.cu` (build.rs): the main build is relocatable device code, where ptxas ignores `setmaxnreg`. |
+| `sm90/paged_attn_wgmma.cu` | The whole file, sm_90a only (every other target compiles a trap): paged attention prefill FlashAttention-3 style (#1215, `src/model/core/paged/hopper.rs`, `--hopper-attn`): F16 K and V blocks loaded by the TMA through the block table into a ring of shared-memory stages by a producer warpgroup, two consumer warpgroups of 64 query rows each on `wgmma` (S = Q K^T with both operands in shared memory, O += P V with P in registers), ping-ponged on named barriers so one's softmax overlaps the other's MMAs. Heads of 128 and 256. Untested on hardware. A library of its own (build.rs), compiled whole-program. |
 
 The other files have no architecture-specific code (`fused.cu`, `dflash_draft.cu`, `expert_mv/` (split by weight type into its own translation units, #955),
 `dequant.cu`, `shim.cu`, `gdn_scan.cu`) or one family only (`nvfp4_mm/` (split into the GEMM,
@@ -77,6 +78,9 @@ older fallback. The launchers then pick a path per device, decided once per devi
   together with compute capability 12.x: qwen4_hc's and glm5next's GB10 kernels and
   `launch_pdl`'s programmatic dependent launch; `legion_device::ampere_device()`, together with
   compute capability 8.0-8.7: the GB10 kernels that also measured faster on Ampere, #1212).
+- `legion_device::hopper_pdl_device()` (`binaryVersion` and `ptxVersion` >= 90, compute capability
+  9.0): `launch_pdl` takes Hopper too, only under `--hopper-pdl` (`legion_device::pdl_device()`,
+  #1215, untested on hardware), since the kernels' `griddepcontrol.wait` is compiled for sm_90+ only.
 - Ampere is 8.0 to 8.7 (`legion_device::ampere_cc()`, `crate::hw::per_device::ampere`), never
   `major == 8`: 8.9 (Ada) has picks of its own.
 - Compute capability 12.x (GB10 and RTX 50) is one SM: a pick that depends on instructions,

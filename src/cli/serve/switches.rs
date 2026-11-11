@@ -387,6 +387,27 @@ pub(in crate::cli) struct SwitchArgs {
     /// binary without sm_90a) it does nothing. Off by default.
     #[arg(long, help_heading = HEADING)]
     hopper_gemm: bool,
+    /// CUDA, compute capability 9.0 only (H100, H200, GH200) with a binary built for sm_90a
+    /// (CMAKE_CUDA_ARCHITECTURES=90a): paged attention prefill (prompt chunks and verify steps
+    /// of more than one token per sequence, F16 KV cache, heads of 128 or 256) on a
+    /// FlashAttention-3 style kernel (warpgroup MMA, K and V blocks loaded by the TMA, a producer
+    /// warpgroup and two ping-ponged consumer warpgroups) instead of the mma.sync kernel. Ops it
+    /// does not cover (quantized or compact caches, a host KV tier, other head sizes) keep the
+    /// default kernels. UNTESTED ON HARDWARE: written and compiled without a Hopper GPU, never
+    /// run or measured. The sums round in another order, so greedy text can differ from the
+    /// default's. Elsewhere (other GPUs, a binary without sm_90a) it does nothing. Off by
+    /// default.
+    #[arg(long, help_heading = HEADING)]
+    hopper_attn: bool,
+    /// CUDA, compute capability 9.0 only (H100, H200, GH200) with a binary built for sm_90
+    /// or sm_90a: programmatic dependent launch (each kernel set up while the one ahead of it
+    /// still runs, then waiting for it on the GPU) for Legion's decode kernels that take it on
+    /// compute capability 12.x (the MoE router, the GLM and Qwen4 decode kernels), as on a DGX
+    /// Spark. Each kernel still waits for the one ahead before it reads that one's output, so
+    /// the results keep their bits. UNTESTED ON HARDWARE:
+    /// never run or measured on a Hopper GPU. Elsewhere it does nothing. Off by default.
+    #[arg(long, help_heading = HEADING)]
+    hopper_pdl: bool,
     /// CUDA, compute capability 8.0+, dense NVFP4 weights on Legion's W4A16 kernels
     /// (--nvfp4-mm auto or legion; e.g. the MLPs of unsloth's Qwen3.8-27B-NVFP4): matmuls and
     /// fused SwiGLUs of 33-64 tokens (MTP or DFlash verify steps at 4-8 users, short prompt
@@ -1311,8 +1332,8 @@ pub(in crate::cli) struct SwitchArgs {
     /// instead of one ggml CUDA buffer. The same blocks, read and written the same way (the
     /// same bits); each tensor's rounding to whole granules takes up to 2 MiB more VRAM, so the
     /// expert cache can lose a few slots. Needed by --kv-vmm-keep (#814). On by default, with
-    /// --kv-vmm-keep 32768, on V100s with the expert cache over a layer split of 2 GPUs; off
-    /// elsewhere.
+    /// --kv-vmm-keep 32768, on V100s (and GH200s, unmeasured) with the expert cache over a layer
+    /// split of 2 GPUs; off elsewhere.
     #[arg(long, help_heading = HEADING)]
     kv_vmm: bool,
     /// Turn --kv-vmm (and so --kv-vmm-keep) off where it is on by default: every block of the
@@ -1438,6 +1459,8 @@ impl SwitchArgs {
             fp8_small_batch_gemv: self.fp8_small_batch_gemv.then_some(true),
             fp8_sliced_k: self.fp8_sliced_k.then_some(true),
             hopper_gemm: self.hopper_gemm.then_some(true),
+            hopper_attn: self.hopper_attn.then_some(true),
+            hopper_pdl: self.hopper_pdl.then_some(true),
             nvfp4_wide_mv: self.nvfp4_wide_mv.then_some(true),
             nvfp4_expert_pdl: self.no_nvfp4_expert_pdl.then_some(false),
             nvfp4_expert_tile_prefetch: self.no_nvfp4_expert_tile_prefetch.then_some(false),

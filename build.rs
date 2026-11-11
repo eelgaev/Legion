@@ -261,15 +261,11 @@ fn build_cuda_kernels(ggml: &Path) {
             archs = caps.join(";");
         }
     }
-    let mut b = cc::Build::new();
-    b.cuda(true)
-        .cudart("shared")
-        .include(ggml.join("include"))
-        .include(ggml.join("src"))
-        // The slowest translation units first, so the parallel build starts them first (#955:
-        // expert_mv and paged_attn are split by weight type and head size, nvfp4_mm by kernel
-        // and tile width).
-        .file("src/cuda/paged_attn/d512.cu")
+    let mut b = cuda_build(ggml, &archs);
+    // The slowest translation units first, so the parallel build starts them first (#955:
+    // expert_mv and paged_attn are split by weight type and head size, nvfp4_mm by kernel and
+    // tile width).
+    b.file("src/cuda/paged_attn/d512.cu")
         .file("src/cuda/expert_mv/iq2.cu")
         .file("src/cuda/expert_mv/iq3.cu")
         .file("src/cuda/expert_mv/q4_k.cu")
@@ -332,7 +328,6 @@ fn build_cuda_kernels(ggml: &Path) {
         .file("src/cuda/q8_mmq.cu")
         .file("src/cuda/dflash_draft.cu")
         .file("src/cuda/sm90/cluster_select.cu")
-        .file("src/cuda/sm90/wgmma_gemm.cu")
         .file("src/cuda/glm5next.cu")
         .file("src/cuda/deepseek41.cu")
         .file("src/cuda/glm_exchange.cu")
@@ -342,14 +337,38 @@ fn build_cuda_kernels(ggml: &Path) {
         .file("src/cuda/stage_pull.cu")
         .file("src/cuda/input_pack.cu")
         .file("src/cuda/turboquant.cu")
-        .file("src/cuda/tp_net.cu")
+        .file("src/cuda/tp_net.cu");
+    b.compile("legion_cuda");
+    // The Hopper wgmma kernels (#1215), each a library of its own: cc compiles a build of more
+    // than one CUDA file as relocatable device code (--device-c), and there ptxas ignores
+    // setmaxnreg (C7504), so the consumer warpgroups keep the launch bound's 168 registers (the
+    // GEMMs spill, the attention kernel for heads of 256 spills and serializes its wgmma). A
+    // build of one file is compiled whole-program. Neither file shares device symbols.
+    for (file, lib) in [
+        ("src/cuda/sm90/wgmma_gemm.cu", "legion_cuda_wgmma_gemm"),
+        (
+            "src/cuda/sm90/paged_attn_wgmma.cu",
+            "legion_cuda_hopper_attn",
+        ),
+    ] {
+        cuda_build(ggml, &archs).file(file).compile(lib);
+    }
+}
+
+/// A cc build of CUDA files with Legion's nvcc flags, for `archs` (a CMake-style list).
+fn cuda_build(ggml: &Path, archs: &str) -> cc::Build {
+    let mut b = cc::Build::new();
+    b.cuda(true)
+        .cudart("shared")
+        .include(ggml.join("include"))
+        .include(ggml.join("src"))
         // As ggml-cuda is built: CUDA graphs on (it changes ggml_backend_cuda_context).
         .define("GGML_CUDA_USE_GRAPHS", None)
         .flag("-std=c++17")
         .flag("-O3")
         .flag("--use_fast_math")
         .warnings(false);
-    for f in cuda_arch_flags(&archs) {
+    for f in cuda_arch_flags(archs) {
         b.flag(&f);
     }
     if let Some(host) = env::var_os("CUDAHOSTCXX").filter(|v| !v.is_empty()) {
@@ -357,5 +376,5 @@ fn build_cuda_kernels(ggml: &Path) {
         b.ccbin(false);
         b.flag(format!("-ccbin={}", host.to_string_lossy()));
     }
-    b.compile("legion_cuda");
+    b
 }

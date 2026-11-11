@@ -215,7 +215,7 @@ pub unsafe fn run(
 }
 
 #[cfg(feature = "cuda")]
-mod launch {
+pub(crate) mod launch {
     use std::os::raw::{c_int, c_void};
     use std::sync::atomic::{AtomicI8, Ordering};
 
@@ -223,16 +223,16 @@ mod launch {
 
     /// `dim3`.
     #[repr(C)]
-    struct Dim3 {
-        x: u32,
-        y: u32,
-        z: u32,
+    pub(crate) struct Dim3 {
+        pub(crate) x: u32,
+        pub(crate) y: u32,
+        pub(crate) z: u32,
     }
 
     /// `CUtensorMap`: 128 opaque bytes, 64-byte aligned.
     #[repr(C, align(64))]
     #[derive(Clone, Copy)]
-    struct TensorMap([u64; 16]);
+    pub(crate) struct TensorMap([u64; 16]);
 
     /// `legion_wgmma_maps`: the weights' and the activations' tensor maps.
     #[repr(C, align(64))]
@@ -259,7 +259,7 @@ mod launch {
         static legion_wgmma_gemm_kernels: [*const c_void; 4];
         /// Static shared memory only in its sm_90a body (see the kernel file).
         static legion_wgmma_gemm_probe: *const c_void;
-        fn cudaLaunchKernel(
+        pub(crate) fn cudaLaunchKernel(
             func: *const c_void,
             grid: Dim3,
             block: Dim3,
@@ -270,8 +270,9 @@ mod launch {
         fn cudaGetDevice(device: *mut c_int) -> c_int;
         fn cudaDeviceGetAttribute(value: *mut c_int, attr: c_int, device: c_int) -> c_int;
         fn cudaFuncGetAttributes(attr: *mut FuncAttributes, func: *const c_void) -> c_int;
-        fn cudaFuncSetAttribute(func: *const c_void, attr: c_int, value: c_int) -> c_int;
-        fn cudaGetLastError() -> c_int;
+        pub(crate) fn cudaFuncSetAttribute(func: *const c_void, attr: c_int, value: c_int)
+        -> c_int;
+        pub(crate) fn cudaGetLastError() -> c_int;
         fn cuTensorMapEncodeTiled(
             map: *mut TensorMap,
             dtype: u32,
@@ -290,9 +291,11 @@ mod launch {
 
     const DEV_ATTR_CC_MAJOR: c_int = 75;
     const DEV_ATTR_CC_MINOR: c_int = 76;
-    const FUNC_ATTR_MAX_DYNAMIC_SHARED: c_int = 8;
+    pub(crate) const FUNC_ATTR_MAX_DYNAMIC_SHARED: c_int = 8;
     const SWIZZLE_128B: u32 = 3;
     const L2_PROMOTION_256B: u32 = 3;
+    /// `CU_TENSOR_MAP_DATA_TYPE_FLOAT16`.
+    pub(crate) const TENSOR_MAP_F16: u32 = 6;
 
     /// Devices the caches below cover.
     const DEVICES: usize = 64;
@@ -302,7 +305,7 @@ mod launch {
     /// Per device and kernel: the shared-memory opt-in, 0 not yet, 1 done, -1 refused.
     static SMEM: [[AtomicI8; 4]; DEVICES] = [const { [const { AtomicI8::new(0) }; 4] }; DEVICES];
 
-    fn current() -> Option<usize> {
+    pub(crate) fn current() -> Option<usize> {
         let mut dev: c_int = 0;
         // SAFETY: a plain query.
         let ok = unsafe { cudaGetDevice(&mut dev) } == 0;
@@ -366,19 +369,43 @@ mod launch {
     /// K step x `box_rows` rows, 128-byte swizzle, zeros past the edges; `None` where the driver
     /// refuses it.
     fn map(kind: Kind, base: *const u8, k: i64, rows: i64, box_rows: i64) -> Option<TensorMap> {
-        if (base as usize) % 16 != 0 {
+        map_2d(
+            kind.tensor_map_type(),
+            base,
+            k as u64,
+            rows as u64,
+            (k * kind.elem_bytes()) as u64,
+            kind.bk() as u32,
+            box_rows as u32,
+        )
+    }
+
+    /// The tensor map of `rows` rows of `inner` elements of type `dtype` (`CUtensorMapDataType`)
+    /// at `base`, `row_bytes` apart, in boxes of `box_inner` x `box_rows`, 128-byte swizzle, zeros
+    /// past the edges; `None` where the driver refuses it (the alignment and stride rules of
+    /// `cuTensorMapEncodeTiled`: 16-byte base and row stride).
+    pub(crate) fn map_2d(
+        dtype: u32,
+        base: *const u8,
+        inner: u64,
+        rows: u64,
+        row_bytes: u64,
+        box_inner: u32,
+        box_rows: u32,
+    ) -> Option<TensorMap> {
+        if (base as usize) % 16 != 0 || row_bytes % 16 != 0 {
             return None;
         }
         let mut m = TensorMap([0; 16]);
-        let dims = [k as u64, rows as u64];
-        let strides = [(k * kind.elem_bytes()) as u64];
-        let box_dim = [kind.bk() as u32, box_rows as u32];
+        let dims = [inner, rows];
+        let strides = [row_bytes];
+        let box_dim = [box_inner, box_rows];
         let elem = [1u32, 1];
         // SAFETY: arrays of the rank's lengths; the driver only encodes the address.
         let r = unsafe {
             cuTensorMapEncodeTiled(
                 &mut m,
-                kind.tensor_map_type(),
+                dtype,
                 2,
                 base as *mut c_void,
                 dims.as_ptr(),

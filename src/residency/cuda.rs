@@ -506,9 +506,12 @@ pub fn caps(device: usize) -> Option<Caps> {
     let attr = |a: u32| query(a).unwrap_or(0);
     let vmm = attr(CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED) != 0;
     // The driver's node; where it has none (or no such attribute), the one sysfs gives the
-    // GPU's PCI address, else -1: a failed query is "unknown", never node 0.
+    // GPU's PCI address, else -1: a failed query is "unknown", never node 0. A node without
+    // CPUs (a GH200's HBM is one) gives way to the nearest node with CPUs, whose workers fill
+    // and read the host memory (`crate::hw::numa::cpu_node_near`; nothing changes where the
+    // node has CPUs).
     let host_numa_id = match query(CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID) {
-        Some(id) if id >= 0 => id,
+        Some(id) if id >= 0 => crate::hw::numa::cpu_node_near(id as u32) as i32,
         _ => device_numa_node(device).map_or(-1, |n| n as i32),
     };
     let (host_granularity, host_node) = match (vmm, u32::try_from(host_numa_id)) {
@@ -558,6 +561,7 @@ pub fn device_count() -> usize {
 /// The host NUMA node of CUDA device `device` (ggml's index), from the driver alone: no context
 /// is created, so `--numa` can ask before anything else touches the GPU (#422). The driver's
 /// host NUMA id, else the node sysfs gives the device's PCI address; `None` when neither knows.
+/// A node without CPUs gives way to the nearest one with CPUs (`crate::hw::numa::cpu_node_near`).
 pub fn device_numa_node(device: usize) -> Option<u32> {
     let mut d: CUdevice = 0;
     // SAFETY: cuInit is idempotent; cuDeviceGet writes the handle.
@@ -568,7 +572,7 @@ pub fn device_numa_node(device: usize) -> Option<u32> {
     // SAFETY: writes one int.
     let r = unsafe { cuDeviceGetAttribute(&mut id, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, d) };
     if r == 0 && id >= 0 {
-        return Some(id as u32);
+        return Some(crate::hw::numa::cpu_node_near(id as u32));
     }
     let mut bus = [0 as c_char; 32];
     // SAFETY: writes a NUL-terminated string of at most `bus.len()` bytes.
@@ -578,6 +582,35 @@ pub fn device_numa_node(device: usize) -> Option<u32> {
     // SAFETY: NUL-terminated by the driver (the buffer is zeroed and longer than any id).
     let bus = unsafe { CStr::from_ptr(bus.as_ptr()) }.to_string_lossy();
     crate::hw::numa::pci_numa_node(&crate::hw::gpu::normalize_bdf(&bus))
+        .map(crate::hw::numa::cpu_node_near)
+}
+
+/// CUDA device `device`'s link attributes ([`super::unified::LinkAttrs`]), from the driver
+/// alone (no context, as [`device_numa_node`]); `None` when it cannot be queried.
+pub fn link_attrs(device: usize) -> Option<super::unified::LinkAttrs> {
+    let mut d: CUdevice = 0;
+    // SAFETY: cuInit is idempotent; cuDeviceGet writes the handle.
+    if unsafe { cuInit(0) } != 0 || unsafe { cuDeviceGet(&mut d, device as c_int) } != 0 {
+        return None;
+    }
+    let attr = |a: u32| {
+        let mut v: c_int = 0;
+        // SAFETY: writes one int.
+        (unsafe { cuDeviceGetAttribute(&mut v, a, d) } == 0).then_some(v)
+    };
+    Some(super::unified::LinkAttrs {
+        integrated: attr(CU_DEVICE_ATTRIBUTE_INTEGRATED)? != 0,
+        pageable_access: attr(CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS).unwrap_or(0) != 0,
+        pageable_uses_host_page_tables: attr(
+            CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES,
+        )
+        .unwrap_or(0)
+            != 0,
+        cc: (
+            attr(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?,
+            attr(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?,
+        ),
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
