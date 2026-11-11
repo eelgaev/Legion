@@ -26,7 +26,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// Frames before this version are refused: both ranks must run the same build.
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 
 /// The node settings of a `legion serve` (`--node-rank`, `--node-peer`, `--node-split`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,13 +137,18 @@ pub enum Request {
     /// [`Self::TpMtp`], then the further passes every rank runs on its own from the head's
     /// picks ([`crate::model::core::Executor::mtp_chain`]): per output row of the first pass,
     /// the most drafts it may make (`caps`), and the floor (`p_min`, as bits) under which a
-    /// row stops.
+    /// row stops. The first pass's residual rows come in `parts` as [`Self::TpMtpRows`]'
+    /// (all sent unless `--tp-mtp-local-rows`). `tails`: per output row, the last tokens fed
+    /// up to its bonus token (at most 8), so every rank reads the n-gram rows of the round's
+    /// tokens while it drafts, as rank 0 does (empty: none read).
     TpMtpChain {
         groups: Vec<WireGroup>,
         gather_budget: u64,
+        parts: Vec<RowsPart>,
         h: Vec<f32>,
         caps: Vec<u32>,
         p_min: u32,
+        tails: Vec<Vec<u32>>,
     },
     /// [`Self::TpMtp`] whose residual rows come in `parts`, one after another
     /// (`--tp-mtp-local-rows`, #780): sent ones are the next floats of `h`, the others a range
@@ -280,6 +285,51 @@ fn put_u32s(b: &mut Vec<u8>, v: &[u32]) {
     for &x in v {
         put_u32(b, x);
     }
+}
+
+fn put_parts(head: &mut Vec<u8>, parts: &[RowsPart]) {
+    put_u32(head, parts.len() as u32);
+    for &p in parts {
+        match p {
+            RowsPart::Sent { len } => {
+                head.push(0);
+                head.extend_from_slice(&len.to_le_bytes());
+            }
+            RowsPart::Step {
+                back,
+                layer,
+                start,
+                len,
+                check,
+            } => {
+                head.push(1);
+                put_u32(head, back);
+                put_u32(head, layer);
+                for v in [start, len, check] {
+                    head.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+    }
+}
+
+fn get_parts(r: &mut Cursor<'_>) -> Result<Vec<RowsPart>, String> {
+    let n = r.u32()? as usize;
+    let mut parts = Vec::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        parts.push(match r.u8()? {
+            0 => RowsPart::Sent { len: r.u64()? },
+            1 => RowsPart::Step {
+                back: r.u32()?,
+                layer: r.u32()?,
+                start: r.u64()?,
+                len: r.u64()?,
+                check: r.u64()?,
+            },
+            t => return Err(format!("unknown rows part {t}")),
+        });
+    }
+    Ok(parts)
 }
 
 fn f32_bytes(v: &[f32]) -> &[u8] {
@@ -420,14 +470,21 @@ impl Request {
             Request::TpMtpChain {
                 groups,
                 gather_budget,
+                parts,
                 h,
                 caps,
                 p_min,
+                tails,
             } => {
                 put_groups(&mut head, &groups);
                 head.extend_from_slice(&gather_budget.to_le_bytes());
+                put_parts(&mut head, &parts);
                 put_u32s(&mut head, &caps);
                 put_u32(&mut head, p_min);
+                put_u32(&mut head, tails.len() as u32);
+                for t in &tails {
+                    put_u32s(&mut head, t);
+                }
                 bulk = h;
                 K_TP_MTP_CHAIN
             }
@@ -439,29 +496,7 @@ impl Request {
             } => {
                 put_groups(&mut head, &groups);
                 head.extend_from_slice(&gather_budget.to_le_bytes());
-                put_u32(&mut head, parts.len() as u32);
-                for p in parts {
-                    match p {
-                        RowsPart::Sent { len } => {
-                            head.push(0);
-                            head.extend_from_slice(&len.to_le_bytes());
-                        }
-                        RowsPart::Step {
-                            back,
-                            layer,
-                            start,
-                            len,
-                            check,
-                        } => {
-                            head.push(1);
-                            put_u32(&mut head, back);
-                            put_u32(&mut head, layer);
-                            for v in [start, len, check] {
-                                head.extend_from_slice(&v.to_le_bytes());
-                            }
-                        }
-                    }
-                }
+                put_parts(&mut head, &parts);
                 bulk = h;
                 K_TP_MTP_ROWS
             }
@@ -544,38 +579,33 @@ impl Request {
                 gather_budget: r.u64()?,
                 h: bulk,
             },
-            K_TP_MTP_CHAIN => Request::TpMtpChain {
-                groups: get_groups(&mut r)?,
-                gather_budget: r.u64()?,
-                caps: r.u32s()?,
-                p_min: r.u32()?,
-                h: bulk,
-            },
-            K_TP_MTP_ROWS => {
+            K_TP_MTP_CHAIN => {
                 let groups = get_groups(&mut r)?;
                 let gather_budget = r.u64()?;
+                let parts = get_parts(&mut r)?;
+                let caps = r.u32s()?;
+                let p_min = r.u32()?;
                 let n = r.u32()? as usize;
-                let mut parts = Vec::with_capacity(n.min(1 << 16));
+                let mut tails = Vec::with_capacity(n.min(1 << 16));
                 for _ in 0..n {
-                    parts.push(match r.u8()? {
-                        0 => RowsPart::Sent { len: r.u64()? },
-                        1 => RowsPart::Step {
-                            back: r.u32()?,
-                            layer: r.u32()?,
-                            start: r.u64()?,
-                            len: r.u64()?,
-                            check: r.u64()?,
-                        },
-                        t => return Err(format!("unknown rows part {t}")),
-                    });
+                    tails.push(r.u32s()?);
                 }
-                Request::TpMtpRows {
+                Request::TpMtpChain {
                     groups,
                     gather_budget,
                     parts,
                     h: bulk,
+                    caps,
+                    p_min,
+                    tails,
                 }
             }
+            K_TP_MTP_ROWS => Request::TpMtpRows {
+                groups: get_groups(&mut r)?,
+                gather_budget: r.u64()?,
+                parts: get_parts(&mut r)?,
+                h: bulk,
+            },
             K_TP_COMMIT => {
                 let n = r.u32()? as usize;
                 let mut commits = Vec::with_capacity(n.min(1 << 16));
