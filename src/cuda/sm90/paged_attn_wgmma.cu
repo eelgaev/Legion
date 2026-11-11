@@ -387,8 +387,10 @@ __global__ void __launch_bounds__(THREADS, 1)
 
     // Ping-pong: consumer c issues its GEMMs between bar.sync on barrier 1 + c and bar.arrive on
     // the other's; consumer 0 goes first, and consumer 1 skips its last arrival, so both
-    // barriers see as many arrivals as waits.
-    if (cw == 0) {
+    // barriers see as many arrivals as waits. Consumer 1 seeds barrier 1, so that every phase of
+    // either barrier is one consumer's bar.sync plus the other's bar.arrive (no warpgroup
+    // arrives twice at a barrier before it resets).
+    if (cw == 1) {
         named_arrive(1, 256);
     }
 
