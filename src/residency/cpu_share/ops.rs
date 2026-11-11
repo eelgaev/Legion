@@ -131,7 +131,6 @@ pub struct DeviceShare {
     pub(super) seq: super::Sequence,
     /// Per layer (index = layer id), its experts in host memory, if the device runs it.
     pub(super) layers: Vec<Option<HostExperts>>,
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(super) pool: Arc<Pool>,
     /// The device's job queue in [`Self::pool`].
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
@@ -156,9 +155,15 @@ pub fn register(device: usize, share: Arc<DeviceShare>) {
     d[device] = Some(share);
 }
 
-/// Unregisters every device (the residency that set them up is gone).
+/// Unregisters every device (the residency that set them up is gone). Stops the pools before
+/// any exchange buffer is freed: a pool serves every device of its node and may still hold
+/// their queued jobs, which [`Pool::stop`] releases.
 pub fn clear() {
-    DEVICES.lock().unwrap().clear();
+    let shares = std::mem::take(&mut *DEVICES.lock().unwrap());
+    for share in shares.iter().flatten() {
+        share.pool.stop();
+    }
+    drop(shares);
 }
 
 /// Whether a device registered layer `layer` (graphs are built before the step knows its

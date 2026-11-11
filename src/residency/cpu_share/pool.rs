@@ -127,9 +127,14 @@ pub unsafe fn reference(
 /// How long a pool keeps spinning after its last job before it naps between checks.
 const SPIN_FOR: Duration = Duration::from_millis(50);
 const NAP: Duration = Duration::from_micros(50);
-/// The longest a job waits for its "ready" flag before the pool gives up on it and raises
-/// "done" (so the GPU never waits forever on a step the host missed).
-const READY_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often the pool warns while a job waits for its "ready" flag. It never gives up on a
+/// step: "done" without the rows would let the GPU's `collect` read the previous step's rows
+/// (silently wrong hidden states), so a GPU stalled ahead of a publish (a long prompt chunk on
+/// the device, a debugger) only costs warnings. Short in tests, which wait past it.
+#[cfg(not(test))]
+const READY_WARN_EVERY: Duration = Duration::from_secs(10);
+#[cfg(test)]
+pub(super) const READY_WARN_EVERY: Duration = Duration::from_millis(20);
 /// The fewest rows a task takes, and the tasks per thread aimed for.
 const MIN_ROWS: usize = 16;
 const TASKS_PER_THREAD: usize = 3;
@@ -204,15 +209,28 @@ struct Shared {
     next: AtomicUsize,
     finished: AtomicUsize,
     current: Cell,
+    /// Set by [`Pool::stop`]: the coordinator returns between jobs.
     stop: AtomicBool,
+    /// Set when the coordinator returned: the helpers return (never in the middle of a job,
+    /// whose phases need every thread).
+    quit: AtomicBool,
     threads: usize,
+}
+
+/// Raises its flag when dropped (the coordinator's `quit`, also when it panics).
+struct RaiseOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for RaiseOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 /// A NUMA node's pool: `threads` threads pinned one per CPU of `cpus` (cycled), the first
 /// coordinating. Jobs of each device run in order; of several devices, whichever is ready.
 pub struct Pool {
     shared: Arc<Shared>,
-    handles: Vec<std::thread::JoinHandle<()>>,
+    handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 impl Pool {
@@ -226,6 +244,7 @@ impl Pool {
             finished: AtomicUsize::new(0),
             current: Cell(UnsafeCell::new(Current::default())),
             stop: AtomicBool::new(false),
+            quit: AtomicBool::new(false),
             threads,
         });
         let handles = (0..threads)
@@ -240,6 +259,7 @@ impl Pool {
                             let _ = crate::hw::numa::pin_current_thread(&[c]);
                         }
                         if i == 0 {
+                            let _quit = RaiseOnDrop(&s.quit);
                             coordinate(&s);
                         } else {
                             help(&s, i);
@@ -248,7 +268,38 @@ impl Pool {
                     .expect("spawning a cpu-share thread")
             })
             .collect();
-        Self { shared, handles }
+        Self {
+            shared,
+            handles: Mutex::new(handles),
+        }
+    }
+
+    /// Stops the threads (a job they run finishes first), then raises "done" for every job
+    /// still queued, rows not computed: the one case the pool lets a step through without its
+    /// rows, so that a GPU stream still waiting at a `collect` drains instead of hanging the
+    /// teardown (the share is going away; nothing reads those steps' outputs). Idempotent;
+    /// the queued jobs' exchange buffers must still be live, so the share stops its pools
+    /// before it frees them (`ops::clear`).
+    pub fn stop(&self) {
+        self.shared.stop.store(true, Ordering::Release);
+        for h in self.handles.lock().unwrap().drain(..) {
+            let _ = h.join();
+        }
+        let mut released = 0usize;
+        for queue in self.shared.queues.lock().unwrap().iter_mut() {
+            for (job, _) in queue.drain(..) {
+                // SAFETY: the exchange buffer is live (the caller's order, see above).
+                unsafe { &*job.exchange.done }.store(job.seq, Ordering::Release);
+                released += 1;
+            }
+        }
+        self.shared.pending.store(0, Ordering::Release);
+        if released > 0 {
+            tracing::warn!(
+                jobs = released,
+                "cpu share: stopped with queued steps; released them without their rows"
+            );
+        }
     }
 
     /// A new job queue (one per device).
@@ -267,10 +318,7 @@ impl Pool {
 
 impl Drop for Pool {
     fn drop(&mut self) {
-        self.shared.stop.store(true, Ordering::Release);
-        for h in self.handles.drain(..) {
-            let _ = h.join();
-        }
+        self.stop();
     }
 }
 
@@ -280,8 +328,8 @@ fn reached(flag: &AtomicU32, seq: u32) -> bool {
 }
 
 /// Spins (at low priority) while recently busy, naps otherwise, until `ready` says go; false
-/// when the pool stops.
-fn wait_for(s: &Shared, mut ready: impl FnMut() -> bool) -> bool {
+/// when `stop` is raised first.
+fn wait_for(stop: &AtomicBool, mut ready: impl FnMut() -> bool) -> bool {
     let mut busy = Instant::now();
     let mut spins = 0u32;
     loop {
@@ -291,7 +339,7 @@ fn wait_for(s: &Shared, mut ready: impl FnMut() -> bool) -> bool {
         }
         spins = spins.wrapping_add(1);
         if spins.is_multiple_of(1024) {
-            if s.stop.load(Ordering::Acquire) {
+            if stop.load(Ordering::Acquire) {
                 spin_done();
                 return false;
             }
@@ -308,13 +356,17 @@ fn wait_for(s: &Shared, mut ready: impl FnMut() -> bool) -> bool {
 }
 
 /// The coordinator: takes the first queue's head job that is ready, runs it, raises "done".
+/// A job runs only once its step is published, however long that takes (with a warning every
+/// [`READY_WARN_EVERY`]); "done" always follows its rows.
 fn coordinate(s: &Shared) {
+    // The last "still waiting" warning (one per interval, of all queues).
+    let mut warned = Instant::now();
     loop {
-        if !wait_for(s, || s.pending.load(Ordering::Acquire) > 0) {
+        if !wait_for(&s.stop, || s.pending.load(Ordering::Acquire) > 0) {
             return;
         }
         let mut picked = None;
-        if !wait_for(s, || {
+        if !wait_for(&s.stop, || {
             let mut q = s.queues.lock().unwrap();
             for queue in q.iter_mut() {
                 let Some(&(job, at)) = queue.front() else {
@@ -322,10 +374,20 @@ fn coordinate(s: &Shared) {
                 };
                 // SAFETY: the flags live in the exchange buffer while jobs use it.
                 let ready = unsafe { &*job.exchange.ready };
-                if reached(ready, job.seq) || at.elapsed() > READY_TIMEOUT {
+                if reached(ready, job.seq) {
                     queue.pop_front();
                     picked = Some(job);
                     return true;
+                }
+                let waited = at.elapsed();
+                if waited >= READY_WARN_EVERY && warned.elapsed() >= READY_WARN_EVERY {
+                    warned = Instant::now();
+                    tracing::warn!(
+                        seq = job.seq,
+                        layer = job.layer,
+                        waited_s = waited.as_secs(),
+                        "cpu share: still waiting for the GPU to publish a step"
+                    );
                 }
             }
             false
@@ -336,17 +398,20 @@ fn coordinate(s: &Shared) {
         s.pending.fetch_sub(1, Ordering::AcqRel);
         // SAFETY: as above.
         let (ready, done) = unsafe { (&*job.exchange.ready, &*job.exchange.done) };
-        let start = Instant::now();
-        let mut pairs = 0;
-        if reached(ready, job.seq) {
-            pairs = run_job(s, &job);
-        } else {
+        // The GPU publishes the next step of a device only after this one's `collect`, which
+        // waits for this job: "ready" past the job's step means the host missed a step.
+        let published = ready.load(Ordering::Acquire);
+        if published != job.seq {
             tracing::error!(
                 seq = job.seq,
                 layer = job.layer,
-                "cpu share: the GPU never published a step"
+                published,
+                "cpu share: the GPU published a later step than the host's next job"
             );
+            debug_assert_eq!(published, job.seq, "cpu share: a step was skipped");
         }
+        let start = Instant::now();
+        let pairs = run_job(s, &job);
         let compute = start.elapsed();
         // SAFETY: as above (null when the buffer has no such flag: tests).
         let waited = unsafe { job.exchange.arrived.as_ref() }.is_some_and(|a| reached(a, job.seq));
@@ -462,7 +527,7 @@ fn run_phase(s: &Shared, phase: u64) {
 fn help(s: &Shared, i: usize) {
     let mut seen = 0u64;
     loop {
-        if !wait_for(s, || s.phase_gen.load(Ordering::Acquire) != seen) {
+        if !wait_for(&s.quit, || s.phase_gen.load(Ordering::Acquire) != seen) {
             return;
         }
         seen = s.phase_gen.load(Ordering::Acquire);
