@@ -27,10 +27,12 @@ pub struct GdnBenchArgs {
     /// pair run twice, and the packed rows the fused step stores, "d.store") and time per layer.
     #[arg(long, conflicts_with = "commit")]
     replay: bool,
-    /// Prompt groups (#1183): ggml's op against the chunked kernels of `--gdn-mma` and the
-    /// default staged one (whole heads, value slices) at one GPU's head counts, for bits (rows
-    /// and final states, for each of --tokens and a two-sequence group) and time per layer (the
-    /// first of --tokens, at most 8 layers).
+    /// Prompt groups (#1183): ggml's op against the chunked kernels of `--gdn-mma` (whole heads,
+    /// value slices) and the staged ones (round 8's, and the split layouts: two CTAs a head, 16
+    /// warps a head with one or two input buffers, the default "wide x2", and 8 warps) at one
+    /// GPU's head counts, for bits (rows and final states, for each of --tokens and a
+    /// two-sequence group; the largest relative difference where bits differ) and time per
+    /// layer (the first of --tokens, at most 8 layers).
     #[arg(long, conflicts_with_all = ["commit", "replay"])]
     prompt: bool,
     /// Tokens of the prompt groups (--prompt).
@@ -67,9 +69,14 @@ pub fn run(args: GdnBenchArgs) -> anyhow::Result<()> {
             print!("{:>6} {:>4} {:>12.1}", r.tokens, r.seqs, r.secs[0] * 1e6);
             for (i, d) in r.differ.iter().enumerate() {
                 let s = r.secs[i + 1];
+                let rel = if *d > 0 {
+                    format!(" ({:.1e})", r.rel[i])
+                } else {
+                    String::new()
+                };
                 print!(
                     " {:>24}",
-                    format!("{:.1} {:.3} {d}", s * 1e6, s / r.secs[0].max(1e-12))
+                    format!("{:.1} {:.3} {d}{rel}", s * 1e6, s / r.secs[0].max(1e-12))
                 );
             }
             println!();

@@ -13,15 +13,28 @@ use crate::ggml::{Backend, ComputeAllocator, Context, GgmlError, Graph, Tensor, 
 const S: i64 = 128;
 
 /// The kernels compared after ggml's op, by [`gdn_mma`]'s schedule they force.
-const KERNELS: [Schedule; 4] = [
+const KERNELS: [Schedule; 8] = [
     Schedule::Heads,
     Schedule::Staged,
+    Schedule::Pair,
+    Schedule::Wide,
+    Schedule::Lean,
+    Schedule::WideTwo,
     Schedule::SlicesTwo,
     Schedule::Slices,
 ];
 
 /// Their names, in [`PromptRow::secs`] order after ggml's.
-pub const PROMPT_KERNELS: [&str; 4] = ["heads", "staged", "slices x2", "slices"];
+pub const PROMPT_KERNELS: [&str; 8] = [
+    "heads",
+    "staged",
+    "pair",
+    "wide",
+    "lean",
+    "wide x2",
+    "slices x2",
+    "slices",
+];
 
 /// One prompt size.
 #[derive(Clone, Debug)]
@@ -32,6 +45,9 @@ pub struct PromptRow {
     pub secs: Vec<f64>,
     /// Row and state values whose bits differ from ggml's, per kernel.
     pub differ: Vec<usize>,
+    /// The largest difference from ggml's values relative to their largest magnitude, per
+    /// kernel.
+    pub rel: Vec<f32>,
 }
 
 /// One layer's inputs: a conv-like row per token (q, k, v views), g and beta.
@@ -134,6 +150,12 @@ fn outputs(
     Ok((r, outs))
 }
 
+/// Largest difference relative to `a`'s largest magnitude.
+fn rel(a: &[f32], b: &[f32]) -> f32 {
+    let top = a.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-30);
+    a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs())) / top
+}
+
 fn differ(a: &[f32], b: &[f32]) -> usize {
     assert_eq!(a.len(), b.len());
     a.iter()
@@ -160,6 +182,7 @@ pub fn run_prompt(
     for (i, (nt, ns)) in cases.enumerate() {
         let (r, outs) = outputs(gpu, heads, nt, ns)?;
         let differ: Vec<usize> = outs.iter().map(|o| differ(&r, o)).collect();
+        let rel: Vec<f32> = outs.iter().map(|o| rel(&r, o)).collect();
         let mut secs = vec![0.0; KERNELS.len() + 1];
         if i == 0 {
             // ggml's graph and one per kernel (each built and run with its kernel forced).
@@ -211,6 +234,7 @@ pub fn run_prompt(
             seqs: ns,
             secs,
             differ,
+            rel,
         });
     }
     Ok(rows)

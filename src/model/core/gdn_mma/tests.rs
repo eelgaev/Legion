@@ -241,6 +241,16 @@ fn launch_sizes_match_the_kernels() {
     assert_eq!(Schedule::Heads.smem(), 93312);
     assert_eq!(Schedule::Staged.smem(), 85376);
     assert_eq!(Schedule::Staged.grid(48, 2), 96);
+    // gdn_split's split_shared<64> and split_shared<128>; two CTAs a head for the pair.
+    assert_eq!(Schedule::Pair.smem(), 48384);
+    assert_eq!(Schedule::Wide.smem(), 60672);
+    assert_eq!(Schedule::Lean.smem(), 60672);
+    assert_eq!(Schedule::WideTwo.smem(), 85376);
+    assert_eq!(Schedule::Pair.grid(48, 1), 96);
+    assert_eq!(Schedule::Wide.grid(48, 1), 48);
+    assert_eq!((Schedule::Wide.warps(), Schedule::Pair.warps()), (16, 8));
+    // Two pair CTAs (and the driver's 1 KiB each) fit a GB10 SM's 100 KiB.
+    assert!(2 * (Schedule::Pair.smem() + 1024) <= 100 * 1024);
     assert_eq!(std::mem::size_of::<Args>(), 184);
     assert_eq!(std::mem::offset_of!(Args, h), 64);
     assert_eq!(std::mem::offset_of!(Args, sq), 104);
