@@ -154,6 +154,9 @@ impl Tune {
     pub fn parse(s: &str) -> Result<Tune, String> {
         let mut t = Tune::default();
         let mut rest = s.trim();
+        if !rest.is_ascii() {
+            return Err(format!("tune {s:?}: ASCII keys and digits only"));
+        }
         while !rest.is_empty() {
             let key = rest.as_bytes()[0];
             let digits = rest[1..]
@@ -170,6 +173,9 @@ impl Tune {
                 _ => return Err(format!("tune {s:?}: unknown key {:?}", key as char)),
             }
             rest = &rest[digits..];
+        }
+        if t.chunks > 16 || t.ahead > 256 {
+            return Err(format!("tune {s:?}: at most 16 pieces a row and 256 ahead"));
         }
         if ![0, 8, 16, 32].contains(&t.region) || t.ctas > 2 {
             return Err(format!(

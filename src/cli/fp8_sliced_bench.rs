@@ -29,6 +29,13 @@ pub struct Fp8SlicedBenchArgs {
     rounds: usize,
 }
 
+/// `SLICED_KW` in src/cuda/fp8_mm.cu: K warps of each tile (a tile runs where k is a multiple of
+/// 64 KW; any other tile index falls back to the large GEMM, which this tool must not time as a
+/// tile).
+const SLICED_KW: [usize; 20] = [
+    16, 8, 4, 8, 8, 4, 8, 4, 8, 4, 2, 4, 16, 16, 16, 16, 16, 16, 16, 16,
+];
+
 fn shape(s: &str) -> anyhow::Result<(usize, usize)> {
     let (k, rows) = s
         .split_once('x')
@@ -48,6 +55,13 @@ impl Rng {
 }
 
 pub fn run(args: Fp8SlicedBenchArgs) -> anyhow::Result<()> {
+    // Outside 5-64 tokens the sliced-K GEMM does not run at all.
+    if let Some(n) = args.tokens.iter().find(|n| !(5..=64).contains(*n)) {
+        anyhow::bail!("--tokens takes 5 to 64 (the sliced-K range), not {n}");
+    }
+    if let Some(t) = args.tiles.iter().find(|&&t| t as usize >= SLICED_KW.len()) {
+        anyhow::bail!("--tiles takes 0 to {}, not {t}", SLICED_KW.len() - 1);
+    }
     let mut gpu = legion::ggml::backend_by_name("CUDA0")?;
     let shapes: Vec<(usize, usize)> = if args.shapes.is_empty() {
         vec![
@@ -68,6 +82,18 @@ pub fn run(args: Fp8SlicedBenchArgs) -> anyhow::Result<()> {
         "{:>6} {:>6} {:>3} {:>5} {:>9} {:>7} {:>7} {:>9}",
         "k", "rows", "n", "tile", "us/mm", "GB/s", "vs pick", "differ"
     );
+    for &(k, _) in &shapes {
+        if let Some(t) = args
+            .tiles
+            .iter()
+            .find(|&&t| k % (SLICED_KW[t as usize] * 64) != 0)
+        {
+            anyhow::bail!(
+                "tile {t} needs k a multiple of {}, not {k}",
+                SLICED_KW[*t as usize] * 64
+            );
+        }
+    }
     let mut bad = 0;
     for &(k, m) in &shapes {
         let layers = args.layers.max(1);
