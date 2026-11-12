@@ -44,6 +44,20 @@ pub struct PagedQmBenchArgs {
 pub fn run(args: PagedQmBenchArgs) -> anyhow::Result<()> {
     use legion::model::core::paged_qm_bench as bench;
     use legion::model::core::paged_split_bench::{Group, pool};
+    // Bad arguments fail before the edge cases run.
+    anyhow::ensure!(args.reps > 0, "--reps takes 1 or more timed runs");
+    anyhow::ensure!(args.seqs > 0, "--seqs takes 1 or more sequences");
+    let [n_head, n_head_kv] = args.heads[..] else {
+        anyhow::bail!("--heads takes query heads, kv heads");
+    };
+    let heads = (256, n_head, n_head_kv);
+    let mut chunks = Vec::new();
+    for c in &args.chunks {
+        let (p, t) = c
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("--chunks takes n_past:n_tok, not {c}"))?;
+        chunks.push((p.trim().parse::<usize>()?, t.trim().parse::<usize>()?));
+    }
     let mut gpu = legion::ggml::backend_by_name("CUDA0")?;
     let mut differ = 0;
     if !args.no_edges {
@@ -55,17 +69,6 @@ pub fn run(args: PagedQmBenchArgs) -> anyhow::Result<()> {
             );
             differ += bad;
         }
-    }
-    let [n_head, n_head_kv] = args.heads[..] else {
-        anyhow::bail!("--heads takes query heads, kv heads");
-    };
-    let heads = (256, n_head, n_head_kv);
-    let mut chunks = Vec::new();
-    for c in &args.chunks {
-        let (p, t) = c
-            .split_once(':')
-            .ok_or_else(|| anyhow::anyhow!("--chunks takes n_past:n_tok, not {c}"))?;
-        chunks.push((p.trim().parse::<usize>()?, t.trim().parse::<usize>()?));
     }
     let max_ctx = chunks.iter().map(|(p, t)| p + t).max().unwrap_or(0);
     let n_blocks = max_ctx.div_ceil(64).max(1);

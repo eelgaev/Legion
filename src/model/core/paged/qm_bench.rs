@@ -61,7 +61,6 @@ pub fn run(
             for _ in 0..reps {
                 backend.compute(&graph).expect("compute");
             }
-            let _ = out.to_f32();
             best = best.min(start.elapsed().as_secs_f64() * 1e3 / reps as f64);
         }
     }
