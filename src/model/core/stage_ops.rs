@@ -130,6 +130,17 @@ pub(crate) const SMALL: &[&str] = &[
     "nvfp4_a4_quant",
 ];
 
+/// Dense matmuls captured in small steps only, as [`SMALL`] (#689): `nvfp4_mvq` (5-8 columns
+/// on compute capability 12.x: ggml's quantize_q8_1 and the NVFP4 matvec, two kernels picked
+/// by the column count, the ring by the shapes and the device's attributes, read once) and
+/// `fp8_mm` (the FP8 W8A16 matmuls: one kernel picked by the shapes, the node's parameters and
+/// the device's compute capability; its shared memory opt-in is set once, at the first launch,
+/// which a step runs directly before it is captured). Neither allocates, waits or touches
+/// another stream. Left out, each one cut a verify step's capture: on Qwen3.8-27B NVFP4 with
+/// DFlash on a DGX Spark (GB10) a verify step ran as ~380 captures of 1-7 kernels around
+/// them, a 2-3 µs gap at each cut. Prompt steps keep them between their captures, as before.
+pub(crate) const SMALL_MM: &[&str] = &["nvfp4_mvq", "fp8_mm"];
+
 /// Pure ops captured only while [`set_commit_capture`] is on: a verify commit's conv window
 /// copy (`legion_spec_window_launch`, one kernel picked by the node's shape). Left out, it runs
 /// between captures, and since a commit graph alternates it with single `gdn` launches, no
@@ -158,10 +169,10 @@ pub fn capture_safe(op: &ExternalOp, node: &ffi::ggml_tensor) -> bool {
     }
 }
 
-/// Whether a capture may hold an op `name` of [`PURE`] or [`SMALL`], in a small step (`small`)
-/// or a prompt step.
+/// Whether a capture may hold an op `name` of [`PURE`], [`SMALL`] or [`SMALL_MM`], in a small
+/// step (`small`) or a prompt step.
 fn listed(name: &str, small: bool) -> bool {
-    if SMALL.contains(&name) {
+    if SMALL.contains(&name) || SMALL_MM.contains(&name) {
         small
     } else {
         PURE.contains(&name)
