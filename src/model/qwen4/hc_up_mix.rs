@@ -376,7 +376,11 @@ pub(crate) unsafe fn mix_cast_reads(node: *const ffi::ggml_tensor) -> Option<Vec
         };
         let l = lob_data(lob, rank, n) as usize;
         let mut reads = vec![whole(t.src[0]), (l, l + rank * n * 2)];
-        for &s in &t.src[2..5] {
+        // (src[5] is the cast; 6 and 7 the lazy streams' inputs, `set_lazy_streams`.)
+        for &s in t.src[2..5]
+            .iter()
+            .chain(&t.src[LAZY_OUT_SRC..=LAZY_INJ_SRC])
+        {
             if !s.is_null() {
                 reads.push(whole(s));
             }
@@ -406,6 +410,56 @@ pub(crate) unsafe fn set_mix_cast(
     unsafe {
         (*node).src[MIX_CAST_SRC] = cast;
         crate::ggml::set_external_param(node, P_SKIP_F32, i32::from(skip_f32));
+    }
+}
+
+/// The source slot of a lazy-streams mix node's block output ([`set_lazy_streams`]); its
+/// inject weights are in the next.
+const LAZY_OUT_SRC: usize = 6;
+const LAZY_INJ_SRC: usize = 7;
+
+/// Whether `node` is a mix node made by [`up_mix_rebuilt`] with a BF16 `up` and F32 streams
+/// that does not make its streams yet ([`set_lazy_streams`], #1183).
+///
+/// # Safety
+/// `node` is a valid tensor.
+pub(crate) unsafe fn lazy_mix_target(node: *const ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's; a mix node's sources are valid tensors.
+    unsafe {
+        if !crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &HC_UP_MIX)) {
+            return false;
+        }
+        let t = &*node;
+        !t.src[0].is_null()
+            && (*t.src[0]).type_ == types::BF16
+            && !t.src[2].is_null()
+            && (*t.src[2]).type_ == types::F32
+            && !t.src[3].is_null()
+            && !t.src[4].is_null()
+            && t.src[LAZY_OUT_SRC..].iter().all(|s| s.is_null())
+    }
+}
+
+/// Makes the [`lazy_mix_target`] `node` read the streams before the attention block's
+/// combine, `res` (F32 `[e, hc, n]`, contiguous), and make the new streams itself per value
+/// as the norm did, `out · w + res` with `w = 2 sigmoid(inj / hc)` per stream (one FMA on
+/// CUDA, the norm kernels' expressions, so the same bits): `out` the block's output (F32
+/// `[e, n]`, rows contiguous), `inj` the norm's inject weights for it (F32 `[hc, n]`, rows
+/// contiguous). Lazy streams (#1183): that norm then need not write the new streams.
+///
+/// # Safety
+/// As [`crate::ggml::make_external`]: valid nodes of an allocated graph that has not run.
+pub(crate) unsafe fn set_lazy_streams(
+    node: *mut ffi::ggml_tensor,
+    res: *mut ffi::ggml_tensor,
+    out: *mut ffi::ggml_tensor,
+    inj: *mut ffi::ggml_tensor,
+) {
+    // SAFETY: the caller's.
+    unsafe {
+        (*node).src[2] = res;
+        (*node).src[LAZY_OUT_SRC] = out;
+        (*node).src[LAZY_INJ_SRC] = inj;
     }
 }
 
@@ -580,6 +634,10 @@ unsafe fn cpu_hc_up_mix(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
         let mixedb = dst.src[MIX_CAST_SRC];
         let mixedb = (!mixedb.is_null()).then(|| (*mixedb).data as *mut u16);
         let skip_f32 = params[P_SKIP_F32] != 0;
+        // Lazy streams (#1183): the attention block's output and its inject weights, combined
+        // into the streams first as the norm's CPU code combines them.
+        let lazy = (!dst.src[LAZY_OUT_SRC].is_null())
+            .then(|| (&*dst.src[LAZY_OUT_SRC], &*dst.src[LAZY_INJ_SRC]));
         let mut q = vec![0i8; rank];
         let mut d = vec![0f32; nkb];
         let mut xb = vec![0f32; rank];
@@ -618,10 +676,24 @@ unsafe fn cpu_hc_up_mix(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
                     *g = sum;
                 }
             }
+            let pre = lazy.map(|(o, j)| {
+                let orow = (o.data as *const u8).add(t * o.nb[1]) as *const f32;
+                let irow = (j.data as *const u8).add(t * j.nb[1]) as *const f32;
+                let w: Vec<f32> = (0..hc)
+                    .map(|c| {
+                        let v = *irow.add(c) * (1.0 / hc as f32);
+                        1.0 / (1.0 + (-v).exp()) * 2.0
+                    })
+                    .collect();
+                (orow, w)
+            });
             for i in 0..e {
                 let mut sum = 0f32;
                 for c in 0..hc {
                     let mut xv = xv_at(t * rows + c * e + i);
+                    if let Some((orow, w)) = &pre {
+                        xv = *orow.add(i) * w[c] + xv;
+                    }
                     if let Some((sc, g)) = rebuilt {
                         xv = (xv * *sc.add(t * hc + c)) * *g.add(c * e + i);
                     }
@@ -677,6 +749,12 @@ struct HcUpMix {
     skip_f32: i32,
     /// BF16 `up` only: the kernel ([`force_kernel`]; 0 the default).
     kernel: i32,
+    /// Null, or (lazy streams, [`set_lazy_streams`]) the attention block's output and its
+    /// inject weights, combined into `res` first, rows `pre_out_ld` / `pre_inj_ld` floats apart.
+    pre_out: *const f32,
+    pre_out_ld: i64,
+    pre_inj: *const f32,
+    pre_inj_ld: i64,
 }
 
 #[cfg(feature = "cuda")]
@@ -705,6 +783,10 @@ impl HcUpMix {
             mixedb: std::ptr::null_mut(),
             skip_f32: 0,
             kernel: 0,
+            pre_out: std::ptr::null(),
+            pre_out_ld: 0,
+            pre_inj: std::ptr::null(),
+            pre_inj_ld: 0,
         }
     }
 }
@@ -751,7 +833,7 @@ unsafe fn cuda_hc_up_mix(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
             ),
             None => (null, null, null),
         };
-        let p = HcUpMix {
+        let mut p = HcUpMix {
             up: up.data as *const u8,
             up_nb1: up.nb[1] as i64,
             lo: lo.data as *const f32,
@@ -796,7 +878,19 @@ unsafe fn cuda_hc_up_mix(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
             },
             skip_f32: params[P_SKIP_F32],
             kernel: KERNEL.load(Ordering::Relaxed),
+            pre_out: std::ptr::null(),
+            pre_out_ld: 0,
+            pre_inj: std::ptr::null(),
+            pre_inj_ld: 0,
         };
+        // Lazy streams (#1183, `set_lazy_streams`).
+        if !dst.src[LAZY_OUT_SRC].is_null() {
+            let (o, j) = (&*dst.src[LAZY_OUT_SRC], &*dst.src[LAZY_INJ_SRC]);
+            p.pre_out = o.data as *const f32;
+            p.pre_out_ld = (o.nb[1] / 4) as i64;
+            p.pre_inj = j.data as *const f32;
+            p.pre_inj_ld = (j.nb[1] / 4) as i64;
+        }
         match legion_hc_up_mix_launch(&p, stream) {
             0 => Ok(()),
             e => Err(format!("hc_up_mix: error {e}")),

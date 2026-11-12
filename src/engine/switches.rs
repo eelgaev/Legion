@@ -312,6 +312,9 @@ pub struct Switches {
     /// qwen4exp's MoE tails folded into the next combine-and-norm before the graph is planned
     /// ([`crate::model::qwen4::set_moe_fold`]; on by default on an integrated GPU).
     pub hc_moe_fold: Option<bool>,
+    /// The FFN mixers' residual streams made by their readers in the MoE fold's relayout
+    /// ([`crate::model::qwen4::set_hc_lazy_streams`]; on by default).
+    pub hc_lazy_streams: Option<bool>,
     /// qwen4exp's hyper-connection glue fused around the MoE op on a V100 or an sm_80+ GPU
     /// ([`crate::model::qwen4::set_hc_fuse`]).
     pub hc_fuse: Option<bool>,
@@ -739,6 +742,7 @@ impl Switches {
         set(self.hc_up_stage, qwen4::hc::set_up_stage);
         set(self.hc_post_norm, qwen4::set_fused_post_norm);
         set(self.hc_moe_fold, qwen4::set_moe_fold);
+        set(self.hc_lazy_streams, qwen4::set_hc_lazy_streams);
         set(self.hc_fuse, qwen4::set_hc_fuse);
         set(self.hc_xn16, qwen4::set_xn16);
         set(self.hc_quant, core::set_mmq_preq);

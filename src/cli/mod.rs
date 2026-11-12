@@ -13,6 +13,7 @@ mod fp8_sliced_bench;
 mod gdn_bench;
 mod gguf;
 mod hc_down_bench;
+mod hc_lazy_bench;
 mod hc_mix_bench;
 mod hc_up_mix_bench;
 mod head_mm_bench;
@@ -144,6 +145,10 @@ enum Command {
     /// kernels (development).
     #[command(hide = true)]
     HcUpMixBench(hc_up_mix_bench::HcUpMixBenchArgs),
+    /// Check and time qwen4exp's lazy FFN mixer streams against the streams written
+    /// (development).
+    #[command(hide = true)]
+    HcLazyBench(hc_lazy_bench::HcLazyBenchArgs),
     /// Check and time the read-each-expert-once NVFP4 expert op against ggml's mmvq
     /// (development).
     #[command(hide = true)]
@@ -256,6 +261,7 @@ async fn run(cli: Cli, numa: Option<legion::hw::numa_bind::Placement>) -> anyhow
         Command::HcMixBench(args) => hc_mix_bench::run(args),
         Command::HcDownBench(args) => hc_down_bench::run(args),
         Command::HcUpMixBench(args) => hc_up_mix_bench::run(args),
+        Command::HcLazyBench(args) => hc_lazy_bench::run(args),
         Command::Nvfp4OnceBench(args) => nvfp4_once_bench::run(args),
         Command::Nvfp4MvqBench(args) => nvfp4_mvq_bench::run(args),
         Command::Fp8SlicedBench(args) => fp8_sliced_bench::run(args),

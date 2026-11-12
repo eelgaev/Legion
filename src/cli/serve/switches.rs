@@ -837,6 +837,15 @@ pub(in crate::cli) struct SwitchArgs {
     /// an integrated GPU such as the GB10). For comparisons.
     #[arg(long, help_heading = HEADING)]
     no_hc_moe_fold: bool,
+    /// qwen4exp prompt steps where --hc-moe-fold folds the MoE tails (the default on a GB10):
+    /// each layer's FFN-side hyper-connection combine-and-norm writes the new residual streams
+    /// (4 x n_embd F32 values a token) for that mixer's up-mix and the next layer's norm to
+    /// read, and not, as by default, both of them making those streams per value from the
+    /// streams before it and the attention output, with the norm's own arithmetic (#1183: the
+    /// same bits, ~84 MB less memory traffic per layer at 4K tokens; the attention mixer's
+    /// streams then stay allocated through the MoE layer). For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_hc_lazy_streams: bool,
     /// qwen4exp prompt steps on a V100 (compute capability 7.0) or an sm_80+ GPU such as the
     /// GB10 (#826; no effect elsewhere): the layer's gated shared expert is added in the fused
     /// MoE op's per-token sum, and the next hyper-connection combine-and-norm makes that sum
@@ -1574,6 +1583,7 @@ impl SwitchArgs {
             } else {
                 self.no_hc_moe_fold.then_some(false)
             },
+            hc_lazy_streams: self.no_hc_lazy_streams.then_some(false),
             hc_fuse: self.hc_fuse.then_some(true),
             hc_xn16: self.hc_xn_f32.then_some(false),
             hc_quant: self.hc_quant_ggml.then_some(false),

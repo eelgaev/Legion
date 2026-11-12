@@ -61,11 +61,24 @@ __global__ void lo_bf16(const legion_hc_up_mix p) {
     ((__nv_bfloat162 *) p.lob)[i] = r;
 }
 
+// Lazy streams (#1183, p.pre_out): the weight stream s of token tok takes the attention block's
+// output with, as fused.cu's hc_post_norm kernels compute their wpost (the same expressions).
+__device__ __forceinline__ float pre_weight(const legion_hc_up_mix & p, int64_t tok, int s) {
+    // ggml: scale(inject, 1 / hc), sigmoid, scale(2)
+    const float v = p.pre_inj[tok * p.pre_inj_ld + s] * (1.0f / (float) p.hc);
+    const float e = 1.0f / (1.0f + expf(-v));
+    return e * 2.0f;
+}
+
 // S16 (with RB; #1183, `legion serve --hc-bf16`): the streams are BF16 (hc_post_norm_b16_kernel's),
 // each widened to F32 before the rebuild.
-template <bool RB, bool S16 = false>
+// PRE (with RB, F32 streams; #1183, lazy streams): res holds the streams before the attention
+// block's combine; each value is combined first, __fmaf_rn(pre_out, pre_weight, res), the
+// norm's FMA, so the new streams' bits.
+template <bool RB, bool S16 = false, bool PRE = false>
 __global__ void __launch_bounds__(WARPS * 32) up_mix_bf16(const legion_hc_up_mix p) {
     static_assert(RB || !S16, "up_mix_bf16: BF16 streams in the rebuilt form only");
+    static_assert(!PRE || (RB && !S16), "up_mix_bf16: lazy streams of F32 streams in the rebuilt form only");
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     extern __shared__ int smem[];
     const int  stride = p.rank / 2 + PAD / 4;  // 32-bit words per staged row
@@ -145,6 +158,10 @@ __global__ void __launch_bounds__(WARPS * 32) up_mix_bf16(const legion_hc_up_mix
                     const int64_t at  = (int64_t) tok * K + i;
                     const float * x   = (RB ? p.res : p.xn) + at;
                     float         sum = 0.0f;
+                    [[maybe_unused]] float po = 0.0f;
+                    if constexpr (PRE) {
+                        po = p.pre_out[(int64_t) tok * p.pre_out_ld + i];
+                    }
 #pragma unroll
                     for (int c = 0; c < HC; c++) {
                         float xv;
@@ -152,6 +169,9 @@ __global__ void __launch_bounds__(WARPS * 32) up_mix_bf16(const legion_hc_up_mix
                             xv = __bfloat162float(((const __nv_bfloat16 *) p.res)[at + (int64_t) c * p.e]);
                         } else {
                             xv = x[(int64_t) c * p.e];
+                        }
+                        if constexpr (PRE) {
+                            xv = __fmaf_rn(po, pre_weight(p, tok, c), xv);
                         }
                         if constexpr (RB) {
                             xv = __fmul_rn(__fmul_rn(xv, p.sc[(int64_t) tok * HC + c]), p.g[c * p.e + i]);
@@ -194,9 +214,12 @@ __global__ void __launch_bounds__(WARPS * 32) up_mix_bf16(const legion_hc_up_mix
 // The streams are prefetched into L2 PD tiles ahead (one bulk prefetch per token and stream on
 // sm_90+). For a handful of tokens the up rows are most of the bytes and the register loads of
 // A cost more than up_mix_bf16's staging; the launch keeps up_mix_bf16 there.
-template <int KS, int CG, int TT, int MINB, int PD, bool RB, bool S16>
+// PRE: as up_mix_bf16's (lazy streams, #1183); the attention block's output rows are
+// prefetched with the streams.
+template <int KS, int CG, int TT, int MINB, int PD, bool RB, bool S16, bool PRE = false>
 __global__ void __launch_bounds__(CG * HC * 32, MINB) up_mix_bf16_reg(const legion_hc_up_mix p, const int chunk) {
     static_assert(RB || !S16, "up_mix_bf16_reg: BF16 streams in the rebuilt form only");
+    static_assert(!PRE || (RB && !S16), "up_mix_bf16_reg: lazy streams of F32 streams in the rebuilt form only");
     static_assert(TT % 8 == 0 && TT >= 8, "up_mix_bf16_reg: whole n8 tiles");
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     constexpr int THREADS = CG * HC * 32;
@@ -256,6 +279,25 @@ __global__ void __launch_bounds__(CG * HC * 32, MINB) up_mix_bf16_reg(const legi
 #pragma unroll
                 for (int b = 0; b < COLS * ES; b += 32) {
                     asm volatile("prefetch.global.L2 [%0];" ::"l"(x + b));
+                }
+            }
+        }
+        if constexpr (PRE) {
+            // The attention block's output: COLS F32 values per token.
+            for (int u = tid; u < TT; u += THREADS) {
+                const int tok = base + u;
+                if (tok < t_end) {
+                    const char * x = (const char *) (p.pre_out + (int64_t) tok * p.pre_out_ld + i0);
+#if __CUDA_ARCH__ >= 900
+                    if (((uintptr_t) x & 15) == 0) {
+                        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(x), "r"((uint32_t) (COLS * 4)));
+                        continue;
+                    }
+#endif
+#pragma unroll
+                    for (int b = 0; b < COLS * 4; b += 32) {
+                        asm volatile("prefetch.global.L2 [%0];" ::"l"(x + b));
+                    }
                 }
             }
         }
@@ -343,6 +385,10 @@ __global__ void __launch_bounds__(CG * HC * 32, MINB) up_mix_bf16_reg(const legi
             if (tok < t_end) {
                 const int64_t at  = (int64_t) tok * K + ei;
                 float         sum = 0.0f;
+                [[maybe_unused]] float po = 0.0f;
+                if constexpr (PRE) {
+                    po = p.pre_out[(int64_t) tok * p.pre_out_ld + ei];
+                }
 #pragma unroll
                 for (int s = 0; s < HC; s++) {
                     float xv;
@@ -350,6 +396,9 @@ __global__ void __launch_bounds__(CG * HC * 32, MINB) up_mix_bf16_reg(const legi
                         xv = __bfloat162float(((const __nv_bfloat16 *) p.res)[at + (int64_t) s * p.e]);
                     } else {
                         xv = ((const float *) xs)[at + (int64_t) s * p.e];
+                    }
+                    if constexpr (PRE) {
+                        xv = __fmaf_rn(po, pre_weight(p, tok, s), xv);
                     }
                     if constexpr (RB) {
                         xv = __fmul_rn(__fmul_rn(xv, p.sc[(int64_t) tok * HC + s]), gv[s]);
