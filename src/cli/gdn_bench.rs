@@ -27,6 +27,13 @@ pub struct GdnBenchArgs {
     /// pair run twice, and the packed rows the fused step stores, "d.store") and time per layer.
     #[arg(long, conflicts_with = "commit")]
     replay: bool,
+    /// --replay with sets of this many sequences, each keeping 0, 1, 3, 6 or 8 tokens (one or a
+    /// few users, #689), instead of 16 slots with mixed counts.
+    #[arg(long, requires = "replay")]
+    replay_seqs: Option<usize>,
+    /// --replay's verify tokens per sequence, comma separated (default 4 and 1).
+    #[arg(long, value_delimiter = ',', requires = "replay", value_parser = clap::value_parser!(i64).range(1..=9))]
+    replay_verify: Vec<i64>,
     /// Prompt groups (#1183): ggml's op against the chunked kernels of `--gdn-mma` (whole heads,
     /// value slices) and the staged ones (round 8's, and the split layouts: two CTAs a head, 16
     /// warps a head with one or two input buffers, the default "wide x2", and 8 warps) at one
@@ -43,6 +50,50 @@ pub struct GdnBenchArgs {
         value_parser = clap::value_parser!(i64).range(64..)
     )]
     tokens: Vec<i64>,
+    /// A layer's BF16 alpha and beta gate projections of 1-8 tokens (#689): ggml's two
+    /// `mul_mat_vec_f` launches against the one-launch op, for bits and time per layer (--layers
+    /// layers, row length --ab-k, 48 rows each).
+    #[arg(long, conflicts_with_all = ["commit", "replay", "prompt"])]
+    ab: bool,
+    /// Row lengths of --ab, comma separated.
+    #[arg(long, value_delimiter = ',', default_values_t = [5120])]
+    ab_k: Vec<usize>,
+}
+
+#[cfg(feature = "cuda")]
+fn run_ab(gpu: &mut legion::ggml::Backend, args: &GdnBenchArgs) -> anyhow::Result<()> {
+    use legion::model::core::mvf_bf16::bench::{self, Config};
+    let cfg = Config {
+        ks: args.ab_k.clone(),
+        layers: args.layers,
+        rounds: args.rounds,
+        ..Config::default()
+    };
+    let rows = bench::run(gpu, &cfg).map_err(anyhow::Error::msg)?;
+    println!(
+        "{:>6} {:>4} {:<6} {:>9} {:>7} {:>7} {:>8}",
+        "k", "tok", "kernel", "µs/layer", "vs ggml", "differ", "outputs"
+    );
+    let (mut reference, mut differ) = (0.0, 0);
+    for r in &rows {
+        if r.variant == "ggml" {
+            reference = r.secs;
+        }
+        differ += r.differ;
+        println!(
+            "{:>6} {:>4} {:<6} {:>9.2} {:>7.3} {:>7} {:>8}",
+            r.k,
+            r.tokens,
+            r.variant,
+            r.secs * 1e6,
+            r.secs / reference,
+            r.differ,
+            r.outputs
+        );
+    }
+    anyhow::ensure!(differ == 0, "{differ} values differ from ggml's bits");
+    println!("all bits equal to ggml's mul_mat_vec_f");
+    Ok(())
 }
 
 #[cfg(feature = "cuda")]
@@ -51,6 +102,10 @@ pub fn run(args: GdnBenchArgs) -> anyhow::Result<()> {
         self as bench, Config, PROMPT_KERNELS, REPLAY_VARIANTS, VARIANTS,
     };
     let mut gpu = legion::ggml::backend_by_name("CUDA0")?;
+    if args.ab {
+        return run_ab(&mut gpu, &args);
+    }
+    anyhow::ensure!(args.replay_seqs != Some(0), "--replay-seqs takes 1 or more");
     let cfg = Config {
         seqs: args.seqs,
         rounds: args.rounds,
@@ -60,6 +115,8 @@ pub fn run(args: GdnBenchArgs) -> anyhow::Result<()> {
         } else {
             args.layers
         },
+        replay_seqs: args.replay_seqs,
+        replay_verify: args.replay_verify,
         ..Config::default()
     };
     if args.prompt {

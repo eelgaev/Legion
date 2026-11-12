@@ -38,6 +38,9 @@ pub struct Switches {
     /// Gated DeltaNet replaying verify steps' inputs staged through shared memory
     /// ([`crate::model::core::set_gdn_replay_staged`]).
     pub gdn_replay_staged: Option<bool>,
+    /// Gated DeltaNet replaying verify steps of few sequences on their own kernel
+    /// ([`crate::model::core::set_gdn_replay_few`]).
+    pub gdn_replay_few: Option<bool>,
     /// Gated DeltaNet replaying verify steps skipping their padding rows
     /// ([`crate::model::core::set_gdn_pad_skip`]).
     pub gdn_pad_skip: Option<bool>,
@@ -131,6 +134,9 @@ pub struct Switches {
     pub dense_mv_wide_chain: Option<bool>,
     /// MoE routers of 1-3 tokens as one op ([`crate::model::core::set_router_mv`]).
     pub router_mv: Option<bool>,
+    /// A DeltaNet layer's BF16 alpha and beta matmuls of 1-8 tokens as one op
+    /// ([`crate::model::core::set_mvf_ab`]).
+    pub mvf_ab: Option<bool>,
     /// The router's top-k and weights as one CUDA launch
     /// ([`crate::model::core::set_router_join`]).
     pub router_join: Option<bool>,
@@ -548,6 +554,7 @@ impl Switches {
         set(self.gdn, core::set_gdn);
         set(self.gdn_decode, core::set_gdn_decode);
         set(self.gdn_replay_staged, core::set_gdn_replay_staged);
+        set(self.gdn_replay_few, core::set_gdn_replay_few);
         set(self.gdn_pad_skip, core::set_gdn_pad_skip);
         set(self.gdn_commit_slots, core::set_commit_slots);
         set(self.gdn_commit_in_verify, core::set_commit_in_verify);
@@ -603,6 +610,7 @@ impl Switches {
             crate::model::dense_mv::set_wide_chain,
         );
         set(self.router_mv, core::set_router_mv);
+        set(self.mvf_ab, core::set_mvf_ab);
         set(self.router_join, core::set_router_join);
         set(self.router_bf16, core::set_router_bf16);
         set(
