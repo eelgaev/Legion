@@ -24,6 +24,9 @@ pub(crate) const PURE: &[&str] = &[
     "qwen4_hc_mix",
     "hc_up_mix",
     "hc_up_lob",
+    // The prompt steps' down matmul rebuilding xn from BF16 streams (#1183): one kernel, its
+    // tile chosen from the node's token count and the GPU's SM count.
+    "hc_down_bf16",
     // ggml's gated hc_pre (#836) and the V100's F16-writing mix: one kernel on the compute
     // stream, picked by the node's shape, parameters and pointers' alignment.
     "hc_mix16",

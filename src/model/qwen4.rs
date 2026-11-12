@@ -25,6 +25,7 @@
 
 pub mod hc;
 mod hc_chain;
+pub mod hc_down;
 pub use hc_chain::set_hc_chain;
 mod hc_mix16;
 pub use hc_mix16::{set_hc_pre, set_mix16, set_rebuild_bf16 as set_mix_rebuild_bf16};
@@ -1112,6 +1113,27 @@ impl Model {
                 && xnb_rebuilt
             {
                 let scale = 1.0 / hc_n as f32;
+                // With BF16 streams (`--hc-bf16`) on a GB10, the norm does not write the BF16
+                // xn and the down matmul rebuilds it from the streams (#1183): xn's bits, the
+                // GEMM's sums in another order than cuBLAS's.
+                let [e, _, _, _] = res.ne();
+                if streams16 && hc_down::takes(down, norm, [e, hc_n, n, 1]) {
+                    let p = hc_norm::hc_post_norm_b16_streams(
+                        ctx,
+                        res,
+                        out,
+                        inject,
+                        norm,
+                        inj,
+                        self.hp.rms_eps,
+                        down,
+                    );
+                    let lo = hc_down::mul_mat(ctx, down, p.res, p.scales, norm);
+                    let lo = hc_chain::lo_act(ctx, lo, scale, hc_chain::on_gpu(up));
+                    let mixed =
+                        hc_up_mix::up_mix_rebuilt(ctx, up, lo, p.res, p.scales, norm, hc_n, scale);
+                    return Ok((p.res, mixed, p.inject));
+                }
                 let p = hc_norm::hc_post_norm_rebuilt_xnb(
                     ctx,
                     res,

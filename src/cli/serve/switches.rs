@@ -967,7 +967,9 @@ pub(in crate::cli) struct SwitchArgs {
     /// --hc-xn-written, or with --tp-seq-par splitting the step): keep the hyper-connection
     /// residual streams in BF16 between the mixers instead of F32, so the combine-and-norm (with
     /// the MoE output folded in) and the up-mix kernel move half the stream bytes. Math stays F32
-    /// inside each kernel; each new stream value is rounded to BF16. Decode, verify and mixed
+    /// inside each kernel; each new stream value is rounded to BF16. In steps of 2048+ tokens
+    /// the norm then skips writing its BF16 output and the mixer's down matmul rebuilds it from
+    /// the streams (the same values and, on a GB10, cuBLAS's sums). Decode, verify and mixed
     /// steps keep F32 streams (off by default).
     #[arg(long, help_heading = HEADING)]
     hc_bf16: bool,

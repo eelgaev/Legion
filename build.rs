@@ -304,6 +304,7 @@ fn build_cuda_kernels(ggml: &Path) {
         .file("src/cuda/mmq_preq.cu")
         .file("src/cuda/mmq_ids.cu")
         .file("src/cuda/hc_up_mix.cu")
+        .file("src/cuda/hc_down.cu")
         .file("src/cuda/hc_mix16.cu")
         .file("src/cuda/hc_chain.cu")
         .file("src/cuda/gate_q8.cu")

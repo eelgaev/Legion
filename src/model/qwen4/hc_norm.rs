@@ -273,8 +273,61 @@ pub(super) fn hc_post_norm_rebuilt_xnb<'a>(
     down: Tensor<'a>,
     bf16: bool,
 ) -> PostNormRebuiltXnb<'a> {
+    rebuilt_xnb_node(ctx, res, out, inj, gamma, w, eps, down, bf16, true)
+}
+
+/// [`hc_post_norm_rebuilt_xnb`] with BF16 streams (`bf16` on) that does not write the BF16
+/// `xn`, for a down matmul that rebuilds it from the streams, their scales and gamma
+/// ([`super::hc_down::mul_mat`], #1183): the node keeps its size and every part its place (the
+/// BF16 `xn`'s place stays unwritten), so ggml's allocator plans the graph as with `xn`
+/// written. The same streams, scales and inject weights.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn hc_post_norm_b16_streams<'a>(
+    ctx: &'a Context,
+    res: Tensor<'a>,
+    out: Tensor<'a>,
+    inj: Tensor<'a>,
+    gamma: Tensor<'a>,
+    w: Tensor<'a>,
+    eps: f32,
+    down: Tensor<'a>,
+) -> PostNormStreams<'a> {
+    let p = rebuilt_xnb_node(ctx, res, out, inj, gamma, w, eps, down, true, false);
+    PostNormStreams {
+        res: p.res,
+        scales: p.scales,
+        inject: p.inject,
+    }
+}
+
+/// [`PARAM_STREAMS16`] of a node with BF16 streams that does not write the BF16 `xn`
+/// ([`hc_post_norm_b16_streams`]); 1 is BF16 streams with it written.
+const STREAMS16_NO_XNB: i32 = 2;
+
+/// The parameter holding [`PostNormKind::streams16`] (and [`STREAMS16_NO_XNB`]).
+const PARAM_STREAMS16: usize = 5;
+
+/// [`hc_post_norm_rebuilt_xnb`]'s node; `xnb` false: the BF16 `xn` not written (BF16 streams
+/// only).
+#[allow(clippy::too_many_arguments)]
+fn rebuilt_xnb_node<'a>(
+    ctx: &'a Context,
+    res: Tensor<'a>,
+    out: Tensor<'a>,
+    inj: Tensor<'a>,
+    gamma: Tensor<'a>,
+    w: Tensor<'a>,
+    eps: f32,
+    down: Tensor<'a>,
+    bf16: bool,
+    xnb: bool,
+) -> PostNormRebuiltXnb<'a> {
     let [e, hc, n, _] = res.ne();
     let [k, n_inj, _, _] = w.ne();
+    assert!(
+        xnb || bf16,
+        "hc_post_norm: xn unwritten with BF16 streams only"
+    );
     assert_eq!(down.ty(), types::BF16, "hc_post_norm: BF16 down");
     assert!(rebuild_fits(k, hc, n), "hc_post_norm: {n} tokens");
     // (The BF16 streams' kernel adds no reduce-scatter's partials: no deferred `out` then.)
@@ -297,6 +350,10 @@ pub(super) fn hc_post_norm_rebuilt_xnb<'a>(
             padded: true,
         },
     );
+    if !xnb {
+        // SAFETY: the node just made, an external op node.
+        unsafe { crate::ggml::set_external_param(node.raw(), PARAM_STREAMS16, STREAMS16_NO_XNB) };
+    }
     // `out` the reduce-scatter of a `--tp-seq-par` step with BF16 partials (#1176): the norm
     // adds the two ranks' partials itself, as the exchange's sum kernel adds them, so the sum
     // is not written and read back.
@@ -331,6 +388,16 @@ pub(super) struct PostNormRebuiltXnb<'a> {
     pub scales: Tensor<'a>,
     /// `xn` rounded to BF16 (`[e · hc, n]`).
     pub xnb: Tensor<'a>,
+    /// The per-stream weights, F32 `[n_inj, n]`.
+    pub inject: Tensor<'a>,
+}
+
+/// [`hc_post_norm_b16_streams`]'s outputs.
+pub(super) struct PostNormStreams<'a> {
+    /// The new streams, BF16 `[e, hc, n]`.
+    pub res: Tensor<'a>,
+    /// Each stream's norm scale, F32 `[hc, n]`.
+    pub scales: Tensor<'a>,
     /// The per-stream weights, F32 `[n_inj, n]`.
     pub inject: Tensor<'a>,
 }
@@ -642,9 +709,10 @@ unsafe fn cpu_hc_post_norm(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
         // `xn`, or (`rebuild`) the streams' scales.
         let xn = rn.add(at.xn);
         let mut row = vec![0f32; k];
-        // A BF16 down weight: `xn` as BF16 (#469); a Q8_0 one: `xn` and the weight as F16.
+        // A BF16 down weight: `xn` as BF16 (#469), unless the down matmul rebuilds it
+        // (`hc_post_norm_b16_streams`); a Q8_0 one: `xn` and the weight as F16.
         let xnb = down
-            .filter(|d| d.type_ == types::BF16)
+            .filter(|d| d.type_ == types::BF16 && params[PARAM_STREAMS16] != STREAMS16_NO_XNB)
             .map(|_| rn.add(at.xn16) as *mut u16);
         let down = down.filter(|d| d.type_ == types::Q8_0);
         let xn16 = down.map(|_| rn.add(at.xn16) as *mut u16);
@@ -887,9 +955,9 @@ pub(crate) unsafe fn fold_target(node: *const ffi::ggml_tensor, cuda: bool) -> b
         let n = &*node;
         let p = crate::ggml::external_params(n);
         // eps, down, quant, rebuild, moe, streams16, padded, fold; BF16 streams (`--hc-bf16`,
-        // #1183) or not
+        // #1183, with or without the BF16 xn written) or not
         if p[1..5] != [1, 0, 1, 0]
-            || !(0..=1).contains(&p[5])
+            || !(0..=STREAMS16_NO_XNB).contains(&p[PARAM_STREAMS16])
             || p[6..8] != [1, 0]
             || p[P_RS] != 0
             || n.src[5].is_null()
@@ -898,7 +966,7 @@ pub(crate) unsafe fn fold_target(node: *const ffi::ggml_tensor, cuda: bool) -> b
             return false;
         }
         let (res, w, down) = (&*n.src[0], &*n.src[4], &*n.src[5]);
-        (res.type_ == types::F32 || (p[5] == 1 && res.type_ == types::BF16))
+        (res.type_ == types::F32 || (p[PARAM_STREAMS16] != 0 && res.type_ == types::BF16))
             && down.type_ == types::BF16
             && (!cuda || (res.ne[0] == 2560 && res.ne[1] == 4 && w.ne[1] == 4))
     }
@@ -1302,7 +1370,9 @@ unsafe fn cuda_hc_post_norm(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
             } else {
                 std::ptr::null_mut()
             },
-            xnb: if bf16 {
+            // Null where the down matmul rebuilds it (`hc_post_norm_b16_streams`, #1183): the
+            // BF16 streams' kernel then skips it.
+            xnb: if bf16 && params[PARAM_STREAMS16] != STREAMS16_NO_XNB {
                 rn.add(at.xn16) as *mut u16
             } else {
                 std::ptr::null_mut()
