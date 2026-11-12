@@ -101,3 +101,18 @@ fn w4a4_ops_follow_the_small_step_mark() {
     assert!(listed("nvfp4_mm", true) && listed("nvfp4_mm", false));
     assert!(!listed("tp_all_reduce", true) && !listed("tp_all_reduce", false));
 }
+
+/// The verify step's dense matmuls (`nvfp4_mvq`, `fp8_mm`) are captured in small steps only
+/// (#689), like the W4A4 ops, and are in none of the other lists.
+#[test]
+fn verify_matmuls_follow_the_small_step_mark() {
+    assert_eq!(SMALL_MM, &["nvfp4_mvq", "fp8_mm"][..]);
+    for name in SMALL_MM {
+        assert!(
+            !PURE.contains(name) && !SMALL.contains(name) && !COMMIT.contains(name),
+            "{name}"
+        );
+        assert!(listed(name, true), "{name}");
+        assert!(!listed(name, false), "{name}");
+    }
+}
