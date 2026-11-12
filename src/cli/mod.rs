@@ -13,6 +13,7 @@ mod gdn_bench;
 mod gguf;
 mod hc_down_bench;
 mod hc_mix_bench;
+mod hc_up_mix_bench;
 mod head_mm_bench;
 mod hfmodel;
 mod info;
@@ -138,6 +139,10 @@ enum Command {
     /// the norm's BF16 xn and cuBLAS (development).
     #[command(hide = true)]
     HcDownBench(hc_down_bench::HcDownBenchArgs),
+    /// Check and time qwen4exp's mixer up matmul and gated mix with BF16 up weights in its
+    /// kernels (development).
+    #[command(hide = true)]
+    HcUpMixBench(hc_up_mix_bench::HcUpMixBenchArgs),
     /// Check and time the read-each-expert-once NVFP4 expert op against ggml's mmvq
     /// (development).
     #[command(hide = true)]
@@ -245,6 +250,7 @@ async fn run(cli: Cli, numa: Option<legion::hw::numa_bind::Placement>) -> anyhow
         Command::Q8HeadBench(args) => q8_head_bench::run(args),
         Command::HcMixBench(args) => hc_mix_bench::run(args),
         Command::HcDownBench(args) => hc_down_bench::run(args),
+        Command::HcUpMixBench(args) => hc_up_mix_bench::run(args),
         Command::Nvfp4OnceBench(args) => nvfp4_once_bench::run(args),
         Command::Nvfp4MvqBench(args) => nvfp4_mvq_bench::run(args),
         Command::Q4kHeadBench(args) => q4k_head_bench::run(args),
