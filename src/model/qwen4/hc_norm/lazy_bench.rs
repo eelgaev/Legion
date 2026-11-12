@@ -8,7 +8,9 @@
 //! the same graph on the CPU.
 
 use super::super::{hc_chain, hc_up_mix};
-use super::{P_NO_RES, hc_post_norm_rebuilt_xnb, set_hc_lazy_streams, set_moe_fold};
+use super::{
+    COMPACT, P_NO_RES, P_PADDED, hc_post_norm_rebuilt_xnb, set_hc_lazy_streams, set_moe_fold,
+};
 use crate::ggml::{Backend, ComputeAllocator, Context, Graph, Tensor, ffi, types};
 use crate::model::nvfp4_mm::bf16_bits;
 
@@ -53,6 +55,8 @@ pub struct Row {
     pub secs: f64,
     /// FFN mixer norms whose streams their readers make.
     pub made: usize,
+    /// Norm nodes laid out without their unwritten bytes ([`compacted`]).
+    pub compact: usize,
     /// Compute buffer bytes.
     pub buffer: usize,
     /// View nodes nothing reads ([`unread_views`]; each holds memory to the graph's end).
@@ -257,6 +261,28 @@ pub(super) fn made(c: &Chain<'_>) -> usize {
         .count()
 }
 
+/// The norm nodes of an allocated chain laid out without their unwritten bytes
+/// (`compact_plan`): each lazy layer's FFN mixer norm and the attention mixer norm whose streams
+/// it reads.
+pub(super) fn compacted(c: &Chain<'_>) -> usize {
+    c.ffn
+        .iter()
+        .map(|(res, _)| {
+            // SAFETY: nodes of the allocated graph; a norm node's sources are valid tensors.
+            unsafe {
+                let nf = (*res.raw()).view_src;
+                let na = (*(*nf).src[0]).view_src;
+                [nf, na]
+                    .into_iter()
+                    .filter(|&t| {
+                        !t.is_null() && crate::ggml::external_params(&*t)[P_PADDED] == COMPACT
+                    })
+                    .count()
+            }
+        })
+        .sum()
+}
+
 /// View nodes of an allocated `graph` that run, are no output and that no node reads: ggml's
 /// allocator keeps each one's source alive to the end of the graph.
 pub(super) fn unread_views(graph: &Graph<'_>) -> usize {
@@ -339,6 +365,7 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
                 lazy: vi == 1,
                 secs: best[vi],
                 made: made(c),
+                compact: compacted(c),
                 buffer: *buffer,
                 unread: unread_views(&c.graph),
                 values,

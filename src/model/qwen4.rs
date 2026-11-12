@@ -32,8 +32,8 @@ pub use hc_mix16::{set_hc_pre, set_mix16, set_rebuild_bf16 as set_mix_rebuild_bf
 mod hc_norm;
 pub use hc_norm::lazy_bench as hc_lazy_bench;
 pub(crate) use hc_norm::{
-    FoldSum, fold_moe, fold_target, lazy_fold_target, lazy_parts, lazy_streams, moe_fold,
-    set_lazy_fold, set_no_res,
+    FoldSum, compact_plan, fold_moe, fold_target, lazy_fold_target, lazy_parts, lazy_streams,
+    moe_fold, set_compact, set_lazy_fold, set_no_res,
 };
 pub use hc_norm::{
     hc_fuse, set_fused_post_norm, set_generic_post_norm, set_hc_bf16, set_hc_fuse,
