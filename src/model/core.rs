@@ -38,6 +38,7 @@ pub use gdn::bench as gdn_bench;
 pub use gdn::set_gdn;
 pub use gdn::set_gdn_decode;
 pub use gdn::set_gdn_pad_skip;
+pub use gdn::set_gdn_replay_few;
 pub use gdn::set_gdn_replay_staged;
 pub use gdn_mma::{set_gdn_mma, set_gdn_staged};
 pub use gdn_scan::set_gdn_scan;
@@ -80,6 +81,8 @@ pub use q8_head::set_q8_head;
 pub use q8_mv::set_q8_mv;
 pub(crate) mod mtp;
 pub mod mtp_moe;
+pub mod mvf_bf16;
+pub use mvf_bf16::set_mvf_ab;
 pub mod pad_rows;
 pub(crate) mod paged;
 pub mod pair;
@@ -2293,6 +2296,21 @@ impl Model {
         Some(joined::split_run(ctx, r, &rows))
     }
 
+    /// Layer `il`'s BF16 projections `names` of `x` (2 to [`mvf_bf16::MAX_WEIGHTS`] plain
+    /// weights: a DeltaNet layer's alpha and beta) in one [`mvf_bf16`] launch where the op
+    /// takes them (#689): steps of 1-8 tokens, where [`Self::lmm`] runs each on ggml's
+    /// `mul_mat_vec_f`, whose bits each result has. `None`: run [`Self::lmm`] for each.
+    pub(crate) fn lmm_mvf<'a>(
+        &'a self,
+        ctx: &'a Context,
+        il: usize,
+        names: &[&str],
+        x: Tensor<'a>,
+    ) -> Option<Vec<Tensor<'a>>> {
+        let ws = self.dense_weights(il, names)?;
+        mvf_bf16::takes(&ws, x).then(|| mvf_bf16::mul_mat(ctx, &ws, x))
+    }
+
     /// Layer `il`'s projections `names` of `x` (2 to [`dense_mv::MAX_WEIGHTS`] BF16 weights
     /// without scales) in one [`dense_mv`] launch, where the op takes them together
     /// ([`dense_mv::takes_all`]): decode steps of an NVFP4 checkpoint's DeltaNet `qkv` and `z`,
@@ -3247,11 +3265,23 @@ impl Model {
                 ),
             },
         };
-        // Small steps: alpha and beta from one matmul (#256), whose strided rows the op reads.
-        let (alpha_raw, beta_raw) = match ab.or_else(|| {
-            prep.then(|| self.lmm_joined(ctx, il, "ssm_alpha.weight", "ssm_beta.weight", h))
-                .flatten()
-        }) {
+        // Small steps: alpha and beta from one matmul (#256), whose strided rows the op reads;
+        // BF16 ones of 1-8 tokens from one `mul_mat_vec_f` twin launch (#689).
+        let ab_names = ["ssm_alpha.weight", "ssm_beta.weight"];
+        let (alpha_raw, beta_raw) = match ab
+            .or_else(|| {
+                prep.then(|| self.lmm_joined(ctx, il, ab_names[0], ab_names[1], h))
+                    .flatten()
+            })
+            .or_else(|| {
+                match prep
+                    .then(|| self.lmm_mvf(ctx, il, &ab_names, h))
+                    .flatten()?[..]
+                {
+                    [alpha, beta] => Some((alpha, beta)),
+                    _ => None,
+                }
+            }) {
             Some(ab) => ab,
             None => {
                 let beta = self.lmm_q(ctx, il, "ssm_beta.weight", h, hq)?;
