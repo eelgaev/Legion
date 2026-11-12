@@ -325,6 +325,8 @@ mod cuda {
                 let mut a: FuncAttributes = std::mem::zeroed();
                 ok = cudaFuncGetAttributes(&mut a, f) == 0
                     && a.binary_version >= 80
+                    // PTX built for sm_70 holds the __trap() body even when JIT-built for 12.x.
+                    && a.ptx_version >= 80
                     && cudaFuncSetAttribute(f, FUNC_ATTR_MAX_DYNAMIC_SMEM, legion_hc_down_smem[i])
                         == 0;
                 if ok {

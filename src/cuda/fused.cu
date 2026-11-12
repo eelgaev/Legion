@@ -1739,7 +1739,9 @@ __global__ void __launch_bounds__(HC_THREADS, 4) hc_post_norm_b16_kernel(legion_
         acc[j] = 0.0f;
     }
     const float2 * g = (const float2 *) p.g;
-    __nv_bfloat162 * xnb = (__nv_bfloat162 *) ((__nv_bfloat16 *) p.xnb + t * n);
+    // (Null where the down matmul rebuilds xnb itself, src/cuda/hc_down.cu, #1183.)
+    __nv_bfloat162 * xnb =
+        p.xnb != nullptr ? (__nv_bfloat162 *) ((__nv_bfloat16 *) p.xnb + t * n) : nullptr;
 #pragma unroll
     for (int i = 0; i < PAIRS; i++) {
         const int k = threadIdx.x + i * HC_THREADS;
@@ -1748,8 +1750,7 @@ __global__ void __launch_bounds__(HC_THREADS, 4) hc_post_norm_b16_kernel(legion_
         // (rn * scale) * gamma, as up_mix_bf16 rebuilds it from the BF16 streams
         const float y0 = __fmul_rn(__fmul_rn(v.x, scale[i / PS]), gk.x);
         const float y1 = __fmul_rn(__fmul_rn(v.y, scale[i / PS]), gk.y);
-        // (Null where the down matmul rebuilds xnb itself, src/cuda/hc_down.cu, #1183.)
-        if (p.xnb != nullptr) {
+        if (xnb != nullptr) {
             xnb[k] = __floats2bfloat162_rn(y0, y1);
         }
 #pragma unroll

@@ -174,9 +174,13 @@ fn build<'a>(ctx: &'a Context, w: &Weights<'a>, i: &Inputs<'a>, variant: &str) -
 }
 
 fn check_config(cfg: &Config) -> Result<(), String> {
-    if cfg.copies == 0 || cfg.e % super::BK != 0 || cfg.tokens.iter().any(|&n| n < 1) {
+    if cfg.copies == 0
+        || cfg.rounds == 0
+        || cfg.e % super::BK != 0
+        || cfg.tokens.iter().any(|&n| n < 1)
+    {
         return Err(format!(
-            "copies > 0, e a multiple of 32, tokens > 0: {cfg:?}"
+            "copies > 0, rounds > 0, e a multiple of 32, tokens > 0: {cfg:?}"
         ));
     }
     Ok(())

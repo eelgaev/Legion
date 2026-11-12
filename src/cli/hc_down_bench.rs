@@ -5,6 +5,7 @@
 //! `CUDA_VISIBLE_DEVICES`). `--check` compares the rebuilt values with the norm's xn instead.
 
 use clap::Args;
+use legion::model::qwen4::hc_down::MIN_TOKENS;
 use legion::model::qwen4::hc_down::bench::{self, Config};
 
 #[derive(Args)]
@@ -47,9 +48,10 @@ pub fn run(args: HcDownBenchArgs) -> anyhow::Result<()> {
                 c.tokens, c.what, c.values, c.differing, c.rel
             );
         }
+        // Below MIN_TOKENS cuBLAS may split k, so only its rel counts there.
         let bad = checks
             .iter()
-            .filter(|c| c.what != "vs_cublas" && c.differing > 0)
+            .filter(|c| c.differing > 0 && (c.what != "vs_cublas" || c.tokens >= MIN_TOKENS))
             .count();
         anyhow::ensure!(bad == 0, "{bad} checks differ");
         println!("rebuilt values equal the BF16 xn; streams, scales and inject unmoved");
