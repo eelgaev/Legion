@@ -100,6 +100,22 @@ pub fn set_gdn_replay_staged(on: bool) {
     REPLAY_STAGED.store(on, Ordering::Relaxed);
 }
 
+/// Whether [`rows_replay`] runs the few-sequence kernel (`gdn_replay_few_kernel`, #689) for
+/// steps of at most [`REPLAY_FEW_MAX_SEQS`] sequences and 8 tokens on a GPU [`gpu_for`] chose.
+static REPLAY_FEW: AtomicBool = AtomicBool::new(true);
+
+/// The most sequences a [`rows_replay`] launch runs the few-sequence kernel for: it issues every
+/// load a CTA can at once, which wins where a step is a chain of round trips (one or a few
+/// users), not where it is bandwidth bound.
+#[cfg(feature = "cuda")]
+const REPLAY_FEW_MAX_SEQS: i64 = 4;
+
+/// Sets whether launches from now on run the few-sequence replay kernel (the same bits as the
+/// per-lane kernel). On by default; `legion serve --no-gdn-replay-few` turns it off.
+pub fn set_gdn_replay_few(on: bool) {
+    REPLAY_FEW.store(on, Ordering::Relaxed);
+}
+
 /// Whether [`rows_replay`] skips a verify step's padding tokens where it is given their row map.
 static PAD_SKIP: AtomicBool = AtomicBool::new(true);
 
@@ -847,16 +863,27 @@ pub(crate) fn set_replay_variant(v: i32) {
     REPLAY_VARIANT.store(v, Ordering::Relaxed);
 }
 
-/// The variant a [`rows_replay`] launch passes: the forced one, else the kernel's default (-1)
-/// where staging is on and the launch's GPU (the current device) chosen, else the per-lane
-/// kernel (0).
+/// The variant a [`rows_replay`] launch of `n_seqs` sequences of `n_tokens` passes: the forced
+/// one, else on a GPU [`gpu_for`] chose (the current device) the staged kernel (-1) where
+/// staging is on, the few-sequence kernel (2) where it is on and the step fits it (ggml's CTA
+/// shape, as the per-lane kernel's arithmetic does not depend on it), else the per-lane kernel
+/// (0).
 #[cfg(feature = "cuda")]
-fn replay_variant() -> i32 {
+fn replay_variant(n_seqs: i64, n_tokens: i64) -> i32 {
     let v = REPLAY_VARIANT.load(Ordering::Relaxed);
     if v >= 0 {
-        v
-    } else if REPLAY_STAGED.load(Ordering::Relaxed) && gpu_for(crate::hw::per_device::current()) {
+        return v;
+    }
+    if !gpu_for(crate::hw::per_device::current()) {
+        0
+    } else if REPLAY_STAGED.load(Ordering::Relaxed) {
         -1
+    } else if REPLAY_FEW.load(Ordering::Relaxed)
+        && GDN_WARPS.load(Ordering::Relaxed) == 0
+        && n_seqs <= REPLAY_FEW_MAX_SEQS
+        && (1..=8).contains(&n_tokens)
+    {
+        2
     } else {
         0
     }
@@ -931,7 +958,7 @@ unsafe fn cuda_gdn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), St
             p.rp2 = r.nb[2] as i64 / 4;
             p.rp_t = r.ne[1];
             let params = crate::ggml::external_params(dst);
-            p.replay_variant = replay_variant();
+            p.replay_variant = replay_variant(p.n_seqs, p.n_tokens);
             if mode & MODE_PAD != 0 {
                 let at = params[2] as u32 as u64 | (params[3] as u32 as u64) << 32;
                 p.arrive = at as usize as *mut i32;
