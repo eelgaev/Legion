@@ -26,7 +26,12 @@ pub fn run(args: QsaBenchArgs) -> anyhow::Result<()> {
     use legion::model::core::KvTypes;
     use legion::model::qwen4::{PromptKernel, qsa_bench};
     let mut gpu = legion::ggml::backend_by_name("CUDA0")?;
-    let kernels = [PromptKernel::Mma, PromptKernel::Gb, PromptKernel::Auto];
+    let kernels = [
+        PromptKernel::Mma,
+        PromptKernel::Gb,
+        PromptKernel::Gw,
+        PromptKernel::Auto,
+    ];
     println!(
         "{:<8} {:>7} {:>6} {:>5} {:>9} {:>8} {:>18}",
         "pools", "ctx", "tokens", "kern", "ms/call", "vs mma", "output bits"

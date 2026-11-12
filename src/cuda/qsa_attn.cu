@@ -14,8 +14,8 @@
 //
 // The prompt kernels per architecture live in sm70/qsa_attn.cuh (mma.sync.m8n8k4, attn_kernel),
 // sm80/qsa_attn.cuh (mma.sync.m16n8k16, attn_mma_kernel) and sm80/qsa_attn_gb10.cuh
-// (attn_gb_kernel: attn_mma_kernel's bits, two CTAs per SM, on compute capability 12.x and
-// 8.0-8.7),
+// (attn_gb_kernel on 8.0-8.7, attn_gw_kernel on compute capability 12.x: attn_mma_kernel's
+// bits, two CTAs per SM),
 // included below; launch_attn picks one per device at run time (use_mma, use_gb). The other
 // kernels are portable and stay here.
 
@@ -92,9 +92,9 @@ struct legion_qsa_attn {
     // decode_fast_kernel; 0 lets the launcher choose. Tests: -1 runs decode_kernel, the
     // reference the fast kernel matches bit for bit.
     int32_t hgroups;
-    // The F16 prompt kernel on sm_80+ (#828): 0 the launcher's choice (attn_gb_kernel on compute
-    // capability 12.x, attn_mma_kernel on the others), 1 attn_mma_kernel, 2 attn_gb_kernel. Both
-    // give the same bits.
+    // The F16 prompt kernel on sm_80+ (#828): 0 the launcher's choice (attn_gw_kernel on compute
+    // capability 12.x, attn_gb_kernel on Ampere, attn_mma_kernel on the others),
+    // 1 attn_mma_kernel, 2 attn_gb_kernel, 3 attn_gw_kernel (#1183). All give the same bits.
     int32_t mma_kernel;
 };
 
@@ -442,7 +442,8 @@ __device__ __forceinline__ void qrun_unpack(const char * row, int W, __half * ds
 // The prompt kernel for sm_80 and newer: mma.sync.m16n8k16 + cp.async (attn_mma_kernel).
 #include "sm80/qsa_attn.cuh"
 
-// The GB10 prompt kernel: attn_mma_kernel's bits, two CTAs per SM (attn_gb_kernel).
+// The GB10 prompt kernels: attn_mma_kernel's bits, two CTAs per SM (attn_gb_kernel,
+// attn_gw_kernel).
 #include "sm80/qsa_attn_gb10.cuh"
 
 // --qsa-attn-chain on a GPU running attn_mma_kernel: said once per process.
@@ -475,31 +476,33 @@ bool use_mma() {
 // Whether the current device takes attn_gb_kernel<HD> by default: compute capability 12.x (the
 // GB10 and the other consumer Blackwell GPUs, 100 KB of shared memory per SM) or Ampere, 8.0 to
 // 8.7 (#1212: the sm_86 code took 0.48-0.51x attn_mma_kernel's time at 8K-32K, 4096-token
-// steps; not 8.9), running attn_mma_kernel (use_mma). `forced` (legion_qsa_attn::mma_kernel 2)
-// takes it on any sm_80+.
+// steps; not 8.9), running attn_mma_kernel (use_mma). 12.x takes its warp-local variant,
+// attn_gw_kernel (#1183: 0.88x attn_gb_kernel's time at 8K-123K, 4096-token steps, on a GB10;
+// not measured on Ampere). Returns 0 (neither), 2 (attn_gb_kernel) or 3 (attn_gw_kernel), as
+// legion_qsa_attn::mma_kernel, whose 2 and 3 force either on any sm_80+.
 template <int HD>
-bool use_gb(bool forced) {
+int use_gb(int forced) {
     if (!use_mma<HD>()) {
-        return false;
+        return 0;
     }
-    if (forced) {
-        return true;
+    if (forced == 2 || forced == 3) {
+        return forced;
     }
-    static std::atomic<int> state[64];  // per device: 0 unknown, 1 yes, 2 no
+    static std::atomic<int> state[64];  // per device: -1 unknown, else the kernel (0, 2 or 3)
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
-        return false;
+        return 0;
     }
-    int s = state[dev].load(std::memory_order_acquire);
-    if (s == 0) {
+    int s = state[dev].load(std::memory_order_acquire) - 1;
+    if (s < 0) {
         int major = 0, minor = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
         (void) cudaGetLastError();
-        s = major == 12 || (major == 8 && minor <= 7) ? 1 : 2;
-        state[dev].store(s, std::memory_order_release);
+        s = major == 12 ? 3 : major == 8 && minor <= 7 ? 2 : 0;
+        state[dev].store(s + 1, std::memory_order_release);
     }
-    return s == 1;
+    return s;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1441,15 +1444,17 @@ int launch_attn(const legion_qsa_attn & p, cudaStream_t st) {
                                 "only; this GPU runs the mma.m16n8k16 kernel\n");
             }
         }
-        if (p.mma_kernel != 1 && use_gb<HD>(p.mma_kernel == 2)) {
+        const int gb = p.mma_kernel == 1 ? 0 : use_gb<HD>(p.mma_kernel);
+        if (gb != 0) {
             // ~39 KB at HD 256: under the 48 KB default, two CTAs per SM with the largest
             // shared-memory carveout.
             const int bytes = (int) sizeof(GbSmem<HD>);
-            if (cudaFuncSetAttribute(attn_gb_kernel<HD>, cudaFuncAttributePreferredSharedMemoryCarveout,
+            void (*kern)(legion_qsa_attn) = gb == 3 ? attn_gw_kernel<HD> : attn_gb_kernel<HD>;
+            if (cudaFuncSetAttribute(kern, cudaFuncAttributePreferredSharedMemoryCarveout,
                                      cudaSharedmemCarveoutMaxShared) != cudaSuccess) {
                 return 2;
             }
-            attn_gb_kernel<HD><<<dim3(p.grid[0], p.grid[1]), THREADS, bytes, st>>>(p);
+            kern<<<dim3(p.grid[0], p.grid[1]), THREADS, bytes, st>>>(p);
             return cudaGetLastError() == cudaSuccess ? 0 : 2;
         }
         const int bytes = (int) sizeof(MmaSmem<HD>);
