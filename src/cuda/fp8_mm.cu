@@ -29,6 +29,7 @@
 
 #include "ggml-cuda/common.cuh"
 #include "device_cache.cuh"
+#include "launch_pdl.cuh"
 
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -270,15 +271,17 @@ void launch_sliced_t(const legion_fp8_mm & p, cudaStream_t st) {
         legion_device::smem_opt_in(opted_in, fp8_gemm_sliced<KW, TOK, STAGES, MT, MINB>, (int) C::SMEM);
     }
     const dim3 grid((unsigned) ((p.m + C::ROWS - 1) / C::ROWS), (unsigned) ((p.n + TOK - 1) / TOK));
-    fp8_gemm_sliced<KW, TOK, STAGES, MT, MINB><<<grid, 32 * KW, C::SMEM, st>>>(p);
+    launch_pdl(fp8_gemm_sliced<KW, TOK, STAGES, MT, MINB>, grid, 32 * KW, (int) C::SMEM, st, p);
 }
 
 // The sliced-K tiles: (K warps, tokens per CTA, stages, m16 row tiles, CTAs per SM). Tile i is
 // legion_fp8_mm::sliced_k = 2 + i; sliced_tile() picks one by n and m, the others are there for
 // tuning (cuda_sliced_k_timings in tests/fp8.rs).
-constexpr int SLICED_TILES = 12;
-constexpr int SLICED_KW[SLICED_TILES] = {16, 8, 4, 8, 8, 4, 8, 4, 8, 4, 2, 4};
-constexpr int SLICED_TOK[SLICED_TILES] = {16, 16, 16, 24, 32, 32, 32, 64, 64, 48, 64, 64};
+// Tiles 12-19 keep tile 0's 16 K warps (so its sums, bit for bit) with 8 tokens, two stages,
+// 32 rows or two CTAs per SM kept resident (#689; `legion fp8-sliced-bench` times them).
+constexpr int SLICED_TILES = 20;
+constexpr int SLICED_KW[SLICED_TILES] = {16, 8, 4, 8, 8, 4, 8, 4, 8, 4, 2, 4, 16, 16, 16, 16, 16, 16, 16, 16};
+constexpr int SLICED_TOK[SLICED_TILES] = {16, 16, 16, 24, 32, 32, 32, 64, 64, 48, 64, 64, 8, 8, 8, 8, 16, 16, 16, 8};
 
 bool launch_sliced_tile(int tile, const legion_fp8_mm & p, cudaStream_t st) {
     if (tile < 0 || tile >= SLICED_TILES || p.k % (SLICED_KW[tile] * sk::TILE_K) != 0 || p.n > SLICED_TOK[tile] * 65535) {
@@ -296,7 +299,15 @@ bool launch_sliced_tile(int tile, const legion_fp8_mm & p, cudaStream_t st) {
         case 8: launch_sliced_t<8, 64, 1, 2, 1>(p, st); break;
         case 9: launch_sliced_t<4, 48, 1, 2, 2>(p, st); break;
         case 10: launch_sliced_t<2, 64, 1, 2, 4>(p, st); break;
-        default: launch_sliced_t<4, 64, 2, 2, 1>(p, st); break;
+        case 11: launch_sliced_t<4, 64, 2, 2, 1>(p, st); break;
+        case 12: launch_sliced_t<16, 8, 1, 1, 1>(p, st); break;
+        case 13: launch_sliced_t<16, 8, 2, 1, 1>(p, st); break;
+        case 14: launch_sliced_t<16, 8, 1, 2, 1>(p, st); break;
+        case 15: launch_sliced_t<16, 8, 1, 1, 2>(p, st); break;
+        case 16: launch_sliced_t<16, 16, 2, 1, 1>(p, st); break;
+        case 17: launch_sliced_t<16, 16, 1, 2, 1>(p, st); break;
+        case 18: launch_sliced_t<16, 16, 1, 1, 2>(p, st); break;
+        default: launch_sliced_t<16, 8, 2, 2, 1>(p, st); break;
     }
     return true;
 }
@@ -304,11 +315,12 @@ bool launch_sliced_tile(int tile, const legion_fp8_mm & p, cudaStream_t st) {
 // The sliced-K tile for n tokens, m rows and k (a multiple of SLICED_K_ALIGN), from GB10 timings
 // of the 27B's FP8 shapes (#664): the preferred one, or the 4-warp tile of the same width when k
 // is not a multiple of its K group. 33-64 tokens on 8 warps only with enough 32-row CTAs for
-// the SMs (at m = 5120 the 8-warp tile runs one 80 KiB CTA per SM and loses 20-35%).
+// the SMs (at m = 5120 the 8-warp tile runs one 80 KiB CTA per SM and loses 20-35%). Up to 16
+// tokens tile 0's two-stage twin (tile 16, the same sums): 0.5-1.7% faster at 8 tokens (#689).
 int sliced_tile(int64_t n, int64_t m, int64_t k) {
     int tile, narrow;
     if (n <= 16) {
-        tile = 0; narrow = 2;
+        tile = 16; narrow = 2;
     } else if (n <= 32) {
         tile = 6; narrow = 5;
     } else {

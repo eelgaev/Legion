@@ -11,9 +11,9 @@ namespace {
 
 // Launches `kernel` on `s` with programmatic stream serialization: it may start before the
 // kernel ahead of it on the stream ends, and waits for it in griddepcontrol.wait. Devices other
-// than compute capability 12.x with the kernel's sm_80+ code (legion_device::sm12x_device) get a
-// plain launch, and so does Hopper (9.0) unless --hopper-pdl turns it on there
-// (legion_device::pdl_device; untested on hardware, #1215).
+// than compute capability 12.x running the kernel's sm_90+ code (legion_device::sm12x_device and
+// sm90_code: sm_80 code has no wait) get a plain launch, and so does Hopper (9.0) unless
+// --hopper-pdl turns it on there (legion_device::pdl_device; untested on hardware, #1215).
 template <typename... KArgs, typename... Args>
 void launch_pdl(void (*kernel)(KArgs...), dim3 grid, int threads, int smem, cudaStream_t s, Args... args) {
     cudaLaunchAttribute attr{};

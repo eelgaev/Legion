@@ -143,11 +143,38 @@ bool hopper_pdl_device(void (*probe)(KArgs...)) {
     return st == 1;
 }
 
+// Whether this binary runs sm_90+ code of `probe` on the current device (binaryVersion and
+// ptxVersion >= 90). The kernels' wait for the kernel ahead (griddepcontrol.wait) is compiled for
+// sm_90+ only: sm_80 code (or sm_80 PTX JIT-compiled for a newer device) has no wait, so it must
+// never be launched early.
+template <typename... KArgs>
+bool sm90_code(void (*probe)(KArgs...)) {
+    static std::atomic<int> state[GGML_CUDA_MAX_DEVICES];  // 0 unknown, 1 yes, 2 no
+    const int dev = current();
+    if (dev < 0) {
+        return false;
+    }
+    int st = state[dev].load(std::memory_order_relaxed);
+    if (st == 0) {
+        cudaFuncAttributes fa{};
+        const cudaError_t before = cudaPeekAtLastError();
+        const bool code = cudaFuncGetAttributes(&fa, probe) == cudaSuccess && fa.binaryVersion >= 90 &&
+                          fa.ptxVersion >= 90;
+        if (!code) {
+            clear_own_error(before);
+        }
+        st = code ? 1 : 2;
+        state[dev].store(st, std::memory_order_relaxed);
+    }
+    return st == 1;
+}
+
 // Whether `probe` launches as a programmatic dependent launch on the current device: compute
-// capability 12.x (sm12x_device), and 9.0 under --hopper-pdl (hopper_pdl_device).
+// capability 12.x (sm12x_device) running sm_90+ code of it (sm90_code), and 9.0 under
+// --hopper-pdl (hopper_pdl_device).
 template <typename... KArgs>
 bool pdl_device(void (*probe)(KArgs...)) {
-    return sm12x_device(probe) ||
+    return (sm12x_device(probe) && sm90_code(probe)) ||
            (hopper_pdl_flag().load(std::memory_order_relaxed) && hopper_pdl_device(probe));
 }
 

@@ -9,6 +9,7 @@ mod cpu_bench;
 mod dense_mv_bench;
 mod ep_place;
 mod expert_mv_ptx_bench;
+mod fp8_sliced_bench;
 mod gdn_bench;
 mod gguf;
 mod hc_down_bench;
@@ -150,6 +151,10 @@ enum Command {
     /// Check and time the tensor-core NVFP4 dense matvec op against ggml's mmvq (development).
     #[command(hide = true)]
     Nvfp4MvqBench(nvfp4_mvq_bench::Nvfp4MvqBenchArgs),
+    /// Time the sliced-K FP8 GEMM's tiles and check their bits against the picked one
+    /// (development).
+    #[command(hide = true)]
+    Fp8SlicedBench(fp8_sliced_bench::Fp8SlicedBenchArgs),
     /// Check and time the GB10 Q4_K draft LM head op against ggml's mmvq (development).
     #[command(hide = true)]
     Q4kHeadBench(q4k_head_bench::Q4kHeadBenchArgs),
@@ -253,6 +258,7 @@ async fn run(cli: Cli, numa: Option<legion::hw::numa_bind::Placement>) -> anyhow
         Command::HcUpMixBench(args) => hc_up_mix_bench::run(args),
         Command::Nvfp4OnceBench(args) => nvfp4_once_bench::run(args),
         Command::Nvfp4MvqBench(args) => nvfp4_mvq_bench::run(args),
+        Command::Fp8SlicedBench(args) => fp8_sliced_bench::run(args),
         Command::Q4kHeadBench(args) => q4k_head_bench::run(args),
         Command::HeadMmBench(args) => head_mm_bench::run(args),
         Command::Q8GroupCheck(args) => q8_group_check::run(args),
