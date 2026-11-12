@@ -150,3 +150,52 @@ fn each_gpu_of_a_mixed_box_answers_for_itself() {
         assert_eq!(gpu_for_by(None, engine, test_cc), engine);
     }
 }
+
+#[test]
+fn tuned_shapes_parse_and_plan() {
+    assert_eq!(Tune::parse("").unwrap(), Tune::default());
+    assert_eq!(
+        Tune::parse("r32k2a20").unwrap(),
+        Tune {
+            region: 32,
+            ctas: 0,
+            chunks: 2,
+            ahead: 20
+        }
+    );
+    assert_eq!(Tune::parse("c2").unwrap().shape(), (8, 2));
+    assert_eq!(Tune::default().shape(), (REGION_5_8, 1));
+    assert!(Tune::parse("r12").is_err());
+    assert!(Tune::parse("r32c2").is_err());
+    assert!(Tune::parse("x1").is_err());
+    assert!(Tune::parse("r").is_err());
+    // 1-4 columns keep their kernel; 5-8 take 8-row regions by default.
+    assert_eq!(tuned_kernel_index(4, Tune::parse("r8").unwrap()), Ok(1));
+    assert_eq!(tuned_kernel_index(8, Tune::default()), Ok(3));
+    assert_eq!(tuned_kernel_index(5, Tune::parse("r16").unwrap()), Ok(2));
+    assert_eq!(tuned_kernel_index(8, Tune::parse("r8c2").unwrap()), Ok(6));
+    // The 16-row tune is the 1-4 column plan; the 8-row default whole rows at k 5120.
+    for (k, rows) in [(5120, 17408), (17408, 5120)] {
+        assert_eq!(
+            Tune::parse("r16").unwrap().plan(k, rows, SMEM_12X),
+            plan(k, rows, SMEM_12X)
+        );
+    }
+    assert_eq!(
+        Tune::default().plan(5120, 17408, SMEM_12X),
+        Plan::with_region(5120, 1, REGION_5_8 + AHEAD, SMEM_12X, REGION_5_8)
+    );
+    assert!(Tune::default().plan(5120, 17408, SMEM_12X).is_some());
+    assert!(Tune::default().plan(17408, 5120, SMEM_12X).is_some());
+    // Two CTAs an SM: rings within 49 KiB.
+    let p = Tune::parse("r16c2")
+        .unwrap()
+        .plan(5120, 17408, SMEM_12X)
+        .unwrap();
+    assert!(p.smem <= 49 * 1024 && p.ns == REGION + AHEAD, "{p:?}");
+    let p = Tune::parse("r32")
+        .unwrap()
+        .plan(5120, 17408, SMEM_12X)
+        .unwrap();
+    assert!(p.ns == 32 + AHEAD && p.smem <= SMEM_12X, "{p:?}");
+}

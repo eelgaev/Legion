@@ -20,7 +20,7 @@
 
 #[cfg(feature = "cuda")]
 use std::os::raw::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::ggml::{Context, ExternalOp, Tensor, external_params, ffi, types};
 
@@ -65,8 +65,12 @@ const SMEM_12X: usize = 99 * 1024;
 /// The kernel's warps (`MV_WARPS`).
 const WARPS: usize = 8;
 
-/// Rows of a CTA's region (`MV_R`).
+/// Rows of a CTA's region (the kernel's `R`) at 1-4 columns.
 const REGION: usize = 16;
+
+/// Rows of a CTA's region at 5-8 columns (#689: 8 reads the 27B's FFN weights 0.5-1.5% faster
+/// than 16 on a GB10 at 8 columns; the same bits).
+const REGION_5_8: usize = 8;
 
 /// Pieces the ring holds beyond a chunk of a region (the next chunk's first rows in flight;
 /// 12 measured best of 4-16 on a GB10 at 8 columns).
@@ -86,8 +90,19 @@ impl Plan {
     /// bytes, the pieces are whole 16-byte units and each spans at most two of ggml's 64-block
     /// steps (the kernel holds a piece's activations in registers: `MV_ITERS`).
     pub fn with(k: usize, chunks: usize, ns: usize, smem: usize) -> Option<Plan> {
+        Self::with_region(k, chunks, ns, smem, REGION)
+    }
+
+    /// [`Plan::with`] for regions of `region` rows (the kernel's `R`: 8, 16 or 32).
+    pub fn with_region(
+        k: usize,
+        chunks: usize,
+        ns: usize,
+        smem: usize,
+        region: usize,
+    ) -> Option<Plan> {
         let bpr = k / 64;
-        if chunks == 0 || !bpr.is_multiple_of(4 * chunks) || ns <= REGION {
+        if chunks == 0 || !bpr.is_multiple_of(4 * chunks) || ns <= region {
             return None;
         }
         let cb = bpr / chunks;
@@ -95,7 +110,7 @@ impl Plan {
             return None;
         }
         let pitch = bpr / chunks * BLOCK_BYTES + 16;
-        let part = WARPS * 2 * REGION * 8 * 4;
+        let part = WARPS * 2 * region * 8 * 4;
         let bytes = ns * (pitch + 8) + part;
         (bytes <= smem).then_some(Plan {
             chunks,
@@ -115,6 +130,116 @@ pub fn plan(k: usize, rows: usize, smem: usize) -> Option<Plan> {
     [1, 2, 4, 8, 16]
         .into_iter()
         .find_map(|c| Plan::with(k, c, REGION + AHEAD, smem))
+}
+
+/// The launch shape of the 5-8 column matvec; other than the default for tuning only (`legion
+/// nvfp4-mvq-bench --tune`): every shape gives the same bits (each row's sums keep ggml's order;
+/// only which CTA computes a row, and when its weights are read, change). Zero fields keep the
+/// default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Tune {
+    /// Rows of a region: 8, 16 or 32 (default [`REGION_5_8`]).
+    pub region: usize,
+    /// CTAs per SM: 1 or 2 (default 1; with 2, rings of at most 49 KiB).
+    pub ctas: usize,
+    /// Pieces a row (default: the fewest that fit).
+    pub chunks: usize,
+    /// Pieces the ring holds beyond a region's chunk (default [`AHEAD`]).
+    pub ahead: usize,
+}
+
+impl Tune {
+    /// `r<region>c<ctas>k<chunks>a<ahead>`, any field left out (e.g. `r32a20`).
+    pub fn parse(s: &str) -> Result<Tune, String> {
+        let mut t = Tune::default();
+        let mut rest = s.trim();
+        while !rest.is_empty() {
+            let key = rest.as_bytes()[0];
+            let digits = rest[1..]
+                .find(|c: char| !c.is_ascii_digit())
+                .map_or(rest.len(), |i| i + 1);
+            let v: usize = rest[1..digits]
+                .parse()
+                .map_err(|_| format!("tune {s:?}: no number after {:?}", key as char))?;
+            match key {
+                b'r' => t.region = v,
+                b'c' => t.ctas = v,
+                b'k' => t.chunks = v,
+                b'a' => t.ahead = v,
+                _ => return Err(format!("tune {s:?}: unknown key {:?}", key as char)),
+            }
+            rest = &rest[digits..];
+        }
+        if ![0, 8, 16, 32].contains(&t.region) || t.ctas > 2 {
+            return Err(format!(
+                "tune {s:?}: regions of 8, 16 or 32 rows, 1 or 2 CTAs"
+            ));
+        }
+        if t.region == 32 && t.ctas == 2 {
+            return Err(format!("tune {s:?}: 32-row regions run one CTA per SM"));
+        }
+        Ok(t)
+    }
+
+    /// The region rows and CTAs per SM, defaults filled in.
+    fn shape(self) -> (usize, usize) {
+        (
+            if self.region == 0 {
+                REGION_5_8
+            } else {
+                self.region
+            },
+            self.ctas.max(1),
+        )
+    }
+
+    /// The 5-8 column plan for rows of `k` values: the fewest pieces a row (or `chunks`) whose
+    /// ring holds a chunk of a region and `ahead` more pieces.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    fn plan(self, k: usize, rows: usize, smem: usize) -> Option<Plan> {
+        if !rows.is_multiple_of(ROW_MULTIPLE as usize) {
+            return None;
+        }
+        let (region, ctas) = self.shape();
+        let smem = if ctas == 2 { smem.min(SMEM_2CTA) } else { smem };
+        let ns = region + if self.ahead == 0 { AHEAD } else { self.ahead };
+        let chunks: &[usize] = if self.chunks == 0 {
+            &[1, 2, 4, 8, 16]
+        } else {
+            std::slice::from_ref(&self.chunks)
+        };
+        chunks
+            .iter()
+            .find_map(|&c| Plan::with_region(k, c, ns, smem, region))
+    }
+}
+
+/// Shared memory a CTA may take when two run on an SM (of the 100 KiB an SM of compute
+/// capability 12.x has, 1 KiB a CTA reserved).
+const SMEM_2CTA: usize = 49 * 1024;
+
+static TUNE_REGION: AtomicUsize = AtomicUsize::new(0);
+static TUNE_CTAS: AtomicUsize = AtomicUsize::new(0);
+static TUNE_CHUNKS: AtomicUsize = AtomicUsize::new(0);
+static TUNE_AHEAD: AtomicUsize = AtomicUsize::new(0);
+
+/// Launches from now on take `tune` (tuning only; [`Tune::default`] is the served shape).
+pub fn set_tune(tune: Tune) {
+    TUNE_REGION.store(tune.region, Ordering::Relaxed);
+    TUNE_CTAS.store(tune.ctas, Ordering::Relaxed);
+    TUNE_CHUNKS.store(tune.chunks, Ordering::Relaxed);
+    TUNE_AHEAD.store(tune.ahead, Ordering::Relaxed);
+}
+
+/// The launch shape [`set_tune`] set.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn tune() -> Tune {
+    Tune {
+        region: TUNE_REGION.load(Ordering::Relaxed),
+        ctas: TUNE_CTAS.load(Ordering::Relaxed),
+        chunks: TUNE_CHUNKS.load(Ordering::Relaxed),
+        ahead: TUNE_AHEAD.load(Ordering::Relaxed),
+    }
 }
 
 static ON: AtomicBool = AtomicBool::new(true);
@@ -286,6 +411,26 @@ fn kernel_index(n: usize) -> usize {
     1 + usize::from(n > 4)
 }
 
+/// The matvec of the kernel table for `n` columns, at 5-8 with `tune`'s region rows and CTAs
+/// per SM.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn tuned_kernel_index(n: usize, tune: Tune) -> Result<usize, String> {
+    if n <= 4 {
+        return Ok(kernel_index(n));
+    }
+    match tune.shape() {
+        (16, 1) => Ok(2),
+        (8, 1) => Ok(3),
+        (32, 1) => Ok(4),
+        (16, 2) => Ok(5),
+        (8, 2) => Ok(6),
+        s => Err(format!(
+            "nvfp4_mvq: no kernel for regions of {} rows, {} CTAs",
+            s.0, s.1
+        )),
+    }
+}
+
 /// `legion_nvfp4_mvq` of `src/cuda/sm120/nvfp4_mvq.cu`.
 #[cfg(feature = "cuda")]
 #[repr(C)]
@@ -315,8 +460,14 @@ unsafe fn cuda_nvfp4_mvq(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
         return Err("nvfp4_mvq: weight not 16-byte aligned".into());
     }
     let dev = launch::device()?;
-    let plan = plan(o.k, o.rows, dev.smem.min(SMEM_12X))
-        .ok_or_else(|| format!("nvfp4_mvq: no ring for k {} rows {}", o.k, o.rows))?;
+    let tune = tune();
+    let smem = dev.smem.min(SMEM_12X);
+    let (plan, ctas) = if o.n > 4 {
+        (tune.plan(o.k, o.rows, smem), tune.shape().1)
+    } else {
+        (plan(o.k, o.rows, smem), 1)
+    };
+    let plan = plan.ok_or_else(|| format!("nvfp4_mvq: no ring for k {} rows {}", o.k, o.rows))?;
     let mut p = Params {
         x: o.x as *const f32,
         x_nb1: (o.x_nb1 / 4) as i64,
@@ -344,9 +495,9 @@ unsafe fn cuda_nvfp4_mvq(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
         &mut p,
         stream,
     )?;
-    // One CTA per SM, each taking a run of rows.
+    // One CTA per SM (by default), each taking a run of rows.
     let grid = launch::Dim3 {
-        x: (o.rows / ROW_MULTIPLE as usize).min(dev.sms) as u32,
+        x: (o.rows / ROW_MULTIPLE as usize).min(dev.sms * ctas) as u32,
         y: 1,
         z: 1,
     };
@@ -355,7 +506,14 @@ unsafe fn cuda_nvfp4_mvq(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
         y: 1,
         z: 1,
     };
-    launch::launch(kernel_index(o.n), grid, block, plan.smem, &mut p, stream)
+    launch::launch(
+        tuned_kernel_index(o.n, tune)?,
+        grid,
+        block,
+        plan.smem,
+        &mut p,
+        stream,
+    )
 }
 
 #[cfg(feature = "cuda")]
@@ -409,7 +567,7 @@ mod launch {
     }
 
     /// Entries of the kernel table.
-    const KERNELS: usize = 3;
+    const KERNELS: usize = 7;
     const DEV_ATTR_SM_COUNT: c_int = 16;
     const DEV_ATTR_SMEM_OPTIN: c_int = 97;
     const DEV_ATTR_CC_MAJOR: c_int = 75;

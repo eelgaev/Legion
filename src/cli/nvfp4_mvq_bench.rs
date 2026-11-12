@@ -27,6 +27,11 @@ pub struct Nvfp4MvqBenchArgs {
     /// a power log by), instead of in turns.
     #[arg(long)]
     blocks: bool,
+    /// Launch shapes of the op to time besides the default, at 5-8 columns, comma separated:
+    /// `r<region rows 8|16|32>c<CTAs per SM 1|2>k<pieces a row>a<ring pieces ahead>`, any
+    /// field left out for its default (e.g. `r32,c2k4,a20`).
+    #[arg(long, value_delimiter = ',')]
+    tune: Vec<String>,
 }
 
 fn shape(s: &str) -> anyhow::Result<(usize, usize)> {
@@ -43,6 +48,12 @@ pub fn run(args: Nvfp4MvqBenchArgs) -> anyhow::Result<()> {
         rounds: args.rounds,
         scale: !args.no_scale,
         blocks: args.blocks,
+        tunes: args
+            .tune
+            .iter()
+            .map(|t| legion::model::core::nvfp4_mvq::Tune::parse(t))
+            .collect::<Result<_, _>>()
+            .map_err(anyhow::Error::msg)?,
         ..Config::default()
     };
     if !args.cols.is_empty() {
@@ -57,8 +68,8 @@ pub fn run(args: Nvfp4MvqBenchArgs) -> anyhow::Result<()> {
     }
     let rows = bench::run(&mut gpu, &cfg).map_err(anyhow::Error::msg)?;
     println!(
-        "{:>6} {:>6} {:>4} {:<8} {:>9} {:>7} {:>9} {:>9}  first difference",
-        "k", "rows", "cols", "variant", "us/mm", "vs ggml", "differ", "outputs"
+        "{:>6} {:>6} {:>4} {:<12} {:>9} {:>7} {:>6} {:>9} {:>9}  first difference",
+        "k", "rows", "cols", "variant", "us/mm", "vs ggml", "GB/s", "differ", "outputs"
     );
     let mut reference = 0.0;
     let mut bad = 0;
@@ -66,18 +77,20 @@ pub fn run(args: Nvfp4MvqBenchArgs) -> anyhow::Result<()> {
         if r.variant == "ggml" {
             reference = r.secs;
         }
+        let gbs = (r.k / 64 * 36 * r.rows) as f64 / r.secs / 1e9;
         bad += usize::from(r.differ > 0);
         let first = r.first.map_or(String::new(), |(l, c, row, got, want)| {
             format!("layer {l} col {c} row {row}: {got:e} vs {want:e}")
         });
         println!(
-            "{:>6} {:>6} {:>4} {:<8} {:>9.2} {:>7.3} {:>9} {:>9}  {first}",
+            "{:>6} {:>6} {:>4} {:<12} {:>9.2} {:>7.3} {:>6.1} {:>9} {:>9}  {first}",
             r.k,
             r.rows,
             r.cols,
             r.variant,
             r.secs * 1e6,
             r.secs / reference,
+            gbs,
             r.differ,
             r.outputs,
         );

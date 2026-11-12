@@ -6,7 +6,7 @@
 //! the hidden `legion nvfp4-mvq-bench` subcommand (a build tree's binary on the GPU box) and by
 //! `tests/nvfp4_mvq.rs`.
 
-use super::{fits, mul_mat};
+use super::{Tune, fits, mul_mat, set_tune};
 use crate::ggml::{Backend, ComputeAllocator, Context, Tensor, ffi, types};
 
 /// Shapes and runs.
@@ -25,6 +25,8 @@ pub struct Config {
     /// Each variant's timed rounds back to back (for a power log), with its start and end
     /// times on stderr, instead of in turns.
     pub blocks: bool,
+    /// Launch shapes of the op to time besides the default (5-8 columns; each checked too).
+    pub tunes: Vec<Tune>,
 }
 
 impl Default for Config {
@@ -36,6 +38,7 @@ impl Default for Config {
             rounds: 5,
             scale: true,
             blocks: false,
+            tunes: Vec::new(),
         }
     }
 }
@@ -132,6 +135,11 @@ pub fn variant_names() -> Vec<String> {
     VARIANTS.iter().map(|v| v.to_string()).collect()
 }
 
+/// A tuned launch shape's variant name.
+fn tune_name(t: &Tune) -> String {
+    format!("r{}c{}k{}a{}", t.region, t.ctas, t.chunks, t.ahead)
+}
+
 /// ggml and the op at every shape and column count of `cfg` on `gpu`; they take turns within
 /// a round, the best round counts.
 pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
@@ -155,13 +163,30 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
         }
         s.set_f32(&[0.0123]);
         for &n in &cfg.cols {
-            let ctxs = [(); 2].map(|_| Context::new(8 + 4 * cfg.layers, 4 * cfg.layers + 16));
+            // ggml, the op, then the op at each tuned shape (5-8 columns).
+            let tunes: Vec<Tune> = if n > 4 { cfg.tunes.clone() } else { Vec::new() };
+            let nv = 2 + tunes.len();
+            let names: Vec<String> = VARIANTS
+                .iter()
+                .map(|v| v.to_string())
+                .chain(tunes.iter().map(tune_name))
+                .collect();
+            let tune_of = |vi: usize| {
+                if vi < 2 {
+                    Tune::default()
+                } else {
+                    tunes[vi - 2]
+                }
+            };
+            let ctxs: Vec<Context> = (0..nv)
+                .map(|_| Context::new(8 + 4 * cfg.layers, 4 * cfg.layers + 16))
+                .collect();
             let mut graphs = Vec::new();
             for (vi, ctx) in ctxs.iter().enumerate() {
                 let x = ctx.new_tensor(types::F32, &[k as i64, n as i64]).as_input();
                 let mut graph = ctx.new_graph(4 * cfg.layers + 16);
                 let scale = cfg.scale.then_some(s);
-                if vi == 1
+                if vi >= 1
                     && !(fits(w[0], x, scale)
                         && w[0]
                             .cuda_device()
@@ -191,24 +216,23 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
                 graphs.push((x, graph, outs));
             }
             let xs = activations(k, n, (7 + 31 * n + si) as u64);
-            let mut best = [f64::MAX; 2];
+            let mut best = vec![f64::MAX; nv];
             let mut reference: Vec<f32> = Vec::new();
-            let mut differ = [0usize; 2];
-            let mut first = [None; 2];
+            let mut differ = vec![0usize; nv];
+            let mut first = vec![None; nv];
             // A warm-up run of each variant (checked), then the timed rounds.
             let rounds = cfg.rounds.max(1);
             let order: Vec<(usize, usize)> = if cfg.blocks {
-                (0..2)
+                (0..nv)
                     .map(|vi| (0, vi))
-                    .chain((0..2).flat_map(|vi| (1..=rounds).map(move |r| (r, vi))))
+                    .chain((0..nv).flat_map(|vi| (1..=rounds).map(move |r| (r, vi))))
                     .collect()
             } else {
                 // Round 0 runs ggml first (its outputs are the reference); odd rounds run the
-                // op first, so neither variant always follows the other.
+                // variants in reverse, so none always follows the same one.
                 (0..=rounds)
                     .flat_map(|r| {
-                        let lead = r % 2;
-                        [lead, 1 - lead].map(move |vi| (r, vi))
+                        (0..nv).map(move |i| (r, if r % 2 == 1 { nv - 1 - i } else { i }))
                     })
                     .collect()
             };
@@ -218,7 +242,7 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
                     let t = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_or(0.0, |d| d.as_secs_f64());
-                    eprintln!("{t:.3} {} {k}x{m} cols {n} {what}", VARIANTS[vi]);
+                    eprintln!("{t:.3} {} {k}x{m} cols {n} {what}", names[vi]);
                 };
                 if cfg.blocks && round == 1 {
                     // A gap in the power log between the blocks.
@@ -226,11 +250,13 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
                     mark("start");
                 }
                 x.set_f32(&xs);
+                set_tune(tune_of(vi));
                 let t = std::time::Instant::now();
                 let r = gpu.compute(graph);
                 let secs = t.elapsed().as_secs_f64();
+                set_tune(Tune::default());
                 if let Err(e) = r {
-                    return Err(format!("{}: {e}", VARIANTS[vi]));
+                    return Err(format!("{}: {e}", names[vi]));
                 }
                 if round > 0 {
                     best[vi] = best[vi].min(secs / cfg.layers as f64);
@@ -252,9 +278,9 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
                     mark("end");
                 }
             }
-            for (vi, name) in VARIANTS.iter().enumerate() {
+            for (vi, name) in names.iter().enumerate() {
                 rows.push(Row {
-                    variant: name.to_string(),
+                    variant: name.clone(),
                     k,
                     rows: m,
                     cols: n,
