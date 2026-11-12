@@ -1732,6 +1732,12 @@ fn lazy_chain(relayout: bool, out_read: &[usize]) -> (Vec<Vec<u8>>, usize) {
         allocator
     };
     ctx.alloc_graph(&c.graph, allocator).unwrap();
+    // A view left unread (the old streams' views) would hold its norm's memory to the end.
+    assert_eq!(
+        lazy_bench::unread_views(&c.graph),
+        0,
+        "unread views in the planned graph"
+    );
     lazy_bench::fill(&i);
     backend.compute(&c.graph).unwrap();
     (

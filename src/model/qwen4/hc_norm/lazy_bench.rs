@@ -9,7 +9,7 @@
 
 use super::super::{hc_chain, hc_up_mix};
 use super::{P_NO_RES, hc_post_norm_rebuilt_xnb, set_hc_lazy_streams, set_moe_fold};
-use crate::ggml::{Backend, ComputeAllocator, Context, Graph, Tensor, types};
+use crate::ggml::{Backend, ComputeAllocator, Context, Graph, Tensor, ffi, types};
 use crate::model::nvfp4_mm::bf16_bits;
 
 /// What [`run`] measures.
@@ -55,6 +55,8 @@ pub struct Row {
     pub made: usize,
     /// Compute buffer bytes.
     pub buffer: usize,
+    /// View nodes nothing reads ([`unread_views`]; each holds memory to the graph's end).
+    pub unread: usize,
     /// Output values compared with main's graph, and those that differ (bit for bit).
     pub values: usize,
     pub differing: usize,
@@ -255,6 +257,25 @@ pub(super) fn made(c: &Chain<'_>) -> usize {
         .count()
 }
 
+/// View nodes of an allocated `graph` that run, are no output and that no node reads: ggml's
+/// allocator keeps each one's source alive to the end of the graph.
+pub(super) fn unread_views(graph: &Graph<'_>) -> usize {
+    // SAFETY: an allocated graph whose node array holds valid tensors.
+    unsafe {
+        let n = ffi::ggml_graph_n_nodes(graph.raw()) as usize;
+        let nodes = std::slice::from_raw_parts(ffi::ggml_graph_nodes(graph.raw()), n);
+        nodes
+            .iter()
+            .filter(|&&t| {
+                (*t).op != ffi::ggml_op_GGML_OP_NONE
+                    && !(*t).view_src.is_null()
+                    && (*t).flags & ffi::ggml_tensor_flag_GGML_TENSOR_FLAG_OUTPUT as i32 == 0
+                    && !nodes.iter().any(|&u| (*u).src.contains(&t))
+            })
+            .count()
+    }
+}
+
 /// Graph contexts big enough for a chain of `layers`.
 pub(super) fn context(layers: usize) -> Context {
     Context::new(96 * layers + 96, 64 * layers + 64)
@@ -319,6 +340,7 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
                 secs: best[vi],
                 made: made(c),
                 buffer: *buffer,
+                unread: unread_views(&c.graph),
                 values,
                 differing,
             });

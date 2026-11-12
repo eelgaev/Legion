@@ -1,8 +1,8 @@
 //! `legion hc-lazy-bench`: qwen4exp's prompt-step layers with the FFN mixer norms' streams
 //! written (main) and made by their readers (lazy streams, #1183), timed on one GPU, and every
 //! output compared bit for bit (a development tool, so a build tree's release binary can measure
-//! the box it runs on; pick the GPU with `CUDA_VISIBLE_DEVICES`). Fails on any differing value
-//! or a layer not made lazily.
+//! the box it runs on; pick the GPU with `CUDA_VISIBLE_DEVICES`). Fails on any differing value,
+//! an unread view node (it holds memory to the graph's end) or a layer not made lazily.
 
 use clap::Args;
 use legion::model::qwen4::hc_lazy_bench::{self as bench, Config};
@@ -32,8 +32,16 @@ pub fn run(args: HcLazyBenchArgs) -> anyhow::Result<()> {
     }
     let rows = bench::run(&mut gpu, &cfg).map_err(anyhow::Error::msg)?;
     println!(
-        "{:>6} {:<5} {:>9} {:>8} {:>5} {:>10} {:>10} {:>10}",
-        "tokens", "graph", "µs/layer", "vs main", "lazy", "buffer MiB", "values", "differing"
+        "{:>6} {:<5} {:>9} {:>8} {:>5} {:>10} {:>6} {:>10} {:>10}",
+        "tokens",
+        "graph",
+        "µs/layer",
+        "vs main",
+        "lazy",
+        "buffer MiB",
+        "unread",
+        "values",
+        "differing"
     );
     let mut bad = 0;
     for r in &rows {
@@ -42,21 +50,22 @@ pub fn run(args: HcLazyBenchArgs) -> anyhow::Result<()> {
             .find(|m| m.tokens == r.tokens && !m.lazy)
             .map_or(f64::NAN, |m| m.secs);
         println!(
-            "{:>6} {:<5} {:>9.1} {:>8.3} {:>5} {:>10.1} {:>10} {:>10}",
+            "{:>6} {:<5} {:>9.1} {:>8.3} {:>5} {:>10.1} {:>6} {:>10} {:>10}",
             r.tokens,
             if r.lazy { "lazy" } else { "main" },
             r.secs * 1e6,
             r.secs / main,
             r.made,
             r.buffer as f64 / (1 << 20) as f64,
+            r.unread,
             r.values,
             r.differing
         );
-        bad += usize::from(r.differing > 0 || (r.lazy && r.made != cfg.layers));
+        bad += usize::from(r.differing > 0 || r.unread > 0 || (r.lazy && r.made != cfg.layers));
     }
     anyhow::ensure!(
         bad == 0,
-        "{bad} graphs differ from main's or were not made lazily"
+        "{bad} graphs differ from main's, hold unread views or were not made lazily"
     );
     println!("lazy streams: every output equals main's bit for bit");
     Ok(())

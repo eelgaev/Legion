@@ -36,7 +36,8 @@
 //! readers make them per value from `R_a`, `O_a` and the weights, with the norm's expressions
 //! and its one FMA, so the same bits: the streams' write goes, and `O_a` (a quarter of their
 //! bytes) is read twice more. `R_a` and `O_a` then stay alive through the MoE layer, which is
-//! why it is part of this relayout.
+//! why it is part of this relayout; the norm's views of its streams, read by nothing now, are
+//! retired so they do not keep its memory alive to the end of the step.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -438,7 +439,13 @@ impl Graph {
                 if (fi + 1..ni).any(|j| self.writes_into(j, na) || self.writes_into(j, ro)) {
                     continue;
                 }
-                for t in [nf, uf, nn] {
+                let s0 = (*nf).data as usize;
+                let mut views = Vec::new();
+                self.views_over(nf, s0, s0 + ffi::ggml_nbytes(ra), &mut views);
+                for t in [nf, uf, nn]
+                    .into_iter()
+                    .chain(views.iter().map(|&v| self.nodes[v]))
+                {
                     if !saved.iter().any(|&(s, _)| s == t) {
                         saved.push((t, std::ptr::read(t)));
                     }
@@ -446,6 +453,7 @@ impl Graph {
                 set_no_res(nf);
                 set_lazy_streams(uf, ra, oa, ia);
                 set_lazy_fold(nn, ra, oa);
+                self.retire_unread(&mut views, nf);
                 made += 1;
             }
             made
@@ -519,6 +527,57 @@ impl Graph {
                 && (*n).op != ffi::ggml_op_GGML_OP_NONE
                 && n != r
                 && root(n) == r
+        }
+    }
+
+    /// Pushes onto `out` every view node of `t` (through views) spanning bytes in `[a, b)`.
+    ///
+    /// # Safety
+    /// `t` is a valid tensor.
+    unsafe fn views_over(&self, t: Node, a: usize, b: usize, out: &mut Vec<usize>) {
+        // SAFETY: the caller's; users are valid nodes.
+        unsafe {
+            for &u in self.users(t) {
+                let v = self.nodes[u];
+                if self.none[u] || !is_view_op((*v).op) || (*v).src[0] != t || out.contains(&u) {
+                    continue;
+                }
+                let (x, y) = span(v);
+                if x < y && x < b && a < y {
+                    out.push(u);
+                    self.views_over(v, a, b, out);
+                }
+            }
+        }
+    }
+
+    /// Retires ([`Self::retire`], as views of `keep`) the view nodes `views` that no node reads
+    /// any more, last first (a view read only by retired views is unread too). A view node in
+    /// the graph that nothing reads holds its source's memory to the end of the graph: ggml's
+    /// allocator frees a node's memory when the last view of it is freed, and frees a view when
+    /// its last reader has run. Unread `R_f` views left by the lazy rewrite kept every FFN
+    /// norm's node alive to the end of a prompt step (#1183: 2 GB of compute buffer became
+    /// 19.7 GB at 4096 tokens).
+    ///
+    /// # Safety
+    /// Node indices of this graph; `keep` a valid tensor.
+    unsafe fn retire_unread(&mut self, views: &mut [usize], keep: Node) {
+        views.sort_unstable();
+        for k in (0..views.len()).rev() {
+            let v = views[k];
+            let t = self.nodes[v];
+            // SAFETY: the caller's; readers are valid nodes.
+            let read = self
+                .users(t)
+                .iter()
+                .any(|&u| !self.none[u] && unsafe { (*self.nodes[u]).src.contains(&t) });
+            // SAFETY: the caller's.
+            if !read
+                && unsafe { (*t).flags } & ffi::ggml_tensor_flag_GGML_TENSOR_FLAG_OUTPUT as i32 == 0
+            {
+                // SAFETY: the caller's.
+                unsafe { self.retire(&[v], keep) };
+            }
         }
     }
 
