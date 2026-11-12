@@ -27,13 +27,15 @@ namespace a8 {
 constexpr int BN = 128;
 // A stage layout: STAGES stages of BK bytes of k. SWZ: rows BK bytes apart, each row's 16-byte
 // chunks XOR-swizzled by its row so the 8 rows an ldmatrix phase reads hit distinct banks;
-// else rows padded to BK + 16 bytes.
-template <int WM_, int STAGES_ = 3, int BK_ = 64, bool SWZ_ = false> struct Cfg {
-    static constexpr int WM = WM_, STAGES = STAGES_, BK = BK_;
+// else rows padded to BK + 16 bytes. WARPS: 8 (WM x 8 / WM warps), or 4 (WM 2: 2 x 2 warps of
+// 64 x 64; fp8_gemm8_tma only, two CTAs per SM).
+template <int WM_, int STAGES_ = 3, int BK_ = 64, bool SWZ_ = false, int WARPS_ = 8> struct Cfg {
+    static constexpr int WM = WM_, STAGES = STAGES_, BK = BK_, WARPS = WARPS_, WN = WARPS / WM;
     static constexpr bool SWZ = SWZ_;
     static constexpr int TM = 64 * WM, CH = BK / 16, LD = SWZ ? BK : BK + 16;
     static constexpr size_t TSTAGE = (size_t) (TM + BN) * LD, SMEM = STAGES * TSTAGE;
     static_assert(WM == 2 || WM == 4, "warp rows");
+    static_assert(WARPS == 8 || (WARPS == 4 && WM == 2), "warps");
     static_assert(BK % 32 == 0 && (!SWZ || BK == 64 || BK == 128), "stage layout");
     // Byte offset of 16-byte chunk `chunk` of row `row` in a stage's weights or activations.
     static __device__ __forceinline__ int off(int row, int chunk) {
@@ -43,6 +45,9 @@ template <int WM_, int STAGES_ = 3, int BK_ = 64, bool SWZ_ = false> struct Cfg 
 // WM 4 with a residual: steps before the last that its L2 prefetch is issued (12 or 24 steps
 // of 64 bytes measured no faster on the GB10).
 constexpr int64_t RES_PF_STEPS = 4;
+// 4 warps with a residual: the tokens' prefetches spread evenly over the last RES_PF_SPREAD
+// steps instead (#1133 r11, GB10: 32 steps of 64 bytes measured best of 16-48 there).
+constexpr int64_t RES_PF_SPREAD = 32;
 }  // namespace a8
 
 // The MMAs of one K step of BK bytes from a stage's weights `ws` and activations `xs` into the
@@ -84,16 +89,23 @@ __device__ __forceinline__ void gemm8_stage(const unsigned char * ws, const unsi
 }
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-// WM 4 with a residual: the tile's residual (a token's TM rows are one 16-byte aligned run when
-// m0 + TM <= m) into L2 a few steps before the epilogue, which then loads it a row group at a
-// time from L2 instead of memory.
+// WM 4 or 4 warps with a residual: the tile's residual (a token's TM rows are one 16-byte
+// aligned run when m0 + TM <= m) into L2 a few steps before the epilogue, which then loads it a
+// row group at a time from L2 instead of memory. 4 warps: token t's at its share of the last
+// RES_PF_SPREAD steps, so the requests do not all reach memory at once.
 template <bool RES, class C>
 __device__ __forceinline__ void gemm8_res_prefetch(const legion_fp8_mm8 & p, int64_t step, int64_t steps,
                                                    int64_t m0, int64_t n0) {
-    if constexpr (RES && C::WM != 2) {
-        constexpr int64_t PF = a8::RES_PF_STEPS;
-        if (step == (steps > PF ? steps - PF : 0) && threadIdx.x < a8::BN && n0 + threadIdx.x < p.n &&
-            m0 + C::TM <= p.m) {
+    if constexpr (RES && (C::WM != 2 || C::WARPS == 4)) {
+        int64_t at;
+        if constexpr (C::WARPS == 4) {
+            const int64_t span = a8::RES_PF_SPREAD < steps ? a8::RES_PF_SPREAD : steps;
+            at = steps - span + (int64_t) threadIdx.x * span / a8::BN;
+        } else {
+            constexpr int64_t PF = a8::RES_PF_STEPS;
+            at = steps > PF ? steps - PF : 0;
+        }
+        if (step == at && threadIdx.x < a8::BN && n0 + threadIdx.x < p.n && m0 + C::TM <= p.m) {
             const float * a = p.res + (n0 + threadIdx.x) * p.m + m0;
             if (((uintptr_t) a & 15) == 0) {
                 asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(a), "r"((uint32_t) (C::TM * 4)));
@@ -107,12 +119,12 @@ __device__ __forceinline__ void gemm8_res_prefetch(const legion_fp8_mm8 & p, int
 template <bool RES, class C, int NJ>
 __device__ __forceinline__ void gemm8_epilogue(const legion_fp8_mm8 & p, int64_t m0, int64_t n0, int wm, int wn,
                                                int lane, const float (&acc)[4][NJ][4]) {
-    constexpr int WM = C::WM, WN = 8 / WM;
-    static_assert(NJ == a8::BN / 8 / WN, "n8 tiles per warp");
+    static_assert(NJ == a8::BN / 8 / C::WN, "n8 tiles per warp");
+    constexpr bool WHOLE = NJ <= 4;  // WM 2 with 8 warps: 64 accumulators per thread
     const float s = a8_static(p);
     // RES: the residual loaded before the first store (dst may alias it as far as the compiler
-    // knows: loads between the stores would each wait out the memory latency). WM 2: the whole
-    // tile's at once; WM 4: a row group's (16 rows) before its stores, which keeps the 128
+    // knows: loads between the stores would each wait out the memory latency). WHOLE: the whole
+    // tile's at once; else a row group's (16 rows) before its stores, which keeps the 128
     // accumulators plus 32 residuals in registers.
     float rv[4][NJ][4];
     auto load_res = [&](int i) {
@@ -127,7 +139,7 @@ __device__ __forceinline__ void gemm8_epilogue(const legion_fp8_mm8 & p, int64_t
             }
         }
     };
-    if constexpr (RES && WM == 2) {
+    if constexpr (RES && WHOLE) {
 #pragma unroll
         for (int i = 0; i < 4; i++) {
             load_res(i);
@@ -135,7 +147,7 @@ __device__ __forceinline__ void gemm8_epilogue(const legion_fp8_mm8 & p, int64_t
     }
 #pragma unroll
     for (int i = 0; i < 4; i++) {
-        if constexpr (RES && WM != 2) {
+        if constexpr (RES && !WHOLE) {
             load_res(i);
         }
         const int64_t r0 = m0 + wm * 64 + i * 16 + lane / 4;
@@ -162,6 +174,7 @@ __global__ void __launch_bounds__(256) fp8_gemm8(const legion_fp8_mm8 p) {
     constexpr int WM = C::WM, BK = C::BK, LD = C::LD, STAGES = C::STAGES, CH = C::CH;
     constexpr int WN = 8 / WM, NJ = BN / 8 / WN, TM = C::TM;  // NJ: n8 tiles per warp
     constexpr size_t TSTAGE = C::TSTAGE;
+    static_assert(C::WARPS == 8, "fp8_gemm8 runs 8 warps");
     extern __shared__ __align__(16) unsigned char smem[];
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int wm = warp / WN, wn = warp % WN;
