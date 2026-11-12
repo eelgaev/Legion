@@ -72,6 +72,9 @@ const VARIANTS: [&str; 2] = ["ggml", "mvf"];
 
 /// ggml and the op at every shape and token count of `cfg` on `gpu`.
 pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
+    if cfg.layers == 0 {
+        return Err("--layers must be at least 1".into());
+    }
     let mut out = Vec::new();
     let nw = cfg.rows.len();
     for &k in &cfg.ks {
