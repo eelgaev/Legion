@@ -259,8 +259,12 @@ pub fn run(gpu: &mut Backend, cfg: &Config, modes: &[&'static str]) -> Result<Ve
             fill(&i, cfg, mode, n);
             let mut best = vec![f64::MAX; cfg.kernels.len()];
             let mut ran = vec![0; cfg.kernels.len()];
+            let nk = cfg.kernels.len();
             for round in 0..=cfg.rounds {
-                for (ki, &k) in cfg.kernels.iter().enumerate() {
+                // The order rotates every round, so no kernel always runs first or after the same
+                // one.
+                for ki in (0..nk).map(|j| (round + j) % nk) {
+                    let k = cfg.kernels[ki];
                     force_kernel(k);
                     let t = std::time::Instant::now();
                     let r = gpu.compute(&graph);

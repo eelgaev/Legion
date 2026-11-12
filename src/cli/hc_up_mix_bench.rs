@@ -57,6 +57,15 @@ pub fn run(args: HcUpMixBenchArgs) -> anyhow::Result<()> {
                 c.tokens, c.mode, c.kernel, c.ran, c.values, c.differing, c.hash
             );
         }
+        // A forced kernel that fell back to another one was not checked at all.
+        let skipped = checks
+            .iter()
+            .filter(|c| c.kernel != 0 && c.ran != c.kernel)
+            .count();
+        anyhow::ensure!(
+            skipped == 0,
+            "{skipped} checks ran another kernel than the one forced (rank must be 320 for kernel 2)"
+        );
         let bad = checks.iter().filter(|c| c.differing > 0).count();
         anyhow::ensure!(bad == 0, "{bad} checks differ from up_mix_bf16's bits");
         println!("all kernels' bits equal up_mix_bf16's");
