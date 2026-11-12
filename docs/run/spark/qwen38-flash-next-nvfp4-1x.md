@@ -47,8 +47,8 @@ All three (2026-11-12): prefill 8,240 / 32,738 / 122,528 tokens at 2,353 / 2,450
 rest of the gain since 2026-11-03 is the default prompt-step kernels, same output). The two prefill flags
 leave decode alone: 1 user 36.2 (story) to 58.6 (code), median 43.9; 4 users 91.7; 16 users 172.9 (without
 them 34.8-58.5, 94.2 and 179.5; 4 and 16 users swing a few percent between rounds). Both round prompt-step
-values to BF16, so greedy text can move after prompts of over 64 tokens. The table's row: decode from
-2026-11-03, prefill from 2026-11-12.
+values to BF16, so greedy text can move after prompts of over 64 tokens. The table's row is this
+2026-11-12 run, decode and prefill.
 
 - The opt-in prefill numbers (8K 1,749 / 32K 1,800) add `--nvfp4-a4 prefill --prefill-even` to the command
   without `--spec` (an earlier build).

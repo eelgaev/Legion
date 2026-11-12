@@ -90,7 +90,7 @@ off. llama.cpp runs across two DGX Sparks with its RPC backend (layer split).
 |---|---|---|---|--:|--:|--:|--:|--:|--:|
 | DGX Spark | Legion | [UD-Q4_K_XL GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | MTP | **44-64** | **83.8** | **109.4** | **1,872** | **2,008** | 1,916 |
 | DGX Spark | llama.cpp b12062 | UD-Q4_K_XL GGUF | none ¹ | 27-28 | 55.5 | 90.0 | 955 | 891 | — |
-| DGX Spark | Legion | [NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) | MTP ² | **35-58** | **92.0** | **172.1** | **2,353** | **2,450** | **2,276** |
+| DGX Spark | Legion | [NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) | MTP ² | **36-59** | **91.7** | **172.9** | **2,353** | **2,450** | **2,276** |
 | DGX Spark | vLLM 0.33.0 | NVFP4 | MTP ³ | 28-39 | 72.9 | 150.3 | 1,797 | 2,381 | 1,663 |
 | 2x DGX Spark | Legion | UD-Q4_K_XL GGUF | MTP ⁴ | **55-70** | **112.6** | **216.9** | **2,933** | **2,940** | **2,758** |
 | 2x DGX Spark | llama.cpp b12062 | UD-Q4_K_XL GGUF | none ⁵ | 23-26 | 47.4 | 75.0 | 1,066 | 1,064 | 1,014 |
@@ -142,7 +142,7 @@ off. llama.cpp runs across two DGX Sparks with its RPC backend (layer split).
 
 ¹ No drafting: llama.cpp b12062 aborts with the MTP drafter on this model. 123K did not finish in 20 minutes.
 
-² The checkpoint's own MTP head, with the output-moving opt-ins `--spec-gate-cost-model off`, `--nvfp4-expert-rows-bf16` and `--hc-bf16` (see the run command; prefill without the last two: 2,146, 2,205, 2,071).
+² The checkpoint's own MTP head, with the output-moving opt-ins `--spec-gate-cost-model off`, `--nvfp4-expert-rows-bf16` and `--hc-bf16` (see the run command; decode and prefill from one 2026-11-12 run; prefill without the last two: 2,146, 2,205, 2,071).
 
 ³ A local patch maps the FP8 n-gram table from disk; stock vLLM does not fit it in memory (see the run command).
 
