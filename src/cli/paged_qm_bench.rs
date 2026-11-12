@@ -105,10 +105,17 @@ pub fn run(args: PagedQmBenchArgs) -> anyhow::Result<()> {
         // Both orders (mma, qm, qm, mma), each kernel's faster run kept, so warm-up and clock
         // drift do not favour the side that runs second.
         let mut t = |mode| bench::run(&mut gpu, &kv, &g, mode, args.reps, args.rounds);
+        // The output starts as NaN, so a value no kernel wrote would match on both sides.
+        let finite = |v: &[f32]| v.iter().all(|x| x.is_finite());
         let (a1, m1, _) = t(0);
+        anyhow::ensure!(finite(&a1), "{n_past}:{n_tok}: non-finite mma output");
         let mut cols = Vec::new();
         for &mode in &args.modes {
             let (b1, q1, ran) = t(mode);
+            anyhow::ensure!(
+                finite(&b1),
+                "{n_past}:{n_tok}: non-finite mode {mode} output"
+            );
             let (_, q2, _) = t(mode);
             cols.push((b1, q1, q2, ran));
         }
