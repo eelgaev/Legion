@@ -60,6 +60,8 @@ pub(crate) const PURE: &[&str] = &[
     "router_mv",
     "router_mv_logits",
     "router_mv_ids",
+    // A DeltaNet layer's BF16 alpha and beta of 1-8 tokens in one launch (#689).
+    "mvf_bf16",
     "moe_tail",
     "moe_sum_gate",
     "ids_remap",

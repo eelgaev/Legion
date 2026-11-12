@@ -16,8 +16,12 @@ pub const REPLAY_VERIFY: [i64; 2] = [4, 1];
 
 /// The fused step's kernel variants compared (`src/cuda/gdn.cu`'s `replay_variant`): the
 /// per-lane kernel first (the row's `fused`), then the one with the tokens' inputs in shared
-/// memory.
-pub const REPLAY_VARIANTS: [(i32, &str); 2] = [(0, "plain"), (1, "smem")];
+/// memory, then the one for few sequences (#689).
+pub const REPLAY_VARIANTS: [(i32, &str); 3] = [(0, "plain"), (1, "smem"), (2, "few")];
+
+/// Tokens a sequence's deferred commit keeps in [`run_replay`]'s sets of `n` sequences
+/// ([`Config::replay_seqs`]): each set gives every sequence the same count.
+pub const FEW_KEEPS: [i32; 5] = [0, 1, 3, 6, 8];
 
 /// One set of keep counts and verify step size ([`run_replay`]).
 #[derive(Clone, Debug)]
@@ -215,14 +219,24 @@ fn pair<'a>(cc: &'a Context, cv: &'a Context, p: &Pools<'a>, fused: bool) -> Pai
     }
 }
 
-/// The separate and the fused pair over [`COMMIT_KEEPS`] and [`REPLAY_VERIFY`]: bits (one
-/// layer) and time (`cfg.layers` layers).
+/// The separate and the fused pair over [`COMMIT_KEEPS`] (or, with [`Config::replay_seqs`],
+/// sets of that many sequences each keeping one of [`FEW_KEEPS`]) and [`REPLAY_VERIFY`] (or
+/// [`Config::replay_verify`]): bits (one layer) and time (`cfg.layers` layers).
 pub fn run_replay(gpu: &mut Backend, cfg: &Config) -> Result<Vec<ReplayRow>, String> {
     let (h, nk) = cfg.heads;
     let err = |e: crate::ggml::GgmlError| format!("gdn-bench: {e:?}");
+    let keeps: Vec<Vec<i32>> = match cfg.replay_seqs {
+        Some(n) => FEW_KEEPS.iter().map(|&k| vec![k; n]).collect(),
+        None => COMMIT_KEEPS.iter().map(|k| k.to_vec()).collect(),
+    };
+    let verify = if cfg.replay_verify.is_empty() {
+        REPLAY_VERIFY.to_vec()
+    } else {
+        cfg.replay_verify.clone()
+    };
     let mut out = Vec::new();
-    for nt in REPLAY_VERIFY {
-        for keep in COMMIT_KEEPS {
+    for &nt in &verify {
+        for keep in &keeps {
             let ns = keep.len() as i64;
             // A run of a pair from the filled inputs: the states and rows after it, the
             // fused step's store differences, and the times per layer.
