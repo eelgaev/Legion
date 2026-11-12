@@ -594,7 +594,12 @@ bool gemm8_tma_map(CUtensorMap * map, const uint8_t * base, int64_t k, int64_t r
                                   CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
 }
 
-// fp8_gemm8_tma where the device and the operands allow it; false: not launched.
+// 4 warps: the first wave's start spread over GEMM8_STAGGER_NS_PER_K ns per byte of k (about one
+// tile's time: 123 us at k 6,144 on the GB10, where 60 us gained about half as much).
+constexpr int64_t GEMM8_STAGGER_NS_PER_K = 20;
+
+// fp8_gemm8_tma where the device and the operands allow it (4 warps: and two CTAs fit an SM);
+// false: not launched.
 template <bool RES, class C>
 bool launch_gemm8_tma(const legion_fp8_mm8 & p, cudaStream_t st) {
     constexpr size_t SMEM = gemm8_tma_smem<C>();
@@ -628,8 +633,31 @@ bool launch_gemm8_tma(const legion_fp8_mm8 & p, cudaStream_t st) {
     if (!legion_device::smem_opt_in(opted_in, fp8_gemm8_tma<RES, C>, (int) SMEM)) {
         return false;
     }
+    a8t::Stagger stagger;
+    if constexpr (C::WARPS == 4) {
+        // All of the SM's shared memory as shared memory, then whether two CTAs fit (once per
+        // device).
+        static std::atomic<int8_t> pair_ok[GGML_CUDA_MAX_DEVICES];
+        int8_t two = pair_ok[dev].load(std::memory_order_relaxed);
+        if (two == 0) {
+            int per_sm = 0;
+            const bool fits =
+                cudaFuncSetAttribute(fp8_gemm8_tma<RES, C>, cudaFuncAttributePreferredSharedMemoryCarveout, 100) ==
+                    cudaSuccess &&
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, fp8_gemm8_tma<RES, C>, 32 * C::WARPS, SMEM) ==
+                    cudaSuccess &&
+                per_sm >= 2;
+            two = fits ? 1 : -1;
+            pair_ok[dev].store(two, std::memory_order_relaxed);
+        }
+        if (two < 0) {
+            return false;
+        }
+        stagger.ctas = 2 * sm_count();
+        stagger.ns   = (uint32_t) (GEMM8_STAGGER_NS_PER_K * p.k / stagger.ctas);
+    }
     const dim3 grid((unsigned) ((p.n + a8::BN - 1) / a8::BN), (unsigned) ((p.m + C::TM - 1) / C::TM));
-    fp8_gemm8_tma<RES, C><<<grid, 256, SMEM, st>>>(p, maps);
+    fp8_gemm8_tma<RES, C><<<grid, 32 * C::WARPS, SMEM, st>>>(p, maps, stagger);
     return true;
 }
 
@@ -645,12 +673,21 @@ bool launch_gemm8_tma(const legion_fp8_mm8 & p, cudaStream_t st) {
 // On consumer Blackwell the wide tile with 128-byte steps runs as fp8_gemm8_tma (#1133, GB10,
 // Qwen3.8-27B's projections at 4,096 to 16,384 tokens: 147-152 -> 156-163 TFLOPS, with the
 // residual 120-153 -> 128-155; 4 stages of 64 bytes are no faster there, 3 slower). The same bits.
+// With the residual, those shapes run as two 4-warp 128 x 128 CTAs per SM (three 64-byte TMA
+// stages, 48 KiB each, #1133 r11), whose epilogues overlap the other CTA's MMAs: on the GB10, the
+// output projection (6,144 -> 5,120) at 4,096 to 16,384 tokens 1.11-1.13x the wide tile's speed;
+// without the residual they are no faster than it (0.99-1.02x), so it keeps the wide tile.
 constexpr int64_t GEMM8_WIDE_WAVES = 8;
 template <bool RES>
 void launch_gemm8(const legion_fp8_mm8 & p, cudaStream_t st) {
     const int64_t wide_tiles = p.m / 256 * ((p.n + a8::BN - 1) / a8::BN);
     if (p.m % 256 == 0 && wide_tiles >= GEMM8_WIDE_WAVES * sm_count()) {
         if (p.k % 128 == 0) {
+            if constexpr (RES) {
+                if (launch_gemm8_tma<RES, a8::Cfg<2, 3, 64, true, 4>>(p, st)) {
+                    return;
+                }
+            }
             if (!launch_gemm8_tma<RES, a8::Cfg<4, 2, 128, true>>(p, st)) {
                 launch_gemm8_w<RES, a8::Cfg<4, 2, 128, true>>(p, st);
             }
