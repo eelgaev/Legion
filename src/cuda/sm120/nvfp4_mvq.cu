@@ -210,11 +210,10 @@ __device__ __forceinline__ void bulk_g2s(void * dst, const void * src, uint32_t 
 
 constexpr int MV_WARPS   = 8;
 constexpr int MV_THREADS = MV_WARPS * WARP_SIZE;
-constexpr int MV_R       = 16;  // rows of a region
 constexpr int MV_ITERS   = 8;   // a chunk spans at most MV_ITERS / NWG steps of blocks_per_iter
 
-// `w @ x` with ggml's MMVQ order for NWG of its warps (4: 1-4 columns, 2: 5-8). G CTAs (one per
-// SM) take regions of up to MV_R rows (see `start` below), each row in p.chunks pieces along K
+// `w @ x` with ggml's MMVQ order for NWG of its warps (4: 1-4 columns, 2: 5-8). G CTAs (MINB per
+// SM) take regions of up to R rows (16 by default; 8 and 32 for tuning, the same bits) (see `start` below), each row in p.chunks pieces along K
 // (a chunk of the region's rows at a time, the partial sums carried from chunk to chunk: every
 // chain keeps its K order).
 // Thread (g, t) of a warp (lane 4g + t) takes column g, the rows 2 (t % 2) and 2 (t % 2) + 1 of
@@ -224,14 +223,14 @@ constexpr int MV_ITERS   = 8;   // a chunk spans at most MV_ITERS / NWG steps of
 // blocks_per_iter); warp w here holds the residues r = w + 8P, a partial sum for each.
 //
 // Dynamic shared memory: p.ns piece slots of piece_bytes + 16 (the 4 rows of a group land in
-// different banks), the partial sums [warp][h][MV_R][column], p.ns mbarriers. Pieces are read
+// different banks), the partial sums [warp][h][R][column], p.ns mbarriers. Pieces are read
 // in order (region, chunk, row), piece q into slot q % ns.
-template <int NWG>
-__global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
+template <int NWG, int R, int MINB>
+__global__ void __launch_bounds__(MV_THREADS, MINB) mv(const legion_nvfp4_mvq p) {
     pdl_launch_dependents();
 #ifdef LEGION_MVQ_MMA
     using namespace legion_tma;
-    constexpr int R   = MV_R;
+    static_assert(R == 8 || R == 16 || R == 32, "regions of 8, 16 or 32 rows");
     constexpr int BPI = 16 * NWG;
     constexpr int NP  = BPI / MV_WARPS;
     constexpr int G4  = R / 4;
@@ -485,10 +484,15 @@ __global__ void __launch_bounds__(MV_THREADS, 1) mv(const legion_nvfp4_mvq p) {
 
 }  // namespace
 
-// The kernels for the host stubs: the quantization, then mv<NWG> for NWG = 4, 2
-// (src/model/core/nvfp4_mvq.rs's kernel index).
-extern "C" const void * const legion_nvfp4_mvq_kernels[3] = {
+// The kernels for the host stubs: the quantization, then mv<NWG, R, MINB> (src/model/core/
+// nvfp4_mvq.rs's kernel index: 1-4 columns, then the 5-8 column shapes; 16-row regions are the
+// default there, the others for tuning).
+extern "C" const void * const legion_nvfp4_mvq_kernels[7] = {
     reinterpret_cast<const void *>(&quantize),
-    reinterpret_cast<const void *>(&mv<4>),
-    reinterpret_cast<const void *>(&mv<2>),
+    reinterpret_cast<const void *>(&mv<4, 16, 1>),
+    reinterpret_cast<const void *>(&mv<2, 16, 1>),
+    reinterpret_cast<const void *>(&mv<2, 8, 1>),
+    reinterpret_cast<const void *>(&mv<2, 32, 1>),
+    reinterpret_cast<const void *>(&mv<2, 16, 2>),
+    reinterpret_cast<const void *>(&mv<2, 8, 2>),
 };
