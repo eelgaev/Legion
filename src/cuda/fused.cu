@@ -6,6 +6,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "launch_pdl.cuh"
 #include "nvfp4_plan.cuh"
 #include "router_select.cuh"
 
@@ -337,7 +338,8 @@ __device__ __forceinline__ float conv_in(const legion_conv_silu & p, int j, int 
 // registers; reads and writes are coalesced over the channels. A norm block (one q or k head,
 // blockDim == norm_head) sums each token's squares as delta_prep_kernel's 256-thread block
 // does (the warps past the head add zeros there: s_sum's tail is zero here), so its outputs
-// are delta_prep's q and k, and the separate pass over them is saved.
+// are delta_prep's q and k, and the separate pass over them is saved. Launched through
+// launch_pdl (#689): the weights are read before griddepcontrol.wait, every input after it.
 __global__ void conv_silu_kernel(legion_conv_silu p) {
     __shared__ float s_sum[PREP_BLOCK / 32];
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -355,6 +357,9 @@ __global__ void conv_silu_kernel(legion_conv_silu p) {
     for (int k = 0; k < MAX_D; k++) {
         w[k] = k < d ? p.w[k + c * d] : 0.0f;
     }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+#endif
     const int t0 = blockIdx.y * p.chunk;
     const int t1 = min(t0 + p.chunk, p.nt);
     // the window for output t holds inputs t .. t + d - 1 (in [state | x] order)
@@ -2151,6 +2156,7 @@ int legion_conv_silu_launch(const legion_conv_silu * p, void * stream) {
                                (int64_t) p->norm_blocks * p->norm_head > p->C)) {
         return -2;
     }
-    conv_silu_kernel<<<dim3(p->grid[0], p->grid[1], p->grid[2]), p->block, 0, (cudaStream_t) stream>>>(*p);
+    launch_pdl(conv_silu_kernel, dim3(p->grid[0], p->grid[1], p->grid[2]), (int) p->block, 0, (cudaStream_t) stream,
+               *p);
     return (int) cudaGetLastError();
 }
