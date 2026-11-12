@@ -17,7 +17,10 @@
 //   mix.
 // BF16 up weights (the NVFP4 checkpoints, #836) take `lo_bf16` and `up_mix_bf16` instead
 // (sm80/hc_up_mix_bf16.cuh, on by default): the BF16 GEMM's m16n8k16 products in K order, then
-// the same mix, cuBLAS's sums at the mixer's shape.
+// the same mix, cuBLAS's sums at the mixer's shape. At rank 320 and 512 tokens or more
+// `up_mix_bf16_reg` (#1183) runs in its place: the same instructions per output, the up rows
+// held in registers and lo shared by the CTA's warps, so the mix streams its bytes near the
+// memory's rate.
 //
 // The same bits as ggml's two ops wherever ggml's MMQ computes each output tile in one CTA
 // (no stream-k split, whose fixup adds the partial sums in another order); the Rust side takes
@@ -66,6 +69,9 @@ struct legion_hc_up_mix {
     // beside mixed; with skip_f32 nonzero mixed itself is not written (nothing reads it).
     void *        mixedb;
     int32_t       skip_f32;
+    // BF16 up only (#1183, `legion hc-up-mix-bench`): 0 the default kernel for the shape, 1
+    // up_mix_bf16, 2 up_mix_bf16_reg at any token count (2 + 100 R: runs of R tiles a CTA).
+    int32_t       kernel;
 };
 
 // Launches the kernels on `stream`; returns a cudaError_t (cudaErrorInvalidValue for shapes the
@@ -75,6 +81,10 @@ int legion_hc_up_mix_launch(const legion_hc_up_mix * p, void * stream);
 // Only lo_bf16: lo (F32 [n][rank]) rounded to BF16 into lob, for a BF16 up_mix node whose
 // lob_ready is set.
 int legion_hc_up_lob_launch(const legion_hc_up_mix * p, void * stream);
+
+// The BF16 up-mix kernel the last launch ran, as p->kernel numbers it (1 up_mix_bf16, 2
+// up_mix_bf16_reg), for `legion hc-up-mix-bench`.
+int legion_hc_up_mix_last_kernel(void);
 
 }  // extern "C"
 
@@ -139,6 +149,59 @@ bool mma_code() {
     return st == 1;
 }
 
+// up_mix_bf16_reg's form, tuned on a GB10 (#1183): rank 320 (20 K steps), 2 column groups (32
+// columns, 8 warps) and 16 tokens a tile, 2 CTAs an SM, the streams prefetched a tile ahead.
+// A CTA takes a short run of tiles, 64 tokens of F32 streams or 128 of BF16 ones: long runs
+// (each CTA's up rows loaded once) and single tiles were both slower. Below REG_MIN_N tokens
+// up_mix_bf16 is faster (the up rows are most of the bytes) and the default keeps it.
+constexpr int REG_KS     = 20;
+constexpr int REG_CG     = 2;
+constexpr int REG_TT     = 16;
+constexpr int REG_MINB   = 2;
+constexpr int REG_PD     = 1;
+constexpr int REG_RUN    = 4;  // tiles a CTA, F32 streams
+constexpr int REG_RUN_16 = 8;  // tiles a CTA, BF16 streams
+constexpr int REG_MIN_N  = 512;
+
+// One up_mix_bf16_reg launch: e / 32 column blocks times runs of `run` tiles. False (nothing
+// launched) when the kernel cannot have its shared memory.
+template <bool RB, bool S16> bool launch_reg(const legion_hc_up_mix & p, cudaStream_t s, int run) {
+    constexpr int THREADS = REG_CG * HC * 32;
+    constexpr int COLS    = REG_CG * ROWS;
+    constexpr int SMEM = (2 * REG_TT * (REG_KS * 8 + PAD / 4) + HC * REG_TT * (COLS + 4)) * (int) sizeof(float);
+    const auto    kernel = up_mix_bf16_reg<REG_KS, REG_CG, REG_TT, REG_MINB, REG_PD, RB, S16>;
+    static std::atomic<int8_t> opt[GGML_CUDA_MAX_DEVICES];
+    if (!legion_device::smem_opt_in(opt, kernel, SMEM)) {
+        return false;
+    }
+    const int  chunk = run * REG_TT;
+    const dim3 grid((unsigned) (p.e / COLS), (unsigned) ((p.n + chunk - 1) / chunk));
+    kernel<<<grid, THREADS, SMEM, s>>>(p, chunk);
+    return true;
+}
+
+// The kernel the last BF16 launch ran (legion_hc_up_mix_last_kernel).
+std::atomic<int> last_kernel{ 0 };
+
+// The BF16 up-mix by p.kernel (see legion_hc_up_mix): up_mix_bf16_reg where the default or
+// kernel 2 takes it; false when up_mix_bf16 should run. Kernel 2 + 100 R: runs of R tiles
+// (`legion hc-up-mix-bench`).
+bool launch_bf16_reg(const legion_hc_up_mix & p, cudaStream_t s) {
+    if (p.kernel == 1 || p.rank != REG_KS * 16 || p.e % (REG_CG * ROWS) != 0 ||
+        (p.kernel == 0 && p.n < REG_MIN_N)) {
+        return false;
+    }
+    const bool rb = p.res != nullptr, s16 = rb && p.res_bf16 != 0;
+    const int  r  = p.kernel / 100 > 0 ? p.kernel / 100 : s16 ? REG_RUN_16 : REG_RUN;
+    const bool ok = s16 ? launch_reg<true, true>(p, s, r) :
+                    rb  ? launch_reg<true, false>(p, s, r) :
+                          launch_reg<false, false>(p, s, r);
+    if (ok) {
+        last_kernel.store(p.kernel % 100 == 2 ? p.kernel : 2, std::memory_order_relaxed);
+    }
+    return ok;
+}
+
 }  // namespace
 
 extern "C" int legion_hc_up_mix_launch(const legion_hc_up_mix * p, void * stream) {
@@ -156,6 +219,9 @@ extern "C" int legion_hc_up_mix_launch(const legion_hc_up_mix * p, void * stream
             const int64_t pairs = (int64_t) p->n * p->rank / 2;
             lo_bf16<<<(unsigned) ((pairs + 255) / 256), 256, 0, s>>>(*p);
         }
+        if (launch_bf16_reg(*p, s)) {
+            return (int) cudaGetLastError();
+        }
         const int  smem = HC * ROWS * (p->rank / 2 + PAD / 4) * (int) sizeof(uint32_t);
         const dim3 grid(p->e / ROWS, (p->n + CHUNK - 1) / CHUNK);
         if (p->res != nullptr && p->res_bf16 != 0) {
@@ -165,6 +231,7 @@ extern "C" int legion_hc_up_mix_launch(const legion_hc_up_mix * p, void * stream
         } else {
             up_mix_bf16<false><<<grid, WARPS * 32, smem, s>>>(*p);
         }
+        last_kernel.store(1, std::memory_order_relaxed);
         return (int) cudaGetLastError();
     }
     // (The BF16 copy of mixed is the BF16 kernel's only.)
@@ -199,4 +266,8 @@ extern "C" int legion_hc_up_lob_launch(const legion_hc_up_mix * p, void * stream
     const int64_t pairs = (int64_t) p->n * p->rank / 2;
     lo_bf16<<<(unsigned) ((pairs + 255) / 256), 256, 0, (cudaStream_t) stream>>>(*p);
     return (int) cudaGetLastError();
+}
+
+extern "C" int legion_hc_up_mix_last_kernel(void) {
+    return last_kernel.load(std::memory_order_relaxed);
 }

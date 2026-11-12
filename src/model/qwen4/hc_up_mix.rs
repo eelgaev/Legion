@@ -86,6 +86,19 @@ static BF16_ON: AtomicBool = AtomicBool::new(true);
 /// Largest low rank the BF16 kernel takes (its `up` rows staged in 48 KiB of shared memory).
 const MAX_RANK_BF16: i64 = 368;
 
+/// The BF16 kernel launches run with ([`force_kernel`]).
+static KERNEL: AtomicI32 = AtomicI32::new(0);
+
+/// Forces the BF16 up-mix's kernel for the launches from now on (`legion hc-up-mix-bench`): 0
+/// the default (`up_mix_bf16_reg` at rank 320 and 512 tokens or more, else `up_mix_bf16`), 1
+/// `up_mix_bf16`, 2 `up_mix_bf16_reg` at any token count, 2 + 100 R its runs of R tiles a CTA
+/// (`src/cuda/hc_up_mix.cu`). Every kernel adds the same products in the same order, so the
+/// same bits.
+#[doc(hidden)]
+pub fn force_kernel(kernel: i32) {
+    KERNEL.store(kernel, Ordering::Relaxed);
+}
+
 /// Sets whether graphs built from now on run the mixer's up matmul and gated mix as one op for
 /// BF16 `up` weights where it fits (on by default; [`set_up_mix`] off turns it off too); `false`
 /// keeps ggml's cuBLAS `mul_mat` and `hc_pre`.
@@ -662,6 +675,8 @@ struct HcUpMix {
     mixedb: *mut u16,
     /// Nonzero: the F32 mixed values are not written.
     skip_f32: i32,
+    /// BF16 `up` only: the kernel ([`force_kernel`]; 0 the default).
+    kernel: i32,
 }
 
 #[cfg(feature = "cuda")]
@@ -689,6 +704,7 @@ impl HcUpMix {
             lob_ready: 0,
             mixedb: std::ptr::null_mut(),
             skip_f32: 0,
+            kernel: 0,
         }
     }
 }
@@ -697,6 +713,20 @@ impl HcUpMix {
 unsafe extern "C" {
     fn legion_hc_up_mix_launch(p: *const HcUpMix, stream: *mut c_void) -> i32;
     fn legion_hc_up_lob_launch(p: *const HcUpMix, stream: *mut c_void) -> i32;
+    fn legion_hc_up_mix_last_kernel() -> i32;
+}
+
+/// The BF16 up-mix kernel the last launch ran, numbered as [`force_kernel`] numbers them (0: none
+/// yet, or no CUDA build).
+#[doc(hidden)]
+pub fn last_kernel() -> i32 {
+    #[cfg(feature = "cuda")]
+    {
+        // SAFETY: reads an atomic.
+        unsafe { legion_hc_up_mix_last_kernel() }
+    }
+    #[cfg(not(feature = "cuda"))]
+    0
 }
 
 #[cfg(feature = "cuda")]
@@ -765,6 +795,7 @@ unsafe fn cuda_hc_up_mix(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
                 c => (*c).data as *mut u16,
             },
             skip_f32: params[P_SKIP_F32],
+            kernel: KERNEL.load(Ordering::Relaxed),
         };
         match legion_hc_up_mix_launch(&p, stream) {
             0 => Ok(()),
@@ -772,6 +803,8 @@ unsafe fn cuda_hc_up_mix(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
         }
     }
 }
+
+pub mod bench;
 
 #[cfg(test)]
 mod tests;

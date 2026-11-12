@@ -176,3 +176,199 @@ __global__ void __launch_bounds__(WARPS * 32) up_mix_bf16(const legion_hc_up_mix
     __trap();
 #endif
 }
+
+// up_mix_bf16_reg (#1183): up_mix_bf16's sums and mix, laid out for the memory floor of a
+// prompt step. The mix streams the 4 streams of every token once (F32: 40 KB a token at
+// qwen4exp's shape) and its matmul is small (rank 320), so what costs is everything around the
+// bytes: up_mix_bf16 stages 40 KB of up rows per 128 tokens with one dependent load per 16
+// bytes, has 4 warps on a CTA and 2 CTAs on an SM to cover it, and starts each epilogue on an
+// L2 prefetch issued just before its matmul.
+//
+// Here a warp holds its 16 up rows of one stream in registers (KS = rank / 16 K steps of the
+// m16n8k16 A fragment), loaded once; a CTA owns CG groups of 16 columns (CG x HC warps) and a
+// run of tokens (the launch's chunk), TT at a time. Per tile: lo's TT rows go to shared memory
+// by cp.async one tile ahead (shared by all the CTA's warps), each warp adds its stream's
+// products for TT tokens in K order from zero (up_mix_bf16's instructions: the same A, B and C
+// fragments, so the same sums), the gates go to shared memory, and then every thread mixes
+// TT / 8 outputs of one column with up_mix_bf16's epilogue expressions, the streams in order.
+// The streams are prefetched into L2 PD tiles ahead (one bulk prefetch per token and stream on
+// sm_90+). For a handful of tokens the up rows are most of the bytes and the register loads of
+// A cost more than up_mix_bf16's staging; the launch keeps up_mix_bf16 there.
+template <int KS, int CG, int TT, int MINB, int PD, bool RB, bool S16>
+__global__ void __launch_bounds__(CG * HC * 32, MINB) up_mix_bf16_reg(const legion_hc_up_mix p, const int chunk) {
+    static_assert(RB || !S16, "up_mix_bf16_reg: BF16 streams in the rebuilt form only");
+    static_assert(TT % 8 == 0 && TT >= 8, "up_mix_bf16_reg: whole n8 tiles");
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr int THREADS = CG * HC * 32;
+    constexpr int COLS    = CG * ROWS;      // mixed columns of the CTA
+    constexpr int NT      = TT / 8;         // n8 token tiles a tile
+    constexpr int LW      = KS * 8 + PAD / 4;  // 32-bit words per staged lo row
+    constexpr int GS      = COLS + 4;       // floats per staged gate row (2 GS = 8 mod 32 words)
+    constexpr int J       = TT / 8;         // outputs a thread mixes per tile (TT x COLS / THREADS)
+    constexpr int ES      = S16 ? 2 : 4;    // bytes per stream value
+    extern __shared__ int smem[];
+    uint32_t * lb = (uint32_t *) smem;            // [2][TT][LW]: lo's BF16 pairs
+    float *    gs = (float *) (lb + 2 * TT * LW);  // [HC][TT][GS]: the gates
+
+    const int     tid = threadIdx.x, warp = tid / 32, lane = tid % 32, g = lane / 4, q = lane % 4;
+    const int     c = warp % HC, gi = warp / HC;  // the warp's stream and column group
+    const int     i0 = blockIdx.x * COLS;
+    const int64_t K  = (int64_t) HC * p.e;
+    const int     t_begin = blockIdx.y * chunk;
+    const int     t_end   = min(p.n, t_begin + chunk);
+    if (t_begin >= t_end) {
+        return;
+    }
+    const int tiles = (t_end - t_begin + TT - 1) / TT;
+    const void * xs = RB ? (const void *) p.res : (const void *) p.xn;
+
+    // lo's rows of tile `tile` into buffer `buf` (tokens past the run: zeros), one group.
+    auto stage = [&](int tile, int buf) {
+        constexpr int V    = KS * 2;  // 16-byte pieces a row
+        const int     base = t_begin + tile * TT;
+        for (int u = tid; u < TT * V; u += THREADS) {
+            const int      r = u / V, v = u % V;
+            const int      tok = base + r;
+            const bool     ok  = tok < t_end;
+            const char *   src = (const char *) p.lob + (int64_t) (ok ? tok : t_begin) * (KS * 32) + v * 16;
+            const uint32_t dst = (uint32_t) __cvta_generic_to_shared(lb + (buf * TT + r) * LW + v * 4);
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src), "r"(ok ? 16 : 0)
+                         : "memory");
+        }
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    };
+    // The streams of tile `tile` into L2: COLS values per token and stream.
+    auto prefetch = [&](int tile) {
+        if (tile >= tiles) {
+            return;
+        }
+        const int base = t_begin + tile * TT;
+        for (int u = tid; u < TT * HC; u += THREADS) {
+            const int tok = base + u / HC;
+            if (tok < t_end) {
+                const char * x = (const char *) xs + ((int64_t) tok * K + (int64_t) (u % HC) * p.e + i0) * ES;
+#if __CUDA_ARCH__ >= 900
+                if (((uintptr_t) x & 15) == 0) {
+                    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(x), "r"((uint32_t) (COLS * ES)));
+                    continue;
+                }
+#endif
+#pragma unroll
+                for (int b = 0; b < COLS * ES; b += 32) {
+                    asm volatile("prefetch.global.L2 [%0];" ::"l"(x + b));
+                }
+            }
+        }
+    };
+
+    stage(0, 0);
+#pragma unroll
+    for (int d = 0; d < PD; d++) {
+        prefetch(d);
+    }
+
+    // A: the warp's up rows c * e + i0 + 16 gi + g and + 8, every K step (up_mix_bf16's
+    // fragment: words k0 / 2 + q and k0 / 2 + 4 + q of each row).
+    uint32_t a[KS][4];
+    {
+        const uint32_t * r0 = (const uint32_t *) (p.up + (int64_t) (c * p.e + i0 + gi * ROWS + g) * p.up_nb1);
+        const uint32_t * r1 = (const uint32_t *) ((const char *) r0 + 8 * p.up_nb1);
+#pragma unroll
+        for (int k = 0; k < KS; k++) {
+            a[k][0] = r0[k * 8 + q];
+            a[k][1] = r1[k * 8 + q];
+            a[k][2] = r0[k * 8 + 4 + q];
+            a[k][3] = r1[k * 8 + 4 + q];
+        }
+    }
+    // The thread's epilogue column and gammas.
+    const int ec = tid % COLS, er = tid / COLS;  // er: 0 .. THREADS / COLS - 1 = 7
+    const int ei = i0 + ec;
+    float     gv[HC];
+#pragma unroll
+    for (int s = 0; s < HC; s++) {
+        gv[s] = RB ? p.g[s * p.e + ei] : 0.0f;
+    }
+
+    for (int it = 0; it < tiles; it++) {
+        const int buf  = it & 1;
+        const int base = t_begin + it * TT;
+        asm volatile("cp.async.wait_group 0;" ::: "memory");
+        // Tile it's lo is in; every thread is past the last tile's matmul (buffer buf ^ 1 free)
+        // and its mix (the gates free).
+        __syncthreads();
+        if (it + 1 < tiles) {
+            stage(it + 1, buf ^ 1);
+        }
+        if (PD > 0) {
+            prefetch(it + PD);
+        }
+
+        float acc[NT][4];
+#pragma unroll
+        for (int t = 0; t < NT; t++) {
+#pragma unroll
+            for (int l = 0; l < 4; l++) {
+                acc[t][l] = 0.0f;
+            }
+        }
+        const uint32_t * lt = lb + buf * TT * LW;
+#pragma unroll
+        for (int k = 0; k < KS; k++) {
+            uint32_t b[NT][2];
+#pragma unroll
+            for (int t = 0; t < NT; t++) {
+                const uint32_t * src = lt + (t * 8 + g) * LW + k * 8;
+                b[t][0]              = src[q];
+                b[t][1]              = src[4 + q];
+            }
+#pragma unroll
+            for (int t = 0; t < NT; t++) {
+                mma_bf16(acc[t], a[k], b[t]);
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < NT; t++) {
+#pragma unroll
+            for (int l = 0; l < 4; l++) {
+                gs[(c * TT + t * 8 + 2 * q + (l & 1)) * GS + gi * ROWS + g + (l >> 1) * 8] = acc[t][l];
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int j = 0; j < J; j++) {
+            const int tt  = er + 8 * j;
+            const int tok = base + tt;
+            if (tok < t_end) {
+                const int64_t at  = (int64_t) tok * K + ei;
+                float         sum = 0.0f;
+#pragma unroll
+                for (int s = 0; s < HC; s++) {
+                    float xv;
+                    if constexpr (S16) {
+                        xv = __bfloat162float(((const __nv_bfloat16 *) p.res)[at + (int64_t) s * p.e]);
+                    } else {
+                        xv = ((const float *) xs)[at + (int64_t) s * p.e];
+                    }
+                    if constexpr (RB) {
+                        xv = __fmul_rn(__fmul_rn(xv, p.sc[(int64_t) tok * HC + s]), gv[s]);
+                    }
+                    const float wv = 1.0f / (1.0f + expf(-gs[(s * TT + tt) * GS + ec]));
+                    sum += xv * wv;
+                }
+                const float   v  = p.scale * sum;
+                const int64_t mo = (int64_t) tok * p.e + ei;
+                if (p.skip_f32 == 0) {
+                    p.mixed[mo] = v;
+                }
+                if (p.mixedb != nullptr) {
+                    ((__nv_bfloat16 *) p.mixedb)[mo] = __float2bfloat16(v);
+                }
+            }
+        }
+    }
+#else
+    __trap();
+#endif
+}
