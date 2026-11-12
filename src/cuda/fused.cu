@@ -197,7 +197,8 @@ int legion_hc_post_norm_fold_launch(const legion_hc_post_norm * p, const legion_
 // res is BF16 too (res_ld in BF16 values), else F32. f: null, or a folded MoE tail (as
 // legion_hc_post_norm_fold_launch; p->out is then not read). Each thread takes pairs of
 // adjacent values (4-byte BF16 and 8-byte F32 accesses), so the sums run in another order
-// than the F32 kernels'. -1 if the step does not fit.
+// than the F32 kernels'. xnb may be null (src/cuda/hc_down.cu rebuilds it in the down matmul):
+// then it is not written. -1 if the step does not fit.
 int legion_hc_post_norm_b16_launch(const legion_hc_post_norm * p, const legion_moe_fold * f, int in16, void * stream);
 
 // delta_prep: a gated DeltaNet layer's delta-rule inputs from its conv output, per token:
@@ -1747,7 +1748,10 @@ __global__ void __launch_bounds__(HC_THREADS, 4) hc_post_norm_b16_kernel(legion_
         // (rn * scale) * gamma, as up_mix_bf16 rebuilds it from the BF16 streams
         const float y0 = __fmul_rn(__fmul_rn(v.x, scale[i / PS]), gk.x);
         const float y1 = __fmul_rn(__fmul_rn(v.y, scale[i / PS]), gk.y);
-        xnb[k] = __floats2bfloat162_rn(y0, y1);
+        // (Null where the down matmul rebuilds xnb itself, src/cuda/hc_down.cu, #1183.)
+        if (p.xnb != nullptr) {
+            xnb[k] = __floats2bfloat162_rn(y0, y1);
+        }
 #pragma unroll
         for (int j = 0; j < NINJ; j++) {
             const float2 wk = ((const float2 *) (p.w + (int64_t) n * j))[k];
@@ -2045,7 +2049,7 @@ int legion_hc_post_norm_b16_launch(const legion_hc_post_norm * p, const legion_m
     const bool aligned = (uintptr_t) p->res % (in16 ? 4 : 8) == 0 && p->res_ld % 2 == 0 &&
                          (uintptr_t) p->res_new % 4 == 0 && (uintptr_t) p->xnb % 4 == 0 &&
                          (uintptr_t) p->g % 8 == 0 && (uintptr_t) p->w % 8 == 0;
-    if (major < 8 || p->hc != B16_HC || p->n_inj != 4 || p->e != E || p->xnb == nullptr || p->scale_at == 0 ||
+    if (major < 8 || p->hc != B16_HC || p->n_inj != 4 || p->e != E || p->scale_at == 0 ||
         p->xq != nullptr || p->xn16 != nullptr || p->rs != nullptr || p->n_tok < 1 || !aligned) {
         return -1;
     }

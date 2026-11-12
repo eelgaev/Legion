@@ -11,6 +11,7 @@ mod ep_place;
 mod expert_mv_ptx_bench;
 mod gdn_bench;
 mod gguf;
+mod hc_down_bench;
 mod hc_mix_bench;
 mod head_mm_bench;
 mod hfmodel;
@@ -133,6 +134,10 @@ enum Command {
     /// Check and time qwen4exp's hyper-connection mixer op in its kernel variants (development).
     #[command(hide = true)]
     HcMixBench(hc_mix_bench::HcMixBenchArgs),
+    /// Check and time qwen4exp's mixer down matmul with xn rebuilt from BF16 streams against
+    /// the norm's BF16 xn and cuBLAS (development).
+    #[command(hide = true)]
+    HcDownBench(hc_down_bench::HcDownBenchArgs),
     /// Check and time the read-each-expert-once NVFP4 expert op against ggml's mmvq
     /// (development).
     #[command(hide = true)]
@@ -239,6 +244,7 @@ async fn run(cli: Cli, numa: Option<legion::hw::numa_bind::Placement>) -> anyhow
         Command::Q8MvBench(args) => q8_mv_bench::run(args),
         Command::Q8HeadBench(args) => q8_head_bench::run(args),
         Command::HcMixBench(args) => hc_mix_bench::run(args),
+        Command::HcDownBench(args) => hc_down_bench::run(args),
         Command::Nvfp4OnceBench(args) => nvfp4_once_bench::run(args),
         Command::Nvfp4MvqBench(args) => nvfp4_mvq_bench::run(args),
         Command::Q4kHeadBench(args) => q4k_head_bench::run(args),
