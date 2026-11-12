@@ -26,19 +26,29 @@ The gate behind `--spec-max-batch` stops the MTP drafts at 8 or more decoding se
 without drafts. Without `--spec mtp` (an earlier build): 1 user 19.7, 4 users 56.3, 16 users 121.9, prefill
 8K 1,977 / 32K 1,972.
 
-### 16 users: one output-moving opt-in
+### The table's row: three output-moving opt-ins
 
-Add this to the command above:
+Add these to the command above:
 
 ```sh
-  --spec-gate-cost-model off
+  --spec-gate-cost-model off \
+  --nvfp4-expert-rows-bf16 \
+  --hc-bf16
 ```
 
-The table's row is this command (2026-11-03, the same session as the numbers above): 16 users decode at
+`--spec-gate-cost-model off` alone (2026-11-03, the same session as the numbers above): 16 users decode at
 172.1 tok/s total, against 121.0 without the flag; MTP keeps drafting at the depth its step-cost model picks,
 mean accepted length 3.07. 1 user 34.8 (story) to 57.7 (code), median 41.9, mean accepted length 3.13;
 4 users 92.0. Prefill 8,240 / 32,738 / 122,528 tokens: 2,024 / 2,065 / 1,946 tok/s. Greedy text at 8 or
 more users changes (other drafts, other verify shapes).
+
+All three (2026-11-12): prefill 8,240 / 32,738 / 122,528 tokens at 2,353 / 2,450 / 2,276 tok/s, against
+2,146 / 2,205 / 2,071 with `--spec-gate-cost-model off` alone from the same build in the same session (the
+rest of the gain since 2026-11-03 is the default prompt-step kernels, same output). The two prefill flags
+leave decode alone: 1 user 36.2 (story) to 58.6 (code), median 43.9; 4 users 91.7; 16 users 172.9 (without
+them 34.8-58.5, 94.2 and 179.5; 4 and 16 users swing a few percent between rounds). Both round prompt-step
+values to BF16, so greedy text can move after prompts of over 64 tokens. The table's row: decode from
+2026-11-03, prefill from 2026-11-12.
 
 - The opt-in prefill numbers (8K 1,749 / 32K 1,800) add `--nvfp4-a4 prefill --prefill-even` to the command
   without `--spec` (an earlier build).
@@ -52,3 +62,5 @@ more users changes (other drafts, other verify shapes).
 - `--spec` (`mtp`): Speculative decoding drafter. `mtp` uses the model's own multi-token-prediction head to draft tokens that one verify step then checks, which raises decode speed without changing greedy output. The NVFP4 checkpoint ships its head, so no `--spec-draft` file is needed.
 - `--spec-draft-vocab` (`65536`): The MTP head scores only the first N vocabulary entries while drafting, reading N rows of the output head instead of all of them. Drafting gets cheaper; the verify step still checks against the full vocabulary, so output does not change.
 - `--spec-gate-cost-model` (`off`, opt-in above): lets MTP keep drafting at `--spec-max-batch` (8) or more decoding sequences, at the depth its step-cost model picks. Output-moving at 8 or more users.
+- `--nvfp4-expert-rows-bf16` (opt-in above): on prompt steps of more than 64 tokens, the routed experts' down projection stores each (token, expert) row as BF16 instead of F32 and the weighted sum reads it back (here the hyper-connection norm the MoE output folds into reads them), half the bytes of those rows. Output-moving: each row is rounded to BF16 before the sum. Decode and verify steps keep F32 rows.
+- `--hc-bf16` (opt-in above): on prompt steps of 256 or more tokens on the GB10, the hyper-connection residual streams stay BF16 between the mixers instead of F32, so the combine-and-norm and the up-mix kernel move half the stream bytes. Math stays F32 inside each kernel; each new stream value is rounded to BF16, so output moves. Decode, verify and mixed steps keep F32 streams.

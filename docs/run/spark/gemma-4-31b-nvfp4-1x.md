@@ -37,6 +37,10 @@ and argmax, same bits): 16 users 252.4, the median of 16 rounds in two sessions 
 vLLM's 244.3), against 250.9 (235.8-254.5) for the build before the head change in the same sessions. 1 user
 the same tokens and speed, 4 users ~83, prefill 8K 1,965, 32K 1,643, 123K 916.
 
+Re-measured 2026-11-12 with this command (two servers, 2 rounds each), after the queries-as-M prompt attention
+for heads of 256: within run noise of the row. 1 user 22.1 (story) to 39.6 (code), median 29.1, the same tokens;
+4 users 84.4; 16 users 254.2 (252.2-257.4); prefill 8K 2,009 / 2,016, 32K 1,654 / 1,654, 123K 913 / 911.
+
 The 2026-11-06 session, before `--spec-draft-batched-attn` and the drafter step changes that came with it:
 22.1-39.5 at 1 user (29.0 median), 81.0 at 4 users, 235.1 at 16, prefill 8K 1,845, 32K 1,540, 123K 874. The
 build before `--head-rope-fused`
