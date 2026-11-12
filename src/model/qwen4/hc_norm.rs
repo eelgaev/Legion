@@ -42,6 +42,14 @@ const P_NO_RES: usize = 8;
 /// #1183).
 const PRE_OUT_SRC: usize = 9;
 
+/// The parameter holding [`PostNormKind::padded`]; [`COMPACT`] there is
+/// [`PostNormLayout::compact`].
+const P_PADDED: usize = 6;
+
+/// [`P_PADDED`]'s value for a node laid out without its unwritten parts ([`compact_plan`],
+/// lazy streams, #1183).
+const COMPACT: i32 = 2;
+
 /// Most streams and inject outputs [`hc_norm`]'s CUDA kernel takes.
 pub(super) const HC_NORM_MAX: i64 = 8;
 
@@ -644,6 +652,26 @@ impl PostNormLayout {
             },
         }
     }
+
+    /// The compact layout of a rebuilt BF16-`xn` node ([`hc_post_norm_rebuilt_xnb`], F32
+    /// streams; lazy streams, #1183): `[res_new | xnb | scales | inject]` with no unwritten
+    /// part, `res_new` empty unless `streams` (a [`set_no_res`] node writes none). `xnb` (read
+    /// by a GEMM) starts where the node does or right after the streams, 128 bytes aligned at
+    /// qwen4exp's width as in the padded layout; the scales take `hc` floats a token.
+    fn compact(k: usize, n: usize, hc: usize, n_inj: usize, streams: bool) -> Self {
+        let xn16 = if streams { k * n } else { 0 };
+        let xn = xn16 + (k * n).div_ceil(8) * 4;
+        let inject = xn + hc * n;
+        let end = inject + n_inj * n;
+        PostNormLayout {
+            xn,
+            xn16,
+            down16: xn,
+            inject,
+            xq: (end * 4).next_multiple_of(256),
+            floats: end,
+        }
+    }
 }
 
 /// [`PostNormLayout::new`]'s `scales` for a rebuilt node of `k` values in `hc` streams a token:
@@ -701,15 +729,7 @@ unsafe fn cpu_hc_post_norm(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
         let rebuild = params[3] != 0;
         // BF16 streams (#826): each new value rounded to BF16 before it is used.
         let streams16 = params[5] != 0;
-        let at = PostNormLayout::new(
-            k,
-            n,
-            n_inj,
-            down16_values(down.map(|d| d.type_), k * m),
-            down.is_some(),
-            quant,
-            rebuild.then_some(scales_place(k, hc, params[6] != 0, streams16)),
-        );
+        let at = node_layout(dst);
         let rn = dst.data as *mut f32;
         let rn16 = dst.data as *mut u16;
         let res16 = res.type_ == types::BF16;
@@ -1113,6 +1133,11 @@ unsafe fn node_layout(dst: &ffi::ggml_tensor) -> PostNormLayout {
         let (e, hc, n) = (res.ne[0] as usize, res.ne[1] as usize, res.ne[2] as usize);
         let params = crate::ggml::external_params(dst);
         let k = e * hc;
+        if params[P_PADDED] == COMPACT {
+            // A node that writes no streams (`set_no_res`) holds none.
+            let no_res = params[7] == 0 && params[P_NO_RES] != 0;
+            return PostNormLayout::compact(k, n, hc, w.ne[1] as usize, !no_res);
+        }
         let down = (params[1] != 0).then(|| &*dst.src[5]);
         let m = down.map_or(0, |d| d.ne[1] as usize);
         PostNormLayout::new(
@@ -1122,7 +1147,7 @@ unsafe fn node_layout(dst: &ffi::ggml_tensor) -> PostNormLayout {
             down16_values(down.map(|d| d.type_), k * m),
             down.is_some(),
             params[2] != 0,
-            (params[3] != 0).then_some(scales_place(k, hc, params[6] != 0, params[5] != 0)),
+            (params[3] != 0).then_some(scales_place(k, hc, params[P_PADDED] != 0, params[5] != 0)),
         )
     }
 }
@@ -1205,6 +1230,88 @@ pub(crate) unsafe fn lazy_parts(
 pub(crate) unsafe fn set_no_res(nf: *mut ffi::ggml_tensor) {
     // SAFETY: the caller's.
     unsafe { crate::ggml::set_external_param(nf, P_NO_RES, 1) };
+}
+
+/// How a norm node of the lazy streams ([`lazy_parts`]'s FFN mixer norm after [`set_no_res`],
+/// or the attention mixer norm whose streams it reads) is laid out compactly
+/// ([`PostNormLayout::compact`], [`set_compact`], #1183).
+pub(crate) struct Compact {
+    /// Each written part: its first byte in the node as laid out now, in the compact node, and
+    /// its bytes.
+    pub parts: Vec<(usize, usize, usize)>,
+    /// The compact node's size in floats.
+    pub floats: usize,
+}
+
+/// The [`Compact`] layout of `node`: an unfolded or folded [`hc_post_norm_rebuilt_xnb`] node
+/// (padded, F32 streams, the BF16 `xn` written) that is no graph output. Its padded layout keeps
+/// `xn`'s place, `e · hc` floats a token, of which the scales take `hc` (and a [`set_no_res`]
+/// node does not write the streams' `e · hc` either): ggml's allocator then plans the graph as
+/// it plans main's (#836). The lazy streams' relayout plans the graph again anyway and keeps
+/// both norms' nodes alive longer than main does (`R_a` until the next layer's folded norm),
+/// so they drop those bytes: 80 KB a token for the FFN mixer's norm, 40 KB for the attention
+/// mixer's. `None` for any other node.
+///
+/// # Safety
+/// `node` is a valid tensor, its sources valid tensors.
+pub(crate) unsafe fn compact_plan(node: *const ffi::ggml_tensor) -> Option<Compact> {
+    // SAFETY: the caller's.
+    unsafe {
+        if !crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &HC_POST_NORM)) {
+            return None;
+        }
+        let t = &*node;
+        let p = crate::ggml::external_params(t);
+        // eps, down, quant, rebuild, moe, F32 streams with xnb written, padded
+        if t.flags & ffi::ggml_tensor_flag_GGML_TENSOR_FLAG_OUTPUT as i32 != 0
+            || p[1..7] != [1, 0, 1, 0, 0, 1]
+            || t.src[5].is_null()
+            || (*t.src[5]).type_ != types::BF16
+            || t.type_ != types::F32
+        {
+            return None;
+        }
+        let (res, w) = (&*t.src[0], &*t.src[4]);
+        let (e, hc, n) = (res.ne[0] as usize, res.ne[1] as usize, res.ne[2] as usize);
+        let (k, n_inj) = (e * hc, w.ne[1] as usize);
+        let streams = !(p[7] == 0 && p[P_NO_RES] != 0);
+        let old = node_layout(t);
+        let new = PostNormLayout::compact(k, n, hc, n_inj, streams);
+        // The kernels take the scales' place as a 32-bit offset.
+        if old.floats != t.ne[0] as usize || i32::try_from(new.xn).is_err() {
+            return None;
+        }
+        let mut parts = vec![
+            (old.xn16 * 4, new.xn16 * 4, k * n * 2),
+            (old.xn * 4, new.xn * 4, hc * n * 4),
+            (old.inject * 4, new.inject * 4, n_inj * n * 4),
+        ];
+        if streams {
+            parts.push((0, 0, k * n * 4));
+        }
+        Some(Compact {
+            parts,
+            floats: new.floats,
+        })
+    }
+}
+
+/// Lays `node` out as its [`compact_plan`] says: the node shrinks to `floats`; the caller moves
+/// its views (#1183).
+///
+/// # Safety
+/// As [`crate::ggml::make_external`]: a valid node of an allocated graph that has not run,
+/// planned again after this.
+pub(crate) unsafe fn set_compact(node: *mut ffi::ggml_tensor, floats: usize) {
+    // SAFETY: the caller's.
+    unsafe {
+        crate::ggml::set_external_param(node, P_PADDED, COMPACT);
+        let t = &mut *node;
+        t.ne = [floats as i64, 1, 1, 1];
+        t.nb[1] = t.nb[0] * floats;
+        t.nb[2] = t.nb[1];
+        t.nb[3] = t.nb[2];
+    }
 }
 
 /// Whether `node` is a folded norm ([`fold_moe`]) of F32 streams that may read lazy streams
@@ -1519,24 +1626,10 @@ unsafe fn cuda_hc_post_norm(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
         let (e, hc, n) = (res.ne[0], res.ne[1], res.ne[2]);
         let params = crate::ggml::external_params(dst);
         let down = (params[1] != 0).then(|| &*dst.src[5]);
-        let m = down.map_or(0, |d| d.ne[1]);
         let quant = params[2] != 0;
         let rebuild = params[3] != 0;
         let streams16 = params[5] != 0;
-        let at = PostNormLayout::new(
-            (e * hc) as usize,
-            n as usize,
-            w.ne[1] as usize,
-            down16_values(down.map(|d| d.type_), (e * hc * m) as usize),
-            down.is_some(),
-            quant,
-            rebuild.then_some(scales_place(
-                (e * hc) as usize,
-                hc as usize,
-                params[6] != 0,
-                streams16,
-            )),
-        );
+        let at = node_layout(dst);
         // A Q8_0 down weight: xn and the weight as F16; a BF16 one: xn as BF16 (#469).
         let bf16 = down.is_some_and(|d| d.type_ == types::BF16);
         let down = down.filter(|d| d.type_ == types::Q8_0);
