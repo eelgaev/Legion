@@ -1710,9 +1710,9 @@ fn each_gpu_of_a_mixed_box_answers_for_itself() {
 }
 
 /// [`lazy_bench`]'s chain of qwen4exp's prompt-step layers, small, on the CPU: its outputs (the
-/// last norm's, every FFN mixer's up-mix) as bytes and its FFN mixer norms made lazily, planned
-/// with the fold's relayout (`relayout`) or as built; `out_read`: those layers' streams are
-/// graph outputs too.
+/// last norm's, every FFN mixer's up-mix, then the `out_read` streams) as bytes and its FFN mixer
+/// norms made lazily, planned with the fold's relayout (`relayout`) or as built; `out_read`:
+/// those layers' streams are graph outputs too.
 fn lazy_chain(relayout: bool, out_read: &[usize]) -> (Vec<Vec<u8>>, usize) {
     let cfg = lazy_bench::tiny();
     let mut backend = Backend::cpu().unwrap();
@@ -1740,8 +1740,10 @@ fn lazy_chain(relayout: bool, out_read: &[usize]) -> (Vec<Vec<u8>>, usize) {
     );
     lazy_bench::fill(&i);
     backend.compute(&c.graph).unwrap();
+    // The streams marked as outputs are compared too: a lazy rewrite must leave them written.
+    let streams = out_read.iter().map(|&l| c.ffn[l].0.bytes());
     (
-        c.outs.iter().map(|t| t.bytes()).collect(),
+        c.outs.iter().map(|t| t.bytes()).chain(streams).collect(),
         lazy_bench::made(&c),
     )
 }

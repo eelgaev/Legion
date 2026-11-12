@@ -313,7 +313,9 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
         let want: Vec<Vec<u8>> = chains[0].0.outs.iter().map(|t| t.bytes()).collect();
         let mut best = [f64::MAX; 2];
         for round in 0..=cfg.rounds {
-            for (vi, (c, _)) in chains.iter().enumerate() {
+            // Odd rounds run lazy first: neither variant always gets the warmer state.
+            for vi in [round % 2, 1 - round % 2] {
+                let c = &chains[vi].0;
                 let t = std::time::Instant::now();
                 gpu.compute(&c.graph)
                     .map_err(|e| format!("{n} tokens: {e}"))?;
