@@ -126,6 +126,20 @@ struct legion_hc_post_norm {
     // the stream before this kernel, so a captured launch reads the current exchange's buffers.
     // At the end: every other field keeps its place.
     const __nv_bfloat16 * const * rs;
+    // Lazy streams (#1183, src/model/core/node_fuse/fold.rs): null, or res holds the streams
+    // before the previous block's combine, made here first as that block's norm made them,
+    // res' = pre_out * w + res with w = 2 sigmoid(pre_inj / hc) per stream (the same
+    // expressions, so the same bits): pre_out [e, n_tok] (token t at pre_out + t * pre_out_ld),
+    // pre_inj [hc, n_tok] (token t at pre_inj + t * pre_inj_ld). legion_hc_post_norm_fold_launch
+    // only.
+    const float * pre_out;
+    int64_t pre_out_ld;
+    const float * pre_inj;
+    int64_t pre_inj_ld;
+    // Nonzero: the new streams are not written (res_new's streams stay as they are; a reader
+    // makes them from this launch's res, out and inj, see pre_out). legion_hc_post_norm_launch's
+    // rebuilt BF16-xn form only.
+    int32_t no_res;
 };
 
 int legion_hc_post_norm_launch(const legion_hc_post_norm * p, void * stream);
@@ -1014,8 +1028,9 @@ __global__ void __launch_bounds__(HC_THREADS) hc_post_norm_reg_kernel(legion_hc_
 // RS (#1176, legion_hc_post_norm_rs_launch): out made from the two ranks' BF16 partials at the
 // addresses p.rs holds, rank 0's first, as tp_sum_bf16 makes it (each widened to F32, one
 // rounded add): out's bits.
+// NR (#1183, p.no_res): the new streams are not written; everything else is the same.
 template <int HC, int NINJ, int PS, bool SM80 = false, bool Q = false, bool B16 = false, bool RB = false,
-          bool RS = false>
+          bool RS = false, bool NR = false>
 __global__ void __launch_bounds__(HC_THREADS, 4) hc_post_norm_v70_kernel(legion_hc_post_norm p) {
     static_assert(HC <= HC_MAX && NINJ <= HC_INJ_MAX, "hc_post_norm_v70_kernel: too many sums");
     static_assert(!(Q && B16), "hc_post_norm_v70_kernel: xq or xnb, not both");
@@ -1077,7 +1092,9 @@ __global__ void __launch_bounds__(HC_THREADS, 4) hc_post_norm_v70_kernel(legion_
             const int i = h * PS + r;
             // dsv4_hc_post_f32: sum = x * post; sum += residual
             const float v = __fmaf_rn(ov[r], wpost[h], val[i]);
-            rn[threadIdx.x + i * HC_THREADS] = v;
+            if constexpr (!NR) {
+                rn[threadIdx.x + i * HC_THREADS] = v;
+            }
             val[i] = v;
             sq[h] = SM80 ? __fadd_rn(sq[h], __fmul_rn(v, v)) : __fmaf_rn(v, v, sq[h]);
         }
@@ -1486,7 +1503,10 @@ __device__ __forceinline__ void moe_fold_row(const legion_moe_fold & f, int64_t 
 // hc_post_norm_fold (#836): hc_post_norm_v70_kernel<4, 4, 10, true, false, true, true>'s pass
 // (sm_80+, the BF16 xn and the streams' scales, the L2 prefetch of gamma and the inject weights)
 // after moe_fold_row: from the token's out row on, the same values in the same order.
-template <bool FMA, bool W, bool X16 = false>
+// PRE (#1183, lazy streams, p.pre_out): res holds the streams before the previous block's
+// combine, which is made first per value as hc_post_norm_v70_kernel made it in that block's
+// norm (the same inject expressions and the same FMA, so the same bits).
+template <bool FMA, bool W, bool X16 = false, bool PRE = false>
 __global__ void __launch_bounds__(HC_THREADS, 4) hc_post_norm_fold_kernel(legion_hc_post_norm p, legion_moe_fold f) {
     constexpr int HC = 4, NINJ = 4, PS = 10, PER = HC * PS;
     __shared__ float red[HC_MAX][HC_THREADS / 32];
@@ -1506,9 +1526,30 @@ __global__ void __launch_bounds__(HC_THREADS, 4) hc_post_norm_fold_kernel(legion
     float ov[PS];
     moe_fold_row<PS, FMA, W, X16>(f, t, ov);
     float val[PER];
+    if constexpr (PRE) {
+        float wpre[HC];
 #pragma unroll
-    for (int i = 0; i < PER; i++) {
-        val[i] = res[threadIdx.x + i * HC_THREADS];
+        for (int h = 0; h < HC; h++) {
+            // ggml: scale(inject, 1 / hc), sigmoid, scale(2), as wpost below
+            const float v = p.pre_inj[t * p.pre_inj_ld + h] * (1.0f / (float) p.hc);
+            const float s = 1.0f / (1.0f + expf(-v));
+            wpre[h] = s * 2.0f;
+        }
+        const float * po = p.pre_out + t * p.pre_out_ld;
+#pragma unroll
+        for (int r = 0; r < PS; r++) {
+            const float o = po[threadIdx.x + r * HC_THREADS];
+#pragma unroll
+            for (int h = 0; h < HC; h++) {
+                const int i = h * PS + r;
+                val[i] = __fmaf_rn(o, wpre[h], res[threadIdx.x + i * HC_THREADS]);
+            }
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < PER; i++) {
+            val[i] = res[threadIdx.x + i * HC_THREADS];
+        }
     }
     float wpost[HC];
 #pragma unroll
@@ -1880,7 +1921,7 @@ static void hc_post_norm_dispatch(const legion_hc_post_norm * p, cudaStream_t st
 }
 
 int legion_hc_post_norm_launch(const legion_hc_post_norm * p, void * stream) {
-    if (p->hc > HC_MAX || p->n_inj > HC_INJ_MAX) {
+    if (p->hc > HC_MAX || p->n_inj > HC_INJ_MAX || p->pre_out != nullptr) {
         return -1;
     }
     const cudaStream_t st = (cudaStream_t) stream;
@@ -1900,8 +1941,17 @@ int legion_hc_post_norm_launch(const legion_hc_post_norm * p, void * stream) {
             if (p->hc != 4 || p->n_inj != 4 || p->e != 10 * HC_THREADS) {
                 return -1;
             }
-            hc_post_norm_v70_kernel<4, 4, 10, true, false, true, true><<<p->n_tok, HC_THREADS, 0, st>>>(*p);
+            if (p->no_res != 0) {
+                // Lazy streams (#1183): the new streams not written.
+                hc_post_norm_v70_kernel<4, 4, 10, true, false, true, true, false, true>
+                    <<<p->n_tok, HC_THREADS, 0, st>>>(*p);
+            } else {
+                hc_post_norm_v70_kernel<4, 4, 10, true, false, true, true><<<p->n_tok, HC_THREADS, 0, st>>>(*p);
+            }
             return (int) cudaGetLastError();
+        }
+        if (p->no_res != 0) {
+            return -1;
         }
         const bool all_generic = __atomic_load_n(&g_hc_generic, __ATOMIC_RELAXED) != 0;
         if (t_hc_generic == 0 && !all_generic && p->hc == 4 && p->n_inj == 4 && p->e == 10 * HC_THREADS) {
@@ -1910,6 +1960,9 @@ int legion_hc_post_norm_launch(const legion_hc_post_norm * p, void * stream) {
             hc_post_norm_kernel<false><<<p->n_tok, HC_THREADS, 0, st>>>(*p);
         }
         return (int) cudaGetLastError();
+    }
+    if (p->no_res != 0) {
+        return -1;
     }
     if (p->xq == nullptr && p->scale_at != 0) {
         // The scales instead of xn, with xn16 (#774): the V100 kernel at qwen4exp's shape only.
@@ -1934,6 +1987,9 @@ int legion_hc_post_norm_launch(const legion_hc_post_norm * p, void * stream) {
 }
 
 int legion_hc_post_norm_rs_launch(const legion_hc_post_norm * p, void * stream) {
+    if (p->pre_out != nullptr || p->no_res != 0) {
+        return -1;  // (lazy streams: legion_hc_post_norm_launch / _fold_launch only)
+    }
     int dev = 0, major = 0;
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
@@ -1948,6 +2004,9 @@ int legion_hc_post_norm_rs_launch(const legion_hc_post_norm * p, void * stream) 
 }
 
 int legion_hc_post_norm_s16_launch(const legion_hc_post_norm * p, int in16, void * stream) {
+    if (p->pre_out != nullptr || p->no_res != 0) {
+        return -1;  // (lazy streams: legion_hc_post_norm_launch / _fold_launch only)
+    }
     int dev = 0, major = 0;
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
@@ -1965,6 +2024,9 @@ int legion_hc_post_norm_s16_launch(const legion_hc_post_norm * p, int in16, void
 }
 
 int legion_hc_post_norm_moe_launch(const legion_hc_post_norm * p, const legion_moe_pair_sum * s, void * stream) {
+    if (p->pre_out != nullptr || p->no_res != 0) {
+        return -1;  // (lazy streams: legion_hc_post_norm_launch / _fold_launch only)
+    }
     int dev = 0, major = 0, minor = 0;
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
@@ -1993,6 +2055,16 @@ int legion_hc_post_norm_moe_launch(const legion_hc_post_norm * p, const legion_m
     return (int) cudaGetLastError();
 }
 
+// hc_post_norm_fold_kernel<FMA, W, X16>, its lazy-streams form for p->pre_out.
+template <bool FMA, bool W, bool X16>
+static void hc_post_norm_fold_go(const legion_hc_post_norm * p, const legion_moe_fold * f, cudaStream_t st) {
+    if (p->pre_out != nullptr) {
+        hc_post_norm_fold_kernel<FMA, W, X16, true><<<p->n_tok, HC_THREADS, 0, st>>>(*p, *f);
+    } else {
+        hc_post_norm_fold_kernel<FMA, W, X16><<<p->n_tok, HC_THREADS, 0, st>>>(*p, *f);
+    }
+}
+
 int legion_hc_post_norm_fold_launch(const legion_hc_post_norm * p, const legion_moe_fold * f, void * stream) {
     int dev = 0, major = 0;
     cudaGetDevice(&dev);
@@ -2000,23 +2072,23 @@ int legion_hc_post_norm_fold_launch(const legion_hc_post_norm * p, const legion_
     if (major < 8 || p->hc != 4 || p->n_inj != 4 || p->e != 10 * HC_THREADS || p->xnb == nullptr ||
         p->scale_at == 0 || p->xq != nullptr || p->xn16 != nullptr || p->n_tok < 1 || f->k < 1 ||
         f->sh == nullptr || (f->w == nullptr && f->fma != 0) || (f->x == nullptr) == (f->x16 == nullptr) ||
-        (f->x16 != nullptr && f->w == nullptr)) {
+        (f->x16 != nullptr && f->w == nullptr) || p->no_res != 0 || (p->pre_out == nullptr) != (p->pre_inj == nullptr)) {
         return -1;
     }
     const cudaStream_t st = (cudaStream_t) stream;
     if (f->x16 != nullptr) {
         // BF16 rows (--nvfp4-expert-rows-bf16, #1183): with the router weights only.
         if (f->fma != 0) {
-            hc_post_norm_fold_kernel<true, true, true><<<p->n_tok, HC_THREADS, 0, st>>>(*p, *f);
+            hc_post_norm_fold_go<true, true, true>(p, f, st);
         } else {
-            hc_post_norm_fold_kernel<false, true, true><<<p->n_tok, HC_THREADS, 0, st>>>(*p, *f);
+            hc_post_norm_fold_go<false, true, true>(p, f, st);
         }
     } else if (f->w == nullptr) {
-        hc_post_norm_fold_kernel<false, false><<<p->n_tok, HC_THREADS, 0, st>>>(*p, *f);
+        hc_post_norm_fold_go<false, false, false>(p, f, st);
     } else if (f->fma != 0) {
-        hc_post_norm_fold_kernel<true, true><<<p->n_tok, HC_THREADS, 0, st>>>(*p, *f);
+        hc_post_norm_fold_go<true, true, false>(p, f, st);
     } else {
-        hc_post_norm_fold_kernel<false, true><<<p->n_tok, HC_THREADS, 0, st>>>(*p, *f);
+        hc_post_norm_fold_go<false, true, false>(p, f, st);
     }
     return (int) cudaGetLastError();
 }
@@ -2042,6 +2114,9 @@ static void hc_post_norm_b16_fold(const legion_hc_post_norm * p, const legion_mo
 }
 
 int legion_hc_post_norm_b16_launch(const legion_hc_post_norm * p, const legion_moe_fold * f, int in16, void * stream) {
+    if (p->pre_out != nullptr || p->no_res != 0) {
+        return -1;  // (lazy streams: legion_hc_post_norm_launch / _fold_launch only)
+    }
     int dev = 0, major = 0;
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);

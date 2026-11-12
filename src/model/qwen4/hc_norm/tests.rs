@@ -1708,3 +1708,64 @@ fn each_gpu_of_a_mixed_box_answers_for_itself() {
         assert_eq!(gpu_for_by(None, engine, xnb_takes, false, test_cc), engine);
     }
 }
+
+/// [`lazy_bench`]'s chain of qwen4exp's prompt-step layers, small, on the CPU: its outputs (the
+/// last norm's, every FFN mixer's up-mix) as bytes and its FFN mixer norms made lazily, planned
+/// with the fold's relayout (`relayout`) or as built; `out_read`: those layers' streams are
+/// graph outputs too.
+fn lazy_chain(relayout: bool, out_read: &[usize]) -> (Vec<Vec<u8>>, usize) {
+    let cfg = lazy_bench::tiny();
+    let mut backend = Backend::cpu().unwrap();
+    backend.set_threads(4);
+    let wctx = Context::new(16 * cfg.layers + 8, 0);
+    let w = lazy_bench::weights(&wctx, &backend, &cfg).unwrap();
+    let ctx = lazy_bench::context(cfg.layers);
+    let i = lazy_bench::inputs(&ctx, &cfg, cfg.tokens[0]);
+    let c = lazy_bench::build(&ctx, &w, &i);
+    for &l in out_read {
+        c.ffn[l].0.as_output();
+    }
+    let allocator = ComputeAllocator::new(backend.buffer_type());
+    let allocator = if relayout {
+        allocator.with_relayout(fold_relayout())
+    } else {
+        allocator
+    };
+    ctx.alloc_graph(&c.graph, allocator).unwrap();
+    // A view left unread (the old streams' views) would hold its norm's memory to the end.
+    assert_eq!(
+        lazy_bench::unread_views(&c.graph),
+        0,
+        "unread views in the planned graph"
+    );
+    lazy_bench::fill(&i);
+    backend.compute(&c.graph).unwrap();
+    (
+        c.outs.iter().map(|t| t.bytes()).collect(),
+        lazy_bench::made(&c),
+    )
+}
+
+/// Lazy streams (#1183): after the fold, every FFN mixer norm whose streams only its up-mix and
+/// the next (folded) norm read writes none and those two make them from the streams before it
+/// and the attention block's output, with the norm's own expressions: every output keeps the
+/// bits of the graph planned as built.
+#[test]
+fn lazy_streams_keep_the_bits() {
+    let layers = lazy_bench::tiny().layers;
+    let (want, none) = lazy_chain(false, &[]);
+    let (got, made) = lazy_chain(true, &[]);
+    assert_eq!((none, made), (0, layers), "layers made lazily");
+    assert!(got == want, "the outputs moved");
+}
+
+/// Streams read by a third node (here: a graph output) stay written; the other layers are still
+/// made lazily, the bits the same.
+#[test]
+fn lazy_streams_read_elsewhere_stay_written() {
+    let layers = lazy_bench::tiny().layers;
+    let (want, _) = lazy_chain(false, &[1]);
+    let (got, made) = lazy_chain(true, &[1]);
+    assert_eq!(made, layers - 1, "layers made lazily");
+    assert!(got == want, "the outputs moved");
+}

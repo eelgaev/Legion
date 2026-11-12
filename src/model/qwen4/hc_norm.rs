@@ -34,6 +34,14 @@ static HC_NORM: ExternalOp = ExternalOp {
 /// tail's.
 const P_RS: usize = 9;
 
+/// An unfolded [`hc_post_norm_rebuilt_xnb`] node's parameter set when it does not write the new
+/// streams (lazy streams, [`set_no_res`], #1183); a folded node's 8 is its tail's `k`.
+const P_NO_RES: usize = 8;
+
+/// The source slot of a folded node's previous block output (lazy streams, [`set_lazy_fold`],
+/// #1183).
+const PRE_OUT_SRC: usize = 9;
+
 /// Most streams and inject outputs [`hc_norm`]'s CUDA kernel takes.
 pub(super) const HC_NORM_MAX: i64 = 8;
 
@@ -736,6 +744,16 @@ unsafe fn cpu_hc_post_norm(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
         // A folded MoE tail (#836): the token's block output made here.
         let folded = params[7] != 0;
         let mut fold_row = vec![0f32; if folded { e } else { 0 }];
+        // Lazy streams (#1183): the new streams not written (`set_no_res`), or `res` holding
+        // the streams before the previous block's combine, made here first as its norm made
+        // them (`set_lazy_fold`).
+        let no_res = !folded && params[P_NO_RES] != 0;
+        let pre = if folded && !dst.src[PRE_OUT_SRC].is_null() {
+            let (inj_a, ld) = lazy_inject(res).expect("hc_post_norm: lazy streams of a norm's");
+            Some((&*dst.src[PRE_OUT_SRC], inj_a, ld))
+        } else {
+            None
+        };
         for t in (ith..n).step_by(nth) {
             let rr = (res.data as *const u8).add(t * res.nb[2]);
             let res_at = |i: usize| {
@@ -752,18 +770,32 @@ unsafe fn cpu_hc_post_norm(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
                 (out.data as *const u8).add(t * out.nb[1]) as *const f32
             };
             let irow = (inj.data as *const u8).add(t * inj.nb[1]) as *const f32;
+            let pre_row = pre.map(|(o, inj_a, ld)| {
+                let orow = (o.data as *const u8).add(t * o.nb[1]) as *const f32;
+                let w: Vec<f32> = (0..hc)
+                    .map(|h| {
+                        let v = *inj_a.add(t * ld + h) * (1.0 / hc as f32);
+                        1.0 / (1.0 + (-v).exp()) * 2.0
+                    })
+                    .collect();
+                (orow, w)
+            });
             let mut acc = vec![0f32; n_inj];
             for h in 0..hc {
                 let v = *irow.add(h) * (1.0 / hc as f32);
                 let wh = 1.0 / (1.0 + (-v).exp()) * 2.0;
                 let mut ss = 0f32;
                 for i in 0..e {
-                    let mut x = *orow.add(i) * wh + res_at(h * e + i);
+                    let r = match &pre_row {
+                        Some((oa, wa)) => *oa.add(i) * wa[h] + res_at(h * e + i),
+                        None => res_at(h * e + i),
+                    };
+                    let mut x = *orow.add(i) * wh + r;
                     if streams16 {
                         let b = crate::model::nvfp4_mm::bf16_bits(x);
                         *rn16.add(t * k + h * e + i) = b;
                         x = f32::from_bits(u32::from(b) << 16);
-                    } else {
+                    } else if !no_res {
                         *rn.add(t * k + h * e + i) = x;
                     }
                     srow[h * e + i] = x;
@@ -838,6 +870,14 @@ struct HcPostNorm {
     /// rank 0's and rank 1's BF16 partials whose sum is `out`, laid out as `out` (`out_ld`),
     /// which the exchange writes there on the stream ([`crate::tp_net::seq_par::sum_slot`]).
     rs: *const u64,
+    /// Null, or (lazy streams, [`set_lazy_fold`], #1183) the previous block's output and its
+    /// inject weights, combined into `res` first, rows `pre_out_ld` / `pre_inj_ld` floats apart.
+    pre_out: *const f32,
+    pre_out_ld: i64,
+    pre_inj: *const f32,
+    pre_inj_ld: i64,
+    /// Nonzero: the new streams are not written ([`set_no_res`], #1183).
+    no_res: i32,
 }
 
 /// `legion_moe_fold` (src/cuda/fused.cu): a folded MoE tail's inputs ([`fold_moe`]).
@@ -959,6 +999,7 @@ pub(crate) unsafe fn fold_target(node: *const ffi::ggml_tensor, cuda: bool) -> b
         if p[1..5] != [1, 0, 1, 0]
             || !(0..=STREAMS16_NO_XNB).contains(&p[PARAM_STREAMS16])
             || p[6..8] != [1, 0]
+            || p[P_NO_RES] != 0
             || p[P_RS] != 0
             || n.src[5].is_null()
             || n.src[6..].iter().any(|s| !s.is_null())
@@ -1042,6 +1083,166 @@ unsafe fn cpu_fold_row(dst: &ffi::ggml_tensor, t: usize, out: &mut [f32]) {
             }
             *o = sum + *shp.add(col) * s;
         }
+    }
+}
+
+/// Lazy streams (#1183; on by default, `legion serve --no-hc-lazy-streams` turns them off).
+static LAZY_STREAMS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Sets whether the MoE fold's relayout ([`fold_moe`]) also makes the FFN mixer's new streams
+/// lazily (`crate::model::core::node_fuse::fold`, #1183): that mixer's combine-and-norm does
+/// not write them, and its up-mix and the next combine-and-norm make them from the streams
+/// before it and the attention block's output, as it would have (the same bits, fewer bytes).
+pub fn set_hc_lazy_streams(on: bool) {
+    LAZY_STREAMS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`set_hc_lazy_streams`] is on.
+pub(crate) fn lazy_streams() -> bool {
+    LAZY_STREAMS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Where the parts of the [`HC_POST_NORM`] node `dst` sit.
+///
+/// # Safety
+/// `dst` is such a node, its sources valid tensors.
+unsafe fn node_layout(dst: &ffi::ggml_tensor) -> PostNormLayout {
+    // SAFETY: the caller's.
+    unsafe {
+        let (res, w) = (&*dst.src[0], &*dst.src[4]);
+        let (e, hc, n) = (res.ne[0] as usize, res.ne[1] as usize, res.ne[2] as usize);
+        let params = crate::ggml::external_params(dst);
+        let k = e * hc;
+        let down = (params[1] != 0).then(|| &*dst.src[5]);
+        let m = down.map_or(0, |d| d.ne[1] as usize);
+        PostNormLayout::new(
+            k,
+            n,
+            w.ne[1] as usize,
+            down16_values(down.map(|d| d.type_), k * m),
+            down.is_some(),
+            params[2] != 0,
+            (params[3] != 0).then_some(scales_place(k, hc, params[6] != 0, params[5] != 0)),
+        )
+    }
+}
+
+/// For the streams `res` of a lazy-streams fold ([`set_lazy_fold`]), a view of an
+/// [`HC_POST_NORM`] node: that node's inject weights (`[n_inj, n]` contiguous) and `n_inj`.
+///
+/// # Safety
+/// `res` is a valid tensor of an allocated graph.
+unsafe fn lazy_inject(res: &ffi::ggml_tensor) -> Option<(*const f32, usize)> {
+    // SAFETY: the caller's; view sources are valid tensors.
+    unsafe {
+        let norm = res.view_src;
+        if norm.is_null()
+            || !crate::ggml::op_of(norm).is_some_and(|op| std::ptr::eq(op, &HC_POST_NORM))
+            || (*norm).data.is_null()
+        {
+            return None;
+        }
+        let at = node_layout(&*norm);
+        let n_inj = (*(*norm).src[4]).ne[1] as usize;
+        Some((((*norm).data as *const f32).add(at.inject), n_inj))
+    }
+}
+
+/// The lazy-streams parts of an FFN mixer's norm `nf` (an unfolded F32-stream
+/// [`hc_post_norm_rebuilt_xnb`] node; on CUDA, `cuda`, of the fold kernel's shape) whose
+/// streams `res` are those of another such norm's node (written by it) and whose inject
+/// weights `inj` are that node's: `(res, out, inj)`, its sources, for [`set_no_res`],
+/// [`super::hc_up_mix::set_lazy_streams`] and [`set_lazy_fold`] (#1183). `None` for any other
+/// node.
+///
+/// # Safety
+/// `nf` is a valid tensor of an allocated graph.
+pub(crate) unsafe fn lazy_parts(
+    nf: *const ffi::ggml_tensor,
+    cuda: bool,
+) -> Option<[*mut ffi::ggml_tensor; 3]> {
+    // SAFETY: the caller's; a norm node's sources are valid tensors.
+    unsafe {
+        // Unfolded, F32 streams, streams written.
+        if !fold_target(nf, cuda) || crate::ggml::external_params(&*nf)[PARAM_STREAMS16] != 0 {
+            return None;
+        }
+        let t = &*nf;
+        let (res, out, inj) = (t.src[0], t.src[1], t.src[2]);
+        let r = &*res;
+        let na = r.view_src;
+        if r.type_ != types::F32
+            || na.is_null()
+            || r.view_offs != 0
+            || r.nb[2] != r.nb[1] * r.ne[1] as usize
+            || !crate::ggml::op_of(na).is_some_and(|op| std::ptr::eq(op, &HC_POST_NORM))
+        {
+            return None;
+        }
+        let pa = crate::ggml::external_params(&*na);
+        // The streams' node writes F32 streams (a folded node always writes them).
+        if pa[PARAM_STREAMS16] != 0 || (pa[7] == 0 && pa[P_NO_RES] != 0) {
+            return None;
+        }
+        let (inj_a, n_inj) = lazy_inject(r)?;
+        let (o, j) = (&*out, &*inj);
+        (o.type_ == types::F32
+            && o.nb[0] == 4
+            && j.view_src == na
+            && j.data as *const f32 == inj_a
+            && j.nb[0] == 4
+            && j.nb[1] == n_inj * 4
+            && j.ne[..2] == [r.ne[1], r.ne[2]])
+        .then_some([res, out, inj])
+    }
+}
+
+/// Makes the norm node `nf` ([`lazy_parts`]) not write its new streams (#1183): every reader
+/// makes them itself.
+///
+/// # Safety
+/// As [`crate::ggml::make_external`]: a valid node of an allocated graph that has not run.
+pub(crate) unsafe fn set_no_res(nf: *mut ffi::ggml_tensor) {
+    // SAFETY: the caller's.
+    unsafe { crate::ggml::set_external_param(nf, P_NO_RES, 1) };
+}
+
+/// Whether `node` is a folded norm ([`fold_moe`]) of F32 streams that may read lazy streams
+/// ([`set_lazy_fold`]).
+///
+/// # Safety
+/// `node` is a valid tensor.
+pub(crate) unsafe fn lazy_fold_target(node: *const ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's; a norm node's sources are valid tensors.
+    unsafe {
+        if !crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &HC_POST_NORM)) {
+            return false;
+        }
+        let p = crate::ggml::external_params(&*node);
+        let t = &*node;
+        p[7] != 0
+            && p[PARAM_STREAMS16] == 0
+            && !t.src[0].is_null()
+            && (*t.src[0]).type_ == types::F32
+            && t.src[PRE_OUT_SRC].is_null()
+    }
+}
+
+/// Makes the folded norm `node` ([`lazy_fold_target`]) read the streams `res` before the
+/// previous block's combine and make them first, `out · w + res` per value with `w` from the
+/// inject weights of `res`'s node ([`lazy_parts`]), as that block's norm would have (#1183).
+///
+/// # Safety
+/// As [`crate::ggml::make_external`]: valid nodes of an allocated graph that has not run.
+pub(crate) unsafe fn set_lazy_fold(
+    node: *mut ffi::ggml_tensor,
+    res: *mut ffi::ggml_tensor,
+    out: *mut ffi::ggml_tensor,
+) {
+    // SAFETY: the caller's.
+    unsafe {
+        (*node).src[0] = res;
+        (*node).src[PRE_OUT_SRC] = out;
     }
 }
 
@@ -1378,7 +1579,22 @@ unsafe fn cuda_hc_post_norm(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
                 std::ptr::null_mut()
             },
             rs: std::ptr::null(),
+            pre_out: std::ptr::null(),
+            pre_out_ld: 0,
+            pre_inj: std::ptr::null(),
+            pre_inj_ld: 0,
+            // Lazy streams (#1183): an unfolded node's new streams not written.
+            no_res: i32::from(params[7] == 0 && params[P_NO_RES] != 0),
         };
+        if params[7] != 0 && !dst.src[PRE_OUT_SRC].is_null() {
+            // Lazy streams (#1183): `res` the streams before the previous block's combine.
+            let o = &*dst.src[PRE_OUT_SRC];
+            let (inj_a, ld) = lazy_inject(res).ok_or("hc_post_norm: lazy streams of no norm's")?;
+            p.pre_out = o.data as *const f32;
+            p.pre_out_ld = (o.nb[1] / 4) as i64;
+            p.pre_inj = inj_a;
+            p.pre_inj_ld = ld as i64;
+        }
         // `out` a deferred reduce-scatter (#1176): the two ranks' BF16 partials added here,
         // their addresses read on the GPU from the slot the exchange wrote them to, so a
         // stage graph may capture this launch. The exchange frees its buffers later.
@@ -1549,6 +1765,8 @@ unsafe fn cuda_hc_norm(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<()
         }
     }
 }
+
+pub mod lazy_bench;
 
 #[cfg(test)]
 mod tests;

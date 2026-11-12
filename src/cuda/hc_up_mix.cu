@@ -72,6 +72,16 @@ struct legion_hc_up_mix {
     // BF16 up only (#1183, `legion hc-up-mix-bench`): 0 the default kernel for the shape, 1
     // up_mix_bf16, 2 up_mix_bf16_reg at any token count (2 + 100 R: runs of R tiles a CTA).
     int32_t       kernel;
+    // BF16 up with F32 streams only (#1183, lazy streams, src/model/core/node_fuse/fold.rs):
+    // null, or res holds the streams before the attention block's combine, which is made
+    // first per value as the norm (fused.cu, hc_post_norm_v70_kernel) made it: res' = pre_out *
+    // w + res, w = 2 sigmoid(pre_inj / hc) per stream, the same expressions, so the same bits.
+    // pre_out F32 [n][e] (token t at pre_out + t * pre_out_ld), pre_inj F32 [n][hc] (token t
+    // at pre_inj + t * pre_inj_ld).
+    const float * pre_out;
+    int64_t       pre_out_ld;
+    const float * pre_inj;
+    int64_t       pre_inj_ld;
 };
 
 // Launches the kernels on `stream`; returns a cudaError_t (cudaErrorInvalidValue for shapes the
@@ -165,11 +175,11 @@ constexpr int REG_MIN_N  = 512;
 
 // One up_mix_bf16_reg launch: e / 32 column blocks times runs of `run` tiles. False (nothing
 // launched) when the kernel cannot have its shared memory.
-template <bool RB, bool S16> bool launch_reg(const legion_hc_up_mix & p, cudaStream_t s, int run) {
+template <bool RB, bool S16, bool PRE = false> bool launch_reg(const legion_hc_up_mix & p, cudaStream_t s, int run) {
     constexpr int THREADS = REG_CG * HC * 32;
     constexpr int COLS    = REG_CG * ROWS;
     constexpr int SMEM = (2 * REG_TT * (REG_KS * 8 + PAD / 4) + HC * REG_TT * (COLS + 4)) * (int) sizeof(float);
-    const auto    kernel = up_mix_bf16_reg<REG_KS, REG_CG, REG_TT, REG_MINB, REG_PD, RB, S16>;
+    const auto    kernel = up_mix_bf16_reg<REG_KS, REG_CG, REG_TT, REG_MINB, REG_PD, RB, S16, PRE>;
     static std::atomic<int8_t> opt[GGML_CUDA_MAX_DEVICES];
     if (!legion_device::smem_opt_in(opt, kernel, SMEM)) {
         return false;
@@ -193,9 +203,10 @@ bool launch_bf16_reg(const legion_hc_up_mix & p, cudaStream_t s) {
     }
     const bool rb = p.res != nullptr, s16 = rb && p.res_bf16 != 0;
     const int  r  = p.kernel / 100 > 0 ? p.kernel / 100 : s16 ? REG_RUN_16 : REG_RUN;
-    const bool ok = s16 ? launch_reg<true, true>(p, s, r) :
-                    rb  ? launch_reg<true, false>(p, s, r) :
-                          launch_reg<false, false>(p, s, r);
+    const bool ok = s16                    ? launch_reg<true, true>(p, s, r) :
+                    p.pre_out != nullptr   ? launch_reg<true, false, true>(p, s, r) :
+                    rb                     ? launch_reg<true, false>(p, s, r) :
+                                             launch_reg<false, false>(p, s, r);
     if (ok) {
         last_kernel.store(p.kernel % 100 == 2 ? p.kernel : 2, std::memory_order_relaxed);
     }
@@ -209,7 +220,8 @@ extern "C" int legion_hc_up_mix_launch(const legion_hc_up_mix * p, void * stream
     if (p->up_bf16 != 0) {
         const bool aligned = (uintptr_t) p->up % 16 == 0 && p->up_nb1 % 16 == 0 && (uintptr_t) p->lob % 16 == 0;
         if (p->hc != HC || p->rank % 16 != 0 || p->rank < 16 || p->rank > MAX_RANK_BF16 || p->e % ROWS != 0 ||
-            p->n < 1 || (p->res == nullptr && p->res_bf16 != 0) || !aligned) {
+            p->n < 1 || (p->res == nullptr && p->res_bf16 != 0) || !aligned ||
+            (p->pre_out != nullptr && (p->res == nullptr || p->res_bf16 != 0 || p->pre_inj == nullptr))) {
             return cudaErrorInvalidValue;
         }
         if (!mma_code()) {
@@ -226,6 +238,8 @@ extern "C" int legion_hc_up_mix_launch(const legion_hc_up_mix * p, void * stream
         const dim3 grid(p->e / ROWS, (p->n + CHUNK - 1) / CHUNK);
         if (p->res != nullptr && p->res_bf16 != 0) {
             up_mix_bf16<true, true><<<grid, WARPS * 32, smem, s>>>(*p);
+        } else if (p->pre_out != nullptr) {
+            up_mix_bf16<true, false, true><<<grid, WARPS * 32, smem, s>>>(*p);
         } else if (p->res != nullptr) {
             up_mix_bf16<true><<<grid, WARPS * 32, smem, s>>>(*p);
         } else {
@@ -234,8 +248,8 @@ extern "C" int legion_hc_up_mix_launch(const legion_hc_up_mix * p, void * stream
         last_kernel.store(1, std::memory_order_relaxed);
         return (int) cudaGetLastError();
     }
-    // (The BF16 copy of mixed is the BF16 kernel's only.)
-    if (p->mixedb != nullptr || p->skip_f32 != 0) {
+    // (The BF16 copy of mixed and the lazy streams are the BF16 kernels' only.)
+    if (p->mixedb != nullptr || p->skip_f32 != 0 || p->pre_out != nullptr) {
         return cudaErrorInvalidValue;
     }
     if (p->hc != HC || p->rank % 32 != 0 || p->rank < 32 || p->rank > 32 * MAX_KB || p->e % ROWS != 0 || p->n < 1) {
