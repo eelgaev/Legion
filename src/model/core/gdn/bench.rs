@@ -9,7 +9,7 @@ use crate::ggml::{Backend, ComputeAllocator};
 mod prompt;
 mod replay;
 pub use prompt::{PROMPT_KERNELS, PromptRow, run_prompt};
-pub use replay::{REPLAY_VARIANTS, REPLAY_VERIFY, ReplayRow, run_replay};
+pub use replay::{FEW_KEEPS, REPLAY_VARIANTS, REPLAY_VERIFY, ReplayRow, run_replay};
 
 /// The kernel variants compared (`src/cuda/gdn.cu`'s `GDN_DECODE_*` bits), the default (-1) first.
 pub const VARIANTS: [(i32, &str); 9] = [
@@ -37,6 +37,11 @@ pub struct Config {
     pub rounds: usize,
     /// Graph runs per timing.
     pub reps: usize,
+    /// `--replay`: sets of this many sequences (each keeping one of [`FEW_KEEPS`]) instead of
+    /// [`COMMIT_KEEPS`]'s 16 slots.
+    pub replay_seqs: Option<usize>,
+    /// `--replay`: verify tokens per sequence (empty: [`REPLAY_VERIFY`]).
+    pub replay_verify: Vec<i64>,
 }
 
 impl Default for Config {
@@ -47,6 +52,8 @@ impl Default for Config {
             layers: 36,
             rounds: 5,
             reps: 20,
+            replay_seqs: None,
+            replay_verify: Vec::new(),
         }
     }
 }

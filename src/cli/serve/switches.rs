@@ -86,6 +86,13 @@ pub(in crate::cli) struct SwitchArgs {
     /// same bits; about 3% faster in these steps on GB10 but flat end to end (#836).
     #[arg(long, help_heading = HEADING)]
     gdn_replay_smem: bool,
+    /// CUDA, compute capability 9.0+, gated DeltaNet layers in verify steps that run the deferred
+    /// commit first, at one user and 8 tokens: the per-lane kernel instead of the default one for
+    /// that shape (each CTA issues all its state, input and row-map loads at once and stages the
+    /// tokens through shared memory, instead of a chain of round trips; the same bits, #689). For
+    /// comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_gdn_replay_few: bool,
     /// CUDA, gated DeltaNet layers in MTP verify steps that run the deferred commit first
     /// (qwen4exp, with the MoE row map --no-moe-pad-remap leaves on): run the delta rule of a
     /// sequence's padding rows too, and store their inputs for the next commit, instead of the
@@ -341,6 +348,13 @@ pub(in crate::cli) struct SwitchArgs {
     /// rows load while the kernel ahead still runs (#836). For comparisons.
     #[arg(long, help_heading = HEADING)]
     no_router_mv: bool,
+    /// Keep a DeltaNet layer's BF16 alpha and beta gate projections in steps of 8 tokens (a
+    /// one-user verify step) as two ggml matmuls. By default (CUDA, compute capability 9.0+,
+    /// stage graphs on) one launch computes both, each row as ggml's mul_mat_vec_f does: the
+    /// same bits, one launch fewer per DeltaNet layer, and each thread's weight loads in flight
+    /// at once (#689). For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_mvf_ab: bool,
     /// Run a MoE layer's expert selection as two CUDA launches, the top-k and then the
     /// weights. By default (CUDA, routers outside the one-op router above and without
     /// `--nvfp4-once`'s routing plan or `--decode-fuse`) one launch picks the experts and makes
@@ -1448,6 +1462,7 @@ impl SwitchArgs {
             gdn: self.gdn_ggml.then_some(false),
             gdn_decode: self.gdn_decode_ggml.then_some(false),
             gdn_replay_staged: self.gdn_replay_smem.then_some(true),
+            gdn_replay_few: self.no_gdn_replay_few.then_some(false),
             gdn_pad_skip: self.no_gdn_pad_skip.then_some(false),
             gdn_commit_slots: self.gdn_commit_runs.then_some(false),
             gdn_commit_in_verify: if self.no_gdn_commit_in_verify {
@@ -1500,6 +1515,7 @@ impl SwitchArgs {
                 self.dense_mv_wide_chain.then_some(true)
             },
             router_mv: self.no_router_mv.then_some(false),
+            mvf_ab: self.no_mvf_ab.then_some(false),
             router_join: self.no_router_join.then_some(false),
             router_bf16: self.no_router_bf16.then_some(false),
             ple_early_reads: self.no_ple_early_reads.then_some(false),
