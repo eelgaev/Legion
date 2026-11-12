@@ -146,6 +146,16 @@ int64_t legion_paged_attn_ffma_launches(void);
 // Launches of the WMMA kernel's all-row split (vsplit, #1211) from the calling thread so far.
 int64_t legion_paged_attn_vsplit_launches(void);
 
+// Whether prefill groups on compute capability 12.x take the queries-as-M kernel
+// (sm80/paged_attn_qm.cuh, the same bits as paged_prefill_mma) where it covers them and its grid
+// is faster (fa_qm::pays): `on` 1 (the default) or 0, or 2 (benches) for every group it covers,
+// for all threads (`this_thread` 0) or for the calling thread only (`this_thread` 1, tests and
+// benches; -1 ends it).
+void legion_paged_attn_set_qm(int on, int this_thread);
+
+// Launches of the queries-as-M kernel from the calling thread so far.
+int64_t legion_paged_attn_qm_launches(void);
+
 // Whether prefill launches on the current device take the WMMA kernel, which a split scratch
 // (legion_paged_attn::split) replaces for the last token's rows: sm_70 / sm_75 without the
 // m8n8k4 opt-in.
@@ -173,6 +183,9 @@ extern thread_local int t_prefill_all;
 extern thread_local int64_t t_m884_launches;
 extern thread_local int64_t t_ffma_launches;
 extern thread_local int64_t t_vsplit_launches;
+extern int g_qm;
+extern thread_local int t_qm;
+extern thread_local int64_t t_qm_launches;
 }  // namespace legion_paged
 
 namespace {
@@ -185,6 +198,13 @@ using legion_paged::t_prefill_all;
 using legion_paged::t_m884_launches;
 using legion_paged::t_ffma_launches;
 using legion_paged::t_vsplit_launches;
+using legion_paged::t_qm_launches;
+
+// The queries-as-M prefill kernel's mode for the calling thread (legion_paged_attn_set_qm): 0
+// off, 1 on where it takes the op, 2+ (benches) on for every group it covers.
+int qm_mode() {
+    return legion_paged::t_qm >= 0 ? legion_paged::t_qm : __atomic_load_n(&legion_paged::g_qm, __ATOMIC_RELAXED);
+}
 
 // Whether the current device is sm_70 (cached per device).
 bool device_is_sm70() {
@@ -828,6 +848,9 @@ __global__ void __launch_bounds__(256) paged_prefill(const legion_paged_attn p) 
 // Prefill on sm_80+: mma.sync m16n8k16 + cp.async, namespace fa.
 #include "../sm80/paged_attn.cuh"
 
+// Prefill on compute capability 12.x, queries as the MMA's M: namespace fa_qm (#1133).
+#include "../sm80/paged_attn_qm.cuh"
+
 // Prefill on sm_70 (Volta): mma.sync m8n8k4, namespace v70.
 #include "../sm70/paged_attn.cuh"
 
@@ -861,6 +884,15 @@ int launch(const legion_paged_attn & p, cudaStream_t st) {
         // A split scratch (--paged-verify-split): small groups split over the key blocks.
         if (p.max_split > 1 && !p.piece_blk && !p.ml) {
             return fa::launch_split<D, G, C>(p, st);
+        }
+        // Heads of 256 on compute capability 12.x: queries as M where it covers the op, the same
+        // bits (-1: no shared memory for it, paged_prefill_mma instead).
+        if constexpr (D == 256 && !C) {
+            if (fa_qm::takes<D, G>(p)) {
+                if (const int rc = fa_qm::launch<D, G>(p, st); rc >= 0) {
+                    return rc;
+                }
+            }
         }
         return fa::launch<D, G, C>(p, st);
     } else if (p.k_type != LEGION_KV_F16 || p.v_type != LEGION_KV_F16) {

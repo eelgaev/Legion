@@ -10,6 +10,9 @@ thread_local int t_prefill_all = -1;
 thread_local int64_t t_m884_launches = 0;
 thread_local int64_t t_ffma_launches = 0;
 thread_local int64_t t_vsplit_launches = 0;
+int g_qm = 1;
+thread_local int t_qm = -1;
+thread_local int64_t t_qm_launches = 0;
 
 }  // namespace legion_paged
 
@@ -141,6 +144,18 @@ int64_t legion_paged_attn_ffma_launches(void) {
 
 int64_t legion_paged_attn_vsplit_launches(void) {
     return t_vsplit_launches;
+}
+
+int64_t legion_paged_attn_qm_launches(void) {
+    return t_qm_launches;
+}
+
+void legion_paged_attn_set_qm(int on, int this_thread) {
+    if (this_thread > 0) {
+        legion_paged::t_qm = on;
+    } else {
+        __atomic_store_n(&legion_paged::g_qm, on, __ATOMIC_RELAXED);
+    }
 }
 
 void legion_paged_attn_set_prefill(int kernel, int this_thread) {

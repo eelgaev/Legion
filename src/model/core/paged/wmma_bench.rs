@@ -178,7 +178,7 @@ pub fn time(
 }
 
 /// The query (noise at a spread that gives peaked and flat rows), tables and positions.
-fn fill(q: Tensor, tab: Tensor, past: Tensor, g: &Group) {
+pub(super) fn fill(q: Tensor, tab: Tensor, past: Tensor, g: &Group) {
     let d = g.heads.0;
     let qmul = 2.0 * g.scale * (d as f32).sqrt().min(16.0);
     q.set_f32(
