@@ -7,7 +7,18 @@
 namespace {
 #include "../sm90/tma.cuh"
 #include "gemm_glu_tma.cuh"
+#include "gemm_glu_tile.cuh"
 }  // namespace
+
+int legion_nvfp4_swiglu_gemm_tile_launch(const legion_nvfp4_mm * p, const uint8_t * packed, int nt, int mode,
+                                         void * stream) {
+    const cudaStream_t st = (cudaStream_t) stream;
+    switch (nt) {
+        case 8: return launch_glu_tile_mode<8>(*p, packed, mode, st);
+        case 16: return launch_glu_tile_mode<16>(*p, packed, mode, st);
+        default: return -1;
+    }
+}
 
 int legion_nvfp4::launch_swiglu_gemm(const legion_nvfp4_mm & p, int nt, int variant, cudaStream_t st) {
     switch (nt) {
