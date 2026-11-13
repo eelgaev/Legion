@@ -13,6 +13,13 @@ namespace {
 int legion_nvfp4_swiglu_gemm_tile_launch(const legion_nvfp4_mm * p, const uint8_t * packed, int nt, int mode,
                                          void * stream) {
     const cudaStream_t st = (cudaStream_t) stream;
+    if (mode == 4) {  // the old layout: TMA weight tiles, every thread's token copies
+        switch (nt) {
+            case 8: return launch_glu_tma<8, true>(*p, st);
+            case 16: return launch_glu_tma<16, true>(*p, st);
+            default: return -1;
+        }
+    }
     switch (nt) {
         case 8: return launch_glu_tile_mode<8>(*p, packed, mode, st);
         case 16: return launch_glu_tile_mode<16>(*p, packed, mode, st);

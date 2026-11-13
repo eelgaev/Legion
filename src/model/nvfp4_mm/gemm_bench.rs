@@ -86,7 +86,7 @@ impl Variant {
             return format!("{op} tma");
         }
         if let Some(mode) = self.tiled {
-            let m = ["cp", "tma", "tma2", "warp"]
+            let m = ["cp", "tma", "tma2", "warp", "oldhyb"]
                 .get(mode as usize)
                 .unwrap_or(&"?");
             return format!("{op} tiled {m}");
@@ -135,7 +135,7 @@ pub fn variants() -> Vec<Variant> {
         ..v(Op::Glu, None, None, Family::Default)
     };
     let mut out = vec![v(Op::Glu, None, None, Family::Default), exact(Op::Glu), tma];
-    for mode in 0..4 {
+    for mode in 0..5 {
         out.push(Variant {
             tiled: Some(mode),
             ..v(Op::Glu, None, None, Family::Default)

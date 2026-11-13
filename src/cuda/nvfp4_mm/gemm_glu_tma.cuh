@@ -49,7 +49,9 @@ __device__ __forceinline__ void tma_3d(void * dst, const CUtensorMap * map, int 
 #endif
 }  // namespace glu_tma
 
-template <int NT>
+// HYB (#1183 r20 micro harness): the weight tiles by TMA as above, but the token rows by every
+// thread's cp.async and a CTA barrier per step, nvfp4_gemm's pipeline.
+template <int NT, bool HYB = false>
 __global__ void __launch_bounds__(256, 1) nvfp4_glu_tma(const legion_nvfp4_mm p, const __grid_constant__ glu_tma::Maps maps) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     using namespace legion_tma;
@@ -108,7 +110,7 @@ __global__ void __launch_bounds__(256, 1) nvfp4_glu_tma(const legion_nvfp4_mm p,
         prefetch_map(&maps.w2);
 #pragma unroll
         for (int s = 0; s < ST; s++) {
-            bar_init(full + s, 1 + 32);  // the TMA tiles' expect_tx, and each lane's copies
+            bar_init(full + s, HYB ? 1 : 1 + 32);  // the TMA tiles' expect_tx, and each lane's copies
             released[s] = 0;
         }
         bar_init_fence();
@@ -148,6 +150,28 @@ __global__ void __launch_bounds__(256, 1) nvfp4_glu_tma(const legion_nvfp4_mm p,
         }
         asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" ::"r"(saddr(bar)) : "memory");
     };
+    // HYB: step `step` into stage `stage` by the whole CTA (thread 0 the weight tiles).
+    auto load_hyb = [&](int64_t step, int stage) {
+        unsigned char * s = smem + stage * STAGE;
+        uint64_t * bar = full + stage;
+        if (threadIdx.x == 0) {
+            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+            bar_expect_tx(bar, 2 * W_HALF);
+            const int c0 = (int) ((step * 36) & ~(int64_t) 15);
+            glu_tma::tma_3d(s, &maps.w, c0, (int) m0, expert, bar);
+            glu_tma::tma_3d(s + W_HALF, &maps.w2, c0, (int) m0, expert, bar);
+        }
+        __nv_bfloat16 * xs = (__nv_bfloat16 *) (s + 2 * W_HALF);
+#pragma unroll
+        for (int i = 0; i < (BN * 8 + 255) / 256; i++) {
+            const int c = threadIdx.x + i * 256;
+            if (BN * 8 % 256 == 0 || c < BN * 8) {
+                const int t = c / 8, col = c % 8 * 8;
+                const bool ok = t < n_tok;
+                cp_async16(xs + t * LDX + col, p.x + (ok ? x_off[t] : 0) + step * BK + col, ok);
+            }
+        }
+    };
 
     // nvfp4_gemm's L2 bulk prefetch: each row's next PF blocks, PF blocks ahead of the copies.
     constexpr int PF = 32;
@@ -167,7 +191,15 @@ __global__ void __launch_bounds__(256, 1) nvfp4_glu_tma(const legion_nvfp4_mm p,
     };
     prefetch(0);
     prefetch(PF);
-    if (warp == 0) {
+    if (HYB) {
+#pragma unroll
+        for (int s = 0; s < ST - 1; s++) {
+            if (s < steps) {
+                load_hyb(s, s);
+            }
+            asm volatile("cp.async.commit_group;\n" ::);
+        }
+    } else if (warp == 0) {
 #pragma unroll
         for (int s = 0; s < ST; s++) {
             if (s < steps) {
@@ -246,7 +278,17 @@ __global__ void __launch_bounds__(256, 1) nvfp4_glu_tma(const legion_nvfp4_mm p,
         if (step % PF == 0 && step > 0) {
             prefetch(step + PF);
         }
+        if (HYB) {
+            asm volatile("cp.async.wait_group %0;\n" ::"n"(ST - 2));
+        }
         bar_wait(full + stage, (uint32_t) (step / ST) & 1);
+        if (HYB) {
+            __syncthreads();
+            if (step + ST - 1 < steps) {
+                load_hyb(step + ST - 1, (int) ((step + ST - 1) % ST));
+            }
+            asm volatile("cp.async.commit_group;\n" ::);
+        }
         const unsigned char * ws = smem + stage * STAGE;
         const __nv_bfloat16 * xs = (const __nv_bfloat16 *) (ws + 2 * W_HALF);
         if (n_tok == BN) {
@@ -254,7 +296,7 @@ __global__ void __launch_bounds__(256, 1) nvfp4_glu_tma(const legion_nvfp4_mm p,
         } else {
             mma_stage(ws, xs, step, std::false_type{});
         }
-        if (step + ST < steps) {
+        if (!HYB && step + ST < steps) {
             // This warp's reads of the stage are done (their values are in the MMAs above). The
             // acq_rel count orders every warp's reads before the last arrival, whose warp
             // refills the stage with step + ST (after a proxy fence: the copies write through
@@ -336,7 +378,7 @@ inline bool glu_tma_map(CUtensorMap * map, const void * base, int64_t row_bytes,
 
 // nvfp4_glu_tma for a grouped SwiGLU GEMM of 8 * NT tokens per tile; -1 when it does not apply
 // (nothing launched).
-template <int NT> int launch_glu_tma(const legion_nvfp4_mm & p, cudaStream_t st) {
+template <int NT, bool HYB = false> int launch_glu_tma(const legion_nvfp4_mm & p, cudaStream_t st) {
     const uintptr_t align = (uintptr_t) p.w | (uintptr_t) p.w2 | (uintptr_t) p.x;
     const int64_t row_bytes = p.k / 64 * 36;
     if (!p.plan || !p.w2 || p.k % 64 != 0 || p.k <= 0 || p.m <= 0 || p.n_expert <= 0 || align % 16 != 0 ||
@@ -350,7 +392,7 @@ template <int NT> int launch_glu_tma(const legion_nvfp4_mm & p, cudaStream_t st)
         return -1;
     }
     constexpr int SMEM = glu_tma::smem_bytes<NT>();
-    auto kernel = nvfp4_glu_tma<NT>;
+    auto kernel = nvfp4_glu_tma<NT, HYB>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
     kernel<<<(unsigned) p.tiles_m * (unsigned) p.tiles_n, 256, SMEM, st>>>(p, maps);
     return status();
