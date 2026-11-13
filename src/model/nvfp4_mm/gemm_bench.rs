@@ -9,7 +9,7 @@ use super::bench::routing_tiles;
 use super::{
     GemmTune, Grouped, Kernel, MV_MAX_N, bf16_bits, force_gemm_tune, force_grouped_tiles,
     force_kernel, glu_gemm_tile, mul_mat_id, pick_grouped, plan_grouped, set_expert_mv_max,
-    set_expert_mv_tile, swiglu_id,
+    set_expert_mv_tile, set_expert_tiled, set_expert_tma, swiglu_id, tile_experts,
 };
 use crate::ggml::{Backend, ComputeAllocator, Context, Graph, Tensor, types};
 
@@ -39,7 +39,8 @@ pub enum Family {
 /// One variant: the op, its tile (`mi`, `nt`; the SwiGLU's `mi` is always 2) and its stages and
 /// occupancy; `None`s are the defaults. A `tile` or `tune` is the GEMM's. `exact`: the default
 /// with a grid of the routing's own token tile count instead of the host's upper bound (#836:
-/// what the CTAs that find no tile cost).
+/// what the CTAs that find no tile cost). `tma`: the default with the SwiGLU GEMM's stages filled
+/// by the TMA ([`super::set_expert_tma`], #1183).
 #[derive(Clone, Copy, Debug)]
 pub struct Variant {
     pub op: Op,
@@ -47,12 +48,21 @@ pub struct Variant {
     pub tune: Option<GemmTune>,
     pub family: Family,
     pub exact: bool,
+    pub tma: bool,
+    /// The default reading the gate/up experts from their tiled copy, stages filled in this mode
+    /// ([`super::set_expert_tiled`], #1183 r20).
+    pub tiled: Option<i32>,
 }
 
 impl Variant {
     /// The op's default choice, the reference of the bit checks.
     pub fn is_default(&self) -> bool {
-        self.family == Family::Default && self.tile.is_none() && self.tune.is_none() && !self.exact
+        self.family == Family::Default
+            && self.tile.is_none()
+            && self.tune.is_none()
+            && !self.exact
+            && !self.tma
+            && self.tiled.is_none()
     }
 
     /// The kernel family this variant runs on at `per` pairs per expert.
@@ -71,6 +81,15 @@ impl Variant {
         };
         if self.exact {
             return format!("{op} exact");
+        }
+        if self.tma {
+            return format!("{op} tma");
+        }
+        if let Some(mode) = self.tiled {
+            let m = ["cp", "tma", "tma2", "warp", "oldhyb"]
+                .get(mode as usize)
+                .unwrap_or(&"?");
+            return format!("{op} tiled {m}");
         }
         match self.family {
             Family::Mv(nt) => return format!("{op} mv nt<={nt}"),
@@ -104,12 +123,24 @@ pub fn variants() -> Vec<Variant> {
         tune,
         family,
         exact: false,
+        tma: false,
+        tiled: None,
     };
     let exact = |op| Variant {
         exact: true,
         ..v(op, None, None, Family::Default)
     };
-    let mut out = vec![v(Op::Glu, None, None, Family::Default), exact(Op::Glu)];
+    let tma = Variant {
+        tma: true,
+        ..v(Op::Glu, None, None, Family::Default)
+    };
+    let mut out = vec![v(Op::Glu, None, None, Family::Default), exact(Op::Glu), tma];
+    for mode in 0..5 {
+        out.push(Variant {
+            tiled: Some(mode),
+            ..v(Op::Glu, None, None, Family::Default)
+        });
+    }
     for nt in [8, 16] {
         for t in TUNES {
             out.push(v(Op::Glu, Some((2, nt)), tune(t), Family::Default));
@@ -153,6 +184,8 @@ pub struct Config {
     /// Routings per round.
     pub sets: usize,
     pub rounds: usize,
+    /// Variants to run by [`Variant::name`] besides each op's default; empty runs them all.
+    pub only: Vec<String>,
 }
 
 impl Default for Config {
@@ -167,6 +200,7 @@ impl Default for Config {
             pools: vec![512, 160],
             sets: 2,
             rounds: 3,
+            only: Vec::new(),
         }
     }
 }
@@ -311,8 +345,10 @@ fn hash(bytes: &[u8]) -> u64 {
     })
 }
 
-fn force(v: Option<&Variant>) {
+fn force(v: Option<&Variant>, tiled: usize) {
     force_grouped_tiles(None, None);
+    set_expert_tma(v.is_some_and(|v| v.tma));
+    set_expert_tiled(v.and_then(|v| v.tiled).map(|m| (tiled, m)));
     // A GEMM tile or tune, or the GEMM family: the GEMM at any size; the mv family: the mv
     // kernel at any size.
     let (mv_max, mv_nt) = match v {
@@ -348,11 +384,28 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
     let sg = weights_ctx.new_tensor(types::F32, &[n_expert as i64]);
     let su = weights_ctx.new_tensor(types::F32, &[n_expert as i64]);
     let sd = weights_ctx.new_tensor(types::F32, &[n_expert as i64]);
+    let variants: Vec<Variant> = variants()
+        .into_iter()
+        .filter(|v| v.is_default() || cfg.only.is_empty() || cfg.only.contains(&v.name()))
+        .collect();
+    // The gate/up experts' tiled copy, for the tiled variants only.
+    let tiled = variants.iter().any(|v| v.tiled.is_some()).then(|| {
+        let bytes = 2 * blocks(k, m) * n_expert;
+        weights_ctx.new_tensor(types::I8, &[bytes as i64])
+    });
     weights_ctx
         .alloc_tensors(gpu.buffer_type())
         .map_err(|e| e.to_string())?;
+    let mut tiled_addr = 0usize;
     for (i, w) in [wg, wu, wd].into_iter().enumerate() {
         w.set_bytes(&weights(blocks(k, m) * n_expert, 3 + i as u64));
+    }
+    if let Some(t) = tiled {
+        let gate = weights(blocks(k, m) * n_expert, 3);
+        let up = weights(blocks(k, m) * n_expert, 4);
+        t.set_bytes(&tile_experts(&gate, &up, k, m, n_expert));
+        // SAFETY: an allocated tensor's metadata.
+        tiled_addr = unsafe { (*t.raw()).data } as usize;
     }
     for (i, s) in [sg, su, sd].into_iter().enumerate() {
         let mut rng = Rng(17 + i as u64);
@@ -361,7 +414,6 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
             .collect();
         s.set_f32(&v);
     }
-    let variants = variants();
     let down0 = variants
         .iter()
         .position(|v| v.op == Op::Down)
@@ -407,7 +459,7 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
                 }
                 let gi = (var.op == Op::Down) as usize;
                 let (_, ids, graph, outs) = &graphs[gi];
-                force(Some(var));
+                force(Some(var), tiled_addr);
                 let mut total = 0.0;
                 for (si, set) in sets.iter().enumerate() {
                     for (it, ids) in ids.iter().zip(set) {
@@ -421,7 +473,7 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
                     total += t.elapsed().as_secs_f64();
                     if let Err(e) = r {
                         if var.is_default() {
-                            force(None);
+                            force(None, 0);
                             return Err(format!("{}: {e}", var.name()));
                         }
                         differ[vi] = None;
@@ -447,7 +499,7 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
                     best[vi] = best[vi].min(total / (sets.len() * cfg.layers) as f64);
                 }
             }
-            force(None);
+            force(None, 0);
             let pairs = (cfg.n_used * n_tok) as f64;
             let per = (cfg.n_used * n_tok / (cfg.n_used * n_tok).clamp(1, n_expert)) as i64;
             for (vi, var) in variants.iter().enumerate() {

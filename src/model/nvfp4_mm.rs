@@ -96,6 +96,70 @@ pub fn set_expert_tile_prefetch(on: bool) {
     EXPERT_TILE_PREFETCH.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+static EXPERT_TMA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the routed experts' fused SwiGLU GEMM at prompt steps ([`swiglu_id`] on the grouped
+/// GEMM, default stages) fills its stages with the TMA (one tensor copy per 128 weight rows, one
+/// bulk copy per token, mbarrier stages, the last warp out of a stage refilling it) instead of
+/// per-thread cp.async copies and a CTA barrier per block of k, on GPUs with sm_90+ code (the
+/// GB10) and 16-byte aligned weight rows (k a multiple of 256). The same MMAs in the same order:
+/// the same bits either way. `legion serve --nvfp4-expert-tma` (#1183).
+pub fn set_expert_tma(on: bool) {
+    EXPERT_TMA.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+static EXPERT_TILED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static EXPERT_TILED_MODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Micro harness only (`nvfp4-gemm-bench`, #1183): the grouped SwiGLU GEMM at default stages
+/// reads its gate/up experts from `packed` (a device address of the tiled copy, see
+/// `src/cuda/nvfp4_mm/gemm_glu_tile.cuh`) with its stages filled in `mode` (0-3); `None`: off.
+#[doc(hidden)]
+pub fn set_expert_tiled(tiled: Option<(usize, i32)>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (packed, mode) = tiled.unwrap_or((0, -1));
+    EXPERT_TILED.store(packed, Relaxed);
+    EXPERT_TILED_MODE.store(mode, Relaxed);
+}
+
+/// The tiled copy of the gate (`gate`) and up (`up`) experts, `[k, m, n_expert]` NVFP4 bytes
+/// (rows `k / 64 * 36` bytes, packed), in `gemm_glu_tile.cuh`'s layout: per expert, per 128 rows,
+/// per block of k, 9,216 bytes in the order the GEMM's lanes read them.
+#[doc(hidden)]
+pub fn tile_experts(gate: &[u8], up: &[u8], k: usize, m: usize, n_expert: usize) -> Vec<u8> {
+    const SPAN: usize = 9216;
+    let (row, blocks, tiles_m) = (k / 64 * 36, k / 64, m.div_ceil(128));
+    let mut out = vec![0u8; n_expert * tiles_m * blocks * SPAN];
+    for e in 0..n_expert {
+        for mt in 0..tiles_m {
+            for b in 0..blocks {
+                let span = &mut out[((e * tiles_m + mt) * blocks + b) * SPAN..][..SPAN];
+                for w in 0..8 {
+                    for lane in 0..32 {
+                        let (g, t) = (lane / 4, lane % 4);
+                        for (i, src) in [gate, up].into_iter().enumerate() {
+                            for h in 0..2 {
+                                let r = mt * 128 + w * 16 + h * 8 + g;
+                                if r >= m {
+                                    continue;
+                                }
+                                let blk = &src[(e * m + r) * row + b * 36..][..36];
+                                for s in 0..4 {
+                                    let at = ((w * 2 + i) * 32 + lane) * 16 + s * 4 + h * 2;
+                                    span[at..at + 2]
+                                        .copy_from_slice(&blk[4 + 8 * s + 2 * t..][..2]);
+                                }
+                                span[8192 + (w * 32 + lane) * 4 + i * 2 + h] = blk[t];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 static PAD_SKIP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Whether a routed SwiGLU FFN on the grouped mv kernels ([`swiglu_id_rows`] with a row map,
@@ -1481,6 +1545,18 @@ mod cuda {
             variant: i32,
             stream: *mut c_void,
         ) -> i32;
+        fn legion_nvfp4_swiglu_gemm_tma_launch(
+            p: *const Params,
+            nt: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        fn legion_nvfp4_swiglu_gemm_tile_launch(
+            p: *const Params,
+            packed: *const u8,
+            nt: i32,
+            mode: i32,
+            stream: *mut c_void,
+        ) -> i32;
         fn legion_nvfp4_mvg_launch(
             p: *const Params,
             nt: i32,
@@ -2016,6 +2092,27 @@ mod cuda {
 
     /// The grouped SwiGLU GEMM at `8 * nt` tokens per tile.
     fn glu_gemm(p: &Params, nt: i32, tune: GemmTune, stream: *mut c_void) -> Result<(), String> {
+        let tiled = EXPERT_TILED.load(Ordering::Relaxed);
+        if tune == GEMM_DEFAULT && tiled != 0 {
+            let mode = EXPERT_TILED_MODE.load(Ordering::Relaxed);
+            // SAFETY: as below, `tiled` a device copy of these experts (the micro harness's);
+            // -1 (nothing launched) where the kernel does not apply.
+            match unsafe {
+                legion_nvfp4_swiglu_gemm_tile_launch(p, tiled as *const u8, nt, mode, stream)
+            } {
+                0 => return Ok(()),
+                -1 => {}
+                e => return Err(format!("nvfp4 swiglu_id (tiled): CUDA error {e}")),
+            }
+        }
+        if tune == GEMM_DEFAULT && EXPERT_TMA.load(Ordering::Relaxed) {
+            // SAFETY: as below; -1 (nothing launched) where the TMA kernel does not apply.
+            match unsafe { legion_nvfp4_swiglu_gemm_tma_launch(p, nt, stream) } {
+                0 => return Ok(()),
+                -1 => {}
+                e => return Err(format!("nvfp4 swiglu_id (TMA): CUDA error {e}")),
+            }
+        }
         // SAFETY: parameters checked by the caller; the node's stream.
         match unsafe { legion_nvfp4_swiglu_gemm_launch(p, nt, tune.code(), stream) } {
             0 => Ok(()),
