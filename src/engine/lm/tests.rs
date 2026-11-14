@@ -1053,3 +1053,12 @@ fn verify_rows_mask_only_up_to_min_tokens() {
         Logits::FirstPick(3, 1)
     );
 }
+
+#[test]
+fn groups_in_flight_over_two_nodes_draft_nothing() {
+    if std::env::var_os("LEGION_DEBUG_NODE_GROUP_DRAFTS").is_some() {
+        return;
+    }
+    assert!(groups_drafts(false), "whole steps and one machine draft");
+    assert!(!groups_drafts(true));
+}

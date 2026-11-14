@@ -846,6 +846,10 @@ pub struct LinkTimes {
     pub drafts: u64,
     pub draft_remote_ms: f64,
     pub draft_link_ms: f64,
+    /// Draft rounds not waited for (take-ins only, read with a later reply) and rank 1's
+    /// milliseconds on them, which the later reply's wait includes.
+    pub take_ins: u64,
+    pub take_in_remote_ms: f64,
 }
 
 /// Rank 0's end of the connection.
@@ -955,6 +959,10 @@ impl Link {
                     self.times.drafts += 1;
                     self.times.draft_remote_ms += f64::from(*ms);
                     self.times.draft_link_ms += waited(*ms);
+                }
+                Reply::Drafts { ms, .. } => {
+                    self.times.take_ins += 1;
+                    self.times.take_in_remote_ms += f64::from(*ms);
                 }
                 _ => {}
             }

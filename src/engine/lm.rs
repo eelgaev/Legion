@@ -667,6 +667,21 @@ pub fn drafts_with_mtp_head(spec: &SpecConfig) -> bool {
         && spec.token_drafter.is_none()
 }
 
+/// Whether the depth policy may draft for a group of decoding sequences that leaves the
+/// pipeline while another is in flight (`piped_remote`: on rank 0 of a model over two nodes,
+/// #560). It may not: the two ranks' pieces of a round take about as long as each other, so a
+/// verify step's extra rows cost about what they return in tokens, and the draft round adds
+/// to the round after both (GLM-5.3-Flash NVFP4 on two Sparks at 4 users: 15.3 tok/s drafting
+/// against 18.5 without). `LEGION_DEBUG_NODE_GROUP_DRAFTS=1` lets the policy choose (the old
+/// behaviour, for A/B). Whole steps (fewer sequences than groups form at) draft as before.
+fn groups_drafts(piped_remote: bool) -> bool {
+    static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !piped_remote
+        || *OLD.get_or_init(|| {
+            std::env::var_os("LEGION_DEBUG_NODE_GROUP_DRAFTS").is_some_and(|v| v == "1")
+        })
+}
+
 /// Why `--glm-parallel-decode` cannot draft as `spec` asks (none when it can): no drafting, or
 /// GLM's own MTP head (on the last GPU, #669). Other drafters are not wired to the parallel
 /// steps.
@@ -7939,8 +7954,12 @@ impl Worker {
                 .map(|&i| prefilling[i].n_past)
                 .fold(span, usize::max);
             // The depth policy's choice for every sequence that drafts now (one verify shape).
+            // Decoding groups in flight over two machines (#560): no drafts ([`groups_drafts`]).
+            let piped_remote = self.exec.has_remote() && self.exec.pipe_in_flight() > 0;
             let chosen = self.depth.as_mut().map(|d| {
-                if crate::spec::adaptive::cost_model_gated(draft_batch, &self.spec_config) {
+                if crate::spec::adaptive::cost_model_gated(draft_batch, &self.spec_config)
+                    || !groups_drafts(piped_remote)
+                {
                     return (0, self.spec_config.p_min);
                 }
                 // The head's ceiling (`--spec-k`; `k` may be the n-gram's deeper one).
