@@ -128,6 +128,27 @@ fn probes_alternate_around_the_best_depth() {
 }
 
 #[test]
+fn probes_back_off_from_a_neighbour_measured_far_below() {
+    // One sequence at --spec-k 3: 4-row steps 30 ms, the 3-row probe 45 ms (its graph switch).
+    let mut m = DepthModel::new(false);
+    let gains = geo(0.8, 3);
+    m.choose(&gains, 3);
+    for _ in 0..2 {
+        m.record_step(4, 30.0);
+        m.record_step(3, 45.0);
+    }
+    m.record_passes(1, 1, 1.0);
+    let picks: Vec<usize> = (0..1100).map(|_| m.choose(&gains, 3)).collect();
+    let probes: Vec<usize> = (picks.iter().enumerate())
+        .filter(|&(_, &k)| k != 3)
+        .map(|(i, _)| i + 1)
+        .collect();
+    // The gap doubles from PROBE_EVERY up to MAX_PROBE_GAP.
+    assert_eq!(probes, [16, 48, 112, 240, 496, 752, 1008], "{picks:?}");
+    assert!(probes.iter().all(|&c| picks[c - 1] == 2));
+}
+
+#[test]
 fn small_differences_keep_the_current_depth() {
     let gains = geo(0.75, 6);
     let mut m = DepthModel::new(false);

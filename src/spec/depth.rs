@@ -19,7 +19,12 @@
 //! Rows never measured are interpolated between measured neighbours, or held at the nearest
 //! measured value (optimistic above the largest: the policy goes there and measures it). Every
 //! [`PROBE_EVERY`]th choice tries a depth next to the best one, so neighbours get measured and
-//! drifting costs (a growing context) are followed. A new choice must beat the current one by
+//! drifting costs (a growing context) are followed. A probe changes the verify graph's shape
+//! twice (there and back), which on two V100s costs a 3-row step 35 ms against 27 for the 4-row
+//! steps around it (#1159): while the neighbour probed is measured well below the best depth
+//! ([`PROBE_BACKOFF`]), the gap to the next probe doubles, up to [`MAX_PROBE_GAP`], and a
+//! neighbour that comes close (or is not measured, as in a new context bucket or batch size)
+//! brings it back to [`PROBE_EVERY`]. A new choice must beat the current one by
 //! [`HYSTERESIS`], so noise does not flip depths (and the verify graph's shape) every step, and
 //! the depth climbs one step per choice (it drops at once): a brief run of accepted drafts does
 //! not buy a deep, expensive step.
@@ -43,6 +48,11 @@
 const EWMA: f64 = 0.2;
 /// Every this many choices, a neighbouring depth instead of the best one.
 pub const PROBE_EVERY: usize = 16;
+/// A probed neighbour predicted below this share of the best depth's throughput doubles the
+/// gap to the next probe.
+pub const PROBE_BACKOFF: f64 = 0.9;
+/// Most choices between two probes.
+pub const MAX_PROBE_GAP: usize = 256;
 /// Factor by which a depth's predicted throughput must beat the current depth's to replace it.
 pub const HYSTERESIS: f64 = 1.02;
 /// Depth before anything is measured.
@@ -197,6 +207,10 @@ pub struct DepthModel {
     /// The last depth chosen by throughput (not a probe).
     current: Option<usize>,
     choices: usize,
+    /// Probes made, and the choice the next one is due at (see [`PROBE_BACKOFF`]).
+    probes: usize,
+    probe_gap: usize,
+    next_probe: usize,
     calibration: Calibration,
 }
 
@@ -209,6 +223,9 @@ impl DepthModel {
             active: 0,
             current: None,
             choices: 0,
+            probes: 0,
+            probe_gap: PROBE_EVERY,
+            next_probe: PROBE_EVERY,
             calibration: Calibration::default(),
         }
     }
@@ -373,18 +390,39 @@ impl DepthModel {
         } else {
             top
         };
+        // A neighbour, alternating up and down, so both sides stay measured.
+        let up = (self.probes + 1) % 2 == 1;
+        let probe = match (up, best) {
+            (true, b) if b < k_max => b + 1,
+            (_, b) if b > 0 => b - 1,
+            (_, b) => b + 1,
+        };
+        let due = self.choices + 1 >= self.next_probe;
+        let far = due
+            && self.measured(gains.len() * (1 + probe))
+            && score(probe) < score(best) * PROBE_BACKOFF;
         self.current = Some(best);
         self.choices += 1;
-        if self.choices.is_multiple_of(PROBE_EVERY) {
-            // A neighbour, alternating up and down, so both sides stay measured.
-            let up = (self.choices / PROBE_EVERY) % 2 == 1;
-            return match (up, best) {
-                (true, b) if b < k_max => b + 1,
-                (_, b) if b > 0 => b - 1,
-                (_, b) => b + 1,
+        if due {
+            self.probes += 1;
+            self.probe_gap = if far {
+                (self.probe_gap * 2).min(MAX_PROBE_GAP)
+            } else {
+                PROBE_EVERY
             };
+            self.next_probe = self.choices + self.probe_gap;
+            return probe;
         }
         best
+    }
+
+    /// Whether steps of `rows` rows were measured in the active context bucket (past a first
+    /// step, which may build the shape's graph).
+    fn measured(&self, rows: usize) -> bool {
+        self.buckets[self.active]
+            .step
+            .get(rows)
+            .is_some_and(|m| m.n >= 2)
     }
 }
 
