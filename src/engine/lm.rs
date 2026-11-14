@@ -1474,6 +1474,9 @@ pub struct LmEngine {
     load_report: report::LoadReport,
     /// `--pipeline-mtp-split`'s measurements, shared with the worker (#765).
     split_probe: Option<Arc<Mutex<pipe_split::Probe>>>,
+    /// An automatic KV host tier's place in the process's plan (#1163): dropped after the
+    /// worker (and the tier with it).
+    _tier_plan: Option<host_tier::Reservation>,
 }
 
 impl Drop for LmEngine {
@@ -2045,8 +2048,14 @@ enum TpTier {
 }
 
 /// The tier [`fit_tp_cache`] may give a tensor-parallel cache of `block_bytes` per block (over
-/// all the GPUs): as given, or automatic where every GPU's driver maps host NUMA memory.
-fn tp_tier(cfg: &LmConfig, layout: &layout::Layout, block_bytes: usize) -> Result<TpTier, String> {
+/// all the GPUs): as given, or automatic where every GPU's driver maps host NUMA memory, from
+/// the budgets `owner` shares with the process's other loads ([`host_tier::serve_node`]).
+fn tp_tier(
+    cfg: &LmConfig,
+    layout: &layout::Layout,
+    block_bytes: usize,
+    owner: host_tier::Owner,
+) -> Result<TpTier, String> {
     if let Some(t) = cfg.kv_host_tokens {
         return Ok(if t == 0 {
             TpTier::Off
@@ -2070,18 +2079,9 @@ fn tp_tier(cfg: &LmConfig, layout: &layout::Layout, block_bytes: usize) -> Resul
         let bytes = (block_bytes / n_dev) as u64;
         match nodes.iter_mut().find(|n| n.node == node) {
             Some(n) => n.block_bytes += bytes,
-            None => {
-                let mem = host_tier::node_memory(node).ok_or_else(|| {
-                    format!("cannot read NUMA node {node}'s memory for the KV host tier")
-                })?;
-                nodes.push(host_tier::Node {
-                    node,
-                    block_bytes: bytes,
-                    free: mem.free,
-                    cache: mem.cache,
-                    total: mem.total,
-                });
-            }
+            None => nodes.push(host_tier::serve_node(owner, node, bytes).ok_or_else(|| {
+                format!("cannot read NUMA node {node}'s memory for the KV host tier")
+            })?),
         }
     }
     Ok(TpTier::Auto(nodes))
@@ -2301,64 +2301,98 @@ fn tp_tier_for(
 /// The automatic host tier's tokens (`--kv-host-tokens` not given): 0 unless a context does
 /// not fit in GPU memory (`fit_full` blocks, before the expert cache's share) on a layer split
 /// or one discrete CUDA GPU with an automatic pool; then the rest of the automatic pool (`want`)
-/// past the `n_blocks` the device holds, capped by the GPUs' NUMA nodes' free memory. Where the
-/// tier cannot be had (no host NUMA memory through VMM), 0: the load goes on as without it
-/// (and fails as before when a native context does not fit).
-#[allow(clippy::too_many_arguments)]
+/// past the `n_blocks` the device holds, capped by the budgets of the GPUs' NUMA nodes
+/// ([`host_tier::node_budget`], shared with the process's other loads). Where the tier cannot
+/// be had (no host NUMA memory through VMM), 0: the load goes on as without it (and fails as
+/// before when a native context does not fit). Also the most host tokens the budgets hold.
+/// `stage_bytes`: per stage, the bytes a KV block takes over its pools (the MTP head's own with
+/// the last stage's), all of which the tier holds past the device blocks.
 fn auto_host_tokens(
     layout: &layout::Layout,
     cfg: &LmConfig,
-    hp: &crate::model::core::Hparams,
+    owner: host_tier::Owner,
+    stage_bytes: &[usize],
     (fit, fit_full): (Option<usize>, Option<usize>),
     (ctx_blocks, n_blocks): (usize, usize),
-    want: usize,
-    (ring, types, shared): (bool, crate::model::core::kv_type::KvTypes, bool),
-) -> Result<usize, String> {
+    (want, shared): (usize, bool),
+) -> Result<(usize, usize), String> {
     let (Some(_), Some(full)) = (fit, fit_full) else {
-        return Ok(0);
+        return Ok((0, 0));
     };
     if cfg.tp > 1 || shared || cfg.kv_cache_tokens.is_some() || full >= ctx_blocks {
-        return Ok(0);
+        return Ok((0, 0));
     }
     // Per node: the bytes a host block takes over the stages whose GPU is on it.
     let mut nodes: Vec<host_tier::Node> = Vec::new();
-    for (d, layers) in &layout.stages {
+    for (si, (d, _)) in layout.stages.iter().enumerate() {
         let Some(device) = d.and_then(cuda_index) else {
-            return Ok(0);
+            return Ok((0, 0));
         };
         let Some(node) = tier_node(device) else {
             tracing::warn!(
                 "the {}-token context does not fit in CUDA{device}'s memory, and its driver                  cannot map host NUMA memory for a KV host tier",
                 cfg.ctx_size
             );
-            return Ok(0);
+            return Ok((0, 0));
         };
-        let bytes = KvPool::block_bytes_paged(hp, layers.clone(), ring, types) as u64;
+        let bytes = stage_bytes.get(si).copied().unwrap_or(0) as u64;
         // `--tp-per-gpu`: the other rank pins as much for each block, on the same node when
         // its GPU is there.
         let bytes = bytes * pair_ranks_on(cfg.tp_pair.as_ref(), node);
         match nodes.iter_mut().find(|n| n.node == node) {
             Some(n) => n.block_bytes += bytes,
-            None => {
-                let mem = host_tier::node_memory(node).ok_or_else(|| {
-                    format!("cannot read NUMA node {node}'s memory for the KV host tier")
-                })?;
-                nodes.push(host_tier::Node {
-                    node,
-                    block_bytes: bytes,
-                    free: mem.free,
-                    cache: mem.cache,
-                    total: mem.total,
-                });
-            }
+            None => nodes.push(host_tier::serve_node(owner, node, bytes).ok_or_else(|| {
+                format!("cannot read NUMA node {node}'s memory for the KV host tier")
+            })?),
         }
     }
     let blocks = host_tier::auto_host_blocks(full, ctx_blocks, want, n_blocks, &nodes)?;
-    Ok(blocks * KV_BLOCK)
+    Ok((
+        blocks * KV_BLOCK,
+        host_tier::budget_blocks(&nodes) * KV_BLOCK,
+    ))
+}
+
+/// Per NUMA node, the bytes one host block of a load's tier takes there: an automatic
+/// tensor-parallel tier's as sized (`tp_nodes`), else each stage's (`stage_bytes`) on its
+/// tier's node (`stage_nodes`; `None`: no tier).
+fn tier_plan_bytes(
+    tp_nodes: &[host_tier::Node],
+    stage_nodes: &[Option<u32>],
+    stage_bytes: &[usize],
+) -> Vec<(u32, u64)> {
+    if !tp_nodes.is_empty() {
+        return tp_nodes.iter().map(|n| (n.node, n.block_bytes)).collect();
+    }
+    let mut out: Vec<(u32, u64)> = Vec::new();
+    for (node, &bytes) in stage_nodes.iter().zip(stage_bytes) {
+        let Some(node) = *node else { continue };
+        match out.iter_mut().find(|p| p.0 == node) {
+            Some(p) => p.1 += bytes as u64,
+            None => out.push((node, bytes as u64)),
+        }
+    }
+    out
+}
+
+/// The owner of this load's KV host tier in the process's plan ([`host_tier::Ledger`]):
+/// `--tp-per-gpu`'s ranks share their pair's group, any other load has one of its own.
+fn tier_owner(cfg: &LmConfig) -> host_tier::Owner {
+    match &cfg.tp_pair {
+        Some(p) => host_tier::Owner {
+            group: p.group,
+            rank: p.rank,
+        },
+        None => host_tier::Owner {
+            group: host_tier::new_group(),
+            rank: 0,
+        },
+    }
 }
 
 /// The `--tp-per-gpu` ranks whose KV host tiers would sit on NUMA node `node`, this one's
-/// included (1 without the pair): each rank sizes its tier alone, from the same free memory.
+/// included (1 without the pair): the pair's budget there split evenly between them, from the
+/// node's memory as the first of them read it ([`host_tier::serve_node`]).
 fn pair_ranks_on(pair: Option<&tp_pair::TpPairRank>, node: u32) -> u64 {
     let Some(p) = pair else { return 1 };
     let other = (p.cuda - p.rank) + (1 - p.rank);
@@ -3663,6 +3697,7 @@ fn log_memory_plan(
         gpus,
         host,
         expert_shrunk,
+        kv_host_tier_nodes: host_tier::serve_plan(),
     });
 }
 
@@ -4336,21 +4371,41 @@ impl LmEngine {
             }
         };
         // The host tier's tokens: as given, or automatic (a discrete GPU whose memory does not
-        // hold a context, see `host_tier`).
+        // hold a context, see `host_tier`), from the budgets this load shares with the
+        // process's others (#1163); with the most the budgets hold.
         let auto_tier = cfg.kv_host_tokens.is_none();
-        let mut host_tokens = match cfg.kv_host_tokens {
-            Some(t) => t,
+        let tier_owner = tier_owner(&cfg);
+        // Per stage: the bytes a block takes over its pools, the MTP head's with the last
+        // stage's, as the fit counts them (the host tier holds them all).
+        let tier_stage_bytes: Vec<usize> = (layout.stages.iter().enumerate())
+            .map(|(si, (_, layers))| {
+                let mtp = if si + 1 == layout.stages.len() {
+                    mtp_block
+                } else {
+                    0
+                };
+                KvPool::block_bytes_paged(pool_hp, pool_layers(layers), ring.is_some(), types) + mtp
+            })
+            .collect();
+        let (mut host_tokens, tier_most_tokens) = match cfg.kv_host_tokens {
+            Some(t) => (t, usize::MAX),
             None => auto_host_tokens(
                 &layout,
                 &cfg,
-                &hp,
+                tier_owner,
+                &tier_stage_bytes,
                 (fit, fit_full),
                 (ctx_blocks, n_blocks),
-                auto_kv_want(max_seqs, ctx_blocks, cache_split, shared),
-                (ring.is_some(), types, shared),
+                (
+                    auto_kv_want(max_seqs, ctx_blocks, cache_split, shared),
+                    shared,
+                ),
             )
             .map_err(LoadError::Device)?,
         };
+        // Per node: the bytes a host block of an automatic tensor-parallel tier takes there
+        // (`tp_tier`), for the process's plan.
+        let mut tp_tier_nodes: Vec<host_tier::Node> = Vec::new();
         // Tensor parallelism: a small cache first, to measure the compute buffers next to it;
         // the cache is then sized to what they leave (see `fit_tp_cache`).
         let tp_fit = cfg.tp > 1;
@@ -4663,8 +4718,11 @@ impl LmEngine {
                     managed_tp_cache(&mut exec, &cfg, tokens, spec_k)?
                 }
                 _ => {
-                    let tier =
-                        tp_tier(&cfg, &layout, exec.kv_block_bytes()).map_err(LoadError::Device)?;
+                    let tier = tp_tier(&cfg, &layout, exec.kv_block_bytes(), tier_owner)
+                        .map_err(LoadError::Device)?;
+                    if let TpTier::Auto(nodes) = &tier {
+                        tp_tier_nodes = nodes.clone();
+                    }
                     let (device, host) = fit_tp_cache(
                         &mut exec, &layout, &mut cfg, sched, mtp, native_ctx, tier, head_pool,
                     )?;
@@ -4725,6 +4783,8 @@ impl LmEngine {
         let mut hbm_blocks = n_blocks;
         // Per stage: the NUMA node of its KV host tier (for the startup report).
         let mut tier_nodes: Vec<Option<u32>> = Vec::new();
+        // An automatic tier's place in the process's plan (#1163), for as long as the tier.
+        let mut tier_plan: Option<host_tier::Reservation> = None;
         // Sequence slots take the tier's buffers (and their alias) even all in VRAM.
         if host_tokens > 0 || exec.kv_slot_blocks() > 0 {
             let mut host_blocks = host_tokens.div_ceil(KV_BLOCK);
@@ -4734,13 +4794,18 @@ impl LmEngine {
             } else {
                 cfg.kv_stage_tokens.div_ceil(KV_BLOCK).min(host_blocks)
             };
-            // The staging slots take device blocks' memory; an automatic tier takes them back.
+            // The staging slots take device blocks' memory; an automatic tier takes them back,
+            // up to what the nodes' budgets hold.
             let cost = exec
                 .kv_stage_cost(stage_blocks)
                 .min(hbm_blocks.saturating_sub(1));
             hbm_blocks -= cost;
             if auto_tier {
+                let sized = host_blocks;
                 host_blocks += cost;
+                if !tp_fit && sized > 0 {
+                    host_blocks = host_blocks.min((tier_most_tokens / KV_BLOCK).max(sized));
+                }
             }
             // Sequence slots: each slot's first blocks in VRAM.
             let slot_blocks = exec.kv_slot_blocks();
@@ -4770,6 +4835,14 @@ impl LmEngine {
             tier_nodes = tiers.iter().map(|t| t.map(|t| t.node)).collect();
             let nodes: Vec<u32> = tiers.iter().flatten().map(|t| t.node).collect();
             exec.set_kv_tiers(tiers);
+            if auto_tier && host_blocks > 0 {
+                // What it pins: every host block, or a lazily backed tier's budget (#1131).
+                let backed = exec.kv_slot_host_budget().unwrap_or(host_blocks) as u64;
+                let per_node = tier_plan_bytes(&tp_tier_nodes, &tier_nodes, &tier_stage_bytes);
+                let per_node: Vec<(u32, u64)> =
+                    per_node.into_iter().map(|(n, b)| (n, b * backed)).collect();
+                tier_plan = Some(host_tier::reserve(tier_owner, &per_node));
+            }
             n_blocks = hbm_blocks + host_blocks;
             exec.resize_kv(n_blocks).map_err(|e| {
                 LoadError::Device(format!(
@@ -5581,6 +5654,7 @@ impl LmEngine {
             worker: Some(worker),
             load_report,
             split_probe,
+            _tier_plan: tier_plan,
         })
     }
 

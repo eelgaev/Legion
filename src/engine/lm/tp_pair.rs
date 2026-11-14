@@ -24,6 +24,9 @@ pub struct TpPairRank {
     pub cuda: usize,
     /// The all-reduce both ranks' graphs sum through.
     pub sum: Arc<PairSum>,
+    /// The pair's group in the process's KV host tier plan (both ranks size from one budget,
+    /// `super::host_tier::Ledger`).
+    pub group: u64,
     ends: Arc<Mutex<Ends>>,
 }
 
@@ -62,10 +65,12 @@ impl TpPairRank {
             serve: Some(serve),
             rank1: None,
         }));
+        let group = super::host_tier::new_group();
         [0, 1].map(|rank| Self {
             rank,
             cuda: first + rank,
             sum: sum.clone(),
+            group,
             ends: ends.clone(),
         })
     }
