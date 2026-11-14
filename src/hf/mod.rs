@@ -52,7 +52,8 @@ pub enum Fp8Mode {
 pub struct OpenOptions {
     pub fp8: Fp8Mode,
     /// GLM-5.3-Flash's MTP block: its BF16 routed experts quantized to NVFP4 at load (the
-    /// decoder's own format), for a model split over two nodes whose rank 1 holds the head.
+    /// decoder's own format), for a model split over two nodes whose rank 1 holds the head, or
+    /// over tensor-parallel ranks that each hold the head's share.
     /// Only the drafter reads them, so the target's tokens under greedy verify do not change.
     pub mtp_nvfp4: bool,
 }

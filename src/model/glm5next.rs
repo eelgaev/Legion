@@ -888,6 +888,9 @@ impl Model {
             } else {
                 self.glm_kda(pass, il, h)?
             };
+            // Tensor parallelism over machines (#560, `tp_net::shard::glm5`): this rank's heads'
+            // partial output, summed over the ranks.
+            let out = self.tp_sum(ctx, out);
             res = ops::hc_post(ctx, out, None, res, &pre);
             tap.tap("hc_attn_post", il, res);
 
@@ -898,6 +901,7 @@ impl Model {
                 // The first MoE layer's router lookahead (#611) from the last dense layer.
                 self.glm_ssd_predict(pass, il + 1, h, Predictor::PostAttn, None)?;
                 let out = self.glm_ffn(ctx, il, "", p.clamp_shexp[il], h)?;
+                let out = self.tp_sum(ctx, out);
                 tap.tap("ffn_out", il, out);
                 ops::hc_post(ctx, out, None, res, &pre)
             } else {
@@ -911,7 +915,13 @@ impl Model {
                 tap.tap("ffn_moe_out", il, moe);
                 let sh = self.glm_ffn(ctx, il, "_shexp", p.clamp_shexp[il], h)?;
                 tap.tap("ffn_shexp", il, sh);
-                ops::hc_post(ctx, moe, Some(sh), res, &pre)
+                if self.tp_on() {
+                    // This rank's rows of the routed and the shared experts: one sum of both.
+                    let ffn = self.tp_sum(ctx, ops::add(ctx, moe, sh));
+                    ops::hc_post(ctx, ffn, None, res, &pre)
+                } else {
+                    ops::hc_post(ctx, moe, Some(sh), res, &pre)
+                }
             };
             tap.tap("l_out", il, res);
             // The router lookahead from this layer's output (#611 trace, --ssd-prefetch

@@ -670,12 +670,15 @@ pub fn drafts_with_mtp_head(spec: &SpecConfig) -> bool {
 /// The safetensors checkpoint options of a load. Over two nodes with the MTP head drafting
 /// (#560), GLM-5.3-Flash's BF16 MTP experts load as NVFP4 (~10 GiB less on rank 1, so the split
 /// MTP off takes fits with the head): only the drafter reads them, and greedy verify keeps the
-/// target's tokens. `LEGION_DEBUG_NODE_MTP_BF16=1` keeps them BF16, for A/B.
+/// target's tokens. Under tensor parallelism over machines too: each rank then holds its rows of
+/// the NVFP4 experts (~3.4 GiB less per rank on two Sparks than its rows in BF16).
+/// `LEGION_DEBUG_NODE_MTP_BF16=1` keeps them BF16, for A/B.
 fn hf_options(cfg: &LmConfig) -> crate::hf::OpenOptions {
     let bf16 = std::env::var_os("LEGION_DEBUG_NODE_MTP_BF16").is_some_and(|v| v == "1");
+    let split = cfg.node.is_some() || cfg.tp_net.is_some();
     crate::hf::OpenOptions {
         fp8: cfg.hf_fp8,
-        mtp_nvfp4: cfg.node.is_some() && drafts_with_mtp_head(&cfg.spec) && !bf16,
+        mtp_nvfp4: split && drafts_with_mtp_head(&cfg.spec) && !bf16,
     }
 }
 

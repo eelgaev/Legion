@@ -105,7 +105,9 @@ impl Model {
                 },
             ));
         }
-        let attn = self.glm_dsa(&pass, il, x)?;
+        // Under tensor parallelism over machines (#560): this rank's heads' partial output,
+        // summed over the ranks.
+        let attn = self.tp_sum(ctx, self.glm_dsa(&pass, il, x)?);
         // The rest is per token: the output rows alone.
         let (attn, cur) = match inputs.out_rows {
             Some(rows) => (
@@ -124,7 +126,7 @@ impl Model {
         let room = ctx.tensors_left().saturating_sub(super::SSD_TAIL_TENSORS);
         let moe = self.glm_moe(&pass, il, x, room)?;
         let sh = self.glm_ffn(ctx, il, "_shexp", p.clamp_shexp[il], x)?;
-        let out = ops::add(ctx, ops::add(ctx, moe, sh), ffn_inp);
+        let out = ops::add(ctx, self.tp_sum(ctx, ops::add(ctx, moe, sh)), ffn_inp);
         let hn = ops::rms_norm(
             ctx,
             out,
