@@ -265,6 +265,10 @@ pub struct ResidencyConfig {
     /// what is allocated after it (ggml's CUDA pools, cuBLAS workspaces); a long prompt's lend
     /// keeps it free too (`--expert-cache-reserve-mib`).
     pub cache_reserve: u64,
+    /// What a long prompt's lend keeps free in place of [`Self::cache_reserve`], where the
+    /// engine set a smaller reserve for the cache than the prompt's passes were sized with
+    /// (the host expert tier's machine, #37). `None`: the reserve.
+    pub lend_reserve: Option<u64>,
     /// The cache also takes the VRAM the measured prompt steps' compute buffers would keep
     /// free, on GPUs whose step buffers can spill into host memory (unified memory); a prompt
     /// step's buffer then takes what VRAM is free and the rest from host memory
@@ -283,7 +287,9 @@ pub struct ResidencyConfig {
     /// The bounded host tier's saved routing heat (#37, set by the engine, no flag): read at
     /// load if the file is there and fits the model (the VRAM slots and the RAM slots then
     /// start with each layer's most routed experts; the layers' slot counts stay as without
-    /// it), written on exit. Unused with a `profile`.
+    /// it), written on exit. Unused with a `profile`. Set on the tier's machine and model
+    /// also when every expert fits in host memory (no tier, no RAM slots): the VRAM slots
+    /// start from it the same way.
     pub tier_heat: Option<std::path::PathBuf>,
     /// Per-layer slot counts from a previous run's measured misses ([`miss_split`]): read at
     /// load if the file exists, written on exit (`--expert-split-misses`).
@@ -412,6 +418,7 @@ impl Default for ResidencyConfig {
             mode: ExpertMode::Auto,
             cache_bytes: None,
             cache_reserve: CACHE_RESERVE,
+            lend_reserve: None,
             fill_prompt_room: None,
             profile: None,
             profile_seed: PROFILE_SEED,

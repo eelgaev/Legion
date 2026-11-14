@@ -299,6 +299,32 @@ impl Drop for Pool {
 /// whole matrices (4 MiB) would leave most reader threads idle and the drive's queue short.
 pub const PIECE: usize = 1 << 20;
 
+/// A [`Job::Raw`] of `src` to `dst` as raw reads of at most `piece` bytes each, cut where the
+/// file offset is a multiple of `piece` (with `piece` a multiple of [`ALIGN`], every cut is on
+/// a block boundary). The same bytes land at the same addresses; a decode step's few experts
+/// then keep every reader busy. `piece` 0: the one job.
+pub fn raw_pieces(src: FileRange, dst: usize, piece: u64) -> Vec<Job> {
+    let end = src.offset + src.len;
+    if piece == 0 || src.len == 0 {
+        return vec![Job::Raw { src, dst }];
+    }
+    let mut out = Vec::with_capacity((src.len / piece) as usize + 2);
+    let mut at = src.offset;
+    while at < end {
+        let next = ((at / piece + 1) * piece).min(end);
+        out.push(Job::Raw {
+            src: FileRange {
+                file: src.file,
+                offset: at,
+                len: next - at,
+            },
+            dst: dst + (at - src.offset) as usize,
+        });
+        at = next;
+    }
+    out
+}
+
 /// `job` as reads of at most [`PIECE`] codes each (whole rows: a row's codes, scales and
 /// repacked bytes are contiguous); other jobs as they are.
 pub fn split(job: Job) -> Vec<Job> {

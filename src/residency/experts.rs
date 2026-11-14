@@ -1363,11 +1363,9 @@ impl ExpertResidency {
             _ => None,
         };
         // The bounded host tier's saved heat (#37): a file that is missing, unreadable or of
-        // another model is passed over, and the cache starts as without one.
-        let tier_heat = host
-            .as_ref()
-            .and(cfg.tier_heat.as_ref())
-            .filter(|_| cfg.profile.is_none());
+        // another model is passed over, and the cache starts as without one. Set only for the
+        // tier's machine and model, with the tier or with every expert in host memory.
+        let tier_heat = cfg.tier_heat.as_ref().filter(|_| cfg.profile.is_none());
         let tier_prof = tier_heat
             .filter(|p| p.exists())
             .and_then(|p| match Profile::read(p) {

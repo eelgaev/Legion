@@ -146,6 +146,51 @@ fn big_reads_split_into_whole_row_pieces() {
     assert_eq!(split(copy).len(), 1);
 }
 
+#[test]
+fn raw_pieces_cover_the_range_once_cut_at_multiples_of_the_piece() {
+    let src = FileRange {
+        file: 2,
+        offset: 1000,
+        len: 10_000,
+    };
+    let spans = |piece: u64| -> Vec<(u64, u64, usize)> {
+        io::raw_pieces(src, 50, piece)
+            .into_iter()
+            .map(|j| match j {
+                Job::Raw { src, dst } => {
+                    assert_eq!(src.file, 2);
+                    (src.offset, src.len, dst)
+                }
+                j => panic!("{j:?}"),
+            })
+            .collect()
+    };
+    // 0: the one read, as before.
+    assert_eq!(spans(0), vec![(1000, 10_000, 50)]);
+    assert_eq!(spans(1 << 20), vec![(1000, 10_000, 50)]);
+    assert_eq!(
+        spans(4096),
+        vec![
+            (1000, 3096, 50),
+            (4096, 4096, 50 + 3096),
+            (8192, 2808, 50 + 7192)
+        ]
+    );
+    // A range that ends on a cut has no empty last piece.
+    let even = FileRange {
+        file: 0,
+        offset: 8192,
+        len: 8192,
+    };
+    assert_eq!(io::raw_pieces(even, 0, 4096).len(), 2);
+    let none = FileRange {
+        file: 0,
+        offset: 8192,
+        len: 0,
+    };
+    assert_eq!(io::raw_pieces(none, 0, 4096).len(), 1);
+}
+
 const ROWS: usize = 4;
 const K: usize = 128;
 const N_EXPERT: usize = 6;

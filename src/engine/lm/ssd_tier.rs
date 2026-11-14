@@ -160,6 +160,21 @@ pub const HOST_TIER_PASS: usize = 8704;
 /// (`--warmup-shapes`): the first chats find the VRAM cache as the load filled it.
 pub const HOST_TIER_LONG: usize = 1536;
 
+/// The VRAM the expert cache leaves free beside the measured step buffers on the bounded host
+/// tier's machine (one discrete GPU, one stage), in place of
+/// [`crate::residency::CACHE_RESERVE`]: every 3 MiB of it is a slot, and a slot saves a copy
+/// over PCIe each time its expert is routed to. Measured on a 24 GB card (four chats at once,
+/// prompts up to 32K, `--deterministic`): about 1 GiB stays free beside the cache with it. A
+/// long prompt's lend keeps [`HOST_TIER_LEND_RESERVE`] free instead
+/// ([`crate::residency::ResidencyConfig::lend_reserve`]).
+pub const HOST_TIER_RESERVE: u64 = 512 << 20;
+
+/// What a long prompt's lend keeps free there in place of [`HOST_TIER_RESERVE`]. Measured: the
+/// staged passes then get within 50 MiB of the VRAM they had with the default reserve. With
+/// 1 GiB they got 238 MiB more, and four prompts of 3,000 tokens at once went in one pass
+/// whose compute buffer did not fit (handled, in unified memory) instead of two.
+pub const HOST_TIER_LEND_RESERVE: u64 = 768 << 20;
+
 /// The fewest tokens a staged pass of the bounded host tier is capped to.
 pub const HOST_TIER_MIN_PASS: usize = 1024;
 
@@ -180,6 +195,34 @@ pub struct HostTierPlan {
     pub plan: crate::residency::host_tier::Plan,
 }
 
+/// [`host_tier_wanted`] for this load (on one machine).
+fn host_tier_machine(cfg: &LmConfig, hp: &Hparams, layout: &Layout) -> bool {
+    layout.node.is_none()
+        && host_tier_wanted(
+            std::env::consts::ARCH,
+            layout.mode,
+            hp.arch.name(),
+            layout.stages.len(),
+            cfg.tp,
+            layout.stages[0].0.map(|d| d.kind()),
+            layout.arenas.is_some(),
+        )
+}
+
+/// Whether this load is the bounded host tier's machine and model ([`host_tier_wanted`], plain
+/// GGUF experts) whatever its memory: with every routed expert in host memory
+/// ([`host_tier_plan`] gives `None`) it still starts its VRAM slots from the saved routing heat
+/// and lends the KV pool's tail to the expert cache, as with the tier.
+pub fn host_tier_applies(
+    cfg: &LmConfig,
+    gguf: &GgufFile,
+    layout: &Layout,
+) -> Result<bool, LoadError> {
+    let hp = Hparams::from_gguf(gguf)?;
+    Ok(host_tier_machine(cfg, &hp, layout)
+        && crate::residency::host_tier::sources(gguf, hp.n_layer, hp.n_expert as usize).is_some())
+}
+
 /// The bounded host tier's plan when it applies to this load: [`host_tier_wanted`], and the
 /// routed experts do not fit in the host memory there is beside the n-gram table and the KV
 /// host tier ([`crate::residency::host_tier::size`]). `None`: the load is as before.
@@ -191,18 +234,7 @@ pub fn host_tier_plan(
     use crate::residency::host_tier::{self, Sizing, Table};
     use crate::residency::lookup_table::TableIo;
     let hp = Hparams::from_gguf(gguf)?;
-    let device = layout.stages[0].0.map(|d| d.kind());
-    if layout.node.is_some()
-        || !host_tier_wanted(
-            std::env::consts::ARCH,
-            layout.mode,
-            hp.arch.name(),
-            layout.stages.len(),
-            cfg.tp,
-            device,
-            layout.arenas.is_some(),
-        )
-    {
+    if !host_tier_machine(cfg, &hp, layout) {
         return Ok(None);
     }
     let Some(srcs) = host_tier::sources(gguf, hp.n_layer, hp.n_expert as usize) else {

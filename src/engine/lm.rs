@@ -3129,7 +3129,7 @@ fn build_expert_cache(
                 let need = long.get(i).copied().unwrap_or(0)
                     + 2 * COMPUTE_MARGIN
                     + pinned.get(i).copied().unwrap_or(0);
-                (need as u64 + cfg.cache_reserve).saturating_sub(beside)
+                (need as u64 + cfg.lend_reserve.unwrap_or(cfg.cache_reserve)).saturating_sub(beside)
             })
             .collect();
     }
@@ -3818,10 +3818,26 @@ impl LmEngine {
             if cfg.long_prompts.min_tokens == LongPrompts::default().min_tokens {
                 cfg.long_prompts.min_tokens = ssd_tier::HOST_TIER_LONG;
             }
-            // The routing heat of the last run fills the VRAM and RAM slots at load.
-            if cfg.residency.profile.is_none() {
-                cfg.residency.tier_heat = ssd_tier::host_tier_heat_path(&gguf);
-            }
+        }
+        // The same machine and model with every routed expert in host memory (no tier): the
+        // saved routing heat and the KV tail's lend below serve its VRAM slots all the same.
+        let tier_whole = host_tier.is_none()
+            && ssd_layers.is_none()
+            && ssd_tier::host_tier_applies(&cfg, &gguf, &layout)?;
+        // The routing heat of the last run fills the VRAM slots (and the tier's RAM slots) at
+        // load.
+        if (host_tier.is_some() || tier_whole) && cfg.residency.profile.is_none() {
+            cfg.residency.tier_heat = ssd_tier::host_tier_heat_path(&gguf);
+        }
+        // Its one GPU's reserve beside the cache, where `--expert-cache-reserve-mib` is at its
+        // default: what was measured in use there, not the layer splits' share.
+        if (host_tier.is_some() || tier_whole)
+            && cfg.residency.cache_reserve == crate::residency::CACHE_RESERVE
+        {
+            // A long prompt's lend leaves free what it did with the default reserve: the staged
+            // passes are sized to it.
+            cfg.residency.lend_reserve = Some(ssd_tier::HOST_TIER_LEND_RESERVE);
+            cfg.residency.cache_reserve = ssd_tier::HOST_TIER_RESERVE;
         }
         // The other machine's layers and head.
         let hp_file = crate::model::core::Hparams::from_gguf(&gguf)?;
@@ -4742,9 +4758,10 @@ impl LmEngine {
         // The bounded host tier (#37, an x86_64 PC's one discrete GPU): the same lend with no
         // flag, the pool past its first KV_VMM_KEEP_TIER tokens. There every VRAM slot saves
         // a copy over PCIe (or a checkpoint read), and the tail comes back when a chat needs
-        // it (`Worker::kv_make_room`).
+        // it (`Worker::kv_make_room`). With every expert in host memory (`tier_whole`) a slot
+        // saves the same copy: the same lend.
         let kv_tier = kv_vmm::tier_default(
-            exec.model().host_tier().is_some(),
+            exec.model().host_tier().is_some() || tier_whole,
             cfg.switches.kv_vmm,
             mode == ExpertMode::Cache,
             layout.stages.len(),
@@ -5093,7 +5110,9 @@ impl LmEngine {
                     && layout.node.is_none()
                     && tp_start.is_none()
                     && cfg.long_prompts.min_tokens > 0
-                    && !long.is_empty();
+                    // No measured long step with every expert in host memory on one GPU: a
+                    // lend there frees every slot, the tail's bytes among them.
+                    && (!long.is_empty() || (tier_whole && kv_tier));
                 if kv_vmm_all && plain {
                     let keep = crate::residency::kv_vmm::keep_blocks(tokens, KV_BLOCK, n_blocks);
                     if let Some((lend, bytes)) =

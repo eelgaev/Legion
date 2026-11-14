@@ -1033,6 +1033,7 @@ impl ModelArgs {
                 .expert_cache_gib
                 .map(|g| (g.max(0.0) * (1u64 << 30) as f64) as u64),
             cache_reserve: self.expert_cache_reserve_mib << 20,
+            lend_reserve: None,
             fill_prompt_room: if self.no_expert_cache_fill_prompt_room {
                 Some(false)
             } else {

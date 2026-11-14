@@ -47,7 +47,7 @@ use crate::gguf::{FileRange, GgufFile};
 use super::lookup_table::MemInfo;
 use super::ssd_experts::KINDS;
 use super::ssd_experts::cache::SlotCache;
-use super::ssd_experts::io::{Group, Job, Pool};
+use super::ssd_experts::io::{Group, Job, Pool, raw_pieces};
 
 mod passes;
 pub use passes::{PassHook, PassSrc, release_arg, wait_arg};
@@ -62,6 +62,22 @@ pub const GAP: usize = 4;
 
 /// Reader threads (an NVMe drive's queue; a decode step misses a few experts per layer).
 const READERS: usize = 8;
+
+/// Bytes a read of a small step takes at most ([`raw_pieces`]): an expert's three tensors
+/// (about 1 MiB each) as twelve reads over the eight readers instead of three.
+const READ_PIECE: u64 = 256 << 10;
+
+/// [`READ_PIECE`], or `LEGION_DEBUG_TIER_READ_PIECE_KIB` (0: every tensor in one read, the way
+/// before), for A/B runs.
+fn read_piece() -> u64 {
+    static PIECE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PIECE.get_or_init(|| {
+        std::env::var("LEGION_DEBUG_TIER_READ_PIECE_KIB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(READ_PIECE, |kib| kib << 10)
+    })
+}
 
 /// Fewest RAM slots per layer worth running with: a full decode batch's experts of a few
 /// sequences.
@@ -1157,11 +1173,23 @@ impl Inner {
                 t.index[e] = self.slots + GAP + self.place_at(il, p);
             }
         }
+        let big = ids.len() >= AHEAD_PAIRS_PER_EXPERT * self.n_expert;
+        // A small step waits for a few experts, three reads each: cut into pieces they keep
+        // every reader busy. A big step's reads do already.
+        let piece = if big { 0 } else { read_piece() };
+        if piece > 0 {
+            jobs = jobs
+                .into_iter()
+                .flat_map(|j| match j {
+                    Job::Raw { src, dst } => raw_pieces(src, dst, piece),
+                    j => vec![j],
+                })
+                .collect();
+        }
         let group = self.pool.submit(jobs);
         // A big step: the next layer's experts start now, into the other set, which the layer
         // before is done with (the stream runs this after its kernels).
         let next = il + 1;
-        let big = ids.len() >= AHEAD_PAIRS_PER_EXPERT * self.n_expert;
         if big {
             // What this step took from the checkpoint: the layer's next read ahead.
             let read = ready.iter().map(|r| r.0).filter(|&e| seen[e]);
@@ -1360,7 +1388,7 @@ fn fatal(e: &str) -> ! {
 #[cfg(feature = "cuda")]
 mod cuda {
     use std::os::raw::{c_int, c_void};
-    use std::sync::Arc;
+    use std::sync::{Arc, OnceLock};
 
     use super::{Inner, external_params, fatal, lookup};
     use crate::ggml::ffi;
@@ -1378,6 +1406,7 @@ mod cuda {
             f: unsafe extern "C" fn(*mut c_void),
             user: *mut c_void,
         ) -> c_int;
+        fn cudaStreamSynchronize(s: *mut c_void) -> c_int;
     }
 
     /// `cudaMemcpyDefault`: the direction from the pointers (unified addressing).
@@ -1407,8 +1436,19 @@ mod cuda {
         }
     }
 
-    /// Copies the ids to pinned memory, runs the fetch as a host function on the stream, and
-    /// copies the result into the op's output.
+    /// Whether the fetch runs as a host function on the stream (`LEGION_DEBUG_TIER_FETCH=
+    /// hostfunc`, the way before) instead of on the launching thread.
+    fn as_host_function() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var_os("LEGION_DEBUG_TIER_FETCH").is_some_and(|v| v == "hostfunc")
+        })
+    }
+
+    /// Copies the ids to pinned memory, runs the fetch, and copies the result into the op's
+    /// output. The launching thread waits for the ids and runs the fetch itself: a host
+    /// function on the stream starts only once a driver thread has woken up for it, at every
+    /// layer of every step, and that wake-up is longer than the wait here (the thread polls).
     pub(super) unsafe fn fetch(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
         let p = external_params(dst);
         let inner = lookup(p[0]);
@@ -1418,6 +1458,31 @@ mod cuda {
         let (ids_in, ids_out) = inner.xchg.ok_or("no exchange buffers")?;
         if n > inner.cap {
             return Err(format!("{n} ids, room for {}", inner.cap));
+        }
+        if !as_host_function() {
+            // SAFETY: device and pinned buffers of `n` ids; after the wait the stream is done
+            // with everything before this op (the copy in, the layer before and the copy out
+            // of its fetch), so this thread reads and writes the exchange buffers alone.
+            unsafe {
+                let e = cudaMemcpyAsync(ids_in as *mut c_void, src.data, n * 4, DEFAULT, stream);
+                if e != 0 {
+                    return Err(format!("ids to host: CUDA error {e}"));
+                }
+                let e = cudaStreamSynchronize(stream);
+                if e != 0 {
+                    return Err(format!("waiting for the ids: CUDA error {e}"));
+                }
+                let ids = std::slice::from_raw_parts(ids_in as *const i32, n);
+                let out = std::slice::from_raw_parts_mut(ids_out as *mut i32, n);
+                if let Err(e) = inner.fetch(p[1] as usize, p[2] as usize, ids, out) {
+                    fatal(&e);
+                }
+                let e = cudaMemcpyAsync(dst.data, ids_out as *const c_void, n * 4, DEFAULT, stream);
+                if e != 0 {
+                    return Err(format!("ids to device: CUDA error {e}"));
+                }
+            }
+            return Ok(());
         }
         let job = Box::into_raw(Box::new(Job {
             inner: inner.clone(),
