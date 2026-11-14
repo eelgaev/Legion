@@ -2184,9 +2184,32 @@ impl ExpertResidency {
         Ok(())
     }
 
+    /// The bounded host tier: no table may name a slot whose VRAM is lent, or that the restore
+    /// thread is still mapping (the layer is not `backed` yet): the next step's kernels would
+    /// read unmapped memory, the illegal access of [`Self::tier_settled`]. Checked before
+    /// every table write (a few layers' slots, and only while a lend or a restore is under
+    /// way), so that a wrong order names itself here instead of in a kernel.
+    fn tier_lent_unread(&self) -> Result<(), String> {
+        for (il, l) in self.layers.iter().enumerate() {
+            let Some(l) = l.as_ref().filter(|l| l.tier && !l.backed) else {
+                continue;
+            };
+            let kept = if l.tail_lent { l.keep.unwrap_or(0) } else { 0 };
+            if let Some(s) = l.slots.ready().iter().skip(kept).position(Option::is_some) {
+                return Err(format!(
+                    "expert cache: layer {il}'s table would name slot {} while its memory is \
+                     lent ({kept} slots kept)",
+                    kept + s
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Writes the changed tables: whole device tables (`scope` None), or only the changed rows
     /// of the layers `scope` selects, leaving every other row's bytes alone.
     fn upload_tables(&mut self, scope: Option<&dyn Fn(usize) -> bool>) -> Result<(), String> {
+        self.tier_lent_unread()?;
         let n_expert = self.n_expert;
         for (d, dev) in self.devices.iter_mut().enumerate() {
             let mine = self
@@ -2303,6 +2326,14 @@ impl ExpertResidency {
     /// kernel raced with is still not known, and the wait stays. It finds the device idle
     /// (under 0.01 ms) at every after-step but the one that ends a staged pass, where the
     /// staging stream has about 33 ms of copies left; decode measures the same with it.
+    ///
+    /// A later try lent the cache in the startup warmup again, as the faulting runs did,
+    /// without the wait: three more clean runs. The kernel log of the two faults names a read
+    /// at the same address in both processes, 8 and 12 KiB into a 2 MiB page nothing was mapped
+    /// in, about 128 MiB past the end of a staged range in the layout of the build of today:
+    /// a read past the end of a mapping by the build of that day (it was never committed),
+    /// more likely than a race. [`Self::tier_lent_unread`] checks the one ordering the wait
+    /// could have covered.
     #[cfg(feature = "cuda")]
     fn tier_settled(&self) -> Result<(), String> {
         if self.host.is_none() {
@@ -2495,6 +2526,17 @@ impl ExpertResidency {
                     }
                     l.slots.decay(self.decay);
                 }
+            }
+            // The bounded host tier keeps its RAM slots by the same heat.
+            if let Some(h) = &self.host {
+                h.set_heat(
+                    self.layers
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(il, l)| l.as_ref().map(|l| (il, l)))
+                        .filter(|(il, l)| l.tier && ran(*il))
+                        .map(|(il, l)| (il, l.slots.heat())),
+                );
             }
             if let Some(p) = passes {
                 self.balance.add_pass(&p);

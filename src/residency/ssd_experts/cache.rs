@@ -13,6 +13,9 @@ pub struct SlotCache {
     pinned: Vec<bool>,
     /// The current step (starts at 1, so 0 is "never").
     tick: u64,
+    /// Expert -> its routing heat ([`Self::set_heat`]); empty: slots go out least recently
+    /// used first.
+    heat: Vec<f32>,
 }
 
 /// What a step must do to have all its experts in slots.
@@ -32,7 +35,17 @@ impl SlotCache {
             used: vec![0; n_slots],
             pinned: vec![false; n_slots],
             tick: 0,
+            heat: Vec::new(),
         }
+    }
+
+    /// From now on the slot that goes out for a new expert is the one whose expert has the
+    /// least `heat` (per expert: a routing count that decays, the VRAM cache's own), the least
+    /// recently used of those on ties, instead of the least recently used of all. An expert
+    /// routed to often but not in the last steps then outlives one that a single step used.
+    pub fn set_heat(&mut self, heat: &[f32]) {
+        self.heat.clear();
+        self.heat.extend_from_slice(heat);
     }
 
     pub fn n_slots(&self) -> usize {
@@ -211,9 +224,21 @@ impl SlotCache {
         if let Some(s) = (0..self.n_slots()).find(|&s| self.owner[s] < 0 && !self.pinned[s]) {
             return Some(s);
         }
-        (0..self.n_slots())
-            .filter(|&s| self.used[s] < self.tick && !self.pinned[s])
-            .min_by_key(|&s| self.used[s])
+        let free = (0..self.n_slots()).filter(|&s| self.used[s] < self.tick && !self.pinned[s]);
+        if self.heat.is_empty() {
+            return free.min_by_key(|&s| self.used[s]);
+        }
+        let heat = |s: usize| {
+            self.heat
+                .get(self.owner[s] as usize)
+                .copied()
+                .unwrap_or(0.0)
+        };
+        free.min_by(|&a, &b| {
+            heat(a)
+                .total_cmp(&heat(b))
+                .then(self.used[a].cmp(&self.used[b]))
+        })
     }
 
     /// [`Self::victim`] that keeps the experts needed soonest (`next`, [`Self::plan_ahead`]).

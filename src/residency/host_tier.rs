@@ -101,6 +101,22 @@ const REPORT_EVERY: u64 = 48 * 256;
 const MARGIN_MIN: u64 = 8 << 30;
 /// ... or a tenth of the machine's, if more.
 const MARGIN_SHARE: u64 = 10;
+/// A machine too small for [`MARGIN_MIN`] to be a sixth of its memory (under 48 GiB) keeps
+/// that sixth free instead, and never less than this.
+const MARGIN_SMALL_SHARE: u64 = 6;
+const MARGIN_FLOOR: u64 = 4 << 30;
+
+/// The host memory kept free beside the tier on a machine with `total` bytes: what is
+/// available when the tier is sized already leaves out what the desktop holds, so this is
+/// only room to grow into, and the tier's memory is pinned and cannot give way. A 32 GiB
+/// machine keeps 5.3 GiB (2.7 GiB more for RAM slots than with 8: about 19 slots a layer of
+/// Qwen3.8-Flash-Next, a quarter more), a 24 GiB one 4 GiB, from 48 GiB on it is 8 GiB as
+/// before and a tenth of the memory past 80 GiB.
+pub(crate) fn margin(total: u64) -> u64 {
+    (total / MARGIN_SMALL_SHARE)
+        .clamp(MARGIN_FLOOR, MARGIN_MIN)
+        .max(total / MARGIN_SHARE)
+}
 
 /// The direct n-gram tier's row cache at most ([`super::lookup_table`]'s default cap).
 const TABLE_CACHE: u64 = 4 << 30;
@@ -147,7 +163,7 @@ pub struct Plan {
 }
 
 /// The pinned host memory the routed experts get on a machine with `mem`: what is available
-/// less a margin (8 GiB or a tenth of the machine's memory), the n-gram table's share and
+/// less a margin ([`margin`]), the n-gram table's share and
 /// `kv_spill` (host memory the KV cache may take). `per_slot`: one expert of every kind of
 /// every layer (the layers' types may differ), the experts whole taking `n_expert` of that;
 /// `stage_one`: one expert of every staging buffer.
@@ -164,7 +180,7 @@ pub fn size(
     table: Option<Table>,
     kv_spill: u64,
 ) -> Sizing {
-    let margin = MARGIN_MIN.max(mem.total / MARGIN_SHARE);
+    let margin = margin(mem.total);
     let room = mem.available.saturating_sub(margin + kv_spill);
     let all = per_slot * n_expert as u64;
     // What the table takes at least: all of it when asked for in RAM, else its row cache.
@@ -730,6 +746,26 @@ impl HostTier {
     /// Closes the batch of [`Self::swap`]s queued since the last call.
     pub fn swaps_queued(&self) {
         self.inner.swaps_queued();
+    }
+
+    /// The routing heat of `layers`' experts (`(layer, per expert)`, the VRAM cache's own
+    /// decayed counts) as of the step just learned: their RAM slots give up the coldest
+    /// expert first from now on ([`SlotCache::set_heat`]), not the least recently used. An
+    /// expert a VRAM slot holds counts as cold: no step reads its RAM copy (one the refill
+    /// after a long prompt left), so that slot goes first.
+    pub fn set_heat<'a>(&self, layers: impl Iterator<Item = (usize, &'a [f32])>) {
+        let mut st = self.inner.state.lock().unwrap();
+        let st = &mut *st;
+        let mut cold = Vec::new();
+        for (il, heat) in layers {
+            cold.clear();
+            cold.extend(
+                heat.iter()
+                    .zip(&st.in_vram[il])
+                    .map(|(&h, &v)| if v { 0.0 } else { h }),
+            );
+            st.caches[il].set_heat(&cold);
+        }
     }
 
     /// The oldest batch's copies are done.

@@ -109,7 +109,9 @@ fn a_32_gib_machine_gets_fewer() {
     let Sizing::Bounded(p) = size(mem(32, 27), 48 * EXPERT, EXPERT, 512, table(false), 0) else {
         panic!("bounded");
     };
-    assert_eq!(p.slots, 98);
+    // A sixth of the machine is kept free, not 8 GiB: 19 slots more.
+    assert_eq!(p.margin, 32 * GIB / 6);
+    assert_eq!(p.slots, 117);
     assert_eq!((p.places, p.sets), (256, 2));
     // The KV spill comes off the experts.
     let Sizing::Bounded(q) = size(mem(32, 27), 48 * EXPERT, EXPERT, 512, table(false), 2 * GIB)
@@ -117,15 +119,45 @@ fn a_32_gib_machine_gets_fewer() {
         panic!("bounded");
     };
     assert_eq!(q.kv_spill, 2 * GIB);
-    assert!(q.slots < p.slots);
+    assert_eq!(q.slots, 103);
+}
+
+#[test]
+fn a_small_machine_keeps_a_sixth_free_and_never_under_4_gib() {
+    assert_eq!(margin(16 * GIB), 4 * GIB);
+    assert_eq!(margin(24 * GIB), 4 * GIB);
+    assert_eq!(margin(32 * GIB), 32 * GIB / 6);
+    // From 48 GiB on as before: 8 GiB, a tenth past 80 GiB.
+    assert_eq!(margin(48 * GIB), 8 * GIB);
+    assert_eq!(margin(64 * GIB), 8 * GIB);
+    assert_eq!(margin(125 * GIB), 125 * GIB / 10);
 }
 
 #[test]
 fn too_little_memory_is_told() {
     assert!(matches!(
-        size(mem(16, 14), 48 * EXPERT, EXPERT, 512, table(false), 0),
+        size(mem(16, 13), 48 * EXPERT, EXPERT, 512, table(false), 0),
         Sizing::TooSmall(_)
     ));
+}
+
+#[test]
+fn ram_slots_give_up_the_coldest_expert_once_heat_is_known() {
+    let mut c = SlotCache::new(8, 3);
+    plan_step(&mut c, 8, &[5, 2, 6]);
+    plan_step(&mut c, 8, &[2, 6]);
+    // Least recently used: 5 goes.
+    let mut lru = c.clone();
+    assert_eq!(plan_step(&mut lru, 8, &[1]).loads, vec![(1, Some(0))]);
+    // By heat 5 is the most routed of the three and stays; 6 is the coldest.
+    c.set_heat(&[0.0, 0.0, 2.0, 0.0, 0.0, 9.0, 1.0, 0.0]);
+    assert_eq!(plan_step(&mut c, 8, &[1]).loads, vec![(1, Some(2))]);
+    assert_eq!(c.slot(6), None);
+    // A step's own experts never go, whatever their heat; equal heat: least recently used.
+    c.set_heat(&[0.0; 8]);
+    let t = plan_step(&mut c, 8, &[5, 3]);
+    assert_eq!(t.loads, vec![(3, Some(1))]);
+    assert!(t.cached[5]);
 }
 
 #[test]
