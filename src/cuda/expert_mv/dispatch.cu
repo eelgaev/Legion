@@ -14,10 +14,15 @@ constexpr int STAGE_PAIRS   = 512;  // most pairs a step has here (64 tokens x 8
 // out the slots alike: a host expert's first pair takes the next slot while slots last.
 __global__ void __launch_bounds__(STAGE_THREADS) stage_copy(const legion_expert_stage s) {
     __shared__ int slot[STAGE_PAIRS];
+    __shared__ int ids[STAGE_PAIRS];
     const int n_pairs = s.n_used * s.n_tok;
-    auto id = [&](int q) {
-        return *(const int32_t *) ((const char *) s.ids + (q / s.n_used) * s.ids_nb1 + (q % s.n_used) * 4);
-    };
+    // The ids once, one load per thread: on a peer they are the running GPU's memory, each load
+    // a trip over the link, and the scan below would make thread q wait for q of them in a row.
+    for (int q = threadIdx.x; q < n_pairs; q += blockDim.x) {
+        ids[q] = *(const int32_t *) ((const char *) s.ids + (q / s.n_used) * s.ids_nb1 + (q % s.n_used) * 4);
+    }
+    __syncthreads();
+    auto id = [&](int q) { return ids[q]; };
     for (int q = threadIdx.x; q < n_pairs; q += blockDim.x) {
         const int e = id(q);
         bool first  = e >= s.vram_below && e < s.n_w;
