@@ -471,12 +471,14 @@ impl Executor {
         }
     }
 
-    /// The other ranks' read-ahead of a prompt chunk's table rows (`tokens`, after `before`,
-    /// the prompt's last tokens before them), as this rank reads its own (`next`: the next
-    /// chunk while this one's step computes; else the first one on its arrival): without it
-    /// every other rank read each prompt step's rows from the SSD inside that step, which rank
-    /// 0 then waited for at the sums (#1176). Nothing without a table read through a store.
-    pub fn tp_prefetch_rows(&mut self, before: &[u32], tokens: &[u32], next: bool) {
+    /// The other ranks' read-ahead of a prompt's next chunk's table rows (`tokens`, after
+    /// `before`, the prompt's tokens before them), as this rank reads its own while the
+    /// current chunk's step computes: without it every other rank read each prompt step's
+    /// rows from the SSD inside that step, which rank 0 then waited for at the sums (#1176).
+    /// Not a first chunk's on its arrival: the step follows at once, and its fill would wait
+    /// for those reads where its own late reads run beside the first layers (30 to 60 ms more
+    /// on a cold first step). Nothing without a table read through a store.
+    pub fn tp_prefetch_rows(&mut self, before: &[u32], tokens: &[u32]) {
         if tokens.is_empty() || self.model.ngram.is_none() {
             return;
         }
@@ -487,7 +489,6 @@ impl Executor {
             lead.mirror(&Request::TpPrefetch {
                 before: before.to_vec(),
                 tokens: tokens.to_vec(),
-                next,
             });
         }
     }

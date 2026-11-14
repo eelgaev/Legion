@@ -170,15 +170,13 @@ pub enum Request {
     TpCommit {
         commits: Vec<(u32, u32)>,
     },
-    /// Start reading the per-layer table rows (n-gram or Engram) of prompt tokens `tokens`,
-    /// which follow `before` (the prompt's last tokens before them, at most 8; empty at its
-    /// start), as rank 0 starts its own (#1176): a prompt's next chunk while the step of its
-    /// current one computes (`next`, that step's fill does not wait for them), or its first
-    /// chunk on its arrival at an idle engine. A hint: the rows are the same bytes either way.
+    /// Start reading the per-layer table rows (n-gram or Engram) of a prompt's next chunk
+    /// `tokens`, which follow `before` (the prompt's last tokens before them), as rank 0
+    /// starts its own (#1176): sent before the step of the current chunk, whose fill does not
+    /// wait for them. A hint: the rows are the same bytes either way.
     TpPrefetch {
         before: Vec<u32>,
         tokens: Vec<u32>,
-        next: bool,
     },
     /// The MTP drafts after the last step (`--spec mtp` over two nodes, #560): rank 1 holds the
     /// head and the residual rows the step captured, so only the sequences go over the link.
@@ -525,14 +523,9 @@ impl Request {
                 }
                 K_TP_COMMIT
             }
-            Request::TpPrefetch {
-                before,
-                tokens,
-                next,
-            } => {
+            Request::TpPrefetch { before, tokens } => {
                 put_u32s(&mut head, &before);
                 put_u32s(&mut head, &tokens);
-                head.push(u8::from(next));
                 K_TP_PREFETCH
             }
             Request::Draft { reqs, p_min } => {
@@ -645,7 +638,6 @@ impl Request {
             K_TP_PREFETCH => Request::TpPrefetch {
                 before: r.u32s()?,
                 tokens: r.u32s()?,
-                next: r.u8()? != 0,
             },
             K_DRAFT => {
                 let p_min = r.u32()?;

@@ -90,12 +90,10 @@ fn requests_round_trip() {
         Request::TpPrefetch {
             before: vec![7, 8, u32::MAX],
             tokens: vec![1, 2, 3, 4],
-            next: true,
         },
         Request::TpPrefetch {
             before: vec![],
             tokens: vec![9],
-            next: false,
         },
         Request::TpMtpChain {
             groups: match step() {

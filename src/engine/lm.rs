@@ -7330,7 +7330,7 @@ impl Worker {
                     .prefetch_ngram_next(&s.prompt[..end], next);
                 self.exec.model().prefetch_engram(&s.prompt[..end], next);
                 // The other ranks of tensor parallelism read theirs too, before this step.
-                self.exec.tp_prefetch_rows(&s.prompt[..end], next, true);
+                self.exec.tp_prefetch_rows(&s.prompt[..end], next);
             }
         }
         // A step of one prompt's chunk alone builds the next chunk's graph while it computes
