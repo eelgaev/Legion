@@ -6,14 +6,17 @@
 //! machine cannot hold. With it a layer's tiered tensor is
 //!
 //! ```text
-//! [ S VRAM slots | R pinned RAM slots | gap | staging: one place per expert ]
+//! [ S VRAM slots | R pinned RAM slots | gap | staging: two sets of places ]
 //! ```
 //!
 //! - The **RAM slots** hold the experts used last (least recently used out first,
-//!   [`SlotCache`]); `R` comes from the memory the machine has ([`size`]).
-//! - The **staging** part is one buffer of a whole layer's experts that every layer maps: a
-//!   step that routes to more experts than the RAM slots hold (a prompt chunk) reads the rest
-//!   there, each expert at its own place.
+//!   [`SlotCache`]); `R` comes from the memory the machine has ([`size`]). An expert a VRAM
+//!   slot drops goes to a RAM slot, and the RAM copy of one a VRAM slot takes is dropped
+//!   ([`HostTier::swap`]): the two tiers hold different experts.
+//! - The **staging** part is one buffer that every layer maps: a step that routes to more
+//!   experts than the RAM slots hold (a prompt chunk) reads the rest into its places
+//!   ([`stage_sets`]). The layers take its two sets in turn, so a big step reads the next
+//!   layer's experts (those its last big step read) while this layer computes.
 //! - Experts in neither are read from the GGUF, around the page cache (`O_DIRECT` through the
 //!   SSD tier's readers, [`super::ssd_experts::io`]), as the step routes to them.
 //!
@@ -27,6 +30,7 @@
 //! The VRAM cache's own copies (its first fill and its swaps) take their bytes from a RAM slot
 //! or, read first, from the expert's staging place ([`HostTier::sources`]).
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
@@ -37,7 +41,7 @@ use crate::gguf::{FileRange, GgufFile};
 use super::lookup_table::MemInfo;
 use super::ssd_experts::KINDS;
 use super::ssd_experts::cache::SlotCache;
-use super::ssd_experts::io::{Job, Pool};
+use super::ssd_experts::io::{Group, Job, Pool};
 
 #[cfg(test)]
 mod tests;
@@ -53,6 +57,35 @@ const READERS: usize = 8;
 /// Fewest RAM slots per layer worth running with: a full decode batch's experts of a few
 /// sequences.
 pub const MIN_SLOTS: usize = 32;
+
+/// Staging places kept beyond the experts the RAM slots cannot hold: RAM slots that VRAM
+/// swaps under way keep from a step.
+const SPARE_PLACES: usize = 16;
+
+/// Experts of a layer its VRAM slots hold at least, where the staging has two sets: a set
+/// need not hold those. A layer with fewer runs its big steps without reads ahead.
+const AHEAD_IN_VRAM: usize = 64;
+
+/// A step of at least this many routed (token, expert) pairs per expert of a layer is a big
+/// one (a prompt chunk): it routes to about every expert of every layer, and the next
+/// layer's are read ahead.
+const AHEAD_PAIRS_PER_EXPERT: usize = 8;
+
+/// The staging part for `slots` RAM slots: `(places per set, sets)`. A step needs at most a
+/// place for every expert the RAM slots cannot hold. Two sets, which the layers take in turn
+/// so that a big step reads the next layer's experts while this one computes: each as big as
+/// a big step's layer needs with its VRAM slots, together at least what any step needs and
+/// at most a place per expert (a layer that needs more than its set takes the other too, and
+/// the next layer is not read ahead).
+pub(crate) fn stage_sets(n_expert: usize, slots: usize) -> (usize, usize) {
+    let need = (n_expert.saturating_sub(slots) + SPARE_PLACES).min(n_expert);
+    let places = need
+        .saturating_sub(AHEAD_IN_VRAM)
+        .min(n_expert / 2)
+        .max(need.div_ceil(2))
+        .max(1);
+    (places, 2)
+}
 
 /// Fetches between two reports.
 const REPORT_EVERY: u64 = 48 * 256;
@@ -91,6 +124,9 @@ pub enum Sizing {
 pub struct Plan {
     /// RAM slots per layer.
     pub slots: usize,
+    /// Staging places per set, and the sets ([`stage_sets`]).
+    pub places: usize,
+    pub sets: usize,
     /// Their bytes over all layers.
     pub slot_bytes: u64,
     /// The staging buffer's bytes.
@@ -135,11 +171,22 @@ pub fn size(
     if room >= all + table_min {
         return Sizing::Whole;
     }
-    let stage_bytes = stage_one * (n_expert + GAP + 1) as u64;
-    let left = room.saturating_sub(table_min + stage_bytes);
-    let slots = ((left / per_slot.max(1)) as usize).min(n_expert);
+    // The most slots that fit with the staging they leave to do ([`stage_sets`]).
+    let left = room.saturating_sub(table_min);
+    let stage = |slots: usize| {
+        let (places, sets) = stage_sets(n_expert, slots);
+        stage_one * (GAP + places * sets + 1) as u64
+    };
+    let mut slots = ((left / per_slot.max(1)) as usize).min(n_expert);
+    while slots > 0 && slots as u64 * per_slot + stage(slots) > left {
+        slots -= 1;
+    }
+    let stage_bytes = stage(slots);
+    let (places, sets) = stage_sets(n_expert, slots);
     let plan = Plan {
         slots,
+        places,
+        sets,
         slot_bytes: slots as u64 * per_slot,
         stage_bytes,
         margin,
@@ -217,6 +264,10 @@ pub struct HostStats {
     /// Experts read into a RAM slot, and into the staging buffer.
     pub ram_loads: u64,
     pub stage_loads: u64,
+    /// Experts big steps read into the staging buffer a layer ahead.
+    pub ahead_loads: u64,
+    /// Experts a VRAM slot dropped that went to a RAM slot.
+    pub write_backs: u64,
     /// Bytes read from the GGUF (steps and the VRAM cache's copies).
     pub read_bytes: u64,
     /// Time steps waited in the fetch.
@@ -231,6 +282,8 @@ struct Counters {
     ssd_pairs: AtomicU64,
     ram_loads: AtomicU64,
     stage_loads: AtomicU64,
+    ahead_loads: AtomicU64,
+    write_backs: AtomicU64,
     fetch_ns: AtomicU64,
     fetches: AtomicU64,
 }
@@ -252,13 +305,152 @@ struct Inner {
     n_expert: usize,
     /// RAM slots per layer.
     slots: usize,
+    /// Staging places per set, and the sets ([`stage_sets`]): layer `il`'s steps take set
+    /// `il % sets` first.
+    places: usize,
+    sets: usize,
     layers: Vec<LayerMem>,
     /// Pinned ids in and out of the fetch (CUDA), `cap` ids each.
     xchg: Option<(usize, usize)>,
     cap: usize,
     pool: Pool,
-    state: Mutex<Vec<SlotCache>>,
+    state: Mutex<State>,
     counts: Counters,
+}
+
+/// The RAM slots of every layer, and the VRAM swaps whose copies are under way.
+struct State {
+    caches: Vec<SlotCache>,
+    /// Batches of swaps ([`HostTier::swap`], closed by [`HostTier::swaps_queued`]), oldest
+    /// first: one per [`HostTier::swaps_landed`].
+    flights: VecDeque<Vec<Flight>>,
+    /// The batch being queued.
+    open: Vec<Flight>,
+    /// Per layer, the experts the VRAM cache took ([`HostTier::sources`], [`HostTier::swap`])
+    /// and has not dropped: a read ahead leaves them out.
+    in_vram: Vec<Vec<bool>>,
+    /// Per layer, the experts its last big step read from the checkpoint: what the next big
+    /// step's read ahead takes (prompts route alike from chunk to chunk).
+    last_big: Vec<Vec<usize>>,
+    /// The read ahead under way, if any.
+    ahead: Option<Ahead>,
+}
+
+/// Experts of a layer being read into staging places ahead of the big step that is one layer
+/// before it.
+struct Ahead {
+    layer: usize,
+    group: Arc<Group>,
+    /// `(expert, place)`.
+    at: Vec<(usize, usize)>,
+}
+
+/// The experts a big step's read ahead takes for a layer: those its last big step read
+/// (`last`) that are still in no VRAM slot (`in_vram`) and no RAM slot of `cache`, as many as
+/// a set has `places`.
+pub(crate) fn plan_ahead(
+    cache: &SlotCache,
+    in_vram: &[bool],
+    last: &[usize],
+    places: usize,
+) -> Vec<usize> {
+    last.iter()
+        .copied()
+        .filter(|&e| !in_vram[e] && cache.slot(e).is_none())
+        .take(places)
+        .collect()
+}
+
+/// Gives the experts a step stages their places: `taken` places of the step's own set (`set`
+/// of `sets`, `places` each) hold experts read ahead; the others follow there, then in the
+/// other sets from their first place. `None`: more experts than places. Returns the places
+/// and whether another set was used (its places then hold this step's experts: no read ahead
+/// into it).
+pub(crate) fn assign_places(
+    n: usize,
+    set: usize,
+    sets: usize,
+    places: usize,
+    taken: usize,
+) -> Option<(Vec<usize>, bool)> {
+    let own = places.saturating_sub(taken);
+    if n > own + (sets - 1) * places {
+        return None;
+    }
+    let at = (0..n)
+        .map(|i| {
+            if i < own {
+                set * places + taken + i
+            } else {
+                let j = i - own;
+                ((set + 1 + j / places) % sets) * places + j % places
+            }
+        })
+        .collect();
+    Some((at, n > own))
+}
+
+/// One VRAM swap's RAM slots while its copies are under way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Flight {
+    pub layer: usize,
+    /// The RAM slot the new expert's bytes are copied from (pinned; emptied when it lands:
+    /// the expert is in VRAM then).
+    pub from: Option<usize>,
+    /// The expert the VRAM slot dropped and the RAM slot its bytes are copied to (reserved;
+    /// the expert's when it lands).
+    pub back: Option<(usize, usize)>,
+}
+
+/// Where a VRAM swap takes and leaves its experts ([`HostTier::swap`]), as indices past the
+/// layer's VRAM slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwapAt {
+    /// The new expert's bytes: its RAM slot, or its staging place (read first).
+    pub src: usize,
+    /// The RAM slot the dropped expert's bytes go to, before the slot is overwritten.
+    pub back: Option<usize>,
+    /// `src` is a staging place: its bytes only stay until the next step or swap, so the
+    /// copy must be done by then.
+    pub staged: bool,
+}
+
+/// Plans one VRAM swap in a layer's RAM slots `cache`: `new` comes from its RAM slot (pinned
+/// until the swap lands), `old` (what the VRAM slot held) goes to a reserved RAM slot unless
+/// a RAM slot holds it already. The swap's [`Flight`] of layer `il`.
+pub(crate) fn plan_swap(
+    cache: &mut SlotCache,
+    il: usize,
+    new: usize,
+    old: Option<usize>,
+) -> Flight {
+    let from = cache.slot(new);
+    if let Some(r) = from {
+        cache.pin(r, true);
+    }
+    let back = old
+        .filter(|&o| cache.slot(o).is_none())
+        .and_then(|o| cache.reserve().map(|s| (o, s)));
+    Flight {
+        layer: il,
+        from,
+        back,
+    }
+}
+
+/// A swap's copies are done: the new expert leaves its RAM slot (it is in VRAM), the dropped
+/// one takes the slot its bytes went to (unless a step read it into another meanwhile).
+pub(crate) fn land_swap(cache: &mut SlotCache, f: &Flight) {
+    if let Some(r) = f.from {
+        cache.drop_slot(r);
+    }
+    if let Some((o, d)) = f.back {
+        if cache.slot(o).is_some() {
+            cache.drop_slot(d);
+        } else {
+            cache.put(o, d);
+        }
+    }
 }
 
 // SAFETY: the addresses point into host buffers the owning `HostTier` keeps alive; every write
@@ -307,6 +499,10 @@ impl HostTier {
             return Err("no MoE layers".into());
         }
         let slots = plan.slots;
+        let n_place = plan.places * plan.sets;
+        if plan.places == 0 || plan.sets == 0 {
+            return Err("the host expert tier needs staging places".into());
+        }
         // The layers' experts differ in type (a mixed quantization): one staging tensor per
         // kind and type, shared by the layers that have it.
         let (classes, class_of) = classes(srcs);
@@ -322,7 +518,7 @@ impl HostTier {
         }
         for (c, &(il, k)) in classes.iter().enumerate() {
             let t = &srcs[il][k];
-            ctx.new_tensor(t.ggml_type, &shape(t, n_expert + GAP + 1))
+            ctx.new_tensor(t.ggml_type, &shape(t, n_place + GAP + 1))
                 .named(&format!("host_tier.stage.{c}"));
         }
         let cap = n_used * max_tokens.max(1);
@@ -340,7 +536,7 @@ impl HostTier {
         let mut layers = Vec::with_capacity(srcs.len());
         for (il, l) in srcs.iter().enumerate() {
             let bytes = [0, 1, 2].map(|k| (l[k].size / n_expert as u64) as usize);
-            // A staging place's index past the VRAM slots is `slots + GAP + expert`: its bytes
+            // A staging place's index past the VRAM slots is `slots + GAP + place`: its bytes
             // start that many experts after the RAM slots' start, of which the RAM tensor's own
             // pieces cover `span`.
             let mut stage = [0usize; 3];
@@ -352,7 +548,7 @@ impl HostTier {
                     .checked_sub(span)
                     .ok_or("the RAM slots' piece runs past the gap")?;
                 // The last place's bytes and a matmul's reads past them stay inside the buffer.
-                if at + (n_expert + 1) * bytes[k] > tail_span {
+                if at + (n_place + 1) * bytes[k] > tail_span {
                     return Err("the staging buffer is too short".into());
                 }
                 stage[k] = addr(&name) + at;
@@ -376,7 +572,16 @@ impl HostTier {
         let inner = Arc::new(Inner {
             n_expert,
             slots,
-            state: Mutex::new(vec![SlotCache::new(n_expert, slots); layers.len()]),
+            places: plan.places,
+            sets: plan.sets,
+            state: Mutex::new(State {
+                caches: vec![SlotCache::new(n_expert, slots); layers.len()],
+                flights: VecDeque::new(),
+                open: Vec::new(),
+                in_vram: vec![vec![false; n_expert]; layers.len()],
+                last_big: vec![Vec::new(); layers.len()],
+                ahead: None,
+            }),
             layers,
             xchg,
             cap,
@@ -447,10 +652,15 @@ impl HostTier {
         self.inner.slots
     }
 
-    /// The experts of a layer's tiered tensor past its VRAM slots: RAM slots, the gap and a
-    /// staging place per expert.
+    /// The experts of a layer's tiered tensor past its VRAM slots: RAM slots, the gap and
+    /// the staging places.
     pub fn n_host(&self) -> usize {
-        self.inner.slots + GAP + self.inner.n_expert
+        self.inner.slots + GAP + self.places()
+    }
+
+    /// The staging places: the most experts one [`Self::sources`] call can read.
+    pub fn places(&self) -> usize {
+        self.inner.places * self.inner.sets
     }
 
     pub fn plan(&self) -> Plan {
@@ -495,6 +705,28 @@ impl HostTier {
         self.inner.sources(il, experts)
     }
 
+    /// A VRAM slot of layer `il` swaps `old` (what it held, if anything) for `new`: where
+    /// the copies go. The caller queues, in this order, the slot's bytes to
+    /// [`SwapAt::back`] and [`SwapAt::src`]'s to the slot, then closes its batch of swaps
+    /// with [`Self::swaps_queued`] and tells when the batch's copies are done
+    /// ([`Self::swaps_landed`], batches in order). Until then the RAM slots involved are
+    /// pinned: `new` reads from its RAM slot, `old` from the checkpoint if a step wants it.
+    /// So an expert a VRAM slot drops stays in RAM, and RAM holds no copy of an expert that
+    /// is in VRAM: the two tiers hold different experts.
+    pub fn swap(&self, il: usize, new: u32, old: Option<u32>) -> Result<SwapAt, String> {
+        self.inner.swap(il, new as usize, old.map(|o| o as usize))
+    }
+
+    /// Closes the batch of [`Self::swap`]s queued since the last call.
+    pub fn swaps_queued(&self) {
+        self.inner.swaps_queued();
+    }
+
+    /// The oldest batch's copies are done.
+    pub fn swaps_landed(&self) {
+        self.inner.swaps_landed();
+    }
+
     pub fn stats(&self) -> HostStats {
         let c = &self.inner.counts;
         let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
@@ -504,6 +736,8 @@ impl HostTier {
             ssd_pairs: l(&c.ssd_pairs),
             ram_loads: l(&c.ram_loads),
             stage_loads: l(&c.stage_loads),
+            ahead_loads: l(&c.ahead_loads),
+            write_backs: l(&c.write_backs),
             read_bytes: self.inner.pool.bytes_read(),
             fetch_ns: l(&c.fetch_ns),
             fetches: l(&c.fetches),
@@ -610,9 +844,16 @@ pub(crate) fn plan_step(cache: &mut SlotCache, n_expert: usize, need: &[usize]) 
     t
 }
 
+/// Where a read puts an expert: a RAM slot, or a staging place.
+#[derive(Clone, Copy)]
+enum To {
+    Slot(usize),
+    Place(usize),
+}
+
 impl Inner {
-    /// The reads of expert `e` of layer `il` into RAM slot `slot`, or its staging place.
-    fn reads(&self, il: usize, e: usize, slot: Option<usize>) -> [Job; 3] {
+    /// The reads of expert `e` of layer `il` into RAM slot `to`, or into staging place `to`.
+    fn reads(&self, il: usize, e: usize, to: To) -> [Job; 3] {
         let mem = &self.layers[il];
         [0, 1, 2].map(|k| {
             let n = mem.bytes[k];
@@ -622,11 +863,26 @@ impl Inner {
                     offset: mem.src[k].offset + (e * n) as u64,
                     len: n as u64,
                 },
-                dst: match slot {
-                    Some(s) => mem.ram[k] + s * n,
-                    None => mem.stage[k] + e * n,
+                dst: match to {
+                    To::Slot(s) => mem.ram[k] + s * n,
+                    To::Place(p) => mem.stage[k] + p * n,
                 },
             }
+        })
+    }
+
+    /// Waits for the read ahead under way, if any, and gives its `(expert, place)` when it is
+    /// layer `il`'s. Anything that writes or reads staging places starts with this: another
+    /// layer's read ahead is dropped, its places free again.
+    fn take_ahead(&self, st: &mut State, il: Option<usize>) -> Result<Vec<(usize, usize)>, String> {
+        let Some(a) = st.ahead.take() else {
+            return Ok(Vec::new());
+        };
+        a.group.wait()?;
+        Ok(if Some(a.layer) == il {
+            a.at
+        } else {
+            Vec::new()
         })
     }
 
@@ -654,14 +910,72 @@ impl Inner {
             return Ok(());
         }
         let mut st = self.state.lock().unwrap();
-        let t = plan_step(&mut st[il], self.n_expert, &need);
-        let jobs: Vec<Job> = t
+        let st = &mut *st;
+        // The experts read ahead for this layer are in their places.
+        let ready = self.take_ahead(st, Some(il))?;
+        let mut place = vec![usize::MAX; self.n_expert];
+        for &(e, p) in &ready {
+            place[e] = p;
+        }
+        let cache = &mut st.caches[il];
+        need.retain(|&e| place[e] == usize::MAX || cache.slot(e).is_some());
+        let mut t = plan_step(cache, self.n_expert, &need);
+        // The experts the RAM slots cannot hold: places after those read ahead.
+        let over: Vec<usize> = t
             .loads
             .iter()
-            .flat_map(|&(e, s)| self.reads(il, e, s))
+            .filter(|l| l.1.is_none())
+            .map(|l| l.0)
             .collect();
-        self.pool.run(jobs)?;
-        drop(st);
+        let set = il % self.sets;
+        let (at, spilled) = assign_places(over.len(), set, self.sets, self.places, ready.len())
+            .ok_or_else(|| format!("layer {il}: {} experts to stage, no place", over.len()))?;
+        let mut jobs: Vec<Job> = Vec::new();
+        for (&e, &p) in over.iter().zip(&at) {
+            place[e] = p;
+            jobs.extend(self.reads(il, e, To::Place(p)));
+        }
+        for &(e, s) in &t.loads {
+            if let Some(s) = s {
+                jobs.extend(self.reads(il, e, To::Slot(s)));
+            }
+        }
+        for (e, &p) in place.iter().enumerate() {
+            if p != usize::MAX && cache.slot(e).is_none() {
+                t.index[e] = self.slots + GAP + p;
+            }
+        }
+        let group = self.pool.submit(jobs);
+        // A big step: the next layer's experts start now, into the other set, which the layer
+        // before is done with (the stream runs this after its kernels).
+        let next = il + 1;
+        let big = ids.len() >= AHEAD_PAIRS_PER_EXPERT * self.n_expert;
+        if big {
+            // What this step took from the checkpoint: the layer's next read ahead.
+            let read = ready.iter().map(|r| r.0).filter(|&e| seen[e]);
+            st.last_big[il] = read.chain(t.loads.iter().map(|l| l.0)).collect();
+        }
+        if big && self.sets > 1 && !spilled && next < self.layers.len() {
+            let last = &st.last_big[next];
+            let experts = plan_ahead(&st.caches[next], &st.in_vram[next], last, self.places);
+            let base = (next % self.sets) * self.places;
+            let at: Vec<(usize, usize)> = experts
+                .iter()
+                .enumerate()
+                .map(|(i, &e)| (e, base + i))
+                .collect();
+            let jobs: Vec<Job> = at
+                .iter()
+                .flat_map(|&(e, p)| self.reads(next, e, To::Place(p)))
+                .collect();
+            c.ahead_loads.fetch_add(at.len() as u64, Ordering::Relaxed);
+            st.ahead = Some(Ahead {
+                layer: next,
+                group: self.pool.submit(jobs),
+                at,
+            });
+        }
+        group.wait()?;
         let (mut vram, mut ram, mut ssd) = (0u64, 0u64, 0u64);
         for (o, &id) in out.iter_mut().zip(ids) {
             match (id as usize).checked_sub(n_slots) {
@@ -695,20 +1009,67 @@ impl Inner {
     }
 
     fn sources(&self, il: usize, experts: &[u32]) -> Result<Vec<usize>, String> {
-        let st = self.state.lock().unwrap();
+        let mut st = self.state.lock().unwrap();
+        let st = &mut *st;
+        self.take_ahead(st, None)?;
         let mut jobs = Vec::new();
-        let at = experts
-            .iter()
-            .map(|&e| {
-                let e = e as usize;
-                st[il].slot(e).unwrap_or_else(|| {
-                    jobs.extend(self.reads(il, e, None));
-                    self.slots + GAP + e
-                })
-            })
-            .collect();
+        let mut used = 0;
+        let mut at = Vec::with_capacity(experts.len());
+        for &e in experts {
+            let e = e as usize;
+            st.in_vram[il][e] = true;
+            at.push(match st.caches[il].slot(e) {
+                Some(s) => s,
+                None => {
+                    if used == self.places * self.sets {
+                        return Err(format!("layer {il}: more experts than staging places"));
+                    }
+                    jobs.extend(self.reads(il, e, To::Place(used)));
+                    used += 1;
+                    self.slots + GAP + used - 1
+                }
+            });
+        }
         self.pool.run(jobs)?;
         Ok(at)
+    }
+
+    fn swap(&self, il: usize, new: usize, old: Option<usize>) -> Result<SwapAt, String> {
+        let mut st = self.state.lock().unwrap();
+        let st = &mut *st;
+        self.take_ahead(st, None)?;
+        let f = plan_swap(&mut st.caches[il], il, new, old);
+        st.in_vram[il][new] = true;
+        if let Some(o) = old {
+            st.in_vram[il][o] = false;
+        }
+        // Read first, the new expert is in the first staging place until its copy is done.
+        let at = SwapAt {
+            src: f.from.unwrap_or(self.slots + GAP),
+            back: f.back.map(|b| b.1),
+            staged: f.from.is_none(),
+        };
+        st.open.push(f);
+        if at.staged {
+            self.pool.run(self.reads(il, new, To::Place(0)).into())?;
+        }
+        if at.back.is_some() {
+            self.counts.write_backs.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(at)
+    }
+
+    fn swaps_queued(&self) {
+        let mut st = self.state.lock().unwrap();
+        let batch = std::mem::take(&mut st.open);
+        st.flights.push_back(batch);
+    }
+
+    fn swaps_landed(&self) {
+        let mut st = self.state.lock().unwrap();
+        for f in st.flights.pop_front().unwrap_or_default() {
+            land_swap(&mut st.caches[f.layer], &f);
+        }
     }
 
     fn report(&self) {
@@ -726,6 +1087,8 @@ impl Inner {
             ssd_pairs = ssd,
             ram_loads = l(&c.ram_loads),
             stage_loads = l(&c.stage_loads),
+            ahead_loads = l(&c.ahead_loads),
+            write_backs = l(&c.write_backs),
             read_gib = self.pool.bytes_read() as f64 / (1u64 << 30) as f64,
             fetch_wait_s = l(&c.fetch_ns) as f64 / 1e9,
             fetches = l(&c.fetches),

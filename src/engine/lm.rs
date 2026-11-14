@@ -3810,6 +3810,14 @@ impl LmEngine {
             if cfg.ngram.io == crate::residency::lookup_table::TableIo::Auto {
                 cfg.ngram.io = crate::residency::lookup_table::TableIo::Direct;
             }
+            // Prompts read the host experts in place, once per chunk over the link: unless
+            // chunk or batch were given, bigger chunks (the VRAM cache leaves their room).
+            if let Some((chunk, batch)) =
+                ssd_tier::host_tier_chunk(cfg.ring_step, cfg.prefill_chunk, cfg.max_batch_tokens)
+            {
+                cfg.prefill_chunk = chunk;
+                cfg.max_batch_tokens = batch;
+            }
         }
         // The other machine's layers and head.
         let hp_file = crate::model::core::Hparams::from_gguf(&gguf)?;

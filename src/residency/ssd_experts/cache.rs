@@ -189,6 +189,24 @@ impl SlotCache {
         Some(s)
     }
 
+    /// Takes a slot for bytes that arrive later (the bounded host tier's write-back of an
+    /// expert a VRAM slot drops): an empty one first, else the least recently used one, whose
+    /// expert is evicted. The slot is left empty and pinned until [`Self::put`] or
+    /// [`Self::drop_slot`]. `None`: every slot is pinned or the current step's.
+    pub fn reserve(&mut self) -> Option<usize> {
+        let s = self.victim()?;
+        self.drop_slot(s);
+        self.pinned[s] = true;
+        Some(s)
+    }
+
+    /// Puts `expert` (not cached) into slot `s` that [`Self::reserve`] took, and unpins it.
+    pub fn put(&mut self, expert: usize, s: usize) {
+        debug_assert!(self.slot(expert).is_none() && self.owner[s] < 0);
+        self.assign(expert, s);
+        self.pinned[s] = false;
+    }
+
     fn victim(&self) -> Option<usize> {
         if let Some(s) = (0..self.n_slots()).find(|&s| self.owner[s] < 0 && !self.pinned[s]) {
             return Some(s);

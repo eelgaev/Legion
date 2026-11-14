@@ -126,8 +126,11 @@ pub fn build(
 /// VRAM expert cache on one discrete GPU reading a pinned host arena, Qwen3.8-Flash-Next's
 /// plain GGUF experts. Not the SSD tier's gate above (GLM-5.3-Flash NVFP4 on an integrated
 /// GPU), which stays as it is; whether it does apply is the memory's to say
-/// ([`host_tier_plan`]).
+/// ([`host_tier_plan`]). `cpu` is the host's architecture ([`std::env::consts::ARCH`]): the
+/// tier is an x86_64 PC's; a POWER9 host (unified memory behind its GPUs) and every other
+/// one load as before, whatever their memory.
 pub fn host_tier_wanted(
+    cpu: &str,
     mode: ExpertMode,
     arch: &str,
     stages: usize,
@@ -135,12 +138,32 @@ pub fn host_tier_wanted(
     device: Option<DeviceKind>,
     arena: bool,
 ) -> bool {
-    mode == ExpertMode::Cache
+    cpu == "x86_64"
+        && mode == ExpertMode::Cache
         && arch == "qwen4exp"
         && stages == 1
         && tp <= 1
         && device == Some(DeviceKind::Gpu)
         && arena
+}
+
+/// Prompt tokens per chunk with the bounded host tier, when none were asked for: a chunk reads
+/// every host expert it routes to once over the link, nearly all of them from a few hundred
+/// tokens on, so a prompt costs its chunks more than its tokens. The step buffers of a bigger
+/// chunk come off the VRAM expert cache: on a 24 GB card 2048 tokens take 8% of its slots
+/// (decode 2-5% slower, prompts 1.5-1.9 times faster than at 512), 4096 take 18%.
+pub const HOST_TIER_CHUNK: usize = 2048;
+
+/// The prompt chunk and the most tokens per step the bounded host tier runs with:
+/// [`HOST_TIER_CHUNK`] for both, unless a chunk was given (`given`: `--prefill-chunk`) or the
+/// batch (`max_batch`) is not the default. `None`: as configured.
+pub fn host_tier_chunk(
+    given: Option<usize>,
+    chunk: usize,
+    max_batch: usize,
+) -> Option<(usize, usize)> {
+    (given.is_none() && chunk == super::PREFILL_CHUNK && max_batch == super::MAX_BATCH_TOKENS)
+        .then_some((HOST_TIER_CHUNK, HOST_TIER_CHUNK))
 }
 
 /// The bounded host tier of a load: its layers' expert tensors and its memory.
@@ -163,6 +186,7 @@ pub fn host_tier_plan(
     let device = layout.stages[0].0.map(|d| d.kind());
     if layout.node.is_some()
         || !host_tier_wanted(
+            std::env::consts::ARCH,
             layout.mode,
             hp.arch.name(),
             layout.stages.len(),

@@ -56,6 +56,32 @@ fn empty_slots_take_experts_without_evicting() {
 }
 
 #[test]
+fn a_reserved_slot_is_empty_and_kept_until_it_is_filled() {
+    let mut c = SlotCache::new(8, 2);
+    c.plan(&[3]);
+    c.plan(&[4]);
+    // The least recently used slot goes: its expert is evicted.
+    assert_eq!(c.reserve(), Some(0));
+    assert_eq!((c.slot(3), c.filled()), (None, 1));
+    // No step takes it: with the other slot the step's own, a second expert finds none.
+    assert_eq!(
+        c.plan_some(&[4, 6]),
+        (
+            Plan {
+                hits: 1,
+                loads: vec![]
+            },
+            vec![6]
+        )
+    );
+    c.put(7, 0);
+    assert_eq!(c.slot(7), Some(0));
+    // Filled, it is a slot like any other.
+    c.plan(&[4]);
+    assert_eq!(c.plan(&[1]).loads, vec![(1, 0)]);
+}
+
+#[test]
 fn aligned_spans_cover_the_range() {
     let r = FileRange {
         file: 0,

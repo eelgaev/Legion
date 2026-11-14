@@ -60,6 +60,9 @@ type CopyEvent = super::cuda::CopyEvent;
 struct InFlight {
     event: CopyEvent,
     slots: Vec<(usize, u32)>,
+    /// A batch of the bounded host tier's swaps ([`super::host_tier::HostTier::swap`]) it
+    /// has not been told the end of yet.
+    tier: bool,
 }
 
 struct Device {
@@ -1982,12 +1985,16 @@ impl ExpertResidency {
         if fills.is_empty() {
             return Ok(());
         }
-        let experts: Vec<u32> = fills.iter().map(|f| f.1).collect();
-        let at = h.sources(il, &experts)?;
-        for (&(s, _), a) in fills.iter().zip(at) {
-            self.copy_expert(il, s, n_slots + a)?;
+        // As many at a time as the tier has staging places.
+        for part in fills.chunks(h.places().max(1)) {
+            let experts: Vec<u32> = part.iter().map(|f| f.1).collect();
+            let at = h.sources(il, &experts)?;
+            for (&(s, _), a) in part.iter().zip(at) {
+                self.copy_expert(il, s, n_slots + a)?;
+            }
+            self.sync_copies()?;
         }
-        self.sync_copies()
+        Ok(())
     }
 
     /// The bounded host tier the layers' host parts are, if any.
@@ -2409,9 +2416,32 @@ impl ExpertResidency {
             return Ok(());
         }
         self.swaps += swaps.len() as u64;
+        let tier = self.host.clone();
         for s in &swaps {
             self.layers[s.layer].as_mut().unwrap().dirty = true;
-            self.copy_from_host(s.layer, &[(s.slot, s.new)])?;
+            match &tier {
+                // The bounded host tier: the dropped expert's bytes go to a RAM slot first,
+                // the new one's come from its RAM slot (or, read first, its staging place:
+                // those bytes only stay until the next read, so that copy is waited for).
+                Some(h) => {
+                    let n_slots = self.layers[s.layer].as_ref().unwrap().slots.n_slots();
+                    let at = h.swap(s.layer, s.new, s.old)?;
+                    if let Some(back) = at.back {
+                        self.copy_expert(s.layer, (n_slots + back) as u32, s.slot as usize)?;
+                    }
+                    self.copy_expert(s.layer, s.slot, n_slots + at.src)?;
+                    if at.staged {
+                        self.sync_copies()?;
+                    }
+                }
+                None => self.copy_from_host(s.layer, &[(s.slot, s.new)])?,
+            }
+        }
+        if let Some(h) = &tier {
+            h.swaps_queued();
+            if self.devices[d].place.cuda.is_none() {
+                h.swaps_landed();
+            }
         }
         let filled: Vec<(usize, u32)> = swaps.iter().map(|s| (s.layer, s.slot)).collect();
         let dev = &mut self.devices[d];
@@ -2422,6 +2452,7 @@ impl ExpertResidency {
                 dev.inflight.push_back(InFlight {
                     event,
                     slots: filled,
+                    tier: tier.is_some(),
                 });
             }
             _ => {
@@ -2449,6 +2480,11 @@ impl ExpertResidency {
             while i < dev.inflight.len() {
                 if !dev.inflight[i].event.done()? {
                     break;
+                }
+                if std::mem::take(&mut dev.inflight[i].tier)
+                    && let Some(h) = &self.host
+                {
+                    h.swaps_landed();
                 }
                 let layers = &mut self.layers;
                 dev.inflight[i].slots.retain(|&(il, slot)| {

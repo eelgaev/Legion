@@ -60,21 +60,61 @@ fn the_budget_is_free_memory_less_kv_steps_and_reserve_unless_given() {
 fn the_host_tier_is_for_the_expert_cache_of_one_discrete_gpu_with_a_pinned_arena() {
     let gpu = Some(DeviceKind::Gpu);
     let cache = ExpertMode::Cache;
-    assert!(host_tier_wanted(cache, "qwen4exp", 1, 1, gpu, true));
+    let pc = "x86_64";
+    assert!(host_tier_wanted(pc, cache, "qwen4exp", 1, 1, gpu, true));
     // Integrated GPUs, the CPU, several stages, tensor parallelism, other models, other
     // expert modes and a host without an arena stay as they are.
-    assert!(!host_tier_wanted(cache, "qwen4exp", 1, 1, IGPU, true));
-    assert!(!host_tier_wanted(cache, "qwen4exp", 1, 1, None, true));
-    assert!(!host_tier_wanted(cache, "qwen4exp", 2, 1, gpu, true));
-    assert!(!host_tier_wanted(cache, "qwen4exp", 1, 2, gpu, true));
-    assert!(!host_tier_wanted(cache, "glm5-next", 1, 1, gpu, true));
-    assert!(!host_tier_wanted(cache, "qwen4exp", 1, 1, gpu, false));
+    assert!(!host_tier_wanted(pc, cache, "qwen4exp", 1, 1, IGPU, true));
+    assert!(!host_tier_wanted(pc, cache, "qwen4exp", 1, 1, None, true));
+    assert!(!host_tier_wanted(pc, cache, "qwen4exp", 2, 1, gpu, true));
+    assert!(!host_tier_wanted(pc, cache, "qwen4exp", 1, 2, gpu, true));
+    assert!(!host_tier_wanted(pc, cache, "glm5-next", 1, 1, gpu, true));
+    assert!(!host_tier_wanted(pc, cache, "qwen4exp", 1, 1, gpu, false));
     assert!(!host_tier_wanted(
+        pc,
         ExpertMode::Device,
         "qwen4exp",
         1,
         1,
         gpu,
         true
+    ));
+}
+
+#[test]
+fn the_host_tier_takes_big_prompt_chunks_unless_told() {
+    use crate::engine::lm::{MAX_BATCH_TOKENS, PREFILL_CHUNK};
+    assert_eq!(
+        host_tier_chunk(None, PREFILL_CHUNK, MAX_BATCH_TOKENS),
+        Some((HOST_TIER_CHUNK, HOST_TIER_CHUNK))
+    );
+    // `--prefill-chunk` (even the default's value) and `--max-batch-tokens` are kept.
+    assert_eq!(
+        host_tier_chunk(Some(PREFILL_CHUNK), PREFILL_CHUNK, MAX_BATCH_TOKENS),
+        None
+    );
+    assert_eq!(host_tier_chunk(None, PREFILL_CHUNK, 4096), None);
+}
+
+#[test]
+fn the_host_tier_is_off_on_power9_and_arm_hosts() {
+    let gpu = Some(DeviceKind::Gpu);
+    let cache = ExpertMode::Cache;
+    // A V100 box with one stage and little free memory, and an ARM host with a discrete GPU:
+    // neither changes its load.
+    assert!(!host_tier_wanted(
+        "powerpc64",
+        cache,
+        "qwen4exp",
+        1,
+        1,
+        gpu,
+        true
+    ));
+    assert!(!host_tier_wanted(
+        "aarch64", cache, "qwen4exp", 1, 1, gpu, true
+    ));
+    assert!(!host_tier_wanted(
+        "aarch64", cache, "qwen4exp", 1, 1, IGPU, true
     ));
 }
