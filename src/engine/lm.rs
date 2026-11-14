@@ -621,8 +621,8 @@ pub(crate) fn default_mtp_window(arch: &str, mtp: bool, integrated: bool) -> usi
     }
 }
 
-/// Why `--spec-draft-vocab n` cannot apply, if it cannot: it is for the MTP heads of qwen4exp
-/// and qwen35 and for DFlash drafters (`dflash`), and below the vocabulary's size.
+/// Why `--spec-draft-vocab n` cannot apply, if it cannot: it is for the MTP heads of qwen4exp,
+/// qwen35 and glm5-next and for DFlash drafters (`dflash`), and below the vocabulary's size.
 pub(crate) fn draft_vocab_unused(
     n: usize,
     mtp: bool,
@@ -632,10 +632,12 @@ pub(crate) fn draft_vocab_unused(
 ) -> Option<String> {
     if n == 0 {
         None
-    } else if !dflash && (!mtp || !matches!(arch, "qwen4exp" | "qwen35" | "qwen35moe")) {
+    } else if !dflash
+        && (!mtp || !matches!(arch, "qwen4exp" | "qwen35" | "qwen35moe" | "glm5-next"))
+    {
         Some(format!(
-            "--spec-draft-vocab applies to the MTP heads of qwen4exp and qwen35 (--spec mtp) \
-             and to DFlash drafters (--spec dflash) only, not {arch}: ignored"
+            "--spec-draft-vocab applies to the MTP heads of qwen4exp, qwen35 and glm5-next \
+             (--spec mtp) and to DFlash drafters (--spec dflash) only, not {arch}: ignored"
         ))
     } else if n as i64 >= n_vocab {
         Some(format!(

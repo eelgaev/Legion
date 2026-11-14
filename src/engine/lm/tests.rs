@@ -493,8 +493,13 @@ fn explicit_kv_pool_respects_the_reserve_on_shared_memory() {
 }
 
 #[test]
-fn draft_vocab_applies_to_qwen4exp_and_qwen35_mtp_and_dflash_only() {
+fn draft_vocab_applies_to_qwen4exp_qwen35_and_glm_mtp_and_dflash_only() {
     assert_eq!(draft_vocab_unused(0, false, false, "gemma4", 1000), None);
+    assert_eq!(
+        draft_vocab_unused(65536, true, false, "glm5-next", 154880),
+        None
+    );
+    assert!(draft_vocab_unused(154880, true, false, "glm5-next", 154880).is_some());
     assert_eq!(
         draft_vocab_unused(65536, true, false, "qwen4exp", 248320),
         None

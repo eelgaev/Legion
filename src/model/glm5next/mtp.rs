@@ -12,7 +12,7 @@
 //! Every op is a Legion GLM op ([`ops`]); the routed experts go through the same expert tier
 //! as the target's (the head's layer is the last stage's).
 
-use crate::ggml::{Context, Graph, types};
+use crate::ggml::{Context, Graph, Tensor, types};
 use crate::model::core::mtp::MtpGraph;
 use crate::model::core::state::KvPool;
 use crate::model::core::{GRAPH_SIZE, GroupShape, Model, ModelError, Pass, StatePool, Tap};
@@ -132,7 +132,7 @@ impl Model {
             hp.rms_eps,
         );
         let h_out = hn.as_output();
-        let logits = self.glm_mm(ctx, "output.weight", hn)?.as_output();
+        let logits = self.glm_draft_logits(ctx, hn)?.as_output();
         let argmax = ops::argmax_wide(ctx, logits).as_output();
         let pmax = ops::pmax(ctx, logits).as_output();
         let mut graph = pass.graph.into_inner();
@@ -151,5 +151,38 @@ impl Model {
                 h_out: Some(h_out),
             },
         ))
+    }
+
+    /// The draft's logits of `hn` (`[n_embd, n_out]`): over the first `--spec-draft-vocab`
+    /// tokens only where it is set (a view of the head's first rows, so a pass reads that many
+    /// rows of the 154,880 instead of all of them), else over the whole vocabulary. The rows
+    /// are the target's, so a kept token's logit has the same bits; every draft is verified by
+    /// the target with its whole head, so only acceptance can change. A checkpoint's NVFP4 or
+    /// FP8 head drafts over the whole vocabulary.
+    fn glm_draft_logits<'a>(
+        &'a self,
+        ctx: &'a Context,
+        hn: Tensor<'a>,
+    ) -> Result<Tensor<'a>, ModelError> {
+        let w = self.w("output.weight")?;
+        let vocab = draft_rows(self.draft_vocab(), w.ne()[1]);
+        if vocab == w.ne()[1]
+            || w.ty() == types::NVFP4
+            || w.ty() == types::I8
+            || self.w("output.scale").is_ok()
+        {
+            return self.glm_mm(ctx, "output.weight", hn);
+        }
+        let head = ctx.view_2d(w, [w.ne()[0], vocab], w.nb()[1], 0);
+        self.glm_mm_w(ctx, "output.weight", head, None, hn, None)
+    }
+}
+
+/// The head rows a draft pass scores: the first `draft_vocab` of the head's `rows` (0 or at
+/// least `rows`: all of them).
+pub(super) fn draft_rows(draft_vocab: usize, rows: i64) -> i64 {
+    match draft_vocab as i64 {
+        v if v > 0 && v < rows => v,
+        _ => rows,
     }
 }

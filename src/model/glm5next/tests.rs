@@ -140,3 +140,12 @@ fn decode_mv_raises_the_limit_for_plain_decode_only() {
     // Verify steps stay verify steps either way.
     assert!(mv_pass([(true, 3), (false, 1)], true));
 }
+
+#[test]
+fn draft_rows_takes_the_first_draft_vocab_rows_below_the_head() {
+    use super::mtp::draft_rows;
+    assert_eq!(draft_rows(0, 154880), 154880);
+    assert_eq!(draft_rows(65536, 154880), 65536);
+    assert_eq!(draft_rows(154880, 154880), 154880);
+    assert_eq!(draft_rows(200000, 154880), 154880);
+}
