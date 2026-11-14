@@ -483,3 +483,12 @@ fn settles_only_deterministic_pair_balance() {
     );
     assert!(!ResidencyConfig::default().settles());
 }
+
+#[test]
+fn a_cold_cache_plans_more_swaps_a_round() {
+    let rule = crate::residency::policy::SwapRule::default();
+    assert_eq!(super::cold_rule(rule, false), rule);
+    let cold = super::cold_rule(rule, true);
+    assert_eq!(cold.budget, rule.budget * super::COLD_SWAPS);
+    assert_eq!((cold.margin, cold.ratio), (rule.margin, rule.ratio));
+}

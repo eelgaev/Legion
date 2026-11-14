@@ -269,6 +269,46 @@ pub fn host_tier_plan(
     }
 }
 
+/// Where the bounded host tier keeps a model's routing heat between runs: a small file (the
+/// ranking of every routed layer and expert, some 200 KB) in the user's state directory
+/// (`$XDG_STATE_HOME`, else `$HOME/.local/state`), named after the checkpoint's first file and
+/// the bytes of all its files, so another checkpoint (or the same one requantized) never reads
+/// it. Never beside the model. `None` (nothing saved or read) without a home directory.
+pub fn host_tier_heat_file(
+    state_home: Option<&str>,
+    home: Option<&str>,
+    model: &std::path::Path,
+    bytes: u64,
+) -> Option<std::path::PathBuf> {
+    let dir = match (state_home.filter(|s| s.starts_with('/')), home) {
+        (Some(s), _) => std::path::PathBuf::from(s),
+        (None, Some(h)) if h.starts_with('/') => std::path::Path::new(h).join(".local/state"),
+        _ => return None,
+    };
+    let name = model.file_name()?.to_string_lossy();
+    Some(
+        dir.join("legion")
+            .join("expert-heat")
+            .join(format!("{name}.{bytes}.heat")),
+    )
+}
+
+/// [`host_tier_heat_file`] for the loaded checkpoint.
+pub fn host_tier_heat_path(gguf: &GgufFile) -> Option<std::path::PathBuf> {
+    let mut shards = gguf.shard_paths();
+    let first = shards.next()?.to_path_buf();
+    let mut bytes = std::fs::metadata(&first).ok()?.len();
+    for p in shards {
+        bytes += std::fs::metadata(p).ok()?.len();
+    }
+    host_tier_heat_file(
+        std::env::var("XDG_STATE_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+        &first,
+        bytes,
+    )
+}
+
 /// Builds the bounded host tier `plan` for the loaded model, its memory in stage 0's arena.
 pub fn host_tier_build(
     cfg: &LmConfig,

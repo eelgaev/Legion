@@ -226,22 +226,37 @@ pub fn size(
 
 /// A debug cap for emulating a smaller machine (`LEGION_DEBUG_HOST_MEM_GIB`, see
 /// `docs/debug-env.md`): the tier is sized as on a machine with that much memory, all of it
-/// available. Not a tuning knob: real machines are sized from `/proc/meminfo`.
+/// available, or as `total:available` says (a 32 GB machine has some 27 GiB available: "32:27"
+/// gives it its own margin, "27" the smaller one of a 27 GiB machine). Not a tuning knob: real
+/// machines are sized from `/proc/meminfo`.
 pub fn mem_info() -> MemInfo {
     let real = MemInfo::read();
     match std::env::var("LEGION_DEBUG_HOST_MEM_GIB")
         .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|g| *g > 0.0)
+        .and_then(|v| debug_mem(&v))
     {
-        Some(g) => {
-            let b = (g * (1u64 << 30) as f64) as u64;
-            MemInfo {
-                total: b,
-                available: b.min(real.available.max(1)),
-            }
-        }
+        Some((total, available)) => MemInfo {
+            total,
+            available: available.min(real.available.max(1)),
+        },
         None => real,
+    }
+}
+
+/// [`mem_info`]'s debug value as `(total, available)` bytes: `"<GiB>"` (both) or
+/// `"<total GiB>:<available GiB>"`; `None` when it is neither (or not positive, or more is
+/// available than there is).
+pub(crate) fn debug_mem(v: &str) -> Option<(u64, u64)> {
+    let gib = |s: &str| {
+        s.trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|g| *g > 0.0 && g.is_finite())
+            .map(|g| (g * (1u64 << 30) as f64) as u64)
+    };
+    match v.split_once(':') {
+        Some((t, a)) => gib(t).zip(gib(a)).filter(|(t, a)| a <= t),
+        None => gib(v).map(|b| (b, b)),
     }
 }
 
@@ -768,6 +783,24 @@ impl HostTier {
         }
     }
 
+    /// At load: reads `experts` of layer `il` (best first, none of them in a VRAM slot) from
+    /// the checkpoint into the layer's empty RAM slots, as many as there are. Returns how many
+    /// were read.
+    pub fn prefill(&self, il: usize, experts: &[u32]) -> Result<usize, String> {
+        let inner = &self.inner;
+        let mut st = inner.state.lock().unwrap();
+        let st = &mut *st;
+        inner.take_ahead(st, None)?;
+        let want: Vec<usize> = experts.iter().map(|&e| e as usize).collect();
+        let loads = plan_prefill(&mut st.caches[il], &want);
+        let jobs: Vec<Job> = loads
+            .iter()
+            .flat_map(|&(e, s)| inner.reads(il, e, To::Slot(s)))
+            .collect();
+        inner.pool.run(jobs)?;
+        Ok(loads.len())
+    }
+
     /// The oldest batch's copies are done.
     pub fn swaps_landed(&self) {
         self.inner.swaps_landed();
@@ -889,6 +922,22 @@ pub(crate) fn plan_step(cache: &mut SlotCache, n_expert: usize, need: &[usize]) 
         t.loads.push((e, None));
     }
     t
+}
+
+/// The `(expert, slot)` reads that put `experts` (in order) into `cache`'s empty slots, until
+/// none is left; the ones cached already are passed over.
+pub(crate) fn plan_prefill(cache: &mut SlotCache, experts: &[usize]) -> Vec<(usize, usize)> {
+    let mut loads = Vec::new();
+    for &e in experts {
+        if cache.slot(e).is_some() {
+            continue;
+        }
+        match cache.take_empty(e) {
+            Some(s) => loads.push((e, s)),
+            None => break,
+        }
+    }
+    loads
 }
 
 /// Where a read puts an expert: a RAM slot, or a staging place.

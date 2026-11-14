@@ -280,6 +280,11 @@ pub struct ResidencyConfig {
     /// The profile sizes each layer's slots only: the first contents are each layer's lowest
     /// experts, as without a profile, and no heat is seeded (`--expert-profile-split-only`).
     pub profile_split_only: bool,
+    /// The bounded host tier's saved routing heat (#37, set by the engine, no flag): read at
+    /// load if the file is there and fits the model (the VRAM slots and the RAM slots then
+    /// start with each layer's most routed experts; the layers' slot counts stay as without
+    /// it), written on exit. Unused with a `profile`.
+    pub tier_heat: Option<std::path::PathBuf>,
     /// Per-layer slot counts from a previous run's measured misses ([`miss_split`]): read at
     /// load if the file exists, written on exit (`--expert-split-misses`).
     pub split_misses: Option<std::path::PathBuf>,
@@ -411,6 +416,7 @@ impl Default for ResidencyConfig {
             profile: None,
             profile_seed: PROFILE_SEED,
             profile_split_only: false,
+            tier_heat: None,
             split_misses: None,
             swaps: policy::SwapRule::default(),
             device_swaps: Vec::new(),

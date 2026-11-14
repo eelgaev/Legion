@@ -1043,6 +1043,7 @@ impl ModelArgs {
                 .expert_profile_seed
                 .unwrap_or(legion::residency::PROFILE_SEED),
             profile_split_only: self.expert_profile_split_only,
+            tier_heat: None,
             split_misses: self.expert_split_misses.clone(),
             swaps: SwapRule {
                 budget: self.expert_swaps,

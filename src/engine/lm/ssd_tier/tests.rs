@@ -116,3 +116,29 @@ fn the_host_tier_is_off_on_power9_and_arm_hosts() {
         "aarch64", cache, "qwen4exp", 1, 1, IGPU, true
     ));
 }
+
+#[test]
+fn the_heat_file_is_in_the_state_directory_and_names_the_checkpoint() {
+    let model = std::path::Path::new("/models/q/Model-00001-of-00004.gguf");
+    let at = |state, home| host_tier_heat_file(state, home, model, 123);
+    let name = "legion/expert-heat/Model-00001-of-00004.gguf.123.heat";
+    assert_eq!(
+        at(Some("/x/state"), Some("/home/u")),
+        Some(std::path::Path::new("/x/state").join(name))
+    );
+    assert_eq!(
+        at(None, Some("/home/u")),
+        Some(std::path::Path::new("/home/u/.local/state").join(name))
+    );
+    // A relative XDG_STATE_HOME is not one.
+    assert_eq!(
+        at(Some("state"), Some("/home/u")),
+        Some(std::path::Path::new("/home/u/.local/state").join(name))
+    );
+    assert_eq!(at(None, None), None);
+    // Another checkpoint's bytes: another file.
+    assert_ne!(
+        host_tier_heat_file(None, Some("/home/u"), model, 124),
+        at(None, Some("/home/u"))
+    );
+}

@@ -329,6 +329,36 @@ fn a_staged_pass_without_places_reads_nothing() {
 }
 
 #[test]
+fn the_debug_memory_is_one_value_or_total_and_available() {
+    assert_eq!(debug_mem("58"), Some((58 * GIB, 58 * GIB)));
+    assert_eq!(debug_mem("32:27"), Some((32 * GIB, 27 * GIB)));
+    assert_eq!(
+        debug_mem(" 32 : 27.5 "),
+        Some((32 * GIB, 27 * GIB + GIB / 2))
+    );
+    for bad in ["", "0", "-4", "x", "32:", ":27", "27:32", "32:0", "1:2:3"] {
+        assert_eq!(debug_mem(bad), None, "{bad:?}");
+    }
+    // A 32 GiB machine with 27 available keeps its own margin: fewer bytes for the slots
+    // than a 27 GiB machine with all of it available.
+    let room = |(total, available): (u64, u64)| available - margin(total);
+    assert!(room(debug_mem("32:27").unwrap()) < room(debug_mem("27").unwrap()));
+}
+
+#[test]
+fn prefill_takes_the_empty_slots_in_order() {
+    let mut cache = SlotCache::new(8, 3);
+    cache.plan(&[5]);
+    // 5 is cached already; 6, 1 and 7 are wanted, two slots are empty.
+    assert_eq!(
+        plan_prefill(&mut cache, &[6, 5, 1, 7]),
+        vec![(6, 1), (1, 2)]
+    );
+    assert_eq!(cache.filled(), 3);
+    assert_eq!(plan_prefill(&mut cache, &[7]), vec![]);
+}
+
+#[test]
 fn sources_are_named_like_the_models_tensors() {
     assert_eq!(
         skipped_tensors(1),

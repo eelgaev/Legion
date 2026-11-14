@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::policy::{
     LayerSlots, LendLayer, MAX_FIT_TRIES, SwapRule, allocate_slots_in, auto_keep_carved,
-    layers_left_for, lowest_experts, plan_swaps, shrunk_budget,
+    hottest_experts, layers_left_for, lowest_experts, plan_swaps, shrunk_budget,
 };
 use super::profile::Profile;
 use super::{Fetch, ResidencyConfig};
@@ -775,6 +775,13 @@ pub struct ExpertResidency {
     /// Most heat an expert gains per logged pass (0: no limit; `--expert-heat-pass-cap`).
     heat_pass_cap: f32,
     profile: Option<PathBuf>,
+    /// The bounded host tier's routing heat file ([`ResidencyConfig::tier_heat`]): written on
+    /// exit.
+    tier_heat: Option<PathBuf>,
+    /// The bounded host tier: the last round of swaps took its whole budget (or nothing was
+    /// saved to start from), so the cache is far from what is routed to and the next round may
+    /// plan [`COLD_SWAPS`] times as many.
+    cold: bool,
     /// Where the per-layer hits and misses go on exit (`--expert-split-misses`).
     split_misses: Option<PathBuf>,
     swaps: u64,
@@ -1329,6 +1336,37 @@ impl ExpertResidency {
             }
             _ => None,
         };
+        // The bounded host tier's saved heat (#37): a file that is missing, unreadable or of
+        // another model is passed over, and the cache starts as without one.
+        let tier_heat = host
+            .as_ref()
+            .and(cfg.tier_heat.as_ref())
+            .filter(|_| cfg.profile.is_none());
+        let tier_prof = tier_heat
+            .filter(|p| p.exists())
+            .and_then(|p| match Profile::read(p) {
+                Ok(prof) if prof.n_expert == n_expert && prof.n_layers <= n_layers => Some(prof),
+                Ok(prof) => {
+                    tracing::info!(
+                        layers = prof.n_layers,
+                        experts = prof.n_expert,
+                        "host expert tier: the saved routing heat is another model's, not used"
+                    );
+                    None
+                }
+                Err(e) => {
+                    tracing::info!(error = %e, "host expert tier: saved routing heat not read");
+                    None
+                }
+            });
+        // Per layer its experts, the most routed first.
+        let tier_order: Option<Vec<Vec<u32>>> = tier_prof.as_ref().map(|p| {
+            let mut order = vec![Vec::new(); n_layers];
+            for &(l, e) in &p.ranked {
+                order[l].push(e);
+            }
+            order
+        });
         let mut ranked: Vec<(usize, u32)> =
             profile.as_ref().map_or_else(Vec::new, |p| p.ranked.clone());
         // Expert parallelism: a layer's ranking goes to every entry serving it, each taking its
@@ -1398,6 +1436,9 @@ impl ExpertResidency {
             let mut alloc = allocate_slots_in(&ranked, &slot_bytes, &owned_all, n_expert, b);
             if cfg.profile_split_only && profile.is_some() {
                 alloc = lowest_experts(&alloc, &owned_all, n_expert);
+            }
+            if let Some(order) = &tier_order {
+                alloc = hottest_experts(&alloc, order);
             }
             if let Some(m) = &measured {
                 alloc =
@@ -1650,6 +1691,9 @@ impl ExpertResidency {
                 // Seed the heat so the profile's residents are not swapped out at once.
                 slots.add_heat(&prof.heat(cfg.profile_seed)[real(il)]);
             }
+            if let Some(prof) = tier_prof.as_ref().filter(|p| il < p.n_layers) {
+                slots.add_heat(&prof.heat(cfg.profile_seed)[il]);
+            }
             layers[il] = Some(Layer {
                 dev: d,
                 row: rows[il],
@@ -1792,6 +1836,8 @@ impl ExpertResidency {
             decay: cfg.decay,
             heat_pass_cap: cfg.heat_pass_cap,
             profile: cfg.profile.clone(),
+            tier_heat: tier_heat.cloned(),
+            cold: tier_prof.is_none(),
             split_misses: cfg.split_misses.clone(),
             swaps: 0,
             logged: 0,
@@ -1841,6 +1887,33 @@ impl ExpertResidency {
             me.copy_from_host(il, &fills)?;
         }
         me.sync_copies()?;
+        // The bounded host tier's saved heat: the RAM slots take each layer's most routed
+        // experts the VRAM slots did not, from the checkpoint, and keep by that heat.
+        if let (Some(h), Some(order)) = (me.host.clone(), &tier_order) {
+            let t0 = std::time::Instant::now();
+            let mut read = 0;
+            for il in 0..n_layers {
+                let Some(l) = &me.layers[il] else { continue };
+                let rest: Vec<u32> = order[il]
+                    .iter()
+                    .copied()
+                    .filter(|&e| !l.slots.serves(e))
+                    .collect();
+                read += h.prefill(il, &rest)?;
+            }
+            h.set_heat(
+                me.layers
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(il, l)| l.as_ref().map(|l| (il, l.slots.heat()))),
+            );
+            tracing::info!(
+                ram_experts = read,
+                seconds = t0.elapsed().as_secs_f64(),
+                "host expert tier: the VRAM and RAM slots start with the experts the last run \
+                 routed to most"
+            );
+        }
         me.upload_tables(None)?;
         Ok(me)
     }
@@ -2651,7 +2724,10 @@ impl ExpertResidency {
                         .map(|l| &mut l.slots)
                 })
                 .collect();
-            plan_swaps(&mut view, self.rule.on_device(&self.device_swaps, d))
+            let rule = self.rule.on_device(&self.device_swaps, d);
+            let swaps = plan_swaps(&mut view, cold_rule(rule, self.host.is_some() && self.cold));
+            self.cold = swaps.len() >= rule.budget;
+            swaps
         };
         if swaps.is_empty() {
             return Ok(());
@@ -3600,6 +3676,62 @@ impl Drop for ExpertResidency {
                 tracing::warn!(path = %path.display(), error = %e, "could not save the expert profile");
             }
         }
+        // The bounded host tier: the heat the cache ends with (what it keeps its slots by) is
+        // what the next load starts from; pairs only an older run routed to rank after it.
+        if let Some(path) = &self.tier_heat
+            && routed
+        {
+            let heat: Vec<Vec<f32>> = self
+                .layers
+                .iter()
+                .map(|l| {
+                    l.as_ref()
+                        .map_or_else(|| vec![0.0; self.n_expert], |l| l.slots.heat().to_vec())
+                })
+                .collect();
+            let mut learned = Profile::from_heat(&heat);
+            learned.n_expert = self.n_expert;
+            if let Ok(old) = Profile::read(path)
+                && old.n_expert == learned.n_expert
+                && old.n_layers == learned.n_layers
+            {
+                let mut seen: std::collections::HashSet<_> =
+                    learned.ranked.iter().copied().collect();
+                learned
+                    .ranked
+                    .extend(old.ranked.into_iter().filter(|p| seen.insert(*p)));
+            }
+            let saved = path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| learned.write(path));
+            match saved {
+                Ok(()) => tracing::info!(
+                    pairs = learned.ranked.len(),
+                    "host expert tier: routing heat saved for the next load"
+                ),
+                Err(e) => {
+                    tracing::warn!(error = %e, "host expert tier: could not save the routing heat")
+                }
+            }
+        }
+    }
+}
+
+/// With the bounded host tier, a round of swaps plans this many times its budget while the
+/// cache is cold (`ExpertResidency::cold`): right after a load without saved heat, or after
+/// the chats changed, the budget is what holds the VRAM hits back, not the routing.
+pub(crate) const COLD_SWAPS: usize = 4;
+
+/// `rule` for a round of swaps, its budget [`COLD_SWAPS`] times as big when `cold`.
+pub(crate) fn cold_rule(rule: SwapRule, cold: bool) -> SwapRule {
+    SwapRule {
+        budget: if cold {
+            rule.budget * COLD_SWAPS
+        } else {
+            rule.budget
+        },
+        ..rule
     }
 }
 

@@ -780,3 +780,16 @@ fn repeated_failures_without_a_drift_shrink_in_a_few_tries() {
         bytes / MIB
     );
 }
+
+#[test]
+fn saved_heat_picks_the_contents_and_keeps_the_layer_sizes() {
+    let alloc = vec![vec![0, 1, 2], vec![0, 1], vec![], vec![0, 1, 2, 3]];
+    // Layer 1's ranking is longer than its slots, layer 3's shorter, layer 0 has none.
+    let order = vec![vec![], vec![7, 0, 5], vec![4], vec![9, 1]];
+    assert_eq!(
+        hottest_experts(&alloc, &order),
+        vec![vec![0, 1, 2], vec![7, 0], vec![], vec![9, 1, 0, 2]]
+    );
+    // A ranking of fewer layers leaves the others as they were.
+    assert_eq!(hottest_experts(&alloc, &order[..1]), alloc);
+}

@@ -3816,6 +3816,10 @@ impl LmEngine {
             if cfg.long_prompts.min_tokens == LongPrompts::default().min_tokens {
                 cfg.long_prompts.min_tokens = ssd_tier::HOST_TIER_LONG;
             }
+            // The routing heat of the last run fills the VRAM and RAM slots at load.
+            if cfg.residency.profile.is_none() {
+                cfg.residency.tier_heat = ssd_tier::host_tier_heat_path(&gguf);
+            }
         }
         // The other machine's layers and head.
         let hp_file = crate::model::core::Hparams::from_gguf(&gguf)?;

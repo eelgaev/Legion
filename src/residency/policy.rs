@@ -658,6 +658,26 @@ pub fn lowest_experts(
         .collect()
 }
 
+/// Each layer's slot count of `alloc` with the layer's most routed experts first (`order`,
+/// per layer, hottest first), then the experts `alloc` gave it that are not among them: the
+/// bounded host tier's saved heat picks the first contents, the layers' sizes stay.
+pub fn hottest_experts(alloc: &[Vec<u32>], order: &[Vec<u32>]) -> Vec<Vec<u32>> {
+    alloc
+        .iter()
+        .enumerate()
+        .map(|(l, v)| {
+            let hot = order.get(l).map_or(&[][..], Vec::as_slice);
+            let mut taken = std::collections::HashSet::new();
+            hot.iter()
+                .chain(v)
+                .copied()
+                .filter(|e| taken.insert(*e))
+                .take(v.len())
+                .collect()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests;
 
