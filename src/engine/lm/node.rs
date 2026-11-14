@@ -441,7 +441,8 @@ impl Follower {
             | Request::EnableRingSaves { .. }
             | Request::TpMtp { .. }
             | Request::TpMtpChain { .. }
-            | Request::TpMtpRows { .. } => {
+            | Request::TpMtpRows { .. }
+            | Request::TpPrefetch { .. } => {
                 return Err(
                     "a request of tensor parallelism over machines (--tp-rank): this rank \
                         runs a model split by layers (--node-rank)"

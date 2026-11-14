@@ -29,6 +29,9 @@ const STEPS_AHEAD: usize = 2;
 /// Answers left unread before a mirrored state change reads the oldest ones.
 const MIRRORS_AHEAD: usize = 16;
 
+/// The prompt tokens before a read-ahead chunk sent with it ([`Executor::tp_prefetch_rows`]).
+const PREFETCH_BEFORE: usize = 32;
+
 /// A control connection to another rank: over the network, or to a thread of this process.
 enum RankLink {
     Net(Link),
@@ -465,6 +468,27 @@ impl Executor {
     pub(super) fn tp_mirror_states(&mut self, req: impl FnOnce() -> Request) {
         if let Some(lead) = self.tp.as_mut() {
             lead.mirror(&req());
+        }
+    }
+
+    /// The other ranks' read-ahead of a prompt chunk's table rows (`tokens`, after `before`,
+    /// the prompt's last tokens before them), as this rank reads its own (`next`: the next
+    /// chunk while this one's step computes; else the first one on its arrival): without it
+    /// every other rank read each prompt step's rows from the SSD inside that step, which rank
+    /// 0 then waited for at the sums (#1176). Nothing without a table read through a store.
+    pub fn tp_prefetch_rows(&mut self, before: &[u32], tokens: &[u32], next: bool) {
+        if tokens.is_empty() || self.model.ngram.is_none() {
+            return;
+        }
+        if let Some(lead) = self.tp.as_mut() {
+            // A row's n-gram reaches back a few tokens: 32 is more than any table's, and too
+            // few would only read other rows (it is a hint).
+            let before = &before[before.len().saturating_sub(PREFETCH_BEFORE)..];
+            lead.mirror(&Request::TpPrefetch {
+                before: before.to_vec(),
+                tokens: tokens.to_vec(),
+                next,
+            });
         }
     }
 

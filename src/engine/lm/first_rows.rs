@@ -21,7 +21,7 @@ pub(super) fn ahead_len(prompt: usize, chunk: usize, budget: usize) -> usize {
 impl Worker {
     /// Starts reading the table rows of `prompt`'s first chunk (a hint; nothing without a
     /// table read through a store). Called by an idle engine on a request's arrival.
-    pub(super) fn prefetch_first(&self, prompt: &[u32]) {
+    pub(super) fn prefetch_first(&mut self, prompt: &[u32]) {
         let n = ahead_len(prompt.len(), self.prefill_chunk, self.max_batch_tokens);
         if n == 0 {
             return;
@@ -29,6 +29,8 @@ impl Worker {
         let first = &prompt[..n];
         self.exec.model().prefetch_ngram(&[], first);
         self.exec.model().prefetch_engram(&[], first);
+        // The other ranks of tensor parallelism (idle too) read theirs at once (#1176).
+        self.exec.tp_prefetch_rows(&[], first, false);
     }
 }
 
