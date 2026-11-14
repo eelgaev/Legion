@@ -799,6 +799,15 @@ impl<'a> TieredLayer<'a> {
         )
     }
 
+    /// The address of [`Self::table_view`]'s ids in the device's memory (the peer prefetch reads
+    /// them from the other GPU of the pair).
+    pub fn table_addr(&self) -> usize {
+        let t = self.dev.table();
+        // SAFETY: a live tensor; reads a field.
+        let data = unsafe { (*t.raw()).data as usize };
+        data + self.layer.row * self.n_expert * t.nb()[0]
+    }
+
     /// Which of the layer's experts their owners cache, I32 `[n_expert]` (1 cached, 0 not),
     /// the same on every device ([`ResidencyConfig::ep_cached`]); `None` without it.
     /// The device's `--glm-prefetch` staging ring and its layout

@@ -191,6 +191,53 @@ int legion_expert_mv_launch(int type, const legion_expert_mv * p, int smem, void
 // Returns a cudaError_t.
 int legion_expert_stage_launch(const legion_expert_stage * s, void * stream);
 
+// stage_prepare: the slot table of a layer whose idle peer copied a guess of its host experts
+// into prefetch slots one layer early (the peer prefetch). The guess is the tiered ids `guess`
+// (n_guess of them) with the slot table `guess_slot` stage_copy wrote for them (slot j of the
+// prefetch slots, or -1). A host expert of the step that the guess holds reads prefetch slot
+// `pf_base + j`; the others are ranked as stage_copy ranks them (t_every, t_take, cap) for the
+// peer's copy inside the layer, which reads `rest`: the step's ids with the prefetched experts'
+// ids replaced by -1. With `x_keep`, the layer's input (n_tok columns of k floats, x_nb2 bytes
+// apart) is copied there for the peer's guess of the next layer.
+struct legion_expert_prepare {
+    const int32_t * ids;   // [n_tok][n_used], ids_nb1 bytes per token
+    int64_t ids_nb1;
+    int32_t n_used, n_tok;
+    int32_t vram_below, n_w;
+    int32_t * table;       // out: an int32 slot per pair (-1: none)
+    int32_t * rest;        // out: [n_tok][n_used] packed
+    const int32_t * guess; // n_guess ids (may be null when n_guess is 0)
+    const int32_t * guess_slot;
+    int32_t n_guess;
+    int32_t pf_base;
+    int32_t cap, t_every, t_take;
+    int32_t k;
+    const char * x;
+    int64_t x_nb2;
+    float * x_keep;        // out: [n_tok][k] packed, or null
+    uint64_t * count;      // in/out: host experts, prefetched ones, prefetch slots filled, launches
+};
+
+// Returns a cudaError_t.
+int legion_expert_prepare_launch(const legion_expert_prepare * s, void * stream);
+
+// The peer's guess of a layer's routing: the layer's F32 or F16 router `w` over the input of the layer
+// before it (`x`, stage_prepare's copy), the n_used largest logits per token looked up in the
+// layer's table of tiered ids. Two launches: the logits, then the ids. A guess: sums in another
+// order than the router's own op.
+struct legion_expert_guess {
+    const void * w;         // [n_expert][k], contiguous, F32 or F16 (w_f16)
+    const float * x;        // [n_tok][k] packed
+    int32_t k, n_expert, n_tok, n_used;
+    int32_t w_f16;
+    float * logits;         // scratch: [n_tok][n_expert]
+    const int32_t * table;  // n_expert tiered ids
+    int32_t * guess;        // out: [n_used][n_tok] packed (rank-major)
+};
+
+// Returns a cudaError_t.
+int legion_expert_guess_launch(const legion_expert_guess * s, void * stream);
+
 }  // extern "C"
 
 namespace {

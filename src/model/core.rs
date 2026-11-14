@@ -4226,6 +4226,32 @@ impl Model {
             && crate::model::qwen4::hc_fuse()
             && crate::model::qwen4::params(hp).is_some();
         let experts = if let Some(t) = self.experts.as_ref().and_then(|r| r.layer(il)) {
+            // The peer prefetch (#519) guesses this layer's experts with its router while the
+            // layer before it computes: where the router and the table of tiered ids are.
+            #[cfg(feature = "cuda")]
+            if expert_mv::peer::prefetch::enabled()
+                && let Some(w) = self.plain_weight(il, "ffn_gate_inp.weight")
+                && (w.ty() == types::F32 || w.ty() == types::F16)
+                && w.ne()[2] == 1
+                && w.ne()[3] == 1
+                && w.is_contiguous()
+                && !w.is_host()
+                && !w.is_meta()
+                && w.ne()[1] as usize == t.n_expert()
+            {
+                // SAFETY: live tensors; reads a field.
+                let addr = |t: Tensor<'_>| unsafe { (*t.raw()).data as usize };
+                expert_mv::peer::prefetch::register(
+                    addr(t.weight(1)),
+                    expert_mv::peer::prefetch::Router {
+                        w: addr(w),
+                        f16: w.ty() == types::F16,
+                        n_embd: w.ne()[0] as usize,
+                        n_expert: t.n_expert(),
+                        table: t.table_addr(),
+                    },
+                );
+            }
             // Tiered: cached experts from VRAM slots, the others from host memory in place.
             // With `--moe-pad-remap-tiered`, a verify step whose experts all run on Legion's
             // expert matvec looks up its padding rows as their sequences' first rows

@@ -78,6 +78,139 @@ __global__ void __launch_bounds__(STAGE_THREADS) stage_copy(const legion_expert_
     }
 }
 
+// One CTA (see legion_expert_prepare): which of the step's host experts the peer prefetched, the
+// slot table for the layer's launches, the ids left for the peer's copy inside the layer and the
+// step's ids for the next step's guess. The ranks and slots of the experts left are stage_copy's
+// over `rest` (same order, same rule), so the table says what the peer's stage_copy fills.
+__global__ void __launch_bounds__(STAGE_THREADS) stage_prepare(const legion_expert_prepare s) {
+    __shared__ int slot[STAGE_PAIRS];
+    const int n_pairs = s.n_used * s.n_tok;
+    auto id = [&](int q) {
+        return *(const int32_t *) ((const char *) s.ids + (q / s.n_used) * s.ids_nb1 + (q % s.n_used) * 4);
+    };
+    for (int q = threadIdx.x; q < n_pairs; q += blockDim.x) {
+        const int e     = id(q);
+        const bool host = e >= s.vram_below && e < s.n_w;
+        int pf          = -1;
+        for (int r = 0; r < s.n_guess && host && pf < 0; r++) {
+            if (s.guess[r] == e && s.guess_slot[r] >= 0) {
+                pf = s.guess_slot[r];
+            }
+        }
+        bool first = host;
+        for (int r = 0; r < q && first; r++) {
+            first = id(r) != e;
+        }
+        // -1: no slot; -2: an expert to rank; else its prefetch slot.
+        slot[q]   = !first ? -1 : pf < 0 ? -2 : s.pf_base + pf;
+        s.rest[q] = pf < 0 ? e : -1;
+    }
+    if (s.x_keep != nullptr) {
+        for (int i = threadIdx.x; i < s.n_tok * s.k; i += blockDim.x) {
+            s.x_keep[i] = *(const float *) (s.x + (i / s.k) * s.x_nb2 + (int64_t) (i % s.k) * 4);
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int rank = 0, host = 0, hit = 0, filled = 0;
+        for (int q = 0; q < n_pairs; q++) {
+            if (slot[q] == -1) {
+                continue;
+            }
+            host++;
+            if (slot[q] >= 0) {
+                hit++;
+                continue;
+            }
+            int sl      = -1;
+            const int r = rank++;
+            if (r % s.t_every < s.t_take) {
+                sl = r / s.t_every * s.t_take + r % s.t_every;
+            }
+            slot[q] = sl < s.cap ? sl : -1;
+        }
+        for (int r = 0; r < s.n_guess; r++) {
+            filled += s.guess_slot[r] >= 0;
+        }
+        s.count[0] += host;
+        s.count[1] += hit;
+        s.count[2] += filled;
+        s.count[3] += 1;
+    }
+    __syncthreads();
+    for (int q = threadIdx.x; q < n_pairs; q += blockDim.x) {
+        s.table[q] = slot[q];
+    }
+}
+
+constexpr int GUESS_ROWS    = 8;     // router rows per CTA, a warp each
+constexpr int GUESS_X       = 8192;  // floats of x a CTA holds at once
+constexpr int GUESS_TOKENS  = 8;     // tokens per pass at most
+constexpr int GUESS_EXPERTS = 1024;
+
+// The guess's logits (see legion_expert_guess): a warp per router row, x in shared memory a few
+// tokens at a time, so the router's rows cross the link once per pass.
+__global__ void __launch_bounds__(GUESS_ROWS * 32) guess_logits(const legion_expert_guess s) {
+    __shared__ float xs[GUESS_X];
+    const int lane  = threadIdx.x & 31;
+    const int row   = blockIdx.x * GUESS_ROWS + (threadIdx.x >> 5);
+    const int chunk = min(GUESS_X / s.k, GUESS_TOKENS);
+    for (int t0 = 0; t0 < s.n_tok; t0 += chunk) {
+        const int nt = min(chunk, s.n_tok - t0);
+        __syncthreads();
+        for (int i = threadIdx.x; i < nt * s.k; i += blockDim.x) {
+            xs[i] = __ldg(s.x + (int64_t) t0 * s.k + i);
+        }
+        __syncthreads();
+        if (row >= s.n_expert) {
+            continue;
+        }
+        float acc[GUESS_TOKENS] = {};
+        const int64_t wr        = (int64_t) row * s.k;
+#pragma unroll 8
+        for (int i = lane; i < s.k; i += 32) {
+            const float wv = s.w_f16 ? __half2float(__ldg((const __half *) s.w + wr + i)) :
+                                       __ldg((const float *) s.w + wr + i);
+            for (int t = 0; t < nt; t++) {
+                acc[t] += wv * xs[t * s.k + i];
+            }
+        }
+        for (int t = 0; t < nt; t++) {
+            float v = acc[t];
+            for (int o = 16; o > 0; o >>= 1) {
+                v += __shfl_xor_sync(0xffffffff, v, o);
+            }
+            if (lane == 0) {
+                s.logits[(int64_t) (t0 + t) * s.n_expert + row] = v;
+            }
+        }
+    }
+}
+
+// The guess's ids: per token the n_used largest logits (ties: the lower expert), as tiered ids,
+// rank-major (a copy of the first few takes every token's likeliest experts).
+__global__ void __launch_bounds__(STAGE_THREADS) guess_topk(const legion_expert_guess s) {
+    __shared__ float l[GUESS_EXPERTS];
+    for (int t = 0; t < s.n_tok; t++) {
+        __syncthreads();
+        for (int e = threadIdx.x; e < s.n_expert; e += blockDim.x) {
+            l[e] = s.logits[(int64_t) t * s.n_expert + e];
+        }
+        __syncthreads();
+        for (int e = threadIdx.x; e < s.n_expert; e += blockDim.x) {
+            const float v = l[e];
+            int rank      = 0;
+            for (int j = 0; j < s.n_expert && rank < s.n_used; j++) {
+                rank += l[j] > v || (l[j] == v && j < e);
+            }
+            if (rank < s.n_used) {
+                // Rank-major: every token's first choice, then their second ones...
+                s.guess[rank * s.n_tok + t] = s.table[e];
+            }
+        }
+    }
+}
+
 // quantize_x (`steps & 1`), then the type's kernels (`steps & 2`, launch_type in the type's .cu).
 template <ggml_type type>
 int launch_steps(const legion_expert_mv & p, int smem, cudaStream_t stream) {
@@ -122,5 +255,25 @@ extern "C" int legion_expert_stage_launch(const legion_expert_stage * s, void * 
         return cudaErrorInvalidValue;
     }
     stage_copy<<<s->ctas, STAGE_THREADS, 0, (cudaStream_t) stream>>>(*s);
+    return cudaGetLastError();
+}
+
+extern "C" int legion_expert_prepare_launch(const legion_expert_prepare * s, void * stream) {
+    if (s->n_used * s->n_tok > STAGE_PAIRS || s->n_guess < 0 || s->n_guess > STAGE_PAIRS || s->t_every < 1 ||
+        s->t_take < 1 || s->t_take > s->t_every) {
+        return cudaErrorInvalidValue;
+    }
+    stage_prepare<<<1, STAGE_THREADS, 0, (cudaStream_t) stream>>>(*s);
+    return cudaGetLastError();
+}
+
+extern "C" int legion_expert_guess_launch(const legion_expert_guess * s, void * stream) {
+    if (s->k < 1 || s->k > GUESS_X || s->n_expert < 1 || s->n_expert > GUESS_EXPERTS || s->n_tok < 1 ||
+        s->n_used < 1 || s->n_used > s->n_expert || s->n_used * s->n_tok > STAGE_PAIRS) {
+        return cudaErrorInvalidValue;
+    }
+    const int ctas = (s->n_expert + GUESS_ROWS - 1) / GUESS_ROWS;
+    guess_logits<<<ctas, GUESS_ROWS * 32, 0, (cudaStream_t) stream>>>(*s);
+    guess_topk<<<1, STAGE_THREADS, 0, (cudaStream_t) stream>>>(*s);
     return cudaGetLastError();
 }

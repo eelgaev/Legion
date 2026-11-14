@@ -129,7 +129,7 @@ pub fn set_stage_pairs(n: usize) {
     STAGE_PAIRS_SET.store(n, Ordering::Relaxed);
 }
 
-fn stage_pairs() -> usize {
+pub(super) fn stage_pairs() -> usize {
     match STAGE_PAIRS_SET.load(Ordering::Relaxed) {
         0 => STAGE_PAIRS,
         n => n,

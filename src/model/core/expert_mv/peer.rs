@@ -530,5 +530,7 @@ pub(super) unsafe fn wait(main: *mut c_void, l: Link, which: usize) -> Result<()
     )
 }
 
+pub mod prefetch;
+
 #[cfg(test)]
 mod tests;

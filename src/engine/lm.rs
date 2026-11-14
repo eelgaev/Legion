@@ -3250,6 +3250,10 @@ fn build_expert_cache(
             // split pair of ops.
             peer::set_auto(false);
         }
+        // `--expert-peer-prefetch` (#519): the peer can also fetch a guess of the next layer's
+        // misses where the peer fetch is on by the automatic choice for a plain layer split
+        // (GLM's pairs have their own prefetch).
+        peer::prefetch::set_auto(on && !paired && peer::forced().is_none() && peer::enabled());
         if cfg.stage_peer && ep_cuda.is_none() {
             stage_peers(&r, &nodes)?;
         }

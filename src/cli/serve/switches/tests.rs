@@ -135,6 +135,7 @@ fn flags_set_their_switches() {
         "--no-expert-mv-half-tiles",
         "--expert-miss-overlap",
         "--expert-peer-fetch",
+        "--expert-peer-prefetch",
         "--expert-peer-share",
         "3/4",
         "--expert-peer-ctas",
@@ -328,6 +329,7 @@ fn flags_set_their_switches() {
             expert_mv_half_tiles: Some(false),
             expert_miss_overlap: Some(true),
             expert_peer_fetch: Some(true),
+            expert_peer_prefetch: Some(true),
             expert_peer_share: Some(Share { take: 3, every: 4 }),
             expert_peer_ctas: Some(48),
             qsa_scores_tc: Some(true),
@@ -412,6 +414,16 @@ fn flags_set_their_switches() {
             kv_vmm: Some(true),
             kv_vmm_keep: Some(32768),
         }
+    );
+}
+
+#[test]
+fn expert_peer_prefetch_is_opt_in() {
+    // No flag: off (#519).
+    assert_eq!(switches(&[]).expert_peer_prefetch, None);
+    assert_eq!(
+        switches(&["--expert-peer-prefetch"]).expert_peer_prefetch,
+        Some(true)
     );
 }
 
