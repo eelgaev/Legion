@@ -3726,6 +3726,11 @@ fn model_id(cfg: &LmConfig, gguf: &GgufFile) -> String {
 impl LmEngine {
     /// Loads the model (blocking: run it off the async runtime) and starts the worker thread.
     pub fn load(mut cfg: LmConfig) -> Result<Self, LoadError> {
+        // A dense qwen35 has no meta-device split: `--tp 2` runs it as two ranks (#1163).
+        if !cfg.tp_per_gpu && tp_pair::implied(&cfg) {
+            tracing::info!("--tp 2 on a dense qwen35 model: one rank per GPU (as --tp-per-gpu)");
+            cfg.tp_per_gpu = true;
+        }
         // `--tp-per-gpu`: rank 1 loads on a thread of its own, this call goes on as rank 0.
         if cfg.tp_per_gpu {
             return tp_pair::load(cfg);

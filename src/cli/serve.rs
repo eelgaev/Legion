@@ -453,10 +453,12 @@ pub(super) struct ModelArgs {
     pub gpus: usize,
     /// With --device cuda: tensor parallelism over this many GPUs (CUDA0, CUDA1, ...): every
     /// layer's heads and FFN rows split across them, one all-reduce after attention and one
-    /// after the FFN (dense models; not with --gpus or --layer-split).
+    /// after the FFN (dense models; not with --gpus or --layer-split). A dense Qwen3.5+ model
+    /// (Qwen3.8-27B) runs --tp 2 as --tp-per-gpu does.
     #[arg(long, env = "LEGION_TP", default_value_t = 1)]
     pub tp: usize,
-    /// With --tp 2 (dense Gemma 4): run CUDA0 and CUDA1 as two ranks of this process, each
+    /// With --tp 2 (dense Gemma 4; always on for dense Qwen3.5+): run CUDA0 and CUDA1 as two
+    /// ranks of this process, each
     /// with its own share of the model, executor and launch thread, instead of one ggml meta
     /// device over both. Each GPU keeps its graphs per step shape (decode, MTP verify and
     /// draft) with fused ops and CUDA graphs, as one GPU alone does, and the layers' partial

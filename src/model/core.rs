@@ -1769,6 +1769,12 @@ impl Model {
         }
     }
 
+    /// Whether this model is one rank's share and sums its partial outputs
+    /// ([`Self::set_tp_comm`], [`Self::set_tp_pair`]).
+    pub(crate) fn tp_active(&self) -> bool {
+        self.tp_pair.is_some() || self.tp_comm.is_some()
+    }
+
     /// `x` summed over the tensor-parallel ranks ([`Self::set_tp_comm`],
     /// [`Self::set_tp_pair`]); `x` itself without.
     pub(crate) fn tp_sum<'a>(&self, ctx: &'a Context, x: Tensor<'a>) -> Tensor<'a> {

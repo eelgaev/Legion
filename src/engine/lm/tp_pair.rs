@@ -120,6 +120,17 @@ pub(super) fn check(cfg: &LmConfig) -> Result<(), LoadError> {
     Ok(())
 }
 
+/// Whether `cfg` runs as two ranks without `--tp-per-gpu` asked for: `--tp 2` on a dense
+/// `qwen35` GGUF (Qwen3.8-27B, #1163), which the meta device does not split.
+pub(super) fn implied(cfg: &LmConfig) -> bool {
+    cfg.tp == 2
+        && cfg.tp_pair.is_none()
+        && cfg.tp_net.is_none()
+        && cfg.model_path.is_file()
+        && crate::gguf::GgufFile::open(&cfg.model_path)
+            .is_ok_and(|g| g.architecture().as_deref() == Some("qwen35"))
+}
+
 /// Each rank's config: its share of `cfg`, one GPU, the pair's all-reduce. The sliding layers
 /// in rings whatever the attention (the CPU gathers), as under the meta device.
 pub(super) fn rank_configs(cfg: &LmConfig, sum: Arc<PairSum>, first: usize) -> [LmConfig; 2] {
