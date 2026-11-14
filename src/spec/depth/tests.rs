@@ -149,6 +149,31 @@ fn probes_back_off_from_a_neighbour_measured_far_below() {
 }
 
 #[test]
+fn probes_up_do_not_back_off() {
+    // Best depth 1 (2-row steps 20 ms); depths 0 and 2 measured far below it.
+    let mut m = DepthModel::new(false);
+    let gains = geo(0.8, 3);
+    m.choose(&gains, 3);
+    for _ in 0..2 {
+        m.record_step(1, 60.0);
+        m.record_step(2, 20.0);
+        m.record_step(3, 60.0);
+    }
+    m.record_passes(1, 1, 1.0);
+    let picks: Vec<usize> = (0..8 * PROBE_EVERY).map(|_| m.choose(&gains, 3)).collect();
+    for (i, &k) in picks.iter().enumerate() {
+        let n = i + 1;
+        let want = match n {
+            // Up every second slot; down at 32, 64 (gap 32), then 128 (gap 64).
+            _ if n % (2 * PROBE_EVERY) == PROBE_EVERY => 2,
+            32 | 64 | 128 => 0,
+            _ => 1,
+        };
+        assert_eq!(k, want, "choice {n}: {picks:?}");
+    }
+}
+
+#[test]
 fn small_differences_keep_the_current_depth() {
     let gains = geo(0.75, 6);
     let mut m = DepthModel::new(false);
