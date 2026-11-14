@@ -669,6 +669,8 @@ pub struct Executor {
     tp: Option<TpLead>,
     /// See [`Self::no_deferred_commits`].
     no_defer: bool,
+    /// See [`Self::tp_deferred_commits`]; 0 without it (every commit that may be deferred is).
+    tp_defer_min: usize,
     /// Rank 1 of a split model: the residual rows of the step's micro-chunks that came over
     /// the link, which the first stage takes in order ([`Self::step_from`]).
     ext_rows: std::sync::Mutex<std::collections::VecDeque<Vec<f32>>>,
@@ -918,6 +920,7 @@ impl Executor {
             remote: None,
             tp: None,
             no_defer: false,
+            tp_defer_min: 0,
             ext_rows: Default::default(),
             captures: Vec::new(),
             applied: Vec::new(),
@@ -1623,6 +1626,16 @@ impl Executor {
         self.no_defer = true;
     }
 
+    /// For a rank of tensor parallelism over machines, instead of
+    /// [`Self::no_deferred_commits`]: the commits after its verify steps of at least `min_seqs`
+    /// sequences (1 or more) are deferred into the next verify step; narrower verify steps and
+    /// their commits run as without it, on the same graphs ([`SpecPool::new_layers_wide`];
+    /// `legion serve --tp-commit-in-verify-min-seqs`, #1176). The same bits either way; every
+    /// rank must be told the same.
+    pub fn tp_deferred_commits(&mut self, min_seqs: usize) {
+        self.tp_defer_min = min_seqs.max(1);
+    }
+
     /// Allocates replay buffers for speculative verify groups ([`Group::verify`]) of up to
     /// `max_tokens` tokens per sequence (drafts + 1), for every running-state slot.
     pub fn enable_spec(&mut self, max_tokens: usize) -> Result<(), ModelError> {
@@ -1639,6 +1652,7 @@ impl Executor {
         // Pools defer their commits only where `commit` does (#836 part 38): their inputs are
         // then stored packed for the replay alone.
         let defers = self.defers_commits() && !self.no_defer;
+        let tp_defer_min = self.tp_defer_min;
         for (d, s) in self.stages.iter_mut().enumerate() {
             // Kept graphs may reference the pool being replaced.
             s.forget_graphs();
@@ -1646,13 +1660,14 @@ impl Executor {
             let may_defer = defers && !buft.is_host() && !s.backend.is_meta();
             // The old pool goes first: two at once may not fit.
             s.spec = None;
-            let mut pool = SpecPool::new_layers(
+            let mut pool = SpecPool::new_layers_wide(
                 hp,
                 buft,
                 s.rec.n_slots(),
                 max_tokens,
                 s.layers.clone(),
                 may_defer,
+                tp_defer_min,
             )?;
             if shard.is_some() {
                 pool.set_shard(d);
@@ -2581,15 +2596,33 @@ impl Executor {
             return Ok(());
         }
         let model = &self.model;
+        // A rank of tensor parallelism over machines that defers (`Self::tp_deferred_commits`)
+        // runs at once the commits of the slots whose last verify step was a narrow one.
+        let mut at_once = None;
         if self.defers_commits() {
             let s = &mut self.stages[0];
             let spec = s
                 .spec
                 .as_ref()
                 .expect("commit without Executor::enable_spec");
+            let split = spec.split_commits(commits);
+            let deferred = split.as_ref().map_or(commits, |(d, _)| d.as_slice());
             // SAFETY: as below; the deferred graphs read the stage's pools only.
-            match unsafe { spec.commit_deferred(&mut s.backend, &mut s.commits, &s.rec, commits) } {
-                Ok(true) => return Ok(()),
+            match unsafe { spec.commit_deferred(&mut s.backend, &mut s.commits, &s.rec, deferred) }
+            {
+                Ok(true) => match split {
+                    Some((_, rest)) if !rest.is_empty() => at_once = Some(rest),
+                    _ => return Ok(()),
+                },
+                // A pool with both stores has those slots' inputs in the packed rows only.
+                Ok(false) if split.is_some() => {
+                    self.wait_commit();
+                    return Err(ModelError::Unsupported(
+                        "--tp-commit-in-verify-min-seqs on this backend (its deferred commit \
+                         graph does not fit)"
+                            .into(),
+                    ));
+                }
                 Ok(false) => {}
                 Err(e) => {
                     self.wait_commit();
@@ -2597,6 +2630,7 @@ impl Executor {
                 }
             }
         }
+        let commits = at_once.as_deref().unwrap_or(commits);
         let mut res = Ok(());
         for (i, s) in self.stages.iter_mut().enumerate() {
             // A stage still computing a round's piece (#762): its commit starts once it is done
@@ -2628,10 +2662,13 @@ impl Executor {
 
     /// Whether [`Self::commit`] may defer the delta rule into the next verify step
     /// (`--gdn-commit-in-verify`, #836 part 14): one stage on this machine, no parallel or
-    /// pipelined steps (their commits run elsewhere or later).
+    /// pipelined steps (their commits run elsewhere or later). A lead of tensor parallelism
+    /// over machines defers only when told to ([`Self::tp_deferred_commits`]), as each other
+    /// rank then does its share: every rank's states are its own heads', committed by its own
+    /// verify steps.
     fn defers_commits(&self) -> bool {
         self.stages.len() == 1
-            && self.tp.is_none()
+            && (self.tp.is_none() || self.tp_defer_min > 0)
             && self.remote.is_none()
             && self.par.pool.is_none()
             && !self.par.every_step
@@ -2676,10 +2713,15 @@ impl Executor {
         {
             return Ok(());
         }
+        // A verify group too narrow to replay (a pool with both stores, #1176) reads the
+        // states as any other group does.
+        let replays = |p: &SpecPool, g: &Group<'_>| g.verify && p.replays(g.seqs.len());
         let touched = self.stages.iter().any(|s| {
-            s.spec
-                .as_ref()
-                .is_some_and(|p| groups.iter().any(|g| !g.verify && p.defers_slots(range(g))))
+            s.spec.as_ref().is_some_and(|p| {
+                groups
+                    .iter()
+                    .any(|g| !replays(p, g) && p.defers_slots(range(g)))
+            })
         });
         if touched {
             self.flush_commits()?;
@@ -2687,8 +2729,12 @@ impl Executor {
         for s in &mut self.stages {
             if let Some(p) = s.spec.as_ref() {
                 for g in groups.iter().filter(|g| g.verify) {
-                    let n_tok = g.seqs.first().map_or(0, |q| q.tokens.len());
-                    p.before_verify(&mut s.backend, range(g), n_tok);
+                    if replays(p, g) {
+                        let n_tok = g.seqs.first().map_or(0, |q| q.tokens.len());
+                        p.before_verify(&mut s.backend, range(g), n_tok);
+                    } else {
+                        p.plain_verify(range(g));
+                    }
                 }
             }
         }

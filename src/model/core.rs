@@ -118,7 +118,8 @@ pub use media::{ImageSpan, Media};
 pub use mtp::{DraftHeadType, MtpGraph, MtpOutput};
 pub use spec::{
     Replay, SpecPool, set_commit_in_verify, set_commit_slots, set_state_defer,
-    set_state_defer_min_seqs, set_state_defer_rows,
+    set_state_defer_min_seqs, set_state_defer_rows, set_tp_commit_in_verify_min_seqs,
+    tp_commit_in_verify_min_seqs,
 };
 pub use state::{KV_BLOCK, KvPool, KvRing, KvTier, SeqState, SplitTier, StatePool, fnv1a};
 
@@ -3405,10 +3406,11 @@ impl Model {
                 None => {
                     // A pool that defers its commits stores the inputs in the delta rule
                     // (`gdn::rows_replay`), after it reads the last step's kept ones there; a
-                    // packed one that does not (no GPU counts) by copies (`store`).
+                    // packed one that does not (no GPU counts) by copies (`store`). A pool with
+                    // both stores (#1176) defers its wide steps only (`SpecPool::replays`).
                     let views = sh.verify.then(|| pass.spec.expect("checked in build"));
                     let views = views
-                        .filter(|spec| !spec.packed())
+                        .filter(|spec| !spec.packed() && !spec.replays(sh.n_seqs))
                         .map(|spec| spec.token_views(ctx, il, sh.slot, nt, ns));
                     let store = views.map(|[q, k, v_pool, g, beta]| {
                         // v is a view of the conv output: a copy.
@@ -3446,6 +3448,7 @@ impl Model {
                 // A verify step reads the rows only: its states advance in the commit.
                 let spec = pass.spec.expect("checked in build");
                 let replay = spec.replay_views(ctx, il, sh.slot, sh.n_seqs);
+                let replays = replay.is_some();
                 let rows = if let Some((keep, replay, arrive)) = replay {
                     // The last commit deferred into this step (#836 part 14): a pool that
                     // defers has no other way to run it. The op then stores this step's inputs
@@ -3468,7 +3471,7 @@ impl Model {
                 };
                 let conv_in = conv_in.expect("a verify group's conv input");
                 let mut graph = pass.graph.borrow_mut();
-                if stored || spec.defers() {
+                if stored || replays {
                     // The op wrote q, k, g and beta already, and v is copied; or the delta rule
                     // stored them over the packed rows (`rows_replay`).
                     spec.store_window(ctx, &mut graph, il, sh.slot, conv_in);

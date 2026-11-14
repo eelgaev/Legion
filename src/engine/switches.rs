@@ -59,6 +59,9 @@ pub struct Switches {
     /// The fewest sequences a verify step of such pools leaves the states in
     /// ([`crate::model::core::set_state_defer_min_seqs`]).
     pub gdn_state_defer_min_seqs: Option<u8>,
+    /// The fewest sequences a commit of a rank of tensor parallelism over machines defers
+    /// ([`crate::model::core::set_tp_commit_in_verify_min_seqs`]).
+    pub tp_commit_in_verify_min_seqs: Option<u8>,
     /// Attention layers' fused norm + RoPE op ([`crate::model::core::set_norm_rope`]).
     pub norm_rope: Option<bool>,
     /// Attention layers' K/V and indexer cache appends and pool-key op
@@ -575,6 +578,9 @@ impl Switches {
         }
         if let Some(n) = self.gdn_state_defer_min_seqs {
             core::set_state_defer_min_seqs(n.into());
+        }
+        if let Some(n) = self.tp_commit_in_verify_min_seqs {
+            core::set_tp_commit_in_verify_min_seqs(n.into());
         }
         set(self.norm_rope, core::set_norm_rope);
         set(self.kv_append, core::set_kv_append);

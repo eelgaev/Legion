@@ -309,10 +309,6 @@ fn gpu() -> Option<Backend> {
     Some(gpu)
 }
 
-/// On a GPU where the kernels run, the cluster top-k gives `qsa_topk`'s output index for index
-/// and the cluster argmax ggml-cuda's argmax, ties included: forced ties, k == n, -inf runs,
-/// NaN, -FLT_MAX and signed zeros, rows from 1 to the limits.
-#[cfg(feature = "cuda")]
 #[test]
 fn best_rank_orders_as_argmax_rank() {
     let cols: Vec<usize> = (0..300_000).step_by(13).collect();
@@ -351,6 +347,10 @@ fn joined_parts_are_the_argmax() {
     assert_eq!(join_best(&flat, 1), (vec![u32::MAX], vec![-f32::MAX]));
 }
 
+/// On a GPU where the kernels run, the cluster top-k gives `qsa_topk`'s output index for index
+/// and the cluster argmax ggml-cuda's argmax, ties included: forced ties, k == n, -inf runs,
+/// NaN, -FLT_MAX and signed zeros, rows from 1 to the limits.
+#[cfg(feature = "cuda")]
 #[test]
 #[ignore = "needs a GPU"]
 fn cuda_matches_one_cta_kernels() {
