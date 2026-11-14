@@ -43,6 +43,13 @@ Measured against vLLM 0.33.0 with tensor parallel 2, MTP and CUDA graphs on the 
 43-58 / 116.8 / 248.5 tok/s decode, 3,174 / 3,257 / 3,135 tok/s prefill); its command is in
 [other engines](../other-engines.md).
 
+Optional, for many users: `--tp-commit-in-verify-min-seqs 8` on both ranks. After a verify step of 8 or more
+sequences, each rank advances its gated DeltaNet states inside the next verify step instead of in a commit of its
+own, so the states go through memory once less per round. 16 users: 248.2 -> 257.5 tok/s (median of 6 rounds
+each, same sessions; the rounds spread 240-257 and 247-260), same output. Steps of fewer sequences run as without
+the flag (1 and 4 users measured within the round spread: 49.8 -> 49.0 and 121.6 -> 120.0), so the numbers above
+are without it.
+
 ## What each flag does
 
 - `--max-seqs` (`16`): How many requests are decoded at once (continuous batching). Set to the highest concurrency the benchmark uses.
