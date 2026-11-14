@@ -58,7 +58,7 @@ mod waves;
 use chat_format::ChatFormat;
 use response_format::{Constraint, GrammarCache, MaskPool};
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -1474,6 +1474,8 @@ pub struct LmEngine {
     load_report: report::LoadReport,
     /// `--pipeline-mtp-split`'s measurements, shared with the worker (#765).
     split_probe: Option<Arc<Mutex<pipe_split::Probe>>>,
+    /// [`Engine::set_warming`], shared with the worker.
+    warming: Arc<AtomicBool>,
 }
 
 impl Drop for LmEngine {
@@ -4737,10 +4739,38 @@ impl LmEngine {
                  too; off: never)"
             );
         }
-        let kv_keep = cfg
-            .switches
-            .kv_vmm_keep
-            .or(kv_auto.then_some(KV_VMM_KEEP_DEFAULT));
+        // The bounded host tier (#37, an x86_64 PC's one discrete GPU): the same lend with no
+        // flag, the pool past its first KV_VMM_KEEP_TIER tokens. There every VRAM slot saves
+        // a copy over PCIe (or a checkpoint read), and the tail comes back when a chat needs
+        // it (`Worker::kv_make_room`).
+        let kv_tier = kv_vmm::tier_default(
+            exec.model().host_tier().is_some(),
+            cfg.switches.kv_vmm,
+            mode == ExpertMode::Cache,
+            layout.stages.len(),
+            tp_fit || tp_start.is_some() || layout.node.is_some(),
+            host_tokens,
+        );
+        // Not after a run whose chats were long (`kv_vmm::TierUse`): with the tail mapped the
+        // cache is worse off than with no lend. This run's chats decide the next load's.
+        let kv_long_file = (cfg.residency.tier_heat.as_deref())
+            .filter(|_| kv_tier)
+            .map(kv_vmm::tier_long_file);
+        let kv_tier = kv_tier && !kv_long_file.as_ref().is_some_and(|f| f.exists());
+        if kv_long_file.is_some() && !kv_tier {
+            tracing::info!(
+                kept_tokens = kv_vmm::KEEP_TIER,
+                "host expert tier: the last run's chats held more KV tokens than the lend \
+                 keeps most of the time: the KV pool's tail is not lent to the expert cache \
+                 this run (--kv-vmm-keep lends it anyway)"
+            );
+        }
+        let kv_auto = kv_auto || kv_tier;
+        let kv_keep = cfg.switches.kv_vmm_keep.or(kv_auto.then_some(if kv_tier {
+            kv_vmm::KEEP_TIER
+        } else {
+            KV_VMM_KEEP_DEFAULT
+        }));
         let mut kv_vmm_all = false;
         if cfg.switches.kv_vmm == Some(true) || kv_auto {
             kv_vmm_all = kv_vmm::apply(&mut exec, &layout, tp_fit)?;
@@ -5354,6 +5384,7 @@ impl LmEngine {
         );
 
         let (submit, rx) = std::sync::mpsc::channel();
+        let warming = Arc::new(AtomicBool::new(false));
         let expert_stats = exec.experts_mut().map(|experts| experts.stats());
         let stats = Arc::new(Mutex::new(EngineStats {
             rooflines: bandwidth::stage_rooflines(&layout),
@@ -5586,8 +5617,17 @@ impl LmEngine {
             long_past,
             long_cap: 0,
             long_reserve: 0,
+            kv_tier,
+            kv_tail_used: Instant::now(),
+            kv_use: kv_vmm::TierUse {
+                file: kv_long_file,
+                keep: (kv_vmm::KEEP_TIER / KV_BLOCK) as u32,
+                ..Default::default()
+            },
             tier_step,
             tier_cap: 0,
+            warming: warming.clone(),
+            warming_seen: false,
             clock: Default::default(),
             outbox: stream::Outbox::new(tokenizer.clone(), cfg.stream_thread_seqs),
         };
@@ -5629,6 +5669,7 @@ impl LmEngine {
             worker: Some(worker),
             load_report,
             split_probe,
+            warming,
         })
     }
 
@@ -5875,6 +5916,10 @@ impl Engine for LmEngine {
     fn stats(&self) -> EngineStats {
         self.stats.lock().map(|s| *s).unwrap_or_default()
     }
+
+    fn set_warming(&self, on: bool) {
+        self.warming.store(on, Ordering::Release);
+    }
 }
 
 /// Owns everything that touches the device, and the scheduler's bookkeeping.
@@ -5990,12 +6035,23 @@ struct Worker {
     long_cap: usize,
     /// VRAM a KV tail mapped during the current lend leaves free for its step buffers.
     long_reserve: usize,
+    /// The KV tail is lent with no flag for the bounded host tier ([`kv_vmm::tier_default`]).
+    kv_tier: bool,
+    /// When the tail was last mapped for, or held by, a decoding sequence
+    /// ([`kv_vmm::tier_holds`]).
+    kv_tail_used: Instant,
+    /// The run's chat lengths, for the next load's lend.
+    kv_use: kv_vmm::TierUse,
     /// The bounded host tier on one GPU: the device, and the bytes a prompt step of that many
     /// tokens took when measured at load.
     tier_step: Option<(Option<crate::ggml::Device>, usize, usize)>,
     /// The most tokens a staged pass of the current lend takes
     /// ([`ssd_tier::host_tier_pass_cap`]; 0: no cap).
     tier_cap: usize,
+    /// [`Engine::set_warming`], and what the expert cache was last told of it
+    /// ([`Self::warming_changed`]).
+    warming: Arc<AtomicBool>,
+    warming_seen: bool,
     /// `--kv-vmm-keep` (#814): the KV pools' tail, lent to the expert cache while no sequence
     /// needs it ([`kv_vmm::KvLend`]).
     kv_lend: Option<kv_vmm::KvLend>,
@@ -6172,6 +6228,8 @@ impl Worker {
         let mut experts_at = Instant::now();
         // `--deterministic` ([`waves`]): requests that arrived since the running wave started.
         let mut held: Vec<Job> = Vec::new();
+        // Every block is free before the first request.
+        self.kv_use.total = self.pool.free_blocks();
         loop {
             // The cache gets its VRAM back once no prompt is being read (before idling too).
             // `--kv-vmm-keep`: while the KV pools' tail holds some of the cache's VRAM, all but
@@ -6179,6 +6237,7 @@ impl Worker {
             if prefilling.is_empty() && !pipe.is_active() {
                 self.kv_shrink(&decoding);
             }
+            self.kv_use.note(decoding.len(), self.pool.free_blocks());
             if self.lent && prefilling.is_empty() {
                 self.restore_cache();
             }
@@ -6258,6 +6317,7 @@ impl Worker {
                 }
             }
             waiting.retain(|w| w.keep(&mut self.outbox));
+            self.warming_changed();
             // `on-demand`: room for the decoding sequences' next step, victims preempted.
             if self.on_demand()
                 && let Err(e) = self.make_room(&mut decoding, &mut prefilling, &mut waiting)
@@ -6993,6 +7053,11 @@ impl Worker {
             if need == 0 || !short(self) {
                 return Ok(());
             }
+        }
+        // The bounded host tier's lend (#37) evicts no cached chat for the tail's sake:
+        // reading a chat again costs seconds, the mapped tail a few percent of decode.
+        let evicts = !self.kv_tier || self.kv_lend.as_ref().is_some_and(|l| l.grown);
+        if !resume && evicts {
             // Everything they hold is a kept block while the tail is lent, but blocks the
             // last shrink kept in host memory (#1196).
             let host_held = self.kv_lend.as_ref().is_some_and(|l| l.host_held > 0);
@@ -7025,6 +7090,7 @@ impl Worker {
                 self.exec.set_micro_taper(0);
             }
         }
+        self.kv_tail_used = Instant::now();
         let lend = self.kv_lend.as_mut().expect("a lent KV tail");
         let host_held = lend.host_held;
         let reserve = self.long_reserve;
@@ -7056,6 +7122,28 @@ impl Worker {
             );
         }
         Ok(())
+    }
+
+    /// Tells the expert cache when the startup warmup begins or is over
+    /// ([`Engine::set_warming`]): it does not learn from the warmup's prompts where a saved
+    /// routing heat file filled its slots (the bounded host tier). Over: the last warmup
+    /// step's deferred cache work runs first, still unlearned.
+    fn warming_changed(&mut self) {
+        let on = self.warming.load(Ordering::Acquire);
+        if on == self.warming_seen {
+            return;
+        }
+        self.warming_seen = on;
+        // Only such a cache is told; every other load runs as before.
+        if !(self.exec.model().experts()).is_some_and(|x| x.holds_warmup()) {
+            return;
+        }
+        if !on && let Err(e) = self.exec.quiesce() {
+            tracing::warn!(error = %e, "could not finish the warmup's steps");
+        }
+        if let Some(experts) = self.exec.experts_mut() {
+            experts.set_hold(on);
+        }
     }
 
     /// Evicts every cached prefix and warm sequence holding a block from `keep` on, then the
@@ -7127,6 +7215,12 @@ impl Worker {
             return;
         };
         if decoding.iter().any(|s| s.blocks.iter().any(|&b| b >= keep)) {
+            self.kv_tail_used = Instant::now();
+            return;
+        }
+        // The bounded host tier: a long chat's next turn finds its tail mapped.
+        let in_use = self.pool.slow_in_use() > 0;
+        if kv_vmm::tier_holds(self.kv_tier, in_use, self.kv_tail_used.elapsed()) {
             return;
         }
         let mut host = None;
@@ -7203,18 +7297,7 @@ impl Worker {
             Ok(true) => {
                 self.lent = true;
                 (self.long_cap, self.long_reserve) = self.long_micro_cap(end);
-                // The bounded host tier: a pass's step buffer stays in the VRAM the lend
-                // left free (the host's memory is the experts').
-                if let Some((Some(d), bytes, at)) = self.tier_step {
-                    let keep = crate::model::core::LENT_SCRATCH + LENT_MICRO_MARGIN;
-                    let free = d.memory().0.saturating_sub(keep);
-                    self.tier_cap = ssd_tier::host_tier_pass_cap(free, bytes, at, KV_BLOCK);
-                    tracing::info!(
-                        free_mib = free >> 20,
-                        pass_tokens = self.tier_cap,
-                        "host expert tier: staged passes sized to the lent VRAM"
-                    );
-                }
+                self.size_tier_pass();
                 self.exec.set_pipeline_micro(self.capped(self.long.micro));
                 self.exec.set_micro_taper(self.long.taper);
                 tracing::info!(
@@ -7230,6 +7313,21 @@ impl Worker {
                     tracing::warn!(error = %e, "could not restore the expert cache");
                 }
             }
+        }
+    }
+
+    /// The bounded host tier: a pass's step buffer stays in the VRAM the lend left free now
+    /// (the host's memory is the experts'). Sized again once the KV tail is mapped out of it.
+    fn size_tier_pass(&mut self) {
+        if let Some((Some(d), bytes, at)) = self.tier_step {
+            let keep = crate::model::core::LENT_SCRATCH + LENT_MICRO_MARGIN;
+            let free = d.memory().0.saturating_sub(keep);
+            self.tier_cap = ssd_tier::host_tier_pass_cap(free, bytes, at, KV_BLOCK);
+            tracing::info!(
+                free_mib = free >> 20,
+                pass_tokens = self.tier_cap,
+                "host expert tier: staged passes sized to the lent VRAM"
+            );
         }
     }
 
@@ -7551,9 +7649,12 @@ impl Worker {
             // freed is free. Mapped mid-prompt, the prompt steps' buffers had taken it first
             // (cuMemCreate out of memory on 4 V100s with 16 sequences). The same blocks
             // and bits, mapped a few steps earlier.
+            // The bounded host tier's lend (#37) too: its passes are sized to the VRAM free
+            // once the tail is mapped (sized before, a 12K prompt's one pass found 960 MiB
+            // less than planned and its buffer spilled into host memory).
             if long
                 && self.lent
-                && self.exec.model().glm_par.is_some()
+                && (self.exec.model().glm_par.is_some() || self.kv_tier)
                 && self.kv_lend.as_ref().is_some_and(|l| !l.grown)
             {
                 let need = prefilling
@@ -7572,6 +7673,9 @@ impl Worker {
                             .any(|s| s.blocks.iter().any(|&b| b >= l.keep as u32))
                 });
                 self.kv_make_room(need, resume)?;
+                if self.kv_tier && self.kv_lend.as_ref().is_some_and(|l| l.grown) {
+                    self.size_tier_pass();
+                }
             }
         }
         // A long prompt turns a short lend into a long one until the cache is restored (the

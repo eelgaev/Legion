@@ -492,3 +492,44 @@ fn a_cold_cache_plans_more_swaps_a_round() {
     assert_eq!(cold.budget, rule.budget * super::COLD_SWAPS);
     assert_eq!((cold.margin, cold.ratio), (rule.margin, rule.ratio));
 }
+
+#[test]
+fn the_warmup_is_not_learned_from_only_over_a_saved_heat_file() {
+    assert!(super::hold_applies(true, true));
+    // No file filled the slots: the warmup's routing is all there is to start from.
+    assert!(!super::hold_applies(true, false));
+    assert!(!super::hold_applies(false, true));
+    assert!(!super::hold_applies(false, false));
+}
+
+#[test]
+fn the_heat_file_is_saved_again_only_when_due_and_something_was_learned() {
+    use std::time::Duration;
+    let every = super::HEAT_SAVE_EVERY;
+    assert!(super::heat_save_due(true, every));
+    assert!(super::heat_save_due(true, every + Duration::from_secs(1)));
+    assert!(!super::heat_save_due(true, every - Duration::from_secs(1)));
+    // An idle server writes nothing.
+    assert!(!super::heat_save_due(false, every * 10));
+}
+
+#[test]
+fn a_saved_heat_ranking_keeps_the_older_files_other_pairs_after_its_own() {
+    use crate::residency::profile::Profile;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state").join("m.gguf.1.heat");
+    let old = Profile::from_heat(&[vec![0.0, 3.0, 1.0], vec![2.0, 0.0, 0.0]]);
+    assert_eq!(super::save_heat(&path, old.clone()).unwrap(), 3);
+    assert_eq!(Profile::read(&path).unwrap(), old);
+    // A new ranking: its pairs first, the old file's others behind them.
+    let new = Profile::from_heat(&[vec![9.0, 0.0, 0.0], vec![5.0, 0.0, 0.0]]);
+    assert_eq!(super::save_heat(&path, new).unwrap(), 4);
+    let got = Profile::read(&path).unwrap();
+    assert_eq!(got.ranked, vec![(0, 0), (1, 0), (0, 1), (0, 2)]);
+    // Written through a temporary file that is renamed: none is left behind.
+    assert!(!path.with_extension("tmp").exists());
+    // Another model's file (other sizes) is replaced, not merged.
+    let other = Profile::from_heat(&[vec![1.0, 2.0]]);
+    assert_eq!(super::save_heat(&path, other.clone()).unwrap(), 2);
+    assert_eq!(Profile::read(&path).unwrap(), other);
+}

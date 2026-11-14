@@ -679,6 +679,32 @@ fn per_device_budget_overrides_only_the_devices_it_names() {
 }
 
 #[test]
+fn layers_left_coldest_takes_the_candidates_of_least_heat_until_the_need() {
+    let lent = [Some(100), None, Some(100), Some(50), None, Some(60)];
+    let heat = [1.0, 0.0, 5.0, 9.0, 0.0, 7.0];
+    // The coldest candidate covers it: layer 0, though it is the first.
+    assert_eq!(
+        layers_left_coldest(&lent, &heat, 100),
+        vec![true, false, false, false, false, false]
+    );
+    // Then the next coldest (layer 2); never a layer that is not a candidate.
+    assert_eq!(
+        layers_left_coldest(&lent, &heat, 150),
+        vec![true, false, true, false, false, false]
+    );
+    // Equal heat: the later layer first, as `layers_left_for`.
+    assert_eq!(
+        layers_left_coldest(&lent, &[0.0; 6], 100),
+        layers_left_for(&lent, 100)
+    );
+    assert_eq!(layers_left_coldest(&lent, &heat, 0), vec![false; 6]);
+    assert_eq!(
+        layers_left_coldest(&lent, &heat, 10_000),
+        vec![true, false, true, true, false, true]
+    );
+}
+
+#[test]
 fn layers_left_for_takes_the_last_candidates_until_the_need() {
     let lent = [Some(100), None, Some(100), Some(50), None, Some(60)];
     // From the last one down: 60, then 50 (110 >= 100); the rest are refilled.

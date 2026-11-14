@@ -2261,12 +2261,19 @@ pub async fn run(
             }
         }
     };
+    engine.set_warming(true);
     if kind == EngineKind::Model {
         warmup::shapes(engine.as_ref(), &e.warmup_shapes).await;
     }
-    if e.warmup_prompt > 0 {
-        warmup::run(engine.as_ref(), e.warmup_prompt).await?;
-    }
+    let warmed = if e.warmup_prompt > 0 {
+        warmup::run(engine.as_ref(), e.warmup_prompt)
+            .await
+            .map(drop)
+    } else {
+        Ok(())
+    };
+    engine.set_warming(false);
+    warmed?;
     if interactive {
         if !reported {
             let model = engine

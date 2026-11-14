@@ -808,6 +808,25 @@ pub fn layers_left_for(lent: &[Option<u64>], need: u64) -> Vec<bool> {
     left
 }
 
+/// [`layers_left_for`] for the bounded host tier, where a slot without VRAM costs a copy over
+/// PCIe per routed token: the candidates whose lent slots held the least routing heat
+/// (`heat[i]`) go first, the later layer of two equal ones before the earlier.
+pub fn layers_left_coldest(lent: &[Option<u64>], heat: &[f32], need: u64) -> Vec<bool> {
+    let mut left = vec![false; lent.len()];
+    let mut order: Vec<usize> = (0..lent.len()).filter(|&i| lent[i].is_some()).collect();
+    let h = |i: usize| heat.get(i).copied().unwrap_or(0.0);
+    order.sort_by(|&a, &b| h(a).total_cmp(&h(b)).then(b.cmp(&a)));
+    let mut sum = 0u64;
+    for i in order {
+        if sum >= need {
+            break;
+        }
+        sum += lent[i].unwrap_or(0);
+        left[i] = true;
+    }
+    left
+}
+
 /// Returns the keep, and [`auto_keep`]'s byte-count keep (the same unless it was lowered).
 pub fn auto_keep_carved(
     layers: &[LendLayer],

@@ -260,6 +260,82 @@ fn a_zero_budget_with_nothing_held_lends_as_before() {
 }
 
 #[test]
+fn the_host_tier_lends_the_tail_with_no_flag_only_on_its_one_gpu() {
+    assert!(tier_default(true, None, true, 1, false, 0));
+    // No bounded host tier (an AC922, a Spark): as before.
+    assert!(!tier_default(false, None, true, 1, false, 0));
+    // --kv-vmm and --no-kv-vmm decide for themselves.
+    assert!(!tier_default(true, Some(false), true, 1, false, 0));
+    assert!(!tier_default(true, Some(true), true, 1, false, 0));
+    // No VRAM expert cache, a layer split, tensor parallelism, a KV host tier.
+    assert!(!tier_default(true, None, false, 1, false, 0));
+    assert!(!tier_default(true, None, true, 2, false, 0));
+    assert!(!tier_default(true, None, true, 1, true, 0));
+    assert!(!tier_default(true, None, true, 1, false, 4096));
+}
+
+#[test]
+fn the_host_tiers_mapped_tail_waits_for_a_cached_chats_next_turn() {
+    let s = std::time::Duration::from_secs;
+    assert!(tier_holds(true, true, s(0)));
+    assert!(tier_holds(true, true, TIER_HOLD - s(1)));
+    // Idle long enough: lent again (the chat moves to host memory).
+    assert!(!tier_holds(true, true, TIER_HOLD));
+    // Nothing cached on it: lent again at once.
+    assert!(!tier_holds(true, false, s(0)));
+    // --kv-vmm as a flag, an AC922: as before.
+    assert!(!tier_holds(false, true, s(0)));
+}
+
+#[test]
+fn a_run_of_long_chats_turns_the_next_loads_lend_off_and_short_ones_on_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let heat = dir.path().join("legion/expert-heat/m.gguf.1.heat");
+    let file = tier_long_file(&heat);
+    assert_eq!(
+        file,
+        dir.path().join("legion/expert-heat/m.gguf.1.long-chats")
+    );
+    let run = |long: u64, short: u64, file: Option<&std::path::Path>| {
+        let mut u = TierUse {
+            file: file.map(Into::into),
+            total: 160,
+            keep: 32,
+            ..Default::default()
+        };
+        // Idle turns count nothing; 33 blocks in use is past the 32 kept, 32 is not.
+        u.note(0, 0);
+        (0..long).for_each(|_| u.note(1, 160 - 33));
+        (0..short).for_each(|_| u.note(2, 160 - 32));
+        assert_eq!(
+            (u.long, u.steps),
+            if file.is_some() {
+                (long, long + short)
+            } else {
+                (0, 0)
+            }
+        );
+    };
+    // Too few steps to tell: nothing written.
+    run(TIER_USE_STEPS - 1, 0, Some(&file));
+    assert!(!file.exists());
+    // Mostly long: noted (its directory made).
+    run(TIER_USE_STEPS, TIER_USE_STEPS - 1, Some(&file));
+    assert!(file.exists());
+    // Too few steps: it stays. Half or fewer long: removed, and removing nothing is fine.
+    run(0, 3, Some(&file));
+    assert!(file.exists());
+    run(TIER_USE_STEPS, TIER_USE_STEPS, Some(&file));
+    assert!(!file.exists());
+    run(0, TIER_USE_STEPS, Some(&file));
+    // No bounded host tier: nothing counted or written.
+    run(TIER_USE_STEPS, 0, None);
+    assert!(!file.exists());
+    assert_eq!(tier_chats_long(1, 2), None);
+    assert_eq!(tier_chats_long(TIER_USE_STEPS, TIER_USE_STEPS), Some(true));
+}
+
+#[test]
 fn the_default_host_budget_is_an_eighth_of_available_memory_at_most_the_tail() {
     let gib = 1usize << 30;
     // 574 GB free, a 119 GiB tail: an eighth of the memory.

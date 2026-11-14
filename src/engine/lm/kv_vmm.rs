@@ -110,6 +110,111 @@ pub(super) fn default_host_budget(lent: usize, available: u64) -> usize {
     lent.min(usize::try_from(available / 8).unwrap_or(usize::MAX))
 }
 
+/// Tokens of the KV pool that keep VRAM under the bounded host expert tier (#37): the rest
+/// is lent to the VRAM expert cache until the sequences hold more than this together.
+pub(super) const KEEP_TIER: usize = 8192;
+
+/// How long the bounded host tier's mapped tail waits, after the last decoding sequence on
+/// it, while a cached chat still holds a block of it, before it is lent again: the next turn
+/// of a long chat maps nothing (mapping it again lends and restores the whole expert cache,
+/// most of a second before the first token).
+pub(super) const TIER_HOLD: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Whether the KV pool's tail is lent to the expert cache with no flag for the bounded host
+/// tier (`tier`: this load has one): `--kv-vmm` / `--no-kv-vmm` not given (`asked`), the VRAM
+/// expert cache (`cache`) on one stage, no tensor parallelism or second machine (`shared`),
+/// no KV host tier (`host_tokens`).
+pub(super) fn tier_default(
+    tier: bool,
+    asked: Option<bool>,
+    cache: bool,
+    stages: usize,
+    shared: bool,
+    host_tokens: usize,
+) -> bool {
+    tier && asked.is_none() && cache && stages == 1 && !shared && host_tokens == 0
+}
+
+/// Whether the bounded host tier's mapped tail stays mapped though no decoding sequence
+/// holds a block of it: a cached chat does (`in_use`) and one decoded on it less than
+/// [`TIER_HOLD`] ago (`idle`). Nothing cached on it: it is lent again at once.
+pub(super) fn tier_holds(tier: bool, in_use: bool, idle: std::time::Duration) -> bool {
+    tier && in_use && idle < TIER_HOLD
+}
+
+/// Decode steps a run must count before it decides the next load's lend ([`tier_chats_long`]).
+pub(super) const TIER_USE_STEPS: u64 = 512;
+
+/// Whether a run's chats were long for the bounded host tier's lend: of its `steps` decode
+/// steps, more than half ran with more KV blocks in use (cached chats included) than the lend
+/// keeps (`long`). `None` under [`TIER_USE_STEPS`] steps: too few to tell.
+pub(super) fn tier_chats_long(long: u64, steps: u64) -> Option<bool> {
+    (steps >= TIER_USE_STEPS).then_some(long * 2 > steps)
+}
+
+/// The file beside the routing heat file `heat` whose presence says the last run's chats were
+/// long ([`tier_chats_long`]): the next load does not lend the tail.
+pub(super) fn tier_long_file(heat: &std::path::Path) -> std::path::PathBuf {
+    heat.with_extension("long-chats")
+}
+
+/// Counts, for the bounded host tier, a run's decode steps and those with more KV blocks in
+/// use than the lend keeps; when dropped (the engine stops), writes or removes
+/// [`tier_long_file`] for the next load. With the tail mapped, whole layers of the expert
+/// cache are without part of their slots (decode 8% slower than with no lend, measured), so a
+/// machine whose chats are long loads without the lend, and with it again once they are not.
+#[derive(Debug, Default)]
+pub(super) struct TierUse {
+    /// `None`: nothing counted or written (no bounded host tier, a flag decided).
+    pub(super) file: Option<std::path::PathBuf>,
+    /// The pool's blocks, and how many the lend keeps.
+    pub(super) total: u32,
+    pub(super) keep: u32,
+    pub(super) steps: u64,
+    pub(super) long: u64,
+}
+
+impl TierUse {
+    /// A loop turn with `decoding` sequences decoding and `free` of the pool's blocks free.
+    pub(super) fn note(&mut self, decoding: usize, free: u32) {
+        if self.file.is_none() || decoding == 0 {
+            return;
+        }
+        self.steps += 1;
+        self.long += u64::from(self.total.saturating_sub(free) > self.keep);
+    }
+}
+
+impl Drop for TierUse {
+    fn drop(&mut self) {
+        let Some(file) = &self.file else { return };
+        let Some(long) = tier_chats_long(self.long, self.steps) else {
+            return;
+        };
+        let done = if long {
+            file.parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(file, b""))
+        } else {
+            match std::fs::remove_file(file) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            }
+        };
+        match done {
+            Ok(()) => tracing::info!(
+                steps = self.steps,
+                long_steps = self.long,
+                lend_next = !long,
+                "host expert tier: whether the next load lends the KV pool's tail to the \
+                 expert cache follows this run's chats (long: more KV tokens in use than \
+                 the lend keeps)"
+            ),
+            Err(e) => tracing::warn!(error = %e, "could not note this run's chat lengths"),
+        }
+    }
+}
+
 /// The pieces of `tails` that hold a block of `held` (ascending ids): what a shrink keeps.
 pub(super) fn host_plan(tails: &[Tail], held: &[u32]) -> HostPlan {
     let mut bytes = 0;

@@ -25,7 +25,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::policy::{
     LayerSlots, LendLayer, MAX_FIT_TRIES, SwapRule, allocate_slots_in, auto_keep_carved,
-    hottest_experts, layers_left_for, lowest_experts, plan_swaps, shrunk_budget,
+    hottest_experts, layers_left_coldest, layers_left_for, lowest_experts, plan_swaps,
+    shrunk_budget,
 };
 use super::profile::Profile;
 use super::{Fetch, ResidencyConfig};
@@ -776,8 +777,19 @@ pub struct ExpertResidency {
     heat_pass_cap: f32,
     profile: Option<PathBuf>,
     /// The bounded host tier's routing heat file ([`ResidencyConfig::tier_heat`]): written on
-    /// exit.
+    /// exit and every [`HEAT_SAVE_EVERY`] while steps are logged ([`Self::save_tier_heat`]).
     tier_heat: Option<PathBuf>,
+    /// Whether the slots were filled from that file at load.
+    tier_seeded: bool,
+    /// [`Self::set_hold`]: the startup warmup runs, so with `tier_seeded` its routing neither
+    /// counts nor swaps (the slots stay as the file ordered them).
+    hold: bool,
+    /// When the heat file was last written (or the cache built), and whether a step was
+    /// learned from since.
+    heat_saved: std::time::Instant,
+    heat_fresh: bool,
+    /// The thread writing the heat file, if one is still at it.
+    heat_writer: Option<std::thread::JoinHandle<()>>,
     /// The bounded host tier: the last round of swaps took its whole budget (or nothing was
     /// saved to start from), so the cache is far from what is routed to and the next round may
     /// plan [`COLD_SWAPS`] times as many.
@@ -1837,6 +1849,11 @@ impl ExpertResidency {
             heat_pass_cap: cfg.heat_pass_cap,
             profile: cfg.profile.clone(),
             tier_heat: tier_heat.cloned(),
+            tier_seeded: tier_prof.is_some(),
+            hold: false,
+            heat_saved: std::time::Instant::now(),
+            heat_fresh: false,
+            heat_writer: None,
             cold: tier_prof.is_none(),
             split_misses: cfg.split_misses.clone(),
             swaps: 0,
@@ -2449,6 +2466,7 @@ impl ExpertResidency {
     fn learn_tally(&mut self, ran: &dyn Fn(usize) -> bool) {
         let n_expert = self.n_expert;
         let decay = self.decay;
+        let held = self.held();
         for d in 0..self.devices.len() {
             let Some((tally, _)) = self.devices[d].tally() else {
                 continue;
@@ -2482,10 +2500,13 @@ impl ExpertResidency {
                 if seen.iter().all(|&x| x == 0.0) {
                     continue;
                 }
-                l.slots.decay(decay);
-                l.slots.add_heat(seen);
-                for (c, &x) in l.counts.iter_mut().zip(seen) {
-                    *c += x as u64;
+                // The warmup's prompts over slots a heat file filled: dropped unread.
+                if !held {
+                    l.slots.decay(decay);
+                    l.slots.add_heat(seen);
+                    for (c, &x) in l.counts.iter_mut().zip(seen) {
+                        *c += x as u64;
+                    }
                 }
                 tally.memset(l.row * n_expert * 4, n_expert * 4, 0);
             }
@@ -2531,6 +2552,7 @@ impl ExpertResidency {
                 l.read_at_most(pairs, st);
             }
         }
+        let held = self.held();
         if n > 0 && n <= LOG_TOKENS {
             if count {
                 self.logged += 1;
@@ -2591,6 +2613,10 @@ impl ExpertResidency {
                             chosen: l.owned_chosen(mine),
                         });
                     }
+                    // The warmup's prompts over slots a heat file filled: not learned from.
+                    if held {
+                        continue;
+                    }
                     l.slots.record_capped(mine, self.heat_pass_cap);
                     for &id in mine {
                         if let Some((e, _)) = l.slots.decode(id) {
@@ -2600,8 +2626,9 @@ impl ExpertResidency {
                     l.slots.decay(self.decay);
                 }
             }
+            self.heat_fresh |= !held;
             // The bounded host tier keeps its RAM slots by the same heat.
-            if let Some(h) = &self.host {
+            if let Some(h) = self.host.as_ref().filter(|_| !held) {
                 h.set_heat(
                     self.layers
                         .iter()
@@ -2617,8 +2644,9 @@ impl ExpertResidency {
             if predicted {
                 self.predict.end_pass();
             }
-            // No swaps into lent slots: their VRAM is gone until `restore`.
-            if self.lent.is_none() {
+            // No swaps into lent slots: their VRAM is gone until `restore`. None for the
+            // warmup's routing either.
+            if self.lent.is_none() && !held {
                 for d in 0..self.devices.len() {
                     if self.rule.on_device(&self.device_swaps, d).budget > 0 {
                         self.start_swaps(d, scope)?;
@@ -2643,7 +2671,78 @@ impl ExpertResidency {
         if n > LOG_TOKENS && self.lent.is_none() {
             self.learn_tally(ran);
         }
+        self.save_tier_heat_if_due();
         self.upload_tables(scope)
+    }
+
+    /// The startup warmup begins (`true`) or is over: while it runs over slots a saved heat
+    /// file filled (the bounded host tier, #37), its prompts' routing is not added to the heat
+    /// or the counts and plans no swaps, so the first chats find the VRAM cache as the file
+    /// ordered it. Without such a file (and without the tier) nothing changes.
+    pub fn set_hold(&mut self, hold: bool) {
+        self.hold = hold;
+    }
+
+    /// Whether [`Self::set_hold`] changes anything here: the slots were filled from the
+    /// bounded host tier's saved heat file.
+    pub fn holds_warmup(&self) -> bool {
+        self.tier_seeded
+    }
+
+    /// Whether routing is not learned from now ([`Self::set_hold`]).
+    fn held(&self) -> bool {
+        hold_applies(self.hold, self.tier_seeded)
+    }
+
+    /// The bounded host tier's heat as a ranking, when there is a file to keep it in and
+    /// something was routed to.
+    fn tier_heat_ranked(&self) -> Option<(PathBuf, Profile)> {
+        let path = self.tier_heat.clone()?;
+        let routed = self
+            .layers
+            .iter()
+            .flatten()
+            .any(|l| l.counts.iter().any(|&c| c > 0));
+        if !routed {
+            return None;
+        }
+        // The heat the cache has now (what it keeps its slots by) is what the next load
+        // starts from.
+        let heat: Vec<Vec<f32>> = self
+            .layers
+            .iter()
+            .map(|l| {
+                l.as_ref()
+                    .map_or_else(|| vec![0.0; self.n_expert], |l| l.slots.heat().to_vec())
+            })
+            .collect();
+        let mut learned = Profile::from_heat(&heat);
+        learned.n_expert = self.n_expert;
+        Some((path, learned))
+    }
+
+    /// Every [`HEAT_SAVE_EVERY`] with steps learned from since the last save: the bounded host
+    /// tier's heat file is written again (by a thread of its own; atomically, a temporary file
+    /// renamed over it), so a server that is killed keeps what it learned.
+    fn save_tier_heat_if_due(&mut self) {
+        if self.tier_heat.is_none()
+            || !heat_save_due(self.heat_fresh, self.heat_saved.elapsed())
+            || self.heat_writer.as_ref().is_some_and(|t| !t.is_finished())
+        {
+            return;
+        }
+        self.heat_saved = std::time::Instant::now();
+        self.heat_fresh = false;
+        let Some((path, learned)) = self.tier_heat_ranked() else {
+            return;
+        };
+        let spawned = std::thread::Builder::new()
+            .name("legion-heat".into())
+            .spawn(move || {
+                let pairs = save_heat(&path, learned);
+                tracing::debug!(?pairs, "host expert tier: routing heat saved (periodic)");
+            });
+        self.heat_writer = spawned.ok();
     }
 
     /// Logs the expert-parallel steps' routed work since the last report (#729): per GPU its
@@ -3269,8 +3368,21 @@ impl ExpertResidency {
     /// staged layers without VRAM from the last one down, until their lent slots' bytes (the
     /// tail past [`Layer::keep`], or every slot) reach the device's bytes.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-    fn layers_left(&self, leave: &[(usize, u64)]) -> Vec<bool> {
+    fn layers_left(&self, leave: &[(usize, u64)], held: &[Vec<u32>]) -> Vec<bool> {
         let mut left = vec![false; self.layers.len()];
+        // The bounded host tier: the layers whose lent slots held the least routing heat
+        // (`held`: the experts each layer's lent slots held).
+        let heat: Option<Vec<f32>> = self.host.as_ref().map(|_| {
+            (0..self.layers.len())
+                .map(|il| {
+                    let (Some(l), Some(ids)) = (self.layers[il].as_ref(), held.get(il)) else {
+                        return 0.0;
+                    };
+                    let h = l.slots.heat();
+                    ids.iter().filter_map(|&e| h.get(e as usize)).sum()
+                })
+                .collect()
+        });
         for &(cuda, bytes) in leave {
             let Some(d) = self.devices.iter().position(|d| d.place.cuda == Some(cuda)) else {
                 continue;
@@ -3286,7 +3398,11 @@ impl ExpertResidency {
                     Some((0..3).map(|k| (n * l.expert_bytes[k]) as u64).sum())
                 })
                 .collect();
-            for (x, y) in left.iter_mut().zip(layers_left_for(&lent, bytes)) {
+            let chosen = match &heat {
+                Some(h) => layers_left_coldest(&lent, h, bytes),
+                None => layers_left_for(&lent, bytes),
+            };
+            for (x, y) in left.iter_mut().zip(chosen) {
                 *x |= y;
             }
         }
@@ -3308,7 +3424,7 @@ impl ExpertResidency {
             let t0 = std::time::Instant::now();
             // `leave`: layers kept without VRAM, and the devices whose staging goes (parked,
             // it would hold their lent slots' memory).
-            let left = self.layers_left(leave);
+            let left = self.layers_left(leave, &held);
             let leaving: Vec<bool> = (0..self.devices.len())
                 .map(|d| {
                     self.layers
@@ -3676,38 +3792,15 @@ impl Drop for ExpertResidency {
                 tracing::warn!(path = %path.display(), error = %e, "could not save the expert profile");
             }
         }
-        // The bounded host tier: the heat the cache ends with (what it keeps its slots by) is
-        // what the next load starts from; pairs only an older run routed to rank after it.
-        if let Some(path) = &self.tier_heat
-            && routed
-        {
-            let heat: Vec<Vec<f32>> = self
-                .layers
-                .iter()
-                .map(|l| {
-                    l.as_ref()
-                        .map_or_else(|| vec![0.0; self.n_expert], |l| l.slots.heat().to_vec())
-                })
-                .collect();
-            let mut learned = Profile::from_heat(&heat);
-            learned.n_expert = self.n_expert;
-            if let Ok(old) = Profile::read(path)
-                && old.n_expert == learned.n_expert
-                && old.n_layers == learned.n_layers
-            {
-                let mut seen: std::collections::HashSet<_> =
-                    learned.ranked.iter().copied().collect();
-                learned
-                    .ranked
-                    .extend(old.ranked.into_iter().filter(|p| seen.insert(*p)));
-            }
-            let saved = path
-                .parent()
-                .map_or(Ok(()), std::fs::create_dir_all)
-                .and_then(|()| learned.write(path));
-            match saved {
-                Ok(()) => tracing::info!(
-                    pairs = learned.ranked.len(),
+        // The bounded host tier: the heat the cache ends with is what the next load starts
+        // from (after a periodic save still being written).
+        if let Some(t) = self.heat_writer.take() {
+            let _ = t.join();
+        }
+        if let Some((path, learned)) = self.tier_heat_ranked() {
+            match save_heat(&path, learned) {
+                Ok(pairs) => tracing::info!(
+                    pairs,
                     "host expert tier: routing heat saved for the next load"
                 ),
                 Err(e) => {
@@ -3716,6 +3809,42 @@ impl Drop for ExpertResidency {
             }
         }
     }
+}
+
+/// How often the bounded host tier writes its routing heat file while steps are learned from
+/// (besides on exit): a killed server loses at most this much of what it learned.
+pub(crate) const HEAT_SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Whether a periodic save of the heat file is due: steps were learned from since the last
+/// one (`fresh`), [`HEAT_SAVE_EVERY`] ago or longer.
+pub(crate) fn heat_save_due(fresh: bool, since: std::time::Duration) -> bool {
+    fresh && since >= HEAT_SAVE_EVERY
+}
+
+/// Whether routing is not learned from: the startup warmup runs (`hold`) over slots a saved
+/// heat file filled (`seeded`).
+pub(crate) fn hold_applies(hold: bool, seeded: bool) -> bool {
+    hold && seeded
+}
+
+/// Writes the bounded host tier's heat ranking `learned` to `path` (atomically,
+/// [`Profile::write`]), the pairs only the file's older ranking holds (same model) after it.
+/// The pairs written.
+pub(crate) fn save_heat(path: &std::path::Path, mut learned: Profile) -> std::io::Result<usize> {
+    if let Ok(old) = Profile::read(path)
+        && old.n_expert == learned.n_expert
+        && old.n_layers == learned.n_layers
+    {
+        let mut seen: std::collections::HashSet<_> = learned.ranked.iter().copied().collect();
+        learned
+            .ranked
+            .extend(old.ranked.into_iter().filter(|p| seen.insert(*p)));
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    learned.write(path)?;
+    Ok(learned.ranked.len())
 }
 
 /// With the bounded host tier, a round of swaps plans this many times its budget while the
