@@ -997,6 +997,11 @@ impl Inner {
                     vram += 1;
                 }
                 Some(e) => {
+                    // An id past the layer's RAM slots and places would send the matmul
+                    // outside the tensor: an error here, not an illegal access there.
+                    if t.index[e] >= self.slots + GAP + self.places * self.sets {
+                        return Err(format!("layer {il}: expert {e} has no RAM slot or place"));
+                    }
                     *o = (n_slots + t.index[e]) as i32;
                     if t.cached[e] {
                         ram += 1;

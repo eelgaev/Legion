@@ -2295,8 +2295,14 @@ impl ExpertResidency {
 
     /// The bounded host tier: waits for the devices before the after-step work. Without the
     /// wait a kernel of a step soon after a restore read unmapped memory (an illegal access,
-    /// in both runs that lent the cache); with it none did. What the kernel raced with is
-    /// not known yet; decode measured the same with the wait.
+    /// in both runs that lent the cache); with it none did. Those runs lent the cache in the
+    /// startup warmup, on an empty cache. Since the cache is lent only to a long prompt the
+    /// fault has not come back: eight runs with a lend and a restore each, without the wait
+    /// or with a narrower one (the copy stream only, the staging stream only, only with a
+    /// refill pending, only after the refill, a sleep instead), all ran clean. So what the
+    /// kernel raced with is still not known, and the wait stays. It finds the device idle
+    /// (under 0.01 ms) at every after-step but the one that ends a staged pass, where the
+    /// staging stream has about 33 ms of copies left; decode measures the same with it.
     #[cfg(feature = "cuda")]
     fn tier_settled(&self) -> Result<(), String> {
         if self.host.is_none() {
