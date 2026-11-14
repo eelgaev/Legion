@@ -191,6 +191,93 @@ int legion_expert_mv_launch(int type, const legion_expert_mv * p, int smem, void
 // Returns a cudaError_t.
 int legion_expert_stage_launch(const legion_expert_stage * s, void * stream);
 
+// stage_prepare: the slot table of a layer whose idle peer may have copied a guess of its host
+// experts into prefetch slots one layer early (the peer prefetch). First it writes `now` to
+// `progress`, which stops every prefetch copy of a stamp up to `now` still running on the peer
+// (see legion_expert_prefetch). A prefetch slot j of the half (`pf_slots` of them) holds the
+// tiered id `pf_ids[j]` only if each of the copy's `pf_ctas` CTAs stamped its part with `seq`
+// (`stamps[j * pf_ctas + c]`); a slot not done in time is simply not used. A host expert of the
+// step that a done slot holds reads prefetch slot `pf_base + j`; the others are ranked as
+// stage_copy ranks them (t_every, t_take, cap) for the peer's copy inside the layer, which reads
+// `rest`: the step's ids with the prefetched experts' ids replaced by -1. With `x_keep`, the
+// layer's input (n_tok columns of k floats, x_nb2 bytes apart) is copied there for the peer's
+// guess of the next layer. Nothing here waits for the peer.
+struct legion_expert_prepare {
+    const int32_t * ids;   // [n_tok][n_used], ids_nb1 bytes per token
+    int64_t ids_nb1;
+    int32_t n_used, n_tok;
+    int32_t vram_below, n_w;
+    int32_t * table;       // out: an int32 slot per pair (-1: none)
+    int32_t * rest;        // out: [n_tok][n_used] packed
+    const uint64_t * stamps;  // [pf_slots][pf_ctas] (null: no prefetch for this layer)
+    const int32_t * pf_ids;   // [pf_slots]
+    int32_t pf_slots, pf_ctas;
+    uint64_t seq;          // the stamp of the copy made for this layer
+    uint64_t now;          // the newest stamp handed out
+    uint64_t * progress;   // out: now
+    int32_t pf_base;
+    int32_t cap, t_every, t_take;
+    int32_t k;
+    const char * x;
+    int64_t x_nb2;
+    float * x_keep;        // out: [n_tok][k] packed, or null
+    uint64_t * count;      // in/out: host experts, prefetched ones, prefetch slots done, launches
+};
+
+// The peer's copy of a guess into a prefetch half (the peer prefetch), on its own stream: the
+// first `cap` distinct host ids of `guess` (vram_below <= id < n_w, in the guess's order) take
+// slots 0, 1, ...; CTA 0 writes their ids to `pf_ids`. Each CTA copies its share of every slot's
+// n_seg matrices (src[m] + id * nb2[m] to the slot + off[m]), then stamps that slot with `seq`
+// (`stamps[j * gridDim.x + cta]`, behind a system fence). It stops as soon as the running GPU's
+// `progress` reaches `seq` (the layer it was for has started: what is not stamped then is not
+// used), and it starts a slot only if the slot's learned copy time ends before the learned time
+// of that FORK (`timing`), so it rarely runs beside that layer's own peer copies.
+struct legion_expert_prefetch {
+    const int32_t * guess;  // n_guess tiered ids
+    int32_t n_guess;
+    int32_t vram_below, n_w;
+    int32_t cap;            // slots of the half
+    char * slots;           // the half's first slot
+    int64_t slot;           // a slot's bytes
+    int32_t n_seg;
+    const char * src[3];
+    int64_t nb2[3];
+    int64_t off[3];
+    uint64_t * stamps;      // out: [cap][gridDim.x]
+    int32_t * pf_ids;       // out: [cap]
+    uint64_t seq;
+    const uint64_t * progress;  // the running GPU's (read volatile)
+    uint64_t * count;       // in/out: slots taken, copies stopped early, slots skipped (no time)
+    // in/out, the layer's: the time from the copy's start to the next FORK (ns), and a slot's
+    // copy time (ns), both learned by CTA 0 (0: not yet). A slot is started only if it ends
+    // before that FORK, so that a copy rarely runs beside the next layer's own peer copies.
+    uint64_t * timing;
+    int32_t ctas;
+};
+
+// Returns a cudaError_t.
+int legion_expert_prefetch_launch(const legion_expert_prefetch * s, void * stream);
+
+// Returns a cudaError_t.
+int legion_expert_prepare_launch(const legion_expert_prepare * s, void * stream);
+
+// The peer's guess of a layer's routing: the layer's F32 or F16 router `w` over the input of the layer
+// before it (`x`, stage_prepare's copy), the n_used largest logits per token looked up in the
+// layer's table of tiered ids. Two launches: the logits, then the ids. A guess: sums in another
+// order than the router's own op.
+struct legion_expert_guess {
+    const void * w;         // [n_expert][k], contiguous, F32 or F16 (w_f16)
+    const float * x;        // [n_tok][k] packed
+    int32_t k, n_expert, n_tok, n_used;
+    int32_t w_f16;
+    float * logits;         // scratch: [n_tok][n_expert]
+    const int32_t * table;  // n_expert tiered ids
+    int32_t * guess;        // out: [n_used][n_tok] packed (rank-major)
+};
+
+// Returns a cudaError_t.
+int legion_expert_guess_launch(const legion_expert_guess * s, void * stream);
+
 }  // extern "C"
 
 namespace {

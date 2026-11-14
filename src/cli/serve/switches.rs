@@ -758,6 +758,17 @@ pub(in crate::cli) struct SwitchArgs {
     /// comparisons.
     #[arg(long, help_heading = HEADING)]
     no_expert_peer_fetch: bool,
+    /// Opt-in, only where --expert-peer-fetch is on by the automatic choice for a layer split
+    /// over one NVLink pair (two V100s of an AC922; ignored elsewhere): the idle peer also
+    /// guesses the next layer's missed experts (that layer's router over this layer's input,
+    /// computed on the peer) and copies up to 4 of them into VRAM while this layer computes; the
+    /// next layer reads those whose copy finished in time from there and never waits for the
+    /// rest. The same output bits either way (a wrong or late guess is not used). Takes ~30 MB
+    /// more VRAM per GPU. Measured on Qwen3.8-Flash-Next it serves 16% of the misses but still
+    /// decodes one user ~2.5% slower (the fixed cost of the guess and the handoff on every
+    /// layer), so it stays off.
+    #[arg(long, help_heading = HEADING)]
+    expert_peer_prefetch: bool,
     /// --expert-peer-fetch without --expert-miss-overlap: the idle peer stages TAKE of every
     /// EVERY of a layer's missed experts (in the order of their first use, at most TAKE/EVERY of
     /// 16 a layer), the running GPU reads the rest in place over its own host link. Default 1/2
@@ -1581,6 +1592,7 @@ impl SwitchArgs {
             } else {
                 self.no_expert_peer_fetch.then_some(false)
             },
+            expert_peer_prefetch: self.expert_peer_prefetch.then_some(true),
             expert_peer_share: self.expert_peer_share,
             expert_peer_ctas: self.expert_peer_ctas.map(usize::from),
             qsa_scores_tc: self.qsa_scores_tc.then_some(true),

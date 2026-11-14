@@ -1651,7 +1651,7 @@ unsafe fn split_launch(
 ) -> Result<(), String> {
     let mut st = o.stage;
     let n_pairs = o.n_used * o.n_tok;
-    let hdr = overlap::stage_header(n_pairs);
+    let mut hdr = overlap::stage_header(n_pairs);
     let nb2 = o.w_nb[2];
     let fork = o.split == overlap::FORK;
     let side = o.mode & overlap::MODE_SIDE != 0;
@@ -1664,18 +1664,57 @@ unsafe fn split_launch(
         (true, true) => peer::link([o.w, o.w2, st.down])?,
         (true, false) => peer::forked(),
     };
+    let mut ahead = None;
+    // The bytes from a slot to the next (with the peer prefetch: the device's largest slot).
+    let mut stride = slot;
     if !side {
         let Some(l) = link else {
             // No idle peer: the pair of ops as without the switch.
             return launch(p, stream);
         };
-        st.bytes = hdr + st.slots * slot;
-        // SAFETY: `stream` is the current device's, the link's; only this stream's ops use it.
-        st.buf = unsafe { peer::buffer(stream, l, st.bytes)? };
+        // With the peer prefetch (#519): the buffer with the prefetch slots, its slot table
+        // written here from the peer's guess for this layer; the JOIN op follows its FORK op.
+        ahead = if fork {
+            let op = peer::prefetch::Op {
+                ids: o.ids as *const i32,
+                ids_nb1: o.ids_nb1,
+                n_used: o.n_used,
+                n_tok: o.n_tok,
+                stacks: [o.w, o.w2, st.down],
+                nb2: [nb2, st.down_nb2],
+                vram_below: o.vram_below,
+                n_w: o.n_w,
+                slot,
+                cap: st.slots,
+                // The layer's input, when it is one F32 column per token.
+                x: if o.n_x == 1 && o.x_nb[0] == 4 {
+                    o.x
+                } else {
+                    std::ptr::null()
+                },
+                x_nb2: o.x_nb[2],
+                k: o.k,
+            };
+            // SAFETY: as the caller promises; the link is this device's and reads these stacks.
+            unsafe { peer::prefetch::fork(stream, l, &op)? }
+        } else {
+            peer::prefetch::forked()
+        };
+        match ahead {
+            Some(a) => (hdr, stride, st.bytes, st.buf) = (a.hdr, a.slot, a.bytes, a.buf),
+            None => {
+                st.bytes = hdr + st.slots * slot;
+                // SAFETY: `stream` is the current device's, the link's; only this stream's ops
+                // use it.
+                st.buf = unsafe { peer::buffer(stream, l, st.bytes)? };
+            }
+        }
     }
     let ok = !st.buf.is_null()
         && st.slots > 0
-        && st.bytes >= hdr + st.slots * slot
+        && st.bytes >= hdr + st.slots * stride
+        && stride >= slot
+        && stride.is_multiple_of(16)
         && (!fork || !(st.down.is_null() || o.w2.is_null()))
         && (!fork || slot == 2 * nb2 + st.down_nb2)
         && slot >= nb2
@@ -1695,7 +1734,7 @@ unsafe fn split_launch(
         steps: 2,
         stage: st.buf,
         stage_hdr: hdr as i64,
-        stage_slot: slot as i64,
+        stage_slot: stride as i64,
         // FORK: gate at 0, up after it; JOIN: down last.
         stage_w: if fork { 0 } else { (slot - nb2) as i64 },
         stage_w2: nb2 as i64,
@@ -1717,16 +1756,21 @@ unsafe fn split_launch(
         // beside the side stream every rank takes a slot and the peer fills the odd ones.
         let (every, take) = peer::share();
         let ranks = if side { (1, 1) } else { (every, take) };
+        // With the peer prefetch the peer ranks the ids left (those it has not brought already).
+        let (ids, ids_nb1) = match ahead {
+            Some(a) => (a.rest, o.n_used * 4),
+            None => (o.ids as *const i32, o.ids_nb1),
+        };
         let gate_up = overlap::StageParams {
-            ids: o.ids as *const i32,
-            ids_nb1: o.ids_nb1 as i64,
+            ids,
+            ids_nb1: ids_nb1 as i64,
             n_used: o.n_used as i32,
             n_tok: o.n_tok as i32,
             vram_below: o.vram_below,
             n_w: o.n_w as i32,
             stage: st.buf,
             hdr: hdr as i64,
-            slot: slot as i64,
+            slot: stride as i64,
             cap: st.slots as i32,
             table: 0,
             n_seg: 2,
@@ -1751,6 +1795,10 @@ unsafe fn split_launch(
             // SAFETY: as the caller promises; the peer reaches the ids and the buffer (this
             // device's memory) and the stacks' host parts (mapped for it when it was connected).
             unsafe { peer::fork(stream, l, &gate_up, &down)? };
+            if let Some(a) = &ahead {
+                // SAFETY: as above; behind the layer's own copies on the peer's stream.
+                unsafe { peer::prefetch::ahead(l, a)? };
+            }
         }
         // The activations, all columns.
         launch(LaunchParams { steps: 1, ..p }, stream)?;
@@ -1783,7 +1831,7 @@ unsafe fn split_launch(
                 overlap::stage(&down, s)?;
                 overlap::mark(stream, 1)?;
             }
-        } else {
+        } else if ahead.is_none() {
             // Only the slot table, on this stream, for the launches below.
             let table = overlap::StageParams {
                 n_seg: 0,
@@ -1807,7 +1855,12 @@ unsafe fn split_launch(
             peer::wait(stream, l, which)?;
         }
     }
-    launch(staged, stream)
+    launch(staged, stream)?;
+    if let (false, Some(l), Some(_)) = (fork, link, ahead) {
+        // SAFETY: as the caller promises; the FORK op of this pair ran with the prefetch.
+        unsafe { peer::prefetch::join(stream, l)? };
+    }
+    Ok(())
 }
 
 pub mod ahead;

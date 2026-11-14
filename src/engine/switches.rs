@@ -279,6 +279,9 @@ pub struct Switches {
     /// ([`crate::model::core::expert_mv::peer::set_enabled`]); `None`: the automatic choice
     /// ([`crate::model::core::expert_mv::peer::auto`]).
     pub expert_peer_fetch: Option<bool>,
+    /// The peer also fetches a guess of the next layer's missed experts (opt-in)
+    /// ([`crate::model::core::expert_mv::peer::prefetch::set_enabled`]).
+    pub expert_peer_prefetch: Option<bool>,
     /// The peer's share of a layer's missed experts
     /// ([`crate::model::core::expert_mv::peer::set_share`]).
     pub expert_peer_share: Option<crate::model::core::expert_mv::peer::Share>,
@@ -730,6 +733,10 @@ impl Switches {
         set(self.expert_mv_half_tiles, expert_mv::set_half_tiles);
         set(self.expert_miss_overlap, expert_mv::overlap::set_enabled);
         set(self.expert_peer_fetch, expert_mv::peer::set_enabled);
+        set(
+            self.expert_peer_prefetch,
+            expert_mv::peer::prefetch::set_enabled,
+        );
         if let Some(sh) = self.expert_peer_share {
             expert_mv::peer::set_share(sh.take, sh.every);
         }
