@@ -496,6 +496,94 @@ impl SwapRule {
     }
 }
 
+/// Logged steps of a device per [`ChurnControl`] window.
+pub const CHURN_WINDOW: u32 = 64;
+
+/// A window's hit rate above the last one's by more than this is still rising...
+pub const CHURN_RISE: f64 = 0.005;
+
+/// ...and below it by more than this has fallen (the routing moved, e.g. a new conversation).
+pub const CHURN_DROP: f64 = 0.02;
+
+/// The swap margin grows to at most this multiple of the rule's while the hit rate is flat.
+pub const CHURN_MAX: f32 = 4.0;
+
+/// Swap-in churn control of one device (#519): while its hit rate stops rising, swaps mostly
+/// trade one about-as-warm expert for another (on 2 V100s about 16 copies a step at a flat
+/// hit rate), each copy taking link time the next step's missed experts need. So once a
+/// window's hit rate is not above the last one's, the swap margin doubles (up to
+/// [`CHURN_MAX`] times the rule's); a rising rate halves it again, a falling one (the routing
+/// moved) puts it straight back. Cache contents only: the outputs are the same bits.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChurnControl {
+    steps: u32,
+    /// The device's hits and misses at the window's start.
+    start: (u64, u64),
+    last: Option<f64>,
+    factor: f32,
+    on: bool,
+}
+
+impl ChurnControl {
+    /// `on` false: the margin stays the rule's (the default; see [`churn_on`]).
+    pub fn new(on: bool) -> Self {
+        Self {
+            steps: 0,
+            start: (0, 0),
+            last: None,
+            factor: 1.0,
+            on,
+        }
+    }
+
+    /// One logged step of the device; `hits` and `misses` its counts since the start.
+    pub fn step(&mut self, hits: u64, misses: u64) {
+        self.steps += 1;
+        if self.steps < CHURN_WINDOW {
+            return;
+        }
+        let (h, m) = (hits - self.start.0, misses - self.start.1);
+        self.steps = 0;
+        self.start = (hits, misses);
+        if h + m == 0 {
+            return;
+        }
+        let rate = h as f64 / (h + m) as f64;
+        if let Some(last) = self.last {
+            self.factor = if rate < last - CHURN_DROP {
+                1.0
+            } else if rate > last + CHURN_RISE {
+                (self.factor / 2.0).max(1.0)
+            } else {
+                (self.factor * 2.0).min(CHURN_MAX)
+            };
+        }
+        self.last = Some(rate);
+    }
+
+    /// The multiple of the rule's margin the device swaps with now.
+    pub fn factor(&self) -> f32 {
+        if self.on { self.factor } else { 1.0 }
+    }
+
+    /// `rule` with its margin raised by [`Self::factor`].
+    pub fn rule(&self, rule: SwapRule) -> SwapRule {
+        SwapRule {
+            margin: rule.margin * self.factor(),
+            ..rule
+        }
+    }
+}
+
+/// Whether [`ChurnControl`] raises the swap margin: only with `LEGION_DEBUG_SWAP_CHURN=on`
+/// (`debug`: the variable's value; an A/B switch). On an AC922 with 2 GPUs it is a tie (1 user
+/// 76.4/77.6 vs 76.4/77.8): the hit rate there drifts with the routing, and fewer swaps lose it
+/// (a fixed margin 4 / 8: 7.9 / 4.0 swaps a step vs 14.9, hit rate 0.59 / 0.52 vs 0.60, chats -2% /
+/// -9%).
+pub fn churn_on(debug: Option<&str>) -> bool {
+    debug.is_some_and(|v| v.trim() == "on")
+}
+
 /// Plans up to `rule.budget` swaps over `layers` (index = layer id), the largest heat gains
 /// first, and marks them started (old entries leave the table now; new ones join on
 /// [`LayerSlots::complete`]). The caller copies each new expert into its slot.

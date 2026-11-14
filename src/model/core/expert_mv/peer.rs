@@ -207,6 +207,34 @@ pub(super) fn share() -> (i32, i32) {
     (every as i32, take.clamp(1, every) as i32)
 }
 
+/// `LEGION_DEBUG_PEER_SHARE`, read once (#519, an A/B switch): unset, the waits are neither
+/// timed nor followed ([`probe`]).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn share_debug() -> Option<&'static str> {
+    static V: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    V.get_or_init(|| std::env::var("LEGION_DEBUG_PEER_SHARE").ok())
+        .as_deref()
+}
+
+/// Whether the share follows the running GPU's measured wait for the peer ([`probe`], #519):
+/// only with `LEGION_DEBUG_PEER_SHARE=auto` and no `--expert-peer-share`.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(super) fn share_is_auto() -> bool {
+    probe::auto_share(SHARE_TAKE.load(Ordering::Relaxed) != 0, share_debug())
+}
+
+/// `(every, take)` of the FORK op of `l`'s device now: [`share`], unless [`share_is_auto`]:
+/// then the share [`probe::ShareControl`] picked for the device from its waits (the slots stay
+/// [`slots`]' count, so a larger share fills at most those).
+#[cfg(feature = "cuda")]
+pub(super) fn share_now(l: Link) -> (i32, i32) {
+    if !share_is_auto() {
+        return share();
+    }
+    let (take, every) = probe::share_of(l.device);
+    (every as i32, take as i32)
+}
+
 /// Staging slots of a pair of ops the peer fills alone: its share of `pairs` slots.
 pub(super) fn slots(pairs: usize) -> usize {
     let (every, take) = share();
@@ -510,6 +538,20 @@ pub(super) unsafe fn fork(
     }
 }
 
+/// A FORK op over `l` starts on `main`: the join-wait counter may time it ([`probe`]), only
+/// while `LEGION_DEBUG_PEER_SHARE` is set.
+///
+/// # Safety
+/// `main` is a live stream of the link's device, the current device.
+#[cfg(feature = "cuda")]
+pub(super) unsafe fn probe_start(main: *mut c_void, l: Link) {
+    if share_debug().is_none() {
+        return;
+    }
+    // SAFETY: as the caller promises.
+    unsafe { probe::fork_start(l.device, main) }
+}
+
 /// The link the last FORK op on this thread got from [`link`] (the JOIN op's).
 #[cfg(feature = "cuda")]
 pub(super) fn forked() -> Option<Link> {
@@ -529,6 +571,8 @@ pub(super) unsafe fn wait(main: *mut c_void, l: Link, which: usize) -> Result<()
         "cudaStreamWaitEvent",
     )
 }
+
+pub(super) mod probe;
 
 #[cfg(test)]
 mod tests;
