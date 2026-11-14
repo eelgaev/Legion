@@ -116,6 +116,7 @@ pub fn run(cfg: &PoolBench, line: &mut dyn FnMut(String)) -> std::io::Result<()>
                                 max_tok: n_tok,
                                 max_used: n_used,
                                 n_embd: ne,
+                                exact: None,
                             },
                         };
                         let t = Instant::now();

@@ -3986,9 +3986,20 @@ fn share_setup(
     found: &[Option<(LayerPlace, [Tensor<'_>; 3])>],
 ) -> Result<u32, String> {
     use super::cpu_share::{DevicePlan, HostExperts, format_of, setup, threshold};
-    // POWER9 (AC922) only: its host link is the one the share relieves; elsewhere a no-op.
-    if !cfg!(all(target_arch = "powerpc64", target_endian = "little")) {
-        tracing::warn!("--cpu-expert-share is POWER9 (ppc64le) only; ignored on this host");
+    use crate::cpu::gpu_exact;
+    // POWER9 (AC922): the host kernels' share (outputs move). x86 with AVX2, FMA and F16C: the
+    // exact share, the GPU kernels' bits (#37). Elsewhere a no-op.
+    let power9 = cfg!(all(target_arch = "powerpc64", target_endian = "little"));
+    let exact = cfg!(target_arch = "x86_64") && gpu_exact::simd();
+    if !power9 && !exact {
+        tracing::warn!(
+            "--cpu-expert-share needs POWER9 (ppc64le) or x86 with AVX2, FMA and F16C; ignored \
+             on this host"
+        );
+        return Ok(0);
+    }
+    if power9 && cfg.cpu_share.auto {
+        tracing::warn!("--cpu-expert-share auto is the exact share (x86) only; the share is off");
         return Ok(0);
     }
     let mut plans: Vec<DevicePlan> = Vec::new();
@@ -4019,6 +4030,19 @@ fn share_setup(
             n_ff: ts[1].ne()[1] as usize,
             n_expert: ts[1].ne()[2] as usize,
         };
+        // The exact share: formats the host computes the kernels' bits of, whole Q8_1 blocks.
+        if exact
+            && (gpu_exact::units_per_row(up_gate, he.n_embd).is_none()
+                || gpu_exact::units_per_row(down, he.n_ff).is_none()
+                || !he.n_embd.is_multiple_of(256)
+                || !he.n_ff.is_multiple_of(32))
+        {
+            tracing::warn!(
+                layer = il,
+                "cpu expert share: no exact host kernels for the experts, layer left to the GPU"
+            );
+            continue;
+        }
         let plan = match plans.iter_mut().find(|d| d.device == device) {
             Some(d) => d,
             None => {
@@ -4028,6 +4052,7 @@ fn share_setup(
                     node,
                     layers: Vec::new(),
                     n_embd: he.n_embd,
+                    exact,
                 });
                 plans.last_mut().unwrap()
             }

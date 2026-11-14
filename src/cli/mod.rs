@@ -8,6 +8,7 @@ mod completions;
 mod cpu_bench;
 mod dense_mv_bench;
 mod ep_place;
+mod expert_cpu_proof;
 mod expert_mv_ptx_bench;
 mod fp8_sliced_bench;
 mod gdn_bench;
@@ -107,6 +108,10 @@ enum Command {
     /// Check and benchmark the host CPU kernels and the CPU expert share's pool (development).
     #[command(hide = true)]
     CpuBench(cpu_bench::CpuBenchArgs),
+    /// Check on the host the bits of the GPU decode kernels' expert products, and time the
+    /// host kernels that reproduce them (development).
+    #[command(hide = true)]
+    ExpertCpuProof(expert_cpu_proof::ExpertCpuProofArgs),
     /// Measure GPU-to-GPU exchange latency and host-memory read bandwidth (development).
     #[command(hide = true)]
     CommBench(comm_bench::CommBenchArgs),
@@ -249,6 +254,7 @@ async fn run(cli: Cli, numa: Option<legion::hw::numa_bind::Placement>) -> anyhow
         Command::EpPlace(args) => ep_place::run(args),
         Command::SsdReplay(args) => ssd_replay::run(args),
         Command::CpuBench(args) => cpu_bench::run(args),
+        Command::ExpertCpuProof(args) => expert_cpu_proof::run(args),
         Command::CommBench(args) => comm_bench::run(args),
         Command::ExpertMvPtxBench(args) => expert_mv_ptx_bench::run(args),
         Command::MmqIdsBench(args) => mmq_ids_bench::run(args),

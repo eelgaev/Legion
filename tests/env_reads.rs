@@ -13,6 +13,10 @@ const ALLOWED: &[(&str, &str)] = &[
     ("src/ggml/meta.rs", "LEGION_META_DEBUG"),
     ("src/ggml/op_profile.rs", "LEGION_OP_PROFILE"),
     ("src/hf/deepseek41/hash/tests.rs", "LEGION_TEST_DS41_HF"),
+    (
+        "src/model/core/expert_mv/dump.rs",
+        "LEGION_DEBUG_EXPERT_DUMP",
+    ),
     ("src/model/moe_ffn/tests.rs", "LEGION_MOE_SPEED_TYPES"),
     ("src/model/qwen4/qsa_attn/tests.rs", "LEGION_TINY"),
     (

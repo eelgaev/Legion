@@ -217,6 +217,7 @@ fn pool_matches_the_reference() {
             max_tok: n_tok,
             max_used: n_used,
             n_embd,
+            exact: None,
         };
         let job = Job {
             seq: seq.div_ceil(2),
@@ -287,6 +288,7 @@ fn pool_waits_for_a_late_publish() {
             max_tok: n_tok,
             max_used: n_used,
             n_embd,
+            exact: None,
         },
     };
     pool.submit(queue, job);
@@ -347,6 +349,7 @@ fn stopping_the_pool_releases_queued_jobs() {
                     max_tok: n_tok,
                     max_used: n_used,
                     n_embd,
+                    exact: None,
                 },
             },
         );
@@ -363,4 +366,158 @@ fn stopping_the_pool_releases_queued_jobs() {
     pool.stop();
     drop(pool);
     assert_eq!(done.load(Ordering::Acquire), 2);
+}
+
+#[test]
+fn exact_layout_follows_the_plain_one() {
+    let l = Layout::new(2560);
+    let e = ExactLayout::new(l.bytes, 2560, 640, 48);
+    assert!(e.gu_done >= l.bytes);
+    let flags = [e.gu_done, e.act_ready, e.act_arrived, e.n_miss];
+    assert!(
+        flags.windows(2).all(|w| w[1] - w[0] >= 128),
+        "flags share a cache line"
+    );
+    assert!(e.n_miss + 4 <= e.thr && e.thr + 48 * 4 <= e.cost && e.cost + 48 * 4 <= e.xq);
+    let pairs = ops::MAX_TOKENS * ops::MAX_USED;
+    assert!(e.xq + ops::MAX_TOKENS * 2560 / 32 * 36 <= e.gu);
+    assert!(e.gu + pairs * 2 * 640 * 4 <= e.aq);
+    assert_eq!(e.bytes, e.aq + pairs * 640 / 32 * 36);
+    assert!([e.thr, e.cost, e.xq, e.gu, e.aq].iter().all(|o| o % 4 == 0));
+}
+
+#[test]
+fn split_balances_link_and_pool() {
+    use super::pool::split;
+    assert_eq!(split(100.0, 100.0, THRESHOLD_ONE), 512);
+    assert_eq!(split(120.0, 60.0, THRESHOLD_ONE), 683);
+    assert_eq!(split(120.0, 60.0, 600), 600);
+    assert_eq!(split(100.0, 0.0, THRESHOLD_ONE), THRESHOLD_ONE);
+    assert_eq!(split(0.0, 10.0, THRESHOLD_ONE), 0);
+    assert_eq!(split(f64::NAN, 10.0, THRESHOLD_ONE), 0);
+}
+
+/// `n` random block_q8_1 (an f16 scale and sum, 32 quants).
+fn q8_1_blocks(rng: &mut Rng, n: usize) -> Vec<u8> {
+    use crate::cpu::gpu_exact::f32_to_f16;
+    let mut out = Vec::with_capacity(n * 36);
+    for _ in 0..n {
+        let d = f32_to_f16(rng.f().abs() * 0.02 + 1e-4);
+        let s = f32_to_f16(rng.f() * 4.0);
+        out.extend_from_slice(&d.to_le_bytes());
+        out.extend_from_slice(&s.to_le_bytes());
+        out.extend((0..32).map(|_| (rng.f() * 127.0) as i8 as u8));
+    }
+    out
+}
+
+/// The exact pool, driven as the GPU drives it (ready, gate/up done, act ready, done): its
+/// gate and up sums and down rows are `gpu_exact::matvec`'s of the published blocks, bit for
+/// bit, for every host pair (each expert's pairs of several tokens); other pairs untouched.
+#[test]
+fn exact_pool_matches_gpu_exact() {
+    use std::sync::atomic::Ordering;
+
+    use super::pool::ExactExchange;
+    use crate::cpu::gpu_exact::matvec;
+
+    let (n_embd, n_ff, n_expert, n_used, n_tok) = (512, 256, 6, 4, 3);
+    let (_kinds, he) = experts(n_embd, n_ff, n_expert);
+    let mut rng = Rng(21);
+    let ids: Vec<i32> = (0..n_tok * n_used)
+        .map(|i| if i % 3 == 1 { -1 } else { (i % 5) as i32 })
+        .collect();
+    let xq = q8_1_blocks(&mut rng, n_tok * n_embd / 32);
+    let aq = q8_1_blocks(&mut rng, n_tok * n_used * n_ff / 32);
+    let mut gu = vec![-7.0f32; n_tok * n_used * 2 * n_ff];
+    let mut out = vec![-7.0f32; n_tok * n_used * n_embd];
+    let flags: Vec<AtomicU32> = (0..6).map(|_| AtomicU32::new(0)).collect();
+    let thr = [AtomicU32::new(512)];
+    let mut cost = [0.0f32];
+    let n_miss = AtomicU32::new(4);
+    let pool = Pool::new(&[], 4);
+    let queue = pool.add_queue();
+    let job = Job {
+        seq: 1,
+        layer: 0,
+        n_tok,
+        n_used,
+        experts: he,
+        exchange: Exchange {
+            ready: &flags[0],
+            done: &flags[1],
+            arrived: std::ptr::null(),
+            ids: ids.as_ptr(),
+            x: std::ptr::null(),
+            out: out.as_mut_ptr(),
+            max_tok: n_tok,
+            max_used: n_used,
+            n_embd,
+            exact: Some(ExactExchange {
+                gu_done: &flags[2],
+                act_ready: &flags[3],
+                act_arrived: &flags[4],
+                n_miss: &n_miss,
+                thr: thr.as_ptr(),
+                cost: cost.as_mut_ptr(),
+                n_layers: 1,
+                xq: xq.as_ptr(),
+                gu: gu.as_mut_ptr(),
+                aq: aq.as_ptr(),
+                n_ff,
+                auto: true,
+                cap: THRESHOLD_ONE,
+                link_us_per_byte: 1e-4,
+            }),
+        },
+    };
+    pool.submit(queue, job);
+    flags[0].store(1, Ordering::Release);
+    let wait = |f: &AtomicU32| {
+        let start = std::time::Instant::now();
+        while f.load(Ordering::Acquire) != 1 {
+            assert!(start.elapsed().as_secs() < 30, "pool stuck");
+            std::hint::spin_loop();
+        }
+    };
+    wait(&flags[2]);
+    assert_eq!(flags[1].load(Ordering::Acquire), 0, "done before act ready");
+    flags[3].store(1, Ordering::Release);
+    wait(&flags[1]);
+    let (xb, ab) = (n_embd / 32 * 36, n_ff / 32 * 36);
+    for (pair, &e) in ids.iter().enumerate() {
+        let (sums, row) = (
+            &gu[pair * 2 * n_ff..][..2 * n_ff],
+            &out[pair * n_embd..][..n_embd],
+        );
+        if e < 0 {
+            assert!(
+                sums.iter().chain(row).all(|&v| v == -7.0),
+                "pair {pair} touched"
+            );
+            continue;
+        }
+        let t = pair / n_used;
+        // SAFETY: the experts live in `_kinds`.
+        let (up, gate, down) = unsafe {
+            (
+                he.expert(0, e as usize),
+                he.expert(1, e as usize),
+                he.expert(2, e as usize),
+            )
+        };
+        let x = &xq[t * xb..][..xb];
+        let (mut g, mut u, mut o) = (vec![0.0; n_ff], vec![0.0; n_ff], vec![0.0; n_embd]);
+        matvec(he.up_gate, gate, x, n_embd, &mut g).unwrap();
+        matvec(he.up_gate, up, x, n_embd, &mut u).unwrap();
+        matvec(he.down, down, &aq[pair * ab..][..ab], n_ff, &mut o).unwrap();
+        let bits = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits());
+        assert!(bits(&sums[..n_ff], &g), "pair {pair}: gate");
+        assert!(bits(&sums[n_ff..], &u), "pair {pair}: up");
+        assert!(bits(row, &o), "pair {pair}: down");
+    }
+    drop(pool);
+    // The layer's share followed the measured cost.
+    assert!(cost[0] > 0.0);
+    assert!((1..=THRESHOLD_ONE).contains(&thr[0].load(Ordering::Relaxed)));
 }

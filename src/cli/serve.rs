@@ -335,15 +335,17 @@ pub(super) struct ModelArgs {
     /// the same outputs. At several sequences it also folds different users' routings.
     #[arg(long, value_name = "ROUTINGS", value_parser = non_negative, default_value_t = 0.0)]
     pub expert_heat_pass_cap: f32,
-    /// Hybrid decode (opt-in, POWER9 + CUDA only, ignored elsewhere; decode and verify steps of
-    /// up to 8 tokens): the host
+    /// Hybrid decode (opt-in, CUDA; decode and verify steps of up to 8 tokens): the host
     /// computes this share of each MoE layer's missed experts (those read from host memory) on
     /// a pinned worker pool per NUMA node while the GPU computes the rest, cutting the bytes the
-    /// GPU reads over the link. 0 (the default) is off. Changes outputs slightly (the host
-    /// kernels sum in another order than the GPU's). From Strata-AC922's POWER9 CPU expert
-    /// share (`--pcie-frac`).
-    #[arg(long, value_parser = share_fraction, default_value_t = 0.0)]
-    pub cpu_expert_share: f32,
+    /// GPU reads over the link. 0 (the default) is off. POWER9: changes outputs slightly (the
+    /// host kernels sum in another order than the GPU's). x86 with AVX2, FMA and F16C: the
+    /// same outputs (the host computes the GPU kernels' bits; the activations' quantization
+    /// and SwiGLU stay on the GPU), and `auto` sets each layer's share from the link's and the
+    /// pool's measured time per expert. Ignored elsewhere. From Strata-AC922's POWER9 CPU
+    /// expert share (`--pcie-frac`).
+    #[arg(long, value_name = "SHARE|auto", value_parser = share_arg, default_value = "0")]
+    pub cpu_expert_share: ShareArg,
     /// Worker threads of each NUMA node's `--cpu-expert-share` pool (0: `--cpu-expert-smt`
     /// per core of the node, less two cores left to the engine's threads).
     #[arg(long, default_value_t = 0)]
@@ -1069,7 +1071,8 @@ impl ModelArgs {
             stage_below: None,
             learn_long: !self.no_prefill_learn,
             cpu_share: legion::residency::cpu_share::CpuShareConfig {
-                share: self.cpu_expert_share,
+                share: self.cpu_expert_share.share,
+                auto: self.cpu_expert_share.auto,
                 workers: self.cpu_expert_workers,
                 smt: self.cpu_expert_smt as usize,
             },
@@ -2530,6 +2533,24 @@ fn share_fraction(value: &str) -> Result<f32, String> {
     } else {
         Err(format!("must be in [0, 1], got {value}"))
     }
+}
+
+/// `--cpu-expert-share`: a share in `[0, 1]`, or `auto` (the exact share's measured split, at
+/// most all of the misses).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShareArg {
+    pub share: f32,
+    pub auto: bool,
+}
+
+fn share_arg(value: &str) -> Result<ShareArg, String> {
+    if value == "auto" {
+        return Ok(ShareArg {
+            share: 1.0,
+            auto: true,
+        });
+    }
+    share_fraction(value).map(|share| ShareArg { share, auto: false })
 }
 
 /// The heat decay: in (0, 1] (0 would forget every routing at once, NaN freeze the cache).

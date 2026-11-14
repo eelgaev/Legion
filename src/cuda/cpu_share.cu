@@ -8,6 +8,15 @@
 //   the host's pairs replaced by -2, which the expert matvecs skip.
 // - `collect` copies the down projection's output, with the host's rows (from the exchange
 //   buffer) for the pairs marked -2, after the stream waited for the host's "done" flag.
+//
+// The exact share (x86, `exact`; src/cpu/gpu_exact.rs computes the expert matvecs' bits on the
+// host): `publish` writes x as the Q8_1 blocks the expert kernels' quantize_x makes of it (not
+// f32) and gives the host the first of the step's distinct host experts in routing order (the
+// link keeps the last ones); `activate`, between the SwiGLU and down ops, makes the host's
+// pairs' SwiGLU from the raw gate and up sums the host wrote (the kernels' own `swiglu`, whose
+// MUFU approximations the host cannot reproduce) and their Q8_1 blocks for the host's down rows.
+
+#include "expert_mv/common.cuh"
 
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -27,6 +36,21 @@ struct legion_cpu_share_publish {
     int32_t * ids_host;   // [n_tok][n_used]: the host's expert, or -1 (the exchange buffer)
     float * x_host;       // [n_tok][k], dense (the exchange buffer)
     int32_t * ids_dev;    // [n_tok][n_used]: the ids, -2 for the host's pairs (the op's output)
+    int32_t exact;        // non-zero: the exact share (x_host unused, the fields below)
+    const uint32_t * thr; // non-null: the share of 1024 to take (threshold unused), host-written
+    void * xq_host;       // [n_tok][k / 32] block_q8_1 of x (the exchange buffer)
+    uint32_t * n_miss;    // the step's distinct host experts (the exchange buffer)
+};
+
+struct legion_cpu_share_activate {
+    const int32_t * ids;  // [n_tok][n_used], dense: publish's output
+    int32_t n_used, n_tok, rows;
+    const float * src;    // the SwiGLU op's output, [n_tok][n_used][rows]
+    int64_t src_nb1, src_nb2;
+    const float * gu;     // the host's raw sums, [n_tok][n_used][2][rows]: gate, then up
+    void * aq;            // [n_tok][n_used][rows / 32] block_q8_1 of the host pairs' SwiGLU
+    float * dst;          // the op's output, dense
+    float limit;          // the SwiGLU op's clamp (0: none)
 };
 
 struct legion_cpu_share_collect {
@@ -40,6 +64,7 @@ struct legion_cpu_share_collect {
 
 int legion_cpu_share_publish_launch(const legion_cpu_share_publish * p, void * stream);
 int legion_cpu_share_collect_launch(const legion_cpu_share_collect * p, void * stream);
+int legion_cpu_share_activate_launch(const legion_cpu_share_activate * p, void * stream);
 
 }  // extern "C"
 
@@ -48,11 +73,36 @@ namespace {
 constexpr int MAX_PAIRS = 128;  // ops::MAX_TOKENS x ops::MAX_USED
 constexpr int HOST_PAIR = -2;
 
-// Block 0 picks the host's experts; blocks 1.. copy one token's activations each.
+// Value `el` of a column `col` (k values, k a multiple of 32) as quantize_x writes it
+// (src/cuda/expert_mv/common.cuh, the same operations): the warp holds one 32-value block.
+__device__ __forceinline__ void quantize_q8_1_el(const float xi, block_q8_1 * col, const int el) {
+    float amax    = fabsf(xi);
+    float sum     = xi;
+    amax          = warp_reduce_max<QK8_1>(amax);
+    sum           = warp_reduce_sum<QK8_1>(sum);
+    const float d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    block_q8_1 * b    = col + el / QK8_1;
+    b->qs[el % QK8_1] = q;
+    if (el % QK8_1 == 0) {
+        b->ds = make_half2(d, sum);
+    }
+}
+
+// Block 0 picks the host's experts; blocks 1.. copy one token's activations each (exact: its
+// Q8_1 blocks).
 __global__ void publish(const legion_cpu_share_publish p) {
     if (blockIdx.x > 0) {
         const int t = blockIdx.x - 1;
         const float * x = (const float *) ((const char *) p.x + t * p.x_nb1);
+        if (p.exact) {
+            block_q8_1 * col = (block_q8_1 *) p.xq_host + (int64_t) t * (p.k / QK8_1);
+            // Whole warps per pass (k is a multiple of 32): the reductions see full blocks.
+            for (int i = threadIdx.x; i < p.k; i += blockDim.x) {
+                quantize_q8_1_el(x[i], col, i);
+            }
+            return;
+        }
         for (int i = threadIdx.x; i < p.k; i += blockDim.x) {
             p.x_host[(int64_t) t * p.k + i] = x[i];
         }
@@ -88,10 +138,15 @@ __global__ void publish(const legion_cpu_share_publish p) {
             }
         }
         first_of[i] = first;
-        key[i] = users << 20 | (uint32_t) (id - p.n_slots);
+        // Exact: routing order (the host takes the first experts, the link reads the last).
+        key[i] = p.exact ? (uint32_t) i : users << 20 | (uint32_t) (id - p.n_slots);
     }
     __syncthreads();
-    const uint32_t c = (min(p.threshold, 1024u) * (uint32_t) n_host + p.dither) >> 10;
+    const uint32_t threshold = p.thr != nullptr ? *(const volatile uint32_t *) p.thr : p.threshold;
+    const uint32_t c = (min(threshold, 1024u) * (uint32_t) n_host + p.dither) >> 10;
+    if (threadIdx.x == 0 && p.n_miss != nullptr) {
+        *p.n_miss = (uint32_t) n_host;
+    }
     // A host expert's first pair: owned when fewer than `c` host experts have a smaller key.
     __shared__ bool owned[MAX_PAIRS];
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
@@ -127,11 +182,39 @@ __global__ void collect(const legion_cpu_share_collect p) {
     }
 }
 
+// grid.x: (token, slot) pairs. A GPU pair copies the SwiGLU op's row; a host pair makes its row
+// from the host's gate and up sums as the fused kernel does (swiglu of the two products) and
+// writes its Q8_1 blocks for the host's down rows. rows is a multiple of 32 and the block's
+// threads go over it in whole warps, so each warp reduces whole blocks.
+__global__ void activate(const legion_cpu_share_activate p) {
+    const int pair = blockIdx.x;
+    const int t = pair / p.n_used, j = pair % p.n_used;
+    float * dst = p.dst + (int64_t) pair * p.rows;
+    if (p.ids[pair] != HOST_PAIR) {
+        const float * src = (const float *) ((const char *) p.src + t * p.src_nb2 + j * p.src_nb1);
+        for (int r = threadIdx.x; r < p.rows; r += blockDim.x) {
+            dst[r] = src[r];
+        }
+        return;
+    }
+    const float * g = p.gu + (int64_t) pair * 2 * p.rows;
+    const float * u = g + p.rows;
+    block_q8_1 * col = (block_q8_1 *) p.aq + (int64_t) pair * (p.rows / QK8_1);
+    for (int r = threadIdx.x; r < p.rows; r += blockDim.x) {
+        const float v = swiglu(g[r], u[r], p.limit);
+        dst[r] = v;
+        quantize_q8_1_el(v, col, r);
+    }
+}
+
 }  // namespace
 
 extern "C" int legion_cpu_share_publish_launch(const legion_cpu_share_publish * p, void * stream) {
     if (p->n_tok <= 0 || p->n_used <= 0 || p->n_tok * p->n_used > MAX_PAIRS) {
         return p->n_tok * p->n_used > MAX_PAIRS ? (int) cudaErrorInvalidValue : 0;
+    }
+    if (p->exact && p->k % QK8_1 != 0) {
+        return (int) cudaErrorInvalidValue;
     }
     publish<<<1 + p->n_tok, 128, 0, (cudaStream_t) stream>>>(*p);
     return cudaGetLastError();
@@ -142,5 +225,16 @@ extern "C" int legion_cpu_share_collect_launch(const legion_cpu_share_collect * 
         return 0;
     }
     collect<<<p->n_tok * p->n_used, 256, 0, (cudaStream_t) stream>>>(*p);
+    return cudaGetLastError();
+}
+
+extern "C" int legion_cpu_share_activate_launch(const legion_cpu_share_activate * p, void * stream) {
+    if (p->n_tok <= 0 || p->n_used <= 0) {
+        return 0;
+    }
+    if (p->rows % QK8_1 != 0 || p->n_tok * p->n_used > MAX_PAIRS) {
+        return (int) cudaErrorInvalidValue;
+    }
+    activate<<<p->n_tok * p->n_used, 128, 0, (cudaStream_t) stream>>>(*p);
     return cudaGetLastError();
 }
