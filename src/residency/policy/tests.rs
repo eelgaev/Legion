@@ -780,3 +780,73 @@ fn repeated_failures_without_a_drift_shrink_in_a_few_tries() {
         bytes / MIB
     );
 }
+
+/// Feeds `c` one window at hit rate `rate` (of 1000 routings a step) after `at` steps' worth.
+fn churn_window(c: &mut ChurnControl, at: &mut (u64, u64), rate: f64) {
+    for _ in 0..CHURN_WINDOW {
+        let h = (rate * 1000.0).round() as u64;
+        *at = (at.0 + h, at.1 + 1000 - h);
+        c.step(at.0, at.1);
+    }
+}
+
+#[test]
+fn churn_raises_the_margin_while_the_hit_rate_is_flat() {
+    let mut c = ChurnControl::new(true);
+    let mut at = (0, 0);
+    let rule = SwapRule::default();
+    // The first window only sets the reference.
+    churn_window(&mut c, &mut at, 0.70);
+    assert_eq!(c.factor(), 1.0);
+    // Still rising: no change.
+    churn_window(&mut c, &mut at, 0.75);
+    assert_eq!(c.factor(), 1.0);
+    // Flat: doubles each window up to the cap.
+    for f in [2.0, 4.0, CHURN_MAX] {
+        churn_window(&mut c, &mut at, 0.751);
+        assert_eq!(c.factor(), f);
+    }
+    assert_eq!(c.rule(rule).margin, rule.margin * CHURN_MAX);
+    assert_eq!(c.rule(rule).budget, rule.budget);
+    // Rising again: halves.
+    churn_window(&mut c, &mut at, 0.77);
+    assert_eq!(c.factor(), CHURN_MAX / 2.0);
+    // A fall (the routing moved): straight back to the rule's margin.
+    churn_window(&mut c, &mut at, 0.70);
+    assert_eq!(c.factor(), 1.0);
+}
+
+#[test]
+fn churn_moves_only_once_a_window() {
+    let mut c = ChurnControl::new(true);
+    let mut at = (0, 0);
+    churn_window(&mut c, &mut at, 0.7);
+    for _ in 0..CHURN_WINDOW - 1 {
+        at = (at.0 + 700, at.1 + 300);
+        c.step(at.0, at.1);
+        assert_eq!(c.factor(), 1.0);
+    }
+    at = (at.0 + 700, at.1 + 300);
+    c.step(at.0, at.1);
+    assert_eq!(c.factor(), 2.0);
+}
+
+#[test]
+fn churn_off_keeps_the_rule() {
+    let mut c = ChurnControl::new(false);
+    let mut at = (0, 0);
+    for _ in 0..4 {
+        churn_window(&mut c, &mut at, 0.7);
+    }
+    assert_eq!(c.factor(), 1.0);
+    assert_eq!(c.rule(SwapRule::default()), SwapRule::default());
+    // A window without routings changes nothing.
+    let mut c = ChurnControl::new(true);
+    for _ in 0..3 * CHURN_WINDOW {
+        c.step(0, 0);
+    }
+    assert_eq!(c.factor(), 1.0);
+    assert!(churn_on(None));
+    assert!(churn_on(Some("")));
+    assert!(!churn_on(Some("off")));
+}

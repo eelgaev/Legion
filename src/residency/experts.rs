@@ -24,8 +24,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::policy::{
-    LayerSlots, LendLayer, MAX_FIT_TRIES, SwapRule, allocate_slots_in, auto_keep_carved,
-    layers_left_for, lowest_experts, plan_swaps, shrunk_budget,
+    ChurnControl, LayerSlots, LendLayer, MAX_FIT_TRIES, SwapRule, allocate_slots_in,
+    auto_keep_carved, churn_on, layers_left_for, lowest_experts, plan_swaps, shrunk_budget,
 };
 use super::profile::Profile;
 use super::{Fetch, ResidencyConfig};
@@ -660,6 +660,8 @@ pub struct ExpertResidency {
     rule: SwapRule,
     /// Per-device swap budgets over `rule`'s (`--expert-swaps-device`; empty: `rule`'s).
     device_swaps: Vec<usize>,
+    /// Per device: the swap margin raised while its hit rate is flat (#519).
+    churn: Vec<ChurnControl>,
     decay: f32,
     /// Most heat an expert gains per logged pass (0: no limit; `--expert-heat-pass-cap`).
     heat_pass_cap: f32,
@@ -1626,6 +1628,7 @@ impl ExpertResidency {
             n_used,
             rule: cfg.swaps,
             device_swaps: cfg.device_swaps.clone(),
+            churn: Vec::new(),
             decay: cfg.decay,
             heat_pass_cap: cfg.heat_pass_cap,
             profile: cfg.profile.clone(),
@@ -2217,6 +2220,28 @@ impl ExpertResidency {
             if predicted {
                 self.predict.end_pass();
             }
+            // Swap-in churn (#519): each device whose layers ran counts this logged step, with
+            // the hits and misses of all its layers (counts that only grow).
+            if self.churn.len() != self.devices.len() {
+                let on = churn_on(std::env::var("LEGION_DEBUG_SWAP_CHURN").ok().as_deref());
+                self.churn = vec![ChurnControl::new(on); self.devices.len()];
+            }
+            for d in 0..self.devices.len() {
+                let (mut h, mut m, mut any) = (0, 0, false);
+                for (il, l) in self
+                    .layers
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(il, l)| l.as_ref().map(|l| (il, l)))
+                    .filter(|(_, l)| l.dev == d)
+                {
+                    (h, m) = (h + l.slots.hits, m + l.slots.misses);
+                    any |= ran(il);
+                }
+                if any {
+                    self.churn[d].step(h, m);
+                }
+            }
             // No swaps into lent slots: their VRAM is gone until `restore`.
             if self.lent.is_none() {
                 for d in 0..self.devices.len() {
@@ -2232,6 +2257,7 @@ impl ExpertResidency {
                     hit_rate = h as f64 / (h + m).max(1) as f64,
                     swaps = s.swaps,
                     logged_steps = s.logged_steps,
+                    churn_margin = ?self.churn.iter().map(|c| c.factor()).collect::<Vec<_>>(),
                     "expert cache, last {REPORT_EVERY} logged steps"
                 );
                 self.reported = (s.hits, s.misses);
@@ -2313,6 +2339,8 @@ impl ExpertResidency {
         d: usize,
         scope: Option<&dyn Fn(usize) -> bool>,
     ) -> Result<(), String> {
+        let rule = self.rule.on_device(&self.device_swaps, d);
+        let rule = self.churn.get(d).map_or(rule, |c| c.rule(rule));
         let swaps = {
             let mut view: Vec<Option<&mut LayerSlots>> = self
                 .layers
@@ -2324,7 +2352,7 @@ impl ExpertResidency {
                         .map(|l| &mut l.slots)
                 })
                 .collect();
-            plan_swaps(&mut view, self.rule.on_device(&self.device_swaps, d))
+            plan_swaps(&mut view, rule)
         };
         if swaps.is_empty() {
             return Ok(());

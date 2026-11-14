@@ -1715,7 +1715,10 @@ unsafe fn split_launch(
     if fork {
         // The peer alone takes its share of the missed experts' ranks and fills every slot;
         // beside the side stream every rank takes a slot and the peer fills the odd ones.
-        let (every, take) = peer::share();
+        let (every, take) = match link {
+            Some(l) => peer::share_now(l),
+            None => peer::share(),
+        };
         let ranks = if side { (1, 1) } else { (every, take) };
         let gate_up = overlap::StageParams {
             ids: o.ids as *const i32,
@@ -1750,7 +1753,10 @@ unsafe fn split_launch(
         if let Some(l) = link {
             // SAFETY: as the caller promises; the peer reaches the ids and the buffer (this
             // device's memory) and the stacks' host parts (mapped for it when it was connected).
-            unsafe { peer::fork(stream, l, &gate_up, &down)? };
+            unsafe {
+                peer::probe_start(stream, l);
+                peer::fork(stream, l, &gate_up, &down)?
+            };
         }
         // The activations, all columns.
         launch(LaunchParams { steps: 1, ..p }, stream)?;
@@ -1794,6 +1800,10 @@ unsafe fn split_launch(
             unsafe { overlap::stage(&table, stream)? };
         }
     } else {
+        if link.is_some() {
+            // SAFETY: the current device's stream (the join-wait counter's F event).
+            unsafe { peer::probe::mark(stream) };
+        }
         launch(LaunchParams { steps: 1, ..p }, stream)?;
     }
     launch(first, stream)?;
@@ -1804,7 +1814,10 @@ unsafe fn split_launch(
             overlap::wait(stream, which)?;
         }
         if let Some(l) = link {
+            // The join-wait counter's A and B events around the wait, on timed ops.
+            peer::probe::mark(stream);
             peer::wait(stream, l, which)?;
+            peer::probe::mark(stream);
         }
     }
     launch(staged, stream)

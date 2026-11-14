@@ -207,6 +207,28 @@ pub(super) fn share() -> (i32, i32) {
     (every as i32, take.clamp(1, every) as i32)
 }
 
+/// Whether the share follows the running GPU's measured wait for the peer ([`probe`], #519):
+/// unless `--expert-peer-share` fixed it or `LEGION_DEBUG_PEER_SHARE=fixed` (A/B runs).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(super) fn share_is_auto() -> bool {
+    probe::auto_share(
+        SHARE_TAKE.load(Ordering::Relaxed) != 0,
+        std::env::var("LEGION_DEBUG_PEER_SHARE").ok().as_deref(),
+    )
+}
+
+/// `(every, take)` of the FORK op of `l`'s device now: [`share`] when `--expert-peer-share`
+/// fixed it, else the share [`probe::ShareControl`] picked for the device from its waits (the
+/// slots stay [`slots`]' count, so a larger share fills at most those).
+#[cfg(feature = "cuda")]
+pub(super) fn share_now(l: Link) -> (i32, i32) {
+    if SHARE_TAKE.load(Ordering::Relaxed) != 0 {
+        return share();
+    }
+    let (take, every) = probe::share_of(l.device);
+    (every as i32, take as i32)
+}
+
 /// Staging slots of a pair of ops the peer fills alone: its share of `pairs` slots.
 pub(super) fn slots(pairs: usize) -> usize {
     let (every, take) = share();
@@ -510,6 +532,16 @@ pub(super) unsafe fn fork(
     }
 }
 
+/// A FORK op over `l` starts on `main`: the join-wait counter may time it ([`probe`]).
+///
+/// # Safety
+/// `main` is a live stream of the link's device, the current device.
+#[cfg(feature = "cuda")]
+pub(super) unsafe fn probe_start(main: *mut c_void, l: Link) {
+    // SAFETY: as the caller promises.
+    unsafe { probe::fork_start(l.device, main) }
+}
+
 /// The link the last FORK op on this thread got from [`link`] (the JOIN op's).
 #[cfg(feature = "cuda")]
 pub(super) fn forked() -> Option<Link> {
@@ -529,6 +561,8 @@ pub(super) unsafe fn wait(main: *mut c_void, l: Link, which: usize) -> Result<()
         "cudaStreamWaitEvent",
     )
 }
+
+pub(super) mod probe;
 
 #[cfg(test)]
 mod tests;
