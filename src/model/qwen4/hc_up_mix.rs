@@ -395,6 +395,21 @@ const MIX_CAST_SRC: usize = 5;
 /// The parameter of a BF16 mix node set when it does not write the F32 mixed values.
 const P_SKIP_F32: usize = 2;
 
+/// The parameter of a BF16 mix node that the all-gather reading it sets ([`set_by_exchange`]).
+const P_BY_EXCHANGE: usize = 3;
+
+/// Leaves the BF16 mix node `node` ([`mix_cast_reads`]) to the all-gather that alone reads it
+/// (#1176, [`crate::tp_net::seq_par::take_mix`]): on CUDA the node launches nothing, and the
+/// exchange runs the mix itself ([`launch_mix`]), its values rounded to BF16 straight into the
+/// send buffer. The CPU op computes the node as before.
+///
+/// # Safety
+/// As [`crate::ggml::make_external`]: a valid mix node of an allocated graph that has not run.
+pub(crate) unsafe fn set_by_exchange(node: *mut ffi::ggml_tensor) {
+    // SAFETY: the caller's.
+    unsafe { crate::ggml::set_external_param(node, P_BY_EXCHANGE, 1) };
+}
+
 /// Makes the BF16 mix node `node` ([`mix_cast_reads`]) also write its mixed values rounded to
 /// BF16 into `cast` (contiguous BF16, as many values), as ggml's F32 -> BF16 copy rounds them
 /// (#1183); with `skip_f32`, not the F32 values themselves (nothing reads them).
@@ -813,6 +828,28 @@ pub fn last_kernel() -> i32 {
 
 #[cfg(feature = "cuda")]
 unsafe fn cuda_hc_up_mix(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
+    // The all-gather reading it runs it ([`set_by_exchange`]).
+    if crate::ggml::external_params(dst)[P_BY_EXCHANGE] != 0 {
+        return Ok(());
+    }
+    // SAFETY: the caller's.
+    unsafe { launch_mix(dst, None, stream) }
+}
+
+/// Runs the mix node `dst` on `stream`: as the node itself (`out16` `None`), or, for the
+/// all-gather that took it over ([`set_by_exchange`], #1176), a BF16 mix with its values rounded
+/// to BF16 at the device address `out16` only (`[e, n]` contiguous: the gather's send buffer),
+/// as [`set_mix_cast`]'s copy rounds them, the F32 values not written.
+///
+/// # Safety
+/// `dst` is a mix node of an allocated graph whose sources hold their values, device tensors
+/// of the stream's device; `out16` device-writable for the node's values.
+#[cfg(feature = "cuda")]
+pub(crate) unsafe fn launch_mix(
+    dst: &ffi::ggml_tensor,
+    out16: Option<u64>,
+    stream: *mut c_void,
+) -> Result<(), String> {
     // SAFETY: a node made by `up_mix`, device tensors of the stream's device.
     unsafe {
         let (up, xn) = (&*dst.src[0], &*dst.src[2]);
@@ -883,6 +920,13 @@ unsafe fn cuda_hc_up_mix(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
             pre_inj: std::ptr::null(),
             pre_inj_ld: 0,
         };
+        if let Some(a) = out16 {
+            if !up_bf16 {
+                return Err("hc_up_mix: only a BF16 mix writes for an exchange".into());
+            }
+            p.mixedb = a as *mut u16;
+            p.skip_f32 = 1;
+        }
         // Lazy streams (#1183, `set_lazy_streams`).
         if !dst.src[LAZY_OUT_SRC].is_null() {
             let (o, j) = (&*dst.src[LAZY_OUT_SRC], &*dst.src[LAZY_INJ_SRC]);

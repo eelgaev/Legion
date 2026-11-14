@@ -860,6 +860,19 @@ pub(in crate::cli) struct SwitchArgs {
     /// streams then stay allocated through the MoE layer). For comparisons.
     #[arg(long, help_heading = HEADING)]
     no_hc_lazy_streams: bool,
+    /// Tensor parallelism with --tp-seq-par and --tp-wire bf16 (two ranks' prompt steps): the
+    /// hyper-connection mixer writes the block input it makes as F32 and the all-gather rounds
+    /// it into its send buffer, and not, as by default, the all-gather running that mixer
+    /// with its values rounded straight into the send buffer (#1176: the same bits, one pass
+    /// over the block input less before each gather). For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_tp_gather_mix: bool,
+    /// Tensor parallelism with --tp-seq-par and --tp-wire bf16: the F32 copy of a gathered
+    /// BF16 block input (for its F32 readers, the MoE router) is made by a copy after the
+    /// all-gather, and not, as by default, by the all-gather itself, this rank's share while
+    /// the other rank's is still on the wire (#1176: the same values). For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_tp_gather_widen: bool,
     /// qwen4exp prompt steps on a V100 (compute capability 7.0) or an sm_80+ GPU such as the
     /// GB10 (#826; no effect elsewhere): the layer's gated shared expert is added in the fused
     /// MoE op's per-token sum, and the next hyper-connection combine-and-norm makes that sum
@@ -1600,6 +1613,8 @@ impl SwitchArgs {
                 self.no_hc_moe_fold.then_some(false)
             },
             hc_lazy_streams: self.no_hc_lazy_streams.then_some(false),
+            tp_gather_mix: self.no_tp_gather_mix.then_some(false),
+            tp_gather_widen: self.no_tp_gather_widen.then_some(false),
             hc_fuse: self.hc_fuse.then_some(true),
             hc_xn16: self.hc_xn_f32.then_some(false),
             hc_quant: self.hc_quant_ggml.then_some(false),

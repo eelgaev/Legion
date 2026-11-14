@@ -315,7 +315,7 @@ pub(super) mod cuda {
         let src = unsafe { &*dst.src[0] };
         let plan = micro_plan(&comm, &m, src);
         // SAFETY: the caller's.
-        let r = unsafe { start(&comm, &plan, src.data as usize, stream, true, None) };
+        let r = unsafe { start(&comm, &plan, src.data as usize, stream, true, None, None) };
         if let Err(e) = &r {
             comm.fail(e.clone());
         }
@@ -384,6 +384,10 @@ pub(super) mod cuda {
         /// An all-gather with a BF16 output (`seq_par::all_gather_bf16`): the BF16 values
         /// copied as they travelled, not widened to F32.
         out_bf16: bool,
+        /// With `out_bf16`: the device address of the output's F32 copy that the exchange
+        /// writes too ([`crate::tp_net::seq_par::take_cast`]), this rank's share before the
+        /// wait for the peers'.
+        widen: Option<usize>,
     }
 
     /// The plan of a plain exchange node.
@@ -420,6 +424,10 @@ pub(super) mod cuda {
             pieces,
             pack_whole: true,
             out_bf16: kind == Kind::AllGather && dst.type_ == crate::ggml::types::BF16,
+            widen: match kind {
+                Kind::AllGather => crate::tp_net::seq_par::cast_of(dst),
+                _ => None,
+            },
         }
     }
 
@@ -450,6 +458,7 @@ pub(super) mod cuda {
             pieces,
             pack_whole: false,
             out_bf16: false,
+            widen: None,
         }
     }
 
@@ -490,7 +499,21 @@ pub(super) mod cuda {
                 }
                 t => Ok(t),
             };
-            let started = tail.and_then(|tail| start(&comm, &plan, src, stream, false, tail));
+            // A hyper-connection mix this all-gather runs itself (#1176): its BF16 values
+            // straight into the send buffer, or with F32 on the wire into its own output first.
+            let mix = match kind {
+                Kind::AllGather => crate::tp_net::seq_par::mix_of(dst),
+                _ => None,
+            };
+            let mix = match mix {
+                Some(m) if plan.wire != Wire::Bf16 => {
+                    crate::model::qwen4::launch_mix(m, None, stream).map(|_| None)
+                }
+                m => Ok(m),
+            };
+            let started = tail.and_then(|tail| {
+                mix.and_then(|mix| start(&comm, &plan, src, stream, false, tail, mix))
+            });
             started.and_then(|seq| {
                 if defer {
                     hand_over(&comm, &plan, seq, stream)
@@ -601,11 +624,14 @@ pub(super) mod cuda {
     /// queued. Returns the exchange's sequence number; `micro`: it stays in flight (for
     /// [`launch_micro_finish`]). `tail` (a plain BF16 reduce-scatter's, see
     /// [`crate::tp_net::seq_par::take_tail`]): the MoE tail node whose values `src` holds,
-    /// not run yet; it runs here with its values rounded straight into the send buffer.
+    /// not run yet; it runs here with its values rounded straight into the send buffer. `mix`
+    /// (a plain BF16 all-gather's, see [`crate::tp_net::seq_par::take_mix`]): the same for the
+    /// hyper-connection mix node whose values `src` holds.
     ///
     /// # Safety
     /// `src` is the device address of the plan's source on `stream`'s device; `tail` as
-    /// [`crate::model::core::node_fuse::launch_tail`]'s node.
+    /// [`crate::model::core::node_fuse::launch_tail`]'s node, `mix` as
+    /// [`crate::model::qwen4::launch_mix`]'s.
     unsafe fn start(
         comm: &super::super::Comm,
         plan: &Plan,
@@ -613,6 +639,7 @@ pub(super) mod cuda {
         stream: *mut c_void,
         micro: bool,
         tail: Option<&ffi::ggml_tensor>,
+        mix: Option<&ffi::ggml_tensor>,
     ) -> Result<u32, String> {
         // Only the BF16 whole-source pack below runs a tail; anywhere else its node (a no-op
         // now) would leave stale values to send. Checked before the sequence number moves.
@@ -620,6 +647,11 @@ pub(super) mod cuda {
             && !(plan.wire == Wire::Bf16 && plan.kind == Kind::ReduceScatter && plan.pack_whole)
         {
             return Err("tp exchange: a tail needs a BF16 whole-source reduce-scatter".into());
+        }
+        if mix.is_some()
+            && !(plan.wire == Wire::Bf16 && plan.kind == Kind::AllGather && plan.pack_whole)
+        {
+            return Err("tp exchange: a mix needs a BF16 whole-source all-gather".into());
         }
         let (rank, n_ranks) = (comm.rank(), comm.n_ranks());
         let kind = plan.kind;
@@ -734,6 +766,10 @@ pub(super) mod cuda {
                     None,
                     stream,
                 )?;
+            } else if bf16 && let Some(m) = mix {
+                // This rank's share as the pack below rounds it (#1176), the mix's F32 values
+                // never written.
+                crate::model::qwen4::launch_mix(m, Some(dd + send as u64), stream)?;
             } else if bf16 {
                 let packs: Vec<(usize, usize)> = match kind {
                     Kind::AllGather => vec![(0, mine.1)],
@@ -915,6 +951,16 @@ pub(super) mod cuda {
             if kind == Kind::AllGather {
                 if plan.out_bf16 {
                     copy_bf16(dd + send as u64, dst16(mine.0), mine.1, stream)?;
+                    // The F32 copy of this rank's share (#1176), while the peers' travel.
+                    if let Some(w) = plan.widen {
+                        sum(
+                            legion_tp_net_sum_bf16_kernel,
+                            &[send_dev(0)],
+                            (w + mine.0 * 4) as *mut f32,
+                            mine.1,
+                            stream,
+                        )?;
+                    }
                 } else if bf16 {
                     let one = [send_dev(0)];
                     sum(
@@ -948,6 +994,15 @@ pub(super) mod cuda {
                     let (i, c) = plan.pieces[r];
                     if plan.out_bf16 {
                         copy_bf16(recv_dev(r) as u64, dst16(i), c, stream)?;
+                        if let Some(w) = plan.widen {
+                            sum(
+                                legion_tp_net_sum_bf16_kernel,
+                                &[recv_dev(r)],
+                                (w + i * 4) as *mut f32,
+                                c,
+                                stream,
+                            )?;
+                        }
                     } else if bf16 {
                         sum(
                             legion_tp_net_sum_bf16_kernel,
