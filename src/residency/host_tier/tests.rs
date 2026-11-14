@@ -236,6 +236,67 @@ fn a_swap_writes_nothing_back_when_ram_has_the_expert() {
 }
 
 #[test]
+fn a_staged_pass_reads_a_layers_missing_experts_in_batches_of_a_set() {
+    use passes::{Held, PassSrc, plan_pass};
+    // 10 RAM slots, 2 sets of 2 places. Layer 0: one expert in RAM slot 7, three to read;
+    // layer 1: all in RAM; layer 2: one to read.
+    let layers = vec![
+        vec![Held::Stage, Held::Ram(7), Held::Stage, Held::Stage],
+        vec![Held::Ram(1), Held::Ram(2)],
+        vec![Held::Stage],
+    ];
+    let (srcs, batches) = plan_pass(&layers, 10, 2, 2).unwrap();
+    let at = |place: usize| 10 + GAP + place;
+    let read = |batch: usize, place: usize| PassSrc::Read {
+        batch,
+        at: at(place),
+    };
+    assert_eq!(
+        srcs[0],
+        vec![read(0, 0), PassSrc::Ram(7), read(0, 1), read(1, 2)]
+    );
+    assert_eq!(srcs[1], vec![PassSrc::Ram(1), PassSrc::Ram(2)]);
+    // A batch is one layer's: layer 2 starts a new one, in the first set again.
+    assert_eq!(srcs[2], vec![read(2, 0)]);
+    let p = To::Place;
+    assert_eq!(
+        batches,
+        vec![
+            vec![(0, 0, p(0)), (0, 2, p(1))],
+            vec![(0, 3, p(2))],
+            vec![(2, 0, p(0))]
+        ]
+    );
+    // Batch `b` and batch `b + sets` share places: the reader waits for the first's release.
+    assert_eq!(passes::wait_arg(3) + 1, passes::release_arg(3));
+}
+
+#[test]
+fn a_staged_pass_reads_into_the_ram_slots_it_was_given() {
+    use passes::{Held, PassSrc, plan_pass};
+    // 10 RAM slots, 2 sets of 2 places: slots 4 and 5 are free for two of the three experts
+    // the checkpoint holds. They ride in the batch and take none of its places.
+    let layers = vec![vec![Held::Load(4), Held::Stage, Held::Load(5)]];
+    let (srcs, batches) = plan_pass(&layers, 10, 2, 2).unwrap();
+    let read = |batch: usize, at: usize| PassSrc::Read { batch, at };
+    assert_eq!(srcs[0], vec![read(0, 4), read(0, 10 + GAP), read(1, 5)]);
+    assert_eq!(
+        batches,
+        vec![
+            vec![(0, 0, To::Slot(4)), (0, 1, To::Place(0))],
+            vec![(0, 2, To::Slot(5))]
+        ]
+    );
+}
+
+#[test]
+fn a_staged_pass_without_places_reads_nothing() {
+    use passes::{Held, plan_pass};
+    assert!(plan_pass(&[vec![Held::Ram(0)]], 4, 0, 0).is_ok());
+    assert!(plan_pass(&[vec![Held::Stage]], 4, 0, 0).is_err());
+}
+
+#[test]
 fn sources_are_named_like_the_models_tensors() {
     assert_eq!(
         skipped_tensors(1),

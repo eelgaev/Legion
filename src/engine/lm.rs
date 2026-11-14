@@ -3810,13 +3810,11 @@ impl LmEngine {
             if cfg.ngram.io == crate::residency::lookup_table::TableIo::Auto {
                 cfg.ngram.io = crate::residency::lookup_table::TableIo::Direct;
             }
-            // Prompts read the host experts in place, once per chunk over the link: unless
-            // chunk or batch were given, bigger chunks (the VRAM cache leaves their room).
-            if let Some((chunk, batch)) =
-                ssd_tier::host_tier_chunk(cfg.ring_step, cfg.prefill_chunk, cfg.max_batch_tokens)
-            {
-                cfg.prefill_chunk = chunk;
-                cfg.max_batch_tokens = batch;
+            // Prompts lend the VRAM cache and run as staged passes
+            // ([`crate::residency::host_tier`]), shorter ones than elsewhere: a chunk of an
+            // unlent cache reads the checkpoint for what it routes to.
+            if cfg.long_prompts.min_tokens == LongPrompts::default().min_tokens {
+                cfg.long_prompts.min_tokens = ssd_tier::HOST_TIER_LONG;
             }
         }
         // The other machine's layers and head.
@@ -4895,12 +4893,19 @@ impl LmEngine {
                 };
                 // A long prompt's micro-chunk over the lent cache: what a lend must free sizes
                 // how much of the cache long prompts keep (`ResidencyConfig::lend_need`).
+                // The bounded host tier (one GPU): a whole pass's step, as a kept slot's
+                // experts are neither copied nor read from the checkpoint.
+                let tier = exec.model().host_tier().is_some() && layout.stages.len() == 1;
                 let long = if cfg.residency.staging
                     && cfg.residency.lend_keep.is_empty()
                     && cfg.long_prompts.min_tokens > 0
-                    && layout.stages.len() > 1
+                    && (layout.stages.len() > 1 || tier)
                 {
-                    let tokens = cfg.long_prompts.micro;
+                    let tokens = if tier {
+                        ssd_tier::HOST_TIER_PASS.min(cfg.ctx_size / 2)
+                    } else {
+                        cfg.long_prompts.micro
+                    };
                     exec.measure_prompt_step(tokens, cfg.ctx_size.saturating_sub(tokens))
                         .map_err(err(format!("a {tokens}-token long prompt step")))?
                 } else {
@@ -5474,6 +5479,16 @@ impl LmEngine {
             Vec::new()
         };
         let long_past = cfg.ctx_size.saturating_sub(long_micro).max(1);
+        // The bounded host tier (one GPU): the pass step measured at load, which caps a
+        // lend's passes to the VRAM it left free.
+        let tier_step = match (&measured_long[..], &layout.stages[..]) {
+            (&[bytes], [(device, _)]) if exec.model().host_tier().is_some() => Some((
+                *device,
+                bytes,
+                ssd_tier::HOST_TIER_PASS.min(cfg.ctx_size / 2),
+            )),
+            _ => None,
+        };
         let worker = Worker {
             exec,
             tokenizer: tokenizer.clone(),
@@ -5567,6 +5582,8 @@ impl LmEngine {
             long_past,
             long_cap: 0,
             long_reserve: 0,
+            tier_step,
+            tier_cap: 0,
             clock: Default::default(),
             outbox: stream::Outbox::new(tokenizer.clone(), cfg.stream_thread_seqs),
         };
@@ -5969,6 +5986,12 @@ struct Worker {
     long_cap: usize,
     /// VRAM a KV tail mapped during the current lend leaves free for its step buffers.
     long_reserve: usize,
+    /// The bounded host tier on one GPU: the device, and the bytes a prompt step of that many
+    /// tokens took when measured at load.
+    tier_step: Option<(Option<crate::ggml::Device>, usize, usize)>,
+    /// The most tokens a staged pass of the current lend takes
+    /// ([`ssd_tier::host_tier_pass_cap`]; 0: no cap).
+    tier_cap: usize,
     /// `--kv-vmm-keep` (#814): the KV pools' tail, lent to the expert cache while no sequence
     /// needs it ([`kv_vmm::KvLend`]).
     kv_lend: Option<kv_vmm::KvLend>,
@@ -7176,6 +7199,18 @@ impl Worker {
             Ok(true) => {
                 self.lent = true;
                 (self.long_cap, self.long_reserve) = self.long_micro_cap(end);
+                // The bounded host tier: a pass's step buffer stays in the VRAM the lend
+                // left free (the host's memory is the experts').
+                if let Some((Some(d), bytes, at)) = self.tier_step {
+                    let keep = crate::model::core::LENT_SCRATCH + LENT_MICRO_MARGIN;
+                    let free = d.memory().0.saturating_sub(keep);
+                    self.tier_cap = ssd_tier::host_tier_pass_cap(free, bytes, at, KV_BLOCK);
+                    tracing::info!(
+                        free_mib = free >> 20,
+                        pass_tokens = self.tier_cap,
+                        "host expert tier: staged passes sized to the lent VRAM"
+                    );
+                }
                 self.exec.set_pipeline_micro(self.capped(self.long.micro));
                 self.exec.set_micro_taper(self.long.taper);
                 tracing::info!(
@@ -7215,6 +7250,7 @@ impl Worker {
         self.lent_short = false;
         self.long_cap = 0;
         self.long_reserve = 0;
+        self.tier_cap = 0;
         self.exec.set_pipeline_micro(self.micro);
         self.exec.set_micro_taper(0);
         tracing::info!(
@@ -7552,7 +7588,11 @@ impl Worker {
         } else {
             self.long.batch_tokens
         };
-        let max_batch = if big {
+        // The bounded host tier: passes of what the lend left free, the prompt in equal ones.
+        let tier_pass = big && self.tier_cap > 0;
+        let max_batch = if tier_pass {
+            self.tier_cap
+        } else if big {
             long_batch.max(self.max_batch_tokens)
         } else {
             self.max_batch_tokens
@@ -7622,7 +7662,7 @@ impl Worker {
             if take == 0 {
                 break;
             }
-            let take = if self.prefill_even {
+            let take = if self.prefill_even || tier_pass {
                 even::even_take(
                     seq.prompt.len() - seq.n_past,
                     take,

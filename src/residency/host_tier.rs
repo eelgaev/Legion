@@ -29,6 +29,10 @@
 //!
 //! The VRAM cache's own copies (its first fill and its swaps) take their bytes from a RAM slot
 //! or, read first, from the expert's staging place ([`HostTier::sources`]).
+//!
+//! A long prompt lends the VRAM cache as without the tier; its big steps skip the fetch and
+//! stage every layer's experts in VRAM from the RAM slots and, through the staging places,
+//! from the checkpoint, read layers ahead ([`passes`]).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,6 +46,9 @@ use super::lookup_table::MemInfo;
 use super::ssd_experts::KINDS;
 use super::ssd_experts::cache::SlotCache;
 use super::ssd_experts::io::{Group, Job, Pool};
+
+mod passes;
+pub use passes::{PassHook, PassSrc, release_arg, wait_arg};
 
 #[cfg(test)]
 mod tests;
@@ -315,6 +322,8 @@ struct Inner {
     cap: usize,
     pool: Pool,
     state: Mutex<State>,
+    /// The staged prompt pass whose reads are under way ([`HostTier::stage_pass`]).
+    pass: Mutex<Option<passes::Running>>,
     counts: Counters,
 }
 
@@ -586,6 +595,7 @@ impl HostTier {
             xchg,
             cap,
             pool,
+            pass: Mutex::new(None),
             counts: Counters::default(),
         });
         let id = {
@@ -747,6 +757,7 @@ impl HostTier {
 
 impl Drop for HostTier {
     fn drop(&mut self) {
+        self.inner.settle();
         self.inner.report();
         REGISTRY.lock().unwrap()[self.id as usize] = None;
     }
@@ -845,7 +856,7 @@ pub(crate) fn plan_step(cache: &mut SlotCache, n_expert: usize, need: &[usize]) 
 }
 
 /// Where a read puts an expert: a RAM slot, or a staging place.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum To {
     Slot(usize),
     Place(usize),
@@ -873,8 +884,10 @@ impl Inner {
 
     /// Waits for the read ahead under way, if any, and gives its `(expert, place)` when it is
     /// layer `il`'s. Anything that writes or reads staging places starts with this: another
-    /// layer's read ahead is dropped, its places free again.
+    /// layer's read ahead is dropped, its places free again. So are those of a staged prompt
+    /// pass, done by now ([`Self::settle`]).
     fn take_ahead(&self, st: &mut State, il: Option<usize>) -> Result<Vec<(usize, usize)>, String> {
+        self.settle();
         let Some(a) = st.ahead.take() else {
             return Ok(Vec::new());
         };

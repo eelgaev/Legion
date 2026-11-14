@@ -194,6 +194,11 @@ mod sys {
         pub fn cudaEventDestroy(e: cudaEvent_t) -> cudaError_t;
         pub fn cudaStreamWaitEvent(s: cudaStream_t, e: cudaEvent_t, flags: c_uint) -> cudaError_t;
         pub fn cudaMemsetAsync(p: *mut c_void, v: c_int, n: usize, s: cudaStream_t) -> cudaError_t;
+        pub fn cudaLaunchHostFunc(
+            s: cudaStream_t,
+            f: unsafe extern "C" fn(*mut c_void),
+            user: *mut c_void,
+        ) -> cudaError_t;
     }
 }
 
@@ -239,6 +244,14 @@ fn rt(e: cudaError_t, what: &str) -> Result<(), String> {
     // SAFETY: a static NUL-terminated string.
     let msg = unsafe { CStr::from_ptr(cudaGetErrorString(e)) }.to_string_lossy();
     Err(format!("{what}: {msg}"))
+}
+
+/// Waits for everything queued on `device`, kernels and copies of every stream.
+pub fn sync_device(device: usize) -> Result<(), String> {
+    use_device(device)?;
+    // SAFETY: a plain runtime call.
+    let e = unsafe { cudaDeviceSynchronize() };
+    rt(e, "cudaDeviceSynchronize")
 }
 
 /// Makes `device` current on this thread, with its primary context (driver calls need one).
@@ -2128,7 +2141,30 @@ impl Copier {
         // SAFETY: the copier's own live stream.
         unsafe { e.record(self.stream) }
     }
+
+    /// Queues a call of `f(arg)` after the copies queued so far: later copies wait until it
+    /// returns. It runs on a thread of the driver's and must make no CUDA call.
+    pub fn call(&mut self, f: StreamCall, arg: usize) -> Result<(), String> {
+        unsafe extern "C" fn run(user: *mut c_void) {
+            // SAFETY: the box `call` leaked for this call.
+            let job = unsafe { Box::from_raw(user as *mut (StreamCall, usize)) };
+            (job.0)(job.1);
+        }
+        let job = Box::into_raw(Box::new((f, arg)));
+        // SAFETY: the copier's own live stream; the host function owns `job`.
+        unsafe {
+            cudaSetDevice(self.device as c_int);
+            let e = cudaLaunchHostFunc(self.stream, run, job.cast());
+            if e != 0 {
+                drop(Box::from_raw(job));
+            }
+            rt(e, "cudaLaunchHostFunc")
+        }
+    }
 }
+
+/// What [`Copier::call`] runs.
+pub type StreamCall = std::sync::Arc<dyn Fn(usize) + Send + Sync>;
 
 /// Thread blocks of a [`PeerPuller`]'s copy kernel: about two per V100 SM, which keeps its
 /// host link busy (68 GB/s from 80 to 640 blocks of 512 threads).

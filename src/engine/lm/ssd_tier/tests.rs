@@ -82,18 +82,16 @@ fn the_host_tier_is_for_the_expert_cache_of_one_discrete_gpu_with_a_pinned_arena
 }
 
 #[test]
-fn the_host_tier_takes_big_prompt_chunks_unless_told() {
-    use crate::engine::lm::{MAX_BATCH_TOKENS, PREFILL_CHUNK};
-    assert_eq!(
-        host_tier_chunk(None, PREFILL_CHUNK, MAX_BATCH_TOKENS),
-        Some((HOST_TIER_CHUNK, HOST_TIER_CHUNK))
-    );
-    // `--prefill-chunk` (even the default's value) and `--max-batch-tokens` are kept.
-    assert_eq!(
-        host_tier_chunk(Some(PREFILL_CHUNK), PREFILL_CHUNK, MAX_BATCH_TOKENS),
-        None
-    );
-    assert_eq!(host_tier_chunk(None, PREFILL_CHUNK, 4096), None);
+fn a_host_tier_pass_takes_the_tokens_the_free_vram_fits() {
+    let gib = 1usize << 30;
+    // A step of 8704 tokens measured at 4 GiB: 2 GiB free fit half of it, in whole blocks.
+    assert_eq!(host_tier_pass_cap(2 * gib, 4 * gib, 8704, 64), 4352);
+    assert_eq!(host_tier_pass_cap(2 * gib + 1000, 4 * gib, 8704, 64), 4352);
+    // More than the measured step when more is free.
+    assert_eq!(host_tier_pass_cap(8 * gib, 4 * gib, 8704, 64), 17408);
+    // Never below the smallest pass; no cap without a measurement.
+    assert_eq!(host_tier_pass_cap(0, 4 * gib, 8704, 64), HOST_TIER_MIN_PASS);
+    assert_eq!(host_tier_pass_cap(gib, 0, 8704, 64), 0);
 }
 
 #[test]

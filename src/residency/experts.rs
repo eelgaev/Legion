@@ -190,6 +190,10 @@ struct Layer {
     /// (the slots' VRAM is two allocations, the rest of it is lent: [`super::cuda::unback_tail`]).
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))] // read by the CUDA lend paths only
     keep: Option<usize>,
+    /// Its host part is the bounded host tier's ([`super::host_tier`]): RAM slots and staging
+    /// places, not every expert's bytes.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))] // read by the CUDA lend paths only
+    tier: bool,
     /// Its tail is lent and not refilled yet (the slots before it still have VRAM).
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))] // read by the CUDA lend paths only
     tail_lent: bool,
@@ -505,6 +509,110 @@ impl Layer {
             .map(|r| self.stage_first + r.end)
             .collect::<Vec<_>>();
         parts.copies(pieces > 0, self.stage_first, &ends)
+    }
+
+    /// The experts a staged pass copies into this layer's staging buffers, each with its id in
+    /// the staged tensors: the packed ids ([`Self::stage_ids`]), or `n_slots + expert` for
+    /// every expert the table reads from host memory.
+    #[cfg(feature = "cuda")]
+    fn stage_misses(&self) -> Vec<(u32, usize)> {
+        if !self.stage_ids.is_empty() {
+            let first = self.stage_first;
+            let ids = self.stage_miss.iter().enumerate();
+            return ids.map(|(i, &e)| (e, first + i)).collect();
+        }
+        let n_slots = self.slots.n_slots();
+        let table = self.slots.table();
+        (0..table.len() as u32)
+            .filter(|&e| table[e as usize] as usize >= n_slots)
+            .map(|e| (e, n_slots + e as usize))
+            .collect()
+    }
+
+    /// [`Self::stage_copies`] with the bounded host tier: expert `i` of [`Self::stage_misses`]
+    /// comes from `srcs[i]` ([`super::host_tier::HostTier::stage_pass`]). In order: the zeroed
+    /// pads, the experts in RAM slots, then each batch of experts read from the checkpoint
+    /// between the calls that wait for its reads and give its places back
+    /// ([`super::staging::CALL`]). Copies of neighbours on both sides are one copy.
+    #[cfg(feature = "cuda")]
+    fn tier_copies(&self, srcs: &[super::host_tier::PassSrc]) -> Vec<super::staging::Copy> {
+        use super::host_tier::{PassSrc, release_arg, wait_arg};
+        use super::staging::CALL;
+        let n_slots = self.slots.n_slots();
+        let n_expert = self.slots.n_expert();
+        let miss = self.stage_misses();
+        debug_assert_eq!(miss.len(), srcs.len());
+        let packed = !self.stage_ids.is_empty();
+        let staged: [usize; 3] = std::array::from_fn(|k| {
+            // SAFETY: reading the data pointer of a live tensor.
+            unsafe { (*self.staged[k].tensor(KINDS[k]).expect("staged").raw()).data as usize }
+        });
+        let mut out: Vec<super::staging::Copy> = Vec::new();
+        // The quantized matmuls' reads past an expert's last row (see `stage_copies`): zeroes
+        // after every run of copied ids that no copy follows, and where the ids start.
+        for k in 0..3 {
+            let b = self.expert_bytes[k];
+            let Some(pad) = (self.tensor(k).ne()[0] % 512 != 0).then_some(4096.min(b)) else {
+                continue;
+            };
+            if packed {
+                let (at, split) = super::cuda::tiered_split(self.tensor(k)).unwrap_or((0, 0));
+                let head = (at + self.stage_first * b).saturating_sub(split);
+                if head > 0 {
+                    out.push((staged[k] - at + split, 0, pad.min(head)));
+                }
+            } else if miss.first().is_none_or(|m| m.0 != 0) {
+                out.push((staged[k] + n_slots * b, 0, pad));
+            }
+            for (i, &(_, id)) in miss.iter().enumerate() {
+                if miss.get(i + 1).is_none_or(|m| m.1 != id + 1) {
+                    out.push((staged[k] + (id + 1) * b, 0, pad));
+                }
+            }
+        }
+        debug_assert!(packed || miss.last().is_none_or(|m| m.1 < n_slots + n_expert));
+        // One kind's copies of the experts `picked` (positions in `miss`, from index `at`
+        // past the slots), neighbours joined up to a staging piece.
+        let copy = |out: &mut Vec<super::staging::Copy>, picked: &[(usize, usize)]| {
+            for k in 0..3 {
+                let b = self.expert_bytes[k];
+                let start = out.len();
+                for &(i, at) in picked {
+                    let (dst, src) = (staged[k] + miss[i].1 * b, self.addr(k, n_slots + at));
+                    match out[start..].last_mut() {
+                        Some(c) if c.0 + c.2 == dst && c.1 + c.2 == src && c.2 < STAGE_PIECE => {
+                            c.2 += b;
+                        }
+                        _ => out.push((dst, src, b)),
+                    }
+                }
+            }
+        };
+        let ram: Vec<(usize, usize)> = srcs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| match s {
+                PassSrc::Ram(at) => Some((i, *at)),
+                PassSrc::Read { .. } => None,
+            })
+            .collect();
+        copy(&mut out, &ram);
+        let mut read: Vec<(usize, usize, usize)> = srcs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| match s {
+                PassSrc::Read { batch, at } => Some((*batch, i, *at)),
+                PassSrc::Ram(_) => None,
+            })
+            .collect();
+        read.sort_unstable();
+        for batch in read.chunk_by(|a, b| a.0 == b.0) {
+            let picked: Vec<(usize, usize)> = batch.iter().map(|r| (r.1, r.2)).collect();
+            out.push((CALL, wait_arg(batch[0].0), 0));
+            copy(&mut out, &picked);
+            out.push((CALL, release_arg(batch[0].0), 0));
+        }
+        out
     }
 
     /// Plans packed staging for this lend ([`Self::stage_ids`]) from the current table: the
@@ -905,8 +1013,9 @@ impl<'a> TieredLayer<'a> {
         let ids = kernel_flat.map_or(ids, |k| ctx.get_rows(table, k));
         let ids = ctx.reshape_2d(ids, used, n);
         // The bounded host tier: a miss (`n_slots + expert`, as logged) reads the RAM slot or
-        // staging place the tier's fetch puts the expert in.
-        match self.host {
+        // staging place the tier's fetch puts the expert in. Not in a staged pass, whose
+        // copies bring every miss into VRAM ([`ExpertResidency::begin_pass`]).
+        match self.host.filter(|_| !self.stages(n)) {
             Some((h, il)) => h
                 .fetch(ctx, il, ids, self.n_slots())
                 .unwrap_or_else(|e| panic!("host expert tier: {e}")),
@@ -1146,8 +1255,9 @@ impl ExpertResidency {
             found.push(entry);
         }
         // The bounded host tier: experts are in RAM slots or read as routed, so nothing may
-        // read an expert's host bytes at `n_slots + expert` (no prompt staging and lending, no
-        // host share).
+        // read an expert's host bytes at `n_slots + expert`: no host share, no re-pack of the
+        // kept slots, and a long prompt's staged passes take every expert from where the tier
+        // has it ([`Layer::tier_copies`]: one plan a row, kept across lends).
         let host = found
             .iter()
             .flatten()
@@ -1157,7 +1267,10 @@ impl ExpertResidency {
         let cfg = match &host {
             Some(_) => {
                 bounded = ResidencyConfig {
-                    staging: false,
+                    lend_repack: 0,
+                    lend_keep: Vec::new(),
+                    stage_pieces: 0,
+                    stage_reuse: true,
                     cpu_share: super::cpu_share::CpuShareConfig {
                         share: 0.0,
                         ..cfg.cpu_share.clone()
@@ -1556,6 +1669,7 @@ impl ExpertResidency {
                 backed: true,
                 dirty: true,
                 keep,
+                tier: host.is_some(),
                 tail_lent: false,
                 stage_ids: Vec::new(),
                 stage_first: 0,
@@ -1739,7 +1853,23 @@ impl ExpertResidency {
         #[cfg(feature = "cuda")]
         if n as i64 >= self.stage_min {
             for d in 0..self.devices.len() {
-                let plan = self.stage_plan(d, &ran);
+                let plan = match self.host.clone() {
+                    // The bounded host tier: the pass's copies with the tier's sources, its
+                    // checkpoint reads started; the pass before's copies are done first, as
+                    // they read the staging places these reads fill.
+                    Some(h) => {
+                        match self.devices[d].stage_mut() {
+                            Some(st) => st.sync()?,
+                            None => continue,
+                        }
+                        let (plan, hook) = self.tier_plan(d, &ran, &h)?;
+                        if let (Some(st), Some(hook)) = (self.devices[d].stage_mut(), hook) {
+                            st.set_hook(hook)?;
+                        }
+                        plan
+                    }
+                    None => self.stage_plan(d, &ran),
+                };
                 let idle = &self.idle;
                 if let (Some(st), false) = (self.devices[d].stage_mut(), plan.is_empty()) {
                     // A staging peer idle while this pass runs takes half of its copies
@@ -1772,8 +1902,10 @@ impl ExpertResidency {
     /// pass's copies must not depend on what the running pass caches.
     #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     pub fn stage_ahead(&mut self, n: usize, ran: impl Fn(usize) -> bool) -> Result<(), String> {
+        // Not with the bounded host tier: a pass's checkpoint reads take the staging places
+        // the running pass's copies still read.
         #[cfg(feature = "cuda")]
-        if self.is_lent() && n as i64 >= self.stage_min {
+        if self.is_lent() && n as i64 >= self.stage_min && self.host.is_none() {
             for d in 0..self.devices.len() {
                 let plan = self.stage_plan(d, &ran);
                 if let (Some(st), false) = (self.devices[d].stage_mut(), plan.is_empty()) {
@@ -1805,6 +1937,46 @@ impl ExpertResidency {
         // the model's layers, its row at its layer's place, [`run_rows`]).
         plan.sort_by_key(|p| p.1);
         plan
+    }
+
+    /// [`Self::stage_plan`] with the bounded host tier `h`, and the calls its copies make
+    /// ([`super::host_tier::HostTier::stage_pass`]): none when no layer is staged.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::type_complexity)]
+    fn tier_plan(
+        &self,
+        d: usize,
+        ran: &impl Fn(usize) -> bool,
+        h: &super::host_tier::HostTier,
+    ) -> Result<
+        (
+            Vec<(usize, usize, Vec<super::staging::Copy>)>,
+            Option<super::host_tier::PassHook>,
+        ),
+        String,
+    > {
+        let mut rows: Vec<(usize, &Layer)> = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter_map(|(il, l)| Some((il, l.as_ref()?)))
+            .filter(|(il, l)| l.dev == d && ran(*il) && !l.staged.is_empty())
+            .collect();
+        if rows.is_empty() {
+            return Ok((Vec::new(), None));
+        }
+        rows.sort_by_key(|r| r.1.row);
+        let misses: Vec<(usize, Vec<u32>)> = rows
+            .iter()
+            .map(|(il, l)| (*il, l.stage_misses().iter().map(|m| m.0).collect()))
+            .collect();
+        let (srcs, hook) = h.stage_pass(&misses)?;
+        let plan = rows
+            .iter()
+            .zip(&srcs)
+            .map(|((il, l), s)| (*il, l.row, l.tier_copies(s)))
+            .collect();
+        Ok((plan, Some(hook)))
     }
 
     /// The bytes of routed experts the layers `layers` read since the start, by where (#391's
@@ -2115,8 +2287,25 @@ impl ExpertResidency {
     /// writes changed tables, over every layer. Must run before the next pass starts.
     pub fn after_step(&mut self, n: usize, ran: impl Fn(usize) -> bool) -> Result<(), String> {
         #[cfg(feature = "cuda")]
+        self.tier_settled()?;
+        #[cfg(feature = "cuda")]
         self.refill(None, false)?;
         self.learn(n, &ran, None, true)
+    }
+
+    /// The bounded host tier: waits for the devices before the after-step work. Without the
+    /// wait a kernel of a step soon after a restore read unmapped memory (an illegal access,
+    /// in both runs that lent the cache); with it none did. What the kernel raced with is
+    /// not known yet; decode measured the same with the wait.
+    #[cfg(feature = "cuda")]
+    fn tier_settled(&self) -> Result<(), String> {
+        if self.host.is_none() {
+            return Ok(());
+        }
+        for c in self.devices.iter().filter_map(|d| d.place.cuda) {
+            super::cuda::sync_device(c)?;
+        }
+        Ok(())
     }
 
     /// [`Self::after_step`] that touches only the layers `ran` says: it completes their
@@ -2125,6 +2314,8 @@ impl ExpertResidency {
     /// layer's copies stay pending until its own call). Once the refill after
     /// [`Self::restore`] is done, it points these layers' tables at their slots again.
     pub fn after_step_only(&mut self, n: usize, ran: impl Fn(usize) -> bool) -> Result<(), String> {
+        #[cfg(feature = "cuda")]
+        self.tier_settled()?;
         #[cfg(feature = "cuda")]
         self.refill(Some(&ran), false)?;
         self.learn(n, &ran, Some(&ran), true)
@@ -2136,6 +2327,8 @@ impl ExpertResidency {
     /// [`Self::after_step_only`]. Planning is per device, so as long as each device's layers
     /// are in one call, the calls plan the swaps one call over all of them would.
     pub fn after_step_more(&mut self, n: usize, ran: impl Fn(usize) -> bool) -> Result<(), String> {
+        #[cfg(feature = "cuda")]
+        self.tier_settled()?;
         #[cfg(feature = "cuda")]
         self.refill(Some(&ran), false)?;
         self.learn(n, &ran, Some(&ran), false)
@@ -2764,6 +2957,12 @@ impl ExpertResidency {
                     .stage_table()
                     .set_i32_at(l.row * self.n_expert, &l.stage_ids);
             }
+            // The bounded host tier: the experts the slots gave up are in the checkpoint only.
+            if let Some(h) = &self.host {
+                for (il, gone) in held.iter().enumerate() {
+                    h.dropped(il, gone);
+                }
+            }
             // Every lookup reads host memory before any slot is freed.
             self.upload_tables(None)?;
             self.lent = Some(held);
@@ -3082,7 +3281,10 @@ impl ExpertResidency {
                 // The experts routed to most that the kept slots do not hold (the kept ones stay:
                 // a lend copies the others in runs of consecutive ids); before any routing was
                 // seen, those it took.
+                // The bounded host tier has no host bytes of every expert: its layers' slots
+                // only take VRAM here, and `refill` fills them from the tier's RAM slots.
                 let fills = match l.slots.ranked() {
+                    _ if l.tier => Vec::new(),
                     Some(ranked) => l.slots.refill(&ranked),
                     None => l.slots.refill(held),
                 };
@@ -3167,6 +3369,7 @@ impl ExpertResidency {
             .partition(|(il, _)| scope.is_none_or(|f| f(*il)));
         self.refilled = later;
         let mut n = 0;
+        let mut tier = Vec::new();
         for (il, r) in now {
             let l = self.layers[il].as_mut().expect("tiered layer");
             match r {
@@ -3175,6 +3378,9 @@ impl ExpertResidency {
                     l.tail_lent = false;
                     for s in 0..l.slots.n_slots() as u32 {
                         l.slots.complete(s);
+                    }
+                    if l.tier {
+                        tier.push(il);
                     }
                     n += 1;
                 }
@@ -3187,9 +3393,30 @@ impl ExpertResidency {
             }
             l.dirty = true;
         }
+        // The bounded host tier: the emptied slots take the most routed experts its RAM
+        // slots hold (copies over the link, no checkpoint read); the swaps bring the others.
+        let mut from_ram = 0;
+        if let Some(h) = self.host.clone() {
+            for il in tier {
+                let in_ram = h.in_ram(il);
+                let l = self.layers[il].as_mut().expect("tiered layer");
+                let Some(ranked) = l.slots.ranked() else {
+                    continue;
+                };
+                let hot: Vec<u32> = ranked.into_iter().filter(|&e| in_ram[e as usize]).collect();
+                let fills = l.slots.refill(&hot);
+                from_ram += fills.len();
+                self.copy_from_host(il, &fills)?;
+                let l = self.layers[il].as_mut().expect("tiered layer");
+                for &(s, _) in &fills {
+                    l.slots.complete(s);
+                }
+            }
+        }
         tracing::debug!(
             waited_ms = t0.elapsed().as_secs_f64() * 1e3,
             layers = n,
+            from_ram,
             "expert cache refilled"
         );
         Ok(())
@@ -4045,7 +4272,11 @@ impl LendWork<'_> {
                                 l.ranges.push(r);
                             }
                         }
-                        l.ranges[k].view(l.tensor(k), packed.then_some(n_ids), kind)
+                        // The bounded host tier's tensor ends after its RAM slots and
+                        // staging places: the staged ids go on to the last expert's.
+                        let all = l.slots.n_slots() + l.slots.n_expert();
+                        let n = packed.then_some(n_ids).or(l.tier.then_some(all));
+                        l.ranges[k].view(l.tensor(k), n, kind)
                     } else if packed {
                         super::cuda::staged_packed(c, l.tensor(k), buf, n_ids, kind)
                     } else if *mode == Lend::Keep {

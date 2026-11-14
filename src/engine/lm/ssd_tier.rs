@@ -147,23 +147,31 @@ pub fn host_tier_wanted(
         && arena
 }
 
-/// Prompt tokens per chunk with the bounded host tier, when none were asked for: a chunk reads
-/// every host expert it routes to once over the link, nearly all of them from a few hundred
-/// tokens on, so a prompt costs its chunks more than its tokens. The step buffers of a bigger
-/// chunk come off the VRAM expert cache: on a 24 GB card 2048 tokens take 8% of its slots
-/// (decode 2-5% slower, prompts 1.5-1.9 times faster than at 512), 4096 take 18%.
-pub const HOST_TIER_CHUNK: usize = 2048;
+/// The prompt step the bounded host tier's long prompts are sized for: a pass over the lent
+/// VRAM cache copies every expert no kept slot holds into VRAM once, those in no RAM slot
+/// read from the checkpoint first, so a prompt costs its passes more than its tokens. The
+/// cache keeps as many slots through a lend as leave a step of this many tokens its buffers
+/// (an 8K prompt is one pass); the kept slots' experts are neither copied nor read.
+pub const HOST_TIER_PASS: usize = 8704;
 
-/// The prompt chunk and the most tokens per step the bounded host tier runs with:
-/// [`HOST_TIER_CHUNK`] for both, unless a chunk was given (`given`: `--prefill-chunk`) or the
-/// batch (`max_batch`) is not the default. `None`: as configured.
-pub fn host_tier_chunk(
-    given: Option<usize>,
-    chunk: usize,
-    max_batch: usize,
-) -> Option<(usize, usize)> {
-    (given.is_none() && chunk == super::PREFILL_CHUNK && max_batch == super::MAX_BATCH_TOKENS)
-        .then_some((HOST_TIER_CHUNK, HOST_TIER_CHUNK))
+/// From this many prompt tokens left, the bounded host tier's prompts lend the cache (with
+/// `--long-prompt-tokens` at its default): a staged pass reads the checkpoint once, shorter
+/// prompts' chunks read what they route to. Above the startup warmup's longest prompt
+/// (`--warmup-shapes`): the first chats find the VRAM cache as the load filled it.
+pub const HOST_TIER_LONG: usize = 1536;
+
+/// The fewest tokens a staged pass of the bounded host tier is capped to.
+pub const HOST_TIER_MIN_PASS: usize = 1024;
+
+/// The most tokens a staged pass of the bounded host tier takes: what fits `free` bytes of
+/// VRAM, when a step of `tokens` tokens takes `bytes` (linear in the tokens), in whole
+/// `block`s and at least [`HOST_TIER_MIN_PASS`]. 0 (no cap) when nothing was measured.
+pub fn host_tier_pass_cap(free: usize, bytes: usize, tokens: usize, block: usize) -> usize {
+    if bytes == 0 || tokens == 0 {
+        return 0;
+    }
+    let fits = (free as u128 * tokens as u128 / bytes as u128) as usize;
+    (fits / block.max(1) * block.max(1)).max(HOST_TIER_MIN_PASS)
 }
 
 /// The bounded host tier of a load: its layers' expert tensors and its memory.
