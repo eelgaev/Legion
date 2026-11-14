@@ -392,6 +392,9 @@ pub struct Model {
     /// The 4-bit copy of the output head the MTP head drafts with
     /// ([`Self::quantize_draft_head`]).
     draft_head: Option<Context>,
+    /// The token ids the MTP head drafts over when they are not the vocabulary's first
+    /// [`Self::draft_vocab`] ([`Self::set_draft_ids`]): ascending.
+    draft_ids: Option<Vec<u32>>,
     /// Where the per-layer n-gram table's rows come from when it is read through a store
     /// ([`crate::residency::lookup_table`]: RAM, page cache or direct SSD reads); `None`: from
     /// the weights' own host memory.
@@ -1592,6 +1595,7 @@ impl Model {
             widened: None,
             requant: None,
             draft_head: None,
+            draft_ids: None,
             ngram: None,
             ple_late: Default::default(),
             ple_ahead: Default::default(),
@@ -1642,6 +1646,7 @@ impl Model {
             widened: None,
             requant: None,
             draft_head: None,
+            draft_ids: None,
             ngram: None,
             ple_late: Default::default(),
             ple_ahead: Default::default(),
@@ -1806,6 +1811,23 @@ impl Model {
     /// The draft vocabulary set by [`Self::set_draft_vocab`].
     pub(crate) fn draft_vocab(&self) -> usize {
         self.draft_vocab
+    }
+
+    /// MTP drafts from now on over the tokens `ids` (ascending, each below the vocabulary's
+    /// size) instead of the vocabulary's first [`Self::draft_vocab`]: the executor copies those
+    /// rows of the output head when it enables the head ([`Self::copy_draft_head`], or
+    /// [`Self::quantize_draft_head`] with `--spec-draft-lm-head q4`). glm5-next (#1172).
+    pub fn set_draft_ids(&mut self, ids: Vec<u32>) {
+        debug_assert!(
+            ids.windows(2).all(|p| p[0] < p[1]),
+            "draft ids not ascending"
+        );
+        self.draft_ids = Some(ids);
+    }
+
+    /// The token ids set by [`Self::set_draft_ids`], if any.
+    pub(crate) fn draft_ids(&self) -> Option<&[u32]> {
+        self.draft_ids.as_deref()
     }
 
     /// How the fused expert op keeps per-pair outputs from now on (default:

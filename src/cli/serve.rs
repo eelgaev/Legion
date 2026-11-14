@@ -1541,15 +1541,18 @@ struct EngineArgs {
     /// only steps the n-gram drafts in verify more rows (with --spec-fixed every step does).
     #[arg(long, value_name = "K", value_parser = clap::value_parser!(u8).range(1..=16))]
     spec_mtp_ngram_k: Option<u8>,
-    /// Model engine, the MTP heads of qwen4exp and qwen35 (`--spec mtp`) and DFlash drafters that
-    /// borrow the target's output head (`--spec dflash`): the head scores only the first this many
-    /// tokens of the vocabulary when it drafts (0, the default: all), so a draft pass reads that
-    /// many rows of the output head instead of all 248,320 on the Qwen3.8 models (see also
-    /// --spec-draft-lm-head). Drafts only: every token is verified by the full model, so the output
-    /// does not change; a draft outside the set is never proposed. Recommended: 65536 (GB10:
-    /// Flash-Next ~2 ms less per draft pass, chats 38.8 / 37.1 / 37.0 -> 40.8 / 40.5 / 41.8 tok/s;
-    /// the 27B cycle 117-127 -> 108-113 ms, +3-9% by prompt class). Smaller sets (32768 and below)
-    /// cut acceptance more than they save. The head's probability is then over those tokens
+    /// Model engine, the MTP heads of qwen4exp, qwen35 and glm5-next (`--spec mtp`) and DFlash
+    /// drafters that borrow the target's output head (`--spec dflash`): the head scores only the
+    /// first this many tokens of the vocabulary when it drafts (0, the default: all), so a draft
+    /// pass reads that many rows of the output head instead of all 248,320 on the Qwen3.8 models
+    /// (154,880 on GLM-5.3-Flash, which scores the number tokens past them too: its 2-5 digit
+    /// pieces sit past id 98,000; see also --spec-draft-lm-head). Drafts only: every token is
+    /// verified by the full model, so the output does not change; a draft outside the set is
+    /// never proposed. Recommended: 65536 (GB10: Flash-Next ~2 ms less per draft pass, chats
+    /// 38.8 / 37.1 / 37.0 -> 40.8 / 40.5 / 41.8 tok/s; the 27B cycle 117-127 -> 108-113 ms, +3-9%
+    /// by prompt class; GLM-5.3-Flash Maya-S at 1 user 84.8 -> 82.3 ms a step, -0.7 to +3.2% by
+    /// chat, 4 users and prefill unchanged). Smaller sets (32768 and below) cut acceptance more
+    /// than they save. The head's probability is then over those tokens
     /// (higher), which --spec-p-min and the depth policy see. See docs/tuning-integrated-gpus.md.
     #[arg(long, env = "LEGION_SPEC_DRAFT_VOCAB", default_value_t = 0)]
     spec_draft_vocab: usize,

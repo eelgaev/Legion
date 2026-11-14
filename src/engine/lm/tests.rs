@@ -493,8 +493,13 @@ fn explicit_kv_pool_respects_the_reserve_on_shared_memory() {
 }
 
 #[test]
-fn draft_vocab_applies_to_qwen4exp_and_qwen35_mtp_and_dflash_only() {
+fn draft_vocab_applies_to_qwen4exp_qwen35_and_glm_mtp_and_dflash_only() {
     assert_eq!(draft_vocab_unused(0, false, false, "gemma4", 1000), None);
+    assert_eq!(
+        draft_vocab_unused(65536, true, false, "glm5-next", 154880),
+        None
+    );
+    assert!(draft_vocab_unused(154880, true, false, "glm5-next", 154880).is_some());
     assert_eq!(
         draft_vocab_unused(65536, true, false, "qwen4exp", 248320),
         None
@@ -523,12 +528,12 @@ fn draft_vocab_applies_to_qwen4exp_and_qwen35_mtp_and_dflash_only() {
 }
 
 #[test]
-fn mtp_lm_head_applies_to_qwen4exp_and_qwen35_only() {
+fn mtp_lm_head_applies_to_qwen4exp_qwen35_and_glm_only() {
     use crate::spec::DraftLmHead::{Auto, Model, Q4};
-    for arch in ["qwen4exp", "qwen35", "qwen35moe"] {
+    for arch in ["qwen4exp", "qwen35", "qwen35moe", "glm5-next"] {
         assert!(mtp_lm_head_unused(Q4, arch).is_none(), "{arch}");
     }
-    for arch in ["glm5-next", "gemma4"] {
+    for arch in ["gemma4", "deepseek4"] {
         assert!(mtp_lm_head_unused(Q4, arch).is_some(), "{arch}");
         assert!(mtp_lm_head_unused(Model, arch).is_none(), "{arch}");
         // The default warns about nothing.
