@@ -40,6 +40,7 @@ fn checkpoint_matches_the_converted_gguf() {
     // The converter dequantizes FP8 weights to BF16; compare like with like.
     let bf16 = legion::hf::OpenOptions {
         fp8: legion::hf::Fp8Mode::Bf16,
+        ..Default::default()
     };
     let ours = GgufFile::open_with(&dir, &bf16).unwrap();
     let want = GgufFile::open(&reference).unwrap();

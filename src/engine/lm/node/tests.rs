@@ -70,6 +70,24 @@ fn a_drafting_head_counts_on_rank_1() {
     assert_eq!(balanced_split(&bytes, first, last), 3);
 }
 
+/// The automatic split is the one without drafting (#560 round 4): the head drafts between
+/// steps, so it counts for the fit only (as before with `head_counts`).
+#[test]
+fn a_drafting_head_leaves_the_split_alone() {
+    let mut tensors = vec![
+        tensor("token_embd.weight", 7),
+        tensor("output.weight", 5),
+        tensor("blk.4.nextn.eh_proj.weight", 30),
+    ];
+    for il in 0..4 {
+        tensors.push(tensor(&format!("blk.{il}.attn_q.weight"), 10));
+    }
+    assert_eq!(auto_split(&tensors, 4, false, false), 2);
+    assert_eq!(auto_split(&tensors, 4, true, false), 2);
+    assert_eq!(auto_split(&tensors, 4, true, true), 3);
+    assert_eq!(auto_split(&tensors, 4, false, true), 2);
+}
+
 #[test]
 fn balanced_split_evens_the_bytes() {
     // Rank 0 has the embeddings, rank 1 the head.

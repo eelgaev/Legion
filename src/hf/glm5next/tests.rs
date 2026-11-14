@@ -193,6 +193,170 @@ fn mtp_block_is_the_converters_nextn_layer() {
     assert!(b.stacks.is_empty());
 }
 
+/// A one-file safetensors checkpoint of `(name, dtype, shape, bytes)`.
+fn write_checkpoint_data(dir: &Path, tensors: &[(String, &str, Vec<usize>, Vec<u8>)]) {
+    let mut header = serde_json::Map::new();
+    let mut data = Vec::new();
+    for (name, dtype, shape, bytes) in tensors {
+        header.insert(
+            name.clone(),
+            json!({"dtype": dtype, "shape": shape, "data_offsets": [data.len(), data.len() + bytes.len()]}),
+        );
+        data.extend_from_slice(bytes);
+    }
+    let mut h = serde_json::to_vec(&header).unwrap();
+    while !h.len().is_multiple_of(8) {
+        h.push(b' ');
+    }
+    let mut out = (h.len() as u64).to_le_bytes().to_vec();
+    out.extend(h);
+    out.extend(data);
+    std::fs::write(dir.join("model.safetensors"), out).unwrap();
+}
+
+/// `n` BF16 values in [-0.05, 0.05) from a fixed stream.
+fn bf16_values(n: usize, seed: u32) -> Vec<u8> {
+    let mut s = seed;
+    (0..n)
+        .flat_map(|_| {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let v = ((s >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0) * 0.05;
+            ((v.to_bits() >> 16) as u16).to_le_bytes()
+        })
+        .collect()
+}
+
+/// Over two nodes the MTP layer's BF16 routed experts load as NVFP4 (#560 round 4): the
+/// decoder's layout (ggml blocks plus a per-expert `.scale`), each value within one unit of its
+/// 16-element block's scale and the largest exact; the shared expert stays BF16.
+#[test]
+fn bf16_experts_load_as_nvfp4_when_asked() {
+    const E: usize = 128;
+    const FF: usize = 64;
+    const NE: usize = 2;
+    let l = "model.language_model.layers.3.";
+    let s = |t: &str| format!("{l}{t}");
+    let d = |t: &str| format!("blk.3.{t}");
+    let mut t: Vec<(String, &str, Vec<usize>, Vec<u8>)> = Vec::new();
+    let mut seed = 1;
+    let mut add = |name: String, shape: Vec<usize>| {
+        seed += 1;
+        let n = shape.iter().product();
+        t.push((name, "BF16", shape, bf16_values(n, seed)));
+    };
+    add(s("mlp.gate.weight"), vec![NE, E]);
+    for e in 0..NE {
+        add(s(&format!("mlp.experts.{e}.gate_proj.weight")), vec![FF, E]);
+        add(s(&format!("mlp.experts.{e}.up_proj.weight")), vec![FF, E]);
+        add(s(&format!("mlp.experts.{e}.down_proj.weight")), vec![E, FF]);
+    }
+    for (h, shape) in [
+        ("gate_proj", vec![FF, E]),
+        ("up_proj", vec![FF, E]),
+        ("down_proj", vec![E, FF]),
+    ] {
+        add(s(&format!("mlp.shared_experts.{h}.weight")), shape);
+    }
+    t.push((
+        s("mlp.gate.e_score_correction_bias"),
+        "F32",
+        vec![NE],
+        vec![0; 4 * NE],
+    ));
+    let dir = tempfile::tempdir().unwrap();
+    write_checkpoint_data(dir.path(), &t);
+    let mut b = Builder::new(Arc::new(Checkpoint::open(dir.path()).unwrap()));
+    moe(&mut b, &s, &d, E as u64, NE as u64, FF as u64, true).unwrap();
+    let to_f32 = |b: &[u8]| -> Vec<f32> {
+        b.chunks_exact(2)
+            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+            .collect()
+    };
+    for (g, h, k, rows) in [
+        ("gate", "gate_proj", E, FF),
+        ("up", "up_proj", E, FF),
+        ("down", "down_proj", FF, E),
+    ] {
+        let name = d(&format!("ffn_{g}_exps.weight"));
+        let info = b.tensors.iter().find(|t| t.name == name).unwrap();
+        assert_eq!(info.ggml_type, types::NVFP4, "{name}");
+        assert_eq!(info.shape, vec![k as u64, rows as u64, NE as u64]);
+        let Some(Recipe::Computed(w)) = b.recipes.get(&name) else {
+            panic!("{name}: not computed");
+        };
+        let Some(Recipe::Computed(sc)) = b.recipes.get(&d(&format!("ffn_{g}_exps.scale"))) else {
+            panic!("{name}: no computed scale");
+        };
+        let w = w().unwrap();
+        assert_eq!(w.len() as u64, info.size);
+        let sc: Vec<f32> = sc()
+            .unwrap()
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(sc.len(), NE);
+        let per = w.len() / NE;
+        for e in 0..NE {
+            let x = to_f32(
+                b.ckpt
+                    .data(&s(&format!("mlp.experts.{e}.{h}.weight")))
+                    .unwrap(),
+            );
+            let q = crate::ggml::dequantize(types::NVFP4, &w[e * per..(e + 1) * per], rows * k);
+            let amax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+            assert_eq!(sc[e], amax / 2688.0);
+            for (i, (&a, &v)) in x.iter().zip(&q).enumerate() {
+                let block = &x[i / 16 * 16..i / 16 * 16 + 16];
+                let bmax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
+                let y = v * sc[e];
+                assert!(
+                    (a - y).abs() <= bmax / 6.0 * 1.07,
+                    "{name} expert {e} [{i}]: {a} -> {y}"
+                );
+                if a.abs() == amax {
+                    assert!(
+                        (a - y).abs() <= amax * 1e-6,
+                        "{name} expert {e}: max {a} -> {y}"
+                    );
+                }
+            }
+        }
+    }
+    let shexp = b
+        .tensors
+        .iter()
+        .find(|t| t.name == d("ffn_gate_shexp.weight"))
+        .unwrap();
+    assert_eq!(shexp.ggml_type, types::BF16);
+    // No SSD-tier sources: the NVFP4 bytes are made at load.
+    assert!(b.stacks.is_empty());
+}
+
+/// Experts not of whole 64-element blocks stay BF16 even when asked.
+#[test]
+fn odd_sized_experts_stay_bf16() {
+    let dir = tempfile::tempdir().unwrap();
+    write_checkpoint(dir.path(), &mtp_layer());
+    let mut b = Builder::new(Arc::new(Checkpoint::open(dir.path()).unwrap()));
+    b.mtp_nvfp4 = true;
+    let dims = MtpDims {
+        n_embd: E as u64,
+        n_head: H as u64,
+        n_expert: NE as u64,
+        ff: FF as u64,
+        kv_lora: KV as u64,
+        k_dim: K as u64,
+        v_dim: V as u64,
+    };
+    mtp_block(&mut b, "model.language_model.", IL, &dims).unwrap();
+    let t = b
+        .tensors
+        .iter()
+        .find(|t| t.name == format!("blk.{IL}.ffn_up_exps.weight"))
+        .unwrap();
+    assert_eq!(t.ggml_type, types::BF16);
+}
+
 #[test]
 fn nextn_layers_follow_the_checkpoint() {
     let tc = json!({"num_nextn_predict_layers": 1});

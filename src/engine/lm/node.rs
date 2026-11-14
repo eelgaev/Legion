@@ -105,6 +105,27 @@ pub(super) fn balanced_split(bytes: &[u64], first: u64, last: u64) -> usize {
         .unwrap_or(1)
 }
 
+/// The automatic split: balanced by the bytes a step reads (the layers, rank 0's embeddings,
+/// rank 1's output norm and head). A drafting MTP head (`mtp`) runs on rank 1 between steps,
+/// not in the pipelined rounds of several groups, where the slower rank sets the pace (#560):
+/// its layer and its copy of the embeddings count for the fit only, so the split is the one
+/// without drafting. `head_counts`: they count here too (the split before #560 round 4, for
+/// A/B), which gives rank 0 more layers.
+pub(super) fn auto_split(
+    tensors: &[TensorInfo],
+    n_layer: usize,
+    mtp: bool,
+    head_counts: bool,
+) -> usize {
+    let (bytes, first, last) = byte_shares(tensors, n_layer, mtp && head_counts);
+    balanced_split(&bytes, first, last)
+}
+
+/// `LEGION_DEBUG_NODE_SPLIT_HEAD=1`: [`auto_split`] counts a drafting MTP head's bytes.
+fn split_counts_head() -> bool {
+    std::env::var_os("LEGION_DEBUG_NODE_SPLIT_HEAD").is_some_and(|v| v == "1")
+}
+
 /// The split closest to balanced under which both ranks fit in `room` bytes each (`None`: no
 /// split does).
 pub(super) fn fitting_split(bytes: &[u64], first: u64, last: u64, room: u64) -> Option<usize> {
@@ -124,11 +145,11 @@ fn gib(b: u64) -> f64 {
 }
 
 impl Share {
-    /// This rank's share of the model's layers: at `--node-split`, else balanced by the
-    /// layers' bytes. Every tensor of the share must fit in `free` bytes of device memory
-    /// (no SSD or host tier over two nodes): if not, the error names a split that would fit.
-    /// With `mtp` (the MTP head drafts) rank 1's share counts the head's layer and its copy of
-    /// the embeddings.
+    /// This rank's share of the model's layers: at `--node-split`, else [`auto_split`] (from
+    /// the model's tensors only, so both ranks pick the same one). Every tensor of the share
+    /// must fit in `free` bytes of device memory (no SSD or host tier over two nodes): if not,
+    /// the error names a split that would fit. With `mtp` (the MTP head drafts) rank 1's share
+    /// holds the head's layer and its copy of the embeddings.
     pub fn plan(
         node: &NodeConfig,
         hp: &Hparams,
@@ -152,7 +173,7 @@ impl Share {
                 )));
             }
             Some(s) => s,
-            None => balanced_split(&bytes, first, last),
+            None => auto_split(tensors, n, mtp, split_counts_head()),
         };
         let (b0, b1) = rank_bytes(&bytes, first, last, split);
         let need = if node.rank == 0 { b0 } else { b1 };

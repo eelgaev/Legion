@@ -269,6 +269,166 @@ pub fn repack_nvfp4_into(weight: &[u8], scale: &[u8], rows: usize, k: usize, out
     }
 }
 
+/// A BF16 value (little-endian bytes) as f32, exactly.
+fn bf16_at(b: &[u8], i: usize) -> f32 {
+    f32::from_bits((u16::from_le_bytes([b[2 * i], b[2 * i + 1]]) as u32) << 16)
+}
+
+/// The per-tensor NVFP4 scale ModelOpt gives a BF16 weight (`weight_scale_2`): its largest
+/// magnitude over the largest E2M1 value (6) times the largest E4M3 scale (448); 1 for an
+/// all-zero weight.
+pub fn bf16_nvfp4_scale2(bf16: &[u8]) -> f32 {
+    let amax = (0..bf16.len() / 2).fold(0f32, |m, i| m.max(bf16_at(bf16, i).abs()));
+    if amax > 0.0 && amax.is_finite() {
+        amax / (6.0 * 448.0)
+    } else {
+        1.0
+    }
+}
+
+/// BF16 weight rows (`rows` x `k`, row-major, little-endian) quantized to NVFP4 the way
+/// ModelOpt quantizes a weight (`NVFP4QTensor`), as ggml `block_nvfp4` rows
+/// ([`repack_nvfp4`]): with the per-tensor `scale2` ([`bf16_nvfp4_scale2`]), each 16 elements
+/// get the E4M3 scale `amax16 / 6 / scale2` and the E2M1 codes of `x / (scale · scale2)`, both
+/// rounded to nearest even and saturated. Dequantized, an element is `e2m1 · e4m3 · scale2`.
+pub fn quantize_bf16_nvfp4(bf16: &[u8], rows: usize, k: usize, scale2: f32) -> Vec<u8> {
+    use crate::model::nvfp4_a4::{e2m1, e4m3, e4m3_value};
+    assert_eq!(k % BLOCK, 0, "NVFP4 rows hold whole 64-element blocks");
+    assert_eq!(bf16.len(), rows * k * 2);
+    let n = rows * k;
+    // ModelOpt's layout first: two codes a byte (element 2i low), one E4M3 per 16 elements.
+    let mut weight = vec![0u8; n / 2];
+    let mut scale = vec![0u8; n / SUB];
+    for (s, sc) in scale.iter_mut().enumerate() {
+        let x: [f32; SUB] = std::array::from_fn(|j| bf16_at(bf16, s * SUB + j));
+        let amax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+        *sc = e4m3(amax / 6.0 / scale2);
+        let d = e4m3_value(*sc) * scale2;
+        if d == 0.0 {
+            continue;
+        }
+        for (j, pair) in x.chunks_exact(2).enumerate() {
+            weight[s * SUB / 2 + j] = e2m1(pair[0] / d) | e2m1(pair[1] / d) << 4;
+        }
+    }
+    repack_nvfp4(&weight, &scale, rows, k)
+}
+
+/// Threads one quantized stack uses at load (the loader converts a few tensors at once).
+const QUANT_THREADS: usize = 4;
+
+/// `f(i, item)` for every `per`-long item `i` of `out`, on a few threads (a run of items each).
+fn par_items<T: Send>(
+    out: &mut [T],
+    per: usize,
+    f: &(dyn Fn(usize, &mut [T]) -> Result<(), String> + Sync),
+) -> Result<(), String> {
+    let n = out.len() / per.max(1);
+    if n == 0 {
+        return Ok(());
+    }
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |t| t.get())
+        .clamp(1, QUANT_THREADS)
+        .min(n);
+    let run = n.div_ceil(threads);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = out
+            .chunks_mut(run * per)
+            .enumerate()
+            .map(|(c, part)| {
+                s.spawn(move || {
+                    for (j, item) in part.chunks_mut(per).enumerate() {
+                        f(c * run + j, item)?;
+                    }
+                    Ok::<(), String>(())
+                })
+            })
+            .collect();
+        handles.into_iter().try_for_each(|h| {
+            h.join()
+                .map_err(|_| "a quantizer thread panicked".to_string())?
+        })
+    })
+}
+
+/// `name` (NVFP4, ggml `shape` `[k, rows, n_expert]`) is the BF16 experts `srcs` (row-major
+/// `[rows, k]` each) stacked and quantized at load ([`quantize_bf16_nvfp4`]), with their
+/// per-expert scales as the F32 `<name>.scale` (`[n_expert]`): the layout
+/// [`super::nemotron_h::stack_nvfp4`] gives the experts the checkpoint ships in NVFP4. Each
+/// expert's scale is read off its weight once, for both tensors. Not an SSD-tier stack (it has
+/// no NVFP4 bytes in the shards).
+pub(super) fn stack_bf16_as_nvfp4(
+    b: &mut Builder,
+    name: &str,
+    srcs: &[String],
+    shape: Vec<u64>,
+) -> Result<(), String> {
+    let (k, rows) = (shape[0] as usize, shape[1] as usize);
+    if k % BLOCK != 0 || shape.get(2) != Some(&(srcs.len() as u64)) {
+        return Err(format!(
+            "`{name}`: {shape:?} does not stack {} experts in 64-element blocks",
+            srcs.len()
+        ));
+    }
+    for src in srcs {
+        let (_, t) = b.source(src)?;
+        if t.dtype != Dtype::BF16 || t.shape != [rows, k] {
+            return Err(format!(
+                "`{src}`: {} {:?}, expected BF16 [{rows}, {k}]",
+                t.dtype.name(),
+                t.shape
+            ));
+        }
+    }
+    let scale_name = name
+        .strip_suffix(".weight")
+        .map(|b| format!("{b}.scale"))
+        .ok_or_else(|| format!("`{name}`: no .weight"))?;
+    let ckpt = b.ckpt.clone();
+    let srcs: Arc<Vec<String>> = Arc::new(srcs.to_vec());
+    let memo: Arc<std::sync::OnceLock<Result<Vec<f32>, String>>> = Arc::default();
+    let scales = {
+        let (ckpt, srcs) = (ckpt.clone(), srcs.clone());
+        Arc::new(move || -> Result<Vec<f32>, String> {
+            memo.get_or_init(|| {
+                let mut out = vec![0f32; srcs.len()];
+                par_items(&mut out, 1, &|e, o| {
+                    o[0] = bf16_nvfp4_scale2(ckpt.data(&srcs[e]).map_err(|e| e.to_string())?);
+                    Ok(())
+                })?;
+                Ok(out)
+            })
+            .clone()
+        })
+    };
+    let per = rows * k / BLOCK * BLOCK_BYTES;
+    let weights: Compute = {
+        let scales = scales.clone();
+        Arc::new(move || {
+            let s2 = scales()?;
+            let mut out = vec![0u8; per * srcs.len()];
+            par_items(&mut out, per, &|e, o| {
+                let w = ckpt.data(&srcs[e]).map_err(|e| e.to_string())?;
+                o.copy_from_slice(&quantize_bf16_nvfp4(w, rows, k, s2[e]));
+                Ok(())
+            })?;
+            Ok(out)
+        })
+    };
+    b.push(name, types::NVFP4, shape.clone(), 0, 0);
+    b.recipes
+        .insert(name.to_string(), Recipe::Computed(weights));
+    b.push(&scale_name, types::F32, vec![shape[2]], 0, 0);
+    b.recipes.insert(
+        scale_name,
+        Recipe::Computed(Arc::new(move || {
+            Ok(scales()?.iter().flat_map(|v| v.to_le_bytes()).collect())
+        })),
+    );
+    Ok(())
+}
+
 /// A scalar F32 source tensor's value.
 pub(super) fn scalar(ckpt: &Checkpoint, name: &str) -> Result<f32, String> {
     let (_, t) = ckpt

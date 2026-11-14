@@ -272,7 +272,7 @@ pub(super) fn build(b: &mut Builder, config: &Json) -> Result<(), String> {
                 )?;
             }
         } else {
-            moe(b, &s, &d, n_embd, n_expert, ff_exp)?;
+            moe(b, &s, &d, n_embd, n_expert, ff_exp, false)?;
         }
     }
     if nextn > 0 {
@@ -322,7 +322,9 @@ pub(super) struct MtpDims {
 /// MoE with its shared expert like the decoder's, without hyper-connections (no `hc_*`), plus
 /// `nextn.eh_proj` (BF16) and the `nextn.enorm` / `nextn.hnorm` / `nextn.shared_head_norm` norms
 /// (F32). Its embedding and output head are the model's: the checkpoint ships none of its own.
-/// As shipped: the block is BF16 in the NVFP4 release, its 288 routed experts too.
+/// As shipped: the block is BF16 in the NVFP4 release, its 288 routed experts too, unless
+/// [`super::OpenOptions::mtp_nvfp4`] quantizes those to NVFP4 at load
+/// ([`super::nvfp4::stack_bf16_as_nvfp4`]).
 pub(super) fn mtp_block(b: &mut Builder, prefix: &str, il: u64, m: &MtpDims) -> Result<(), String> {
     let src = format!("{prefix}layers.{il}.");
     let blk = format!("blk.{il}.");
@@ -337,7 +339,8 @@ pub(super) fn mtp_block(b: &mut Builder, prefix: &str, il: u64, m: &MtpDims) -> 
     let a = |t: &str| s(&format!("self_attn.{t}"));
     mla_attention(b, &a, &d, m.n_head, m.kv_lora, m.k_dim, m.v_dim)?;
     b.direct(&d("attn_output.weight"), &a("o_proj.weight"), None)?;
-    moe(b, &s, &d, m.n_embd, m.n_expert, m.ff)?;
+    let quantize = b.mtp_nvfp4;
+    moe(b, &s, &d, m.n_embd, m.n_expert, m.ff, quantize)?;
     b.direct(&d("nextn.eh_proj.weight"), &s("eh_proj.weight"), None)?;
     for (g, h) in [
         ("nextn.enorm.weight", "enorm.weight"),
@@ -485,7 +488,8 @@ fn mla_attention(
     )
 }
 
-/// A routed-expert layer: router, bias, the stacked experts and the shared expert.
+/// A routed-expert layer: router, bias, the stacked experts and the shared expert. With
+/// `bf16_to_nvfp4`, BF16 routed experts are quantized to NVFP4 at load.
 fn moe(
     b: &mut Builder,
     s: &dyn Fn(&str) -> String,
@@ -493,6 +497,7 @@ fn moe(
     n_embd: u64,
     n_expert: u64,
     ff: u64,
+    bf16_to_nvfp4: bool,
 ) -> Result<(), String> {
     b.computed_f32(
         &d("ffn_gate_inp.weight"),
@@ -519,6 +524,8 @@ fn moe(
         let scale = srcs[0].replace(".weight", ".weight_scale");
         if t.dtype == Dtype::U8 && b.has(&scale) {
             super::nemotron_h::stack_nvfp4(b, &name, &srcs, shape)?;
+        } else if bf16_to_nvfp4 && t.dtype == Dtype::BF16 && shape[0] % 64 == 0 {
+            super::nvfp4::stack_bf16_as_nvfp4(b, &name, &srcs, shape)?;
         } else {
             b.stack(&name, &srcs, shape)?;
         }
