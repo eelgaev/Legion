@@ -73,6 +73,21 @@ pub enum ConfigError {
     Unsupported(String),
 }
 
+/// The most block positions [`debug_block`] widens a block to (16 drafts).
+pub const DEBUG_BLOCK_MAX: usize = 17;
+
+/// `LEGION_DEBUG_DFLASH2_BLOCK=<n>` (docs/debug-env.md), for A/B runs: a DFlash 2 drafter
+/// runs blocks of `n` positions instead of its trained `block_size`, so one pass drafts up to
+/// `n - 1` tokens (vLLM runs `1 + num_speculative_tokens`). Only widens, up to
+/// [`DEBUG_BLOCK_MAX`]; any other value, or a drafter that is not DFlash 2, keeps the trained
+/// size.
+pub fn debug_block(cfg: &Config, value: Option<&str>) -> usize {
+    let wider = value
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| cfg.v2.is_some() && n > cfg.block_size && n <= DEBUG_BLOCK_MAX);
+    wider.unwrap_or(cfg.block_size)
+}
+
 fn invalid<T>(msg: impl Into<String>) -> Result<T, ConfigError> {
     Err(ConfigError::Invalid(msg.into()))
 }

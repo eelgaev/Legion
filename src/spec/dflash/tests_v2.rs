@@ -183,6 +183,29 @@ fn block_drafts_from_the_config_alone() {
     assert!(block_drafts_of(&fx.root.join("missing.gguf")).is_err());
 }
 
+/// `LEGION_DEBUG_DFLASH2_BLOCK` only widens a DFlash 2 block, up to 16 drafts.
+#[test]
+fn debug_block_widens_dflash2_only() {
+    let fx = Fixture::new();
+    let cfg = |c: &TinyDraft, name: &str| {
+        Source::open(&fx.gguf(name, c))
+            .unwrap()
+            .config(Flavor::Dflash)
+            .unwrap()
+    };
+    let v2 = cfg(&v2_draft(), "d.gguf");
+    assert_eq!(v2.block_size, 8);
+    let block = |v: Option<&str>| config::debug_block(&v2, v);
+    assert_eq!(block(None), 8);
+    assert_eq!(block(Some("11")), 11);
+    assert_eq!(block(Some(" 17 ")), config::DEBUG_BLOCK_MAX);
+    for v in ["", "x", "4", "8", "18", "-3"] {
+        assert_eq!(block(Some(v)), 8, "{v:?}");
+    }
+    let v1 = cfg(&TinyDraft::default(), "v1.gguf");
+    assert_eq!(config::debug_block(&v1, Some("11")), v1.block_size);
+}
+
 #[test]
 fn hugging_face_dflash2_loads_like_gguf() {
     let fx = Fixture::new();

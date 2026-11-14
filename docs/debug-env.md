@@ -60,6 +60,7 @@ without notice.
 |---|---|
 | `LEGION_OP_PROFILE=1` | Per-op GPU time profile (CUDA): every graph node timed between CUDA events, a table on stderr now and then. Disables ggml's CUDA graphs and fusions. |
 | `LEGION_DEBUG_NGRAM_OLD_POLICY=1` | An n-gram table read from the SSD with an `--ngram-ram` budget: the row cache replaces round-robin, without a hot set (the policy before #1209), for A/B runs. Output does not change. |
+| `LEGION_DEBUG_DFLASH2_BLOCK=<n>` | `--spec dflash` with a DFlash 2 drafter: run blocks of `n` positions (up to 17) instead of the trained size, so one pass drafts up to `n - 1` tokens and steps verify as many, for A/B runs against a wider draft. Only widens; drafts past the trained block move acceptance, not output. |
 | `LEGION_META_DEBUG=1` | Tensor parallelism: print how each tensor is split over the GPUs. |
 | `LEGION_DEBUG_FAIL_CUMEMCREATE_AFTER=<n>[,<count>]` | The expert cache's slot allocations (CUDA): after the first `n` `cuMemCreate` calls for VRAM slots, the next `count` (1 if left out) fail as out of memory, to try the load's shrink to fit (#1208: the cache plans that GPU again in less and the memory plan says how many slots it kept). |
 | `LEGION_EXPERT_COUNTS=<file>` | On exit, write the raw routing counts per layer and expert as JSON, for offline expert-cache studies. |

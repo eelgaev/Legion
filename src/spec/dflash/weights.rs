@@ -82,7 +82,7 @@ impl Source {
     }
 
     pub fn config(&self, flavor: Flavor) -> Result<Config, ConfigError> {
-        match self {
+        let mut cfg = match self {
             Source::Gguf(g) => Config::from_gguf(g, flavor),
             Source::Hf(c) => Config::from_hf(
                 c.config().ok_or_else(|| {
@@ -90,7 +90,10 @@ impl Source {
                 })?,
                 flavor,
             ),
-        }
+        }?;
+        let debug = std::env::var("LEGION_DEBUG_DFLASH2_BLOCK").ok();
+        cfg.block_size = super::config::debug_block(&cfg, debug.as_deref());
+        Ok(cfg)
     }
 
     /// Names of all tensors, in the GGUF naming.
