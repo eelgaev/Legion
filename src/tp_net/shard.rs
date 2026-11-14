@@ -20,6 +20,7 @@
 //! Gemma 4 dense models (31B): every layer's KV heads must divide among the ranks. Gemma's
 //! mixture-of-experts layers would need expert parallelism, and per-layer embeddings a split of
 //! their projections. Qwen3.8-Flash-Next (`qwen4exp`) and its MTP head: [`qwen4`].
+//! GLM-5.3-Flash (`glm5-next`) and its MTP block: [`glm5`].
 //!
 //! A safetensors checkpoint's tensors that are computed at load (NVFP4
 //! repacks) are made whole on every rank and then cut, so each rank reads and repacks the
@@ -33,6 +34,7 @@ use std::sync::Arc;
 use crate::ggml::{self, ffi};
 use crate::gguf::{Compute, GgufFile, GgufWriter, Recipe, TensorInfo, Value};
 
+pub mod glm5;
 pub mod qwen4;
 
 /// FFN rows go in multiples of this when they divide evenly (kernels' preferred tile).
@@ -205,7 +207,7 @@ fn check(gguf: &GgufFile) -> Result<(), String> {
     let arch = gguf.architecture().unwrap_or_default();
     if arch != "gemma4" {
         return Err(format!(
-            "architecture {arch:?}: dense Gemma 4 and qwen4exp only for now"
+            "architecture {arch:?}: dense Gemma 4, qwen4exp and glm5-next only for now"
         ));
     }
     let n = |k: &str| gguf.get_u64(&format!("gemma4.{k}")).unwrap_or(0);
@@ -229,6 +231,9 @@ fn set(meta: &mut GgufWriter, arch: &str, k: &str, v: Value) -> Result<(), Strin
 pub fn view(gguf: &GgufFile, rank: usize, n: usize) -> Result<GgufFile, String> {
     if gguf.architecture().as_deref() == Some("qwen4exp") {
         return qwen4::view(gguf, rank, n);
+    }
+    if gguf.architecture().as_deref() == Some("glm5-next") {
+        return glm5::view(gguf, rank, n);
     }
     check(gguf)?;
     let heads = heads_of(gguf)?;
