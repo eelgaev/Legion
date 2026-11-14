@@ -486,7 +486,7 @@ pub(super) mod cuda {
             };
             let tail = match tail {
                 Some(t) if plan.wire != Wire::Bf16 => {
-                    crate::model::core::node_fuse::launch_tail(t, None, stream).map(|_| None)
+                    crate::model::core::node_fuse::launch_tail(t, None, None, stream).map(|_| None)
                 }
                 t => Ok(t),
             };
@@ -581,6 +581,19 @@ pub(super) mod cuda {
         let mut argv = [(&raw mut args).cast::<c_void>()];
         // SAFETY: the caller's.
         unsafe { launch_1d(legion_tp_net_pack_bf16_kernel, &mut argv, n, stream) }
+    }
+
+    /// Whether a whole-source exchange's send buffer can be filled a rank's piece at a time:
+    /// the pieces are the source's values, each once, in rank order.
+    fn own_last(plan: &Plan) -> bool {
+        let mut at = 0;
+        for &(i, c) in &plan.pieces {
+            if i != at {
+                return false;
+            }
+            at += c;
+        }
+        at == plan.span
     }
 
     /// The first half of an exchange on a working communicator: the buffers (grown if needed),
@@ -686,10 +699,41 @@ pub(super) mod cuda {
         // SAFETY: device tensors of the stream's device; the pinned buffers are mapped for it
         // and live as long as the communicator.
         unsafe {
-            if bf16 && let Some(t) = tail.filter(|_| kind == Kind::ReduceScatter && plan.pack_whole)
-            {
+            // A BF16 whole-source reduce-scatter (#1176): the peers' pieces first, "ready"
+            // raised, then this rank's own piece (only its sum reads it, after the wait for the
+            // peers' values), so its kernel runs while the pieces travel. The kernels work a
+            // value (the tail a token) at a time: every value as the whole launch makes it.
+            let split = bf16 && kind == Kind::ReduceScatter && plan.pack_whole && own_last(plan);
+            let fill = |own: bool| -> Result<(), String> {
+                for (r, &(i, c)) in plan.pieces.iter().enumerate() {
+                    if (r == rank) != own || c == 0 {
+                        continue;
+                    }
+                    match tail {
+                        Some(t) => {
+                            let e = t.ne[0] as usize;
+                            crate::model::core::node_fuse::launch_tail(
+                                t,
+                                Some(dd + send as u64),
+                                Some((i / e, c / e)),
+                                stream,
+                            )?;
+                        }
+                        None => pack(src + i * 4, dd + (send + i * eb) as u64, c, stream)?,
+                    }
+                }
+                Ok(())
+            };
+            if split {
+                fill(false)?;
+            } else if bf16 && let Some(t) = tail {
                 // The whole source as the pack below rounds it (#1176).
-                crate::model::core::node_fuse::launch_tail(t, Some(dd + send as u64), stream)?;
+                crate::model::core::node_fuse::launch_tail(
+                    t,
+                    Some(dd + send as u64),
+                    None,
+                    stream,
+                )?;
             } else if bf16 {
                 let packs: Vec<(usize, usize)> = match kind {
                     Kind::AllGather => vec![(0, mine.1)],
@@ -726,6 +770,9 @@ pub(super) mod cuda {
                 "cuStreamWriteValue32",
                 cuStreamWriteValue32_v2(stream, fd + READY as u64, seq, 0),
             )?;
+            if split {
+                fill(true)?;
+            }
         }
         comm.queue_pinned(
             (seq, seq.wrapping_sub(p.nbuf as u32)),

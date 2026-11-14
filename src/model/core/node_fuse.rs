@@ -1051,34 +1051,40 @@ unsafe fn cuda_moe_sum_gate(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
         return Ok(());
     }
     // SAFETY: the caller's.
-    unsafe { launch_sum_gate(dst, None, stream) }
+    unsafe { launch_sum_gate(dst, None, None, stream) }
 }
 
 /// For the reduce-scatter that took over the [`MOE_SUM_GATE`] node `dst` (#1176, see
 /// [`P_BY_EXCHANGE`]): runs it on `stream`, into its own output (`out16` `None`, an F32
 /// exchange) or with its values rounded to BF16 at the device address `out16` instead,
-/// `[n_embd, n_tok]` contiguous (the send buffer).
+/// `[n_embd, n_tok]` contiguous (the send buffer). `tokens`: only the node's tokens `(first,
+/// count)`, at their places (the kernel works a token at a time, so the launches of a split
+/// give every value the whole launch's bits): the exchange makes the peers' tokens first and
+/// its own while they travel.
 ///
 /// # Safety
 /// `dst` is such a node of an allocated graph, its sources' memory still holding their values
-/// (the exchange reads them too); `out16` device-writable for the node's values.
+/// (the exchange reads them too); `out16` device-writable for the node's values; `tokens`
+/// within the node's.
 #[cfg(feature = "cuda")]
 pub(crate) unsafe fn launch_tail(
     dst: &ffi::ggml_tensor,
     out16: Option<u64>,
+    tokens: Option<(usize, usize)>,
     stream: *mut c_void,
 ) -> Result<(), String> {
     // SAFETY: the caller's.
-    unsafe { launch_sum_gate(dst, out16, stream) }
+    unsafe { launch_sum_gate(dst, out16, tokens, stream) }
 }
 
 /// # Safety
 /// `dst` is a [`MOE_SUM_GATE`] node of an allocated graph whose sources hold their values;
-/// `out16` (fused-sum form only) as [`launch_tail`]'s.
+/// `out16` (fused-sum form only) and `tokens` as [`launch_tail`]'s.
 #[cfg(feature = "cuda")]
 unsafe fn launch_sum_gate(
     dst: &ffi::ggml_tensor,
     out16: Option<u64>,
+    tokens: Option<(usize, usize)>,
     stream: *mut c_void,
 ) -> Result<(), String> {
     // SAFETY: a node made by the rewrite, device tensors of the stream's device; the kernel
@@ -1092,20 +1098,35 @@ unsafe fn launch_sum_gate(
         let w = (weights != 0).then(|| &*dst.src[1]);
         let at = 1 + usize::from(weights != 0);
         let gate = (gated != 0).then(|| (&*dst.src[at], &*dst.src[at + 1]));
-        let (e, n) = (dst.ne[0], dst.ne[1]);
+        let e = dst.ne[0];
+        let (t0, n) = match tokens {
+            Some((a, c)) if (a + c) as i64 <= dst.ne[1] => (a, c as i64),
+            Some(_) => return Err("moe_sum_gate: tokens past the node's".into()),
+            None => (0, dst.ne[1]),
+        };
         if n < 1 || e < 1 {
             return Ok(());
         }
         if fma != 0 && (w.is_none() || gate.is_none()) {
             return Err("moe_sum_gate: the fused sum needs the weights and the gate".into());
         }
+        // Token `t0`'s place in each tensor (the kernels index them by token).
+        let g_ld = gate.map_or(0, |(_, g)| g.nb[1] / 4);
+        let (ke, e_us) = (k as usize * e as usize, e as usize);
+        let out16 = out16.map(|a| a + (t0 * e_us * 2) as u64);
         let mut p = SumGate {
-            x: x.data as *const f32,
-            w: w.map_or(std::ptr::null(), |w| w.data as *const f32),
-            sh: gate.map_or(std::ptr::null(), |(sh, _)| sh.data as *const f32),
-            g: gate.map_or(std::ptr::null(), |(_, g)| g.data as *const f32),
-            g_ld: gate.map_or(0, |(_, g)| (g.nb[1] / 4) as i64),
-            out: dst.data as *mut f32,
+            x: (x.data as *const f32).add(t0 * ke),
+            w: w.map_or(std::ptr::null(), |w| {
+                (w.data as *const f32).add(t0 * k as usize)
+            }),
+            sh: gate.map_or(std::ptr::null(), |(sh, _)| {
+                (sh.data as *const f32).add(t0 * e_us)
+            }),
+            g: gate.map_or(std::ptr::null(), |(_, g)| {
+                (g.data as *const f32).add(t0 * g_ld)
+            }),
+            g_ld: g_ld as i64,
+            out: (dst.data as *mut f32).add(t0 * e_us),
             n_embd: e,
             k,
             n_tok: n as i32,
