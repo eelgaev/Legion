@@ -4,8 +4,8 @@
 
 `--model` is the downloaded snapshot of `nvidia/Qwen3.8-Flash-Next-NVFP4` on each Spark. One process per Spark.
 Rank 0 serves HTTP; `--tp-peers` lists the two ranks' addresses on the QSFP link (rank 0 first) and is the same on
-both. MTP uses the checkpoint's own head, so there is no `--spec-draft` file. Decode (41-53 tok/s at 1 user, 117.8 at 4,
-244.8 at 16; deterministic client) and prefill (3,469 / 3,380 / 3,127 tok/s at 8K / 32K / 123K):
+both. MTP uses the checkpoint's own head, so there is no `--spec-draft` file. Decode (44-58 tok/s at 1 user, 121.8 at 4,
+248.6 at 16; deterministic client) and prefill (3,469 / 3,380 / 3,127 tok/s at 8K / 32K / 123K):
 
 ```sh
 # rank 0
@@ -33,6 +33,7 @@ legion serve \
   --tp-moe-ep \
   --prefill-slots 16 \
   --tp-rails 2 \
+  --tp-head-split \
   --tp-rank 0 \
   --tp-peers <rank0-ip>:7619,<rank1-ip>:7619
 # rank 1: the same without --port, with --tp-rank 1
@@ -78,5 +79,10 @@ Measured against vLLM 0.33.0 with tensor parallel 2, MTP and CUDA graphs on the 
   `2`, prompt-step sums of at least 1 MiB go in 1 MiB pieces over both devices instead of only the one on the
   `--tp-peers` address (the second needs no IP address). Prefill +2% (2,523 / 2,609 / 2,506 tok/s before);
   decode steps stay on the first device, and the same bytes arrive, so output does not change.
+- `--tp-head-split`: The output head reads its whole weight every step (1.27 GB here) and only rank 0 ran it. With
+  this, a greedy decode or verify step computes it as two halves of the vocabulary, one on each Spark, and rank 0
+  keeps the better of the two candidates per row. Same output (the pick and its tie order are the whole head's).
+  Decode 41-53 / 116.4 / 242.8 -> 44-58 / 121.8 / 248.6 tok/s at 1 / 4 / 16 users in the same sessions; prefill
+  unchanged. Requests with sampling, log probabilities or `min_tokens` keep the whole head on rank 0.
 - `--tp-rank` (`0`): This process's rank in tensor parallelism across machines (one process per DGX Spark). Rank 0 serves HTTP.
 - `--tp-peers`: Every rank's `ip:port` on the QSFP link, in rank order, identical on all ranks.
