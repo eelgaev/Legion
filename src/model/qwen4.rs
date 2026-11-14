@@ -30,14 +30,18 @@ pub use hc_chain::set_hc_chain;
 mod hc_mix16;
 pub use hc_mix16::{set_hc_pre, set_mix16, set_rebuild_bf16 as set_mix_rebuild_bf16};
 mod hc_norm;
-pub(crate) use hc_norm::{FoldSum, fold_moe, fold_target, moe_fold};
+pub use hc_norm::lazy_bench as hc_lazy_bench;
+pub(crate) use hc_norm::{
+    FoldSum, fold_moe, fold_target, lazy_fold_target, lazy_parts, lazy_streams, moe_fold,
+    set_lazy_fold, set_no_res,
+};
 pub use hc_norm::{
-    hc_fuse, set_fused_post_norm, set_generic_post_norm, set_hc_bf16, set_hc_fuse, set_moe_fold,
-    set_norm_fma, set_streams_bf16, set_xn16, set_xn16_gpu,
+    hc_fuse, set_fused_post_norm, set_generic_post_norm, set_hc_bf16, set_hc_fuse,
+    set_hc_lazy_streams, set_moe_fold, set_norm_fma, set_streams_bf16, set_xn16, set_xn16_gpu,
 };
 mod hc_up_mix;
 pub use hc_up_mix::bench as hc_up_mix_bench;
-pub(crate) use hc_up_mix::{mix_cast_reads, set_mix_cast};
+pub(crate) use hc_up_mix::{lazy_mix_target, mix_cast_reads, set_lazy_streams, set_mix_cast};
 pub use hc_up_mix::{
     set_gpu as set_up_mix_gpu, set_rebuild as set_up_mix_rebuild, set_up_mix, set_up_mix_bf16,
 };
