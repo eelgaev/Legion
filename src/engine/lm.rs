@@ -4947,16 +4947,23 @@ impl LmEngine {
                 // The bounded host tier (one GPU): a whole pass's step, as a kept slot's
                 // experts are neither copied nor read from the checkpoint.
                 let tier = exec.model().host_tier().is_some() && layout.stages.len() == 1;
+                // #37: one GPU with every expert in host memory reads a prompt in one step.
+                // The same pass-sized step sizes the slots its lends keep; a longer prompt's
+                // lend keeps none (`ResidencyConfig::lend_spread_upto`), as before.
+                let whole = tier_whole && layout.stages.len() == 1;
                 let long = if cfg.residency.staging
                     && cfg.residency.lend_keep.is_empty()
                     && cfg.long_prompts.min_tokens > 0
-                    && (layout.stages.len() > 1 || tier)
+                    && (layout.stages.len() > 1 || tier || whole)
                 {
-                    let tokens = if tier {
+                    let tokens = if tier || whole {
                         ssd_tier::HOST_TIER_PASS.min(cfg.ctx_size / 2)
                     } else {
                         cfg.long_prompts.micro
                     };
+                    if whole {
+                        cfg.residency.lend_spread_upto = tokens;
+                    }
                     exec.measure_prompt_step(tokens, cfg.ctx_size.saturating_sub(tokens))
                         .map_err(err(format!("a {tokens}-token long prompt step")))?
                 } else {
@@ -7680,7 +7687,8 @@ impl Worker {
                 .is_some_and(|n| prefilling.iter().any(|s| left(s) >= n));
         if (long || short) && !self.lent {
             let end = prefilling.iter().map(|s| s.prompt.len()).max().unwrap_or(0);
-            self.lend_cache(prefilling.iter().map(left).max().unwrap_or(0), end);
+            // Every prompt's tokens: they share the big steps a lend sizes for (#37).
+            self.lend_cache(prefilling.iter().map(left).sum(), end);
             self.lent_short = !long;
             // `--kv-vmm-keep` with `--glm-parallel-decode` (#1174): a long prompt that will
             // pass the kept blocks maps the KV pools' tail now, while the VRAM the lend just

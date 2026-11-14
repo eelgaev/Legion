@@ -844,6 +844,9 @@ pub struct ExpertResidency {
     /// [`ResidencyConfig::lend_repack`].
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     lend_repack: usize,
+    /// [`ResidencyConfig::lend_spread_upto`].
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    lend_spread_upto: usize,
     /// CUDA devices idle during the passes [`Self::begin_pass`] starts ([`Self::set_idle`]).
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     idle: Vec<usize>,
@@ -1889,6 +1892,7 @@ impl ExpertResidency {
             stage_pieces: cfg.stage_pieces,
             stage_reuse: cfg.stage_reuse,
             lend_repack: cfg.lend_repack,
+            lend_spread_upto: cfg.lend_spread_upto,
             stage_min: cfg.stage_min_tokens as i64,
             idle: Vec::new(),
             lend_keep: cfg.lend_keep.clone(),
@@ -3120,7 +3124,10 @@ impl ExpertResidency {
             let staged: Vec<bool> = (0..self.layers.len())
                 .map(|il| self.stages_entry(il))
                 .collect();
-            let spread = self.layers.iter().flatten().any(|l| l.keep.is_some());
+            // `lend_spread_upto` (#37): a prompt whose one step outgrows what the kept slots
+            // leave lends every slot whole, as without a keep.
+            let keeps = self.layers.iter().flatten().any(|l| l.keep.is_some());
+            let spread = keeps && tokens <= self.lend_spread_upto;
             let mut budget: Vec<u64> = self
                 .devices
                 .iter()
@@ -3161,7 +3168,10 @@ impl ExpertResidency {
             }
             let kept = mode.iter().filter(|m| **m == Lend::Keep).count();
             // Staging kept across lends: not with whole kept layers (`lend_keep`).
-            let reuse = self.stage_reuse && kept == 0;
+            // Nor by such a whole lend: its buffers would hold the kept slots' heads, which a
+            // lend that keeps them cannot stage into (the kept staging of the last lend that
+            // kept goes with this one's, as one too small would).
+            let reuse = self.stage_reuse && kept == 0 && (spread || !keeps);
             // `lend_repack` (#778): per device, the copies that re-pack its layers' kept slots,
             // and how many experts came from host memory and from VRAM.
             let n_dev = self.devices.len();
