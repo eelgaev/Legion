@@ -1245,7 +1245,7 @@ fn fatal(e: &str) -> ! {
 #[cfg(feature = "cuda")]
 mod cuda {
     use std::os::raw::{c_int, c_void};
-    use std::sync::Arc;
+    use std::sync::{Arc, OnceLock};
 
     use super::{Inner, external_params, fatal, lookup};
     use crate::ggml::ffi;
@@ -1263,6 +1263,7 @@ mod cuda {
             f: unsafe extern "C" fn(*mut c_void),
             user: *mut c_void,
         ) -> c_int;
+        fn cudaStreamSynchronize(s: *mut c_void) -> c_int;
     }
 
     /// `cudaMemcpyDefault`: the direction from the pointers (unified addressing).
@@ -1292,8 +1293,19 @@ mod cuda {
         }
     }
 
-    /// Copies the ids to pinned memory, runs the fetch as a host function on the stream, and
-    /// copies the result into the op's output.
+    /// Whether the fetch runs as a host function on the stream (`LEGION_DEBUG_TIER_FETCH=
+    /// hostfunc`, the way before) instead of on the launching thread.
+    fn as_host_function() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var_os("LEGION_DEBUG_TIER_FETCH").is_some_and(|v| v == "hostfunc")
+        })
+    }
+
+    /// Copies the ids to pinned memory, runs the fetch, and copies the result into the op's
+    /// output. The launching thread waits for the ids and runs the fetch itself: a host
+    /// function on the stream starts only once a driver thread has woken up for it, at every
+    /// layer of every step, and that wake-up is longer than the wait here (the thread polls).
     pub(super) unsafe fn fetch(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
         let p = external_params(dst);
         let inner = lookup(p[0]);
@@ -1303,6 +1315,31 @@ mod cuda {
         let (ids_in, ids_out) = inner.xchg.ok_or("no exchange buffers")?;
         if n > inner.cap {
             return Err(format!("{n} ids, room for {}", inner.cap));
+        }
+        if !as_host_function() {
+            // SAFETY: device and pinned buffers of `n` ids; after the wait the stream is done
+            // with everything before this op (the copy in, the layer before and the copy out
+            // of its fetch), so this thread reads and writes the exchange buffers alone.
+            unsafe {
+                let e = cudaMemcpyAsync(ids_in as *mut c_void, src.data, n * 4, DEFAULT, stream);
+                if e != 0 {
+                    return Err(format!("ids to host: CUDA error {e}"));
+                }
+                let e = cudaStreamSynchronize(stream);
+                if e != 0 {
+                    return Err(format!("waiting for the ids: CUDA error {e}"));
+                }
+                let ids = std::slice::from_raw_parts(ids_in as *const i32, n);
+                let out = std::slice::from_raw_parts_mut(ids_out as *mut i32, n);
+                if let Err(e) = inner.fetch(p[1] as usize, p[2] as usize, ids, out) {
+                    fatal(&e);
+                }
+                let e = cudaMemcpyAsync(dst.data, ids_out as *const c_void, n * 4, DEFAULT, stream);
+                if e != 0 {
+                    return Err(format!("ids to device: CUDA error {e}"));
+                }
+            }
+            return Ok(());
         }
         let job = Box::into_raw(Box::new(Job {
             inner: inner.clone(),
