@@ -287,3 +287,59 @@ fn rank_1_drafts_as_one_machine_does() {
     assert_eq!(got, want, "drafts and confidences");
     assert_eq!(got_logits, want_logits, "verify logits");
 }
+
+/// Positions 10..12 waiting (2 floats a row), tokens from 2 on.
+fn waiting() -> Waiting {
+    Waiting {
+        seq: 7,
+        start: 10,
+        base: 2,
+        tokens: (2..12).collect(),
+        hidden: vec![10.0, 10.5, 11.0, 11.5],
+        blocks: vec![0],
+        ring: 0,
+    }
+}
+
+#[test]
+fn a_take_in_right_after_the_waiting_positions_joins_them() {
+    let w = waiting();
+    assert_eq!(w.len(2), 2);
+    // The next decode step's position 12 (its tokens from 12 - 8 on, through 12).
+    let j = w
+        .join(12, 4, &(4..13).collect::<Vec<u32>>(), &[12.0, 12.5], 2)
+        .unwrap();
+    assert_eq!((j.start, j.len(2), j.base), (10, 3, 2));
+    assert_eq!(j.hidden, [10.0, 10.5, 11.0, 11.5, 12.0, 12.5]);
+    assert_eq!(j.tokens, (2..13).collect::<Vec<u32>>());
+    let p = j.positioned();
+    assert_eq!((p.len(), p[1], p[2], p[12]), (13, 0, 2, 12));
+}
+
+#[test]
+fn a_take_in_that_runs_waiting_positions_again_replaces_them() {
+    // Position 11 again, with a new token and row, and 12.
+    let j = waiting()
+        .join(
+            11,
+            3,
+            &[3, 4, 5, 6, 7, 8, 9, 10, 99, 100],
+            &[1.0, 1.5, 2.0, 2.5],
+            2,
+        )
+        .unwrap();
+    assert_eq!((j.start, j.len(2)), (10, 3));
+    assert_eq!(j.hidden, [10.0, 10.5, 1.0, 1.5, 2.0, 2.5]);
+    assert_eq!(j.tokens[..2], [2, 3]);
+    assert_eq!(j.tokens[j.tokens.len() - 2..], [99, 100]);
+    assert_eq!(j.base + j.tokens.len(), 13);
+}
+
+#[test]
+fn a_take_in_past_a_gap_or_before_the_waiting_positions_does_not_join() {
+    // Position 13: 12 is missing.
+    let w = waiting().join(13, 5, &[0; 9], &[0.0; 2], 2).unwrap_err();
+    assert_eq!(w, waiting());
+    // Position 9: before them.
+    assert!(waiting().join(9, 1, &[0; 9], &[0.0; 2], 2).is_err());
+}
