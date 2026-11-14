@@ -26,7 +26,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// Frames before this version are refused: both ranks must run the same build.
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
 
 /// The node settings of a `legion serve` (`--node-rank`, `--node-peer`, `--node-split`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,12 +106,16 @@ pub enum Request {
     },
     /// The same step as rank 0's, with the executor settings that cut a step into passes
     /// (each pass's all-reduces must line up on every rank): the micro-chunk and its taper,
-    /// and the gather budget.
+    /// and the gather budget. `head`: the share of the output head this rank computes
+    /// ([`crate::model::core::head_split`]; 0: none, or all of it where it reads no captured
+    /// rows), whose candidates it answers with ([`Reply::Step`]: each row's column and, as
+    /// the one row of `rows`, their values).
     TpStep {
         groups: Vec<WireGroup>,
         micro: u32,
         taper: u32,
         gather_budget: u64,
+        head: u32,
     },
     /// Save ring `ring`'s first `n` positions in copy `slot`, or (`restore`) put that copy
     /// back.
@@ -434,11 +438,13 @@ impl Request {
                 micro,
                 taper,
                 gather_budget,
+                head: share,
             } => {
                 put_groups(&mut head, &groups);
                 put_u32(&mut head, micro);
                 put_u32(&mut head, taper);
                 head.extend_from_slice(&gather_budget.to_le_bytes());
+                put_u32(&mut head, share);
                 K_TP_STEP
             }
             Request::SaveRing {
@@ -566,6 +572,7 @@ impl Request {
                 micro: r.u32()?,
                 taper: r.u32()?,
                 gather_budget: r.u64()?,
+                head: r.u32()?,
             },
             K_SAVE_RING => Request::SaveRing {
                 ring: r.u32()?,

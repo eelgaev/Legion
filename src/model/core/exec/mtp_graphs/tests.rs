@@ -19,6 +19,7 @@ fn shape(n_tok: usize) -> Vec<GroupShape> {
         kv_slots: Vec::new(),
         par: false,
         pair: false,
+        head_half: 0,
         img: 0,
         captures: Vec::new(),
     }]

@@ -68,6 +68,7 @@ pub mod nvfp4_once;
 pub use nvfp4_once::set_nvfp4_once;
 pub mod head_mm;
 pub use head_mm::set_head_mm;
+pub(crate) mod head_split;
 pub mod nvfp4_mvq;
 pub use nvfp4_mvq::set_nvfp4_mvq;
 pub mod q4k_head;
@@ -615,6 +616,10 @@ pub struct GroupShape {
     /// paired MoE layers share their experts with the other GPU of its NVLink pair. Kept apart
     /// from the other steps' graphs.
     pub(crate) pair: bool,
+    /// A greedy step whose head is split over the two ranks of tensor parallelism
+    /// ([`head_split`]): the share of the vocabulary this graph's head covers (1: rank 0's, 2:
+    /// rank 1's), its argmax output the share's candidates. 0: the whole head.
+    pub(crate) head_half: u8,
     /// Image tokens of the group's sequences ([`Media`]), whose input rows replace their token
     /// embeddings.
     pub(crate) img: usize,
@@ -659,6 +664,7 @@ impl GroupShape {
             kv_slots: Vec::new(),
             par: false,
             pair: false,
+            head_half: 0,
             img: g
                 .seqs
                 .iter()
@@ -2442,6 +2448,27 @@ impl Model {
         self.linear.mul_mat(ctx, name, w, scale, input_scale, x)
     }
 
+    /// Whether a greedy step's head may run as two shares of the vocabulary on the two ranks
+    /// of tensor parallelism ([`head_split`], `--tp-head-split`): an architecture whose split
+    /// head was shown to keep the text ([`Arch::head_splits`]), with the core's head as a
+    /// plain matmul of `output.weight` (no scale, no FP8 activation scale) in one GPU's
+    /// memory, and a vocabulary that splits ([`head_split::vocab_fits`]).
+    pub(crate) fn head_splits(&self) -> bool {
+        let name = "output.weight";
+        let Ok(w) = self.w(name) else {
+            return false;
+        };
+        self.hp.arch.head_splits()
+            && crate::model::cluster_select::on_cuda()
+            && !w.is_meta()
+            && !w.is_host()
+            && w.ne()[2] == 1
+            && w.ne()[1] == self.hp.n_vocab
+            && head_split::vocab_fits(w.ne()[1] as usize)
+            && linear::scale_name(name).is_none_or(|s| self.w(&s).is_err())
+            && self.w("output.input_scale").is_err()
+    }
+
     /// Whether the LM head `name` (`w`) for `x` runs on [`head_mm`]: [`head_mm::takes`], and
     /// [`Self::mm`] would be a plain matmul of it (no scale, no FP8 activation scale).
     fn head_mm_takes(&self, name: &str, w: Tensor<'_>, x: Tensor<'_>) -> bool {
@@ -3162,7 +3189,20 @@ impl Model {
                         Err(_) => "token_embd.weight",
                     };
                     let w = self.w(head)?;
+                    let half = shape.first().map_or(0, |g| g.head_half);
                     match arch.logit_softcap() {
+                        // This rank's share of a split head ([`head_split`], #1176): the
+                        // logits of its vocabulary rows and each output row's candidates
+                        // among them.
+                        _ if half != 0 => {
+                            let (off, rows) = head_split::range(w.ne()[1] as usize, half);
+                            let nb1 = w.nb()[1];
+                            let part = ctx.view_2d(w, [w.ne()[0], rows as i64], nb1, off * nb1);
+                            let logits = self.linear.mul_mat(ctx, head, part, None, None, x)?;
+                            let logits = arch.logits(ctx, logits);
+                            let best = crate::model::cluster_select::argmax_best(ctx, logits);
+                            (logits, best)
+                        }
                         // A BF16 head of verify steps of many sequences, matmul, soft-cap and
                         // argmax in one pass with ggml's bits (#1181).
                         Some(cap) if self.head_mm_takes(head, w, x) => {

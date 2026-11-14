@@ -554,6 +554,13 @@ pub struct Executor {
     mtp_rows_in: Option<crate::ggml::RowsAt>,
     /// The stop tokens a greedy pick below `min_tokens` may not pick ([`Self::set_stop_tokens`]).
     stop_tokens: Vec<u32>,
+    /// Rank 0 of tensor parallelism splits greedy steps' heads with rank 1
+    /// ([`Self::set_tp_head_split`]).
+    head_split: bool,
+    /// The share of the vocabulary the steps' heads cover from now on ([`Self::set_head_half`]).
+    head_half: u8,
+    /// A split step's value of each row's candidate ([`Self::take_head_vals`]).
+    head_vals: Vec<f32>,
     /// See [`Self::set_stage_cpus`].
     stage_cpus: Vec<Vec<u32>>,
     /// GLM's parallel decode steps ([`par_step`]).
@@ -859,6 +866,9 @@ impl Executor {
             hidden_dev_from: None,
             mtp_rows_in: None,
             stop_tokens: Vec::new(),
+            head_split: false,
+            head_half: 0,
+            head_vals: Vec::new(),
             stage_cpus: Vec::new(),
             par: Default::default(),
             pair: Default::default(),
@@ -2882,6 +2892,36 @@ impl Executor {
         self.stop_tokens = stop.to_vec();
     }
 
+    /// Rank 0 of tensor parallelism over two ranks: greedy decode and verify steps split their
+    /// output head with rank 1 from now on (`--tp-head-split`,
+    /// [`crate::model::core::head_split`]), where the model's head splits
+    /// ([`Model::head_splits`]). Returns whether they will.
+    pub fn set_tp_head_split(&mut self, on: bool) -> bool {
+        self.head_split = on && self.model.head_splits();
+        self.head_split
+    }
+
+    /// The steps from now on compute share `half` of the output head (1: the vocabulary's
+    /// first rows, 2: the rest; [`crate::model::core::head_split::range`]) and return each
+    /// row's candidate among them, its column of the whole vocabulary in
+    /// [`StepOutput::argmax`] and its value in [`Self::take_head_vals`]; 0: the whole head
+    /// again. Only for steps whose rows are all device argmaxes
+    /// ([`crate::model::core::head_split::fits`]) on a model whose head splits.
+    pub fn set_head_half(&mut self, half: u8) {
+        self.head_half = half;
+        self.head_vals.clear();
+    }
+
+    /// The values of the last split step's candidates ([`Self::set_head_half`]), a row each.
+    pub fn take_head_vals(&mut self) -> Vec<f32> {
+        std::mem::take(&mut self.head_vals)
+    }
+
+    /// Whether the model's head splits ([`Model::head_splits`]).
+    pub fn head_splits(&self) -> bool {
+        self.model.head_splits()
+    }
+
     /// The next [`Self::step`] reads its captured rows ([`StepOutput::hidden`]) back from row
     /// `row` on only: the rows before it keep their length in the output but hold anything (an
     /// earlier step's rows, or zeros). For a drafter that reads only a prompt chunk's last rows
@@ -2975,6 +3015,14 @@ impl Executor {
         let paired = self.pair_fits(n_micro, prompt, n_tok);
         if paired {
             shapes.iter_mut().flatten().for_each(|g| g.pair = true);
+        }
+        // This rank's share of a split head (`set_head_half`): graphs of their own.
+        let head_half = self.head_half;
+        if head_half != 0 {
+            shapes
+                .iter_mut()
+                .flatten()
+                .for_each(|g| g.head_half = head_half);
         }
         // A decode or verify step's inputs as copies queued ahead of each stage's graph
         // (`step_fill`).
@@ -4123,7 +4171,22 @@ impl Executor {
         if s + 1 == n_stages {
             // The micro-chunks' rows one after another (a prompt's earlier micro-chunks have
             // none).
-            out.argmax.extend(o.argmax);
+            match shape.first().map_or(0, |g| g.head_half) {
+                0 => out.argmax.extend(o.argmax),
+                // A split head's graph returns its share's candidates in the argmaxes' place
+                // (`head_split`): each row's pick among them, as a column of the whole
+                // vocabulary, and its value.
+                half => {
+                    let off = super::head_split::range(n_vocab, half).0 as u32;
+                    let (cols, vals) =
+                        crate::model::cluster_select::join_best(&o.argmax, o.rows.len());
+                    out.argmax.extend(
+                        cols.into_iter()
+                            .map(|c| if c == u32::MAX { c } else { c + off }),
+                    );
+                    self.head_vals.extend(vals);
+                }
+            }
             out.rows.extend(o.rows);
         }
     }

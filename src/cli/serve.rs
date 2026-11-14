@@ -745,6 +745,17 @@ pub(super) struct ModelArgs {
     /// With --tp-mtp-chain, a decode draft round's rows from the verify step too (#1176).
     #[arg(long)]
     pub tp_mtp_local_rows: bool,
+    /// With --tp-rank on two machines, on rank 0, Qwen3.8-Flash-Next (qwen4exp) with a plain
+    /// output head (the NVFP4 checkpoint's BF16 head): a decode or verify step whose rows are
+    /// all greedy picks computes its output head as two shares of the vocabulary, one on each
+    /// rank, instead of all of it on rank 0 while the other rank waits. Each rank finds its
+    /// share's best token per row (by value, then the device argmax's tie order), rank 1
+    /// answers the step with its candidates and rank 0 keeps the better one: the same pick as
+    /// the whole head's. The head reads its whole weight every step (1.27 GB on this model),
+    /// so each rank reads half of it. Steps with sampled rows, log probabilities or picks below
+    /// min_tokens keep the whole head on rank 0. Off (default): rank 0 computes the head.
+    #[arg(long)]
+    pub tp_head_split: bool,
     /// With --tp-rank, Qwen3.8-Flash-Next (qwen4exp): expert parallelism for the routed
     /// experts. Rank r of n holds the experts r*E/n .. (r+1)*E/n whole (the checkpoint's bytes
     /// as shipped, cut by expert index) instead of every expert's 1/n of the rows, and runs
@@ -2174,6 +2185,7 @@ pub async fn run(
                     seq_par: e.model.tp_seq_par,
                     mtp_chain: e.model.tp_mtp_chain,
                     mtp_local_rows: e.model.tp_mtp_local_rows,
+                    head_split: e.model.tp_head_split,
                     moe_ep: e.model.tp_moe_ep,
                     overlap: e.model.tp_overlap,
                     moe_ep_place: moe_ep_place.clone(),

@@ -2470,6 +2470,12 @@ impl Arch for Qwen4Params {
         true
     }
 
+    /// Two DGX Sparks, the NVFP4 checkpoint's BF16 head: the same text split, 1 to 16 users
+    /// (#1176).
+    fn head_splits(&self) -> bool {
+        true
+    }
+
     fn mtp(&self) -> bool {
         true
     }

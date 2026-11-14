@@ -314,6 +314,44 @@ fn gpu() -> Option<Backend> {
 /// NaN, -FLT_MAX and signed zeros, rows from 1 to the limits.
 #[cfg(feature = "cuda")]
 #[test]
+fn best_rank_orders_as_argmax_rank() {
+    let cols: Vec<usize> = (0..300_000).step_by(13).collect();
+    for w in cols.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        assert_eq!(best_col(best_rank(a)), a);
+        assert_eq!(
+            best_rank(a) < best_rank(b),
+            argmax_rank(a) < argmax_rank(b),
+            "{a} {b}"
+        );
+    }
+    // A column offset of whole 1,024s moves the rank by that many, nothing else.
+    assert_eq!(best_rank(5000 + 122 * 1024), best_rank(5000) + 122);
+}
+
+#[test]
+fn joined_parts_are_the_argmax() {
+    for (n, rows, seed) in [(2000usize, 3usize, 1u64), (124_928, 2, 2), (123_392, 5, 3)] {
+        let x = tie_rows(n, rows, seed);
+        let parts = argmax_parts(n as i64) as usize;
+        let best: Vec<u32> = x
+            .chunks(n)
+            .flat_map(|row| best_row(row, parts))
+            .flat_map(|(v, r)| [v, r])
+            .collect();
+        let (cols, vals) = join_best(&best, rows);
+        for (r, row) in x.chunks(n).enumerate() {
+            assert_eq!(cols[r] as i32, argmax_row(row), "n {n} row {r}");
+            assert_eq!(vals[r], row[cols[r] as usize]);
+        }
+    }
+    // No candidate: argmax's -1.
+    let none = best_row(&vec![f32::NEG_INFINITY; 5000], 2);
+    let flat: Vec<u32> = none.into_iter().flat_map(|(v, r)| [v, r]).collect();
+    assert_eq!(join_best(&flat, 1), (vec![u32::MAX], vec![-f32::MAX]));
+}
+
+#[test]
 #[ignore = "needs a GPU"]
 fn cuda_matches_one_cta_kernels() {
     let Some(mut gpu) = gpu() else {

@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use super::Executor;
 use crate::model::core::pair::sum::PairSum;
-use crate::model::core::{Group, ModelError, MtpOutput, StepOutput};
+use crate::model::core::{Group, ModelError, MtpOutput, StepOutput, head_split};
 use crate::node::local::LocalLink;
 use crate::node::{Link, Reply, Request, RowsPart};
 use crate::tp_net::{CommHandle, StepProfile};
@@ -291,11 +291,17 @@ impl Executor {
 
     /// [`Self::step`] on every rank (see the module docs).
     pub(super) fn tp_step(&mut self, groups: &[Group<'_>]) -> Result<StepOutput, ModelError> {
+        // A greedy decode or verify step's output head, half the vocabulary on each of two
+        // ranks (`--tp-head-split`).
+        let split = self.head_split
+            && self.tp.as_ref().is_some_and(|l| l.links.len() == 1)
+            && head_split::fits(groups, crate::ggml::model_bytes::DECODE_MAX_TOKENS);
         let req = Request::TpStep {
             groups: super::remote::to_wire(groups),
             micro: self.pipeline_micro as u32,
             taper: self.micro_taper as u32,
             gather_budget: self.gather_budget as u64,
+            head: if split { 2 } else { 0 },
         };
         let lead = self.tp.as_mut().expect("tensor-parallel lead");
         // The last step's rows become the step before's while the engine holds them (the
@@ -310,7 +316,13 @@ impl Executor {
         if let Some(rows) = older.and_then(|o| Arc::try_unwrap(o).ok()) {
             self.spare_rows.keep(rows, super::BOUNCE_MIN_BYTES);
         }
-        let out = self.tp_run(&req, |e| e.step_here(groups))?;
+        self.set_head_half(u8::from(split));
+        let out = self.tp_run(&req, |e| e.step_here(groups));
+        self.head_half = 0;
+        let mut out = out?;
+        if split {
+            self.tp_join_head(&mut out)?;
+        }
         let lead = self.tp.as_mut().expect("tensor-parallel lead");
         if lead.local_rows {
             lead.step_rows = (out.hidden.iter())
@@ -318,6 +330,24 @@ impl Executor {
                 .collect();
         }
         Ok(out)
+    }
+
+    /// After this rank's share of a split head ([`head_split`]): waits for rank 1's answer to
+    /// the step (the last request sent: state changes go out between steps) and puts each
+    /// row's pick over both shares in `out`'s argmaxes.
+    fn tp_join_head(&mut self, out: &mut StepOutput) -> Result<(), ModelError> {
+        let mine = self.take_head_vals();
+        let lead = self.tp.as_mut().expect("tensor-parallel lead");
+        let reply = lead.links[0]
+            .wait()
+            .map_err(|e| err(format!("rank 1: {e}")))?;
+        let Reply::Step { argmax, rows, .. } = reply else {
+            return Err(err("rank 1 answered a split step without its share".into()));
+        };
+        let theirs = rows.first().map_or(&[][..], |v| v.as_slice());
+        out.argmax = head_split::join((&out.argmax[..], &mine[..]), (&argmax[..], theirs))
+            .ok_or_else(|| err("rank 1's share of a split step has other rows".into()))?;
+        Ok(())
     }
 
     /// The last step's rows are handed back ([`Self::recycle_rows`]): MTP passes send their
