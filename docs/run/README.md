@@ -11,6 +11,11 @@ binding removed; `--port 8090` added). All requests use temperature 0.
   the 8 prompts are sent twice, so 16 requests are in flight; every engine gets the same requests.
 - **Prefill:** one request per prompt size, tok/s to the first token.
 - **llama-benchy:** `--pp 512 --tg 256 --no-cache --exact-tg`, concurrency 1 4 16 (or 1 4), 2-3 runs; tg tok/s.
+  It reads lower than the deterministic client on the same server, and the two are not interchangeable: its random
+  prompts draft worse (MTP accepts 2.3 tokens per step instead of 2.5), and its total runs from the first request's
+  first token to the last one's last token, so with 512-token prompts the later requests' prompt steps fall inside
+  it. Qwen3.8-Flash-Next NVFP4 on two Sparks, one server, 1 / 4 / 16 users: 42.5 / 110.8 / 195.6 with llama-benchy
+  (its own peak 43 / 120 / 233), 45.7 / 117.9 / 242.5 with the deterministic client.
 - MTP heads (`--spec-draft`) are the `mtp-*.gguf` files in the same Hugging Face repo as the model.
 
 [llama.cpp and vLLM next to Legion](other-engines.md): the other engines' commands for every model.
