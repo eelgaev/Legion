@@ -727,6 +727,10 @@ pub struct ExpertResidency {
     ep_stage_all: bool,
     /// The CUDA devices whose slots did not all fit at load (#1208), [`ExpertResidency::shrunk`].
     shrunk: Vec<Shrunk>,
+    /// The bounded host tier (#37) the layers' host parts are, if any: RAM slots and a staging
+    /// buffer in place of every expert's host bytes. Last: dropped after the tiered ranges
+    /// that map its memory.
+    host: Option<std::sync::Arc<super::host_tier::HostTier>>,
 }
 
 /// A CUDA device whose expert slots did not all find VRAM at load (#1208): the cache planned
@@ -755,6 +759,8 @@ pub struct TieredLayer<'a> {
     /// [`ResidencyConfig::stage_min_tokens`].
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     stage_min: i64,
+    /// The bounded host tier and this layer in it ([`ExpertResidency::host_tier`]).
+    host: Option<(&'a super::host_tier::HostTier, usize)>,
 }
 
 /// Steps of at most this many tokens gather their experts first with [`Fetch::Copy`].
@@ -894,7 +900,21 @@ impl<'a> TieredLayer<'a> {
             graph.borrow_mut().expand(ctx.cpy(sum, row));
         }
         let ids = kernel_flat.map_or(ids, |k| ctx.get_rows(table, k));
-        ctx.reshape_2d(ids, used, n)
+        let ids = ctx.reshape_2d(ids, used, n);
+        // The bounded host tier: a miss (`n_slots + expert`, as logged) reads the RAM slot or
+        // staging place the tier's fetch puts the expert in.
+        match self.host {
+            Some((h, il)) => h
+                .fetch(ctx, il, ids, self.n_slots())
+                .unwrap_or_else(|e| panic!("host expert tier: {e}")),
+            None => ids,
+        }
+    }
+
+    /// Whether the layer's host part is the bounded host tier's (RAM slots and staging, not
+    /// every expert's bytes).
+    pub fn bounded(&self) -> bool {
+        self.host.is_some()
     }
 
     /// Logs `guess` (I32 `[n_used, n]`, raw expert ids: the router of this entry's layer
@@ -1112,14 +1132,39 @@ impl ExpertResidency {
                 .iter()
                 .map(|k| find(&format!("blk.{il}.{k}.weight")))
                 .collect();
+            // With the bounded host tier (#37) a layer's host tensor is its RAM slots.
+            let whole = |t: &Tensor<'w>| {
+                t.ne()[2] == n_expert as i64 || super::host_tier::HostTier::of(*t).is_some()
+            };
             let entry = match (place(il), ts) {
-                (Some(p), Some(ts)) if ts.iter().all(|t| t.ne()[2] == n_expert as i64) => {
-                    Some((p, [ts[0], ts[1], ts[2]]))
-                }
+                (Some(p), Some(ts)) if ts.iter().all(whole) => Some((p, [ts[0], ts[1], ts[2]])),
                 _ => None,
             };
             found.push(entry);
         }
+        // The bounded host tier: experts are in RAM slots or read as routed, so nothing may
+        // read an expert's host bytes at `n_slots + expert` (no prompt staging and lending, no
+        // host share).
+        let host = found
+            .iter()
+            .flatten()
+            .find_map(|(_, ts)| super::host_tier::HostTier::of(ts[0]))
+            .map(|(t, _)| t);
+        let bounded;
+        let cfg = match &host {
+            Some(_) => {
+                bounded = ResidencyConfig {
+                    staging: false,
+                    cpu_share: super::cpu_share::CpuShareConfig {
+                        share: 0.0,
+                        ..cfg.cpu_share.clone()
+                    },
+                    ..cfg.clone()
+                };
+                &bounded
+            }
+            None => cfg,
+        };
         let mut devices: Vec<Device> = Vec::new();
         let mut dev_of = vec![usize::MAX; n_layers];
         for (il, f) in found.iter().enumerate() {
@@ -1403,7 +1448,8 @@ impl ExpertResidency {
             let mut tensors = Vec::with_capacity(3);
             let mut no_vram = None;
             for (k, t) in ts.iter().enumerate() {
-                match tiered_tensor(p, *t, n_slots, keep_of[il], KINDS[k], n_expert) {
+                let tail = host.as_deref().map(|h| (h.stage_tensor(il, k), h.n_host()));
+                match tiered_tensor(p, *t, n_slots, keep_of[il], KINDS[k], n_expert, tail) {
                     Ok(c) => tensors.push(c),
                     Err(e) if e.no_vram && n_slots > 0 && failures[d] < MAX_FIT_TRIES => {
                         no_vram = Some(e.msg);
@@ -1657,6 +1703,7 @@ impl ExpertResidency {
             cached_rows: Vec::new(),
             ep_stage_all: cfg.ep_stage_all,
             shrunk,
+            host,
         };
         #[cfg(feature = "cuda")]
         if super::cpu_share::threshold(cfg.cpu_share.share) > 0 {
@@ -1673,9 +1720,8 @@ impl ExpertResidency {
                 .enumerate()
                 .filter_map(|(s, e)| e.map(|e| (s as u32, e)))
                 .collect();
-            for (s, e) in fills {
-                me.copy_expert(il, s, n_slots + e as usize)?;
-            }
+            let _ = n_slots;
+            me.copy_from_host(il, &fills)?;
         }
         me.sync_copies()?;
         me.upload_tables(None)?;
@@ -1820,6 +1866,7 @@ impl ExpertResidency {
             share: self.share,
             pieces: self.stage_pieces,
             stage_min: self.stage_min,
+            host: self.host.as_deref().map(|h| (h, il)),
         })
     }
 
@@ -1914,6 +1961,38 @@ impl ExpertResidency {
             }
         }
         Ok(())
+    }
+
+    /// Copies the host bytes of experts into slots of layer `il` (`(slot, expert)`): from
+    /// `n_slots + expert`, or with the bounded host tier from where it has them (a RAM slot,
+    /// or the expert's staging place after a read), waiting for the copies there, as those
+    /// bytes only stay until the next step.
+    fn copy_from_host(&mut self, il: usize, fills: &[(u32, u32)]) -> Result<(), String> {
+        let n_slots = self.layers[il]
+            .as_ref()
+            .expect("tiered layer")
+            .slots
+            .n_slots();
+        let Some(h) = self.host.clone() else {
+            for &(s, e) in fills {
+                self.copy_expert(il, s, n_slots + e as usize)?;
+            }
+            return Ok(());
+        };
+        if fills.is_empty() {
+            return Ok(());
+        }
+        let experts: Vec<u32> = fills.iter().map(|f| f.1).collect();
+        let at = h.sources(il, &experts)?;
+        for (&(s, _), a) in fills.iter().zip(at) {
+            self.copy_expert(il, s, n_slots + a)?;
+        }
+        self.sync_copies()
+    }
+
+    /// The bounded host tier the layers' host parts are, if any.
+    pub fn host_tier(&self) -> Option<&std::sync::Arc<super::host_tier::HostTier>> {
+        self.host.as_ref()
     }
 
     fn sync_copies(&mut self) -> Result<(), String> {
@@ -2332,8 +2411,7 @@ impl ExpertResidency {
         self.swaps += swaps.len() as u64;
         for s in &swaps {
             self.layers[s.layer].as_mut().unwrap().dirty = true;
-            let n_slots = self.layers[s.layer].as_ref().unwrap().slots.n_slots();
-            self.copy_expert(s.layer, s.slot, n_slots + s.new as usize)?;
+            self.copy_from_host(s.layer, &[(s.slot, s.new)])?;
         }
         let filled: Vec<(usize, u32)> = swaps.iter().map(|s| (s.layer, s.slot)).collect();
         let dev = &mut self.devices[d];
@@ -3303,10 +3381,20 @@ fn tiered_tensor(
     keep: Option<usize>,
     name: &str,
     n_expert: usize,
+    tail: Option<(Tensor<'_>, usize)>,
 ) -> Result<Context, TierError> {
+    #[cfg(not(feature = "cuda"))]
+    let _ = tail;
     match p.cuda {
         #[cfg(feature = "cuda")]
-        Some(dev) => super::cuda::tiered(dev, host, n_slots, keep, name).map_err(|e| TierError {
+        Some(dev) => match tail {
+            // The bounded host tier: RAM slots, then the staging buffer's places.
+            Some((tail, n_host)) => {
+                super::cuda::tiered_tail(dev, host, tail, n_host, n_slots, keep, name)
+            }
+            None => super::cuda::tiered(dev, host, n_slots, keep, name),
+        }
+        .map_err(|e| TierError {
             msg: e.to_string(),
             no_vram: e.no_vram,
         }),

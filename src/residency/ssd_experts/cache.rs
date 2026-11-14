@@ -112,6 +112,35 @@ impl SlotCache {
         plan
     }
 
+    /// [`Self::plan`] for a step that may need more experts than the slots hold: the experts
+    /// no slot is left for (every slot is this step's or pinned) come back second, in order,
+    /// and are not cached.
+    pub fn plan_some(&mut self, experts: &[usize]) -> (Plan, Vec<usize>) {
+        self.tick += 1;
+        let mut plan = Plan::default();
+        let mut missing = Vec::new();
+        for &e in experts {
+            match self.slot(e) {
+                Some(s) => {
+                    self.used[s] = self.tick;
+                    plan.hits += 1;
+                }
+                None => missing.push(e),
+            }
+        }
+        let mut over = Vec::new();
+        for e in missing {
+            match self.victim() {
+                Some(s) => {
+                    self.assign(e, s);
+                    plan.loads.push((e, s));
+                }
+                None => over.push(e),
+            }
+        }
+        (plan, over)
+    }
+
     /// A prefetch of `experts` (distinct, best first) for the layer's next step: marks the
     /// cached ones used, then gives each other one, while `budget` lasts, an empty slot or the
     /// least recently used one the prediction does not keep. Returns the `(expert, slot)` loads.

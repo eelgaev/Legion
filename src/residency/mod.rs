@@ -34,6 +34,7 @@ pub mod ep_balance;
 pub mod ep_prefetch;
 pub mod experts;
 pub mod fallback;
+pub mod host_tier;
 pub mod kv_vmm;
 pub mod miss_split;
 pub mod split;

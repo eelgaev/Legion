@@ -359,6 +359,10 @@ pub struct Model {
     /// Routed experts read from the checkpoint as steps route to them, when set up
     /// ([`crate::residency::ssd_experts`]; GLM-5.3-Flash NVFP4).
     ssd: Option<crate::residency::ssd_experts::SsdExperts>,
+    /// The bounded host expert tier, when set up ([`crate::residency::host_tier`]: a discrete
+    /// GPU on a machine with less RAM than the experts take). After `experts`, whose ranges map
+    /// its memory.
+    host_tier: Option<std::sync::Arc<crate::residency::host_tier::HostTier>>,
     /// Weight pairs read as one matrix by small steps ([`joined`]), made by the first graph
     /// that asks. Before the weights, whose memory they share.
     joined: std::cell::OnceCell<Option<joined::Joined>>,
@@ -445,6 +449,11 @@ pub enum MoeKernel {
 /// Smallest batch the fused expert op takes in [`MoeKernel::Auto`]: below it, ggml's
 /// `mul_mat_id` (its MMQ / MMVQ kernels for small batches) is as fast.
 pub const MOE_FFN_MIN_TOKENS: i64 = 64;
+
+/// With the bounded host expert tier ([`crate::residency::host_tier`]), steps of at least
+/// this many tokens run the fused op in place (no staged copies there): the prompt chunks
+/// that staging takes elsewhere. Smaller steps keep the graph they have without the tier.
+pub const HOST_TIER_FUSED_TOKENS: i64 = 256;
 
 /// Where a weight lives when the model runs on a GPU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1577,6 +1586,7 @@ impl Model {
         Ok(Self {
             experts: None,
             ssd: None,
+            host_tier: None,
             joined: Default::default(),
             router_bf16: Default::default(),
             host_pins: None,
@@ -1627,6 +1637,7 @@ impl Model {
         Ok(Self {
             experts: None,
             ssd: None,
+            host_tier: None,
             joined: Default::default(),
             router_bf16: Default::default(),
             host_pins: None,
@@ -1669,6 +1680,17 @@ impl Model {
     /// must have been left out of the load).
     pub fn set_ssd_experts(&mut self, ssd: crate::residency::ssd_experts::SsdExperts) {
         self.ssd = Some(ssd);
+    }
+
+    /// The routed experts' host memory is `tier`'s RAM slots from now on (their tensors must
+    /// have been left out of the load); the expert cache built next reads through it.
+    pub fn set_host_tier(&mut self, tier: std::sync::Arc<crate::residency::host_tier::HostTier>) {
+        self.host_tier = Some(tier);
+    }
+
+    /// The bounded host expert tier, when set up.
+    pub fn host_tier(&self) -> Option<&std::sync::Arc<crate::residency::host_tier::HostTier>> {
+        self.host_tier.as_ref()
     }
 
     /// The SSD expert tier, when set up.
@@ -2136,6 +2158,8 @@ impl Model {
             .or_else(|| self.widened.as_ref().and_then(|c| c.tensor(name)))
             .or_else(|| self.weights.get(name))
             .or_else(|| self.mtp.as_ref().and_then(|m| m.get(name)))
+            // The bounded host tier: a layer's routed experts are its RAM slot tensors.
+            .or_else(|| self.host_tier.as_ref().and_then(|h| h.tensor(name)))
             .ok_or_else(|| ModelError::Tensor(name.into()))
     }
 
@@ -4273,7 +4297,10 @@ impl Model {
                         moe_ffn::moe_ffn_shexp(ctx, x, ids, w2, refs(ws), pair, shexp)
                     });
                 }
-                if summed.is_none() && fused == Some(MoeKernel::Fused) {
+                // The bounded host tier has no staged copies: its prompt chunks run the fused
+                // op in place, over the RAM slots and the staging buffer.
+                let in_place = t.bounded() && n >= HOST_TIER_FUSED_TOKENS;
+                if summed.is_none() && (fused == Some(MoeKernel::Fused) || in_place) {
                     // Forced: in place (on a GPU, host experts over the link).
                     summed = Some(moe_ffn::moe_ffn_shexp(
                         ctx,

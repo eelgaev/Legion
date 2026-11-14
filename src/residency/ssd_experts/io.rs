@@ -37,6 +37,9 @@ pub enum Job {
     },
     /// Copy `len` bytes from `src` to `dst` (host memory, not overlapping).
     Copy { src: usize, dst: usize, len: usize },
+    /// Read the file range `src` as it is to `dst` (`src.len` bytes of host memory): a plain
+    /// GGUF expert, for the bounded host tier ([`crate::residency::host_tier`]).
+    Raw { src: FileRange, dst: usize },
 }
 
 /// A batch of jobs: waits for all of them, or cancels the ones not started.
@@ -484,6 +487,12 @@ fn run(s: &Shared, job: Job, codes: &mut Aligned, scales: &mut Aligned) -> Resul
             // memory that outlives the job.
             let out = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, bytes) };
             crate::hf::nvfp4::repack_nvfp4_into(w, sc, rows, k, out);
+            Ok(())
+        }
+        Job::Raw { src, dst } => {
+            let bytes = read_range(s, src, codes)?;
+            // SAFETY: as above: a destination of the job's own, `src.len` bytes long.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len()) };
             Ok(())
         }
         Job::Copy { src, dst, len } => {

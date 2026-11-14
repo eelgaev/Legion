@@ -1666,7 +1666,7 @@ pub fn tiered(
         no_vram: e.no_vram,
     };
     let (buf, offset) =
-        tiered_buffer(device, host, host.nb()[2], n_slots, keep, true).map_err(err)?;
+        tiered_buffer(device, host, None, host.nb()[2], n_slots, keep, true).map_err(err)?;
     let ne = host.ne();
     let ctx = Context::new(1, 0);
     let t = ctx
@@ -1678,6 +1678,95 @@ pub fn tiered(
         no_vram: false,
     })?;
     Ok(ctx)
+}
+
+/// [`tiered`] for the bounded host tier ([`super::host_tier`]): after `host`'s arena pieces
+/// (the layer's RAM slots) come `tail`'s (the staging buffer every layer shares, mapped once
+/// more per layer), and the tensor has `n_slots + n_host` experts, `n_host` of them over the
+/// two host parts.
+pub fn tiered_tail(
+    device: usize,
+    host: Tensor<'_>,
+    tail: Tensor<'_>,
+    n_host: usize,
+    n_slots: usize,
+    keep: Option<usize>,
+    name: &str,
+) -> Result<Context, TieredError> {
+    let err = |e: BufError| TieredError {
+        error: GgmlError::Alloc {
+            bytes: n_slots * host.nb()[2],
+            buffer: format!("tiered range on CUDA{device}: {}", e.msg),
+        },
+        no_vram: e.no_vram,
+    };
+    let row = host.nb()[2];
+    let spans = arena_span(host).zip(arena_span(tail));
+    if spans.is_none_or(|(h, t)| h + t < n_host * row) {
+        return Err(err(
+            "the host tier's pieces are shorter than its experts".into()
+        ));
+    }
+    let (buf, offset) =
+        tiered_buffer(device, host, Some(tail), row, n_slots, keep, true).map_err(err)?;
+    let ne = host.ne();
+    let ctx = Context::new(1, 0);
+    let t = ctx
+        .new_tensor(host.ty(), &[ne[0], ne[1], (n_slots + n_host) as i64])
+        .named(name);
+    // SAFETY: the buffer is new and owned by ctx from here; the tensor fits from `offset`
+    // (checked above: the host parts hold `n_host` experts).
+    unsafe { ctx.adopt_buffer(t, buf, offset) }.map_err(|error| TieredError {
+        error,
+        no_vram: false,
+    })?;
+    Ok(ctx)
+}
+
+/// The bytes of the arena pieces under `host` (a tensor that is an arena piece of its own):
+/// what a tiered range maps for it.
+pub fn arena_span(host: Tensor<'_>) -> Option<usize> {
+    host_pieces(host)
+        .ok()
+        .map(|(_, p)| p.iter().map(|p| p.size).sum())
+}
+
+/// The arena type and pieces under `host`: one piece, or one per NUMA node of a split arena
+/// (back to back).
+fn host_pieces(host: Tensor<'_>) -> Result<(&'static ArenaType, Vec<&'static Piece>), BufError> {
+    // SAFETY: reading the fields of a live tensor and of its buffer.
+    let (arena_buf, data, view) = unsafe {
+        let t = host.raw();
+        ((*t).buffer, (*t).data as u64, !(*t).view_src.is_null())
+    };
+    // SAFETY: as above.
+    let at = (!arena_buf.is_null())
+        .then(|| arena_of(unsafe { (*arena_buf).buft }))
+        .flatten()
+        .filter(|_| !view)
+        .ok_or("the host tensor is not in a host arena buffer")?;
+    // SAFETY: the buffer is an arena buffer, so its context is an ArenaBuffer; arena buffers
+    // hold the weights and live as long as any range mapped over them.
+    let ab: &'static ArenaBuffer = unsafe { &*((*arena_buf).context as *const ArenaBuffer) };
+    let off = (data - ab.va) as usize;
+    let first_piece = ab
+        .pieces
+        .iter()
+        .position(|p| p.offset == off)
+        .ok_or("the host tensor is not an arena piece of its own")?;
+    let mut pieces: Vec<&Piece> = Vec::new();
+    let mut covered = 0;
+    for p in &ab.pieces[first_piece..] {
+        if covered >= host.nbytes() {
+            break;
+        }
+        pieces.push(p);
+        covered += p.size;
+    }
+    if covered < host.nbytes() {
+        return Err("the host tensor runs past its arena pieces".into());
+    }
+    Ok((at, pieces))
 }
 
 /// Why [`tiered`] failed.
@@ -1774,8 +1863,8 @@ pub fn tiered_rows(
         bytes: n_rows * host.nb()[1],
         buffer: format!("tiered rows on CUDA{device}: {msg}"),
     };
-    let (buf, offset) =
-        tiered_buffer(device, host, host.nb()[1], n_rows, None, false).map_err(|e| err(e.msg))?;
+    let (buf, offset) = tiered_buffer(device, host, None, host.nb()[1], n_rows, None, false)
+        .map_err(|e| err(e.msg))?;
     // Written by the graphs (a cache), not weights.
     // SAFETY: a live buffer.
     unsafe {
@@ -1800,44 +1889,18 @@ pub fn tiered_rows(
 fn tiered_buffer(
     device: usize,
     host: Tensor<'_>,
+    tail: Option<Tensor<'_>>,
     slot_bytes: usize,
     n_slots: usize,
     keep: Option<usize>,
     hook: bool,
 ) -> Result<(NonNull<ffi::ggml_backend_buffer>, usize), BufError> {
-    // SAFETY: reading the fields of a live tensor and of its buffer.
-    let (arena_buf, data, view) = unsafe {
-        let t = host.raw();
-        ((*t).buffer, (*t).data as u64, !(*t).view_src.is_null())
-    };
-    // SAFETY: as above.
-    let at = (!arena_buf.is_null())
-        .then(|| arena_of(unsafe { (*arena_buf).buft }))
-        .flatten()
-        .filter(|_| !view)
-        .ok_or("the host tensor is not in a host arena buffer")?;
-    // SAFETY: the buffer is an arena buffer, so its context is an ArenaBuffer.
-    let ab = unsafe { &*((*arena_buf).context as *const ArenaBuffer) };
-    let off = (data - ab.va) as usize;
-    // The tensor's pieces: one, or one per NUMA node of a split arena (back to back).
-    let first_piece = ab
-        .pieces
-        .iter()
-        .position(|p| p.offset == off)
-        .ok_or("the host tensor is not an arena piece of its own")?;
-    let mut pieces: Vec<&Piece> = Vec::new();
-    let mut covered = 0;
-    for p in &ab.pieces[first_piece..] {
-        if covered >= host.nbytes() {
-            break;
-        }
-        pieces.push(p);
-        covered += p.size;
+    let (at, mut pieces) = host_pieces(host)?;
+    // [`tiered_tail`]: another arena tensor's pieces right after the host tensor's.
+    if let Some(t) = tail {
+        pieces.extend(host_pieces(t)?.1);
     }
-    if covered < host.nbytes() {
-        return Err("the host tensor runs past its arena pieces".into());
-    }
-    let host_bytes = covered;
+    let host_bytes: usize = pieces.iter().map(|p| p.size).sum();
     use_device(device)?;
     let dgran = granularity(CU_MEM_LOCATION_TYPE_DEVICE, device as i32);
     if dgran == 0 || !at.gran.is_multiple_of(dgran) {

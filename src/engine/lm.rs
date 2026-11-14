@@ -3796,6 +3796,21 @@ impl LmEngine {
             .as_deref()
             .map(crate::residency::ssd_experts::skipped_tensors)
             .unwrap_or_default();
+        // Routed experts that do not fit in the host memory of a discrete-GPU machine: a
+        // bounded set of RAM slots, the rest read from the checkpoint as routed (#37).
+        let host_tier = if ssd_layers.is_some() {
+            None
+        } else {
+            ssd_tier::host_tier_plan(&cfg, &gguf, &layout)?
+        };
+        if host_tier.is_some() {
+            let n_layer = crate::model::core::Hparams::from_gguf(&gguf)?.n_layer;
+            skip.extend(crate::residency::host_tier::skipped_tensors(n_layer));
+            // The RAM is the experts': the n-gram table stays on the SSD.
+            if cfg.ngram.io == crate::residency::lookup_table::TableIo::Auto {
+                cfg.ngram.io = crate::residency::lookup_table::TableIo::Direct;
+            }
+        }
         // The other machine's layers and head.
         let hp_file = crate::model::core::Hparams::from_gguf(&gguf)?;
         skip.extend(layout.node_skipped(&gguf, hp_file.n_layer));
@@ -3861,6 +3876,10 @@ impl LmEngine {
         if let Some(layers) = &ssd_layers {
             let tier = ssd_tier::build(&cfg, &gguf, &layout, &model.hp, layers)?;
             model.set_ssd_experts(tier);
+        }
+        if let Some(plan) = &host_tier {
+            let tier = ssd_tier::host_tier_build(&cfg, &gguf, &layout, &model.hp, plan)?;
+            model.set_host_tier(tier);
         }
         if cfg.pair_tp {
             pair_tp::set_up(&cfg, &mut model, &layout)?;

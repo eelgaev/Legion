@@ -122,5 +122,147 @@ pub fn build(
     .map_err(|e| LoadError::Device(format!("SSD expert tier: {e}")))
 }
 
+/// Whether the bounded host expert tier ([`crate::residency::host_tier`], #37) may apply: the
+/// VRAM expert cache on one discrete GPU reading a pinned host arena, Qwen3.8-Flash-Next's
+/// plain GGUF experts. Not the SSD tier's gate above (GLM-5.3-Flash NVFP4 on an integrated
+/// GPU), which stays as it is; whether it does apply is the memory's to say
+/// ([`host_tier_plan`]).
+pub fn host_tier_wanted(
+    mode: ExpertMode,
+    arch: &str,
+    stages: usize,
+    tp: usize,
+    device: Option<DeviceKind>,
+    arena: bool,
+) -> bool {
+    mode == ExpertMode::Cache
+        && arch == "qwen4exp"
+        && stages == 1
+        && tp <= 1
+        && device == Some(DeviceKind::Gpu)
+        && arena
+}
+
+/// The bounded host tier of a load: its layers' expert tensors and its memory.
+pub struct HostTierPlan {
+    pub srcs: Vec<[crate::gguf::TensorInfo; 3]>,
+    pub plan: crate::residency::host_tier::Plan,
+}
+
+/// The bounded host tier's plan when it applies to this load: [`host_tier_wanted`], and the
+/// routed experts do not fit in the host memory there is beside the n-gram table and the KV
+/// host tier ([`crate::residency::host_tier::size`]). `None`: the load is as before.
+pub fn host_tier_plan(
+    cfg: &LmConfig,
+    gguf: &GgufFile,
+    layout: &Layout,
+) -> Result<Option<HostTierPlan>, LoadError> {
+    use crate::residency::host_tier::{self, Sizing, Table};
+    use crate::residency::lookup_table::TableIo;
+    let hp = Hparams::from_gguf(gguf)?;
+    let device = layout.stages[0].0.map(|d| d.kind());
+    if layout.node.is_some()
+        || !host_tier_wanted(
+            layout.mode,
+            hp.arch.name(),
+            layout.stages.len(),
+            cfg.tp,
+            device,
+            layout.arenas.is_some(),
+        )
+    {
+        return Ok(None);
+    }
+    let Some(srcs) = host_tier::sources(gguf, hp.n_layer, hp.n_expert as usize) else {
+        return Ok(None);
+    };
+    let (per_slot, stage_one) = host_tier::expert_bytes(&srcs, hp.n_expert as usize);
+    let table = hp
+        .arch
+        .ngram_table()
+        .then(|| crate::model::core::Model::ngram_table_info(gguf))
+        .flatten()
+        .map(|t| Table {
+            bytes: t.bytes(),
+            in_ram: matches!(cfg.ngram.io, TableIo::Ram | TableIo::Mmap),
+            direct: cfg.ngram.io == TableIo::Direct,
+        });
+    // A KV host tier asked for by hand; the automatic one takes what the experts leave.
+    let per = KvPool::block_bytes_paged(&hp, 0..hp.n_layer, false, cfg.cache_types);
+    let kv_spill = cfg
+        .kv_host_tokens
+        .map_or(0, |t| (t.div_ceil(KV_BLOCK) * per) as u64);
+    let mem = host_tier::mem_info();
+    let mib = |b: u64| b >> 20;
+    match host_tier::size(
+        mem,
+        per_slot,
+        stage_one,
+        hp.n_expert as usize,
+        table,
+        kv_spill,
+    ) {
+        Sizing::Whole => Ok(None),
+        Sizing::Bounded(plan) => {
+            tracing::info!(
+                part = "host experts",
+                ram_slots_per_layer = plan.slots,
+                experts_per_layer = hp.n_expert,
+                expert_ram_mib = mib(plan.slot_bytes),
+                expert_staging_mib = mib(plan.stage_bytes),
+                ngram_table_mib = mib(plan.table),
+                ngram_io = if table.is_some_and(|t| t.in_ram) {
+                    "ram"
+                } else {
+                    "direct"
+                },
+                kv_spill_mib = mib(plan.kv_spill),
+                margin_mib = mib(plan.margin),
+                host_available_mib = mib(plan.available),
+                all_experts_mib = mib(per_slot * hp.n_expert as u64),
+                "memory plan"
+            );
+            Ok(Some(HostTierPlan { srcs, plan }))
+        }
+        Sizing::TooSmall(plan) => Err(LoadError::Device(format!(
+            "the routed experts do not fit in host memory: {} MiB available leave {} RAM slots \
+             per layer after a {} MiB margin and {} MiB for the n-gram table (at least {} slots \
+             are needed)",
+            mib(plan.available),
+            plan.slots,
+            mib(plan.margin),
+            mib(plan.table),
+            host_tier::MIN_SLOTS
+        ))),
+    }
+}
+
+/// Builds the bounded host tier `plan` for the loaded model, its memory in stage 0's arena.
+pub fn host_tier_build(
+    cfg: &LmConfig,
+    gguf: &GgufFile,
+    layout: &Layout,
+    hp: &Hparams,
+    plan: &HostTierPlan,
+) -> Result<std::sync::Arc<crate::residency::host_tier::HostTier>, LoadError> {
+    let buft = layout
+        .arenas
+        .as_ref()
+        .and_then(|a| a.first())
+        .map(|a| a.0)
+        .ok_or_else(|| LoadError::Device("host expert tier: no pinned host arena".into()))?;
+    let max_tokens = cfg.max_batch_tokens.max(cfg.prefill_chunk);
+    crate::residency::host_tier::HostTier::new(
+        gguf,
+        &plan.srcs,
+        hp.n_expert as usize,
+        hp.n_expert_used as usize,
+        plan.plan,
+        buft,
+        max_tokens,
+    )
+    .map_err(|e| LoadError::Device(format!("host expert tier: {e}")))
+}
+
 #[cfg(test)]
 mod tests;
