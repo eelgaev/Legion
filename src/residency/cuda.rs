@@ -1141,6 +1141,12 @@ struct TieredBuffer {
     hole: bool,
     /// The slot part from `split` on is not mapped: its tail was lent out ([`unback_tail`]).
     tail_hole: bool,
+    /// The slot part's last bytes that the last [`Slots::reback`] left unmapped
+    /// ([`Slots::with_cut`]: whole granules, inside the tail): while the slot part is mapped,
+    /// `tail` ends that much before it.
+    cut: usize,
+    /// The granule its parts are whole multiples of.
+    gran: usize,
     /// `vram` (head) or `tail` belong to a device's kept staging buffers
     /// ([`Slots::with_parts`]): unmapped here, never released.
     shared_head: bool,
@@ -1158,9 +1164,14 @@ impl TieredBuffer {
         // SAFETY: only what this buffer mapped and reserved.
         unsafe {
             let total = self.vram_bytes + self.host_bytes;
-            if self.hole || self.tail_hole {
-                if !self.hole && self.split > 0 {
-                    cuMemUnmap(self.va, self.split);
+            if self.hole || self.tail_hole || self.cut > 0 {
+                let mapped = match (self.hole, self.tail_hole) {
+                    (true, _) => 0,
+                    (false, true) => self.split,
+                    (false, false) => self.vram_bytes - self.cut,
+                };
+                if mapped > 0 {
+                    cuMemUnmap(self.va, mapped);
                 }
                 if self.host_bytes > 0 {
                     cuMemUnmap(self.va + self.vram_bytes as u64, self.host_bytes);
@@ -1193,9 +1204,14 @@ impl TieredBuffer {
             parts.push((self.vram, self.split));
         }
         if self.tail != 0 && !self.tail_hole {
-            parts.push((self.tail, self.vram_bytes - self.split));
+            parts.push((self.tail, self.tail_bytes()));
         }
         parts
+    }
+
+    /// The bytes `tail` maps while the slot part is mapped (what [`Self::cut`] leaves of it).
+    fn tail_bytes(&self) -> usize {
+        self.vram_bytes - self.split - self.cut
     }
 }
 
@@ -1325,7 +1341,7 @@ pub fn unback(t: Tensor<'_>) -> Result<usize, String> {
 }
 
 /// The slot range of a tiered tensor, to give VRAM back from any thread ([`Slots::reback`]).
-pub struct Slots(*mut TieredBuffer, Option<(u64, u64)>);
+pub struct Slots(*mut TieredBuffer, Option<(u64, u64)>, usize);
 
 // SAFETY: the tiered buffer outlives the handle (the residency joins the thread using it before
 // it drops its tensors), and nothing else touches its slot part meanwhile (see `unback`).
@@ -1335,22 +1351,33 @@ impl Slots {
     /// The slot range of the tiered tensor `t`.
     pub fn of(t: Tensor<'_>) -> Result<Self, String> {
         tiered_of(t)
-            .map(|b| Self(b, None))
+            .map(|b| Self(b, None, 0))
             .ok_or_else(|| "not a tiered tensor".into())
+    }
+
+    /// [`Self::reback`] leaves the range's last `bytes` (rounded down to whole granules, at
+    /// most its tail) unmapped: memory something else holds now. The slots in them, and the
+    /// one the cut starts in, must stay empty until a reback without it.
+    pub fn with_cut(self, bytes: usize) -> Self {
+        // SAFETY: reading the fields of the live tiered buffer.
+        let b = unsafe { &*self.0 };
+        let g = b.gran.max(1);
+        let cut = (bytes / g * g).min(b.vram_bytes - b.split);
+        Self(self.0, self.1, cut)
     }
 
     /// The range's own allocations `(vram, tail)` (from [`slot_handles`], 0: none), which a
     /// device's kept staging buffers hold while its slots are lent: [`Self::reback`] maps them
     /// back instead of new memory, and they stay the staging buffers' (`shared`).
     pub fn with_parts(self, parts: Option<(u64, u64)>) -> Self {
-        Self(self.0, parts)
+        Self(self.0, parts, self.2)
     }
 
     /// Gives the range VRAM slots again after [`unback`] (their contents undefined).
     pub fn reback(&self) -> Result<(), String> {
         match self.1 {
-            Some(parts) => reback_shared(self.0, parts),
-            None => reback_buffer(self.0),
+            Some(parts) => reback_shared(self.0, parts, self.2),
+            None => reback_buffer(self.0, self.2),
         }
     }
 }
@@ -1371,12 +1398,16 @@ pub fn slot_handles(t: Tensor<'_>, tail_only: bool) -> Option<(u64, u64)> {
 
 /// [`reback_buffer`] mapping `(vram, tail)` (0: new memory), the range's own allocations of
 /// before the lend (now a kept staging buffer's), at their places again.
-fn reback_shared(b: *mut TieredBuffer, (vram, tail): (u64, u64)) -> Result<(), String> {
+fn reback_shared(b: *mut TieredBuffer, (vram, tail): (u64, u64), cut: usize) -> Result<(), String> {
     // SAFETY: maps the range's former allocations or new memory into its unmapped slot part.
     unsafe {
         let b = &mut *b;
         if !b.hole && !b.tail_hole {
             return Ok(());
+        }
+        // The tail allocation was made for the cut of the last reback.
+        if tail != 0 && cut != b.cut {
+            return Err("the slots' kept tail does not fit the cut".into());
         }
         use_device(b.device)?;
         let d = b.device;
@@ -1400,7 +1431,7 @@ fn reback_shared(b: *mut TieredBuffer, (vram, tail): (u64, u64)) -> Result<(), S
             }
             Ok((h, true))
         };
-        let (split, tail_n) = (b.split, b.vram_bytes - b.split);
+        let (split, tail_n) = (b.split, b.vram_bytes - b.split - cut);
         let head = if b.hole && split > 0 {
             Some(map(0, split, vram)?)
         } else {
@@ -1432,11 +1463,12 @@ fn reback_shared(b: *mut TieredBuffer, (vram, tail): (u64, u64)) -> Result<(), S
         b.shared_tail = shared;
         b.hole = false;
         b.tail_hole = false;
+        b.cut = cut;
         Ok(())
     }
 }
 
-fn reback_buffer(b: *mut TieredBuffer) -> Result<(), String> {
+fn reback_buffer(b: *mut TieredBuffer, cut: usize) -> Result<(), String> {
     // SAFETY: maps new memory into the range's unmapped slot part.
     unsafe {
         let b = &mut *b;
@@ -1446,7 +1478,7 @@ fn reback_buffer(b: *mut TieredBuffer) -> Result<(), String> {
         use_device(b.device)?;
         // The same allocations as before the lend: a tail can be lent alone again.
         let tail_at = b.va + b.split as u64;
-        let tail_n = b.vram_bytes - b.split;
+        let tail_n = b.vram_bytes - b.split - cut;
         if b.hole {
             let head = if b.split > 0 {
                 map_fresh(b.device, b.va, b.split)?
@@ -1469,11 +1501,12 @@ fn reback_buffer(b: *mut TieredBuffer) -> Result<(), String> {
             };
             b.vram = head;
             b.tail = tail;
-        } else {
+        } else if tail_n > 0 {
             b.tail = map_fresh(b.device, tail_at, tail_n)?;
         }
         b.hole = false;
         b.tail_hole = false;
+        b.cut = cut;
         Ok(())
     }
 }
@@ -1619,7 +1652,7 @@ unsafe extern "C" fn tiered_clear(buffer: ffi::ggml_backend_buffer_t, v: u8) {
     // SAFETY: the VRAM part only; the host part belongs to the arena.
     unsafe {
         cudaSetDevice(b.device as c_int);
-        cudaMemset(b.va as *mut c_void, v as c_int, b.vram_bytes);
+        cudaMemset(b.va as *mut c_void, v as c_int, b.vram_bytes - b.cut);
         cudaDeviceSynchronize();
     }
 }
@@ -1938,6 +1971,8 @@ fn tiered_buffer(
         host_bytes,
         hole: false,
         tail_hole: false,
+        cut: 0,
+        gran: at.gran,
         shared_head: false,
         shared_tail: false,
         borrowed: false,
@@ -2585,7 +2620,7 @@ pub fn unback_tail(t: Tensor<'_>) -> Result<Option<DeviceMem>, String> {
             return Ok(None);
         }
         use_device(b.device)?;
-        let (d, n) = (b.device, b.vram_bytes - b.split);
+        let (d, n) = (b.device, b.tail_bytes());
         cu(
             timed("cuMemUnmap", d, n, || cuMemUnmap(b.va + b.split as u64, n)),
             "cuMemUnmap(VRAM slot tail)",
@@ -2605,6 +2640,13 @@ pub fn unback_tail(t: Tensor<'_>) -> Result<Option<DeviceMem>, String> {
         }
         Ok(Some(mem))
     }
+}
+
+/// The granule the parts of the tiered tensor `t`'s range are whole multiples of.
+pub fn tiered_gran(t: Tensor<'_>) -> Option<usize> {
+    let b = tiered_of(t)?;
+    // SAFETY: reading a field of the tensor's live tiered buffer.
+    unsafe { Some((*b).gran) }
 }
 
 /// `(first, split)` of the tiered tensor `t`: where slot 0 starts in its range and where the
@@ -2701,6 +2743,8 @@ pub fn staged(
         host_bytes: 0,
         hole: false,
         tail_hole: false,
+        cut: 0,
+        gran: ARENA_ALIGN,
         shared_head: false,
         shared_tail: false,
         borrowed: false,
@@ -2844,6 +2888,8 @@ pub fn staged_packed(
         host_bytes: mem.size,
         hole: head.is_none(),
         tail_hole: false,
+        cut: 0,
+        gran: ARENA_ALIGN,
         shared_head: false,
         shared_tail: false,
         borrowed: false,
@@ -2974,6 +3020,8 @@ pub fn staged_range(
         host_bytes: mem.size,
         hole: head == 0,
         tail_hole: false,
+        cut: 0,
+        gran: ARENA_ALIGN,
         shared_head: false,
         shared_tail: false,
         borrowed: false,
@@ -3140,6 +3188,8 @@ pub fn staged_over_hole(
         host_bytes: mem.size,
         hole: true,
         tail_hole: false,
+        cut: 0,
+        gran: ARENA_ALIGN,
         shared_head: false,
         shared_tail: false,
         borrowed: false,

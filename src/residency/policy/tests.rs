@@ -819,3 +819,61 @@ fn saved_heat_picks_the_contents_and_keeps_the_layer_sizes() {
     // A ranking of fewer layers leaves the others as they were.
     assert_eq!(hottest_experts(&alloc, &order[..1]), alloc);
 }
+
+#[test]
+fn a_limit_empties_the_last_slots_and_keeps_them_empty() {
+    let mut l = LayerSlots::new(8, 4);
+    l.fill(&[0, 1, 2, 3]);
+    // Slots 2 and 3 lose their memory: their experts read from host memory.
+    assert_eq!(l.set_limit(2), vec![2, 3]);
+    assert_eq!(l.limit(), 2);
+    assert_eq!(l.table(), vec![0, 1, 6, 7, 8, 9, 10, 11]);
+    // Nothing takes them: neither a refill nor a swap, however hot the newcomer.
+    assert!(l.refill(&[5, 6]).is_empty());
+    l.record(&[4 + 7, 4 + 7, 4 + 7, 4 + 7, 4 + 7, 4 + 7, 4 + 7, 4 + 7]);
+    let swaps = plan_swaps(&mut [Some(&mut l)], SwapRule::default());
+    assert!(swaps.iter().all(|s| s.slot < 2), "{swaps:?}");
+    // A lend's clear and refill stay inside the limit too.
+    l.clear();
+    assert_eq!(l.refill(&[7, 6, 5]).len(), 2);
+    // The memory is back: the slots fill again.
+    assert!(l.set_limit(4).is_empty());
+    assert_eq!(l.refill(&[5, 4]), vec![(2, 5), (3, 4)]);
+    // Never past the slots there are.
+    l.set_limit(99);
+    assert_eq!(l.limit(), 4);
+}
+
+#[test]
+fn even_cuts_take_a_slot_a_layer_from_the_last_one_down() {
+    const G: usize = 2 << 20;
+    // 3 MiB a slot in three kinds of 1 MiB. The first empty slot keeps its memory: three
+    // slots free one granule a kind.
+    let b = [1 << 20; 3];
+    assert_eq!(cut_spare(0), 0);
+    assert_eq!(cut_spare(3), 2);
+    assert_eq!(cut_bytes(&b, 1, G), 0);
+    assert_eq!(cut_bytes(&b, 2, G), 0);
+    assert_eq!(cut_bytes(&b, 3, G), 3 * G as u64);
+    assert_eq!(cut_bytes(&b, 5, G), 6 * G as u64);
+    let layers = [Some((b, 4)), None, Some((b, 4)), Some((b, 1))];
+    assert_eq!(even_cuts(&layers, G, 0), Some(vec![0, 0, 0, 0]));
+    // Two slots each free nothing yet; the third round stops at the first layer that does
+    // (layer 3 may give one slot only).
+    assert_eq!(even_cuts(&layers, G, 1), Some(vec![2, 0, 3, 1]));
+    assert_eq!(
+        even_cuts(&layers, G, 3 * G as u64 + 1),
+        Some(vec![3, 0, 3, 1])
+    );
+    // All they may give: 4 + 4 slots free 6 granules (a fourth slot frees no whole granule
+    // more), layer 3's one slot none.
+    assert_eq!(even_cuts(&layers, G, 6 * G as u64), Some(vec![3, 0, 3, 1]));
+    assert_eq!(even_cuts(&layers, G, 6 * G as u64 + 1), None);
+    // No two layers differ by more than a slot.
+    let many = vec![Some((b, 50)); 48];
+    let cuts = even_cuts(&many, G, 960 << 20).unwrap();
+    let (lo, hi) = (cuts.iter().min().unwrap(), cuts.iter().max().unwrap());
+    assert!(hi - lo <= 1, "{cuts:?}");
+    let freed: u64 = cuts.iter().map(|&c| cut_bytes(&b, c, G)).sum();
+    assert!(freed >= 960 << 20 && freed < (960 << 20) + 3 * G as u64);
+}

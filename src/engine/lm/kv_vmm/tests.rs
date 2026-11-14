@@ -288,6 +288,16 @@ fn the_host_tiers_mapped_tail_waits_for_a_cached_chats_next_turn() {
 }
 
 #[test]
+fn the_host_tier_counts_the_blocks_its_sequences_will_still_take() {
+    assert_eq!(tier_blocks_ahead(std::iter::empty()), 0);
+    // A new 7.9K prompt with a 600-token reply (34 blocks, none held yet) beside a chat that
+    // holds 3 of its 5: 36 to come, more than 32 kept blocks hold.
+    assert_eq!(tier_blocks_ahead([(34, 0), (5, 3)].into_iter()), 36);
+    // A sequence that holds more than it was admitted for (a resumed prefix) counts as none.
+    assert_eq!(tier_blocks_ahead([(2, 4), (1, 0)].into_iter()), 1);
+}
+
+#[test]
 fn a_run_of_long_chats_turns_the_next_loads_lend_off_and_short_ones_on_again() {
     let dir = tempfile::tempdir().unwrap();
     let heat = dir.path().join("legion/expert-heat/m.gguf.1.heat");

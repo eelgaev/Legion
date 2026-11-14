@@ -7218,6 +7218,17 @@ impl Worker {
             self.kv_tail_used = Instant::now();
             return;
         }
+        // The bounded host tier: mapped when a sequence was admitted whose reply will pass the
+        // kept blocks (`plan_step`); it stays until that reply is over.
+        if self.kv_tier {
+            let ahead = kv_vmm::tier_blocks_ahead(
+                (decoding.iter()).map(|s| (s.need, s.table.blocks().len())),
+            );
+            if ahead > self.pool.free_fast_blocks() as usize {
+                self.kv_tail_used = Instant::now();
+                return;
+            }
+        }
         // The bounded host tier: a long chat's next turn finds its tail mapped.
         let in_use = self.pool.slow_in_use() > 0;
         if kv_vmm::tier_holds(self.kv_tier, in_use, self.kv_tail_used.elapsed()) {
@@ -7280,6 +7291,13 @@ impl Worker {
                 {
                     tracing::warn!(error = %e, "could not refill the expert cache");
                 }
+                // The bounded host tier's even share (#37): every layer's tail is mapped at
+                // its full size again by a lend and the restore the loop runs next.
+                let cut = (self.exec.model().experts()).is_some_and(|x| x.cut_slots() > 0);
+                if cut && !self.lent && self.can_lend {
+                    self.lend_cache(0, usize::MAX);
+                    self.lent_short = self.lent;
+                }
             }
             // The next sequence past the kept blocks maps what is unmapped again.
             Err(e) => {
@@ -7335,7 +7353,8 @@ impl Worker {
     /// background while steps run on.
     /// `--kv-vmm-keep` (#814): while the KV pools' tail is mapped, the cache's slots that held
     /// its VRAM stay without (whole layers; their experts read from host memory) until
-    /// [`Self::kv_shrink`] gives it back.
+    /// [`Self::kv_shrink`] gives it back. The bounded host tier (#37) takes it from every
+    /// layer's last slots instead, a few each.
     fn restore_cache(&mut self) {
         let t = Instant::now();
         let leave = self
@@ -7676,6 +7695,21 @@ impl Worker {
                 if self.kv_tier && self.kv_lend.as_ref().is_some_and(|l| l.grown) {
                     self.size_tier_pass();
                 }
+            }
+        }
+        // The bounded host tier's lend (#37): sequences whose prompts and replies
+        // (`max_tokens`) will pass the kept blocks map the tail while the prompt is read,
+        // before the first token. Mapped in the middle of a reply, the lend and restore of
+        // the expert cache around it stalled the stream for half a second.
+        if self.kv_tier && !prefilling.is_empty() && self.kv_lend.as_ref().is_some_and(|l| !l.grown)
+        {
+            let ahead = kv_vmm::tier_blocks_ahead(
+                (prefilling.iter().chain(decoding.iter()))
+                    .map(|s| (s.need, s.table.blocks().len())),
+            );
+            self.kv_make_room(ahead, false)?;
+            if self.lent && self.kv_lend.as_ref().is_some_and(|l| l.grown) {
+                self.size_tier_pass();
             }
         }
         // A long prompt turns a short lend into a long one until the cache is restored (the

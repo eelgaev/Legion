@@ -198,6 +198,10 @@ struct Layer {
     /// Its tail is lent and not refilled yet (the slots before it still have VRAM).
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))] // read by the CUDA lend paths only
     tail_lent: bool,
+    /// The bounded host tier: its last slots that gave their VRAM to the KV pools' mapped
+    /// tail ([`ExpertResidency::restore_leaving`]); they stay empty.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))] // set by the CUDA restore only
+    cut: usize,
     /// While lent with packed staging: per expert, its id in the staged tensors (a kept slot,
     /// or `stage_first + i` for the `i`-th uncached expert, `stage_miss[i]`); empty otherwise.
     stage_ids: Vec<i32>,
@@ -1727,6 +1731,7 @@ impl ExpertResidency {
                 keep,
                 tier: host.is_some(),
                 tail_lent: false,
+                cut: 0,
                 stage_ids: Vec::new(),
                 stage_first: 0,
                 stage_miss: Vec::new(),
@@ -2281,6 +2286,18 @@ impl ExpertResidency {
     /// way), so that a wrong order names itself here instead of in a kernel.
     fn tier_lent_unread(&self) -> Result<(), String> {
         for (il, l) in self.layers.iter().enumerate() {
+            // Its last slots gave their VRAM to the KV pools' tail (`Layer::cut`).
+            if let Some(l) = l.as_ref().filter(|l| l.tier && l.backed && l.cut > 0) {
+                let first = l.slots.n_slots() - l.cut;
+                if let Some(s) = l.slots.ready().iter().skip(first).position(Option::is_some) {
+                    return Err(format!(
+                        "expert cache: layer {il}'s table would name slot {} while the KV \
+                         pools' tail holds its memory ({} slots cut)",
+                        first + s,
+                        l.cut
+                    ));
+                }
+            }
             let Some(l) = l.as_ref().filter(|l| l.tier && !l.backed) else {
                 continue;
             };
@@ -2738,9 +2755,13 @@ impl ExpertResidency {
         };
         let spawned = std::thread::Builder::new()
             .name("legion-heat".into())
-            .spawn(move || {
-                let pairs = save_heat(&path, learned);
-                tracing::debug!(?pairs, "host expert tier: routing heat saved (periodic)");
+            .spawn(move || match save_heat(&path, learned) {
+                Ok(pairs) => {
+                    tracing::debug!(pairs, "host expert tier: routing heat saved (periodic)")
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "host expert tier: periodic heat save failed")
+                }
             });
         self.heat_writer = spawned.ok();
     }
@@ -3344,6 +3365,13 @@ impl ExpertResidency {
         Ok(())
     }
 
+    /// The slots without VRAM for the KV pools' mapped tail, over the layers (the bounded host
+    /// tier's even share, [`Self::restore_leaving`]); the next restore that leaves nothing
+    /// gives them VRAM again.
+    pub fn cut_slots(&self) -> usize {
+        self.layers.iter().flatten().map(|l| l.cut).sum()
+    }
+
     /// Refills, while not lent, the layers [`Self::restore_leaving`] left without VRAM (after a
     /// restore still under way). Nothing to do when every layer has VRAM.
     pub fn refill_unbacked(&mut self) -> Result<(), String> {
@@ -3409,6 +3437,49 @@ impl ExpertResidency {
         left
     }
 
+    /// The bounded host tier's share of `leave` ([`Self::restore_leaving`]), taken evenly
+    /// ([`super::policy::even_cuts`]): per layer, how many of its last slots stay without VRAM
+    /// from this restore on. The layers the restore gives VRAM (those without) share what the
+    /// cuts of the others do not leave already; none of them keeps a cut when `leave` is
+    /// empty. `None`: not the tier, or its layers cannot free that much past their kept slots
+    /// ([`Self::layers_left`] then).
+    #[cfg(feature = "cuda")]
+    fn tail_cuts(&self, leave: &[(usize, u64)]) -> Option<Vec<usize>> {
+        self.host.as_ref()?;
+        let mut cuts: Vec<usize> = (self.layers.iter())
+            .map(|l| l.as_ref().filter(|l| l.backed).map_or(0, |l| l.cut))
+            .collect();
+        for &(cuda, bytes) in leave {
+            let Some(d) = self.devices.iter().position(|d| d.place.cuda == Some(cuda)) else {
+                continue;
+            };
+            let mut gran = 1;
+            let mut need = bytes;
+            let mut give = vec![None; self.layers.len()];
+            for (il, l) in self.layers.iter().enumerate() {
+                let Some(l) = l.as_ref().filter(|l| l.dev == d && l.tier) else {
+                    continue;
+                };
+                let g = super::cuda::tiered_gran(l.tensor(0)).unwrap_or(1);
+                if l.backed {
+                    let left = super::policy::cut_bytes(&l.expert_bytes, l.cut, g);
+                    need = need.saturating_sub(left);
+                } else if let Some(keep) = l.keep {
+                    gran = g;
+                    let most = l.slots.n_slots().saturating_sub(keep + 1);
+                    give[il] = Some((l.expert_bytes, most));
+                }
+            }
+            let c = super::policy::even_cuts(&give, gran, need)?;
+            for (il, c) in c.into_iter().enumerate() {
+                if give[il].is_some() {
+                    cuts[il] = c;
+                }
+            }
+        }
+        Some(cuts)
+    }
+
     /// [`Self::restore_leaving`] of the slots `held` held when lent.
     fn restore_held(
         &mut self,
@@ -3424,13 +3495,35 @@ impl ExpertResidency {
             let t0 = std::time::Instant::now();
             // `leave`: layers kept without VRAM, and the devices whose staging goes (parked,
             // it would hold their lent slots' memory).
-            let left = self.layers_left(leave, &held);
+            // The bounded host tier: every layer leaves a few of its last slots instead of some
+            // layers their whole lent part.
+            let cuts = self.tail_cuts(leave);
+            let left = match &cuts {
+                Some(_) => vec![false; self.layers.len()],
+                None => self.layers_left(leave, &held),
+            };
+            let cut_of = |il: usize| cuts.as_ref().map_or(0, |c| c[il]);
+            if let Some(c) = cuts.as_ref().filter(|c| c.iter().any(|&n| n > 0)) {
+                tracing::debug!(
+                    slots = c.iter().sum::<usize>(),
+                    most = c.iter().max().copied().unwrap_or(0),
+                    "host expert tier: the mapped KV tail's VRAM comes from every layer's last slots"
+                );
+            }
+            // A layer with a cut, or whose cut goes, maps a tail of another size than its kept
+            // one: its device's staging goes, as with layers left without VRAM.
             let leaving: Vec<bool> = (0..self.devices.len())
                 .map(|d| {
                     self.layers
                         .iter()
                         .zip(&left)
-                        .any(|(l, &x)| x && l.as_ref().is_some_and(|l| l.dev == d))
+                        .enumerate()
+                        .any(|(il, (l, &x))| {
+                            (l.as_ref()).is_some_and(|l| {
+                                let cut = !l.backed && (l.cut > 0 || cut_of(il) > 0);
+                                l.dev == d && (x || cut)
+                            })
+                        })
                 })
                 .collect();
             // Per device: its staged ranges and staging buffers, which its refill thread frees
@@ -3512,10 +3605,16 @@ impl ExpertResidency {
                 };
                 // Kept staging: the slots map their own allocations back.
                 let kept = self.devices[l.dev].kept;
+                // Its last slots that stay without VRAM (`tail_cuts`): empty from here on.
+                let cut = cuts.as_ref().map_or(0, |c| c[il]);
+                l.cut = cut;
+                l.slots.set_limit(l.slots.n_slots() - cut);
                 let slots = (0..3)
                     .map(|k| {
                         let s = super::cuda::Slots::of(l.tensor(k))?;
-                        Ok(s.with_parts(l.shared[k].filter(|_| kept)))
+                        let spare = super::policy::cut_spare(cut);
+                        Ok(s.with_parts(l.shared[k].filter(|_| kept))
+                            .with_cut(spare * l.expert_bytes[k]))
                     })
                     .collect::<Result<Vec<_>, String>>()?;
                 // The experts routed to most that the kept slots do not hold (the kept ones stay:

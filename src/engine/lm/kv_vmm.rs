@@ -142,6 +142,15 @@ pub(super) fn tier_holds(tier: bool, in_use: bool, idle: std::time::Duration) ->
     tier && in_use && idle < TIER_HOLD
 }
 
+/// The blocks the running sequences will still take for the bounded host tier's lend: per
+/// sequence `(need, held)`, the blocks its whole length needs (prompt and `max_tokens`) and
+/// those it holds. More than the kept blocks free: the KV pool's tail is mapped when the
+/// sequence is admitted, not in the middle of its reply (the expert cache is lent and
+/// restored around the mapping, most of a second).
+pub(super) fn tier_blocks_ahead(seqs: impl Iterator<Item = (usize, usize)>) -> usize {
+    seqs.map(|(need, held)| need.saturating_sub(held)).sum()
+}
+
 /// Decode steps a run must count before it decides the next load's lend ([`tier_chats_long`]).
 pub(super) const TIER_USE_STEPS: u64 = 512;
 

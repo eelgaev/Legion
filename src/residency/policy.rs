@@ -40,6 +40,8 @@ pub struct LayerSlots {
     /// The experts this layer's slots serve (expert parallelism: its GPU's share), `None`:
     /// all. The others take no heat, no counts and no slots ([`Self::set_owned`]).
     owned: Option<std::ops::Range<u32>>,
+    /// The slots from here on have no memory now ([`Self::set_limit`]): they stay empty.
+    limit: usize,
 }
 
 /// One planned copy: `new` goes into `slot` of `layer`, replacing `old`.
@@ -60,7 +62,20 @@ impl LayerSlots {
             hits: 0,
             misses: 0,
             owned: None,
+            limit: n_slots,
         }
+    }
+
+    /// Only the slots `0..limit` have memory from now on (all of them: `n_slots`): the others
+    /// are emptied and take no expert until a higher limit. Returns the experts they held.
+    pub fn set_limit(&mut self, limit: usize) -> Vec<u32> {
+        self.limit = limit.min(self.slots.len());
+        self.clear_from(self.limit)
+    }
+
+    /// The slots that have memory ([`Self::set_limit`]).
+    pub fn limit(&self) -> usize {
+        self.limit
     }
 
     /// Serves only the experts `owned` from now on (set before the first fill): routings of the
@@ -92,7 +107,7 @@ impl LayerSlots {
     pub fn fill(&mut self, experts: &[u32]) {
         let mut s = 0;
         for &e in experts {
-            if s == self.slots.len() {
+            if s == self.limit {
                 break;
             }
             if self.slot_of[e as usize].is_some() {
@@ -216,10 +231,10 @@ impl LayerSlots {
             if self.slot_of[e as usize].is_some() {
                 continue;
             }
-            while s < self.slots.len() && self.slots[s] != Slot::Empty {
+            while s < self.limit && self.slots[s] != Slot::Empty {
                 s += 1;
             }
-            if s == self.slots.len() {
+            if s == self.limit {
                 break;
             }
             self.slots[s] = Slot::Filling(e);
@@ -376,6 +391,7 @@ impl LayerSlots {
             .slots
             .iter()
             .enumerate()
+            .take(self.limit)
             .filter_map(|(s, slot)| match *slot {
                 Slot::Empty => Some((f32::NEG_INFINITY, s as u32, None)),
                 Slot::Ready(e) => Some((self.heat[e as usize], s as u32, Some(e))),
@@ -825,6 +841,60 @@ pub fn layers_left_coldest(lent: &[Option<u64>], heat: &[f32], need: u64) -> Vec
         left[i] = true;
     }
     left
+}
+
+/// The bytes a layer's slot ranges free when its last `slots` slots stay empty: per kind
+/// (`bytes` a slot), the whole mapping granules (`gran`) in all of them but the first, which
+/// keeps its memory ([`cut_spare`]).
+pub fn cut_bytes(bytes: &[usize; 3], slots: usize, gran: usize) -> u64 {
+    let g = gran.max(1);
+    let n = cut_spare(slots);
+    bytes.iter().map(|b| (n * b / g * g) as u64).sum()
+}
+
+/// Of a layer's last `slots` empty slots, those that give their memory up: all but the first.
+/// A step of several tokens reads past the end of the last expert it multiplies (tiles of
+/// rows, the rows past the end unused): after the last slot in use that must be mapped memory,
+/// as the slot after it or the host part always was.
+pub fn cut_spare(slots: usize) -> usize {
+    slots.saturating_sub(1)
+}
+
+/// [`layers_left_for`] for the bounded host tier, taken evenly: how many slots each of a
+/// device's layers gives up at its end so that `need` bytes stay free, instead of whole
+/// layers' lent slots (a layer without half its slots copies over PCIe for every token routed
+/// to them). `layers[i]`: the bytes of a slot per kind and the most slots layer `i` may give up
+/// (`None`: none). One slot at a time, from the last layer down, so no two layers differ by
+/// more than one slot (but where a layer reached its most). `None` when they cannot free
+/// `need`.
+pub fn even_cuts(
+    layers: &[Option<([usize; 3], usize)>],
+    gran: usize,
+    need: u64,
+) -> Option<Vec<usize>> {
+    let mut cuts = vec![0usize; layers.len()];
+    let freed = |cuts: &[usize]| -> u64 {
+        (layers.iter().zip(cuts))
+            .filter_map(|(l, &c)| l.as_ref().map(|(b, _)| cut_bytes(b, c, gran)))
+            .sum()
+    };
+    while freed(&cuts) < need {
+        let mut grew = false;
+        for (i, l) in layers.iter().enumerate().rev() {
+            let Some((_, most)) = l else { continue };
+            if cuts[i] < *most {
+                cuts[i] += 1;
+                grew = true;
+                if freed(&cuts) >= need {
+                    return Some(cuts);
+                }
+            }
+        }
+        if !grew {
+            return None;
+        }
+    }
+    Some(cuts)
 }
 
 /// Returns the keep, and [`auto_keep`]'s byte-count keep (the same unless it was lowered).
