@@ -1952,8 +1952,17 @@ fn fit_tp_slots(
                 )));
             }
             TpTier::Auto(nodes) => {
-                // One slot's context on the host at least; past what the host holds, the
-                // slots' host blocks are backed as they fill (#1131).
+                // One slot's context on the host at least; past what the budgets for a tier
+                // pinned at load hold, or with shared VRAM chunks, the slots' host blocks are
+                // backed as they fill (#1131), from the looser budgets of such tiers (#1163).
+                let lazy = lend > 0 || host_tier::budget_blocks(nodes) < host;
+                let lazy_nodes: Vec<host_tier::Node>;
+                let nodes = if lazy {
+                    lazy_nodes = nodes.iter().map(|n| n.backed_as_filled()).collect();
+                    &lazy_nodes
+                } else {
+                    nodes
+                };
                 let held = host_tier::auto_host_blocks(
                     hbm_slot,
                     slot_blocks,
@@ -1962,9 +1971,10 @@ fn fit_tp_slots(
                     nodes,
                 )
                 .map_err(LoadError::Device)?;
-                if held < host {
+                // Every slot backed (`held` = `host`) needs no room past the slots' chunks.
+                if held < host || (lazy && lend == 0) {
                     let cap = lazy_slot_cap(held, n_seqs);
-                    if cap < slot_blocks {
+                    if held < host && cap < slot_blocks {
                         return Err(LoadError::Device(format!(
                             "--kv-slots: the host has room for {} tokens of KV cache past the \
                              GPUs ({}), short of one {}-token context besides the {n_seqs} \
@@ -4836,12 +4846,14 @@ impl LmEngine {
             let nodes: Vec<u32> = tiers.iter().flatten().map(|t| t.node).collect();
             exec.set_kv_tiers(tiers);
             if auto_tier && host_blocks > 0 {
-                // What it pins: every host block, or a lazily backed tier's budget (#1131).
+                // What it pins: every host block, or a lazily backed tier's budget (#1131),
+                // the latter as it fills (#1163).
+                let lazy = exec.kv_slot_host_budget().is_some() || exec.kv_slot_lend() > 0;
                 let backed = exec.kv_slot_host_budget().unwrap_or(host_blocks) as u64;
                 let per_node = tier_plan_bytes(&tp_tier_nodes, &tier_nodes, &tier_stage_bytes);
                 let per_node: Vec<(u32, u64)> =
                     per_node.into_iter().map(|(n, b)| (n, b * backed)).collect();
-                tier_plan = Some(host_tier::reserve(tier_owner, &per_node));
+                tier_plan = Some(host_tier::reserve(tier_owner, &per_node, lazy));
             }
             n_blocks = hbm_blocks + host_blocks;
             exec.resize_kv(n_blocks).map_err(|e| {

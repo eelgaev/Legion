@@ -268,6 +268,8 @@ pub(super) fn log(p: &MemoryPlan) {
             node = n.node,
             planned_mib = mib(n.planned),
             cap_mib = mib(n.cap),
+            backed_as_filled_mib = mib(n.lazy),
+            all_tiers_cap_mib = mib(n.lazy_cap),
             "memory plan"
         );
     }

@@ -10,6 +10,8 @@ fn node(block_bytes: u64, free_gib: u64, total_gib: u64) -> Node {
         cache: 0,
         total: total_gib * GIB,
         planned: 0,
+        planned_lazy: 0,
+        lazy: false,
     }
 }
 
@@ -243,6 +245,8 @@ fn meminfo_power9_page_cache_lets_the_context_fit() {
             cache: m.cache,
             total: m.total,
             planned: 0,
+            planned_lazy: 0,
+            lazy: false,
         }
     };
     let ctx_blocks = 120_000;
@@ -320,6 +324,8 @@ fn hang_node(block_bytes: u64) -> Node {
         cache: gib(182.2),
         total: gib(255.5),
         planned: 0,
+        planned_lazy: 0,
+        lazy: false,
     }
 }
 
@@ -447,34 +453,38 @@ fn the_ledger_sums_every_load_per_node() {
     l.memory(1, 0, || Some(nm(240, 256)));
     l.memory(2, 0, || Some(nm(120, 256)));
     l.memory(2, 8, || Some(nm(250, 256)));
-    l.plan(r0, &[(0, 60 * GIB)]);
-    l.plan(r1, &[(0, 60 * GIB)]);
+    l.plan(r0, &[(0, 60 * GIB)], false);
+    l.plan(r1, &[(0, 60 * GIB)], false);
     // The pair's own ranks are not "other loads" to each other: their split is in the block
     // bytes.
-    assert_eq!(l.others(1, 0), 0);
-    assert_eq!(l.others(2, 0), 120 * GIB);
-    l.plan(replica, &[(0, 4 * GIB), (8, 50 * GIB)]);
-    assert_eq!(l.others(1, 0), 4 * GIB);
-    assert_eq!(l.others(1, 8), 50 * GIB);
+    assert_eq!(l.others(1, 0), (0, 0));
+    assert_eq!(l.others(2, 0), (120 * GIB, 0));
+    l.plan(replica, &[(0, 4 * GIB), (8, 50 * GIB)], true);
+    assert_eq!(l.others(1, 0), (4 * GIB, 4 * GIB));
+    assert_eq!(l.others(1, 8), (50 * GIB, 50 * GIB));
     assert_eq!(
         l.per_node(),
         vec![
             NodePlan {
                 node: 0,
-                planned: 124 * GIB,
-                cap: 128 * GIB
+                planned: 120 * GIB,
+                cap: 128 * GIB,
+                lazy: 4 * GIB,
+                lazy_cap: lazy_cap(256 * GIB),
             },
             NodePlan {
                 node: 8,
-                planned: 50 * GIB,
-                cap: 128 * GIB
+                planned: 0,
+                cap: 128 * GIB,
+                lazy: 50 * GIB,
+                lazy_cap: lazy_cap(256 * GIB),
             },
         ]
     );
     // A replan replaces the owner's plan.
-    l.plan(replica, &[(8, 10 * GIB)]);
-    assert_eq!(l.others(1, 0), 0);
-    assert_eq!(l.others(1, 8), 10 * GIB);
+    l.plan(replica, &[(8, 10 * GIB)], false);
+    assert_eq!(l.others(1, 0), (0, 0));
+    assert_eq!(l.others(1, 8), (10 * GIB, 0));
 }
 
 #[test]
@@ -483,14 +493,14 @@ fn a_released_load_leaves_the_plan() {
     let r0 = Owner { group: 1, rank: 0 };
     let r1 = Owner { group: 1, rank: 1 };
     l.memory(1, 0, || Some(nm(240, 256)));
-    l.plan(r0, &[(0, 60 * GIB)]);
-    l.plan(r1, &[(0, 60 * GIB)]);
+    l.plan(r0, &[(0, 60 * GIB)], false);
+    l.plan(r1, &[(0, 60 * GIB)], false);
     l.release(r0);
-    assert_eq!(l.others(2, 0), 60 * GIB);
+    assert_eq!(l.others(2, 0), (60 * GIB, 0));
     // The group's look stays while a rank of it plans.
     assert_eq!(l.memory(1, 0, || Some(nm(1, 256))), Some(nm(240, 256)));
     l.release(r1);
-    assert_eq!(l.others(2, 0), 0);
+    assert_eq!(l.others(2, 0), (0, 0));
     assert!(l.per_node().is_empty());
     assert_eq!(l.memory(1, 0, || Some(nm(1, 256))), Some(nm(1, 256)));
 }
@@ -502,15 +512,117 @@ fn the_plan_note() {
             node: 0,
             planned: gib(61.7),
             cap: 128 * GIB,
+            lazy: 0,
+            lazy_cap: gib(204.8),
         },
         NodePlan {
             node: 8,
             planned: 0,
             cap: 128 * GIB,
+            lazy: gib(191.6),
+            lazy_cap: gib(204.8),
         },
     ]);
     assert_eq!(
         note,
-        "node 0: 61.7 GiB of a 128.0 GiB cap; node 8: 0.0 GiB of a 128.0 GiB cap"
+        "node 0: 61.7 GiB of a 128.0 GiB cap; node 8: 0.0 GiB of a 128.0 GiB cap, 191.6 GiB \
+         backed as sequences fill (all tiers at most 204.8 GiB)"
     );
+}
+
+/// Gemma 4 31B's `--tp 2` docs command (16 x 262,144 tokens) on node 8 of an AC922 with the
+/// GPUs' node nearly empty: 251.5 GiB free of 255.5, 16.8 GiB of it page cache. Its slots are
+/// backed as they fill.
+fn gemma_node() -> Node {
+    Node {
+        node: 8,
+        block_bytes: 1 << 20,
+        free: gib(251.5),
+        cache: gib(16.8),
+        total: gib(255.5),
+        planned: 0,
+        planned_lazy: 0,
+        lazy: false,
+    }
+}
+
+#[test]
+fn a_tier_backed_as_it_fills_takes_the_looser_cap() {
+    // Pinned at load: half the node, 127.75 GiB.
+    assert!((as_gib(node_budget(&gemma_node())) - 127.75).abs() < 0.01);
+    // Backed as it fills: 251.5 - 8.4 (half the page cache) - 25.55 margin = 217.55 GiB of
+    // room, the 80% cap 204.4 GiB.
+    let lazy = gemma_node().backed_as_filled();
+    assert!(
+        (as_gib(node_budget(&lazy)) - 204.4).abs() < 0.01,
+        "{}",
+        as_gib(node_budget(&lazy))
+    );
+    // Room still bounds it: a node with less free memory gets what it has, less the margin.
+    let tight = Node {
+        free: gib(150.0),
+        cache: 0,
+        ..lazy
+    };
+    assert!((as_gib(node_budget(&tight)) - 124.45).abs() < 0.01);
+}
+
+#[test]
+fn backed_as_filled_plans_count_against_both_caps() {
+    // Another load backs 100 GiB as it fills: not pinned yet, so it comes out of the room too,
+    // but not out of the cap for tiers pinned at load.
+    let n = Node {
+        planned: 100 * GIB,
+        planned_lazy: 100 * GIB,
+        ..gemma_node()
+    };
+    // Pinned at load: room 217.55 - 100, the 80% cap 204.4 - 100, the 50% cap 127.75 - 0.
+    assert!(
+        (as_gib(node_budget(&n)) - 104.4).abs() < 0.01,
+        "{}",
+        as_gib(node_budget(&n))
+    );
+    // Another load pinned 100 GiB at load (already out of the free memory read): the 50% cap
+    // leaves 27.75 GiB for one pinned at load, the 80% cap 104.4 GiB for one backed as filled.
+    let pinned = Node {
+        planned: 100 * GIB,
+        ..gemma_node()
+    };
+    assert!((as_gib(node_budget(&pinned)) - 27.75).abs() < 0.01);
+    assert!((as_gib(node_budget(&pinned.backed_as_filled())) - 104.4).abs() < 0.01);
+}
+
+#[test]
+fn the_gemma_docs_slots_are_not_cut_to_half_the_node() {
+    // 16 slots of 266,240 tokens past no device blocks: 4,259,840 tokens. With 81.9 KB a token
+    // (81.25 GiB for 4 slots), the half-node budget backs 1.67M tokens at once, the looser one
+    // 2.68M, as much as before the cap (199.7 GiB).
+    let block = (gib(81.25) as f64 / (4 * 266_240 / KV_BLOCK) as f64) as u64;
+    let slot = 266_240 / KV_BLOCK;
+    let host = 16 * slot;
+    let at_load = Node {
+        block_bytes: block,
+        ..gemma_node()
+    };
+    let eager = auto_host_blocks(0, slot, host, 0, &[at_load]).unwrap();
+    let lazy = auto_host_blocks(0, slot, host, 0, &[at_load.backed_as_filled()]).unwrap();
+    assert!(eager < host && lazy < host);
+    assert!(
+        as_gib(lazy as u64 * block) > 199.7,
+        "{}",
+        as_gib(lazy as u64 * block)
+    );
+    assert!(as_gib(eager as u64 * block) < 127.8);
+    let err = auto_host_blocks(
+        0,
+        slot,
+        host,
+        0,
+        &[Node {
+            planned: gib(250.0),
+            ..at_load.backed_as_filled()
+        }],
+    )
+    .unwrap_err();
+    assert!(err.contains("pinning at most 80% of a node"), "{err}");
 }
