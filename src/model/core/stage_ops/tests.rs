@@ -20,6 +20,7 @@ fn host_bound_ops_are_not_listed() {
         "ssd_expert_predict",
         "cpu_share_publish",
         "cpu_share_collect",
+        "cpu_share_act",
         "tp_all_reduce",
         "tp_reduce_scatter",
         "pair_link",

@@ -4338,7 +4338,7 @@ impl Model {
                         let w = [w_gate, w_up, t.weight(2)];
                         // The host computes a share of the missed experts (#268, opt-in).
                         let shared = t.cpu_share(n).and_then(|share| {
-                            let (slots, n_expert) = (t.n_slots(), t.n_expert());
+                            let (slots, n_expert) = (t.n_slots(), t.share_experts());
                             cpu_share::ops::glu_down(ctx, w, x, ids, slots, n_expert, il, share)
                         });
                         let split = shared.or_else(|| {

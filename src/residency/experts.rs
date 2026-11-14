@@ -977,6 +977,18 @@ impl<'a> TieredLayer<'a> {
         self.n_expert
     }
 
+    /// The ids past [`Self::n_slots`] the host's share may compute ([`super::cpu_share`]):
+    /// every expert, or with the bounded host tier its RAM slots only (the share's host
+    /// tensor is the RAM slots, [`share_setup`]). The tier's fetch turns a miss into its RAM
+    /// slot or staging place before the share's `publish` reads the ids, so `n_slots + i`
+    /// with `i` below this is RAM slot `i`; a staging place (an expert no RAM slot was left
+    /// for, read from the checkpoint this step) stays on the link. Why the pool may read a
+    /// RAM slot until the layer's `collect`: the `cpu_share` module docs, "The bounded host
+    /// tier".
+    pub fn share_experts(&self) -> usize {
+        self.host.map_or(self.n_expert, |(h, _)| h.slots())
+    }
+
     /// The layer's cache slots: [`Self::remap`]'s indices below this are VRAM.
     pub fn n_slots(&self) -> usize {
         self.layer.slots.n_slots()
@@ -1332,9 +1344,10 @@ impl ExpertResidency {
             found.push(entry);
         }
         // The bounded host tier: experts are in RAM slots or read as routed, so nothing may
-        // read an expert's host bytes at `n_slots + expert`: no host share, no re-pack of the
-        // kept slots, and a long prompt's staged passes take every expert from where the tier
-        // has it ([`Layer::tier_copies`]: one plan a row, kept across lends).
+        // read an expert's host bytes at `n_slots + expert`: no re-pack of the kept slots, and
+        // a long prompt's staged passes take every expert from where the tier has it
+        // ([`Layer::tier_copies`]: one plan a row, kept across lends). The host share takes
+        // only misses the tier's fetch found in a RAM slot ([`TieredLayer::share_experts`]).
         let host = found
             .iter()
             .flatten()
@@ -1348,10 +1361,6 @@ impl ExpertResidency {
                     lend_keep: Vec::new(),
                     stage_pieces: 0,
                     stage_reuse: true,
-                    cpu_share: super::cpu_share::CpuShareConfig {
-                        share: 0.0,
-                        ..cfg.cpu_share.clone()
-                    },
                     ..cfg.clone()
                 };
                 &bounded
@@ -4064,9 +4073,20 @@ fn share_setup(
     found: &[Option<(LayerPlace, [Tensor<'_>; 3])>],
 ) -> Result<u32, String> {
     use super::cpu_share::{DevicePlan, HostExperts, format_of, setup, threshold};
-    // POWER9 (AC922) only: its host link is the one the share relieves; elsewhere a no-op.
-    if !cfg!(all(target_arch = "powerpc64", target_endian = "little")) {
-        tracing::warn!("--cpu-expert-share is POWER9 (ppc64le) only; ignored on this host");
+    use crate::cpu::gpu_exact;
+    // POWER9 (AC922): the host kernels' share (outputs move). x86 with AVX2, FMA and F16C: the
+    // exact share, the GPU kernels' bits (#37). Elsewhere a no-op.
+    let power9 = cfg!(all(target_arch = "powerpc64", target_endian = "little"));
+    let exact = cfg!(target_arch = "x86_64") && gpu_exact::simd();
+    if !power9 && !exact {
+        tracing::warn!(
+            "--cpu-expert-share needs POWER9 (ppc64le) or x86 with AVX2, FMA and F16C; ignored \
+             on this host"
+        );
+        return Ok(0);
+    }
+    if power9 && cfg.cpu_share.auto {
+        tracing::warn!("--cpu-expert-share auto is the exact share (x86) only; the share is off");
         return Ok(0);
     }
     let mut plans: Vec<DevicePlan> = Vec::new();
@@ -4097,6 +4117,30 @@ fn share_setup(
             n_ff: ts[1].ne()[1] as usize,
             n_expert: ts[1].ne()[2] as usize,
         };
+        // The bounded host tier: the host tensors are the layer's RAM slots, the ids the share
+        // takes ([`TieredLayer::share_experts`]).
+        if let Some(h) = &me.host
+            && ts.iter().any(|t| t.ne()[2] as usize != h.slots())
+        {
+            tracing::warn!(
+                layer = il,
+                "cpu expert share: the host tier's RAM slots do not match, layer left to the GPU"
+            );
+            continue;
+        }
+        // The exact share: formats the host computes the kernels' bits of, whole Q8_1 blocks.
+        if exact
+            && (gpu_exact::units_per_row(up_gate, he.n_embd).is_none()
+                || gpu_exact::units_per_row(down, he.n_ff).is_none()
+                || !he.n_embd.is_multiple_of(256)
+                || !he.n_ff.is_multiple_of(32))
+        {
+            tracing::warn!(
+                layer = il,
+                "cpu expert share: no exact host kernels for the experts, layer left to the GPU"
+            );
+            continue;
+        }
         let plan = match plans.iter_mut().find(|d| d.device == device) {
             Some(d) => d,
             None => {
@@ -4106,6 +4150,7 @@ fn share_setup(
                     node,
                     layers: Vec::new(),
                     n_embd: he.n_embd,
+                    exact,
                 });
                 plans.last_mut().unwrap()
             }

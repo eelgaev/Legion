@@ -30,6 +30,15 @@ static COLLECT: ExternalOp = ExternalOp {
     cuda: None,
 };
 
+static ACTIVATE: ExternalOp = ExternalOp {
+    name: "cpu_share_act",
+    cpu: cpu_pass,
+    #[cfg(feature = "cuda")]
+    cuda: Some(cuda::activate),
+    #[cfg(not(feature = "cuda"))]
+    cuda: None,
+};
+
 /// Tokens a step may have for the share to take part (larger steps leave every expert to the
 /// GPU): the expert matvecs' default limit, and the exchange buffer's capacity.
 pub const MAX_TOKENS: usize = expert_mv::MAX_TOKENS as usize;
@@ -58,17 +67,36 @@ pub fn glu_down<'a>(
         || n as usize > MAX_TOKENS
         || n_used as usize > MAX_USED
         || !expert_mv::glu_fits(gate, up, x, ids)
-        || !registered(layer)
     {
         return None;
     }
+    let exact = match registered(layer) {
+        None => return None,
+        Some(exact) => exact,
+    };
+    if exact && !EXACT_WIDTHS.contains(&(n as usize)) {
+        return None;
+    }
     let shared = publish(ctx, x, ids, layer, n_slots, n_expert, threshold);
-    let act = expert_mv::glu_tiered(ctx, gate, up, x, shared, n_slots);
+    let mut act = expert_mv::glu_tiered(ctx, gate, up, x, shared, n_slots);
     if !expert_mv::fits(down, act, shared) {
         return None;
     }
+    if exact {
+        act = activate(ctx, act, shared);
+    }
     let out = expert_mv::mul_mat_id_tiered(ctx, down, act, shared, n_slots);
     Some(collect(ctx, out, shared))
+}
+
+/// The steps' widths the exact share takes: those whose kernel bits the host's were checked
+/// against on a real model (`legion expert-cpu-proof`); 5 and 7 tokens never came up.
+pub const EXACT_WIDTHS: [usize; 6] = [1, 2, 3, 4, 6, 8];
+
+/// The exact share's SwiGLU output `act` (F32 `[n_ff, n_used, n]`) with the host pairs' rows
+/// made from the host's gate and up sums, once they are written; `ids` is [`publish`]'s result.
+fn activate<'a>(ctx: &'a Context, act: Tensor<'a>, ids: Tensor<'a>) -> Tensor<'a> {
+    ctx.external_with(&ACTIVATE, types::F32, act.ne(), &[act, ids], &[])
 }
 
 /// The router's `ids` (I32 `[n_used, n]`, tiered) of layer `layer`, published with the
@@ -127,6 +155,9 @@ pub struct DeviceShare {
     pub(super) device_base: u64,
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(super) layout: super::Layout,
+    /// The exact share's part of the buffer (x86), if the device runs it.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(super) exact: Option<super::ExactLayout>,
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(super) seq: super::Sequence,
     /// Per layer (index = layer id), its experts in host memory, if the device runs it.
@@ -167,14 +198,15 @@ pub fn clear() {
 }
 
 /// Whether a device registered layer `layer` (graphs are built before the step knows its
-/// device; a layer belongs to one device).
-fn registered(layer: usize) -> bool {
+/// device; a layer belongs to one device): `Some(exact)`, whether its share is the exact one.
+fn registered(layer: usize) -> Option<bool> {
     DEVICES
         .lock()
         .unwrap()
         .iter()
         .flatten()
-        .any(|d| d.layers.get(layer).is_some_and(Option::is_some))
+        .find(|d| d.layers.get(layer).is_some_and(Option::is_some))
+        .map(|d| d.exact.is_some())
 }
 
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
@@ -206,6 +238,27 @@ mod cuda {
         ids_host: *mut i32,
         x_host: *mut f32,
         ids_dev: *mut i32,
+        exact: i32,
+        thr: *const u32,
+        xq_host: *mut c_void,
+        n_miss: *mut u32,
+    }
+
+    #[repr(C)]
+    struct Activate {
+        ids: *const i32,
+        n_used: i32,
+        n_tok: i32,
+        rows: i32,
+        src: *const f32,
+        src_nb1: i64,
+        src_nb2: i64,
+        gu: *const f32,
+        aq: *mut c_void,
+        dst: *mut f32,
+        limit: f32,
+        wait: *const u32,
+        seq: u32,
     }
 
     #[repr(C)]
@@ -219,14 +272,44 @@ mod cuda {
         src_nb1: i64,
         src_nb2: i64,
         dst: *mut f32,
+        wait: *const u32,
+        seq: u32,
     }
 
     /// `CU_STREAM_WAIT_VALUE_GEQ`: `(int32_t)(*addr - value) >= 0`, so wrapping is fine.
     const WAIT_GEQ: u32 = 0;
 
+    /// How `activate` and `collect` wait for the host's flag. By default the host pairs' blocks
+    /// of the op's kernel poll it (a system-scope acquire load a few hundred nanoseconds
+    /// apart), so the launch and the GPU pairs' copies overlap the host's work and the kernel
+    /// sees the flag about as soon as the host raises it. `LEGION_DEBUG_SHARE_STREAM_WAIT=1`:
+    /// the stream waits for it before the launch (`cuStreamWaitValue32`, the way before), for
+    /// A/B runs. The same results either way.
+    fn stream_wait() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("LEGION_DEBUG_SHARE_STREAM_WAIT").is_ok_and(|v| v == "1"))
+    }
+
+    /// Waits in `stream` for the host's flag at `addr` to reach `seq` when the stream waits
+    /// ([`stream_wait`]); otherwise gives the flag's device address for the kernel to poll.
+    ///
+    /// # Safety
+    /// `addr` is a flag's device address in a device's exchange buffer.
+    unsafe fn wait_for(stream: *mut c_void, addr: u64, seq: u32) -> Result<*const u32, String> {
+        if !stream_wait() {
+            return Ok(addr as *const u32);
+        }
+        // SAFETY: the caller's.
+        match unsafe { cuStreamWaitValue32_v2(stream, addr, seq, WAIT_GEQ) } {
+            0 => Ok(std::ptr::null()),
+            e => Err(format!("cuStreamWaitValue32: error {e}")),
+        }
+    }
+
     unsafe extern "C" {
         fn legion_cpu_share_publish_launch(p: *const Publish, stream: *mut c_void) -> c_int;
         fn legion_cpu_share_collect_launch(p: *const Collect, stream: *mut c_void) -> c_int;
+        fn legion_cpu_share_activate_launch(p: *const Activate, stream: *mut c_void) -> c_int;
         fn cudaGetDevice(device: *mut c_int) -> c_int;
         fn cuStreamWriteValue32_v2(stream: *mut c_void, addr: u64, value: u32, flags: u32)
         -> c_int;
@@ -263,7 +346,23 @@ mod cuda {
             .copied()
             .flatten()
             .ok_or("cpu share: layer not registered on this device")?;
+        // The pool reads ids below `n_expert` at its experts' addresses (the bounded host
+        // tier: its RAM slots, so no more than those).
+        if n_expert < 0 || n_expert as usize > experts.n_expert {
+            return Err(format!(
+                "cpu share: layer {layer} takes {n_expert} host ids, its host tensor holds {}",
+                experts.n_expert
+            ));
+        }
         let lay = &share.layout;
+        let base = share.device_base;
+        let el = share.exact.as_ref();
+        let n_layers = ex.exact.map_or(0, |x| x.n_layers);
+        if el.is_some() && (k % 32 != 0 || layer as usize >= n_layers) {
+            return Err(format!(
+                "cpu share: layer {layer} (k {k}) does not fit the exchange"
+            ));
+        }
         let p = Publish {
             ids: ids.data as *const i32,
             ids_nb1: ids.nb[1] as i64,
@@ -276,9 +375,19 @@ mod cuda {
             n_expert,
             threshold: threshold as u32,
             dither: super::super::dither(layer as u32),
-            ids_host: (share.device_base + lay.ids as u64) as *mut i32,
-            x_host: (share.device_base + lay.x as u64) as *mut f32,
+            ids_host: (base + lay.ids as u64) as *mut i32,
+            x_host: (base + lay.x as u64) as *mut f32,
             ids_dev: dst.data as *mut i32,
+            exact: i32::from(el.is_some()),
+            thr: el.map_or(std::ptr::null(), |e| {
+                (base + (e.thr + layer as usize * 4) as u64) as *const u32
+            }),
+            xq_host: el.map_or(std::ptr::null_mut(), |e| {
+                (base + e.xq as u64) as *mut c_void
+            }),
+            n_miss: el.map_or(std::ptr::null_mut(), |e| {
+                (base + e.n_miss as u64) as *mut u32
+            }),
         };
         // SAFETY: device tensors of the stream's device; the exchange is mapped for it.
         let e = unsafe { legion_cpu_share_publish_launch(&p, stream) };
@@ -308,6 +417,69 @@ mod cuda {
         Ok(())
     }
 
+    /// The exact share's `activate`: waits for the host's gate and up sums, makes its pairs'
+    /// SwiGLU rows and blocks, raises "act ready".
+    pub(super) unsafe fn activate(
+        dst: &ffi::ggml_tensor,
+        stream: *mut c_void,
+    ) -> Result<(), String> {
+        let share = device(current_device()?).ok_or("cpu share: device not registered")?;
+        let e = share
+            .exact
+            .as_ref()
+            .ok_or("cpu share: activate without the exact share")?;
+        // SAFETY: a node made by `activate`: act F32 [n_ff, n_used, n], ids I32 dense.
+        let (act, ids) = unsafe { (&*dst.src[0], &*dst.src[1]) };
+        let rows = act.ne[0] as usize;
+        if rows > e.n_ff || rows % 32 != 0 {
+            return Err(format!(
+                "cpu share: {rows} rows do not fit the exchange ({})",
+                e.n_ff
+            ));
+        }
+        let base = share.device_base;
+        let seq = share.seq.last();
+        // `auto` steers the share by who waited ([`super::pool::nudge`]); otherwise only the
+        // debug statistics read the flag.
+        if share.exchange.exact.is_some_and(|x| x.auto)
+            || tracing::enabled!(target: "legion::residency::cpu_share", tracing::Level::DEBUG)
+        {
+            // SAFETY: the flag's device address, in the exchange buffer.
+            let r = unsafe { cuStreamWriteValue32_v2(stream, base + e.act_arrived as u64, seq, 0) };
+            if r != 0 {
+                return Err(format!("cuStreamWriteValue32: error {r}"));
+            }
+        }
+        // SAFETY: the flag's device address, in the exchange buffer.
+        let wait = unsafe { wait_for(stream, base + e.gu_done as u64, seq)? };
+        let p = Activate {
+            ids: ids.data as *const i32,
+            n_used: ids.ne[0] as i32,
+            n_tok: ids.ne[1] as i32,
+            rows: rows as i32,
+            src: act.data as *const f32,
+            src_nb1: act.nb[1] as i64,
+            src_nb2: act.nb[2] as i64,
+            gu: (base + e.gu as u64) as *const f32,
+            aq: (base + e.aq as u64) as *mut c_void,
+            dst: dst.data as *mut f32,
+            limit: 0.0,
+            wait,
+            seq,
+        };
+        // SAFETY: device tensors; the exchange is mapped for the device.
+        let r = unsafe { legion_cpu_share_activate_launch(&p, stream) };
+        if r != 0 {
+            return Err(format!("cpu share activate: error {r}"));
+        }
+        // Ordered after the kernel's writes, as `publish`'s flag.
+        // SAFETY: the flag's device address, in the exchange buffer.
+        match unsafe { cuStreamWriteValue32_v2(stream, base + e.act_ready as u64, seq, 0) } {
+            0 => Ok(()),
+            r => Err(format!("cuStreamWriteValue32: error {r}")),
+        }
+    }
+
     pub(super) unsafe fn collect(
         dst: &ffi::ggml_tensor,
         stream: *mut c_void,
@@ -327,12 +499,7 @@ mod cuda {
             }
         }
         // SAFETY: the done flag's device address, in the exchange buffer.
-        let e = unsafe {
-            cuStreamWaitValue32_v2(stream, share.device_base + lay.done as u64, seq, WAIT_GEQ)
-        };
-        if e != 0 {
-            return Err(format!("cuStreamWaitValue32: error {e}"));
-        }
+        let wait = unsafe { wait_for(stream, share.device_base + lay.done as u64, seq)? };
         let p = Collect {
             ids: ids.data as *const i32,
             n_used: ids.ne[0] as i32,
@@ -343,6 +510,8 @@ mod cuda {
             src_nb1: experts.nb[1] as i64,
             src_nb2: experts.nb[2] as i64,
             dst: dst.data as *mut f32,
+            wait,
+            seq,
         };
         // SAFETY: device tensors; the exchange's output rows are mapped for the device.
         match unsafe { legion_cpu_share_collect_launch(&p, stream) } {

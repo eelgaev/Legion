@@ -77,6 +77,18 @@ enum What {
         /// Timed jobs per point (the median is shown).
         #[arg(long, default_value_t = 200)]
         jobs: usize,
+        /// The exact share's jobs (x86 with AVX2, FMA and F16C): the GPU kernels' bits, the
+        /// gate and up sums and the down rows apart, as the GPU drives them.
+        #[arg(long)]
+        exact: bool,
+        /// With `--exact`: microseconds between the pool's "gate/up done" and the GPU's "act
+        /// ready" (the GPU's SwiGLU round trip); the per-expert columns leave it out.
+        #[arg(long, default_value_t = 0)]
+        act_us: u64,
+        /// Tasks per thread each phase is cut into, comma separated (3 is the share's; 1 gives
+        /// each thread one range, so several experts run side by side).
+        #[arg(long, value_delimiter = ',', default_values_t = [3])]
+        tasks_per_thread: Vec<usize>,
     },
 }
 
@@ -139,6 +151,9 @@ pub fn run(args: CpuBenchArgs) -> anyhow::Result<()> {
             tokens,
             experts,
             jobs,
+            exact,
+            act_us,
+            tasks_per_thread,
         } => {
             let cfg = PoolBench {
                 shape: qwen(down),
@@ -148,6 +163,9 @@ pub fn run(args: CpuBenchArgs) -> anyhow::Result<()> {
                 tokens,
                 experts,
                 jobs,
+                exact,
+                act_us,
+                tasks_per_thread,
             };
             pool_bench::run(&cfg, &mut line)?;
         }
