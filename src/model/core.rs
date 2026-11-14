@@ -117,7 +117,8 @@ pub use media::{ImageSpan, Media};
 pub use mtp::{DraftHeadType, MtpGraph, MtpOutput};
 pub use spec::{
     Replay, SpecPool, set_commit_in_verify, set_commit_slots, set_state_defer,
-    set_state_defer_min_seqs, set_state_defer_rows,
+    set_state_defer_min_seqs, set_state_defer_rows, set_tp_commit_in_verify_min_seqs,
+    tp_commit_in_verify_min_seqs,
 };
 pub use state::{KV_BLOCK, KvPool, KvRing, KvTier, SeqState, SplitTier, StatePool, fnv1a};
 

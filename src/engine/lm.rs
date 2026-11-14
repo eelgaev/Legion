@@ -4461,7 +4461,12 @@ impl LmEngine {
         };
         let mut exec = made
             .and_then(|mut exec| {
-                if layout.node.is_some() || tp_start.is_some() {
+                // The ranks of tensor parallelism over machines may defer their wide commits,
+                // each its own (--tp-commit-in-verify-min-seqs, #1176).
+                let tp_defer = crate::model::core::tp_commit_in_verify_min_seqs();
+                if tp_start.is_some() && layout.node.is_none() && tp_defer > 0 {
+                    exec.tp_deferred_commits(tp_defer);
+                } else if layout.node.is_some() || tp_start.is_some() {
                     // Their commits are not deferred (`Executor::commit`), so neither are the
                     // pools' (#836 part 38).
                     exec.no_deferred_commits();

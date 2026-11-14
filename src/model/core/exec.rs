@@ -662,6 +662,8 @@ pub struct Executor {
     tp: Option<TpLead>,
     /// See [`Self::no_deferred_commits`].
     no_defer: bool,
+    /// See [`Self::tp_deferred_commits`]; 0 without it (every commit that may be deferred is).
+    tp_defer_min: usize,
     /// Rank 1 of a split model: the residual rows of the step's micro-chunks that came over
     /// the link, which the first stage takes in order ([`Self::step_from`]).
     ext_rows: std::sync::Mutex<std::collections::VecDeque<Vec<f32>>>,
@@ -908,6 +910,7 @@ impl Executor {
             remote: None,
             tp: None,
             no_defer: false,
+            tp_defer_min: 0,
             ext_rows: Default::default(),
             captures: Vec::new(),
             applied: Vec::new(),
@@ -1611,6 +1614,15 @@ impl Executor {
     /// defer, or that runs another machine's steps.
     pub fn no_deferred_commits(&mut self) {
         self.no_defer = true;
+    }
+
+    /// For a rank of tensor parallelism over machines, instead of
+    /// [`Self::no_deferred_commits`]: its commits of at least `min_seqs` sequences (1 or more)
+    /// are deferred into the next verify step, narrower ones run in the commit (`legion serve
+    /// --tp-commit-in-verify-min-seqs`, #1176). The same bits either way; every rank must be
+    /// told the same.
+    pub fn tp_deferred_commits(&mut self, min_seqs: usize) {
+        self.tp_defer_min = min_seqs.max(1);
     }
 
     /// Allocates replay buffers for speculative verify groups ([`Group::verify`]) of up to
@@ -2570,8 +2582,14 @@ impl Executor {
             self.hold_commit(commits);
             return Ok(());
         }
+        // A rank of tensor parallelism over machines defers its wide commits only
+        // (`Self::tp_deferred_commits`): a narrow one runs now, after any still deferred.
+        let wide = super::spec::wide_commit(self.tp_defer_min, commits.len());
+        if !wide && self.defers_commits() {
+            self.flush_commits()?;
+        }
         let model = &self.model;
-        if self.defers_commits() {
+        if wide && self.defers_commits() {
             let s = &mut self.stages[0];
             let spec = s
                 .spec
@@ -2618,10 +2636,13 @@ impl Executor {
 
     /// Whether [`Self::commit`] may defer the delta rule into the next verify step
     /// (`--gdn-commit-in-verify`, #836 part 14): one stage on this machine, no parallel or
-    /// pipelined steps (their commits run elsewhere or later).
+    /// pipelined steps (their commits run elsewhere or later). A lead of tensor parallelism
+    /// over machines defers only when told to ([`Self::tp_deferred_commits`]), as each other
+    /// rank then does its share: every rank's states are its own heads', committed by its own
+    /// verify steps.
     fn defers_commits(&self) -> bool {
         self.stages.len() == 1
-            && self.tp.is_none()
+            && (self.tp.is_none() || self.tp_defer_min > 0)
             && self.remote.is_none()
             && self.par.pool.is_none()
             && !self.par.every_step

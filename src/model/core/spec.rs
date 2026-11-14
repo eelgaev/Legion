@@ -113,6 +113,27 @@ pub fn set_state_defer_min_seqs(n: usize) {
     STATE_DEFER_MIN_SEQS.store(n, Ordering::Relaxed);
 }
 
+/// The fewest sequences a commit of a rank of tensor parallelism over machines defers into the
+/// next verify step ([`DEFER`], #1176); 0, the default: such ranks defer none.
+static TP_DEFER_MIN_SEQS: AtomicUsize = AtomicUsize::new(0);
+
+/// Sets the fewest sequences a commit of the ranks of tensor parallelism over machines made
+/// from now on defers (`legion serve --tp-commit-in-verify-min-seqs`; 0: none).
+pub fn set_tp_commit_in_verify_min_seqs(n: usize) {
+    TP_DEFER_MIN_SEQS.store(n, Ordering::Relaxed);
+}
+
+/// What [`set_tp_commit_in_verify_min_seqs`] set.
+pub fn tp_commit_in_verify_min_seqs() -> usize {
+    TP_DEFER_MIN_SEQS.load(Ordering::Relaxed)
+}
+
+/// Whether a commit of `n` sequences is one to defer where commits of at least `min` are
+/// ([`set_tp_commit_in_verify_min_seqs`]; 0 or 1: every commit).
+pub(super) fn wide_commit(min: usize, n: usize) -> bool {
+    n >= min
+}
+
 /// Whether deferring pools made now let verify steps leave the states ([`STATE_DEFER`]).
 fn state_defer() -> bool {
     STATE_DEFER.load(Ordering::Relaxed) == 1

@@ -146,6 +146,14 @@ pub(in crate::cli) struct SwitchArgs {
     /// 0-255, default 0 (every step may leave them).
     #[arg(long, help_heading = HEADING, value_name = "N")]
     gdn_state_defer_min_seqs: Option<u8>,
+    /// CUDA, gated DeltaNet layers, MTP with --tp over machines: every rank runs its commits of
+    /// at least this many sequences inside its next verify step (see --gdn-commit-in-verify),
+    /// narrower ones in the commit as without the flag. The same bits either way. Many
+    /// sequences' commits are a few ms of GPU time per round ahead of the draft passes; one or
+    /// a few sequences' are small and hide behind the drafting, where deferring them slows a
+    /// round (#1176). Give every rank the same value. 0-255, default 0 (no commit deferred).
+    #[arg(long, help_heading = HEADING, value_name = "N")]
+    tp_commit_in_verify_min_seqs: Option<u8>,
     /// CUDA, attention layers: Legion's one-launch norm + RoPE for the q and k heads (and
     /// Qwen3.8-Flash-Next's indexer queries) instead of ggml's rms_norm, mul and rope_multi.
     /// The same bits, but no faster on V100 (the fused external launch splits ggml's CUDA
@@ -1499,6 +1507,7 @@ impl SwitchArgs {
             },
             gdn_state_defer_rows: self.gdn_state_defer_rows,
             gdn_state_defer_min_seqs: self.gdn_state_defer_min_seqs,
+            tp_commit_in_verify_min_seqs: self.tp_commit_in_verify_min_seqs,
             norm_rope: self.norm_rope.then_some(true),
             kv_append: self.kv_append.then_some(true),
             head_rope_fused: self.head_rope_fused.then_some(true),
