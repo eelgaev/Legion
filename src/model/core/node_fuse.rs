@@ -112,6 +112,10 @@ pub(crate) struct Counts {
     pub mix_cast: usize,
     /// Of those, mixes whose F32 values nothing else reads, so not written.
     pub mix_f32_skipped: usize,
+    /// BF16 hyper-connection mixes run by the all-gather reading them (#1176).
+    pub gather_mix: usize,
+    /// F32 copies of a BF16 all-gather's output written by the gather (#1176).
+    pub gather_cast: usize,
     /// Nodes turned into `GGML_OP_NONE`.
     pub none: usize,
 }
@@ -139,6 +143,8 @@ pub unsafe fn rewrite(graph: *mut ffi::ggml_cgraph) {
             remap = c.remap,
             mix_cast = c.mix_cast,
             mix_f32_skipped = c.mix_f32_skipped,
+            gather_mix = c.gather_mix,
+            gather_cast = c.gather_cast,
             none = c.none,
             "node fuse: small ggml chains as Legion ops (the first graphs; --node-fuse-ggml off)"
         );
@@ -164,7 +170,12 @@ pub(crate) unsafe fn rewrite_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> 
             match (*g.nodes[i]).op {
                 ffi::ggml_op_GGML_OP_MUL => g.moe(i, cuda, &mut c),
                 ffi::ggml_op_GGML_OP_GET_ROWS => g.remap(i, &mut c),
-                ffi::ggml_op_GGML_OP_CUSTOM => g.mix_cast(i, &mut c),
+                ffi::ggml_op_GGML_OP_CUSTOM => {
+                    g.mix_cast(i, &mut c);
+                    if cuda {
+                        g.gather(i, &mut c);
+                    }
+                }
                 _ => {}
             }
         }
@@ -841,6 +852,15 @@ impl Graph {
     /// # Safety
     /// `mix` is a node of the graph.
     unsafe fn bf16_cast_of(&self, mix: Node) -> Option<usize> {
+        // SAFETY: the caller's.
+        unsafe { self.cast_of(mix, ffi::ggml_type_GGML_TYPE_BF16) }
+    }
+
+    /// [`Self::bf16_cast_of`] for a cast of all of `mix`'s values to `ty`.
+    ///
+    /// # Safety
+    /// `mix` is a node of the graph.
+    unsafe fn cast_of(&self, mix: Node, ty: ffi::ggml_type) -> Option<usize> {
         // SAFETY: the caller's; users are valid nodes.
         unsafe {
             let whole = |t: Node| {
@@ -862,7 +882,7 @@ impl Graph {
                 let t = self.nodes[j];
                 !self.none[j]
                     && (*t).op == ffi::ggml_op_GGML_OP_CPY
-                    && (*t).type_ == ffi::ggml_type_GGML_TYPE_BF16
+                    && (*t).type_ == ty
                     && (*t).src[1] == t
                     && (*t).view_src.is_null()
                     && !(*t).data.is_null()
@@ -915,6 +935,96 @@ impl Graph {
             self.none[j] = true;
             c.mix_cast += 1;
             c.mix_f32_skipped += usize::from(skip_f32);
+        }
+    }
+
+    /// Whether no node in `from..to` that runs (not a view, not turned off) has its output in
+    /// `ranges` (`(start, end)` bytes).
+    ///
+    /// # Safety
+    /// `from..to` are node indices.
+    unsafe fn unwritten(&self, from: usize, to: usize, ranges: &[(usize, usize)]) -> bool {
+        // SAFETY: the caller's; nodes are valid tensors.
+        unsafe {
+            (from..to).all(|k| {
+                let n = self.nodes[k];
+                if self.none[k] || is_view_op((*n).op) || (*n).op == ffi::ggml_op_GGML_OP_NONE {
+                    return true;
+                }
+                let (a, b) = span(n);
+                a >= b || !ranges.iter().any(|&(x, y)| x < y && x < b && a < y)
+            })
+        }
+    }
+
+    /// The sequence-parallel all-gather at `at` on CUDA (#1176,
+    /// [`crate::tp_net::seq_par::all_gather`]), a block input gathered from every rank's share.
+    ///
+    /// Where its source is qwen4exp's BF16 hyper-connection mix
+    /// ([`crate::model::qwen4::mix_cast_reads`]) that nothing else reads, the gather runs the
+    /// mix itself, its values rounded straight into the send buffer
+    /// ([`crate::tp_net::seq_par::take_mix`]): the mix node launches nothing. The mix then runs
+    /// at the gather's place in the graph, so only where no node in between writes what it
+    /// reads.
+    ///
+    /// Where the BF16 gather's output is cast to F32 (for the block's F32 readers), the gather
+    /// writes the cast's values too, this rank's share while the peers' travel
+    /// ([`crate::tp_net::seq_par::take_cast`]), and the cast becomes `GGML_OP_NONE`. Its memory
+    /// is written earlier than the cast did, so only where no node in between writes or reads
+    /// it and it is not the gather's own.
+    ///
+    /// # Safety
+    /// `at` is a node index.
+    unsafe fn gather(&mut self, at: usize, c: &mut Counts) {
+        use crate::tp_net::seq_par;
+        // SAFETY: the caller's; nodes and sources are valid tensors.
+        unsafe {
+            let ag = self.nodes[at];
+            if !seq_par::is_all_gather(ag) || (*ag).data.is_null() || (*ag).src[0].is_null() {
+                return;
+            }
+            let src = (*ag).src[0];
+            let mix = if (*src).view_src.is_null() {
+                src
+            } else {
+                (*src).view_src
+            };
+            if seq_par::gather_mix()
+                && let Some(&m) = self.index.get(&(mix as usize))
+                && m < at
+                && !self.none[m]
+                && let Some(reads) = crate::model::qwen4::mix_cast_reads(mix)
+                && self.only_read_by(mix, &[at])
+                && self.unwritten(m + 1, at, &reads)
+                && seq_par::take_mix(ag, mix)
+            {
+                crate::model::qwen4::set_mix_by_exchange(mix);
+                c.gather_mix += 1;
+            }
+            if !seq_par::gather_widen() || (*ag).type_ != ffi::ggml_type_GGML_TYPE_BF16 {
+                return;
+            }
+            let Some(j) = self.cast_of(ag, ffi::ggml_type_GGML_TYPE_F32) else {
+                return;
+            };
+            let cast = self.nodes[j];
+            if j <= at || overlap(ag, cast) {
+                return;
+            }
+            for k in at + 1..j {
+                let n = self.nodes[k];
+                if self.none[k] || is_view_op((*n).op) || (*n).op == ffi::ggml_op_GGML_OP_NONE {
+                    continue;
+                }
+                if overlap(n, cast) || (*n).src.iter().any(|&s| !s.is_null() && overlap(s, cast)) {
+                    return;
+                }
+            }
+            if seq_par::take_cast(ag, cast) {
+                (*cast).op = ffi::ggml_op_GGML_OP_NONE;
+                self.none[j] = true;
+                c.gather_cast += 1;
+            }
         }
     }
 }

@@ -321,6 +321,12 @@ pub struct Switches {
     /// The FFN mixers' residual streams made by their readers in the MoE fold's relayout
     /// ([`crate::model::qwen4::set_hc_lazy_streams`]; on by default).
     pub hc_lazy_streams: Option<bool>,
+    /// A sequence-parallel all-gather running the mix it reads
+    /// ([`crate::tp_net::seq_par::set_gather_mix`]; on by default).
+    pub tp_gather_mix: Option<bool>,
+    /// A sequence-parallel all-gather writing its output's F32 copy
+    /// ([`crate::tp_net::seq_par::set_gather_widen`]; on by default).
+    pub tp_gather_widen: Option<bool>,
     /// qwen4exp's hyper-connection glue fused around the MoE op on a V100 or an sm_80+ GPU
     /// ([`crate::model::qwen4::set_hc_fuse`]).
     pub hc_fuse: Option<bool>,
@@ -751,6 +757,11 @@ impl Switches {
         set(self.hc_post_norm, qwen4::set_fused_post_norm);
         set(self.hc_moe_fold, qwen4::set_moe_fold);
         set(self.hc_lazy_streams, qwen4::set_hc_lazy_streams);
+        set(self.tp_gather_mix, crate::tp_net::seq_par::set_gather_mix);
+        set(
+            self.tp_gather_widen,
+            crate::tp_net::seq_par::set_gather_widen,
+        );
         set(self.hc_fuse, qwen4::set_hc_fuse);
         set(self.hc_xn16, qwen4::set_xn16);
         set(self.hc_quant, core::set_mmq_preq);

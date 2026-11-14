@@ -177,6 +177,126 @@ pub(crate) fn tail_of(dst: &ffi::ggml_tensor) -> Option<&ffi::ggml_tensor> {
     }
 }
 
+/// Whether graphs rewritten from now on let an all-gather run the mix it reads ([`take_mix`])
+/// and write its output's F32 copy ([`take_cast`]).
+static GATHER_MIX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static GATHER_WIDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Sets whether a BF16 all-gather runs the hyper-connection mix it alone reads itself, rounded
+/// straight into its send buffer ([`take_mix`]; on by default, `legion serve
+/// --no-tp-gather-mix` turns it off for comparisons).
+pub fn set_gather_mix(on: bool) {
+    GATHER_MIX.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`set_gather_mix`] is on.
+pub(crate) fn gather_mix() -> bool {
+    GATHER_MIX.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Sets whether a BF16 all-gather writes the F32 copy of its output itself, this rank's share
+/// while the peers' travel ([`take_cast`]; on by default, `legion serve --no-tp-gather-widen`
+/// turns it off for comparisons).
+pub fn set_gather_widen(on: bool) {
+    GATHER_WIDEN.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`set_gather_widen`] is on.
+pub(crate) fn gather_widen() -> bool {
+    GATHER_WIDEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The parameter of an [`all_gather`] node that [`take_mix`] sets.
+const P_MIX: usize = 1;
+
+/// The source slot of an [`all_gather_bf16`] node's F32 copy ([`take_cast`]).
+const CAST_SRC: usize = 1;
+
+/// Whether `t` is a node of [`all_gather`] or [`all_gather_bf16`].
+///
+/// # Safety
+/// `t` is a valid tensor.
+pub(crate) unsafe fn is_all_gather(t: *const ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's.
+    unsafe { crate::ggml::op_of(t) }.is_some_and(|op| std::ptr::eq(op, &ALL_GATHER))
+}
+
+/// A post-allocation rewrite on CUDA (#1176): the all-gather node `ag` whose source is `mix`
+/// (a hyper-connection mix that only `ag` reads, directly or through a view of all of it) runs
+/// that mix itself: with BF16 on the wire the mix's values go rounded to BF16 straight into
+/// the send buffer (the values the exchange's rounding of `mix` would put there, without `mix`
+/// written and read back), else into `mix` first as before. The caller makes `mix` launch
+/// nothing. Whether it did (not for a node already rewritten).
+///
+/// # Safety
+/// Valid nodes of an allocated graph not yet run.
+pub(crate) unsafe fn take_mix(ag: *mut ffi::ggml_tensor, mix: *mut ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's.
+    unsafe {
+        if !is_all_gather(ag) || external_params(&*ag)[P_MIX] != 0 {
+            return false;
+        }
+        let src = (*ag).src[0];
+        let whole = src == mix
+            || (!(*src).view_src.is_null()
+                && (*src).view_src == mix
+                && (*src).view_offs == 0
+                && ffi::ggml_is_contiguous(src)
+                && ffi::ggml_nelements(src) == ffi::ggml_nelements(mix));
+        if !whole || !ffi::ggml_is_contiguous(mix) {
+            return false;
+        }
+        crate::ggml::set_external_param(ag, P_MIX, 1);
+        true
+    }
+}
+
+/// The mix node the [`all_gather`] node `dst` runs itself ([`take_mix`]), if any.
+#[cfg(feature = "cuda")]
+pub(crate) fn mix_of(dst: &ffi::ggml_tensor) -> Option<&ffi::ggml_tensor> {
+    if external_params(dst)[P_MIX] == 0 {
+        return None;
+    }
+    // SAFETY: a node of `all_gather`: its source is the mix or a view of all of it.
+    unsafe {
+        let src = &*dst.src[0];
+        Some(if src.view_src.is_null() {
+            src
+        } else {
+            &*src.view_src
+        })
+    }
+}
+
+/// A post-allocation rewrite on CUDA (#1176): the [`all_gather_bf16`] node `ag` also writes
+/// `cast`, the F32 copy of all of its output (a `ggml_cast` the caller turns into a node that
+/// runs nothing): each BF16 value widened, exactly, this rank's share before the wait for the
+/// peers' (so while they travel) and theirs after it. Whether it did (not for an F32 gather or
+/// one already rewritten).
+///
+/// # Safety
+/// Valid nodes of an allocated graph not yet run; `cast` is contiguous F32 with memory, as
+/// many values as `ag`.
+pub(crate) unsafe fn take_cast(ag: *mut ffi::ggml_tensor, cast: *mut ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's.
+    unsafe {
+        if !is_all_gather(ag) || (*ag).type_ != types::BF16 || !(*ag).src[CAST_SRC].is_null() {
+            return false;
+        }
+        (*ag).src[CAST_SRC] = cast;
+        true
+    }
+}
+
+/// The device address of the F32 copy the [`all_gather_bf16`] node `dst` writes itself
+/// ([`take_cast`]), if any.
+#[cfg(feature = "cuda")]
+pub(crate) fn cast_of(dst: &ffi::ggml_tensor) -> Option<usize> {
+    let c = dst.src[CAST_SRC];
+    // SAFETY: a node of `all_gather_bf16`: its second source is null or the cast.
+    (dst.type_ == types::BF16 && !c.is_null()).then(|| unsafe { (*c).data as usize })
+}
+
 /// For the reader of the deferred reduce-scatter node `rs` ([`defer_sum`]), on CUDA: the device
 /// address of the communicator's sum slot, two `u64`s that the exchange sets on the stream to
 /// the device addresses of rank 0's and rank 1's BF16 partials of this rank's columns
