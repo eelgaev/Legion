@@ -3,6 +3,52 @@ use super::*;
 const GIB: u64 = 1 << 30;
 /// Qwen3.8-Flash-Next UD-Q4_K_XL: one expert's up, gate and down.
 const EXPERT: u64 = 921_600 + 921_600 + 1_228_800;
+/// 48 layers of that one size.
+const LAYERS: [[u64; 3]; 48] = [[921_600, 921_600, 1_228_800]; 48];
+
+#[test]
+fn layers_of_one_size_stage_back_to_back() {
+    let (second, bytes) = stage_layout(&LAYERS, 135);
+    assert!(second.iter().all(|&s| s == 135));
+    assert_eq!(
+        bytes.iter().sum::<u64>(),
+        EXPERT * (2 * 135 + GAP as u64 + 1)
+    );
+}
+
+#[test]
+fn layers_of_mixed_sizes_share_one_staging_buffer_a_kind() {
+    // The real file: 42 layers as above, one with Q5_K up and gate, five with Q8_0 down.
+    let mut layers = LAYERS.to_vec();
+    layers[0] = [1_126_400, 1_126_400, 1_228_800];
+    for l in &mut layers[43..] {
+        l[2] = 1_740_800;
+    }
+    let places = 256;
+    let (second, bytes) = stage_layout(&layers, places);
+    assert!(mixed(&layers) && !mixed(&LAYERS));
+    // No first set (it starts within the gap, or a place later) nor the place behind it
+    // reaches any layer's second set, in any kind.
+    for k in 0..3 {
+        for (l, &s) in layers.iter().zip(&second) {
+            assert!(s >= places + 2);
+            // Layers of the same size line up (same start in the gap); the others' first
+            // sets end before this one's second starts, wherever in the gap each starts.
+            let others = layers.iter().filter(|o| o[k] != l[k]);
+            for o in others {
+                assert!(s as u64 * l[k] >= (GAP + places + 2) as u64 * o[k]);
+            }
+            assert!((GAP + s + places + 1) as u64 * l[k] <= bytes[k]);
+        }
+    }
+    // A third less than a buffer per type (six of them, two sets and the gap each).
+    let per_type: u64 = 921_600 * 2 + 1_126_400 * 2 + 1_228_800 + 1_740_800;
+    let before = per_type * (2 * places + GAP + 1) as u64;
+    assert!(bytes.iter().sum::<u64>() * 3 < before * 2 + before / 10);
+    // One index for a layer's three kinds: the kind that needs the most room decides.
+    assert_eq!(second[47], 321);
+    assert_eq!(second[1], 372);
+}
 
 fn mem(total: u64, available: u64) -> MemInfo {
     MemInfo {
@@ -23,20 +69,17 @@ fn table(in_ram: bool) -> Option<Table> {
 fn everything_fits_changes_nothing() {
     // 71.7 GiB of experts, a 4 GiB row cache and a 12.5 GiB margin in 120 GiB.
     assert_eq!(
-        size(mem(125, 120), 48 * EXPERT, EXPERT, 512, table(false), 0),
+        size(mem(125, 120), &LAYERS, 512, table(false), 0),
         Sizing::Whole
     );
     // No table.
-    assert_eq!(
-        size(mem(125, 90), 48 * EXPERT, EXPERT, 512, None, 0),
-        Sizing::Whole
-    );
+    assert_eq!(size(mem(125, 90), &LAYERS, 512, None, 0), Sizing::Whole);
 }
 
 #[test]
 fn a_table_asked_into_ram_counts_whole() {
     // 71.7 + 27 + 12.5 > 105.
-    let Sizing::Bounded(p) = size(mem(125, 105), 48 * EXPERT, EXPERT, 512, table(true), 0) else {
+    let Sizing::Bounded(p) = size(mem(125, 105), &LAYERS, 512, table(true), 0) else {
         panic!("bounded");
     };
     assert_eq!(p.table, 27 * GIB);
@@ -45,7 +88,7 @@ fn a_table_asked_into_ram_counts_whole() {
 
 #[test]
 fn a_64_gib_machine_gets_most_experts() {
-    let Sizing::Bounded(p) = size(mem(64, 58), 48 * EXPERT, EXPERT, 512, table(false), 0) else {
+    let Sizing::Bounded(p) = size(mem(64, 58), &LAYERS, 512, table(false), 0) else {
         panic!("bounded");
     };
     // 58 - 8 (margin) - 4 (row cache) = 46 GiB of 140.6 MiB slots and the staging they leave
@@ -106,7 +149,7 @@ fn a_read_ahead_takes_what_the_last_big_step_read() {
 
 #[test]
 fn a_32_gib_machine_gets_fewer() {
-    let Sizing::Bounded(p) = size(mem(32, 27), 48 * EXPERT, EXPERT, 512, table(false), 0) else {
+    let Sizing::Bounded(p) = size(mem(32, 27), &LAYERS, 512, table(false), 0) else {
         panic!("bounded");
     };
     // A sixth of the machine is kept free, not 8 GiB: 19 slots more.
@@ -114,8 +157,7 @@ fn a_32_gib_machine_gets_fewer() {
     assert_eq!(p.slots, 117);
     assert_eq!((p.places, p.sets), (256, 2));
     // The KV spill comes off the experts.
-    let Sizing::Bounded(q) = size(mem(32, 27), 48 * EXPERT, EXPERT, 512, table(false), 2 * GIB)
-    else {
+    let Sizing::Bounded(q) = size(mem(32, 27), &LAYERS, 512, table(false), 2 * GIB) else {
         panic!("bounded");
     };
     assert_eq!(q.kv_spill, 2 * GIB);
@@ -136,7 +178,7 @@ fn a_small_machine_keeps_a_sixth_free_and_never_under_4_gib() {
 #[test]
 fn too_little_memory_is_told() {
     assert!(matches!(
-        size(mem(16, 13), 48 * EXPERT, EXPERT, 512, table(false), 0),
+        size(mem(16, 13), &LAYERS, 512, table(false), 0),
         Sizing::TooSmall(_)
     ));
 }

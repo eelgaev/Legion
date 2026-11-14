@@ -847,16 +847,23 @@ fn a_limit_empties_the_last_slots_and_keeps_them_empty() {
 #[test]
 fn even_cuts_take_a_slot_a_layer_from_the_last_one_down() {
     const G: usize = 2 << 20;
-    // 3 MiB a slot in three kinds of 1 MiB. The first empty slot keeps its memory: three
-    // slots free one granule a kind.
+    // 3 MiB a slot in three kinds of 1 MiB. The first bytes of the first empty slot stay
+    // mapped (what a matmul reads behind the last slot in use): three slots free one granule
+    // a kind.
+    assert_eq!(expert_pad(144 * 8, 2048), 288);
+    assert_eq!(expert_pad(176 * 8, 2048), 352);
+    assert_eq!(expert_pad(24 * 64, 2048), 384);
+    assert_eq!(expert_pad(34 * 64, 2048), 544);
     let b = [1 << 20; 3];
-    assert_eq!(cut_spare(0), 0);
-    assert_eq!(cut_spare(3), 2);
-    assert_eq!(cut_bytes(&b, 1, G), 0);
-    assert_eq!(cut_bytes(&b, 2, G), 0);
-    assert_eq!(cut_bytes(&b, 3, G), 3 * G as u64);
-    assert_eq!(cut_bytes(&b, 5, G), 6 * G as u64);
-    let layers = [Some((b, 4)), None, Some((b, 4)), Some((b, 1))];
+    let p = [288, 288, 384];
+    assert_eq!(cut_bytes(&b, &p, 0, G), 0);
+    assert_eq!(cut_bytes(&b, &p, 1, G), 0);
+    assert_eq!(cut_bytes(&b, &p, 2, G), 0);
+    assert_eq!(cut_bytes(&b, &p, 3, G), 3 * G as u64);
+    assert_eq!(cut_bytes(&b, &p, 5, G), 6 * G as u64);
+    // Without the pad two slots are a granule.
+    assert_eq!(cut_bytes(&b, &[0; 3], 2, G), 3 * G as u64);
+    let layers = [Some((b, p, 4)), None, Some((b, p, 4)), Some((b, p, 1))];
     assert_eq!(even_cuts(&layers, G, 0), Some(vec![0, 0, 0, 0]));
     // Two slots each free nothing yet; the third round stops at the first layer that does
     // (layer 3 may give one slot only).
@@ -870,10 +877,10 @@ fn even_cuts_take_a_slot_a_layer_from_the_last_one_down() {
     assert_eq!(even_cuts(&layers, G, 6 * G as u64), Some(vec![3, 0, 3, 1]));
     assert_eq!(even_cuts(&layers, G, 6 * G as u64 + 1), None);
     // No two layers differ by more than a slot.
-    let many = vec![Some((b, 50)); 48];
+    let many = vec![Some((b, p, 50)); 48];
     let cuts = even_cuts(&many, G, 960 << 20).unwrap();
     let (lo, hi) = (cuts.iter().min().unwrap(), cuts.iter().max().unwrap());
     assert!(hi - lo <= 1, "{cuts:?}");
-    let freed: u64 = cuts.iter().map(|&c| cut_bytes(&b, c, G)).sum();
+    let freed: u64 = cuts.iter().map(|&c| cut_bytes(&b, &p, c, G)).sum();
     assert!(freed >= 960 << 20 && freed < (960 << 20) + 3 * G as u64);
 }

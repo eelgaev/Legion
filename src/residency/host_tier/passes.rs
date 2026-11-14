@@ -263,7 +263,18 @@ impl HostTier {
                     .collect()
             })
             .collect();
-        let (srcs, batches) = plan_pass(&held, inner.slots, inner.places, inner.sets)?;
+        let (mut srcs, batches) = plan_pass(&held, inner.slots, inner.places, inner.sets)?;
+        // A place's index is the layer's own ([`Inner::place_at`]).
+        let first = inner.slots + GAP;
+        for ((il, _), s) in layers.iter().zip(&mut srcs) {
+            for src in s.iter_mut() {
+                if let PassSrc::Read { at, .. } = src
+                    && let Some(p) = at.checked_sub(first)
+                {
+                    *at = first + inner.place_at(*il, p);
+                }
+            }
+        }
         let per = |il: usize| inner.layers[il].bytes.iter().sum::<usize>() as u64;
         let (mut ram_experts, mut ram_bytes) = (0usize, 0u64);
         for ((il, _), s) in layers.iter().zip(&srcs) {

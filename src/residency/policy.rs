@@ -844,44 +844,51 @@ pub fn layers_left_coldest(lent: &[Option<u64>], heat: &[f32], need: u64) -> Vec
 }
 
 /// The bytes a layer's slot ranges free when its last `slots` slots stay empty: per kind
-/// (`bytes` a slot), the whole mapping granules (`gran`) in all of them but the first, which
-/// keeps its memory ([`cut_spare`]).
-pub fn cut_bytes(bytes: &[usize; 3], slots: usize, gran: usize) -> u64 {
+/// (`bytes` a slot), the whole mapping granules (`gran`) in all of them past the first `pad`
+/// bytes ([`expert_pad`]), which stay mapped behind the last slot in use.
+pub fn cut_bytes(bytes: &[usize; 3], pad: &[usize; 3], slots: usize, gran: usize) -> u64 {
     let g = gran.max(1);
-    let n = cut_spare(slots);
-    bytes.iter().map(|b| (n * b / g * g) as u64).sum()
+    (bytes.iter().zip(pad))
+        .map(|(b, p)| ((slots * b).saturating_sub(*p) / g * g) as u64)
+        .sum()
 }
 
-/// Of a layer's last `slots` empty slots, those that give their memory up: all but the first.
-/// A step of several tokens reads past the end of the last expert it multiplies (tiles of
-/// rows, the rows past the end unused): after the last slot in use that must be mapped memory,
-/// as the slot after it or the host part always was.
-pub fn cut_spare(slots: usize) -> usize {
-    slots.saturating_sub(1)
+/// ggml-cuda's `MATRIX_ROW_PADDING`: its quantized matmuls of several tokens may read up to
+/// this many values past the end of a weight matrix (it allocates and zeroes as much behind
+/// its own tensors).
+pub const ROW_PADDING: usize = 512;
+
+/// The bytes behind an expert that a matmul of several tokens may read ([`ROW_PADDING`] values
+/// of its type: a row of `row_values` values is `row_bytes`): 288 for Q4_K, 352 for Q5_K, 384
+/// for Q5_1, 544 for Q8_0. They must be mapped memory, and bytes that decode to finite values:
+/// experts of the same layout or zeros (an Inf or NaN scale times the zero activation of the
+/// padding is NaN).
+pub fn expert_pad(row_bytes: usize, row_values: usize) -> usize {
+    (row_bytes * ROW_PADDING).div_ceil(row_values.max(1))
 }
 
 /// [`layers_left_for`] for the bounded host tier, taken evenly: how many slots each of a
 /// device's layers gives up at its end so that `need` bytes stay free, instead of whole
 /// layers' lent slots (a layer without half its slots copies over PCIe for every token routed
-/// to them). `layers[i]`: the bytes of a slot per kind and the most slots layer `i` may give up
-/// (`None`: none). One slot at a time, from the last layer down, so no two layers differ by
-/// more than one slot (but where a layer reached its most). `None` when they cannot free
-/// `need`.
+/// to them). `layers[i]`: the bytes of a slot per kind, the bytes that stay mapped behind its
+/// last slot in use ([`expert_pad`]) and the most slots layer `i` may give up (`None`: none).
+/// One slot at a time, from the last layer down, so no two layers differ by more than one slot
+/// (but where a layer reached its most). `None` when they cannot free `need`.
 pub fn even_cuts(
-    layers: &[Option<([usize; 3], usize)>],
+    layers: &[Option<([usize; 3], [usize; 3], usize)>],
     gran: usize,
     need: u64,
 ) -> Option<Vec<usize>> {
     let mut cuts = vec![0usize; layers.len()];
     let freed = |cuts: &[usize]| -> u64 {
         (layers.iter().zip(cuts))
-            .filter_map(|(l, &c)| l.as_ref().map(|(b, _)| cut_bytes(b, c, gran)))
+            .filter_map(|(l, &c)| l.as_ref().map(|(b, p, _)| cut_bytes(b, p, c, gran)))
             .sum()
     };
     while freed(&cuts) < need {
         let mut grew = false;
         for (i, l) in layers.iter().enumerate().rev() {
-            let Some((_, most)) = l else { continue };
+            let Some((_, _, most)) = l else { continue };
             if cuts[i] < *most {
                 cuts[i] += 1;
                 grew = true;

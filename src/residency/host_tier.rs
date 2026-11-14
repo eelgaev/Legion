@@ -13,10 +13,12 @@
 //!   [`SlotCache`]); `R` comes from the memory the machine has ([`size`]). An expert a VRAM
 //!   slot drops goes to a RAM slot, and the RAM copy of one a VRAM slot takes is dropped
 //!   ([`HostTier::swap`]): the two tiers hold different experts.
-//! - The **staging** part is one buffer that every layer maps: a step that routes to more
-//!   experts than the RAM slots hold (a prompt chunk) reads the rest into its places
-//!   ([`stage_sets`]). The layers take its two sets in turn, so a big step reads the next
-//!   layer's experts (those its last big step read) while this layer computes.
+//! - The **staging** part is one buffer a kind (up, gate, down) that every layer maps, also
+//!   layers whose experts are of another size: a step that routes to more experts than the
+//!   RAM slots hold (a prompt chunk) reads the rest into its places ([`stage_sets`]). The
+//!   layers take its two sets in turn, so a big step reads the next layer's experts (those
+//!   its last big step read) while this layer computes; [`stage_layout`] says where each
+//!   layer's second set starts so that no layer's first set reaches another's second.
 //! - Experts in neither are read from the GGUF, around the page cache (`O_DIRECT` through the
 //!   SSD tier's readers, [`super::ssd_experts::io`]), as the step routes to them.
 //!
@@ -94,6 +96,63 @@ pub(crate) fn stage_sets(n_expert: usize, slots: usize) -> (usize, usize) {
     (places, 2)
 }
 
+/// The staging buffers of layers whose experts differ in size (a mixed quantization): one
+/// buffer per kind, which every layer maps behind its RAM slots and indexes with its own
+/// expert size. `layers`: one expert's bytes per layer and kind; `places` a set, two sets.
+/// Returns per layer the place index its second set starts at, and the buffers' bytes.
+///
+/// Layer A computes on one set while layer B's experts are read into the other, so no
+/// layer's first set may share bytes with any layer's second: every first set starts within
+/// [`GAP`] experts of the buffer's start (the layer's RAM slots end in the gap), or one
+/// expert later ([`LayerMem::first`]), and a matmul of several tokens reads a little past the
+/// last expert it multiplies ([`super::policy::expert_pad`]), into the place behind it. So a
+/// second set starts past `GAP + 1 + places + 1` experts of every other size, and two places
+/// past the first set's end among layers of one size: the place behind a set holds no layer's
+/// experts, and [`Inner::zero_pads`] can zero its start. A model of one size has the two sets
+/// back to back, as it always had: there the bytes behind an expert are another expert of the
+/// same layout, or memory nothing wrote.
+pub(crate) fn stage_layout(layers: &[[u64; 3]], places: usize) -> (Vec<usize>, [u64; 3]) {
+    let room = if mixed(layers) { MIXED_ROOM } else { 0 };
+    let second: Vec<usize> = layers
+        .iter()
+        .map(|l| {
+            (0..3)
+                .map(|k| {
+                    let other = layers
+                        .iter()
+                        .map(|o| o[k])
+                        .filter(|&b| b != l[k])
+                        .max()
+                        .unwrap_or(0);
+                    (((GAP + places + room) as u64 * other).div_ceil(l[k].max(1)) as usize)
+                        .max(places + room)
+                })
+                .max()
+                .unwrap_or(places)
+        })
+        .collect();
+    // A place past the last one stays inside the buffer (a matmul's reads past an expert).
+    let bytes = [0, 1, 2].map(|k| {
+        layers
+            .iter()
+            .zip(&second)
+            .map(|(l, &s)| (GAP + s + places + 1) as u64 * l[k])
+            .max()
+            .unwrap_or(0)
+    });
+    (second, bytes)
+}
+
+/// Whether the layers' experts differ in size in some kind (a mixed quantization): then one
+/// layer's staging places hold other layers' bytes between its steps.
+pub(crate) fn mixed(layers: &[[u64; 3]]) -> bool {
+    layers.windows(2).any(|w| w[0] != w[1])
+}
+
+/// The places [`stage_layout`] leaves free in a mixed model: one a first set may start later
+/// ([`LayerMem::first`]) and the one behind it.
+const MIXED_ROOM: usize = 2;
+
 /// Fetches between two reports.
 const REPORT_EVERY: u64 = 48 * 256;
 
@@ -164,9 +223,9 @@ pub struct Plan {
 
 /// The pinned host memory the routed experts get on a machine with `mem`: what is available
 /// less a margin ([`margin`]), the n-gram table's share and
-/// `kv_spill` (host memory the KV cache may take). `per_slot`: one expert of every kind of
-/// every layer (the layers' types may differ), the experts whole taking `n_expert` of that;
-/// `stage_one`: one expert of every staging buffer.
+/// `kv_spill` (host memory the KV cache may take). `layers`: one expert's bytes per layer and
+/// kind ([`expert_bytes`]; the layers' types may differ), the experts whole taking `n_expert`
+/// of each; the staging buffers are [`stage_layout`]'s.
 ///
 /// The table and the experts are decided together: when both fit whole, or the experts fit
 /// beside the table's direct tier (its row cache), nothing changes ([`Sizing::Whole`]: the
@@ -174,12 +233,12 @@ pub struct Plan {
 /// the experts get RAM slots from what is left.
 pub fn size(
     mem: MemInfo,
-    per_slot: u64,
-    stage_one: u64,
+    layers: &[[u64; 3]],
     n_expert: usize,
     table: Option<Table>,
     kv_spill: u64,
 ) -> Sizing {
+    let per_slot: u64 = layers.iter().flatten().sum();
     let margin = margin(mem.total);
     let room = mem.available.saturating_sub(margin + kv_spill);
     let all = per_slot * n_expert as u64;
@@ -197,8 +256,8 @@ pub fn size(
     // The most slots that fit with the staging they leave to do ([`stage_sets`]).
     let left = room.saturating_sub(table_min);
     let stage = |slots: usize| {
-        let (places, sets) = stage_sets(n_expert, slots);
-        stage_one * (GAP + places * sets + 1) as u64
+        let (places, _) = stage_sets(n_expert, slots);
+        stage_layout(layers, places).1.iter().sum::<u64>()
     };
     let mut slots = ((left / per_slot.max(1)) as usize).min(n_expert);
     while slots > 0 && slots as u64 * per_slot + stage(slots) > left {
@@ -335,8 +394,14 @@ struct LayerMem {
     bytes: [usize; 3],
     /// Host address of expert 0's staging place, per kind.
     stage: [usize; 3],
-    /// The layer's staging tensors: [`classes`]' index per kind.
-    class: [usize; 3],
+    /// The place index the layer's second set starts at ([`stage_layout`]).
+    second: usize,
+    /// The place index its first set starts at: 0, or 1 in a mixed model where place 0 would
+    /// start within the first bytes of the staging buffer, which stay zero (a matmul reads
+    /// them behind a layer's last RAM slot when that ends at the buffer's start).
+    first: usize,
+    /// Per kind, the bytes a matmul may read behind an expert ([`super::policy::expert_pad`]).
+    pad: [usize; 3],
 }
 
 struct Inner {
@@ -347,6 +412,8 @@ struct Inner {
     /// `il % sets` first.
     places: usize,
     sets: usize,
+    /// The layers' experts differ in size ([`mixed`]): [`Self::zero_pads`] has work.
+    mixed: bool,
     layers: Vec<LayerMem>,
     /// Pinned ids in and out of the fetch (CUDA), `cap` ids each.
     xchg: Option<(usize, usize)>,
@@ -539,14 +606,20 @@ impl HostTier {
             return Err("no MoE layers".into());
         }
         let slots = plan.slots;
-        let n_place = plan.places * plan.sets;
-        if plan.places == 0 || plan.sets == 0 {
+        if plan.places == 0 || plan.sets != 2 {
             return Err("the host expert tier needs staging places".into());
         }
-        // The layers' experts differ in type (a mixed quantization): one staging tensor per
-        // kind and type, shared by the layers that have it.
-        let (classes, class_of) = classes(srcs);
-        let ctx = Context::new(srcs.len() * 3 + classes.len() + 2, 0);
+        // One staging tensor per kind, shared by every layer whatever its experts' type (a
+        // mixed quantization): as many experts of the kind's biggest type as hold
+        // [`stage_layout`]'s bytes.
+        let sizes = expert_bytes(srcs, n_expert);
+        let (second, stage_bytes) = stage_layout(&sizes, plan.places);
+        let biggest = [0, 1, 2].map(|k| {
+            (0..srcs.len())
+                .max_by_key(|&il| (sizes[il][k], std::cmp::Reverse(il)))
+                .unwrap_or(0)
+        });
+        let ctx = Context::new(srcs.len() * 3 + 3 + 2, 0);
         let shape = |t: &crate::gguf::TensorInfo, n: usize| {
             [t.shape[0] as i64, t.shape[1] as i64, n as i64]
         };
@@ -556,10 +629,11 @@ impl HostTier {
                     .named(&format!("blk.{il}.{kind}.weight"));
             }
         }
-        for (c, &(il, k)) in classes.iter().enumerate() {
+        for (k, &il) in biggest.iter().enumerate() {
             let t = &srcs[il][k];
-            ctx.new_tensor(t.ggml_type, &shape(t, n_place + GAP + 1))
-                .named(&format!("host_tier.stage.{c}"));
+            let n = stage_bytes[k].div_ceil(sizes[il][k].max(1)) as usize;
+            ctx.new_tensor(t.ggml_type, &shape(t, n))
+                .named(&format!("host_tier.stage.{k}"));
         }
         let cap = n_used * max_tokens.max(1);
         ctx.new_tensor(types::I32, &[cap as i64])
@@ -573,6 +647,30 @@ impl HostTier {
             // SAFETY: an allocated tensor of this context, in host memory.
             unsafe { (*t(name).raw()).data as usize }
         };
+        let is_mixed = mixed(&sizes);
+        let pads: Vec<[usize; 3]> = srcs
+            .iter()
+            .zip(&sizes)
+            .map(|(l, b)| {
+                [0, 1, 2].map(|k| {
+                    let (values, rows) = (l[k].shape[0] as usize, l[k].shape[1] as usize);
+                    super::policy::expert_pad(b[k] as usize / rows.max(1), values)
+                })
+            })
+            .collect();
+        // A mixed model: the first bytes of each staging buffer, as many as any layer's matmul
+        // reads behind its last RAM slot, are no layer's place and stay zero.
+        let head = [0, 1, 2].map(|k| {
+            let most = pads.iter().map(|p| p[k]).max().unwrap_or(0);
+            if is_mixed { most } else { 0 }
+        });
+        for (k, &n) in head.iter().enumerate() {
+            // SAFETY: the start of the staging tensor just allocated in host memory, which holds
+            // more than a place.
+            unsafe {
+                std::ptr::write_bytes(addr(&format!("host_tier.stage.{k}")) as *mut u8, 0, n)
+            };
+        }
         let mut layers = Vec::with_capacity(srcs.len());
         for (il, l) in srcs.iter().enumerate() {
             let bytes = [0, 1, 2].map(|k| (l[k].size / n_expert as u64) as usize);
@@ -580,15 +678,19 @@ impl HostTier {
             // start that many experts after the RAM slots' start, of which the RAM tensor's own
             // pieces cover `span`.
             let mut stage = [0usize; 3];
+            let mut first = 0;
             for (k, kind) in KINDS.iter().enumerate() {
                 let ram = t(&format!("blk.{il}.{kind}.weight"));
-                let name = format!("host_tier.stage.{}", class_of[il][k]);
+                let name = format!("host_tier.stage.{k}");
                 let (span, tail_span) = spans(ram, t(&name))?;
                 let at = ((slots + GAP) * bytes[k])
                     .checked_sub(span)
                     .ok_or("the RAM slots' piece runs past the gap")?;
+                if at < head[k] {
+                    first = 1;
+                }
                 // The last place's bytes and a matmul's reads past them stay inside the buffer.
-                if at + (n_place + 1) * bytes[k] > tail_span {
+                if at + (second[il] + plan.places + 1) * bytes[k] > tail_span {
                     return Err("the staging buffer is too short".into());
                 }
                 stage[k] = addr(&name) + at;
@@ -602,7 +704,9 @@ impl HostTier {
                 ram: [0, 1, 2].map(|k| addr(&format!("blk.{il}.{}.weight", KINDS[k]))),
                 bytes,
                 stage,
-                class: class_of[il],
+                second: second[il],
+                first,
+                pad: pads[il],
             });
         }
         let cuda = cfg!(feature = "cuda") && !buft.is_plain_cpu();
@@ -614,6 +718,7 @@ impl HostTier {
             slots,
             places: plan.places,
             sets: plan.sets,
+            mixed: is_mixed,
             state: Mutex::new(State {
                 caches: vec![SlotCache::new(n_expert, slots); layers.len()],
                 flights: VecDeque::new(),
@@ -678,13 +783,10 @@ impl HostTier {
             .flatten()
     }
 
-    /// The staging tensor of layer `il`'s expert kind `k`.
-    pub fn stage_tensor(&self, il: usize, k: usize) -> Tensor<'_> {
+    /// The staging tensor of expert kind `k`, which every layer maps.
+    pub fn stage_tensor(&self, k: usize) -> Tensor<'_> {
         self.ctx
-            .tensor(&format!(
-                "host_tier.stage.{}",
-                self.inner.layers[il].class[k]
-            ))
+            .tensor(&format!("host_tier.stage.{k}"))
             .expect("staging tensor")
     }
 
@@ -693,10 +795,10 @@ impl HostTier {
         self.inner.slots
     }
 
-    /// The experts of a layer's tiered tensor past its VRAM slots: RAM slots, the gap and
-    /// the staging places.
-    pub fn n_host(&self) -> usize {
-        self.inner.slots + GAP + self.places()
+    /// The experts of layer `il`'s tiered tensor past its VRAM slots: RAM slots, the gap and
+    /// the staging places (its second set where [`stage_layout`] puts it).
+    pub fn n_host(&self, il: usize) -> usize {
+        self.inner.n_host(il)
     }
 
     /// The staging places: the most experts one [`Self::sources`] call can read.
@@ -832,42 +934,11 @@ impl Drop for HostTier {
     }
 }
 
-/// The staging tensors `srcs` need: one per kind and tensor type and shape, as the `(layer,
-/// kind)` of its first user, and every layer's index into them per kind.
-pub(crate) fn classes(
-    srcs: &[[crate::gguf::TensorInfo; 3]],
-) -> (Vec<(usize, usize)>, Vec<[usize; 3]>) {
-    let mut classes: Vec<(usize, usize)> = Vec::new();
-    let of = srcs
-        .iter()
-        .enumerate()
-        .map(|(il, l)| {
-            [0, 1, 2].map(|k| {
-                let same = |&(jl, j): &(usize, usize)| {
-                    let (a, b) = (&srcs[jl][j], &l[k]);
-                    j == k && a.ggml_type == b.ggml_type && a.shape == b.shape && a.size == b.size
-                };
-                classes.iter().position(same).unwrap_or_else(|| {
-                    classes.push((il, k));
-                    classes.len() - 1
-                })
-            })
-        })
-        .collect();
-    (classes, of)
-}
-
-/// One expert of every kind of every layer of `srcs`, and one expert of every staging tensor
-/// ([`classes`]): what [`size`] counts in.
-pub fn expert_bytes(srcs: &[[crate::gguf::TensorInfo; 3]], n_expert: usize) -> (u64, u64) {
-    let one = |t: &crate::gguf::TensorInfo| t.size / n_expert as u64;
-    let per_slot = srcs.iter().flatten().map(one).sum();
-    let stage_one = classes(srcs)
-        .0
-        .iter()
-        .map(|&(il, k)| one(&srcs[il][k]))
-        .sum();
-    (per_slot, stage_one)
+/// One expert's bytes per layer of `srcs` and kind: what [`size`] counts in.
+pub fn expert_bytes(srcs: &[[crate::gguf::TensorInfo; 3]], n_expert: usize) -> Vec<[u64; 3]> {
+    srcs.iter()
+        .map(|l| [0, 1, 2].map(|k| l[k].size / n_expert as u64))
+        .collect()
 }
 
 /// The bytes a tiered range maps for the RAM slot tensor `ram` and the staging tensor `tail`.
@@ -948,6 +1019,49 @@ enum To {
 }
 
 impl Inner {
+    /// Staging place `p` (`set * places + i`) of layer `il` as its index past the gap: the
+    /// second set is where [`stage_layout`] puts it for the layer's expert sizes.
+    fn place_at(&self, il: usize, p: usize) -> usize {
+        match p.checked_sub(self.places) {
+            Some(i) => self.layers[il].second + i,
+            None => self.layers[il].first + p,
+        }
+    }
+
+    /// In a mixed model, zeroes the bytes a matmul may read behind every staging place a step
+    /// of layer `il` uses (`index`: expert -> index past the VRAM slots) whose next place it
+    /// does not use: that place may hold bytes of a layer of another size, which need not
+    /// decode to finite values where the matmul reads them (times the zero of its padding: NaN,
+    /// and the next router picks no expert). The place is this layer's set's, or the free one
+    /// behind the set ([`stage_layout`]): nothing reads or writes it meanwhile. A model of one
+    /// size: nothing, as it always was.
+    fn zero_pads(&self, il: usize, index: &[usize]) {
+        if !self.mixed {
+            return;
+        }
+        let mem = &self.layers[il];
+        let n = mem.second + self.places + 1;
+        let mut used = vec![false; n + 1];
+        for &ix in index {
+            if let Some(q) = ix.checked_sub(self.slots + GAP).filter(|&q| q < n) {
+                used[q] = true;
+            }
+        }
+        for q in (0..n).filter(|&q| used[q] && !used[q + 1]) {
+            for k in 0..3 {
+                let at = mem.stage[k] + (q + 1) * mem.bytes[k];
+                // SAFETY: the start of a place of this layer's set or of the free place behind
+                // it, inside the staging buffer ([`HostTier::new`] checked the last one).
+                unsafe { std::ptr::write_bytes(at as *mut u8, 0, mem.pad[k]) };
+            }
+        }
+    }
+
+    /// The experts of layer `il`'s tiered tensor past its VRAM slots ([`HostTier::n_host`]).
+    fn n_host(&self, il: usize) -> usize {
+        self.slots + GAP + self.layers[il].second + self.places
+    }
+
     /// The reads of expert `e` of layer `il` into RAM slot `to`, or into staging place `to`.
     fn reads(&self, il: usize, e: usize, to: To) -> [Job; 3] {
         let mem = &self.layers[il];
@@ -961,7 +1075,7 @@ impl Inner {
                 },
                 dst: match to {
                     To::Slot(s) => mem.ram[k] + s * n,
-                    To::Place(p) => mem.stage[k] + p * n,
+                    To::Place(p) => mem.stage[k] + self.place_at(il, p) * n,
                 },
             }
         })
@@ -1040,7 +1154,7 @@ impl Inner {
         }
         for (e, &p) in place.iter().enumerate() {
             if p != usize::MAX && cache.slot(e).is_none() {
-                t.index[e] = self.slots + GAP + p;
+                t.index[e] = self.slots + GAP + self.place_at(il, p);
             }
         }
         let group = self.pool.submit(jobs);
@@ -1084,7 +1198,7 @@ impl Inner {
                 Some(e) => {
                     // An id past the layer's RAM slots and places would send the matmul
                     // outside the tensor: an error here, not an illegal access there.
-                    if t.index[e] >= self.slots + GAP + self.places * self.sets {
+                    if t.index[e] >= self.n_host(il) {
                         return Err(format!("layer {il}: expert {e} has no RAM slot or place"));
                     }
                     *o = (n_slots + t.index[e]) as i32;
@@ -1096,6 +1210,7 @@ impl Inner {
                 }
             }
         }
+        self.zero_pads(il, &t.index);
         let staged = t.loads.iter().filter(|l| l.1.is_none()).count() as u64;
         c.vram_pairs.fetch_add(vram, Ordering::Relaxed);
         c.ram_pairs.fetch_add(ram, Ordering::Relaxed);
@@ -1129,7 +1244,7 @@ impl Inner {
                     }
                     jobs.extend(self.reads(il, e, To::Place(used)));
                     used += 1;
-                    self.slots + GAP + used - 1
+                    self.slots + GAP + self.place_at(il, used - 1)
                 }
             });
         }

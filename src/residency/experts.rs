@@ -745,6 +745,16 @@ impl Layer {
         let base = unsafe { (*self.tensor(k).raw()).data as usize };
         base + s * self.expert_bytes[k]
     }
+
+    /// Per kind, the bytes behind an expert that a matmul of several tokens may read
+    /// ([`super::policy::expert_pad`]).
+    #[cfg(feature = "cuda")]
+    fn pad(&self) -> [usize; 3] {
+        std::array::from_fn(|k| {
+            let t = self.tensor(k);
+            super::policy::expert_pad(t.nb()[1], t.ne()[0] as usize)
+        })
+    }
 }
 
 /// Where the cache stands.
@@ -1621,7 +1631,11 @@ impl ExpertResidency {
             let mut tensors = Vec::with_capacity(3);
             let mut no_vram = None;
             for (k, t) in ts.iter().enumerate() {
-                let tail = host.as_deref().map(|h| (h.stage_tensor(il, k), h.n_host()));
+                // The tier's own index of the layer (its RAM slot tensor says which).
+                let tail = host.as_deref().map(|h| {
+                    let at = super::host_tier::HostTier::of(*t).map_or(il, |(_, i)| i);
+                    (h.stage_tensor(k), h.n_host(at))
+                });
                 match tiered_tensor(p, *t, n_slots, keep_of[il], KINDS[k], n_expert, tail) {
                     Ok(c) => tensors.push(c),
                     Err(e) if e.no_vram && n_slots > 0 && failures[d] < MAX_FIT_TRIES => {
@@ -3462,12 +3476,12 @@ impl ExpertResidency {
                 };
                 let g = super::cuda::tiered_gran(l.tensor(0)).unwrap_or(1);
                 if l.backed {
-                    let left = super::policy::cut_bytes(&l.expert_bytes, l.cut, g);
+                    let left = super::policy::cut_bytes(&l.expert_bytes, &l.pad(), l.cut, g);
                     need = need.saturating_sub(left);
                 } else if let Some(keep) = l.keep {
                     gran = g;
                     let most = l.slots.n_slots().saturating_sub(keep + 1);
-                    give[il] = Some((l.expert_bytes, most));
+                    give[il] = Some((l.expert_bytes, l.pad(), most));
                 }
             }
             let c = super::policy::even_cuts(&give, gran, need)?;
@@ -3609,12 +3623,14 @@ impl ExpertResidency {
                 let cut = cuts.as_ref().map_or(0, |c| c[il]);
                 l.cut = cut;
                 l.slots.set_limit(l.slots.n_slots() - cut);
+                // Behind the last slot in use the bytes a matmul of several tokens may read stay
+                // mapped and are zeroed (`policy::expert_pad`): the start of the first empty slot.
+                let pad = l.pad();
                 let slots = (0..3)
                     .map(|k| {
                         let s = super::cuda::Slots::of(l.tensor(k))?;
-                        let spare = super::policy::cut_spare(cut);
                         Ok(s.with_parts(l.shared[k].filter(|_| kept))
-                            .with_cut(spare * l.expert_bytes[k]))
+                            .with_cut(cut * l.expert_bytes[k], pad[k]))
                     })
                     .collect::<Result<Vec<_>, String>>()?;
                 // The experts routed to most that the kept slots do not hold (the kept ones stay:

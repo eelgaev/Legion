@@ -1341,7 +1341,7 @@ pub fn unback(t: Tensor<'_>) -> Result<usize, String> {
 }
 
 /// The slot range of a tiered tensor, to give VRAM back from any thread ([`Slots::reback`]).
-pub struct Slots(*mut TieredBuffer, Option<(u64, u64)>, usize);
+pub struct Slots(*mut TieredBuffer, Option<(u64, u64)>, usize, (usize, usize));
 
 // SAFETY: the tiered buffer outlives the handle (the residency joins the thread using it before
 // it drops its tensors), and nothing else touches its slot part meanwhile (see `unback`).
@@ -1351,34 +1351,50 @@ impl Slots {
     /// The slot range of the tiered tensor `t`.
     pub fn of(t: Tensor<'_>) -> Result<Self, String> {
         tiered_of(t)
-            .map(|b| Self(b, None, 0))
+            .map(|b| Self(b, None, 0, (0, 0)))
             .ok_or_else(|| "not a tiered tensor".into())
     }
 
-    /// [`Self::reback`] leaves the range's last `bytes` (rounded down to whole granules, at
-    /// most its tail) unmapped: memory something else holds now. The slots in them, and the
-    /// one the cut starts in, must stay empty until a reback without it.
-    pub fn with_cut(self, bytes: usize) -> Self {
+    /// [`Self::reback`] leaves the range's last `bytes` unmapped but their first `pad`
+    /// (rounded down to whole granules, at most its tail): memory something else holds now.
+    /// The slots in the last `bytes` must stay empty until a reback without the cut; the
+    /// first `pad` of them are mapped and zeroed, for the matmuls that read that far past the
+    /// slot before them.
+    pub fn with_cut(self, bytes: usize, pad: usize) -> Self {
         // SAFETY: reading the fields of the live tiered buffer.
         let b = unsafe { &*self.0 };
         let g = b.gran.max(1);
-        let cut = (bytes / g * g).min(b.vram_bytes - b.split);
-        Self(self.0, self.1, cut)
+        let pad = pad.min(bytes);
+        let cut = ((bytes - pad) / g * g).min(b.vram_bytes - b.split);
+        Self(self.0, self.1, cut, (b.vram_bytes - bytes, pad))
     }
 
     /// The range's own allocations `(vram, tail)` (from [`slot_handles`], 0: none), which a
     /// device's kept staging buffers hold while its slots are lent: [`Self::reback`] maps them
     /// back instead of new memory, and they stay the staging buffers' (`shared`).
     pub fn with_parts(self, parts: Option<(u64, u64)>) -> Self {
-        Self(self.0, parts, self.2)
+        Self(self.0, parts, self.2, self.3)
     }
 
-    /// Gives the range VRAM slots again after [`unback`] (their contents undefined).
+    /// Gives the range VRAM slots again after [`unback`] (their contents undefined, but the
+    /// zeroed pad of [`Self::with_cut`]).
     pub fn reback(&self) -> Result<(), String> {
+        // SAFETY: reading the fields of the live tiered buffer.
+        let unmapped = unsafe { (*self.0).hole || (*self.0).tail_hole };
         match self.1 {
-            Some(parts) => reback_shared(self.0, parts, self.2),
-            None => reback_buffer(self.0, self.2),
+            Some(parts) => reback_shared(self.0, parts, self.2)?,
+            None => reback_buffer(self.0, self.2)?,
         }
+        let (at, n) = self.3;
+        if unmapped && n > 0 {
+            // SAFETY: `n` bytes of the range the reback just mapped (before its cut), in a slot
+            // that stays empty; the reback made the range's device current.
+            unsafe {
+                let va = (*self.0).va as usize + at;
+                rt(cudaMemset(va as *mut c_void, 0, n), "cudaMemset(cut pad)")?;
+            }
+        }
+        Ok(())
     }
 }
 

@@ -208,7 +208,8 @@ pub fn host_tier_plan(
     let Some(srcs) = host_tier::sources(gguf, hp.n_layer, hp.n_expert as usize) else {
         return Ok(None);
     };
-    let (per_slot, stage_one) = host_tier::expert_bytes(&srcs, hp.n_expert as usize);
+    let sizes = host_tier::expert_bytes(&srcs, hp.n_expert as usize);
+    let per_slot: u64 = sizes.iter().flatten().sum();
     let table = hp
         .arch
         .ngram_table()
@@ -226,14 +227,7 @@ pub fn host_tier_plan(
         .map_or(0, |t| (t.div_ceil(KV_BLOCK) * per) as u64);
     let mem = host_tier::mem_info();
     let mib = |b: u64| b >> 20;
-    match host_tier::size(
-        mem,
-        per_slot,
-        stage_one,
-        hp.n_expert as usize,
-        table,
-        kv_spill,
-    ) {
+    match host_tier::size(mem, &sizes, hp.n_expert as usize, table, kv_spill) {
         Sizing::Whole => Ok(None),
         Sizing::Bounded(plan) => {
             tracing::info!(
