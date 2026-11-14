@@ -386,6 +386,24 @@ const LENT_MIXED_KEPT: usize = 1;
 /// was padded past the free memory (`ComputeAllocator::padded`) and failed anyway.
 pub const LENT_SCRATCH: usize = 512 << 20;
 
+/// [`headroom::hopeless`] for `stage`'s step graph in `ctx`, whose allocation failed asking
+/// `bytes`: while the cache is `lent` the buffer must leave [`LENT_SCRATCH`] free, which
+/// `bytes` counts only when the allocation itself succeeded (its buffer grew past `before`,
+/// [`lent_scratch`]).
+fn step_hopeless(stage: &Stage, ctx: &Context, bytes: usize, lent: bool, before: usize) -> bool {
+    let held = ctx.allocator_size();
+    let kept = (stage.decode.iter().chain(&stage.mixed))
+        .map(|(_, g)| g.allocator_size())
+        .sum();
+    let scratch = if lent && held <= before {
+        LENT_SCRATCH
+    } else {
+        0
+    };
+    let free = stage.backend.device().memory().0;
+    headroom::hopeless(free, held, kept, bytes, scratch)
+}
+
 /// While the expert cache is lent, after a step graph's compute buffer (`held` bytes on
 /// `device`) was allocated: the out-of-memory error the allocation would have been, should it
 /// leave the device less than [`LENT_SCRATCH`].
@@ -3003,6 +3021,11 @@ impl Executor {
         // before still computed on other stages (see `early_inputs`).
         let mut early = vec![Early::No; n_stages];
         let mut n_rounds = n_micro + n_stages - 1;
+        // `step tail us` (debug level): when the first stage's launch returned, and how long
+        // the stages' outputs took to read.
+        let tail_log = tracing::enabled!(tracing::Level::DEBUG);
+        let mut launched_at: Option<std::time::Instant> = None;
+        let mut tail_output_ms = 0.0;
         front.lap("shapes");
         if self.dataflow_for(n_micro) {
             let flow = dataflow::Flow {
@@ -3258,6 +3281,9 @@ impl Executor {
                     }
                 }
                 front.done();
+                if tail_log && launched_at.is_none() {
+                    launched_at = Some(std::time::Instant::now());
+                }
                 let t_launched = t0.elapsed();
                 // `--tp-profile`'s laps: the next verify graph built, then the GPU waited for.
                 let (mut t_ahead, mut ahead_wait) = (t_launched, std::time::Duration::ZERO);
@@ -3409,7 +3435,9 @@ impl Executor {
                     output_ms,
                 );
             }
+            tail_output_ms += output_ms;
         }
+        let tail_at = launched_at.map(|t| (t, std::time::Instant::now()));
         deferred.join(None, &mut hidden);
         // Captured layers in the order asked for, the micro-chunks' rows one after another.
         out.hidden = self
@@ -3454,7 +3482,21 @@ impl Executor {
                 // Run beside the next MTP pass (or before the next step).
                 self.deferred_target = Some((n, kind));
             } else {
+                let t = std::time::Instant::now();
                 self.after_pass(n, |il| il < n_layer, kind)?;
+                if let Some((launched, rounds_end)) = tail_at {
+                    // From the first launch's return (the GPU work of a synchronized
+                    // one-stage step included) to the rounds' end, then the rest up to the
+                    // cache's after-step, then the after-step itself.
+                    tracing::debug!(
+                        tokens = n,
+                        rounds_us = (rounds_end - launched).as_micros() as u64,
+                        output_us = (tail_output_ms * 1e3) as u64,
+                        between_us = (t - rounds_end).as_micros() as u64,
+                        after_us = t.elapsed().as_micros() as u64,
+                        "step tail us"
+                    );
+                }
             }
         }
         Ok(out)
@@ -3777,7 +3819,11 @@ impl Executor {
                     }) {
                         Ok(()) => {}
                         // The graphs a restore hands its thread may still hold the memory.
-                        Err(GgmlError::Alloc { .. }) if self.freeing.wait() => {
+                        // Not when even that memory could not make it fit.
+                        Err(GgmlError::Alloc { bytes, .. })
+                            if self.freeing.wait()
+                                && !step_hopeless(stage, &ctx, bytes, lent && !spilled, before) =>
+                        {
                             tracing::debug!(
                                 stage = s,
                                 "out of memory for a step's compute buffer: waited for the \
@@ -3788,6 +3834,11 @@ impl Executor {
                         }
                         Err(GgmlError::Alloc { bytes, .. }) => {
                             let tokens = shape.iter().map(GroupShape::tokens).sum::<usize>();
+                            // When even free memory, this attempt's buffer and every kept
+                            // graph's fall short, dropping kept graphs and allocating again
+                            // cannot fit: to unified memory now (#37).
+                            let hopeless =
+                                step_hopeless(stage, &ctx, bytes, lent && !spilled, before);
                             // The oldest other kept graph first, mixed before decode (the
                             // smaller, hotter ones): its buffer grows for this graph, the rest
                             // stay (a mixed step beside four decoding sequences is a new shape
@@ -3797,7 +3848,7 @@ impl Executor {
                             } else {
                                 &mut stage.mixed
                             };
-                            if !oldest.is_empty() {
+                            if !hopeless && !oldest.is_empty() {
                                 let (_, g) = oldest.remove(0);
                                 if let Some(a) = g.into_allocator() {
                                     tracing::debug!(
@@ -3813,7 +3864,7 @@ impl Executor {
                                 }
                             }
                             let others = stage.decode.len() + stage.mixed.len();
-                            if retry && others > 0 {
+                            if !hopeless && retry && others > 0 {
                                 tracing::warn!(
                                     stage = s,
                                     tokens,

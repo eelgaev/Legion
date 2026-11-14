@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::policy::{
-    LayerSlots, LendLayer, MAX_FIT_TRIES, SwapRule, allocate_slots_in, auto_keep_carved,
+    LayerSlots, LendLayer, MAX_FIT_TRIES, Swap, SwapRule, allocate_slots_in, auto_keep_carved,
     hottest_experts, layers_left_coldest, layers_left_for, lowest_experts, plan_swaps,
     shrunk_budget,
 };
@@ -871,10 +871,54 @@ pub struct ExpertResidency {
     ep_stage_all: bool,
     /// The CUDA devices whose slots did not all fit at load (#1208), [`ExpertResidency::shrunk`].
     shrunk: Vec<Shrunk>,
+    /// The after-step's host time by part, at debug level only ([`AfterLaps`]).
+    laps: AfterLaps,
+    /// Whether the after-step writes the tables before it starts the planned swaps' copies on
+    /// a CUDA device (#37; not with the bounded host tier, whose swaps wait for some of their
+    /// copies).
+    /// Written after them, the table's small host-to-device copy queued on the copy engine
+    /// behind every swap's expert bytes (~20 x 3 MiB a decode step on the 4090, ~2.7 ms over
+    /// PCIe) and the next step started that much later. `LEGION_DEBUG_SWAP_COPIES_FIRST`
+    /// keeps the old order for A/B runs. The same copies into the same slots either way: the
+    /// tables leave those slots out until they are filled.
+    tables_first: bool,
+    /// The swaps planned this after-step whose copies start after the table write, per device.
+    later: Vec<(usize, Vec<Swap>)>,
     /// The bounded host tier (#37) the layers' host parts are, if any: RAM slots and a staging
     /// buffer in place of every expert's host bytes. Last: dropped after the tiered ranges
     /// that map its memory.
     host: Option<std::sync::Arc<super::host_tier::HostTier>>,
+}
+
+/// The host time of one after-step by part (`expert cache after-step us`, logged at debug
+/// level per logged step; nothing is timed otherwise): where the time between a decode step's
+/// end and the next one's launch goes.
+#[derive(Default)]
+struct AfterLaps {
+    at: Option<std::time::Instant>,
+    laps: Vec<(&'static str, u32)>,
+}
+
+impl AfterLaps {
+    fn start(&mut self) {
+        self.laps.clear();
+        self.at = tracing::enabled!(tracing::Level::DEBUG).then(std::time::Instant::now);
+    }
+
+    fn lap(&mut self, name: &'static str) {
+        if let Some(at) = self.at.as_mut() {
+            let now = std::time::Instant::now();
+            self.laps
+                .push((name, (now - *at).as_micros().min(u32::MAX as u128) as u32));
+            *at = now;
+        }
+    }
+
+    fn log(&mut self, swaps: usize) {
+        if self.at.take().is_some() {
+            tracing::debug!(swaps, laps = ?self.laps, "expert cache after-step us");
+        }
+    }
 }
 
 /// A CUDA device whose expert slots did not all find VRAM at load (#1208): the cache planned
@@ -1871,6 +1915,9 @@ impl ExpertResidency {
             heat_saved: std::time::Instant::now(),
             heat_fresh: false,
             heat_writer: None,
+            laps: AfterLaps::default(),
+            tables_first: std::env::var_os("LEGION_DEBUG_SWAP_COPIES_FIRST").is_none(),
+            later: Vec::new(),
             cold: tier_prof.is_none(),
             split_misses: cfg.split_misses.clone(),
             swaps: 0,
@@ -2428,10 +2475,13 @@ impl ExpertResidency {
     /// finished copies, learns the pass's routing if it was logged, plans and starts swaps, and
     /// writes changed tables, over every layer. Must run before the next pass starts.
     pub fn after_step(&mut self, n: usize, ran: impl Fn(usize) -> bool) -> Result<(), String> {
+        self.laps.start();
         #[cfg(feature = "cuda")]
         self.tier_settled()?;
+        self.laps.lap("settled");
         #[cfg(feature = "cuda")]
         self.refill(None, false)?;
+        self.laps.lap("refill");
         self.learn(n, &ran, None, true)
     }
 
@@ -2554,7 +2604,9 @@ impl ExpertResidency {
         scope: Option<&dyn Fn(usize) -> bool>,
         count: bool,
     ) -> Result<(), String> {
+        let swaps0 = self.swaps;
         self.complete_copies(scope)?;
+        self.laps.lap("complete");
         // Model bytes (#391): whether the pass gathered its experts or read staged copies.
         let gathered = self.fetch == Fetch::Copy && n as i64 <= COPY_MAX_TOKENS;
         #[cfg(feature = "cuda")]
@@ -2656,6 +2708,7 @@ impl ExpertResidency {
                 }
             }
             self.heat_fresh |= !held;
+            self.laps.lap("record");
             // The bounded host tier keeps its RAM slots by the same heat.
             if let Some(h) = self.host.as_ref().filter(|_| !held) {
                 h.set_heat(
@@ -2675,6 +2728,7 @@ impl ExpertResidency {
             }
             // No swaps into lent slots: their VRAM is gone until `restore`. None for the
             // warmup's routing either.
+            self.laps.lap("heat");
             if self.lent.is_none() && !held {
                 for d in 0..self.devices.len() {
                     if self.rule.on_device(&self.device_swaps, d).budget > 0 {
@@ -2682,6 +2736,7 @@ impl ExpertResidency {
                     }
                 }
             }
+            self.laps.lap("copies");
             if count && self.logged.is_multiple_of(REPORT_EVERY) {
                 let s = self.stats();
                 let (h, m) = (s.hits - self.reported.0, s.misses - self.reported.1);
@@ -2701,7 +2756,16 @@ impl ExpertResidency {
             self.learn_tally(ran);
         }
         self.save_tier_heat_if_due();
-        self.upload_tables(scope)
+        self.laps.lap("report");
+        let r = self.upload_tables(scope);
+        self.laps.lap("tables");
+        // The swaps planned above start now, behind the table write (`tables_first`).
+        for (d, swaps) in std::mem::take(&mut self.later) {
+            self.issue_swaps(d, &swaps)?;
+        }
+        self.laps.lap("later");
+        self.laps.log((self.swaps - swaps0) as usize);
+        r
     }
 
     /// The startup warmup begins (`true`) or is over: while it runs over slots a saved heat
@@ -2861,13 +2925,27 @@ impl ExpertResidency {
             self.cold = swaps.len() >= rule.budget;
             swaps
         };
+        self.laps.lap("plan");
         if swaps.is_empty() {
             return Ok(());
         }
         self.swaps += swaps.len() as u64;
-        let tier = self.host.clone();
         for s in &swaps {
             self.layers[s.layer].as_mut().unwrap().dirty = true;
+        }
+        // A CUDA device's copies start after the table write (`tables_first`); host copies
+        // are done at once and fill their slots before it, as before.
+        if self.tables_first && self.host.is_none() && self.devices[d].place.cuda.is_some() {
+            self.later.push((d, swaps));
+            return Ok(());
+        }
+        self.issue_swaps(d, &swaps)
+    }
+
+    /// Starts the copies of device `d`'s planned `swaps` (already out of the tables).
+    fn issue_swaps(&mut self, d: usize, swaps: &[Swap]) -> Result<(), String> {
+        let tier = self.host.clone();
+        for s in swaps {
             match &tier {
                 // The bounded host tier: the dropped expert's bytes go to a RAM slot first,
                 // the new one's come from its RAM slot (or, read first, its staging place:

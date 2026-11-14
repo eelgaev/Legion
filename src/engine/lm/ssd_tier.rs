@@ -169,6 +169,13 @@ pub const HOST_TIER_LONG: usize = 1536;
 /// ([`crate::residency::ResidencyConfig::lend_reserve`]).
 pub const HOST_TIER_RESERVE: u64 = 512 << 20;
 
+/// Added to [`HOST_TIER_RESERVE`] when the bounded tier runs with the token embeddings in host
+/// memory (`layout::embd_on_host`). Measured on the 4090 (#37 round 11), against the same
+/// binary with them in VRAM: the VRAM in use beside the weights, KV, cache and step buffers
+/// grew 73 MiB at 64 GB and 120 MiB at 32 GB (23 at 128 GB, no tier), and a 32 GB decode
+/// graph then found 496 MiB free, under the 510 the lend keeps. What grows is not pinned down.
+pub const HOST_TIER_EMBD_RESERVE: u64 = 128 << 20;
+
 /// What a long prompt's lend keeps free there in place of [`HOST_TIER_RESERVE`]. Measured: the
 /// staged passes then get within 50 MiB of the VRAM they had with the default reserve. With
 /// 1 GiB they got 238 MiB more, and four prompts of 3,000 tokens at once went in one pass

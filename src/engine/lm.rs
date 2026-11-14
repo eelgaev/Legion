@@ -3838,6 +3838,10 @@ impl LmEngine {
             // passes are sized to it.
             cfg.residency.lend_reserve = Some(ssd_tier::HOST_TIER_LEND_RESERVE);
             cfg.residency.cache_reserve = ssd_tier::HOST_TIER_RESERVE;
+            // One stage's shared host memory is the embeddings moved off the tier's GPU.
+            if host_tier.is_some() && layout.shared_host.is_some() && layout.stages.len() == 1 {
+                cfg.residency.cache_reserve += ssd_tier::HOST_TIER_EMBD_RESERVE;
+            }
         }
         // The other machine's layers and head.
         let hp_file = crate::model::core::Hparams::from_gguf(&gguf)?;
