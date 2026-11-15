@@ -47,6 +47,11 @@ pub const K: [i64; 2] = [4096, 5120];
 /// Most columns the op takes: ggml-cuda runs MMVQ up to 8 (`MMVQ_MAX_BATCH_SIZE`).
 pub const MAX_COLS: i64 = 8;
 
+/// Fewest rows [`takes`] takes from 3 columns: below, every CTA's own quantization of the input
+/// costs more than the faster weight reads gain (the take-in's 2,048 K/V rows: 3-15% slower than
+/// ggml at 3-8 columns, 10% faster at 1-2; a DGX Spark).
+pub const MIN_ROWS: i64 = 4096;
+
 /// Bytes of a Q4_K block.
 const Q4_K_BYTES: usize = 144;
 
@@ -89,10 +94,11 @@ impl DraftMode {
 }
 
 /// Whether `w @ x` takes the op: a GPU that runs the kernel ([`super::q4k_head::device_supported`]),
-/// [`fits`], a weight in one GPU's memory.
+/// [`fits`], at least [`MIN_ROWS`] rows from 3 columns, a weight in one GPU's memory.
 pub fn takes(w: Tensor<'_>, x: Tensor<'_>) -> bool {
     cfg!(feature = "cuda")
         && fits(w, x)
+        && (w.ne()[1] >= MIN_ROWS || x.ne()[1] <= 2)
         && !w.is_host()
         && !w.is_meta()
         && super::q4k_head::device_supported()
@@ -138,9 +144,10 @@ pub struct Shape {
 }
 
 /// The default shape for `n` columns (GB10, the drafter's shapes; `legion q4k-mv-bench` times
-/// the others).
+/// the others): two rows a warp step up to 2 columns, one from 3 (two rows' registers spill
+/// there: 2-14x slower from 4 columns).
 pub fn default_shape(n: usize) -> Shape {
-    if n <= 4 {
+    if n <= 2 {
         Shape { warps: 8, rows: 2 }
     } else {
         Shape { warps: 16, rows: 1 }
