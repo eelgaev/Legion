@@ -180,8 +180,11 @@ impl Remote {
         if self.logged >= 256 {
             let t = std::mem::take(&mut self.link.times);
             let n = t.steps.max(1) as f64;
-            if t.drafts > 0 {
-                let d = t.drafts as f64;
+            if t.drafts > 0 || t.take_ins > 0 {
+                let d = t.drafts.max(1) as f64;
+                // Take-ins not waited for: their time is in the wait of the reply after them
+                // (`link_ms` of a step).
+                let ti = t.take_ins.max(1) as f64;
                 tracing::info!(
                     steps = t.steps,
                     rank1_ms = t.remote_ms / n,
@@ -189,7 +192,9 @@ impl Remote {
                     drafts = t.drafts,
                     rank1_draft_ms = t.draft_remote_ms / d,
                     draft_link_ms = t.draft_link_ms / d,
-                    "node link: per step and MTP draft round waited for"
+                    take_ins = t.take_ins,
+                    rank1_take_in_ms = t.take_in_remote_ms / ti,
+                    "node link: per step, MTP draft round and take-in"
                 );
             } else {
                 tracing::info!(

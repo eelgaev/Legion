@@ -51,6 +51,11 @@ pub enum Fp8Mode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OpenOptions {
     pub fp8: Fp8Mode,
+    /// GLM-5.3-Flash's MTP block: its BF16 routed experts quantized to NVFP4 at load (the
+    /// decoder's own format), for a model split over two nodes whose rank 1 holds the head, or
+    /// over tensor-parallel ranks that each hold the head's share.
+    /// Only the drafter reads them, so the target's tokens under greedy verify do not change.
+    pub mtp_nvfp4: bool,
 }
 
 /// Opens the checkpoint in `dir` as a synthetic GGUF model.
@@ -71,6 +76,7 @@ pub(crate) fn open(dir: &Path, opts: &OpenOptions) -> Result<GgufFile, GgufError
         .to_string();
     let mut b = Builder::new(Arc::new(ckpt));
     b.modelopt = nvfp4::ModelOpt::detect(&b.ckpt, &config, opts.fp8).map_err(err)?;
+    b.mtp_nvfp4 = opts.mtp_nvfp4;
     match model_type.as_str() {
         "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => {
             qwen35::build(&mut b, &config).map_err(err)?
@@ -139,6 +145,8 @@ pub(crate) struct Builder {
     modelopt: Option<nvfp4::ModelOpt>,
     /// Stacked NVFP4 experts' per-expert sources ([`GgufFile::nvfp4_stack`]).
     stacks: HashMap<String, Arc<crate::gguf::Nvfp4Stack>>,
+    /// [`OpenOptions::mtp_nvfp4`].
+    mtp_nvfp4: bool,
 }
 
 /// The ggml type that holds a safetensors dtype unchanged.
@@ -160,6 +168,7 @@ impl Builder {
             recipes: HashMap::new(),
             modelopt: None,
             stacks: HashMap::new(),
+            mtp_nvfp4: false,
         }
     }
 

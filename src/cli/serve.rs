@@ -729,10 +729,11 @@ pub(super) struct ModelArgs {
     #[arg(long, value_name = "TYPE", value_enum, default_value_t = legion::tp_net::Wire::F32)]
     pub tp_wire: legion::tp_net::Wire,
     /// With --tp-rank: prompt steps of at least N tokens split the per-token work between the
-    /// sums by tokens as well (sequence parallelism): each rank runs Qwen3.8-Flash-Next's
-    /// hyper-connection mixers on its share of the tokens instead of all of them, and each sum
-    /// becomes a reduce-scatter plus an all-gather of the same bytes. For long prompts over
-    /// two machines (e.g. 1024). 0 (default): off. Every rank must pass the same value.
+    /// sums by tokens as well (sequence parallelism): each rank runs the hyper-connection
+    /// mixers (Qwen3.8-Flash-Next, GLM-5.3-Flash) on its share of the tokens instead of all of
+    /// them, and each sum becomes a reduce-scatter plus an all-gather of the same bytes. For
+    /// long prompts over two machines (e.g. 1024). 0 (default): off. Every rank must pass the
+    /// same value.
     #[arg(long, value_name = "N", default_value_t = 0)]
     pub tp_seq_par: usize,
     /// With --tp-rank and --spec mtp (Qwen3.8-Flash-Next's head), on rank 0: a draft round

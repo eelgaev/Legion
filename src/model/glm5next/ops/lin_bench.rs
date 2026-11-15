@@ -364,3 +364,118 @@ pub fn chain_ms(
     });
     rows
 }
+
+/// One BF16 decode product of GLM-5.3-Flash NVFP4 (`legion lin-bench --gemv`, #560 r6): `name`,
+/// `k` inputs, `m` rows, `h` matrices. `tp.*` are a tensor-parallel rank's halves over two
+/// machines, `one.*` the whole products of one machine.
+#[derive(Clone, Copy, Debug)]
+pub struct GemvShape {
+    pub name: &'static str,
+    pub k: i64,
+    pub m: i64,
+    pub h: i64,
+}
+
+const fn gs(name: &'static str, k: i64, m: i64, h: i64) -> GemvShape {
+    GemvShape { name, k, m, h }
+}
+
+/// GLM-5.3-Flash NVFP4's BF16 matvecs (KDA q/k/v and o, MLA q_a/q_b/k_b/v_b/o, the shared
+/// expert, the output head), as a rank of two and as one machine runs them.
+pub const GEMV_SHAPES: [GemvShape; 15] = [
+    gs("tp.kda.qkv", 4096, 4096, 1),
+    gs("tp.kda.o", 4096, 4096, 1),
+    gs("tp.mla.q_a", 4096, 1536, 1),
+    gs("tp.mla.q_b", 1536, 8192, 1),
+    gs("tp.mla.k_b", 256, 512, 32),
+    gs("tp.mla.v_b", 512, 256, 32),
+    gs("tp.mla.o", 8192, 4096, 1),
+    gs("tp.shexp.gu", 4096, 1024, 1),
+    gs("tp.shexp.down", 1024, 4096, 1),
+    gs("head", 4096, 154880, 1),
+    gs("one.kda.qkv", 4096, 8192, 1),
+    gs("one.kda.o", 8192, 4096, 1),
+    gs("one.mla.o", 16384, 4096, 1),
+    gs("one.shexp.gu", 4096, 2048, 1),
+    gs("one.shexp.down", 2048, 4096, 1),
+];
+
+/// One [`bf16_gemv`] kernel's time in [`gemv_ms`].
+pub struct GemvTiming {
+    pub kernel: u8,
+    /// Milliseconds per product: the best round's mean.
+    pub ms: f64,
+    /// [`bits_hash`] of the output.
+    pub bits: u64,
+}
+
+/// Times `shape` at `n_tok` tokens (1-8) on `backend` for each [`bf16_gemv`] kernel of
+/// `kernels`: BF16 weights in [-0.05, 0.05), F32 activations in [-1, 1). Each graph holds copies
+/// of the product on distinct copies of the weights (~384 MB of them in all, so that no copy is
+/// still in L2 when it comes round again), all on the same `x`. Each round runs every kernel's
+/// graph in turn, one warm-up call and `reps` timed ones.
+pub fn gemv_ms(
+    backend: &mut Backend,
+    shape: GemvShape,
+    n_tok: usize,
+    reps: usize,
+    rounds: usize,
+    kernels: &[u8],
+) -> Vec<GemvTiming> {
+    let GemvShape { k, m, h, .. } = shape;
+    let n = n_tok as i64;
+    let wbytes = (k * m * h * 2) as usize;
+    let copies = (384usize << 20).div_ceil(wbytes).clamp(1, 48);
+    let data = Context::new(copies + 2, 0);
+    let ws: Vec<Tensor<'_>> = (0..copies)
+        .map(|_| data.new_tensor(types::BF16, &[k, m, h]))
+        .collect();
+    let x = if h == 1 {
+        data.new_tensor(types::F32, &[k, n])
+    } else {
+        data.new_tensor(types::F32, &[k, h, n])
+    };
+    data.alloc_tensors(backend.buffer_type()).unwrap();
+    let wb: Vec<u8> = noise(ws[0].elements(), 7)
+        .iter()
+        .flat_map(|v| to_bf16(v * 0.05).to_ne_bytes())
+        .collect();
+    for w in &ws {
+        w.set_bytes(&wb);
+    }
+    drop(wb);
+    x.set_f32(&noise(x.elements(), 8));
+    let bt = backend.buffer_type();
+    let ctxs: Vec<Context> = kernels
+        .iter()
+        .map(|_| Context::new(copies + 4, copies + 16))
+        .collect();
+    let graphs: Vec<(Tensor<'_>, Graph<'_>)> = ctxs
+        .iter()
+        .zip(kernels)
+        .map(|(ctx, &kernel)| {
+            set_bf16_gemv(kernel);
+            let mut graph = ctx.new_graph(copies + 16);
+            let mut first = None;
+            for &w in &ws {
+                let out = linear(ctx, w, x, 1.0, None).as_output();
+                graph.expand(out);
+                first.get_or_insert(out);
+            }
+            ctx.alloc_graph(&graph, ComputeAllocator::new(bt)).unwrap();
+            (first.unwrap(), graph)
+        })
+        .collect();
+    let refs: Vec<&Graph<'_>> = graphs.iter().map(|(_, g)| g).collect();
+    let ms = time_graphs(backend, &refs, reps, rounds);
+    kernels
+        .iter()
+        .zip(&graphs)
+        .zip(ms)
+        .map(|((&kernel, (out, _)), ms)| GemvTiming {
+            kernel,
+            ms: ms / copies as f64,
+            bits: bits_hash(&out.to_f32()),
+        })
+        .collect()
+}

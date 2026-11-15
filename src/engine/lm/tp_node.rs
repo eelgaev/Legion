@@ -245,6 +245,11 @@ pub(super) fn mtp_share(
         return tp_net::shard::qwen35::head_view(&gguf, hp, rank, n)
             .map_err(|e| device(format!("--spec-draft: {e}")));
     }
+    if gguf.architecture().as_deref() == Some("glm5-next") {
+        // GLM's MTP block is one more DSA layer of the target's: cut as the target's are.
+        return tp_net::shard::glm5::view(&gguf, rank, n)
+            .map_err(|e| device(format!("--spec-draft: {e}")));
+    }
     if hp.n_layer < 2 {
         return Err(device(
             "an MTP assistant for a model of fewer than two layers",

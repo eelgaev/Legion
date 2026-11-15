@@ -1824,6 +1824,11 @@ impl Model {
         }
     }
 
+    /// Whether [`Self::tp_sum`] sums over tensor-parallel ranks (else it is `x` itself).
+    pub(crate) fn tp_on(&self) -> bool {
+        self.tp_pair.is_some() || self.tp_comm.is_some()
+    }
+
     pub fn set_attention(&mut self, a: Attention) {
         self.attention = a;
     }

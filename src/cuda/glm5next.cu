@@ -4,7 +4,8 @@
 //
 // - linear: y = scale * ws * (W x) for Q8_0, BF16, F16 or F32 weights, or Project Maya's Q6_K and
 //   Q4_K (glm5next_kquant.cuh). Up to 8 tokens a GEMV
-//   (a warp per row, 32-value blocks per lane, F32 sums); more a GEMM on tensor cores through
+//   (a warp per row, 32-value blocks per lane, F32 sums; on the GB10 BF16 weights take
+//   linear_mv_bf16, its sums with contiguous loads, #560 r6); more a GEMM on tensor cores through
 //   the portable WMMA API: 64 x 64 tiles (rows x tokens), K steps of 32, W dequantized and x
 //   rounded to F16 in shared memory. Volta's tensor cores truncate long accumulation chains, so
 //   each 16-deep product goes into a fresh fragment that is added into the F32 sums.
@@ -281,6 +282,143 @@ __global__ void __launch_bounds__(128) linear_mv(const Lin p) {
             p.dst[(t * p.h + i) * p.m + r] = s * sc;
         }
     }
+}
+
+// ---- BF16 decode GEMV on the GB10 (#560 r6) ----
+// linear_mv<N> for BF16 weights with each lane's sums unchanged: lane L sums its 32-value blocks
+// L, L + 32, ... in that order, each half block a 16-value FMA chain from 0 added to its token's
+// sum, the warp's lanes then in warp_sum and times the scale: the same bits. What differs is how
+// the bytes come in. linear_mv's lanes each load their own 64 bytes a block (every 16-byte load of
+// the warp touches 16 lines) and x one float at a time, 128 bytes from the next lane's (32 lines a
+// load): ~110-120 GB/s on a GB10 at 1 token, and 1.5x / 2x the time per call at 3 / 4 tokens.
+// Here (params[6] 1, ops::bf16_gemv) the warp's 32 blocks of a step (2 KB) load as 128
+// consecutive uint4s (4 a lane, each load one contiguous 512 bytes, streaming), U steps ahead in
+// registers, and pass through shared memory to the lane that sums them (swizzled: no bank
+// conflicts either way); x comes in float4 loads on the read-only path (rows 16-byte aligned).
+// `legion lin-bench --gemv` on a GB10 (GLM-5.3-Flash NVFP4's BF16 shapes): 220-245 GB/s at 1
+// token, 190-230 at 3, 135-195 at 4, 75-110 at 8, the same output bits as linear_mv everywhere.
+// (Each lane loading its own blocks U ahead with x in float4s gave 120-150 GB/s at 1 token.)
+
+// Block b's half h of a lane (two uint4s of BF16 pairs, the lower k in the low half) times each
+// token's x: linear_mv's chain, with x in float4s.
+template <int N>
+__device__ __forceinline__ void bf16_half(const Lin & p, int64_t i, int64_t b, int h, uint4 u0, uint4 u1, float (&acc)[N]) {
+    float v[16];
+    const uint32_t w[8] = {u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w};
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        v[2 * j] = bf16f((uint16_t) (w[j] & 0xFFFF));
+        v[2 * j + 1] = bf16f((uint16_t) (w[j] >> 16));
+    }
+#pragma unroll
+    for (int t = 0; t < N; t++) {
+        if (t < p.n) {
+            const float4 * x4 = (const float4 *) ((const float *) (p.x + i * p.x_nbi + t * p.x_nbt) + b * 32 + 16 * h);
+            float x[16];
+#pragma unroll
+            for (int q = 0; q < 4; q++) {
+                const float4 f = __ldg(x4 + q);
+                x[4 * q] = f.x;
+                x[4 * q + 1] = f.y;
+                x[4 * q + 2] = f.z;
+                x[4 * q + 3] = f.w;
+            }
+            float s = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 16; j++) {
+                s += v[j] * x[j];
+            }
+            acc[t] += s;
+        }
+    }
+}
+
+// linear_mv's epilogue.
+template <int N>
+__device__ __forceinline__ void bf16_store(const Lin & p, int64_t r, int64_t i, int lane, float (&acc)[N]) {
+    const float sc = lin_scale(p, r);
+#pragma unroll
+    for (int t = 0; t < N; t++) {
+        const float s = warp_sum(acc[t]);
+        if (lane == 0 && t < p.n) {
+            p.dst[(t * p.h + i) * p.m + r] = s * sc;
+        }
+    }
+}
+
+// Where uint4 q (0..127) of a step's 2 KB sits in linear_mv_bf16's shared memory: lane L reads
+// q = 4 L + c (c = 0..3), 8 lanes at a time, and q ^ (bits 3-4 of q) puts those 8 in 8 distinct
+// 16-byte bank groups; the writes (q = 32 e + L) XOR 8 consecutive q by one value, also distinct.
+__device__ __forceinline__ int bf16_sw(int q) { return q ^ ((q >> 3) & 3); }
+
+// Steps of a row (2 KB each) a warp of linear_mv_bf16 keeps in flight, by tokens.
+template <int N> struct Bf16U { static constexpr int v = N <= 4 ? 2 : 1; };
+
+template <int N, int U>
+__global__ void __launch_bounds__(128) linear_mv_bf16(const Lin p) {
+    pdl_wait();
+    __shared__ uint4 sm[4][U * 128];
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int64_t r = (int64_t) blockIdx.x * 4 + warp, i = blockIdx.y;
+    if (r >= p.m) {
+        return;
+    }
+    const uint4 * row = (const uint4 *) (p.w + r * p.w_nb1 + i * p.w_nb2);
+    float acc[N];
+#pragma unroll
+    for (int t = 0; t < N; t++) {
+        acc[t] = 0.0f;
+    }
+    const int64_t nb = p.k / 32, nq = nb * 4;
+    const int64_t groups = (nb + 32 * U - 1) / (32 * U);
+    uint4 reg[U][4];
+#pragma unroll
+    for (int u = 0; u < U; u++) {
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+            const int64_t q = (int64_t) u * 128 + 32 * e + lane;
+            if (q < nq) {
+                reg[u][e] = __ldcs(row + q);
+            }
+        }
+    }
+    uint4 * s = sm[warp];
+    for (int64_t g = 0; g < groups; g++) {
+#pragma unroll
+        for (int u = 0; u < U; u++) {
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int ql = 32 * e + lane;
+                if ((g * U + u) * 128 + ql < nq) {
+                    s[u * 128 + bf16_sw(ql)] = reg[u][e];
+                }
+            }
+        }
+        __syncwarp();
+        if (g + 1 < groups) {
+#pragma unroll
+            for (int u = 0; u < U; u++) {
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int64_t q = ((g + 1) * U + u) * 128 + 32 * e + lane;
+                    if (q < nq) {
+                        reg[u][e] = __ldcs(row + q);
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < U; u++) {
+            const int64_t b = (g * U + u) * 32 + lane;
+            if (b < nb) {
+                const uint4 * c = s + u * 128;
+                bf16_half<N>(p, i, b, 0, c[bf16_sw(4 * lane)], c[bf16_sw(4 * lane + 1)], acc);
+                bf16_half<N>(p, i, b, 1, c[bf16_sw(4 * lane + 2)], c[bf16_sw(4 * lane + 3)], acc);
+            }
+        }
+        __syncwarp();
+    }
+    bf16_store<N>(p, r, i, lane, acc);
 }
 
 // Blocks of a row a lane of linear_mv_f32 loads before it sums them (32 float4s).
@@ -1442,6 +1580,18 @@ int launch_linear(const A & a, cudaStream_t st) {
             } else {
                 launch_pdl(linear_mv_q4k<8>, grid, 128,0, st, p);
             }
+        }
+    } else if (p.n <= 8 && wt == T_BF16 && a.params[2] && x16 && a.params[6] == 1) {
+        // params[2]: the GB10 kernels with their GEMV; params[6] (ops::bf16_gemv): the BF16 GEMV
+        const dim3 grid((unsigned) ((p.m + 3) / 4), (unsigned) p.h);
+        if (p.n == 1) {
+            launch_pdl(linear_mv_bf16<1, Bf16U<1>::v>, grid, 128,0, st, p);
+        } else if (p.n == 2) {
+            launch_pdl(linear_mv_bf16<2, Bf16U<2>::v>, grid, 128,0, st, p);
+        } else if (p.n <= 4) {
+            launch_pdl(linear_mv_bf16<4, Bf16U<4>::v>, grid, 128,0, st, p);
+        } else {
+            launch_pdl(linear_mv_bf16<8, Bf16U<8>::v>, grid, 128,0, st, p);
         }
     } else if (p.n <= 8 && wt == T_Q5_K) {
         const dim3 grid((unsigned) ((p.m + 3) / 4), (unsigned) p.h);

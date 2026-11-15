@@ -9,7 +9,7 @@
 //! ([`cuda`]). Formulas follow llama.cpp's `src/models/glm5-next.cpp` (MIT) unless a doc says
 //! otherwise.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::ggml::{Context, ExternalOp, Tensor, external_params, ffi, types};
 
@@ -213,6 +213,7 @@ pub fn linear_io<'a>(
             xh.is_some() as i32,
             kernel.param(),
             out_f16 as i32,
+            bf16_gemv() as i32,
         ],
     )
 }
@@ -340,6 +341,43 @@ static GB10_GEMV: AtomicBool = AtomicBool::new(true);
 /// The same bits either way.
 pub fn set_gb10_gemv(on: bool) {
     GB10_GEMV.store(on, Ordering::Relaxed);
+}
+
+/// [`bf16_gemv`] before the first read: the environment's choice.
+const BF16_GEMV_UNSET: u8 = u8::MAX;
+
+static BF16_GEMV: AtomicU8 = AtomicU8::new(BF16_GEMV_UNSET);
+
+/// The BF16 decode GEMV of [`set_gb10_gemv`]'s steps (8 tokens or fewer, BF16 weights, the
+/// node's `params[6]`; #560 r6): 0 linear_mv, 1 linear_mv_bf16 (the default: the warp's weight
+/// bytes loaded contiguously a few steps ahead and handed to the summing lane through shared
+/// memory, x in float4s). Every lane sums the same values in the same order in both: the same
+/// bits. `LEGION_DEBUG_GLM_BF16_GEMV=0` takes linear_mv back for A/B runs.
+pub fn bf16_gemv() -> u8 {
+    let v = BF16_GEMV.load(Ordering::Relaxed);
+    if v != BF16_GEMV_UNSET {
+        return v;
+    }
+    let v = bf16_gemv_of(std::env::var("LEGION_DEBUG_GLM_BF16_GEMV").ok().as_deref());
+    BF16_GEMV.store(v, Ordering::Relaxed);
+    v
+}
+
+/// [`bf16_gemv`] given the environment's value.
+pub(crate) fn bf16_gemv_of(env: Option<&str>) -> u8 {
+    match env.map(str::trim) {
+        Some("0") => 0,
+        Some("1") => 1,
+        _ => BF16_GEMV_DEFAULT,
+    }
+}
+
+/// [`bf16_gemv`]'s default.
+pub(crate) const BF16_GEMV_DEFAULT: u8 = 1;
+
+/// Sets [`bf16_gemv`] for [`linear`]s built from now on (`legion lin-bench --gemv`).
+pub fn set_bf16_gemv(v: u8) {
+    BF16_GEMV.store(v.min(1), Ordering::Relaxed);
 }
 
 /// `x` (F32, contiguous) rounded to BF16 (to nearest, ties to even, as ggml's

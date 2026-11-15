@@ -478,7 +478,11 @@ fn row_scaled_fp8_runs_like_its_bf16_dequant() {
     let dir = tempfile::tempdir().unwrap();
     let src = checkpoint(dir.path());
     let raw = GgufFile::open(dir.path()).unwrap();
-    let bf16 = GgufFile::open_with(dir.path(), &OpenOptions { fp8: Fp8Mode::Bf16 }).unwrap();
+    let opts = OpenOptions {
+        fp8: Fp8Mode::Bf16,
+        ..Default::default()
+    };
+    let bf16 = GgufFile::open_with(dir.path(), &opts).unwrap();
     assert!(bf16.get("legion.tensor_extra.fp8_e4m3").is_none());
 
     let backend = Backend::cpu().unwrap();

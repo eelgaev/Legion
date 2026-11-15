@@ -29,7 +29,10 @@ pub struct ModelFacts {
 /// Opens checkpoint metadata only. This never maps tensor data or runs a device workload; the
 /// layer split is the load's ([`LoadReport::stages`]), not guessed here.
 pub fn inspect(cfg: &LmConfig) -> Result<ModelFacts, LoadError> {
-    let hf = crate::hf::OpenOptions { fp8: cfg.hf_fp8 };
+    let hf = crate::hf::OpenOptions {
+        fp8: cfg.hf_fp8,
+        ..Default::default()
+    };
     let gguf = GgufFile::open_with(&cfg.model_path, &hf)?;
     let hp = Hparams::from_gguf(&gguf)?;
     let mut quantization = BTreeMap::<String, u64>::new();

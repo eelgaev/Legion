@@ -897,6 +897,7 @@ fn mtp_head_opens_as_shipped() {
     let c = checkpoint(dir.path(), SHUFFLED);
     let opts = legion::hf::OpenOptions {
         fp8: Default::default(),
+        ..Default::default()
     };
     let g = legion::hf::open_mtp(dir.path(), &opts).unwrap();
     let n = LAYERS.len();
@@ -986,6 +987,7 @@ fn mtp_head_fp8_experts_match_their_dequantized_twin() {
     use legion::model::core::{Executor, Group, Logits, SeqInput};
     let opts = legion::hf::OpenOptions {
         fp8: Default::default(),
+        ..Default::default()
     };
     fn group<'a>(tokens: &'a [u32], logits: Logits) -> Group<'a> {
         Group {

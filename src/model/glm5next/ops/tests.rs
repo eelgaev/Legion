@@ -743,6 +743,16 @@ fn gb10_kernels_keep_the_plain_gemv_when_asked() {
 }
 
 #[test]
+fn bf16_gemv_takes_the_debug_switch() {
+    assert_eq!(bf16_gemv_of(None), BF16_GEMV_DEFAULT);
+    assert_eq!(bf16_gemv_of(Some("0")), 0);
+    assert_eq!(bf16_gemv_of(Some(" 0\n")), 0);
+    assert_eq!(bf16_gemv_of(Some("1")), 1);
+    assert_eq!(bf16_gemv_of(Some("2")), BF16_GEMV_DEFAULT);
+    assert_eq!(bf16_gemv_of(Some("7")), BF16_GEMV_DEFAULT);
+}
+
+#[test]
 fn wf16_rounds_q6k_values_like_ggml() {
     let (k, m, h) = (512usize, 3usize, 2usize);
     let w = noise(k * m * h, 43)
