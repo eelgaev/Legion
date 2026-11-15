@@ -290,6 +290,16 @@ pub fn all_gather<'a>(ctx: &'a Context, comm: i32, x: Tensor<'a>, cols: i64) -> 
     ctx.external_with(&ALL_GATHER, types::F32, [row, cols, 1, 1], &[x], &[comm])
 }
 
+/// [`all_gather`] of I32 columns (#560 r9: the sparse attention's selection rows of every
+/// rank's share of the tokens), copied exactly: 4 bytes a value on the wire whatever
+/// `--tp-wire` says. `x` is I32 `[row, share]`; returns I32 `[row, cols]`.
+pub fn all_gather_i32<'a>(ctx: &'a Context, comm: i32, x: Tensor<'a>, cols: i64) -> Tensor<'a> {
+    assert_eq!(x.ty(), types::I32, "tp all-gather: I32");
+    let row = x.ne()[0];
+    let x = if x.is_contiguous() { x } else { ctx.cont(x) };
+    ctx.external_with(&ALL_GATHER, types::I32, [row, cols, 1, 1], &[x], &[comm])
+}
+
 /// [`all_gather`] as BF16, where the columns travel in BF16 (`--tp-wire bf16` at this size,
 /// so they are BF16 values already, this rank's own rounded too): the same values at half the
 /// bytes, copied from the wire buffers as they are (#1176). `None` with F32 on the wire.
@@ -354,6 +364,10 @@ unsafe fn cpu_all_gather(dst: &ffi::ggml_tensor, ith: usize, _nth: usize) {
         // SAFETY: a node of `all_gather_bf16`.
         return unsafe { cpu_all_gather_bf16(dst) };
     }
+    if dst.type_ == types::I32 {
+        // SAFETY: a node of `all_gather_i32`.
+        return unsafe { cpu_all_gather_i32(dst) };
+    }
     // SAFETY: a node of `all_gather`.
     let (src, out, row) = unsafe { host_io(dst) };
     match super::comm(external_params(dst)[0]) {
@@ -390,5 +404,29 @@ unsafe fn cpu_all_gather_bf16(dst: &ffi::ggml_tensor) {
     }
     for (o, v) in out.iter_mut().zip(all) {
         *o = super::comm::bf16_bits(v);
+    }
+}
+
+/// [`cpu_all_gather`] of an [`all_gather_i32`] node.
+///
+/// # Safety
+/// A node of [`all_gather_i32`] on the CPU.
+unsafe fn cpu_all_gather_i32(dst: &ffi::ggml_tensor) {
+    // SAFETY: the caller's: a contiguous I32 source and output with host data.
+    let (src, out) = unsafe {
+        let src = &*dst.src[0];
+        (
+            std::slice::from_raw_parts(src.data as *const i32, ffi::ggml_nelements(src) as usize),
+            std::slice::from_raw_parts_mut(dst.data as *mut i32, ffi::ggml_nelements(dst) as usize),
+        )
+    };
+    match super::comm(external_params(dst)[0]) {
+        Some(c) => {
+            let _ = c.all_gather_host_i32(src, out, dst.ne[0] as usize);
+        }
+        None => {
+            tracing::error!("tp all-gather: the communicator is gone");
+            out.fill(0);
+        }
     }
 }

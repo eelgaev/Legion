@@ -413,10 +413,13 @@ pub(super) mod cuda {
                 }
             })
             .collect();
+        // An I32 all-gather (`seq_par::all_gather_i32`) copies its 4-byte values as they are:
+        // the F32 wire's plain copies, whatever `--tp-wire` says.
+        let exact = kind == Kind::AllGather && dst.type_ == crate::ggml::types::I32;
         Plan {
             kind,
             span: full,
-            wire: comm.wire(full),
+            wire: if exact { Wire::F32 } else { comm.wire(full) },
             pieces,
             pack_whole: true,
             out_bf16: kind == Kind::AllGather && dst.type_ == crate::ggml::types::BF16,

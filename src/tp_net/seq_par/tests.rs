@@ -232,6 +232,56 @@ fn the_graph_ops_scatter_and_gather_on_the_cpu() {
 }
 
 #[test]
+fn an_i32_gather_copies_exactly_on_the_bf16_wire() {
+    // #560 r9: the selection rows travel as they are, though every F32 exchange of the size
+    // would be rounded to BF16; uneven shares, as the host call and as the graph op.
+    let (row, cols) = (3usize, 7usize);
+    let ints = move |r: usize| -> Vec<i32> {
+        (0..row * cols)
+            .map(|i| match i % 4 {
+                0 => -1,
+                1 => i32::MAX - (i + r) as i32,
+                2 => 123_456_789 + (i * 10 + r) as i32,
+                _ => i32::MIN + i as i32,
+            })
+            .collect()
+    };
+    let got = on_ranks(2, Wire::Bf16, move |r, c| {
+        let (a, m) = share(cols, r, 2);
+        let mine = ints(r)[a * row..(a + m) * row].to_vec();
+        let mut host = vec![0i32; row * cols];
+        c.all_gather_host_i32(&mine, &mut host, row).unwrap();
+        let handle = register(c);
+        let mut backend = Backend::cpu().unwrap();
+        backend.set_threads(3);
+        let ctx = Context::new(16, 16);
+        let x = ctx
+            .new_tensor(types::I32, &[row as i64, m as i64])
+            .as_input();
+        let y = all_gather_i32(&ctx, handle.id(), x, cols as i64).as_output();
+        let mut graph = ctx.new_graph(16);
+        graph.expand(y);
+        ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+            .unwrap();
+        x.set_i32(&mine);
+        backend.compute(&graph).unwrap();
+        assert!(handle.comm().error().is_none());
+        (host, y.ty(), y.to_i32())
+    });
+    let want: Vec<i32> = (0..2)
+        .flat_map(|r| {
+            let (a, m) = share(cols, r, 2);
+            ints(r)[a * row..(a + m) * row].to_vec()
+        })
+        .collect();
+    for (r, (host, ty, op)) in got.into_iter().enumerate() {
+        assert_eq!(host, want, "host, rank {r}");
+        assert_eq!(ty, types::I32, "rank {r}");
+        assert_eq!(op, want, "op, rank {r}");
+    }
+}
+
+#[test]
 fn off_unless_set_and_big_enough() {
     let got = on_ranks(2, Wire::F32, |_, c| {
         let handle = register(c.clone());
