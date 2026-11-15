@@ -20,8 +20,8 @@ is no other choice (ggml provides the quantized kernels underneath).
   MoEs such as [Nemotron3.5-30B-A3B](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16),
   [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) and [Gemma4-26B-A4B](https://huggingface.co/google/gemma-4-26B-A4B-it).
 - **Hardware.** Built for unified memory: very good support for the IBM AC922 (V100
-  over NVLink 2.0 + ATS) and the DGX Spark (GB10). Models bigger than VRAM keep their
-  experts in host memory, read in place or cached in VRAM by heat. Minimum GPU: sm_70 (Volta).
+  over NVLink 2.0 + ATS) and the DGX Spark (GB10). Gaming PCs with one RTX card too: a MoE
+  much bigger than VRAM keeps its experts in RAM, the hot ones cached in VRAM by heat. Minimum GPU: sm_70 (Volta).
 - **Formats.** GGUF, and Hugging Face safetensors as shipped (BF16, FP8, NVFP4 and more), with no
   conversion step. See [GGUF and safetensors, one engine](#gguf-and-safetensors-one-engine).
 - **One user or many.** Fast single-stream decode with speculative decoding (MTP, n-gram, draft
@@ -75,13 +75,14 @@ and 16 users: per request at 1 user, the total over all requests at 4 and 16. **
 32K or 123K tokens, in tokens per second. With drafting (MTP, DFlash 2) the 1-user speed
 depends on the prompt: a range such as 23-51 is the slowest to the fastest of the fixed benchmark prompts (prose,
 code, lists, chats), from the 2026-11-03 runs. `—`: not measured or did not finish (see the notes). **Bold**: Legion beats the other engine on the same machine with the same kind of weights (llama.cpp or Project Maya for GGUF,
-vLLM for NVFP4; at 1 user by median). Legion's greedy output is identical to the run without the opt-in flags unless a note
+vLLM for NVFP4, Strata on gaming PCs; at 1 user by median). Legion's greedy output is identical to the run without the opt-in flags unless a note
 says otherwise. Every command, Legion's and the other engines', is
 in [Run commands](#run-commands).
 
 Engines: Legion `main`; llama.cpp b12062 (`29c720e`, 2026-11-02, stock build); vLLM 0.33.0 (DGX Spark only; vLLM does not
 support the V100); [Project Maya](https://github.com/mw00/project-maya) v1.1.51, the engine the Maya-S GGUFs are made
-for (AC922, Maya-S only, its recommended setup: one sequence, its own MTP drafting). All with 16 sequences (`--max-seqs 16`, `-np 16 -kvu`, `--max-num-seqs 16`) and prefix caching
+for (AC922, Maya-S only, its recommended setup: one sequence, its own MTP drafting); [Strata](https://github.com/Niko1221/Strata)
+v0.2.13.1 (`628f749`, gaming PCs only, its recommended setup). All with 16 sequences (`--max-seqs 16`, `-np 16 -kvu`, `--max-num-seqs 16`) and prefix caching
 off. llama.cpp runs across two DGX Sparks with its RPC backend (layer split).
 
 ### Qwen3.8-Flash-Next
@@ -100,6 +101,12 @@ off. llama.cpp runs across two DGX Sparks with its RPC backend (layer split).
 | AC922, 2x V100 | llama.cpp b12062 | UD-Q4_K_XL GGUF | MTP ⁸ | 11-13 | 7.3 | — | 120 | — | — |
 | AC922, 4x V100 | Legion | UD-Q4_K_XL GGUF | MTP ⁷ | **79-101** | 118.6 | 136.2 | 4,370 | 6,316 | 8,050 |
 | AC922, 4x V100 | llama.cpp b12062 | UD-Q4_K_XL GGUF | MTP ⁸ | 6-9 | — | — | — | — | — |
+| RTX 4090, 128 GB DDR5-4800 | Legion | UD-Q4_K_XL GGUF | none ¹⁷ | 60-61 | — | — | 2,709 | 4,616 | — |
+| RTX 4090, 128 GB DDR5-4800 | Strata v0.2.13.1 | UD-Q4_K_XL GGUF | its own ¹⁸ | 61-64 | — | — | 2,788 | 5,245 | — |
+| RTX 4090, 64 GB DDR5-4800 | Legion | UD-Q4_K_XL GGUF | none ¹⁷ | **46-49** | — | — | **1,660** | **2,336** | — |
+| RTX 4090, 64 GB DDR5-4800 | Strata v0.2.13.1 | UD-Q4_K_XL GGUF | its own ¹⁸ | 38-44 | — | — | 1,377 | 2,109 | — |
+| RTX 4090, 32 GB DDR5-4800 | Legion | UD-Q4_K_XL GGUF | none ¹⁷ | **24-26** | — | — | **888** | **1,215** | — |
+| RTX 4090, 32 GB DDR5-4800 | Strata v0.2.13.1 | UD-Q4_K_XL GGUF | its own ¹⁸ | 16-21 | — | — | 616 | 836 | — |
 
 ### Qwen3.8-27B
 
@@ -172,7 +179,16 @@ off. llama.cpp runs across two DGX Sparks with its RPC backend (layer split).
 
 ¹⁶ The 123K request (about 86K GLM tokens) does not fit the run command's 64K context (`-c 65536`, shared by 16 sequences).
 
-Measured 2026-10-20 to 2026-11-12. Each new speed record is added here.
+¹⁷ One RTX 4090 (24 GB, PCIe 4.0, a desktop session using 1.2 GB of it), a Ryzen 9 7950X3D and DDR5-4800 RAM. The experts that do not fit
+VRAM stay in RAM, and with the opt-in `--cpu-expert-share auto` the CPU computes part of the RAM misses with the GPU's
+bits (same output). 4 sequences (`--max-seqs 4`). 64 and 32 GB: the same PC under a memory limit with no swap. Decode is three single-user chats
+right after the load, not the fixed benchmark prompts; prefill is one request each, tok/s to the first token. 4 and
+16 users and 123K were not measured.
+
+¹⁸ Strata's own speculative decoding (`--spec 4`) and int8 KV; its output differs from Legion's. 64 and 32 GB with
+`--resident-budget-gib 40` and `8` (see the run command).
+
+Measured 2026-10-20 to 2026-11-15. Each new speed record is added here.
 
 ## Roadmap
 
@@ -183,10 +199,9 @@ Measured 2026-10-20 to 2026-11-12. Each new speed record is added here.
 
 **Hardware**, after the AC922 and the DGX Spark, in this order:
 
-1. **Gaming PCs with MoE streaming.** RTX 30/40/50 cards with 16-32 GB of VRAM on PCIe. MoE models
-   much larger than VRAM: the hot experts stay cached in VRAM, the rest are read from host RAM or
-   straight from an NVMe SSD, and the next layers' experts are prefetched while the current
-   layer runs.
+1. **Gaming PCs with MoE streaming** (started: the RTX 4090 rows above). RTX 30/40/50 cards with 16-32 GB of
+   VRAM on PCIe. MoE models much larger than VRAM: the hot experts stay cached in VRAM, the rest are read from host
+   RAM or straight from an NVMe SSD, and the next layers' experts are prefetched while the current layer runs.
 2. **Grace Hopper (GH200).** H100/H200 behind NVLink-C2C to the Grace CPU, unified memory like the
    AC922 and the Spark but much faster, so host-resident experts cost far less.
 3. **Grace Blackwell (GB200 / GB300).** Blackwell GPUs with Grace over NVLink-C2C, native NVFP4
@@ -219,6 +234,10 @@ The exact `legion serve` command behind every row of the tables, and how it was 
 - [GLM-5.3-Flash UD-Q4_K_XL, 4x V100 SXM2 16 GB](docs/run/ac922/glm-53-flash-ud-q4-k-xl-4x.md)
 - [Gemma 4 31B QAT UD-Q4_K_XL, 2x V100 SXM2 16 GB](docs/run/ac922/gemma-4-31b-qat-ud-q4-k-xl-2x.md)
 - [Qwen3.8-27B UD-Q4_K_XL, 2x V100 SXM2 16 GB](docs/run/ac922/qwen38-27b-ud-q4-k-xl-2x.md)
+
+**Gaming PCs**
+
+- [Qwen3.8-Flash-Next UD-Q4_K_XL, RTX 4090 + Ryzen 9 7950X3D, 128 / 64 / 32 GB DDR5-4800](docs/run/gaming-pc/qwen38-flash-next-ud-q4-k-xl-rtx4090.md)
 
 ## Build
 
@@ -265,7 +284,7 @@ The equivalent environment variables are `LEGION_TLS_CERT` and `LEGION_TLS_KEY`.
 
 ## Docs
 
-- [docs/run](docs/run/README.md): the command lines behind the performance tables, one page per model and machine (DGX Spark, IBM AC922)
+- [docs/run](docs/run/README.md): the command lines behind the performance tables, one page per model and machine (DGX Spark, IBM AC922, gaming PCs)
 - [docs/ac922.md](docs/ac922.md): running on the IBM AC922: RHEL 8, NVLink 2.0, the kernel and driver it needs (550.54.15, the power9-nvidia-nvlink2 patches), gcc-toolset-12, build and run
 - [docs/serving.md](docs/serving.md): guide to running the server and connecting clients
 - [docs/clients.md](docs/clients.md): curl, open-webui, openai-python, anthropic-python and Claude Code against `legion serve`
