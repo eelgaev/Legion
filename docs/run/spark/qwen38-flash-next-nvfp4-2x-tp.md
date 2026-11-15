@@ -4,8 +4,8 @@
 
 `--model` is the downloaded snapshot of `nvidia/Qwen3.8-Flash-Next-NVFP4` on each Spark. One process per Spark.
 Rank 0 serves HTTP; `--tp-peers` lists the two ranks' addresses on the QSFP link (rank 0 first) and is the same on
-both. MTP uses the checkpoint's own head, so there is no `--spec-draft` file. Decode (39-52 tok/s at 1 user, 113.7 at 4,
-240.5 at 16) and prefill (2,990 / 3,122 / 2,956 tok/s at 8K / 32K / 123K):
+both. MTP uses the checkpoint's own head, so there is no `--spec-draft` file. Decode (44-58 tok/s at 1 user, 121.8 at 4,
+248.6 at 16; deterministic client) and prefill (3,469 / 3,380 / 3,127 tok/s at 8K / 32K / 123K):
 
 ```sh
 # rank 0
@@ -33,6 +33,7 @@ legion serve \
   --tp-moe-ep \
   --prefill-slots 16 \
   --tp-rails 2 \
+  --tp-head-split \
   --tp-rank 0 \
   --tp-peers <rank0-ip>:7619,<rank1-ip>:7619
 # rank 1: the same without --port, with --tp-rank 1
@@ -41,6 +42,17 @@ legion serve \
 Measured against vLLM 0.33.0 with tensor parallel 2, MTP and CUDA graphs on the same two Sparks (2026-11-04:
 43-58 / 116.8 / 248.5 tok/s decode, 3,174 / 3,257 / 3,135 tok/s prefill); its command is in
 [other engines](../other-engines.md).
+
+Optional, for many users: `--tp-commit-in-verify-min-seqs 8` on both ranks. After a verify step of 8 or more
+sequences, each rank advances its gated DeltaNet states inside the next verify step instead of in a commit of its
+own, so the states go through memory once less per round. 16 users: 248.2 -> 256.3 tok/s (median of 6 rounds
+each from one binary, three sessions in alternating order; every round is above the round without the flag at the
+same place of its session, +3.7% on average, while the rounds' ranges, 243-255 and 252-265, still overlap), same
+output. Steps of fewer sequences run as without the flag (1 and 4 users: 49.2 -> 49.9 and 120.7 -> 122.6, inside
+what the rounds spread), so the numbers above are without it. `--gdn-state-defer --gdn-state-defer-min-seqs 8` on
+top (such steps also leave the states unwritten while the stored tokens have room) reads 257.0 at 16 users (rounds
+256-268, 1 and 4 users 49.4 and 120.7), same output: about 1 ms less per verify step, which these rounds cannot
+tell from the flag alone.
 
 ## What each flag does
 
@@ -78,5 +90,10 @@ Measured against vLLM 0.33.0 with tensor parallel 2, MTP and CUDA graphs on the 
   `2`, prompt-step sums of at least 1 MiB go in 1 MiB pieces over both devices instead of only the one on the
   `--tp-peers` address (the second needs no IP address). Prefill +2% (2,523 / 2,609 / 2,506 tok/s before);
   decode steps stay on the first device, and the same bytes arrive, so output does not change.
+- `--tp-head-split`: The output head reads its whole weight every step (1.27 GB here) and only rank 0 ran it. With
+  this, a greedy decode or verify step computes it as two halves of the vocabulary, one on each Spark, and rank 0
+  keeps the better of the two candidates per row. Same output (the pick and its tie order are the whole head's).
+  Decode 41-53 / 116.4 / 242.8 -> 44-58 / 121.8 / 248.6 tok/s at 1 / 4 / 16 users in the same sessions; prefill
+  unchanged. Requests with sampling, log probabilities or `min_tokens` keep the whole head on rank 0.
 - `--tp-rank` (`0`): This process's rank in tensor parallelism across machines (one process per DGX Spark). Rank 0 serves HTTP.
 - `--tp-peers`: Every rank's `ip:port` on the QSFP link, in rank order, identical on all ranks.

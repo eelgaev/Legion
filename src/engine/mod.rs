@@ -365,4 +365,9 @@ pub trait Engine: Send + Sync + 'static {
     fn replica_stats(&self) -> Vec<replicas::ReplicaStats> {
         Vec::new()
     }
+
+    /// The server's startup warmup prompts begin (`true`) or are over (`false`). An engine
+    /// that learns from what its requests route to may leave the warmup's synthetic prompts
+    /// out; the others ignore it.
+    fn set_warming(&self, _on: bool) {}
 }

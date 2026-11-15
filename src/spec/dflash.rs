@@ -579,7 +579,17 @@ impl DflashDrafter {
         let take: Vec<usize> = (0..batch.len()).filter(|&i| batch[i].ran > 0).collect();
         let rows: usize = take.iter().map(|&i| batch[i].ran).sum();
         let window = self.model.window;
-        if take.len() < 2 || rows > INGEST_CHUNK || take.iter().any(|&i| batch[i].ran > window) {
+        // One sequence goes this way only when `ingest` would take in all its rows in one
+        // piece (a decode step's): then the graph is `ingest`'s, started without waiting.
+        let alone = match take.as_slice() {
+            [] => true,
+            &[i] => {
+                let r = &batch[i];
+                ingest_from(r.tokens.len(), r.start, r.ran, window) != 0
+            }
+            _ => false,
+        };
+        if alone || rows > INGEST_CHUNK || take.iter().any(|&i| batch[i].ran > window) {
             return take
                 .into_iter()
                 .try_for_each(|i| self.ingest(&batch[i], i, src));
@@ -630,12 +640,13 @@ impl DflashDrafter {
     /// [`ModelDrafter::step`] with the step's rows where `src` says.
     fn step_from(&mut self, batch: &mut [DraftRequest<'_>], src: Src<'_>) -> Result<(), String> {
         // DFlash 2 runs the same block length for every sequence: several sequences share one
-        // take-in graph and one draft pass, which read the drafter's weights once.
+        // take-in graph and one draft pass, which read the drafter's weights once. One sequence
+        // goes the same way, so that its draft pass is built while its take-in runs.
         let asking = batch
             .iter()
             .filter(|r| r.max > 0 && !r.tokens.is_empty())
             .count();
-        if self.model.selector().is_some() && asking > 1 {
+        if self.model.selector().is_some() && asking > 0 {
             for r in batch.iter() {
                 self.cache_for(r.seq)?;
             }

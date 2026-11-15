@@ -58,6 +58,11 @@ pub(super) const MARK: usize = usize::MAX;
 pub(super) const CACHED_MARK: usize = 1;
 pub(super) const PIECE_MARK: usize = 0;
 
+/// A call instead of a copy: `(CALL, arg, 0)` runs the staging's hook ([`Staging::set_hook`])
+/// with `arg` on the copy stream, between the copies before and after it (the bounded host
+/// tier's reads into the pinned places a pass copies from, [`super::host_tier`]).
+pub(super) const CALL: usize = usize::MAX - 1;
+
 /// A row's split waits, from the marks of its last queued plan.
 #[derive(Default)]
 struct Split {
@@ -92,6 +97,8 @@ struct Core {
     /// The idle peer's copies ([`Staging::peer`]), and whether this pass uses it.
     peer: Option<PeerPuller>,
     help: bool,
+    /// What the plans' [`CALL`]s run.
+    hook: Option<super::cuda::StreamCall>,
     /// Since the last [`Staging::take_stats`].
     stats: StageStats,
 }
@@ -120,7 +127,7 @@ impl Core {
         self.queued += 1;
         let t0 = std::time::Instant::now();
         self.stats.rows += 1;
-        self.stats.copies += copies.iter().filter(|c| c.0 != MARK).count() as u64;
+        self.stats.copies += copies.iter().filter(|c| c.0 != MARK && c.0 != CALL).count() as u64;
         let r = self.rows[*row].as_mut().expect("planned rows stage");
         let s = &mut r.split;
         s.marked = false;
@@ -133,6 +140,11 @@ impl Core {
         }
         let (mut own, mut theirs, mut pending) = (0usize, 0usize, false);
         for &(dst, src, n) in copies {
+            if dst == CALL {
+                let hook = self.hook.clone().ok_or("a staging call without a hook")?;
+                self.copier.call(hook, src)?;
+                continue;
+            }
             if dst == MARK {
                 if let (Some(p), true) = (peer.as_mut(), pending) {
                     p.join(&mut self.copier)?;
@@ -270,6 +282,7 @@ impl Staging {
             missed: 0,
             peer,
             help: false,
+            hook: None,
             stats: StageStats::default(),
         }));
         let id = {
@@ -343,6 +356,21 @@ impl Staging {
             unsafe { c.copier.zero(at, n)? };
         }
         Ok(())
+    }
+
+    /// Waits for the copies queued so far, then sets what the next passes' [`CALL`]s run.
+    /// The copies of a pass wait for its layers' matmuls, so the pass before must have been
+    /// started on its stream.
+    pub fn set_hook(&mut self, hook: super::cuda::StreamCall) -> Result<(), String> {
+        let mut c = self.core.lock().unwrap();
+        c.copier.sync()?;
+        c.hook = Some(hook);
+        Ok(())
+    }
+
+    /// Waits for the copies queued so far (see [`Self::set_hook`]).
+    pub fn sync(&mut self) -> Result<(), String> {
+        self.core.lock().unwrap().copier.sync()
     }
 
     /// Kind `k`'s buffer for `row`.

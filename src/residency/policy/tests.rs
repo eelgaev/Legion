@@ -319,6 +319,47 @@ fn budgeted_ranking_matches_with_ties_and_odd_heats() {
     }
 }
 
+/// Host experts at or below the margin are left out of the ranking when no slot is empty:
+/// across margins (negative, zero, between heats, above most of them), ratios and full or
+/// partly empty layers, the plan is still the full sort's.
+#[test]
+fn margin_floor_plans_the_full_sorts_swaps() {
+    let vals = [0.0, 0.3, 0.5, 1.0, 1.5, 1.5, 2.0, 3.0, 4.5, 9.0, f32::NAN];
+    for margin in [-1.0, 0.0, 0.5, 1.5, 3.0, 20.0] {
+        for ratio in [0.0, 0.25] {
+            for budget in [1, 6, 48] {
+                let rule = SwapRule {
+                    budget,
+                    margin,
+                    ratio,
+                };
+                for seed in 0..40u64 {
+                    // Every fourth layer keeps two slots empty.
+                    let held = if seed % 4 == 0 { 28 } else { 30 };
+                    let mut l = LayerSlots::new(80, 30);
+                    l.fill(
+                        &(0..held)
+                            .map(|e| (e * 11 + seed as u32) % 80)
+                            .collect::<Vec<_>>(),
+                    );
+                    for (e, h) in l.heat.iter_mut().enumerate() {
+                        *h = vals[(e * 13 + seed as usize * 7) % vals.len()];
+                    }
+                    let mut a = [l.clone()];
+                    let mut b = [l];
+                    let mut va: Vec<Option<&mut LayerSlots>> = a.iter_mut().map(Some).collect();
+                    let got = plan_swaps(&mut va, rule);
+                    assert_eq!(
+                        got,
+                        full_sort_plan(&mut b, rule),
+                        "margin {margin} ratio {ratio} budget {budget} seed {seed}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn clear_from_keeps_the_first_slots() {
     let mut l = LayerSlots::new(8, 4);
@@ -679,6 +720,32 @@ fn per_device_budget_overrides_only_the_devices_it_names() {
 }
 
 #[test]
+fn layers_left_coldest_takes_the_candidates_of_least_heat_until_the_need() {
+    let lent = [Some(100), None, Some(100), Some(50), None, Some(60)];
+    let heat = [1.0, 0.0, 5.0, 9.0, 0.0, 7.0];
+    // The coldest candidate covers it: layer 0, though it is the first.
+    assert_eq!(
+        layers_left_coldest(&lent, &heat, 100),
+        vec![true, false, false, false, false, false]
+    );
+    // Then the next coldest (layer 2); never a layer that is not a candidate.
+    assert_eq!(
+        layers_left_coldest(&lent, &heat, 150),
+        vec![true, false, true, false, false, false]
+    );
+    // Equal heat: the later layer first, as `layers_left_for`.
+    assert_eq!(
+        layers_left_coldest(&lent, &[0.0; 6], 100),
+        layers_left_for(&lent, 100)
+    );
+    assert_eq!(layers_left_coldest(&lent, &heat, 0), vec![false; 6]);
+    assert_eq!(
+        layers_left_coldest(&lent, &heat, 10_000),
+        vec![true, false, true, true, false, true]
+    );
+}
+
+#[test]
 fn layers_left_for_takes_the_last_candidates_until_the_need() {
     let lent = [Some(100), None, Some(100), Some(50), None, Some(60)];
     // From the last one down: 60, then 50 (110 >= 100); the rest are refilled.
@@ -779,4 +846,82 @@ fn repeated_failures_without_a_drift_shrink_in_a_few_tries() {
         "{} MiB",
         bytes / MIB
     );
+}
+
+#[test]
+fn saved_heat_picks_the_contents_and_keeps_the_layer_sizes() {
+    let alloc = vec![vec![0, 1, 2], vec![0, 1], vec![], vec![0, 1, 2, 3]];
+    // Layer 1's ranking is longer than its slots, layer 3's shorter, layer 0 has none.
+    let order = vec![vec![], vec![7, 0, 5], vec![4], vec![9, 1]];
+    assert_eq!(
+        hottest_experts(&alloc, &order),
+        vec![vec![0, 1, 2], vec![7, 0], vec![], vec![9, 1, 0, 2]]
+    );
+    // A ranking of fewer layers leaves the others as they were.
+    assert_eq!(hottest_experts(&alloc, &order[..1]), alloc);
+}
+
+#[test]
+fn a_limit_empties_the_last_slots_and_keeps_them_empty() {
+    let mut l = LayerSlots::new(8, 4);
+    l.fill(&[0, 1, 2, 3]);
+    // Slots 2 and 3 lose their memory: their experts read from host memory.
+    assert_eq!(l.set_limit(2), vec![2, 3]);
+    assert_eq!(l.limit(), 2);
+    assert_eq!(l.table(), vec![0, 1, 6, 7, 8, 9, 10, 11]);
+    // Nothing takes them: neither a refill nor a swap, however hot the newcomer.
+    assert!(l.refill(&[5, 6]).is_empty());
+    l.record(&[4 + 7, 4 + 7, 4 + 7, 4 + 7, 4 + 7, 4 + 7, 4 + 7, 4 + 7]);
+    let swaps = plan_swaps(&mut [Some(&mut l)], SwapRule::default());
+    assert!(swaps.iter().all(|s| s.slot < 2), "{swaps:?}");
+    // A lend's clear and refill stay inside the limit too.
+    l.clear();
+    assert_eq!(l.refill(&[7, 6, 5]).len(), 2);
+    // The memory is back: the slots fill again.
+    assert!(l.set_limit(4).is_empty());
+    assert_eq!(l.refill(&[5, 4]), vec![(2, 5), (3, 4)]);
+    // Never past the slots there are.
+    l.set_limit(99);
+    assert_eq!(l.limit(), 4);
+}
+
+#[test]
+fn even_cuts_take_a_slot_a_layer_from_the_last_one_down() {
+    const G: usize = 2 << 20;
+    // 3 MiB a slot in three kinds of 1 MiB. The first bytes of the first empty slot stay
+    // mapped (what a matmul reads behind the last slot in use): three slots free one granule
+    // a kind.
+    assert_eq!(expert_pad(144 * 8, 2048), 288);
+    assert_eq!(expert_pad(176 * 8, 2048), 352);
+    assert_eq!(expert_pad(24 * 64, 2048), 384);
+    assert_eq!(expert_pad(34 * 64, 2048), 544);
+    let b = [1 << 20; 3];
+    let p = [288, 288, 384];
+    assert_eq!(cut_bytes(&b, &p, 0, G), 0);
+    assert_eq!(cut_bytes(&b, &p, 1, G), 0);
+    assert_eq!(cut_bytes(&b, &p, 2, G), 0);
+    assert_eq!(cut_bytes(&b, &p, 3, G), 3 * G as u64);
+    assert_eq!(cut_bytes(&b, &p, 5, G), 6 * G as u64);
+    // Without the pad two slots are a granule.
+    assert_eq!(cut_bytes(&b, &[0; 3], 2, G), 3 * G as u64);
+    let layers = [Some((b, p, 4)), None, Some((b, p, 4)), Some((b, p, 1))];
+    assert_eq!(even_cuts(&layers, G, 0), Some(vec![0, 0, 0, 0]));
+    // Two slots each free nothing yet; the third round stops at the first layer that does
+    // (layer 3 may give one slot only).
+    assert_eq!(even_cuts(&layers, G, 1), Some(vec![2, 0, 3, 1]));
+    assert_eq!(
+        even_cuts(&layers, G, 3 * G as u64 + 1),
+        Some(vec![3, 0, 3, 1])
+    );
+    // All they may give: 4 + 4 slots free 6 granules (a fourth slot frees no whole granule
+    // more), layer 3's one slot none.
+    assert_eq!(even_cuts(&layers, G, 6 * G as u64), Some(vec![3, 0, 3, 1]));
+    assert_eq!(even_cuts(&layers, G, 6 * G as u64 + 1), None);
+    // No two layers differ by more than a slot.
+    let many = vec![Some((b, p, 50)); 48];
+    let cuts = even_cuts(&many, G, 960 << 20).unwrap();
+    let (lo, hi) = (cuts.iter().min().unwrap(), cuts.iter().max().unwrap());
+    assert!(hi - lo <= 1, "{cuts:?}");
+    let freed: u64 = cuts.iter().map(|&c| cut_bytes(&b, &p, c, G)).sum();
+    assert!(freed >= 960 << 20 && freed < (960 << 20) + 3 * G as u64);
 }

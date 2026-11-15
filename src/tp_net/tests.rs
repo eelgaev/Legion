@@ -611,10 +611,13 @@ fn shards_refuse_what_they_cannot_cut() {
     crate::model::gemma4::tiny::write(&moe, 5).unwrap();
     let e = refused(&GgufFile::open(&moe).unwrap(), 2);
     assert!(e.contains("experts"), "{e}");
+    // Dense qwen35 splits (`shard::qwen35`), three ranks not.
     let qwen = dir.path().join("qwen.gguf");
     crate::model::qwen35::tiny::write(&qwen, &Default::default()).unwrap();
-    let e = refused(&GgufFile::open(&qwen).unwrap(), 2);
-    assert!(e.contains("Gemma 4"), "{e}");
+    let qwen = GgufFile::open(&qwen).unwrap();
+    assert!(shard::view(&qwen, 1, 2).is_ok());
+    let e = refused(&qwen, 3);
+    assert!(e.contains("divide"), "{e}");
 }
 
 #[test]

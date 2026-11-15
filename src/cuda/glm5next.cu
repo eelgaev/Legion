@@ -4068,7 +4068,7 @@ __global__ void argmax_kernel(const A a) {
                 bi = is[w];
             }
         }
-        ((int32_t *) a.dst)[t] = (int32_t) bi;
+        ((int32_t *) a.dst)[t] = a.n_src > 1 ? ((const int32_t *) a.src[1])[bi] : (int32_t) bi;
     }
 }
 
@@ -4154,7 +4154,8 @@ __global__ void __launch_bounds__(32) argmax_fin_kernel(const A a) {
         }
     }
     if (c == 0) {
-        d[t] = (int32_t) bi;
+        // Over picked rows (ops::argmax_wide_ids, src 1: their token ids): the row's id.
+        d[t] = a.n_src > 1 ? ((const int32_t *) a.src[1])[bi] : (int32_t) bi;
     }
 }
 

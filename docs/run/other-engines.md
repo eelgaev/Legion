@@ -92,7 +92,7 @@ vllm serve RedHatAI/gemma-4-31B-it-NVFP4 --port 8090 \
 
 Legion: [1x DGX Spark](spark/qwen38-flash-next-ud-q4-k-xl-1x.md), [2x DGX Spark](spark/qwen38-flash-next-ud-q4-k-xl-2x-tp.md),
 [2x V100](ac922/qwen38-flash-next-ud-q4-k-xl-2x.md), [4x V100](ac922/qwen38-flash-next-ud-q4-k-xl-4x.md),
-[NVFP4](spark/qwen38-flash-next-nvfp4-1x.md), [NVFP4 2x DGX Spark](spark/qwen38-flash-next-nvfp4-2x-tp.md).
+[NVFP4](spark/qwen38-flash-next-nvfp4-1x.md), [NVFP4 2x DGX Spark](spark/qwen38-flash-next-nvfp4-2x-tp.md), [RTX 4090 gaming PC](gaming-pc/qwen38-flash-next-ud-q4-k-xl-rtx4090.md).
 
 llama.cpp, 1x DGX Spark. `--lazy-mode on` keeps the Engram table on the SSD (the default, `auto`, turns lazy loading
 off on the GB10 and the weights then do not fit). Adding the drafter (`-md mtp-Qwen3.8-Flash-Next-Q8_0.gguf
@@ -191,6 +191,19 @@ rpc-server -H <rpc-ip> -p 50052
 llama-server -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf --port 8090 --jinja \
   -ngl 99 -fa on -np 16 -kvu --no-cache-prompt -c 262144 --lazy-mode on --rpc <rpc-ip>:50052
 ```
+
+Strata v0.2.13.1 (`628f749`), RTX 4090 gaming PC, its recommended setup: an expert pack made from the same GGUF
+with its own tools, its routing profile, the expert cache and prefill picked by itself, its own speculative decoding
+and int8 KV. Served through its `serve.server` front end (`--engine strata`), the engine run as:
+
+```sh
+strata --pack ud-q4_k_xl --native Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+  --expert-profile expert-profile.bin --expert-cache auto --prefill auto \
+  --spec 4 --spec-min-p 0.5 --max-context 40960 --kv int8
+```
+
+128 GB with `STRATA_ROUTE_TAIL_SKIP=0` (its routing tail skip off). 64 and 32 GB under the same memory limits as
+Legion, with `--resident-budget-gib 40` and `--resident-budget-gib 8`. Measured 2026-11-14.
 
 ## GLM-5.3-Flash Maya-S v2
 

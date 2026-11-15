@@ -1319,14 +1319,39 @@ const ARGMAX_SPLIT: i64 = 32;
 /// values and indices. The same index as [`argmax`] for logits without NaNs (the first of the
 /// largest).
 pub fn argmax_wide<'a>(ctx: &'a Context, x: Tensor<'a>) -> Tensor<'a> {
+    argmax_wide_ids(ctx, x, None)
+}
+
+/// [`argmax_wide`] of logits over the rows `ids` (I32 `[v]`, ascending token ids: the MTP
+/// draft head's picked rows, #1172) where given: each column's pick is `ids[i]` for its largest
+/// entry `i` (the first of ties, so the lowest id, as over the whole vocabulary).
+pub fn argmax_wide_ids<'a>(ctx: &'a Context, x: Tensor<'a>, ids: Option<Tensor<'a>>) -> Tensor<'a> {
     let n = x.ne()[1];
-    let node = ctx.external_with(
-        &ARGMAX,
-        types::I32,
-        [n, 1 + 2 * ARGMAX_SPLIT, 1, 1],
-        &[contiguous(x)],
-        &[ARGMAX_SPLIT as i32],
-    );
+    let x = contiguous(x);
+    let node = match ids {
+        Some(ids) => {
+            assert!(
+                ids.ty() == types::I32 && ids.elements() as i64 == x.ne()[0],
+                "argmax ids: {:?} for {:?}",
+                ids.ne(),
+                x.ne()
+            );
+            ctx.external_with(
+                &ARGMAX,
+                types::I32,
+                [n, 1 + 2 * ARGMAX_SPLIT, 1, 1],
+                &[x, ids],
+                &[ARGMAX_SPLIT as i32],
+            )
+        }
+        None => ctx.external_with(
+            &ARGMAX,
+            types::I32,
+            [n, 1 + 2 * ARGMAX_SPLIT, 1, 1],
+            &[x],
+            &[ARGMAX_SPLIT as i32],
+        ),
+    };
     ctx.view_1d(node, n, 0)
 }
 
@@ -2275,7 +2300,12 @@ unsafe fn cpu_argmax(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
                     best = i;
                 }
             }
-            *out.add(t) = best as i32;
+            // Over picked rows (`argmax_wide_ids`): the row's token id.
+            *out.add(t) = if dst.src[1].is_null() {
+                best as i32
+            } else {
+                *((*dst.src[1]).data as *const i32).add(best)
+            };
         }
     }
 }

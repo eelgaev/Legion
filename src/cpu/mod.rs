@@ -26,6 +26,7 @@
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
 mod dispatch;
+pub mod gpu_exact;
 pub mod microbench;
 #[cfg(all(target_arch = "powerpc64", target_endian = "little"))]
 mod power;

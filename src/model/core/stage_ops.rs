@@ -99,6 +99,11 @@ pub(crate) const PURE: &[&str] = &[
     // device-global scratch, the grid from the device's occupancy (fixed per kernel).
     "nvfp4_once",
     "nvfp4_once_glu",
+    // GGUF-quantized matmuls of 2-8 tokens on a V100 (#1210): ggml's quantization into the
+    // node's own memory, then the matvec, one kernel each on the compute stream, picked by the
+    // weight's type, the column count and the variant fixed in the node at build time.
+    "q_small_m_quantize",
+    "q_small_m",
     // Paged attention and the KV writes.
     "paged_attn",
     "norm_rope",
@@ -109,6 +114,9 @@ pub(crate) const PURE: &[&str] = &[
     // heads' greedy argmax, a kernel picked by the row length (#827).
     "cluster_topk",
     "cluster_argmax",
+    // A split head's candidates (#1176): the split argmax's first kernel alone, its grid from
+    // the node's shape, written to the node's tensor.
+    "argmax_best",
 ];
 
 /// Pure ops captured in small steps only ([`crate::ggml::stage_graph::small_step`]: decode,
@@ -144,10 +152,11 @@ pub(crate) const SMALL: &[&str] = &[
 pub(crate) const SMALL_MM: &[&str] = &["nvfp4_mvq", "fp8_mm"];
 
 /// Pure ops captured only while [`set_commit_capture`] is on: a verify commit's conv window
-/// copy (`legion_spec_window_launch`, one kernel picked by the node's shape). Left out, it runs
-/// between captures, and since a commit graph alternates it with single `gdn` launches, no
-/// piece of the commit is captured at all.
-pub(crate) const COMMIT: &[&str] = &["spec_window"];
+/// copy (`legion_spec_window_launch`, one kernel picked by the node's shape) and its every-layer
+/// form (`spec_windows`, #689: the same kernel over a pointer table filled once, when the graph
+/// is allocated). Left out, they run between captures, and since a commit graph alternates them
+/// with single `gdn` launches, no piece of the commit is captured at all.
+pub(crate) const COMMIT: &[&str] = &["spec_window", "spec_windows"];
 
 /// See [`set_commit_capture`].
 static COMMIT_CAPTURE: AtomicBool = AtomicBool::new(false);

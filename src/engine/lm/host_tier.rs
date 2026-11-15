@@ -1,7 +1,12 @@
 //! The automatic KV host tier (#352): when a context does not fit in a discrete GPU's memory,
 //! the KV blocks past the device's go to pinned memory on the GPU's NUMA node instead of the
-//! load failing. Sized to what the context (or the automatic pool) needs, capped by what the
-//! nodes have free with a margin. `--kv-host-tokens` sets the tier by hand (0: none).
+//! load failing. Sized to what the context (or the automatic pool) needs, capped by a budget
+//! per node ([`node_budget`]): what the node has free with half its page cache, less a
+//! margin, and never more than half the node for all of this process's tiers together
+//! ([`Ledger`]). `--kv-host-tokens` sets the tier by hand (0: none).
+
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::model::core::KV_BLOCK;
 
@@ -9,6 +14,20 @@ use crate::model::core::KV_BLOCK;
 const MARGIN_MIN: u64 = 16 << 30;
 /// ... or this share of the node's memory, if more.
 const MARGIN_SHARE: f64 = 0.10;
+/// The share of a node's reclaimable page cache the tier counts as free (#1163). The kernel
+/// gives page cache back as the tier pins, but all at once on a node the process is bound to:
+/// two AC922 starts that counted 145 and 182 GiB of page cache as free froze the machine
+/// while pinning 223 and 228 GiB of a 255.5 GiB node.
+const CACHE_SHARE: f64 = 0.5;
+/// The most of a node's memory the KV host tiers of one process (every stage, rank and
+/// replica) pin together (#1163): pinned memory is never reclaimed or moved, so the other half
+/// stays for the weights' page cache, ring checkpoints, the driver and the system.
+const NODE_SHARE: f64 = 0.5;
+/// The most of a node's memory all the process's tiers take together when some are backed as
+/// their sequences fill (#1131, #1163): those pin a chunk at a time while serving, never all at
+/// once at load (Gemma 4 31B's `--tp 2` slots: 205-214 GiB planned, 13-21 GiB pinned at load),
+/// so they get a looser limit than [`NODE_SHARE`], which still bounds the tiers pinned at load.
+const LAZY_SHARE: f64 = 0.8;
 
 /// Measured read rate of pinned host memory over the link to the CPU on an AC922 (NVLink 2.0,
 /// `hostbw`, see `docs/bandwidth.md`), GB/s.
@@ -41,6 +60,66 @@ pub(crate) struct Node {
     /// The part of `free` that is reclaimable page cache.
     pub cache: u64,
     pub total: u64,
+    /// The bytes the process's other loads planned on the node ([`Ledger::others`]) ...
+    pub planned: u64,
+    /// ... the part of them backed as their sequences fill.
+    pub planned_lazy: u64,
+    /// This tier is backed as its sequences fill, not pinned at load (its budget is
+    /// [`lazy_cap`]'s, not [`node_cap`]'s).
+    pub lazy: bool,
+}
+
+impl Node {
+    /// A node of `block_bytes` per host block, as `mem` reads, `(planned, planned_lazy)` taken
+    /// by other loads; pinned at load.
+    pub fn new(node: u32, block_bytes: u64, mem: NodeMemory, planned: (u64, u64)) -> Self {
+        Self {
+            node,
+            block_bytes,
+            free: mem.free,
+            cache: mem.cache,
+            total: mem.total,
+            planned: planned.0,
+            planned_lazy: planned.1,
+            lazy: false,
+        }
+    }
+
+    /// The node for a tier backed as its sequences fill.
+    pub fn backed_as_filled(self) -> Self {
+        Self { lazy: true, ..self }
+    }
+}
+
+/// The most the KV host tiers of one process pin at load on a node of `total` bytes
+/// ([`NODE_SHARE`]).
+pub(crate) fn node_cap(total: u64) -> u64 {
+    (total as f64 * NODE_SHARE) as u64
+}
+
+/// The most all the KV host tiers of one process take on a node of `total` bytes when some
+/// are backed as they fill ([`LAZY_SHARE`]).
+pub(crate) fn lazy_cap(total: u64) -> u64 {
+    (total as f64 * LAZY_SHARE) as u64
+}
+
+/// The bytes a tier may take on node `n`: its free memory with [`CACHE_SHARE`] of the page
+/// cache, less the margin and what other loads back as they fill (not pinned yet, so not out
+/// of the free memory read), at most [`lazy_cap`] less all other loads' plans, and for a tier
+/// pinned at load also at most [`node_cap`] less the other tiers pinned at load.
+pub(crate) fn node_budget(n: &Node) -> u64 {
+    let margin = MARGIN_MIN.max((n.total as f64 * MARGIN_SHARE) as u64);
+    let cache = n.cache.min(n.free);
+    let counted = n.free - cache + (cache as f64 * CACHE_SHARE) as u64;
+    let room = counted
+        .saturating_sub(margin)
+        .saturating_sub(n.planned_lazy);
+    let all = lazy_cap(n.total).saturating_sub(n.planned);
+    if n.lazy {
+        return room.min(all);
+    }
+    let eager = n.planned.saturating_sub(n.planned_lazy);
+    room.min(all).min(node_cap(n.total).saturating_sub(eager))
 }
 
 /// A NUMA node's memory as the tier sees it, from its meminfo (bytes).
@@ -53,9 +132,19 @@ pub(crate) struct NodeMemory {
     pub total: u64,
 }
 
+/// The host blocks the nodes' budgets ([`node_budget`]) hold, the tightest node's.
+pub(crate) fn budget_blocks(nodes: &[Node]) -> usize {
+    nodes
+        .iter()
+        .map(|n| (node_budget(n) / n.block_bytes.max(1)) as usize)
+        .min()
+        .unwrap_or(0)
+}
+
 /// The host blocks for an automatic tier: none when a context fits (`fit` device blocks against
 /// `ctx_blocks`), else the rest of `want` (the automatic pool) past the `device` blocks, capped
-/// by the nodes' free memory less the margin. An error when not even a context fits that way.
+/// by the nodes' budgets ([`node_budget`]). An error when not even a context fits that way;
+/// a pool cut short says by how much (admission then waits for room, every context fits).
 pub(crate) fn auto_host_blocks(
     fit: usize,
     ctx_blocks: usize,
@@ -68,20 +157,14 @@ pub(crate) fn auto_host_blocks(
     }
     let need = ctx_blocks.saturating_sub(device);
     let wanted = want.max(ctx_blocks).saturating_sub(device);
-    let cap = nodes
-        .iter()
-        .map(|n| {
-            let margin = MARGIN_MIN.max((n.total as f64 * MARGIN_SHARE) as u64);
-            (n.free.saturating_sub(margin) / n.block_bytes.max(1)) as usize
-        })
-        .min()
-        .unwrap_or(0);
+    let cap = budget_blocks(nodes);
     if cap < need {
         return Err(format!(
             "the context of {} tokens does not fit in GPU memory (room for {}), and the host \
              memory of NUMA node(s) {} ({}) has room for {} more tokens of KV cache, not the {} \
-             it needs (keeping {} GiB or {:.0}% of each node free). Lower --ctx-size, quantize \
-             the cache, or free host memory",
+             it needs (keeping {} GiB or {:.0}% of each node free, counting {:.0}% of its page \
+             cache, and pinning at most {:.0}% of a node). Lower --ctx-size, quantize the \
+             cache, or free host memory",
             ctx_blocks * KV_BLOCK,
             device * KV_BLOCK,
             node_list(nodes),
@@ -89,7 +172,13 @@ pub(crate) fn auto_host_blocks(
             cap * KV_BLOCK,
             need * KV_BLOCK,
             MARGIN_MIN >> 30,
-            MARGIN_SHARE * 100.0
+            MARGIN_SHARE * 100.0,
+            CACHE_SHARE * 100.0,
+            if nodes.iter().any(|n| n.lazy) {
+                LAZY_SHARE * 100.0
+            } else {
+                NODE_SHARE * 100.0
+            }
         ));
     }
     let blocks = wanted.min(cap);
@@ -101,21 +190,54 @@ pub(crate) fn auto_host_blocks(
             room_note(nodes)
         );
     }
+    if blocks < wanted {
+        let short: u64 =
+            nodes.iter().map(|n| n.block_bytes).sum::<u64>() * (wanted - blocks) as u64;
+        tracing::warn!(
+            host_tokens = blocks * KV_BLOCK,
+            wanted_tokens = wanted * KV_BLOCK,
+            "the KV host tier holds {} of the {} tokens every sequence at full context would \
+             take past the GPUs ({} tokens, {:.1} GiB short; {}): every context still fits, \
+             sequences wait for room past that",
+            blocks * KV_BLOCK,
+            wanted * KV_BLOCK,
+            (wanted - blocks) * KV_BLOCK,
+            short as f64 / (1u64 << 30) as f64,
+            room_note(nodes)
+        );
+    }
     Ok(blocks)
 }
 
-/// Each node's memory the tier counted as free, and how much of it is page cache.
+/// Each node's memory the tier counted as free, how much of it is page cache, and the tier's
+/// budget there ([`node_budget`]).
 pub(crate) fn room_note(nodes: &[Node]) -> String {
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
     nodes
         .iter()
         .map(|n| {
+            let others = match (n.planned, n.planned_lazy) {
+                (0, _) => String::new(),
+                (p, 0) => format!(", {:.1} GiB planned by other loads", gib(p)),
+                (p, l) => format!(
+                    ", {:.1} GiB planned by other loads ({:.1} GiB of it backed as they fill)",
+                    gib(p),
+                    gib(l)
+                ),
+            };
+            let kind = if n.lazy {
+                "budget backed as filled"
+            } else {
+                "budget"
+            };
             format!(
-                "node {}: {:.1} GiB free of {:.1} GiB, {:.1} GiB of it page cache",
+                "node {}: {:.1} GiB free of {:.1} GiB, {:.1} GiB of it page cache{others}, \
+                 {kind} {:.1} GiB",
                 crate::residency::fallback::node_label(n.node),
                 gib(n.free),
                 gib(n.total),
-                gib(n.cache)
+                gib(n.cache),
+                gib(node_budget(n))
             )
         })
         .collect::<Vec<_>>()
@@ -171,6 +293,206 @@ pub(crate) fn node_memory(node: u32) -> Option<NodeMemory> {
         format!("/sys/devices/system/node/node{node}/meminfo")
     };
     parse_meminfo(&std::fs::read_to_string(path).ok()?)
+}
+
+/// Whose tier a plan is: a load (`group`, fresh per [`LmEngine::load`](super::LmEngine::load))
+/// and its rank in it. `--tp-per-gpu`'s two ranks are one group: each sizes its share of the
+/// group's budget (the other rank's blocks counted in [`Node::block_bytes`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Owner {
+    pub group: u64,
+    pub rank: usize,
+}
+
+/// A group no load has used.
+pub(crate) fn new_group() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// One node of the process's plan: the bytes every load planned there pinned at load and
+/// their cap ([`node_cap`]), and backed as sequences fill with the cap of all of them
+/// ([`lazy_cap`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NodePlan {
+    pub node: u32,
+    pub planned: u64,
+    pub cap: u64,
+    pub lazy: u64,
+    pub lazy_cap: u64,
+}
+
+/// The automatic KV host tiers this process planned, per owner and node (#1163): every stage,
+/// rank and replica of one serve sizes from one budget per node. Also each group's first look
+/// at a node's memory, so a pair's two ranks size from the same figures (not the second from
+/// what is left once the first pinned).
+#[derive(Debug, Default)]
+pub(crate) struct Ledger {
+    /// Owner, node, bytes, the node's total, backed as sequences fill.
+    planned: Vec<(Owner, u32, u64, u64, bool)>,
+    seen: Vec<(u64, u32, NodeMemory)>,
+}
+
+impl Ledger {
+    const fn new() -> Self {
+        Self {
+            planned: Vec::new(),
+            seen: Vec::new(),
+        }
+    }
+
+    /// The bytes groups other than `group` planned on `node`, and the part of them backed as
+    /// sequences fill.
+    pub fn others(&self, group: u64, node: u32) -> (u64, u64) {
+        let theirs = || (self.planned.iter()).filter(move |p| p.0.group != group && p.1 == node);
+        (
+            theirs().map(|p| p.2).sum(),
+            theirs().filter(|p| p.4).map(|p| p.2).sum(),
+        )
+    }
+
+    /// `node`'s memory as `group` first saw it: `read` on its first look.
+    pub fn memory(
+        &mut self,
+        group: u64,
+        node: u32,
+        read: impl FnOnce() -> Option<NodeMemory>,
+    ) -> Option<NodeMemory> {
+        if let Some(s) = self.seen.iter().find(|s| s.0 == group && s.1 == node) {
+            return Some(s.2);
+        }
+        let m = read()?;
+        self.seen.push((group, node, m));
+        Some(m)
+    }
+
+    /// Records `owner`'s plan of `per_node` (node, bytes), pinned at load or backed as its
+    /// sequences fill (`lazy`), an earlier plan of the owner's replaced; each node's total as
+    /// its group saw it (0 if it never looked).
+    pub fn plan(&mut self, owner: Owner, per_node: &[(u32, u64)], lazy: bool) {
+        self.planned.retain(|p| p.0 != owner);
+        for &(node, bytes) in per_node {
+            let total = (self.seen.iter())
+                .find(|s| s.0 == owner.group && s.1 == node)
+                .map_or(0, |s| s.2.total);
+            self.planned.push((owner, node, bytes, total, lazy));
+        }
+    }
+
+    /// Drops `owner`'s plan, and its group's looks once no rank of it plans anything.
+    pub fn release(&mut self, owner: Owner) {
+        self.planned.retain(|p| p.0 != owner);
+        if !self.planned.iter().any(|p| p.0.group == owner.group) {
+            self.seen.retain(|s| s.0 != owner.group);
+        }
+    }
+
+    /// The whole process's plan per node, by node.
+    pub fn per_node(&self) -> Vec<NodePlan> {
+        let mut out: Vec<NodePlan> = Vec::new();
+        for &(_, node, bytes, total, lazy) in &self.planned {
+            let i = match out.iter().position(|p| p.node == node) {
+                Some(i) => i,
+                None => {
+                    out.push(NodePlan {
+                        node,
+                        planned: 0,
+                        cap: 0,
+                        lazy: 0,
+                        lazy_cap: 0,
+                    });
+                    out.len() - 1
+                }
+            };
+            let p = &mut out[i];
+            if lazy {
+                p.lazy += bytes;
+            } else {
+                p.planned += bytes;
+            }
+            p.cap = p.cap.max(node_cap(total));
+            p.lazy_cap = p.lazy_cap.max(lazy_cap(total));
+        }
+        out.sort_by_key(|p| p.node);
+        out
+    }
+}
+
+static LEDGER: Mutex<Ledger> = Mutex::new(Ledger::new());
+
+fn ledger() -> std::sync::MutexGuard<'static, Ledger> {
+    LEDGER.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Node `node` for `owner`'s tier of `block_bytes` per host block: its memory as the group
+/// first read it, less what other loads of this process planned there. `None` when its memory
+/// cannot be read.
+pub(crate) fn serve_node(owner: Owner, node: u32, block_bytes: u64) -> Option<Node> {
+    let mut l = ledger();
+    let mem = l.memory(owner.group, node, || node_memory(node))?;
+    Some(Node::new(
+        node,
+        block_bytes,
+        mem,
+        l.others(owner.group, node),
+    ))
+}
+
+/// `owner`'s planned tier, in the process's plan until dropped (with the tier).
+#[derive(Debug)]
+pub(crate) struct Reservation(Owner);
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        ledger().release(self.0);
+    }
+}
+
+/// Puts `owner`'s tier of `per_node` (node, bytes), pinned at load or backed as its sequences
+/// fill (`lazy`), in the process's plan and logs the plan of every node.
+pub(crate) fn reserve(owner: Owner, per_node: &[(u32, u64)], lazy: bool) -> Reservation {
+    let plan = {
+        let mut l = ledger();
+        l.plan(owner, per_node, lazy);
+        l.per_node()
+    };
+    tracing::info!(
+        rank = owner.rank,
+        "KV host tier: pinned memory planned for the whole process per NUMA node: {}",
+        plan_note(&plan)
+    );
+    Reservation(owner)
+}
+
+/// The process's planned KV host tiers per node ([`Ledger::per_node`]).
+pub(crate) fn serve_plan() -> Vec<NodePlan> {
+    ledger().per_node()
+}
+
+/// `node 0: 61.7 GiB of a 127.8 GiB cap; ...`, and where tiers are backed as they fill
+/// `, 191.6 GiB backed as sequences fill (all tiers at most 204.4 GiB)`.
+pub(crate) fn plan_note(plan: &[NodePlan]) -> String {
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    plan.iter()
+        .map(|p| {
+            let lazy = if p.lazy > 0 {
+                format!(
+                    ", {:.1} GiB backed as sequences fill (all tiers at most {:.1} GiB)",
+                    gib(p.lazy),
+                    gib(p.lazy_cap)
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "node {}: {:.1} GiB of a {:.1} GiB cap{lazy}",
+                crate::residency::fallback::node_label(p.node),
+                gib(p.planned),
+                gib(p.cap)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// The startup line's speed note: what the link reads host blocks at, and what that costs.

@@ -67,6 +67,7 @@ fn requests_round_trip() {
             micro: 512,
             taper: 3,
             gather_budget: u64::MAX - 1,
+            head: 2,
         },
         Request::SaveRing {
             ring: 4,

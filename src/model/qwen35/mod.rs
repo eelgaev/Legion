@@ -158,7 +158,9 @@ impl Arch for Qwen35 {
         // Dense prompt steps on the opt-in prefill kernels (`--fp8-act a8-dynamic`, `--nvfp4-a4`):
         // the residual adds in the output projections' epilogues and the post-attention norm in
         // the W4A4 SwiGLU's quantization, each with ggml's bits (#749).
-        let fuse = !pass.tap.on && !hp.moe && m.linear.residual_fusion(n);
+        // Not on a rank's share (`--tp 2`, #1163): its partial outputs are summed before the
+        // residual add.
+        let fuse = !pass.tap.on && !hp.moe && !m.tp_active() && m.linear.residual_fusion(n);
         for il in layers {
             // A gated DeltaNet layer's input feeds BF16 (beta / alpha) and FP8 matmuls.
             let both = fuse && hp.is_recurrent(il);
@@ -186,6 +188,8 @@ impl Arch for Qwen35 {
             } else {
                 m.attention(pass, il, h)?
             };
+            // A rank's share of the heads gives a partial output (`--tp 2`; `attn` without).
+            let attn = m.tp_sum(ctx, attn);
             let x_attn = ctx.add(attn, x);
             pass.tap.tap("attn_residual", il, x_attn);
             let h = m.norm_mul(pass, x_attn, m.lw(il, "post_attention_norm.weight")?);
@@ -193,7 +197,7 @@ impl Arch for Qwen35 {
             let ffn = if hp.moe {
                 m.moe(ctx, &pass.tap, &pass.graph, il, h, n, pass.prompt_only())?
             } else {
-                m.ffn(ctx, il, h)?
+                m.tp_sum(ctx, m.ffn(ctx, il, h)?)
             };
             pass.tap.tap("ffn_out", il, ffn);
             x = ctx.add(ffn, x_attn);

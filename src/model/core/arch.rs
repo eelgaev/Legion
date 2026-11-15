@@ -375,6 +375,14 @@ pub trait Arch: Debug + Send + Sync + Any {
         false
     }
 
+    /// Whether a greedy step's head may run as two shares of the vocabulary on the two ranks
+    /// of tensor parallelism ([`crate::model::core::head_split`], `--tp-head-split`): only
+    /// architectures on the core's head ([`Self::head`] `None`) whose text was shown to stay
+    /// the same with it.
+    fn head_splits(&self) -> bool {
+        false
+    }
+
     /// The logits as the model returns them (a soft-cap, say).
     fn logits<'a>(&self, _ctx: &'a Context, logits: Tensor<'a>) -> Tensor<'a> {
         logits

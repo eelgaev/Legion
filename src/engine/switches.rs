@@ -59,6 +59,9 @@ pub struct Switches {
     /// The fewest sequences a verify step of such pools leaves the states in
     /// ([`crate::model::core::set_state_defer_min_seqs`]).
     pub gdn_state_defer_min_seqs: Option<u8>,
+    /// The fewest sequences a commit of a rank of tensor parallelism over machines defers
+    /// ([`crate::model::core::set_tp_commit_in_verify_min_seqs`]).
+    pub tp_commit_in_verify_min_seqs: Option<u8>,
     /// Attention layers' fused norm + RoPE op ([`crate::model::core::set_norm_rope`]).
     pub norm_rope: Option<bool>,
     /// Attention layers' K/V and indexer cache appends and pool-key op
@@ -85,6 +88,12 @@ pub struct Switches {
     /// A Q8_0 MTP draft LM head of 9-16 sequences on Legion's Q8_0 matvec op
     /// ([`crate::model::core::set_q8_mv`]).
     pub q8_mv: Option<bool>,
+    /// GGUF-quantized matmuls of 2-8 columns on a V100 on Legion's small-M op (opt-in)
+    /// ([`crate::model::core::set_q_small_m`]).
+    pub q_small_m: Option<bool>,
+    /// That op also for the steps ggml runs on MMQ, up to 8 columns
+    /// ([`crate::model::core::q_small_m::set_wide`]).
+    pub q_small_m_wide: Option<bool>,
     /// A one-column Q8_0 MTP draft LM head on Legion's one-column Q8_0 matvec op
     /// ([`crate::model::core::set_q8_head`]).
     pub q8_head: Option<bool>,
@@ -321,6 +330,12 @@ pub struct Switches {
     /// The FFN mixers' residual streams made by their readers in the MoE fold's relayout
     /// ([`crate::model::qwen4::set_hc_lazy_streams`]; on by default).
     pub hc_lazy_streams: Option<bool>,
+    /// A sequence-parallel all-gather running the mix it reads
+    /// ([`crate::tp_net::seq_par::set_gather_mix`]; on by default).
+    pub tp_gather_mix: Option<bool>,
+    /// A sequence-parallel all-gather writing its output's F32 copy
+    /// ([`crate::tp_net::seq_par::set_gather_widen`]; on by default).
+    pub tp_gather_widen: Option<bool>,
     /// qwen4exp's hyper-connection glue fused around the MoE op on a V100 or an sm_80+ GPU
     /// ([`crate::model::qwen4::set_hc_fuse`]).
     pub hc_fuse: Option<bool>,
@@ -570,6 +585,9 @@ impl Switches {
         if let Some(n) = self.gdn_state_defer_min_seqs {
             core::set_state_defer_min_seqs(n.into());
         }
+        if let Some(n) = self.tp_commit_in_verify_min_seqs {
+            core::set_tp_commit_in_verify_min_seqs(n.into());
+        }
         set(self.norm_rope, core::set_norm_rope);
         set(self.kv_append, core::set_kv_append);
         set(
@@ -588,6 +606,8 @@ impl Switches {
         );
         set(self.dense_mv, crate::model::dense_mv::set_dense_mv);
         set(self.q8_mv, core::set_q8_mv);
+        set(self.q_small_m, core::set_q_small_m);
+        set(self.q_small_m_wide, core::q_small_m::set_wide);
         set(self.q8_head, core::set_q8_head);
         set(self.q8_head_pick, core::q8_head::pick::set_pick);
         set(self.q8_row_mv, core::q8_head::set_row_mv);
@@ -751,6 +771,11 @@ impl Switches {
         set(self.hc_post_norm, qwen4::set_fused_post_norm);
         set(self.hc_moe_fold, qwen4::set_moe_fold);
         set(self.hc_lazy_streams, qwen4::set_hc_lazy_streams);
+        set(self.tp_gather_mix, crate::tp_net::seq_par::set_gather_mix);
+        set(
+            self.tp_gather_widen,
+            crate::tp_net::seq_par::set_gather_widen,
+        );
         set(self.hc_fuse, qwen4::set_hc_fuse);
         set(self.hc_xn16, qwen4::set_xn16);
         set(self.hc_quant, core::set_mmq_preq);

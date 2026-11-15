@@ -116,6 +116,9 @@ pub(super) struct MemoryPlan {
     pub host: HostPlan,
     /// The GPUs whose expert slots the load shrank to the VRAM it found (#1208).
     pub expert_shrunk: Vec<crate::residency::experts::Shrunk>,
+    /// The pinned KV host tier memory the whole process planned per NUMA node, every rank,
+    /// stage and replica loaded so far (#1163).
+    pub kv_host_tier_nodes: Vec<super::host_tier::NodePlan>,
 }
 
 /// Share `i` of `bytes` split evenly over `n` (the first ones take the remainder): a
@@ -259,4 +262,15 @@ pub(super) fn log(p: &MemoryPlan) {
         host_available_mib = mib(h.available),
         "memory plan"
     );
+    for n in &p.kv_host_tier_nodes {
+        tracing::info!(
+            part = "kv host tier",
+            node = n.node,
+            planned_mib = mib(n.planned),
+            cap_mib = mib(n.cap),
+            backed_as_filled_mib = mib(n.lazy),
+            all_tiers_cap_mib = mib(n.lazy_cap),
+            "memory plan"
+        );
+    }
 }

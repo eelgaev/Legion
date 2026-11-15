@@ -9,6 +9,9 @@ fn node(block_bytes: u64, free_gib: u64, total_gib: u64) -> Node {
         free: free_gib * GIB,
         cache: 0,
         total: total_gib * GIB,
+        planned: 0,
+        planned_lazy: 0,
+        lazy: false,
     }
 }
 
@@ -33,8 +36,8 @@ fn the_rest_of_the_pool_goes_to_the_host() {
 
 #[test]
 fn capped_by_the_tightest_node() {
-    // 50 GiB free of 64 on one node: margin 16 GiB, 34 GiB = 34,816 blocks of 1 MiB; the
-    // other node has more.
+    // 50 GiB free of 64 on one node: margin 16 GiB leaves 34 GiB, but at most half the node
+    // (32 GiB = 32,768 blocks of 1 MiB) is pinned; the other node has more.
     let tight = node(1 << 20, 50, 64);
     let loose = Node {
         node: 8,
@@ -42,7 +45,7 @@ fn capped_by_the_tightest_node() {
     };
     assert_eq!(
         auto_host_blocks(1000, 4096, 100_000, 1000, &[loose, tight]),
-        Ok(34 * 1024)
+        Ok(32 * 1024)
     );
 }
 
@@ -230,8 +233,9 @@ fn meminfo_power9_two_nodes() {
 
 #[test]
 fn meminfo_power9_page_cache_lets_the_context_fit() {
-    // The #541 abort: a context needing ~180 GiB of 1 MiB host blocks on node 0, which has
-    // 97 GiB free. With its page cache counted, node 0 has room and node 8 caps nothing.
+    // The #541 abort: a context needing ~98 GiB of 1 MiB host blocks on node 0, which has
+    // 97 GiB free (72 GiB past the margin). With half its 146 GiB of page cache counted, node
+    // 0 has room (a 125.6 GiB budget, half the node) and node 8 caps nothing.
     let as_node = |id: u32, text: &str| {
         let m = parse_meminfo(text).unwrap();
         Node {
@@ -240,9 +244,12 @@ fn meminfo_power9_page_cache_lets_the_context_fit() {
             free: m.free,
             cache: m.cache,
             total: m.total,
+            planned: 0,
+            planned_lazy: 0,
+            lazy: false,
         }
     };
-    let ctx_blocks = 200_000;
+    let ctx_blocks = 120_000;
     let device = 20_000;
     let only_free = Node {
         free: 101_711_872 * 1024,
@@ -269,13 +276,14 @@ fn meminfo_gb10_mapped_model_is_not_free() {
 
 #[test]
 fn the_margin_applies_to_free_plus_cache() {
-    // 40 GiB free + 100 GiB page cache of 256: margin 25.6 GiB, ~114 GiB of 1 MiB blocks.
+    // 40 GiB free + 100 GiB page cache of 256: half the cache counts, 90 GiB, less a margin
+    // of 25.6 GiB: ~64.4 GiB of 1 MiB blocks (under the 128 GiB cap).
     let n = Node {
         cache: 100 * GIB,
         ..node(1 << 20, 140, 256)
     };
     let margin = (256.0 * GIB as f64 * 0.10) as u64;
-    let cap = ((140 * GIB - margin) >> 20) as usize;
+    let cap = ((90 * GIB - margin) >> 20) as usize;
     assert_eq!(auto_host_blocks(1000, 4096, 1_000_000, 1000, &[n]), Ok(cap));
 }
 
@@ -295,4 +303,326 @@ fn speed_note_per_link() {
         "{c2c}"
     );
     assert!(!c2c.contains("68.5"), "{c2c}");
+}
+
+fn gib(x: f64) -> u64 {
+    (x * GIB as f64) as u64
+}
+
+fn as_gib(b: u64) -> f64 {
+    b as f64 / GIB as f64
+}
+
+/// Node 0 of the 2026-11-14 hang (Qwen3.8-27B, `--tp 2 --tp-per-gpu`, 16 x 262,144 tokens, both
+/// GPUs on node 0 under `--numa` bind 0): 240.0 GiB "free" of 255.5, 182.2 GiB of it page
+/// cache.
+fn hang_node(block_bytes: u64) -> Node {
+    Node {
+        node: 0,
+        block_bytes,
+        free: gib(240.0),
+        cache: gib(182.2),
+        total: gib(255.5),
+        planned: 0,
+        planned_lazy: 0,
+        lazy: false,
+    }
+}
+
+/// 34,816 bytes per token per rank (the 27B's KV with its MTP head's): one host block.
+const HANG_RANK_BLOCK: u64 = 34_816 * KV_BLOCK as u64;
+
+#[test]
+fn page_cache_counts_half() {
+    // 100 GiB "free" that is all page cache, of 256: 50 GiB counted, less 25.6 GiB margin.
+    let n = Node {
+        cache: 100 * GIB,
+        ..node(1, 100, 256)
+    };
+    let margin = (256.0 * GIB as f64 * 0.10) as u64;
+    assert_eq!(node_budget(&n), 50 * GIB - margin);
+    // Page cache past "free" (a racy read) counts as no more than "free".
+    let odd = Node {
+        cache: 300 * GIB,
+        ..node(1, 100, 256)
+    };
+    assert_eq!(node_budget(&odd), 50 * GIB - margin);
+}
+
+#[test]
+fn at_most_half_a_node_is_pinned() {
+    // An empty node: 250 GiB free of 256, the margin leaves 224.4, the cap 128.
+    assert_eq!(node_budget(&node(1, 250, 256)), 128 * GIB);
+    assert_eq!(node_cap(256 * GIB), 128 * GIB);
+}
+
+#[test]
+fn the_hang_budget() {
+    // Before: 240.0 - 25.55 = 214.45 GiB for the pair, 114 GiB pinned per rank, 228 GiB of
+    // the node. Now: 57.8 GiB of real free + half of 182.2 GiB page cache - 25.55 GiB margin =
+    // 123.35 GiB, under the 127.75 GiB cap.
+    let budget = as_gib(node_budget(&hang_node(HANG_RANK_BLOCK)));
+    assert!((budget - 123.35).abs() < 0.01, "{budget}");
+}
+
+#[test]
+fn two_ranks_on_one_node_split_the_budget() {
+    // The hang's pair: both GPUs on node 0 (a bind, or both GPUs of one socket), so each
+    // rank's host block counts both ranks' bytes and each rank sizes half the node's budget.
+    let ctx = 262_144 / KV_BLOCK;
+    let want = 16 * ctx;
+    let device = 600;
+    let pair = [hang_node(2 * HANG_RANK_BLOCK)];
+    let per_rank = auto_host_blocks(device, ctx, want, device, &pair).unwrap();
+    let alone = auto_host_blocks(device, ctx, want, device, &[hang_node(HANG_RANK_BLOCK)]).unwrap();
+    assert_eq!(per_rank, alone / 2);
+    // ~1.90M tokens and ~61.7 GiB per rank, the pair's 123.35 GiB under half the node.
+    let tokens = per_rank * KV_BLOCK;
+    assert!((1_895_000..1_905_000).contains(&tokens), "{tokens}");
+    let both = 2 * per_rank as u64 * HANG_RANK_BLOCK;
+    assert!(both <= node_cap(gib(255.5)), "{}", as_gib(both));
+    assert!((as_gib(both) - 123.35).abs() < 0.01, "{}", as_gib(both));
+    // Every context still fits: the cut is the pool, never one sequence.
+    assert!(per_rank >= ctx - device);
+}
+
+#[test]
+fn ranks_on_two_nodes_each_take_their_node() {
+    // No bind and the pair's GPUs on two sockets: each rank's tier is on its own node, with
+    // only its own bytes there, and sizes from that node's whole budget.
+    let ctx = 262_144 / KV_BLOCK;
+    let n8 = Node {
+        node: 8,
+        ..hang_node(HANG_RANK_BLOCK)
+    };
+    let r0 = auto_host_blocks(600, ctx, 16 * ctx, 600, &[hang_node(HANG_RANK_BLOCK)]).unwrap();
+    let r1 = auto_host_blocks(600, ctx, 16 * ctx, 600, &[n8]).unwrap();
+    assert_eq!(r0, r1);
+    let shared = auto_host_blocks(600, ctx, 16 * ctx, 600, &[hang_node(2 * HANG_RANK_BLOCK)]);
+    assert_eq!(shared.unwrap(), r0 / 2);
+}
+
+#[test]
+fn other_loads_shrink_the_cap() {
+    // A replica loaded before planned 100 GiB on the node: 28 GiB of the 128 GiB cap is left,
+    // whatever the node reads free now.
+    let n = Node {
+        planned: 100 * GIB,
+        ..node(1 << 20, 250, 256)
+    };
+    assert_eq!(node_budget(&n), 28 * GIB);
+    let full = Node {
+        planned: 200 * GIB,
+        ..node(1 << 20, 250, 256)
+    };
+    assert_eq!(node_budget(&full), 0);
+    // Not even a context then: a clear refusal, not a hang.
+    let err = auto_host_blocks(1000, 4096, 4096, 1000, &[full]).unwrap_err();
+    assert!(err.contains("200.0 GiB planned by other loads"), "{err}");
+    assert!(err.contains("pinning at most 50% of a node"), "{err}");
+}
+
+fn nm(free_gib: u64, total_gib: u64) -> NodeMemory {
+    NodeMemory {
+        free: free_gib * GIB,
+        cache: 0,
+        total: total_gib * GIB,
+    }
+}
+
+#[test]
+fn a_group_sizes_from_its_first_look() {
+    // The pair's second rank reads the node after the first pinned: it must size from the
+    // same figures, or the ranks disagree (the 2026-11-03 log: 237.5 vs 232.4 GiB).
+    let mut l = Ledger::new();
+    assert_eq!(l.memory(1, 0, || Some(nm(237, 256))), Some(nm(237, 256)));
+    assert_eq!(l.memory(1, 0, || Some(nm(232, 256))), Some(nm(237, 256)));
+    // Another group (a later replica) reads anew.
+    assert_eq!(l.memory(2, 0, || Some(nm(100, 256))), Some(nm(100, 256)));
+    // An unreadable node is not remembered.
+    assert_eq!(l.memory(3, 8, || None), None);
+    assert_eq!(l.memory(3, 8, || Some(nm(9, 16))), Some(nm(9, 16)));
+}
+
+#[test]
+fn the_ledger_sums_every_load_per_node() {
+    let mut l = Ledger::new();
+    let r0 = Owner { group: 1, rank: 0 };
+    let r1 = Owner { group: 1, rank: 1 };
+    let replica = Owner { group: 2, rank: 0 };
+    l.memory(1, 0, || Some(nm(240, 256)));
+    l.memory(2, 0, || Some(nm(120, 256)));
+    l.memory(2, 8, || Some(nm(250, 256)));
+    l.plan(r0, &[(0, 60 * GIB)], false);
+    l.plan(r1, &[(0, 60 * GIB)], false);
+    // The pair's own ranks are not "other loads" to each other: their split is in the block
+    // bytes.
+    assert_eq!(l.others(1, 0), (0, 0));
+    assert_eq!(l.others(2, 0), (120 * GIB, 0));
+    l.plan(replica, &[(0, 4 * GIB), (8, 50 * GIB)], true);
+    assert_eq!(l.others(1, 0), (4 * GIB, 4 * GIB));
+    assert_eq!(l.others(1, 8), (50 * GIB, 50 * GIB));
+    assert_eq!(
+        l.per_node(),
+        vec![
+            NodePlan {
+                node: 0,
+                planned: 120 * GIB,
+                cap: 128 * GIB,
+                lazy: 4 * GIB,
+                lazy_cap: lazy_cap(256 * GIB),
+            },
+            NodePlan {
+                node: 8,
+                planned: 0,
+                cap: 128 * GIB,
+                lazy: 50 * GIB,
+                lazy_cap: lazy_cap(256 * GIB),
+            },
+        ]
+    );
+    // A replan replaces the owner's plan.
+    l.plan(replica, &[(8, 10 * GIB)], false);
+    assert_eq!(l.others(1, 0), (0, 0));
+    assert_eq!(l.others(1, 8), (10 * GIB, 0));
+}
+
+#[test]
+fn a_released_load_leaves_the_plan() {
+    let mut l = Ledger::new();
+    let r0 = Owner { group: 1, rank: 0 };
+    let r1 = Owner { group: 1, rank: 1 };
+    l.memory(1, 0, || Some(nm(240, 256)));
+    l.plan(r0, &[(0, 60 * GIB)], false);
+    l.plan(r1, &[(0, 60 * GIB)], false);
+    l.release(r0);
+    assert_eq!(l.others(2, 0), (60 * GIB, 0));
+    // The group's look stays while a rank of it plans.
+    assert_eq!(l.memory(1, 0, || Some(nm(1, 256))), Some(nm(240, 256)));
+    l.release(r1);
+    assert_eq!(l.others(2, 0), (0, 0));
+    assert!(l.per_node().is_empty());
+    assert_eq!(l.memory(1, 0, || Some(nm(1, 256))), Some(nm(1, 256)));
+}
+
+#[test]
+fn the_plan_note() {
+    let note = plan_note(&[
+        NodePlan {
+            node: 0,
+            planned: gib(61.7),
+            cap: 128 * GIB,
+            lazy: 0,
+            lazy_cap: gib(204.8),
+        },
+        NodePlan {
+            node: 8,
+            planned: 0,
+            cap: 128 * GIB,
+            lazy: gib(191.6),
+            lazy_cap: gib(204.8),
+        },
+    ]);
+    assert_eq!(
+        note,
+        "node 0: 61.7 GiB of a 128.0 GiB cap; node 8: 0.0 GiB of a 128.0 GiB cap, 191.6 GiB \
+         backed as sequences fill (all tiers at most 204.8 GiB)"
+    );
+}
+
+/// Gemma 4 31B's `--tp 2` docs command (16 x 262,144 tokens) on node 8 of an AC922 with the
+/// GPUs' node nearly empty: 251.5 GiB free of 255.5, 16.8 GiB of it page cache. Its slots are
+/// backed as they fill.
+fn gemma_node() -> Node {
+    Node {
+        node: 8,
+        block_bytes: 1 << 20,
+        free: gib(251.5),
+        cache: gib(16.8),
+        total: gib(255.5),
+        planned: 0,
+        planned_lazy: 0,
+        lazy: false,
+    }
+}
+
+#[test]
+fn a_tier_backed_as_it_fills_takes_the_looser_cap() {
+    // Pinned at load: half the node, 127.75 GiB.
+    assert!((as_gib(node_budget(&gemma_node())) - 127.75).abs() < 0.01);
+    // Backed as it fills: 251.5 - 8.4 (half the page cache) - 25.55 margin = 217.55 GiB of
+    // room, the 80% cap 204.4 GiB.
+    let lazy = gemma_node().backed_as_filled();
+    assert!(
+        (as_gib(node_budget(&lazy)) - 204.4).abs() < 0.01,
+        "{}",
+        as_gib(node_budget(&lazy))
+    );
+    // Room still bounds it: a node with less free memory gets what it has, less the margin.
+    let tight = Node {
+        free: gib(150.0),
+        cache: 0,
+        ..lazy
+    };
+    assert!((as_gib(node_budget(&tight)) - 124.45).abs() < 0.01);
+}
+
+#[test]
+fn backed_as_filled_plans_count_against_both_caps() {
+    // Another load backs 100 GiB as it fills: not pinned yet, so it comes out of the room too,
+    // but not out of the cap for tiers pinned at load.
+    let n = Node {
+        planned: 100 * GIB,
+        planned_lazy: 100 * GIB,
+        ..gemma_node()
+    };
+    // Pinned at load: room 217.55 - 100, the 80% cap 204.4 - 100, the 50% cap 127.75 - 0.
+    assert!(
+        (as_gib(node_budget(&n)) - 104.4).abs() < 0.01,
+        "{}",
+        as_gib(node_budget(&n))
+    );
+    // Another load pinned 100 GiB at load (already out of the free memory read): the 50% cap
+    // leaves 27.75 GiB for one pinned at load, the 80% cap 104.4 GiB for one backed as filled.
+    let pinned = Node {
+        planned: 100 * GIB,
+        ..gemma_node()
+    };
+    assert!((as_gib(node_budget(&pinned)) - 27.75).abs() < 0.01);
+    assert!((as_gib(node_budget(&pinned.backed_as_filled())) - 104.4).abs() < 0.01);
+}
+
+#[test]
+fn the_gemma_docs_slots_are_not_cut_to_half_the_node() {
+    // 16 slots of 266,240 tokens past no device blocks: 4,259,840 tokens. With 81.9 KB a token
+    // (81.25 GiB for 4 slots), the half-node budget backs 1.67M tokens at once, the looser one
+    // 2.68M, as much as before the cap (199.7 GiB).
+    let block = (gib(81.25) as f64 / (4 * 266_240 / KV_BLOCK) as f64) as u64;
+    let slot = 266_240 / KV_BLOCK;
+    let host = 16 * slot;
+    let at_load = Node {
+        block_bytes: block,
+        ..gemma_node()
+    };
+    let eager = auto_host_blocks(0, slot, host, 0, &[at_load]).unwrap();
+    let lazy = auto_host_blocks(0, slot, host, 0, &[at_load.backed_as_filled()]).unwrap();
+    assert!(eager < host && lazy < host);
+    assert!(
+        as_gib(lazy as u64 * block) > 199.7,
+        "{}",
+        as_gib(lazy as u64 * block)
+    );
+    assert!(as_gib(eager as u64 * block) < 127.8);
+    let err = auto_host_blocks(
+        0,
+        slot,
+        host,
+        0,
+        &[Node {
+            planned: gib(250.0),
+            ..at_load.backed_as_filled()
+        }],
+    )
+    .unwrap_err();
+    assert!(err.contains("pinning at most 80% of a node"), "{err}");
 }

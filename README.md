@@ -20,8 +20,8 @@ is no other choice (ggml provides the quantized kernels underneath).
   MoEs such as [Nemotron3.5-30B-A3B](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16),
   [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) and [Gemma4-26B-A4B](https://huggingface.co/google/gemma-4-26B-A4B-it).
 - **Hardware.** Built for unified memory: very good support for the IBM AC922 (V100
-  over NVLink 2.0 + ATS) and the DGX Spark (GB10). Models bigger than VRAM keep their
-  experts in host memory, read in place or cached in VRAM by heat. Minimum GPU: sm_70 (Volta).
+  over NVLink 2.0 + ATS) and the DGX Spark (GB10). Gaming PCs with one RTX card too: a MoE
+  much bigger than VRAM keeps its experts in RAM, the hot ones cached in VRAM by heat. Minimum GPU: sm_70 (Volta).
 - **Formats.** GGUF, and Hugging Face safetensors as shipped (BF16, FP8, NVFP4 and more), with no
   conversion step. See [GGUF and safetensors, one engine](#gguf-and-safetensors-one-engine).
 - **One user or many.** Fast single-stream decode with speculative decoding (MTP, n-gram, draft
@@ -70,75 +70,132 @@ being tuned.
 ## Performance
 
 Legion next to llama.cpp (GGUF weights) and vLLM (safetensors), on the same machines, weights, drafters and
-benchmark client. One table per model, one row per machine and engine. **Decode** is in tokens per second at 1, 4
+benchmark client. One section per model, one table per machine, one row per engine. **Decode** is in tokens per second at 1, 4
 and 16 users: per request at 1 user, the total over all requests at 4 and 16. **Prefill** is one prompt of 8K,
 32K or 123K tokens, in tokens per second. With drafting (MTP, DFlash 2) the 1-user speed
 depends on the prompt: a range such as 23-51 is the slowest to the fastest of the fixed benchmark prompts (prose,
 code, lists, chats), from the 2026-11-03 runs. `—`: not measured or did not finish (see the notes). **Bold**: Legion beats the other engine on the same machine with the same kind of weights (llama.cpp or Project Maya for GGUF,
-vLLM for NVFP4; at 1 user by median). Legion's greedy output is identical to the run without the opt-in flags unless a note
+vLLM for NVFP4, Strata on gaming PCs; at 1 user by median). Legion's greedy output is identical to the run without the opt-in flags unless a note
 says otherwise. Every command, Legion's and the other engines', is
 in [Run commands](#run-commands).
 
 Engines: Legion `main`; llama.cpp b12062 (`29c720e`, 2026-11-02, stock build); vLLM 0.33.0 (DGX Spark only; vLLM does not
 support the V100); [Project Maya](https://github.com/mw00/project-maya) v1.1.51, the engine the Maya-S GGUFs are made
-for (AC922, Maya-S only, its recommended setup: one sequence, its own MTP drafting). All with 16 sequences (`--max-seqs 16`, `-np 16 -kvu`, `--max-num-seqs 16`) and prefix caching
+for (AC922, Maya-S only, its recommended setup: one sequence, its own MTP drafting); [Strata](https://github.com/Niko1221/Strata)
+v0.2.13.1 (`628f749`, gaming PCs only, its recommended setup). All with 16 sequences (`--max-seqs 16`, `-np 16 -kvu`, `--max-num-seqs 16`) and prefix caching
 off. llama.cpp runs across two DGX Sparks with its RPC backend (layer split).
 
 ### Qwen3.8-Flash-Next
 
-| Machine | Engine | Weights | Drafting | Decode, 1 user | 4 users | 16 users | Prefill 8K | 32K | 123K |
-|---|---|---|---|--:|--:|--:|--:|--:|--:|
-| DGX Spark | Legion | [UD-Q4_K_XL GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | MTP | **44-64** | **83.8** | **109.4** | **1,872** | **2,008** | 1,916 |
-| DGX Spark | llama.cpp b12062 | UD-Q4_K_XL GGUF | none ¹ | 27-28 | 55.5 | 90.0 | 955 | 891 | — |
-| DGX Spark | Legion | [NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) | MTP ² | **36-59** | **91.7** | **172.9** | **2,353** | **2,450** | **2,276** |
-| DGX Spark | vLLM 0.33.0 | NVFP4 | MTP ³ | 28-39 | 72.9 | 150.3 | 1,797 | 2,381 | 1,663 |
-| 2x DGX Spark | Legion | UD-Q4_K_XL GGUF | MTP ⁴ | **55-70** | **112.6** | **216.9** | **2,933** | **2,940** | **2,758** |
-| 2x DGX Spark | llama.cpp b12062 | UD-Q4_K_XL GGUF | none ⁵ | 23-26 | 47.4 | 75.0 | 1,066 | 1,064 | 1,014 |
-| 2x DGX Spark | Legion | NVFP4 | MTP ⁴ | 39-52 | 113.7 | 240.5 | 2,990 | 3,122 | 2,956 |
-| 2x DGX Spark | vLLM 0.33.0 | NVFP4 | MTP ⁶ | 43-58 | 116.8 | 248.5 | 3,174 | 3,257 | 3,135 |
-| AC922, 2x V100 | Legion | UD-Q4_K_XL GGUF | MTP ⁷ | **70-90** | **86.4** | 88.5 | **2,789** | 4,094 | 4,302 |
-| AC922, 2x V100 | llama.cpp b12062 | UD-Q4_K_XL GGUF | MTP ⁸ | 11-13 | 7.3 | — | 120 | — | — |
-| AC922, 4x V100 | Legion | UD-Q4_K_XL GGUF | MTP ⁷ | **79-101** | 118.6 | 136.2 | 4,370 | 6,316 | 8,050 |
-| AC922, 4x V100 | llama.cpp b12062 | UD-Q4_K_XL GGUF | MTP ⁸ | 6-9 | — | — | — | — | — |
+#### DGX Spark
+
+| Engine | Weights | Drafting | Decode, 1 user | 4 users | 16 users | Prefill 8K | 32K | 123K |
+|---|---|---|--:|--:|--:|--:|--:|--:|
+| Legion | [UD-Q4_K_XL GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | MTP | **44-64** | **83.8** | **109.4** | **1,872** | **2,008** | 1,916 |
+| llama.cpp b12062 | UD-Q4_K_XL GGUF | none ¹ | 27-28 | 55.5 | 90.0 | 955 | 891 | — |
+| Legion | [NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) | MTP ² | **36-59** | **91.7** | **172.9** | **2,353** | **2,450** | **2,276** |
+| vLLM 0.33.0 | NVFP4 | MTP ³ | 28-39 | 72.9 | 150.3 | 1,797 | 2,381 | 1,663 |
+
+#### 2x DGX Spark
+
+| Engine | Weights | Drafting | Decode, 1 user | 4 users | 16 users | Prefill 8K | 32K | 123K |
+|---|---|---|--:|--:|--:|--:|--:|--:|
+| Legion | UD-Q4_K_XL GGUF | MTP ⁴ | **55-70** | **112.6** | **216.9** | **2,933** | **2,940** | **2,758** |
+| llama.cpp b12062 | UD-Q4_K_XL GGUF | none ⁵ | 23-26 | 47.4 | 75.0 | 1,066 | 1,064 | 1,014 |
+| Legion | NVFP4 | MTP ⁴ | 44-58 | **121.8** | 248.6 | **3,469** | **3,380** | 3,127 |
+| vLLM 0.33.0 | NVFP4 | MTP ⁶ | 43-58 | 116.8 | 248.5 | 3,174 | 3,257 | 3,135 |
+
+#### AC922, 2x V100
+
+| Engine | Weights | Drafting | Decode, 1 user | 4 users | 16 users | Prefill 8K | 32K | 123K |
+|---|---|---|--:|--:|--:|--:|--:|--:|
+| Legion | UD-Q4_K_XL GGUF | MTP ⁷ | **70-90** | **86.4** | 88.5 | **2,789** | 4,094 | 4,302 |
+| llama.cpp b12062 | UD-Q4_K_XL GGUF | MTP ⁸ | 11-13 | 7.3 | — | 120 | — | — |
+
+#### AC922, 4x V100
+
+| Engine | Weights | Drafting | Decode, 1 user | 4 users | 16 users | Prefill 8K | 32K | 123K |
+|---|---|---|--:|--:|--:|--:|--:|--:|
+| Legion | UD-Q4_K_XL GGUF | MTP ⁷ | **79-101** | 118.6 | 136.2 | 4,370 | 6,316 | 8,050 |
+| llama.cpp b12062 | UD-Q4_K_XL GGUF | MTP ⁸ | 6-9 | — | — | — | — | — |
+
+#### RTX 4090 gaming PC
+
+| RAM | Engine | Weights | Drafting | Decode, 1 user | Prefill 8K | 32K |
+|---|---|---|---|--:|--:|--:|
+| 128 GB DDR5-4800 | Legion | UD-Q4_K_XL GGUF | none ¹⁷ | 60-61 | 2,709 | 4,616 |
+| 128 GB DDR5-4800 | Strata v0.2.13.1 | UD-Q4_K_XL GGUF | its own ¹⁸ | 61-64 | 2,788 | 5,245 |
+| 64 GB DDR5-4800 | Legion | UD-Q4_K_XL GGUF | none ¹⁷ | **46-49** | **1,660** | **2,336** |
+| 64 GB DDR5-4800 | Strata v0.2.13.1 | UD-Q4_K_XL GGUF | its own ¹⁸ | 38-44 | 1,377 | 2,109 |
+| 32 GB DDR5-4800 | Legion | UD-Q4_K_XL GGUF | none ¹⁷ | **24-26** | **888** | **1,215** |
+| 32 GB DDR5-4800 | Strata v0.2.13.1 | UD-Q4_K_XL GGUF | its own ¹⁸ | 16-21 | 616 | 836 |
 
 ### Qwen3.8-27B
 
-| Machine | Engine | Weights | Drafting | Decode, 1 user | 4 users | 16 users | Prefill 8K | 32K | 123K |
-|---|---|---|---|--:|--:|--:|--:|--:|--:|
-| DGX Spark | Legion | [UD-Q4_K_XL GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) | MTP ⁹ | **23-40** | **80.1** | **121.7** | **880** | **822** | 652 |
-| DGX Spark | llama.cpp b12062 | UD-Q4_K_XL GGUF | MTP n=3 | 22-31 | 61.4 | 108.3 | 821 | 795 | — |
-| DGX Spark | Legion | [NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) | DFlash 2 ⁹ | **23-51** | **97.0** | **235.2** | **2,697** | **2,309** | 1,438 |
-| DGX Spark | vLLM 0.33.0 | NVFP4 | DFlash 2 | 20-45 | 84.2 | 193.1 | 2,548 | 2,140 | — |
-| AC922, 2x V100 | Legion | UD-Q4_K_XL GGUF | MTP ⁹ | 58-79 | **122.1** | **194.6** | **1,375** | **1,023** | **509** |
-| AC922, 2x V100 | llama.cpp b12062 | UD-Q4_K_XL GGUF | MTP n=3 | 63-85 | 105.4 | 148.6 | 807 | 732 | 500 |
+#### DGX Spark
+
+| Engine | Weights | Drafting | Decode, 1 user | 4 users | 16 users | Prefill 8K | 32K | 123K |
+|---|---|---|--:|--:|--:|--:|--:|--:|
+| Legion | [UD-Q4_K_XL GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) | MTP ⁹ | **23-40** | **80.1** | **121.7** | **880** | **822** | 652 |
+| llama.cpp b12062 | UD-Q4_K_XL GGUF | MTP n=3 | 22-31 | 61.4 | 108.3 | 821 | 795 | — |
+| Legion | [NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) | DFlash 2 ⁹ | **23-51** | **97.0** | **235.2** | **2,697** | **2,309** | 1,438 |
+| vLLM 0.33.0 | NVFP4 | DFlash 2 | 20-45 | 84.2 | 193.1 | 2,548 | 2,140 | — |
+
+#### AC922, 2x V100
+
+| Engine | Weights | Drafting | Decode, 1 user | 4 users | 16 users | Prefill 8K | 32K | 123K |
+|---|---|---|--:|--:|--:|--:|--:|--:|
+| Legion | UD-Q4_K_XL GGUF | MTP ⁹ | 58-79 | **122.1** | **194.6** | **1,375** | **1,023** | **509** |
+| llama.cpp b12062 | UD-Q4_K_XL GGUF | MTP n=3 | 63-85 | 105.4 | 148.6 | 807 | 732 | 500 |
 
 ### Gemma 4 31B
 
-| Machine | Engine | Weights | Drafting | Decode, 1 user | 4 users | 16 users | Prefill 8K | 32K | 123K |
-|---|---|---|---|--:|--:|--:|--:|--:|--:|
-| DGX Spark | Legion | [QAT UD-Q4_K_XL GGUF](https://huggingface.co/unsloth/gemma-4-31B-it-qat-GGUF) | MTP ⁹ | **24-49** | **93.0** | **254.9** | **791** | **704** | 532 |
-| DGX Spark | llama.cpp b12062 | QAT UD-Q4_K_XL GGUF | MTP n=3 | 24-36 | 65.1 | 213.9 | 773 | 671 | — |
-| DGX Spark | Legion | [NVFP4](https://huggingface.co/RedHatAI/gemma-4-31B-it-NVFP4) | DFlash 2 ¹⁰ | **22-39** | **83.9** | **252.4** | **2,041** | **1,630** | 907 |
-| DGX Spark | vLLM 0.33.0 | NVFP4 | DFlash 2 | 18-35 | 77.5 | 244.3 | 1,795 | 1,029 | — |
-| 2x DGX Spark | Legion | QAT UD-Q4_K_XL GGUF | MTP ¹¹ | 37-66 | 119.9 | 202.6 | 975 | 925 | 744 |
-| AC922, 2x V100 | Legion | QAT UD-Q4_K_XL GGUF | MTP ¹² | 64-106 | **141.1** | **247.2** | **1,000** | **799** | **441** |
-| AC922, 2x V100 | llama.cpp b12062 | QAT UD-Q4_K_XL GGUF | MTP n=3 | 75-102 | 129.1 | 196.4 | 774 | 489 | 288 |
+#### DGX Spark
+
+| Engine | Weights | Drafting | Decode, 1 user | 4 users | 16 users | Prefill 8K | 32K | 123K |
+|---|---|---|--:|--:|--:|--:|--:|--:|
+| Legion | [QAT UD-Q4_K_XL GGUF](https://huggingface.co/unsloth/gemma-4-31B-it-qat-GGUF) | MTP ⁹ | **24-49** | **93.0** | **254.9** | **791** | **704** | 532 |
+| llama.cpp b12062 | QAT UD-Q4_K_XL GGUF | MTP n=3 | 24-36 | 65.1 | 213.9 | 773 | 671 | — |
+| Legion | [NVFP4](https://huggingface.co/RedHatAI/gemma-4-31B-it-NVFP4) | DFlash 2 ¹⁰ | **22-39** | **83.9** | **252.4** | **2,041** | **1,630** | 907 |
+| vLLM 0.33.0 | NVFP4 | DFlash 2 | 18-35 | 77.5 | 244.3 | 1,795 | 1,029 | — |
+
+#### 2x DGX Spark
+
+| Engine | Weights | Drafting | Decode, 1 user | 4 users | 16 users | Prefill 8K | 32K | 123K |
+|---|---|---|--:|--:|--:|--:|--:|--:|
+| Legion | QAT UD-Q4_K_XL GGUF | MTP ¹¹ | 37-66 | 119.9 | 202.6 | 975 | 925 | 744 |
+
+#### AC922, 2x V100
+
+| Engine | Weights | Drafting | Decode, 1 user | 4 users | 16 users | Prefill 8K | 32K | 123K |
+|---|---|---|--:|--:|--:|--:|--:|--:|
+| Legion | QAT UD-Q4_K_XL GGUF | MTP ¹² | 64-106 | **141.1** | **247.2** | **1,000** | **799** | **441** |
+| llama.cpp b12062 | QAT UD-Q4_K_XL GGUF | MTP n=3 | 75-102 | 129.1 | 196.4 | 774 | 489 | 288 |
 
 ### GLM-5.3-Flash Maya-S v2 IQ2_XXS
 
-| Machine | Engine | Weights | Drafting | Decode, 1 user | 4 users | 16 users | Prefill 8K | 32K | 123K |
-|---|---|---|---|--:|--:|--:|--:|--:|--:|
-| DGX Spark | Legion | [GGUF](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF) | MTP k=2 ⁹ | 24-29 | **42.5** | **69.3** | **689** | **633** | **498** |
-| DGX Spark | llama.cpp b12062 | GGUF | MTP n=2 | 25-27 | 39.4 | 58.6 | 331 | 313 | — ¹⁶ |
-| AC922, 4x V100 | Legion | GGUF | MTP k=2 ¹³ | **61-68** | **71.4** | **84.0** | **1,299** | **1,302** | **1,205** |
-| AC922, 4x V100 | Project Maya 1.1.51 | GGUF | MTP ¹⁴ | 53-63 | 52.2 | — | 859 | 1,214 | — |
+#### DGX Spark
+
+| Engine | Weights | Drafting | Decode, 1 user | 4 users | 16 users | Prefill 8K | 32K | 123K |
+|---|---|---|--:|--:|--:|--:|--:|--:|
+| Legion | [GGUF](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF) | MTP k=2 ⁹ | 24-29 | **42.5** | **69.3** | **689** | **633** | **498** |
+| llama.cpp b12062 | GGUF | MTP n=2 | 25-27 | 39.4 | 58.6 | 331 | 313 | — ¹⁶ |
+
+#### AC922, 4x V100
+
+| Engine | Weights | Drafting | Decode, 1 user | 4 users | 16 users | Prefill 8K | 32K | 123K |
+|---|---|---|--:|--:|--:|--:|--:|--:|
+| Legion | GGUF | MTP k=2 ¹³ | **61-68** | **71.4** | **84.0** | **1,299** | **1,302** | **1,205** |
+| Project Maya 1.1.51 | GGUF | MTP ¹⁴ | 53-63 | 52.2 | — | 859 | 1,214 | — |
 
 ### GLM-5.3-Flash UD-Q4_K_XL
 
-| Machine | Engine | Weights | Drafting | Decode, 1 user | 4 users | 16 users | Prefill 8K | 32K | 123K |
-|---|---|---|---|--:|--:|--:|--:|--:|--:|
-| AC922, 4x V100 | Legion | [UD-Q4_K_XL GGUF](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) | MTP k=2 ¹³ | **39-44** | **42.7** | 55.4 | **1,198** | **1,171** | 1,120 |
-| AC922, 4x V100 | llama.cpp b12062 | UD-Q4_K_XL GGUF | MTP n=2 ¹⁵ | 3-4 | 3.4 | — | 25 | — | — |
+#### AC922, 4x V100
+
+| Engine | Weights | Drafting | Decode, 1 user | 4 users | 16 users | Prefill 8K | 32K | 123K |
+|---|---|---|--:|--:|--:|--:|--:|--:|
+| Legion | [UD-Q4_K_XL GGUF](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) | MTP k=2 ¹³ | **39-44** | **42.7** | 55.4 | **1,198** | **1,171** | 1,120 |
+| llama.cpp b12062 | UD-Q4_K_XL GGUF | MTP n=2 ¹⁵ | 3-4 | 3.4 | — | 25 | — | — |
 
 ¹ No drafting: llama.cpp b12062 aborts with the MTP drafter on this model. 123K did not finish in 20 minutes.
 
@@ -172,7 +229,16 @@ off. llama.cpp runs across two DGX Sparks with its RPC backend (layer split).
 
 ¹⁶ The 123K request (about 86K GLM tokens) does not fit the run command's 64K context (`-c 65536`, shared by 16 sequences).
 
-Measured 2026-10-20 to 2026-11-12. Each new speed record is added here.
+¹⁷ One RTX 4090 (24 GB, PCIe 4.0, a desktop session using 1.2 GB of it), a Ryzen 9 7950X3D and DDR5-4800 RAM. The experts that do not fit
+VRAM stay in RAM, and with the opt-in `--cpu-expert-share auto` the CPU computes part of the RAM misses with the GPU's
+bits (same output). 4 sequences (`--max-seqs 4`). 64 and 32 GB: the same PC under a memory limit with no swap. Decode is three single-user chats
+right after the load, not the fixed benchmark prompts; prefill is one request each, tok/s to the first token. 4 and
+16 users and 123K were not measured.
+
+¹⁸ Strata's own speculative decoding (`--spec 4`) and int8 KV; its output differs from Legion's. 64 and 32 GB with
+`--resident-budget-gib 40` and `8` (see the run command).
+
+Measured 2026-10-20 to 2026-11-15. Each new speed record is added here.
 
 ## Roadmap
 
@@ -183,10 +249,9 @@ Measured 2026-10-20 to 2026-11-12. Each new speed record is added here.
 
 **Hardware**, after the AC922 and the DGX Spark, in this order:
 
-1. **Gaming PCs with MoE streaming.** RTX 30/40/50 cards with 16-32 GB of VRAM on PCIe. MoE models
-   much larger than VRAM: the hot experts stay cached in VRAM, the rest are read from host RAM or
-   straight from an NVMe SSD, and the next layers' experts are prefetched while the current
-   layer runs.
+1. **Gaming PCs with MoE streaming** (started: the RTX 4090 rows above). RTX 30/40/50 cards with 16-32 GB of
+   VRAM on PCIe. MoE models much larger than VRAM: the hot experts stay cached in VRAM, the rest are read from host
+   RAM or straight from an NVMe SSD, and the next layers' experts are prefetched while the current layer runs.
 2. **Grace Hopper (GH200).** H100/H200 behind NVLink-C2C to the Grace CPU, unified memory like the
    AC922 and the Spark but much faster, so host-resident experts cost far less.
 3. **Grace Blackwell (GB200 / GB300).** Blackwell GPUs with Grace over NVLink-C2C, native NVFP4
@@ -219,6 +284,10 @@ The exact `legion serve` command behind every row of the tables, and how it was 
 - [GLM-5.3-Flash UD-Q4_K_XL, 4x V100 SXM2 16 GB](docs/run/ac922/glm-53-flash-ud-q4-k-xl-4x.md)
 - [Gemma 4 31B QAT UD-Q4_K_XL, 2x V100 SXM2 16 GB](docs/run/ac922/gemma-4-31b-qat-ud-q4-k-xl-2x.md)
 - [Qwen3.8-27B UD-Q4_K_XL, 2x V100 SXM2 16 GB](docs/run/ac922/qwen38-27b-ud-q4-k-xl-2x.md)
+
+**Gaming PCs**
+
+- [Qwen3.8-Flash-Next UD-Q4_K_XL, RTX 4090 + Ryzen 9 7950X3D, 128 / 64 / 32 GB DDR5-4800](docs/run/gaming-pc/qwen38-flash-next-ud-q4-k-xl-rtx4090.md)
 
 ## Build
 
@@ -265,7 +334,7 @@ The equivalent environment variables are `LEGION_TLS_CERT` and `LEGION_TLS_KEY`.
 
 ## Docs
 
-- [docs/run](docs/run/README.md): the command lines behind the performance tables, one page per model and machine (DGX Spark, IBM AC922)
+- [docs/run](docs/run/README.md): the command lines behind the performance tables, one page per model and machine (DGX Spark, IBM AC922, gaming PCs)
 - [docs/ac922.md](docs/ac922.md): running on the IBM AC922: RHEL 8, NVLink 2.0, the kernel and driver it needs (550.54.15, the power9-nvidia-nvlink2 patches), gcc-toolset-12, build and run
 - [docs/serving.md](docs/serving.md): guide to running the server and connecting clients
 - [docs/clients.md](docs/clients.md): curl, open-webui, openai-python, anthropic-python and Claude Code against `legion serve`

@@ -58,7 +58,7 @@ mod waves;
 use chat_format::ChatFormat;
 use response_format::{Constraint, GrammarCache, MaskPool};
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -621,8 +621,8 @@ pub(crate) fn default_mtp_window(arch: &str, mtp: bool, integrated: bool) -> usi
     }
 }
 
-/// Why `--spec-draft-vocab n` cannot apply, if it cannot: it is for the MTP heads of qwen4exp
-/// and qwen35 and for DFlash drafters (`dflash`), and below the vocabulary's size.
+/// Why `--spec-draft-vocab n` cannot apply, if it cannot: it is for the MTP heads of qwen4exp,
+/// qwen35 and glm5-next and for DFlash drafters (`dflash`), and below the vocabulary's size.
 pub(crate) fn draft_vocab_unused(
     n: usize,
     mtp: bool,
@@ -632,10 +632,12 @@ pub(crate) fn draft_vocab_unused(
 ) -> Option<String> {
     if n == 0 {
         None
-    } else if !dflash && (!mtp || !matches!(arch, "qwen4exp" | "qwen35" | "qwen35moe")) {
+    } else if !dflash
+        && (!mtp || !matches!(arch, "qwen4exp" | "qwen35" | "qwen35moe" | "glm5-next"))
+    {
         Some(format!(
-            "--spec-draft-vocab applies to the MTP heads of qwen4exp and qwen35 (--spec mtp) \
-             and to DFlash drafters (--spec dflash) only, not {arch}: ignored"
+            "--spec-draft-vocab applies to the MTP heads of qwen4exp, qwen35 and glm5-next \
+             (--spec mtp) and to DFlash drafters (--spec dflash) only, not {arch}: ignored"
         ))
     } else if n as i64 >= n_vocab {
         Some(format!(
@@ -647,15 +649,16 @@ pub(crate) fn draft_vocab_unused(
 }
 
 /// Why `--spec-draft-lm-head q4` does not apply to the MTP head of `arch`, if it does not: only
-/// the qwen4exp and qwen35 heads draft with the copy.
+/// the qwen4exp, qwen35 and glm5-next heads draft with the copy.
 pub(crate) fn mtp_lm_head_unused(h: crate::spec::DraftLmHead, arch: &str) -> Option<String> {
-    (h == crate::spec::DraftLmHead::Q4 && !matches!(arch, "qwen4exp" | "qwen35" | "qwen35moe"))
-        .then(|| {
-            format!(
-                "--spec-draft-lm-head applies to the MTP heads of qwen4exp and qwen35 only, \
-                 not {arch}: ignored"
-            )
-        })
+    (h == crate::spec::DraftLmHead::Q4
+        && !matches!(arch, "qwen4exp" | "qwen35" | "qwen35moe" | "glm5-next"))
+    .then(|| {
+        format!(
+            "--spec-draft-lm-head applies to the MTP heads of qwen4exp, qwen35 and glm5-next \
+             only, not {arch}: ignored"
+        )
+    })
 }
 
 /// Whether the model's own MTP head drafts: `--spec mtp` without a draft model or token drafter.
@@ -1504,6 +1507,11 @@ pub struct LmEngine {
     load_report: report::LoadReport,
     /// `--pipeline-mtp-split`'s measurements, shared with the worker (#765).
     split_probe: Option<Arc<Mutex<pipe_split::Probe>>>,
+    /// An automatic KV host tier's place in the process's plan (#1163): dropped after the
+    /// worker (and the tier with it).
+    _tier_plan: Option<host_tier::Reservation>,
+    /// [`Engine::set_warming`], shared with the worker.
+    warming: Arc<AtomicBool>,
 }
 
 impl Drop for LmEngine {
@@ -1979,8 +1987,17 @@ fn fit_tp_slots(
                 )));
             }
             TpTier::Auto(nodes) => {
-                // One slot's context on the host at least; past what the host holds, the
-                // slots' host blocks are backed as they fill (#1131).
+                // One slot's context on the host at least; past what the budgets for a tier
+                // pinned at load hold, or with shared VRAM chunks, the slots' host blocks are
+                // backed as they fill (#1131), from the looser budgets of such tiers (#1163).
+                let lazy = lend > 0 || host_tier::budget_blocks(nodes) < host;
+                let lazy_nodes: Vec<host_tier::Node>;
+                let nodes = if lazy {
+                    lazy_nodes = nodes.iter().map(|n| n.backed_as_filled()).collect();
+                    &lazy_nodes
+                } else {
+                    nodes
+                };
                 let held = host_tier::auto_host_blocks(
                     hbm_slot,
                     slot_blocks,
@@ -1989,9 +2006,10 @@ fn fit_tp_slots(
                     nodes,
                 )
                 .map_err(LoadError::Device)?;
-                if held < host {
+                // Every slot backed (`held` = `host`) needs no room past the slots' chunks.
+                if held < host || (lazy && lend == 0) {
                     let cap = lazy_slot_cap(held, n_seqs);
-                    if cap < slot_blocks {
+                    if held < host && cap < slot_blocks {
                         return Err(LoadError::Device(format!(
                             "--kv-slots: the host has room for {} tokens of KV cache past the \
                              GPUs ({}), short of one {}-token context besides the {n_seqs} \
@@ -2075,8 +2093,14 @@ enum TpTier {
 }
 
 /// The tier [`fit_tp_cache`] may give a tensor-parallel cache of `block_bytes` per block (over
-/// all the GPUs): as given, or automatic where every GPU's driver maps host NUMA memory.
-fn tp_tier(cfg: &LmConfig, layout: &layout::Layout, block_bytes: usize) -> Result<TpTier, String> {
+/// all the GPUs): as given, or automatic where every GPU's driver maps host NUMA memory, from
+/// the budgets `owner` shares with the process's other loads ([`host_tier::serve_node`]).
+fn tp_tier(
+    cfg: &LmConfig,
+    layout: &layout::Layout,
+    block_bytes: usize,
+    owner: host_tier::Owner,
+) -> Result<TpTier, String> {
     if let Some(t) = cfg.kv_host_tokens {
         return Ok(if t == 0 {
             TpTier::Off
@@ -2100,18 +2124,9 @@ fn tp_tier(cfg: &LmConfig, layout: &layout::Layout, block_bytes: usize) -> Resul
         let bytes = (block_bytes / n_dev) as u64;
         match nodes.iter_mut().find(|n| n.node == node) {
             Some(n) => n.block_bytes += bytes,
-            None => {
-                let mem = host_tier::node_memory(node).ok_or_else(|| {
-                    format!("cannot read NUMA node {node}'s memory for the KV host tier")
-                })?;
-                nodes.push(host_tier::Node {
-                    node,
-                    block_bytes: bytes,
-                    free: mem.free,
-                    cache: mem.cache,
-                    total: mem.total,
-                });
-            }
+            None => nodes.push(host_tier::serve_node(owner, node, bytes).ok_or_else(|| {
+                format!("cannot read NUMA node {node}'s memory for the KV host tier")
+            })?),
         }
     }
     Ok(TpTier::Auto(nodes))
@@ -2331,64 +2346,98 @@ fn tp_tier_for(
 /// The automatic host tier's tokens (`--kv-host-tokens` not given): 0 unless a context does
 /// not fit in GPU memory (`fit_full` blocks, before the expert cache's share) on a layer split
 /// or one discrete CUDA GPU with an automatic pool; then the rest of the automatic pool (`want`)
-/// past the `n_blocks` the device holds, capped by the GPUs' NUMA nodes' free memory. Where the
-/// tier cannot be had (no host NUMA memory through VMM), 0: the load goes on as without it
-/// (and fails as before when a native context does not fit).
-#[allow(clippy::too_many_arguments)]
+/// past the `n_blocks` the device holds, capped by the budgets of the GPUs' NUMA nodes
+/// ([`host_tier::node_budget`], shared with the process's other loads). Where the tier cannot
+/// be had (no host NUMA memory through VMM), 0: the load goes on as without it (and fails as
+/// before when a native context does not fit). Also the most host tokens the budgets hold.
+/// `stage_bytes`: per stage, the bytes a KV block takes over its pools (the MTP head's own with
+/// the last stage's), all of which the tier holds past the device blocks.
 fn auto_host_tokens(
     layout: &layout::Layout,
     cfg: &LmConfig,
-    hp: &crate::model::core::Hparams,
+    owner: host_tier::Owner,
+    stage_bytes: &[usize],
     (fit, fit_full): (Option<usize>, Option<usize>),
     (ctx_blocks, n_blocks): (usize, usize),
-    want: usize,
-    (ring, types, shared): (bool, crate::model::core::kv_type::KvTypes, bool),
-) -> Result<usize, String> {
+    (want, shared): (usize, bool),
+) -> Result<(usize, usize), String> {
     let (Some(_), Some(full)) = (fit, fit_full) else {
-        return Ok(0);
+        return Ok((0, 0));
     };
     if cfg.tp > 1 || shared || cfg.kv_cache_tokens.is_some() || full >= ctx_blocks {
-        return Ok(0);
+        return Ok((0, 0));
     }
     // Per node: the bytes a host block takes over the stages whose GPU is on it.
     let mut nodes: Vec<host_tier::Node> = Vec::new();
-    for (d, layers) in &layout.stages {
+    for (si, (d, _)) in layout.stages.iter().enumerate() {
         let Some(device) = d.and_then(cuda_index) else {
-            return Ok(0);
+            return Ok((0, 0));
         };
         let Some(node) = tier_node(device) else {
             tracing::warn!(
                 "the {}-token context does not fit in CUDA{device}'s memory, and its driver                  cannot map host NUMA memory for a KV host tier",
                 cfg.ctx_size
             );
-            return Ok(0);
+            return Ok((0, 0));
         };
-        let bytes = KvPool::block_bytes_paged(hp, layers.clone(), ring, types) as u64;
+        let bytes = stage_bytes.get(si).copied().unwrap_or(0) as u64;
         // `--tp-per-gpu`: the other rank pins as much for each block, on the same node when
         // its GPU is there.
         let bytes = bytes * pair_ranks_on(cfg.tp_pair.as_ref(), node);
         match nodes.iter_mut().find(|n| n.node == node) {
             Some(n) => n.block_bytes += bytes,
-            None => {
-                let mem = host_tier::node_memory(node).ok_or_else(|| {
-                    format!("cannot read NUMA node {node}'s memory for the KV host tier")
-                })?;
-                nodes.push(host_tier::Node {
-                    node,
-                    block_bytes: bytes,
-                    free: mem.free,
-                    cache: mem.cache,
-                    total: mem.total,
-                });
-            }
+            None => nodes.push(host_tier::serve_node(owner, node, bytes).ok_or_else(|| {
+                format!("cannot read NUMA node {node}'s memory for the KV host tier")
+            })?),
         }
     }
     let blocks = host_tier::auto_host_blocks(full, ctx_blocks, want, n_blocks, &nodes)?;
-    Ok(blocks * KV_BLOCK)
+    Ok((
+        blocks * KV_BLOCK,
+        host_tier::budget_blocks(&nodes) * KV_BLOCK,
+    ))
+}
+
+/// Per NUMA node, the bytes one host block of a load's tier takes there: an automatic
+/// tensor-parallel tier's as sized (`tp_nodes`), else each stage's (`stage_bytes`) on its
+/// tier's node (`stage_nodes`; `None`: no tier).
+fn tier_plan_bytes(
+    tp_nodes: &[host_tier::Node],
+    stage_nodes: &[Option<u32>],
+    stage_bytes: &[usize],
+) -> Vec<(u32, u64)> {
+    if !tp_nodes.is_empty() {
+        return tp_nodes.iter().map(|n| (n.node, n.block_bytes)).collect();
+    }
+    let mut out: Vec<(u32, u64)> = Vec::new();
+    for (node, &bytes) in stage_nodes.iter().zip(stage_bytes) {
+        let Some(node) = *node else { continue };
+        match out.iter_mut().find(|p| p.0 == node) {
+            Some(p) => p.1 += bytes as u64,
+            None => out.push((node, bytes as u64)),
+        }
+    }
+    out
+}
+
+/// The owner of this load's KV host tier in the process's plan ([`host_tier::Ledger`]):
+/// `--tp-per-gpu`'s ranks share their pair's group, any other load has one of its own.
+fn tier_owner(cfg: &LmConfig) -> host_tier::Owner {
+    match &cfg.tp_pair {
+        Some(p) => host_tier::Owner {
+            group: p.group,
+            rank: p.rank,
+        },
+        None => host_tier::Owner {
+            group: host_tier::new_group(),
+            rank: 0,
+        },
+    }
 }
 
 /// The `--tp-per-gpu` ranks whose KV host tiers would sit on NUMA node `node`, this one's
-/// included (1 without the pair): each rank sizes its tier alone, from the same free memory.
+/// included (1 without the pair): the pair's budget there split evenly between them, from the
+/// node's memory as the first of them read it ([`host_tier::serve_node`]).
 fn pair_ranks_on(pair: Option<&tp_pair::TpPairRank>, node: u32) -> u64 {
     let Some(p) = pair else { return 1 };
     let other = (p.cuda - p.rank) + (1 - p.rank);
@@ -3157,7 +3206,7 @@ fn build_expert_cache(
                 let need = long.get(i).copied().unwrap_or(0)
                     + 2 * COMPUTE_MARGIN
                     + pinned.get(i).copied().unwrap_or(0);
-                (need as u64 + cfg.cache_reserve).saturating_sub(beside)
+                (need as u64 + cfg.lend_reserve.unwrap_or(cfg.cache_reserve)).saturating_sub(beside)
             })
             .collect();
     }
@@ -3693,6 +3742,7 @@ fn log_memory_plan(
         gpus,
         host,
         expert_shrunk,
+        kv_host_tier_nodes: host_tier::serve_plan(),
     });
 }
 
@@ -3711,6 +3761,11 @@ fn model_id(cfg: &LmConfig, gguf: &GgufFile) -> String {
 impl LmEngine {
     /// Loads the model (blocking: run it off the async runtime) and starts the worker thread.
     pub fn load(mut cfg: LmConfig) -> Result<Self, LoadError> {
+        // A dense qwen35 has no meta-device split: `--tp 2` runs it as two ranks (#1163).
+        if !cfg.tp_per_gpu && tp_pair::implied(&cfg) {
+            tracing::info!("--tp 2 on a dense qwen35 model: one rank per GPU (as --tp-per-gpu)");
+            cfg.tp_per_gpu = true;
+        }
         // `--tp-per-gpu`: rank 1 loads on a thread of its own, this call goes on as rank 0.
         if cfg.tp_per_gpu {
             return tp_pair::load(cfg);
@@ -3825,6 +3880,62 @@ impl LmEngine {
             .as_deref()
             .map(crate::residency::ssd_experts::skipped_tensors)
             .unwrap_or_default();
+        // Routed experts that do not fit in the host memory of a discrete-GPU machine: a
+        // bounded set of RAM slots, the rest read from the checkpoint as routed (#37).
+        let host_tier = if ssd_layers.is_some() {
+            None
+        } else {
+            ssd_tier::host_tier_plan(&cfg, &gguf, &layout)?
+        };
+        if host_tier.is_some() {
+            let n_layer = crate::model::core::Hparams::from_gguf(&gguf)?.n_layer;
+            skip.extend(crate::residency::host_tier::skipped_tensors(n_layer));
+            // The RAM is the experts': the n-gram table stays on the SSD.
+            if cfg.ngram.io == crate::residency::lookup_table::TableIo::Auto {
+                cfg.ngram.io = crate::residency::lookup_table::TableIo::Direct;
+            }
+            // Prompts lend the VRAM cache and run as staged passes
+            // ([`crate::residency::host_tier`]), shorter ones than elsewhere: a chunk of an
+            // unlent cache reads the checkpoint for what it routes to.
+            if cfg.long_prompts.min_tokens == LongPrompts::default().min_tokens {
+                cfg.long_prompts.min_tokens = ssd_tier::HOST_TIER_LONG;
+            }
+        }
+        // The same machine and model with every routed expert in host memory (no tier): the
+        // saved routing heat and the KV tail's lend below serve its VRAM slots all the same.
+        let tier_whole = host_tier.is_none()
+            && ssd_layers.is_none()
+            && ssd_tier::host_tier_applies(&cfg, &gguf, &layout)?;
+        // The routing heat of the last run fills the VRAM slots (and the tier's RAM slots) at
+        // load.
+        if (host_tier.is_some() || tier_whole) && cfg.residency.profile.is_none() {
+            cfg.residency.tier_heat = ssd_tier::host_tier_heat_path(&gguf);
+        }
+        // With every routed expert in host memory, that heat sizes the layers too (#37 round
+        // 17: +1.2% decode on a 24 GB card). `LEGION_DEBUG_HEAT_SIZES=0` keeps even sizes, for
+        // A/B runs.
+        cfg.residency.tier_heat_sizes = tier_whole
+            && cfg.residency.tier_heat.is_some()
+            && std::env::var_os("LEGION_DEBUG_HEAT_SIZES").is_none_or(|v| v != "0");
+        // Its one GPU's reserve beside the cache, where `--expert-cache-reserve-mib` is at its
+        // default: what was measured in use there, not the layer splits' share.
+        if (host_tier.is_some() || tier_whole)
+            && cfg.residency.cache_reserve == crate::residency::CACHE_RESERVE
+        {
+            // A long prompt's lend leaves free what it did with the default reserve: the staged
+            // passes are sized to it.
+            cfg.residency.lend_reserve = Some(ssd_tier::HOST_TIER_LEND_RESERVE);
+            cfg.residency.cache_reserve = ssd_tier::HOST_TIER_RESERVE;
+            // One stage's shared host memory is the embeddings moved off the tier's GPU.
+            if host_tier.is_some() && layout.shared_host.is_some() && layout.stages.len() == 1 {
+                cfg.residency.cache_reserve += ssd_tier::HOST_TIER_EMBD_RESERVE;
+            }
+        }
+        // Every routed expert in host memory there: more swaps a pass, where
+        // `--expert-swaps` is not given (placement only).
+        if tier_whole && !cfg.residency.swaps_given {
+            cfg.residency.swaps.budget = ssd_tier::HOST_TIER_WHOLE_SWAPS;
+        }
         // The other machine's layers and head.
         let hp_file = crate::model::core::Hparams::from_gguf(&gguf)?;
         skip.extend(layout.node_skipped(&gguf, hp_file.n_layer));
@@ -3890,6 +4001,10 @@ impl LmEngine {
         if let Some(layers) = &ssd_layers {
             let tier = ssd_tier::build(&cfg, &gguf, &layout, &model.hp, layers)?;
             model.set_ssd_experts(tier);
+        }
+        if let Some(plan) = &host_tier {
+            let tier = ssd_tier::host_tier_build(&cfg, &gguf, &layout, &model.hp, plan)?;
+            model.set_host_tier(tier);
         }
         if cfg.pair_tp {
             pair_tp::set_up(&cfg, &mut model, &layout)?;
@@ -4072,7 +4187,21 @@ impl LmEngine {
         ) {
             Some(why) => tracing::warn!(draft_vocab = cfg.draft_vocab, "{why}"),
             None if dflash => dflash_vocab = cfg.draft_vocab,
-            None => model.set_draft_vocab(cfg.draft_vocab),
+            None => {
+                model.set_draft_vocab(cfg.draft_vocab);
+                // GLM-5.3-Flash: the number tokens too, which its vocabulary keeps far past
+                // the first rows (#1172).
+                if model.hp.arch.name() == "glm5-next"
+                    && let Some(ids) = model.glm_draft_ids(|i| tokenizer.token_to_piece(i))
+                {
+                    tracing::info!(
+                        draft_vocab = cfg.draft_vocab,
+                        rows = ids.len(),
+                        "MTP drafts over the first tokens and the number tokens"
+                    );
+                    model.set_draft_ids(ids);
+                }
+            }
         }
         if mtp && !head_on_peer && !model.has_mtp() {
             // The head's GGUF, else a safetensors checkpoint's own head (`mtp.*`), as shipped.
@@ -4368,21 +4497,41 @@ impl LmEngine {
             }
         };
         // The host tier's tokens: as given, or automatic (a discrete GPU whose memory does not
-        // hold a context, see `host_tier`).
+        // hold a context, see `host_tier`), from the budgets this load shares with the
+        // process's others (#1163); with the most the budgets hold.
         let auto_tier = cfg.kv_host_tokens.is_none();
-        let mut host_tokens = match cfg.kv_host_tokens {
-            Some(t) => t,
+        let tier_owner = tier_owner(&cfg);
+        // Per stage: the bytes a block takes over its pools, the MTP head's with the last
+        // stage's, as the fit counts them (the host tier holds them all).
+        let tier_stage_bytes: Vec<usize> = (layout.stages.iter().enumerate())
+            .map(|(si, (_, layers))| {
+                let mtp = if si + 1 == layout.stages.len() {
+                    mtp_block
+                } else {
+                    0
+                };
+                KvPool::block_bytes_paged(pool_hp, pool_layers(layers), ring.is_some(), types) + mtp
+            })
+            .collect();
+        let (mut host_tokens, tier_most_tokens) = match cfg.kv_host_tokens {
+            Some(t) => (t, usize::MAX),
             None => auto_host_tokens(
                 &layout,
                 &cfg,
-                &hp,
+                tier_owner,
+                &tier_stage_bytes,
                 (fit, fit_full),
                 (ctx_blocks, n_blocks),
-                auto_kv_want(max_seqs, ctx_blocks, cache_split, shared),
-                (ring.is_some(), types, shared),
+                (
+                    auto_kv_want(max_seqs, ctx_blocks, cache_split, shared),
+                    shared,
+                ),
             )
             .map_err(LoadError::Device)?,
         };
+        // Per node: the bytes a host block of an automatic tensor-parallel tier takes there
+        // (`tp_tier`), for the process's plan.
+        let mut tp_tier_nodes: Vec<host_tier::Node> = Vec::new();
         // Tensor parallelism: a small cache first, to measure the compute buffers next to it;
         // the cache is then sized to what they leave (see `fit_tp_cache`).
         let tp_fit = cfg.tp > 1;
@@ -4493,7 +4642,12 @@ impl LmEngine {
         };
         let mut exec = made
             .and_then(|mut exec| {
-                if layout.node.is_some() || tp_start.is_some() {
+                // The ranks of tensor parallelism over machines may defer their wide commits,
+                // each its own (--tp-commit-in-verify-min-seqs, #1176).
+                let tp_defer = crate::model::core::tp_commit_in_verify_min_seqs();
+                if tp_start.is_some() && layout.node.is_none() && tp_defer > 0 {
+                    exec.tp_deferred_commits(tp_defer);
+                } else if layout.node.is_some() || tp_start.is_some() {
                     // Their commits are not deferred (`Executor::commit`), so neither are the
                     // pools' (#836 part 38).
                     exec.no_deferred_commits();
@@ -4695,8 +4849,11 @@ impl LmEngine {
                     managed_tp_cache(&mut exec, &cfg, tokens, spec_k)?
                 }
                 _ => {
-                    let tier =
-                        tp_tier(&cfg, &layout, exec.kv_block_bytes()).map_err(LoadError::Device)?;
+                    let tier = tp_tier(&cfg, &layout, exec.kv_block_bytes(), tier_owner)
+                        .map_err(LoadError::Device)?;
+                    if let TpTier::Auto(nodes) = &tier {
+                        tp_tier_nodes = nodes.clone();
+                    }
                     let (device, host) = fit_tp_cache(
                         &mut exec, &layout, &mut cfg, sched, mtp, native_ctx, tier, head_pool,
                     )?;
@@ -4740,10 +4897,39 @@ impl LmEngine {
                  too; off: never)"
             );
         }
-        let kv_keep = cfg
-            .switches
-            .kv_vmm_keep
-            .or(kv_auto.then_some(KV_VMM_KEEP_DEFAULT));
+        // The bounded host tier (#37, an x86_64 PC's one discrete GPU): the same lend with no
+        // flag, the pool past its first KV_VMM_KEEP_TIER tokens. There every VRAM slot saves
+        // a copy over PCIe (or a checkpoint read), and the tail comes back when a chat needs
+        // it (`Worker::kv_make_room`). With every expert in host memory (`tier_whole`) a slot
+        // saves the same copy: the same lend.
+        let kv_tier = kv_vmm::tier_default(
+            exec.model().host_tier().is_some() || tier_whole,
+            cfg.switches.kv_vmm,
+            mode == ExpertMode::Cache,
+            layout.stages.len(),
+            tp_fit || tp_start.is_some() || layout.node.is_some(),
+            host_tokens,
+        );
+        // Not after a run whose chats were long (`kv_vmm::TierUse`): with the tail mapped the
+        // cache is worse off than with no lend. This run's chats decide the next load's.
+        let kv_long_file = (cfg.residency.tier_heat.as_deref())
+            .filter(|_| kv_tier)
+            .map(kv_vmm::tier_long_file);
+        let kv_tier = kv_tier && !kv_long_file.as_ref().is_some_and(|f| f.exists());
+        if kv_long_file.is_some() && !kv_tier {
+            tracing::info!(
+                kept_tokens = kv_vmm::KEEP_TIER,
+                "host expert tier: the last run's chats held more KV tokens than the lend \
+                 keeps most of the time: the KV pool's tail is not lent to the expert cache \
+                 this run (--kv-vmm-keep lends it anyway)"
+            );
+        }
+        let kv_auto = kv_auto || kv_tier;
+        let kv_keep = cfg.switches.kv_vmm_keep.or(kv_auto.then_some(if kv_tier {
+            kv_vmm::KEEP_TIER
+        } else {
+            KV_VMM_KEEP_DEFAULT
+        }));
         let mut kv_vmm_all = false;
         if cfg.switches.kv_vmm == Some(true) || kv_auto {
             kv_vmm_all = kv_vmm::apply(&mut exec, &layout, tp_fit)?;
@@ -4757,6 +4943,8 @@ impl LmEngine {
         let mut hbm_blocks = n_blocks;
         // Per stage: the NUMA node of its KV host tier (for the startup report).
         let mut tier_nodes: Vec<Option<u32>> = Vec::new();
+        // An automatic tier's place in the process's plan (#1163), for as long as the tier.
+        let mut tier_plan: Option<host_tier::Reservation> = None;
         // Sequence slots take the tier's buffers (and their alias) even all in VRAM.
         if host_tokens > 0 || exec.kv_slot_blocks() > 0 {
             let mut host_blocks = host_tokens.div_ceil(KV_BLOCK);
@@ -4766,13 +4954,18 @@ impl LmEngine {
             } else {
                 cfg.kv_stage_tokens.div_ceil(KV_BLOCK).min(host_blocks)
             };
-            // The staging slots take device blocks' memory; an automatic tier takes them back.
+            // The staging slots take device blocks' memory; an automatic tier takes them back,
+            // up to what the nodes' budgets hold.
             let cost = exec
                 .kv_stage_cost(stage_blocks)
                 .min(hbm_blocks.saturating_sub(1));
             hbm_blocks -= cost;
             if auto_tier {
+                let sized = host_blocks;
                 host_blocks += cost;
+                if !tp_fit && sized > 0 {
+                    host_blocks = host_blocks.min((tier_most_tokens / KV_BLOCK).max(sized));
+                }
             }
             // Sequence slots: each slot's first blocks in VRAM.
             let slot_blocks = exec.kv_slot_blocks();
@@ -4802,6 +4995,16 @@ impl LmEngine {
             tier_nodes = tiers.iter().map(|t| t.map(|t| t.node)).collect();
             let nodes: Vec<u32> = tiers.iter().flatten().map(|t| t.node).collect();
             exec.set_kv_tiers(tiers);
+            if auto_tier && host_blocks > 0 {
+                // What it pins: every host block, or a lazily backed tier's budget (#1131),
+                // the latter as it fills (#1163).
+                let lazy = exec.kv_slot_host_budget().is_some() || exec.kv_slot_lend() > 0;
+                let backed = exec.kv_slot_host_budget().unwrap_or(host_blocks) as u64;
+                let per_node = tier_plan_bytes(&tp_tier_nodes, &tier_nodes, &tier_stage_bytes);
+                let per_node: Vec<(u32, u64)> =
+                    per_node.into_iter().map(|(n, b)| (n, b * backed)).collect();
+                tier_plan = Some(host_tier::reserve(tier_owner, &per_node, lazy));
+            }
             n_blocks = hbm_blocks + host_blocks;
             exec.resize_kv(n_blocks).map_err(|e| {
                 LoadError::Device(format!(
@@ -4900,12 +5103,19 @@ impl LmEngine {
                 };
                 // A long prompt's micro-chunk over the lent cache: what a lend must free sizes
                 // how much of the cache long prompts keep (`ResidencyConfig::lend_need`).
+                // The bounded host tier (one GPU): a whole pass's step, as a kept slot's
+                // experts are neither copied nor read from the checkpoint.
+                let tier = exec.model().host_tier().is_some() && layout.stages.len() == 1;
                 let long = if cfg.residency.staging
                     && cfg.residency.lend_keep.is_empty()
                     && cfg.long_prompts.min_tokens > 0
-                    && layout.stages.len() > 1
+                    && (layout.stages.len() > 1 || tier)
                 {
-                    let tokens = cfg.long_prompts.micro;
+                    let tokens = if tier {
+                        ssd_tier::HOST_TIER_PASS.min(cfg.ctx_size / 2)
+                    } else {
+                        cfg.long_prompts.micro
+                    };
                     exec.measure_prompt_step(tokens, cfg.ctx_size.saturating_sub(tokens))
                         .map_err(err(format!("a {tokens}-token long prompt step")))?
                 } else {
@@ -5006,8 +5216,11 @@ impl LmEngine {
                 );
             }
             // `--expert-cache-fill-prompt-room`: the prompt steps' room goes to the cache where
-            // their buffers can spill into host memory. The default on V100s (an AC922) and a GH200.
-            let fill_prompt_room = cfg.residency.fills_prompt_room(spill_default);
+            // their buffers can spill into host memory. The default on V100s (an AC922) and a GH200,
+            // and on the bounded host tier's machine and model with every routed expert in host
+            // memory (`tier_whole`, #37 round 17): prompts of 2K and more lend the cache whole, so
+            // only short ones' buffers may spill; ~120 more slots on a 24 GB card.
+            let fill_prompt_room = cfg.residency.fills_prompt_room(spill_default || tier_whole);
             if fill_prompt_room && layout.stages.iter().any(|(d, _)| d.is_some_and(spills)) {
                 tracing::info!(
                     "expert cache takes the prompt steps' compute room (prompt buffers may spill \
@@ -5059,7 +5272,9 @@ impl LmEngine {
                     && layout.node.is_none()
                     && tp_start.is_none()
                     && cfg.long_prompts.min_tokens > 0
-                    && !long.is_empty();
+                    // No measured long step with every expert in host memory on one GPU: a
+                    // lend there frees every slot, the tail's bytes among them.
+                    && (!long.is_empty() || (tier_whole && kv_tier));
                 if kv_vmm_all && plain {
                     let keep = crate::residency::kv_vmm::keep_blocks(tokens, KV_BLOCK, n_blocks);
                     if let Some((lend, bytes)) =
@@ -5350,6 +5565,7 @@ impl LmEngine {
         );
 
         let (submit, rx) = std::sync::mpsc::channel();
+        let warming = Arc::new(AtomicBool::new(false));
         let expert_stats = exec.experts_mut().map(|experts| experts.stats());
         let stats = Arc::new(Mutex::new(EngineStats {
             rooflines: bandwidth::stage_rooflines(&layout),
@@ -5479,6 +5695,16 @@ impl LmEngine {
             Vec::new()
         };
         let long_past = cfg.ctx_size.saturating_sub(long_micro).max(1);
+        // The bounded host tier (one GPU): the pass step measured at load, which caps a
+        // lend's passes to the VRAM it left free.
+        let tier_step = match (&measured_long[..], &layout.stages[..]) {
+            (&[bytes], [(device, _)]) if exec.model().host_tier().is_some() => Some((
+                *device,
+                bytes,
+                ssd_tier::HOST_TIER_PASS.min(cfg.ctx_size / 2),
+            )),
+            _ => None,
+        };
         let worker = Worker {
             exec,
             tokenizer: tokenizer.clone(),
@@ -5572,6 +5798,17 @@ impl LmEngine {
             long_past,
             long_cap: 0,
             long_reserve: 0,
+            kv_tier,
+            kv_tail_used: Instant::now(),
+            kv_use: kv_vmm::TierUse {
+                file: kv_long_file,
+                keep: (kv_vmm::KEEP_TIER / KV_BLOCK) as u32,
+                ..Default::default()
+            },
+            tier_step,
+            tier_cap: 0,
+            warming: warming.clone(),
+            warming_seen: false,
             clock: Default::default(),
             outbox: stream::Outbox::new(tokenizer.clone(), cfg.stream_thread_seqs),
         };
@@ -5613,6 +5850,8 @@ impl LmEngine {
             worker: Some(worker),
             load_report,
             split_probe,
+            _tier_plan: tier_plan,
+            warming,
         })
     }
 
@@ -5859,6 +6098,10 @@ impl Engine for LmEngine {
     fn stats(&self) -> EngineStats {
         self.stats.lock().map(|s| *s).unwrap_or_default()
     }
+
+    fn set_warming(&self, on: bool) {
+        self.warming.store(on, Ordering::Release);
+    }
 }
 
 /// Owns everything that touches the device, and the scheduler's bookkeeping.
@@ -5974,6 +6217,23 @@ struct Worker {
     long_cap: usize,
     /// VRAM a KV tail mapped during the current lend leaves free for its step buffers.
     long_reserve: usize,
+    /// The KV tail is lent with no flag for the bounded host tier ([`kv_vmm::tier_default`]).
+    kv_tier: bool,
+    /// When the tail was last mapped for, or held by, a decoding sequence
+    /// ([`kv_vmm::tier_holds`]).
+    kv_tail_used: Instant,
+    /// The run's chat lengths, for the next load's lend.
+    kv_use: kv_vmm::TierUse,
+    /// The bounded host tier on one GPU: the device, and the bytes a prompt step of that many
+    /// tokens took when measured at load.
+    tier_step: Option<(Option<crate::ggml::Device>, usize, usize)>,
+    /// The most tokens a staged pass of the current lend takes
+    /// ([`ssd_tier::host_tier_pass_cap`]; 0: no cap).
+    tier_cap: usize,
+    /// [`Engine::set_warming`], and what the expert cache was last told of it
+    /// ([`Self::warming_changed`]).
+    warming: Arc<AtomicBool>,
+    warming_seen: bool,
     /// `--kv-vmm-keep` (#814): the KV pools' tail, lent to the expert cache while no sequence
     /// needs it ([`kv_vmm::KvLend`]).
     kv_lend: Option<kv_vmm::KvLend>,
@@ -6150,6 +6410,8 @@ impl Worker {
         let mut experts_at = Instant::now();
         // `--deterministic` ([`waves`]): requests that arrived since the running wave started.
         let mut held: Vec<Job> = Vec::new();
+        // Every block is free before the first request.
+        self.kv_use.total = self.pool.free_blocks();
         loop {
             // The cache gets its VRAM back once no prompt is being read (before idling too).
             // `--kv-vmm-keep`: while the KV pools' tail holds some of the cache's VRAM, all but
@@ -6157,6 +6419,7 @@ impl Worker {
             if prefilling.is_empty() && !pipe.is_active() {
                 self.kv_shrink(&decoding);
             }
+            self.kv_use.note(decoding.len(), self.pool.free_blocks());
             if self.lent && prefilling.is_empty() {
                 self.restore_cache();
             }
@@ -6236,6 +6499,7 @@ impl Worker {
                 }
             }
             waiting.retain(|w| w.keep(&mut self.outbox));
+            self.warming_changed();
             // `on-demand`: room for the decoding sequences' next step, victims preempted.
             if self.on_demand()
                 && let Err(e) = self.make_room(&mut decoding, &mut prefilling, &mut waiting)
@@ -6971,6 +7235,11 @@ impl Worker {
             if need == 0 || !short(self) {
                 return Ok(());
             }
+        }
+        // The bounded host tier's lend (#37) evicts no cached chat for the tail's sake:
+        // reading a chat again costs seconds, the mapped tail a few percent of decode.
+        let evicts = !self.kv_tier || self.kv_lend.as_ref().is_some_and(|l| l.grown);
+        if !resume && evicts {
             // Everything they hold is a kept block while the tail is lent, but blocks the
             // last shrink kept in host memory (#1196).
             let host_held = self.kv_lend.as_ref().is_some_and(|l| l.host_held > 0);
@@ -7003,6 +7272,7 @@ impl Worker {
                 self.exec.set_micro_taper(0);
             }
         }
+        self.kv_tail_used = Instant::now();
         let lend = self.kv_lend.as_mut().expect("a lent KV tail");
         let host_held = lend.host_held;
         let reserve = self.long_reserve;
@@ -7034,6 +7304,28 @@ impl Worker {
             );
         }
         Ok(())
+    }
+
+    /// Tells the expert cache when the startup warmup begins or is over
+    /// ([`Engine::set_warming`]): it does not learn from the warmup's prompts where a saved
+    /// routing heat file filled its slots (the bounded host tier). Over: the last warmup
+    /// step's deferred cache work runs first, still unlearned.
+    fn warming_changed(&mut self) {
+        let on = self.warming.load(Ordering::Acquire);
+        if on == self.warming_seen {
+            return;
+        }
+        self.warming_seen = on;
+        // Only such a cache is told; every other load runs as before.
+        if !(self.exec.model().experts()).is_some_and(|x| x.holds_warmup()) {
+            return;
+        }
+        if !on && let Err(e) = self.exec.quiesce() {
+            tracing::warn!(error = %e, "could not finish the warmup's steps");
+        }
+        if let Some(experts) = self.exec.experts_mut() {
+            experts.set_hold(on);
+        }
     }
 
     /// Evicts every cached prefix and warm sequence holding a block from `keep` on, then the
@@ -7105,6 +7397,23 @@ impl Worker {
             return;
         };
         if decoding.iter().any(|s| s.blocks.iter().any(|&b| b >= keep)) {
+            self.kv_tail_used = Instant::now();
+            return;
+        }
+        // The bounded host tier: mapped when a sequence was admitted whose reply will pass the
+        // kept blocks (`plan_step`); it stays until that reply is over.
+        if self.kv_tier {
+            let ahead = kv_vmm::tier_blocks_ahead(
+                (decoding.iter()).map(|s| (s.need, s.table.blocks().len())),
+            );
+            if ahead > self.pool.free_fast_blocks() as usize {
+                self.kv_tail_used = Instant::now();
+                return;
+            }
+        }
+        // The bounded host tier: a long chat's next turn finds its tail mapped.
+        let in_use = self.pool.slow_in_use() > 0;
+        if kv_vmm::tier_holds(self.kv_tier, in_use, self.kv_tail_used.elapsed()) {
             return;
         }
         let mut host = None;
@@ -7164,6 +7473,13 @@ impl Worker {
                 {
                     tracing::warn!(error = %e, "could not refill the expert cache");
                 }
+                // The bounded host tier's even share (#37): every layer's tail is mapped at
+                // its full size again by a lend and the restore the loop runs next.
+                let cut = (self.exec.model().experts()).is_some_and(|x| x.cut_slots() > 0);
+                if cut && !self.lent && self.can_lend {
+                    self.lend_cache(0, usize::MAX);
+                    self.lent_short = self.lent;
+                }
             }
             // The next sequence past the kept blocks maps what is unmapped again.
             Err(e) => {
@@ -7181,6 +7497,7 @@ impl Worker {
             Ok(true) => {
                 self.lent = true;
                 (self.long_cap, self.long_reserve) = self.long_micro_cap(end);
+                self.size_tier_pass();
                 self.exec.set_pipeline_micro(self.capped(self.long.micro));
                 self.exec.set_micro_taper(self.long.taper);
                 tracing::info!(
@@ -7199,11 +7516,27 @@ impl Worker {
         }
     }
 
+    /// The bounded host tier: a pass's step buffer stays in the VRAM the lend left free now
+    /// (the host's memory is the experts'). Sized again once the KV tail is mapped out of it.
+    fn size_tier_pass(&mut self) {
+        if let Some((Some(d), bytes, at)) = self.tier_step {
+            let keep = crate::model::core::LENT_SCRATCH + LENT_MICRO_MARGIN;
+            let free = d.memory().0.saturating_sub(keep);
+            self.tier_cap = ssd_tier::host_tier_pass_cap(free, bytes, at, KV_BLOCK);
+            tracing::info!(
+                free_mib = free >> 20,
+                pass_tokens = self.tier_cap,
+                "host expert tier: staged passes sized to the lent VRAM"
+            );
+        }
+    }
+
     /// Takes the expert cache's VRAM back after a long prompt; the slots refill in the
     /// background while steps run on.
     /// `--kv-vmm-keep` (#814): while the KV pools' tail is mapped, the cache's slots that held
     /// its VRAM stay without (whole layers; their experts read from host memory) until
-    /// [`Self::kv_shrink`] gives it back.
+    /// [`Self::kv_shrink`] gives it back. The bounded host tier (#37) takes it from every
+    /// layer's last slots instead, a few each.
     fn restore_cache(&mut self) {
         let t = Instant::now();
         let leave = self
@@ -7220,6 +7553,7 @@ impl Worker {
         self.lent_short = false;
         self.long_cap = 0;
         self.long_reserve = 0;
+        self.tier_cap = 0;
         self.exec.set_pipeline_micro(self.micro);
         self.exec.set_micro_taper(0);
         tracing::info!(
@@ -7516,9 +7850,12 @@ impl Worker {
             // freed is free. Mapped mid-prompt, the prompt steps' buffers had taken it first
             // (cuMemCreate out of memory on 4 V100s with 16 sequences). The same blocks
             // and bits, mapped a few steps earlier.
+            // The bounded host tier's lend (#37) too: its passes are sized to the VRAM free
+            // once the tail is mapped (sized before, a 12K prompt's one pass found 960 MiB
+            // less than planned and its buffer spilled into host memory).
             if long
                 && self.lent
-                && self.exec.model().glm_par.is_some()
+                && (self.exec.model().glm_par.is_some() || self.kv_tier)
                 && self.kv_lend.as_ref().is_some_and(|l| !l.grown)
             {
                 let need = prefilling
@@ -7537,6 +7874,24 @@ impl Worker {
                             .any(|s| s.blocks.iter().any(|&b| b >= l.keep as u32))
                 });
                 self.kv_make_room(need, resume)?;
+                if self.kv_tier && self.kv_lend.as_ref().is_some_and(|l| l.grown) {
+                    self.size_tier_pass();
+                }
+            }
+        }
+        // The bounded host tier's lend (#37): sequences whose prompts and replies
+        // (`max_tokens`) will pass the kept blocks map the tail while the prompt is read,
+        // before the first token. Mapped in the middle of a reply, the lend and restore of
+        // the expert cache around it stalled the stream for half a second.
+        if self.kv_tier && !prefilling.is_empty() && self.kv_lend.as_ref().is_some_and(|l| !l.grown)
+        {
+            let ahead = kv_vmm::tier_blocks_ahead(
+                (prefilling.iter().chain(decoding.iter()))
+                    .map(|s| (s.need, s.table.blocks().len())),
+            );
+            self.kv_make_room(ahead, false)?;
+            if self.lent && self.kv_lend.as_ref().is_some_and(|l| l.grown) {
+                self.size_tier_pass();
             }
         }
         // A long prompt turns a short lend into a long one until the cache is restored (the
@@ -7557,7 +7912,11 @@ impl Worker {
         } else {
             self.long.batch_tokens
         };
-        let max_batch = if big {
+        // The bounded host tier: passes of what the lend left free, the prompt in equal ones.
+        let tier_pass = big && self.tier_cap > 0;
+        let max_batch = if tier_pass {
+            self.tier_cap
+        } else if big {
             long_batch.max(self.max_batch_tokens)
         } else {
             self.max_batch_tokens
@@ -7627,7 +7986,7 @@ impl Worker {
             if take == 0 {
                 break;
             }
-            let take = if self.prefill_even {
+            let take = if self.prefill_even || tier_pass {
                 even::even_take(
                     seq.prompt.len() - seq.n_past,
                     take,
