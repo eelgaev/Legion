@@ -22,7 +22,7 @@ use crate::ggml::{Backend, ComputeAllocator, Context, RowsAt, Tensor, ffi, types
 use super::cache::{CachePool, SeqCache};
 use super::config::{Config, Flavor};
 use super::v2::{self, Selector};
-use super::weights::{HostTensor, Store};
+use super::weights::{self, HostTensor, Store};
 
 #[cfg(test)]
 mod tests;
@@ -294,6 +294,28 @@ fn mul_mats<'a>(ctx: &'a Context, ws: &[Tensor<'a>], x: Tensor<'a>) -> Vec<Tenso
         dense_mv::mul_mat_wide_chains(ctx, ws, x)
     } else {
         ws.iter().map(|&w| mul_mat(ctx, w, x)).collect()
+    }
+}
+
+/// Most columns a matmul takes fused weights at ([`weights::fused_groups`]): ggml-cuda's
+/// MMVQ_MAX_BATCH_SIZE. Wider steps run MMQ, whose stream-k split of the sums depends on the
+/// matmul's rows, so they keep one matmul per weight.
+const FUSED_MAX_N: i64 = 8;
+
+/// `t` (`[d, heads, n]`, its first two dims packed) as `[d · heads, n]` rows: a reshape when
+/// `t` is contiguous, else a view of the same rows (a projection inside a fused matmul's
+/// output, #689).
+fn rows_2d<'a>(ctx: &'a Context, t: Tensor<'a>, row: i64, n: i64) -> Tensor<'a> {
+    if t.is_contiguous() {
+        ctx.reshape_2d(t, row, n)
+    } else {
+        assert_eq!(t.ne()[0] * t.ne()[1], row, "rows of the heads");
+        assert_eq!(
+            t.nb()[1],
+            t.ne()[0] as usize * t.element_size(),
+            "packed heads"
+        );
+        ctx.view_2d(t, [row, n], t.nb()[2], 0)
     }
 }
 
@@ -674,6 +696,75 @@ impl Model {
         }
     }
 
+    /// Layer `il`'s weights `stem` stored side by side as one tensor ([`weights::fused_groups`],
+    /// quantized drafter weights) when a matmul of `n` columns runs on ggml's MMVQ, where each
+    /// row's sum is the same in one matmul as in one per weight (#689); else `None`.
+    fn fused(&self, il: usize, stem: &str, n: i64) -> Option<Tensor<'_>> {
+        (n <= FUSED_MAX_N)
+            .then(|| {
+                self.store
+                    .get(&format!("blk.{il}.{stem}{}", weights::FUSED_SUFFIX))
+            })
+            .flatten()
+    }
+
+    /// `out`'s rows `at..at + d · heads` (a projection inside a fused matmul's output) as
+    /// `[d, heads, n]`.
+    fn heads_of<'a>(ctx: &'a Context, out: Tensor<'a>, d: i64, heads: i64, at: i64) -> Tensor<'a> {
+        let es = out.element_size();
+        ctx.view_3d(
+            out,
+            [d, heads, out.ne()[1]],
+            [d as usize * es, out.nb()[1]],
+            at as usize * es,
+        )
+    }
+
+    /// Q, K and V of the noise block's rows `x` in layer `il` (Q `[d, n_head, n]`), from one
+    /// matmul when the weights are fused ([`Self::fused`]).
+    fn qkv<'a>(
+        &'a self,
+        ctx: &'a Context,
+        il: usize,
+        x: Tensor<'a>,
+        pos: Tensor<'a>,
+    ) -> (Tensor<'a>, Tensor<'a>, Tensor<'a>) {
+        let c = &self.cfg;
+        let (d, nh, kvh) = (c.head_dim as i64, c.n_head as i64, c.n_head_kv as i64);
+        let Some(w) = self.fused(il, "attn_qkv", x.ne()[1]) else {
+            let q = ctx.reshape_3d(
+                mul_mat(ctx, self.lw(il, "attn_q.weight"), x),
+                d,
+                nh,
+                x.ne()[1],
+            );
+            let (k, v) = self.kv(ctx, il, x, pos);
+            return (q, k, v);
+        };
+        assert_eq!(w.ne()[1], d * (nh + 2 * kvh), "fused Q, K and V rows");
+        let out = ctx.mul_mat(w, x);
+        let q = Self::heads_of(ctx, out, d, nh, 0);
+        let k = Self::heads_of(ctx, out, d, kvh, d * nh);
+        let v = Self::heads_of(ctx, out, d, kvh, d * (nh + kvh));
+        (q, self.k_rope(ctx, il, k, pos), v)
+    }
+
+    /// K (`[d, n_head_kv, n]`) through its per-head norm and RoPE.
+    fn k_rope<'a>(
+        &'a self,
+        ctx: &'a Context,
+        il: usize,
+        k: Tensor<'a>,
+        pos: Tensor<'a>,
+    ) -> Tensor<'a> {
+        let c = &self.cfg;
+        let k = ctx.mul(
+            ctx.rms_norm(k, c.rms_eps),
+            self.lw(il, "attn_k_norm.weight"),
+        );
+        rope(ctx, k, pos, c.n_rot, c.rope_base)
+    }
+
     /// K and V of the rows `x` (`[n_embd, n]`, after the layer's input norm for the noise
     /// block, the fused features as they are for the context) in layer `il`.
     fn kv<'a>(
@@ -686,6 +777,16 @@ impl Model {
         let c = &self.cfg;
         let n = x.ne()[1];
         let (d, kvh) = (c.head_dim as i64, c.n_head_kv as i64);
+        if let Some(w) = self.fused(il, "attn_qkv", n) {
+            // K's and V's rows of the fused weight, one matmul.
+            let rq = (c.head_dim * c.n_head) as usize;
+            let nb1 = w.nb()[1];
+            let wkv = ctx.view_2d(w, [w.ne()[0], 2 * d * kvh], nb1, rq * nb1);
+            let out = ctx.mul_mat(wkv, x);
+            let k = Self::heads_of(ctx, out, d, kvh, 0);
+            let v = Self::heads_of(ctx, out, d, kvh, d * kvh);
+            return (self.k_rope(ctx, il, k, pos), v);
+        }
         let wk = self.lw(il, "attn_k.weight");
         let (k, v) = match self.store.get(&format!("blk.{il}.attn_v.weight")) {
             Some(wv) => {
@@ -701,11 +802,7 @@ impl Model {
                 (k, ctx.rms_norm(k, c.rms_eps))
             }
         };
-        let k = ctx.mul(
-            ctx.rms_norm(k, c.rms_eps),
-            self.lw(il, "attn_k_norm.weight"),
-        );
-        (rope(ctx, k, pos, c.n_rot, c.rope_base), v)
+        (self.k_rope(ctx, il, k, pos), v)
     }
 
     /// Runs the fused target features `feats` (`n_layers × n_embd` per row) through the
@@ -800,7 +897,7 @@ impl Model {
             let (k, v) = self.kv(&ctx, il, g, pos);
             let row = (c.head_dim * c.n_head_kv) as i64;
             for (kind, x) in [("k", k), ("v", v)] {
-                let x = ctx.reshape_2d(x, row, n as i64);
+                let x = rows_2d(&ctx, x, row, n as i64);
                 if let (Some(pool), Some(pc)) = (pool, pool_cells) {
                     graph.expand(ctx.set_rows(pool.tensor(kind, il), x, pc));
                     continue;
@@ -950,18 +1047,13 @@ impl Model {
         for il in 0..c.n_layer {
             let x = ctx.mul(ctx.rms_norm(h, c.rms_eps), self.lw(il, "attn_norm.weight"));
             let (x, attn_dynamic) = self.conv_in(&ctx, il, "attn", x, nb);
-            let q = ctx.reshape_3d(
-                mul_mat(&ctx, self.lw(il, "attn_q.weight"), x),
-                d,
-                nh,
-                total as i64,
-            );
+            debug_assert_eq!(x.ne()[1], total as i64);
+            let (q, k_all, v_all) = self.qkv(&ctx, il, x, pos);
             let q = ctx.mul(
                 ctx.rms_norm(q, c.rms_eps),
                 self.lw(il, "attn_q_norm.weight"),
             );
             let q_all = rope(&ctx, q, pos, c.n_rot, c.rope_base);
-            let (k_all, v_all) = self.kv(&ctx, il, x, pos);
             let mut out = None;
             // Several sequences: each one's attention output is copied into its columns of one
             // tensor (a chain of concats copied everything before it again, ~0.9 ms a step at 16
@@ -992,7 +1084,7 @@ impl Model {
                 };
                 // The block's K/V go to the scratch cells; the attention below reads them there.
                 for (kind, t) in [("k", k), ("v", v)] {
-                    let t = ctx.reshape_2d(t, row, nb);
+                    let t = rows_2d(&ctx, t, row, nb);
                     graph.expand(ctx.set_rows(cache.tensor(kind, il), t, cells));
                 }
                 let (ck, cv) = (cache.tensor("k", il), cache.tensor("v", il));
@@ -1043,11 +1135,23 @@ impl Model {
                 self.lw(il, "ffn_norm.weight"),
             );
             let (f, ffn_dynamic) = self.conv_in(&ctx, il, "ffn", f, nb);
-            let gu = mul_mats(
-                &ctx,
-                &[self.lw(il, "ffn_gate.weight"), self.lw(il, "ffn_up.weight")],
-                f,
-            );
+            let gu = match self.fused(il, "ffn_gate_up", f.ne()[1]) {
+                // Gate and up from one matmul: the first and second half of its rows.
+                Some(w) => {
+                    let out = ctx.mul_mat(w, f);
+                    let ff = self.lw(il, "ffn_gate.weight").ne()[1];
+                    assert_eq!(out.ne()[0], 2 * ff, "gate and up of one width");
+                    let (nb1, es) = (out.nb()[1], out.element_size());
+                    let half =
+                        |at: i64| ctx.view_2d(out, [ff, out.ne()[1]], nb1, (at * ff) as usize * es);
+                    vec![half(0), half(1)]
+                }
+                None => mul_mats(
+                    &ctx,
+                    &[self.lw(il, "ffn_gate.weight"), self.lw(il, "ffn_up.weight")],
+                    f,
+                ),
+            };
             let act = ctx.mul(ctx.silu(gu[0]), gu[1]);
             let down = mul_mat(&ctx, self.lw(il, "ffn_down.weight"), act);
             let down = self.conv_out(&ctx, il, "ffn", down, ffn_dynamic, nb);
@@ -1240,7 +1344,7 @@ impl Model {
         let slot_bytes = pa.pool.cells() * row as usize * es;
         // The blocks' K/V go to their slots' scratch cells; the attention reads them there.
         let read = |kind: &str, t: Tensor<'a>| {
-            let t = ctx.reshape_2d(t, row, total);
+            let t = rows_2d(ctx, t, row, total);
             let all = ctx.set_rows(pa.pool.tensor(kind, il), t, pa.block_cells);
             let t = ctx.view_4d(
                 all,
