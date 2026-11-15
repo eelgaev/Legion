@@ -86,11 +86,8 @@ __global__ void __launch_bounds__(32) l2_prefetch(const char * p, int64_t bytes,
         l2_prefetch_issue(p, bytes, chunk);
     }
 #else
-    (void) p;
-    (void) bytes;
-    (void) chunk;
-    (void) late;
-    (void) pace_ns;
+    // Launched on compute capability 12.x only (l2_prefetch.rs): any other launch is a host bug.
+    __trap();
 #endif
 }
 
