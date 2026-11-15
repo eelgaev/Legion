@@ -265,6 +265,153 @@ pub fn split_ok() -> bool {
     false
 }
 
+/// Whether graphs built from now on give groups of 2 to [`VERIFY_SPLIT_TOKENS`] tokens per
+/// sequence (speculative verify steps, short prompt chunks) the scratch that splits all their
+/// rows over the key blocks on sm_70 / sm_75 ([`split_ok`]; `src/cuda/sm70/paged_vsplit.cuh`,
+/// #1211): the WMMA kernel's result, bit for bit, from CTAs spread over the whole GPU instead
+/// of one per query tile and kv head walking the whole context twice. Off by default
+/// (`legion serve --paged-verify-split-wmma` turns it on): at a short context its launches
+/// cost more than the walk they split (a V100, 128 keys, 4 sequences: 0.13 ms against 0.10).
+static WMMA_SPLIT: AtomicBool = AtomicBool::new(false);
+
+/// Sets [`WMMA_SPLIT`].
+pub fn set_verify_split_wmma(on: bool) {
+    WMMA_SPLIT.store(on, Ordering::Relaxed);
+}
+
+/// The weights of at least this many key blocks at a time (or the whole table) in a scratch
+/// of [`wmma_split_floats`]: fewer would take more launches than the split saves.
+const WMMA_SPLIT_MIN_CHUNK: usize = 64;
+
+/// F32 elements a group's scratch for [`WMMA_SPLIT`] takes at most when its sequences' whole
+/// tables do not fit (64 MiB: one sequence of Qwen3.8-27B's verify step at a 256K context in two
+/// chunks of weights); a group of more then runs its sequences in turns or its weights in chunks
+/// ([`wmma_split_plan`]).
+const WMMA_SPLIT_BUDGET: usize = 16 << 20;
+
+/// Most CTAs (query tiles times kv heads times sequences) of the WMMA kernel a group may have
+/// to take [`WMMA_SPLIT`]: more already spread over a V100's 80 SMs, and the split would run in
+/// more turns than it saves.
+const WMMA_SPLIT_MAX_CTAS: usize = 32;
+
+/// Query tiles of a group of `n_tok` tokens per sequence with `g` query heads per kv head
+/// (the WMMA kernel's CTAs per sequence and kv head: 64 / g tokens each), and the rows of the
+/// largest, padded to whole 16-row WMMA tiles (`vsplit::tiles`, `vsplit::rows16`).
+fn wmma_rows(g: usize, n_tok: usize) -> (usize, usize) {
+    let qt = 64 / g;
+    (n_tok.div_ceil(qt), (n_tok.min(qt) * g).next_multiple_of(16))
+}
+
+/// F32 elements of one (sequence, query tile, kv head) lane of the [`WMMA_SPLIT`] scratch: per
+/// table entry each row's max and sum, each row's final max and 1 / sum, the output fragments
+/// carried between chunks, and `chunk` blocks of F16 weights (`vsplit::lane`).
+fn wmma_lane_floats(d: usize, nr: usize, table_width: usize, chunk: usize) -> usize {
+    2 * table_width * nr + 2 * nr + nr * d + chunk * nr * KV_BLOCK / 2
+}
+
+/// F32 elements of the [`WMMA_SPLIT`] scratch for a layer of head size `d` and `n_head` query
+/// heads over `n_head_kv` kv heads, for a group of `n_tok` tokens per sequence of `n_seqs`
+/// sequences with `table_width`-entry tables: all of it at once if that fits in
+/// [`WMMA_SPLIT_BUDGET`], else that budget or (if more) one sequence's room with the smallest
+/// chunk. 0 when the group does not take the split.
+pub fn wmma_split_floats(
+    d: usize,
+    n_head: usize,
+    n_head_kv: usize,
+    n_tok: usize,
+    n_seqs: usize,
+    table_width: usize,
+) -> usize {
+    if !(2..=VERIFY_SPLIT_TOKENS).contains(&n_tok)
+        || n_head_kv == 0
+        || !n_head.is_multiple_of(n_head_kv)
+    {
+        return 0;
+    }
+    let (tiles, nr) = wmma_rows(n_head / n_head_kv, n_tok);
+    let units = tiles * n_head_kv;
+    if n_seqs * units > WMMA_SPLIT_MAX_CTAS {
+        return 0;
+    }
+    let full = n_seqs * units * wmma_lane_floats(d, nr, table_width, table_width);
+    let least = units * wmma_lane_floats(d, nr, table_width, WMMA_SPLIT_MIN_CHUNK.min(table_width));
+    full.min(WMMA_SPLIT_BUDGET.max(least))
+}
+
+/// The [`WMMA_SPLIT`] scratch a group's attention layers share (the most any of them, of head
+/// size and kv heads `dims`, needs; [`wmma_split_floats`]), or 0 when the group does not take
+/// the split: off, not 2 to [`VERIFY_SPLIT_TOKENS`] tokens per sequence, or a device that does
+/// not run the WMMA kernel.
+pub fn wmma_split_len(
+    dims: &[(i64, i64)],
+    n_head: i64,
+    n_tok: usize,
+    n_seqs: usize,
+    table_width: usize,
+) -> usize {
+    if !(2..=VERIFY_SPLIT_TOKENS).contains(&n_tok)
+        || !WMMA_SPLIT.load(Ordering::Relaxed)
+        || !split_ok()
+    {
+        return 0;
+    }
+    dims.iter()
+        .map(|&(d, kv)| {
+            wmma_split_floats(
+                d as usize,
+                n_head as usize,
+                kv as usize,
+                n_tok,
+                n_seqs,
+                table_width,
+            )
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// How a launch uses a [`WMMA_SPLIT`] scratch of `len` elements: (sequences per run, key blocks
+/// of weights per chunk), the pair with the fewest kernel launches (each run takes 4 plus 2 per
+/// chunk), or `None` when not even one sequence with the smallest chunk fits (the op then runs
+/// the WMMA kernel).
+pub fn wmma_split_plan(
+    len: usize,
+    d: usize,
+    n_head: usize,
+    n_head_kv: usize,
+    n_tok: usize,
+    n_seqs: usize,
+    table_width: usize,
+) -> Option<(usize, usize)> {
+    if !(2..=VERIFY_SPLIT_TOKENS).contains(&n_tok)
+        || n_head_kv == 0
+        || !n_head.is_multiple_of(n_head_kv)
+        || table_width == 0
+    {
+        return None;
+    }
+    let (tiles, nr) = wmma_rows(n_head / n_head_kv, n_tok);
+    let units = tiles * n_head_kv;
+    if n_seqs * units > WMMA_SPLIT_MAX_CTAS {
+        return None;
+    }
+    let fixed = wmma_lane_floats(d, nr, table_width, 0);
+    let per_block = nr * KV_BLOCK / 2;
+    let min_chunk = WMMA_SPLIT_MIN_CHUNK.min(table_width);
+    (1..=n_seqs)
+        .filter_map(|s| {
+            let lane = len / (s * units);
+            let chunk = (lane.checked_sub(fixed)? / per_block).min(table_width);
+            (chunk >= min_chunk).then_some((s, chunk))
+        })
+        .min_by_key(|&(s, chunk)| {
+            (
+                n_seqs.div_ceil(s) * (4 + 2 * table_width.div_ceil(chunk)),
+                s,
+            )
+        })
+}
+
 /// F32 elements of a prefill group's scratch over a tiered pool with `stage_blocks` staging
 /// slots: the rows' running (max, sum), then the pieces' I32 walk arrays (blocks and entries
 /// per table entry, a count per sequence, the staged count) and the slots' pool blocks.
@@ -554,6 +701,9 @@ struct LaunchParams {
     compact: i32,
     /// Elements from one kv head to the next in a compact cache's cell.
     head_stride: i64,
+    /// With `split`: every row of a 2-16-token group split over the key blocks, the weights of
+    /// this many blocks at a time ([`wmma_split_plan`]); 0: the last token's rows only.
+    vsplit_chunk: i32,
 }
 
 /// The kernels' code for a cache type (`LEGION_KV_*` in paged_attn.cu), if they read it.
@@ -583,6 +733,62 @@ unsafe extern "C" {
     fn legion_paged_attn_set_prefill(kernel: i32, this_thread: i32);
     #[cfg(test)]
     fn legion_paged_attn_m884_launches() -> i64;
+    #[cfg(test)]
+    fn legion_paged_attn_ffma_launches() -> i64;
+    fn legion_paged_attn_vsplit_launches() -> i64;
+    fn legion_paged_attn_set_qm(on: i32, this_thread: i32);
+    fn legion_paged_attn_qm_launches() -> i64;
+}
+
+/// Prefill groups with heads of 256 on compute capability 12.x devices (a DGX Spark's GB10, RTX
+/// 50) through the kernel that takes the queries as the MMA's M dimension
+/// (`src/cuda/sm80/paged_attn_qm.cuh`, #1133) where it covers them and its grid of CTAs is the
+/// faster one (prompt chunks; verify steps and short chunks over a long context are not), or
+/// (`false`) through
+/// `paged_prefill_mma` as before. The same bits either way; on by default (`legion serve
+/// --no-paged-prefill-qm` turns it off). Other GPUs and ops keep their kernels. For every thread.
+pub fn set_qm_prefill(on: bool) {
+    #[cfg(feature = "cuda")]
+    // SAFETY: sets a flag the launches read.
+    unsafe {
+        legion_paged_attn_set_qm(i32::from(on), 0)
+    };
+    #[cfg(not(feature = "cuda"))]
+    let _ = on;
+}
+
+/// [`set_qm_prefill`] for launches from the calling thread only (benches and tests); `None`
+/// follows the setting for every thread again.
+pub fn set_qm_prefill_here(on: Option<bool>) {
+    #[cfg(feature = "cuda")]
+    // SAFETY: sets a thread-local flag the launches read.
+    unsafe {
+        legion_paged_attn_set_qm(on.map_or(-1, i32::from), 1)
+    };
+    #[cfg(not(feature = "cuda"))]
+    let _ = on;
+}
+
+/// [`set_qm_prefill_here`] by mode (benches): 0 off, 1 on where its grid is the faster one (the
+/// default), 2 on for every multi-token group it covers.
+pub fn set_qm_mode_here(mode: i32) {
+    #[cfg(feature = "cuda")]
+    // SAFETY: sets a thread-local flag the launches read.
+    unsafe {
+        legion_paged_attn_set_qm(mode, 1)
+    };
+    #[cfg(not(feature = "cuda"))]
+    let _ = mode;
+}
+
+/// Launches of the queries-as-M prefill kernel ([`set_qm_prefill`]) from the calling thread so
+/// far (0 without CUDA).
+pub fn qm_launches() -> i64 {
+    #[cfg(feature = "cuda")]
+    // SAFETY: reads a thread-local counter.
+    return unsafe { legion_paged_attn_qm_launches() };
+    #[cfg(not(feature = "cuda"))]
+    0
 }
 
 /// Prefill chunks (and speculative verify steps, several tokens per sequence) on sm_70 devices
@@ -598,11 +804,58 @@ pub fn set_m884_prefill(on: bool) {
     let _ = on;
 }
 
+/// Prefill chunks on sm_75 devices through the one-pass FP32 FMA kernel (F16 caches; the
+/// caller sets it for Turing GPUs without tensor cores, whose emulated HMMA runs the default
+/// WMMA kernel slowly), or (`false`) the default. Not the WMMA kernel's bits. Overrides
+/// [`set_m884_prefill`] (one choice for every thread; m8n8k4 applies on sm_70 only anyway).
+pub fn set_ffma_prefill(on: bool) {
+    #[cfg(feature = "cuda")]
+    // SAFETY: sets a flag the launches read.
+    unsafe {
+        legion_paged_attn_set_prefill(if on { 2 } else { 0 }, 0)
+    };
+    #[cfg(not(feature = "cuda"))]
+    let _ = on;
+}
+
+/// [`set_ffma_prefill`] for launches from the calling thread only, on any GPU (tests).
+#[cfg(all(test, feature = "cuda"))]
+fn set_ffma_prefill_here(on: bool) {
+    // SAFETY: sets a thread-local flag the launches read.
+    unsafe { legion_paged_attn_set_prefill(if on { 2 } else { 0 }, 1) };
+}
+
+/// Launches of the FP32 FMA prefill kernel from the calling thread so far (tests).
+#[cfg(all(test, feature = "cuda"))]
+fn ffma_launches() -> i64 {
+    // SAFETY: reads a thread-local counter.
+    unsafe { legion_paged_attn_ffma_launches() }
+}
+
+/// The calling thread reads `kernel` (`LEGION_PREFILL_*`, -1 to stop) in place of the choice
+/// for every thread, with its per-architecture limits; other threads keep theirs (tests of
+/// [`set_m884_prefill`] and [`set_ffma_prefill`] that run beside other GPU tests).
+#[cfg(all(test, feature = "cuda"))]
+fn set_prefill_for_all_here(kernel: i32) {
+    // SAFETY: sets a thread-local flag the launches read.
+    unsafe { legion_paged_attn_set_prefill(kernel, 2) };
+}
+
 /// [`set_m884_prefill`] for launches from the calling thread only (tests).
 #[cfg(all(test, feature = "cuda"))]
 fn set_m884_prefill_here(on: bool) {
     // SAFETY: sets a thread-local flag the launches read.
     unsafe { legion_paged_attn_set_prefill(i32::from(on), 1) };
+}
+
+/// Launches of the WMMA kernel's all-row split ([`WMMA_SPLIT`]) from the calling thread so far
+/// (0 without CUDA).
+pub(crate) fn vsplit_launches() -> i64 {
+    #[cfg(feature = "cuda")]
+    // SAFETY: reads a thread-local counter.
+    return unsafe { legion_paged_attn_vsplit_launches() };
+    #[cfg(not(feature = "cuda"))]
+    0
 }
 
 /// Launches of the m8n8k4 prefill kernel from the calling thread so far (tests).
@@ -661,6 +914,7 @@ unsafe fn cuda_paged_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
         split_seqs: 0,
         compact: i32::from(o.compact),
         head_stride: o.head_stride as i64,
+        vsplit_chunk: 0,
     };
     // A multi-token group runs split over the key blocks (sm_80+) only with a scratch made for
     // it (split_scratch_shape); the placeholder and a tier's scratch have one split.
@@ -676,6 +930,23 @@ unsafe fn cuda_paged_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
             p.split = ptr;
             p.split_seqs = fit.min(o.n_seqs) as i32;
         }
+    } else if WMMA_SPLIT.load(Ordering::Relaxed)
+        && !(o.tier.is_some() && staged(&o))
+        && let Some((seqs, chunk)) = wmma_split_plan(
+            o.scratch_len,
+            o.d,
+            o.n_head,
+            o.n_head_kv,
+            o.n_tok,
+            o.n_seqs,
+            o.table_width,
+        )
+    {
+        // Every row of a 2-16-token group split over the key blocks (sm_70 / sm_75's WMMA path
+        // only; the other kernels ignore it), given a scratch made for it (wmma_split_len).
+        p.split = o.scratch;
+        p.split_seqs = seqs as i32;
+        p.vsplit_chunk = chunk as i32;
     }
     let check = |rc: i32| match rc {
         0 => Ok(()),
@@ -686,6 +957,26 @@ unsafe fn cuda_paged_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
         e => Err(format!("CUDA launch failed ({e})")),
     };
     let Some((hbm, cap, k_stage, v_stage)) = o.tier.filter(|_| staged(&o)) else {
+        // `--hopper-attn` (#1215): prefill on Hopper's wgmma kernel where it covers the op.
+        let shape = hopper::Shape {
+            d: o.d,
+            n_head: o.n_head,
+            n_head_kv: o.n_head_kv,
+            n_tok: o.n_tok,
+            f16: k_type == 0 && v_type == 0,
+            compact: o.compact,
+            tiered: o.tier.is_some(),
+            max_split: p.max_split.max(1) as usize,
+            k_cell: o.k_cell,
+            v_cell: o.v_cell,
+            // SAFETY: the op's K and V pools.
+            k_cells: unsafe { (*dst.src[1]).ne[1] } as usize,
+            v_cells: unsafe { (*dst.src[2]).ne[1] } as usize,
+        };
+        // SAFETY: the op's parameters and pools, on the stream's device.
+        if unsafe { hopper::run(&p, &shape, stream) }? {
+            return Ok(());
+        }
         return check(unsafe { legion_paged_attn_launch(&p, stream) });
     };
     // Pieces (#352): at most `cap` host blocks each, as many as the step can reach.
@@ -788,10 +1079,14 @@ pub fn supported(head_dim: i64, n_head: i64, n_head_kv: i64) -> bool {
         && matches!(n_head / n_head_kv, 1 | 2 | 4 | 6 | 8 | 12 | 16)
 }
 
+#[cfg(all(test, feature = "cuda"))]
+mod ffma_tests;
 #[cfg(test)]
 mod granule_tests;
+pub mod hopper;
 #[cfg(all(test, feature = "cuda"))]
 mod m884_tests;
+pub mod qm_bench;
 #[cfg(test)]
 mod quant_tests;
 #[cfg(test)]
@@ -805,3 +1100,6 @@ mod tier_tests;
 pub mod tq;
 #[cfg(test)]
 mod vsplit_tests;
+pub mod wmma_bench;
+#[cfg(test)]
+mod wmma_split_tests;

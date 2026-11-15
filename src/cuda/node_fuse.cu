@@ -8,12 +8,15 @@
 //                  op_sigmoid, mul and add, each rounded (shexp_gate_kernel's, fused.cu).
 //   moe_tail_fma   moe_sum_gate's tail where ggml-cuda fuses the weighted sum (one fma per
 //                  expert), under --tp-moe-ep zero-weight rows not read (#1176).
+//                  With out16 (#1176) the values go out rounded to BF16 instead, into the
+//                  tensor-parallel send buffer of the reduce-scatter that reads the tail.
 //   ids_remap      the routed expert ids through the layer's expert table: ggml's cont and
 //                  get_rows of the I32 ids (integers, exact).
 //
 // The same flags as ggml-cuda and fused.cu (--use_fast_math), so expf is ggml's.
 
 #include <cstdint>
+#include <cuda_bf16.h>
 
 extern "C" {
 
@@ -28,6 +31,10 @@ struct legion_moe_sum_gate {
     int32_t       k;
     int32_t       n_tok;
     int32_t       skip_zero;  // moe_tail_fma: rows of zero router weights not read
+    // moe_tail_fma, null or [n_embd, n_tok] contiguous (#1176): out is not written; each value
+    // goes here rounded to BF16 (nearest even, as src/cuda/tp_net.cu's tp_pack_bf16 rounds
+    // out's values into the send buffer). 8-byte aligned for the 4-column kernel.
+    uint16_t *    out16;
 };
 
 struct legion_ids_remap {
@@ -143,7 +150,22 @@ template <int V> __global__ void moe_tail_fma_kernel(const legion_moe_sum_gate p
     for (int r = 0; r < V; ++r) {
         sum[r] = __fadd_rn(sum[r], __fmul_rn(sh[r], s));
     }
-    if constexpr (V == 4) {
+    if (p.out16) {
+        uint16_t b[V];
+#pragma unroll
+        for (int r = 0; r < V; ++r) {
+            b[r] = __bfloat16_as_ushort(__float2bfloat16_rn(sum[r]));
+        }
+        if constexpr (V == 4) {
+            *(uint2 *) (p.out16 + i) = make_uint2((uint32_t) b[0] | (uint32_t) b[1] << 16,
+                                                  (uint32_t) b[2] | (uint32_t) b[3] << 16);
+        } else {
+#pragma unroll
+            for (int r = 0; r < V; ++r) {
+                p.out16[i + r] = b[r];
+            }
+        }
+    } else if constexpr (V == 4) {
         *(float4 *) (p.out + i) = make_float4(sum[0], sum[1], sum[2], sum[3]);
     } else {
 #pragma unroll

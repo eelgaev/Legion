@@ -26,6 +26,10 @@ pub struct LinBenchArgs {
     /// the conversion and an F16-input kernel, against linear_tc on the F32 rows).
     #[arg(long)]
     convert: bool,
+    /// Also time each product as it runs without the GB10 kernels (`plain` rows: `serve
+    /// --glm-linear-plain`, linear_mm for F16 weights; #1212).
+    #[arg(long)]
+    plain: bool,
     /// Time the MLA products' F16 handoff instead (#862): attn_q_b -> attn_k_b and attn_v_b ->
     /// attn_output's rows, as main runs them and in F16 (attn_k_b on each kernel); fails when
     /// a value's bits differ.
@@ -61,7 +65,8 @@ pub fn run(args: LinBenchArgs) -> anyhow::Result<()> {
             );
             let mut t =
                 lin_bench::gemm_ms(&mut gpu, shape, n, args.reps, args.rounds, &kernels, false);
-            let plain = t.len();
+            let direct = t.len();
+            let mut labels: Vec<String> = Vec::new();
             if args.convert && !shape.xh && shape.h == 1 {
                 t.extend(lin_bench::gemm_ms(
                     &mut gpu,
@@ -73,18 +78,34 @@ pub fn run(args: LinBenchArgs) -> anyhow::Result<()> {
                     true,
                 ));
             }
-            let flop = 2.0 * (shape.k * shape.m * shape.h) as f64 * n as f64;
             for (i, r) in t.iter().enumerate() {
                 let kern = match r.kernel {
                     LinTc::Auto => "auto".to_string(),
                     LinTc::Tc => "tc".to_string(),
                     LinTc::Gb(v) => format!("gb{v}"),
                 };
-                let kern = if i < plain {
+                labels.push(if i < direct {
                     kern
                 } else {
                     format!("cvt+{kern}")
-                };
+                });
+            }
+            if args.plain {
+                set_gb10_linear(false);
+                t.extend(lin_bench::gemm_ms(
+                    &mut gpu,
+                    shape,
+                    n,
+                    args.reps,
+                    args.rounds,
+                    &[LinTc::Auto],
+                    false,
+                ));
+                set_gb10_linear(true);
+                labels.push("plain".to_string());
+            }
+            let flop = 2.0 * (shape.k * shape.m * shape.h) as f64 * n as f64;
+            for (r, kern) in t.iter().zip(labels) {
                 println!(
                     "{:<11} {:>6} {:>6} {:>6} {:>3} {:>6} {:>8} {:>9.3} {:>7.1} {:>8.3} {:>18}",
                     shape.name,

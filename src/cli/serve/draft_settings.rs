@@ -31,10 +31,13 @@ pub(super) struct DraftSettings {
     #[arg(long, value_enum, default_value_t = legion::spec::DraftWeights::Model)]
     pub spec_draft_weights: legion::spec::DraftWeights,
     /// The output head rows drafts are scored with: by a DFlash drafter that borrows the
-    /// target's head (`--spec dflash`), or by the MTP head of qwen4exp and qwen35 (`--spec
-    /// mtp`). `model`: as stored (all of them, or the first --spec-draft-vocab).
+    /// target's head (`--spec dflash`), or by the MTP head of qwen4exp, qwen35 and glm5-next
+    /// (`--spec mtp`). `model`: as stored (all of them, or the first --spec-draft-vocab; on
+    /// glm5-next also the number tokens past them).
     /// `q4`: a 4-bit copy of those rows made at load (Q4_K, the head's scales folded in), which
-    /// a draft pass reads instead (Qwen3.8-27B's FP8 head, 131,072 rows: 671 -> 377 MB).
+    /// a draft pass reads instead (Qwen3.8-27B's FP8 head, 131,072 rows: 671 -> 377 MB;
+    /// GLM-5.3-Flash Maya-S's Q6_K head at --spec-draft-vocab 65536: 212 -> 145 MiB, ~0.7 ms
+    /// less a step on a GB10 but lower acceptance on some chats).
     /// `auto` (default): `q4` for the qwen4exp MTP head on an integrated GPU (GB10) when the
     /// target's head is 16- or 32-bit (Qwen3.8-Flash-Next-NVFP4's BF16 head), else `model`
     /// (always `model` for DFlash). Drafts only: every token is verified by the target, so the
@@ -42,6 +45,14 @@ pub(super) struct DraftSettings {
     /// head.
     #[arg(long, value_enum, default_value_t = legion::spec::DraftLmHead::Auto)]
     pub spec_draft_lm_head: legion::spec::DraftLmHead,
+    /// DFlash 2 (opt-in): the draft pass over several sequences attends all of them in one
+    /// flash attention per drafter layer, their caches slots of one pool (a slot for each of
+    /// --max-seqs, made when the first sequence drafts), instead of one small attention per
+    /// sequence and layer. Drafts only: every token is verified by the target, but the drafts'
+    /// numerics differ slightly, so with 2 or more sequences drafting at once acceptance (and
+    /// under --deterministic the text) can move. One sequence drafts as without it.
+    #[arg(long)]
+    pub spec_draft_batched_attn: bool,
 }
 
 fn temperature(value: &str) -> Result<f32, String> {

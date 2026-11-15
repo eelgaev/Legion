@@ -5,6 +5,7 @@
 use super::*;
 use crate::ggml::{Backend, ComputeAllocator};
 use crate::model::core::mmq_preq::tests::{noise, q8_0_matrix};
+use crate::model::core::node_fuse::{Counts, rewrite_graph};
 
 #[test]
 fn mmq_whole_tiles_follows_ggml_stream_k() {
@@ -523,7 +524,7 @@ fn bf16_chain_case(
     let scale = 1.0 / hc as f32;
     let lo = |xnb| ctx.silu(ctx.scale(ctx.mul_mat(down, xnb), scale));
     let (r, ij, m) = if rebuilt {
-        let p = hc_post_norm_rebuilt_xnb(&ctx, res, out, inj, g, w, 1e-6, down);
+        let p = hc_post_norm_rebuilt_xnb(&ctx, res, out, inj, g, w, 1e-6, down, false);
         let mixed = up_mix_rebuilt(&ctx, up, lo(p.xnb), p.res, p.scales, g, hc, scale);
         (p.res, p.inject, mixed)
     } else {
@@ -599,5 +600,160 @@ fn cuda_rebuilt_bf16_chain_is_the_xn_chain() {
             let diff = ours[i].iter().zip(&xn[i]).filter(|(a, b)| a != b).count();
             assert_eq!(diff, 0, "{n} tokens: {diff} {what} bytes moved");
         }
+    }
+}
+
+/// The BF16 up-mix rebuilding xn from BF16 streams (`--hc-bf16`, #1183) and from F32 streams
+/// holding the same values, on `backend`: the mixed values' bytes of each.
+fn bf16_streams_case(backend: &mut Backend, e: i64, rank: i64, n: i64) -> [Vec<u8>; 2] {
+    let hc = 4i64;
+    let k = hc * e;
+    let ctx = Context::new(64, 64);
+    let up = ctx.new_tensor(types::BF16, &[rank, k]).as_input();
+    let lo = ctx.new_tensor(types::F32, &[rank, n]).as_input();
+    let res = ctx.new_tensor(types::F32, &[e, hc, n]).as_input();
+    let res16 = ctx.new_tensor(types::BF16, &[e, hc, n]).as_input();
+    let sc = ctx.new_tensor(types::F32, &[hc, n]).as_input();
+    let g = ctx.new_tensor(types::F32, &[k]).as_input();
+    let outs = [res, res16].map(|r| up_mix_rebuilt(&ctx, up, lo, r, sc, g, hc, 0.25).as_output());
+    let mut graph = ctx.new_graph(64);
+    for t in outs {
+        graph.expand(t);
+    }
+    ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+        .unwrap();
+    up.set_bytes(&bf16_matrix(rank as usize, k as usize, 71));
+    lo.set_f32(&noise((rank * n) as usize, 72));
+    let r: Vec<u16> = noise((k * n) as usize, 73)
+        .into_iter()
+        .map(crate::model::nvfp4_mm::bf16_bits)
+        .collect();
+    let wide: Vec<f32> = r
+        .iter()
+        .map(|&b| f32::from_bits(u32::from(b) << 16))
+        .collect();
+    res.set_f32(&wide);
+    res16.set_bytes(&r.iter().flat_map(|b| b.to_ne_bytes()).collect::<Vec<_>>());
+    sc.set_f32(
+        &noise((hc * n) as usize, 74)
+            .iter()
+            .map(|v| v.abs() + 0.5)
+            .collect::<Vec<_>>(),
+    );
+    g.set_f32(&noise(k as usize, 75));
+    backend.compute(&graph).unwrap();
+    outs.map(|t| t.bytes())
+}
+
+/// BF16 streams widen exactly, so the mix is the F32 streams' bit for bit (the CPU reference).
+#[test]
+fn cpu_bf16_streams_up_mix_is_the_f32_one() {
+    let mut cpu = Backend::cpu().unwrap();
+    cpu.set_threads(4);
+    for n in [1, 9] {
+        let [f, b] = bf16_streams_case(&mut cpu, 128, 64, n);
+        assert!(floats(&f).iter().any(|v| *v != 0.0), "nothing mixed");
+        assert!(f == b, "{n} tokens: BF16 streams moved the mix");
+    }
+}
+
+/// The same on sm_80+ at qwen4exp's shape: `up_mix_bf16<true, true>` against
+/// `up_mix_bf16<true>`.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an sm_80+ GPU"]
+fn cuda_bf16_streams_up_mix_is_the_f32_one() {
+    use crate::ggml::{DeviceKind, device_by_kind};
+    let mut gpu = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU device")
+        .init()
+        .unwrap();
+    if !crate::model::fp8::bf16_mma() {
+        println!("no BF16 tensor cores: skipped");
+        return;
+    }
+    for n in [256, 300, 2058] {
+        let [f, b] = bf16_streams_case(&mut gpu, 2560, 320, n);
+        assert!(f == b, "{n} tokens: BF16 streams moved the mix");
+    }
+}
+
+/// `lo` as BF16 sits at the end of its node, 256-byte aligned, within it (#1183).
+#[test]
+fn lob_sits_at_the_node_end() {
+    for (rows, rank, n) in [(10240usize, 320usize, 4096usize), (512, 64, 9), (64, 16, 1)] {
+        let bytes = rows * n * 4;
+        let at = lob_offset(bytes, rank, n);
+        assert_eq!(at % 256, 0, "{rows} {rank} {n}: aligned");
+        let end = at + rank * n * 2;
+        assert!(end <= bytes, "{rows} {rank} {n}: within the node");
+        assert!(end + 256 > bytes, "{rows} {rank} {n}: at the end");
+    }
+}
+
+/// The BF16 up-mix rebuilding `xn` and ggml's cast of its values to BF16, on the CPU, with the
+/// node fusion (`fuse`) or as built: the cast's bytes, the mixed values' bytes (`keep_f32`: a
+/// graph output, else read by the cast only) and what the fusion did.
+fn mix_cast_case(fuse: bool, keep_f32: bool) -> (Vec<u8>, Option<Vec<u8>>, Counts) {
+    let mut cpu = Backend::cpu().unwrap();
+    cpu.set_threads(4);
+    let (e, rank, n, hc) = (128i64, 64i64, 9i64, 4i64);
+    let k = hc * e;
+    let ctx = Context::new(64, 64);
+    // Inputs kept for the whole graph (outputs too), as weights and earlier layers' tensors are:
+    // otherwise the allocator may put the cast in their memory once the mix has read them, and
+    // the fusion rightly refuses a cast over what the mix reads.
+    let kept = |ty, ne: &[i64]| ctx.new_tensor(ty, ne).as_input().as_output();
+    let up = kept(types::BF16, &[rank, k]);
+    let lo = kept(types::F32, &[rank, n]);
+    let res = kept(types::F32, &[e, hc, n]);
+    let sc = kept(types::F32, &[hc, n]);
+    let g = kept(types::F32, &[k]);
+    // `lo` made in the graph, as the down projection's output is.
+    let lo2 = ctx.scale(lo, 1.5);
+    let mixed = up_mix_rebuilt(&ctx, up, lo2, res, sc, g, hc, 0.25);
+    let mixed = if keep_f32 { mixed.as_output() } else { mixed };
+    let cast = ctx.cast(mixed, types::BF16).as_output();
+    let mut graph = ctx.new_graph(64);
+    graph.expand(cast);
+    if keep_f32 {
+        graph.expand(mixed);
+    }
+    ctx.alloc_graph(&graph, ComputeAllocator::new(cpu.buffer_type()))
+        .unwrap();
+    // SAFETY: an allocated graph that has not run.
+    let c = if fuse {
+        unsafe { rewrite_graph(graph.raw(), false) }
+    } else {
+        Counts::default()
+    };
+    up.set_bytes(&bf16_matrix(rank as usize, k as usize, 81));
+    lo.set_f32(&noise((rank * n) as usize, 82));
+    res.set_f32(&noise((k * n) as usize, 83));
+    sc.set_f32(
+        &noise((hc * n) as usize, 84)
+            .iter()
+            .map(|v| v.abs() + 0.5)
+            .collect::<Vec<_>>(),
+    );
+    g.set_f32(&noise(k as usize, 85));
+    cpu.compute(&graph).unwrap();
+    (cast.bytes(), keep_f32.then(|| mixed.bytes()), c)
+}
+
+/// The fused cast is ggml's cast bit for bit; the mix skips its F32 values only where nothing
+/// but the cast reads them.
+#[test]
+fn cpu_mix_cast_is_ggmls_cast() {
+    for keep_f32 in [false, true] {
+        let (built, built_f32, _) = mix_cast_case(false, keep_f32);
+        let (fused, fused_f32, c) = mix_cast_case(true, keep_f32);
+        assert_eq!(c.mix_cast, 1, "keep_f32 {keep_f32}: the cast fused");
+        let skipped = usize::from(!keep_f32);
+        assert_eq!(c.mix_f32_skipped, skipped, "keep_f32 {keep_f32}: skipped");
+        assert!(built.iter().any(|&b| b != 0), "nothing mixed");
+        assert!(built == fused, "keep_f32 {keep_f32}: the cast moved");
+        assert!(built_f32 == fused_f32, "keep_f32 {keep_f32}: F32 moved");
     }
 }

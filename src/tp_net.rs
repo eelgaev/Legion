@@ -31,9 +31,9 @@ mod rdma;
 pub mod seq_par;
 pub mod shard;
 
-pub use profile::StepProfile;
+pub use profile::{StepLaps, StepProfile};
 
-pub use comm::{ArStats, Comm};
+pub use comm::{ArStats, Comm, StepMarks};
 pub use op::all_reduce;
 
 use std::io::{Read, Write};
@@ -94,6 +94,10 @@ pub struct TpNetConfig {
     /// (a prompt chunk's take-in) go to the other ranks as that range, and each reads its own
     /// copy (`--tp-mtp-local-rows`, #780); off: their values are sent.
     pub mtp_local_rows: bool,
+    /// Rank 0 of two: greedy decode and verify steps compute the output head as two shares
+    /// of the vocabulary, one on each rank (`--tp-head-split`, #1176;
+    /// [`crate::model::core::head_split`]); off: rank 0 computes all of it.
+    pub head_split: bool,
     /// qwen4exp: each rank holds whole routed experts, its share of the expert ids, instead of
     /// every expert's share of the rows (`--tp-moe-ep`, #798; [`shard::qwen4::Experts`]).
     pub moe_ep: bool,

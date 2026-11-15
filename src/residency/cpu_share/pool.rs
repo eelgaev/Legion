@@ -48,6 +48,44 @@ pub struct Exchange {
     pub max_tok: usize,
     pub max_used: usize,
     pub n_embd: usize,
+    /// The exact share's part (x86, see the `cpu_share` module docs): `x` and the host kernels
+    /// are not used then.
+    pub exact: Option<ExactExchange>,
+}
+
+/// The exact share's part of an exchange buffer (`cpu_share::ExactLayout`).
+#[derive(Debug, Clone, Copy)]
+pub struct ExactExchange {
+    /// Raised by the pool when its pairs' gate and up sums are written.
+    pub gu_done: *const AtomicU32,
+    /// Raised by the GPU when the host pairs' SwiGLU blocks are written (`activate`).
+    pub act_ready: *const AtomicU32,
+    /// Raised by the GPU when it reaches `activate` (with debug logging on only).
+    pub act_arrived: *const AtomicU32,
+    /// The step's distinct host experts (`publish`).
+    pub n_miss: *const AtomicU32,
+    /// `[n_layers]`: each layer's share of 1024, which `publish` reads.
+    pub thr: *const AtomicU32,
+    /// `[n_layers]`: the pool's running mean of microseconds per expert (0: none yet).
+    pub cost: *mut f32,
+    pub n_layers: usize,
+    /// `[n_tok][n_embd / 32]` block_q8_1: x as the expert kernels quantize it.
+    pub xq: *const u8,
+    /// `[n_tok][n_used][2][n_ff]`: the host pairs' raw gate and up sums (the layer's `n_ff`).
+    pub gu: *mut f32,
+    /// `[n_tok][n_used][n_ff / 32]` block_q8_1: the host pairs' SwiGLU (the layer's `n_ff`).
+    pub aq: *const u8,
+    /// The most rows of an expert the buffer holds.
+    pub n_ff: usize,
+    /// Whether the pool sets each layer's share from the costs (else `thr` stays).
+    pub auto: bool,
+    /// The most share `auto` gives a layer, of 1024.
+    pub cap: u32,
+    /// The link's time per byte of an expert the GPU reads over it.
+    pub link_us_per_byte: f32,
+    /// `publish` gives the pool every host expert of a step with at most this many (0: none
+    /// past the share), and `auto` learns only from the other jobs ([`all_upto`]).
+    pub all_upto: u32,
 }
 
 // SAFETY: plain addresses of a pinned buffer; the flags order every access (see `Pool`).
@@ -127,12 +165,47 @@ pub unsafe fn reference(
 /// How long a pool keeps spinning after its last job before it naps between checks.
 const SPIN_FOR: Duration = Duration::from_millis(50);
 const NAP: Duration = Duration::from_micros(50);
-/// The longest a job waits for its "ready" flag before the pool gives up on it and raises
-/// "done" (so the GPU never waits forever on a step the host missed).
-const READY_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often the pool warns while a job waits for its "ready" flag. It never gives up on a
+/// step: "done" without the rows would let the GPU's `collect` read the previous step's rows
+/// (silently wrong hidden states), so a GPU stalled ahead of a publish (a long prompt chunk on
+/// the device, a debugger) only costs warnings. Short in tests, which wait past it.
+#[cfg(not(test))]
+const READY_WARN_EVERY: Duration = Duration::from_secs(10);
+#[cfg(test)]
+pub(super) const READY_WARN_EVERY: Duration = Duration::from_millis(20);
 /// The fewest rows a task takes, and the tasks per thread aimed for.
 const MIN_ROWS: usize = 16;
 const TASKS_PER_THREAD: usize = 3;
+
+/// How a phase's rows are cut into tasks: about `tasks_per_thread` tasks per thread over all
+/// the job's experts, at least `min_rows` rows each. The tasks go expert after expert and
+/// thread `i` starts with task `i`, so at one task per thread each thread takes one
+/// contiguous range and a job of several experts runs them side by side on a part of the
+/// threads each (`legion cpu-bench pool --tasks-per-thread` compares them). Placement of work
+/// only: every row is the same sum either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Split {
+    pub tasks_per_thread: usize,
+    pub min_rows: usize,
+}
+
+impl Default for Split {
+    fn default() -> Self {
+        Self {
+            tasks_per_thread: TASKS_PER_THREAD,
+            min_rows: MIN_ROWS,
+        }
+    }
+}
+
+/// Rows per task for `rows` rows of each of `groups` experts over `threads` threads.
+pub fn rows_per_task(split: Split, threads: usize, groups: usize, rows: usize) -> usize {
+    (rows * groups)
+        .div_ceil(threads.max(1) * split.tasks_per_thread.max(1))
+        .max(split.min_rows.max(1))
+        .min(rows)
+        .max(1)
+}
 
 /// POWER's SMT priority hints (`or 1,1,1`: low, `or 2,2,2`: medium): a spinning thread
 /// gives its core's dispatch slots to the core's other threads. Elsewhere a spin hint.
@@ -183,6 +256,8 @@ struct Task {
 #[derive(Default)]
 struct Current {
     job: Option<Job>,
+    /// An exact job ([`run_exact`]): phases 1 and 3 only, with the GPU kernels' bits.
+    exact: bool,
     groups: Vec<Group>,
     tasks: Vec<Task>,
     n_tasks: usize,
@@ -204,19 +279,38 @@ struct Shared {
     next: AtomicUsize,
     finished: AtomicUsize,
     current: Cell,
+    /// Set by [`Pool::stop`]: the coordinator returns between jobs.
     stop: AtomicBool,
+    /// Set when the coordinator returned: the helpers return (never in the middle of a job,
+    /// whose phases need every thread).
+    quit: AtomicBool,
     threads: usize,
+    split: Split,
+}
+
+/// Raises its flag when dropped (the coordinator's `quit`, also when it panics).
+struct RaiseOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for RaiseOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 /// A NUMA node's pool: `threads` threads pinned one per CPU of `cpus` (cycled), the first
 /// coordinating. Jobs of each device run in order; of several devices, whichever is ready.
 pub struct Pool {
     shared: Arc<Shared>,
-    handles: Vec<std::thread::JoinHandle<()>>,
+    handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 impl Pool {
     pub fn new(cpus: &[u32], threads: usize) -> Self {
+        Self::with_split(cpus, threads, Split::default())
+    }
+
+    /// [`Self::new`] with another cut of the phases into tasks (the pool benchmark's).
+    pub fn with_split(cpus: &[u32], threads: usize, split: Split) -> Self {
         let threads = threads.max(1);
         let shared = Arc::new(Shared {
             queues: Mutex::new(Vec::new()),
@@ -226,7 +320,9 @@ impl Pool {
             finished: AtomicUsize::new(0),
             current: Cell(UnsafeCell::new(Current::default())),
             stop: AtomicBool::new(false),
+            quit: AtomicBool::new(false),
             threads,
+            split,
         });
         let handles = (0..threads)
             .map(|i| {
@@ -240,6 +336,7 @@ impl Pool {
                             let _ = crate::hw::numa::pin_current_thread(&[c]);
                         }
                         if i == 0 {
+                            let _quit = RaiseOnDrop(&s.quit);
                             coordinate(&s);
                         } else {
                             help(&s, i);
@@ -248,7 +345,43 @@ impl Pool {
                     .expect("spawning a cpu-share thread")
             })
             .collect();
-        Self { shared, handles }
+        Self {
+            shared,
+            handles: Mutex::new(handles),
+        }
+    }
+
+    /// Stops the threads (a job they run finishes first), then raises "done" for every job
+    /// still queued, rows not computed: the one case the pool lets a step through without its
+    /// rows, so that a GPU stream still waiting at a `collect` drains instead of hanging the
+    /// teardown (the share is going away; nothing reads those steps' outputs). Idempotent;
+    /// the queued jobs' exchange buffers must still be live, so the share stops its pools
+    /// before it frees them (`ops::clear`).
+    pub fn stop(&self) {
+        self.shared.stop.store(true, Ordering::Release);
+        for h in self.handles.lock().unwrap().drain(..) {
+            let _ = h.join();
+        }
+        let mut released = 0usize;
+        for queue in self.shared.queues.lock().unwrap().iter_mut() {
+            for (job, _) in queue.drain(..) {
+                // SAFETY: the exchange buffer is live (the caller's order, see above).
+                unsafe {
+                    if let Some(e) = job.exchange.exact {
+                        (*e.gu_done).store(job.seq, Ordering::Release);
+                    }
+                    (*job.exchange.done).store(job.seq, Ordering::Release);
+                }
+                released += 1;
+            }
+        }
+        self.shared.pending.store(0, Ordering::Release);
+        if released > 0 {
+            tracing::warn!(
+                jobs = released,
+                "cpu share: stopped with queued steps; released them without their rows"
+            );
+        }
     }
 
     /// A new job queue (one per device).
@@ -267,10 +400,7 @@ impl Pool {
 
 impl Drop for Pool {
     fn drop(&mut self) {
-        self.shared.stop.store(true, Ordering::Release);
-        for h in self.handles.drain(..) {
-            let _ = h.join();
-        }
+        self.stop();
     }
 }
 
@@ -280,9 +410,9 @@ fn reached(flag: &AtomicU32, seq: u32) -> bool {
 }
 
 /// Spins (at low priority) while recently busy, naps otherwise, until `ready` says go; false
-/// when the pool stops.
-fn wait_for(s: &Shared, mut ready: impl FnMut() -> bool) -> bool {
-    let mut busy = Instant::now();
+/// when `stop` is raised first.
+fn wait_for(stop: &AtomicBool, mut ready: impl FnMut() -> bool) -> bool {
+    let busy = Instant::now();
     let mut spins = 0u32;
     loop {
         if ready() {
@@ -291,14 +421,16 @@ fn wait_for(s: &Shared, mut ready: impl FnMut() -> bool) -> bool {
         }
         spins = spins.wrapping_add(1);
         if spins.is_multiple_of(1024) {
-            if s.stop.load(Ordering::Acquire) {
+            if stop.load(Ordering::Acquire) {
                 spin_done();
                 return false;
             }
             if busy.elapsed() >= SPIN_FOR {
                 std::thread::sleep(NAP);
+                // `ready` may have acted (taken a job), so a yes here is final.
                 if ready() {
-                    busy = Instant::now();
+                    spin_done();
+                    return true;
                 }
                 continue;
             }
@@ -308,13 +440,17 @@ fn wait_for(s: &Shared, mut ready: impl FnMut() -> bool) -> bool {
 }
 
 /// The coordinator: takes the first queue's head job that is ready, runs it, raises "done".
+/// A job runs only once its step is published, however long that takes (with a warning every
+/// [`READY_WARN_EVERY`]); "done" always follows its rows.
 fn coordinate(s: &Shared) {
+    // The last "still waiting" warning (one per interval, of all queues).
+    let mut warned = Instant::now();
     loop {
-        if !wait_for(s, || s.pending.load(Ordering::Acquire) > 0) {
+        if !wait_for(&s.stop, || s.pending.load(Ordering::Acquire) > 0) {
             return;
         }
         let mut picked = None;
-        if !wait_for(s, || {
+        if !wait_for(&s.stop, || {
             let mut q = s.queues.lock().unwrap();
             for queue in q.iter_mut() {
                 let Some(&(job, at)) = queue.front() else {
@@ -322,10 +458,20 @@ fn coordinate(s: &Shared) {
                 };
                 // SAFETY: the flags live in the exchange buffer while jobs use it.
                 let ready = unsafe { &*job.exchange.ready };
-                if reached(ready, job.seq) || at.elapsed() > READY_TIMEOUT {
+                if reached(ready, job.seq) {
                     queue.pop_front();
                     picked = Some(job);
                     return true;
+                }
+                let waited = at.elapsed();
+                if waited >= READY_WARN_EVERY && warned.elapsed() >= READY_WARN_EVERY {
+                    warned = Instant::now();
+                    tracing::warn!(
+                        seq = job.seq,
+                        layer = job.layer,
+                        waited_s = waited.as_secs(),
+                        "cpu share: still waiting for the GPU to publish a step"
+                    );
                 }
             }
             false
@@ -336,17 +482,26 @@ fn coordinate(s: &Shared) {
         s.pending.fetch_sub(1, Ordering::AcqRel);
         // SAFETY: as above.
         let (ready, done) = unsafe { (&*job.exchange.ready, &*job.exchange.done) };
-        let start = Instant::now();
-        let mut pairs = 0;
-        if reached(ready, job.seq) {
-            pairs = run_job(s, &job);
-        } else {
+        // The GPU publishes the next step of a device only after this one's `collect`, which
+        // waits for this job: "ready" past the job's step means the host missed a step.
+        let published = ready.load(Ordering::Acquire);
+        if published != job.seq {
             tracing::error!(
                 seq = job.seq,
                 layer = job.layer,
-                "cpu share: the GPU never published a step"
+                published,
+                "cpu share: the GPU published a later step than the host's next job"
             );
+            debug_assert_eq!(published, job.seq, "cpu share: a step was skipped");
         }
+        if job.exchange.exact.is_some() {
+            let st = run_exact(s, &job);
+            done.store(job.seq, Ordering::Release);
+            exact_stats(&st);
+            continue;
+        }
+        let start = Instant::now();
+        let pairs = run_job(s, &job);
         let compute = start.elapsed();
         // SAFETY: as above (null when the buffer has no such flag: tests).
         let waited = unsafe { job.exchange.arrived.as_ref() }.is_some_and(|a| reached(a, job.seq));
@@ -377,6 +532,236 @@ fn stats(compute: Duration, pairs: usize, waited: bool) {
     }
 }
 
+/// What an exact job did ([`run_exact`]), for [`exact_stats`].
+#[derive(Debug, Default)]
+struct ExactStats {
+    /// The step's distinct host experts, and those the pool computed (with their pairs).
+    miss: u32,
+    experts: usize,
+    pairs: usize,
+    gate_up: Duration,
+    /// From "gate/up done" to "act ready".
+    wait: Duration,
+    down: Duration,
+    /// Whether the GPU reached `activate` / `collect` before the pool was done (`activate`'s
+    /// with `auto` or debug logging, `collect`'s with debug logging only).
+    gpu_waited_act: bool,
+    gpu_waited: bool,
+    /// The layer's share after the job.
+    thr: u32,
+}
+
+/// How fast a layer's cost per expert follows its jobs (a running mean over about 16).
+const COST_EMA: f64 = 1.0 / 16.0;
+
+/// How far one job moves an `auto` layer's share, of [`super::THRESHOLD_ONE`].
+pub const NUDGE: u32 = 4;
+
+/// An `auto` layer's next share after a job whose misses were split at `thr`: less when the
+/// GPU reached `activate` before the pool's gate and up sums were done (it waited for the
+/// pool), more when the pool finished first (the GPU's side was the later one). The first
+/// split ([`split`]) prices the link from a timed copy, which leaves out the GPU's own work
+/// on its hits and how fast its kernels read mapped memory, so after it the race itself sets
+/// the share: it settles where each side waits for the other about as often. Only jobs the
+/// pool took experts in move it (a job without any says nothing about the race), so it stays
+/// at [`AUTO_MIN`] or more: a share near 0 would hardly ever give the pool a job to learn from.
+pub fn nudge(thr: u32, gpu_waited: bool, cap: u32) -> u32 {
+    let next = if gpu_waited {
+        thr.saturating_sub(NUDGE)
+    } else {
+        thr + NUDGE
+    };
+    next.max(AUTO_MIN).min(cap)
+}
+
+/// The least share [`nudge`] leaves a layer, of [`super::THRESHOLD_ONE`] (3%).
+pub const AUTO_MIN: u32 = 32;
+
+/// [`ExactExchange::all_upto`] with `auto` where every routed expert is in host memory (no
+/// bounded host tier, `tiered` false): a decode step's layer has 2-3 host experts, and the
+/// pool computing all of them beat splitting them with the link (the GPU reading the rest
+/// over PCIe while the pool reads the same DRAM) on a 4090 with 128 GB. Steps with more (four
+/// chats at once) race as before. 0 elsewhere. `LEGION_DEBUG_SHARE_ALL_UPTO=<n>` sets it (0:
+/// off), for A/B runs.
+pub fn all_upto(auto: bool, tiered: bool) -> u32 {
+    let debug = std::env::var("LEGION_DEBUG_SHARE_ALL_UPTO")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    all_upto_with(auto, tiered, debug)
+}
+
+/// [`all_upto`] with the debug value given.
+pub fn all_upto_with(auto: bool, tiered: bool, debug: Option<u32>) -> u32 {
+    match debug {
+        Some(n) if auto => n,
+        _ if auto && !tiered => ALL_UPTO,
+        _ => 0,
+    }
+}
+
+/// [`all_upto`]'s default.
+pub const ALL_UPTO: u32 = 3;
+
+/// Runs an exact job (see the `cpu_share` module docs): the pairs' gate and up sums, "gate/up
+/// done", the wait for the GPU's SwiGLU blocks, the down rows. The caller raises "done".
+fn run_exact(s: &Shared, job: &Job) -> ExactStats {
+    let ex = job.exchange;
+    let e = ex.exact.expect("an exact exchange");
+    let layer = job.layer as usize;
+    let (n_tok, n_used) = (job.n_tok.min(ex.max_tok), job.n_used.min(ex.max_used));
+    // SAFETY: the GPU wrote the ids and the count before raising "ready" (acquired); nothing
+    // writes them until this job's "done". The flags live in the buffer.
+    let (ids, gu_done, act_ready, miss) = unsafe {
+        (
+            std::slice::from_raw_parts(ex.ids, n_tok * n_used),
+            &*e.gu_done,
+            &*e.act_ready,
+            (*e.n_miss).load(Ordering::Acquire),
+        )
+    };
+    let thr_of = |il: usize| {
+        // SAFETY: a word of the buffer's `thr` (in range).
+        (il < e.n_layers).then(|| unsafe { &*e.thr.add(il) }.load(Ordering::Relaxed))
+    };
+    let mut st = ExactStats {
+        miss,
+        thr: thr_of(layer).unwrap_or(0),
+        ..Default::default()
+    };
+    let groups = groups(ids, n_used);
+    if groups.is_empty() {
+        gu_done.store(job.seq, Ordering::Release);
+        return st;
+    }
+    st.experts = groups.len();
+    st.pairs = groups.iter().map(|g| g.1.len()).sum();
+    let (ne, nf) = (job.experts.n_embd, job.experts.n_ff);
+    // SAFETY: no phase runs (the helpers wait for `phase_gen`): this thread has it alone.
+    unsafe {
+        let c = &mut *s.current.0.get();
+        c.job = Some(*job);
+        c.exact = true;
+        c.groups = groups
+            .into_iter()
+            .map(|(expert, pairs)| Group {
+                act_ptr: std::ptr::null_mut(),
+                act: UnsafeCell::new(Vec::new()),
+                expert,
+                pairs,
+                xa: UnsafeCell::new(None),
+                aa: UnsafeCell::new(None),
+            })
+            .collect();
+    }
+    let t = Instant::now();
+    split_rows(s, nf);
+    run_phase(s, 1);
+    st.gate_up = t.elapsed();
+    // SAFETY: the flag lives in the buffer.
+    st.gpu_waited_act = reached(unsafe { &*e.act_arrived }, job.seq);
+    gu_done.store(job.seq, Ordering::Release);
+    let t = Instant::now();
+    // The GPU's `activate` follows its SwiGLU op at once; stopping leaves the rows undone (the
+    // share is going away, see `Pool::stop`).
+    if !wait_for(&s.stop, || reached(act_ready, job.seq)) {
+        return st;
+    }
+    st.wait = t.elapsed();
+    let t = Instant::now();
+    split_rows(s, ne);
+    run_phase(s, 3);
+    st.down = t.elapsed();
+    // SAFETY: as above (null when the buffer has no such flag: tests).
+    st.gpu_waited = unsafe { ex.arrived.as_ref() }.is_some_and(|a| reached(a, job.seq));
+    // A step the pool takes whole ([`ExactExchange::all_upto`]) says nothing about the race.
+    if e.auto && layer < e.n_layers && miss > e.all_upto {
+        let now = (st.gate_up + st.down).as_secs_f64() * 1e6 / st.experts as f64;
+        // SAFETY: the layer's words of the buffer; only this thread writes `cost`.
+        unsafe {
+            let cost = e.cost.add(layer);
+            let prev = f64::from(*cost);
+            let c = if prev > 0.0 {
+                prev + (now - prev) * COST_EMA
+            } else {
+                now
+            };
+            *cost = c as f32;
+            let thr = if prev > 0.0 {
+                nudge(st.thr, st.gpu_waited_act, e.cap)
+            } else {
+                let bytes: usize = job.experts.expert_bytes.iter().sum();
+                split(f64::from(e.link_us_per_byte) * bytes as f64, c, e.cap)
+            };
+            (*e.thr.add(layer)).store(thr, Ordering::Relaxed);
+            st.thr = thr;
+        }
+    }
+    st
+}
+
+/// The share of 1024 where `c` microseconds a pool expert and `l` a link expert finish together
+/// (`l / (l + c)` of the misses on the pool), at most `cap`.
+pub fn split(l: f64, c: f64, cap: u32) -> u32 {
+    if !(l > 0.0) || !(c >= 0.0) {
+        return 0;
+    }
+    ((l / (l + c) * super::THRESHOLD_ONE as f64).round() as u32).min(cap)
+}
+
+/// Debug statistics of the exact share (`RUST_LOG=legion::residency::cpu_share=debug`), per
+/// 4,096 jobs: misses per job and the pool's part of them, the pool's phases and its wait for
+/// the GPU's SwiGLU blocks, microseconds per expert, the jobs the GPU waited for (debug only)
+/// and the mean share.
+fn exact_stats(st: &ExactStats) {
+    #[derive(Default)]
+    struct Acc {
+        jobs: u64,
+        busy: u64,
+        miss: u64,
+        experts: u64,
+        pairs: u64,
+        gate_up: f64,
+        wait: f64,
+        down: f64,
+        waited_act: u64,
+        waited: u64,
+        thr: u64,
+    }
+    static ACC: Mutex<Option<Acc>> = Mutex::new(None);
+    let mut g = ACC.lock().unwrap();
+    let a = g.get_or_insert_with(Acc::default);
+    a.jobs += 1;
+    a.busy += u64::from(st.experts > 0);
+    a.miss += u64::from(st.miss);
+    a.experts += st.experts as u64;
+    a.pairs += st.pairs as u64;
+    a.gate_up += st.gate_up.as_secs_f64() * 1e6;
+    a.wait += st.wait.as_secs_f64() * 1e6;
+    a.down += st.down.as_secs_f64() * 1e6;
+    a.waited_act += u64::from(st.gpu_waited_act);
+    a.waited += u64::from(st.gpu_waited);
+    a.thr += u64::from(st.thr);
+    if a.jobs.is_multiple_of(4096) {
+        let n = a.jobs as f64;
+        let busy = a.busy.max(1) as f64;
+        tracing::debug!(
+            jobs = a.jobs,
+            misses = a.miss as f64 / n,
+            pool_experts = a.experts as f64 / n,
+            pool_pairs = a.pairs as f64 / n,
+            gate_up_us = a.gate_up / busy,
+            act_wait_us = a.wait / busy,
+            down_us = a.down / busy,
+            us_per_expert = (a.gate_up + a.down) / a.experts.max(1) as f64,
+            gpu_waited_act = a.waited_act as f64 / n,
+            gpu_waited = a.waited as f64 / n,
+            share = a.thr as f64 / n / super::THRESHOLD_ONE as f64,
+            "cpu share exact jobs"
+        );
+        *a = Acc::default();
+    }
+}
+
 /// Runs `job` over the pool; returns its host pairs.
 fn run_job(s: &Shared, job: &Job) -> usize {
     let ex = job.exchange;
@@ -394,6 +779,7 @@ fn run_job(s: &Shared, job: &Job) -> usize {
     unsafe {
         let c = &mut *s.current.0.get();
         c.job = Some(*job);
+        c.exact = false;
         c.groups = groups
             .into_iter()
             .map(|(expert, pairs)| {
@@ -421,16 +807,11 @@ fn run_job(s: &Shared, job: &Job) -> usize {
     pairs
 }
 
-/// Splits every group's `rows` into tasks: about [`TASKS_PER_THREAD`] per thread, at least
-/// [`MIN_ROWS`] rows each.
+/// Splits every group's `rows` into tasks of [`rows_per_task`] rows (the pool's [`Split`]).
 fn split_rows(s: &Shared, rows: usize) {
     // SAFETY: between phases (see `run_job`).
     let c = unsafe { &mut *s.current.0.get() };
-    let total = rows * c.groups.len();
-    let per = total
-        .div_ceil(s.threads * TASKS_PER_THREAD)
-        .max(MIN_ROWS)
-        .min(rows);
+    let per = rows_per_task(s.split, s.threads, c.groups.len(), rows);
     c.tasks.clear();
     for g in 0..c.groups.len() {
         for r0 in (0..rows).step_by(per) {
@@ -462,7 +843,7 @@ fn run_phase(s: &Shared, phase: u64) {
 fn help(s: &Shared, i: usize) {
     let mut seen = 0u64;
     loop {
-        if !wait_for(s, || s.phase_gen.load(Ordering::Acquire) != seen) {
+        if !wait_for(&s.quit, || s.phase_gen.load(Ordering::Acquire) != seen) {
             return;
         }
         seen = s.phase_gen.load(Ordering::Acquire);
@@ -494,6 +875,11 @@ unsafe fn run_task(c: &Current, phase: u64, task: usize) {
     let job = c.job.as_ref().expect("a job");
     let ex = &job.experts;
     let (ne, nf) = (ex.n_embd, ex.n_ff);
+    if c.exact {
+        // SAFETY: the caller's guarantee.
+        unsafe { run_exact_task(c, job, phase, task) };
+        return;
+    }
     match phase {
         0 | 2 => {
             let g = &c.groups[task];
@@ -550,6 +936,55 @@ unsafe fn run_task(c: &Current, phase: u64, task: usize) {
                     let dst = job.exchange.out.add((t * job.n_used + j) * ne + r0);
                     std::ptr::copy_nonoverlapping(o.as_ptr().add(q * n), dst, n);
                 }
+            }
+        }
+    }
+}
+
+/// Task `task` of an exact job's phase `phase`: 1 computes a row range of a group's gate and up
+/// sums for each of its pairs from x's blocks, 3 a row range of its down rows from the pairs'
+/// SwiGLU blocks, into the exchange buffer.
+///
+/// # Safety
+/// The task must be the calling thread's alone in the phase.
+unsafe fn run_exact_task(c: &Current, job: &Job, phase: u64, task: usize) {
+    use crate::cpu::gpu_exact::{Q8_1_BLOCK_BYTES, matvec};
+    let ex = &job.experts;
+    let e = job.exchange.exact.expect("an exact exchange");
+    let (ne, nf) = (ex.n_embd, ex.n_ff);
+    let Task { group, r0, r1 } = c.tasks[task];
+    let g = &c.groups[group];
+    let n = r1 - r0;
+    let (xq_bytes, aq_bytes) = (ne / 32 * Q8_1_BLOCK_BYTES, nf / 32 * Q8_1_BLOCK_BYTES);
+    if phase == 1 {
+        let rb = ex.up_gate.row_bytes(ne).expect("gate rows");
+        // SAFETY: live host experts (the pool's owner keeps them mapped).
+        let (gate, up) = unsafe { (ex.expert(1, g.expert), ex.expert(0, g.expert)) };
+        for &(t, j) in &g.pairs {
+            let pair = t * job.n_used + j;
+            // SAFETY: the GPU wrote x's blocks before raising "ready"; rows `r0..r1` of the
+            // pair's sums are this task's alone, and the GPU reads them after "gate/up done".
+            unsafe {
+                let xq = std::slice::from_raw_parts(e.xq.add(t * xq_bytes), xq_bytes);
+                let sums = e.gu.add(pair * 2 * nf);
+                let g_out = std::slice::from_raw_parts_mut(sums.add(r0), n);
+                matvec(ex.up_gate, &gate[r0 * rb..r1 * rb], xq, ne, g_out).expect("gate");
+                let u_out = std::slice::from_raw_parts_mut(sums.add(nf + r0), n);
+                matvec(ex.up_gate, &up[r0 * rb..r1 * rb], xq, ne, u_out).expect("up");
+            }
+        }
+    } else {
+        let rb = ex.down.row_bytes(nf).expect("down rows");
+        // SAFETY: as above.
+        let down = unsafe { ex.expert(2, g.expert) };
+        for &(t, j) in &g.pairs {
+            let pair = t * job.n_used + j;
+            // SAFETY: the GPU wrote the pair's blocks before raising "act ready"; rows `r0..r1`
+            // of the pair's output row are this task's alone; the GPU reads them after "done".
+            unsafe {
+                let aq = std::slice::from_raw_parts(e.aq.add(pair * aq_bytes), aq_bytes);
+                let out = std::slice::from_raw_parts_mut(job.exchange.out.add(pair * ne + r0), n);
+                matvec(ex.down, &down[r0 * rb..r1 * rb], aq, nf, out).expect("down");
             }
         }
     }

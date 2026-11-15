@@ -88,7 +88,10 @@ impl Executor {
     /// drafts so far after each new one (rank 0 starts reading the drafts' n-gram rows there).
     /// Every pass runs on this rank only, except that a rank 0 of [`Self::mtp_chains`] first
     /// sends the round to the other ranks, which run the same passes (there `first` must be
-    /// `0..`: the request carries no order).
+    /// `0..`: the request carries no order) and read the n-gram rows of its tokens from
+    /// `tails` (per row `k`, its last tokens fed up to the bonus token; see
+    /// [`Request::TpMtpChain`]).
+    #[allow(clippy::too_many_arguments)]
     pub fn mtp_chain(
         &mut self,
         groups: &[Group<'_>],
@@ -96,6 +99,7 @@ impl Executor {
         caps: &[u32],
         first: &[usize],
         p_min: f32,
+        tails: &[&[u32]],
         on_draft: impl FnMut(&Executor, usize, &[(u32, f32)]),
     ) -> Result<ChainOutput, ModelError> {
         if !self.mtp_chains() {
@@ -106,12 +110,15 @@ impl Executor {
                 "an MTP chain over machines with its first pass in another order".into(),
             ));
         }
+        let (wire_parts, h) = self.tp_rows_wire(parts);
         let req = Request::TpMtpChain {
             groups: super::remote::to_wire(groups),
             gather_budget: self.gather_budget as u64,
-            h: parts.concat(),
+            parts: wire_parts,
+            h,
             caps: caps.to_vec(),
             p_min: p_min.to_bits(),
+            tails: tails.iter().map(|t| t.to_vec()).collect(),
         };
         self.tp_run(&req, |e| {
             e.mtp_chain_here(groups, parts, caps, first, p_min, on_draft)

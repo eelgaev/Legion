@@ -90,7 +90,7 @@ pub fn set_gdn_decode(on: bool) {
     DECODE_ON.store(on, Ordering::Relaxed);
 }
 
-/// Whether [`rows_replay`] stages its tokens' inputs through shared memory on a GPU [`set_gpu`]
+/// Whether [`rows_replay`] stages its tokens' inputs through shared memory on a GPU [`gpu_for`]
 /// chose (the same bits as the per-lane kernel).
 static REPLAY_STAGED: AtomicBool = AtomicBool::new(false);
 
@@ -98,6 +98,24 @@ static REPLAY_STAGED: AtomicBool = AtomicBool::new(false);
 /// `legion serve --gdn-replay-smem` turns it on (compute capability 9.0+ only).
 pub fn set_gdn_replay_staged(on: bool) {
     REPLAY_STAGED.store(on, Ordering::Relaxed);
+}
+
+/// Whether [`rows_replay`] runs the few-sequence kernel (`gdn_replay_few_kernel`, #689) for
+/// steps of one sequence and 8 tokens on a GPU [`gpu_for`] chose.
+static REPLAY_FEW: AtomicBool = AtomicBool::new(true);
+
+/// The step shape a [`rows_replay`] launch runs the few-sequence kernel for: (sequences,
+/// tokens). It issues every load a CTA can at once, which wins where a step is a chain of round
+/// trips. On a GB10 (`legion gdn-bench --replay --replay-seqs N`, N 1, 2 and 4, Qwen3.8-27B's heads) it was
+/// 4-11% faster than the per-lane kernel at one sequence of 8 tokens (a one-user DFlash verify
+/// step) for every kept count, but not at 4 or 1 tokens, nor at 2 or 4 sequences.
+#[cfg(feature = "cuda")]
+const REPLAY_FEW_SHAPE: (i64, i64) = (1, 8);
+
+/// Sets whether launches from now on run the few-sequence replay kernel (the same bits as the
+/// per-lane kernel). On by default; `legion serve --no-gdn-replay-few` turns it off.
+pub fn set_gdn_replay_few(on: bool) {
+    REPLAY_FEW.store(on, Ordering::Relaxed);
 }
 
 /// Whether [`rows_replay`] skips a verify step's padding tokens where it is given their row map.
@@ -131,11 +149,36 @@ pub(super) fn pad_fits(pad: Tensor<'_>, v: Tensor<'_>) -> bool {
 /// used on compute capability 9.0+ (`cc_major`), where they were measured (GB10, #836); other GPUs
 /// keep ggml's op and the per-lane replay kernel.
 pub fn set_gpu(cc_major: Option<i32>) {
-    DECODE_GPU.store(cc_major.is_some_and(|m| m >= 9), Ordering::Relaxed);
+    DECODE_GPU.store(gpu_takes(cc_major), Ordering::Relaxed);
+}
+
+/// Whether a GPU of compute capability major `cc_major` takes [`decode`] ([`set_gpu`]).
+pub(super) fn gpu_takes(cc_major: Option<i32>) -> bool {
+    cc_major.is_some_and(|m| m >= 9)
+}
+
+/// Whether the GPU of device `dev` (the state's, or a launch's) takes [`decode`] and the staged
+/// replay, asked per device (#1201: a box may hold GPUs of different architectures); the
+/// engine's answer ([`set_gpu`]) where `dev` is unknown.
+fn gpu_for(dev: Option<usize>) -> bool {
+    gpu_for_by(
+        dev,
+        DECODE_GPU.load(Ordering::Relaxed),
+        crate::hw::per_device::cc,
+    )
+}
+
+/// [`gpu_for`] with the engine's answer `engine` and the compute capabilities `cc_of` gives.
+pub(super) fn gpu_for_by(
+    dev: Option<usize>,
+    engine: bool,
+    cc_of: impl FnOnce(usize) -> Option<(i32, i32)>,
+) -> bool {
+    crate::hw::per_device::pick_by(dev, engine, |cc| gpu_takes(cc.map(|c| c.0)), cc_of)
 }
 
 /// Whether [`decode`] takes ggml's `gated_delta_net(q, k, v, g, beta, state, 1)`: as [`fits`],
-/// for one token per sequence, on a GPU [`set_gpu`] chose.
+/// for one token per sequence, the state on a GPU it is chosen for ([`gpu_for`]).
 pub(super) fn decode_fits(
     q: Tensor<'_>,
     k: Tensor<'_>,
@@ -145,13 +188,13 @@ pub(super) fn decode_fits(
     state: Tensor<'_>,
 ) -> bool {
     DECODE_ON.load(Ordering::Relaxed)
-        && DECODE_GPU.load(Ordering::Relaxed)
         && cfg!(feature = "cuda")
         && v.ne()[2] == 1
         && [q, k, v, g, beta, state]
             .iter()
             .all(|t| !t.is_host() && !t.is_meta())
         && shapes_fit(q, k, v, g, beta, state)
+        && gpu_for(state.cuda_device())
 }
 
 /// Whether the op takes ggml's `gated_delta_net(q, k, v, g, beta, state, 1)`: on a GPU only (the
@@ -822,15 +865,26 @@ pub(crate) fn set_replay_variant(v: i32) {
     REPLAY_VARIANT.store(v, Ordering::Relaxed);
 }
 
-/// The variant a [`rows_replay`] launch passes: the forced one, else the kernel's default (-1)
-/// where staging is on and the GPU chosen, else the per-lane kernel (0).
+/// The variant a [`rows_replay`] launch of `n_seqs` sequences of `n_tokens` passes: the forced
+/// one, else on a GPU [`gpu_for`] chose (the current device) the staged kernel (-1) where
+/// staging is on, the few-sequence kernel (2) where it is on and the step has its shape (and
+/// ggml's CTA shape is not forced), else the per-lane kernel
+/// (0).
 #[cfg(feature = "cuda")]
-fn replay_variant() -> i32 {
+fn replay_variant(n_seqs: i64, n_tokens: i64) -> i32 {
     let v = REPLAY_VARIANT.load(Ordering::Relaxed);
     if v >= 0 {
-        v
-    } else if REPLAY_STAGED.load(Ordering::Relaxed) && DECODE_GPU.load(Ordering::Relaxed) {
+        return v;
+    }
+    if !gpu_for(crate::hw::per_device::current()) {
+        0
+    } else if REPLAY_STAGED.load(Ordering::Relaxed) {
         -1
+    } else if REPLAY_FEW.load(Ordering::Relaxed)
+        && GDN_WARPS.load(Ordering::Relaxed) == 0
+        && (n_seqs, n_tokens) == REPLAY_FEW_SHAPE
+    {
+        2
     } else {
         0
     }
@@ -905,7 +959,7 @@ unsafe fn cuda_gdn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), St
             p.rp2 = r.nb[2] as i64 / 4;
             p.rp_t = r.ne[1];
             let params = crate::ggml::external_params(dst);
-            p.replay_variant = replay_variant();
+            p.replay_variant = replay_variant(p.n_seqs, p.n_tokens);
             if mode & MODE_PAD != 0 {
                 let at = params[2] as u32 as u64 | (params[3] as u32 as u64) << 32;
                 p.arrive = at as usize as *mut i32;

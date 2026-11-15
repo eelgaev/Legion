@@ -7,6 +7,12 @@
 // compiles for every target architecture; fp8_mma() in fp8_mm.cu (compute capability 8.9+)
 // decides per device at run time whether they run, and the engine refuses at load a GPU this
 // binary has no code of its architecture for.
+//
+// Ada's E4M3 MMAs (an RTX 4090, #1213) add C and their 32 products in a window of ~14 bits under
+// the largest exponent among them and truncate the rest, so over k the sums drift from F32 ones
+// (relative to the largest output, 1.3e-3 at k 2,688, 4.3e-3 at 5,120); the GB10 sums in F32.
+// Starting every MMA from zero and adding in F32 cuts that to ~8e-5 but cost the big GEMM 6-7%
+// there, under E4M3 activations' own rounding, so the MMAs accumulate in place everywhere.
 
 // More tokens: 64 * WM rows x 128 tokens per CTA, 8 warps as WM x (8 / WM) of 64 rows x
 // 128 / (8 / WM) tokens, mma.sync m16n8k32 E4M3 x E4M3 -> F32 (sm_89+) straight from the raw
@@ -21,13 +27,15 @@ namespace a8 {
 constexpr int BN = 128;
 // A stage layout: STAGES stages of BK bytes of k. SWZ: rows BK bytes apart, each row's 16-byte
 // chunks XOR-swizzled by its row so the 8 rows an ldmatrix phase reads hit distinct banks;
-// else rows padded to BK + 16 bytes.
-template <int WM_, int STAGES_ = 3, int BK_ = 64, bool SWZ_ = false> struct Cfg {
-    static constexpr int WM = WM_, STAGES = STAGES_, BK = BK_;
+// else rows padded to BK + 16 bytes. WARPS: 8 (WM x 8 / WM warps), or 4 (WM 2: 2 x 2 warps of
+// 64 x 64; fp8_gemm8_tma only, two CTAs per SM).
+template <int WM_, int STAGES_ = 3, int BK_ = 64, bool SWZ_ = false, int WARPS_ = 8> struct Cfg {
+    static constexpr int WM = WM_, STAGES = STAGES_, BK = BK_, WARPS = WARPS_, WN = WARPS / WM;
     static constexpr bool SWZ = SWZ_;
     static constexpr int TM = 64 * WM, CH = BK / 16, LD = SWZ ? BK : BK + 16;
     static constexpr size_t TSTAGE = (size_t) (TM + BN) * LD, SMEM = STAGES * TSTAGE;
     static_assert(WM == 2 || WM == 4, "warp rows");
+    static_assert(WARPS == 8 || (WARPS == 4 && WM == 2), "warps");
     static_assert(BK % 32 == 0 && (!SWZ || BK == 64 || BK == 128), "stage layout");
     // Byte offset of 16-byte chunk `chunk` of row `row` in a stage's weights or activations.
     static __device__ __forceinline__ int off(int row, int chunk) {
@@ -37,6 +45,9 @@ template <int WM_, int STAGES_ = 3, int BK_ = 64, bool SWZ_ = false> struct Cfg 
 // WM 4 with a residual: steps before the last that its L2 prefetch is issued (12 or 24 steps
 // of 64 bytes measured no faster on the GB10).
 constexpr int64_t RES_PF_STEPS = 4;
+// 4 warps with a residual: the tokens' prefetches spread evenly over the last RES_PF_SPREAD
+// steps instead (#1133 r11, GB10: 32 steps of 64 bytes measured best of 16-48 there).
+constexpr int64_t RES_PF_SPREAD = 32;
 }  // namespace a8
 
 // The MMAs of one K step of BK bytes from a stage's weights `ws` and activations `xs` into the
@@ -78,16 +89,23 @@ __device__ __forceinline__ void gemm8_stage(const unsigned char * ws, const unsi
 }
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-// WM 4 with a residual: the tile's residual (a token's TM rows are one 16-byte aligned run when
-// m0 + TM <= m) into L2 a few steps before the epilogue, which then loads it a row group at a
-// time from L2 instead of memory.
+// WM 4 or 4 warps with a residual: the tile's residual (a token's TM rows are one 16-byte
+// aligned run when m0 + TM <= m) into L2 a few steps before the epilogue, which then loads it a
+// row group at a time from L2 instead of memory. 4 warps: token t's at its share of the last
+// RES_PF_SPREAD steps, so the requests do not all reach memory at once.
 template <bool RES, class C>
 __device__ __forceinline__ void gemm8_res_prefetch(const legion_fp8_mm8 & p, int64_t step, int64_t steps,
                                                    int64_t m0, int64_t n0) {
-    if constexpr (RES && C::WM != 2) {
-        constexpr int64_t PF = a8::RES_PF_STEPS;
-        if (step == (steps > PF ? steps - PF : 0) && threadIdx.x < a8::BN && n0 + threadIdx.x < p.n &&
-            m0 + C::TM <= p.m) {
+    if constexpr (RES && (C::WM != 2 || C::WARPS == 4)) {
+        int64_t at;
+        if constexpr (C::WARPS == 4) {
+            const int64_t span = a8::RES_PF_SPREAD < steps ? a8::RES_PF_SPREAD : steps;
+            at = steps - span + (int64_t) threadIdx.x * span / a8::BN;
+        } else {
+            constexpr int64_t PF = a8::RES_PF_STEPS;
+            at = steps > PF ? steps - PF : 0;
+        }
+        if (step == at && threadIdx.x < a8::BN && n0 + threadIdx.x < p.n && m0 + C::TM <= p.m) {
             const float * a = p.res + (n0 + threadIdx.x) * p.m + m0;
             if (((uintptr_t) a & 15) == 0) {
                 asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(a), "r"((uint32_t) (C::TM * 4)));
@@ -101,12 +119,12 @@ __device__ __forceinline__ void gemm8_res_prefetch(const legion_fp8_mm8 & p, int
 template <bool RES, class C, int NJ>
 __device__ __forceinline__ void gemm8_epilogue(const legion_fp8_mm8 & p, int64_t m0, int64_t n0, int wm, int wn,
                                                int lane, const float (&acc)[4][NJ][4]) {
-    constexpr int WM = C::WM, WN = 8 / WM;
-    static_assert(NJ == a8::BN / 8 / WN, "n8 tiles per warp");
+    static_assert(NJ == a8::BN / 8 / C::WN, "n8 tiles per warp");
+    constexpr bool WHOLE = NJ <= 4;  // WM 2 with 8 warps: 64 accumulators per thread
     const float s = a8_static(p);
     // RES: the residual loaded before the first store (dst may alias it as far as the compiler
-    // knows: loads between the stores would each wait out the memory latency). WM 2: the whole
-    // tile's at once; WM 4: a row group's (16 rows) before its stores, which keeps the 128
+    // knows: loads between the stores would each wait out the memory latency). WHOLE: the whole
+    // tile's at once; else a row group's (16 rows) before its stores, which keeps the 128
     // accumulators plus 32 residuals in registers.
     float rv[4][NJ][4];
     auto load_res = [&](int i) {
@@ -121,7 +139,7 @@ __device__ __forceinline__ void gemm8_epilogue(const legion_fp8_mm8 & p, int64_t
             }
         }
     };
-    if constexpr (RES && WM == 2) {
+    if constexpr (RES && WHOLE) {
 #pragma unroll
         for (int i = 0; i < 4; i++) {
             load_res(i);
@@ -129,7 +147,7 @@ __device__ __forceinline__ void gemm8_epilogue(const legion_fp8_mm8 & p, int64_t
     }
 #pragma unroll
     for (int i = 0; i < 4; i++) {
-        if constexpr (RES && WM != 2) {
+        if constexpr (RES && !WHOLE) {
             load_res(i);
         }
         const int64_t r0 = m0 + wm * 64 + i * 16 + lane / 4;
@@ -156,6 +174,7 @@ __global__ void __launch_bounds__(256) fp8_gemm8(const legion_fp8_mm8 p) {
     constexpr int WM = C::WM, BK = C::BK, LD = C::LD, STAGES = C::STAGES, CH = C::CH;
     constexpr int WN = 8 / WM, NJ = BN / 8 / WN, TM = C::TM;  // NJ: n8 tiles per warp
     constexpr size_t TSTAGE = C::TSTAGE;
+    static_assert(C::WARPS == 8, "fp8_gemm8 runs 8 warps");
     extern __shared__ __align__(16) unsigned char smem[];
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int wm = warp / WN, wn = warp % WN;
@@ -221,7 +240,8 @@ __global__ void __launch_bounds__(256) fp8_gemm8(const legion_fp8_mm8 p) {
 #endif
 }
 
-// Few tokens past the GEMV (9..64): memory-bound, so a CTA is W warps of 16 weight rows each
+// Few tokens past the GEMV (9..64, and on Ada mid-size batches the big GEMM's tiles would not
+// fill the SMs with, over 64-token column tiles): memory-bound, so a CTA is W warps of 16 weight rows each
 // over all of its BN tokens, so there are enough CTAs (weight streams) to keep the bus busy; K
 // steps of 128 bytes through four cp.async stages (three where four would not fit in the 99 KiB
 // of shared memory a block gets on sm_86/89/12x), mma.sync m16n8k32 E4M3 as above.
@@ -231,17 +251,28 @@ template <int BN, int W>
 __host__ __device__ constexpr int stages() {
     return (size_t) 4 * (16 * W + BN) * LD <= 96 * 1024 ? 4 : 3;
 }
+// Ada's mid-size batches (fp8_mm.cu, gemm8_ada_skinny): the most stages (4 to 2) that still
+// let two CTAs share an SM's 100 KB of shared memory (48 KiB each), else stages<BN, W>(). The
+// same bits.
 template <int BN, int W>
+__host__ __device__ constexpr int stages_ada() {
+    return (size_t) 4 * (16 * W + BN) * LD <= 48 * 1024   ? 4
+           : (size_t) 3 * (16 * W + BN) * LD <= 48 * 1024 ? 3
+           : (size_t) 2 * (16 * W + BN) * LD <= 48 * 1024 ? 2
+                                                           : stages<BN, W>();
+}
+template <int BN, int W, int STAGES = stages<BN, W>()>
 __host__ __device__ constexpr size_t smem() {
-    return (size_t) stages<BN, W>() * (16 * W + BN) * LD;
+    return (size_t) STAGES * (16 * W + BN) * LD;
 }
 }  // namespace a8s
 
-template <int BN, int W>
+// RES: p.res added to every output, as fp8_gemm8<true> does (only Ada's mid-size batches).
+template <int BN, int W, bool RES = false, int STAGES = a8s::stages<BN, W>()>
 __global__ void __launch_bounds__(32 * W) fp8_gemm8_skinny(const legion_fp8_mm8 p) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
     using namespace a8s;
-    constexpr int BM = 16 * W, T = 32 * W, NT = BN / 8, STAGES = stages<BN, W>();
+    constexpr int BM = 16 * W, T = 32 * W, NT = BN / 8;
     constexpr size_t STAGE = (size_t) (BM + BN) * LD;
     constexpr int WCH = BM * BK / 16 / T, XCH = (BN * BK / 16 + T - 1) / T;
     extern __shared__ __align__(16) unsigned char smem[];
@@ -348,7 +379,8 @@ __global__ void __launch_bounds__(32 * W) fp8_gemm8_skinny(const legion_fp8_mm8 
         for (int e = 0; e < 4; e++) {
             const int64_t row = r0 + (e / 2) * 8, tok = t0 + e % 2;
             if (row < p.m && tok < p.n) {
-                p.dst[tok * p.m + row] = acc[j][e] * a8_scale(p, s, row, tok);
+                const float v = acc[j][e] * a8_scale(p, s, row, tok);
+                p.dst[tok * p.m + row] = RES ? __fadd_rn(v, p.res[tok * p.m + row]) : v;
             }
         }
     }

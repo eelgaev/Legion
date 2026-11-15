@@ -16,11 +16,17 @@ mod tests;
 /// matvecs are checked per node ([`super::expert_mv::capture_safe`]).
 pub(crate) const PURE: &[&str] = &[
     // qwen4 (Qwen3.8-Flash-Next): the hyper-connection mixers, per-layer embeddings, QSA.
+    // The reader of a deferred reduce-scatter's partials too (#1176): its kernel reads their
+    // addresses from the communicator's device slot (`crate::tp_net::seq_par::sum_slot`, fixed
+    // for the communicator's life), which the exchange writes on the stream before it.
     "hc_post_norm",
     "hc_norm",
     "qwen4_hc_mix",
     "hc_up_mix",
     "hc_up_lob",
+    // The prompt steps' down matmul rebuilding xn from BF16 streams (#1183): one kernel, its
+    // tile chosen from the node's token count and the GPU's SM count.
+    "hc_down_bf16",
     // ggml's gated hc_pre (#836) and the V100's F16-writing mix: one kernel on the compute
     // stream, picked by the node's shape, parameters and pointers' alignment.
     "hc_mix16",
@@ -54,6 +60,8 @@ pub(crate) const PURE: &[&str] = &[
     "router_mv",
     "router_mv_logits",
     "router_mv_ids",
+    // A DeltaNet layer's BF16 alpha and beta of 1-8 tokens in one launch (#689).
+    "mvf_bf16",
     "moe_tail",
     "moe_sum_gate",
     "ids_remap",
@@ -106,6 +114,9 @@ pub(crate) const PURE: &[&str] = &[
     // heads' greedy argmax, a kernel picked by the row length (#827).
     "cluster_topk",
     "cluster_argmax",
+    // A split head's candidates (#1176): the split argmax's first kernel alone, its grid from
+    // the node's shape, written to the node's tensor.
+    "argmax_best",
 ];
 
 /// Pure ops captured in small steps only ([`crate::ggml::stage_graph::small_step`]: decode,
@@ -128,6 +139,17 @@ pub(crate) const SMALL: &[&str] = &[
     "nvfp4_a4_swiglu_id",
     "nvfp4_a4_quant",
 ];
+
+/// Dense matmuls captured in small steps only, as [`SMALL`] (#689): `nvfp4_mvq` (5-8 columns
+/// on compute capability 12.x: ggml's quantize_q8_1 and the NVFP4 matvec, two kernels picked
+/// by the column count, the ring by the shapes and the device's attributes, read once) and
+/// `fp8_mm` (the FP8 W8A16 matmuls: one kernel picked by the shapes, the node's parameters and
+/// the device's compute capability; its shared memory opt-in is set once, at the first launch,
+/// which a step runs directly before it is captured). Neither allocates, waits or touches
+/// another stream. Left out, each one cut a verify step's capture: on Qwen3.8-27B NVFP4 with
+/// DFlash on a DGX Spark (GB10) a verify step ran as ~380 captures of 1-7 kernels around
+/// them, a 2-3 µs gap at each cut. Prompt steps keep them between their captures, as before.
+pub(crate) const SMALL_MM: &[&str] = &["nvfp4_mvq", "fp8_mm"];
 
 /// Pure ops captured only while [`set_commit_capture`] is on: a verify commit's conv window
 /// copy (`legion_spec_window_launch`, one kernel picked by the node's shape). Left out, it runs
@@ -157,10 +179,10 @@ pub fn capture_safe(op: &ExternalOp, node: &ffi::ggml_tensor) -> bool {
     }
 }
 
-/// Whether a capture may hold an op `name` of [`PURE`] or [`SMALL`], in a small step (`small`)
-/// or a prompt step.
+/// Whether a capture may hold an op `name` of [`PURE`], [`SMALL`] or [`SMALL_MM`], in a small
+/// step (`small`) or a prompt step.
 fn listed(name: &str, small: bool) -> bool {
-    if SMALL.contains(&name) {
+    if SMALL.contains(&name) || SMALL_MM.contains(&name) {
         small
     } else {
         PURE.contains(&name)

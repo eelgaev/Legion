@@ -832,6 +832,29 @@ unsafe fn cuda_fp8_mm8(
             },
         }
     };
+    // `--hopper-gemm` (untested on hardware): prompt GEMMs on the Hopper wgmma kernels where
+    // the device, the binary and the shape allow; the default GEMM otherwise.
+    if p.n > 64 && crate::model::wgmma_gemm::enabled() {
+        use crate::model::wgmma_gemm::{Args, Kind, run};
+        let mut a = Args {
+            dst: p.dst,
+            res: p.res,
+            scale: p.scale,
+            wscale: p.wscale,
+            k: p.k,
+            m: p.m,
+            n: p.n,
+            scale_stride: p.scale_stride,
+            wscale_stride: p.wscale_stride,
+            desc_hi: 0,
+            tiles_m: 0,
+            tiles_n: 0,
+        };
+        // SAFETY: the node's device tensors, as for the default GEMM below.
+        if unsafe { run(Kind::E4m3, p.w, p.x, &mut a, stream) }? {
+            return Ok(());
+        }
+    }
     match unsafe { legion_fp8_mm8_launch(&p, stream) } {
         0 => Ok(()),
         1 if !p.res.is_null() => Err(format!(

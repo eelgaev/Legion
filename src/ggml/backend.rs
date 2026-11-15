@@ -886,8 +886,10 @@ unsafe fn compute_with_external(
                 let launch = op
                     .cuda
                     .ok_or_else(|| GgmlError::External(format!("{}: no CUDA kernel", op.name)))?;
-                launch(&*node, stream)
-                    .map_err(|e| GgmlError::External(format!("{}: {e}", op.name)))?;
+                launch(&*node, stream).map_err(|e| {
+                    let name = str_of((*node).name.as_ptr());
+                    GgmlError::External(format!("{} (node {i} `{name}`): {e}", op.name))
+                })?;
                 start = i + 1;
             }
             fill_before(n, &mut start)?;
@@ -895,6 +897,10 @@ unsafe fn compute_with_external(
         }
     };
     let done = run();
+    if let Err(e) = &done {
+        // The sync below aborts on a sticky CUDA error (an illegal address): name the op first.
+        tracing::error!("graph compute failed: {e}");
+    }
     if sync || done.is_err() {
         // SAFETY: the caller's.
         unsafe { ffi::ggml_backend_synchronize(raw) };

@@ -34,6 +34,22 @@ static HC_NORM: ExternalOp = ExternalOp {
 /// tail's.
 const P_RS: usize = 9;
 
+/// An unfolded [`hc_post_norm_rebuilt_xnb`] node's parameter set when it does not write the new
+/// streams (lazy streams, [`set_no_res`], #1183); a folded node's 8 is its tail's `k`.
+const P_NO_RES: usize = 8;
+
+/// The source slot of a folded node's previous block output (lazy streams, [`set_lazy_fold`],
+/// #1183).
+const PRE_OUT_SRC: usize = 9;
+
+/// The parameter holding [`PostNormKind::padded`]; [`COMPACT`] there is
+/// [`PostNormLayout::compact`].
+const P_PADDED: usize = 6;
+
+/// [`P_PADDED`]'s value for a node laid out without its unwritten parts ([`compact_plan`],
+/// lazy streams, #1183).
+const COMPACT: i32 = 2;
+
 /// Most streams and inject outputs [`hc_norm`]'s CUDA kernel takes.
 pub(super) const HC_NORM_MAX: i64 = 8;
 
@@ -256,6 +272,11 @@ pub(super) fn hc_post_norm_rebuilt16<'a>(
 /// for a reader that rebuilds `xn` itself ([`super::hc_mix16::mix_rebuilt_f32`]): each stream's
 /// norm scale instead of the F32 `xn`, as [`hc_post_norm_rebuilt16`] (#836). On CUDA, needs
 /// [`rebuild16_fits`]'s shape (the register kernel's).
+///
+/// `bf16` ([`set_hc_bf16`], opt-in, #1183): the new streams are rounded to BF16 and written as
+/// BF16 (half the bytes) where the F32 ones would start, and the rounded values are the ones
+/// normed, rounded into `xnb` and injected; `res` may then be BF16 too (the previous norm's
+/// streams). The node keeps its size and every other part its place. Moves output.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn hc_post_norm_rebuilt_xnb<'a>(
     ctx: &'a Context,
@@ -266,11 +287,67 @@ pub(super) fn hc_post_norm_rebuilt_xnb<'a>(
     w: Tensor<'a>,
     eps: f32,
     down: Tensor<'a>,
+    bf16: bool,
+) -> PostNormRebuiltXnb<'a> {
+    rebuilt_xnb_node(ctx, res, out, inj, gamma, w, eps, down, bf16, true)
+}
+
+/// [`hc_post_norm_rebuilt_xnb`] with BF16 streams (`bf16` on) that does not write the BF16
+/// `xn`, for a down matmul that rebuilds it from the streams, their scales and gamma
+/// ([`super::hc_down::mul_mat`], #1183): the node keeps its size and every part its place (the
+/// BF16 `xn`'s place stays unwritten), so ggml's allocator plans the graph as with `xn`
+/// written. The same streams, scales and inject weights.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn hc_post_norm_b16_streams<'a>(
+    ctx: &'a Context,
+    res: Tensor<'a>,
+    out: Tensor<'a>,
+    inj: Tensor<'a>,
+    gamma: Tensor<'a>,
+    w: Tensor<'a>,
+    eps: f32,
+    down: Tensor<'a>,
+) -> PostNormStreams<'a> {
+    let p = rebuilt_xnb_node(ctx, res, out, inj, gamma, w, eps, down, true, false);
+    PostNormStreams {
+        res: p.res,
+        scales: p.scales,
+        inject: p.inject,
+    }
+}
+
+/// [`PARAM_STREAMS16`] of a node with BF16 streams that does not write the BF16 `xn`
+/// ([`hc_post_norm_b16_streams`]); 1 is BF16 streams with it written.
+const STREAMS16_NO_XNB: i32 = 2;
+
+/// The parameter holding [`PostNormKind::streams16`] (and [`STREAMS16_NO_XNB`]).
+const PARAM_STREAMS16: usize = 5;
+
+/// [`hc_post_norm_rebuilt_xnb`]'s node; `xnb` false: the BF16 `xn` not written (BF16 streams
+/// only).
+#[allow(clippy::too_many_arguments)]
+fn rebuilt_xnb_node<'a>(
+    ctx: &'a Context,
+    res: Tensor<'a>,
+    out: Tensor<'a>,
+    inj: Tensor<'a>,
+    gamma: Tensor<'a>,
+    w: Tensor<'a>,
+    eps: f32,
+    down: Tensor<'a>,
+    bf16: bool,
+    xnb: bool,
 ) -> PostNormRebuiltXnb<'a> {
     let [e, hc, n, _] = res.ne();
     let [k, n_inj, _, _] = w.ne();
+    assert!(
+        xnb || bf16,
+        "hc_post_norm: xn unwritten with BF16 streams only"
+    );
     assert_eq!(down.ty(), types::BF16, "hc_post_norm: BF16 down");
     assert!(rebuild_fits(k, hc, n), "hc_post_norm: {n} tokens");
+    // (The BF16 streams' kernel adds no reduce-scatter's partials: no deferred `out` then.)
+    let defer = !bf16 && crate::tp_net::seq_par::deferrable(out);
     let (node, at) = post_norm_node(
         ctx,
         res,
@@ -284,22 +361,35 @@ pub(super) fn hc_post_norm_rebuilt_xnb<'a>(
             quant: false,
             rebuild: true,
             moe: false,
-            streams16: false,
+            streams16: bf16,
             // xn's whole place kept: every part of the node where hc_post_norm has it (#836).
             padded: true,
         },
     );
+    if !xnb {
+        // SAFETY: the node just made, an external op node.
+        unsafe { crate::ggml::set_external_param(node.raw(), PARAM_STREAMS16, STREAMS16_NO_XNB) };
+    }
     // `out` the reduce-scatter of a `--tp-seq-par` step with BF16 partials (#1176): the norm
     // adds the two ranks' partials itself, as the exchange's sum kernel adds them, so the sum
     // is not written and read back.
-    if crate::tp_net::seq_par::deferrable(out) {
+    if defer {
         crate::tp_net::seq_par::defer_sum(out);
         // SAFETY: the node just made, an external op node.
         unsafe { crate::ggml::set_external_param(node.raw(), P_RS, 1) };
     }
     let xnb = ctx.view_1d(node, (k * n) / 2, at.xn16 * 4);
+    let res_new = if bf16 {
+        ctx.reinterpret(
+            ctx.view_1d(node, (k * n) / 2, 0),
+            types::BF16,
+            [e, hc, n, 1],
+        )
+    } else {
+        ctx.view_3d(node, [e, hc, n], [e as usize * 4, k as usize * 4], 0)
+    };
     PostNormRebuiltXnb {
-        res: ctx.view_3d(node, [e, hc, n], [e as usize * 4, k as usize * 4], 0),
+        res: res_new,
         scales: ctx.view_2d(node, [hc, n], hc as usize * 4, at.xn * 4),
         xnb: ctx.reinterpret(xnb, types::BF16, [k, n, 1, 1]),
         inject: ctx.view_2d(node, [n_inj, n], n_inj as usize * 4, at.inject * 4),
@@ -308,12 +398,22 @@ pub(super) fn hc_post_norm_rebuilt_xnb<'a>(
 
 /// [`hc_post_norm_rebuilt_xnb`]'s outputs.
 pub(super) struct PostNormRebuiltXnb<'a> {
-    /// The new streams, F32 `[e, hc, n]`.
+    /// The new streams, F32 `[e, hc, n]` (BF16 with `bf16`).
     pub res: Tensor<'a>,
     /// Each stream's norm scale, F32 `[hc, n]`.
     pub scales: Tensor<'a>,
     /// `xn` rounded to BF16 (`[e · hc, n]`).
     pub xnb: Tensor<'a>,
+    /// The per-stream weights, F32 `[n_inj, n]`.
+    pub inject: Tensor<'a>,
+}
+
+/// [`hc_post_norm_b16_streams`]'s outputs.
+pub(super) struct PostNormStreams<'a> {
+    /// The new streams, BF16 `[e, hc, n]`.
+    pub res: Tensor<'a>,
+    /// Each stream's norm scale, F32 `[hc, n]`.
+    pub scales: Tensor<'a>,
     /// The per-stream weights, F32 `[n_inj, n]`.
     pub inject: Tensor<'a>,
 }
@@ -468,7 +568,7 @@ fn post_norm_node<'a>(
         down16_values(down.map(|d| d.ty()), (k * m) as usize),
         down.is_some(),
         quant,
-        rebuild.then_some((if padded { k as usize } else { hc as usize }, streams16)),
+        rebuild.then_some(scales_place(k as usize, hc as usize, padded, streams16)),
     );
     if moe {
         moe_ffn::defer_sum(out);
@@ -552,6 +652,34 @@ impl PostNormLayout {
             },
         }
     }
+
+    /// The compact layout of a rebuilt BF16-`xn` node ([`hc_post_norm_rebuilt_xnb`], F32
+    /// streams; lazy streams, #1183): `[res_new | xnb | scales | inject]` with no unwritten
+    /// part, `res_new` empty unless `streams` (a [`set_no_res`] node writes none). `xnb` (read
+    /// by a GEMM) starts where the node does or right after the streams, 128 bytes aligned at
+    /// qwen4exp's width as in the padded layout; the scales take `hc` floats a token.
+    fn compact(k: usize, n: usize, hc: usize, n_inj: usize, streams: bool) -> Self {
+        let xn16 = if streams { k * n } else { 0 };
+        let xn = xn16 + (k * n).div_ceil(8) * 4;
+        let inject = xn + hc * n;
+        let end = inject + n_inj * n;
+        PostNormLayout {
+            xn,
+            xn16,
+            down16: xn,
+            inject,
+            xq: (end * 4).next_multiple_of(256),
+            floats: end,
+        }
+    }
+}
+
+/// [`PostNormLayout::new`]'s `scales` for a rebuilt node of `k` values in `hc` streams a token:
+/// the padded form ([`PostNormKind::padded`]) keeps all of `xn`'s place and, with BF16 streams
+/// (#1183), the F32 streams' place too (the BF16 ones take its first half), so every other part
+/// sits where it does with F32 streams; the unpadded form packs both (#826).
+fn scales_place(k: usize, hc: usize, padded: bool, streams16: bool) -> (usize, bool) {
+    if padded { (k, false) } else { (hc, streams16) }
 }
 
 /// How many values of the down weight `down` (of type `ty`, `values` in all) [`hc_post_norm`]'s
@@ -601,15 +729,7 @@ unsafe fn cpu_hc_post_norm(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
         let rebuild = params[3] != 0;
         // BF16 streams (#826): each new value rounded to BF16 before it is used.
         let streams16 = params[5] != 0;
-        let at = PostNormLayout::new(
-            k,
-            n,
-            n_inj,
-            down16_values(down.map(|d| d.type_), k * m),
-            down.is_some(),
-            quant,
-            rebuild.then_some((if params[6] != 0 { k } else { hc }, streams16)),
-        );
+        let at = node_layout(dst);
         let rn = dst.data as *mut f32;
         let rn16 = dst.data as *mut u16;
         let res16 = res.type_ == types::BF16;
@@ -617,9 +737,10 @@ unsafe fn cpu_hc_post_norm(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
         // `xn`, or (`rebuild`) the streams' scales.
         let xn = rn.add(at.xn);
         let mut row = vec![0f32; k];
-        // A BF16 down weight: `xn` as BF16 (#469); a Q8_0 one: `xn` and the weight as F16.
+        // A BF16 down weight: `xn` as BF16 (#469), unless the down matmul rebuilds it
+        // (`hc_post_norm_b16_streams`); a Q8_0 one: `xn` and the weight as F16.
         let xnb = down
-            .filter(|d| d.type_ == types::BF16)
+            .filter(|d| d.type_ == types::BF16 && params[PARAM_STREAMS16] != STREAMS16_NO_XNB)
             .map(|_| rn.add(at.xn16) as *mut u16);
         let down = down.filter(|d| d.type_ == types::Q8_0);
         let xn16 = down.map(|_| rn.add(at.xn16) as *mut u16);
@@ -643,6 +764,16 @@ unsafe fn cpu_hc_post_norm(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
         // A folded MoE tail (#836): the token's block output made here.
         let folded = params[7] != 0;
         let mut fold_row = vec![0f32; if folded { e } else { 0 }];
+        // Lazy streams (#1183): the new streams not written (`set_no_res`), or `res` holding
+        // the streams before the previous block's combine, made here first as its norm made
+        // them (`set_lazy_fold`).
+        let no_res = !folded && params[P_NO_RES] != 0;
+        let pre = if folded && !dst.src[PRE_OUT_SRC].is_null() {
+            let (inj_a, ld) = lazy_inject(res).expect("hc_post_norm: lazy streams of a norm's");
+            Some((&*dst.src[PRE_OUT_SRC], inj_a, ld))
+        } else {
+            None
+        };
         for t in (ith..n).step_by(nth) {
             let rr = (res.data as *const u8).add(t * res.nb[2]);
             let res_at = |i: usize| {
@@ -659,18 +790,32 @@ unsafe fn cpu_hc_post_norm(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
                 (out.data as *const u8).add(t * out.nb[1]) as *const f32
             };
             let irow = (inj.data as *const u8).add(t * inj.nb[1]) as *const f32;
+            let pre_row = pre.map(|(o, inj_a, ld)| {
+                let orow = (o.data as *const u8).add(t * o.nb[1]) as *const f32;
+                let w: Vec<f32> = (0..hc)
+                    .map(|h| {
+                        let v = *inj_a.add(t * ld + h) * (1.0 / hc as f32);
+                        1.0 / (1.0 + (-v).exp()) * 2.0
+                    })
+                    .collect();
+                (orow, w)
+            });
             let mut acc = vec![0f32; n_inj];
             for h in 0..hc {
                 let v = *irow.add(h) * (1.0 / hc as f32);
                 let wh = 1.0 / (1.0 + (-v).exp()) * 2.0;
                 let mut ss = 0f32;
                 for i in 0..e {
-                    let mut x = *orow.add(i) * wh + res_at(h * e + i);
+                    let r = match &pre_row {
+                        Some((oa, wa)) => *oa.add(i) * wa[h] + res_at(h * e + i),
+                        None => res_at(h * e + i),
+                    };
+                    let mut x = *orow.add(i) * wh + r;
                     if streams16 {
                         let b = crate::model::nvfp4_mm::bf16_bits(x);
                         *rn16.add(t * k + h * e + i) = b;
                         x = f32::from_bits(u32::from(b) << 16);
-                    } else {
+                    } else if !no_res {
                         *rn.add(t * k + h * e + i) = x;
                     }
                     srow[h * e + i] = x;
@@ -741,9 +886,18 @@ struct HcPostNorm {
     xq: *mut i8,
     /// Null, or where `xn` rounded to BF16 goes (a BF16 down weight, #469).
     xnb: *mut u16,
-    /// Null, or (`legion_hc_post_norm_rs_launch`, #1176) rank 0's and rank 1's BF16 partials
-    /// whose sum is `out`, laid out as `out` (`out_ld`).
-    rs: [*const u16; 2],
+    /// Null, or (`legion_hc_post_norm_rs_launch`, #1176) device memory holding the addresses of
+    /// rank 0's and rank 1's BF16 partials whose sum is `out`, laid out as `out` (`out_ld`),
+    /// which the exchange writes there on the stream ([`crate::tp_net::seq_par::sum_slot`]).
+    rs: *const u64,
+    /// Null, or (lazy streams, [`set_lazy_fold`], #1183) the previous block's output and its
+    /// inject weights, combined into `res` first, rows `pre_out_ld` / `pre_inj_ld` floats apart.
+    pre_out: *const f32,
+    pre_out_ld: i64,
+    pre_inj: *const f32,
+    pre_inj_ld: i64,
+    /// Nonzero: the new streams are not written ([`set_no_res`], #1183).
+    no_res: i32,
 }
 
 /// `legion_moe_fold` (src/cuda/fused.cu): a folded MoE tail's inputs ([`fold_moe`]).
@@ -757,6 +911,8 @@ struct MoeFold {
     g_ld: i64,
     k: i32,
     fma: i32,
+    /// Null, or the experts' rows as BF16 (`x` null; `--nvfp4-expert-rows-bf16`, #1183).
+    x16: *const u16,
 }
 
 #[cfg(feature = "cuda")]
@@ -769,6 +925,12 @@ unsafe extern "C" {
     fn legion_hc_post_norm_launch(p: *const HcPostNorm, stream: *mut c_void) -> i32;
     fn legion_hc_post_norm_rs_launch(p: *const HcPostNorm, stream: *mut c_void) -> i32;
     fn legion_hc_post_norm_s16_launch(p: *const HcPostNorm, in16: i32, stream: *mut c_void) -> i32;
+    fn legion_hc_post_norm_b16_launch(
+        p: *const HcPostNorm,
+        f: *const MoeFold,
+        in16: i32,
+        stream: *mut c_void,
+    ) -> i32;
     fn legion_hc_post_norm_moe_launch(
         p: *const HcPostNorm,
         s: *const moe_ffn::PairSum,
@@ -838,7 +1000,8 @@ fn fold_code(f: FoldSum) -> i32 {
 }
 
 /// Whether `node` is an unfolded [`hc_post_norm_rebuilt_xnb`] node a MoE tail may be folded
-/// into ([`fold_moe`]): F32 streams, a BF16 down weight, and on CUDA (`cuda`) qwen4exp's 4 x
+/// into ([`fold_moe`]): F32 streams (or BF16 ones into BF16, [`set_hc_bf16`]), a BF16 down
+/// weight, and on CUDA (`cuda`) qwen4exp's 4 x
 /// 2560 streams with 4 inject outputs (the fold kernel's shape).
 ///
 /// # Safety
@@ -851,8 +1014,12 @@ pub(crate) unsafe fn fold_target(node: *const ffi::ggml_tensor, cuda: bool) -> b
         }
         let n = &*node;
         let p = crate::ggml::external_params(n);
-        // eps, down, quant, rebuild, moe, streams16, padded, fold
-        if p[1..8] != [1, 0, 1, 0, 0, 1, 0]
+        // eps, down, quant, rebuild, moe, streams16, padded, fold; BF16 streams (`--hc-bf16`,
+        // #1183, with or without the BF16 xn written) or not
+        if p[1..5] != [1, 0, 1, 0]
+            || !(0..=STREAMS16_NO_XNB).contains(&p[PARAM_STREAMS16])
+            || p[6..8] != [1, 0]
+            || p[P_NO_RES] != 0
             || p[P_RS] != 0
             || n.src[5].is_null()
             || n.src[6..].iter().any(|s| !s.is_null())
@@ -860,7 +1027,7 @@ pub(crate) unsafe fn fold_target(node: *const ffi::ggml_tensor, cuda: bool) -> b
             return false;
         }
         let (res, w, down) = (&*n.src[0], &*n.src[4], &*n.src[5]);
-        res.type_ == types::F32
+        (res.type_ == types::F32 || (p[PARAM_STREAMS16] != 0 && res.type_ == types::BF16))
             && down.type_ == types::BF16
             && (!cuda || (res.ne[0] == 2560 && res.ne[1] == 4 && w.ne[1] == 4))
     }
@@ -910,12 +1077,22 @@ unsafe fn cpu_fold_row(dst: &ffi::ggml_tensor, t: usize, out: &mut [f32]) {
         let w = (*dst.src[8]).data as *const f32;
         let fma = params[7] == 2;
         let (e, k) = (out.len(), params[8] as usize);
+        // BF16 rows (`--nvfp4-expert-rows-bf16`, #1183): read as F32, exactly.
+        let x16 = x.type_ == types::BF16;
         let xp = x.data as *const f32;
+        let xh = x.data as *const u16;
         let gv = *((g.data as *const u8).add(t * g.nb[1]) as *const f32);
         let s = 1.0 / (1.0 + (-gv).exp());
         let shp = (sh.data as *const f32).add(t * e);
         for (col, o) in out.iter_mut().enumerate() {
-            let v = |j: usize| *xp.add((t * k + j) * e + col);
+            let v = |j: usize| {
+                let i = (t * k + j) * e + col;
+                if x16 {
+                    f32::from_bits((*xh.add(i) as u32) << 16)
+                } else {
+                    *xp.add(i)
+                }
+            };
             let mut sum = v(0) * *w.add(t * k);
             for j in 1..k {
                 sum = if fma {
@@ -926,6 +1103,253 @@ unsafe fn cpu_fold_row(dst: &ffi::ggml_tensor, t: usize, out: &mut [f32]) {
             }
             *o = sum + *shp.add(col) * s;
         }
+    }
+}
+
+/// Lazy streams (#1183; on by default, `legion serve --no-hc-lazy-streams` turns them off).
+static LAZY_STREAMS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Sets whether the MoE fold's relayout ([`fold_moe`]) also makes the FFN mixer's new streams
+/// lazily (`crate::model::core::node_fuse::fold`, #1183): that mixer's combine-and-norm does
+/// not write them, and its up-mix and the next combine-and-norm make them from the streams
+/// before it and the attention block's output, as it would have (the same bits, fewer bytes).
+pub fn set_hc_lazy_streams(on: bool) {
+    LAZY_STREAMS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`set_hc_lazy_streams`] is on.
+pub(crate) fn lazy_streams() -> bool {
+    LAZY_STREAMS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Where the parts of the [`HC_POST_NORM`] node `dst` sit.
+///
+/// # Safety
+/// `dst` is such a node, its sources valid tensors.
+unsafe fn node_layout(dst: &ffi::ggml_tensor) -> PostNormLayout {
+    // SAFETY: the caller's.
+    unsafe {
+        let (res, w) = (&*dst.src[0], &*dst.src[4]);
+        let (e, hc, n) = (res.ne[0] as usize, res.ne[1] as usize, res.ne[2] as usize);
+        let params = crate::ggml::external_params(dst);
+        let k = e * hc;
+        if params[P_PADDED] == COMPACT {
+            // A node that writes no streams (`set_no_res`) holds none.
+            let no_res = params[7] == 0 && params[P_NO_RES] != 0;
+            return PostNormLayout::compact(k, n, hc, w.ne[1] as usize, !no_res);
+        }
+        let down = (params[1] != 0).then(|| &*dst.src[5]);
+        let m = down.map_or(0, |d| d.ne[1] as usize);
+        PostNormLayout::new(
+            k,
+            n,
+            w.ne[1] as usize,
+            down16_values(down.map(|d| d.type_), k * m),
+            down.is_some(),
+            params[2] != 0,
+            (params[3] != 0).then_some(scales_place(k, hc, params[P_PADDED] != 0, params[5] != 0)),
+        )
+    }
+}
+
+/// For the streams `res` of a lazy-streams fold ([`set_lazy_fold`]), a view of an
+/// [`HC_POST_NORM`] node: that node's inject weights (`[n_inj, n]` contiguous) and `n_inj`.
+///
+/// # Safety
+/// `res` is a valid tensor of an allocated graph.
+unsafe fn lazy_inject(res: &ffi::ggml_tensor) -> Option<(*const f32, usize)> {
+    // SAFETY: the caller's; view sources are valid tensors.
+    unsafe {
+        let norm = res.view_src;
+        if norm.is_null()
+            || !crate::ggml::op_of(norm).is_some_and(|op| std::ptr::eq(op, &HC_POST_NORM))
+            || (*norm).data.is_null()
+        {
+            return None;
+        }
+        let at = node_layout(&*norm);
+        let n_inj = (*(*norm).src[4]).ne[1] as usize;
+        Some((((*norm).data as *const f32).add(at.inject), n_inj))
+    }
+}
+
+/// The lazy-streams parts of an FFN mixer's norm `nf` (an unfolded F32-stream
+/// [`hc_post_norm_rebuilt_xnb`] node; on CUDA, `cuda`, of the fold kernel's shape) whose
+/// streams `res` are those of another such norm's node (written by it) and whose inject
+/// weights `inj` are that node's: `(res, out, inj)`, its sources, for [`set_no_res`],
+/// [`super::hc_up_mix::set_lazy_streams`] and [`set_lazy_fold`] (#1183). `None` for any other
+/// node.
+///
+/// # Safety
+/// `nf` is a valid tensor of an allocated graph.
+pub(crate) unsafe fn lazy_parts(
+    nf: *const ffi::ggml_tensor,
+    cuda: bool,
+) -> Option<[*mut ffi::ggml_tensor; 3]> {
+    // SAFETY: the caller's; a norm node's sources are valid tensors.
+    unsafe {
+        // Unfolded, F32 streams, streams written.
+        if !fold_target(nf, cuda) || crate::ggml::external_params(&*nf)[PARAM_STREAMS16] != 0 {
+            return None;
+        }
+        let t = &*nf;
+        let (res, out, inj) = (t.src[0], t.src[1], t.src[2]);
+        let r = &*res;
+        let na = r.view_src;
+        if r.type_ != types::F32
+            || na.is_null()
+            || r.view_offs != 0
+            || r.nb[2] != r.nb[1] * r.ne[1] as usize
+            || !crate::ggml::op_of(na).is_some_and(|op| std::ptr::eq(op, &HC_POST_NORM))
+        {
+            return None;
+        }
+        let pa = crate::ggml::external_params(&*na);
+        // The streams' node writes F32 streams (a folded node always writes them).
+        if pa[PARAM_STREAMS16] != 0 || (pa[7] == 0 && pa[P_NO_RES] != 0) {
+            return None;
+        }
+        let (inj_a, n_inj) = lazy_inject(r)?;
+        let (o, j) = (&*out, &*inj);
+        (o.type_ == types::F32
+            && o.nb[0] == 4
+            && j.view_src == na
+            && j.data as *const f32 == inj_a
+            && j.nb[0] == 4
+            && j.nb[1] == n_inj * 4
+            && j.ne[..2] == [r.ne[1], r.ne[2]])
+        .then_some([res, out, inj])
+    }
+}
+
+/// Makes the norm node `nf` ([`lazy_parts`]) not write its new streams (#1183): every reader
+/// makes them itself.
+///
+/// # Safety
+/// As [`crate::ggml::make_external`]: a valid node of an allocated graph that has not run.
+pub(crate) unsafe fn set_no_res(nf: *mut ffi::ggml_tensor) {
+    // SAFETY: the caller's.
+    unsafe { crate::ggml::set_external_param(nf, P_NO_RES, 1) };
+}
+
+/// How a norm node of the lazy streams ([`lazy_parts`]'s FFN mixer norm after [`set_no_res`],
+/// or the attention mixer norm whose streams it reads) is laid out compactly
+/// ([`PostNormLayout::compact`], [`set_compact`], #1183).
+pub(crate) struct Compact {
+    /// Each written part: its first byte in the node as laid out now, in the compact node, and
+    /// its bytes.
+    pub parts: Vec<(usize, usize, usize)>,
+    /// The compact node's size in floats.
+    pub floats: usize,
+}
+
+/// The [`Compact`] layout of `node`: an unfolded or folded [`hc_post_norm_rebuilt_xnb`] node
+/// (padded, F32 streams, the BF16 `xn` written) that is no graph output. Its padded layout keeps
+/// `xn`'s place, `e · hc` floats a token, of which the scales take `hc` (and a [`set_no_res`]
+/// node does not write the streams' `e · hc` either): ggml's allocator then plans the graph as
+/// it plans main's (#836). The lazy streams' relayout plans the graph again anyway and keeps
+/// both norms' nodes alive longer than main does (`R_a` until the next layer's folded norm),
+/// so they drop those bytes: 80 KB a token for the FFN mixer's norm, 40 KB for the attention
+/// mixer's. `None` for any other node.
+///
+/// # Safety
+/// `node` is a valid tensor, its sources valid tensors.
+pub(crate) unsafe fn compact_plan(node: *const ffi::ggml_tensor) -> Option<Compact> {
+    // SAFETY: the caller's.
+    unsafe {
+        if !crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &HC_POST_NORM)) {
+            return None;
+        }
+        let t = &*node;
+        let p = crate::ggml::external_params(t);
+        // eps, down, quant, rebuild, moe, F32 streams with xnb written, padded
+        if t.flags & ffi::ggml_tensor_flag_GGML_TENSOR_FLAG_OUTPUT as i32 != 0
+            || p[1..7] != [1, 0, 1, 0, 0, 1]
+            || t.src[5].is_null()
+            || (*t.src[5]).type_ != types::BF16
+            || t.type_ != types::F32
+        {
+            return None;
+        }
+        let (res, w) = (&*t.src[0], &*t.src[4]);
+        let (e, hc, n) = (res.ne[0] as usize, res.ne[1] as usize, res.ne[2] as usize);
+        let (k, n_inj) = (e * hc, w.ne[1] as usize);
+        let streams = !(p[7] == 0 && p[P_NO_RES] != 0);
+        let old = node_layout(t);
+        let new = PostNormLayout::compact(k, n, hc, n_inj, streams);
+        // The kernels take the scales' place as a 32-bit offset.
+        if old.floats != t.ne[0] as usize || i32::try_from(new.xn).is_err() {
+            return None;
+        }
+        let mut parts = vec![
+            (old.xn16 * 4, new.xn16 * 4, k * n * 2),
+            (old.xn * 4, new.xn * 4, hc * n * 4),
+            (old.inject * 4, new.inject * 4, n_inj * n * 4),
+        ];
+        if streams {
+            parts.push((0, 0, k * n * 4));
+        }
+        Some(Compact {
+            parts,
+            floats: new.floats,
+        })
+    }
+}
+
+/// Lays `node` out as its [`compact_plan`] says: the node shrinks to `floats`; the caller moves
+/// its views (#1183).
+///
+/// # Safety
+/// As [`crate::ggml::make_external`]: a valid node of an allocated graph that has not run,
+/// planned again after this.
+pub(crate) unsafe fn set_compact(node: *mut ffi::ggml_tensor, floats: usize) {
+    // SAFETY: the caller's.
+    unsafe {
+        crate::ggml::set_external_param(node, P_PADDED, COMPACT);
+        let t = &mut *node;
+        t.ne = [floats as i64, 1, 1, 1];
+        t.nb[1] = t.nb[0] * floats;
+        t.nb[2] = t.nb[1];
+        t.nb[3] = t.nb[2];
+    }
+}
+
+/// Whether `node` is a folded norm ([`fold_moe`]) of F32 streams that may read lazy streams
+/// ([`set_lazy_fold`]).
+///
+/// # Safety
+/// `node` is a valid tensor.
+pub(crate) unsafe fn lazy_fold_target(node: *const ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's; a norm node's sources are valid tensors.
+    unsafe {
+        if !crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &HC_POST_NORM)) {
+            return false;
+        }
+        let p = crate::ggml::external_params(&*node);
+        let t = &*node;
+        p[7] != 0
+            && p[PARAM_STREAMS16] == 0
+            && !t.src[0].is_null()
+            && (*t.src[0]).type_ == types::F32
+            && t.src[PRE_OUT_SRC].is_null()
+    }
+}
+
+/// Makes the folded norm `node` ([`lazy_fold_target`]) read the streams `res` before the
+/// previous block's combine and make them first, `out · w + res` per value with `w` from the
+/// inject weights of `res`'s node ([`lazy_parts`]), as that block's norm would have (#1183).
+///
+/// # Safety
+/// As [`crate::ggml::make_external`]: valid nodes of an allocated graph that has not run.
+pub(crate) unsafe fn set_lazy_fold(
+    node: *mut ffi::ggml_tensor,
+    res: *mut ffi::ggml_tensor,
+    out: *mut ffi::ggml_tensor,
+) {
+    // SAFETY: the caller's.
+    unsafe {
+        (*node).src[0] = res;
+        (*node).src[PRE_OUT_SRC] = out;
     }
 }
 
@@ -948,6 +1372,25 @@ pub(super) fn streams_bf16_fits(res: Tensor<'_>, w: Tensor<'_>) -> bool {
     STREAMS_BF16.load(std::sync::atomic::Ordering::Relaxed)
         && res.ne()[..2] == [2560, 4]
         && w.ne()[1] == 4
+}
+
+/// `legion serve --hc-bf16` ([`set_hc_bf16`]; off by default).
+static HC_BF16: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Sets whether graphs built from now on keep qwen4exp's residual streams in BF16 between the
+/// mixers that take [`hc_post_norm_rebuilt_xnb`] (BF16 mixers, the NVFP4 checkpoints, on
+/// sm_80+ GPUs such as the GB10), in passes whose every sequence is in its prompt (#1183): the
+/// combine-and-norm (or the MoE tail folded into it) writes them as BF16 and the next one and
+/// the up-mix read them so, half the stream bytes. Each new stream value is rounded to BF16,
+/// so output moves (opt-in); decode, verify and mixed passes keep F32 streams, and every other
+/// reader of the streams gets them converted back to F32.
+pub fn set_hc_bf16(on: bool) {
+    HC_BF16.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`set_hc_bf16`] is on.
+pub(super) fn hc_bf16() -> bool {
+    HC_BF16.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Whether [`hc_post_norm`] also writes `xn` as F16 for the mixer's down projection where
@@ -982,27 +1425,85 @@ pub fn set_xn16_gpu(cc: Option<(i32, i32)>) {
     let ggml_default = std::env::var("GGML_CUDA_CUBLAS_COMPUTE_TYPE").map_or(true, |v| {
         matches!(v.to_lowercase().as_str(), "auto" | "f16" | "fp16")
     });
+    XN16_CUBLAS.store(ggml_default, std::sync::atomic::Ordering::Relaxed);
     XN16_GPU.store(
-        cc == Some((7, 0)) && ggml_default,
+        xn16_takes(cc, ggml_default),
         std::sync::atomic::Ordering::Relaxed,
     );
     // A BF16 weight's GEMM computes in BF16 unless the variable asks for F32 or F16.
     let bf16_default = std::env::var("GGML_CUDA_CUBLAS_COMPUTE_TYPE").map_or(true, |v| {
         matches!(v.to_lowercase().as_str(), "auto" | "bf16")
     });
+    XNB_CUBLAS.store(bf16_default, std::sync::atomic::Ordering::Relaxed);
     XNB_GPU.store(
-        cc.is_some_and(|(major, _)| major >= 8) && bf16_default,
+        xnb_takes(cc, bf16_default),
         std::sync::atomic::Ordering::Relaxed,
     );
 }
 
+/// Whether `GGML_CUDA_CUBLAS_COMPUTE_TYPE` leaves the F16 GEMM [`xn16_fits`] replaces as it is
+/// (set with [`set_xn16_gpu`]).
+static XN16_CUBLAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether `GGML_CUDA_CUBLAS_COMPUTE_TYPE` leaves the BF16 GEMM [`xnb_fits`] feeds as it is (set
+/// with [`set_xn16_gpu`]).
+static XNB_CUBLAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a GPU of compute capability `cc` takes [`xn16_fits`] (a V100), the cuBLAS compute
+/// type ggml's (`cublas`).
+fn xn16_takes(cc: Option<(i32, i32)>, cublas: bool) -> bool {
+    cc == Some((7, 0)) && cublas
+}
+
+/// Whether a GPU of compute capability `cc` takes [`xnb_fits`] (sm_80+), the cuBLAS compute type
+/// ggml's (`cublas`).
+fn xnb_takes(cc: Option<(i32, i32)>, cublas: bool) -> bool {
+    cc.is_some_and(|(major, _)| major >= 8) && cublas
+}
+
+/// The answer of `takes` (with the cuBLAS setting `cublas`) for the GPU of device `dev` (the
+/// down weight's), asked per device (#1201: a box may hold GPUs of different architectures);
+/// `engine` (the engine's GPU's, [`set_xn16_gpu`]) where `dev` is unknown.
+fn gpu_for_by(
+    dev: Option<usize>,
+    engine: bool,
+    takes: fn(Option<(i32, i32)>, bool) -> bool,
+    cublas: bool,
+    cc_of: impl FnOnce(usize) -> Option<(i32, i32)>,
+) -> bool {
+    crate::hw::per_device::pick_by(dev, engine, |cc| takes(cc, cublas), cc_of)
+}
+
+/// [`xn16_fits`]'s GPU check for the down weight `down`.
+fn xn16_gpu(down: Tensor<'_>) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    gpu_for_by(
+        down.cuda_device(),
+        XN16_GPU.load(Relaxed),
+        xn16_takes,
+        XN16_CUBLAS.load(Relaxed),
+        crate::hw::per_device::cc,
+    )
+}
+
+/// [`xnb_fits`]'s GPU check for the down weight `down`.
+fn xnb_gpu(down: Tensor<'_>) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    gpu_for_by(
+        down.cuda_device(),
+        XNB_GPU.load(Relaxed),
+        xnb_takes,
+        XNB_CUBLAS.load(Relaxed),
+        crate::hw::per_device::cc,
+    )
+}
+
 /// Whether a prompt step of `n` tokens hands `mul_mat(down, xn)` an F16 `xn` from
-/// [`hc_post_norm`] (with `down` as F16 from it too): switched on, a V100
-/// ([`set_xn16_gpu`]), at least [`XN16_MIN_TOKENS`] tokens and Q8_0 down weights in one
-/// device's memory, so ggml-cuda would run the same GEMM on the same F16 inputs.
+/// [`hc_post_norm`] (with `down` as F16 from it too): switched on, at least [`XN16_MIN_TOKENS`]
+/// tokens and Q8_0 down weights in the memory of one V100 ([`xn16_gpu`]), so ggml-cuda would
+/// run the same GEMM on the same F16 inputs.
 pub(super) fn xn16_fits(down: Tensor<'_>, n: i64) -> bool {
     XN16.load(std::sync::atomic::Ordering::Relaxed)
-        && XN16_GPU.load(std::sync::atomic::Ordering::Relaxed)
         && cfg!(feature = "cuda")
         && n >= XN16_MIN_TOKENS
         && down.ty() == types::Q8_0
@@ -1012,6 +1513,7 @@ pub(super) fn xn16_fits(down: Tensor<'_>, n: i64) -> bool {
         && down.ne()[0] % 2 == 0
         && !down.is_host()
         && !down.is_meta()
+        && xn16_gpu(down)
 }
 
 /// Whether the engine's GPU runs ggml-cuda's BF16 `mul_mat` as a cuBLAS BF16 GEMM that reads a
@@ -1025,13 +1527,12 @@ static XNB_GPU: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 pub(super) const XNB_MIN_TOKENS: i64 = 128;
 
 /// Whether a prompt step of `n` tokens hands `mul_mat(down, xn)` a BF16 `xn` from
-/// [`hc_post_norm`] (#469): switched on ([`set_xn16`]), an sm_80+ GPU ([`XNB_GPU`]), at least
-/// [`XNB_MIN_TOKENS`] tokens and a BF16 down weight (the NVFP4 checkpoints' mixers) in one
-/// device's memory. ggml-cuda would round `xn` to BF16 as the op does (`__float2bfloat16`) and
+/// [`hc_post_norm`] (#469): switched on ([`set_xn16`]), at least [`XNB_MIN_TOKENS`] tokens and a
+/// BF16 down weight (the NVFP4 checkpoints' mixers) in the memory of one sm_80+ GPU
+/// ([`xnb_gpu`]). ggml-cuda would round `xn` to BF16 as the op does (`__float2bfloat16`) and
 /// run the same cuBLAS GEMM on it, so the result has the same bits, minus the conversion pass.
 pub(super) fn xnb_fits(down: Tensor<'_>, n: i64) -> bool {
     XN16.load(std::sync::atomic::Ordering::Relaxed)
-        && XNB_GPU.load(std::sync::atomic::Ordering::Relaxed)
         && cfg!(feature = "cuda")
         && n >= XNB_MIN_TOKENS
         && down.ty() == types::BF16
@@ -1041,6 +1542,7 @@ pub(super) fn xnb_fits(down: Tensor<'_>, n: i64) -> bool {
         && down.ne()[0] % 2 == 0
         && !down.is_host()
         && !down.is_meta()
+        && xnb_gpu(down)
 }
 
 /// Whether the engine's GPU is a V100 (compute capability 7.0; set with [`set_xn16_gpu`]).
@@ -1124,26 +1626,10 @@ unsafe fn cuda_hc_post_norm(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
         let (e, hc, n) = (res.ne[0], res.ne[1], res.ne[2]);
         let params = crate::ggml::external_params(dst);
         let down = (params[1] != 0).then(|| &*dst.src[5]);
-        let m = down.map_or(0, |d| d.ne[1]);
         let quant = params[2] != 0;
         let rebuild = params[3] != 0;
         let streams16 = params[5] != 0;
-        let at = PostNormLayout::new(
-            (e * hc) as usize,
-            n as usize,
-            w.ne[1] as usize,
-            down16_values(down.map(|d| d.type_), (e * hc * m) as usize),
-            down.is_some(),
-            quant,
-            rebuild.then_some((
-                if params[6] != 0 {
-                    (e * hc) as usize
-                } else {
-                    hc as usize
-                },
-                streams16,
-            )),
-        );
+        let at = node_layout(dst);
         // A Q8_0 down weight: xn and the weight as F16; a BF16 one: xn as BF16 (#469).
         let bf16 = down.is_some_and(|d| d.type_ == types::BF16);
         let down = down.filter(|d| d.type_ == types::Q8_0);
@@ -1178,33 +1664,67 @@ unsafe fn cuda_hc_post_norm(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
             } else {
                 std::ptr::null_mut()
             },
-            xnb: if bf16 {
+            // Null where the down matmul rebuilds it (`hc_post_norm_b16_streams`, #1183): the
+            // BF16 streams' kernel then skips it.
+            xnb: if bf16 && params[PARAM_STREAMS16] != STREAMS16_NO_XNB {
                 rn.add(at.xn16) as *mut u16
             } else {
                 std::ptr::null_mut()
             },
-            rs: [std::ptr::null(); 2],
+            rs: std::ptr::null(),
+            pre_out: std::ptr::null(),
+            pre_out_ld: 0,
+            pre_inj: std::ptr::null(),
+            pre_inj_ld: 0,
+            // Lazy streams (#1183): an unfolded node's new streams not written.
+            no_res: i32::from(params[7] == 0 && params[P_NO_RES] != 0),
         };
-        // `out` a deferred reduce-scatter (#1176): the two ranks' BF16 partials added here.
-        let rs = (params[P_RS] != 0)
-            .then(|| crate::tp_net::seq_par::take_deferred(out))
-            .flatten();
-        let code = if let Some((srcs, _)) = rs {
-            p.rs = srcs.map(|a| a as *const u16);
-            legion_hc_post_norm_rs_launch(&p, stream)
-        } else if params[7] != 0 {
-            // A folded MoE tail (#836): `out` (the experts' rows) is not read as a row.
+        if params[7] != 0 && !dst.src[PRE_OUT_SRC].is_null() {
+            // Lazy streams (#1183): `res` the streams before the previous block's combine.
+            let o = &*dst.src[PRE_OUT_SRC];
+            let (inj_a, ld) = lazy_inject(res).ok_or("hc_post_norm: lazy streams of no norm's")?;
+            p.pre_out = o.data as *const f32;
+            p.pre_out_ld = (o.nb[1] / 4) as i64;
+            p.pre_inj = inj_a;
+            p.pre_inj_ld = ld as i64;
+        }
+        // `out` a deferred reduce-scatter (#1176): the two ranks' BF16 partials added here,
+        // their addresses read on the GPU from the slot the exchange wrote them to, so a
+        // stage graph may capture this launch. The exchange frees its buffers later.
+        // A folded MoE tail (#836): `out` (the experts' rows) is not read as a row.
+        let fold = (params[7] != 0).then(|| {
             let (sh, g) = (&*dst.src[6], &*dst.src[7]);
-            let f = MoeFold {
-                x: out.data as *const f32,
+            let x16 = out.type_ == types::BF16;
+            MoeFold {
+                x: if x16 {
+                    std::ptr::null()
+                } else {
+                    out.data as *const f32
+                },
+                x16: if x16 {
+                    out.data as *const u16
+                } else {
+                    std::ptr::null()
+                },
                 w: (*dst.src[8]).data as *const f32,
                 sh: sh.data as *const f32,
                 g: g.data as *const f32,
                 g_ld: (g.nb[1] / 4) as i64,
                 k: params[8],
                 fma: i32::from(params[7] == 2),
-            };
-            legion_hc_post_norm_fold_launch(&p, &f, stream)
+            }
+        });
+        let code = if params[P_RS] != 0 && crate::tp_net::seq_par::deferred(out) {
+            p.rs = crate::tp_net::seq_par::sum_slot(out)? as *const u64;
+            legion_hc_post_norm_rs_launch(&p, stream)
+        } else if streams16 && bf16 {
+            // BF16 streams for BF16 mixers (#1183), with or without a folded tail.
+            let f = fold
+                .as_ref()
+                .map_or(std::ptr::null(), |f| f as *const MoeFold);
+            legion_hc_post_norm_b16_launch(&p, f, i32::from(res16), stream)
+        } else if let Some(f) = &fold {
+            legion_hc_post_norm_fold_launch(&p, f, stream)
         } else if streams16 {
             // BF16 streams (#826).
             legion_hc_post_norm_s16_launch(&p, i32::from(res16), stream)
@@ -1215,16 +1735,8 @@ unsafe fn cuda_hc_post_norm(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
         } else {
             legion_hc_post_norm_launch(&p, stream)
         };
-        match code {
-            0 => {}
-            e => {
-                let e = format!("hc_post_norm: error {e}");
-                if rs.is_some() {
-                    // The exchange's buffers stay held: no later exchange may wait on them.
-                    crate::tp_net::seq_par::fail_deferred(out, &e);
-                }
-                return Err(e);
-            }
+        if code != 0 {
+            return Err(format!("hc_post_norm: error {code}"));
         }
         if let Some(d) = down {
             // The converter ggml-cuda's cuBLAS matmul path dequantizes the weight with.
@@ -1234,11 +1746,7 @@ unsafe fn cuda_hc_post_norm(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
             let values = d.ne[0] * d.ne[1];
             to_f16(d.data, rn.add(at.down16) as *mut u16, values, stream);
         }
-        match rs {
-            // The exchange's buffers free once the partials were read.
-            Some((_, seq)) => crate::tp_net::seq_par::release_deferred(out, seq, stream),
-            None => Ok(()),
-        }
+        Ok(())
     }
 }
 
@@ -1350,6 +1858,8 @@ unsafe fn cuda_hc_norm(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<()
         }
     }
 }
+
+pub mod lazy_bench;
 
 #[cfg(test)]
 mod tests;

@@ -27,6 +27,11 @@
 // rounds them once, as for the large GEMM), F32 accumulation; but K is summed per warp slice
 // and the slices are then added in warp order, so the sums round differently from fp8_gemm's
 // (one running sum over K). Hence opt-in.
+//
+// Launch (#689): on compute capability 12.x a programmatic dependent launch (launch_pdl.cuh), so
+// a CTA issues its first stages' weight copies (no kernel's output) before it waits for the
+// kernel ahead (griddepcontrol.wait) and loads that kernel's activations, and lets the next
+// kernel launch early. The same sums.
 
 namespace sk {
 constexpr int TILE_K = 64;  // K columns per warp per group
@@ -84,7 +89,7 @@ __global__ void __launch_bounds__(32 * KW, MINB) fp8_gemm_sliced(const legion_fp
     const int64_t n0 = (int64_t) blockIdx.y * TOK;
     const int64_t groups = p.k / BK;
 
-    auto load = [&](int stage, int64_t g) {
+    auto load_w = [&](int stage, int64_t g) {
         const int64_t k0 = g * BK;
         unsigned char * cs = codes(stage);
 #pragma unroll
@@ -95,6 +100,9 @@ __global__ void __launch_bounds__(32 * KW, MINB) fp8_gemm_sliced(const legion_fp
             const int64_t row = min(m0 + r, p.m - 1);
             cp_async16(cs + r * BK + (ch ^ (r & 7)) * 16, p.w + row * p.k + k0 + ch * 16, true);
         }
+    };
+    auto load_x = [&](int stage, int64_t g) {
+        const int64_t k0 = g * BK;
         __nv_bfloat16 * xs = acts(stage, warp);
         const int64_t kw = k0 + warp * sk::TILE_K;
 #pragma unroll
@@ -116,10 +124,24 @@ __global__ void __launch_bounds__(32 * KW, MINB) fp8_gemm_sliced(const legion_fp
         }
     }
 
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;" :::);
+#endif
+    // The first stages' weights before the wait, their activations after it; group s holds
+    // stage s's activations (and group 0 all these weights).
 #pragma unroll
     for (int s = 0; s < STAGES; s++) {
         if (s < groups) {
-            load(s, s);
+            load_w(s, s);
+        }
+    }
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+#pragma unroll
+    for (int s = 0; s < STAGES; s++) {
+        if (s < groups) {
+            load_x(s, s);
         }
         asm volatile("cp.async.commit_group;\n" ::);
     }
@@ -174,7 +196,8 @@ __global__ void __launch_bounds__(32 * KW, MINB) fp8_gemm_sliced(const legion_fp
         // Every warp is done with this stage before it is loaded again.
         __syncthreads();
         if (g + STAGES < groups) {
-            load(stage, g + STAGES);
+            load_w(stage, g + STAGES);
+            load_x(stage, g + STAGES);
         }
         asm volatile("cp.async.commit_group;\n" ::);
     }

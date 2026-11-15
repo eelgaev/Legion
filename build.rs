@@ -15,6 +15,18 @@ mod cuda_wrap;
 #[path = "build/stb.rs"]
 mod stb;
 
+/// ggml's x86 instruction-set switches, passed to its CMake build when set in the environment.
+const X86_ISA_OPTIONS: [&str; 8] = [
+    "GGML_SSE42",
+    "GGML_AVX",
+    "GGML_AVX_VNNI",
+    "GGML_AVX2",
+    "GGML_BMI2",
+    "GGML_AVX512",
+    "GGML_FMA",
+    "GGML_F16C",
+];
+
 /// Short git commit of the checkout at `dir`, or `unknown` when there is no git
 /// metadata (tarball builds, no git on PATH, empty repo), so `--version` always
 /// prints an honest build identity.
@@ -85,6 +97,19 @@ fn main() {
         "GGML_NATIVE",
         cmake_env::cmake_bool(&native).unwrap_or_else(|e| panic!("GGML_NATIVE: {e}")),
     );
+    // With GGML_NATIVE=OFF, ggml's x86 build turns AVX2, FMA and BMI2 on by default, which an
+    // AVX-only CPU (Sandy/Ivy Bridge) cannot run. Its instruction-set switches pass through when
+    // set (e.g. GGML_AVX2=OFF GGML_FMA=OFF GGML_BMI2=OFF for such a CPU, plus GGML_F16C=OFF on
+    // Sandy Bridge, which has no F16C).
+    for var in X86_ISA_OPTIONS {
+        if let Some(v) = env::var_os(var).filter(|v| !v.is_empty()) {
+            let v = v.to_string_lossy();
+            cfg.define(
+                var,
+                cmake_env::cmake_bool(&v).unwrap_or_else(|e| panic!("{var}: {e}")),
+            );
+        }
+    }
     // A newer host toolchain (e.g. a gcc-toolset on RHEL) is selected with CC/CXX/CUDAHOSTCXX.
     for (var, define) in [
         ("CC", "CMAKE_C_COMPILER"),
@@ -183,7 +208,10 @@ fn main() {
         "CUDAHOSTCXX",
         "CUDA_PATH",
         "CUDA_HOME",
-    ] {
+    ]
+    .into_iter()
+    .chain(X86_ISA_OPTIONS)
+    {
         println!("cargo:rerun-if-env-changed={var}");
     }
 }
@@ -233,15 +261,11 @@ fn build_cuda_kernels(ggml: &Path) {
             archs = caps.join(";");
         }
     }
-    let mut b = cc::Build::new();
-    b.cuda(true)
-        .cudart("shared")
-        .include(ggml.join("include"))
-        .include(ggml.join("src"))
-        // The slowest translation units first, so the parallel build starts them first (#955:
-        // expert_mv and paged_attn are split by weight type and head size, nvfp4_mm by kernel
-        // and tile width).
-        .file("src/cuda/paged_attn/d512.cu")
+    let mut b = cuda_build(ggml, &archs);
+    // The slowest translation units first, so the parallel build starts them first (#955:
+    // expert_mv and paged_attn are split by weight type and head size, nvfp4_mm by kernel and
+    // tile width).
+    b.file("src/cuda/paged_attn/d512.cu")
         .file("src/cuda/expert_mv/iq2.cu")
         .file("src/cuda/expert_mv/iq3.cu")
         .file("src/cuda/expert_mv/q4_k.cu")
@@ -277,9 +301,11 @@ fn build_cuda_kernels(ggml: &Path) {
         .file("src/cuda/nvfp4_mm/dispatch.cu")
         .file("src/cuda/fused.cu")
         .file("src/cuda/router_mv.cu")
+        .file("src/cuda/mvf_bf16.cu")
         .file("src/cuda/mmq_preq.cu")
         .file("src/cuda/mmq_ids.cu")
         .file("src/cuda/hc_up_mix.cu")
+        .file("src/cuda/hc_down.cu")
         .file("src/cuda/hc_mix16.cu")
         .file("src/cuda/hc_chain.cu")
         .file("src/cuda/gate_q8.cu")
@@ -291,6 +317,7 @@ fn build_cuda_kernels(ggml: &Path) {
         .file("src/cuda/gdn.cu")
         .file("src/cuda/norm_rope.cu")
         .file("src/cuda/sm120/nvfp4_a4.cu")
+        .file("src/cuda/sm120/nvfp4_mvq.cu")
         .file("src/cuda/dequant.cu")
         .file("src/cuda/cpu_share.cu")
         .file("src/cuda/dense_mv.cu")
@@ -300,7 +327,10 @@ fn build_cuda_kernels(ggml: &Path) {
         .file("src/cuda/q8_head.cu")
         .file("src/cuda/q4k_head.cu")
         .file("src/cuda/q_small_m.cu")
+        .file("src/cuda/head_mm.cu")
         .file("src/cuda/q8_mmq.cu")
+        .file("src/cuda/dflash_draft.cu")
+        .file("src/cuda/tu_mmq.cu")
         .file("src/cuda/sm90/cluster_select.cu")
         .file("src/cuda/glm5next.cu")
         .file("src/cuda/deepseek41.cu")
@@ -311,14 +341,38 @@ fn build_cuda_kernels(ggml: &Path) {
         .file("src/cuda/stage_pull.cu")
         .file("src/cuda/input_pack.cu")
         .file("src/cuda/turboquant.cu")
-        .file("src/cuda/tp_net.cu")
+        .file("src/cuda/tp_net.cu");
+    b.compile("legion_cuda");
+    // The Hopper wgmma kernels (#1215), each a library of its own: cc compiles a build of more
+    // than one CUDA file as relocatable device code (--device-c), and there ptxas ignores
+    // setmaxnreg (C7504), so the consumer warpgroups keep the launch bound's 168 registers (the
+    // GEMMs spill, the attention kernel for heads of 256 spills and serializes its wgmma). A
+    // build of one file is compiled whole-program. Neither file shares device symbols.
+    for (file, lib) in [
+        ("src/cuda/sm90/wgmma_gemm.cu", "legion_cuda_wgmma_gemm"),
+        (
+            "src/cuda/sm90/paged_attn_wgmma.cu",
+            "legion_cuda_hopper_attn",
+        ),
+    ] {
+        cuda_build(ggml, &archs).file(file).compile(lib);
+    }
+}
+
+/// A cc build of CUDA files with Legion's nvcc flags, for `archs` (a CMake-style list).
+fn cuda_build(ggml: &Path, archs: &str) -> cc::Build {
+    let mut b = cc::Build::new();
+    b.cuda(true)
+        .cudart("shared")
+        .include(ggml.join("include"))
+        .include(ggml.join("src"))
         // As ggml-cuda is built: CUDA graphs on (it changes ggml_backend_cuda_context).
         .define("GGML_CUDA_USE_GRAPHS", None)
         .flag("-std=c++17")
         .flag("-O3")
         .flag("--use_fast_math")
         .warnings(false);
-    for f in cuda_arch_flags(&archs) {
+    for f in cuda_arch_flags(archs) {
         b.flag(&f);
     }
     if let Some(host) = env::var_os("CUDAHOSTCXX").filter(|v| !v.is_empty()) {
@@ -326,5 +380,5 @@ fn build_cuda_kernels(ggml: &Path) {
         b.ccbin(false);
         b.flag(format!("-ccbin={}", host.to_string_lossy()));
     }
-    b.compile("legion_cuda");
+    b
 }

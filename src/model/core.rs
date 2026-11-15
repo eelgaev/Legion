@@ -38,11 +38,14 @@ pub use gdn::bench as gdn_bench;
 pub use gdn::set_gdn;
 pub use gdn::set_gdn_decode;
 pub use gdn::set_gdn_pad_skip;
+pub use gdn::set_gdn_replay_few;
 pub use gdn::set_gdn_replay_staged;
-pub use gdn_mma::set_gdn_mma;
+pub use gdn_mma::{set_gdn_mma, set_gdn_staged};
 pub use gdn_scan::set_gdn_scan;
 pub(crate) use graph_size::graph_size;
 pub use norm_rope::{set_kv_append, set_norm_rope};
+pub use paged::qm_bench as paged_qm_bench;
+pub use paged::wmma_bench as paged_split_bench;
 pub(crate) mod shape_diff;
 pub(crate) mod shared_q8;
 pub use shared_q8::set_shared_q8;
@@ -63,12 +66,17 @@ pub use mmq_preq::set_mmq_preq;
 pub(crate) mod norm_rope;
 pub mod nvfp4_once;
 pub use nvfp4_once::set_nvfp4_once;
+pub mod head_mm;
+pub use head_mm::set_head_mm;
+pub(crate) mod head_split;
+pub mod nvfp4_mvq;
+pub use nvfp4_mvq::set_nvfp4_mvq;
 pub mod q4k_head;
 pub use q4k_head::set_q4k_head;
 pub mod q8_group;
 pub mod q8_head;
 pub mod q8_mv;
-pub(crate) use linear::{f16_joined, has_precision_hint};
+pub(crate) use linear::{bf16_cast_joined, bf16_join_fits, f16_joined, has_precision_hint};
 pub use q8_group::set_q8_group;
 pub use q8_head::set_q8_head;
 pub use q8_mv::set_q8_mv;
@@ -76,9 +84,12 @@ pub mod q_small_m;
 pub use q_small_m::set_q_small_m;
 pub(crate) mod mtp;
 pub mod mtp_moe;
+pub mod mvf_bf16;
+pub use mvf_bf16::set_mvf_ab;
 pub mod pad_rows;
 pub(crate) mod paged;
 pub mod pair;
+pub(crate) mod picks;
 mod spec;
 pub(crate) mod stable_fusions;
 pub mod stage_ops;
@@ -99,7 +110,7 @@ mod window_attn;
 
 pub use arch::{Arch, ArchRef, Recurrent, TokenConv};
 pub use exec::{
-    ChainOutput, Executor, Pool, PromptNext, Remote, StateCapture, StepPart, TpLead,
+    ChainOutput, Executor, LENT_SCRATCH, Pool, PromptNext, Remote, StateCapture, StepPart, TpLead,
     default_verify_budget, from_wire, set_mtp_kept_graphs, set_prompt_buffer_reserve,
     set_prompt_build_ahead, set_prompt_step_stats, set_verify_kept_graphs, verify_kept_graphs,
 };
@@ -109,7 +120,8 @@ pub use media::{ImageSpan, Media};
 pub use mtp::{DraftHeadType, MtpGraph, MtpOutput};
 pub use spec::{
     Replay, SpecPool, set_commit_in_verify, set_commit_slots, set_state_defer,
-    set_state_defer_min_seqs, set_state_defer_rows,
+    set_state_defer_min_seqs, set_state_defer_rows, set_tp_commit_in_verify_min_seqs,
+    tp_commit_in_verify_min_seqs,
 };
 pub use state::{KV_BLOCK, KvPool, KvRing, KvTier, SeqState, SplitTier, StatePool, fnv1a};
 
@@ -122,6 +134,7 @@ use crate::model::fp8_act;
 use crate::model::moe_ffn;
 use crate::residency::cpu_share;
 use crate::weights::{LoadError, Weights};
+use picks::{Need, Picks, took};
 
 /// `GGML_ROPE_TYPE_IMROPE`: interleaved multi-section RoPE.
 pub(crate) const ROPE_IMROPE: i32 = 40;
@@ -133,6 +146,11 @@ pub(crate) const ROPE_IMROPE: i32 = 40;
 /// flip an F16 rounding of a softmax weight and, through Q8_0 activation quantization, grow
 /// into ~1 logit of drift over 40 layers.
 const ATTN_KV_PAD: i64 = 256;
+
+/// Most bytes of logits rows [`Inputs::out_pin_bytes`] sizes the pinned output buffer for, so
+/// that [`Inputs::output_with`] reads runs of rows in one DMA ([`picks::spans`]; a 16-user verify
+/// step's 48 rows of a 248K vocabulary are ~48 MB); rows further apart come back in more reads.
+const OUT_SPAN_BYTES: usize = 64 << 20;
 
 /// Tensors and nodes a step's graph of up to [`graph_size::GRAPH_SIZE_GROUPS`] groups may hold
 /// ([`graph_size()`] sizes bigger steps' graphs).
@@ -345,6 +363,10 @@ pub struct Model {
     /// Routed experts read from the checkpoint as steps route to them, when set up
     /// ([`crate::residency::ssd_experts`]; GLM-5.3-Flash NVFP4).
     ssd: Option<crate::residency::ssd_experts::SsdExperts>,
+    /// The bounded host expert tier, when set up ([`crate::residency::host_tier`]: a discrete
+    /// GPU on a machine with less RAM than the experts take). After `experts`, whose ranges map
+    /// its memory.
+    host_tier: Option<std::sync::Arc<crate::residency::host_tier::HostTier>>,
     /// Weight pairs read as one matrix by small steps ([`joined`]), made by the first graph
     /// that asks. Before the weights, whose memory they share.
     joined: std::cell::OnceCell<Option<joined::Joined>>,
@@ -378,6 +400,9 @@ pub struct Model {
     /// The 4-bit copy of the output head the MTP head drafts with
     /// ([`Self::quantize_draft_head`]).
     draft_head: Option<Context>,
+    /// The token ids the MTP head drafts over when they are not the vocabulary's first
+    /// [`Self::draft_vocab`] ([`Self::set_draft_ids`]): ascending.
+    draft_ids: Option<Vec<u32>>,
     /// Where the per-layer n-gram table's rows come from when it is read through a store
     /// ([`crate::residency::lookup_table`]: RAM, page cache or direct SSD reads); `None`: from
     /// the weights' own host memory.
@@ -431,6 +456,11 @@ pub enum MoeKernel {
 /// Smallest batch the fused expert op takes in [`MoeKernel::Auto`]: below it, ggml's
 /// `mul_mat_id` (its MMQ / MMVQ kernels for small batches) is as fast.
 pub const MOE_FFN_MIN_TOKENS: i64 = 64;
+
+/// With the bounded host expert tier ([`crate::residency::host_tier`]), steps of at least
+/// this many tokens run the fused op in place (no staged copies there): the prompt chunks
+/// that staging takes elsewhere. Smaller steps keep the graph they have without the tier.
+pub const HOST_TIER_FUSED_TOKENS: i64 = 256;
 
 /// Where a weight lives when the model runs on a GPU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -493,26 +523,44 @@ pub enum Logits {
     First(usize),
     /// Only the argmaxes of the first `n` tokens' (a greedy verify step).
     FirstGreedy(usize),
+    /// Only the greedy pick of the last token's with the stop tokens masked (a greedy sequence
+    /// below `min_tokens`, [`picks`]): the argmax, or the host's pick where it may differ.
+    Pick,
+    /// Only the greedy picks of the first `n` tokens' (a greedy verify step below `min_tokens`,
+    /// [`picks`]), the first `m` with the stop tokens masked.
+    FirstPick(usize, usize),
 }
 
 impl Logits {
     fn rows(self, n_tok: usize) -> usize {
         match self {
             Logits::None => 0,
-            Logits::Last | Logits::Greedy => 1,
+            Logits::Last | Logits::Greedy | Logits::Pick => 1,
             Logits::All => n_tok,
-            Logits::First(n) | Logits::FirstGreedy(n) => n.min(n_tok),
+            Logits::First(n) | Logits::FirstGreedy(n) | Logits::FirstPick(n, _) => n.min(n_tok),
         }
     }
 
-    /// Whether only argmaxes come back.
-    fn greedy(self) -> bool {
-        matches!(self, Logits::Greedy | Logits::FirstGreedy(_))
+    /// Whether the rows come back whole (for the engine to sample from), not as argmaxes or
+    /// picks.
+    fn sampled(self) -> bool {
+        matches!(self, Logits::Last | Logits::All | Logits::First(_))
     }
 
     /// Whether the rows are the first tokens' rather than the last ones'.
     fn leading(self) -> bool {
-        matches!(self, Logits::First(_) | Logits::FirstGreedy(_))
+        matches!(
+            self,
+            Logits::First(_) | Logits::FirstGreedy(_) | Logits::FirstPick(..)
+        )
+    }
+
+    /// Whether only the last token's row is asked for (or none).
+    fn last_only(self) -> bool {
+        matches!(
+            self,
+            Logits::None | Logits::Last | Logits::Greedy | Logits::Pick
+        )
     }
 }
 
@@ -583,6 +631,10 @@ pub struct GroupShape {
     /// paired MoE layers share their experts with the other GPU of its NVLink pair. Kept apart
     /// from the other steps' graphs.
     pub(crate) pair: bool,
+    /// A greedy step whose head is split over the two ranks of tensor parallelism
+    /// ([`head_split`]): the share of the vocabulary this graph's head covers (1: rank 0's, 2:
+    /// rank 1's), its argmax output the share's candidates. 0: the whole head.
+    pub(crate) head_half: u8,
     /// Image tokens of the group's sequences ([`Media`]), whose input rows replace their token
     /// embeddings.
     pub(crate) img: usize,
@@ -619,10 +671,7 @@ impl GroupShape {
             table: table.unwrap_or(0),
             ring: 0,
             logits: g.seqs.iter().map(|s| s.logits.rows(n_tok)).collect(),
-            last_only: g
-                .seqs
-                .iter()
-                .all(|s| matches!(s.logits, Logits::None | Logits::Last | Logits::Greedy)),
+            last_only: g.seqs.iter().all(|s| s.logits.last_only()),
             verify: g.verify,
             n_pool,
             n_new,
@@ -630,6 +679,7 @@ impl GroupShape {
             kv_slots: Vec::new(),
             par: false,
             pair: false,
+            head_half: 0,
             img: g
                 .seqs
                 .iter()
@@ -836,6 +886,11 @@ pub struct StepOutput {
     /// Per captured layer ([`Executor::capture_hidden`]): its output for every token of the
     /// step, `[tokens][n_embd]` in the order of groups, sequences, tokens.
     pub hidden: Vec<Vec<f32>>,
+    /// The same rows left on the device instead ([`Executor::set_hidden_on_device`], #1181):
+    /// per captured layer, its `[n_embd, tokens]` output in the step graph's buffer, valid
+    /// until the executor runs anything again. `hidden` then holds empty vectors. Empty when
+    /// the rows were read back.
+    pub hidden_dev: Vec<crate::ggml::RowsAt>,
 }
 
 impl StepOutput {
@@ -1019,14 +1074,51 @@ impl<'a> Inputs<'a> {
 
     /// Reads the step's results back: every row's argmax, and the rows that want logits.
     fn output(&self, groups: &[Group<'_>], n_vocab: usize) -> StepOutput {
-        self.output_with(groups, n_vocab, |t| t.to_f32())
+        self.output_with(groups, n_vocab, None, Picks::default(), |t| t.to_f32())
     }
 
-    /// [`Self::output`], reading the captured rows with `read`.
+    /// The bytes of the step's argmaxes (0 without them): what [`Self::output_with`] reads
+    /// them through needs this much room.
+    fn argmax_bytes(&self) -> usize {
+        self.argmax.map_or(0, |t| t.nbytes())
+    }
+
+    /// The bytes [`Self::output_with`] reads the argmaxes and then the logits rows of `groups`
+    /// through: the biggest of [`Self::argmax_bytes`], one row of `n_vocab` F32s and the span
+    /// from the first to the last row that comes back whole ([`Logits::sampled`]), when that is
+    /// at most [`OUT_SPAN_BYTES`] (0 without logits).
+    fn out_pin_bytes(&self, groups: &[Group<'_>], n_vocab: usize) -> usize {
+        let Some(_) = self.logits else {
+            return self.argmax_bytes();
+        };
+        let row = n_vocab * 4;
+        let (mut first, mut end, mut i) = (None, 0, 0);
+        for s in groups.iter().flat_map(|g| &g.seqs) {
+            let n = s.logits.rows(s.tokens.len());
+            if n > 0 && s.logits.sampled() {
+                first.get_or_insert(i);
+                end = i + n;
+            }
+            i += n;
+        }
+        let span = first.map_or(0, |f| (end - f) * row);
+        let span = if span <= OUT_SPAN_BYTES { span } else { 0 };
+        self.argmax_bytes().max(row).max(span)
+    }
+
+    /// [`Self::output`], reading the captured rows with `read`, and the argmaxes and logits rows
+    /// through host tensor `ids` (pinned memory, [`Tensor::to_i32_via`],
+    /// [`Tensor::with_f32_range_via`]) when it has room for them ([`Self::out_pin_bytes`]).
+    /// Of a greedy pick row ([`Logits::Pick`], [`Logits::FirstPick`]) only what `picks` needs comes
+    /// back ([`picks::Need`]): the pick then stands in its argmax's place and its row stays empty.
+    /// Rows next to each other come back in one read when they fit ([`picks::spans`]: one DMA,
+    /// not one per row).
     fn output_with(
         &self,
         groups: &[Group<'_>],
         n_vocab: usize,
+        ids: Option<Tensor<'_>>,
+        picks: Picks<'_>,
         mut read: impl FnMut(Tensor<'a>) -> Vec<f32>,
     ) -> StepOutput {
         let hidden = self.hidden.iter().map(|&t| read(t)).collect();
@@ -1036,21 +1128,82 @@ impl<'a> Inputs<'a> {
                 ..Default::default()
             };
         };
-        let argmax = argmax.to_i32().into_iter().map(|t| t as u32).collect();
-        let mut rows = Vec::new();
+        let argmax = match ids.filter(|v| v.nbytes() >= argmax.nbytes()) {
+            Some(via) => argmax.to_i32_via(via),
+            None => argmax.to_i32(),
+        };
+        let mut argmax: Vec<u32> = argmax.into_iter().map(|t| t as u32).collect();
+        let mut needs = Vec::with_capacity(argmax.len());
         for s in groups.iter().flat_map(|g| &g.seqs) {
-            for _ in 0..s.logits.rows(s.tokens.len()) {
-                rows.push(if s.logits.greedy() {
-                    Vec::new()
-                } else {
-                    logits.f32_range(rows.len() * n_vocab, n_vocab)
-                });
+            for i in 0..s.logits.rows(s.tokens.len()) {
+                let t = argmax.get(needs.len()).copied().unwrap_or(u32::MAX);
+                needs.push(Need::of(s.logits, i, t, n_vocab, picks));
             }
+        }
+        let mut rows = vec![Vec::new(); needs.len()];
+        let wanted: Vec<usize> = (0..needs.len())
+            .filter(|&r| needs[r].len(n_vocab) > 0)
+            .collect();
+        // Each read brings back a run of rows' parts (one DMA through `ids`, [`picks::spans`]).
+        let parts: Vec<(usize, usize)> = (wanted.iter())
+            .map(|&r| (r * n_vocab, needs[r].len(n_vocab)))
+            .collect();
+        let cap = ids.map_or(0, |v| v.nbytes() / 4);
+        // Picks that need their whole row after all.
+        let mut whole = Vec::new();
+        for span in picks::spans(&parts, picks::SPAN_GAP, cap) {
+            let rs = &wanted[span.clone()];
+            let start = parts[span.start].0;
+            let (last, len) = parts[span.end - 1];
+            let n = last + len - start;
+            let mut take = |r: usize, values: &[f32]| {
+                if !took(
+                    needs[r],
+                    values,
+                    &mut argmax[r],
+                    &mut rows[r],
+                    n_vocab,
+                    picks,
+                ) {
+                    whole.push(r);
+                }
+            };
+            match ids.filter(|v| v.nbytes() >= n * 4) {
+                // SAFETY: the closure only reads the slice; nothing writes `via` meanwhile.
+                Some(via) => unsafe {
+                    logits.with_f32_range_via(via, start, n, |v| {
+                        for &r in rs {
+                            let at = r * n_vocab - start;
+                            take(r, &v[at..at + needs[r].len(n_vocab)]);
+                        }
+                    })
+                },
+                None => {
+                    for &r in rs {
+                        take(r, &logits.f32_range(r * n_vocab, needs[r].len(n_vocab)));
+                    }
+                }
+            }
+        }
+        for r in whole {
+            let Need::Pick { masked, .. } = needs[r] else {
+                continue;
+            };
+            let need = Need::Pick {
+                len: n_vocab,
+                masked,
+            };
+            let v = match ids.filter(|v| v.nbytes() >= n_vocab * 4) {
+                Some(via) => logits.f32_range_via(via, r * n_vocab, n_vocab),
+                None => logits.f32_range(r * n_vocab, n_vocab),
+            };
+            took(need, &v, &mut argmax[r], &mut rows[r], n_vocab, picks);
         }
         StepOutput {
             argmax,
             rows,
             hidden,
+            hidden_dev: Vec::new(),
         }
     }
 
@@ -1323,6 +1476,13 @@ pub struct Pass<'a> {
 }
 
 impl<'a> Pass<'a> {
+    /// Whether every group of this pass is a prompt step: more than one token per sequence and
+    /// no speculative verify ([`GroupShape::verify`]). Decode and verify groups, also in a
+    /// mixed pass, make it false.
+    pub(crate) fn prompt_only(&self) -> bool {
+        self.shape.iter().all(|g| !g.verify && g.n_tok > 1)
+    }
+
     /// The cells this step's tokens take in layer `il`'s cache: their ring cells if it is a
     /// ring ([`KvRing`]).
     pub(crate) fn write_cells(&self, il: usize) -> Tensor<'a> {
@@ -1438,6 +1598,7 @@ impl Model {
         Ok(Self {
             experts: None,
             ssd: None,
+            host_tier: None,
             joined: Default::default(),
             router_bf16: Default::default(),
             host_pins: None,
@@ -1453,6 +1614,7 @@ impl Model {
             widened: None,
             requant: None,
             draft_head: None,
+            draft_ids: None,
             ngram: None,
             ple_late: Default::default(),
             ple_ahead: Default::default(),
@@ -1488,6 +1650,7 @@ impl Model {
         Ok(Self {
             experts: None,
             ssd: None,
+            host_tier: None,
             joined: Default::default(),
             router_bf16: Default::default(),
             host_pins: None,
@@ -1503,6 +1666,7 @@ impl Model {
             widened: None,
             requant: None,
             draft_head: None,
+            draft_ids: None,
             ngram: None,
             ple_late: Default::default(),
             ple_ahead: Default::default(),
@@ -1530,6 +1694,17 @@ impl Model {
     /// must have been left out of the load).
     pub fn set_ssd_experts(&mut self, ssd: crate::residency::ssd_experts::SsdExperts) {
         self.ssd = Some(ssd);
+    }
+
+    /// The routed experts' host memory is `tier`'s RAM slots from now on (their tensors must
+    /// have been left out of the load); the expert cache built next reads through it.
+    pub fn set_host_tier(&mut self, tier: std::sync::Arc<crate::residency::host_tier::HostTier>) {
+        self.host_tier = Some(tier);
+    }
+
+    /// The bounded host expert tier, when set up.
+    pub fn host_tier(&self) -> Option<&std::sync::Arc<crate::residency::host_tier::HostTier>> {
+        self.host_tier.as_ref()
     }
 
     /// The SSD expert tier, when set up.
@@ -1667,6 +1842,23 @@ impl Model {
     /// The draft vocabulary set by [`Self::set_draft_vocab`].
     pub(crate) fn draft_vocab(&self) -> usize {
         self.draft_vocab
+    }
+
+    /// MTP drafts from now on over the tokens `ids` (ascending, each below the vocabulary's
+    /// size) instead of the vocabulary's first [`Self::draft_vocab`]: the executor copies those
+    /// rows of the output head when it enables the head ([`Self::copy_draft_head`], or
+    /// [`Self::quantize_draft_head`] with `--spec-draft-lm-head q4`). glm5-next (#1172).
+    pub fn set_draft_ids(&mut self, ids: Vec<u32>) {
+        debug_assert!(
+            ids.windows(2).all(|p| p[0] < p[1]),
+            "draft ids not ascending"
+        );
+        self.draft_ids = Some(ids);
+    }
+
+    /// The token ids set by [`Self::set_draft_ids`], if any.
+    pub(crate) fn draft_ids(&self) -> Option<&[u32]> {
+        self.draft_ids.as_deref()
     }
 
     /// How the fused expert op keeps per-pair outputs from now on (default:
@@ -1997,6 +2189,8 @@ impl Model {
             .or_else(|| self.widened.as_ref().and_then(|c| c.tensor(name)))
             .or_else(|| self.weights.get(name))
             .or_else(|| self.mtp.as_ref().and_then(|m| m.get(name)))
+            // The bounded host tier: a layer's routed experts are its RAM slot tensors.
+            .or_else(|| self.host_tier.as_ref().and_then(|h| h.tensor(name)))
             .ok_or_else(|| ModelError::Tensor(name.into()))
     }
 
@@ -2157,6 +2351,21 @@ impl Model {
         Some(joined::split_run(ctx, r, &rows))
     }
 
+    /// Layer `il`'s BF16 projections `names` of `x` (2 to [`mvf_bf16::MAX_WEIGHTS`] plain
+    /// weights: a DeltaNet layer's alpha and beta) in one [`mvf_bf16`] launch where the op
+    /// takes them (#689): steps of 1-8 tokens, where [`Self::lmm`] runs each on ggml's
+    /// `mul_mat_vec_f`, whose bits each result has. `None`: run [`Self::lmm`] for each.
+    pub(crate) fn lmm_mvf<'a>(
+        &'a self,
+        ctx: &'a Context,
+        il: usize,
+        names: &[&str],
+        x: Tensor<'a>,
+    ) -> Option<Vec<Tensor<'a>>> {
+        let ws = self.dense_weights(il, names)?;
+        mvf_bf16::takes(&ws, x).then(|| mvf_bf16::mul_mat(ctx, &ws, x))
+    }
+
     /// Layer `il`'s projections `names` of `x` (2 to [`dense_mv::MAX_WEIGHTS`] BF16 weights
     /// without scales) in one [`dense_mv`] launch, where the op takes them together
     /// ([`dense_mv::takes_all`]): decode steps of an NVFP4 checkpoint's DeltaNet `qkv` and `z`,
@@ -2286,6 +2495,37 @@ impl Model {
             .strip_suffix(".weight")
             .and_then(|b| self.w(&format!("{b}.input_scale")).ok());
         self.linear.mul_mat(ctx, name, w, scale, input_scale, x)
+    }
+
+    /// Whether a greedy step's head may run as two shares of the vocabulary on the two ranks
+    /// of tensor parallelism ([`head_split`], `--tp-head-split`): an architecture whose split
+    /// head was shown to keep the text ([`Arch::head_splits`]), with the core's head as a
+    /// plain matmul of `output.weight` (no scale, no FP8 activation scale) in one GPU's
+    /// memory, and a vocabulary that splits ([`head_split::vocab_fits`]).
+    pub(crate) fn head_splits(&self) -> bool {
+        let name = "output.weight";
+        let Ok(w) = self.w(name) else {
+            return false;
+        };
+        self.hp.arch.head_splits()
+            && crate::model::cluster_select::on_cuda()
+            && !w.is_meta()
+            && !w.is_host()
+            && w.ne()[2] == 1
+            && w.ne()[1] == self.hp.n_vocab
+            && head_split::vocab_fits(w.ne()[1] as usize)
+            && linear::scale_name(name).is_none_or(|s| self.w(&s).is_err())
+            && self.w("output.input_scale").is_err()
+    }
+
+    /// Whether the LM head `name` (`w`) for `x` runs on [`head_mm`]: [`head_mm::takes`], and
+    /// [`Self::mm`] would be a plain matmul of it (no scale, no FP8 activation scale).
+    fn head_mm_takes(&self, name: &str, w: Tensor<'_>, x: Tensor<'_>) -> bool {
+        head_mm::takes(w, x)
+            && linear::scale_name(name).is_none_or(|s| self.w(&s).is_err())
+            && name
+                .strip_suffix(".weight")
+                .is_none_or(|b| self.w(&format!("{b}.input_scale")).is_err())
     }
 
     /// [`Self::mm`] over the first `rows` rows of `name` only (an MTP head drafting over part
@@ -2699,6 +2939,9 @@ impl Model {
                             .collect();
                         let d = dims.iter().map(|x| x.0).max().unwrap_or(hp.head_dim);
                         let min_kv = dims.iter().map(|x| x.1).min().unwrap_or(hp.n_head_kv);
+                        // A verify step's rows split over the key blocks (sm_70 / sm_75).
+                        let wmma =
+                            paged::wmma_split_len(&dims, hp.n_head, g.n_tok, g.n_seqs, g.table);
                         let scratch = if self.kv_stage_blocks > 0 && g.n_tok > 1 {
                             let n = paged::tier_scratch_len(
                                 hp.n_head as usize,
@@ -2707,7 +2950,9 @@ impl Model {
                                 g.table,
                                 self.kv_stage_blocks,
                             );
-                            [n as i64, 1, 1, 1]
+                            [n.max(wmma) as i64, 1, 1, 1]
+                        } else if wmma > 0 {
+                            [wmma as i64, 1, 1, 1]
                         } else {
                             paged::scratch_shape(d, hp.n_head, min_kv, g.n_tok, g.n_seqs)
                         };
@@ -2992,11 +3237,33 @@ impl Model {
                         Ok(_) => "output.weight",
                         Err(_) => "token_embd.weight",
                     };
-                    let logits = self.mm(ctx, head, x)?;
-                    let logits = arch.logits(ctx, logits);
-                    let argmax =
-                        crate::model::cluster_select::argmax_of(ctx, logits, self.w(head)?);
-                    (logits, argmax)
+                    let w = self.w(head)?;
+                    let half = shape.first().map_or(0, |g| g.head_half);
+                    match arch.logit_softcap() {
+                        // This rank's share of a split head ([`head_split`], #1176): the
+                        // logits of its vocabulary rows and each output row's candidates
+                        // among them.
+                        _ if half != 0 => {
+                            let (off, rows) = head_split::range(w.ne()[1] as usize, half);
+                            let nb1 = w.nb()[1];
+                            let part = ctx.view_2d(w, [w.ne()[0], rows as i64], nb1, off * nb1);
+                            let logits = self.linear.mul_mat(ctx, head, part, None, None, x)?;
+                            let logits = arch.logits(ctx, logits);
+                            let best = crate::model::cluster_select::argmax_best(ctx, logits);
+                            (logits, best)
+                        }
+                        // A BF16 head of verify steps of many sequences, matmul, soft-cap and
+                        // argmax in one pass with ggml's bits (#1181).
+                        Some(cap) if self.head_mm_takes(head, w, x) => {
+                            head_mm::head(ctx, w, x, cap)
+                        }
+                        _ => {
+                            let logits = self.mm(ctx, head, x)?;
+                            let logits = arch.logits(ctx, logits);
+                            let argmax = crate::model::cluster_select::argmax_of(ctx, logits, w);
+                            (logits, argmax)
+                        }
+                    }
                 }
             };
             let (logits, argmax) = (logits.as_output(), argmax.as_output());
@@ -3087,11 +3354,23 @@ impl Model {
                 ),
             },
         };
-        // Small steps: alpha and beta from one matmul (#256), whose strided rows the op reads.
-        let (alpha_raw, beta_raw) = match ab.or_else(|| {
-            prep.then(|| self.lmm_joined(ctx, il, "ssm_alpha.weight", "ssm_beta.weight", h))
-                .flatten()
-        }) {
+        // Small steps: alpha and beta from one matmul (#256), whose strided rows the op reads;
+        // BF16 ones of 1-8 tokens from one `mul_mat_vec_f` twin launch (#689).
+        let ab_names = ["ssm_alpha.weight", "ssm_beta.weight"];
+        let (alpha_raw, beta_raw) = match ab
+            .or_else(|| {
+                prep.then(|| self.lmm_joined(ctx, il, ab_names[0], ab_names[1], h))
+                    .flatten()
+            })
+            .or_else(|| {
+                match prep
+                    .then(|| self.lmm_mvf(ctx, il, &ab_names, h))
+                    .flatten()?[..]
+                {
+                    [alpha, beta] => Some((alpha, beta)),
+                    _ => None,
+                }
+            }) {
             Some(ab) => ab,
             None => {
                 let beta = self.lmm_q(ctx, il, "ssm_beta.weight", h, hq)?;
@@ -3175,10 +3454,11 @@ impl Model {
                 None => {
                     // A pool that defers its commits stores the inputs in the delta rule
                     // (`gdn::rows_replay`), after it reads the last step's kept ones there; a
-                    // packed one that does not (no GPU counts) by copies (`store`).
+                    // packed one that does not (no GPU counts) by copies (`store`). A pool with
+                    // both stores (#1176) defers its wide steps only (`SpecPool::replays`).
                     let views = sh.verify.then(|| pass.spec.expect("checked in build"));
                     let views = views
-                        .filter(|spec| !spec.packed())
+                        .filter(|spec| !spec.packed() && !spec.replays(sh.n_seqs))
                         .map(|spec| spec.token_views(ctx, il, sh.slot, nt, ns));
                     let store = views.map(|[q, k, v_pool, g, beta]| {
                         // v is a view of the conv output: a copy.
@@ -3216,6 +3496,7 @@ impl Model {
                 // A verify step reads the rows only: its states advance in the commit.
                 let spec = pass.spec.expect("checked in build");
                 let replay = spec.replay_views(ctx, il, sh.slot, sh.n_seqs);
+                let replays = replay.is_some();
                 let rows = if let Some((keep, replay, arrive)) = replay {
                     // The last commit deferred into this step (#836 part 14): a pool that
                     // defers has no other way to run it. The op then stores this step's inputs
@@ -3238,7 +3519,7 @@ impl Model {
                 };
                 let conv_in = conv_in.expect("a verify group's conv input");
                 let mut graph = pass.graph.borrow_mut();
-                if stored || spec.defers() {
+                if stored || replays {
                     // The op wrote q, k, g and beta already, and v is copied; or the delta rule
                     // stored them over the packed rows (`rows_replay`).
                     spec.store_window(ctx, &mut graph, il, sh.slot, conv_in);
@@ -3865,8 +4146,9 @@ impl Model {
         il: usize,
         h: Tensor<'a>,
         n: i64,
+        prompt: bool,
     ) -> Result<Tensor<'a>, ModelError> {
-        self.moe_rows(ctx, tap, graph, il, h, n, None)
+        self.moe_rows(ctx, tap, graph, il, h, n, None, prompt)
     }
 
     /// [`Self::moe`] with a verify step's row map (I32 `[n]`, [`pad_rows::map`]): Legion's
@@ -3875,6 +4157,9 @@ impl Model {
     /// Legion's expert matvec over an expert cache with `--moe-pad-remap-tiered` (opt-in, not
     /// byte-identical end to end). With `--moe-pad-skip-tiered` (opt-in) that matvec skips the
     /// padding rows' pairs of experts no real row chose instead (`pad_rows::skip_tiered`).
+    /// `prompt` ([`Pass::prompt_only`]): every group of the pass is a prompt step, the only
+    /// passes `--nvfp4-expert-rows-bf16` gives BF16 expert rows (decode and verify rows stay
+    /// F32, #1183).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn moe_rows<'a>(
         &'a self,
@@ -3885,6 +4170,7 @@ impl Model {
         h: Tensor<'a>,
         n: i64,
         rows: Option<Tensor<'a>>,
+        prompt: bool,
     ) -> Result<Tensor<'a>, ModelError> {
         let hp = &self.hp;
         let used = hp.n_expert_used;
@@ -3974,7 +4260,8 @@ impl Model {
         } else {
             // With `--nvfp4-once` the top-k kernel also writes the routing plan of the NVFP4
             // expert ops (#836), which then launch without building one.
-            let plan = ep.is_none() && self.experts.is_none() && nvfp4_once::plan_fits(used, n);
+            let plan =
+                ep.is_none() && self.experts.is_none() && nvfp4_once::plan_fits(gate_w, used, n);
             // Joined top-k and weights (#814): the weights go into the graph below, before
             // the experts pull the ids in (not with `--decode-fuse`, which adds the ids).
             fused::router_planned(ctx, logits, used, plan, !df)
@@ -4077,7 +4364,10 @@ impl Model {
                         moe_ffn::moe_ffn_shexp(ctx, x, ids, w2, refs(ws), pair, shexp)
                     });
                 }
-                if summed.is_none() && fused == Some(MoeKernel::Fused) {
+                // The bounded host tier has no staged copies: its prompt chunks run the fused
+                // op in place, over the RAM slots and the staging buffer.
+                let in_place = t.bounded() && n >= HOST_TIER_FUSED_TOKENS;
+                if summed.is_none() && (fused == Some(MoeKernel::Fused) || in_place) {
                     // Forced: in place (on a GPU, host experts over the link).
                     summed = Some(moe_ffn::moe_ffn_shexp(
                         ctx,
@@ -4114,9 +4404,18 @@ impl Model {
                         // The missed experts on a side stream beside the cached ones (#253).
                         let w = [w_gate, w_up, t.weight(2)];
                         // The host computes a share of the missed experts (#268, opt-in).
+                        // Laid out as the plain path below (the same pre-quantized gate and
+                        // up, no memory of its own), so ggml's fusions see the same graph.
                         let shared = t.cpu_share(n).and_then(|share| {
-                            let (slots, n_expert) = (t.n_slots(), t.n_expert());
-                            cpu_share::ops::glu_down(ctx, w, x, ids, slots, n_expert, il, share)
+                            let xq =
+                                h_q8_1.filter(|&q| expert_mv::glu_preq_fits(w_gate, x, ids, q));
+                            let layer = cpu_share::ops::ShareLayer {
+                                n_slots: t.n_slots(),
+                                n_expert: t.share_experts(),
+                                layer: il,
+                                threshold: share,
+                            };
+                            cpu_share::ops::glu_down(ctx, w, (x, ids, xq), t.share_ids()?, layer)
                         });
                         let split = shared.or_else(|| {
                             (!t.gathers(n))
@@ -4307,7 +4606,9 @@ impl Model {
                     let l = &self.linear;
                     l.swiglu_ffn_id_skips(ctx, g, u, d, x, selected, rows)
                 } else {
-                    self.linear.swiglu_ffn_id(ctx, g, u, d, x, selected, rows)
+                    let bf16 = prompt && crate::model::nvfp4_mm::expert_rows_bf16(n);
+                    self.linear
+                        .swiglu_ffn_id(ctx, g, u, d, x, selected, rows, bf16)
                 }
             } {
                 Some(out)

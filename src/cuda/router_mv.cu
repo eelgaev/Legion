@@ -37,6 +37,10 @@ int legion_router_mv_launch(const legion_router_mv * p, void * stream);
 // Whether the current device runs the op (compute capability 9.0+).
 int legion_router_mv_supported(void);
 
+// `--hopper-pdl` (#1215): programmatic dependent launch through launch_pdl.cuh on compute
+// capability 9.0 too (legion_device::hopper_pdl_flag; every file's launch_pdl reads the one flag).
+void legion_set_hopper_pdl(int on);
+
 }  // extern "C"
 
 namespace {
@@ -186,6 +190,10 @@ int legion_router_mv_supported(void) {
     // Not on a V100 (#814): there one launch of this kernel takes longer (~36 us at 3 tokens)
     // than ggml's matmul and the two selection launches together (~25 us).
     return legion_device::compute_capability() >= 90 ? 1 : 0;
+}
+
+void legion_set_hopper_pdl(int on) {
+    legion_device::hopper_pdl_flag().store(on != 0, std::memory_order_relaxed);
 }
 
 int legion_router_mv_launch(const legion_router_mv * p, void * stream) {

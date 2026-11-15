@@ -70,7 +70,10 @@ fn expert_split_misses_flag() {
 fn expert_swap_rule_flags() {
     let d = residency(&[]);
     assert_eq!(d.swaps, SwapRule::default());
+    assert!(!d.swaps_given);
     assert_eq!(d.decay, ResidencyConfig::default().decay);
+    // The default's own value given is still given (the load keeps it).
+    assert!(residency(&["--expert-swaps", "24"]).swaps_given);
     // Values other than the defaults, so an unwired flag shows.
     let c = residency(&[
         "--expert-swaps",
@@ -378,6 +381,19 @@ fn spec_draft_lm_head_flag() {
         assert!(e.contains("--spec-draft-lm-head needs"), "{e}");
     }
     assert!(Cli::try_parse_from(["legion", "serve", "--spec-draft-lm-head", "q8_0"]).is_err());
+}
+
+#[test]
+fn spec_draft_batched_attn_flag() {
+    let base = ["--spec", "dflash", "--spec-draft", "d"];
+    assert!(!spec(&base).unwrap().draft_batched_attn);
+    let on = [&base[..], &["--spec-draft-batched-attn"]].concat();
+    assert!(spec(&on).unwrap().draft_batched_attn);
+    for other in [&[][..], &["--spec", "dspark", "--spec-draft", "d"]] {
+        let argv = [other, &["--spec-draft-batched-attn"]].concat();
+        let e = spec(&argv).unwrap_err().to_string();
+        assert!(e.contains("--spec-draft-batched-attn needs"), "{e}");
+    }
 }
 
 fn serve_args(argv: &[&str]) -> Box<ServeArgs> {
@@ -884,4 +900,20 @@ fn ngram_ram_flag() {
         let argv = ["legion", "serve", "--ngram-ram", bad];
         assert!(Cli::try_parse_from(argv).is_err(), "{bad}");
     }
+}
+
+#[test]
+fn tu_attn_ffma_flag() {
+    let model = |argv: &[&str]| {
+        let argv = ["legion", "serve"].into_iter().chain(argv.iter().copied());
+        match Cli::try_parse_from(argv).unwrap().command {
+            Command::Serve(args) => args.engine.model.tu_attn_ffma,
+            _ => unreachable!("the parser returned a command other than serve"),
+        }
+    };
+    assert!(!model(&[]));
+    assert!(model(&["--tu-attn-ffma"]));
+    assert!(
+        !legion::engine::lm::LmConfig::new("m", legion::engine::lm::DeviceChoice::Cpu).tu_attn_ffma
+    );
 }

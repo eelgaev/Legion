@@ -1533,6 +1533,9 @@ int launch_linear(const A & a, cudaStream_t st) {
             if (kern == 0 && tc_gb_device() && tc_gb_auto(xh, xh ? ph : p, st, oh)) {
                 return 0;
             }
+            if (kern == 0 && tc_gb_ampere_device() && tc_gb_auto_ampere(xh, xh ? ph : p, st, oh)) {
+                return 0;
+            }
             if (oh && xh) {
                 launch_pdl(linear_tc<true, true>, tg, 256, TC_SMEM_XH, st, ph);
             } else if (oh) {
@@ -3707,7 +3710,7 @@ __global__ void argmax_kernel(const A a) {
                 bi = is[w];
             }
         }
-        ((int32_t *) a.dst)[t] = (int32_t) bi;
+        ((int32_t *) a.dst)[t] = a.n_src > 1 ? ((const int32_t *) a.src[1])[bi] : (int32_t) bi;
     }
 }
 
@@ -3793,7 +3796,8 @@ __global__ void __launch_bounds__(32) argmax_fin_kernel(const A a) {
         }
     }
     if (c == 0) {
-        d[t] = (int32_t) bi;
+        // Over picked rows (ops::argmax_wide_ids, src 1: their token ids): the row's id.
+        d[t] = a.n_src > 1 ? ((const int32_t *) a.src[1])[bi] : (int32_t) bi;
     }
 }
 
@@ -4084,9 +4088,12 @@ extern "C" int legion_glm_launch(int op, const legion_glm_args * ap, void * stre
             } else if (a.params[3] && a.params[5] != 1 && a.ne[1] % MT_H == 0 && a.ne[2] >= 64 &&
                        ((uintptr_t) a.src[1] | (uintptr_t) a.src_nb[1][1] | (uintptr_t) a.dst) % 16 == 0 &&
                        a.nb[1] == MD * 4 && a.nb[2] == a.ne[1] * MD * 4 &&
-                       (a.params[5] == 2 ? dev_sm80() : legion_device::sm12x_device(mla_gb_kernel))) {
+                       (a.params[5] == 2 ? dev_sm80() :
+                                           legion_device::sm12x_device(mla_gb_kernel) ||
+                                               legion_device::ampere_device(mla_gb_kernel))) {
                 // params[5]: the prompt kernel (ops::MlaKernel): 0 mla_gb_kernel on compute
-                // capability 12.x (GB10, RTX 50; #1200) and mla_tiled_kernel elsewhere, 1
+                // capability 12.x (GB10, RTX 50; #1200) and 8.0-8.7 (Ampere, #1212: the sm_86
+                // code 0.68-0.70x mla_tiled_kernel's time), mla_tiled_kernel elsewhere, 1
                 // mla_tiled_kernel, 2 mla_gb_kernel on any sm_80+ (the same bits); 3 comes with
                 // params[4] (mla_tc_kernel above, else as 0)
                 constexpr int smem = mla_gb_smem();

@@ -97,15 +97,32 @@ pub fn gpu_takes(cc: Option<(i32, i32)>) -> bool {
     cc.is_some_and(|(major, _)| major == 12)
 }
 
-pub(crate) fn on() -> bool {
-    ON.load(Ordering::Relaxed) && GPU.load(Ordering::Relaxed) && cfg!(feature = "cuda")
+/// Whether the GPU of device `dev` (the weights') takes the ops, asked per device (#1201: a box
+/// may hold GPUs of different architectures); the engine's answer where `dev` is unknown.
+fn gpu_for(dev: Option<usize>) -> bool {
+    gpu_for_by(dev, GPU.load(Ordering::Relaxed), crate::hw::per_device::cc)
 }
 
-/// Whether a router of `n_used` experts for `n` tokens writes the routing plan of the ops'
-/// warp kernels with its ids ([`super::fused::router_planned`]): switched on, a GB10, and a
-/// step the ops take (the plan holds every pair). The ops then launch without building it.
-pub fn plan_fits(n_used: i64, n: i64) -> bool {
-    on() && plan_shape(n_used, n)
+/// [`gpu_for`] with the engine's answer `engine` and the compute capabilities `cc_of` gives.
+fn gpu_for_by(
+    dev: Option<usize>,
+    engine: bool,
+    cc_of: impl FnOnce(usize) -> Option<(i32, i32)>,
+) -> bool {
+    crate::hw::per_device::pick_by(dev, engine, gpu_takes, cc_of)
+}
+
+/// Whether the ops are switched on for the weight `w` (its device's answer, [`gpu_for`]).
+pub(crate) fn on(w: Tensor<'_>) -> bool {
+    ON.load(Ordering::Relaxed) && cfg!(feature = "cuda") && gpu_for(w.cuda_device())
+}
+
+/// Whether a router of `n_used` experts for `n` tokens of the layer with the weight `w` (on the
+/// layer's device) writes the routing plan of the ops' warp kernels with its ids
+/// ([`super::fused::router_planned`]): switched on, a GB10, and a step the ops take (the plan
+/// holds every pair). The ops then launch without building it.
+pub fn plan_fits(w: Tensor<'_>, n_used: i64, n: i64) -> bool {
+    ON.load(Ordering::Relaxed) && plan_shape(n_used, n) && on(w)
 }
 
 /// [`plan_fits`]'s shape check: a step of [`MIN_TOKENS`]..=[`MAX_TOKENS`] tokens and at most
@@ -117,7 +134,7 @@ pub fn plan_shape(n_used: i64, n: i64) -> bool {
 /// Whether [`mul_mat_id`] takes `mul_mat_id(w, x, ids)` times `scale`: switched on, a GB10,
 /// [`fits_shape`] and [`scale_fits`].
 pub fn usable(w: Tensor<'_>, scale: Option<Tensor<'_>>, x: Tensor<'_>, ids: Tensor<'_>) -> bool {
-    on() && fits_shape(w, x, ids) && scale_fits(w, scale)
+    ON.load(Ordering::Relaxed) && fits_shape(w, x, ids) && scale_fits(w, scale) && on(w)
 }
 
 /// Whether [`swiglu_id`] takes the gate and up matmuls `(weight, scale)` of `x`: switched on, a
@@ -128,7 +145,7 @@ pub fn glu_usable(
     x: Tensor<'_>,
     ids: Tensor<'_>,
 ) -> bool {
-    on() && glu_fits(gate, up, x, ids)
+    ON.load(Ordering::Relaxed) && glu_fits(gate, up, x, ids) && on(gate.0)
 }
 
 /// [`glu_usable`]'s shape checks: both weights fit ([`fits_shape`], [`scale_fits`]) with the

@@ -64,14 +64,15 @@ fn m884_flag_for_all_threads_skips_sm80() {
     if !quant_ok() {
         return; // sm_70/75: the flag applies on sm_70 (and sm_75 falls back by its shared memory)
     }
-    // Off again however the test ends: other tests of this process read the flag.
+    // The choice for every thread as this thread alone reads it: the GPU tests running beside
+    // this one keep their default kernel. Off again however the test ends.
     struct Off;
     impl Drop for Off {
         fn drop(&mut self) {
-            set_m884_prefill(false);
+            set_prefill_for_all_here(-1);
         }
     }
-    set_m884_prefill(true);
+    set_prefill_for_all_here(1);
     let _off = Off;
     let before = m884_launches();
     ring_case(&mut backend, 256, 16, 8, 100, 37, &[190], 37, 5e-4);

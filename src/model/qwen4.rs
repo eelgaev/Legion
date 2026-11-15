@@ -25,16 +25,28 @@
 
 pub mod hc;
 mod hc_chain;
+pub mod hc_down;
 pub use hc_chain::set_hc_chain;
 mod hc_mix16;
 pub use hc_mix16::{set_hc_pre, set_mix16, set_rebuild_bf16 as set_mix_rebuild_bf16};
 mod hc_norm;
-pub(crate) use hc_norm::{FoldSum, fold_moe, fold_target, moe_fold};
+pub use hc_norm::lazy_bench as hc_lazy_bench;
+pub(crate) use hc_norm::{
+    FoldSum, compact_plan, fold_moe, fold_target, lazy_fold_target, lazy_parts, lazy_streams,
+    moe_fold, set_compact, set_lazy_fold, set_no_res,
+};
 pub use hc_norm::{
-    hc_fuse, set_fused_post_norm, set_generic_post_norm, set_hc_fuse, set_moe_fold, set_norm_fma,
-    set_streams_bf16, set_xn16, set_xn16_gpu,
+    hc_fuse, set_fused_post_norm, set_generic_post_norm, set_hc_bf16, set_hc_fuse,
+    set_hc_lazy_streams, set_moe_fold, set_norm_fma, set_streams_bf16, set_xn16, set_xn16_gpu,
 };
 mod hc_up_mix;
+pub use hc_up_mix::bench as hc_up_mix_bench;
+#[cfg(feature = "cuda")]
+pub(crate) use hc_up_mix::launch_mix;
+pub(crate) use hc_up_mix::{
+    lazy_mix_target, mix_cast_reads, set_by_exchange as set_mix_by_exchange, set_lazy_streams,
+    set_mix_cast,
+};
 pub use hc_up_mix::{
     set_gpu as set_up_mix_gpu, set_rebuild as set_up_mix_rebuild, set_up_mix, set_up_mix_bf16,
 };
@@ -960,13 +972,15 @@ impl Model {
 
     /// [`Self::hc_combine`] of `pending` (the previous block's output and inject, if any) into
     /// the streams `res`, then the `prefix` mixer with its inject: `(streams, mixed, inject)`.
-    /// On a GPU, in a small step, one op does both (see [`hc`]).
+    /// On a GPU, in a small step, one op does both (see [`hc`]). `bf16`: the step may keep the
+    /// streams in BF16 ([`set_hc_bf16`], #1183; a prompt-only pass).
     fn hc_mix_after<'a>(
         &'a self,
         ctx: &'a Context,
         res: Tensor<'a>,
         pending: Option<(Tensor<'a>, Tensor<'a>)>,
         prefix: &str,
+        bf16: bool,
     ) -> Result<(Tensor<'a>, Tensor<'a>, Tensor<'a>), ModelError> {
         let w = |s: &str| self.w(&format!("{prefix}_{s}.weight"));
         let (norm, down, up, inj) = (w("norm")?, w("down")?, w("up")?, w("inject")?);
@@ -1035,7 +1049,15 @@ impl Model {
                     hc_up_mix::up_mix_rebuilt(ctx, up, lo, p.res, p.scales, norm, hc_n, scale);
                 return Ok((p.res, mixed, p.inject));
             }
-            let res = f32_streams(res);
+            // The BF16 mixers' rebuilt norm below takes this step (sm_80+, the NVFP4
+            // checkpoints): with `bf16` (`--hc-bf16`, #1183) it reads and writes BF16 streams.
+            let xnb_rebuilt = f16.is_some_and(|d| d.ty() == types::BF16)
+                && !hc_mix16::on()
+                && hc_up_mix::rebuild()
+                && hc_up_mix::fits_up_bf16(up, n, hc_n)
+                && hc_norm::rebuild_xnb_fits(res.ne()[0], hc_n, inj.ne()[1], n);
+            let streams16 = bf16 && xnb_rebuilt;
+            let res = if streams16 { res } else { f32_streams(res) };
             // On a V100, the gated mix as one op that also writes the block input as F16, the
             // operand ggml-cuda's cuBLAS GEMMs convert it to in each of its Q8_0 projections, so
             // they take it instead (#774); and, where the norm can write the streams' scales
@@ -1098,12 +1120,30 @@ impl Model {
             // and none more read by the up-mix (the streams in place of xn). `legion serve
             // --hc-xn-written` keeps xn written and read.
             if let Some(down) = f16
-                && down.ty() == types::BF16
-                && hc_up_mix::rebuild()
-                && hc_up_mix::fits_up_bf16(up, n, hc_n)
-                && hc_norm::rebuild_xnb_fits(res.ne()[0], hc_n, inj.ne()[1], n)
+                && xnb_rebuilt
             {
                 let scale = 1.0 / hc_n as f32;
+                // With BF16 streams (`--hc-bf16`) on a GB10, the norm does not write the BF16
+                // xn and the down matmul rebuilds it from the streams (#1183): xn's bits, the
+                // GEMM's sums in another order than cuBLAS's.
+                let [e, _, _, _] = res.ne();
+                if streams16 && hc_down::takes(down, norm, [e, hc_n, n, 1]) {
+                    let p = hc_norm::hc_post_norm_b16_streams(
+                        ctx,
+                        res,
+                        out,
+                        inject,
+                        norm,
+                        inj,
+                        self.hp.rms_eps,
+                        down,
+                    );
+                    let lo = hc_down::mul_mat(ctx, down, p.res, p.scales, norm);
+                    let lo = hc_chain::lo_act(ctx, lo, scale, hc_chain::on_gpu(up));
+                    let mixed =
+                        hc_up_mix::up_mix_rebuilt(ctx, up, lo, p.res, p.scales, norm, hc_n, scale);
+                    return Ok((p.res, mixed, p.inject));
+                }
                 let p = hc_norm::hc_post_norm_rebuilt_xnb(
                     ctx,
                     res,
@@ -1113,6 +1153,7 @@ impl Model {
                     inj,
                     self.hp.rms_eps,
                     down,
+                    streams16,
                 );
                 let lo =
                     hc_chain::lo_act(ctx, ctx.mul_mat(down, p.xnb), scale, hc_chain::on_gpu(up));
@@ -1144,6 +1185,7 @@ impl Model {
                     inj,
                     self.hp.rms_eps,
                     down,
+                    false,
                 );
                 let lo =
                     hc_chain::lo_act(ctx, ctx.mul_mat(down, p.xnb), scale, hc_chain::on_gpu(up));
@@ -1294,6 +1336,9 @@ impl Model {
         // the mixers and combines on those only; each block's input is gathered from every
         // rank's share and its partial output reduce-scattered to them.
         let sp = if tap.on { None } else { self.tp_seq_par(n) };
+        // `--hc-bf16` (#1183): BF16 streams between the mixers, in prompt-only passes without
+        // the sequence-parallel split.
+        let bf16 = hc_norm::hc_bf16() && pass.prompt_only() && sp.is_none() && !tap.on;
         let ple_layer = q4.ple.as_ref().map(|p| p.layer);
         let (mut split, n_all) = (false, n);
         // `--tp-overlap` (#758): the split layers in two micro-batches.
@@ -1304,6 +1349,30 @@ impl Model {
             let res = ctx.reshape_2d(flush(res, p), e * hc.n, res.ne()[2]);
             let res = crate::tp_net::seq_par::all_gather(ctx, c, res, n_all);
             ctx.reshape_3d(res, e, hc.n, n_all)
+        };
+        // A block input `h` gathered from every rank's share for layer `il`'s projection
+        // `name` (its first; the others are of the same kind). Where its columns travel in BF16
+        // and that projection takes a BF16 cast of its input (the NVFP4 checkpoints' BF16
+        // projections, #469), the gather stays BF16 (#1176): the BF16 projections and the
+        // experts read it as that cast, the values they would get from the F32 gather, and only
+        // the F32 readers (the router) widen it, exactly.
+        let gather_in = |h: Tensor<'a>, il: usize, name: &str| {
+            let (c, ..) = sp.expect("sequence parallel");
+            // (This rank's share of `h` has the gathered input's type and rows.)
+            let takes = self
+                .lw(il, name)
+                .is_ok_and(|w| crate::model::core::bf16_join_fits(w, h));
+            let bf16 = takes
+                .then(|| crate::tp_net::seq_par::all_gather_bf16(ctx, c, h, n_all))
+                .flatten();
+            match bf16 {
+                Some(g) => {
+                    let h = ctx.cast(g, types::F32);
+                    ctx.set_shared_cast(h, types::BF16, g);
+                    h
+                }
+                None => crate::tp_net::seq_par::all_gather(ctx, c, h, n_all),
+            }
         };
         for il in layers {
             let want = sp.is_some() && il + 1 < hp.n_layer && ple_layer.is_none_or(|p| p < il);
@@ -1340,11 +1409,14 @@ impl Model {
                 continue;
             }
             let pre = format!("blk.{il}.hc_attn");
-            let (r, h, mut inject) = self.hc_mix_after(ctx, res, pending.take(), &pre)?;
+            let (r, h, mut inject) = self.hc_mix_after(ctx, res, pending.take(), &pre, bf16)?;
             res = r;
-            let h = match sp {
-                Some((c, ..)) if split => crate::tp_net::seq_par::all_gather(ctx, c, h, n),
-                _ => h,
+            let h = if !split {
+                h
+            } else if hp.is_recurrent(il) {
+                gather_in(h, il, "attn_qkv.weight")
+            } else {
+                gather_in(h, il, "attn_q.weight")
             };
             let mut attn = if hp.is_recurrent(il) {
                 self.delta_net(pass, il, h)?
@@ -1367,18 +1439,19 @@ impl Model {
             let attn = self.tp_sum_split(ctx, attn, sp.filter(|_| split));
             pending = Some((attn, inject));
             let pre = format!("blk.{il}.hc_ffn");
-            let (r, h, inject) = self.hc_mix_after(ctx, res, pending.take(), &pre)?;
+            let (r, h, inject) = self.hc_mix_after(ctx, res, pending.take(), &pre, bf16)?;
             res = r;
-            let h = match sp {
-                Some((c, ..)) if split => crate::tp_net::seq_par::all_gather(ctx, c, h, n),
-                _ => h,
+            let h = if split {
+                gather_in(h, il, "ffn_up_shexp.weight")
+            } else {
+                h
             };
             // A paired step's layer shares its experts with the stage GPU's pair (`--pair-tp`).
             let ffn = match self.pair_moe(pass, il, h, n)? {
                 Some(ffn) => ffn,
                 None => {
                     let rows = self.qwen4().moe_rows(pass);
-                    self.moe_rows(ctx, tap, &pass.graph, il, h, n, rows)?
+                    self.moe_rows(ctx, tap, &pass.graph, il, h, n, rows, pass.prompt_only())?
                 }
             };
             let ffn = self.tp_sum_split(ctx, ffn, sp.filter(|_| split));
@@ -1589,10 +1662,20 @@ impl Model {
     }
 
     /// Starts reading the n-gram rows of `tokens`, which follow `before` in a sequence (its
-    /// prompt so far; empty at its start), so that their step finds them read: called with a
-    /// prompt's next chunk while the current one computes. A hint (see
-    /// [`crate::residency::lookup_table::LookupTable::prefetch`]).
+    /// prompt so far; empty at its start), so that their step finds them read: the next step's
+    /// tokens. A hint (see [`crate::residency::lookup_table::LookupTable::prefetch`]).
     pub fn prefetch_ngram(&self, before: &[u32], tokens: &[u32]) {
+        self.prefetch_ngram_for(before, tokens, false);
+    }
+
+    /// [`Self::prefetch_ngram`] of a prompt's next chunk, before the step of its current one:
+    /// that step's fill does not wait for these reads, they run while it computes (see
+    /// [`crate::residency::lookup_table::LookupTable::prefetch_next`]).
+    pub fn prefetch_ngram_next(&self, before: &[u32], tokens: &[u32]) {
+        self.prefetch_ngram_for(before, tokens, true);
+    }
+
+    fn prefetch_ngram_for(&self, before: &[u32], tokens: &[u32], next: bool) {
         let ple = params(&self.hp).and_then(|p| p.ple.as_ref());
         let (Some(ple), Some(store)) = (ple, &self.ngram) else {
             return;
@@ -1613,7 +1696,11 @@ impl Model {
             prev.push(tok);
         }
         let rows: Vec<u32> = rows.iter().map(|&r| r as u32).collect();
-        store.prefetch(&rows);
+        if next {
+            store.prefetch_next(&rows);
+        } else {
+            store.prefetch(&rows);
+        }
     }
 
     /// The store the n-gram rows come from, if one is set.
@@ -1851,10 +1938,15 @@ impl Model {
         };
         let (ctx, n) = (pass.ctx, pass.n);
         let d = q.head_dim;
-        // ggml's matmuls; from the F16 copy of `h` the mixer wrote, where it did (#774).
+        // ggml's matmuls; from the F16 copy of `h` the mixer wrote, where it did (#774), or the
+        // BF16 cast of `h` the step's projections share, where there is one (#1176: a BF16
+        // all-gather of `h`, so the widened `h` need not be written for these).
         let mm = |w: Tensor<'a>| match crate::model::core::f16_joined(ctx, w, h) {
             Some((w16, h16)) => ctx.mul_mat(w16, h16),
-            None => ctx.mul_mat(w, h),
+            None => match crate::model::core::bf16_cast_joined(ctx, w, h) {
+                Some(hb) => ctx.mul_mat(w, hb),
+                None => ctx.mul_mat(w, h),
+            },
         };
         let k_raw = mm(self.lw(il, "indexer.k_proj.weight")?);
         let direct = pass
@@ -2375,6 +2467,12 @@ impl Arch for Qwen4Params {
 
     /// The last layer ends in the final mixer over the output rows.
     fn output_ready(&self) -> bool {
+        true
+    }
+
+    /// Two DGX Sparks, the NVFP4 checkpoint's BF16 head: the same text split, 1 to 16 users
+    /// (#1176).
+    fn head_splits(&self) -> bool {
         true
     }
 

@@ -113,6 +113,36 @@ pub fn set_state_defer_min_seqs(n: usize) {
     STATE_DEFER_MIN_SEQS.store(n, Ordering::Relaxed);
 }
 
+/// The fewest sequences a verify step of a rank of tensor parallelism over machines has for
+/// its commit to be deferred into the next verify step ([`DEFER`], #1176); 0, the default: such
+/// ranks defer none.
+static TP_DEFER_MIN_SEQS: AtomicUsize = AtomicUsize::new(0);
+
+/// Sets the fewest sequences a verify step of the ranks of tensor parallelism over machines
+/// made from now on has for its commit to be deferred (`legion serve
+/// --tp-commit-in-verify-min-seqs`; 0: none).
+pub fn set_tp_commit_in_verify_min_seqs(n: usize) {
+    TP_DEFER_MIN_SEQS.store(n, Ordering::Relaxed);
+}
+
+/// What [`set_tp_commit_in_verify_min_seqs`] set.
+pub fn tp_commit_in_verify_min_seqs() -> usize {
+    TP_DEFER_MIN_SEQS.load(Ordering::Relaxed)
+}
+
+/// `commits` (`(slot, keep)`) as those of the slots whose last verify step stored its inputs in
+/// the packed replay rows (`in_rows[slot]`), which a pool with both stores
+/// ([`SpecPool::new_layers_wide`]) defers, and the others, which it runs in the commit.
+fn split_by_store(
+    in_rows: &[bool],
+    commits: &[(usize, usize)],
+) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    commits
+        .iter()
+        .copied()
+        .partition(|&(slot, _)| in_rows[slot])
+}
+
 /// Whether deferring pools made now let verify steps leave the states ([`STATE_DEFER`]).
 fn state_defer() -> bool {
     STATE_DEFER.load(Ordering::Relaxed) == 1
@@ -237,6 +267,13 @@ pub struct SpecPool {
     pending: Mutex<pending::Pending>,
     /// The deferred commit graph does not fit (found once, by a build): commits run as usual.
     defer_unfit: AtomicBool,
+    /// A pool with both stores ([`Self::new_layers_wide`]): the fewest sequences a verify step
+    /// has to replay and store in the packed rows. 0 for any other pool (every verify step of a
+    /// deferring pool does).
+    replay_min: usize,
+    /// Per slot of a pool with both stores: its last verify step stored its inputs in the packed
+    /// rows (its commit is deferred), not in the layers' own tensors (its commit runs at once).
+    in_rows: Mutex<Vec<bool>>,
 }
 
 /// The stored tensors of one layer.
@@ -280,6 +317,24 @@ impl SpecPool {
         stage: std::ops::Range<usize>,
         may_defer: bool,
     ) -> Result<Self, GgmlError> {
+        Self::new_layers_wide(hp, buft, n_slots, max_tokens, stage, may_defer, 0)
+    }
+
+    /// [`Self::new_layers`] for a rank of tensor parallelism over machines (#1176). With
+    /// `replay_min` above 0, a pool that would defer has both stores: the layers' own q, k, v, g
+    /// and beta, which verify steps of fewer than `replay_min` sequences store and whose commits
+    /// run at once (graphs and kernels of a pool that does not defer), and the packed replay
+    /// rows, which wider verify steps replay and store ([`Self::replays`]) and whose commits are
+    /// deferred. Each slot's commit follows its last verify step ([`Self::split_commits`]).
+    pub fn new_layers_wide(
+        hp: &Hparams,
+        buft: BufferType,
+        n_slots: usize,
+        max_tokens: usize,
+        stage: std::ops::Range<usize>,
+        may_defer: bool,
+        replay_min: usize,
+    ) -> Result<Self, GgmlError> {
         let n_slots = n_slots.max(1);
         let max_tokens = max_tokens.max(1);
         let layers: Vec<usize> = stage
@@ -293,6 +348,8 @@ impl SpecPool {
         let (t, s) = (max_tokens as i64, n_slots as i64);
         let kda = hp.arch.recurrent() == Recurrent::Kda;
         let defer = may_defer && Self::defers_layers(hp) && !layers.is_empty();
+        // Both stores: the own tensors beside the packed rows.
+        let both = defer && replay_min > 0;
         // Verify steps that may leave the states keep the waiting tokens of more rounds in the
         // packed rows (#836).
         let extra = if defer {
@@ -318,10 +375,12 @@ impl SpecPool {
             new("conv", &[hp.ssm_d_conv - 1 + t, conv_dim, s]);
             let a_qk = hp.ssm_d_state * hp.ssm_n_group;
             let widths = [a_qk, a_qk, head_v * n_v, n_v, n_v];
-            if !defer {
+            if !defer || both {
                 for (name, w) in ["q", "k", "v", "g", "beta"].into_iter().zip(widths) {
                     new(name, &[w, t, s]);
                 }
+            }
+            if !defer {
                 continue;
             }
             // Deferred commits keep the inputs packed per token only (#836 part 38), as the
@@ -332,6 +391,9 @@ impl SpecPool {
             let r = ctx
                 .new_tensor(types::F32, &[row, rows, s])
                 .named(&format!("spec_r-{il}"));
+            if both {
+                continue;
+            }
             let nb = r.nb();
             let mut off = 0;
             for (name, w) in ["q", "k", "v", "g", "beta"].into_iter().zip(widths) {
@@ -360,7 +422,7 @@ impl SpecPool {
         // Committing never reads rows a verify step did not write, but keep them finite.
         ctx.clear_buffers(0);
         // The verify step's delta rule reads them on a GPU only.
-        let packed = defer;
+        let packed = defer && !both;
         let defer = defer
             && ctx
                 .tensor("spec_pending")
@@ -390,6 +452,8 @@ impl SpecPool {
                     .leave_from(STATE_DEFER_MIN_SEQS.load(Ordering::Relaxed)),
             ),
             defer_unfit: AtomicBool::new(false),
+            replay_min: if both && defer { replay_min } else { 0 },
+            in_rows: Mutex::new(vec![false; n_slots]),
         })
     }
 
@@ -464,7 +528,9 @@ impl SpecPool {
         let pending = i64::from(Self::defers_layers(hp) && n_rec > 0);
         // Verify steps that may leave the states: rows for more rounds' kept tokens (#836).
         let extra = Self::leave_rows(hp, max_tokens) as i64;
-        let rows = (t + extra) * per_token;
+        // A pool with both stores ([`Self::new_layers_wide`]): the inputs once more.
+        let both = i64::from(pending == 1 && tp_commit_in_verify_min_seqs() > 0);
+        let rows = (t + extra + both * t) * per_token;
         (4 * (n_rec * ((hp.ssm_d_conv - 1 + t) * conv_dim + rows) + ple + pending)) as usize
     }
 
@@ -922,6 +988,31 @@ impl SpecPool {
         self.packed
     }
 
+    /// Whether a verify step of `n` sequences replays its slots' deferred commits and stores
+    /// its inputs in the packed replay rows ([`Self::replay_views`]): any of a pool that defers,
+    /// those of at least its floor where it has both stores ([`Self::new_layers_wide`]).
+    pub fn replays(&self, n: usize) -> bool {
+        self.defer && n >= self.replay_min
+    }
+
+    /// Before a verify step over `slots` that does not replay ([`Self::replays`]): their
+    /// commits run at once, from the layers' own tensors.
+    pub fn plain_verify(&self, slots: std::ops::Range<usize>) {
+        if self.replay_min > 0 {
+            self.in_rows.lock().unwrap()[slots].fill(false);
+        }
+    }
+
+    /// For a pool with both stores ([`Self::new_layers_wide`]): `commits` as those to defer
+    /// ([`Self::commit_deferred`]) and those to run at once ([`Self::commit`]), by each slot's
+    /// last verify step. `None` for any other pool, whose commits all go one way.
+    pub fn split_commits(
+        &self,
+        commits: &[(usize, usize)],
+    ) -> Option<(Vec<(usize, usize)>, Vec<(usize, usize)>)> {
+        (self.replay_min > 0).then(|| split_by_store(&self.in_rows.lock().unwrap(), commits))
+    }
+
     /// Layer `il`'s packed replay rows ([`DEFER`]), `[row, max_tokens, slots]`.
     fn replay_tensor(&self, il: usize) -> Tensor<'_> {
         self.ctx
@@ -939,7 +1030,8 @@ impl SpecPool {
     /// A verify group's view of the deferred commits of slots `slot..slot + n` in layer `il`
     /// ([`super::gdn::rows_replay`]): their counts (I32 `[n]`), packed rows (`[row,
     /// max_tokens, n]`), and the pool's counters with the group's first slot (the tensor itself,
-    /// not a view: a view would be one more graph node). `None` when the pool does not defer.
+    /// not a view: a view would be one more graph node). `None` when the pool does not defer, or
+    /// not for a step this narrow ([`Self::replays`]).
     pub fn replay_views<'a>(
         &'a self,
         ctx: &'a Context,
@@ -947,7 +1039,7 @@ impl SpecPool {
         slot: usize,
         n: usize,
     ) -> Option<(Tensor<'a>, Tensor<'a>, (Tensor<'a>, usize))> {
-        if !self.defer {
+        if !self.replays(n) {
             return None;
         }
         self.check(slot, 1, n as i64);
@@ -1056,6 +1148,9 @@ impl SpecPool {
     ) {
         if !self.defer {
             return;
+        }
+        if self.replay_min > 0 {
+            self.in_rows.lock().unwrap()[slots.clone()].fill(true);
         }
         let up = self.pending.lock().unwrap().verify(slots, n_tok);
         if let Some(counts) = up {

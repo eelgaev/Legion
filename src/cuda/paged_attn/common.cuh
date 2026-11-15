@@ -25,6 +25,8 @@
 //   same kernel split over the key blocks as decode is, and a combine kernel (#697).
 // - prefill with LEGION_PREFILL_M884 (opt-in; meant for sm_70): one pass with an online softmax
 //   on mma.sync m8n8k4 (paged_prefill_m884, described where it is defined).
+// - prefill with LEGION_PREFILL_FFMA (opt-in; meant for Turing without tensor cores): one pass
+//   with an online softmax on FP32 FMAs (paged_prefill_ffma, described where it is defined).
 // - prefill on sm_70 and sm_75 otherwise: tensor cores through the portable WMMA API. A CTA takes 64
 //   query rows (64 / G tokens times the G query heads of one kv head) and walks the key blocks
 //   twice: first for each row's softmax max and sum, then to accumulate exp(s - max) / sum
@@ -32,7 +34,9 @@
 //   per-row rescaling of WMMA accumulators, whose element layout the API does not expose.
 //   Given a split scratch (an MTP head's take-in pass, whose last rows alone are read), the
 //   last token's rows of the same kernel come split over the key blocks instead, the same bits
-//   (sm70/paged_split.cuh).
+//   (sm70/paged_split.cuh); given one for all rows (vsplit_chunk > 0: speculative verify steps
+//   and other groups of 2 to 16 tokens per sequence), every row of the same kernel split over the
+//   key blocks, the same bits (sm70/paged_vsplit.cuh, #1211).
 //
 // Both prefill kernels round Q and P to F16 for the MMA (as cuBLAS does for the plain mul_mat
 // path); scores, softmax and the output accumulate in F32. On Volta, Turing and consumer
@@ -43,7 +47,7 @@
 // mma.sync kernel keeps its chains to 16 K steps or fewer the same way.
 //
 // The per-architecture prefill kernels live in sm80/paged_attn.cuh (paged_prefill_mma) and
-// sm70/paged_attn.cuh (paged_prefill_m884), included below; `launch` picks one per device at run
+// sm70/paged_attn.cuh (paged_prefill_m884) and sm75/paged_attn.cuh (paged_prefill_ffma), included below; `launch` picks one per device at run
 // time. Decode and the WMMA prefill are portable and stay here, the tiered-pool pieces in
 // dispatch.cu.
 //
@@ -108,6 +112,11 @@ struct legion_paged_attn {
     // (v_stage points into k_stage at V's offset). 0 for every other cache.
     int32_t compact;
     int64_t head_stride;
+    // > 0 with `split` (2 to 16 tokens per sequence): every row of the group comes split over
+    // the key blocks instead of the last token's (sm70/paged_vsplit.cuh, #1211), the WMMA
+    // kernel's bits, with the weights of this many key blocks at a time in the scratch (its size
+    // is paged::wmma_split_plan on the Rust side).
+    int32_t vsplit_chunk;
 };
 
 enum { LEGION_KV_F16 = 0, LEGION_KV_Q8_0 = 1, LEGION_KV_Q4_0 = 2 };
@@ -117,15 +126,35 @@ enum { LEGION_KV_F16 = 0, LEGION_KV_Q8_0 = 1, LEGION_KV_Q4_0 = 2 };
 int legion_paged_attn_quant_ok(void);
 
 // Prefill kernel choice: LEGION_PREFILL_AUTO (sm_80+: paged_prefill_mma; sm_70/75: the WMMA
-// kernel) or LEGION_PREFILL_M884 (the m8n8k4 one-pass kernel, F16 caches). Set for all threads
-// (`this_thread` 0), M884 applies on sm_70 devices only, AUTO elsewhere (sm_75 lacks its shared
-// memory, sm_80+ would run m8n8k4 emulated). Set for the calling thread (`this_thread` > 0,
-// tests), it applies on any GPU from sm_70.
-enum { LEGION_PREFILL_AUTO = 0, LEGION_PREFILL_M884 = 1 };
+// kernel), LEGION_PREFILL_M884 (the m8n8k4 one-pass kernel, F16 caches) or LEGION_PREFILL_FFMA
+// (the FP32 FMA one-pass kernel, F16 caches, prefill launches without a split scratch). Set
+// for all threads (`this_thread` 0), M884 applies on sm_70 devices only, FFMA on sm_75 ones
+// only (the caller sets it for those without tensor cores), AUTO elsewhere (sm_75 lacks M884's
+// shared memory, sm_80+ would run m8n8k4 emulated). Set for the calling thread (`this_thread`
+// 1, tests), it applies on any GPU from sm_70. `this_thread` 2 (tests of the all-threads
+// choice): the calling thread reads `kernel` in place of the all-threads choice, with its
+// per-architecture limits, and the other threads keep theirs (-1 ends it).
+enum { LEGION_PREFILL_AUTO = 0, LEGION_PREFILL_M884 = 1, LEGION_PREFILL_FFMA = 2 };
 void legion_paged_attn_set_prefill(int kernel, int this_thread);
 
 // Prefill launches of the m8n8k4 kernel from the calling thread so far (tests).
 int64_t legion_paged_attn_m884_launches(void);
+
+// Prefill launches of the FP32 FMA kernel from the calling thread so far (tests).
+int64_t legion_paged_attn_ffma_launches(void);
+
+// Launches of the WMMA kernel's all-row split (vsplit, #1211) from the calling thread so far.
+int64_t legion_paged_attn_vsplit_launches(void);
+
+// Whether prefill groups on compute capability 12.x take the queries-as-M kernel
+// (sm80/paged_attn_qm.cuh, the same bits as paged_prefill_mma) where it covers them and its grid
+// is faster (fa_qm::pays): `on` 1 (the default) or 0, or 2 (benches) for every group it covers,
+// for all threads (`this_thread` 0) or for the calling thread only (`this_thread` 1, tests and
+// benches; -1 ends it).
+void legion_paged_attn_set_qm(int on, int this_thread);
+
+// Launches of the queries-as-M kernel from the calling thread so far.
+int64_t legion_paged_attn_qm_launches(void);
 
 // Whether prefill launches on the current device take the WMMA kernel, which a split scratch
 // (legion_paged_attn::split) replaces for the last token's rows: sm_70 / sm_75 without the
@@ -145,12 +174,18 @@ int legion_paged_attn_piece(const legion_paged_attn * p, int32_t hbm_blocks, int
 
 }  // extern "C"
 
-// The prefill kernel choice and the m8n8k4 launch count (legion_paged_attn_set_prefill), one
-// copy for every translation unit: defined in dispatch.cu.
+// The prefill kernel choice and the m8n8k4 and FFMA launch counts (legion_paged_attn_set_prefill),
+// one copy for every translation unit: defined in dispatch.cu.
 namespace legion_paged {
 extern int g_prefill;
 extern thread_local int t_prefill;
+extern thread_local int t_prefill_all;
 extern thread_local int64_t t_m884_launches;
+extern thread_local int64_t t_ffma_launches;
+extern thread_local int64_t t_vsplit_launches;
+extern int g_qm;
+extern thread_local int t_qm;
+extern thread_local int64_t t_qm_launches;
 }  // namespace legion_paged
 
 namespace {
@@ -159,11 +194,27 @@ constexpr int BLK = 64;  // positions per KV block (KV_BLOCK on the Rust side)
 
 using legion_paged::g_prefill;
 using legion_paged::t_prefill;
+using legion_paged::t_prefill_all;
 using legion_paged::t_m884_launches;
+using legion_paged::t_ffma_launches;
+using legion_paged::t_vsplit_launches;
+using legion_paged::t_qm_launches;
+
+// The queries-as-M prefill kernel's mode for the calling thread (legion_paged_attn_set_qm): 0
+// off, 1 on where it takes the op, 2+ (benches) on for every group it covers.
+int qm_mode() {
+    return legion_paged::t_qm >= 0 ? legion_paged::t_qm : __atomic_load_n(&legion_paged::g_qm, __ATOMIC_RELAXED);
+}
 
 // Whether the current device is sm_70 (cached per device).
 bool device_is_sm70() {
     return legion_device::compute_capability() == 70;
+}
+
+// The all-threads prefill choice as the calling thread reads it (see
+// legion_paged_attn_set_prefill).
+int prefill_for_all() {
+    return t_prefill_all >= 0 ? t_prefill_all : __atomic_load_n(&g_prefill, __ATOMIC_RELAXED);
 }
 
 // Whether prefill launches take the m8n8k4 kernel (see legion_paged_attn_set_prefill).
@@ -171,7 +222,15 @@ bool use_m884() {
     if (t_prefill >= 0) {
         return t_prefill == LEGION_PREFILL_M884;
     }
-    return __atomic_load_n(&g_prefill, __ATOMIC_RELAXED) == LEGION_PREFILL_M884 && device_is_sm70();
+    return prefill_for_all() == LEGION_PREFILL_M884 && device_is_sm70();
+}
+
+// Whether prefill launches take the FP32 FMA kernel (see legion_paged_attn_set_prefill).
+bool use_ffma() {
+    if (t_prefill >= 0) {
+        return t_prefill == LEGION_PREFILL_FFMA;
+    }
+    return prefill_for_all() == LEGION_PREFILL_FFMA && legion_device::compute_capability() == 75;
 }
 
 // The first cell of the block holding positions b * BLK .. of a sequence whose table is `tab`.
@@ -582,22 +641,33 @@ __device__ __forceinline__ void mma_acc(AccFrag & acc, const FA & a, const FB & 
     }
 }
 
-template <int D>
+// ROWS query rows a CTA: 64, or 32 where 64 rows' tiles do not fit the device's shared memory
+// (head size 512 on Turing's 64 KB a block: 93,184 bytes against 46,592).
+template <int D, int ROWS = 64>
 struct PrefillSmem {
     static constexpr int QLD = D + 8;    // halves
     static constexpr int SLD = BLK + 4;  // floats
     static constexpr int PLD = BLK + 8;  // halves
     static constexpr size_t Q    = 0;
-    static constexpr size_t S    = Q + 64 * QLD * sizeof(half);
-    static constexpr size_t P    = S + 64 * SLD * sizeof(float);
-    static constexpr size_t SIZE = P + 64 * PLD * sizeof(half);
+    static constexpr size_t S    = Q + ROWS * QLD * sizeof(half);
+    static constexpr size_t P    = S + ROWS * SLD * sizeof(float);
+    static constexpr size_t SIZE = P + ROWS * PLD * sizeof(half);
 };
 
-template <int D, int G, bool C = false>
+// ROWS (64 or 32) query rows of one kv head a CTA, 8 warps: RT row tiles of 16 rows, each split
+// over 8 / RT warps by key columns (S) and output dims (P V). Every 16 x 16 tile of S and of
+// the output sums the same products in the same order whatever warp computes it, and the
+// softmax keeps four threads a row (the threads past ROWS rows idle there), so 32 rows give
+// the 64-row kernel's bits: a CTA's extra masked key blocks add exact zeros.
+template <int D, int G, bool C = false, int ROWS = 64>
 __global__ void __launch_bounds__(256) paged_prefill(const legion_paged_attn p) {
-    using L = PrefillSmem<D>;
-    constexpr int QT = 64 / G;  // tokens per CTA
-    constexpr int DH = D / 2;   // output dims per warp
+    static_assert(ROWS == 64 || ROWS == 32, "64 or 32 query rows a CTA");
+    using L = PrefillSmem<D, ROWS>;
+    constexpr int QT = ROWS / G;     // tokens per CTA
+    constexpr int RT = ROWS / 16;    // row tiles
+    constexpr int CW = 8 / RT;       // warps a row tile
+    constexpr int SW = BLK / CW;     // key columns a warp (S)
+    constexpr int DH = D / CW;       // output dims a warp
     extern __shared__ __align__(128) unsigned char smem[];
     half  * qs = (half *) (smem + L::Q);
     float * ss = (float *) (smem + L::S);
@@ -605,8 +675,8 @@ __global__ void __launch_bounds__(256) paged_prefill(const legion_paged_attn p) 
 
     const int t0 = blockIdx.x * QT, kvh = blockIdx.y, seq = blockIdx.z;
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int rw = warp % 4;  // row tile: rows 16 * rw ..
-    const int dh = warp / 4;  // half: key columns for S, output dims for P V
+    const int rw = warp % RT;  // row tile: rows 16 * rw ..
+    const int dh = warp / RT;  // part: key columns for S, output dims for P V
     const int n_past = p.n_past[seq];
     const int t_last = min(t0 + QT, p.n_tok) - 1;
     const int nblk = (n_past + t_last) / BLK + 1;
@@ -618,8 +688,8 @@ __global__ void __launch_bounds__(256) paged_prefill(const legion_paged_attn p) 
     }
 
     // Q rows: r = token_in_tile * G + head_in_group, as F16; rows past n_tok are zero, and so
-    // are the rows past QT * G when G does not divide 64 (e.g. 12: 5 tokens, 60 rows).
-    for (int i = threadIdx.x; i < 64 * D; i += blockDim.x) {
+    // are the rows past QT * G when G does not divide ROWS (e.g. 12: 5 tokens, 60 rows).
+    for (int i = threadIdx.x; i < ROWS * D; i += blockDim.x) {
         const int r = i / D, c = i % D;
         const int t = t0 + r / G;
         float x = 0.0f;
@@ -631,33 +701,37 @@ __global__ void __launch_bounds__(256) paged_prefill(const legion_paged_attn p) 
     }
     __syncthreads();
 
-    // S = Q K^T for walk entry i: this warp's 16 rows x 32 key columns, into ss.
+    // S = Q K^T for walk entry i: this warp's 16 rows x SW key columns, into ss.
     auto scores = [&](int i) {
         const half * kblk = (const half *) wk.cells(p.k, p.k_stage, i, p.k_cell) + head_at<D, C>(p, kvh);
-        AccFrag acc[2];
-        wmma::fill_fragment(acc[0], 0.0f);
-        wmma::fill_fragment(acc[1], 0.0f);
+        AccFrag acc[SW / 16];
+#pragma unroll
+        for (int n = 0; n < SW / 16; n++) {
+            wmma::fill_fragment(acc[n], 0.0f);
+        }
 #pragma unroll 4
         for (int k = 0; k < D / 16; k++) {
             wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
             wmma::load_matrix_sync(a, qs + rw * 16 * L::QLD + k * 16, L::QLD);
 #pragma unroll
-            for (int n = 0; n < 2; n++) {
+            for (int n = 0; n < SW / 16; n++) {
                 wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> kb;
-                const int col = dh * 32 + n * 16;
+                const int col = dh * SW + n * 16;
                 wmma::load_matrix_sync(kb, kblk + (int64_t) col * p.kv_row + k * 16, p.kv_row);
                 mma_acc(acc[n], a, kb);
             }
         }
 #pragma unroll
-        for (int n = 0; n < 2; n++) {
-            wmma::store_matrix_sync(ss + rw * 16 * L::SLD + dh * 32 + n * 16, acc[n], L::SLD,
+        for (int n = 0; n < SW / 16; n++) {
+            wmma::store_matrix_sync(ss + rw * 16 * L::SLD + dh * SW + n * 16, acc[n], L::SLD,
                                     wmma::mem_row_major);
         }
     };
 
-    // Four threads per row, 16 columns each.
+    // Four threads per row, 16 columns each; with 32 rows, warps 4-7 hold no row (whole warps,
+    // so the rows' shuffles stay within active warps).
     const int r = threadIdx.x / 4, part = threadIdx.x % 4;
+    const bool row_on = ROWS == 64 || r < ROWS;
     const int limit = n_past + t0 + r / G;  // last visible key of row r
     const int lo    = first_key(limit, p.window);  // first visible key of row r
 
@@ -667,30 +741,32 @@ __global__ void __launch_bounds__(256) paged_prefill(const legion_paged_attn p) 
         const int b = wk.block(i);
         scores(i);
         __syncthreads();
-        float x[16];
-        float mx = -INFINITY;
+        if (row_on) {
+            float x[16];
+            float mx = -INFINITY;
 #pragma unroll
-        for (int i = 0; i < 16; i++) {
-            const int c = part * 16 + i;
-            const int k = b * BLK + c;
-            x[i] = k <= limit && k >= lo ? ss[r * L::SLD + c] * p.scale : -INFINITY;
-            mx = fmaxf(mx, x[i]);
-        }
-        mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 1));
-        mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 2));
-        const float m_new = fmaxf(m, mx);
-        // A row with no visible key yet keeps m = -inf (with a sliding window, a row whose
-        // window starts in a later block); exp against 0 then gives 0 instead of NaN.
-        const float m_use = m_new == -INFINITY ? 0.0f : m_new;
-        float sum = 0.0f;
+            for (int i = 0; i < 16; i++) {
+                const int c = part * 16 + i;
+                const int k = b * BLK + c;
+                x[i] = k <= limit && k >= lo ? ss[r * L::SLD + c] * p.scale : -INFINITY;
+                mx = fmaxf(mx, x[i]);
+            }
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 1));
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 2));
+            const float m_new = fmaxf(m, mx);
+            // A row with no visible key yet keeps m = -inf (with a sliding window, a row whose
+            // window starts in a later block); exp against 0 then gives 0 instead of NaN.
+            const float m_use = m_new == -INFINITY ? 0.0f : m_new;
+            float sum = 0.0f;
 #pragma unroll
-        for (int i = 0; i < 16; i++) {
-            sum += expf(x[i] - m_use);
+            for (int i = 0; i < 16; i++) {
+                sum += expf(x[i] - m_use);
+            }
+            sum += __shfl_xor_sync(0xffffffff, sum, 1);
+            sum += __shfl_xor_sync(0xffffffff, sum, 2);
+            l = l * expf(m - m_use) + sum;
+            m = m_new;
         }
-        sum += __shfl_xor_sync(0xffffffff, sum, 1);
-        sum += __shfl_xor_sync(0xffffffff, sum, 2);
-        l = l * expf(m - m_use) + sum;
-        m = m_new;
         __syncthreads();
     }
     const float inv_l = 1.0f / l;
@@ -706,12 +782,14 @@ __global__ void __launch_bounds__(256) paged_prefill(const legion_paged_attn p) 
         const half * vblk = (const half *) wk.cells(p.v, p.v_stage, i, p.v_cell) + head_at<D, C>(p, kvh);
         scores(i);
         __syncthreads();
+        if (row_on) {
 #pragma unroll
-        for (int i = 0; i < 16; i++) {
-            const int c = part * 16 + i;
-            const int k = b * BLK + c;
-            const float w = k <= limit && k >= lo ? expf(ss[r * L::SLD + c] * p.scale - m) * inv_l : 0.0f;
-            ps[r * L::PLD + c] = __float2half(w);
+            for (int i = 0; i < 16; i++) {
+                const int c = part * 16 + i;
+                const int k = b * BLK + c;
+                const float w = k <= limit && k >= lo ? expf(ss[r * L::SLD + c] * p.scale - m) * inv_l : 0.0f;
+                ps[r * L::PLD + c] = __float2half(w);
+            }
         }
         __syncthreads();
 #pragma unroll
@@ -732,7 +810,7 @@ __global__ void __launch_bounds__(256) paged_prefill(const legion_paged_attn p) 
     // P buffer, free now), from the row's thread of part 0.
     float2 * mf = (float2 *) ps;
     if (p.ml) {
-        if (part == 0) {
+        if (part == 0 && row_on) {
             const int t = t0 + r / G;
             if (r < QT * G && t < p.n_tok) {
                 const int64_t row = ((int64_t) seq * p.n_tok + t) * p.n_head + kvh * G + r % G;
@@ -770,11 +848,20 @@ __global__ void __launch_bounds__(256) paged_prefill(const legion_paged_attn p) 
 // Prefill on sm_80+: mma.sync m16n8k16 + cp.async, namespace fa.
 #include "../sm80/paged_attn.cuh"
 
+// Prefill on compute capability 12.x, queries as the MMA's M: namespace fa_qm (#1133).
+#include "../sm80/paged_attn_qm.cuh"
+
 // Prefill on sm_70 (Volta): mma.sync m8n8k4, namespace v70.
 #include "../sm70/paged_attn.cuh"
 
+// Prefill on Turing without tensor cores: FP32 FMAs, namespace tu75 (#1214).
+#include "../sm75/paged_attn.cuh"
+
 // The WMMA kernel's last-token rows split over the key blocks, namespace split (#436).
 #include "../sm70/paged_split.cuh"
+
+// The WMMA kernel's rows of a 2-16-token group split over the key blocks, namespace vsplit (#1211).
+#include "../sm70/paged_vsplit.cuh"
 
 template <int D, int G, bool C = false>
 int launch(const legion_paged_attn & p, cudaStream_t st) {
@@ -788,22 +875,55 @@ int launch(const legion_paged_attn & p, cudaStream_t st) {
                                   : -1;
                rc >= 0) {
         return rc;
+    } else if (const int rc = use_ffma() && p.k_type == LEGION_KV_F16 && p.v_type == LEGION_KV_F16 && !p.split
+                                  ? tu75::launch<D, G, C>(p, st)
+                                  : -1;
+               rc >= 0) {
+        return rc;  // -1: Q's rows unaligned, the default kernels instead
     } else if (fa::available()) {
         // A split scratch (--paged-verify-split): small groups split over the key blocks.
         if (p.max_split > 1 && !p.piece_blk && !p.ml) {
             return fa::launch_split<D, G, C>(p, st);
         }
+        // Heads of 256 on compute capability 12.x: queries as M where it covers the op, the same
+        // bits (-1: no shared memory for it, paged_prefill_mma instead).
+        if constexpr (D == 256 && !C) {
+            if (fa_qm::takes<D, G>(p)) {
+                if (const int rc = fa_qm::launch<D, G>(p, st); rc >= 0) {
+                    return rc;
+                }
+            }
+        }
         return fa::launch<D, G, C>(p, st);
     } else if (p.k_type != LEGION_KV_F16 || p.v_type != LEGION_KV_F16) {
         return 1;  // the WMMA kernel reads F16 only (legion_paged_attn_quant_ok)
-    } else if (p.split && p.split_seqs > 0 && !p.piece_blk) {
+    } else if (p.split && p.split_seqs > 0 && !p.piece_blk && p.vsplit_chunk == 0) {
         return split::launch<D, G, C>(p, st);
+    } else if (const int rc = p.split && p.split_seqs > 0 && !p.piece_blk && !p.ml && p.vsplit_chunk > 0
+                                  ? vsplit::launch<D, G, C>(p, st)
+                                  : -1;
+               rc >= 0) {
+        return rc;  // -1: the device lacks the kernels' shared memory, the WMMA kernel instead
     } else {
         constexpr size_t smem = PrefillSmem<D>::SIZE;
         // Per device, once (the attribute is per function and device).
         static std::atomic<int8_t> opted_in[GGML_CUDA_MAX_DEVICES];
         if (!legion_device::smem_opt_in(opted_in, paged_prefill<D, G, C>, (int) smem)) {
-            return 2;
+            // 64 rows' tiles past the device's shared memory a block (head size 512 on Turing's
+            // 64 KB): 32 rows a CTA, the same bits.
+            if constexpr (smem > 64 * 1024) {
+                constexpr size_t smem32 = PrefillSmem<D, 32>::SIZE;
+                static std::atomic<int8_t> opted_in32[GGML_CUDA_MAX_DEVICES];
+                if (!legion_device::smem_opt_in(opted_in32, paged_prefill<D, G, C, 32>, (int) smem32)) {
+                    return 2;
+                }
+                constexpr int QT32 = 32 / G;
+                paged_prefill<D, G, C, 32>
+                    <<<dim3((p.n_tok + QT32 - 1) / QT32, p.n_head_kv, p.n_seqs), 256, smem32, st>>>(p);
+                return cudaGetLastError() == cudaSuccess ? 0 : 2;
+            } else {
+                return 2;
+            }
         }
         constexpr int QT = 64 / G;
         paged_prefill<D, G, C><<<dim3((p.n_tok + QT - 1) / QT, p.n_head_kv, p.n_seqs), 256, smem, st>>>(p);

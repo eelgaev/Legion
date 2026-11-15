@@ -142,16 +142,11 @@ pub fn gpu_sms() -> i32 {
     GPU_SMS.load(Ordering::Relaxed)
 }
 
-/// The SMs of `w`'s GPU where the op runs there, else 0: the engine's GPU is one it runs on
-/// ([`gpu_sms`]) and so is the weight's own device (asked once per device: a box may hold GPUs
-/// of different architectures, #1201), whose SM count ggml's split is planned for.
+/// The SMs of `w`'s GPU where the op runs there (compute capability 12.x), else 0: asked once
+/// per device (a box may hold GPUs of different architectures, #1201), whose SM count ggml's
+/// split is planned for; the engine's GPU's ([`gpu_sms`]) where the weight names no device.
 fn sms_for(w: Tensor<'_>) -> i32 {
-    let engine = gpu_sms();
-    if engine <= 0 {
-        return 0;
-    }
-    w.cuda_device()
-        .map_or(engine, crate::hw::per_device::sms_if_cc12)
+    crate::hw::per_device::sms_if_cc12_on(w.cuda_device(), gpu_sms())
 }
 
 /// ggml-cuda's MMQ tile width for a Q8_0 weight of `rows` rows times `n` columns

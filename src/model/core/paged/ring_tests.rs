@@ -4,7 +4,7 @@
 //! overwriting the ring entries of earlier ones), and the cases put chunk starts, chunk ends
 //! and decode positions on and around block boundaries and ring wraps.
 
-use super::tests::{Shape, f16_bytes, noise, oracle};
+use super::tests::{Shape, f16_bytes, max_abs_diff, noise, oracle};
 use super::*;
 use crate::ggml::{Backend, ComputeAllocator};
 use crate::model::core::{KV_BLOCK, KvRing};
@@ -152,11 +152,7 @@ pub(super) fn ring_case(
         window,
     };
     let want = oracle(&sh, &qv, &k_full, &v_full, n_past, &tables);
-    let diff = a
-        .iter()
-        .zip(&want)
-        .map(|(x, y)| (x - y).abs())
-        .fold(0f32, f32::max);
+    let diff = max_abs_diff(&a, &want);
     assert!(diff < tol, "{label}: max |ring - oracle| {diff}");
 }
 

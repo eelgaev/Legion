@@ -126,6 +126,9 @@ struct Stage {
     /// Pinned host memory a step's smaller captured rows (a decode or verify step's) are read
     /// back through ([`read_rows`]).
     bounce_small: Option<Context>,
+    /// Pinned host memory a step's argmaxes and logits rows are read back through
+    /// ([`Inputs::output_with`]).
+    ids_pin: Option<Context>,
     /// Pinned host memory the MTP passes' inputs and outputs go through (the last stage's,
     /// [`mtp_window`]), and a decode or verify step's inputs ([`step_fill`]).
     mtp_io: PinnedIo,
@@ -175,6 +178,7 @@ impl Stage {
             bounce: None,
             bounce_b: None,
             bounce_small: None,
+            ids_pin: None,
             mtp_io: PinnedIo::default(),
             flow_io: PinnedIo::default(),
             flow_io_b: PinnedIo::default(),
@@ -314,6 +318,47 @@ fn write_rows(bounce: &mut Option<Context>, backend: &Backend, t: Tensor<'_>, pa
     }
 }
 
+/// Writes `host` and then the device rows `rows` one after another into input `t` (F32, as
+/// many bytes) of a graph on `backend` (#1183): the host part set right away (a row or so),
+/// the rows copied on the backend's stream, ahead of the graph queued after. A `t` that is not
+/// a plain F32 matrix takes the rows through the host.
+fn write_rows_dev(backend: &Backend, t: Tensor<'_>, host: &[&[f32]], rows: &crate::ggml::RowsAt) {
+    let host_bytes: usize = host.iter().map(|p| std::mem::size_of_val(*p)).sum();
+    assert_eq!(
+        host_bytes + rows.nbytes(),
+        t.nbytes(),
+        "input `{}`: host and device rows",
+        t.name()
+    );
+    let mut at = 0;
+    for p in host {
+        t.set_bytes_at(at, as_bytes_f32(p));
+        at += std::mem::size_of_val(*p);
+    }
+    let row_bytes = rows.width * std::mem::size_of::<f32>();
+    match t.rows_at() {
+        Some(dst) if dst.width == rows.width && at % row_bytes == 0 => {
+            let dst = dst.slice(at / row_bytes, rows.rows);
+            // SAFETY: the caller keeps the step's buffer and its rows until the pass is done
+            // (`Executor::mtp_step_rows`); `t` is this pass's input, read only by its graph,
+            // which is queued after the copy on the same stream.
+            unsafe { backend.copy_rows(rows, &dst) };
+        }
+        _ => {
+            let ctx = Context::new(1, 0);
+            // SAFETY: as above.
+            let v = unsafe { ctx.over_rows(rows) }.to_f32();
+            t.set_bytes_at(at, as_bytes_f32(&v));
+        }
+    }
+}
+
+/// `values`' bytes.
+fn as_bytes_f32(values: &[f32]) -> &[u8] {
+    // SAFETY: any f32 is 4 plain bytes; the slice covers exactly `values`.
+    unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) }
+}
+
 type Kept = (Vec<GroupShape>, KeptGraph);
 
 fn kept_in<'k>(
@@ -339,7 +384,25 @@ const LENT_MIXED_KEPT: usize = 1;
 /// grew 8-58 MiB in 3-12K-token steps on top of what earlier steps had mapped, and an 11.8K-token
 /// step with 148 MiB left aborted. Before, a graph over 1.8 GiB that leaves less than this
 /// was padded past the free memory (`ComputeAllocator::padded`) and failed anyway.
-const LENT_SCRATCH: usize = 512 << 20;
+pub const LENT_SCRATCH: usize = 512 << 20;
+
+/// [`headroom::hopeless`] for `stage`'s step graph in `ctx`, whose allocation failed asking
+/// `bytes`: while the cache is `lent` the buffer must leave [`LENT_SCRATCH`] free, which
+/// `bytes` counts only when the allocation itself succeeded (its buffer grew past `before`,
+/// [`lent_scratch`]).
+fn step_hopeless(stage: &Stage, ctx: &Context, bytes: usize, lent: bool, before: usize) -> bool {
+    let held = ctx.allocator_size();
+    let kept = (stage.decode.iter().chain(&stage.mixed))
+        .map(|(_, g)| g.allocator_size())
+        .sum();
+    let scratch = if lent && held <= before {
+        LENT_SCRATCH
+    } else {
+        0
+    };
+    let free = stage.backend.device().memory().0;
+    headroom::hopeless(free, held, kept, bytes, scratch)
+}
 
 /// While the expert cache is lent, after a step graph's compute buffer (`held` bytes on
 /// `device`) was allocated: the out-of-memory error the allocation would have been, should it
@@ -498,6 +561,24 @@ pub struct Executor {
     prompt_next: Option<PromptNext>,
     /// The next step's first captured row read back ([`Self::set_hidden_from`]).
     hidden_from: usize,
+    /// The CUDA device the next step leaves its captured rows on
+    /// ([`Self::set_hidden_on_device`]).
+    hidden_on_device: Option<usize>,
+    /// The first captured row the next step still reads back when it leaves them on the
+    /// device ([`Self::set_hidden_on_device_from`]).
+    hidden_dev_from: Option<usize>,
+    /// The device rows the next MTP pass copies into its input after the host rows
+    /// ([`Self::mtp_step_rows`]).
+    mtp_rows_in: Option<crate::ggml::RowsAt>,
+    /// The stop tokens a greedy pick below `min_tokens` may not pick ([`Self::set_stop_tokens`]).
+    stop_tokens: Vec<u32>,
+    /// Rank 0 of tensor parallelism splits greedy steps' heads with rank 1
+    /// ([`Self::set_tp_head_split`]).
+    head_split: bool,
+    /// The share of the vocabulary the steps' heads cover from now on ([`Self::set_head_half`]).
+    head_half: u8,
+    /// A split step's value of each row's candidate ([`Self::take_head_vals`]).
+    head_vals: Vec<f32>,
     /// See [`Self::set_stage_cpus`].
     stage_cpus: Vec<Vec<u32>>,
     /// GLM's parallel decode steps ([`par_step`]).
@@ -550,6 +631,10 @@ pub struct Executor {
     held_commit: commit_hold::HeldCommit,
     /// The host time from an MTP pass's picks to the next step's first launch ([`step_front`]).
     front_clock: step_front::FrontClock,
+    /// The last step's host laps, for `--tp-profile` ([`Self::take_step_laps`]).
+    step_laps: Option<crate::tp_net::StepLaps>,
+    /// The host time the last stage launch spent writing its late n-gram rows (`launch_stage`).
+    late_rows_took: std::time::Duration,
     /// See [`Self::set_mtp_ahead`].
     mtp_ahead: bool,
     /// The inputs the last MTP pass queued for the next one ([`mtp_ahead`]), until the next
@@ -602,6 +687,8 @@ pub struct Executor {
     tp: Option<TpLead>,
     /// See [`Self::no_deferred_commits`].
     no_defer: bool,
+    /// See [`Self::tp_deferred_commits`]; 0 without it (every commit that may be deferred is).
+    tp_defer_min: usize,
     /// Rank 1 of a split model: the residual rows of the step's micro-chunks that came over
     /// the link, which the first stage takes in order ([`Self::step_from`]).
     ext_rows: std::sync::Mutex<std::collections::VecDeque<Vec<f32>>>,
@@ -795,6 +882,13 @@ impl Executor {
             mixed_aside: 0,
             prompt_next: None,
             hidden_from: 0,
+            hidden_on_device: None,
+            hidden_dev_from: None,
+            mtp_rows_in: None,
+            stop_tokens: Vec::new(),
+            head_split: false,
+            head_half: 0,
+            head_vals: Vec::new(),
             stage_cpus: Vec::new(),
             par: Default::default(),
             pair: Default::default(),
@@ -820,6 +914,8 @@ impl Executor {
             commit_last_late: false,
             held_commit: Default::default(),
             front_clock: Default::default(),
+            step_laps: None,
+            late_rows_took: std::time::Duration::ZERO,
             mtp_ahead: false,
             mtp_staged: None,
             mtp_pipe_rows: 0,
@@ -842,6 +938,7 @@ impl Executor {
             remote: None,
             tp: None,
             no_defer: false,
+            tp_defer_min: 0,
             ext_rows: Default::default(),
             captures: Vec::new(),
             applied: Vec::new(),
@@ -1547,6 +1644,16 @@ impl Executor {
         self.no_defer = true;
     }
 
+    /// For a rank of tensor parallelism over machines, instead of
+    /// [`Self::no_deferred_commits`]: the commits after its verify steps of at least `min_seqs`
+    /// sequences (1 or more) are deferred into the next verify step; narrower verify steps and
+    /// their commits run as without it, on the same graphs ([`SpecPool::new_layers_wide`];
+    /// `legion serve --tp-commit-in-verify-min-seqs`, #1176). The same bits either way; every
+    /// rank must be told the same.
+    pub fn tp_deferred_commits(&mut self, min_seqs: usize) {
+        self.tp_defer_min = min_seqs.max(1);
+    }
+
     /// Allocates replay buffers for speculative verify groups ([`Group::verify`]) of up to
     /// `max_tokens` tokens per sequence (drafts + 1), for every running-state slot.
     pub fn enable_spec(&mut self, max_tokens: usize) -> Result<(), ModelError> {
@@ -1563,6 +1670,7 @@ impl Executor {
         // Pools defer their commits only where `commit` does (#836 part 38): their inputs are
         // then stored packed for the replay alone.
         let defers = self.defers_commits() && !self.no_defer;
+        let tp_defer_min = self.tp_defer_min;
         for (d, s) in self.stages.iter_mut().enumerate() {
             // Kept graphs may reference the pool being replaced.
             s.forget_graphs();
@@ -1570,13 +1678,14 @@ impl Executor {
             let may_defer = defers && !buft.is_host() && !s.backend.is_meta();
             // The old pool goes first: two at once may not fit.
             s.spec = None;
-            let mut pool = SpecPool::new_layers(
+            let mut pool = SpecPool::new_layers_wide(
                 hp,
                 buft,
                 s.rec.n_slots(),
                 max_tokens,
                 s.layers.clone(),
                 may_defer,
+                tp_defer_min,
             )?;
             if shard.is_some() {
                 pool.set_shard(d);
@@ -1598,6 +1707,12 @@ impl Executor {
         for s in &mut self.stages {
             s.forget_graphs();
         }
+    }
+
+    /// Whether steps return captured rows ([`Self::capture_hidden`]): then every layer runs
+    /// on all of a step's rows, whatever its logits rows.
+    pub fn captures_hidden(&self) -> bool {
+        !self.hidden.is_empty()
     }
 
     /// Hands a step's captured rows ([`StepOutput::hidden`]) back once read: the next step
@@ -1655,6 +1770,16 @@ impl Executor {
                 mib_after = after,
                 seconds = t.elapsed().as_secs_f64(),
                 "MTP drafts with a 4-bit copy of the output head"
+            );
+        } else if self.model.draft_ids().is_some() {
+            // Picked rows of the head (glm5-next, #1172): a copy of them as stored.
+            let t = std::time::Instant::now();
+            let (rows, mib) = self.model.copy_draft_head()?;
+            tracing::info!(
+                rows,
+                mib,
+                seconds = t.elapsed().as_secs_f64(),
+                "MTP drafts with a copy of the output head's picked rows"
             );
         }
         if self.model.hp.arch.mtp_shares_kv() {
@@ -1717,6 +1842,30 @@ impl Executor {
             return self.tp_mtp(groups, parts);
         }
         self.mtp_step_here(groups, parts)
+    }
+
+    /// [`Self::mtp_step_parts`] of a take-in pass whose input rows are `first` (on the host,
+    /// may be empty) and then `rows`: rows of a step's captured output it left on the device
+    /// ([`StepOutput::hidden_dev`], [`Self::set_hidden_on_device`]), which must still hold
+    /// them. They are copied into the head's input on the device (#1183) instead of being read
+    /// back, gathered on the host and uploaded again: the same floats, so the same pass.
+    pub fn mtp_step_rows(
+        &mut self,
+        groups: &[Group<'_>],
+        first: &[f32],
+        rows: crate::ggml::RowsAt,
+    ) -> Result<MtpOutput, ModelError> {
+        if self.tp.is_some() || self.mtp_runs_par(groups) || self.budget_chunks(groups).len() > 1 {
+            // Not one pass on this machine: the rows on the host, as before.
+            let ctx = Context::new(1, 0);
+            // SAFETY: the caller keeps the step's buffer and its rows (see above).
+            let host = unsafe { ctx.over_rows(&rows) }.to_f32();
+            return self.mtp_step_parts(groups, &[first, &host]);
+        }
+        self.mtp_rows_in = Some(rows);
+        let out = self.mtp_pass(groups, &[first], Ahead::default());
+        self.mtp_rows_in = None;
+        out
     }
 
     /// [`Self::mtp_step_parts`] on this machine.
@@ -2016,6 +2165,8 @@ impl Executor {
     ) -> Result<Pass, ModelError> {
         // What the last pass staged is this pass's or no one's (`mtp_ahead`).
         let staged = self.mtp_staged.take().filter(|_| ahead.staged);
+        // The input rows past `h` still on the device ([`Self::mtp_step_rows`]).
+        let dev_rows = self.mtp_rows_in.take();
         // Queued ahead (`ahead.spec`), the pass runs on the GPU only if the round went on up
         // to it: the device's flag, which the pass that staged it updated from its picks.
         let behind = ahead.spec && staged.as_ref().is_some_and(|s| s.decided);
@@ -2225,7 +2376,9 @@ impl Executor {
             }
             let h_in = kept.tensor(n_in);
             let h_bytes: usize = h.iter().map(|p| std::mem::size_of_val(*p)).sum();
-            if h_bytes >= BOUNCE_MIN_BYTES {
+            if let Some(rows) = &dev_rows {
+                write_rows_dev(backend, h_in, h, rows);
+            } else if h_bytes >= BOUNCE_MIN_BYTES {
                 write_rows(bounce, backend, h_in, h);
             } else {
                 mtp_io.write_f32_parts(backend, h_in, h);
@@ -2471,15 +2624,33 @@ impl Executor {
             return Ok(());
         }
         let model = &self.model;
+        // A rank of tensor parallelism over machines that defers (`Self::tp_deferred_commits`)
+        // runs at once the commits of the slots whose last verify step was a narrow one.
+        let mut at_once = None;
         if self.defers_commits() {
             let s = &mut self.stages[0];
             let spec = s
                 .spec
                 .as_ref()
                 .expect("commit without Executor::enable_spec");
+            let split = spec.split_commits(commits);
+            let deferred = split.as_ref().map_or(commits, |(d, _)| d.as_slice());
             // SAFETY: as below; the deferred graphs read the stage's pools only.
-            match unsafe { spec.commit_deferred(&mut s.backend, &mut s.commits, &s.rec, commits) } {
-                Ok(true) => return Ok(()),
+            match unsafe { spec.commit_deferred(&mut s.backend, &mut s.commits, &s.rec, deferred) }
+            {
+                Ok(true) => match split {
+                    Some((_, rest)) if !rest.is_empty() => at_once = Some(rest),
+                    _ => return Ok(()),
+                },
+                // A pool with both stores has those slots' inputs in the packed rows only.
+                Ok(false) if split.is_some() => {
+                    self.wait_commit();
+                    return Err(ModelError::Unsupported(
+                        "--tp-commit-in-verify-min-seqs on this backend (its deferred commit \
+                         graph does not fit)"
+                            .into(),
+                    ));
+                }
                 Ok(false) => {}
                 Err(e) => {
                     self.wait_commit();
@@ -2487,6 +2658,7 @@ impl Executor {
                 }
             }
         }
+        let commits = at_once.as_deref().unwrap_or(commits);
         let mut res = Ok(());
         for (i, s) in self.stages.iter_mut().enumerate() {
             // A stage still computing a round's piece (#762): its commit starts once it is done
@@ -2518,10 +2690,13 @@ impl Executor {
 
     /// Whether [`Self::commit`] may defer the delta rule into the next verify step
     /// (`--gdn-commit-in-verify`, #836 part 14): one stage on this machine, no parallel or
-    /// pipelined steps (their commits run elsewhere or later).
+    /// pipelined steps (their commits run elsewhere or later). A lead of tensor parallelism
+    /// over machines defers only when told to ([`Self::tp_deferred_commits`]), as each other
+    /// rank then does its share: every rank's states are its own heads', committed by its own
+    /// verify steps.
     fn defers_commits(&self) -> bool {
         self.stages.len() == 1
-            && self.tp.is_none()
+            && (self.tp.is_none() || self.tp_defer_min > 0)
             && self.remote.is_none()
             && self.par.pool.is_none()
             && !self.par.every_step
@@ -2566,10 +2741,15 @@ impl Executor {
         {
             return Ok(());
         }
+        // A verify group too narrow to replay (a pool with both stores, #1176) reads the
+        // states as any other group does.
+        let replays = |p: &SpecPool, g: &Group<'_>| g.verify && p.replays(g.seqs.len());
         let touched = self.stages.iter().any(|s| {
-            s.spec
-                .as_ref()
-                .is_some_and(|p| groups.iter().any(|g| !g.verify && p.defers_slots(range(g))))
+            s.spec.as_ref().is_some_and(|p| {
+                groups
+                    .iter()
+                    .any(|g| !replays(p, g) && p.defers_slots(range(g)))
+            })
         });
         if touched {
             self.flush_commits()?;
@@ -2577,8 +2757,12 @@ impl Executor {
         for s in &mut self.stages {
             if let Some(p) = s.spec.as_ref() {
                 for g in groups.iter().filter(|g| g.verify) {
-                    let n_tok = g.seqs.first().map_or(0, |q| q.tokens.len());
-                    p.before_verify(&mut s.backend, range(g), n_tok);
+                    if replays(p, g) {
+                        let n_tok = g.seqs.first().map_or(0, |q| q.tokens.len());
+                        p.before_verify(&mut s.backend, range(g), n_tok);
+                    } else {
+                        p.plain_verify(range(g));
+                    }
                 }
             }
         }
@@ -2722,12 +2906,94 @@ impl Executor {
         if self.tp.is_some() {
             self.prompt_next = None;
             self.hidden_from = 0;
+            self.hidden_on_device = None;
+            self.hidden_dev_from = None;
             self.captures.clear();
             return self.tp_step(groups);
         }
         let out = self.step_here(groups);
         self.hidden_from = 0;
+        self.hidden_on_device = None;
+        self.hidden_dev_from = None;
         out
+    }
+
+    /// The next [`Self::step`] may leave its captured rows on the device
+    /// ([`StepOutput::hidden_dev`], #1181) instead of reading them back: a drafter that gathers
+    /// the rows it takes in on the device (DFlash) reads them there before anything runs on
+    /// the executor again. Applied by a step of one micro-chunk on one stage on this machine
+    /// whose captured layers are F32 matrices in a buffer of CUDA device `device` (the
+    /// drafter's); any other step reads them back as without (`None`: always). Only the next
+    /// step reads it.
+    pub fn set_hidden_on_device(&mut self, device: Option<usize>) {
+        self.hidden_on_device = device;
+    }
+
+    /// With [`Self::set_hidden_on_device`] applied, the next step still reads its captured
+    /// rows back from row `row` on ([`StepOutput::hidden`], the rows before keep their length
+    /// and hold anything), beside leaving them all on the device: the MTP head's take-in of a
+    /// prompt chunk copies its pieces' rows on the device and reads only its last few rows on
+    /// the host (#1183). A step that does not leave them on the device reads every row back.
+    /// Only the next step reads it.
+    pub fn set_hidden_on_device_from(&mut self, row: usize) {
+        self.hidden_dev_from = Some(row);
+    }
+
+    /// The CUDA device a step's captured rows may stay on for the MTP head's take-in
+    /// ([`Self::set_hidden_on_device`], [`Self::mtp_step_rows`], #1183): the last stage's, when
+    /// the model runs as one stage on this machine with a head of its own cache (the head
+    /// runs on that stage's backend). `None` otherwise.
+    pub fn mtp_rows_device(&self) -> Option<usize> {
+        if !self.mtp_enabled
+            || self.mtp_shares_kv()
+            || self.tp.is_some()
+            || self.remote.is_some()
+            || self.stages.len() != 1
+        {
+            return None;
+        }
+        let backend = &self.last().backend;
+        if backend.is_meta() {
+            return None;
+        }
+        let name = backend.device().name();
+        name.strip_prefix("CUDA")?.parse().ok()
+    }
+
+    /// The stop tokens a greedy pick below `min_tokens` ([`Logits::Pick`],
+    /// [`Logits::FirstPick`]) may not pick: the engine's.
+    pub fn set_stop_tokens(&mut self, stop: &[u32]) {
+        self.stop_tokens = stop.to_vec();
+    }
+
+    /// Rank 0 of tensor parallelism over two ranks: greedy decode and verify steps split their
+    /// output head with rank 1 from now on (`--tp-head-split`,
+    /// [`crate::model::core::head_split`]), where the model's head splits
+    /// ([`Model::head_splits`]). Returns whether they will.
+    pub fn set_tp_head_split(&mut self, on: bool) -> bool {
+        self.head_split = on && self.model.head_splits();
+        self.head_split
+    }
+
+    /// The steps from now on compute share `half` of the output head (1: the vocabulary's
+    /// first rows, 2: the rest; [`crate::model::core::head_split::range`]) and return each
+    /// row's candidate among them, its column of the whole vocabulary in
+    /// [`StepOutput::argmax`] and its value in [`Self::take_head_vals`]; 0: the whole head
+    /// again. Only for steps whose rows are all device argmaxes
+    /// ([`crate::model::core::head_split::fits`]) on a model whose head splits.
+    pub fn set_head_half(&mut self, half: u8) {
+        self.head_half = half;
+        self.head_vals.clear();
+    }
+
+    /// The values of the last split step's candidates ([`Self::set_head_half`]), a row each.
+    pub fn take_head_vals(&mut self) -> Vec<f32> {
+        std::mem::take(&mut self.head_vals)
+    }
+
+    /// Whether the model's head splits ([`Model::head_splits`]).
+    pub fn head_splits(&self) -> bool {
+        self.model.head_splits()
     }
 
     /// The next [`Self::step`] reads its captured rows ([`StepOutput::hidden`]) back from row
@@ -2739,9 +3005,18 @@ impl Executor {
         self.hidden_from = row;
     }
 
+    /// The last step's host laps (`--tp-profile`), if it ran as one round of one stage (a
+    /// decode or verify step on a tensor-parallel rank); taken, so a later step without them
+    /// gives `None`.
+    pub fn take_step_laps(&mut self) -> Option<crate::tp_net::StepLaps> {
+        self.step_laps.take()
+    }
+
     /// [`Self::step`] on this machine.
     fn step_here(&mut self, groups: &[Group<'_>]) -> Result<StepOutput, ModelError> {
         debug_assert!(self.pipe.is_empty(), "a whole step with groups in flight");
+        let t_entry = std::time::Instant::now();
+        self.step_laps = None;
         // Read by this step only (`prompt_ahead`).
         let prompt_next = self.prompt_next.take();
         let mut front = self.front_clock.step();
@@ -2815,6 +3090,14 @@ impl Executor {
         if paired {
             shapes.iter_mut().flatten().for_each(|g| g.pair = true);
         }
+        // This rank's share of a split head (`set_head_half`): graphs of their own.
+        let head_half = self.head_half;
+        if head_half != 0 {
+            shapes
+                .iter_mut()
+                .flatten()
+                .for_each(|g| g.head_half = head_half);
+        }
         // A decode or verify step's inputs as copies queued ahead of each stage's graph
         // (`step_fill`).
         let queued = step_fill::queued(n_micro, prompt, paired, self.remote.is_some());
@@ -2842,6 +3125,11 @@ impl Executor {
         // before still computed on other stages (see `early_inputs`).
         let mut early = vec![Early::No; n_stages];
         let mut n_rounds = n_micro + n_stages - 1;
+        // `step tail us` (debug level): when the first stage's launch returned, and how long
+        // the stages' outputs took to read.
+        let tail_log = tracing::enabled!(tracing::Level::DEBUG);
+        let mut launched_at: Option<std::time::Instant> = None;
+        let mut tail_output_ms = 0.0;
         front.lap("shapes");
         if self.dataflow_for(n_micro) {
             let flow = dataflow::Flow {
@@ -3097,9 +3385,17 @@ impl Executor {
                     }
                 }
                 front.done();
+                if tail_log && launched_at.is_none() {
+                    launched_at = Some(std::time::Instant::now());
+                }
+                let t_launched = t0.elapsed();
+                // `--tp-profile`'s laps: the next verify graph built, then the GPU waited for.
+                let (mut t_ahead, mut ahead_wait) = (t_launched, std::time::Duration::ZERO);
                 if let Some(next) = &ahead {
                     self.build_ahead(0, &shapes[0], next, late);
+                    t_ahead = t0.elapsed();
                     self.stages[0].backend.synchronize();
+                    ahead_wait = t0.elapsed() - t_ahead;
                 }
                 if let Some(next) = &prompt_ahead {
                     let t = std::time::Instant::now();
@@ -3175,6 +3471,23 @@ impl Executor {
                     );
                     output_ms += t_out.elapsed().as_secs_f64() * 1e3;
                 }
+                if let [(_, _)] = active[..]
+                    && n_rounds == 1
+                {
+                    let out_d = std::time::Duration::from_secs_f64(output_ms / 1e3);
+                    let synced = t0.elapsed().saturating_sub(out_d);
+                    self.step_laps = Some(crate::tp_net::StepLaps {
+                        before: t0 - t_entry,
+                        prepare: t_prepare,
+                        fill: t_inputs,
+                        launch: t_launched.saturating_sub(t_inputs + t_prepare),
+                        rows: self.late_rows_took,
+                        ahead: t_ahead - t_launched,
+                        beside: t_launch.saturating_sub(t_ahead + ahead_wait),
+                        wait: ahead_wait + synced.saturating_sub(t_launch),
+                        output: out_d,
+                    });
+                }
             }
             // The cache learns each micro-batch's routing (its graph's route log holds it until
             // the stage runs the next one), once every stage of the round is done.
@@ -3226,7 +3539,9 @@ impl Executor {
                     output_ms,
                 );
             }
+            tail_output_ms += output_ms;
         }
+        let tail_at = launched_at.map(|t| (t, std::time::Instant::now()));
         deferred.join(None, &mut hidden);
         // Captured layers in the order asked for, the micro-chunks' rows one after another.
         out.hidden = self
@@ -3271,7 +3586,21 @@ impl Executor {
                 // Run beside the next MTP pass (or before the next step).
                 self.deferred_target = Some((n, kind));
             } else {
+                let t = std::time::Instant::now();
                 self.after_pass(n, |il| il < n_layer, kind)?;
+                if let Some((launched, rounds_end)) = tail_at {
+                    // From the first launch's return (the GPU work of a synchronized
+                    // one-stage step included) to the rounds' end, then the rest up to the
+                    // cache's after-step, then the after-step itself.
+                    tracing::debug!(
+                        tokens = n,
+                        rounds_us = (rounds_end - launched).as_micros() as u64,
+                        output_us = (tail_output_ms * 1e3) as u64,
+                        between_us = (t - rounds_end).as_micros() as u64,
+                        after_us = t.elapsed().as_micros() as u64,
+                        "step tail us"
+                    );
+                }
             }
         }
         Ok(out)
@@ -3298,7 +3627,7 @@ impl Executor {
             && micro > 0
             && seq.tokens.len() > micro
             && !lead.verify
-            && matches!(seq.logits, Logits::None | Logits::Last | Logits::Greedy)
+            && seq.logits.last_only()
         {
             let mut out = vec![riders.to_vec()];
             out.extend(self.micro_chunks(std::slice::from_ref(lead)));
@@ -3333,7 +3662,7 @@ impl Executor {
         }
         let [seq] = &g.seqs[..] else { return whole };
         let n = seq.tokens.len();
-        let last_only = matches!(seq.logits, Logits::None | Logits::Last | Logits::Greedy);
+        let last_only = seq.logits.last_only();
         if self.stages.len() < 2 || micro == 0 || n <= micro || g.verify || !last_only {
             return whole;
         }
@@ -3594,7 +3923,11 @@ impl Executor {
                     }) {
                         Ok(()) => {}
                         // The graphs a restore hands its thread may still hold the memory.
-                        Err(GgmlError::Alloc { .. }) if self.freeing.wait() => {
+                        // Not when even that memory could not make it fit.
+                        Err(GgmlError::Alloc { bytes, .. })
+                            if self.freeing.wait()
+                                && !step_hopeless(stage, &ctx, bytes, lent && !spilled, before) =>
+                        {
                             tracing::debug!(
                                 stage = s,
                                 "out of memory for a step's compute buffer: waited for the \
@@ -3605,6 +3938,11 @@ impl Executor {
                         }
                         Err(GgmlError::Alloc { bytes, .. }) => {
                             let tokens = shape.iter().map(GroupShape::tokens).sum::<usize>();
+                            // When even free memory, this attempt's buffer and every kept
+                            // graph's fall short, dropping kept graphs and allocating again
+                            // cannot fit: to unified memory now (#37).
+                            let hopeless =
+                                step_hopeless(stage, &ctx, bytes, lent && !spilled, before);
                             // The oldest other kept graph first, mixed before decode (the
                             // smaller, hotter ones): its buffer grows for this graph, the rest
                             // stay (a mixed step beside four decoding sequences is a new shape
@@ -3614,7 +3952,7 @@ impl Executor {
                             } else {
                                 &mut stage.mixed
                             };
-                            if !oldest.is_empty() {
+                            if !hopeless && !oldest.is_empty() {
                                 let (_, g) = oldest.remove(0);
                                 if let Some(a) = g.into_allocator() {
                                     tracing::debug!(
@@ -3630,7 +3968,7 @@ impl Executor {
                                 }
                             }
                             let others = stage.decode.len() + stage.mixed.len();
-                            if retry && others > 0 {
+                            if !hopeless && retry && others > 0 {
                                 tracing::warn!(
                                     stage = s,
                                     tokens,
@@ -3759,7 +4097,9 @@ impl Executor {
         let stage = &self.stages[s];
         let kept = stage.kept(shape).expect("prepared");
         let inputs = Inputs::from_parts(shape, self.parts(s), |i| kept.tensor(i));
+        let t0 = std::time::Instant::now();
         inputs.fill(groups, shape);
+        let filled = t0.elapsed();
         self.model.fill_extra(
             &inputs,
             groups,
@@ -3769,6 +4109,16 @@ impl Executor {
             stage.spec.as_ref(),
             &mut super::SetNow,
         );
+        let tokens: usize = shape.iter().map(|g| g.n_seqs * g.n_tok).sum();
+        if tokens >= 1024 {
+            tracing::debug!(
+                stage = s,
+                tokens,
+                common_ms = filled.as_secs_f64() * 1e3,
+                extra_ms = (t0.elapsed() - filled).as_secs_f64() * 1e3,
+                "step inputs"
+            );
+        }
     }
 
     /// Copies the residual stage `s - 1` handed over into stage `s`'s input (none for the
@@ -3844,24 +4194,51 @@ impl Executor {
         let parts = self.parts(s);
         let captured = self.captured(s);
         let n_vocab = self.model.hp.n_vocab as usize;
+        let exact = self.model.hp.arch.argmax_first_of_ties();
+        // The step's captured rows may stay where the graph wrote them
+        // ([`Executor::set_hidden_on_device`]): one stage, one micro-chunk, nothing read ahead.
+        let stay_on = self
+            .hidden_on_device
+            .filter(|_| n_micro == 1 && n_stages == 1 && read.is_none() && self.remote.is_none());
         let Stage {
             decode,
             mixed,
             bounce,
             bounce_b,
             bounce_small,
+            ids_pin,
             backend,
             ..
         } = &mut self.stages[s];
         let spare = &mut self.spare_rows;
         let kept = kept_in(decode, mixed, shape).expect("prepared");
         let inputs = Inputs::from_parts(shape, parts, |i| kept.tensor(i));
+        let ids = bounce_for(ids_pin, backend, inputs.out_pin_bytes(group, n_vocab));
+        let picks = super::Picks {
+            stop: &self.stop_tokens,
+            exact,
+        };
+        // Every captured layer an F32 matrix on that device, or all are read back.
+        let on_device = stay_on.and_then(|dev| {
+            (inputs.hidden.iter())
+                .map(|t| t.rows_at().filter(|r| r.device == Some(dev)))
+                .collect::<Option<Vec<_>>>()
+        });
         let defer = n_micro > 1 && captured.len() == 1;
         // The one micro-chunk's rows are the step's ([`Executor::set_hidden_from`]).
         let from = if n_micro == 1 { self.hidden_from } else { 0 };
         let parity = round % 2;
+        // Left on the device, its last rows read back all the same
+        // ([`Executor::set_hidden_on_device_from`]).
+        let dev_from = self.hidden_dev_from;
         let mut started = Vec::new();
-        let mut o = inputs.output_with(group, n_vocab, |t| {
+        let mut o = inputs.output_with(group, n_vocab, ids, picks, |t| {
+            if on_device.is_some() {
+                return match dev_from {
+                    Some(row) => read_rows_from(bounce, bounce_small, spare, backend, t, row),
+                    None => Vec::new(),
+                };
+            }
             let n = t.nbytes();
             if defer && n >= BOUNCE_MIN_BYTES {
                 // Already in the round's bounce buffer (the dataflow stage thread read it).
@@ -3888,6 +4265,9 @@ impl Executor {
             deferred.start(k, layer, parity, src, n);
         }
         hidden[k].extend(captured.into_iter().zip(std::mem::take(&mut o.hidden)));
+        if let Some(rows) = on_device {
+            out.hidden_dev = rows;
+        }
         // Rank 0 of a split model: the residual for rank 1 ([`remote`]).
         if s + 1 == n_stages
             && let Some(r) = self.remote.as_mut()
@@ -3898,7 +4278,22 @@ impl Executor {
         if s + 1 == n_stages {
             // The micro-chunks' rows one after another (a prompt's earlier micro-chunks have
             // none).
-            out.argmax.extend(o.argmax);
+            match shape.first().map_or(0, |g| g.head_half) {
+                0 => out.argmax.extend(o.argmax),
+                // A split head's graph returns its share's candidates in the argmaxes' place
+                // (`head_split`): each row's pick among them, as a column of the whole
+                // vocabulary, and its value.
+                half => {
+                    let off = super::head_split::range(n_vocab, half).0 as u32;
+                    let (cols, vals) =
+                        crate::model::cluster_select::join_best(&o.argmax, o.rows.len());
+                    out.argmax.extend(
+                        cols.into_iter()
+                            .map(|c| if c == u32::MAX { c } else { c + off }),
+                    );
+                    self.head_vals.extend(vals);
+                }
+            }
             out.rows.extend(o.rows);
         }
     }

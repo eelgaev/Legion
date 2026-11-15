@@ -58,7 +58,7 @@ mod waves;
 use chat_format::ChatFormat;
 use response_format::{Constraint, GrammarCache, MaskPool};
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -86,7 +86,9 @@ use crate::model::core::{
 use crate::residency::ExpertMode;
 use crate::residency::fallback::known_node;
 use crate::spec::accept;
-use crate::spec::{Draft, DraftRequest, SeqId, SpecConfig, SpecCounters, TargetInfo, TokenDrafter};
+use crate::spec::{
+    DeviceHidden, Draft, DraftRequest, SeqId, SpecConfig, SpecCounters, TargetInfo, TokenDrafter,
+};
 use crate::tokenizer::Tokenizer;
 pub use pipe::DEFAULT_MIN_GROUP as DEFAULT_PIPELINE_MIN_GROUP;
 pub use preempt::KvAdmission;
@@ -619,8 +621,8 @@ pub(crate) fn default_mtp_window(arch: &str, mtp: bool, integrated: bool) -> usi
     }
 }
 
-/// Why `--spec-draft-vocab n` cannot apply, if it cannot: it is for the MTP heads of qwen4exp
-/// and qwen35 and for DFlash drafters (`dflash`), and below the vocabulary's size.
+/// Why `--spec-draft-vocab n` cannot apply, if it cannot: it is for the MTP heads of qwen4exp,
+/// qwen35 and glm5-next and for DFlash drafters (`dflash`), and below the vocabulary's size.
 pub(crate) fn draft_vocab_unused(
     n: usize,
     mtp: bool,
@@ -630,10 +632,12 @@ pub(crate) fn draft_vocab_unused(
 ) -> Option<String> {
     if n == 0 {
         None
-    } else if !dflash && (!mtp || !matches!(arch, "qwen4exp" | "qwen35" | "qwen35moe")) {
+    } else if !dflash
+        && (!mtp || !matches!(arch, "qwen4exp" | "qwen35" | "qwen35moe" | "glm5-next"))
+    {
         Some(format!(
-            "--spec-draft-vocab applies to the MTP heads of qwen4exp and qwen35 (--spec mtp) \
-             and to DFlash drafters (--spec dflash) only, not {arch}: ignored"
+            "--spec-draft-vocab applies to the MTP heads of qwen4exp, qwen35 and glm5-next \
+             (--spec mtp) and to DFlash drafters (--spec dflash) only, not {arch}: ignored"
         ))
     } else if n as i64 >= n_vocab {
         Some(format!(
@@ -645,15 +649,16 @@ pub(crate) fn draft_vocab_unused(
 }
 
 /// Why `--spec-draft-lm-head q4` does not apply to the MTP head of `arch`, if it does not: only
-/// the qwen4exp and qwen35 heads draft with the copy.
+/// the qwen4exp, qwen35 and glm5-next heads draft with the copy.
 pub(crate) fn mtp_lm_head_unused(h: crate::spec::DraftLmHead, arch: &str) -> Option<String> {
-    (h == crate::spec::DraftLmHead::Q4 && !matches!(arch, "qwen4exp" | "qwen35" | "qwen35moe"))
-        .then(|| {
-            format!(
-                "--spec-draft-lm-head applies to the MTP heads of qwen4exp and qwen35 only, \
-                 not {arch}: ignored"
-            )
-        })
+    (h == crate::spec::DraftLmHead::Q4
+        && !matches!(arch, "qwen4exp" | "qwen35" | "qwen35moe" | "glm5-next"))
+    .then(|| {
+        format!(
+            "--spec-draft-lm-head applies to the MTP heads of qwen4exp, qwen35 and glm5-next \
+             only, not {arch}: ignored"
+        )
+    })
 }
 
 /// Whether the model's own MTP head drafts: `--spec mtp` without a draft model or token drafter.
@@ -1131,6 +1136,10 @@ pub struct LmConfig {
     /// differs from the default by rounding order (P rounded to F16 against the running max,
     /// one pass, 64-wide MMA chains against WMMA's 16-wide).
     pub paged_prefill_m884: bool,
+    /// Prompt attention on Turing GPUs without tensor cores through the one-pass FP32 FMA
+    /// kernel instead of the WMMA one (other GPUs keep their default). Greedy output can differ
+    /// from the default (no F16 rounding of Q and P, one pass, another summation order).
+    pub tu_attn_ffma: bool,
     /// qwen4exp prompt steps: ggml's indexer chain (pool mask, lightning indexer, bias add)
     /// instead of Legion's one-op scores (the same bits), for comparisons.
     pub qsa_scores_ggml: bool,
@@ -1240,6 +1249,33 @@ impl Default for LongPrompts {
 
 /// The smallest adaptive micro-chunk ([`LongPrompts::micro_for`]).
 const MIN_MICRO: usize = 2048;
+
+/// The smallest micro-chunk a lend caps long prompts to (#1216, [`Worker::long_micro_cap`]):
+/// below it, staging every expert per micro-chunk costs more than a spilled step buffer.
+const MIN_LENT_MICRO: usize = 512;
+
+/// VRAM a lend's micro-chunk cap leaves free beside the long step buffer and
+/// [`crate::model::core::LENT_SCRATCH`] (#1216).
+const LENT_MICRO_MARGIN: usize = 64 << 20;
+
+/// #1216: a stage's long prompt step compute buffer at [`LongPrompts::micro`] tokens, as
+/// measured at load after no past and after the longest ([`Worker::long_past`]).
+#[derive(Debug, Clone, Copy)]
+struct LongStep {
+    device: Option<crate::ggml::Device>,
+    first: usize,
+    last: usize,
+}
+
+impl LongStep {
+    /// The buffer for a micro-chunk ending at most `end` tokens in: linear in the past
+    /// between the two measurements (an indexer's scores grow with it), at most `last`.
+    fn at(&self, end: usize, long_past: usize) -> usize {
+        let grow = self.last.saturating_sub(self.first) as u128;
+        let past = end.min(long_past) as u128;
+        self.first + (grow * past / long_past.max(1) as u128) as usize
+    }
+}
 
 /// [`LongPrompts::even_micro`]'s micro-chunks are whole KV blocks.
 const EVEN_STEP: usize = KV_BLOCK;
@@ -1392,6 +1428,7 @@ impl LmConfig {
             glm_route_bias: 0.0,
             glm_prune: None,
             paged_prefill_m884: false,
+            tu_attn_ffma: false,
             long_prompts: LongPrompts::default(),
             swa_full: false,
             swa_ring: false,
@@ -1440,6 +1477,8 @@ pub struct LmEngine {
     load_report: report::LoadReport,
     /// `--pipeline-mtp-split`'s measurements, shared with the worker (#765).
     split_probe: Option<Arc<Mutex<pipe_split::Probe>>>,
+    /// [`Engine::set_warming`], shared with the worker.
+    warming: Arc<AtomicBool>,
 }
 
 impl Drop for LmEngine {
@@ -2343,25 +2382,41 @@ fn tier_node(_: usize) -> Option<u32> {
     None
 }
 
-/// Whether the layout's GPUs reach host memory over NVLink (they use the host's page tables:
-/// an AC922, a Grace Hopper), not PCIe.
+/// The link the layout's GPUs read host memory over: NVLink when they use the host's page
+/// tables (an AC922), NVLink-C2C when they also are a Grace Hopper's
+/// ([`crate::residency::unified::c2c`]), else PCIe.
 #[cfg(feature = "cuda")]
-fn tier_link_nvlink(layout: &layout::Layout) -> bool {
-    let nvlink = |d: Option<crate::ggml::Device>| {
+fn tier_link(layout: &layout::Layout) -> host_tier::TierLink {
+    use crate::residency::unified::{LinkAttrs, c2c};
+    let caps = |d: Option<crate::ggml::Device>| {
         d.and_then(cuda_index)
             .and_then(crate::residency::cuda::caps)
-            .is_some_and(|c| c.pageable_uses_host_page_tables)
     };
     // Tensor parallelism: the GPUs under the meta device (which has no CUDA index).
-    if !layout.tp_devices.is_empty() {
-        return layout.tp_devices.iter().all(|&d| nvlink(Some(d)));
+    let caps: Vec<_> = if !layout.tp_devices.is_empty() {
+        layout.tp_devices.iter().map(|&d| caps(Some(d))).collect()
+    } else {
+        layout.stages.iter().map(|(d, _)| caps(*d)).collect()
+    };
+    let nvlink = caps
+        .iter()
+        .all(|c| c.is_some_and(|c| c.pageable_uses_host_page_tables));
+    if !nvlink {
+        host_tier::TierLink::Pcie
+    } else if caps
+        .iter()
+        .flatten()
+        .all(|c| c2c(std::env::consts::ARCH, LinkAttrs::from(c)))
+    {
+        host_tier::TierLink::C2c
+    } else {
+        host_tier::TierLink::Nvlink
     }
-    layout.stages.iter().all(|(d, _)| nvlink(*d))
 }
 
 #[cfg(not(feature = "cuda"))]
-fn tier_link_nvlink(_: &layout::Layout) -> bool {
-    false
+fn tier_link(_: &layout::Layout) -> host_tier::TierLink {
+    host_tier::TierLink::Pcie
 }
 
 /// Per stage, where its rings are saved ([`Executor::enable_ring_saves`]): pinned memory on
@@ -3077,7 +3132,7 @@ fn build_expert_cache(
                 let need = long.get(i).copied().unwrap_or(0)
                     + 2 * COMPUTE_MARGIN
                     + pinned.get(i).copied().unwrap_or(0);
-                (need as u64 + cfg.cache_reserve).saturating_sub(beside)
+                (need as u64 + cfg.lend_reserve.unwrap_or(cfg.cache_reserve)).saturating_sub(beside)
             })
             .collect();
     }
@@ -3746,6 +3801,62 @@ impl LmEngine {
             .as_deref()
             .map(crate::residency::ssd_experts::skipped_tensors)
             .unwrap_or_default();
+        // Routed experts that do not fit in the host memory of a discrete-GPU machine: a
+        // bounded set of RAM slots, the rest read from the checkpoint as routed (#37).
+        let host_tier = if ssd_layers.is_some() {
+            None
+        } else {
+            ssd_tier::host_tier_plan(&cfg, &gguf, &layout)?
+        };
+        if host_tier.is_some() {
+            let n_layer = crate::model::core::Hparams::from_gguf(&gguf)?.n_layer;
+            skip.extend(crate::residency::host_tier::skipped_tensors(n_layer));
+            // The RAM is the experts': the n-gram table stays on the SSD.
+            if cfg.ngram.io == crate::residency::lookup_table::TableIo::Auto {
+                cfg.ngram.io = crate::residency::lookup_table::TableIo::Direct;
+            }
+            // Prompts lend the VRAM cache and run as staged passes
+            // ([`crate::residency::host_tier`]), shorter ones than elsewhere: a chunk of an
+            // unlent cache reads the checkpoint for what it routes to.
+            if cfg.long_prompts.min_tokens == LongPrompts::default().min_tokens {
+                cfg.long_prompts.min_tokens = ssd_tier::HOST_TIER_LONG;
+            }
+        }
+        // The same machine and model with every routed expert in host memory (no tier): the
+        // saved routing heat and the KV tail's lend below serve its VRAM slots all the same.
+        let tier_whole = host_tier.is_none()
+            && ssd_layers.is_none()
+            && ssd_tier::host_tier_applies(&cfg, &gguf, &layout)?;
+        // The routing heat of the last run fills the VRAM slots (and the tier's RAM slots) at
+        // load.
+        if (host_tier.is_some() || tier_whole) && cfg.residency.profile.is_none() {
+            cfg.residency.tier_heat = ssd_tier::host_tier_heat_path(&gguf);
+        }
+        // With every routed expert in host memory, that heat sizes the layers too (#37 round
+        // 17: +1.2% decode on a 24 GB card). `LEGION_DEBUG_HEAT_SIZES=0` keeps even sizes, for
+        // A/B runs.
+        cfg.residency.tier_heat_sizes = tier_whole
+            && cfg.residency.tier_heat.is_some()
+            && std::env::var_os("LEGION_DEBUG_HEAT_SIZES").is_none_or(|v| v != "0");
+        // Its one GPU's reserve beside the cache, where `--expert-cache-reserve-mib` is at its
+        // default: what was measured in use there, not the layer splits' share.
+        if (host_tier.is_some() || tier_whole)
+            && cfg.residency.cache_reserve == crate::residency::CACHE_RESERVE
+        {
+            // A long prompt's lend leaves free what it did with the default reserve: the staged
+            // passes are sized to it.
+            cfg.residency.lend_reserve = Some(ssd_tier::HOST_TIER_LEND_RESERVE);
+            cfg.residency.cache_reserve = ssd_tier::HOST_TIER_RESERVE;
+            // One stage's shared host memory is the embeddings moved off the tier's GPU.
+            if host_tier.is_some() && layout.shared_host.is_some() && layout.stages.len() == 1 {
+                cfg.residency.cache_reserve += ssd_tier::HOST_TIER_EMBD_RESERVE;
+            }
+        }
+        // Every routed expert in host memory there: more swaps a pass, where
+        // `--expert-swaps` is not given (placement only).
+        if tier_whole && !cfg.residency.swaps_given {
+            cfg.residency.swaps.budget = ssd_tier::HOST_TIER_WHOLE_SWAPS;
+        }
         // The other machine's layers and head.
         let hp_file = crate::model::core::Hparams::from_gguf(&gguf)?;
         skip.extend(layout.node_skipped(&gguf, hp_file.n_layer));
@@ -3811,6 +3922,10 @@ impl LmEngine {
         if let Some(layers) = &ssd_layers {
             let tier = ssd_tier::build(&cfg, &gguf, &layout, &model.hp, layers)?;
             model.set_ssd_experts(tier);
+        }
+        if let Some(plan) = &host_tier {
+            let tier = ssd_tier::host_tier_build(&cfg, &gguf, &layout, &model.hp, plan)?;
+            model.set_host_tier(tier);
         }
         if cfg.pair_tp {
             pair_tp::set_up(&cfg, &mut model, &layout)?;
@@ -3897,33 +4012,59 @@ impl LmEngine {
         #[cfg(feature = "cuda")]
         warn_nvfp4_a4(&layout, cfg.nvfp4_a4);
         #[cfg(feature = "cuda")]
-        let caps = device
+        let dev_caps = device
             .and_then(cuda_index)
-            .and_then(crate::residency::cuda::caps)
-            .map(|c| (c.cc_major, c.cc_minor, c.sms));
+            .and_then(crate::residency::cuda::caps);
+        #[cfg(feature = "cuda")]
+        let caps = dev_caps.map(|c| (c.cc_major, c.cc_minor, c.sms));
         #[cfg(not(feature = "cuda"))]
         let caps: Option<(i32, i32, i32)> = None;
+        // The defaults that let step buffers spill into host memory (the expert cache taking
+        // the prompt room, `--kv-vmm` on a 2-GPU split): a V100's, and a GH200's (#1215,
+        // `unified::spill_default`; an AC922 and a GB10 as before).
+        #[cfg(feature = "cuda")]
+        let spill_default = crate::residency::unified::spill_default_here(
+            dev_caps
+                .as_ref()
+                .map(crate::residency::unified::LinkAttrs::from),
+        );
+        #[cfg(not(feature = "cuda"))]
+        let spill_default = false;
         let cc = caps.map(|c| (c.0, c.1));
         let cc_major = cc.map(|c| c.0);
         // V100 (#574): the GB10 prompt kernels too (Maya-S, 8K-token prompt 565 -> 804 tok/s), but
-        // the plain Q6_K decode GEMV (the staged one ~11% slower there). The same bits.
+        // the plain Q6_K decode GEMV (the staged one ~11% slower there). Ampere (8.0 to 8.7,
+        // #1212) likewise: without them its prompt products run linear_mm, no tensor cores; the
+        // decode GEMV stays the plain one. The same bits.
         let volta = cc == Some((7, 0));
-        if volta && cfg.switches.glm_gb10_linear.is_none() {
+        let ampere = cc.is_some_and(crate::hw::per_device::ampere);
+        if (volta || ampere) && cfg.switches.glm_gb10_linear.is_none() {
             crate::model::glm5next::ops::set_gb10_linear(true);
         }
-        crate::model::glm5next::ops::set_gb10_gemv(!volta);
+        crate::model::glm5next::ops::set_gb10_gemv(!(volta || ampere));
         // #594: long prompt steps' Q6_K products through F16 weights and linear_tc (sm_80+, the
         // same bits)
         crate::model::glm5next::ops::set_q6k_f16(cc_major.is_some_and(|m| m >= 8));
         crate::model::core::gdn_scan::set_gpu(cc_major);
-        crate::model::core::gdn_mma::set_gpu(cc_major);
+        crate::model::core::gdn_mma::set_gpu(cc);
         crate::model::core::gdn::set_gpu(cc_major);
         crate::model::qwen4::set_xn16_gpu(cc);
         crate::model::core::mmq_preq::set_gpu(cc_major);
         crate::model::core::mmq_ids::set_gpu(cc);
         crate::model::core::nvfp4_once::set_gpu(cc);
+        crate::model::core::nvfp4_mvq::set_gpu(cc);
         crate::model::qwen4::set_up_mix_gpu(cc_major, caps.map_or(0, |c| c.2));
         crate::model::q8_mmq::set_gpu(cc_major, caps.map_or(0, |c| c.2));
+        // #1214: a GTX 16xx's prompt matmuls on dp4a (no tensor cores to run MMQ's MMA on).
+        let tu11x = device
+            .and_then(cuda_index)
+            .is_some_and(crate::hw::per_device::turing_without_tensor_cores);
+        crate::model::tu_mmq::set_gpu(if tu11x { caps.map_or(0, |c| c.2) } else { 0 });
+        if tu11x && cfg.tu_attn_ffma {
+            // After set_m884_prefill above (one prefill choice for the process; m8n8k4 is
+            // sm_70's).
+            crate::model::core::paged::set_ffma_prefill(true);
+        }
         let mma16 = device.is_some() && crate::model::moe_ffn::mma16();
         let moe_kernel = resolve_moe_kernel(cfg.moe_kernel, mode, integrated, cc_major, mma16);
         if moe_kernel != cfg.moe_kernel {
@@ -3967,7 +4108,21 @@ impl LmEngine {
         ) {
             Some(why) => tracing::warn!(draft_vocab = cfg.draft_vocab, "{why}"),
             None if dflash => dflash_vocab = cfg.draft_vocab,
-            None => model.set_draft_vocab(cfg.draft_vocab),
+            None => {
+                model.set_draft_vocab(cfg.draft_vocab);
+                // GLM-5.3-Flash: the number tokens too, which its vocabulary keeps far past
+                // the first rows (#1172).
+                if model.hp.arch.name() == "glm5-next"
+                    && let Some(ids) = model.glm_draft_ids(|i| tokenizer.token_to_piece(i))
+                {
+                    tracing::info!(
+                        draft_vocab = cfg.draft_vocab,
+                        rows = ids.len(),
+                        "MTP drafts over the first tokens and the number tokens"
+                    );
+                    model.set_draft_ids(ids);
+                }
+            }
         }
         if mtp && !head_on_peer && !model.has_mtp() {
             // The head's GGUF, else a safetensors checkpoint's own head (`mtp.*`), as shipped.
@@ -4385,7 +4540,12 @@ impl LmEngine {
         };
         let mut exec = made
             .and_then(|mut exec| {
-                if layout.node.is_some() || tp_start.is_some() {
+                // The ranks of tensor parallelism over machines may defer their wide commits,
+                // each its own (--tp-commit-in-verify-min-seqs, #1176).
+                let tp_defer = crate::model::core::tp_commit_in_verify_min_seqs();
+                if tp_start.is_some() && layout.node.is_none() && tp_defer > 0 {
+                    exec.tp_deferred_commits(tp_defer);
+                } else if layout.node.is_some() || tp_start.is_some() {
                     // Their commits are not deferred (`Executor::commit`), so neither are the
                     // pools' (#836 part 38).
                     exec.no_deferred_commits();
@@ -4402,6 +4562,10 @@ impl LmEngine {
                     buft.name()
                 ))
             })?;
+        // The stop tokens a pick below `min_tokens` may not take (#1176). Set before the node
+        // and TP followers branch off: a layer split's rank 1 makes the step's picks.
+        let stop_tokens = chat_format.stop_tokens(&tokenizer);
+        exec.set_stop_tokens(&stop_tokens);
         let mut saved_host_bytes = 0u64;
         if saved_host {
             let moved = exec.saved_states_to_host().map_err(|e| {
@@ -4594,9 +4758,10 @@ impl LmEngine {
             };
         }
         // `--kv-vmm` (#814): the pools in reserved virtual ranges, before the cache is sized.
-        // The default on a V100 with the expert cache over a layer split of 2 GPUs (as measured,
-        // the same bits): the pools past the first KV_VMM_KEEP_DEFAULT tokens go to the cache.
-        let kv_auto = volta
+        // The default on a V100 (and a GH200, unmeasured: `spill_default`) with the expert cache
+        // over a layer split of 2 GPUs (as measured on V100s, the same bits): the pools past the
+        // first KV_VMM_KEEP_DEFAULT tokens go to the cache.
+        let kv_auto = spill_default
             && cfg.switches.kv_vmm.is_none()
             && mode == ExpertMode::Cache
             && layout.stages.len() == 2
@@ -4627,10 +4792,39 @@ impl LmEngine {
                  too; off: never)"
             );
         }
-        let kv_keep = cfg
-            .switches
-            .kv_vmm_keep
-            .or(kv_auto.then_some(KV_VMM_KEEP_DEFAULT));
+        // The bounded host tier (#37, an x86_64 PC's one discrete GPU): the same lend with no
+        // flag, the pool past its first KV_VMM_KEEP_TIER tokens. There every VRAM slot saves
+        // a copy over PCIe (or a checkpoint read), and the tail comes back when a chat needs
+        // it (`Worker::kv_make_room`). With every expert in host memory (`tier_whole`) a slot
+        // saves the same copy: the same lend.
+        let kv_tier = kv_vmm::tier_default(
+            exec.model().host_tier().is_some() || tier_whole,
+            cfg.switches.kv_vmm,
+            mode == ExpertMode::Cache,
+            layout.stages.len(),
+            tp_fit || tp_start.is_some() || layout.node.is_some(),
+            host_tokens,
+        );
+        // Not after a run whose chats were long (`kv_vmm::TierUse`): with the tail mapped the
+        // cache is worse off than with no lend. This run's chats decide the next load's.
+        let kv_long_file = (cfg.residency.tier_heat.as_deref())
+            .filter(|_| kv_tier)
+            .map(kv_vmm::tier_long_file);
+        let kv_tier = kv_tier && !kv_long_file.as_ref().is_some_and(|f| f.exists());
+        if kv_long_file.is_some() && !kv_tier {
+            tracing::info!(
+                kept_tokens = kv_vmm::KEEP_TIER,
+                "host expert tier: the last run's chats held more KV tokens than the lend \
+                 keeps most of the time: the KV pool's tail is not lent to the expert cache \
+                 this run (--kv-vmm-keep lends it anyway)"
+            );
+        }
+        let kv_auto = kv_auto || kv_tier;
+        let kv_keep = cfg.switches.kv_vmm_keep.or(kv_auto.then_some(if kv_tier {
+            kv_vmm::KEEP_TIER
+        } else {
+            KV_VMM_KEEP_DEFAULT
+        }));
         let mut kv_vmm_all = false;
         if cfg.switches.kv_vmm == Some(true) || kv_auto {
             kv_vmm_all = kv_vmm::apply(&mut exec, &layout, tp_fit)?;
@@ -4709,7 +4903,7 @@ impl LmEngine {
                     "KV cache: a host tier past the device blocks"
                 );
                 if let Some(budget) = exec.kv_slot_host_budget() {
-                    let nvlink = tier_link_nvlink(&layout);
+                    let link = tier_link(&layout);
                     let held = (budget * exec.kv_block_bytes()) as f64 / (1u64 << 30) as f64;
                     tracing::warn!(
                         "{max_seqs} sequences of {} tokens do not fit in GPU or host memory: \
@@ -4721,10 +4915,10 @@ impl LmEngine {
                         cfg.ctx_size,
                         slot_hbm * KV_BLOCK,
                         budget * KV_BLOCK,
-                        host_tier::speed_note(nvlink)
+                        host_tier::speed_note(link)
                     );
                 } else if auto_tier {
-                    let nvlink = tier_link_nvlink(&layout);
+                    let link = tier_link(&layout);
                     tracing::warn!(
                         "the {}-token context does not fit in GPU memory: a KV host tier of {} \
                         tokens ({gib:.1} GiB of pinned memory on NUMA node(s) {nodes:?}) is on, \
@@ -4732,13 +4926,15 @@ impl LmEngine {
                         cfg.ctx_size,
                         host_blocks * KV_BLOCK,
                         hbm_blocks * KV_BLOCK,
-                        host_tier::speed_note(nvlink)
+                        host_tier::speed_note(link)
                     );
                 }
             }
         }
         // The measured step compute buffers per stage (for the startup report).
         let mut measured_compute: Vec<usize> = Vec::new();
+        // Per stage: a long prompt's micro-chunk step buffer as measured (#1216).
+        let mut measured_long: Vec<usize> = Vec::new();
         // Per stage, for the memory plan: the VRAM kept free of the expert cache for step
         // compute buffers, and the prompt steps' room the cache took (may spill to host).
         let mut planned_compute: Vec<usize> = Vec::new();
@@ -4785,12 +4981,19 @@ impl LmEngine {
                 };
                 // A long prompt's micro-chunk over the lent cache: what a lend must free sizes
                 // how much of the cache long prompts keep (`ResidencyConfig::lend_need`).
+                // The bounded host tier (one GPU): a whole pass's step, as a kept slot's
+                // experts are neither copied nor read from the checkpoint.
+                let tier = exec.model().host_tier().is_some() && layout.stages.len() == 1;
                 let long = if cfg.residency.staging
                     && cfg.residency.lend_keep.is_empty()
                     && cfg.long_prompts.min_tokens > 0
-                    && layout.stages.len() > 1
+                    && (layout.stages.len() > 1 || tier)
                 {
-                    let tokens = cfg.long_prompts.micro;
+                    let tokens = if tier {
+                        ssd_tier::HOST_TIER_PASS.min(cfg.ctx_size / 2)
+                    } else {
+                        cfg.long_prompts.micro
+                    };
                     exec.measure_prompt_step(tokens, cfg.ctx_size.saturating_sub(tokens))
                         .map_err(err(format!("a {tokens}-token long prompt step")))?
                 } else {
@@ -4891,8 +5094,11 @@ impl LmEngine {
                 );
             }
             // `--expert-cache-fill-prompt-room`: the prompt steps' room goes to the cache where
-            // their buffers can spill into host memory. The default on V100s (an AC922).
-            let fill_prompt_room = cfg.residency.fills_prompt_room(volta);
+            // their buffers can spill into host memory. The default on V100s (an AC922) and a GH200,
+            // and on the bounded host tier's machine and model with every routed expert in host
+            // memory (`tier_whole`, #37 round 17): prompts of 2K and more lend the cache whole, so
+            // only short ones' buffers may spill; ~120 more slots on a 24 GB card.
+            let fill_prompt_room = cfg.residency.fills_prompt_room(spill_default || tier_whole);
             if fill_prompt_room && layout.stages.iter().any(|(d, _)| d.is_some_and(spills)) {
                 tracing::info!(
                     "expert cache takes the prompt steps' compute room (prompt buffers may spill \
@@ -4936,6 +5142,7 @@ impl LmEngine {
             // `--kv-vmm-keep` (#814): the pools' blocks past the kept ones give their VRAM to
             // the cache, and a lend must free it again beside a long step's buffers (the
             // blocks are mapped while the cache is lent).
+            measured_long.clone_from(&long);
             let mut long = long;
             if let Some(tokens) = kv_keep {
                 let plain = hbm_blocks == n_blocks
@@ -4943,7 +5150,9 @@ impl LmEngine {
                     && layout.node.is_none()
                     && tp_start.is_none()
                     && cfg.long_prompts.min_tokens > 0
-                    && !long.is_empty();
+                    // No measured long step with every expert in host memory on one GPU: a
+                    // lend there frees every slot, the tail's bytes among them.
+                    && (!long.is_empty() || (tier_whole && kv_tier));
                 if kv_vmm_all && plain {
                     let keep = crate::residency::kv_vmm::keep_blocks(tokens, KV_BLOCK, n_blocks);
                     if let Some((lend, bytes)) =
@@ -5233,8 +5442,8 @@ impl LmEngine {
             },
         );
 
-        let stop_tokens = chat_format.stop_tokens(&tokenizer);
         let (submit, rx) = std::sync::mpsc::channel();
+        let warming = Arc::new(AtomicBool::new(false));
         let expert_stats = exec.experts_mut().map(|experts| experts.stats());
         let stats = Arc::new(Mutex::new(EngineStats {
             rooflines: bandwidth::stage_rooflines(&layout),
@@ -5339,6 +5548,41 @@ impl LmEngine {
         let slot_host_budget = exec.kv_slot_host_budget();
         let slot_lend = exec.kv_slot_lend();
         let ring_ckpt_slots = exec.ring_save_slots();
+        // #1216: a lend caps the long prompt's micro-chunks to what each stage's GPU has left
+        // free. GLM-5.3-Flash over a layer split only (not its parallel decode). Its step
+        // buffer grows with the past (the indexer's scores): measured once more at none.
+        let long_micro = cfg.long_prompts.micro;
+        let long_step = if crate::model::glm5next::params(exec.hp()).is_some()
+            && exec.model().glm_par.is_none()
+            && measured_long.len() == layout.stages.len()
+            && long_micro > 0
+        {
+            match exec.measure_prompt_step(long_micro, 0) {
+                Ok(first) if first.len() == measured_long.len() => {
+                    (layout.stages.iter().zip(first).zip(&measured_long))
+                        .map(|(((d, _), b0), &b)| LongStep {
+                            device: *d,
+                            first: b0.min(b),
+                            last: b,
+                        })
+                        .collect()
+                }
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        let long_past = cfg.ctx_size.saturating_sub(long_micro).max(1);
+        // The bounded host tier (one GPU): the pass step measured at load, which caps a
+        // lend's passes to the VRAM it left free.
+        let tier_step = match (&measured_long[..], &layout.stages[..]) {
+            (&[bytes], [(device, _)]) if exec.model().host_tier().is_some() => Some((
+                *device,
+                bytes,
+                ssd_tier::HOST_TIER_PASS.min(cfg.ctx_size / 2),
+            )),
+            _ => None,
+        };
         let worker = Worker {
             exec,
             tokenizer: tokenizer.clone(),
@@ -5428,6 +5672,21 @@ impl LmEngine {
             lent: false,
             lent_short: false,
             can_lend: cfg.long_prompts.min_tokens > 0,
+            long_step,
+            long_past,
+            long_cap: 0,
+            long_reserve: 0,
+            kv_tier,
+            kv_tail_used: Instant::now(),
+            kv_use: kv_vmm::TierUse {
+                file: kv_long_file,
+                keep: (kv_vmm::KEEP_TIER / KV_BLOCK) as u32,
+                ..Default::default()
+            },
+            tier_step,
+            tier_cap: 0,
+            warming: warming.clone(),
+            warming_seen: false,
             clock: Default::default(),
             outbox: stream::Outbox::new(tokenizer.clone(), cfg.stream_thread_seqs),
         };
@@ -5469,6 +5728,7 @@ impl LmEngine {
             worker: Some(worker),
             load_report,
             split_probe,
+            warming,
         })
     }
 
@@ -5715,6 +5975,10 @@ impl Engine for LmEngine {
     fn stats(&self) -> EngineStats {
         self.stats.lock().map(|s| *s).unwrap_or_default()
     }
+
+    fn set_warming(&self, on: bool) {
+        self.warming.store(on, Ordering::Release);
+    }
 }
 
 /// Owns everything that touches the device, and the scheduler's bookkeeping.
@@ -5821,6 +6085,32 @@ struct Worker {
     lent_short: bool,
     /// Whether lending is possible (cleared after a failure).
     can_lend: bool,
+    /// #1216: per stage, its long prompt step's compute buffers as measured at load (empty:
+    /// no cap, see [`Self::long_micro_cap`]).
+    long_step: Vec<LongStep>,
+    /// The past [`LongStep::last`] was measured after.
+    long_past: usize,
+    /// The micro-chunk cap of the current lend (0: none).
+    long_cap: usize,
+    /// VRAM a KV tail mapped during the current lend leaves free for its step buffers.
+    long_reserve: usize,
+    /// The KV tail is lent with no flag for the bounded host tier ([`kv_vmm::tier_default`]).
+    kv_tier: bool,
+    /// When the tail was last mapped for, or held by, a decoding sequence
+    /// ([`kv_vmm::tier_holds`]).
+    kv_tail_used: Instant,
+    /// The run's chat lengths, for the next load's lend.
+    kv_use: kv_vmm::TierUse,
+    /// The bounded host tier on one GPU: the device, and the bytes a prompt step of that many
+    /// tokens took when measured at load.
+    tier_step: Option<(Option<crate::ggml::Device>, usize, usize)>,
+    /// The most tokens a staged pass of the current lend takes
+    /// ([`ssd_tier::host_tier_pass_cap`]; 0: no cap).
+    tier_cap: usize,
+    /// [`Engine::set_warming`], and what the expert cache was last told of it
+    /// ([`Self::warming_changed`]).
+    warming: Arc<AtomicBool>,
+    warming_seen: bool,
     /// `--kv-vmm-keep` (#814): the KV pools' tail, lent to the expert cache while no sequence
     /// needs it ([`kv_vmm::KvLend`]).
     kv_lend: Option<kv_vmm::KvLend>,
@@ -5997,6 +6287,8 @@ impl Worker {
         let mut experts_at = Instant::now();
         // `--deterministic` ([`waves`]): requests that arrived since the running wave started.
         let mut held: Vec<Job> = Vec::new();
+        // Every block is free before the first request.
+        self.kv_use.total = self.pool.free_blocks();
         loop {
             // The cache gets its VRAM back once no prompt is being read (before idling too).
             // `--kv-vmm-keep`: while the KV pools' tail holds some of the cache's VRAM, all but
@@ -6004,6 +6296,7 @@ impl Worker {
             if prefilling.is_empty() && !pipe.is_active() {
                 self.kv_shrink(&decoding);
             }
+            self.kv_use.note(decoding.len(), self.pool.free_blocks());
             if self.lent && prefilling.is_empty() {
                 self.restore_cache();
             }
@@ -6083,6 +6376,7 @@ impl Worker {
                 }
             }
             waiting.retain(|w| w.keep(&mut self.outbox));
+            self.warming_changed();
             // `on-demand`: room for the decoding sequences' next step, victims preempted.
             if self.on_demand()
                 && let Err(e) = self.make_room(&mut decoding, &mut prefilling, &mut waiting)
@@ -6642,6 +6936,28 @@ impl Worker {
     }
 
     /// Grows `seq`'s block table to hold `n` tokens, from its reservation.
+    /// Room for `k` drafted tokens past the kept positions of every decoding sequence not in
+    /// `done` and every prompt in `joined` ([`Self::grow`]).
+    fn grow_for_drafts(
+        &mut self,
+        decoding: &mut [Seq<'_>],
+        done: &[usize],
+        prefilling: &mut [Seq<'_>],
+        joined: &[usize],
+        k: usize,
+    ) -> Result<(), String> {
+        for (i, seq) in decoding.iter_mut().enumerate() {
+            if !done.contains(&i) {
+                self.grow(seq, seq.n_past + k)?;
+            }
+        }
+        for &i in joined {
+            let seq = &mut prefilling[i];
+            self.grow(seq, seq.n_past + k)?;
+        }
+        Ok(())
+    }
+
     fn grow(&mut self, seq: &mut Seq<'_>, n: usize) -> Result<(), String> {
         let have = seq.table.num_tokens() as usize;
         if n <= have {
@@ -6796,6 +7112,11 @@ impl Worker {
             if need == 0 || !short(self) {
                 return Ok(());
             }
+        }
+        // The bounded host tier's lend (#37) evicts no cached chat for the tail's sake:
+        // reading a chat again costs seconds, the mapped tail a few percent of decode.
+        let evicts = !self.kv_tier || self.kv_lend.as_ref().is_some_and(|l| l.grown);
+        if !resume && evicts {
             // Everything they hold is a kept block while the tail is lent, but blocks the
             // last shrink kept in host memory (#1196).
             let host_held = self.kv_lend.as_ref().is_some_and(|l| l.host_held > 0);
@@ -6821,16 +7142,18 @@ impl Worker {
         }
         let t = Instant::now();
         if !self.lent && self.can_lend {
-            self.lend_cache(0);
+            self.lend_cache(0, usize::MAX);
             if self.lent {
                 self.lent_short = true;
                 self.exec.set_pipeline_micro(self.micro);
                 self.exec.set_micro_taper(0);
             }
         }
+        self.kv_tail_used = Instant::now();
         let lend = self.kv_lend.as_mut().expect("a lent KV tail");
         let host_held = lend.host_held;
-        let (bytes, restored) = match lend.grow(&self.exec) {
+        let reserve = self.long_reserve;
+        let (bytes, restored, host) = match lend.grow(&self.exec, reserve) {
             Ok(b) => b,
             Err(e) => {
                 // Blocks kept in host memory may have lost their bytes: nothing resumes them.
@@ -6845,11 +7168,41 @@ impl Worker {
             ms = t.elapsed().as_secs_f64() * 1e3,
             mib = bytes >> 20,
             from_host_mib = restored >> 20,
+            host_mib = host >> 20,
             cache_lent = self.lent,
             resume,
             "KV pools' tail mapped for a sequence past the kept blocks (--kv-vmm-keep)"
         );
+        if host > 0 {
+            tracing::warn!(
+                host_mib = host >> 20,
+                "no VRAM left for part of the KV pools' tail: it is served from host memory \
+                 (slower attention past the kept blocks) instead of failing the request"
+            );
+        }
         Ok(())
+    }
+
+    /// Tells the expert cache when the startup warmup begins or is over
+    /// ([`Engine::set_warming`]): it does not learn from the warmup's prompts where a saved
+    /// routing heat file filled its slots (the bounded host tier). Over: the last warmup
+    /// step's deferred cache work runs first, still unlearned.
+    fn warming_changed(&mut self) {
+        let on = self.warming.load(Ordering::Acquire);
+        if on == self.warming_seen {
+            return;
+        }
+        self.warming_seen = on;
+        // Only such a cache is told; every other load runs as before.
+        if !(self.exec.model().experts()).is_some_and(|x| x.holds_warmup()) {
+            return;
+        }
+        if !on && let Err(e) = self.exec.quiesce() {
+            tracing::warn!(error = %e, "could not finish the warmup's steps");
+        }
+        if let Some(experts) = self.exec.experts_mut() {
+            experts.set_hold(on);
+        }
     }
 
     /// Evicts every cached prefix and warm sequence holding a block from `keep` on, then the
@@ -6921,6 +7274,23 @@ impl Worker {
             return;
         };
         if decoding.iter().any(|s| s.blocks.iter().any(|&b| b >= keep)) {
+            self.kv_tail_used = Instant::now();
+            return;
+        }
+        // The bounded host tier: mapped when a sequence was admitted whose reply will pass the
+        // kept blocks (`plan_step`); it stays until that reply is over.
+        if self.kv_tier {
+            let ahead = kv_vmm::tier_blocks_ahead(
+                (decoding.iter()).map(|s| (s.need, s.table.blocks().len())),
+            );
+            if ahead > self.pool.free_fast_blocks() as usize {
+                self.kv_tail_used = Instant::now();
+                return;
+            }
+        }
+        // The bounded host tier: a long chat's next turn finds its tail mapped.
+        let in_use = self.pool.slow_in_use() > 0;
+        if kv_vmm::tier_holds(self.kv_tier, in_use, self.kv_tail_used.elapsed()) {
             return;
         }
         let mut host = None;
@@ -6960,7 +7330,7 @@ impl Worker {
             shrunk = if self.pool.slow_in_use() == 0 {
                 lend.shrink(&mut self.exec, None)
             } else {
-                lend.grow(&self.exec).and(Err(e))
+                lend.grow(&self.exec, 0).and(Err(e))
             };
         }
         match shrunk {
@@ -6980,6 +7350,13 @@ impl Worker {
                 {
                     tracing::warn!(error = %e, "could not refill the expert cache");
                 }
+                // The bounded host tier's even share (#37): every layer's tail is mapped at
+                // its full size again by a lend and the restore the loop runs next.
+                let cut = (self.exec.model().experts()).is_some_and(|x| x.cut_slots() > 0);
+                if cut && !self.lent && self.can_lend {
+                    self.lend_cache(0, usize::MAX);
+                    self.lent_short = self.lent;
+                }
             }
             // The next sequence past the kept blocks maps what is unmapped again.
             Err(e) => {
@@ -6991,12 +7368,14 @@ impl Worker {
     /// Lends the expert cache's VRAM to the long prompt about to be read (see [`LongPrompts`]);
     /// on failure the cache keeps it and lending stays off. `tokens`: the longest prompt's
     /// tokens still to read.
-    fn lend_cache(&mut self, tokens: usize) {
+    fn lend_cache(&mut self, tokens: usize, end: usize) {
         let t = Instant::now();
         match self.exec.lend_experts(tokens) {
             Ok(true) => {
                 self.lent = true;
-                self.exec.set_pipeline_micro(self.long.micro);
+                (self.long_cap, self.long_reserve) = self.long_micro_cap(end);
+                self.size_tier_pass();
+                self.exec.set_pipeline_micro(self.capped(self.long.micro));
                 self.exec.set_micro_taper(self.long.taper);
                 tracing::info!(
                     ms = t.elapsed().as_secs_f64() * 1e3,
@@ -7014,11 +7393,27 @@ impl Worker {
         }
     }
 
+    /// The bounded host tier: a pass's step buffer stays in the VRAM the lend left free now
+    /// (the host's memory is the experts'). Sized again once the KV tail is mapped out of it.
+    fn size_tier_pass(&mut self) {
+        if let Some((Some(d), bytes, at)) = self.tier_step {
+            let keep = crate::model::core::LENT_SCRATCH + LENT_MICRO_MARGIN;
+            let free = d.memory().0.saturating_sub(keep);
+            self.tier_cap = ssd_tier::host_tier_pass_cap(free, bytes, at, KV_BLOCK);
+            tracing::info!(
+                free_mib = free >> 20,
+                pass_tokens = self.tier_cap,
+                "host expert tier: staged passes sized to the lent VRAM"
+            );
+        }
+    }
+
     /// Takes the expert cache's VRAM back after a long prompt; the slots refill in the
     /// background while steps run on.
     /// `--kv-vmm-keep` (#814): while the KV pools' tail is mapped, the cache's slots that held
     /// its VRAM stay without (whole layers; their experts read from host memory) until
-    /// [`Self::kv_shrink`] gives it back.
+    /// [`Self::kv_shrink`] gives it back. The bounded host tier (#37) takes it from every
+    /// layer's last slots instead, a few each.
     fn restore_cache(&mut self) {
         let t = Instant::now();
         let leave = self
@@ -7033,6 +7428,9 @@ impl Worker {
         }
         self.lent = false;
         self.lent_short = false;
+        self.long_cap = 0;
+        self.long_reserve = 0;
+        self.tier_cap = 0;
         self.exec.set_pipeline_micro(self.micro);
         self.exec.set_micro_taper(0);
         tracing::info!(
@@ -7040,6 +7438,60 @@ impl Worker {
             kv_tail,
             "expert cache restored, refilling"
         );
+    }
+
+    /// #1216: the longest micro-chunk (in whole KV blocks, at least [`MIN_LENT_MICRO`]) whose
+    /// long step buffer for a prompt ending `end` tokens in fits each stage GPU's free VRAM
+    /// now (just after a lend) beside [`crate::model::core::LENT_SCRATCH`], and the VRAM a KV
+    /// tail mapped during the lend must leave for it; `(0, 0)` (no cap) when the full
+    /// [`LongPrompts::micro`] fits, nothing was measured, or not even [`MIN_LENT_MICRO`] fits
+    /// (the step then spills as before). The buffer grows about linearly with the micro-chunk
+    /// and with the past ([`LongStep::at`]).
+    /// Smaller micro-chunks stage every expert more often, but a long step's buffer in host
+    /// memory ran prompts ~10x slower (an AC922 with 3 GPUs: GLM's staging ring takes nearly
+    /// all of a GPU's lent cache).
+    fn long_micro_cap(&self, end: usize) -> (usize, usize) {
+        let micro = self.long.micro;
+        let mut cap = micro;
+        for s in &self.long_step {
+            let bytes = s.at(end, self.long_past);
+            let Some(d) = s.device.filter(|_| bytes > 0) else {
+                continue;
+            };
+            let keep = crate::model::core::LENT_SCRATCH + LENT_MICRO_MARGIN;
+            let free = d.memory().0.saturating_sub(keep);
+            let fits = (free as u128 * micro as u128 / bytes as u128) as usize;
+            cap = cap.min(fits / KV_BLOCK * KV_BLOCK);
+        }
+        if cap >= micro || cap < MIN_LENT_MICRO {
+            return (0, 0);
+        }
+        let step = (self.long_step.iter())
+            .map(|s| (s.at(end, self.long_past) as u128 * cap as u128 / micro as u128) as usize)
+            .max()
+            .unwrap_or(0);
+        let reserve = step + crate::model::core::LENT_SCRATCH + LENT_MICRO_MARGIN;
+        tracing::info!(
+            micro = cap,
+            prompt_end = end.min(self.long_past),
+            reserve_mib = reserve >> 20,
+            free_mib = ?self
+                .long_step
+                .iter()
+                .map(|s| s.device.map_or(0, |d| d.memory().0 >> 20))
+                .collect::<Vec<_>>(),
+            "long prompt micro-chunks capped to what the lend left free (step buffers stay in VRAM)"
+        );
+        (cap, reserve)
+    }
+
+    /// `micro` within the current lend's cap ([`Self::long_micro_cap`]).
+    fn capped(&self, micro: usize) -> usize {
+        if self.long_cap > 0 {
+            micro.min(self.long_cap)
+        } else {
+            micro
+        }
     }
 
     /// One forward pass: a token for every decoding sequence plus prefill chunks within the
@@ -7055,6 +7507,23 @@ impl Worker {
             return Ok(());
         };
         self.clock.lap(host_time::Phase::Plan, &mut at);
+        // A step of one prompt's chunk alone that the MTP head takes in right after (not left
+        // for the next step, [`DeferredTakeIn`]): its rows stay on the device for the head's
+        // pieces, and only the last few are read back (#1183). A chunk that ends the prompt gets
+        // the blocks of its bonus token and drafts now: after the step, growing waits until the
+        // head has read those rows (`grow_after`), and the head's first pass writes past them.
+        let mtp_device = match (&self.drafting, &plan.chunks[..]) {
+            (Drafting::Mtp(_), &[(i, len)]) if decoding.is_empty() => {
+                let s = &prefilling[i];
+                let room = spec::device_take_in_room(s.prompt.len(), s.n_past, len, self.spec_k);
+                room.zip(self.exec.mtp_rows_device())
+                    .map(|(n, d)| (i, len, n, d))
+            }
+            _ => None,
+        };
+        if let Some((i, _, n, _)) = mtp_device {
+            self.grow(&mut prefilling[i], n)?;
+        }
         let asked = self.ask_captures(prefilling, &plan.chunks);
         let fed = fed_tokens(decoding, &plan);
         // Which rows are padding, for the MoE layers' expert kernels (`pad_rows`).
@@ -7087,13 +7556,16 @@ impl Worker {
             });
         }
         // A prompt's next chunk: its n-gram table rows are read (from the SSD with
-        // `--ngram-io direct`) while this step computes.
+        // `--ngram-io direct`) while this step computes; this step's fill does not wait for
+        // them (#1183).
         for &(i, len) in &plan.chunks {
             let s = &prefilling[i];
             let end = s.n_past + len;
             let next = &s.prompt[end..(end + len).min(s.prompt.len())];
             if !next.is_empty() {
-                self.exec.model().prefetch_ngram(&s.prompt[..end], next);
+                self.exec
+                    .model()
+                    .prefetch_ngram_next(&s.prompt[..end], next);
                 self.exec.model().prefetch_engram(&s.prompt[..end], next);
             }
         }
@@ -7128,6 +7600,19 @@ impl Worker {
             _ => 0,
         };
         self.exec.set_hidden_from(from);
+        // A decode or verify step: a drafter that gathers its take-in on the device reads the
+        // captured rows where the step left them, not a copy of all of them on the host (#1181).
+        let on_device = match &self.drafting {
+            Drafting::Model(d) if plan.chunks.is_empty() => d.reads_device_rows(),
+            _ => None,
+        };
+        self.exec.set_hidden_on_device(on_device);
+        // The MTP head's take-in from the device (see `mtp_device` above).
+        if let Some((_, len, _, device)) = mtp_device {
+            self.exec.set_hidden_on_device(Some(device));
+            self.exec
+                .set_hidden_on_device_from(spec::take_in_host_from(len));
+        }
         self.clock.lap(host_time::Phase::Pack, &mut at);
         let t_step = Instant::now();
         let out = self.exec.step(&groups).map_err(|e| e.to_string());
@@ -7234,16 +7719,20 @@ impl Worker {
                 .short_from()
                 .is_some_and(|n| prefilling.iter().any(|s| left(s) >= n));
         if (long || short) && !self.lent {
-            self.lend_cache(prefilling.iter().map(left).max().unwrap_or(0));
+            let end = prefilling.iter().map(|s| s.prompt.len()).max().unwrap_or(0);
+            self.lend_cache(prefilling.iter().map(left).max().unwrap_or(0), end);
             self.lent_short = !long;
             // `--kv-vmm-keep` with `--glm-parallel-decode` (#1174): a long prompt that will
             // pass the kept blocks maps the KV pools' tail now, while the VRAM the lend just
             // freed is free. Mapped mid-prompt, the prompt steps' buffers had taken it first
             // (cuMemCreate out of memory on 4 V100s with 16 sequences). The same blocks
             // and bits, mapped a few steps earlier.
+            // The bounded host tier's lend (#37) too: its passes are sized to the VRAM free
+            // once the tail is mapped (sized before, a 12K prompt's one pass found 960 MiB
+            // less than planned and its buffer spilled into host memory).
             if long
                 && self.lent
-                && self.exec.model().glm_par.is_some()
+                && (self.exec.model().glm_par.is_some() || self.kv_tier)
                 && self.kv_lend.as_ref().is_some_and(|l| !l.grown)
             {
                 let need = prefilling
@@ -7262,6 +7751,24 @@ impl Worker {
                             .any(|s| s.blocks.iter().any(|&b| b >= l.keep as u32))
                 });
                 self.kv_make_room(need, resume)?;
+                if self.kv_tier && self.kv_lend.as_ref().is_some_and(|l| l.grown) {
+                    self.size_tier_pass();
+                }
+            }
+        }
+        // The bounded host tier's lend (#37): sequences whose prompts and replies
+        // (`max_tokens`) will pass the kept blocks map the tail while the prompt is read,
+        // before the first token. Mapped in the middle of a reply, the lend and restore of
+        // the expert cache around it stalled the stream for half a second.
+        if self.kv_tier && !prefilling.is_empty() && self.kv_lend.as_ref().is_some_and(|l| !l.grown)
+        {
+            let ahead = kv_vmm::tier_blocks_ahead(
+                (prefilling.iter().chain(decoding.iter()))
+                    .map(|s| (s.need, s.table.blocks().len())),
+            );
+            self.kv_make_room(ahead, false)?;
+            if self.lent && self.kv_lend.as_ref().is_some_and(|l| l.grown) {
+                self.size_tier_pass();
             }
         }
         // A long prompt turns a short lend into a long one until the cache is restored (the
@@ -7282,7 +7789,11 @@ impl Worker {
         } else {
             self.long.batch_tokens
         };
-        let max_batch = if big {
+        // The bounded host tier: passes of what the lend left free, the prompt in equal ones.
+        let tier_pass = big && self.tier_cap > 0;
+        let max_batch = if tier_pass {
+            self.tier_cap
+        } else if big {
             long_batch.max(self.max_batch_tokens)
         } else {
             self.max_batch_tokens
@@ -7301,9 +7812,10 @@ impl Worker {
                 Some(lead) if riders => lead.prompt.len() - lead.n_past,
                 _ => prefilling.iter().map(|s| s.prompt.len() - s.n_past).sum(),
             };
-            micro = self
-                .long
-                .micro_for(left.min(max_batch), self.exec.n_stages());
+            micro = self.capped(
+                self.long
+                    .micro_for(left.min(max_batch), self.exec.n_stages()),
+            );
             self.exec.set_pipeline_micro(micro);
         }
         // What the riders may take besides the decoding sequences' rows.
@@ -7351,7 +7863,7 @@ impl Worker {
             if take == 0 {
                 break;
             }
-            let take = if self.prefill_even {
+            let take = if self.prefill_even || tier_pass {
                 even::even_take(
                     seq.prompt.len() - seq.n_past,
                     take,
@@ -7384,7 +7896,7 @@ impl Worker {
             && self.long.even
             && let [(_, len)] = chunks[..]
         {
-            let micro = self.long.even_micro(len, self.exec.n_stages());
+            let micro = self.capped(self.long.even_micro(len, self.exec.n_stages()));
             self.exec.set_pipeline_micro(micro);
         }
         if self.slo.is_some() {
@@ -7435,6 +7947,8 @@ impl Worker {
 
         // Shared with the take-ins left for the next step ([`DeferredTakeIn`]).
         let hidden = std::sync::Arc::new(out.hidden);
+        // Or the same rows still on the device ([`ModelDrafter::step_device`]).
+        let hidden_dev = out.hidden_dev;
         let mut rows = out.argmax.into_iter().zip(out.rows);
         let mut copies = Vec::new();
         let mut commits = Vec::new();
@@ -7681,15 +8195,12 @@ impl Worker {
             // that just finished and excluding sequences that have ended.
             let draft_batch = batch - done.len() + joined.len();
             // Drafts sit past the kept positions: room for them in the block tables (the
-            // next step takes those blocks anyway).
-            for (i, seq) in decoding.iter_mut().enumerate() {
-                if !done.contains(&i) {
-                    self.grow(seq, seq.n_past + k)?;
-                }
-            }
-            for &i in &joined {
-                let seq = &mut prefilling[i];
-                self.grow(seq, seq.n_past + k)?;
+            // next step takes those blocks anyway). A drafter reading the step's rows on the
+            // device (#1181) reads them first: growing can lend the expert cache, which drops
+            // the kept graphs and with them the buffer those rows are in.
+            let grow_after = !hidden_dev.is_empty();
+            if !grow_after {
+                self.grow_for_drafts(decoding, &done, prefilling, &joined, k)?;
             }
             let max_ctx = self.max_ctx;
             let draft_span = (joined.iter())
@@ -7823,7 +8334,12 @@ impl Worker {
                 let (Some((off, len)), false) = (chunk_of[i], ended.contains(&i)) else {
                     continue;
                 };
-                if defer && !joined.contains(&i) && seq.prompt.len() - seq.n_past <= KV_BLOCK {
+                // Not with its rows left on the device: those are gone by the next step.
+                if defer
+                    && hidden_dev.is_empty()
+                    && !joined.contains(&i)
+                    && seq.prompt.len() - seq.n_past <= KV_BLOCK
+                {
                     seq.draft = Draft::default();
                     seq.draft_cap = 0;
                     seq.take_in = Some(DeferredTakeIn {
@@ -7869,7 +8385,15 @@ impl Worker {
                 match &mut self.drafting {
                     Drafting::Model(d) => {
                         let t = Instant::now();
-                        d.step(&mut batch)?;
+                        if hidden_dev.is_empty() {
+                            d.step(&mut batch)?;
+                        } else {
+                            let rows = DeviceHidden {
+                                layers: &hidden_dev,
+                                first: &offs,
+                            };
+                            d.step_device(&mut batch, &rows)?;
+                        }
                         let ms = t.elapsed().as_secs_f64() * 1e3;
                         tracing::debug!(ms, seqs = batch.len(), "model drafts");
                         // A block drafter's pass, timed without a prompt's take-in.
@@ -7883,7 +8407,12 @@ impl Worker {
                         let passes = if self.exec.has_remote() {
                             d.step_remote(&mut self.exec, &mut batch, &blocks, &rings, &offs)?
                         } else {
-                            d.step(&mut self.exec, &mut batch, &blocks, &rings)?
+                            let rows = DeviceHidden {
+                                layers: &hidden_dev,
+                                first: &offs,
+                            };
+                            let dev = (!hidden_dev.is_empty()).then_some(&rows);
+                            d.step_rows(&mut self.exec, &mut batch, &blocks, &rings, dev)?
                         };
                         let ms = t.elapsed().as_secs_f64() * 1e3;
                         tracing::debug!(ms, passes, "mtp drafts");
@@ -7899,6 +8428,9 @@ impl Worker {
                     _ => unreachable!(),
                 }
                 self.clock.lap(host_time::Phase::Device, &mut at);
+            }
+            if grow_after {
+                self.grow_for_drafts(decoding, &done, prefilling, &joined, k)?;
             }
         }
         // Read: the next step copies its captured rows into them (#363), unless a take-in left
@@ -8135,6 +8667,33 @@ enum StepRow<'a> {
     Picked(u32, Option<Vec<f32>>),
 }
 
+/// What a step returns for a sequence that has `generated` of its `min_tokens` tokens:
+/// `greedy` (no grammar, greedy sampling, no log probabilities) only its greedy pick, the
+/// device argmax ([`Logits::Greedy`]), or below `min_tokens` the pick with the stop tokens
+/// masked ([`Logits::Pick`]: the executor reads back only what that needs, often nothing, #1176);
+/// otherwise the full row.
+fn logits_kind(greedy: bool, generated: u32, min_tokens: u32) -> Logits {
+    if !greedy {
+        Logits::Last
+    } else if generated >= min_tokens {
+        Logits::Greedy
+    } else {
+        Logits::Pick
+    }
+}
+
+/// What a verify step returns for `n` rows of a sequence whose [`logits_kind`] is `kind`: rows
+/// `0..min_tokens - generated` of a [`Logits::Pick`] sequence are below `min_tokens`.
+fn verify_logits(kind: Logits, n: usize, generated: u32, min_tokens: u32) -> Logits {
+    match kind {
+        Logits::Greedy => Logits::FirstGreedy(n),
+        Logits::Pick => {
+            Logits::FirstPick(n, (min_tokens.saturating_sub(generated) as usize).min(n))
+        }
+        _ => Logits::First(n),
+    }
+}
+
 /// One sequence being generated: everything but the model state.
 struct Active<'t> {
     sampler: Sampler,
@@ -8219,19 +8778,13 @@ impl<'t> Active<'t> {
         }
     }
 
-    /// What the step must return for this sequence: only the argmax when that is the whole
-    /// sampling decision and no log probabilities are asked for. While `min_tokens` masking
-    /// is still needed the full row is required, because the argmax-only path cannot mask.
+    /// What the step must return for this sequence ([`logits_kind`]).
     fn logits_kind(&self) -> Logits {
-        if !self.constrained()
-            && self.sampler.is_greedy()
-            && self.logprobs.is_none()
-            && self.generated >= self.min_tokens
-        {
-            Logits::Greedy
-        } else {
-            Logits::Last
-        }
+        logits_kind(
+            !self.constrained() && self.sampler.is_greedy() && self.logprobs.is_none(),
+            self.generated,
+            self.min_tokens,
+        )
     }
 
     /// What [`Self::advance`] samples from, for a step row with device argmax `t` and `logits`
@@ -8281,13 +8834,9 @@ impl<'t> Active<'t> {
         }
     }
 
-    /// What a verify step must return for this sequence's `n` real rows.
+    /// What a verify step must return for this sequence's `n` rows ([`verify_logits`]).
     fn verify_logits(&self, n: usize) -> Logits {
-        if self.logits_kind() == Logits::Greedy {
-            Logits::FirstGreedy(n)
-        } else {
-            Logits::First(n)
-        }
+        verify_logits(self.logits_kind(), n, self.generated, self.min_tokens)
     }
 
     /// When the request arrived (queued, before admission).

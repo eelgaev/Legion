@@ -86,6 +86,19 @@ static BF16_ON: AtomicBool = AtomicBool::new(true);
 /// Largest low rank the BF16 kernel takes (its `up` rows staged in 48 KiB of shared memory).
 const MAX_RANK_BF16: i64 = 368;
 
+/// The BF16 kernel launches run with ([`force_kernel`]).
+static KERNEL: AtomicI32 = AtomicI32::new(0);
+
+/// Forces the BF16 up-mix's kernel for the launches from now on (`legion hc-up-mix-bench`): 0
+/// the default (`up_mix_bf16_reg` at rank 320 and 512 tokens or more, else `up_mix_bf16`), 1
+/// `up_mix_bf16`, 2 `up_mix_bf16_reg` at any token count, 2 + 100 R its runs of R tiles a CTA
+/// (`src/cuda/hc_up_mix.cu`). Every kernel adds the same products in the same order, so the
+/// same bits.
+#[doc(hidden)]
+pub fn force_kernel(kernel: i32) {
+    KERNEL.store(kernel, Ordering::Relaxed);
+}
+
 /// Sets whether graphs built from now on run the mixer's up matmul and gated mix as one op for
 /// BF16 `up` weights where it fits (on by default; [`set_up_mix`] off turns it off too); `false`
 /// keeps ggml's cuBLAS `mul_mat` and `hc_pre`.
@@ -128,16 +141,11 @@ pub fn set_gpu(cc_major: Option<i32>, sms: i32) {
     );
 }
 
-/// The SMs of `up`'s GPU where the op runs there, else 0: the engine's GPU is one it is chosen
-/// for ([`set_gpu`]) and so is the weight's own device (asked once per device: a box may hold
-/// GPUs of different architectures, #1201), whose SM count the split is planned for.
+/// The SMs of `up`'s GPU where the op is chosen for it (compute capability 12.x), else 0: asked
+/// once per device (a box may hold GPUs of different architectures, #1201), whose SM count the
+/// split is planned for; the engine's GPU's ([`set_gpu`]) where the weight names no device.
 fn sms_for(up: Tensor<'_>) -> i32 {
-    let engine = GPU_SMS.load(Ordering::Relaxed);
-    if engine <= 0 {
-        return 0;
-    }
-    up.cuda_device()
-        .map_or(engine, crate::hw::per_device::sms_if_cc12)
+    crate::hw::per_device::sms_if_cc12_on(up.cuda_device(), GPU_SMS.load(Ordering::Relaxed))
 }
 
 /// ggml-cuda's MMQ tile widths for a Q8_0 weight whose rows are a multiple of 128
@@ -315,6 +323,161 @@ pub(super) fn up_mix<'a>(
     node(ctx, &[up, lo, xn], e, rank, n, hc, scale)
 }
 
+/// Where `lo` as BF16 (`rank · n` values) sits in its `hc_up_lob` node of `node_bytes` bytes:
+/// at the node's end, 256-byte aligned. The node has the gate's size (see [`HC_UP_LOB`]), far
+/// more than `lo` needs; whatever the allocator puts first in its memory once the mix has run
+/// (usually the BF16 copy of the mixed values, the next node) then shares none of it with the
+/// part the mix reads, so the mix may write that copy itself (#1183, [`mix_cast_reads`]).
+pub(super) fn lob_offset(node_bytes: usize, rank: usize, n: usize) -> usize {
+    (node_bytes - rank * n * 2) / 256 * 256
+}
+
+/// The BF16 `lo` of the `hc_up_lob` node `lob` ([`lob_offset`]).
+///
+/// # Safety
+/// `lob` is a node made by [`up_mix`] or [`up_mix_rebuilt`] with memory; `rank` and `n` its
+/// `lo`'s.
+unsafe fn lob_data(lob: &ffi::ggml_tensor, rank: usize, n: usize) -> *mut u16 {
+    // SAFETY: the caller's; the offset stays within the node.
+    unsafe {
+        let bytes = ffi::ggml_nbytes(lob);
+        (lob.data as *mut u8).add(lob_offset(bytes, rank, n)) as *mut u16
+    }
+}
+
+/// For a BF16 mix node (`up_mix` or `up_mix_rebuilt` with a BF16 `up`) that writes no BF16
+/// copy yet: the bytes it reads (`up`, the part of its `hc_up_lob` node holding `lo`, `xn` or
+/// the streams, and the scales and gamma), as `(start, end)` ranges. `None` for any other
+/// node. The node fusion asks it before the mix writes a cast's values ([`set_mix_cast`]).
+///
+/// # Safety
+/// `node` is a valid tensor of an allocated graph; its sources valid tensors.
+pub(crate) unsafe fn mix_cast_reads(node: *const ffi::ggml_tensor) -> Option<Vec<(usize, usize)>> {
+    // SAFETY: the caller's.
+    unsafe {
+        let op = crate::ggml::op_of(node)?;
+        let t = &*node;
+        if !std::ptr::eq(op, &HC_UP_MIX)
+            || t.src[0].is_null()
+            || (*t.src[0]).type_ != types::BF16
+            || t.src[1].is_null()
+            || t.src[2].is_null()
+            || !t.src[MIX_CAST_SRC].is_null()
+            || t.data.is_null()
+        {
+            return None;
+        }
+        let lob = &*t.src[1];
+        let lo = &*lob.src[0];
+        let (rank, n) = (lo.ne[0] as usize, lo.ne[1] as usize);
+        let whole = |s: *const ffi::ggml_tensor| {
+            let p = (*s).data as usize;
+            (p, p + ffi::ggml_nbytes(s))
+        };
+        let l = lob_data(lob, rank, n) as usize;
+        let mut reads = vec![whole(t.src[0]), (l, l + rank * n * 2)];
+        // (src[5] is the cast; 6 and 7 the lazy streams' inputs, `set_lazy_streams`.)
+        for &s in t.src[2..5]
+            .iter()
+            .chain(&t.src[LAZY_OUT_SRC..=LAZY_INJ_SRC])
+        {
+            if !s.is_null() {
+                reads.push(whole(s));
+            }
+        }
+        Some(reads)
+    }
+}
+
+/// The source slot of a BF16 mix node's BF16 copy ([`set_mix_cast`]).
+const MIX_CAST_SRC: usize = 5;
+
+/// The parameter of a BF16 mix node set when it does not write the F32 mixed values.
+const P_SKIP_F32: usize = 2;
+
+/// The parameter of a BF16 mix node that the all-gather reading it sets ([`set_by_exchange`]).
+const P_BY_EXCHANGE: usize = 3;
+
+/// Leaves the BF16 mix node `node` ([`mix_cast_reads`]) to the all-gather that alone reads it
+/// (#1176, [`crate::tp_net::seq_par::take_mix`]): on CUDA the node launches nothing, and the
+/// exchange runs the mix itself ([`launch_mix`]), its values rounded to BF16 straight into the
+/// send buffer. The CPU op computes the node as before.
+///
+/// # Safety
+/// As [`crate::ggml::make_external`]: a valid mix node of an allocated graph that has not run.
+pub(crate) unsafe fn set_by_exchange(node: *mut ffi::ggml_tensor) {
+    // SAFETY: the caller's.
+    unsafe { crate::ggml::set_external_param(node, P_BY_EXCHANGE, 1) };
+}
+
+/// Makes the BF16 mix node `node` ([`mix_cast_reads`]) also write its mixed values rounded to
+/// BF16 into `cast` (contiguous BF16, as many values), as ggml's F32 -> BF16 copy rounds them
+/// (#1183); with `skip_f32`, not the F32 values themselves (nothing reads them).
+///
+/// # Safety
+/// As [`crate::ggml::make_external`]: valid nodes of an allocated graph that has not run.
+pub(crate) unsafe fn set_mix_cast(
+    node: *mut ffi::ggml_tensor,
+    cast: *mut ffi::ggml_tensor,
+    skip_f32: bool,
+) {
+    // SAFETY: the caller's.
+    unsafe {
+        (*node).src[MIX_CAST_SRC] = cast;
+        crate::ggml::set_external_param(node, P_SKIP_F32, i32::from(skip_f32));
+    }
+}
+
+/// The source slot of a lazy-streams mix node's block output ([`set_lazy_streams`]); its
+/// inject weights are in the next.
+const LAZY_OUT_SRC: usize = 6;
+const LAZY_INJ_SRC: usize = 7;
+
+/// Whether `node` is a mix node made by [`up_mix_rebuilt`] with a BF16 `up` and F32 streams
+/// that does not make its streams yet ([`set_lazy_streams`], #1183).
+///
+/// # Safety
+/// `node` is a valid tensor.
+pub(crate) unsafe fn lazy_mix_target(node: *const ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's; a mix node's sources are valid tensors.
+    unsafe {
+        if !crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &HC_UP_MIX)) {
+            return false;
+        }
+        let t = &*node;
+        !t.src[0].is_null()
+            && (*t.src[0]).type_ == types::BF16
+            && !t.src[2].is_null()
+            && (*t.src[2]).type_ == types::F32
+            && !t.src[3].is_null()
+            && !t.src[4].is_null()
+            && t.src[LAZY_OUT_SRC..].iter().all(|s| s.is_null())
+    }
+}
+
+/// Makes the [`lazy_mix_target`] `node` read the streams before the attention block's
+/// combine, `res` (F32 `[e, hc, n]`, contiguous), and make the new streams itself per value
+/// as the norm did, `out · w + res` with `w = 2 sigmoid(inj / hc)` per stream (one FMA on
+/// CUDA, the norm kernels' expressions, so the same bits): `out` the block's output (F32
+/// `[e, n]`, rows contiguous), `inj` the norm's inject weights for it (F32 `[hc, n]`, rows
+/// contiguous). Lazy streams (#1183): that norm then need not write the new streams.
+///
+/// # Safety
+/// As [`crate::ggml::make_external`]: valid nodes of an allocated graph that has not run.
+pub(crate) unsafe fn set_lazy_streams(
+    node: *mut ffi::ggml_tensor,
+    res: *mut ffi::ggml_tensor,
+    out: *mut ffi::ggml_tensor,
+    inj: *mut ffi::ggml_tensor,
+) {
+    // SAFETY: the caller's.
+    unsafe {
+        (*node).src[2] = res;
+        (*node).src[LAZY_OUT_SRC] = out;
+        (*node).src[LAZY_INJ_SRC] = inj;
+    }
+}
+
 /// The F32 `lo` (`[rank, n]`) a BF16 mix node reads: its `lob` node's source.
 ///
 /// # Safety
@@ -333,7 +496,8 @@ unsafe fn cpu_hc_up_lob(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
     unsafe {
         let lo = &*dst.src[0];
         let m = ffi::ggml_nelements(lo) as usize;
-        let (x, y) = (lo.data as *const f32, dst.data as *mut u16);
+        let y = lob_data(dst, lo.ne[0] as usize, lo.ne[1] as usize);
+        let x = lo.data as *const f32;
         for i in (ith..m).step_by(nth) {
             *y.add(i) = crate::model::nvfp4_mm::bf16_bits(*x.add(i));
         }
@@ -348,7 +512,7 @@ unsafe fn cuda_hc_up_lob(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
         let mut p = HcUpMix::empty();
         p.lo = lo.data as *const f32;
         (p.rank, p.n) = (lo.ne[0] as i32, lo.ne[1] as i32);
-        p.lob = dst.data as *mut u16;
+        p.lob = lob_data(dst, lo.ne[0] as usize, lo.ne[1] as usize);
         match legion_hc_up_lob_launch(&p, stream) {
             0 => Ok(()),
             e => Err(format!("hc_up_lob: error {e}")),
@@ -361,7 +525,8 @@ unsafe fn cuda_hc_up_lob(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
 /// `res` the new streams (F32 `[e, hc, n]`), `scales` each stream's norm scale (F32 `[hc, n]`),
 /// `gamma` the norm's weight (F32 `[e · hc]`), all contiguous. Saves the norm writing `xn` and
 /// this op reading it back: `res` is read instead (#526). `res` may also be BF16, the streams
-/// of `legion serve --hc-streams-bf16` (#826): each value is widened to F32 first.
+/// of `legion serve --hc-streams-bf16` (#826) or, for a BF16 `up`, `--hc-bf16` (#1183): each
+/// value is widened to F32 first.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn up_mix_rebuilt<'a>(
     ctx: &'a Context,
@@ -395,11 +560,10 @@ pub(super) fn up_mix_rebuilt<'a>(
         assert!(t.is_contiguous(), "hc_up_mix: contiguous operands");
     }
     if bf16 {
-        // F32 streams only (the BF16 kernel's rebuild); the two nodes of `up_mix`'s BF16 form,
-        // the mix node reading the streams, scales and gamma in place of `xn`. `res` and the
-        // scales are views of the norm's node, as `xn` is, so ggml's allocator frees and
-        // places every tensor as it does for `up_mix` (#836).
-        assert_eq!(res.ty(), types::F32, "hc_up_mix: F32 streams for a BF16 up");
+        // The two nodes of `up_mix`'s BF16 form, the mix node reading the streams, scales and
+        // gamma in place of `xn`. `res` and the scales are views of the norm's node, as `xn`
+        // is, so ggml's allocator frees and places every tensor as it does for `up_mix` (#836).
+        // BF16 streams: `legion serve --hc-bf16` (#1183).
         let lob = ctx.external(&HC_UP_LOB, types::F32, [rows, n, 1, 1], &[lo]);
         return ctx.external_with(
             &HC_UP_MIX,
@@ -476,7 +640,19 @@ unsafe fn cpu_hc_up_mix(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
         let bf16 = |b: u16| f32::from_bits(u32::from(b) << 16);
         // BF16: `lo` as BF16 from the `hc_up_lob` node (src[1]), as on CUDA. The F32 `lo` is
         // no source of this node: the allocator may have handed its memory on (to `dst`).
-        let lob = (*dst.src[1]).data as *const u16;
+        let lob = if up_bf16 {
+            lob_data(&*dst.src[1], rank, n) as *const u16
+        } else {
+            std::ptr::null()
+        };
+        // The node fusion's BF16 copy of the mixed values (#1183), and whether the F32 ones go.
+        let mixedb = dst.src[MIX_CAST_SRC];
+        let mixedb = (!mixedb.is_null()).then(|| (*mixedb).data as *mut u16);
+        let skip_f32 = params[P_SKIP_F32] != 0;
+        // Lazy streams (#1183): the attention block's output and its inject weights, combined
+        // into the streams first as the norm's CPU code combines them.
+        let lazy = (!dst.src[LAZY_OUT_SRC].is_null())
+            .then(|| (&*dst.src[LAZY_OUT_SRC], &*dst.src[LAZY_INJ_SRC]));
         let mut q = vec![0i8; rank];
         let mut d = vec![0f32; nkb];
         let mut xb = vec![0f32; rank];
@@ -515,16 +691,36 @@ unsafe fn cpu_hc_up_mix(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
                     *g = sum;
                 }
             }
+            let pre = lazy.map(|(o, j)| {
+                let orow = (o.data as *const u8).add(t * o.nb[1]) as *const f32;
+                let irow = (j.data as *const u8).add(t * j.nb[1]) as *const f32;
+                let w: Vec<f32> = (0..hc)
+                    .map(|c| {
+                        let v = *irow.add(c) * (1.0 / hc as f32);
+                        1.0 / (1.0 + (-v).exp()) * 2.0
+                    })
+                    .collect();
+                (orow, w)
+            });
             for i in 0..e {
                 let mut sum = 0f32;
                 for c in 0..hc {
                     let mut xv = xv_at(t * rows + c * e + i);
+                    if let Some((orow, w)) = &pre {
+                        xv = *orow.add(i) * w[c] + xv;
+                    }
                     if let Some((sc, g)) = rebuilt {
                         xv = (xv * *sc.add(t * hc + c)) * *g.add(c * e + i);
                     }
                     sum += xv * (1.0 / (1.0 + (-gate[c * e + i]).exp()));
                 }
-                *out.add(t * e + i) = scale * sum;
+                let v = scale * sum;
+                if !skip_f32 {
+                    *out.add(t * e + i) = v;
+                }
+                if let Some(b) = mixedb {
+                    *b.add(t * e + i) = crate::model::nvfp4_mm::bf16_bits(v);
+                }
             }
         }
     }
@@ -562,6 +758,18 @@ struct HcUpMix {
     lob: *mut u16,
     /// Nonzero: `lob` already holds `lo` as BF16 (the `hc_up_lob` node).
     lob_ready: i32,
+    /// BF16 `up` only: null, or where the mixed values rounded to BF16 go ([`set_mix_cast`]).
+    mixedb: *mut u16,
+    /// Nonzero: the F32 mixed values are not written.
+    skip_f32: i32,
+    /// BF16 `up` only: the kernel ([`force_kernel`]; 0 the default).
+    kernel: i32,
+    /// Null, or (lazy streams, [`set_lazy_streams`]) the attention block's output and its
+    /// inject weights, combined into `res` first, rows `pre_out_ld` / `pre_inj_ld` floats apart.
+    pre_out: *const f32,
+    pre_out_ld: i64,
+    pre_inj: *const f32,
+    pre_inj_ld: i64,
 }
 
 #[cfg(feature = "cuda")]
@@ -587,6 +795,13 @@ impl HcUpMix {
             up_bf16: 0,
             lob: std::ptr::null_mut(),
             lob_ready: 0,
+            mixedb: std::ptr::null_mut(),
+            skip_f32: 0,
+            kernel: 0,
+            pre_out: std::ptr::null(),
+            pre_out_ld: 0,
+            pre_inj: std::ptr::null(),
+            pre_inj_ld: 0,
         }
     }
 }
@@ -595,10 +810,46 @@ impl HcUpMix {
 unsafe extern "C" {
     fn legion_hc_up_mix_launch(p: *const HcUpMix, stream: *mut c_void) -> i32;
     fn legion_hc_up_lob_launch(p: *const HcUpMix, stream: *mut c_void) -> i32;
+    fn legion_hc_up_mix_last_kernel() -> i32;
+}
+
+/// The BF16 up-mix kernel the last launch ran, numbered as [`force_kernel`] numbers them (0: none
+/// yet, or no CUDA build).
+#[doc(hidden)]
+pub fn last_kernel() -> i32 {
+    #[cfg(feature = "cuda")]
+    {
+        // SAFETY: reads an atomic.
+        unsafe { legion_hc_up_mix_last_kernel() }
+    }
+    #[cfg(not(feature = "cuda"))]
+    0
 }
 
 #[cfg(feature = "cuda")]
 unsafe fn cuda_hc_up_mix(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
+    // The all-gather reading it runs it ([`set_by_exchange`]).
+    if crate::ggml::external_params(dst)[P_BY_EXCHANGE] != 0 {
+        return Ok(());
+    }
+    // SAFETY: the caller's.
+    unsafe { launch_mix(dst, None, stream) }
+}
+
+/// Runs the mix node `dst` on `stream`: as the node itself (`out16` `None`), or, for the
+/// all-gather that took it over ([`set_by_exchange`], #1176), a BF16 mix with its values rounded
+/// to BF16 at the device address `out16` only (`[e, n]` contiguous: the gather's send buffer),
+/// as [`set_mix_cast`]'s copy rounds them, the F32 values not written.
+///
+/// # Safety
+/// `dst` is a mix node of an allocated graph whose sources hold their values, device tensors
+/// of the stream's device; `out16` device-writable for the node's values.
+#[cfg(feature = "cuda")]
+pub(crate) unsafe fn launch_mix(
+    dst: &ffi::ggml_tensor,
+    out16: Option<u64>,
+    stream: *mut c_void,
+) -> Result<(), String> {
     // SAFETY: a node made by `up_mix`, device tensors of the stream's device.
     unsafe {
         let (up, xn) = (&*dst.src[0], &*dst.src[2]);
@@ -619,7 +870,7 @@ unsafe fn cuda_hc_up_mix(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
             ),
             None => (null, null, null),
         };
-        let p = HcUpMix {
+        let mut p = HcUpMix {
             up: up.data as *const u8,
             up_nb1: up.nb[1] as i64,
             lo: lo.data as *const f32,
@@ -652,18 +903,46 @@ unsafe fn cuda_hc_up_mix(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
             up_bf16: i32::from(up_bf16),
             // BF16: the `hc_up_lob` node (src[1]) holds `lo` as BF16 already.
             lob: if up_bf16 {
-                (*dst.src[1]).data as *mut u16
+                lob_data(&*dst.src[1], rank as usize, n as usize)
             } else {
                 std::ptr::null_mut()
             },
             lob_ready: i32::from(up_bf16),
+            // The node fusion's BF16 copy of the mixed values, if it made one (#1183).
+            mixedb: match dst.src[MIX_CAST_SRC] {
+                c if c.is_null() => std::ptr::null_mut(),
+                c => (*c).data as *mut u16,
+            },
+            skip_f32: params[P_SKIP_F32],
+            kernel: KERNEL.load(Ordering::Relaxed),
+            pre_out: std::ptr::null(),
+            pre_out_ld: 0,
+            pre_inj: std::ptr::null(),
+            pre_inj_ld: 0,
         };
+        if let Some(a) = out16 {
+            if !up_bf16 {
+                return Err("hc_up_mix: only a BF16 mix writes for an exchange".into());
+            }
+            p.mixedb = a as *mut u16;
+            p.skip_f32 = 1;
+        }
+        // Lazy streams (#1183, `set_lazy_streams`).
+        if !dst.src[LAZY_OUT_SRC].is_null() {
+            let (o, j) = (&*dst.src[LAZY_OUT_SRC], &*dst.src[LAZY_INJ_SRC]);
+            p.pre_out = o.data as *const f32;
+            p.pre_out_ld = (o.nb[1] / 4) as i64;
+            p.pre_inj = j.data as *const f32;
+            p.pre_inj_ld = (j.nb[1] / 4) as i64;
+        }
         match legion_hc_up_mix_launch(&p, stream) {
             0 => Ok(()),
             e => Err(format!("hc_up_mix: error {e}")),
         }
     }
 }
+
+pub mod bench;
 
 #[cfg(test)]
 mod tests;

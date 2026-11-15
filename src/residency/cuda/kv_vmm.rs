@@ -115,6 +115,51 @@ impl VmmBuffer {
             rt(cudaMemset(va as *mut c_void, 0, n), "cudaMemset(KV pool)")
         }
     }
+
+    /// Backs piece `i`, which has nothing mapped now, with a host piece instead of VRAM
+    /// (#1216: no VRAM left for it), zeroed with `zero`. The device reads and writes it over
+    /// the link at the same address; the next unmap gives it back to the pool.
+    fn back_host(&mut self, i: usize, zero: bool) -> Result<(), String> {
+        let (off, n) = (self.maps[i].off, self.maps[i].n);
+        let va = self.va + off as u64;
+        let hp = host_take(self.device, n, usize::MAX)?;
+        // SAFETY: the host piece's own range, then this buffer's piece, which has nothing
+        // mapped now; on failure the piece is unmapped again and goes back to the pool.
+        unsafe {
+            if zero
+                && let Err(e) = rt(
+                    cudaMemset(hp.va as *mut c_void, 0, n),
+                    "cudaMemset(KV host piece)",
+                )
+            {
+                host_give(hp);
+                return Err(e);
+            }
+            if let Err(e) = map_host(self.device, va, &hp) {
+                host_give(hp);
+                return Err(e);
+            }
+        }
+        self.maps[i].back = Back::Host(hp);
+        Ok(())
+    }
+}
+
+/// Maps host piece `hp` at `va` (a piece of a KV pool with nothing mapped) for `device`.
+///
+/// # Safety
+/// `va` must be a reserved, unmapped range of `hp.n` bytes.
+unsafe fn map_host(device: usize, va: CUdeviceptr, hp: &HostPiece) -> Result<(), String> {
+    // SAFETY: as the caller promises.
+    unsafe {
+        cu(cuMemMap(va, hp.n, 0, hp.h, 0), "cuMemMap(KV host)")?;
+        let a = access(CU_MEM_LOCATION_TYPE_DEVICE, device as i32);
+        let r = cu(cuMemSetAccess(va, hp.n, &a, 1), "cuMemSetAccess(KV host)");
+        if r.is_err() {
+            cuMemUnmap(va, hp.n);
+        }
+        r
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -383,11 +428,26 @@ pub fn kv_vmm_unmap(
     }
 }
 
+/// What [`kv_vmm_remap`] mapped: bytes backed by VRAM again, of them those copied back from
+/// host memory, and bytes left in (or backed by) host memory for want of VRAM (#1216).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Remapped {
+    pub vram: usize,
+    pub restored: usize,
+    pub host: usize,
+}
+
 /// Backs every piece of `--kv-vmm` tensor `t` that [`kv_vmm_unmap`] left without memory with
 /// new, zeroed VRAM, and every piece it left in host memory with new VRAM holding its bytes
-/// (the host piece goes back to the pool), done before this returns. Returns the bytes
-/// mapped, and of them those that came from host memory.
-pub fn kv_vmm_remap(t: Tensor<'_>) -> Result<(usize, usize), String> {
+/// (the host piece goes back to the pool), done before this returns.
+///
+/// `host_below` (#1216): with `Some(reserve)`, a piece takes VRAM only while the device has
+/// at least its bytes and `reserve` more free (and the allocation succeeds); otherwise it is
+/// backed by a zeroed host piece, or a piece already in host memory stays there with its
+/// bytes. The blocks keep their address either way, so a sequence past the kept blocks is
+/// served from host memory over the link instead of failing for want of VRAM. `None`: VRAM
+/// or an error, as before.
+pub fn kv_vmm_remap(t: Tensor<'_>, host_below: Option<usize>) -> Result<Remapped, String> {
     let (b, at) = vmm_of(t).ok_or("not a --kv-vmm tensor")?;
     let end = at + t.nbytes();
     use_device(b.device)?;
@@ -399,7 +459,14 @@ pub fn kv_vmm_remap(t: Tensor<'_>) -> Result<(usize, usize), String> {
         // SAFETY: nothing queued may still read a host piece's mapping, unmapped below.
         rt(unsafe { cudaDeviceSynchronize() }, "cudaDeviceSynchronize")?;
     }
-    let (mut mapped, mut restored) = (0, 0);
+    let device = b.device;
+    // Whether a piece of `n` bytes may take VRAM (always without a fallback or a reserve: it
+    // goes to host memory only once VRAM fails it).
+    let room = |n: usize| match host_below {
+        None | Some(0) => true,
+        Some(reserve) => free_vram(device).is_ok_and(|f| f >= n.saturating_add(reserve)),
+    };
+    let mut out = Remapped::default();
     let mut done: Vec<HostPiece> = Vec::new();
     let r = (|| {
         for i in 0..b.maps.len() {
@@ -411,8 +478,27 @@ pub fn kv_vmm_remap(t: Tensor<'_>) -> Result<(usize, usize), String> {
             match std::mem::replace(&mut p.back, Back::None) {
                 Back::Vram(h) => p.back = Back::Vram(h),
                 Back::None => {
-                    b.back(i, true)?;
-                    mapped += n;
+                    let vram = if room(n) {
+                        b.back(i, true)
+                    } else {
+                        Err(String::new())
+                    };
+                    match vram {
+                        Ok(()) => out.vram += n,
+                        // Mapped but not zeroed (or no fallback): an error, as before.
+                        Err(e) if host_below.is_none() || !matches!(b.maps[i].back, Back::None) => {
+                            return Err(e);
+                        }
+                        Err(_) => {
+                            b.back_host(i, true)?;
+                            out.host += n;
+                        }
+                    }
+                }
+                Back::Host(hp) if !room(n) => {
+                    // No VRAM for it: it stays in host memory, bytes and all.
+                    b.maps[i].back = Back::Host(hp);
+                    out.host += n;
                 }
                 Back::Host(hp) => {
                     // SAFETY: the host piece stays readable at its own range for the copy.
@@ -421,6 +507,15 @@ pub fn kv_vmm_remap(t: Tensor<'_>) -> Result<(usize, usize), String> {
                         return Err(e);
                     }
                     if let Err(e) = b.back(i, false) {
+                        if host_below.is_some() {
+                            // SAFETY: the piece has nothing mapped again; the host piece kept
+                            // its bytes.
+                            if unsafe { map_host(device, va, &hp) }.is_ok() {
+                                b.maps[i].back = Back::Host(hp);
+                                out.host += n;
+                                continue;
+                            }
+                        }
                         // Its bytes are lost: zeroed VRAM if any, as a lend that kept none.
                         host_give(hp);
                         return Err(e);
@@ -440,8 +535,8 @@ pub fn kv_vmm_remap(t: Tensor<'_>) -> Result<(usize, usize), String> {
                     );
                     done.push(hp);
                     c?;
-                    mapped += n;
-                    restored += n;
+                    out.vram += n;
+                    out.restored += n;
                 }
             }
         }
@@ -455,7 +550,7 @@ pub fn kv_vmm_remap(t: Tensor<'_>) -> Result<(usize, usize), String> {
     }
     r?;
     synced?;
-    Ok((mapped, restored))
+    Ok(out)
 }
 
 fn vmm_type<'a>(buft: ffi::ggml_backend_buffer_type_t) -> &'a VmmType {

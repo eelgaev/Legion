@@ -57,6 +57,16 @@ pub(in crate::cli) struct SwitchArgs {
     /// tok/s, 32K 2,493/2,503 -> 2,590/2,600; TP+MTP 32K 2,432/2,447 -> 2,510/2,513).
     #[arg(long, help_heading = HEADING)]
     gdn_mma: bool,
+    /// CUDA, gated DeltaNet layers, prompt groups of 64+ tokens that run a chunked kernel with
+    /// one CTA per head: ggml-cuda's chunked kernel for the groups it runs itself, and Legion's
+    /// port of it for the groups --gdn-mma brings, instead of Legion's staged one (the default:
+    /// the same arithmetic and bits on 16 warps that each keep an 8-column block of the state in
+    /// registers, the next chunk's inputs copied into shared memory while the current one
+    /// computes; on a DGX Spark (GB10) a Qwen3.8-Flash-Next layer of 4K prompt tokens takes 1.33
+    /// ms instead of 2.41). The default takes ggml-cuda's own groups on compute capability 12.0
+    /// and 12.1 only. For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    gdn_prompt_ggml: bool,
     /// CUDA, gated DeltaNet layers in MTP verify and commit steps: ggml's gated_delta_net
     /// instead of Legion's op (the default: the same bits; the verify step skips the final
     /// states it never reads, the commit writes them in place instead of computing the rows and
@@ -76,6 +86,13 @@ pub(in crate::cli) struct SwitchArgs {
     /// same bits; about 3% faster in these steps on GB10 but flat end to end (#836).
     #[arg(long, help_heading = HEADING)]
     gdn_replay_smem: bool,
+    /// CUDA, compute capability 9.0+, gated DeltaNet layers in verify steps that run the deferred
+    /// commit first, at one user and 8 tokens: the per-lane kernel instead of the default one for
+    /// that shape (each CTA issues all its state, input and row-map loads at once and stages the
+    /// tokens through shared memory, instead of a chain of round trips; the same bits, #689). For
+    /// comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_gdn_replay_few: bool,
     /// CUDA, gated DeltaNet layers in MTP verify steps that run the deferred commit first
     /// (qwen4exp, with the MoE row map --no-moe-pad-remap leaves on): run the delta rule of a
     /// sequence's padding rows too, and store their inputs for the next commit, instead of the
@@ -129,6 +146,16 @@ pub(in crate::cli) struct SwitchArgs {
     /// 0-255, default 0 (every step may leave them).
     #[arg(long, help_heading = HEADING, value_name = "N")]
     gdn_state_defer_min_seqs: Option<u8>,
+    /// CUDA, gated DeltaNet layers, MTP with --tp over machines: after a verify step of at
+    /// least this many sequences, every rank runs the commit's delta rule inside its next
+    /// verify step (see --gdn-commit-in-verify), which saves reading the states once more.
+    /// Narrower verify steps and their commits run as without the flag (one or a few
+    /// sequences' commits are small and hide behind the drafting, where deferring them slows
+    /// a round, #1176). The same bits either way. Takes a second copy of the replay inputs in
+    /// VRAM (a few MB per sequence). Give every rank the same value. 0-255, default 0 (no
+    /// commit deferred).
+    #[arg(long, help_heading = HEADING, value_name = "N")]
+    tp_commit_in_verify_min_seqs: Option<u8>,
     /// CUDA, attention layers: Legion's one-launch norm + RoPE for the q and k heads (and
     /// Qwen3.8-Flash-Next's indexer queries) instead of ggml's rms_norm, mul and rope_multi.
     /// The same bits, but no faster on V100 (the fused external launch splits ggml's CUDA
@@ -245,6 +272,13 @@ pub(in crate::cli) struct SwitchArgs {
     /// columns at once (the default: the same token and probability bits). For comparisons.
     #[arg(long, help_heading = HEADING)]
     no_draft_head_q4k_pick_cols: bool,
+    /// Verify steps of 49-128 rows (7-16 sequences drafting 8 tokens) with a BF16 LM head
+    /// (Gemma 4 31B on a GB10): keep the head on ggml's matmul (cuBLAS), soft-cap and argmax
+    /// instead of Legion's head op (the default where it gives cuBLAS's bits: the matmul, the
+    /// soft-cap and every row's argmax in one pass over the weights, the logits written once).
+    /// For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_head_mm: bool,
     /// CUDA, compute capability 7.x-8.x (V100 to RTX 40), steps of 1-8 tokens inside stage
     /// graphs, with this flag an RTX 50 (12.0) too, without the mixer's parts (unmeasured there),
     /// and with this flag a GB10 at 2-8 tokens (without the mixer's parts; ggml's bits
@@ -303,7 +337,8 @@ pub(in crate::cli) struct SwitchArgs {
     /// Qwen3.8-Flash-Next) on ggml's cuBLAS GEMM in decode steps of 9-16 tokens. By default
     /// (CUDA, compute capability 9.0+) they ride along in the layer's qkv+z dense op, computed
     /// in cuBLAS's order: the same bits, without the two ~18 us latency-bound cuBLAS launches
-    /// per layer (#836). For comparisons.
+    /// per layer (#836). For comparisons, and on Hopper (9.x), whose cuBLAS the order was not
+    /// matched against.
     #[arg(long, help_heading = HEADING)]
     no_dense_mv_ab: bool,
     /// CUDA, compute capability 9.0+: a dense BF16 matmul of 2-16 tokens with fewer row tiles
@@ -336,6 +371,13 @@ pub(in crate::cli) struct SwitchArgs {
     /// rows load while the kernel ahead still runs (#836). For comparisons.
     #[arg(long, help_heading = HEADING)]
     no_router_mv: bool,
+    /// Keep a DeltaNet layer's BF16 alpha and beta gate projections in steps of 8 tokens (a
+    /// one-user verify step) as two ggml matmuls. By default (CUDA, compute capability 9.0+,
+    /// stage graphs on) one launch computes both, each row as ggml's mul_mat_vec_f does: the
+    /// same bits, one launch fewer per DeltaNet layer, and each thread's weight loads in flight
+    /// at once (#689). For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_mvf_ab: bool,
     /// Run a MoE layer's expert selection as two CUDA launches, the top-k and then the
     /// weights. By default (CUDA, routers outside the one-op router above and without
     /// `--nvfp4-once`'s routing plan or `--decode-fuse`) one launch picks the experts and makes
@@ -384,6 +426,44 @@ pub(in crate::cli) struct SwitchArgs {
     /// can differ from the default's where such steps occur. Off by default.
     #[arg(long, help_heading = HEADING)]
     fp8_sliced_k: bool,
+    /// CUDA, compute capability 9.0 only (H100, H200, GH200) with a binary built for sm_90a
+    /// (CMAKE_CUDA_ARCHITECTURES=90a): W8A8 FP8 prompt matmuls (more than 64 tokens) on the
+    /// Hopper GEMM (warpgroup MMA fed by the TMA, a warp-specialized pipeline of 128 x 128 tiles,
+    /// each 128-deep FP8 sum promoted to F32) instead of the mma.sync GEMM. UNTESTED ON HARDWARE:
+    /// written and compiled without a Hopper GPU, never run or measured. The sums round in
+    /// another order, so greedy text can differ from the default's. Elsewhere (other GPUs, a
+    /// binary without sm_90a) it does nothing. Off by default.
+    #[arg(long, help_heading = HEADING)]
+    hopper_gemm: bool,
+    /// CUDA, compute capability 9.0 only (H100, H200, GH200) with a binary built for sm_90a
+    /// (CMAKE_CUDA_ARCHITECTURES=90a): paged attention prefill (prompt chunks and verify steps
+    /// of more than one token per sequence, F16 KV cache, heads of 128 or 256) on a
+    /// FlashAttention-3 style kernel (warpgroup MMA, K and V blocks loaded by the TMA, a producer
+    /// warpgroup and two ping-ponged consumer warpgroups) instead of the mma.sync kernel. Ops it
+    /// does not cover (quantized or compact caches, a host KV tier, other head sizes) keep the
+    /// default kernels. UNTESTED ON HARDWARE: written and compiled without a Hopper GPU, never
+    /// run or measured. The sums round in another order, so greedy text can differ from the
+    /// default's. Elsewhere (other GPUs, a binary without sm_90a) it does nothing. Off by
+    /// default.
+    #[arg(long, help_heading = HEADING)]
+    hopper_attn: bool,
+    /// CUDA, compute capability 12.x (DGX Spark's GB10, RTX 50), paged attention with heads of
+    /// 256 (Qwen3.5+ and Gemma 4's sliding layers) over an F16 cache: keep every step on the
+    /// kernel that takes 8 query columns per warp. By default a step goes to the one that takes
+    /// 16 query rows per warp with Q in shared memory when its grid costs less there, costed as
+    /// waves of CTAs over the SMs; steps too small to fill the GPU (most verify steps, short
+    /// chunks) stay on the old kernel. The same bits either way. For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_paged_prefill_qm: bool,
+    /// CUDA, compute capability 9.0 only (H100, H200, GH200) with a binary built for sm_90
+    /// or sm_90a: programmatic dependent launch (each kernel set up while the one ahead of it
+    /// still runs, then waiting for it on the GPU) for Legion's decode kernels that take it on
+    /// compute capability 12.x (the MoE router, the GLM and Qwen4 decode kernels), as on a DGX
+    /// Spark. Each kernel still waits for the one ahead before it reads that one's output, so
+    /// the results keep their bits. UNTESTED ON HARDWARE:
+    /// never run or measured on a Hopper GPU. Elsewhere it does nothing. Off by default.
+    #[arg(long, help_heading = HEADING)]
+    hopper_pdl: bool,
     /// CUDA, compute capability 8.0+, dense NVFP4 weights on Legion's W4A16 kernels
     /// (--nvfp4-mm auto or legion; e.g. the MLPs of unsloth's Qwen3.8-27B-NVFP4): matmuls and
     /// fused SwiGLUs of 33-64 tokens (MTP or DFlash verify steps at 4-8 users, short prompt
@@ -434,6 +514,15 @@ pub(in crate::cli) struct SwitchArgs {
     /// own kernel); decode and verify steps keep the default's kernels. For A/B runs.
     #[arg(long, value_enum, help_heading = HEADING, value_name = "MODE")]
     nvfp4_expert_mv_split: Option<MvSplit>,
+    /// CUDA, NVFP4 routed experts on Legion's W4A16 kernels, prompt steps of more than 64
+    /// tokens: the down projection stores each (token, expert) row as BF16 instead of F32, and
+    /// the weighted sum reads it back (on qwen4exp the hyper-connection norm the MoE tail folds
+    /// into reads the BF16 rows itself). Half the bytes of those rows written and read: on a
+    /// DGX Spark (GB10), Qwen3.8-Flash-Next NVFP4 prefill is a few percent faster. Each row is
+    /// rounded to BF16 before the sum, so output moves (opt-in); decode and verify steps, and
+    /// steps that batch a prompt with them, keep F32 rows.
+    #[arg(long, help_heading = HEADING)]
+    nvfp4_expert_rows_bf16: bool,
     /// qwen4exp speculative verify steps with NVFP4 routed experts on Legion's kernels: read
     /// the experts of the padding rows too (the rows after a sequence's drafts that fill every
     /// sequence up to the step's shape; nothing reads their output), instead of routing their
@@ -495,6 +584,16 @@ pub(in crate::cli) struct SwitchArgs {
     /// Not used over a pool with a host tier. Off by default.
     #[arg(long, help_heading = HEADING)]
     paged_verify_split: bool,
+    /// CUDA, compute capability 7.0 / 7.5 (V100, Turing): split the paged attention of groups
+    /// of 2-16 tokens per sequence (speculative verify steps, short prompt chunks) over the key
+    /// blocks across the GPU, at up to 32 CTAs of the WMMA kernel (one per query tile and kv
+    /// head, each walking the whole context twice). The attention's output bits are the same,
+    /// up to 11x faster at a 64K context, but slower at a short one with several sequences
+    /// (more launches). With --spec, cheaper verify steps change how much the adaptive draft
+    /// length drafts, and with it which steps compute each token, so greedy text can differ
+    /// from the default's. Off by default.
+    #[arg(long, help_heading = HEADING)]
+    paged_verify_split_wmma: bool,
     /// CUDA, MoE layers: the shared expert's gate (sigmoid, scaling and sum) as one op instead of
     /// ggml's three, and on steps of up to 3 tokens the router's and the gate's logits from one
     /// matmul (one matmul and two kernels fewer per layer). Each op gives ggml's bits, but the
@@ -775,6 +874,28 @@ pub(in crate::cli) struct SwitchArgs {
     /// an integrated GPU such as the GB10). For comparisons.
     #[arg(long, help_heading = HEADING)]
     no_hc_moe_fold: bool,
+    /// qwen4exp prompt steps where --hc-moe-fold folds the MoE tails (the default on a GB10):
+    /// each layer's FFN-side hyper-connection combine-and-norm writes the new residual streams
+    /// (4 x n_embd F32 values a token) for that mixer's up-mix and the next layer's norm to
+    /// read, and not, as by default, both of them making those streams per value from the
+    /// streams before it and the attention output, with the norm's own arithmetic (#1183: the
+    /// same bits, ~84 MB less memory traffic per layer at 4K tokens; the attention mixer's
+    /// streams then stay allocated through the MoE layer). For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_hc_lazy_streams: bool,
+    /// Tensor parallelism with --tp-seq-par and --tp-wire bf16 (two ranks' prompt steps): the
+    /// hyper-connection mixer writes the block input it makes as F32 and the all-gather rounds
+    /// it into its send buffer, and not, as by default, the all-gather running that mixer
+    /// with its values rounded straight into the send buffer (#1176: the same bits, one pass
+    /// over the block input less before each gather). For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_tp_gather_mix: bool,
+    /// Tensor parallelism with --tp-seq-par and --tp-wire bf16: the F32 copy of a gathered
+    /// BF16 block input (for its F32 readers, the MoE router) is made by a copy after the
+    /// all-gather, and not, as by default, by the all-gather itself, this rank's share while
+    /// the other rank's is still on the wire (#1176: the same values). For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_tp_gather_widen: bool,
     /// qwen4exp prompt steps on a V100 (compute capability 7.0) or an sm_80+ GPU such as the
     /// GB10 (#826; no effect elsewhere): the layer's gated shared expert is added in the fused
     /// MoE op's per-token sum, and the next hyper-connection combine-and-norm makes that sum
@@ -821,6 +942,16 @@ pub(in crate::cli) struct SwitchArgs {
     /// by default.
     #[arg(long, help_heading = HEADING)]
     nvfp4_once: bool,
+    /// The default since #1133 round 2; accepted for older command lines (see --no-nvfp4-mvq).
+    #[arg(long, hide = true, conflicts_with = "no_nvfp4_mvq")]
+    nvfp4_mvq: bool,
+    /// NVFP4 dense matmuls of 5-8 tokens (verify steps, decode of 5-8 users) on compute capability 12.x
+    /// (GB10, RTX 50; no effect elsewhere): keep them on ggml's MMVQ instead of Legion's op
+    /// (the default: the sub-block sums on tensor cores, then ggml's float order, so the same
+    /// bits as MMVQ; `legion nvfp4-mvq-bench` checks them and times both). The same output
+    /// either way; for comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_nvfp4_mvq: bool,
     /// The default since #858; accepted for older command lines (see --q8-mmq-ggml).
     #[arg(long, hide = true, conflicts_with = "q8_mmq_ggml")]
     q8_mmq: bool,
@@ -850,6 +981,13 @@ pub(in crate::cli) struct SwitchArgs {
     /// the same. For comparisons.
     #[arg(long, value_enum, help_heading = HEADING, value_name = "MODE")]
     q8_mmq_fixup: Option<legion::model::q8_mmq::Fixup>,
+    /// Q4_K, Q5_K, Q6_K and Q8_0 prompt matmuls on Turing GPUs without tensor cores (GTX 16xx,
+    /// MX450, MX550; no effect elsewhere): all on ggml's MMQ, whose int8 MMA these GPUs run
+    /// without tensor cores, instead of Legion's dp4a op (the default: ggml's quantization,
+    /// tile loads and per-output sums in ggml's order, taken where ggml runs every tile on one
+    /// CTA). The same output either way; for comparisons.
+    #[arg(long, help_heading = HEADING)]
+    tu_mmq_ggml: bool,
     /// qwen4exp prompt steps on compute capability 12.x GPUs (GB10; no effect elsewhere): run
     /// the hyper-connection mixer's up matmul (ggml's MMQ, which writes the gate) and the gated
     /// mix (ggml's hc_pre, which reads it back; Legion's copy of it unless --hc-pre-ggml) as
@@ -882,6 +1020,18 @@ pub(in crate::cli) struct SwitchArgs {
     /// half the stream bytes. Each new stream value is rounded to BF16 (off by default).
     #[arg(long, help_heading = HEADING)]
     hc_streams_bf16: bool,
+    /// Opt-in, moves output. qwen4exp passes where every sequence is in its prompt (steps of
+    /// 256+ tokens), on compute capability 12.x GPUs (GB10, RTX 50, where the BF16 up-mix kernel
+    /// runs) with BF16 mixer weights (the NVFP4 checkpoints; no effect elsewhere, with
+    /// --hc-xn-written, or with --tp-seq-par splitting the step): keep the hyper-connection
+    /// residual streams in BF16 between the mixers instead of F32, so the combine-and-norm (with
+    /// the MoE output folded in) and the up-mix kernel move half the stream bytes. Math stays F32
+    /// inside each kernel; each new stream value is rounded to BF16. In steps of 2048+ tokens
+    /// the norm then skips writing its BF16 output and the mixer's down matmul rebuilds it from
+    /// the streams (the same values and, on a GB10, cuBLAS's sums). Decode, verify and mixed
+    /// steps keep F32 streams (off by default).
+    #[arg(long, help_heading = HEADING)]
+    hc_bf16: bool,
     /// qwen4exp prompt steps of 64+ tokens on a V100 (compute capability 7.0; no effect
     /// elsewhere): the hyper-connection mix as one op that also writes the block input as F16,
     /// which its Q8_0 projections (cuBLAS F16 GEMMs) then take with an F16 copy of their weight
@@ -1072,9 +1222,10 @@ pub(in crate::cli) struct SwitchArgs {
     #[arg(long, help_heading = HEADING)]
     glm_decode_mv: bool,
     /// GLM-5.3-Flash, CUDA: the plain dense-weight kernels instead of the GB10-tuned ones (the
-    /// default on integrated GPUs such as the GB10 and on V100s; other GPUs run the plain ones): a
-    /// Q6_K decode GEMV staging its weight rows through shared memory with 16-byte loads (~165 ->
-    /// ~220 GB/s; not on V100s, where it is slower), a prompt GEMM on 128 x 128 tiles (~2x; on
+    /// default on integrated GPUs such as the GB10, on V100s and on Ampere GPUs (compute
+    /// capability 8.0 to 8.7); other GPUs run the plain ones): a Q6_K decode GEMV staging its
+    /// weight rows through shared memory with 16-byte loads (~165 -> ~220 GB/s; not on V100s,
+    /// where it is slower, nor on Ampere GPUs), a prompt GEMM on 128 x 128 tiles (~2x; on
     /// sm_80+ Q6_K weights of 1024+ rows on mma.sync, ~1.3x more, reading the input once rounded
     /// to F16 when 2+ share it), prompt MLA attention with 16 heads a block (each staged cache row
     /// read by 4x the heads), the prompt hyper-connection mix 4 tokens a block, the prompt
@@ -1287,8 +1438,9 @@ pub(in crate::cli) struct SwitchArgs {
     /// instead of one ggml CUDA buffer. The same blocks, read and written the same way (the
     /// same bits); each tensor's rounding to whole granules takes up to 2 MiB more VRAM, so the
     /// expert cache can lose a few slots. Needed by --kv-vmm-keep (#814). On by default, with
-    /// --kv-vmm-keep 32768, on V100s with the expert cache over a layer split of 2 GPUs; off
-    /// elsewhere.
+    /// --kv-vmm-keep 32768, on V100s (and GH200s, unmeasured) with the expert cache over a layer
+    /// split of 2 GPUs, and with 8192 kept tokens on an x86_64 PC's one discrete GPU whose
+    /// experts do not all fit in host memory (#37); off elsewhere.
     #[arg(long, help_heading = HEADING)]
     kv_vmm: bool,
     /// Turn --kv-vmm (and so --kv-vmm-keep) off where it is on by default: every block of the
@@ -1306,7 +1458,10 @@ pub(in crate::cli) struct SwitchArgs {
     /// --glm-parallel-decode, where every GPU keeps every layer's KV (an AC922 with 4 GPUs,
     /// 131072 context: 2.9 GiB a GPU back to the cache at 32768; a long prompt past the kept
     /// tokens maps the rest when it starts). Default 32768 where --kv-vmm is on by default;
-    /// elsewhere off (every block keeps its VRAM).
+    /// elsewhere off (every block keeps its VRAM). An x86_64 PC's one discrete GPU whose experts
+    /// do not all fit in host memory (#37) keeps 8192 by default and, without this flag, maps
+    /// the rest rather than evict a cached chat, and keeps it mapped for five minutes after a
+    /// chat on it last ran (a long chat's next turn maps nothing).
     #[arg(long, help_heading = HEADING, value_name = "TOKENS", value_parser = clap::value_parser!(u32).range(1..))]
     kv_vmm_keep: Option<u32>,
     /// Threads that read the model files at load (1-8; default 4). Replaces
@@ -1352,9 +1507,11 @@ impl SwitchArgs {
             delta_prep: self.delta_prep_ggml.then_some(false),
             gdn_scan: self.gdn_scan_ggml.then_some(false),
             gdn_mma: self.gdn_mma.then_some(true),
+            gdn_staged: self.gdn_prompt_ggml.then_some(false),
             gdn: self.gdn_ggml.then_some(false),
             gdn_decode: self.gdn_decode_ggml.then_some(false),
             gdn_replay_staged: self.gdn_replay_smem.then_some(true),
+            gdn_replay_few: self.no_gdn_replay_few.then_some(false),
             gdn_pad_skip: self.no_gdn_pad_skip.then_some(false),
             gdn_commit_slots: self.gdn_commit_runs.then_some(false),
             gdn_commit_in_verify: if self.no_gdn_commit_in_verify {
@@ -1369,6 +1526,7 @@ impl SwitchArgs {
             },
             gdn_state_defer_rows: self.gdn_state_defer_rows,
             gdn_state_defer_min_seqs: self.gdn_state_defer_min_seqs,
+            tp_commit_in_verify_min_seqs: self.tp_commit_in_verify_min_seqs,
             norm_rope: self.norm_rope.then_some(true),
             kv_append: self.kv_append.then_some(true),
             head_rope_fused: self.head_rope_fused.then_some(true),
@@ -1387,6 +1545,7 @@ impl SwitchArgs {
             q8_out_mv: self.q8_out_row_mv.then_some(true),
             q4k_head_pick: self.no_draft_head_q4k_pick.then_some(false),
             q4k_head_pick_cols: self.no_draft_head_q4k_pick_cols.then_some(false),
+            head_mm: self.no_head_mm.then_some(false),
             q8_group: if self.no_q8_group {
                 Some(false)
             } else {
@@ -1408,18 +1567,24 @@ impl SwitchArgs {
                 self.dense_mv_wide_chain.then_some(true)
             },
             router_mv: self.no_router_mv.then_some(false),
+            mvf_ab: self.no_mvf_ab.then_some(false),
             router_join: self.no_router_join.then_some(false),
             router_bf16: self.no_router_bf16.then_some(false),
             ple_early_reads: self.no_ple_early_reads.then_some(false),
             nvfp4_mmvq_glu: self.nvfp4_mmvq_glu.then_some(true),
             fp8_small_batch_gemv: self.fp8_small_batch_gemv.then_some(true),
             fp8_sliced_k: self.fp8_sliced_k.then_some(true),
+            hopper_gemm: self.hopper_gemm.then_some(true),
+            hopper_attn: self.hopper_attn.then_some(true),
+            paged_prefill_qm: self.no_paged_prefill_qm.then_some(false),
+            hopper_pdl: self.hopper_pdl.then_some(true),
             nvfp4_wide_mv: self.nvfp4_wide_mv.then_some(true),
             nvfp4_expert_pdl: self.no_nvfp4_expert_pdl.then_some(false),
             nvfp4_expert_tile_prefetch: self.no_nvfp4_expert_tile_prefetch.then_some(false),
             nvfp4_expert_mv_max: self.nvfp4_expert_mv_max.map(i64::from),
             nvfp4_expert_mv_tile: self.nvfp4_expert_mv_tile.map(i32::from),
             nvfp4_expert_mv_split: self.nvfp4_expert_mv_split,
+            nvfp4_expert_rows_bf16: self.nvfp4_expert_rows_bf16.then_some(true),
             moe_pad_remap: self.no_moe_pad_remap.then_some(false),
             moe_pad_remap_tiered: self.moe_pad_remap_tiered.then_some(true),
             moe_pad_remap_probe: self.moe_pad_remap_probe,
@@ -1428,6 +1593,7 @@ impl SwitchArgs {
             moe_pad_skip: self.no_moe_pad_skip.then_some(false),
             tp_moe_ep_skip: self.no_tp_moe_ep_skip.then_some(false),
             paged_verify_split: self.paged_verify_split.then_some(true),
+            paged_verify_split_wmma: self.paged_verify_split_wmma.then_some(true),
             shexp_gate: self.shexp_gate.then_some(true),
             decode_fuse: self.decode_fuse.then_some(true),
             node_fuse: self.node_fuse_ggml.then_some(false),
@@ -1476,11 +1642,19 @@ impl SwitchArgs {
             } else {
                 self.no_hc_moe_fold.then_some(false)
             },
+            hc_lazy_streams: self.no_hc_lazy_streams.then_some(false),
+            tp_gather_mix: self.no_tp_gather_mix.then_some(false),
+            tp_gather_widen: self.no_tp_gather_widen.then_some(false),
             hc_fuse: self.hc_fuse.then_some(true),
             hc_xn16: self.hc_xn_f32.then_some(false),
             hc_quant: self.hc_quant_ggml.then_some(false),
             mmq_ids: self.expert_mmq.then_some(true),
             nvfp4_once: self.nvfp4_once.then_some(true),
+            nvfp4_mvq: if self.no_nvfp4_mvq {
+                Some(false)
+            } else {
+                self.nvfp4_mvq.then_some(true)
+            },
             q8_mmq: if self.q8_mmq_ggml {
                 Some(false)
             } else {
@@ -1488,10 +1662,12 @@ impl SwitchArgs {
             },
             q8_mmq_stream: self.q8_mmq_stream.then_some(true),
             q8_mmq_fixup: self.q8_mmq_fixup,
+            tu_mmq: self.tu_mmq_ggml.then_some(false),
             hc_up_mix: self.hc_up_mix_ggml.then_some(false),
             hc_up_mix_bf16: self.no_hc_up_mix_bf16.then_some(false),
             hc_xn_rebuild: self.hc_xn_written.then_some(false),
             hc_streams_bf16: self.hc_streams_bf16.then_some(true),
+            hc_bf16: self.hc_bf16.then_some(true),
             hc_mix16: self.hc_mix_f16.then_some(true),
             hc_mix_rebuild_bf16: self.hc_mix_rebuild_bf16.then_some(true),
             hc_chain: self.hc_chain_ggml.then_some(false),

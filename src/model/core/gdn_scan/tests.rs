@@ -178,3 +178,19 @@ fn cuda_gdn_scan_is_ggml() {
         }
     }
 }
+
+#[test]
+fn each_gpu_of_a_mixed_box_answers_for_itself() {
+    use crate::hw::per_device::test_cc;
+    let picks: Vec<bool> = (0..6)
+        .map(|d| gpu_for_by(Some(d), false, test_cc))
+        .collect();
+    // Only the V100 (device 2) takes the op.
+    assert_eq!(picks, [false, false, true, false, false, false]);
+    let picks: Vec<bool> = (0..6).map(|d| gpu_for_by(Some(d), true, test_cc)).collect();
+    assert_eq!(picks, [false, false, true, false, false, false]);
+    // A state that names no device: the engine's answer.
+    assert!(gpu_for_by(None, true, test_cc));
+    assert!(!gpu_for_by(None, false, test_cc));
+    assert!(gpu_takes(Some(7)) && !gpu_takes(Some(8)) && !gpu_takes(None));
+}

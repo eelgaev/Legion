@@ -36,8 +36,11 @@
 #include <climits>
 #include <cstdint>
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+// In every pass, host included: from CUDA 13.4 the header's libcu++ objects are device variables
+// the host stub registers, so a header seen by the device pass only breaks the host compile.
 #include <cooperative_groups.h>
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 #define LEGION_CLUSTER 1
 #else
 #define LEGION_CLUSTER 0

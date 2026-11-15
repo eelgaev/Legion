@@ -441,6 +441,11 @@ impl Arch for Gemma4Params {
         m.build_assistant(ctx, kv, rec, shape)
     }
 
+    /// The soft-cap of [`Self::logits`] (0: none).
+    fn logit_softcap(&self) -> Option<f32> {
+        Some(self.softcap.max(0.0))
+    }
+
     /// The final logit soft-cap, `c · tanh(logits / c)`, if the model has one.
     fn logits<'a>(&self, ctx: &'a Context, logits: Tensor<'a>) -> Tensor<'a> {
         match self.softcap {

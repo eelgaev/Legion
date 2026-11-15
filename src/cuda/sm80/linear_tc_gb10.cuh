@@ -12,6 +12,8 @@
 // row of A and column of B, so the tile shape, the warp layout, the K step and the pipeline
 // depth change the speed only.
 //
+// Ampere (compute capability 8.0-8.7) takes shapes of its own (tc_gb_auto_ampere, #1212).
+//
 // linear_tc runs 128 x 128 tiles with K steps of 32: on the GB10 it reaches ~50 TFLOPS of the
 // ~118 TFLOPS mma.sync peak. The shapes here: BM rows x BN tokens a block, warps of WM x WN,
 // K steps of BK through an S-stage cp.async ring, MINB blocks per SM.
@@ -259,4 +261,27 @@ bool tc_gb_auto(bool xh, const Lin & p, cudaStream_t st, bool oh = false) {
         return tc_gb_shape(2, true, p, st, oh);
     }
     return !oh && p.n >= 2048 && tc_gb_shape(1, true, p, st);
+}
+
+// Whether the current device is Ampere, compute capability 8.0 to 8.7 (not 8.9): the GPUs
+// tc_gb_auto_ampere's table is for.
+bool tc_gb_ampere_device() {
+    return legion_device::ampere_cc(legion_device::compute_capability());
+}
+
+// The device's choice on Ampere (#1212); false leaves the product to linear_tc. `legion lin-bench`
+// with the sm_86 code at Maya-S's shapes, 512 to 4096 tokens: F16 rows (XH) on 128 x 128 tiles,
+// two stages, 64 x 32 warps and two blocks per SM (shape 4), 0.85-0.94x linear_tc's time for
+// 2048 to 12288 weight rows; F32 rows of up to 1536 weight rows on 64 x 128 tiles (shape 3): 512
+// rows 0.61x at 512 and 2048 tokens, 1536 rows 0.62x and 0.91x, but both 1.19x at 4096 tokens,
+// where linear_tc stays; with 4096+ rows shape 3 took 1.2x, and no shape beat linear_tc by more
+// than 2% there. F16 outputs (`oh`) and per-head products stay on linear_tc.
+bool tc_gb_auto_ampere(bool xh, const Lin & p, cudaStream_t st, bool oh = false) {
+    if (oh || p.h != 1) {
+        return false;
+    }
+    if (xh) {
+        return tc_gb_shape(4, true, p, st);
+    }
+    return p.m <= 1536 && p.n <= 2048 && tc_gb_shape(3, false, p, st);
 }

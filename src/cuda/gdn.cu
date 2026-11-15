@@ -59,7 +59,9 @@ struct legion_gdn {
     int32_t * arrive;
     // With replay: the kernel (#836; the same arithmetic and bits in each). 0: gdn_replay_rows_kernel
     // (each lane holds its tokens' q and k rows in registers; the engine's default); 1, or -1
-    // (--gdn-replay-smem): gdn_replay_smem_kernel (the tokens' inputs in shared memory).
+    // (--gdn-replay-smem): gdn_replay_smem_kernel (the tokens' inputs in shared memory); 2:
+    // gdn_replay_few_kernel (#689: every independent load at once, for one or a few sequences;
+    // steps of over 8 tokens run gdn_replay_smem_kernel).
     int32_t replay_variant;
     // Or null. With replay (#836): a verify step's MoE row map, I32 [n_tokens * n_seqs]
     // (pad_rows::map): token t of sequence s is padding when t > 0 and pad[s * n_tokens + t] is
@@ -93,6 +95,8 @@ constexpr int GDN_LANES_PER_COL = 32 / GDN_COLS_PER_WARP;  // 8
 constexpr int GDN_ROWS_PER_LANE = GDN_S / GDN_LANES_PER_COL;  // 16
 constexpr int GDN_MAX_T = 8;
 constexpr int GDN_MAX_LIVE = 1 << 30;  // gdn_steps' n_live: every token
+// gdn_stash_shared's values per thread and round: 8 tokens' k and their g and beta at 128 threads.
+constexpr int GDN_STASH_U = GDN_MAX_T + 1;
 
 // ggml-cuda's warp_reduce_sum<8> (common.cuh).
 __device__ __forceinline__ float gdn_reduce(float x) {
@@ -347,16 +351,26 @@ __global__ void __launch_bounds__(128, 2) gdn_kernel(const legion_gdn p) {
 }
 
 // A replaying verify step's real tokens of sequence `sequence` (#836, p.pad): all of them
-// without a row map, else up to its first padding token (token 0 is always real).
+// without a row map, else up to its first padding token (token 0 is always real). The map's
+// words are read GDN_MAX_T at a time, all in flight at once (#689: not one round trip each).
 __device__ __forceinline__ int gdn_live(const legion_gdn & p, const int64_t sequence) {
     const int nt = (int) p.n_tokens;
     if (p.pad == nullptr) {
         return nt;
     }
     const int64_t first = sequence * p.n_tokens;
-    for (int t = 1; t < nt; t++) {
-        if (p.pad[first + t] != (int32_t) (first + t)) {
-            return t;
+    for (int t0 = 1; t0 < nt; t0 += GDN_MAX_T) {
+        int32_t w[GDN_MAX_T];
+#pragma unroll
+        for (int u = 0; u < GDN_MAX_T; u++) {
+            const int t = t0 + u;
+            w[u] = t < nt ? p.pad[first + t] : (int32_t) (first + t);
+        }
+#pragma unroll
+        for (int u = 0; u < GDN_MAX_T; u++) {
+            if (w[u] != (int32_t) (first + t0 + u)) {
+                return t0 + u;
+            }
         }
     }
     return nt;
@@ -403,18 +417,44 @@ __device__ __forceinline__ void gdn_stash_shared(const legion_gdn & p, const int
     if (!last) {
         return;
     }
+    // The values in rounds of GDN_STASH_U per thread, every load of a round in flight before its
+    // stores (#689: a token at a time, the copies cost one round trip per token): k (S per
+    // token), then (token, head) pairs of g and beta for the heads h = j + m * neqk1.
     const int64_t qk = GDN_S * p.neqk1;
-    for (int64_t t = 0; t < live; t++) {
-        float * row = p.replay + sequence * p.rp2 + (at + t) * p.rp1;
-        const float * k = p.k + sequence * p.sq3 + t * p.sq2 + j * p.sq1;
-        for (int i = tid; i < GDN_S; i += threads) {
-            row[qk + j * GDN_S + i] = k[i];
+    const int hpj = (int) (p.H / p.neqk1);
+    const int n_k = live * GDN_S;
+    const int n_all = n_k + live * hpj;
+    const float * k0 = p.k + sequence * p.sq3 + j * p.sq1;
+    float * rows = p.replay + sequence * p.rp2 + at * p.rp1;
+    for (int base = 0; base < n_all; base += threads * GDN_STASH_U) {
+        float a[GDN_STASH_U], b[GDN_STASH_U];
+#pragma unroll
+        for (int u = 0; u < GDN_STASH_U; u++) {
+            const int e = base + tid + u * threads;
+            if (e < n_k) {
+                const int t = e / GDN_S;
+                a[u] = k0[t * p.sq2 + (e - t * GDN_S)];
+            } else if (e < n_all) {
+                const int t = (e - n_k) / hpj;
+                const int64_t h = j + (int64_t) (e - n_k - t * hpj) * p.neqk1;
+                const int64_t gb = sequence * p.sb3 + t * p.sb2 + h * p.sb1;
+                a[u] = p.g[gb];
+                b[u] = p.beta[gb];
+            }
         }
-        const int64_t gb = sequence * p.sb3 + t * p.sb2;
-        float * g = row + 2 * qk + GDN_S * p.H;
-        for (int64_t h = j + (int64_t) tid * p.neqk1; h < p.H; h += (int64_t) threads * p.neqk1) {
-            g[h] = p.g[gb + h * p.sb1];
-            g[p.H + h] = p.beta[gb + h * p.sb1];
+#pragma unroll
+        for (int u = 0; u < GDN_STASH_U; u++) {
+            const int e = base + tid + u * threads;
+            if (e < n_k) {
+                const int t = e / GDN_S;
+                rows[t * p.rp1 + qk + j * GDN_S + (e - t * GDN_S)] = a[u];
+            } else if (e < n_all) {
+                const int t = (e - n_k) / hpj;
+                const int64_t h = j + (int64_t) (e - n_k - t * hpj) * p.neqk1;
+                float * g = rows + t * p.rp1 + 2 * qk + GDN_S * p.H;
+                g[h] = a[u];
+                g[p.H + h] = b[u];
+            }
         }
     }
 }
@@ -685,6 +725,195 @@ cudaError_t gdn_replay_smem_launch(const legion_gdn & p, cudaStream_t st) {
     return cudaGetLastError();
 }
 
+// ---- The replaying verify step for few sequences (#689, replay_variant 2).
+//
+// At one sequence (one user with drafts) the step is not bandwidth bound but a chain of round
+// trips per CTA: the count word, then the state and each replayed token in turn, each verify
+// token in turn, and the last CTA's stores. Here a CTA issues every load it can at once: the
+// state, the count word, the row map's words and this step's T tokens' inputs (k, q, its
+// columns' v, g and beta) together, then, with the count, all replayed tokens' inputs (up to
+// GDN_TOK_CHUNK; longer runs as gdn_replay_smem_kernel fills them). The inputs go through shared
+// memory, and the arithmetic is gdn_steps_smem's (gdn_steps' order): the same bits as
+// gdn_replay_rows_kernel. T: the verify tokens, 1 to GDN_TOK_CHUNK.
+
+constexpr int GDN_FEW_WARPS = 4;
+constexpr int GDN_FEW_MIN_CTAS = 5;
+
+template <int T>
+__global__ void __launch_bounds__(GDN_FEW_WARPS * 32, GDN_FEW_MIN_CTAS) gdn_replay_few_kernel(const legion_gdn p) {
+    constexpr int COLS = GDN_FEW_WARPS * GDN_COLS_PER_WARP;
+    constexpr int CHUNKS = GDN_S / COLS;
+    constexpr int THREADS = GDN_FEW_WARPS * 32;
+    static_assert(THREADS == GDN_S, "one thread per k and q value");
+    static_assert(T >= 1 && T <= GDN_TOK_CHUNK, "verify tokens");
+    __shared__ gdn_smem_tok<COLS> vt[T];
+    __shared__ gdn_smem_tok<COLS> rt[GDN_TOK_CHUNK];
+
+    const int64_t unit = blockIdx.x;
+    const int chunk = (int) (unit % CHUNKS);
+    const int64_t hs = unit / CHUNKS;
+    const int64_t h_idx = hs % p.H;
+    const int64_t sequence = hs / p.H;
+    const int64_t j = h_idx % p.neqk1;
+    const int tid = threadIdx.y * 32 + threadIdx.x;
+    const int col_in_warp = threadIdx.x / GDN_LANES_PER_COL;
+    const int lane_in_col = threadIdx.x - col_in_warp * GDN_LANES_PER_COL;
+    const int ccol = threadIdx.y * GDN_COLS_PER_WARP + col_in_warp;
+    const int col0 = chunk * COLS;
+    const int col = col0 + ccol;
+
+    // The loads that need nothing: the state, the count word, the row map, this step's inputs
+    // (rq3 is 1 here, so q and k of sequence `sequence`).
+    const int64_t state_off = gdn_state_off(p, h_idx, sequence, col);
+    float s[GDN_ROWS_PER_LANE];
+    gdn_state_load(s, p.state, state_off, lane_in_col);
+    const int32_t w = p.keep[sequence];
+    const int64_t first = sequence * T;
+    int32_t pw[T];
+    if (p.pad != nullptr) {
+#pragma unroll
+        for (int t = 1; t < T; t++) {
+            pw[t] = p.pad[first + t];
+        }
+    }
+    const float * xq = p.q + sequence * p.sq3 + j * p.sq1 + tid;
+    const float * xk = p.k + sequence * p.sq3 + j * p.sq1 + tid;
+    float vq[T], vk[T];
+#pragma unroll
+    for (int t = 0; t < T; t++) {
+        vk[t] = xk[t * p.sq2];
+        vq[t] = xq[t * p.sq2];
+    }
+    float vv = 0.0f, vg = 0.0f, vb = 0.0f;
+    if (tid < T * COLS) {
+        const int t = tid / COLS;
+        vv = p.v[sequence * p.sv3 + h_idx * p.sv1 + t * p.sv2 + col0 + (tid - t * COLS)];
+    }
+    if (tid < T) {
+        const int64_t gb = sequence * p.sb3 + h_idx * p.sb1 + tid * p.sb2;
+        vg = p.g[gb];
+        vb = p.beta[gb];
+    }
+
+    // With the count: the replayed tokens' inputs (no q), as gdn_fill reads them.
+    int keep, start;
+    gdn_count(w, keep, start);
+    const bool leave = gdn_leaves(p, w, keep, start);
+    const int n0 = keep < GDN_TOK_CHUNK ? keep : GDN_TOK_CHUNK;
+    const gdn_src rs = gdn_src_from(gdn_src_replay(p), start);
+    const float * rk = rs.k + sequence * rs.sq3 + j * rs.sq1 + tid;
+    float rkv[GDN_TOK_CHUNK];
+#pragma unroll
+    for (int t = 0; t < GDN_TOK_CHUNK; t++) {
+        if (t < n0) {
+            rkv[t] = rk[t * rs.sq2];
+        }
+    }
+    float rv = 0.0f, rg = 0.0f, rb = 0.0f;
+    if (tid < n0 * COLS) {
+        const int t = tid / COLS;
+        rv = rs.v[sequence * rs.sv3 + h_idx * rs.sv1 + t * rs.sv2 + col0 + (tid - t * COLS)];
+    }
+    if (tid < n0) {
+        const int64_t gb = sequence * rs.sb3 + h_idx * rs.sb1 + tid * rs.sb2;
+        rg = rs.g[gb];
+        rb = rs.beta[gb];
+    }
+
+    // Into shared memory.
+#pragma unroll
+    for (int t = 0; t < T; t++) {
+        vt[t].k[tid] = vk[t];
+        vt[t].q[tid] = vq[t];
+    }
+    if (tid < T * COLS) {
+        const int t = tid / COLS;
+        vt[t].v[tid - t * COLS] = vv;
+    }
+    if (tid < T) {
+        vt[tid].g = vg;
+        vt[tid].beta = vb;
+    }
+#pragma unroll
+    for (int t = 0; t < GDN_TOK_CHUNK; t++) {
+        if (t < n0) {
+            rt[t].k[tid] = rkv[t];
+        }
+    }
+    if (tid < n0 * COLS) {
+        const int t = tid / COLS;
+        rt[t].v[tid - t * COLS] = rv;
+    }
+    if (tid < n0) {
+        rt[tid].g = rg;
+        rt[tid].beta = rb;
+    }
+    // A replaying verify step's real tokens, as gdn_live finds them.
+    int live = T;
+    if (p.pad != nullptr) {
+#pragma unroll
+        for (int t = T - 1; t >= 1; t--) {
+            if (pw[t] != (int32_t) (first + t)) {
+                live = t;
+            }
+        }
+    }
+    __syncthreads();
+
+    float * rows = p.rows + (sequence * p.n_tokens * p.H + h_idx) * GDN_S;
+    if (keep > 0) {
+        gdn_steps_smem<COLS, false>(p, rt, n0, s, rows, lane_in_col, ccol, col);
+        for (int t0 = GDN_TOK_CHUNK; t0 < keep; t0 += GDN_TOK_CHUNK) {
+            const int n = keep - t0 < GDN_TOK_CHUNK ? keep - t0 : GDN_TOK_CHUNK;
+            __syncthreads();
+            gdn_fill<COLS, THREADS, false>(rt, p, rs, h_idx, sequence, col0, t0, n, tid);
+            __syncthreads();
+            gdn_steps_smem<COLS, false>(p, rt, n, s, rows, lane_in_col, ccol, col);
+        }
+        if (!leave) {
+            gdn_state_store(s, p.state_out, state_off, lane_in_col);
+        }
+    }
+    const int at = leave ? start + keep : 0;
+    // The step's own v over the packed rows, as gdn_stash_v stores it (from shared memory). Every
+    // read of the packed rows' v (any thread's, for the CTA's columns) was before a barrier.
+    {
+        float * dst = p.replay + sequence * p.rp2 + at * p.rp1 + 2 * GDN_S * p.neqk1 + h_idx * GDN_S + col;
+        for (int t = lane_in_col; t < live; t += GDN_LANES_PER_COL) {
+            dst[t * p.rp1] = vt[t].v[ccol];
+        }
+    }
+    gdn_steps_smem<COLS, true>(p, vt, live, s, rows, lane_in_col, ccol, col);
+    if (lane_in_col == 0) {
+        for (int t = live; t < T; t++) {
+            rows[col] = 0.0f;
+            rows += GDN_S * p.H;
+        }
+    }
+    gdn_stash_shared(p, h_idx, sequence, CHUNKS, at, live);
+}
+
+cudaError_t gdn_replay_few_launch(const legion_gdn & p, cudaStream_t st) {
+    const int64_t units = p.H * p.n_seqs * (GDN_S / (GDN_FEW_WARPS * GDN_COLS_PER_WARP));
+    if (units > 0x7fffffff) {
+        return cudaErrorInvalidConfiguration;
+    }
+    const dim3 grid((unsigned) units), block(32, GDN_FEW_WARPS, 1);
+    switch (p.n_tokens) {
+        case 1: gdn_replay_few_kernel<1><<<grid, block, 0, st>>>(p); break;
+        case 2: gdn_replay_few_kernel<2><<<grid, block, 0, st>>>(p); break;
+        case 3: gdn_replay_few_kernel<3><<<grid, block, 0, st>>>(p); break;
+        case 4: gdn_replay_few_kernel<4><<<grid, block, 0, st>>>(p); break;
+        case 5: gdn_replay_few_kernel<5><<<grid, block, 0, st>>>(p); break;
+        case 6: gdn_replay_few_kernel<6><<<grid, block, 0, st>>>(p); break;
+        case 7: gdn_replay_few_kernel<7><<<grid, block, 0, st>>>(p); break;
+        case 8: gdn_replay_few_kernel<8><<<grid, block, 0, st>>>(p); break;
+        // Longer steps: the inputs in chunks (the same bits).
+        default: return gdn_replay_smem_launch(p, st);
+    }
+    return cudaGetLastError();
+}
+
 template <bool ROWS, bool STATE>
 cudaError_t gdn_dispatch(const legion_gdn & p, dim3 grid, dim3 block, cudaStream_t st) {
     switch (p.n_tokens) {
@@ -931,10 +1160,12 @@ extern "C" int legion_gdn_launch(const legion_gdn * p, void * stream) {
     cudaError_t e;
     if (p->replay != nullptr) {
         if (!rows || !state || p->keep == nullptr || p->arrive == nullptr || p->rq3 != 1 ||
-            p->H % p->neqk1 != 0 || p->replay_variant > 1 || p->rp_t < p->n_tokens) {
+            p->H % p->neqk1 != 0 || p->replay_variant > 2 || p->rp_t < p->n_tokens) {
             return -1;
         }
-        e = p->replay_variant == 0 ? gdn_replay_dispatch(*p, grid, block, st) : gdn_replay_smem_launch(*p, st);
+        e = p->replay_variant == 0   ? gdn_replay_dispatch(*p, grid, block, st)
+            : p->replay_variant == 2 ? gdn_replay_few_launch(*p, st)
+                                     : gdn_replay_smem_launch(*p, st);
     } else if (p->keep != nullptr) {
         if (rows || !state) {
             return -1;

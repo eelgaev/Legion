@@ -305,6 +305,52 @@ fn staging_plan_takes_the_biggest_buffers_first() {
 }
 
 #[test]
+fn ring_buffers_take_their_own_rows_biggest_layer() {
+    use super::{plan_staging_sized, ring_bytes};
+    // The device's biggest layer per kind, and four rows: row 2 (even) is the big one.
+    let bytes = [1584 * MIB, 1584 * MIB, 1890 * MIB];
+    let small = [1296 * MIB, 1296 * MIB, 1584 * MIB];
+    let rows = [
+        (0, small),
+        (1, [1296 * MIB, 1296 * MIB, 1890 * MIB]),
+        (2, bytes),
+        (3, small),
+    ];
+    let need = ring_bytes(bytes, 2, &rows);
+    // Kind k's buffer j at k * 2 + j: the even rows' biggest, then the odd rows'.
+    assert_eq!(
+        need,
+        vec![
+            1584 * MIB,
+            1296 * MIB,
+            1584 * MIB,
+            1296 * MIB,
+            1890 * MIB,
+            1890 * MIB
+        ]
+    );
+    // One size for all without rows (packed staging), and for a buffer no row uses.
+    assert_eq!(
+        ring_bytes(bytes, 2, &[]),
+        vec![bytes[0], bytes[0], bytes[1], bytes[1], bytes[2], bytes[2]]
+    );
+    let need3 = ring_bytes(bytes, 3, &rows[..2]);
+    assert_eq!(need3[2], bytes[0]);
+    assert_eq!(need3[0], small[0]);
+    // Never more than the biggest layer.
+    let big = [(0, [2 * bytes[0], 0, 0])];
+    assert_eq!(ring_bytes(bytes, 2, &big)[0], bytes[0]);
+    // Uniform sizes plan as before.
+    let sizes = [60 * MIB, 50 * MIB, 50 * MIB, 40 * MIB, 20 * MIB, 800 * MIB];
+    let b = [40 * MIB, 100 * MIB, 20 * MIB];
+    let uniform: Vec<usize> = (0..6).map(|i| b[i / 2]).collect();
+    assert_eq!(
+        plan_staging_sized(&sizes, &uniform, true),
+        plan_staging(&sizes, b, 2, true)
+    );
+}
+
+#[test]
 fn staging_cover_fallback_still_covers() {
     let sizes = [300 * MIB + 1, 200 * MIB + 7, 100 * MIB + 3];
     let picked = pick_cover(&sizes, 320 * MIB);
@@ -436,4 +482,54 @@ fn settles_only_deterministic_pair_balance() {
         .settles()
     );
     assert!(!ResidencyConfig::default().settles());
+}
+
+#[test]
+fn a_cold_cache_plans_more_swaps_a_round() {
+    let rule = crate::residency::policy::SwapRule::default();
+    assert_eq!(super::cold_rule(rule, false), rule);
+    let cold = super::cold_rule(rule, true);
+    assert_eq!(cold.budget, rule.budget * super::COLD_SWAPS);
+    assert_eq!((cold.margin, cold.ratio), (rule.margin, rule.ratio));
+}
+
+#[test]
+fn the_warmup_is_not_learned_from_only_over_a_saved_heat_file() {
+    assert!(super::hold_applies(true, true));
+    // No file filled the slots: the warmup's routing is all there is to start from.
+    assert!(!super::hold_applies(true, false));
+    assert!(!super::hold_applies(false, true));
+    assert!(!super::hold_applies(false, false));
+}
+
+#[test]
+fn the_heat_file_is_saved_again_only_when_due_and_something_was_learned() {
+    use std::time::Duration;
+    let every = super::HEAT_SAVE_EVERY;
+    assert!(super::heat_save_due(true, every));
+    assert!(super::heat_save_due(true, every + Duration::from_secs(1)));
+    assert!(!super::heat_save_due(true, every - Duration::from_secs(1)));
+    // An idle server writes nothing.
+    assert!(!super::heat_save_due(false, every * 10));
+}
+
+#[test]
+fn a_saved_heat_ranking_keeps_the_older_files_other_pairs_after_its_own() {
+    use crate::residency::profile::Profile;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state").join("m.gguf.1.heat");
+    let old = Profile::from_heat(&[vec![0.0, 3.0, 1.0], vec![2.0, 0.0, 0.0]]);
+    assert_eq!(super::save_heat(&path, old.clone()).unwrap(), 3);
+    assert_eq!(Profile::read(&path).unwrap(), old);
+    // A new ranking: its pairs first, the old file's others behind them.
+    let new = Profile::from_heat(&[vec![9.0, 0.0, 0.0], vec![5.0, 0.0, 0.0]]);
+    assert_eq!(super::save_heat(&path, new).unwrap(), 4);
+    let got = Profile::read(&path).unwrap();
+    assert_eq!(got.ranked, vec![(0, 0), (1, 0), (0, 1), (0, 2)]);
+    // Written through a temporary file that is renamed: none is left behind.
+    assert!(!path.with_extension("tmp").exists());
+    // Another model's file (other sizes) is replaced, not merged.
+    let other = Profile::from_heat(&[vec![1.0, 2.0]]);
+    assert_eq!(super::save_heat(&path, other.clone()).unwrap(), 2);
+    assert_eq!(Profile::read(&path).unwrap(), other);
 }

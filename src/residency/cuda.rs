@@ -21,6 +21,8 @@ use std::sync::Mutex;
 use super::fallback::{self, HostLoc, NO_NODE};
 use crate::ggml::{BufferType, Context, GgmlError, Tensor, ffi};
 
+mod bench_host;
+pub use bench_host::{BenchHost, bench_host, bench_host_pages};
 mod host_register;
 pub use host_register::{HostRegistration, register_host};
 mod kv_vmm;
@@ -183,6 +185,17 @@ mod sys {
             height: usize,
             kind: c_int,
         ) -> cudaError_t;
+        #[allow(clippy::too_many_arguments)]
+        pub fn cudaMemcpy2DAsync(
+            dst: *mut c_void,
+            dpitch: usize,
+            src: *const c_void,
+            spitch: usize,
+            width: usize,
+            height: usize,
+            kind: c_int,
+            s: cudaStream_t,
+        ) -> cudaError_t;
         pub fn cudaMemset(p: *mut c_void, v: c_int, n: usize) -> cudaError_t;
         pub fn cudaStreamCreateWithFlags(s: *mut cudaStream_t, flags: c_uint) -> cudaError_t;
         pub fn cudaStreamDestroy(s: cudaStream_t) -> cudaError_t;
@@ -194,11 +207,21 @@ mod sys {
         pub fn cudaEventDestroy(e: cudaEvent_t) -> cudaError_t;
         pub fn cudaStreamWaitEvent(s: cudaStream_t, e: cudaEvent_t, flags: c_uint) -> cudaError_t;
         pub fn cudaMemsetAsync(p: *mut c_void, v: c_int, n: usize, s: cudaStream_t) -> cudaError_t;
+        pub fn cudaLaunchHostFunc(
+            s: cudaStream_t,
+            f: unsafe extern "C" fn(*mut c_void),
+            user: *mut c_void,
+        ) -> cudaError_t;
     }
 }
 
 use sys::*;
 
+mod swap_pace;
+pub use swap_pace::{
+    swap_pace_clear, swap_pace_enable, swap_pace_flush, swap_pace_layer, swap_pace_on,
+    swap_pace_queue,
+};
 mod spill;
 pub use spill::{spill_devices, spill_type, spill_type_keeping};
 
@@ -239,6 +262,14 @@ fn rt(e: cudaError_t, what: &str) -> Result<(), String> {
     // SAFETY: a static NUL-terminated string.
     let msg = unsafe { CStr::from_ptr(cudaGetErrorString(e)) }.to_string_lossy();
     Err(format!("{what}: {msg}"))
+}
+
+/// Waits for everything queued on `device`, kernels and copies of every stream.
+pub fn sync_device(device: usize) -> Result<(), String> {
+    use_device(device)?;
+    // SAFETY: a plain runtime call.
+    let e = unsafe { cudaDeviceSynchronize() };
+    rt(e, "cudaDeviceSynchronize")
 }
 
 /// Makes `device` current on this thread, with its primary context (driver calls need one).
@@ -506,9 +537,12 @@ pub fn caps(device: usize) -> Option<Caps> {
     let attr = |a: u32| query(a).unwrap_or(0);
     let vmm = attr(CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED) != 0;
     // The driver's node; where it has none (or no such attribute), the one sysfs gives the
-    // GPU's PCI address, else -1: a failed query is "unknown", never node 0.
+    // GPU's PCI address, else -1: a failed query is "unknown", never node 0. A node without
+    // CPUs (a GH200's HBM is one) gives way to the nearest node with CPUs, whose workers fill
+    // and read the host memory (`crate::hw::numa::cpu_node_near`; nothing changes where the
+    // node has CPUs).
     let host_numa_id = match query(CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID) {
-        Some(id) if id >= 0 => id,
+        Some(id) if id >= 0 => crate::hw::numa::cpu_node_near(id as u32) as i32,
         _ => device_numa_node(device).map_or(-1, |n| n as i32),
     };
     let (host_granularity, host_node) = match (vmm, u32::try_from(host_numa_id)) {
@@ -558,6 +592,7 @@ pub fn device_count() -> usize {
 /// The host NUMA node of CUDA device `device` (ggml's index), from the driver alone: no context
 /// is created, so `--numa` can ask before anything else touches the GPU (#422). The driver's
 /// host NUMA id, else the node sysfs gives the device's PCI address; `None` when neither knows.
+/// A node without CPUs gives way to the nearest one with CPUs (`crate::hw::numa::cpu_node_near`).
 pub fn device_numa_node(device: usize) -> Option<u32> {
     let mut d: CUdevice = 0;
     // SAFETY: cuInit is idempotent; cuDeviceGet writes the handle.
@@ -568,7 +603,7 @@ pub fn device_numa_node(device: usize) -> Option<u32> {
     // SAFETY: writes one int.
     let r = unsafe { cuDeviceGetAttribute(&mut id, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, d) };
     if r == 0 && id >= 0 {
-        return Some(id as u32);
+        return Some(crate::hw::numa::cpu_node_near(id as u32));
     }
     let mut bus = [0 as c_char; 32];
     // SAFETY: writes a NUL-terminated string of at most `bus.len()` bytes.
@@ -578,6 +613,35 @@ pub fn device_numa_node(device: usize) -> Option<u32> {
     // SAFETY: NUL-terminated by the driver (the buffer is zeroed and longer than any id).
     let bus = unsafe { CStr::from_ptr(bus.as_ptr()) }.to_string_lossy();
     crate::hw::numa::pci_numa_node(&crate::hw::gpu::normalize_bdf(&bus))
+        .map(crate::hw::numa::cpu_node_near)
+}
+
+/// CUDA device `device`'s link attributes ([`super::unified::LinkAttrs`]), from the driver
+/// alone (no context, as [`device_numa_node`]); `None` when it cannot be queried.
+pub fn link_attrs(device: usize) -> Option<super::unified::LinkAttrs> {
+    let mut d: CUdevice = 0;
+    // SAFETY: cuInit is idempotent; cuDeviceGet writes the handle.
+    if unsafe { cuInit(0) } != 0 || unsafe { cuDeviceGet(&mut d, device as c_int) } != 0 {
+        return None;
+    }
+    let attr = |a: u32| {
+        let mut v: c_int = 0;
+        // SAFETY: writes one int.
+        (unsafe { cuDeviceGetAttribute(&mut v, a, d) } == 0).then_some(v)
+    };
+    Some(super::unified::LinkAttrs {
+        integrated: attr(CU_DEVICE_ATTRIBUTE_INTEGRATED)? != 0,
+        pageable_access: attr(CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS).unwrap_or(0) != 0,
+        pageable_uses_host_page_tables: attr(
+            CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES,
+        )
+        .unwrap_or(0)
+            != 0,
+        cc: (
+            attr(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?,
+            attr(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?,
+        ),
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1095,6 +1159,12 @@ struct TieredBuffer {
     hole: bool,
     /// The slot part from `split` on is not mapped: its tail was lent out ([`unback_tail`]).
     tail_hole: bool,
+    /// The slot part's last bytes that the last [`Slots::reback`] left unmapped
+    /// ([`Slots::with_cut`]: whole granules, inside the tail): while the slot part is mapped,
+    /// `tail` ends that much before it.
+    cut: usize,
+    /// The granule its parts are whole multiples of.
+    gran: usize,
     /// `vram` (head) or `tail` belong to a device's kept staging buffers
     /// ([`Slots::with_parts`]): unmapped here, never released.
     shared_head: bool,
@@ -1112,9 +1182,14 @@ impl TieredBuffer {
         // SAFETY: only what this buffer mapped and reserved.
         unsafe {
             let total = self.vram_bytes + self.host_bytes;
-            if self.hole || self.tail_hole {
-                if !self.hole && self.split > 0 {
-                    cuMemUnmap(self.va, self.split);
+            if self.hole || self.tail_hole || self.cut > 0 {
+                let mapped = match (self.hole, self.tail_hole) {
+                    (true, _) => 0,
+                    (false, true) => self.split,
+                    (false, false) => self.vram_bytes - self.cut,
+                };
+                if mapped > 0 {
+                    cuMemUnmap(self.va, mapped);
                 }
                 if self.host_bytes > 0 {
                     cuMemUnmap(self.va + self.vram_bytes as u64, self.host_bytes);
@@ -1147,9 +1222,14 @@ impl TieredBuffer {
             parts.push((self.vram, self.split));
         }
         if self.tail != 0 && !self.tail_hole {
-            parts.push((self.tail, self.vram_bytes - self.split));
+            parts.push((self.tail, self.tail_bytes()));
         }
         parts
+    }
+
+    /// The bytes `tail` maps while the slot part is mapped (what [`Self::cut`] leaves of it).
+    fn tail_bytes(&self) -> usize {
+        self.vram_bytes - self.split - self.cut
     }
 }
 
@@ -1279,7 +1359,7 @@ pub fn unback(t: Tensor<'_>) -> Result<usize, String> {
 }
 
 /// The slot range of a tiered tensor, to give VRAM back from any thread ([`Slots::reback`]).
-pub struct Slots(*mut TieredBuffer, Option<(u64, u64)>);
+pub struct Slots(*mut TieredBuffer, Option<(u64, u64)>, usize, (usize, usize));
 
 // SAFETY: the tiered buffer outlives the handle (the residency joins the thread using it before
 // it drops its tensors), and nothing else touches its slot part meanwhile (see `unback`).
@@ -1289,23 +1369,50 @@ impl Slots {
     /// The slot range of the tiered tensor `t`.
     pub fn of(t: Tensor<'_>) -> Result<Self, String> {
         tiered_of(t)
-            .map(|b| Self(b, None))
+            .map(|b| Self(b, None, 0, (0, 0)))
             .ok_or_else(|| "not a tiered tensor".into())
+    }
+
+    /// [`Self::reback`] leaves the range's last `bytes` unmapped but their first `pad`
+    /// (rounded down to whole granules, at most its tail): memory something else holds now.
+    /// The slots in the last `bytes` must stay empty until a reback without the cut; the
+    /// first `pad` of them are mapped and zeroed, for the matmuls that read that far past the
+    /// slot before them.
+    pub fn with_cut(self, bytes: usize, pad: usize) -> Self {
+        // SAFETY: reading the fields of the live tiered buffer.
+        let b = unsafe { &*self.0 };
+        let g = b.gran.max(1);
+        let pad = pad.min(bytes);
+        let cut = ((bytes - pad) / g * g).min(b.vram_bytes - b.split);
+        Self(self.0, self.1, cut, (b.vram_bytes - bytes, pad))
     }
 
     /// The range's own allocations `(vram, tail)` (from [`slot_handles`], 0: none), which a
     /// device's kept staging buffers hold while its slots are lent: [`Self::reback`] maps them
     /// back instead of new memory, and they stay the staging buffers' (`shared`).
     pub fn with_parts(self, parts: Option<(u64, u64)>) -> Self {
-        Self(self.0, parts)
+        Self(self.0, parts, self.2, self.3)
     }
 
-    /// Gives the range VRAM slots again after [`unback`] (their contents undefined).
+    /// Gives the range VRAM slots again after [`unback`] (their contents undefined, but the
+    /// zeroed pad of [`Self::with_cut`]).
     pub fn reback(&self) -> Result<(), String> {
+        // SAFETY: reading the fields of the live tiered buffer.
+        let unmapped = unsafe { (*self.0).hole || (*self.0).tail_hole };
         match self.1 {
-            Some(parts) => reback_shared(self.0, parts),
-            None => reback_buffer(self.0),
+            Some(parts) => reback_shared(self.0, parts, self.2)?,
+            None => reback_buffer(self.0, self.2)?,
         }
+        let (at, n) = self.3;
+        if unmapped && n > 0 {
+            // SAFETY: `n` bytes of the range the reback just mapped (before its cut), in a slot
+            // that stays empty; the reback made the range's device current.
+            unsafe {
+                let va = (*self.0).va as usize + at;
+                rt(cudaMemset(va as *mut c_void, 0, n), "cudaMemset(cut pad)")?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1325,12 +1432,16 @@ pub fn slot_handles(t: Tensor<'_>, tail_only: bool) -> Option<(u64, u64)> {
 
 /// [`reback_buffer`] mapping `(vram, tail)` (0: new memory), the range's own allocations of
 /// before the lend (now a kept staging buffer's), at their places again.
-fn reback_shared(b: *mut TieredBuffer, (vram, tail): (u64, u64)) -> Result<(), String> {
+fn reback_shared(b: *mut TieredBuffer, (vram, tail): (u64, u64), cut: usize) -> Result<(), String> {
     // SAFETY: maps the range's former allocations or new memory into its unmapped slot part.
     unsafe {
         let b = &mut *b;
         if !b.hole && !b.tail_hole {
             return Ok(());
+        }
+        // The tail allocation was made for the cut of the last reback.
+        if tail != 0 && cut != b.cut {
+            return Err("the slots' kept tail does not fit the cut".into());
         }
         use_device(b.device)?;
         let d = b.device;
@@ -1354,7 +1465,7 @@ fn reback_shared(b: *mut TieredBuffer, (vram, tail): (u64, u64)) -> Result<(), S
             }
             Ok((h, true))
         };
-        let (split, tail_n) = (b.split, b.vram_bytes - b.split);
+        let (split, tail_n) = (b.split, b.vram_bytes - b.split - cut);
         let head = if b.hole && split > 0 {
             Some(map(0, split, vram)?)
         } else {
@@ -1386,11 +1497,12 @@ fn reback_shared(b: *mut TieredBuffer, (vram, tail): (u64, u64)) -> Result<(), S
         b.shared_tail = shared;
         b.hole = false;
         b.tail_hole = false;
+        b.cut = cut;
         Ok(())
     }
 }
 
-fn reback_buffer(b: *mut TieredBuffer) -> Result<(), String> {
+fn reback_buffer(b: *mut TieredBuffer, cut: usize) -> Result<(), String> {
     // SAFETY: maps new memory into the range's unmapped slot part.
     unsafe {
         let b = &mut *b;
@@ -1400,7 +1512,7 @@ fn reback_buffer(b: *mut TieredBuffer) -> Result<(), String> {
         use_device(b.device)?;
         // The same allocations as before the lend: a tail can be lent alone again.
         let tail_at = b.va + b.split as u64;
-        let tail_n = b.vram_bytes - b.split;
+        let tail_n = b.vram_bytes - b.split - cut;
         if b.hole {
             let head = if b.split > 0 {
                 map_fresh(b.device, b.va, b.split)?
@@ -1423,11 +1535,12 @@ fn reback_buffer(b: *mut TieredBuffer) -> Result<(), String> {
             };
             b.vram = head;
             b.tail = tail;
-        } else {
+        } else if tail_n > 0 {
             b.tail = map_fresh(b.device, tail_at, tail_n)?;
         }
         b.hole = false;
         b.tail_hole = false;
+        b.cut = cut;
         Ok(())
     }
 }
@@ -1573,7 +1686,7 @@ unsafe extern "C" fn tiered_clear(buffer: ffi::ggml_backend_buffer_t, v: u8) {
     // SAFETY: the VRAM part only; the host part belongs to the arena.
     unsafe {
         cudaSetDevice(b.device as c_int);
-        cudaMemset(b.va as *mut c_void, v as c_int, b.vram_bytes);
+        cudaMemset(b.va as *mut c_void, v as c_int, b.vram_bytes - b.cut);
         cudaDeviceSynchronize();
     }
 }
@@ -1633,7 +1746,7 @@ pub fn tiered(
         no_vram: e.no_vram,
     };
     let (buf, offset) =
-        tiered_buffer(device, host, host.nb()[2], n_slots, keep, true).map_err(err)?;
+        tiered_buffer(device, host, None, host.nb()[2], n_slots, keep, true).map_err(err)?;
     let ne = host.ne();
     let ctx = Context::new(1, 0);
     let t = ctx
@@ -1645,6 +1758,95 @@ pub fn tiered(
         no_vram: false,
     })?;
     Ok(ctx)
+}
+
+/// [`tiered`] for the bounded host tier ([`super::host_tier`]): after `host`'s arena pieces
+/// (the layer's RAM slots) come `tail`'s (the staging buffer every layer shares, mapped once
+/// more per layer), and the tensor has `n_slots + n_host` experts, `n_host` of them over the
+/// two host parts.
+pub fn tiered_tail(
+    device: usize,
+    host: Tensor<'_>,
+    tail: Tensor<'_>,
+    n_host: usize,
+    n_slots: usize,
+    keep: Option<usize>,
+    name: &str,
+) -> Result<Context, TieredError> {
+    let err = |e: BufError| TieredError {
+        error: GgmlError::Alloc {
+            bytes: n_slots * host.nb()[2],
+            buffer: format!("tiered range on CUDA{device}: {}", e.msg),
+        },
+        no_vram: e.no_vram,
+    };
+    let row = host.nb()[2];
+    let spans = arena_span(host).zip(arena_span(tail));
+    if spans.is_none_or(|(h, t)| h + t < n_host * row) {
+        return Err(err(
+            "the host tier's pieces are shorter than its experts".into()
+        ));
+    }
+    let (buf, offset) =
+        tiered_buffer(device, host, Some(tail), row, n_slots, keep, true).map_err(err)?;
+    let ne = host.ne();
+    let ctx = Context::new(1, 0);
+    let t = ctx
+        .new_tensor(host.ty(), &[ne[0], ne[1], (n_slots + n_host) as i64])
+        .named(name);
+    // SAFETY: the buffer is new and owned by ctx from here; the tensor fits from `offset`
+    // (checked above: the host parts hold `n_host` experts).
+    unsafe { ctx.adopt_buffer(t, buf, offset) }.map_err(|error| TieredError {
+        error,
+        no_vram: false,
+    })?;
+    Ok(ctx)
+}
+
+/// The bytes of the arena pieces under `host` (a tensor that is an arena piece of its own):
+/// what a tiered range maps for it.
+pub fn arena_span(host: Tensor<'_>) -> Option<usize> {
+    host_pieces(host)
+        .ok()
+        .map(|(_, p)| p.iter().map(|p| p.size).sum())
+}
+
+/// The arena type and pieces under `host`: one piece, or one per NUMA node of a split arena
+/// (back to back).
+fn host_pieces(host: Tensor<'_>) -> Result<(&'static ArenaType, Vec<&'static Piece>), BufError> {
+    // SAFETY: reading the fields of a live tensor and of its buffer.
+    let (arena_buf, data, view) = unsafe {
+        let t = host.raw();
+        ((*t).buffer, (*t).data as u64, !(*t).view_src.is_null())
+    };
+    // SAFETY: as above.
+    let at = (!arena_buf.is_null())
+        .then(|| arena_of(unsafe { (*arena_buf).buft }))
+        .flatten()
+        .filter(|_| !view)
+        .ok_or("the host tensor is not in a host arena buffer")?;
+    // SAFETY: the buffer is an arena buffer, so its context is an ArenaBuffer; arena buffers
+    // hold the weights and live as long as any range mapped over them.
+    let ab: &'static ArenaBuffer = unsafe { &*((*arena_buf).context as *const ArenaBuffer) };
+    let off = (data - ab.va) as usize;
+    let first_piece = ab
+        .pieces
+        .iter()
+        .position(|p| p.offset == off)
+        .ok_or("the host tensor is not an arena piece of its own")?;
+    let mut pieces: Vec<&Piece> = Vec::new();
+    let mut covered = 0;
+    for p in &ab.pieces[first_piece..] {
+        if covered >= host.nbytes() {
+            break;
+        }
+        pieces.push(p);
+        covered += p.size;
+    }
+    if covered < host.nbytes() {
+        return Err("the host tensor runs past its arena pieces".into());
+    }
+    Ok((at, pieces))
 }
 
 /// Why [`tiered`] failed.
@@ -1741,8 +1943,8 @@ pub fn tiered_rows(
         bytes: n_rows * host.nb()[1],
         buffer: format!("tiered rows on CUDA{device}: {msg}"),
     };
-    let (buf, offset) =
-        tiered_buffer(device, host, host.nb()[1], n_rows, None, false).map_err(|e| err(e.msg))?;
+    let (buf, offset) = tiered_buffer(device, host, None, host.nb()[1], n_rows, None, false)
+        .map_err(|e| err(e.msg))?;
     // Written by the graphs (a cache), not weights.
     // SAFETY: a live buffer.
     unsafe {
@@ -1767,44 +1969,18 @@ pub fn tiered_rows(
 fn tiered_buffer(
     device: usize,
     host: Tensor<'_>,
+    tail: Option<Tensor<'_>>,
     slot_bytes: usize,
     n_slots: usize,
     keep: Option<usize>,
     hook: bool,
 ) -> Result<(NonNull<ffi::ggml_backend_buffer>, usize), BufError> {
-    // SAFETY: reading the fields of a live tensor and of its buffer.
-    let (arena_buf, data, view) = unsafe {
-        let t = host.raw();
-        ((*t).buffer, (*t).data as u64, !(*t).view_src.is_null())
-    };
-    // SAFETY: as above.
-    let at = (!arena_buf.is_null())
-        .then(|| arena_of(unsafe { (*arena_buf).buft }))
-        .flatten()
-        .filter(|_| !view)
-        .ok_or("the host tensor is not in a host arena buffer")?;
-    // SAFETY: the buffer is an arena buffer, so its context is an ArenaBuffer.
-    let ab = unsafe { &*((*arena_buf).context as *const ArenaBuffer) };
-    let off = (data - ab.va) as usize;
-    // The tensor's pieces: one, or one per NUMA node of a split arena (back to back).
-    let first_piece = ab
-        .pieces
-        .iter()
-        .position(|p| p.offset == off)
-        .ok_or("the host tensor is not an arena piece of its own")?;
-    let mut pieces: Vec<&Piece> = Vec::new();
-    let mut covered = 0;
-    for p in &ab.pieces[first_piece..] {
-        if covered >= host.nbytes() {
-            break;
-        }
-        pieces.push(p);
-        covered += p.size;
+    let (at, mut pieces) = host_pieces(host)?;
+    // [`tiered_tail`]: another arena tensor's pieces right after the host tensor's.
+    if let Some(t) = tail {
+        pieces.extend(host_pieces(t)?.1);
     }
-    if covered < host.nbytes() {
-        return Err("the host tensor runs past its arena pieces".into());
-    }
-    let host_bytes = covered;
+    let host_bytes: usize = pieces.iter().map(|p| p.size).sum();
     use_device(device)?;
     let dgran = granularity(CU_MEM_LOCATION_TYPE_DEVICE, device as i32);
     if dgran == 0 || !at.gran.is_multiple_of(dgran) {
@@ -1829,6 +2005,8 @@ fn tiered_buffer(
         host_bytes,
         hole: false,
         tail_hole: false,
+        cut: 0,
+        gran: at.gran,
         shared_head: false,
         shared_tail: false,
         borrowed: false,
@@ -2032,7 +2210,30 @@ impl Copier {
         // SAFETY: the copier's own live stream.
         unsafe { e.record(self.stream) }
     }
+
+    /// Queues a call of `f(arg)` after the copies queued so far: later copies wait until it
+    /// returns. It runs on a thread of the driver's and must make no CUDA call.
+    pub fn call(&mut self, f: StreamCall, arg: usize) -> Result<(), String> {
+        unsafe extern "C" fn run(user: *mut c_void) {
+            // SAFETY: the box `call` leaked for this call.
+            let job = unsafe { Box::from_raw(user as *mut (StreamCall, usize)) };
+            (job.0)(job.1);
+        }
+        let job = Box::into_raw(Box::new((f, arg)));
+        // SAFETY: the copier's own live stream; the host function owns `job`.
+        unsafe {
+            cudaSetDevice(self.device as c_int);
+            let e = cudaLaunchHostFunc(self.stream, run, job.cast());
+            if e != 0 {
+                drop(Box::from_raw(job));
+            }
+            rt(e, "cudaLaunchHostFunc")
+        }
+    }
 }
+
+/// What [`Copier::call`] runs.
+pub type StreamCall = std::sync::Arc<dyn Fn(usize) + Send + Sync>;
 
 /// Thread blocks of a [`PeerPuller`]'s copy kernel: about two per V100 SM, which keeps its
 /// host link busy (68 GB/s from 80 to 640 blocks of 512 threads).
@@ -2277,6 +2478,53 @@ pub unsafe fn zero_ranges_now(device: usize, ranges: &[(usize, usize)]) -> Resul
     }
 }
 
+/// Reads the first `out.len() / rows` I32 values of `rows` rows `pitch` values apart, from
+/// element `start` of a tensor in `device`'s plain memory, into `out` (row after row), and
+/// waits for it: one strided copy on the per-thread default stream, as
+/// `ggml_backend_tensor_get` does for a whole range. A decode step's expert log is ~2 KiB of a
+/// half-MiB range.
+pub fn read_rows_i32(
+    device: usize,
+    t: Tensor<'_>,
+    start: usize,
+    pitch: usize,
+    rows: usize,
+    out: &mut [i32],
+) -> Result<(), String> {
+    let width = out.len() / rows.max(1);
+    assert!(
+        width * rows == out.len() && width <= pitch,
+        "read_rows_i32 shape"
+    );
+    assert!(
+        rows == 0 || (start + (rows - 1) * pitch + width) * 4 <= t.nbytes(),
+        "read_rows_i32 out of bounds"
+    );
+    if rows == 0 || width == 0 {
+        return Ok(());
+    }
+    let per_thread = 0x2 as cudaStream_t;
+    // SAFETY: the bounds are checked above; the tensor's memory is `device`'s.
+    unsafe {
+        let src = (*t.raw()).data.cast::<i32>().add(start);
+        rt(cudaSetDevice(device as c_int), "cudaSetDevice")?;
+        rt(
+            cudaMemcpy2DAsync(
+                out.as_mut_ptr().cast(),
+                width * 4,
+                src.cast(),
+                pitch * 4,
+                width * 4,
+                rows,
+                2,
+                per_thread,
+            ),
+            "cudaMemcpy2DAsync",
+        )?;
+        rt(cudaStreamSynchronize(per_thread), "cudaStreamSynchronize")
+    }
+}
+
 /// VRAM allocated through VMM, to be mapped into ranges (prefill staging buffers): one or
 /// more physical allocations, mapped back to back.
 pub struct DeviceMem {
@@ -2453,7 +2701,7 @@ pub fn unback_tail(t: Tensor<'_>) -> Result<Option<DeviceMem>, String> {
             return Ok(None);
         }
         use_device(b.device)?;
-        let (d, n) = (b.device, b.vram_bytes - b.split);
+        let (d, n) = (b.device, b.tail_bytes());
         cu(
             timed("cuMemUnmap", d, n, || cuMemUnmap(b.va + b.split as u64, n)),
             "cuMemUnmap(VRAM slot tail)",
@@ -2473,6 +2721,13 @@ pub fn unback_tail(t: Tensor<'_>) -> Result<Option<DeviceMem>, String> {
         }
         Ok(Some(mem))
     }
+}
+
+/// The granule the parts of the tiered tensor `t`'s range are whole multiples of.
+pub fn tiered_gran(t: Tensor<'_>) -> Option<usize> {
+    let b = tiered_of(t)?;
+    // SAFETY: reading a field of the tensor's live tiered buffer.
+    unsafe { Some((*b).gran) }
 }
 
 /// `(first, split)` of the tiered tensor `t`: where slot 0 starts in its range and where the
@@ -2569,6 +2824,8 @@ pub fn staged(
         host_bytes: 0,
         hole: false,
         tail_hole: false,
+        cut: 0,
+        gran: ARENA_ALIGN,
         shared_head: false,
         shared_tail: false,
         borrowed: false,
@@ -2712,6 +2969,8 @@ pub fn staged_packed(
         host_bytes: mem.size,
         hole: head.is_none(),
         tail_hole: false,
+        cut: 0,
+        gran: ARENA_ALIGN,
         shared_head: false,
         shared_tail: false,
         borrowed: false,
@@ -2842,6 +3101,8 @@ pub fn staged_range(
         host_bytes: mem.size,
         hole: head == 0,
         tail_hole: false,
+        cut: 0,
+        gran: ARENA_ALIGN,
         shared_head: false,
         shared_tail: false,
         borrowed: false,
@@ -3008,6 +3269,8 @@ pub fn staged_over_hole(
         host_bytes: mem.size,
         hole: true,
         tail_hole: false,
+        cut: 0,
+        gran: ARENA_ALIGN,
         shared_head: false,
         shared_tail: false,
         borrowed: false,

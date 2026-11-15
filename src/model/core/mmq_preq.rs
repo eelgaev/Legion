@@ -70,7 +70,27 @@ pub fn set_mmq_preq(on: bool) {
 /// The engine's GPU: [`mul_mat`] is used on compute capability 12.x (`cc_major`: GB10), where
 /// it was measured faster than ggml's quantization pass; elsewhere ggml's `mul_mat` stays.
 pub fn set_gpu(cc_major: Option<i32>) {
-    GPU.store(cc_major == Some(12), Ordering::Relaxed);
+    GPU.store(gpu_takes(cc_major), Ordering::Relaxed);
+}
+
+/// Whether a GPU of compute capability major `cc_major` takes [`mul_mat`] ([`set_gpu`]).
+pub(crate) fn gpu_takes(cc_major: Option<i32>) -> bool {
+    cc_major == Some(12)
+}
+
+/// Whether the GPU of device `dev` (the weight's) takes [`mul_mat`], asked per device (#1201: a
+/// box may hold GPUs of different architectures); the engine's answer where `dev` is unknown.
+fn gpu_for(dev: Option<usize>) -> bool {
+    gpu_for_by(dev, GPU.load(Ordering::Relaxed), crate::hw::per_device::cc)
+}
+
+/// [`gpu_for`] with the engine's answer `engine` and the compute capabilities `cc_of` gives.
+pub(crate) fn gpu_for_by(
+    dev: Option<usize>,
+    engine: bool,
+    cc_of: impl FnOnce(usize) -> Option<(i32, i32)>,
+) -> bool {
+    crate::hw::per_device::pick_by(dev, engine, |cc| gpu_takes(cc.map(|c| c.0)), cc_of)
 }
 
 /// Whether the engine's GPU is compute capability 12.x ([`set_gpu`]): where the #526 ops were
@@ -84,13 +104,12 @@ pub(crate) fn q8_1_bytes(k: i64, n: i64) -> usize {
     (k / BLOCK * n) as usize * BLOCK_BYTES + PAD_BYTES
 }
 
-/// Whether [`mul_mat`] takes `w` times `n` columns: switched on, a 12.x GPU ([`set_gpu`]),
-/// a Q8_0 matrix in one device's memory with rows of a multiple of 512 values, and enough
-/// columns for ggml-cuda to take MMQ.
+/// Whether [`mul_mat`] takes `w` times `n` columns: switched on, a Q8_0 matrix in the memory of
+/// one 12.x GPU ([`gpu_for`]) with rows of a multiple of 512 values, and enough columns for
+/// ggml-cuda to take MMQ.
 pub(crate) fn fits(w: Tensor<'_>, n: i64) -> bool {
     let [k, _, n2, n3] = w.ne();
     ON.load(Ordering::Relaxed)
-        && GPU.load(Ordering::Relaxed)
         && cfg!(feature = "cuda")
         && w.ty() == types::Q8_0
         && k % 512 == 0
@@ -100,6 +119,7 @@ pub(crate) fn fits(w: Tensor<'_>, n: i64) -> bool {
         && w.is_contiguous()
         && !w.is_host()
         && !w.is_meta()
+        && gpu_for(w.cuda_device())
 }
 
 /// `mul_mat(w, x)` (F32 `[rows, n]`) for `w` Q8_0 `[k, rows]` and `x` F32 `[k, n]`, from `xq`:

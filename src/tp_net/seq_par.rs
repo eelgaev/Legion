@@ -96,10 +96,11 @@ pub fn deferrable(out: Tensor<'_>) -> bool {
 /// Hands the sum of the [`deferrable`] reduce-scatter `out` to its only reader (#1176: the
 /// next hyper-connection norm, `hc_post_norm` in its rebuilt BF16-xn form), which adds the two
 /// ranks' BF16 partials itself as the sum kernel does (rank order, one F32 rounding): on CUDA
-/// the node then waits for the peer's partial but does not sum, leaves `out` unwritten and the
-/// buffers held until the reader ran ([`super::op::cuda::take_deferred`]). If the next exchange
-/// starts first (the graph's order allows it), that exchange makes the sum into `out` as the
-/// node would have, and the reader reads `out`. The CPU op writes `out` either way.
+/// the node then waits for the peer's partial but does not sum, leaves `out` unwritten, puts
+/// the partials' addresses in the communicator's slot for the reader ([`sum_slot`]) and keeps
+/// the buffers held until the next exchange. Where the graph's order runs another exchange
+/// before the reader, [`check_order`] undoes this before the graph's first run, and the node
+/// sums into `out` as before. The CPU op writes `out` either way.
 pub fn defer_sum(out: Tensor<'_>) {
     assert!(deferrable(out), "seq_par::defer_sum: not a deferrable sum");
     // SAFETY: a node of `reduce_scatter` (checked above).
@@ -111,40 +112,292 @@ pub(crate) fn deferred(dst: &ffi::ggml_tensor) -> bool {
     external_params(dst)[P_DEFERRED] != 0
 }
 
-/// For the reader of the deferred reduce-scatter node `rs` ([`defer_sum`]), on CUDA: the device
-/// addresses of rank 0's and rank 1's BF16 partials of this rank's columns (`[row, share]`
-/// each) and the exchange's sequence number, for [`release_deferred`]. `None`: the node summed
-/// into its output itself.
-#[cfg(feature = "cuda")]
-pub(crate) fn take_deferred(rs: &ffi::ggml_tensor) -> Option<([u64; 2], u32)> {
-    if !deferred(rs) {
-        return None;
-    }
-    let c = super::comm(external_params(rs)[0])?;
-    super::op::cuda::take_deferred(&c, rs.data as usize).map(|d| (d.srcs, d.seq))
-}
+/// The parameter of a [`reduce_scatter`] node that [`take_tail`] sets.
+const P_TAIL: usize = 2;
 
-/// After the reader's kernel of [`take_deferred`]'s sum `seq`: the exchange's buffers free.
+/// A post-allocation rewrite on CUDA (#1176): the [`reduce_scatter`] node `rs` whose source
+/// is `tail` (a MoE tail made one op in its fused-sum form,
+/// [`crate::model::core::node_fuse::MOE_SUM_GATE`], which only `rs` reads, directly or
+/// through a view of all of it) runs that tail itself: with `--tp-wire bf16` at its size the
+/// tail's values go rounded to BF16 straight into the send buffer (the values the exchange's
+/// rounding of `tail` would put there, without `tail` written and read back), else into
+/// `tail` first as before. `inputs` (the tail's sources) become `rs`'s sources too, so the
+/// graph, planned again after the rewrite, keeps them until `rs`; `tail` launches nothing.
+/// Whether it did (not for a micro-batch exchange or one already rewritten).
 ///
 /// # Safety
-/// `stream` is the stream the node ran on.
-#[cfg(feature = "cuda")]
-pub(crate) unsafe fn release_deferred(
-    rs: &ffi::ggml_tensor,
-    seq: u32,
-    stream: *mut std::os::raw::c_void,
-) -> Result<(), String> {
-    let c = super::comm(external_params(rs)[0]).ok_or("tp reduce-scatter: the communicator")?;
+/// Valid nodes of a graph not yet run; the caller plans the graph again and saves `rs` and
+/// `tail` first if it may undo this.
+pub(crate) unsafe fn take_tail(
+    rs: *mut ffi::ggml_tensor,
+    tail: *mut ffi::ggml_tensor,
+    inputs: &[*mut ffi::ggml_tensor],
+) -> bool {
     // SAFETY: the caller's.
-    unsafe { super::op::cuda::release_deferred(&c, seq, stream) }
+    unsafe {
+        let t = &mut *rs;
+        if !crate::ggml::op_of(t).is_some_and(|op| std::ptr::eq(op, &REDUCE_SCATTER))
+            || external_params(t)[P_TAIL] != 0
+            || inputs.len() + 1 > ffi::GGML_MAX_SRC as usize
+            || t.src[1..].iter().any(|s| !s.is_null())
+        {
+            return false;
+        }
+        let src = t.src[0];
+        let whole = src == tail
+            || (!(*src).view_src.is_null()
+                && (*src).view_src == tail
+                && (*src).view_offs == 0
+                && ffi::ggml_is_contiguous(src)
+                && ffi::ggml_nelements(src) == ffi::ggml_nelements(tail));
+        if !whole || !ffi::ggml_is_contiguous(tail) {
+            return false;
+        }
+        t.src[1..1 + inputs.len()].copy_from_slice(inputs);
+        crate::ggml::set_external_param(rs, P_TAIL, 1);
+        crate::ggml::set_external_param(tail, crate::model::core::node_fuse::P_BY_EXCHANGE, 1);
+        true
+    }
 }
 
-/// The reader of [`take_deferred`]'s sum could not run: its communicator fails with `e`, which
-/// releases every wait on the exchange's buffers.
+/// The MoE tail node the [`reduce_scatter`] node `dst` runs itself ([`take_tail`]), if any.
 #[cfg(feature = "cuda")]
-pub(crate) fn fail_deferred(rs: &ffi::ggml_tensor, e: &str) {
-    if let Some(c) = super::comm(external_params(rs)[0]) {
-        c.fail(e.to_string());
+pub(crate) fn tail_of(dst: &ffi::ggml_tensor) -> Option<&ffi::ggml_tensor> {
+    if external_params(dst)[P_TAIL] == 0 {
+        return None;
+    }
+    // SAFETY: a node of `reduce_scatter`: its source is the tail or a view of all of it.
+    unsafe {
+        let src = &*dst.src[0];
+        Some(if src.view_src.is_null() {
+            src
+        } else {
+            &*src.view_src
+        })
+    }
+}
+
+/// Whether graphs rewritten from now on let an all-gather run the mix it reads ([`take_mix`])
+/// and write its output's F32 copy ([`take_cast`]).
+static GATHER_MIX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static GATHER_WIDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Sets whether a BF16 all-gather runs the hyper-connection mix it alone reads itself, rounded
+/// straight into its send buffer ([`take_mix`]; on by default, `legion serve
+/// --no-tp-gather-mix` turns it off for comparisons).
+pub fn set_gather_mix(on: bool) {
+    GATHER_MIX.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`set_gather_mix`] is on.
+pub(crate) fn gather_mix() -> bool {
+    GATHER_MIX.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Sets whether a BF16 all-gather writes the F32 copy of its output itself, this rank's share
+/// while the peers' travel ([`take_cast`]; on by default, `legion serve --no-tp-gather-widen`
+/// turns it off for comparisons).
+pub fn set_gather_widen(on: bool) {
+    GATHER_WIDEN.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`set_gather_widen`] is on.
+pub(crate) fn gather_widen() -> bool {
+    GATHER_WIDEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The parameter of an [`all_gather`] node that [`take_mix`] sets.
+const P_MIX: usize = 1;
+
+/// The source slot of an [`all_gather_bf16`] node's F32 copy ([`take_cast`]).
+const CAST_SRC: usize = 1;
+
+/// Whether `t` is a node of [`all_gather`] or [`all_gather_bf16`].
+///
+/// # Safety
+/// `t` is a valid tensor.
+pub(crate) unsafe fn is_all_gather(t: *const ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's.
+    unsafe { crate::ggml::op_of(t) }.is_some_and(|op| std::ptr::eq(op, &ALL_GATHER))
+}
+
+/// A post-allocation rewrite on CUDA (#1176): the all-gather node `ag` whose source is `mix`
+/// (a hyper-connection mix that only `ag` reads, directly or through a view of all of it) runs
+/// that mix itself: with BF16 on the wire the mix's values go rounded to BF16 straight into
+/// the send buffer (the values the exchange's rounding of `mix` would put there, without `mix`
+/// written and read back), else into `mix` first as before. The caller makes `mix` launch
+/// nothing. Whether it did (not for a node already rewritten).
+///
+/// # Safety
+/// Valid nodes of an allocated graph not yet run.
+pub(crate) unsafe fn take_mix(ag: *mut ffi::ggml_tensor, mix: *mut ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's.
+    unsafe {
+        if !is_all_gather(ag) || external_params(&*ag)[P_MIX] != 0 {
+            return false;
+        }
+        let src = (*ag).src[0];
+        let whole = src == mix
+            || (!(*src).view_src.is_null()
+                && (*src).view_src == mix
+                && (*src).view_offs == 0
+                && ffi::ggml_is_contiguous(src)
+                && ffi::ggml_nelements(src) == ffi::ggml_nelements(mix));
+        if !whole || !ffi::ggml_is_contiguous(mix) {
+            return false;
+        }
+        crate::ggml::set_external_param(ag, P_MIX, 1);
+        true
+    }
+}
+
+/// The mix node the [`all_gather`] node `dst` runs itself ([`take_mix`]), if any.
+#[cfg(feature = "cuda")]
+pub(crate) fn mix_of(dst: &ffi::ggml_tensor) -> Option<&ffi::ggml_tensor> {
+    if external_params(dst)[P_MIX] == 0 {
+        return None;
+    }
+    // SAFETY: a node of `all_gather`: its source is the mix or a view of all of it.
+    unsafe {
+        let src = &*dst.src[0];
+        Some(if src.view_src.is_null() {
+            src
+        } else {
+            &*src.view_src
+        })
+    }
+}
+
+/// A post-allocation rewrite on CUDA (#1176): the [`all_gather_bf16`] node `ag` also writes
+/// `cast`, the F32 copy of all of its output (a `ggml_cast` the caller turns into a node that
+/// runs nothing): each BF16 value widened, exactly, this rank's share before the wait for the
+/// peers' (so while they travel) and theirs after it. Whether it did (not for an F32 gather or
+/// one already rewritten).
+///
+/// # Safety
+/// Valid nodes of an allocated graph not yet run; `cast` is contiguous F32 with memory, as
+/// many values as `ag`.
+pub(crate) unsafe fn take_cast(ag: *mut ffi::ggml_tensor, cast: *mut ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's.
+    unsafe {
+        if !is_all_gather(ag) || (*ag).type_ != types::BF16 || !(*ag).src[CAST_SRC].is_null() {
+            return false;
+        }
+        (*ag).src[CAST_SRC] = cast;
+        true
+    }
+}
+
+/// The device address of the F32 copy the [`all_gather_bf16`] node `dst` writes itself
+/// ([`take_cast`]), if any.
+#[cfg(feature = "cuda")]
+pub(crate) fn cast_of(dst: &ffi::ggml_tensor) -> Option<usize> {
+    let c = dst.src[CAST_SRC];
+    // SAFETY: a node of `all_gather_bf16`: its second source is null or the cast.
+    (dst.type_ == types::BF16 && !c.is_null()).then(|| unsafe { (*c).data as usize })
+}
+
+/// For the reader of the deferred reduce-scatter node `rs` ([`defer_sum`]), on CUDA: the device
+/// address of the communicator's sum slot, two `u64`s that the exchange sets on the stream to
+/// the device addresses of rank 0's and rank 1's BF16 partials of this rank's columns
+/// (`[row, share]` each). The address is fixed for the communicator's life, so a stage graph
+/// may capture the reader's launch: a replay reads the addresses the latest exchange wrote.
+/// The exchange's buffers are freed by the next exchange ([`check_order`] makes sure the
+/// reader runs before it).
+#[cfg(feature = "cuda")]
+pub(crate) fn sum_slot(rs: &ffi::ggml_tensor) -> Result<u64, String> {
+    let c = super::comm(external_params(rs)[0]).ok_or("tp reduce-scatter: the communicator")?;
+    super::op::cuda::sum_slot(&c).ok_or_else(|| "tp reduce-scatter: no sum slot yet".into())
+}
+
+/// Whether `t` is a node of one of the exchanges: an all-reduce, a [`reduce_scatter`], an
+/// [`all_gather`] or a micro-batch exchange's half ([`super::micro`]).
+fn is_exchange(t: &ffi::ggml_tensor) -> bool {
+    // SAFETY: a valid tensor.
+    unsafe { crate::ggml::op_of(t) }.is_some_and(|op| op.name.starts_with("tp_"))
+}
+
+/// Whether `t` is a [`reduce_scatter`] node whose sum its reader makes ([`defer_sum`]).
+fn is_deferred_rs(t: &ffi::ggml_tensor) -> bool {
+    // SAFETY: a valid tensor.
+    unsafe { crate::ggml::op_of(t) }.is_some_and(|op| std::ptr::eq(op, &REDUCE_SCATTER))
+        && deferred(t)
+}
+
+/// Whether `t` reads its sources' memory when it runs: not a view or a node that runs nothing.
+fn reads(t: &ffi::ggml_tensor) -> bool {
+    !matches!(
+        t.op,
+        ffi::ggml_op_GGML_OP_NONE
+            | ffi::ggml_op_GGML_OP_VIEW
+            | ffi::ggml_op_GGML_OP_RESHAPE
+            | ffi::ggml_op_GGML_OP_PERMUTE
+            | ffi::ggml_op_GGML_OP_TRANSPOSE
+    )
+}
+
+/// [`check_order`] as the check run on every allocated graph
+/// ([`crate::ggml::post_alloc::set_order`]), whatever memory it got.
+///
+/// # Safety
+/// As [`check_order`].
+pub(crate) unsafe fn order_pass(graph: *mut ffi::ggml_cgraph) {
+    // SAFETY: the caller's.
+    unsafe { check_order(graph) };
+}
+
+/// A deferred sum made by its node after all ([`check_order`]), for the log.
+static WRITTEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Before `graph` first runs (#1176): every [`defer_sum`] reduce-scatter whose reader does not
+/// run before the graph's next exchange, or that no node reads, writes its sum after all, as
+/// without [`defer_sum`]. The exchange after a deferred one frees its buffers and its reader
+/// reads the addresses the deferred one left in the communicator's slot ([`sum_slot`]), so that
+/// reader must come first, in every run of the graph alike (a stage graph's replay too). The
+/// readers read the sum from the output then, the same bits. Returns how many it changed.
+///
+/// # Safety
+/// A live graph none of whose nodes has run yet.
+pub(crate) unsafe fn check_order(graph: *mut ffi::ggml_cgraph) -> usize {
+    // SAFETY: the caller's: a live graph whose node array holds `n` valid tensors.
+    unsafe {
+        let n = ffi::ggml_graph_n_nodes(graph) as usize;
+        let nodes = std::slice::from_raw_parts(ffi::ggml_graph_nodes(graph), n);
+        let mut pending: Option<*mut ffi::ggml_tensor> = None;
+        let mut late = Vec::new();
+        for &t in nodes {
+            let node = &*t;
+            if let Some(rs) = pending {
+                if is_exchange(node) {
+                    late.push(rs);
+                    pending = None;
+                } else if reads(node)
+                    && node
+                        .src
+                        .iter()
+                        .any(|&s| !s.is_null() && (s == rs || (*s).view_src == rs))
+                {
+                    // Its reader (directly or through a view).
+                    pending = None;
+                }
+            }
+            if is_deferred_rs(node) {
+                pending = Some(t);
+            }
+        }
+        late.extend(pending);
+        for &rs in &late {
+            crate::ggml::set_external_param(rs, P_DEFERRED, 0);
+        }
+        let changed = late.len();
+        if changed > 0 && WRITTEN.fetch_add(changed, std::sync::atomic::Ordering::Relaxed) < 3 {
+            tracing::warn!(
+                sums = changed,
+                "tp reduce-scatter: a deferred sum's reader does not run before the next \
+                 exchange; the sum is written to its output instead (the first graphs)"
+            );
+        }
+        changed
     }
 }
 
@@ -155,6 +408,25 @@ pub fn all_gather<'a>(ctx: &'a Context, comm: i32, x: Tensor<'a>, cols: i64) -> 
     let row = x.ne()[0];
     let x = if x.is_contiguous() { x } else { ctx.cont(x) };
     ctx.external_with(&ALL_GATHER, types::F32, [row, cols, 1, 1], &[x], &[comm])
+}
+
+/// [`all_gather`] as BF16, where the columns travel in BF16 (`--tp-wire bf16` at this size,
+/// so they are BF16 values already, this rank's own rounded too): the same values at half the
+/// bytes, copied from the wire buffers as they are (#1176). `None` with F32 on the wire.
+pub fn all_gather_bf16<'a>(
+    ctx: &'a Context,
+    comm: i32,
+    x: Tensor<'a>,
+    cols: i64,
+) -> Option<Tensor<'a>> {
+    assert_eq!(x.ty(), types::F32, "tp all-gather: F32 only");
+    let row = x.ne()[0];
+    let c = super::comm(comm)?;
+    if c.wire((row * cols) as usize) != super::Wire::Bf16 {
+        return None;
+    }
+    let x = if x.is_contiguous() { x } else { ctx.cont(x) };
+    Some(ctx.external_with(&ALL_GATHER, types::BF16, [row, cols, 1, 1], &[x], &[comm]))
 }
 
 /// The node's F32 source and output as host slices, and its row length.
@@ -198,6 +470,10 @@ unsafe fn cpu_all_gather(dst: &ffi::ggml_tensor, ith: usize, _nth: usize) {
     if ith != 0 {
         return;
     }
+    if dst.type_ == types::BF16 {
+        // SAFETY: a node of `all_gather_bf16`.
+        return unsafe { cpu_all_gather_bf16(dst) };
+    }
     // SAFETY: a node of `all_gather`.
     let (src, out, row) = unsafe { host_io(dst) };
     match super::comm(external_params(dst)[0]) {
@@ -208,5 +484,31 @@ unsafe fn cpu_all_gather(dst: &ffi::ggml_tensor, ith: usize, _nth: usize) {
             tracing::error!("tp all-gather: the communicator is gone");
             out.fill(0.0);
         }
+    }
+}
+
+/// [`cpu_all_gather`] of an [`all_gather_bf16`] node: the F32 gather (BF16 values, as they
+/// travelled), stored as their BF16 bits.
+///
+/// # Safety
+/// A node of [`all_gather_bf16`] on the CPU.
+unsafe fn cpu_all_gather_bf16(dst: &ffi::ggml_tensor) {
+    // SAFETY: the caller's: a contiguous F32 source and BF16 output with host data.
+    let (src, out) = unsafe {
+        let src = &*dst.src[0];
+        (
+            std::slice::from_raw_parts(src.data as *const f32, ffi::ggml_nelements(src) as usize),
+            std::slice::from_raw_parts_mut(dst.data as *mut u16, ffi::ggml_nelements(dst) as usize),
+        )
+    };
+    let mut all = vec![0f32; out.len()];
+    match super::comm(external_params(dst)[0]) {
+        Some(c) => {
+            let _ = c.all_gather_host(src, &mut all, dst.ne[0] as usize);
+        }
+        None => tracing::error!("tp all-gather: the communicator is gone"),
+    }
+    for (o, v) in out.iter_mut().zip(all) {
+        *o = super::comm::bf16_bits(v);
     }
 }

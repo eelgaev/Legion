@@ -21,6 +21,10 @@
 //!   after it (`crate::ggml::post_alloc::set_relayout`), before this pass runs.
 //! - The routed expert ids through the layer's expert table (the expert cache's remap: a `cont`
 //!   and a `get_rows` of I32 ids): one op ([`IDS_REMAP`]).
+//! - qwen4exp's hyper-connection mix of BF16 `up` weights (prompt steps) writes the cast of its
+//!   values to BF16 (ggml's `cpy`, which the BF16 projections read) itself, rounded as
+//!   ggml-cuda's copy rounds them, into the cast's memory, and skips its F32 values where only
+//!   the cast reads them (#1183): a copy kernel per mixer gone ([`Graph::mix_cast`]).
 //!
 //! An op runs at the position of the chain's last node, into that node's memory; the chain's
 //! other nodes become `GGML_OP_NONE`. An op reading a tensor later than the chain did is only
@@ -55,6 +59,12 @@ type Node = *mut ffi::ggml_tensor;
 /// `params[3]` of a [`MOE_SUM_GATE`] in its fused-sum form that skips the rows of zero router
 /// weights (`1` reads them all).
 pub(crate) const FMA_SKIP: i32 = 2;
+
+/// The parameter of a [`MOE_SUM_GATE`] in its fused-sum form that the reduce-scatter reading
+/// it sets ([`crate::tp_net::seq_par::take_tail`], #1176): the node launches nothing, and the
+/// exchange runs the tail itself ([`launch_tail`]), its values rounded to BF16 straight into
+/// the send buffer.
+pub(crate) const P_BY_EXCHANGE: usize = 4;
 
 pub(crate) static MOE_SUM_GATE: ExternalOp = ExternalOp {
     name: "moe_sum_gate",
@@ -98,6 +108,14 @@ pub(crate) struct Counts {
     pub gate: usize,
     /// Expert id remaps.
     pub remap: usize,
+    /// BF16 hyper-connection mixes writing their cast to BF16 themselves.
+    pub mix_cast: usize,
+    /// Of those, mixes whose F32 values nothing else reads, so not written.
+    pub mix_f32_skipped: usize,
+    /// BF16 hyper-connection mixes run by the all-gather reading them (#1176).
+    pub gather_mix: usize,
+    /// F32 copies of a BF16 all-gather's output written by the gather (#1176).
+    pub gather_cast: usize,
     /// Nodes turned into `GGML_OP_NONE`.
     pub none: usize,
 }
@@ -123,6 +141,10 @@ pub unsafe fn rewrite(graph: *mut ffi::ggml_cgraph) {
             sum = c.sum,
             gate = c.gate,
             remap = c.remap,
+            mix_cast = c.mix_cast,
+            mix_f32_skipped = c.mix_f32_skipped,
+            gather_mix = c.gather_mix,
+            gather_cast = c.gather_cast,
             none = c.none,
             "node fuse: small ggml chains as Legion ops (the first graphs; --node-fuse-ggml off)"
         );
@@ -148,6 +170,12 @@ pub(crate) unsafe fn rewrite_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> 
             match (*g.nodes[i]).op {
                 ffi::ggml_op_GGML_OP_MUL => g.moe(i, cuda, &mut c),
                 ffi::ggml_op_GGML_OP_GET_ROWS => g.remap(i, &mut c),
+                ffi::ggml_op_GGML_OP_CUSTOM => {
+                    g.mix_cast(i, &mut c);
+                    if cuda {
+                        g.gather(i, &mut c);
+                    }
+                }
                 _ => {}
             }
         }
@@ -817,6 +845,188 @@ impl Graph {
             c.remap += 1;
         }
     }
+
+    /// The cast to BF16 (`ggml_cast`: a `cpy` into a new contiguous tensor) of all of `mix`'s
+    /// values, read directly or through a reshape or view of all of them, by index.
+    ///
+    /// # Safety
+    /// `mix` is a node of the graph.
+    unsafe fn bf16_cast_of(&self, mix: Node) -> Option<usize> {
+        // SAFETY: the caller's.
+        unsafe { self.cast_of(mix, ffi::ggml_type_GGML_TYPE_BF16) }
+    }
+
+    /// [`Self::bf16_cast_of`] for a cast of all of `mix`'s values to `ty`.
+    ///
+    /// # Safety
+    /// `mix` is a node of the graph.
+    unsafe fn cast_of(&self, mix: Node, ty: ffi::ggml_type) -> Option<usize> {
+        // SAFETY: the caller's; users are valid nodes.
+        unsafe {
+            let whole = |t: Node| {
+                t == mix
+                    || (is_view_op((*t).op)
+                        && (*t).view_src == mix
+                        && (*t).view_offs == 0
+                        && ffi::ggml_is_contiguous(t)
+                        && ffi::ggml_nelements(t) == ffi::ggml_nelements(mix))
+            };
+            let mut readers: Vec<usize> = self.users(mix).to_vec();
+            for &u in self.users(mix) {
+                if is_view_op((*self.nodes[u]).op) {
+                    readers.extend(self.users(self.nodes[u]));
+                }
+            }
+            readers.sort_unstable();
+            readers.into_iter().find(|&j| {
+                let t = self.nodes[j];
+                !self.none[j]
+                    && (*t).op == ffi::ggml_op_GGML_OP_CPY
+                    && (*t).type_ == ty
+                    && (*t).src[1] == t
+                    && (*t).view_src.is_null()
+                    && !(*t).data.is_null()
+                    && ffi::ggml_is_contiguous(t)
+                    && ffi::ggml_nelements(t) == ffi::ggml_nelements(mix)
+                    && !(*t).src[0].is_null()
+                    && whole((*t).src[0])
+            })
+        }
+    }
+
+    /// qwen4exp's BF16 hyper-connection mix at `at` ([`crate::model::qwen4::mix_cast_reads`])
+    /// and the cast of its values to BF16: the mix writes the cast's values itself, rounded as
+    /// ggml-cuda's copy rounds them (`__float2bfloat16`; the CPU's as ggml's CPU copy), into the
+    /// cast's memory, and the cast becomes `GGML_OP_NONE`. Its memory is written earlier than
+    /// the cast did, so only where none of it is what the mix reads or writes, and no node in
+    /// between writes or reads it. Where the cast is the only reader of the F32 values (the
+    /// attention's mix), the mix does not write them.
+    ///
+    /// # Safety
+    /// `at` is a node index.
+    unsafe fn mix_cast(&mut self, at: usize, c: &mut Counts) {
+        // SAFETY: the caller's; nodes and sources are valid tensors.
+        unsafe {
+            let mix = self.nodes[at];
+            let Some(reads) = crate::model::qwen4::mix_cast_reads(mix) else {
+                return;
+            };
+            let Some(j) = self.bf16_cast_of(mix) else {
+                return;
+            };
+            let cast = self.nodes[j];
+            let (c0, c1) = span(cast);
+            let hits = |(a, b): (usize, usize)| a < b && a < c1 && c0 < b;
+            if c0 >= c1 || hits(span(mix)) || reads.iter().any(|&r| hits(r)) {
+                return;
+            }
+            for k in at + 1..j {
+                let n = self.nodes[k];
+                if self.none[k] || is_view_op((*n).op) || (*n).op == ffi::ggml_op_GGML_OP_NONE {
+                    continue;
+                }
+                if overlap(n, cast) || (*n).src.iter().any(|&s| !s.is_null() && overlap(s, cast)) {
+                    return;
+                }
+            }
+            let skip_f32 = self.only_read_by(mix, &[j]);
+            crate::model::qwen4::set_mix_cast(mix, cast, skip_f32);
+            (*cast).op = ffi::ggml_op_GGML_OP_NONE;
+            self.none[j] = true;
+            c.mix_cast += 1;
+            c.mix_f32_skipped += usize::from(skip_f32);
+        }
+    }
+
+    /// Whether no node in `from..to` that runs (not a view, not turned off) has its output in
+    /// `ranges` (`(start, end)` bytes).
+    ///
+    /// # Safety
+    /// `from..to` are node indices.
+    unsafe fn unwritten(&self, from: usize, to: usize, ranges: &[(usize, usize)]) -> bool {
+        // SAFETY: the caller's; nodes are valid tensors.
+        unsafe {
+            (from..to).all(|k| {
+                let n = self.nodes[k];
+                if self.none[k] || is_view_op((*n).op) || (*n).op == ffi::ggml_op_GGML_OP_NONE {
+                    return true;
+                }
+                let (a, b) = span(n);
+                a >= b || !ranges.iter().any(|&(x, y)| x < y && x < b && a < y)
+            })
+        }
+    }
+
+    /// The sequence-parallel all-gather at `at` on CUDA (#1176,
+    /// [`crate::tp_net::seq_par::all_gather`]), a block input gathered from every rank's share.
+    ///
+    /// Where its source is qwen4exp's BF16 hyper-connection mix
+    /// ([`crate::model::qwen4::mix_cast_reads`]) that nothing else reads, the gather runs the
+    /// mix itself, its values rounded straight into the send buffer
+    /// ([`crate::tp_net::seq_par::take_mix`]): the mix node launches nothing. The mix then runs
+    /// at the gather's place in the graph, so only where no node in between writes what it
+    /// reads.
+    ///
+    /// Where the BF16 gather's output is cast to F32 (for the block's F32 readers), the gather
+    /// writes the cast's values too, this rank's share while the peers' travel
+    /// ([`crate::tp_net::seq_par::take_cast`]), and the cast becomes `GGML_OP_NONE`. Its memory
+    /// is written earlier than the cast did, so only where no node in between writes or reads
+    /// it and it is not the gather's own.
+    ///
+    /// # Safety
+    /// `at` is a node index.
+    unsafe fn gather(&mut self, at: usize, c: &mut Counts) {
+        use crate::tp_net::seq_par;
+        // SAFETY: the caller's; nodes and sources are valid tensors.
+        unsafe {
+            let ag = self.nodes[at];
+            if !seq_par::is_all_gather(ag) || (*ag).data.is_null() || (*ag).src[0].is_null() {
+                return;
+            }
+            let src = (*ag).src[0];
+            let mix = if (*src).view_src.is_null() {
+                src
+            } else {
+                (*src).view_src
+            };
+            if seq_par::gather_mix()
+                && let Some(&m) = self.index.get(&(mix as usize))
+                && m < at
+                && !self.none[m]
+                && let Some(reads) = crate::model::qwen4::mix_cast_reads(mix)
+                && self.only_read_by(mix, &[at])
+                && self.unwritten(m + 1, at, &reads)
+                && seq_par::take_mix(ag, mix)
+            {
+                crate::model::qwen4::set_mix_by_exchange(mix);
+                c.gather_mix += 1;
+            }
+            if !seq_par::gather_widen() || (*ag).type_ != ffi::ggml_type_GGML_TYPE_BF16 {
+                return;
+            }
+            let Some(j) = self.cast_of(ag, ffi::ggml_type_GGML_TYPE_F32) else {
+                return;
+            };
+            let cast = self.nodes[j];
+            if j <= at || overlap(ag, cast) {
+                return;
+            }
+            for k in at + 1..j {
+                let n = self.nodes[k];
+                if self.none[k] || is_view_op((*n).op) || (*n).op == ffi::ggml_op_GGML_OP_NONE {
+                    continue;
+                }
+                if overlap(n, cast) || (*n).src.iter().any(|&s| !s.is_null() && overlap(s, cast)) {
+                    return;
+                }
+            }
+            if seq_par::take_cast(ag, cast) {
+                (*cast).op = ffi::ggml_op_GGML_OP_NONE;
+                self.none[j] = true;
+                c.gather_cast += 1;
+            }
+        }
+    }
 }
 
 unsafe fn cpu_moe_sum_gate(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
@@ -896,6 +1106,7 @@ struct SumGate {
     k: i32,
     n_tok: i32,
     skip_zero: i32,
+    out16: *mut u16,
 }
 
 /// `legion_ids_remap` (src/cuda/node_fuse.cu).
@@ -945,37 +1156,101 @@ const THREADS: u32 = 256;
 
 #[cfg(feature = "cuda")]
 unsafe fn cuda_moe_sum_gate(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
+    // The reduce-scatter reading it runs it (#1176).
+    if external_params(dst)[P_BY_EXCHANGE] != 0 {
+        return Ok(());
+    }
+    // SAFETY: the caller's.
+    unsafe { launch_sum_gate(dst, None, None, stream) }
+}
+
+/// For the reduce-scatter that took over the [`MOE_SUM_GATE`] node `dst` (#1176, see
+/// [`P_BY_EXCHANGE`]): runs it on `stream`, into its own output (`out16` `None`, an F32
+/// exchange) or with its values rounded to BF16 at the device address `out16` instead,
+/// `[n_embd, n_tok]` contiguous (the send buffer). `tokens`: only the node's tokens `(first,
+/// count)`, at their places (the kernel works a token at a time, so the launches of a split
+/// give every value the whole launch's bits): the exchange makes the peers' tokens first and
+/// its own while they travel.
+///
+/// # Safety
+/// `dst` is such a node of an allocated graph, its sources' memory still holding their values
+/// (the exchange reads them too); `out16` device-writable for the node's values; `tokens`
+/// within the node's.
+#[cfg(feature = "cuda")]
+pub(crate) unsafe fn launch_tail(
+    dst: &ffi::ggml_tensor,
+    out16: Option<u64>,
+    tokens: Option<(usize, usize)>,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    // SAFETY: the caller's.
+    unsafe { launch_sum_gate(dst, out16, tokens, stream) }
+}
+
+/// # Safety
+/// `dst` is a [`MOE_SUM_GATE`] node of an allocated graph whose sources hold their values;
+/// `out16` (fused-sum form only) and `tokens` as [`launch_tail`]'s.
+#[cfg(feature = "cuda")]
+unsafe fn launch_sum_gate(
+    dst: &ffi::ggml_tensor,
+    out16: Option<u64>,
+    tokens: Option<(usize, usize)>,
+    stream: *mut c_void,
+) -> Result<(), String> {
     // SAFETY: a node made by the rewrite, device tensors of the stream's device; the kernel
     // reads `p` from the launch's copy of its argument.
     unsafe {
         let [weights, gated, k, fma, ..] = external_params(dst);
+        if out16.is_some() && fma == 0 {
+            return Err("moe_sum_gate: BF16 values from the fused sum only".into());
+        }
         let x = &*dst.src[0];
         let w = (weights != 0).then(|| &*dst.src[1]);
         let at = 1 + usize::from(weights != 0);
         let gate = (gated != 0).then(|| (&*dst.src[at], &*dst.src[at + 1]));
-        let (e, n) = (dst.ne[0], dst.ne[1]);
+        let e = dst.ne[0];
+        let (t0, n) = match tokens {
+            Some((a, c)) if (a + c) as i64 <= dst.ne[1] => (a, c as i64),
+            Some(_) => return Err("moe_sum_gate: tokens past the node's".into()),
+            None => (0, dst.ne[1]),
+        };
         if n < 1 || e < 1 {
             return Ok(());
         }
         if fma != 0 && (w.is_none() || gate.is_none()) {
             return Err("moe_sum_gate: the fused sum needs the weights and the gate".into());
         }
+        // Token `t0`'s place in each tensor (the kernels index them by token).
+        let g_ld = gate.map_or(0, |(_, g)| g.nb[1] / 4);
+        let (ke, e_us) = (k as usize * e as usize, e as usize);
+        let out16 = out16.map(|a| a + (t0 * e_us * 2) as u64);
         let mut p = SumGate {
-            x: x.data as *const f32,
-            w: w.map_or(std::ptr::null(), |w| w.data as *const f32),
-            sh: gate.map_or(std::ptr::null(), |(sh, _)| sh.data as *const f32),
-            g: gate.map_or(std::ptr::null(), |(_, g)| g.data as *const f32),
-            g_ld: gate.map_or(0, |(_, g)| (g.nb[1] / 4) as i64),
-            out: dst.data as *mut f32,
+            x: (x.data as *const f32).add(t0 * ke),
+            w: w.map_or(std::ptr::null(), |w| {
+                (w.data as *const f32).add(t0 * k as usize)
+            }),
+            sh: gate.map_or(std::ptr::null(), |(sh, _)| {
+                (sh.data as *const f32).add(t0 * e_us)
+            }),
+            g: gate.map_or(std::ptr::null(), |(_, g)| {
+                (g.data as *const f32).add(t0 * g_ld)
+            }),
+            g_ld: g_ld as i64,
+            out: (dst.data as *mut f32).add(t0 * e_us),
             n_embd: e,
             k,
             n_tok: n as i32,
             skip_zero: i32::from(fma == FMA_SKIP),
+            out16: out16.map_or(std::ptr::null_mut(), |a| a as *mut u16),
         };
-        // The fused sum's kernel: 4 columns a thread where every row is 16-byte aligned.
+        // The fused sum's kernel: 4 columns a thread where every row is 16-byte aligned (the
+        // BF16 values' rows 8-byte aligned).
         let aligned = |t: *const f32| (t as usize).is_multiple_of(16);
-        let v4 =
-            fma != 0 && e % 4 == 0 && aligned(p.x) && aligned(p.sh) && aligned(p.out.cast_const());
+        let out_aligned = match out16 {
+            Some(a) => a.is_multiple_of(8),
+            None => aligned(p.out.cast_const()),
+        };
+        let v4 = fma != 0 && e % 4 == 0 && aligned(p.x) && aligned(p.sh) && out_aligned;
         let (kernel, cols) = match (fma != 0, v4) {
             (false, _) => (legion_moe_sum_gate_kernel, 1),
             (true, false) => (legion_moe_tail_fma_kernel, 1),

@@ -39,7 +39,7 @@ pub(super) const MIN_TOKENS: i64 = 16;
 static ON: AtomicBool = AtomicBool::new(true);
 
 /// Whether the engine's GPU is one the op is chosen for (compute capability 7.x), set when the
-/// engine loads ([`set_gpu`]).
+/// engine loads ([`set_gpu`]): the answer for a group whose state names no device ([`gpu_for`]).
 static GPU: AtomicBool = AtomicBool::new(false);
 
 /// Sets whether graphs built from now on use [`gdn_scan`] where it fits (on by default; ggml's
@@ -52,12 +52,32 @@ pub fn set_gdn_scan(on: bool) {
 /// ggml-cuda's bits faster; elsewhere ggml's op stays (sm_80+ GPUs may run ggml's chunked
 /// kernel, other bits).
 pub fn set_gpu(cc_major: Option<i32>) {
-    GPU.store(cc_major == Some(7), Ordering::Relaxed);
+    GPU.store(gpu_takes(cc_major), Ordering::Relaxed);
 }
 
-/// Whether [`gdn_scan`] takes this group: switched on, a 7.x GPU ([`set_gpu`]), a prompt group
-/// (at least [`MIN_TOKENS`] tokens, not a verify group: `prompt`), heads of [`HEAD`] with a
-/// scalar gate, F32, and the state in one device's memory.
+/// Whether a GPU of compute capability major `cc_major` takes the op ([`set_gpu`]).
+pub(super) fn gpu_takes(cc_major: Option<i32>) -> bool {
+    cc_major == Some(7)
+}
+
+/// Whether the GPU of device `dev` (the state's) takes the op, asked per device (#1201: a box
+/// may hold GPUs of different architectures); the engine's answer where `dev` is unknown.
+fn gpu_for(dev: Option<usize>) -> bool {
+    gpu_for_by(dev, GPU.load(Ordering::Relaxed), crate::hw::per_device::cc)
+}
+
+/// [`gpu_for`] with the engine's answer `engine` and the compute capabilities `cc_of` gives.
+pub(super) fn gpu_for_by(
+    dev: Option<usize>,
+    engine: bool,
+    cc_of: impl FnOnce(usize) -> Option<(i32, i32)>,
+) -> bool {
+    crate::hw::per_device::pick_by(dev, engine, |cc| gpu_takes(cc.map(|c| c.0)), cc_of)
+}
+
+/// Whether [`gdn_scan`] takes this group: switched on, a prompt group (at least [`MIN_TOKENS`]
+/// tokens, not a verify group: `prompt`), heads of [`HEAD`] with a scalar gate, F32, and the
+/// state in the memory of one 7.x GPU ([`gpu_for`]).
 pub(super) fn fits(
     q: Tensor<'_>,
     v: Tensor<'_>,
@@ -67,7 +87,6 @@ pub(super) fn fits(
     prompt: bool,
 ) -> bool {
     ON.load(Ordering::Relaxed)
-        && GPU.load(Ordering::Relaxed)
         && cfg!(feature = "cuda")
         && prompt
         && n_tok >= MIN_TOKENS
@@ -77,6 +96,7 @@ pub(super) fn fits(
         && [q, v, g, state].iter().all(|t| t.ty() == types::F32)
         && !state.is_host()
         && !state.is_meta()
+        && gpu_for(state.cuda_device())
 }
 
 /// ggml's `gated_delta_net(q, k, v, g, beta, state, 1)` as [`GDN_SCAN`]: the same shapes in

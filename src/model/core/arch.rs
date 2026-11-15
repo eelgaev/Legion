@@ -375,9 +375,25 @@ pub trait Arch: Debug + Send + Sync + Any {
         false
     }
 
+    /// Whether a greedy step's head may run as two shares of the vocabulary on the two ranks
+    /// of tensor parallelism ([`crate::model::core::head_split`], `--tp-head-split`): only
+    /// architectures on the core's head ([`Self::head`] `None`) whose text was shown to stay
+    /// the same with it.
+    fn head_splits(&self) -> bool {
+        false
+    }
+
     /// The logits as the model returns them (a soft-cap, say).
     fn logits<'a>(&self, _ctx: &'a Context, logits: Tensor<'a>) -> Tensor<'a> {
         logits
+    }
+
+    /// `Some(c)` when [`Self::logits`] is exactly the soft-cap `c · tanh(logits / c)` built as
+    /// `scale(tanh(scale(logits, 1 / c)), c)` (`c` 0: the logits as they are), so the BF16 head
+    /// of verify steps may run on [`crate::model::core::head_mm`]; `None` (the default) keeps
+    /// the core's matmul and [`Self::logits`].
+    fn logit_softcap(&self) -> Option<f32> {
+        None
     }
 
     // MTP.

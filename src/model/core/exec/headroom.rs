@@ -30,5 +30,25 @@ pub(super) fn step_allocator(buft: BufferType, lent: bool, roomy: bool) -> Compu
     }
 }
 
+/// What the free memory a failed step buffer allocation reckons with may miss (each buffer's
+/// allocation granule): within it, [`hopeless`] still lets the retries run.
+const HOPELESS_SLACK: usize = 64 << 20;
+
+/// Whether a step graph's compute buffer whose allocation failed asking `bytes` cannot fit
+/// however many kept graphs are dropped (#37): `free` device bytes, `held` by the failed
+/// attempt's allocator, `kept` by the stage's kept graphs, and `scratch` more the buffer must
+/// leave free (`LENT_SCRATCH` while the cache is lent, when `bytes` does not count it yet).
+/// Then each retry only allocates and frees again: a lent 32K-token prompt's 12.3 GiB buffer
+/// that left less than the scratch took 0.23 s a try.
+pub(super) fn hopeless(
+    free: usize,
+    held: usize,
+    kept: usize,
+    bytes: usize,
+    scratch: usize,
+) -> bool {
+    free + held + kept + HOPELESS_SLACK < bytes + scratch
+}
+
 #[cfg(test)]
 mod tests;

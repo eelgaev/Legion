@@ -26,6 +26,9 @@ pub struct Switches {
     /// Gated DeltaNet prompt steps whose head counts ggml-cuda keeps on its per-token kernel (a
     /// tensor parallel rank's share) on its chunked kernel ([`crate::model::core::set_gdn_mma`]).
     pub gdn_mma: Option<bool>,
+    /// Gated DeltaNet prompt groups' whole-head chunked kernel staged through shared memory
+    /// ([`crate::model::core::set_gdn_staged`]).
+    pub gdn_staged: Option<bool>,
     /// Gated DeltaNet verify and commit steps' delta rule as Legion's op
     /// ([`crate::model::core::set_gdn`]).
     pub gdn: Option<bool>,
@@ -35,6 +38,9 @@ pub struct Switches {
     /// Gated DeltaNet replaying verify steps' inputs staged through shared memory
     /// ([`crate::model::core::set_gdn_replay_staged`]).
     pub gdn_replay_staged: Option<bool>,
+    /// Gated DeltaNet replaying verify steps of few sequences on their own kernel
+    /// ([`crate::model::core::set_gdn_replay_few`]).
+    pub gdn_replay_few: Option<bool>,
     /// Gated DeltaNet replaying verify steps skipping their padding rows
     /// ([`crate::model::core::set_gdn_pad_skip`]).
     pub gdn_pad_skip: Option<bool>,
@@ -53,6 +59,9 @@ pub struct Switches {
     /// The fewest sequences a verify step of such pools leaves the states in
     /// ([`crate::model::core::set_state_defer_min_seqs`]).
     pub gdn_state_defer_min_seqs: Option<u8>,
+    /// The fewest sequences a commit of a rank of tensor parallelism over machines defers
+    /// ([`crate::model::core::set_tp_commit_in_verify_min_seqs`]).
+    pub tp_commit_in_verify_min_seqs: Option<u8>,
     /// Attention layers' fused norm + RoPE op ([`crate::model::core::set_norm_rope`]).
     pub norm_rope: Option<bool>,
     /// Attention layers' K/V and indexer cache appends and pool-key op
@@ -105,6 +114,9 @@ pub struct Switches {
     pub q4k_head_pick: Option<bool>,
     /// That pick at 2-7 columns ([`crate::model::core::q4k_head::set_pick_cols`]).
     pub q4k_head_pick_cols: Option<bool>,
+    /// The BF16 LM head of verify steps of 49-128 rows as Legion's op (matmul, soft-cap and
+    /// argmax in one pass) where that has cuBLAS's bits ([`crate::model::core::set_head_mm`]).
+    pub head_mm: Option<bool>,
     /// Q8_0 matvecs of one input on Legion's op that quantizes it once
     /// ([`crate::model::core::set_q8_group`]).
     pub q8_group: Option<bool>,
@@ -131,6 +143,9 @@ pub struct Switches {
     pub dense_mv_wide_chain: Option<bool>,
     /// MoE routers of 1-3 tokens as one op ([`crate::model::core::set_router_mv`]).
     pub router_mv: Option<bool>,
+    /// A DeltaNet layer's BF16 alpha and beta matmuls of 1-8 tokens as one op
+    /// ([`crate::model::core::set_mvf_ab`]).
+    pub mvf_ab: Option<bool>,
     /// The router's top-k and weights as one CUDA launch
     /// ([`crate::model::core::set_router_join`]).
     pub router_join: Option<bool>,
@@ -149,6 +164,18 @@ pub struct Switches {
     /// W8A16 FP8 matmuls of 5-64 tokens on the sliced-K GEMM
     /// ([`crate::model::fp8::set_sliced_k`]).
     pub fp8_sliced_k: Option<bool>,
+    /// W8A8 FP8 prompt matmuls on the Hopper wgmma GEMM, untested on hardware
+    /// ([`crate::model::wgmma_gemm::set_enabled`]).
+    pub hopper_gemm: Option<bool>,
+    /// Paged attention prefill on the Hopper wgmma kernel, untested on hardware
+    /// (`model::core::paged::hopper::set_enabled`).
+    pub hopper_attn: Option<bool>,
+    /// Paged attention prefill with heads of 256 on compute capability 12.x through the
+    /// queries-as-M kernel, the same bits (`model::core::paged::set_qm_prefill`).
+    pub paged_prefill_qm: Option<bool>,
+    /// Programmatic dependent launch on compute capability 9.0 too, untested on hardware
+    /// (`model::core::router_mv::set_hopper_pdl`).
+    pub hopper_pdl: Option<bool>,
     /// Dense NVFP4 matmuls of 33-64 tokens on the mv kernel
     /// ([`crate::model::nvfp4_mm::set_wide_mv`]).
     pub nvfp4_wide_mv: Option<bool>,
@@ -167,6 +194,9 @@ pub struct Switches {
     /// How the mv/GEMM cutoff applies: per step, per expert, the down projection only
     /// ([`crate::model::nvfp4_mm::set_expert_mv_split`]).
     pub nvfp4_expert_mv_split: Option<crate::model::nvfp4_mm::MvSplit>,
+    /// The routed experts' down matmul of prompt steps storing BF16 per-pair rows
+    /// ([`crate::model::nvfp4_mm::set_expert_rows_bf16`]; off by default).
+    pub nvfp4_expert_rows_bf16: Option<bool>,
     /// Verify steps routing their padding rows' experts as their sequences' first rows
     /// ([`crate::model::core::pad_rows::set_pad_remap`]).
     pub moe_pad_remap: Option<bool>,
@@ -191,6 +221,9 @@ pub struct Switches {
     /// Paged attention of 2-16-token groups split over the key blocks
     /// ([`crate::model::core::paged::set_verify_split`]).
     pub paged_verify_split: Option<bool>,
+    /// sm_70 / sm_75: 2-16-token groups' rows split over the key blocks, the WMMA kernel's bits
+    /// ([`crate::model::core::paged::set_verify_split_wmma`]).
+    pub paged_verify_split_wmma: Option<bool>,
     /// MoE layers' shared-expert gate, scaling and sum as one op
     /// ([`crate::model::core::set_shexp_gate`]).
     pub shexp_gate: Option<bool>,
@@ -294,6 +327,15 @@ pub struct Switches {
     /// qwen4exp's MoE tails folded into the next combine-and-norm before the graph is planned
     /// ([`crate::model::qwen4::set_moe_fold`]; on by default on an integrated GPU).
     pub hc_moe_fold: Option<bool>,
+    /// The FFN mixers' residual streams made by their readers in the MoE fold's relayout
+    /// ([`crate::model::qwen4::set_hc_lazy_streams`]; on by default).
+    pub hc_lazy_streams: Option<bool>,
+    /// A sequence-parallel all-gather running the mix it reads
+    /// ([`crate::tp_net::seq_par::set_gather_mix`]; on by default).
+    pub tp_gather_mix: Option<bool>,
+    /// A sequence-parallel all-gather writing its output's F32 copy
+    /// ([`crate::tp_net::seq_par::set_gather_widen`]; on by default).
+    pub tp_gather_widen: Option<bool>,
     /// qwen4exp's hyper-connection glue fused around the MoE op on a V100 or an sm_80+ GPU
     /// ([`crate::model::qwen4::set_hc_fuse`]).
     pub hc_fuse: Option<bool>,
@@ -309,6 +351,9 @@ pub struct Switches {
     /// NVFP4 expert matmuls of 2-8 tokens reading each routed expert once, with ggml's MMVQ bits
     /// ([`crate::model::core::set_nvfp4_once`]).
     pub nvfp4_once: Option<bool>,
+    /// NVFP4 dense matmuls of 5-8 tokens on Legion's tensor-core op with ggml's MMVQ bits
+    /// ([`crate::model::core::set_nvfp4_mvq`]).
+    pub nvfp4_mvq: Option<bool>,
     /// Q8_0 matmuls of 9-255 tokens on Legion's two-launch op with MMQ's bits
     /// ([`crate::model::q8_mmq::set_q8_mmq`]).
     pub q8_mmq: Option<bool>,
@@ -318,6 +363,9 @@ pub struct Switches {
     /// How the op adds up split tiles' pieces, all with MMQ's bits
     /// ([`crate::model::q8_mmq::set_q8_mmq_fixup`]).
     pub q8_mmq_fixup: Option<crate::model::q8_mmq::Fixup>,
+    /// Prompt matmuls on Turing GPUs without tensor cores on Legion's dp4a op with MMQ's bits
+    /// ([`crate::model::tu_mmq::set_tu_mmq`]).
+    pub tu_mmq: Option<bool>,
     /// qwen4exp's mixer up matmul and gated mix as one op ([`crate::model::qwen4::set_up_mix`]).
     pub hc_up_mix: Option<bool>,
     /// The same op for BF16 mixer up weights ([`crate::model::qwen4::set_up_mix_bf16`], on by
@@ -329,6 +377,10 @@ pub struct Switches {
     /// qwen4exp's residual streams kept in BF16 between the GB10 prompt mixers
     /// ([`crate::model::qwen4::set_streams_bf16`], opt-in, moves output).
     pub hc_streams_bf16: Option<bool>,
+    /// qwen4exp's residual streams kept in BF16 between the compute capability 12.x BF16 prompt
+    /// mixers (the NVFP4 checkpoints, [`crate::model::qwen4::set_hc_bf16`], opt-in, moves
+    /// output).
+    pub hc_bf16: Option<bool>,
     /// qwen4exp's mixer gated mix also writing the block input as F16 for its Q8_0 projections
     /// on a V100 ([`crate::model::qwen4::set_mix16`]).
     pub hc_mix16: Option<bool>,
@@ -407,7 +459,7 @@ pub struct Switches {
     pub glm_decode_mv: Option<bool>,
     /// GLM-5.3-Flash: the GB10-tuned linear kernels
     /// ([`crate::model::glm5next::ops::set_gb10_linear`]; `None`: the engine's choice, on for
-    /// integrated GPUs and V100s).
+    /// integrated GPUs, V100s and Ampere GPUs).
     pub glm_gb10_linear: Option<bool>,
     /// GLM-5.3-Flash: prompt MLA attention on tensor cores
     /// ([`crate::model::glm5next::ops::set_mla_tc`]; off by default).
@@ -516,9 +568,11 @@ impl Switches {
         set(self.delta_prep, core::set_delta_prep);
         set(self.gdn_scan, core::set_gdn_scan);
         set(self.gdn_mma, core::set_gdn_mma);
+        set(self.gdn_staged, core::set_gdn_staged);
         set(self.gdn, core::set_gdn);
         set(self.gdn_decode, core::set_gdn_decode);
         set(self.gdn_replay_staged, core::set_gdn_replay_staged);
+        set(self.gdn_replay_few, core::set_gdn_replay_few);
         set(self.gdn_pad_skip, core::set_gdn_pad_skip);
         set(self.gdn_commit_slots, core::set_commit_slots);
         set(self.gdn_commit_in_verify, core::set_commit_in_verify);
@@ -530,6 +584,9 @@ impl Switches {
         }
         if let Some(n) = self.gdn_state_defer_min_seqs {
             core::set_state_defer_min_seqs(n.into());
+        }
+        if let Some(n) = self.tp_commit_in_verify_min_seqs {
+            core::set_tp_commit_in_verify_min_seqs(n.into());
         }
         set(self.norm_rope, core::set_norm_rope);
         set(self.kv_append, core::set_kv_append);
@@ -558,6 +615,7 @@ impl Switches {
         set(self.q8_out_mv, core::q8_head::set_out_mv);
         set(self.q4k_head_pick, core::q4k_head::set_pick);
         set(self.q4k_head_pick_cols, core::q4k_head::set_pick_cols);
+        set(self.head_mm, core::set_head_mm);
         set(self.q8_group, core::set_q8_group);
         if let Some(m) = self.q8_group_parts {
             core::q8_group::set_parts(m);
@@ -575,6 +633,7 @@ impl Switches {
             crate::model::dense_mv::set_wide_chain,
         );
         set(self.router_mv, core::set_router_mv);
+        set(self.mvf_ab, core::set_mvf_ab);
         set(self.router_join, core::set_router_join);
         set(self.router_bf16, core::set_router_bf16);
         set(
@@ -587,6 +646,19 @@ impl Switches {
             crate::model::fp8::set_small_batch_gemv,
         );
         set(self.fp8_sliced_k, crate::model::fp8::set_sliced_k);
+        set(self.hopper_gemm, crate::model::wgmma_gemm::set_enabled);
+        set(
+            self.hopper_attn,
+            crate::model::core::paged::hopper::set_enabled,
+        );
+        set(
+            self.paged_prefill_qm,
+            crate::model::core::paged::set_qm_prefill,
+        );
+        set(
+            self.hopper_pdl,
+            crate::model::core::router_mv::set_hopper_pdl,
+        );
         set(self.nvfp4_wide_mv, crate::model::nvfp4_mm::set_wide_mv);
         set(
             self.nvfp4_expert_pdl,
@@ -605,6 +677,10 @@ impl Switches {
         if let Some(mode) = self.nvfp4_expert_mv_split {
             crate::model::nvfp4_mm::set_expert_mv_split(mode);
         }
+        set(
+            self.nvfp4_expert_rows_bf16,
+            crate::model::nvfp4_mm::set_expert_rows_bf16,
+        );
         set(
             self.moe_pad_remap,
             crate::model::core::pad_rows::set_pad_remap,
@@ -630,9 +706,14 @@ impl Switches {
             self.paged_verify_split,
             crate::model::core::paged::set_verify_split,
         );
+        set(
+            self.paged_verify_split_wmma,
+            crate::model::core::paged::set_verify_split_wmma,
+        );
         set(self.shexp_gate, core::set_shexp_gate);
         set(self.decode_fuse, core::set_decode_fuse);
         set(self.node_fuse, core::set_node_fuse);
+        crate::ggml::post_alloc::set_order(crate::tp_net::seq_par::order_pass);
         crate::ggml::post_alloc::set_rewrite(core::node_fuse::rewrite);
         crate::ggml::post_alloc::set_relayout(core::node_fuse::fold::RELAYOUT);
         if let Some(p) = self.moe_pair_out {
@@ -689,11 +770,18 @@ impl Switches {
         set(self.hc_up_stage, qwen4::hc::set_up_stage);
         set(self.hc_post_norm, qwen4::set_fused_post_norm);
         set(self.hc_moe_fold, qwen4::set_moe_fold);
+        set(self.hc_lazy_streams, qwen4::set_hc_lazy_streams);
+        set(self.tp_gather_mix, crate::tp_net::seq_par::set_gather_mix);
+        set(
+            self.tp_gather_widen,
+            crate::tp_net::seq_par::set_gather_widen,
+        );
         set(self.hc_fuse, qwen4::set_hc_fuse);
         set(self.hc_xn16, qwen4::set_xn16);
         set(self.hc_quant, core::set_mmq_preq);
         set(self.mmq_ids, core::set_mmq_ids);
         set(self.nvfp4_once, core::set_nvfp4_once);
+        set(self.nvfp4_mvq, core::set_nvfp4_mvq);
         set(self.q8_mmq, crate::model::q8_mmq::set_q8_mmq);
         set(self.q8_mmq_stream, |on| {
             crate::model::q8_mmq::set_q8_mmq_fast(if on { 8 } else { 0 })
@@ -701,10 +789,12 @@ impl Switches {
         if let Some(f) = self.q8_mmq_fixup {
             crate::model::q8_mmq::set_q8_mmq_fixup(f);
         }
+        set(self.tu_mmq, crate::model::tu_mmq::set_tu_mmq);
         set(self.hc_up_mix, qwen4::set_up_mix);
         set(self.hc_up_mix_bf16, qwen4::set_up_mix_bf16);
         set(self.hc_xn_rebuild, qwen4::set_up_mix_rebuild);
         set(self.hc_streams_bf16, qwen4::set_streams_bf16);
+        set(self.hc_bf16, qwen4::set_hc_bf16);
         set(self.hc_mix16, qwen4::set_mix16);
         set(self.hc_mix_rebuild_bf16, qwen4::set_mix_rebuild_bf16);
         set(self.hc_chain, qwen4::set_hc_chain);

@@ -34,6 +34,16 @@ pub fn set_rewrite(f: Rewrite) {
     let _ = REWRITE.set(f);
 }
 
+static ORDER: OnceLock<Rewrite> = OnceLock::new();
+
+/// Sets a check run on every graph allocated from now on, before [`set_rewrite`]'s pass and
+/// whatever memory the graph got (a spill buffer too; the first call wins). It may only change
+/// how nodes run, never what they compute (#1176: a deferred reduce-scatter whose reader does
+/// not run before the next exchange writes its sum itself, `tp_net::seq_par::check_order`).
+pub fn set_order(f: Rewrite) {
+    let _ = ORDER.set(f);
+}
+
 /// Whether graphs allocated in `buft` are computed by ggml's CUDA backend: device memory of a
 /// CUDA device (not pinned host memory, not a split or meta buffer).
 fn is_cuda(buft: BufferType) -> bool {
@@ -44,11 +54,16 @@ fn is_cuda(buft: BufferType) -> bool {
     }
 }
 
-/// Runs the pass on `graph`, just allocated in `buft`, when it is a CUDA graph.
+/// Runs the check ([`set_order`]) on `graph`, just allocated in `buft`, and the pass when it is a
+/// CUDA graph.
 ///
 /// # Safety
 /// As [`Rewrite`].
 pub(crate) unsafe fn run(graph: *mut ffi::ggml_cgraph, buft: BufferType) {
+    if let Some(f) = ORDER.get() {
+        // SAFETY: the caller's.
+        unsafe { f(graph) }
+    }
     if let Some(f) = REWRITE.get()
         && is_cuda(buft)
     {

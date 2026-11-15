@@ -134,6 +134,47 @@ pub fn set_up_stage(on: bool) {
     UP_STAGE.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The GB10 Q8_0 kernels' choices forced by [`force_gb10`] (negative: those of
+/// `LEGION_DEBUG_HC_GB10`, else the defaults).
+static GB10: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// `gb10` bit (with [`GB10_SET`]): the down rows go through a ring of slices in shared memory
+/// (#1176) instead of being staged whole.
+pub const GB10_RING: i32 = 1;
+/// `gb10` bit (with [`GB10_SET`]): the norm is launched early (programmatic dependent launch).
+pub const GB10_EARLY: i32 = 2;
+/// `gb10` bit: [`GB10_RING`] and [`GB10_EARLY`] as given; without it (0) the defaults, both on.
+pub const GB10_SET: i32 = 1 << 8;
+
+/// `LEGION_DEBUG_HC_GB10` as the kernels' `gb10` code (#1176): `whole` for the down rows staged
+/// whole and the norm launched plainly (the kernels before #1176), `ring` or `early` for one of
+/// the two only; anything else is 0, the defaults (both). All add the same products in the same
+/// order: the same bits.
+pub fn parse_gb10(v: Option<&str>) -> i32 {
+    match v.map(str::trim) {
+        Some("whole") => GB10_SET,
+        Some("ring") => GB10_SET | GB10_RING,
+        Some("early") => GB10_SET | GB10_EARLY,
+        _ => 0,
+    }
+}
+
+/// Forces the GB10 Q8_0 kernels' choices ([`bench`]): a `gb10` code ([`GB10_SET`] and its bits,
+/// or 0 for the defaults), negative for `LEGION_DEBUG_HC_GB10`'s.
+pub fn force_gb10(code: i32) {
+    GB10.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn gb10() -> i32 {
+    let forced = GB10.load(std::sync::atomic::Ordering::Relaxed);
+    if forced >= 0 {
+        return forced;
+    }
+    static ENV: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| parse_gb10(std::env::var("LEGION_DEBUG_HC_GB10").ok().as_deref()))
+}
+
 /// Whether [`combine_mix`] writes the block input's Q8_1 blocks wherever the Q8_0 kernels with
 /// their loads ahead run, not only in stage graphs ([`bench`], so that it runs the decode's
 /// kernels outside a server).
@@ -522,6 +563,7 @@ struct LaunchParams {
     mixed_q: *mut u8,
     l2_ahead: i32,
     variant: i32,
+    gb10: i32,
 }
 
 #[cfg(feature = "cuda")]
@@ -596,6 +638,7 @@ unsafe fn cuda_hc_mix(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(),
             DOWN_HOIST.load(std::sync::atomic::Ordering::Relaxed),
             UP_STAGE.load(std::sync::atomic::Ordering::Relaxed),
         ),
+        gb10: gb10(),
     };
     match unsafe { legion_hc_mix_launch(&p, stream) } {
         0 => Ok(()),

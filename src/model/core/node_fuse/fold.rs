@@ -26,14 +26,37 @@
 //! that op alone reads the experts' rows, nothing reads those rows at all, so the grouped NVFP4
 //! down matmul (and the SwiGLU on its plan that only it reads) stores no zeros for them
 //! ([`nvfp4_mm::unread_nodes`]); every value read is the same.
+//!
+//! Lazy streams (#1183, after the folds; `legion serve --no-hc-lazy-streams` turns them off):
+//! a layer's FFN mixer combine-and-norm makes the new residual streams `R_f = O_a · w + R_a`
+//! (the attention block's output `O_a`, the weights `w` from the attention mixer's inject
+//! weights, the streams `R_a` before it) and writes them, 4 x n_embd F32 values a token, for
+//! its up-mix and the next layer's folded norm to read back. Where those two are its streams'
+//! only readers, the norm does not write them ([`crate::model::qwen4::set_no_res`]) and both
+//! readers make them per value from `R_a`, `O_a` and the weights, with the norm's expressions
+//! and its one FMA, so the same bits: the streams' write goes, and `O_a` (a quarter of their
+//! bytes) is read twice more. `R_a` and `O_a` then stay alive through the MoE layer, which is
+//! why it is part of this relayout; the norm's views of its streams, read by nothing now, are
+//! retired so they do not keep its memory alive to the end of the step. Both norms' nodes are
+//! then laid out without the bytes they do not write ([`crate::model::qwen4::compact_plan`]):
+//! the FFN mixer's holds only its BF16 `xn`, scales and inject weights (20 KB a token, not
+//! 100), the attention mixer's (the one holding `R_a`) loses the unused rest of `xn`'s place
+//! (60 KB, not 100), so a prompt step's compute buffer is no larger than with the streams
+//! written, though `R_a` (with that node's other parts) and `O_a` live longer.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::{FMA_SKIP, Gate, Graph, MOE_SUM_GATE, Node, ON, Sum, f32_contiguous, is_view_op, root};
+use super::{
+    FMA_SKIP, Gate, Graph, MOE_SUM_GATE, Node, ON, Sum, f32_contiguous, is_view_op, root, span,
+};
 use crate::ggml::post_alloc::{Relaid, Relayout};
 use crate::ggml::{ffi, make_external};
 use crate::model::nvfp4_mm;
-use crate::model::qwen4::{FoldSum, fold_moe, fold_target, moe_fold};
+use crate::model::qwen4::{
+    FoldSum, compact_plan, fold_moe, fold_target, lazy_fold_target, lazy_mix_target, lazy_parts,
+    lazy_streams, moe_fold, set_compact, set_lazy_fold, set_lazy_streams, set_no_res,
+};
+use crate::tp_net::seq_par;
 
 /// The fold as a relayout (`crate::ggml::post_alloc::set_relayout`): only graphs holding a norm
 /// a tail may fold into ([`fold_target`]) take it, with [`crate::model::qwen4::set_moe_fold`]
@@ -49,6 +72,10 @@ static UNDONE: AtomicUsize = AtomicUsize::new(0);
 /// Grouped NVFP4 nodes left without their skipped pairs' zeros so far (#1176; logged with the
 /// first relayouts).
 static UNREAD: AtomicUsize = AtomicUsize::new(0);
+
+/// Tails run by the reduce-scatter reading them so far (#1176; logged with the first
+/// relayouts).
+static TAKEN: AtomicUsize = AtomicUsize::new(0);
 
 /// [`Relayout::wants`].
 ///
@@ -84,10 +111,14 @@ unsafe fn rewrite(graph: *mut ffi::ggml_cgraph, cuda: bool) -> Option<Box<dyn Re
         tracing::info!(
             folded,
             fma,
+            lazy_streams = undo.lazy,
+            compact = undo.compact,
             left = undo.left.len(),
             unread = UNREAD.load(Ordering::Relaxed),
+            by_exchange = TAKEN.load(Ordering::Relaxed),
             "hc moe fold: MoE tails made by the next hyper-connection norm, or as one op at \
-             the gate's add where no such norm reads them (the first graphs; --hc-moe-fold)"
+             the gate's add where no such norm reads them, and the FFN mixers' streams made by \
+             their readers (the first graphs; --hc-moe-fold, --no-hc-lazy-streams)"
         );
     }
     Some(Box::new(undo))
@@ -108,6 +139,8 @@ pub(crate) unsafe fn fold_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> (Un
             left: Vec::new(),
             saved: Vec::new(),
             cuda,
+            lazy: 0,
+            compact: 0,
         };
         let (mut folded, mut fma) = (0, 0);
         for i in 0..n {
@@ -125,6 +158,9 @@ pub(crate) unsafe fn fold_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> (Un
                 undo.left.push((i, fused));
             }
         }
+        if folded > 0 && lazy_streams() {
+            (undo.lazy, undo.compact) = g.lazy_streams(cuda, &mut undo.saved);
+        }
         (undo, folded, fma)
     }
 }
@@ -137,6 +173,10 @@ pub(crate) struct Undo {
     /// The nodes changed, as they were.
     saved: Vec<(Node, ffi::ggml_tensor)>,
     cuda: bool,
+    /// FFN mixers whose streams are made lazily (see the module doc).
+    pub(crate) lazy: usize,
+    /// Norm nodes of those laid out without their unwritten bytes (see the module doc).
+    pub(crate) compact: usize,
 }
 
 impl Relaid for Undo {
@@ -242,6 +282,13 @@ impl Graph {
             dead.extend(&gt.chain);
             dead.push(gt.add);
             dead.extend(view);
+            // BF16 rows read back as F32 (`--nvfp4-expert-rows-bf16`, #1183): the norm reads
+            // the BF16 rows (the cast is exact) and the cast goes too.
+            let (x, cast) = match self.bf16_rows(x, s.at) {
+                Some((rows, i)) => (rows, Some(i)),
+                None => (x, None),
+            };
+            dead.extend(cast);
             saved.push((norm, std::ptr::read(norm)));
             saved.extend(
                 dead.iter()
@@ -251,6 +298,28 @@ impl Graph {
             fold_moe(norm, x, s.weights, s.k, sum, gt.sh, gt.g);
             self.retire(&dead, root(x));
             true
+        }
+    }
+
+    /// Where `x` is a cast to F32 of contiguous BF16 rows of its shape (a node), read only by the
+    /// node `at`: those rows and the cast's index.
+    ///
+    /// # Safety
+    /// `x` is a valid tensor of the graph.
+    unsafe fn bf16_rows(&self, x: Node, at: usize) -> Option<(Node, usize)> {
+        // SAFETY: the caller's; sources are valid tensors.
+        unsafe {
+            let src = (*x).src[0];
+            let i = *self.index.get(&(x as usize))?;
+            ((*x).op == ffi::ggml_op_GGML_OP_CPY
+                && !self.none[i]
+                && !src.is_null()
+                && (*src).type_ == ffi::ggml_type_GGML_TYPE_BF16
+                && ffi::ggml_is_contiguous(src)
+                && (*src).ne == (*x).ne
+                // ggml's cast lists itself as its second source.
+                && self.only_read_by(x, &[at, i]))
+            .then_some((src, i))
         }
     }
 
@@ -302,6 +371,275 @@ impl Graph {
             }
             make_external(a, &MOE_SUM_GATE, &srcs, &[1, 1, s.k as i32, fma]);
             self.retire(&dead, root(s.experts));
+            // The reduce-scatter reading the tail runs it, its values rounded to BF16 straight
+            // into the send buffer (#1176; the graph is planned again after this rewrite).
+            let rs = match *self.users(a) {
+                [u] if is_view_op((*self.nodes[u]).op) => match *self.users(self.nodes[u]) {
+                    [r] => Some(r),
+                    _ => None,
+                },
+                [u] => Some(u),
+                _ => None,
+            };
+            if let Some(r) = rs.filter(|&r| !self.none[r] && self.only_read_by(a, &[r])) {
+                // (`a` is saved as built above, which an undo puts back whole.)
+                let rs = self.nodes[r];
+                let was = std::ptr::read(rs);
+                if seq_par::take_tail(rs, a, &srcs) {
+                    saved.push((rs, was));
+                    TAKEN.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            true
+        }
+    }
+
+    /// Lazy streams (see the module doc): for every folded norm reading an FFN mixer norm's new
+    /// streams, where only that mixer's up-mix (after the norm) and the folded norm read them,
+    /// the streams before that norm come from another norm's node that writes them, the
+    /// attention mixer's, and no node in between writes into that node's memory or the
+    /// attention block output's: the FFN norm stops writing its streams and its two readers
+    /// make them. Saves the nodes it changes first (each once: an undo puts back the first
+    /// copy). Both norms' nodes are then laid out without their unwritten bytes
+    /// ([`Self::compact`]). How many FFN mixers it made lazy, and how many nodes it laid out
+    /// compactly.
+    ///
+    /// # Safety
+    /// As [`fold_graph`], after its folds.
+    unsafe fn lazy_streams(
+        &mut self,
+        cuda: bool,
+        saved: &mut Vec<(Node, ffi::ggml_tensor)>,
+    ) -> (usize, usize) {
+        // SAFETY: the caller's; nodes and their sources are valid tensors.
+        unsafe {
+            let (mut made, mut compact) = (0, 0);
+            for ni in 0..self.nodes.len() {
+                let nn = self.nodes[ni];
+                if self.none[ni] || !lazy_fold_target(nn) {
+                    continue;
+                }
+                let rf = (*nn).src[0];
+                let nf = (*rf).view_src;
+                let Some(&fi) = self.index.get(&(nf as usize)) else {
+                    continue;
+                };
+                if self.none[fi] || fi >= ni {
+                    continue;
+                }
+                let Some([ra, oa, ia]) = lazy_parts(nf, cuda) else {
+                    continue;
+                };
+                let like_ra = |t: Node| {
+                    (*t).view_src == nf
+                        && (*t).view_offs == 0
+                        && (*t).ne == (*ra).ne
+                        && (*t).nb == (*ra).nb
+                };
+                if !like_ra(rf) {
+                    continue;
+                }
+                let Some(ui) = self.streams_reader(nf, ffi::ggml_nbytes(ra), ni) else {
+                    continue;
+                };
+                let uf = self.nodes[ui];
+                if !(fi < ui && ui < ni) || !lazy_mix_target(uf) || !like_ra((*uf).src[2]) {
+                    continue;
+                }
+                let (na, ro) = (root(ra), root(oa));
+                if (fi + 1..ni).any(|j| self.writes_into(j, na) || self.writes_into(j, ro)) {
+                    continue;
+                }
+                let s0 = (*nf).data as usize;
+                let mut views = Vec::new();
+                self.views_over(nf, s0, s0 + ffi::ggml_nbytes(ra), &mut views);
+                for t in [nf, uf, nn]
+                    .into_iter()
+                    .chain(views.iter().map(|&v| self.nodes[v]))
+                {
+                    if !saved.iter().any(|&(s, _)| s == t) {
+                        saved.push((t, std::ptr::read(t)));
+                    }
+                }
+                set_no_res(nf);
+                set_lazy_streams(uf, ra, oa, ia);
+                set_lazy_fold(nn, ra, oa);
+                self.retire_unread(&mut views, nf);
+                // Both norms' nodes without their unwritten bytes: the FFN mixer's (no streams
+                // now) and the attention mixer's, alive until the next layer's norm now.
+                compact += usize::from(self.compact(nf, saved));
+                compact += usize::from(self.compact(root(ra), saved));
+                made += 1;
+            }
+            (made, compact)
+        }
+    }
+
+    /// For the norm node `nf` whose first `bytes` are its new streams: where every node reading
+    /// it is a view and those views' bytes in the streams are read (through views) only by the
+    /// node `ni` and one other node, that node (`None` without one).
+    ///
+    /// # Safety
+    /// `nf` is a node of this graph.
+    unsafe fn streams_reader(&self, nf: Node, bytes: usize, ni: usize) -> Option<usize> {
+        // SAFETY: the caller's; users are valid nodes.
+        unsafe {
+            if (*nf).flags & ffi::ggml_tensor_flag_GGML_TENSOR_FLAG_OUTPUT as i32 != 0 {
+                return None;
+            }
+            let s0 = (*nf).data as usize;
+            let mut reads = Vec::new();
+            for &u in self.users(nf) {
+                let v = self.nodes[u];
+                if !is_view_op((*v).op) {
+                    return None;
+                }
+                let (a, b) = span(v);
+                if a < b && a < s0 + bytes && s0 < b && !self.reads_through_views(v, &mut reads) {
+                    return None;
+                }
+            }
+            let mut other = reads.into_iter().filter(|&r| r != ni);
+            let first = other.next()?;
+            other.all(|r| r == first).then_some(first)
+        }
+    }
+
+    /// Pushes onto `reads` every node reading `t` other than views, through views; false when
+    /// `t` or a view of it is a graph output.
+    ///
+    /// # Safety
+    /// `t` is a valid tensor.
+    unsafe fn reads_through_views(&self, t: Node, reads: &mut Vec<usize>) -> bool {
+        // SAFETY: the caller's; users are valid nodes.
+        unsafe {
+            if (*t).flags & ffi::ggml_tensor_flag_GGML_TENSOR_FLAG_OUTPUT as i32 != 0 {
+                return false;
+            }
+            for &u in self.users(t) {
+                let v = self.nodes[u];
+                if !is_view_op((*v).op) {
+                    reads.push(u);
+                } else if !self.reads_through_views(v, reads) {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+
+    /// Whether node `j` runs and writes into the memory of the node `r` (in place: a view of
+    /// it that is not only a view).
+    ///
+    /// # Safety
+    /// `j` is a node index; `r` a valid tensor.
+    unsafe fn writes_into(&self, j: usize, r: Node) -> bool {
+        // SAFETY: the caller's.
+        unsafe {
+            let n = self.nodes[j];
+            !self.none[j]
+                && !is_view_op((*n).op)
+                && (*n).op != ffi::ggml_op_GGML_OP_NONE
+                && n != r
+                && root(n) == r
+        }
+    }
+
+    /// Pushes onto `out` every view node of `t` (through views) spanning bytes in `[a, b)`.
+    ///
+    /// # Safety
+    /// `t` is a valid tensor.
+    unsafe fn views_over(&self, t: Node, a: usize, b: usize, out: &mut Vec<usize>) {
+        // SAFETY: the caller's; users are valid nodes.
+        unsafe {
+            for &u in self.users(t) {
+                let v = self.nodes[u];
+                if self.none[u] || !is_view_op((*v).op) || (*v).src[0] != t || out.contains(&u) {
+                    continue;
+                }
+                let (x, y) = span(v);
+                if x < y && x < b && a < y {
+                    out.push(u);
+                    self.views_over(v, a, b, out);
+                }
+            }
+        }
+    }
+
+    /// Retires ([`Self::retire`], as views of `keep`) the view nodes `views` that no node reads
+    /// any more, last first (a view read only by retired views is unread too). A view node in
+    /// the graph that nothing reads holds its source's memory to the end of the graph: ggml's
+    /// allocator frees a node's memory when the last view of it is freed, and frees a view when
+    /// its last reader has run. Unread `R_f` views left by the lazy rewrite kept every FFN
+    /// norm's node alive to the end of a prompt step (#1183: 2 GB of compute buffer became
+    /// 19.7 GB at 4096 tokens).
+    ///
+    /// # Safety
+    /// Node indices of this graph; `keep` a valid tensor.
+    unsafe fn retire_unread(&mut self, views: &mut [usize], keep: Node) {
+        views.sort_unstable();
+        for k in (0..views.len()).rev() {
+            let v = views[k];
+            let t = self.nodes[v];
+            // SAFETY: the caller's; readers are valid nodes.
+            let read = self
+                .users(t)
+                .iter()
+                .any(|&u| !self.none[u] && unsafe { (*self.nodes[u]).src.contains(&t) });
+            // SAFETY: the caller's.
+            if !read
+                && unsafe { (*t).flags } & ffi::ggml_tensor_flag_GGML_TENSOR_FLAG_OUTPUT as i32 == 0
+            {
+                // SAFETY: the caller's.
+                unsafe { self.retire(&[v], keep) };
+            }
+        }
+    }
+
+    /// Lays the norm node `node` out compactly where [`compact_plan`] takes it (#1183): its
+    /// unwritten bytes go, and every view of it that runs moves to its part's new place. Only
+    /// where each such view lies within one written part and every node reading `node` itself
+    /// is a view. Saves the nodes it changes first (each once). Whether it did.
+    ///
+    /// # Safety
+    /// As [`Self::lazy_streams`]; `node` a valid tensor.
+    unsafe fn compact(&mut self, node: Node, saved: &mut Vec<(Node, ffi::ggml_tensor)>) -> bool {
+        // SAFETY: the caller's; nodes and their sources are valid tensors.
+        unsafe {
+            let Some(c) = compact_plan(node) else {
+                return false;
+            };
+            if self
+                .users(node)
+                .iter()
+                .any(|&u| !self.none[u] && !is_view_op((*self.nodes[u]).op))
+            {
+                return false;
+            }
+            let mut moves = Vec::new();
+            for (j, &v) in self.nodes.iter().enumerate() {
+                if self.none[j] || (*v).view_src != node {
+                    continue;
+                }
+                let (a, b) = ((*v).view_offs, (*v).view_offs + ffi::ggml_nbytes(v));
+                let Some(&(from, to, _)) = c
+                    .parts
+                    .iter()
+                    .find(|&&(from, _, len)| from <= a && b <= from + len)
+                else {
+                    return false;
+                };
+                moves.push((v, to + (a - from)));
+            }
+            for t in std::iter::once(node).chain(moves.iter().map(|&(v, _)| v)) {
+                if !saved.iter().any(|&(s, _)| s == t) {
+                    saved.push((t, std::ptr::read(t)));
+                }
+            }
+            for (v, offs) in moves {
+                (*v).view_offs = offs;
+            }
+            set_compact(node, c.floats);
             true
         }
     }

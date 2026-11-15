@@ -410,6 +410,20 @@ fn cuda_verify_timings() {
     }
 }
 
+/// The W8A8 matmul's relative error to the CPU's F32 sums at `n` tokens: summation order (1e-5),
+/// except for the E4M3 tensor-core GEMMs (more than 8 tokens; up to 8 the F32 GEMV) on Ada
+/// (compute capability 8.9). Its E4M3 MMAs add C and their 32 products in a window
+/// of ~14 bits under the largest exponent among them and truncate the rest (an RTX 4090: 1 +
+/// 2^-14 comes back as 1), so chained over k the sums drift from F32 ones as k grows: 2.2e-3
+/// at k 2,688, ~4e-3 at 5,120, an order of magnitude under what E4M3 activations themselves
+/// cost (W8A8 against W8A16 on the CPU: up to 0.1).
+#[cfg(feature = "cuda")]
+fn a8_tolerance(gpu: &Backend, n: usize) -> f64 {
+    let ordinal = gpu.name().strip_prefix("CUDA").and_then(|i| i.parse().ok());
+    let cc = ordinal.and_then(legion::hw::per_device::compute_capability);
+    if n > 8 && cc == Some(89) { 1e-2 } else { 1e-5 }
+}
+
 /// W8A8 on `backend`: quantize `x` with `scale`, then the E4M3 x E4M3 matmul.
 fn run_a8(
     backend: &mut Backend,
@@ -488,7 +502,8 @@ fn cuda_a8_matches_cpu() {
         let want: Vec<f64> = yc.iter().map(|&v| v as f64).collect();
         let e = rel_err(&yg, &want);
         println!("a8 k {k} m {m} n {n}: relative error {e:.2e}");
-        assert!(e < 1e-5, "k {k}, m {m}, n {n}: relative error {e}");
+        let tol = a8_tolerance(&gpu, n);
+        assert!(e < tol, "k {k}, m {m}, n {n}: relative error {e}");
     }
 }
 
@@ -847,13 +862,33 @@ fn cuda_a8_dynamic_matches_cpu() {
             assert_eq!(qc, qg, "k {k} n {n}: quantized activations differ");
             let same = tc.iter().zip(&tg).all(|(a, b)| a.to_bits() == b.to_bits());
             assert!(same, "k {k} n {n}: token scales differ");
+            if n > 1 {
+                let zero = &yg[m..2 * m];
+                assert!(
+                    zero.iter().all(|&v| v == 0.0),
+                    "k {k} n {n}: the all-zero token"
+                );
+            }
+            // Each token against its own scale: magnitudes span 256x, so a batch-wide scale
+            // would hide a broken small token.
+            let tol = a8_tolerance(&gpu, n);
+            for (t, (g, c)) in yg.chunks(m).zip(yc.chunks(m)).enumerate() {
+                if t == 1 {
+                    continue;
+                }
+                let want: Vec<f64> = c.iter().map(|&v| v as f64).collect();
+                let e = rel_err(g, &want);
+                assert!(
+                    e < tol,
+                    "k {k}, m {m}, n {n}, token {t}: relative error {e}"
+                );
+            }
             let want: Vec<f64> = yc.iter().map(|&v| v as f64).collect();
             let e = rel_err(&yg, &want);
             println!(
                 "a8-dynamic k {k} m {m} n {n} ({} scales): relative error {e:.2e}",
                 ws.len()
             );
-            assert!(e < 1e-5, "k {k}, m {m}, n {n}: relative error {e}");
         }
     }
 }

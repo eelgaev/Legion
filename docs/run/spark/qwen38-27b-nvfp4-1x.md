@@ -59,7 +59,11 @@ With the FP8 prompt-step GEMMs fed by TMA (2026-11-06, the same output): 8K 2,36
 With the NVFP4 prompt-step GEMMs fed by TMA as well (2026-11-07, the same output): 8K 2,518 and 32K 2,097 tok/s,
 against 2,370 / 2,013 from the build before in the same session; 123K 1,268 against 1,245. 16 users decoded at
 226.1 tok/s total against 228.3 there (mean accepted length 3.41 against 3.49: at 8 or more users the drafts follow
-the requests' arrival timing). Greedy text at 8 or more users changes (other
+the requests' arrival timing).
+With the split GDN prompt kernel and queries-as-M prompt attention for heads of 256 (2026-11-12, both default and
+the same output; two servers, 2 rounds each): 8K 2,697, 32K 2,309 and 123K 1,438 tok/s (2,691 / 2,313 / 1,441 and
+2,703 / 2,304 / 1,434). 1 user 23.3 (story) to 50.8 (code), median 34.1, the same tokens as before; 4 users 97.5;
+16 users 235.2 (227.5-244.0). Greedy text at 8 or more users changes (other
 drafts, other verify shapes), and so does a prompt longer than 4,096 tokens (other step sums). Below 8 users,
 and for prompts up to 4,096 tokens, the output is the same as without the flags.
 

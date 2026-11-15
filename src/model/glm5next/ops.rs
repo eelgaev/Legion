@@ -110,7 +110,7 @@ pub fn linear_h<'a>(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinTc {
     /// The launcher's choice: linear_tc_gb's measured shape on compute capability 12.x (the
-    /// GB10), linear_tc on the other GPUs.
+    /// GB10) and Ampere (8.0 to 8.7, a table of its own, #1212), linear_tc on the other GPUs.
     Auto,
     /// `linear_tc`: 128 x 128 tiles, K steps of 32, three stages.
     Tc,
@@ -320,8 +320,9 @@ static GB10_LINEAR: AtomicBool = AtomicBool::new(false);
 /// 64+ tokens 4 tokens a block, each weight and stream read once; and the KDA conv and scan over
 /// 64+ tokens without a stored state, 64 state rows a block (#571, ~3x); and the routed experts'
 /// GEMMs on IQ2 weights ([`crate::model::moe_ffn::glm_kernels`]). The engine turns them on for
-/// integrated GPUs and V100s (there without the GEMV, [`set_gb10_gemv`]); `legion serve
-/// --glm-linear-plain` keeps the plain kernels.
+/// integrated GPUs, V100s and Ampere GPUs (compute capability 8.0 to 8.7, #1212; on those two
+/// without the GEMV, [`set_gb10_gemv`]); `legion serve --glm-linear-plain` keeps the plain
+/// kernels.
 pub fn set_gb10_linear(on: bool) {
     GB10_LINEAR.store(on, Ordering::Relaxed);
 }
@@ -1135,8 +1136,8 @@ pub fn mla_attn<'a>(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MlaKernel {
-    /// The launcher's choice: [`MlaKernel::Gb`] on compute capability 12.x (the GB10, RTX 50),
-    /// [`MlaKernel::Tiled`] on the others.
+    /// The launcher's choice: [`MlaKernel::Gb`] on compute capability 12.x (the GB10, RTX 50)
+    /// and Ampere (8.0 to 8.7, #1212), [`MlaKernel::Tiled`] on the others.
     Auto = 0,
     /// `mla_tiled_kernel`: 8 warps a block, each scoring 2 heads and then summing values.
     Tiled = 1,
@@ -1269,14 +1270,39 @@ const ARGMAX_SPLIT: i64 = 32;
 /// values and indices. The same index as [`argmax`] for logits without NaNs (the first of the
 /// largest).
 pub fn argmax_wide<'a>(ctx: &'a Context, x: Tensor<'a>) -> Tensor<'a> {
+    argmax_wide_ids(ctx, x, None)
+}
+
+/// [`argmax_wide`] of logits over the rows `ids` (I32 `[v]`, ascending token ids: the MTP
+/// draft head's picked rows, #1172) where given: each column's pick is `ids[i]` for its largest
+/// entry `i` (the first of ties, so the lowest id, as over the whole vocabulary).
+pub fn argmax_wide_ids<'a>(ctx: &'a Context, x: Tensor<'a>, ids: Option<Tensor<'a>>) -> Tensor<'a> {
     let n = x.ne()[1];
-    let node = ctx.external_with(
-        &ARGMAX,
-        types::I32,
-        [n, 1 + 2 * ARGMAX_SPLIT, 1, 1],
-        &[contiguous(x)],
-        &[ARGMAX_SPLIT as i32],
-    );
+    let x = contiguous(x);
+    let node = match ids {
+        Some(ids) => {
+            assert!(
+                ids.ty() == types::I32 && ids.elements() as i64 == x.ne()[0],
+                "argmax ids: {:?} for {:?}",
+                ids.ne(),
+                x.ne()
+            );
+            ctx.external_with(
+                &ARGMAX,
+                types::I32,
+                [n, 1 + 2 * ARGMAX_SPLIT, 1, 1],
+                &[x, ids],
+                &[ARGMAX_SPLIT as i32],
+            )
+        }
+        None => ctx.external_with(
+            &ARGMAX,
+            types::I32,
+            [n, 1 + 2 * ARGMAX_SPLIT, 1, 1],
+            &[x],
+            &[ARGMAX_SPLIT as i32],
+        ),
+    };
     ctx.view_1d(node, n, 0)
 }
 
@@ -2225,7 +2251,12 @@ unsafe fn cpu_argmax(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
                     best = i;
                 }
             }
-            *out.add(t) = best as i32;
+            // Over picked rows (`argmax_wide_ids`): the row's token id.
+            *out.add(t) = if dst.src[1].is_null() {
+                best as i32
+            } else {
+                *((*dst.src[1]).data as *const i32).add(best)
+            };
         }
     }
 }

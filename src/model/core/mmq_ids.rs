@@ -88,12 +88,28 @@ fn chain_for(cc: Option<(i32, i32)>) -> u8 {
     }
 }
 
-/// Whether the op takes `mul_mat_id(w, x, ids)`: switched on, a 12.x GPU, and [`fits_shape`].
+/// MMQ's chain on device `dev` (the weight's, or a launch's), asked per device (#1201: a box may
+/// hold GPUs of different architectures); the engine's ([`set_gpu`]) where `dev` is unknown.
+fn chain_on(dev: Option<usize>) -> u8 {
+    chain_on_by(dev, GPU.load(Ordering::Relaxed), crate::hw::per_device::cc)
+}
+
+/// [`chain_on`] with the engine's chain `engine` and the compute capabilities `cc_of` gives.
+fn chain_on_by(
+    dev: Option<usize>,
+    engine: u8,
+    cc_of: impl FnOnce(usize) -> Option<(i32, i32)>,
+) -> u8 {
+    crate::hw::per_device::pick_by(dev, engine, chain_for, cc_of)
+}
+
+/// Whether the op takes `mul_mat_id(w, x, ids)`: switched on, the experts on a GPU whose MMQ
+/// chain it knows (12.x or 7.0, [`chain_on`]), and [`fits_shape`].
 pub fn usable(w: Tensor<'_>, x: Tensor<'_>, ids: Tensor<'_>) -> bool {
     ON.load(Ordering::Relaxed)
-        && GPU.load(Ordering::Relaxed) != CHAIN_NONE
         && cfg!(feature = "cuda")
         && fits_shape(w, x, ids)
+        && chain_on(w.cuda_device()) != CHAIN_NONE
 }
 
 /// Whether the op can compute `mul_mat_id(w, x, ids)`: a Q4_K or Q5_1 expert stack in one
@@ -282,8 +298,9 @@ unsafe extern "C" {
 static SCRATCH: std::sync::Mutex<Option<std::collections::HashMap<(i32, usize), usize>>> =
     std::sync::Mutex::new(None);
 
+/// The current device (the stream's) and its scratch buffer for `stream`.
 #[cfg(feature = "cuda")]
-fn scratch(stream: *mut c_void) -> Result<*mut u8, String> {
+fn scratch(stream: *mut c_void) -> Result<(i32, *mut u8), String> {
     let mut dev = 0;
     // SAFETY: plain queries and an allocation on the current device (the stream's).
     unsafe {
@@ -294,7 +311,7 @@ fn scratch(stream: *mut c_void) -> Result<*mut u8, String> {
         let mut map = SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
         let map = map.get_or_insert_with(std::collections::HashMap::new);
         if let Some(&p) = map.get(&(dev, stream as usize)) {
-            return Ok(p as *mut u8);
+            return Ok((dev, p as *mut u8));
         }
         let mut p = std::ptr::null_mut();
         if cudaMalloc(&mut p, SCRATCH_BYTES) != 0 {
@@ -302,7 +319,7 @@ fn scratch(stream: *mut c_void) -> Result<*mut u8, String> {
             return Err(format!("mmq_ids: cudaMalloc of {SCRATCH_BYTES} bytes"));
         }
         map.insert((dev, stream as usize), p as usize);
-        Ok(p as *mut u8)
+        Ok((dev, p as *mut u8))
     }
 }
 
@@ -319,7 +336,7 @@ unsafe fn cuda_mmq_ids(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<()
             "mmq_ids launch refused: {bytes} bytes of scratch (at most {SCRATCH_BYTES})"
         ));
     }
-    let s = scratch(stream)?;
+    let (dev, s) = scratch(stream)?;
     let a16 = |p: *const u8| (p as usize).is_multiple_of(16);
     if !a16(o.w) || !a16(o.x) || !a16(s) {
         return Err(format!(
@@ -349,7 +366,8 @@ unsafe fn cuda_mmq_ids(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<()
         scratch: s,
         ds_off: ds_off as i64,
         plan_off: plan_off as i64,
-        dp4a: i32::from(GPU.load(Ordering::Relaxed) == CHAIN_DP4A),
+        // MMQ's chain on the launch's device (#1201).
+        dp4a: i32::from(chain_on(usize::try_from(dev).ok()) == CHAIN_DP4A),
     };
     // SAFETY: operands checked by `fits_shape` when the node was built and above.
     match unsafe { legion_mmq_ids_launch(o.ty as i32, &p, stream) } {

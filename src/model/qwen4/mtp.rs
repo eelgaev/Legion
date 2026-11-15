@@ -196,7 +196,10 @@ impl Model {
         let gpu = super::hc_chain::on_gpu(w("hc_ffn_up.weight")?);
         let res = self.hc_combine(ctx, res, attn, inject, gpu);
         let (x, inject) = self.hc_mix(ctx, res, &format!("blk.{il}.hc_ffn"), true, true)?;
-        let ffn = self.tp_sum(ctx, self.moe(ctx, &pass.tap, &pass.graph, il, x, n)?);
+        let ffn = self.tp_sum(
+            ctx,
+            self.moe(ctx, &pass.tap, &pass.graph, il, x, n, pass.prompt_only())?,
+        );
         let res = self.hc_combine(ctx, res, ffn, inject.expect("inject"), gpu);
 
         let mut graph = pass.graph.into_inner();

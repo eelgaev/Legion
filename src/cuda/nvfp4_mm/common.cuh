@@ -67,7 +67,8 @@ struct legion_nvfp4_mm {
     const uint8_t * w2;
     const float * scale2;
     // Epilogue: 0 stores F32; 1 stores relu(v)^2 as BF16 (squared-ReLU FFNs: the next matmul's
-    // input, which it would round to BF16 anyway). Fused SwiGLU (dense): the gate's activation,
+    // input, which it would round to BF16 anyway); 3 stores v as BF16 (rounded to nearest: the
+    // routed experts' per-pair rows, opt-in, #1183). Fused SwiGLU (dense): the gate's activation,
     // 0 silu, 2 the tanh GELU (a GeGLU FFN; see glu_gate).
     int32_t act;
     // Fused SwiGLU GEMM, above 0: GLM-5.3-Flash's clamp, silu(min(gate, limit)) *
@@ -247,6 +248,8 @@ __device__ __forceinline__ void store_out(const legion_nvfp4_mm & p, int64_t i, 
     if (p.act == 1) {
         const float r = fmaxf(v, 0.0f);
         ((__nv_bfloat16 *) p.dst)[i] = __float2bfloat16_rn(r * r);
+    } else if (p.act == 3) {
+        ((__nv_bfloat16 *) p.dst)[i] = __float2bfloat16_rn(v);
     } else {
         p.dst[i] = v;
     }

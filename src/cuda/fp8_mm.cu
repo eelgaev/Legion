@@ -29,6 +29,7 @@
 
 #include "ggml-cuda/common.cuh"
 #include "device_cache.cuh"
+#include "launch_pdl.cuh"
 
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -270,15 +271,17 @@ void launch_sliced_t(const legion_fp8_mm & p, cudaStream_t st) {
         legion_device::smem_opt_in(opted_in, fp8_gemm_sliced<KW, TOK, STAGES, MT, MINB>, (int) C::SMEM);
     }
     const dim3 grid((unsigned) ((p.m + C::ROWS - 1) / C::ROWS), (unsigned) ((p.n + TOK - 1) / TOK));
-    fp8_gemm_sliced<KW, TOK, STAGES, MT, MINB><<<grid, 32 * KW, C::SMEM, st>>>(p);
+    launch_pdl(fp8_gemm_sliced<KW, TOK, STAGES, MT, MINB>, grid, 32 * KW, (int) C::SMEM, st, p);
 }
 
 // The sliced-K tiles: (K warps, tokens per CTA, stages, m16 row tiles, CTAs per SM). Tile i is
 // legion_fp8_mm::sliced_k = 2 + i; sliced_tile() picks one by n and m, the others are there for
 // tuning (cuda_sliced_k_timings in tests/fp8.rs).
-constexpr int SLICED_TILES = 12;
-constexpr int SLICED_KW[SLICED_TILES] = {16, 8, 4, 8, 8, 4, 8, 4, 8, 4, 2, 4};
-constexpr int SLICED_TOK[SLICED_TILES] = {16, 16, 16, 24, 32, 32, 32, 64, 64, 48, 64, 64};
+// Tiles 12-19 keep tile 0's 16 K warps (so its sums, bit for bit) with 8 tokens, two stages,
+// 32 rows or two CTAs per SM kept resident (#689; `legion fp8-sliced-bench` times them).
+constexpr int SLICED_TILES = 20;
+constexpr int SLICED_KW[SLICED_TILES] = {16, 8, 4, 8, 8, 4, 8, 4, 8, 4, 2, 4, 16, 16, 16, 16, 16, 16, 16, 16};
+constexpr int SLICED_TOK[SLICED_TILES] = {16, 16, 16, 24, 32, 32, 32, 64, 64, 48, 64, 64, 8, 8, 8, 8, 16, 16, 16, 8};
 
 bool launch_sliced_tile(int tile, const legion_fp8_mm & p, cudaStream_t st) {
     if (tile < 0 || tile >= SLICED_TILES || p.k % (SLICED_KW[tile] * sk::TILE_K) != 0 || p.n > SLICED_TOK[tile] * 65535) {
@@ -296,7 +299,15 @@ bool launch_sliced_tile(int tile, const legion_fp8_mm & p, cudaStream_t st) {
         case 8: launch_sliced_t<8, 64, 1, 2, 1>(p, st); break;
         case 9: launch_sliced_t<4, 48, 1, 2, 2>(p, st); break;
         case 10: launch_sliced_t<2, 64, 1, 2, 4>(p, st); break;
-        default: launch_sliced_t<4, 64, 2, 2, 1>(p, st); break;
+        case 11: launch_sliced_t<4, 64, 2, 2, 1>(p, st); break;
+        case 12: launch_sliced_t<16, 8, 1, 1, 1>(p, st); break;
+        case 13: launch_sliced_t<16, 8, 2, 1, 1>(p, st); break;
+        case 14: launch_sliced_t<16, 8, 1, 2, 1>(p, st); break;
+        case 15: launch_sliced_t<16, 8, 1, 1, 2>(p, st); break;
+        case 16: launch_sliced_t<16, 16, 2, 1, 1>(p, st); break;
+        case 17: launch_sliced_t<16, 16, 1, 2, 1>(p, st); break;
+        case 18: launch_sliced_t<16, 16, 1, 1, 2>(p, st); break;
+        default: launch_sliced_t<16, 8, 2, 2, 1>(p, st); break;
     }
     return true;
 }
@@ -304,11 +315,12 @@ bool launch_sliced_tile(int tile, const legion_fp8_mm & p, cudaStream_t st) {
 // The sliced-K tile for n tokens, m rows and k (a multiple of SLICED_K_ALIGN), from GB10 timings
 // of the 27B's FP8 shapes (#664): the preferred one, or the 4-warp tile of the same width when k
 // is not a multiple of its K group. 33-64 tokens on 8 warps only with enough 32-row CTAs for
-// the SMs (at m = 5120 the 8-warp tile runs one 80 KiB CTA per SM and loses 20-35%).
+// the SMs (at m = 5120 the 8-warp tile runs one 80 KiB CTA per SM and loses 20-35%). Up to 16
+// tokens tile 0's two-stage twin (tile 16, the same sums): 0.5-1.7% faster at 8 tokens (#689).
 int sliced_tile(int64_t n, int64_t m, int64_t k) {
     int tile, narrow;
     if (n <= 16) {
-        tile = 0; narrow = 2;
+        tile = 16; narrow = 2;
     } else if (n <= 32) {
         tile = 6; narrow = 5;
     } else {
@@ -525,27 +537,39 @@ __global__ void __launch_bounds__(128) fp8_gemv8(const legion_fp8_mm8 p) {
 // sm_90 and newer: fp8_gemm8 fed by TMA (fp8_gemm8_tma).
 #include "sm90/fp8_gemm8_tma.cuh"
 
-template <int BN, int W>
+template <int BN, int W, bool RES, int STAGES>
 void launch_gemm8_skinny_w(const legion_fp8_mm8 & p, cudaStream_t st) {
-    constexpr size_t SMEM = a8s::smem<BN, W>();
+    constexpr size_t SMEM = a8s::smem<BN, W, STAGES>();
     static_assert(SMEM <= 96 * 1024, "shared memory");
     static std::atomic<int8_t> opted_in[GGML_CUDA_MAX_DEVICES];
-    legion_device::smem_opt_in(opted_in, fp8_gemm8_skinny<BN, W>, (int) SMEM);
+    legion_device::smem_opt_in(opted_in, fp8_gemm8_skinny<BN, W, RES, STAGES>, (int) SMEM);
     const dim3 grid((unsigned) ((p.m + 16 * W - 1) / (16 * W)), (unsigned) ((p.n + BN - 1) / BN));
-    fp8_gemm8_skinny<BN, W><<<grid, 32 * W, SMEM, st>>>(p);
+    fp8_gemm8_skinny<BN, W, RES, STAGES><<<grid, 32 * W, SMEM, st>>>(p);
 }
 
-// As many CTAs as two per SM, with the tallest tiles that still give that many.
-template <int BN>
+// As many CTAs as two per SM, with the tallest tiles that still give that many. ADA: the stage
+// counts that fit two CTAs in an Ada SM (a8s::stages_ada).
+template <int BN, bool RES = false, bool ADA = false>
 void launch_gemm8_skinny(const legion_fp8_mm8 & p, cudaStream_t st) {
     const int64_t cols = (p.n + BN - 1) / BN, want = 2 * (int64_t) sm_count();
     if ((p.m + 127) / 128 * cols >= want) {
-        launch_gemm8_skinny_w<BN, 8>(p, st);
+        launch_gemm8_skinny_w<BN, 8, RES, ADA ? a8s::stages_ada<BN, 8>() : a8s::stages<BN, 8>()>(p, st);
     } else if ((p.m + 63) / 64 * cols >= want) {
-        launch_gemm8_skinny_w<BN, 4>(p, st);
+        launch_gemm8_skinny_w<BN, 4, RES, ADA ? a8s::stages_ada<BN, 4>() : a8s::stages<BN, 4>()>(p, st);
     } else {
-        launch_gemm8_skinny_w<BN, 2>(p, st);
+        launch_gemm8_skinny_w<BN, 2, RES, ADA ? a8s::stages_ada<BN, 2>() : a8s::stages<BN, 2>()>(p, st);
     }
+}
+
+// Ada (compute capability 8.9: an RTX 4090 has 128 SMs where the GB10 has 48), more than 64
+// tokens: the big GEMM's 128 x 128 tiles leave most SMs idle while they number under a quarter
+// of the SMs, so there the skinny kernel runs over 64-token column tiles instead (#1213, an
+// RTX 4090, k 4,096, 2,688 rows, 128 tokens: 21 tiles, 62 -> 29 us; with 40 to 80 tiles it
+// measured from 0.9x to 1.2x the GEMM's time, so those stay). The same bits: every output takes
+// the same MMAs in the same k order.
+bool gemm8_ada_skinny(const legion_fp8_mm8 & p) {
+    const int64_t tiles = (p.m + 127) / 128 * ((p.n + a8::BN - 1) / a8::BN);
+    return p.k % a8s::BK == 0 && tiles * 4 < sm_count() && legion_device::compute_capability() == 89;
 }
 
 template <bool RES, class C>
@@ -582,7 +606,12 @@ bool gemm8_tma_map(CUtensorMap * map, const uint8_t * base, int64_t k, int64_t r
                                   CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
 }
 
-// fp8_gemm8_tma where the device and the operands allow it; false: not launched.
+// 4 warps: the first wave's start spread over GEMM8_STAGGER_NS_PER_K ns per byte of k (about one
+// tile's time: 123 us at k 6,144 on the GB10, where 60 us gained about half as much).
+constexpr int64_t GEMM8_STAGGER_NS_PER_K = 20;
+
+// fp8_gemm8_tma where the device and the operands allow it (4 warps: and two CTAs fit an SM);
+// false: not launched.
 template <bool RES, class C>
 bool launch_gemm8_tma(const legion_fp8_mm8 & p, cudaStream_t st) {
     constexpr size_t SMEM = gemm8_tma_smem<C>();
@@ -616,8 +645,31 @@ bool launch_gemm8_tma(const legion_fp8_mm8 & p, cudaStream_t st) {
     if (!legion_device::smem_opt_in(opted_in, fp8_gemm8_tma<RES, C>, (int) SMEM)) {
         return false;
     }
+    a8t::Stagger stagger;
+    if constexpr (C::WARPS == 4) {
+        // All of the SM's shared memory as shared memory, then whether two CTAs fit (once per
+        // device).
+        static std::atomic<int8_t> pair_ok[GGML_CUDA_MAX_DEVICES];
+        int8_t two = pair_ok[dev].load(std::memory_order_relaxed);
+        if (two == 0) {
+            int per_sm = 0;
+            const bool fits =
+                cudaFuncSetAttribute(fp8_gemm8_tma<RES, C>, cudaFuncAttributePreferredSharedMemoryCarveout, 100) ==
+                    cudaSuccess &&
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, fp8_gemm8_tma<RES, C>, 32 * C::WARPS, SMEM) ==
+                    cudaSuccess &&
+                per_sm >= 2;
+            two = fits ? 1 : -1;
+            pair_ok[dev].store(two, std::memory_order_relaxed);
+        }
+        if (two < 0) {
+            return false;
+        }
+        stagger.ctas = 2 * sm_count();
+        stagger.ns   = (uint32_t) (GEMM8_STAGGER_NS_PER_K * p.k / stagger.ctas);
+    }
     const dim3 grid((unsigned) ((p.n + a8::BN - 1) / a8::BN), (unsigned) ((p.m + C::TM - 1) / C::TM));
-    fp8_gemm8_tma<RES, C><<<grid, 256, SMEM, st>>>(p, maps);
+    fp8_gemm8_tma<RES, C><<<grid, 32 * C::WARPS, SMEM, st>>>(p, maps, stagger);
     return true;
 }
 
@@ -633,12 +685,21 @@ bool launch_gemm8_tma(const legion_fp8_mm8 & p, cudaStream_t st) {
 // On consumer Blackwell the wide tile with 128-byte steps runs as fp8_gemm8_tma (#1133, GB10,
 // Qwen3.8-27B's projections at 4,096 to 16,384 tokens: 147-152 -> 156-163 TFLOPS, with the
 // residual 120-153 -> 128-155; 4 stages of 64 bytes are no faster there, 3 slower). The same bits.
+// With the residual, those shapes run as two 4-warp 128 x 128 CTAs per SM (three 64-byte TMA
+// stages, 48 KiB each, #1133 r11), whose epilogues overlap the other CTA's MMAs: on the GB10, the
+// output projection (6,144 -> 5,120) at 4,096 to 16,384 tokens 1.11-1.13x the wide tile's speed;
+// without the residual they are no faster than it (0.99-1.02x), so it keeps the wide tile.
 constexpr int64_t GEMM8_WIDE_WAVES = 8;
 template <bool RES>
 void launch_gemm8(const legion_fp8_mm8 & p, cudaStream_t st) {
     const int64_t wide_tiles = p.m / 256 * ((p.n + a8::BN - 1) / a8::BN);
     if (p.m % 256 == 0 && wide_tiles >= GEMM8_WIDE_WAVES * sm_count()) {
         if (p.k % 128 == 0) {
+            if constexpr (RES) {
+                if (launch_gemm8_tma<RES, a8::Cfg<2, 3, 64, true, 4>>(p, st)) {
+                    return;
+                }
+            }
             if (!launch_gemm8_tma<RES, a8::Cfg<4, 2, 128, true>>(p, st)) {
                 launch_gemm8_w<RES, a8::Cfg<4, 2, 128, true>>(p, st);
             }
@@ -794,6 +855,12 @@ int legion_fp8_mm8_launch(const legion_fp8_mm8 * p, void * stream) {
         launch_gemm8_skinny<32>(*p, st);
     } else if (p->n <= 64 && p->k % a8s::BK == 0) {
         launch_gemm8_skinny<64>(*p, st);
+    } else if (gemm8_ada_skinny(*p)) {
+        if (p->res) {
+            launch_gemm8_skinny<64, true, true>(*p, st);
+        } else {
+            launch_gemm8_skinny<64, false, true>(*p, st);
+        }
     } else if (p->res) {
         launch_gemm8<true>(*p, st);
     } else {

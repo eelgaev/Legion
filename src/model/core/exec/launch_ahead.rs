@@ -95,6 +95,8 @@ impl Executor {
         } = &mut self.stages[s];
         let kept = super::kept_in(decode, mixed, shape).expect("prepared");
         // The n-gram rows the fill left: read while the first layer computes.
+        let took = std::cell::Cell::new(std::time::Duration::ZERO);
+        let took_ref = &took;
         let mut write = late_rows.map(|rows| {
             let t = super::Inputs::from_parts(shape, parts, |i| kept.tensor(i))
                 .ple
@@ -102,7 +104,9 @@ impl Executor {
             let mut rows = Some(rows);
             (t, move || {
                 if let Some(rows) = rows.take() {
+                    let t0 = std::time::Instant::now();
                     model.write_ple(t, rows);
+                    took_ref.set(t0.elapsed());
                 }
             })
         });
@@ -110,7 +114,10 @@ impl Executor {
             tensor: *t,
             fill: f,
         });
-        backend.compute_kept_with(kept, sync, late)?;
+        let r = backend.compute_kept_with(kept, sync, late);
+        drop(write);
+        self.late_rows_took = took.get();
+        r?;
         Ok(())
     }
 }

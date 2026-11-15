@@ -493,8 +493,13 @@ fn explicit_kv_pool_respects_the_reserve_on_shared_memory() {
 }
 
 #[test]
-fn draft_vocab_applies_to_qwen4exp_and_qwen35_mtp_and_dflash_only() {
+fn draft_vocab_applies_to_qwen4exp_qwen35_and_glm_mtp_and_dflash_only() {
     assert_eq!(draft_vocab_unused(0, false, false, "gemma4", 1000), None);
+    assert_eq!(
+        draft_vocab_unused(65536, true, false, "glm5-next", 154880),
+        None
+    );
+    assert!(draft_vocab_unused(154880, true, false, "glm5-next", 154880).is_some());
     assert_eq!(
         draft_vocab_unused(65536, true, false, "qwen4exp", 248320),
         None
@@ -523,12 +528,12 @@ fn draft_vocab_applies_to_qwen4exp_and_qwen35_mtp_and_dflash_only() {
 }
 
 #[test]
-fn mtp_lm_head_applies_to_qwen4exp_and_qwen35_only() {
+fn mtp_lm_head_applies_to_qwen4exp_qwen35_and_glm_only() {
     use crate::spec::DraftLmHead::{Auto, Model, Q4};
-    for arch in ["qwen4exp", "qwen35", "qwen35moe"] {
+    for arch in ["qwen4exp", "qwen35", "qwen35moe", "glm5-next"] {
         assert!(mtp_lm_head_unused(Q4, arch).is_none(), "{arch}");
     }
-    for arch in ["glm5-next", "gemma4"] {
+    for arch in ["gemma4", "deepseek4"] {
         assert!(mtp_lm_head_unused(Q4, arch).is_some(), "{arch}");
         assert!(mtp_lm_head_unused(Model, arch).is_none(), "{arch}");
         // The default warns about nothing.
@@ -994,5 +999,62 @@ fn ring_checkpoints_come_out_of_a_lazy_host_tier() {
     assert_eq!(
         ring_checkpoints_in_budget(48, 16, gib, Some(1024), mib, 2048),
         (16, Some(1024))
+    );
+}
+
+#[test]
+fn long_step_buffer_grows_with_the_past_up_to_its_measurement() {
+    let mib = 1usize << 20;
+    let s = LongStep {
+        device: None,
+        first: 1000 * mib,
+        last: 2000 * mib,
+    };
+    let past = 100_000;
+    assert_eq!(s.at(0, past), 1000 * mib);
+    assert_eq!(s.at(50_000, past), 1500 * mib);
+    assert_eq!(s.at(past, past), 2000 * mib);
+    // Past the measurement (or an unknown end): the measured longest.
+    assert_eq!(s.at(usize::MAX, past), 2000 * mib);
+    // A buffer measured no bigger after a long past stays flat.
+    let flat = LongStep {
+        device: None,
+        first: 700 * mib,
+        last: 700 * mib,
+    };
+    assert_eq!(flat.at(12_345, past), 700 * mib);
+}
+
+#[test]
+fn greedy_rows_below_min_tokens_are_picks() {
+    // Sampled rows come back whole; greedy ones as argmaxes, below `min_tokens` as picks with
+    // the stop tokens masked (#1176), so a stop token argmax is never taken there.
+    assert_eq!(logits_kind(false, 0, 8), Logits::Last);
+    assert_eq!(logits_kind(false, 9, 8), Logits::Last);
+    assert_eq!(logits_kind(true, 0, 0), Logits::Greedy);
+    assert_eq!(logits_kind(true, 8, 8), Logits::Greedy);
+    assert_eq!(logits_kind(true, 7, 8), Logits::Pick);
+    assert_eq!(logits_kind(true, 0, 8), Logits::Pick);
+}
+
+#[test]
+fn verify_rows_mask_only_up_to_min_tokens() {
+    assert_eq!(verify_logits(Logits::Last, 3, 0, 8), Logits::First(3));
+    assert_eq!(
+        verify_logits(Logits::Greedy, 3, 8, 8),
+        Logits::FirstGreedy(3)
+    );
+    // Two tokens left below `min_tokens`: the first two of three rows are masked.
+    assert_eq!(
+        verify_logits(Logits::Pick, 3, 6, 8),
+        Logits::FirstPick(3, 2)
+    );
+    assert_eq!(
+        verify_logits(Logits::Pick, 3, 0, 8),
+        Logits::FirstPick(3, 3)
+    );
+    assert_eq!(
+        verify_logits(Logits::Pick, 3, 7, 8),
+        Logits::FirstPick(3, 1)
     );
 }

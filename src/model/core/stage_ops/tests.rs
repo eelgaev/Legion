@@ -19,7 +19,8 @@ fn host_bound_ops_are_not_listed() {
         "ssd_expert_fetch",
         "ssd_expert_predict",
         "cpu_share_publish",
-        "cpu_share_collect",
+        "cpu_share_glu",
+        "cpu_share_down",
         "tp_all_reduce",
         "tp_reduce_scatter",
         "pair_link",
@@ -102,4 +103,19 @@ fn w4a4_ops_follow_the_small_step_mark() {
     // The other listed ops do not depend on the step.
     assert!(listed("nvfp4_mm", true) && listed("nvfp4_mm", false));
     assert!(!listed("tp_all_reduce", true) && !listed("tp_all_reduce", false));
+}
+
+/// The verify step's dense matmuls (`nvfp4_mvq`, `fp8_mm`) are captured in small steps only
+/// (#689), like the W4A4 ops, and are in none of the other lists.
+#[test]
+fn verify_matmuls_follow_the_small_step_mark() {
+    assert_eq!(SMALL_MM, &["nvfp4_mvq", "fp8_mm"][..]);
+    for name in SMALL_MM {
+        assert!(
+            !PURE.contains(name) && !SMALL.contains(name) && !COMMIT.contains(name),
+            "{name}"
+        );
+        assert!(listed(name, true), "{name}");
+        assert!(!listed(name, false), "{name}");
+    }
 }

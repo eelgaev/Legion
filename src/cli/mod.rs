@@ -8,10 +8,16 @@ mod completions;
 mod cpu_bench;
 mod dense_mv_bench;
 mod ep_place;
+mod expert_cpu_proof;
 mod expert_mv_ptx_bench;
+mod fp8_sliced_bench;
 mod gdn_bench;
 mod gguf;
+mod hc_down_bench;
+mod hc_lazy_bench;
 mod hc_mix_bench;
+mod hc_up_mix_bench;
+mod head_mm_bench;
 mod hfmodel;
 mod info;
 mod lin_bench;
@@ -21,7 +27,10 @@ mod mmq_ids_bench;
 mod model_path;
 mod nvfp4_gemm_bench;
 mod nvfp4_mv_bench;
+mod nvfp4_mvq_bench;
 mod nvfp4_once_bench;
+mod paged_qm_bench;
+mod paged_split_bench;
 mod q4k_head_bench;
 mod q8_group_check;
 mod q8_head_bench;
@@ -100,6 +109,10 @@ enum Command {
     /// Check and benchmark the host CPU kernels and the CPU expert share's pool (development).
     #[command(hide = true)]
     CpuBench(cpu_bench::CpuBenchArgs),
+    /// Check on the host the bits of the GPU decode kernels' expert products, and time the
+    /// host kernels that reproduce them (development).
+    #[command(hide = true)]
+    ExpertCpuProof(expert_cpu_proof::ExpertCpuProofArgs),
     /// Measure GPU-to-GPU exchange latency and host-memory read bandwidth (development).
     #[command(hide = true)]
     CommBench(comm_bench::CommBenchArgs),
@@ -133,13 +146,36 @@ enum Command {
     /// Check and time qwen4exp's hyper-connection mixer op in its kernel variants (development).
     #[command(hide = true)]
     HcMixBench(hc_mix_bench::HcMixBenchArgs),
+    /// Check and time qwen4exp's mixer down matmul with xn rebuilt from BF16 streams against
+    /// the norm's BF16 xn and cuBLAS (development).
+    #[command(hide = true)]
+    HcDownBench(hc_down_bench::HcDownBenchArgs),
+    /// Check and time qwen4exp's mixer up matmul and gated mix with BF16 up weights in its
+    /// kernels (development).
+    #[command(hide = true)]
+    HcUpMixBench(hc_up_mix_bench::HcUpMixBenchArgs),
+    /// Check and time qwen4exp's lazy FFN mixer streams against the streams written
+    /// (development).
+    #[command(hide = true)]
+    HcLazyBench(hc_lazy_bench::HcLazyBenchArgs),
     /// Check and time the read-each-expert-once NVFP4 expert op against ggml's mmvq
     /// (development).
     #[command(hide = true)]
     Nvfp4OnceBench(nvfp4_once_bench::Nvfp4OnceBenchArgs),
+    /// Check and time the tensor-core NVFP4 dense matvec op against ggml's mmvq (development).
+    #[command(hide = true)]
+    Nvfp4MvqBench(nvfp4_mvq_bench::Nvfp4MvqBenchArgs),
+    /// Time the sliced-K FP8 GEMM's tiles and check their bits against the picked one
+    /// (development).
+    #[command(hide = true)]
+    Fp8SlicedBench(fp8_sliced_bench::Fp8SlicedBenchArgs),
     /// Check and time the GB10 Q4_K draft LM head op against ggml's mmvq (development).
     #[command(hide = true)]
     Q4kHeadBench(q4k_head_bench::Q4kHeadBenchArgs),
+    /// Check and time the BF16 verify-step LM head op against ggml's matmul, soft-cap and
+    /// argmax (development).
+    #[command(hide = true)]
+    HeadMmBench(head_mm_bench::HeadMmBenchArgs),
     /// Compare the grouped Q8_0 matvec op's bits with ggml's `mul_mat` (development).
     #[command(hide = true)]
     Q8GroupCheck(q8_group_check::Q8GroupCheckArgs),
@@ -155,6 +191,14 @@ enum Command {
     /// Check and time GLM's sparse MLA prompt kernels against each other (development).
     #[command(hide = true)]
     MlaBench(mla_bench::MlaBenchArgs),
+    /// Check and time the sm_70 / sm_75 paged attention split of verify steps against the WMMA
+    /// kernel (development).
+    #[command(hide = true)]
+    PagedSplitBench(paged_split_bench::PagedSplitBenchArgs),
+    /// Check and time the queries-as-M paged attention prefill kernel against paged_prefill_mma
+    /// on compute capability 12.x (development).
+    #[command(hide = true)]
+    PagedQmBench(paged_qm_bench::PagedQmBenchArgs),
 }
 
 /// The parsed `Cli` as a bare `clap::Command`, so `completions` can generate from it
@@ -214,6 +258,7 @@ async fn run(cli: Cli, numa: Option<legion::hw::numa_bind::Placement>) -> anyhow
         Command::EpPlace(args) => ep_place::run(args),
         Command::SsdReplay(args) => ssd_replay::run(args),
         Command::CpuBench(args) => cpu_bench::run(args),
+        Command::ExpertCpuProof(args) => expert_cpu_proof::run(args),
         Command::CommBench(args) => comm_bench::run(args),
         Command::ExpertMvPtxBench(args) => expert_mv_ptx_bench::run(args),
         Command::MmqIdsBench(args) => mmq_ids_bench::run(args),
@@ -225,12 +270,20 @@ async fn run(cli: Cli, numa: Option<legion::hw::numa_bind::Placement>) -> anyhow
         Command::QSmallMBench(args) => q_small_m_bench::run(args),
         Command::Q8HeadBench(args) => q8_head_bench::run(args),
         Command::HcMixBench(args) => hc_mix_bench::run(args),
+        Command::HcDownBench(args) => hc_down_bench::run(args),
+        Command::HcUpMixBench(args) => hc_up_mix_bench::run(args),
+        Command::HcLazyBench(args) => hc_lazy_bench::run(args),
         Command::Nvfp4OnceBench(args) => nvfp4_once_bench::run(args),
+        Command::Nvfp4MvqBench(args) => nvfp4_mvq_bench::run(args),
+        Command::Fp8SlicedBench(args) => fp8_sliced_bench::run(args),
         Command::Q4kHeadBench(args) => q4k_head_bench::run(args),
+        Command::HeadMmBench(args) => head_mm_bench::run(args),
         Command::Q8GroupCheck(args) => q8_group_check::run(args),
         Command::Q8MmqCheck(args) => q8_mmq_check::run(args),
         Command::LinBench(args) => lin_bench::run(args),
         Command::QsaBench(args) => qsa_bench::run(args),
         Command::MlaBench(args) => mla_bench::run(args),
+        Command::PagedSplitBench(args) => paged_split_bench::run(args),
+        Command::PagedQmBench(args) => paged_qm_bench::run(args),
     }
 }

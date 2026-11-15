@@ -336,7 +336,9 @@ fn the_router_plans_only_steps_the_ops_take() {
     // More pairs than the plan holds.
     assert!(!plan_shape(MAX_PAIRS / 2 + 1, 2));
     // Switched off (the default), no router writes one.
-    assert!(!plan_fits(10, 3));
+    let ctx = Context::new(16, 0);
+    let w = ctx.new_tensor(types::NVFP4, &[2560, 512, 128]);
+    assert!(!plan_fits(w, 10, 3));
 }
 
 #[test]
@@ -364,4 +366,22 @@ fn planned_router_ids_are_marked_and_the_same_on_the_cpu() {
         .unwrap();
     be.compute(&g).unwrap();
     assert_eq!(plain.to_i32(), planned.to_i32());
+}
+
+#[test]
+fn each_gpu_of_a_mixed_box_answers_for_itself() {
+    use crate::hw::per_device::test_cc;
+    // The GB10 and the 5090 (12.x) take the ops; the others keep ggml's MMVQ, whatever the
+    // engine's GPU is.
+    for engine in [false, true] {
+        let picks: Vec<bool> = (0..6)
+            .map(|d| gpu_for_by(Some(d), engine, test_cc))
+            .collect();
+        assert_eq!(
+            picks,
+            [true, false, false, false, true, false],
+            "engine {engine}"
+        );
+        assert_eq!(gpu_for_by(None, engine, test_cc), engine);
+    }
 }
