@@ -80,6 +80,8 @@ pub(crate) use linear::{bf16_cast_joined, bf16_join_fits, f16_joined, has_precis
 pub use q8_group::set_q8_group;
 pub use q8_head::set_q8_head;
 pub use q8_mv::set_q8_mv;
+pub mod q_small_m;
+pub use q_small_m::set_q_small_m;
 pub(crate) mod mtp;
 pub mod mtp_moe;
 pub mod mvf_bf16;
