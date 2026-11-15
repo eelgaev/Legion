@@ -24,6 +24,9 @@ pub struct TpPairRank {
     pub cuda: usize,
     /// The all-reduce both ranks' graphs sum through.
     pub sum: Arc<PairSum>,
+    /// The pair's group in the process's KV host tier plan (both ranks size from one budget,
+    /// `super::host_tier::Ledger`).
+    pub group: u64,
     ends: Arc<Mutex<Ends>>,
 }
 
@@ -62,10 +65,12 @@ impl TpPairRank {
             serve: Some(serve),
             rank1: None,
         }));
+        let group = super::host_tier::new_group();
         [0, 1].map(|rank| Self {
             rank,
             cuda: first + rank,
             sum: sum.clone(),
+            group,
             ends: ends.clone(),
         })
     }
@@ -113,6 +118,17 @@ pub(super) fn check(cfg: &LmConfig) -> Result<(), LoadError> {
         return Err(err("not with --attention gather (the ranks page)"));
     }
     Ok(())
+}
+
+/// Whether `cfg` runs as two ranks without `--tp-per-gpu` asked for: `--tp 2` on a dense
+/// `qwen35` GGUF (Qwen3.8-27B, #1163), which the meta device does not split.
+pub(super) fn implied(cfg: &LmConfig) -> bool {
+    cfg.tp == 2
+        && cfg.tp_pair.is_none()
+        && cfg.tp_net.is_none()
+        && cfg.model_path.is_file()
+        && crate::gguf::GgufFile::open(&cfg.model_path)
+            .is_ok_and(|g| g.architecture().as_deref() == Some("qwen35"))
 }
 
 /// Each rank's config: its share of `cfg`, one GPU, the pair's all-reduce. The sliding layers

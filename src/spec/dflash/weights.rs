@@ -261,6 +261,78 @@ pub fn q8_matrix(name: &str, shape: &[i64]) -> bool {
         && shape[0] % 32 == 0
 }
 
+/// The suffix of a fused weight's name ([`fused_groups`]): `blk.N.attn_qkv_fused`,
+/// `blk.N.ffn_gate_up_fused`.
+pub const FUSED_SUFFIX: &str = "_fused";
+
+/// Weights a drafter layer multiplies one input by, stored side by side as one tensor (#689):
+/// the fused name's stem and its parts, in row order.
+const FUSED: [(&str, &[&str]); 2] = [
+    ("attn_qkv", &["attn_q", "attn_k", "attn_v"]),
+    ("ffn_gate_up", &["ffn_gate", "ffn_up"]),
+];
+
+/// A layer's [`FUSED`] weights as one tensor `name` (`ty`, rows of `k` values): its parts are
+/// views of it, `(name, rows)` in row order.
+#[derive(Debug, PartialEq)]
+pub struct Fused {
+    pub name: String,
+    pub parts: Vec<(String, i64)>,
+    pub ty: ffi::ggml_type,
+    pub k: i64,
+}
+
+/// The [`Fused`] tensors of `tensors` (`(name, type, ggml shape)`): per layer, each [`FUSED`]
+/// group whose weights are all there, 2D, of one quantized type (Q4_K, Q4_0 or Q8_0: ggml runs
+/// them on MMVQ in draft steps, where every row's sum is the same in one matmul or several)
+/// and one row length.
+pub fn fused_groups(tensors: &[(&str, ffi::ggml_type, &[i64])]) -> Vec<Fused> {
+    let find = |n: &str| tensors.iter().find(|t| t.0 == n);
+    let mut layers: Vec<usize> = tensors
+        .iter()
+        .filter_map(|t| t.0.strip_prefix("blk.")?.split('.').next()?.parse().ok())
+        .collect();
+    layers.sort_unstable();
+    layers.dedup();
+    let mut out = Vec::new();
+    for il in layers {
+        for (stem, parts) in FUSED {
+            let found: Option<Vec<_>> = parts
+                .iter()
+                .map(|p| find(&format!("blk.{il}.{p}.weight")))
+                .collect();
+            let Some(found) = found else {
+                continue;
+            };
+            let (ty, k) = (found[0].1, found[0].2[0]);
+            // Gate and up are the halves of the fused output: one width.
+            let same = found.iter().all(|t| {
+                t.1 == ty
+                    && t.2.len() == 2
+                    && t.2[0] == k
+                    && (stem != "ffn_gate_up" || t.2[1] == found[0].2[1])
+            });
+            if !same || ![types::Q4_K, types::Q4_0, types::Q8_0].contains(&ty) {
+                continue;
+            }
+            out.push(Fused {
+                name: format!("blk.{il}.{stem}{FUSED_SUFFIX}"),
+                parts: found.iter().map(|t| (t.0.to_string(), t.2[1])).collect(),
+                ty,
+                k,
+            });
+        }
+    }
+    out
+}
+
+/// Whether quantized drafter weights are stored fused ([`fused_groups`]); on unless
+/// `LEGION_DEBUG_DRAFT_FUSE=0` (A/B runs). Read once.
+fn fuse_wanted() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("LEGION_DEBUG_DRAFT_FUSE").as_deref() != Ok("0"))
+}
+
 /// `bytes` (`ty`: F32, F16 or BF16, rows of `k`) as Q8_0, the rows split over threads.
 pub(super) fn to_q8(ty: ffi::ggml_type, bytes: &[u8], k: usize) -> Vec<u8> {
     let row = crate::ggml::row_size(ty, k);
@@ -454,8 +526,30 @@ fn load_hf(c: &Checkpoint, buft: BufferType, weights: DraftWeights) -> Result<St
             fp8_scale: None,
         });
     }
-    let ctx = Context::new(items.len().max(1), 0);
+    let fused = if fuse_wanted() {
+        let all: Vec<_> = items
+            .iter()
+            .map(|i| (i.name.as_str(), i.ty, i.shape.as_slice()))
+            .collect();
+        fused_groups(&all)
+    } else {
+        Vec::new()
+    };
+    let ctx = Context::new(items.len() + fused.len() + 1, 0);
+    for f in &fused {
+        let rows: i64 = f.parts.iter().map(|p| p.1).sum();
+        let t = ctx.new_tensor(f.ty, &[f.k, rows]).named(&f.name);
+        let nb1 = crate::ggml::row_size(f.ty, f.k as usize);
+        let mut at = 0;
+        for (name, r) in &f.parts {
+            ctx.view_2d(t, [f.k, *r], nb1, at * nb1).named(name);
+            at += *r as usize;
+        }
+    }
     for i in &items {
+        if fused.iter().any(|f| f.parts.iter().any(|p| p.0 == i.name)) {
+            continue;
+        }
         ctx.new_tensor(i.ty, &i.shape).named(&i.name);
     }
     ctx.alloc_tensors(buft).map_err(|e| e.to_string())?;

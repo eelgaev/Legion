@@ -119,7 +119,8 @@ impl Model {
                 },
             ));
         }
-        let cur = ctx.add(self.attention(&pass, il, x)?, cur);
+        // A rank's share of the head (`--tp 2`, #1163) sums its partial outputs.
+        let cur = ctx.add(self.tp_sum(ctx, self.attention(&pass, il, x)?), cur);
         // The take-in rows only had to write their K/V (the attention above did): the FFN and
         // the head run on the output rows alone. Every op from here is per token.
         let (cur, n) = match inputs.out_rows {
@@ -133,7 +134,7 @@ impl Model {
         let ffn = if hp.moe {
             self.moe(ctx, &pass.tap, &pass.graph, il, x, n, pass.prompt_only())?
         } else {
-            self.ffn(ctx, il, x)?
+            self.tp_sum(ctx, self.ffn(ctx, il, x)?)
         };
         let cur = ctx.add(ffn, cur);
         let cur = ctx.mul(

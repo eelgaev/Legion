@@ -950,6 +950,10 @@ pub unsafe fn capture_safe(dst: &ffi::ggml_tensor) -> bool {
     if matches!(o.split, overlap::FORK | overlap::JOIN) {
         return false;
     }
+    // `LEGION_DEBUG_EXPERT_DUMP` copies the op's operands to the host after its launch.
+    if dump::enabled() {
+        return false;
+    }
     #[cfg(feature = "cuda")]
     if ptx::side() && ptx::params_for(&o).is_some() {
         return false;
@@ -975,7 +979,7 @@ unsafe fn pad_pair_dead(o: &Operands, t: usize, raw: i32) -> bool {
     }
 }
 
-unsafe fn cpu_expert_mv(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
+pub(crate) unsafe fn cpu_expert_mv(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
     // SAFETY: a node made by `mul_mat_id`, all tensors in host memory.
     let o = unsafe { Operands::of(dst) };
     for pair in (ith..o.n_used * o.n_tok).step_by(nth) {
@@ -1463,16 +1467,34 @@ unsafe extern "C" {
 }
 
 #[cfg(feature = "cuda")]
-unsafe fn cuda_expert_mv(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
+pub(crate) unsafe fn cuda_expert_mv(
+    dst: &ffi::ggml_tensor,
+    stream: *mut c_void,
+) -> Result<(), String> {
     // SAFETY: the caller's.
-    unsafe { cuda_expert_mv_as(dst, stream, false) }
+    unsafe {
+        cuda_expert_mv_as(dst, stream, false)?;
+        if dump::enabled() {
+            dump::after(dst, stream, false);
+        }
+    }
+    Ok(())
 }
 
 /// [`cuda_expert_mv`] of a [`glu_tiered_preq`] node: its activations' Q8_1 blocks are there.
 #[cfg(feature = "cuda")]
-unsafe fn cuda_expert_mv_preq(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
+pub(crate) unsafe fn cuda_expert_mv_preq(
+    dst: &ffi::ggml_tensor,
+    stream: *mut c_void,
+) -> Result<(), String> {
     // SAFETY: the caller's.
-    unsafe { cuda_expert_mv_as(dst, stream, true) }
+    unsafe {
+        cuda_expert_mv_as(dst, stream, true)?;
+        if dump::enabled() {
+            dump::after(dst, stream, true);
+        }
+    }
+    Ok(())
 }
 
 /// The launches of an expert op; `preq`: its `xq` source holds the activations' Q8_1 blocks
@@ -1811,6 +1833,7 @@ unsafe fn split_launch(
 }
 
 pub mod ahead;
+pub mod dump;
 pub mod overlap;
 pub mod peer;
 pub mod ptx;

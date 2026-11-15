@@ -6,7 +6,7 @@
 //! the hidden `legion nvfp4-mvq-bench` subcommand (a build tree's binary on the GPU box) and by
 //! `tests/nvfp4_mvq.rs`.
 
-use super::{Tune, fits, mul_mat, set_tune};
+use super::{Tune, fits, mul_mat, mul_mat_swiglu, set_tune};
 use crate::ggml::{Backend, ComputeAllocator, Context, Tensor, ffi, types};
 
 /// Shapes and runs.
@@ -27,6 +27,9 @@ pub struct Config {
     pub blocks: bool,
     /// Launch shapes of the op to time besides the default (5-8 columns; each checked too).
     pub tunes: Vec<Tune>,
+    /// The matmul's input is ggml's `swiglu_split` of two inputs (a SwiGLU FFN's down
+    /// projection), and the op also runs with it in its quantization ([`mul_mat_swiglu`]).
+    pub swiglu: bool,
 }
 
 impl Default for Config {
@@ -39,6 +42,7 @@ impl Default for Config {
             scale: true,
             blocks: false,
             tunes: Vec::new(),
+            swiglu: false,
         }
     }
 }
@@ -165,17 +169,29 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
         for &n in &cfg.cols {
             // ggml, the op, then the op at each tuned shape (5-8 columns).
             let tunes: Vec<Tune> = if n > 4 { cfg.tunes.clone() } else { Vec::new() };
-            let nv = 2 + tunes.len();
+            // With `swiglu`: the matmul's input is ggml's swiglu_split of two inputs; ggml and
+            // the op run over ggml's SwiGLU, then the op with it in its quantization
+            // (`swiglu`, at 5-8 columns), the tuned shapes that way too.
+            let fused = cfg.swiglu && n > 4;
+            let first_tune = 2 + usize::from(fused);
+            let nv = first_tune + tunes.len();
             let names: Vec<String> = VARIANTS
                 .iter()
                 .map(|v| v.to_string())
-                .chain(tunes.iter().map(tune_name))
+                .chain(fused.then(|| "swiglu".to_string()))
+                .chain(tunes.iter().map(|t| {
+                    if fused {
+                        format!("swiglu-{}", tune_name(t))
+                    } else {
+                        tune_name(t)
+                    }
+                }))
                 .collect();
             let tune_of = |vi: usize| {
-                if vi < 2 {
+                if vi < first_tune {
                     Tune::default()
                 } else {
-                    tunes[vi - 2]
+                    tunes[vi - first_tune]
                 }
             };
             let ctxs: Vec<Context> = (0..nv)
@@ -184,6 +200,9 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
             let mut graphs = Vec::new();
             for (vi, ctx) in ctxs.iter().enumerate() {
                 let x = ctx.new_tensor(types::F32, &[k as i64, n as i64]).as_input();
+                let u = cfg
+                    .swiglu
+                    .then(|| ctx.new_tensor(types::F32, &[k as i64, n as i64]).as_input());
                 let mut graph = ctx.new_graph(4 * cfg.layers + 16);
                 let scale = cfg.scale.then_some(s);
                 if vi >= 1
@@ -201,10 +220,18 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
                 let outs: Vec<Tensor<'_>> = w
                     .iter()
                     .map(|&wl| {
-                        let y = if vi == 0 {
-                            ggml_mul_mat(ctx, wl, x, scale)
-                        } else {
-                            mul_mat(ctx, wl, x, scale)
+                        let y = match u {
+                            Some(u) if vi >= 2 => mul_mat_swiglu(ctx, wl, x, u, scale),
+                            Some(u) => {
+                                let act = ctx.swiglu_split(x, u);
+                                if vi == 0 {
+                                    ggml_mul_mat(ctx, wl, act, scale)
+                                } else {
+                                    mul_mat(ctx, wl, act, scale)
+                                }
+                            }
+                            None if vi == 0 => ggml_mul_mat(ctx, wl, x, scale),
+                            None => mul_mat(ctx, wl, x, scale),
                         }
                         .as_output();
                         graph.expand(y);
@@ -213,9 +240,10 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
                     .collect();
                 ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
                     .map_err(|e| e.to_string())?;
-                graphs.push((x, graph, outs));
+                graphs.push((x, u, graph, outs));
             }
             let xs = activations(k, n, (7 + 31 * n + si) as u64);
+            let us = activations(k, n, (11 + 37 * n + si) as u64);
             let mut best = vec![f64::MAX; nv];
             let mut reference: Vec<f32> = Vec::new();
             let mut differ = vec![0usize; nv];
@@ -237,7 +265,7 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
                     .collect()
             };
             for &(round, vi) in &order {
-                let (x, graph, outs) = &graphs[vi];
+                let (x, u, graph, outs) = &graphs[vi];
                 let mark = |what: &str| {
                     let t = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -250,6 +278,9 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
                     mark("start");
                 }
                 x.set_f32(&xs);
+                if let Some(u) = u {
+                    u.set_f32(&us);
+                }
                 set_tune(tune_of(vi));
                 let t = std::time::Instant::now();
                 let r = gpu.compute(graph);

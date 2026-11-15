@@ -32,6 +32,10 @@ pub struct Nvfp4MvqBenchArgs {
     /// field left out for its default (e.g. `r32,c2k4,a20`).
     #[arg(long, value_delimiter = ',')]
     tune: Vec<String>,
+    /// Each matmul's input is ggml's SwiGLU of two inputs (an FFN's down projection); at 5-8
+    /// columns the op also runs with the SwiGLU in its quantization kernel (`swiglu`).
+    #[arg(long)]
+    swiglu: bool,
 }
 
 fn shape(s: &str) -> anyhow::Result<(usize, usize)> {
@@ -48,6 +52,7 @@ pub fn run(args: Nvfp4MvqBenchArgs) -> anyhow::Result<()> {
         rounds: args.rounds,
         scale: !args.no_scale,
         blocks: args.blocks,
+        swiglu: args.swiglu,
         tunes: args
             .tune
             .iter()
