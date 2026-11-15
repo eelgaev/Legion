@@ -6,8 +6,9 @@
 //   nothing waits for a plan), writes the step's activations and the host's expert ids into
 //   host memory the CPU reads (the device's mapped exchange buffer), and outputs the ids with
 //   the host's pairs replaced by -2, which the expert matvecs skip.
-// - `collect` copies the down projection's output, with the host's rows (from the exchange
-//   buffer) for the pairs marked -2, once the host raised its "done" flag: the host pairs'
+// - `collect` writes the host's rows (from the exchange buffer) over the down projection's
+//   output for the pairs marked -2 (in place; with a separate output it copies the GPU's rows
+//   too), once the host raised its "done" flag: the host pairs'
 //   blocks poll it themselves (the other pairs copy meanwhile), or the stream waited for it
 //   before the launch (the way before, LEGION_DEBUG_SHARE_STREAM_WAIT=1).
 //
@@ -216,6 +217,9 @@ __global__ void collect(const legion_cpu_share_collect p) {
     const float * src = host ? p.host + (int64_t) pair * p.rows
                              : (const float *) ((const char *) p.src + t * p.src_nb2 + j * p.src_nb1);
     float * dst = p.dst + (int64_t) pair * p.rows;
+    if (src == dst) {
+        return;  // in place: the GPU pair's row is already there
+    }
     for (int r = threadIdx.x; r < p.rows; r += blockDim.x) {
         dst[r] = src[r];
     }
@@ -237,6 +241,9 @@ __global__ void activate(const legion_cpu_share_activate p) {
     }
     if (!host) {
         const float * src = (const float *) ((const char *) p.src + t * p.src_nb2 + j * p.src_nb1);
+        if (src == dst) {
+            return;  // in place: the SwiGLU op's row is already there
+        }
         for (int r = threadIdx.x; r < p.rows; r += blockDim.x) {
             dst[r] = src[r];
         }

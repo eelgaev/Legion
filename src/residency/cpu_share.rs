@@ -31,11 +31,11 @@
 //!    buffer and sets "done", never before the rows are written (it waits for "ready" as long
 //!    as it takes, warning now and then). A layer whose split gives the host nothing is done
 //!    as soon as the pool sees "ready".
-//! 4. `collect` (an external op on the down projection's output): copies the host's rows into
-//!    the output once "done" reached the sequence number. The kernel's blocks of the host's
-//!    pairs, and its first block whatever its pair, poll the flag (a system-scope acquire
-//!    load, a short sleep apart) while the other blocks copy the GPU's rows, so the kernel ends
-//!    after "done" as a stream wait would. `LEGION_DEBUG_SHARE_STREAM_WAIT=1`: the stream
+//! 4. `collect` (a kernel the down projection's op launches after its own): writes the host's
+//!    rows into the op's output once "done" reached the sequence number. The kernel's blocks
+//!    of the host's pairs, and its first block whatever its pair, poll the flag (a
+//!    system-scope acquire load, a short sleep apart) while the other blocks end at once
+//!    (their rows are there), so the kernel ends after "done" as a stream wait would. `LEGION_DEBUG_SHARE_STREAM_WAIT=1`: the stream
 //!    waits for the flag before the launch (a stream memory operation), the way before.
 //!
 //! Layers follow each other in a device's stream, so one exchange buffer per device suffices:
@@ -54,7 +54,7 @@
 //!    ones, as Strata's `--pcie-frac` leaves them).
 //! 2. The pool computes its pairs' raw gate and up sums ([`crate::cpu::gpu_exact::matvec`]) into
 //!    the exchange buffer and raises "gate/up done" while the GPU's SwiGLU op runs the others.
-//! 3. `activate` (an external op between the SwiGLU and down ops): waits for "gate/up done" as
+//! 3. `activate` (a kernel the SwiGLU op launches after its own): waits for "gate/up done" as
 //!    `collect` waits for "done", makes the host pairs' SwiGLU from the sums (the kernels'
 //!    `swiglu`) and their Q8_1 blocks, and raises "act ready".
 //! 4. The pool computes its pairs' down rows from those blocks while the GPU's down op runs the
@@ -67,6 +67,20 @@
 //! ([`pool::nudge`]: the GPU flags its arrival at `activate`), so it settles where the GPU and the
 //! pool wait for each other about as often. Steps of 5 or 7 tokens leave every expert to the
 //! GPU (the kernels' bits at those widths were not checked).
+//!
+//! # The graph's layout
+//!
+//! ggml-cuda fuses some MoE ops (the weighted sum of the experts, #472) only where the
+//! tensors' memory ranges allow, so a node more or less in the step graph's memory moves which
+//! layers fuse, and with it the bits. The share adds no memory of its own: `publish` writes
+//! its ids at a place of the layer's own outside the graph (`expert_share_ids`,
+//! [`super::experts::TieredLayer::share_ids`]); `activate` and `collect` are no nodes but
+//! kernels the SwiGLU and down ops launch after theirs (ops wrapping the share-off ones, the
+//! same nodes, sources and params); the SwiGLU op reads the same pre-quantized x as without
+//! the share; and the down op keeps the router's ids as an unread source, so they are freed
+//! where the share-off down op frees them. So the graph lays out its memory as the share-off
+//! one, node for node. (In-place nodes of their own did not do: ggml's allocator never lets a
+//! view's reader take the view's memory, so the weighted sum's `mul` got memory of its own.)
 //!
 //! # The bounded host tier
 //!

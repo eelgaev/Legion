@@ -4337,9 +4337,18 @@ impl Model {
                         // The missed experts on a side stream beside the cached ones (#253).
                         let w = [w_gate, w_up, t.weight(2)];
                         // The host computes a share of the missed experts (#268, opt-in).
+                        // Laid out as the plain path below (the same pre-quantized gate and
+                        // up, no memory of its own), so ggml's fusions see the same graph.
                         let shared = t.cpu_share(n).and_then(|share| {
-                            let (slots, n_expert) = (t.n_slots(), t.share_experts());
-                            cpu_share::ops::glu_down(ctx, w, x, ids, slots, n_expert, il, share)
+                            let xq =
+                                h_q8_1.filter(|&q| expert_mv::glu_preq_fits(w_gate, x, ids, q));
+                            let layer = cpu_share::ops::ShareLayer {
+                                n_slots: t.n_slots(),
+                                n_expert: t.share_experts(),
+                                layer: il,
+                                threshold: share,
+                            };
+                            cpu_share::ops::glu_down(ctx, w, (x, ids, xq), t.share_ids()?, layer)
                         });
                         let split = shared.or_else(|| {
                             (!t.gathers(n))

@@ -579,3 +579,99 @@ fn exact_pool_matches_gpu_exact() {
     assert!(cost[0] > 0.0);
     assert!((1..=THRESHOLD_ONE).contains(&thr[0].load(Ordering::Relaxed)));
 }
+
+/// The share lays out the step graph's memory as the share-off path does, node for node
+/// (`publish` aside, which writes outside the graph): its SwiGLU and down nodes are the
+/// share-off ones with the op swapped, so ggml-cuda's layout-dependent MoE fusions (#472) fire
+/// in the same layers with the share on and off.
+#[test]
+fn share_keeps_the_plain_layout() {
+    use super::ops::{MAX_PAIRS, ShareLayer, share_nodes};
+    use crate::ggml::{Backend, ComputeAllocator, Context, ffi, op_of};
+    use crate::model::core::expert_mv;
+
+    let (k, rows, n_expert, n_used, n_tok) = (256i64, 64i64, 6i64, 3i64, 2i64);
+    // `share`: None for the share-off path, else whether the share is exact.
+    let layout = |share: Option<bool>, preq: bool| {
+        let b = Backend::cpu().unwrap();
+        let weights = Context::new(9, 0);
+        let stacks: Vec<_> = (0..3)
+            .map(|_| {
+                [
+                    weights.new_tensor(types::Q4_K, &[k, rows, n_expert]),
+                    weights.new_tensor(types::Q4_K, &[k, rows, n_expert]),
+                    weights.new_tensor(types::Q5_1, &[rows, k, n_expert]),
+                ]
+            })
+            .collect();
+        // The layers' places for the published ids, outside the graph's memory.
+        let ids_at = weights.new_tensor(types::I32, &[3 * MAX_PAIRS as i64]);
+        weights.alloc_tensors(b.buffer_type()).unwrap();
+        let ctx = Context::new(128, 0);
+        let x = ctx.new_tensor(types::F32, &[k, 1, n_tok]).as_input();
+        let it = ctx.new_tensor(types::I32, &[n_used, n_tok]).as_input();
+        let wts = ctx.new_tensor(types::F32, &[1, n_used, n_tok]).as_input();
+        let xq_in = ctx.new_tensor(types::F32, &[k * n_tok]).as_input();
+        // Three layers, each reading the last one's output summed over its experts.
+        let mut h = x;
+        for (l, &[g, u, d]) in stacks.iter().enumerate() {
+            let xq = preq.then(|| ctx.scale(xq_in, 1.0));
+            let out = match share {
+                Some(exact) => {
+                    let layer = ShareLayer {
+                        n_slots: 3,
+                        n_expert: 3,
+                        layer: l,
+                        threshold: 512,
+                    };
+                    let at = (ids_at, l * MAX_PAIRS * 4);
+                    share_nodes(&ctx, [g, u, d], (h, it, xq), at, layer, exact)
+                }
+                None => {
+                    let act = match xq {
+                        Some(q) => expert_mv::glu_tiered_preq(&ctx, g, u, h, it, 3, q),
+                        None => expert_mv::glu_tiered(&ctx, g, u, h, it, 3),
+                    };
+                    expert_mv::mul_mat_id_tiered(&ctx, d, act, it, 3)
+                }
+            };
+            let out = ctx.mul(out, wts);
+            let sum = ctx.sum_rows(ctx.cont(ctx.permute(out, [1, 0, 2, 3])));
+            h = ctx.add(ctx.scale(h, 0.5), ctx.reshape_3d(sum, k, 1, n_tok));
+        }
+        let mut gr = ctx.new_graph(128);
+        gr.expand(h);
+        ctx.alloc_graph(&gr, ComputeAllocator::new(b.buffer_type()))
+            .unwrap();
+        let g = gr.raw();
+        // SAFETY: an allocated graph; every node has its buffer and data.
+        unsafe {
+            let n = ffi::ggml_graph_n_nodes(g);
+            let ours = (0..n)
+                .map(|i| ffi::ggml_graph_node(g, i))
+                .filter(|&t| op_of(t).is_some_and(|op| op.name.starts_with("cpu_share")))
+                .count();
+            let offsets = (0..n)
+                .map(|i| ffi::ggml_graph_node(g, i))
+                .filter(|&t| !op_of(t).is_some_and(|op| op.name == "cpu_share_publish"))
+                .map(|t| {
+                    (*t).data as usize - ffi::ggml_backend_buffer_get_base((*t).buffer) as usize
+                })
+                .collect::<Vec<_>>();
+            (offsets, ours)
+        }
+    };
+    for preq in [false, true] {
+        let (plain, none) = layout(None, preq);
+        assert_eq!(none, 0);
+        for exact in [false, true] {
+            let (shared, ours) = layout(Some(exact), preq);
+            assert_eq!(
+                ours,
+                3 * if exact { 3 } else { 2 },
+                "exact {exact} preq {preq}"
+            );
+            assert_eq!(shared, plain, "exact {exact} preq {preq}");
+        }
+    }
+}

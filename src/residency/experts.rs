@@ -989,6 +989,15 @@ impl<'a> TieredLayer<'a> {
         self.host.map_or(self.n_expert, |(h, _)| h.slots())
     }
 
+    /// Where the share's `publish` writes this layer's ids (I32, room for
+    /// [`super::cpu_share::ops::MAX_PAIRS`]): a place of the layer's own outside the step
+    /// graph, so the share takes no memory in the graph's layout (the `cpu_share` module docs,
+    /// "The graph's layout"). `None` without the share.
+    pub fn share_ids(&self) -> Option<(Tensor<'a>, usize)> {
+        let t = self.dev.ctx.tensor("expert_share_ids")?;
+        Some((t, self.layer.row * super::cpu_share::ops::MAX_PAIRS * 4))
+    }
+
     /// The layer's cache slots: [`Self::remap`]'s indices below this are VRAM.
     pub fn n_slots(&self) -> usize {
         self.layer.slots.n_slots()
@@ -1851,6 +1860,12 @@ impl ExpertResidency {
             dev.ctx
                 .new_tensor(types::I32, &[(n_used * LOG_TOKENS) as i64 * r])
                 .named("expert_log");
+            if super::cpu_share::threshold(cfg.cpu_share.share) > 0 && dev.place.cuda.is_some() {
+                // The share's published ids, one place per layer ([`TieredLayer::share_ids`]).
+                dev.ctx
+                    .new_tensor(types::I32, &[super::cpu_share::ops::MAX_PAIRS as i64 * r])
+                    .named("expert_share_ids");
+            }
             if cfg.ep_cached && cfg.ep.is_some() {
                 dev.ctx
                     .new_tensor(types::I32, &[n_expert as i64, r])
