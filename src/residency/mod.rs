@@ -34,6 +34,7 @@ pub mod ep_balance;
 pub mod ep_prefetch;
 pub mod experts;
 pub mod fallback;
+pub mod host_tier;
 pub mod kv_vmm;
 pub mod miss_split;
 pub mod split;
@@ -264,11 +265,16 @@ pub struct ResidencyConfig {
     /// what is allocated after it (ggml's CUDA pools, cuBLAS workspaces); a long prompt's lend
     /// keeps it free too (`--expert-cache-reserve-mib`).
     pub cache_reserve: u64,
+    /// What a long prompt's lend keeps free in place of [`Self::cache_reserve`], where the
+    /// engine set a smaller reserve for the cache than the prompt's passes were sized with
+    /// (the host expert tier's machine, #37). `None`: the reserve.
+    pub lend_reserve: Option<u64>,
     /// The cache also takes the VRAM the measured prompt steps' compute buffers would keep
     /// free, on GPUs whose step buffers can spill into host memory (unified memory); a prompt
     /// step's buffer then takes what VRAM is free and the rest from host memory
     /// (`--expert-cache-fill-prompt-room`, `--no-expert-cache-fill-prompt-room`). `None`: on
-    /// for V100s and a GH200 ([`Self::fills_prompt_room`]).
+    /// for V100s, a GH200 and the host expert tier's machine with every routed expert in host
+    /// memory ([`Self::fills_prompt_room`]).
     pub fill_prompt_room: Option<bool>,
     /// Profile to seed the cache from (and to save the learned one to).
     pub profile: Option<std::path::PathBuf>,
@@ -279,11 +285,25 @@ pub struct ResidencyConfig {
     /// The profile sizes each layer's slots only: the first contents are each layer's lowest
     /// experts, as without a profile, and no heat is seeded (`--expert-profile-split-only`).
     pub profile_split_only: bool,
+    /// The bounded host tier's saved routing heat (#37, set by the engine, no flag): read at
+    /// load if the file is there and fits the model (the VRAM slots and the RAM slots then
+    /// start with each layer's most routed experts; the layers' slot counts stay as without
+    /// it unless [`Self::tier_heat_sizes`]), written on exit. Unused with a `profile`. Set on
+    /// the tier's machine and model also when every expert fits in host memory (no tier, no
+    /// RAM slots): the VRAM slots start from it the same way.
+    pub tier_heat: Option<std::path::PathBuf>,
+    /// The saved routing heat ([`Self::tier_heat`]) also sizes the layers' slots, as a
+    /// profile's hottest pairs do, instead of even slot counts (#37, set by the engine, no
+    /// flag): with every routed expert in host memory on one GPU. Placement only.
+    pub tier_heat_sizes: bool,
     /// Per-layer slot counts from a previous run's measured misses ([`miss_split`]): read at
     /// load if the file exists, written on exit (`--expert-split-misses`).
     pub split_misses: Option<std::path::PathBuf>,
     /// Swaps per step and their thresholds; a budget of 0 keeps the first fill.
     pub swaps: policy::SwapRule,
+    /// Whether the budget in [`Self::swaps`] was asked for (`--expert-swaps`); if not, the load
+    /// may raise it for the machine (every routed expert in host memory on one GPU).
+    pub swaps_given: bool,
     /// Per-device swap budgets (`--expert-swaps-device`, in the cache's device order),
     /// replacing [`Self::swaps`]' budget on the devices listed; empty: the same everywhere.
     pub device_swaps: Vec<usize>,
@@ -406,12 +426,16 @@ impl Default for ResidencyConfig {
             mode: ExpertMode::Auto,
             cache_bytes: None,
             cache_reserve: CACHE_RESERVE,
+            lend_reserve: None,
             fill_prompt_room: None,
             profile: None,
             profile_seed: PROFILE_SEED,
             profile_split_only: false,
+            tier_heat: None,
+            tier_heat_sizes: false,
             split_misses: None,
             swaps: policy::SwapRule::default(),
+            swaps_given: false,
             device_swaps: Vec::new(),
             decay: 0.95,
             heat_pass_cap: 0.0,
@@ -446,7 +470,8 @@ impl ResidencyConfig {
     /// as given, else `spill_default` ([`unified::spill_default`]: V100s, compute capability
     /// 7.0, and a GH200). It applies only on GPUs whose step buffers can spill into host memory,
     /// so by default an AC922 (V100s with ATS over NVLink): its 2-GPU cache gets ~5% more slots
-    /// (~440 MiB a GPU), the same outputs; and a GH200 (unmeasured).
+    /// (~440 MiB a GPU), the same outputs; and a GH200 (unmeasured). The engine also passes
+    /// `true` on the host expert tier's machine with every routed expert in host memory (#37).
     pub fn fills_prompt_room(&self, spill_default: bool) -> bool {
         self.fill_prompt_room.unwrap_or(spill_default)
     }

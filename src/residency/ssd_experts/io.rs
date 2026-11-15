@@ -37,6 +37,9 @@ pub enum Job {
     },
     /// Copy `len` bytes from `src` to `dst` (host memory, not overlapping).
     Copy { src: usize, dst: usize, len: usize },
+    /// Read the file range `src` as it is to `dst` (`src.len` bytes of host memory): a plain
+    /// GGUF expert, for the bounded host tier ([`crate::residency::host_tier`]).
+    Raw { src: FileRange, dst: usize },
 }
 
 /// A batch of jobs: waits for all of them, or cancels the ones not started.
@@ -296,6 +299,32 @@ impl Drop for Pool {
 /// whole matrices (4 MiB) would leave most reader threads idle and the drive's queue short.
 pub const PIECE: usize = 1 << 20;
 
+/// A [`Job::Raw`] of `src` to `dst` as raw reads of at most `piece` bytes each, cut where the
+/// file offset is a multiple of `piece` (with `piece` a multiple of [`ALIGN`], every cut is on
+/// a block boundary). The same bytes land at the same addresses; a decode step's few experts
+/// then keep every reader busy. `piece` 0: the one job.
+pub fn raw_pieces(src: FileRange, dst: usize, piece: u64) -> Vec<Job> {
+    let end = src.offset + src.len;
+    if piece == 0 || src.len == 0 {
+        return vec![Job::Raw { src, dst }];
+    }
+    let mut out = Vec::with_capacity((src.len / piece) as usize + 2);
+    let mut at = src.offset;
+    while at < end {
+        let next = ((at / piece + 1) * piece).min(end);
+        out.push(Job::Raw {
+            src: FileRange {
+                file: src.file,
+                offset: at,
+                len: next - at,
+            },
+            dst: dst + (at - src.offset) as usize,
+        });
+        at = next;
+    }
+    out
+}
+
 /// `job` as reads of at most [`PIECE`] codes each (whole rows: a row's codes, scales and
 /// repacked bytes are contiguous); other jobs as they are.
 pub fn split(job: Job) -> Vec<Job> {
@@ -484,6 +513,12 @@ fn run(s: &Shared, job: Job, codes: &mut Aligned, scales: &mut Aligned) -> Resul
             // memory that outlives the job.
             let out = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, bytes) };
             crate::hf::nvfp4::repack_nvfp4_into(w, sc, rows, k, out);
+            Ok(())
+        }
+        Job::Raw { src, dst } => {
+            let bytes = read_range(s, src, codes)?;
+            // SAFETY: as above: a destination of the job's own, `src.len` bytes long.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len()) };
             Ok(())
         }
         Job::Copy { src, dst, len } => {

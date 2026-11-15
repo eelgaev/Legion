@@ -56,6 +56,32 @@ fn empty_slots_take_experts_without_evicting() {
 }
 
 #[test]
+fn a_reserved_slot_is_empty_and_kept_until_it_is_filled() {
+    let mut c = SlotCache::new(8, 2);
+    c.plan(&[3]);
+    c.plan(&[4]);
+    // The least recently used slot goes: its expert is evicted.
+    assert_eq!(c.reserve(), Some(0));
+    assert_eq!((c.slot(3), c.filled()), (None, 1));
+    // No step takes it: with the other slot the step's own, a second expert finds none.
+    assert_eq!(
+        c.plan_some(&[4, 6]),
+        (
+            Plan {
+                hits: 1,
+                loads: vec![]
+            },
+            vec![6]
+        )
+    );
+    c.put(7, 0);
+    assert_eq!(c.slot(7), Some(0));
+    // Filled, it is a slot like any other.
+    c.plan(&[4]);
+    assert_eq!(c.plan(&[1]).loads, vec![(1, 0)]);
+}
+
+#[test]
 fn aligned_spans_cover_the_range() {
     let r = FileRange {
         file: 0,
@@ -118,6 +144,51 @@ fn big_reads_split_into_whole_row_pieces() {
         len: 3,
     };
     assert_eq!(split(copy).len(), 1);
+}
+
+#[test]
+fn raw_pieces_cover_the_range_once_cut_at_multiples_of_the_piece() {
+    let src = FileRange {
+        file: 2,
+        offset: 1000,
+        len: 10_000,
+    };
+    let spans = |piece: u64| -> Vec<(u64, u64, usize)> {
+        io::raw_pieces(src, 50, piece)
+            .into_iter()
+            .map(|j| match j {
+                Job::Raw { src, dst } => {
+                    assert_eq!(src.file, 2);
+                    (src.offset, src.len, dst)
+                }
+                j => panic!("{j:?}"),
+            })
+            .collect()
+    };
+    // 0: the one read, as before.
+    assert_eq!(spans(0), vec![(1000, 10_000, 50)]);
+    assert_eq!(spans(1 << 20), vec![(1000, 10_000, 50)]);
+    assert_eq!(
+        spans(4096),
+        vec![
+            (1000, 3096, 50),
+            (4096, 4096, 50 + 3096),
+            (8192, 2808, 50 + 7192)
+        ]
+    );
+    // A range that ends on a cut has no empty last piece.
+    let even = FileRange {
+        file: 0,
+        offset: 8192,
+        len: 8192,
+    };
+    assert_eq!(io::raw_pieces(even, 0, 4096).len(), 2);
+    let none = FileRange {
+        file: 0,
+        offset: 8192,
+        len: 0,
+    };
+    assert_eq!(io::raw_pieces(none, 0, 4096).len(), 1);
 }
 
 const ROWS: usize = 4;

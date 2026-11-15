@@ -65,6 +65,11 @@ pub(crate) fn diff(a: &[GroupShape], b: &[GroupShape]) -> Vec<String> {
         );
         f("par", x.par.to_string(), y.par.to_string());
         f("pair", x.pair.to_string(), y.pair.to_string());
+        f(
+            "head_half",
+            x.head_half.to_string(),
+            y.head_half.to_string(),
+        );
         f("img", x.img.to_string(), y.img.to_string());
         f(
             "captures",

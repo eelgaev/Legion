@@ -244,6 +244,28 @@ pub(crate) unsafe fn set_external_param(node: *mut ffi::ggml_tensor, i: usize, v
     }
 }
 
+/// Makes the external op node `node` compute `op` instead, its sources and params unchanged
+/// (an op that wraps the node's own, built before the graph is).
+///
+/// # Safety
+/// `node` is a valid external op node not yet in a graph that ran; `op` reads its sources and
+/// params as the node's op does.
+pub(crate) unsafe fn retarget(node: *mut ffi::ggml_tensor, op: &'static ExternalOp) {
+    // SAFETY: the caller's; the header is the first bytes of op_params (read unaligned, as in
+    // `op_of`).
+    unsafe {
+        assert!(
+            op_of(node).is_some(),
+            "{}: not an external op node",
+            op.name
+        );
+        let at = (*node).op_params.as_mut_ptr() as *mut CustomParams;
+        let mut h = std::ptr::read_unaligned(at);
+        h.userdata = op as *const ExternalOp as *mut c_void;
+        std::ptr::write_unaligned(at, h);
+    }
+}
+
 #[cfg(feature = "cuda")]
 pub(crate) mod cuda {
     use std::cell::Cell;

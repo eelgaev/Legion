@@ -326,6 +326,50 @@ fn a_reduce_scatter_takes_over_only_the_tail_it_reads() {
 }
 
 #[test]
+fn an_all_gather_takes_over_only_the_mix_and_the_cast_it_reads() {
+    // #1176: a gather runs the mix that is its source, and a BF16 gather writes its F32 copy.
+    let got = on_ranks(2, Wire::Bf16, |r, c| {
+        let handle = register(c);
+        let ctx = Context::new(16, 16);
+        let (_, m) = share(6, r, 2);
+        let x = ctx.new_tensor(types::F32, &[4, m as i64]).as_input();
+        // Plain nodes standing in for the mix and for another node.
+        let mix = ctx.scale(x, 2.0);
+        let other = ctx.scale(x, 3.0);
+        let g = all_gather_bf16(&ctx, handle.id(), mix, 6).expect("BF16 on the wire");
+        let f = all_gather(&ctx, handle.id(), x, 6);
+        let wide = ctx.cast(g, types::F32);
+        // SAFETY: nodes of `ctx`, never run.
+        unsafe {
+            let not_a_gather = take_mix(mix.raw(), x.raw());
+            let not_its_source = take_mix(g.raw(), other.raw());
+            let untouched = mix_param(g.raw()) == 0;
+            let took = take_mix(g.raw(), mix.raw());
+            let again = take_mix(g.raw(), mix.raw());
+            let f32_gather = take_cast(f.raw(), wide.raw());
+            let cast = take_cast(g.raw(), wide.raw());
+            let twice = take_cast(g.raw(), wide.raw());
+            let src = (*g.raw()).src[1] == wide.raw() && (*f.raw()).src[1].is_null();
+            (
+                [not_a_gather, not_its_source, again, f32_gather, twice],
+                [untouched, took, cast, src],
+                mix_param(g.raw()),
+            )
+        }
+    });
+    assert_eq!(got, [([false; 5], [true; 4], 1); 2]);
+}
+
+/// The [`take_mix`] parameter of the all-gather node `ag`.
+///
+/// # Safety
+/// `ag` is a valid external op node.
+unsafe fn mix_param(ag: *const ffi::ggml_tensor) -> i32 {
+    // SAFETY: the caller's.
+    external_params(unsafe { &*ag })[P_MIX]
+}
+
+#[test]
 fn a_deferred_sum_read_after_another_exchange_is_written_after_all() {
     // #1176: the exchange after a deferred reduce-scatter frees its buffers and its reader
     // reads the partials' addresses from the communicator's slot, so the reader must come

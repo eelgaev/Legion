@@ -12,6 +12,10 @@
 //   per thread), instead of reading it twice.
 // - The inject rows (F32) come first in `down_g`'s grid and are prefetched into L2 before the
 //   wait, so their long per-thread sums do not trail the down rows.
+// - By default (#1176) `down_g` streams its rows through a ring of three 2,176-byte slices per
+//   row instead of staging them whole (26 KB of shared memory a CTA instead of 43.5 KB), so
+//   `up_mix_g`'s CTAs fit beside it and stage the up rows while `down_g` runs, and `norm_g`
+//   itself is launched early, its gamma read while the kernel ahead ends.
 //
 // Not a standalone header: qwen4_hc.cu includes it inside its anonymous namespace, after the
 // legion_hc_mix declaration, the constants and block_sum / quantize_lane. The kernel bodies are
@@ -23,6 +27,12 @@ constexpr int G_ROWS        = 4;   // down_g: down rows per CTA (4 x 10880 B of 
 constexpr int G_COLS        = 16;  // up_mix_g: columns per CTA
 constexpr int G_UNROLL_DOWN = 5;
 constexpr int G_UNROLL_UP   = 5;
+constexpr int G_RING_SL     = 2;   // down_g's ring (#1176): K-loop trips a slice (64 Q8_0 blocks, 2,176 B a row)
+constexpr int G_RING_ST     = 3;   // and slices in shared memory (3 x 4 x 2,176 B = 26 KB a CTA)
+// legion_hc_mix::gb10 (#1176): 0 the defaults (G_RING and G_EARLY); with G_SET, the bits below.
+constexpr int G_RING        = 1;       // down_g's rows through the ring instead of staged whole
+constexpr int G_EARLY       = 2;       // norm_g launched early (PDL): gamma read while the kernel ahead ends
+constexpr int G_SET         = 1 << 8;  // the two bits above as given (LEGION_DEBUG_HC_GB10)
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 // `bytes` (a multiple of 16) from `src` to `dst` in shared memory, 16 bytes per copy, the CTA's
@@ -112,7 +122,11 @@ __global__ void __launch_bounds__(NORM_THREADS) norm_g(const legion_hc_mix p) {
 // sums as `down` splits them (thread i: units i, i + DOWN_THREADS, ...), each unit's activations
 // loaded once for the R rows; an inject sum as `down`'s INJ_THREADS threads split it (thread i:
 // k = i, i + INJ_THREADS, ...), each thread here running two of those threads' sums.
-template <int NT, int R>
+//
+// SL > 0 (the ring, #1176): the R rows staged SL trips of the K loop at a time through ST
+// buffers (see below); the same units of each thread in the same order, so the same bits.
+// K / QK8_0 is a multiple of SL * DOWN_THREADS / 4 blocks there (ring_fits).
+template <int NT, int R, int SL = 0, int ST = 2>
 __global__ void __launch_bounds__(DOWN_THREADS) down_g(const legion_hc_mix p, const int n_inj) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     static_assert(INJ_THREADS == 2 * DOWN_THREADS, "two inject sums per thread");
@@ -158,15 +172,12 @@ __global__ void __launch_bounds__(DOWN_THREADS) down_g(const legion_hc_mix p, co
         return;
     }
     const int r0 = ((int) blockIdx.x - n_inj) * R;
-    stage_g(rows, p.down + r0 * p.down_nb1, R * (int) p.down_nb1);
-    ggml_cuda_pdl_sync();
-    stage_wait_g();
     constexpr int VDR = VDR_Q8_0_Q8_1_MMVQ, lanes_per_block = QI8_0 / VDR;
     float s[R][NT] = {};
-#pragma unroll G_UNROLL_DOWN
-    for (int c = threadIdx.x; c < K / QK8_0 * lanes_per_block; c += DOWN_THREADS) {
+    // Unit c of the R rows (block kbx of the row, iqs), their weights in shared memory at `base`,
+    // a row every `row_bytes`, block kbx at block `lb` there.
+    auto unit = [&](const char * base, int row_bytes, int kbx, int lb, int iqs) {
         // vec_dot_q8_0_q8_1(row, &xq[t][kbx], kbx, iqs) for each row and token.
-        const int kbx = c / lanes_per_block, iqs = VDR * (c % lanes_per_block);
         int u[NT][VDR];
         half d1[NT];
 #pragma unroll
@@ -180,7 +191,7 @@ __global__ void __launch_bounds__(DOWN_THREADS) down_g(const legion_hc_mix p, co
         }
 #pragma unroll
         for (int r = 0; r < R; r++) {
-            const block_q8_0 * bq8_0 = (const block_q8_0 *) (rows + r * p.down_nb1) + kbx;
+            const block_q8_0 * bq8_0 = (const block_q8_0 *) (base + r * row_bytes) + lb;
             int v[VDR];
 #pragma unroll
             for (int i = 0; i < VDR; i++) {
@@ -190,6 +201,52 @@ __global__ void __launch_bounds__(DOWN_THREADS) down_g(const legion_hc_mix p, co
             for (int t = 0; t < NT; t++) {
                 s[r][t] += vec_dot_q8_0_q8_1_impl<float, VDR>(v, u[t], bq8_0->d, d1[t]);
             }
+        }
+    };
+    if constexpr (SL == 0) {
+        stage_g(rows, p.down + r0 * p.down_nb1, R * (int) p.down_nb1);
+        ggml_cuda_pdl_sync();
+        stage_wait_g();
+#pragma unroll G_UNROLL_DOWN
+        for (int c = threadIdx.x; c < K / QK8_0 * lanes_per_block; c += DOWN_THREADS) {
+            const int kbx = c / lanes_per_block;
+            unit(rows, (int) p.down_nb1, kbx, kbx, VDR * (c % lanes_per_block));
+        }
+    } else {
+        // The ring (#1176): the rows go through ST buffers of SL of the K loop's trips each (SB
+        // bytes a row), the next ST - 1 slices in flight while one is computed, so the CTA holds
+        // ST * R * SB bytes of shared memory instead of R whole rows and up_mix_g's CTAs fit
+        // beside it to stage their rows while down runs. Each thread's units in the same order.
+        constexpr int SLICE_BLOCKS = SL * DOWN_THREADS / lanes_per_block;
+        constexpr int SB           = SLICE_BLOCKS * (int) sizeof(block_q8_0);
+        static_assert(SB % 16 == 0, "16-byte copies");
+        const int ns = K / QK8_0 / SLICE_BLOCKS;
+        auto issue = [&](int i) {
+            if (i < ns) {
+                char * buf = rows + (i % ST) * R * SB;
+#pragma unroll
+                for (int r = 0; r < R; r++) {
+                    stage_g(buf + r * SB, p.down + (r0 + r) * p.down_nb1 + (int64_t) i * SB, SB);
+                }
+            }
+            asm volatile("cp.async.commit_group;" : : : "memory");
+        };
+#pragma unroll
+        for (int i = 0; i < ST - 1; i++) {
+            issue(i);
+        }
+        ggml_cuda_pdl_sync();
+        for (int i = 0; i < ns; i++) {
+            issue(i + ST - 1);
+            asm volatile("cp.async.wait_group %0;" : : "n"(ST - 1) : "memory");
+            __syncthreads();
+            const char * buf = rows + (i % ST) * R * SB;
+#pragma unroll
+            for (int it = 0; it < SL; it++) {
+                const int c = threadIdx.x + it * DOWN_THREADS, lb = c / lanes_per_block;
+                unit(buf, SB, i * SLICE_BLOCKS + lb, lb, VDR * (c % lanes_per_block));
+            }
+            __syncthreads();
         }
     }
     // block_sum<DOWN_THREADS> of each (row, token), then * 1/hc and SiLU, as `down`.

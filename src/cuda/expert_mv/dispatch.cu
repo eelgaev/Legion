@@ -124,3 +124,38 @@ extern "C" int legion_expert_stage_launch(const legion_expert_stage * s, void * 
     stage_copy<<<s->ctas, STAGE_THREADS, 0, (cudaStream_t) stream>>>(*s);
     return cudaGetLastError();
 }
+
+namespace {
+
+// LEGION_DEBUG_EXPERT_DUMP (docs/debug-env.md): the first 64 bytes of each pair's expert as the
+// kernels read it (`w + id * nb2`; zeros for an id outside the stack), a CTA per pair.
+__global__ void debug_peek(const uint8_t * w, int64_t nb2, const int32_t * ids, int64_t ids_nb1, int n_used, int n_w,
+                           uint8_t * out) {
+    const int pair = blockIdx.x;
+    const int id   = *(const int32_t *) ((const char *) ids + (pair / n_used) * ids_nb1 + (pair % n_used) * 4);
+    const bool in  = id >= 0 && id < n_w;
+    out[(int64_t) pair * 64 + threadIdx.x] = in ? w[(int64_t) id * nb2 + threadIdx.x] : 0;
+}
+
+// ... and the kernels' SwiGLU of raw gate and up products (the same inline function).
+__global__ void debug_swiglu(const float * g, const float * u, float * out, int n, float limit) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = swiglu(g[i], u[i], limit);
+    }
+}
+
+}  // namespace
+
+extern "C" int legion_expert_mv_debug_peek(const void * w, int64_t nb2, const void * ids, int64_t ids_nb1,
+                                           int n_used, int n_tok, int n_w, void * out, void * stream) {
+    debug_peek<<<n_used * n_tok, 64, 0, (cudaStream_t) stream>>>((const uint8_t *) w, nb2, (const int32_t *) ids,
+                                                                  ids_nb1, n_used, n_w, (uint8_t *) out);
+    return cudaGetLastError();
+}
+
+extern "C" int legion_expert_mv_debug_swiglu(const float * g, const float * u, float * out, int n, float limit,
+                                             void * stream) {
+    debug_swiglu<<<(n + 255) / 256, 256, 0, (cudaStream_t) stream>>>(g, u, out, n, limit);
+    return cudaGetLastError();
+}

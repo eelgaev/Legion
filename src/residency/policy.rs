@@ -40,6 +40,8 @@ pub struct LayerSlots {
     /// The experts this layer's slots serve (expert parallelism: its GPU's share), `None`:
     /// all. The others take no heat, no counts and no slots ([`Self::set_owned`]).
     owned: Option<std::ops::Range<u32>>,
+    /// The slots from here on have no memory now ([`Self::set_limit`]): they stay empty.
+    limit: usize,
 }
 
 /// One planned copy: `new` goes into `slot` of `layer`, replacing `old`.
@@ -60,7 +62,20 @@ impl LayerSlots {
             hits: 0,
             misses: 0,
             owned: None,
+            limit: n_slots,
         }
+    }
+
+    /// Only the slots `0..limit` have memory from now on (all of them: `n_slots`): the others
+    /// are emptied and take no expert until a higher limit. Returns the experts they held.
+    pub fn set_limit(&mut self, limit: usize) -> Vec<u32> {
+        self.limit = limit.min(self.slots.len());
+        self.clear_from(self.limit)
+    }
+
+    /// The slots that have memory ([`Self::set_limit`]).
+    pub fn limit(&self) -> usize {
+        self.limit
     }
 
     /// Serves only the experts `owned` from now on (set before the first fill): routings of the
@@ -92,7 +107,7 @@ impl LayerSlots {
     pub fn fill(&mut self, experts: &[u32]) {
         let mut s = 0;
         for &e in experts {
-            if s == self.slots.len() {
+            if s == self.limit {
                 break;
             }
             if self.slot_of[e as usize].is_some() {
@@ -216,10 +231,10 @@ impl LayerSlots {
             if self.slot_of[e as usize].is_some() {
                 continue;
             }
-            while s < self.slots.len() && self.slots[s] != Slot::Empty {
+            while s < self.limit && self.slots[s] != Slot::Empty {
                 s += 1;
             }
-            if s == self.slots.len() {
+            if s == self.limit {
                 break;
             }
             self.slots[s] = Slot::Filling(e);
@@ -251,13 +266,20 @@ impl LayerSlots {
     /// The lookup table the graph reads: per expert, its slot if ready, else
     /// `n_slots + expert`.
     pub fn table(&self) -> Vec<i32> {
+        let mut t = vec![0; self.slot_of.len()];
+        self.write_table(&mut t);
+        t
+    }
+
+    /// [`Self::table`] into `out` (one entry an expert), without a new allocation.
+    pub fn write_table(&self, out: &mut [i32]) {
         let n = self.slots.len() as i32;
-        (0..self.slot_of.len())
-            .map(|e| match self.slot_of[e] {
+        for (e, (t, s)) in out.iter_mut().zip(&self.slot_of).enumerate() {
+            *t = match *s {
                 Some(s) if self.slots[s as usize] == Slot::Ready(e as u32) => s as i32,
                 _ => n + e as i32,
-            })
-            .collect()
+            };
+        }
     }
 
     /// Whether a ready slot holds expert `e` (the table reads it from VRAM).
@@ -363,19 +385,34 @@ impl LayerSlots {
         ratio: f32,
         limit: usize,
     ) -> Vec<(f32, u32, Option<u32>, u32)> {
+        // With no empty slot every pair needs `h_new - max(h_old, 0) > margin`, so a host
+        // expert of heat `<= margin` never passes, and the pairs stop at the first one that
+        // fails: leaving such experts out of the ranking plans the same swaps, from a much
+        // shorter list (most of a layer's host experts hold a little decayed heat; ranking
+        // them all was most of the after-step's planning time).
+        let empty = self.slots[..self.limit]
+            .iter()
+            .any(|s| matches!(s, Slot::Empty));
+        let floor = if empty { 0.0 } else { margin.max(0.0) };
         let mut hot: Vec<u32> = (0..self.slot_of.len() as u32)
-            .filter(|&e| self.slot_of[e as usize].is_none() && self.heat[e as usize] > 0.0)
+            .filter(|&e| self.slot_of[e as usize].is_none() && self.heat[e as usize] > floor)
             .collect();
+        if hot.is_empty() {
+            return Vec::new();
+        }
         let by_heat = |a: &u32, b: &u32| {
             self.heat[*b as usize]
                 .total_cmp(&self.heat[*a as usize])
                 .then(a.cmp(b))
         };
         top(&mut hot, limit, by_heat);
+        // Only as many of the coldest slots as there are newcomers are paired.
+        let limit = limit.min(hot.len());
         let mut cold: Vec<(f32, u32, Option<u32>)> = self
             .slots
             .iter()
             .enumerate()
+            .take(self.limit)
             .filter_map(|(s, slot)| match *slot {
                 Slot::Empty => Some((f32::NEG_INFINITY, s as u32, None)),
                 Slot::Ready(e) => Some((self.heat[e as usize], s as u32, Some(e))),
@@ -658,6 +695,26 @@ pub fn lowest_experts(
         .collect()
 }
 
+/// Each layer's slot count of `alloc` with the layer's most routed experts first (`order`,
+/// per layer, hottest first), then the experts `alloc` gave it that are not among them: the
+/// bounded host tier's saved heat picks the first contents, the layers' sizes stay.
+pub fn hottest_experts(alloc: &[Vec<u32>], order: &[Vec<u32>]) -> Vec<Vec<u32>> {
+    alloc
+        .iter()
+        .enumerate()
+        .map(|(l, v)| {
+            let hot = order.get(l).map_or(&[][..], Vec::as_slice);
+            let mut taken = std::collections::HashSet::new();
+            hot.iter()
+                .chain(v)
+                .copied()
+                .filter(|e| taken.insert(*e))
+                .take(v.len())
+                .collect()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -786,6 +843,86 @@ pub fn layers_left_for(lent: &[Option<u64>], need: u64) -> Vec<bool> {
         }
     }
     left
+}
+
+/// [`layers_left_for`] for the bounded host tier, where a slot without VRAM costs a copy over
+/// PCIe per routed token: the candidates whose lent slots held the least routing heat
+/// (`heat[i]`) go first, the later layer of two equal ones before the earlier.
+pub fn layers_left_coldest(lent: &[Option<u64>], heat: &[f32], need: u64) -> Vec<bool> {
+    let mut left = vec![false; lent.len()];
+    let mut order: Vec<usize> = (0..lent.len()).filter(|&i| lent[i].is_some()).collect();
+    let h = |i: usize| heat.get(i).copied().unwrap_or(0.0);
+    order.sort_by(|&a, &b| h(a).total_cmp(&h(b)).then(b.cmp(&a)));
+    let mut sum = 0u64;
+    for i in order {
+        if sum >= need {
+            break;
+        }
+        sum += lent[i].unwrap_or(0);
+        left[i] = true;
+    }
+    left
+}
+
+/// The bytes a layer's slot ranges free when its last `slots` slots stay empty: per kind
+/// (`bytes` a slot), the whole mapping granules (`gran`) in all of them past the first `pad`
+/// bytes ([`expert_pad`]), which stay mapped behind the last slot in use.
+pub fn cut_bytes(bytes: &[usize; 3], pad: &[usize; 3], slots: usize, gran: usize) -> u64 {
+    let g = gran.max(1);
+    (bytes.iter().zip(pad))
+        .map(|(b, p)| ((slots * b).saturating_sub(*p) / g * g) as u64)
+        .sum()
+}
+
+/// ggml-cuda's `MATRIX_ROW_PADDING`: its quantized matmuls of several tokens may read up to
+/// this many values past the end of a weight matrix (it allocates and zeroes as much behind
+/// its own tensors).
+pub const ROW_PADDING: usize = 512;
+
+/// The bytes behind an expert that a matmul of several tokens may read ([`ROW_PADDING`] values
+/// of its type: a row of `row_values` values is `row_bytes`): 288 for Q4_K, 352 for Q5_K, 384
+/// for Q5_1, 544 for Q8_0. They must be mapped memory, and bytes that decode to finite values:
+/// experts of the same layout or zeros (an Inf or NaN scale times the zero activation of the
+/// padding is NaN).
+pub fn expert_pad(row_bytes: usize, row_values: usize) -> usize {
+    (row_bytes * ROW_PADDING).div_ceil(row_values.max(1))
+}
+
+/// [`layers_left_for`] for the bounded host tier, taken evenly: how many slots each of a
+/// device's layers gives up at its end so that `need` bytes stay free, instead of whole
+/// layers' lent slots (a layer without half its slots copies over PCIe for every token routed
+/// to them). `layers[i]`: the bytes of a slot per kind, the bytes that stay mapped behind its
+/// last slot in use ([`expert_pad`]) and the most slots layer `i` may give up (`None`: none).
+/// One slot at a time, from the last layer down, so no two layers differ by more than one slot
+/// (but where a layer reached its most). `None` when they cannot free `need`.
+pub fn even_cuts(
+    layers: &[Option<([usize; 3], [usize; 3], usize)>],
+    gran: usize,
+    need: u64,
+) -> Option<Vec<usize>> {
+    let mut cuts = vec![0usize; layers.len()];
+    let freed = |cuts: &[usize]| -> u64 {
+        (layers.iter().zip(cuts))
+            .filter_map(|(l, &c)| l.as_ref().map(|(b, p, _)| cut_bytes(b, p, c, gran)))
+            .sum()
+    };
+    while freed(&cuts) < need {
+        let mut grew = false;
+        for (i, l) in layers.iter().enumerate().rev() {
+            let Some((_, _, most)) = l else { continue };
+            if cuts[i] < *most {
+                cuts[i] += 1;
+                grew = true;
+                if freed(&cuts) >= need {
+                    return Some(cuts);
+                }
+            }
+        }
+        if !grew {
+            return None;
+        }
+    }
+    Some(cuts)
 }
 
 /// Returns the keep, and [`auto_keep`]'s byte-count keep (the same unless it was lowered).

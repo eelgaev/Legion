@@ -13,6 +13,9 @@ pub struct SlotCache {
     pinned: Vec<bool>,
     /// The current step (starts at 1, so 0 is "never").
     tick: u64,
+    /// Expert -> its routing heat ([`Self::set_heat`]); empty: slots go out least recently
+    /// used first.
+    heat: Vec<f32>,
 }
 
 /// What a step must do to have all its experts in slots.
@@ -32,7 +35,17 @@ impl SlotCache {
             used: vec![0; n_slots],
             pinned: vec![false; n_slots],
             tick: 0,
+            heat: Vec::new(),
         }
+    }
+
+    /// From now on the slot that goes out for a new expert is the one whose expert has the
+    /// least `heat` (per expert: a routing count that decays, the VRAM cache's own), the least
+    /// recently used of those on ties, instead of the least recently used of all. An expert
+    /// routed to often but not in the last steps then outlives one that a single step used.
+    pub fn set_heat(&mut self, heat: &[f32]) {
+        self.heat.clear();
+        self.heat.extend_from_slice(heat);
     }
 
     pub fn n_slots(&self) -> usize {
@@ -112,6 +125,35 @@ impl SlotCache {
         plan
     }
 
+    /// [`Self::plan`] for a step that may need more experts than the slots hold: the experts
+    /// no slot is left for (every slot is this step's or pinned) come back second, in order,
+    /// and are not cached.
+    pub fn plan_some(&mut self, experts: &[usize]) -> (Plan, Vec<usize>) {
+        self.tick += 1;
+        let mut plan = Plan::default();
+        let mut missing = Vec::new();
+        for &e in experts {
+            match self.slot(e) {
+                Some(s) => {
+                    self.used[s] = self.tick;
+                    plan.hits += 1;
+                }
+                None => missing.push(e),
+            }
+        }
+        let mut over = Vec::new();
+        for e in missing {
+            match self.victim() {
+                Some(s) => {
+                    self.assign(e, s);
+                    plan.loads.push((e, s));
+                }
+                None => over.push(e),
+            }
+        }
+        (plan, over)
+    }
+
     /// A prefetch of `experts` (distinct, best first) for the layer's next step: marks the
     /// cached ones used, then gives each other one, while `budget` lasts, an empty slot or the
     /// least recently used one the prediction does not keep. Returns the `(expert, slot)` loads.
@@ -160,13 +202,43 @@ impl SlotCache {
         Some(s)
     }
 
+    /// Takes a slot for bytes that arrive later (the bounded host tier's write-back of an
+    /// expert a VRAM slot drops): an empty one first, else the least recently used one, whose
+    /// expert is evicted. The slot is left empty and pinned until [`Self::put`] or
+    /// [`Self::drop_slot`]. `None`: every slot is pinned or the current step's.
+    pub fn reserve(&mut self) -> Option<usize> {
+        let s = self.victim()?;
+        self.drop_slot(s);
+        self.pinned[s] = true;
+        Some(s)
+    }
+
+    /// Puts `expert` (not cached) into slot `s` that [`Self::reserve`] took, and unpins it.
+    pub fn put(&mut self, expert: usize, s: usize) {
+        debug_assert!(self.slot(expert).is_none() && self.owner[s] < 0);
+        self.assign(expert, s);
+        self.pinned[s] = false;
+    }
+
     fn victim(&self) -> Option<usize> {
         if let Some(s) = (0..self.n_slots()).find(|&s| self.owner[s] < 0 && !self.pinned[s]) {
             return Some(s);
         }
-        (0..self.n_slots())
-            .filter(|&s| self.used[s] < self.tick && !self.pinned[s])
-            .min_by_key(|&s| self.used[s])
+        let free = (0..self.n_slots()).filter(|&s| self.used[s] < self.tick && !self.pinned[s]);
+        if self.heat.is_empty() {
+            return free.min_by_key(|&s| self.used[s]);
+        }
+        let heat = |s: usize| {
+            self.heat
+                .get(self.owner[s] as usize)
+                .copied()
+                .unwrap_or(0.0)
+        };
+        free.min_by(|&a, &b| {
+            heat(a)
+                .total_cmp(&heat(b))
+                .then(self.used[a].cmp(&self.used[b]))
+        })
     }
 
     /// [`Self::victim`] that keeps the experts needed soonest (`next`, [`Self::plan_ahead`]).
