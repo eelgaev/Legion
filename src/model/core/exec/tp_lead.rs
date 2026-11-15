@@ -32,12 +32,12 @@ const MIRRORS_AHEAD: usize = 16;
 /// The prompt tokens before a read-ahead chunk sent with it ([`Executor::tp_prefetch_rows`]).
 const PREFETCH_BEFORE: usize = 32;
 
-/// `LEGION_DEBUG_TP_ROW_HINT=1`: [`Executor::tp_prefetch_rows`] sends the other ranks a
-/// prompt's next chunk to read ahead (for A/B runs only; off, they read each chunk's rows in
-/// its own step).
+/// [`Executor::tp_prefetch_rows`] sends the other ranks a prompt's next chunk to read ahead;
+/// `LEGION_DEBUG_TP_ROW_HINT=0` turns that off (for A/B runs only: then they read each
+/// chunk's rows in its own step).
 fn row_hint() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_TP_ROW_HINT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_TP_ROW_HINT").is_none_or(|v| v != "0"))
 }
 
 /// A control connection to another rank: over the network, or to a thread of this process.
