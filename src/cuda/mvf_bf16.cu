@@ -7,7 +7,8 @@
 // warp sums and then the CTA's warp sums with ggml's own warp_reduce_sum), so every output has
 // its bits. What differs: one launch for all the weights' rows, and each thread loads all its
 // weight words before its first FMA (ggml's loop waits for each load in turn: on a GB10 a
-// 48-row launch at 8 tokens takes ~12 us for ~0.5 MB). A plain launch: the kernel ahead of it
+// 48-row launch at 8 tokens takes ~12 us for ~0.5 MB), and by default a CTA computes four rows
+// from one read of the activations (mvf_bf16_rows_kernel). A plain launch: the kernel ahead of it
 // (the z projection's NVFP4 matvec) lets its dependents start early, and resident CTAs waiting
 // for it would take its SMs' slots.
 
@@ -29,6 +30,7 @@ struct legion_mvf_bf16 {
     float * dst;      // [sum rows, n_tok]: the weights' rows in order, token t at dst + t * dst_ld
     int64_t dst_ld;
     int32_t k, n_tok;
+    int32_t rows_per_cta;  // 2 or 4: mvf_bf16_rows_kernel; else one row a CTA (the same bits)
 };
 
 int legion_mvf_bf16_launch(const legion_mvf_bf16 * p, void * stream);
@@ -125,9 +127,149 @@ __global__ void __launch_bounds__(256) mvf_bf16_kernel(const legion_mvf_bf16 p) 
     }
 }
 
+// RPC (2 or 4) output rows per CTA (#689 round 7): each thread's activation loads feed the
+// FMAs of all its rows (the activations are read from L2 once per CTA, so RPC times less
+// often), and the CTA's warp sums of every (row, token) are added in one pass: all warps
+// store theirs, one barrier, then warp q % warps adds pair q's with ggml's warp_reduce_sum over
+// the same 32 values (the warp sums, zeros past the last warp). Each row's FMAs and sums are
+// those of mvf_bf16_kernel (ggml's), so every output keeps its bits.
+template <int NT, int RPC>
+__global__ void __launch_bounds__(256) mvf_bf16_rows_kernel(const legion_mvf_bf16 p, const int total) {
+    const int tid = threadIdx.x;
+    const int bs = blockDim.x;
+    const int ncols2 = p.k / 2;
+
+    const uint32_t * xb[RPC];
+    bool live[RPC];
+#pragma unroll
+    for (int r = 0; r < RPC; r++) {
+        int row = blockIdx.x * RPC + r;
+        live[r] = row < total;
+        int wi = 0;
+        while (wi + 1 < p.n_w && row >= p.rows[wi]) {
+            row -= p.rows[wi];
+            wi++;
+        }
+        xb[r] = (const uint32_t *) (p.w[wi] + (int64_t) (live[r] ? row : 0) * p.w_ld[wi]);
+    }
+
+    uint32_t pre[RPC][MVF_PRE];
+#pragma unroll
+    for (int i = 0; i < MVF_PRE; i++) {
+        const int col2 = tid + i * bs;
+#pragma unroll
+        for (int r = 0; r < RPC; r++) {
+            pre[r][i] = col2 < ncols2 && live[r] ? __ldg(xb[r] + col2) : 0u;
+        }
+    }
+
+    const float2 * y2 = (const float2 *) p.x;
+    const int64_t y_ld2 = p.x_ld / 2;
+    // The warp sums [row][token][warp], zeros past the last warp.
+    __shared__ float buf[RPC * NT * 32];
+    if (bs > 32) {
+        for (int i = tid; i < RPC * NT * 32; i += bs) {
+            buf[i] = 0.0f;
+        }
+        __syncthreads();
+    }
+
+    float sumf[RPC][NT];
+#pragma unroll
+    for (int r = 0; r < RPC; r++) {
+#pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            sumf[r][j] = 0.0f;
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < MVF_PRE; i++) {
+        const int col2 = tid + i * bs;
+        if (col2 < ncols2) {
+            float2 tmpx[RPC];
+#pragma unroll
+            for (int r = 0; r < RPC; r++) {
+                tmpx[r] = mvf_widen(pre[r][i]);
+            }
+#pragma unroll
+            for (int j = 0; j < NT; ++j) {
+                const float2 tmpy = y2[j * y_ld2 + col2];
+#pragma unroll
+                for (int r = 0; r < RPC; r++) {
+                    ggml_cuda_mad(sumf[r][j], tmpx[r].x, tmpy.x);
+                    ggml_cuda_mad(sumf[r][j], tmpx[r].y, tmpy.y);
+                }
+            }
+        }
+    }
+    for (int col2 = tid + MVF_PRE * bs; col2 < ncols2; col2 += bs) {
+        float2 tmpx[RPC];
+#pragma unroll
+        for (int r = 0; r < RPC; r++) {
+            tmpx[r] = mvf_widen(live[r] ? __ldg(xb[r] + col2) : 0u);
+        }
+#pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            const float2 tmpy = y2[j * y_ld2 + col2];
+#pragma unroll
+            for (int r = 0; r < RPC; r++) {
+                ggml_cuda_mad(sumf[r][j], tmpx[r].x, tmpy.x);
+                ggml_cuda_mad(sumf[r][j], tmpx[r].y, tmpy.y);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < RPC; r++) {
+#pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            sumf[r][j] = warp_reduce_sum<32>(sumf[r][j]);
+        }
+    }
+    if (bs == 32) {
+        if (tid == 0) {
+#pragma unroll
+            for (int r = 0; r < RPC; r++) {
+#pragma unroll
+                for (int j = 0; j < NT; ++j) {
+                    if (live[r]) {
+                        p.dst[(int64_t) j * p.dst_ld + blockIdx.x * RPC + r] = sumf[r][j];
+                    }
+                }
+            }
+        }
+        return;
+    }
+    const int warp = tid / 32;
+    const int lane = tid % 32;
+    if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < RPC; r++) {
+#pragma unroll
+            for (int j = 0; j < NT; ++j) {
+                buf[(r * NT + j) * 32 + warp] = sumf[r][j];
+            }
+        }
+    }
+    __syncthreads();
+    const int nwarps = bs / 32;
+    for (int q = warp; q < RPC * NT; q += nwarps) {
+        const int r = q / NT;
+        const int j = q % NT;
+        const float v = warp_reduce_sum<32>(buf[q * 32 + lane]);
+        if (lane == 0 && blockIdx.x * RPC + r < total) {
+            p.dst[(int64_t) j * p.dst_ld + blockIdx.x * RPC + r] = v;
+        }
+    }
+}
+
 template <int NT>
 void mvf_go(const legion_mvf_bf16 * p, int total, int bs, cudaStream_t s) {
-    mvf_bf16_kernel<NT><<<total, bs, 0, s>>>(*p);
+    switch (p->rows_per_cta) {
+        case 2: mvf_bf16_rows_kernel<NT, 2><<<(total + 1) / 2, bs, 0, s>>>(*p, total); break;
+        case 4: mvf_bf16_rows_kernel<NT, 4><<<(total + 3) / 4, bs, 0, s>>>(*p, total); break;
+        default: mvf_bf16_kernel<NT><<<total, bs, 0, s>>>(*p); break;
+    }
 }
 
 }  // namespace
