@@ -135,6 +135,11 @@ use picks::{Need, Picks, took};
 /// `GGML_ROPE_TYPE_IMROPE`: interleaved multi-section RoPE.
 pub(crate) const ROPE_IMROPE: i32 = 40;
 
+/// Most tokens of a step whose DeltaNet z projection runs before the delta rule (#1176):
+/// ggml-cuda's vector-kernel range. Larger steps keep it late, so prompt steps do not hold z
+/// across the delta rule.
+const Z_EARLY_MAX_TOKENS: i64 = 8;
+
 /// Attention runs over a key span padded to a multiple of this (masked, zero K/V), as llama.cpp's
 /// KV cache view is (`n_kv` is padded to 256). The padding changes nothing mathematically, but
 /// the soft_max and V·softmax reductions then run over the same length as llama.cpp's, and the
@@ -3265,6 +3270,12 @@ impl Model {
                 ),
             },
         };
+        // Decode and verify steps (#1176): z joins the graph here, right after its input, instead
+        // of just before the gated norm, i.e. right after the delta rule, whose state stores are
+        // still dirty in L2 then and get written back during the next weight stream.
+        if h.ne()[1] <= Z_EARLY_MAX_TOKENS {
+            pass.graph.borrow_mut().expand(z);
+        }
         // Small steps: alpha and beta from one matmul (#256), whose strided rows the op reads;
         // BF16 ones of 1-8 tokens from one `mul_mat_vec_f` twin launch (#689).
         let ab_names = ["ssm_alpha.weight", "ssm_beta.weight"];
