@@ -748,8 +748,10 @@ fn bf16_gemv_takes_the_debug_switch() {
     assert_eq!(bf16_gemv_of(Some("0")), 0);
     assert_eq!(bf16_gemv_of(Some(" 0\n")), 0);
     assert_eq!(bf16_gemv_of(Some("1")), 1);
-    assert_eq!(bf16_gemv_of(Some("2")), BF16_GEMV_DEFAULT);
-    assert_eq!(bf16_gemv_of(Some("7")), BF16_GEMV_DEFAULT);
+    assert_eq!(bf16_gemv_of(Some("2")), 2);
+    assert_eq!(bf16_gemv_of(Some("3")), 3);
+    assert_eq!(bf16_gemv_of(Some("4")), BF16_GEMV_DEFAULT);
+    assert_eq!(bf16_gemv_of(Some("x")), BF16_GEMV_DEFAULT);
 }
 
 #[test]

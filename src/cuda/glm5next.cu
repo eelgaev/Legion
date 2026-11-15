@@ -5,7 +5,8 @@
 // - linear: y = scale * ws * (W x) for Q8_0, BF16, F16 or F32 weights, or Project Maya's Q6_K and
 //   Q4_K (glm5next_kquant.cuh). Up to 8 tokens a GEMV
 //   (a warp per row, 32-value blocks per lane, F32 sums; on the GB10 BF16 weights take
-//   linear_mv_bf16, its sums with contiguous loads, #560 r6); more a GEMM on tensor cores through
+//   linear_mv_bf16, its sums with contiguous loads, #560 r6, and at 2-8 tokens linear_mv_bf16x,
+//   x staged once per block, r8); more a GEMM on tensor cores through
 //   the portable WMMA API: 64 x 64 tiles (rows x tokens), K steps of 32, W dequantized and x
 //   rounded to F16 in shared memory. Volta's tensor cores truncate long accumulation chains, so
 //   each 16-deep product goes into a fresh fragment that is added into the F32 sums.
@@ -419,6 +420,197 @@ __global__ void __launch_bounds__(128) linear_mv_bf16(const Lin p) {
         __syncwarp();
     }
     bf16_store<N>(p, r, i, lane, acc);
+}
+
+// ---- BF16 decode GEMV with x staged once per block (#560 r8) ----
+// linear_mv_bf16 at 2-8 tokens reads x from L1 in float4s, lane L 128 bytes from lane L + 1: each
+// warp load touches 32 lines, every line comes in 8 loads a token a step, and the block's 4 warps
+// each read the same x. That is L1-wavefront bound (135-195 GB/s at 4 tokens, 75-110 at 8 on a
+// GB10). linear_mv_bf16x copies each step's x (1024 values a token, contiguous) to shared memory
+// once per block by cp.async, TG tokens a stage and D stages deep, swizzled so that the lanes'
+// float4 reads of their own blocks are conflict free. The weights come in as in linear_mv_bf16
+// (contiguous loads U steps ahead, through the warp's 2 KB of shared memory to the summing lane),
+// one step at a time. Each lane sums its blocks in linear_mv's order for each token (a block's
+// two halves in turn), so every output keeps linear_mv's bits (params[6] 2, the default; sm_80+).
+// `legion lin-bench --gemv` on a GB10 (GLM-5.3-Flash NVFP4's BF16 shapes): 200-250 GB/s at 8
+// tokens (linear_mv_bf16 71-108), 235-252 at 4 for rows of 1536+ values (138-195), the same
+// output bits everywhere; the MLA's k_b (256-value rows, 32 heads) stays at 70-130.
+// N 16 (params[6] 3, an opt-in) takes 9-16 tokens, which otherwise run a GEMM by K tiles with x
+// rounded to F16: there the bits move.
+
+// Where float4 f (float4 f % 8 of block f / 8) of a staged token's step sits: its low 3 bits
+// XOR the block's, so 8 lanes reading float4 c of their own blocks hit 8 distinct 16-byte bank
+// groups, and so do the 8 threads copying one block's float4s.
+__device__ __forceinline__ int bf16_xsw(int f) { return f ^ ((f >> 3) & 7); }
+
+// Half h of a lane's block (two uint4s of BF16 pairs) times one staged token's x (`xs`, its 256
+// float4s of the step): bf16_half's chain.
+__device__ __forceinline__ void bf16_xhalf(uint4 u0, uint4 u1, const float4 * xs, int lane, int h, float & acc) {
+    float v[16];
+    const uint32_t w[8] = {u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w};
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        v[2 * j] = bf16f((uint16_t) (w[j] & 0xFFFF));
+        v[2 * j + 1] = bf16f((uint16_t) (w[j] >> 16));
+    }
+    float x[16];
+#pragma unroll
+    for (int q = 0; q < 4; q++) {
+        const float4 f = xs[bf16_xsw(lane * 8 + 4 * h + q)];
+        x[4 * q] = f.x;
+        x[4 * q + 1] = f.y;
+        x[4 * q + 2] = f.z;
+        x[4 * q + 3] = f.w;
+    }
+    float s = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 16; j++) {
+        s += v[j] * x[j];
+    }
+    acc += s;
+}
+
+template <int N, int U, int TG, int D>
+__global__ void __launch_bounds__(128) linear_mv_bf16x(const Lin p) {
+    static_assert(N % TG == 0 && D >= 2, "linear_mv_bf16x: TG divides N, 2+ stages");
+    pdl_wait();
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    __shared__ uint4 sm[4][128];
+    __shared__ float4 sx[D][TG * 256];
+    const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
+    const int64_t r = (int64_t) blockIdx.x * 4 + warp, i = blockIdx.y;
+    // a warp past the last row still copies x and meets every barrier
+    const bool act = r < p.m;
+    const uint4 * row = (const uint4 *) (p.w + (act ? r : 0) * p.w_nb1 + i * p.w_nb2);
+    float acc[N];
+#pragma unroll
+    for (int t = 0; t < N; t++) {
+        acc[t] = 0.0f;
+    }
+    const int64_t nb = p.k / 32, nq = nb * 4, steps = (nb + 31) / 32;
+    const int nt = p.n < N ? (int) p.n : N, ntg = (nt + TG - 1) / TG;
+    const int64_t stages = steps * ntg;
+    const char * xb = p.x + i * p.x_nbi;
+    // Stage st (step st / ntg, tokens TG (st % ntg) on) into sx[st % D], then one commit group
+    // (empty past the last stage).
+    auto stage = [&](int64_t st) {
+        if (st < stages) {
+            const int64_t g = st / ntg;
+            const int t0 = (int) (st % ntg) * TG;
+            float4 * d = sx[st % D];
+#pragma unroll
+            for (int e = 0; e < 2 * TG; e++) {
+                const int idx = e * 128 + tid, tt = idx / 256, f = idx % 256;
+                if (t0 + tt < nt && g * 32 + f / 8 < nb) {
+                    const float4 * src = (const float4 *) (xb + (int64_t) (t0 + tt) * p.x_nbt) + g * 256 + f;
+                    const uint32_t a = (uint32_t) __cvta_generic_to_shared(d + tt * 256 + bf16_xsw(f));
+                    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(a), "l"(src));
+                }
+            }
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
+    uint4 reg[U][4];
+    if (act) {
+#pragma unroll
+        for (int u = 0; u < U; u++) {
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int64_t q = (int64_t) u * 128 + 32 * e + lane;
+                if (q < nq) {
+                    reg[u][e] = __ldcs(row + q);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int d = 0; d < D - 1; d++) {
+        stage(d);
+    }
+    uint4 * s = sm[warp];
+    int64_t st = 0;
+    for (int64_t g0 = 0; g0 < steps; g0 += U) {
+#pragma unroll
+        for (int u = 0; u < U; u++) {
+            const int64_t g = g0 + u;
+            if (g >= steps) {
+                break;
+            }
+            // step g's weights to the summing lanes, step g + U's loads issued
+            if (act) {
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int ql = 32 * e + lane;
+                    if (g * 128 + ql < nq) {
+                        s[bf16_sw(ql)] = reg[u][e];
+                    }
+                }
+            }
+            __syncwarp();
+            if (act) {
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int64_t q = (g + U) * 128 + 32 * e + lane;
+                    if (q < nq) {
+                        reg[u][e] = __ldcs(row + q);
+                    }
+                }
+            }
+            const int64_t b = g * 32 + lane;
+            const bool on = act && b < nb;
+            uint4 w[4];
+            if (on) {
+#pragma unroll
+                for (int c = 0; c < 4; c++) {
+                    w[c] = s[bf16_sw(4 * lane + c)];
+                }
+            }
+            // (step g + 1 writes s after the barrier of this step's first stage)
+#pragma unroll
+            for (int tg = 0; tg < N / TG; tg++) {
+                if (tg < ntg) {
+                    asm volatile("cp.async.wait_group %0;\n" ::"n"(D - 2));
+                    __syncthreads();
+                    stage(st + D - 1);
+                    if (on) {
+                        const float4 * xs = sx[st % D];
+#pragma unroll
+                        for (int tt = 0; tt < TG; tt++) {
+                            if (tg * TG + tt < nt) {
+                                bf16_xhalf(w[0], w[1], xs + tt * 256, lane, 0, acc[tg * TG + tt]);
+                                bf16_xhalf(w[2], w[3], xs + tt * 256, lane, 1, acc[tg * TG + tt]);
+                            }
+                        }
+                    }
+                    st++;
+                }
+            }
+        }
+    }
+    if (act) {
+        bf16_store<N>(p, r, i, lane, acc);
+    }
+#else
+    __trap();  // dev_sm80() only
+#endif
+}
+
+// Whether params[6] `v` takes p's 9-16 tokens on linear_mv_bf16x too: the opt-in (3), on one
+// matrix of rows of 2048+ values. Shorter rows and the MLA's per-head matrices (k_b, v_b) run
+// faster as the GEMM (`legion lin-bench --gemv --gemv-tokens 12,16 --gemv-kernels 3` on a GB10).
+bool bf16x_wide(int v, const Lin & p) { return v == 3 && p.h == 1 && p.k >= 2048; }
+
+// linear_mv_bf16x for p.n tokens (2-16: N 2, 4, 8 or 16), TG at most N.
+template <int U, int TG, int D> void launch_bf16x(const Lin & p, dim3 grid, cudaStream_t st) {
+    if (p.n == 2) {
+        launch_pdl(linear_mv_bf16x<2, U, (TG < 2 ? TG : 2), D>, grid, 128, 0, st, p);
+    } else if (p.n <= 4) {
+        launch_pdl(linear_mv_bf16x<4, U, (TG < 4 ? TG : 4), D>, grid, 128, 0, st, p);
+    } else if (p.n <= 8) {
+        launch_pdl(linear_mv_bf16x<8, U, TG, D>, grid, 128, 0, st, p);
+    } else {
+        launch_pdl(linear_mv_bf16x<16, U, TG, D>, grid, 128, 0, st, p);
+    }
 }
 
 // Blocks of a row a lane of linear_mv_f32 loads before it sums them (32 float4s).
@@ -1581,10 +1773,26 @@ int launch_linear(const A & a, cudaStream_t st) {
                 launch_pdl(linear_mv_q4k<8>, grid, 128,0, st, p);
             }
         }
-    } else if (p.n <= 8 && wt == T_BF16 && a.params[2] && x16 && a.params[6] == 1) {
-        // params[2]: the GB10 kernels with their GEMV; params[6] (ops::bf16_gemv): the BF16 GEMV
+    } else if (p.n <= 16 && wt == T_BF16 && a.params[2] && x16 && !hin && !oh && a.params[6] >= 1 &&
+               (p.n <= 8 || bf16x_wide(a.params[6], p)) && (p.n == 1 || a.params[6] == 1 || dev_sm80())) {
+        // params[2]: the GB10 kernels with their GEMV; params[6] (ops::bf16_gemv): the BF16 GEMV,
+        // 1 linear_mv_bf16, 2+ linear_mv_bf16x at 2-8 tokens, 3 also at 9-16 (an opt-in)
         const dim3 grid((unsigned) ((p.m + 3) / 4), (unsigned) p.h);
-        if (p.n == 1) {
+        // `legion lin-bench --gemv` on a GB10 picked the stages: 2 tokens a stage 3 deep for rows
+        // under 2048 values (and 9+ tokens), 4 tokens a stage 2 deep otherwise, one weight step
+        // ahead at 5-8 tokens. Rows of 256-511 values at 2 tokens stay on linear_mv_bf16 (one step
+        // a row: the staging latency is not hidden there).
+        if (p.n >= 2 && a.params[6] >= 2 && !(p.n == 2 && p.k < 512)) {
+            if (p.k < 2048 || p.n > 8) {
+                launch_bf16x<2, 2, 3>(p, grid, st);
+            } else if (p.n > 4) {
+                launch_pdl(linear_mv_bf16x<8, 1, 4, 2>, grid, 128, 0, st, p);
+            } else if (p.n > 2) {
+                launch_pdl(linear_mv_bf16x<4, 2, 4, 2>, grid, 128, 0, st, p);
+            } else {
+                launch_pdl(linear_mv_bf16x<2, 2, 2, 2>, grid, 128, 0, st, p);
+            }
+        } else if (p.n == 1) {
             launch_pdl(linear_mv_bf16<1, Bf16U<1>::v>, grid, 128,0, st, p);
         } else if (p.n == 2) {
             launch_pdl(linear_mv_bf16<2, Bf16U<2>::v>, grid, 128,0, st, p);
