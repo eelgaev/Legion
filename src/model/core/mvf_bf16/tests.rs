@@ -141,3 +141,11 @@ fn rows_per_cta_switch() {
     assert_eq!(rows_per_cta_from(Some(" 2 ")), 2);
     assert_eq!(rows_per_cta_from(Some("3")), 4);
 }
+
+#[test]
+fn min_ctas_switch() {
+    assert_eq!(min_ctas_from(None), 1);
+    assert_eq!(min_ctas_from(Some("2")), 2);
+    assert_eq!(min_ctas_from(Some(" 3 ")), 3);
+    assert_eq!(min_ctas_from(Some("4")), 1);
+}

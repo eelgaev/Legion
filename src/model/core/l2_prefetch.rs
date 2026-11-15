@@ -109,6 +109,21 @@ pub fn gdn_z_bytes_from(v: Option<&str>) -> usize {
     mib << 20
 }
 
+/// Bytes of the output projection's weight read into L2 behind z on the side stream (#689
+/// round 14, [`behind_side`]): `LEGION_DEBUG_GDN_OUT_TAIL` in MiB (an A/B probe, up to 64),
+/// else 0 (off); read once.
+pub fn out_tail_bytes() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("LEGION_DEBUG_GDN_OUT_TAIL")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&m| m <= 64)
+            .unwrap_or(0)
+            << 20
+    })
+}
+
 /// `LEGION_DEBUG_GDN_PF_FAR=1` (a probe, read once): the LM head's rows instead of z's.
 pub fn far() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
@@ -159,6 +174,20 @@ pub fn z_side() -> bool {
 /// [`z_side`] for the switch's value `v`.
 pub fn z_side_from(v: Option<&str>) -> bool {
     !v.is_some_and(|v| v.trim() == "0")
+}
+
+/// The sliced-K tile z's GEMM runs on the side stream (#689 round 14, see the module doc):
+/// `LEGION_DEBUG_GDN_Z_TILE=<i>` picks tile `i` of `fp8_mm.cu`'s table (a tuning probe; only
+/// tiles of 16 K warps keep the bits), else the GEMM's own pick (`None`); read once.
+pub fn z_tile() -> Option<u8> {
+    static V: OnceLock<Option<u8>> = OnceLock::new();
+    *V.get_or_init(|| z_tile_from(std::env::var("LEGION_DEBUG_GDN_Z_TILE").ok().as_deref()))
+}
+
+/// [`z_tile`] for the switch's value `v`: a tile index below 20.
+pub fn z_tile_from(v: Option<&str>) -> Option<u8> {
+    v.and_then(|s| s.trim().parse::<u8>().ok())
+        .filter(|&t| t < 20)
 }
 
 /// Whether the prefetch runs on the forked side stream, joined after the layer's output
@@ -234,6 +263,28 @@ pub fn ahead<'a>(
     )
 }
 
+/// A prefetch like [`ahead`] that runs on the side stream right behind the side stream's last
+/// op (z's GEMM, [`on_side`]), not forked from the compute stream: a programmatic dependent
+/// launch that issues its reads as soon as that op's last CTAs are placed, so they fill its
+/// tail and the short kernels after it (#689 round 14). `after` only orders the node on the
+/// host: it must follow the [`side_join`] of that op, which then does not wait for it. Joined
+/// like a side [`ahead`] node ([`join`]).
+pub fn behind_side<'a>(
+    ctx: &'a Context,
+    w: Tensor<'a>,
+    bytes: usize,
+    after: Tensor<'a>,
+) -> Tensor<'a> {
+    let (first, n) = span(0, bytes, w.nbytes());
+    ctx.external_with(
+        &L2_PREFETCH,
+        types::F32,
+        [1, 1, 1, 1],
+        &[w, after],
+        &[first as i32, n as i32, 1, 1],
+    )
+}
+
 /// A node after which the compute stream waits for side-stream prefetch `pf` ([`ahead`] with
 /// `side`), placed after `after`: expanded, it pulls in `after`'s chain first (the order the
 /// graph would have anyway) and runs right behind it. Its F32 `[1]` result holds nothing; for
@@ -299,12 +350,19 @@ unsafe fn cuda_l2_prefetch(
     let Some((base, bytes, on_side)) = (unsafe { plan(dst) }) else {
         return Ok(());
     };
-    if on_side {
-        let s = side::fork(stream)?;
-        launch::launch(base, bytes, s, false)?;
+    if external_params(dst)[3] != 0 {
+        // [`behind_side`]: behind the side stream's last op, issuing at once.
+        let s = side::stream()?;
+        launch::launch(base, bytes, s, true, true)?;
+        crate::ggml::stage_graph::prio::mark_side(s);
         return side::done(s);
     }
-    launch::launch(base, bytes, stream, true)
+    if on_side {
+        let s = side::fork(stream)?;
+        launch::launch(base, bytes, s, false, false)?;
+        return side::done(s);
+    }
+    launch::launch(base, bytes, stream, true, false)
 }
 
 /// A prefetch node's (device address, bytes, on the side stream), or `None` when it launches
@@ -400,6 +458,11 @@ mod side {
         Ok(s.stream)
     }
 
+    /// The current device's side stream, as it is (no fork).
+    pub(super) fn stream() -> Result<*mut c_void, String> {
+        Ok(get()?.stream)
+    }
+
     /// Records the done event on side stream `side` behind what it holds.
     pub(super) fn done(side: *mut c_void) -> Result<(), String> {
         let s = get()?;
@@ -483,19 +546,21 @@ mod launch {
     /// as a programmatic dependent launch where `pdl` (the GPUs [`super::takes`] gives it are
     /// 12.x), else a plain one (the side stream: it starts once the fork's point is complete,
     /// and its `griddepcontrol.wait` returns at once). Paced on the side stream only: on the
-    /// compute stream a paced kernel would hold every kernel after it.
+    /// compute stream a paced kernel would hold every kernel after it. `first`: the reads go
+    /// out before the kernel's `griddepcontrol.wait` (as `LEGION_DEBUG_GDN_PF_LATE=1` does).
     pub(super) fn launch(
         base: usize,
         bytes: usize,
         stream: *mut c_void,
         pdl: bool,
+        first: bool,
     ) -> Result<(), String> {
         let (size, threads) = shape();
         let chunks = bytes.div_ceil(size);
         let mut p = base as *const u8;
         let mut total = bytes as i64;
         let mut chunk = size as i32;
-        let mut late = i32::from(super::late());
+        let mut late = i32::from(first || super::late());
         let mut pace = if pdl { 0 } else { super::pace_ns() as i32 };
         let mut argv = [
             (&mut p as *mut *const u8).cast::<c_void>(),

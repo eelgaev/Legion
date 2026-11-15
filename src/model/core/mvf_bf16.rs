@@ -185,6 +185,26 @@ struct Params {
     k: i32,
     n_tok: i32,
     rows_per_cta: i32,
+    min_ctas: i32,
+}
+
+/// CTAs an SM the four-row kernel's registers are capped for (#689 round 14, so it fits beside
+/// a z GEMM CTA on the side stream): `LEGION_DEBUG_MVF_MINB=2` or `=3`, else 1 (an A/B probe,
+/// the same bits, read once).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn min_ctas() -> i32 {
+    static V: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| min_ctas_from(std::env::var("LEGION_DEBUG_MVF_MINB").ok().as_deref()))
+}
+
+/// [`min_ctas`] for the switch's value `v`: 2 or 3, else 1.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn min_ctas_from(v: Option<&str>) -> i32 {
+    match v.map(str::trim) {
+        Some("2") => 2,
+        Some("3") => 3,
+        _ => 1,
+    }
 }
 
 /// Output rows a CTA computes: 4 (#689 round 7: each CTA reads the activations from L2 once for
@@ -234,6 +254,7 @@ unsafe fn cuda_mvf_bf16(
             k: x.ne[0] as i32,
             n_tok: x.ne[1] as i32,
             rows_per_cta: rows_per_cta(),
+            min_ctas: min_ctas(),
         };
         for i in 0..nw {
             let w = &*dst.src[1 + i];

@@ -3403,6 +3403,13 @@ impl Model {
         {
             // SAFETY: an FP8 matmul node of this context; P_SIDE is one of its parameters.
             unsafe { crate::ggml::set_external_param(zm.raw(), crate::model::fp8::P_SIDE, 1) };
+            // SAFETY: as above; param 1 is the sliced-K GEMM's tile (0: not that GEMM).
+            if let Some(t) = l2_prefetch::z_tile()
+                && crate::ggml::external_params(unsafe { &*zm.raw() })[1] != 0
+            {
+                // SAFETY: as above.
+                unsafe { crate::ggml::set_external_param(zm.raw(), 1, 2 + t as i32) };
+            }
             // qkv first: z forks once it is done, not beside it (both stream weights).
             pass.graph.borrow_mut().expand(qkv);
             pass.graph.borrow_mut().expand(zm);
@@ -3704,6 +3711,18 @@ impl Model {
         if let Some(keep) = z_join {
             let j = l2_prefetch::side_join(ctx, o, &keep);
             pass.graph.borrow_mut().expand(j);
+            // `LEGION_DEBUG_GDN_OUT_TAIL=<MiB>` (#689 round 14, a probe): the output
+            // projection's first rows read into L2 behind z on the side stream, during z's last
+            // wave and the gated norm; joined after the projection ([`Self::delta_net_res`]).
+            let bytes = l2_prefetch::out_tail_bytes();
+            if bytes > 0
+                && let Ok(wo) = self.lw(il, "ssm_out.weight")
+                && l2_prefetch::takes(wo, n)
+            {
+                let node = l2_prefetch::behind_side(ctx, wo, bytes, j);
+                pass.graph.borrow_mut().expand(node);
+                pf_join.set(Some(node));
+            }
         }
         tap.tap("z", il, z);
         // Gated RMS norm: norm(o) * silu(z), or sigmoid(z) (see [`Arch::sigmoid_gate`]); on a

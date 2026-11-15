@@ -31,6 +31,15 @@ fn z_goes_to_the_side_stream_unless_switched_off() {
 }
 
 #[test]
+fn z_tile_switch() {
+    assert_eq!(z_tile_from(None), None);
+    assert_eq!(z_tile_from(Some("13")), Some(13));
+    assert_eq!(z_tile_from(Some(" 0 ")), Some(0));
+    assert_eq!(z_tile_from(Some("20")), None);
+    assert_eq!(z_tile_from(Some("x")), None);
+}
+
+#[test]
 fn a_side_join_keeps_the_side_work_and_its_inputs() {
     let ctx = Context::new(16, 0);
     let x = ctx.new_tensor(types::F32, &[16, 8]);

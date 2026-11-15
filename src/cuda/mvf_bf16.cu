@@ -31,6 +31,8 @@ struct legion_mvf_bf16 {
     int64_t dst_ld;
     int32_t k, n_tok;
     int32_t rows_per_cta;  // 2 or 4: mvf_bf16_rows_kernel; else one row a CTA (the same bits)
+    int32_t min_ctas;      // 2 or 3: four rows a CTA built for that many CTAs an SM (fewer
+                           // registers, the same bits); else 1
 };
 
 int legion_mvf_bf16_launch(const legion_mvf_bf16 * p, void * stream);
@@ -132,9 +134,11 @@ __global__ void __launch_bounds__(256) mvf_bf16_kernel(const legion_mvf_bf16 p) 
 // often), and the CTA's warp sums of every (row, token) are added in one pass: all warps
 // store theirs, one barrier, then warp q % warps adds pair q's with ggml's warp_reduce_sum over
 // the same 32 values (the warp sums, zeros past the last warp). Each row's FMAs and sums are
-// those of mvf_bf16_kernel (ggml's), so every output keeps its bits.
-template <int NT, int RPC>
-__global__ void __launch_bounds__(256) mvf_bf16_rows_kernel(const legion_mvf_bf16 p, const int total) {
+// those of mvf_bf16_kernel (ggml's), so every output keeps its bits. MINB (#689 round 14): the
+// CTAs of 256 threads an SM the registers are capped for (MINB 2: 128 a thread), so a CTA fits
+// on an SM beside a z GEMM CTA of the side stream; the same code, so the same bits.
+template <int NT, int RPC, int MINB>
+__global__ void __launch_bounds__(256, MINB) mvf_bf16_rows_kernel(const legion_mvf_bf16 p, const int total) {
     const int tid = threadIdx.x;
     const int bs = blockDim.x;
     const int ncols2 = p.k / 2;
@@ -266,8 +270,16 @@ __global__ void __launch_bounds__(256) mvf_bf16_rows_kernel(const legion_mvf_bf1
 template <int NT>
 void mvf_go(const legion_mvf_bf16 * p, int total, int bs, cudaStream_t s) {
     switch (p->rows_per_cta) {
-        case 2: mvf_bf16_rows_kernel<NT, 2><<<(total + 1) / 2, bs, 0, s>>>(*p, total); break;
-        case 4: mvf_bf16_rows_kernel<NT, 4><<<(total + 3) / 4, bs, 0, s>>>(*p, total); break;
+        case 2: mvf_bf16_rows_kernel<NT, 2, 1><<<(total + 1) / 2, bs, 0, s>>>(*p, total); break;
+        case 4:
+            if (p->min_ctas == 2) {
+                mvf_bf16_rows_kernel<NT, 4, 2><<<(total + 3) / 4, bs, 0, s>>>(*p, total);
+            } else if (p->min_ctas == 3) {
+                mvf_bf16_rows_kernel<NT, 4, 3><<<(total + 3) / 4, bs, 0, s>>>(*p, total);
+            } else {
+                mvf_bf16_rows_kernel<NT, 4, 1><<<(total + 3) / 4, bs, 0, s>>>(*p, total);
+            }
+            break;
         default: mvf_bf16_kernel<NT><<<total, bs, 0, s>>>(*p); break;
     }
 }
