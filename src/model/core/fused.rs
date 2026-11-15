@@ -341,7 +341,21 @@ pub(super) fn conv_silu_window<'a>(
     w: Tensor<'a>,
     keep: i64,
 ) -> (Tensor<'a>, Tensor<'a>) {
-    conv_silu_node(ctx, x, state, w, keep, None)
+    conv_silu_node(ctx, x, state, w, keep, None, None)
+}
+
+/// [`conv_silu_window`] whose kernel also issues an L2 prefetch of `n` 4 KiB chunks of weight
+/// `pw` from chunk `first` on at its start (#689 round 11, `LEGION_DEBUG_GDN_PF_CONV=1`; a
+/// hint, the outputs keep their bits).
+pub(super) fn conv_silu_window_pf<'a>(
+    ctx: &'a Context,
+    x: Tensor<'a>,
+    state: Tensor<'a>,
+    w: Tensor<'a>,
+    keep: i64,
+    pf: (Tensor<'a>, usize, usize),
+) -> (Tensor<'a>, Tensor<'a>) {
+    conv_silu_node(ctx, x, state, w, keep, None, Some(pf))
 }
 
 /// Threads of a `conv_silu` CUDA block: one q or k head of [`conv_silu_norm`] each.
@@ -379,10 +393,11 @@ pub(super) fn conv_silu_norm<'a>(
         "conv_silu_norm: conv rows"
     );
     let d = w.ne()[0];
-    conv_silu_node(ctx, x, state, w, d - 1, Some((2 * n_k, head_k, eps)))
+    conv_silu_node(ctx, x, state, w, d - 1, Some((2 * n_k, head_k, eps)), None)
 }
 
-/// The `conv_silu` node; `norm`: (heads normalized, head size, eps).
+/// The `conv_silu` node; `norm`: (heads normalized, head size, eps); `pf`: (weight, first
+/// chunk, chunks) to prefetch, see [`conv_silu_window_pf`].
 fn conv_silu_node<'a>(
     ctx: &'a Context,
     x: Tensor<'a>,
@@ -390,6 +405,7 @@ fn conv_silu_node<'a>(
     w: Tensor<'a>,
     keep: i64,
     norm: Option<(i64, i64, f32)>,
+    pf: Option<(Tensor<'a>, usize, usize)>,
 ) -> (Tensor<'a>, Tensor<'a>) {
     let [c, nt, ns, _] = x.ne();
     let [d, wc, _, _] = w.ne();
@@ -408,18 +424,30 @@ fn conv_silu_node<'a>(
     let n_out = c * nt * ns;
     let n_hist = keep * c * ns;
     let (norm_heads, norm_head, eps) = norm.unwrap_or((0, 0, 0.0));
-    let node = ctx.external_with(
-        &CONV_SILU,
-        types::F32,
-        [n_out + n_hist, 1, 1, 1],
-        &[x, state, w],
-        &[
-            keep as i32,
-            norm_heads as i32,
-            norm_head as i32,
-            eps.to_bits() as i32,
-        ],
-    );
+    let params = [
+        keep as i32,
+        norm_heads as i32,
+        norm_head as i32,
+        eps.to_bits() as i32,
+        pf.map_or(0, |p| p.1 as i32),
+        pf.map_or(0, |p| p.2 as i32),
+    ];
+    let node = match pf {
+        Some((pw, ..)) => ctx.external_with(
+            &CONV_SILU,
+            types::F32,
+            [n_out + n_hist, 1, 1, 1],
+            &[x, state, w, pw],
+            &params,
+        ),
+        None => ctx.external_with(
+            &CONV_SILU,
+            types::F32,
+            [n_out + n_hist, 1, 1, 1],
+            &[x, state, w],
+            &params[..4],
+        ),
+    };
     let out = ctx.view_3d(
         node,
         [c, nt, ns],
@@ -533,6 +561,8 @@ struct ConvSilu {
     norm_scale: f32,
     grid: [u32; 3],
     block: u32,
+    pf: *const u8,
+    pf_bytes: i64,
 }
 
 #[cfg(feature = "cuda")]
@@ -553,7 +583,7 @@ unsafe fn cuda_conv_silu(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
         const CHUNK: i64 = 32;
         let params = crate::ggml::external_params(dst);
         let out = dst.data as *mut f32;
-        let p = ConvSilu {
+        let mut p = ConvSilu {
             x: x.data as *const f32,
             x_ld: x_ld as i64,
             x_sd: x_sd as i64,
@@ -583,7 +613,17 @@ unsafe fn cuda_conv_silu(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
                 ns as u32,
             ],
             block: BLOCK,
+            pf: std::ptr::null(),
+            pf_bytes: 0,
         };
+        // conv_silu_window_pf's prefetch: whole 4 KiB chunks, 16-byte aligned.
+        if !dst.src[3].is_null() && params[5] > 0 {
+            let base = (*dst.src[3]).data as usize + params[4] as usize * 4096;
+            if base % 16 == 0 {
+                p.pf = base as *const u8;
+                p.pf_bytes = params[5] as i64 * 4096;
+            }
+        }
         match legion_conv_silu_launch(&p, stream) {
             0 => Ok(()),
             -1 => Err(format!("conv_silu: kernel width {} unsupported", w.ne[0])),

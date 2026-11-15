@@ -57,6 +57,7 @@ pub use joined::{
     set_prompt_z as set_joined_prompt_z,
 };
 pub mod kv_type;
+pub mod l2_prefetch;
 mod linear;
 pub mod media;
 pub mod mmq_ids;
@@ -3304,6 +3305,26 @@ impl Model {
         h: Tensor<'a>,
         res: Option<Tensor<'a>>,
     ) -> Result<Tensor<'a>, ModelError> {
+        let pf_join = std::cell::Cell::new(None);
+        let out = self.delta_net_layer(pass, il, h, res, &pf_join)?;
+        // `LEGION_DEBUG_GDN_PF_FORK=1`: the side stream's z prefetch joins the compute stream
+        // behind the output projection (z never waits for it), in the layer's capture.
+        if let Some(pf) = pf_join.get() {
+            let j = l2_prefetch::join(pass.ctx, pf, out);
+            pass.graph.borrow_mut().expand(j);
+        }
+        Ok(out)
+    }
+
+    /// [`Self::delta_net_res`]'s layer; a side-stream prefetch node it made goes to `pf_join`.
+    fn delta_net_layer<'a>(
+        &'a self,
+        pass: &Pass<'a>,
+        il: usize,
+        h: Tensor<'a>,
+        res: Option<Tensor<'a>>,
+        pf_join: &std::cell::Cell<Option<Tensor<'a>>>,
+    ) -> Result<Tensor<'a>, ModelError> {
         let (ctx, tap, n) = (pass.ctx, &pass.tap, pass.n);
         debug_assert!(
             res.is_none() || !tap.on,
@@ -3361,6 +3382,63 @@ impl Model {
                 ),
             },
         };
+        // `LEGION_DEBUG_GDN_Z_SIDE=1` (#689 round 12, an A/B probe): z's FP8 GEMM on the side
+        // stream right after qkv, beside the small kernels up to the gated norm, which waits for
+        // it ([`l2_prefetch::side_join`], keeping the GEMM's input allocated until then).
+        let mut z_join = None;
+        if l2_prefetch::z_side()
+            && !tap.on
+            && !hp.moe
+            && let Some(zm) = crate::model::fp8::mm_node(ctx, z)
+            && let Ok(wz) = self.lw(il, "attn_gate.weight")
+            && l2_prefetch::takes(wz, n)
+        {
+            // SAFETY: an FP8 matmul node of this context; P_SIDE is one of its parameters.
+            unsafe { crate::ggml::set_external_param(zm.raw(), crate::model::fp8::P_SIDE, 1) };
+            // qkv first: z forks once it is done, not beside it (both stream weights).
+            pass.graph.borrow_mut().expand(qkv);
+            pass.graph.borrow_mut().expand(zm);
+            // SAFETY: a matmul node: src[1] its activations.
+            let x = ctx.wrap(unsafe { (*zm.raw()).src[1] });
+            z_join = Some([zm, x]);
+        }
+        // Dense models' steps of a few users on a GB10 (#689, off by default: no gain): z's
+        // first rows read into L2 while the small kernels between the two projections run
+        // ([`l2_prefetch`]). Expanded here, so the node runs right after qkv; nothing reads
+        // it, so no output changes.
+        let pf = l2_prefetch::gdn_z_bytes();
+        // `LEGION_DEBUG_GDN_PF_CONV=1`: (weight, first chunk, chunks) for a verify step's conv.
+        let mut conv_pf = None;
+        if pf > 0
+            && !tap.on
+            && !hp.moe
+            && let Ok(wz) = self.lw(il, "attn_gate.weight")
+            && l2_prefetch::reads(z, wz)
+            && l2_prefetch::takes(wz, n)
+        {
+            // `LEGION_DEBUG_GDN_PF_FAR=1`: as many of the LM head's bytes, a layer's own span.
+            let head = self
+                .w("output.weight")
+                .ok()
+                .filter(|&w| l2_prefetch::far() && l2_prefetch::takes(w, n));
+            let (w, off) = match head {
+                Some(w) => (w, il * pf % w.nbytes().saturating_sub(pf).max(1)),
+                None => (wz, 0),
+            };
+            if l2_prefetch::in_conv() {
+                // The first verify group's conv takes it (none in other steps: a probe).
+                let (first, chunks) = l2_prefetch::span(off, pf, w.nbytes());
+                conv_pf = Some((w, first, chunks));
+            } else {
+                let side = l2_prefetch::forked();
+                let node = l2_prefetch::ahead(ctx, w, off, pf, qkv, side);
+                pass.graph.borrow_mut().expand(node);
+                if side {
+                    // Joined after the output projection ([`Self::delta_net_res`]).
+                    pf_join.set(Some(node));
+                }
+            }
+        }
         // Small steps: alpha and beta from one matmul (#256), whose strided rows the op reads;
         // BF16 ones of 1-8 tokens from one `mul_mat_vec_f` twin launch (#689).
         let ab_names = ["ssm_alpha.weight", "ssm_beta.weight"];
@@ -3414,7 +3492,10 @@ impl Model {
             let (conv, history) = if sh.verify {
                 // The whole window [history | chunk] for the replay, from the same op.
                 let keep = conv_w.ne()[0] - 1 + nt;
-                fused::conv_silu_window(ctx, qkv, conv_state, conv_w, keep)
+                match conv_pf.take() {
+                    Some(p) => fused::conv_silu_window_pf(ctx, qkv, conv_state, conv_w, keep, p),
+                    None => fused::conv_silu_window(ctx, qkv, conv_state, conv_w, keep),
+                }
             } else if conv_norm {
                 fused::conv_silu_norm(ctx, qkv, conv_state, conv_w, heads, prep_eps)
             } else {
@@ -3608,6 +3689,10 @@ impl Model {
         let o = concat_cols(ctx, outs);
         let o = ctx.reshape_4d(o, [head_v, n_v, n, 1]);
         tap.tap("attn_output", il, o);
+        if let Some(keep) = z_join {
+            let j = l2_prefetch::side_join(ctx, o, &keep);
+            pass.graph.borrow_mut().expand(j);
+        }
         tap.tap("z", il, z);
         // Gated RMS norm: norm(o) * silu(z), or sigmoid(z) (see [`Arch::sigmoid_gate`]); on a
         // GPU one op (`--gated-norm`).

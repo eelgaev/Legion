@@ -30,6 +30,24 @@ static FP8_MM: ExternalOp = ExternalOp {
     cuda: None,
 };
 
+/// Parameter slot of a [`mul_mat`] node: 1 launches it on the side stream of
+/// [`crate::model::core::l2_prefetch::on_side`] (#689 round 12, `LEGION_DEBUG_GDN_Z_SIDE`).
+pub(crate) const P_SIDE: usize = 2;
+
+/// `t`, or its first source, when that is a [`mul_mat`] node (of `ctx`).
+pub(crate) fn mm_node<'a>(ctx: &'a Context, t: Tensor<'a>) -> Option<Tensor<'a>> {
+    // SAFETY: a valid node; its sources are null or valid tensors.
+    let is_mm = |p: *mut ffi::ggml_tensor| unsafe {
+        !p.is_null() && crate::ggml::op_of(p).is_some_and(|op| std::ptr::eq(op, &FP8_MM))
+    };
+    if is_mm(t.raw()) {
+        return Some(t);
+    }
+    // SAFETY: as above.
+    let s = unsafe { (*t.raw()).src[0] };
+    is_mm(s).then(|| ctx.wrap(s))
+}
+
 /// Whether graphs built from now on run W8A16 matmuls of 5-9 tokens on the GEMV
 /// ([`set_small_batch_gemv`]).
 static SMALL_BATCH_GEMV: AtomicBool = AtomicBool::new(false);
@@ -681,11 +699,16 @@ unsafe fn cuda_fp8_mm(
             sliced_k: crate::ggml::external_params(dst)[1] as i64,
         }
     };
-    match unsafe { legion_fp8_mm_launch(&p, stream) } {
+    // SAFETY: the node's device tensors, on `stream` or a stream of the same device.
+    let launch = |s| match unsafe { legion_fp8_mm_launch(&p, s) } {
         0 => Ok(()),
         1 => Err(format!("unsupported FP8 matmul shape: k = {}", p.k)),
         e => Err(format!("CUDA launch failed ({e})")),
+    };
+    if crate::ggml::external_params(dst)[P_SIDE] != 0 {
+        return crate::model::core::l2_prefetch::on_side(stream, launch);
     }
+    launch(stream)
 }
 
 #[cfg(feature = "cuda")]

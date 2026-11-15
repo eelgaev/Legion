@@ -112,3 +112,20 @@ fn sliced_k_split_by_width() {
         assert_eq!(sliced_k_takes(sliced, 16, k), takes, "k {k}");
     }
 }
+
+#[test]
+fn mm_node_finds_the_matmul_under_a_scale() {
+    let ctx = Context::new(16, 0);
+    let w = ctx.new_tensor(types::I8, &[64, 32]);
+    let x = ctx.new_tensor(types::F32, &[64, 8]);
+    let mm = mul_mat(&ctx, w, x, None);
+    let found = mm_node(&ctx, mm).map(|t| t.raw());
+    assert_eq!(found, Some(mm.raw()));
+    let scaled = ctx.scale(mm, 2.0);
+    assert_eq!(mm_node(&ctx, scaled).map(|t| t.raw()), Some(mm.raw()));
+    assert!(mm_node(&ctx, x).is_none());
+    // The side-stream slot is free (zero) on a new node.
+    // SAFETY: a node of the live context.
+    let params = crate::ggml::external_params(unsafe { &*mm.raw() });
+    assert_eq!(params[P_SIDE], 0);
+}
