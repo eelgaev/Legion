@@ -368,6 +368,8 @@ pub struct DevicePlan {
     pub n_embd: usize,
     /// The exact share (x86, see the module docs): the host computes the GPU kernels' bits.
     pub exact: bool,
+    /// The layers' host experts are the bounded host tier's RAM slots (not every expert).
+    pub tiered: bool,
 }
 
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
@@ -605,6 +607,7 @@ pub fn setup(cfg: &CpuShareConfig, devices: Vec<DevicePlan>) -> Result<(), Strin
                     auto: cfg.auto,
                     cap: thr,
                     link_us_per_byte: us_per_byte as f32,
+                    all_upto: pool::all_upto(cfg.auto, d.tiered),
                 })
             }
         };

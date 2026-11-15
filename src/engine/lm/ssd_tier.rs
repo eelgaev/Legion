@@ -182,6 +182,13 @@ pub const HOST_TIER_EMBD_RESERVE: u64 = 128 << 20;
 /// whose compute buffer did not fit (handled, in unified memory) instead of two.
 pub const HOST_TIER_LEND_RESERVE: u64 = 768 << 20;
 
+/// The expert cache's swaps a pass (when `--expert-swaps` is not given) on the
+/// bounded host tier's machine and model with every routed expert in host memory (no tier):
+/// the copies start behind the exact share's pool jobs, a few a layer, on a link the share
+/// keeps mostly idle. Measured on a 4090 with 128 GB (#37 round 16): 48 serves 69.9% of the
+/// routings from VRAM instead of 68.0% with 24, +2.3% decode, the same outputs.
+pub const HOST_TIER_WHOLE_SWAPS: usize = 48;
+
 /// The fewest tokens a staged pass of the bounded host tier is capped to.
 pub const HOST_TIER_MIN_PASS: usize = 1024;
 

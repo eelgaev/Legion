@@ -3843,6 +3843,11 @@ impl LmEngine {
                 cfg.residency.cache_reserve += ssd_tier::HOST_TIER_EMBD_RESERVE;
             }
         }
+        // Every routed expert in host memory there: more swaps a pass, where
+        // `--expert-swaps` is not given (placement only).
+        if tier_whole && !cfg.residency.swaps_given {
+            cfg.residency.swaps.budget = ssd_tier::HOST_TIER_WHOLE_SWAPS;
+        }
         // The other machine's layers and head.
         let hp_file = crate::model::core::Hparams::from_gguf(&gguf)?;
         skip.extend(layout.node_skipped(&gguf, hp_file.n_layer));

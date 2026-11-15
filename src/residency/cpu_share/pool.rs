@@ -83,6 +83,9 @@ pub struct ExactExchange {
     pub cap: u32,
     /// The link's time per byte of an expert the GPU reads over it.
     pub link_us_per_byte: f32,
+    /// `publish` gives the pool every host expert of a step with at most this many (0: none
+    /// past the share), and `auto` learns only from the other jobs ([`all_upto`]).
+    pub all_upto: u32,
 }
 
 // SAFETY: plain addresses of a pinned buffer; the flags order every access (see `Pool`).
@@ -574,6 +577,31 @@ pub fn nudge(thr: u32, gpu_waited: bool, cap: u32) -> u32 {
 /// The least share [`nudge`] leaves a layer, of [`super::THRESHOLD_ONE`] (3%).
 pub const AUTO_MIN: u32 = 32;
 
+/// [`ExactExchange::all_upto`] with `auto` where every routed expert is in host memory (no
+/// bounded host tier, `tiered` false): a decode step's layer has 2-3 host experts, and the
+/// pool computing all of them beat splitting them with the link (the GPU reading the rest
+/// over PCIe while the pool reads the same DRAM) on a 4090 with 128 GB. Steps with more (four
+/// chats at once) race as before. 0 elsewhere. `LEGION_DEBUG_SHARE_ALL_UPTO=<n>` sets it (0:
+/// off), for A/B runs.
+pub fn all_upto(auto: bool, tiered: bool) -> u32 {
+    let debug = std::env::var("LEGION_DEBUG_SHARE_ALL_UPTO")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    all_upto_with(auto, tiered, debug)
+}
+
+/// [`all_upto`] with the debug value given.
+pub fn all_upto_with(auto: bool, tiered: bool, debug: Option<u32>) -> u32 {
+    match debug {
+        Some(n) if auto => n,
+        _ if auto && !tiered => ALL_UPTO,
+        _ => 0,
+    }
+}
+
+/// [`all_upto`]'s default.
+pub const ALL_UPTO: u32 = 3;
+
 /// Runs an exact job (see the `cpu_share` module docs): the pairs' gate and up sums, "gate/up
 /// done", the wait for the GPU's SwiGLU blocks, the down rows. The caller raises "done".
 fn run_exact(s: &Shared, job: &Job) -> ExactStats {
@@ -645,7 +673,8 @@ fn run_exact(s: &Shared, job: &Job) -> ExactStats {
     st.down = t.elapsed();
     // SAFETY: as above (null when the buffer has no such flag: tests).
     st.gpu_waited = unsafe { ex.arrived.as_ref() }.is_some_and(|a| reached(a, job.seq));
-    if e.auto && layer < e.n_layers {
+    // A step the pool takes whole ([`ExactExchange::all_upto`]) says nothing about the race.
+    if e.auto && layer < e.n_layers && miss > e.all_upto {
         let now = (st.gate_up + st.down).as_secs_f64() * 1e6 / st.experts as f64;
         // SAFETY: the layer's words of the buffer; only this thread writes `cost`.
         unsafe {

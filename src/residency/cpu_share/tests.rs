@@ -455,6 +455,20 @@ fn nudge_moves_toward_the_side_that_waited() {
     assert_eq!(t, 512);
 }
 
+#[test]
+fn all_upto_only_with_auto() {
+    use super::pool::{ALL_UPTO, all_upto_with};
+    // Every expert in host memory: the pool takes small steps whole.
+    assert_eq!(all_upto_with(true, false, None), ALL_UPTO);
+    // The bounded host tier, or a fixed share: the split as before.
+    assert_eq!(all_upto_with(true, true, None), 0);
+    assert_eq!(all_upto_with(false, false, None), 0);
+    // The debug value, with auto only (0: off).
+    assert_eq!(all_upto_with(true, false, Some(0)), 0);
+    assert_eq!(all_upto_with(true, true, Some(2)), 2);
+    assert_eq!(all_upto_with(false, false, Some(2)), 0);
+}
+
 /// `n` random block_q8_1 (an f16 scale and sum, 32 quants).
 fn q8_1_blocks(rng: &mut Rng, n: usize) -> Vec<u8> {
     use crate::cpu::gpu_exact::f32_to_f16;
@@ -526,6 +540,7 @@ fn exact_pool_matches_gpu_exact() {
                 auto: true,
                 cap: THRESHOLD_ONE,
                 link_us_per_byte: 1e-4,
+                all_upto: 0,
             }),
         },
     };

@@ -303,9 +303,10 @@ pub(super) struct ModelArgs {
     #[arg(long, value_name = "PATH", conflicts_with = "expert_profile")]
     pub expert_split_misses: Option<PathBuf>,
     /// Experts the cache may copy in per device, per pass (MTP passes included), replacing
-    /// colder ones (0: keep the first fill).
-    #[arg(long, env = "LEGION_EXPERT_SWAPS", default_value_t = SwapRule::default().budget)]
-    pub expert_swaps: usize,
+    /// colder ones (0: keep the first fill). Default: 24; 48 on a Qwen3.8-Flash-Next machine
+    /// with one discrete GPU and every routed expert in host memory.
+    #[arg(long, env = "LEGION_EXPERT_SWAPS", value_name = "N")]
+    pub expert_swaps: Option<usize>,
     /// Per-device copy budgets in place of --expert-swaps, comma-separated in pipeline order
     /// (the GPU holding the first layers first; e.g. `48,24`); devices past the list keep
     /// --expert-swaps. Default: none, --expert-swaps everywhere. For tuning layer-split runs
@@ -1051,10 +1052,11 @@ impl ModelArgs {
             tier_heat: None,
             split_misses: self.expert_split_misses.clone(),
             swaps: SwapRule {
-                budget: self.expert_swaps,
+                budget: self.expert_swaps.unwrap_or(SwapRule::default().budget),
                 margin: self.expert_swap_margin,
                 ratio: self.expert_swap_ratio,
             },
+            swaps_given: self.expert_swaps.is_some(),
             device_swaps: self.expert_swaps_device.clone(),
             decay: self.expert_heat_decay,
             heat_pass_cap: self.expert_heat_pass_cap,

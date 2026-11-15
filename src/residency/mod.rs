@@ -296,6 +296,9 @@ pub struct ResidencyConfig {
     pub split_misses: Option<std::path::PathBuf>,
     /// Swaps per step and their thresholds; a budget of 0 keeps the first fill.
     pub swaps: policy::SwapRule,
+    /// Whether the budget in [`Self::swaps`] was asked for (`--expert-swaps`); if not, the load
+    /// may raise it for the machine (every routed expert in host memory on one GPU).
+    pub swaps_given: bool,
     /// Per-device swap budgets (`--expert-swaps-device`, in the cache's device order),
     /// replacing [`Self::swaps`]' budget on the devices listed; empty: the same everywhere.
     pub device_swaps: Vec<usize>,
@@ -426,6 +429,7 @@ impl Default for ResidencyConfig {
             tier_heat: None,
             split_misses: None,
             swaps: policy::SwapRule::default(),
+            swaps_given: false,
             device_swaps: Vec::new(),
             decay: 0.95,
             heat_pass_cap: 0.0,

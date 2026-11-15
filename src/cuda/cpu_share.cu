@@ -43,6 +43,7 @@ struct legion_cpu_share_publish {
     const uint32_t * thr; // non-null: the share of 1024 to take (threshold unused), host-written
     void * xq_host;       // [n_tok][k / 32] block_q8_1 of x (the exchange buffer)
     uint32_t * n_miss;    // the step's distinct host experts (the exchange buffer)
+    uint32_t all_upto;    // the host takes every host expert of a step with at most this many
 };
 
 struct legion_cpu_share_activate {
@@ -152,7 +153,9 @@ __global__ void publish(const legion_cpu_share_publish p) {
     }
     __syncthreads();
     const uint32_t threshold = p.thr != nullptr ? *(const volatile uint32_t *) p.thr : p.threshold;
-    const uint32_t c = (min(threshold, 1024u) * (uint32_t) n_host + p.dither) >> 10;
+    const uint32_t c = (uint32_t) n_host <= p.all_upto
+        ? (uint32_t) n_host
+        : (min(threshold, 1024u) * (uint32_t) n_host + p.dither) >> 10;
     if (threadIdx.x == 0 && p.n_miss != nullptr) {
         *p.n_miss = (uint32_t) n_host;
     }

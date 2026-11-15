@@ -305,6 +305,7 @@ mod cuda {
         thr: *const u32,
         xq_host: *mut c_void,
         n_miss: *mut u32,
+        all_upto: u32,
     }
 
     #[repr(C)]
@@ -451,6 +452,7 @@ mod cuda {
             n_miss: el.map_or(std::ptr::null_mut(), |e| {
                 (base + e.n_miss as u64) as *mut u32
             }),
+            all_upto: ex.exact.map_or(0, |x| x.all_upto),
         };
         // SAFETY: device tensors of the stream's device; the exchange is mapped for it.
         let e = unsafe { legion_cpu_share_publish_launch(&p, stream) };

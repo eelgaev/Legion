@@ -4235,6 +4235,7 @@ fn share_setup(
                     layers: Vec::new(),
                     n_embd: he.n_embd,
                     exact,
+                    tiered: me.host.is_some(),
                 });
                 plans.last_mut().unwrap()
             }

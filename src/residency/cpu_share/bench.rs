@@ -266,6 +266,7 @@ pub fn run(cfg: &PoolBench, line: &mut dyn FnMut(String)) -> std::io::Result<()>
                                 auto: false,
                                 cap: THRESHOLD_ONE,
                                 link_us_per_byte: 0.0,
+                                all_upto: 0,
                             });
                             let job = Job {
                                 seq,
