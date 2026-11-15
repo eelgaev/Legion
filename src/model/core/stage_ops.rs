@@ -109,6 +109,9 @@ pub(crate) const PURE: &[&str] = &[
     // heads' greedy argmax, a kernel picked by the row length (#827).
     "cluster_topk",
     "cluster_argmax",
+    // A split head's candidates (#1176): the split argmax's first kernel alone, its grid from
+    // the node's shape, written to the node's tensor.
+    "argmax_best",
 ];
 
 /// Pure ops captured in small steps only ([`crate::ggml::stage_graph::small_step`]: decode,

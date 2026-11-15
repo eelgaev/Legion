@@ -68,6 +68,7 @@ pub mod nvfp4_once;
 pub use nvfp4_once::set_nvfp4_once;
 pub mod head_mm;
 pub use head_mm::set_head_mm;
+pub(crate) mod head_split;
 pub mod nvfp4_mvq;
 pub use nvfp4_mvq::set_nvfp4_mvq;
 pub mod q4k_head;
@@ -117,7 +118,8 @@ pub use media::{ImageSpan, Media};
 pub use mtp::{DraftHeadType, MtpGraph, MtpOutput};
 pub use spec::{
     Replay, SpecPool, set_commit_in_verify, set_commit_slots, set_state_defer,
-    set_state_defer_min_seqs, set_state_defer_rows,
+    set_state_defer_min_seqs, set_state_defer_rows, set_tp_commit_in_verify_min_seqs,
+    tp_commit_in_verify_min_seqs,
 };
 pub use state::{KV_BLOCK, KvPool, KvRing, KvTier, SeqState, SplitTier, StatePool, fnv1a};
 
@@ -359,6 +361,10 @@ pub struct Model {
     /// Routed experts read from the checkpoint as steps route to them, when set up
     /// ([`crate::residency::ssd_experts`]; GLM-5.3-Flash NVFP4).
     ssd: Option<crate::residency::ssd_experts::SsdExperts>,
+    /// The bounded host expert tier, when set up ([`crate::residency::host_tier`]: a discrete
+    /// GPU on a machine with less RAM than the experts take). After `experts`, whose ranges map
+    /// its memory.
+    host_tier: Option<std::sync::Arc<crate::residency::host_tier::HostTier>>,
     /// Weight pairs read as one matrix by small steps ([`joined`]), made by the first graph
     /// that asks. Before the weights, whose memory they share.
     joined: std::cell::OnceCell<Option<joined::Joined>>,
@@ -392,6 +398,9 @@ pub struct Model {
     /// The 4-bit copy of the output head the MTP head drafts with
     /// ([`Self::quantize_draft_head`]).
     draft_head: Option<Context>,
+    /// The token ids the MTP head drafts over when they are not the vocabulary's first
+    /// [`Self::draft_vocab`] ([`Self::set_draft_ids`]): ascending.
+    draft_ids: Option<Vec<u32>>,
     /// Where the per-layer n-gram table's rows come from when it is read through a store
     /// ([`crate::residency::lookup_table`]: RAM, page cache or direct SSD reads); `None`: from
     /// the weights' own host memory.
@@ -445,6 +454,11 @@ pub enum MoeKernel {
 /// Smallest batch the fused expert op takes in [`MoeKernel::Auto`]: below it, ggml's
 /// `mul_mat_id` (its MMQ / MMVQ kernels for small batches) is as fast.
 pub const MOE_FFN_MIN_TOKENS: i64 = 64;
+
+/// With the bounded host expert tier ([`crate::residency::host_tier`]), steps of at least
+/// this many tokens run the fused op in place (no staged copies there): the prompt chunks
+/// that staging takes elsewhere. Smaller steps keep the graph they have without the tier.
+pub const HOST_TIER_FUSED_TOKENS: i64 = 256;
 
 /// Where a weight lives when the model runs on a GPU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -615,6 +629,10 @@ pub struct GroupShape {
     /// paired MoE layers share their experts with the other GPU of its NVLink pair. Kept apart
     /// from the other steps' graphs.
     pub(crate) pair: bool,
+    /// A greedy step whose head is split over the two ranks of tensor parallelism
+    /// ([`head_split`]): the share of the vocabulary this graph's head covers (1: rank 0's, 2:
+    /// rank 1's), its argmax output the share's candidates. 0: the whole head.
+    pub(crate) head_half: u8,
     /// Image tokens of the group's sequences ([`Media`]), whose input rows replace their token
     /// embeddings.
     pub(crate) img: usize,
@@ -659,6 +677,7 @@ impl GroupShape {
             kv_slots: Vec::new(),
             par: false,
             pair: false,
+            head_half: 0,
             img: g
                 .seqs
                 .iter()
@@ -1577,6 +1596,7 @@ impl Model {
         Ok(Self {
             experts: None,
             ssd: None,
+            host_tier: None,
             joined: Default::default(),
             router_bf16: Default::default(),
             host_pins: None,
@@ -1592,6 +1612,7 @@ impl Model {
             widened: None,
             requant: None,
             draft_head: None,
+            draft_ids: None,
             ngram: None,
             ple_late: Default::default(),
             ple_ahead: Default::default(),
@@ -1627,6 +1648,7 @@ impl Model {
         Ok(Self {
             experts: None,
             ssd: None,
+            host_tier: None,
             joined: Default::default(),
             router_bf16: Default::default(),
             host_pins: None,
@@ -1642,6 +1664,7 @@ impl Model {
             widened: None,
             requant: None,
             draft_head: None,
+            draft_ids: None,
             ngram: None,
             ple_late: Default::default(),
             ple_ahead: Default::default(),
@@ -1669,6 +1692,17 @@ impl Model {
     /// must have been left out of the load).
     pub fn set_ssd_experts(&mut self, ssd: crate::residency::ssd_experts::SsdExperts) {
         self.ssd = Some(ssd);
+    }
+
+    /// The routed experts' host memory is `tier`'s RAM slots from now on (their tensors must
+    /// have been left out of the load); the expert cache built next reads through it.
+    pub fn set_host_tier(&mut self, tier: std::sync::Arc<crate::residency::host_tier::HostTier>) {
+        self.host_tier = Some(tier);
+    }
+
+    /// The bounded host expert tier, when set up.
+    pub fn host_tier(&self) -> Option<&std::sync::Arc<crate::residency::host_tier::HostTier>> {
+        self.host_tier.as_ref()
     }
 
     /// The SSD expert tier, when set up.
@@ -1812,6 +1846,23 @@ impl Model {
     /// The draft vocabulary set by [`Self::set_draft_vocab`].
     pub(crate) fn draft_vocab(&self) -> usize {
         self.draft_vocab
+    }
+
+    /// MTP drafts from now on over the tokens `ids` (ascending, each below the vocabulary's
+    /// size) instead of the vocabulary's first [`Self::draft_vocab`]: the executor copies those
+    /// rows of the output head when it enables the head ([`Self::copy_draft_head`], or
+    /// [`Self::quantize_draft_head`] with `--spec-draft-lm-head q4`). glm5-next (#1172).
+    pub fn set_draft_ids(&mut self, ids: Vec<u32>) {
+        debug_assert!(
+            ids.windows(2).all(|p| p[0] < p[1]),
+            "draft ids not ascending"
+        );
+        self.draft_ids = Some(ids);
+    }
+
+    /// The token ids set by [`Self::set_draft_ids`], if any.
+    pub(crate) fn draft_ids(&self) -> Option<&[u32]> {
+        self.draft_ids.as_deref()
     }
 
     /// How the fused expert op keeps per-pair outputs from now on (default:
@@ -2142,6 +2193,8 @@ impl Model {
             .or_else(|| self.widened.as_ref().and_then(|c| c.tensor(name)))
             .or_else(|| self.weights.get(name))
             .or_else(|| self.mtp.as_ref().and_then(|m| m.get(name)))
+            // The bounded host tier: a layer's routed experts are its RAM slot tensors.
+            .or_else(|| self.host_tier.as_ref().and_then(|h| h.tensor(name)))
             .ok_or_else(|| ModelError::Tensor(name.into()))
     }
 
@@ -2446,6 +2499,27 @@ impl Model {
             .strip_suffix(".weight")
             .and_then(|b| self.w(&format!("{b}.input_scale")).ok());
         self.linear.mul_mat(ctx, name, w, scale, input_scale, x)
+    }
+
+    /// Whether a greedy step's head may run as two shares of the vocabulary on the two ranks
+    /// of tensor parallelism ([`head_split`], `--tp-head-split`): an architecture whose split
+    /// head was shown to keep the text ([`Arch::head_splits`]), with the core's head as a
+    /// plain matmul of `output.weight` (no scale, no FP8 activation scale) in one GPU's
+    /// memory, and a vocabulary that splits ([`head_split::vocab_fits`]).
+    pub(crate) fn head_splits(&self) -> bool {
+        let name = "output.weight";
+        let Ok(w) = self.w(name) else {
+            return false;
+        };
+        self.hp.arch.head_splits()
+            && crate::model::cluster_select::on_cuda()
+            && !w.is_meta()
+            && !w.is_host()
+            && w.ne()[2] == 1
+            && w.ne()[1] == self.hp.n_vocab
+            && head_split::vocab_fits(w.ne()[1] as usize)
+            && linear::scale_name(name).is_none_or(|s| self.w(&s).is_err())
+            && self.w("output.input_scale").is_err()
     }
 
     /// Whether the LM head `name` (`w`) for `x` runs on [`head_mm`]: [`head_mm::takes`], and
@@ -3168,7 +3242,20 @@ impl Model {
                         Err(_) => "token_embd.weight",
                     };
                     let w = self.w(head)?;
+                    let half = shape.first().map_or(0, |g| g.head_half);
                     match arch.logit_softcap() {
+                        // This rank's share of a split head ([`head_split`], #1176): the
+                        // logits of its vocabulary rows and each output row's candidates
+                        // among them.
+                        _ if half != 0 => {
+                            let (off, rows) = head_split::range(w.ne()[1] as usize, half);
+                            let nb1 = w.nb()[1];
+                            let part = ctx.view_2d(w, [w.ne()[0], rows as i64], nb1, off * nb1);
+                            let logits = self.linear.mul_mat(ctx, head, part, None, None, x)?;
+                            let logits = arch.logits(ctx, logits);
+                            let best = crate::model::cluster_select::argmax_best(ctx, logits);
+                            (logits, best)
+                        }
                         // A BF16 head of verify steps of many sequences, matmul, soft-cap and
                         // argmax in one pass with ggml's bits (#1181).
                         Some(cap) if self.head_mm_takes(head, w, x) => {
@@ -3371,10 +3458,11 @@ impl Model {
                 None => {
                     // A pool that defers its commits stores the inputs in the delta rule
                     // (`gdn::rows_replay`), after it reads the last step's kept ones there; a
-                    // packed one that does not (no GPU counts) by copies (`store`).
+                    // packed one that does not (no GPU counts) by copies (`store`). A pool with
+                    // both stores (#1176) defers its wide steps only (`SpecPool::replays`).
                     let views = sh.verify.then(|| pass.spec.expect("checked in build"));
                     let views = views
-                        .filter(|spec| !spec.packed())
+                        .filter(|spec| !spec.packed() && !spec.replays(sh.n_seqs))
                         .map(|spec| spec.token_views(ctx, il, sh.slot, nt, ns));
                     let store = views.map(|[q, k, v_pool, g, beta]| {
                         // v is a view of the conv output: a copy.
@@ -3412,6 +3500,7 @@ impl Model {
                 // A verify step reads the rows only: its states advance in the commit.
                 let spec = pass.spec.expect("checked in build");
                 let replay = spec.replay_views(ctx, il, sh.slot, sh.n_seqs);
+                let replays = replay.is_some();
                 let rows = if let Some((keep, replay, arrive)) = replay {
                     // The last commit deferred into this step (#836 part 14): a pool that
                     // defers has no other way to run it. The op then stores this step's inputs
@@ -3434,7 +3523,7 @@ impl Model {
                 };
                 let conv_in = conv_in.expect("a verify group's conv input");
                 let mut graph = pass.graph.borrow_mut();
-                if stored || spec.defers() {
+                if stored || replays {
                     // The op wrote q, k, g and beta already, and v is copied; or the delta rule
                     // stored them over the packed rows (`rows_replay`).
                     spec.store_window(ctx, &mut graph, il, sh.slot, conv_in);
@@ -4279,7 +4368,10 @@ impl Model {
                         moe_ffn::moe_ffn_shexp(ctx, x, ids, w2, refs(ws), pair, shexp)
                     });
                 }
-                if summed.is_none() && fused == Some(MoeKernel::Fused) {
+                // The bounded host tier has no staged copies: its prompt chunks run the fused
+                // op in place, over the RAM slots and the staging buffer.
+                let in_place = t.bounded() && n >= HOST_TIER_FUSED_TOKENS;
+                if summed.is_none() && (fused == Some(MoeKernel::Fused) || in_place) {
                     // Forced: in place (on a GPU, host experts over the link).
                     summed = Some(moe_ffn::moe_ffn_shexp(
                         ctx,
@@ -4316,9 +4408,18 @@ impl Model {
                         // The missed experts on a side stream beside the cached ones (#253).
                         let w = [w_gate, w_up, t.weight(2)];
                         // The host computes a share of the missed experts (#268, opt-in).
+                        // Laid out as the plain path below (the same pre-quantized gate and
+                        // up, no memory of its own), so ggml's fusions see the same graph.
                         let shared = t.cpu_share(n).and_then(|share| {
-                            let (slots, n_expert) = (t.n_slots(), t.n_expert());
-                            cpu_share::ops::glu_down(ctx, w, x, ids, slots, n_expert, il, share)
+                            let xq =
+                                h_q8_1.filter(|&q| expert_mv::glu_preq_fits(w_gate, x, ids, q));
+                            let layer = cpu_share::ops::ShareLayer {
+                                n_slots: t.n_slots(),
+                                n_expert: t.share_experts(),
+                                layer: il,
+                                threshold: share,
+                            };
+                            cpu_share::ops::glu_down(ctx, w, (x, ids, xq), t.share_ids()?, layer)
                         });
                         let split = shared.or_else(|| {
                             (!t.gathers(n))

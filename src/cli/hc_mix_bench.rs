@@ -22,6 +22,11 @@ pub struct HcMixBenchArgs {
     /// timing; fails on any differing byte.
     #[arg(long)]
     check: bool,
+    /// The GB10 kernels' choices (down rows staged whole or through a ring, the norm launched
+    /// plainly or early) instead of the V100 variants, without the block input's Q8_1 blocks
+    /// (the GB10 kernels do not write them).
+    #[arg(long)]
+    gb10: bool,
 }
 
 pub fn run(args: HcMixBenchArgs) -> anyhow::Result<()> {
@@ -29,8 +34,11 @@ pub fn run(args: HcMixBenchArgs) -> anyhow::Result<()> {
     let mut cfg = Config {
         copies: args.copies,
         rounds: args.rounds,
+        quant: !args.gb10,
+        gb10: args.gb10,
         ..Config::default()
     };
+    let reference = bench::choices(&cfg)[0].name;
     if !args.tokens.is_empty() {
         cfg.tokens = args.tokens.clone();
     }
@@ -54,15 +62,17 @@ pub fn run(args: HcMixBenchArgs) -> anyhow::Result<()> {
     let rows = bench::run(&mut gpu, &cfg).map_err(anyhow::Error::msg)?;
     println!(
         "{:>6} {:<8} {:>9} {:>7} {:>7}",
-        "tokens", "variant", "µs", "GB/s", "vs ahead"
+        "tokens",
+        "variant",
+        "µs",
+        "GB/s",
+        format!("vs {reference}")
     );
     for n in &cfg.tokens {
-        let of = |name: &str| {
-            rows.iter()
-                .find(|r| r.tokens == *n && r.variant == name)
-                .map_or(f64::NAN, |r| r.secs)
-        };
-        let reference = of("ahead");
+        let base = rows
+            .iter()
+            .find(|r| r.tokens == *n && r.variant == reference)
+            .map_or(f64::NAN, |r| r.secs);
         for r in rows.iter().filter(|r| r.tokens == *n) {
             println!(
                 "{:>6} {:<8} {:>9.2} {:>7.1} {:>7.3}",
@@ -70,7 +80,7 @@ pub fn run(args: HcMixBenchArgs) -> anyhow::Result<()> {
                 r.variant,
                 r.secs * 1e6,
                 r.bytes / r.secs / 1e9,
-                r.secs / reference,
+                r.secs / base,
             );
         }
     }

@@ -51,6 +51,15 @@ static ARGMAX: ExternalOp = ExternalOp {
     cuda: None,
 };
 
+static ARGMAX_BEST: ExternalOp = ExternalOp {
+    name: "argmax_best",
+    cpu: cpu_argmax_best,
+    #[cfg(feature = "cuda")]
+    cuda: Some(cuda::argmax_best),
+    #[cfg(not(feature = "cuda"))]
+    cuda: None,
+};
+
 /// CTAs per row: the portable cluster size.
 pub const CLUSTER: u32 = 8;
 
@@ -189,6 +198,91 @@ pub fn argmax_of<'a>(ctx: &'a Context, x: Tensor<'a>, w: Tensor<'_>) -> Tensor<'
     }
 }
 
+/// No candidate in a part of [`argmax_best`] (a row's values all at or below `-f32::MAX`, or NaN).
+pub(crate) const BEST_NONE: u32 = u32::MAX;
+
+/// Each row's best candidates by slice instead of its argmax: I32 `[2 * parts, rows]`
+/// ([`argmax_parts`] slices a row), per slice the bits of its largest value above `-f32::MAX`
+/// and that value's [`best_rank`] ([`BEST_NONE`] without one), which [`join_best`] turns into
+/// the row's [`argmax`] and its value. For a head computed in pieces on several GPUs (each
+/// its own columns, #1176): the pieces' picks compare by value, then rank. `x`: F32 `[n,
+/// rows]`, contiguous, on a GPU of any kind (not a meta device) or the CPU.
+pub fn argmax_best<'a>(ctx: &'a Context, x: Tensor<'a>) -> Tensor<'a> {
+    let [n, rows, ..] = x.ne();
+    ctx.external(
+        &ARGMAX_BEST,
+        types::I32,
+        [2 * argmax_parts(n), rows, 1, 1],
+        &[x],
+    )
+}
+
+/// [`argmax_rank`] in the 32 bits the kernels keep (columns below 2^31).
+pub(crate) fn best_rank(col: usize) -> u32 {
+    let t = (col % 1024) as u32;
+    let rev5 = |v: u32| v.reverse_bits() >> 27;
+    (rev5(t >> 5) << 26) | (rev5(t & 31) << 21) | (col >> 10) as u32
+}
+
+/// The column of a [`best_rank`].
+pub(crate) fn best_col(rank: u32) -> usize {
+    let rev5 = |v: u32| v.reverse_bits() >> 27;
+    (((rank & 0x1f_ffff) << 10) | (rev5(rank >> 26) << 5) | rev5((rank >> 21) & 31)) as usize
+}
+
+/// Whether candidate `(v, r)` beats `(bv, br)`: larger, or equal and earlier in the tie order
+/// (the kernels' `am_better`).
+fn best_beats(v: f32, r: u32, bv: f32, br: u32) -> bool {
+    v > bv || (v == bv && r < br)
+}
+
+/// One row of [`argmax_best`]: `(value bits, rank)` of each of `parts` slices of `row`, as the
+/// kernel slices it.
+pub(crate) fn best_row(row: &[f32], parts: usize) -> Vec<(u32, u32)> {
+    let n = row.len();
+    let slice = (n.div_ceil(parts.max(1)) + 3) & !3;
+    (0..parts)
+        .map(|p| {
+            let lo = n.min(p * slice);
+            let hi = n.min(lo + slice);
+            let (mut bv, mut br) = (-f32::MAX, BEST_NONE);
+            for (c, &v) in row.iter().enumerate().take(hi).skip(lo) {
+                if v > -f32::MAX {
+                    let r = best_rank(c);
+                    if best_beats(v, r, bv, br) {
+                        (bv, br) = (v, r);
+                    }
+                }
+            }
+            (bv.to_bits(), br)
+        })
+        .collect()
+}
+
+/// The rows' picks from what [`argmax_best`] wrote (`best`, read back as it is: `rows` rows of
+/// the same number of `(value bits, rank)` pairs): each row's argmax as [`argmax`] gives it
+/// (`u32::MAX` for its -1) and that column's value (`-f32::MAX` without one).
+pub(crate) fn join_best(best: &[u32], rows: usize) -> (Vec<u32>, Vec<f32>) {
+    let per = if rows == 0 { 0 } else { best.len() / rows };
+    let (mut cols, mut vals) = (Vec::with_capacity(rows), Vec::with_capacity(rows));
+    for row in best.chunks_exact(per.max(2)).take(rows) {
+        let (mut bv, mut br) = (-f32::MAX, BEST_NONE);
+        for c in row.chunks_exact(2) {
+            let (v, r) = (f32::from_bits(c[0]), c[1]);
+            if best_beats(v, r, bv, br) {
+                (bv, br) = (v, r);
+            }
+        }
+        cols.push(if br == BEST_NONE {
+            u32::MAX
+        } else {
+            best_col(br) as u32
+        });
+        vals.push(bv);
+    }
+    (cols, vals)
+}
+
 /// `argmax_f32`'s order among equal maxima for column `col` (lower wins): thread `t = col %
 /// 1024` scans columns `t, t + 1024, ...` keeping the first strictly larger value, then two
 /// xor-butterflies keep the larger value and otherwise their own, so the pick is the lowest
@@ -246,6 +340,23 @@ unsafe fn cpu_argmax(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
             let row =
                 std::slice::from_raw_parts((x.data as *const u8).add(r * x.nb[1]) as *const f32, n);
             *(dst.data as *mut i32).add(r) = argmax_row(row);
+        }
+    }
+}
+
+unsafe fn cpu_argmax_best(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
+    // SAFETY: a node made by `argmax_best`, host tensors.
+    unsafe {
+        let x = &*dst.src[0];
+        let (n, rows, parts) = (x.ne[0] as usize, x.ne[1] as usize, dst.ne[0] as usize / 2);
+        for r in (ith..rows).step_by(nth) {
+            let row =
+                std::slice::from_raw_parts((x.data as *const u8).add(r * x.nb[1]) as *const f32, n);
+            let out = (dst.data as *mut u8).add(r * dst.nb[1]) as *mut u32;
+            for (p, (v, rank)) in best_row(row, parts).into_iter().enumerate() {
+                *out.add(2 * p) = v;
+                *out.add(2 * p + 1) = rank;
+            }
         }
     }
 }
@@ -626,6 +737,50 @@ mod cuda {
                 "cluster_argmax",
                 legion_argmax_cluster_kernel,
                 rows as u32,
+                &mut p,
+                stream,
+            )
+        }
+    }
+
+    /// The split argmax's first launch alone, its parts written to the node's tensor.
+    pub(super) unsafe fn argmax_best(
+        dst: &ffi::ggml_tensor,
+        stream: *mut c_void,
+    ) -> Result<(), String> {
+        // SAFETY: a node made by `argmax_best`, device tensors of the stream's device.
+        unsafe {
+            let x = &*dst.src[0];
+            let (n, rows, parts) = (x.ne[0], x.ne[1], dst.ne[0] / 2);
+            if x.nb[0] != 4
+                || n <= 0
+                || n > i32::MAX as i64
+                || rows <= 0
+                || parts <= 0
+                || dst.ne[1] != rows
+                || dst.nb[1] as i64 != 8 * parts
+            {
+                return Err("argmax_best: unsupported shape".into());
+            }
+            let mut p = ArgmaxSplit {
+                x: x.data as *const f32,
+                x_nb1: x.nb[1] as i64,
+                dst: std::ptr::null_mut(),
+                part: dst.data,
+                n: n as i32,
+                rows: rows as i32,
+                parts: parts as i32,
+            };
+            let grid = Dim3 {
+                x: parts as u32,
+                y: rows as u32,
+                z: 1,
+            };
+            launch_plain(
+                "argmax_best",
+                legion_argmax_split_kernel,
+                grid,
+                THREADS,
                 &mut p,
                 stream,
             )

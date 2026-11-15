@@ -70,7 +70,10 @@ fn expert_split_misses_flag() {
 fn expert_swap_rule_flags() {
     let d = residency(&[]);
     assert_eq!(d.swaps, SwapRule::default());
+    assert!(!d.swaps_given);
     assert_eq!(d.decay, ResidencyConfig::default().decay);
+    // The default's own value given is still given (the load keeps it).
+    assert!(residency(&["--expert-swaps", "24"]).swaps_given);
     // Values other than the defaults, so an unwired flag shows.
     let c = residency(&[
         "--expert-swaps",

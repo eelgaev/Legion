@@ -27,6 +27,7 @@ fn json_overrides_thinking_and_template_kwargs() {
         ctx_size: 128,
         max_waiting: 1,
         queued: Default::default(),
+        warming: Default::default(),
         stats: Default::default(),
         submit: None,
         worker: None,

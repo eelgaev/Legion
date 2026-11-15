@@ -134,6 +134,11 @@ fn spill_map(t: &SpillType, size: usize) -> Result<Box<SpillBuffer>, String> {
         host_bytes: total - vram_bytes,
         mapped: (false, false),
     });
+    // Where a step buffer's allocation time goes (debug level): VRAM part made, host part
+    // made, access set.
+    let t0 = std::time::Instant::now();
+    let mut laps = [0u32; 3];
+    let mut lap = |i: usize| laps[i] = t0.elapsed().as_micros() as u32;
     // SAFETY: reserves, creates and maps within the new range; on failure releases it.
     let r = unsafe {
         (|| -> Result<(), String> {
@@ -153,6 +158,7 @@ fn spill_map(t: &SpillType, size: usize) -> Result<Box<SpillBuffer>, String> {
                 )?;
                 b.mapped.0 = true;
             }
+            lap(0);
             if b.host_bytes > 0 {
                 let prop = host_prop(t.node);
                 cu(
@@ -165,10 +171,20 @@ fn spill_map(t: &SpillType, size: usize) -> Result<Box<SpillBuffer>, String> {
                 )?;
                 b.mapped.1 = true;
             }
+            lap(1);
             let a = access(CU_MEM_LOCATION_TYPE_DEVICE, t.device as i32);
-            cu(cuMemSetAccess(b.va, total, &a, 1), "cuMemSetAccess(spill)")
+            let r = cu(cuMemSetAccess(b.va, total, &a, 1), "cuMemSetAccess(spill)");
+            lap(2);
+            r
         })()
     };
+    tracing::debug!(
+        vram_us = laps[0],
+        host_us = laps[1].saturating_sub(laps[0]),
+        access_us = laps[2].saturating_sub(laps[1]),
+        mib = total >> 20,
+        "spill buffer allocation"
+    );
     if let Err(e) = r {
         b.release();
         return Err(e);

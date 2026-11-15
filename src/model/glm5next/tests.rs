@@ -140,3 +140,37 @@ fn decode_mv_raises_the_limit_for_plain_decode_only() {
     // Verify steps stay verify steps either way.
     assert!(mv_pass([(true, 3), (false, 1)], true));
 }
+
+#[test]
+fn draft_rows_takes_the_first_draft_vocab_rows_below_the_head() {
+    use super::mtp::draft_rows;
+    assert_eq!(draft_rows(0, 154880), 154880);
+    assert_eq!(draft_rows(65536, 154880), 65536);
+    assert_eq!(draft_rows(154880, 154880), 154880);
+    assert_eq!(draft_rows(200000, 154880), 154880);
+}
+
+#[test]
+fn draft_ids_add_the_number_tokens_past_the_first_rows() {
+    use super::mtp::draft_ids;
+    let pieces: [&[u8]; 10] = [
+        b"a",
+        b"1",
+        b" the",
+        b"12",
+        b" 345",
+        b"x9",
+        b" ",
+        b"",
+        b"\xe4\xb8\x80",
+        b"  7",
+    ];
+    let piece = |i: u32| pieces[i as usize];
+    // The first 3, then the digit-only pieces with at most one leading space.
+    assert_eq!(draft_ids(3, 10, piece), Some(vec![0, 1, 2, 3, 4]));
+    // No number token past the first rows: just them, so none.
+    assert_eq!(draft_ids(5, 10, piece), None);
+    // 0 or the whole head: every row.
+    assert_eq!(draft_ids(0, 10, piece), None);
+    assert_eq!(draft_ids(10, 10, piece), None);
+}
