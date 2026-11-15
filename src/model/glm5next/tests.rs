@@ -142,6 +142,36 @@ fn decode_mv_raises_the_limit_for_plain_decode_only() {
 }
 
 #[test]
+fn share_levels_from_the_environment() {
+    assert_eq!(share_level_of(None), SHARE_LEVEL_DEFAULT);
+    assert_eq!(share_level_of(Some("0")), 0);
+    assert_eq!(share_level_of(Some(" 2 ")), 2);
+    assert_eq!(share_level_of(Some("9")), SHARE_LEVEL_DEFAULT);
+    assert_eq!(share_level_of(Some("x")), SHARE_LEVEL_DEFAULT);
+}
+
+#[test]
+fn the_qsa_cut_gives_the_later_tokens_fewer() {
+    // A 32K prompt's 4th 4096-token step (pools of 4 positions, 4096 listed): rank 0 takes
+    // more than half of the tokens, the costs about equal.
+    let cut = qsa_cut(4096, 4096, 4);
+    assert!((2150..2300).contains(&cut), "{cut}");
+    let cost =
+        |r: std::ops::Range<usize>| -> f64 { r.map(|i| 3584.0 - (4095 - i) as f64 / 4.0).sum() };
+    let (a, b) = (cost(0..cut), cost(cut..4096));
+    assert!((a - b).abs() / (a + b) < 0.002, "{a} {b}");
+    // Later steps grow less unequal: the cut nears the middle.
+    let later = qsa_cut(4096, 6144, 4);
+    assert!(later < cut && later > 2048, "{later}");
+    // Too few tokens for two shares of 8: the even shares.
+    assert_eq!(qsa_cut(15, 4096, 4), 0);
+    assert_eq!(qsa_cut(4096, 4096, 0), 0);
+    // Every share keeps at least 8 tokens.
+    let c = qsa_cut(16, 64, 4);
+    assert!(c == 0 || c == 8, "{c}");
+}
+
+#[test]
 fn draft_rows_takes_the_first_draft_vocab_rows_below_the_head() {
     use super::mtp::draft_rows;
     assert_eq!(draft_rows(0, 154880), 154880);

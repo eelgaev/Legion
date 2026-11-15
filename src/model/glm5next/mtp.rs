@@ -124,7 +124,7 @@ impl Model {
         }
         // A chunked SSD step's room (#1205): what the context holds past the head's rest.
         let room = ctx.tensors_left().saturating_sub(super::SSD_TAIL_TENSORS);
-        let moe = self.glm_moe(&pass, il, x, room)?;
+        let moe = self.glm_moe(&pass, il, x, room, None)?;
         let sh = self.glm_ffn(ctx, il, "_shexp", p.clamp_shexp[il], x)?;
         let out = ops::add(ctx, self.tp_sum(ctx, ops::add(ctx, moe, sh)), ffn_inp);
         let hn = ops::rms_norm(

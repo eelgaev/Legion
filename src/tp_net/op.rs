@@ -407,12 +407,17 @@ pub(super) mod cuda {
             Kind::AllGather => (dst.ne[0] as usize, dst.ne[1] as usize),
         };
         let full = row * cols;
+        // An I32 all-gather's shares may be cut elsewhere (`seq_par::share_cut`, #560 r10).
+        let cut = match kind {
+            Kind::AllGather => crate::tp_net::seq_par::cut_of(dst),
+            _ => 0,
+        };
         // Rank `r`'s values: (first, count); an all-reduce's are all of them.
         let pieces = (0..n_ranks)
             .map(|r| match kind {
                 Kind::AllReduce => (0, full),
                 _ => {
-                    let (a, c) = crate::tp_net::seq_par::share(cols, r, n_ranks);
+                    let (a, c) = crate::tp_net::seq_par::share_cut(cols, r, n_ranks, cut);
                     (a * row, c * row)
                 }
             })
