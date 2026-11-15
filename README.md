@@ -101,12 +101,12 @@ off. llama.cpp runs across two DGX Sparks with its RPC backend (layer split).
 | AC922, 2x V100 | llama.cpp b12062 | UD-Q4_K_XL GGUF | MTP ⁸ | 11-13 | 7.3 | — | 120 | — | — |
 | AC922, 4x V100 | Legion | UD-Q4_K_XL GGUF | MTP ⁷ | **79-101** | 118.6 | 136.2 | 4,370 | 6,316 | 8,050 |
 | AC922, 4x V100 | llama.cpp b12062 | UD-Q4_K_XL GGUF | MTP ⁸ | 6-9 | — | — | — | — | — |
-| RTX 4090 + Ryzen 9 7950X3D, 128 GB DDR5-4800 | Legion | UD-Q4_K_XL GGUF | none ¹⁷ | 60-61 | — | — | 2,709 | 4,616 | — |
-| RTX 4090 + Ryzen 9 7950X3D, 128 GB DDR5-4800 | Strata v0.2.13.1 | UD-Q4_K_XL GGUF | its own ¹⁸ | 61-64 | — | — | 2,788 | 5,245 | — |
-| RTX 4090 + Ryzen 9 7950X3D, 64 GB DDR5-4800 | Legion | UD-Q4_K_XL GGUF | none ¹⁷ | **46-49** | — | — | **1,660** | **2,336** | — |
-| RTX 4090 + Ryzen 9 7950X3D, 64 GB DDR5-4800 | Strata v0.2.13.1 | UD-Q4_K_XL GGUF | its own ¹⁸ | 38-44 | — | — | 1,377 | 2,109 | — |
-| RTX 4090 + Ryzen 9 7950X3D, 32 GB DDR5-4800 | Legion | UD-Q4_K_XL GGUF | none ¹⁷ | **24-26** | — | — | **888** | **1,215** | — |
-| RTX 4090 + Ryzen 9 7950X3D, 32 GB DDR5-4800 | Strata v0.2.13.1 | UD-Q4_K_XL GGUF | its own ¹⁸ | 16-21 | — | — | 616 | 836 | — |
+| RTX 4090, 128 GB DDR5-4800 | Legion | UD-Q4_K_XL GGUF | none ¹⁷ | 60-61 | — | — | 2,709 | 4,616 | — |
+| RTX 4090, 128 GB DDR5-4800 | Strata v0.2.13.1 | UD-Q4_K_XL GGUF | its own ¹⁸ | 61-64 | — | — | 2,788 | 5,245 | — |
+| RTX 4090, 64 GB DDR5-4800 | Legion | UD-Q4_K_XL GGUF | none ¹⁷ | **46-49** | — | — | **1,660** | **2,336** | — |
+| RTX 4090, 64 GB DDR5-4800 | Strata v0.2.13.1 | UD-Q4_K_XL GGUF | its own ¹⁸ | 38-44 | — | — | 1,377 | 2,109 | — |
+| RTX 4090, 32 GB DDR5-4800 | Legion | UD-Q4_K_XL GGUF | none ¹⁷ | **24-26** | — | — | **888** | **1,215** | — |
+| RTX 4090, 32 GB DDR5-4800 | Strata v0.2.13.1 | UD-Q4_K_XL GGUF | its own ¹⁸ | 16-21 | — | — | 616 | 836 | — |
 
 ### Qwen3.8-27B
 
