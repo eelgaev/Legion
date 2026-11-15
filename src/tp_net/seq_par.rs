@@ -23,6 +23,41 @@ pub fn share(cols: usize, rank: usize, n: usize) -> (usize, usize) {
     (a, cols * (rank + 1) / n - a)
 }
 
+/// [`share`] with the cut between two ranks at column `cut` instead (#560 r10: shares sized
+/// by their cost): rank 0 owns `[0, cut)`, rank 1 `[cut, cols)`. `cut` 0 (or other than two
+/// ranks) is [`share`]'s.
+pub fn share_cut(cols: usize, rank: usize, n: usize, cut: usize) -> (usize, usize) {
+    if cut == 0 || n != 2 {
+        return share(cols, rank, n);
+    }
+    let cut = cut.min(cols);
+    if rank == 0 {
+        (0, cut)
+    } else {
+        (cut, cols - cut)
+    }
+}
+
+/// The [`share_cut`] of `cols` columns whose costs grow linearly from `first` (column 0) to
+/// `last` (the last column) that gives both ranks about half the total cost, each share at
+/// least `min` columns. 0 (the even shares) when the cut lands on the even one or two shares
+/// of `min` do not fit.
+pub fn cost_cut(cols: usize, first: f64, last: f64, min: usize) -> usize {
+    if cols < 2 * min.max(1) || cols < 2 || !(first > 0.0 && last >= first) {
+        return 0;
+    }
+    // The cost of the columns before `c`: first·c + d·c²/2, d the cost's growth a column.
+    let d = (last - first) / (cols - 1) as f64;
+    let half = (first * cols as f64 + d * (cols * cols) as f64 / 2.0) / 2.0;
+    let c = if d <= 0.0 {
+        cols as f64 / 2.0
+    } else {
+        (-first + (first * first + 2.0 * d * half).sqrt()) / d
+    };
+    let c = (c.round() as usize).clamp(min, cols - min);
+    if c == share(cols, 1, 2).0 { 0 } else { c }
+}
+
 /// The communicator `comm`'s rank and rank count when a step of `n` tokens runs its per-token
 /// work on a share of the tokens: `--tp-seq-par` is on and `n` reaches it (and every rank gets
 /// at least one token).
@@ -292,12 +327,41 @@ pub fn all_gather<'a>(ctx: &'a Context, comm: i32, x: Tensor<'a>, cols: i64) -> 
 
 /// [`all_gather`] of I32 columns (#560 r9: the sparse attention's selection rows of every
 /// rank's share of the tokens), copied exactly: 4 bytes a value on the wire whatever
-/// `--tp-wire` says. `x` is I32 `[row, share]`; returns I32 `[row, cols]`.
-pub fn all_gather_i32<'a>(ctx: &'a Context, comm: i32, x: Tensor<'a>, cols: i64) -> Tensor<'a> {
+/// `--tp-wire` says. `x` is I32 `[row, share]`, the share [`share_cut`]`(cols, rank, n, cut)`
+/// (`cut` 0: [`share`]'s); returns I32 `[row, cols]`.
+pub fn all_gather_i32<'a>(
+    ctx: &'a Context,
+    comm: i32,
+    x: Tensor<'a>,
+    cols: i64,
+    cut: usize,
+) -> Tensor<'a> {
     assert_eq!(x.ty(), types::I32, "tp all-gather: I32");
     let row = x.ne()[0];
+    if let Some(c) = super::comm(comm) {
+        let (_, mine) = share_cut(cols as usize, c.rank(), c.n_ranks(), cut);
+        assert_eq!(x.ne()[1], mine as i64, "tp all-gather: this rank's share");
+    }
     let x = if x.is_contiguous() { x } else { ctx.cont(x) };
-    ctx.external_with(&ALL_GATHER, types::I32, [row, cols, 1, 1], &[x], &[comm])
+    ctx.external_with(
+        &ALL_GATHER,
+        types::I32,
+        [row, cols, 1, 1],
+        &[x],
+        &[comm, i32::try_from(cut).expect("tp all-gather: the cut")],
+    )
+}
+
+/// The parameter of an [`all_gather_i32`] node with its cut ([`share_cut`]).
+pub(crate) const P_CUT: usize = 1;
+
+/// The cut of a node made by one of this module's all-gathers ([`share_cut`]; 0 for
+/// [`share`]'s shares: the F32 and BF16 ones have none).
+pub(crate) fn cut_of(dst: &ffi::ggml_tensor) -> usize {
+    if dst.type_ != types::I32 {
+        return 0;
+    }
+    usize::try_from(external_params(dst)[P_CUT]).unwrap_or(0)
 }
 
 /// [`all_gather`] as BF16, where the columns travel in BF16 (`--tp-wire bf16` at this size,
@@ -420,9 +484,10 @@ unsafe fn cpu_all_gather_i32(dst: &ffi::ggml_tensor) {
             std::slice::from_raw_parts_mut(dst.data as *mut i32, ffi::ggml_nelements(dst) as usize),
         )
     };
+    let cut = cut_of(dst);
     match super::comm(external_params(dst)[0]) {
         Some(c) => {
-            let _ = c.all_gather_host_i32(src, out, dst.ne[0] as usize);
+            let _ = c.all_gather_host_i32(src, out, dst.ne[0] as usize, cut);
         }
         None => {
             tracing::error!("tp all-gather: the communicator is gone");

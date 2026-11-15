@@ -212,6 +212,56 @@ pub fn route_bias() -> f32 {
     f32::from_bits(ROUTE_BIAS.load(Ordering::Relaxed))
 }
 
+/// How much of a `--tp-seq-par` step's per-token work beyond round 9's runs on the token share
+/// (#560 r10), each level the ones below and the same bits as all of them:
+/// 1 the indexer's shares cut by their cost ([`qsa_cut`]), 2 the indexer's query and head
+/// weight products on the share, 3 (the default) the router on the share.
+/// `LEGION_DEBUG_GLM_SHARE_LEVEL=0..3` takes a level for A/B runs (on every rank alike).
+fn share_level() -> u8 {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        share_level_of(
+            std::env::var("LEGION_DEBUG_GLM_SHARE_LEVEL")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// [`share_level`] given the environment's value.
+pub(crate) fn share_level_of(env: Option<&str>) -> u8 {
+    env.and_then(|v| v.trim().parse::<u8>().ok())
+        .map_or(SHARE_LEVEL_DEFAULT, |v| v.min(SHARE_LEVEL_DEFAULT))
+}
+
+/// [`share_level`]'s default: all of them.
+pub(crate) const SHARE_LEVEL_DEFAULT: u8 = 3;
+
+/// The fewest tokens a rank's share may have for the scores to take the share's kernel
+/// (`qsa_attn::scores`' exact path, 8+ queries).
+const QSA_SHARE_MIN: usize = 8;
+
+/// The fewest tokens of a rank's share for a product to run on the share (#560 r10): from
+/// there on the full step and the share take the same GEMM kernel (the GB10's wide tiles from
+/// 256 tokens on), and every linear kernel past the GEMV's 8 tokens sums each output in the
+/// same order whatever the token count.
+const LINEAR_SHARE_MIN: i64 = 256;
+
+/// The cut between two ranks' shares of a one-sequence group of `n_tok` tokens that lists
+/// `n_pool` pools of `kpool` positions (#560 r10): the indexer's scores of a token cost about
+/// its visible pools, which grow by one every `kpool` tokens, so the later share costs more
+/// (~15% at 32K with even shares). The cut gives each rank about half the cost; only the
+/// shape goes in (a graph serves every step of its shape), the listed pools padded past the
+/// visible ones by up to a quarter, so ~7/8 of them is the last token's. 0: the even shares.
+pub(crate) fn qsa_cut(n_tok: usize, n_pool: usize, kpool: usize) -> usize {
+    if kpool == 0 || n_tok < 2 * QSA_SHARE_MIN {
+        return 0;
+    }
+    let last = n_pool as f64 * 7.0 / 8.0;
+    let first = (last - (n_tok - 1) as f64 / kpool as f64).max(1.0);
+    crate::tp_net::seq_par::cost_cut(n_tok, first, last.max(first), QSA_SHARE_MIN)
+}
+
 /// What [`soft_prune`] penalizes: `(layer, expert)` pairs and the selection penalty.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SoftPrune {
@@ -949,7 +999,7 @@ impl Model {
                 let left = ctx.tensors_left();
                 let part = start - left;
                 let rest = most.max(2 * part) * (layers.end - il) - part + SSD_TAIL_TENSORS;
-                let moe = self.glm_moe(pass, il, h, left.saturating_sub(rest))?;
+                let moe = self.glm_moe(pass, il, h, left.saturating_sub(rest), sp)?;
                 tap.tap("ffn_moe_out", il, moe);
                 let sh = self.glm_ffn(ctx, il, "_shexp", p.clamp_shexp[il], h)?;
                 tap.tap("ffn_shexp", il, sh);
@@ -1058,15 +1108,44 @@ impl Model {
         il: usize,
         x: Tensor<'a>,
         room: usize,
+        sp: Option<(i32, usize, usize)>,
     ) -> Result<Tensor<'a>, ModelError> {
         let (ctx, tap) = (pass.ctx, &pass.tap);
         let p = self.glm();
         let hp = &self.hp;
-        let logits = self.glm_lmm(ctx, il, "ffn_gate_inp.weight", x)?;
-        tap.tap("ffn_moe_logits", il, logits);
         let bias = self.lw(il, "exp_probs_b.bias")?;
         let bonus = route_bias();
         let decoding = pass.shape.iter().all(|g| g.verify || g.n_tok == 1);
+        let n_x = x.ne()[1];
+        // `--tp-seq-par` (#560 r10): each rank routes its share of the tokens (the router's
+        // product a column at a time, the same bits once every share has LINEAR_SHARE_MIN
+        // tokens), and the ranks all-gather the choices and their weights, exactly (I32).
+        let rsp = sp.filter(|&(_, _, ranks)| {
+            share_level() >= 3
+                && !tap.on
+                && !decoding
+                && x.ne()[2] == 1
+                && n_x == pass.n
+                && (0..ranks)
+                    .map(|r| crate::tp_net::seq_par::share(n_x as usize, r, ranks).1 as i64)
+                    .min()
+                    .is_some_and(|f| f >= LINEAR_SHARE_MIN)
+        });
+        if let Some((c, rank, ranks)) = rsp {
+            let (a, m) = crate::tp_net::seq_par::share(n_x as usize, rank, ranks);
+            let xs = cols(ctx, x, a as i64, m as i64);
+            let logits = self.glm_lmm(ctx, il, "ffn_gate_inp.weight", xs)?;
+            let ids = ops::router_ids(ctx, logits, bias, hp.n_expert_used);
+            let w = ops::router_w(ctx, logits, ids, p.weights_norm, p.weights_scale);
+            let k = hp.n_expert_used;
+            let ids = crate::tp_net::seq_par::all_gather_i32(ctx, c, ids, n_x, 0);
+            let w = ctx.reinterpret(w, types::I32, [k, m as i64, 1, 1]);
+            let w = crate::tp_net::seq_par::all_gather_i32(ctx, c, w, n_x, 0);
+            let w = ctx.reinterpret(w, types::F32, [k, n_x, 1, 1]);
+            return self.glm_moe_routed(pass, il, x, room, ids, w);
+        }
+        let logits = self.glm_lmm(ctx, il, "ffn_gate_inp.weight", x)?;
+        tap.tap("ffn_moe_logits", il, logits);
         let ids = match self.expert_tier(il) {
             // --glm-route-bias: decode and verify steps favour the cached experts.
             Some(t) if bonus != 0.0 && decoding => ops::router_ids_resident(
@@ -1082,6 +1161,24 @@ impl Model {
         };
         let w = ops::router_w(ctx, logits, ids, p.weights_norm, p.weights_scale);
         tap.tap("ffn_moe_weights_scaled", il, w);
+        self.glm_moe_routed(pass, il, x, room, ids, w)
+    }
+
+    /// [`Self::glm_moe`] of the tokens `x` routed to the experts `ids` (I32 `[k, n]`) with the
+    /// weights `w` (F32 `[k, n]`).
+    fn glm_moe_routed<'a>(
+        &'a self,
+        pass: &Pass<'a>,
+        il: usize,
+        x: Tensor<'a>,
+        room: usize,
+        ids: Tensor<'a>,
+        w: Tensor<'a>,
+    ) -> Result<Tensor<'a>, ModelError> {
+        let ctx = pass.ctx;
+        let p = self.glm();
+        let hp = &self.hp;
+        let decoding = pass.shape.iter().all(|g| g.verify || g.n_tok == 1);
         let limit = p.clamp_exp[il];
         // Routed SwiGLU over NVFP4 experts `[up, gate, down]` with per-expert scales, for the
         // tokens of `x` (all of the step's, or a piece's: `w` their router weights).
@@ -1761,22 +1858,49 @@ impl Model {
             // only (each rank's per-token work, which the mirrored graph does for every token on
             // every rank), then the ranks all-gather the selection rows, exactly (I32). Each
             // token's row is its own, so every rank attends over the same rows as without.
-            // The indexer's query and head weights stay over every token (their products'
-            // kernels go by the token count).
+            // Round 10: in a one-sequence group the later tokens see more pools, so the cut
+            // between the shares goes by the scores' cost ([`qsa_cut`]), and the indexer's
+            // query and head weights are the share's products too once every share has
+            // LINEAR_SHARE_MIN tokens (each token's column the same bits as the whole step's).
             let gsp = sp.and_then(|_| self.tp_seq_par(ng));
+            let level = share_level();
             let sel = if sh.pick_all && !tap.on {
                 qsa_attn::select_all(ctx, inp.pool_vis, n_top, inp.pool_idxs, inp.tail_idxs, pos)
             } else if let Some((c, rank, ranks)) = gsp {
-                let (a, m) = crate::tp_net::seq_par::share(ng as usize, rank, ranks);
+                let cut = if level >= 1 && sh.n_seqs == 1 {
+                    qsa_cut(ng as usize, sh.n_pool, p.kpool)
+                } else {
+                    0
+                };
+                let (a, m) = crate::tp_net::seq_par::share_cut(ng as usize, rank, ranks, cut);
                 let (a, m) = (a as i64, m as i64);
                 let t0 = off + a;
-                let qnb = iq.nb();
-                let qg = ctx.view_3d(iq, [di, ih, m], [qnb[1], qnb[2]], t0 as usize * qnb[2]);
+                let fewest = (0..ranks)
+                    .map(|r| crate::tp_net::seq_par::share_cut(ng as usize, r, ranks, cut).1)
+                    .min()
+                    .unwrap_or(0) as i64;
+                let (qg, wg) = if level >= 2 && fewest >= LINEAR_SHARE_MIN {
+                    let iq = mm("indexer.attn_q_b.weight", cols(ctx, qr, t0, m))?;
+                    let iw = ops::linear(
+                        ctx,
+                        self.lw(il, &format!("indexer.proj.weight{}", part.mirror))?,
+                        cols(ctx, x, t0, m),
+                        1.0 / ((di * ih) as f32).sqrt(),
+                        None,
+                    );
+                    (ctx.reshape_3d(iq, di, ih, m), iw)
+                } else {
+                    let qnb = iq.nb();
+                    (
+                        ctx.view_3d(iq, [di, ih, m], [qnb[1], qnb[2]], t0 as usize * qnb[2]),
+                        cols(ctx, iw, t0, m),
+                    )
+                };
                 let score = qsa_attn::scores(
                     ctx,
                     qg,
                     pooled,
-                    cols(ctx, iw, t0, m),
+                    wg,
                     cols(ctx, inp.pool_vis, a, m),
                     Some(inp.pool_bias),
                     Some(inp.pool_cells),
@@ -1785,7 +1909,7 @@ impl Model {
                 let pm = ctx.view_2d(pass.pos, [m, 1], m as usize * es, t0 as usize * es);
                 let tail = cols(ctx, inp.tail_idxs, a, m);
                 let mine = qsa_attn::select(ctx, top, score, inp.pool_idxs, tail, pm);
-                crate::tp_net::seq_par::all_gather_i32(ctx, c, mine, ng)
+                crate::tp_net::seq_par::all_gather_i32(ctx, c, mine, ng, cut)
             } else {
                 let qnb = iq.nb();
                 let qg = ctx.view_3d(iq, [di, ih, ng], [qnb[1], qnb[2]], off as usize * qnb[2]);

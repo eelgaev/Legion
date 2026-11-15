@@ -1262,16 +1262,18 @@ impl Comm {
 
     /// [`Self::all_gather_host`] of I32 values (the CPU op of
     /// [`super::seq_par::all_gather_i32`]): copied exactly, 4 bytes a value on the wire
-    /// whatever `--tp-wire` says. On failure the other ranks' columns are zeros.
+    /// whatever `--tp-wire` says, the shares cut at `cut` ([`super::seq_par::share_cut`]; 0 for
+    /// [`super::seq_par::share`]'s). On failure the other ranks' columns are zeros.
     pub fn all_gather_host_i32(
         &self,
         src: &[i32],
         dst: &mut [i32],
         row: usize,
+        cut: usize,
     ) -> Result<(), String> {
         let cols = dst.len() / row;
         let range = |r: usize| {
-            let (a, n) = super::seq_par::share(cols, r, self.n);
+            let (a, n) = super::seq_par::share_cut(cols, r, self.n, cut);
             a * row..(a + n) * row
         };
         assert_eq!(range(self.rank).len(), src.len(), "all-gather lengths");

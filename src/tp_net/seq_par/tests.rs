@@ -234,7 +234,42 @@ fn the_graph_ops_scatter_and_gather_on_the_cpu() {
 #[test]
 fn an_i32_gather_copies_exactly_on_the_bf16_wire() {
     // #560 r9: the selection rows travel as they are, though every F32 exchange of the size
-    // would be rounded to BF16; uneven shares, as the host call and as the graph op.
+    // would be rounded to BF16; uneven shares, and (r10) shares cut elsewhere, as the host call
+    // and as the graph op.
+    for cut in [0, 1, 5, 6] {
+        i32_gather_on_the_bf16_wire(cut);
+    }
+}
+
+#[test]
+fn a_cut_splits_two_ranks_there() {
+    assert_eq!(share_cut(10, 0, 2, 0), share(10, 0, 2));
+    assert_eq!(share_cut(10, 1, 2, 0), share(10, 1, 2));
+    assert_eq!(share_cut(10, 0, 2, 3), (0, 3));
+    assert_eq!(share_cut(10, 1, 2, 3), (3, 7));
+    assert_eq!(share_cut(10, 1, 2, 12), (10, 0));
+    // Other rank counts keep the even shares.
+    for r in 0..3 {
+        assert_eq!(share_cut(10, r, 3, 4), share(10, r, 3));
+    }
+}
+
+#[test]
+fn a_cost_cut_halves_the_cost() {
+    // Flat costs: the even cut, 0.
+    assert_eq!(cost_cut(100, 1.0, 1.0, 8), 0);
+    // Costs 1 to 3 over 1000 columns: the first ~618 cost half (c + c²/1000 = 1000).
+    let c = cost_cut(1000, 1.0, 3.0, 8);
+    assert!((612..=624).contains(&c), "{c}");
+    // Shares of `min` at least, else the even shares.
+    assert_eq!(cost_cut(20, 1.0, 1000.0, 8), 12);
+    assert_eq!(cost_cut(15, 1.0, 2.0, 8), 0);
+    // Nonsense costs: the even shares.
+    assert_eq!(cost_cut(100, 0.0, 1.0, 8), 0);
+    assert_eq!(cost_cut(100, 2.0, 1.0, 8), 0);
+}
+
+fn i32_gather_on_the_bf16_wire(cut: usize) {
     let (row, cols) = (3usize, 7usize);
     let ints = move |r: usize| -> Vec<i32> {
         (0..row * cols)
@@ -247,10 +282,10 @@ fn an_i32_gather_copies_exactly_on_the_bf16_wire() {
             .collect()
     };
     let got = on_ranks(2, Wire::Bf16, move |r, c| {
-        let (a, m) = share(cols, r, 2);
+        let (a, m) = share_cut(cols, r, 2, cut);
         let mine = ints(r)[a * row..(a + m) * row].to_vec();
         let mut host = vec![0i32; row * cols];
-        c.all_gather_host_i32(&mine, &mut host, row).unwrap();
+        c.all_gather_host_i32(&mine, &mut host, row, cut).unwrap();
         let handle = register(c);
         let mut backend = Backend::cpu().unwrap();
         backend.set_threads(3);
@@ -258,7 +293,7 @@ fn an_i32_gather_copies_exactly_on_the_bf16_wire() {
         let x = ctx
             .new_tensor(types::I32, &[row as i64, m as i64])
             .as_input();
-        let y = all_gather_i32(&ctx, handle.id(), x, cols as i64).as_output();
+        let y = all_gather_i32(&ctx, handle.id(), x, cols as i64, cut).as_output();
         let mut graph = ctx.new_graph(16);
         graph.expand(y);
         ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
@@ -270,14 +305,14 @@ fn an_i32_gather_copies_exactly_on_the_bf16_wire() {
     });
     let want: Vec<i32> = (0..2)
         .flat_map(|r| {
-            let (a, m) = share(cols, r, 2);
+            let (a, m) = share_cut(cols, r, 2, cut);
             ints(r)[a * row..(a + m) * row].to_vec()
         })
         .collect();
     for (r, (host, ty, op)) in got.into_iter().enumerate() {
-        assert_eq!(host, want, "host, rank {r}");
+        assert_eq!(host, want, "host, rank {r}, cut {cut}");
         assert_eq!(ty, types::I32, "rank {r}");
-        assert_eq!(op, want, "op, rank {r}");
+        assert_eq!(op, want, "op, rank {r}, cut {cut}");
     }
 }
 
