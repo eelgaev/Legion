@@ -319,6 +319,47 @@ fn budgeted_ranking_matches_with_ties_and_odd_heats() {
     }
 }
 
+/// Host experts at or below the margin are left out of the ranking when no slot is empty:
+/// across margins (negative, zero, between heats, above most of them), ratios and full or
+/// partly empty layers, the plan is still the full sort's.
+#[test]
+fn margin_floor_plans_the_full_sorts_swaps() {
+    let vals = [0.0, 0.3, 0.5, 1.0, 1.5, 1.5, 2.0, 3.0, 4.5, 9.0, f32::NAN];
+    for margin in [-1.0, 0.0, 0.5, 1.5, 3.0, 20.0] {
+        for ratio in [0.0, 0.25] {
+            for budget in [1, 6, 48] {
+                let rule = SwapRule {
+                    budget,
+                    margin,
+                    ratio,
+                };
+                for seed in 0..40u64 {
+                    // Every fourth layer keeps two slots empty.
+                    let held = if seed % 4 == 0 { 28 } else { 30 };
+                    let mut l = LayerSlots::new(80, 30);
+                    l.fill(
+                        &(0..held)
+                            .map(|e| (e * 11 + seed as u32) % 80)
+                            .collect::<Vec<_>>(),
+                    );
+                    for (e, h) in l.heat.iter_mut().enumerate() {
+                        *h = vals[(e * 13 + seed as usize * 7) % vals.len()];
+                    }
+                    let mut a = [l.clone()];
+                    let mut b = [l];
+                    let mut va: Vec<Option<&mut LayerSlots>> = a.iter_mut().map(Some).collect();
+                    let got = plan_swaps(&mut va, rule);
+                    assert_eq!(
+                        got,
+                        full_sort_plan(&mut b, rule),
+                        "margin {margin} ratio {ratio} budget {budget} seed {seed}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn clear_from_keeps_the_first_slots() {
     let mut l = LayerSlots::new(8, 4);

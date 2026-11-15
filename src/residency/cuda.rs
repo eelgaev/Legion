@@ -185,6 +185,17 @@ mod sys {
             height: usize,
             kind: c_int,
         ) -> cudaError_t;
+        #[allow(clippy::too_many_arguments)]
+        pub fn cudaMemcpy2DAsync(
+            dst: *mut c_void,
+            dpitch: usize,
+            src: *const c_void,
+            spitch: usize,
+            width: usize,
+            height: usize,
+            kind: c_int,
+            s: cudaStream_t,
+        ) -> cudaError_t;
         pub fn cudaMemset(p: *mut c_void, v: c_int, n: usize) -> cudaError_t;
         pub fn cudaStreamCreateWithFlags(s: *mut cudaStream_t, flags: c_uint) -> cudaError_t;
         pub fn cudaStreamDestroy(s: cudaStream_t) -> cudaError_t;
@@ -2463,6 +2474,53 @@ pub unsafe fn zero_ranges_now(device: usize, ranges: &[(usize, usize)]) -> Resul
                 "cudaMemsetAsync",
             )?;
         }
+        rt(cudaStreamSynchronize(per_thread), "cudaStreamSynchronize")
+    }
+}
+
+/// Reads the first `out.len() / rows` I32 values of `rows` rows `pitch` values apart, from
+/// element `start` of a tensor in `device`'s plain memory, into `out` (row after row), and
+/// waits for it: one strided copy on the per-thread default stream, as
+/// `ggml_backend_tensor_get` does for a whole range. A decode step's expert log is ~2 KiB of a
+/// half-MiB range.
+pub fn read_rows_i32(
+    device: usize,
+    t: Tensor<'_>,
+    start: usize,
+    pitch: usize,
+    rows: usize,
+    out: &mut [i32],
+) -> Result<(), String> {
+    let width = out.len() / rows.max(1);
+    assert!(
+        width * rows == out.len() && width <= pitch,
+        "read_rows_i32 shape"
+    );
+    assert!(
+        rows == 0 || (start + (rows - 1) * pitch + width) * 4 <= t.nbytes(),
+        "read_rows_i32 out of bounds"
+    );
+    if rows == 0 || width == 0 {
+        return Ok(());
+    }
+    let per_thread = 0x2 as cudaStream_t;
+    // SAFETY: the bounds are checked above; the tensor's memory is `device`'s.
+    unsafe {
+        let src = (*t.raw()).data.cast::<i32>().add(start);
+        rt(cudaSetDevice(device as c_int), "cudaSetDevice")?;
+        rt(
+            cudaMemcpy2DAsync(
+                out.as_mut_ptr().cast(),
+                width * 4,
+                src.cast(),
+                pitch * 4,
+                width * 4,
+                rows,
+                2,
+                per_thread,
+            ),
+            "cudaMemcpy2DAsync",
+        )?;
         rt(cudaStreamSynchronize(per_thread), "cudaStreamSynchronize")
     }
 }

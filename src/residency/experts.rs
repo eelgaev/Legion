@@ -870,6 +870,8 @@ pub struct ExpertResidency {
     predict: super::ep_prefetch::PrefetchStats,
     /// [`ResidencyConfig::ep_cached`]: per device, its `expert_cached` rows as last written.
     cached_rows: Vec<Vec<i32>>,
+    /// The logged steps' id reads land here, reused from step to step.
+    log_buf: Vec<i32>,
     /// [`ResidencyConfig::ep_stage_all`].
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     ep_stage_all: bool,
@@ -1983,6 +1985,7 @@ impl ExpertResidency {
             balance: Default::default(),
             predict: Default::default(),
             cached_rows: Vec::new(),
+            log_buf: Vec::new(),
             ep_stage_all: cfg.ep_stage_all,
             shrunk,
             host,
@@ -2432,7 +2435,8 @@ impl ExpertResidency {
                     }
                     let mut table = vec![0i32; n_expert * dev.rows];
                     for (_, l) in mine {
-                        table[l.row * n_expert..][..n_expert].copy_from_slice(&l.slots.table());
+                        l.slots
+                            .write_table(&mut table[l.row * n_expert..][..n_expert]);
                         l.dirty = false;
                     }
                     dev.table().set_i32(&table);
@@ -2450,8 +2454,8 @@ impl ExpertResidency {
                         // bytes).
                         let mut table = vec![0i32; n_expert * (hi - lo)];
                         for (_, l) in inside {
-                            table[(l.row - lo) * n_expert..][..n_expert]
-                                .copy_from_slice(&l.slots.table());
+                            l.slots
+                                .write_table(&mut table[(l.row - lo) * n_expert..][..n_expert]);
                             l.dirty = false;
                         }
                         dev.table().set_i32_at(lo * n_expert, &table);
@@ -2698,7 +2702,24 @@ impl ExpertResidency {
                 if lo >= hi {
                     continue;
                 }
-                let ids = dev.log().i32_range(lo * cap, cap * (hi - lo));
+                // Each row's first `per` ids only, in one strided read, where the log is plain
+                // VRAM (`stride` per a row then); else the rows' whole range.
+                let mut ids = std::mem::take(&mut self.log_buf);
+                #[cfg(feature = "cuda")]
+                let strided = dev.place.cuda.filter(|&cd| {
+                    super::buft_of(dev.log()).and_then(super::cuda::plain_cuda_device) == Some(cd)
+                });
+                #[cfg(not(feature = "cuda"))]
+                let strided: Option<usize> = None;
+                let stride = if strided.is_some() { per } else { cap };
+                ids.resize(stride * (hi - lo), 0);
+                match strided {
+                    #[cfg(feature = "cuda")]
+                    Some(cd) => {
+                        super::cuda::read_rows_i32(cd, dev.log(), lo * cap, cap, hi - lo, &mut ids)?
+                    }
+                    _ => dev.log().i32_range_into(lo * cap, &mut ids),
+                }
                 let guesses = dev
                     .pred_log()
                     .map(|t| t.i32_range(lo * cap, cap * (hi - lo)));
@@ -2710,7 +2731,7 @@ impl ExpertResidency {
                     .filter_map(|(il, l)| l.as_mut().map(|l| (il, l)))
                     .filter(|(il, l)| l.dev == d && ran(*il))
                 {
-                    let mine = &ids[(l.row - lo) * cap..][..per];
+                    let mine = &ids[(l.row - lo) * stride..][..per];
                     let unpacked;
                     let mine = if staged(l) && !l.stage_ids.is_empty() {
                         unpacked = l.unpack(mine);
@@ -2746,6 +2767,7 @@ impl ExpertResidency {
                     }
                     l.slots.decay(self.decay);
                 }
+                self.log_buf = ids;
             }
             self.heat_fresh |= !held;
             self.laps.lap("record");

@@ -579,6 +579,20 @@ impl<'a> Tensor<'a> {
         out
     }
 
+    /// [`Self::i32_range`] into `out` (`out.len()` values from element `start` on).
+    pub fn i32_range_into(self, start: usize, out: &mut [i32]) {
+        assert_eq!(
+            self.ty(),
+            ffi::ggml_type_GGML_TYPE_I32,
+            "i32_range_into on a non-I32 tensor"
+        );
+        let n = out.len();
+        assert!((start + n) * 4 <= self.nbytes(), "i32_range out of bounds");
+        unsafe {
+            ffi::ggml_backend_tensor_get(self.raw(), out.as_mut_ptr().cast(), start * 4, n * 4)
+        };
+    }
+
     /// Sets `len` bytes starting `offset` bytes in to `value` (host or device memory).
     pub fn memset(self, offset: usize, len: usize, value: u8) {
         assert!(

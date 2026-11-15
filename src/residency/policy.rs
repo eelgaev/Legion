@@ -266,13 +266,20 @@ impl LayerSlots {
     /// The lookup table the graph reads: per expert, its slot if ready, else
     /// `n_slots + expert`.
     pub fn table(&self) -> Vec<i32> {
+        let mut t = vec![0; self.slot_of.len()];
+        self.write_table(&mut t);
+        t
+    }
+
+    /// [`Self::table`] into `out` (one entry an expert), without a new allocation.
+    pub fn write_table(&self, out: &mut [i32]) {
         let n = self.slots.len() as i32;
-        (0..self.slot_of.len())
-            .map(|e| match self.slot_of[e] {
+        for (e, (t, s)) in out.iter_mut().zip(&self.slot_of).enumerate() {
+            *t = match *s {
                 Some(s) if self.slots[s as usize] == Slot::Ready(e as u32) => s as i32,
                 _ => n + e as i32,
-            })
-            .collect()
+            };
+        }
     }
 
     /// Whether a ready slot holds expert `e` (the table reads it from VRAM).
@@ -378,15 +385,29 @@ impl LayerSlots {
         ratio: f32,
         limit: usize,
     ) -> Vec<(f32, u32, Option<u32>, u32)> {
+        // With no empty slot every pair needs `h_new - max(h_old, 0) > margin`, so a host
+        // expert of heat `<= margin` never passes, and the pairs stop at the first one that
+        // fails: leaving such experts out of the ranking plans the same swaps, from a much
+        // shorter list (most of a layer's host experts hold a little decayed heat; ranking
+        // them all was most of the after-step's planning time).
+        let empty = self.slots[..self.limit]
+            .iter()
+            .any(|s| matches!(s, Slot::Empty));
+        let floor = if empty { 0.0 } else { margin.max(0.0) };
         let mut hot: Vec<u32> = (0..self.slot_of.len() as u32)
-            .filter(|&e| self.slot_of[e as usize].is_none() && self.heat[e as usize] > 0.0)
+            .filter(|&e| self.slot_of[e as usize].is_none() && self.heat[e as usize] > floor)
             .collect();
+        if hot.is_empty() {
+            return Vec::new();
+        }
         let by_heat = |a: &u32, b: &u32| {
             self.heat[*b as usize]
                 .total_cmp(&self.heat[*a as usize])
                 .then(a.cmp(b))
         };
         top(&mut hot, limit, by_heat);
+        // Only as many of the coldest slots as there are newcomers are paired.
+        let limit = limit.min(hot.len());
         let mut cold: Vec<(f32, u32, Option<u32>)> = self
             .slots
             .iter()
