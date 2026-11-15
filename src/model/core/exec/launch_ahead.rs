@@ -34,6 +34,24 @@ pub(super) fn wanted(on: bool, queued: bool, s: usize, n_stages: usize, peer_fet
     on && queued && s + 1 < n_stages && !peer_fetch
 }
 
+/// Late n-gram writes from this size on log their parts with `LEGION_DEBUG_PLE_LAPS=1` (a
+/// prompt step's; a decode step's are a few KB).
+const LAPS_MIN_BYTES: usize = 1 << 20;
+
+/// The late n-gram writes' debug switches, read once: `(pinned, laps)`.
+/// `LEGION_DEBUG_PLE_PIN=0` writes through a new pageable vector as before #1176's round 29;
+/// `LEGION_DEBUG_PLE_LAPS=1` logs a big write's read, gather and copy times.
+fn ple_write_debug() -> (bool, bool) {
+    static ON: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let var = |k| std::env::var(k).ok();
+        (
+            var("LEGION_DEBUG_PLE_PIN").as_deref() != Some("0"),
+            var("LEGION_DEBUG_PLE_LAPS").as_deref() == Some("1"),
+        )
+    })
+}
+
 impl Executor {
     /// See [`wanted`] (with this executor's setting and the peer fetch as it is now).
     pub(super) fn launches_ahead(&self, queued: bool, s: usize) -> bool {
@@ -91,25 +109,38 @@ impl Executor {
             decode,
             mixed,
             backend,
+            ple_pin,
             ..
         } = &mut self.stages[s];
         let kept = super::kept_in(decode, mixed, shape).expect("prepared");
         // The n-gram rows the fill left: read while the first layer computes.
         let took = std::cell::Cell::new(std::time::Duration::ZERO);
         let took_ref = &took;
-        let mut write = late_rows.map(|rows| {
-            let t = super::Inputs::from_parts(shape, parts, |i| kept.tensor(i))
-                .ple
-                .expect("a step with n-gram rows has their input");
-            let mut rows = Some(rows);
-            (t, move || {
-                if let Some(rows) = rows.take() {
-                    let t0 = std::time::Instant::now();
-                    model.write_ple(t, rows);
-                    took_ref.set(t0.elapsed());
-                }
-            })
-        });
+        let (pin, laps) = ple_write_debug();
+        let mut write = match late_rows {
+            Some(rows) => {
+                let t = super::Inputs::from_parts(shape, parts, |i| kept.tensor(i))
+                    .ple
+                    .expect("a step with n-gram rows has their input");
+                // Gathered into pinned memory kept for the stage (#1176).
+                let n = t.nbytes().max(super::BOUNCE_MIN_BYTES);
+                let via = if pin {
+                    super::bounce_for(ple_pin, backend, n)
+                } else {
+                    None
+                };
+                let laps = laps && t.nbytes() >= LAPS_MIN_BYTES;
+                let mut rows = Some(rows);
+                Some((t, move || {
+                    if let Some(rows) = rows.take() {
+                        let t0 = std::time::Instant::now();
+                        model.write_ple_via(t, rows, via, laps);
+                        took_ref.set(t0.elapsed());
+                    }
+                }))
+            }
+            None => None,
+        };
         let late = write.as_mut().map(|(t, f)| crate::ggml::LateInput {
             tensor: *t,
             fill: f,

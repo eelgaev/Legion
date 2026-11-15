@@ -309,6 +309,8 @@ pub struct TableStats {
     pub keep_awake_reads: u64,
     /// Rows (each once per batch) asked of the peer ([`PeerRows`]) instead of read.
     pub peer_rows: u64,
+    /// Of `reads`, the pages that joined another batch's read of them in flight instead.
+    pub joined_reads: u64,
 }
 
 /// Another rank that reads the table's rows for this one ([`LookupTable::set_peer`]): under
@@ -346,6 +348,8 @@ pub struct LookupTable {
     prefetched: Mutex<Vec<Ticket>>,
     /// [`Self::prefetch_next`]es that the next [`Self::issue`] leaves for the one after.
     next: Mutex<Vec<Ticket>>,
+    /// Whether [`Self::read_for_peer`] logs each ask's waits (`--tp-profile`).
+    peer_log: std::sync::atomic::AtomicBool,
 }
 
 enum Tier {
@@ -590,6 +594,7 @@ impl LookupTable {
             cpus,
             prefetched: Mutex::new(Vec::new()),
             next: Mutex::new(Vec::new()),
+            peer_log: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -671,21 +676,45 @@ impl LookupTable {
                 prefetch: false,
             }),
             Tier::Direct(d) => {
-                if urgent {
-                    self.take_prefetched_of(d, rows);
+                let t0 = std::time::Instant::now();
+                let own = if urgent {
+                    self.take_prefetched_of(d, rows)
+                } else {
+                    0
+                };
+                let t_own = t0.elapsed();
+                let (t, issued) = d.issue_counted(&self.parts, rows, Ask::Peer { urgent });
+                let missed = t.missed.len();
+                let got = d.collect(t, self.file.row_bytes);
+                if self.peer_log.load(std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!(
+                        rows = rows.len(),
+                        urgent,
+                        own_tickets = own,
+                        own_wait_ms = format!("{:.2}", t_own.as_secs_f64() * 1e3),
+                        missed,
+                        pages = issued.pages,
+                        joined = issued.joined,
+                        read_ms = format!("{:.2}", (t0.elapsed() - t_own).as_secs_f64() * 1e3),
+                        "lookup table: rows for a peer"
+                    );
                 }
-                d.collect(
-                    d.issue(&self.parts, rows, Ask::Peer { urgent }),
-                    self.file.row_bytes,
-                )
+                got
             }
         }
     }
 
+    /// Whether [`Self::read_for_peer`] logs every ask: its rows, the wait for this rank's own
+    /// read-ahead, the misses, the pages read and joined, and the read's time.
+    pub fn set_peer_log(&self, on: bool) {
+        self.peer_log
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Waits for the [`Self::prefetch`]es still out that hold at least half of `rows` (by a
     /// sample of every 8th) and puts their rows in the cache; the others stay for the next
-    /// issue, which waits for them as before.
-    fn take_prefetched_of(&self, d: &Direct, rows: &[u32]) {
+    /// issue, which waits for them as before. How many it waited for.
+    fn take_prefetched_of(&self, d: &Direct, rows: &[u32]) -> usize {
         let taken: Vec<Ticket> = {
             let mut p = self.prefetched.lock().unwrap_or_else(|e| e.into_inner());
             let (take, keep) = std::mem::take(&mut *p).into_iter().partition(|t: &Ticket| {
@@ -698,9 +727,11 @@ impl LookupTable {
             *p = keep;
             take
         };
+        let n = taken.len();
         for t in taken {
             let _ = d.collect(t, self.file.row_bytes);
         }
+        n
     }
 
     /// Starts reading rows a later [`Self::issue`] will ask for (the next prompt chunk's) into
@@ -1195,6 +1226,27 @@ struct Job {
     /// (index in the ticket's rows, byte offset of the row in the read).
     uses: Vec<(usize, usize)>,
     pending: Arc<Pending>,
+    /// In [`Queue::inflight`]: reads of its page by later batches joined it
+    /// ([`Direct::join_reads`]), and it delivers to them too.
+    shared: bool,
+}
+
+/// What a [`Direct::issue_counted`] read: its page reads, and of them those that joined a read
+/// in flight.
+#[derive(Debug, Clone, Copy)]
+struct Issued {
+    pages: usize,
+    joined: usize,
+}
+
+/// A page read in flight that later batches' reads of it joined ([`Direct::join_reads`]).
+struct Inflight {
+    /// The read's length (a batch whose row straddles into the next page reads two).
+    len: usize,
+    /// Whether it is a fetch's read (the urgent queue).
+    urgent: bool,
+    /// The batches that joined: their rows in this read, and their ticket.
+    joined: Vec<(Vec<(usize, usize)>, Arc<Pending>)>,
 }
 
 /// The I/O threads' reads. A fetch's (a step waits for them) go before the reads of
@@ -1205,6 +1257,8 @@ struct Job {
 struct Queue {
     jobs: Mutex<Jobs>,
     ready: Condvar,
+    /// The I/O threads' reads not done yet, by page offset (the [`Job::shared`] ones).
+    inflight: Mutex<HashMap<u64, Inflight>>,
 }
 
 #[derive(Default)]
@@ -1240,6 +1294,12 @@ fn fifo_queue() -> bool {
     std::env::var_os("LEGION_DEBUG_NGRAM_FIFO").is_some_and(|v| v == "1")
 }
 
+/// `LEGION_DEBUG_NGRAM_JOIN=0`: every batch reads its pages itself, even those another batch
+/// is reading already ([`Direct::join_reads`] off; for A/B runs only). The same bytes either way.
+fn join_queued_reads() -> bool {
+    std::env::var_os("LEGION_DEBUG_NGRAM_JOIN").is_none_or(|v| v != "0")
+}
+
 struct Direct {
     cache: Mutex<RowCache>,
     queue: Arc<Queue>,
@@ -1252,6 +1312,8 @@ struct Direct {
     keep_awake: Option<keep_awake::KeepAwake>,
     /// [`fifo_queue`], read at open.
     fifo: bool,
+    /// [`join_queued_reads`], read at open.
+    join: bool,
     /// Asked for the rows the cache misses instead of reading them ([`LookupTable::set_peer`]).
     peer: std::sync::OnceLock<Arc<dyn PeerRows>>,
 }
@@ -1414,6 +1476,7 @@ impl Direct {
         let queue = Arc::new(Queue {
             jobs: Mutex::new(Jobs::default()),
             ready: Condvar::new(),
+            inflight: Mutex::new(HashMap::new()),
         });
         let workers = (0..inflight.max(1))
             .map(|i| {
@@ -1463,6 +1526,7 @@ impl Direct {
             aio_max: aio_max.min(aio::DEPTH),
             keep_awake,
             fifo: fifo_queue(),
+            join: join_queued_reads(),
             peer: std::sync::OnceLock::new(),
         })
     }
@@ -1470,6 +1534,11 @@ impl Direct {
     /// `ask`: who wants the rows. Only a fetch counts for the hot set: a prefetch's rows are
     /// asked for later ([`LookupTable::prefetch`]), and a peer's by this rank too.
     fn issue(&self, parts: &Parts, rows: &[u32], ask: Ask) -> Ticket {
+        self.issue_counted(parts, rows, ask).0
+    }
+
+    /// [`Self::issue`], and how many page reads it made and joined.
+    fn issue_counted(&self, parts: &Parts, rows: &[u32], ask: Ask) -> (Ticket, Issued) {
         let prefetch = ask != Ask::Fetch;
         let rb = parts.row_bytes as usize;
         let mut out = vec![0u8; rows.len() * rb];
@@ -1549,8 +1618,13 @@ impl Direct {
                 len,
                 uses,
                 pending: pending.clone(),
+                shared: false,
             })
             .collect();
+        let mut issued = Issued {
+            pages: jobs.len(),
+            joined: 0,
+        };
         if let Some(peer) = peer {
             let a = PeerAsk {
                 rows: asked.clone(),
@@ -1562,29 +1636,85 @@ impl Direct {
                 fifo: self.fifo,
             };
             peer.ask(asked, ask.urgent(), Box::new(move |got| a.done(got)));
-            return Ticket {
+            issued.pages = 0;
+            let t = Ticket {
                 rows: rows.to_vec(),
                 pending: Some(pending),
                 missed,
                 prefetch,
             };
+            return (t, issued);
         }
         // What AIO does not take (no free slots) goes to the threads.
-        let jobs = match aio {
+        let mut jobs = match aio {
             Some(aio) => aio.submit(jobs),
             None => jobs,
         };
+        if self.join && !jobs.is_empty() {
+            let n = jobs.len();
+            jobs = self.join_reads(jobs, ask.urgent());
+            issued.joined = n - jobs.len();
+        }
         if !jobs.is_empty() {
             let mut q = self.queue.jobs.lock().unwrap_or_else(|e| e.into_inner());
             q.push(jobs, ask.urgent(), self.fifo);
             self.queue.ready.notify_all();
         }
-        Ticket {
+        let t = Ticket {
             rows: rows.to_vec(),
             pending: Some(pending),
             missed,
             prefetch,
+        };
+        (t, issued)
+    }
+
+    /// Of `jobs` (a batch's reads for the I/O threads), those of a page another batch's read
+    /// already has in flight join that read instead, which delivers their rows too; the others
+    /// are returned to be queued, each in [`Queue::inflight`] for later batches to join. Under
+    /// tensor parallelism over machines rank 0 reads a cold prompt chunk's rows for itself and
+    /// for the other rank at once ([`LookupTable::read_for_peer`]), each page twice without
+    /// this (#1176). A fetch's read joins only another fetch's: a read-ahead's may wait behind
+    /// the whole read-ahead queue. The same bytes either way.
+    fn join_reads(&self, jobs: Vec<Job>, urgent: bool) -> Vec<Job> {
+        let mut own = Vec::with_capacity(jobs.len());
+        let mut joined = 0u64;
+        {
+            let mut inflight = self
+                .queue
+                .inflight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for mut job in jobs {
+                match inflight.get_mut(&job.offset) {
+                    Some(f) if f.len >= job.len && (f.urgent || !urgent) => {
+                        f.joined.push((job.uses, job.pending));
+                        joined += 1;
+                    }
+                    // Shorter, or a read-ahead's that a fetch should not wait behind.
+                    Some(_) => own.push(job),
+                    None => {
+                        inflight.insert(
+                            job.offset,
+                            Inflight {
+                                len: job.len,
+                                urgent,
+                                joined: Vec::new(),
+                            },
+                        );
+                        job.shared = true;
+                        own.push(job);
+                    }
+                }
+            }
         }
+        if joined > 0 {
+            self.stats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .joined_reads += joined;
+        }
+        own
     }
 
     fn collect(&self, t: Ticket, rb: usize) -> io::Result<Vec<u8>> {
@@ -1623,6 +1753,7 @@ impl Drop for LookupTable {
                 cache_hit_rate = s.cache_hits as f64 / s.rows.max(1) as f64,
                 hot_rows = s.hot_rows,
                 reads = s.reads,
+                joined_reads = s.joined_reads,
                 read_mib = s.read_bytes as f64 / (1u64 << 20) as f64,
                 "lookup table direct reads"
             );
@@ -1659,32 +1790,60 @@ fn io_worker(file: &File, queue: &Queue) {
                 q = queue.ready.wait(q).unwrap_or_else(|e| e.into_inner());
             }
         };
-        let read = read_full(file, buf.slice(job.len), job.offset);
-        deliver(&job, read, buf.slice(job.len), false);
+        let read = read_full(file, buf.slice(job.len), job.offset).map_err(|e| e.to_string());
+        // The batches that joined this read: none join once it is out of the map.
+        let joined = if job.shared {
+            queue
+                .inflight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&job.offset)
+                .map_or_else(Vec::new, |f| f.joined)
+        } else {
+            Vec::new()
+        };
+        let data = buf.slice(job.len);
+        deliver_to(&job.pending, &job.uses, job.offset, &read, data, false);
+        for (uses, pending) in &joined {
+            deliver_to(pending, uses, job.offset, &read, data, false);
+        }
     }
 }
 
 /// Puts `job`'s rows from `data` (its read: `read` bytes of it, or the error) into its ticket and
 /// counts the job done (an AIO one: also off `aio_jobs`).
 fn deliver(job: &Job, read: io::Result<usize>, data: &[u8], aio: bool) {
-    let mut st = job.pending.state.lock().unwrap_or_else(|e| e.into_inner());
+    let read = read.map_err(|e| e.to_string());
+    deliver_to(&job.pending, &job.uses, job.offset, &read, data, aio);
+}
+
+/// [`deliver`] of a read at `offset` to one ticket (`pending`) and its rows in it (`uses`).
+fn deliver_to(
+    pending: &Pending,
+    uses: &[(usize, usize)],
+    offset: u64,
+    read: &Result<usize, String>,
+    data: &[u8],
+    aio: bool,
+) {
+    let mut st = pending.state.lock().unwrap_or_else(|e| e.into_inner());
     match read {
         Ok(n) => {
-            let data = &data[..n.min(data.len())];
+            let data = &data[..(*n).min(data.len())];
             let row_bytes = st.row_bytes;
-            for &(i, at) in &job.uses {
+            for &(i, at) in uses {
                 match data.get(at..at + row_bytes) {
                     Some(src) => st.out[i * row_bytes..][..row_bytes].copy_from_slice(src),
                     None => {
                         st.error.get_or_insert_with(|| {
-                            format!("short read at byte {} of the table file", job.offset)
+                            format!("short read at byte {offset} of the table file")
                         });
                     }
                 }
             }
         }
         Err(e) => {
-            st.error.get_or_insert_with(|| e.to_string());
+            st.error.get_or_insert_with(|| e.clone());
         }
     }
     st.jobs -= 1;
@@ -1692,7 +1851,7 @@ fn deliver(job: &Job, read: io::Result<usize>, data: &[u8], aio: bool) {
         st.aio_jobs -= 1;
     }
     if st.jobs == 0 {
-        job.pending.done.notify_all();
+        pending.done.notify_all();
     }
 }
 

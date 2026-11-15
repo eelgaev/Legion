@@ -531,6 +531,7 @@ fn fetch_reads_go_before_queued_prefetches() {
                 len: PAGE as usize,
                 uses: Vec::new(),
                 pending: pending.clone(),
+                shared: false,
             })
             .collect()
     };
@@ -1058,4 +1059,114 @@ fn a_peer_reads_the_rows_this_rank_misses() {
         io::ErrorKind::InvalidInput
     );
     assert_eq!(t.stats().peer_rows, 0);
+}
+
+/// A batch's reads of pages another batch is reading join those reads (#1176 round 29): a
+/// peer's rows asked for while this rank's read-ahead of them is still queued come from that
+/// read-ahead's reads, exactly, and no page is read twice. A fetch's reads never join a
+/// read-ahead's, and a read-ahead's join a fetch's.
+#[test]
+fn reads_in_flight_are_joined_not_repeated() {
+    let base = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"));
+    std::fs::create_dir_all(&base).unwrap();
+    let dir = tempfile::tempdir_in(&base).unwrap();
+    let n_rows = 6000u64;
+    let (file, rows) = table(dir.path(), n_rows);
+    let open = || {
+        LookupTable::open(
+            file.clone(),
+            &TableOptions {
+                io: TableIo::Direct,
+                ram_cache_bytes: Some(16 << 20),
+                inflight: 2,
+                aio_max: 0,
+                keep_awake_ms: 0,
+                ..TableOptions::default()
+            },
+            None,
+        )
+        .unwrap()
+    };
+    let picks: Vec<u32> = (0..400u32)
+        .map(|i| i.wrapping_mul(2_654_435_761) % n_rows as u32)
+        .chain([0, n_rows as u32 - 1])
+        .collect();
+    // The rule, on reads that never go out.
+    let t = open();
+    let Tier::Direct(d) = &t.tier else {
+        panic!("a direct table")
+    };
+    let pending = Arc::new(Pending {
+        state: Mutex::new(PendingState {
+            jobs: 0,
+            aio_jobs: 0,
+            out: Vec::new(),
+            row_bytes: 90,
+            error: None,
+        }),
+        done: Condvar::new(),
+    });
+    let jobs = |offsets: &[u64], len: usize| -> Vec<Job> {
+        offsets
+            .iter()
+            .map(|&offset| Job {
+                offset,
+                len,
+                uses: Vec::new(),
+                pending: pending.clone(),
+                shared: false,
+            })
+            .collect()
+    };
+    let p = PAGE as usize;
+    let own = d.join_reads(jobs(&[0, PAGE], p), false);
+    assert!(own.len() == 2 && own.iter().all(|j| j.shared));
+    // A fetch does not wait behind a read-ahead's read; a two-page read does not join one.
+    let own = d.join_reads(jobs(&[0], p), true);
+    assert!(own.len() == 1 && !own[0].shared);
+    let own = d.join_reads(jobs(&[PAGE], 2 * p), false);
+    assert!(own.len() == 1 && !own[0].shared);
+    let own = d.join_reads(jobs(&[2 * PAGE], p), true);
+    assert!(own.len() == 1 && own[0].shared);
+    // A read-ahead's joins both kinds.
+    assert!(
+        d.join_reads(jobs(&[0, PAGE, 2 * PAGE], p), false)
+            .is_empty()
+    );
+    assert_eq!(t.stats().joined_reads, 3);
+
+    // End to end: rank 0's read-ahead of a chunk is queued (the I/O threads held), and the
+    // other rank asks for the same rows meanwhile.
+    let t = open();
+    let Tier::Direct(d) = &t.tier else {
+        panic!("a direct table")
+    };
+    std::thread::scope(|s| {
+        let held = d.queue.jobs.lock().unwrap();
+        let ahead = s.spawn(|| t.prefetch(&picks));
+        let until = |what: &str, done: &dyn Fn() -> bool| {
+            let t0 = std::time::Instant::now();
+            while !done() {
+                assert!(t0.elapsed() < std::time::Duration::from_secs(10), "{what}");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        until("the read-ahead's reads in flight", &|| {
+            !d.queue.inflight.lock().unwrap().is_empty()
+        });
+        let pages = d.queue.inflight.lock().unwrap().len() as u64;
+        let peer = s.spawn(|| t.read_for_peer(&picks, false));
+        until("the peer's reads joined", &|| {
+            t.stats().joined_reads == pages
+        });
+        drop(held);
+        ahead.join().unwrap();
+        assert!(peer.join().unwrap().unwrap() == want(&rows, &picks));
+        assert_eq!(t.stats().reads, 2 * pages);
+    });
+    // The read-ahead's rows, from its reads.
+    assert!(t.fetch(&picks).unwrap() == want(&rows, &picks));
+    assert!(d.queue.inflight.lock().unwrap().is_empty());
 }

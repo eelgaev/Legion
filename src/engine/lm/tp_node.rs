@@ -40,6 +40,7 @@ fn serve_rows(exec: &Executor, cfg: &TpNetConfig) {
     let Some(table) = exec.model().ngram_table_shared() else {
         return;
     };
+    table.set_peer_log(cfg.profile > 0);
     for to in 1..cfg.n_ranks() {
         let t = table.clone();
         let read: tp_net::rows::ReadRows =
@@ -59,8 +60,9 @@ fn serve_rows(exec: &Executor, cfg: &TpNetConfig) {
 /// A rank above 0: takes rank 0's rows connection on a thread of its own (rank 0 dials it once
 /// this rank answers the control connection) and from then on asks rank 0 for the lookup-table
 /// rows its cache misses, instead of reading them from its own copy of the file: on two DGX
-/// Sparks that copy is the first's disk over NFS, ~6 times slower to read (#1176).
-fn take_rows(exec: &Executor, mut control: ControlListener) {
+/// Sparks that copy is the first's disk over NFS, ~6 times slower to read (#1176). `log`: one
+/// line per answer (`--tp-profile`).
+fn take_rows(exec: &Executor, mut control: ControlListener, log: bool) {
     let table = exec.model().ngram_table_shared();
     let taken = std::thread::Builder::new()
         .name("tp-rows-accept".into())
@@ -75,7 +77,7 @@ fn take_rows(exec: &Executor, mut control: ControlListener) {
             let Some(table) = table.filter(|_| rows_from_rank0()) else {
                 return;
             };
-            match tp_net::rows::Client::start(s) {
+            match tp_net::rows::Client::start(s, log) {
                 Ok(c) => {
                     let on = table.set_peer(c);
                     tracing::info!(
@@ -519,7 +521,7 @@ pub(super) fn follow(
         Ok(s) => s,
         Err(e) => return device(format!("rank {rank}: waiting for rank 0: {e}")),
     };
-    take_rows(&exec, control);
+    take_rows(&exec, control, cfg.profile > 0);
     let mut profile = StepProfile::new(cfg.profile);
     let mut rows = Default::default();
     let r = crate::node::serve_one(stream, &mut |req| {

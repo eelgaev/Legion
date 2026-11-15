@@ -129,6 +129,9 @@ struct Stage {
     /// Pinned host memory a step's argmaxes and logits rows are read back through
     /// ([`Inputs::output_with`]).
     ids_pin: Option<Context>,
+    /// Pinned host memory a step's late n-gram rows are gathered into and copied from
+    /// (`launch_stage`), kept across steps.
+    ple_pin: Option<Context>,
     /// Pinned host memory the MTP passes' inputs and outputs go through (the last stage's,
     /// [`mtp_window`]), and a decode or verify step's inputs ([`step_fill`]).
     mtp_io: PinnedIo,
@@ -179,6 +182,7 @@ impl Stage {
             bounce_b: None,
             bounce_small: None,
             ids_pin: None,
+            ple_pin: None,
             mtp_io: PinnedIo::default(),
             flow_io: PinnedIo::default(),
             flow_io_b: PinnedIo::default(),

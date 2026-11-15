@@ -44,8 +44,9 @@ const WAIT: Duration = Duration::from_secs(10);
 #[test]
 fn asks_get_their_rows_and_errors() {
     let (r0, r1) = pair();
-    serve(r0, table(), false).unwrap();
-    let c = Client::start(r1).unwrap();
+    // Logging on: the answers are the same.
+    serve(r0, table(), true).unwrap();
+    let c = Client::start(r1, true).unwrap();
     let many: Vec<u32> = (0..5000).map(|i| i * 7).collect();
     let a = ask(&c, vec![3, 9, 300], true);
     let b = ask(&c, many.clone(), false);
@@ -66,7 +67,7 @@ fn asks_get_their_rows_and_errors() {
 #[test]
 fn asks_fail_once_the_connection_ends() {
     let (r0, r1) = pair();
-    let c = Client::start(r1).unwrap();
+    let c = Client::start(r1, false).unwrap();
     // Nobody answers: the ask waits.
     let waiting = ask(&c, vec![1, 2], true);
     assert!(waiting.recv_timeout(Duration::from_millis(100)).is_err());
