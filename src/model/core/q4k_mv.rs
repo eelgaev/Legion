@@ -261,12 +261,11 @@ unsafe fn cuda_q4k_mv(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(),
             k: k as i32,
             n: n as i32,
         };
-        let per_step = (shape.warps * shape.rows) as i64;
         launch::launch(
             kernel,
             shape.warps,
             smem_bytes(k, n, shape),
-            w.ne[1].div_ceil(per_step) as usize,
+            (w.ne[1] as usize).div_ceil(shape.warps * shape.rows),
             &mut p,
             stream,
         )
