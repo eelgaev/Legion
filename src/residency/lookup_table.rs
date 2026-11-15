@@ -20,7 +20,12 @@
 //!   batches (a decode step's or a draft's rows, up to `--ngram-aio-max` pages) go out as Linux
 //!   AIO from the asking thread instead ([`aio`]): no thread to wake per read. With
 //!   `--ngram-keep-awake-ms`, a helper thread keeps the SSD out of its power-saving states while
-//!   fetches come ([`keep_awake`]).
+//!   fetches come ([`keep_awake`]). Under tensor parallelism over machines the other ranks
+//!   need the same rows as rank 0; a rank whose copy of the file is slow to read (another
+//!   machine's disk over NFS) asks rank 0 for the rows it misses instead ([`PeerRows`],
+//!   [`LookupTable::set_peer`]), which reads them from its own disk
+//!   ([`LookupTable::read_for_peer`]); the same bytes, and its own reads if rank 0 fails. A
+//!   batch AIO takes (a decode step's) it still reads itself: sooner than the round trip.
 //! - **auto:** ram when the table fits in available memory with a margin and may be locked;
 //!   otherwise direct, with a RAM cache sized to what is free. On a GPU that shares the host's
 //!   memory (GB10) always direct: the GPU's KV cache and buffers come later out of the same RAM
@@ -302,7 +307,20 @@ pub struct TableStats {
     pub read_bytes: u64,
     /// Pages read only to keep the SSD awake ([`keep_awake`]).
     pub keep_awake_reads: u64,
+    /// Rows (each once per batch) asked of the peer ([`PeerRows`]) instead of read.
+    pub peer_rows: u64,
 }
+
+/// Another rank that reads the table's rows for this one ([`LookupTable::set_peer`]): under
+/// tensor parallelism over machines, rank 0, from its own disk.
+pub trait PeerRows: Send + Sync {
+    /// Asks for `rows` (ascending, each once); `done` gets their bytes, row after row, or an
+    /// error (then this rank reads them itself). `urgent`: a step waits for them.
+    fn ask(&self, rows: Vec<u32>, urgent: bool, done: PeerDone);
+}
+
+/// What a [`PeerRows::ask`] calls with the rows' bytes, on any thread.
+pub type PeerDone = Box<dyn FnOnce(io::Result<Vec<u8>>) + Send>;
 
 impl TableStats {
     /// Rows the row cache did not hold.
@@ -616,8 +634,72 @@ impl LookupTable {
             },
             Tier::Direct(d) => {
                 self.take_prefetched(d);
-                d.issue(&self.parts, rows, false)
+                d.issue(&self.parts, rows, Ask::Fetch)
             }
+        }
+    }
+
+    /// From now on the direct tier asks `peer` for the rows it does not hold instead of
+    /// reading them; its own reads only when an ask fails, and for batches small enough for
+    /// AIO (a decode step's), which it reads sooner itself. Whether it took it: the RAM tiers
+    /// read their own memory, and a direct tier takes one peer.
+    pub fn set_peer(&self, peer: Arc<dyn PeerRows>) -> bool {
+        match &self.tier {
+            Tier::Direct(d) => d.peer.set(peer).is_ok(),
+            Tier::Mapped { .. } => false,
+        }
+    }
+
+    /// `rows`' bytes for another rank ([`PeerRows`]), row after row: the cached ones and reads
+    /// of the others, which the cache keeps as read ahead of this rank's own ask (that ask, not
+    /// this one, counts for the hot set). `urgent`: its step waits for them, so its reads go
+    /// before this rank's read-ahead; the read-ahead of this rank's that holds most of them
+    /// (the prompt's chunk it read ahead, the same chunk the other rank is at) is waited for
+    /// first, so its rows are not read twice.
+    pub fn read_for_peer(&self, rows: &[u32], urgent: bool) -> io::Result<Vec<u8>> {
+        if let Some(r) = rows.iter().find(|&&r| r as u64 >= self.file.n_rows) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("row {r} outside the {}-row table", self.file.n_rows),
+            ));
+        }
+        match &self.tier {
+            Tier::Mapped { .. } => self.collect(Ticket {
+                rows: rows.to_vec(),
+                pending: None,
+                missed: Vec::new(),
+                prefetch: false,
+            }),
+            Tier::Direct(d) => {
+                if urgent {
+                    self.take_prefetched_of(d, rows);
+                }
+                d.collect(
+                    d.issue(&self.parts, rows, Ask::Peer { urgent }),
+                    self.file.row_bytes,
+                )
+            }
+        }
+    }
+
+    /// Waits for the [`Self::prefetch`]es still out that hold at least half of `rows` (by a
+    /// sample of every 8th) and puts their rows in the cache; the others stay for the next
+    /// issue, which waits for them as before.
+    fn take_prefetched_of(&self, d: &Direct, rows: &[u32]) {
+        let taken: Vec<Ticket> = {
+            let mut p = self.prefetched.lock().unwrap_or_else(|e| e.into_inner());
+            let (take, keep) = std::mem::take(&mut *p).into_iter().partition(|t: &Ticket| {
+                // A prefetch's rows are ascending and each once (`prefetch_into`).
+                let (asked, held) = rows.iter().step_by(8).fold((0, 0), |(a, h), r| {
+                    (a + 1, h + usize::from(t.rows.binary_search(r).is_ok()))
+                });
+                asked > 0 && 2 * held >= asked
+            });
+            *p = keep;
+            take
+        };
+        for t in taken {
+            let _ = d.collect(t, self.file.row_bytes);
         }
     }
 
@@ -652,7 +734,7 @@ impl LookupTable {
             .collect();
         rows.sort_unstable();
         rows.dedup();
-        let t = d.issue(&self.parts, &rows, true);
+        let t = d.issue(&self.parts, &rows, Ask::Prefetch);
         into.lock().unwrap_or_else(|e| e.into_inner()).push(t);
     }
 
@@ -1170,6 +1252,87 @@ struct Direct {
     keep_awake: Option<keep_awake::KeepAwake>,
     /// [`fifo_queue`], read at open.
     fifo: bool,
+    /// Asked for the rows the cache misses instead of reading them ([`LookupTable::set_peer`]).
+    peer: std::sync::OnceLock<Arc<dyn PeerRows>>,
+}
+
+/// Who asks [`Direct::issue`] for rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ask {
+    /// A step, which waits for them ([`LookupTable::issue`]).
+    Fetch,
+    /// A later fetch's read-ahead ([`LookupTable::prefetch`]).
+    Prefetch,
+    /// Another rank ([`LookupTable::read_for_peer`]); `urgent`: for one of its fetches.
+    Peer { urgent: bool },
+}
+
+impl Ask {
+    /// Its reads go before the read-ahead's.
+    fn urgent(self) -> bool {
+        matches!(self, Ask::Fetch | Ask::Peer { urgent: true })
+    }
+}
+
+/// A [`PeerRows::ask`]'s rows: where they go, and the reads to make if it fails.
+struct PeerAsk {
+    /// The rows asked for, ascending.
+    rows: Vec<u32>,
+    /// (index in the ticket's rows, row): every miss of the ticket.
+    missed: Vec<(usize, u32)>,
+    pending: Arc<Pending>,
+    /// The ticket's page reads, for this rank to make itself.
+    jobs: Vec<Job>,
+    queue: Arc<Queue>,
+    urgent: bool,
+    fifo: bool,
+}
+
+impl PeerAsk {
+    /// Puts the peer's rows `got` into the ticket; on an error (or a wrong length) queues the
+    /// ticket's own reads instead.
+    fn done(self, got: io::Result<Vec<u8>>) {
+        let mut st = self.pending.state.lock().unwrap_or_else(|e| e.into_inner());
+        let rb = st.row_bytes;
+        let got = got.and_then(|b| {
+            if b.len() == self.rows.len() * rb {
+                Ok(b)
+            } else {
+                Err(io::Error::other(format!(
+                    "{} bytes for {} rows of {rb} bytes",
+                    b.len(),
+                    self.rows.len()
+                )))
+            }
+        });
+        match got {
+            Ok(bytes) => {
+                for &(i, r) in &self.missed {
+                    // Every miss is among the rows asked for.
+                    let k = self.rows.binary_search(&r).expect("an asked row");
+                    st.out[i * rb..][..rb].copy_from_slice(&bytes[k * rb..][..rb]);
+                }
+                st.jobs -= 1;
+                if st.jobs == 0 {
+                    self.pending.done.notify_all();
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, rows = self.rows.len(), "lookup table: the peer's rows failed, reading them here");
+                // The ask's job becomes the reads'.
+                st.jobs = st.jobs - 1 + self.jobs.len();
+                if st.jobs == 0 {
+                    self.pending.done.notify_all();
+                }
+                drop(st);
+                if !self.jobs.is_empty() {
+                    let mut q = self.queue.jobs.lock().unwrap_or_else(|e| e.into_inner());
+                    q.push(self.jobs, self.urgent, self.fifo);
+                    self.queue.ready.notify_all();
+                }
+            }
+        }
+    }
 }
 
 /// What [`keep_awake`] reads: a page of the bytes `start..start + len`, every `interval`.
@@ -1300,12 +1463,14 @@ impl Direct {
             aio_max: aio_max.min(aio::DEPTH),
             keep_awake,
             fifo: fifo_queue(),
+            peer: std::sync::OnceLock::new(),
         })
     }
 
-    /// `prefetch`: rows a later issue asks for ([`LookupTable::prefetch`]); the hot set counts
-    /// that ask, not this one.
-    fn issue(&self, parts: &Parts, rows: &[u32], prefetch: bool) -> Ticket {
+    /// `ask`: who wants the rows. Only a fetch counts for the hot set: a prefetch's rows are
+    /// asked for later ([`LookupTable::prefetch`]), and a peer's by this rank too.
+    fn issue(&self, parts: &Parts, rows: &[u32], ask: Ask) -> Ticket {
+        let prefetch = ask != Ask::Fetch;
         let rb = parts.row_bytes as usize;
         let mut out = vec![0u8; rows.len() * rb];
         let mut missed = Vec::new();
@@ -1331,20 +1496,45 @@ impl Direct {
         }
         let mut pages: Vec<_> = by_page.into_iter().collect();
         pages.sort_unstable_by_key(|(p, _)| *p);
+        // A peer reads the misses (never for another peer: that rank asked this one), except a
+        // batch AIO takes (a decode step's few pages): those come back sooner from here than
+        // over the peer's connection and its reads.
+        let small = self.aio.is_some() && pages.len() <= self.aio_max;
+        let peer = match ask {
+            Ask::Peer { .. } => None,
+            _ => self.peer.get().filter(|_| !pages.is_empty() && !small),
+        };
+        let asked: Vec<u32> = match peer {
+            Some(_) => {
+                let mut r: Vec<u32> = missed.iter().map(|&(_, r)| r).collect();
+                r.sort_unstable();
+                r.dedup();
+                r
+            }
+            None => Vec::new(),
+        };
         {
             let mut s = self.stats.lock().unwrap_or_else(|e| e.into_inner());
             s.rows += rows.len() as u64;
             s.cache_hits += (rows.len() - missed.len()) as u64;
-            s.reads += pages.len() as u64;
-            s.read_bytes += pages.iter().map(|(_, (len, _))| *len as u64).sum::<u64>();
+            if peer.is_some() {
+                s.peer_rows += asked.len() as u64;
+            } else {
+                s.reads += pages.len() as u64;
+                s.read_bytes += pages.iter().map(|(_, (len, _))| *len as u64).sum::<u64>();
+            }
         }
         if let Some(k) = &self.keep_awake {
-            k.touch(!pages.is_empty());
+            k.touch(!pages.is_empty() && peer.is_none());
         }
-        let aio = self.aio.as_ref().filter(|_| pages.len() <= self.aio_max);
+        let aio = self
+            .aio
+            .as_ref()
+            .filter(|_| pages.len() <= self.aio_max && peer.is_none());
         let pending = Arc::new(Pending {
             state: Mutex::new(PendingState {
-                jobs: pages.len(),
+                // A peer's ask is one job.
+                jobs: if peer.is_some() { 1 } else { pages.len() },
                 aio_jobs: if aio.is_some() { pages.len() } else { 0 },
                 out,
                 row_bytes: rb,
@@ -1361,6 +1551,24 @@ impl Direct {
                 pending: pending.clone(),
             })
             .collect();
+        if let Some(peer) = peer {
+            let a = PeerAsk {
+                rows: asked.clone(),
+                missed: missed.clone(),
+                pending: pending.clone(),
+                jobs,
+                queue: self.queue.clone(),
+                urgent: ask.urgent(),
+                fifo: self.fifo,
+            };
+            peer.ask(asked, ask.urgent(), Box::new(move |got| a.done(got)));
+            return Ticket {
+                rows: rows.to_vec(),
+                pending: Some(pending),
+                missed,
+                prefetch,
+            };
+        }
         // What AIO does not take (no free slots) goes to the threads.
         let jobs = match aio {
             Some(aio) => aio.submit(jobs),
@@ -1368,7 +1576,7 @@ impl Direct {
         };
         if !jobs.is_empty() {
             let mut q = self.queue.jobs.lock().unwrap_or_else(|e| e.into_inner());
-            q.push(jobs, !prefetch, self.fifo);
+            q.push(jobs, ask.urgent(), self.fifo);
             self.queue.ready.notify_all();
         }
         Ticket {
