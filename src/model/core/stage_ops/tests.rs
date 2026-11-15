@@ -50,6 +50,8 @@ fn decode_matmuls_are_listed() {
         "q_small_m_quantize",
         "q_small_m",
         "q4k_mv",
+        "l2_prefetch",
+        "l2_join",
     ] {
         assert!(PURE.contains(&name), "{name}");
     }
