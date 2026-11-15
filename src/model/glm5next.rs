@@ -47,6 +47,7 @@ use crate::model::core::{
 use crate::model::qwen4::{QsaInputs, pools_listed, pools_new, qsa_attn};
 use crate::model::{fp8, moe_ffn, nvfp4_mm};
 use crate::residency::ssd_experts::trace::Predictor;
+use tp_overlap::Edges;
 
 /// [`Model::glm_xh`]: the CUDA Q6_K prompt GEMM's tokens and weight rows at least (one tile
 /// of tokens, 8 of rows).
@@ -216,11 +217,13 @@ pub fn route_bias() -> f32 {
 /// How much of a `--tp-seq-par` step's per-token work beyond round 9's runs on the token share
 /// (#560 r10), each level the ones below and the same bits as all of them:
 /// 1 the indexer's shares cut by their cost ([`qsa_cut`]), 2 the indexer's query and head
-/// weight products on the share, 3 the router on the share, 4 (the default, round 12) fewer
-/// and smaller exchanges: the router's ids and weights in one, the indexer's picks instead of
-/// the selection rows ([`qsa_attn::select_vis`]), and with `--tp-overlap` halves down to
-/// 256 tokens (`tp_overlap`'s floor; below level 4, `tp_net::micro`'s 1,024).
-/// `LEGION_DEBUG_GLM_SHARE_LEVEL=0..4` takes a level for A/B runs (on every rank alike).
+/// weight products on the share, 3 the router on the share, 4 (round 12) fewer and smaller
+/// exchanges: the router's ids and weights in one, the indexer's picks instead of the
+/// selection rows ([`qsa_attn::select_vis`]), and with `--tp-overlap` halves down to 256
+/// tokens (`tp_overlap`'s floor; below level 4, `tp_net::micro`'s 1,024), 5 (the default,
+/// round 13) with `--tp-overlap` the sublayers' first and last products of BF16 weights by
+/// micro-batch too (`tp_overlap`'s edges).
+/// `LEGION_DEBUG_GLM_SHARE_LEVEL=0..5` takes a level for A/B runs (on every rank alike).
 fn share_level() -> u8 {
     static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *LEVEL.get_or_init(|| {
@@ -239,7 +242,7 @@ pub(crate) fn share_level_of(env: Option<&str>) -> u8 {
 }
 
 /// [`share_level`]'s default: all of them.
-pub(crate) const SHARE_LEVEL_DEFAULT: u8 = 4;
+pub(crate) const SHARE_LEVEL_DEFAULT: u8 = 5;
 
 /// The fewest tokens a rank's share may have for the scores to take the share's kernel
 /// (`qsa_attn::scores`' exact path, 8+ queries).
@@ -1580,6 +1583,19 @@ impl Model {
         x: Tensor<'a>,
         part: Part<'_>,
     ) -> Result<Tensor<'a>, ModelError> {
+        self.glm_kda_edges(pass, il, x, part, &Edges::default())
+    }
+
+    /// [`Self::glm_kda_on`] with `edges`' products of `x` made ahead and, with `edges.tail`,
+    /// the output projection's input returned instead of its output (`tp_overlap`, #560 r13).
+    fn glm_kda_edges<'a>(
+        &'a self,
+        pass: &Pass<'a>,
+        il: usize,
+        x: Tensor<'a>,
+        part: Part<'_>,
+        edges: &Edges<'a>,
+    ) -> Result<Tensor<'a>, ModelError> {
         let (ctx, tap) = (pass.ctx, &pass.tap);
         let p = self.glm();
         let hp = &self.hp;
@@ -1593,9 +1609,11 @@ impl Model {
         ];
         let qkv = [qkv[0].as_str(), qkv[1].as_str(), qkv[2].as_str()];
         let xh = self.glm_xh(ctx, il, &qkv, x);
-        let q = self.glm_lmm_h(ctx, il, qkv[0], x, xh)?;
-        let k = self.glm_lmm_h(ctx, il, qkv[1], x, xh)?;
-        let v = self.glm_lmm_h(ctx, il, qkv[2], x, xh)?;
+        let pre = |name: &str, xh| match edges.get(name) {
+            Some(t) => Ok(t),
+            None => self.glm_lmm_h(ctx, il, name, x, xh),
+        };
+        let (q, k, v) = (pre(qkv[0], xh)?, pre(qkv[1], xh)?, pre(qkv[2], xh)?);
         let (dt, ssm_a) = (
             self.lw(il, &format!("ssm_dt.bias{s}"))?,
             self.lw(il, &format!("ssm_a{s}"))?,
@@ -1632,13 +1650,10 @@ impl Model {
             );
             (b[0], a[2], Some(b[1]))
         } else {
-            let z = self.glm_lmm(ctx, il, &format!("ssm_f_a.weight{m}"), x)?;
+            let z = pre(&format!("ssm_f_a.weight{m}"), None)?;
             let z = self.glm_lmm(ctx, il, &format!("ssm_f_b.weight{s}"), z)?;
             let g = ops::kda_gate(ctx, z, dt, ssm_a, p.kda_lower);
-            let beta = ops::sigmoid(
-                ctx,
-                self.glm_lmm(ctx, il, &format!("ssm_beta.weight{s}"), x)?,
-            );
+            let beta = ops::sigmoid(ctx, pre(&format!("ssm_beta.weight{s}"), None)?);
             (g, beta, None)
         };
         tap.tap("kda_g1", il, g);
@@ -1691,12 +1706,15 @@ impl Model {
         let gate = match gate {
             Some(gate) => gate,
             None => {
-                let gate = self.glm_lmm(ctx, il, &format!("ssm_g_a.weight{m}"), x)?;
+                let gate = pre(&format!("ssm_g_a.weight{m}"), None)?;
                 self.glm_lmm(ctx, il, &format!("ssm_g_b.weight{s}"), gate)?
             }
         };
         let gate = ctx.reshape_2d(gate, d, h * pass.n);
         let o = ops::gated_rms(ctx, o, norm, Some(gate), hp.rms_eps);
+        if edges.tail {
+            return Ok(ctx.reshape_2d(o, c, pass.n));
+        }
         let out = self.glm_lmm(
             ctx,
             il,
@@ -1785,6 +1803,20 @@ impl Model {
         part: Part<'_>,
         sp: Option<(i32, usize, usize)>,
     ) -> Result<Tensor<'a>, ModelError> {
+        self.glm_dsa_edges(pass, il, x, part, sp, &Edges::default())
+    }
+
+    /// [`Self::glm_dsa_on`] with `edges`' products of `x` made ahead and, with `edges.tail`,
+    /// the output projection's input returned instead of its output (`tp_overlap`, #560 r13).
+    fn glm_dsa_edges<'a>(
+        &'a self,
+        pass: &Pass<'a>,
+        il: usize,
+        x: Tensor<'a>,
+        part: Part<'_>,
+        sp: Option<(i32, usize, usize)>,
+        edges: &Edges<'a>,
+    ) -> Result<Tensor<'a>, ModelError> {
         let (ctx, tap) = (pass.ctx, &pass.tap);
         let p = self.glm();
         let hp = &self.hp;
@@ -1808,9 +1840,14 @@ impl Model {
         // A mirrored weight's product / a split one's.
         let mm = |name: &str, x| self.glm_lmm(ctx, il, &format!("{name}{m}"), x);
         let sm = |name: &str, x| self.glm_lmm(ctx, il, &format!("{name}{s}"), x);
+        // A mirrored weight's product with x, made ahead or now.
+        let pre = |name: &str| match edges.get(&format!("{name}{m}")) {
+            Some(t) => Ok(t),
+            None => mm(name, x),
+        };
 
         // The indexer's key and gate rows of this step's tokens.
-        let ik = mm("indexer.attn_k.weight", x)?;
+        let ik = pre("indexer.attn_k.weight")?;
         let ik = ops::layer_norm(
             ctx,
             ik,
@@ -1819,11 +1856,11 @@ impl Model {
             p.norm_eps,
         );
         tap.tap("indexer_k", il, ik);
-        let ig = mm("indexer_compressor_gate.weight", x)?;
+        let ig = pre("indexer_compressor_gate.weight")?;
         tap.tap("indexer_gate", il, ig);
 
         // Queries, absorbed into the latent space: [kv_lora, n_head, n].
-        let qr = rms(mm("attn_q_a.weight", x)?, "attn_q_a_norm.weight")?;
+        let qr = rms(pre("attn_q_a.weight")?, "attn_q_a_norm.weight")?;
         tap.tap("q_resid", il, qr);
         // At GB10 prompt steps attn_q_b gives attn_k_b its rows in F16 (#862).
         let lw = |name: &str| self.lw(il, &format!("{name}{s}"));
@@ -1835,7 +1872,7 @@ impl Model {
         let q = ctx.reshape_3d(q, dh, nh, n);
         let q = sm("attn_k_b.weight", q)?;
         // The latents of this step's tokens.
-        let kv = rms(mm("attn_kv_a_mqa.weight", x)?, "attn_kv_a_norm.weight")?;
+        let kv = rms(pre("attn_kv_a_mqa.weight")?, "attn_kv_a_norm.weight")?;
 
         // The indexer's queries and head weights.
         let iq = mm("indexer.attn_q_b.weight", qr)?;
@@ -1987,6 +2024,9 @@ impl Model {
             sm("attn_v_b.weight", o)?
         };
         let o = ctx.reshape_2d(o, dh * nh, n);
+        if edges.tail {
+            return Ok(o);
+        }
         let out = sm("attn_output.weight", o)?;
         tap.tap("attn_out", il, out);
         Ok(out)

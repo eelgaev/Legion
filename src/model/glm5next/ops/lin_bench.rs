@@ -400,6 +400,98 @@ pub const GEMV_SHAPES: [GemvShape; 15] = [
     gs("one.shexp.down", 2048, 4096, 1),
 ];
 
+/// GLM-5.3-Flash NVFP4's BF16 products that `--tp-overlap` runs by micro-batch at a rank of two
+/// machines (#560 r13, `tp_overlap`'s edges), for [`edges_check`].
+pub const EDGE_SHAPES: [GemvShape; 10] = [
+    // KDA: q / k / v, f_a and g_a, beta (a rank's heads), attn_output
+    gs("kda.qkv", 4096, 4096, 1),
+    gs("kda.f_a", 4096, 128, 1),
+    gs("kda.beta", 4096, 32, 1),
+    gs("kda.o", 4096, 4096, 1),
+    // MLA: q_a, kv_a, the indexer's k and gate, attn_output
+    gs("mla.q_a", 4096, 1536, 1),
+    gs("mla.kv_a", 4096, 512, 1),
+    gs("idx.k", 4096, 128, 1),
+    gs("mla.o", 8192, 4096, 1),
+    // the shared expert: gate / up, down
+    gs("shexp.gu", 4096, 1024, 1),
+    gs("shexp.down", 1024, 4096, 1),
+];
+
+/// One shape's [`edges_check`]: the whole step's product against its pieces' (written into one
+/// tensor as `tp_overlap` writes them).
+pub struct EdgeCheck {
+    /// Milliseconds per call of the whole product and of all the pieces' products.
+    pub whole_ms: f64,
+    pub pieces_ms: f64,
+    /// [`bits_hash`] of each output.
+    pub whole: u64,
+    pub pieces: u64,
+    /// Output values whose bits differ.
+    pub differ: usize,
+}
+
+/// `shape`'s BF16 product (weights in [-0.05, 0.05), F32 activations in [-1, 1)) at a step of
+/// `n_tok` tokens on `backend`, once on all the columns and once on each of two ranks' pieces of
+/// each micro-batch ([`crate::tp_net::micro::piece`]), each piece's outputs written into one
+/// `[m, n]` tensor at its columns as `tp_overlap`'s edges do (#560 r13).
+pub fn edges_check(
+    backend: &mut Backend,
+    shape: GemvShape,
+    n_tok: usize,
+    reps: usize,
+    rounds: usize,
+) -> EdgeCheck {
+    use crate::model::core::cols;
+    use crate::tp_net::micro;
+    let GemvShape { k, m, .. } = shape;
+    let n = n_tok as i64;
+    let data = Context::new(4, 0);
+    let w = data.new_tensor(types::BF16, &[k, m]);
+    let x = data.new_tensor(types::F32, &[k, n]);
+    data.alloc_tensors(backend.buffer_type()).unwrap();
+    let wb: Vec<u8> = noise(w.elements(), 7)
+        .iter()
+        .flat_map(|v| to_bf16(v * 0.05).to_ne_bytes())
+        .collect();
+    w.set_bytes(&wb);
+    x.set_f32(&noise(x.elements(), 8));
+    let bt = backend.buffer_type();
+    // the pieces' graph: the tensor, 4 column views, 4 products, their join
+    let (cw, cp) = (Context::new(8, 16), Context::new(16, 32));
+    let whole = linear(&cw, w, x, 1.0, None).as_output();
+    let mut gw = cw.new_graph(16);
+    gw.expand(whole);
+    cw.alloc_graph(&gw, ComputeAllocator::new(bt)).unwrap();
+    let buf = super::super::tp_overlap::buffer(&cp, m, n, x);
+    let mut parts = Vec::new();
+    for j in 0..micro::MICRO {
+        for r in 0..2 {
+            let (a, c) = micro::piece(n_tok, r, 2, j, false);
+            let y = linear(&cp, w, cols(&cp, x, a as i64, c as i64), 1.0, None);
+            super::super::tp_overlap::write_into(y, buf, a as i64);
+            parts.push(y);
+        }
+    }
+    let pieces = super::super::tp_overlap::joined(&cp, buf, &parts).as_output();
+    let mut gp = cp.new_graph(32);
+    gp.expand(pieces);
+    cp.alloc_graph(&gp, ComputeAllocator::new(bt)).unwrap();
+    let ms = time_graphs(backend, &[&gw, &gp], reps, rounds);
+    let (a, b) = (whole.to_f32(), pieces.to_f32());
+    EdgeCheck {
+        whole_ms: ms[0],
+        pieces_ms: ms[1],
+        whole: bits_hash(&a),
+        pieces: bits_hash(&b),
+        differ: a
+            .iter()
+            .zip(&b)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count(),
+    }
+}
+
 /// One [`bf16_gemv`] kernel's time in [`gemv_ms`].
 pub struct GemvTiming {
     pub kernel: u8,

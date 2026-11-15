@@ -147,9 +147,20 @@ fn share_levels_from_the_environment() {
     assert_eq!(share_level_of(Some("0")), 0);
     assert_eq!(share_level_of(Some(" 2 ")), 2);
     assert_eq!(share_level_of(Some("3")), 3);
-    assert_eq!(SHARE_LEVEL_DEFAULT, 4);
+    assert_eq!(share_level_of(Some("4")), 4);
+    assert_eq!(SHARE_LEVEL_DEFAULT, 5);
     assert_eq!(share_level_of(Some("9")), SHARE_LEVEL_DEFAULT);
     assert_eq!(share_level_of(Some("x")), SHARE_LEVEL_DEFAULT);
+}
+
+#[test]
+fn edge_groups_from_the_environment() {
+    use tp_overlap::{EDGES_DEFAULT, edge_groups_of};
+    assert_eq!(edge_groups_of(None), EDGES_DEFAULT);
+    assert_eq!(edge_groups_of(Some("0")), 0);
+    assert_eq!(edge_groups_of(Some(" 17 ")), 17);
+    assert_eq!(edge_groups_of(Some("255")), 63);
+    assert_eq!(edge_groups_of(Some("x")), EDGES_DEFAULT);
 }
 
 #[test]

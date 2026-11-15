@@ -41,6 +41,12 @@ pub struct LinBenchArgs {
     /// `GEMV_SHAPES` names.
     #[arg(long)]
     gemv: bool,
+    /// Check GLM-5.3-Flash NVFP4's BF16 products by micro-batch instead (#560 r13,
+    /// `--tp-overlap`'s edges at a rank of two): each `EDGE_SHAPES` product at `--tokens`, on
+    /// all the columns and on each rank's piece of each micro-batch; fails when an output's bits
+    /// differ. `--shapes` takes the `EDGE_SHAPES` names.
+    #[arg(long)]
+    edges: bool,
     /// Tokens per decode step for `--gemv` (1-8), comma separated.
     #[arg(long, value_delimiter = ',', default_values_t = [1usize, 2, 3, 4, 8])]
     gemv_tokens: Vec<usize>,
@@ -60,6 +66,9 @@ pub fn run(args: LinBenchArgs) -> anyhow::Result<()> {
     }
     if args.gemv {
         return gemv(&mut gpu, &args);
+    }
+    if args.edges {
+        return edges(&mut gpu, &args);
     }
     println!(
         "{:<11} {:>6} {:>6} {:>6} {:>3} {:>6} {:>8} {:>9} {:>7} {:>8} {:>18}",
@@ -247,6 +256,56 @@ fn gemv(gpu: &mut legion::ggml::Backend, args: &LinBenchArgs) -> anyhow::Result<
     set_bf16_gemv(default);
     if differ > 0 {
         anyhow::bail!("{differ} outputs differ from linear_mv's bits");
+    }
+    Ok(())
+}
+
+/// `--edges`: [`legion::model::glm5next::ops::lin_bench::edges_check`] per shape and token count.
+#[cfg(feature = "cuda")]
+fn edges(gpu: &mut legion::ggml::Backend, args: &LinBenchArgs) -> anyhow::Result<()> {
+    use legion::model::glm5next::ops::lin_bench;
+    println!(
+        "{:<11} {:>6} {:>6} {:>6} {:>9} {:>9} {:>7} {:>18} {:>18} {:>7}",
+        "shape",
+        "k",
+        "m",
+        "tokens",
+        "whole ms",
+        "parts ms",
+        "ratio",
+        "whole bits",
+        "parts bits",
+        "differ"
+    );
+    let mut differ = 0;
+    for shape in lin_bench::EDGE_SHAPES {
+        if !args.shapes.is_empty() && !args.shapes.iter().any(|s| s == shape.name) {
+            continue;
+        }
+        for &n in &args.tokens {
+            anyhow::ensure!(
+                n >= 1024,
+                "--tokens {n}: micro-batch pieces of 256+ tokens take steps of 1024+"
+            );
+            let r = lin_bench::edges_check(gpu, shape, n, args.reps, args.rounds);
+            println!(
+                "{:<11} {:>6} {:>6} {:>6} {:>9.3} {:>9.3} {:>7.3} {:>18} {:>18} {:>7}",
+                shape.name,
+                shape.k,
+                shape.m,
+                n,
+                r.whole_ms,
+                r.pieces_ms,
+                r.pieces_ms / r.whole_ms,
+                format!("{:016x}", r.whole),
+                format!("{:016x}", r.pieces),
+                r.differ
+            );
+            differ += r.differ;
+        }
+    }
+    if differ > 0 {
+        anyhow::bail!("{differ} values differ in bits");
     }
     Ok(())
 }
