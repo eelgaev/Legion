@@ -1115,9 +1115,47 @@ struct Job {
     pending: Arc<Pending>,
 }
 
+/// The I/O threads' reads. A fetch's (a step waits for them) go before the reads of
+/// prefetches queued earlier: a prompt's next chunk is read ahead before the current chunk's
+/// step fills, so in one queue that fill's own reads waited behind the whole next chunk's. Over
+/// NFS, where 4 KiB reads at any depth come at ~108K/s (a second DGX Spark's table, #1176), a
+/// cold first step's late rows went from ~520 to ~820 ms behind a read-ahead.
 struct Queue {
-    jobs: Mutex<(VecDeque<Job>, bool)>,
+    jobs: Mutex<Jobs>,
     ready: Condvar,
+}
+
+#[derive(Default)]
+struct Jobs {
+    /// Fetches' reads, in the order asked.
+    urgent: VecDeque<Job>,
+    /// Prefetches' reads, in the order asked.
+    ahead: VecDeque<Job>,
+    /// The table closed: the threads end.
+    closed: bool,
+}
+
+impl Jobs {
+    /// Queues `jobs`: a fetch's (`urgent`) after the fetches queued before, a prefetch's after
+    /// everything. With `LEGION_DEBUG_NGRAM_FIFO=1` (`fifo`) every read goes in asking order.
+    fn push(&mut self, jobs: Vec<Job>, urgent: bool, fifo: bool) {
+        if urgent && !fifo {
+            self.urgent.extend(jobs);
+        } else {
+            self.ahead.extend(jobs);
+        }
+    }
+
+    /// The next read to go out: the oldest fetch's, else the oldest prefetch's.
+    fn pop(&mut self) -> Option<Job> {
+        self.urgent.pop_front().or_else(|| self.ahead.pop_front())
+    }
+}
+
+/// `LEGION_DEBUG_NGRAM_FIFO=1`: the direct tier's I/O threads take every read in asking order,
+/// prefetches' and fetches' alike (the old queue; for A/B runs only).
+fn fifo_queue() -> bool {
+    std::env::var_os("LEGION_DEBUG_NGRAM_FIFO").is_some_and(|v| v == "1")
 }
 
 struct Direct {
@@ -1130,6 +1168,8 @@ struct Direct {
     /// Batches of at most this many pages go to `aio`.
     aio_max: usize,
     keep_awake: Option<keep_awake::KeepAwake>,
+    /// [`fifo_queue`], read at open.
+    fifo: bool,
 }
 
 /// What [`keep_awake`] reads: a page of the bytes `start..start + len`, every `interval`.
@@ -1209,7 +1249,7 @@ impl Direct {
             .flatten()
             .map(Box::new);
         let queue = Arc::new(Queue {
-            jobs: Mutex::new((VecDeque::new(), false)),
+            jobs: Mutex::new(Jobs::default()),
             ready: Condvar::new(),
         });
         let workers = (0..inflight.max(1))
@@ -1259,6 +1299,7 @@ impl Direct {
             aio,
             aio_max: aio_max.min(aio::DEPTH),
             keep_awake,
+            fifo: fifo_queue(),
         })
     }
 
@@ -1327,7 +1368,7 @@ impl Direct {
         };
         if !jobs.is_empty() {
             let mut q = self.queue.jobs.lock().unwrap_or_else(|e| e.into_inner());
-            q.0.extend(jobs);
+            q.push(jobs, !prefetch, self.fifo);
             self.queue.ready.notify_all();
         }
         Ticket {
@@ -1385,7 +1426,7 @@ impl Drop for Direct {
     fn drop(&mut self) {
         {
             let mut q = self.queue.jobs.lock().unwrap_or_else(|e| e.into_inner());
-            q.1 = true;
+            q.closed = true;
         }
         self.queue.ready.notify_all();
         for w in self.workers.drain(..) {
@@ -1401,10 +1442,10 @@ fn io_worker(file: &File, queue: &Queue) {
         let job = {
             let mut q = queue.jobs.lock().unwrap_or_else(|e| e.into_inner());
             loop {
-                if let Some(j) = q.0.pop_front() {
+                if let Some(j) = q.pop() {
                     break j;
                 }
-                if q.1 {
+                if q.closed {
                     return;
                 }
                 q = queue.ready.wait(q).unwrap_or_else(|e| e.into_inner());
