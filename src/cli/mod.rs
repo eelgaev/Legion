@@ -23,6 +23,7 @@ mod lin_bench;
 mod logging;
 mod mla_bench;
 mod mmq_ids_bench;
+mod mmvq_once_bench;
 mod model_path;
 mod nvfp4_gemm_bench;
 mod nvfp4_mv_bench;
@@ -153,6 +154,10 @@ enum Command {
     /// (development).
     #[command(hide = true)]
     Nvfp4OnceBench(nvfp4_once_bench::Nvfp4OnceBenchArgs),
+    /// Check and time the stream-each-expert-once quantized expert ops against ggml's mmvq
+    /// (development).
+    #[command(hide = true)]
+    MmvqOnceBench(mmvq_once_bench::MmvqOnceBenchArgs),
     /// Check and time the tensor-core NVFP4 dense matvec op against ggml's mmvq (development).
     #[command(hide = true)]
     Nvfp4MvqBench(nvfp4_mvq_bench::Nvfp4MvqBenchArgs),
@@ -263,6 +268,7 @@ async fn run(cli: Cli, numa: Option<legion::hw::numa_bind::Placement>) -> anyhow
         Command::HcUpMixBench(args) => hc_up_mix_bench::run(args),
         Command::HcLazyBench(args) => hc_lazy_bench::run(args),
         Command::Nvfp4OnceBench(args) => nvfp4_once_bench::run(args),
+        Command::MmvqOnceBench(args) => mmvq_once_bench::run(args),
         Command::Nvfp4MvqBench(args) => nvfp4_mvq_bench::run(args),
         Command::Fp8SlicedBench(args) => fp8_sliced_bench::run(args),
         Command::Q4kHeadBench(args) => q4k_head_bench::run(args),

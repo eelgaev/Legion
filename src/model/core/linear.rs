@@ -815,6 +815,12 @@ impl Linear {
             // ggml's MMVQ bits and its scale chain's, each routed expert read once per step (#836).
             return Ok(super::nvfp4_once::mul_mat_id(ctx, w, x, ids, scale));
         }
+        if !super::expert_mv::usable(w, x, ids) && super::mmvq_once::usable(w, scale, x, ids) {
+            // Quantized GGUF experts at 1-8 tokens on a GB10 under LEGION_DEBUG_MMVQ_ONCE=all or
+            // split: ggml's quantize_q8_1 + MMVQ bits, each routed expert's rows streamed once
+            // per step (#1176).
+            return Ok(super::mmvq_once::mul_mat_id(ctx, w, x, ids));
+        }
         let res = if super::expert_mv::usable(w, x, ids) {
             super::expert_mv::mul_mat_id(ctx, w, x, ids)
         } else if super::mmq_ids::usable(w, x, ids) {
