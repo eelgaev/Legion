@@ -1732,7 +1732,33 @@ int launch_linear(const A & a, cudaStream_t st) {
         const dim3 grid((unsigned) ((p.m + 3) / 4), (unsigned) p.h);
         // params[2]: the GB10 kernels (ops::set_gb10_linear): the staged Q6_K GEMV, for rows it takes
         const bool st16 = ((int64_t) ((uintptr_t) p.w | p.w_nb1 | p.w_nb2) % 16) == 0;
-        if (wt == T_Q6_K && a.params[2] && st16 && p.k % (256 * KQ_STAGE) == 0) {
+        // params[7] (ops::q6k_mv, #1172 r3): linear_mv_q6k_rw's rows a warp (bits 0-7; whole
+        // stages of contiguous rows, ops checks w_nb1), two stages in flight (bit 8), early launch
+        // of the next kernel (bit 9); runs start 16-byte aligned. 1-4 tokens: at 5-8 its warp_sum per
+        // short row costs more than the 2-byte loads it saves (k_b at 8 tokens 96 -> 64 GB/s)
+        const int rw = a.params[7] & 255;
+        const bool rw16 = ((int64_t) ((uintptr_t) p.w | (p.h > 1 ? p.w_nb2 : 0)) % 16) == 0 &&
+                          p.w_nb1 == p.k / 256 * 210;
+        if (wt == T_Q6_K && a.params[2] && rw > 0 && rw16 && p.n <= 4 && p.m % rw == 0 &&
+            p.k / 256 * rw % KQ_STAGE == 0) {
+            const dim3 g((unsigned) ((p.m / rw + 3) / 4), (unsigned) p.h);
+            const int early = (a.params[7] >> 9) & 1;
+            if ((a.params[7] >> 8) & 1) {
+                if (p.n == 1) {
+                    launch_pdl(linear_mv_q6k_rw<1, 2>, g, 128, 0, st, p, rw, early);
+                } else if (p.n == 2) {
+                    launch_pdl(linear_mv_q6k_rw<2, 2>, g, 128, 0, st, p, rw, early);
+                } else {
+                    launch_pdl(linear_mv_q6k_rw<4, 2>, g, 128, 0, st, p, rw, early);
+                }
+            } else if (p.n == 1) {
+                launch_pdl(linear_mv_q6k_rw<1, 1>, g, 128, 0, st, p, rw, early);
+            } else if (p.n == 2) {
+                launch_pdl(linear_mv_q6k_rw<2, 1>, g, 128, 0, st, p, rw, early);
+            } else {
+                launch_pdl(linear_mv_q6k_rw<4, 1>, g, 128, 0, st, p, rw, early);
+            }
+        } else if (wt == T_Q6_K && a.params[2] && st16 && p.k % (256 * KQ_STAGE) == 0) {
             if (p.n == 1) {
                 launch_pdl(linear_mv_q6k_st<1>, grid, 128,0, st, p);
             } else if (p.n == 2) {

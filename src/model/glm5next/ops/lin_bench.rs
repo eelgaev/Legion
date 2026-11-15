@@ -479,3 +479,126 @@ pub fn gemv_ms(
         })
         .collect()
 }
+
+/// GLM-5.3-Flash Maya-S's Q6_K decode matvecs (`legion lin-bench --q6k`, #1172 r3), per-layer
+/// counts in the comments.
+pub const Q6K_SHAPES: [GemvShape; 13] = [
+    // KDA layers (34): attn_q / attn_k / attn_v, attn_output (and nextn.eh_proj)
+    gs("kda.qkv", 4096, 8192, 1),
+    gs("kda.o", 8192, 4096, 1),
+    // MLA layers (12)
+    gs("mla.q_a", 4096, 1536, 1),
+    gs("mla.kv_a", 4096, 512, 1),
+    gs("mla.q_b", 1536, 16384, 1),
+    gs("mla.k_b", 256, 512, 64),
+    gs("mla.v_b", 512, 256, 64),
+    gs("mla.o", 16384, 4096, 1),
+    // shared experts (43): gate / up, down
+    gs("shexp.gu", 4096, 2048, 1),
+    gs("shexp.down", 2048, 4096, 1),
+    // the leading dense FFNs (3)
+    gs("ffn.gu", 4096, 12288, 1),
+    gs("ffn.down", 12288, 4096, 1),
+    gs("head", 4096, 154880, 1),
+];
+
+/// One [`super::q6k_mv`] mode's time in [`q6k_ms`].
+pub struct Q6kTiming {
+    pub mode: u8,
+    /// Milliseconds per product: the best round's mean.
+    pub ms: f64,
+    /// Output values whose bits differ from the first mode's (every copy's output).
+    pub differ: usize,
+}
+
+/// Valid random Q6_K rows: random quants and int8 scales, block scales in [2^-12, 2^-11).
+fn q6k_noise(blocks: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let mut out = Vec::with_capacity(blocks * 210);
+    for _ in 0..blocks {
+        for _ in 0..208 / 8 {
+            out.extend_from_slice(&next().to_ne_bytes());
+        }
+        let d = (1.0 + (next() >> 40) as f32 / (1u64 << 24) as f32) / 4096.0;
+        out.extend_from_slice(&f16_bytes(&[d]));
+    }
+    out
+}
+
+/// Times Q6_K `shape` at `n_tok` tokens (1-8) on `backend` for each [`super::q6k_mv`] mode of
+/// `modes` (random Q6_K weights, F32 activations in [-1, 1)), as [`gemv_ms`] does: each graph
+/// holds the product on distinct copies of the weights (~384 MB in all), back to back as a
+/// step's matvecs run. Counts the output values whose bits differ from the first mode's.
+pub fn q6k_ms(
+    backend: &mut Backend,
+    shape: GemvShape,
+    n_tok: usize,
+    reps: usize,
+    rounds: usize,
+    modes: &[u8],
+) -> Vec<Q6kTiming> {
+    let GemvShape { k, m, h, .. } = shape;
+    let n = n_tok as i64;
+    let blocks = (k / 256 * m * h) as usize;
+    let copies = (384usize << 20).div_ceil(blocks * 210).clamp(1, 48);
+    let data = Context::new(copies + 2, 0);
+    let ws: Vec<Tensor<'_>> = (0..copies)
+        .map(|_| data.new_tensor(types::Q6_K, &[k, m, h]))
+        .collect();
+    let x = if h == 1 {
+        data.new_tensor(types::F32, &[k, n])
+    } else {
+        data.new_tensor(types::F32, &[k, h, n])
+    };
+    data.alloc_tensors(backend.buffer_type()).unwrap();
+    for (i, w) in ws.iter().enumerate() {
+        w.set_bytes(&q6k_noise(blocks, 7 + i as u64));
+    }
+    x.set_f32(&noise(x.elements(), 8));
+    let bt = backend.buffer_type();
+    let ctxs: Vec<Context> = modes
+        .iter()
+        .map(|_| Context::new(copies + 4, copies + 16))
+        .collect();
+    let graphs: Vec<(Vec<Tensor<'_>>, Graph<'_>)> = ctxs
+        .iter()
+        .zip(modes)
+        .map(|(ctx, &mode)| {
+            set_q6k_mv(mode);
+            let mut graph = ctx.new_graph(copies + 16);
+            let outs: Vec<Tensor<'_>> = ws
+                .iter()
+                .map(|&w| {
+                    let out = linear(ctx, w, x, 1.0, None).as_output();
+                    graph.expand(out);
+                    out
+                })
+                .collect();
+            ctx.alloc_graph(&graph, ComputeAllocator::new(bt)).unwrap();
+            (outs, graph)
+        })
+        .collect();
+    let refs: Vec<&Graph<'_>> = graphs.iter().map(|(_, g)| g).collect();
+    let ms = time_graphs(backend, &refs, reps, rounds);
+    let first: Vec<Vec<u8>> = graphs[0].0.iter().map(|o| o.bytes()).collect();
+    modes
+        .iter()
+        .zip(&graphs)
+        .zip(ms)
+        .map(|((&mode, (outs, _)), ms)| Q6kTiming {
+            mode,
+            ms: ms / copies as f64,
+            differ: outs
+                .iter()
+                .zip(&first)
+                .map(|(o, f)| differing(f, &o.bytes(), 4))
+                .sum(),
+        })
+        .collect()
+}

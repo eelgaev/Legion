@@ -755,6 +755,35 @@ fn bf16_gemv_takes_the_debug_switch() {
 }
 
 #[test]
+fn q6k_mv_takes_the_debug_switch() {
+    assert_eq!(q6k_mv_of(None), Q6K_MV_DEFAULT);
+    assert_eq!(q6k_mv_of(Some(" 7\n")), 7);
+    assert_eq!(q6k_mv_of(Some("8")), 0);
+    assert_eq!(q6k_mv_of(Some("x")), Q6K_MV_DEFAULT);
+}
+
+#[test]
+fn q6k_mv_param_makes_whole_stages_of_contiguous_rows() {
+    let nb1 = |k: i64| k / 256 * 210;
+    // off, or rows not contiguous
+    assert_eq!(q6k_mv_param(0, 4096, 8192, nb1(4096)), 0);
+    assert_eq!(q6k_mv_param(1, 4096, 8192, nb1(4096) + 2), 0);
+    // rows of whole 8-super-block stages stay on the staged kernel
+    assert_eq!(q6k_mv_param(1, 4096, 8192, nb1(4096)), 0);
+    assert_eq!(q6k_mv_param(0x17, 2048, 4096, nb1(2048)), 0);
+    // else the fewest rows a warp that make whole stages
+    assert_eq!(q6k_mv_param(1, 1536, 16384, nb1(1536)), 4);
+    assert_eq!(q6k_mv_param(1, 512, 256, nb1(512)), 4);
+    assert_eq!(q6k_mv_param(1, 256, 512, nb1(256)), 8);
+    // more rows (bits 4-6), two stages (bit 1 -> 8), early launch (bit 2 -> 9)
+    assert_eq!(q6k_mv_param(0x11, 512, 256, nb1(512)), 8);
+    assert_eq!(q6k_mv_param(0x23, 1536, 16384, nb1(1536)), 16 | 1 << 8);
+    assert_eq!(q6k_mv_param(0x07, 256, 512, nb1(256)), 8 | 1 << 8 | 1 << 9);
+    // m no multiple of the rows a warp
+    assert_eq!(q6k_mv_param(1, 256, 12, nb1(256)), 0);
+}
+
+#[test]
 fn wf16_rounds_q6k_values_like_ggml() {
     let (k, m, h) = (512usize, 3usize, 2usize);
     let w = noise(k * m * h, 43)

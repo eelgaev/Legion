@@ -339,6 +339,133 @@ __global__ void __launch_bounds__(128) linear_mv_q6k_st(const Lin p) {
     }
 }
 
+// linear_mv_q6k_st over R consecutive rows a warp (#1172 r3, params[7], ops::q6k_mv): the rows of
+// a matrix are contiguous, so the warp streams their super-blocks as one run, KQ_STAGE at a time
+// with D stages in flight in registers, the first D loaded before pdl_wait (weights are no
+// kernel's output). Each super-block is summed as linear_mv_q6k_st sums it, and a row's totals go
+// through warp_sum and out right after its last super-block: every row gets linear_mv_q6k's
+// values in its order, the same bits. Rows shorter than a stage (MLA's k_b and v_b, 256 and 512
+// values a head) share one, and rows that are no whole number of stages (q_b, 1536) take R of
+// them that are; both otherwise run linear_mv_q6k's 2-byte loads. `early` lets the next kernel
+// launch once every block is past its wait (griddepcontrol.launch_dependents): it waits in its
+// own pdl_wait as before, so nothing reads a value sooner, but its blocks are resident (and a
+// GEMV's first stages loaded) while this one drains. The launcher checks m % R == 0, R k / 256 a
+// multiple of KQ_STAGE and the runs' 16-byte alignment.
+__device__ __forceinline__ void pdl_trigger() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+#endif
+}
+
+template <int N, int D>
+__global__ void __launch_bounds__(128) linear_mv_q6k_rw(const Lin p, int R, int early) {
+    __shared__ uint4 sm[4][KQ_STAGE_V];
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int64_t r0 = ((int64_t) blockIdx.x * 4 + warp) * R, i = blockIdx.y;
+    const int64_t nbr = p.k / 256;
+    const int64_t ns = r0 < p.m ? R * nbr / KQ_STAGE : 0;
+    const uint4 * run = (const uint4 *) (p.w + r0 * p.w_nb1 + i * p.w_nb2);
+    uint4 reg[D][KQ_STAGE_PER];
+#pragma unroll
+    for (int d = 0; d < D; d++) {
+#pragma unroll
+        for (int e = 0; e < KQ_STAGE_PER; e++) {
+            if (d < ns && lane + 32 * e < KQ_STAGE_V) {
+                reg[d][e] = __ldcs(run + d * KQ_STAGE_V + lane + 32 * e);
+            }
+        }
+    }
+    pdl_wait();
+    if (early) {
+        pdl_trigger();
+    }
+    if (ns == 0) {
+        return;
+    }
+    const int n = lane / 16, l = (lane % 16) * 2;
+    float acc[N];
+#pragma unroll
+    for (int t = 0; t < N; t++) {
+        acc[t] = 0.0f;
+    }
+    int64_t r = r0, b = 0;  // the row and super-block the next one summed belongs to
+    const char * sb = (const char *) sm[warp];
+    for (int64_t s0 = 0; s0 < ns; s0 += D) {
+#pragma unroll
+        for (int d = 0; d < D; d++) {
+            const int64_t sg = s0 + d;
+            if (sg >= ns) {
+                break;
+            }
+#pragma unroll
+            for (int e = 0; e < KQ_STAGE_PER; e++) {
+                if (lane + 32 * e < KQ_STAGE_V) {
+                    sm[warp][lane + 32 * e] = reg[d][e];
+                }
+            }
+            __syncwarp();
+            if (sg + D < ns) {
+#pragma unroll
+                for (int e = 0; e < KQ_STAGE_PER; e++) {
+                    if (lane + 32 * e < KQ_STAGE_V) {
+                        reg[d][e] = __ldcs(run + (sg + D) * KQ_STAGE_V + lane + 32 * e);
+                    }
+                }
+            }
+#pragma unroll
+            for (int bb = 0; bb < KQ_STAGE; bb++) {
+                const char * blk = sb + bb * 210;
+                const uint32_t a = *(const uint16_t *) (blk + 64 * n + l);
+                const uint32_t c = *(const uint16_t *) (blk + 64 * n + 32 + l);
+                const uint32_t h = *(const uint16_t *) (blk + 128 + 32 * n + l);
+                const float dd = __half2float(*(const __half *) (blk + 208));
+                const int8_t * sc = (const int8_t *) (blk + 192 + 8 * n + l / 16);
+                float ds[4];
+#pragma unroll
+                for (int q = 0; q < 4; q++) {
+                    ds[q] = dd * (float) sc[2 * q];
+                }
+                float v[4][2];
+#pragma unroll
+                for (int j = 0; j < 2; j++) {
+                    const uint32_t qa = (a >> (8 * j)) & 0xFF, qc = (c >> (8 * j)) & 0xFF, qh = (h >> (8 * j)) & 0xFF;
+                    v[0][j] = (float) ((int) ((qa & 0xF) | ((qh & 3) << 4)) - 32);
+                    v[1][j] = (float) ((int) ((qc & 0xF) | (((qh >> 2) & 3) << 4)) - 32);
+                    v[2][j] = (float) ((int) ((qa >> 4) | (((qh >> 4) & 3) << 4)) - 32);
+                    v[3][j] = (float) ((int) ((qc >> 4) | (((qh >> 6) & 3) << 4)) - 32);
+                }
+#pragma unroll
+                for (int t = 0; t < N; t++) {
+                    if (t < p.n) {
+                        const float * x = (const float *) (p.x + i * p.x_nbi + t * p.x_nbt) + b * 256 + 128 * n + l;
+                        float s = 0.0f;
+#pragma unroll
+                        for (int q = 0; q < 4; q++) {
+                            const float2 xv = __ldg((const float2 *) (x + 32 * q));
+                            s += ds[q] * (v[q][0] * xv.x + v[q][1] * xv.y);
+                        }
+                        acc[t] += s;
+                    }
+                }
+                if (++b == nbr) {
+                    const float scl = lin_scale(p, r);
+#pragma unroll
+                    for (int t = 0; t < N; t++) {
+                        const float s = warp_sum(acc[t]);
+                        if (lane == 0 && t < p.n) {
+                            p.dst[(t * p.h + i) * p.m + r] = s * scl;
+                        }
+                        acc[t] = 0.0f;
+                    }
+                    b = 0;
+                    r++;
+                }
+            }
+            __syncwarp();
+        }
+    }
+}
+
 // Q4_K rows for a few tokens: lane = 8 g + j / 4 takes values 64 g + j .. + 3 (low nibbles of one
 // 32-bit word of qs, scale 2 g) and 64 g + 32 + j .. + 3 (its high nibbles, scale 2 g + 1); the
 // block header (d, dmin, scales) in one 16-byte load the warp shares; activations in float4s.

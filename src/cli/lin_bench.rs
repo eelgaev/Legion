@@ -49,6 +49,15 @@ pub struct LinBenchArgs {
     /// linear_mv_bf16x, 3 also above 8 tokens), comma separated.
     #[arg(long, value_delimiter = ',', default_values_t = [0u8, 1, 2])]
     gemv_kernels: Vec<u8>,
+    /// Time GLM-5.3-Flash Maya-S's Q6_K decode matvecs instead (#1172 r3): each
+    /// `LEGION_DEBUG_GLM_Q6K_MV` mode of `--q6k-modes` at `--gemv-tokens` (1-8), in GB/s of
+    /// weights; fails when an output value's bits differ from the first mode's. `--shapes` takes
+    /// the `Q6K_SHAPES` names.
+    #[arg(long)]
+    q6k: bool,
+    /// `LEGION_DEBUG_GLM_Q6K_MV` modes for `--q6k`, comma separated.
+    #[arg(long, value_delimiter = ',', default_values_t = [0u8, 1, 3, 5, 7, 17, 19])]
+    q6k_modes: Vec<u8>,
 }
 
 #[cfg(feature = "cuda")]
@@ -65,6 +74,9 @@ pub fn run(args: LinBenchArgs) -> anyhow::Result<()> {
     }
     if args.gemv {
         return gemv(&mut gpu, &args);
+    }
+    if args.q6k {
+        return q6k(&mut gpu, &args);
     }
     println!(
         "{:<11} {:>6} {:>6} {:>6} {:>3} {:>6} {:>8} {:>9} {:>7} {:>8} {:>18}",
@@ -261,6 +273,52 @@ fn gemv(gpu: &mut legion::ggml::Backend, args: &LinBenchArgs) -> anyhow::Result<
     set_bf16_gemv(default);
     if differ > 0 {
         anyhow::bail!("{differ} outputs differ from the first kernel's bits");
+    }
+    Ok(())
+}
+
+/// `--q6k`: [`legion::model::glm5next::ops::lin_bench::q6k_ms`] per shape and token count.
+#[cfg(feature = "cuda")]
+fn q6k(gpu: &mut legion::ggml::Backend, args: &LinBenchArgs) -> anyhow::Result<()> {
+    use legion::model::glm5next::ops::{lin_bench, q6k_mv, set_q6k_mv};
+    let default = q6k_mv();
+    println!(
+        "{:<11} {:>6} {:>6} {:>3} {:>6} {:>5} {:>9} {:>7} {:>8} {:>7}",
+        "shape", "k", "m", "h", "tokens", "mode", "ms/call", "GB/s", "vs 1st", "differ"
+    );
+    let mut differ = 0;
+    for shape in lin_bench::Q6K_SHAPES {
+        if !args.shapes.is_empty() && !args.shapes.iter().any(|s| s == shape.name) {
+            continue;
+        }
+        for &n in &args.gemv_tokens {
+            anyhow::ensure!(
+                (1..=8).contains(&n),
+                "--gemv-tokens {n}: the Q6_K matvecs take 1-8 tokens"
+            );
+            let t = lin_bench::q6k_ms(gpu, shape, n, args.reps, args.rounds, &args.q6k_modes);
+            let bytes = (shape.k / 256 * 210 * shape.m * shape.h) as f64;
+            for r in &t {
+                println!(
+                    "{:<11} {:>6} {:>6} {:>3} {:>6} {:>5} {:>9.4} {:>7.1} {:>8.3} {:>7}",
+                    shape.name,
+                    shape.k,
+                    shape.m,
+                    shape.h,
+                    n,
+                    r.mode,
+                    r.ms,
+                    bytes / r.ms / 1e6,
+                    r.ms / t[0].ms,
+                    r.differ
+                );
+                differ += r.differ;
+            }
+        }
+    }
+    set_q6k_mv(default);
+    if differ > 0 {
+        anyhow::bail!("{differ} output values differ from the first mode's bits");
     }
     Ok(())
 }

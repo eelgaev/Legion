@@ -219,8 +219,87 @@ pub fn linear_io<'a>(
             } else {
                 0
             },
+            if GB10_GEMV.load(Ordering::Relaxed) && w.ty() == types::Q6_K {
+                q6k_mv_param(q6k_mv(), k, m, w.nb()[1] as i64)
+            } else {
+                0
+            },
         ],
     )
+}
+
+/// [`q6k_mv`] before the first read: the environment's choice.
+const Q6K_MV_UNSET: u8 = u8::MAX;
+
+static Q6K_MV: AtomicU8 = AtomicU8::new(Q6K_MV_UNSET);
+
+/// The Q6_K decode GEMV of [`set_gb10_gemv`]'s steps (8 tokens or fewer, #1172 r3; the node's
+/// `params[7]`, [`q6k_mv_param`]). 0: linear_mv_q6k_st on rows of whole stages (2048 values),
+/// linear_mv_q6k (2-byte loads) on the others. Bit 0: linear_mv_q6k_rw on those others at 1-4 tokens,
+/// linear_mv_q6k_st's lanes over several contiguous rows a warp (MLA's q_b, k_b and v_b), its first
+/// stages loaded before the wait for the kernel ahead; bit 1: two stages in flight; bit 2: the
+/// next kernel launched once every block is past its wait; bits 4-6: log2 of more rows a warp.
+/// Every lane sums the same values in the same order in all of them: the same bits.
+/// `LEGION_DEBUG_GLM_Q6K_MV` picks one for A/B runs (0: as before).
+pub fn q6k_mv() -> u8 {
+    let v = Q6K_MV.load(Ordering::Relaxed);
+    if v != Q6K_MV_UNSET {
+        return v;
+    }
+    let v = q6k_mv_of(std::env::var("LEGION_DEBUG_GLM_Q6K_MV").ok().as_deref());
+    Q6K_MV.store(v, Ordering::Relaxed);
+    v
+}
+
+/// [`q6k_mv`] given the environment's value.
+pub(crate) fn q6k_mv_of(env: Option<&str>) -> u8 {
+    match env.map(str::trim).and_then(|s| s.parse::<u8>().ok()) {
+        Some(v) => v & Q6K_MV_BITS,
+        None => Q6K_MV_DEFAULT,
+    }
+}
+
+/// [`q6k_mv`]'s default: linear_mv_q6k_rw on MLA's q_b, k_b and v_b (a DGX Spark at one user:
+/// those three 141 / 66 / 85 GB/s -> 174 / 128 / 126 at 3 tokens, ~1 ms off an 85 ms verify
+/// step). Bits 1 and 2 gained nothing there.
+pub(crate) const Q6K_MV_DEFAULT: u8 = 1;
+
+/// The bits [`q6k_mv`] uses.
+const Q6K_MV_BITS: u8 = 0x77;
+
+/// Sets [`q6k_mv`] for [`linear`]s built from now on (`legion lin-bench --q6k`).
+pub fn set_q6k_mv(v: u8) {
+    Q6K_MV.store(v & Q6K_MV_BITS, Ordering::Relaxed);
+}
+
+/// Super-blocks a linear_mv_q6k_rw stage holds (the kernel file's KQ_STAGE).
+const Q6K_STAGE: i64 = 8;
+
+/// A Q6_K [`linear`]'s `params[7]` for [`q6k_mv`] mode `mode`, weights `[k, m]` (or `[k, m, h]`)
+/// with rows `nb1` bytes apart: linear_mv_q6k_rw's rows a warp (bits 0-7: the fewest that make
+/// whole stages, times 2^(mode bits 4-6)), two stages in flight (bit 8), early launch (bit 9);
+/// 0 (the staged or plain kernel) when the mode is off, the rows are whole stages already, not
+/// contiguous, or `m` is no multiple of the rows a warp.
+pub(crate) fn q6k_mv_param(mode: u8, k: i64, m: i64, nb1: i64) -> i32 {
+    if mode & 1 == 0 || k <= 0 || k % 256 != 0 || m <= 0 || nb1 != k / 256 * 210 {
+        return 0;
+    }
+    let nbr = k / 256;
+    let mut a = nbr;
+    let mut b = Q6K_STAGE;
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    // Rows of whole stages stay on linear_mv_q6k_st: the same bytes, and its fixed row loop is
+    // 10-25% faster at 2-4 columns (`lin-bench --q6k`).
+    if a == Q6K_STAGE {
+        return 0;
+    }
+    let rows = (Q6K_STAGE / a) << ((mode >> 4) & 7);
+    if rows > 255 || m % rows != 0 {
+        return 0;
+    }
+    rows as i32 | (((mode >> 1) & 1) as i32) << 8 | (((mode >> 2) & 1) as i32) << 9
 }
 
 /// Whether a prompt step of `n` tokens on a compute capability 12.x GPU (`cc12`, the GB10)
