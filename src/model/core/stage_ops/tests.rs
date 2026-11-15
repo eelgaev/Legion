@@ -52,6 +52,7 @@ fn decode_matmuls_are_listed() {
         "q4k_mv",
         "l2_prefetch",
         "l2_join",
+        "side_join",
     ] {
         assert!(PURE.contains(&name), "{name}");
     }
