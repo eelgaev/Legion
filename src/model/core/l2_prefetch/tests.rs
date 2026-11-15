@@ -23,6 +23,30 @@ fn the_pace_takes_nanoseconds_up_to_a_millisecond() {
 }
 
 #[test]
+fn z_goes_to_the_side_stream_unless_switched_off() {
+    assert!(z_side_from(None));
+    assert!(z_side_from(Some("1")));
+    assert!(!z_side_from(Some("0")));
+    assert!(!z_side_from(Some(" 0 ")));
+}
+
+#[test]
+fn a_side_join_keeps_the_side_work_and_its_inputs() {
+    let ctx = Context::new(16, 0);
+    let x = ctx.new_tensor(types::F32, &[16, 8]);
+    let z = ctx.scale(x, 3.0);
+    let out = ctx.scale(x, 0.5);
+    let j = side_join(&ctx, out, &[z, x]);
+    assert_eq!(j.ne(), [1, 1, 1, 1]);
+    // SAFETY: a node of the live context.
+    let src = unsafe { (*j.raw()).src };
+    assert!(std::ptr::eq(src[0], out.raw()));
+    assert!(std::ptr::eq(src[1], z.raw()));
+    assert!(std::ptr::eq(src[2], x.raw()));
+    assert!(src[3].is_null());
+}
+
+#[test]
 fn spans_stay_inside_the_tensor() {
     // 31.5 MB: the 27B's FP8 z projection (5120 x 6144 bytes).
     let z = 5120 * 6144;

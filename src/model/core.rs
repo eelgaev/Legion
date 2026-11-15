@@ -3387,11 +3387,37 @@ impl Model {
                 ),
             },
         };
+        // Dense models' steps of a few users on a GB10 (#689 round 13): z's FP8 GEMM on the side
+        // stream right after qkv, beside the small kernels up to the gated norm, which waits for
+        // it ([`l2_prefetch::side_join`], keeping the GEMM's input allocated until then); the
+        // stage graph runs the small kernels' blocks first (`stage_graph::prio`). Same kernels,
+        // same inputs, so no output changes. `LEGION_DEBUG_GDN_Z_SIDE=0` turns it off.
+        let mut z_join = None;
+        if l2_prefetch::z_side()
+            && !tap.on
+            && !hp.moe
+            && let Some(zm) = crate::model::fp8::mm_node(ctx, z)
+            && let Ok(wz) = self.lw(il, "attn_gate.weight")
+            && l2_prefetch::takes(wz, n)
+        {
+            // SAFETY: an FP8 matmul node of this context; P_SIDE is one of its parameters.
+            unsafe { crate::ggml::set_external_param(zm.raw(), crate::model::fp8::P_SIDE, 1) };
+            // qkv first: z forks once it is done, not beside it (both stream weights).
+            pass.graph.borrow_mut().expand(qkv);
+            pass.graph.borrow_mut().expand(zm);
+            // SAFETY: a matmul node: src[1] its activations.
+            let x = ctx.wrap(unsafe { (*zm.raw()).src[1] });
+            z_join = Some([zm, x]);
+        }
         // Dense models' steps of a few users on a GB10 (#689): z's first rows read into L2 on a
         // side stream while the small kernels between the two projections run
         // ([`l2_prefetch`]). Expanded here, so the node forks right after qkv; nothing reads
-        // it, so no output changes.
-        let pf = l2_prefetch::gdn_z_bytes();
+        // it, so no output changes. Not with z itself on the side stream (it starts after qkv).
+        let pf = if z_join.is_some() {
+            0
+        } else {
+            l2_prefetch::gdn_z_bytes()
+        };
         // `LEGION_DEBUG_GDN_PF_CONV=1`: (weight, first chunk, chunks) for a verify step's conv.
         let mut conv_pf = None;
         if pf > 0
@@ -3674,6 +3700,10 @@ impl Model {
         let o = concat_cols(ctx, outs);
         let o = ctx.reshape_4d(o, [head_v, n_v, n, 1]);
         tap.tap("attn_output", il, o);
+        if let Some(keep) = z_join {
+            let j = l2_prefetch::side_join(ctx, o, &keep);
+            pass.graph.borrow_mut().expand(j);
+        }
         tap.tap("z", il, z);
         // Gated RMS norm: norm(o) * silu(z), or sigmoid(z) (see [`Arch::sigmoid_gate`]); on a
         // GPU one op (`--gated-norm`).

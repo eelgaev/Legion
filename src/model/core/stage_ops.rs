@@ -71,9 +71,12 @@ pub(crate) const PURE: &[&str] = &[
     // makes the compute stream wait for it. A capture records that as a forked branch joined
     // inside it: every op between the two is listed here (or in [`SMALL_MM`] for these small
     // steps), so both land in one capture. A join without its fork in the capture would make
-    // CUDA refuse the capture, which then runs directly (speed, never bits).
+    // CUDA refuse the capture, which then runs directly (speed, never bits). The same for z on
+    // the side stream (#689 round 13): `fp8_mm` (listed) forks, `side_join` before the gated
+    // norm joins.
     "l2_prefetch",
     "l2_join",
+    "side_join",
     "moe_tail",
     "moe_sum_gate",
     "ids_remap",
