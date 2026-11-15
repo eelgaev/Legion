@@ -409,7 +409,7 @@ pub struct GemvTiming {
     pub bits: u64,
 }
 
-/// Times `shape` at `n_tok` tokens (1-8) on `backend` for each [`bf16_gemv`] kernel of
+/// Times `shape` at `n_tok` tokens (1-16) on `backend` for each [`bf16_gemv`] kernel of
 /// `kernels`: BF16 weights in [-0.05, 0.05), F32 activations in [-1, 1). Each graph holds copies
 /// of the product on distinct copies of the weights (~384 MB of them in all, so that no copy is
 /// still in L2 when it comes round again), all on the same `x`. Each round runs every kernel's

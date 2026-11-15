@@ -36,14 +36,19 @@ pub struct LinBenchArgs {
     #[arg(long)]
     chain: bool,
     /// Time GLM-5.3-Flash NVFP4's BF16 decode matvecs instead (#560 r6): each BF16 GEMV kernel
-    /// (`LEGION_DEBUG_GLM_BF16_GEMV` 0 linear_mv, 1 linear_mv_bf16) at `--gemv-tokens`, in GB/s
-    /// of weights; fails when an output's bits differ from linear_mv's. `--shapes` takes the
+    /// of `--gemv-kernels` at `--gemv-tokens`, in GB/s of weights; fails when an output's bits
+    /// differ from the first kernel's at 8 tokens or fewer. Above 8 tokens it times the GEMM
+    /// those steps take against the opt-in GEMV (whose bits differ). `--shapes` takes the
     /// `GEMV_SHAPES` names.
     #[arg(long)]
     gemv: bool,
-    /// Tokens per decode step for `--gemv` (1-8), comma separated.
-    #[arg(long, value_delimiter = ',', default_values_t = [1usize, 2, 3, 4, 8])]
+    /// Tokens per decode step for `--gemv` (1-16), comma separated.
+    #[arg(long, value_delimiter = ',', default_values_t = [1usize, 2, 3, 4, 6, 8])]
     gemv_tokens: Vec<usize>,
+    /// `LEGION_DEBUG_GLM_BF16_GEMV` values for `--gemv` (0 linear_mv, 1 linear_mv_bf16, 2
+    /// linear_mv_bf16x, 3 also above 8 tokens), comma separated.
+    #[arg(long, value_delimiter = ',', default_values_t = [0u8, 1, 2])]
+    gemv_kernels: Vec<u8>,
 }
 
 #[cfg(feature = "cuda")]
@@ -209,10 +214,9 @@ fn chain(
 fn gemv(gpu: &mut legion::ggml::Backend, args: &LinBenchArgs) -> anyhow::Result<()> {
     use legion::model::glm5next::ops::{bf16_gemv, lin_bench, set_bf16_gemv};
     let default = bf16_gemv();
-    let kernels = [0u8, 1];
     println!(
         "{:<15} {:>6} {:>6} {:>3} {:>6} {:>5} {:>9} {:>7} {:>8} {:>18}",
-        "shape", "k", "m", "h", "tokens", "kern", "ms/call", "GB/s", "vs mv", "output bits"
+        "shape", "k", "m", "h", "tokens", "kern", "ms/call", "GB/s", "vs 1st", "output bits"
     );
     let mut differ = 0;
     for shape in lin_bench::GEMV_SHAPES {
@@ -221,9 +225,19 @@ fn gemv(gpu: &mut legion::ggml::Backend, args: &LinBenchArgs) -> anyhow::Result<
         }
         for &n in &args.gemv_tokens {
             anyhow::ensure!(
-                (1..=8).contains(&n),
-                "--gemv-tokens {n}: the GEMVs take 1-8 tokens"
+                (1..=16).contains(&n),
+                "--gemv-tokens {n}: the GEMVs take 1-16 tokens"
             );
+            // Above 8 tokens the first kernel is the GEMM those steps run (kernel 0), then the
+            // opt-in GEMV (3) if listed, whose bits differ from it.
+            let wide = n > 8;
+            let kernels: Vec<u8> = if wide {
+                std::iter::once(0)
+                    .chain(args.gemv_kernels.iter().copied().filter(|&k| k == 3))
+                    .collect()
+            } else {
+                args.gemv_kernels.clone()
+            };
             let t = lin_bench::gemv_ms(gpu, shape, n, args.reps, args.rounds, &kernels);
             let bytes = (shape.k * shape.m * shape.h * 2) as f64;
             for r in &t {
@@ -240,13 +254,13 @@ fn gemv(gpu: &mut legion::ggml::Backend, args: &LinBenchArgs) -> anyhow::Result<
                     r.ms / t[0].ms,
                     format!("{:016x}", r.bits)
                 );
-                differ += (r.bits != t[0].bits) as usize;
+                differ += (!wide && r.bits != t[0].bits) as usize;
             }
         }
     }
     set_bf16_gemv(default);
     if differ > 0 {
-        anyhow::bail!("{differ} outputs differ from linear_mv's bits");
+        anyhow::bail!("{differ} outputs differ from the first kernel's bits");
     }
     Ok(())
 }

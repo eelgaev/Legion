@@ -213,7 +213,12 @@ pub fn linear_io<'a>(
             xh.is_some() as i32,
             kernel.param(),
             out_f16 as i32,
-            bf16_gemv() as i32,
+            // the GB10 GEMV's alone (above 8 tokens params[2] is on without it)
+            if GB10_GEMV.load(Ordering::Relaxed) {
+                bf16_gemv() as i32
+            } else {
+                0
+            },
         ],
     )
 }
@@ -349,10 +354,14 @@ const BF16_GEMV_UNSET: u8 = u8::MAX;
 static BF16_GEMV: AtomicU8 = AtomicU8::new(BF16_GEMV_UNSET);
 
 /// The BF16 decode GEMV of [`set_gb10_gemv`]'s steps (8 tokens or fewer, BF16 weights, the
-/// node's `params[6]`; #560 r6): 0 linear_mv, 1 linear_mv_bf16 (the default: the warp's weight
-/// bytes loaded contiguously a few steps ahead and handed to the summing lane through shared
-/// memory, x in float4s). Every lane sums the same values in the same order in both: the same
-/// bits. `LEGION_DEBUG_GLM_BF16_GEMV=0` takes linear_mv back for A/B runs.
+/// node's `params[6]`; #560 r6, r8): 0 linear_mv; 1 linear_mv_bf16 (the warp's weight bytes
+/// loaded contiguously a few steps ahead and handed to the summing lane through shared memory,
+/// x in float4s); 2, the default, linear_mv_bf16 at 1 token and linear_mv_bf16x at 2-8 (x
+/// copied to shared memory once per block, conflict free, instead of each warp reading it from
+/// L1). Every lane sums the same values in the same order in all three: the same bits.
+/// 3 (an opt-in) is 2 plus linear_mv_bf16x at 9-16 tokens on one matrix of 2048+-value rows,
+/// which otherwise take the GEMM (x rounded to F16, sums by K tiles): outputs move.
+/// `LEGION_DEBUG_GLM_BF16_GEMV` picks one for A/B runs.
 pub fn bf16_gemv() -> u8 {
     let v = BF16_GEMV.load(Ordering::Relaxed);
     if v != BF16_GEMV_UNSET {
@@ -365,19 +374,21 @@ pub fn bf16_gemv() -> u8 {
 
 /// [`bf16_gemv`] given the environment's value.
 pub(crate) fn bf16_gemv_of(env: Option<&str>) -> u8 {
-    match env.map(str::trim) {
-        Some("0") => 0,
-        Some("1") => 1,
+    match env.map(str::trim).and_then(|s| s.parse::<u8>().ok()) {
+        Some(v) if v <= BF16_GEMV_MAX => v,
         _ => BF16_GEMV_DEFAULT,
     }
 }
 
 /// [`bf16_gemv`]'s default.
-pub(crate) const BF16_GEMV_DEFAULT: u8 = 1;
+pub(crate) const BF16_GEMV_DEFAULT: u8 = 2;
+
+/// [`bf16_gemv`]'s largest value.
+pub(crate) const BF16_GEMV_MAX: u8 = 3;
 
 /// Sets [`bf16_gemv`] for [`linear`]s built from now on (`legion lin-bench --gemv`).
 pub fn set_bf16_gemv(v: u8) {
-    BF16_GEMV.store(v.min(1), Ordering::Relaxed);
+    BF16_GEMV.store(v.min(BF16_GEMV_MAX), Ordering::Relaxed);
 }
 
 /// `x` (F32, contiguous) rounded to BF16 (to nearest, ties to even, as ggml's
