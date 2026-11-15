@@ -24,6 +24,73 @@ mod tests;
 /// How long a rank waits for the others to start (and load).
 const WAIT: Duration = Duration::from_secs(600);
 
+/// How long rank 0 waits for a loaded rank to answer its rows connection.
+const ROWS_WAIT: Duration = Duration::from_secs(30);
+
+/// Whether a rank above 0 asks rank 0 for the lookup-table rows its cache misses
+/// ([`tp_net::rows`]); `LEGION_DEBUG_TP_ROWS=0` makes it read them itself (for A/B runs only).
+fn rows_from_rank0() -> bool {
+    std::env::var_os("LEGION_DEBUG_TP_ROWS").is_none_or(|v| v != "0")
+}
+
+/// Rank 0: the rows connection to every other rank, answered from `exec`'s lookup table on
+/// threads of their own (nothing without a table read through a store). A rank it cannot
+/// reach reads its table itself.
+fn serve_rows(exec: &Executor, cfg: &TpNetConfig) {
+    let Some(table) = exec.model().ngram_table_shared() else {
+        return;
+    };
+    for to in 1..cfg.n_ranks() {
+        let t = table.clone();
+        let read: tp_net::rows::ReadRows =
+            Arc::new(move |rows: &[u32], urgent: bool| t.read_for_peer(rows, urgent));
+        let served = tp_net::dial_rows(cfg, to, ROWS_WAIT)
+            .and_then(|s| tp_net::rows::serve(s, read, cfg.profile > 0));
+        if let Err(e) = served {
+            tracing::warn!(
+                rank = to,
+                error = %e,
+                "tensor parallel: no rows connection; that rank reads the lookup table itself"
+            );
+        }
+    }
+}
+
+/// A rank above 0: takes rank 0's rows connection on a thread of its own (rank 0 dials it once
+/// this rank answers the control connection) and from then on asks rank 0 for the lookup-table
+/// rows its cache misses, instead of reading them from its own copy of the file: on two DGX
+/// Sparks that copy is the first's disk over NFS, ~6 times slower to read (#1176).
+fn take_rows(exec: &Executor, mut control: ControlListener) {
+    let table = exec.model().ngram_table_shared();
+    let taken = std::thread::Builder::new()
+        .name("tp-rows-accept".into())
+        .spawn(move || {
+            let s = match control.accept_rows() {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "tensor parallel: no rows connection from rank 0");
+                    return;
+                }
+            };
+            let Some(table) = table.filter(|_| rows_from_rank0()) else {
+                return;
+            };
+            match tp_net::rows::Client::start(s) {
+                Ok(c) => {
+                    let on = table.set_peer(c);
+                    tracing::info!(
+                        on,
+                        "tensor parallel: lookup-table rows this rank misses come from rank 0"
+                    );
+                }
+                Err(e) => tracing::warn!(error = %e, "tensor parallel: the rows connection failed"),
+            }
+        });
+    if let Err(e) = taken {
+        tracing::warn!(error = %e, "tensor parallel: no rows connection thread");
+    }
+}
+
 /// A rank's connections, made before the model loads.
 pub(super) struct Start {
     rank: usize,
@@ -367,6 +434,7 @@ pub(super) fn lead(exec: &mut Executor, start: Start, n_blocks: usize) -> Result
                 )?;
                 links.push(link);
             }
+            serve_rows(exec, &cfg);
             let mut lead = TpLead::new(links, comm, cfg.profile);
             lead.set_mtp_chains(cfg.mtp_chain);
             lead.set_mtp_local_rows(cfg.mtp_local_rows);
@@ -451,6 +519,7 @@ pub(super) fn follow(
         Ok(s) => s,
         Err(e) => return device(format!("rank {rank}: waiting for rank 0: {e}")),
     };
+    take_rows(&exec, control);
     let mut profile = StepProfile::new(cfg.profile);
     let mut rows = Default::default();
     let r = crate::node::serve_one(stream, &mut |req| {

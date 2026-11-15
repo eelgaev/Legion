@@ -952,3 +952,110 @@ fn hot_set_on_a_multi_part_table_with_hashed_rows() {
     assert!(old < 0.2, "round-robin kept {old} of the hot rows");
     assert_eq!(pinned, 0);
 }
+
+/// Another rank's table: answers from the file's rows, or fails every ask.
+struct FakePeer {
+    rows: Vec<u8>,
+    fail: bool,
+    asks: Mutex<Vec<(Vec<u32>, bool)>>,
+}
+
+impl PeerRows for FakePeer {
+    fn ask(&self, rows: Vec<u32>, urgent: bool, done: PeerDone) {
+        assert!(rows.windows(2).all(|w| w[0] < w[1]), "rows ascending, once");
+        let got = if self.fail {
+            Err(io::Error::other("no peer"))
+        } else {
+            Ok(want(&self.rows, &rows))
+        };
+        self.asks.lock().unwrap().push((rows, urgent));
+        // On another thread, as the connection's reader calls it.
+        std::thread::spawn(move || done(got));
+    }
+}
+
+/// With a peer the direct tier asks it for the rows it misses (each once, a fetch's urgent,
+/// a prefetch's not) and reads none itself; the rows are the file's, and cached. When the
+/// peer fails, it reads them itself, the same rows. `read_for_peer` gives the file's rows
+/// and refuses rows outside the table.
+#[test]
+fn a_peer_reads_the_rows_this_rank_misses() {
+    let base = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"));
+    std::fs::create_dir_all(&base).unwrap();
+    let dir = tempfile::tempdir_in(&base).unwrap();
+    let n_rows = 6000u64;
+    let (file, rows) = table(dir.path(), n_rows);
+    let picks: Vec<u32> = (0..1500u32)
+        .map(|i| i.wrapping_mul(2_654_435_761) % n_rows as u32)
+        .chain([0, 45, 45, n_rows as u32 - 1])
+        .collect();
+    let next: Vec<u32> = (0..300u32).map(|i| i * 7 % n_rows as u32).collect();
+    let open = || {
+        LookupTable::open(
+            file.clone(),
+            &TableOptions {
+                io: TableIo::Direct,
+                ram_cache_bytes: Some(16 << 20),
+                inflight: 8,
+                aio_max: 0,
+                keep_awake_ms: 0,
+                ..TableOptions::default()
+            },
+            None,
+        )
+        .unwrap()
+    };
+    for fail in [false, true] {
+        let t = open();
+        let peer = Arc::new(FakePeer {
+            rows: rows.clone(),
+            fail,
+            asks: Mutex::new(Vec::new()),
+        });
+        assert!(t.set_peer(peer.clone()));
+        assert!(
+            t.fetch(&picks).unwrap() == want(&rows, &picks),
+            "fail {fail}"
+        );
+        // A second fetch finds them all in the cache.
+        let asks = peer.asks.lock().unwrap().len();
+        assert!(
+            t.fetch(&picks).unwrap() == want(&rows, &picks),
+            "fail {fail}"
+        );
+        assert_eq!(peer.asks.lock().unwrap().len(), asks);
+        let mut unique = picks.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        {
+            let a = peer.asks.lock().unwrap();
+            assert_eq!(a.len(), 1);
+            assert_eq!(a[0], (unique.clone(), true));
+        }
+        let s = t.stats();
+        assert_eq!(s.peer_rows, unique.len() as u64);
+        if fail {
+            assert!(s.reads > 0);
+        } else {
+            assert_eq!(s.reads, 0);
+        }
+        // A prefetch asks too, not urgent; the next fetch takes its rows.
+        t.prefetch(&next);
+        assert!(t.fetch(&next).unwrap() == want(&rows, &next), "fail {fail}");
+        let a = peer.asks.lock().unwrap();
+        assert!(a.len() == 2 && !a[1].1, "fail {fail}: {:?}", a.len());
+    }
+    let t = open();
+    assert!(t.read_for_peer(&picks, true).unwrap() == want(&rows, &picks));
+    assert!(t.read_for_peer(&next, false).unwrap() == want(&rows, &next));
+    assert!(t.read_for_peer(&[], true).unwrap().is_empty());
+    assert_eq!(
+        t.read_for_peer(&[1, n_rows as u32], true)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    assert_eq!(t.stats().peer_rows, 0);
+}
