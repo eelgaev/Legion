@@ -29,6 +29,7 @@ pub mod ops;
 pub mod par;
 #[cfg(test)]
 mod tests;
+mod tp_overlap;
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -962,6 +963,9 @@ impl Model {
             let mine = ctx.view_2d(flat, [e * p.hc, m as i64], flat.nb()[1], a * flat.nb()[1]);
             res = ctx.reshape_3d(ctx.cont(mine), e, p.hc, m as i64);
         }
+        // `--tp-overlap` (#560 r11): the mixers in two micro-batches, the sums' wire time
+        // under them (`tp_overlap`).
+        let mut micro = self.glm_micro_split(ctx, sp, n_all, res);
         // A sublayer's input from every rank's share of the tokens, and its partial output
         // summed: over the ranks for every token, or with `sp` for this rank's share only.
         let gather = |h: Tensor<'a>| match sp {
@@ -979,6 +983,10 @@ impl Model {
         // The most tensors a layer has taken, for the room a chunked SSD step may use (#1205).
         let mut most = 0;
         for il in layers.clone() {
+            if let Some(st) = micro.as_mut() {
+                self.glm_micro_layer(pass, il, st, sp)?;
+                continue;
+            }
             let start = ctx.tensors_left();
             let (pre, h) = self.glm_hc_pre(ctx, il, "attn", res)?;
             tap.tap("hc_attn_pre", il, pre.y);
@@ -1039,6 +1047,9 @@ impl Model {
                 self.glm_ssd_predict(pass, il + 1, h, Predictor::PostMoe, None)?;
             }
             most = most.max(start - ctx.tensors_left());
+        }
+        if let Some(st) = micro.take() {
+            res = self.glm_micro_join(pass, st);
         }
         if layers.end != hp.n_layer {
             // The next stage's input is [n_embd · hc, n].

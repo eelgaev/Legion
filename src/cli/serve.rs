@@ -789,7 +789,10 @@ pub(super) struct ModelArgs {
     /// halves' matmuls split K differently from the whole share's (MMQ stream-k) and moved long
     /// prompts' greedy output; with the 1,024-token floor, greedy text at 1,536 and 4,096 prompt
     /// tokens matched off on two DGX Sparks (Qwen3.8-Flash-Next NVFP4, mixers: prefill 8K /
-    /// 32K / 123K 2,872 / 3,013 / 2,825 -> 2,966 / 3,022 / 2,859 tok/s). Experimental.
+    /// 32K / 123K 2,872 / 3,013 / 2,825 -> 2,966 / 3,022 / 2,859 tok/s). GLM-5.3-Flash: the
+    /// mixers only (ffn runs as mixers: per-half experts would read the expert weights twice),
+    /// with the attention, router and experts on all the step's tokens, so the output keeps
+    /// its bits. Experimental.
     #[arg(long, value_name = "WHAT", value_enum, default_value_t = legion::tp_net::Overlap::Off)]
     pub tp_overlap: legion::tp_net::Overlap,
     /// With --tp-moe-ep: which rank holds each routed expert, per layer, from a JSON file
