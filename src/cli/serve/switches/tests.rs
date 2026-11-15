@@ -50,6 +50,8 @@ fn flags_set_their_switches() {
         "16",
         "--gdn-state-defer-min-seqs",
         "8",
+        "--tp-commit-in-verify-min-seqs",
+        "8",
         "--norm-rope",
         "--kv-append",
         "--head-rope-fused",
@@ -153,6 +155,8 @@ fn flags_set_their_switches() {
         "--hc-post-norm-ggml",
         "--hc-moe-fold",
         "--no-hc-lazy-streams",
+        "--no-tp-gather-mix",
+        "--no-tp-gather-widen",
         "--hc-fuse",
         "--hc-xn-f32",
         "--hc-quant-ggml",
@@ -253,6 +257,7 @@ fn flags_set_their_switches() {
             gdn_state_defer: Some(true),
             gdn_state_defer_rows: Some(16),
             gdn_state_defer_min_seqs: Some(8),
+            tp_commit_in_verify_min_seqs: Some(8),
             norm_rope: Some(true),
             kv_append: Some(true),
             head_rope_fused: Some(true),
@@ -343,6 +348,8 @@ fn flags_set_their_switches() {
             hc_post_norm: Some(false),
             hc_moe_fold: Some(true),
             hc_lazy_streams: Some(false),
+            tp_gather_mix: Some(false),
+            tp_gather_widen: Some(false),
             hc_fuse: Some(true),
             hc_xn16: Some(false),
             hc_quant: Some(false),
@@ -581,6 +588,9 @@ fn gdn_state_defer_either_way() {
     assert_eq!(none.gdn_state_defer_min_seqs, None);
     let wide = switches(&["--gdn-state-defer-min-seqs", "8"]);
     assert_eq!(wide.gdn_state_defer_min_seqs, Some(8));
+    assert_eq!(none.tp_commit_in_verify_min_seqs, None);
+    let tp = switches(&["--tp-commit-in-verify-min-seqs", "8"]);
+    assert_eq!(tp.tp_commit_in_verify_min_seqs, Some(8));
     let argv = [
         "legion",
         "serve",
@@ -706,6 +716,7 @@ fn help_lists_the_switches_under_their_heading() {
         "--no-gdn-state-defer",
         "--gdn-state-defer-rows",
         "--gdn-state-defer-min-seqs",
+        "--tp-commit-in-verify-min-seqs",
         "--norm-rope",
         "--kv-append",
         "--head-rope-fused",
@@ -760,6 +771,8 @@ fn help_lists_the_switches_under_their_heading() {
         "--hc-moe-fold",
         "--no-hc-moe-fold",
         "--no-hc-lazy-streams",
+        "--no-tp-gather-mix",
+        "--no-tp-gather-widen",
         "--hc-fuse",
         "--hc-xn-f32",
         "--hc-quant-ggml",

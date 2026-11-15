@@ -146,6 +146,16 @@ pub(in crate::cli) struct SwitchArgs {
     /// 0-255, default 0 (every step may leave them).
     #[arg(long, help_heading = HEADING, value_name = "N")]
     gdn_state_defer_min_seqs: Option<u8>,
+    /// CUDA, gated DeltaNet layers, MTP with --tp over machines: after a verify step of at
+    /// least this many sequences, every rank runs the commit's delta rule inside its next
+    /// verify step (see --gdn-commit-in-verify), which saves reading the states once more.
+    /// Narrower verify steps and their commits run as without the flag (one or a few
+    /// sequences' commits are small and hide behind the drafting, where deferring them slows
+    /// a round, #1176). The same bits either way. Takes a second copy of the replay inputs in
+    /// VRAM (a few MB per sequence). Give every rank the same value. 0-255, default 0 (no
+    /// commit deferred).
+    #[arg(long, help_heading = HEADING, value_name = "N")]
+    tp_commit_in_verify_min_seqs: Option<u8>,
     /// CUDA, attention layers: Legion's one-launch norm + RoPE for the q and k heads (and
     /// Qwen3.8-Flash-Next's indexer queries) instead of ggml's rms_norm, mul and rope_multi.
     /// The same bits, but no faster on V100 (the fused external launch splits ggml's CUDA
@@ -860,6 +870,19 @@ pub(in crate::cli) struct SwitchArgs {
     /// streams then stay allocated through the MoE layer). For comparisons.
     #[arg(long, help_heading = HEADING)]
     no_hc_lazy_streams: bool,
+    /// Tensor parallelism with --tp-seq-par and --tp-wire bf16 (two ranks' prompt steps): the
+    /// hyper-connection mixer writes the block input it makes as F32 and the all-gather rounds
+    /// it into its send buffer, and not, as by default, the all-gather running that mixer
+    /// with its values rounded straight into the send buffer (#1176: the same bits, one pass
+    /// over the block input less before each gather). For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_tp_gather_mix: bool,
+    /// Tensor parallelism with --tp-seq-par and --tp-wire bf16: the F32 copy of a gathered
+    /// BF16 block input (for its F32 readers, the MoE router) is made by a copy after the
+    /// all-gather, and not, as by default, by the all-gather itself, this rank's share while
+    /// the other rank's is still on the wire (#1176: the same values). For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_tp_gather_widen: bool,
     /// qwen4exp prompt steps on a V100 (compute capability 7.0) or an sm_80+ GPU such as the
     /// GB10 (#826; no effect elsewhere): the layer's gated shared expert is added in the fused
     /// MoE op's per-token sum, and the next hyper-connection combine-and-norm makes that sum
@@ -1490,6 +1513,7 @@ impl SwitchArgs {
             },
             gdn_state_defer_rows: self.gdn_state_defer_rows,
             gdn_state_defer_min_seqs: self.gdn_state_defer_min_seqs,
+            tp_commit_in_verify_min_seqs: self.tp_commit_in_verify_min_seqs,
             norm_rope: self.norm_rope.then_some(true),
             kv_append: self.kv_append.then_some(true),
             head_rope_fused: self.head_rope_fused.then_some(true),
@@ -1604,6 +1628,8 @@ impl SwitchArgs {
                 self.no_hc_moe_fold.then_some(false)
             },
             hc_lazy_streams: self.no_hc_lazy_streams.then_some(false),
+            tp_gather_mix: self.no_tp_gather_mix.then_some(false),
+            tp_gather_widen: self.no_tp_gather_widen.then_some(false),
             hc_fuse: self.hc_fuse.then_some(true),
             hc_xn16: self.hc_xn_f32.then_some(false),
             hc_quant: self.hc_quant_ggml.then_some(false),

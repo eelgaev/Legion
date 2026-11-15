@@ -68,6 +68,7 @@ pub mod nvfp4_once;
 pub use nvfp4_once::set_nvfp4_once;
 pub mod head_mm;
 pub use head_mm::set_head_mm;
+pub(crate) mod head_split;
 pub mod nvfp4_mvq;
 pub use nvfp4_mvq::set_nvfp4_mvq;
 pub mod q4k_head;
@@ -117,7 +118,8 @@ pub use media::{ImageSpan, Media};
 pub use mtp::{DraftHeadType, MtpGraph, MtpOutput};
 pub use spec::{
     Replay, SpecPool, set_commit_in_verify, set_commit_slots, set_state_defer,
-    set_state_defer_min_seqs, set_state_defer_rows,
+    set_state_defer_min_seqs, set_state_defer_rows, set_tp_commit_in_verify_min_seqs,
+    tp_commit_in_verify_min_seqs,
 };
 pub use state::{KV_BLOCK, KvPool, KvRing, KvTier, SeqState, SplitTier, StatePool, fnv1a};
 
@@ -627,6 +629,10 @@ pub struct GroupShape {
     /// paired MoE layers share their experts with the other GPU of its NVLink pair. Kept apart
     /// from the other steps' graphs.
     pub(crate) pair: bool,
+    /// A greedy step whose head is split over the two ranks of tensor parallelism
+    /// ([`head_split`]): the share of the vocabulary this graph's head covers (1: rank 0's, 2:
+    /// rank 1's), its argmax output the share's candidates. 0: the whole head.
+    pub(crate) head_half: u8,
     /// Image tokens of the group's sequences ([`Media`]), whose input rows replace their token
     /// embeddings.
     pub(crate) img: usize,
@@ -671,6 +677,7 @@ impl GroupShape {
             kv_slots: Vec::new(),
             par: false,
             pair: false,
+            head_half: 0,
             img: g
                 .seqs
                 .iter()
@@ -2488,6 +2495,27 @@ impl Model {
         self.linear.mul_mat(ctx, name, w, scale, input_scale, x)
     }
 
+    /// Whether a greedy step's head may run as two shares of the vocabulary on the two ranks
+    /// of tensor parallelism ([`head_split`], `--tp-head-split`): an architecture whose split
+    /// head was shown to keep the text ([`Arch::head_splits`]), with the core's head as a
+    /// plain matmul of `output.weight` (no scale, no FP8 activation scale) in one GPU's
+    /// memory, and a vocabulary that splits ([`head_split::vocab_fits`]).
+    pub(crate) fn head_splits(&self) -> bool {
+        let name = "output.weight";
+        let Ok(w) = self.w(name) else {
+            return false;
+        };
+        self.hp.arch.head_splits()
+            && crate::model::cluster_select::on_cuda()
+            && !w.is_meta()
+            && !w.is_host()
+            && w.ne()[2] == 1
+            && w.ne()[1] == self.hp.n_vocab
+            && head_split::vocab_fits(w.ne()[1] as usize)
+            && linear::scale_name(name).is_none_or(|s| self.w(&s).is_err())
+            && self.w("output.input_scale").is_err()
+    }
+
     /// Whether the LM head `name` (`w`) for `x` runs on [`head_mm`]: [`head_mm::takes`], and
     /// [`Self::mm`] would be a plain matmul of it (no scale, no FP8 activation scale).
     fn head_mm_takes(&self, name: &str, w: Tensor<'_>, x: Tensor<'_>) -> bool {
@@ -3208,7 +3236,20 @@ impl Model {
                         Err(_) => "token_embd.weight",
                     };
                     let w = self.w(head)?;
+                    let half = shape.first().map_or(0, |g| g.head_half);
                     match arch.logit_softcap() {
+                        // This rank's share of a split head ([`head_split`], #1176): the
+                        // logits of its vocabulary rows and each output row's candidates
+                        // among them.
+                        _ if half != 0 => {
+                            let (off, rows) = head_split::range(w.ne()[1] as usize, half);
+                            let nb1 = w.nb()[1];
+                            let part = ctx.view_2d(w, [w.ne()[0], rows as i64], nb1, off * nb1);
+                            let logits = self.linear.mul_mat(ctx, head, part, None, None, x)?;
+                            let logits = arch.logits(ctx, logits);
+                            let best = crate::model::cluster_select::argmax_best(ctx, logits);
+                            (logits, best)
+                        }
                         // A BF16 head of verify steps of many sequences, matmul, soft-cap and
                         // argmax in one pass with ggml's bits (#1181).
                         Some(cap) if self.head_mm_takes(head, w, x) => {
@@ -3411,10 +3452,11 @@ impl Model {
                 None => {
                     // A pool that defers its commits stores the inputs in the delta rule
                     // (`gdn::rows_replay`), after it reads the last step's kept ones there; a
-                    // packed one that does not (no GPU counts) by copies (`store`).
+                    // packed one that does not (no GPU counts) by copies (`store`). A pool with
+                    // both stores (#1176) defers its wide steps only (`SpecPool::replays`).
                     let views = sh.verify.then(|| pass.spec.expect("checked in build"));
                     let views = views
-                        .filter(|spec| !spec.packed())
+                        .filter(|spec| !spec.packed() && !spec.replays(sh.n_seqs))
                         .map(|spec| spec.token_views(ctx, il, sh.slot, nt, ns));
                     let store = views.map(|[q, k, v_pool, g, beta]| {
                         // v is a view of the conv output: a copy.
@@ -3452,6 +3494,7 @@ impl Model {
                 // A verify step reads the rows only: its states advance in the commit.
                 let spec = pass.spec.expect("checked in build");
                 let replay = spec.replay_views(ctx, il, sh.slot, sh.n_seqs);
+                let replays = replay.is_some();
                 let rows = if let Some((keep, replay, arrive)) = replay {
                     // The last commit deferred into this step (#836 part 14): a pool that
                     // defers has no other way to run it. The op then stores this step's inputs
@@ -3474,7 +3517,7 @@ impl Model {
                 };
                 let conv_in = conv_in.expect("a verify group's conv input");
                 let mut graph = pass.graph.borrow_mut();
-                if stored || spec.defers() {
+                if stored || replays {
                     // The op wrote q, k, g and beta already, and v is copied; or the delta rule
                     // stored them over the packed rows (`rows_replay`).
                     spec.store_window(ctx, &mut graph, il, sh.slot, conv_in);
