@@ -240,6 +240,11 @@ pub(super) fn mtp_share(
         return tp_net::shard::qwen4::view_with(&gguf, rank, n, experts(cfg))
             .map_err(|e| device(format!("--spec-draft: {e}")));
     }
+    if gguf.architecture().as_deref() == Some("qwen35") {
+        // So is a dense qwen35's (#1163); its file has no shapes of its own, the target's.
+        return tp_net::shard::qwen35::head_view(&gguf, hp, rank, n)
+            .map_err(|e| device(format!("--spec-draft: {e}")));
+    }
     if gguf.architecture().as_deref() == Some("glm5-next") {
         // GLM's MTP block is one more DSA layer of the target's: cut as the target's are.
         return tp_net::shard::glm5::view(&gguf, rank, n)

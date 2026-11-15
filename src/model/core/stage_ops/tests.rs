@@ -47,6 +47,8 @@ fn decode_matmuls_are_listed() {
         "q8_mmq",
         "shared_q8_small",
         "q8_head_out",
+        "q_small_m_quantize",
+        "q_small_m",
     ] {
         assert!(PURE.contains(&name), "{name}");
     }
@@ -66,10 +68,16 @@ fn the_commit_window_follows_its_switch() {
     };
     // SAFETY: a plain C struct; `capture_safe` reads nothing of it for this op.
     let node: ffi::ggml_tensor = unsafe { std::mem::zeroed() };
+    let all = ExternalOp {
+        name: "spec_windows",
+        ..op
+    };
     set_commit_capture(true);
     assert!(capture_safe(&op, &node));
+    assert!(capture_safe(&all, &node));
     set_commit_capture(false);
     assert!(!capture_safe(&op, &node));
+    assert!(!capture_safe(&all, &node));
     // The listed ops do not depend on it.
     let gdn = ExternalOp { name: "gdn", ..op };
     assert!(capture_safe(&gdn, &node));

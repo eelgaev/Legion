@@ -80,6 +80,8 @@ pub(crate) use linear::{bf16_cast_joined, bf16_join_fits, f16_joined, has_precis
 pub use q8_group::set_q8_group;
 pub use q8_head::set_q8_head;
 pub use q8_mv::set_q8_mv;
+pub mod q_small_m;
+pub use q_small_m::set_q_small_m;
 pub(crate) mod mtp;
 pub mod mtp_moe;
 pub mod mvf_bf16;
@@ -1801,6 +1803,12 @@ impl Model {
             Some((c, ..)) => crate::tp_net::seq_par::reduce_scatter(ctx, c, x),
             None => self.tp_sum(ctx, x),
         }
+    }
+
+    /// Whether this model is one rank's share and sums its partial outputs
+    /// ([`Self::set_tp_comm`], [`Self::set_tp_pair`]).
+    pub(crate) fn tp_active(&self) -> bool {
+        self.tp_pair.is_some() || self.tp_comm.is_some()
     }
 
     /// `x` summed over the tensor-parallel ranks ([`Self::set_tp_comm`],
