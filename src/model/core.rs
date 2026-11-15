@@ -57,6 +57,7 @@ pub use joined::{
     set_prompt_z as set_joined_prompt_z,
 };
 pub mod kv_type;
+pub mod l2_prefetch;
 mod linear;
 pub mod media;
 pub mod mmq_ids;
@@ -3361,6 +3362,38 @@ impl Model {
                 ),
             },
         };
+        // Dense models' steps of a few users on a GB10 (#689, off by default: no gain): z's
+        // first rows read into L2 while the small kernels between the two projections run
+        // ([`l2_prefetch`]). Expanded here, so the node runs right after qkv; nothing reads
+        // it, so no output changes.
+        let pf = l2_prefetch::gdn_z_bytes();
+        // `LEGION_DEBUG_GDN_PF_CONV=1`: (weight, first chunk, chunks) for a verify step's conv.
+        let mut conv_pf = None;
+        if pf > 0
+            && !tap.on
+            && !hp.moe
+            && let Ok(wz) = self.lw(il, "attn_gate.weight")
+            && l2_prefetch::reads(z, wz)
+            && l2_prefetch::takes(wz, n)
+        {
+            // `LEGION_DEBUG_GDN_PF_FAR=1`: as many of the LM head's bytes, a layer's own span.
+            let head = self
+                .w("output.weight")
+                .ok()
+                .filter(|&w| l2_prefetch::far() && l2_prefetch::takes(w, n));
+            let (w, off) = match head {
+                Some(w) => (w, il * pf % w.nbytes().saturating_sub(pf).max(1)),
+                None => (wz, 0),
+            };
+            if l2_prefetch::in_conv() {
+                // The first verify group's conv takes it (none in other steps: a probe).
+                let (first, chunks) = l2_prefetch::span(off, pf, w.nbytes());
+                conv_pf = Some((w, first, chunks));
+            } else {
+                let node = l2_prefetch::ahead(ctx, w, off, pf, qkv);
+                pass.graph.borrow_mut().expand(node);
+            }
+        }
         // Small steps: alpha and beta from one matmul (#256), whose strided rows the op reads;
         // BF16 ones of 1-8 tokens from one `mul_mat_vec_f` twin launch (#689).
         let ab_names = ["ssm_alpha.weight", "ssm_beta.weight"];
@@ -3414,7 +3447,10 @@ impl Model {
             let (conv, history) = if sh.verify {
                 // The whole window [history | chunk] for the replay, from the same op.
                 let keep = conv_w.ne()[0] - 1 + nt;
-                fused::conv_silu_window(ctx, qkv, conv_state, conv_w, keep)
+                match conv_pf.take() {
+                    Some(p) => fused::conv_silu_window_pf(ctx, qkv, conv_state, conv_w, keep, p),
+                    None => fused::conv_silu_window(ctx, qkv, conv_state, conv_w, keep),
+                }
             } else if conv_norm {
                 fused::conv_silu_norm(ctx, qkv, conv_state, conv_w, heads, prep_eps)
             } else {

@@ -37,6 +37,10 @@ struct legion_conv_silu {
     float norm_eps, norm_scale;
     uint32_t grid[3];
     uint32_t block;
+    // Or null (#689 round 11, LEGION_DEBUG_GDN_PF_CONV=1): pf_bytes of a weight to prefetch into
+    // L2, 16-byte aligned, 4 KiB a thread from the kernel's start (compute capability 9.0+).
+    const char * pf;
+    int64_t pf_bytes;
 };
 
 int legion_conv_silu_launch(const legion_conv_silu * p, void * stream);
@@ -360,6 +364,19 @@ __global__ void conv_silu_kernel(legion_conv_silu p) {
     if (norm && threadIdx.x < PREP_BLOCK / 32) {
         s_sum[threadIdx.x] = 0.0f;
     }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if (p.pf != nullptr) {
+        // A hint only: reads nothing back, writes nothing.
+        const int64_t nth = (int64_t) gridDim.x * gridDim.y * gridDim.z * blockDim.x;
+        const int64_t tid =
+            (((int64_t) blockIdx.z * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x;
+        for (int64_t i = tid * 4096; i < p.pf_bytes; i += nth * 4096) {
+            const int64_t  left = p.pf_bytes - i;
+            const uint32_t n    = (uint32_t) (left < 4096 ? left : 4096);
+            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(p.pf + i), "r"(n) : "memory");
+        }
+    }
+#endif
     if (c >= p.C) {
         return;
     }

@@ -1,0 +1,46 @@
+//! `l2_prefetch`: the node's shape and parameters, and its switches.
+
+use super::*;
+
+#[test]
+fn the_switch_takes_whole_mib() {
+    assert_eq!(gdn_z_bytes_from(None), GDN_Z_MIB << 20);
+    assert_eq!(gdn_z_bytes_from(Some("0")), 0);
+    assert_eq!(gdn_z_bytes_from(Some("4")), 4 << 20);
+    assert_eq!(gdn_z_bytes_from(Some(" 8 ")), 8 << 20);
+    assert_eq!(gdn_z_bytes_from(Some("65")), GDN_Z_MIB << 20);
+    assert_eq!(gdn_z_bytes_from(Some("x")), GDN_Z_MIB << 20);
+}
+
+#[test]
+fn spans_stay_inside_the_tensor() {
+    // 31.5 MB: the 27B's FP8 z projection (5120 x 6144 bytes).
+    let z = 5120 * 6144;
+    assert_eq!(span(0, 4 << 20, z), (0, 1024));
+    // More than the tensor: all of it.
+    assert_eq!(span(0, 64 << 20, z), (0, z / CHUNK));
+    // An offset near the end keeps at least one chunk and none past the end.
+    let (first, n) = span(z - 100, 4 << 20, z);
+    assert_eq!((first, n), (z / CHUNK - 1, 1));
+    // Under a chunk: nothing; a partial chunk is dropped.
+    assert_eq!(span(0, 4096, 4000), (0, 0));
+    assert_eq!(span(0, 6000, 3 * CHUNK), (0, 1));
+}
+
+#[test]
+fn the_node_reads_the_weight_after_its_anchor() {
+    let ctx = Context::new(16, 0);
+    let w = ctx.new_tensor(types::I8, &[5120, 6144]);
+    let x = ctx.new_tensor(types::F32, &[16, 8]);
+    let after = ctx.scale(x, 2.0);
+    let node = ahead(&ctx, w, 0, 8 << 20, after);
+    assert_eq!(node.ne(), [1, 1, 1, 1]);
+    assert!(reads(node, w));
+    assert!(reads(node, after));
+    // x through `after`, one level down; an unrelated tensor not at all.
+    assert!(reads(node, x));
+    assert!(!reads(node, ctx.new_tensor(types::F32, &[4])));
+    // SAFETY: a node of the live context.
+    let [first, n, ..] = external_params(unsafe { &*node.raw() });
+    assert_eq!((first, n), (0, 2048));
+}

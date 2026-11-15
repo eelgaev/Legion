@@ -62,6 +62,10 @@ pub(crate) const PURE: &[&str] = &[
     "router_mv_ids",
     // A DeltaNet layer's BF16 alpha and beta of 1-8 tokens in one launch (#689).
     "mvf_bf16",
+    // The z projection's first rows read into L2 after the qkv projection (#689): one kernel
+    // over the node's weight pointer and parameters, writing nothing. Left out, it would cut
+    // a verify step's capture at every DeltaNet layer.
+    "l2_prefetch",
     "moe_tail",
     "moe_sum_gate",
     "ids_remap",
