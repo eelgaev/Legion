@@ -1006,6 +1006,7 @@ impl Inner {
                     .iter()
                     .map(|j| match j {
                         Job::Read { src, .. } => src.weight.len + src.scale.len,
+                        Job::Raw { src, .. } => src.len,
                         Job::Copy { .. } => 0,
                     })
                     .sum();

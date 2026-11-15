@@ -32,8 +32,8 @@ pub use hc_mix16::{set_hc_pre, set_mix16, set_rebuild_bf16 as set_mix_rebuild_bf
 mod hc_norm;
 pub use hc_norm::lazy_bench as hc_lazy_bench;
 pub(crate) use hc_norm::{
-    FoldSum, fold_moe, fold_target, lazy_fold_target, lazy_parts, lazy_streams, moe_fold,
-    set_lazy_fold, set_no_res,
+    FoldSum, compact_plan, fold_moe, fold_target, lazy_fold_target, lazy_parts, lazy_streams,
+    moe_fold, set_compact, set_lazy_fold, set_no_res,
 };
 pub use hc_norm::{
     hc_fuse, set_fused_post_norm, set_generic_post_norm, set_hc_bf16, set_hc_fuse,
@@ -41,7 +41,12 @@ pub use hc_norm::{
 };
 mod hc_up_mix;
 pub use hc_up_mix::bench as hc_up_mix_bench;
-pub(crate) use hc_up_mix::{lazy_mix_target, mix_cast_reads, set_lazy_streams, set_mix_cast};
+#[cfg(feature = "cuda")]
+pub(crate) use hc_up_mix::launch_mix;
+pub(crate) use hc_up_mix::{
+    lazy_mix_target, mix_cast_reads, set_by_exchange as set_mix_by_exchange, set_lazy_streams,
+    set_mix_cast,
+};
 pub use hc_up_mix::{
     set_gpu as set_up_mix_gpu, set_rebuild as set_up_mix_rebuild, set_up_mix, set_up_mix_bf16,
 };
@@ -2462,6 +2467,12 @@ impl Arch for Qwen4Params {
 
     /// The last layer ends in the final mixer over the output rows.
     fn output_ready(&self) -> bool {
+        true
+    }
+
+    /// Two DGX Sparks, the NVFP4 checkpoint's BF16 head: the same text split, 1 to 16 users
+    /// (#1176).
+    fn head_splits(&self) -> bool {
         true
     }
 

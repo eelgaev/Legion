@@ -79,6 +79,11 @@ pub struct Config {
     /// Mixers a graph runs, each with its own weights.
     pub copies: usize,
     pub rounds: usize,
+    /// Whether the mixers also write the block input's Q8_1 blocks (as the V100's stage graphs
+    /// do); the GB10 kernels do not, so a GB10 run turns it off.
+    pub quant: bool,
+    /// Time the GB10 kernels' choices ([`GB10_CHOICES`]) instead of [`VARIANTS`] (#1176).
+    pub gb10: bool,
 }
 
 impl Default for Config {
@@ -91,6 +96,8 @@ impl Default for Config {
             tokens: vec![1, 2, 3],
             copies: 32,
             rounds: 20,
+            quant: true,
+            gb10: false,
         }
     }
 }
@@ -240,10 +247,53 @@ fn fill(i: &Inputs<'_>, cfg: &Config, n: i64) {
     i.inj.set_f32(&noise(hc * n, 93));
 }
 
-/// Sets `v`'s kernels; back to the defaults with `None`.
-fn select(v: Option<&Variant>) {
-    set_mix_loads_ahead(v.is_none_or(|v| v.ahead));
-    super::force_variant(v.map_or(-1, |v| v.force));
+/// The GB10 Q8_0 kernels' choices [`Config::gb10`] times (#1176), as `gb10` codes: the kernels
+/// before #1176 first (the reference), the ring or the early norm alone, the defaults (both).
+pub const GB10_CHOICES: [(&str, i32); 4] = [
+    ("whole", super::GB10_SET),
+    ("ring", super::GB10_SET | super::GB10_RING),
+    ("early", super::GB10_SET | super::GB10_EARLY),
+    ("default", 0),
+];
+
+/// A run's choice: a variant and the GB10 kernels' code it forces (see [`super::force_gb10`];
+/// negative: none forced).
+#[derive(Clone, Copy, Debug)]
+pub struct Choice {
+    pub name: &'static str,
+    pub variant: Variant,
+    pub gb10: i32,
+}
+
+/// What [`run`] and [`check`] take turns over, the reference first: [`VARIANTS`], or with
+/// [`Config::gb10`] the defaults' variant with each of [`GB10_CHOICES`].
+pub fn choices(cfg: &Config) -> Vec<Choice> {
+    if cfg.gb10 {
+        let default = VARIANTS[VARIANTS.len() - 1];
+        return GB10_CHOICES
+            .iter()
+            .map(|&(name, gb10)| Choice {
+                name,
+                variant: default,
+                gb10,
+            })
+            .collect();
+    }
+    VARIANTS
+        .iter()
+        .map(|&v| Choice {
+            name: v.name,
+            variant: v,
+            gb10: -1,
+        })
+        .collect()
+}
+
+/// Sets `c`'s kernels; back to the defaults with `None`.
+fn select(c: Option<&Choice>) {
+    set_mix_loads_ahead(c.is_none_or(|c| c.variant.ahead));
+    super::force_variant(c.map_or(-1, |c| c.variant.force));
+    super::force_gb10(c.map_or(-1, |c| c.gb10));
 }
 
 fn check_config(cfg: &Config) -> Result<(), String> {
@@ -265,7 +315,8 @@ fn check_config(cfg: &Config) -> Result<(), String> {
 /// round, the best round counts. The kernels are back at their defaults afterwards.
 pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
     check_config(cfg)?;
-    super::force_quant(true);
+    super::force_quant(cfg.quant);
+    let choices = choices(cfg);
     let wctx = Context::new(4 * cfg.copies + 4, 0);
     let w = weights(&wctx, gpu, cfg)?;
     let k = (cfg.n_embd * cfg.hc) as f64;
@@ -279,9 +330,9 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
         ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
             .map_err(|e| e.to_string())?;
         fill(&inputs, cfg, n);
-        let mut best = vec![f64::MAX; VARIANTS.len()];
+        let mut best = vec![f64::MAX; choices.len()];
         for round in 0..=cfg.rounds {
-            for (vi, v) in VARIANTS.iter().enumerate() {
+            for (vi, v) in choices.iter().enumerate() {
                 select(Some(v));
                 let t = std::time::Instant::now();
                 let r = gpu.compute(&graph);
@@ -293,7 +344,7 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
                 }
             }
         }
-        for (vi, v) in VARIANTS.iter().enumerate() {
+        for (vi, v) in choices.iter().enumerate() {
             rows.push(Row {
                 variant: v.name,
                 tokens: n,
@@ -307,10 +358,12 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
 }
 
 /// Every variant's output bytes (mixed, inject, the combined streams and the block input's
-/// Q8_1 blocks of every copy) against [`VARIANTS`]`[0]`'s (the default's), at every token count of `cfg`.
+/// Q8_1 blocks of every copy) against the first [`choices`]' (the reference's), at every token
+/// count of `cfg`.
 pub fn check(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Check>, String> {
     check_config(cfg)?;
-    super::force_quant(true);
+    super::force_quant(cfg.quant);
+    let choices = choices(cfg);
     let wctx = Context::new(4 * cfg.copies + 4, 0);
     let w = weights(&wctx, gpu, cfg)?;
     let mut out = Vec::new();
@@ -321,7 +374,11 @@ pub fn check(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Check>, String> {
             .map_err(|e| e.to_string())?;
         fill(&inputs, cfg, n);
         let mut reference: Vec<u8> = Vec::new();
-        for v in &VARIANTS {
+        for v in &choices {
+            // Poison the outputs first, so that a kernel that skips some cannot pass.
+            for t in &kept {
+                t.set_bytes(&vec![0xa5; t.bytes().len()]);
+            }
             select(Some(v));
             let r = gpu.compute(&graph);
             select(None);

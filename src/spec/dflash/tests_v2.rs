@@ -600,6 +600,63 @@ fn q4_drafter_weights_are_4_bit_copies_of_the_q8_0_matrices() {
 }
 
 #[test]
+fn quantized_layer_weights_fuse_by_input_and_type() {
+    let (q4k, q8, bf) = (types::Q4_K, types::Q8_0, types::BF16);
+    let (e, kv, ff) = (&[512i64, 1024][..], &[512i64, 256][..], &[512i64, 2048][..]);
+    let tensors = [
+        ("blk.0.attn_q.weight", q4k, e),
+        ("blk.0.attn_k.weight", q4k, kv),
+        ("blk.0.attn_v.weight", q4k, kv),
+        ("blk.0.ffn_gate.weight", q4k, ff),
+        ("blk.0.ffn_up.weight", q4k, ff),
+        // Layer 1: one type per group only (V in Q8_0), gate and up BF16.
+        ("blk.1.attn_q.weight", q4k, e),
+        ("blk.1.attn_k.weight", q4k, kv),
+        ("blk.1.attn_v.weight", q8, kv),
+        ("blk.1.ffn_gate.weight", bf, ff),
+        ("blk.1.ffn_up.weight", bf, ff),
+        // Layer 2: no V (K shared), Q8_0 gate and up.
+        ("blk.2.attn_q.weight", q8, e),
+        ("blk.2.attn_k.weight", q8, kv),
+        ("blk.2.ffn_gate.weight", q8, ff),
+        ("blk.2.ffn_up.weight", q8, ff),
+    ];
+    let parts = |il: usize, names: &[&str], rows: &[i64]| -> Vec<(String, i64)> {
+        names
+            .iter()
+            .zip(rows)
+            .map(|(n, r)| (format!("blk.{il}.{n}.weight"), *r))
+            .collect()
+    };
+    let fused = |name: &str, parts, ty| weights::Fused {
+        name: name.to_string(),
+        parts,
+        ty,
+        k: 512,
+    };
+    assert_eq!(
+        weights::fused_groups(&tensors),
+        vec![
+            fused(
+                "blk.0.attn_qkv_fused",
+                parts(0, &["attn_q", "attn_k", "attn_v"], &[1024, 256, 256]),
+                q4k
+            ),
+            fused(
+                "blk.0.ffn_gate_up_fused",
+                parts(0, &["ffn_gate", "ffn_up"], &[2048, 2048]),
+                q4k
+            ),
+            fused(
+                "blk.2.ffn_gate_up_fused",
+                parts(2, &["ffn_gate", "ffn_up"], &[2048, 2048]),
+                q8
+            ),
+        ]
+    );
+}
+
+#[test]
 fn fp8_block_scaled_matrices_are_read_as_q8_0() {
     let fx = Fixture::new();
     let c = v2_draft();

@@ -44,4 +44,30 @@ mod cuda {
             assert!(rows.iter().all(|r| r.differ == 0 && r.outputs > 0));
         }
     }
+
+    /// The down projection with ggml's SwiGLU in the op's quantization has the bits of
+    /// ggml's `swiglu_split` and then MMVQ.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn cuda_swiglu_down_has_ggmls_bits() {
+        let Some(mut gpu) = gpu() else { return };
+        let cfg = bench::Config {
+            // k 5376: a last quantization CTA with one block of 256 values.
+            shapes: vec![(17408, 5120), (5376, 1024)],
+            cols: (5..=8).collect(),
+            layers: 2,
+            rounds: 0,
+            swiglu: true,
+            ..bench::Config::default()
+        };
+        let rows = bench::run(&mut gpu, &cfg).unwrap();
+        for r in &rows {
+            println!(
+                "k {} rows {} cols {} {}: {} of {} differ, first {:?}",
+                r.k, r.rows, r.cols, r.variant, r.differ, r.outputs, r.first
+            );
+        }
+        assert!(rows.iter().any(|r| r.variant == "swiglu"));
+        assert!(rows.iter().all(|r| r.differ == 0 && r.outputs > 0));
+    }
 }

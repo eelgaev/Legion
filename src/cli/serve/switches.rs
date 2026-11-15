@@ -146,6 +146,16 @@ pub(in crate::cli) struct SwitchArgs {
     /// 0-255, default 0 (every step may leave them).
     #[arg(long, help_heading = HEADING, value_name = "N")]
     gdn_state_defer_min_seqs: Option<u8>,
+    /// CUDA, gated DeltaNet layers, MTP with --tp over machines: after a verify step of at
+    /// least this many sequences, every rank runs the commit's delta rule inside its next
+    /// verify step (see --gdn-commit-in-verify), which saves reading the states once more.
+    /// Narrower verify steps and their commits run as without the flag (one or a few
+    /// sequences' commits are small and hide behind the drafting, where deferring them slows
+    /// a round, #1176). The same bits either way. Takes a second copy of the replay inputs in
+    /// VRAM (a few MB per sequence). Give every rank the same value. 0-255, default 0 (no
+    /// commit deferred).
+    #[arg(long, help_heading = HEADING, value_name = "N")]
+    tp_commit_in_verify_min_seqs: Option<u8>,
     /// CUDA, attention layers: Legion's one-launch norm + RoPE for the q and k heads (and
     /// Qwen3.8-Flash-Next's indexer queries) instead of ggml's rms_norm, mul and rope_multi.
     /// The same bits, but no faster on V100 (the fused external launch splits ggml's CUDA
@@ -204,6 +214,19 @@ pub(in crate::cli) struct SwitchArgs {
     /// GB10); for comparisons and further work.
     #[arg(long, help_heading = HEADING)]
     draft_head_q8_mv: bool,
+    /// Compute capability 7.0 GPUs (V100; no effect elsewhere): run GGUF-quantized matmuls of
+    /// 2-8 tokens (MTP verify steps, small decode batches; Q4_K, Q5_K, Q6_K, IQ4_XS, Q8_0,
+    /// IQ4_NL, Q3_K weights) on Legion's small-M op instead of ggml's mul_mat (quantize + mmvq),
+    /// where ggml runs mmvq. Same bits as ggml. Off by default: faster than mmvq only on IQ4_XS
+    /// (up to ~20% at 5-8 tokens), 0-15% slower on the K-quants.
+    #[arg(long, help_heading = HEADING)]
+    q_small_m: bool,
+    /// Compute capability 7.0 GPUs (V100), with --q-small-m: also run the steps of up to 8
+    /// tokens that ggml runs on MMQ (Q4_K above 5 tokens, Q5_K and Q3_K above 6, Q6_K above 7)
+    /// on Legion's small-M op. Changes outputs (mmvq's sums instead of MMQ's), so greedy text
+    /// can differ from the default.
+    #[arg(long, help_heading = HEADING)]
+    q_small_m_wide: bool,
     /// Compute capability 7.x GPUs (V100; no effect elsewhere), MTP draft passes of one
     /// sequence with a Q8_0 draft LM head: keep the head on ggml's mul_mat (quantize + mmvq)
     /// instead of Legion's one-column Q8_0 matvec op (the default there: ggml's bits, the head
@@ -860,6 +883,19 @@ pub(in crate::cli) struct SwitchArgs {
     /// streams then stay allocated through the MoE layer). For comparisons.
     #[arg(long, help_heading = HEADING)]
     no_hc_lazy_streams: bool,
+    /// Tensor parallelism with --tp-seq-par and --tp-wire bf16 (two ranks' prompt steps): the
+    /// hyper-connection mixer writes the block input it makes as F32 and the all-gather rounds
+    /// it into its send buffer, and not, as by default, the all-gather running that mixer
+    /// with its values rounded straight into the send buffer (#1176: the same bits, one pass
+    /// over the block input less before each gather). For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_tp_gather_mix: bool,
+    /// Tensor parallelism with --tp-seq-par and --tp-wire bf16: the F32 copy of a gathered
+    /// BF16 block input (for its F32 readers, the MoE router) is made by a copy after the
+    /// all-gather, and not, as by default, by the all-gather itself, this rank's share while
+    /// the other rank's is still on the wire (#1176: the same values). For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_tp_gather_widen: bool,
     /// qwen4exp prompt steps on a V100 (compute capability 7.0) or an sm_80+ GPU such as the
     /// GB10 (#826; no effect elsewhere): the layer's gated shared expert is added in the fused
     /// MoE op's per-token sum, and the next hyper-connection combine-and-norm makes that sum
@@ -1403,7 +1439,8 @@ pub(in crate::cli) struct SwitchArgs {
     /// same bits); each tensor's rounding to whole granules takes up to 2 MiB more VRAM, so the
     /// expert cache can lose a few slots. Needed by --kv-vmm-keep (#814). On by default, with
     /// --kv-vmm-keep 32768, on V100s (and GH200s, unmeasured) with the expert cache over a layer
-    /// split of 2 GPUs; off elsewhere.
+    /// split of 2 GPUs, and with 8192 kept tokens on an x86_64 PC's one discrete GPU whose
+    /// experts do not all fit in host memory (#37); off elsewhere.
     #[arg(long, help_heading = HEADING)]
     kv_vmm: bool,
     /// Turn --kv-vmm (and so --kv-vmm-keep) off where it is on by default: every block of the
@@ -1421,7 +1458,10 @@ pub(in crate::cli) struct SwitchArgs {
     /// --glm-parallel-decode, where every GPU keeps every layer's KV (an AC922 with 4 GPUs,
     /// 131072 context: 2.9 GiB a GPU back to the cache at 32768; a long prompt past the kept
     /// tokens maps the rest when it starts). Default 32768 where --kv-vmm is on by default;
-    /// elsewhere off (every block keeps its VRAM).
+    /// elsewhere off (every block keeps its VRAM). An x86_64 PC's one discrete GPU whose experts
+    /// do not all fit in host memory (#37) keeps 8192 by default and, without this flag, maps
+    /// the rest rather than evict a cached chat, and keeps it mapped for five minutes after a
+    /// chat on it last ran (a long chat's next turn maps nothing).
     #[arg(long, help_heading = HEADING, value_name = "TOKENS", value_parser = clap::value_parser!(u32).range(1..))]
     kv_vmm_keep: Option<u32>,
     /// Threads that read the model files at load (1-8; default 4). Replaces
@@ -1486,6 +1526,7 @@ impl SwitchArgs {
             },
             gdn_state_defer_rows: self.gdn_state_defer_rows,
             gdn_state_defer_min_seqs: self.gdn_state_defer_min_seqs,
+            tp_commit_in_verify_min_seqs: self.tp_commit_in_verify_min_seqs,
             norm_rope: self.norm_rope.then_some(true),
             kv_append: self.kv_append.then_some(true),
             head_rope_fused: self.head_rope_fused.then_some(true),
@@ -1495,6 +1536,8 @@ impl SwitchArgs {
             joined_prompt_qkv: self.no_joined_prompt_qkv.then_some(false),
             dense_mv: self.dense_mv_ggml.then_some(false),
             q8_mv: self.draft_head_q8_mv.then_some(true),
+            q_small_m: self.q_small_m.then_some(true),
+            q_small_m_wide: self.q_small_m_wide.then_some(true),
             q8_head: self.no_draft_head_mv.then_some(false),
             q8_head_pick: self.no_draft_head_pick.then_some(false),
             q8_row_mv: self.no_q8_group_row_mv.then_some(false),
@@ -1600,6 +1643,8 @@ impl SwitchArgs {
                 self.no_hc_moe_fold.then_some(false)
             },
             hc_lazy_streams: self.no_hc_lazy_streams.then_some(false),
+            tp_gather_mix: self.no_tp_gather_mix.then_some(false),
+            tp_gather_widen: self.no_tp_gather_widen.then_some(false),
             hc_fuse: self.hc_fuse.then_some(true),
             hc_xn16: self.hc_xn_f32.then_some(false),
             hc_quant: self.hc_quant_ggml.then_some(false),

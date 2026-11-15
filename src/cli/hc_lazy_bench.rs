@@ -32,12 +32,13 @@ pub fn run(args: HcLazyBenchArgs) -> anyhow::Result<()> {
     }
     let rows = bench::run(&mut gpu, &cfg).map_err(anyhow::Error::msg)?;
     println!(
-        "{:>6} {:<5} {:>9} {:>8} {:>5} {:>10} {:>6} {:>10} {:>10}",
+        "{:>6} {:<5} {:>9} {:>8} {:>5} {:>7} {:>10} {:>6} {:>10} {:>10}",
         "tokens",
         "graph",
         "µs/layer",
         "vs main",
         "lazy",
+        "compact",
         "buffer MiB",
         "unread",
         "values",
@@ -50,12 +51,13 @@ pub fn run(args: HcLazyBenchArgs) -> anyhow::Result<()> {
             .find(|m| m.tokens == r.tokens && !m.lazy)
             .map_or(f64::NAN, |m| m.secs);
         println!(
-            "{:>6} {:<5} {:>9.1} {:>8.3} {:>5} {:>10.1} {:>6} {:>10} {:>10}",
+            "{:>6} {:<5} {:>9.1} {:>8.3} {:>5} {:>7} {:>10.1} {:>6} {:>10} {:>10}",
             r.tokens,
             if r.lazy { "lazy" } else { "main" },
             r.secs * 1e6,
             r.secs / main,
             r.made,
+            r.compact,
             r.buffer as f64 / (1 << 20) as f64,
             r.unread,
             r.values,

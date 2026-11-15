@@ -6,7 +6,8 @@
 //!   the output head and the MTP head on the last one.
 //! - With several stages the token embeddings go to pinned host memory every GPU reads (the
 //!   first stage embeds the prompt, the MTP head on the last embeds its drafts; a few rows per
-//!   token), and so do the RoPE frequency factors every attention layer reads. A model whose
+//!   token), and so do the RoPE frequency factors every attention layer reads; the bounded
+//!   host tier's one GPU does the same ([`embd_on_host`]) for VRAM slots. A model whose
 //!   LM head is its embeddings (tied, Gemma 4) also gets a copy of them on the last GPU as
 //!   `output.weight` ([`HEAD_COPY`]): the head reads every row each step, which over the host
 //!   link cost more than the rest of a decode step.
@@ -28,7 +29,8 @@ pub(super) struct Layout {
     pub mode: ExpertMode,
     /// Per stage: the pinned host arena its layers' experts load into, and its NUMA node.
     pub arenas: Option<Vec<(BufferType, u32)>>,
-    /// Pinned host memory every GPU reads (the token embeddings of a multi-stage layout).
+    /// Pinned host memory every GPU reads (the token embeddings of a multi-stage layout, or of
+    /// the bounded host tier's one GPU: [`embd_on_host`]).
     pub shared_host: Option<BufferType>,
     pub host: BufferType,
     /// Tensor parallelism: the devices under the one stage's meta device (else empty).
@@ -51,6 +53,17 @@ pub(super) struct Layout {
 /// The tied head's device copy for a multi-stage layout: `(name, source)` for the loader
 /// ([`crate::load_io::Options::aliases`]).
 pub const HEAD_COPY: (&str, &str) = ("output.weight", "token_embd.weight");
+
+/// Whether one stage's token embeddings (and the other [`SHARED`] tensors) go to pinned host
+/// memory as a multi-stage layout's do: the bounded host tier's machine and model (`tier`,
+/// [`super::ssd_tier::host_tier_wanted`]) with an LM head of its own (`untied`: a tied head
+/// would read every row over the host link each step), unless `LEGION_DEBUG_EMBD_DEVICE`
+/// (`keep`, an A/B switch) keeps them in VRAM. A step reads only its tokens' rows (a few KiB
+/// each); Qwen3.8-Flash-Next's Q8_0 table is 644 MiB of the 4090's VRAM, ~210 expert slots.
+/// Strata keeps it in mapped host memory too.
+pub(super) fn embd_on_host(n_stages: usize, tier: bool, untied: bool, keep: bool) -> bool {
+    n_stages == 1 && tier && untied && !keep
+}
 
 /// Tensors outside the layers that layers of any stage read: in memory every GPU reads when
 /// there are several stages.
@@ -323,9 +336,26 @@ impl Layout {
                 ranges.len()
             )));
         }
-        // Several GPUs read the embeddings: pinned host memory.
+        // Several GPUs read the embeddings: pinned host memory. So does the host tier's one
+        // discrete GPU (#37, [`embd_on_host`]): a step reads only its tokens' rows, and the VRAM
+        // holds expert slots instead.
+        let embd_host = embd_on_host(
+            n_stages,
+            node.is_none()
+                && super::ssd_tier::host_tier_wanted(
+                    std::env::consts::ARCH,
+                    mode,
+                    hp.arch.name(),
+                    n_stages,
+                    cfg.tp,
+                    devs[0].map(|d| d.kind()),
+                    arenas.is_some(),
+                ),
+            gguf.tensor("output.weight").is_some(),
+            std::env::var_os("LEGION_DEBUG_EMBD_DEVICE").is_some(),
+        );
         let shared_host = match &devs[0] {
-            Some(d) if n_stages > 1 => d.host_buffer_type(),
+            Some(d) if n_stages > 1 || embd_host => d.host_buffer_type(),
             _ => None,
         };
         let me = Self {

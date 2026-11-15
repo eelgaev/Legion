@@ -345,7 +345,57 @@ pub fn mul_mat<'a>(
         types::F32,
         [w.ne()[1], x.ne()[1], 1, 1],
         &args,
-        &[i32::from(scale.is_some())],
+        &[i32::from(scale.is_some()), 0],
+    )
+}
+
+/// Whether the op can compute `w @ swiglu_split(gate, up)` (times `scale`) with ggml's bits
+/// ([`mul_mat_swiglu`]): [`fits`] for `w` over `gate`, and `up` an F32 tensor of `gate`'s
+/// shape and column layout in device memory.
+pub fn swiglu_fits(
+    w: Tensor<'_>,
+    gate: Tensor<'_>,
+    up: Tensor<'_>,
+    scale: Option<Tensor<'_>>,
+) -> bool {
+    let unb = up.nb();
+    fits(w, gate, scale)
+        && up.ty() == types::F32
+        && up.ne() == gate.ne()
+        && unb[0] == 4
+        && unb[1].is_multiple_of(4)
+        && !up.is_host()
+        && !up.is_meta()
+}
+
+/// Whether [`super::linear::Linear`] builds a SwiGLU FFN's down projection as
+/// [`mul_mat_swiglu`] where it fits (#689: on unless `LEGION_DEBUG_MVQ_SWIGLU=0`, for A/B
+/// runs; the same bits either way).
+pub fn swiglu_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("LEGION_DEBUG_MVQ_SWIGLU").as_deref() != Ok("0"))
+}
+
+/// `w @ swiglu_split(gate, up)` (F32 `[rows, n]`), times `scale` when there is one, on the op
+/// with ggml's SwiGLU in its quantization kernel: the bits of ggml's `swiglu_split` and then
+/// [`mul_mat`] over it, one kernel fewer, and the quantization few enough CTAs that the matvec
+/// launches while the up matmul before it still runs (see the kernel file). The caller checked
+/// [`swiglu_fits`] (and [`takes`] over `gate` for a served graph).
+pub fn mul_mat_swiglu<'a>(
+    ctx: &'a Context,
+    w: Tensor<'a>,
+    gate: Tensor<'a>,
+    up: Tensor<'a>,
+    scale: Option<Tensor<'a>>,
+) -> Tensor<'a> {
+    let mut args = vec![w, gate, up];
+    args.extend(scale);
+    ctx.external_with(
+        &NVFP4_MVQ,
+        types::F32,
+        [w.ne()[1], gate.ne()[1], 1, 1],
+        &args,
+        &[i32::from(scale.is_some()), 1],
     )
 }
 
@@ -355,6 +405,9 @@ struct Operands {
     x: *const u8,
     x_nb1: usize,
     scale: *const u8,
+    /// [`mul_mat_swiglu`]'s up (`x` is the gate), else null.
+    up: *const u8,
+    up_nb1: usize,
     dst: *mut u8,
     dst_nb1: usize,
     k: usize,
@@ -364,21 +417,25 @@ struct Operands {
 
 impl Operands {
     /// # Safety
-    /// `dst` is a node made by [`mul_mat`].
+    /// `dst` is a node made by [`mul_mat`] or [`mul_mat_swiglu`].
     unsafe fn of(dst: &ffi::ggml_tensor) -> Self {
-        let [scaled, ..] = external_params(dst);
+        let [scaled, swiglu, ..] = external_params(dst);
         unsafe {
             let (w, x) = (&*dst.src[0], &*dst.src[1]);
+            let up = (swiglu != 0).then(|| &*dst.src[2]);
+            let s = 2 + usize::from(up.is_some());
             Self {
                 w: w.data as *const u8,
                 w_nb1: w.nb[1],
                 x: x.data as *const u8,
                 x_nb1: x.nb[1],
                 scale: if scaled != 0 {
-                    (*dst.src[2]).data as *const u8
+                    (*dst.src[s]).data as *const u8
                 } else {
                     std::ptr::null()
                 },
+                up: up.map_or(std::ptr::null(), |u| u.data as *const u8),
+                up_nb1: up.map_or(0, |u| u.nb[1]),
                 dst: dst.data as *mut u8,
                 dst_nb1: dst.nb[1],
                 k: w.ne[0] as usize,
@@ -404,12 +461,29 @@ unsafe fn cpu_nvfp4_mvq(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
             let w = crate::ggml::dequantize(types::NVFP4, row, o.k);
             for j in 0..o.n {
                 let x = std::slice::from_raw_parts(o.x.add(j * o.x_nb1) as *const f32, o.k);
-                let v: f32 = w.iter().zip(x).map(|(a, b)| a * b).sum();
+                let act: Vec<f32> = if o.up.is_null() {
+                    x.to_vec()
+                } else {
+                    let u = std::slice::from_raw_parts(o.up.add(j * o.up_nb1) as *const f32, o.k);
+                    x.iter()
+                        .zip(u)
+                        .map(|(&g, &u)| g / (1.0 + (-g).exp()) * u)
+                        .collect()
+                };
+                let v: f32 = w.iter().zip(&act).map(|(a, b)| a * b).sum();
                 *(o.dst.add(j * o.dst_nb1) as *mut f32).add(r) = scale.map_or(v, |s| v * s);
             }
         }
     }
 }
+
+/// The kernel table's SwiGLU quantization ([`mul_mat_swiglu`]).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+const QUANTIZE_SWIGLU: usize = 7;
+
+/// Blocks of 256 values a CTA of the SwiGLU quantization takes (the kernel's `SWIGLU_BLOCKS`).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+const SWIGLU_BLOCKS: usize = 4;
 
 /// The matvec of the kernel table for `n` columns: ggml's warps for the column count (4 up to
 /// 4 columns, 2 above).
@@ -454,6 +528,8 @@ struct Params {
     n: i32,
     ns: i32,
     chunks: i32,
+    up: *const f32,
+    up_nb1: i64,
 }
 
 /// # Safety
@@ -488,14 +564,19 @@ unsafe fn cuda_nvfp4_mvq(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
         n: o.n as i32,
         ns: plan.ns as i32,
         chunks: plan.chunks as i32,
+        up: o.up as *const f32,
+        up_nb1: (o.up_nb1 / 4) as i64,
     };
+    // The SwiGLU quantization takes SWIGLU_BLOCKS blocks of 256 values a CTA.
+    let swiglu = !o.up.is_null();
+    let per_cta = if swiglu { 256 * SWIGLU_BLOCKS } else { 256 };
     let quantize = launch::Dim3 {
-        x: o.k.div_ceil(256) as u32,
+        x: o.k.div_ceil(per_cta) as u32,
         y: o.n as u32,
         z: 1,
     };
     launch::launch(
-        0,
+        if swiglu { QUANTIZE_SWIGLU } else { 0 },
         quantize,
         launch::Dim3 { x: 256, y: 1, z: 1 },
         0,
@@ -574,7 +655,7 @@ mod launch {
     }
 
     /// Entries of the kernel table.
-    const KERNELS: usize = 7;
+    const KERNELS: usize = 8;
     const DEV_ATTR_SM_COUNT: c_int = 16;
     const DEV_ATTR_SMEM_OPTIN: c_int = 97;
     const DEV_ATTR_CC_MAJOR: c_int = 75;
