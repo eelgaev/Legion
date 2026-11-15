@@ -58,7 +58,8 @@ struct legion_qsa_select {
     uint32_t block;
     // select_all (the indexer's early exit, after upstream Strata's #783 series, MIT): each
     // token's visible pools [first, end), at most n_top, instead of top and score; null for
-    // the select.
+    // the select. With top and no score (select_vis, #560 r12): the range that says which of
+    // the picks are live.
     const int32_t * vis;
     int64_t vis_nb1;
 };
@@ -209,7 +210,7 @@ __global__ void select_kernel(legion_qsa_select p) {
     __syncthreads();
     for (int j = tid; j < p.sort_n; j += blockDim.x) {
         long long k = ((long long) dead << 32) | 0xffffffffll;
-        if (p.vis != nullptr) {
+        if (p.vis != nullptr && p.top == nullptr) {
             // Every visible pool, as top_k picks them all when they fit its budget (all of
             // them score above -inf).
             const int32_t * v = (const int32_t *) ((const char *) p.vis + t * p.vis_nb1);
@@ -222,7 +223,16 @@ __global__ void select_kernel(legion_qsa_select p) {
             }
         } else if (j < p.n_top) {
             const int pool = top[j];
-            if (score[pool] > -INFINITY) {
+            // select_vis (no scores): a pick is live when the token sees its pool, as the
+            // indexer's mask scores every other pool -inf.
+            bool live;
+            if (p.score != nullptr) {
+                live = score[pool] > -INFINITY;
+            } else {
+                const int32_t * v = (const int32_t *) ((const char *) p.vis + t * p.vis_nb1);
+                live = pool >= v[0] && pool < v[1];
+            }
+            if (live) {
                 const int first =
                     *(const int32_t *) ((const char *) p.pool_idxs + pool * p.pool_nb1);
                 k = ((long long) first << 32) | (unsigned) pool;

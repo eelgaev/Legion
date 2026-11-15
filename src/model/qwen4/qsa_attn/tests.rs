@@ -1211,3 +1211,105 @@ fn cuda_select_all_is_the_scored_selection() {
         );
     }
 }
+
+/// A step's selection from the indexer's chain (pool mask, lightning indexer, pool bias,
+/// [`top_k`] of `n_top`) both ways on `backend`: [`select`] with the scores and
+/// [`select_vis`] with the visible ranges (#560 r12), the [`pick_all_case`] listing.
+fn pick_vis_case(
+    backend: &mut Backend,
+    pools: &[usize],
+    n_pool: usize,
+    n_top: usize,
+    n_tok: usize,
+) -> (Vec<i32>, Vec<i32>) {
+    let (d, nh, kpool) = (128i64, 4i64, 4usize);
+    let ng = pools.len() * n_tok;
+    let ctx = Context::new(64, 64);
+    let q = ctx.new_tensor(types::F32, &[d, nh, ng as i64]).as_input();
+    let keys = ctx
+        .new_tensor(types::F32, &[d, 1, n_pool as i64])
+        .as_input();
+    let w = ctx.new_tensor(types::F32, &[nh, ng as i64]).as_input();
+    let vis = ctx.new_tensor(types::I32, &[2, ng as i64]).as_input();
+    let bias = ctx.new_tensor(types::F32, &[n_pool as i64]).as_input();
+    let pidx = ctx
+        .new_tensor(types::I32, &[kpool as i64, n_pool as i64])
+        .as_input();
+    let tail = ctx
+        .new_tensor(types::I32, &[kpool as i64 - 1, ng as i64])
+        .as_input();
+    let pos = ctx.new_tensor(types::I32, &[ng as i64]).as_input();
+    let mask = pool_mask(&ctx, vis, n_pool as i64);
+    let score = ctx.add(ctx.lightning_indexer(q, keys, w, mask), bias);
+    let top = top_k(&ctx, score, n_top as i64);
+    let chain = select(&ctx, top, score, pidx, tail, pos).as_output();
+    let picks = select_vis(&ctx, top, vis, pidx, tail, pos).as_output();
+    let mut g = ctx.new_graph(64);
+    g.expand(chain);
+    g.expand(picks);
+    ctx.alloc_graph(&g, ComputeAllocator::new(backend.buffer_type()))
+        .unwrap();
+    q.set_f32(&noise(d as usize * nh as usize * ng, 3));
+    keys.set_f32(&noise(d as usize * n_pool, 4));
+    w.set_f32(&vec![1.0 / (d as f32).sqrt(); nh as usize * ng]);
+    let (mut v, mut b, mut members, mut tails, mut ps) = (vec![], vec![], vec![], vec![], vec![]);
+    for &n in pools {
+        let first = b.len() as i32;
+        for j in 0..n {
+            b.push(j as f32 * 1e-30);
+            members.extend((0..kpool).map(|k| (j * kpool + k) as i32));
+        }
+        let end = n * kpool + kpool - 1;
+        for t in 0..n_tok {
+            let p = (end - (n_tok - 1 - t)) as i32;
+            v.extend([first, b.len() as i32]);
+            tails.extend((0..kpool as i32 - 1).map(|k| p - k));
+            ps.push(p);
+        }
+    }
+    assert!(b.len() < n_pool);
+    b.resize(n_pool, 0.0);
+    members.resize(n_pool * kpool, i32::MAX);
+    vis.set_bytes(&bytes(&v));
+    bias.set_f32(&b);
+    pidx.set_bytes(&bytes(&members));
+    tail.set_bytes(&bytes(&tails));
+    pos.set_bytes(&bytes(&ps));
+    backend.compute(&g).unwrap();
+    (chain.to_i32(), picks.to_i32())
+}
+
+/// (pools per sequence, listed pools, picks, tokens per sequence): more visible pools than
+/// picks, fewer (dead picks past them), several sequences, a prompt chunk.
+const PICK_VIS_CASES: [(&[usize], usize, usize, usize); 4] = [
+    (&[100], 128, 64, 3),
+    (&[300, 260], 576, 512, 3),
+    (&[512, 7, 130, 64], 768, 256, 2),
+    (&[500], 512, 128, 64),
+];
+
+#[test]
+fn cpu_select_vis_is_the_scored_selection() {
+    for &(pools, n_pool, n_top, n_tok) in &PICK_VIS_CASES {
+        let (chain, picks) = pick_vis_case(&mut cpu(), pools, n_pool, n_top, n_tok);
+        assert_eq!(chain, picks, "{pools:?} over {n_pool}, {n_top} picks");
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_select_vis_is_the_scored_selection() {
+    use crate::ggml::{DeviceKind, device_by_kind};
+    let mut gpu = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU")
+        .init()
+        .unwrap();
+    for &(pools, n_pool, n_top, n_tok) in &PICK_VIS_CASES {
+        let (chain, picks) = pick_vis_case(&mut gpu, pools, n_pool, n_top, n_tok);
+        let (cpu_chain, _) = pick_vis_case(&mut cpu(), pools, n_pool, n_top, n_tok);
+        assert_eq!(chain, picks, "{pools:?} over {n_pool}, {n_top} picks");
+        assert_eq!(picks, cpu_chain, "{pools:?} over {n_pool}: CUDA vs CPU");
+    }
+}

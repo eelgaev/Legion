@@ -82,7 +82,14 @@ pub fn set_min_cols(cols: usize) {
 /// `--tp-overlap`: every rank's every micro-batch has at least [`MIN_COLS`] columns. The
 /// same answer on every rank.
 pub fn worth(n: usize, ranks: usize) -> bool {
-    let min = MIN.load(std::sync::atomic::Ordering::Relaxed);
+    worth_at(n, ranks, usize::MAX)
+}
+
+/// [`worth`] with a floor of the caller's, `min` columns a micro-batch (or [`set_min_cols`]'s
+/// if lower): for a model whose split work gives every token the same bits at any column
+/// count (#560 r12: GLM-5.3-Flash's mixers).
+pub fn worth_at(n: usize, ranks: usize, min: usize) -> bool {
+    let min = min.min(MIN.load(std::sync::atomic::Ordering::Relaxed));
     (0..ranks)
         .flat_map(|r| (0..MICRO).map(move |j| piece(n, r, ranks, j, false).1))
         .all(|m| m >= min)

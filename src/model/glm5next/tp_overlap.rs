@@ -27,6 +27,14 @@ use crate::tp_net::seq_par::share;
 
 use super::ops::{self, HcPre};
 
+/// The fewest columns a micro-batch takes here (#560 r12), below `micro`'s [`micro::MIN_COLS`]
+/// so the 1,650- and 2,470-token tail steps of long prompts split too. Only the mixers run per
+/// micro-batch, and theirs are the whole share's kernels at any size from 64 tokens (`hc_pre`'s
+/// tiled mix, the norm, `hc_post`), each token's values summed in one order, so a micro-batch
+/// gives its tokens the whole share's bits; at 256 the halves of even a 1,024-token step stay
+/// clear of that.
+const MICRO_MIN: usize = 256;
+
 /// The split layers' state.
 pub(super) struct Micro<'a> {
     comm: i32,
@@ -61,7 +69,12 @@ impl Model {
         }
         let n = n as usize;
         // Short steps stay whole (the same choice on every rank).
-        if !micro::worth(n, ranks) {
+        let floor = if super::share_level() >= 4 {
+            MICRO_MIN
+        } else {
+            micro::MIN_COLS
+        };
+        if !micro::worth_at(n, ranks, floor) {
             return None;
         }
         let (a, _) = share(n, rank, ranks);

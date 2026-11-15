@@ -66,3 +66,14 @@ fn short_steps_stay_whole() {
         assert_eq!(worth(n, ranks), split, "n {n} ranks {ranks}");
     }
 }
+
+/// A caller's lower floor (#560 r12, GLM's 256): a long prompt's 1,650- and 2,470-token tail
+/// steps split over two ranks, a 1,023-token one does not; above `MIN_COLS` it changes nothing.
+#[test]
+fn lower_floor_splits_tail_steps() {
+    for (n, split) in [(1650, true), (2470, true), (1024, true), (1023, false)] {
+        assert_eq!(worth_at(n, 2, 256), split, "n {n}");
+    }
+    assert!(!worth_at(4095, 2, 4096));
+    assert_eq!(worth_at(4095, 2, 2048), worth(4095, 2));
+}

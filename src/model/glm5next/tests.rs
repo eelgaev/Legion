@@ -146,6 +146,8 @@ fn share_levels_from_the_environment() {
     assert_eq!(share_level_of(None), SHARE_LEVEL_DEFAULT);
     assert_eq!(share_level_of(Some("0")), 0);
     assert_eq!(share_level_of(Some(" 2 ")), 2);
+    assert_eq!(share_level_of(Some("3")), 3);
+    assert_eq!(SHARE_LEVEL_DEFAULT, 4);
     assert_eq!(share_level_of(Some("9")), SHARE_LEVEL_DEFAULT);
     assert_eq!(share_level_of(Some("x")), SHARE_LEVEL_DEFAULT);
 }
