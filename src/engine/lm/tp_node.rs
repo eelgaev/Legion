@@ -693,6 +693,13 @@ fn handle(
             exec.commit(&commits).map_err(|e| e.to_string())?;
             Reply::Done
         }
+        Request::TpPrefetch { before, tokens } => {
+            // A prompt's next chunk's table rows, read ahead as rank 0 reads its own (#1176):
+            // that chunk's step finds them read instead of waiting for the SSD.
+            exec.model().prefetch_ngram_next(&before, &tokens);
+            exec.model().prefetch_engram(&before, &tokens);
+            Reply::Done
+        }
         Request::SaveRing {
             ring,
             slot,
