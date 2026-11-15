@@ -216,8 +216,11 @@ pub fn route_bias() -> f32 {
 /// How much of a `--tp-seq-par` step's per-token work beyond round 9's runs on the token share
 /// (#560 r10), each level the ones below and the same bits as all of them:
 /// 1 the indexer's shares cut by their cost ([`qsa_cut`]), 2 the indexer's query and head
-/// weight products on the share, 3 (the default) the router on the share.
-/// `LEGION_DEBUG_GLM_SHARE_LEVEL=0..3` takes a level for A/B runs (on every rank alike).
+/// weight products on the share, 3 the router on the share, 4 (the default, round 12) fewer
+/// and smaller exchanges: the router's ids and weights in one, the indexer's picks instead of
+/// the selection rows ([`qsa_attn::select_vis`]), and with `--tp-overlap` halves down to
+/// 256 tokens (`tp_overlap`'s floor; below level 4, `tp_net::micro`'s 1,024).
+/// `LEGION_DEBUG_GLM_SHARE_LEVEL=0..4` takes a level for A/B runs (on every rank alike).
 fn share_level() -> u8 {
     static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *LEVEL.get_or_init(|| {
@@ -236,7 +239,7 @@ pub(crate) fn share_level_of(env: Option<&str>) -> u8 {
 }
 
 /// [`share_level`]'s default: all of them.
-pub(crate) const SHARE_LEVEL_DEFAULT: u8 = 3;
+pub(crate) const SHARE_LEVEL_DEFAULT: u8 = 4;
 
 /// The fewest tokens a rank's share may have for the scores to take the share's kernel
 /// (`qsa_attn::scores`' exact path, 8+ queries).
@@ -1149,10 +1152,26 @@ impl Model {
             let ids = ops::router_ids(ctx, logits, bias, hp.n_expert_used);
             let w = ops::router_w(ctx, logits, ids, p.weights_norm, p.weights_scale);
             let k = hp.n_expert_used;
-            let ids = crate::tp_net::seq_par::all_gather_i32(ctx, c, ids, n_x, 0);
-            let w = ctx.reinterpret(w, types::I32, [k, m as i64, 1, 1]);
-            let w = crate::tp_net::seq_par::all_gather_i32(ctx, c, w, n_x, 0);
-            let w = ctx.reinterpret(w, types::F32, [k, n_x, 1, 1]);
+            if share_level() < 4 {
+                let ids = crate::tp_net::seq_par::all_gather_i32(ctx, c, ids, n_x, 0);
+                let w = ctx.reinterpret(w, types::I32, [k, m as i64, 1, 1]);
+                let w = crate::tp_net::seq_par::all_gather_i32(ctx, c, w, n_x, 0);
+                let w = ctx.reinterpret(w, types::F32, [k, n_x, 1, 1]);
+                return self.glm_moe_routed(pass, il, x, room, ids, w);
+            }
+            // Round 12: both in one exchange, a token's ids then its weights' bits (`[2k,
+            // share]`; the join and the splits copy 4-byte values as they are).
+            let idf = ctx.reinterpret(ids, types::F32, [k, m as i64, 1, 1]);
+            let both = ctx.concat(idf, w, 0);
+            let both = ctx.reinterpret(both, types::I32, [2 * k, m as i64, 1, 1]);
+            let both = crate::tp_net::seq_par::all_gather_i32(ctx, c, both, n_x, 0);
+            let both = ctx.reinterpret(both, types::F32, [2 * k, n_x, 1, 1]);
+            let half = |i: i64| {
+                let nb1 = both.nb()[1];
+                ctx.cont(ctx.view_2d(both, [k, n_x], nb1, (i * k) as usize * 4))
+            };
+            let ids = ctx.reinterpret(half(0), types::I32, [k, n_x, 1, 1]);
+            let w = half(1);
             return self.glm_moe_routed(pass, il, x, room, ids, w);
         }
         let logits = self.glm_lmm(ctx, il, "ffn_gate_inp.weight", x)?;
@@ -1917,10 +1936,18 @@ impl Model {
                     Some(inp.pool_cells),
                 );
                 let top = qsa_attn::top_k(ctx, score, n_top);
-                let pm = ctx.view_2d(pass.pos, [m, 1], m as usize * es, t0 as usize * es);
-                let tail = cols(ctx, inp.tail_idxs, a, m);
-                let mine = qsa_attn::select(ctx, top, score, inp.pool_idxs, tail, pm);
-                crate::tp_net::seq_par::all_gather_i32(ctx, c, mine, ng, cut)
+                if level >= 4 {
+                    // Round 12: the picks (`[n_top, share]`, a quarter of the selection rows'
+                    // bytes) gathered instead, every rank selecting for all the group's tokens
+                    // from them and the tokens' visible pools, the same rows.
+                    let top = crate::tp_net::seq_par::all_gather_i32(ctx, c, top, ng, cut);
+                    qsa_attn::select_vis(ctx, top, inp.pool_vis, inp.pool_idxs, inp.tail_idxs, pos)
+                } else {
+                    let pm = ctx.view_2d(pass.pos, [m, 1], m as usize * es, t0 as usize * es);
+                    let tail = cols(ctx, inp.tail_idxs, a, m);
+                    let mine = qsa_attn::select(ctx, top, score, inp.pool_idxs, tail, pm);
+                    crate::tp_net::seq_par::all_gather_i32(ctx, c, mine, ng, cut)
+                }
             } else {
                 let qnb = iq.nb();
                 let qg = ctx.view_3d(iq, [di, ih, ng], [qnb[1], qnb[2]], off as usize * qnb[2]);

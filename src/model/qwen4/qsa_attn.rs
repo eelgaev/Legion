@@ -58,6 +58,15 @@ static SELECT_ALL: ExternalOp = ExternalOp {
     cuda: None,
 };
 
+static SELECT_VIS: ExternalOp = ExternalOp {
+    name: "qsa_select_vis",
+    cpu: cpu_select_vis,
+    #[cfg(feature = "cuda")]
+    cuda: Some(cuda_select_vis),
+    #[cfg(not(feature = "cuda"))]
+    cuda: None,
+};
+
 static SCORES: ExternalOp = ExternalOp {
     name: "qsa_scores",
     cpu: cpu_scores,
@@ -484,6 +493,32 @@ pub fn select_all<'a>(
     )
 }
 
+/// [`select`] from the picks `top` without their scores (#560 r12: GLM's `--tp-seq-par`
+/// ranks exchange each token's picks, a quarter of its selection row's bytes, and select
+/// for every token themselves): a pick is live when its pool is in the token's visible range
+/// `vis` (I32 `[2, tokens]`, as [`select_all`] takes it). The indexer's scores mask every
+/// other pool to -inf and every visible one is finite, so these are `select(top, score, ..)`'s
+/// rows (the tests compare them).
+pub fn select_vis<'a>(
+    ctx: &'a Context,
+    top: Tensor<'a>,
+    vis: Tensor<'a>,
+    pool_idxs: Tensor<'a>,
+    tail: Tensor<'a>,
+    pos: Tensor<'a>,
+) -> Tensor<'a> {
+    let [n_top, ng, ..] = top.ne();
+    assert_eq!(vis.ne()[1], ng, "qsa select_vis: a range a token");
+    let kpool = pool_idxs.ne()[0];
+    let cap = n_top * kpool + kpool - 1;
+    ctx.external(
+        &SELECT_VIS,
+        types::I32,
+        [1 + cap, ng, 1, 1],
+        &[top, vis, pool_idxs, tail, pos],
+    )
+}
+
 /// Attention of `q` (F32 `[d, n_head, n_tok, n_seqs]`, may be a strided view) over the pools
 /// `k`, `v` (`[d × n_head_kv, cells]`, F16, or q8_0 / q4_0 as [`reads_types`] says): token
 /// `t` of sequence `s` attends to the positions of selection row `s × n_tok + t` of `sel` (from
@@ -725,6 +760,49 @@ unsafe fn cpu_select(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
             select_row(
                 top_row,
                 |j| *score_row.add(j),
+                |j, k| at_i32((pidx.data as *const u8).add(j * pidx.nb[1]), k),
+                kpool,
+                tail_row,
+                p,
+                out,
+            );
+        }
+    }
+}
+
+unsafe fn cpu_select_vis(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
+    // SAFETY: a node made by `select_vis`, host tensors.
+    unsafe {
+        let src = |i: usize| &*dst.src[i];
+        let (top, vis, pidx, tail, pos) = (src(0), src(1), src(2), src(3), src(4));
+        let (n_top, ng) = (top.ne[0] as usize, top.ne[1] as usize);
+        let kpool = pidx.ne[0] as usize;
+        let row_len = dst.ne[0] as usize;
+        for t in (ith..ng).step_by(nth) {
+            let top_row = std::slice::from_raw_parts(
+                (top.data as *const u8).add(t * top.nb[1]) as *const i32,
+                n_top,
+            );
+            let v = (vis.data as *const u8).add(t * vis.nb[1]);
+            let (first, end) = (at_i32(v, 0) as usize, at_i32(v, 1) as usize);
+            let tail_row = std::slice::from_raw_parts(
+                (tail.data as *const u8).add(t * tail.nb[1]) as *const i32,
+                kpool - 1,
+            );
+            let p = at_i32((pos.data as *const u8).add(t * pos.nb[0]), 0);
+            let out = std::slice::from_raw_parts_mut(
+                (dst.data as *mut u8).add(t * dst.nb[1]) as *mut i32,
+                row_len,
+            );
+            select_row(
+                top_row,
+                |j| {
+                    if (first..end).contains(&j) {
+                        0.0
+                    } else {
+                        f32::NEG_INFINITY
+                    }
+                },
                 |j, k| at_i32((pidx.data as *const u8).add(j * pidx.nb[1]), k),
                 kpool,
                 tail_row,
@@ -1276,6 +1354,45 @@ unsafe fn cuda_select_all(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
             vis_nb1: vis.nb[1] as i64,
         };
         launched("qsa_select_all", cuda::legion_qsa_select_launch(&p, stream))
+    }
+}
+
+#[cfg(feature = "cuda")]
+unsafe fn cuda_select_vis(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
+    // SAFETY: a node made by `select_vis`, device tensors of the stream's device.
+    unsafe {
+        let src = |i: usize| &*dst.src[i];
+        let (top, vis, pidx, tail, pos) = (src(0), src(1), src(2), src(3), src(4));
+        let n_top = top.ne[0] as usize;
+        if n_top > CUDA_MAX_TOP {
+            return Err(format!(
+                "qsa_select_vis: {n_top} pools per token (at most {CUDA_MAX_TOP})"
+            ));
+        }
+        // The select kernel with picks and no scores: the pick's liveness from `vis`.
+        let p = cuda::Select {
+            top: top.data as *const i32,
+            top_nb1: top.nb[1] as i64,
+            score: std::ptr::null(),
+            score_nb1: 0,
+            pool_idxs: pidx.data as *const i32,
+            pool_nb1: pidx.nb[1] as i64,
+            tail: tail.data as *const i32,
+            tail_nb1: tail.nb[1] as i64,
+            pos: pos.data as *const i32,
+            pos_nb0: pos.nb[0] as i64,
+            dst: dst.data as *mut i32,
+            dst_nb1: dst.nb[1] as i64,
+            n_top: n_top as i32,
+            kpool: pidx.ne[0] as i32,
+            row_len: dst.ne[0] as i32,
+            n_tok: top.ne[1] as i32,
+            sort_n: n_top.next_power_of_two().max(32) as i32,
+            block: 256,
+            vis: vis.data as *const i32,
+            vis_nb1: vis.nb[1] as i64,
+        };
+        launched("qsa_select_vis", cuda::legion_qsa_select_launch(&p, stream))
     }
 }
 
