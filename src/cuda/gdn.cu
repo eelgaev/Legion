@@ -84,6 +84,10 @@ struct legion_spec_window {
 int legion_gdn_launch(const legion_gdn * p, void * stream);
 int legion_gdn_decode_launch(const legion_gdn * p, int variant, void * stream);
 int legion_spec_window_launch(const legion_spec_window * p, void * stream);
+// The same copy for `layers` (src, dst) pairs of one shape and strides at once: table[2 l] and
+// table[2 l + 1] (device memory) are pair l's src and dst; p's own src/dst are pair 0's.
+int legion_spec_windows_launch(const legion_spec_window * p, const uint64_t * table, int64_t layers,
+                               void * stream);
 
 }  // extern "C"
 
@@ -541,6 +545,24 @@ __global__ void spec_window_kernel(const legion_spec_window p) {
         return;
     }
     p.dst[s * p.d2 + r * p.d1 + j] = p.src[s * p.s2 + r * p.s1 + keep + j];
+}
+
+// spec_window_kernel with the grid's y the pair: one launch for every layer.
+__global__ void spec_windows_kernel(const legion_spec_window p, const uint64_t * table) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= p.w * p.rows * p.n) {
+        return;
+    }
+    const int64_t j = i % p.w;
+    const int64_t r = (i / p.w) % p.rows;
+    const int64_t s = i / (p.w * p.rows);
+    const int64_t keep = p.keep[s];
+    if (keep <= 0) {
+        return;
+    }
+    const float * src = (const float *) table[2 * blockIdx.y];
+    float * dst = (float *) table[2 * blockIdx.y + 1];
+    dst[s * p.d2 + r * p.d1 + j] = src[s * p.s2 + r * p.s1 + keep + j];
 }
 
 cudaError_t gdn_replay_dispatch(const legion_gdn & p, dim3 grid, dim3 block, cudaStream_t st) {
@@ -1196,5 +1218,25 @@ extern "C" int legion_spec_window_launch(const legion_spec_window * p, void * st
         return -1;
     }
     spec_window_kernel<<<(unsigned) blocks, threads, 0, (cudaStream_t) stream>>>(*p);
+    return (int) cudaGetLastError();
+}
+
+extern "C" int legion_spec_windows_launch(const legion_spec_window * p, const uint64_t * table, int64_t layers,
+                                          void * stream) {
+    if (p->keep == nullptr || table == nullptr || p->w < 0 || p->rows < 0 || p->n < 0 || layers < 0 ||
+        layers > 65535) {
+        return -1;
+    }
+    const int64_t total = p->w * p->rows * p->n;
+    if (total == 0 || layers == 0) {
+        return 0;
+    }
+    const int threads = 256;
+    const int64_t blocks = (total + threads - 1) / threads;
+    if (blocks > 0x7fffffff) {
+        return -1;
+    }
+    const dim3 grid((unsigned) blocks, (unsigned) layers);
+    spec_windows_kernel<<<grid, threads, 0, (cudaStream_t) stream>>>(*p, table);
     return (int) cudaGetLastError();
 }

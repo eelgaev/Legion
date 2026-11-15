@@ -61,6 +61,14 @@ mod window;
 /// On by default since part 38 (the packed rows cost no memory beyond the default's).
 static DEFER: AtomicBool = AtomicBool::new(true);
 
+/// Whether the all-slot commit graph copies every layer's conv window in one launch
+/// ([`window::windows`], #689); on unless `LEGION_DEBUG_SPEC_WINDOWS=0` (A/B runs: one launch a
+/// layer, the same bytes). Read once.
+fn one_window_launch() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("LEGION_DEBUG_SPEC_WINDOWS").as_deref() != Ok("0"))
+}
+
 /// Sets whether pools made from now on defer their commits into the next verify step (`legion
 /// serve --gdn-commit-in-verify`, `--no-gdn-commit-in-verify`).
 pub fn set_commit_in_verify(on: bool) {
@@ -842,6 +850,7 @@ impl SpecPool {
             .new_tensor(types::I32, &[n as i64])
             .as_input()
             .as_output();
+        let mut pairs = Vec::with_capacity(self.layers.len());
         for &il in &self.layers {
             let l = self.layer(il);
             let conv = rec.conv_slots(&ctx, il, 0, n);
@@ -849,7 +858,21 @@ impl SpecPool {
             if !window::fits(window_src, conv, keep) {
                 return Ok(None);
             }
-            graph.expand(window::window(&ctx, window_src, conv, keep));
+            pairs.push((window_src, conv));
+        }
+        // Every layer's window in one launch where they share a shape (#689); else one each.
+        let table = if one_window_launch() && window::fits_all(&pairs, keep) {
+            let (node, table) = window::windows(&ctx, &pairs, keep);
+            graph.expand(node);
+            Some(table)
+        } else {
+            for &(src, dst) in &pairs {
+                graph.expand(window::window(&ctx, src, dst, keep));
+            }
+            None
+        };
+        for &il in &self.layers {
+            let l = self.layer(il);
             if defer {
                 // The kept tokens' inputs stay in the packed replay rows, where the verify step
                 // stored them, for the next verify step's replay (#836 part 38).
@@ -880,6 +903,9 @@ impl SpecPool {
         ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))?;
         if !backend.queues_copies_of(keep) {
             return Ok(None);
+        }
+        if let Some(table) = table {
+            window::fill_table(table, &pairs);
         }
         let parts = KeptParts::new(&graph, &[keep]);
         // SAFETY: the graph reads `rec`, this pool and nothing else; the caller keeps them

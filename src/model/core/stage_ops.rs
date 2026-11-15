@@ -144,10 +144,11 @@ pub(crate) const SMALL: &[&str] = &[
 pub(crate) const SMALL_MM: &[&str] = &["nvfp4_mvq", "fp8_mm"];
 
 /// Pure ops captured only while [`set_commit_capture`] is on: a verify commit's conv window
-/// copy (`legion_spec_window_launch`, one kernel picked by the node's shape). Left out, it runs
-/// between captures, and since a commit graph alternates it with single `gdn` launches, no
-/// piece of the commit is captured at all.
-pub(crate) const COMMIT: &[&str] = &["spec_window"];
+/// copy (`legion_spec_window_launch`, one kernel picked by the node's shape) and its every-layer
+/// form (`spec_windows`, #689: the same kernel over a pointer table filled once, when the graph
+/// is allocated). Left out, they run between captures, and since a commit graph alternates them
+/// with single `gdn` launches, no piece of the commit is captured at all.
+pub(crate) const COMMIT: &[&str] = &["spec_window", "spec_windows"];
 
 /// See [`set_commit_capture`].
 static COMMIT_CAPTURE: AtomicBool = AtomicBool::new(false);
