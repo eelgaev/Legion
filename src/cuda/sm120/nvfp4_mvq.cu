@@ -59,6 +59,7 @@
 // code.
 
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/unary.cuh"
 
 #include <cuda.h>
 #include <cuda_fp16.h>
@@ -83,6 +84,8 @@ struct legion_nvfp4_mvq {
     int32_t       n;        // 1-8
     int32_t       ns;       // piece slots of the ring (more than 16)
     int32_t       chunks;   // pieces a row (each whole 16-byte units)
+    const float * up;       // F32 [n][k] for `quantize_swiglu` (x is the gate there), else null
+    int64_t       up_nb1;   // floats between up's columns
 };
 }
 
@@ -147,6 +150,55 @@ __global__ void __launch_bounds__(QUANTIZE_THREADS) quantize(const legion_nvfp4_
     // ggml's ds.x (make_half2(d, sum)): d rounded to F16; halved here, exactly.
     const float yd = __half2float(__float2half_rn(d)) * 0.5f;
     scratch_yd[(kbx * 2 + ((i0 >> 5) & 1)) * MAX_N + t] = yd;
+}
+
+// `quantize` of ggml's swiglu_split(x, up) (unary_gated_op_kernel's silu(x) * up, rounded to
+// F32 as its output is), for the down projection of a SwiGLU FFN: one kernel in place of
+// ggml's GLU kernel and `quantize`, SWIGLU_BLOCKS blocks of 256 values a CTA (grid (ceil(k /
+// (256 SWIGLU_BLOCKS)), n)). Few enough CTAs to all be resident next to the up matmul's, so
+// they launch_dependents while it runs and the down's matvec, launched early, streams its first
+// weights as the up's CTAs end (ggml's GLU kernel has a CTA per 256 values: 544 at 8 x 17408,
+// more than fit, so nothing after it launched before the up matmul ended).
+constexpr int SWIGLU_BLOCKS = 4;
+
+__global__ void __launch_bounds__(QUANTIZE_THREADS) quantize_swiglu(const legion_nvfp4_mvq p) {
+    pdl_launch_dependents();
+    const int t = blockIdx.y;
+    pdl_wait();
+    uint8_t * xq = reinterpret_cast<uint8_t *>(scratch_xq);
+    // Every block's two inputs first, all loads in flight at once.
+    float g[SWIGLU_BLOCKS], u[SWIGLU_BLOCKS];
+#pragma unroll
+    for (int b = 0; b < SWIGLU_BLOCKS; ++b) {
+        const int i0 = (blockIdx.x * SWIGLU_BLOCKS + b) * QUANTIZE_THREADS + threadIdx.x;
+        g[b] = i0 < p.k ? p.x[t * p.x_nb1 + i0] : 0.0f;
+        u[b] = i0 < p.k ? p.up[t * p.up_nb1 + i0] : 0.0f;
+    }
+#pragma unroll
+    for (int b = 0; b < SWIGLU_BLOCKS; ++b) {
+        const int i0 = (blockIdx.x * SWIGLU_BLOCKS + b) * QUANTIZE_THREADS + threadIdx.x;
+        if (i0 >= p.k) {
+            return;  // k is a multiple of 256: the CTA's remaining blocks are all past it
+        }
+        const float xi = ggml_cuda_op_silu_single(g[b]) * u[b];
+        float amax = fabsf(xi);
+        amax = warp_reduce_max<QK8_1>(amax);
+
+        const float  d = amax / 127.0f;
+        const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+        const int kbx = i0 >> 6;
+        const int s   = (i0 >> 4) & 3;
+        const int e   = i0 & 15;
+        const int th  = (e & 7) >> 1;
+        const int pos = ((e & 1) << 1) | (e >> 3);
+        xq[(((int64_t) t * (p.k >> 6) + kbx) * 4 + th) * 16 + s * 4 + pos] = (uint8_t) (q + 128);
+
+        if ((i0 & (QK8_1 - 1)) == 0) {
+            const float yd = __half2float(__float2half_rn(d)) * 0.5f;
+            scratch_yd[(kbx * 2 + ((i0 >> 5) & 1)) * MAX_N + t] = yd;
+        }
+    }
 }
 
 #ifdef LEGION_MVQ_MMA
@@ -486,8 +538,8 @@ __global__ void __launch_bounds__(MV_THREADS, MINB) mv(const legion_nvfp4_mvq p)
 
 // The kernels for the host stubs: the quantization, then mv<NWG, R, MINB> (src/model/core/
 // nvfp4_mvq.rs's kernel index: 1-4 columns, then the 5-8 column shapes; 16-row regions are the
-// default there, the others for tuning).
-extern "C" const void * const legion_nvfp4_mvq_kernels[7] = {
+// default there, the others for tuning), then the SwiGLU quantization.
+extern "C" const void * const legion_nvfp4_mvq_kernels[8] = {
     reinterpret_cast<const void *>(&quantize),
     reinterpret_cast<const void *>(&mv<4, 16, 1>),
     reinterpret_cast<const void *>(&mv<2, 16, 1>),
@@ -495,4 +547,5 @@ extern "C" const void * const legion_nvfp4_mvq_kernels[7] = {
     reinterpret_cast<const void *>(&mv<2, 32, 1>),
     reinterpret_cast<const void *>(&mv<2, 16, 2>),
     reinterpret_cast<const void *>(&mv<2, 8, 2>),
+    reinterpret_cast<const void *>(&quantize_swiglu),
 };

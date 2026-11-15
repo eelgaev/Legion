@@ -4088,6 +4088,14 @@ impl Model {
         // one matvec kernel in decode steps.
         let gate = self.lmm(ctx, il, "ffn_gate.weight", h)?;
         let up = self.lmm(ctx, il, "ffn_up.weight", h)?;
+        // Verify steps of 5-8 tokens on a GB10: the SwiGLU in the NVFP4 down matvec's
+        // quantization (#689).
+        if let Some(out) = self
+            .linear
+            .swiglu_down_mvq(ctx, &dn, wd, sd, gate, up, fusion.res)
+        {
+            return Ok(out);
+        }
         let act = ctx.swiglu_split(gate, up);
         // The down projection's BF16 input in one kernel (sm_80+ prompt chunks of dense
         // models; ggml's bits).
