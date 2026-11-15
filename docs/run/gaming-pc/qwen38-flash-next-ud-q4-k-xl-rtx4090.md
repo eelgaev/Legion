@@ -2,8 +2,8 @@
 
 [Back to the performance tables](../../../README.md#performance). How these runs were measured: [docs/run/README.md](../README.md).
 
-One RTX 4090 (24 GB, PCIe 4.0) with a desktop session on it (1.2 GB of VRAM used), a Ryzen 9 7950X3D and 128 GB
-of RAM. The model's experts do not fit the card: Legion keeps them in RAM, caches the hot ones in VRAM by routing
+One RTX 4090 (24 GB, PCIe 4.0) with a desktop session on it (1.2 GB of VRAM used), a Ryzen 9 7950X3D and 128 GB of DDR5-4800
+RAM. The model's experts do not fit the card: Legion keeps them in RAM, caches the hot ones in VRAM by routing
 heat (saved between runs) and swaps them while it decodes. The tier switches on by itself when the experts do not
 fit. `--cpu-expert-share auto` is opt-in: the CPU computes part of the experts that miss VRAM, with the same bits as
 the GPU (the output does not change), and the share per layer follows the measured GPU and CPU times.
