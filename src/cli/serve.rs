@@ -271,11 +271,13 @@ pub(super) struct ModelArgs {
     /// The expert cache also takes the VRAM kept free for prompt steps' compute buffers, on
     /// GPUs with unified memory: a prompt step's buffer then spills into host memory (pinned,
     /// on the GPU's NUMA node) as far as VRAM is short. Decode keeps its buffers in VRAM. The
-    /// default on V100s (an AC922: ~5% more slots on 2 GPUs, the same outputs) and on GH200s
-    /// (unmeasured); other GPUs keep the room unless this is given.
+    /// default on V100s (an AC922: ~5% more slots on 2 GPUs, the same outputs), on GH200s
+    /// (unmeasured) and on one discrete GPU running Qwen3.8-Flash-Next with every routed expert
+    /// in host memory (~120 more slots on a 24 GB card); other GPUs keep the room unless this
+    /// is given.
     #[arg(long)]
     pub expert_cache_fill_prompt_room: bool,
-    /// Keep the prompt steps' compute room out of the expert cache on V100s and GH200s too (see
+    /// Keep the prompt steps' compute room out of the expert cache where it is the default (see
     /// --expert-cache-fill-prompt-room): prompt buffers then stay in VRAM. For comparisons.
     #[arg(long, conflicts_with = "expert_cache_fill_prompt_room")]
     pub no_expert_cache_fill_prompt_room: bool,
@@ -303,9 +305,10 @@ pub(super) struct ModelArgs {
     #[arg(long, value_name = "PATH", conflicts_with = "expert_profile")]
     pub expert_split_misses: Option<PathBuf>,
     /// Experts the cache may copy in per device, per pass (MTP passes included), replacing
-    /// colder ones (0: keep the first fill).
-    #[arg(long, env = "LEGION_EXPERT_SWAPS", default_value_t = SwapRule::default().budget)]
-    pub expert_swaps: usize,
+    /// colder ones (0: keep the first fill). Default: 24; 48 on a Qwen3.8-Flash-Next machine
+    /// with one discrete GPU and every routed expert in host memory.
+    #[arg(long, env = "LEGION_EXPERT_SWAPS", value_name = "N")]
+    pub expert_swaps: Option<usize>,
     /// Per-device copy budgets in place of --expert-swaps, comma-separated in pipeline order
     /// (the GPU holding the first layers first; e.g. `48,24`); devices past the list keep
     /// --expert-swaps. Default: none, --expert-swaps everywhere. For tuning layer-split runs
@@ -335,15 +338,19 @@ pub(super) struct ModelArgs {
     /// the same outputs. At several sequences it also folds different users' routings.
     #[arg(long, value_name = "ROUTINGS", value_parser = non_negative, default_value_t = 0.0)]
     pub expert_heat_pass_cap: f32,
-    /// Hybrid decode (opt-in, POWER9 + CUDA only, ignored elsewhere; decode and verify steps of
-    /// up to 8 tokens): the host
+    /// Hybrid decode (opt-in, CUDA; decode and verify steps of up to 8 tokens): the host
     /// computes this share of each MoE layer's missed experts (those read from host memory) on
     /// a pinned worker pool per NUMA node while the GPU computes the rest, cutting the bytes the
-    /// GPU reads over the link. 0 (the default) is off. Changes outputs slightly (the host
-    /// kernels sum in another order than the GPU's). From Strata-AC922's POWER9 CPU expert
-    /// share (`--pcie-frac`).
-    #[arg(long, value_parser = share_fraction, default_value_t = 0.0)]
-    pub cpu_expert_share: f32,
+    /// GPU reads over the link. 0 (the default) is off. POWER9: changes outputs slightly (the
+    /// host kernels sum in another order than the GPU's). x86 with AVX2, FMA and F16C: the
+    /// same outputs (the host computes the GPU kernels' bits; the activations' quantization
+    /// and SwiGLU stay on the GPU), and `auto` starts each layer's share from the link's and the
+    /// pool's measured time per expert, then moves it toward whichever of the GPU and the pool
+    /// waited. Ignored elsewhere. With the bounded host tier (part of the experts in RAM) the
+    /// host takes only misses held in RAM; those read from disk stay on the GPU. From
+    /// Strata-AC922's POWER9 CPU expert share (`--pcie-frac`).
+    #[arg(long, value_name = "SHARE|auto", value_parser = share_arg, default_value = "0")]
+    pub cpu_expert_share: ShareArg,
     /// Worker threads of each NUMA node's `--cpu-expert-share` pool (0: `--cpu-expert-smt`
     /// per core of the node, less two cores left to the engine's threads).
     #[arg(long, default_value_t = 0)]
@@ -453,10 +460,12 @@ pub(super) struct ModelArgs {
     pub gpus: usize,
     /// With --device cuda: tensor parallelism over this many GPUs (CUDA0, CUDA1, ...): every
     /// layer's heads and FFN rows split across them, one all-reduce after attention and one
-    /// after the FFN (dense models; not with --gpus or --layer-split).
+    /// after the FFN (dense models; not with --gpus or --layer-split). A dense Qwen3.5+ model
+    /// (Qwen3.8-27B) runs --tp 2 as --tp-per-gpu does.
     #[arg(long, env = "LEGION_TP", default_value_t = 1)]
     pub tp: usize,
-    /// With --tp 2 (dense Gemma 4): run CUDA0 and CUDA1 as two ranks of this process, each
+    /// With --tp 2 (dense Gemma 4; always on for dense Qwen3.5+): run CUDA0 and CUDA1 as two
+    /// ranks of this process, each
     /// with its own share of the model, executor and launch thread, instead of one ggml meta
     /// device over both. Each GPU keeps its graphs per step shape (decode, MTP verify and
     /// draft) with fused ops and CUDA graphs, as one GPU alone does, and the layers' partial
@@ -746,6 +755,17 @@ pub(super) struct ModelArgs {
     /// With --tp-mtp-chain, a decode draft round's rows from the verify step too (#1176).
     #[arg(long)]
     pub tp_mtp_local_rows: bool,
+    /// With --tp-rank on two machines, on rank 0, Qwen3.8-Flash-Next (qwen4exp) with a plain
+    /// output head (the NVFP4 checkpoint's BF16 head): a decode or verify step whose rows are
+    /// all greedy picks computes its output head as two shares of the vocabulary, one on each
+    /// rank, instead of all of it on rank 0 while the other rank waits. Each rank finds its
+    /// share's best token per row (by value, then the device argmax's tie order), rank 1
+    /// answers the step with its candidates and rank 0 keeps the better one: the same pick as
+    /// the whole head's. The head reads its whole weight every step (1.27 GB on this model),
+    /// so each rank reads half of it. Steps with sampled rows, log probabilities or picks below
+    /// min_tokens keep the whole head on rank 0. Off (default): rank 0 computes the head.
+    #[arg(long)]
+    pub tp_head_split: bool,
     /// With --tp-rank, Qwen3.8-Flash-Next (qwen4exp): expert parallelism for the routed
     /// experts. Rank r of n holds the experts r*E/n .. (r+1)*E/n whole (the checkpoint's bytes
     /// as shipped, cut by expert index) instead of every expert's 1/n of the rows, and runs
@@ -1038,6 +1058,7 @@ impl ModelArgs {
                 .expert_cache_gib
                 .map(|g| (g.max(0.0) * (1u64 << 30) as f64) as u64),
             cache_reserve: self.expert_cache_reserve_mib << 20,
+            lend_reserve: None,
             fill_prompt_room: if self.no_expert_cache_fill_prompt_room {
                 Some(false)
             } else {
@@ -1048,12 +1069,15 @@ impl ModelArgs {
                 .expert_profile_seed
                 .unwrap_or(legion::residency::PROFILE_SEED),
             profile_split_only: self.expert_profile_split_only,
+            tier_heat: None,
+            tier_heat_sizes: false,
             split_misses: self.expert_split_misses.clone(),
             swaps: SwapRule {
-                budget: self.expert_swaps,
+                budget: self.expert_swaps.unwrap_or(SwapRule::default().budget),
                 margin: self.expert_swap_margin,
                 ratio: self.expert_swap_ratio,
             },
+            swaps_given: self.expert_swaps.is_some(),
             device_swaps: self.expert_swaps_device.clone(),
             decay: self.expert_heat_decay,
             heat_pass_cap: self.expert_heat_pass_cap,
@@ -1072,7 +1096,8 @@ impl ModelArgs {
             stage_below: None,
             learn_long: !self.no_prefill_learn,
             cpu_share: legion::residency::cpu_share::CpuShareConfig {
-                share: self.cpu_expert_share,
+                share: self.cpu_expert_share.share,
+                auto: self.cpu_expert_share.auto,
                 workers: self.cpu_expert_workers,
                 smt: self.cpu_expert_smt as usize,
             },
@@ -1546,15 +1571,18 @@ struct EngineArgs {
     /// only steps the n-gram drafts in verify more rows (with --spec-fixed every step does).
     #[arg(long, value_name = "K", value_parser = clap::value_parser!(u8).range(1..=16))]
     spec_mtp_ngram_k: Option<u8>,
-    /// Model engine, the MTP heads of qwen4exp and qwen35 (`--spec mtp`) and DFlash drafters that
-    /// borrow the target's output head (`--spec dflash`): the head scores only the first this many
-    /// tokens of the vocabulary when it drafts (0, the default: all), so a draft pass reads that
-    /// many rows of the output head instead of all 248,320 on the Qwen3.8 models (see also
-    /// --spec-draft-lm-head). Drafts only: every token is verified by the full model, so the output
-    /// does not change; a draft outside the set is never proposed. Recommended: 65536 (GB10:
-    /// Flash-Next ~2 ms less per draft pass, chats 38.8 / 37.1 / 37.0 -> 40.8 / 40.5 / 41.8 tok/s;
-    /// the 27B cycle 117-127 -> 108-113 ms, +3-9% by prompt class). Smaller sets (32768 and below)
-    /// cut acceptance more than they save. The head's probability is then over those tokens
+    /// Model engine, the MTP heads of qwen4exp, qwen35 and glm5-next (`--spec mtp`) and DFlash
+    /// drafters that borrow the target's output head (`--spec dflash`): the head scores only the
+    /// first this many tokens of the vocabulary when it drafts (0, the default: all), so a draft
+    /// pass reads that many rows of the output head instead of all 248,320 on the Qwen3.8 models
+    /// (154,880 on GLM-5.3-Flash, which scores the number tokens past them too: its 2-5 digit
+    /// pieces sit past id 98,000; see also --spec-draft-lm-head). Drafts only: every token is
+    /// verified by the full model, so the output does not change; a draft outside the set is
+    /// never proposed. Recommended: 65536 (GB10: Flash-Next ~2 ms less per draft pass, chats
+    /// 38.8 / 37.1 / 37.0 -> 40.8 / 40.5 / 41.8 tok/s; the 27B cycle 117-127 -> 108-113 ms, +3-9%
+    /// by prompt class; GLM-5.3-Flash Maya-S at 1 user 84.8 -> 82.3 ms a step, -0.7 to +3.2% by
+    /// chat, 4 users and prefill unchanged). Smaller sets (32768 and below) cut acceptance more
+    /// than they save. The head's probability is then over those tokens
     /// (higher), which --spec-p-min and the depth policy see. See docs/tuning-integrated-gpus.md.
     #[arg(long, env = "LEGION_SPEC_DRAFT_VOCAB", default_value_t = 0)]
     spec_draft_vocab: usize,
@@ -2179,6 +2207,7 @@ pub async fn run(
                     seq_par: e.model.tp_seq_par,
                     mtp_chain: e.model.tp_mtp_chain,
                     mtp_local_rows: e.model.tp_mtp_local_rows,
+                    head_split: e.model.tp_head_split,
                     moe_ep: e.model.tp_moe_ep,
                     overlap: e.model.tp_overlap,
                     moe_ep_place: moe_ep_place.clone(),
@@ -2265,12 +2294,19 @@ pub async fn run(
             }
         }
     };
+    engine.set_warming(true);
     if kind == EngineKind::Model {
         warmup::shapes(engine.as_ref(), &e.warmup_shapes).await;
     }
-    if e.warmup_prompt > 0 {
-        warmup::run(engine.as_ref(), e.warmup_prompt).await?;
-    }
+    let warmed = if e.warmup_prompt > 0 {
+        warmup::run(engine.as_ref(), e.warmup_prompt)
+            .await
+            .map(drop)
+    } else {
+        Ok(())
+    };
+    engine.set_warming(false);
+    warmed?;
     if interactive {
         if !reported {
             let model = engine
@@ -2526,6 +2562,24 @@ fn share_fraction(value: &str) -> Result<f32, String> {
     } else {
         Err(format!("must be in [0, 1], got {value}"))
     }
+}
+
+/// `--cpu-expert-share`: a share in `[0, 1]`, or `auto` (the exact share's measured split, at
+/// most all of the misses).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShareArg {
+    pub share: f32,
+    pub auto: bool,
+}
+
+fn share_arg(value: &str) -> Result<ShareArg, String> {
+    if value == "auto" {
+        return Ok(ShareArg {
+            share: 1.0,
+            auto: true,
+        });
+    }
+    share_fraction(value).map(|share| ShareArg { share, auto: false })
 }
 
 /// The heat decay: in (0, 1] (0 would forget every routing at once, NaN freeze the cache).

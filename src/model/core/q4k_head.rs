@@ -55,8 +55,9 @@ static Q4K_HEAD_PICK: ExternalOp = ExternalOp {
     cuda: None,
 };
 
-/// Row lengths the op takes: Qwen3.8-Flash-Next's 2,560 (10 Q4_K blocks).
-pub const K: [i64; 1] = [2560];
+/// Row lengths the op takes: Qwen3.8-Flash-Next's 2,560 (10 Q4_K blocks) and GLM-5.3-Flash's
+/// 4,096 (16, #1172).
+pub const K: [i64; 2] = [2560, 4096];
 
 /// Fewest rows the op takes: a draft head (`--spec-draft-vocab 65536` or the whole vocabulary).
 /// With far fewer, the resident CTAs' start (each quantizes the input) is not hidden.

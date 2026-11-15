@@ -118,9 +118,15 @@ pub struct Dims {
 impl Dims {
     /// From a qwen4exp GGUF's (or MTP head's) metadata.
     pub fn of(gguf: &GgufFile) -> Result<Self, String> {
+        Self::of_arch(gguf, ARCH)
+    }
+
+    /// From the metadata of a GGUF of the Qwen3-Next family under the prefix `arch` (`qwen4exp`,
+    /// `qwen35`: the same keys).
+    pub fn of_arch(gguf: &GgufFile, arch: &str) -> Result<Self, String> {
         let u = |k: &str| {
-            gguf.get_u64(&format!("{ARCH}.{k}"))
-                .ok_or_else(|| format!("{ARCH}.{k}: missing"))
+            gguf.get_u64(&format!("{arch}.{k}"))
+                .ok_or_else(|| format!("{arch}.{k}: missing"))
         };
         let n_v = u("ssm.time_step_rank")?;
         let inner = u("ssm.inner_size")?;
@@ -143,7 +149,7 @@ impl Dims {
     }
 
     /// The metadata of rank `rank`'s share over `n` ranks, checked: every split count divides.
-    fn share(&self, n: usize, rank: usize) -> Result<Dims, String> {
+    pub(super) fn share(&self, n: usize, rank: usize) -> Result<Dims, String> {
         let n64 = n as u64;
         for (what, v) in [
             ("attention.head_count", self.n_head),
@@ -418,11 +424,6 @@ pub fn view_with(
         let recipe = gguf.recipe(&t.name);
         let mut s = t.clone();
         match p {
-            Piece::Mirrored => {
-                if let Some(r) = recipe {
-                    recipes.insert(t.name.clone(), r.clone());
-                }
-            }
             Piece::Experts(runs) => {
                 let last = t.shape.len() - 1;
                 let per = t.size / t.shape[last];
@@ -465,99 +466,7 @@ pub fn view_with(
                 };
                 recipes.insert(t.name.clone(), r);
             }
-            Piece::Rows(ranges) => {
-                let row = ggml::row_size(t.ggml_type, t.shape[0] as usize) as u64;
-                let ne1 = t.shape.get(1).copied().unwrap_or(1);
-                let slices: u64 = t.shape.iter().skip(2).product();
-                let take: u64 = ranges.iter().map(|r| r.1).sum();
-                if ranges.iter().any(|&(s, l)| l == 0 || s + l > ne1) {
-                    return Err(format!("{}: rows {ranges:?} out of {ne1}", t.name));
-                }
-                // Byte ranges of the tensor, in order.
-                let bytes: Vec<(u64, u64)> = (0..slices)
-                    .flat_map(|sl| {
-                        ranges
-                            .iter()
-                            .map(move |&(st, l)| ((sl * ne1 + st) * row, l * row))
-                    })
-                    .collect();
-                if s.shape.len() < 2 {
-                    s.shape.push(1);
-                }
-                s.shape[1] = take;
-                s.size = take * row * slices;
-                let r = match recipe {
-                    None => Recipe::Gather(
-                        bytes
-                            .iter()
-                            .map(|&(at, len)| FileRange {
-                                file: t.file_index,
-                                offset: t.offset + at,
-                                len,
-                            })
-                            .collect(),
-                    ),
-                    Some(_) => {
-                        let whole = super::whole_bytes(gguf, &paths, &t);
-                        Recipe::Computed(Arc::new(move || {
-                            let w = whole()?;
-                            let mut b = Vec::new();
-                            for &(at, len) in &bytes {
-                                b.extend_from_slice(&w[at as usize..(at + len) as usize]);
-                            }
-                            Ok(b)
-                        }))
-                    }
-                };
-                recipes.insert(t.name.clone(), r);
-            }
-            Piece::Cols(ranges) => {
-                let block = unsafe { ffi::ggml_blck_size(t.ggml_type) } as u64;
-                if ranges
-                    .iter()
-                    .any(|&(s, l)| !s.is_multiple_of(block) || !l.is_multiple_of(block))
-                {
-                    return Err(format!(
-                        "{}: columns {ranges:?} are not whole blocks of {block}",
-                        t.name
-                    ));
-                }
-                if ranges.iter().any(|&(s, l)| l == 0 || s + l > t.shape[0]) {
-                    return Err(format!(
-                        "{}: columns {ranges:?} out of {}",
-                        t.name, t.shape[0]
-                    ));
-                }
-                let row = ggml::row_size(t.ggml_type, t.shape[0] as usize);
-                let cuts: Vec<(usize, usize)> = ranges
-                    .iter()
-                    .map(|&(st, l)| {
-                        (
-                            ggml::row_size(t.ggml_type, st as usize),
-                            ggml::row_size(t.ggml_type, l as usize),
-                        )
-                    })
-                    .collect();
-                let take_cols: u64 = ranges.iter().map(|r| r.1).sum();
-                let take = ggml::row_size(t.ggml_type, take_cols as usize);
-                let rows = (t.size as usize) / row;
-                s.shape[0] = take_cols;
-                s.size = (rows * take) as u64;
-                let whole = super::whole_bytes(gguf, &paths, &t);
-                recipes.insert(
-                    t.name.clone(),
-                    Recipe::Computed(Arc::new(move || {
-                        let w = whole()?;
-                        let mut b = Vec::with_capacity(rows * take);
-                        for r in w.chunks_exact(row) {
-                            for &(at, len) in &cuts {
-                                b.extend_from_slice(&r[at..at + len]);
-                            }
-                        }
-                        Ok(b)
-                    })),
-                );
-            }
+            p => s = apply(gguf, &paths, &t, p, &mut recipes)?,
         }
         if t.name.ends_with(".ffn_down_exps.weight") {
             ff_exp.get_or_insert(s.shape[0]);
@@ -576,6 +485,126 @@ pub fn view_with(
         .map_err(|e| e.to_string())?;
     cut.set_checkpoint(gguf.checkpoint());
     Ok(cut)
+}
+
+/// Tensor `t` of `gguf` (backed by `paths`) cut as `p` says (mirrored, rows or columns; not
+/// whole experts): its share's info, with the recipe that reads its share's bytes put in
+/// `recipes` where it needs one. Row ranges of a plain file tensor are gathered straight from
+/// the file; column cuts (and any tensor a safetensors checkpoint computes at load) read the
+/// whole tensor and keep this rank's part.
+pub(super) fn apply(
+    gguf: &GgufFile,
+    paths: &[PathBuf],
+    t: &TensorInfo,
+    p: Piece,
+    recipes: &mut HashMap<String, Recipe>,
+) -> Result<TensorInfo, String> {
+    let recipe = gguf.recipe(&t.name);
+    let mut s = t.clone();
+    match p {
+        Piece::Mirrored => {
+            if let Some(r) = recipe {
+                recipes.insert(t.name.clone(), r.clone());
+            }
+        }
+        Piece::Experts(_) => {
+            return Err(format!("{}: whole experts are cut by view_with", t.name));
+        }
+        Piece::Rows(ranges) => {
+            let row = ggml::row_size(t.ggml_type, t.shape[0] as usize) as u64;
+            let ne1 = t.shape.get(1).copied().unwrap_or(1);
+            let slices: u64 = t.shape.iter().skip(2).product();
+            let take: u64 = ranges.iter().map(|r| r.1).sum();
+            if ranges.iter().any(|&(s, l)| l == 0 || s + l > ne1) {
+                return Err(format!("{}: rows {ranges:?} out of {ne1}", t.name));
+            }
+            // Byte ranges of the tensor, in order.
+            let bytes: Vec<(u64, u64)> = (0..slices)
+                .flat_map(|sl| {
+                    ranges
+                        .iter()
+                        .map(move |&(st, l)| ((sl * ne1 + st) * row, l * row))
+                })
+                .collect();
+            if s.shape.len() < 2 {
+                s.shape.push(1);
+            }
+            s.shape[1] = take;
+            s.size = take * row * slices;
+            let r = match recipe {
+                None => Recipe::Gather(
+                    bytes
+                        .iter()
+                        .map(|&(at, len)| FileRange {
+                            file: t.file_index,
+                            offset: t.offset + at,
+                            len,
+                        })
+                        .collect(),
+                ),
+                Some(_) => {
+                    let whole = super::whole_bytes(gguf, paths, t);
+                    Recipe::Computed(Arc::new(move || {
+                        let w = whole()?;
+                        let mut b = Vec::new();
+                        for &(at, len) in &bytes {
+                            b.extend_from_slice(&w[at as usize..(at + len) as usize]);
+                        }
+                        Ok(b)
+                    }))
+                }
+            };
+            recipes.insert(t.name.clone(), r);
+        }
+        Piece::Cols(ranges) => {
+            let block = unsafe { ffi::ggml_blck_size(t.ggml_type) } as u64;
+            if ranges
+                .iter()
+                .any(|&(s, l)| !s.is_multiple_of(block) || !l.is_multiple_of(block))
+            {
+                return Err(format!(
+                    "{}: columns {ranges:?} are not whole blocks of {block}",
+                    t.name
+                ));
+            }
+            if ranges.iter().any(|&(s, l)| l == 0 || s + l > t.shape[0]) {
+                return Err(format!(
+                    "{}: columns {ranges:?} out of {}",
+                    t.name, t.shape[0]
+                ));
+            }
+            let row = ggml::row_size(t.ggml_type, t.shape[0] as usize);
+            let cuts: Vec<(usize, usize)> = ranges
+                .iter()
+                .map(|&(st, l)| {
+                    (
+                        ggml::row_size(t.ggml_type, st as usize),
+                        ggml::row_size(t.ggml_type, l as usize),
+                    )
+                })
+                .collect();
+            let take_cols: u64 = ranges.iter().map(|r| r.1).sum();
+            let take = ggml::row_size(t.ggml_type, take_cols as usize);
+            let rows = (t.size as usize) / row;
+            s.shape[0] = take_cols;
+            s.size = (rows * take) as u64;
+            let whole = super::whole_bytes(gguf, paths, t);
+            recipes.insert(
+                t.name.clone(),
+                Recipe::Computed(Arc::new(move || {
+                    let w = whole()?;
+                    let mut b = Vec::with_capacity(rows * take);
+                    for r in w.chunks_exact(row) {
+                        for &(at, len) in &cuts {
+                            b.extend_from_slice(&r[at..at + len]);
+                        }
+                    }
+                    Ok(b)
+                })),
+            );
+        }
+    }
+    Ok(s)
 }
 
 /// Experts `runs` (`(first, count)` of expert ids, in order) of the stacked NVFP4 tensor whose

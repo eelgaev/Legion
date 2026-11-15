@@ -379,6 +379,10 @@ impl Linear {
             // Q8_0 weights in verify steps of 9-255 tokens: ggml's MMQ bits without its
             // stream-k fixup launch (#836).
             crate::model::q8_mmq::mul_mat(ctx, w, x)
+        } else if crate::model::core::q_small_m::takes(w, x) {
+            // GGUF-quantized weights in steps of 2-8 tokens on a V100: ggml's quantize + MMVQ
+            // bits, opt-in (--q-small-m, #1210).
+            crate::model::core::q_small_m::mul_mat(ctx, w, x)
         } else if crate::model::tu_mmq::takes(w, x) {
             // Q4_K/Q5_K/Q6_K/Q8_0 prompt steps on a Turing GPU without tensor cores: ggml's MMQ
             // chain on dp4a instead of emulated int8 MMA, the same bits (#1214).
@@ -435,6 +439,38 @@ impl Linear {
             return Ok(crate::model::nvfp4_a4::mul_mat_add(ctx, w, x, scale, res));
         }
         Ok(ctx.add(self.mul_mat(ctx, name, w, scale, input_scale, x)?, res))
+    }
+
+    /// `w @ swiglu_split(gate, up)` (+ `res`) with the SwiGLU in the quantization of the 5-8
+    /// column NVFP4 op ([`super::nvfp4_mvq::mul_mat_swiglu`]) where [`Self::mul_mat`] would run
+    /// `w` on that op; `None`: build ggml's `swiglu_split` and [`Self::mul_mat_add`]. The same
+    /// bits either way (ggml's add after the op, as [`Self::mul_mat_add`] builds it there).
+    #[allow(clippy::too_many_arguments)]
+    pub fn swiglu_down_mvq<'a>(
+        &self,
+        ctx: &'a Context,
+        name: &str,
+        w: Tensor<'a>,
+        scale: Option<Tensor<'a>>,
+        gate: Tensor<'a>,
+        up: Tensor<'a>,
+        res: Option<Tensor<'a>>,
+    ) -> Option<Tensor<'a>> {
+        use super::nvfp4_mvq;
+        let n: i64 = gate.ne()[1..].iter().product();
+        let takes = nvfp4_mvq::swiglu_on()
+            && !self.fp8.contains(name)
+            && !(self.w4a16(name, w, scale, n) && w.ne()[2] == 1)
+            && nvfp4_mvq::takes(w, gate, scale)
+            && nvfp4_mvq::swiglu_fits(w, gate, up, scale);
+        if !takes {
+            return None;
+        }
+        let y = nvfp4_mvq::mul_mat_swiglu(ctx, w, gate, up, scale);
+        Some(match res {
+            Some(r) => ctx.add(y, r),
+            None => y,
+        })
     }
 
     /// The SwiGLU FFN `down @ (silu(gate @ x) * (up @ x))` with the gate and up matmuls as one

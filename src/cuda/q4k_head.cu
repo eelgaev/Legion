@@ -52,7 +52,7 @@ struct legion_q4k_head {
     int64_t       x_ld;
     float *       dst;     // F32 [n][rows], dst_ld floats between columns
     int64_t       dst_ld;
-    int32_t       k;       // 2560
+    int32_t       k;       // 2560 or 4096
     int32_t       n;       // 1-8
     void *        pick;         // the draft pick's buffer (head_pick.cuh), or null
     int32_t       pick_cap;     // partials a column's slice of the buffer holds
@@ -414,6 +414,9 @@ int legion_q4k_head_launch(const legion_q4k_head * p, void * stream) {
     switch (p->k) {
         case 2560:
             r = launch_cols<10>(*p, s, warps, ctas, rows);
+            break;
+        case 4096:  // GLM-5.3-Flash's head (#1172)
+            r = launch_cols<16>(*p, s, warps, ctas, rows);
             break;
         default:
             return 1;

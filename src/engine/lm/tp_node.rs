@@ -240,6 +240,11 @@ pub(super) fn mtp_share(
         return tp_net::shard::qwen4::view_with(&gguf, rank, n, experts(cfg))
             .map_err(|e| device(format!("--spec-draft: {e}")));
     }
+    if gguf.architecture().as_deref() == Some("qwen35") {
+        // So is a dense qwen35's (#1163); its file has no shapes of its own, the target's.
+        return tp_net::shard::qwen35::head_view(&gguf, hp, rank, n)
+            .map_err(|e| device(format!("--spec-draft: {e}")));
+    }
     if gguf.architecture().as_deref() == Some("glm5-next") {
         // GLM's MTP block is one more DSA layer of the target's: cut as the target's are.
         return tp_net::shard::glm5::view(&gguf, rank, n)
@@ -366,6 +371,14 @@ pub(super) fn lead(exec: &mut Executor, start: Start, n_blocks: usize) -> Result
             lead.set_mtp_chains(cfg.mtp_chain);
             lead.set_mtp_local_rows(cfg.mtp_local_rows);
             exec.set_tp_lead(lead);
+            if cfg.head_split {
+                let on = n == 2 && exec.set_tp_head_split(true);
+                tracing::info!(
+                    on,
+                    "tensor parallelism over machines: --tp-head-split (greedy steps' output \
+                     head, half the vocabulary on each rank)"
+                );
+            }
             n
         }
         Via::Pair { sum, end } => {
@@ -552,14 +565,22 @@ fn handle(
             micro,
             taper,
             gather_budget,
+            head,
         } => {
             exec.set_pipeline_micro(micro as usize);
             exec.set_micro_taper(taper as usize);
             exec.set_gather_budget(gather_budget as usize);
             let mut groups = crate::model::core::from_wire(&groups)?;
+            // A greedy step's head split with rank 0 (`--tp-head-split`): this rank's share
+            // of the vocabulary, its candidates the answer.
+            let split = head != 0;
+            if split && !(head == 2 && exec.head_splits()) {
+                return Err(format!("no share {head} of this model's output head"));
+            }
+            exec.set_head_half(if split { 2 } else { 0 });
             // Rank 0 samples, this rank only keeps the captured rows: no output head here when
             // the layers run on all rows anyway (#1176).
-            if exec.captures_hidden() {
+            if !split && exec.captures_hidden() {
                 for s in groups.iter_mut().flat_map(|g| &mut g.seqs) {
                     s.logits = crate::model::core::Logits::None;
                 }
@@ -570,12 +591,21 @@ fn handle(
             // the last two steps' rows): this step copies into them.
             rows.swap(0, 1);
             exec.recycle_rows(std::mem::take(&mut rows[0]));
-            rows[0] = exec.step(&groups).map_err(|e| e.to_string())?.hidden;
+            let out = exec.step(&groups).map_err(|e| e.to_string())?;
+            rows[0] = out.hidden;
             comm.record(profile, t0.elapsed(), exec.take_step_laps());
             if let Some(e) = comm.error() {
                 return Err(e);
             }
-            Reply::Done
+            if split {
+                Reply::Step {
+                    argmax: out.argmax,
+                    rows: vec![exec.take_head_vals()],
+                    ms: t0.elapsed().as_secs_f32() * 1e3,
+                }
+            } else {
+                Reply::Done
+            }
         }
         Request::TpMtp {
             groups,

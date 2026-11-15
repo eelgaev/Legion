@@ -17,8 +17,11 @@ fn fits_takes_q4_k_heads_of_one_to_eight_columns() {
     // ggml runs MMQ from 9 columns.
     assert!(!fits(w, col(9)));
     assert!(!fits(w, col(16)));
+    // GLM-5.3-Flash's 4,096 values a row fit too (#1172).
+    let glm = ctx.new_tensor(types::Q4_K, &[4096, 65536]);
+    assert!(fits(glm, ctx.new_tensor(types::F32, &[4096, 3])));
     // Row lengths the kernel is not built for, another weight type, an F16 input.
-    for k in [2048, 4096] {
+    for k in [2048, 3072] {
         let w = ctx.new_tensor(types::Q4_K, &[k, 4096]);
         assert!(!fits(w, ctx.new_tensor(types::F32, &[k, 1])), "k {k}");
     }
