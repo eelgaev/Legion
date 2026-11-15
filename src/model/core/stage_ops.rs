@@ -62,6 +62,18 @@ pub(crate) const PURE: &[&str] = &[
     "router_mv_ids",
     // A DeltaNet layer's BF16 alpha and beta of 1-8 tokens in one launch (#689).
     "mvf_bf16",
+    // The z projection's first rows read into L2 after the qkv projection (#689): one kernel
+    // over the node's weight pointer and parameters, writing nothing. Left out, it would cut
+    // a verify step's capture at every DeltaNet layer.
+    // The one exception to "no side streams or events" (#689 round 12, the DeltaNet z
+    // prefetch, see `l2_prefetch`): a side node forks a device side stream off the compute
+    // stream (event record and wait) and its `l2_join`, after the layer's output projection,
+    // makes the compute stream wait for it. A capture records that as a forked branch joined
+    // inside it: every op between the two is listed here (or in [`SMALL_MM`] for these small
+    // steps), so both land in one capture. A join without its fork in the capture would make
+    // CUDA refuse the capture, which then runs directly (speed, never bits).
+    "l2_prefetch",
+    "l2_join",
     "moe_tail",
     "moe_sum_gate",
     "ids_remap",
