@@ -8,7 +8,9 @@
 //! The connections: every rank keeps one data connection to every other rank (rank `i`
 //! dials rank `j > i` at `--tp-peers[j]`), plain TCP with `TCP_NODELAY`, set up before the
 //! model loads ([`connect`]); rank 0 adds one control connection to each other rank once it
-//! has loaded ([`dial_control`]), which carries the steps (the frames of [`crate::node`]). Each
+//! has loaded ([`dial_control`]), which carries the steps (the frames of [`crate::node`]), and
+//! with a lookup table read through a store a rows connection ([`dial_rows`], [`rows`]), on
+//! which the other ranks ask rank 0 for the table rows their caches miss. Each
 //! connection starts with a preamble (magic, protocol version, kind, the dialer's rank and the
 //! rank count) that the far end checks and answers with its own.
 //!
@@ -28,6 +30,7 @@ pub mod micro;
 mod op;
 mod profile;
 mod rdma;
+pub mod rows;
 pub mod seq_par;
 pub mod shard;
 
@@ -42,13 +45,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Both ends of every connection must speak this version (the same build on every rank).
-/// 2: a data connection starts with the transport offers (`rdma::Offer`).
-pub const VERSION: u32 = 2;
+/// 2: a data connection starts with the transport offers (`rdma::Offer`). 3: the rows
+/// connection ([`rows`]).
+pub const VERSION: u32 = 3;
 /// The most ranks the sum kernel adds (`src/cuda/tp_net.cu`).
 pub const MAX_RANKS: usize = 8;
 const MAGIC: u32 = u32::from_le_bytes(*b"LgTP");
 const KIND_DATA: u32 = 1;
 const KIND_CONTROL: u32 = 2;
+const KIND_ROWS: u32 = 3;
 
 /// How the all-reduce's partials travel between two ranks (`--tp-transport`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -314,6 +319,26 @@ impl ControlListener {
             }
         }
     }
+
+    /// After [`Self::accept`]: rank 0's rows connection ([`rows`]), answered.
+    pub fn accept_rows(&mut self) -> std::io::Result<TcpStream> {
+        loop {
+            let (mut s, from) = self.listener.accept()?;
+            match read_preamble(&mut s, self.n) {
+                Ok((KIND_ROWS, 0)) => {
+                    s.set_nodelay(true)?;
+                    send_preamble(&mut s, KIND_ROWS, self.rank, self.n)?;
+                    return Ok(s);
+                }
+                Ok((kind, r)) => {
+                    tracing::warn!(%from, kind, rank = r, "tensor parallel: refused a connection");
+                }
+                Err(e) => {
+                    tracing::warn!(%from, error = %e, "tensor parallel: refused a connection")
+                }
+            }
+        }
+    }
 }
 
 /// Connects this rank to every other (see the module docs); waits up to `wait` for each rank
@@ -378,6 +403,11 @@ pub fn connect(cfg: &TpNetConfig, wait: Duration) -> std::io::Result<Mesh> {
 /// answers once it has loaded).
 pub fn dial_control(cfg: &TpNetConfig, to: usize, wait: Duration) -> std::io::Result<TcpStream> {
     dial_rank(&cfg.peers[to], KIND_CONTROL, 0, to, cfg.n_ranks(), wait)
+}
+
+/// Rank 0, after [`dial_control`]: the rows connection to rank `to` ([`rows`]).
+pub fn dial_rows(cfg: &TpNetConfig, to: usize, wait: Duration) -> std::io::Result<TcpStream> {
+    dial_rank(&cfg.peers[to], KIND_ROWS, 0, to, cfg.n_ranks(), wait)
 }
 
 /// The communicators graphs refer to by index (an external op's params): see [`register`].

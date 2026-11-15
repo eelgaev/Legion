@@ -407,7 +407,8 @@ pub struct Model {
     /// Where the per-layer n-gram table's rows come from when it is read through a store
     /// ([`crate::residency::lookup_table`]: RAM, page cache or direct SSD reads); `None`: from
     /// the weights' own host memory.
-    pub(crate) ngram: Option<crate::residency::lookup_table::LookupTable>,
+    /// Shared with the rows connection that reads them for other ranks (`tp_net::rows`).
+    pub(crate) ngram: Option<std::sync::Arc<crate::residency::lookup_table::LookupTable>>,
     /// Whether a step's fill leaves the n-gram rows it reads through `ngram` to its compute,
     /// and the rows the last one left, their reads issued (qwen4exp's `set_ple_late`).
     pub(crate) ple_late: std::sync::Mutex<(bool, Option<crate::model::qwen4::LateRows>)>,

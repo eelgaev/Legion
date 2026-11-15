@@ -1658,7 +1658,15 @@ impl Model {
     /// Reads the per-layer n-gram table's rows through `table` (opened on
     /// [`Self::ngram_table_info`]) instead of the weights' host memory.
     pub fn set_ngram_table(&mut self, table: crate::residency::lookup_table::LookupTable) {
-        self.ngram = Some(table);
+        self.ngram = Some(std::sync::Arc::new(table));
+    }
+
+    /// [`Self::ngram_table`], shared: tensor parallelism's rows connection reads it for the
+    /// other ranks (rank 0), or makes it ask rank 0 (the others).
+    pub fn ngram_table_shared(
+        &self,
+    ) -> Option<std::sync::Arc<crate::residency::lookup_table::LookupTable>> {
+        self.ngram.clone()
     }
 
     /// Starts reading the n-gram rows of `tokens`, which follow `before` in a sequence (its
@@ -1705,7 +1713,7 @@ impl Model {
 
     /// The store the n-gram rows come from, if one is set.
     pub fn ngram_table(&self) -> Option<&crate::residency::lookup_table::LookupTable> {
-        self.ngram.as_ref()
+        self.ngram.as_deref()
     }
 
     /// Fills the per-layer embedding input of a step: hashes every token's n-grams (with the
