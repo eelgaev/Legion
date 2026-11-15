@@ -271,11 +271,13 @@ pub(super) struct ModelArgs {
     /// The expert cache also takes the VRAM kept free for prompt steps' compute buffers, on
     /// GPUs with unified memory: a prompt step's buffer then spills into host memory (pinned,
     /// on the GPU's NUMA node) as far as VRAM is short. Decode keeps its buffers in VRAM. The
-    /// default on V100s (an AC922: ~5% more slots on 2 GPUs, the same outputs) and on GH200s
-    /// (unmeasured); other GPUs keep the room unless this is given.
+    /// default on V100s (an AC922: ~5% more slots on 2 GPUs, the same outputs), on GH200s
+    /// (unmeasured) and on one discrete GPU running Qwen3.8-Flash-Next with every routed expert
+    /// in host memory (~120 more slots on a 24 GB card); other GPUs keep the room unless this
+    /// is given.
     #[arg(long)]
     pub expert_cache_fill_prompt_room: bool,
-    /// Keep the prompt steps' compute room out of the expert cache on V100s and GH200s too (see
+    /// Keep the prompt steps' compute room out of the expert cache where it is the default (see
     /// --expert-cache-fill-prompt-room): prompt buffers then stay in VRAM. For comparisons.
     #[arg(long, conflicts_with = "expert_cache_fill_prompt_room")]
     pub no_expert_cache_fill_prompt_room: bool,
@@ -1050,6 +1052,7 @@ impl ModelArgs {
                 .unwrap_or(legion::residency::PROFILE_SEED),
             profile_split_only: self.expert_profile_split_only,
             tier_heat: None,
+            tier_heat_sizes: false,
             split_misses: self.expert_split_misses.clone(),
             swaps: SwapRule {
                 budget: self.expert_swaps.unwrap_or(SwapRule::default().budget),

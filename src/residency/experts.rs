@@ -1461,6 +1461,14 @@ impl ExpertResidency {
         });
         let mut ranked: Vec<(usize, u32)> =
             profile.as_ref().map_or_else(Vec::new, |p| p.ranked.clone());
+        // `tier_heat_sizes` (#37): the saved heat's hottest pairs over all layers also size the
+        // layers, as a profile's do.
+        if ranked.is_empty()
+            && cfg.tier_heat_sizes
+            && let Some(p) = &tier_prof
+        {
+            ranked = p.ranked.clone();
+        }
         // Expert parallelism: a layer's ranking goes to every entry serving it, each taking its
         // own experts.
         let ep = cfg.ep.as_ref();

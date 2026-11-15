@@ -3829,6 +3829,12 @@ impl LmEngine {
         if (host_tier.is_some() || tier_whole) && cfg.residency.profile.is_none() {
             cfg.residency.tier_heat = ssd_tier::host_tier_heat_path(&gguf);
         }
+        // With every routed expert in host memory, that heat sizes the layers too (#37 round
+        // 17: +1.2% decode on a 24 GB card). `LEGION_DEBUG_HEAT_SIZES=0` keeps even sizes, for
+        // A/B runs.
+        cfg.residency.tier_heat_sizes = tier_whole
+            && cfg.residency.tier_heat.is_some()
+            && std::env::var_os("LEGION_DEBUG_HEAT_SIZES").is_none_or(|v| v != "0");
         // Its one GPU's reserve beside the cache, where `--expert-cache-reserve-mib` is at its
         // default: what was measured in use there, not the layer splits' share.
         if (host_tier.is_some() || tier_whole)
@@ -5066,8 +5072,11 @@ impl LmEngine {
                 );
             }
             // `--expert-cache-fill-prompt-room`: the prompt steps' room goes to the cache where
-            // their buffers can spill into host memory. The default on V100s (an AC922) and a GH200.
-            let fill_prompt_room = cfg.residency.fills_prompt_room(spill_default);
+            // their buffers can spill into host memory. The default on V100s (an AC922) and a GH200,
+            // and on the bounded host tier's machine and model with every routed expert in host
+            // memory (`tier_whole`, #37 round 17): prompts of 2K and more lend the cache whole, so
+            // only short ones' buffers may spill; ~120 more slots on a 24 GB card.
+            let fill_prompt_room = cfg.residency.fills_prompt_room(spill_default || tier_whole);
             if fill_prompt_room && layout.stages.iter().any(|(d, _)| d.is_some_and(spills)) {
                 tracing::info!(
                     "expert cache takes the prompt steps' compute room (prompt buffers may spill \
