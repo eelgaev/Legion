@@ -174,9 +174,26 @@ pub fn ple_row_f32(
     src: &[u8],
     dim: usize,
 ) -> Vec<f32> {
+    let mut out = vec![0f32; dim];
+    ple_row_into(ty, fp8_scale, src, &mut out);
+    out
+}
+
+/// [`ple_row_f32`] into `dst` (`dim` floats): an FP8 table's row without a vector of its own
+/// (a prompt step gathers ~65K of them).
+pub fn ple_row_into(
+    ty: crate::ggml::ffi::ggml_type,
+    fp8_scale: Option<f32>,
+    src: &[u8],
+    dst: &mut [f32],
+) {
     match fp8_scale {
-        Some(s) if ty == types::I8 => src.iter().map(|&b| E4M3[b as usize] * s).collect(),
-        _ => crate::ggml::dequantize(ty, src, dim),
+        Some(s) if ty == types::I8 => {
+            for (d, &b) in dst.iter_mut().zip(src) {
+                *d = E4M3[b as usize] * s;
+            }
+        }
+        _ => dst.copy_from_slice(&crate::ggml::dequantize(ty, src, dst.len())),
     }
 }
 
@@ -1794,7 +1811,7 @@ impl Model {
     }
 
     /// While `on`, a step's fill leaves the per-layer n-gram rows it reads through the n-gram
-    /// store for [`Self::take_ple_late`], whose caller writes them with [`Self::write_ple`]
+    /// store for [`Self::take_ple_late`], whose caller writes them with [`Self::write_ple_via`]
     /// while the step's first layer computes: the newest draft's rows come from the SSD
     /// (~1 ms on the GB10), which the verify step waited for before it started. Turning it on
     /// drops rows a failed step left.
@@ -1825,9 +1842,57 @@ impl Model {
     }
 
     /// Writes the per-layer embedding input `t` from the n-gram table's rows the fill left
-    /// (see [`Self::fill_ple`]).
-    pub(crate) fn write_ple(&self, t: Tensor<'_>, late: LateRows) {
-        t.set_f32(&self.gather_ple_from(late));
+    /// (see [`Self::fill_ple`]), gathered straight into host tensor `via` (pinned memory kept
+    /// across steps) where given and big enough, else into a new vector. A prompt step's input
+    /// is tens of MB: a new vector for it page-faults in as it is written, and the copy from it
+    /// is a pageable one (#1176). The same values either way. `laps`: one line with the
+    /// write's parts.
+    pub(crate) fn write_ple_via(
+        &self,
+        t: Tensor<'_>,
+        late: LateRows,
+        via: Option<Tensor<'_>>,
+        laps: bool,
+    ) {
+        let rows = late.rows.clone();
+        let t0 = std::time::Instant::now();
+        let (read, gathered) = match via.filter(|v| v.nbytes() >= t.nbytes()) {
+            Some(via) => {
+                let mut read = std::time::Duration::ZERO;
+                let mut gathered = std::time::Duration::ZERO;
+                t.fill_f32_via(via, |dst| {
+                    read = self.gather_ple_into(&rows, Some(late), dst);
+                    gathered = t0.elapsed();
+                });
+                (read, gathered)
+            }
+            None => {
+                let mut out = vec![0f32; rows.len() * self.ple_dim()];
+                let read = self.gather_ple_into(&rows, Some(late), &mut out);
+                let gathered = t0.elapsed();
+                t.set_f32(&out);
+                (read, gathered)
+            }
+        };
+        if laps {
+            let pinned = via.is_some_and(|v| v.nbytes() >= t.nbytes());
+            tracing::info!(
+                rows = rows.len(),
+                pinned,
+                read_ms = format!("{:.2}", read.as_secs_f64() * 1e3),
+                gather_ms = format!("{:.2}", (gathered - read).as_secs_f64() * 1e3),
+                copy_ms = format!("{:.2}", (t0.elapsed() - gathered).as_secs_f64() * 1e3),
+                "n-gram rows: late write"
+            );
+        }
+    }
+
+    /// The per-layer embedding input's floats per n-gram row.
+    fn ple_dim(&self) -> usize {
+        params(&self.hp)
+            .and_then(|p| p.ple.as_ref())
+            .expect("per-layer embedding")
+            .head_dim as usize
     }
 
     /// The per-layer embedding input's values for the n-gram table's `rows` (see
@@ -1836,15 +1901,22 @@ impl Model {
         self.gather_ple_rows(rows, None)
     }
 
-    /// [`Self::gather_ple`] of the rows a fill left, their bytes from the reads it issued.
-    fn gather_ple_from(&self, late: LateRows) -> Vec<f32> {
-        let rows = late.rows.clone();
-        self.gather_ple_rows(&rows, Some(late))
-    }
-
     /// [`Self::gather_ple`], the store's bytes from `late`'s reads where given (`late` holds
     /// `rows`).
     fn gather_ple_rows(&self, rows: &[i32], late: Option<LateRows>) -> Vec<f32> {
+        let mut out = vec![0f32; rows.len() * self.ple_dim()];
+        self.gather_ple_into(rows, late, &mut out);
+        out
+    }
+
+    /// [`Self::gather_ple_rows`] into `out` (`rows.len()` rows of [`Self::ple_dim`] floats).
+    /// Returns the time it waited for the rows' bytes.
+    fn gather_ple_into(
+        &self,
+        rows: &[i32],
+        late: Option<LateRows>,
+        out: &mut [f32],
+    ) -> std::time::Duration {
         let ple = params(&self.hp)
             .and_then(|p| p.ple.as_ref())
             .expect("per-layer embedding");
@@ -1860,8 +1932,14 @@ impl Model {
             rows.iter().all(|&r| (r as usize) < n_rows),
             "n-gram row outside the {n_rows}-row table"
         );
+        assert_eq!(
+            out.len(),
+            rows.len() * dim,
+            "per-layer embedding input size"
+        );
         // The rows' bytes: from the store (RAM, page cache or the SSD), or straight from the
         // weights' host memory.
+        let t0 = std::time::Instant::now();
         let fetched;
         let (bytes, at): (&[u8], Vec<usize>) = match &self.ngram {
             Some(store) => {
@@ -1879,21 +1957,21 @@ impl Model {
                 rows.iter().map(|&r| r as usize).collect(),
             ),
         };
+        let read = t0.elapsed();
         // Big steps dequantize on several threads; with the weights' own memory they also wait
         // on page faults at once.
-        let mut out = vec![0f32; rows.len() * dim];
         let threads = ple_gather_threads(rows.len(), self.ngram.is_some());
         let per = rows.len().div_ceil(threads).max(1);
         let fp8 = ple.fp8_scale;
         let gather = |at: &[usize], out: &mut [f32]| {
             for (&r, dst) in at.iter().zip(out.chunks_mut(dim)) {
                 let src = &bytes[r * row_bytes..][..row_bytes];
-                dst.copy_from_slice(&ple_row_f32(ty, fp8, src, dim));
+                ple_row_into(ty, fp8, src, dst);
             }
         };
         if threads == 1 {
             // A decode step's few rows: starting a thread costs more than the work.
-            gather(&at, &mut out);
+            gather(&at, out);
         } else {
             // Off the engine thread's core (#250).
             let pin = &crate::hw::host_core::off_host_core(&[]);
@@ -1906,7 +1984,7 @@ impl Model {
                 }
             });
         }
-        out
+        read
     }
 }
 

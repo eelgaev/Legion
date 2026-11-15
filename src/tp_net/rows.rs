@@ -36,9 +36,6 @@ const ANSWERERS: usize = 4;
 /// The most rows one ask may name (a prompt step's 16 rows a token for 64K tokens).
 const MAX_ROWS: usize = 1 << 20;
 
-/// Asks of at least this many rows are logged when rank 0 serves with `log`.
-const LOG_ROWS: usize = 1024;
-
 /// Reads rows for an ask: `(rows, urgent)` to their bytes (rank 0's
 /// [`crate::residency::lookup_table::LookupTable::read_for_peer`]).
 pub type ReadRows = Arc<dyn Fn(&[u32], bool) -> io::Result<Vec<u8>> + Send + Sync>;
@@ -110,7 +107,8 @@ fn read_answer(r: &mut impl Read) -> io::Result<(u64, Result<Vec<u8>, String>)> 
 }
 
 /// Rank 0: answers the asks that come on `stream` with `read`, on threads of their own, until
-/// the connection ends. `log`: one line per ask of [`LOG_ROWS`] rows or more (`--tp-profile`).
+/// the connection ends. `log`: one line per ask (`--tp-profile`; asks come only for batches
+/// too big for the asking rank's AIO, about one or two a prompt step).
 pub fn serve(stream: TcpStream, read: ReadRows, log: bool) -> io::Result<()> {
     let writer = Arc::new(Mutex::new(stream.try_clone()?));
     let (tx, rx) = mpsc::channel::<(u64, bool, Vec<u32>, Instant)>();
@@ -142,7 +140,7 @@ pub fn serve(stream: TcpStream, read: ReadRows, log: bool) -> io::Result<()> {
                         tracing::warn!(error = %e, "tensor parallel: the rows connection failed");
                         return;
                     }
-                    if log && rows.len() >= LOG_ROWS {
+                    if log {
                         tracing::info!(
                             rows = rows.len(),
                             urgent,
@@ -185,6 +183,8 @@ pub fn serve(stream: TcpStream, read: ReadRows, log: bool) -> io::Result<()> {
 pub struct Client {
     writer: Mutex<TcpStream>,
     state: Arc<Mutex<ClientState>>,
+    /// One line per answer: its rows and round trip (`--tp-profile`).
+    log: bool,
 }
 
 #[derive(Default)]
@@ -218,7 +218,8 @@ impl ClientState {
 
 impl Client {
     /// Takes `stream` (the rows connection from rank 0) and reads its answers on a thread.
-    pub fn start(stream: TcpStream) -> io::Result<Arc<Self>> {
+    /// `log`: one line per answer (`--tp-profile`).
+    pub fn start(stream: TcpStream, log: bool) -> io::Result<Arc<Self>> {
         let state = Arc::new(Mutex::new(ClientState::default()));
         let mut reader = stream.try_clone()?;
         let st = state.clone();
@@ -247,12 +248,28 @@ impl Client {
         Ok(Arc::new(Self {
             writer: Mutex::new(stream),
             state,
+            log,
         }))
     }
 }
 
 impl PeerRows for Client {
     fn ask(&self, rows: Vec<u32>, urgent: bool, done: PeerDone) {
+        let done: PeerDone = if self.log {
+            let (n, asked) = (rows.len(), Instant::now());
+            Box::new(move |got: io::Result<Vec<u8>>| {
+                tracing::info!(
+                    rows = n,
+                    urgent,
+                    ok = got.is_ok(),
+                    round_trip_ms = format!("{:.2}", asked.elapsed().as_secs_f64() * 1e3),
+                    "tensor parallel: rows from rank 0"
+                );
+                done(got)
+            })
+        } else {
+            done
+        };
         let id = {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(why) = &st.ended {
