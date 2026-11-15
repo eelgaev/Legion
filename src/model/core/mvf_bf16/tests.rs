@@ -120,11 +120,24 @@ fn cuda_mvf_bf16_has_ggmls_bits() {
     if !device_supported() {
         return;
     }
-    for (k, rows) in [(5120, &[48, 48][..]), (2048, &[16, 48][..])] {
+    // Odd row counts: CTAs of two or four rows spanning two weights, and a short last CTA.
+    for (k, rows) in [
+        (5120, &[48, 48][..]),
+        (2048, &[16, 48][..]),
+        (4096, &[47, 17][..]),
+    ] {
         for n in 1..=MAX_TOKENS {
             let (got, want) = case(&mut gpu, k, rows, n, false);
             let differ = got.iter().zip(&want).filter(|(a, b)| a != b).count();
             assert_eq!(differ, 0, "k {k}, rows {rows:?}, {n} tokens");
         }
     }
+}
+
+#[test]
+fn rows_per_cta_switch() {
+    assert_eq!(rows_per_cta_from(None), 4);
+    assert_eq!(rows_per_cta_from(Some("1")), 1);
+    assert_eq!(rows_per_cta_from(Some(" 2 ")), 2);
+    assert_eq!(rows_per_cta_from(Some("3")), 4);
 }

@@ -8,6 +8,7 @@ mod completions;
 mod cpu_bench;
 mod dense_mv_bench;
 mod ep_place;
+mod expert_cpu_proof;
 mod expert_mv_ptx_bench;
 mod fp8_sliced_bench;
 mod gdn_bench;
@@ -31,10 +32,12 @@ mod nvfp4_once_bench;
 mod paged_qm_bench;
 mod paged_split_bench;
 mod q4k_head_bench;
+mod q4k_mv_bench;
 mod q8_group_check;
 mod q8_head_bench;
 mod q8_mmq_check;
 mod q8_mv_bench;
+mod q_small_m_bench;
 mod qsa_bench;
 mod report;
 mod run;
@@ -107,6 +110,10 @@ enum Command {
     /// Check and benchmark the host CPU kernels and the CPU expert share's pool (development).
     #[command(hide = true)]
     CpuBench(cpu_bench::CpuBenchArgs),
+    /// Check on the host the bits of the GPU decode kernels' expert products, and time the
+    /// host kernels that reproduce them (development).
+    #[command(hide = true)]
+    ExpertCpuProof(expert_cpu_proof::ExpertCpuProofArgs),
     /// Measure GPU-to-GPU exchange latency and host-memory read bandwidth (development).
     #[command(hide = true)]
     CommBench(comm_bench::CommBenchArgs),
@@ -131,6 +138,9 @@ enum Command {
     /// Check and time the Q8_0 draft LM head op against ggml's MMQ (development).
     #[command(hide = true)]
     Q8MvBench(q8_mv_bench::Q8MvBenchArgs),
+    /// Check and time the 2-8-column quantized matmul op against ggml's MMVQ (development).
+    #[command(hide = true)]
+    QSmallMBench(q_small_m_bench::QSmallMBenchArgs),
     /// Check and time the one-column Q8_0 draft LM head op against ggml's mmvq (development).
     #[command(hide = true)]
     Q8HeadBench(q8_head_bench::Q8HeadBenchArgs),
@@ -163,6 +173,10 @@ enum Command {
     /// Check and time the GB10 Q4_K draft LM head op against ggml's mmvq (development).
     #[command(hide = true)]
     Q4kHeadBench(q4k_head_bench::Q4kHeadBenchArgs),
+    /// Check and time the GB10 Q4_K matvec op of the DFlash drafter against ggml's mmvq
+    /// (development).
+    #[command(hide = true)]
+    Q4kMvBench(q4k_mv_bench::Q4kMvBenchArgs),
     /// Check and time the BF16 verify-step LM head op against ggml's matmul, soft-cap and
     /// argmax (development).
     #[command(hide = true)]
@@ -249,6 +263,7 @@ async fn run(cli: Cli, numa: Option<legion::hw::numa_bind::Placement>) -> anyhow
         Command::EpPlace(args) => ep_place::run(args),
         Command::SsdReplay(args) => ssd_replay::run(args),
         Command::CpuBench(args) => cpu_bench::run(args),
+        Command::ExpertCpuProof(args) => expert_cpu_proof::run(args),
         Command::CommBench(args) => comm_bench::run(args),
         Command::ExpertMvPtxBench(args) => expert_mv_ptx_bench::run(args),
         Command::MmqIdsBench(args) => mmq_ids_bench::run(args),
@@ -257,6 +272,7 @@ async fn run(cli: Cli, numa: Option<legion::hw::numa_bind::Placement>) -> anyhow
         Command::GdnBench(args) => gdn_bench::run(args),
         Command::DenseMvBench(args) => dense_mv_bench::run(args),
         Command::Q8MvBench(args) => q8_mv_bench::run(args),
+        Command::QSmallMBench(args) => q_small_m_bench::run(args),
         Command::Q8HeadBench(args) => q8_head_bench::run(args),
         Command::HcMixBench(args) => hc_mix_bench::run(args),
         Command::HcDownBench(args) => hc_down_bench::run(args),
@@ -266,6 +282,7 @@ async fn run(cli: Cli, numa: Option<legion::hw::numa_bind::Placement>) -> anyhow
         Command::Nvfp4MvqBench(args) => nvfp4_mvq_bench::run(args),
         Command::Fp8SlicedBench(args) => fp8_sliced_bench::run(args),
         Command::Q4kHeadBench(args) => q4k_head_bench::run(args),
+        Command::Q4kMvBench(args) => q4k_mv_bench::run(args),
         Command::HeadMmBench(args) => head_mm_bench::run(args),
         Command::Q8GroupCheck(args) => q8_group_check::run(args),
         Command::Q8MmqCheck(args) => q8_mmq_check::run(args),

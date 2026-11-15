@@ -769,6 +769,20 @@ impl Model {
         let ws = name
             .strip_suffix(".weight")
             .and_then(|b| self.w(&format!("{b}.scale")).ok());
+        self.glm_mm_w(ctx, name, w, ws, x, xh)
+    }
+
+    /// [`Self::glm_mm_h`] of the weights `w` (`name`'s, or a view of its first rows) and their
+    /// scale `ws`.
+    fn glm_mm_w<'a>(
+        &'a self,
+        ctx: &'a Context,
+        name: &str,
+        w: Tensor<'a>,
+        ws: Option<Tensor<'a>>,
+        x: Tensor<'a>,
+        xh: Option<Tensor<'a>>,
+    ) -> Result<Tensor<'a>, ModelError> {
         if w.ty() == types::NVFP4 && nvfp4_mm::supports(w) {
             if ws.is_some_and(|s| s.elements() != 1) {
                 return Err(ModelError::Unsupported(format!(

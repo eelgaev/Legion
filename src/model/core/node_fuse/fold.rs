@@ -37,7 +37,12 @@
 //! and its one FMA, so the same bits: the streams' write goes, and `O_a` (a quarter of their
 //! bytes) is read twice more. `R_a` and `O_a` then stay alive through the MoE layer, which is
 //! why it is part of this relayout; the norm's views of its streams, read by nothing now, are
-//! retired so they do not keep its memory alive to the end of the step.
+//! retired so they do not keep its memory alive to the end of the step. Both norms' nodes are
+//! then laid out without the bytes they do not write ([`crate::model::qwen4::compact_plan`]):
+//! the FFN mixer's holds only its BF16 `xn`, scales and inject weights (20 KB a token, not
+//! 100), the attention mixer's (the one holding `R_a`) loses the unused rest of `xn`'s place
+//! (60 KB, not 100), so a prompt step's compute buffer is no larger than with the streams
+//! written, though `R_a` (with that node's other parts) and `O_a` live longer.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -48,8 +53,8 @@ use crate::ggml::post_alloc::{Relaid, Relayout};
 use crate::ggml::{ffi, make_external};
 use crate::model::nvfp4_mm;
 use crate::model::qwen4::{
-    FoldSum, fold_moe, fold_target, lazy_fold_target, lazy_mix_target, lazy_parts, lazy_streams,
-    moe_fold, set_lazy_fold, set_lazy_streams, set_no_res,
+    FoldSum, compact_plan, fold_moe, fold_target, lazy_fold_target, lazy_mix_target, lazy_parts,
+    lazy_streams, moe_fold, set_compact, set_lazy_fold, set_lazy_streams, set_no_res,
 };
 use crate::tp_net::seq_par;
 
@@ -107,6 +112,7 @@ unsafe fn rewrite(graph: *mut ffi::ggml_cgraph, cuda: bool) -> Option<Box<dyn Re
             folded,
             fma,
             lazy_streams = undo.lazy,
+            compact = undo.compact,
             left = undo.left.len(),
             unread = UNREAD.load(Ordering::Relaxed),
             by_exchange = TAKEN.load(Ordering::Relaxed),
@@ -134,6 +140,7 @@ pub(crate) unsafe fn fold_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> (Un
             saved: Vec::new(),
             cuda,
             lazy: 0,
+            compact: 0,
         };
         let (mut folded, mut fma) = (0, 0);
         for i in 0..n {
@@ -152,7 +159,7 @@ pub(crate) unsafe fn fold_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> (Un
             }
         }
         if folded > 0 && lazy_streams() {
-            undo.lazy = g.lazy_streams(cuda, &mut undo.saved);
+            (undo.lazy, undo.compact) = g.lazy_streams(cuda, &mut undo.saved);
         }
         (undo, folded, fma)
     }
@@ -168,6 +175,8 @@ pub(crate) struct Undo {
     cuda: bool,
     /// FFN mixers whose streams are made lazily (see the module doc).
     pub(crate) lazy: usize,
+    /// Norm nodes of those laid out without their unwritten bytes (see the module doc).
+    pub(crate) compact: usize,
 }
 
 impl Relaid for Undo {
@@ -391,7 +400,9 @@ impl Graph {
     /// attention mixer's, and no node in between writes into that node's memory or the
     /// attention block output's: the FFN norm stops writing its streams and its two readers
     /// make them. Saves the nodes it changes first (each once: an undo puts back the first
-    /// copy). How many it did.
+    /// copy). Both norms' nodes are then laid out without their unwritten bytes
+    /// ([`Self::compact`]). How many FFN mixers it made lazy, and how many nodes it laid out
+    /// compactly.
     ///
     /// # Safety
     /// As [`fold_graph`], after its folds.
@@ -399,10 +410,10 @@ impl Graph {
         &mut self,
         cuda: bool,
         saved: &mut Vec<(Node, ffi::ggml_tensor)>,
-    ) -> usize {
+    ) -> (usize, usize) {
         // SAFETY: the caller's; nodes and their sources are valid tensors.
         unsafe {
-            let mut made = 0;
+            let (mut made, mut compact) = (0, 0);
             for ni in 0..self.nodes.len() {
                 let nn = self.nodes[ni];
                 if self.none[ni] || !lazy_fold_target(nn) {
@@ -454,9 +465,13 @@ impl Graph {
                 set_lazy_streams(uf, ra, oa, ia);
                 set_lazy_fold(nn, ra, oa);
                 self.retire_unread(&mut views, nf);
+                // Both norms' nodes without their unwritten bytes: the FFN mixer's (no streams
+                // now) and the attention mixer's, alive until the next layer's norm now.
+                compact += usize::from(self.compact(nf, saved));
+                compact += usize::from(self.compact(root(ra), saved));
                 made += 1;
             }
-            made
+            (made, compact)
         }
     }
 
@@ -578,6 +593,54 @@ impl Graph {
                 // SAFETY: the caller's.
                 unsafe { self.retire(&[v], keep) };
             }
+        }
+    }
+
+    /// Lays the norm node `node` out compactly where [`compact_plan`] takes it (#1183): its
+    /// unwritten bytes go, and every view of it that runs moves to its part's new place. Only
+    /// where each such view lies within one written part and every node reading `node` itself
+    /// is a view. Saves the nodes it changes first (each once). Whether it did.
+    ///
+    /// # Safety
+    /// As [`Self::lazy_streams`]; `node` a valid tensor.
+    unsafe fn compact(&mut self, node: Node, saved: &mut Vec<(Node, ffi::ggml_tensor)>) -> bool {
+        // SAFETY: the caller's; nodes and their sources are valid tensors.
+        unsafe {
+            let Some(c) = compact_plan(node) else {
+                return false;
+            };
+            if self
+                .users(node)
+                .iter()
+                .any(|&u| !self.none[u] && !is_view_op((*self.nodes[u]).op))
+            {
+                return false;
+            }
+            let mut moves = Vec::new();
+            for (j, &v) in self.nodes.iter().enumerate() {
+                if self.none[j] || (*v).view_src != node {
+                    continue;
+                }
+                let (a, b) = ((*v).view_offs, (*v).view_offs + ffi::ggml_nbytes(v));
+                let Some(&(from, to, _)) = c
+                    .parts
+                    .iter()
+                    .find(|&&(from, _, len)| from <= a && b <= from + len)
+                else {
+                    return false;
+                };
+                moves.push((v, to + (a - from)));
+            }
+            for t in std::iter::once(node).chain(moves.iter().map(|&(v, _)| v)) {
+                if !saved.iter().any(|&(s, _)| s == t) {
+                    saved.push((t, std::ptr::read(t)));
+                }
+            }
+            for (v, offs) in moves {
+                (*v).view_offs = offs;
+            }
+            set_compact(node, c.floats);
+            true
         }
     }
 

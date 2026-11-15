@@ -11,9 +11,14 @@ binding removed; `--port 8090` added). All requests use temperature 0.
   the 8 prompts are sent twice, so 16 requests are in flight; every engine gets the same requests.
 - **Prefill:** one request per prompt size, tok/s to the first token.
 - **llama-benchy:** `--pp 512 --tg 256 --no-cache --exact-tg`, concurrency 1 4 16 (or 1 4), 2-3 runs; tg tok/s.
+  It reads lower than the deterministic client on the same server, and the two are not interchangeable: its random
+  prompts draft worse (MTP accepts 2.3 tokens per step instead of 2.5), and its total runs from the first request's
+  first token to the last one's last token, so with 512-token prompts the later requests' prompt steps fall inside
+  it. Qwen3.8-Flash-Next NVFP4 on two Sparks, one server, 1 / 4 / 16 users: 42.5 / 110.8 / 195.6 with llama-benchy
+  (its own peak 43 / 120 / 233), 45.7 / 117.9 / 242.5 with the deterministic client.
 - MTP heads (`--spec-draft`) are the `mtp-*.gguf` files in the same Hugging Face repo as the model.
 
-[llama.cpp and vLLM next to Legion](other-engines.md): the other engines' commands for every model.
+[llama.cpp, vLLM, Project Maya and Strata next to Legion](other-engines.md): the other engines' commands for every model.
 
 ## DGX Spark
 
@@ -40,3 +45,7 @@ on current kernels), the recommended setup; see [ac922.md](../ac922.md) for the 
 - [GLM-5.3-Flash UD-Q4_K_XL, IBM AC922 4x V100 SXM2 16 GB](ac922/glm-53-flash-ud-q4-k-xl-4x.md)
 - [Gemma 4 31B QAT UD-Q4_K_XL, IBM AC922 2x V100 SXM2 16 GB](ac922/gemma-4-31b-qat-ud-q4-k-xl-2x.md)
 - [Qwen3.8-27B UD-Q4_K_XL, IBM AC922 2x V100 SXM2 16 GB](ac922/qwen38-27b-ud-q4-k-xl-2x.md)
+
+## Gaming PCs
+
+- [Qwen3.8-Flash-Next UD-Q4_K_XL, one RTX 4090 with 128 / 64 / 32 GB of RAM](gaming-pc/qwen38-flash-next-ud-q4-k-xl-rtx4090.md)

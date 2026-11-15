@@ -150,3 +150,11 @@ fn without_q4_there_is_no_copy() {
     .unwrap();
     assert!(executor(&path, 40, false).model().draft_head().is_none());
 }
+
+#[test]
+fn ids_runs_split_ids_into_consecutive_runs() {
+    use super::ids_runs;
+    assert_eq!(ids_runs(&[0, 1, 2, 5, 7, 8]), vec![0..3, 5..6, 7..9]);
+    assert_eq!(ids_runs(&[4]), vec![4..5]);
+    assert!(ids_runs(&[]).is_empty());
+}

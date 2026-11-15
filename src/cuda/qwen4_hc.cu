@@ -88,6 +88,7 @@ struct legion_hc_mix {
     block_q8_1 * mixed_q;     // or null: mixed as Q8_1 too, [n][n_embd / 32] (ahead path only)
     int32_t l2_ahead;         // ahead path: L2_DOWN | L2_UP, the next kernel's weights read into L2
     int32_t variant;          // ahead path: V_NORM_REGS | V_DOWN_SPLIT | V_DOWN_HOIST | V_UP_STAGE, with V_DEFAULTS where cc 7.x picks
+    int32_t gb10;             // GB10 Q8_0 path (#1176): 0 the defaults, else G_SET | G_RING | G_EARLY (sm80/qwen4_hc.cuh)
 };
 
 // Launches the kernels on `stream`; returns a cudaError_t.
@@ -982,11 +983,33 @@ bool bf16_wide(const legion_hc_mix & p) {
            p.rank % 8 == 0;
 }
 
+// The GB10 bits in effect: legion_hc_mix::gb10 when G_SET, else the defaults.
+int gb10_bits(const legion_hc_mix & p) {
+    return p.gb10 & G_SET ? p.gb10 : G_RING | G_EARLY;
+}
+
+// Whether down_g's ring takes this mixer: K / QK8_0 a multiple of its slice (G_RING_SL * 32
+// blocks). Otherwise the rows are staged whole, the same bits.
+bool ring_fits(const legion_hc_mix & p) {
+    return (p.hc * p.n_embd / QK8_0) % (G_RING_SL * (DOWN_THREADS / 4)) == 0;
+}
+
+// On one GB10 (Flash-Next's mixer, 1-8 tokens, hc-mix-bench --gb10, #1176) the ring with norm_g
+// launched early is 5-8% faster than the rows staged whole: down_g's CTAs hold 26 KB instead of
+// 43.5 KB, so up_mix_g's CTAs become resident beside them and stage their up rows while down
+// runs. Fewer rows or columns per CTA, the L2 prefetch of either matrix from extra norm CTAs, the
+// largest carveout, and rings of other depths were no faster or slower.
 template <int NT>
 void launch_rows_g(const legion_hc_mix & p, cudaStream_t s) {
     const int n_inj = p.inject_w ? p.hc * p.n : 0;
-    launch_pdl(down_g<NT, G_ROWS>, dim3(n_inj + p.rank / G_ROWS), DOWN_THREADS, G_ROWS * (int) p.down_nb1, s, p,
-               n_inj);
+    if ((gb10_bits(p) & G_RING) && ring_fits(p)) {
+        constexpr int SB = G_RING_SL * (DOWN_THREADS / 4) * (int) sizeof(block_q8_0);
+        launch_pdl(down_g<NT, G_ROWS, G_RING_SL, G_RING_ST>, dim3(n_inj + p.rank / G_ROWS), DOWN_THREADS,
+                   G_RING_ST * G_ROWS * SB, s, p, n_inj);
+    } else {
+        launch_pdl(down_g<NT, G_ROWS>, dim3(n_inj + p.rank / G_ROWS), DOWN_THREADS, G_ROWS * (int) p.down_nb1, s, p,
+                   n_inj);
+    }
     const int rows = p.hc * G_COLS * (int) p.up_nb1;
     const int lq = NT * (p.rank / QK8_1) * (int) sizeof(block_q8_1);
     const int gate = NT * G_COLS * MAX_HC * (int) sizeof(float);  // up_mix_g's static shared memory
@@ -1081,7 +1104,13 @@ extern "C" int legion_hc_mix_launch(const legion_hc_mix * p, void * stream) {
         return cudaGetLastError();
     }
     if (use_gb10(*p)) {
-        norm_g<true><<<dim3(p->hc, p->n), NORM_THREADS, 0, s>>>(*p);
+        // norm_g reads gamma before its wait for the kernel ahead (ggml_cuda_pdl_sync), the
+        // stream and its outputs after it.
+        if (gb10_bits(*p) & G_EARLY) {
+            launch_pdl(norm_g<true>, dim3(p->hc, p->n), NORM_THREADS, 0, s, *p);
+        } else {
+            norm_g<true><<<dim3(p->hc, p->n), NORM_THREADS, 0, s>>>(*p);
+        }
         switch (p->n) {
             case 1: launch_rows_g<1>(*p, s); break;
             case 2: launch_rows_g<2>(*p, s); break;

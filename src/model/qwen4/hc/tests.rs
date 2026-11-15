@@ -131,6 +131,49 @@ fn cuda_l2_prefetch_is_bit_for_bit() {
     }
 }
 
+/// `LEGION_DEBUG_HC_GB10` (#1176): `whole`, `ring` and `early` as their codes, anything else the
+/// defaults (0).
+#[test]
+fn gb10_codes() {
+    assert_eq!(parse_gb10(Some("whole")), GB10_SET);
+    assert_eq!(parse_gb10(Some(" ring ")), GB10_SET | GB10_RING);
+    assert_eq!(parse_gb10(Some("early")), GB10_SET | GB10_EARLY);
+    for bad in [None, Some(""), Some("4,16"), Some("rings"), Some("Ring")] {
+        assert_eq!(parse_gb10(bad), 0, "{bad:?}");
+    }
+}
+
+/// On CUDA every GB10 choice (#1176) writes the same bytes as the kernels before it, for 1 to 8
+/// tokens and the shapes of [`cuda_loads_ahead_is_bit_for_bit`] (the last one's K is no multiple
+/// of the ring's slice, so its rows are staged whole; elsewhere than compute capability 12.x the
+/// choices are not read).
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_gb10_choices_are_bit_for_bit() {
+    use crate::ggml::{DeviceKind, device_by_kind};
+    let mut gpu = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU device")
+        .init()
+        .unwrap();
+    for (e, hc, rank) in [(2560i64, 4i64, 320i64), (3072, 6, 1024), (1024, 3, 64)] {
+        for n in 1..=MAX_TOKENS {
+            force_gb10(GB10_SET);
+            let reference = cuda_case(&mut gpu, e, hc, rank, n);
+            for code in [GB10_SET | GB10_RING, GB10_SET | GB10_EARLY, 0] {
+                force_gb10(code);
+                let got = cuda_case(&mut gpu, e, hc, rank, n);
+                assert_eq!(
+                    got, reference,
+                    "{e} x {hc}, rank {rank}, {n} tokens, code {code:#x}"
+                );
+            }
+            force_gb10(-1);
+        }
+    }
+}
+
 /// [`mix`] on `backend` with Q8_0 down and up matrices and an inject: the mixed and inject
 /// bytes.
 #[cfg(feature = "cuda")]
