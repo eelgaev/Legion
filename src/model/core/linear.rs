@@ -441,6 +441,38 @@ impl Linear {
         Ok(ctx.add(self.mul_mat(ctx, name, w, scale, input_scale, x)?, res))
     }
 
+    /// `w @ swiglu_split(gate, up)` (+ `res`) with the SwiGLU in the quantization of the 5-8
+    /// column NVFP4 op ([`super::nvfp4_mvq::mul_mat_swiglu`]) where [`Self::mul_mat`] would run
+    /// `w` on that op; `None`: build ggml's `swiglu_split` and [`Self::mul_mat_add`]. The same
+    /// bits either way (ggml's add after the op, as [`Self::mul_mat_add`] builds it there).
+    #[allow(clippy::too_many_arguments)]
+    pub fn swiglu_down_mvq<'a>(
+        &self,
+        ctx: &'a Context,
+        name: &str,
+        w: Tensor<'a>,
+        scale: Option<Tensor<'a>>,
+        gate: Tensor<'a>,
+        up: Tensor<'a>,
+        res: Option<Tensor<'a>>,
+    ) -> Option<Tensor<'a>> {
+        use super::nvfp4_mvq;
+        let n: i64 = gate.ne()[1..].iter().product();
+        let takes = nvfp4_mvq::swiglu_on()
+            && !self.fp8.contains(name)
+            && !(self.w4a16(name, w, scale, n) && w.ne()[2] == 1)
+            && nvfp4_mvq::takes(w, gate, scale)
+            && nvfp4_mvq::swiglu_fits(w, gate, up, scale);
+        if !takes {
+            return None;
+        }
+        let y = nvfp4_mvq::mul_mat_swiglu(ctx, w, gate, up, scale);
+        Some(match res {
+            Some(r) => ctx.add(y, r),
+            None => y,
+        })
+    }
+
     /// The SwiGLU FFN `down @ (silu(gate @ x) * (up @ x))` with the gate and up matmuls as one
     /// fused W4A16 op ([`crate::model::nvfp4_mm::swiglu`], BF16 out) when all three weights take
     /// Legion's NVFP4 kernels at this batch size; `None`: run it unfused. Each weight is
