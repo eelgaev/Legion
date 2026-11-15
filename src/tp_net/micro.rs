@@ -13,10 +13,13 @@
 //! layout a micro-batch's own `[row, n_j]` tensor, every rank's piece after the other in rank
 //! order (the MoE's input and output with `--tp-overlap ffn`). A sum adds every rank's value in
 //! rank order and with `--tp-wire bf16` rounds every one of them, so each value gets the bits
-//! the plain exchange gives it. The model's per-token work on half the columns does not, on a
-//! GPU: ggml's MMQ splits K over its CTAs by the number of output tiles (stream-k), so the
-//! mixers' and experts' matmuls round differently and long prompts' greedy output differs
-//! from `--tp-overlap off` (on the CPU, the reference, it is the same; #758 measured it).
+//! the plain exchange gives it. The model's per-token work on half the columns need not, on a
+//! GPU: ggml's MMQ splits K over its CTAs by the number of output tiles (stream-k) and cuBLAS
+//! picks split-K by the column count, so a matmul can round differently on half the columns
+//! (on the CPU, the reference, it is the same; #758 measured it). Qwen3.8-Flash-Next's BF16
+//! mixers (its NVFP4 checkpoints) on a GB10 sum their down matmul per micro-batch as the whole
+//! share's (#1176: cuBLAS split K at exactly 1,024 columns, which had moved 32K prompts'
+//! greedy output); with `ffn` the experts' matmuls still may not.
 //!
 //! On a GPU the finishes run in the order of the starts and at most two exchanges are in
 //! flight; on the CPU (the reference) the start does nothing and the finish the whole exchange.
@@ -65,8 +68,9 @@ pub fn overlap(comm: i32) -> Overlap {
 
 /// Micro-batches of fewer columns than this leave a step whole ([`worth`]). On a GPU a
 /// micro-batch's matmuls may split K differently from the whole share's, and below about this
-/// size they did (#1176: a 1,536-token prompt's greedy text moved, a 4,096-token one's did
-/// not); such steps also have little wire time to hide.
+/// size they did (#1176: a 1,536-token prompt's greedy text moved); such steps also have little
+/// wire time to hide. (At exactly this size cuBLAS split the mixers' down matmul too, until
+/// the micro-batches summed it as the whole share's, #1176 r31.)
 pub const MIN_COLS: usize = 1024;
 
 /// [`MIN_COLS`], or what [`set_min_cols`] set.

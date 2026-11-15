@@ -16,8 +16,15 @@
 //! Every node goes into the graph at once, in that order (ggml runs a graph's nodes in the
 //! order they were added), so the GPU stream sees each exchange's start, the other
 //! micro-batch's work, then its finish.
+//!
+//! The mixers' per-token work gives a token the same bits in a micro-batch as in the whole
+//! share, but for the down matmul: cuBLAS picks split-K by the column count (on a GB10 it
+//! splits at exactly 1,024 columns, not at 1,025-2,304), so a micro-batch of a 4,096-token step
+//! got other bits than its 2,048-column share. Here the BF16 mixers' down matmul runs on
+//! [`super::hc_down`]'s kernel, one chain over `k` per output at any size, cuBLAS's sums at the
+//! whole shares the split steps have (#1176 r31).
 
-use crate::ggml::{Context, Tensor};
+use crate::ggml::{Context, Tensor, types};
 use crate::model::core::{Model, ModelError, Pass, cols};
 use crate::tp_net::Overlap;
 use crate::tp_net::micro::{self, Started};
@@ -49,6 +56,9 @@ pub(super) struct Micro<'a> {
     /// Each micro-batch's streams, `[n_embd, hc, tokens]`.
     pub(super) res: [Tensor<'a>; 2],
     pub(super) pending: Pending<'a>,
+    /// F32 ones for the mixers' down matmul summed as the whole share's
+    /// ([`super::hc_down::mul_mat_xnb`]).
+    pub(super) ones: Tensor<'a>,
 }
 
 impl Model {
@@ -87,12 +97,19 @@ impl Model {
         });
         let p = pending.take();
         let pending = Pending::Summed([0, 1].map(|j| p.map(|(o, i)| (part(o, j), part(i, j)))));
+        // Enough for the down weight's `e · hc` values and either micro-batch's scales.
+        let most = (0..micro::MICRO)
+            .map(|j| micro::piece(n, rank, ranks, j, false).1 as i64)
+            .max()
+            .unwrap_or(0);
+        let ones = ctx.fill(ctx.new_tensor(types::F32, &[(e * hc).max(hc * most)]), 1.0);
         Some(Micro {
             comm,
             n,
             ffn,
             res,
             pending,
+            ones,
         })
     }
 
@@ -123,7 +140,8 @@ impl Model {
                     Some((out, inject[j]))
                 }
             };
-            let (res, h, inject) = self.hc_mix_after(ctx, st.res[j], pending, prefix, false)?;
+            let (res, h, inject) =
+                self.hc_mix_after_in(ctx, st.res[j], pending, prefix, false, Some(st.ones))?;
             st.res[j] = res;
             let g = micro::all_gather_start(ctx, st.comm, h, st.n, j, compact);
             Self::add(pass, g.node);

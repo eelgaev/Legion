@@ -174,6 +174,113 @@ fn rebuilt_down_reads_xnb_on_the_cpu() {
     check(&mut cpu, 256, &[1, 9]);
 }
 
+/// [`mul_mat_xnb`] on `n` tokens of a BF16 `xnb` (`[k, n]`) whole and in two column halves
+/// (`--tp-overlap mixers`' micro-batches, #1176), one-hot down weights on the whole, and ggml's
+/// `mul_mat` of the random weight: (whole, halves joined, one-hot outputs, ggml's).
+fn xnb_case(
+    backend: &mut Backend,
+    e: i64,
+    n: i64,
+) -> (Vec<f32>, Vec<f32>, Vec<Vec<f32>>, Vec<f32>, Vec<f32>) {
+    let hc = 4i64;
+    let k = e * hc;
+    let hot_n = (k + M - 1) / M;
+    let size = 64 + 2 * hot_n as usize;
+    let ctx = Context::new(size, size);
+    let xnb = ctx.new_tensor(types::BF16, &[k, n]).as_input();
+    let down = ctx.new_tensor(types::BF16, &[k, M]).as_input();
+    let hot: Vec<Tensor<'_>> = (0..hot_n)
+        .map(|_| ctx.new_tensor(types::BF16, &[k, M]).as_input())
+        .collect();
+    let ones = ctx.fill(ctx.new_tensor(types::F32, &[k.max(hc * n)]), 1.0);
+    let whole = mul_mat_xnb(&ctx, down, xnb, hc, ones).as_output();
+    let h = n / 2;
+    let half = |a: i64, m: i64| {
+        let x = ctx.cont(ctx.view_2d(xnb, [k, m], xnb.nb()[1], a as usize * xnb.nb()[1]));
+        mul_mat_xnb(&ctx, down, x, hc, ones)
+    };
+    let halves = ctx.concat(half(0, h), half(h, n - h), 1).as_output();
+    let hot_lo: Vec<Tensor<'_>> = hot
+        .iter()
+        .map(|&w| mul_mat_xnb(&ctx, w, xnb, hc, ones).as_output())
+        .collect();
+    let lo_ref = ctx.mul_mat(down, xnb).as_output();
+    let mut graph = ctx.new_graph(size);
+    for t in hot_lo.iter().chain([&whole, &halves, &lo_ref]) {
+        graph.expand(*t);
+    }
+    ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+        .unwrap();
+    let x: Vec<f32> = noise((k * n) as usize, 91)
+        .iter()
+        .map(|v| 3.0 * v)
+        .collect();
+    xnb.set_bytes(&bf16_bytes(&x));
+    down.set_bytes(&bf16_bytes(
+        &noise((k * M) as usize, 92)
+            .iter()
+            .map(|v| 0.02 * v)
+            .collect::<Vec<_>>(),
+    ));
+    for (j, w) in hot.iter().enumerate() {
+        w.set_bytes(&one_hot(k, j as i64));
+    }
+    backend.compute(&graph).unwrap();
+    let xw = x
+        .iter()
+        .map(|&v| f32::from_bits(u32::from(bf16_bits(v)) << 16))
+        .collect();
+    (
+        whole.to_f32(),
+        halves.to_f32(),
+        hot_lo.iter().map(|t| t.to_f32()).collect(),
+        xw,
+        lo_ref.to_f32(),
+    )
+}
+
+/// The checks of [`xnb_case`]: the halves give the whole's bits; every B value is `xnb`'s; the
+/// product is ggml's `mul_mat` within F32 rounding of the sum order.
+fn check_xnb(backend: &mut Backend, e: i64, ns: &[i64]) {
+    for &n in ns {
+        let (whole, halves, hot, xw, lo_ref) = xnb_case(backend, e, n);
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert!(bits(&whole) == bits(&halves), "{n} tokens: halves moved");
+        let k = e * 4;
+        for (j, lo) in hot.iter().enumerate() {
+            for t in 0..n {
+                for r in 0..M {
+                    let col = (j as i64 * M + r) % k;
+                    let got = lo[(t * M + r) as usize];
+                    let want = xw[(t * k + col) as usize];
+                    assert!(
+                        got == want,
+                        "{n} tokens: token {t} k {col}: {got} vs {want}"
+                    );
+                }
+            }
+        }
+        let (num, den) = whole
+            .iter()
+            .zip(&lo_ref)
+            .fold((0f64, 0f64), |(a, b), (&x, &y)| {
+                let d = f64::from(x) - f64::from(y);
+                (a + d * d, b + f64::from(y) * f64::from(y))
+            });
+        assert!(den > 0.0, "{n} tokens: zero output");
+        let rel = (num / den).sqrt();
+        assert!(rel < 1e-5, "{n} tokens: off ggml's mul_mat by {rel}");
+    }
+}
+
+/// [`check_xnb`] on the CPU (the reference).
+#[test]
+fn xnb_down_halves_match_the_whole_on_the_cpu() {
+    let mut cpu = Backend::cpu().unwrap();
+    cpu.set_threads(4);
+    check_xnb(&mut cpu, 256, &[2, 9]);
+}
+
 /// [`rebuild`] is the norm's arithmetic: two rounded F32 multiplies, then BF16 nearest even.
 #[test]
 fn rebuild_rounds_as_the_norm() {
@@ -272,6 +379,8 @@ fn cuda_rebuilt_down_reads_xnb() {
     for nt in [0, 2, 3, 4] {
         force_nt(nt);
         check(&mut gpu, 2560, &[1, 33, 300, 4096]);
+        // `--tp-overlap mixers`' micro-batches of a 4,096-token step's 2,048-token share.
+        check_xnb(&mut gpu, 2560, &[2048, 2050, 2276]);
     }
     force_nt(0);
 }

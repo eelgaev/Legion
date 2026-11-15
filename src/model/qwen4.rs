@@ -982,6 +982,22 @@ impl Model {
         prefix: &str,
         bf16: bool,
     ) -> Result<(Tensor<'a>, Tensor<'a>, Tensor<'a>), ModelError> {
+        self.hc_mix_after_in(ctx, res, pending, prefix, bf16, None)
+    }
+
+    /// [`Self::hc_mix_after`]; `ones` (F32 ones, see [`hc_down::mul_mat_xnb`]): a
+    /// `--tp-overlap mixers` micro-batch, whose BF16-xn down matmul sums every output as one
+    /// chain over `k` (the whole share's bits at any column count, #1176) where the kernel takes
+    /// it.
+    fn hc_mix_after_in<'a>(
+        &'a self,
+        ctx: &'a Context,
+        res: Tensor<'a>,
+        pending: Option<(Tensor<'a>, Tensor<'a>)>,
+        prefix: &str,
+        bf16: bool,
+        ones: Option<Tensor<'a>>,
+    ) -> Result<(Tensor<'a>, Tensor<'a>, Tensor<'a>), ModelError> {
         let w = |s: &str| self.w(&format!("{prefix}_{s}.weight"));
         let (norm, down, up, inj) = (w("norm")?, w("down")?, w("up")?, w("inject")?);
         let rows_ok = |t: Tensor<'_>| t.ty() == types::F32 && t.nb()[0] == 4;
@@ -1155,8 +1171,15 @@ impl Model {
                     down,
                     streams16,
                 );
-                let lo =
-                    hc_chain::lo_act(ctx, ctx.mul_mat(down, p.xnb), scale, hc_chain::on_gpu(up));
+                // A `--tp-overlap mixers` micro-batch: the down matmul summed as the whole
+                // share's (#1176; cuBLAS splits `k` on some column counts, 1,024 on a GB10).
+                let lo = match ones {
+                    Some(ones) if hc_down::takes_xnb(down, [e, hc_n, n, 1]) => {
+                        hc_down::mul_mat_xnb(ctx, down, p.xnb, hc_n, ones)
+                    }
+                    _ => ctx.mul_mat(down, p.xnb),
+                };
+                let lo = hc_chain::lo_act(ctx, lo, scale, hc_chain::on_gpu(up));
                 let mixed =
                     hc_up_mix::up_mix_rebuilt(ctx, up, lo, p.res, p.scales, norm, hc_n, scale);
                 return Ok((p.res, mixed, p.inject));

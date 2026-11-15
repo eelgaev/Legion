@@ -786,10 +786,11 @@ pub(super) struct ModelArgs {
     /// mixers: the hyper-connection mixers run per half; ffn: the MoE too (each half reads the
     /// expert weights again). Steps with a half under 1,024 tokens on any rank run whole. Needs
     /// twice the pinned exchange buffers. Every rank must pass the same value. On a GPU smaller
-    /// halves' matmuls split K differently from the whole share's (MMQ stream-k) and moved long
-    /// prompts' greedy output; with the 1,024-token floor, greedy text at 1,536 and 4,096 prompt
-    /// tokens matched off on two DGX Sparks (Qwen3.8-Flash-Next NVFP4, mixers: prefill 8K /
-    /// 32K / 123K 2,872 / 3,013 / 2,825 -> 2,966 / 3,022 / 2,859 tok/s). GLM-5.3-Flash: the
+    /// halves' matmuls may split K differently from the whole share's (MMQ stream-k, cuBLAS
+    /// split-K) and move greedy output. Qwen3.8-Flash-Next NVFP4 (mixers): the halves' mixer
+    /// down matmul sums as the whole share's (cuBLAS split it at 1,024 columns on a GB10 and
+    /// moved 32K prompts' output), so with the 1,024-token floor greedy output matches off on
+    /// two DGX Sparks; ffn's experts may still differ. GLM-5.3-Flash: the
     /// mixers only (ffn runs as mixers: per-half experts would read the expert weights twice),
     /// with the attention, router and experts on all the step's tokens, so the output keeps
     /// its bits, and halves of 256+ tokens (its mixers give every token the same bits at any

@@ -92,18 +92,28 @@ pub(super) fn takes(down: Tensor<'_>, gamma: Tensor<'_>, streams: [i64; 4]) -> b
     // SAFETY: live tensors; reads a field.
     let aligned = |t: Tensor<'_>| unsafe { (*t.raw()).data as usize }.is_multiple_of(16);
     ON.load(Ordering::Relaxed)
-        && cfg!(feature = "cuda")
         && streams[2] >= MIN_TOKENS
-        && shape_fits(down.ty(), down.ne(), down.nb(), streams)
-        && down.is_contiguous()
+        && takes_xnb(down, streams)
         && gamma.ty() == types::F32
         && gamma.is_contiguous()
         && gamma.elements() == down.ne()[0] as usize
+        && aligned(gamma)
+}
+
+/// Whether [`mul_mat_xnb`] takes the down weight `down` and a BF16 `xn` of `streams[2]` tokens
+/// (`streams`: `[e, hc, n]`) at any step size: [`takes`]' shapes, weights and GPU, without the
+/// [`MIN_TOKENS`] floor or the switch (`--tp-overlap mixers`' micro-batches need it for their
+/// bits, #1176).
+pub(super) fn takes_xnb(down: Tensor<'_>, streams: [i64; 4]) -> bool {
+    // SAFETY: live tensors; reads a field.
+    let aligned = |t: Tensor<'_>| unsafe { (*t.raw()).data as usize }.is_multiple_of(16);
+    cfg!(feature = "cuda")
+        && shape_fits(down.ty(), down.ne(), down.nb(), streams)
+        && down.is_contiguous()
         && !down.is_host()
         && !down.is_meta()
         && crate::model::cluster_select::on_cuda()
         && aligned(down)
-        && aligned(gamma)
         && down
             .cuda_device()
             .is_some_and(|dev| crate::hw::per_device::sms_if_cc12(dev) > 0 && supported_on(dev))
@@ -175,6 +185,38 @@ pub(super) fn mul_mat<'a>(
         [M, n, 1, 1],
         &[down, res, scales, gamma],
     )
+}
+
+/// `lo = down @ xnb` (F32 `[M, n]`) for a BF16 `xn` the norm wrote (`[e · hc, n]`, contiguous;
+/// [`super::hc_norm::hc_post_norm_rebuilt_xnb`]'s), on the kernel above with unit scales and
+/// gamma: every B value is `bf16((v · 1) · 1)`, `xnb`'s own, so the product is `mul_mat(down,
+/// xnb)` summed as one chain over `k` from 0 for each output, whatever the step's columns.
+/// cuBLAS sums it so too on a GB10 at 1,025 to 2,304 columns (`legion hc-down-bench --check`)
+/// but splits `k` at exactly 1,024, so a `--tp-overlap mixers` micro-batch of 1,024 columns
+/// got other bits than its step's 2,048-column share (#1176). `ones`: F32 ones, at least
+/// `max(e · hc, hc · n)` values (the unit gamma and scales are views of it). Needs
+/// [`takes_xnb`].
+pub(super) fn mul_mat_xnb<'a>(
+    ctx: &'a Context,
+    down: Tensor<'a>,
+    xnb: Tensor<'a>,
+    hc: i64,
+    ones: Tensor<'a>,
+) -> Tensor<'a> {
+    let [k, n, _, _] = xnb.ne();
+    assert_eq!(xnb.ty(), types::BF16, "hc_down: BF16 xn");
+    assert!(xnb.is_contiguous(), "hc_down: contiguous xn");
+    assert_eq!(ones.ty(), types::F32, "hc_down: F32 ones");
+    assert!(ones.is_contiguous(), "hc_down: contiguous ones");
+    assert!(
+        ones.elements() >= k.max(hc * n) as usize,
+        "hc_down: {} ones for {k} values, {n} tokens",
+        ones.elements()
+    );
+    let streams = ctx.reshape_3d(xnb, k / hc, hc, n);
+    let gamma = ctx.view_1d(ones, k, 0);
+    let scales = ctx.view_2d(ones, [hc, n], hc as usize * 4, 0);
+    mul_mat(ctx, down, streams, scales, gamma)
 }
 
 /// One value of `xn` as the BF16 streams' norm rounds it into `xnb` (`hc_post_norm_b16_kernel`)
