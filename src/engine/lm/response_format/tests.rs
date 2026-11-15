@@ -33,6 +33,7 @@ fn json_overrides_thinking_and_template_kwargs() {
         worker: None,
         load_report: Default::default(),
         split_probe: None,
+        _tier_plan: None,
     };
     let mut req = GenerateRequest {
         model: String::new(),
