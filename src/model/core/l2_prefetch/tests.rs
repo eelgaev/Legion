@@ -23,6 +23,38 @@ fn the_pace_takes_nanoseconds_up_to_a_millisecond() {
 }
 
 #[test]
+fn the_delay_hold_and_out_switches_default_to_off() {
+    assert_eq!(delay_from(None), 0);
+    assert_eq!(delay_from(Some("20000")), 20_000);
+    assert_eq!(delay_from(Some("1000001")), 0);
+    assert_eq!(hold_from(None), (0, 0));
+    assert_eq!(hold_from(Some("4:30000")), (4 << 20, 30_000));
+    assert_eq!(hold_from(Some(" 2 : 500 ")), (2 << 20, 500));
+    assert_eq!(hold_from(Some("4")), (0, 0));
+    assert_eq!(hold_from(Some("65:100")), (0, 0));
+    assert_eq!(hold_from(Some("4:1000001")), (0, 0));
+    assert_eq!(mib_or_zero(None), 0);
+    assert_eq!(mib_or_zero(Some("8")), 8 << 20);
+    assert_eq!(mib_or_zero(Some("65")), 0);
+}
+
+#[test]
+fn a_side_join_keeps_the_side_work_and_its_inputs() {
+    let ctx = Context::new(16, 0);
+    let x = ctx.new_tensor(types::F32, &[16, 8]);
+    let z = ctx.scale(x, 3.0);
+    let out = ctx.scale(x, 0.5);
+    let j = side_join(&ctx, out, &[z, x]);
+    assert_eq!(j.ne(), [1, 1, 1, 1]);
+    // SAFETY: a node of the live context.
+    let src = unsafe { (*j.raw()).src };
+    assert!(std::ptr::eq(src[0], out.raw()));
+    assert!(std::ptr::eq(src[1], z.raw()));
+    assert!(std::ptr::eq(src[2], x.raw()));
+    assert!(src[3].is_null());
+}
+
+#[test]
 fn spans_stay_inside_the_tensor() {
     // 31.5 MB: the 27B's FP8 z projection (5120 x 6144 bytes).
     let z = 5120 * 6144;

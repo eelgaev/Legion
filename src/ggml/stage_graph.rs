@@ -40,6 +40,7 @@ mod tests;
 pub mod cond;
 pub(crate) mod copy_kernel;
 pub mod kept_words;
+pub(crate) mod prio;
 pub(crate) mod spare;
 pub mod stats;
 pub(crate) mod store;

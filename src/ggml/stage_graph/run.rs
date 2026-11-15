@@ -992,6 +992,7 @@ impl Run<'_> {
         // SAFETY: the caller's; the stream is the backend's and captures nothing else now (the
         // backend is this thread's until `compute` returns).
         unsafe {
+            super::prio::begin();
             if cudaStreamBeginCapture(self.stream, CAPTURE_RELAXED) != 0 {
                 cudaGetLastError();
                 return None;
@@ -1035,12 +1036,20 @@ impl Run<'_> {
             if stats::logging() && big {
                 super::topo::note_capture(dev, sig::of(graph));
             }
-            if let Some(x) = update_spare(dev, nodes, clusters, graph) {
+            // `LEGION_DEBUG_SIDE_PRIO=1` (#689 round 13): node priorities, which a spare's
+            // update would not carry.
+            let prio = super::prio::apply(graph);
+            if !prio && let Some(x) = update_spare(dev, nodes, clusters, graph) {
                 cudaGraphDestroy(graph);
                 return Some(ExecCell::new(x, dev, nodes, clusters));
             }
+            let flags = if prio {
+                super::prio::INSTANTIATE_FLAG
+            } else {
+                0
+            };
             let mut exec = std::ptr::null_mut();
-            let status = cudaGraphInstantiateWithFlags(&mut exec, graph, 0);
+            let status = cudaGraphInstantiateWithFlags(&mut exec, graph, flags);
             cudaGraphDestroy(graph);
             if status != 0 || exec.is_null() {
                 cudaGetLastError();

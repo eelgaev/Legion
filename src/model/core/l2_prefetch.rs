@@ -30,6 +30,17 @@
 //! unpaced), `LEGION_DEBUG_GDN_PF_PACE=<ns>` (0: unpaced), `LEGION_DEBUG_GDN_PF_FAR=1` (as many
 //! bytes of the LM head instead, rows nobody reads before they leave L2: DRAM traffic without
 //! the data; z does not move, so the cost is z's data, not a DRAM ramp).
+//!
+//! Round 13 probes (off by default): `LEGION_DEBUG_GDN_Z_SIDE=1` runs the z projection's GEMM
+//! itself on the side stream, forked after the qkv projection, beside the small kernels, and a
+//! [`side_join`] before the gated norm brings it back ([`z_side`], [`on_side`]); the z prefetch
+//! is then left out (z starts right after qkv). `LEGION_DEBUG_SIDE_PRIO=1` (see
+//! `stage_graph::prio`) gives every kernel of a capture but the side stream's the greatest
+//! priority, so the small kernels' blocks go ahead of z's queued ones instead of waiting for
+//! z's last wave. `LEGION_DEBUG_GDN_OUT_PF=<MiB>` reads the output projection's first rows into
+//! L2 on the compute stream after the small kernels, while it waits for z ([`out_pf_bytes`]).
+//! `LEGION_DEBUG_GDN_PF_DELAY=<ns>` and `LEGION_DEBUG_GDN_PF_HOLD=<MiB>:<ns>` shape the paced
+//! prefetch ([`delay_ns`], [`hold`]).
 
 use std::sync::OnceLock;
 
@@ -54,6 +65,15 @@ static L2_JOIN: ExternalOp = ExternalOp {
     cpu: cpu_l2_prefetch,
     #[cfg(feature = "cuda")]
     cuda: Some(cuda_l2_join),
+    #[cfg(not(feature = "cuda"))]
+    cuda: None,
+};
+
+static SIDE_JOIN: ExternalOp = ExternalOp {
+    name: "side_join",
+    cpu: cpu_l2_prefetch,
+    #[cfg(feature = "cuda")]
+    cuda: Some(cuda_side_join),
     #[cfg(not(feature = "cuda"))]
     cuda: None,
 };
@@ -123,9 +143,73 @@ pub fn pace_ns() -> u32 {
 
 /// [`pace_ns`] for the switch's value `v`.
 pub fn pace_from(v: Option<&str>) -> u32 {
+    ns_or(v, GDN_Z_PACE_NS)
+}
+
+/// Nanoseconds in `v`, up to 1 ms, else `default`.
+fn ns_or(v: Option<&str>, default: u32) -> u32 {
     v.and_then(|s| s.trim().parse::<u32>().ok())
         .filter(|&ns| ns <= 1_000_000)
-        .unwrap_or(GDN_Z_PACE_NS)
+        .unwrap_or(default)
+}
+
+/// `LEGION_DEBUG_GDN_PF_DELAY=<ns>` (an A/B probe, read once; else 0, at most 1 ms): the paced
+/// prefetch's first step waits that long after the kernel ahead of the fork.
+pub fn delay_ns() -> u32 {
+    static V: OnceLock<u32> = OnceLock::new();
+    *V.get_or_init(|| delay_from(std::env::var("LEGION_DEBUG_GDN_PF_DELAY").ok().as_deref()))
+}
+
+/// [`delay_ns`] for the switch's value `v`.
+pub fn delay_from(v: Option<&str>) -> u32 {
+    ns_or(v, 0)
+}
+
+/// `LEGION_DEBUG_GDN_PF_HOLD=<MiB>:<ns>` (an A/B probe, read once; else none): once the paced
+/// prefetch has issued `<MiB>`, its next steps come `<ns>` later (at most 1 ms), so the delta
+/// rule's replay, which moves the layer's states, runs without it. (bytes, ns).
+pub fn hold() -> (usize, u32) {
+    static V: OnceLock<(usize, u32)> = OnceLock::new();
+    *V.get_or_init(|| hold_from(std::env::var("LEGION_DEBUG_GDN_PF_HOLD").ok().as_deref()))
+}
+
+/// [`hold`] for the switch's value `v`: (0, 0) unless it is `<MiB up to 64>:<ns up to 1 ms>`.
+pub fn hold_from(v: Option<&str>) -> (usize, u32) {
+    v.and_then(|s| {
+        let (m, ns) = s.trim().split_once(':')?;
+        let m = m.trim().parse::<usize>().ok().filter(|&m| m <= 64)?;
+        let ns = ns
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|&ns| ns <= 1_000_000)?;
+        Some((m << 20, ns))
+    })
+    .unwrap_or((0, 0))
+}
+
+/// `LEGION_DEBUG_GDN_OUT_PF=<MiB>` (an A/B probe with [`z_side`], read once; whole MiB up to
+/// 64, else 0): the output projection's first bytes read into L2 on the compute stream after
+/// the delta rule, while the compute stream waits for z on the side stream.
+pub fn out_pf_bytes() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| mib_or_zero(std::env::var("LEGION_DEBUG_GDN_OUT_PF").ok().as_deref()))
+}
+
+/// Whole MiB in `v` up to 64, as bytes, else 0.
+pub fn mib_or_zero(v: Option<&str>) -> usize {
+    v.and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&m| m <= 64)
+        .unwrap_or(0)
+        << 20
+}
+
+/// `LEGION_DEBUG_GDN_Z_SIDE=1` (#689 round 12-13, an A/B probe, read once): a DeltaNet layer's
+/// z projection itself runs on the side stream, forked right after the qkv projection, beside
+/// the small kernels between the two; a [`side_join`] before the gated norm brings it back.
+pub fn z_side() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("LEGION_DEBUG_GDN_Z_SIDE").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// Whether the prefetch runs on the forked side stream, joined after the layer's output
@@ -207,6 +291,36 @@ pub fn ahead<'a>(
 /// a prefetch on the compute stream it launches nothing.
 pub fn join<'a>(ctx: &'a Context, pf: Tensor<'a>, after: Tensor<'a>) -> Tensor<'a> {
     ctx.external(&L2_JOIN, types::F32, [1, 1, 1, 1], &[after, pf])
+}
+
+/// A node after which the compute stream waits for the side stream's last op (one launched
+/// through [`on_side`]), placed after `after` like [`join`]. `keep` are that op's node and its
+/// inputs: as this node's sources they stay allocated until it, so no tensor of the compute
+/// stream's work in between takes their memory while the side stream still reads or writes it.
+pub fn side_join<'a>(ctx: &'a Context, after: Tensor<'a>, keep: &[Tensor<'a>]) -> Tensor<'a> {
+    let mut srcs = vec![after];
+    srcs.extend_from_slice(keep);
+    ctx.external(&SIDE_JOIN, types::F32, [1, 1, 1, 1], &srcs)
+}
+
+/// Runs `launch` on the side stream forked from `stream` at this point, then records the side
+/// stream's done event for a [`side_join`].
+#[cfg(feature = "cuda")]
+pub(crate) fn on_side(
+    stream: *mut std::os::raw::c_void,
+    launch: impl FnOnce(*mut std::os::raw::c_void) -> Result<(), String>,
+) -> Result<(), String> {
+    let s = side::fork(stream)?;
+    launch(s)?;
+    side::done(s)
+}
+
+#[cfg(feature = "cuda")]
+unsafe fn cuda_side_join(
+    _dst: &ffi::ggml_tensor,
+    stream: *mut std::os::raw::c_void,
+) -> Result<(), String> {
+    side::join(stream)
 }
 
 unsafe fn cpu_l2_prefetch(_dst: &ffi::ggml_tensor, _ith: usize, _nth: usize) {
@@ -335,8 +449,10 @@ mod side {
         Ok(s.stream)
     }
 
-    /// Records the done event on side stream `side` behind what it holds.
+    /// Records the done event on side stream `side` behind what it holds. In a capture under
+    /// `LEGION_DEBUG_SIDE_PRIO=1`, the node just captured there keeps the least priority.
     pub(super) fn done(side: *mut c_void) -> Result<(), String> {
+        crate::ggml::stage_graph::prio::mark_side(side);
         let s = get()?;
         // SAFETY: a live event and stream of the current device.
         rt(unsafe { cudaEventRecord(s.done, side) }, "done")
@@ -432,12 +548,19 @@ mod launch {
         let mut chunk = size as i32;
         let mut late = i32::from(super::late());
         let mut pace = if pdl { 0 } else { super::pace_ns() as i32 };
+        let mut delay = super::delay_ns() as i32;
+        let (hold_at, hold_ns) = super::hold();
+        let mut hold_at = hold_at as i64;
+        let mut hold_ns = hold_ns as i32;
         let mut argv = [
             (&mut p as *mut *const u8).cast::<c_void>(),
             (&mut total as *mut i64).cast::<c_void>(),
             (&mut chunk as *mut i32).cast::<c_void>(),
             (&mut late as *mut i32).cast::<c_void>(),
             (&mut pace as *mut i32).cast::<c_void>(),
+            (&mut delay as *mut i32).cast::<c_void>(),
+            (&mut hold_at as *mut i64).cast::<c_void>(),
+            (&mut hold_ns as *mut i32).cast::<c_void>(),
         ];
         // Paced: one CTA walks the whole span.
         let ctas = match pace {
@@ -466,9 +589,9 @@ mod launch {
             attrs: &mut attr,
             num_attrs: u32::from(pdl),
         };
-        // SAFETY: the table's kernel takes (const char *, int64_t, int32_t, int32_t, int32_t),
-        // given here by pointers to the launch's copies; `base` is device memory of the
-        // stream's device.
+        // SAFETY: the table's kernel takes (const char *, int64_t, int32_t, int32_t, int32_t,
+        // int32_t, int64_t, int32_t), given here by pointers to the launch's copies; `base` is
+        // device memory of the stream's device.
         match unsafe {
             cudaLaunchKernelExC(&config, legion_l2_prefetch_kernels[0], argv.as_mut_ptr())
         } {

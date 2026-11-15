@@ -12,7 +12,7 @@
 // writes nothing, so no output changes. With `late` it issues the prefetches first and waits
 // after (still before it ends, so the kernels after it see the one ahead complete). With
 // `pace_ns` (the side stream's default) one CTA issues them a block's chunks at a time,
-// pace_ns apart (round 12).
+// pace_ns apart (round 12), with an optional start delay and one hold (round 13 probes).
 
 #include <cstdint>
 
@@ -33,15 +33,33 @@ __device__ __forceinline__ void l2_prefetch_issue(const char * p, int64_t bytes,
 #endif
 }
 
+__device__ __forceinline__ void l2_sleep_until(uint64_t until) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    uint64_t t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    while (t < until) {
+        __nanosleep(64);
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    }
+#else
+    (void) until;
+#endif
+}
+
 // Paced (#689 round 12, pace_ns > 0, one CTA): step s issues the block's chunks of bytes
 // [s * step, (s + 1) * step) (step = blockDim.x * chunk), then sleeps until pace_ns * (s + 1)
 // after its start, so the prefetches reach DRAM at step / pace_ns bytes a ns instead of as one
-// burst that the kernels beside it queue behind.
-__device__ __forceinline__ void l2_prefetch_paced(const char * p, int64_t bytes, int32_t chunk, int32_t pace_ns) {
+// burst that the kernels beside it queue behind. Round 13 probes: the first step waits delay_ns
+// after the kernel's wait returns, and once hold_at bytes are issued the steps after it wait
+// hold_ns more (a gap in the stream of prefetches, so a kernel beside it has DRAM to itself).
+__device__ __forceinline__ void l2_prefetch_paced(const char * p, int64_t bytes, int32_t chunk, int32_t pace_ns,
+                                                  int32_t delay_ns, int64_t hold_at, int32_t hold_ns) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     const int64_t step = (int64_t) blockDim.x * chunk;
     uint64_t      t0;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    t0 += (uint64_t) delay_ns;
+    l2_sleep_until(t0);
     for (int64_t off = 0, s = 1; off < bytes; off += step, ++s) {
         const int64_t i = off + (int64_t) threadIdx.x * chunk;
         if (i < bytes) {
@@ -52,28 +70,29 @@ __device__ __forceinline__ void l2_prefetch_paced(const char * p, int64_t bytes,
         if (off + step >= bytes) {
             break;
         }
-        const uint64_t until = t0 + (uint64_t) pace_ns * (uint64_t) s;
-        uint64_t       t;
-        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-        while (t < until) {
-            __nanosleep(64);
-            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        if (hold_ns > 0 && off < hold_at && off + step >= hold_at) {
+            t0 += (uint64_t) hold_ns;
         }
+        l2_sleep_until(t0 + (uint64_t) pace_ns * (uint64_t) s);
     }
 #else
     (void) p;
     (void) bytes;
     (void) chunk;
     (void) pace_ns;
+    (void) delay_ns;
+    (void) hold_at;
+    (void) hold_ns;
 #endif
 }
 
 __global__ void __launch_bounds__(32) l2_prefetch(const char * p, int64_t bytes, int32_t chunk, int32_t late,
-                                                  int32_t pace_ns) {
+                                                  int32_t pace_ns, int32_t delay_ns, int64_t hold_at,
+                                                  int32_t hold_ns) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     if (pace_ns > 0) {
         asm volatile("griddepcontrol.wait;" ::: "memory");
-        l2_prefetch_paced(p, bytes, chunk, pace_ns);
+        l2_prefetch_paced(p, bytes, chunk, pace_ns, delay_ns, hold_at, hold_ns);
         return;
     }
     if (late) {
@@ -91,6 +110,9 @@ __global__ void __launch_bounds__(32) l2_prefetch(const char * p, int64_t bytes,
     (void) chunk;
     (void) late;
     (void) pace_ns;
+    (void) delay_ns;
+    (void) hold_at;
+    (void) hold_ns;
 #endif
 }
 
