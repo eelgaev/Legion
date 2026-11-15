@@ -79,7 +79,7 @@ pub struct Row {
 }
 
 /// Deterministic values in [-1, 1).
-fn noise(n: usize, seed: u64) -> Vec<f32> {
+pub(crate) fn noise(n: usize, seed: u64) -> Vec<f32> {
     let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
     (0..n)
         .map(|_| {
@@ -93,7 +93,7 @@ fn noise(n: usize, seed: u64) -> Vec<f32> {
 
 /// `bytes` (whole rows of `k` values) of Q4_K weights: ggml's quantization of up to ~1 MiB of
 /// rows of noise, repeated; `seed` picks them.
-fn weights(bytes: usize, k: usize, seed: u64) -> Vec<u8> {
+pub(crate) fn weights(bytes: usize, k: usize, seed: u64) -> Vec<u8> {
     let row = k / QK_K * Q4_K_BYTES;
     let rows = (bytes / row).clamp(1, (1 << 20) / row);
     let f: Vec<f32> = noise(rows * k, seed).iter().map(|v| 0.05 * v).collect();
@@ -225,7 +225,7 @@ pub struct Check {
 }
 
 /// FNV-1a over the bits of `v`.
-fn hash(v: &[f32]) -> u64 {
+pub(crate) fn hash(v: &[f32]) -> u64 {
     v.iter()
         .flat_map(|f| f.to_bits().to_le_bytes())
         .fold(0xcbf2_9ce4_8422_2325, |h, b| {
