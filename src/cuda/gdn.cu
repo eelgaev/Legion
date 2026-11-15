@@ -547,22 +547,33 @@ __global__ void spec_window_kernel(const legion_spec_window p) {
     p.dst[s * p.d2 + r * p.d1 + j] = p.src[s * p.s2 + r * p.s1 + keep + j];
 }
 
-// spec_window_kernel with the grid's y the pair: one launch for every layer.
+// Elements of one slot's window a thread of spec_windows_kernel copies.
+constexpr int SPEC_WINDOWS_PER_THREAD = 4;
+
+// spec_window_kernel's copy with the grid's y the pair (one launch for every layer) and a block
+// covering a range of one slot's elements for every slot in turn: a slot keeping nothing costs a
+// block one read of its count, not blocks of its own. A per-element grid over all slots ran ~10
+// µs a layer at one busy slot of 16 on a GB10, nearly all of it scheduling idle slots' blocks.
 __global__ void spec_windows_kernel(const legion_spec_window p, const uint64_t * table) {
-    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= p.w * p.rows * p.n) {
-        return;
-    }
-    const int64_t j = i % p.w;
-    const int64_t r = (i / p.w) % p.rows;
-    const int64_t s = i / (p.w * p.rows);
-    const int64_t keep = p.keep[s];
-    if (keep <= 0) {
-        return;
-    }
     const float * src = (const float *) table[2 * blockIdx.y];
     float * dst = (float *) table[2 * blockIdx.y + 1];
-    dst[s * p.d2 + r * p.d1 + j] = src[s * p.s2 + r * p.s1 + keep + j];
+    const int64_t per_slot = p.w * p.rows;
+    const int64_t base = (int64_t) blockIdx.x * blockDim.x * SPEC_WINDOWS_PER_THREAD + threadIdx.x;
+    for (int64_t s = 0; s < p.n; ++s) {
+        const int64_t keep = p.keep[s];
+        if (keep <= 0) {
+            continue;
+        }
+#pragma unroll
+        for (int e = 0; e < SPEC_WINDOWS_PER_THREAD; ++e) {
+            const int64_t i = base + (int64_t) e * blockDim.x;
+            if (i < per_slot) {
+                const int64_t j = i % p.w;
+                const int64_t r = i / p.w;
+                dst[s * p.d2 + r * p.d1 + j] = src[s * p.s2 + r * p.s1 + keep + j];
+            }
+        }
+    }
 }
 
 cudaError_t gdn_replay_dispatch(const legion_gdn & p, dim3 grid, dim3 block, cudaStream_t st) {
@@ -1227,12 +1238,13 @@ extern "C" int legion_spec_windows_launch(const legion_spec_window * p, const ui
         layers > 65535) {
         return -1;
     }
-    const int64_t total = p->w * p->rows * p->n;
-    if (total == 0 || layers == 0) {
+    const int64_t per_slot = p->w * p->rows;
+    if (per_slot == 0 || p->n == 0 || layers == 0) {
         return 0;
     }
     const int threads = 256;
-    const int64_t blocks = (total + threads - 1) / threads;
+    const int64_t per_block = (int64_t) threads * SPEC_WINDOWS_PER_THREAD;
+    const int64_t blocks = (per_slot + per_block - 1) / per_block;
     if (blocks > 0x7fffffff) {
         return -1;
     }
