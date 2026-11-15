@@ -30,6 +30,16 @@
 //! unpaced), `LEGION_DEBUG_GDN_PF_PACE=<ns>` (0: unpaced), `LEGION_DEBUG_GDN_PF_FAR=1` (as many
 //! bytes of the LM head instead, rows nobody reads before they leave L2: DRAM traffic without
 //! the data; z does not move, so the cost is z's data, not a DRAM ramp).
+//!
+//! Round 13: where it applies (an FP8 z, [`takes`]), the z projection's GEMM itself runs on the
+//! side stream instead, forked after the qkv projection, beside the small kernels, and a
+//! [`side_join`] before the gated norm brings it back ([`z_side`], [`on_side`]); the z prefetch
+//! is then left out (z starts right after qkv). The stage graph gives every kernel of such a
+//! capture but the side stream's the greatest priority (`stage_graph::prio`), so the small
+//! kernels' blocks go ahead of z's queued ones instead of waiting for z's last wave. Measured
+//! on a GB10: z 134 -> 166 us beside the small kernels, out_proj 135 -> 152 us (it now pays the
+//! cold start), the layer from qkv's end to out_proj's end 345 -> 330 us, -0.5 to -1.0 ms a
+//! verify step. `LEGION_DEBUG_GDN_Z_SIDE=0` goes back to the paced z prefetch (an A/B probe).
 
 use std::sync::OnceLock;
 
@@ -54,6 +64,15 @@ static L2_JOIN: ExternalOp = ExternalOp {
     cpu: cpu_l2_prefetch,
     #[cfg(feature = "cuda")]
     cuda: Some(cuda_l2_join),
+    #[cfg(not(feature = "cuda"))]
+    cuda: None,
+};
+
+static SIDE_JOIN: ExternalOp = ExternalOp {
+    name: "side_join",
+    cpu: cpu_l2_prefetch,
+    #[cfg(feature = "cuda")]
+    cuda: Some(cuda_side_join),
     #[cfg(not(feature = "cuda"))]
     cuda: None,
 };
@@ -126,6 +145,20 @@ pub fn pace_from(v: Option<&str>) -> u32 {
     v.and_then(|s| s.trim().parse::<u32>().ok())
         .filter(|&ns| ns <= 1_000_000)
         .unwrap_or(GDN_Z_PACE_NS)
+}
+
+/// Whether a DeltaNet layer's z projection itself runs on the side stream, forked right after
+/// the qkv projection, beside the small kernels between the two, a [`side_join`] before the
+/// gated norm bringing it back (#689 round 13): yes unless `LEGION_DEBUG_GDN_Z_SIDE=0` (an A/B
+/// probe: the paced z prefetch instead); read once.
+pub fn z_side() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| z_side_from(std::env::var("LEGION_DEBUG_GDN_Z_SIDE").ok().as_deref()))
+}
+
+/// [`z_side`] for the switch's value `v`.
+pub fn z_side_from(v: Option<&str>) -> bool {
+    !v.is_some_and(|v| v.trim() == "0")
 }
 
 /// Whether the prefetch runs on the forked side stream, joined after the layer's output
@@ -207,6 +240,38 @@ pub fn ahead<'a>(
 /// a prefetch on the compute stream it launches nothing.
 pub fn join<'a>(ctx: &'a Context, pf: Tensor<'a>, after: Tensor<'a>) -> Tensor<'a> {
     ctx.external(&L2_JOIN, types::F32, [1, 1, 1, 1], &[after, pf])
+}
+
+/// A node after which the compute stream waits for the side stream's last op (one launched
+/// through [`on_side`]), placed after `after` like [`join`]. `keep` are that op's node and its
+/// inputs: as this node's sources they stay allocated until it, so no tensor of the compute
+/// stream's work in between takes their memory while the side stream still reads or writes it.
+pub fn side_join<'a>(ctx: &'a Context, after: Tensor<'a>, keep: &[Tensor<'a>]) -> Tensor<'a> {
+    let mut srcs = vec![after];
+    srcs.extend_from_slice(keep);
+    ctx.external(&SIDE_JOIN, types::F32, [1, 1, 1, 1], &srcs)
+}
+
+/// Runs `launch` on the side stream forked from `stream` at this point, then records the side
+/// stream's done event for a [`side_join`]. In a capture, the node(s) `launch` captured keep the
+/// least priority (`stage_graph::prio`).
+#[cfg(feature = "cuda")]
+pub(crate) fn on_side(
+    stream: *mut std::os::raw::c_void,
+    launch: impl FnOnce(*mut std::os::raw::c_void) -> Result<(), String>,
+) -> Result<(), String> {
+    let s = side::fork(stream)?;
+    launch(s)?;
+    crate::ggml::stage_graph::prio::mark_side(s);
+    side::done(s)
+}
+
+#[cfg(feature = "cuda")]
+unsafe fn cuda_side_join(
+    _dst: &ffi::ggml_tensor,
+    stream: *mut std::os::raw::c_void,
+) -> Result<(), String> {
+    side::join(stream)
 }
 
 unsafe fn cpu_l2_prefetch(_dst: &ffi::ggml_tensor, _ith: usize, _nth: usize) {
