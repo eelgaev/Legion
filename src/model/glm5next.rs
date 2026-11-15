@@ -890,6 +890,42 @@ impl Model {
         let hp = &self.hp;
         let e = hp.n_embd;
         let mut res = ctx.reshape_3d(x, e, p.hc, pass.n);
+        // `--tp-seq-par` (#560 r7, Flash-Next's #751 for GLM): in a big step of the whole model
+        // over machines, each rank keeps its share of the tokens' streams and runs the
+        // hyper-connection mixers, the sublayers' norms and the combines on those only. Each
+        // sublayer's input is gathered from every rank's share, and its partial output
+        // reduce-scattered back to them (the same bytes as the all-reduce). Not with the SSD
+        // router lookahead (it mixes the next layer's streams) or a trace.
+        let sp = if tap.on
+            || self.ssd_experts().is_some()
+            || layers.start != 0
+            || layers.end != hp.n_layer
+        {
+            None
+        } else {
+            self.tp_seq_par(pass.n)
+        };
+        let n_all = pass.n;
+        if let Some((_, rank, ranks)) = sp {
+            let (a, m) = crate::tp_net::seq_par::share(n_all as usize, rank, ranks);
+            let flat = ctx.reshape_2d(res, e * p.hc, n_all);
+            let mine = ctx.view_2d(flat, [e * p.hc, m as i64], flat.nb()[1], a * flat.nb()[1]);
+            res = ctx.reshape_3d(ctx.cont(mine), e, p.hc, m as i64);
+        }
+        // A sublayer's input from every rank's share of the tokens, and its partial output
+        // summed: over the ranks for every token, or with `sp` for this rank's share only.
+        let gather = |h: Tensor<'a>| match sp {
+            Some((c, ..)) => crate::tp_net::seq_par::all_gather(ctx, c, h, n_all),
+            None => h,
+        };
+        let sum = |x: Tensor<'a>| match sp {
+            // (A reduce-scatter takes `[row, tokens]`; a sublayer may give `[row, n_tok, seqs]`.)
+            Some(_) => {
+                let x = if x.is_contiguous() { x } else { ctx.cont(x) };
+                self.tp_sum_split(ctx, ctx.reshape_2d(x, e, n_all), sp)
+            }
+            None => self.tp_sum(ctx, x),
+        };
         // The most tensors a layer has taken, for the room a chunked SSD step may use (#1205).
         let mut most = 0;
         for il in layers.clone() {
@@ -897,21 +933,27 @@ impl Model {
             let (pre, h) = self.glm_hc_pre(ctx, il, "attn", res)?;
             tap.tap("hc_attn_pre", il, pre.y);
             tap.tap("attn_norm", il, h);
+            let h = gather(h);
             let out = if p.mla[il] {
-                self.glm_dsa(pass, il, h)?
+                self.glm_dsa_on(pass, il, h, Part::WHOLE, sp)?
             } else {
                 self.glm_kda(pass, il, h)?
             };
+            // Tensor parallelism over machines (#560, `tp_net::shard::glm5`): this rank's heads'
+            // partial output, summed over the ranks.
+            let out = sum(out);
             res = ops::hc_post(ctx, out, None, res, &pre);
             tap.tap("hc_attn_post", il, res);
 
             let (pre, h) = self.glm_hc_pre(ctx, il, "ffn", res)?;
             tap.tap("hc_ffn_pre", il, pre.y);
             tap.tap("ffn_norm", il, h);
+            let h = gather(h);
             res = if il < p.n_dense {
                 // The first MoE layer's router lookahead (#611) from the last dense layer.
                 self.glm_ssd_predict(pass, il + 1, h, Predictor::PostAttn, None)?;
                 let out = self.glm_ffn(ctx, il, "", p.clamp_shexp[il], h)?;
+                let out = sum(out);
                 tap.tap("ffn_out", il, out);
                 ops::hc_post(ctx, out, None, res, &pre)
             } else {
@@ -925,7 +967,13 @@ impl Model {
                 tap.tap("ffn_moe_out", il, moe);
                 let sh = self.glm_ffn(ctx, il, "_shexp", p.clamp_shexp[il], h)?;
                 tap.tap("ffn_shexp", il, sh);
-                ops::hc_post(ctx, moe, Some(sh), res, &pre)
+                if self.tp_on() {
+                    // This rank's rows of the routed and the shared experts: one sum of both.
+                    let ffn = sum(ops::add(ctx, moe, sh));
+                    ops::hc_post(ctx, ffn, None, res, &pre)
+                } else {
+                    ops::hc_post(ctx, moe, Some(sh), res, &pre)
+                }
             };
             tap.tap("l_out", il, res);
             // The router lookahead from this layer's output (#611 trace, --ssd-prefetch
@@ -945,6 +993,18 @@ impl Model {
         if layers.end != hp.n_layer {
             // The next stage's input is [n_embd · hc, n].
             return Ok(ctx.reshape_2d(res, e * p.hc, pass.n));
+        }
+        if let Some((c, ..)) = sp {
+            // The head input of this rank's tokens, gathered from every rank's share, then the
+            // output rows' (as the cropped head gives them, the MTP capture's way).
+            let mine = ops::hc_head(ctx, res, None, self.w("output_norm.weight")?, hp.rms_eps);
+            let x = crate::tp_net::seq_par::all_gather(ctx, c, mine, n_all);
+            let x = match pass.out_rows.filter(|_| !all_rows) {
+                Some(rows) => ops::get_cols(ctx, x, rows),
+                None => x,
+            };
+            tap.tap("result_norm", 0, x);
+            return Ok(x);
         }
         let x = ops::hc_head(
             ctx,
@@ -1596,18 +1656,21 @@ impl Model {
         il: usize,
         x: Tensor<'a>,
     ) -> Result<Tensor<'a>, ModelError> {
-        self.glm_dsa_on(pass, il, x, Part::WHOLE)
+        self.glm_dsa_on(pass, il, x, Part::WHOLE, None)
     }
 
     /// [`Self::glm_dsa`] as `part` reads it: every GPU caches every latent and indexer row and
     /// selects the same positions; a GPU's share of the heads attends, its output projection
-    /// giving a partial sum ([`par`]).
+    /// giving a partial sum ([`par`]). With `sp` (`--tp-seq-par`, [`Self::glm_layers`]) each
+    /// rank scores and selects for its share of a big group's tokens only, and the ranks
+    /// all-gather the selections.
     pub(crate) fn glm_dsa_on<'a>(
         &'a self,
         pass: &Pass<'a>,
         il: usize,
         x: Tensor<'a>,
         part: Part<'_>,
+        sp: Option<(i32, usize, usize)>,
     ) -> Result<Tensor<'a>, ModelError> {
         let (ctx, tap) = (pass.ctx, &pass.tap);
         let p = self.glm();
@@ -1707,8 +1770,36 @@ impl Model {
             pass.graph.borrow_mut().expand(pk);
             let pos = ctx.view_2d(pass.pos, [ng, 1], ng as usize * es, off as usize * es);
             let n_top = (sh.n_pool as i64).min((p.top_k / p.kpool) as i64);
+            // `--tp-seq-par` (#560 r9): in a group of at least its tokens, each rank scores the
+            // pools, picks the best and lists the positions for its share of the group's tokens
+            // only (each rank's per-token work, which the mirrored graph does for every token on
+            // every rank), then the ranks all-gather the selection rows, exactly (I32). Each
+            // token's row is its own, so every rank attends over the same rows as without.
+            // The indexer's query and head weights stay over every token (their products'
+            // kernels go by the token count).
+            let gsp = sp.and_then(|_| self.tp_seq_par(ng));
             let sel = if sh.pick_all && !tap.on {
                 qsa_attn::select_all(ctx, inp.pool_vis, n_top, inp.pool_idxs, inp.tail_idxs, pos)
+            } else if let Some((c, rank, ranks)) = gsp {
+                let (a, m) = crate::tp_net::seq_par::share(ng as usize, rank, ranks);
+                let (a, m) = (a as i64, m as i64);
+                let t0 = off + a;
+                let qnb = iq.nb();
+                let qg = ctx.view_3d(iq, [di, ih, m], [qnb[1], qnb[2]], t0 as usize * qnb[2]);
+                let score = qsa_attn::scores(
+                    ctx,
+                    qg,
+                    pooled,
+                    cols(ctx, iw, t0, m),
+                    cols(ctx, inp.pool_vis, a, m),
+                    Some(inp.pool_bias),
+                    Some(inp.pool_cells),
+                );
+                let top = qsa_attn::top_k(ctx, score, n_top);
+                let pm = ctx.view_2d(pass.pos, [m, 1], m as usize * es, t0 as usize * es);
+                let tail = cols(ctx, inp.tail_idxs, a, m);
+                let mine = qsa_attn::select(ctx, top, score, inp.pool_idxs, tail, pm);
+                crate::tp_net::seq_par::all_gather_i32(ctx, c, mine, ng)
             } else {
                 let qnb = iq.nb();
                 let qg = ctx.view_3d(iq, [di, ih, ng], [qnb[1], qnb[2]], off as usize * qnb[2]);

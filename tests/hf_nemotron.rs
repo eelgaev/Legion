@@ -447,7 +447,11 @@ fn raw_fp8_runs_close_to_bf16_dequantized() {
         (Fp8Mode::Bf16, Fp8Act::A16),
         (Fp8Mode::Raw, Fp8Act::A8),
     ] {
-        let g = GgufFile::open_with(dir.path(), &OpenOptions { fp8 }).unwrap();
+        let opts = OpenOptions {
+            fp8,
+            ..Default::default()
+        };
+        let g = GgufFile::open_with(dir.path(), &opts).unwrap();
         let mut model = Model::load(&g, |_| backend.buffer_type()).unwrap();
         model.set_fp8_act(act);
         let nm = legion::model::nemotron_h::params(&model.hp).unwrap();

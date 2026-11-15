@@ -509,6 +509,45 @@ fn direct_defaults_to_a_deep_read_queue() {
     assert!(t.fetch(&picks).unwrap() == want(&rows, &picks));
 }
 
+/// The I/O threads take a fetch's reads before the prefetches' queued earlier, each kind in
+/// asking order; the FIFO switch keeps every read in asking order.
+#[test]
+fn fetch_reads_go_before_queued_prefetches() {
+    let pending = Arc::new(Pending {
+        state: Mutex::new(PendingState {
+            jobs: 0,
+            aio_jobs: 0,
+            out: Vec::new(),
+            row_bytes: 90,
+            error: None,
+        }),
+        done: Condvar::new(),
+    });
+    let jobs = |offsets: &[u64]| -> Vec<Job> {
+        offsets
+            .iter()
+            .map(|&offset| Job {
+                offset,
+                len: PAGE as usize,
+                uses: Vec::new(),
+                pending: pending.clone(),
+            })
+            .collect()
+    };
+    let order = |fifo: bool| {
+        let mut q = Jobs::default();
+        q.push(jobs(&[10, 11]), false, fifo);
+        q.push(jobs(&[20, 21]), true, fifo);
+        q.push(jobs(&[12]), false, fifo);
+        q.push(jobs(&[22]), true, fifo);
+        std::iter::from_fn(|| q.pop())
+            .map(|j| j.offset)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(order(false), [20, 21, 22, 10, 11, 12]);
+    assert_eq!(order(true), [10, 11, 20, 21, 12, 22]);
+}
+
 /// `keep_awake_ms` (#835): while fetches come, the direct tier reads a page whenever no read went
 /// out for that long; a second after the last fetch it stops, and the next fetch starts it again.
 /// The rows stay the file's. 0 reads nothing.

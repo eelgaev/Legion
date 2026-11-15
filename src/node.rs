@@ -26,7 +26,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// Frames before this version are refused: both ranks must run the same build.
-const VERSION: u32 = 6;
+const VERSION: u32 = 7;
 
 /// The node settings of a `legion serve` (`--node-rank`, `--node-peer`, `--node-split`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,6 +170,14 @@ pub enum Request {
     TpCommit {
         commits: Vec<(u32, u32)>,
     },
+    /// Start reading the per-layer table rows (n-gram or Engram) of a prompt's next chunk
+    /// `tokens`, which follow `before` (the prompt's last tokens before them), as rank 0
+    /// starts its own (#1176): sent before the step of the current chunk, whose fill does not
+    /// wait for them. A hint: the rows are the same bytes either way.
+    TpPrefetch {
+        before: Vec<u32>,
+        tokens: Vec<u32>,
+    },
     /// The MTP drafts after the last step (`--spec mtp` over two nodes, #560): rank 1 holds the
     /// head and the residual rows the step captured, so only the sequences go over the link.
     /// `p_min` (as bits): the head confidence under which a sequence stops drafting.
@@ -267,6 +275,7 @@ const K_TP_MTP_CHAIN: u32 = 12;
 const K_TP_MTP_ROWS: u32 = 13;
 const K_DRAFT: u32 = 14;
 const K_DRAFT_RELEASE: u32 = 15;
+const K_TP_PREFETCH: u32 = 16;
 const R_HELLO: u32 = 101;
 const R_DONE: u32 = 102;
 const R_STEP: u32 = 103;
@@ -514,6 +523,11 @@ impl Request {
                 }
                 K_TP_COMMIT
             }
+            Request::TpPrefetch { before, tokens } => {
+                put_u32s(&mut head, &before);
+                put_u32s(&mut head, &tokens);
+                K_TP_PREFETCH
+            }
             Request::Draft { reqs, p_min } => {
                 put_u32(&mut head, p_min);
                 put_u32(&mut head, reqs.len() as u32);
@@ -621,6 +635,10 @@ impl Request {
                 }
                 Request::TpCommit { commits }
             }
+            K_TP_PREFETCH => Request::TpPrefetch {
+                before: r.u32s()?,
+                tokens: r.u32s()?,
+            },
             K_DRAFT => {
                 let p_min = r.u32()?;
                 let n = r.u32()? as usize;
@@ -853,6 +871,10 @@ pub struct LinkTimes {
     pub drafts: u64,
     pub draft_remote_ms: f64,
     pub draft_link_ms: f64,
+    /// Draft rounds not waited for (take-ins only, read with a later reply) and rank 1's
+    /// milliseconds on them, which the later reply's wait includes.
+    pub take_ins: u64,
+    pub take_in_remote_ms: f64,
 }
 
 /// Rank 0's end of the connection.
@@ -962,6 +984,10 @@ impl Link {
                     self.times.drafts += 1;
                     self.times.draft_remote_ms += f64::from(*ms);
                     self.times.draft_link_ms += waited(*ms);
+                }
+                Reply::Drafts { ms, .. } => {
+                    self.times.take_ins += 1;
+                    self.times.take_in_remote_ms += f64::from(*ms);
                 }
                 _ => {}
             }

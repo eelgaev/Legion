@@ -670,6 +670,36 @@ pub fn drafts_with_mtp_head(spec: &SpecConfig) -> bool {
         && spec.token_drafter.is_none()
 }
 
+/// The safetensors checkpoint options of a load. Over two nodes with the MTP head drafting
+/// (#560), GLM-5.3-Flash's BF16 MTP experts load as NVFP4 (~10 GiB less on rank 1, so the split
+/// MTP off takes fits with the head): only the drafter reads them, and greedy verify keeps the
+/// target's tokens. Under tensor parallelism over machines too: each rank then holds its rows of
+/// the NVFP4 experts (~3.4 GiB less per rank on two Sparks than its rows in BF16).
+/// `LEGION_DEBUG_NODE_MTP_BF16=1` keeps them BF16, for A/B.
+fn hf_options(cfg: &LmConfig) -> crate::hf::OpenOptions {
+    let bf16 = std::env::var_os("LEGION_DEBUG_NODE_MTP_BF16").is_some_and(|v| v == "1");
+    let split = cfg.node.is_some() || cfg.tp_net.is_some();
+    crate::hf::OpenOptions {
+        fp8: cfg.hf_fp8,
+        mtp_nvfp4: split && drafts_with_mtp_head(&cfg.spec) && !bf16,
+    }
+}
+
+/// Whether the depth policy may draft for a group of decoding sequences that leaves the
+/// pipeline while another is in flight (`piped_remote`: on rank 0 of a model over two nodes,
+/// #560). It may not: the two ranks' pieces of a round take about as long as each other, so a
+/// verify step's extra rows cost about what they return in tokens, and the draft round adds
+/// to the round after both (GLM-5.3-Flash NVFP4 on two Sparks at 4 users: 15.3 tok/s drafting
+/// against 18.5 without). `LEGION_DEBUG_NODE_GROUP_DRAFTS=1` lets the policy choose (the old
+/// behaviour, for A/B). Whole steps (fewer sequences than groups form at) draft as before.
+fn groups_drafts(piped_remote: bool) -> bool {
+    static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !piped_remote
+        || *OLD.get_or_init(|| {
+            std::env::var_os("LEGION_DEBUG_NODE_GROUP_DRAFTS").is_some_and(|v| v == "1")
+        })
+}
+
 /// Why `--glm-parallel-decode` cannot draft as `spec` asks (none when it can): no drafting, or
 /// GLM's own MTP head (on the last GPU, #669). Other drafters are not wired to the parallel
 /// steps.
@@ -3773,8 +3803,7 @@ impl LmEngine {
                  paged-out memory stays local"
             );
         }
-        let hf = crate::hf::OpenOptions { fp8: cfg.hf_fp8 };
-        let gguf = GgufFile::open_with(&cfg.model_path, &hf)?;
+        let gguf = GgufFile::open_with(&cfg.model_path, &hf_options(&cfg))?;
         // Tensor parallelism over machines (#619): this rank's share of every layer, and the
         // connections to the other ranks.
         let (gguf, mut tp_start) = tp_node::start(&cfg, gguf)?;
@@ -4179,7 +4208,10 @@ impl LmEngine {
             let head = match cfg.spec.draft.as_ref() {
                 Some(path) => GgufFile::open(path)?,
                 None if cfg.model_path.is_dir() => {
-                    let hf = crate::hf::OpenOptions { fp8: cfg.hf_fp8 };
+                    let hf = crate::hf::OpenOptions {
+                        fp8: cfg.hf_fp8,
+                        ..Default::default()
+                    };
                     crate::hf::open_mtp(&cfg.model_path, &hf)?
                 }
                 None => {
@@ -7658,6 +7690,8 @@ impl Worker {
                     .model()
                     .prefetch_ngram_next(&s.prompt[..end], next);
                 self.exec.model().prefetch_engram(&s.prompt[..end], next);
+                // The other ranks of tensor parallelism read theirs too, before this step.
+                self.exec.tp_prefetch_rows(&s.prompt[..end], next);
             }
         }
         // A step of one prompt's chunk alone builds the next chunk's graph while it computes
@@ -8298,8 +8332,12 @@ impl Worker {
                 .map(|&i| prefilling[i].n_past)
                 .fold(span, usize::max);
             // The depth policy's choice for every sequence that drafts now (one verify shape).
+            // Decoding groups in flight over two machines (#560): no drafts ([`groups_drafts`]).
+            let piped_remote = self.exec.has_remote() && self.exec.pipe_in_flight() > 0;
             let chosen = self.depth.as_mut().map(|d| {
-                if crate::spec::adaptive::cost_model_gated(draft_batch, &self.spec_config) {
+                if crate::spec::adaptive::cost_model_gated(draft_batch, &self.spec_config)
+                    || !groups_drafts(piped_remote)
+                {
                     return (0, self.spec_config.p_min);
                 }
                 // The head's ceiling (`--spec-k`; `k` may be the n-gram's deeper one).

@@ -105,6 +105,27 @@ pub(super) fn balanced_split(bytes: &[u64], first: u64, last: u64) -> usize {
         .unwrap_or(1)
 }
 
+/// The automatic split: balanced by the bytes a step reads (the layers, rank 0's embeddings,
+/// rank 1's output norm and head). A drafting MTP head (`mtp`) runs on rank 1 between steps,
+/// not in the pipelined rounds of several groups, where the slower rank sets the pace (#560):
+/// its layer and its copy of the embeddings count for the fit only, so the split is the one
+/// without drafting. `head_counts`: they count here too (the split before #560 round 4, for
+/// A/B), which gives rank 0 more layers.
+pub(super) fn auto_split(
+    tensors: &[TensorInfo],
+    n_layer: usize,
+    mtp: bool,
+    head_counts: bool,
+) -> usize {
+    let (bytes, first, last) = byte_shares(tensors, n_layer, mtp && head_counts);
+    balanced_split(&bytes, first, last)
+}
+
+/// `LEGION_DEBUG_NODE_SPLIT_HEAD=1`: [`auto_split`] counts a drafting MTP head's bytes.
+fn split_counts_head() -> bool {
+    std::env::var_os("LEGION_DEBUG_NODE_SPLIT_HEAD").is_some_and(|v| v == "1")
+}
+
 /// The split closest to balanced under which both ranks fit in `room` bytes each (`None`: no
 /// split does).
 pub(super) fn fitting_split(bytes: &[u64], first: u64, last: u64, room: u64) -> Option<usize> {
@@ -124,11 +145,11 @@ fn gib(b: u64) -> f64 {
 }
 
 impl Share {
-    /// This rank's share of the model's layers: at `--node-split`, else balanced by the
-    /// layers' bytes. Every tensor of the share must fit in `free` bytes of device memory
-    /// (no SSD or host tier over two nodes): if not, the error names a split that would fit.
-    /// With `mtp` (the MTP head drafts) rank 1's share counts the head's layer and its copy of
-    /// the embeddings.
+    /// This rank's share of the model's layers: at `--node-split`, else [`auto_split`] (from
+    /// the model's tensors only, so both ranks pick the same one). Every tensor of the share
+    /// must fit in `free` bytes of device memory (no SSD or host tier over two nodes): if not,
+    /// the error names a split that would fit. With `mtp` (the MTP head drafts) rank 1's share
+    /// holds the head's layer and its copy of the embeddings.
     pub fn plan(
         node: &NodeConfig,
         hp: &Hparams,
@@ -152,7 +173,7 @@ impl Share {
                 )));
             }
             Some(s) => s,
-            None => balanced_split(&bytes, first, last),
+            None => auto_split(tensors, n, mtp, split_counts_head()),
         };
         let (b0, b1) = rank_bytes(&bytes, first, last, split);
         let need = if node.rank == 0 { b0 } else { b1 };
@@ -269,12 +290,110 @@ pub(super) fn follow(
     LoadError::Device(format!("node rank 1 stopped listening: {r:?}"))
 }
 
+/// A decode-sized take-in (at most this many positions, no drafts) waits on rank 1
+/// ([`Follower::drafts`]).
+pub(super) const WAIT_RAN: usize = super::spec::TAKE_IN_TAIL;
+/// Positions a sequence's take-ins wait for at most: past these they run as one.
+pub(super) const WAIT_POSITIONS: usize = 256;
+
+/// A sequence's take-ins of the MTP head that rank 1 has not run yet ([`Follower::drafts`]):
+/// its positions `start..` with their tokens and the target's rows.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct Waiting {
+    pub seq: u64,
+    /// The first position not taken in.
+    pub start: usize,
+    /// The position of `tokens[0]`.
+    pub base: usize,
+    /// The sequence's tokens from `base` on.
+    pub tokens: Vec<u32>,
+    /// The target's rows at the positions from `start` on, `w` floats each.
+    pub hidden: Vec<f32>,
+    /// The sequence's block table and ring, as its last request gave them.
+    pub blocks: Vec<u32>,
+    pub ring: usize,
+}
+
+impl Waiting {
+    /// Positions held.
+    pub fn len(&self, w: usize) -> usize {
+        self.hidden.len() / w.max(1)
+    }
+
+    /// These positions followed by a take-in of `hidden` at `start..` (tokens `tokens` from
+    /// `base`), when it starts within them or right after them: positions it runs again are
+    /// its own (as a take-in rewrites them). Else `Err(self)`.
+    pub fn join(
+        mut self,
+        start: usize,
+        base: usize,
+        tokens: &[u32],
+        hidden: &[f32],
+        w: usize,
+    ) -> Result<Self, Self> {
+        let end = self.start + self.len(w);
+        if start < self.start || start > end || base < self.base {
+            return Err(self);
+        }
+        let keep = base - self.base;
+        if keep > self.tokens.len() {
+            return Err(self);
+        }
+        self.hidden.truncate((start - self.start) * w);
+        self.hidden.extend_from_slice(hidden);
+        self.tokens.truncate(keep);
+        self.tokens.extend_from_slice(tokens);
+        Ok(self)
+    }
+
+    /// Its tokens at their positions (zeros before `base`), as a draft request reads them.
+    fn positioned(&self) -> Vec<u32> {
+        let mut v = vec![0u32; self.base];
+        v.extend_from_slice(&self.tokens);
+        v
+    }
+}
+
+/// `LEGION_DEBUG_NODE_TAKE_IN_NOW=1`: rank 1 runs every MTP take-in when it comes
+/// ([`Follower::drafts`]).
+fn take_in_now() -> bool {
+    static NOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NOW.get_or_init(|| std::env::var_os("LEGION_DEBUG_NODE_TAKE_IN_NOW").is_some_and(|v| v == "1"))
+}
+
+/// Runs the head's take-in of the waiting positions `takes` (no drafts); returns its passes.
+fn take_in(
+    d: &mut MtpDrafter,
+    exec: &mut Executor,
+    takes: &[Waiting],
+    w: usize,
+) -> Result<usize, String> {
+    let tokens: Vec<Vec<u32>> = takes.iter().map(Waiting::positioned).collect();
+    let mut outs = vec![Draft::default(); takes.len()];
+    let mut batch: Vec<DraftRequest<'_>> = (takes.iter().zip(&tokens).zip(&mut outs))
+        .map(|((t, tokens), out)| DraftRequest {
+            seq: t.seq,
+            tokens,
+            start: t.start,
+            ran: t.len(w),
+            hidden: vec![t.hidden.as_slice()],
+            max: 0,
+            out,
+        })
+        .collect();
+    let blocks: Vec<&[u32]> = takes.iter().map(|t| t.blocks.as_slice()).collect();
+    let rings: Vec<usize> = takes.iter().map(|t| t.ring).collect();
+    d.step(exec, &mut batch, &blocks, &rings)
+}
+
 /// Rank 1's executor and what it keeps between rank 0's requests.
 pub(super) struct Follower {
     pub exec: Executor,
     /// The MTP head's driver (`--spec mtp`, #560): it drafts here, from the rows the last step
     /// captured, so neither those rows nor the head cross the link.
     drafter: Option<MtpDrafter>,
+    /// Per sequence: its take-ins waiting ([`Self::drafts`]).
+    waiting: std::collections::HashMap<u64, Waiting>,
     /// The captured rows of the last step ([`crate::model::core::StepOutput::hidden`]).
     last_hidden: Vec<Vec<f32>>,
     /// The model's layer count and the split.
@@ -295,6 +414,7 @@ impl Follower {
         Self {
             exec,
             drafter,
+            waiting: std::collections::HashMap::new(),
             last_hidden: Vec::new(),
             mine,
             blocks: n_blocks,
@@ -302,6 +422,16 @@ impl Follower {
     }
 
     /// The MTP drafts of `reqs` from the last step's rows.
+    ///
+    /// A request that only takes in a decode step's few positions ([`WAIT_RAN`], no drafts)
+    /// waits ([`Waiting`]): its positions join the sequence's next take-in, so one head pass
+    /// takes in many steps. Rank 1 runs a round after its share of the step, so while decoding
+    /// groups are in flight (#560), which then draft nothing, each round's take-in would run
+    /// on the path of every round (~18 ms of a ~110 ms round at 4 users on two Sparks). The
+    /// positions run when the sequence drafts again, when [`WAIT_POSITIONS`] wait, or when it
+    /// ends ([`Request::DraftRelease`]): the head's caches hold the same positions when it
+    /// next reads them. A head sharing the target's caches takes in at once.
+    /// `LEGION_DEBUG_NODE_TAKE_IN_NOW=1`: every take-in at once (the old behaviour, for A/B).
     fn drafts(&mut self, reqs: Vec<WireDraft>, p_min: f32) -> Result<Reply, String> {
         let t = std::time::Instant::now();
         let d = self.drafter.as_mut().ok_or(
@@ -309,46 +439,101 @@ impl Follower {
         )?;
         d.set_p_min(p_min);
         let w = self.exec.mtp_width();
+        let may_wait = !self.exec.mtp_shares_kv() && !take_in_now();
         let rows = self.last_hidden.first().map_or(&[][..], Vec::as_slice);
-        // Each sequence's tokens at their positions (none needed before `base`).
-        let tokens: Vec<Vec<u32>> = reqs
-            .iter()
-            .map(|r| {
-                let mut v = vec![0u32; r.base as usize];
-                v.extend_from_slice(&r.tokens);
-                v
+        // Per request: `None` if it waits, else whether it runs with positions that waited.
+        let mut takes: Vec<Option<Option<Waiting>>> = Vec::with_capacity(reqs.len());
+        // Waiting positions their sequence's take-in does not continue: they run first.
+        let mut first: Vec<Waiting> = Vec::new();
+        for r in &reqs {
+            let (start, ran, off) = (r.start as usize, r.ran as usize, r.off as usize);
+            let fed = start + ran + usize::from(r.max > 0);
+            let n_tokens = r.base as usize + r.tokens.len();
+            let hidden = rows.get(off * w..(off + ran) * w);
+            let (Some(hidden), true) = (hidden, r.base as usize <= start && fed <= n_tokens) else {
+                return Err(format!(
+                    "a draft request for rows {off}..{} of {} (positions {start}..{} of \
+                     {n_tokens}): not what the last step ran",
+                    off + ran,
+                    rows.len() / w.max(1),
+                    start + ran,
+                ));
+            };
+            let joined = match self.waiting.remove(&r.seq) {
+                Some(o) => o
+                    .join(start, r.base as usize, &r.tokens, hidden, w)
+                    .map_err(|o| first.push(o))
+                    .ok(),
+                None => None,
+            };
+            let held = joined.as_ref().map_or(ran, |j| j.len(w));
+            if may_wait && r.max == 0 && ran <= WAIT_RAN && held <= WAIT_POSITIONS {
+                let mut wait = joined.unwrap_or_else(|| Waiting {
+                    seq: r.seq,
+                    start,
+                    base: r.base as usize,
+                    tokens: r.tokens.clone(),
+                    hidden: hidden.to_vec(),
+                    blocks: Vec::new(),
+                    ring: 0,
+                });
+                wait.blocks.clone_from(&r.blocks);
+                wait.ring = r.ring as usize;
+                self.waiting.insert(r.seq, wait);
+                takes.push(None);
+            } else {
+                takes.push(Some(joined));
+            }
+        }
+        let mut passes = 0;
+        if !first.is_empty() {
+            passes += take_in(d, &mut self.exec, &first, w)?;
+        }
+        // Each running sequence's tokens at their positions (none needed before `base`).
+        let tokens: Vec<Vec<u32>> = (reqs.iter().zip(&takes))
+            .filter_map(|(r, take)| {
+                Some(match take.as_ref()? {
+                    Some(j) => j.positioned(),
+                    None => {
+                        let mut v = vec![0u32; r.base as usize];
+                        v.extend_from_slice(&r.tokens);
+                        v
+                    }
+                })
             })
             .collect();
         let mut outs = vec![Draft::default(); reqs.len()];
         let mut batch = Vec::with_capacity(reqs.len());
-        for ((r, tokens), out) in reqs.iter().zip(&tokens).zip(&mut outs) {
-            let (start, ran, off) = (r.start as usize, r.ran as usize, r.off as usize);
-            let fed = start + ran + usize::from(r.max > 0);
-            let hidden = rows.get(off * w..(off + ran) * w);
-            let (Some(hidden), true) = (hidden, r.base as usize <= start && fed <= tokens.len())
-            else {
-                return Err(format!(
-                    "a draft request for rows {off}..{} of {} (positions {start}..{} of {}): \
-                     not what the last step ran",
-                    off + ran,
-                    rows.len() / w.max(1),
-                    start + ran,
-                    tokens.len()
-                ));
+        let mut blocks: Vec<&[u32]> = Vec::with_capacity(reqs.len());
+        let mut rings = Vec::with_capacity(reqs.len());
+        let mut tokens_of = tokens.iter();
+        for ((r, take), out) in reqs.iter().zip(&takes).zip(&mut outs) {
+            let Some(take) = take else { continue };
+            let (start, ran, hidden) = match take {
+                Some(j) => (j.start, j.len(w), j.hidden.as_slice()),
+                None => {
+                    let (off, ran) = (r.off as usize, r.ran as usize);
+                    (r.start as usize, ran, &rows[off * w..(off + ran) * w])
+                }
             };
             batch.push(DraftRequest {
                 seq: r.seq,
-                tokens: tokens.as_slice(),
+                tokens: tokens_of
+                    .next()
+                    .expect("one per running take-in")
+                    .as_slice(),
                 start,
                 ran,
                 hidden: vec![hidden],
                 max: r.max as usize,
                 out,
             });
+            blocks.push(r.blocks.as_slice());
+            rings.push(r.ring as usize);
         }
-        let blocks: Vec<&[u32]> = reqs.iter().map(|r| r.blocks.as_slice()).collect();
-        let rings: Vec<usize> = reqs.iter().map(|r| r.ring as usize).collect();
-        let passes = d.step(&mut self.exec, &mut batch, &blocks, &rings)?;
+        if !batch.is_empty() {
+            passes += d.step(&mut self.exec, &mut batch, &blocks, &rings)?;
+        }
         drop(batch);
         let drafts = outs
             .into_iter()
@@ -374,6 +559,8 @@ impl Follower {
                 n_blocks,
             } => {
                 crate::node::check_hello(version, n_layer, split, mine)?;
+                // A new rank 0: its sequences are new.
+                self.waiting.clear();
                 let n = (*blocks).min(n_blocks as usize);
                 if n < *blocks {
                     exec.resize_kv(n).map_err(|e| e.to_string())?;
@@ -418,6 +605,12 @@ impl Follower {
             Request::Draft { reqs, p_min } => return self.drafts(reqs, f32::from_bits(p_min)),
             Request::DraftRelease { seq } => {
                 if let Some(d) = self.drafter.as_mut() {
+                    // Its waiting positions go into the head's caches, which a warm sequence
+                    // or a next turn reads as one machine's would hold them.
+                    if let Some(wait) = self.waiting.remove(&seq) {
+                        let w = exec.mtp_width();
+                        take_in(d, exec, std::slice::from_ref(&wait), w)?;
+                    }
                     d.release(seq);
                 }
                 Reply::Done
@@ -441,7 +634,8 @@ impl Follower {
             | Request::EnableRingSaves { .. }
             | Request::TpMtp { .. }
             | Request::TpMtpChain { .. }
-            | Request::TpMtpRows { .. } => {
+            | Request::TpMtpRows { .. }
+            | Request::TpPrefetch { .. } => {
                 return Err(
                     "a request of tensor parallelism over machines (--tp-rank): this rank \
                         runs a model split by layers (--node-rank)"

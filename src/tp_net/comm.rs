@@ -1260,6 +1260,40 @@ impl Comm {
         r
     }
 
+    /// [`Self::all_gather_host`] of I32 values (the CPU op of
+    /// [`super::seq_par::all_gather_i32`]): copied exactly, 4 bytes a value on the wire
+    /// whatever `--tp-wire` says. On failure the other ranks' columns are zeros.
+    pub fn all_gather_host_i32(
+        &self,
+        src: &[i32],
+        dst: &mut [i32],
+        row: usize,
+    ) -> Result<(), String> {
+        let cols = dst.len() / row;
+        let range = |r: usize| {
+            let (a, n) = super::seq_par::share(cols, r, self.n);
+            a * row..(a + n) * row
+        };
+        assert_eq!(range(self.rank).len(), src.len(), "all-gather lengths");
+        let r: Result<(), String> = (|| {
+            let mine: Arc<Vec<u8>> = Arc::new(src.iter().flat_map(|v| v.to_le_bytes()).collect());
+            let parts = self.exchange_host(|_| mine.clone(), |peer| range(peer).len() * 4)?;
+            for (r, part) in parts.iter().enumerate() {
+                let b = part.as_deref().unwrap_or(&mine);
+                for (d, v) in dst[range(r)].iter_mut().zip(b.chunks_exact(4)) {
+                    *d = i32::from_le_bytes(v.try_into().expect("4 bytes"));
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = &r {
+            self.shared.fail(e.clone());
+            dst.fill(0);
+            dst[range(self.rank)].copy_from_slice(src);
+        }
+        r
+    }
+
     /// An exchange of one micro-batch of [`super::micro`] on the host (its CPU op). Rank `r`'s
     /// piece is the columns `pieces(r) = (first, count)` (of `row` values each) of `src` for a
     /// reduce-scatter (`dst` gets the sum of this rank's piece) or of `dst` for an all-gather

@@ -115,7 +115,7 @@ impl Model {
             // Attention: this GPU's heads, their output projection's partial sum.
             let (pre, h) = self.glm_hc_pre_on(ctx, il, "attn", res, &mirror)?;
             let a = if p.mla[il] {
-                self.glm_dsa_on(&pass, il, h, part)?
+                self.glm_dsa_on(&pass, il, h, part, None)?
             } else {
                 self.glm_kda_on(&pass, il, h, part)?
             };

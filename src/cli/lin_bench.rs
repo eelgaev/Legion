@@ -35,6 +35,15 @@ pub struct LinBenchArgs {
     /// a value's bits differ.
     #[arg(long)]
     chain: bool,
+    /// Time GLM-5.3-Flash NVFP4's BF16 decode matvecs instead (#560 r6): each BF16 GEMV kernel
+    /// (`LEGION_DEBUG_GLM_BF16_GEMV` 0 linear_mv, 1 linear_mv_bf16) at `--gemv-tokens`, in GB/s
+    /// of weights; fails when an output's bits differ from linear_mv's. `--shapes` takes the
+    /// `GEMV_SHAPES` names.
+    #[arg(long)]
+    gemv: bool,
+    /// Tokens per decode step for `--gemv` (1-8), comma separated.
+    #[arg(long, value_delimiter = ',', default_values_t = [1usize, 2, 3, 4, 8])]
+    gemv_tokens: Vec<usize>,
 }
 
 #[cfg(feature = "cuda")]
@@ -48,6 +57,9 @@ pub fn run(args: LinBenchArgs) -> anyhow::Result<()> {
     kernels.push(LinTc::Auto);
     if args.chain {
         return chain(&mut gpu, &args, &kernels);
+    }
+    if args.gemv {
+        return gemv(&mut gpu, &args);
     }
     println!(
         "{:<11} {:>6} {:>6} {:>6} {:>3} {:>6} {:>8} {:>9} {:>7} {:>8} {:>18}",
@@ -188,6 +200,53 @@ fn chain(
     }
     if differ > 0 {
         anyhow::bail!("{differ} values differ in bits");
+    }
+    Ok(())
+}
+
+/// `--gemv`: [`legion::model::glm5next::ops::lin_bench::gemv_ms`] per shape and token count.
+#[cfg(feature = "cuda")]
+fn gemv(gpu: &mut legion::ggml::Backend, args: &LinBenchArgs) -> anyhow::Result<()> {
+    use legion::model::glm5next::ops::{bf16_gemv, lin_bench, set_bf16_gemv};
+    let default = bf16_gemv();
+    let kernels = [0u8, 1];
+    println!(
+        "{:<15} {:>6} {:>6} {:>3} {:>6} {:>5} {:>9} {:>7} {:>8} {:>18}",
+        "shape", "k", "m", "h", "tokens", "kern", "ms/call", "GB/s", "vs mv", "output bits"
+    );
+    let mut differ = 0;
+    for shape in lin_bench::GEMV_SHAPES {
+        if !args.shapes.is_empty() && !args.shapes.iter().any(|s| s == shape.name) {
+            continue;
+        }
+        for &n in &args.gemv_tokens {
+            anyhow::ensure!(
+                (1..=8).contains(&n),
+                "--gemv-tokens {n}: the GEMVs take 1-8 tokens"
+            );
+            let t = lin_bench::gemv_ms(gpu, shape, n, args.reps, args.rounds, &kernels);
+            let bytes = (shape.k * shape.m * shape.h * 2) as f64;
+            for r in &t {
+                println!(
+                    "{:<15} {:>6} {:>6} {:>3} {:>6} {:>5} {:>9.4} {:>7.1} {:>8.3} {:>18}",
+                    shape.name,
+                    shape.k,
+                    shape.m,
+                    shape.h,
+                    n,
+                    r.kernel,
+                    r.ms,
+                    bytes / r.ms / 1e6,
+                    r.ms / t[0].ms,
+                    format!("{:016x}", r.bits)
+                );
+                differ += (r.bits != t[0].bits) as usize;
+            }
+        }
+    }
+    set_bf16_gemv(default);
+    if differ > 0 {
+        anyhow::bail!("{differ} outputs differ from linear_mv's bits");
     }
     Ok(())
 }

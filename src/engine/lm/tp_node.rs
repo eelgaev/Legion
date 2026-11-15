@@ -245,6 +245,11 @@ pub(super) fn mtp_share(
         return tp_net::shard::qwen35::head_view(&gguf, hp, rank, n)
             .map_err(|e| device(format!("--spec-draft: {e}")));
     }
+    if gguf.architecture().as_deref() == Some("glm5-next") {
+        // GLM's MTP block is one more DSA layer of the target's: cut as the target's are.
+        return tp_net::shard::glm5::view(&gguf, rank, n)
+            .map_err(|e| device(format!("--spec-draft: {e}")));
+    }
     if hp.n_layer < 2 {
         return Err(device(
             "an MTP assistant for a model of fewer than two layers",
@@ -686,6 +691,13 @@ fn handle(
                 .map(|(slot, keep)| (slot as usize, keep as usize))
                 .collect();
             exec.commit(&commits).map_err(|e| e.to_string())?;
+            Reply::Done
+        }
+        Request::TpPrefetch { before, tokens } => {
+            // A prompt's next chunk's table rows, read ahead as rank 0 reads its own (#1176):
+            // that chunk's step finds them read instead of waiting for the SSD.
+            exec.model().prefetch_ngram_next(&before, &tokens);
+            exec.model().prefetch_engram(&before, &tokens);
             Reply::Done
         }
         Request::SaveRing {

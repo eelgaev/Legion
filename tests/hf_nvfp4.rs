@@ -246,7 +246,10 @@ fn checkpoint(dir: &Path) -> std::collections::HashMap<String, T> {
 fn modelopt_checkpoint_opens_as_the_converter_would_write_it() {
     let dir = tempfile::tempdir().unwrap();
     let src = checkpoint(dir.path());
-    let bf16 = OpenOptions { fp8: Fp8Mode::Bf16 };
+    let bf16 = OpenOptions {
+        fp8: Fp8Mode::Bf16,
+        ..Default::default()
+    };
     let g = GgufFile::open_with(dir.path(), &bf16).unwrap();
 
     let ty = |n: &str| g.tensor(n).map(|t| (t.ggml_type, t.shape));
