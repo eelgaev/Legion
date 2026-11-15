@@ -184,6 +184,27 @@ struct Params {
     dst_ld: i64,
     k: i32,
     n_tok: i32,
+    rows_per_cta: i32,
+}
+
+/// Output rows a CTA computes: 4 (#689 round 7: each CTA reads the activations from L2 once for
+/// four rows; Qwen3.8-27B's one-user verify steps on a GB10: 0.611 against 0.648 ms a cycle at
+/// one row, 0.624 at two); `LEGION_DEBUG_MVF_ROWS=1` or `=2` picks one row (the kernel before)
+/// or two, all with the same bits (an A/B switch, read once).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn rows_per_cta() -> i32 {
+    static V: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| rows_per_cta_from(std::env::var("LEGION_DEBUG_MVF_ROWS").ok().as_deref()))
+}
+
+/// [`rows_per_cta`] for the switch's value `v`: 1, 2 or 4, else 4.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn rows_per_cta_from(v: Option<&str>) -> i32 {
+    match v.map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 4,
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -212,6 +233,7 @@ unsafe fn cuda_mvf_bf16(
             dst_ld: (dst.nb[1] / 4) as i64,
             k: x.ne[0] as i32,
             n_tok: x.ne[1] as i32,
+            rows_per_cta: rows_per_cta(),
         };
         for i in 0..nw {
             let w = &*dst.src[1 + i];
