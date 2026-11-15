@@ -331,6 +331,14 @@ fn mul_mat<'a>(ctx: &'a Context, w: Tensor<'a>, x: Tensor<'a>) -> Tensor<'a> {
     }
 }
 
+/// `w @ x` on the Q4_K matvec op (#689: ggml's bits, the weights read faster) where it takes them
+/// and [`q4k_mv::draft_mode`](crate::model::core::q4k_mv::draft_mode) has it on (`head`: the
+/// head's matmul, else a layer's); `None` where the caller's matmul stays.
+fn q4k_mv<'a>(ctx: &'a Context, w: Tensor<'a>, x: Tensor<'a>, head: bool) -> Option<Tensor<'a>> {
+    use crate::model::core::q4k_mv;
+    (q4k_mv::draft_mode().on(head) && q4k_mv::takes(w, x)).then(|| q4k_mv::mul_mat(ctx, w, x))
+}
+
 fn host_f32(t: Tensor<'_>) -> Vec<f32> {
     floats(t.ty(), &t.bytes(), t.elements())
 }
@@ -742,7 +750,7 @@ impl Model {
             return (q, k, v);
         };
         assert_eq!(w.ne()[1], d * (nh + 2 * kvh), "fused Q, K and V rows");
-        let out = ctx.mul_mat(w, x);
+        let out = q4k_mv(ctx, w, x, false).unwrap_or_else(|| ctx.mul_mat(w, x));
         let q = Self::heads_of(ctx, out, d, nh, 0);
         let k = Self::heads_of(ctx, out, d, kvh, d * nh);
         let v = Self::heads_of(ctx, out, d, kvh, d * (nh + kvh));
@@ -782,7 +790,7 @@ impl Model {
             let rq = (c.head_dim * c.n_head) as usize;
             let nb1 = w.nb()[1];
             let wkv = ctx.view_2d(w, [w.ne()[0], 2 * d * kvh], nb1, rq * nb1);
-            let out = ctx.mul_mat(wkv, x);
+            let out = q4k_mv(ctx, wkv, x, false).unwrap_or_else(|| ctx.mul_mat(wkv, x));
             let k = Self::heads_of(ctx, out, d, kvh, 0);
             let v = Self::heads_of(ctx, out, d, kvh, d * kvh);
             return (self.k_rope(ctx, il, k, pos), v);
@@ -1127,7 +1135,8 @@ impl Model {
             } else {
                 o
             };
-            let attn = mul_mat(&ctx, self.lw(il, "attn_output.weight"), o);
+            let wo = self.lw(il, "attn_output.weight");
+            let attn = q4k_mv(&ctx, wo, o, false).unwrap_or_else(|| mul_mat(&ctx, wo, o));
             let attn = self.conv_out(&ctx, il, "attn", attn, attn_dynamic, nb);
             let h_attn = ctx.add(attn, h);
             let f = ctx.mul(
@@ -1138,7 +1147,7 @@ impl Model {
             let gu = match self.fused(il, "ffn_gate_up", f.ne()[1]) {
                 // Gate and up from one matmul: the first and second half of its rows.
                 Some(w) => {
-                    let out = ctx.mul_mat(w, f);
+                    let out = q4k_mv(&ctx, w, f, false).unwrap_or_else(|| ctx.mul_mat(w, f));
                     let ff = self.lw(il, "ffn_gate.weight").ne()[1];
                     assert_eq!(out.ne()[0], 2 * ff, "gate and up of one width");
                     let (nb1, es) = (out.nb()[1], out.element_size());
@@ -1180,7 +1189,7 @@ impl Model {
         let logits = if head.ty() == types::I8 {
             crate::model::fp8::mul_mat(&ctx, head, x, self.head_scale())
         } else {
-            let logits = mul_mat(&ctx, head, x);
+            let logits = q4k_mv(&ctx, head, x, true).unwrap_or_else(|| mul_mat(&ctx, head, x));
             match self.head_scale() {
                 Some(s) => ctx.mul(logits, s),
                 None => logits,

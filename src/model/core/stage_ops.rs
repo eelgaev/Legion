@@ -87,6 +87,12 @@ pub(crate) const PURE: &[&str] = &[
     // One-column Q8_0 projections of 6,144 values on a V100 (#814): q8_head's kernel (the one
     // q8_group's row matvecs launch), its variant fixed at startup.
     "q8_head_out",
+    // The DFlash drafter's Q4_K matvecs of 1-8 columns with ggml's MMVQ bits (#689): one
+    // kernel picked by the shapes, its grid from the device's SM count and occupancy (read
+    // once, with the shared memory opt-in, at the first launch, which a step runs directly).
+    // Left out, each one cut a draft pass's capture: 21 cuts a pass, ~1 ms of a C=1 cycle on a
+    // DGX Spark (GB10).
+    "q4k_mv",
     // Q8_0 matmuls of 9-255 tokens with ggml's MMQ bits and no fixup launch (#836): two
     // kernels on the compute stream, scratch kept per stream from its first launch.
     "q8_mmq",

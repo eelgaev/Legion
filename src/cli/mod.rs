@@ -31,6 +31,7 @@ mod nvfp4_once_bench;
 mod paged_qm_bench;
 mod paged_split_bench;
 mod q4k_head_bench;
+mod q4k_mv_bench;
 mod q8_group_check;
 mod q8_head_bench;
 mod q8_mmq_check;
@@ -163,6 +164,10 @@ enum Command {
     /// Check and time the GB10 Q4_K draft LM head op against ggml's mmvq (development).
     #[command(hide = true)]
     Q4kHeadBench(q4k_head_bench::Q4kHeadBenchArgs),
+    /// Check and time the GB10 Q4_K matvec op of the DFlash drafter against ggml's mmvq
+    /// (development).
+    #[command(hide = true)]
+    Q4kMvBench(q4k_mv_bench::Q4kMvBenchArgs),
     /// Check and time the BF16 verify-step LM head op against ggml's matmul, soft-cap and
     /// argmax (development).
     #[command(hide = true)]
@@ -266,6 +271,7 @@ async fn run(cli: Cli, numa: Option<legion::hw::numa_bind::Placement>) -> anyhow
         Command::Nvfp4MvqBench(args) => nvfp4_mvq_bench::run(args),
         Command::Fp8SlicedBench(args) => fp8_sliced_bench::run(args),
         Command::Q4kHeadBench(args) => q4k_head_bench::run(args),
+        Command::Q4kMvBench(args) => q4k_mv_bench::run(args),
         Command::HeadMmBench(args) => head_mm_bench::run(args),
         Command::Q8GroupCheck(args) => q8_group_check::run(args),
         Command::Q8MmqCheck(args) => q8_mmq_check::run(args),

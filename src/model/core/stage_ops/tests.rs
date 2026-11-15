@@ -46,6 +46,7 @@ fn decode_matmuls_are_listed() {
         "q8_mmq",
         "shared_q8_small",
         "q8_head_out",
+        "q4k_mv",
     ] {
         assert!(PURE.contains(&name), "{name}");
     }
