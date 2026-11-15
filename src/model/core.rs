@@ -72,6 +72,7 @@ pub mod nvfp4_mvq;
 pub use nvfp4_mvq::set_nvfp4_mvq;
 pub mod q4k_head;
 pub use q4k_head::set_q4k_head;
+pub mod q4k_mv;
 pub mod q8_group;
 pub mod q8_head;
 pub mod q8_mv;
