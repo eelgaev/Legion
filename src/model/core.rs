@@ -63,6 +63,7 @@ pub mod mmq_ids;
 pub use mmq_ids::set_mmq_ids;
 pub(crate) mod mmq_preq;
 pub use mmq_preq::set_mmq_preq;
+pub mod mmvq_once;
 pub(crate) mod norm_rope;
 pub mod nvfp4_once;
 pub use nvfp4_once::set_nvfp4_once;
@@ -2680,6 +2681,22 @@ impl Model {
             .then(|| nvfp4_once::swiglu_id(ctx, gate, up, x, ids)))
     }
 
+    /// Layer `il`'s routed gate and up matmuls of `x` and their SwiGLU on
+    /// [`mmvq_once::swiglu_id`] (quantized GGUF experts at 1-3 tokens on a GB10, #1176), when it
+    /// takes them.
+    fn mmvq_once_glu<'a>(
+        &'a self,
+        ctx: &'a Context,
+        il: usize,
+        x: Tensor<'a>,
+        ids: Tensor<'a>,
+    ) -> Result<Option<Tensor<'a>>, ModelError> {
+        let gate = self.w(&format!("blk.{il}.ffn_gate_exps.weight"))?;
+        let up = self.w(&format!("blk.{il}.ffn_up_exps.weight"))?;
+        Ok(mmvq_once::glu_usable(gate, up, x, ids)
+            .then(|| mmvq_once::swiglu_id(ctx, gate, up, x, ids)))
+    }
+
     /// An empty decode state for up to `max_ctx` tokens, in buffers of `buft` (use the
     /// buffer type of the backend that will run [`Self::forward`]).
     pub fn new_state(&self, buft: BufferType, max_ctx: usize) -> Result<SeqState, ModelError> {
@@ -4519,6 +4536,15 @@ impl Model {
                 let gate = self.lmm_id(ctx, il, "ffn_gate_exps.weight", x, selected)?;
                 let up = self.lmm_id(ctx, il, "ffn_up_exps.weight", x, selected)?;
                 let act = ctx.swiglu_split(gate, up);
+                Some(self.lmm_id(ctx, il, "ffn_down_exps.weight", act, selected)?)
+            } else if let Some(act) = (!scaled)
+                .then(|| self.mmvq_once_glu(ctx, il, x, selected))
+                .transpose()?
+                .flatten()
+            {
+                // Decode and verify steps of quantized GGUF experts on a GB10: gate, up and the
+                // SwiGLU in one op streaming each routed expert's rows once, the bits of the
+                // ops below (#1176); down on the same kernels (`Linear::mul_mat_id`).
                 Some(self.lmm_id(ctx, il, "ffn_down_exps.weight", act, selected)?)
             } else {
                 let up = self.lmm_id(ctx, il, "ffn_up_exps.weight", x, selected)?;
