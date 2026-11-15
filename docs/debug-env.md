@@ -58,7 +58,7 @@ without notice.
 
 | Variable | Effect |
 |---|---|
-| `LEGION_OP_PROFILE=1` | Per-op GPU time profile (CUDA): every graph node timed between CUDA events, a table on stderr now and then. Disables ggml's CUDA graphs and fusions. |
+| `LEGION_OP_PROFILE=1` | Per-op GPU time profile (CUDA): every graph node timed between CUDA events, a table on stderr now and then (`=dev`: per GPU, every row). Disables ggml's CUDA graphs and fusions. A node that reads a weight of 1 MiB or more is keyed `op weight [type] ne0xne1xne2 x<tokens>` and shows `GB/s`: the weight bytes it read per second, its achieved bandwidth (caches and states do not count; an expert stack counts every routed choice as a different expert, so its GB/s above 1 token is an upper bound). External ops take their token count from their input, so a flat output still lands in the right `x<tokens>` row. |
 | `LEGION_DEBUG_NGRAM_OLD_POLICY=1` | An n-gram table read from the SSD with an `--ngram-ram` budget: the row cache replaces round-robin, without a hot set (the policy before #1209), for A/B runs. Output does not change. |
 | `LEGION_META_DEBUG=1` | Tensor parallelism: print how each tensor is split over the GPUs. |
 | `LEGION_DEBUG_FAIL_CUMEMCREATE_AFTER=<n>[,<count>]` | The expert cache's slot allocations (CUDA): after the first `n` `cuMemCreate` calls for VRAM slots, the next `count` (1 if left out) fail as out of memory, to try the load's shrink to fit (#1208: the cache plans that GPU again in less and the memory plan says how many slots it kept). |
