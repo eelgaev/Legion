@@ -40,6 +40,66 @@ pub struct PoolBench {
     pub act_us: u64,
     /// Cuts of each phase into tasks ([`Split::tasks_per_thread`]), each a row of the table.
     pub tasks_per_thread: Vec<usize>,
+    /// Where the experts live ([`HostMem`]).
+    pub host_mem: HostMem,
+}
+
+/// Where [`run`] places the experts it cycles through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostMem {
+    /// Plain heap memory (`Vec`): transparent huge pages where the system gives them.
+    Heap,
+    /// Pinned `cuMemCreate` host memory, as the server's expert arena (CUDA builds).
+    Arena,
+    /// An anonymous mapping advised for huge pages and registered with the driver (CUDA builds).
+    Thp,
+}
+
+/// The experts' bytes per kind (up, gate, down) where [`HostMem`] asks; the holders keep the
+/// pinned ranges alive.
+struct Placed {
+    base: [usize; 3],
+    #[cfg(feature = "cuda")]
+    _held: Vec<crate::residency::cuda::BenchHost>,
+    _heap: Option<[Vec<u8>; 3]>,
+    /// The first kind's page size and huge-page bytes, for the header.
+    pages: Option<(u64, u64)>,
+}
+
+fn place(kinds: [Vec<u8>; 3], mem: HostMem) -> Result<Placed, String> {
+    if mem == HostMem::Heap {
+        return Ok(Placed {
+            base: kinds.each_ref().map(|k| k.as_ptr() as usize),
+            #[cfg(feature = "cuda")]
+            _held: Vec::new(),
+            _heap: Some(kinds),
+            pages: None,
+        });
+    }
+    #[cfg(feature = "cuda")]
+    {
+        use crate::residency::cuda::{bench_host, bench_host_pages};
+        let mut held = Vec::new();
+        for k in &kinds {
+            let b = bench_host(0, k.len(), mem == HostMem::Thp)?;
+            // SAFETY: `b` holds at least `k.len()` bytes and does not overlap `k`.
+            unsafe { std::ptr::copy_nonoverlapping(k.as_ptr(), b.as_mut_ptr(), k.len()) };
+            held.push(b);
+        }
+        let base = std::array::from_fn(|i| held[i].as_mut_ptr() as usize);
+        let pages = bench_host_pages(held[0].as_mut_ptr());
+        Ok(Placed {
+            base,
+            _held: held,
+            _heap: None,
+            pages,
+        })
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        drop(kinds);
+        Err(format!("--host-mem {mem:?} needs a CUDA build"))
+    }
 }
 
 /// The allowed CPUs grouped by core, in order.
@@ -105,8 +165,15 @@ pub fn run(cfg: &PoolBench, line: &mut dyn FnMut(String)) -> std::io::Result<()>
         return Ok(());
     }
     let kinds = random_experts(shape, cfg.n_expert);
+    let placed = match place(kinds, cfg.host_mem) {
+        Ok(p) => p,
+        Err(e) => {
+            line(format!("share pool: {e}"));
+            return Ok(());
+        }
+    };
     let he = HostExperts {
-        base: kinds.each_ref().map(|k| k.as_ptr() as usize),
+        base: placed.base,
         expert_bytes: [shape.gate_bytes(), shape.gate_bytes(), shape.down_bytes()],
         up_gate: shape.up_gate,
         down: shape.down,
@@ -122,12 +189,17 @@ pub fn run(cfg: &PoolBench, line: &mut dyn FnMut(String)) -> std::io::Result<()>
     let previous = pin_current_thread(&own[..1])?;
     let mb = shape.bytes() as f64 / 1e6;
     line(format!(
-        "share pool{}: {:?}/{:?} experts, {ne} x {nf}, {mb:.2} MB each, {} cycled; {} cores \
-         allowed (the last runs the caller){}",
+        "share pool{}: {:?}/{:?} experts, {ne} x {nf}, {mb:.2} MB each, {} cycled in {:?} \
+         memory{}; {} cores allowed (the last runs the caller){}",
         if cfg.exact { " (exact)" } else { "" },
         shape.up_gate,
         shape.down,
         cfg.n_expert,
+        cfg.host_mem,
+        placed.pages.map_or_else(String::new, |(kp, huge)| format!(
+            " ({kp} kB pages, {} MiB of huge pages)",
+            huge >> 10
+        )),
         cores.len(),
         if cfg.exact {
             format!("; act ready {} us after gate/up done", cfg.act_us)
@@ -217,7 +289,7 @@ pub fn run(cfg: &PoolBench, line: &mut dyn FnMut(String)) -> std::io::Result<()>
                             let t = Instant::now();
                             match &eb {
                                 None => {
-                                    // SAFETY: the buffers and `kinds` outlive the call.
+                                    // SAFETY: the buffers and `placed` outlive the call.
                                     unsafe { run_now(&pool, queue, job) };
                                 }
                                 Some(b) => {

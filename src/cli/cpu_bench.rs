@@ -7,7 +7,7 @@ use std::time::Duration;
 use clap::{Args, Subcommand};
 use legion::cpu::QuantFormat;
 use legion::cpu::microbench::{self, ExpertShape};
-use legion::residency::cpu_share::bench::{self as pool_bench, PoolBench};
+use legion::residency::cpu_share::bench::{self as pool_bench, HostMem, PoolBench};
 
 #[derive(Args)]
 pub struct CpuBenchArgs {
@@ -56,8 +56,9 @@ enum What {
     /// The CPU expert share's worker pool on this process's CPUs: microseconds per job and
     /// per expert by cores, SMT threads per core, tokens and experts per job.
     Pool {
-        /// Experts in memory (more than the caches hold).
-        #[arg(long, default_value_t = 64)]
+        /// Experts in memory (more than the caches hold: 1024 are ~3 GB, read from DRAM as the
+        /// server's are; 64 fit a large L3 and read up to twice as fast).
+        #[arg(long, default_value_t = 1024)]
         n_expert: usize,
         /// Down projection format.
         #[arg(long, default_value = "q5_1", value_parser = format)]
@@ -89,7 +90,20 @@ enum What {
         /// each thread one range, so several experts run side by side).
         #[arg(long, value_delimiter = ',', default_values_t = [3])]
         tasks_per_thread: Vec<usize>,
+        /// Where the experts live: `heap` (plain memory, huge pages where the system gives
+        /// them), `arena` (pinned cuMemCreate host memory, as the server's expert arena; CUDA
+        /// builds) or `thp` (an anonymous mapping with huge pages, registered with the driver;
+        /// CUDA builds).
+        #[arg(long, value_enum, default_value_t = HostMemArg::Heap)]
+        host_mem: HostMemArg,
     },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum HostMemArg {
+    Heap,
+    Arena,
+    Thp,
 }
 
 fn format(s: &str) -> Result<QuantFormat, String> {
@@ -154,7 +168,13 @@ pub fn run(args: CpuBenchArgs) -> anyhow::Result<()> {
             exact,
             act_us,
             tasks_per_thread,
+            host_mem,
         } => {
+            let host_mem = match host_mem {
+                HostMemArg::Heap => HostMem::Heap,
+                HostMemArg::Arena => HostMem::Arena,
+                HostMemArg::Thp => HostMem::Thp,
+            };
             let cfg = PoolBench {
                 shape: qwen(down),
                 n_expert,
@@ -166,6 +186,7 @@ pub fn run(args: CpuBenchArgs) -> anyhow::Result<()> {
                 exact,
                 act_us,
                 tasks_per_thread,
+                host_mem,
             };
             pool_bench::run(&cfg, &mut line)?;
         }

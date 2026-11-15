@@ -21,6 +21,8 @@ use std::sync::Mutex;
 use super::fallback::{self, HostLoc, NO_NODE};
 use crate::ggml::{BufferType, Context, GgmlError, Tensor, ffi};
 
+mod bench_host;
+pub use bench_host::{BenchHost, bench_host, bench_host_pages};
 mod host_register;
 pub use host_register::{HostRegistration, register_host};
 mod kv_vmm;
@@ -204,6 +206,11 @@ mod sys {
 
 use sys::*;
 
+mod swap_pace;
+pub use swap_pace::{
+    swap_pace_clear, swap_pace_enable, swap_pace_flush, swap_pace_layer, swap_pace_on,
+    swap_pace_queue,
+};
 mod spill;
 pub use spill::{spill_devices, spill_type, spill_type_keeping};
 

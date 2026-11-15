@@ -506,7 +506,9 @@ mod cuda {
         // SAFETY: the caller's; a node made by `mul_mat_id_tiered`.
         unsafe {
             expert_mv::cuda_expert_mv(dst, stream)?;
-            collect(dst, stream)
+            collect(dst, stream)?;
+            // The layer's share of the expert cache's swap copies starts behind it (#37).
+            crate::residency::cuda::swap_pace_layer(current_device()?, stream)
         }
     }
 

@@ -78,6 +78,10 @@ struct Device {
     copier: Option<Copier>,
     #[cfg(feature = "cuda")]
     inflight: VecDeque<InFlight>,
+    /// Swapped slots whose copies wait in the device's pacer (`super::cuda::swap_pace_queue`),
+    /// queued as in flight once the pacer gives the batch's event ([`ExpertResidency::flush_paced`]).
+    #[cfg(feature = "cuda")]
+    paced: Vec<(usize, u32)>,
     /// Prefill staging buffers, while the device's slots are lent ([`ExpertResidency::lend`]),
     /// and between lends while [`Self::kept`].
     #[cfg(feature = "cuda")]
@@ -1393,6 +1397,8 @@ impl ExpertResidency {
                         #[cfg(feature = "cuda")]
                         inflight: VecDeque::new(),
                         #[cfg(feature = "cuda")]
+                        paced: Vec::new(),
+                        #[cfg(feature = "cuda")]
                         staging: None,
                         #[cfg(feature = "cuda")]
                         kept: false,
@@ -2354,6 +2360,8 @@ impl ExpertResidency {
 
     fn sync_copies(&mut self) -> Result<(), String> {
         #[cfg(feature = "cuda")]
+        self.flush_paced()?;
+        #[cfg(feature = "cuda")]
         for d in &mut self.devices {
             if let Some(c) = d.copier.as_mut() {
                 c.sync()?;
@@ -2785,6 +2793,16 @@ impl ExpertResidency {
         self.laps.lap("tables");
         // The swaps planned above start now, behind the table write (`tables_first`).
         for (d, swaps) in std::mem::take(&mut self.later) {
+            // After a step the share takes, the next one's share layers start them (#37).
+            #[cfg(feature = "cuda")]
+            if n <= super::cpu_share::ops::MAX_TOKENS
+                && self.host.is_none()
+                && let Some(cd) = self.devices[d].place.cuda
+                && super::cuda::swap_pace_on(cd)
+            {
+                self.pace_swaps(d, cd, &swaps)?;
+                continue;
+            }
             self.issue_swaps(d, &swaps)?;
         }
         self.laps.lap("later");
@@ -3016,10 +3034,57 @@ impl ExpertResidency {
         Ok(())
     }
 
+    /// The CPU expert share on CUDA device `cd` (no bounded host tier, #37): queues the copies
+    /// of device `d`'s planned `swaps` (already out of the tables) in the device's pacer, for
+    /// the next step's share layers to start a few at a time (`super::cuda::swap_pace_layer`).
+    /// The slots fill as [`Self::issue_swaps`]'s would, once the batch's copies landed.
+    #[cfg(feature = "cuda")]
+    fn pace_swaps(&mut self, d: usize, cd: usize, swaps: &[Swap]) -> Result<(), String> {
+        self.flush_paced()?;
+        let mut pieces = Vec::with_capacity(swaps.len() * 3);
+        for s in swaps {
+            let l = self.layers[s.layer].as_ref().expect("tiered layer");
+            let src = l.slots.n_slots() + s.new as usize;
+            for k in 0..3 {
+                pieces.push((
+                    l.addr(k, s.slot as usize),
+                    l.addr(k, src),
+                    l.expert_bytes[k],
+                ));
+            }
+        }
+        let dev = &mut self.devices[d];
+        super::cuda::swap_pace_queue(cd, dev.copier.as_ref().expect("copier"), &pieces, 3)?;
+        dev.paced.extend(swaps.iter().map(|s| (s.layer, s.slot)));
+        Ok(())
+    }
+
+    /// Sends the swap copies still waiting in the devices' pacers to their copiers and queues
+    /// their slots as in flight, behind the batch's event.
+    #[cfg(feature = "cuda")]
+    fn flush_paced(&mut self) -> Result<(), String> {
+        for dev in &mut self.devices {
+            if dev.paced.is_empty() {
+                continue;
+            }
+            let cd = dev.place.cuda.expect("paced swaps on a CUDA device");
+            let event = super::cuda::swap_pace_flush(cd)?
+                .ok_or("swap pacing: a batch without its event")?;
+            dev.inflight.push_back(InFlight {
+                event,
+                slots: std::mem::take(&mut dev.paced),
+                tier: false,
+            });
+        }
+        Ok(())
+    }
+
     /// Marks the slots of finished copies filled, of the layers `scope` selects (all: None);
     /// others stay queued.
     #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     fn complete_copies(&mut self, scope: Option<&dyn Fn(usize) -> bool>) -> Result<(), String> {
+        #[cfg(feature = "cuda")]
+        self.flush_paced()?;
         // `settle` (#1165): every copy queued so far counts, finished or not yet.
         if self.settle {
             self.sync_copies()?;
@@ -3943,6 +4008,10 @@ impl Drop for ExpertResidency {
             let _ = thread.join();
         }
         let _ = self.sync_copies();
+        #[cfg(feature = "cuda")]
+        if self.share > 0 {
+            super::cuda::swap_pace_clear();
+        }
         // Raw routing counts per layer and expert, for offline cache studies. Debug output
         // (docs/debug-env.md), not a setting, so an environment variable rather than a flag
         // (#737).
@@ -4175,7 +4244,17 @@ fn share_setup(
         }
         plan.layers[il] = Some(he);
     }
+    // The exact share's down ops start the swap copies a few layers at a time (all experts in
+    // host memory; the bounded host tier swaps through its RAM slots and staging places).
+    let paced: Vec<usize> = plans
+        .iter()
+        .filter(|d| d.exact && me.host.is_none() && d.layers.iter().any(Option::is_some))
+        .map(|d| d.device)
+        .collect();
     setup(&cfg.cpu_share, plans)?;
+    for device in paced {
+        super::cuda::swap_pace_enable(device);
+    }
     Ok(threshold(cfg.cpu_share.share))
 }
 
