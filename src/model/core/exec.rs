@@ -1746,6 +1746,16 @@ impl Executor {
                 seconds = t.elapsed().as_secs_f64(),
                 "MTP drafts with a 4-bit copy of the output head"
             );
+        } else if self.model.draft_ids().is_some() {
+            // Picked rows of the head (glm5-next, #1172): a copy of them as stored.
+            let t = std::time::Instant::now();
+            let (rows, mib) = self.model.copy_draft_head()?;
+            tracing::info!(
+                rows,
+                mib,
+                seconds = t.elapsed().as_secs_f64(),
+                "MTP drafts with a copy of the output head's picked rows"
+            );
         }
         if self.model.hp.arch.mtp_shares_kv() {
             // The head reads the target's cache.

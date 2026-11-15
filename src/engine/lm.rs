@@ -621,8 +621,8 @@ pub(crate) fn default_mtp_window(arch: &str, mtp: bool, integrated: bool) -> usi
     }
 }
 
-/// Why `--spec-draft-vocab n` cannot apply, if it cannot: it is for the MTP heads of qwen4exp
-/// and qwen35 and for DFlash drafters (`dflash`), and below the vocabulary's size.
+/// Why `--spec-draft-vocab n` cannot apply, if it cannot: it is for the MTP heads of qwen4exp,
+/// qwen35 and glm5-next and for DFlash drafters (`dflash`), and below the vocabulary's size.
 pub(crate) fn draft_vocab_unused(
     n: usize,
     mtp: bool,
@@ -632,10 +632,12 @@ pub(crate) fn draft_vocab_unused(
 ) -> Option<String> {
     if n == 0 {
         None
-    } else if !dflash && (!mtp || !matches!(arch, "qwen4exp" | "qwen35" | "qwen35moe")) {
+    } else if !dflash
+        && (!mtp || !matches!(arch, "qwen4exp" | "qwen35" | "qwen35moe" | "glm5-next"))
+    {
         Some(format!(
-            "--spec-draft-vocab applies to the MTP heads of qwen4exp and qwen35 (--spec mtp) \
-             and to DFlash drafters (--spec dflash) only, not {arch}: ignored"
+            "--spec-draft-vocab applies to the MTP heads of qwen4exp, qwen35 and glm5-next \
+             (--spec mtp) and to DFlash drafters (--spec dflash) only, not {arch}: ignored"
         ))
     } else if n as i64 >= n_vocab {
         Some(format!(
@@ -647,15 +649,16 @@ pub(crate) fn draft_vocab_unused(
 }
 
 /// Why `--spec-draft-lm-head q4` does not apply to the MTP head of `arch`, if it does not: only
-/// the qwen4exp and qwen35 heads draft with the copy.
+/// the qwen4exp, qwen35 and glm5-next heads draft with the copy.
 pub(crate) fn mtp_lm_head_unused(h: crate::spec::DraftLmHead, arch: &str) -> Option<String> {
-    (h == crate::spec::DraftLmHead::Q4 && !matches!(arch, "qwen4exp" | "qwen35" | "qwen35moe"))
-        .then(|| {
-            format!(
-                "--spec-draft-lm-head applies to the MTP heads of qwen4exp and qwen35 only, \
-                 not {arch}: ignored"
-            )
-        })
+    (h == crate::spec::DraftLmHead::Q4
+        && !matches!(arch, "qwen4exp" | "qwen35" | "qwen35moe" | "glm5-next"))
+    .then(|| {
+        format!(
+            "--spec-draft-lm-head applies to the MTP heads of qwen4exp, qwen35 and glm5-next \
+             only, not {arch}: ignored"
+        )
+    })
 }
 
 /// Whether the model's own MTP head drafts: `--spec mtp` without a draft model or token drafter.
@@ -4105,7 +4108,21 @@ impl LmEngine {
         ) {
             Some(why) => tracing::warn!(draft_vocab = cfg.draft_vocab, "{why}"),
             None if dflash => dflash_vocab = cfg.draft_vocab,
-            None => model.set_draft_vocab(cfg.draft_vocab),
+            None => {
+                model.set_draft_vocab(cfg.draft_vocab);
+                // GLM-5.3-Flash: the number tokens too, which its vocabulary keeps far past
+                // the first rows (#1172).
+                if model.hp.arch.name() == "glm5-next"
+                    && let Some(ids) = model.glm_draft_ids(|i| tokenizer.token_to_piece(i))
+                {
+                    tracing::info!(
+                        draft_vocab = cfg.draft_vocab,
+                        rows = ids.len(),
+                        "MTP drafts over the first tokens and the number tokens"
+                    );
+                    model.set_draft_ids(ids);
+                }
+            }
         }
         if mtp && !head_on_peer && !model.has_mtp() {
             // The head's GGUF, else a safetensors checkpoint's own head (`mtp.*`), as shipped.
