@@ -271,11 +271,13 @@ pub(super) struct ModelArgs {
     /// The expert cache also takes the VRAM kept free for prompt steps' compute buffers, on
     /// GPUs with unified memory: a prompt step's buffer then spills into host memory (pinned,
     /// on the GPU's NUMA node) as far as VRAM is short. Decode keeps its buffers in VRAM. The
-    /// default on V100s (an AC922: ~5% more slots on 2 GPUs, the same outputs) and on GH200s
-    /// (unmeasured); other GPUs keep the room unless this is given.
+    /// default on V100s (an AC922: ~5% more slots on 2 GPUs, the same outputs), on GH200s
+    /// (unmeasured) and on one discrete GPU running Qwen3.8-Flash-Next with every routed expert
+    /// in host memory (~120 more slots on a 24 GB card); other GPUs keep the room unless this
+    /// is given.
     #[arg(long)]
     pub expert_cache_fill_prompt_room: bool,
-    /// Keep the prompt steps' compute room out of the expert cache on V100s and GH200s too (see
+    /// Keep the prompt steps' compute room out of the expert cache where it is the default (see
     /// --expert-cache-fill-prompt-room): prompt buffers then stay in VRAM. For comparisons.
     #[arg(long, conflicts_with = "expert_cache_fill_prompt_room")]
     pub no_expert_cache_fill_prompt_room: bool,
@@ -303,9 +305,10 @@ pub(super) struct ModelArgs {
     #[arg(long, value_name = "PATH", conflicts_with = "expert_profile")]
     pub expert_split_misses: Option<PathBuf>,
     /// Experts the cache may copy in per device, per pass (MTP passes included), replacing
-    /// colder ones (0: keep the first fill).
-    #[arg(long, env = "LEGION_EXPERT_SWAPS", default_value_t = SwapRule::default().budget)]
-    pub expert_swaps: usize,
+    /// colder ones (0: keep the first fill). Default: 24; 48 on a Qwen3.8-Flash-Next machine
+    /// with one discrete GPU and every routed expert in host memory.
+    #[arg(long, env = "LEGION_EXPERT_SWAPS", value_name = "N")]
+    pub expert_swaps: Option<usize>,
     /// Per-device copy budgets in place of --expert-swaps, comma-separated in pipeline order
     /// (the GPU holding the first layers first; e.g. `48,24`); devices past the list keep
     /// --expert-swaps. Default: none, --expert-swaps everywhere. For tuning layer-split runs
@@ -335,15 +338,19 @@ pub(super) struct ModelArgs {
     /// the same outputs. At several sequences it also folds different users' routings.
     #[arg(long, value_name = "ROUTINGS", value_parser = non_negative, default_value_t = 0.0)]
     pub expert_heat_pass_cap: f32,
-    /// Hybrid decode (opt-in, POWER9 + CUDA only, ignored elsewhere; decode and verify steps of
-    /// up to 8 tokens): the host
+    /// Hybrid decode (opt-in, CUDA; decode and verify steps of up to 8 tokens): the host
     /// computes this share of each MoE layer's missed experts (those read from host memory) on
     /// a pinned worker pool per NUMA node while the GPU computes the rest, cutting the bytes the
-    /// GPU reads over the link. 0 (the default) is off. Changes outputs slightly (the host
-    /// kernels sum in another order than the GPU's). From Strata-AC922's POWER9 CPU expert
-    /// share (`--pcie-frac`).
-    #[arg(long, value_parser = share_fraction, default_value_t = 0.0)]
-    pub cpu_expert_share: f32,
+    /// GPU reads over the link. 0 (the default) is off. POWER9: changes outputs slightly (the
+    /// host kernels sum in another order than the GPU's). x86 with AVX2, FMA and F16C: the
+    /// same outputs (the host computes the GPU kernels' bits; the activations' quantization
+    /// and SwiGLU stay on the GPU), and `auto` starts each layer's share from the link's and the
+    /// pool's measured time per expert, then moves it toward whichever of the GPU and the pool
+    /// waited. Ignored elsewhere. With the bounded host tier (part of the experts in RAM) the
+    /// host takes only misses held in RAM; those read from disk stay on the GPU. From
+    /// Strata-AC922's POWER9 CPU expert share (`--pcie-frac`).
+    #[arg(long, value_name = "SHARE|auto", value_parser = share_arg, default_value = "0")]
+    pub cpu_expert_share: ShareArg,
     /// Worker threads of each NUMA node's `--cpu-expert-share` pool (0: `--cpu-expert-smt`
     /// per core of the node, less two cores left to the engine's threads).
     #[arg(long, default_value_t = 0)]
@@ -1033,6 +1040,7 @@ impl ModelArgs {
                 .expert_cache_gib
                 .map(|g| (g.max(0.0) * (1u64 << 30) as f64) as u64),
             cache_reserve: self.expert_cache_reserve_mib << 20,
+            lend_reserve: None,
             fill_prompt_room: if self.no_expert_cache_fill_prompt_room {
                 Some(false)
             } else {
@@ -1043,12 +1051,15 @@ impl ModelArgs {
                 .expert_profile_seed
                 .unwrap_or(legion::residency::PROFILE_SEED),
             profile_split_only: self.expert_profile_split_only,
+            tier_heat: None,
+            tier_heat_sizes: false,
             split_misses: self.expert_split_misses.clone(),
             swaps: SwapRule {
-                budget: self.expert_swaps,
+                budget: self.expert_swaps.unwrap_or(SwapRule::default().budget),
                 margin: self.expert_swap_margin,
                 ratio: self.expert_swap_ratio,
             },
+            swaps_given: self.expert_swaps.is_some(),
             device_swaps: self.expert_swaps_device.clone(),
             decay: self.expert_heat_decay,
             heat_pass_cap: self.expert_heat_pass_cap,
@@ -1067,7 +1078,8 @@ impl ModelArgs {
             stage_below: None,
             learn_long: !self.no_prefill_learn,
             cpu_share: legion::residency::cpu_share::CpuShareConfig {
-                share: self.cpu_expert_share,
+                share: self.cpu_expert_share.share,
+                auto: self.cpu_expert_share.auto,
                 workers: self.cpu_expert_workers,
                 smt: self.cpu_expert_smt as usize,
             },
@@ -2260,12 +2272,19 @@ pub async fn run(
             }
         }
     };
+    engine.set_warming(true);
     if kind == EngineKind::Model {
         warmup::shapes(engine.as_ref(), &e.warmup_shapes).await;
     }
-    if e.warmup_prompt > 0 {
-        warmup::run(engine.as_ref(), e.warmup_prompt).await?;
-    }
+    let warmed = if e.warmup_prompt > 0 {
+        warmup::run(engine.as_ref(), e.warmup_prompt)
+            .await
+            .map(drop)
+    } else {
+        Ok(())
+    };
+    engine.set_warming(false);
+    warmed?;
     if interactive {
         if !reported {
             let model = engine
@@ -2521,6 +2540,24 @@ fn share_fraction(value: &str) -> Result<f32, String> {
     } else {
         Err(format!("must be in [0, 1], got {value}"))
     }
+}
+
+/// `--cpu-expert-share`: a share in `[0, 1]`, or `auto` (the exact share's measured split, at
+/// most all of the misses).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShareArg {
+    pub share: f32,
+    pub auto: bool,
+}
+
+fn share_arg(value: &str) -> Result<ShareArg, String> {
+    if value == "auto" {
+        return Ok(ShareArg {
+            share: 1.0,
+            auto: true,
+        });
+    }
+    share_fraction(value).map(|share| ShareArg { share, auto: false })
 }
 
 /// The heat decay: in (0, 1] (0 would forget every routing at once, NaN freeze the cache).

@@ -74,3 +74,15 @@ fn glm_mtp_bf16_experts_stay_on_the_device() {
         ]
     );
 }
+
+#[test]
+fn embd_on_host_only_for_the_tier_gpu() {
+    // The host tier's one GPU with an LM head of its own: the embeddings go to host memory.
+    assert!(embd_on_host(1, true, true, false));
+    // Several stages have their own rule (`shared_host`); off the tier's gate, with a tied head
+    // (the head reads every row each step) or the A/B switch, they stay in VRAM.
+    assert!(!embd_on_host(2, true, true, false));
+    assert!(!embd_on_host(1, false, true, false));
+    assert!(!embd_on_host(1, true, false, false));
+    assert!(!embd_on_host(1, true, true, true));
+}

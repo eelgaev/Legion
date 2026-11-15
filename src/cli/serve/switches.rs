@@ -1403,7 +1403,8 @@ pub(in crate::cli) struct SwitchArgs {
     /// same bits); each tensor's rounding to whole granules takes up to 2 MiB more VRAM, so the
     /// expert cache can lose a few slots. Needed by --kv-vmm-keep (#814). On by default, with
     /// --kv-vmm-keep 32768, on V100s (and GH200s, unmeasured) with the expert cache over a layer
-    /// split of 2 GPUs; off elsewhere.
+    /// split of 2 GPUs, and with 8192 kept tokens on an x86_64 PC's one discrete GPU whose
+    /// experts do not all fit in host memory (#37); off elsewhere.
     #[arg(long, help_heading = HEADING)]
     kv_vmm: bool,
     /// Turn --kv-vmm (and so --kv-vmm-keep) off where it is on by default: every block of the
@@ -1421,7 +1422,10 @@ pub(in crate::cli) struct SwitchArgs {
     /// --glm-parallel-decode, where every GPU keeps every layer's KV (an AC922 with 4 GPUs,
     /// 131072 context: 2.9 GiB a GPU back to the cache at 32768; a long prompt past the kept
     /// tokens maps the rest when it starts). Default 32768 where --kv-vmm is on by default;
-    /// elsewhere off (every block keeps its VRAM).
+    /// elsewhere off (every block keeps its VRAM). An x86_64 PC's one discrete GPU whose experts
+    /// do not all fit in host memory (#37) keeps 8192 by default and, without this flag, maps
+    /// the rest rather than evict a cached chat, and keeps it mapped for five minutes after a
+    /// chat on it last ran (a long chat's next turn maps nothing).
     #[arg(long, help_heading = HEADING, value_name = "TOKENS", value_parser = clap::value_parser!(u32).range(1..))]
     kv_vmm_keep: Option<u32>,
     /// Threads that read the model files at load (1-8; default 4). Replaces
