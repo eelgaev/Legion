@@ -763,6 +763,15 @@ fn q6k_mv_takes_the_debug_switch() {
 }
 
 #[test]
+fn small_mv_takes_the_debug_switch() {
+    assert_eq!(small_mv_of(None), SMALL_MV_DEFAULT);
+    assert_eq!(small_mv_of(Some(" 0\n")), 0);
+    assert_eq!(small_mv_of(Some("2")), SMALL_MV_SET);
+    assert_eq!(small_mv_of(Some("15")), 7);
+    assert_eq!(small_mv_of(Some("x")), SMALL_MV_DEFAULT);
+}
+
+#[test]
 fn q6k_mv_param_makes_whole_stages_of_contiguous_rows() {
     let nb1 = |k: i64| k / 256 * 210;
     // off, or rows not contiguous

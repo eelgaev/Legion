@@ -602,3 +602,174 @@ pub fn q6k_ms(
         })
         .collect()
 }
+
+/// GLM-5.3-Flash Maya-S's small decode products (`legion lin-bench --small`, #1172 r4): the F32
+/// router `ffn_gate_inp` (4096 x 288, 43 MoE layers), the KDA gates' second products `ssm_f_b`
+/// and `ssm_g_b` in one [`linear_set`] (Q8_0 128 x 8192 each, the first with kda_gate's
+/// epilogue; 34 KDA layers) and [`hc_pre_norm`] (F32 mix rows 16384 x 24, twice a layer).
+pub const SMALL_SHAPES: [&str; 3] = ["router", "kda.fgb", "hc_pre"];
+
+/// Weight bytes one [`SMALL_SHAPES`] product reads.
+pub fn small_bytes(name: &str) -> f64 {
+    match name {
+        "router" => (4096 * 288 * 4) as f64,
+        "kda.fgb" => (2 * 8192 * 4 * 34) as f64,
+        _ => (16384 * 24 * 4) as f64,
+    }
+}
+
+/// One [`super::small_mv`] mode's time in [`small_ms`].
+pub struct SmallTiming {
+    pub mode: u8,
+    /// Milliseconds per product: the best round's mean.
+    pub ms: f64,
+    /// Output values whose bits differ from the first mode's (the last copy's outputs).
+    pub differ: usize,
+}
+
+/// Valid random Q8_0 rows: random quants, block scales in [2^-8, 2^-7).
+fn q8_noise(blocks: usize, seed: u64) -> Vec<u8> {
+    let d = noise(blocks, seed ^ 0x55);
+    let q = noise(blocks * 32, seed);
+    let mut out = Vec::with_capacity(blocks * 34);
+    for (d, q) in d.iter().zip(q.chunks(32)) {
+        out.extend_from_slice(&f16_bytes(&[(1.5 + 0.5 * d) / 256.0]));
+        out.extend(q.iter().map(|v| (v * 127.0) as i8 as u8));
+    }
+    out
+}
+
+/// Times the [`SMALL_SHAPES`] product `name` at `n_tok` tokens (1-8) on `backend` for each
+/// [`super::small_mv`] mode of `modes`, as [`q6k_ms`] does (copies of the weights, ~384 MB in
+/// all, back to back), with random weights and inputs. Counts the output values of the last
+/// copy whose bits differ from the first mode's.
+pub fn small_ms(
+    backend: &mut Backend,
+    name: &str,
+    n_tok: usize,
+    reps: usize,
+    rounds: usize,
+    modes: &[u8],
+) -> Vec<SmallTiming> {
+    let n = n_tok as i64;
+    let copies = (384usize << 20)
+        .div_ceil(small_bytes(name) as usize)
+        .clamp(1, 48);
+    let data = Context::new(2 * copies + 16, 0);
+    // (weights per copy, the inputs and constants)
+    let (ws, xs): (Vec<Vec<Tensor<'_>>>, Vec<Tensor<'_>>) = match name {
+        "router" => (
+            (0..copies)
+                .map(|_| vec![data.new_tensor(types::F32, &[4096, 288])])
+                .collect(),
+            vec![data.new_tensor(types::F32, &[4096, n])],
+        ),
+        "kda.fgb" => (
+            (0..copies)
+                .map(|_| {
+                    vec![
+                        data.new_tensor(types::Q8_0, &[128, 8192]),
+                        data.new_tensor(types::Q8_0, &[128, 8192]),
+                    ]
+                })
+                .collect(),
+            vec![
+                data.new_tensor(types::F32, &[128, n]),
+                data.new_tensor(types::F32, &[128, n]),
+                data.new_tensor(types::F32, &[8192]),
+                data.new_tensor(types::F32, &[64]),
+            ],
+        ),
+        _ => (
+            (0..copies)
+                .map(|_| vec![data.new_tensor(types::F32, &[16384, 24])])
+                .collect(),
+            vec![
+                data.new_tensor(types::F32, &[4096, 4, n]),
+                data.new_tensor(types::F32, &[3]),
+                data.new_tensor(types::F32, &[24]),
+                data.new_tensor(types::F32, &[4096]),
+            ],
+        ),
+    };
+    data.alloc_tensors(backend.buffer_type()).unwrap();
+    for (c, w) in ws.iter().enumerate() {
+        for (j, w) in w.iter().enumerate() {
+            let seed = 7 + (2 * c + j) as u64;
+            if w.ty() == types::Q8_0 {
+                w.set_bytes(&q8_noise(w.elements() / 32, seed));
+            } else {
+                let v: Vec<f32> = noise(w.elements(), seed).iter().map(|v| v * 0.05).collect();
+                w.set_f32(&v);
+            }
+        }
+    }
+    for (i, x) in xs.iter().enumerate() {
+        let v: Vec<f32> = noise(x.elements(), 31 + i as u64)
+            .iter()
+            .map(|v| {
+                if name == "hc_pre" && i > 0 {
+                    0.5 + 0.25 * v
+                } else {
+                    *v
+                }
+            })
+            .collect();
+        x.set_f32(&v);
+    }
+    let bt = backend.buffer_type();
+    let ctxs: Vec<Context> = modes
+        .iter()
+        .map(|_| Context::new(8 * copies + 16, 8 * copies + 16))
+        .collect();
+    let graphs: Vec<(Vec<Tensor<'_>>, Graph<'_>)> = ctxs
+        .iter()
+        .zip(modes)
+        .map(|(ctx, &mode)| {
+            set_small_mv(mode);
+            let mut graph = ctx.new_graph(8 * copies + 16);
+            let mut last = Vec::new();
+            for w in &ws {
+                let outs: Vec<Tensor<'_>> = match name {
+                    "router" => vec![linear(ctx, w[0], xs[0], 1.0, None)],
+                    "kda.fgb" => linear_set(
+                        ctx,
+                        &[
+                            (w[0], xs[0], SetEpi::KdaGate(xs[2], xs[3], -5.0)),
+                            (w[1], xs[1], SetEpi::Plain),
+                        ],
+                    ),
+                    _ => {
+                        let (p, h) = hc_pre_norm(
+                            ctx, xs[0], w[0], xs[1], xs[2], 1e-6, 1e-6, 20, xs[3], 1e-5,
+                        );
+                        vec![p.y, p.pre, p.post, p.comb, h]
+                    }
+                };
+                last = outs.into_iter().map(|o| o.as_output()).collect();
+                for &o in &last {
+                    graph.expand(o);
+                }
+            }
+            ctx.alloc_graph(&graph, ComputeAllocator::new(bt)).unwrap();
+            (last, graph)
+        })
+        .collect();
+    let refs: Vec<&Graph<'_>> = graphs.iter().map(|(_, g)| g).collect();
+    let ms = time_graphs(backend, &refs, reps, rounds);
+    let first: Vec<Vec<u8>> = graphs[0].0.iter().map(|o| o.bytes()).collect();
+    modes
+        .iter()
+        .zip(&graphs)
+        .zip(ms)
+        .map(|((&mode, (outs, _)), ms)| SmallTiming {
+            mode,
+            ms: ms / copies as f64,
+            differ: outs
+                .iter()
+                .zip(&first)
+                .map(|(o, f)| differing(f, &o.bytes(), 4))
+                .sum(),
+        })
+        .collect()
+}
