@@ -241,13 +241,44 @@ impl TpEp {
         n: i64,
     ) -> (Tensor<'a>, Tensor<'a>) {
         let used = selected.ne()[0];
-        let flat = ctx.reshape_1d(ctx.cont(selected), used * n);
         let at = self.at(il);
         let table = |what: &str| self.ctx.tensor(&name(what, at)).expect("created in new");
         let slot = ctx.reshape_2d(table(SLOT), 1, self.n_expert as i64);
-        let ids = ctx.reshape_2d(ctx.get_rows(slot, flat), used, n);
-        let keep = ctx.reshape_2d(ctx.get_rows(table(KEEP), flat), used, n);
+        let (ids, keep) = if ggml_rows() {
+            let flat = ctx.reshape_1d(ctx.cont(selected), used * n);
+            (ctx.get_rows(slot, flat), ctx.get_rows(table(KEEP), flat))
+        } else {
+            (
+                gather(ctx, slot, selected, used * n),
+                gather(ctx, table(KEEP), selected, used * n),
+            )
+        };
+        let ids = ctx.reshape_2d(ids, used, n);
+        let keep = ctx.reshape_2d(keep, used, n);
         let w = if w.is_contiguous() { w } else { ctx.cont(w) };
         (ids, ctx.mul(w, keep))
     }
+}
+
+/// `table`'s rows (one 4-byte value each, `[1, E]`) at the router's choices `selected`
+/// (`[used, n]` I32, any strides) as `[1, count]`: ggml's `get_rows(table, cont(selected))`,
+/// the same values (copies), in one kernel of a thread per pair ([`node_fuse::IDS_REMAP`],
+/// #1176 r32) instead of the `cont` and ggml-cuda's block per pair (~150 us a layer at a
+/// 4,551-token prompt step on a GB10).
+///
+/// [`node_fuse::IDS_REMAP`]: super::node_fuse::IDS_REMAP
+fn gather<'a>(ctx: &'a Context, table: Tensor<'a>, selected: Tensor<'a>, count: i64) -> Tensor<'a> {
+    ctx.external(
+        &super::node_fuse::IDS_REMAP,
+        table.ty(),
+        [1, count, 1, 1],
+        &[table, selected],
+    )
+}
+
+/// `LEGION_DEBUG_TP_EP_GET_ROWS=1` (A/B runs): [`TpEp::remap_skips`] on ggml's `get_rows`, as
+/// before #1176 r32.
+fn ggml_rows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_TP_EP_GET_ROWS").is_some_and(|v| v == "1"))
 }
