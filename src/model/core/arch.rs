@@ -460,6 +460,30 @@ pub trait Arch: Debug + Send + Sync + Any {
         false
     }
 
+    /// Whether replay pools of this architecture's own recurrent layers ([`Recurrent::Kda`])
+    /// made now defer each commit's state update into the next verify step: [`Self::spec_replay`]
+    /// then gets a stash ([`super::Replay::stash`]), the verify steps run the waiting updates
+    /// first, and [`Self::spec_flush`] runs them on their own.
+    fn spec_defers(&self) -> bool {
+        false
+    }
+
+    /// The deferred state updates ([`Self::spec_defers`]) of every slot of recurrent states
+    /// `state` on their own, from the pool's stash of the layer and the device's count words
+    /// (I32, one per slot): the node that runs them.
+    fn spec_flush<'a>(
+        &self,
+        _ctx: &'a Context,
+        _state: Tensor<'a>,
+        _stash: Tensor<'a>,
+        _counts: Tensor<'a>,
+    ) -> Result<Tensor<'a>, ModelError> {
+        Err(ModelError::Unsupported(format!(
+            "deferred speculative commits of {}'s recurrent layers",
+            self.name()
+        )))
+    }
+
     /// The commit of a verify step's kept tokens into recurrent layer `il` of an architecture
     /// whose recurrent layers run its own ops ([`Recurrent::Kda`]): the nodes that advance the
     /// layer's states by them (see [`super::Replay`]).

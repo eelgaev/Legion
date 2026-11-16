@@ -207,7 +207,16 @@ pub struct Replay<'a> {
     /// GLM's parallel steps ([`SpecPool::set_shard`]): the GPU whose share of the heads the
     /// states hold, whose shards of the weights the replay reads; `None` for the whole layer.
     pub shard: Option<usize>,
+    /// A commit deferred into the next verify step ([`super::Arch::spec_defers`], #1172 r9):
+    /// the stored decays and betas as one F32 `[c + n_v, keep, n]` view (`g` and `beta` are
+    /// views of it), and the stash the replay fills for the next verify step (F32 `[3 c +
+    /// n_v, keep, n]` view): the convs advance their states now, the scan waits.
+    pub stash: Option<[Tensor<'a>; 2]>,
 }
+
+/// The key of a pool's deferred KDA commit graph of a set of runs in [`CommitGraphs`]: after
+/// the runs.
+const KDA_DEFER_MARK: (usize, usize, usize) = (usize::MAX, 2, 0);
 
 /// `src` viewed as `[a, rows, n]` (strides `nb`, at `offset`), copied into `dst`, a contiguous
 /// tensor of that shape: a commit's conv window.
@@ -355,7 +364,9 @@ impl SpecPool {
         let head_v = hp.ssm_d_inner / n_v;
         let (t, s) = (max_tokens as i64, n_slots as i64);
         let kda = hp.arch.recurrent() == Recurrent::Kda;
-        let defer = may_defer && Self::defers_layers(hp) && !layers.is_empty();
+        // KDA pools (#1172 r9) have one store only.
+        let defer =
+            may_defer && Self::defers_layers(hp) && !layers.is_empty() && !(kda && replay_min > 0);
         // Both stores: the own tensors beside the packed rows.
         let both = defer && replay_min > 0;
         // Verify steps that may leave the states keep the waiting tokens of more rounds in the
@@ -374,10 +385,27 @@ impl SpecPool {
             };
             if kda {
                 // The conv inputs, one decay per channel.
-                for name in ["q", "k", "v", "g"] {
-                    new(name, &[hp.ssm_d_inner, t, s]);
+                let c = hp.ssm_d_inner;
+                for name in ["q", "k", "v"] {
+                    new(name, &[c, t, s]);
                 }
-                new("beta", &[n_v, t, s]);
+                if !defer {
+                    new("g", &[c, t, s]);
+                    new("beta", &[n_v, t, s]);
+                    continue;
+                }
+                // A pool that defers (#1172 r9): g and beta share each token's row, which the
+                // commit's convs copy into the stash (`spec_x`: k and v after the convs, g, beta)
+                // for the next verify step's scan.
+                let gb = ctx
+                    .new_tensor(types::F32, &[c + n_v, t, s])
+                    .named(&format!("spec_gb-{il}"));
+                let nb = gb.nb();
+                ctx.view_3d(gb, [c, t, s], [nb[1], nb[2]], 0)
+                    .named(&format!("spec_g-{il}"));
+                ctx.view_3d(gb, [n_v, t, s], [nb[1], nb[2]], c as usize * 4)
+                    .named(&format!("spec_beta-{il}"));
+                new("x", &[3 * c + n_v, t, s]);
                 continue;
             }
             new("conv", &[hp.ssm_d_conv - 1 + t, conv_dim, s]);
@@ -412,6 +440,8 @@ impl SpecPool {
         }
         if defer {
             ctx.new_tensor(types::I32, &[s]).named("spec_pending");
+        }
+        if defer && !kda {
             // The verify steps' delta-rule CTAs count themselves here (part 39); zeros between
             // launches. One set for every layer: the layers run one after another.
             ctx.new_tensor(types::I32, &[hp.ssm_n_group * s])
@@ -430,7 +460,7 @@ impl SpecPool {
         // Committing never reads rows a verify step did not write, but keep them finite.
         ctx.clear_buffers(0);
         // The verify step's delta rule reads them on a GPU only.
-        let packed = defer && !both;
+        let packed = defer && !both && !kda;
         let defer = defer
             && ctx
                 .tensor("spec_pending")
@@ -468,7 +498,7 @@ impl SpecPool {
     /// Whether deferring pools of `hp`'s layers made now let their verify steps leave the
     /// states ([`STATE_DEFER`]).
     fn leaves_layers(hp: &Hparams) -> bool {
-        Self::defers_layers(hp) && state_defer()
+        hp.arch.recurrent() == Recurrent::DeltaNet && Self::defers_layers(hp) && state_defer()
     }
 
     /// The packed rows per slot beyond the verify width (`max_tokens`) a deferring pool of
@@ -489,6 +519,10 @@ impl SpecPool {
     /// commit on, a CUDA build.
     fn defers_layers(hp: &Hparams) -> bool {
         let n_v = hp.ssm_dt_rank.max(1);
+        if hp.arch.recurrent() == Recurrent::Kda {
+            // The architecture's own scan replays them (#1172 r9), for its head size.
+            return hp.arch.spec_defers() && hp.ssm_d_inner / n_v == 128;
+        }
         DEFER.load(Ordering::Relaxed)
             && cfg!(feature = "cuda")
             && hp.arch.recurrent() == Recurrent::DeltaNet
@@ -528,8 +562,12 @@ impl SpecPool {
             _ => 0,
         };
         if hp.arch.recurrent() == Recurrent::Kda {
-            // q, k, v and the decay per channel, beta per head; no conv window.
-            return (4 * (n_rec * t * (4 * hp.ssm_d_inner + hp.ssm_dt_rank) + ple)) as usize;
+            // q, k, v and the decay per channel, beta per head; no conv window. Deferred
+            // commits (#1172 r9): the stash of k, v, g and beta, and one count.
+            let c = hp.ssm_d_inner;
+            let defer = i64::from(Self::defers_layers(hp) && n_rec > 0);
+            let row = 4 * c + hp.ssm_dt_rank + defer * (3 * c + hp.ssm_dt_rank);
+            return (4 * (n_rec * t * row + ple + defer)) as usize;
         }
         // Deferred commits ([`DEFER`]): the inputs packed per token instead (the same floats, #836
         // part 38) and one count.
@@ -704,6 +742,36 @@ impl SpecPool {
         self.check(slot, n_tok, n);
         let l = self.layer(il);
         [l.q, l.k, l.v, l.g, l.beta].map(|t| Self::slots_view(ctx, t, slot, n_tok, n))
+    }
+
+    /// A KDA verify group's view of the deferred commits of slots `slot..slot + n` in layer
+    /// `il` (#1172 r9, [`super::Arch::spec_defers`]): the stash (F32 `[3 c + n_v,
+    /// max_tokens, n]`), and the device's count words with the group's first slot (the tensor
+    /// itself). `None` when the pool does not defer.
+    pub fn kda_deferred<'a>(
+        &'a self,
+        ctx: &'a Context,
+        il: usize,
+        slot: usize,
+        n: usize,
+    ) -> Option<(Tensor<'a>, (Tensor<'a>, usize))> {
+        if !self.kda || !self.replays(n) {
+            return None;
+        }
+        self.check(slot, 1, n as i64);
+        let x = self.stash_tensor(il);
+        let t = self.max_tokens as i64;
+        Some((
+            Self::slots_view(ctx, x, slot, t, n as i64),
+            (self.pending_tensor(), slot),
+        ))
+    }
+
+    /// A deferring KDA pool's stash of layer `il` (`[3 c + n_v, max_tokens, slots]`).
+    fn stash_tensor(&self, il: usize) -> Tensor<'_> {
+        self.ctx
+            .tensor(&format!("spec_x-{il}"))
+            .unwrap_or_else(|| panic!("layer {il} has no stash"))
     }
 
     /// `[w, n_tok, n]` of the pool tensor `t` (`[w, max_tokens, slots]`) at slot `slot`.
@@ -1111,12 +1179,13 @@ impl SpecPool {
         kept: &mut CommitGraphs,
         rec: &StatePool,
         commits: &[(usize, usize)],
+        model: &Model,
     ) -> Result<bool, GgmlError> {
         if commits.is_empty() {
             return Ok(true);
         }
         if !self.defer
-            || !self.slots_wanted()
+            || (!self.kda && !self.slots_wanted())
             || backend.is_meta()
             || self.defer_unfit.load(Ordering::Relaxed)
         {
@@ -1125,7 +1194,28 @@ impl SpecPool {
         if !self.pending.lock().unwrap().can_commit(commits) {
             // A slot committed again without its verify step in between: not a verify round.
             // SAFETY: the caller's.
-            unsafe { self.flush(backend, kept, rec) }?;
+            unsafe { self.flush(backend, kept, rec, model) }?;
+        }
+        if self.kda {
+            // KDA (#1172 r9): the runs' convs, which stash what their scans need, in a graph
+            // per set of runs as [`Self::commit`] keeps them.
+            let counts = self.pending.lock().unwrap().commit(commits);
+            self.upload_counts(backend, &counts);
+            let mut runs = self.commit_runs(commits);
+            runs.push(KDA_DEFER_MARK);
+            if let Some(i) = kept.iter().position(|(r, _)| *r == runs) {
+                let g = kept.remove(i);
+                let res = backend.compute_kept_async(&g.1);
+                kept.push(g);
+                if res.is_err() {
+                    backend.synchronize();
+                }
+                res?;
+            } else {
+                self.build_commit(backend, kept, rec, runs, model)?;
+            }
+            self.push_fed(rec, commits);
+            return Ok(true);
         }
         let i = match kept.iter().position(|(r, _)| r[..] == DEFER_KEY) {
             Some(i) => i,
@@ -1202,6 +1292,7 @@ impl SpecPool {
         backend: &mut Backend,
         kept: &mut CommitGraphs,
         rec: &StatePool,
+        model: &Model,
     ) -> Result<(), GgmlError> {
         if !self.defer {
             return Ok(());
@@ -1212,7 +1303,7 @@ impl SpecPool {
         let i = match kept.iter().position(|(r, _)| r[..] == FLUSH_KEY) {
             Some(i) => i,
             None => {
-                let g = self.build_flush(backend, rec)?;
+                let g = self.build_flush(backend, rec, model)?;
                 kept.push((FLUSH_KEY.to_vec(), g));
                 kept.len() - 1
             }
@@ -1227,7 +1318,12 @@ impl SpecPool {
 
     /// The flush graph ([`Self::flush`]): per layer the deferred delta rule of every slot from
     /// its packed replay rows, reading the device's deferred counts.
-    fn build_flush(&self, backend: &mut Backend, rec: &StatePool) -> Result<KeptGraph, GgmlError> {
+    fn build_flush(
+        &self,
+        backend: &mut Backend,
+        rec: &StatePool,
+        model: &Model,
+    ) -> Result<KeptGraph, GgmlError> {
         // Per layer the state's view, five views of the replay rows and the op.
         let n_nodes = 12 * self.layers.len() + 32;
         let ctx = Context::new(n_nodes, n_nodes);
@@ -1236,6 +1332,16 @@ impl SpecPool {
         let keep = self.pending_tensor();
         for &il in &self.layers {
             let state = rec.ssm_slots(&ctx, il, 0, n);
+            if self.kda {
+                // The architecture's scan of the stashed tokens (#1172 r9).
+                let node = model
+                    .hp
+                    .arch
+                    .spec_flush(&ctx, state, self.stash_tensor(il), keep)
+                    .map_err(|e| GgmlError::External(e.to_string()))?;
+                graph.expand(node);
+                continue;
+            }
             let r = self.replay_tensor(il);
             graph.expand(super::gdn::commit_replay(&ctx, r, state, keep, self.n_k));
         }
@@ -1295,6 +1401,9 @@ impl SpecPool {
         let ctx = Context::new(n_nodes, n_nodes);
         let mut graph = ctx.new_graph(n_nodes);
         let (hk, nk, hv, nv) = (self.head_k, self.n_k, self.head_v, self.n_v);
+        // A KDA commit deferred into the next verify step ([`Self::commit_deferred`]).
+        let defer = runs.last() == Some(&KDA_DEFER_MARK);
+        let (key, runs) = (runs.clone(), &runs[..runs.len() - usize::from(defer)]);
         // Mamba-2: the selective scan reads each run's slots through ids 0..n. Set once, after
         // the allocation, and the graph is kept and run again: an output too, so the allocator
         // never places a node over it once its last scan ran (#836).
@@ -1306,10 +1415,17 @@ impl SpecPool {
         });
         for &il in &self.layers {
             let l = self.layer(il);
-            for &(slot, n, keep) in &runs {
+            for &(slot, n, keep) in runs {
                 let (n_i, keep_i) = (n as i64, keep as i64);
                 if self.kda {
                     let v = |t| Self::slots_view(&ctx, t, slot, keep_i, n_i);
+                    let stash = defer.then(|| {
+                        let gb = self
+                            .ctx
+                            .tensor(&format!("spec_gb-{il}"))
+                            .expect("a deferring KDA pool");
+                        [v(gb), v(self.stash_tensor(il))]
+                    });
                     let r = Replay {
                         x: [v(l.q), v(l.k), v(l.v)],
                         g: v(l.g),
@@ -1318,6 +1434,7 @@ impl SpecPool {
                         ssm: rec.ssm_slots(&ctx, il, slot, n),
                         keep: keep_i,
                         shard: self.shard,
+                        stash,
                     };
                     let nodes = model
                         .hp
@@ -1408,7 +1525,7 @@ impl SpecPool {
         if let Some((il, hist, width)) = self.ple {
             let t = self.ctx.tensor("spec_ple").expect("a per-layer embedding");
             let nb = t.nb();
-            for &(slot, n, keep) in &runs {
+            for &(slot, n, keep) in runs {
                 graph.expand(window_copy(
                     &ctx,
                     t,
@@ -1434,7 +1551,7 @@ impl SpecPool {
         // alive while it keeps the graph (this function's contract).
         let g = unsafe { KeptGraph::new(ctx, parts) };
         let res = backend.compute_kept_async(&g);
-        kept.push((runs, g));
+        kept.push((key, g));
         if res.is_err() {
             backend.synchronize();
         }

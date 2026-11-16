@@ -3196,12 +3196,15 @@ __global__ void hc_head_kernel(const A a) {
 // A thread per (channel, sequence), the tokens in order. blockIdx.y picks the projection of a
 // fused q/k/v replay (params[4], #676: sources x_q, w_q, state, x_k, w_k, x_v, w_v, dst
 // [c, n, 3], projection j's channels from ch_off + j * c); one projection otherwise.
+// A deferred commit's replay (params[5], #1172 r9, ops::kda_conv3_stash) also stashes each
+// token's k and v outputs and its stored decays and beta (the eighth source, [c + n_head, ...])
+// in the ninth source's rows ([k c | v c | g c | beta n_head]) for the next verify step's scan.
 __global__ void kda_conv_kernel(const A a) {
     pdl_wait();
     const int64_t c = a.ne[0], n = a.ne[1];
     const int j = blockIdx.y, xi = j == 0 ? 0 : 2 * j + 1, wi = xi + 1;
     const int64_t ch_off = a.params[0] + j * c, n_tok = a.params[1], n_seqs = n / n_tok;
-    const bool verify = a.params[2] != 0;
+    const bool verify = a.params[2] != 0, stash = a.params[4] != 0 && a.params[5] != 0;
     const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= c * n_seqs) {
         return;
@@ -3224,7 +3227,20 @@ __global__ void kda_conv_kernel(const A a) {
         acc += w1 * wc[1];
         acc += w2 * wc[2];
         acc += xv * wc[3];
-        out[col * c + ch] = silu(acc);
+        const float y = silu(acc);
+        out[col * c + ch] = y;
+        if (stash) {
+            float * row = (float *) ((char *) a.src[8] + s * a.src_nb[8][2] + t * a.src_nb[8][1]);
+            if (j > 0) {
+                row[(j - 1) * c + ch] = y;
+            } else {
+                const float * gb = (const float *) (S(a, 7) + s * a.src_nb[7][2] + t * a.src_nb[7][1]);
+                row[2 * c + ch] = gb[ch];
+                if (ch < a.src_ne[7][0] - c) {
+                    row[3 * c + ch] = gb[c + ch];
+                }
+            }
+        }
         w0 = w1;
         w1 = w2;
         w2 = xv;
@@ -3324,25 +3340,48 @@ __global__ void sigmoid_kernel(const float * x, float * out, int64_t n) {
 // gets the same values in the same order: the same bits. A 1,024-thread block a head is 64
 // blocks for Maya-S's 64 heads, two waves on the GB10's 48 SMs (one block an SM); 256-thread
 // blocks are one wave. The first block of a head stores the verify group's decays and beta.
+//
+// params[1] (#1172 r9, ops::kda_scan_verify_replay / ops::kda_flush): 0 a commit, 1 a verify
+// group, 2 a verify group that first runs its sequences' deferred commits, 3 those commits alone
+// (sources: the states, the stash). A deferred commit is sequence s's count word at the address
+// in params[4..5] (its kept tokens, from the stash row in bits 8-15): those tokens' k, v, decays
+// and beta, stashed by its replay's convs (kda_conv_kernel), go through the same instructions
+// as this kernel's commit gives them (q left at zeros: its output is not written), and the state
+// goes back over the slot before the step's own tokens start from it. One pass over the state
+// instead of the commit's and then the verify group's: the same bits.
 constexpr int KD = 128, KL = 8, KR = KD / KL;
 
 template <int ROWS>
 __global__ void __launch_bounds__(ROWS * KL) kda_scan_kernel(const A a) {
-    static_assert(KD % ROWS == 0 && ROWS * KL >= 2 * KD, "a block's threads cover q and k's norms");
+    static_assert(KD % ROWS == 0 && ROWS * KL >= 64, "whole warps");
     pdl_wait();
     __shared__ float qs[KD], ks[KD], dec[KD], part[8];
     constexpr int SPLIT = KD / ROWS;
+    const int mode = a.params[1];
+    const int si = mode == 3 ? 0 : 5, xi = mode == 3 ? 1 : 8;
     const int64_t h = a.ne[1], hd = blockIdx.x / SPLIT, s = blockIdx.y;
     const int rb = (int) (blockIdx.x % SPLIT) * ROWS;
-    const int64_t n_tok = a.params[0], n_seqs = a.ne[2] / n_tok;
-    const bool verify = a.params[1] != 0, first = rb == 0;
+    const int64_t n_tok = mode == 3 ? 0 : a.params[0], n_seqs = gridDim.y;
+    const bool verify = mode == 1 || mode == 2, first = rb == 0;
     const int tid = threadIdx.x, j = rb + tid / KL, l = tid % KL;
     const float * q = (const float *) a.src[0];
     const float * k = (const float *) a.src[1];
     const float * v = (const float *) a.src[2];
-    const char * g = S(a, 3) + s * seq_nb(a, 3, 2, n_tok, n_seqs) + hd * a.src_nb[3][1];
-    const char * beta = S(a, 4) + s * seq_nb(a, 4, 1, n_tok, n_seqs) + hd * 4;
-    float * st = (float *) ((char *) a.src[5] + hd * a.src_nb[5][2] + s * a.src_nb[5][3]) + j * KD;
+    const char * g = mode == 3 ? nullptr : S(a, 3) + s * seq_nb(a, 3, 2, n_tok, n_seqs) + hd * a.src_nb[3][1];
+    const char * beta = mode == 3 ? nullptr : S(a, 4) + s * seq_nb(a, 4, 1, n_tok, n_seqs) + hd * 4;
+    float * st = (float *) ((char *) a.src[si] + hd * a.src_nb[si][2] + s * a.src_nb[si][3]) + j * KD;
+    int64_t keep = 0, row0 = 0;
+    if (mode >= 2) {
+        const int32_t * words =
+            (const int32_t *) (((uint64_t) (uint32_t) a.params[5] << 32) | (uint64_t) (uint32_t) a.params[4]);
+        const int32_t w = words[s];
+        keep = w & 0xff;
+        row0 = (w >> 8) & 0xff;
+    }
+    if (mode == 3 && keep == 0) {
+        return;
+    }
+    const int64_t c = KD * h;
     float S_[KR];
 #pragma unroll
     for (int r = 0; r < KR; r++) {
@@ -3350,27 +3389,48 @@ __global__ void __launch_bounds__(ROWS * KL) kda_scan_kernel(const A a) {
     }
     const float qscale = rsqrtf((float) KD);
     float * out = (float *) a.dst;
-    for (int64_t t = 0; t < n_tok; t++) {
+    for (int64_t t = -keep; t < n_tok; t++) {
+        // t < 0: a deferred commit's token, from its stash row.
+        const float * xr = (const float *) (S(a, xi) + s * a.src_nb[xi][2] + (row0 + keep + t) * a.src_nb[xi][1]);
         const int64_t col = s * n_tok + t, off = (col * h + hd) * KD;
-        if (tid < KD) {
-            qs[tid] = q[off + tid];
-            ks[tid] = k[off + tid];
-            const float gv = ((const float *) (g + t * a.src_nb[3][2]))[tid];
-            dec[tid] = expf(gv);
-            if (verify && first) {
-                ((float *) ((char *) a.src[6] + s * a.src_nb[6][2] + t * a.src_nb[6][1]))[hd * KD + tid] = gv;
+        for (int i = tid; i < KD; i += ROWS * KL) {
+            if (t < 0) {
+                qs[i] = 0.0f;
+                ks[i] = xr[hd * KD + i];
+                dec[i] = expf(xr[2 * c + hd * KD + i]);
+            } else {
+                qs[i] = q[off + i];
+                ks[i] = k[off + i];
+                const float gv = ((const float *) (g + t * a.src_nb[3][2]))[i];
+                dec[i] = expf(gv);
+                if (verify && first) {
+                    ((float *) ((char *) a.src[6] + s * a.src_nb[6][2] + t * a.src_nb[6][1]))[hd * KD + i] = gv;
+                }
             }
         }
-        const float bt = *(const float *) (beta + t * a.src_nb[4][1]);
-        if (verify && first && tid == 0) {
+        const float bt = t < 0 ? xr[3 * c + hd] : *(const float *) (beta + t * a.src_nb[4][1]);
+        if (t >= 0 && verify && first && tid == 0) {
             ((float *) ((char *) a.src[7] + s * a.src_nb[7][2] + t * a.src_nb[7][1]))[hd] = bt;
         }
         __syncthreads();
-        if (tid < 2 * KD) {
-            const float x = tid < KD ? qs[tid] : ks[tid - KD];
-            const float sq = warp_sum(x * x);
-            if (tid % 32 == 0) {
-                part[tid / 32] = sq;
+        if constexpr (ROWS * KL >= 2 * KD) {
+            if (tid < 2 * KD) {
+                const float x = tid < KD ? qs[tid] : ks[tid - KD];
+                const float sq = warp_sum(x * x);
+                if (tid % 32 == 0) {
+                    part[tid / 32] = sq;
+                }
+            }
+        } else {
+            // 128 or 64 threads (8 or 16 blocks a head, #1172 r9): warp w sums q's and then k's
+            // values 32 c .. 32 c + 31 for its chunks c, as warps c and 4 + c do above.
+            for (int cc = tid / 32; cc < 4; cc += ROWS * KL / 32) {
+                const float x = qs[32 * cc + tid % 32], y = ks[32 * cc + tid % 32];
+                const float sq = warp_sum(x * x), sk = warp_sum(y * y);
+                if (tid % 32 == 0) {
+                    part[cc] = sq;
+                    part[4 + cc] = sk;
+                }
             }
         }
         __syncthreads();
@@ -3387,7 +3447,7 @@ __global__ void __launch_bounds__(ROWS * KL) kda_scan_kernel(const A a) {
         kv += __shfl_xor_sync(0xffffffffu, kv, 1);
         kv += __shfl_xor_sync(0xffffffffu, kv, 2);
         kv += __shfl_xor_sync(0xffffffffu, kv, 4);
-        const float delta = (v[off + j] - kv) * bt;
+        const float delta = ((t < 0 ? xr[c + hd * KD + j] : v[off + j]) - kv) * bt;
         float o = 0.0f;
 #pragma unroll
         for (int r = 0; r < KR; r++) {
@@ -3398,13 +3458,20 @@ __global__ void __launch_bounds__(ROWS * KL) kda_scan_kernel(const A a) {
         o += __shfl_xor_sync(0xffffffffu, o, 1);
         o += __shfl_xor_sync(0xffffffffu, o, 2);
         o += __shfl_xor_sync(0xffffffffu, o, 4);
-        if (l == 0) {
+        if (t >= 0 && l == 0) {
             out[off + j] = o;
+        }
+        if (t == -1) {
+            // The deferred commit is done: its state over the slot.
+#pragma unroll
+            for (int r = 0; r < KR; r++) {
+                st[l + KL * r] = S_[r];
+            }
         }
         __syncthreads();
     }
     // A verify group leaves the state for the commit.
-    if (verify) {
+    if (mode != 0) {
         return;
     }
 #pragma unroll
@@ -4793,26 +4860,28 @@ extern "C" int legion_glm_launch(int op, const legion_glm_args * ap, void * stre
         case SIGMOID:
             launch_pdl(sigmoid_kernel, blocks(n_out, 256), 256, 0, st, (const float *) a.src[0], (float *) a.dst, n_out);
             break;
-        case KDA_SCAN:
+        case KDA_SCAN: {
             if (a.ne[0] != KD) {
                 return 1;
             }
+            // params[1] 3: the deferred commits alone (#1172 r9), a block row per state slot
+            const unsigned ns = (unsigned) (a.params[1] == 3 ? a.src_ne[0][3] : a.ne[2] / a.params[0]);
             // params[2]: the GB10 kernels (ops::set_gb10_linear), for prompt steps
             if (a.params[2] && !a.params[1] && a.params[0] >= 64) {
-                launch_pdl(kda_scan_rows_kernel,
-                           dim3((unsigned) (a.ne[1] * (KD / KS_ROWS)), (unsigned) (a.ne[2] / a.params[0])), 32 * KS_W,
-                           0, st, a);
+                launch_pdl(kda_scan_rows_kernel, dim3((unsigned) (a.ne[1] * (KD / KS_ROWS)), ns), 32 * KS_W, 0, st, a);
+            } else if (a.params[3] == 4) {  // ops::kda_split (#1172 r9): 16 blocks a head
+                launch_pdl(kda_scan_kernel<KD / 16>, dim3((unsigned) (a.ne[1] * 16), ns), KD / 16 * KL, 0, st, a);
+            } else if (a.params[3] == 3) {  // ops::kda_split (#1172 r9): 8 blocks a head
+                launch_pdl(kda_scan_kernel<KD / 8>, dim3((unsigned) (a.ne[1] * 8), ns), KD / 8 * KL, 0, st, a);
             } else if (a.params[3] == 2) {  // ops::kda_split (#1172 r8): 4 blocks a head
-                launch_pdl(kda_scan_kernel<KD / 4>, dim3((unsigned) (a.ne[1] * 4), (unsigned) (a.ne[2] / a.params[0])),
-                           KD / 4 * KL, 0, st, a);
+                launch_pdl(kda_scan_kernel<KD / 4>, dim3((unsigned) (a.ne[1] * 4), ns), KD / 4 * KL, 0, st, a);
             } else if (a.params[3] == 1) {  // 2 blocks a head
-                launch_pdl(kda_scan_kernel<KD / 2>, dim3((unsigned) (a.ne[1] * 2), (unsigned) (a.ne[2] / a.params[0])),
-                           KD / 2 * KL, 0, st, a);
+                launch_pdl(kda_scan_kernel<KD / 2>, dim3((unsigned) (a.ne[1] * 2), ns), KD / 2 * KL, 0, st, a);
             } else {
-                launch_pdl(kda_scan_kernel<KD>, dim3((unsigned) a.ne[1], (unsigned) (a.ne[2] / a.params[0])), KD * KL, 0,
-                           st, a);
+                launch_pdl(kda_scan_kernel<KD>, dim3((unsigned) a.ne[1], ns), KD * KL, 0, st, a);
             }
             break;
+        }
         case GATED_RMS:
             launch_pdl(gated_rms_kernel, (unsigned) (n_out / a.src_ne[1][0]), 128, 0, st, a);
             break;

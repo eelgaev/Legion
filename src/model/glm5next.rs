@@ -656,6 +656,28 @@ impl Arch for Glm5Params {
         Recurrent::Kda
     }
 
+    /// MTP commits' scans wait for the next verify step's ([`ops::kda_defer`], #1172 r9): the
+    /// GPU kernels only.
+    fn spec_defers(&self) -> bool {
+        cfg!(feature = "cuda") && ops::kda_defer()
+    }
+
+    /// The deferred commits' scans on their own ([`ops::kda_flush`]).
+    fn spec_flush<'a>(
+        &self,
+        ctx: &'a Context,
+        state: Tensor<'a>,
+        stash: Tensor<'a>,
+        counts: Tensor<'a>,
+    ) -> Result<Tensor<'a>, ModelError> {
+        let counts = (counts, 0);
+        Ok(ops::kda_flush(
+            ctx,
+            state,
+            ops::KdaDeferred { stash, counts },
+        ))
+    }
+
     /// The kept tokens through the same convs and scan as a decode step's (each runs its
     /// tokens one after another), from the verify step's stored inputs.
     fn spec_replay<'a>(
@@ -671,15 +693,17 @@ impl Arch for Glm5Params {
         let n = r.x[0].ne()[2];
         let split = r.shard.map_or_else(String::new, |g| par::shard_name("", g));
         let conv_w = |s: &str| m.lw(il, &format!("ssm_conv1d_{s}.weight{split}"));
+        let w = [conv_w("q")?, conv_w("k")?, conv_w("v")?];
+        if let Some(stash) = r.stash {
+            // A commit deferred into the next verify step (#1172 r9): the convs now, which
+            // stash what the scan needs; the next verify step's scan runs it.
+            return Ok(vec![ops::kda_conv3_stash(
+                ctx, r.x, w, r.conv, r.keep, stash,
+            )]);
+        }
         // q, k and v in one launch (#676): a commit is ~4 launches a KDA layer, launched
         // while the host does the step's cache work, and each took the driver from it.
-        let y = ops::kda_conv3(
-            ctx,
-            r.x,
-            [conv_w("q")?, conv_w("k")?, conv_w("v")?],
-            r.conv,
-            r.keep,
-        );
+        let y = ops::kda_conv3(ctx, r.x, w, r.conv, r.keep);
         let part = |j: usize| {
             let nb1 = d as usize * 4;
             let nb2 = c as usize * 4;
@@ -1689,9 +1713,20 @@ impl Model {
             let gg = ctx.reshape_3d(cols(ctx, g, off, ng), d, h, ng);
             let bg = cols(ctx, beta, off, ng);
             let ssm = pass.rec.ssm_slots(ctx, il, sh.slot, sh.n_seqs);
-            outs.push(match store {
-                Some(st) => ops::kda_scan_verify(ctx, qc, kc, vc, gg, bg, ssm, nt, [st[3], st[4]]),
-                None => ops::kda_scan(ctx, qc, kc, vc, gg, bg, ssm, nt),
+            // A pool that defers its commits' scans (#1172 r9): this step runs them first.
+            let deferred = store
+                .and(pass.spec)
+                .and_then(|spec| spec.kda_deferred(ctx, il, sh.slot, sh.n_seqs));
+            outs.push(match (store, deferred) {
+                (Some(st), Some((stash, counts))) => {
+                    let r = ops::KdaDeferred { stash, counts };
+                    let store = [st[3], st[4]];
+                    ops::kda_scan_verify_replay(ctx, qc, kc, vc, gg, bg, ssm, nt, store, r)
+                }
+                (Some(st), None) => {
+                    ops::kda_scan_verify(ctx, qc, kc, vc, gg, bg, ssm, nt, [st[3], st[4]])
+                }
+                (None, _) => ops::kda_scan(ctx, qc, kc, vc, gg, bg, ssm, nt),
             });
         }
         let o = ops::join_cols(ctx, &outs);
