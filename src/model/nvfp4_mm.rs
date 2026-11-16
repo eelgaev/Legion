@@ -1407,6 +1407,37 @@ pub fn glu_gemm_tile(k: i64, n_expert: i64, per: i64) -> (i32, GemmTune) {
     (nt, grouped_gemm_tune(k, n_expert, 2, nt, true))
 }
 
+/// The prefill SwiGLU GEMM tile of `LEGION_DEBUG_NVFP4_GLU` (#1176, A/B runs only): `8 * nt`
+/// tokens per tile with variant `tune`, for every expert or (`cut`) only for the experts of at
+/// most `cut` pairs, the others on the default tile in a launch of their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DebugGlu {
+    pub nt: i32,
+    pub tune: GemmTune,
+    pub cut: Option<i32>,
+}
+
+/// `<nt>,<stages * 10 + ctas>[,<cut>]` (`8,22,64`), where that tile and variant are compiled
+/// ([`gemm_tune_fits`] at 64 or 128 tokens; the default variant also at 32); else `None`.
+pub fn parse_debug_glu(s: &str) -> Option<DebugGlu> {
+    let f: Vec<i32> = s
+        .split(',')
+        .map(|v| v.trim().parse().ok())
+        .collect::<Option<_>>()?;
+    let (nt, code, cut) = match f[..] {
+        [nt, code] => (nt, code, None),
+        [nt, code, cut] if cut > 0 => (nt, code, Some(cut)),
+        _ => return None,
+    };
+    let tune = GemmTune::from_code(code);
+    let ok = if tune == GEMM_DEFAULT {
+        matches!(nt, 4 | 8 | 16)
+    } else {
+        gemm_tune_fits(2, nt, tune)
+    };
+    ok.then_some(DebugGlu { nt, tune, cut })
+}
+
 #[cfg(feature = "cuda")]
 mod cuda {
     use std::os::raw::c_void;
@@ -2011,7 +2042,55 @@ mod cuda {
         if let Some(t) = forced_tiles().filter(|_| split.is_none()) {
             p.tiles_n = p.tiles_n.min(t);
         }
-        glu_gemm(&p, nt, tune_at(nt), stream)
+        // LEGION_DEBUG_NVFP4_GLU (A/B runs): another tile for the step's GEMM, where nothing is
+        // forced. A cut needs launches that store no skipped pair's zeros (the selected
+        // launches leave them to no CTA): no -1 ids, or ids whose rows nothing reads.
+        let dbg = debug_glu().filter(|d| {
+            split.is_none()
+                && forced_nt == 0
+                && forced_tune().is_none()
+                && forced_tiles().is_none()
+                && (d.cut.is_none() || (rows.is_null() && (!skips || p.unread_skips != 0)))
+        });
+        match dbg {
+            None => glu_gemm(&p, nt, tune_at(nt), stream),
+            Some(DebugGlu {
+                nt: d_nt,
+                tune,
+                cut: None,
+            }) => {
+                p.tiles_n = grouped_tiles(pairs, 8 * d_nt as i64, n_expert, skip || skips);
+                glu_gemm(&p, d_nt, tune, stream)
+            }
+            Some(DebugGlu {
+                nt: d_nt,
+                tune,
+                cut: Some(cut),
+            }) => {
+                // The experts of more than `cut` pairs on the default tile, then the others.
+                p.tiles_n = split_tiles(pairs, cols, n_expert, cut, true);
+                (p.sel_lo, p.sel_hi) = (cut, ALL.1);
+                glu_gemm(&p, nt, tune_at(nt), stream)?;
+                p.tiles_n = split_tiles(pairs, 8 * d_nt as i64, n_expert, cut, false);
+                (p.sel_lo, p.sel_hi) = (ALL.0, cut);
+                glu_gemm(&p, d_nt, tune, stream)
+            }
+        }
+    }
+
+    /// [`super::parse_debug_glu`] of `LEGION_DEBUG_NVFP4_GLU`, read once (a value it does not
+    /// take is reported and ignored).
+    fn debug_glu() -> Option<DebugGlu> {
+        static V: std::sync::OnceLock<Option<DebugGlu>> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            let v = std::env::var("LEGION_DEBUG_NVFP4_GLU").ok()?;
+            let d = parse_debug_glu(&v);
+            match d {
+                Some(d) => tracing::info!("LEGION_DEBUG_NVFP4_GLU: {d:?}"),
+                None => tracing::warn!("LEGION_DEBUG_NVFP4_GLU={v:?} ignored"),
+            }
+            d
+        })
     }
 
     /// The grouped SwiGLU GEMM at `8 * nt` tokens per tile.

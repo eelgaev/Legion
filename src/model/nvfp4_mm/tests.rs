@@ -314,6 +314,33 @@ fn gemm_tune_codes() {
 }
 
 #[test]
+fn debug_glu_values() {
+    assert_eq!(
+        parse_debug_glu("8,22"),
+        Some(DebugGlu {
+            nt: 8,
+            tune: GEMM_DOWN,
+            cut: None
+        })
+    );
+    assert_eq!(
+        parse_debug_glu("8, 22, 64"),
+        Some(DebugGlu {
+            nt: 8,
+            tune: GEMM_DOWN,
+            cut: Some(64)
+        })
+    );
+    assert_eq!(parse_debug_glu("4,31").map(|d| d.nt), Some(4));
+    // Not compiled: two CTAs of 128-token stages, a 32-token tuned tile; a bad cut or shape.
+    assert_eq!(parse_debug_glu("16,22"), None);
+    assert_eq!(parse_debug_glu("4,22"), None);
+    assert_eq!(parse_debug_glu("8,22,0"), None);
+    assert_eq!(parse_debug_glu("8"), None);
+    assert_eq!(parse_debug_glu("8,x"), None);
+}
+
+#[test]
 fn bf16_rounding() {
     assert_eq!(bf16_bits(1.0), 0x3f80);
     // Ties to even: 1 + 2^-8 rounds down to 1, 1 + 3 * 2^-8 up to 1 + 2^-6.
