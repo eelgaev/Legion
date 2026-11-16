@@ -509,6 +509,13 @@ fn glm_kernels_marks_the_node() {
     let both = glm_q8(glm_kernels(op(), true), true);
     assert_eq!((marked(both), q8(both)), (1, 1));
     assert_eq!(q8(glm_q8(glm_q8(op(), true), false)), 0);
+    // the back-to-back launches (#1172 r6): a second bit, only on a node of GLM's kernels
+    assert_eq!(marked(glm_pdl(op(), true)), 0);
+    assert_eq!(marked(glm_pdl(glm_kernels(op(), true), true)), 1 | GLM_PDL);
+    assert_eq!(
+        marked(glm_pdl(glm_pdl(glm_kernels(op(), true), true), false)),
+        1
+    );
 }
 
 /// GLM-5.3-Flash's int8 prompt GEMMs (#603, opt-in; IQ2_S and IQ3_XXS down, #594): within the

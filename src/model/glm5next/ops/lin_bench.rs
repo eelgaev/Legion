@@ -609,8 +609,18 @@ pub fn q6k_ms(
 /// epilogue; 34 KDA layers) and [`hc_pre_norm`] (F32 mix rows 16384 x 24, twice a layer); and
 /// (#1172 r5) the shared expert's gate, up and GLU (`shexp.glu`, Q6_K 4096 x 2048 each, 43 MoE
 /// layers) as `glm_ffn` builds them: [`glu_mv`] where [`glu_mv_takes`], else two [`linear`]s
-/// and [`glu`].
-pub const SMALL_SHAPES: [&str; 4] = ["router", "kda.fgb", "hc_pre", "shexp.glu"];
+/// and [`glu`]; and (#1172 r6) MLA's kv_a and q_a (Q6_K 4096 x 512 and 4096 x 1536, 12 MLA
+/// layers) through [`linear_sp`], and the shared expert's gate, up, GLU and down (`shexp.chain`,
+/// the down through [`linear_sp`]) back to back.
+pub const SMALL_SHAPES: [&str; 7] = [
+    "router",
+    "kda.fgb",
+    "hc_pre",
+    "shexp.glu",
+    "mla.kv_a",
+    "mla.q_a",
+    "shexp.chain",
+];
 
 /// Weight bytes one [`SMALL_SHAPES`] product reads.
 pub fn small_bytes(name: &str) -> f64 {
@@ -618,6 +628,9 @@ pub fn small_bytes(name: &str) -> f64 {
         "router" => (4096 * 288 * 4) as f64,
         "kda.fgb" => (2 * 8192 * 4 * 34) as f64,
         "shexp.glu" => (2 * 4096 / 256 * 210 * 2048) as f64,
+        "mla.kv_a" => (4096 / 256 * 210 * 512) as f64,
+        "mla.q_a" => (4096 / 256 * 210 * 1536) as f64,
+        "shexp.chain" => (3 * 4096 / 256 * 210 * 2048) as f64,
         _ => (16384 * 24 * 4) as f64,
     }
 }
@@ -659,7 +672,7 @@ pub fn small_ms(
     let copies = (384usize << 20)
         .div_ceil(small_bytes(name) as usize)
         .clamp(1, 48);
-    let data = Context::new(2 * copies + 16, 0);
+    let data = Context::new(3 * copies + 16, 0);
     // (weights per copy, the inputs and constants)
     let (ws, xs): (Vec<Vec<Tensor<'_>>>, Vec<Tensor<'_>>) = match name {
         "router" => (
@@ -690,6 +703,27 @@ pub fn small_ms(
                     vec![
                         data.new_tensor(types::Q6_K, &[4096, 2048]),
                         data.new_tensor(types::Q6_K, &[4096, 2048]),
+                    ]
+                })
+                .collect(),
+            vec![data.new_tensor(types::F32, &[4096, n])],
+        ),
+        "mla.kv_a" | "mla.q_a" => (
+            (0..copies)
+                .map(|_| {
+                    let m = if name == "mla.kv_a" { 512 } else { 1536 };
+                    vec![data.new_tensor(types::Q6_K, &[4096, m])]
+                })
+                .collect(),
+            vec![data.new_tensor(types::F32, &[4096, n])],
+        ),
+        "shexp.chain" => (
+            (0..copies)
+                .map(|_| {
+                    vec![
+                        data.new_tensor(types::Q6_K, &[4096, 2048]),
+                        data.new_tensor(types::Q6_K, &[4096, 2048]),
+                        data.new_tensor(types::Q6_K, &[2048, 4096]),
                     ]
                 })
                 .collect(),
@@ -763,6 +797,19 @@ pub fn small_ms(
                         let g = linear(ctx, w[0], xs[0], 1.0, None);
                         let u = linear(ctx, w[1], xs[0], 1.0, None);
                         vec![glu(ctx, g, u, 7.0)]
+                    }
+                    "mla.kv_a" | "mla.q_a" => {
+                        vec![linear_sp(linear(ctx, w[0], xs[0], 1.0, None))]
+                    }
+                    "shexp.chain" => {
+                        let h = if glu_mv_takes(w[0], w[1], n) {
+                            glu_mv(ctx, w[0], w[1], xs[0], 7.0)
+                        } else {
+                            let g = linear(ctx, w[0], xs[0], 1.0, None);
+                            let u = linear(ctx, w[1], xs[0], 1.0, None);
+                            glu(ctx, g, u, 7.0)
+                        };
+                        vec![linear_sp(linear(ctx, w[2], h, 1.0, None))]
                     }
                     _ => {
                         let (p, h) = hc_pre_norm(

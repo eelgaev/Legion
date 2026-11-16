@@ -67,6 +67,7 @@ struct Args {
     raw_off: c_int,
     sum_cnt: *mut i32,
     frag_ycap: c_int,
+    pdl: c_int,
 }
 
 /// The sm_80+ fragment GEMMs' block-row cap (`frag_ycap`; 0: one block row per plan tile) for a
@@ -228,6 +229,7 @@ pub(super) unsafe fn launch(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
             raw_off: !raw_staging() as c_int,
             sum_cnt: std::ptr::null_mut(),
             frag_ycap: 0,
+            pdl: 0,
         };
         check(&a, x, [up, gate, down])?;
         // GLM-5.3-Flash's int8 GEMMs (opt-in, #603) where this step and the device take them;
@@ -245,7 +247,18 @@ pub(super) unsafe fn launch(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
                 a.sum_cnt = std::ptr::null_mut();
             }
         }
-        crate::residency::cuda::zero_async(a.count.cast(), 4 * n_expert as usize, stream)?;
+        // GLM's decode steps launched back to back (moe_ffn::glm_pdl, #1172 r6): the plan kernel
+        // counts the pairs, so no memset of the counts
+        if dst.op_params[P_GLM] & GLM_PDL != 0
+            && dst.op_params[P_STAGE] == 0
+            && a.q8 == 0
+            && a.sum_cnt.is_null()
+            && n <= 16
+        {
+            a.pdl = 1;
+        } else {
+            crate::residency::cuda::zero_async(a.count.cast(), 4 * n_expert as usize, stream)?;
+        }
         launched("moe prep", legion_moe_prep(&a, stream))?;
         launched("moe plan", legion_moe_plan(&a, stream))?;
         launched("moe scatter", legion_moe_scatter(&a, stream))?;

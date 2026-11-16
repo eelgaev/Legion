@@ -548,6 +548,39 @@ __device__ __forceinline__ void q6k_row_sum(const Lin & p, const char * x0, uint
     }
 }
 
+// linear_mv_q6k_st with each warp's whole row (at most NG stages) loaded before pdl_wait (#1172
+// r6, params[7] bit 10, ops::linear_sp: MLA's kv_a and q_a, the shared expert's down, whose
+// kernels ahead let it launch early). The weights are no kernel's output; the row is summed after
+// the wait as linear_mv_q6k_st sums it (q6k_row_sum): the same bits. One matrix (h 1), rows of
+// whole stages, 16-byte aligned (the launcher checks).
+template <int N, int NG>
+__global__ void __launch_bounds__(128) linear_mv_q6k_sp(const Lin p) {
+    __shared__ uint4 sm[4][KQ_STAGE_V];
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int64_t r = (int64_t) blockIdx.x * 4 + warp;
+    const int64_t ng = r < p.m ? p.k / (256 * KQ_STAGE) : 0;
+    uint4 reg[NG][KQ_STAGE_PER];
+    q6k_row_load<NG>((const uint4 *) (p.w + (ng ? r : 0) * p.w_nb1), ng, lane, reg);
+    pdl_wait();
+    if (!ng) {
+        return;
+    }
+    float acc[N];
+#pragma unroll
+    for (int t = 0; t < N; t++) {
+        acc[t] = 0.0f;
+    }
+    q6k_row_sum<N, NG>(p, p.x, sm[warp], ng, lane, reg, acc);
+    const float sc = lin_scale(p, r);
+#pragma unroll
+    for (int t = 0; t < N; t++) {
+        const float s = warp_sum(acc[t]);
+        if (lane == 0 && t < p.n) {
+            p.dst[t * p.m + r] = s * sc;
+        }
+    }
+}
+
 // Q4_K rows for a few tokens: lane = 8 g + j / 4 takes values 64 g + j .. + 3 (low nibbles of one
 // 32-bit word of qs, scale 2 g) and 64 g + 32 + j .. + 3 (its high nibbles, scale 2 g + 1); the
 // block header (d, dmin, scales) in one 16-byte load the warp shares; activations in float4s.

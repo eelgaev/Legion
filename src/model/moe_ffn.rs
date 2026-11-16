@@ -387,6 +387,31 @@ pub fn glm_q8<'a>(out: Tensor<'a>, on: bool) -> Tensor<'a> {
     out
 }
 
+/// [`glm_pdl`]'s bit in the `P_GLM` param.
+const GLM_PDL: i32 = 2;
+
+/// Sets whether the op of `out` (marked by [`glm_kernels`], after it) launches its decode steps'
+/// kernels back to back (#1172 r6, GLM-5.3-Flash at 1-4 tokens on the GB10, opt-in by
+/// `LEGION_DEBUG_GLM_SMALL_MV`): the pairs per expert counted in the plan kernel instead of a
+/// memset and prep's atomics, and prep, plan, scatter, GLM's decode GEMMs and the sum launched
+/// with the PDL attribute, each waiting for the kernel ahead before it reads anything. The same
+/// counts and products: the same bits. Steps of more than 16 tokens, staged weights and the int8
+/// GEMMs keep the plain launches.
+pub fn glm_pdl<'a>(out: Tensor<'a>, on: bool) -> Tensor<'a> {
+    // SAFETY: `out` is a view of the fresh node `moe_ffn_with` made.
+    unsafe {
+        let node = (*out.raw()).view_src;
+        assert!(!node.is_null(), "moe_ffn::glm_pdl: not a moe_ffn result");
+        let p = &mut (*node).op_params[P_GLM];
+        *p = if on && *p != 0 {
+            *p | GLM_PDL
+        } else {
+            *p & !GLM_PDL
+        };
+    }
+    out
+}
+
 /// [`moe_ffn`] over staged weights whose copy is still running: `stage` is the `(staging id,
 /// row)` of [`crate::residency::experts::TieredLayer::staged_split`], and the op computes each range of
 /// experts once its part of the copy is in (on Volta; newer GPUs wait for the whole copy).

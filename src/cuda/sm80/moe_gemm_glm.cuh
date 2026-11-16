@@ -469,6 +469,11 @@ __global__ void __launch_bounds__(GlmDec<W, NW, DP, SPAN, REG>::NT)
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int g = lane >> 2, tg = lane & 3;
     unsigned char * ring = sm + W::SMEM_TAB + warp * DP * S::STAGE;
+    // The decode tables (constants) while the kernel ahead drains (#1172 r6, launched with the PDL
+    // attribute under legion_moe_args::pdl; the wait returns at once otherwise); the plan's
+    // outputs only after the wait.
+    W::tables(tabs, threadIdx.x, S::NT);
+    moe_pdl_wait();
 
     const int NR = (int) ((K == GU ? p.n_embd : p.n_ff) / 256);  // super-blocks per row (SPAN | NR)
     const int groups = (int) ((K == GU ? 2 * p.n_ff : p.n_embd) / 16);
@@ -551,7 +556,6 @@ __global__ void __launch_bounds__(GlmDec<W, NW, DP, SPAN, REG>::NT)
     for (int s = 0; s < (REG ? 1 : DP - 1); s++) {
         issue();
     }
-    W::tables(tabs, threadIdx.x, S::NT);
     __syncthreads();
 
     int q = 0;
@@ -705,6 +709,11 @@ bool glm_dec_launch(const legion_moe_args * a, unsigned n_tiles, void * stream) 
     const int64_t want = ((int64_t) n_tiles * groups + NW - 1) / NW;
     const int64_t fit = (int64_t) std::max(legion_device::sm_count(), 1) * per_sm;
     const unsigned blocks = (unsigned) std::max<int64_t>(1, std::min(want, fit));
+    if (a->pdl) {
+        launch_pdl(gemm_glm_dec_kernel<W, K, NW, DP, SPAN, REG>, dim3(blocks), S::NT, S::SMEM, (cudaStream_t) stream, *a,
+                   (int) n_tiles);
+        return true;
+    }
     gemm_glm_dec_kernel<W, K, NW, DP, SPAN, REG><<<blocks, S::NT, S::SMEM, (cudaStream_t) stream>>>(*a, (int) n_tiles);
     return true;
 }
