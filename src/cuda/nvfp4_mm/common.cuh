@@ -343,10 +343,10 @@ __device__ __forceinline__ bool find_tile(const int32_t * offs, int n_expert, in
 // out to see what bounds it, wrong results. DIAG_NODEC: A fragments from a constant (no scale or
 // code reads, no decode); DIAG_NOMMA: no MMAs (the fragments kept live); DIAG_NOEPI: no
 // epilogue; DIAG_NOW / DIAG_NOX: no weight / activation copies (no L2 prefetch with NOW);
-// DIAG_NOK: no k loop (the tile lookup and the epilogue alone). DIAG_PF4 / 16 / 32: the same
-// sums (exact), the weights' L2 prefetch in runs of 4 / 16 / 32 blocks (see PF).
+// DIAG_NOK: no k loop (the tile lookup and the epilogue alone). DIAG_PF4 / 8 / 16 / 32: the
+// same sums (exact), the weights' L2 prefetch in runs of 4 / 8 / 16 / 32 blocks (see PF).
 constexpr int DIAG_NODEC = 1, DIAG_NOMMA = 2, DIAG_NOEPI = 4, DIAG_NOW = 8, DIAG_NOX = 16, DIAG_NOK = 64,
-              DIAG_PF16 = 256, DIAG_PF4 = 512, DIAG_PF32 = 2048;
+              DIAG_PF16 = 256, DIAG_PF4 = 512, DIAG_PF8 = 1024, DIAG_PF32 = 2048;
 template <int MI, int NT, bool GROUPED, bool GLU, int ST = STAGES, int MINB = 1, int DIAG = 0>
 __global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -479,12 +479,16 @@ __global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p)
     // (see nvfp4_mvs). The routed experts' SwiGLU tile at prefill (#1176 r35): runs of 8 blocks.
     // With 32 (the whole k of a 2560-wide layer at once) a step waits for nearly all of the
     // tile's weights before its first MMA, so stream and MMAs hardly overlapped; 8 is 7-9%
-    // faster at 2,560-4,551-token steps and streams faster too. Other tiles keep 32 (unmeasured).
+    // faster at 2,560-4,551-token steps and streams faster too. Its 64-token tile (33-64 pairs
+    // an expert, #1176 r36) the same: 8-11% faster on the route at 1,024-3,072-token steps.
+    // The down projection (k 640: 10 blocks) and the dense GEMMs at 2,048-4,096 tokens gain
+    // nothing from shorter runs, so they keep 32.
     constexpr int PF = DIAG & DIAG_PF4    ? 4
+                       : DIAG & DIAG_PF8  ? 8
                        : DIAG & DIAG_PF16 ? 16
                        : DIAG & DIAG_PF32 ? 32
-                       : GROUPED && GLU && NT == 16 ? 8
-                                                    : 32;
+                       : GROUPED && GLU && (NT == 16 || NT == 8) ? 8
+                                                                 : 32;
     auto prefetch = [&](int64_t step) {
 #if __CUDA_ARCH__ >= 900
         if (!(DIAG & DIAG_NOW) && threadIdx.x < BM && step < steps) {
@@ -1141,7 +1145,7 @@ int status() {
     return e == cudaSuccess ? 0 : (int) e;
 }
 
-template <int MI, int NT, bool GLU = false>
+template <int MI, int NT, bool GLU = false, int DIAG = 0>
 int gemm(const legion_nvfp4_mm & p, cudaStream_t st) {
     constexpr int SMEM = smem_bytes<MI, NT>();
     const unsigned grid = (unsigned) p.tiles_m * (unsigned) p.tiles_n;
@@ -1150,18 +1154,19 @@ int gemm(const legion_nvfp4_mm & p, cudaStream_t st) {
         kernel<<<grid, 256, SMEM, st>>>(p);
     };
     if constexpr (GLU) {
-        p.plan ? go(nvfp4_gemm<MI, NT, true, true>) : go(nvfp4_gemm<MI, NT, false, true>);
+        p.plan ? go(nvfp4_gemm<MI, NT, true, true, STAGES, 1, DIAG>)
+               : go(nvfp4_gemm<MI, NT, false, true, STAGES, 1, DIAG>);
     } else if (p.plan) {
-        go(nvfp4_gemm<MI, NT, true, false>);
+        go(nvfp4_gemm<MI, NT, true, false, STAGES, 1, DIAG>);
     } else {
-        go(nvfp4_gemm<MI, NT, false, false>);
+        go(nvfp4_gemm<MI, NT, false, false, STAGES, 1, DIAG>);
     }
     return status();
 }
 
 // The grouped GEMM's other stage counts and occupancies (#824): ST stages, MINB CTAs per SM.
 // Grouped tiles only (the routed experts' prefill). -1 where the stages do not fit.
-template <int MI, int NT, bool GLU, int ST, int MINB>
+template <int MI, int NT, bool GLU, int ST, int MINB, int DIAG = 0>
 int gemm_tuned(const legion_nvfp4_mm & p, cudaStream_t st) {
     constexpr int SMEM = smem_bytes<MI, NT, ST>();
     // An sm_120 / sm_121 SM has 100 KiB of shared memory, 1 KiB of it reserved per CTA; the
@@ -1174,7 +1179,7 @@ int gemm_tuned(const legion_nvfp4_mm & p, cudaStream_t st) {
             return -1;
         }
         const unsigned grid = (unsigned) p.tiles_m * (unsigned) p.tiles_n;
-        auto kernel = nvfp4_gemm<MI, NT, true, GLU, ST, MINB>;
+        auto kernel = nvfp4_gemm<MI, NT, true, GLU, ST, MINB, DIAG>;
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
         if (MINB > 1) {
             cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
@@ -1185,10 +1190,53 @@ int gemm_tuned(const legion_nvfp4_mm & p, cudaStream_t st) {
     }
 }
 
+// The bench's prefetch runs (legion nvfp4-gemm-bench, nvfp4-mv-bench --dense; #1176 r36):
+// variant tune + 100 * DIAG_PF*, the tune's kernel with the weights' L2 prefetch in runs of
+// 4 / 8 / 16 / 32 blocks, the same sums. Compiled for the tiles prefill uses: 128 tokens (the
+// default tune, dense or grouped), the grouped SwiGLU's 64 tokens (default and short-step
+// tunes) and the down projection's
+// 256 x 64 two-CTA tile. -1 elsewhere.
+template <int MI, int NT, bool GLU, int PFD>
+int gemm_pf1(const legion_nvfp4_mm & p, int tune, cudaStream_t st) {
+    if constexpr (NT == 16 || GLU) {
+        if (tune == 31) {
+            return gemm<MI, NT, GLU, PFD>(p, st);
+        }
+        if constexpr (GLU && NT == 8) {
+            if (tune == 41) {
+                return gemm_tuned<MI, NT, GLU, 4, 1, PFD>(p, st);
+            }
+        }
+    } else if constexpr (MI == 2 && NT == 8) {
+        if (tune == 22) {
+            return gemm_tuned<MI, NT, GLU, 2, 2, PFD>(p, st);
+        }
+    }
+    return -1;
+}
+
+template <int MI, int NT, bool GLU>
+int gemm_pf(const legion_nvfp4_mm & p, int variant, cudaStream_t st) {
+    if constexpr (NT == 16 || (NT == 8 && (GLU || MI == 2))) {
+        const int tune = variant % 100;
+        switch (variant / 100) {
+            case DIAG_PF4: return gemm_pf1<MI, NT, GLU, DIAG_PF4>(p, tune, st);
+            case DIAG_PF8: return gemm_pf1<MI, NT, GLU, DIAG_PF8>(p, tune, st);
+            case DIAG_PF16: return gemm_pf1<MI, NT, GLU, DIAG_PF16>(p, tune, st);
+            case DIAG_PF32: return gemm_pf1<MI, NT, GLU, DIAG_PF32>(p, tune, st);
+            default: return -1;
+        }
+    }
+    return -1;
+}
+
 // stages * 10 + CTAs per SM: 31 is the default kernel (gemm); the others for 64- and 128-token
-// tiles.
+// tiles. 100 and up: gemm_pf's prefetch runs.
 template <int MI, int NT, bool GLU>
 int gemm_variant(const legion_nvfp4_mm & p, int variant, cudaStream_t st) {
+    if (variant >= 100) {
+        return gemm_pf<MI, NT, GLU>(p, variant, st);
+    }
     if (variant == 31) {
         return gemm<MI, NT, GLU>(p, st);
     }
@@ -1217,6 +1265,13 @@ int gemm_diag1(const legion_nvfp4_mm & p, cudaStream_t st) {
 
 template <int MI, int NT, bool GLU>
 int gemm_diag(const legion_nvfp4_mm & p, int variant, cudaStream_t st) {
+    switch (variant / 100) {
+        case DIAG_PF4:
+        case DIAG_PF8:
+        case DIAG_PF16:
+        case DIAG_PF32: return gemm_pf<MI, NT, GLU>(p, variant, st);
+        default: break;
+    }
     if (!p.plan || variant % 100 != 31) {
         return -1;
     }
@@ -1231,9 +1286,6 @@ int gemm_diag(const legion_nvfp4_mm & p, int variant, cudaStream_t st) {
             return gemm_diag1<MI, NT, GLU, DIAG_NOW | DIAG_NOX | DIAG_NODEC>(p, st);
         case DIAG_NOK: return gemm_diag1<MI, NT, GLU, DIAG_NOK>(p, st);
         case DIAG_NOMMA | DIAG_NODEC: return gemm_diag1<MI, NT, GLU, DIAG_NOMMA | DIAG_NODEC>(p, st);
-        case DIAG_PF4: return gemm_diag1<MI, NT, GLU, DIAG_PF4>(p, st);
-        case DIAG_PF16: return gemm_diag1<MI, NT, GLU, DIAG_PF16>(p, st);
-        case DIAG_PF32: return gemm_diag1<MI, NT, GLU, DIAG_PF32>(p, st);
         case DIAG_PF32 | DIAG_NOMMA | DIAG_NODEC:
             return gemm_diag1<MI, NT, GLU, DIAG_PF32 | DIAG_NOMMA | DIAG_NODEC>(p, st);
         default: return -1;

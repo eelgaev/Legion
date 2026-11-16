@@ -1913,7 +1913,17 @@ int launch_linear(const A & a, cudaStream_t st) {
         const int rw = a.params[7] & 255;
         const bool rw16 = ((int64_t) ((uintptr_t) p.w | (p.h > 1 ? p.w_nb2 : 0)) % 16) == 0 &&
                           p.w_nb1 == p.k / 256 * 210;
-        if (wt == T_Q6_K && a.params[2] && rw > 0 && rw16 && p.n <= 4 && p.m % rw == 0 &&
+        // params[7] bit 10 (ops::linear_sp, #1172 r6): linear_mv_q6k_sp, rows of one or two stages
+        if (wt == T_Q6_K && a.params[2] && ((a.params[7] >> 10) & 1) && rw16 && st16 && p.h == 1 && p.n <= 4 &&
+            p.k % (256 * KQ_STAGE) == 0 && p.k / (256 * KQ_STAGE) <= 2) {
+            if (p.n == 1) {
+                launch_pdl(linear_mv_q6k_sp<1, 2>, grid, 128, 0, st, p);
+            } else if (p.n == 2) {
+                launch_pdl(linear_mv_q6k_sp<2, 2>, grid, 128, 0, st, p);
+            } else {
+                launch_pdl(linear_mv_q6k_sp<4, 2>, grid, 128, 0, st, p);
+            }
+        } else if (wt == T_Q6_K && a.params[2] && rw > 0 && rw16 && p.n <= 4 && p.m % rw == 0 &&
             p.k / 256 * rw % KQ_STAGE == 0) {
             const dim3 g((unsigned) ((p.m / rw + 3) / 4), (unsigned) p.h);
             const int early = (a.params[7] >> 9) & 1;
@@ -3045,6 +3055,12 @@ __global__ void __launch_bounds__(HC_WIDE_T) hc_finish_wide_kernel(const A a) {
     if (PRE) {
         pdl_wait();
     }
+    // params[6] bit 32 (ops::SMALL_MV_TRIG, #1172 r6), 1-4 tokens: the next kernel launches once
+    // every block is here (its pre-wait part loads only weights; it waits for this one before it
+    // reads anything)
+    if ((a.params[6] & 32) && n <= 4) {
+        pdl_trigger();
+    }
     __shared__ float mv[(2 + 4) * 4 + 1];
     __shared__ float ys[HC_WIDE_E];
     const float * mix = hc_mix_at(a, t);
@@ -3633,7 +3649,7 @@ __global__ void __launch_bounds__(128, Q6K_MIN_BLOCKS(N)) glu_mv_q6k(const Lin p
 // its whole row (at most NG stages) before pdl_wait and summing it as linear_mv_q6k_st does
 // (q6k_row_sum), then glu_kernel's expression on the pair. The same bits.
 template <int N, int NG>
-__global__ void __launch_bounds__(128) glu_mv_q6k_sp(const Lin p, const char * wu, float lim) {
+__global__ void __launch_bounds__(128) glu_mv_q6k_sp(const Lin p, const char * wu, float lim, int trig) {
     __shared__ uint4 sm[4][KQ_STAGE_V];
     __shared__ float res[2][2][N];
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -3642,6 +3658,11 @@ __global__ void __launch_bounds__(128) glu_mv_q6k_sp(const Lin p, const char * w
     uint4 reg[NG][KQ_STAGE_PER];
     q6k_row_load<NG>((const uint4 *) ((warp % 2 ? wu : p.w) + (ng ? r : 0) * p.w_nb1), ng, lane, reg);
     pdl_wait();
+    // trig (params[2], ops::SMALL_MV_TRIG, #1172 r6): the next kernel (the shared expert's down)
+    // launches once every block has its loads in flight and is past its wait
+    if (trig) {
+        pdl_trigger();
+    }
     if (ng) {
         float acc[N];
 #pragma unroll
@@ -3670,7 +3691,7 @@ __global__ void __launch_bounds__(128) glu_mv_q6k_sp(const Lin p, const char * w
 }
 
 // GLU_MV: sources gate and up (Q6_K, one shape and layout) and x (F32, n tokens of k); params
-// [limit, GB10 staged rows (glu_mv_q6k_sp)]. dst F32 [m, n].
+// [limit, GB10 staged rows (glu_mv_q6k_sp), its early trigger (#1172 r6)]. dst F32 [m, n].
 int launch_glu_mv(const A & a, cudaStream_t st) {
     if (a.src_type[0] != T_Q6_K || a.src_type[1] != T_Q6_K) {
         return 1;
@@ -3700,12 +3721,13 @@ int launch_glu_mv(const A & a, cudaStream_t st) {
     const unsigned grid = (unsigned) ((p.m + 1) / 2);
     if (a.params[1] && p.n <= 4 && p.k % (256 * KQ_STAGE) == 0 && p.k / (256 * KQ_STAGE) <= 2 &&
         ((int64_t) ((uintptr_t) p.w | (uintptr_t) wu | p.w_nb1) % 16) == 0) {
+        const int trig = a.params[2] != 0;
         if (p.n == 1) {
-            launch_pdl(glu_mv_q6k_sp<1, 2>, grid, 128, 0, st, p, wu, lim);
+            launch_pdl(glu_mv_q6k_sp<1, 2>, grid, 128, 0, st, p, wu, lim, trig);
         } else if (p.n == 2) {
-            launch_pdl(glu_mv_q6k_sp<2, 2>, grid, 128, 0, st, p, wu, lim);
+            launch_pdl(glu_mv_q6k_sp<2, 2>, grid, 128, 0, st, p, wu, lim, trig);
         } else {
-            launch_pdl(glu_mv_q6k_sp<4, 2>, grid, 128, 0, st, p, wu, lim);
+            launch_pdl(glu_mv_q6k_sp<4, 2>, grid, 128, 0, st, p, wu, lim, trig);
         }
         return 0;
     }
@@ -3837,6 +3859,11 @@ constexpr int KPOOL_MAX = 16;
 
 __global__ void pool_keys_kernel(const A a) {
     pdl_wait();
+    // params[0] (ops::SMALL_MV_TRIG, #1172 r6): the next kernel (q_a) launches once every block is
+    // past its wait, as hc_finish_wide_kernel's
+    if (a.params[0]) {
+        pdl_trigger();
+    }
     const int64_t d = a.src_ne[3][0], kpool = a.src_ne[3][1], p = blockIdx.x;
     const char * cache = S(a, 0);
     const int64_t cnb1 = a.src_nb[0][1];

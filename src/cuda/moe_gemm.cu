@@ -113,6 +113,12 @@ struct legion_moe_args {
     // the plan tiles y, y + gridDim.y, ... below tile0[n_expert] (#858: a 144-row verify step's
     // grid holds ~534 block rows for ~230 tiles, the rest return at once). 0: one row per tile.
     int frag_ycap;
+    // 1 (#1172 r6, GLM-5.3-Flash's decode steps, opt-in): the plan kernel counts the pairs per
+    // expert itself (no memset of count ahead, prep_kernel does not count), and prep, plan,
+    // scatter, GLM's decode GEMMs and reduce launch with the PDL attribute: each waits for the
+    // kernel ahead (griddepcontrol.wait) before it reads anything, so only the launch gaps go.
+    // The same counts and the same products: the same bits. 0: as before.
+    int pdl;
 };
 
 // Launchers, one per kernel; each returns cudaGetLastError(). Grids are the caller's.
@@ -181,7 +187,16 @@ constexpr int DSUM_BN = 128;
 // Pairs per token the down GEMM's own sums take (a bit each, all loads issued before the sum).
 constexpr int DSUM_MAX_USED = 16;
 
+// The wait for the kernel ahead when launched with the PDL attribute (legion_moe_args::pdl); it
+// returns at once otherwise, and compiles to nothing before sm_90.
+__device__ __forceinline__ void moe_pdl_wait() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+#endif
+}
+
 __global__ void prep_kernel(const legion_moe_args p) {
+    moe_pdl_wait();
     const int64_t t = blockIdx.x;
     const float * xr = p.x + t * p.x_ld;
     __half2 * o = (__half2 *) (p.xh + t * p.n_embd);
@@ -189,7 +204,8 @@ __global__ void prep_kernel(const legion_moe_args p) {
         const float2 v = ((const float2 *) xr)[i];
         o[i] = __floats2half2_rn(v.x, v.y);
     }
-    if (threadIdx.x < p.n_used) {
+    // p.pdl: plan_kernel<true> counts
+    if (!p.pdl && threadIdx.x < p.n_used) {
         const int e = p.ids[t * p.ids_ld + threadIdx.x];
         if (expert_ok(p, e)) {
             atomicAdd(&p.count[e], 1);
@@ -197,16 +213,33 @@ __global__ void prep_kernel(const legion_moe_args p) {
     }
 }
 
-__global__ void plan_kernel(const legion_moe_args p) {
+// CNT (legion_moe_args::pdl): the pairs per expert counted here from ids into shared memory, the
+// counts prep_kernel's atomics would give (integers: the same plan).
+template <bool CNT> __global__ void plan_kernel(const legion_moe_args p) {
+    moe_pdl_wait();
     const int n_expert = p.n_expert, TM = p.tm;
     // one block of 1024 threads; n_expert <= 1024 * 4
     __shared__ int32_t sp[1024], st[1024];
+    __shared__ int32_t cnt[CNT ? 4096 : 1];
+    if (CNT) {
+        for (int e = threadIdx.x; e < n_expert; e += 1024) {
+            cnt[e] = 0;
+        }
+        __syncthreads();
+        for (int64_t i = threadIdx.x; i < p.n_tok * p.n_used; i += 1024) {
+            const int e = p.ids[(i / p.n_used) * p.ids_ld + i % p.n_used];
+            if (expert_ok(p, e)) {
+                atomicAdd(&cnt[e], 1);
+            }
+        }
+        __syncthreads();
+    }
     constexpr int PER = 4;
     const int i0 = threadIdx.x * PER;
     int32_t c[PER], tl[PER], sum = 0, tsum = 0;
     for (int k = 0; k < PER; k++) {
         const int e = i0 + k;
-        c[k] = e < n_expert ? p.count[e] : 0;
+        c[k] = e < n_expert ? (CNT ? cnt[e] : p.count[e]) : 0;
         tl[k] = (c[k] + TM - 1) / TM;
         sum += c[k];
         tsum += tl[k];
@@ -240,6 +273,7 @@ __global__ void plan_kernel(const legion_moe_args p) {
 }
 
 __global__ void scatter_kernel(const legion_moe_args p) {
+    moe_pdl_wait();
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= p.n_tok * p.n_used) {
         return;
@@ -1378,6 +1412,7 @@ __device__ __forceinline__ void reduce4(const legion_moe_args & p, int64_t t, fl
 
 // FMT: p.d_fmt (legion_moe_reduce picks the instance), so the F32 kernel keeps its registers.
 template <int FMT> __global__ void reduce_kernel(const legion_moe_args p) {
+    moe_pdl_wait();
     const int64_t t = blockIdx.x;
     // The shared expert's gate: ggml's op_sigmoid (unary.cu), the same expression and flags.
     const float sgate = p.sh ? 1.0f / (1.0f + expf(-p.sg[t * p.sg_ld])) : 0.0f;
@@ -1651,6 +1686,10 @@ int legion_moe_prep(const legion_moe_args * a, void * stream) {
         launch_pdl(prep_q8_kernel, dim3((unsigned) a->n_tok), 256, 0, (cudaStream_t) stream, *a);
         return (int) cudaGetLastError();
     }
+    if (a->pdl) {
+        launch_pdl(prep_kernel, dim3((unsigned) a->n_tok), 256, 0, (cudaStream_t) stream, *a);
+        return (int) cudaGetLastError();
+    }
     prep_kernel<<<(unsigned) a->n_tok, 256, 0, (cudaStream_t) stream>>>(*a);
     return (int) cudaGetLastError();
 }
@@ -1659,12 +1698,20 @@ int legion_moe_plan(const legion_moe_args * a, void * stream) {
     if (a->n_expert > 4096) {
         return -1;
     }
-    plan_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(*a);
+    if (a->pdl) {
+        launch_pdl(plan_kernel<true>, dim3(1), 1024, 0, (cudaStream_t) stream, *a);
+        return (int) cudaGetLastError();
+    }
+    plan_kernel<false><<<1, 1024, 0, (cudaStream_t) stream>>>(*a);
     return (int) cudaGetLastError();
 }
 
 int legion_moe_scatter(const legion_moe_args * a, void * stream) {
     const int64_t np = a->n_tok * a->n_used;
+    if (a->pdl) {
+        launch_pdl(scatter_kernel, dim3((unsigned) ((np + 255) / 256)), 256, 0, (cudaStream_t) stream, *a);
+        return (int) cudaGetLastError();
+    }
     scatter_kernel<<<(unsigned) ((np + 255) / 256), 256, 0, (cudaStream_t) stream>>>(*a);
     return (int) cudaGetLastError();
 }
@@ -1759,6 +1806,10 @@ int legion_moe_glm_q8(const legion_moe_args * a, int gu_type, int down_type) {
 
 int legion_moe_reduce(const legion_moe_args * a, void * stream) {
     const auto k = a->d_fmt == 1 ? reduce_kernel<1> : a->d_fmt == 2 ? reduce_kernel<2> : reduce_kernel<0>;
+    if (a->pdl) {
+        launch_pdl(k, dim3((unsigned) a->n_tok), 256, 0, (cudaStream_t) stream, *a);
+        return (int) cudaGetLastError();
+    }
     k<<<(unsigned) a->n_tok, 256, 0, (cudaStream_t) stream>>>(*a);
     return (int) cudaGetLastError();
 }
