@@ -2004,10 +2004,11 @@ int launch_linear(const A & a, cudaStream_t st) {
     } else if (p.n <= 8 && wt == T_Q5_K) {
         const dim3 grid((unsigned) ((p.m + 3) / 4), (unsigned) p.h);
         launch_pdl(linear_mv<8, true>, grid, 128,0, st, p);
-    } else if (p.n <= 4 && wt == T_F32 && (a.params[7] & 1) && p.h == 1 && x16 &&
+    } else if (p.n >= 2 && p.n <= 4 && wt == T_F32 && (a.params[7] & 1) && p.h == 1 && x16 &&
                lin_xs_bytes(p.k, p.n) <= 96 * 1024) {
         // params[7] bit 0 for F32 weights (ops::small_mv, #1172 r4): linear_mv_f32_xs, a warp a
-        // row, as many rows a block as fill the SMs once (one block an SM: its x copy)
+        // row, as many rows a block as fill the SMs once (one block an SM: its x copy); from 2
+        // tokens (at 1 the router's split kernel is faster: 30 vs 35 us on a GB10)
         const int sms = lin_sms();
         const int64_t per = (p.m + sms - 1) / sms;
         const int warps = per > 8 ? 8 : per < 1 ? 1 : (int) per;
@@ -2191,8 +2192,9 @@ int launch_linear_set(const A & a, cudaStream_t st) {
     }
     s.first[s.nseg] = first;
     // params[6] bit 1 (ops::small_mv, #1172 r4): linear_set_q8_rw when every segment's rows are
-    // 4 blocks, contiguous, in whole runs of LS_RB from a 16-byte boundary
-    bool rw = (a.params[6] & 2) && n <= 4;
+    // 4 blocks, contiguous, in whole runs of LS_RB from a 16-byte boundary; from 3 tokens (at 1-2
+    // a warp a row is as fast or faster: 12.5 vs 15 us at 1 token on a GB10)
+    bool rw = (a.params[6] & 2) && n >= 3 && n <= 4;
     for (int g = 0; g < s.nseg && rw; g++) {
         const Lin & p = s.p[g];
         rw = p.k == 128 && p.w_nb1 == 136 && p.m % LS_RB == 0 && ((uintptr_t) p.w % 16) == 0;
