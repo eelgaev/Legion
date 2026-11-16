@@ -259,6 +259,58 @@ fn placed_tables_follow_the_placement() {
     assert!(TpEp::new(up, N_EXPERT, 0, 2, Some(&other)).is_err());
 }
 
+/// [`TpEp::remap_skips`]'s gathers (#1176 r32: one kernel of a thread per pair, not ggml's
+/// `get_rows` of a `cont`): the slot table's ids and the router weights times the keep table,
+/// from a strided view of the router's choices (as the top-k's).
+#[test]
+fn skips_remap_gathers_the_tables() {
+    let e = experts();
+    let (lo, n_local) = (N_EXPERT / 2, N_EXPERT / 2);
+    let which: Vec<u64> = (lo as u64..(lo + n_local) as u64).collect();
+    let wctx = Context::new(4, 0);
+    let [up, _, _] = load(&wctx, &e, &which);
+    let share = TpEp::new(up, N_EXPERT, 1, 2, None).unwrap();
+    let mut backend = Backend::cpu().unwrap();
+    backend.set_threads(2);
+    let ctx = Context::new(64, 64);
+    let (nt, nu) = (N_TOK as i64, N_USED as i64);
+    let wide = ctx.new_tensor(types::I32, &[2 * nu, nt]).as_input();
+    let idt = ctx.view_2d(wide, [nu, nt], wide.nb()[1], 0);
+    let wt = ctx.new_tensor(types::F32, &[nu, nt]).as_input();
+    let (ids, w) = share.remap_skips(&ctx, IL, idt, wt, nt);
+    let (ids, w) = (ctx.cont(ids).as_output(), w.as_output());
+    let mut graph = ctx.new_graph(64);
+    graph.expand(ids);
+    graph.expand(w);
+    ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+        .unwrap();
+    // The columns past the view hold another valid id, so a read of them shows.
+    let mut all = vec![(N_EXPERT - 1) as i32; 2 * N_USED * N_TOK];
+    for t in 0..N_TOK {
+        all[t * 2 * N_USED..][..N_USED].copy_from_slice(&e.ids[t * N_USED..][..N_USED]);
+    }
+    wide.set_i32(&all);
+    wt.set_f32(&e.w);
+    backend.compute(&graph).unwrap();
+    let (slot, _, keep) = tables(N_EXPERT, lo, n_local);
+    let want_ids: Vec<i32> = e.ids.iter().map(|&s| slot[s as usize]).collect();
+    let want_w: Vec<f32> = e
+        .ids
+        .iter()
+        .zip(&e.w)
+        .map(|(&s, &v)| v * keep[s as usize])
+        .collect();
+    assert_eq!(ids.to_i32(), want_ids);
+    let got_w = w.to_f32();
+    assert!(
+        got_w
+            .iter()
+            .zip(&want_w)
+            .all(|(a, b)| a.to_bits() == b.to_bits())
+    );
+    assert!(want_ids.iter().any(|&i| i < 0) && want_ids.iter().any(|&i| i >= 0));
+}
+
 #[test]
 fn placed_shares_add_up_to_the_full_moe() {
     let place = scattered();
