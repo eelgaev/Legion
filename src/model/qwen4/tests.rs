@@ -268,3 +268,26 @@ fn step_pools_listed_keeps_the_shape_for_many_steps() {
     assert!(ours <= 2, "{ours} changes in 85 steps");
     assert!(changes(&plain) >= 12);
 }
+
+/// #1176 r37: the indexer's token shares under `--tp-seq-par` are cut by their cost.
+#[test]
+fn the_qsa_share_cut_gives_the_later_tokens_fewer() {
+    // A 123K prompt's last 4,544-token step (pools of 4 positions, 32,768 listed): rank 0
+    // takes a little more than half of the tokens, the costs about equal.
+    let cut = qsa_share_cut(4544, 32768, 4);
+    assert!(cut > 2272 && cut < 2320, "{cut}");
+    let last = 32768.0 * 7.0 / 8.0;
+    let cost =
+        |r: std::ops::Range<usize>| -> f64 { r.map(|i| last - (4543 - i) as f64 / 4.0).sum() };
+    let (a, b) = (cost(0..cut), cost(cut..4544));
+    assert!((a - b).abs() / (a + b) < 0.002, "{a} {b}");
+    // A prompt's first step: the later tokens see far more pools, the cut is well past half.
+    let first = qsa_share_cut(4544, 1536, 4);
+    assert!(first > 2800, "{first}");
+    // Too few tokens for two shares of 8, or no pools: the even shares.
+    assert_eq!(qsa_share_cut(15, 4096, 4), 0);
+    assert_eq!(qsa_share_cut(4096, 4096, 0), 0);
+    // Every share keeps at least 8 tokens.
+    let c = qsa_share_cut(16, 64, 4);
+    assert!(c == 0 || c == 8, "{c}");
+}

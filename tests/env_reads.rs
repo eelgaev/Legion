@@ -3,37 +3,27 @@
 //! docs/debug-env.md), and passes a name it did not spell out only in
 //! the files listed for that. A new switch goes into `src/cli/serve.rs` (or
 //! `src/cli/serve/switches.rs`) as a clap argument instead.
+//!
+//! `LEGION_DEBUG_*` variables are a class of their own: A/B switches that put back the code
+//! before a change, for measurements. Any file may read one by its literal name, as long as
+//! docs/debug-env.md has a table row for that exact name; a row whose variable nothing reads
+//! any more fails too.
 
 use std::path::{Path, PathBuf};
 
-/// `(file, variable)`: the `LEGION_*` reads that may stay.
+/// The prefix of the A/B switches documented row by row in docs/debug-env.md.
+const DEBUG_PREFIX: &str = "LEGION_DEBUG_";
+
+/// `(file, variable)`: the other `LEGION_*` reads that may stay.
 const ALLOWED: &[(&str, &str)] = &[
     // Debug and development hooks (docs/debug-env.md).
     ("src/cpu/bench.rs", "LEGION_CPU_BENCH"),
     ("src/ggml/meta.rs", "LEGION_META_DEBUG"),
     ("src/ggml/op_profile.rs", "LEGION_OP_PROFILE"),
     ("src/hf/deepseek41/hash/tests.rs", "LEGION_TEST_DS41_HF"),
-    (
-        "src/model/core/expert_mv/dump.rs",
-        "LEGION_DEBUG_EXPERT_DUMP",
-    ),
-    ("src/model/glm5next/ops.rs", "LEGION_DEBUG_GLM_KDA_SPLIT"),
     ("src/model/moe_ffn/tests.rs", "LEGION_MOE_SPEED_TYPES"),
-    ("src/model/nvfp4_mm.rs", "LEGION_DEBUG_NVFP4_PF32"),
     ("src/model/qwen4/qsa_attn/tests.rs", "LEGION_TINY"),
-    (
-        "src/residency/cpu_share/ops.rs",
-        "LEGION_DEBUG_SHARE_STREAM_WAIT",
-    ),
-    (
-        "src/residency/cuda.rs",
-        "LEGION_DEBUG_FAIL_CUMEMCREATE_AFTER",
-    ),
     ("src/residency/experts.rs", "LEGION_EXPERT_COUNTS"),
-    (
-        "src/residency/lookup_table.rs",
-        "LEGION_DEBUG_NGRAM_OLD_POLICY",
-    ),
     ("src/residency/ssd_experts.rs", "LEGION_SSD_EXPERT_TRACE"),
 ];
 
@@ -96,14 +86,41 @@ fn reads(text: &str) -> Vec<Option<String>> {
     found
 }
 
+/// The `LEGION_DEBUG_*` names of `doc`'s table rows: those spelled in a row's first cell.
+fn debug_rows(doc: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in doc.lines() {
+        let Some(cell) = line
+            .trim_start()
+            .strip_prefix('|')
+            .and_then(|l| l.split('|').next())
+        else {
+            continue;
+        };
+        let mut rest = cell;
+        while let Some(at) = rest.find(DEBUG_PREFIX) {
+            rest = &rest[at..];
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            names.push(rest[..end].to_string());
+            rest = &rest[end..];
+        }
+    }
+    names
+}
+
 #[test]
 fn legion_variables_are_read_only_where_allowed() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let doc = std::fs::read_to_string(root.join("docs/debug-env.md")).unwrap();
+    let rows = debug_rows(&doc);
     let mut files = Vec::new();
     sources(&root.join("src"), &mut files);
     files.sort();
     let mut bad = Vec::new();
     let mut seen = Vec::new();
+    let mut seen_debug = Vec::new();
     for path in &files {
         let rel = path
             .strip_prefix(root)
@@ -113,6 +130,15 @@ fn legion_variables_are_read_only_where_allowed() {
         let text = std::fs::read_to_string(path).unwrap();
         for read in reads(&text) {
             match read {
+                Some(name) if name.starts_with(DEBUG_PREFIX) => {
+                    if rows.contains(&name) {
+                        seen_debug.push(name);
+                    } else {
+                        bad.push(format!(
+                            "{rel}: reads {name}, which has no row in docs/debug-env.md"
+                        ));
+                    }
+                }
                 Some(name) if name.starts_with("LEGION_") => {
                     if ALLOWED.contains(&(rel.as_str(), name.as_str())) {
                         seen.push((rel.clone(), name));
@@ -129,7 +155,8 @@ fn legion_variables_are_read_only_where_allowed() {
     assert!(
         bad.is_empty(),
         "environment reads outside the allow-list (make a feature switch a `legion serve` \
-         flag; a test or debug hook goes into tests/env_reads.rs and docs/debug-env.md):\n{}",
+         flag; a LEGION_DEBUG_* A/B switch needs a row in docs/debug-env.md; another test or \
+         debug hook goes into tests/env_reads.rs and docs/debug-env.md):\n{}",
         bad.join("\n")
     );
     // The list follows the code: an entry nothing reads any more goes.
@@ -137,6 +164,13 @@ fn legion_variables_are_read_only_where_allowed() {
         assert!(
             seen.iter().any(|(f, n)| f == file && n == name),
             "{file} no longer reads {name}: drop it from ALLOWED"
+        );
+    }
+    // So do the doc's rows.
+    for name in &rows {
+        assert!(
+            seen_debug.contains(name),
+            "nothing reads {name} any more: drop its row from docs/debug-env.md"
         );
     }
 }
@@ -148,6 +182,24 @@ fn debug_hooks_are_documented() {
     for (_, name) in ALLOWED {
         assert!(doc.contains(name), "docs/debug-env.md does not list {name}");
     }
+}
+
+#[test]
+fn the_doc_rows_parse() {
+    let doc = "\
+Text naming `LEGION_DEBUG_PROSE=1` outside a table.
+
+| Variable | Effect |
+|---|---|
+| `LEGION_DEBUG_A=1` | Effect, see `LEGION_DEBUG_IN_EFFECT`. |
+| `LEGION_DEBUG_B=<n>[,<m>]` | Effect. |
+| `LEGION_DEBUG_C` | Effect. |
+| `LEGION_OP_PROFILE=1` | Not a debug switch. |
+";
+    assert_eq!(
+        debug_rows(doc),
+        ["LEGION_DEBUG_A", "LEGION_DEBUG_B", "LEGION_DEBUG_C"]
+    );
 }
 
 #[test]
