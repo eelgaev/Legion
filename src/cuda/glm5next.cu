@@ -3317,15 +3317,26 @@ __global__ void sigmoid_kernel(const float * x, float * out, int64_t n) {
 
 // KDA's gated delta rule, d = 128: a block per (head, sequence), thread 8 j + l holds the keys
 // l, l + 8, ... of state row j.
+//
+// ROWS < KD (#1172 r8, params[3], ops::kda_split): KD / ROWS blocks a head, each with ROWS of the
+// state rows. A row meets the other rows only through the token's q and k norms, which every
+// block computes the same way from the same values (as kda_scan_rows_kernel does), so each row
+// gets the same values in the same order: the same bits. A 1,024-thread block a head is 64
+// blocks for Maya-S's 64 heads, two waves on the GB10's 48 SMs (one block an SM); 256-thread
+// blocks are one wave. The first block of a head stores the verify group's decays and beta.
 constexpr int KD = 128, KL = 8, KR = KD / KL;
 
-__global__ void __launch_bounds__(KD * KL) kda_scan_kernel(const A a) {
+template <int ROWS>
+__global__ void __launch_bounds__(ROWS * KL) kda_scan_kernel(const A a) {
+    static_assert(KD % ROWS == 0 && ROWS * KL >= 2 * KD, "a block's threads cover q and k's norms");
     pdl_wait();
     __shared__ float qs[KD], ks[KD], dec[KD], part[8];
-    const int64_t h = a.ne[1], hd = blockIdx.x, s = blockIdx.y;
+    constexpr int SPLIT = KD / ROWS;
+    const int64_t h = a.ne[1], hd = blockIdx.x / SPLIT, s = blockIdx.y;
+    const int rb = (int) (blockIdx.x % SPLIT) * ROWS;
     const int64_t n_tok = a.params[0], n_seqs = a.ne[2] / n_tok;
-    const bool verify = a.params[1] != 0;
-    const int tid = threadIdx.x, j = tid / KL, l = tid % KL;
+    const bool verify = a.params[1] != 0, first = rb == 0;
+    const int tid = threadIdx.x, j = rb + tid / KL, l = tid % KL;
     const float * q = (const float *) a.src[0];
     const float * k = (const float *) a.src[1];
     const float * v = (const float *) a.src[2];
@@ -3346,12 +3357,12 @@ __global__ void __launch_bounds__(KD * KL) kda_scan_kernel(const A a) {
             ks[tid] = k[off + tid];
             const float gv = ((const float *) (g + t * a.src_nb[3][2]))[tid];
             dec[tid] = expf(gv);
-            if (verify) {
+            if (verify && first) {
                 ((float *) ((char *) a.src[6] + s * a.src_nb[6][2] + t * a.src_nb[6][1]))[hd * KD + tid] = gv;
             }
         }
         const float bt = *(const float *) (beta + t * a.src_nb[4][1]);
-        if (verify && tid == 0) {
+        if (verify && first && tid == 0) {
             ((float *) ((char *) a.src[7] + s * a.src_nb[7][2] + t * a.src_nb[7][1]))[hd] = bt;
         }
         __syncthreads();
@@ -4791,8 +4802,14 @@ extern "C" int legion_glm_launch(int op, const legion_glm_args * ap, void * stre
                 launch_pdl(kda_scan_rows_kernel,
                            dim3((unsigned) (a.ne[1] * (KD / KS_ROWS)), (unsigned) (a.ne[2] / a.params[0])), 32 * KS_W,
                            0, st, a);
+            } else if (a.params[3] == 2) {  // ops::kda_split (#1172 r8): 4 blocks a head
+                launch_pdl(kda_scan_kernel<KD / 4>, dim3((unsigned) (a.ne[1] * 4), (unsigned) (a.ne[2] / a.params[0])),
+                           KD / 4 * KL, 0, st, a);
+            } else if (a.params[3] == 1) {  // 2 blocks a head
+                launch_pdl(kda_scan_kernel<KD / 2>, dim3((unsigned) (a.ne[1] * 2), (unsigned) (a.ne[2] / a.params[0])),
+                           KD / 2 * KL, 0, st, a);
             } else {
-                launch_pdl(kda_scan_kernel, dim3((unsigned) a.ne[1], (unsigned) (a.ne[2] / a.params[0])), KD * KL, 0,
+                launch_pdl(kda_scan_kernel<KD>, dim3((unsigned) a.ne[1], (unsigned) (a.ne[2] / a.params[0])), KD * KL, 0,
                            st, a);
             }
             break;

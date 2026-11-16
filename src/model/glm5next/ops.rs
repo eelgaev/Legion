@@ -372,7 +372,8 @@ static Q6K_MV: AtomicU8 = AtomicU8::new(Q6K_MV_UNSET);
 /// linear_mv_q6k (2-byte loads) on the others. Bit 0: linear_mv_q6k_rw on those others at 1-4 tokens,
 /// linear_mv_q6k_st's lanes over several contiguous rows a warp (MLA's q_b, k_b and v_b), its first
 /// stages loaded before the wait for the kernel ahead; bit 1: two stages in flight; bit 2: the
-/// next kernel launched once every block is past its wait; bits 4-6: log2 of more rows a warp.
+/// next kernel launched once every block is past its wait; bit 3: the output head's rows too
+/// (#1172 r8); bits 4-6: log2 of more rows a warp.
 /// Every lane sums the same values in the same order in all of them: the same bits.
 /// `LEGION_DEBUG_GLM_Q6K_MV` picks one for A/B runs (0: as before).
 pub fn q6k_mv() -> u8 {
@@ -399,7 +400,7 @@ pub(crate) fn q6k_mv_of(env: Option<&str>) -> u8 {
 pub(crate) const Q6K_MV_DEFAULT: u8 = 1;
 
 /// The bits [`q6k_mv`] uses.
-const Q6K_MV_BITS: u8 = 0x77;
+const Q6K_MV_BITS: u8 = 0x7F;
 
 /// Sets [`q6k_mv`] for [`linear`]s built from now on (`legion lin-bench --q6k`).
 pub fn set_q6k_mv(v: u8) {
@@ -408,6 +409,11 @@ pub fn set_q6k_mv(v: u8) {
 
 /// Super-blocks a linear_mv_q6k_rw stage holds (the kernel file's KQ_STAGE).
 const Q6K_STAGE: i64 = 8;
+
+/// Rows from which a Q6_K product of whole-stage rows counts as the output head for
+/// [`q6k_mv`]'s bit 3 (Maya-S: 154,880, or 66,067 with `--spec-draft-vocab 65536`; its widest
+/// other Q6_K matrix has 16,384).
+const Q6K_HEAD_ROWS: i64 = 32768;
 
 /// A Q6_K [`linear`]'s `params[7]` for [`q6k_mv`] mode `mode`, weights `[k, m]` (or `[k, m, h]`)
 /// with rows `nb1` bytes apart: linear_mv_q6k_rw's rows a warp (bits 0-7: the fewest that make
@@ -425,8 +431,9 @@ pub(crate) fn q6k_mv_param(mode: u8, k: i64, m: i64, nb1: i64) -> i32 {
         (a, b) = (b, a % b);
     }
     // Rows of whole stages stay on linear_mv_q6k_st: the same bytes, and its fixed row loop is
-    // 10-25% faster at 2-4 columns (`lin-bench --q6k`).
-    if a == Q6K_STAGE {
+    // 10-25% faster at 2-4 columns (`lin-bench --q6k`). Bit 3 (#1172 r8) moves the output head's
+    // (Q6K_HEAD_ROWS or more rows) to linear_mv_q6k_rw too, 2^(bits 4-6) rows a warp.
+    if a == Q6K_STAGE && (mode & 8 == 0 || m < Q6K_HEAD_ROWS) {
         return 0;
     }
     let rows = (Q6K_STAGE / a) << ((mode >> 4) & 7);
@@ -1246,8 +1253,58 @@ fn scan_op<'a>(
             n_tok as i32,
             store.is_some() as i32,
             GB10_LINEAR.load(Ordering::Relaxed) as i32,
+            kda_split_param(),
         ],
     )
+}
+
+/// [`kda_split`] before the first read: the environment's choice (outside 0-2: every one is a
+/// mode).
+const KDA_SPLIT_UNSET: u8 = u8::MAX;
+
+static KDA_SPLIT: AtomicU8 = AtomicU8::new(KDA_SPLIT_UNSET);
+
+/// How many blocks [`kda_scan`]'s decode kernel (steps of fewer than 64 tokens: a 1-user verify
+/// step's scan and every commit's, #1172 r8) gives each head on [`set_gb10_gemv`]'s GPUs, as a
+/// log2: 0 one (1,024 threads, the kernel before r8), 1 two, 2 four (256 threads). Each block
+/// holds its share of the head's state rows and computes the token's q and k norms itself, from
+/// the same values in the same order: the same bits. `LEGION_DEBUG_GLM_KDA_SPLIT` picks it for
+/// A/B runs.
+pub fn kda_split() -> u8 {
+    let v = KDA_SPLIT.load(Ordering::Relaxed);
+    if v != KDA_SPLIT_UNSET {
+        return v;
+    }
+    let v = kda_split_of(std::env::var("LEGION_DEBUG_GLM_KDA_SPLIT").ok().as_deref());
+    KDA_SPLIT.store(v, Ordering::Relaxed);
+    v
+}
+
+/// [`kda_split`] given the environment's value: 0-2, else the default.
+pub(crate) fn kda_split_of(env: Option<&str>) -> u8 {
+    match env.map(str::trim).and_then(|s| s.parse::<u8>().ok()) {
+        Some(v) if v <= 2 => v,
+        _ => KDA_SPLIT_DEFAULT,
+    }
+}
+
+/// [`kda_split`]'s default: four blocks a head (Maya-S's 64 heads as 256 blocks, one wave on a
+/// DGX Spark's 48 SMs instead of two).
+pub(crate) const KDA_SPLIT_DEFAULT: u8 = 2;
+
+/// Sets [`kda_split`] for nodes built from now on (`legion lin-bench --kda`).
+pub fn set_kda_split(v: u8) {
+    KDA_SPLIT.store(v.min(2), Ordering::Relaxed);
+}
+
+/// [`kda_split`] as the node's parameter: on the GPUs that take the GB10 decode kernels
+/// ([`set_gb10_linear`] and [`set_gb10_gemv`]), else 0 (a V100's 80 SMs hold the 64 blocks).
+fn kda_split_param() -> i32 {
+    if GB10_LINEAR.load(Ordering::Relaxed) && GB10_GEMV.load(Ordering::Relaxed) {
+        kda_split() as i32
+    } else {
+        0
+    }
 }
 
 /// RMS norm of each `ne0` row of `o` (F32, contiguous) times `w`, times `sigmoid(gate)` if

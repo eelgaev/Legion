@@ -845,3 +845,146 @@ pub fn small_ms(
         })
         .collect()
 }
+
+/// GLM-5.3-Flash Maya-S's KDA delta-rule scans at decode (`legion lin-bench --kda`, #1172 r8),
+/// d 128 x 64 heads, one sequence: `commit` (a verify step's commit: the kept tokens through
+/// [`kda_scan`], the state advanced in place) and `verify` (a verify group's [`kda_scan_verify`]:
+/// the outputs and the stored decays and beta, the state left as it was).
+pub const KDA_SHAPES: [&str; 2] = ["commit", "verify"];
+
+/// KDA layers of Maya-S: one scan each a commit or a verify step.
+pub const KDA_LAYERS: usize = 34;
+
+/// State bytes one [`KDA_SHAPES`] scan moves (4 MiB of state a layer): a commit reads and writes
+/// it, a verify group reads it.
+pub fn kda_bytes(name: &str) -> f64 {
+    let state = (128 * 128 * 64 * 4) as f64;
+    if name == "commit" { 2.0 * state } else { state }
+}
+
+/// Times the [`KDA_SHAPES`] scan `name` at `n_tok` tokens on `backend` for each
+/// [`super::kda_split`] mode of `modes`: a graph of [`KDA_LAYERS`] scans, each on a state of its
+/// own (random inputs, decays in (-0.55, -0.05]), back to back as a step runs them. Before the
+/// timing each mode runs once from the same states, and every output value, every state value
+/// and (verify) every stored value whose bits differ from the first mode's is counted.
+pub fn kda_ms(
+    backend: &mut Backend,
+    name: &str,
+    n_tok: usize,
+    reps: usize,
+    rounds: usize,
+    modes: &[u8],
+) -> Vec<SmallTiming> {
+    let (d, h, n, l) = (128i64, 64i64, n_tok as i64, KDA_LAYERS);
+    let verify = name == "verify";
+    let data = Context::new(3 * l + 8, 0);
+    let q = data.new_tensor(types::F32, &[d, h, n]);
+    let k = data.new_tensor(types::F32, &[d, h, n]);
+    let v = data.new_tensor(types::F32, &[d, h, n]);
+    let g = data.new_tensor(types::F32, &[d, h, n]);
+    let beta = data.new_tensor(types::F32, &[h, n]);
+    let states: Vec<Tensor<'_>> = (0..l)
+        .map(|_| data.new_tensor(types::F32, &[d, d, h, 1]))
+        .collect();
+    let stores: Vec<[Tensor<'_>; 2]> = (0..if verify { l } else { 0 })
+        .map(|_| {
+            [
+                data.new_tensor(types::F32, &[d * h, n, 1]),
+                data.new_tensor(types::F32, &[h, n, 1]),
+            ]
+        })
+        .collect();
+    data.alloc_tensors(backend.buffer_type()).unwrap();
+    for (i, x) in [q, k, v].iter().enumerate() {
+        x.set_f32(&noise(x.elements(), 41 + i as u64));
+    }
+    let gv: Vec<f32> = noise(g.elements(), 44)
+        .iter()
+        .map(|x| -0.05 - 0.5 * x.abs())
+        .collect();
+    g.set_f32(&gv);
+    let bv: Vec<f32> = noise(beta.elements(), 45)
+        .iter()
+        .map(|x| 0.5 + 0.4 * x)
+        .collect();
+    beta.set_f32(&bv);
+    let init: Vec<Vec<f32>> = (0..l)
+        .map(|i| {
+            noise(states[i].elements(), 50 + i as u64)
+                .iter()
+                .map(|x| 0.1 * x)
+                .collect()
+        })
+        .collect();
+    let reset = || {
+        for (s, v) in states.iter().zip(&init) {
+            s.set_f32(v);
+        }
+        for [sg, sb] in &stores {
+            sg.set_f32(&vec![0.0; sg.elements()]);
+            sb.set_f32(&vec![0.0; sb.elements()]);
+        }
+    };
+    let bt = backend.buffer_type();
+    let ctxs: Vec<Context> = modes.iter().map(|_| Context::new(l + 16, l + 16)).collect();
+    let default = kda_split();
+    let graphs: Vec<(Vec<Tensor<'_>>, Graph<'_>)> = ctxs
+        .iter()
+        .zip(modes)
+        .map(|(ctx, &mode)| {
+            set_kda_split(mode);
+            let mut graph = ctx.new_graph(l + 16);
+            let outs: Vec<Tensor<'_>> = (0..l)
+                .map(|i| {
+                    let out = if verify {
+                        kda_scan_verify(ctx, q, k, v, g, beta, states[i], n, stores[i])
+                    } else {
+                        kda_scan(ctx, q, k, v, g, beta, states[i], n)
+                    }
+                    .as_output();
+                    graph.expand(out);
+                    out
+                })
+                .collect();
+            ctx.alloc_graph(&graph, ComputeAllocator::new(bt)).unwrap();
+            (outs, graph)
+        })
+        .collect();
+    set_kda_split(default);
+    // Every value one run from the initial states leaves: outputs, states, stores.
+    let mut run_once = |graph: &Graph<'_>, outs: &[Tensor<'_>]| -> Vec<Vec<u8>> {
+        reset();
+        backend.compute(graph).unwrap();
+        let mut all: Vec<Vec<u8>> = outs.iter().map(|o| o.bytes()).collect();
+        all.extend(states.iter().map(|s| s.bytes()));
+        for [sg, sb] in &stores {
+            all.push(sg.bytes());
+            all.push(sb.bytes());
+        }
+        all
+    };
+    let first = run_once(&graphs[0].1, &graphs[0].0);
+    let differ: Vec<usize> = graphs
+        .iter()
+        .map(|(outs, graph)| {
+            run_once(graph, outs)
+                .iter()
+                .zip(&first)
+                .map(|(o, f)| differing(f, o, 4))
+                .sum()
+        })
+        .collect();
+    reset();
+    let refs: Vec<&Graph<'_>> = graphs.iter().map(|(_, g)| g).collect();
+    let ms = time_graphs(backend, &refs, reps, rounds);
+    modes
+        .iter()
+        .zip(ms)
+        .zip(differ)
+        .map(|((&mode, ms), differ)| SmallTiming {
+            mode,
+            ms: ms / l as f64,
+            differ,
+        })
+        .collect()
+}
