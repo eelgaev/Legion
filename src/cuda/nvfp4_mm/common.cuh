@@ -339,15 +339,23 @@ __device__ __forceinline__ bool find_tile(const int32_t * offs, int n_expert, in
 // ST: cp.async stages; MINB: CTAs per SM the registers are limited for (2: two CTAs of up to
 // ~49 KiB of stages share an SM, one's copies and epilogue overlapping the other's MMAs). Neither
 // changes any sum: every output is the same MMAs over k in the same order (#824).
-template <int MI, int NT, bool GROUPED, bool GLU, int ST = STAGES, int MINB = 1>
-__global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p) {
+// AHEAD (grouped, #1176 r34): with one CTA an SM, a CTA's weights start streaming only when the
+// CTA starts, after the one before it on that SM is done, so the stream stalls at every tile
+// boundary. An AHEAD CTA also prefetches into L2 the weight rows of the CTA `ahead_ctas` after
+// it (about the one that starts when it ends, whichever SM runs it): `ahead` = 10 * len + at,
+// at step (at - 1) * steps / 8 (at 1-8) the first len / 8 of each row (len 0: all of it).
+// Prefetches only: the same copies and MMAs, so the same bits.
+template <int MI, int NT, bool GROUPED, bool GLU, int ST = STAGES, int MINB = 1, bool AHEAD = false>
+__global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p, int32_t ahead_ctas, int32_t ahead) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     static_assert(!GLU || MI == 2, "SwiGLU: gate and up tiles");
+    static_assert(!AHEAD || GROUPED, "the ahead prefetch: grouped tiles");
     constexpr int BM = 128 * MI, BN = 8 * NT, W_STAGE = BM * LDW, STAGE = stage_bytes<MI, NT>();
     constexpr int BM_OUT = GLU ? BM / 2 : BM;  // output rows per tile
     extern __shared__ __align__(16) unsigned char smem[];
     __shared__ int64_t x_off[GROUPED ? BN : 1], d_off[GROUPED ? BN : 1];
     __shared__ int32_t tile_expert, tile_tokens;
+    __shared__ int32_t ahead_expert, ahead_m0;
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
 
     int64_t m0, n0 = 0, n_tok;
@@ -411,6 +419,25 @@ __global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p)
                     const int t = q / p.n_used, slot = q % p.n_used;
                     x_off[i] = ((int64_t) t * p.n_x + (p.n_x == 1 ? 0 : slot)) * p.x_ld;
                     d_off[i] = (int64_t) q * p.m;
+                }
+            }
+        }
+        if constexpr (AHEAD) {
+            // The CTA ahead_ctas on: its expert and first row (warp 1, beside warp 0's scan).
+            if (warp == 1) {
+                const int64_t ab = (int64_t) blockIdx.x + ahead_ctas;
+                int e = -1;
+                if (ahead > 0 && ab < (int64_t) gridDim.x) {
+                    const int at_tile = (int) (ab / p.tiles_m);
+                    int found, first, count;
+                    if (!legion_nvfp4::past_plan_tiles<TI>(p, at_tile) &&
+                        find_tile(p.plan, p.n_expert, BN, at_tile, lane, p.sel_lo, p.sel_hi, found, first, count)) {
+                        e = found;
+                    }
+                }
+                if (lane == 0) {
+                    ahead_expert = e;
+                    ahead_m0 = (int) (ab % p.tiles_m) * BM_OUT;
                 }
             }
         }
@@ -486,6 +513,29 @@ __global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p)
         }
 #endif
     };
+    // AHEAD: the CTA ahead's rows (its first len / 8 of each, all with len 0), one bulk L2
+    // prefetch per row.
+    auto prefetch_ahead = [&]() {
+#if __CUDA_ARCH__ >= 900
+        if constexpr (AHEAD) {
+            if (threadIdx.x < BM && ahead_expert >= 0) {
+                const int r = threadIdx.x;
+                const int64_t row = ahead_m0 + (GLU ? r / 32 * 16 + r % 16 : r);
+                if (row < p.m) {
+                    const int len = ahead / 10;
+                    const int64_t n = len > 0 ? max((int64_t) 1, steps * len / 8) : steps;
+                    const uint8_t * wt = (GLU && r / 16 % 2 ? p.w2 : p.w) + (int64_t) ahead_expert * p.w_e;
+                    const uintptr_t a = (uintptr_t) (wt + row * p.w_ld);
+                    const uintptr_t e = a + n * 36;
+                    const uintptr_t a16 = a & ~(uintptr_t) 15;
+                    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(a16),
+                                 "r"((uint32_t) ((e - a16 + 15) & ~(uintptr_t) 15)));
+                }
+            }
+        }
+#endif
+    };
+    const int64_t ahead_step = AHEAD ? (int64_t) (ahead % 10 - 1) * steps / 8 : -1;
     prefetch(0);
     prefetch(PF);
 
@@ -592,6 +642,9 @@ __global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p)
         asm volatile("cp.async.commit_group;\n" ::);
         if (step % PF == 0 && step > 0) {
             prefetch(step + PF);
+        }
+        if (AHEAD && step == ahead_step) {
+            prefetch_ahead();
         }
         const unsigned char * ws = smem + (step % ST) * STAGE;
         const __nv_bfloat16 * xs = (const __nv_bfloat16 *) (ws + W_STAGE);
@@ -1118,7 +1171,7 @@ int gemm(const legion_nvfp4_mm & p, cudaStream_t st) {
     const unsigned grid = (unsigned) p.tiles_m * (unsigned) p.tiles_n;
     auto go = [&](auto kernel) {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
-        kernel<<<grid, 256, SMEM, st>>>(p);
+        kernel<<<grid, 256, SMEM, st>>>(p, 0, 0);
     };
     if constexpr (GLU) {
         p.plan ? go(nvfp4_gemm<MI, NT, true, true>) : go(nvfp4_gemm<MI, NT, false, true>);
@@ -1131,9 +1184,11 @@ int gemm(const legion_nvfp4_mm & p, cudaStream_t st) {
 }
 
 // The grouped GEMM's other stage counts and occupancies (#824): ST stages, MINB CTAs per SM.
-// Grouped tiles only (the routed experts' prefill). -1 where the stages do not fit.
-template <int MI, int NT, bool GLU, int ST, int MINB>
-int gemm_tuned(const legion_nvfp4_mm & p, cudaStream_t st) {
+// Grouped tiles only (the routed experts' prefill). -1 where the stages do not fit. AHEAD: the
+// kernel's ahead prefetch (`ahead` as nvfp4_gemm's), the CTA one wave of CTAs on (the SMs times
+// MINB).
+template <int MI, int NT, bool GLU, int ST, int MINB, bool AHEAD = false>
+int gemm_tuned(const legion_nvfp4_mm & p, cudaStream_t st, int ahead = 0) {
     constexpr int SMEM = smem_bytes<MI, NT, ST>();
     // An sm_120 / sm_121 SM has 100 KiB of shared memory, 1 KiB of it reserved per CTA; the
     // kernel's static arrays (the grouped tile's token offsets) take 16 bytes per token.
@@ -1145,23 +1200,39 @@ int gemm_tuned(const legion_nvfp4_mm & p, cudaStream_t st) {
             return -1;
         }
         const unsigned grid = (unsigned) p.tiles_m * (unsigned) p.tiles_n;
-        auto kernel = nvfp4_gemm<MI, NT, true, GLU, ST, MINB>;
+        auto kernel = nvfp4_gemm<MI, NT, true, GLU, ST, MINB, AHEAD>;
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
         if (MINB > 1) {
             cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
                                  cudaSharedmemCarveoutMaxShared);
         }
-        kernel<<<grid, 256, SMEM, st>>>(p);
+        int ctas = 0;
+        if (AHEAD) {
+            int dev = 0, sms = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+            ctas = sms * MINB;
+        }
+        kernel<<<grid, 256, SMEM, st>>>(p, ctas, AHEAD ? ahead : 0);
         return status();
     }
 }
 
 // stages * 10 + CTAs per SM: 31 is the default kernel (gemm); the others for 64- and 128-token
-// tiles.
+// tiles. Above 100 (#1176 r34): the default's stages and occupancy with the ahead prefetch,
+// variant / 100 its `ahead` (the grouped SwiGLU GEMM only).
 template <int MI, int NT, bool GLU>
 int gemm_variant(const legion_nvfp4_mm & p, int variant, cudaStream_t st) {
     if (variant == 31) {
         return gemm<MI, NT, GLU>(p, st);
+    }
+    if (variant > 100) {
+        if constexpr (GLU && (NT == 8 || NT == 16)) {
+            if (variant % 100 == 31) {
+                return gemm_tuned<MI, NT, GLU, 3, 1, true>(p, st, variant / 100);
+            }
+        }
+        return -1;
     }
     if constexpr (NT == 8 || NT == 16) {
         switch (variant) {

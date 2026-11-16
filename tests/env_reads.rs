@@ -18,6 +18,7 @@ const ALLOWED: &[(&str, &str)] = &[
         "LEGION_DEBUG_EXPERT_DUMP",
     ),
     ("src/model/moe_ffn/tests.rs", "LEGION_MOE_SPEED_TYPES"),
+    ("src/model/nvfp4_mm.rs", "LEGION_DEBUG_NVFP4_AHEAD"),
     ("src/model/qwen4/qsa_attn/tests.rs", "LEGION_TINY"),
     (
         "src/residency/cpu_share/ops.rs",

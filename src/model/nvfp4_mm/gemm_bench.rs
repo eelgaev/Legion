@@ -84,7 +84,11 @@ impl Variant {
             (t, u) => {
                 let (mi, nt) = t.unwrap_or((0, 0));
                 let u = u.unwrap_or(super::GEMM_DEFAULT);
-                format!("{op} mi{mi} nt{nt} s{}c{}", u.stages, u.ctas)
+                if u.ahead != 0 {
+                    format!("{op} mi{mi} nt{nt} s{}c{} a{}", u.stages, u.ctas, u.ahead)
+                } else {
+                    format!("{op} mi{mi} nt{nt} s{}c{}", u.stages, u.ctas)
+                }
             }
         }
     }
@@ -93,11 +97,22 @@ impl Variant {
 /// The stage counts and occupancies tried (the default first).
 const TUNES: [(i32, i32); 5] = [(3, 1), (2, 1), (2, 2), (3, 2), (4, 1)];
 
+/// The ahead prefetches tried on the SwiGLU GEMM's 128-token tile (`10 * len + at`): whole rows
+/// at the start, a quarter, half and three quarters in; the first quarter or half of each row
+/// at the start and half way.
+const AHEADS: [i32; 8] = [1, 3, 5, 7, 21, 41, 25, 45];
+
 /// The variants: each op's default first, then its tiles in every tune, then (#836) the GEMM's
 /// own choice and its small tiles at any size and the mv kernel at each widest token tile; each
 /// default's exact grid right after it.
 pub fn variants() -> Vec<Variant> {
-    let tune = |(stages, ctas): (i32, i32)| Some(GemmTune { stages, ctas });
+    let tune = |(stages, ctas): (i32, i32)| {
+        Some(GemmTune {
+            stages,
+            ctas,
+            ahead: 0,
+        })
+    };
     let v = |op, tile, tune, family| Variant {
         op,
         tile,
@@ -114,6 +129,14 @@ pub fn variants() -> Vec<Variant> {
         for t in TUNES {
             out.push(v(Op::Glu, Some((2, nt)), tune(t), Family::Default));
         }
+    }
+    // #1176 r34: the default tile and variant with the ahead prefetch (GemmTune::ahead).
+    for ahead in AHEADS {
+        let t = GemmTune {
+            ahead,
+            ..super::GEMM_DEFAULT
+        };
+        out.push(v(Op::Glu, Some((2, 16)), Some(t), Family::Default));
     }
     out.push(v(Op::Glu, None, None, Family::Gemm));
     out.push(v(Op::Glu, Some((2, 4)), tune((3, 1)), Family::Gemm));

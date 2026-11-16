@@ -1335,37 +1335,59 @@ fn wide_down(k: i64, n_expert: i64) -> bool {
 /// A stage count and occupancy of the GEMM (`nvfp4_gemm`): `stages` cp.async stages of one
 /// NVFP4 block (64 of k), registers limited for `ctas` CTAs per SM. Every variant gives the same
 /// bits (each output is the same MMAs over k in the same order); the non-default ones are
-/// compiled for grouped tiles of 64 and 128 tokens (#824).
+/// compiled for grouped tiles of 64 and 128 tokens (#824). `ahead` (#1176 r34, nonzero: the
+/// grouped SwiGLU GEMM's default stages and occupancy only): each CTA also prefetches into L2
+/// the weight rows of the CTA one wave on, `10 * len + at`: at step `(at - 1) * steps / 8` (at
+/// 1-8), the first `len / 8` of each row (0: all of it); prefetches only, the same bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GemmTune {
     pub stages: i32,
     pub ctas: i32,
+    pub ahead: i32,
 }
 
 impl GemmTune {
     /// The launch functions' `variant`.
     pub fn code(self) -> i32 {
-        self.stages * 10 + self.ctas
+        self.ahead * 100 + self.stages * 10 + self.ctas
     }
 
     /// The tune of a launch function's `variant`.
     pub fn from_code(v: i32) -> Self {
         Self {
-            stages: v / 10,
+            stages: v / 10 % 10,
             ctas: v % 10,
+            ahead: v / 100,
         }
     }
 }
 
 /// The GEMM's default: three stages, one CTA per SM.
-pub const GEMM_DEFAULT: GemmTune = GemmTune { stages: 3, ctas: 1 };
+pub const GEMM_DEFAULT: GemmTune = GemmTune {
+    stages: 3,
+    ctas: 1,
+    ahead: 0,
+};
+
+/// Whether `ahead` is a [`GemmTune::ahead`] the kernel takes: `at` 1-8, `len` 0-8.
+pub fn gemm_ahead_valid(ahead: i32) -> bool {
+    (1..=8).contains(&(ahead % 10)) && (0..=8).contains(&(ahead / 10))
+}
 
 /// Whether the GEMM has `tune` for tiles of `128 * mi` rows by `8 * nt` tokens: the default
 /// always; the others at 64 and 128 tokens where `ctas` CTAs' stages fit an sm_120 / sm_121 SM's
-/// 100 KiB of shared memory (`gemm_tuned` in `src/cuda/nvfp4_mm/common.cuh`).
+/// 100 KiB of shared memory (`gemm_tuned` in `src/cuda/nvfp4_mm/common.cuh`). An `ahead` tune:
+/// the default's stages and occupancy at 256 rows by 64 or 128 tokens, for the grouped SwiGLU
+/// GEMM only (the down GEMM has none).
 pub fn gemm_tune_fits(mi: i32, nt: i32, tune: GemmTune) -> bool {
     if tune == GEMM_DEFAULT {
         return true;
+    }
+    if tune.ahead != 0 {
+        return mi == 2
+            && (nt == 8 || nt == 16)
+            && gemm_ahead_valid(tune.ahead)
+            && GemmTune { ahead: 0, ..tune } == GEMM_DEFAULT;
     }
     // One stage: 48 bytes per weight row, 144 per token row; then x_off/d_off and the CTA's
     // reserved KiB.
@@ -1376,7 +1398,11 @@ pub fn gemm_tune_fits(mi: i32, nt: i32, tune: GemmTune) -> bool {
 }
 
 /// Two stages, two CTAs per SM: [`pick_grouped`]'s 256-row by 64-token down projection tile.
-pub const GEMM_DOWN: GemmTune = GemmTune { stages: 2, ctas: 2 };
+pub const GEMM_DOWN: GemmTune = GemmTune {
+    stages: 2,
+    ctas: 2,
+    ahead: 0,
+};
 
 /// The variant of a grouped GEMM (`glu`: the fused SwiGLU's) of `128 * mi` rows by `8 * nt`
 /// tokens over `k` on `n_expert` experts.
@@ -1390,7 +1416,11 @@ pub fn grouped_gemm_tune(k: i64, n_expert: i64, mi: i32, nt: i32, glu: bool) -> 
 
 /// Four stages, one CTA per SM: the grouped SwiGLU GEMM's tile of 64 tokens at up to
 /// [`MV_MAX_N`] pairs per expert (the GEMM there only under [`set_expert_mv_max`]).
-pub const GEMM_GLU_SHORT: GemmTune = GemmTune { stages: 4, ctas: 1 };
+pub const GEMM_GLU_SHORT: GemmTune = GemmTune {
+    stages: 4,
+    ctas: 1,
+    ahead: 0,
+};
 
 /// The grouped SwiGLU GEMM's token tile (`8 * nt` tokens) and its variant at `per` pairs per
 /// expert. Up to [`MV_MAX_N`] pairs (short prompt steps, on the GEMM only under
@@ -2011,7 +2041,32 @@ mod cuda {
         if let Some(t) = forced_tiles().filter(|_| split.is_none()) {
             p.tiles_n = p.tiles_n.min(t);
         }
-        glu_gemm(&p, nt, tune_at(nt), stream)
+        // LEGION_DEBUG_NVFP4_AHEAD (#1176 r34, A/B runs): the default variant with the ahead
+        // prefetch, where nothing is forced.
+        let tune = match (tune_at(nt), debug_ahead()) {
+            (t, Some(ahead))
+                if forced_tune().is_none() && gemm_tune_fits(2, nt, GemmTune { ahead, ..t }) =>
+            {
+                GemmTune { ahead, ..t }
+            }
+            (t, _) => t,
+        };
+        glu_gemm(&p, nt, tune, stream)
+    }
+
+    /// `LEGION_DEBUG_NVFP4_AHEAD=<ahead>` ([`GemmTune::ahead`]), read once; a value the kernel
+    /// does not take is reported and ignored.
+    fn debug_ahead() -> Option<i32> {
+        static V: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            let v = std::env::var("LEGION_DEBUG_NVFP4_AHEAD").ok()?;
+            let a = v.trim().parse().ok().filter(|&a| gemm_ahead_valid(a));
+            match a {
+                Some(a) => tracing::info!("LEGION_DEBUG_NVFP4_AHEAD: {a}"),
+                None => tracing::warn!("LEGION_DEBUG_NVFP4_AHEAD={v:?} ignored"),
+            }
+            a
+        })
     }
 
     /// The grouped SwiGLU GEMM at `8 * nt` tokens per tile.

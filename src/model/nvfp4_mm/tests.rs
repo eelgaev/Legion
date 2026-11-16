@@ -311,6 +311,20 @@ fn gemm_tune_codes() {
     assert!(gemm_tune_fits(2, 16, GemmTune::from_code(21)));
     assert!(!gemm_tune_fits(2, 16, GEMM_DOWN));
     assert!(!gemm_tune_fits(2, 16, GemmTune::from_code(41)));
+    // #1176 r34: the ahead prefetch, on the default's stages and occupancy at 256 rows only.
+    for v in [131, 531, 2131, 4531, 831] {
+        let t = GemmTune::from_code(v);
+        assert_eq!(t.code(), v);
+        assert_eq!((t.stages, t.ctas), (3, 1));
+        assert!(gemm_tune_fits(2, 16, t) && gemm_tune_fits(2, 8, t));
+        assert!(!gemm_tune_fits(1, 16, t) && !gemm_tune_fits(2, 4, t));
+    }
+    assert_eq!(GemmTune::from_code(4531).ahead, 45);
+    assert!(!gemm_tune_fits(2, 16, GemmTune::from_code(122)));
+    assert!(!gemm_tune_fits(2, 16, GemmTune::from_code(931)));
+    assert!(!gemm_tune_fits(2, 16, GemmTune::from_code(9131)));
+    assert!(gemm_ahead_valid(1) && gemm_ahead_valid(88));
+    assert!(!gemm_ahead_valid(0) && !gemm_ahead_valid(10));
 }
 
 #[test]
