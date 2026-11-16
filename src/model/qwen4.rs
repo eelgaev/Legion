@@ -447,6 +447,26 @@ pub(crate) fn pools_listed(g: &Group<'_>, kpool: usize) -> usize {
     (real + 1).div_ceil(pad).max(1) * pad
 }
 
+/// The fewest tokens of a rank's share for the indexer to run on the shares
+/// ([`qsa_attn::scores_exact_fit`]'s 8-token floor).
+const QSA_SHARE_MIN: usize = 8;
+
+/// The cut between two ranks' shares of a one-sequence group of `n_tok` tokens that lists
+/// `n_pool` pools of `kpool` positions (#1176 r37, GLM's #560 r10 rule): a token's indexer
+/// scores cost about its visible pools, one more every `kpool` tokens, so the later share costs
+/// more (in a prompt's first chunk three times the earlier one with even shares). The cut
+/// gives each rank about half the cost; only the shape goes in (a graph serves every step of
+/// its shape), and a prompt chunk lists up to a quarter more pools than the last token sees
+/// ([`pools_listed`]), so ~7/8 of them is the last token's. 0: the even shares.
+pub(crate) fn qsa_share_cut(n_tok: usize, n_pool: usize, kpool: usize) -> usize {
+    if kpool == 0 || n_tok < 2 * QSA_SHARE_MIN {
+        return 0;
+    }
+    let last = n_pool as f64 * 7.0 / 8.0;
+    let first = (last - (n_tok - 1) as f64 / kpool as f64).max(1.0);
+    crate::tp_net::seq_par::cost_cut(n_tok, first, last.max(first), QSA_SHARE_MIN)
+}
+
 /// `legion serve --qsa-pool-pad-steps` (#858; 0, the default: off): decode and verify steps of
 /// several sequences pad their listed pools to cover at least this many steps' growth. A step
 /// of `t` tokens completes up to `t / kpool` pools, so at 64 pools a 16-sequence verify step
@@ -2033,6 +2053,8 @@ impl Model {
     /// `own_top` (the CUDA paged path) the scores come from [`qsa_attn::scores_exact`] (ggml's
     /// bits, one op) and the picks from [`qsa_attn::top_k`] (one launch; the same pools but for
     /// exact ties at the threshold; `legion serve --qsa-topk-ggml` keeps ggml's `top_k`).
+    /// With `share` (`(first, count)` of the group's tokens, [`Self::qsa_share`]) only those
+    /// tokens' scores and picks, the same columns as the whole group's.
     fn qsa_top<'a>(
         &'a self,
         pass: &Pass<'a>,
@@ -2040,6 +2062,7 @@ impl Model {
         gi: usize,
         iq: Tensor<'a>,
         own_top: bool,
+        share: Option<(i64, i64)>,
     ) -> Result<(Tensor<'a>, Tensor<'a>), ModelError> {
         let (off, sh) = pass.groups().nth(gi).expect("group index");
         let q = self.qwen4().qsa.as_ref().expect("sparse attention");
@@ -2047,9 +2070,28 @@ impl Model {
         let inp = QsaInputs::from_slice(&pass.group[gi]);
         let (d, kpool) = (q.head_dim, q.kpool as i64);
         let n_pool = sh.n_pool as i64;
-        let ng = sh.tokens() as i64;
         let pooled = self.qsa_pool_keys(pass, il, gi)?;
         let keys = || ctx.reshape_3d(ctx.get_rows(pooled, inp.pool_cells), d, 1, n_pool);
+        if let Some((a, ng)) = share {
+            // A rank's share (#1176 r37): ggml's CUDA scores for the share's columns (each
+            // token's an FMA chain of its own) and their picks.
+            let qnb = iq.nb();
+            let qg = ctx.view_3d(
+                iq,
+                [d, q.n_head, ng],
+                [qnb[1], qnb[2]],
+                (off as i64 + a) as usize * qnb[2],
+            );
+            let w = ctx.fill(
+                ctx.new_tensor(types::F32, &[q.n_head, ng]),
+                1.0 / (d as f32).sqrt(),
+            );
+            let vis = crate::model::core::cols(ctx, inp.pool_vis, a, ng);
+            let score = qsa_attn::scores_exact(ctx, qg, keys(), w, vis, inp.pool_bias);
+            let n_top = n_pool.min(q.top_k as i64 / kpool);
+            return Ok((score, qsa_attn::top_k(ctx, score, n_top)));
+        }
+        let ng = sh.tokens() as i64;
 
         // Score: unweighted sum of the rectified head scores, scaled by 1/sqrt(d).
         let qnb = iq.nb();
@@ -2130,7 +2172,24 @@ impl Model {
                 pos,
             ));
         }
-        let (score, top) = self.qsa_top(pass, il, gi, iq, true)?;
+        if let Some((c, cut, a, m)) = self.qsa_share(pass, il, gi) {
+            // `--tp-seq-par` (#1176 r37, GLM's #560 r9-r12): each rank scores the pools and
+            // picks the best for its share of the group's tokens only (the indexer has one key
+            // head, so the mirrored graph did this for every token on every rank), then the
+            // ranks all-gather the picks, exactly (I32), and select for every token from them
+            // and the tokens' visible pools: the same rows as without.
+            let (_, top) = self.qsa_top(pass, il, gi, iq, true, Some((a, m)))?;
+            let top = crate::tp_net::seq_par::all_gather_i32(pass.ctx, c, top, ng as i64, cut);
+            return Ok(qsa_attn::select_vis(
+                pass.ctx,
+                top,
+                inp.pool_vis,
+                inp.pool_idxs,
+                inp.tail_idxs,
+                pos,
+            ));
+        }
+        let (score, top) = self.qsa_top(pass, il, gi, iq, true, None)?;
         Ok(qsa_attn::select(
             pass.ctx,
             top,
@@ -2139,6 +2198,55 @@ impl Model {
             inp.tail_idxs,
             pos,
         ))
+    }
+
+    /// Where group `gi` of sparse-attention layer `il` runs its indexer on this rank's share of
+    /// its tokens (#1176 r37): under `--tp-seq-par` in a group of at least its tokens, in the
+    /// model's own layers (not the MTP head's) without a trace, where the whole group would
+    /// take [`qsa_attn::scores_exact`] and [`qsa_attn::top_k`] and so would every share (each
+    /// token's scores and picks then the same bits whatever the columns around it). Returns
+    /// the communicator, the cut between the shares ([`qsa_share_cut`]) and this rank's share
+    /// `(first, count)` of the group's tokens. `LEGION_DEBUG_QWEN4_QSA_SHARE=0`: never (every
+    /// rank scores every token, the way before), for A/B runs.
+    fn qsa_share(&self, pass: &Pass<'_>, il: usize, gi: usize) -> Option<(i32, usize, i64, i64)> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| {
+            std::env::var_os("LEGION_DEBUG_QWEN4_QSA_SHARE").is_none_or(|v| v != "0")
+        });
+        if !on || pass.tap.on || il >= self.hp.n_layer {
+            return None;
+        }
+        let (_, sh) = pass.groups().nth(gi).expect("group index");
+        let q = self.qwen4().qsa.as_ref()?;
+        let ng = sh.tokens();
+        let (c, rank, ranks) = self.tp_seq_par(ng as i64)?;
+        let cut = if sh.n_seqs == 1 {
+            qsa_share_cut(ng, sh.n_pool, q.kpool)
+        } else {
+            0
+        };
+        let fewest = (0..ranks)
+            .map(|r| crate::tp_net::seq_par::share_cut(ng, r, ranks, cut).1)
+            .min()
+            .unwrap_or(0) as i64;
+        let n_pool = sh.n_pool as i64;
+        let n_top = n_pool.min(q.top_k as i64 / q.kpool as i64);
+        let row = 4 * sh.n_pool;
+        let nb = [4, row, row * ng, row * ng];
+        let whole_takes_own = !qsa_attn::scores_fit(q.n_head, q.head_dim, ng as i64)
+            && qsa_attn::scores_exact_fit(q.n_head, q.head_dim, ng as i64)
+            && qsa_attn::own_top_k()
+            && !crate::model::cluster_select::topk_fits(
+                types::F32,
+                [n_pool, ng as i64, 1, 1],
+                nb,
+                n_top,
+            );
+        if !whole_takes_own || !qsa_attn::scores_exact_fit(q.n_head, q.head_dim, fewest) {
+            return None;
+        }
+        let (a, m) = crate::tp_net::seq_par::share_cut(ng, rank, ranks, cut);
+        Some((c, cut, a as i64, m as i64))
     }
 
     /// The attention mask of group `gi` in sparse-attention layer `il` for the gather path: its
@@ -2152,7 +2260,7 @@ impl Model {
         iq: Tensor<'a>,
         mask: Tensor<'a>,
     ) -> Result<Tensor<'a>, ModelError> {
-        let (score, top) = self.qsa_top(pass, il, gi, iq, false)?;
+        let (score, top) = self.qsa_top(pass, il, gi, iq, false, None)?;
         let (_, sh) = pass.groups().nth(gi).expect("group index");
         let q = self.qwen4().qsa.as_ref().expect("sparse attention");
         let ctx = pass.ctx;
