@@ -466,6 +466,88 @@ __global__ void __launch_bounds__(128) linear_mv_q6k_rw(const Lin p, int R, int 
     }
 }
 
+// One stage of a Q6_K row from shared memory (sb, KQ_STAGE super-blocks from super-block b0),
+// summed into lane (n, l)'s acc as linear_mv_q6k_st's loop body sums it: the same values in the
+// same order (#1172 r5). x0: the activations of matrix i (p.x + i p.x_nbi).
+template <int N>
+__device__ __forceinline__ void q6k_st_stage(const Lin & p, const char * x0, const char * sb, int64_t b0, int n, int l,
+                                             float (&acc)[N]) {
+#pragma unroll
+    for (int bb = 0; bb < KQ_STAGE; bb++) {
+        const int64_t b = b0 + bb;
+        const char * blk = sb + bb * 210;
+        const uint32_t a = *(const uint16_t *) (blk + 64 * n + l);
+        const uint32_t c = *(const uint16_t *) (blk + 64 * n + 32 + l);
+        const uint32_t h = *(const uint16_t *) (blk + 128 + 32 * n + l);
+        const float d = __half2float(*(const __half *) (blk + 208));
+        const int8_t * sc = (const int8_t *) (blk + 192 + 8 * n + l / 16);
+        float ds[4];
+#pragma unroll
+        for (int q = 0; q < 4; q++) {
+            ds[q] = d * (float) sc[2 * q];
+        }
+        float v[4][2];
+#pragma unroll
+        for (int j = 0; j < 2; j++) {
+            const uint32_t qa = (a >> (8 * j)) & 0xFF, qc = (c >> (8 * j)) & 0xFF, qh = (h >> (8 * j)) & 0xFF;
+            v[0][j] = (float) ((int) ((qa & 0xF) | ((qh & 3) << 4)) - 32);
+            v[1][j] = (float) ((int) ((qc & 0xF) | (((qh >> 2) & 3) << 4)) - 32);
+            v[2][j] = (float) ((int) ((qa >> 4) | (((qh >> 4) & 3) << 4)) - 32);
+            v[3][j] = (float) ((int) ((qc >> 4) | (((qh >> 6) & 3) << 4)) - 32);
+        }
+#pragma unroll
+        for (int t = 0; t < N; t++) {
+            if (t < p.n) {
+                const float * x = (const float *) (x0 + t * p.x_nbt) + b * 256 + 128 * n + l;
+                float s = 0.0f;
+#pragma unroll
+                for (int q = 0; q < 4; q++) {
+                    const float2 xv = __ldg((const float2 *) (x + 32 * q));
+                    s += ds[q] * (v[q][0] * xv.x + v[q][1] * xv.y);
+                }
+                acc[t] += s;
+            }
+        }
+    }
+}
+
+// A warp's Q6_K row of at most NG stages into registers (reg), all of it, with linear_mv_q6k_st's
+// 16-byte streaming loads; ng stages of the row (0: none, a warp past the matrix).
+template <int NG>
+__device__ __forceinline__ void q6k_row_load(const uint4 * row, int64_t ng, int lane, uint4 (&reg)[NG][KQ_STAGE_PER]) {
+#pragma unroll
+    for (int g = 0; g < NG; g++) {
+#pragma unroll
+        for (int e = 0; e < KQ_STAGE_PER; e++) {
+            if (g < ng && lane + 32 * e < KQ_STAGE_V) {
+                reg[g][e] = __ldcs(row + g * KQ_STAGE_V + lane + 32 * e);
+            }
+        }
+    }
+}
+
+// The row q6k_row_load loaded, summed stage by stage through the warp's shared memory sm as
+// linear_mv_q6k_st sums it (the same bits).
+template <int N, int NG>
+__device__ __forceinline__ void q6k_row_sum(const Lin & p, const char * x0, uint4 * sm, int64_t ng, int lane,
+                                            const uint4 (&reg)[NG][KQ_STAGE_PER], float (&acc)[N]) {
+    const int n = lane / 16, l = (lane % 16) * 2;
+#pragma unroll
+    for (int g = 0; g < NG; g++) {
+        if (g < ng) {
+#pragma unroll
+            for (int e = 0; e < KQ_STAGE_PER; e++) {
+                if (lane + 32 * e < KQ_STAGE_V) {
+                    sm[lane + 32 * e] = reg[g][e];
+                }
+            }
+            __syncwarp();
+            q6k_st_stage<N>(p, x0, (const char *) sm, (int64_t) g * KQ_STAGE, n, l, acc);
+            __syncwarp();
+        }
+    }
+}
+
 // Q4_K rows for a few tokens: lane = 8 g + j / 4 takes values 64 g + j .. + 3 (low nibbles of one
 // 32-bit word of qs, scale 2 g) and 64 g + 32 + j .. + 3 (its high nibbles, scale 2 g + 1); the
 // block header (d, dmin, scales) in one 16-byte load the warp shares; activations in float4s.

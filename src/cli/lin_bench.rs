@@ -59,7 +59,7 @@ pub struct LinBenchArgs {
     #[arg(long, value_delimiter = ',', default_values_t = [0u8, 1, 3, 5, 7, 17, 19])]
     q6k_modes: Vec<u8>,
     /// Time GLM-5.3-Flash Maya-S's small decode products instead (#1172 r4: the F32 router,
-    /// ssm_f_b + ssm_g_b, hc_pre): each `LEGION_DEBUG_GLM_SMALL_MV` mode of `--small-modes` at
+    /// ssm_f_b + ssm_g_b, hc_pre; r5: the shared expert's gate + up + GLU): each `LEGION_DEBUG_GLM_SMALL_MV` mode of `--small-modes` at
     /// `--gemv-tokens` (1-8), in GB/s of weights; fails when an output value's bits differ from
     /// the first mode's. `--shapes` takes the `SMALL_SHAPES` names.
     #[arg(long)]
@@ -341,7 +341,7 @@ fn small(gpu: &mut legion::ggml::Backend, args: &LinBenchArgs) -> anyhow::Result
     use legion::model::glm5next::ops::{lin_bench, set_small_mv, small_mv};
     let default = small_mv();
     println!(
-        "{:<8} {:>6} {:>5} {:>9} {:>7} {:>8} {:>7}",
+        "{:<9} {:>6} {:>5} {:>9} {:>7} {:>8} {:>7}",
         "product", "tokens", "mode", "ms/call", "GB/s", "vs 1st", "differ"
     );
     let mut differ = 0;
@@ -358,7 +358,7 @@ fn small(gpu: &mut legion::ggml::Backend, args: &LinBenchArgs) -> anyhow::Result
             let bytes = lin_bench::small_bytes(name);
             for r in &t {
                 println!(
-                    "{:<8} {:>6} {:>5} {:>9.4} {:>7.1} {:>8.3} {:>7}",
+                    "{:<9} {:>6} {:>5} {:>9.4} {:>7.1} {:>8.3} {:>7}",
                     name,
                     n,
                     r.mode,

@@ -244,11 +244,20 @@ pub(crate) const SMALL_MV_SET: u8 = 2;
 /// [`small_mv`]: [`hc_pre_norm`]'s F32 mix rows with the tokens in one block, the weights read
 /// once (hc_mix_tok_kernel).
 pub(crate) const SMALL_MV_HC: u8 = 4;
+/// [`small_mv`] (#1172 r5): [`hc_pre_norm`]'s finish (weights, `y` and `h`) launched while the
+/// mix drains, its streams and norm weight loaded before it waits for the mix rows
+/// (hc_mix_tok_kernel's early trigger and hc_finish_wide_kernel's PRE; with [`SMALL_MV_HC`]).
+pub(crate) const SMALL_MV_HCF: u8 = 8;
+/// [`small_mv`] (#1172 r5): [`glu_mv`] on these GPUs at 1-4 tokens for gate and up rows of one or
+/// two whole stages (the shared expert's 4096 x 2048), each row loaded before the wait and summed
+/// as linear_mv_q6k_st sums it (glu_mv_q6k_sp): one launch instead of two GEMVs and the GLU.
+pub(crate) const SMALL_MV_GLU: u8 = 16;
 
-/// The small decode products of GLM's 1-4 token steps on [`set_gb10_gemv`]'s GPUs (#1172 r4):
-/// [`SMALL_MV_F32`], [`SMALL_MV_SET`] and [`SMALL_MV_HC`], each summing the same values in the
-/// same order as the kernel it replaces (the same bits) and only reading its memory differently.
-/// `LEGION_DEBUG_GLM_SMALL_MV` picks the bits for A/B runs (0: the kernels before).
+/// The small decode products of GLM's 1-4 token steps on [`set_gb10_gemv`]'s GPUs (#1172 r4,
+/// r5): [`SMALL_MV_F32`], [`SMALL_MV_SET`], [`SMALL_MV_HC`], [`SMALL_MV_HCF`] and
+/// [`SMALL_MV_GLU`], each summing the same values in the same order as the kernels it replaces
+/// (the same bits) and only reading its memory differently or launching sooner.
+/// `LEGION_DEBUG_GLM_SMALL_MV` picks the bits for A/B runs (0: the kernels before r4, 7: r4's).
 pub fn small_mv() -> u8 {
     let v = SMALL_MV.load(Ordering::Relaxed);
     if v != SMALL_MV_UNSET {
@@ -268,10 +277,11 @@ pub(crate) fn small_mv_of(env: Option<&str>) -> u8 {
 }
 
 /// [`small_mv`]'s default.
-pub(crate) const SMALL_MV_DEFAULT: u8 = SMALL_MV_F32 | SMALL_MV_SET | SMALL_MV_HC;
+pub(crate) const SMALL_MV_DEFAULT: u8 =
+    SMALL_MV_F32 | SMALL_MV_SET | SMALL_MV_HC | SMALL_MV_HCF | SMALL_MV_GLU;
 
 /// The bits [`small_mv`] uses.
-const SMALL_MV_BITS: u8 = SMALL_MV_F32 | SMALL_MV_SET | SMALL_MV_HC;
+const SMALL_MV_BITS: u8 = SMALL_MV_F32 | SMALL_MV_SET | SMALL_MV_HC | SMALL_MV_HCF | SMALL_MV_GLU;
 
 /// Sets [`small_mv`] for nodes built from now on (`legion lin-bench --small`).
 pub fn set_small_mv(v: u8) {
@@ -990,14 +1000,43 @@ pub fn linear_set<'a>(
 /// Whether [`glu_mv`] takes the gate and up weights `gate`, `up` over `n` tokens: Q6_K
 /// matrices of one shape and layout, `k` a multiple of 256, up to 8 tokens (decode and verify
 /// steps), and the plain kernels (not the GB10 ones, [`set_gb10_linear`]), whose
-/// linear_mv_q6k it sums with.
+/// linear_mv_q6k it sums with; on the GB10 ones with [`SMALL_MV_GLU`], rows of one or two
+/// whole stages at 1-4 tokens ([`glu_sp_takes`]), summed as their linear_mv_q6k_st.
 pub fn glu_mv_takes(gate: Tensor<'_>, up: Tensor<'_>, n: i64) -> bool {
     glu_mv_fits(gate, up, n)
-        && !gb10_kernels(
+        && (!gb10_kernels(
             GB10_LINEAR.load(Ordering::Relaxed),
             GB10_GEMV.load(Ordering::Relaxed),
             n,
-        )
+        ) || glu_sp_takes(gate, n))
+}
+
+/// Whether [`glu_mv`] of `gate`'s shape at `n` tokens takes CUDA's glu_mv_q6k_sp on the GB10
+/// kernels: [`SMALL_MV_GLU`] in [`small_mv`] (on [`set_gb10_gemv`]'s GPUs), 1-4 tokens, rows
+/// of one or two whole stages, contiguous, and at most [`GLU_SP_ROWS`] of them.
+fn glu_sp_takes(gate: Tensor<'_>, n: i64) -> bool {
+    let k = gate.ne()[0];
+    gb10_kernels(
+        GB10_LINEAR.load(Ordering::Relaxed),
+        GB10_GEMV.load(Ordering::Relaxed),
+        n,
+    ) && small_mv_param() as u8 & SMALL_MV_GLU != 0
+        && (1..=4).contains(&n)
+        && glu_sp_shape(k, gate.ne()[1], gate.nb()[1] as i64)
+}
+
+/// The most rows [`glu_sp_takes`] takes: the shared expert's 2048 with room; the leading dense
+/// FFNs' 12288 (four stages a row) stay on linear_mv_q6k_st.
+const GLU_SP_ROWS: i64 = 4096;
+
+/// [`glu_sp_takes`]'s shapes: `k` values a row in one or two whole stages, `m` rows of at most
+/// [`GLU_SP_ROWS`], `nb1` bytes apart (contiguous).
+pub(crate) fn glu_sp_shape(k: i64, m: i64, nb1: i64) -> bool {
+    k > 0
+        && k % (256 * Q6K_STAGE) == 0
+        && k / (256 * Q6K_STAGE) <= 2
+        && (1..=GLU_SP_ROWS).contains(&m)
+        && nb1 == k / 256 * 210
 }
 
 /// [`glu_mv_takes`]'s shapes and types.
@@ -1032,7 +1071,7 @@ pub fn glu_mv<'a>(
         types::F32,
         [gate.ne()[1], n, 1, 1],
         &[gate, up, x],
-        &[limit.to_bits() as i32],
+        &[limit.to_bits() as i32, glu_sp_takes(gate, n) as i32],
     )
 }
 

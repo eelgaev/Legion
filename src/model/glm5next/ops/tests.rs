@@ -767,8 +767,21 @@ fn small_mv_takes_the_debug_switch() {
     assert_eq!(small_mv_of(None), SMALL_MV_DEFAULT);
     assert_eq!(small_mv_of(Some(" 0\n")), 0);
     assert_eq!(small_mv_of(Some("2")), SMALL_MV_SET);
-    assert_eq!(small_mv_of(Some("15")), 7);
+    assert_eq!(small_mv_of(Some("15")), 15);
+    assert_eq!(small_mv_of(Some("255")), 31);
     assert_eq!(small_mv_of(Some("x")), SMALL_MV_DEFAULT);
+}
+
+#[test]
+fn glu_sp_takes_the_shared_experts_shape() {
+    let nb1 = |k: i64| k / 256 * 210;
+    assert!(glu_sp_shape(4096, 2048, nb1(4096)));
+    assert!(glu_sp_shape(2048, 4096, nb1(2048)));
+    // the dense FFNs' 12288 rows, rows of no whole stages or of three, strided rows
+    assert!(!glu_sp_shape(4096, 12288, nb1(4096)));
+    assert!(!glu_sp_shape(1536, 2048, nb1(1536)));
+    assert!(!glu_sp_shape(6144, 2048, nb1(6144)));
+    assert!(!glu_sp_shape(4096, 2048, nb1(4096) + 16));
 }
 
 #[test]

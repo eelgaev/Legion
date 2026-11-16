@@ -606,14 +606,18 @@ pub fn q6k_ms(
 /// GLM-5.3-Flash Maya-S's small decode products (`legion lin-bench --small`, #1172 r4): the F32
 /// router `ffn_gate_inp` (4096 x 288, 43 MoE layers), the KDA gates' second products `ssm_f_b`
 /// and `ssm_g_b` in one [`linear_set`] (Q8_0 128 x 8192 each, the first with kda_gate's
-/// epilogue; 34 KDA layers) and [`hc_pre_norm`] (F32 mix rows 16384 x 24, twice a layer).
-pub const SMALL_SHAPES: [&str; 3] = ["router", "kda.fgb", "hc_pre"];
+/// epilogue; 34 KDA layers) and [`hc_pre_norm`] (F32 mix rows 16384 x 24, twice a layer); and
+/// (#1172 r5) the shared expert's gate, up and GLU (`shexp.glu`, Q6_K 4096 x 2048 each, 43 MoE
+/// layers) as `glm_ffn` builds them: [`glu_mv`] where [`glu_mv_takes`], else two [`linear`]s
+/// and [`glu`].
+pub const SMALL_SHAPES: [&str; 4] = ["router", "kda.fgb", "hc_pre", "shexp.glu"];
 
 /// Weight bytes one [`SMALL_SHAPES`] product reads.
 pub fn small_bytes(name: &str) -> f64 {
     match name {
         "router" => (4096 * 288 * 4) as f64,
         "kda.fgb" => (2 * 8192 * 4 * 34) as f64,
+        "shexp.glu" => (2 * 4096 / 256 * 210 * 2048) as f64,
         _ => (16384 * 24 * 4) as f64,
     }
 }
@@ -680,6 +684,17 @@ pub fn small_ms(
                 data.new_tensor(types::F32, &[64]),
             ],
         ),
+        "shexp.glu" => (
+            (0..copies)
+                .map(|_| {
+                    vec![
+                        data.new_tensor(types::Q6_K, &[4096, 2048]),
+                        data.new_tensor(types::Q6_K, &[4096, 2048]),
+                    ]
+                })
+                .collect(),
+            vec![data.new_tensor(types::F32, &[4096, n])],
+        ),
         _ => (
             (0..copies)
                 .map(|_| vec![data.new_tensor(types::F32, &[16384, 24])])
@@ -698,6 +713,8 @@ pub fn small_ms(
             let seed = 7 + (2 * c + j) as u64;
             if w.ty() == types::Q8_0 {
                 w.set_bytes(&q8_noise(w.elements() / 32, seed));
+            } else if w.ty() == types::Q6_K {
+                w.set_bytes(&q6k_noise(w.elements() / 256, seed));
             } else {
                 let v: Vec<f32> = noise(w.elements(), seed).iter().map(|v| v * 0.05).collect();
                 w.set_f32(&v);
@@ -739,6 +756,14 @@ pub fn small_ms(
                             (w[1], xs[1], SetEpi::Plain),
                         ],
                     ),
+                    "shexp.glu" if glu_mv_takes(w[0], w[1], n) => {
+                        vec![glu_mv(ctx, w[0], w[1], xs[0], 7.0)]
+                    }
+                    "shexp.glu" => {
+                        let g = linear(ctx, w[0], xs[0], 1.0, None);
+                        let u = linear(ctx, w[1], xs[0], 1.0, None);
+                        vec![glu(ctx, g, u, 7.0)]
+                    }
                     _ => {
                         let (p, h) = hc_pre_norm(
                             ctx, xs[0], w[0], xs[1], xs[2], 1e-6, 1e-6, 20, xs[3], 1e-5,
