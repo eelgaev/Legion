@@ -483,7 +483,7 @@ fn cuda_kernels_agree_bitwise() {
 /// [`glm_kernels`] marks the op's node; the op leaves it unmarked by default.
 #[test]
 fn glm_kernels_marks_the_node() {
-    let ctx = Context::new(64, 0);
+    let ctx = Context::new(128, 0);
     let (e, f, s, n) = (4096, 2048, 8, 5);
     let refs = || ExpertRefs {
         up: ctx.new_tensor(types::IQ2_XXS, &[e, f, s]),
