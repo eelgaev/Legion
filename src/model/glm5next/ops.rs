@@ -221,11 +221,70 @@ pub fn linear_io<'a>(
             },
             if GB10_GEMV.load(Ordering::Relaxed) && w.ty() == types::Q6_K {
                 q6k_mv_param(q6k_mv(), k, m, w.nb()[1] as i64)
+            } else if GB10_GEMV.load(Ordering::Relaxed) && w.ty() == types::F32 {
+                (small_mv() & SMALL_MV_F32) as i32
             } else {
                 0
             },
         ],
     )
+}
+
+/// [`small_mv`] before the first read: the environment's choice.
+const SMALL_MV_UNSET: u8 = u8::MAX;
+
+static SMALL_MV: AtomicU8 = AtomicU8::new(SMALL_MV_UNSET);
+
+/// [`small_mv`]: F32 weights' decode GEMV (the router) with the tokens' inputs copied to shared
+/// memory once per block (linear_mv_f32_xs).
+pub(crate) const SMALL_MV_F32: u8 = 1;
+/// [`small_mv`]: [`linear_set`]'s 128-value Q8_0 rows (`ssm_f_b`, `ssm_g_b`) staged through
+/// shared memory with 16-byte loads, two rows a warp (linear_set_q8_rw).
+pub(crate) const SMALL_MV_SET: u8 = 2;
+/// [`small_mv`]: [`hc_pre_norm`]'s F32 mix rows with the tokens in one block, the weights read
+/// once (hc_mix_tok_kernel).
+pub(crate) const SMALL_MV_HC: u8 = 4;
+
+/// The small decode products of GLM's 1-4 token steps on [`set_gb10_gemv`]'s GPUs (#1172 r4):
+/// [`SMALL_MV_F32`], [`SMALL_MV_SET`] and [`SMALL_MV_HC`], each summing the same values in the
+/// same order as the kernel it replaces (the same bits) and only reading its memory differently.
+/// `LEGION_DEBUG_GLM_SMALL_MV` picks the bits for A/B runs (0: the kernels before).
+pub fn small_mv() -> u8 {
+    let v = SMALL_MV.load(Ordering::Relaxed);
+    if v != SMALL_MV_UNSET {
+        return v;
+    }
+    let v = small_mv_of(std::env::var("LEGION_DEBUG_GLM_SMALL_MV").ok().as_deref());
+    SMALL_MV.store(v, Ordering::Relaxed);
+    v
+}
+
+/// [`small_mv`] given the environment's value.
+pub(crate) fn small_mv_of(env: Option<&str>) -> u8 {
+    match env.map(str::trim).and_then(|s| s.parse::<u8>().ok()) {
+        Some(v) => v & SMALL_MV_BITS,
+        None => SMALL_MV_DEFAULT,
+    }
+}
+
+/// [`small_mv`]'s default.
+pub(crate) const SMALL_MV_DEFAULT: u8 = SMALL_MV_F32 | SMALL_MV_SET | SMALL_MV_HC;
+
+/// The bits [`small_mv`] uses.
+const SMALL_MV_BITS: u8 = SMALL_MV_F32 | SMALL_MV_SET | SMALL_MV_HC;
+
+/// Sets [`small_mv`] for nodes built from now on (`legion lin-bench --small`).
+pub fn set_small_mv(v: u8) {
+    SMALL_MV.store(v & SMALL_MV_BITS, Ordering::Relaxed);
+}
+
+/// [`small_mv`] as the nodes' parameter: its bits on [`set_gb10_gemv`]'s GPUs, else 0.
+fn small_mv_param() -> i32 {
+    if GB10_GEMV.load(Ordering::Relaxed) {
+        small_mv() as i32
+    } else {
+        0
+    }
 }
 
 /// [`q6k_mv`] before the first read: the environment's choice.
@@ -645,6 +704,7 @@ pub fn hc_pre_norm<'a>(
             GB10_LINEAR.load(Ordering::Relaxed) as i32,
             norm_eps.to_bits() as i32,
             split as i32,
+            small_mv_param(),
         ],
     );
     let at = |i: i64| i as usize * 4;
@@ -884,7 +944,7 @@ pub fn linear_set<'a>(
         "glm_linear_set: Q8_0, up to 8 tokens"
     );
     let mut args = Vec::new();
-    let mut params = [set.len() as i32, 0, 0, 0, 0, n as i32];
+    let mut params = [set.len() as i32, 0, 0, 0, 0, n as i32, small_mv_param()];
     let mut gate = None;
     for (g, &(w, x, epi)) in set.iter().enumerate() {
         assert_eq!(x.ne()[0], w.ne()[0], "glm_linear_set: x rows");

@@ -766,14 +766,127 @@ __global__ void __launch_bounds__(128) linear_mv_f32_split(const Lin p) {
 // that linear_mv_f32's warp a row fills the GPU on its own.
 constexpr int64_t LIN_F32_SPLIT_ROWS = 4096;
 
+// linear_mv_f32 at 1-4 tokens with x in shared memory (#1172 r4: GLM's F32 router, 288 rows of
+// 4096, on a GB10). In linear_mv_f32 and linear_mv_f32_split a lane reads 16 x values in a row,
+// 128 bytes from the next lane's, so each 4-byte x load of a warp touches 32 lines: ~3,000 L1
+// wavefronts a row at 3 tokens, the router ~55 us (85 GB/s). Here the block first copies the
+// tokens' x rows into shared memory with 16-byte loads, 36 floats a 32-value block (16-byte
+// reads conflict free), and then each warp sums a row exactly as linear_mv_f32's warp does: the
+// same lanes, blocks, FMA chains and warp_sum (the same bits). The first weights of each warp's
+// row are loaded before the wait for the kernel ahead (weights, which no kernel writes).
+constexpr int LIN_XS_F4 = 9;  // float4s a 32-value block takes in shared memory
+
+template <int N>
+__global__ void __launch_bounds__(256) linear_mv_f32_xs(const Lin p) {
+    extern __shared__ float4 lin_xs[];
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int64_t r = (int64_t) blockIdx.x * (blockDim.x / 32) + warp;
+    const bool live = r < p.m;
+    const float4 * row = (const float4 *) (p.w + (live ? r : 0) * p.w_nb1);
+    const int64_t nb = p.k / 32;
+    float4 w[LIN_F32_U][8];
+#pragma unroll
+    for (int u = 0; u < LIN_F32_U; u++) {
+        const int64_t b = lane + 32 * u;
+#pragma unroll
+        for (int q = 0; q < 8; q++) {
+            w[u][q] = b < nb ? __ldg(row + b * 8 + q) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+    }
+    pdl_wait();
+    const int64_t c8 = nb * 8;
+    for (int64_t c = threadIdx.x; c < p.n * c8; c += blockDim.x) {
+        const int64_t t = c / c8, o = c % c8;
+        lin_xs[(t * nb + o / 8) * LIN_XS_F4 + o % 8] = __ldg((const float4 *) (p.x + t * p.x_nbt) + o);
+    }
+    __syncthreads();
+    if (!live) {
+        return;
+    }
+    float acc[N];
+#pragma unroll
+    for (int t = 0; t < N; t++) {
+        acc[t] = 0.0f;
+    }
+    for (int64_t b0 = lane; b0 < nb; b0 += 32 * LIN_F32_U) {
+        if (b0 != lane) {
+#pragma unroll
+            for (int u = 0; u < LIN_F32_U; u++) {
+                const int64_t b = b0 + 32 * u;
+#pragma unroll
+                for (int q = 0; q < 8; q++) {
+                    w[u][q] = b < nb ? __ldg(row + b * 8 + q) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                }
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < LIN_F32_U; u++) {
+            const int64_t b = b0 + 32 * u;
+            if (b >= nb) {
+                break;
+            }
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const float v[16] = {w[u][4 * h].x,     w[u][4 * h].y,     w[u][4 * h].z,     w[u][4 * h].w,
+                                     w[u][4 * h + 1].x, w[u][4 * h + 1].y, w[u][4 * h + 1].z, w[u][4 * h + 1].w,
+                                     w[u][4 * h + 2].x, w[u][4 * h + 2].y, w[u][4 * h + 2].z, w[u][4 * h + 2].w,
+                                     w[u][4 * h + 3].x, w[u][4 * h + 3].y, w[u][4 * h + 3].z, w[u][4 * h + 3].w};
+#pragma unroll
+                for (int t = 0; t < N; t++) {
+                    if (t < p.n) {
+                        const float4 * xq = lin_xs + (t * nb + b) * LIN_XS_F4 + 4 * h;
+                        const float4 x0 = xq[0], x1 = xq[1], x2 = xq[2], x3 = xq[3];
+                        const float x[16] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w,
+                                             x2.x, x2.y, x2.z, x2.w, x3.x, x3.y, x3.z, x3.w};
+                        float s = 0.0f;
+#pragma unroll
+                        for (int j = 0; j < 16; j++) {
+                            s += v[j] * x[j];
+                        }
+                        acc[t] += s;
+                    }
+                }
+            }
+        }
+    }
+    const float sc = lin_scale(p, r);
+#pragma unroll
+    for (int t = 0; t < N; t++) {
+        const float s = warp_sum(acc[t]);
+        if (lane == 0 && t < p.n) {
+            p.dst[t * p.m + r] = s * sc;
+        }
+    }
+}
+
+// linear_mv_f32_xs's shared memory for `n` tokens of `k` values, in bytes.
+inline int64_t lin_xs_bytes(int64_t k, int64_t n) { return n * (k / 32) * LIN_XS_F4 * 16; }
+
+// The SMs of the current device (cached per device).
+int lin_sms() {
+    static int sms[16] = {0};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 16) {
+        return 48;
+    }
+    if (sms[dev] == 0) {
+        int v = 0;
+        cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, dev);
+        sms[dev] = v > 0 ? v : 48;
+    }
+    return sms[dev];
+}
+
 // Q8_0 rows for a few tokens, read the way ggml's mmvq lays a warp over them: lane l takes the
 // quarter l % 4 (8 quants) of block l / 4 + 8 j, so each load of a warp covers 8 consecutive
 // blocks (272 bytes; 16-bit loads, blocks being 34 bytes), and the activations come in float4s
 // that the other rows' warps find in L1. A warp per row; two blocks per lane in flight.
 // linear_mv_q8_acc is a lane's part of row r of matrix i, before the warp's sum.
-template <int N>
-__device__ __forceinline__ void linear_mv_q8_acc(const Lin & p, int64_t r, int64_t i, int lane, float (&acc)[N]) {
-    const char * row = p.w + r * p.w_nb1 + i * p.w_nb2;
+// linear_mv_q8_row is that part for the row at `row`: in global memory, or with SM (#1172 r4,
+// linear_set_q8_rw) a copy of it in shared memory, read with plain loads; the same sums.
+template <int N, bool SM = false>
+__device__ __forceinline__ void linear_mv_q8_row(const Lin & p, const char * row, int64_t i, int lane, float (&acc)[N]) {
     const int q = lane % 4;
 #pragma unroll
     for (int t = 0; t < N; t++) {
@@ -783,12 +896,12 @@ __device__ __forceinline__ void linear_mv_q8_acc(const Lin & p, int64_t r, int64
 #pragma unroll 2
     for (int64_t b = lane / 4; b < nb; b += 8) {
         const char * blk = row + b * 34;
-        const float d = __half2float(__ldg((const __half *) blk));
+        const float d = __half2float(SM ? *(const __half *) blk : __ldg((const __half *) blk));
         const uint16_t * qs = (const uint16_t *) (blk + 2 + 8 * q);
         float v[8];
 #pragma unroll
         for (int j = 0; j < 4; j++) {
-            const uint16_t w = __ldg(qs + j);
+            const uint16_t w = SM ? qs[j] : __ldg(qs + j);
             v[2 * j] = (float) (int8_t) (w & 0xFF);
             v[2 * j + 1] = (float) (int8_t) (w >> 8);
         }
@@ -804,6 +917,11 @@ __device__ __forceinline__ void linear_mv_q8_acc(const Lin & p, int64_t r, int64
             }
         }
     }
+}
+
+template <int N>
+__device__ __forceinline__ void linear_mv_q8_acc(const Lin & p, int64_t r, int64_t i, int lane, float (&acc)[N]) {
+    linear_mv_q8_row<N>(p, p.w + r * p.w_nb1 + i * p.w_nb2, i, lane, acc);
 }
 
 template <int N>
@@ -873,6 +991,62 @@ __global__ void __launch_bounds__(128) linear_set_q8(const LinSet s) {
                 o = sigm(-(__fadd_rn(z, s.dt[r]) * s.av[r / s.head])) * s.lower;
             }
             p.dst[t * p.m + r] = o;
+        }
+    }
+}
+
+// linear_set_q8 for segments of 4-block rows (k = 128: GLM's ssm_f_b and ssm_g_b, #1172 r4) at
+// 1-4 tokens. linear_set_q8's warp a row leaves 16 lanes idle on such a row and loads it in
+// 2-byte pieces, and a step's 16,384 rows take 4,096 blocks (~52 GB/s on a GB10). Here a block
+// copies LS_RB contiguous rows (8,704 bytes) into shared memory with 16-byte loads, issued
+// before the wait for the kernel ahead (weights), then each warp sums two rows at a time, lanes
+// 0-15 and 16-31 each as lanes 0-15 of linear_set_q8's warp (linear_mv_q8_row), and in place of
+// warp_sum, whose first step there adds lanes 16-31's zeros, adds a zero and then takes the half
+// warp's steps 8, 4, 2, 1; the epilogues are linear_set_q8's: the same bits.
+constexpr int LS_RB = 64, LS_RW_BYTES = LS_RB * 136;
+
+template <int N>
+__global__ void __launch_bounds__(128) linear_set_q8_rw(const LinSet s) {
+    __shared__ uint4 ws[LS_RW_BYTES / 16];
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    int g = 0;
+    while (g + 1 < s.nseg && (int64_t) blockIdx.x >= s.first[g + 1]) {
+        g++;
+    }
+    const Lin & p = s.p[g];
+    const int64_t r0 = ((int64_t) blockIdx.x - s.first[g]) * LS_RB;
+    const uint4 * src = (const uint4 *) (p.w + r0 * p.w_nb1);
+    for (int c = threadIdx.x; c < LS_RW_BYTES / 16; c += blockDim.x) {
+        ws[c] = __ldg(src + c);
+    }
+    pdl_wait();
+    __syncthreads();
+    const int half = lane / 16, l = lane % 16;
+    const int epi = s.epi[g];
+#pragma unroll 1
+    for (int j = 0; j < LS_RB / 8; j++) {
+        const int rr = (LS_RB / 4) * warp + 2 * j + half;
+        const int64_t r = r0 + rr;
+        float acc[N];
+        linear_mv_q8_row<N, true>(p, (const char *) ws + rr * 136, 0, l, acc);
+        const float sc = lin_scale(p, r);
+#pragma unroll
+        for (int t = 0; t < N; t++) {
+            float v = __fadd_rn(acc[t], 0.0f);
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1) {
+                v += __shfl_xor_sync(0xffffffffu, v, o);
+            }
+            if (l == 0 && t < p.n) {
+                const float z = v * sc;
+                float o = z;
+                if (epi == LS_SIGMOID) {
+                    o = sigm(z);
+                } else if (epi == LS_KDA_GATE) {
+                    o = sigm(-(__fadd_rn(z, s.dt[r]) * s.av[r / s.head])) * s.lower;
+                }
+                p.dst[t * p.m + r] = o;
+            }
         }
     }
 }
@@ -1830,6 +2004,20 @@ int launch_linear(const A & a, cudaStream_t st) {
     } else if (p.n <= 8 && wt == T_Q5_K) {
         const dim3 grid((unsigned) ((p.m + 3) / 4), (unsigned) p.h);
         launch_pdl(linear_mv<8, true>, grid, 128,0, st, p);
+    } else if (p.n <= 4 && wt == T_F32 && (a.params[7] & 1) && p.h == 1 && x16 &&
+               lin_xs_bytes(p.k, p.n) <= 96 * 1024) {
+        // params[7] bit 0 for F32 weights (ops::small_mv, #1172 r4): linear_mv_f32_xs, a warp a
+        // row, as many rows a block as fill the SMs once (one block an SM: its x copy)
+        const int sms = lin_sms();
+        const int64_t per = (p.m + sms - 1) / sms;
+        const int warps = per > 8 ? 8 : per < 1 ? 1 : (int) per;
+        const unsigned g = (unsigned) ((p.m + warps - 1) / warps);
+        const int smem = (int) lin_xs_bytes(p.k, p.n);
+        void (*k)(const Lin) = p.n == 1 ? &linear_mv_f32_xs<1> : p.n == 2 ? &linear_mv_f32_xs<2> : &linear_mv_f32_xs<4>;
+        if (cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, smem) != cudaSuccess) {
+            return 1;
+        }
+        launch_pdl(k, g, 32 * warps, smem, st, p);
     } else if (p.n <= 8 && wt == T_F32 && p.m * p.h <= LIN_F32_SPLIT_ROWS) {
         const dim3 grid((unsigned) p.m, (unsigned) p.h);
         if (p.n == 1) {
@@ -2002,6 +2190,21 @@ int launch_linear_set(const A & a, cudaStream_t st) {
         off += p.m * n;
     }
     s.first[s.nseg] = first;
+    // params[6] bit 1 (ops::small_mv, #1172 r4): linear_set_q8_rw when every segment's rows are
+    // 4 blocks, contiguous, in whole runs of LS_RB from a 16-byte boundary
+    bool rw = (a.params[6] & 2) && n <= 4;
+    for (int g = 0; g < s.nseg && rw; g++) {
+        const Lin & p = s.p[g];
+        rw = p.k == 128 && p.w_nb1 == 136 && p.m % LS_RB == 0 && ((uintptr_t) p.w % 16) == 0;
+    }
+    if (rw) {
+        first = 0;
+        for (int g = 0; g < s.nseg; g++) {
+            s.first[g] = first;
+            first += s.p[g].m / LS_RB;
+        }
+        s.first[s.nseg] = first;
+    }
     if (gate) {
         const int di = 2 * s.nseg;
         if (a.n_src < di + 2 || a.src_ne[di + 1][0] < 1 || a.src_ne[di][0] % a.src_ne[di + 1][0] != 0) {
@@ -2018,6 +2221,16 @@ int launch_linear_set(const A & a, cudaStream_t st) {
         s.lower = host_f32(a.params[4]);
     }
     const unsigned grid = (unsigned) first;
+    if (rw) {
+        if (n == 1) {
+            launch_pdl(linear_set_q8_rw<1>, grid, 128, 0, st, s);
+        } else if (n == 2) {
+            launch_pdl(linear_set_q8_rw<2>, grid, 128, 0, st, s);
+        } else {
+            launch_pdl(linear_set_q8_rw<4>, grid, 128, 0, st, s);
+        }
+        return 0;
+    }
     if (n == 1) {
         launch_pdl(linear_set_q8<1>, grid, 128, 0, st, s);
     } else if (n == 2) {
@@ -2311,6 +2524,62 @@ __global__ void __launch_bounds__(32) hc_mix_split_kernel(const A a) {
         hc_mix_split_row<U, true>(a, r);
     } else {
         hc_mix_split_row<U, false>(a, r);
+    }
+}
+
+// hc_mix_split_kernel at GLM's size (e hc = 32 HC_MIX_W HC_SPLIT_UW: one step of 64 elements a
+// thread) and 1-4 tokens with the tokens in one block (#1172 r4): warp t of block (r, w) is
+// hc_mix_split_kernel's block (r, w, t), the same loads, sums and order (the same bits), but the
+// tokens' warps read the row's weights together (from L2 once instead of once a token) and load
+// them before the wait for the kernel ahead (weights, which no kernel writes).
+template <bool SQ>
+__device__ __forceinline__ void hc_mix_tok_row(const A & a, int64_t r, int64_t t, int lane) {
+    constexpr int U = HC_SPLIT_UW;
+    const int64_t e = a.src_ne[0][0], hc = a.src_ne[0][1];
+    const int64_t warp = blockIdx.x % HC_MIX_W;
+    const int64_t eh = e * hc, bd = 32 * HC_MIX_W;
+    const float * x = (const float *) a.src[0] + t * eh;
+    const float * w = (const float *) (S(a, 1) + r * a.src_nb[1][1]);
+    const int64_t i = warp * 32 + lane;
+    float wv[U], xv[U];
+#pragma unroll
+    for (int u = 0; u < U; u++) {
+        wv[u] = __ldg(w + i + u * bd);
+    }
+    pdl_wait();
+#pragma unroll
+    for (int u = 0; u < U; u++) {
+        xv[u] = __ldg(x + i + u * bd);
+    }
+    float acc = 0.0f;
+    double sq = 0.0;
+#pragma unroll
+    for (int u = 0; u < U; u++) {
+        acc += wv[u] * xv[u];
+        if (SQ) {
+            sq += (double) xv[u] * xv[u];
+        }
+    }
+    acc = warp_sum(acc);
+    if (SQ) {
+        sq = warp_sum(sq);
+    }
+    if (lane == 0) {
+        float * m = hc_mix_at(a, t);
+        m[HC_MIX_W * (2 + r) + warp] = acc;
+        if (SQ) {
+            ((double *) m)[warp] = sq;
+        }
+    }
+}
+
+__global__ void __launch_bounds__(128) hc_mix_tok_kernel(const A a) {
+    const int64_t r = blockIdx.x / HC_MIX_W;
+    const int64_t t = threadIdx.x / 32;
+    if (r == 0) {
+        hc_mix_tok_row<true>(a, r, t, (int) threadIdx.x % 32);
+    } else {
+        hc_mix_tok_row<false>(a, r, t, (int) threadIdx.x % 32);
     }
 }
 
@@ -4345,7 +4614,11 @@ extern "C" int legion_glm_launch(int op, const legion_glm_args * ap, void * stre
                     return 1;
                 }
                 const dim3 grid((unsigned) ((2 + hc) * hc * HC_MIX_W), (unsigned) a.src_ne[0][2]);
-                if (e * hc >= HC_SPLIT_UW * 32 * HC_MIX_W) {
+                // params[6] bit 2 (ops::small_mv, #1172 r4): the tokens' warps in one block
+                if ((a.params[6] & 4) && a.src_ne[0][2] <= 4 && e * hc == HC_SPLIT_UW * 32 * HC_MIX_W &&
+                    (int64_t) ((uintptr_t) a.src[1]) % 4 == 0) {
+                    launch_pdl(hc_mix_tok_kernel, dim3(grid.x), 32 * (int) a.src_ne[0][2], 0, st, a);
+                } else if (e * hc >= HC_SPLIT_UW * 32 * HC_MIX_W) {
                     launch_pdl(hc_mix_split_kernel<HC_SPLIT_UW>, grid, 32, 0, st, a);
                 } else {
                     launch_pdl(hc_mix_split_kernel<HC_SPLIT_U>, grid, 32, 0, st, a);
