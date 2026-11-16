@@ -1410,6 +1410,8 @@ impl Model {
             let out = moe_ffn::glm_kernels(out, ops::gb10_linear());
             // decode steps' kernels back to back (#1172 r6, the same bits)
             let out = moe_ffn::glm_pdl(out, ops::moe_pdl());
+            // and each signalling the next one early (#1172 r7, the same bits)
+            let out = moe_ffn::glm_pdl_trig(out, ops::moe_trig());
             moe_ffn::glm_q8(out, ops::gb10_linear() && ops::expert_q8())
         };
         if let Some(t) = self.expert_tier(il) {
@@ -1919,8 +1921,18 @@ impl Model {
             // LINEAR_SHARE_MIN tokens (each token's column the same bits as the whole step's).
             let gsp = sp.and_then(|_| self.tp_seq_par(ng));
             let level = share_level();
+            // The selection launched back to back with the kernels around it on the GB10 (#1172
+            // r7, the same rows).
+            let sel_pdl = |sel| qsa_attn::select_pdl(sel, ops::select_pdl());
             let sel = if sh.pick_all && !tap.on {
-                qsa_attn::select_all(ctx, inp.pool_vis, n_top, inp.pool_idxs, inp.tail_idxs, pos)
+                sel_pdl(qsa_attn::select_all(
+                    ctx,
+                    inp.pool_vis,
+                    n_top,
+                    inp.pool_idxs,
+                    inp.tail_idxs,
+                    pos,
+                ))
             } else if let Some((c, rank, ranks)) = gsp {
                 let cut = if level >= 1 && sh.n_seqs == 1 {
                     qsa_cut(ng as usize, sh.n_pool, p.kpool)
@@ -1987,7 +1999,8 @@ impl Model {
                 );
                 tap.tap("indexer_score", il, score);
                 let top = qsa_attn::top_k(ctx, score, n_top);
-                qsa_attn::select(ctx, top, score, inp.pool_idxs, inp.tail_idxs, pos)
+                let sel = qsa_attn::select(ctx, top, score, inp.pool_idxs, inp.tail_idxs, pos);
+                sel_pdl(sel)
             };
             let qnb = q.nb();
             let qg = ctx.view_3d(q, [dl, nh, ng], [qnb[1], qnb[2]], off as usize * qnb[2]);

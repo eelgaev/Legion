@@ -4603,6 +4603,101 @@ __global__ void pmax_kernel(const A a) {
     }
 }
 
+// pmax_kernel spread over the GPU (ops::pmax with params[0], #1172 r7): one CTA took ~84 us a
+// column, three times between a 1-user MTP cycle's graphs (the verify and both draft passes). dst
+// is F32 [n, 1 + PMAX_SPLIT + 2 PMAX_WARPS]: row 0 the result, then each column's chunk maxima,
+// then its warps' sums (doubles as lo/hi words). The maximum is exact in any order, and the sum
+// keeps pmax_kernel's: warp w of pmax_part_sum_kernel is pmax_kernel's warp w on its own CTA, each
+// lane summing the same elements in the same order, and pmax_fin_kernel adds the warps' sums as
+// block_sum's warp 0 does. The same bits.
+constexpr int PMAX_SPLIT = 32;
+constexpr int PMAX_WARPS = 8;  // pmax_kernel's 256 threads
+constexpr int PMAX_UNROLL = 32;
+
+__global__ void __launch_bounds__(256) pmax_part_max_kernel(const A a) {
+    pdl_wait();
+    const int64_t v = a.src_ne[0][0], n = a.ne[0], t = blockIdx.y, c = blockIdx.x;
+    const int64_t len = (v + PMAX_SPLIT - 1) / PMAX_SPLIT, i1 = min(v, (c + 1) * len);
+    const float * x = (const float *) a.src[0] + t * v;
+    float m = -INFINITY;
+    for (int64_t i0 = c * len + threadIdx.x; i0 < i1; i0 += VOCAB_UNROLL * blockDim.x) {
+        float xs[VOCAB_UNROLL];
+#pragma unroll
+        for (int u = 0; u < VOCAB_UNROLL; u++) {
+            const int64_t i = i0 + u * blockDim.x;
+            xs[u]           = i < i1 ? __ldg(x + i) : -INFINITY;
+        }
+#pragma unroll
+        for (int u = 0; u < VOCAB_UNROLL; u++) {
+            m = fmaxf(m, xs[u]);
+        }
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    }
+    __shared__ float ms[8];
+    if (threadIdx.x % 32 == 0) {
+        ms[threadIdx.x / 32] = m;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int w = 0; w < (int) blockDim.x / 32; w++) {
+            m = fmaxf(m, ms[w]);
+        }
+        ((float *) a.dst)[n + t * PMAX_SPLIT + c] = m;
+    }
+}
+
+__global__ void __launch_bounds__(32) pmax_part_sum_kernel(const A a) {
+    pdl_wait();
+    const int64_t v = a.src_ne[0][0], n = a.ne[0], t = blockIdx.y;
+    const int w = blockIdx.x, lane = threadIdx.x;
+    const float * x = (const float *) a.src[0] + t * v;
+    float * d = (float *) a.dst;
+    float m = d[n + t * PMAX_SPLIT + lane];
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    }
+    // pmax_kernel's thread w * 32 + lane: elements tid, tid + 256, ... in order
+    constexpr int64_t NT = 32 * PMAX_WARPS;
+    double sum = 0.0;
+    for (int64_t i0 = w * 32 + lane; i0 < v; i0 += PMAX_UNROLL * NT) {
+        float xs[PMAX_UNROLL];
+#pragma unroll
+        for (int u = 0; u < PMAX_UNROLL; u++) {
+            const int64_t i = i0 + u * NT;
+            xs[u]           = i < v ? __ldg(x + i) : 0.0f;
+        }
+#pragma unroll
+        for (int u = 0; u < PMAX_UNROLL; u++) {
+            if (i0 + u * NT < v) {
+                sum += (double) expf(xs[u] - m);
+            }
+        }
+    }
+    sum = warp_sum(sum);
+    if (lane == 0) {
+        int * s = (int *) (d + n + n * PMAX_SPLIT) + 2 * (t * PMAX_WARPS + w);
+        s[0] = __double2loint(sum);
+        s[1] = __double2hiint(sum);
+    }
+}
+
+__global__ void __launch_bounds__(32) pmax_fin_kernel(const A a) {
+    pdl_wait();
+    const int64_t n = a.ne[0], t = blockIdx.x;
+    const int lane = threadIdx.x;
+    float * d = (float *) a.dst;
+    const int * s = (const int *) (d + n + n * PMAX_SPLIT) + 2 * (t * PMAX_WARPS + lane);
+    double sum = lane < PMAX_WARPS ? __hiloint2double(s[1], s[0]) : 0.0;
+    sum = warp_sum(sum);
+    if (lane == 0) {
+        d[t] = (float) (1.0 / sum);
+    }
+}
+
 // MTP input: [rms(e) * enorm; rms(h) * hnorm] per token, a block per (token, half).
 __global__ void nextn_in_kernel(const A a) {
     pdl_wait();
@@ -4916,6 +5011,15 @@ extern "C" int legion_glm_launch(int op, const legion_glm_args * ap, void * stre
             launch_pdl(argmax_kernel, (unsigned) a.ne[0], 256, 0, st, a);
             break;
         case PMAX:
+            if (a.params[0]) {  // spread over the GPU (#1172 r7)
+                if (a.params[0] != PMAX_SPLIT || a.ne[1] != 1 + PMAX_SPLIT + 2 * PMAX_WARPS) {
+                    return 1;
+                }
+                launch_pdl(pmax_part_max_kernel, dim3(PMAX_SPLIT, (unsigned) a.ne[0]), 256, 0, st, a);
+                launch_pdl(pmax_part_sum_kernel, dim3(PMAX_WARPS, (unsigned) a.ne[0]), 32, 0, st, a);
+                launch_pdl(pmax_fin_kernel, (unsigned) a.ne[0], 32, 0, st, a);
+                break;
+            }
             launch_pdl(pmax_kernel, (unsigned) a.ne[0], 256, 0, st, a);
             break;
         case NEXTN_IN:

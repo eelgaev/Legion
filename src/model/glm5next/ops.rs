@@ -230,83 +230,102 @@ pub fn linear_io<'a>(
     )
 }
 
-/// [`small_mv`] before the first read: the environment's choice (outside u8: every u8 is a mode).
+/// [`small_mv`] before the first read: the environment's choice (outside [`SMALL_MV_BITS`]).
 const SMALL_MV_UNSET: u16 = u16::MAX;
 
 static SMALL_MV: AtomicU16 = AtomicU16::new(SMALL_MV_UNSET);
 
 /// [`small_mv`]: F32 weights' decode GEMV (the router) with the tokens' inputs copied to shared
 /// memory once per block (linear_mv_f32_xs).
-pub(crate) const SMALL_MV_F32: u8 = 1;
+pub(crate) const SMALL_MV_F32: u16 = 1;
 /// [`small_mv`]: [`linear_set`]'s 128-value Q8_0 rows (`ssm_f_b`, `ssm_g_b`) staged through
 /// shared memory with 16-byte loads, two rows a warp (linear_set_q8_rw).
-pub(crate) const SMALL_MV_SET: u8 = 2;
+pub(crate) const SMALL_MV_SET: u16 = 2;
 /// [`small_mv`]: [`hc_pre_norm`]'s F32 mix rows with the tokens in one block, the weights read
 /// once (hc_mix_tok_kernel).
-pub(crate) const SMALL_MV_HC: u8 = 4;
+pub(crate) const SMALL_MV_HC: u16 = 4;
 /// [`small_mv`] (#1172 r5): [`hc_pre_norm`]'s finish (weights, `y` and `h`) launched while the
 /// mix drains, its streams and norm weight loaded before it waits for the mix rows
 /// (hc_mix_tok_kernel's early trigger and hc_finish_wide_kernel's PRE; with [`SMALL_MV_HC`]).
-pub(crate) const SMALL_MV_HCF: u8 = 8;
+pub(crate) const SMALL_MV_HCF: u16 = 8;
 /// [`small_mv`] (#1172 r5): [`glu_mv`] on these GPUs at 1-4 tokens for gate and up rows of one or
 /// two whole stages (the shared expert's 4096 x 2048), each row loaded before the wait and summed
 /// as linear_mv_q6k_st sums it (glu_mv_q6k_sp): one launch instead of two GEMVs and the GLU.
-pub(crate) const SMALL_MV_GLU: u8 = 16;
+pub(crate) const SMALL_MV_GLU: u16 = 16;
 /// [`small_mv`] (#1172 r6): the kernels ahead of MLA's kv_a and q_a and of the shared expert's
 /// down (hc_finish_wide_kernel, pool_keys_kernel, glu_mv_q6k_sp) let the next kernel launch once
 /// each of their blocks is past its own wait (griddepcontrol.launch_dependents), so its blocks
 /// are resident and its weights loading while they drain. The next kernel still waits for them
 /// before it reads anything: the same bits.
-pub(crate) const SMALL_MV_TRIG: u8 = 32;
+pub(crate) const SMALL_MV_TRIG: u16 = 32;
 /// [`small_mv`] (#1172 r6): [`linear_sp`]'s Q6_K products (kv_a, q_a, shared expert down) at 1-4
 /// tokens load each warp's whole row (one or two stages) before the wait for the kernel ahead
 /// and sum it as linear_mv_q6k_st sums it (linear_mv_q6k_sp): the same bits.
-pub(crate) const SMALL_MV_SP: u8 = 64;
+pub(crate) const SMALL_MV_SP: u16 = 64;
 /// [`small_mv`] (#1172 r6): the routed experts' kernels back to back ([`moe_pdl`]).
-pub(crate) const SMALL_MV_MOE: u8 = 128;
+pub(crate) const SMALL_MV_MOE: u16 = 128;
+/// [`small_mv`] (#1172 r7): with [`SMALL_MV_MOE`], the routed experts' prep, plan, scatter and
+/// decode GEMMs let the next kernel launch once each of their blocks is past its own wait, as
+/// [`SMALL_MV_TRIG`] does for the kernels ahead of the small products: the GEMMs' blocks are
+/// resident and their decode tables built while the kernel ahead drains. The same bits.
+pub(crate) const SMALL_MV_MTRIG: u16 = 256;
+/// [`small_mv`] (#1172 r7): the attention's selection rows (`qsa_attn::select` and its
+/// variants) launched with the PDL attribute, waiting for the kernel ahead before reading
+/// anything and then letting the attention launch (it waits for the rows): the same rows.
+pub(crate) const SMALL_MV_SEL: u16 = 512;
+/// [`small_mv`] (#1172 r7): [`pmax`] (the draft head's confidence) spread over the GPU, its sum
+/// in the one-CTA kernel's order: the same bits.
+pub(crate) const SMALL_MV_PMAX: u16 = 1024;
 
-/// The small decode products of GLM's 1-4 token steps on [`set_gb10_gemv`]'s GPUs (#1172 r4-r6):
+/// The small decode products of GLM's 1-4 token steps on [`set_gb10_gemv`]'s GPUs (#1172 r4-r7):
 /// [`SMALL_MV_F32`], [`SMALL_MV_SET`], [`SMALL_MV_HC`], [`SMALL_MV_HCF`], [`SMALL_MV_GLU`],
-/// [`SMALL_MV_TRIG`], [`SMALL_MV_SP`] and [`SMALL_MV_MOE`], each summing the same values in the
-/// same order as the kernels it replaces (the same bits) and only reading its memory differently
-/// or launching sooner. `LEGION_DEBUG_GLM_SMALL_MV` picks the bits for A/B runs (0: the kernels
-/// before r4, 7: r4's, 31: r5's).
-pub fn small_mv() -> u8 {
+/// [`SMALL_MV_TRIG`], [`SMALL_MV_SP`], [`SMALL_MV_MOE`], [`SMALL_MV_MTRIG`], [`SMALL_MV_SEL`] and
+/// [`SMALL_MV_PMAX`], each summing the same values in the same order as the kernels it replaces
+/// (the same bits) and only reading its memory differently or launching sooner.
+/// `LEGION_DEBUG_GLM_SMALL_MV` picks the bits for A/B runs (0: the kernels before r4, 7: r4's,
+/// 31: r5's, 191: r6's).
+pub fn small_mv() -> u16 {
     let v = SMALL_MV.load(Ordering::Relaxed);
     if v != SMALL_MV_UNSET {
-        return v as u8;
+        return v;
     }
     let v = small_mv_of(std::env::var("LEGION_DEBUG_GLM_SMALL_MV").ok().as_deref());
-    SMALL_MV.store(v as u16, Ordering::Relaxed);
+    SMALL_MV.store(v, Ordering::Relaxed);
     v
 }
 
 /// [`small_mv`] given the environment's value.
-pub(crate) fn small_mv_of(env: Option<&str>) -> u8 {
-    match env.map(str::trim).and_then(|s| s.parse::<u8>().ok()) {
+pub(crate) fn small_mv_of(env: Option<&str>) -> u16 {
+    match env.map(str::trim).and_then(|s| s.parse::<u16>().ok()) {
         Some(v) => v & SMALL_MV_BITS,
         None => SMALL_MV_DEFAULT,
     }
 }
 
-/// [`small_mv`]'s default: every bit but [`SMALL_MV_SP`] (31 = r5's kernels). The pre-wait rows
-/// gave nothing in the model with the early triggers on (#1172 r6: 191 and 255 the same step) and
-/// are 4-21% slower alone, so they stay opt-in.
-pub(crate) const SMALL_MV_DEFAULT: u8 = SMALL_MV_BITS & !SMALL_MV_SP;
+/// [`small_mv`]'s default: r6's bits (191), every bit but [`SMALL_MV_SP`] and r7's. The pre-wait
+/// rows gave nothing in the model with the early triggers on (#1172 r6: 191 and 255 the same
+/// step) and are 4-21% slower alone. Of r7's, the expert chain's early triggers made the 1-user
+/// step ~2% slower (84.3 vs 82.7 ms), and the selection rows' PDL and the spread pmax (84 -> 50 us
+/// a call) left it where it was (1727: 82.3 vs 82.2 ms). All stay opt-in.
+pub(crate) const SMALL_MV_DEFAULT: u16 =
+    SMALL_MV_BITS & !(SMALL_MV_SP | SMALL_MV_MTRIG | SMALL_MV_SEL | SMALL_MV_PMAX);
 
 /// The bits [`small_mv`] uses.
-const SMALL_MV_BITS: u8 = SMALL_MV_F32
+const SMALL_MV_BITS: u16 = SMALL_MV_F32
     | SMALL_MV_SET
     | SMALL_MV_HC
     | SMALL_MV_HCF
     | SMALL_MV_GLU
     | SMALL_MV_TRIG
     | SMALL_MV_SP
-    | SMALL_MV_MOE;
+    | SMALL_MV_MOE
+    | SMALL_MV_MTRIG
+    | SMALL_MV_SEL
+    | SMALL_MV_PMAX;
 
 /// Sets [`small_mv`] for nodes built from now on (`legion lin-bench --small`).
-pub fn set_small_mv(v: u8) {
-    SMALL_MV.store((v & SMALL_MV_BITS) as u16, Ordering::Relaxed);
+pub fn set_small_mv(v: u16) {
+    SMALL_MV.store(v & SMALL_MV_BITS, Ordering::Relaxed);
 }
 
 /// [`small_mv`] as the nodes' parameter: its bits on [`set_gb10_gemv`]'s GPUs, else 0.
@@ -321,7 +340,18 @@ fn small_mv_param() -> i32 {
 /// Whether GLM's routed experts launch their decode steps' kernels back to back
 /// ([`SMALL_MV_MOE`], `crate::model::moe_ffn::glm_pdl`): on [`set_gb10_gemv`]'s GPUs.
 pub(crate) fn moe_pdl() -> bool {
-    small_mv_param() as u8 & SMALL_MV_MOE != 0
+    small_mv_param() as u16 & SMALL_MV_MOE != 0
+}
+
+/// Whether [`moe_pdl`]'s kernels also trigger their next kernel early ([`SMALL_MV_MTRIG`]).
+pub(crate) fn moe_trig() -> bool {
+    small_mv_param() as u16 & SMALL_MV_MTRIG != 0
+}
+
+/// Whether GLM's attention selection rows launch with the PDL attribute ([`SMALL_MV_SEL`],
+/// `crate::model::qwen4::qsa_attn::select_pdl`): on [`set_gb10_gemv`]'s GPUs.
+pub(crate) fn select_pdl() -> bool {
+    small_mv_param() as u16 & SMALL_MV_SEL != 0
 }
 
 /// `linear_mv_q6k_sp`'s flag in a Q6_K [`linear`]'s `params[7]` (above [`q6k_mv_param`]'s bits).
@@ -333,7 +363,7 @@ const Q6K_SP: i32 = 1 << 10;
 /// ahead trigger early with [`SMALL_MV_TRIG`]). CUDA takes it at 1-4 tokens on the GB10 kernels
 /// and keeps linear_mv_q6k_st otherwise. Any other tensor is returned as is.
 pub(crate) fn linear_sp<'a>(t: Tensor<'a>) -> Tensor<'a> {
-    if small_mv_param() as u8 & SMALL_MV_SP == 0 {
+    if small_mv_param() as u16 & SMALL_MV_SP == 0 {
         return t;
     }
     let node = t.raw();
@@ -1085,7 +1115,7 @@ fn glu_sp_takes(gate: Tensor<'_>, n: i64) -> bool {
         GB10_LINEAR.load(Ordering::Relaxed),
         GB10_GEMV.load(Ordering::Relaxed),
         n,
-    ) && small_mv_param() as u8 & SMALL_MV_GLU != 0
+    ) && small_mv_param() as u16 & SMALL_MV_GLU != 0
         && (1..=4).contains(&n)
         && glu_sp_shape(k, gate.ne()[1], gate.nb()[1] as i64)
 }
@@ -1140,7 +1170,7 @@ pub fn glu_mv<'a>(
             limit.to_bits() as i32,
             glu_sp_takes(gate, n) as i32,
             // the next kernel (the shared expert's down) launched early (#1172 r6)
-            (small_mv_param() as u8 & SMALL_MV_TRIG != 0) as i32,
+            (small_mv_param() as u16 & SMALL_MV_TRIG != 0) as i32,
         ],
     )
 }
@@ -1401,7 +1431,7 @@ pub fn pool_keys<'a>(
         types::F32,
         [d, n_new, 1, 1],
         &args,
-        &[(small_mv_param() as u8 & SMALL_MV_TRIG != 0) as i32],
+        &[(small_mv_param() as u16 & SMALL_MV_TRIG != 0) as i32],
     )
 }
 
@@ -1613,9 +1643,30 @@ pub fn argmax_wide_ids<'a>(ctx: &'a Context, x: Tensor<'a>, ids: Option<Tensor<'
 
 /// Each column's largest softmax probability, `1 / Σ exp(x - max)`: F32 `[n]` from F32
 /// `[v, n]` (an MTP draft's confidence).
+///
+/// With [`SMALL_MV_PMAX`] on [`set_gb10_gemv`]'s GPUs (#1172 r7) CUDA spreads each column over
+/// [`PMAX_SPLIT`] CTAs for the maximum and one CTA per warp of the one-CTA kernel for the sum,
+/// each lane summing its elements in the same order: the node is F32 `[n, 1 + PMAX_SPLIT +
+/// 2 · PMAX_WARPS]` (row 0 the result, returned as a view, the rest the parts), the same bits.
 pub fn pmax<'a>(ctx: &'a Context, x: Tensor<'a>) -> Tensor<'a> {
-    ctx.external(&PMAX, types::F32, [x.ne()[1], 1, 1, 1], &[contiguous(x)])
+    let n = x.ne()[1];
+    if small_mv_param() as u16 & SMALL_MV_PMAX == 0 {
+        return ctx.external(&PMAX, types::F32, [n, 1, 1, 1], &[contiguous(x)]);
+    }
+    let node = ctx.external_with(
+        &PMAX,
+        types::F32,
+        [n, 1 + PMAX_SPLIT + 2 * PMAX_WARPS, 1, 1],
+        &[contiguous(x)],
+        &[PMAX_SPLIT as i32],
+    );
+    ctx.view_1d(node, n, 0)
 }
+
+/// [`pmax`]'s chunks a column for the maximum (CUDA's `PMAX_SPLIT`).
+const PMAX_SPLIT: i64 = 32;
+/// [`pmax`]'s warps a column for the sum (CUDA's `PMAX_WARPS`: the one-CTA kernel's 256 threads).
+const PMAX_WARPS: i64 = 8;
 
 /// The MTP head's input (llama.cpp's `graph_mtp`): per token, the RMS-normed embedding `e`
 /// times `enorm` stacked over the RMS-normed hidden row `h` times `hnorm`, F32 `[2 · d, n]`

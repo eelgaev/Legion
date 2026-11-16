@@ -519,6 +519,27 @@ pub fn select_vis<'a>(
     )
 }
 
+/// Marks `sel`, a [`select`], [`select_all`] or [`select_vis`] node, for a launch with the PDL
+/// attribute where CUDA's device takes one (GLM-5.3-Flash on compute capability 12.x, #1172 r7):
+/// the kernel waits for the kernel ahead before it reads anything and lets the attention after
+/// it launch once its last load is in. The same rows. Any other tensor is returned as is.
+pub fn select_pdl<'a>(sel: Tensor<'a>, on: bool) -> Tensor<'a> {
+    let node = sel.raw();
+    // SAFETY: a valid node; an external node of these ops (made without params) is checked
+    // before its first param is set.
+    unsafe {
+        let ours = crate::ggml::op_of(node).is_some_and(|op| {
+            [&SELECT, &SELECT_ALL, &SELECT_VIS]
+                .iter()
+                .any(|s| std::ptr::eq(op, *s))
+        });
+        if on && ours {
+            crate::ggml::set_external_param(node, 0, 1);
+        }
+    }
+    sel
+}
+
 /// Attention of `q` (F32 `[d, n_head, n_tok, n_seqs]`, may be a strided view) over the pools
 /// `k`, `v` (`[d × n_head_kv, cells]`, F16, or q8_0 / q4_0 as [`reads_types`] says): token
 /// `t` of sequence `s` attends to the positions of selection row `s × n_tok + t` of `sel` (from
@@ -1145,6 +1166,8 @@ mod cuda {
         /// for [`super::select`].
         pub vis: *const i32,
         pub vis_nb1: i64,
+        /// 1: launched with the PDL attribute ([`super::select_pdl`]).
+        pub pdl: i32,
     }
 
     #[repr(C)]
@@ -1313,6 +1336,7 @@ unsafe fn cuda_select(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(),
             block: 256,
             vis: std::ptr::null(),
             vis_nb1: 0,
+            pdl: crate::ggml::external_params(dst)[0],
         };
         launched("qsa_select", cuda::legion_qsa_select_launch(&p, stream))
     }
@@ -1352,6 +1376,7 @@ unsafe fn cuda_select_all(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
             block: 256,
             vis: vis.data as *const i32,
             vis_nb1: vis.nb[1] as i64,
+            pdl: crate::ggml::external_params(dst)[0],
         };
         launched("qsa_select_all", cuda::legion_qsa_select_launch(&p, stream))
     }
@@ -1391,6 +1416,7 @@ unsafe fn cuda_select_vis(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
             block: 256,
             vis: vis.data as *const i32,
             vis_nb1: vis.nb[1] as i64,
+            pdl: crate::ggml::external_params(dst)[0],
         };
         launched("qsa_select_vis", cuda::legion_qsa_select_launch(&p, stream))
     }

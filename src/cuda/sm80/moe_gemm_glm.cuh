@@ -474,6 +474,7 @@ __global__ void __launch_bounds__(GlmDec<W, NW, DP, SPAN, REG>::NT)
     // outputs only after the wait.
     W::tables(tabs, threadIdx.x, S::NT);
     moe_pdl_wait();
+    moe_pdl_trigger(p);  // pdl bit 1 (#1172 r7): the next GEMM's tables while this one runs
 
     const int NR = (int) ((K == GU ? p.n_embd : p.n_ff) / 256);  // super-blocks per row (SPAN | NR)
     const int groups = (int) ((K == GU ? 2 * p.n_ff : p.n_embd) / 16);

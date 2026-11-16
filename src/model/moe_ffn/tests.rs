@@ -516,6 +516,11 @@ fn glm_kernels_marks_the_node() {
         marked(glm_pdl(glm_pdl(glm_kernels(op(), true), true), false)),
         1
     );
+    // their early triggers (#1172 r7): a third bit, only with the back-to-back launches
+    assert_eq!(marked(glm_pdl_trig(glm_kernels(op(), true), true)), 1);
+    let trig = glm_pdl_trig(glm_pdl(glm_kernels(op(), true), true), true);
+    assert_eq!(marked(trig), 1 | GLM_PDL | GLM_TRIG);
+    assert_eq!(marked(glm_pdl_trig(trig, false)), 1 | GLM_PDL);
 }
 
 /// GLM-5.3-Flash's int8 prompt GEMMs (#603, opt-in; IQ2_S and IQ3_XXS down, #594): within the

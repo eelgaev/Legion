@@ -60,14 +60,15 @@ pub struct LinBenchArgs {
     q6k_modes: Vec<u8>,
     /// Time GLM-5.3-Flash Maya-S's small decode products instead (#1172 r4: the F32 router,
     /// ssm_f_b + ssm_g_b, hc_pre; r5: the shared expert's gate + up + GLU; r6: MLA's kv_a and q_a,
-    /// the shared expert's gate + up + GLU + down): each `LEGION_DEBUG_GLM_SMALL_MV` mode of `--small-modes` at
+    /// the shared expert's gate + up + GLU + down; r7: the draft head's pmax over the vocabulary):
+    /// each `LEGION_DEBUG_GLM_SMALL_MV` mode of `--small-modes` at
     /// `--gemv-tokens` (1-8), in GB/s of weights; fails when an output value's bits differ from
     /// the first mode's. `--shapes` takes the `SMALL_SHAPES` names.
     #[arg(long)]
     small: bool,
     /// `LEGION_DEBUG_GLM_SMALL_MV` modes for `--small`, comma separated.
-    #[arg(long, value_delimiter = ',', default_values_t = [0u8, 7])]
-    small_modes: Vec<u8>,
+    #[arg(long, value_delimiter = ',', default_values_t = [0u16, 7])]
+    small_modes: Vec<u16>,
 }
 
 #[cfg(feature = "cuda")]

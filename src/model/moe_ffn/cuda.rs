@@ -255,7 +255,12 @@ pub(super) unsafe fn launch(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
             && a.sum_cnt.is_null()
             && n <= 16
         {
-            a.pdl = 1;
+            // bit 1: the kernels' early triggers (moe_ffn::glm_pdl_trig, #1172 r7)
+            a.pdl = if dst.op_params[P_GLM] & GLM_TRIG != 0 {
+                3
+            } else {
+                1
+            };
         } else {
             crate::residency::cuda::zero_async(a.count.cast(), 4 * n_expert as usize, stream)?;
         }

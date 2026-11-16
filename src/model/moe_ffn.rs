@@ -389,6 +389,8 @@ pub fn glm_q8<'a>(out: Tensor<'a>, on: bool) -> Tensor<'a> {
 
 /// [`glm_pdl`]'s bit in the `P_GLM` param.
 const GLM_PDL: i32 = 2;
+/// [`glm_pdl`]'s early triggers in the `P_GLM` param (with [`GLM_PDL`]).
+const GLM_TRIG: i32 = 4;
 
 /// Sets whether the op of `out` (marked by [`glm_kernels`], after it) launches its decode steps'
 /// kernels back to back (#1172 r6, GLM-5.3-Flash at 1-4 tokens on the GB10, opt-in by
@@ -407,6 +409,26 @@ pub fn glm_pdl<'a>(out: Tensor<'a>, on: bool) -> Tensor<'a> {
             *p | GLM_PDL
         } else {
             *p & !GLM_PDL
+        };
+    }
+    out
+}
+
+/// Sets whether the kernels [`glm_pdl`] launches back to back (prep, plan, scatter and GLM's
+/// decode GEMMs) also let the next kernel launch once each of their blocks is past its own wait
+/// (griddepcontrol.launch_dependents, #1172 r7): the next one's blocks resident and the GEMMs'
+/// decode tables built while they drain, every kernel still waiting before it reads anything.
+/// The same bits. Only with [`glm_pdl`] on.
+pub fn glm_pdl_trig<'a>(out: Tensor<'a>, on: bool) -> Tensor<'a> {
+    // SAFETY: `out` is a view of the fresh node `moe_ffn_with` made.
+    unsafe {
+        let node = (*out.raw()).view_src;
+        assert!(!node.is_null(), "moe_ffn::glm_pdl_trig: not a moe result");
+        let p = &mut (*node).op_params[P_GLM];
+        *p = if on && *p & GLM_PDL != 0 {
+            *p | GLM_TRIG
+        } else {
+            *p & !GLM_TRIG
         };
     }
     out

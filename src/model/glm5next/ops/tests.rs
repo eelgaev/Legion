@@ -774,6 +774,13 @@ fn small_mv_takes_the_debug_switch() {
         small_mv_of(Some("224")),
         SMALL_MV_TRIG | SMALL_MV_SP | SMALL_MV_MOE
     );
+    // r7's bits above the u8 ones
+    assert_eq!(
+        small_mv_of(Some("1792")),
+        SMALL_MV_MTRIG | SMALL_MV_SEL | SMALL_MV_PMAX
+    );
+    assert_eq!(small_mv_of(Some("2047")), 2047);
+    assert_eq!(small_mv_of(Some("6143")), 2047);
     assert_eq!(small_mv_of(Some("x")), SMALL_MV_DEFAULT);
 }
 

@@ -195,8 +195,20 @@ __device__ __forceinline__ void moe_pdl_wait() {
 #endif
 }
 
+// legion_moe_args::pdl bit 1 (#1172 r7, after moe_pdl_wait): the next kernel of the chain may
+// launch once every block of this one is here (griddepcontrol.launch_dependents); it still waits
+// for this one's end before it reads anything. Nothing before sm_90.
+__device__ __forceinline__ void moe_pdl_trigger(const legion_moe_args & p) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if (p.pdl & 2) {
+        asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+    }
+#endif
+}
+
 __global__ void prep_kernel(const legion_moe_args p) {
     moe_pdl_wait();
+    moe_pdl_trigger(p);
     const int64_t t = blockIdx.x;
     const float * xr = p.x + t * p.x_ld;
     __half2 * o = (__half2 *) (p.xh + t * p.n_embd);
@@ -217,6 +229,7 @@ __global__ void prep_kernel(const legion_moe_args p) {
 // counts prep_kernel's atomics would give (integers: the same plan).
 template <bool CNT> __global__ void plan_kernel(const legion_moe_args p) {
     moe_pdl_wait();
+    moe_pdl_trigger(p);
     const int n_expert = p.n_expert, TM = p.tm;
     // one block of 1024 threads; n_expert <= 1024 * 4
     __shared__ int32_t sp[1024], st[1024];
@@ -274,6 +287,7 @@ template <bool CNT> __global__ void plan_kernel(const legion_moe_args p) {
 
 __global__ void scatter_kernel(const legion_moe_args p) {
     moe_pdl_wait();
+    moe_pdl_trigger(p);
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= p.n_tok * p.n_used) {
         return;

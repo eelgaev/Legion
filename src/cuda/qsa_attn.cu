@@ -28,6 +28,8 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "launch_pdl.cuh"
+
 extern "C" {
 
 struct legion_qsa_pool_mask {
@@ -62,6 +64,10 @@ struct legion_qsa_select {
     // the picks are live.
     const int32_t * vis;
     int64_t vis_nb1;
+    // 1 (GLM-5.3-Flash on compute capability 12.x, #1172 r7): launched with the PDL attribute,
+    // the kernel waits for the kernel ahead before it reads anything and lets the next one launch
+    // once its last load is in. 0: a plain launch.
+    int32_t pdl;
 };
 
 struct legion_qsa_attn {
@@ -193,12 +199,34 @@ __global__ void pool_mask_kernel(legion_qsa_pool_mask p) {
     row[j] = (j >= v[0] && j < v[1]) ? 0x0000 : 0xfc00;
 }
 
+// legion_qsa_select::pdl (#1172 r7): the wait for the kernel ahead and the early signal to the
+// next one; nothing before sm_90.
+__device__ __forceinline__ void select_pdl_wait(const legion_qsa_select & p) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if (p.pdl) {
+        asm volatile("griddepcontrol.wait;\n" ::: "memory");
+    }
+#endif
+}
+
+__device__ __forceinline__ void select_pdl_trigger(const legion_qsa_select & p) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if (p.pdl) {
+        asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+    }
+#endif
+}
+
 // One CTA per token: the live pools (finite score) sorted by first member, ties by pool index
 // (a bitonic sort of (first, pool) pairs in shared memory), their members, then the tail.
 __global__ void select_kernel(legion_qsa_select p) {
     __shared__ long long key[1024];
     __shared__ int n_live;
     __shared__ int n_out;
+    select_pdl_wait(p);
+    // the attention may launch now: its CTAs wait (griddepcontrol.wait) for this kernel's end and
+    // its writes before they read a row; a signal after the tail (4 us in) left its launch exposed
+    select_pdl_trigger(p);
     const int t = blockIdx.x;
     const int tid = threadIdx.x;
     const int32_t * top = (const int32_t *) ((const char *) p.top + t * p.top_nb1);
@@ -1803,7 +1831,11 @@ int legion_qsa_select_launch(const legion_qsa_select * p, void * stream) {
     if (p->n_tok == 0) {
         return 0;
     }
-    select_kernel<<<p->n_tok, p->block, 0, (cudaStream_t) stream>>>(*p);
+    if (p->pdl) {
+        launch_pdl(select_kernel, dim3((unsigned) p->n_tok), (int) p->block, 0, (cudaStream_t) stream, *p);
+    } else {
+        select_kernel<<<p->n_tok, p->block, 0, (cudaStream_t) stream>>>(*p);
+    }
     return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
 

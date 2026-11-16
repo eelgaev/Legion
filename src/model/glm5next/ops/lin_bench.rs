@@ -611,8 +611,10 @@ pub fn q6k_ms(
 /// layers) as `glm_ffn` builds them: [`glu_mv`] where [`glu_mv_takes`], else two [`linear`]s
 /// and [`glu`]; and (#1172 r6) MLA's kv_a and q_a (Q6_K 4096 x 512 and 4096 x 1536, 12 MLA
 /// layers) through [`linear_sp`], and the shared expert's gate, up, GLU and down (`shexp.chain`,
-/// the down through [`linear_sp`]) back to back.
-pub const SMALL_SHAPES: [&str; 7] = [
+/// the down through [`linear_sp`]) back to back; and (#1172 r7) the MTP draft head's [`pmax`]
+/// over its logits (`head.pmax`, F32 over a 154,880-token vocabulary, three times a 1-user
+/// cycle).
+pub const SMALL_SHAPES: [&str; 8] = [
     "router",
     "kda.fgb",
     "hc_pre",
@@ -620,7 +622,11 @@ pub const SMALL_SHAPES: [&str; 7] = [
     "mla.kv_a",
     "mla.q_a",
     "shexp.chain",
+    "head.pmax",
 ];
+
+/// `head.pmax`'s vocabulary.
+const PMAX_VOCAB: i64 = 154_880;
 
 /// Weight bytes one [`SMALL_SHAPES`] product reads.
 pub fn small_bytes(name: &str) -> f64 {
@@ -631,13 +637,15 @@ pub fn small_bytes(name: &str) -> f64 {
         "mla.kv_a" => (4096 / 256 * 210 * 512) as f64,
         "mla.q_a" => (4096 / 256 * 210 * 1536) as f64,
         "shexp.chain" => (3 * 4096 / 256 * 210 * 2048) as f64,
+        // the logits of one token (each token's column reads its own)
+        "head.pmax" => (PMAX_VOCAB * 4) as f64,
         _ => (16384 * 24 * 4) as f64,
     }
 }
 
 /// One [`super::small_mv`] mode's time in [`small_ms`].
 pub struct SmallTiming {
-    pub mode: u8,
+    pub mode: u16,
     /// Milliseconds per product: the best round's mean.
     pub ms: f64,
     /// Output values whose bits differ from the first mode's (the last copy's outputs).
@@ -666,7 +674,7 @@ pub fn small_ms(
     n_tok: usize,
     reps: usize,
     rounds: usize,
-    modes: &[u8],
+    modes: &[u16],
 ) -> Vec<SmallTiming> {
     let n = n_tok as i64;
     let copies = (384usize << 20)
@@ -729,6 +737,13 @@ pub fn small_ms(
                 .collect(),
             vec![data.new_tensor(types::F32, &[4096, n])],
         ),
+        // the logits as each copy's "weights"
+        "head.pmax" => (
+            (0..copies)
+                .map(|_| vec![data.new_tensor(types::F32, &[PMAX_VOCAB, n])])
+                .collect(),
+            Vec::new(),
+        ),
         _ => (
             (0..copies)
                 .map(|_| vec![data.new_tensor(types::F32, &[16384, 24])])
@@ -750,7 +765,9 @@ pub fn small_ms(
             } else if w.ty() == types::Q6_K {
                 w.set_bytes(&q6k_noise(w.elements() / 256, seed));
             } else {
-                let v: Vec<f32> = noise(w.elements(), seed).iter().map(|v| v * 0.05).collect();
+                // logits spread as a head's are (terms from ~1 down to ~1e-7 of the largest)
+                let s = if name == "head.pmax" { 8.0 } else { 0.05 };
+                let v: Vec<f32> = noise(w.elements(), seed).iter().map(|v| v * s).collect();
                 w.set_f32(&v);
             }
         }
@@ -811,6 +828,7 @@ pub fn small_ms(
                         };
                         vec![linear_sp(linear(ctx, w[2], h, 1.0, None))]
                     }
+                    "head.pmax" => vec![pmax(ctx, w[0])],
                     _ => {
                         let (p, h) = hc_pre_norm(
                             ctx, xs[0], w[0], xs[1], xs[2], 1e-6, 1e-6, 20, xs[3], 1e-5,
