@@ -926,14 +926,17 @@ pub fn kda_ms(
         }
     };
     let bt = backend.buffer_type();
-    let ctxs: Vec<Context> = modes.iter().map(|_| Context::new(l + 16, l + 16)).collect();
+    let ctxs: Vec<Context> = modes
+        .iter()
+        .map(|_| Context::new(l + 16, 4 * l + 16))
+        .collect();
     let default = kda_split();
     let graphs: Vec<(Vec<Tensor<'_>>, Graph<'_>)> = ctxs
         .iter()
         .zip(modes)
         .map(|(ctx, &mode)| {
             set_kda_split(mode);
-            let mut graph = ctx.new_graph(l + 16);
+            let mut graph = ctx.new_graph(4 * l + 16);
             let outs: Vec<Tensor<'_>> = (0..l)
                 .map(|i| {
                     let out = if verify {
