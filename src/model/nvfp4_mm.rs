@@ -1560,6 +1560,8 @@ mod cuda {
     /// grouped SwiGLU GEMM's forced tokens per tile (`nt`); 0 is none.
     pub(super) static FORCED_TUNE: AtomicU64 = AtomicU64::new(0);
     pub(super) static FORCED_GLU_NT: AtomicU64 = AtomicU64::new(0);
+    /// [`super::force_gemm_diag`]'s parts left out of the grouped SwiGLU GEMM; 0 is none.
+    pub(super) static FORCED_DIAG: AtomicU64 = AtomicU64::new(0);
 
     fn forced_tune() -> Option<GemmTune> {
         let v = FORCED_TUNE.load(Ordering::Relaxed) as i32;
@@ -2015,9 +2017,21 @@ mod cuda {
     }
 
     /// The grouped SwiGLU GEMM at `8 * nt` tokens per tile.
+    /// `LEGION_DEBUG_NVFP4_PF32=1`: the prefill SwiGLU GEMM prefetches its weights in runs of 32
+    /// blocks (before #1176 r35) instead of 8, for A/B runs; the same sums.
+    fn pf32() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_NVFP4_PF32").is_some_and(|v| v == "1"))
+    }
+
     fn glu_gemm(p: &Params, nt: i32, tune: GemmTune, stream: *mut c_void) -> Result<(), String> {
+        let diag = match FORCED_DIAG.load(Ordering::Relaxed) as i32 {
+            0 if nt == 16 && tune.code() == 31 && pf32() => 2048,
+            d => d,
+        };
+        let code = tune.code() + 100 * diag;
         // SAFETY: parameters checked by the caller; the node's stream.
-        match unsafe { legion_nvfp4_swiglu_gemm_launch(p, nt, tune.code(), stream) } {
+        match unsafe { legion_nvfp4_swiglu_gemm_launch(p, nt, code, stream) } {
             0 => Ok(()),
             -1 => Err(format!("nvfp4 swiglu_id: no GEMM at nt = {nt} {tune:?}")),
             e => Err(format!("nvfp4 swiglu_id: CUDA error {e}")),
@@ -2051,6 +2065,20 @@ pub fn force_gemm_tune(tune: Option<GemmTune>, glu_nt: Option<i32>) {
     }
     #[cfg(not(feature = "cuda"))]
     let _ = (tune, glu_nt);
+}
+
+/// Launches every grouped SwiGLU GEMM from now on with the parts `diag` left out (`DIAG_*` of
+/// `nvfp4_gemm` in `src/cuda/nvfp4_mm/common.cuh`: 1 no decode, 2 no MMAs, 4 no epilogue, 8 no
+/// weight copies, 16 no activation copies, 64 no k loop; the combinations
+/// [`gemm_bench`] runs), at 128-token tiles and the default tune only; 0: the
+/// whole kernel. `legion nvfp4-gemm-bench` only (#1176 r35): what bounds the GEMM. The results
+/// are wrong.
+#[doc(hidden)]
+pub fn force_gemm_diag(diag: i32) {
+    #[cfg(feature = "cuda")]
+    cuda::FORCED_DIAG.store(diag as u64, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "cuda"))]
+    let _ = diag;
 }
 
 /// Launches every grouped mv [`mul_mat_id`] from now on as the variant `g`, or the default for

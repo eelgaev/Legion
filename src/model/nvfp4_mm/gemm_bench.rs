@@ -7,9 +7,9 @@
 
 use super::bench::routing_tiles;
 use super::{
-    GemmTune, Grouped, Kernel, MV_MAX_N, bf16_bits, force_gemm_tune, force_grouped_tiles,
-    force_kernel, glu_gemm_tile, mul_mat_id, pick_grouped, plan_grouped, set_expert_mv_max,
-    set_expert_mv_tile, swiglu_id,
+    GemmTune, Grouped, Kernel, MV_MAX_N, bf16_bits, force_gemm_diag, force_gemm_tune,
+    force_grouped_tiles, force_kernel, glu_gemm_tile, leave_unread, mul_mat_id, pick_grouped,
+    plan_grouped, set_expert_mv_max, set_expert_mv_tile, skips, swiglu_id,
 };
 use crate::ggml::{Backend, ComputeAllocator, Context, Graph, Tensor, types};
 
@@ -47,12 +47,42 @@ pub struct Variant {
     pub tune: Option<GemmTune>,
     pub family: Family,
     pub exact: bool,
+    /// The SwiGLU GEMM's parts left out ([`super::force_gemm_diag`], #1176 r35): what bounds
+    /// it; wrong results. 0: the whole kernel.
+    pub diag: i32,
+}
+
+/// The diagnostic SwiGLU GEMMs (#1176 r35, [`super::force_gemm_diag`]): the parts left out and
+/// their names. [`exact_diag`]: the same sums with another weight prefetch.
+pub const DIAGS: [(i32, &str); 13] = [
+    (1, "nodec"),
+    (2, "nomma"),
+    (3, "nomma+nodec"),
+    (4, "noepi"),
+    (8, "now"),
+    (9, "now+nodec"),
+    (24, "now+nox"),
+    (25, "now+nox+nodec"),
+    (64, "nok"),
+    (2051, "pf32+nomma+nodec"),
+    (2048, "pf32"),
+    (256, "pf16"),
+    (512, "pf4"),
+];
+
+/// A diagnostic GEMM (in [`DIAGS`]) that only prefetches otherwise: the default's sums.
+pub fn exact_diag(diag: i32) -> bool {
+    diag >= 128 && diag % 128 == 0
 }
 
 impl Variant {
     /// The op's default choice, the reference of the bit checks.
     pub fn is_default(&self) -> bool {
-        self.family == Family::Default && self.tile.is_none() && self.tune.is_none() && !self.exact
+        self.family == Family::Default
+            && self.tile.is_none()
+            && self.tune.is_none()
+            && !self.exact
+            && self.diag == 0
     }
 
     /// The kernel family this variant runs on at `per` pairs per expert.
@@ -71,6 +101,10 @@ impl Variant {
         };
         if self.exact {
             return format!("{op} exact");
+        }
+        if self.diag != 0 {
+            let d = DIAGS.iter().find(|d| d.0 == self.diag).map_or("?", |d| d.1);
+            return format!("{op} diag {d}");
         }
         match self.family {
             Family::Mv(nt) => return format!("{op} mv nt<={nt}"),
@@ -104,10 +138,15 @@ pub fn variants() -> Vec<Variant> {
         tune,
         family,
         exact: false,
+        diag: 0,
     };
     let exact = |op| Variant {
         exact: true,
         ..v(op, None, None, Family::Default)
+    };
+    let diag = |diag| Variant {
+        diag,
+        ..v(Op::Glu, None, None, Family::Default)
     };
     let mut out = vec![v(Op::Glu, None, None, Family::Default), exact(Op::Glu)];
     for nt in [8, 16] {
@@ -120,6 +159,7 @@ pub fn variants() -> Vec<Variant> {
     for nt in [1, 2, 4] {
         out.push(v(Op::Glu, None, None, Family::Mv(nt)));
     }
+    out.extend(DIAGS.iter().map(|d| diag(d.0)));
     out.push(v(Op::Down, None, None, Family::Default));
     out.push(exact(Op::Down));
     for (mi, nt) in [(1, 8), (1, 16), (2, 8), (2, 16)] {
@@ -153,6 +193,12 @@ pub struct Config {
     /// Routings per round.
     pub sets: usize,
     pub rounds: usize,
+    /// A recorded routing to replay instead of random pools ([`load_route`]); `n_expert` is
+    /// then its rank's expert count.
+    pub route: Option<Route>,
+    /// Only the variants whose names hold one of these (the ops' defaults always run, the
+    /// bit checks' reference); empty: all.
+    pub only: Vec<String>,
 }
 
 impl Default for Config {
@@ -167,8 +213,132 @@ impl Default for Config {
             pools: vec![512, 160],
             sets: 2,
             rounds: 3,
+            route: None,
+            only: Vec::new(),
         }
     }
+}
+
+/// A recorded routing (`legion serve --moe-route-record`) as one rank of `--tp-moe-ep`'s
+/// contiguous split sees it (#1176 r35): per MoE layer, the prompt steps' tokens in order,
+/// `n_used` ids each, the rank's own experts as its local index and the others' as -1 (the
+/// pairs the grouped kernels skip).
+#[derive(Clone, Debug)]
+pub struct Route {
+    pub layers: Vec<Vec<i32>>,
+    /// The rank's experts.
+    pub n_expert: usize,
+    pub n_used: usize,
+    /// Prompt chunks replayed per layer, spread evenly over the recorded tokens.
+    pub chunks: usize,
+}
+
+/// [`Route`] from the records in `bytes` (`legion serve --moe-route-record`'s file: per record
+/// layer, experts, ids per token, tokens as u32 LE, then the ids as i32 LE) of at least
+/// `min_tok` tokens (the prompt steps), for `rank` of `ranks`.
+pub fn load_route(
+    bytes: &[u8],
+    rank: usize,
+    ranks: usize,
+    min_tok: usize,
+    chunks: usize,
+) -> Result<Route, String> {
+    let u = |i: usize| u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap()) as usize;
+    let mut layers: std::collections::BTreeMap<usize, Vec<i32>> = Default::default();
+    let (mut n_expert, mut n_used, mut at) = (0, 0, 0);
+    while at + 16 <= bytes.len() {
+        let (il, ne, nu, nt) = (u(at), u(at + 4), u(at + 8), u(at + 12));
+        let len = nu * nt * 4;
+        if at + 16 + len > bytes.len() {
+            break;
+        }
+        if n_expert == 0 {
+            (n_expert, n_used) = (ne, nu);
+        }
+        if (ne, nu) != (n_expert, n_used) || ranks == 0 || ne % ranks != 0 || rank >= ranks {
+            return Err(format!(
+                "record at byte {at}: {ne} experts, {nu} used; {n_expert}, {n_used} before, rank {rank} of {ranks}"
+            ));
+        }
+        if nt >= min_tok {
+            let per = ne / ranks;
+            let first = (rank * per) as i32;
+            layers.entry(il).or_default().extend(
+                bytes[at + 16..at + 16 + len]
+                    .chunks_exact(4)
+                    .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                    .map(|e| {
+                        if e >= first && e < first + per as i32 {
+                            e - first
+                        } else {
+                            -1
+                        }
+                    }),
+            );
+        }
+        at += 16 + len;
+    }
+    if layers.is_empty() {
+        return Err(format!("no records of {min_tok} tokens or more"));
+    }
+    Ok(Route {
+        layers: layers.into_values().collect(),
+        n_expert: n_expert / ranks,
+        n_used,
+        chunks: chunks.max(1),
+    })
+}
+
+/// The routings [`run`] replays from `route` at chunks of `n_tok` tokens, in sets of `layers`:
+/// every recorded layer at each of `route.chunks` chunks spread over the recorded tokens.
+pub(super) fn route_sets(
+    route: &Route,
+    layers: usize,
+    n_tok: usize,
+) -> Result<Vec<Vec<Vec<i32>>>, String> {
+    let per = route.n_used * n_tok;
+    let avail = route
+        .layers
+        .iter()
+        .map(|l| l.len() / per)
+        .min()
+        .unwrap_or(0);
+    if avail == 0 {
+        return Err(format!("the route holds fewer than {n_tok} tokens a layer"));
+    }
+    let chunks = route.chunks.min(avail);
+    let all: Vec<Vec<i32>> = (0..chunks)
+        .map(|c| (2 * c + 1) * avail / (2 * chunks))
+        .flat_map(|c| {
+            route
+                .layers
+                .iter()
+                .map(move |l| l[c * per..(c + 1) * per].to_vec())
+        })
+        .collect();
+    if all.len() < layers {
+        return Err(format!(
+            "{} routings, fewer than {layers} layers",
+            all.len()
+        ));
+    }
+    Ok(all.chunks_exact(layers).map(|s| s.to_vec()).collect())
+}
+
+/// The bytes of the outputs `outs` (one per routing of `set`) of the pairs routed to an expert
+/// (ids of -1: skipped pairs, whose rows may hold anything).
+fn routed_bytes(outs: &[Tensor<'_>], set: &[Vec<i32>]) -> Vec<u8> {
+    let mut got = Vec::new();
+    for (o, ids) in outs.iter().zip(set) {
+        let b = o.bytes();
+        let row = b.len() / ids.len().max(1);
+        for (q, &e) in ids.iter().enumerate() {
+            if e >= 0 {
+                got.extend_from_slice(&b[q * row..(q + 1) * row]);
+            }
+        }
+    }
+    got
 }
 
 /// One variant at one chunk size and pool.
@@ -274,11 +444,17 @@ fn build<'a>(
     let outs = ids
         .iter()
         .map(|&id| {
-            let y = match op {
+            let mut y = match op {
                 Op::Glu => swiglu_id(ctx, wg, wu, x, id, Some(sg), Some(su)),
                 Op::Down => mul_mat_id(ctx, wd, x, id, Some(sd)),
+            };
+            if cfg.route.is_some() {
+                // As --tp-moe-ep's rank: the other ranks' pairs skipped, their rows not stored.
+                y = skips(y);
+                // SAFETY: `skips` checked that the view's source is the grouped node.
+                unsafe { leave_unread((*y.raw()).view_src) };
             }
-            .as_output();
+            let y = y.as_output();
             graph.expand(y);
             y
         })
@@ -333,6 +509,7 @@ fn force(v: Option<&Variant>) {
     );
     let glu_nt = tile.filter(|_| !down).map(|(_, nt)| nt);
     force_gemm_tune(v.and_then(|v| v.tune), glu_nt);
+    force_gemm_diag(v.map_or(0, |v| v.diag));
 }
 
 /// Every variant at every chunk size and pool of `cfg` on `gpu`; the variants take turns within
@@ -361,21 +538,40 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
             .collect();
         s.set_f32(&v);
     }
-    let variants = variants();
+    let variants: Vec<Variant> = variants()
+        .into_iter()
+        .filter(|v| {
+            v.is_default()
+                || cfg.only.is_empty()
+                || cfg.only.iter().any(|o| v.name().contains(o.as_str()))
+        })
+        .collect();
     let down0 = variants
         .iter()
         .position(|v| v.op == Op::Down)
         .expect("a down default");
+    // A route: one "pool" (0), the recorded routing.
+    let pools = if cfg.route.is_some() {
+        vec![0]
+    } else {
+        cfg.pools.clone()
+    };
     let mut rows = Vec::new();
     for &n_tok in &cfg.toks {
-        for &pool in &cfg.pools {
-            let sets: Vec<Vec<Vec<i32>>> = (0..cfg.sets as u64)
-                .map(|i| {
-                    (0..cfg.layers as u64)
-                        .map(|l| routing(cfg.n_used, n_tok, n_expert, pool, 1 + 64 * i + l))
-                        .collect()
-                })
-                .collect();
+        for &pool in &pools {
+            let sets: Vec<Vec<Vec<i32>>> = match &cfg.route {
+                Some(r) => route_sets(r, cfg.layers, n_tok)?,
+                None => (0..cfg.sets as u64)
+                    .map(|i| {
+                        (0..cfg.layers as u64)
+                            .map(|l| routing(cfg.n_used, n_tok, n_expert, pool, 1 + 64 * i + l))
+                            .collect()
+                    })
+                    .collect(),
+            };
+            // The pairs routed to this GPU's experts, per routing.
+            let routed = sets.iter().flatten().flatten().filter(|&&e| e >= 0).count() as f64
+                / (sets.len() * cfg.layers) as f64;
             let ops = [Op::Glu, Op::Down];
             let ctxs = ops.map(|_| Context::new(16 + 24 * cfg.layers, 16 * cfg.layers + 16));
             let graphs: Vec<_> = ops
@@ -409,6 +605,7 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
                 let (_, ids, graph, outs) = &graphs[gi];
                 force(Some(var));
                 let mut total = 0.0;
+                let mut checked = Vec::new();
                 for (si, set) in sets.iter().enumerate() {
                     for (it, ids) in ids.iter().zip(set) {
                         it.set_i32(ids);
@@ -427,20 +624,25 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
                         differ[vi] = None;
                         break;
                     }
-                    // The check: the warm-up run's last routing against the op's default.
-                    if i < nv && si == sets.len() - 1 {
-                        let got: Vec<u8> = outs.iter().flat_map(|o| o.bytes()).collect();
-                        hashes[vi] = hash(&got);
-                        if var.is_default() {
-                            reference[gi] = got;
-                        } else {
-                            differ[vi] = Some(
-                                got.iter()
-                                    .zip(&reference[gi])
-                                    .filter(|(a, b)| a != b)
-                                    .count(),
-                            );
-                        }
+                    // The check: the warm-up run's last routing (and a route's first) against
+                    // the op's default, the routed pairs' rows.
+                    if i < nv && (si == sets.len() - 1 || (si == 0 && cfg.route.is_some())) {
+                        checked.extend(routed_bytes(outs, set));
+                    }
+                }
+                if i < nv && differ[vi].is_some() {
+                    hashes[vi] = hash(&checked);
+                    if var.is_default() {
+                        reference[gi] = checked;
+                    } else {
+                        differ[vi] = Some(
+                            checked
+                                .iter()
+                                .zip(&reference[gi])
+                                .filter(|(a, b)| a != b)
+                                .count()
+                                + checked.len().abs_diff(reference[gi].len()),
+                        );
                     }
                 }
                 if i >= nv && differ[vi].is_some() {
@@ -448,7 +650,7 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
                 }
             }
             force(None);
-            let pairs = (cfg.n_used * n_tok) as f64;
+            let pairs = routed;
             let per = (cfg.n_used * n_tok / (cfg.n_used * n_tok).clamp(1, n_expert)) as i64;
             for (vi, var) in variants.iter().enumerate() {
                 let default = &variants[if var.op == Op::Glu { 0 } else { down0 }];
@@ -461,7 +663,8 @@ pub fn run(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Row>, String> {
                     secs: best[vi],
                     flops: mults * 2.0 * (k * m) as f64 * pairs,
                     differ: differ[vi],
-                    bitwise: var.runs_mv(per) == default.runs_mv(per),
+                    bitwise: var.runs_mv(per) == default.runs_mv(per)
+                        && (var.diag == 0 || exact_diag(var.diag)),
                     hash: hashes[vi],
                 });
             }

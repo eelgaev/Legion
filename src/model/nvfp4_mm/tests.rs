@@ -446,6 +446,44 @@ fn gemm_bench_times_each_default_on_its_exact_grid() {
         assert_eq!(of_op.iter().filter(|v| v.exact).count(), 1);
         assert!(of_op[1].name().ends_with("exact"));
     }
+    // The diagnostic GEMMs (#1176 r35) are never the reference, each named once.
+    let diags: Vec<_> = variants.iter().filter(|v| v.diag != 0).collect();
+    assert_eq!(diags.len(), gemm_bench::DIAGS.len());
+    assert!(
+        diags
+            .iter()
+            .all(|v| v.op == gemm_bench::Op::Glu && !v.is_default())
+    );
+    assert!(diags.iter().all(|v| !v.name().ends_with('?')));
+}
+
+/// A recorded routing replays as rank 1 of 2 sees it: its experts as local indices, the other
+/// rank's as -1, decode records left out, and chunks of the requested tokens over every layer.
+#[test]
+fn gemm_bench_route_replays_one_ranks_experts() {
+    use crate::tp_net::ep_place::write_record;
+    let mut bytes = Vec::new();
+    // Two layers, 8 experts, 2 per token: a 4-token prompt step each, then a 1-token decode step.
+    for il in 0..2 {
+        let ids: Vec<i32> = (0..8).map(|i| ((i * 3 + il) % 8) as i32).collect();
+        write_record(&mut bytes, il, 8, 2, &ids).unwrap();
+    }
+    for il in 0..2 {
+        write_record(&mut bytes, il, 8, 2, &[7, 0]).unwrap();
+    }
+    let r = gemm_bench::load_route(&bytes, 1, 2, 2, 2).unwrap();
+    assert_eq!((r.n_expert, r.n_used, r.layers.len()), (4, 2, 2));
+    // Layer 0's ids 0 3 6 1 4 7 2 5: experts 4-7 are rank 1's 0-3.
+    assert_eq!(r.layers[0], vec![-1, -1, 2, -1, 0, 3, -1, 1]);
+    assert_eq!(r.layers[1].len(), 8);
+    // Chunks of 2 tokens: 2 per layer, spread over the 4 tokens (chunks 0 and 1 of 2), in
+    // sets of 2 layers.
+    let sets = gemm_bench::route_sets(&r, 2, 2).unwrap();
+    assert_eq!(sets.len(), 2);
+    assert_eq!(sets[0][0], vec![-1, -1, 2, -1]);
+    assert_eq!(sets[1][0], vec![0, 3, -1, 1]);
+    assert!(gemm_bench::route_sets(&r, 2, 5).is_err());
+    assert!(gemm_bench::load_route(&bytes, 0, 2, 9, 2).is_err());
 }
 
 /// A row map routes each token's pairs as the token it names: the named tokens' experts on the
