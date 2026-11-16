@@ -40,6 +40,15 @@ fn row_hint() -> bool {
     *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_TP_ROW_HINT").is_none_or(|v| v != "0"))
 }
 
+/// Whether an empty [`Executor::copy_states`] (every step's end calls one) still goes to the
+/// other ranks; `LEGION_DEBUG_TP_EMPTY_COPIES=1` sends it (the way before, for A/B runs only).
+/// Sent, its answer was the one the next step's send waited for in [`TpLead::settle`]: it went
+/// out just before, so every decode round waited a round trip there (#1176).
+pub(super) fn mirror_empty_copies() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_TP_EMPTY_COPIES").is_some_and(|v| v == "1"))
+}
+
 /// A control connection to another rank: over the network, or to a thread of this process.
 enum RankLink {
     Net(Link),

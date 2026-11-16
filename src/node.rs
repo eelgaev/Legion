@@ -13,11 +13,13 @@
 //! thread, so a prompt chunk's residual (tens of MB) goes out while it computes the next
 //! chunk; every request gets one reply, in order, which rank 0 reads only when it needs one
 //! (a step with logits): prompt chunks without logits run on rank 1 while rank 0 computes the
-//! next one. Rank 1 reads frames on a reader thread for the same reason.
+//! next one. Rank 1 reads frames on a reader thread for the same reason. Every wait for a
+//! frame on either side spins, then naps, before it blocks ([`wait`]).
 
 pub mod local;
 #[cfg(test)]
 mod tests;
+pub mod wait;
 
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
@@ -922,11 +924,12 @@ impl Link {
         stream.set_nodelay(true)?;
         let out = stream.try_clone()?;
         let (tx, rx) = mpsc::channel::<Frame>();
+        let pace = wait::spins().then_some(wait::LINK);
         let writer = std::thread::Builder::new()
             .name("legion-node-tx".into())
             .spawn(move || {
                 let mut w = BufWriter::with_capacity(1 << 20, out);
-                for f in rx {
+                while let Some(f) = wait::recv(&rx, pace) {
                     write_frame(&mut w, &f)?;
                 }
                 Ok(())
@@ -959,6 +962,7 @@ impl Link {
     }
 
     fn read_reply(&mut self) -> Result<Reply, String> {
+        wait::for_frame(&self.rd, wait::spins().then_some(wait::LINK));
         match read_frame(&mut self.rd) {
             Ok(Some((k, h, b))) => Reply::decode(k, &h, b),
             Ok(None) => Err("node rank 1 closed the connection".into()),
@@ -1050,11 +1054,13 @@ pub fn serve_one(
     let input = stream.try_clone()?;
     // A few frames ahead: the next prompt chunk's residual arrives while this one computes.
     let (tx, rx) = mpsc::sync_channel::<std::io::Result<Request>>(4);
+    let pace = wait::spins().then_some(wait::LINK);
     let reader = std::thread::Builder::new()
         .name("legion-node-rx".into())
         .spawn(move || {
             let mut r = BufReader::with_capacity(1 << 20, input);
             loop {
+                wait::for_frame(&r, pace);
                 let item = match read_frame(&mut r) {
                     Ok(Some((k, h, b))) => Request::decode(k, &h, b).map_err(invalid),
                     Ok(None) => return,
@@ -1068,7 +1074,7 @@ pub fn serve_one(
         })?;
     let mut w = BufWriter::with_capacity(1 << 20, stream);
     let mut out = Ok(());
-    for req in rx {
+    while let Some(req) = wait::recv(&rx, pace) {
         let req = match req {
             Ok(r) => r,
             Err(e) => {

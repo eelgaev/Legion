@@ -4768,7 +4768,11 @@ impl Executor {
         if let Some(r) = self.remote.as_mut() {
             r.mirror(wire());
         }
-        self.tp_mirror_states(wire);
+        // Nothing to copy, nothing for the other ranks to mirror (their states are in step:
+        // their next step runs after their commit on the same stream, as here).
+        if !copies.is_empty() || tp_lead::mirror_empty_copies() {
+            self.tp_mirror_states(wire);
+        }
         for s in &mut self.stages {
             let pool = |p| match p {
                 Pool::Seq => &s.rec,
