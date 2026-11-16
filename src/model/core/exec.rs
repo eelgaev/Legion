@@ -2650,9 +2650,10 @@ impl Executor {
                 .expect("commit without Executor::enable_spec");
             let split = spec.split_commits(commits);
             let deferred = split.as_ref().map_or(commits, |(d, _)| d.as_slice());
-            // SAFETY: as below; the deferred graphs read the stage's pools only.
-            match unsafe { spec.commit_deferred(&mut s.backend, &mut s.commits, &s.rec, deferred) }
-            {
+            // SAFETY: as below; the deferred graphs read the stage's pools and (KDA's convs)
+            // the model's weights only.
+            let (backend, kept) = (&mut s.backend, &mut s.commits);
+            match unsafe { spec.commit_deferred(backend, kept, &s.rec, deferred, model) } {
                 Ok(true) => match split {
                     Some((_, rest)) if !rest.is_empty() => at_once = Some(rest),
                     _ => return Ok(()),
@@ -2718,16 +2719,37 @@ impl Executor {
             && self.pipe_run.is_none()
     }
 
+    /// Whether the depth policy waits for the commit of a verify step ([`Self::commit`]) before
+    /// it times the next draft pass and charges the wait to that verify step (#1172 r11): GLM's
+    /// KDA layers on one stage of this machine, the configurations whose commits may defer
+    /// their scans into the next verify step ([`Self::defers_commits`],
+    /// [`crate::model::glm5next::ops::kda_defer`]). Without the wait the pass's time holds what
+    /// is left of the commit on the stream, so the policy's depth and confidence floor depend on
+    /// where the commit's work lands. Other models keep the timing they had, and so do GLM's
+    /// parallel steps, whose other GPUs' commits are meant to run beside the pass.
+    /// Opt-in: `LEGION_DEBUG_GLM_COMMIT_WAIT=1` ([`crate::model::glm5next::ops::commit_wait`]).
+    pub fn commit_charged_to_step(&self) -> bool {
+        self.model.hp.arch.recurrent() == super::Recurrent::Kda
+            && self.stages.len() == 1
+            && self.tp.is_none()
+            && self.remote.is_none()
+            && self.par.pool.is_none()
+            && !self.par.every_step
+            && self.pipe_run.is_none()
+            && crate::model::glm5next::ops::commit_wait()
+    }
+
     /// Runs every deferred commit's delta rule now (queued, waited for as a commit): before
     /// anything but a verify step of their slots reads or writes the states.
     fn flush_commits(&mut self) -> Result<(), GgmlError> {
+        let model = &self.model;
         for s in &mut self.stages {
             let Some(spec) = s.spec.as_ref().filter(|p| p.defers_any()) else {
                 continue;
             };
             self.commit_pending = true;
             // SAFETY: as in `commit`.
-            let res = unsafe { spec.flush(&mut s.backend, &mut s.commits, &s.rec) };
+            let res = unsafe { spec.flush(&mut s.backend, &mut s.commits, &s.rec, model) };
             if let Err(e) = res {
                 self.wait_commit();
                 return Err(e);

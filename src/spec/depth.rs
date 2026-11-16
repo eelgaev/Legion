@@ -165,6 +165,9 @@ pub fn context_bucket(span: usize) -> usize {
 struct Mean {
     ms: f64,
     n: u32,
+    /// The mean before the last sample, and that sample ([`Self::charge`] adds to it).
+    prev: f64,
+    last: f64,
 }
 
 impl Mean {
@@ -172,12 +175,28 @@ impl Mean {
     /// keeps is rebuilt: the second sample replaces a higher first one, and later samples count
     /// at most [`SPIKE`] times the mean.
     fn add(&mut self, ms: f64) {
-        self.ms = match self.n {
-            0 => ms,
-            1 => self.ms.min(ms),
-            _ => self.ms + EWMA * (ms.min(SPIKE * self.ms) - self.ms),
-        };
+        self.prev = self.ms;
+        self.last = ms;
+        self.ms = Self::next(self.prev, self.n, ms);
         self.n = self.n.saturating_add(1);
+    }
+
+    /// The mean after sample `ms` when `n` samples made it `mean`.
+    fn next(mean: f64, n: u32, ms: f64) -> f64 {
+        match n {
+            0 => ms,
+            1 => mean.min(ms),
+            _ => mean + EWMA * (ms.min(SPIKE * mean) - mean),
+        }
+    }
+
+    /// The last sample took `ms` more than [`Self::add`] was told: the mean as if it had.
+    fn charge(&mut self, ms: f64) {
+        if self.n == 0 {
+            return;
+        }
+        self.last += ms;
+        self.ms = Self::next(self.prev, self.n - 1, self.last);
     }
 }
 
@@ -250,6 +269,20 @@ impl DepthModel {
             step.resize(rows + 1, Mean::default());
         }
         step[rows].add(ms);
+    }
+
+    /// The target step of `rows` rows last given to [`Self::record_step`], at a context of
+    /// `span` positions, took `ms` more: work it queued that ran on after it was timed (GLM's
+    /// MTP commit, waited for before the next draft pass is timed, #1172 r11), so the draft
+    /// pass is not charged for it.
+    pub fn charge_step(&mut self, span: usize, rows: usize, ms: f64) {
+        if ms.is_nan() || ms <= 0.0 {
+            return;
+        }
+        let bucket = self.buckets.get_mut(context_bucket(span));
+        if let Some(m) = bucket.and_then(|c| c.step.get_mut(rows)) {
+            m.charge(ms);
+        }
     }
 
     /// The verify step of `rows` rows just given to [`Self::record_step`] carried `drafted`

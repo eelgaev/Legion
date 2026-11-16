@@ -937,6 +937,126 @@ pub fn kda_conv3<'a>(
     state: Tensor<'a>,
     n_tok: i64,
 ) -> Tensor<'a> {
+    conv3_op(ctx, x, w, state, n_tok, None, [1, 0], None)
+}
+
+/// [`kda_conv3`] of a commit deferred into the next verify step ([`kda_defer`], #1172 r9): the
+/// same outputs and conv states, and each token's k and v outputs and its stored decays and
+/// beta (`gb`: F32 `[c + n_head, n_tok, n_seqs]`, the verify step's store, decays first) also go
+/// to `stash` (F32 `[3 c + n_head, n_tok, n_seqs]` rows: `[k | v | g | beta]`), which the next
+/// verify step's scan reads ([`kda_scan_verify_replay`]) or a flush ([`kda_flush`]). The GPU
+/// kernel writes no output (#1172 r10: nothing reads it, the stash has k and v) and leaves out
+/// q's sums (q's window still advances); the CPU's writes them as [`kda_conv3`] does.
+pub fn kda_conv3_stash<'a>(
+    ctx: &'a Context,
+    x: [Tensor<'a>; 3],
+    w: [Tensor<'a>; 3],
+    state: Tensor<'a>,
+    n_tok: i64,
+    stash: [Tensor<'a>; 2],
+) -> Tensor<'a> {
+    conv3_op(ctx, x, w, state, n_tok, Some(stash), [1, 0], None)
+}
+
+/// [`kda_conv3_stash`] as r9 ran it on a GPU, the output and q's sums written too: for
+/// lin-bench's A/B (`lin_bench::kda_fold_ms`).
+#[cfg(feature = "cuda")]
+fn kda_conv3_stash_full<'a>(
+    ctx: &'a Context,
+    x: [Tensor<'a>; 3],
+    w: [Tensor<'a>; 3],
+    state: Tensor<'a>,
+    n_tok: i64,
+    stash: [Tensor<'a>; 2],
+) -> Tensor<'a> {
+    conv3_op(ctx, x, w, state, n_tok, Some(stash), [1, 1], None)
+}
+
+/// One layer's sources of [`kda_conv3_stash_layers`], as [`kda_conv3_stash`] takes them.
+#[derive(Clone, Copy)]
+pub struct KdaConvLayer<'a> {
+    pub x: [Tensor<'a>; 3],
+    pub w: [Tensor<'a>; 3],
+    pub state: Tensor<'a>,
+    pub stash: [Tensor<'a>; 2],
+}
+
+/// I64 entries a layer of [`kda_conv3_stash_layers`]'s table.
+pub const KDA_CONV_ROW: usize = 11;
+
+/// [`kda_conv3_stash_layers`]'s table: a row of [`KDA_CONV_ROW`] a layer, the byte offsets of
+/// x_q, w_q, the conv state, x_k, w_k, x_v, w_v and gb from layer 0's, then the layer's stash
+/// (its address, nb\[1\] and nb\[2\]: the op's ninth source is the table, as a ggml node takes
+/// at most 9). `None` unless every source is allocated and has layer 0's shape and strides.
+pub fn kda_conv_layer_offsets(layers: &[KdaConvLayer<'_>]) -> Option<Vec<i64>> {
+    fn srcs<'a>(l: &KdaConvLayer<'a>) -> [Tensor<'a>; 9] {
+        let [xq, xk, xv] = l.x;
+        let [wq, wk, wv] = l.w;
+        let [gb, st] = l.stash;
+        [xq, wq, l.state, xk, wk, xv, wv, gb, st]
+    }
+    // SAFETY: allocated tensors and views of them; only the addresses are taken.
+    let addr = |t: Tensor<'_>| unsafe { (*t.raw()).data as i64 };
+    let first = srcs(layers.first()?);
+    let mut out = Vec::with_capacity(KDA_CONV_ROW * layers.len());
+    for l in layers {
+        let s = srcs(l);
+        for (&t, f) in s.iter().zip(first) {
+            if t.ne() != f.ne() || t.nb() != f.nb() || t.ty() != f.ty() || addr(t) == 0 {
+                return None;
+            }
+        }
+        out.extend(s[..8].iter().zip(first).map(|(&t, f)| addr(t) - addr(f)));
+        out.extend([addr(s[8]), s[8].nb()[1] as i64, s[8].nb()[2] as i64]);
+    }
+    Some(out)
+}
+
+/// [`kda_conv3_stash`] of every layer of `layers` (sources of one shape a source; #1172 r10) in
+/// one launch: on a GPU a block row a layer, layer `il`'s sources from the `il`-th row of
+/// `table` (I64 `[KDA_CONV_ROW · layers]`, [`kda_conv_layer_offsets`], which the caller writes
+/// once the graph is allocated). The commit of an MTP cycle was 34 conv launches of a few µs
+/// each. The output (each layer's on the CPU, in turn) is not to be read.
+pub fn kda_conv3_stash_layers<'a>(
+    ctx: &'a Context,
+    layers: &[KdaConvLayer<'a>],
+    n_tok: i64,
+    table: Tensor<'a>,
+) -> Tensor<'a> {
+    let n = layers.len();
+    assert!(
+        n >= 1
+            && table.ty() == types::I64
+            && table.elements() >= KDA_CONV_ROW * n
+            && table.nb()[0] == 8,
+        "glm_kda_conv: a table of KDA_CONV_ROW I64 entries a layer"
+    );
+    let l = layers[0];
+    conv3_op(
+        ctx,
+        l.x,
+        l.w,
+        l.state,
+        n_tok,
+        Some(l.stash),
+        [n as i32, 0],
+        Some(table),
+    )
+}
+
+/// The KDA_CONV node of q, k and v at once: `layers` (params[6]: 1 for one) and `full`
+/// (params[7], [`kda_conv3_stash_full`]) for a stash.
+#[allow(clippy::too_many_arguments)]
+fn conv3_op<'a>(
+    ctx: &'a Context,
+    x: [Tensor<'a>; 3],
+    w: [Tensor<'a>; 3],
+    state: Tensor<'a>,
+    n_tok: i64,
+    stash: Option<[Tensor<'a>; 2]>,
+    [layers, full]: [i32; 2],
+    table: Option<Tensor<'a>>,
+) -> Tensor<'a> {
     let [c, a, b, _] = x[0].ne();
     let n = a * b;
     for (xj, wj) in x.iter().zip(&w) {
@@ -957,12 +1077,39 @@ pub fn kda_conv3<'a>(
     assert!(3 * c <= state.ne()[1]);
     let [xq, xk, xv] = x;
     let [wq, wk, wv] = w;
+    let mut args = vec![xq, wq, state, xk, wk, xv, wv];
+    if let Some([gb, st]) = stash {
+        let (n_seqs, nh) = (n / n_tok, gb.ne()[0] - c);
+        assert!(
+            nh > 0
+                && gb.nb()[0] == 4
+                && gb.ne()[1..3] == [n_tok, n_seqs]
+                && st.nb()[0] == 4
+                && st.ne()[..3] == [3 * c + nh, n_tok, n_seqs],
+            "glm_kda_conv: gb [c + n_head, n_tok, n_seqs], stash [3 c + n_head, n_tok, n_seqs]"
+        );
+        // Several layers: the table in the stash's place (each layer's stash is in its row).
+        args.extend([gb, if layers > 1 { table.unwrap_or(st) } else { st }]);
+    }
+    assert!(
+        layers <= 1 || (stash.is_some() && table.is_some()),
+        "glm_kda_conv: layers in one launch with a stash and a table"
+    );
     ctx.external_with(
         &KDA_CONV,
         types::F32,
         [c, n, 3, 1],
-        &[xq, wq, state, xk, wk, xv, wv],
-        &[0, n_tok as i32, 0, 0, 1],
+        &args,
+        &[
+            0,
+            n_tok as i32,
+            0,
+            0,
+            1,
+            stash.is_some() as i32,
+            layers,
+            full,
+        ],
     )
 }
 
@@ -1178,7 +1325,7 @@ pub fn kda_scan<'a>(
     state: Tensor<'a>,
     n_tok: i64,
 ) -> Tensor<'a> {
-    scan_op(ctx, [q, k, v, g, beta], state, n_tok, None)
+    scan_op(ctx, [q, k, v, g, beta], state, n_tok, None, None)
 }
 
 /// [`kda_scan`] of a speculative verify group: the same outputs, the states left as they
@@ -1196,7 +1343,88 @@ pub fn kda_scan_verify<'a>(
     n_tok: i64,
     store: [Tensor<'a>; 2],
 ) -> Tensor<'a> {
-    scan_op(ctx, [q, k, v, g, beta], state, n_tok, Some(store))
+    scan_op(ctx, [q, k, v, g, beta], state, n_tok, Some(store), None)
+}
+
+/// Where a verify group's deferred commits wait ([`kda_defer`], #1172 r9): the stash of their
+/// kept tokens (F32 `[3 c + n_head, max_tokens, n_seqs]` rows, [`kda_conv3_stash`]) and the
+/// device's count words (I32, one per slot: kept tokens in bits 0-7, their first stash row in
+/// bits 8-15; 0 for none) with the group's first slot.
+#[derive(Clone, Copy)]
+pub struct KdaDeferred<'a> {
+    pub stash: Tensor<'a>,
+    pub counts: (Tensor<'a>, usize),
+}
+
+impl KdaDeferred<'_> {
+    /// The count words' device address at the first slot, as two params (low, high).
+    fn counts_param(&self) -> [i32; 2] {
+        let (t, slot) = self.counts;
+        assert!(t.ne()[0] as usize > slot, "glm_kda_scan: counts");
+        // SAFETY: an allocated pool tensor; only the address is taken.
+        let at = unsafe { ((*t.raw()).data as *const i32).add(slot) } as u64;
+        [at as u32 as i32, (at >> 32) as u32 as i32]
+    }
+}
+
+/// [`kda_scan_verify`] that first runs the group's deferred commits ([`kda_defer`], #1172 r9):
+/// each sequence's kept tokens from `deferred`'s stash through the commit's instructions, the
+/// state written back over the slot, then the verify tokens from it as [`kda_scan_verify`] runs
+/// them. One pass over the states instead of the commit's and the verify group's: the same
+/// outputs, stores and states as [`kda_scan`] of the kept tokens then [`kda_scan_verify`].
+#[allow(clippy::too_many_arguments)]
+pub fn kda_scan_verify_replay<'a>(
+    ctx: &'a Context,
+    q: Tensor<'a>,
+    k: Tensor<'a>,
+    v: Tensor<'a>,
+    g: Tensor<'a>,
+    beta: Tensor<'a>,
+    state: Tensor<'a>,
+    n_tok: i64,
+    store: [Tensor<'a>; 2],
+    deferred: KdaDeferred<'a>,
+) -> Tensor<'a> {
+    scan_op(
+        ctx,
+        [q, k, v, g, beta],
+        state,
+        n_tok,
+        Some(store),
+        Some(deferred),
+    )
+}
+
+/// The deferred commits of every slot of `state` (`[d, d, n_head, slots]`) on their own
+/// ([`kda_defer`], #1172 r9): the replay [`kda_scan_verify_replay`] runs ahead of its verify
+/// tokens, for anything else that reads the states first. `deferred.counts` from slot 0. The
+/// result (`[d, n_head, 1]`) is not written; the states are.
+pub fn kda_flush<'a>(ctx: &'a Context, state: Tensor<'a>, deferred: KdaDeferred<'a>) -> Tensor<'a> {
+    let [d, _, h, slots] = state.ne();
+    let x = deferred.stash;
+    assert!(
+        state.nb()[1] == d as usize * 4
+            && x.nb()[0] == 4
+            && x.ne()[0] == 3 * d * h + h
+            && x.ne()[2] == slots
+            && deferred.counts.1 == 0,
+        "glm_kda_scan: flush shapes"
+    );
+    let [lo, hi] = deferred.counts_param();
+    ctx.external_with(
+        &KDA_SCAN,
+        types::F32,
+        [d, h, 1, 1],
+        &[state, x],
+        &[
+            0,
+            3,
+            GB10_LINEAR.load(Ordering::Relaxed) as i32,
+            kda_split_param(),
+            lo,
+            hi,
+        ],
+    )
 }
 
 fn scan_op<'a>(
@@ -1205,6 +1433,7 @@ fn scan_op<'a>(
     state: Tensor<'a>,
     n_tok: i64,
     store: Option<[Tensor<'a>; 2]>,
+    deferred: Option<KdaDeferred<'a>>,
 ) -> Tensor<'a> {
     let [d, h, n, _] = q.ne();
     for t in [q, k, v] {
@@ -1244,6 +1473,21 @@ fn scan_op<'a>(
         );
         args.extend([sg, sb]);
     }
+    let mut mode = store.is_some() as i32;
+    let mut at = [0, 0];
+    if let Some(r) = deferred {
+        let x = r.stash;
+        assert!(
+            store.is_some()
+                && x.nb()[0] == 4
+                && x.ne()[0] == 3 * d * h + h
+                && x.ne()[1] >= n_tok
+                && x.ne()[2] == n_seqs,
+            "glm_kda_scan: deferred stash"
+        );
+        args.push(x);
+        (mode, at) = (2, r.counts_param());
+    }
     ctx.external_with(
         &KDA_SCAN,
         types::F32,
@@ -1251,14 +1495,16 @@ fn scan_op<'a>(
         &args,
         &[
             n_tok as i32,
-            store.is_some() as i32,
+            mode,
             GB10_LINEAR.load(Ordering::Relaxed) as i32,
             kda_split_param(),
+            at[0],
+            at[1],
         ],
     )
 }
 
-/// [`kda_split`] before the first read: the environment's choice (outside 0-2: every one is a
+/// [`kda_split`] before the first read: the environment's choice (outside 0-4: every one is a
 /// mode).
 const KDA_SPLIT_UNSET: u8 = u8::MAX;
 
@@ -1266,10 +1512,10 @@ static KDA_SPLIT: AtomicU8 = AtomicU8::new(KDA_SPLIT_UNSET);
 
 /// How many blocks [`kda_scan`]'s decode kernel (steps of fewer than 64 tokens: a 1-user verify
 /// step's scan and every commit's, #1172 r8) gives each head on [`set_gb10_gemv`]'s GPUs, as a
-/// log2: 0 one (1,024 threads, the kernel before r8), 1 two, 2 four (256 threads). Each block
-/// holds its share of the head's state rows and computes the token's q and k norms itself, from
-/// the same values in the same order: the same bits. `LEGION_DEBUG_GLM_KDA_SPLIT` picks it for
-/// A/B runs.
+/// log2: 0 one (1,024 threads, the kernel before r8), 1 two, 2 four (256 threads), 3 eight (128
+/// threads, #1172 r9), 4 sixteen (64 threads). Each block holds its share of the head's state rows and computes the
+/// token's q and k norms itself, from the same values in the same order: the same bits.
+/// `LEGION_DEBUG_GLM_KDA_SPLIT` picks it for A/B runs.
 pub fn kda_split() -> u8 {
     let v = KDA_SPLIT.load(Ordering::Relaxed);
     if v != KDA_SPLIT_UNSET {
@@ -1280,28 +1526,111 @@ pub fn kda_split() -> u8 {
     v
 }
 
-/// [`kda_split`] given the environment's value: 0-2, else the default.
+/// [`kda_split`] given the environment's value: 0-4, else the default.
 pub(crate) fn kda_split_of(env: Option<&str>) -> u8 {
     match env.map(str::trim).and_then(|s| s.parse::<u8>().ok()) {
-        Some(v) if v <= 2 => v,
+        Some(v) if v <= 4 => v,
         _ => KDA_SPLIT_DEFAULT,
     }
 }
 
-/// [`kda_split`]'s default: four blocks a head (Maya-S's 64 heads as 256 blocks, one wave on a
-/// DGX Spark's 48 SMs instead of two).
-pub(crate) const KDA_SPLIT_DEFAULT: u8 = 2;
+/// [`kda_split`]'s default: eight blocks a head (#1172 r9; Maya-S's 64 heads as 512 blocks of
+/// 128 threads, one wave on a DGX Spark's 48 SMs; r8's four blocks a head were 256 of 256).
+pub(crate) const KDA_SPLIT_DEFAULT: u8 = 3;
 
 /// Sets [`kda_split`] for nodes built from now on (`legion lin-bench --kda`).
 pub fn set_kda_split(v: u8) {
-    KDA_SPLIT.store(v.min(2), Ordering::Relaxed);
+    KDA_SPLIT.store(v.min(4), Ordering::Relaxed);
 }
 
-/// [`kda_split`] as the node's parameter: on the GPUs that take the GB10 decode kernels
-/// ([`set_gb10_linear`] and [`set_gb10_gemv`]), else 0 (a V100's 80 SMs hold the 64 blocks).
+/// Whether KDA replay pools made from now on defer each MTP commit's scan into the next verify
+/// step's (#1172 r9): the commit runs the convs, which also stash the kept tokens' k, v, decays
+/// and beta ([`kda_conv3_stash`]), and the slot's next verify scan runs them ahead of its own
+/// tokens in the same pass over the state ([`kda_scan_verify_replay`]); anything else that
+/// reads a slot's state first runs them on their own ([`kda_flush`]). One read of each state
+/// instead of three (the commit's read and write, the verify group's read), the same bits.
+/// Opt-in with `LEGION_DEBUG_GLM_KDA_DEFER=1` (with [`commit_wait`]: +0.7-1.2% at 1 user): the
+/// depth policy's confidence floor sits on a knife edge for some chats, and wall-clock noise
+/// picks a different floor from server to server (same text, other drafts; #1172 r10, r11).
+/// Read once.
+pub fn kda_defer() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| kda_defer_of(std::env::var("LEGION_DEBUG_GLM_KDA_DEFER").ok().as_deref()))
+}
+
+/// [`kda_defer`] given the environment's value: on for `1`, else off.
+pub(crate) fn kda_defer_of(env: Option<&str>) -> bool {
+    env.map(str::trim) == Some("1")
+}
+
+/// Whether the depth policy waits for an MTP commit's queued GPU work before it times the
+/// next draft pass, and charges the wait to the verify step that queued it (#1172 r11,
+/// [`crate::model::core::Executor::commit_charged_to_step`]): otherwise the pass's time holds
+/// whatever part of the commit is still running (all of its KDA scans without [`kda_defer`],
+/// ~1.4 ms; none with it), and the policy's depth and confidence floor depend on where the
+/// commit's work lands (the draft pass 4.90 ms with the scans at once, 4.18 deferred; 4.04-4.15
+/// either way with the wait). Opt-in with `LEGION_DEBUG_GLM_COMMIT_WAIT=1`: it moves the
+/// policy's timing, and with it which chats sit on a confidence floor's knife edge. Read once.
+pub fn commit_wait() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let env = std::env::var("LEGION_DEBUG_GLM_COMMIT_WAIT").ok();
+        env.as_deref().map(str::trim) == Some("1")
+    })
+}
+
+/// Whether a deferred commit ([`kda_defer`]) runs every KDA layer's convs in one launch
+/// ([`kda_conv3_stash_layers`], #1172 r10) instead of one launch a layer (r9): opt-in with
+/// `LEGION_DEBUG_GLM_KDA_CONV_LAYERS=1` (lin-bench: no faster, the scans wait for all 34
+/// layers' convs). Read once.
+pub fn kda_conv_layers() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        kda_conv_layers_of(
+            std::env::var("LEGION_DEBUG_GLM_KDA_CONV_LAYERS")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// [`kda_conv_layers`] given the environment's value: on for `1`, else off.
+pub(crate) fn kda_conv_layers_of(env: Option<&str>) -> bool {
+    env.map(str::trim) == Some("1")
+}
+
+/// [`kda_stream`] before the first read: the environment's choice.
+const KDA_STREAM_UNSET: u8 = u8::MAX;
+
+static KDA_STREAM: AtomicU8 = AtomicU8::new(KDA_STREAM_UNSET);
+
+/// Whether [`kda_scan`]'s decode kernel at a [`kda_split`] of 2-4 streams its tokens (#1172
+/// r11): each thread loads the next token's values while the block runs this one, and the
+/// shared values are double-buffered (two barriers a token instead of three). The same values
+/// through the same instructions: the same bits. `LEGION_DEBUG_GLM_KDA_STREAM=0`: the kernel
+/// before, for A/B runs.
+pub fn kda_stream() -> bool {
+    let v = KDA_STREAM.load(Ordering::Relaxed);
+    if v != KDA_STREAM_UNSET {
+        return v != 0;
+    }
+    let env = std::env::var("LEGION_DEBUG_GLM_KDA_STREAM").ok();
+    let on = env.as_deref().map(str::trim) != Some("0");
+    KDA_STREAM.store(on as u8, Ordering::Relaxed);
+    on
+}
+
+/// Sets [`kda_stream`] for nodes built from now on (`legion lin-bench --kda`).
+pub fn set_kda_stream(on: bool) {
+    KDA_STREAM.store(on as u8, Ordering::Relaxed);
+}
+
+/// [`kda_split`] (bits 0-2) and [`kda_stream`] (bit 3) as the node's parameter: on the GPUs
+/// that take the GB10 decode kernels ([`set_gb10_linear`] and [`set_gb10_gemv`]), else 0 (a
+/// V100's 80 SMs hold the 64 blocks).
 fn kda_split_param() -> i32 {
     if GB10_LINEAR.load(Ordering::Relaxed) && GB10_GEMV.load(Ordering::Relaxed) {
-        kda_split() as i32
+        kda_split() as i32 | (i32::from(kda_stream()) << 3)
     } else {
         0
     }
@@ -2175,20 +2504,28 @@ unsafe fn cpu_kda_conv(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
         let (ch_off, n_tok, verify) = (p[0] as usize, p[1] as usize, p[2] != 0);
         let (c, n) = (dst.ne[0] as usize, dst.ne[1] as usize);
         if p[4] != 0 {
-            // q, k and v at once (kda_conv3): each projection as its own op computes it.
-            for j in 0..3 {
-                let (xi, wi) = if j == 0 {
-                    (0, 1)
-                } else {
-                    (2 * j + 1, 2 * j + 2)
-                };
-                conv_rows(
-                    (&*dst.src[xi], all_f32(&*dst.src[wi]), st),
-                    (j * c, n_tok, None),
-                    (dst.data as *mut f32).add(j * c * n),
-                    (c, n),
-                    (ith, nth),
-                );
+            // A deferred commit's convs of several layers (kda_conv3_stash_layers): layer
+            // il's sources at layer 0's plus the table's il-th row of byte offsets and its
+            // stash from the row's tail (the ninth source is the table), the layers one after
+            // another, each as the one-layer op runs it (dst holds each in turn).
+            let (layers, n_src) = (p[6].max(1) as usize, if p[5] != 0 { 9 } else { 7 });
+            for il in 0..layers {
+                let mut srcs: [ffi::ggml_tensor; 9] =
+                    std::array::from_fn(|i| if i < n_src { *dst.src[i] } else { *dst.src[0] });
+                if layers > 1 {
+                    let table = (*dst.src[8]).data as *const i64;
+                    let row =
+                        std::slice::from_raw_parts(table.add(il * KDA_CONV_ROW), KDA_CONV_ROW);
+                    for (t, d) in srcs.iter_mut().zip(row).take(8) {
+                        t.data = (t.data as *mut u8).offset(*d as isize) as *mut std::ffi::c_void;
+                    }
+                    let st = &mut srcs[8];
+                    *st = *dst.src[7];
+                    st.data = row[8] as usize as *mut std::ffi::c_void;
+                    st.nb[1] = row[9] as usize;
+                    st.nb[2] = row[10] as usize;
+                }
+                conv3_stash_cpu(dst, &srcs, p[5] != 0, (n_tok, c, n), (ith, nth));
             }
             return;
         }
@@ -2200,6 +2537,54 @@ unsafe fn cpu_kda_conv(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
             (c, n),
             (ith, nth),
         );
+    }
+}
+
+/// [`cpu_kda_conv`]'s q, k and v at once ([`kda_conv3`]) from `srcs` (x_q, w_q, state, x_k,
+/// w_k, x_v, w_v, then with `stash` gb and the stash): each projection as its own op computes
+/// it, into `dst`; with `stash` ([`kda_conv3_stash`]) k and v out to the stash rows, g and beta
+/// stored after them.
+unsafe fn conv3_stash_cpu(
+    dst: &ffi::ggml_tensor,
+    srcs: &[ffi::ggml_tensor; 9],
+    stash: bool,
+    (n_tok, c, n): (usize, usize, usize),
+    (ith, nth): (usize, usize),
+) {
+    unsafe {
+        for j in 0..3 {
+            let (xi, wi) = if j == 0 {
+                (0, 1)
+            } else {
+                (2 * j + 1, 2 * j + 2)
+            };
+            conv_rows(
+                (&srcs[xi], all_f32(&srcs[wi]), &srcs[2]),
+                (j * c, n_tok, None),
+                (dst.data as *mut f32).add(j * c * n),
+                (c, n),
+                (ith, nth),
+            );
+        }
+        if !stash {
+            return;
+        }
+        let (gb, x) = (&srcs[7], &srcs[8]);
+        let nh = gb.ne[0] as usize - c;
+        let y = dst.data as *const f32;
+        for col in 0..n {
+            let (s, t) = (col / n_tok, col % n_tok);
+            let row = (x.data as *mut u8).add(s * x.nb[2] + t * x.nb[1]) as *mut f32;
+            let g = f32s(gb, s * gb.nb[2] + t * gb.nb[1], c + nh);
+            for ch in part(c, ith, nth) {
+                *row.add(ch) = *y.add(c * n + col * c + ch);
+                *row.add(c + ch) = *y.add(2 * c * n + col * c + ch);
+                *row.add(2 * c + ch) = g[ch];
+                if ch < nh {
+                    *row.add(3 * c + ch) = g[c + ch];
+                }
+            }
+        }
     }
 }
 
@@ -2286,14 +2671,75 @@ fn l2_normed(x: &[f32], scale: f32) -> Vec<f32> {
     x.iter().map(|v| v * s).collect()
 }
 
+/// One token of the KDA delta rule over head state `state` (`d` rows of `d`): `kn` the
+/// normalized key, `decay` per channel, `b` beta, `v(j)` row `j`'s value; row `j`'s output
+/// against `qn` to `out(j)`, if given.
+fn kda_token(
+    state: &mut [f32],
+    d: usize,
+    (kn, decay, b): (&[f32], &[f32], f32),
+    v: impl Fn(usize) -> f32,
+    mut out: Option<(&[f32], &mut dyn FnMut(usize, f32))>,
+) {
+    for j in 0..d {
+        let row = &mut state[j * d..][..d];
+        for i in 0..d {
+            row[i] *= decay[i];
+        }
+        let delta = (v(j) - dot(row, kn)) * b;
+        for i in 0..d {
+            row[i] += delta * kn[i];
+        }
+        if let Some((qn, put)) = out.as_mut() {
+            put(j, dot(row, qn));
+        }
+    }
+}
+
+/// The deferred commit of sequence `s` (#1172 r9, [`kda_scan_verify_replay`]) over its head
+/// `hd`'s state: the count word at params[4..5] (`p`), the stash `x` rows.
+unsafe fn cpu_kda_replay(
+    state: &mut [f32],
+    (d, h, s, hd): (usize, usize, usize, usize),
+    x: &ffi::ggml_tensor,
+    p: &[i32],
+) {
+    unsafe {
+        let words = (p[4] as u32 as u64 | (p[5] as u32 as u64) << 32) as *const i32;
+        let w = *words.add(s);
+        let (keep, row0) = ((w & 0xff) as usize, ((w >> 8) & 0xff) as usize);
+        let c = d * h;
+        for t in 0..keep {
+            let xr = f32s(x, s * x.nb[2] + (row0 + t) * x.nb[1], 3 * c + h);
+            let kn = l2_normed(&xr[hd * d..][..d], 1.0);
+            let decay: Vec<f32> = xr[2 * c + hd * d..][..d].iter().map(|x| x.exp()).collect();
+            let vr = &xr[c + hd * d..][..d];
+            kda_token(state, d, (&kn, &decay, xr[3 * c + hd]), |j| vr[j], None);
+        }
+    }
+}
+
 unsafe fn cpu_kda_scan(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
     unsafe {
+        let p = external_params(dst);
+        let mode = p[1];
+        if mode == 3 {
+            // The deferred commits alone (kda_flush): sources the states and the stash.
+            let (st, x) = (&*dst.src[0], &*dst.src[1]);
+            let (d, h, slots) = (st.ne[0] as usize, st.ne[2] as usize, st.ne[3] as usize);
+            for idx in part(slots * h, ith, nth) {
+                let (s, hd) = (idx / h, idx % h);
+                let sp = (st.data as *mut u8).add(hd * st.nb[2] + s * st.nb[3]) as *mut f32;
+                let state = std::slice::from_raw_parts_mut(sp, d * d);
+                cpu_kda_replay(state, (d, h, s, hd), x, &p);
+            }
+            return;
+        }
         let src = |i: usize| all_f32(&*dst.src[i]);
         let (q, k, v) = (src(0), src(1), src(2));
         let (g, beta) = (&*dst.src[3], &*dst.src[4]);
         let st = &*dst.src[5];
-        let p = external_params(dst);
-        let (n_tok, verify) = (p[0] as usize, p[1] != 0);
+        let (n_tok, verify) = (p[0] as usize, mode != 0);
         let (d, h, n) = (dst.ne[0] as usize, dst.ne[1] as usize, dst.ne[2] as usize);
         let n_seqs = n / n_tok;
         let (g_seq, b_seq) = (
@@ -2306,6 +2752,11 @@ unsafe fn cpu_kda_scan(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
         for idx in part(n_seqs * h, ith, nth) {
             let (s, hd) = (idx / h, idx % h);
             let sp = (st.data as *mut u8).add(hd * st.nb[2] + s * st.nb[3]) as *mut f32;
+            if mode == 2 {
+                // The deferred commit first, written over the slot.
+                let state = std::slice::from_raw_parts_mut(sp, d * d);
+                cpu_kda_replay(state, (d, h, s, hd), &*dst.src[8], &p);
+            }
             // A verify group works on a copy: the state stays for the commit.
             let mut copy;
             let state = if verify {
@@ -2332,17 +2783,14 @@ unsafe fn cpu_kda_scan(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
                     std::ptr::copy_nonoverlapping(gr.as_ptr(), at(sg, hd * d), d);
                     *at(sb, hd) = b;
                 }
-                for j in 0..d {
-                    let row = &mut state[j * d..][..d];
-                    for i in 0..d {
-                        row[i] *= decay[i];
-                    }
-                    let delta = (v[off + j] - dot(row, &kn)) * b;
-                    for i in 0..d {
-                        row[i] += delta * kn[i];
-                    }
-                    *out.add(off + j) = dot(row, &qn);
-                }
+                let mut put = |j: usize, o: f32| *out.add(off + j) = o;
+                kda_token(
+                    state,
+                    d,
+                    (&kn, &decay, b),
+                    |j| v[off + j],
+                    Some((&qn, &mut put)),
+                );
             }
         }
     }

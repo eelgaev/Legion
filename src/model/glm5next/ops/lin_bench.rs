@@ -846,6 +846,261 @@ pub fn small_ms(
         .collect()
 }
 
+/// The verify width of [`kda_fold_ms`]: a 1-user step with two MTP drafts.
+pub const KDA_FOLD_VERIFY: usize = 3;
+
+/// The ways [`kda_fold_ms`] runs a commit and the next verify step's scan (#1172 r9, r10): 0
+/// the commit's convs and scan, then the verify scan (before r9); 1 the convs with their stash
+/// as r9 ran them (each layer's output and q's sums written too), then the verify scan that
+/// runs the kept tokens first ([`kda_scan_verify_replay`]); 2 the same with r10's lean stash
+/// convs ([`kda_conv3_stash`]: no output, no q sums), a launch a layer; 3 the same with every
+/// layer's stash convs in one launch ([`kda_conv3_stash_layers`]); 4 the lean stash convs,
+/// the flush ([`kda_flush`]), then the verify scan; 5 and 6: 2 and 0 with the scans streaming
+/// their tokens ([`kda_stream`], #1172 r11), 0-4 without.
+pub const KDA_FOLD_MODES: [&str; 7] = [
+    "commit+verify",
+    "fold r9",
+    "fold lean",
+    "fold 1-launch",
+    "flush+verify",
+    "fold stream",
+    "commit+verify stream",
+];
+
+/// State bytes a [`KDA_FOLD_MODES`] way moves a layer: the commit reads and writes the state
+/// and the verify scan reads it again (0, 4, 6); the fold reads and writes it once (1-3, 5).
+pub fn kda_fold_bytes(mode: usize) -> f64 {
+    let state = (128 * 128 * 64 * 4) as f64;
+    if matches!(mode, 1..=3 | 5) {
+        2.0 * state
+    } else {
+        3.0 * state
+    }
+}
+
+/// Times each [`KDA_FOLD_MODES`] way of a commit of `keep` tokens (1-3) and the next verify
+/// step's scan of [`KDA_FOLD_VERIFY`] tokens over [`KDA_LAYERS`] layers of Maya-S (d 128 x 64
+/// heads, one sequence, random inputs, decays in (-0.55, -0.05]), back to back as a cycle runs
+/// them, at the default [`super::kda_split`]. Before the timing each way runs once from the same
+/// states, and every conv state, delta-rule state, verify output and stored value whose bits
+/// differ from the first way's is counted.
+pub fn kda_fold_ms(
+    backend: &mut Backend,
+    keep: usize,
+    reps: usize,
+    rounds: usize,
+) -> Vec<SmallTiming> {
+    let (d, h, l) = (128i64, 64i64, KDA_LAYERS);
+    let c = d * h;
+    let (kp, nv) = (keep as i64, KDA_FOLD_VERIFY as i64);
+    let data = Context::new(8 * l + 24, 0);
+    let new = |ne: &[i64]| data.new_tensor(types::F32, ne);
+    // The commit's stored conv inputs and its decays and betas (one row a token, as a pool
+    // that defers keeps them), the conv weights.
+    let x: Vec<Tensor<'_>> = (0..3).map(|_| new(&[c, kp, 1])).collect();
+    let w: Vec<Tensor<'_>> = (0..3).map(|_| new(&[4, c])).collect();
+    let gb = new(&[c + h, kp, 1]);
+    // The verify step's scan inputs.
+    let q = new(&[d, h, nv]);
+    let k = new(&[d, h, nv]);
+    let v = new(&[d, h, nv]);
+    let g = new(&[d, h, nv]);
+    let beta = new(&[h, nv]);
+    let counts = data.new_tensor(types::I32, &[1]);
+    // Mode 3's table of each layer's sources ([`kda_conv3_stash_layers`]).
+    let table = data.new_tensor(types::I64, &[(KDA_CONV_ROW * l) as i64]);
+    let layer = |_| {
+        (
+            new(&[3, 3 * c, 1]),
+            new(&[d, d, h, 1]),
+            new(&[3 * c + h, nv, 1]),
+            [new(&[c, nv, 1]), new(&[h, nv, 1])],
+        )
+    };
+    // Per layer: the conv state, the delta-rule state, the stash, the verify step's stores.
+    let layers: Vec<_> = (0..l).map(layer).collect();
+    data.alloc_tensors(backend.buffer_type()).unwrap();
+    for (i, t) in x.iter().chain(&w).chain([&q, &k, &v]).enumerate() {
+        t.set_f32(&noise(t.elements(), 61 + i as u64));
+    }
+    let decay = |t: Tensor<'_>, seed| {
+        let gv: Vec<f32> = noise(t.elements(), seed)
+            .iter()
+            .map(|x| -0.05 - 0.5 * x.abs())
+            .collect();
+        t.set_f32(&gv);
+    };
+    decay(g, 71);
+    let bv: Vec<f32> = noise(beta.elements(), 72)
+        .iter()
+        .map(|x| 0.5 + 0.4 * x)
+        .collect();
+    beta.set_f32(&bv);
+    // The stored row: decays then betas.
+    let gbv: Vec<f32> = noise(gb.elements(), 73)
+        .iter()
+        .enumerate()
+        .map(|(i, x)| {
+            if (i as i64 % (c + h)) < c {
+                -0.05 - 0.5 * x.abs()
+            } else {
+                0.5 + 0.4 * x
+            }
+        })
+        .collect();
+    gb.set_f32(&gbv);
+    counts.set_i32(&[keep as i32]);
+    let init: Vec<[Vec<f32>; 2]> = (0..l)
+        .map(|i| {
+            let (cs, ss, ..) = &layers[i];
+            let scaled = |t: Tensor<'_>, seed| -> Vec<f32> {
+                noise(t.elements(), seed).iter().map(|x| 0.1 * x).collect()
+            };
+            [scaled(*cs, 80 + i as u64), scaled(*ss, 180 + i as u64)]
+        })
+        .collect();
+    let reset = || {
+        for ((cs, ss, xs, [sg, sb]), [ci, si]) in layers.iter().zip(&init) {
+            cs.set_f32(ci);
+            ss.set_f32(si);
+            for t in [*xs, *sg, *sb] {
+                t.set_f32(&vec![0.0; t.elements()]);
+            }
+        }
+    };
+    let bt = backend.buffer_type();
+    let ctxs: Vec<Context> = (0..KDA_FOLD_MODES.len())
+        .map(|_| Context::new(16 * l + 32, 8 * l + 32))
+        .collect();
+    let stream = kda_stream();
+    let graphs: Vec<(Vec<Tensor<'_>>, Graph<'_>)> = ctxs
+        .iter()
+        .enumerate()
+        .map(|(mode, ctx)| {
+            // Modes 5 and 6: 2 and 0 with the streaming scan.
+            set_kda_stream(mode >= 5);
+            let mode = match mode {
+                5 => 2,
+                6 => 0,
+                m => m,
+            };
+            let mut graph = ctx.new_graph(8 * l + 32);
+            let mut outs = Vec::new();
+            let nb = gb.nb();
+            let gk = ctx.view_3d(gb, [c, kp, 1], [nb[1], nb[2]], 0);
+            let bk = ctx.view_3d(gb, [h, kp, 1], [nb[1], nb[2]], c as usize * 4);
+            let xw = [x[0], x[1], x[2]];
+            let ww = [w[0], w[1], w[2]];
+            // The stash rows of the kept tokens.
+            fn kept_rows<'a>(ctx: &'a Context, xs: Tensor<'a>, w: i64, kp: i64) -> Tensor<'a> {
+                let xnb = xs.nb();
+                ctx.view_3d(xs, [w, kp, 1], [xnb[1], xnb[2]], 0)
+            }
+            let rows = |xs| kept_rows(ctx, xs, 3 * c + h, kp);
+            if mode == 3 {
+                // Every layer's stash convs first, in one launch, as a deferred commit runs.
+                let all: Vec<KdaConvLayer<'_>> = layers
+                    .iter()
+                    .map(|(cs, _, xs, _)| KdaConvLayer {
+                        x: xw,
+                        w: ww,
+                        state: *cs,
+                        stash: [gb, rows(*xs)],
+                    })
+                    .collect();
+                let offsets = kda_conv_layer_offsets(&all).expect("one shape a source");
+                let bytes: Vec<u8> = offsets.iter().flat_map(|v| v.to_ne_bytes()).collect();
+                table.set_bytes(&bytes);
+                let y = kda_conv3_stash_layers(ctx, &all, kp, table).as_output();
+                graph.expand(y);
+            }
+            for (cs, ss, xs, [sg, sb]) in &layers {
+                let deferred = KdaDeferred {
+                    stash: *xs,
+                    counts: (counts, 0),
+                };
+                // Not compared: a lean stash replay writes no conv output on a GPU (#1172
+                // r10); its k and v reach the states through the scans.
+                let y = match mode {
+                    0 => Some(kda_conv3(ctx, xw, ww, *cs, kp)),
+                    1 => Some(kda_conv3_stash_full(ctx, xw, ww, *cs, kp, [gb, rows(*xs)])),
+                    3 => None,
+                    _ => Some(kda_conv3_stash(ctx, xw, ww, *cs, kp, [gb, rows(*xs)])),
+                }
+                .map(|y| y.as_output());
+                if let Some(y) = y {
+                    graph.expand(y);
+                }
+                let store = [*sg, *sb];
+                let o = match mode {
+                    0 => {
+                        let y = y.expect("mode 0's convs");
+                        let part = |j: usize| {
+                            ctx.view_3d(
+                                y,
+                                [d, h, kp],
+                                [d as usize * 4, c as usize * 4],
+                                j * y.nb()[2],
+                            )
+                        };
+                        let gnb = gk.nb();
+                        let g4 =
+                            ctx.view_4d(gk, [d, h, kp, 1], [d as usize * 4, gnb[1], gnb[2]], 0);
+                        let t = kda_scan(ctx, part(0), part(1), part(2), g4, bk, *ss, kp);
+                        graph.expand(t);
+                        kda_scan_verify(ctx, q, k, v, g, beta, *ss, nv, store)
+                    }
+                    1..=3 => {
+                        kda_scan_verify_replay(ctx, q, k, v, g, beta, *ss, nv, store, deferred)
+                    }
+                    _ => {
+                        graph.expand(kda_flush(ctx, *ss, deferred));
+                        kda_scan_verify(ctx, q, k, v, g, beta, *ss, nv, store)
+                    }
+                }
+                .as_output();
+                graph.expand(o);
+                outs.push(o);
+            }
+            ctx.alloc_graph(&graph, ComputeAllocator::new(bt)).unwrap();
+            (outs, graph)
+        })
+        .collect();
+    set_kda_stream(stream);
+    let mut run_once = |graph: &Graph<'_>, outs: &[Tensor<'_>]| -> Vec<Vec<u8>> {
+        reset();
+        backend.compute(graph).unwrap();
+        let mut all: Vec<Vec<u8>> = outs.iter().map(|o| o.bytes()).collect();
+        for (cs, ss, _, [sg, sb]) in &layers {
+            all.extend([cs.bytes(), ss.bytes(), sg.bytes(), sb.bytes()]);
+        }
+        all
+    };
+    let first = run_once(&graphs[0].1, &graphs[0].0);
+    let differ: Vec<usize> = graphs
+        .iter()
+        .map(|(outs, graph)| {
+            run_once(graph, outs)
+                .iter()
+                .zip(&first)
+                .map(|(o, f)| differing(f, o, 4))
+                .sum()
+        })
+        .collect();
+    reset();
+    let refs: Vec<&Graph<'_>> = graphs.iter().map(|(_, g)| g).collect();
+    let ms = time_graphs(backend, &refs, reps, rounds);
+    ms.into_iter()
+        .zip(differ)
+        .enumerate()
+        .map(|(mode, (ms, differ))| SmallTiming {
+            mode: mode as u8,
+            ms: ms / l as f64,
+            differ,
+        })
+        .collect()
+}
+
 /// GLM-5.3-Flash Maya-S's KDA delta-rule scans at decode (`legion lin-bench --kda`, #1172 r8),
 /// d 128 x 64 heads, one sequence: `commit` (a verify step's commit: the kept tokens through
 /// [`kda_scan`], the state advanced in place) and `verify` (a verify group's [`kda_scan_verify`]:

@@ -373,3 +373,32 @@ fn a_long_context_does_not_price_short_steps() {
     m.set_context(5000);
     assert_eq!(m.step_ms(4), Some(34.0));
 }
+
+#[test]
+fn a_charge_counts_as_part_of_the_last_step() {
+    // The same samples, once whole and once with part charged after the fact.
+    let samples = [20.0, 12.0, 11.0, 13.0, 40.0, 10.5];
+    let mut whole = DepthModel::new(true);
+    let mut charged = DepthModel::new(true);
+    for &ms in &samples {
+        whole.record_step(3, ms);
+        charged.record_step(3, ms - 1.5);
+        charged.charge_step(100, 3, 1.0);
+        charged.charge_step(100, 3, 0.5);
+        let (a, b) = (whole.step_ms(3).unwrap(), charged.step_ms(3).unwrap());
+        assert!((a - b).abs() < 1e-9, "{ms}: {a} vs {b}");
+    }
+    // Nothing to charge: another shape, another context bucket, a step never recorded, or a
+    // charge that is not a positive time.
+    let before = charged.step_ms(3);
+    charged.charge_step(100, 2, 5.0);
+    charged.charge_step(10_000, 3, 5.0);
+    charged.charge_step(100, 3, 0.0);
+    charged.charge_step(100, 3, f64::NAN);
+    assert_eq!(charged.step_ms(3), before);
+    // Held at the nearest measured shape.
+    assert_eq!(charged.step_ms(2), before);
+    let mut empty = DepthModel::new(true);
+    empty.charge_step(100, 3, 5.0);
+    assert_eq!(empty.step_ms(3), None);
+}
