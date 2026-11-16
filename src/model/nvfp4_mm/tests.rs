@@ -455,6 +455,17 @@ fn gemm_bench_times_each_default_on_its_exact_grid() {
             .all(|v| v.op == gemm_bench::Op::Glu && !v.is_default())
     );
     assert!(diags.iter().all(|v| !v.name().ends_with('?')));
+    // The prefetch runs (#1176 r36): each op's default GEMM at every run, named apart.
+    for op in [gemm_bench::Op::Glu, gemm_bench::Op::Down] {
+        let pfs: Vec<_> = variants
+            .iter()
+            .filter(|v| v.op == op && v.pf != 0)
+            .collect();
+        assert_eq!(pfs.len(), gemm_bench::PFS.len());
+        assert!(pfs.iter().all(|v| !v.is_default() && v.diag == 0));
+        let names: std::collections::HashSet<_> = pfs.iter().map(|v| v.name()).collect();
+        assert_eq!(names.len(), pfs.len());
+    }
 }
 
 /// A recorded routing replays as rank 1 of 2 sees it: its experts as local indices, the other
