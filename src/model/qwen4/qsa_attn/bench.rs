@@ -101,18 +101,24 @@ pub struct Timing {
     pub ms: f64,
     /// [`bits_hash`] of the output: equal for kernels that agree bit for bit.
     pub bits: u64,
+    /// Selected keys over all tokens (each kv head reads them all).
+    pub keys: u64,
+    /// Chunks of 32 selected keys over all tokens (the prompt kernels' unit of work).
+    pub chunks: u64,
 }
 
-/// Times [`attention`] on `backend` at qwen4exp's shape (head size 256, 24 heads over 2 kv
-/// heads) with caches of `types`: `n_tok` tokens at the end of an `n_ctx` context, every token
-/// with the pools of [`prompt_pools`] (2,048 keys or fewer) plus its tail. Each round runs every
-/// kernel of `kernels` in turn, one warm-up call and `reps` timed ones. Leaves the launches on
+/// Times [`attention`] on `backend` at qwen4exp's shape (head size 256, `heads` = (query
+/// heads, kv heads): (24, 2) on one GPU, (12, 1) a rank of two under tensor parallelism) with
+/// caches of `types`: `n_tok` tokens at the end of an `n_ctx` context, every token with the
+/// pools of [`prompt_pools`] (2,048 keys or fewer) plus its tail. Each round runs every kernel
+/// of `kernels` in turn, one warm-up call and `reps` timed ones. Leaves the launches on
 /// [`PromptKernel::Auto`].
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub fn prompt_ms(
     backend: &mut Backend,
     types: KvTypes,
+    heads: (i64, i64),
     n_ctx: usize,
     n_tok: usize,
     reps: usize,
@@ -122,7 +128,8 @@ pub fn prompt_ms(
 ) -> Vec<Timing> {
     use crate::ggml::ComputeAllocator;
     let n_blocks = n_ctx / KV_BLOCK + 1;
-    let hp = hparams(256, 24, 2);
+    let (n_head, n_head_kv) = heads;
+    let hp = hparams(256, n_head, n_head_kv);
     let kv = KvPool::new_ring(&hp, backend.buffer_type(), n_blocks, &[0], None, types).unwrap();
     let (kp, vp) = kv.pools(0);
     let fill = |t: Tensor<'_>, ty: KvType, seed: u64| {
@@ -137,7 +144,7 @@ pub fn prompt_ms(
     fill(vp, types.v, 2);
     let ctx = Context::new(16, 16);
     let q = ctx
-        .new_tensor(types::F32, &[256, 24, n_tok as i64, 1])
+        .new_tensor(types::F32, &[256, n_head, n_tok as i64, 1])
         .as_input();
     let table = ctx.new_tensor(types::I32, &[n_blocks as i64, 1]).as_input();
     let cap = 512 * 4 + 3;
@@ -153,6 +160,7 @@ pub fn prompt_ms(
     table.set_i32(&(0..n_blocks as i32).collect::<Vec<_>>());
     // Every token: its pools' members, then its tail.
     let mut rows = Vec::with_capacity(n_tok * (1 + cap));
+    let (mut keys, mut chunks) = (0u64, 0u64);
     for (t, pools) in prompt_pools(n_ctx, n_tok, local).iter().enumerate() {
         let p = n_ctx - n_tok + t;
         let mut row: Vec<i32> = pools
@@ -161,6 +169,8 @@ pub fn prompt_ms(
             .collect();
         row.extend(((p + 1) / 4 * 4..=p).map(|x| x as i32));
         let n = row.len();
+        keys += n as u64;
+        chunks += n.div_ceil(32) as u64;
         rows.push(n as i32);
         rows.extend(row);
         rows.resize(rows.len() + cap - n, -1);
@@ -172,6 +182,8 @@ pub fn prompt_ms(
             kernel,
             ms: f64::INFINITY,
             bits: 0,
+            keys,
+            chunks,
         })
         .collect();
     for _ in 0..rounds.max(1) {

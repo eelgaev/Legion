@@ -568,6 +568,7 @@ pub(super) fn attention_ms(
     let t = super::bench::prompt_ms(
         backend,
         types,
+        (24, 2),
         n_ctx,
         n_tok,
         reps,

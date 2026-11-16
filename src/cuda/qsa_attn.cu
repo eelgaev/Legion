@@ -15,7 +15,7 @@
 // The prompt kernels per architecture live in sm70/qsa_attn.cuh (mma.sync.m8n8k4, attn_kernel),
 // sm80/qsa_attn.cuh (mma.sync.m16n8k16, attn_mma_kernel) and sm80/qsa_attn_gb10.cuh
 // (attn_gb_kernel on 8.0-8.7, attn_gw_kernel on compute capability 12.x: attn_mma_kernel's
-// bits, two CTAs per SM),
+// bits, two CTAs per SM; attn_gs_kernel, split by role, for qsa-bench only),
 // included below; launch_attn picks one per device at run time (use_mma, use_gb). The other
 // kernels are portable and stay here.
 
@@ -95,7 +95,8 @@ struct legion_qsa_attn {
     int32_t hgroups;
     // The F16 prompt kernel on sm_80+ (#828): 0 the launcher's choice (attn_gw_kernel on compute
     // capability 12.x, attn_gb_kernel on Ampere, attn_mma_kernel on the others),
-    // 1 attn_mma_kernel, 2 attn_gb_kernel, 3 attn_gw_kernel (#1183). All give the same bits.
+    // 1 attn_mma_kernel, 2 attn_gb_kernel, 3 attn_gw_kernel (#1183), 4 attn_gs_kernel (#1176),
+    // 5 attn_gs_kernel with two score groups. All give the same bits.
     int32_t mma_kernel;
 };
 
@@ -453,7 +454,7 @@ __device__ __forceinline__ void qrun_unpack(const char * row, int W, __half * ds
 #include "sm80/qsa_attn.cuh"
 
 // The GB10 prompt kernels: attn_mma_kernel's bits, two CTAs per SM (attn_gb_kernel,
-// attn_gw_kernel).
+// attn_gw_kernel) or one of 8 or 12 warps in two roles (attn_gs_kernel).
 #include "sm80/qsa_attn_gb10.cuh"
 
 // --qsa-attn-chain on a GPU running attn_mma_kernel: said once per process.
@@ -488,14 +489,15 @@ bool use_mma() {
 // 8.7 (#1212: the sm_86 code took 0.48-0.51x attn_mma_kernel's time at 8K-32K, 4096-token
 // steps; not 8.9), running attn_mma_kernel (use_mma). 12.x takes its warp-local variant,
 // attn_gw_kernel (#1183: 0.88x attn_gb_kernel's time at 8K-123K, 4096-token steps, on a GB10;
-// not measured on Ampere). Returns 0 (neither), 2 (attn_gb_kernel) or 3 (attn_gw_kernel), as
-// legion_qsa_attn::mma_kernel, whose 2 and 3 force either on any sm_80+.
+// not measured on Ampere; #1176 r38's role-split attn_gs_kernel tied it at best). Returns 0
+// (neither), 2 (attn_gb_kernel) or 3 (attn_gw_kernel), as legion_qsa_attn::mma_kernel, whose 2
+// to 5 force one on any sm_80+ (4 and 5: attn_gs_kernel, one or two score groups).
 template <int HD>
 int use_gb(int forced) {
     if (!use_mma<HD>()) {
         return 0;
     }
-    if (forced == 2 || forced == 3) {
+    if (forced >= 2 && forced <= 5) {
         return forced;
     }
     static std::atomic<int> state[64];  // per device: -1 unknown, else the kernel (0, 2 or 3)
@@ -1455,6 +1457,25 @@ int launch_attn(const legion_qsa_attn & p, cudaStream_t st) {
             }
         }
         const int gb = p.mma_kernel == 1 ? 0 : use_gb<HD>(p.mma_kernel);
+        if (gb == 4 || gb == 5) {
+            // ~80 KB at HD 256: one CTA of 8 (4) or 12 warps (5) per SM.
+            const int bytes = (int) sizeof(GsSmem<HD>);
+            const bool two = gb == 5;
+            const void * fn = two ? (const void *) attn_gs_kernel<HD, 2>
+                                  : (const void *) attn_gs_kernel<HD, 1>;
+            if (cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) !=
+                    cudaSuccess ||
+                cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                     cudaSharedmemCarveoutMaxShared) != cudaSuccess) {
+                return 2;
+            }
+            if (two) {
+                attn_gs_kernel<HD, 2><<<dim3(p.grid[0], p.grid[1]), 3 * 128, bytes, st>>>(p);
+            } else {
+                attn_gs_kernel<HD, 1><<<dim3(p.grid[0], p.grid[1]), 2 * 128, bytes, st>>>(p);
+            }
+            return cudaGetLastError() == cudaSuccess ? 0 : 2;
+        }
         if (gb != 0) {
             // ~39 KB at HD 256: under the 48 KB default, two CTAs per SM with the largest
             // shared-memory carveout.

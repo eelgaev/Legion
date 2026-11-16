@@ -616,6 +616,16 @@ pub enum PromptKernel {
     /// `attn_gw_kernel` (#1183): `attn_gb_kernel` with warp-local copies (each warp refills the
     /// K rows and V dims it reads itself), two CTA barriers per chunk instead of three.
     Gw = 3,
+    /// `attn_gs_kernel` (#1176 r38, `legion qsa-bench` only): one CTA of 8 warps per SM in two
+    /// roles, 4 score warps (scores and softmax) and 4 p.v warps a chunk behind them, K and V
+    /// two chunks ahead. 1.07-1.10x `attn_gw_kernel`'s time on a GB10 with neighbouring tokens
+    /// sharing pools, 1.3-1.7x with pools all over the context.
+    Gs = 4,
+    /// `attn_gs_kernel` with the score warps' K steps split over two groups of 4 warps (12
+    /// warps per SM, half of q's registers each), the first group's sums handed to the second
+    /// (`legion qsa-bench` only): 0.98-1.03x `attn_gw_kernel`'s time with shared pools,
+    /// 1.3-1.75x with spread ones.
+    Gs2 = 5,
 }
 
 /// The prompt kernel launches take from now on ([`PromptKernel`]; `legion qsa-bench`).
@@ -1180,7 +1190,8 @@ mod cuda {
         /// the reference kernel).
         pub hgroups: i32,
         /// The F16 prompt kernel on sm_80+ ([`super::PromptKernel`] as i32): 0 the launcher's
-        /// choice, 1 `attn_mma_kernel`, 2 `attn_gb_kernel`, 3 `attn_gw_kernel`.
+        /// choice, 1 `attn_mma_kernel`, 2 `attn_gb_kernel`, 3 `attn_gw_kernel`, 4 and 5
+        /// `attn_gs_kernel` (one or two score groups).
         pub mma_kernel: i32,
     }
 

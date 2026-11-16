@@ -582,3 +582,431 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
         }
     }
 }
+
+// attn_gs_kernel (#1176 r38): attn_gw_kernel's arithmetic (so attn_mma_kernel's bits) with the
+// work split by role. attn_gw_kernel runs two CTAs of 4 warps per SM, every warp doing scores,
+// softmax and p.v in turn behind two CTA barriers per chunk: an SM sub-partition holds two
+// warps, and while both sit in a softmax, a barrier or a copy wait, its mma.sync pipe idles
+// (gw issues its products at about 55% of the pipe's rate on 4K-token steps). Here one CTA of
+// 8 warps per SM, one warp of each role per sub-partition:
+// - score warps 0-3 (q in registers): warp w's scores of cells 8w..8w+7, then with the other
+//   score warps (a 128-thread barrier) the chunk's online softmax, whose p (hi, lo) and alpha
+//   go to one of two buffers;
+// - p.v warps 4-7: warp 4 + w's p.v of dims [w HD / 4, (w + 1) HD / 4) and the running output,
+//   a chunk behind the scores, so its products fill the pipe while its partner's softmax runs;
+// - named barriers hand the p buffers over (full: the score warps arrive, the p.v warps wait;
+//   empty: the other way round); K and V come in two buffers each, two chunks ahead, each warp
+//   copying the K rows or V dims it reads itself (attn_gw_kernel's warp-local copies).
+// Every product, sum and rounding is attn_gw_kernel's, in the same order. ~80 KB of shared
+// memory at HD 256.
+// SG = 2 splits the score warps' K steps over two groups of 4 warps (12 warps, q's registers
+// halved, which is what holds a CTA of attn_gw_kernel's kind to 8 warps an SM): group 0 sums
+// the first half of a cell's K steps from zero and hands the sums over in shared memory, group
+// 1 adds its half to them in order (the same sum, rounding for rounding) and runs the softmax;
+// group 0 runs up to two chunks ahead.
+// Measured on a GB10 (legion qsa-bench, a rank of two: 12 heads over 1 kv head, 4,096-4,544
+// token steps at 8K-123K): with neighbouring tokens sharing most pools SG = 1 takes 1.07-1.10x
+// attn_gw_kernel's time and SG = 2 0.98-1.03x (both ~36-38 TFLOP/s of issued products, as
+// attn_gw_kernel); with pools spread over a context past L2 both take 1.3-1.75x (one CTA an SM
+// keeps fewer gathers in flight than two). Not launched by default; same bits.
+
+constexpr int GS_THREADS = 256;  // the last score group and the p.v warps (the p buffers' barriers)
+
+template <int HD>
+struct GsSmem {
+    static constexpr int R = HD + 8;    // halves per K / V row (conflict-free ldmatrix rows)
+    static constexpr int PR = MCH + 8;  // halves per p row
+    __half k[2][MCH][R];
+    __half v[2][MCH][R];
+    __half ph[2][ROWS][PR];
+    __half pl[2][ROWS][PR];
+    float s[2][ROWS][MCH + 4];
+    float part[2][4][32][4];  // SG = 2: group 0's sums, per buffer, warp and lane
+    float qmax[8];
+    float alpha[2][ROWS];
+    float lsum[ROWS];
+    float mrow[ROWS];
+};
+
+// Named barriers (0 is __syncthreads()): bar.sync waits, bar.arrive only counts; `n` threads
+// (a multiple of 32) complete one.
+__device__ __forceinline__ void gs_bar_sync(int id, int n) {
+    asm volatile("bar.sync %0, %1;\n" ::"r"(id), "r"(n) : "memory");
+}
+
+__device__ __forceinline__ void gs_bar_arrive(int id, int n) {
+    asm volatile("bar.arrive %0, %1;\n" ::"r"(id), "r"(n) : "memory");
+}
+
+template <int HD, int SG>
+__global__ void __launch_bounds__((SG + 1) * 128, 1) attn_gs_kernel(legion_qsa_attn p) {
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    GsSmem<HD> & S = *reinterpret_cast<GsSmem<HD> *>(smem_raw);
+    constexpr int NW = 4;                  // warps per role (per score group)
+    constexpr int RT = NW * 32;            // threads per role
+    constexpr int PIECES = HD * 2 / 16;    // 16-byte pieces per K or V row
+    constexpr int KR = MCH / NW;           // K rows (score cells) per score warp
+    constexpr int DW = HD / NW;            // p.v dims per p.v warp
+    constexpr int VP = DW * 2 / 16;        // 16-byte pieces of a V row per p.v warp
+    constexpr int GP = PIECES / SG;        // 16-byte pieces of a K row per score group
+    constexpr int KPL = KR * GP / 32;      // K pieces per lane
+    constexpr int VPL = MCH * VP / 32;     // V pieces per lane
+    constexpr int NT = DW / 8;             // p.v n-tiles per warp
+    constexpr int KS = HD / 16;            // score K steps
+    constexpr int KSG = KS / SG;           // score K steps per group
+    // The softmax group's barrier; p buffer b full (2 + b) and empty (4 + b); the output (6);
+    // q's max over the score groups (7); group 0's sums in part[b] (8 + b), read (10 + b).
+    constexpr int BAR_S = 1, BAR_FULL = 2, BAR_EMPTY = 4, BAR_OUT = 6, BAR_Q = 7;
+    constexpr int BAR_PFULL = 8, BAR_PEMPTY = 10;
+    static_assert(SG == 1 || SG == 2, "one or two score groups");
+    static_assert(MCH == 32 && KR == 8, "one lane per chunk row, 8 score cells per warp");
+    static_assert(KR * GP % 32 == 0 && MCH * VP % 32 == 0, "copy layout");
+    static_assert(NT % 2 == 0 && KSG % 2 == 0, "ldmatrix x4 pairs");
+    static_assert(ROWS * 8 == RT, "softmax: 8 threads a row");
+    const int tok = blockIdx.x, kvh = blockIdx.y;
+    const int G = p.n_head / p.n_head_kv;
+    const int s = tok / p.n_tok, ti = tok % p.n_tok;
+    const int32_t * sel = p.sel + (size_t) tok * p.sel_row;
+    const int n = sel[0];
+    const int nch = n > 0 ? (n + MCH - 1) / MCH : 0;
+    const int32_t * ids = sel + 1;
+    const int32_t * table = p.table + (size_t) s * p.table_width;
+    const int t = threadIdx.x, lane = t & 31, warp = (t >> 5) & (NW - 1), grp = t / RT;
+    const int gid = lane >> 2, tig = lane & 3;
+
+    // Lane l: the position of row l of the chunk at c0 (-1 past the selection), its cell.
+    auto pos_at = [&](int c0) { return c0 + lane < n ? ld_issue(ids + c0 + lane) : -1; };
+    auto cell_of = [&](int pos) {
+        return pos < 0 ? -1 : ld_issue(table + pos / BLK) * BLK + pos % BLK;
+    };
+
+    if (grp < SG) {
+        // Score warp: its K rows of a chunk (lane = row of `cell`; its group's dims) into
+        // buffer b; past the last chunk an empty group (every chunk commits one, so the waits
+        // count alike).
+        auto issue_k = [&](int cell, int b, bool live) {
+            __syncwarp();
+            if (live) {
+#pragma unroll
+                for (int i = 0; i < KPL; ++i) {
+                    const int q = lane + 32 * i, c = warp * KR + q / GP, pc = grp * GP + q % GP;
+                    const int cl = __shfl_sync(0xffffffffu, cell, c);
+                    const bool valid = cl >= 0;
+                    const long long r =
+                        valid ? (long long) cl * p.kv_row + (long long) kvh * HD : 0;
+                    cp_async16(&S.k[b][c][pc * 8], reinterpret_cast<const uint4 *>(p.k + r) + pc,
+                               valid);
+                }
+            }
+            cp_async_commit();
+        };
+        int pos2 = -1;  // the positions two chunks ahead
+        if (nch > 0) {
+            const int cell0 = cell_of(pos_at(0));
+            const int cell1 = cell_of(pos_at(MCH));
+            issue_k(cell0, 0, true);
+            issue_k(cell1, 1, nch > 1);
+            pos2 = pos_at(2 * MCH);
+        }
+
+        // q: as attn_gw_kernel (the max over the score warps); this group's K steps.
+        const char * qb = (const char *) p.q + (size_t) s * p.q_nb3 + (size_t) ti * p.q_nb2 +
+                          (size_t) kvh * G * p.q_nb1;
+        float qm = 0.0f;
+        for (int i = t; i < G * HD; i += SG * RT) {
+            qm = fmaxf(qm,
+                       fabsf(*(const float *) (qb + (size_t) (i / HD) * p.q_nb1 + (i % HD) * 4)));
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            qm = fmaxf(qm, __shfl_xor_sync(0xffffffffu, qm, o));
+        }
+        if (lane == 0) {
+            S.qmax[t >> 5] = qm;
+        }
+        if (t < ROWS) {
+            S.mrow[t] = -INFINITY;
+            S.lsum[t] = 0.0f;
+        }
+        gs_bar_sync(BAR_Q, SG * RT);
+        qm = fmaxf(fmaxf(S.qmax[0], S.qmax[1]), fmaxf(S.qmax[2], S.qmax[3]));
+        if (SG == 2) {
+            qm = fmaxf(qm, fmaxf(fmaxf(S.qmax[4], S.qmax[5]), fmaxf(S.qmax[6], S.qmax[7])));
+        }
+        int qe = 0;
+        if (qm > 0.0f) {
+            frexpf(qm, &qe);  // qm < 2^qe
+        }
+        const float qup = ldexpf(1.0f, 14 - qe), qdown = ldexpf(p.scale_log2, qe - 14);
+        uint32_t qh[KSG][4], ql[KSG][4];
+#pragma unroll
+        for (int kk = 0; kk < KSG; ++kk) {
+            const int ks = grp * KSG + kk;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int h = gid + 8 * (i & 1), d = ks * 16 + 2 * tig + 8 * (i >> 1);
+                const float * qr = (const float *) (qb + (size_t) h * p.q_nb1) + d;
+                const float x0 = h < G ? qr[0] * qup : 0.0f;
+                const float x1 = h < G ? qr[1] * qup : 0.0f;
+                const __half h0 = __float2half_rn(x0), h1 = __float2half_rn(x1);
+                const __half2 hi = __halves2half2(h0, h1);
+                const __half2 lo = __halves2half2(__float2half_rn(x0 - __half2float(h0)),
+                                                  __float2half_rn(x1 - __half2float(h1)));
+                qh[kk][i] = *reinterpret_cast<const uint32_t *>(&hi);
+                ql[kk][i] = *reinterpret_cast<const uint32_t *>(&lo);
+            }
+        }
+
+        if (SG == 2 && grp == 0) {
+            // Group 0: the first KSG K steps of every cell's score, summed from zero, into
+            // part[b] for group 1.
+            for (int c = 0; c < nch; ++c) {
+                const int c0 = c * MCH, b = c & 1;
+                const int nh = min(MCH, n - c0);
+                const int cell2 = cell_of(pos2);
+                pos2 = pos_at(c0 + 3 * MCH);
+                cp_async_wait<1>();
+                __syncwarp();
+                const int cb = warp * KR;
+                float sc[4] = {0.f, 0.f, 0.f, 0.f};
+                if (cb < nh) {
+#pragma unroll
+                    for (int kk = 0; kk < KSG; kk += 2) {
+                        uint32_t bf[4];
+                        ldmatrix_x4(bf, &S.k[b][cb + (lane & 7)][kk * 16 + 8 * (lane >> 3)]);
+#pragma unroll
+                        for (int h = 0; h < 2; ++h) {
+                            float tg[4] = {0.f, 0.f, 0.f, 0.f};
+                            mma16816(tg, qh[kk + h], bf + 2 * h);
+                            mma16816(tg, ql[kk + h], bf + 2 * h);
+#pragma unroll
+                            for (int i = 0; i < 4; ++i) {
+                                sc[i] += tg[i];
+                            }
+                        }
+                    }
+                }
+                issue_k(cell2, b, c + 2 < nch);
+                // part[b]: group 1 has read chunk c - 2's.
+                if (c >= 2) {
+                    gs_bar_sync(BAR_PEMPTY + b, 2 * RT);
+                }
+                *reinterpret_cast<float4 *>(S.part[b][warp][lane]) =
+                    make_float4(sc[0], sc[1], sc[2], sc[3]);
+                __threadfence_block();
+                gs_bar_arrive(BAR_PFULL + b, 2 * RT);
+            }
+            return;
+        }
+
+        for (int c = 0; c < nch; ++c) {
+            const int c0 = c * MCH, b = c & 1;
+            const int nh = min(MCH, n - c0);
+            // The cells two chunks ahead (their loads land during the scores), and the
+            // positions three ahead.
+            const int cell2 = cell_of(pos2);
+            pos2 = pos_at(c0 + 3 * MCH);
+            // This warp's K rows of chunk c (chunk c + 1's may still be on their way).
+            cp_async_wait<1>();
+            __syncwarp();
+            // scores: as attn_gw_kernel (SG = 2: this group's K steps' products first, then
+            // the sums on top of group 0's, in K step order)
+            {
+                const int cb = warp * KR;
+                float sc[4] = {0.f, 0.f, 0.f, 0.f};
+                float tg[KSG][4];
+                if (cb < nh) {
+#pragma unroll
+                    for (int kk = 0; kk < KSG; kk += 2) {
+                        uint32_t bf[4];
+                        ldmatrix_x4(bf, &S.k[b][cb + (lane & 7)]
+                                            [(grp * KSG + kk) * 16 + 8 * (lane >> 3)]);
+#pragma unroll
+                        for (int h = 0; h < 2; ++h) {
+#pragma unroll
+                            for (int i = 0; i < 4; ++i) {
+                                tg[kk + h][i] = 0.f;
+                            }
+                            mma16816(tg[kk + h], qh[kk + h], bf + 2 * h);
+                            mma16816(tg[kk + h], ql[kk + h], bf + 2 * h);
+                        }
+                    }
+                }
+                if (SG == 2) {
+                    gs_bar_sync(BAR_PFULL + b, 2 * RT);
+                    const float4 g0 = *reinterpret_cast<const float4 *>(S.part[b][warp][lane]);
+                    if (c + 2 < nch) {
+                        gs_bar_arrive(BAR_PEMPTY + b, 2 * RT);
+                    }
+                    sc[0] = g0.x;
+                    sc[1] = g0.y;
+                    sc[2] = g0.z;
+                    sc[3] = g0.w;
+                }
+                if (cb < nh) {
+#pragma unroll
+                    for (int kk = 0; kk < KSG; ++kk) {
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            sc[i] += tg[kk][i];
+                        }
+                    }
+                }
+                const int cc = cb + 2 * tig;
+                S.s[b][gid][cc] = cc < nh ? sc[0] * qdown : -INFINITY;
+                S.s[b][gid][cc + 1] = cc + 1 < nh ? sc[1] * qdown : -INFINITY;
+                S.s[b][gid + 8][cc] = cc < nh ? sc[2] * qdown : -INFINITY;
+                S.s[b][gid + 8][cc + 1] = cc + 1 < nh ? sc[3] * qdown : -INFINITY;
+            }
+            // This warp's K rows of buffer b are free: chunk c + 2's come in.
+            issue_k(cell2, b, c + 2 < nch);
+            gs_bar_sync(BAR_S, RT);
+            // p buffer b: the p.v warps are done with chunk c - 2's.
+            if (c >= 2) {
+                gs_bar_sync(BAR_EMPTY + b, GS_THREADS);
+            }
+            // online softmax: as attn_gw_kernel
+            {
+                constexpr int PER = MCH / 8;
+                constexpr float VUP = 16384.0f;
+                const int r = (t % RT) >> 3, sub = t & 7;
+                float x[PER], mx = -INFINITY;
+#pragma unroll
+                for (int j = 0; j < PER; ++j) {
+                    x[j] = S.s[b][r][sub * PER + j];
+                    mx = fmaxf(mx, x[j]);
+                }
+#pragma unroll
+                for (int o = 1; o < 8; o <<= 1) {
+                    mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+                }
+                const float m_old = S.mrow[r];
+                const float m_new = fmaxf(m_old, mx);
+                float sum = 0.0f;
+#pragma unroll
+                for (int j = 0; j < PER; ++j) {
+                    const float e = x[j] == -INFINITY ? 0.0f : exp2f(x[j] - m_new);
+                    sum += e;
+                    const float pu = e * VUP;
+                    const __half hi = __float2half_rn(pu);
+                    S.ph[b][r][sub * PER + j] = hi;
+                    S.pl[b][r][sub * PER + j] = __float2half_rn(pu - __half2float(hi));
+                }
+#pragma unroll
+                for (int o = 1; o < 8; o <<= 1) {
+                    sum += __shfl_xor_sync(0xffffffffu, sum, o);
+                }
+                __syncwarp();
+                if (sub == 0) {
+                    const float a = m_old == -INFINITY ? 0.0f : exp2f(m_old - m_new);
+                    S.alpha[b][r] = a;
+                    S.lsum[r] = fmaf(S.lsum[r], a, sum);
+                    S.mrow[r] = m_new;
+                }
+            }
+            // p and alpha of chunk c are in buffer b.
+            __threadfence_block();
+            gs_bar_arrive(BAR_FULL + b, GS_THREADS);
+        }
+        // The running sums are final (or the initial zeros): the p.v warps write the output.
+        __threadfence_block();
+        gs_bar_arrive(BAR_OUT, GS_THREADS);
+        return;
+    }
+
+    // p.v warp: its V dims of a chunk (lane = row of `cell`) into buffer b; past the last
+    // chunk an empty group.
+    auto issue_v = [&](int cell, int b, bool live) {
+        __syncwarp();
+        if (live) {
+#pragma unroll
+            for (int i = 0; i < VPL; ++i) {
+                const int q = lane + 32 * i, c = q / VP, pc = warp * VP + q % VP;
+                const int cl = __shfl_sync(0xffffffffu, cell, c);
+                const bool valid = cl >= 0;
+                const long long r = valid ? (long long) cl * p.kv_row + (long long) kvh * HD : 0;
+                cp_async16(&S.v[b][c][pc * 8], reinterpret_cast<const uint4 *>(p.v + r) + pc,
+                           valid);
+            }
+        }
+        cp_async_commit();
+    };
+    int pos2 = -1;
+    if (nch > 0) {
+        const int cell0 = cell_of(pos_at(0));
+        const int cell1 = cell_of(pos_at(MCH));
+        issue_v(cell0, 0, true);
+        issue_v(cell1, 1, nch > 1);
+        pos2 = pos_at(2 * MCH);
+    }
+    float acc[NT][4];
+#pragma unroll
+    for (int j = 0; j < NT; ++j) {
+        acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.0f;
+    }
+    for (int c = 0; c < nch; ++c) {
+        const int c0 = c * MCH, b = c & 1;
+        const int cell2 = cell_of(pos2);
+        pos2 = pos_at(c0 + 3 * MCH);
+        // This warp's V dims of chunk c, then the chunk's p and alpha.
+        cp_async_wait<1>();
+        __syncwarp();
+        gs_bar_sync(BAR_FULL + b, GS_THREADS);
+        // p.v: as attn_gw_kernel (each n-tile: the chunk's two K steps, hi then lo, chained
+        // from a zero fragment)
+        {
+            constexpr float VDOWN = 1.0f / 16384.0f;
+            float tmp[NT][4];
+#pragma unroll
+            for (int j = 0; j < NT; ++j) {
+                tmp[j][0] = tmp[j][1] = tmp[j][2] = tmp[j][3] = 0.0f;
+            }
+            const int lr = (lane & 7) + 8 * ((lane >> 3) & 1), lc = 8 * (lane >> 4);
+#pragma unroll
+            for (int k0 = 0; k0 < MCH; k0 += 16) {
+                uint32_t ah[4], al[4];
+                ldmatrix_x4(ah, &S.ph[b][lr][k0 + lc]);
+                ldmatrix_x4(al, &S.pl[b][lr][k0 + lc]);
+#pragma unroll
+                for (int j = 0; j < NT; j += 2) {
+                    uint32_t bf[4];
+                    ldmatrix_x4_trans(bf, &S.v[b][k0 + lr][warp * DW + j * 8 + lc]);
+                    mma16816(tmp[j], ah, bf);
+                    mma16816(tmp[j], al, bf);
+                    mma16816(tmp[j + 1], ah, bf + 2);
+                    mma16816(tmp[j + 1], al, bf + 2);
+                }
+            }
+            const float a0 = S.alpha[b][gid], a1 = S.alpha[b][gid + 8];
+#pragma unroll
+            for (int j = 0; j < NT; ++j) {
+                acc[j][0] = fmaf(acc[j][0], a0, tmp[j][0] * VDOWN);
+                acc[j][1] = fmaf(acc[j][1], a0, tmp[j][1] * VDOWN);
+                acc[j][2] = fmaf(acc[j][2], a1, tmp[j][2] * VDOWN);
+                acc[j][3] = fmaf(acc[j][3], a1, tmp[j][3] * VDOWN);
+            }
+        }
+        // This warp's V dims of buffer b are free: chunk c + 2's come in. p buffer b goes
+        // back to the score warps, unless they are done with it.
+        issue_v(cell2, b, c + 2 < nch);
+        if (c + 2 < nch) {
+            gs_bar_arrive(BAR_EMPTY + b, GS_THREADS);
+        }
+    }
+    gs_bar_sync(BAR_OUT, GS_THREADS);
+    const float l0 = S.lsum[gid], l1 = S.lsum[gid + 8];
+    const float i0 = l0 > 0.0f ? 1.0f / l0 : 0.0f, i1 = l1 > 0.0f ? 1.0f / l1 : 0.0f;
+    float * out = p.dst + ((size_t) tok * p.n_head + (size_t) kvh * G) * HD;
+#pragma unroll
+    for (int j = 0; j < NT; ++j) {
+        const int d = warp * DW + j * 8 + 2 * tig;
+        if (gid < G) {
+            *reinterpret_cast<float2 *>(out + (size_t) gid * HD + d) =
+                make_float2(acc[j][0] * i0, acc[j][1] * i0);
+        }
+        if (gid + 8 < G) {
+            *reinterpret_cast<float2 *>(out + (size_t) (gid + 8) * HD + d) =
+                make_float2(acc[j][2] * i1, acc[j][3] * i1);
+        }
+    }
+}
