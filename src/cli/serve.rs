@@ -30,6 +30,7 @@ use super::report::{ColorChoice, StartupReport, StatusLineChoice, TermEnv};
 use super::{hfmodel, model_path, statusline, version};
 
 mod adaptive_settings;
+mod det_parts;
 mod draft_settings;
 mod pipe_split;
 mod switches;
@@ -1631,10 +1632,13 @@ impl EngineArgs {
     }
 
     /// `--deterministic-gather-ms`: the wave admission's gather window, `None` without
-    /// `--deterministic` or with 0.
+    /// `--deterministic` or with 0 (`LEGION_DEBUG_WAVES` overrides it, see `det_parts`).
     fn deterministic_gather(&self) -> Option<std::time::Duration> {
-        (self.deterministic && self.deterministic_gather_ms > 0)
-            .then(|| std::time::Duration::from_millis(self.deterministic_gather_ms))
+        det_parts::waves(
+            self.deterministic,
+            self.deterministic_gather_ms,
+            det_parts::env("LEGION_DEBUG_WAVES").as_deref(),
+        )
     }
 
     /// `--admit-gather-ms`: the idle burst window, `None` at 0.
@@ -2069,7 +2073,21 @@ pub async fn run(
                      planned afresh, requests admitted in waves (gather_ms 0: as they arrive; \
                      then requests decoded at the same time follow their timing, #49)"
                 );
-                // Before the engine allocates its first graph.
+            }
+            // Before the engine allocates its first graph (`LEGION_DEBUG_FRESH_PLANS`
+            // overrides --deterministic, see `det_parts`).
+            let fresh = det_parts::fresh_plans(
+                e.deterministic,
+                det_parts::env("LEGION_DEBUG_FRESH_PLANS").as_deref(),
+            );
+            if fresh != e.deterministic || deterministic_gather.is_some() != e.deterministic {
+                tracing::info!(
+                    fresh_plans = fresh,
+                    waves_ms = deterministic_gather.map_or(0, |d| d.as_millis() as u64),
+                    "--deterministic's parts set by LEGION_DEBUG_FRESH_PLANS / LEGION_DEBUG_WAVES"
+                );
+            }
+            if fresh {
                 legion::ggml::set_fresh_plans(true);
             }
             let residency = e.residency();
