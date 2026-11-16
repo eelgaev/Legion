@@ -19,6 +19,7 @@ const ALLOWED: &[(&str, &str)] = &[
     ),
     ("src/model/moe_ffn/tests.rs", "LEGION_MOE_SPEED_TYPES"),
     ("src/model/nvfp4_mm.rs", "LEGION_DEBUG_NVFP4_PF32"),
+    ("src/model/qwen4.rs", "LEGION_DEBUG_QWEN4_QSA_SHARE"),
     ("src/model/qwen4/qsa_attn/tests.rs", "LEGION_TINY"),
     (
         "src/residency/cpu_share/ops.rs",

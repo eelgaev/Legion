@@ -289,7 +289,8 @@ pub(crate) unsafe fn take_mix(ag: *mut ffi::ggml_tensor, mix: *mut ffi::ggml_ten
 /// The mix node the [`all_gather`] node `dst` runs itself ([`take_mix`]), if any.
 #[cfg(feature = "cuda")]
 pub(crate) fn mix_of(dst: &ffi::ggml_tensor) -> Option<&ffi::ggml_tensor> {
-    if external_params(dst)[P_MIX] == 0 {
+    // An I32 gather's parameter at P_MIX is its cut ([`P_CUT`]): it never runs a mix.
+    if dst.type_ == types::I32 || external_params(dst)[P_MIX] == 0 {
         return None;
     }
     // SAFETY: a node of `all_gather`: its source is the mix or a view of all of it.
