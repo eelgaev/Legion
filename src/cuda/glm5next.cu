@@ -1913,7 +1913,17 @@ int launch_linear(const A & a, cudaStream_t st) {
         const int rw = a.params[7] & 255;
         const bool rw16 = ((int64_t) ((uintptr_t) p.w | (p.h > 1 ? p.w_nb2 : 0)) % 16) == 0 &&
                           p.w_nb1 == p.k / 256 * 210;
-        if (wt == T_Q6_K && a.params[2] && rw > 0 && rw16 && p.n <= 4 && p.m % rw == 0 &&
+        // params[7] bit 10 (ops::linear_sp, #1172 r6): linear_mv_q6k_sp, rows of one or two stages
+        if (wt == T_Q6_K && a.params[2] && ((a.params[7] >> 10) & 1) && rw16 && st16 && p.h == 1 && p.n <= 4 &&
+            p.k % (256 * KQ_STAGE) == 0 && p.k / (256 * KQ_STAGE) <= 2) {
+            if (p.n == 1) {
+                launch_pdl(linear_mv_q6k_sp<1, 2>, grid, 128, 0, st, p);
+            } else if (p.n == 2) {
+                launch_pdl(linear_mv_q6k_sp<2, 2>, grid, 128, 0, st, p);
+            } else {
+                launch_pdl(linear_mv_q6k_sp<4, 2>, grid, 128, 0, st, p);
+            }
+        } else if (wt == T_Q6_K && a.params[2] && rw > 0 && rw16 && p.n <= 4 && p.m % rw == 0 &&
             p.k / 256 * rw % KQ_STAGE == 0) {
             const dim3 g((unsigned) ((p.m / rw + 3) / 4), (unsigned) p.h);
             const int early = (a.params[7] >> 9) & 1;
@@ -2549,6 +2559,11 @@ __device__ __forceinline__ void hc_mix_tok_row(const A & a, int64_t r, int64_t t
         wv[u] = __ldg(w + i + u * bd);
     }
     pdl_wait();
+    // params[6] bit 8 (ops::small_mv, #1172 r5): hc_finish_wide_kernel<true> launches once every
+    // block is past its wait, its streams and norm weight loaded while this one drains
+    if (a.params[6] & 8) {
+        pdl_trigger();
+    }
 #pragma unroll
     for (int u = 0; u < U; u++) {
         xv[u] = __ldg(x + i + u * bd);
@@ -3008,10 +3023,18 @@ __global__ void __launch_bounds__(256) hc_finish_kernel(const A a) {
 // elements j + 256 m in order of m (from shared memory), the other threads add nothing, and
 // block_sum's warp sums of zeros are the zeros its 8 warps' sum is padded with. h is then y sn w
 // from the registers: the same bits. The post and comb block is hc_finish_kernel's.
+// PRE (params[6] bit 8, ops::small_mv, #1172 r5): the norm blocks load the streams and the norm
+// weight before pdl_wait. The streams are the node's input, written before the mix kernel ahead
+// (hc_mix_tok_kernel only), and this kernel launches only once every mix block is past its own
+// wait (the mix's trigger follows it), so they are complete; the norm weight is no kernel's output.
+// The mix rows are read after the wait as before. The same values: the same bits.
 constexpr int HC_WIDE_T = 1024, HC_WIDE_U = 4, HC_WIDE_E = HC_WIDE_T * HC_WIDE_U;
 
+template <bool PRE>
 __global__ void __launch_bounds__(HC_WIDE_T) hc_finish_wide_kernel(const A a) {
-    pdl_wait();
+    if (!PRE) {
+        pdl_wait();
+    }
     const int64_t n = a.src_ne[0][2], b = blockIdx.x;
     const int e = (int) a.src_ne[0][0];
     const int64_t t = b < n ? b : b - n;
@@ -3028,6 +3051,15 @@ __global__ void __launch_bounds__(HC_WIDE_T) hc_finish_wide_kernel(const A a) {
             }
             wv[u] = i < e ? w[i] : 0.0f;
         }
+    }
+    if (PRE) {
+        pdl_wait();
+    }
+    // params[6] bit 32 (ops::SMALL_MV_TRIG, #1172 r6), 1-4 tokens: the next kernel launches once
+    // every block is here (its pre-wait part loads only weights; it waits for this one before it
+    // reads anything)
+    if ((a.params[6] & 32) && n <= 4) {
+        pdl_trigger();
     }
     __shared__ float mv[(2 + 4) * 4 + 1];
     __shared__ float ys[HC_WIDE_E];
@@ -3611,8 +3643,55 @@ __global__ void __launch_bounds__(128, Q6K_MIN_BLOCKS(N)) glu_mv_q6k(const Lin p
     }
 }
 
+// glu_mv_q6k on the GB10's staged rows (#1172 r5, params[1], ops::small_mv bit 16: the shared
+// expert's gate and up, 4096 x 2048, at 1-4 tokens, which took two linear_mv_q6k_st launches and
+// glu_kernel): warps 0, 2 take gate rows 2 b, 2 b + 1 and warps 1, 3 the up rows, each loading
+// its whole row (at most NG stages) before pdl_wait and summing it as linear_mv_q6k_st does
+// (q6k_row_sum), then glu_kernel's expression on the pair. The same bits.
+template <int N, int NG>
+__global__ void __launch_bounds__(128) glu_mv_q6k_sp(const Lin p, const char * wu, float lim, int trig) {
+    __shared__ uint4 sm[4][KQ_STAGE_V];
+    __shared__ float res[2][2][N];
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int64_t r = (int64_t) blockIdx.x * 2 + warp / 2;
+    const int64_t ng = r < p.m ? p.k / (256 * KQ_STAGE) : 0;
+    uint4 reg[NG][KQ_STAGE_PER];
+    q6k_row_load<NG>((const uint4 *) ((warp % 2 ? wu : p.w) + (ng ? r : 0) * p.w_nb1), ng, lane, reg);
+    pdl_wait();
+    // trig (params[2], ops::SMALL_MV_TRIG, #1172 r6): the next kernel (the shared expert's down)
+    // launches once every block has its loads in flight and is past its wait
+    if (trig) {
+        pdl_trigger();
+    }
+    if (ng) {
+        float acc[N];
+#pragma unroll
+        for (int t = 0; t < N; t++) {
+            acc[t] = 0.0f;
+        }
+        q6k_row_sum<N, NG>(p, p.x, sm[warp], ng, lane, reg, acc);
+        const float sc = lin_scale(p, r);
+#pragma unroll
+        for (int t = 0; t < N; t++) {
+            const float s = warp_sum(acc[t]);
+            if (lane == 0 && t < p.n) {
+                res[warp / 2][warp % 2][t] = s * sc;
+            }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < 2 * N) {
+        const int rr = threadIdx.x / N, t = threadIdx.x % N;
+        const int64_t o = (int64_t) blockIdx.x * 2 + rr;
+        if (o < p.m && t < p.n) {
+            const float g = res[rr][0][t], u = res[rr][1][t];
+            p.dst[t * p.m + o] = lim > 0.0f ? silu(fminf(g, lim)) * fminf(fmaxf(u, -lim), lim) : silu(g) * u;
+        }
+    }
+}
+
 // GLU_MV: sources gate and up (Q6_K, one shape and layout) and x (F32, n tokens of k); params
-// [limit]. dst F32 [m, n].
+// [limit, GB10 staged rows (glu_mv_q6k_sp), its early trigger (#1172 r6)]. dst F32 [m, n].
 int launch_glu_mv(const A & a, cudaStream_t st) {
     if (a.src_type[0] != T_Q6_K || a.src_type[1] != T_Q6_K) {
         return 1;
@@ -3640,6 +3719,18 @@ int launch_glu_mv(const A & a, cudaStream_t st) {
     }
     const float lim = host_f32(a.params[0]);
     const unsigned grid = (unsigned) ((p.m + 1) / 2);
+    if (a.params[1] && p.n <= 4 && p.k % (256 * KQ_STAGE) == 0 && p.k / (256 * KQ_STAGE) <= 2 &&
+        ((int64_t) ((uintptr_t) p.w | (uintptr_t) wu | p.w_nb1) % 16) == 0) {
+        const int trig = a.params[2] != 0;
+        if (p.n == 1) {
+            launch_pdl(glu_mv_q6k_sp<1, 2>, grid, 128, 0, st, p, wu, lim, trig);
+        } else if (p.n == 2) {
+            launch_pdl(glu_mv_q6k_sp<2, 2>, grid, 128, 0, st, p, wu, lim, trig);
+        } else {
+            launch_pdl(glu_mv_q6k_sp<4, 2>, grid, 128, 0, st, p, wu, lim, trig);
+        }
+        return 0;
+    }
     if (p.n == 1) {
         launch_pdl(glu_mv_q6k<1>, grid, 128, 0, st, p, wu, lim);
     } else if (p.n == 2) {
@@ -3768,6 +3859,11 @@ constexpr int KPOOL_MAX = 16;
 
 __global__ void pool_keys_kernel(const A a) {
     pdl_wait();
+    // params[0] (ops::SMALL_MV_TRIG, #1172 r6): the next kernel (q_a) launches once every block is
+    // past its wait, as hc_finish_wide_kernel's
+    if (a.params[0]) {
+        pdl_trigger();
+    }
     const int64_t d = a.src_ne[3][0], kpool = a.src_ne[3][1], p = blockIdx.x;
     const char * cache = S(a, 0);
     const int64_t cnb1 = a.src_nb[0][1];
@@ -4611,6 +4707,7 @@ extern "C" int legion_glm_launch(int op, const legion_glm_args * ap, void * stre
             }
             // params[3]: the GB10 kernels (ops::set_gb10_linear), for prompt steps
             const int ht = a.src_type[1];
+            bool tok = false;  // hc_mix_tok_kernel: hc_finish_wide_kernel<true> behind it (params[6] bit 8)
             if (a.params[5]) {  // hc_mix_split_kernel's scratch (hc_pre_norm, a few tokens)
                 if (a.n_src < 5 || ht != T_F32 || a.src_nb[1][1] % 4 != 0 || (e * hc) % 32 != 0) {
                     return 1;
@@ -4620,6 +4717,7 @@ extern "C" int legion_glm_launch(int op, const legion_glm_args * ap, void * stre
                 if ((a.params[6] & 4) && a.src_ne[0][2] <= 4 && e * hc == HC_SPLIT_UW * 32 * HC_MIX_W &&
                     (int64_t) ((uintptr_t) a.src[1]) % 4 == 0) {
                     launch_pdl(hc_mix_tok_kernel, dim3(grid.x), 32 * (int) a.src_ne[0][2], 0, st, a);
+                    tok = true;
                 } else if (e * hc >= HC_SPLIT_UW * 32 * HC_MIX_W) {
                     launch_pdl(hc_mix_split_kernel<HC_SPLIT_UW>, grid, 32, 0, st, a);
                 } else {
@@ -4641,8 +4739,10 @@ extern "C" int legion_glm_launch(int op, const legion_glm_args * ap, void * stre
             }
             const unsigned n = (unsigned) a.src_ne[0][2];
             if (a.n_src >= 5) {  // the norm fused (#606)
-                if (hc == 4 && e <= HC_WIDE_E) {
-                    launch_pdl(hc_finish_wide_kernel, 2 * n, HC_WIDE_T, 0, st, a);
+                if (hc == 4 && e <= HC_WIDE_E && tok && (a.params[6] & 8)) {
+                    launch_pdl(hc_finish_wide_kernel<true>, 2 * n, HC_WIDE_T, 0, st, a);
+                } else if (hc == 4 && e <= HC_WIDE_E) {
+                    launch_pdl(hc_finish_wide_kernel<false>, 2 * n, HC_WIDE_T, 0, st, a);
                 } else {
                     launch_pdl(hc_finish_kernel, 2 * n, 256, 0, st, a);
                 }

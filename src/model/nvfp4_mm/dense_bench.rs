@@ -2,9 +2,12 @@
 //! --dense`): a `[k, m]` weight times `n` tokens, each variant forced through [`force_kernel`],
 //! its outputs checked against the default kernel's bits and timed (the weight bytes over the
 //! time: the stream's bandwidth). For tuning [`pick_dense`] at speculative verify steps (a
-//! drafter's block of tokens per sequence).
+//! drafter's block of tokens per sequence). Also the GEMM's weight prefetch runs at prompt
+//! steps ([`force_gemm_pf`], #1176 r36), for plain matmuls and the fused SwiGLU (`glu`).
 
-use super::{Kernel, force_kernel, mul_mat, pick_dense};
+use super::{
+    Kernel, dense_mv_max_n, force_gemm_pf, force_kernel, mul_mat, pick_dense, swiglu, tokens_tile,
+};
 use crate::ggml::{Backend, ComputeAllocator, Context, types};
 
 /// One measured variant.
@@ -17,6 +20,10 @@ pub struct DenseRow {
     pub kernel: Kernel,
     /// The default (unforced) run.
     pub default: bool,
+    /// The default kernel's weight prefetch forced to runs of `pf` blocks; 0: its own.
+    pub pf: i32,
+    /// The fused SwiGLU (`[k, m]` gate and up weights) instead of a plain matmul.
+    pub glu: bool,
     /// Best seconds per matmul; `None`: the variant does not launch.
     pub secs: Option<f64>,
     pub bytes: f64,
@@ -83,7 +90,9 @@ pub fn variants(n: usize) -> Vec<Kernel> {
 /// Times the default and each of [`variants`] on `[k, m]` weights times each of `toks`:
 /// `layers` weights a graph (`copies` distinct ones, so the graph streams past the L2),
 /// `rounds` timed runs of `reps` graphs, the best counts. `sms`: the GPU's SMs (for the
-/// default's pick).
+/// default's pick). Then the default with each of `pfs`' prefetch runs where it runs the
+/// GEMM. `glu`: the fused SwiGLU of two such weights (layer `l`'s gate and up: weights `l`
+/// and `l + 1`), the default and the prefetch runs only.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     gpu: &mut Backend,
@@ -94,6 +103,8 @@ pub fn run(
     reps: usize,
     sms: i64,
     mv_max_n: i64,
+    pfs: &[i32],
+    glu: bool,
 ) -> Result<Vec<DenseRow>, String> {
     let mut rows = Vec::new();
     for &(k, m) in shapes {
@@ -107,15 +118,19 @@ pub fn run(
         for (i, w) in ws.iter().enumerate() {
             w.set_bytes(&weights(k, m, 5 + i as u64));
         }
-        let bytes = ws[0].nbytes() as f64;
+        let bytes = ws[0].nbytes() as f64 * if glu { 2.0 } else { 1.0 };
         for &n in toks {
             let ctx = Context::new(4 * layers + 4, 4 * layers + 4);
             let x = ctx.new_tensor(types::F32, &[k as i64, n as i64]).as_input();
             let mut graph = ctx.new_graph(4 * layers + 4);
-            let outs: Vec<_> = ws
-                .iter()
-                .map(|w| {
-                    let y = mul_mat(&ctx, *w, x, None).as_output();
+            let outs: Vec<_> = (0..layers)
+                .map(|l| {
+                    let y = if glu {
+                        swiglu(&ctx, ws[l], ws[(l + 1) % layers], x, None, None)
+                    } else {
+                        mul_mat(&ctx, ws[l], x, None)
+                    }
+                    .as_output();
                     graph.expand(y);
                     y
                 })
@@ -131,29 +146,54 @@ pub fn run(
             // later one, whatever the kernel (a DGX Spark (GB10); not looked into).
             gpu.compute(&graph).map_err(|e| e.to_string())?;
             // The default twice: the second's differ counts are run-to-run changes.
-            let mut kernels = vec![None, None];
-            kernels.extend(variants(n).into_iter().map(Some));
-            let mut reference: Vec<f32> = Vec::new();
+            let default_kernel = if !glu {
+                pick_dense(k as i64, m as i64, n as i64, sms, mv_max_n)
+            } else if n as i64 <= dense_mv_max_n() {
+                Kernel::Mv {
+                    nt: tokens_tile(n as i64, 8),
+                    rtw: 1,
+                    kw: 8,
+                    rpt: 1,
+                }
+            } else {
+                Kernel::Gemm {
+                    mi: 2,
+                    nt: tokens_tile(n as i64, 16).max(4),
+                }
+            };
+            let mut kernels: Vec<(Option<Kernel>, i32)> = vec![(None, 0), (None, 0)];
+            if !glu {
+                kernels.extend(variants(n).into_iter().map(|k| (Some(k), 0)));
+            }
+            if matches!(default_kernel, Kernel::Gemm { .. }) {
+                kernels.extend(pfs.iter().map(|&pf| (None, pf)));
+            }
+            let set = |(kernel, pf): (Option<Kernel>, i32)| {
+                force_kernel(kernel);
+                force_gemm_pf(pf);
+            };
+            let elem = if glu { 2 } else { 4 };
+            let mut reference: Vec<u8> = Vec::new();
             let first = rows.len();
-            for kernel in &kernels {
-                force_kernel(*kernel);
+            for &(kernel, pf) in &kernels {
+                set((kernel, pf));
                 let ok = gpu.compute(&graph).is_ok();
-                let got: Vec<f32> = if ok {
-                    outs.iter().flat_map(|o| o.to_f32()).collect()
+                let got: Vec<u8> = if ok {
+                    outs.iter().flat_map(|o| o.bytes()).collect()
                 } else {
                     Vec::new()
                 };
                 if rows.len() == first {
                     if !ok {
-                        force_kernel(None);
+                        set((None, 0));
                         return Err(format!("k {k} m {m} n {n}: the default does not run"));
                     }
                     reference = got.clone();
                 }
                 let differ = if ok {
-                    got.iter()
-                        .zip(&reference)
-                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    got.chunks(elem)
+                        .zip(reference.chunks(elem))
+                        .filter(|(a, b)| a != b)
                         .count()
                 } else {
                     0
@@ -162,9 +202,10 @@ pub fn run(
                     k,
                     m,
                     n,
-                    kernel: kernel
-                        .unwrap_or_else(|| pick_dense(k as i64, m as i64, n as i64, sms, mv_max_n)),
-                    default: kernel.is_none(),
+                    kernel: kernel.unwrap_or(default_kernel),
+                    default: kernel.is_none() && pf == 0,
+                    pf,
+                    glu,
                     secs: ok.then_some(f64::INFINITY),
                     bytes,
                     differ,
@@ -172,10 +213,10 @@ pub fn run(
             }
             // Rounds: the variants take turns within a round (the same clocks for all).
             for _ in 0..rounds {
-                for (i, kernel) in kernels.iter().enumerate() {
+                for (i, &variant) in kernels.iter().enumerate() {
                     let row = &mut rows[first + i];
                     let Some(best) = row.secs else { continue };
-                    force_kernel(*kernel);
+                    set(variant);
                     let t = std::time::Instant::now();
                     for _ in 0..reps {
                         gpu.compute(&graph).map_err(|e| e.to_string())?;
@@ -184,7 +225,7 @@ pub fn run(
                     row.secs = Some(best.min(s));
                 }
             }
-            force_kernel(None);
+            set((None, 0));
         }
     }
     Ok(rows)

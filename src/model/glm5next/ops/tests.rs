@@ -765,10 +765,41 @@ fn q6k_mv_takes_the_debug_switch() {
 #[test]
 fn small_mv_takes_the_debug_switch() {
     assert_eq!(small_mv_of(None), SMALL_MV_DEFAULT);
+    assert_eq!(SMALL_MV_DEFAULT, 191);
     assert_eq!(small_mv_of(Some(" 0\n")), 0);
     assert_eq!(small_mv_of(Some("2")), SMALL_MV_SET);
-    assert_eq!(small_mv_of(Some("15")), 7);
+    assert_eq!(small_mv_of(Some("15")), 15);
+    assert_eq!(small_mv_of(Some("255")), 255);
+    assert_eq!(
+        small_mv_of(Some("224")),
+        SMALL_MV_TRIG | SMALL_MV_SP | SMALL_MV_MOE
+    );
     assert_eq!(small_mv_of(Some("x")), SMALL_MV_DEFAULT);
+}
+
+#[test]
+fn linear_sp_takes_rows_of_one_or_two_stages() {
+    let nb1 = |k: i64| k / 256 * 210;
+    // kv_a and q_a (4096 values a row), the shared expert's down (2048)
+    assert!(sp_shape(4096, nb1(4096)));
+    assert!(sp_shape(2048, nb1(2048)));
+    // more stages (the dense FFN's down), part stages, padded rows
+    assert!(!sp_shape(12288, nb1(12288)));
+    assert!(!sp_shape(1536, nb1(1536)));
+    assert!(!sp_shape(4096, nb1(4096) + 16));
+    assert!(!sp_shape(0, 0));
+}
+
+#[test]
+fn glu_sp_takes_the_shared_experts_shape() {
+    let nb1 = |k: i64| k / 256 * 210;
+    assert!(glu_sp_shape(4096, 2048, nb1(4096)));
+    assert!(glu_sp_shape(2048, 4096, nb1(2048)));
+    // the dense FFNs' 12288 rows, rows of no whole stages or of three, strided rows
+    assert!(!glu_sp_shape(4096, 12288, nb1(4096)));
+    assert!(!glu_sp_shape(1536, 2048, nb1(1536)));
+    assert!(!glu_sp_shape(6144, 2048, nb1(6144)));
+    assert!(!glu_sp_shape(4096, 2048, nb1(4096) + 16));
 }
 
 #[test]

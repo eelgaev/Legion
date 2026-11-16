@@ -46,39 +46,67 @@ pub struct Nvfp4MvBenchArgs {
     /// With --dense: the SMs the default kernel is picked for.
     #[arg(long, default_value_t = 48)]
     sms: i64,
+    /// Fused SwiGLU gate and up weights like --dense's (`K:M`, comma separated; Qwen3.8-27B's
+    /// MLP `5120:17408`), the default kernel and --dense-pf's runs only.
+    #[arg(long, value_delimiter = ',', value_name = "K:M")]
+    dense_glu: Vec<String>,
+    /// With --dense / --dense-glu: also the default GEMM with its weights' L2 prefetch in runs
+    /// of these many blocks (4, 8, 16, 32; comma separated), where the default is the GEMM.
+    #[arg(long, value_delimiter = ',')]
+    dense_pf: Vec<i32>,
 }
 
 fn run_dense(args: &Nvfp4MvBenchArgs) -> anyhow::Result<()> {
     use legion::model::nvfp4_mm::{dense_bench, dense_mv_max_n};
     let mut gpu = legion::ggml::backend_by_name("CUDA0")?;
-    let shapes = args
-        .dense
-        .iter()
-        .map(|s| {
-            let (k, m) = s
-                .split_once(':')
-                .ok_or_else(|| anyhow::anyhow!("--dense {s}: not K:M"))?;
-            Ok((k.parse()?, m.parse()?))
-        })
-        .collect::<anyhow::Result<Vec<(usize, usize)>>>()?;
-    let rows = dense_bench::run(
-        &mut gpu,
-        &shapes,
-        &args.tokens,
-        args.layers,
-        args.rounds,
-        10,
-        args.sms,
-        dense_mv_max_n(),
-    )
-    .map_err(anyhow::Error::msg)?;
+    let parse = |list: &[String]| {
+        list.iter()
+            .map(|s| {
+                let (k, m) = s
+                    .split_once(':')
+                    .ok_or_else(|| anyhow::anyhow!("{s}: not K:M"))?;
+                Ok((k.parse()?, m.parse()?))
+            })
+            .collect::<anyhow::Result<Vec<(usize, usize)>>>()
+    };
+    let mut rows = Vec::new();
+    for (shapes, glu) in [
+        (parse(&args.dense)?, false),
+        (parse(&args.dense_glu)?, true),
+    ] {
+        rows.extend(
+            dense_bench::run(
+                &mut gpu,
+                &shapes,
+                &args.tokens,
+                args.layers,
+                args.rounds,
+                10,
+                args.sms,
+                dense_mv_max_n(),
+                &args.dense_pf,
+                glu,
+            )
+            .map_err(anyhow::Error::msg)?,
+        );
+    }
     println!(
         "{:>6} {:>6} {:>3}  {:<36} {:>8} {:>7} {:>7} {:>7}",
         "k", "m", "n", "kernel", "µs", "GB/s", "vs def", "differ"
     );
     let mut default = 0.0;
     for r in &rows {
-        let name = format!("{}{:?}", if r.default { "default " } else { "" }, r.kernel);
+        let name = format!(
+            "{}{}{:?}{}",
+            if r.glu { "glu " } else { "" },
+            if r.default { "default " } else { "" },
+            r.kernel,
+            if r.pf != 0 {
+                format!(" pf{}", r.pf)
+            } else {
+                String::new()
+            }
+        );
         let Some(s) = r.secs else {
             println!(
                 "{:>6} {:>6} {:>3}  {:<36} {:>8}",
@@ -105,7 +133,7 @@ fn run_dense(args: &Nvfp4MvBenchArgs) -> anyhow::Result<()> {
 }
 
 pub fn run(args: Nvfp4MvBenchArgs) -> anyhow::Result<()> {
-    if !args.dense.is_empty() {
+    if !args.dense.is_empty() || !args.dense_glu.is_empty() {
         return run_dense(&args);
     }
     let mut gpu = legion::ggml::backend_by_name("CUDA0")?;

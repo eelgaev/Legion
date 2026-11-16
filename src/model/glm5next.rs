@@ -1117,7 +1117,8 @@ impl Model {
             .any(|s| self.lw(il, &s.replace(".weight", ".scale")).is_ok());
         if !scaled && x.ty() == types::F32 && x.is_contiguous() && ops::glu_mv_takes(gw, uw, n) {
             let h = ops::glu_mv(ctx, gw, uw, x, limit);
-            return self.glm_lmm(ctx, il, &dn, h);
+            // the shared expert's down: its rows loaded while glu_mv drains (#1172 r6, opt-in)
+            return Ok(ops::linear_sp(self.glm_lmm(ctx, il, &dn, h)?));
         }
         let xh = self.glm_xh(ctx, il, &[&gn, &un], x);
         let g = self.glm_lmm_h(ctx, il, &gn, x, xh)?;
@@ -1407,6 +1408,8 @@ impl Model {
         // (and, opt-in, their int8 prompt GEMMs: output-moving, #603)
         let glm = |out| {
             let out = moe_ffn::glm_kernels(out, ops::gb10_linear());
+            // decode steps' kernels back to back (#1172 r6, the same bits)
+            let out = moe_ffn::glm_pdl(out, ops::moe_pdl());
             moe_ffn::glm_q8(out, ops::gb10_linear() && ops::expert_q8())
         };
         if let Some(t) = self.expert_tier(il) {
@@ -1837,7 +1840,12 @@ impl Model {
         tap.tap("indexer_gate", il, ig);
 
         // Queries, absorbed into the latent space: [kv_lora, n_head, n].
-        let qr = rms(mm("attn_q_a.weight", x)?, "attn_q_a_norm.weight")?;
+        // q_a and kv_a: their rows loaded while the kernel ahead drains (ops::linear_sp, #1172 r6,
+        // opt-in)
+        let qr = rms(
+            ops::linear_sp(mm("attn_q_a.weight", x)?),
+            "attn_q_a_norm.weight",
+        )?;
         tap.tap("q_resid", il, qr);
         // At GB10 prompt steps attn_q_b gives attn_k_b its rows in F16 (#862).
         let lw = |name: &str| self.lw(il, &format!("{name}{s}"));
@@ -1849,7 +1857,10 @@ impl Model {
         let q = ctx.reshape_3d(q, dh, nh, n);
         let q = sm("attn_k_b.weight", q)?;
         // The latents of this step's tokens.
-        let kv = rms(mm("attn_kv_a_mqa.weight", x)?, "attn_kv_a_norm.weight")?;
+        let kv = rms(
+            ops::linear_sp(mm("attn_kv_a_mqa.weight", x)?),
+            "attn_kv_a_norm.weight",
+        )?;
 
         // The indexer's queries and head weights.
         let iq = mm("indexer.attn_q_b.weight", qr)?;
