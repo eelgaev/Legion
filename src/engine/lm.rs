@@ -598,6 +598,27 @@ pub(crate) fn default_kept_graphs(
     (mtp && integrated && arch == "qwen4exp").then_some((256, 32))
 }
 
+/// `--tp-commit-in-verify-min-seqs` where it is not given (#1176): 8 for qwen4exp drafting with
+/// its MTP head on a rank of tensor parallelism over machines, else 0 (no commit deferred).
+/// After a verify step of 8 or more sequences each rank runs the commit's delta rule inside its
+/// next verify step instead of in a commit of its own, which reads every gated DeltaNet state
+/// once less a round: on two DGX Sparks at 16 users the separate commit took ~8 ms of a ~133 ms
+/// round (36 layers x ~235 us, memory bound). Narrower steps commit as before. The same bits
+/// either way (the deferred replay is the commit's own kernel code, `legion gdn-bench
+/// --replay`). `old` (`LEGION_DEBUG_TP_COMMIT_IN_VERIFY=0`): 0, the default before, for A/B runs.
+pub(crate) fn default_tp_commit_in_verify(
+    arch: &str,
+    mtp: bool,
+    tp_over_machines: bool,
+    old: bool,
+) -> usize {
+    if tp_over_machines && mtp && arch == "qwen4exp" && !old {
+        8
+    } else {
+        0
+    }
+}
+
 /// The bytes a stage's kept verify graphs may hold ([`crate::model::core::Executor::set_verify_budget`]):
 /// `--verify-kept-mib` when given (0: no limit), else
 /// [`crate::model::core::default_verify_budget`] of the stage device's `free` bytes after the
@@ -4173,6 +4194,16 @@ impl LmEngine {
             if cfg.switches.verify_kept_graphs.is_none() {
                 crate::model::core::set_verify_kept_graphs(v);
             }
+        }
+        // Before the pools are sized and made (their second store, `SpecPool::new_layers_wide`).
+        if cfg.switches.tp_commit_in_verify_min_seqs.is_none() {
+            let old = std::env::var("LEGION_DEBUG_TP_COMMIT_IN_VERIFY").is_ok_and(|v| v == "0");
+            crate::model::core::set_tp_commit_in_verify_min_seqs(default_tp_commit_in_verify(
+                model.hp.arch.name(),
+                mtp,
+                tp_start.is_some() && layout.node.is_none(),
+                old,
+            ));
         }
         let dflash =
             cfg.spec.kind == crate::spec::SpecKind::Dflash && cfg.spec.model_drafter.is_none();

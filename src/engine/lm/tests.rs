@@ -854,6 +854,17 @@ fn qwen4exp_keeps_more_graph_shapes_with_mtp_on_integrated_gpus() {
 }
 
 #[test]
+fn qwen4exp_mtp_tp_ranks_defer_wide_commits_by_default() {
+    let min = default_tp_commit_in_verify;
+    assert_eq!(min("qwen4exp", true, true, false), 8);
+    // LEGION_DEBUG_TP_COMMIT_IN_VERIFY=0: none, as before.
+    assert_eq!(min("qwen4exp", true, true, true), 0);
+    assert_eq!(min("qwen4exp", false, true, false), 0);
+    assert_eq!(min("qwen4exp", true, false, false), 0);
+    assert_eq!(min("qwen35moe", true, true, false), 0);
+}
+
+#[test]
 fn kept_verify_graphs_have_a_byte_budget() {
     const GIB: usize = 1 << 30;
     // Given: as given (0: no limit).

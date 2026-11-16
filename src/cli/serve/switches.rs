@@ -152,8 +152,8 @@ pub(in crate::cli) struct SwitchArgs {
     /// Narrower verify steps and their commits run as without the flag (one or a few
     /// sequences' commits are small and hide behind the drafting, where deferring them slows
     /// a round, #1176). The same bits either way. Takes a second copy of the replay inputs in
-    /// VRAM (a few MB per sequence). Give every rank the same value. 0-255, default 0 (no
-    /// commit deferred).
+    /// VRAM (a few MB per sequence). Give every rank the same value. 0-255 (0: no commit
+    /// deferred), default 8 for Qwen3.8-Flash-Next with --spec mtp, else 0.
     #[arg(long, help_heading = HEADING, value_name = "N")]
     tp_commit_in_verify_min_seqs: Option<u8>,
     /// CUDA, attention layers: Legion's one-launch norm + RoPE for the q and k heads (and
