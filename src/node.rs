@@ -26,7 +26,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// Frames before this version are refused: both ranks must run the same build.
-const VERSION: u32 = 7;
+const VERSION: u32 = 8;
 
 /// The node settings of a `legion serve` (`--node-rank`, `--node-peer`, `--node-split`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,13 +109,17 @@ pub enum Request {
     /// and the gather budget. `head`: the share of the output head this rank computes
     /// ([`crate::model::core::head_split`]; 0: none, or all of it where it reads no captured
     /// rows), whose candidates it answers with ([`Reply::Step`]: each row's column and, as
-    /// the one row of `rows`, their values).
+    /// the one row of `rows`, their values). `rows_dev`: 0, or `n + 1` when rank 0 leaves
+    /// its captured rows on the device for the MTP head's take-in of a prompt chunk and reads
+    /// back only rows `n` on (#1176): this rank does the same where it can, and the take-in's
+    /// pieces name those rows as [`RowsPart::Device`].
     TpStep {
         groups: Vec<WireGroup>,
         micro: u32,
         taper: u32,
         gather_budget: u64,
         head: u32,
+        rows_dev: u64,
     },
     /// Save ring `ring`'s first `n` positions in copy `slot`, or (`restore`) put that copy
     /// back.
@@ -225,6 +229,11 @@ pub enum RowsPart {
         len: u64,
         check: u64,
     },
+    /// Rows `start..start + rows` of the receiving rank's last step's first captured layer,
+    /// which that step left on the device ([`Request::TpStep`]'s `rows_dev`): copied there
+    /// into the pass's input after the parts before it, the last part (#1176). Where the step
+    /// read them back after all, the same rows from the host.
+    Device { start: u64, rows: u64 },
 }
 
 /// A hash of `v`'s bits (never 0), which a debug build's ranks compare to show that the rows
@@ -322,6 +331,12 @@ fn put_parts(head: &mut Vec<u8>, parts: &[RowsPart]) {
                     head.extend_from_slice(&v.to_le_bytes());
                 }
             }
+            RowsPart::Device { start, rows } => {
+                head.push(2);
+                for v in [start, rows] {
+                    head.extend_from_slice(&v.to_le_bytes());
+                }
+            }
         }
     }
 }
@@ -338,6 +353,10 @@ fn get_parts(r: &mut Cursor<'_>) -> Result<Vec<RowsPart>, String> {
                 start: r.u64()?,
                 len: r.u64()?,
                 check: r.u64()?,
+            },
+            2 => RowsPart::Device {
+                start: r.u64()?,
+                rows: r.u64()?,
             },
             t => return Err(format!("unknown rows part {t}")),
         });
@@ -448,12 +467,14 @@ impl Request {
                 taper,
                 gather_budget,
                 head: share,
+                rows_dev,
             } => {
                 put_groups(&mut head, &groups);
                 put_u32(&mut head, micro);
                 put_u32(&mut head, taper);
                 head.extend_from_slice(&gather_budget.to_le_bytes());
                 put_u32(&mut head, share);
+                head.extend_from_slice(&rows_dev.to_le_bytes());
                 K_TP_STEP
             }
             Request::SaveRing {
@@ -587,6 +608,7 @@ impl Request {
                 taper: r.u32()?,
                 gather_budget: r.u64()?,
                 head: r.u32()?,
+                rows_dev: r.u64()?,
             },
             K_SAVE_RING => Request::SaveRing {
                 ring: r.u32()?,

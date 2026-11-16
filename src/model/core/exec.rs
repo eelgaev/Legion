@@ -1855,13 +1855,28 @@ impl Executor {
         first: &[f32],
         rows: crate::ggml::RowsAt,
     ) -> Result<MtpOutput, ModelError> {
-        if self.tp.is_some() || self.mtp_runs_par(groups) || self.budget_chunks(groups).len() > 1 {
-            // Not one pass on this machine: the rows on the host, as before.
+        let one = !self.mtp_runs_par(groups) && self.budget_chunks(groups).len() <= 1;
+        if one && self.tp.is_some() {
+            // Over machines: every rank copies its own rows on the device (#1176).
+            return self.tp_mtp_rows(groups, first, rows);
+        }
+        if !one {
+            // Not one pass: the rows on the host, as before.
             let ctx = Context::new(1, 0);
             // SAFETY: the caller keeps the step's buffer and its rows (see above).
             let host = unsafe { ctx.over_rows(&rows) }.to_f32();
             return self.mtp_step_parts(groups, &[first, &host]);
         }
+        self.mtp_rows_here(groups, first, rows)
+    }
+
+    /// [`Self::mtp_step_rows`] as one pass on this machine.
+    fn mtp_rows_here(
+        &mut self,
+        groups: &[Group<'_>],
+        first: &[f32],
+        rows: crate::ggml::RowsAt,
+    ) -> Result<MtpOutput, ModelError> {
         self.mtp_rows_in = Some(rows);
         let out = self.mtp_pass(groups, &[first], Ahead::default());
         self.mtp_rows_in = None;
@@ -2906,10 +2921,17 @@ impl Executor {
         if self.tp.is_some() {
             self.prompt_next = None;
             self.hidden_from = 0;
+            // Only the MTP head's take-in leaves the rows on the device over machines (every
+            // rank alike, `tp_step`), where it may ([`Self::mtp_rows_device`]).
+            if self.hidden_dev_from.is_none() || self.mtp_rows_device().is_none() {
+                self.hidden_on_device = None;
+                self.hidden_dev_from = None;
+            }
+            self.captures.clear();
+            let out = self.tp_step(groups);
             self.hidden_on_device = None;
             self.hidden_dev_from = None;
-            self.captures.clear();
-            return self.tp_step(groups);
+            return out;
         }
         let out = self.step_here(groups);
         self.hidden_from = 0;
@@ -2942,11 +2964,14 @@ impl Executor {
     /// The CUDA device a step's captured rows may stay on for the MTP head's take-in
     /// ([`Self::set_hidden_on_device`], [`Self::mtp_step_rows`], #1183): the last stage's, when
     /// the model runs as one stage on this machine with a head of its own cache (the head
-    /// runs on that stage's backend). `None` otherwise.
+    /// runs on that stage's backend). `None` otherwise. Over machines (`--tp-rank`) every rank
+    /// leaves its own rows where they are and rank 0 names them to the others
+    /// ([`crate::node::RowsPart::Device`], #1176); `LEGION_DEBUG_TP_DEVICE_ROWS=0` on rank 0:
+    /// never there (all read back, as before).
     pub fn mtp_rows_device(&self) -> Option<usize> {
         if !self.mtp_enabled
             || self.mtp_shares_kv()
-            || self.tp.is_some()
+            || (self.tp.is_some() && !tp_lead::device_rows())
             || self.remote.is_some()
             || self.stages.len() != 1
         {

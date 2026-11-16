@@ -73,6 +73,16 @@ impl RowsAt {
         }
     }
 
+    /// The row of `whole` it starts at, if it is rows of `whole` ([`Self::slice`]: the same
+    /// buffer and width, from a row of it, within it).
+    pub fn first_row_in(&self, whole: &RowsAt) -> Option<usize> {
+        let row = whole.width * std::mem::size_of::<f32>();
+        let off = self.data.checked_sub(whole.data)?;
+        let first = off / row.max(1);
+        let same = self.buffer == whole.buffer && self.width == whole.width;
+        (same && row > 0 && off % row == 0 && first + self.rows <= whole.rows).then_some(first)
+    }
+
     /// Its bytes.
     pub fn nbytes(&self) -> usize {
         self.width * self.rows * std::mem::size_of::<f32>()

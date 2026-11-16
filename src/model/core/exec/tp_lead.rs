@@ -116,6 +116,19 @@ pub struct TpLead {
     /// Where the rows of the step before the last are while `prev_held` keeps them.
     prev_rows: Vec<(usize, usize)>,
     prev_held: Option<Arc<Vec<Vec<f32>>>>,
+    /// The last step's first captured layer where it left it on the device
+    /// ([`StepOutput::hidden_dev`]) for the MTP head's take-in, which every other rank did too
+    /// (#1176): its pieces name their rows in it ([`RowsPart::Device`]).
+    step_dev: Option<crate::ggml::RowsAt>,
+}
+
+/// The MTP head's take-in of a prompt chunk copies its pieces' rows on the device on every rank
+/// ([`Executor::mtp_rows_device`], #1176); `LEGION_DEBUG_TP_DEVICE_ROWS=0` on rank 0 turns that
+/// off (for A/B runs only: every rank then reads the step's rows back, and the pieces go
+/// through the host).
+pub(super) fn device_rows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_TP_DEVICE_ROWS").is_none_or(|v| v != "0"))
 }
 
 impl Drop for TpLead {
@@ -183,6 +196,7 @@ impl TpLead {
             held: None,
             prev_rows: Vec::new(),
             prev_held: None,
+            step_dev: None,
         }
     }
 
@@ -204,6 +218,7 @@ impl TpLead {
             held: None,
             prev_rows: Vec::new(),
             prev_held: None,
+            step_dev: None,
         }
     }
 
@@ -307,14 +322,21 @@ impl Executor {
         let split = self.head_split
             && self.tp.as_ref().is_some_and(|l| l.links.len() == 1)
             && head_split::fits(groups, crate::ggml::model_bytes::DECODE_MAX_TOKENS);
+        // The MTP head's take-in's rows left on the device ([`Executor::step`]).
+        let rows_dev = match (self.hidden_on_device, self.hidden_dev_from) {
+            (Some(_), Some(from)) => from as u64 + 1,
+            _ => 0,
+        };
         let req = Request::TpStep {
             groups: super::remote::to_wire(groups),
             micro: self.pipeline_micro as u32,
             taper: self.micro_taper as u32,
             gather_budget: self.gather_budget as u64,
             head: if split { 2 } else { 0 },
+            rows_dev,
         };
         let lead = self.tp.as_mut().expect("tensor-parallel lead");
+        lead.step_dev = None;
         // The last step's rows become the step before's while the engine holds them (the
         // other ranks keep theirs too); the older ones go back to the spare rows.
         let older = lead.prev_held.take();
@@ -335,12 +357,53 @@ impl Executor {
             self.tp_join_head(&mut out)?;
         }
         let lead = self.tp.as_mut().expect("tensor-parallel lead");
-        if lead.local_rows {
+        lead.step_dev = out.hidden_dev.first().copied();
+        // Rows asked to stay on the device that this rank read back after all: the others
+        // may have read back only the last ones, so MTP passes send these rows instead of
+        // naming the others' copies.
+        let partial = rows_dev != 0 && lead.step_dev.is_none();
+        if lead.local_rows && !partial {
             lead.step_rows = (out.hidden.iter())
                 .map(|v| (v.as_ptr() as usize, v.len()))
                 .collect();
         }
         Ok(out)
+    }
+
+    /// [`Self::mtp_step_rows`] on every rank as one pass: `first` from the host, then `rows`
+    /// of the last step's first captured layer on this rank's device, which every other rank
+    /// copies from its own ([`RowsPart::Device`]; one that read its rows back after all, from
+    /// those). The same floats on every rank as when they go through the host.
+    pub(super) fn tp_mtp_rows(
+        &mut self,
+        groups: &[Group<'_>],
+        first: &[f32],
+        rows: crate::ggml::RowsAt,
+    ) -> Result<MtpOutput, ModelError> {
+        let lead = self.tp.as_ref().expect("tensor-parallel lead");
+        let Some(start) = lead.step_dev.and_then(|d| rows.first_row_in(&d)) else {
+            // Not rows the others can name: from the host, as before.
+            let ctx = crate::ggml::Context::new(1, 0);
+            // SAFETY: the engine's rows of the last step, untouched until its next step.
+            let host = unsafe { ctx.over_rows(&rows) }.to_f32();
+            return self.mtp_step_parts(groups, &[first, &host]);
+        };
+        let (mut parts, h) = if first.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            self.tp_rows_wire(&[first])
+        };
+        parts.push(RowsPart::Device {
+            start: start as u64,
+            rows: rows.rows as u64,
+        });
+        let req = Request::TpMtpRows {
+            groups: super::remote::to_wire(groups),
+            gather_budget: self.gather_budget as u64,
+            parts,
+            h,
+        };
+        self.tp_run(&req, |e| e.mtp_rows_here(groups, first, rows))
     }
 
     /// After this rank's share of a split head ([`head_split`]): waits for rank 1's answer to

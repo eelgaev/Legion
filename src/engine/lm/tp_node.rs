@@ -537,13 +537,30 @@ pub(super) fn follow(
 }
 
 /// What a rank above 0 keeps between requests: its KV blocks, its `--tp-profile`, and the
-/// rows its last two steps captured ([`crate::model::core::StepOutput::hidden`], the last
-/// first, which [`Request::TpMtpRows`] reads).
-type FollowState<'s> = (
-    &'s mut usize,
-    &'s mut StepProfile,
-    &'s mut [Vec<Vec<f32>>; 2],
-);
+/// rows its last steps captured ([`FollowRows`]).
+type FollowState<'s> = (&'s mut usize, &'s mut StepProfile, &'s mut FollowRows);
+
+/// The rows a rank above 0's last steps captured, which [`Request::TpMtpRows`] reads.
+#[derive(Default)]
+struct FollowRows {
+    /// On the host ([`crate::model::core::StepOutput::hidden`]), the last step's first.
+    host: [Vec<Vec<f32>>; 2],
+    /// The last step's left on the device ([`crate::model::core::StepOutput::hidden_dev`],
+    /// [`RowsPart::Device`]): valid until the next step.
+    dev: Vec<crate::ggml::RowsAt>,
+}
+
+/// [`Request::TpMtpRows`]' parts split into the ones [`rows_of`] reads and a last
+/// [`RowsPart::Device`] part's `(start, rows)`, if any.
+fn split_device(parts: &[RowsPart]) -> Result<(&[RowsPart], Option<(usize, usize)>), String> {
+    match parts.split_last() {
+        Some((&RowsPart::Device { start, rows }, before)) => {
+            let n = |v: u64| usize::try_from(v).map_err(|_| "MTP rows: a device range too big");
+            Ok((before, Some((n(start)?, n(rows)?))))
+        }
+        _ => Ok((parts, None)),
+    }
+}
 
 /// An MTP pass's residual rows from `parts` (see [`RowsPart`]): the sent ones from `h` in
 /// order, the others from `steps`, the captured layers of this rank's last steps (the last
@@ -593,6 +610,9 @@ fn rows_of<'a>(
                 }
                 Ok(s)
             }
+            RowsPart::Device { .. } => {
+                Err("MTP rows: device rows only as a take-in's last part".to_string())
+            }
         })
         .collect::<Result<Vec<_>, String>>()?;
     if at != h.len() {
@@ -635,6 +655,7 @@ fn handle(
             taper,
             gather_budget,
             head,
+            rows_dev,
         } => {
             exec.set_pipeline_micro(micro as usize);
             exec.set_micro_taper(taper as usize);
@@ -658,10 +679,19 @@ fn handle(
             comm.mark_step(profile);
             // The rows of the step before the last are not read any more (rank 0 names at most
             // the last two steps' rows): this step copies into them.
-            rows.swap(0, 1);
-            exec.recycle_rows(std::mem::take(&mut rows[0]));
+            rows.host.swap(0, 1);
+            exec.recycle_rows(std::mem::take(&mut rows.host[0]));
+            // The last step's rows on the device are this step's buffers again.
+            rows.dev.clear();
+            // Rank 0's take-in copies its pieces' rows on the device: so do this rank's, where
+            // the step can leave them there (else they are all read back, as before).
+            if let Some(from) = rows_dev.checked_sub(1) {
+                exec.set_hidden_on_device(exec.mtp_rows_device());
+                exec.set_hidden_on_device_from(from as usize);
+            }
             let out = exec.step(&groups).map_err(|e| e.to_string())?;
-            rows[0] = out.hidden;
+            rows.host[0] = out.hidden;
+            rows.dev = out.hidden_dev;
             comm.record(profile, t0.elapsed(), exec.take_step_laps());
             if let Some(e) = comm.error() {
                 return Err(e);
@@ -698,14 +728,36 @@ fn handle(
             parts,
             h,
         } => {
-            // A prompt chunk's take-in reads this rank's copy of the step's rows (#780).
+            // A prompt chunk's take-in reads this rank's copy of the step's rows (#780), its
+            // pieces' rows on the device where the step left them there (#1176).
             exec.set_gather_budget(gather_budget as usize);
             let groups = crate::model::core::from_wire(&groups)?;
-            let parts = rows_of(&parts, &h, &rows[..])?;
+            let (parts, dev) = split_device(&parts)?;
+            let parts = rows_of(parts, &h, &rows.host[..])?;
             let t0 = std::time::Instant::now();
             comm.mark_step(profile);
-            exec.mtp_step_parts(&groups, &parts)
-                .map_err(|e| e.to_string())?;
+            match (dev, rows.dev.first()) {
+                (None, _) => exec.mtp_step_parts(&groups, &parts),
+                (Some((start, n)), Some(on))
+                    if on.width == exec.mtp_width()
+                        && start.checked_add(n).is_some_and(|end| end <= on.rows) =>
+                {
+                    exec.mtp_step_rows(&groups, &parts.concat(), on.slice(start, n))
+                }
+                (Some((start, n)), _) => {
+                    // The step read them back after all: the same rows from the host.
+                    let w = exec.mtp_width();
+                    let host = (rows.host[0].first())
+                        .and_then(|l| l.get(start * w..(start + n) * w))
+                        .ok_or_else(|| {
+                            format!("MTP rows: rows {start}+{n} are not in this rank's last step")
+                        })?;
+                    let mut all = parts;
+                    all.push(host);
+                    exec.mtp_step_parts(&groups, &all)
+                }
+            }
+            .map_err(|e| e.to_string())?;
             comm.record(profile, t0.elapsed(), None);
             if let Some(e) = comm.error() {
                 return Err(e);
@@ -725,7 +777,7 @@ fn handle(
             // this rank's copy of the step's rows where rank 0 names them (#780).
             exec.set_gather_budget(gather_budget as usize);
             let groups = crate::model::core::from_wire(&groups)?;
-            let parts = rows_of(&parts, &h, &rows[..])?;
+            let parts = rows_of(&parts, &h, &rows.host[..])?;
             let t0 = std::time::Instant::now();
             comm.mark_step(profile);
             // The n-gram rows the verify step after the round reads, started as rank 0 starts
