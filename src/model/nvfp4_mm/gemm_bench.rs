@@ -7,9 +7,9 @@
 
 use super::bench::routing_tiles;
 use super::{
-    GemmTune, Grouped, Kernel, MV_MAX_N, bf16_bits, force_gemm_diag, force_gemm_tune,
-    force_grouped_tiles, force_kernel, glu_gemm_tile, leave_unread, mul_mat_id, pick_grouped,
-    plan_grouped, set_expert_mv_max, set_expert_mv_tile, skips, swiglu_id,
+    GemmTune, Grouped, Kernel, MV_MAX_N, bf16_bits, force_gemm_diag, force_gemm_pf,
+    force_gemm_tune, force_grouped_tiles, force_kernel, glu_gemm_tile, leave_unread, mul_mat_id,
+    pick_grouped, plan_grouped, set_expert_mv_max, set_expert_mv_tile, skips, swiglu_id,
 };
 use crate::ggml::{Backend, ComputeAllocator, Context, Graph, Tensor, types};
 
@@ -50,11 +50,18 @@ pub struct Variant {
     /// The SwiGLU GEMM's parts left out ([`super::force_gemm_diag`], #1176 r35): what bounds
     /// it; wrong results. 0: the whole kernel.
     pub diag: i32,
+    /// The default's GEMM with its weights' L2 prefetch in runs of `pf` blocks
+    /// ([`super::force_gemm_pf`], #1176 r36): the same sums. 0: the kernel's own runs.
+    pub pf: i32,
 }
 
+/// The prefetch runs [`variants`] tries on each op's default GEMM.
+pub const PFS: [i32; 4] = [32, 16, 8, 4];
+
 /// The diagnostic SwiGLU GEMMs (#1176 r35, [`super::force_gemm_diag`]): the parts left out and
-/// their names. [`exact_diag`]: the same sums with another weight prefetch.
-pub const DIAGS: [(i32, &str); 13] = [
+/// their names. [`exact_diag`]: the same sums with another weight prefetch (the prefetch runs
+/// alone are [`Variant::pf`]).
+pub const DIAGS: [(i32, &str); 10] = [
     (1, "nodec"),
     (2, "nomma"),
     (3, "nomma+nodec"),
@@ -65,9 +72,6 @@ pub const DIAGS: [(i32, &str); 13] = [
     (25, "now+nox+nodec"),
     (64, "nok"),
     (2051, "pf32+nomma+nodec"),
-    (2048, "pf32"),
-    (256, "pf16"),
-    (512, "pf4"),
 ];
 
 /// A diagnostic GEMM (in [`DIAGS`]) that only prefetches otherwise: the default's sums.
@@ -83,6 +87,7 @@ impl Variant {
             && self.tune.is_none()
             && !self.exact
             && self.diag == 0
+            && self.pf == 0
     }
 
     /// The kernel family this variant runs on at `per` pairs per expert.
@@ -105,6 +110,9 @@ impl Variant {
         if self.diag != 0 {
             let d = DIAGS.iter().find(|d| d.0 == self.diag).map_or("?", |d| d.1);
             return format!("{op} diag {d}");
+        }
+        if self.pf != 0 {
+            return format!("{op} pf{}", self.pf);
         }
         match self.family {
             Family::Mv(nt) => return format!("{op} mv nt<={nt}"),
@@ -139,6 +147,11 @@ pub fn variants() -> Vec<Variant> {
         family,
         exact: false,
         diag: 0,
+        pf: 0,
+    };
+    let with_pf = |op, pf| Variant {
+        pf,
+        ..v(op, None, None, Family::Default)
     };
     let exact = |op| Variant {
         exact: true,
@@ -160,8 +173,10 @@ pub fn variants() -> Vec<Variant> {
         out.push(v(Op::Glu, None, None, Family::Mv(nt)));
     }
     out.extend(DIAGS.iter().map(|d| diag(d.0)));
+    out.extend(PFS.map(|p| with_pf(Op::Glu, p)));
     out.push(v(Op::Down, None, None, Family::Default));
     out.push(exact(Op::Down));
+    out.extend(PFS.map(|p| with_pf(Op::Down, p)));
     for (mi, nt) in [(1, 8), (1, 16), (2, 8), (2, 16)] {
         for t in TUNES {
             out.push(v(Op::Down, Some((mi, nt)), tune(t), Family::Default));
@@ -510,6 +525,7 @@ fn force(v: Option<&Variant>) {
     let glu_nt = tile.filter(|_| !down).map(|(_, nt)| nt);
     force_gemm_tune(v.and_then(|v| v.tune), glu_nt);
     force_gemm_diag(v.map_or(0, |v| v.diag));
+    force_gemm_pf(v.map_or(0, |v| v.pf));
 }
 
 /// Every variant at every chunk size and pool of `cfg` on `gpu`; the variants take turns within
