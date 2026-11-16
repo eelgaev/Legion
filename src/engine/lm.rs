@@ -8157,6 +8157,22 @@ impl Worker {
                 if let Some(d) = &mut self.depth {
                     d.record_drafts(&drafts.confidence, o.accepted);
                 }
+                // Per verified cycle (`RUST_LOG=spec_cycle=debug`): the drafts, the head's
+                // confidence for each as F32 bits (a function of the verify step's rows: equal
+                // bits, equal rows) and what the step kept.
+                if tracing::enabled!(target: "spec_cycle", tracing::Level::DEBUG) {
+                    let conf: Vec<u32> = drafts.confidence.iter().map(|c| c.to_bits()).collect();
+                    tracing::debug!(
+                        target: "spec_cycle",
+                        seq = ?seq.id,
+                        n_past = seq.n_past,
+                        drafts = ?drafts.tokens,
+                        conf = ?conf,
+                        accepted = o.accepted,
+                        kept = ?o.appended,
+                        "cycle"
+                    );
+                }
                 for (j, &t) in o.appended.iter().enumerate() {
                     seq.n_past += 1;
                     let row = StepRow::Picked(t, raw[j].take());
@@ -8357,7 +8373,19 @@ impl Worker {
                 // The next step reads about this step's span, and the prompts joining it.
                 d.set_context(draft_span);
                 let c = d.choose(&gains, k_max);
-                (c, d.confidence_floor(&gains, c, self.spec_config.p_min))
+                let floor = d.confidence_floor(&gains, c, self.spec_config.p_min);
+                // The policy's inputs per choice (`RUST_LOG=spec_cycle=debug`): with the
+                // drafts below, a draft count that differs between two runs shows whether the
+                // head's confidence or the measured costs moved.
+                tracing::debug!(
+                    target: "spec_cycle",
+                    depth = c,
+                    floor,
+                    pass_ms = d.pass_ms(gains.len()).unwrap_or(f64::NAN),
+                    step_ms = d.step_ms(gains.len() * (1 + c)).unwrap_or(f64::NAN),
+                    "choice"
+                );
+                (c, floor)
             });
             let chosen = chosen.map(|(c, p_min)| {
                 self.mtp_k = c;

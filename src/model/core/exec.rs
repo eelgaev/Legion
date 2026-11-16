@@ -2650,9 +2650,10 @@ impl Executor {
                 .expect("commit without Executor::enable_spec");
             let split = spec.split_commits(commits);
             let deferred = split.as_ref().map_or(commits, |(d, _)| d.as_slice());
-            // SAFETY: as below; the deferred graphs read the stage's pools only.
-            match unsafe { spec.commit_deferred(&mut s.backend, &mut s.commits, &s.rec, deferred) }
-            {
+            // SAFETY: as below; the deferred graphs read the stage's pools and (KDA's convs)
+            // the model's weights only.
+            let (backend, kept) = (&mut s.backend, &mut s.commits);
+            match unsafe { spec.commit_deferred(backend, kept, &s.rec, deferred, model) } {
                 Ok(true) => match split {
                     Some((_, rest)) if !rest.is_empty() => at_once = Some(rest),
                     _ => return Ok(()),
@@ -2721,13 +2722,14 @@ impl Executor {
     /// Runs every deferred commit's delta rule now (queued, waited for as a commit): before
     /// anything but a verify step of their slots reads or writes the states.
     fn flush_commits(&mut self) -> Result<(), GgmlError> {
+        let model = &self.model;
         for s in &mut self.stages {
             let Some(spec) = s.spec.as_ref().filter(|p| p.defers_any()) else {
                 continue;
             };
             self.commit_pending = true;
             // SAFETY: as in `commit`.
-            let res = unsafe { spec.flush(&mut s.backend, &mut s.commits, &s.rec) };
+            let res = unsafe { spec.flush(&mut s.backend, &mut s.commits, &s.rec, model) };
             if let Err(e) = res {
                 self.wait_commit();
                 return Err(e);

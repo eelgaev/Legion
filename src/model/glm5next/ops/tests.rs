@@ -780,13 +780,322 @@ fn small_mv_takes_the_debug_switch() {
 }
 
 #[test]
+fn kda_defer_takes_the_debug_switch() {
+    assert!(!kda_defer_of(None));
+    assert!(kda_defer_of(Some("1")));
+    assert!(kda_defer_of(Some(" 1\n")));
+    assert!(!kda_defer_of(Some("0")));
+    assert!(!kda_defer_of(Some("x")));
+}
+
+#[test]
+fn kda_conv_layers_takes_the_debug_switch() {
+    assert!(!kda_conv_layers_of(None));
+    assert!(kda_conv_layers_of(Some("1")));
+    assert!(kda_conv_layers_of(Some(" 1\n")));
+    assert!(!kda_conv_layers_of(Some("0")));
+}
+
+/// Every layer's stash convs in one node (#1172 r10): the conv states and stash rows of one
+/// [`kda_conv3_stash`] a layer.
+#[test]
+fn kda_conv3_stash_layers_matches_one_a_layer() {
+    let (c, h, n_tok, keep, n_layers) = (6i64, 2i64, 3i64, 2i64, 3usize);
+    let row = 3 * c + h;
+    // Per layer: x_q, w_q, state, x_k, w_k, x_v, w_v, gb, stash.
+    let shapes: [[i64; 3]; 9] = [
+        [c, n_tok, 1],
+        [4, 1, c],
+        [3, 3 * c, 1],
+        [c, n_tok, 1],
+        [4, 1, c],
+        [c, n_tok, 1],
+        [4, 1, c],
+        [c + h, n_tok, 1],
+        [row, n_tok, 1],
+    ];
+    let mut cpu = Backend::cpu().unwrap();
+    let data = Context::new(9 * n_layers + 4, 0);
+    let ts: Vec<Tensor<'_>> = (0..n_layers)
+        .flat_map(|_| shapes.map(|ne| data.new_tensor(types::F32, &ne)))
+        .collect();
+    let table = data.new_tensor(types::I64, &[(KDA_CONV_ROW * n_layers) as i64]);
+    data.alloc_tensors(cpu.buffer_type()).unwrap();
+    let reset = || {
+        for (i, t) in ts.iter().enumerate() {
+            let v = if i % 9 == 8 {
+                vec![0.0; t.elements()]
+            } else {
+                noise(t.elements(), 300 + i as u64)
+            };
+            t.set_f32(&v);
+        }
+    };
+    fn layer<'a>(ctx: &'a Context, s: &[Tensor<'a>], keep: i64) -> KdaConvLayer<'a> {
+        let kept = |t: Tensor<'a>| {
+            let (ne, nb) = (t.ne(), t.nb());
+            ctx.view_3d(t, [ne[0], keep, ne[2]], [nb[1], nb[2]], 0)
+        };
+        KdaConvLayer {
+            x: [kept(s[0]), kept(s[3]), kept(s[5])],
+            w: [s[1], s[4], s[6]],
+            state: s[2],
+            stash: [kept(s[7]), kept(s[8])],
+        }
+    }
+    // The conv states and stashes each way leaves.
+    fn run(
+        cpu: &mut Backend,
+        ctx: &Context,
+        outs: Vec<Tensor<'_>>,
+        ts: &[Tensor<'_>],
+    ) -> Vec<Vec<f32>> {
+        let mut graph = ctx.new_graph(32);
+        for t in outs {
+            graph.expand(t.as_output());
+        }
+        ctx.alloc_graph(&graph, ComputeAllocator::new(cpu.buffer_type()))
+            .unwrap();
+        cpu.compute(&graph).unwrap();
+        ts.iter()
+            .enumerate()
+            .filter(|(i, _)| matches!(i % 9, 2 | 8))
+            .map(|(_, t)| t.to_f32())
+            .collect()
+    }
+    let (one, all) = (Context::new(64, 64), Context::new(64, 64));
+    reset();
+    let outs = (0..n_layers)
+        .map(|il| {
+            let l = layer(&one, &ts[il * 9..][..9], keep);
+            kda_conv3_stash(&one, l.x, l.w, l.state, keep, l.stash)
+        })
+        .collect();
+    let want = run(&mut cpu, &one, outs, &ts);
+    reset();
+    let layers: Vec<KdaConvLayer<'_>> = (0..n_layers)
+        .map(|il| layer(&all, &ts[il * 9..][..9], keep))
+        .collect();
+    let offsets = kda_conv_layer_offsets(&layers).unwrap();
+    assert_eq!(offsets[..9], [0; 9]);
+    assert!(offsets[9..].iter().all(|&o| o != 0));
+    let bytes: Vec<u8> = offsets.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    table.set_bytes(&bytes);
+    let got = run(
+        &mut cpu,
+        &all,
+        vec![kda_conv3_stash_layers(&all, &layers, keep, table)],
+        &ts,
+    );
+    assert_eq!(got, want);
+    // Every layer's state moved and its stash filled.
+    reset();
+    for (i, v) in want.iter().enumerate() {
+        assert_ne!(*v, ts[(i / 2) * 9 + [2, 8][i % 2]].to_f32());
+    }
+}
+
+/// A deferred commit's convs (#1172 r9): the outputs and conv states of [`kda_conv3`], and each
+/// kept token's k and v outputs, decays and beta in its stash row.
+#[test]
+fn kda_conv3_stash_matches_kda_conv3_and_stashes_rows() {
+    let (c, h, n_tok, n_seqs, keep) = (6usize, 2usize, 3usize, 2usize, 2usize);
+    let xs: Vec<Vec<f32>> = (0..3).map(|j| noise(c * n_tok * n_seqs, 171 + j)).collect();
+    let ws: Vec<Vec<f32>> = (0..3).map(|j| noise(4 * c, 181 + j)).collect();
+    let st = noise(3 * 3 * c * n_seqs, 191);
+    let gb = noise((c + h) * n_tok * n_seqs, 192);
+    let x_ne = [c as i64, n_tok as i64, n_seqs as i64];
+    let w_ne = [4, 1, c as i64];
+    let st_ne = [3, 3 * c as i64, n_seqs as i64];
+    let gb_ne = [(c + h) as i64, n_tok as i64, n_seqs as i64];
+    let row = 3 * c + h;
+    let x_out_ne = [row as i64, n_tok as i64, n_seqs as i64];
+    let mut inputs: Vec<(&[i64], Data)> = Vec::new();
+    for j in 0..3 {
+        inputs.push((&x_ne[..], Data::F32(xs[j].clone())));
+        inputs.push((&w_ne[..], Data::F32(ws[j].clone())));
+    }
+    inputs.push((&st_ne[..], Data::F32(st.clone())));
+    inputs.push((&gb_ne[..], Data::F32(gb.clone())));
+    inputs.push((&x_out_ne[..], Data::F32(vec![0.0; row * n_tok * n_seqs])));
+    fn kept<'a>(ctx: &'a Context, t: Tensor<'a>, keep: i64) -> Tensor<'a> {
+        let (ne, nb) = (t.ne(), t.nb());
+        ctx.view_3d(t, [ne[0], keep, ne[2]], [nb[1], nb[2]], 0)
+    }
+    let n_keep = keep as i64;
+    let (want, want_st) = run_all(&inputs, |ctx, t| {
+        let x = [0, 2, 4].map(|i| kept(ctx, t[i], n_keep));
+        vec![kda_conv3(ctx, x, [t[1], t[3], t[5]], t[6], n_keep)]
+    });
+    let (got, got_st) = run_all(&inputs, |ctx, t| {
+        let x = [0, 2, 4].map(|i| kept(ctx, t[i], n_keep));
+        let stash = [kept(ctx, t[7], n_keep), kept(ctx, t[8], n_keep)];
+        vec![kda_conv3_stash(
+            ctx,
+            x,
+            [t[1], t[3], t[5]],
+            t[6],
+            n_keep,
+            stash,
+        )]
+    });
+    assert_eq!(got[0], want[0]);
+    assert_eq!(got_st[6], want_st[6]);
+    // y: [c, keep * n_seqs, 3]; the stash rows of the kept tokens, zeros after them.
+    let y = &want[0];
+    let n = keep * n_seqs;
+    for s in 0..n_seqs {
+        for t in 0..n_tok {
+            let r = &got_st[8][(s * n_tok + t) * row..][..row];
+            if t >= keep {
+                assert!(r.iter().all(|&v| v == 0.0));
+                continue;
+            }
+            let col = s * keep + t;
+            let g = &gb[(s * n_tok + t) * (c + h)..][..c + h];
+            assert_eq!(r[..c], y[(n + col) * c..][..c]);
+            assert_eq!(r[c..2 * c], y[(2 * n + col) * c..][..c]);
+            assert_eq!(r[2 * c..], g[..]);
+        }
+    }
+}
+
+/// The verify scan that runs each slot's deferred commit first (#1172 r9: its kept tokens from
+/// the stash, a count word per slot, 0 for none) leaves the outputs, stores and states of the
+/// commit's scan and then the verify scan; the flush and then the verify scan too.
+#[test]
+fn kda_scan_fold_matches_commit_then_verify() {
+    let (d, h, nt, keep) = (8i64, 2i64, 3i64, 2usize);
+    let (c, ns) = (d * h, 2i64);
+    let (cu, hu, du) = (c as usize, h as usize, d as usize);
+    let row = 3 * cu + hu;
+    let mut cpu = Backend::cpu().unwrap();
+    let data = Context::new(32, 0);
+    let f = |ne: &[i64]| data.new_tensor(types::F32, ne);
+    let [q, k, v, g] = [0; 4].map(|_| f(&[d, h, ns * nt]));
+    let beta = f(&[h, ns * nt]);
+    let st = f(&[d, d, h, ns]);
+    let x = f(&[row as i64, nt, ns]);
+    let (sg, sb) = (f(&[c, nt, ns]), f(&[h, nt, ns]));
+    // Slot 0's kept tokens as the commit's own scan takes them (q any: no state reads it).
+    let [kq, kk, kv, kg] = [0; 4].map(|_| f(&[d, h, keep as i64]));
+    let kb = f(&[h, keep as i64]);
+    let counts = data.new_tensor(types::I32, &[ns]);
+    data.alloc_tensors(cpu.buffer_type()).unwrap();
+    let st0 = noise(st.elements(), 201);
+    let mut xr = vec![0.0f32; x.elements()];
+    for (i, val) in noise(xr.len(), 202).into_iter().enumerate() {
+        let at = i % row;
+        xr[i] = if (2 * cu..3 * cu).contains(&at) {
+            -0.05 - 0.5 * val.abs()
+        } else if at >= 3 * cu {
+            0.5 + 0.4 * val
+        } else {
+            val
+        };
+    }
+    let kept = |lo: usize, w: usize| -> Vec<f32> {
+        (0..keep)
+            .flat_map(|t| xr[t * row + lo..][..w].to_vec())
+            .collect()
+    };
+    let reset = || {
+        for (i, t) in [q, k, v].into_iter().enumerate() {
+            t.set_f32(&noise(t.elements(), 210 + i as u64));
+        }
+        let gv: Vec<f32> = noise(g.elements(), 214)
+            .iter()
+            .map(|x| -0.05 - 0.5 * x.abs())
+            .collect();
+        g.set_f32(&gv);
+        let bv: Vec<f32> = noise(beta.elements(), 215)
+            .iter()
+            .map(|x| 0.5 + 0.4 * x)
+            .collect();
+        beta.set_f32(&bv);
+        st.set_f32(&st0);
+        x.set_f32(&xr);
+        sg.set_f32(&vec![0.0; sg.elements()]);
+        sb.set_f32(&vec![0.0; sb.elements()]);
+        kq.set_f32(&noise(kq.elements(), 216));
+        kk.set_f32(&kept(0, cu));
+        kv.set_f32(&kept(cu, cu));
+        kg.set_f32(&kept(2 * cu, cu));
+        kb.set_f32(&kept(3 * cu, hu));
+        counts.set_i32(&[keep as i32, 0]);
+    };
+    let deferred = KdaDeferred {
+        stash: x,
+        counts: (counts, 0),
+    };
+    // Each way's graph in order, from the same inputs: the verify outputs, then the states and
+    // the stores it leaves.
+    fn finish(
+        cpu: &mut Backend,
+        ctx: &Context,
+        outs: &[Tensor<'_>],
+        read: &[Tensor<'_>],
+    ) -> Vec<Vec<f32>> {
+        let mut graph = ctx.new_graph(32);
+        for &t in outs {
+            graph.expand(t.as_output());
+        }
+        ctx.alloc_graph(&graph, ComputeAllocator::new(cpu.buffer_type()))
+            .unwrap();
+        cpu.compute(&graph).unwrap();
+        let mut all = vec![outs.last().unwrap().to_f32()];
+        all.extend(read.iter().map(|t| t.to_f32()));
+        all
+    }
+    let store = [sg, sb];
+    let read = [st, sg, sb];
+    let ctxs: Vec<Context> = (0..4).map(|_| Context::new(32, 32)).collect();
+    reset();
+    let want = {
+        let ctx = &ctxs[0];
+        let nb = st.nb();
+        let s0 = ctx.view_4d(st, [d, d, h, 1], [nb[1], nb[2], nb[3]], 0);
+        let commit = kda_scan(ctx, kq, kk, kv, kg, kb, s0, keep as i64);
+        let o = kda_scan_verify(ctx, q, k, v, g, beta, st, nt, store);
+        finish(&mut cpu, ctx, &[commit, o], &read)
+    };
+    reset();
+    let fold = {
+        let ctx = &ctxs[1];
+        let o = kda_scan_verify_replay(ctx, q, k, v, g, beta, st, nt, store, deferred);
+        finish(&mut cpu, ctx, &[o], &read)
+    };
+    reset();
+    let flush = {
+        let ctx = &ctxs[2];
+        let f = kda_flush(ctx, st, deferred);
+        let o = kda_scan_verify(ctx, q, k, v, g, beta, st, nt, store);
+        finish(&mut cpu, ctx, &[f, o], &read)
+    };
+    assert_eq!(fold, want);
+    assert_eq!(flush, want);
+    // The commit did move slot 0's state, and only slot 0's.
+    reset();
+    let plain = {
+        let ctx = &ctxs[3];
+        let o = kda_scan_verify(ctx, q, k, v, g, beta, st, nt, store);
+        finish(&mut cpu, ctx, &[o], &read)
+    };
+    let half = du * du * hu;
+    assert_ne!(want[1][..half], plain[1][..half]);
+    assert_eq!(want[1][half..], plain[1][half..]);
+}
+
+#[test]
 fn kda_split_takes_the_debug_switch() {
     assert_eq!(kda_split_of(None), KDA_SPLIT_DEFAULT);
-    assert_eq!(KDA_SPLIT_DEFAULT, 2);
+    assert_eq!(KDA_SPLIT_DEFAULT, 3);
     assert_eq!(kda_split_of(Some(" 0\n")), 0);
     assert_eq!(kda_split_of(Some("1")), 1);
     assert_eq!(kda_split_of(Some("2")), 2);
-    assert_eq!(kda_split_of(Some("3")), KDA_SPLIT_DEFAULT);
+    assert_eq!(kda_split_of(Some("3")), 3);
+    assert_eq!(kda_split_of(Some("4")), 4);
+    assert_eq!(kda_split_of(Some("5")), KDA_SPLIT_DEFAULT);
     assert_eq!(kda_split_of(Some("x")), KDA_SPLIT_DEFAULT);
 }
 

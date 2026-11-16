@@ -71,10 +71,13 @@ pub struct LinBenchArgs {
     /// Time GLM-5.3-Flash Maya-S's KDA scans at decode instead (#1172 r8): a commit's scan and a
     /// verify group's over 34 layers' states, each `LEGION_DEBUG_GLM_KDA_SPLIT` mode of
     /// `--kda-modes` at `--gemv-tokens` (1-8), in GB/s of state; fails when an output, state or
-    /// stored value's bits differ from the first mode's. `--shapes` takes `commit` and `verify`.
+    /// stored value's bits differ from the first mode's. `--shapes` takes `commit` and `verify`,
+    /// and `fold` (#1172 r9): a commit of 1-3 kept tokens (`--gemv-tokens`) and the next verify
+    /// step's scan of 3, as before r9, folded into one pass over the states, and flushed; fails
+    /// when a value's bits differ from the first way's.
     #[arg(long)]
     kda: bool,
-    /// `LEGION_DEBUG_GLM_KDA_SPLIT` modes for `--kda` (0-2: 1, 2 or 4 blocks a head), comma
+    /// `LEGION_DEBUG_GLM_KDA_SPLIT` modes for `--kda` (0-4: 1, 2, 4, 8 or 16 blocks a head), comma
     /// separated.
     #[arg(long, value_delimiter = ',', default_values_t = [0u8, 1, 2])]
     kda_modes: Vec<u8>,
@@ -418,6 +421,32 @@ fn kda(gpu: &mut legion::ggml::Backend, args: &LinBenchArgs) -> anyhow::Result<(
                     name,
                     n,
                     r.mode,
+                    r.ms * 1e3,
+                    bytes / r.ms / 1e6,
+                    r.ms / t[0].ms,
+                    r.differ
+                );
+                differ += r.differ;
+            }
+        }
+    }
+    if args.shapes.is_empty() || args.shapes.iter().any(|s| s == "fold") {
+        // #1172 r9: a commit of `keep` tokens and the next verify step's scan, each way.
+        println!(
+            "\n{:<13} {:>4} {:>10} {:>7} {:>8} {:>7}",
+            "fold", "keep", "us/layer", "GB/s", "vs 1st", "differ"
+        );
+        for &keep in &args.gemv_tokens {
+            if !(1..=lin_bench::KDA_FOLD_VERIFY).contains(&keep) {
+                continue;
+            }
+            let t = lin_bench::kda_fold_ms(gpu, keep, args.reps, args.rounds);
+            for r in &t {
+                let bytes = lin_bench::kda_fold_bytes(r.mode as usize);
+                println!(
+                    "{:<13} {:>4} {:>10.2} {:>7.1} {:>8.3} {:>7}",
+                    lin_bench::KDA_FOLD_MODES[r.mode as usize],
+                    keep,
                     r.ms * 1e3,
                     bytes / r.ms / 1e6,
                     r.ms / t[0].ms,
