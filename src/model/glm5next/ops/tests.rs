@@ -667,7 +667,7 @@ fn kda_scan_verify_and_replay_match_decoding() {
     assert_eq!(got[5], want[5]);
 }
 
-/// The KDA conv and scan nodes carry the GB10 kernel switch ([`set_gb10_linear`]) as their last
+/// The KDA conv and scan nodes carry the GB10 kernel switch ([`set_gb10_linear`]) as a
 /// parameter, which the CUDA launcher reads to take the prompt kernels (#571); the CPU
 /// references ignore it.
 #[test]
@@ -691,12 +691,13 @@ fn kda_nodes_carry_the_gb10_switch() {
                 crate::ggml::external_params(&*scan.raw()),
             )
         };
-        (pc[3], ps[2])
+        (pc[3], ps[2], ps[3])
     };
     let on = flags(true);
     let off = flags(false);
-    assert_eq!(on, (1, 1));
-    assert_eq!(off, (0, 0));
+    // The scan's split (#1172 r8) only with the GB10 kernels (and their GEMVs, on by default).
+    assert_eq!(on, (1, 1, kda_split() as i32));
+    assert_eq!(off, (0, 0, 0));
 }
 
 #[test]
@@ -758,7 +759,8 @@ fn bf16_gemv_takes_the_debug_switch() {
 fn q6k_mv_takes_the_debug_switch() {
     assert_eq!(q6k_mv_of(None), Q6K_MV_DEFAULT);
     assert_eq!(q6k_mv_of(Some(" 7\n")), 7);
-    assert_eq!(q6k_mv_of(Some("8")), 0);
+    assert_eq!(q6k_mv_of(Some("8")), 8);
+    assert_eq!(q6k_mv_of(Some("128")), 0);
     assert_eq!(q6k_mv_of(Some("x")), Q6K_MV_DEFAULT);
 }
 
@@ -775,6 +777,17 @@ fn small_mv_takes_the_debug_switch() {
         SMALL_MV_TRIG | SMALL_MV_SP | SMALL_MV_MOE
     );
     assert_eq!(small_mv_of(Some("x")), SMALL_MV_DEFAULT);
+}
+
+#[test]
+fn kda_split_takes_the_debug_switch() {
+    assert_eq!(kda_split_of(None), KDA_SPLIT_DEFAULT);
+    assert_eq!(KDA_SPLIT_DEFAULT, 2);
+    assert_eq!(kda_split_of(Some(" 0\n")), 0);
+    assert_eq!(kda_split_of(Some("1")), 1);
+    assert_eq!(kda_split_of(Some("2")), 2);
+    assert_eq!(kda_split_of(Some("3")), KDA_SPLIT_DEFAULT);
+    assert_eq!(kda_split_of(Some("x")), KDA_SPLIT_DEFAULT);
 }
 
 #[test]
@@ -821,6 +834,12 @@ fn q6k_mv_param_makes_whole_stages_of_contiguous_rows() {
     assert_eq!(q6k_mv_param(0x07, 256, 512, nb1(256)), 8 | 1 << 8 | 1 << 9);
     // m no multiple of the rows a warp
     assert_eq!(q6k_mv_param(1, 256, 12, nb1(256)), 0);
+    // bit 3: the output head (32,768+ rows of whole stages) on rw, 2^(bits 4-6) rows a warp
+    assert_eq!(q6k_mv_param(9, 4096, 154880, nb1(4096)), 1);
+    assert_eq!(q6k_mv_param(0x2B, 4096, 154880, nb1(4096)), 4 | 1 << 8);
+    assert_eq!(q6k_mv_param(0x19, 4096, 66067, nb1(4096)), 0);
+    assert_eq!(q6k_mv_param(9, 4096, 66067, nb1(4096)), 1);
+    assert_eq!(q6k_mv_param(9, 4096, 16384, nb1(4096)), 0);
 }
 
 #[test]

@@ -68,6 +68,16 @@ pub struct LinBenchArgs {
     /// `LEGION_DEBUG_GLM_SMALL_MV` modes for `--small`, comma separated.
     #[arg(long, value_delimiter = ',', default_values_t = [0u8, 7])]
     small_modes: Vec<u8>,
+    /// Time GLM-5.3-Flash Maya-S's KDA scans at decode instead (#1172 r8): a commit's scan and a
+    /// verify group's over 34 layers' states, each `LEGION_DEBUG_GLM_KDA_SPLIT` mode of
+    /// `--kda-modes` at `--gemv-tokens` (1-8), in GB/s of state; fails when an output, state or
+    /// stored value's bits differ from the first mode's. `--shapes` takes `commit` and `verify`.
+    #[arg(long)]
+    kda: bool,
+    /// `LEGION_DEBUG_GLM_KDA_SPLIT` modes for `--kda` (0-2: 1, 2 or 4 blocks a head), comma
+    /// separated.
+    #[arg(long, value_delimiter = ',', default_values_t = [0u8, 1, 2])]
+    kda_modes: Vec<u8>,
 }
 
 #[cfg(feature = "cuda")]
@@ -90,6 +100,9 @@ pub fn run(args: LinBenchArgs) -> anyhow::Result<()> {
     }
     if args.small {
         return small(&mut gpu, &args);
+    }
+    if args.kda {
+        return kda(&mut gpu, &args);
     }
     println!(
         "{:<11} {:>6} {:>6} {:>6} {:>3} {:>6} {:>8} {:>9} {:>7} {:>8} {:>18}",
@@ -375,6 +388,47 @@ fn small(gpu: &mut legion::ggml::Backend, args: &LinBenchArgs) -> anyhow::Result
     set_small_mv(default);
     if differ > 0 {
         anyhow::bail!("{differ} output values differ from the first mode's bits");
+    }
+    Ok(())
+}
+
+/// `--kda`: [`legion::model::glm5next::ops::lin_bench::kda_ms`] per scan and token count.
+#[cfg(feature = "cuda")]
+fn kda(gpu: &mut legion::ggml::Backend, args: &LinBenchArgs) -> anyhow::Result<()> {
+    use legion::model::glm5next::ops::lin_bench;
+    println!(
+        "{:<7} {:>6} {:>5} {:>9} {:>7} {:>8} {:>7}",
+        "scan", "tokens", "mode", "us/scan", "GB/s", "vs 1st", "differ"
+    );
+    let mut differ = 0;
+    for name in lin_bench::KDA_SHAPES {
+        if !args.shapes.is_empty() && !args.shapes.iter().any(|s| s == name) {
+            continue;
+        }
+        for &n in &args.gemv_tokens {
+            anyhow::ensure!(
+                (1..=8).contains(&n),
+                "--gemv-tokens {n}: the decode scans take 1-8 tokens"
+            );
+            let t = lin_bench::kda_ms(gpu, name, n, args.reps, args.rounds, &args.kda_modes);
+            let bytes = lin_bench::kda_bytes(name);
+            for r in &t {
+                println!(
+                    "{:<7} {:>6} {:>5} {:>9.2} {:>7.1} {:>8.3} {:>7}",
+                    name,
+                    n,
+                    r.mode,
+                    r.ms * 1e3,
+                    bytes / r.ms / 1e6,
+                    r.ms / t[0].ms,
+                    r.differ
+                );
+                differ += r.differ;
+            }
+        }
+    }
+    if differ > 0 {
+        anyhow::bail!("{differ} values differ from the first mode's bits");
     }
     Ok(())
 }
