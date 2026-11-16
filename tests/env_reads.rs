@@ -17,6 +17,11 @@ const ALLOWED: &[(&str, &str)] = &[
         "src/model/core/expert_mv/dump.rs",
         "LEGION_DEBUG_EXPERT_DUMP",
     ),
+    (
+        "src/model/core/exec/tp_lead.rs",
+        "LEGION_DEBUG_TP_DEVICE_ROWS",
+    ),
+    ("src/model/core/exec/tp_lead.rs", "LEGION_DEBUG_TP_ROW_HINT"),
     ("src/model/moe_ffn/tests.rs", "LEGION_MOE_SPEED_TYPES"),
     ("src/model/nvfp4_mm.rs", "LEGION_DEBUG_NVFP4_PF32"),
     ("src/model/qwen4.rs", "LEGION_DEBUG_QWEN4_QSA_SHARE"),

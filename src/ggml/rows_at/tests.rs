@@ -84,3 +84,21 @@ fn a_slice_past_the_rows_panics() {
     ctx.alloc_tensors(backend.buffer_type()).unwrap();
     let _ = t.rows_at().unwrap().slice(4, 2);
 }
+
+/// A slice knows the row of its matrix it starts at; rows of another matrix do not.
+#[test]
+fn a_slice_finds_its_first_row() {
+    let backend = Backend::cpu().unwrap();
+    let ctx = Context::new(2, 0);
+    let a = ctx.new_tensor(types::F32, &[3, 5]);
+    let b = ctx.new_tensor(types::F32, &[3, 5]);
+    ctx.alloc_tensors(backend.buffer_type()).unwrap();
+    let (a, b) = (a.rows_at().unwrap(), b.rows_at().unwrap());
+    assert_eq!(a.slice(0, 5).first_row_in(&a), Some(0));
+    assert_eq!(a.slice(2, 3).first_row_in(&a), Some(2));
+    assert_eq!(a.slice(4, 0).first_row_in(&a), Some(4));
+    // Not within it, or not a slice of it.
+    assert_eq!(a.first_row_in(&a.slice(1, 2)), None);
+    assert_eq!(a.slice(1, 2).first_row_in(&a.slice(2, 3)), None);
+    assert_eq!(b.slice(0, 1).first_row_in(&a), None);
+}

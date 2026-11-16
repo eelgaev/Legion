@@ -68,6 +68,7 @@ fn requests_round_trip() {
             taper: 3,
             gather_budget: u64::MAX - 1,
             head: 2,
+            rows_dev: 4_536,
         },
         Request::SaveRing {
             ring: 4,
@@ -135,6 +136,21 @@ fn requests_round_trip() {
                 RowsPart::Sent { len: 0 },
             ],
             h: vec![1.5, -0.0],
+        },
+        Request::TpMtpRows {
+            groups: match step() {
+                Request::Step { groups, .. } => groups,
+                _ => unreachable!(),
+            },
+            gather_budget: 0,
+            parts: vec![
+                RowsPart::Sent { len: 2 },
+                RowsPart::Device {
+                    start: 1_023,
+                    rows: 1 << 34,
+                },
+            ],
+            h: vec![-3.5, 2.0],
         },
         Request::Draft {
             reqs: vec![

@@ -65,3 +65,20 @@ fn mtp_rows_whose_bits_differ_from_rank_0s_fail() {
     let e = rows_of(&[step(0, 0, 0, 3, theirs)], &[], &steps).unwrap_err();
     assert!(e.contains("differ from rank 0's"), "{e}");
 }
+
+#[test]
+fn a_take_ins_device_rows_are_its_last_part_only() {
+    let dev = RowsPart::Device { start: 7, rows: 3 };
+    let parts = [RowsPart::Sent { len: 2 }, dev];
+    let (before, on) = split_device(&parts).unwrap();
+    assert_eq!(before, &parts[..1]);
+    assert_eq!(on, Some((7, 3)));
+    // None: all parts go to `rows_of`.
+    let host = [RowsPart::Sent { len: 2 }, step(0, 0, 0, 1, 0)];
+    assert_eq!(split_device(&host).unwrap(), (&host[..], None));
+    assert_eq!(split_device(&[]).unwrap(), (&[][..], None));
+    // Anywhere but last, `rows_of` refuses it.
+    let steps = [vec![vec![0.0f32; 4]], vec![]];
+    let e = rows_of(&[dev, RowsPart::Sent { len: 0 }], &[], &steps).unwrap_err();
+    assert!(e.contains("last part"), "{e}");
+}
