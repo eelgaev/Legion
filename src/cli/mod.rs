@@ -25,6 +25,7 @@ mod logging;
 mod mla_bench;
 mod mmq_ids_bench;
 mod model_path;
+mod nvfp4_a4_bench;
 mod nvfp4_gemm_bench;
 mod nvfp4_mv_bench;
 mod nvfp4_mvq_bench;
@@ -129,6 +130,10 @@ enum Command {
     /// Check and time the NVFP4 prefill expert GEMM's tiles and stages (development).
     #[command(hide = true)]
     Nvfp4GemmBench(nvfp4_gemm_bench::Nvfp4GemmBenchArgs),
+    /// Check and time the dense W4A4 NVFP4 GEMM's TMA-fed tiles at prefill shapes
+    /// (development).
+    #[command(hide = true)]
+    Nvfp4A4Bench(nvfp4_a4_bench::Nvfp4A4BenchArgs),
     /// Check and time the gated DeltaNet decode kernel against ggml's (development).
     #[command(hide = true)]
     GdnBench(gdn_bench::GdnBenchArgs),
@@ -269,6 +274,7 @@ async fn run(cli: Cli, numa: Option<legion::hw::numa_bind::Placement>) -> anyhow
         Command::MmqIdsBench(args) => mmq_ids_bench::run(args),
         Command::Nvfp4MvBench(args) => nvfp4_mv_bench::run(args),
         Command::Nvfp4GemmBench(args) => nvfp4_gemm_bench::run(args),
+        Command::Nvfp4A4Bench(args) => nvfp4_a4_bench::run(args),
         Command::GdnBench(args) => gdn_bench::run(args),
         Command::DenseMvBench(args) => dense_mv_bench::run(args),
         Command::Q8MvBench(args) => q8_mv_bench::run(args),
