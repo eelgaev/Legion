@@ -738,6 +738,44 @@ unsafe extern "C" {
     fn legion_paged_attn_vsplit_launches() -> i64;
     fn legion_paged_attn_set_qm(on: i32, this_thread: i32);
     fn legion_paged_attn_qm_launches() -> i64;
+    fn legion_paged_attn_set_d512_pair(on: i32, this_thread: i32);
+    fn legion_paged_attn_d512_pair_launches() -> i64;
+}
+
+/// Prefill groups with heads of 512 and 8 query heads a kv head (Gemma 4's global layers) on
+/// sm_80+ through the kernel that splits each query column's output over a warp pair
+/// (`src/cuda/sm80/paged_attn_pair.cuh`, #1181), or (`false`, the default) through
+/// `paged_prefill_mma` as before. The same bits either way. For every thread.
+pub fn set_d512_pair(on: bool) {
+    #[cfg(feature = "cuda")]
+    // SAFETY: sets a flag the launches read.
+    unsafe {
+        legion_paged_attn_set_d512_pair(i32::from(on), 0)
+    };
+    #[cfg(not(feature = "cuda"))]
+    let _ = on;
+}
+
+/// [`set_d512_pair`] for launches from the calling thread only (benches); `None` follows the
+/// setting for every thread again.
+pub fn set_d512_pair_here(on: Option<bool>) {
+    #[cfg(feature = "cuda")]
+    // SAFETY: sets a thread-local flag the launches read.
+    unsafe {
+        legion_paged_attn_set_d512_pair(on.map_or(-1, i32::from), 1)
+    };
+    #[cfg(not(feature = "cuda"))]
+    let _ = on;
+}
+
+/// Launches of the warp-pair kernel ([`set_d512_pair`]) from the calling thread so far (0
+/// without CUDA).
+pub fn d512_pair_launches() -> i64 {
+    #[cfg(feature = "cuda")]
+    // SAFETY: reads a thread-local counter.
+    return unsafe { legion_paged_attn_d512_pair_launches() };
+    #[cfg(not(feature = "cuda"))]
+    0
 }
 
 /// Prefill groups with heads of 256 on compute capability 12.x devices (a DGX Spark's GB10, RTX

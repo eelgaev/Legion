@@ -13,6 +13,9 @@ thread_local int64_t t_vsplit_launches = 0;
 int g_qm = 1;
 thread_local int t_qm = -1;
 thread_local int64_t t_qm_launches = 0;
+int g_d512_pair = 0;
+thread_local int t_d512_pair = -1;
+thread_local int64_t t_d512_pair_launches = 0;
 
 }  // namespace legion_paged
 
@@ -155,6 +158,18 @@ void legion_paged_attn_set_qm(int on, int this_thread) {
         legion_paged::t_qm = on;
     } else {
         __atomic_store_n(&legion_paged::g_qm, on, __ATOMIC_RELAXED);
+    }
+}
+
+int64_t legion_paged_attn_d512_pair_launches(void) {
+    return t_d512_pair_launches;
+}
+
+void legion_paged_attn_set_d512_pair(int on, int this_thread) {
+    if (this_thread > 0) {
+        legion_paged::t_d512_pair = on;
+    } else {
+        __atomic_store_n(&legion_paged::g_d512_pair, on, __ATOMIC_RELAXED);
     }
 }
 

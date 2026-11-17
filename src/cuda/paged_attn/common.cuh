@@ -156,6 +156,15 @@ void legion_paged_attn_set_qm(int on, int this_thread);
 // Launches of the queries-as-M kernel from the calling thread so far.
 int64_t legion_paged_attn_qm_launches(void);
 
+// Whether prefill groups with heads of 512 and 8 query heads a kv head (Gemma 4's global layers)
+// on sm_80+ take paged_prefill_pair (sm80/paged_attn_pair.cuh, #1181, the same bits as
+// paged_prefill_mma): `on` 1 or 0 (the default), for all threads (`this_thread` 0) or for the
+// calling thread only (`this_thread` 1, benches; -1 ends it).
+void legion_paged_attn_set_d512_pair(int on, int this_thread);
+
+// Launches of paged_prefill_pair from the calling thread so far.
+int64_t legion_paged_attn_d512_pair_launches(void);
+
 // Whether prefill launches on the current device take the WMMA kernel, which a split scratch
 // (legion_paged_attn::split) replaces for the last token's rows: sm_70 / sm_75 without the
 // m8n8k4 opt-in.
@@ -186,6 +195,9 @@ extern thread_local int64_t t_vsplit_launches;
 extern int g_qm;
 extern thread_local int t_qm;
 extern thread_local int64_t t_qm_launches;
+extern int g_d512_pair;
+extern thread_local int t_d512_pair;
+extern thread_local int64_t t_d512_pair_launches;
 }  // namespace legion_paged
 
 namespace {
@@ -199,11 +211,18 @@ using legion_paged::t_m884_launches;
 using legion_paged::t_ffma_launches;
 using legion_paged::t_vsplit_launches;
 using legion_paged::t_qm_launches;
+using legion_paged::t_d512_pair_launches;
 
 // The queries-as-M prefill kernel's mode for the calling thread (legion_paged_attn_set_qm): 0
 // off, 1 on where it takes the op, 2+ (benches) on for every group it covers.
 int qm_mode() {
     return legion_paged::t_qm >= 0 ? legion_paged::t_qm : __atomic_load_n(&legion_paged::g_qm, __ATOMIC_RELAXED);
+}
+
+// Whether heads of 512 take the warp-pair kernel (legion_paged_attn_set_d512_pair).
+bool d512_pair() {
+    const int t = legion_paged::t_d512_pair;
+    return (t >= 0 ? t : __atomic_load_n(&legion_paged::g_d512_pair, __ATOMIC_RELAXED)) > 0;
 }
 
 // Whether the current device is sm_70 (cached per device).
@@ -851,6 +870,10 @@ __global__ void __launch_bounds__(256) paged_prefill(const legion_paged_attn p) 
 // Prefill on compute capability 12.x, queries as the MMA's M: namespace fa_qm (#1133).
 #include "../sm80/paged_attn_qm.cuh"
 
+// Prefill on sm_80+ for heads of 512, each column's output over a warp pair: namespace fa_pair
+// (#1181).
+#include "../sm80/paged_attn_pair.cuh"
+
 // Prefill on sm_70 (Volta): mma.sync m8n8k4, namespace v70.
 #include "../sm70/paged_attn.cuh"
 
@@ -890,6 +913,15 @@ int launch(const legion_paged_attn & p, cudaStream_t st) {
         if constexpr (D == 256 && !C) {
             if (fa_qm::takes<D, G>(p)) {
                 if (const int rc = fa_qm::launch<D, G>(p, st); rc >= 0) {
+                    return rc;
+                }
+            }
+        }
+        // Heads of 512, 8 query heads a kv head (Gemma 4's global layers): each column's output
+        // over a warp pair where opted in (#1181), the same bits.
+        if constexpr (D == 512 && G == 8 && !C) {
+            if (d512_pair()) {
+                if (const int rc = fa_pair::launch<D, G>(p, st); rc >= 0) {
                     return rc;
                 }
             }

@@ -562,6 +562,15 @@ impl Model {
         layers: std::ops::Range<usize>,
     ) -> Result<(Tensor<'a>, Vec<(usize, Tensor<'a>)>), ModelError> {
         let (ctx, tap, n) = (pass.ctx, &pass.tap, pass.n);
+        // LEGION_DEBUG_PAGED_D512_PAIR=1 (#1181): the global layers' prompt attention splits each
+        // query column's output over a warp pair (`paged::set_d512_pair`), the same bits; read
+        // once.
+        static D512_PAIR: std::sync::Once = std::sync::Once::new();
+        D512_PAIR.call_once(|| {
+            if std::env::var("LEGION_DEBUG_PAGED_D512_PAIR").is_ok_and(|v| v == "1") {
+                crate::model::core::paged::set_d512_pair(true);
+            }
+        });
         let hp = &self.hp;
         let eps = hp.rms_eps;
         let norm = |t: Tensor<'a>, il: usize, name: &str| -> Result<Tensor<'a>, ModelError> {
