@@ -156,6 +156,12 @@ void legion_paged_attn_set_qm(int on, int this_thread);
 // Launches of the queries-as-M kernel from the calling thread so far.
 int64_t legion_paged_attn_qm_launches(void);
 
+// Whether prefill groups with heads of 512 and 8 query heads a kv head (Gemma 4's global layers)
+// on paged_prefill_mma read Q's fragments again for each K chunk (#1181, the same bits): `on` 1
+// or 0 (the default), for all threads (`this_thread` 0) or for the calling thread only
+// (`this_thread` 1, benches; -1 ends it).
+void legion_paged_attn_set_q_reload(int on, int this_thread);
+
 // Whether prefill launches on the current device take the WMMA kernel, which a split scratch
 // (legion_paged_attn::split) replaces for the last token's rows: sm_70 / sm_75 without the
 // m8n8k4 opt-in.
@@ -186,6 +192,8 @@ extern thread_local int64_t t_vsplit_launches;
 extern int g_qm;
 extern thread_local int t_qm;
 extern thread_local int64_t t_qm_launches;
+extern int g_q_reload;
+extern thread_local int t_q_reload;
 }  // namespace legion_paged
 
 namespace {
@@ -204,6 +212,12 @@ using legion_paged::t_qm_launches;
 // off, 1 on where it takes the op, 2+ (benches) on for every group it covers.
 int qm_mode() {
     return legion_paged::t_qm >= 0 ? legion_paged::t_qm : __atomic_load_n(&legion_paged::g_qm, __ATOMIC_RELAXED);
+}
+
+// Whether paged_prefill_mma reads Q again for each K chunk (legion_paged_attn_set_q_reload).
+bool q_reload() {
+    const int t = legion_paged::t_q_reload;
+    return (t >= 0 ? t : __atomic_load_n(&legion_paged::g_q_reload, __ATOMIC_RELAXED)) > 0;
 }
 
 // Whether the current device is sm_70 (cached per device).
@@ -892,6 +906,13 @@ int launch(const legion_paged_attn & p, cudaStream_t st) {
                 if (const int rc = fa_qm::launch<D, G>(p, st); rc >= 0) {
                     return rc;
                 }
+            }
+        }
+        // Heads of 512, 8 query heads a kv head (Gemma 4's global layers): Q read again for
+        // each K chunk where opted in (#1181), the same bits.
+        if constexpr (D == 512 && G == 8 && !C) {
+            if (q_reload()) {
+                return fa::launch<D, G, C, true>(p, st);
             }
         }
         return fa::launch<D, G, C>(p, st);
