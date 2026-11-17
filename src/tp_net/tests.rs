@@ -796,3 +796,40 @@ fn ffn_rows_prefer_whole_granules() {
     assert_eq!(shard::ffn_rows(96, 32, 2, 1).unwrap(), (32, 64));
     assert!(shard::ffn_rows(32, 32, 2, 0).is_err());
 }
+
+#[test]
+fn small_exchanges_go_in_halves_over_both_rails() {
+    let min = comm::halves_min_of(None);
+    assert_eq!(min, 128 << 10);
+    assert_eq!(comm::halves_min_of(Some("")), min);
+    assert_eq!(comm::halves_min_of(Some("x")), min);
+    assert_eq!(comm::halves_min_of(Some("0")), 0);
+    assert_eq!(comm::halves_min_of(Some(" 65536 ")), 65536);
+    // A 16-user decode sum (48 tokens of 2,560 F32 values): two 64-byte aligned halves, one
+    // write a rail.
+    let len = 48 * 2560 * 4;
+    let (chunk, depth) = comm::rail_pieces(len, min).unwrap();
+    assert_eq!((chunk, depth), (len / 2, 1));
+    assert_eq!(len.div_ceil(chunk), 2);
+    // An odd size: the first half rounded up to 64 bytes, still two pieces.
+    let (chunk, _) = comm::rail_pieces(min + 4, min).unwrap();
+    assert_eq!(chunk % 64, 0);
+    assert_eq!((min + 4).div_ceil(chunk), 2);
+    // Smaller ones, and every one with the halves off, as before: one write on the first rail.
+    assert_eq!(comm::rail_pieces(min - 4, min), None);
+    assert_eq!(comm::rail_pieces(len, 0), None);
+    // From 1 MiB, 1 MiB pieces as before, whatever the switch.
+    for m in [0, min] {
+        assert_eq!(comm::rail_pieces(1 << 20, m), Some((1 << 20, 4)));
+        assert_eq!(comm::rail_pieces(5 << 20, m), Some((1 << 20, 4)));
+    }
+}
+
+#[test]
+fn the_send_kernel_is_on_unless_0() {
+    assert!(op::send_kernel_of(None));
+    assert!(op::send_kernel_of(Some("")));
+    assert!(op::send_kernel_of(Some("1")));
+    assert!(!op::send_kernel_of(Some("0")));
+    assert!(!op::send_kernel_of(Some(" 0\n")));
+}

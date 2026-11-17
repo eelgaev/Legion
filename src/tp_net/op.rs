@@ -48,6 +48,17 @@ unsafe fn cpu_all_reduce(dst: &ffi::ggml_tensor, ith: usize, _nth: usize) {
     }
 }
 
+/// Whether the CUDA exchanges copy an F32 partial into the pinned send buffer with the copy
+/// kernel (the values' bits as 16-bit words, the BF16 all-gather's kernel) rather than
+/// `cudaMemcpyAsync`, for a `LEGION_DEBUG_TP_SEND_KERNEL` value (#1176): "0" the copy (as
+/// before), anything else (or unset) the kernel. The same bytes either way. On a GB10 a 16-user
+/// decode sum's ~480 KiB took ~12 us on the copy engine and the sum after it waited ~22 us at
+/// the least; by the kernel ~4 us and ~6 us.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(super) fn send_kernel_of(v: Option<&str>) -> bool {
+    v.is_none_or(|s| s.trim() != "0")
+}
+
 #[cfg(feature = "cuda")]
 pub(super) mod cuda {
     use std::os::raw::{c_int, c_uint, c_void};
@@ -614,6 +625,15 @@ pub(super) mod cuda {
         unsafe { launch_1d(legion_tp_net_pack_bf16_kernel, &mut argv, n, stream) }
     }
 
+    /// Whether an F32 exchange's partial goes into the send buffer by the copy kernel instead
+    /// of `cudaMemcpyAsync` (`LEGION_DEBUG_TP_SEND_KERNEL`, see [`super::send_kernel_of`]).
+    fn send_kernel() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            super::send_kernel_of(std::env::var("LEGION_DEBUG_TP_SEND_KERNEL").ok().as_deref())
+        })
+    }
+
     /// Whether a whole-source exchange's send buffer can be filled a rank's piece at a time:
     /// the pieces are the source's values, each once, in rank order.
     fn own_last(plan: &Plan) -> bool {
@@ -797,6 +817,16 @@ pub(super) mod cuda {
                         .collect(),
                 };
                 for (i, c) in copies {
+                    if send_kernel() {
+                        // The F32 values' bits as twice as many 16-bit words.
+                        copy_bf16(
+                            (src + i * 4) as u64,
+                            (dd + (send + i * eb) as u64) as usize,
+                            2 * c,
+                            stream,
+                        )?;
+                        continue;
+                    }
                     check(
                         "cudaMemcpyAsync",
                         cudaMemcpyAsync(
