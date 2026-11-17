@@ -122,7 +122,14 @@ fn d512_pair_for(
     compact: bool,
     max_split: i32,
 ) -> i32 {
-    if d != 512 || n_head != 8 * n_head_kv || compact || n_tok < 2 || max_split > 1 {
+    if d != 512 || n_head != 8 * n_head_kv || compact || max_split > 1 {
+        return 0;
+    }
+    // Measurement kernels (#1181 r16, benches only) for every group.
+    if let Some(m) = PAIR_HERE.with(|c| c.get()).filter(|&m| m > 1) {
+        return m;
+    }
+    if n_tok < 2 {
         return 0;
     }
     let on = D512_PAIR.load(Ordering::Relaxed);

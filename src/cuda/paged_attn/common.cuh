@@ -860,6 +860,9 @@ __global__ void __launch_bounds__(256) paged_prefill(const legion_paged_attn p) 
 // (#1181).
 #include "../sm80/paged_attn_pair.cuh"
 
+// Prefill on sm_80+ for heads of 512, 16 query columns a warp: namespace fa_cols (#1181).
+#include "../sm80/paged_attn_cols.cuh"
+
 // Prefill on sm_70 (Volta): mma.sync m8n8k4, namespace v70.
 #include "../sm70/paged_attn.cuh"
 
@@ -906,6 +909,15 @@ int launch(const legion_paged_attn & p, cudaStream_t st) {
         // Heads of 512, 8 query heads a kv head (Gemma 4's global layers): a small group takes
         // the warp-pair kernel where p.d512_pair says so (#1181), the same bits.
         if constexpr (D == 512 && G == 8 && !C) {
+            switch (p.d512_pair) {
+                case 2: return fa::launch_x<D, G, 1>(p, st);
+                case 3: return fa::launch_x<D, G, 2>(p, st);
+                case 4: return fa::launch_x<D, G, 3>(p, st);
+                case 5: return fa_cols::launch<D, G, 0>(p, st);
+                case 6: return fa_cols::launch<D, G, 1>(p, st);
+                case 7: return fa::launch_x<D, G, 4>(p, st);
+                default: break;
+            }
             if (p.d512_pair) {
                 if (const int rc = fa_pair::launch<D, G>(p, st); rc >= 0) {
                     return rc;

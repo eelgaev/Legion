@@ -113,7 +113,31 @@ __device__ __forceinline__ int split_blocks(int max_split, int split, int * b0, 
     return ns;
 }
 
-template <int D, int G, bool C = false, bool SPLIT = false>
+#ifdef LEGION_PAGED_MMA
+__device__ __forceinline__ void ldsm2(uint32_t r[4], uint32_t addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n" : "=r"(r[0]), "=r"(r[1]) : "r"(addr));
+    r[2] = r[0];
+    r[3] = r[1];
+}
+__device__ __forceinline__ void ldsm2_t(uint32_t r[4], uint32_t addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n" : "=r"(r[0]), "=r"(r[1]) : "r"(addr));
+    r[2] = r[0];
+    r[3] = r[1];
+}
+// mma() that the compiler can neither merge nor drop (probe X = 4: a loop-invariant A fragment).
+__device__ __forceinline__ void mma_v(float c[4], const uint32_t a[4], const uint32_t b[2]) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                 "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+#endif
+
+// X (measurement probes, #1181 r16; wrong output): 1 an A fragment loaded every other MMA (half
+// the ldmatrix count and bytes), 2 ldmatrix.x2 for every MMA (half the bytes, same count), 3 one
+// load a chunk (nearly no ldmatrix; ptxas merges the now identical MMAs, 40 of 256 left), 4 as 3
+// with every MMA kept (volatile).
+template <int D, int G, bool C = false, bool SPLIT = false, int X = 0>
 __global__ void __launch_bounds__(Shape<D>::NW * 32, Shape<D>::MINB) paged_prefill_mma(const legion_paged_attn p) {
 #ifdef LEGION_PAGED_MMA
     using SH = Shape<D>;
@@ -261,6 +285,7 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, Shape<D>::MINB) paged_prefi
                 continue;
             }
             const uint32_t st = sbase + (uint32_t) (j % NS) * CHUNK;
+            uint32_t ax[4] = {0, 0, 0, 0};  // the probes' fragment (X > 0)
             if (part < NC) {
                 // S^T += K Q^T over this chunk's dims.
 #pragma unroll
@@ -268,9 +293,25 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, Shape<D>::MINB) paged_prefi
                     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
                     for (int ks = 0; ks < CH / 16; ks++) {
-                        uint32_t a[4];
-                        ldsm(a, st + k_lane + k_x[ks % 4] + i * 16 * ROWB + ks / 4 * 128);
-                        mma(acc, a, qf[part * (CH / 16) + ks]);
+                        if constexpr (X == 0) {
+                            uint32_t a[4];
+                            ldsm(a, st + k_lane + k_x[ks % 4] + i * 16 * ROWB + ks / 4 * 128);
+                            mma(acc, a, qf[part * (CH / 16) + ks]);
+                        } else {
+                            const uint32_t ad = st + k_lane + k_x[ks % 4] + i * 16 * ROWB + ks / 4 * 128;
+                            if (X == 1 && ks % 2 == 0) {
+                                ldsm(ax, ad);
+                            } else if (X == 2) {
+                                ldsm2(ax, ad);
+                            } else if (X >= 3 && i == 0 && ks == 0) {
+                                ldsm(ax, ad);
+                            }
+                            if constexpr (X == 4) {
+                                mma_v(acc, ax, qf[part * (CH / 16) + ks]);
+                            } else {
+                                mma(acc, ax, qf[part * (CH / 16) + ks]);
+                            }
+                        }
                     }
 #pragma unroll
                     for (int e = 0; e < 4; e++) {
@@ -329,9 +370,25 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, Shape<D>::MINB) paged_prefi
                     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
                     for (int ks = 0; ks < 4; ks++) {
-                        uint32_t a[4];
-                        ldsm_t(a, st + v_lane + v_x[i % 4] + ks * 16 * ROWB + i / 4 * 128);
-                        mma(acc, a, pf[ks]);
+                        if constexpr (X == 0) {
+                            uint32_t a[4];
+                            ldsm_t(a, st + v_lane + v_x[i % 4] + ks * 16 * ROWB + i / 4 * 128);
+                            mma(acc, a, pf[ks]);
+                        } else {
+                            const uint32_t ad = st + v_lane + v_x[i % 4] + ks * 16 * ROWB + i / 4 * 128;
+                            if (X == 1 && ks % 2 == 0) {
+                                ldsm_t(ax, ad);
+                            } else if (X == 2) {
+                                ldsm2_t(ax, ad);
+                            } else if (X >= 3 && i == 0 && ks == 0) {
+                                ldsm_t(ax, ad);
+                            }
+                            if constexpr (X == 4) {
+                                mma_v(acc, ax, pf[ks]);
+                            } else {
+                                mma(acc, ax, pf[ks]);
+                            }
+                        }
                     }
                     float * oi = o[c * (CH / 16) + i];
                     oi[0] = oi[0] * alpha[0] + acc[0];
@@ -415,6 +472,19 @@ int launch(const legion_paged_attn & p, cudaStream_t st) {
     }
     constexpr int QT = Shape<D>::COLS / G;
     paged_prefill_mma<D, G, C><<<dim3((p.n_tok + QT - 1) / QT, p.n_head_kv, p.n_seqs), Shape<D>::NW * 32, Shape<D>::SMEM, st>>>(p);
+    return cudaGetLastError() == cudaSuccess ? 0 : 2;
+}
+
+// The measurement probes paged_prefill_mma<.., X> (benches only).
+template <int D, int G, int X>
+int launch_x(const legion_paged_attn & p, cudaStream_t st) {
+    static std::atomic<int8_t> opted_in[GGML_CUDA_MAX_DEVICES];
+    if (!legion_device::smem_opt_in(opted_in, paged_prefill_mma<D, G, false, false, X>, (int) Shape<D>::SMEM)) {
+        return 2;
+    }
+    constexpr int QT = Shape<D>::COLS / G;
+    paged_prefill_mma<D, G, false, false, X>
+        <<<dim3((p.n_tok + QT - 1) / QT, p.n_head_kv, p.n_seqs), Shape<D>::NW * 32, Shape<D>::SMEM, st>>>(p);
     return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
 

@@ -12,8 +12,13 @@ use crate::ggml::Backend;
 use crate::model::core::KvPool;
 
 /// The kernel choices: `main` (`paged_prefill_mma`), `auto` ([`d512_pair`]'s pick), `pair` (the
-/// pair kernel for every group), `split` (over the key blocks).
-pub const KERNELS: [&str; 4] = ["main", "auto", "pair", "split"];
+/// pair kernel for every group), `split` (over the key blocks); measurement only, wrong output:
+/// `h1` (an A fragment loaded every other MMA), `h2` (ldmatrix.x2, half the bytes), `h0` (one load
+/// a chunk; ptxas merges the identical MMAs), `h0v` (as h0, every MMA kept); exact but slower:
+/// `cols` / `cols2` (`paged_prefill_cols`, 16 query columns a warp, three / two stages).
+pub const KERNELS: [&str; 10] = [
+    "main", "auto", "pair", "split", "h1", "h2", "h0", "cols", "cols2", "h0v",
+];
 
 /// Whether `kernel` runs `g` on the pair kernel on a GPU of `sms` SMs.
 pub fn on_pair(g: &Group, kernel: &str, sms: usize) -> bool {
@@ -40,6 +45,12 @@ pub fn run(
         "main" => 0,
         "auto" => -1,
         "pair" => 1,
+        "h1" => 2,
+        "h2" => 3,
+        "h0" => 4,
+        "cols" => 5,
+        "cols2" => 6,
+        "h0v" => 7,
         "split" => {
             let (d, h, hk) = (d as i64, n_head as i64, n_head_kv as i64);
             scratch = split_scratch_shape(d, h, hk, g.n_tok, g.n_past.len());
