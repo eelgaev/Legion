@@ -11,6 +11,7 @@ mod ep_place;
 mod expert_cpu_proof;
 mod expert_mv_ptx_bench;
 mod fp8_sliced_bench;
+mod gated_norm_check;
 mod gdn_bench;
 mod gguf;
 mod hc_down_bench;
@@ -189,6 +190,10 @@ enum Command {
     /// Compare the grouped Q8_0 matvec op's bits with ggml's `mul_mat` (development).
     #[command(hide = true)]
     Q8GroupCheck(q8_group_check::Q8GroupCheckArgs),
+    /// Compare the gated DeltaNet output norm's BF16 op with ggml's chain and cast
+    /// (development).
+    #[command(hide = true)]
+    GatedNormCheck(gated_norm_check::GatedNormCheckArgs),
     /// Compare the two-launch Q8_0 MMQ op's bits and time with ggml's `mul_mat` (development).
     #[command(hide = true)]
     Q8MmqCheck(q8_mmq_check::Q8MmqCheckArgs),
@@ -291,6 +296,7 @@ async fn run(cli: Cli, numa: Option<legion::hw::numa_bind::Placement>) -> anyhow
         Command::Q4kMvBench(args) => q4k_mv_bench::run(args),
         Command::HeadMmBench(args) => head_mm_bench::run(args),
         Command::Q8GroupCheck(args) => q8_group_check::run(args),
+        Command::GatedNormCheck(args) => gated_norm_check::run(args),
         Command::Q8MmqCheck(args) => q8_mmq_check::run(args),
         Command::LinBench(args) => lin_bench::run(args),
         Command::QsaBench(args) => qsa_bench::run(args),

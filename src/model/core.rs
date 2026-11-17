@@ -29,6 +29,7 @@ pub(crate) mod fused;
 pub(crate) mod gate_q8;
 pub use gate_q8::{set_gate_norm, set_gate_q8};
 pub(crate) mod gdn;
+pub use fused::check as gated_norm_check;
 pub use fused::{set_delta_prep, set_gated_norm, set_moe_combine, set_router_join, set_shexp_gate};
 pub(crate) mod gdn_mma;
 pub(crate) mod gdn_scan;
@@ -3783,9 +3784,12 @@ impl Model {
                     .lw(il, "ssm_out.weight")
                     .is_ok_and(|w| linear::bf16_join_fits(w, o))
         };
+        // Small steps of dense models (#689): the same op offered as the BF16 cast that the
+        // FP8 sliced-K GEMM takes of `o`; one kernel for ggml's three if the matmul takes it.
         if !tap.on
-            && (!hp.moe || bf16_out())
-            && fused::gated_norm_bf16_fits(o2, norm_w, z_rows, head_v, n)
+            && (((!hp.moe || bf16_out())
+                && fused::gated_norm_bf16_fits(o2, norm_w, z_rows, head_v, n))
+                || (!hp.moe && fused::gated_norm_bf16_small_fits(o2, norm_w, z_rows, head_v, n)))
         {
             let silu = !hp.arch.sigmoid_gate();
             let ob = fused::gated_norm_bf16(ctx, o2, norm_w, z_rows, head_v, hp.rms_eps, silu);

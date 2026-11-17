@@ -90,6 +90,28 @@ const CONV_CASES: [(i64, i64, i64, i64); 4] = [
 ];
 
 #[test]
+fn small_gated_norm_switch_is_on_unless_zero() {
+    assert!(small_norm_on(None));
+    assert!(small_norm_on(Some("1".into())));
+    assert!(!small_norm_on(Some("0".into())));
+}
+
+#[test]
+fn small_gated_norm_needs_a_gpu_and_a_small_step() {
+    let ctx = Context::new(8, 0);
+    let o = ctx.new_tensor(types::F32, &[256, 8]);
+    let z = ctx.new_tensor(types::F32, &[256, 8]);
+    let w = ctx.new_tensor(types::F32, &[128]);
+    // The CPU graph keeps ggml's chain; a prompt chunk takes `gated_norm_bf16_fits`.
+    let o_big = ctx.new_tensor(types::F32, &[256, 64]);
+    let z_big = ctx.new_tensor(types::F32, &[256, 64]);
+    assert!(!gated_norm_bf16_small_fits(o_big, w, z_big, 128, 64));
+    if !cfg!(feature = "cuda") {
+        assert!(!gated_norm_bf16_small_fits(o, w, z, 128, 8));
+    }
+}
+
+#[test]
 fn conv_silu_matches_ggml_chain() {
     let mut backend = Backend::cpu().unwrap();
     backend.set_threads(4);

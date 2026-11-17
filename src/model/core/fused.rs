@@ -1031,6 +1031,33 @@ pub(super) fn gated_norm_bf16_fits(
 /// activations (the FP8 GEMM above 32 tokens, the NVFP4 GEMMs).
 pub(super) const NORM_BF16_MIN_N: i64 = 32;
 
+/// Whether [`gated_norm_bf16`] is offered as the BF16 cast of a dense model's gated DeltaNet
+/// output in a step of at most [`NORM_BF16_MIN_N`] tokens (#689): the FP8 sliced-K GEMM of
+/// `--fp8-sliced-k` reads such a step's output projection input as BF16
+/// ([`crate::ggml::Context::cast_shared`]), so the norm, gate and cast run as one kernel
+/// instead of ggml's three (rms_norm with the weight, the gate, the cast) on the critical path
+/// of every verify step. A matmul that reads the F32 rows never takes the offered cast, so
+/// the op is not built then. The same bits either way; on unless
+/// `LEGION_DEBUG_GDN_NORM_BF16=0` (A/B runs).
+pub(super) fn gated_norm_bf16_small_fits(
+    o: Tensor<'_>,
+    w: Tensor<'_>,
+    z: Tensor<'_>,
+    head_v: i64,
+    n: i64,
+) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| small_norm_on(std::env::var("LEGION_DEBUG_GDN_NORM_BF16").ok()));
+    on && n <= NORM_BF16_MIN_N
+        && gated_norm_shapes(o, w, z, head_v)
+        && crate::model::fp8::bf16_mma()
+}
+
+/// [`gated_norm_bf16_small_fits`]'s switch from `LEGION_DEBUG_GDN_NORM_BF16`: on unless `0`.
+pub(super) fn small_norm_on(v: Option<String>) -> bool {
+    v.as_deref() != Some("0")
+}
+
 /// A gated DeltaNet layer's output norm: per token and `head_v`-wide head of `o` (F32
 /// `[head_v * n_v, n]`, rows contiguous), `rms_norm(o, eps) * w * gate(z)` with `gate`
 /// sigmoid or (`silu`) SiLU of `z` (same shape), as ggml's chain computes it: F32 `[head_v *
@@ -1612,6 +1639,8 @@ unsafe fn cuda_shexp_gate(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
         }
     }
 }
+
+pub mod check;
 
 #[cfg(test)]
 mod tests;
