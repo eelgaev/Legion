@@ -20,8 +20,11 @@ pub struct Nvfp4A4BenchArgs {
     shapes: Vec<String>,
     /// Tile variants timed against the kernel before #1133 r12 (1): 0 the default pick; token
     /// tiles x stages with fragments by LDS: 2 8 x 2, 3 6 x 3; by generic loads (as before): 4
-    /// 8 x 2, 5 6 x 3.
-    #[arg(long, value_delimiter = ',', default_values_t = [0, 2, 3, 4, 5])]
+    /// 8 x 2, 5 6 x 3; 6 the default's pick (one tile per CTA); persistent CTAs: 7 with the
+    /// per-warp atom refill, 9 8 x 2, 10 6 x 3, 11 8 x 2 with the odd CTAs starting late (bits
+    /// 16-23: microseconds), 12 8 x 2 with the atom refill, 13 the #1133 r13 pick (persistent
+    /// but for the residual GEMMs).
+    #[arg(long, value_delimiter = ',', default_values_t = [0, 13, 7, 9, 10])]
     variants: Vec<i32>,
     /// Probes of tiles 2 and 4 on plain shapes (outputs not the GEMM's): 1 the loads alone, 2
     /// no refills, 3 no epilogue stores.

@@ -1310,9 +1310,12 @@ pub fn force_tokens_tile(nt: Option<i32>) {
 pub const TWO_CTAS_4: i32 = 0x104;
 
 /// Launches every dense TMA-fed W4A4 GEMM (token tile 8) from now on with tile `variant`
-/// (`legion_nvfp4_a4`'s `variant`: 1 the kernel before #1133 r12, 2 to 5 one tile; bits 8-9 a
-/// probe of tiles 2 and 4, whose outputs are not the GEMM's), or the default choice for 0:
-/// for `legion nvfp4-a4-bench`.
+/// (`legion_nvfp4_a4`'s `variant`: 1 the kernel before #1133 r12, 2 to 5 one tile, 6 the
+/// default's pick, 7 persistent CTAs with the per-warp atom refill, 9 / 10 persistent tile 8 x
+/// 2 / 6 x 3, 11 persistent 8 x 2 with bits 16-23 a start delay of the odd CTAs in
+/// microseconds, 12 persistent 8 x 2 with the atom refill, 13 #1133 r13's persistent pick; bits
+/// 8-9 a probe of tiles 2 and 4, whose outputs are not the GEMM's), or the default choice for
+/// 0: for `legion nvfp4-a4-bench`.
 #[doc(hidden)]
 pub fn force_dense_variant(variant: i32) {
     #[cfg(feature = "cuda")]
@@ -1333,16 +1336,21 @@ mod cuda {
     pub(super) static FORCED_VARIANT: AtomicI32 = AtomicI32::new(0);
 
     /// The dense GEMM's tile variant: a forced one, else 1 (the kernel before #1133 r12) under
-    /// `LEGION_DEBUG_NVFP4_A4_GENERIC=1`, else 0 (the default).
+    /// `LEGION_DEBUG_NVFP4_A4_GENERIC=1`, else 13 (#1133 r13's persistent CTAs, opt-in) under
+    /// `LEGION_DEBUG_NVFP4_A4_PERSISTENT=1`, else 0 (the default).
     fn dense_variant() -> i32 {
-        static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static OLD: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
         match FORCED_VARIANT.load(std::sync::atomic::Ordering::Relaxed) {
-            0 => {
-                let old = *OLD.get_or_init(|| {
-                    std::env::var_os("LEGION_DEBUG_NVFP4_A4_GENERIC").is_some_and(|v| v == "1")
-                });
-                old as i32
-            }
+            0 => *OLD.get_or_init(|| {
+                let on = |name: &str| std::env::var_os(name).is_some_and(|v| v == "1");
+                if on("LEGION_DEBUG_NVFP4_A4_GENERIC") {
+                    1
+                } else if on("LEGION_DEBUG_NVFP4_A4_PERSISTENT") {
+                    13
+                } else {
+                    0
+                }
+            }),
             v => v,
         }
     }

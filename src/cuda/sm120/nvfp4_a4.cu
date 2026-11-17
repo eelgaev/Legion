@@ -72,8 +72,12 @@ struct legion_nvfp4_a4 {
     // (nothing reads their rows); zero: the CTAs past the last tile store them.
     int32_t unread_skips;
     // The dense TMA-fed GEMM's tile (nt 8; see legion_nvfp4_a4_gemm_launch): 0 the default, 1 the
-    // kernel before #1133 r12, 2 to 5 one tile forced (A/B and the bench). Bits 8-9: a probe of
-    // tiles 2 and 4 (legion nvfp4-a4-bench; not the GEMM's outputs).
+    // kernel before #1133 r12, 2 to 5 one tile forced, 6 the default's pick, 7 persistent CTAs
+    // with the per-warp atom refill, 9 / 10 persistent tile 8 x 2 / 6 x 3 forced, 12 persistent
+    // 8 x 2 with the atom refill, 13 persistent CTAs but for the residual GEMMs (#1133 r13;
+    // A/B and the bench). Bits 8-9: a probe of tiles 2 and 4 (legion nvfp4-a4-bench; not the
+    // GEMM's outputs); with 11 (persistent 8 x 2), bits 16-23: the odd CTAs start that many
+    // microseconds late (the same outputs).
     int32_t variant;
 };
 
@@ -1465,6 +1469,13 @@ int legion_nvfp4_a4_rms_quant_launch(const float * x, int64_t x_ld, const float 
 // base keeps the shared state space), 1-4% per GEMM; the SwiGLU keeps 128 x 128 x 2 stages at
 // 16384 tokens too (with LDS 280 against 260 TFLOPS for 128 x 96). Two blocks a stage in twice
 // the stages lost 5-30% everywhere (its loads alone run at 250-265 TFLOPS).
+// #1133 r13 (opt-in, LEGION_DEBUG_NVFP4_A4_PERSISTENT=1, variant 13): the same tiles with
+// persistent CTAs (nvfp4_a4_gemm_tmap: one CTA per SM walks the tiles, the next tile's first
+// stages load during the epilogue) and the stage refill by warp 0 after an "empty" mbarrier
+// instead of an acq_rel atom per warp; the same bits. On the GB10: SwiGLU and plain GEMMs
+// 0-6% faster per call, the residual (long k) ones 5-12% slower (so they keep one tile per
+// CTA), Qwen3.8-27B and Gemma 4 31B prefill flat. Staggering half the CTAs' start (variant 11
+// with a delay) to desynchronise the epilogues: within the run spread.
 int legion_nvfp4_a4_gemm_launch(const legion_nvfp4_a4 * p, int nt, void * stream) {
     const cudaStream_t st = (cudaStream_t) stream;
     switch (nt) {
@@ -1488,6 +1499,16 @@ int legion_nvfp4_a4_gemm_launch(const legion_nvfp4_a4 * p, int nt, void * stream
                 case 3: r = dense_tma<6, 3>(*p, st); break;
                 case 4: r = dense_tma_probe<8, 2, true>(*p, st, probe); break;
                 case 5: r = dense_tma<6, 3, 0, true>(*p, st); break;
+                case 6: r = deep ? dense_tma<6, 3>(*p, st) : dense_tma<8, 2>(*p, st); break;
+                case 7: r = deep ? dense_tmap<6, 3, 0>(*p, st) : dense_tmap<8, 2, 0>(*p, st); break;
+                case 9: r = dense_tmap<8, 2, 1>(*p, st); break;
+                case 10: r = dense_tmap<6, 3, 1>(*p, st); break;
+                case 11: r = dense_tmap<8, 2, 1>(*p, st); break;  // + bits 16-23: the stagger probe
+                case 12: r = dense_tmap<8, 2, 0>(*p, st); break;
+                case 13:
+                    // The residual GEMMs (long k) keep one tile per CTA: 5-12% slower persistent.
+                    r = deep ? dense_tma<6, 3>(*p, st) : p->res ? dense_tma<8, 2>(*p, st) : dense_tmap<8, 2, 1>(*p, st);
+                    break;
                 default: r = deep ? dense_tma<6, 3>(*p, st) : dense_tma<8, 2>(*p, st); break;
             }
             if (r == -1 && forced >= 2) {
