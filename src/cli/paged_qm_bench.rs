@@ -38,6 +38,12 @@ pub struct PagedQmBenchArgs {
     /// Skip the edge cases.
     #[arg(long)]
     no_edges: bool,
+    /// Heads of 512 instead (`--heads 32,4`: Gemma 4 31B's global layers): these kernels against
+    /// `paged_prefill_mma` (#1181), `--modes` ignored: `auto` (the warp-pair kernel where the
+    /// default picks it), `pair` (the warp-pair kernel for every group), `split` (over the key
+    /// blocks as `--paged-verify-split`; other bits, timed for reference).
+    #[arg(long, value_delimiter = ',')]
+    d512: Vec<String>,
 }
 
 #[cfg(feature = "cuda")]
@@ -57,6 +63,9 @@ pub fn run(args: PagedQmBenchArgs) -> anyhow::Result<()> {
             .split_once(':')
             .ok_or_else(|| anyhow::anyhow!("--chunks takes n_past:n_tok, not {c}"))?;
         chunks.push((p.trim().parse::<usize>()?, t.trim().parse::<usize>()?));
+    }
+    if !args.d512.is_empty() {
+        return run_d512(&args, (512, n_head, n_head_kv), &chunks);
     }
     let mut gpu = legion::ggml::backend_by_name("CUDA0")?;
     let mut differ = 0;
@@ -138,6 +147,113 @@ pub fn run(args: PagedQmBenchArgs) -> anyhow::Result<()> {
                 "DIFFER"
             };
             print!(" {qm:>9.3} {:>6.3} {bits:>6}", mma / qm);
+        }
+        println!();
+    }
+    if differ > 0 {
+        anyhow::bail!("{differ} values differ from paged_prefill_mma's bits");
+    }
+    Ok(())
+}
+
+/// `--d512`: the warp-pair kernel (#1181) and the split against `paged_prefill_mma` at heads of
+/// 512.
+#[cfg(feature = "cuda")]
+fn run_d512(
+    args: &PagedQmBenchArgs,
+    heads: (usize, usize, usize),
+    chunks: &[(usize, usize)],
+) -> anyhow::Result<()> {
+    use legion::model::core::paged_d512_bench as bench;
+    use legion::model::core::paged_split_bench::{Group, pool};
+    for k in &args.d512 {
+        anyhow::ensure!(
+            k != "main" && bench::KERNELS.contains(&k.as_str()),
+            "--d512 takes {:?}, not {k}",
+            &bench::KERNELS[1..]
+        );
+    }
+    anyhow::ensure!(
+        heads.1 == 8 * heads.2,
+        "--d512 takes 8 query heads a kv head"
+    );
+    let mut gpu = legion::ggml::backend_by_name("CUDA0")?;
+    let sms = legion::hw::per_device::sm_count(0).max(0) as usize;
+    println!("{sms} SMs");
+    let mut differ = 0;
+    if !args.no_edges {
+        for k in args.d512.iter().filter(|k| *k != "split") {
+            let (cases, ran, total, bad) = bench::edges(&mut gpu, k, sms);
+            println!(
+                "edges, {k}: {cases} cases ({ran} on the pair kernel), {bad} of {total} values differ"
+            );
+            differ += bad;
+        }
+    }
+    let max_ctx = chunks.iter().map(|(p, t)| p + t).max().unwrap_or(0);
+    let n_blocks = max_ctx.div_ceil(64).max(1);
+    let kv = pool(&gpu, heads, n_blocks);
+    let seqs = args.seqs.max(1);
+    // Block i of sequence s in pool block (i * 37 + s * 11) mod n_blocks.
+    let table = |s: usize, len: usize| -> Vec<u32> {
+        (0..len)
+            .map(|i| ((i * 37 + s * 11) % n_blocks) as u32)
+            .collect()
+    };
+    print!(
+        "{:>7} {:>6} {:>4} {:>9}",
+        "n_past", "n_tok", "seqs", "main ms"
+    );
+    for k in &args.d512 {
+        print!(" {:>9} {:>6} {:>6}", format!("{k} ms"), "x", "bits");
+    }
+    println!();
+    for &(n_past, n_tok) in chunks {
+        let past = vec![n_past; seqs];
+        let len = (n_past + n_tok).div_ceil(64);
+        let tables: Vec<Vec<u32>> = (0..seqs).map(|s| table(s, len)).collect();
+        let g = Group {
+            heads,
+            n_tok,
+            n_past: &past,
+            tables: &tables,
+            width: len,
+            window: args.window,
+            ring: 0,
+            scale: 1.0 / (heads.0 as f32).sqrt(),
+        };
+        let finite = |v: &[f32]| v.iter().all(|x| x.is_finite());
+        // main, each kernel twice, main: each one's faster run kept.
+        let mut t = |k: &str| bench::run(&mut gpu, &kv, &g, k, args.reps, args.rounds);
+        let (a1, m1) = t("main");
+        anyhow::ensure!(finite(&a1), "{n_past}:{n_tok}: non-finite main output");
+        let mut cols = Vec::new();
+        for k in &args.d512 {
+            let (b1, q1) = t(k);
+            anyhow::ensure!(finite(&b1), "{n_past}:{n_tok}: non-finite {k} output");
+            let (_, q2) = t(k);
+            cols.push((k, b1, q1.min(q2)));
+        }
+        let (_, m2) = t("main");
+        let main = m1.min(m2);
+        print!("{n_past:>7} {n_tok:>6} {seqs:>4} {main:>9.3}");
+        for (k, b1, ms) in cols {
+            let bad = a1
+                .iter()
+                .zip(&b1)
+                .filter(|(x, y)| x.to_bits() != y.to_bits())
+                .count();
+            let bits = match (k.as_str(), bad) {
+                ("split", 0) => "same",
+                ("split", _) => "other",
+                (_, 0) if bench::on_pair(&g, k, sms) => "pair",
+                (_, 0) => "mma",
+                _ => {
+                    differ += bad;
+                    "DIFFER"
+                }
+            };
+            print!(" {ms:>9.3} {:>6.3} {bits:>6}", main / ms);
         }
         println!();
     }

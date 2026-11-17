@@ -117,6 +117,11 @@ struct legion_paged_attn {
     // kernel's bits, with the weights of this many key blocks at a time in the scratch (its size
     // is paged::wmma_split_plan on the Rust side).
     int32_t vsplit_chunk;
+    // Heads of 512 at 8 query heads a kv head, not compact, on sm_80+ without a split (Gemma 4's
+    // global layers, #1181): 1 runs the group on paged_prefill_pair (sm80/paged_attn_pair.cuh,
+    // each column's output over a warp pair) instead of paged_prefill_mma; the same bits. Picked
+    // on the Rust side (paged::d512_pair) for small groups.
+    int32_t d512_pair;
 };
 
 enum { LEGION_KV_F16 = 0, LEGION_KV_Q8_0 = 1, LEGION_KV_Q4_0 = 2 };
@@ -851,6 +856,10 @@ __global__ void __launch_bounds__(256) paged_prefill(const legion_paged_attn p) 
 // Prefill on compute capability 12.x, queries as the MMA's M: namespace fa_qm (#1133).
 #include "../sm80/paged_attn_qm.cuh"
 
+// Prefill on sm_80+ for heads of 512, each column's output over a warp pair: namespace fa_pair
+// (#1181).
+#include "../sm80/paged_attn_pair.cuh"
+
 // Prefill on sm_70 (Volta): mma.sync m8n8k4, namespace v70.
 #include "../sm70/paged_attn.cuh"
 
@@ -890,6 +899,15 @@ int launch(const legion_paged_attn & p, cudaStream_t st) {
         if constexpr (D == 256 && !C) {
             if (fa_qm::takes<D, G>(p)) {
                 if (const int rc = fa_qm::launch<D, G>(p, st); rc >= 0) {
+                    return rc;
+                }
+            }
+        }
+        // Heads of 512, 8 query heads a kv head (Gemma 4's global layers): a small group takes
+        // the warp-pair kernel where p.d512_pair says so (#1181), the same bits.
+        if constexpr (D == 512 && G == 8 && !C) {
+            if (p.d512_pair) {
+                if (const int rc = fa_pair::launch<D, G>(p, st); rc >= 0) {
                     return rc;
                 }
             }

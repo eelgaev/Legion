@@ -23,6 +23,25 @@ pub fn run(
     rounds: usize,
 ) -> (Vec<f32>, f64, bool) {
     set_qm_mode_here(mode);
+    let before = qm_launches();
+    let (first, best) = op(backend, kv, g, [1, 1, 1, 1], reps, rounds);
+    let ran = qm_launches() > before;
+    set_qm_prefill_here(None);
+    (first, best, ran)
+}
+
+/// The op for `g` over `kv` with a scratch of shape `scratch` (the placeholder `[1, 1, 1, 1]`,
+/// or [`split_scratch_shape`]'s for the split over the key blocks), as the calling thread's
+/// kernel settings pick it: its output, and its milliseconds (best of `rounds` rounds of `reps`
+/// runs after the first; 0 without).
+pub fn op(
+    backend: &mut Backend,
+    kv: &KvPool,
+    g: &Group,
+    scratch: [i64; 4],
+    reps: usize,
+    rounds: usize,
+) -> (Vec<f32>, f64) {
     let (kp, vp) = kv.pools(0);
     let (d, n_head, _) = g.heads;
     let ns = g.n_past.len();
@@ -37,7 +56,7 @@ pub fn run(
         .new_tensor(types::I32, &[g.width as i64, ns as i64])
         .as_input();
     let past = ctx.new_tensor(types::I32, &[ns as i64]).as_input();
-    let scratch = ctx.new_tensor(types::F32, &[1, 1, 1, 1]).as_input();
+    let scratch = ctx.new_tensor(types::F32, &scratch).as_input();
     let out = attention_tiered(
         &ctx, q, kp, vp, tab, past, scratch, g.scale, g.window, g.ring, None,
     )
@@ -49,9 +68,7 @@ pub fn run(
     fill(q, tab, past, g);
     // Garbage in the output: every value the kernels write they compute.
     out.set_f32(&vec![f32::NAN; out.elements()]);
-    let before = qm_launches();
     backend.compute(&graph).expect("compute");
-    let ran = qm_launches() > before;
     let first = out.to_f32();
     let mut best = 0.0f64;
     if reps > 0 {
@@ -64,8 +81,7 @@ pub fn run(
             best = best.min(start.elapsed().as_secs_f64() * 1e3 / reps as f64);
         }
     }
-    set_qm_prefill_here(None);
-    (first, best, ran)
+    (first, best)
 }
 
 /// Values of the op's output (rows the kernels write) whose bits differ between the kernel off
@@ -92,9 +108,7 @@ pub fn compare(backend: &mut Backend, kv: &KvPool, g: &Group, mode: i32) -> (usi
 /// inside blocks (Gemma 4's sliding window of 1,024 among them), a ring. Returns (cases, cases
 /// the kernel ran, values compared, values that differ), printing each failing case.
 pub fn edges(backend: &mut Backend, mode: i32) -> (usize, usize, usize, usize) {
-    let (mut cases, mut ran_cases, mut total, mut differ) = (0, 0, 0, 0);
-    let n_blocks = 160;
-    for (n_head, n_head_kv) in [
+    let pairs = [
         (16, 16),
         (32, 16),
         (16, 4),
@@ -102,11 +116,25 @@ pub fn edges(backend: &mut Backend, mode: i32) -> (usize, usize, usize, usize) {
         (16, 2),
         (24, 2),
         (32, 2),
-    ] {
-        let heads = (256, n_head, n_head_kv);
+    ];
+    edge_cases(backend, 256, &pairs, |b, kv, g| compare(b, kv, g, mode))
+}
+
+/// [`edges`]' cases for heads of `d` at each (query heads, kv heads) of `pairs`, each checked by
+/// `check` (values that differ, values compared, whether the kernel under test ran).
+pub fn edge_cases(
+    backend: &mut Backend,
+    d: usize,
+    pairs: &[(usize, usize)],
+    mut check: impl FnMut(&mut Backend, &KvPool, &Group) -> (usize, usize, bool),
+) -> (usize, usize, usize, usize) {
+    let (mut cases, mut ran_cases, mut total, mut differ) = (0, 0, 0, 0);
+    let n_blocks = 160;
+    for &(n_head, n_head_kv) in pairs {
+        let heads = (d, n_head, n_head_kv);
         let kv = super::wmma_bench::pool(backend, heads, n_blocks);
         let g_ratio = n_head / n_head_kv;
-        let rsd = 1.0 / 16.0;
+        let rsd = 1.0 / (d as f32).sqrt();
         // Verify-sized groups (2 to 64 tokens), then prompt chunks around the old threshold of
         // 256 rows and past one 128-row tile per token run.
         let sizes = [2, 3, 8, 11, 16, 21, 33, 64, 256 / g_ratio + 5, 300];
@@ -140,7 +168,7 @@ pub fn edges(backend: &mut Backend, mode: i32) -> (usize, usize, usize, usize) {
                     ring: 0,
                     scale,
                 };
-                let (x, n, ran) = compare(backend, &kv, &g, mode);
+                let (x, n, ran) = check(backend, &kv, &g);
                 cases += 1;
                 ran_cases += usize::from(ran);
                 total += n;
@@ -172,7 +200,7 @@ pub fn edges(backend: &mut Backend, mode: i32) -> (usize, usize, usize, usize) {
                 ring,
                 scale: rsd,
             };
-            let (x, n, ran) = compare(backend, &kv, &g, mode);
+            let (x, n, ran) = check(backend, &kv, &g);
             cases += 1;
             ran_cases += usize::from(ran);
             total += n;
