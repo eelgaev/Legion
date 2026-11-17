@@ -76,17 +76,47 @@ struct PeerRegion {
 }
 
 /// With a second rail: exchanges of at least this many bytes to one peer go in [`RAIL_CHUNK`]
-/// pieces over both rails (smaller ones, decode steps, as one write on the first).
+/// pieces over both rails.
 const RAIL_MIN: usize = 1 << 20;
 /// The piece of a split exchange: each rail takes the next piece when one of its writes
 /// completes, so the faster rail carries more.
 const RAIL_CHUNK: usize = 1 << 20;
 /// Writes in flight per rail.
 const RAIL_DEPTH: usize = 4;
+/// With a second rail: exchanges of at least this many bytes and under [`RAIL_MIN`] go in two
+/// halves, one on each rail (#1176). A 16-user decode sum (48 tokens in F32, ~480 KiB) took
+/// ~40 µs as one write on one rail, and every rank waits for it at each of a step's ~100
+/// sums. Smaller ones (a few users' decode steps) stay one write on the first rail, where the
+/// second write's completion would cost more than the wire time it saves.
+/// `LEGION_DEBUG_TP_RAIL_HALVES=0` sends every exchange under [`RAIL_MIN`] as one write (as
+/// before); another number sets this size. Every rank must set the same.
+const RAIL_HALVES_MIN: usize = 128 << 10;
 
-/// Whether an exchange of `len` bytes to a peer goes over both rails.
-fn split_rails(len: usize, rails: bool) -> bool {
-    rails && len >= RAIL_MIN
+/// [`RAIL_HALVES_MIN`], or `LEGION_DEBUG_TP_RAIL_HALVES` (0: no halves).
+fn rail_halves_min() -> usize {
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| halves_min_of(std::env::var("LEGION_DEBUG_TP_RAIL_HALVES").ok().as_deref()))
+}
+
+/// The halves' smallest exchange for a `LEGION_DEBUG_TP_RAIL_HALVES` value: unset, empty or not
+/// a number gives [`RAIL_HALVES_MIN`], 0 none.
+pub(super) fn halves_min_of(v: Option<&str>) -> usize {
+    v.and_then(|s| s.trim().parse().ok())
+        .unwrap_or(RAIL_HALVES_MIN)
+}
+
+/// How an exchange of `len` bytes to a peer goes with a second rail (`halves_min`: see
+/// [`RAIL_HALVES_MIN`]): the size of its pieces and how many writes each rail keeps in flight,
+/// or `None` for one write on the first rail.
+pub(super) fn rail_pieces(len: usize, halves_min: usize) -> Option<(usize, usize)> {
+    if len >= RAIL_MIN {
+        Some((RAIL_CHUNK, RAIL_DEPTH))
+    } else if halves_min > 0 && len >= halves_min {
+        // One write a rail, 64-byte aligned halves.
+        Some((len.div_ceil(2).next_multiple_of(64), 1))
+    } else {
+        None
+    }
 }
 
 /// An RDMA write's keys: the local key of the source, the peer's address and key.
@@ -564,7 +594,7 @@ const RDMA_PINNED_ONLY: &str = "the RDMA transport carries a GPU's all-reduces o
 
 /// A writer to an RDMA peer: each partial as one write with immediate (its sequence number)
 /// into the peer's receive buffer, waited for until it completed. With a second rail
-/// (`rail`), a partial of at least [`RAIL_MIN`] bytes goes in pieces over both
+/// (`rail`), a partial big enough for [`rail_pieces`] goes in pieces over both
 /// ([`send_split`]).
 fn rdma_writer(
     ep: Arc<Endpoint>,
@@ -595,9 +625,9 @@ fn rdma_writer(
         }
         sh.timing.report(seq, true);
         if let (Some(r), Some(rd)) = (&rail, rail_dst)
-            && split_rails(len, true)
+            && let Some(pieces) = rail_pieces(len, rail_halves_min())
         {
-            if !send_split([&ep, r], [dst, rd], (ptr, len), seq, &sh, peer) {
+            if !send_split([&ep, r], [dst, rd], (ptr, len), pieces, seq, &sh, peer) {
                 return;
             }
             sh.sent[peer].store(seq, Ordering::Release);
@@ -621,20 +651,22 @@ fn rdma_writer(
     }
 }
 
-/// Sends the `len` bytes at host address `ptr` to `peer` in [`RAIL_CHUNK`] pieces over both
+/// Sends the `len` bytes at host address `ptr` to `peer` in pieces of `chunk` bytes over both
 /// rails (`eps`, each with its keys in `dsts`), each a write with immediate `seq` at the same
-/// offset of the peer's buffer: up to [`RAIL_DEPTH`] writes in flight per rail, the next piece
-/// to the rail whose write completed, so each rail carries what it can. Returns once every
-/// piece completed; false on failure (recorded).
+/// offset of the peer's buffer: up to `depth` writes in flight per rail, the next piece to the
+/// rail whose write completed, so each rail carries what it can ([`rail_pieces`]). Returns once
+/// every piece completed; false on failure (recorded).
+#[allow(clippy::too_many_arguments)]
 fn send_split(
     eps: [&Endpoint; 2],
     dsts: [RdmaDst; 2],
     (ptr, len): (usize, usize),
+    (chunk, depth): (usize, usize),
     seq: u32,
     sh: &Shared,
     peer: usize,
 ) -> bool {
-    let pieces = len.div_ceil(RAIL_CHUNK);
+    let pieces = len.div_ceil(chunk);
     let (mut next, mut out) = (0usize, [0usize; 2]);
     let what = || format!("all-reduce {seq} was not delivered to rank {peer}");
     sh.poll_until(
@@ -649,9 +681,9 @@ fn send_split(
                     }
                     out[q] -= 1;
                 }
-                while out[q] < RAIL_DEPTH && next < pieces {
-                    let off = next * RAIL_CHUNK;
-                    let n = RAIL_CHUNK.min(len - off);
+                while out[q] < depth && next < pieces {
+                    let off = next * chunk;
+                    let n = chunk.min(len - off);
                     let d = dsts[q];
                     eps[q]
                         .post_write((ptr + off, n, d.lkey), (d.raddr + off as u64, d.rkey), seq)
@@ -713,8 +745,8 @@ fn rdma_reader(
 /// Waits until the writes with immediate `seq` on both rails (`eps`) add up to `len` bytes:
 /// one write on the first rail, or [`send_split`]'s pieces. The rails complete out of order,
 /// so a piece of a later exchange can come first; it waits in `early` for its own. An
-/// exchange too small to split polls the first rail only, as with one rail. False on failure
-/// (recorded).
+/// exchange too small to split ([`rail_pieces`]) polls the first rail only, as with one rail.
+/// False on failure (recorded).
 fn recv_rails(
     eps: [&Endpoint; 2],
     (seq, len): (u32, usize),
@@ -735,7 +767,11 @@ fn recv_rails(
         || sh
             .poll_until(
                 || {
-                    let n = if split_rails(len, true) { 2 } else { 1 };
+                    let n = if rail_pieces(len, rail_halves_min()).is_some() {
+                        2
+                    } else {
+                        1
+                    };
                     for ep in &eps[..n] {
                         if let Some((s, b)) = ep.poll_recv()? {
                             if s == seq {
