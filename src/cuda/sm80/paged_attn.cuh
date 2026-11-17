@@ -124,19 +124,22 @@ __device__ __forceinline__ void ldsm2_t(uint32_t r[4], uint32_t addr) {
     r[2] = r[0];
     r[3] = r[1];
 }
-// mma() that the compiler can neither merge nor drop (probe X = 4: a loop-invariant A fragment).
-__device__ __forceinline__ void mma_v(float c[4], const uint32_t a[4], const uint32_t b[2]) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-                 "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+// mma() on the i-th of 16 orders of a's four registers (probe X = 4): with one loop-invariant A
+// fragment the chains of different key or dim blocks would be identical, and ptxas merges identical
+// mma.sync chains (volatile asm does not stop it); a register order a block keeps every MMA.
+__device__ __forceinline__ void mma_p(float c[4], const uint32_t a[4], const uint32_t b[2], int i) {
+    constexpr int P[16] = {0x0123, 0x0132, 0x0213, 0x0231, 0x0312, 0x0321, 0x1023, 0x1032,
+                           0x1203, 0x1230, 0x1302, 0x1320, 0x2013, 0x2031, 0x2103, 0x2130};
+    const int o = P[i & 15];
+    const uint32_t q[4] = {a[(o >> 12) & 3], a[(o >> 8) & 3], a[(o >> 4) & 3], a[o & 3]};
+    mma(c, q, b);
 }
 #endif
 
 // X (measurement probes, #1181 r16; wrong output): 1 an A fragment loaded every other MMA (half
 // the ldmatrix count and bytes), 2 ldmatrix.x2 for every MMA (half the bytes, same count), 3 one
 // load a chunk (nearly no ldmatrix; ptxas merges the now identical MMAs, 40 of 256 left), 4 as 3
-// with every MMA kept (volatile).
+// with every MMA kept (the fragment's registers in a different order per block).
 template <int D, int G, bool C = false, bool SPLIT = false, int X = 0>
 __global__ void __launch_bounds__(Shape<D>::NW * 32, Shape<D>::MINB) paged_prefill_mma(const legion_paged_attn p) {
 #ifdef LEGION_PAGED_MMA
@@ -307,7 +310,7 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, Shape<D>::MINB) paged_prefi
                                 ldsm(ax, ad);
                             }
                             if constexpr (X == 4) {
-                                mma_v(acc, ax, qf[part * (CH / 16) + ks]);
+                                mma_p(acc, ax, qf[part * (CH / 16) + ks], i);
                             } else {
                                 mma(acc, ax, qf[part * (CH / 16) + ks]);
                             }
@@ -384,7 +387,7 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, Shape<D>::MINB) paged_prefi
                                 ldsm_t(ax, ad);
                             }
                             if constexpr (X == 4) {
-                                mma_v(acc, ax, pf[ks]);
+                                mma_p(acc, ax, pf[ks], i);
                             } else {
                                 mma(acc, ax, pf[ks]);
                             }

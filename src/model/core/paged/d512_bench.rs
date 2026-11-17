@@ -14,7 +14,8 @@ use crate::model::core::KvPool;
 /// The kernel choices: `main` (`paged_prefill_mma`), `auto` ([`d512_pair`]'s pick), `pair` (the
 /// pair kernel for every group), `split` (over the key blocks); measurement only, wrong output:
 /// `h1` (an A fragment loaded every other MMA), `h2` (ldmatrix.x2, half the bytes), `h0` (one load
-/// a chunk; ptxas merges the identical MMAs), `h0v` (as h0, every MMA kept); exact but slower:
+/// a chunk; ptxas merges the identical MMAs), `h0v` (as h0, every MMA kept: the fragment's
+/// registers in a different order per block); exact but slower:
 /// `cols` / `cols2` (`paged_prefill_cols`, 16 query columns a warp, three / two stages).
 pub const KERNELS: [&str; 10] = [
     "main", "auto", "pair", "split", "h1", "h2", "h0", "cols", "cols2", "h0v",

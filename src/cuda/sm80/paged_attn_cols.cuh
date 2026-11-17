@@ -10,7 +10,8 @@
 // with ldmatrix (512 bytes) feeds one MMA, and the 8 warps of a CTA each read the whole 32 KB chunk.
 // Measurement only (#1181 r16): it is exact but 0.78-0.86x of paged_prefill_mma (255 registers, the
 // output accumulators spill), and halving paged_prefill_mma's ldmatrix bytes alone is no faster, so
-// shared memory bandwidth is not what limits it. Here a warp takes 16 columns (two MMA
+// shared memory bandwidth is not what limits it; without nearly any ldmatrix (all MMAs kept) that
+// kernel is only 4-8% faster. Here a warp takes 16 columns (two MMA
 // n-tiles), so each fragment feeds two MMAs: half the ldmatrix bytes per MMA. The CTA keeps 64
 // columns of one kv head (8 tokens) and the same K/V fill per column; its 8 warps are 4 pairs, pair
 // g = warp % 4 owning columns 16 g .. 16 g + 15, and the pair splits the work by head dims, so a
