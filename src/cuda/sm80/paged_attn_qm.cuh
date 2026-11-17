@@ -68,7 +68,10 @@ bool pays(const legion_paged_attn & p) {
     return waves * QT * 6 <= waves_mm * QT_MMA * 7;
 }
 
-template <int D, int G>
+// AHEAD: a key tile's pool entry is read from the block table one tile before its chunks are
+// issued, so the issue after each barrier does not wait for that load (#1133, 4 waits a tile; the
+// same chunks, so the same bits). Without it (LEGION_DEBUG_QM_TABLE_AT_ISSUE=1), each issue reads it.
+template <int D, int G, bool AHEAD>
 __global__ void __launch_bounds__(Shape<D>::NW * 32, 1) paged_prefill_qm(const legion_paged_attn p) {
 #ifdef LEGION_PAGED_MMA
     using SH = Shape<D>;
@@ -118,11 +121,32 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, 1) paged_prefill_qm(const l
 
     // Chunk j of the CTA's stream: key tile wk.i0 + j / (2 NC), K chunks then V chunks.
     const int n_chunks = (wk.i1 - wk.i0) * 2 * NC;
+    // AHEAD: e_now is the pool entry (Walk::cells) of the tile being issued, e_next the next one's.
+    auto entry = [&](int i) { return i < wk.i1 ? wk.ent[wk.blk ? i : wk.ring > 0 ? i % wk.ring : i] : 0; };
+    auto at = [](const void * base, const char * stage, int e, int64_t cell_bytes) {
+        return e >= 0 ? (const char *) base + (int64_t) e * BLK * cell_bytes
+                      : stage + (int64_t) (-1 - e) * BLK * cell_bytes;
+    };
+    int e_now = 0, e_next = 0;
+    if (AHEAD && n_chunks > 0) {
+        e_now  = entry(wk.i0);
+        e_next = entry(wk.i0 + 1);
+    }
     auto issue = [&](int j) {
         if (j < n_chunks) {
             const int i = wk.i0 + j / (2 * NC), part = j % (2 * NC);
             const int b = wk.block(i);
-            const char * base = part < NC ? wk.cells(p.k, p.k_stage, i, p.k_cell) : wk.cells(p.v, p.v_stage, i, p.v_cell);
+            const char * base;
+            if (AHEAD) {
+                // Chunks issue in order, so a tile's first chunk moves the entries on by one.
+                if (part == 0 && j > 0) {
+                    e_now  = e_next;
+                    e_next = entry(i + 1);
+                }
+                base = part < NC ? at(p.k, p.k_stage, e_now, p.k_cell) : at(p.v, p.v_stage, e_now, p.v_cell);
+            } else {
+                base = part < NC ? wk.cells(p.k, p.k_stage, i, p.k_cell) : wk.cells(p.v, p.v_stage, i, p.v_cell);
+            }
             const half * src = (const half *) base + kvh * D + (part % NC) * CH;
             const uint32_t dst = rbase + (uint32_t) (j % NS) * CHUNK;
 #pragma unroll
@@ -323,19 +347,25 @@ template <int D, int G>
 bool takes(const legion_paged_attn & p) {
     const int mode = qm_mode();
     return mode > 0 && p.k_type == LEGION_KV_F16 && p.v_type == LEGION_KV_F16 && !p.compact && !p.piece_blk && !p.ml &&
-           legion_device::sm12x_device(paged_prefill_qm<D, G>) && (mode >= 2 || pays<D, G>(p));
+           legion_device::sm12x_device(paged_prefill_qm<D, G, true>) && (mode >= 2 || pays<D, G>(p));
+}
+
+template <int D, int G, bool AHEAD>
+int launch_as(const legion_paged_attn & p, cudaStream_t st) {
+    static std::atomic<int8_t> opted_in[GGML_CUDA_MAX_DEVICES];
+    if (!legion_device::smem_opt_in(opted_in, paged_prefill_qm<D, G, AHEAD>, (int) Shape<D>::SMEM)) {
+        return -1;
+    }
+    constexpr int QT = Shape<D>::ROWS / G;
+    paged_prefill_qm<D, G, AHEAD>
+        <<<dim3((p.n_tok + QT - 1) / QT, p.n_head_kv, p.n_seqs), Shape<D>::NW * 32, Shape<D>::SMEM, st>>>(p);
+    t_qm_launches++;
+    return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
 
 template <int D, int G>
 int launch(const legion_paged_attn & p, cudaStream_t st) {
-    static std::atomic<int8_t> opted_in[GGML_CUDA_MAX_DEVICES];
-    if (!legion_device::smem_opt_in(opted_in, paged_prefill_qm<D, G>, (int) Shape<D>::SMEM)) {
-        return -1;
-    }
-    constexpr int QT = Shape<D>::ROWS / G;
-    paged_prefill_qm<D, G><<<dim3((p.n_tok + QT - 1) / QT, p.n_head_kv, p.n_seqs), Shape<D>::NW * 32, Shape<D>::SMEM, st>>>(p);
-    t_qm_launches++;
-    return cudaGetLastError() == cudaSuccess ? 0 : 2;
+    return qm_table_at_issue() ? launch_as<D, G, false>(p, st) : launch_as<D, G, true>(p, st);
 }
 
 }  // namespace fa_qm

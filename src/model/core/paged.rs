@@ -747,15 +747,33 @@ unsafe extern "C" {
 /// (`false`) through
 /// `paged_prefill_mma` as before. The same bits either way; on by default (`legion serve
 /// --no-paged-prefill-qm` turns it off). Other GPUs and ops keep their kernels. For every thread.
+/// `LEGION_DEBUG_QM_TABLE_AT_ISSUE=1` puts back the kernel's block table reads at each chunk's
+/// issue (before its read-ahead, #1133), for A/B runs.
 pub fn set_qm_prefill(on: bool) {
     #[cfg(feature = "cuda")]
     // SAFETY: sets a flag the launches read.
     unsafe {
-        legion_paged_attn_set_qm(i32::from(on), 0)
+        legion_paged_attn_set_qm(i32::from(on) | qm_at_issue_flag(), 0)
     };
     #[cfg(not(feature = "cuda"))]
     let _ = on;
 }
+
+/// The setting's flag (`LEGION_PAGED_QM_AT_ISSUE`) for `LEGION_DEBUG_QM_TABLE_AT_ISSUE=1`, else 0.
+#[cfg(feature = "cuda")]
+fn qm_at_issue_flag() -> i32 {
+    if std::env::var_os("LEGION_DEBUG_QM_TABLE_AT_ISSUE").is_some_and(|v| v == "1") {
+        QM_AT_ISSUE
+    } else {
+        0
+    }
+}
+
+/// The kernel's setting flag for block table reads at each chunk's issue (the code before its
+/// read-ahead, #1133): `legion_paged_attn_set_qm`'s `LEGION_PAGED_QM_AT_ISSUE`. Benches add it
+/// to a mode ([`set_qm_mode_here`]).
+#[cfg(feature = "cuda")]
+pub const QM_AT_ISSUE: i32 = 0x100;
 
 /// [`set_qm_prefill`] for launches from the calling thread only (benches and tests); `None`
 /// follows the setting for every thread again.
@@ -770,7 +788,8 @@ pub fn set_qm_prefill_here(on: Option<bool>) {
 }
 
 /// [`set_qm_prefill_here`] by mode (benches): 0 off, 1 on where its grid is the faster one (the
-/// default), 2 on for every multi-token group it covers.
+/// default), 2 on for every multi-token group it covers; | [`QM_AT_ISSUE`] for the kernel before
+/// its block table read-ahead.
 pub fn set_qm_mode_here(mode: i32) {
     #[cfg(feature = "cuda")]
     // SAFETY: sets a thread-local flag the launches read.
