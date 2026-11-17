@@ -120,7 +120,8 @@ struct legion_paged_attn {
     // Heads of 512 at 8 query heads a kv head, not compact, on sm_80+ without a split (Gemma 4's
     // global layers, #1181): 1 runs the group on paged_prefill_pair (sm80/paged_attn_pair.cuh,
     // each column's output over a warp pair) instead of paged_prefill_mma; the same bits. Picked
-    // on the Rust side (paged::d512_pair) for small groups.
+    // on the Rust side (paged::d512_pair) for small groups. 2-5 (benches only): the measurement
+    // variants paged_prefill_mma<.., X> with Q's upper half in shared memory (sm80/paged_attn.cuh).
     int32_t d512_pair;
 };
 
@@ -906,6 +907,14 @@ int launch(const legion_paged_attn & p, cudaStream_t st) {
         // Heads of 512, 8 query heads a kv head (Gemma 4's global layers): a small group takes
         // the warp-pair kernel where p.d512_pair says so (#1181), the same bits.
         if constexpr (D == 512 && G == 8 && !C) {
+            if (p.d512_pair >= 2) {
+                switch (p.d512_pair) {
+                    case 2: return fa::launch_x<D, G, 8>(p, st);
+                    case 3: return fa::launch_x<D, G, 1>(p, st);
+                    case 4: return fa::launch_x<D, G, 3>(p, st);
+                    default: return fa::launch_x<D, G, 7>(p, st);
+                }
+            }
             if (p.d512_pair) {
                 if (const int rc = fa_pair::launch<D, G>(p, st); rc >= 0) {
                     return rc;

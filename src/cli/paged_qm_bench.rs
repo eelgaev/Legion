@@ -41,7 +41,8 @@ pub struct PagedQmBenchArgs {
     /// Heads of 512 instead (`--heads 32,4`: Gemma 4 31B's global layers): these kernels against
     /// `paged_prefill_mma` (#1181), `--modes` ignored: `auto` (the warp-pair kernel where the
     /// default picks it), `pair` (the warp-pair kernel for every group), `split` (over the key
-    /// blocks as `--paged-verify-split`; other bits, timed for reference).
+    /// blocks as `--paged-verify-split`; other bits, timed for reference); `x1`-`x4` (the
+    /// measurement variants with Q's upper half in shared memory, for every group, the same bits).
     #[arg(long, value_delimiter = ',')]
     d512: Vec<String>,
 }

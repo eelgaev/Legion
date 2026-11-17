@@ -95,8 +95,9 @@ pub fn set_d512_pair(on: bool) {
 }
 
 /// [`set_d512_pair`] for the calling thread's launches (benches): `Some(0)` `paged_prefill_mma`,
-/// `Some(1)` the pair kernel for every group it covers, `Some(-1)` [`d512_pair`]'s pick; `None`
-/// follows [`set_d512_pair`] again.
+/// `Some(1)` the pair kernel for every group it covers, `Some(-1)` [`d512_pair`]'s pick,
+/// `Some(2..=5)` a measurement variant of `paged_prefill_mma` (Q's upper half in shared memory,
+/// #1181 r15) for every group, single tokens included; `None` follows [`set_d512_pair`] again.
 pub fn set_d512_pair_here(mode: Option<i32>) {
     PAIR_HERE.with(|c| c.set(mode));
 }
@@ -122,7 +123,14 @@ fn d512_pair_for(
     compact: bool,
     max_split: i32,
 ) -> i32 {
-    if d != 512 || n_head != 8 * n_head_kv || compact || n_tok < 2 || max_split > 1 {
+    if d != 512 || n_head != 8 * n_head_kv || compact || max_split > 1 {
+        return 0;
+    }
+    // Measurement variants (#1181 r15): 2.. pick paged_prefill_mma<.., X> for every group.
+    if let Some(m) = PAIR_HERE.with(|c| c.get()).filter(|&m| m > 1) {
+        return m;
+    }
+    if n_tok < 2 {
         return 0;
     }
     let on = D512_PAIR.load(Ordering::Relaxed);
@@ -770,7 +778,8 @@ struct LaunchParams {
     /// this many blocks at a time ([`wmma_split_plan`]); 0: the last token's rows only.
     vsplit_chunk: i32,
     /// Heads of 512 at 8 query heads a kv head on sm_80+: 1 runs the group on the warp-pair
-    /// prefill kernel ([`d512_pair_for`]); 0: `paged_prefill_mma`.
+    /// prefill kernel ([`d512_pair_for`]); 0: `paged_prefill_mma`; 2-5 (benches only): its
+    /// measurement variants with Q's upper half in shared memory.
     d512_pair: i32,
 }
 

@@ -12,8 +12,11 @@ use crate::ggml::Backend;
 use crate::model::core::KvPool;
 
 /// The kernel choices: `main` (`paged_prefill_mma`), `auto` ([`d512_pair`]'s pick), `pair` (the
-/// pair kernel for every group), `split` (over the key blocks).
-pub const KERNELS: [&str; 4] = ["main", "auto", "pair", "split"];
+/// pair kernel for every group), `split` (over the key blocks); `x1`-`x4` the measurement variants
+/// of `paged_prefill_mma` with Q's upper half in shared memory (#1181 r15; the same bits): `x1`
+/// all of it loaded per K chunk, `x2` a two-k-step window, `x3` `x2` with double-buffered V
+/// fragments, `x4` `x3` with the first K chunk k-step outer.
+pub const KERNELS: [&str; 8] = ["main", "auto", "pair", "split", "x1", "x2", "x3", "x4"];
 
 /// Whether `kernel` runs `g` on the pair kernel on a GPU of `sms` SMs.
 pub fn on_pair(g: &Group, kernel: &str, sms: usize) -> bool {
@@ -40,6 +43,10 @@ pub fn run(
         "main" => 0,
         "auto" => -1,
         "pair" => 1,
+        "x1" => 2,
+        "x2" => 3,
+        "x3" => 4,
+        "x4" => 5,
         "split" => {
             let (d, h, hk) = (d as i64, n_head as i64, n_head_kv as i64);
             scratch = split_scratch_shape(d, h, hk, g.n_tok, g.n_past.len());

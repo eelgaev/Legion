@@ -113,14 +113,26 @@ __device__ __forceinline__ int split_blocks(int max_split, int split, int * b0, 
     return ns;
 }
 
-template <int D, int G, bool C = false, bool SPLIT = false>
+// X (measurement variants, #1181 r15): 0 main; >0 Q's upper half in shared memory (QS) with a
+// two-stage ring; X & 1: K1 k-pair outer with a Q window, else all of Q's upper half per chunk;
+// X & 2: V pass with explicit double-buffered fragments; X & 4: K0 k-step outer.
+template <int D> struct QsShape {
+    static constexpr int NS   = 2;
+    static constexpr int QOFF = NS * Shape<D>::CHUNK;                                    // Q's upper half
+    static constexpr size_t SMEM = (size_t) QOFF + Shape<D>::COLS * (D / 2) * sizeof(half);
+};
+
+template <int D, int G, bool C = false, bool SPLIT = false, int X = 0>
 __global__ void __launch_bounds__(Shape<D>::NW * 32, Shape<D>::MINB) paged_prefill_mma(const legion_paged_attn p) {
 #ifdef LEGION_PAGED_MMA
     using SH = Shape<D>;
-    constexpr int NS = SH::NS, CH = SH::CH, UNITS = SH::UNITS, CHUNK = SH::CHUNK;
+    constexpr bool QS = X != 0;
+    constexpr int NS = QS ? QsShape<D>::NS : SH::NS, CH = SH::CH, UNITS = SH::UNITS, CHUNK = SH::CHUNK;
     constexpr int NW = SH::NW, COLS = SH::COLS;
     constexpr int NC = D / CH;    // chunks of K, and of V, per key tile
     constexpr int KS = D / 16;    // k-steps of K Q^T
+    constexpr int QK = QS ? KS / 2 : KS;  // k-steps of Q held in registers
+    static_assert(!QS || (NC == 2 && !SPLIT), "QS: two chunks per head, no split");
     constexpr int QT = COLS / G;  // tokens per CTA
     constexpr float LOG2E = 1.4426950408889634f;
     extern __shared__ __align__(128) unsigned char smem[];
@@ -166,18 +178,34 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, Shape<D>::MINB) paged_prefi
     }
 
     // Q as B fragments (k = dims, n = columns): column gq, dims 2 tq + {0, 1} and + 8.
-    uint32_t qf[KS][2];
+    uint32_t qf[QK][2];
+    // QS: this warp's 8 columns x D / 2 dims of Q's upper half as F16 rows of D / 16 units
+    // (swizzled as the ring), read back by ldmatrix as the same B fragments.
+    constexpr int QU = D / 16;
+    const uint32_t qbase = sbase + (QS ? QsShape<D>::QOFF : 0) + (uint32_t) warp * 8 * QU * 16;
     {
         const int c = warp * 8 + gq;
         const int t = tok_of(c);
         const float * qr = (const float *) ((const char *) p.q + seq * p.q_nb3 + t * p.q_nb2 +
                                             (kvh * G + c % G) * p.q_nb1);
 #pragma unroll
-        for (int ks = 0; ks < KS; ks++) {
+        for (int ks = 0; ks < QK; ks++) {
             const float2 a = *(const float2 *) (qr + ks * 16 + 2 * tq);
             const float2 b = *(const float2 *) (qr + ks * 16 + 8 + 2 * tq);
             qf[ks][0] = pack(a.x, a.y);
             qf[ks][1] = pack(b.x, b.y);
+        }
+        if constexpr (QS) {
+#pragma unroll
+            for (int k = 0; k < QU / 4; k++) {
+                const int u = tq + 4 * k;
+                const float * src = qr + D / 2 + u * 8;
+                const float2 a = *(const float2 *) (src + 0), b = *(const float2 *) (src + 2);
+                const float2 e = *(const float2 *) (src + 4), f = *(const float2 *) (src + 6);
+                const uint4 x = make_uint4(pack(a.x, a.y), pack(b.x, b.y), pack(e.x, e.y), pack(f.x, f.y));
+                *(uint4 *) (smem + (qbase - sbase) + swz<QU>(gq, u)) = x;
+            }
+            __syncwarp();
         }
     }
 
@@ -263,18 +291,96 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, Shape<D>::MINB) paged_prefi
             const uint32_t st = sbase + (uint32_t) (j % NS) * CHUNK;
             if (part < NC) {
                 // S^T += K Q^T over this chunk's dims.
+                if (QS && part == NC - 1) {
+                    // Q's upper half from shared memory (ldmatrix: 2 k-steps of B fragments an
+                    // x4), each accumulator's k-steps in the same order.
+                    float acc[4][4];
 #pragma unroll
-                for (int i = 0; i < 4; i++) {
-                    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                    for (int i = 0; i < 4; i++) {
+                        acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.0f;
+                    }
+                    const uint32_t q_lane = qbase + (uint32_t) (lane % 8) * (QU * 16);
+                    if constexpr ((X & 1) != 0) {
 #pragma unroll
-                    for (int ks = 0; ks < CH / 16; ks++) {
-                        uint32_t a[4];
-                        ldsm(a, st + k_lane + k_x[ks % 4] + i * 16 * ROWB + ks / 4 * 128);
-                        mma(acc, a, qf[part * (CH / 16) + ks]);
+                        for (int kp = 0; kp < CH / 32; kp++) {
+                            uint32_t b[4];
+                            ldsm(b, q_lane + (((4 * kp + lane / 8) ^ (lane % 8)) << 4));
+#pragma unroll
+                            for (int i = 0; i < 4; i++) {
+#pragma unroll
+                                for (int h = 0; h < 2; h++) {
+                                    const int ks = 2 * kp + h;
+                                    uint32_t a[4];
+                                    ldsm(a, st + k_lane + k_x[ks % 4] + i * 16 * ROWB + ks / 4 * 128);
+                                    mma(acc[i], a, &b[2 * h]);
+                                }
+                            }
+                        }
+                    } else {
+                        uint32_t qh[CH / 16][2];
+#pragma unroll
+                        for (int kp = 0; kp < CH / 32; kp++) {
+                            uint32_t b[4];
+                            ldsm(b, q_lane + (((4 * kp + lane / 8) ^ (lane % 8)) << 4));
+                            qh[2 * kp][0]     = b[0];
+                            qh[2 * kp][1]     = b[1];
+                            qh[2 * kp + 1][0] = b[2];
+                            qh[2 * kp + 1][1] = b[3];
+                        }
+#pragma unroll
+                        for (int i = 0; i < 4; i++) {
+#pragma unroll
+                            for (int ks = 0; ks < CH / 16; ks++) {
+                                uint32_t a[4];
+                                ldsm(a, st + k_lane + k_x[ks % 4] + i * 16 * ROWB + ks / 4 * 128);
+                                mma(acc[i], a, qh[ks]);
+                            }
+                        }
                     }
 #pragma unroll
-                    for (int e = 0; e < 4; e++) {
-                        s[i][e] = part == 0 ? acc[e] : s[i][e] + acc[e];
+                    for (int i = 0; i < 4; i++) {
+#pragma unroll
+                        for (int e = 0; e < 4; e++) {
+                            s[i][e] = s[i][e] + acc[i][e];
+                        }
+                    }
+                } else if (QS && (X & 4) != 0) {
+                    // K0, k-step outer: the same chains, four side by side.
+                    float acc[4][4];
+#pragma unroll
+                    for (int i = 0; i < 4; i++) {
+                        acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.0f;
+                    }
+#pragma unroll
+                    for (int ks = 0; ks < CH / 16; ks++) {
+#pragma unroll
+                        for (int i = 0; i < 4; i++) {
+                            uint32_t a[4];
+                            ldsm(a, st + k_lane + k_x[ks % 4] + i * 16 * ROWB + ks / 4 * 128);
+                            mma(acc[i], a, qf[ks % QK]);
+                        }
+                    }
+#pragma unroll
+                    for (int i = 0; i < 4; i++) {
+#pragma unroll
+                        for (int e = 0; e < 4; e++) {
+                            s[i][e] = acc[i][e];
+                        }
+                    }
+                } else {
+#pragma unroll
+                    for (int i = 0; i < 4; i++) {
+                        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+                        for (int ks = 0; ks < CH / 16; ks++) {
+                            uint32_t a[4];
+                            ldsm(a, st + k_lane + k_x[ks % 4] + i * 16 * ROWB + ks / 4 * 128);
+                            mma(acc, a, qf[(part * (CH / 16) + ks) % QK]);
+                        }
+#pragma unroll
+                        for (int e = 0; e < 4; e++) {
+                            s[i][e] = part == 0 ? acc[e] : s[i][e] + acc[e];
+                        }
                     }
                 }
                 if (part == NC - 1) {
@@ -324,20 +430,49 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, Shape<D>::MINB) paged_prefi
             } else {
                 // O^T = O^T alpha + V^T P for this chunk's output dims.
                 const int c = part - NC;
-#pragma unroll
-                for (int i = 0; i < CH / 16; i++) {
-                    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                if constexpr (QS && (X & 2) != 0) {
+                    // The next output group's V fragments load while this group's MMAs run.
+                    uint32_t va[2][4][4];
 #pragma unroll
                     for (int ks = 0; ks < 4; ks++) {
-                        uint32_t a[4];
-                        ldsm_t(a, st + v_lane + v_x[i % 4] + ks * 16 * ROWB + i / 4 * 128);
-                        mma(acc, a, pf[ks]);
+                        ldsm_t(va[0][ks], st + v_lane + v_x[0] + ks * 16 * ROWB);
                     }
-                    float * oi = o[c * (CH / 16) + i];
-                    oi[0] = oi[0] * alpha[0] + acc[0];
-                    oi[1] = oi[1] * alpha[1] + acc[1];
-                    oi[2] = oi[2] * alpha[0] + acc[2];
-                    oi[3] = oi[3] * alpha[1] + acc[3];
+#pragma unroll
+                    for (int i = 0; i < CH / 16; i++) {
+                        if (i + 1 < CH / 16) {
+#pragma unroll
+                            for (int ks = 0; ks < 4; ks++) {
+                                ldsm_t(va[(i + 1) % 2][ks],
+                                       st + v_lane + v_x[(i + 1) % 4] + ks * 16 * ROWB + (i + 1) / 4 * 128);
+                            }
+                        }
+                        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+                        for (int ks = 0; ks < 4; ks++) {
+                            mma(acc, va[i % 2][ks], pf[ks]);
+                        }
+                        float * oi = o[c * (CH / 16) + i];
+                        oi[0] = oi[0] * alpha[0] + acc[0];
+                        oi[1] = oi[1] * alpha[1] + acc[1];
+                        oi[2] = oi[2] * alpha[0] + acc[2];
+                        oi[3] = oi[3] * alpha[1] + acc[3];
+                    }
+                } else {
+#pragma unroll
+                    for (int i = 0; i < CH / 16; i++) {
+                        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+                        for (int ks = 0; ks < 4; ks++) {
+                            uint32_t a[4];
+                            ldsm_t(a, st + v_lane + v_x[i % 4] + ks * 16 * ROWB + i / 4 * 128);
+                            mma(acc, a, pf[ks]);
+                        }
+                        float * oi = o[c * (CH / 16) + i];
+                        oi[0] = oi[0] * alpha[0] + acc[0];
+                        oi[1] = oi[1] * alpha[1] + acc[1];
+                        oi[2] = oi[2] * alpha[0] + acc[2];
+                        oi[3] = oi[3] * alpha[1] + acc[3];
+                    }
                 }
             }
         }
@@ -415,6 +550,19 @@ int launch(const legion_paged_attn & p, cudaStream_t st) {
     }
     constexpr int QT = Shape<D>::COLS / G;
     paged_prefill_mma<D, G, C><<<dim3((p.n_tok + QT - 1) / QT, p.n_head_kv, p.n_seqs), Shape<D>::NW * 32, Shape<D>::SMEM, st>>>(p);
+    return cudaGetLastError() == cudaSuccess ? 0 : 2;
+}
+
+// Measurement variants (#1181 r15): paged_prefill_mma<.., X> with Q's upper half in shared memory.
+template <int D, int G, int X>
+int launch_x(const legion_paged_attn & p, cudaStream_t st) {
+    static std::atomic<int8_t> opted_in[GGML_CUDA_MAX_DEVICES];
+    if (!legion_device::smem_opt_in(opted_in, paged_prefill_mma<D, G, false, false, X>, (int) QsShape<D>::SMEM)) {
+        return 2;
+    }
+    constexpr int QT = Shape<D>::COLS / G;
+    paged_prefill_mma<D, G, false, false, X>
+        <<<dim3((p.n_tok + QT - 1) / QT, p.n_head_kv, p.n_seqs), Shape<D>::NW * 32, QsShape<D>::SMEM, st>>>(p);
     return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
 
