@@ -562,6 +562,14 @@ impl Model {
         layers: std::ops::Range<usize>,
     ) -> Result<(Tensor<'a>, Vec<(usize, Tensor<'a>)>), ModelError> {
         let (ctx, tap, n) = (pass.ctx, &pass.tap, pass.n);
+        // The global layers' small groups (verify steps) on the warp-pair kernel (#1181), the
+        // same bits: Gemma 4 only, `LEGION_DEBUG_PAGED_D512_PAIR=0` keeps paged_prefill_mma.
+        // Read once.
+        static D512_PAIR: std::sync::Once = std::sync::Once::new();
+        D512_PAIR.call_once(|| {
+            let off = std::env::var("LEGION_DEBUG_PAGED_D512_PAIR").is_ok_and(|v| v == "0");
+            crate::model::core::paged::set_d512_pair(!off);
+        });
         let hp = &self.hp;
         let eps = hp.rms_eps;
         let norm = |t: Tensor<'a>, il: usize, name: &str| -> Result<Tensor<'a>, ModelError> {

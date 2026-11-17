@@ -73,6 +73,71 @@ fn verify_split(n_tok: usize) -> bool {
     true
 }
 
+/// Whether small groups with heads of 512 at 8 query heads a kv head take the warp-pair kernel
+/// ([`set_d512_pair`]).
+static D512_PAIR: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// The calling thread's choice ([`set_d512_pair_here`]).
+    static PAIR_HERE: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether groups with heads of 512 and 8 query heads a kv head (Gemma 4's global layers; not
+/// a compact cache, no split over the key blocks) run on the sm_80+ warp-pair prefill kernel
+/// (`paged_prefill_pair`, each query column's output over two warps) instead of
+/// `paged_prefill_mma` where the group is small ([`d512_pair`], #1181): a speculative verify
+/// step of one sequence is 4 CTAs on a GB10's 48 SMs, and there the pair kernel's shorter
+/// per-warp MMA chains run 1.3-1.6x faster per call; on bigger grids it loses. Gemma 4 turns it
+/// on (`LEGION_DEBUG_PAGED_D512_PAIR=0` keeps it off); off for every other model. The same bits
+/// either way.
+pub fn set_d512_pair(on: bool) {
+    D512_PAIR.store(on, Ordering::Relaxed);
+}
+
+/// [`set_d512_pair`] for the calling thread's launches (benches): `Some(0)` `paged_prefill_mma`,
+/// `Some(1)` the pair kernel for every group it covers, `Some(-1)` [`d512_pair`]'s pick; `None`
+/// follows [`set_d512_pair`] again.
+pub fn set_d512_pair_here(mode: Option<i32>) {
+    PAIR_HERE.with(|c| c.set(mode));
+}
+
+/// Whether a group of `n_tok` tokens per sequence, `n_seqs` sequences and `n_head_kv` kv heads
+/// of 8 query heads each takes the warp-pair kernel on a GPU of `sms` SMs: when its grid of
+/// `ceil(n_tok / 4) × n_head_kv × n_seqs` CTAs (4 tokens a CTA) fits on the SMs in one wave (one
+/// CTA an SM: its 96 KB ring), for 2 tokens or more; never with `sms` unknown.
+pub fn d512_pair(n_tok: usize, n_seqs: usize, n_head_kv: usize, sms: usize) -> bool {
+    n_tok >= 2 && sms > 0 && n_tok.div_ceil(4) * n_head_kv * n_seqs <= sms
+}
+
+/// The launch's `d512_pair` ([`set_d512_pair`]): 0 unless the group has heads of 512 at 8 query
+/// heads a kv head in a cache that is not compact, more than one token per sequence and no
+/// split over the key blocks.
+#[cfg(feature = "cuda")]
+fn d512_pair_for(
+    d: usize,
+    n_head: usize,
+    n_head_kv: usize,
+    n_tok: usize,
+    n_seqs: usize,
+    compact: bool,
+    max_split: i32,
+) -> i32 {
+    if d != 512 || n_head != 8 * n_head_kv || compact || n_tok < 2 || max_split > 1 {
+        return 0;
+    }
+    let on = D512_PAIR.load(Ordering::Relaxed);
+    match PAIR_HERE
+        .with(|c| c.get())
+        .unwrap_or(if on { -1 } else { 0 })
+    {
+        -1 => {
+            let sms = crate::hw::per_device::current().map_or(0, crate::hw::per_device::sm_count);
+            i32::from(d512_pair(n_tok, n_seqs, n_head_kv, sms.max(0) as usize))
+        }
+        m => i32::from(m > 0),
+    }
+}
+
 /// [`attention_tiered`] without a tier (tests).
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
@@ -704,6 +769,9 @@ struct LaunchParams {
     /// With `split`: every row of a 2-16-token group split over the key blocks, the weights of
     /// this many blocks at a time ([`wmma_split_plan`]); 0: the last token's rows only.
     vsplit_chunk: i32,
+    /// Heads of 512 at 8 query heads a kv head on sm_80+: 1 runs the group on the warp-pair
+    /// prefill kernel ([`d512_pair_for`]); 0: `paged_prefill_mma`.
+    d512_pair: i32,
 }
 
 /// The kernels' code for a cache type (`LEGION_KV_*` in paged_attn.cu), if they read it.
@@ -915,12 +983,22 @@ unsafe fn cuda_paged_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
         compact: i32::from(o.compact),
         head_stride: o.head_stride as i64,
         vsplit_chunk: 0,
+        d512_pair: 0,
     };
     // A multi-token group runs split over the key blocks (sm_80+) only with a scratch made for
     // it (split_scratch_shape); the placeholder and a tier's scratch have one split.
     if o.n_tok > 1 && o.scratch_len < (o.d + 2) * o.max_split * o.n_head * o.n_tok * o.n_seqs {
         p.max_split = 1;
     }
+    p.d512_pair = d512_pair_for(
+        o.d,
+        o.n_head,
+        o.n_head_kv,
+        o.n_tok,
+        o.n_seqs,
+        o.compact,
+        p.max_split,
+    );
     // A prefill group's last rows split over the key blocks, in runs of as many sequences as
     // the scratch holds (the kernel takes it on sm_70 / sm_75's WMMA path only, and not for
     // staged pieces).
@@ -1079,6 +1157,9 @@ pub fn supported(head_dim: i64, n_head: i64, n_head_kv: i64) -> bool {
         && matches!(n_head / n_head_kv, 1 | 2 | 4 | 6 | 8 | 12 | 16)
 }
 
+pub mod d512_bench;
+#[cfg(test)]
+mod d512_tests;
 #[cfg(all(test, feature = "cuda"))]
 mod ffma_tests;
 #[cfg(test)]
