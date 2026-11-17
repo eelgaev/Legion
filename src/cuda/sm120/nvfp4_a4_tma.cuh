@@ -69,8 +69,16 @@ __global__ void __launch_bounds__(256, 1) nvfp4_a4_gemm_tma(const legion_nvfp4_a
     constexpr int STAGE = T::STAGE, X_OFF = T::X_OFF, XS_OFF = T::XS_OFF, WARPS = 8;
     constexpr int BM_OUT = GLU ? BM / 2 : BM;
     extern __shared__ __align__(1024) unsigned char smem_raw[];
-    unsigned char * smem = GEN ? (unsigned char *) (((uintptr_t) smem_raw + 1023) & ~(uintptr_t) 1023)
-                               : smem_raw + ((1024 - (saddr(smem_raw) & 1023)) & 1023);
+    // The static arrays below come first, so the dynamic base is not 1024-aligned whatever its
+    // declaration says: the empty asm hides the declared alignment, which would fold the offset to 0.
+    unsigned char * smem;
+    if (GEN) {
+        smem = (unsigned char *) (((uintptr_t) smem_raw + 1023) & ~(uintptr_t) 1023);
+    } else {
+        uint32_t base = saddr(smem_raw);
+        asm volatile("" : "+r"(base));
+        smem = smem_raw + ((1024 - (base & 1023)) & 1023);
+    }
     __shared__ uint64_t full[ST];
     __shared__ uint32_t released[ST];
     __shared__ float x_dec[BN];
@@ -96,12 +104,15 @@ __global__ void __launch_bounds__(256, 1) nvfp4_a4_gemm_tma(const legion_nvfp4_a
         unsigned char * s = smem + stage * STAGE;
         uint64_t * bar = full + stage;
         bar_expect_tx(bar, T::TX);
-        tma_2d(s, &maps.w, (int) (step * KB * 36), (int) m0, bar);
+        // A box starts on a 16-byte boundary: KB 2's odd steps start 8 bytes early (the weight
+        // rows' 72 bytes 8 bytes into the box, the scale words 2 words in; see `shift`).
+        const int wx = (int) (step * KB * 36) & ~15;
+        tma_2d(s, &maps.w, wx, (int) m0, bar);
         if (GLU) {
-            tma_2d(s + BM / 2 * LDW, &maps.w2, (int) (step * KB * 36), (int) m0, bar);
+            tma_2d(s + BM / 2 * LDW, &maps.w2, wx, (int) m0, bar);
         }
         tma_2d(s + X_OFF, &maps.xq, (int) (step * XW), (int) n0, bar);
-        tma_2d(s + XS_OFF, &maps.xs, (int) (step * KB * 4), (int) n0, bar);
+        tma_2d(s + XS_OFF, &maps.xs, (int) (step * KB * 4) & ~15, (int) n0, bar);
     };
 
     // nvfp4_a4_gemm's L2 bulk prefetch of the weight rows (its DENSE16 tile: 8 blocks per run,
@@ -180,15 +191,17 @@ __global__ void __launch_bounds__(256, 1) nvfp4_a4_gemm_tma(const legion_nvfp4_a
     struct Frag {
         uint32_t a[MI][4], b[NT][2], sa[MI], sb[NT];
     };
-    auto fragments = [&](const unsigned char * st, int blk, Frag & f) {
+    // shift: the stage's step is an odd one of KB 2 (its weight rows 8 bytes into their boxes,
+    // its scale words 2 words into theirs).
+    auto fragments = [&](const unsigned char * st, int blk, int shift, Frag & f) {
 #pragma unroll
         for (int i = 0; i < MI; i++) {
-            const unsigned char * r = st + (a_base(i) + g) * LDW + blk * 36 + 4 + t * 4;
+            const unsigned char * r = st + (a_base(i) + g) * LDW + shift * 8 + blk * 36 + 4 + t * 4;
             f.a[i][0] = *(const uint32_t *) r;
             f.a[i][1] = *(const uint32_t *) (r + 8 * LDW);
             f.a[i][2] = *(const uint32_t *) (r + 16);
             f.a[i][3] = *(const uint32_t *) (r + 8 * LDW + 16);
-            f.sa[i] = *(const uint32_t *) (st + (a_base(i) + g + (t % 2) * 8) * LDW + blk * 36);
+            f.sa[i] = *(const uint32_t *) (st + (a_base(i) + g + (t % 2) * 8) * LDW + shift * 8 + blk * 36);
         }
 #pragma unroll
         for (int jj = 0; jj < NT / 2; jj++) {
@@ -205,7 +218,7 @@ __global__ void __launch_bounds__(256, 1) nvfp4_a4_gemm_tma(const legion_nvfp4_a
         const uint32_t * bs = (const uint32_t *) (st + XS_OFF);
 #pragma unroll
         for (int j = 0; j < NT; j++) {
-            f.sb[j] = bs[(sb_tok + j * 8) * 4 + blk];
+            f.sb[j] = bs[(sb_tok + j * 8) * 4 + shift * 2 + blk];
         }
     };
 
@@ -218,13 +231,14 @@ __global__ void __launch_bounds__(256, 1) nvfp4_a4_gemm_tma(const legion_nvfp4_a
             bar_wait(full + stage, (uint32_t) (step / ST) & 1);
         }
         const unsigned char * st = smem + stage * STAGE;
+        const int shift = KB == 2 ? (int) (step & 1) : 0;
         if (PROBE != 1) {
             Frag f[2];
-            fragments(st, 0, f[0]);
+            fragments(st, 0, shift, f[0]);
 #pragma unroll
             for (int b = 0; b < KB; b++) {
                 if (b + 1 < KB) {
-                    fragments(st, b + 1, f[(b + 1) % 2]);
+                    fragments(st, b + 1, shift, f[(b + 1) % 2]);
                 }
                 const Frag & c = f[b % 2];
 #pragma unroll
