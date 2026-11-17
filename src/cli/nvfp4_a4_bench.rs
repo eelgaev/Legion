@@ -1,5 +1,6 @@
 //! `legion nvfp4-a4-bench`: the dense W4A4 NVFP4 GEMM's TMA-fed tiles (#1133) at prefill
-//! shapes: each tile variant's outputs checked against the 4-block-stage tile's bits and timed,
+//! shapes: each tile variant's outputs checked against the bits of the kernel before #1133
+//! round 12 and timed,
 //! plus probes of the mainloop (loads alone, no refills, no stores) to see what bounds it (a
 //! development tool, so a build tree's release binary can check the GPU it runs on; pick it
 //! with `CUDA_VISIBLE_DEVICES`).
@@ -17,12 +18,13 @@ pub struct Nvfp4A4BenchArgs {
         default_value = "5120:17408:8192:glu,17408:5120:8192:res,5376:21504:2048:glu,21504:5376:2048:res,5376:8192:2048"
     )]
     shapes: Vec<String>,
-    /// Tile variants timed against the 4-block-stage tile (1): 0 the default pick, 2 8 token
-    /// tiles x 2-block stages x 4, 3 6 x 2 x 5, 4 8 x 4 x 2, 5 6 x 4 x 3, 6 8 x 2 x 3.
-    #[arg(long, value_delimiter = ',', default_values_t = [0, 2, 3, 4, 5, 6])]
+    /// Tile variants timed against the kernel before #1133 r12 (1): 0 the default pick; token
+    /// tiles x blocks a stage x stages, fragments by LDS: 2 8 x 2 x 4, 3 6 x 2 x 5, 4 8 x 4 x
+    /// 2, 5 6 x 4 x 3, 6 8 x 2 x 3; by generic loads (as before): 7 8 x 4 x 2, 8 6 x 4 x 3.
+    #[arg(long, value_delimiter = ',', default_values_t = [0, 2, 3, 4, 5, 6, 7, 8])]
     variants: Vec<i32>,
-    /// Probes of tiles 2 and 4 on plain shapes (outputs not the GEMM's): 1 the loads alone, 2
-    /// no refills, 3 no epilogue stores.
+    /// Probes of tiles 2, 4 and 7 on plain shapes (outputs not the GEMM's): 1 the loads alone,
+    /// 2 no refills, 3 no epilogue stores.
     #[arg(long, value_delimiter = ',')]
     probes: Vec<i32>,
     /// Weights in a graph (distinct ones, so the graph streams past the L2).
@@ -127,7 +129,7 @@ pub fn run(args: Nvfp4A4BenchArgs) -> anyhow::Result<()> {
     let mut differ = 0;
     println!(
         "{:>6} {:>6} {:>6} {:>4} {:>8} {:>9} {:>8} {:>8} {:>7}",
-        "k", "m", "n", "op", "variant", "ms", "TF", "x tile1", "bits"
+        "k", "m", "n", "op", "variant", "ms", "TF", "x v1", "bits"
     );
     for s in &shapes {
         let (k, m, n) = (s.k as i64, s.m as i64, s.n as i64);
@@ -180,14 +182,13 @@ pub fn run(args: Nvfp4A4BenchArgs) -> anyhow::Result<()> {
             r.set_f32(&rs);
         }
 
-        // Tile 1 (the 4-block stages) is the reference, then the variants, then the probes.
+        // Variant 1 (the kernel before) is the reference, then the variants, then the probes.
         let mut runs: Vec<i32> = vec![1];
         runs.extend(args.variants.iter().copied().filter(|&v| v != 1));
         if !s.glu && !s.res {
             for &p in &args.probes {
                 anyhow::ensure!((1..=3).contains(&p), "--probes takes 1, 2 or 3");
-                runs.push(2 | p << 8);
-                runs.push(4 | p << 8);
+                runs.extend([2, 4, 7].map(|v| v | p << 8));
             }
         }
         let elem = if s.glu { 2 } else { 4 };
@@ -199,7 +200,7 @@ pub fn run(args: Nvfp4A4BenchArgs) -> anyhow::Result<()> {
             let ok = gpu.compute(&graph).is_ok() && gpu.compute(&graph).is_ok();
             if !ok {
                 a4::force_dense_variant(0);
-                anyhow::ensure!(v != 1, "k {k} m {m} n {n}: tile 1 does not run");
+                anyhow::ensure!(v != 1, "k {k} m {m} n {n}: variant 1 does not run");
                 rows.push((v, None, None));
                 // A failed launch may leave the backend's error state; a plain run clears it.
                 gpu.compute(&graph)?;
@@ -278,7 +279,7 @@ pub fn run(args: Nvfp4A4BenchArgs) -> anyhow::Result<()> {
         }
     }
     if differ > 0 {
-        anyhow::bail!("{differ} values differ from the 4-block-stage tile's bits");
+        anyhow::bail!("{differ} values differ from the bits of variant 1");
     }
     Ok(())
 }

@@ -72,8 +72,8 @@ struct legion_nvfp4_a4 {
     // (nothing reads their rows); zero: the CTAs past the last tile store them.
     int32_t unread_skips;
     // The dense TMA-fed GEMM's tile (nt 8; see legion_nvfp4_a4_gemm_launch): 0 the default, 1 the
-    // 4-block stages (the tiles before #1133 r12), 2 to 6 one tile forced (A/B and the bench).
-    // Bits 8-9: a probe of tiles 2 and 4 (legion nvfp4-a4-bench; not the GEMM's outputs).
+    // kernel before #1133 r12, 2 to 8 one tile forced (A/B and the bench). Bits 8-9: a probe of
+    // tiles 2, 4 and 7 (legion nvfp4-a4-bench; not the GEMM's outputs).
     int32_t variant;
 };
 
@@ -1480,7 +1480,11 @@ int legion_nvfp4_a4_gemm_launch(const legion_nvfp4_a4 * p, int nt, void * stream
                 case 4: r = dense_tma_probe<8, 2, 4>(*p, st, probe); break;
                 case 5: r = dense_tma<6, 3, 4>(*p, st); break;
                 case 6: r = dense_tma<8, 3, 2>(*p, st); break;
-                default: r = deep ? dense_tma<6, 3>(*p, st) : dense_tma<8, 2>(*p, st); break;
+                case 7: r = dense_tma_probe<8, 2, 4, true>(*p, st, probe); break;
+                case 8: r = dense_tma<6, 3, 4, 0, true>(*p, st); break;
+                default:
+                    r = deep ? dense_tma<6, 3, 4, 0, true>(*p, st) : dense_tma<8, 2, 4, 0, true>(*p, st);
+                    break;
             }
             if (r == -1 && forced >= 2) {
                 return -1;  // a forced tile that does not apply: no other kernel stands in

@@ -1310,9 +1310,9 @@ pub fn force_tokens_tile(nt: Option<i32>) {
 pub const TWO_CTAS_4: i32 = 0x104;
 
 /// Launches every dense TMA-fed W4A4 GEMM (token tile 8) from now on with tile `variant`
-/// (`legion_nvfp4_a4`'s `variant`: 1 the 4-block stages of before #1133 r12, 2 to 6 one tile;
-/// bits 8-9 a probe of tiles 2 and 4, whose outputs are not the GEMM's), or the default
-/// choice for 0: for `legion nvfp4-a4-bench`.
+/// (`legion_nvfp4_a4`'s `variant`: 1 the kernel before #1133 r12, 2 to 8 one tile; bits 8-9 a
+/// probe of tiles 2, 4 and 7, whose outputs are not the GEMM's), or the default choice for 0:
+/// for `legion nvfp4-a4-bench`.
 #[doc(hidden)]
 pub fn force_dense_variant(variant: i32) {
     #[cfg(feature = "cuda")]
@@ -1332,8 +1332,8 @@ mod cuda {
     /// A dense tile forced by [`super::force_dense_variant`]; 0 is none.
     pub(super) static FORCED_VARIANT: AtomicI32 = AtomicI32::new(0);
 
-    /// The dense GEMM's tile variant: a forced one, else 1 (the 4-block stages, the tiles
-    /// before #1133 r12) under `LEGION_DEBUG_NVFP4_A4_KB4=1`, else 0 (the default).
+    /// The dense GEMM's tile variant: a forced one, else 1 (the kernel before #1133 r12) under
+    /// `LEGION_DEBUG_NVFP4_A4_KB4=1`, else 0 (the default).
     fn dense_variant() -> i32 {
         static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         match FORCED_VARIANT.load(std::sync::atomic::Ordering::Relaxed) {

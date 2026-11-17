@@ -56,7 +56,11 @@ template <int NT_, int ST_, int KB_ = 4> struct TmaTile {
 // PROBE (legion nvfp4-a4-bench only; its outputs are not the GEMM's): 1 the loads alone (no
 // MMAs, no stores), 2 no refills (the first ST stages' data computed on over and over: the MMAs
 // and fragment reads without the memory system), 3 no epilogue stores.
-template <int NT, int ST, int KB, bool GLU, bool RES, int PROBE = 0>
+// GEN: the stages' base aligned through an integer (the kernel before #1133 r12), which loses
+// the pointer's state space: every A fragment and scale word is a generic load (LD.E) and each
+// TMA issue checks its destination's window. Else the base is the shared array plus an offset:
+// LDS.
+template <int NT, int ST, int KB, bool GLU, bool RES, int PROBE = 0, bool GEN = false>
 __global__ void __launch_bounds__(256, 1) nvfp4_a4_gemm_tma(const legion_nvfp4_a4 p, const __grid_constant__ a4t::Maps maps) {
 #ifdef LEGION_FP4_MMA
     using T = TmaTile<NT, ST, KB>;
@@ -65,7 +69,8 @@ __global__ void __launch_bounds__(256, 1) nvfp4_a4_gemm_tma(const legion_nvfp4_a
     constexpr int STAGE = T::STAGE, X_OFF = T::X_OFF, XS_OFF = T::XS_OFF, WARPS = 8;
     constexpr int BM_OUT = GLU ? BM / 2 : BM;
     extern __shared__ __align__(1024) unsigned char smem_raw[];
-    unsigned char * smem = (unsigned char *) (((uintptr_t) smem_raw + 1023) & ~(uintptr_t) 1023);
+    unsigned char * smem = GEN ? (unsigned char *) (((uintptr_t) smem_raw + 1023) & ~(uintptr_t) 1023)
+                               : smem_raw + ((1024 - (saddr(smem_raw) & 1023)) & 1023);
     __shared__ uint64_t full[ST];
     __shared__ uint32_t released[ST];
     __shared__ float x_dec[BN];
@@ -278,7 +283,8 @@ inline bool a4_tma_map(CUtensorMap * map, const void * base, int64_t row_bytes, 
 // nvfp4_a4_gemm_tma for a dense GEMM (SwiGLU, residual or plain) of whole stages (k % 256 == 0);
 // -1 when it does not apply or a tensor map cannot be made (nothing launched). PROBE: plain
 // GEMMs only.
-template <int NT, int ST, int KB = 4, int PROBE = 0> int dense_tma(const legion_nvfp4_a4 & p0, cudaStream_t st) {
+template <int NT, int ST, int KB = 4, int PROBE = 0, bool GEN = false>
+int dense_tma(const legion_nvfp4_a4 & p0, cudaStream_t st) {
     using T = TmaTile<NT, ST, KB>;
     if (p0.plan || p0.k % 256 != 0 || p0.n <= 0 || p0.m <= 0 || (PROBE != 0 && (p0.w2 || p0.res))) {
         return -1;
@@ -303,24 +309,25 @@ template <int NT, int ST, int KB = 4, int PROBE = 0> int dense_tma(const legion_
         kernel<<<(unsigned) p.tiles_m * (unsigned) p.tiles_n, 256, T::SMEM, st>>>(p, maps);
     };
     if constexpr (PROBE != 0) {
-        go(nvfp4_a4_gemm_tma<NT, ST, KB, false, false, PROBE>);
+        go(nvfp4_a4_gemm_tma<NT, ST, KB, false, false, PROBE, GEN>);
     } else if (p.w2) {
-        go(nvfp4_a4_gemm_tma<NT, ST, KB, true, false>);
+        go(nvfp4_a4_gemm_tma<NT, ST, KB, true, false, 0, GEN>);
     } else if (p.res) {
-        go(nvfp4_a4_gemm_tma<NT, ST, KB, false, true>);
+        go(nvfp4_a4_gemm_tma<NT, ST, KB, false, true, 0, GEN>);
     } else {
-        go(nvfp4_a4_gemm_tma<NT, ST, KB, false, false>);
+        go(nvfp4_a4_gemm_tma<NT, ST, KB, false, false, 0, GEN>);
     }
     return status();
 }
 
-// A probe of dense_tma<NT, ST, KB> (legion nvfp4-a4-bench).
-template <int NT, int ST, int KB> int dense_tma_probe(const legion_nvfp4_a4 & p, cudaStream_t st, int probe) {
+// A probe of dense_tma<NT, ST, KB, 0, GEN> (legion nvfp4-a4-bench).
+template <int NT, int ST, int KB, bool GEN = false>
+int dense_tma_probe(const legion_nvfp4_a4 & p, cudaStream_t st, int probe) {
     switch (probe) {
-        case 0: return dense_tma<NT, ST, KB>(p, st);
-        case 1: return dense_tma<NT, ST, KB, 1>(p, st);
-        case 2: return dense_tma<NT, ST, KB, 2>(p, st);
-        case 3: return dense_tma<NT, ST, KB, 3>(p, st);
+        case 0: return dense_tma<NT, ST, KB, 0, GEN>(p, st);
+        case 1: return dense_tma<NT, ST, KB, 1, GEN>(p, st);
+        case 2: return dense_tma<NT, ST, KB, 2, GEN>(p, st);
+        case 3: return dense_tma<NT, ST, KB, 3, GEN>(p, st);
         default: return -1;
     }
 }
