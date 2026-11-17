@@ -49,6 +49,7 @@ use crate::ggml::{Context, ExternalOp, Tensor, ffi, types};
 
 #[cfg(test)]
 mod tests;
+pub mod tp;
 
 static L2_PREFETCH: ExternalOp = ExternalOp {
     name: "l2_prefetch",
@@ -301,10 +302,10 @@ unsafe fn cuda_l2_prefetch(
     };
     if on_side {
         let s = side::fork(stream)?;
-        launch::launch(base, bytes, s, false)?;
+        launch::launch(base, bytes, s, false, pace_ns())?;
         return side::done(s);
     }
-    launch::launch(base, bytes, stream, true)
+    launch::launch(base, bytes, stream, true, 0)
 }
 
 /// A prefetch node's (device address, bytes, on the side stream), or `None` when it launches
@@ -482,13 +483,15 @@ mod launch {
     /// Launches the prefetch of `bytes` (whole chunks) from device address `base` on `stream`,
     /// as a programmatic dependent launch where `pdl` (the GPUs [`super::takes`] gives it are
     /// 12.x), else a plain one (the side stream: it starts once the fork's point is complete,
-    /// and its `griddepcontrol.wait` returns at once). Paced on the side stream only: on the
-    /// compute stream a paced kernel would hold every kernel after it.
+    /// and its `griddepcontrol.wait` returns at once). Paced, one step every `pace_ns` (0: all
+    /// at once), on the side stream only: on the compute stream a paced kernel would hold every
+    /// kernel after it.
     pub(super) fn launch(
         base: usize,
         bytes: usize,
         stream: *mut c_void,
         pdl: bool,
+        pace_ns: u32,
     ) -> Result<(), String> {
         let (size, threads) = shape();
         let chunks = bytes.div_ceil(size);
@@ -496,7 +499,7 @@ mod launch {
         let mut total = bytes as i64;
         let mut chunk = size as i32;
         let mut late = i32::from(super::late());
-        let mut pace = if pdl { 0 } else { super::pace_ns() as i32 };
+        let mut pace = if pdl { 0 } else { pace_ns as i32 };
         let mut argv = [
             (&mut p as *mut *const u8).cast::<c_void>(),
             (&mut total as *mut i64).cast::<c_void>(),

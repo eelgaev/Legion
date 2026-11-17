@@ -73,6 +73,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::ggml::{Context, Graph, Tensor, types};
 use crate::gguf::GgufFile;
 use crate::model::core::arch::same_as;
+use crate::model::core::l2_prefetch::tp as tp_l2;
 use crate::model::core::mtp::MtpGraph;
 use crate::model::core::pad_rows;
 use crate::model::core::state::{KvPool, QSA_SCRATCH};
@@ -990,6 +991,21 @@ impl Model {
         Ok(mixed)
     }
 
+    /// The matrices of mixer `prefix` (its down and up) that a step of `n` tokens reads into L2
+    /// at the exchange over machines before that mixer ([`tp_l2::takes`], #1176 round 43);
+    /// `None` when `off`, without tensor parallelism, or where none applies.
+    fn mix_ahead(&self, prefix: &str, n: i64, off: bool) -> Option<Vec<Tensor<'_>>> {
+        if off || !self.tp_on() {
+            return None;
+        }
+        let ws: Vec<_> = ["down", "up"]
+            .iter()
+            .filter_map(|s| self.w(&format!("{prefix}_{s}.weight")).ok())
+            .filter(|&w| tp_l2::takes(w, n))
+            .collect();
+        (!ws.is_empty()).then_some(ws)
+    }
+
     /// [`Self::hc_combine`] of `pending` (the previous block's output and inject, if any) into
     /// the streams `res`, then the `prefix` mixer with its inject: `(streams, mixed, inject)`.
     /// On a GPU, in a small step, one op does both (see [`hc`]). `bf16`: the step may keep the
@@ -1329,6 +1345,7 @@ impl Model {
             ctx.reshape_3d(x, e, hc.n, n)
         };
         let last = layers.end == hp.n_layer;
+        let stage_end = layers.end;
         // A block's output waits to be combined into the streams until the next mixer, which
         // does both in one op on a GPU (see `hc_mix_after`).
         let mut pending: Option<(Tensor<'a>, Tensor<'a>)> = None;
@@ -1455,8 +1472,13 @@ impl Model {
                 n = n_out;
                 res = ctx.reshape_3d(flat, e, hc.n, n);
             }
-            // A rank's share of the heads gives a partial output (`--tp-rank`, #733).
-            let attn = self.tp_sum_split(ctx, attn, sp.filter(|_| split));
+            // A rank's share of the heads gives a partial output (`--tp-rank`, #733). Over
+            // machines, the FFN mixer's matrices go into L2 while the sum is awaited.
+            let attn = match self.mix_ahead(&format!("blk.{il}.hc_ffn"), n, split || tap.on) {
+                Some(ws) => self.tp_sum_ahead(ctx, attn, &ws),
+                None => None,
+            }
+            .unwrap_or_else(|| self.tp_sum_split(ctx, attn, sp.filter(|_| split)));
             pending = Some((attn, inject));
             let pre = format!("blk.{il}.hc_ffn");
             let (r, h, inject) = self.hc_mix_after(ctx, res, pending.take(), &pre, bf16)?;
@@ -1474,7 +1496,18 @@ impl Model {
                     self.moe_rows(ctx, tap, &pass.graph, il, h, n, rows, pass.prompt_only())?
                 }
             };
-            let ffn = self.tp_sum_split(ctx, ffn, sp.filter(|_| split));
+            // And the next mixer's: the next layer's attention mixer, or the output mixer (a
+            // later pipeline stage's are another GPU's).
+            let next = if il + 1 < stage_end {
+                Some(format!("blk.{}.hc_attn", il + 1))
+            } else {
+                last.then(|| "output_hc".to_string())
+            };
+            let ffn = match next.and_then(|p| self.mix_ahead(&p, n, split || tap.on)) {
+                Some(ws) => self.tp_sum_ahead(ctx, ffn, &ws),
+                None => None,
+            }
+            .unwrap_or_else(|| self.tp_sum_split(ctx, ffn, sp.filter(|_| split)));
             tap.tap("ffn_out", il, ffn);
             pending = Some((ffn, inject));
             if tap.on {

@@ -1831,6 +1831,22 @@ impl Model {
         self.tp_pair.is_some() || self.tp_comm.is_some()
     }
 
+    /// [`Self::tp_sum`] of `x` over machines (`--tp-rank`, not a GPU pair) with `ws` read into
+    /// L2 on the side stream while this rank waits for the others' partials
+    /// ([`l2_prefetch::tp`], #1176 round 43), forked between its send and its wait. `None`
+    /// without such ranks or with no `ws`.
+    pub(crate) fn tp_sum_ahead<'a>(
+        &self,
+        ctx: &'a Context,
+        x: Tensor<'a>,
+        ws: &[Tensor<'a>],
+    ) -> Option<Tensor<'a>> {
+        let c = self
+            .tp_comm
+            .filter(|_| self.tp_pair.is_none() && !ws.is_empty())?;
+        Some(crate::tp_net::all_reduce_ahead(ctx, c, x, ws))
+    }
+
     pub fn set_attention(&mut self, a: Attention) {
         self.attention = a;
     }

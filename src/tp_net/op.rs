@@ -22,6 +22,24 @@ pub fn all_reduce<'a>(ctx: &'a Context, comm: i32, x: Tensor<'a>) -> Tensor<'a> 
     ctx.external_with(&ALL_REDUCE, types::F32, x.ne(), &[x], &[comm])
 }
 
+/// [`all_reduce`] that also reads `ws` (weights the GPU reads next) into L2 on the side stream
+/// while it waits for the peers ([`crate::model::core::l2_prefetch::tp`], #1176): on CUDA,
+/// launched after this rank's partial is on its way and before the wait. The sum is
+/// [`all_reduce`]'s, bit for bit; the CPU ignores `ws`.
+pub fn all_reduce_ahead<'a>(
+    ctx: &'a Context,
+    comm: i32,
+    x: Tensor<'a>,
+    ws: &[Tensor<'a>],
+) -> Tensor<'a> {
+    assert_eq!(x.ty(), types::F32, "tp all-reduce: F32 only");
+    let x = if x.is_contiguous() { x } else { ctx.cont(x) };
+    let mut srcs = Vec::with_capacity(ws.len() + 1);
+    srcs.push(x);
+    srcs.extend_from_slice(ws);
+    ctx.external_with(&ALL_REDUCE, types::F32, x.ne(), &srcs, &[comm])
+}
+
 unsafe fn cpu_all_reduce(dst: &ffi::ggml_tensor, ith: usize, _nth: usize) {
     // One thread runs it; ggml's barrier after the node holds the others.
     if ith != 0 {
@@ -523,6 +541,11 @@ pub(super) mod cuda {
                 mix.and_then(|mix| start(&comm, &plan, src, stream, false, tail, mix))
             });
             started.and_then(|seq| {
+                // Weights an `all_reduce_ahead` reads into L2 while it waits: forked now, with
+                // this rank's partial already queued to go.
+                if kind == Kind::AllReduce && !dst.src[1].is_null() {
+                    crate::model::core::l2_prefetch::tp::launch_beside(dst, stream)?;
+                }
                 if defer {
                     hand_over(&comm, &plan, seq, stream)
                 } else {
