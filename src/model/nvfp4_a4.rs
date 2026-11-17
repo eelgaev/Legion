@@ -1309,6 +1309,18 @@ pub fn force_tokens_tile(nt: Option<i32>) {
 #[doc(hidden)]
 pub const TWO_CTAS_4: i32 = 0x104;
 
+/// Launches every dense TMA-fed W4A4 GEMM (token tile 8) from now on with tile `variant`
+/// (`legion_nvfp4_a4`'s `variant`: 1 the kernel before #1133 r12, 2 to 5 one tile; bits 8-9 a
+/// probe of tiles 2 and 4, whose outputs are not the GEMM's), or the default choice for 0:
+/// for `legion nvfp4-a4-bench`.
+#[doc(hidden)]
+pub fn force_dense_variant(variant: i32) {
+    #[cfg(feature = "cuda")]
+    cuda::FORCED_VARIANT.store(variant, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "cuda"))]
+    let _ = variant;
+}
+
 #[cfg(feature = "cuda")]
 mod cuda {
     use std::os::raw::c_void;
@@ -1316,6 +1328,24 @@ mod cuda {
 
     /// A token tile forced by [`super::force_tokens_tile`]; 0 is none.
     pub(super) static FORCED_NT: AtomicI32 = AtomicI32::new(0);
+
+    /// A dense tile forced by [`super::force_dense_variant`]; 0 is none.
+    pub(super) static FORCED_VARIANT: AtomicI32 = AtomicI32::new(0);
+
+    /// The dense GEMM's tile variant: a forced one, else 1 (the kernel before #1133 r12) under
+    /// `LEGION_DEBUG_NVFP4_A4_GENERIC=1`, else 0 (the default).
+    fn dense_variant() -> i32 {
+        static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        match FORCED_VARIANT.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => {
+                let old = *OLD.get_or_init(|| {
+                    std::env::var_os("LEGION_DEBUG_NVFP4_A4_GENERIC").is_some_and(|v| v == "1")
+                });
+                old as i32
+            }
+            v => v,
+        }
+    }
 
     /// A grouped kernel forced by [`super::force_grouped`]: 0 none, 1 the GEMM, `2 | rt << 8 |
     /// kw << 16` the decode kernel.
@@ -1376,6 +1406,7 @@ mod cuda {
         pw: *const f32,
         res: *const f32,
         unread_skips: i32,
+        variant: i32,
     }
 
     unsafe extern "C" {
@@ -1565,6 +1596,7 @@ mod cuda {
             pw: std::ptr::null(),
             res: std::ptr::null(),
             unread_skips: 0,
+            variant: dense_variant(),
         }
     }
 

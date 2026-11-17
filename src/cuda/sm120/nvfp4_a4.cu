@@ -71,6 +71,10 @@ struct legion_nvfp4_a4 {
     // Grouped GEMM, nonzero (#1176): the plan's skipped pairs (ids of -1) get no zeros stored
     // (nothing reads their rows); zero: the CTAs past the last tile store them.
     int32_t unread_skips;
+    // The dense TMA-fed GEMM's tile (nt 8; see legion_nvfp4_a4_gemm_launch): 0 the default, 1 the
+    // kernel before #1133 r12, 2 to 5 one tile forced (A/B and the bench). Bits 8-9: a probe of
+    // tiles 2 and 4 (legion nvfp4-a4-bench; not the GEMM's outputs).
+    int32_t variant;
 };
 
 // Quantizes `rows` rows of k (F32 if x_bf16 is 0, else BF16; x_ld elements apart) to the layout
@@ -1457,6 +1461,10 @@ int legion_nvfp4_a4_rms_quant_launch(const float * x, int64_t x_ld, const float 
 // at 128; at 16384 tokens 128 x 96 x 3 stages (234 against 225 for 128 x 128). The down matmul
 // with its residual (k 17408, 5120 rows) 128 x 96 x 3 stages from 2048 tokens: 180 -> 233
 // TFLOPS at 8192 (128 x 128: 203), 128 x 128 below (81 against 72 at 128 tokens).
+// #1133 r12: the fragments' A and scale words are read by LDS, not generic loads (the stages'
+// base keeps the shared state space), 1-4% per GEMM; the SwiGLU keeps 128 x 128 x 2 stages at
+// 16384 tokens too (with LDS 280 against 260 TFLOPS for 128 x 96). Two blocks a stage in twice
+// the stages lost 5-30% everywhere (its loads alone run at 250-265 TFLOPS).
 int legion_nvfp4_a4_gemm_launch(const legion_nvfp4_a4 * p, int nt, void * stream) {
     const cudaStream_t st = (cudaStream_t) stream;
     switch (nt) {
@@ -1467,8 +1475,24 @@ int legion_nvfp4_a4_gemm_launch(const legion_nvfp4_a4 * p, int nt, void * stream
         case 2: return gemm<Tile<2, 2, 2, 4>>(*p, st);
         case 4: return gemm<Tile<2, 4, 2, 4>>(*p, st);
         case 8: {
-            const bool deep = p->w2 ? p->n >= 16384 : p->k >= 8192 && p->n >= 2048;
-            int r = deep ? dense_tma<6, 3>(*p, st) : dense_tma<8, 2>(*p, st);
+            const bool deep = !p->w2 && p->k >= 8192 && p->n >= 2048;
+            const int probe = p->variant >> 8 & 3, forced = p->plan ? 0 : p->variant & 0xff;
+            int r;
+            switch (forced) {
+                case 1: {
+                    const bool deep_before = p->w2 ? p->n >= 16384 : deep;
+                    r = deep_before ? dense_tma<6, 3, 0, true>(*p, st) : dense_tma<8, 2, 0, true>(*p, st);
+                    break;
+                }
+                case 2: r = dense_tma_probe<8, 2, false>(*p, st, probe); break;
+                case 3: r = dense_tma<6, 3>(*p, st); break;
+                case 4: r = dense_tma_probe<8, 2, true>(*p, st, probe); break;
+                case 5: r = dense_tma<6, 3, 0, true>(*p, st); break;
+                default: r = deep ? dense_tma<6, 3>(*p, st) : dense_tma<8, 2>(*p, st); break;
+            }
+            if (r == -1 && forced >= 2) {
+                return -1;  // a forced tile that does not apply: no other kernel stands in
+            }
             if (r == -1) {
                 r = dense16<Tile<2, 8, 4, 2, 1, true>>(*p, st);
             }

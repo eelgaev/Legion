@@ -45,7 +45,14 @@ template <int NT_, int ST_> struct TmaTile {
     static_assert(SMEM + 1024 <= 99 * 1024, "shared memory");
 };
 
-template <int NT, int ST, bool GLU, bool RES>
+// PROBE (legion nvfp4-a4-bench only; its outputs are not the GEMM's): 1 the loads alone (no
+// MMAs, no stores), 2 no refills (the first ST stages' data computed on over and over: the MMAs
+// and fragment reads without the memory system), 3 no epilogue stores.
+// GEN: the stages' base aligned through an integer (the kernel before #1133 r12), which loses
+// the pointer's state space: every A fragment and scale word is a generic load (LD.E) and each
+// TMA issue checks its destination's window. Else the base is the shared array plus an offset,
+// and those reads are LDS.
+template <int NT, int ST, bool GLU, bool RES, int PROBE = 0, bool GEN = false>
 __global__ void __launch_bounds__(256, 1) nvfp4_a4_gemm_tma(const legion_nvfp4_a4 p, const __grid_constant__ a4t::Maps maps) {
 #ifdef LEGION_FP4_MMA
     using T = TmaTile<NT, ST>;
@@ -54,7 +61,17 @@ __global__ void __launch_bounds__(256, 1) nvfp4_a4_gemm_tma(const legion_nvfp4_a
     constexpr int STAGE = T::STAGE, X_OFF = T::X_OFF, XS_OFF = T::XS_OFF, WARPS = 8;
     constexpr int BM_OUT = GLU ? BM / 2 : BM;
     extern __shared__ __align__(1024) unsigned char smem_raw[];
-    unsigned char * smem = (unsigned char *) (((uintptr_t) smem_raw + 1023) & ~(uintptr_t) 1023);
+    unsigned char * smem;
+    if (GEN) {
+        smem = (unsigned char *) (((uintptr_t) smem_raw + 1023) & ~(uintptr_t) 1023);
+    } else {
+        // The static arrays below come first, so the dynamic base is not 1024-aligned whatever
+        // its declaration says: the empty asm hides the declared alignment, which would fold the
+        // offset to 0.
+        uint32_t base = saddr(smem_raw);
+        asm volatile("" : "+r"(base));
+        smem = smem_raw + ((1024 - (base & 1023)) & 1023);
+    }
     __shared__ uint64_t full[ST];
     __shared__ uint32_t released[ST];
     __shared__ float x_dec[BN];
@@ -195,24 +212,28 @@ __global__ void __launch_bounds__(256, 1) nvfp4_a4_gemm_tma(const legion_nvfp4_a
         if (step % PF == 0 && step > 0) {
             prefetch(step + PF);
         }
-        bar_wait(full + stage, (uint32_t) (step / ST) & 1);
-        const unsigned char * st = smem + stage * STAGE;
-        Frag f[2];
-        fragments(st, 0, f[0]);
-#pragma unroll
-        for (int b = 0; b < KB; b++) {
-            if (b + 1 < KB) {
-                fragments(st, b + 1, f[(b + 1) % 2]);
-            }
-            const Frag & c = f[b % 2];
-#pragma unroll
-            for (int i = 0; i < MI; i++)
-#pragma unroll
-                for (int j = 0; j < NT; j++) {
-                    mma_fp4(acc[i][j], c.a[i], c.b[j][0], c.b[j][1], c.sa[i], c.sb[j]);
-                }
+        if (PROBE != 2 || step < ST) {
+            bar_wait(full + stage, (uint32_t) (step / ST) & 1);
         }
-        if (step + ST < steps) {
+        const unsigned char * st = smem + stage * STAGE;
+        if (PROBE != 1) {
+            Frag f[2];
+            fragments(st, 0, f[0]);
+#pragma unroll
+            for (int b = 0; b < KB; b++) {
+                if (b + 1 < KB) {
+                    fragments(st, b + 1, f[(b + 1) % 2]);
+                }
+                const Frag & c = f[b % 2];
+#pragma unroll
+                for (int i = 0; i < MI; i++)
+#pragma unroll
+                    for (int j = 0; j < NT; j++) {
+                        mma_fp4(acc[i][j], c.a[i], c.b[j][0], c.b[j][1], c.sa[i], c.sb[j]);
+                    }
+            }
+        }
+        if (PROBE != 2 && step + ST < steps) {
             // This warp's reads of the stage are done (their values are in the MMAs above). The
             // acq_rel count orders every warp's reads before the last arrival, which refills
             // the stage with step + ST (after a proxy fence: the TMA writes through the async
@@ -232,7 +253,10 @@ __global__ void __launch_bounds__(256, 1) nvfp4_a4_gemm_tma(const legion_nvfp4_a
             __syncwarp();
         }
     }
-    a4_epilogue<MI, NT, false, GLU, RES>(p, acc, m0, n0, n_tok, x_dec, nullptr, sc, sc2, wm, wn, g, t);
+    // The probes without stores keep their sums alive by a store no launch asks for.
+    if (PROBE == 0 || PROBE == 2 || p.act == 99) {
+        a4_epilogue<MI, NT, false, GLU, RES>(p, acc, m0, n0, n_tok, x_dec, nullptr, sc, sc2, wm, wn, g, t);
+    }
 #else
     __trap();  // launched only where nvfp4_a4_probe answers 1
 #endif
@@ -255,10 +279,11 @@ inline bool a4_tma_map(CUtensorMap * map, const void * base, int64_t row_bytes, 
 }
 
 // nvfp4_a4_gemm_tma for a dense GEMM (SwiGLU, residual or plain) of whole stages (k % 256 == 0);
-// -1 when it does not apply or a tensor map cannot be made (nothing launched).
-template <int NT, int ST> int dense_tma(const legion_nvfp4_a4 & p0, cudaStream_t st) {
+// -1 when it does not apply or a tensor map cannot be made (nothing launched). PROBE: plain
+// GEMMs only.
+template <int NT, int ST, int PROBE = 0, bool GEN = false> int dense_tma(const legion_nvfp4_a4 & p0, cudaStream_t st) {
     using T = TmaTile<NT, ST>;
-    if (p0.plan || p0.k % 256 != 0 || p0.n <= 0 || p0.m <= 0) {
+    if (p0.plan || p0.k % 256 != 0 || p0.n <= 0 || p0.m <= 0 || (PROBE != 0 && (p0.w2 || p0.res))) {
         return -1;
     }
     legion_nvfp4_a4 p = p0;
@@ -279,12 +304,25 @@ template <int NT, int ST> int dense_tma(const legion_nvfp4_a4 & p0, cudaStream_t
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, T::SMEM);
         kernel<<<(unsigned) p.tiles_m * (unsigned) p.tiles_n, 256, T::SMEM, st>>>(p, maps);
     };
-    if (p.w2) {
-        go(nvfp4_a4_gemm_tma<NT, ST, true, false>);
+    if constexpr (PROBE != 0) {
+        go(nvfp4_a4_gemm_tma<NT, ST, false, false, PROBE, GEN>);
+    } else if (p.w2) {
+        go(nvfp4_a4_gemm_tma<NT, ST, true, false, 0, GEN>);
     } else if (p.res) {
-        go(nvfp4_a4_gemm_tma<NT, ST, false, true>);
+        go(nvfp4_a4_gemm_tma<NT, ST, false, true, 0, GEN>);
     } else {
-        go(nvfp4_a4_gemm_tma<NT, ST, false, false>);
+        go(nvfp4_a4_gemm_tma<NT, ST, false, false, 0, GEN>);
     }
     return status();
+}
+
+// dense_tma<NT, ST, probe, GEN> (legion nvfp4-a4-bench; probe 0 the GEMM).
+template <int NT, int ST, bool GEN> int dense_tma_probe(const legion_nvfp4_a4 & p, cudaStream_t st, int probe) {
+    switch (probe) {
+        case 0: return dense_tma<NT, ST, 0, GEN>(p, st);
+        case 1: return dense_tma<NT, ST, 1, GEN>(p, st);
+        case 2: return dense_tma<NT, ST, 2, GEN>(p, st);
+        case 3: return dense_tma<NT, ST, 3, GEN>(p, st);
+        default: return -1;
+    }
 }
