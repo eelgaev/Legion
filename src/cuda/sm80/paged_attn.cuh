@@ -113,7 +113,11 @@ __device__ __forceinline__ int split_blocks(int max_split, int split, int * b0, 
     return ns;
 }
 
-template <int D, int G, bool C = false, bool SPLIT = false>
+// QR (#1181, heads of 512): Q's B fragments are read again from p.q for each K chunk, just
+// before its barrier, instead of being held in registers for the whole key walk (D / 8 of them
+// a thread). That frees 32-64 registers of a kernel at 255, for more ldmatrix and MMA chains in
+// flight. The same values packed the same way: the same bits.
+template <int D, int G, bool C = false, bool SPLIT = false, bool QR = false>
 __global__ void __launch_bounds__(Shape<D>::NW * 32, Shape<D>::MINB) paged_prefill_mma(const legion_paged_attn p) {
 #ifdef LEGION_PAGED_MMA
     using SH = Shape<D>;
@@ -166,18 +170,23 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, Shape<D>::MINB) paged_prefi
     }
 
     // Q as B fragments (k = dims, n = columns): column gq, dims 2 tq + {0, 1} and + 8.
-    uint32_t qf[KS][2];
+    const float * qr;
     {
         const int c = warp * 8 + gq;
         const int t = tok_of(c);
-        const float * qr = (const float *) ((const char *) p.q + seq * p.q_nb3 + t * p.q_nb2 +
-                                            (kvh * G + c % G) * p.q_nb1);
+        qr = (const float *) ((const char *) p.q + seq * p.q_nb3 + t * p.q_nb2 + (kvh * G + c % G) * p.q_nb1);
+    }
+    auto q_frag = [&](int ks, uint32_t f[2]) {
+        const float2 a = *(const float2 *) (qr + ks * 16 + 2 * tq);
+        const float2 b = *(const float2 *) (qr + ks * 16 + 8 + 2 * tq);
+        f[0] = pack(a.x, a.y);
+        f[1] = pack(b.x, b.y);
+    };
+    uint32_t qf[QR ? 1 : KS][2];
+    if constexpr (!QR) {
 #pragma unroll
         for (int ks = 0; ks < KS; ks++) {
-            const float2 a = *(const float2 *) (qr + ks * 16 + 2 * tq);
-            const float2 b = *(const float2 *) (qr + ks * 16 + 8 + 2 * tq);
-            qf[ks][0] = pack(a.x, a.y);
-            qf[ks][1] = pack(b.x, b.y);
+            q_frag(ks, qf[ks]);
         }
     }
 
@@ -254,6 +263,16 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, Shape<D>::MINB) paged_prefi
         float alpha[2];
 #pragma unroll
         for (int part = 0; part < 2 * NC; part++, j++) {
+            // QR: this K chunk's Q fragments, loaded while the CTA waits for the chunk.
+            uint32_t qc[QR ? CH / 16 : 1][2];
+            if constexpr (QR) {
+                if (part < NC && active) {
+#pragma unroll
+                    for (int ks = 0; ks < CH / 16; ks++) {
+                        q_frag(part * (CH / 16) + ks, qc[ks]);
+                    }
+                }
+            }
             asm volatile("cp.async.wait_group %0;\n" ::"n"(NS - 2));
             __syncthreads();
             issue(j + NS - 1);
@@ -263,18 +282,39 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, Shape<D>::MINB) paged_prefi
             const uint32_t st = sbase + (uint32_t) (j % NS) * CHUNK;
             if (part < NC) {
                 // S^T += K Q^T over this chunk's dims.
-#pragma unroll
-                for (int i = 0; i < 4; i++) {
-                    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                if constexpr (QR) {
+                    // The four 16-key chains side by side, each in the same k order.
+                    float acc[4][4] = {};
 #pragma unroll
                     for (int ks = 0; ks < CH / 16; ks++) {
-                        uint32_t a[4];
-                        ldsm(a, st + k_lane + k_x[ks % 4] + i * 16 * ROWB + ks / 4 * 128);
-                        mma(acc, a, qf[part * (CH / 16) + ks]);
+#pragma unroll
+                        for (int i = 0; i < 4; i++) {
+                            uint32_t a[4];
+                            ldsm(a, st + k_lane + k_x[ks % 4] + i * 16 * ROWB + ks / 4 * 128);
+                            mma(acc[i], a, qc[ks]);
+                        }
                     }
 #pragma unroll
-                    for (int e = 0; e < 4; e++) {
-                        s[i][e] = part == 0 ? acc[e] : s[i][e] + acc[e];
+                    for (int i = 0; i < 4; i++) {
+#pragma unroll
+                        for (int e = 0; e < 4; e++) {
+                            s[i][e] = part == 0 ? acc[i][e] : s[i][e] + acc[i][e];
+                        }
+                    }
+                } else {
+#pragma unroll
+                    for (int i = 0; i < 4; i++) {
+                        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+                        for (int ks = 0; ks < CH / 16; ks++) {
+                            uint32_t a[4];
+                            ldsm(a, st + k_lane + k_x[ks % 4] + i * 16 * ROWB + ks / 4 * 128);
+                            mma(acc, a, qf[part * (CH / 16) + ks]);
+                        }
+#pragma unroll
+                        for (int e = 0; e < 4; e++) {
+                            s[i][e] = part == 0 ? acc[e] : s[i][e] + acc[e];
+                        }
                     }
                 }
                 if (part == NC - 1) {
@@ -324,6 +364,33 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, Shape<D>::MINB) paged_prefi
             } else {
                 // O^T = O^T alpha + V^T P for this chunk's output dims.
                 const int c = part - NC;
+                if constexpr (QR) {
+                    // PG output row groups side by side, each in the same k order.
+                    constexpr int PG = 4;
+#pragma unroll
+                    for (int i0 = 0; i0 < CH / 16; i0 += PG) {
+                        float acc[PG][4] = {};
+#pragma unroll
+                        for (int ks = 0; ks < 4; ks++) {
+#pragma unroll
+                            for (int h = 0; h < PG; h++) {
+                                const int i = i0 + h;
+                                uint32_t a[4];
+                                ldsm_t(a, st + v_lane + v_x[i % 4] + ks * 16 * ROWB + i / 4 * 128);
+                                mma(acc[h], a, pf[ks]);
+                            }
+                        }
+#pragma unroll
+                        for (int h = 0; h < PG; h++) {
+                            float * oi = o[c * (CH / 16) + i0 + h];
+                            oi[0] = oi[0] * alpha[0] + acc[h][0];
+                            oi[1] = oi[1] * alpha[1] + acc[h][1];
+                            oi[2] = oi[2] * alpha[0] + acc[h][2];
+                            oi[3] = oi[3] * alpha[1] + acc[h][3];
+                        }
+                    }
+                    continue;
+                }
 #pragma unroll
                 for (int i = 0; i < CH / 16; i++) {
                     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -407,14 +474,15 @@ bool available() {
     return legion_device::compute_capability() >= 80;
 }
 
-template <int D, int G, bool C = false>
+template <int D, int G, bool C = false, bool QR = false>
 int launch(const legion_paged_attn & p, cudaStream_t st) {
     static std::atomic<int8_t> opted_in[GGML_CUDA_MAX_DEVICES];
-    if (!legion_device::smem_opt_in(opted_in, paged_prefill_mma<D, G, C>, (int) Shape<D>::SMEM)) {
+    if (!legion_device::smem_opt_in(opted_in, paged_prefill_mma<D, G, C, false, QR>, (int) Shape<D>::SMEM)) {
         return 2;
     }
     constexpr int QT = Shape<D>::COLS / G;
-    paged_prefill_mma<D, G, C><<<dim3((p.n_tok + QT - 1) / QT, p.n_head_kv, p.n_seqs), Shape<D>::NW * 32, Shape<D>::SMEM, st>>>(p);
+    paged_prefill_mma<D, G, C, false, QR>
+        <<<dim3((p.n_tok + QT - 1) / QT, p.n_head_kv, p.n_seqs), Shape<D>::NW * 32, Shape<D>::SMEM, st>>>(p);
     return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
 

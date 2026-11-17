@@ -738,6 +738,44 @@ unsafe extern "C" {
     fn legion_paged_attn_vsplit_launches() -> i64;
     fn legion_paged_attn_set_qm(on: i32, this_thread: i32);
     fn legion_paged_attn_qm_launches() -> i64;
+    fn legion_paged_attn_set_q_reload(on: i32, this_thread: i32);
+    fn legion_paged_attn_q_reload_launches() -> i64;
+}
+
+/// Prefill groups with heads of 512 and 8 query heads a kv head (Gemma 4's global layers) on
+/// `paged_prefill_mma` read Q's fragments again for each K chunk and run their MMA chains side by
+/// side (#1181), or (`false`, the default) hold Q in registers as before. The same bits either
+/// way. For every thread.
+pub fn set_q_reload(on: bool) {
+    #[cfg(feature = "cuda")]
+    // SAFETY: sets a flag the launches read.
+    unsafe {
+        legion_paged_attn_set_q_reload(i32::from(on), 0)
+    };
+    #[cfg(not(feature = "cuda"))]
+    let _ = on;
+}
+
+/// [`set_q_reload`] for launches from the calling thread only (benches); `None` follows the
+/// setting for every thread again.
+pub fn set_q_reload_here(on: Option<bool>) {
+    #[cfg(feature = "cuda")]
+    // SAFETY: sets a thread-local flag the launches read.
+    unsafe {
+        legion_paged_attn_set_q_reload(on.map_or(-1, i32::from), 1)
+    };
+    #[cfg(not(feature = "cuda"))]
+    let _ = on;
+}
+
+/// Launches of `paged_prefill_mma` with Q read again ([`set_q_reload`]) from the calling thread
+/// so far (0 without CUDA).
+pub fn q_reload_launches() -> i64 {
+    #[cfg(feature = "cuda")]
+    // SAFETY: reads a thread-local counter.
+    return unsafe { legion_paged_attn_q_reload_launches() };
+    #[cfg(not(feature = "cuda"))]
+    0
 }
 
 /// Prefill groups with heads of 256 on compute capability 12.x devices (a DGX Spark's GB10, RTX

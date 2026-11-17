@@ -38,6 +38,11 @@ pub struct PagedQmBenchArgs {
     /// Skip the edge cases.
     #[arg(long)]
     no_edges: bool,
+    /// Heads of 512 instead (give `--heads 32,4` for Gemma 4 31B's global layers): the kernel
+    /// held against `paged_prefill_mma` is that kernel with Q read again for each K chunk and its
+    /// MMA chains side by side (#1181, `LEGION_DEBUG_PAGED_Q_RELOAD`); `--modes` is ignored.
+    #[arg(long)]
+    q_reload: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -50,7 +55,13 @@ pub fn run(args: PagedQmBenchArgs) -> anyhow::Result<()> {
     let [n_head, n_head_kv] = args.heads[..] else {
         anyhow::bail!("--heads takes query heads, kv heads");
     };
-    let heads = (256, n_head, n_head_kv);
+    let d = if args.q_reload { 512 } else { 256 };
+    let modes = if args.q_reload {
+        vec![-1]
+    } else {
+        args.modes.clone()
+    };
+    let heads = (d, n_head, n_head_kv);
     let mut chunks = Vec::new();
     for c in &args.chunks {
         let (p, t) = c
@@ -61,10 +72,10 @@ pub fn run(args: PagedQmBenchArgs) -> anyhow::Result<()> {
     let mut gpu = legion::ggml::backend_by_name("CUDA0")?;
     let mut differ = 0;
     if !args.no_edges {
-        for &mode in &args.modes {
+        for &mode in &modes {
             let (cases, ran, total, bad) = bench::edges(&mut gpu, mode);
             println!(
-                "edges, mode {mode}: {cases} cases ({ran} on the queries-as-M kernel), {bad} of \
+                "edges, mode {mode}: {cases} cases ({ran} on the kernel under test), {bad} of \
                  {total} values differ"
             );
             differ += bad;
@@ -84,7 +95,7 @@ pub fn run(args: PagedQmBenchArgs) -> anyhow::Result<()> {
         "{:>7} {:>6} {:>4} {:>9}",
         "n_past", "n_tok", "seqs", "mma ms"
     );
-    for m in &args.modes {
+    for m in &modes {
         print!(" {:>9} {:>6} {:>6}", format!("m{m} ms"), "x", "bits");
     }
     println!();
@@ -100,7 +111,7 @@ pub fn run(args: PagedQmBenchArgs) -> anyhow::Result<()> {
             width: len,
             window: args.window,
             ring: 0,
-            scale: 1.0 / 16.0,
+            scale: 1.0 / (d as f32).sqrt(),
         };
         // Both orders (mma, qm, qm, mma), each kernel's faster run kept, so warm-up and clock
         // drift do not favour the side that runs second.
@@ -110,7 +121,7 @@ pub fn run(args: PagedQmBenchArgs) -> anyhow::Result<()> {
         let (a1, m1, _) = t(0);
         anyhow::ensure!(finite(&a1), "{n_past}:{n_tok}: non-finite mma output");
         let mut cols = Vec::new();
-        for &mode in &args.modes {
+        for &mode in &modes {
             let (b1, q1, ran) = t(mode);
             anyhow::ensure!(
                 finite(&b1),

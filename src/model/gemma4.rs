@@ -562,6 +562,14 @@ impl Model {
         layers: std::ops::Range<usize>,
     ) -> Result<(Tensor<'a>, Vec<(usize, Tensor<'a>)>), ModelError> {
         let (ctx, tap, n) = (pass.ctx, &pass.tap, pass.n);
+        // LEGION_DEBUG_PAGED_Q_RELOAD=1 (#1181): the global layers' prompt attention reads Q
+        // again for each K chunk (`paged::set_q_reload`), the same bits; read once.
+        static Q_RELOAD: std::sync::Once = std::sync::Once::new();
+        Q_RELOAD.call_once(|| {
+            if std::env::var("LEGION_DEBUG_PAGED_Q_RELOAD").is_ok_and(|v| v == "1") {
+                crate::model::core::paged::set_q_reload(true);
+            }
+        });
         let hp = &self.hp;
         let eps = hp.rms_eps;
         let norm = |t: Tensor<'a>, il: usize, name: &str| -> Result<Tensor<'a>, ModelError> {

@@ -11,9 +11,10 @@ use crate::ggml::{Backend, ComputeAllocator};
 use crate::model::core::KvPool;
 
 /// One run of the op for `g` over `kv` with the kernel in mode `mode` for this thread (0 off, 1
-/// the default, 2 on for every group it covers, [`set_qm_mode_here`]): its output,
+/// the default, 2 on for every group it covers, [`set_qm_mode_here`]; -1: off, and
+/// `paged_prefill_mma` with Q read again instead, [`set_q_reload_here`], #1181): its output,
 /// its milliseconds (best of `rounds` rounds of `reps` runs after the first; 0 without), and
-/// whether the queries-as-M kernel ran.
+/// whether the queries-as-M kernel (-1: the Q reload) ran.
 pub fn run(
     backend: &mut Backend,
     kv: &KvPool,
@@ -22,7 +23,8 @@ pub fn run(
     reps: usize,
     rounds: usize,
 ) -> (Vec<f32>, f64, bool) {
-    set_qm_mode_here(mode);
+    set_qm_mode_here(mode.max(0));
+    set_q_reload_here(Some(mode < 0));
     let (kp, vp) = kv.pools(0);
     let (d, n_head, _) = g.heads;
     let ns = g.n_past.len();
@@ -49,9 +51,13 @@ pub fn run(
     fill(q, tab, past, g);
     // Garbage in the output: every value the kernels write they compute.
     out.set_f32(&vec![f32::NAN; out.elements()]);
-    let before = qm_launches();
+    let before = (qm_launches(), q_reload_launches());
     backend.compute(&graph).expect("compute");
-    let ran = qm_launches() > before;
+    let ran = if mode < 0 {
+        q_reload_launches() > before.1
+    } else {
+        qm_launches() > before.0
+    };
     let first = out.to_f32();
     let mut best = 0.0f64;
     if reps > 0 {
@@ -65,6 +71,7 @@ pub fn run(
         }
     }
     set_qm_prefill_here(None);
+    set_q_reload_here(None);
     (first, best, ran)
 }
 
@@ -89,24 +96,33 @@ pub fn compare(backend: &mut Backend, kv: &KvPool, g: &Group, mode: i32) -> (usi
 /// The edge cases for heads of 256 with the kernel in mode `mode`: every GQA ratio, groups from
 /// 2 tokens (verify steps) to more than one 128-row tile per token run, several sequences over
 /// shuffled tables, contexts that end before, on and after block boundaries, windows that start
-/// inside blocks (Gemma 4's sliding window of 1,024 among them), a ring. Returns (cases, cases
-/// the kernel ran, values compared, values that differ), printing each failing case.
+/// inside blocks (Gemma 4's sliding window of 1,024 among them), a ring. Mode -1 (the Q reload)
+/// takes the same cases with heads of 512 at 8 query heads a kv head. Returns (cases, cases the
+/// kernel ran, values compared, values that differ), printing each failing case.
 pub fn edges(backend: &mut Backend, mode: i32) -> (usize, usize, usize, usize) {
     let (mut cases, mut ran_cases, mut total, mut differ) = (0, 0, 0, 0);
     let n_blocks = 160;
-    for (n_head, n_head_kv) in [
-        (16, 16),
-        (32, 16),
-        (16, 4),
-        (24, 4),
-        (16, 2),
-        (24, 2),
-        (32, 2),
-    ] {
-        let heads = (256, n_head, n_head_kv);
+    let (d, pairs): (usize, &[(usize, usize)]) = if mode < 0 {
+        (512, &[(32, 4), (16, 2)])
+    } else {
+        (
+            256,
+            &[
+                (16, 16),
+                (32, 16),
+                (16, 4),
+                (24, 4),
+                (16, 2),
+                (24, 2),
+                (32, 2),
+            ],
+        )
+    };
+    for &(n_head, n_head_kv) in pairs {
+        let heads = (d, n_head, n_head_kv);
         let kv = super::wmma_bench::pool(backend, heads, n_blocks);
         let g_ratio = n_head / n_head_kv;
-        let rsd = 1.0 / 16.0;
+        let rsd = 1.0 / (d as f32).sqrt();
         // Verify-sized groups (2 to 64 tokens), then prompt chunks around the old threshold of
         // 256 rows and past one 128-row tile per token run.
         let sizes = [2, 3, 8, 11, 16, 21, 33, 64, 256 / g_ratio + 5, 300];
