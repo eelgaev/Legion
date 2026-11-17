@@ -11,7 +11,10 @@ use clap::Args;
 pub struct Nvfp4A4BenchArgs {
     /// Shapes as `k:m:n` (weight rows of `k`, `m` outputs, `n` tokens), `k:m:n:glu` (the fused
     /// SwiGLU of two such weights) or `k:m:n:res` (a residual added in the epilogue), comma
-    /// separated.
+    /// separated. `k:m:n:mlp` (`gmlp`): a whole MLP, the SwiGLU (GeGLU) to `m` then the down
+    /// matmul back to `k` (with a residual; `gmlp` without), timed in pieces with the SwiGLU's
+    /// row amax for the down matmul's quantization off and on (#1133 r14), whose down outputs
+    /// and quantized activations are checked byte for byte.
     #[arg(
         long,
         value_delimiter = ',',
@@ -45,6 +48,8 @@ struct Shape {
     n: usize,
     glu: bool,
     res: bool,
+    /// A whole MLP (`mlp`, `gmlp`): Some(GeGLU).
+    mlp: Option<bool>,
 }
 
 #[cfg(feature = "cuda")]
@@ -57,8 +62,8 @@ fn parse(s: &str) -> anyhow::Result<Shape> {
     let num = |i: usize| -> anyhow::Result<usize> { Ok(parts[i].parse::<usize>()?) };
     let tag = parts.get(3).copied().unwrap_or("");
     anyhow::ensure!(
-        matches!(tag, "" | "glu" | "res"),
-        "--shapes: {tag} is not glu or res"
+        matches!(tag, "" | "glu" | "res" | "mlp" | "gmlp"),
+        "--shapes: {tag} is not glu, res, mlp or gmlp"
     );
     let shape = Shape {
         k: num(0)?,
@@ -66,12 +71,206 @@ fn parse(s: &str) -> anyhow::Result<Shape> {
         n: num(2)?,
         glu: tag == "glu",
         res: tag == "res",
+        mlp: matches!(tag, "mlp" | "gmlp").then_some(tag == "gmlp"),
     };
     anyhow::ensure!(
         shape.k % 256 == 0 && shape.m % 128 == 0 && shape.n > 0,
         "--shapes: k a multiple of 256, m of 128 ({s})"
     );
+    anyhow::ensure!(
+        shape.mlp.is_none() || shape.m % 256 == 0,
+        "--shapes: an MLP's m a multiple of 256 too ({s})"
+    );
     Ok(shape)
+}
+
+/// BF16 bits of `v` (round to nearest even; finite values).
+#[cfg(feature = "cuda")]
+fn bf16(v: f32) -> [u8; 2] {
+    let b = v.to_bits();
+    (((b + 0x7fff + (b >> 16 & 1)) >> 16) as u16).to_le_bytes()
+}
+
+/// An `mlp` / `gmlp` shape: the MLP graph with the SwiGLU's row amax off and on (bits of the
+/// down matmul's outputs and quantized activations compared), and its pieces timed: the
+/// SwiGLU alone, the down matmul alone on a BF16 input (its quantization's own amax pass), and
+/// that quantization alone. Returns the differing bytes.
+#[cfg(feature = "cuda")]
+fn mlp(
+    gpu: &mut legion::ggml::Backend,
+    s: &Shape,
+    args: &Nvfp4A4BenchArgs,
+) -> anyhow::Result<usize> {
+    use legion::ggml::{ComputeAllocator, Context, types};
+    use legion::model::nvfp4_a4 as a4;
+    let (k, m, n) = (s.k as i64, s.m as i64, s.n as i64);
+    let gelu = s.mlp == Some(true);
+    let layers = args.layers;
+    let weights_ctx = Context::new(3 * layers, 0);
+    // Per layer: gate, up, down.
+    let ws: Vec<[legion::ggml::Tensor<'_>; 3]> = (0..layers)
+        .map(|_| {
+            [
+                weights_ctx.new_tensor(types::NVFP4, &[k, m]),
+                weights_ctx.new_tensor(types::NVFP4, &[k, m]),
+                weights_ctx.new_tensor(types::NVFP4, &[m, k]),
+            ]
+        })
+        .collect();
+    weights_ctx.alloc_tensors(gpu.buffer_type())?;
+    for (l, [g, u, d]) in ws.iter().enumerate() {
+        let seed = 11 + 3 * l as u64;
+        g.set_bytes(&weights(s.k, s.m, seed));
+        u.set_bytes(&weights(s.k, s.m, seed + 1));
+        d.set_bytes(&weights(s.m, s.k, seed + 2));
+    }
+    fn glu_op<'a>(
+        ctx: &'a Context,
+        gelu: bool,
+        wg: legion::ggml::Tensor<'a>,
+        wu: legion::ggml::Tensor<'a>,
+        x: legion::ggml::Tensor<'a>,
+    ) -> legion::ggml::Tensor<'a> {
+        if gelu {
+            a4::geglu(ctx, wg, wu, x, None, None)
+        } else {
+            a4::swiglu(ctx, wg, wu, x, None, None)
+        }
+    }
+    let cap = 8 * layers + 8;
+    // The MLP.
+    let fctx = Context::new(cap, cap);
+    let fx = fctx.new_tensor(types::F32, &[k, n]).as_input();
+    let fr = (!gelu).then(|| fctx.new_tensor(types::F32, &[k, n]).as_input());
+    let mut full = fctx.new_graph(cap);
+    let outs: Vec<_> = ws
+        .iter()
+        .map(|&[g, u, d]| {
+            let y = glu_op(&fctx, gelu, g, u, fx);
+            let o = match fr {
+                Some(r) => a4::mul_mat_add(&fctx, d, y, None, r),
+                None => a4::mul_mat(&fctx, d, y, None),
+            }
+            .as_output();
+            full.expand(o);
+            o
+        })
+        .collect();
+    fctx.alloc_graph(&full, ComputeAllocator::new(gpu.buffer_type()))?;
+    // The SwiGLU alone.
+    let gctx = Context::new(cap, cap);
+    let gx = gctx.new_tensor(types::F32, &[k, n]).as_input();
+    let mut glu_graph = gctx.new_graph(cap);
+    for &[g, u, _] in &ws {
+        glu_graph.expand(glu_op(&gctx, gelu, g, u, gx).as_output());
+    }
+    gctx.alloc_graph(&glu_graph, ComputeAllocator::new(gpu.buffer_type()))?;
+    // The down matmul alone on a BF16 input, and that input's quantization alone.
+    let dctx = Context::new(cap, cap);
+    let dy = dctx.new_tensor(types::BF16, &[m, n]).as_input();
+    let dr = (!gelu).then(|| dctx.new_tensor(types::F32, &[k, n]).as_input());
+    let mut down = dctx.new_graph(cap);
+    for &[_, _, d] in &ws {
+        let o = match dr {
+            Some(r) => a4::mul_mat_add(&dctx, d, dy, None, r),
+            None => a4::mul_mat(&dctx, d, dy, None),
+        };
+        down.expand(o.as_output());
+    }
+    dctx.alloc_graph(&down, ComputeAllocator::new(gpu.buffer_type()))?;
+    let qctx = Context::new(cap, cap);
+    let qy = qctx.new_tensor(types::BF16, &[m, n]).as_input();
+    let mut quant = qctx.new_graph(cap);
+    for _ in 0..layers {
+        quant.expand(a4::quantize_op(&qctx, qy).as_output());
+    }
+    qctx.alloc_graph(&quant, ComputeAllocator::new(gpu.buffer_type()))?;
+
+    let mut rng = Rng(0x5eed_0000 + s.n as u64);
+    let xs: Vec<f32> = (0..s.k * s.n).map(|_| rng.unit()).collect();
+    fx.set_f32(&xs);
+    gx.set_f32(&xs);
+    let rs: Vec<f32> = (0..s.k * s.n).map(|_| rng.unit()).collect();
+    for r in [fr, dr].into_iter().flatten() {
+        r.set_f32(&rs);
+    }
+    let ys: Vec<u8> = (0..s.m * s.n)
+        .flat_map(|_| bf16(rng.unit() * 4.0))
+        .collect();
+    dy.set_bytes(&ys);
+    qy.set_bytes(&ys);
+
+    // Bits: the down node's outputs, codes, scales and decode scales (after the 256-byte
+    // aligned outputs), off against on.
+    let (q_ld, s_ld, [codes, scales, dec]) = a4::quant_layout(m, n);
+    let out = (k * n) as usize * 4;
+    let base = out.div_ceil(256) * 256;
+    let parts = [
+        (0, out),
+        (base + codes, (n * q_ld) as usize),
+        (base + scales, (n * s_ld) as usize),
+        (base + dec, n as usize * 4),
+    ];
+    let mut got: [Vec<Vec<u8>>; 2] = [Vec::new(), Vec::new()];
+    for (i, on) in [false, true].into_iter().enumerate() {
+        a4::force_glu_amax(Some(on));
+        gpu.compute(&full)?;
+        gpu.compute(&full)?;
+        got[i] = outs.iter().map(|&o| a4::node_bytes(o)).collect();
+    }
+    let mut bad = [0usize; 4];
+    for (a, b) in got[0].iter().zip(&got[1]) {
+        for (p, &(at, len)) in parts.iter().enumerate() {
+            bad[p] += a[at..at + len]
+                .iter()
+                .zip(&b[at..at + len])
+                .filter(|(x, y)| x != y)
+                .count();
+        }
+    }
+
+    // Times: best per-layer of `rounds` rounds of `reps` graphs, the cases taking turns.
+    let mut best = [f64::INFINITY; 6];
+    for _ in 0..args.rounds {
+        for (c, b) in best.iter_mut().enumerate() {
+            a4::force_glu_amax(Some(c % 2 == 1));
+            let g = match c {
+                0 | 1 => &full,
+                2 | 3 => &glu_graph,
+                4 => &down,
+                _ => &quant,
+            };
+            gpu.compute(g)?;
+            let t = std::time::Instant::now();
+            for _ in 0..args.reps {
+                gpu.compute(g)?;
+            }
+            *b = b.min(t.elapsed().as_secs_f64() / (args.reps * layers) as f64);
+        }
+    }
+    a4::force_glu_amax(None);
+    let ms = |v: f64| v * 1e3;
+    let op = if gelu { "gmlp" } else { "mlp" };
+    let (q_old, down_gemm) = (best[5], best[4] - best[5]);
+    println!(
+        "{k:>6} {m:>6} {n:>6} {op:>4} mlp off {:.3} on {:.3} ms ({:+.1}%) | glu off {:.3} on {:.3} | down+quant off {:.3} on {:.3} | down alone {:.3} = quant {:.3} + gemm {:.3} | new quant ~{:.3} | bits out/codes/scales/dec differ {} {} {} {}",
+        ms(best[0]),
+        ms(best[1]),
+        (best[1] / best[0] - 1.0) * 100.0,
+        ms(best[2]),
+        ms(best[3]),
+        ms(best[0] - best[2]),
+        ms(best[1] - best[3]),
+        ms(best[4]),
+        ms(q_old),
+        ms(down_gemm),
+        ms(best[1] - best[3] - down_gemm),
+        bad[0],
+        bad[1],
+        bad[2],
+        bad[3]
+    );
+    Ok(bad.iter().sum())
 }
 
 #[cfg(feature = "cuda")]
@@ -132,6 +331,10 @@ pub fn run(args: Nvfp4A4BenchArgs) -> anyhow::Result<()> {
         "k", "m", "n", "op", "variant", "ms", "TF", "x v1", "bits"
     );
     for s in &shapes {
+        if s.mlp.is_some() {
+            differ += mlp(&mut gpu, s, &args)?;
+            continue;
+        }
         let (k, m, n) = (s.k as i64, s.m as i64, s.n as i64);
         let n_w = if s.glu { 2 * layers } else { layers };
         let weights_ctx = Context::new(n_w, 0);

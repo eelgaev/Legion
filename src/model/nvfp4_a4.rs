@@ -303,6 +303,44 @@ fn layout(out: usize, rows: i64, k: i64, plan: usize) -> ([usize; 4], usize) {
     ([codes, scales, dec, plan_at], plan_at + plan * 4)
 }
 
+/// A dense SwiGLU node's result part: its BF16 `[m, rows]` outputs, then (256-byte aligned)
+/// one F32 per row, the row's largest |output| when the GEMM keeps it for the next matmul's
+/// quantization ([`force_glu_amax`]). Returns (that F32 array's offset, the part's bytes).
+fn glu_out(m: i64, rows: i64) -> (usize, usize) {
+    let amax_at = ((m * rows) as usize * 2).div_ceil(256) * 256;
+    (amax_at, amax_at + rows as usize * 4)
+}
+
+/// Turns the dense SwiGLU / GeGLU GEMMs' row amax (`legion_nvfp4_a4`'s `amax_out`, #1133 r14)
+/// on or off from now on, or back to `LEGION_DEBUG_NVFP4_A4_GLU_AMAX` for `None`: for `legion
+/// nvfp4-a4-bench`. On, the down matmul whose input is the whole result of such a node
+/// quantizes it in one pass, with that amax (the same bytes).
+#[doc(hidden)]
+pub fn force_glu_amax(on: Option<bool>) {
+    #[cfg(feature = "cuda")]
+    cuda::FORCED_GLU_AMAX.store(
+        on.map_or(0, |o| 1 + o as i32),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    #[cfg(not(feature = "cuda"))]
+    let _ = on;
+}
+
+/// All bytes of the node behind `t`, a view one of these ops returned: its result and the
+/// quantized activations after it (`legion nvfp4-a4-bench`'s bit checks).
+#[doc(hidden)]
+pub fn node_bytes(t: Tensor<'_>) -> Vec<u8> {
+    // SAFETY: `t` is a live view of an allocated node; a plain copy of the node's bytes.
+    unsafe {
+        let node = (*t.raw()).view_src;
+        assert!(!node.is_null(), "not a view of an op's node");
+        let n = ffi::ggml_nbytes(node);
+        let mut out = vec![0u8; n];
+        ffi::ggml_backend_tensor_get(node, out.as_mut_ptr().cast(), 0, n);
+        out
+    }
+}
+
 /// The ops' activation quantization alone (tests): `x` `[k, rows]` (F32 or BF16) to I8 bytes
 /// laid out as [`quant_layout`] says.
 #[doc(hidden)]
@@ -833,7 +871,7 @@ fn swiglu_with<'a>(
     let x = input(ctx, x);
     let [_, n1, n2, n3] = x.ne();
     let rows = n1 * n2 * n3;
-    let (_, total) = layout((m * rows) as usize * 2, rows, k, 0);
+    let (_, total) = layout(glu_out(m, rows).1, rows, k, 0);
     let mut args = vec![wg, wu, x];
     args.extend(sg);
     args.extend(su);
@@ -1332,6 +1370,28 @@ mod cuda {
     /// A dense tile forced by [`super::force_dense_variant`]; 0 is none.
     pub(super) static FORCED_VARIANT: AtomicI32 = AtomicI32::new(0);
 
+    /// [`super::force_glu_amax`]: 0 none, 1 off, 2 on.
+    pub(super) static FORCED_GLU_AMAX: AtomicI32 = AtomicI32::new(0);
+
+    /// Whether the dense GLU GEMMs keep their rows' amax for the down matmul's quantization
+    /// (#1133 r14): forced, else `LEGION_DEBUG_NVFP4_A4_GLU_AMAX` (`1` on, `0` off), else off.
+    fn glu_amax() -> bool {
+        static ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+        match FORCED_GLU_AMAX.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => ENV
+                .get_or_init(
+                    || match std::env::var("LEGION_DEBUG_NVFP4_A4_GLU_AMAX").as_deref() {
+                        Ok("1") => Some(true),
+                        Ok("0") => Some(false),
+                        _ => None,
+                    },
+                )
+                .unwrap_or(false),
+        }
+    }
+
     /// The dense GEMM's tile variant: a forced one, else 1 (the kernel before #1133 r12) under
     /// `LEGION_DEBUG_NVFP4_A4_GENERIC=1`, else 0 (the default).
     fn dense_variant() -> i32 {
@@ -1407,6 +1467,7 @@ mod cuda {
         res: *const f32,
         unread_skips: i32,
         variant: i32,
+        amax_out: *mut f32,
     }
 
     unsafe extern "C" {
@@ -1451,8 +1512,10 @@ mod cuda {
             s: *mut u8,
             s_ld: i64,
             d: *mut f32,
+            amax: *const f32,
             stream: *mut c_void,
         ) -> i32;
+        fn cudaMemsetAsync(ptr: *mut c_void, value: i32, count: usize, stream: *mut c_void) -> i32;
         #[allow(clippy::too_many_arguments)]
         fn legion_nvfp4_a4_rms_quant_launch(
             x: *const f32,
@@ -1525,6 +1588,19 @@ mod cuda {
         out_bytes: usize,
         stream: *mut c_void,
     ) -> Result<(*const u8, *const u8, *const f32), String> {
+        quantize_amax(dst, x, k, rows, out_bytes, std::ptr::null(), stream)
+    }
+
+    /// [`quantize`] with each row's amax already known (`amax`, or null: computed).
+    fn quantize_amax(
+        dst: &ffi::ggml_tensor,
+        x: &ffi::ggml_tensor,
+        k: i64,
+        rows: i64,
+        out_bytes: usize,
+        amax: *const f32,
+        stream: *mut c_void,
+    ) -> Result<(*const u8, *const u8, *const f32), String> {
         let x_ld = (x.nb[1] / x.nb[0]) as i64;
         if k % 64 != 0 || !(x.nb[1]).is_multiple_of(16) || !(x.data as usize).is_multiple_of(16) {
             return Err(format!(
@@ -1549,6 +1625,7 @@ mod cuda {
                 s,
                 s_ld,
                 d,
+                amax,
                 stream,
             )
         };
@@ -1597,6 +1674,34 @@ mod cuda {
             res: std::ptr::null(),
             unread_skips: 0,
             variant: dense_variant(),
+            amax_out: std::ptr::null_mut(),
+        }
+    }
+
+    /// The row amax a dense GLU node keeps for the down matmul (see [`super::glu_out`]), when
+    /// `x` (that matmul's input, `k` x `rows`) is a whole result of such a node where it runs
+    /// (not a copy from another backend) and [`glu_amax`] is on.
+    fn glu_amax_of(x: &ffi::ggml_tensor, k: i64, rows: i64) -> *const f32 {
+        let node = x.view_src;
+        if !glu_amax()
+            || node.is_null()
+            || x.view_offs != 0
+            || x.type_ != types::BF16
+            || x.nb[1] != k as usize * 2
+        {
+            return std::ptr::null();
+        }
+        // SAFETY: `x`'s view source is a valid tensor; a SwiGLU node's sources are its gate
+        // weight and input (see `swiglu_with`).
+        unsafe {
+            if !crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &A4_SWIGLU)) {
+                return std::ptr::null();
+            }
+            let (wg, xin) = (&*(*node).src[0], &*(*node).src[2]);
+            if wg.ne[1] != k || xin.ne[1] * xin.ne[2] * xin.ne[3] != rows {
+                return std::ptr::null();
+            }
+            ((*node).data as *const u8).add(super::glu_out(k, rows).0) as *const f32
         }
     }
 
@@ -1633,7 +1738,8 @@ mod cuda {
         let (w, x) = unsafe { (&*dst.src[0], &*dst.src[1]) };
         let (k, m, n) = (w.ne[0], w.ne[1], x.ne[1] * x.ne[2] * x.ne[3]);
         let esize = if act == 1 { 2 } else { 4 };
-        let xq = quantize(dst, x, k, n, (m * n) as usize * esize, stream)?;
+        let amax = glu_amax_of(x, k, n);
+        let xq = quantize_amax(dst, x, k, n, (m * n) as usize * esize, amax, stream)?;
         let nt = tokens_tile(n);
         let tiles = (
             (m + BM - 1) / BM,
@@ -1744,7 +1850,7 @@ mod cuda {
         // device.
         let (wg, wu, x) = unsafe { (&*dst.src[0], &*dst.src[1], &*dst.src[2]) };
         let (k, m, n) = (wg.ne[0], wg.ne[1], x.ne[1] * x.ne[2] * x.ne[3]);
-        let out_bytes = (m * n) as usize * 2;
+        let (amax_at, out_bytes) = super::glu_out(m, n);
         let xq = if has_norm != 0 {
             // SAFETY: the norm weight follows the scales (see `swiglu_norm`).
             let nw = unsafe { &*dst.src[3 + (has_g + has_u) as usize] };
@@ -1752,6 +1858,18 @@ mod cuda {
             rms_norm_quantize(dst, x, nw, eps, (k, n), out_bytes, stream)?
         } else {
             quantize(dst, x, k, n, out_bytes, stream)?
+        };
+        // The rows' amax for the down matmul (glu_amax_of), maxed in by the GEMM from zeros.
+        let amax_out = if glu_amax() {
+            // SAFETY: the amax array lies in the node (see `glu_out`); the node's stream.
+            let at = unsafe { (dst.data as *mut u8).add(amax_at) };
+            let code = unsafe { cudaMemsetAsync(at.cast(), 0, n as usize * 4, stream) };
+            if code != 0 {
+                return Err(format!("nvfp4 a4 swiglu amax: CUDA error {code}"));
+            }
+            at as *mut f32
+        } else {
+            std::ptr::null_mut()
         };
         let nt = tokens_tile(n);
         let tiles = (
@@ -1769,6 +1887,7 @@ mod cuda {
         );
         p.w2 = wu.data as *const u8;
         p.scale2 = scale_ptr(dst, has_u, 3 + has_g as usize);
+        p.amax_out = amax_out;
         launch(&p, nt, stream)
     }
 

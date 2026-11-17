@@ -75,13 +75,21 @@ struct legion_nvfp4_a4 {
     // kernel before #1133 r12, 2 to 5 one tile forced (A/B and the bench). Bits 8-9: a probe of
     // tiles 2 and 4 (legion nvfp4-a4-bench; not the GEMM's outputs).
     int32_t variant;
+    // Dense GLU, nonzero: each token's largest |output| as stored (the BF16 value), maxed in by
+    // atomicMax on the bits of the non-negative F32 (zeroed before the launch): the row amax the
+    // next matmul's quantization of these outputs needs (#1133 r14), which then skips its own pass.
+    float * amax_out;
 };
 
 // Quantizes `rows` rows of k (F32 if x_bf16 is 0, else BF16; x_ld elements apart) to the layout
 // above: codes rows of q_ld bytes, scales rows of s_ld bytes, decode scales d. Blocks of 64
 // between k and the row strides are written as zeros. Needs k % 64 == 0, 16-byte aligned rows.
+// amax: null, or each row's max |x| already known (a GLU GEMM's amax_out): then one pass over
+// the rows (one thread per sub-block) instead of the amax pass and the quantization; the same
+// bytes (the max does not depend on the order it is taken in).
 int legion_nvfp4_a4_quant_launch(const void * x, int x_bf16, int64_t x_ld, int64_t k, int64_t rows, uint8_t * q,
-                                 int64_t q_ld, uint8_t * s, int64_t s_ld, float * d, void * stream);
+                                 int64_t q_ld, uint8_t * s, int64_t s_ld, float * d, const float * amax,
+                                 void * stream);
 
 // legion_nvfp4_a4_quant_launch of mul(rms_norm(x, eps), w) (x F32 rows of k, x_ld elements
 // apart; w F32 [k]) without storing the normed rows: each row's norm computed as ggml-cuda's
@@ -303,20 +311,12 @@ __device__ __forceinline__ float scale_error(const float * lo, const float * hi,
 #endif
 
 #ifdef LEGION_FP4_MMA
-// Sub-blocks [tid, tid + step, ...) of a row (xr, k values; the row's amax known) quantized:
-// codes, scales and (thread 0) the decode scale; sub-blocks past k up to s_ld written as zeros.
+// Sub-block sb of a row (xr, nsb sub-blocks of values; enc = 2688 / amax and enc16 = 448 / amax
+// of the row's amax, 0 for an all-zero row) quantized: its codes and scale; past nsb zeros.
 template <typename T>
-__device__ __forceinline__ void quant_row(const T * xr, float amax, int64_t k, int64_t row, uint8_t * q,
-                                          int64_t q_ld, uint8_t * s, int64_t s_ld, float * d, int tid, int step) {
-    // Codes are x * enc / scale; a sub-block's scale is its amax * 448 / row amax.
-    const bool live = amax > 0.0f;
-    const float enc = live ? __fdiv_rn(2688.0f, amax) : 0.0f;
-    const float enc16 = live ? __fdiv_rn(448.0f, amax) : 0.0f;
-    if (tid == 0) {
-        d[row] = __fdiv_rn(amax, 2688.0f);
-    }
-    const int64_t nsb = k / 16;
-    for (int64_t sb = tid; sb < s_ld; sb += step) {
+__device__ __forceinline__ void quant_sb(const T * xr, float enc, float enc16, int64_t nsb, int64_t sb, int64_t row,
+                                         uint8_t * q, int64_t q_ld, uint8_t * s, int64_t s_ld) {
+    {
         uint32_t c0 = 0, c1 = 0;
         uint8_t sc = 0;
         if (sb < nsb) {
@@ -359,6 +359,29 @@ __device__ __forceinline__ void quant_row(const T * xr, float amax, int64_t k, i
     }
 }
 
+// Codes are x * enc / scale; a sub-block's scale is its amax * 448 / row amax.
+__device__ __forceinline__ void quant_encs(float amax, float & enc, float & enc16) {
+    const bool live = amax > 0.0f;
+    enc = live ? __fdiv_rn(2688.0f, amax) : 0.0f;
+    enc16 = live ? __fdiv_rn(448.0f, amax) : 0.0f;
+}
+
+// Sub-blocks [tid, tid + step, ...) of a row (xr, k values; the row's amax known) quantized:
+// codes, scales and (thread 0) the decode scale; sub-blocks past k up to s_ld written as zeros.
+template <typename T>
+__device__ __forceinline__ void quant_row(const T * xr, float amax, int64_t k, int64_t row, uint8_t * q,
+                                          int64_t q_ld, uint8_t * s, int64_t s_ld, float * d, int tid, int step) {
+    float enc, enc16;
+    quant_encs(amax, enc, enc16);
+    if (tid == 0) {
+        d[row] = __fdiv_rn(amax, 2688.0f);
+    }
+    const int64_t nsb = k / 16;
+    for (int64_t sb = tid; sb < s_ld; sb += step) {
+        quant_sb(xr, enc, enc16, nsb, sb, row, q, q_ld, s, s_ld);
+    }
+}
+
 // ggml-cuda's warp_reduce_sum (common.cuh, MIT): butterfly over the 32 lanes.
 __device__ __forceinline__ float warp_sum(float x) {
 #pragma unroll
@@ -398,6 +421,30 @@ __global__ void __launch_bounds__(128) nvfp4_a4_quant(const T * x, int64_t x_ld,
     __syncthreads();
     amax = fmaxf(fmaxf(red[0], red[1]), fmaxf(red[2], red[3]));
     quant_row(xr, amax, k, row, q, q_ld, s, s_ld, d, threadIdx.x, 128);
+#else
+    __trap();  // launched only where nvfp4_a4_probe answers 1
+#endif
+}
+
+// nvfp4_a4_quant with each row's amax given (a GLU GEMM's amax_out, #1133 r14): grid (rows,
+// s_ld / 128 rounded up), one sub-block per thread, so the rows are read once and every CTA
+// streams 4 KiB of one row. quant_sb's arithmetic on the same amax: the same bytes.
+template <typename T>
+__global__ void __launch_bounds__(128) nvfp4_a4_quant_amax(const T * x, int64_t x_ld, int64_t k, const float * amax,
+                                                           uint8_t * q, int64_t q_ld, uint8_t * s, int64_t s_ld,
+                                                           float * d) {
+#ifdef LEGION_FP4_MMA
+    const int64_t row = blockIdx.x;
+    const int64_t sb = (int64_t) blockIdx.y * 128 + threadIdx.x;
+    const float a = amax[row];
+    if (blockIdx.y == 0 && threadIdx.x == 0) {
+        d[row] = __fdiv_rn(a, 2688.0f);
+    }
+    if (sb < s_ld) {
+        float enc, enc16;
+        quant_encs(a, enc, enc16);
+        quant_sb(x + row * x_ld, enc, enc16, k / 16, sb, row, q, q_ld, s, s_ld);
+    }
 #else
     __trap();  // launched only where nvfp4_a4_probe answers 1
 #endif
@@ -894,6 +941,13 @@ __device__ __forceinline__ void a4_epilogue(const legion_nvfp4_a4 & p, const flo
                                             int64_t n0, int n_tok, const float * x_dec, const int64_t * d_off,
                                             float sc, float sc2, int wm, int wn, int g, int t) {
     if constexpr (GLU) {
+        // Dense, p.amax_out: this thread's largest |output| as stored, per token (j, e % 2).
+        const bool amax = !GROUPED && p.amax_out;
+        float tmax[NT][2];
+#pragma unroll
+        for (int j = 0; j < NT; j++) {
+            tmax[j][0] = tmax[j][1] = 0.0f;
+        }
 #pragma unroll
         for (int i = 0; i < MI / 2; i++) {
             const int64_t r0 = m0 + wm * 8 * MI + i * 16 + g;
@@ -910,11 +964,37 @@ __device__ __forceinline__ void a4_epilogue(const legion_nvfp4_a4 & p, const flo
                         const float up = acc[i + MI / 2][j][e] * sc2 * x_dec[tk];
                         const float v = (p.act == 3 ? a4_gelu(gate) : gate / (1.0f + expf(-gate))) * up;
                         const int64_t off = (GROUPED ? d_off[tk] : (n0 + tk) * p.m) + row;
+                        float stored = v;
                         if (p.act == 0) {
                             ((float *) p.dst)[off] = v;
                         } else {
-                            ((__nv_bfloat16 *) p.dst)[off] = __float2bfloat16_rn(v);
+                            const __nv_bfloat16 b = __float2bfloat16_rn(v);
+                            ((__nv_bfloat16 *) p.dst)[off] = b;
+                            stored = __bfloat162float(b);
                         }
+                        // fmaxf drops a NaN, as the quantization's own amax pass does.
+                        if (amax) {
+                            tmax[j][e % 2] = fmaxf(tmax[j][e % 2], fabsf(stored));
+                        }
+                    }
+                }
+            }
+        }
+        if (amax) {
+            // The 8 lanes of a token (g) to lane g = 0, then one atomicMax per warp and token:
+            // non-negative F32 order as their bits' signed-integer order.
+#pragma unroll
+            for (int j = 0; j < NT; j++) {
+#pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    float m = tmax[j][h];
+#pragma unroll
+                    for (int o = 4; o < 32; o <<= 1) {
+                        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+                    }
+                    const int tk = wn * 8 * NT + j * 8 + t * 2 + h;
+                    if (g == 0 && tk < n_tok) {
+                        atomicMax((int *) p.amax_out + n0 + tk, __float_as_int(m));
                     }
                 }
             }
@@ -1403,12 +1483,20 @@ template <int NT> int mv_rt(const legion_nvfp4_a4 & p, int rt, int kw, cudaStrea
 }  // namespace
 
 int legion_nvfp4_a4_quant_launch(const void * x, int x_bf16, int64_t x_ld, int64_t k, int64_t rows, uint8_t * q,
-                                 int64_t q_ld, uint8_t * s, int64_t s_ld, float * d, void * stream) {
+                                 int64_t q_ld, uint8_t * s, int64_t s_ld, float * d, const float * amax,
+                                 void * stream) {
     if (rows == 0) {
         return 0;
     }
     const cudaStream_t st = (cudaStream_t) stream;
-    if (x_bf16) {
+    if (amax) {
+        const dim3 grid((unsigned) rows, (unsigned) ((s_ld + 127) / 128));
+        if (x_bf16) {
+            nvfp4_a4_quant_amax<<<grid, 128, 0, st>>>((const __nv_bfloat16 *) x, x_ld, k, amax, q, q_ld, s, s_ld, d);
+        } else {
+            nvfp4_a4_quant_amax<<<grid, 128, 0, st>>>((const float *) x, x_ld, k, amax, q, q_ld, s, s_ld, d);
+        }
+    } else if (x_bf16) {
         nvfp4_a4_quant<<<(unsigned) rows, 128, 0, st>>>((const __nv_bfloat16 *) x, x_ld, k, q, q_ld, s, s_ld, d);
     } else {
         nvfp4_a4_quant<<<(unsigned) rows, 128, 0, st>>>((const float *) x, x_ld, k, q, q_ld, s, s_ld, d);
