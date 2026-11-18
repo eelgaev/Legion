@@ -18,24 +18,74 @@ pub struct Nvfp4A4BenchArgs {
         default_value = "5120:17408:8192:glu,17408:5120:8192:res,5376:21504:2048:glu,21504:5376:2048:res,5376:8192:2048"
     )]
     shapes: Vec<String>,
-    /// Tile variants timed against the kernel before #1133 r12 (1): 0 the default pick; token
-    /// tiles x stages with fragments by LDS: 2 8 x 2, 3 6 x 3; by generic loads (as before): 4
-    /// 8 x 2, 5 6 x 3.
+    /// Tile variants timed against the kernel before #1133 r12 (1): 0 the default pick; rows x
+    /// tokens x stages with fragments by LDS: 2 128 x 128 x 2, 3 128 x 96 x 3; by generic loads
+    /// (as before): 4 128 x 128 x 2, 5 128 x 96 x 3. Plain and residual GEMMs only (#1133 r20):
+    /// 6 192 x 128 x 2, 7 128 x 192 x 2; clusters of two CTAs with half of the shared operand
+    /// multicast by each: 8 two 128 x 96 x 3 sharing the tokens (groups of 4 row-tile pairs), 9
+    /// the same in groups of 12 pairs, 10 two 128 x 96 x 3 sharing the weight rows, 11 two 128 x
+    /// 128 x 2 sharing the tokens (8 to 11 hang on a DGX Spark (GB10): run them under a
+    /// timeout); 12 8's clusters without the multicast (each CTA loads its whole tiles).
     #[arg(long, value_delimiter = ',', default_values_t = [0, 2, 3, 4, 5])]
     variants: Vec<i32>,
-    /// Probes of tiles 2 and 4 on plain shapes (outputs not the GEMM's): 1 the loads alone, 2
-    /// no refills, 3 no epilogue stores.
+    /// Probes of the variants 2, 3, 4 and 6 to 12 on plain shapes (outputs not the GEMM's): 1
+    /// the loads alone, 2 no refills, 3 no epilogue stores.
     #[arg(long, value_delimiter = ',')]
     probes: Vec<i32>,
     /// Weights in a graph (distinct ones, so the graph streams past the L2).
     #[arg(long, default_value_t = 2)]
     layers: usize,
-    /// Timed graphs per variant and round.
+    /// Timed graphs per variant and round (the variants take turns graph by graph).
     #[arg(long, default_value_t = 5)]
     reps: usize,
-    /// Rounds (the variants take turns within a round; the best counts).
+    /// Rounds (each runs `reps` turns of every variant; the median and the best of all graphs
+    /// are shown).
     #[arg(long, default_value_t = 3)]
     rounds: usize,
+}
+
+/// The bytes variant `v`'s CTAs read from the L2 for a shape (plain, residual or SwiGLU; a
+/// cluster pair's shared operand counts half for each CTA), and the bytes a CTA reads per k
+/// block (64 of k) and 1,000 of its row x token products.
+#[cfg(feature = "cuda")]
+fn tile_reads(v: i32, s: &Shape) -> (f64, f64) {
+    let deep = !s.glu && s.k >= 8192 && s.n >= 2048;
+    let (bm, bn, share) = match v & 0xff {
+        0 | 1 if deep => (128, 96, 0),
+        0 | 1 | 2 | 4 => (128, 128, 0),
+        3 | 5 | 12 => (128, 96, 0),
+        6 => (192, 128, 0),
+        7 => (128, 192, 0),
+        8 | 9 => (128, 96, 1),
+        10 => (128, 96, 2),
+        11 => (128, 128, 1),
+        _ => (128, 128, 0),
+    };
+    let out_rows = if s.glu { bm / 2 } else { bm };
+    let tiles_m = s.m.div_ceil(out_rows);
+    let mut tiles_n = s.n.div_ceil(bn);
+    if share == 2 {
+        tiles_n = tiles_n.div_ceil(2) * 2;
+    }
+    let rows = (if share == 2 { bm / 2 } else { bm }) as f64;
+    let toks = (if share == 1 { bn / 2 } else { bn }) as f64;
+    // A stage: each row's 4 blocks of 36 bytes, each token's 128 code bytes and 16 scale bytes.
+    let bytes = (tiles_m * tiles_n * (s.k / 256)) as f64 * 144.0 * (rows + toks);
+    (bytes, 36.0 * (rows + toks) / (bm * bn) as f64 * 1e3)
+}
+
+/// The median and the smallest of `xs` (not empty).
+#[cfg(feature = "cuda")]
+fn med_min(xs: &[f64]) -> (f64, f64) {
+    let mut v = xs.to_vec();
+    v.sort_by(f64::total_cmp);
+    let mid = v.len() / 2;
+    let med = if v.len().is_multiple_of(2) {
+        (v[mid - 1] + v[mid]) / 2.0
+    } else {
+        v[mid]
+    };
+    (med, v[0])
 }
 
 #[cfg(feature = "cuda")]
@@ -128,8 +178,21 @@ pub fn run(args: Nvfp4A4BenchArgs) -> anyhow::Result<()> {
     let layers = args.layers;
     let mut differ = 0;
     println!(
-        "{:>6} {:>6} {:>6} {:>4} {:>8} {:>9} {:>8} {:>8} {:>7}",
-        "k", "m", "n", "op", "variant", "ms", "TF", "x v1", "bits"
+        "{:>6} {:>6} {:>6} {:>4} {:>8} {:>9} {:>9} {:>8} {:>8} {:>8} {:>9} {:>7} {:>7} {:>7}",
+        "k",
+        "m",
+        "n",
+        "op",
+        "variant",
+        "med ms",
+        "min ms",
+        "TF",
+        "x v1",
+        "x v0",
+        "L2 MB",
+        "TB/s",
+        "B/kMMA",
+        "bits"
     );
     for s in &shapes {
         let (k, m, n) = (s.k as i64, s.m as i64, s.n as i64);
@@ -188,12 +251,16 @@ pub fn run(args: Nvfp4A4BenchArgs) -> anyhow::Result<()> {
         if !s.glu && !s.res {
             for &p in &args.probes {
                 anyhow::ensure!((1..=3).contains(&p), "--probes takes 1, 2 or 3");
-                runs.extend([2, 4].map(|v| v | p << 8));
+                let probed = args
+                    .variants
+                    .iter()
+                    .filter(|&&v| matches!(v, 2..=4 | 6..=12));
+                runs.extend(probed.map(|&v| v | p << 8));
             }
         }
         let elem = if s.glu { 2 } else { 4 };
         let mut reference: Vec<u8> = Vec::new();
-        let mut rows: Vec<(i32, Option<f64>, Option<usize>)> = Vec::new();
+        let mut rows: Vec<(i32, Option<Vec<f64>>, Option<usize>)> = Vec::new();
         for &v in &runs {
             a4::force_dense_variant(v);
             // A warm-up run, then the bits.
@@ -209,7 +276,7 @@ pub fn run(args: Nvfp4A4BenchArgs) -> anyhow::Result<()> {
             let got: Vec<u8> = outs.iter().flat_map(|o| o.bytes()).collect();
             if v == 1 {
                 reference = got;
-                rows.push((v, Some(f64::INFINITY), Some(0)));
+                rows.push((v, Some(Vec::new()), Some(0)));
                 continue;
             }
             let bad = got
@@ -220,24 +287,23 @@ pub fn run(args: Nvfp4A4BenchArgs) -> anyhow::Result<()> {
             if v >> 8 == 0 {
                 differ += bad;
             }
-            rows.push((v, Some(f64::INFINITY), Some(bad)));
+            rows.push((v, Some(Vec::new()), Some(bad)));
         }
-        let mut quant = f64::INFINITY;
-        for _ in 0..args.rounds {
+        // The variants take turns graph by graph (the quantization alone among them), so the
+        // clock's drift and the box's heat spread over all of them alike.
+        let mut quant: Vec<f64> = Vec::new();
+        for _ in 0..args.rounds * args.reps {
             let t = std::time::Instant::now();
-            for _ in 0..args.reps {
-                gpu.compute(&qgraph)?;
-            }
-            quant = quant.min(t.elapsed().as_secs_f64() / (args.reps * layers) as f64);
+            gpu.compute(&qgraph)?;
+            quant.push(t.elapsed().as_secs_f64() / layers as f64);
             for row in rows.iter_mut() {
-                let Some(best) = row.1 else { continue };
+                let Some(times) = row.1.as_mut() else {
+                    continue;
+                };
                 a4::force_dense_variant(row.0);
                 let t = std::time::Instant::now();
-                for _ in 0..args.reps {
-                    gpu.compute(&graph)?;
-                }
-                let secs = t.elapsed().as_secs_f64() / (args.reps * layers) as f64;
-                row.1 = Some(best.min(secs));
+                gpu.compute(&graph)?;
+                times.push(t.elapsed().as_secs_f64() / layers as f64);
             }
         }
         a4::force_dense_variant(0);
@@ -249,32 +315,49 @@ pub fn run(args: Nvfp4A4BenchArgs) -> anyhow::Result<()> {
         } else {
             "mm"
         };
-        let base = rows[0].1.map(|t| (t - quant).max(1e-9));
+        let (q_med, q_min) = med_min(&quant);
+        // The GEMM alone: a graph's median (best) less the quantization's median (best).
+        let gemm_of = |times: &Vec<f64>| {
+            let (med, min) = med_min(times);
+            ((med - q_med).max(1e-9), (min - q_min).max(1e-9))
+        };
+        let v1 = rows[0].1.as_ref().map(gemm_of);
+        let v0 = rows
+            .iter()
+            .find(|r| r.0 == 0)
+            .and_then(|r| r.1.as_ref().map(gemm_of));
         println!(
-            "{k:>6} {m:>6} {n:>6} {op:>4} {:>8} {:>9.3}",
+            "{k:>6} {m:>6} {n:>6} {op:>4} {:>8} {:>9.3} {:>9.3}",
             "quant",
-            quant * 1e3
+            q_med * 1e3,
+            q_min * 1e3
         );
-        for (v, secs, bad) in rows {
+        for (v, times, bad) in rows {
             let name = match v >> 8 {
                 0 => format!("{v}"),
                 p => format!("{}p{p}", v & 0xff),
             };
-            let Some(secs) = secs else {
+            let Some(times) = times else {
                 println!("{k:>6} {m:>6} {n:>6} {op:>4} {name:>8} {:>9}", "none");
                 continue;
             };
-            let gemm = (secs - quant).max(1e-9);
+            let (med, min) = gemm_of(&times);
             let bits = match (v >> 8, bad) {
                 (_, Some(0)) => "same".to_string(),
                 (0, Some(b)) => format!("{b} DIFF"),
                 _ => "probe".to_string(),
             };
+            let (l2, per_mma) = tile_reads(v, s);
             println!(
-                "{k:>6} {m:>6} {n:>6} {op:>4} {name:>8} {:>9.3} {:>8.1} {:>8.3} {bits:>7}",
-                gemm * 1e3,
-                flops / gemm / 1e12,
-                base.map_or(0.0, |b| b / gemm)
+                "{k:>6} {m:>6} {n:>6} {op:>4} {name:>8} {:>9.3} {:>9.3} {:>8.1} {:>8.3} {:>8.3} {:>9.1} {:>7.2} {:>7.1} {bits:>7}",
+                med * 1e3,
+                min * 1e3,
+                flops / med / 1e12,
+                v1.map_or(0.0, |b| b.0 / med),
+                v0.map_or(0.0, |b| b.0 / med),
+                l2 / 1e6,
+                l2 / med / 1e12,
+                per_mma
             );
         }
     }

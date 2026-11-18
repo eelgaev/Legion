@@ -72,8 +72,8 @@ struct legion_nvfp4_a4 {
     // (nothing reads their rows); zero: the CTAs past the last tile store them.
     int32_t unread_skips;
     // The dense TMA-fed GEMM's tile (nt 8; see legion_nvfp4_a4_gemm_launch): 0 the default, 1 the
-    // kernel before #1133 r12, 2 to 5 one tile forced (A/B and the bench). Bits 8-9: a probe of
-    // tiles 2 and 4 (legion nvfp4-a4-bench; not the GEMM's outputs).
+    // kernel before #1133 r12, 2 to 12 one tile forced (A/B and the bench). Bits 8-9: a probe of
+    // tiles 2, 3, 4 and 6 to 12 (legion nvfp4-a4-bench; not the GEMM's outputs).
     int32_t variant;
 };
 
@@ -1485,9 +1485,24 @@ int legion_nvfp4_a4_gemm_launch(const legion_nvfp4_a4 * p, int nt, void * stream
                     break;
                 }
                 case 2: r = dense_tma_probe<8, 2, false>(*p, st, probe); break;
-                case 3: r = dense_tma<6, 3>(*p, st); break;
+                case 3: r = dense_tma_probe<6, 3, false>(*p, st, probe); break;
                 case 4: r = dense_tma_probe<8, 2, true>(*p, st, probe); break;
                 case 5: r = dense_tma<6, 3, 0, true>(*p, st); break;
+                // #1133 r20 (legion nvfp4-a4-bench, plain and residual GEMMs): 6 192 x 128 x 2
+                // stages; 7 128 x 192 x 2; clusters of two 128 x 96 x 3 tiles sharing their
+                // tokens (multicast), 8 in groups of 4 row-tile pairs, 9 of 12; 10 two 128 x 96 x 3
+                // tiles sharing their weight rows; 11 two 128 x 128 x 2 sharing their tokens. On a
+                // DGX Spark (GB10) 8 to 11 never finish (the multicast halves never complete the
+                // peer's barrier); 12 finishes with the same bits.
+                case 6: r = dense_tma_probe<8, 2, false, 3>(*p, st, probe); break;
+                case 7: r = dense_tma_probe<12, 2, false>(*p, st, probe); break;
+                case 8: r = dense_tma_probe<6, 3, false, 2, 1, 4>(*p, st, probe); break;
+                case 9: r = dense_tma_probe<6, 3, false, 2, 1, 12>(*p, st, probe); break;
+                case 10: r = dense_tma_probe<6, 3, false, 2, 2>(*p, st, probe); break;
+                case 11: r = dense_tma_probe<8, 2, false, 2, 1, 4>(*p, st, probe); break;
+                // 12: 8's clusters and stage release without the multicast (each CTA loads its
+                // whole tiles): the cost of the handshake alone.
+                case 12: r = dense_tma_probe<6, 3, false, 2, 3, 4>(*p, st, probe); break;
                 default: r = deep ? dense_tma<6, 3>(*p, st) : dense_tma<8, 2>(*p, st); break;
             }
             if (r == -1 && forced >= 2) {

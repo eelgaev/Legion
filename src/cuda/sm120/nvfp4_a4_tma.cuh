@@ -30,10 +30,10 @@ struct Maps {
 };
 }  // namespace a4t
 
-// The tile: 8 warps, 4 over the weight rows x 2 over the tokens, each 32 weight rows (MI 2) x
-// 8 * NT tokens; 4 NVFP4 blocks (256 of k) per stage, ST stages, one CTA per SM.
-template <int NT_, int ST_> struct TmaTile {
-    static constexpr int MI = 2, NT = NT_, KB = 4, ST = ST_, WM = 4, WN = 2;
+// The tile: 8 warps, 4 over the weight rows x 2 over the tokens, each 16 * MI weight rows (MI 2:
+// 32) x 8 * NT tokens; 4 NVFP4 blocks (256 of k) per stage, ST stages, one CTA per SM.
+template <int NT_, int ST_, int MI_ = 2> struct TmaTile {
+    static constexpr int MI = MI_, NT = NT_, KB = 4, ST = ST_, WM = 4, WN = 2;
     static constexpr int BM = 16 * MI * WM, BN = 8 * NT * WN;
     static constexpr int LDW = KB * 36;                    // a weight row's blocks as stored
     static constexpr int X_OFF = BM * LDW;                 // the codes: BN rows of KB * 32 bytes
@@ -52,11 +52,21 @@ template <int NT_, int ST_> struct TmaTile {
 // the pointer's state space: every A fragment and scale word is a generic load (LD.E) and each
 // TMA issue checks its destination's window. Else the base is the shared array plus an offset,
 // and those reads are LDS.
-template <int NT, int ST, bool GLU, bool RES, int PROBE = 0, bool GEN = false>
+// MI: 16 * MI weight rows a warp (#1133 r20: MI 3, a 192-row tile, reads 1.2x fewer L2 bytes
+// per MMA than 128 rows; plain and residual GEMMs only).
+// MC (#1133 r20, plain and residual GEMMs, launched as clusters of 2 CTAs): 1 the two CTAs take
+// neighbouring row tiles of the same tokens, and each loads half of the token tile into both
+// (TMA multicast); 2 neighbouring token tiles of the same rows, each multicasting half of the
+// weight rows. A stage is refilled once both CTAs' warps are done with it (an "empty" mbarrier
+// of 2 arrivals in each CTA). G: MC 1's groups of G row-tile pairs (token tiles inside a group).
+// MC 3 (a probe of the handshake): MC 1's pairs and stage release, each CTA loading its whole
+// tiles itself (no multicast).
+template <int NT, int ST, bool GLU, bool RES, int PROBE = 0, bool GEN = false, int MI_ = 2, int MC = 0, int G = 4>
 __global__ void __launch_bounds__(256, 1) nvfp4_a4_gemm_tma(const legion_nvfp4_a4 p, const __grid_constant__ a4t::Maps maps) {
 #ifdef LEGION_FP4_MMA
-    using T = TmaTile<NT, ST>;
+    using T = TmaTile<NT, ST, MI_>;
     using namespace legion_tma;
+    static_assert((MI_ == 2 && MC == 0) || !GLU, "SwiGLU: the 128-row tile without clusters");
     constexpr int MI = T::MI, KB = T::KB, BM = T::BM, BN = T::BN, WN = T::WN, LDW = T::LDW;
     constexpr int STAGE = T::STAGE, X_OFF = T::X_OFF, XS_OFF = T::XS_OFF, WARPS = 8;
     constexpr int BM_OUT = GLU ? BM / 2 : BM;
@@ -74,16 +84,37 @@ __global__ void __launch_bounds__(256, 1) nvfp4_a4_gemm_tma(const legion_nvfp4_a
     }
     __shared__ uint64_t full[ST];
     __shared__ uint32_t released[ST];
+    __shared__ uint64_t empty[MC != 0 ? ST : 1];
     __shared__ float x_dec[BN];
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane / 4, t = lane % 4;
     const int wm = warp / WN, wn = warp % WN;
 
-    // nvfp4_a4_gemm's dense tile order: groups of group_m row tiles, token tiles inside a group.
-    const int pid = blockIdx.x, in_group = p.group_m * p.tiles_n;
-    const int first_m = pid / in_group * p.group_m;
-    const int group = min(p.tiles_m - first_m, p.group_m);
-    const int64_t m0 = (int64_t) (first_m + pid % in_group % group) * BM_OUT;
-    const int64_t n0 = (int64_t) (pid % in_group / group) * BN;
+    int64_t m0, n0;
+    int rank = 0;
+    if constexpr (MC == 0) {
+        // nvfp4_a4_gemm's dense tile order: groups of group_m row tiles, token tiles inside a group.
+        const int pid = blockIdx.x, in_group = p.group_m * p.tiles_n;
+        const int first_m = pid / in_group * p.group_m;
+        const int group = min(p.tiles_m - first_m, p.group_m);
+        m0 = (int64_t) (first_m + pid % in_group % group) * BM_OUT;
+        n0 = (int64_t) (pid % in_group / group) * BN;
+    } else if constexpr (MC == 1 || MC == 3) {
+        // Pairs of row tiles (tiles_m even), in groups of G pairs, token tiles inside a group.
+        rank = (int) cluster_rank();
+        const int pid = blockIdx.x / 2, in_group = G * p.tiles_n;
+        const int first = pid / in_group * G;
+        const int group = min(p.tiles_m / 2 - first, G);
+        m0 = (int64_t) (2 * (first + pid % in_group % group) + rank) * BM_OUT;
+        n0 = (int64_t) (pid % in_group / group) * BN;
+    } else {
+        // Pairs of token tiles (the last one's second tile may lie past n: zeros, no stores).
+        rank = (int) cluster_rank();
+        const int pid = blockIdx.x / 2, in_group = p.group_m * ((p.tiles_n + 1) / 2);
+        const int first_m = pid / in_group * p.group_m;
+        const int group = min(p.tiles_m - first_m, p.group_m);
+        m0 = (int64_t) (first_m + pid % in_group % group) * BM_OUT;
+        n0 = (int64_t) (2 * (pid % in_group / group) + rank) * BN;
+    }
     const int n_tok = (int) min((int64_t) BN, p.n - n0);
     for (int i = threadIdx.x; i < BN; i += 256) {
         x_dec[i] = i < n_tok ? p.xd[n0 + i] : 0.0f;
@@ -97,12 +128,25 @@ __global__ void __launch_bounds__(256, 1) nvfp4_a4_gemm_tma(const legion_nvfp4_a
         unsigned char * s = smem + stage * STAGE;
         uint64_t * bar = full + stage;
         bar_expect_tx(bar, T::TX);
-        tma_2d(s, &maps.w, (int) (step * KB * 36), (int) m0, bar);
+        if constexpr (MC == 2) {
+            // Half of the rows from each CTA, into both (the maps' boxes are BM / 2 rows).
+            tma_2d_mc(s + rank * (BM / 2) * LDW, &maps.w, (int) (step * KB * 36), (int) m0 + rank * (BM / 2), bar, 3);
+        } else {
+            tma_2d(s, &maps.w, (int) (step * KB * 36), (int) m0, bar);
+        }
         if (GLU) {
             tma_2d(s + BM / 2 * LDW, &maps.w2, (int) (step * KB * 36), (int) m0, bar);
         }
-        tma_2d(s + X_OFF, &maps.xq, (int) (step * KB * 32), (int) n0, bar);
-        tma_2d(s + XS_OFF, &maps.xs, (int) (step * KB * 4), (int) n0, bar);
+        if constexpr (MC == 1) {
+            // Half of the tokens from each CTA, into both (boxes of BN / 2 tokens; the half's
+            // codes start at a 1 KiB multiple, so the 128-byte swizzle stays the same).
+            const int h = rank * (BN / 2);
+            tma_2d_mc(s + X_OFF + h * 128, &maps.xq, (int) (step * KB * 32), (int) n0 + h, bar, 3);
+            tma_2d_mc(s + XS_OFF + h * KB * 4, &maps.xs, (int) (step * KB * 4), (int) n0 + h, bar, 3);
+        } else {
+            tma_2d(s + X_OFF, &maps.xq, (int) (step * KB * 32), (int) n0, bar);
+            tma_2d(s + XS_OFF, &maps.xs, (int) (step * KB * 4), (int) n0, bar);
+        }
     };
 
     // nvfp4_a4_gemm's L2 bulk prefetch of the weight rows (its DENSE16 tile: 8 blocks per run,
@@ -150,10 +194,19 @@ __global__ void __launch_bounds__(256, 1) nvfp4_a4_gemm_tma(const legion_nvfp4_a
         for (int s = 0; s < ST; s++) {
             bar_init(full + s, 1);
             released[s] = 0;
+            if (MC != 0) {
+                bar_init(empty + s, 2);
+            }
         }
         bar_init_fence();
     }
-    __syncthreads();
+    if constexpr (MC != 0) {
+        static_assert(MC != 1 || (BN / 2 % 8 == 0), "the token halves' swizzle and TMA alignment");
+        static_assert(MC != 2 || (BM / 2 * LDW % 128 == 0), "the weight halves' TMA alignment");
+        cluster_sync();  // both CTAs' barriers exist before either copies into or arrives on them
+    } else {
+        __syncthreads();
+    }
     if (threadIdx.x == 0) {
 #pragma unroll
         for (int s = 0; s < ST; s++) {
@@ -246,6 +299,12 @@ __global__ void __launch_bounds__(256, 1) nvfp4_a4_gemm_tma(const legion_nvfp4_a
                              : "r"(saddr(released + stage))
                              : "memory");
                 if (prev % WARPS == WARPS - 1) {
+                    if constexpr (MC != 0) {
+                        // The refill writes into both CTAs' stage: wait for the other's warps too.
+                        bar_arrive_cluster(empty + stage);
+                        bar_arrive_peer(empty + stage, (uint32_t) rank ^ 1);
+                        bar_wait_cluster(empty + stage, (uint32_t) (step / ST) & 1);
+                    }
                     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
                     issue(step + ST, stage);
                 }
@@ -256,6 +315,9 @@ __global__ void __launch_bounds__(256, 1) nvfp4_a4_gemm_tma(const legion_nvfp4_a
     // The probes without stores keep their sums alive by a store no launch asks for.
     if (PROBE == 0 || PROBE == 2 || p.act == 99) {
         a4_epilogue<MI, NT, false, GLU, RES>(p, acc, m0, n0, n_tok, x_dec, nullptr, sc, sc2, wm, wn, g, t);
+    }
+    if constexpr (MC != 0) {
+        cluster_sync();  // no CTA leaves while the other may still reach its shared memory
     }
 #else
     __trap();  // launched only where nvfp4_a4_probe answers 1
@@ -280,49 +342,84 @@ inline bool a4_tma_map(CUtensorMap * map, const void * base, int64_t row_bytes, 
 
 // nvfp4_a4_gemm_tma for a dense GEMM (SwiGLU, residual or plain) of whole stages (k % 256 == 0);
 // -1 when it does not apply or a tensor map cannot be made (nothing launched). PROBE: plain
-// GEMMs only.
-template <int NT, int ST, int PROBE = 0, bool GEN = false> int dense_tma(const legion_nvfp4_a4 & p0, cudaStream_t st) {
-    using T = TmaTile<NT, ST>;
-    if (p0.plan || p0.k % 256 != 0 || p0.n <= 0 || p0.m <= 0 || (PROBE != 0 && (p0.w2 || p0.res))) {
+// GEMMs only. MI, MC, G: nvfp4_a4_gemm_tma's (other than MI 2, MC 0: no SwiGLU; MC 1 needs an
+// even number of row tiles), launched as clusters of 2 CTAs for MC.
+template <int NT, int ST, int PROBE = 0, bool GEN = false, int MI = 2, int MC = 0, int G = 4>
+int dense_tma(const legion_nvfp4_a4 & p0, cudaStream_t st) {
+    using T = TmaTile<NT, ST, MI>;
+    constexpr bool GLU_OK = MI == 2 && MC == 0;
+    if (p0.plan || p0.k % 256 != 0 || p0.n <= 0 || p0.m <= 0 || (PROBE != 0 && (p0.w2 || p0.res)) ||
+        (!GLU_OK && p0.w2)) {
         return -1;
     }
     legion_nvfp4_a4 p = p0;
     p.tiles_n = (int32_t) ((p.n + T::BN - 1) / T::BN);
+    if (MI != 2) {
+        p.tiles_m = (int32_t) ((p.m + T::BM - 1) / T::BM);
+    }
+    if ((MC == 1 || MC == 3) && p.tiles_m % 2 != 0) {
+        return -1;
+    }
     a4t::Maps maps;
     const int64_t row_bytes = p.k / 64 * 36;
-    const int w_rows = p.w2 ? T::BM / 2 : T::BM;
+    const int w_rows = p.w2 || MC == 2 ? T::BM / 2 : T::BM;
+    const int x_rows = MC == 1 ? T::BN / 2 : T::BN;
     if (!a4_tma_map(&maps.w, p.w, row_bytes, p.m, p.w_ld, T::LDW, w_rows, CU_TENSOR_MAP_SWIZZLE_NONE) ||
         (p.w2 && !a4_tma_map(&maps.w2, p.w2, row_bytes, p.m, p.w_ld, T::LDW, w_rows, CU_TENSOR_MAP_SWIZZLE_NONE)) ||
-        !a4_tma_map(&maps.xq, p.xq, p.xq_ld, p.n, p.xq_ld, T::KB * 32, T::BN, CU_TENSOR_MAP_SWIZZLE_128B) ||
-        !a4_tma_map(&maps.xs, p.xs, p.xs_ld, p.n, p.xs_ld, T::KB * 4, T::BN, CU_TENSOR_MAP_SWIZZLE_NONE)) {
+        !a4_tma_map(&maps.xq, p.xq, p.xq_ld, p.n, p.xq_ld, T::KB * 32, x_rows, CU_TENSOR_MAP_SWIZZLE_128B) ||
+        !a4_tma_map(&maps.xs, p.xs, p.xs_ld, p.n, p.xs_ld, T::KB * 4, x_rows, CU_TENSOR_MAP_SWIZZLE_NONE)) {
         return -1;
     }
     if (!p.w2) {
         maps.w2 = maps.w;
     }
+    const unsigned grid = (unsigned) p.tiles_m * (unsigned) (MC == 2 ? (p.tiles_n + 1) / 2 * 2 : p.tiles_n);
     auto go = [&](auto kernel) {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, T::SMEM);
-        kernel<<<(unsigned) p.tiles_m * (unsigned) p.tiles_n, 256, T::SMEM, st>>>(p, maps);
+        if constexpr (MC == 0) {
+            kernel<<<grid, 256, T::SMEM, st>>>(p, maps);
+        } else {
+            cudaLaunchAttribute attr[1];
+            attr[0].id = cudaLaunchAttributeClusterDimension;
+            attr[0].val.clusterDim.x = 2;
+            attr[0].val.clusterDim.y = 1;
+            attr[0].val.clusterDim.z = 1;
+            cudaLaunchConfig_t cfg = {};
+            cfg.gridDim = dim3(grid);
+            cfg.blockDim = dim3(256);
+            cfg.dynamicSmemBytes = T::SMEM;
+            cfg.stream = st;
+            cfg.attrs = attr;
+            cfg.numAttrs = 1;
+            cudaLaunchKernelEx(&cfg, kernel, p, maps);
+        }
     };
     if constexpr (PROBE != 0) {
-        go(nvfp4_a4_gemm_tma<NT, ST, false, false, PROBE, GEN>);
-    } else if (p.w2) {
-        go(nvfp4_a4_gemm_tma<NT, ST, true, false, 0, GEN>);
-    } else if (p.res) {
-        go(nvfp4_a4_gemm_tma<NT, ST, false, true, 0, GEN>);
+        go(nvfp4_a4_gemm_tma<NT, ST, false, false, PROBE, GEN, MI, MC, G>);
     } else {
-        go(nvfp4_a4_gemm_tma<NT, ST, false, false, 0, GEN>);
+        if constexpr (GLU_OK) {
+            if (p.w2) {
+                go(nvfp4_a4_gemm_tma<NT, ST, true, false, 0, GEN>);
+                return status();
+            }
+        }
+        if (p.res) {
+            go(nvfp4_a4_gemm_tma<NT, ST, false, true, 0, GEN, MI, MC, G>);
+        } else {
+            go(nvfp4_a4_gemm_tma<NT, ST, false, false, 0, GEN, MI, MC, G>);
+        }
     }
     return status();
 }
 
-// dense_tma<NT, ST, probe, GEN> (legion nvfp4-a4-bench; probe 0 the GEMM).
-template <int NT, int ST, bool GEN> int dense_tma_probe(const legion_nvfp4_a4 & p, cudaStream_t st, int probe) {
+// dense_tma<NT, ST, probe, GEN, MI, MC, G> (legion nvfp4-a4-bench; probe 0 the GEMM).
+template <int NT, int ST, bool GEN, int MI = 2, int MC = 0, int G = 4>
+int dense_tma_probe(const legion_nvfp4_a4 & p, cudaStream_t st, int probe) {
     switch (probe) {
-        case 0: return dense_tma<NT, ST, 0, GEN>(p, st);
-        case 1: return dense_tma<NT, ST, 1, GEN>(p, st);
-        case 2: return dense_tma<NT, ST, 2, GEN>(p, st);
-        case 3: return dense_tma<NT, ST, 3, GEN>(p, st);
+        case 0: return dense_tma<NT, ST, 0, GEN, MI, MC, G>(p, st);
+        case 1: return dense_tma<NT, ST, 1, GEN, MI, MC, G>(p, st);
+        case 2: return dense_tma<NT, ST, 2, GEN, MI, MC, G>(p, st);
+        case 3: return dense_tma<NT, ST, 3, GEN, MI, MC, G>(p, st);
         default: return -1;
     }
 }
