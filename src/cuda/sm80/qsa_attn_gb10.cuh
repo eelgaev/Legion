@@ -315,7 +315,8 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gb_kernel(legion_qsa_attn p) 
 //   scores (the positions one chunk earlier still), where attn_gb_kernel's sat on the path
 //   between two barriers; lanes take the rows they copy by shuffles;
 // - warps whose 8 cells are all past the selection skip their score products (the cells are
-//   -inf either way).
+//   -inf either way);
+// - the copies go through L1 (cp.async.ca, #1176 round 42; see GW_CA below).
 
 // A 32-bit load from global memory issued where it stands (not moved to its first use).
 __device__ __forceinline__ int ld_issue(const int32_t * a) {
@@ -324,7 +325,54 @@ __device__ __forceinline__ int ld_issue(const int32_t * a) {
     return v;
 }
 
-template <int HD>
+// attn_gw_kernel's variants (#1176 round 42). Every one computes every value in the same order,
+// so they all give the same bits. The launcher runs GW_CA (K and V copied through L1: on a GB10
+// 0.70-0.76x the time of cp.async.cg's L2-only copies on local and real prompt selections, a
+// faster path even with one CTA per SM, and more so with two CTAs sharing lines);
+// LEGION_DEBUG_QSA_GW_L1=0 runs 0, the kernel before. The others are probes for
+// `legion qsa-bench` (PromptKernel 4-10).
+constexpr int GW_CAK = 1;  // cp.async.ca: K rows through L1 (allocating)
+constexpr int GW_CAV = 2;  // cp.async.ca: V rows through L1
+constexpr int GW_CA = GW_CAK | GW_CAV;
+constexpr int GW_FAR = 4;  // consecutive CTAs take tokens far apart (no neighbour shares a wave)
+constexpr int GW_ONE = 8;  // launched with 64 KB of shared memory: one CTA per SM
+
+// The token CTA blockIdx.x takes.
+template <int VAR>
+__device__ __forceinline__ int gw_token() {
+    const int b = blockIdx.x, n = gridDim.x;
+    if constexpr ((VAR & GW_FAR) != 0) {
+        // b * m mod n, m odd, near n / golden ratio and coprime to n: a bijection.
+        int m = (int) ((float) n * 0.618034f) | 1;
+        for (;;) {
+            int a = m, c = n;
+            while (c != 0) {
+                const int r = a % c;
+                a = c;
+                c = r;
+            }
+            if (a == 1) {
+                break;
+            }
+            m += 2;
+        }
+        return (int) ((long long) b * m % n);
+    } else {
+        return b;
+    }
+}
+
+__device__ __forceinline__ void cp_async16_l1(void * smem, const void * gmem, bool valid) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const uint32_t dst = (uint32_t) __cvta_generic_to_shared(smem);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(gmem),
+                 "r"(valid ? 16 : 0));
+#else
+    __trap();
+#endif
+}
+
+template <int HD, int VAR>
 __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     GbSmem<HD> & S = *reinterpret_cast<GbSmem<HD> *>(smem_raw);
@@ -340,7 +388,7 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
     static_assert(MCH == 32 && KR == 8, "one lane per chunk row, 8 score cells per warp");
     static_assert(KR * PIECES % 32 == 0 && MCH * VP % 32 == 0, "copy layout");
     static_assert(NT % 2 == 0 && KS % 2 == 0, "ldmatrix x4 pairs");
-    const int tok = blockIdx.x, kvh = blockIdx.y;
+    const int tok = gw_token<VAR>(), kvh = blockIdx.y;
     const int G = p.n_head / p.n_head_kv;
     const int s = tok / p.n_tok, ti = tok % p.n_tok;
     const char * qb = (const char *) p.q + (size_t) s * p.q_nb3 + (size_t) ti * p.q_nb2 +
@@ -368,7 +416,11 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
             const int cl = __shfl_sync(0xffffffffu, cell, c);
             const bool valid = cl >= 0;
             const long long r = valid ? (long long) cl * p.kv_row + (long long) kvh * HD : 0;
-            cp_async16(&S.k[c][pc * 8], reinterpret_cast<const uint4 *>(p.k + r) + pc, valid);
+            if constexpr ((VAR & GW_CAK) != 0) {
+                cp_async16_l1(&S.k[c][pc * 8], reinterpret_cast<const uint4 *>(p.k + r) + pc, valid);
+            } else {
+                cp_async16(&S.k[c][pc * 8], reinterpret_cast<const uint4 *>(p.k + r) + pc, valid);
+            }
         }
         cp_async_commit();
     };
@@ -380,7 +432,11 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
             const int cl = __shfl_sync(0xffffffffu, cell, c);
             const bool valid = cl >= 0;
             const long long r = valid ? (long long) cl * p.kv_row + (long long) kvh * HD : 0;
-            cp_async16(&S.v[c][pc * 8], reinterpret_cast<const uint4 *>(p.v + r) + pc, valid);
+            if constexpr ((VAR & GW_CAV) != 0) {
+                cp_async16_l1(&S.v[c][pc * 8], reinterpret_cast<const uint4 *>(p.v + r) + pc, valid);
+            } else {
+                cp_async16(&S.v[c][pc * 8], reinterpret_cast<const uint4 *>(p.v + r) + pc, valid);
+            }
         }
         cp_async_commit();
     };

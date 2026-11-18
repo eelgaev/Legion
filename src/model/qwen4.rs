@@ -62,6 +62,7 @@ pub(crate) mod qsa_attn;
 pub use qsa_attn::PromptKernel;
 #[cfg(feature = "cuda")]
 pub use qsa_attn::bench as qsa_bench;
+pub use qsa_attn::sel_dump as qsa_sel;
 #[cfg(test)]
 mod tests;
 pub mod tiny;
