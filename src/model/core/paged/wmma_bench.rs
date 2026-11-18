@@ -14,12 +14,33 @@ use crate::model::core::{Hparams, KvPool};
 pub type Heads = (usize, usize, usize);
 
 /// One layer of `heads` with its K/V in a `KvPool` of `n_blocks` blocks of noise.
-pub fn pool(backend: &Backend, (d, n_head, n_head_kv): Heads, n_blocks: usize) -> KvPool {
-    let hp = hparams(d as i64, n_head as i64, n_head_kv as i64);
+pub fn pool(backend: &Backend, heads: Heads, n_blocks: usize) -> KvPool {
+    pools(backend, heads, n_blocks, 1)
+}
+
+/// `layers` layers of `heads` in one `KvPool` (one buffer, as a model's), each layer's K/V the
+/// same `n_blocks` blocks of noise as [`pool`]'s.
+pub fn pools(
+    backend: &Backend,
+    (d, n_head, n_head_kv): Heads,
+    n_blocks: usize,
+    layers: usize,
+) -> KvPool {
+    let hp = Hparams {
+        n_layer: layers.max(1),
+        ..hparams(d as i64, n_head as i64, n_head_kv as i64)
+    };
     let kv = KvPool::new(&hp, backend.buffer_type(), n_blocks).expect("KV pool");
     let (kp, vp) = kv.pools(0);
-    kp.set_bytes(&f16_bytes(&noise(kp.elements(), 41)));
-    vp.set_bytes(&f16_bytes(&noise(vp.elements(), 42)));
+    let (kb, vb) = (
+        f16_bytes(&noise(kp.elements(), 41)),
+        f16_bytes(&noise(vp.elements(), 42)),
+    );
+    for il in 0..layers.max(1) {
+        let (kp, vp) = kv.pools(il);
+        kp.set_bytes(&kb);
+        vp.set_bytes(&vb);
+    }
     kv
 }
 

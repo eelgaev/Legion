@@ -468,7 +468,9 @@ __device__ __forceinline__ void grid_quad_sync(int id) {
 }
 #endif
 
-template <int D, int G, int NG, int CH_, int NS_>
+// PF: the first line of every K and V block of the CTA's keys prefetched into L2 at the start
+// (#689 r19, below).
+template <int D, int G, int NG, int CH_, int NS_, bool PF = true>
 __global__ void __launch_bounds__(NG * 128, 1) paged_prefill_quad(const legion_paged_attn p) {
 #ifdef LEGION_PAGED_MMA
     using SH = QShape<D, NG, CH_, NS_>;
@@ -599,6 +601,22 @@ __global__ void __launch_bounds__(NG * 128, 1) paged_prefill_quad(const legion_p
 
     for (int j = 0; j < NS - 1; j++) {
         issue(j);
+    }
+    if constexpr (PF) {
+        // While the ring's first loads are in flight: one L2 prefetch of the first line of every
+        // K and V block the CTA will read (2 lines a 64-key tile, ~0.1% of its bytes), so every
+        // page of its keys is translated long before the loop reaches it. In a model each call
+        // comes after other layers' traffic (weights, other layers' K/V), and without this the
+        // loop met each new page's translation cold: on a GB10 at 64K:8 in Qwen3.8-27B's verify
+        // step 1.70 -> 1.47 ms a call (nsys medians), 1.45 -> 1.37 in a bench repeating one call.
+        // Reads nothing into registers and writes nothing: the same bits.
+        const int n = (wk.i1 - wk.i0) * 2;
+#pragma unroll 4
+        for (int x = threadIdx.x; x < n; x += NG * 128) {
+            const int    i = wk.i0 + x / 2;
+            const char * a = x % 2 == 0 ? wk.cells(p.k, p.k_stage, i, p.k_cell) : wk.cells(p.v, p.v_stage, i, p.v_cell);
+            asm volatile("prefetch.global.L2 [%0];\n" ::"l"(a));
+        }
     }
     int j = 0;
     for (int wi = wk.i0; wi < wk.i1; wi++) {
@@ -802,13 +820,18 @@ int launch_with(K kernel, std::atomic<int8_t> * opted_in, const legion_paged_att
 // Where legion_paged_attn::verify_grid says so (heads of 256, 6 query heads a kv head, a
 // non-compact cache, no key-block split; paged::verify_grid on the Rust side): 1 the pair kernel,
 // 2 the quad kernel (a group a CTA, 256-dim chunks through 3 stages; 128-dim chunks through 6
-// stages and two groups a CTA were slower on a GB10). -1: no shared memory for it on this device
-// (paged_prefill_mma instead).
+// stages and two groups a CTA were slower on a GB10), 3 the quad kernel without its page
+// prefetch. -1: no shared memory for it on this device (paged_prefill_mma instead).
 template <int D, int G>
 int launch(const legion_paged_attn & p, cudaStream_t st) {
+    using Q = QShape<D, 1, 256, 3>;
     if (p.verify_grid == 2) {
         static std::atomic<int8_t> o2[GGML_CUDA_MAX_DEVICES];
-        return launch_with<QShape<D, 1, 256, 3>>(paged_prefill_quad<D, G, 1, 256, 3>, o2, p, G, st);
+        return launch_with<Q>(paged_prefill_quad<D, G, 1, 256, 3>, o2, p, G, st);
+    }
+    if (p.verify_grid == 3) {
+        static std::atomic<int8_t> o3[GGML_CUDA_MAX_DEVICES];
+        return launch_with<Q>(paged_prefill_quad<D, G, 1, 256, 3, false>, o3, p, G, st);
     }
     static std::atomic<int8_t> o1[GGML_CUDA_MAX_DEVICES];
     return launch_with<Shape<D, GROUPS>>(paged_prefill_grid<D, G, GROUPS>, o1, p, G, st);

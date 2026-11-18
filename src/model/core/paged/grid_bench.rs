@@ -13,16 +13,33 @@ use crate::model::core::KvPool;
 
 /// The kernel choices: `main` (`paged_prefill_mma`), `auto` ([`verify_grid_kind`]'s pick),
 /// `pair` / `quad` (the pair / quad kernel for every group they cover), `split` (over the key
-/// blocks).
-pub const KERNELS: [&str; 5] = ["main", "auto", "pair", "quad", "split"];
+/// blocks), `quad0` (the quad kernel without its page prefetch).
+pub const KERNELS: [&str; 6] = ["main", "auto", "pair", "quad", "split", "quad0"];
 
 /// Whether `kernel` runs `g` on a wide-grid kernel on a GPU of `sms` SMs.
 pub fn on_grid(g: &Group, kernel: &str, sms: usize) -> bool {
     match kernel {
         "auto" => verify_grid(g.n_tok, g.n_past.len(), g.heads.2, sms),
-        "pair" | "quad" => g.n_tok > 1,
+        "pair" | "quad" | "quad0" => g.n_tok > 1,
         _ => false,
     }
+}
+
+/// The [`set_verify_grid_here`] choice of `kernel` ([`KERNELS`] but `split`).
+pub fn mode(kernel: &str) -> i32 {
+    match kernel {
+        "main" => 0,
+        "auto" => -1,
+        "pair" => 1,
+        "quad" => 2,
+        "quad0" => 3,
+        _ => panic!("no kernel {kernel}; one of {KERNELS:?} but split"),
+    }
+}
+
+/// [`mode`] of `kernel` for the calling thread's launches; `""` follows the default again.
+pub fn set_here(kernel: &str) {
+    set_verify_grid_here((!kernel.is_empty()).then(|| mode(kernel)));
 }
 
 /// One run of the op for `g` over `kv` with `kernel` ([`KERNELS`]): its output and its
@@ -38,16 +55,12 @@ pub fn run(
     let (d, n_head, n_head_kv) = g.heads;
     let mut scratch = [1, 1, 1, 1];
     let mode = match kernel {
-        "main" => 0,
-        "auto" => -1,
-        "pair" => 1,
-        "quad" => 2,
         "split" => {
             let (d, h, hk) = (d as i64, n_head as i64, n_head_kv as i64);
             scratch = split_scratch_shape(d, h, hk, g.n_tok, g.n_past.len());
             0
         }
-        _ => panic!("no kernel {kernel}; one of {KERNELS:?}"),
+        k => mode(k),
     };
     set_verify_grid_here(Some(mode));
     let out = op(backend, kv, g, scratch, reps, rounds);

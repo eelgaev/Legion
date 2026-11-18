@@ -154,6 +154,14 @@ fn verify_grid_default() -> i32 {
     )
 }
 
+/// Whether the quad kernel prefetches its keys' first lines at the start (#689 r19; default on,
+/// `LEGION_DEBUG_PAGED_VERIFY_PREFETCH=0` off, read once). The same bits either way.
+#[cfg(feature = "cuda")]
+fn verify_prefetch() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("LEGION_DEBUG_PAGED_VERIFY_PREFETCH").as_deref() != Ok("0"))
+}
+
 thread_local! {
     /// The calling thread's wide-grid choice ([`set_verify_grid_here`]).
     static GRID_HERE: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
@@ -161,8 +169,9 @@ thread_local! {
 
 /// The wide-grid kernel's choice for the calling thread's launches (benches): `Some(0)`
 /// `paged_prefill_mma`, `Some(1)` the pair kernel and `Some(2)` the quad kernel for every group
-/// they cover, `Some(-1)` [`verify_grid_kind`]'s pick, `Some(-2)` its pick without the quad
-/// kernel; `None` follows the default again.
+/// they cover (`Some(3)` the quad kernel without its page prefetch), `Some(-1)`
+/// [`verify_grid_kind`]'s pick, `Some(-2)` its pick without the quad kernel; `None` follows the
+/// default again.
 pub fn set_verify_grid_here(mode: Option<i32>) {
     GRID_HERE.with(|c| c.set(mode));
 }
@@ -214,7 +223,7 @@ fn verify_grid_for(
         return 0;
     }
     let mode = GRID_HERE.with(|c| c.get());
-    match mode.unwrap_or_else(verify_grid_default) {
+    let kind = match mode.unwrap_or_else(verify_grid_default) {
         m @ (-2 | -1) => {
             let sms = crate::hw::per_device::current().map_or(0, crate::hw::per_device::sm_count);
             let kind = verify_grid_kind(n_tok, n_seqs, n_head_kv, sms.max(0) as usize);
@@ -223,6 +232,12 @@ fn verify_grid_for(
             if m == -2 { kind.min(1) } else { kind }
         }
         m => m.max(0),
+    };
+    // 3: the quad kernel without its page prefetch.
+    if kind == 2 && mode.is_none() && !verify_prefetch() {
+        3
+    } else {
+        kind
     }
 }
 
@@ -1279,6 +1294,7 @@ pub fn supported(head_dim: i64, n_head: i64, n_head_kv: i64) -> bool {
         && matches!(n_head / n_head_kv, 1 | 2 | 4 | 6 | 8 | 12 | 16)
 }
 
+pub mod cold_bench;
 pub mod d512_bench;
 #[cfg(test)]
 mod d512_tests;
