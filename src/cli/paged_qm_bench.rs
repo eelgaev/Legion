@@ -48,10 +48,30 @@ pub struct PagedQmBenchArgs {
     d512: Vec<String>,
     /// The wide-grid kernels for small groups at 6 query heads a kv head (`--heads 24,4`:
     /// Qwen3.8-27B) against `paged_prefill_mma` (#689), `--modes` ignored: `auto` (the default's
-    /// pick), `pair` / `quad` (the pair / quad kernel for every group it covers), `split` (over
-    /// the key blocks as `--paged-verify-split`; other bits, timed for reference).
+    /// pick), `pair` / `quad` (the pair / quad kernel for every group it covers), `quad0` (the
+    /// quad kernel without its page prefetch), `split` (over the key blocks as
+    /// `--paged-verify-split`; other bits, timed for reference).
     #[arg(long, value_delimiter = ',')]
     grid: Vec<String>,
+    /// With `--grid`: time each kernel per call as a model's step meets it (#689), in these
+    /// modes instead of the plain timing: `warm` (nothing between calls), `rot` (the layers'
+    /// pools in turn), `read` (a 1 GiB read before each call), `rotread` (both), `l2` (a 48 MiB
+    /// read), `tlb` / `tlb64k` (one 4-byte read every 2 MiB / 64 KiB over 8 GiB), `pt64k` /
+    /// `pt2m` (the call's own K/V pools touched every 64 KiB / 2 MiB first); parts join with +.
+    #[arg(long, value_delimiter = ',')]
+    cold: Vec<String>,
+    /// With `--cold`: the host sleeps this long before each graph (an idle GPU in between).
+    #[arg(long, default_value_t = 0)]
+    gap_ms: u64,
+    /// With `--cold`: layers in the pool (one buffer), and calls per graph.
+    #[arg(long, default_value_t = 16)]
+    layers: usize,
+    /// With `--cold`: blocks per layer (0: the deepest group's).
+    #[arg(long, default_value_t = 0)]
+    pool_blocks: usize,
+    /// Block i of sequence s sits in pool block (i * stride + s * 11) mod the pool's blocks.
+    #[arg(long, default_value_t = 37)]
+    stride: usize,
 }
 
 /// A kernel family timed and checked against `paged_prefill_mma` (`--d512`, `--grid`).
@@ -122,6 +142,9 @@ pub fn run(args: PagedQmBenchArgs) -> anyhow::Result<()> {
             on: grid::on_grid,
             edges: grid::edges,
         };
+        if !args.cold.is_empty() {
+            return run_cold(&args, heads, &chunks);
+        }
         return run_alt(&args, &alt, heads, &chunks);
     }
     let mut gpu = legion::ggml::backend_by_name("CUDA0")?;
@@ -254,10 +277,10 @@ fn run_alt(
     let n_blocks = max_ctx.div_ceil(64).max(1);
     let kv = pool(&gpu, heads, n_blocks);
     let seqs = args.seqs.max(1);
-    // Block i of sequence s in pool block (i * 37 + s * 11) mod n_blocks.
+    // Block i of sequence s in pool block (i * stride + s * 11) mod n_blocks.
     let table = |s: usize, len: usize| -> Vec<u32> {
         (0..len)
-            .map(|i| ((i * 37 + s * 11) % n_blocks) as u32)
+            .map(|i| ((i * args.stride + s * 11) % n_blocks) as u32)
             .collect()
     };
     print!(
@@ -314,6 +337,115 @@ fn run_alt(
                 }
             };
             print!(" {ms:>9.3} {:>6.3} {bits:>6}", main / ms);
+        }
+        println!();
+    }
+    if differ > 0 {
+        anyhow::bail!("{differ} values differ from paged_prefill_mma's bits");
+    }
+    Ok(())
+}
+
+/// `--grid` with `--cold` (#689): each kernel's ms per call in each cold mode, call 0's output
+/// checked against `paged_prefill_mma`'s bits.
+#[cfg(feature = "cuda")]
+fn run_cold(
+    args: &PagedQmBenchArgs,
+    heads: (usize, usize, usize),
+    chunks: &[(usize, usize)],
+) -> anyhow::Result<()> {
+    use legion::model::core::paged_cold_bench as cold;
+    use legion::model::core::paged_grid_bench as grid;
+    use legion::model::core::paged_split_bench::{Group, pools};
+    for k in &args.grid {
+        anyhow::ensure!(
+            k != "main" && k != "split" && grid::KERNELS.contains(&k.as_str()),
+            "--cold takes --grid kernels of {:?} but split",
+            &grid::KERNELS[1..]
+        );
+    }
+    for m in &args.cold {
+        anyhow::ensure!(
+            cold::valid(m),
+            "--cold takes rotread or {:?} joined with +, not {m}",
+            cold::PARTS
+        );
+    }
+    anyhow::ensure!(
+        heads.1 == 6 * heads.2,
+        "--cold takes 6 query heads a kv head"
+    );
+    let mut gpu = legion::ggml::backend_by_name("CUDA0")?;
+    let max_ctx = chunks.iter().map(|(p, t)| p + t).max().unwrap_or(0);
+    let n_blocks = max_ctx.div_ceil(64).max(args.pool_blocks).max(1);
+    let layers = args.layers.max(1);
+    let kv = pools(&gpu, heads, n_blocks, layers);
+    let flush = cold::Flush::new(&gpu);
+    let seqs = args.seqs.max(1);
+    println!(
+        "{layers} layers of {n_blocks} blocks, table stride {}, {} calls a graph",
+        args.stride, layers
+    );
+    let mut differ = 0;
+    for &(n_past, n_tok) in chunks {
+        let past = vec![n_past; seqs];
+        let len = (n_past + n_tok).div_ceil(64);
+        let tables: Vec<Vec<u32>> = (0..seqs)
+            .map(|s| {
+                (0..len)
+                    .map(|i| ((i * args.stride + s * 11) % n_blocks) as u32)
+                    .collect()
+            })
+            .collect();
+        let g = Group {
+            heads,
+            n_tok,
+            n_past: &past,
+            tables: &tables,
+            width: len,
+            window: args.window,
+            ring: 0,
+            scale: 1.0 / (heads.0 as f32).sqrt(),
+        };
+        let (want, _) = grid::run(&mut gpu, &kv, &g, "main", 0, 0);
+        println!("{n_past}:{n_tok} x{seqs}: ms per call (flush ms per call)");
+        print!("{:>8}", "kernel");
+        for m in &args.cold {
+            print!(" {m:>9}");
+        }
+        println!("  bits");
+        let mut flush_ms = vec![0.0; args.cold.len()];
+        for k in &args.grid {
+            print!("{k:>8}");
+            let mut bad = 0;
+            for (mi, m) in args.cold.iter().enumerate() {
+                let (ms, f, out) = cold::time(
+                    &mut gpu,
+                    &kv,
+                    layers,
+                    &flush,
+                    &g,
+                    k,
+                    m,
+                    layers,
+                    args.reps,
+                    args.rounds,
+                    args.gap_ms,
+                );
+                flush_ms[mi] = f;
+                bad += want
+                    .iter()
+                    .zip(&out)
+                    .filter(|(x, y)| x.to_bits() != y.to_bits())
+                    .count();
+                print!(" {ms:>9.3}");
+            }
+            differ += bad;
+            println!("  {}", if bad == 0 { "same" } else { "DIFFER" });
+        }
+        print!("{:>8}", "flush");
+        for f in flush_ms {
+            print!(" {f:>9.3}");
         }
         println!();
     }
