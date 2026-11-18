@@ -207,6 +207,53 @@ fn bf16_z_alpha_beta_join_as_a_run() {
     assert!(j.get_run(&[z1, a1, b1]).is_none(), "not back to back");
 }
 
+/// A DeltaNet layer's BF16 qkv stored right before z, alpha and beta joins with them as one run
+/// of four (#1176), beside the z run and the alpha / beta pair; with anything between qkv and z
+/// only the z run joins.
+#[test]
+fn bf16_qkv_z_alpha_beta_join_as_a_run() {
+    let ctx = Context::new(16, 0);
+    let weights = [
+        ("blk.0.attn_qkv.weight", types::BF16, 48),
+        ("blk.0.attn_gate.weight", types::BF16, 32),
+        ("blk.0.ssm_alpha.weight", types::BF16, 4),
+        ("blk.0.ssm_beta.weight", types::BF16, 4),
+        ("blk.1.attn_qkv.weight", types::BF16, 48),
+        ("filler", types::BF16, 2),
+        ("blk.1.attn_gate.weight", types::BF16, 32),
+        ("blk.1.ssm_alpha.weight", types::BF16, 4),
+        ("blk.1.ssm_beta.weight", types::BF16, 4),
+    ];
+    for (name, ty, rows) in weights {
+        ctx.new_tensor(ty, &[E, rows]).named(name);
+    }
+    ctx.alloc_tensors(Backend::cpu().unwrap().buffer_type())
+        .unwrap();
+    let all = weights.iter().filter_map(|(n, _, _)| ctx.tensor(n));
+    let j = Joined::build(all, |n| ctx.tensor(n), true).expect("nothing joined");
+    let mut joined: Vec<String> = j.tensors().map(|t| t.name()).collect();
+    joined.sort();
+    let mut want: Vec<String> = ["0.attn_gate", "0.attn_qkv", "0.ssm_alpha"]
+        .iter()
+        .chain(&["1.attn_gate", "1.ssm_alpha"])
+        .map(|m| joined_name(&format!("blk.{m}.weight")))
+        .collect();
+    want.sort();
+    assert_eq!(joined, want);
+    let t = |n: &str| ctx.tensor(n).unwrap();
+    let run = |il: usize| {
+        RUNS[RUN_QKVZ]
+            .iter()
+            .map(|m| t(&format!("blk.{il}.{m}")))
+            .collect::<Vec<_>>()
+    };
+    let all4 = j.get_run(&run(0)).expect("the run of four");
+    assert_eq!((all4.ty(), all4.ne()), (types::BF16, [E, 88, 1, 1]));
+    assert_eq!(addr(all4), addr(run(0)[0]));
+    assert!(j.get_run(&run(1)).is_none(), "not back to back");
+    assert!(j.get_run(&run(1)[1..]).is_some(), "the z run");
+}
+
 /// A full-attention layer's BF16 query + gate, key and value stored back to back join as one
 /// run; with the output projection between key and value they do not.
 #[test]
