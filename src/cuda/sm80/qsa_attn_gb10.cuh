@@ -324,7 +324,64 @@ __device__ __forceinline__ int ld_issue(const int32_t * a) {
     return v;
 }
 
-template <int HD>
+// attn_gw_kernel's bench-only L2 probes (#1176 round 42; PromptKernel 5-10, reachable only
+// through `legion qsa-bench`). Each computes every value as VAR 0 (the kernel) does, in the same
+// order, so the bits are the kernel's; they change which CTA takes which token, add L2 prefetches
+// or route the copies through L1.
+constexpr int GW_FAR = 1;   // consecutive CTAs take tokens far apart (no neighbour shares a wave)
+constexpr int GW_PFN = 2;   // prefetch the next token's chunk two ahead into L2
+constexpr int GW_PFS = 4;   // prefetch this token's own chunk two ahead into L2
+constexpr int GW_CA = 8;    // cp.async.ca: K / V rows through L1 (allocating)
+constexpr int GW_SMP = 16;  // CTAs b and b + SMs (one SM's pair in a wave) take tokens 2j, 2j + 1
+constexpr int GW_ONE = 32;  // launched with 64 KB of shared memory: one CTA per SM
+
+// The token CTA blockIdx.x takes. GW_SMP reads the SM count from p.hgroups (the launcher's copy;
+// the prompt kernel reads no hgroups).
+template <int VAR>
+__device__ __forceinline__ int gw_token(const legion_qsa_attn & p) {
+    const int b = blockIdx.x, n = gridDim.x;
+    if constexpr ((VAR & GW_FAR) != 0) {
+        // b * m mod n, m odd, near n / golden ratio and coprime to n: a bijection.
+        int m = (int) ((float) n * 0.618034f) | 1;
+        for (;;) {
+            int a = m, c = n;
+            while (c != 0) {
+                const int r = a % c;
+                a = c;
+                c = r;
+            }
+            if (a == 1) {
+                break;
+            }
+            m += 2;
+        }
+        return (int) ((long long) b * m % n);
+    } else if constexpr ((VAR & GW_SMP) != 0) {
+        const int w = max(p.hgroups, 1), w2 = 2 * w, base = b / w2 * w2, r = b - base;
+        if (base + w2 > n) {
+            return b;  // the ragged tail keeps its order
+        }
+        return base + (r < w ? 2 * r : 2 * (r - w) + 1);
+    } else {
+        return b;
+    }
+}
+
+__device__ __forceinline__ void prefetch_l2(const void * a) {
+    asm volatile("prefetch.global.L2 [%0];\n" ::"l"(a));
+}
+
+__device__ __forceinline__ void cp_async16_l1(void * smem, const void * gmem, bool valid) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const uint32_t dst = (uint32_t) __cvta_generic_to_shared(smem);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(gmem),
+                 "r"(valid ? 16 : 0));
+#else
+    __trap();
+#endif
+}
+
+template <int HD, int VAR = 0>
 __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     GbSmem<HD> & S = *reinterpret_cast<GbSmem<HD> *>(smem_raw);
@@ -340,7 +397,7 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
     static_assert(MCH == 32 && KR == 8, "one lane per chunk row, 8 score cells per warp");
     static_assert(KR * PIECES % 32 == 0 && MCH * VP % 32 == 0, "copy layout");
     static_assert(NT % 2 == 0 && KS % 2 == 0, "ldmatrix x4 pairs");
-    const int tok = blockIdx.x, kvh = blockIdx.y;
+    const int tok = gw_token<VAR>(p), kvh = blockIdx.y;
     const int G = p.n_head / p.n_head_kv;
     const int s = tok / p.n_tok, ti = tok % p.n_tok;
     const char * qb = (const char *) p.q + (size_t) s * p.q_nb3 + (size_t) ti * p.q_nb2 +
@@ -368,7 +425,11 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
             const int cl = __shfl_sync(0xffffffffu, cell, c);
             const bool valid = cl >= 0;
             const long long r = valid ? (long long) cl * p.kv_row + (long long) kvh * HD : 0;
-            cp_async16(&S.k[c][pc * 8], reinterpret_cast<const uint4 *>(p.k + r) + pc, valid);
+            if constexpr ((VAR & GW_CA) != 0) {
+                cp_async16_l1(&S.k[c][pc * 8], reinterpret_cast<const uint4 *>(p.k + r) + pc, valid);
+            } else {
+                cp_async16(&S.k[c][pc * 8], reinterpret_cast<const uint4 *>(p.k + r) + pc, valid);
+            }
         }
         cp_async_commit();
     };
@@ -380,9 +441,34 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
             const int cl = __shfl_sync(0xffffffffu, cell, c);
             const bool valid = cl >= 0;
             const long long r = valid ? (long long) cl * p.kv_row + (long long) kvh * HD : 0;
-            cp_async16(&S.v[c][pc * 8], reinterpret_cast<const uint4 *>(p.v + r) + pc, valid);
+            if constexpr ((VAR & GW_CA) != 0) {
+                cp_async16_l1(&S.v[c][pc * 8], reinterpret_cast<const uint4 *>(p.v + r) + pc, valid);
+            } else {
+                cp_async16(&S.v[c][pc * 8], reinterpret_cast<const uint4 *>(p.v + r) + pc, valid);
+            }
         }
         cp_async_commit();
+    };
+    // GW_PFN / GW_PFS: lane l prefetches row l of a chunk two ahead (the next token's or its own),
+    // warp w the w-th quarter of its K and V rows.
+    const int32_t * ids_pf = ids;
+    int n_pf = 0;
+    if constexpr ((VAR & GW_PFN) != 0) {
+        if (tok + 1 < (int) gridDim.x && (tok + 1) / p.n_tok == s) {
+            ids_pf = ids + p.sel_row;
+            n_pf = ids_pf[-1];
+        }
+    } else if constexpr ((VAR & GW_PFS) != 0) {
+        n_pf = n;
+    }
+    auto prefetch = [&](int c0) {
+        const int pos = c0 + lane < n_pf ? ld_issue(ids_pf + c0 + lane) : -1;
+        const int cl = cell_of(pos);
+        if (cl >= 0) {
+            const size_t r = (size_t) cl * p.kv_row + (size_t) kvh * HD + (size_t) warp * (HD / 4);
+            prefetch_l2(p.k + r);
+            prefetch_l2(p.v + r);
+        }
     };
     int pos_n = -1;  // the next chunk's positions
     if (n > 0) {
@@ -446,6 +532,9 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
         // the one after.
         const int cell_n = cell_of(pos_n);
         pos_n = pos_at(c0 + 2 * MCH);
+        if constexpr ((VAR & (GW_PFN | GW_PFS)) != 0) {
+            prefetch(c0 + 2 * MCH);
+        }
         // This warp's K rows (its V dims may still be on their way).
         cp_async_wait<1>();
         __syncwarp();

@@ -196,6 +196,8 @@ pub fn capture_safe(op: &ExternalOp, node: &ffi::ggml_tensor) -> bool {
     match op.name {
         // SAFETY: the node of an expert matvec op, which only its builders make.
         "expert_mv" | "expert_mv_glu" => unsafe { super::expert_mv::capture_safe(node) },
+        // `LEGION_DEBUG_QSA_SEL` copies the selections to the host after the launch.
+        "qsa_attn" if crate::model::qwen4::qsa_attn::sel_dump::enabled() => false,
         name if COMMIT.contains(&name) => COMMIT_CAPTURE.load(Ordering::Relaxed),
         name => listed(name, crate::ggml::stage_graph::small_step()),
     }

@@ -616,6 +616,19 @@ pub enum PromptKernel {
     /// `attn_gw_kernel` (#1183): `attn_gb_kernel` with warp-local copies (each warp refills the
     /// K rows and V dims it reads itself), two CTA barriers per chunk instead of three.
     Gw = 3,
+    /// Bench-only probes of `attn_gw_kernel` (#1176 round 42, `legion qsa-bench`): the same
+    /// values in the same order. `GwOne`: one CTA per SM (half the bytes in flight).
+    GwOne = 5,
+    /// Consecutive CTAs take tokens far apart, so no neighbours share a wave or the L2's lines.
+    GwFar = 6,
+    /// Each CTA prefetches the next token's chunk two ahead into L2.
+    GwPfNext = 7,
+    /// Each CTA prefetches its own chunk two ahead into L2.
+    GwPfSelf = 8,
+    /// [`PromptKernel::GwSmp`] with the K / V copies through L1 (`cp.async.ca`).
+    GwSmpL1 = 9,
+    /// CTAs `b` and `b + SMs` (the pair one SM holds in a wave) take neighbouring tokens.
+    GwSmp = 10,
 }
 
 /// The prompt kernel launches take from now on ([`PromptKernel`]; `legion qsa-bench`).
@@ -1180,7 +1193,8 @@ mod cuda {
         /// the reference kernel).
         pub hgroups: i32,
         /// The F16 prompt kernel on sm_80+ ([`super::PromptKernel`] as i32): 0 the launcher's
-        /// choice, 1 `attn_mma_kernel`, 2 `attn_gb_kernel`, 3 `attn_gw_kernel`.
+        /// choice, 1 `attn_mma_kernel`, 2 `attn_gb_kernel`, 3 `attn_gw_kernel`, 5-10 its
+        /// bench-only probes.
         pub mma_kernel: i32,
     }
 
@@ -1450,9 +1464,15 @@ unsafe fn cuda_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), S
         hgroups: decode_hgroups(),
         mma_kernel: PROMPT_KERNEL.load(std::sync::atomic::Ordering::Relaxed) as i32,
     };
-    launched("qsa_attn", unsafe {
+    let r = launched("qsa_attn", unsafe {
         cuda::legion_qsa_attn_launch(&p, stream)
-    })
+    });
+    let tokens = o.n_tok * o.n_seqs;
+    if r.is_ok() && tokens as i64 > DECODE_TOKENS && sel_dump::enabled() {
+        // SAFETY: the node's selection rows, `tokens` of `sel_row` I32s.
+        unsafe { sel_dump::after(o.sel, tokens, o.sel_row, o.n_tok, stream) };
+    }
+    r
 }
 
 #[cfg(any(test, feature = "cuda"))]
@@ -1461,5 +1481,6 @@ pub mod bench;
 mod decode_tests;
 #[cfg(test)]
 mod quant_tests;
+pub mod sel_dump;
 #[cfg(test)]
 mod tests;

@@ -568,11 +568,12 @@ pub(super) fn attention_ms(
     let t = super::bench::prompt_ms(
         backend,
         types,
+        (24, 2),
         n_ctx,
         n_tok,
         reps,
         1,
-        false,
+        super::bench::Layout::Spread,
         &[PromptKernel::Auto],
     );
     (t[0].ms, t[0].bits)
