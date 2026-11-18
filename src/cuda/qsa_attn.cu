@@ -95,8 +95,13 @@ struct legion_qsa_attn {
     int32_t hgroups;
     // The F16 prompt kernel on sm_80+ (#828): 0 the launcher's choice (attn_gw_kernel on compute
     // capability 12.x, attn_gb_kernel on Ampere, attn_mma_kernel on the others),
-    // 1 attn_mma_kernel, 2 attn_gb_kernel, 3 attn_gw_kernel (#1183). All give the same bits.
+    // 1 attn_mma_kernel, 2 attn_gb_kernel, 3 attn_gw_kernel (#1183); 4-10 attn_gw_kernel's
+    // variants for `legion qsa-bench` (#1176 round 42, launch_gw_variant; 4 its cp.async.cg
+    // copies). All give the same bits.
     int32_t mma_kernel;
+    // attn_gw_kernel copies K and V with cp.async.cg (L2 only) instead of cp.async.ca (through
+    // L1, the default): LEGION_DEBUG_QSA_GW_L1=0, for A/B runs.
+    int32_t gw_cg;
 };
 
 int legion_qsa_pool_mask_launch(const legion_qsa_pool_mask * p, void * stream);
@@ -1433,6 +1438,27 @@ __global__ void __launch_bounds__(128) qsa_scores_kernel(const legion_qsa_scores
     }
 }
 
+// attn_gw_kernel<HD, VAR> (sm80/qsa_attn_gb10.cuh): ~39 KB at HD 256, under the 48 KB default,
+// two CTAs per SM with the largest shared-memory carveout (GW_ONE: 64 KB, one CTA per SM).
+template <int HD, int VAR>
+int launch_gw_variant(const legion_qsa_attn & p, cudaStream_t st) {
+    void (*kern)(legion_qsa_attn) = attn_gw_kernel<HD, VAR>;
+    int bytes = (int) sizeof(GbSmem<HD>);
+    if constexpr ((VAR & GW_ONE) != 0) {
+        bytes = 64 * 1024;  // over half of the SM's shared memory
+        if (cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) !=
+            cudaSuccess) {
+            return 2;
+        }
+    }
+    if (cudaFuncSetAttribute(kern, cudaFuncAttributePreferredSharedMemoryCarveout,
+                             cudaSharedmemCarveoutMaxShared) != cudaSuccess) {
+        return 2;
+    }
+    kern<<<dim3(p.grid[0], p.grid[1]), THREADS, bytes, st>>>(p);
+    return cudaGetLastError() == cudaSuccess ? 0 : 2;
+}
+
 template <int HD>
 int launch_attn(const legion_qsa_attn & p, cudaStream_t st) {
     // A quantized cache: the m8n8k4 kernel on every device (attn_mma_kernel reads F16).
@@ -1454,12 +1480,25 @@ int launch_attn(const legion_qsa_attn & p, cudaStream_t st) {
                                 "only; this GPU runs the mma.m16n8k16 kernel\n");
             }
         }
+        switch (p.mma_kernel) {
+            case 4: return launch_gw_variant<HD, 0>(p, st);
+            case 5: return launch_gw_variant<HD, GW_ONE>(p, st);
+            case 6: return launch_gw_variant<HD, GW_FAR>(p, st);
+            case 7: return launch_gw_variant<HD, GW_FAR | GW_CA>(p, st);
+            case 8: return launch_gw_variant<HD, GW_CAK>(p, st);
+            case 9: return launch_gw_variant<HD, GW_CAV>(p, st);
+            case 10: return launch_gw_variant<HD, GW_ONE | GW_CA>(p, st);
+            default: break;
+        }
         const int gb = p.mma_kernel == 1 ? 0 : use_gb<HD>(p.mma_kernel);
+        if (gb == 3) {
+            return p.gw_cg ? launch_gw_variant<HD, 0>(p, st) : launch_gw_variant<HD, GW_CA>(p, st);
+        }
         if (gb != 0) {
             // ~39 KB at HD 256: under the 48 KB default, two CTAs per SM with the largest
             // shared-memory carveout.
             const int bytes = (int) sizeof(GbSmem<HD>);
-            void (*kern)(legion_qsa_attn) = gb == 3 ? attn_gw_kernel<HD> : attn_gb_kernel<HD>;
+            void (*kern)(legion_qsa_attn) = attn_gb_kernel<HD>;
             if (cudaFuncSetAttribute(kern, cudaFuncAttributePreferredSharedMemoryCarveout,
                                      cudaSharedmemCarveoutMaxShared) != cudaSuccess) {
                 return 2;

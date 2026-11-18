@@ -533,3 +533,19 @@ fn a_saved_heat_ranking_keeps_the_older_files_other_pairs_after_its_own() {
     assert_eq!(super::save_heat(&path, other.clone()).unwrap(), 2);
     assert_eq!(Profile::read(&path).unwrap(), other);
 }
+
+#[test]
+fn a_lend_fills_from_ram_only_the_slots_it_keeps() {
+    use super::{Lend, fill_below};
+    // A layer lent whole gives its slots' VRAM away right after: no copies into them.
+    assert_eq!(fill_below(true, Lend::Whole, 40, false), 0);
+    assert_eq!(fill_below(true, Lend::Keep, 0, false), usize::MAX);
+    // A tail lend keeps the slots below `keep` only.
+    assert_eq!(fill_below(true, Lend::Tail, 40, false), 40);
+    assert_eq!(fill_below(true, Lend::Tail, 0, false), 0);
+    // Re-packing the kept slots may copy from the tail's bytes: they all get theirs.
+    assert_eq!(fill_below(true, Lend::Tail, 40, true), usize::MAX);
+    // A layer whose device does not stage keeps its slots whatever its mode says.
+    assert_eq!(fill_below(false, Lend::Whole, 40, false), usize::MAX);
+    assert_eq!(fill_below(false, Lend::Tail, 40, false), usize::MAX);
+}

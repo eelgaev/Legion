@@ -614,8 +614,24 @@ pub enum PromptKernel {
     /// and one V buffer filled out of phase).
     Gb = 2,
     /// `attn_gw_kernel` (#1183): `attn_gb_kernel` with warp-local copies (each warp refills the
-    /// K rows and V dims it reads itself), two CTA barriers per chunk instead of three.
+    /// K rows and V dims it reads itself), two CTA barriers per chunk instead of three; the
+    /// copies go through L1 (`cp.async.ca`, #1176 round 42) unless `LEGION_DEBUG_QSA_GW_L1=0`.
     Gw = 3,
+    /// `attn_gw_kernel`'s variants for `legion qsa-bench` (#1176 round 42): the same values in
+    /// the same order. `GwCg`: the copies with `cp.async.cg` (L2 only), the kernel before.
+    GwCg = 4,
+    /// `GwCg` at one CTA per SM (half the bytes in flight).
+    GwOne = 5,
+    /// `GwCg` with consecutive CTAs taking tokens far apart, so no neighbours share a wave.
+    GwFar = 6,
+    /// [`PromptKernel::GwFar`] with the copies through L1.
+    GwFarL1 = 7,
+    /// K copies only through L1.
+    GwL1K = 8,
+    /// V copies only through L1.
+    GwL1V = 9,
+    /// [`PromptKernel::GwOne`] with the copies through L1 (no CTA beside it to share lines).
+    GwOneL1 = 10,
 }
 
 /// The prompt kernel launches take from now on ([`PromptKernel`]; `legion qsa-bench`).
@@ -627,6 +643,14 @@ pub fn set_prompt_kernel(k: PromptKernel) {
 /// [`set_prompt_kernel`]'s choice.
 #[cfg(feature = "cuda")]
 static PROMPT_KERNEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// `LEGION_DEBUG_QSA_GW_L1=0`: `attn_gw_kernel` copies K and V with `cp.async.cg` (L2 only),
+/// the way before #1176 round 42, for A/B runs (the same bits either way).
+#[cfg(feature = "cuda")]
+fn gw_cg() -> bool {
+    static CG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CG.get_or_init(|| std::env::var_os("LEGION_DEBUG_QSA_GW_L1").is_some_and(|v| v == "0"))
+}
 
 /// The decode kernel's head groups ([`cuda::Attn::hgroups`]): 0, the launcher's choice, except
 /// in tests ([`DECODE_HG_OVERRIDE`]).
@@ -1180,8 +1204,12 @@ mod cuda {
         /// the reference kernel).
         pub hgroups: i32,
         /// The F16 prompt kernel on sm_80+ ([`super::PromptKernel`] as i32): 0 the launcher's
-        /// choice, 1 `attn_mma_kernel`, 2 `attn_gb_kernel`, 3 `attn_gw_kernel`.
+        /// choice, 1 `attn_mma_kernel`, 2 `attn_gb_kernel`, 3 `attn_gw_kernel`, 4-10 its
+        /// variants for `legion qsa-bench`.
         pub mma_kernel: i32,
+        /// 1: `attn_gw_kernel` copies with `cp.async.cg` (`LEGION_DEBUG_QSA_GW_L1=0`), 0
+        /// through L1.
+        pub gw_cg: i32,
     }
 
     #[repr(C)]
@@ -1449,10 +1477,17 @@ unsafe fn cuda_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), S
         v_nb1: o.v_nb1 as i64,
         hgroups: decode_hgroups(),
         mma_kernel: PROMPT_KERNEL.load(std::sync::atomic::Ordering::Relaxed) as i32,
+        gw_cg: gw_cg() as i32,
     };
-    launched("qsa_attn", unsafe {
+    let r = launched("qsa_attn", unsafe {
         cuda::legion_qsa_attn_launch(&p, stream)
-    })
+    });
+    let tokens = o.n_tok * o.n_seqs;
+    if r.is_ok() && tokens as i64 > DECODE_TOKENS && sel_dump::enabled() {
+        // SAFETY: the node's selection rows, `tokens` of `sel_row` I32s.
+        unsafe { sel_dump::after(o.sel, tokens, o.sel_row, o.n_tok, stream) };
+    }
+    r
 }
 
 #[cfg(any(test, feature = "cuda"))]
@@ -1461,5 +1496,6 @@ pub mod bench;
 mod decode_tests;
 #[cfg(test)]
 mod quant_tests;
+pub mod sel_dump;
 #[cfg(test)]
 mod tests;
