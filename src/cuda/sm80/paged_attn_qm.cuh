@@ -28,16 +28,37 @@
 // Tiles a row does not see add nothing (alpha 1 or 0, sums and products of zero weights), so the
 // larger tile (more key blocks for its first and last rows) leaves the bits alone.
 //
+// The ping-pong (PP, prompt chunks at 6 query heads a kv head: Qwen3.8-27B): the CTA's warps as
+// two groups of 4 (rows 0-63 and 64-127) over a ring of 64-dim chunks in 4 stages. The first group
+// fills the ring two chunks ahead and syncs among itself only (named barrier PB_A); the second
+// starts a chunk once the first is done with its MMAs on it (PB_FULL + stage) and hands the stage
+// back when it is done too (PB_EMPTY + stage). So the second group runs one to two chunks behind,
+// and one group's softmax, rescale and ring waits fall under the other's MMAs instead of all 8
+// warps crossing the same CTA barriers 4 times a key tile. Each warp's arithmetic is unchanged
+// (the chunks only split the same MMA chains in more steps), so the bits are the same.
+//
 // Not covered (paged_prefill_mma instead): quantized caches, the compact cache, a host tier's
 // pieces, key-block splits, other head sizes, groups whose grid is faster there (pays()).
 
 namespace fa_qm {
 
-template <int D> struct Shape {
+// The ping-pong's named barriers (0 is __syncthreads): the first group's, then one per stage for a
+// chunk the first group is done with, then one per stage for a chunk the second group is done with.
+constexpr int PB_A = 1, PB_FULL = 2, PB_EMPTY = 6;
+
+__device__ __forceinline__ void bar_sync(int id, int n) {
+    asm volatile("bar.sync %0, %1;\n" ::"r"(id), "r"(n) : "memory");
+}
+__device__ __forceinline__ void bar_arrive(int id, int n) {
+    asm volatile("bar.arrive %0, %1;\n" ::"r"(id), "r"(n) : "memory");
+}
+
+template <int D, bool PP = false> struct Shape {
     static constexpr int NW      = 8;                              // warps per CTA
     static constexpr int ROWS    = 16 * NW;                        // query rows per CTA
-    static constexpr int CH      = 128;                            // dims per K / V chunk
-    static constexpr int NS      = 2;                              // ring stages
+    static constexpr int CH      = PP ? 64 : 128;                  // dims per K / V chunk
+    static constexpr int NS      = PP ? 4 : 2;                     // ring stages
+    static constexpr int PF      = PP ? 2 : NS - 1;                // chunks issued ahead
     static constexpr int QUNITS  = D / 8;                          // 16-byte units per Q row
     static constexpr int QBYTES  = ROWS * D * (int) sizeof(half);  // Q tile
     static constexpr int UNITS   = CH / 8;                         // 16-byte units per chunk row
@@ -68,17 +89,18 @@ bool pays(const legion_paged_attn & p) {
     return waves * QT * 6 <= waves_mm * QT_MMA * 7;
 }
 
-template <int D, int G>
-__global__ void __launch_bounds__(Shape<D>::NW * 32, 1) paged_prefill_qm(const legion_paged_attn p) {
+template <int D, int G, bool PP = false>
+__global__ void __launch_bounds__(Shape<D, PP>::NW * 32, 1) paged_prefill_qm(const legion_paged_attn p) {
 #ifdef LEGION_PAGED_MMA
-    using SH = Shape<D>;
+    using SH = Shape<D, PP>;
     using fa::cp_async16;
     using fa::ldsm;
     using fa::ldsm_t;
     using fa::mma;
     using fa::pack;
     constexpr int NS = SH::NS, CH = SH::CH, UNITS = SH::UNITS, CHUNK = SH::CHUNK, QU = SH::QUNITS;
-    constexpr int NW = SH::NW, ROWS = SH::ROWS;
+    constexpr int NW = SH::NW, ROWS = SH::ROWS, PF = SH::PF;
+    constexpr int NT = PP ? NW * 16 : NW * 32;  // threads that issue the ring's chunks
     constexpr int NC = D / CH;    // chunks of K, and of V, per key tile
     constexpr int KC = CH / 16;   // k-steps of S per K chunk
     constexpr int QT = ROWS / G;  // tokens per CTA
@@ -92,6 +114,7 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, 1) paged_prefill_qm(const l
     const int t0 = (gridDim.x - 1 - blockIdx.x) * QT, kvh = blockIdx.y, seq = blockIdx.z;
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int gq = lane / 4, tq = lane % 4;  // fragment row group, thread in quad
+    const int grp = warp / (NW / 2);         // PP: 0 the group that fills the ring, 1 the other
     const int n_past = p.n_past[seq];
 
     // Row r's token. Rows past n_tok, and past QT * G when G does not divide 128, repeat the
@@ -126,16 +149,29 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, 1) paged_prefill_qm(const l
             const half * src = (const half *) base + kvh * D + (part % NC) * CH;
             const uint32_t dst = rbase + (uint32_t) (j % NS) * CHUNK;
 #pragma unroll
-            for (int x = threadIdx.x; x < BLK * UNITS; x += NW * 32) {
+            for (int x = threadIdx.x; x < BLK * UNITS; x += NT) {
                 const int r = x / UNITS, u = x % UNITS;
                 cp_async16(dst + fa::swz<UNITS>(r, u), src + (int64_t) r * p.kv_row + u * 8, b * BLK + r < k_end);
             }
         }
         asm volatile("cp.async.commit_group;\n" ::);
     };
+    // PP: a warp is done with chunk jj (the first group: its MMAs on it; the second: its shared
+    // memory, unless no chunk goes to that stage again).
+    auto pp_done = [&](int jj) {
+        if constexpr (PP) {
+            if (grp == 0) {
+                bar_arrive(PB_FULL + jj % NS, NW * 32);
+            } else if (jj + NS < n_chunks) {
+                bar_arrive(PB_EMPTY + jj % NS, NW * 32);
+            }
+        }
+    };
 
-    for (int j = 0; j < NS - 1; j++) {
-        issue(j);
+    if (!PP || grp == 0) {
+        for (int j = 0; j < PF; j++) {
+            issue(j);
+        }
     }
 
     // Q's rows in F16 (as paged_prefill_mma rounds them), rows of QU swizzled 16-byte units.
@@ -146,6 +182,9 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, 1) paged_prefill_qm(const l
         const float2 a = *(const float2 *) qr, b = *(const float2 *) (qr + 2);
         const float2 c = *(const float2 *) (qr + 4), d = *(const float2 *) (qr + 6);
         *(uint4 *) (smem + fa::swz<QU>(r, u)) = make_uint4(pack(a.x, a.y), pack(b.x, b.y), pack(c.x, c.y), pack(d.x, d.y));
+    }
+    if constexpr (PP) {
+        __syncthreads();  // Q (the loop's barriers are per group)
     }
 
     // O fragments: [n] dims 8 n + 2 tq + {0, 1}, rows gq ([0], [1]) and gq + 8 ([2], [3]).
@@ -185,10 +224,28 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, 1) paged_prefill_qm(const l
         float alpha[2];
 #pragma unroll
         for (int part = 0; part < 2 * NC; part++, j++) {
-            asm volatile("cp.async.wait_group %0;\n" ::"n"(NS - 2));
-            __syncthreads();
-            issue(j + NS - 1);
+            if constexpr (PP) {
+                if (grp == 0) {
+                    // The group's own copies of chunk j are in and all its warps are past chunk
+                    // j - 1; chunk j + PF goes to the stage of chunk j + PF - NS once the other
+                    // group is done with that.
+                    asm volatile("cp.async.wait_group %0;\n" ::"n"(PF - 1));
+                    bar_sync(PB_A, NW * 16);
+                    const int c = j + PF;
+                    if (c >= NS && c < n_chunks) {
+                        bar_sync(PB_EMPTY + c % NS, NW * 32);
+                    }
+                    issue(c);
+                } else {
+                    bar_sync(PB_FULL + j % NS, NW * 32);
+                }
+            } else {
+                asm volatile("cp.async.wait_group %0;\n" ::"n"(NS - 2));
+                __syncthreads();
+                issue(j + NS - 1);
+            }
             if (!active) {
+                pp_done(j);
                 continue;
             }
             const uint32_t st = rbase + (uint32_t) (j % NS) * CHUNK;
@@ -214,6 +271,7 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, 1) paged_prefill_qm(const l
                         mma(s[2 * np + 1], a, b + 2);
                     }
                 }
+                pp_done(j);  // before the softmax: the other group's MMAs run under it
                 if (part == NC - 1) {
                     // Online softmax per row; element e is key 8 n + 2 tq + e % 2, row
                     // gq + 8 (e / 2).
@@ -288,6 +346,7 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, 1) paged_prefill_qm(const l
                         on[3] = on[3] * alpha[1] + acc[h][3];
                     }
                 }
+                pp_done(j);
             }
         }
     }
@@ -326,16 +385,30 @@ bool takes(const legion_paged_attn & p) {
            legion_device::sm12x_device(paged_prefill_qm<D, G>) && (mode >= 2 || pays<D, G>(p));
 }
 
-template <int D, int G>
-int launch(const legion_paged_attn & p, cudaStream_t st) {
+template <int D, int G, bool PP>
+int launch_as(const legion_paged_attn & p, cudaStream_t st) {
+    using SH = Shape<D, PP>;
     static std::atomic<int8_t> opted_in[GGML_CUDA_MAX_DEVICES];
-    if (!legion_device::smem_opt_in(opted_in, paged_prefill_qm<D, G>, (int) Shape<D>::SMEM)) {
+    if (!legion_device::smem_opt_in(opted_in, paged_prefill_qm<D, G, PP>, (int) SH::SMEM)) {
         return -1;
     }
-    constexpr int QT = Shape<D>::ROWS / G;
-    paged_prefill_qm<D, G><<<dim3((p.n_tok + QT - 1) / QT, p.n_head_kv, p.n_seqs), Shape<D>::NW * 32, Shape<D>::SMEM, st>>>(p);
+    constexpr int QT = SH::ROWS / G;
+    paged_prefill_qm<D, G, PP><<<dim3((p.n_tok + QT - 1) / QT, p.n_head_kv, p.n_seqs), SH::NW * 32, SH::SMEM, st>>>(p);
     t_qm_launches++;
     return cudaGetLastError() == cudaSuccess ? 0 : 2;
+}
+
+// Prompt chunks (64 tokens a sequence or more) at 6 query heads a kv head (Qwen3.8-27B) take the
+// ping-pong (1.03-1.05x per call on a GB10 from 2K to 16K-token chunks over 0 to 119K positions,
+// #1133), unless qm_variant() is 1 (LEGION_DEBUG_QM_PINGPONG=0, benches). The same bits.
+template <int D, int G>
+int launch(const legion_paged_attn & p, cudaStream_t st) {
+    if constexpr (G == 6) {
+        if (p.n_tok >= 64 && qm_variant() != 1) {
+            return launch_as<D, G, true>(p, st);
+        }
+    }
+    return launch_as<D, G, false>(p, st);
 }
 
 }  // namespace fa_qm

@@ -155,7 +155,8 @@ int64_t legion_paged_attn_vsplit_launches(void);
 // (sm80/paged_attn_qm.cuh, the same bits as paged_prefill_mma) where it covers them and its grid
 // is faster (fa_qm::pays): `on` 1 (the default) or 0, or 2 (benches) for every group it covers,
 // for all threads (`this_thread` 0) or for the calling thread only (`this_thread` 1, tests and
-// benches; -1 ends it).
+// benches; -1 ends it). Plus 256 times a variant of the kernel (the same bits): 0 the default, 1
+// without the ping-pong at 6 query heads a kv head (fa_qm::launch).
 void legion_paged_attn_set_qm(int on, int this_thread);
 
 // Launches of the queries-as-M kernel from the calling thread so far.
@@ -205,10 +206,20 @@ using legion_paged::t_ffma_launches;
 using legion_paged::t_vsplit_launches;
 using legion_paged::t_qm_launches;
 
-// The queries-as-M prefill kernel's mode for the calling thread (legion_paged_attn_set_qm): 0
-// off, 1 on where it takes the op, 2+ (benches) on for every group it covers.
-int qm_mode() {
+// The queries-as-M prefill kernel's setting for the calling thread (legion_paged_attn_set_qm):
+// the mode in the low byte, the variant above it.
+int qm_setting() {
     return legion_paged::t_qm >= 0 ? legion_paged::t_qm : __atomic_load_n(&legion_paged::g_qm, __ATOMIC_RELAXED);
+}
+
+// The mode: 0 off, 1 on where it takes the op, 2+ (benches) on for every group it covers.
+int qm_mode() {
+    return qm_setting() & 0xff;
+}
+
+// The kernel's variant: 0 the default, 1 without the ping-pong (fa_qm::launch), the same bits.
+int qm_variant() {
+    return qm_setting() >> 8;
 }
 
 // Whether the current device is sm_70 (cached per device).
