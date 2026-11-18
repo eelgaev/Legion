@@ -384,7 +384,7 @@ fn a_staged_pass_ring_puts_a_batch_behind_the_one_before() {
         batch(3, 3),
         batch(4, 1),
     ];
-    let (at, need) = ring_places(&batches, &[g; 5]).unwrap();
+    let (at, need) = ring_places(&batches, &[g; 5], 4, 2).unwrap().unwrap();
     assert_eq!(
         at,
         vec![
@@ -393,7 +393,7 @@ fn a_staged_pass_ring_puts_a_batch_behind_the_one_before() {
             vec![],
             // 6..10 passes the end: from the start again, over batch 0's places.
             vec![0, 1, 2, 3],
-            // 4..7 overlaps batch 1's.
+            // 4..7 overlaps batch 1's, which the two sets would wait for too.
             vec![4, 5, 6],
             vec![7]
         ]
@@ -422,11 +422,55 @@ fn a_staged_pass_ring_waits_for_any_kind_of_another_size() {
     };
     let batch =
         |l: usize, n: usize| -> passes::Batch { (0..n).map(|i| (l, i, To::Place(i))).collect() };
-    let (at, need) = ring_places(&[batch(0, 2), batch(1, 6), batch(1, 2)], &[a, b]).unwrap();
+    let (at, need) = ring_places(&[batch(0, 2), batch(1, 6), batch(1, 2)], &[a, b], 3, 2)
+        .unwrap()
+        .unwrap();
     assert_eq!(at, vec![vec![0, 1], vec![4, 5, 6, 7, 8, 9], vec![2, 3]]);
     assert_eq!(need, vec![0, 0, 1]);
     // A batch bigger than its layer's places is a planning error.
-    assert!(ring_places(&[batch(0, 7)], &[a]).is_err());
+    assert!(ring_places(&[batch(0, 7)], &[a], 3, 2).is_err());
+}
+
+#[test]
+fn a_staged_pass_ring_never_waits_for_more_than_the_sets() {
+    use passes::{Geo, ring_places};
+    // Two sets of 4. Layer 1's kind 2 experts are 3 bytes, layer 0's 2, so layer 1's places
+    // end one sooner (9). Right behind batch 1 (4..6), layer 1's batch would pass its end, and
+    // from the start it would overwrite batch 1's kind 2 bytes (8..12): the reader would wait
+    // for the batch just read, where the sets wait only for the one before. So batch 1 takes
+    // the last places (8..10), and batch 2 the first, over batch 0's only.
+    let a = Geo {
+        first: 0,
+        end: 10,
+        stage: [0, 0, 0],
+        bytes: [1, 1, 2],
+    };
+    let b = Geo {
+        first: 0,
+        end: 9,
+        stage: [0, 0, 0],
+        bytes: [1, 1, 3],
+    };
+    let batch =
+        |l: usize, n: usize| -> passes::Batch { (0..n).map(|i| (l, i, To::Place(i))).collect() };
+    let batches = [batch(0, 4), batch(0, 2), batch(1, 4), batch(1, 1)];
+    let (at, need) = ring_places(&batches, &[a, b], 4, 2).unwrap().unwrap();
+    assert_eq!(
+        at,
+        vec![vec![0, 1, 2, 3], vec![8, 9], vec![0, 1, 2, 3], vec![4]]
+    );
+    assert_eq!(need, vec![0, 0, 1, 0]);
+    // Where every start of a batch overwrites the batch just before, the pass takes the sets.
+    let c = Geo {
+        first: 0,
+        end: 4,
+        stage: [0, 0, 0],
+        bytes: [1, 1, 1],
+    };
+    assert_eq!(
+        ring_places(&[batch(0, 4), batch(0, 4)], &[c], 4, 2),
+        Ok(None)
+    );
 }
 
 #[test]
