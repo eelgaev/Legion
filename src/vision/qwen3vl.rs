@@ -214,6 +214,12 @@ impl Encoder {
         weight(&self.weights, name)
     }
 
+    /// The tower's tensor `name` (for the GPU tower's upload).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(super) fn weight(&self, name: &str) -> Result<Tensor<'_>, VisionError> {
+        self.w(name)
+    }
+
     /// The tower's output for `p` (see the module docs).
     pub fn encode(&mut self, p: &Preprocessed) -> Result<ImageEmbedding, VisionError> {
         let c = &self.cfg;

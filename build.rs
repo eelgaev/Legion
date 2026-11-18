@@ -336,6 +336,7 @@ fn build_cuda_kernels(ggml: &Path) {
         .file("src/cuda/sm90/cluster_select.cu")
         .file("src/cuda/glm5next.cu")
         .file("src/cuda/deepseek41.cu")
+        .file("src/cuda/vision.cu")
         .file("src/cuda/glm_exchange.cu")
         .file("src/cuda/glm_prefetch.cu")
         .file("src/cuda/pair_link.cu")

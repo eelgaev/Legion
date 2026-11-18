@@ -5659,6 +5659,12 @@ impl LmEngine {
         // ranks and nodes get no images' rows.
         let arch = gguf.architecture().unwrap_or_default();
         let n_embd = exec.hp().n_embd as usize;
+        // The tower runs on the first stage's GPU (#1195), the CPU without one.
+        let vision_gpu = layout
+            .stages
+            .first()
+            .and_then(|(d, _)| *d)
+            .and_then(cuda_index);
         let vision = match &cfg.mmproj {
             Some(_) if cfg.tp_net.is_some() || cfg.node.is_some() => {
                 return Err(LoadError::Device(
@@ -5671,6 +5677,7 @@ impl LmEngine {
                 n_embd,
                 &tokenizer,
                 cfg.threads,
+                vision_gpu,
             )?)),
             None if cfg.no_mmproj || !cfg.model_path.is_dir() => None,
             None if cfg.tp_net.is_some() || cfg.node.is_some() => {
@@ -5686,6 +5693,7 @@ impl LmEngine {
                 n_embd,
                 &tokenizer,
                 cfg.threads,
+                vision_gpu,
             ) {
                 Ok(v) => v.map(Arc::new),
                 Err(e) => {
