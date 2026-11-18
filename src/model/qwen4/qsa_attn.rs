@@ -616,6 +616,10 @@ pub enum PromptKernel {
     /// `attn_gw_kernel` (#1183): `attn_gb_kernel` with warp-local copies (each warp refills the
     /// K rows and V dims it reads itself), two CTA barriers per chunk instead of three.
     Gw = 3,
+    /// `attn_gp_kernel` (#1176): `attn_gw_kernel`'s arithmetic for two neighbouring tokens a
+    /// CTA (8 warps, one CTA per SM) that load the K and V rows both select once, the tokens'
+    /// chunks run in a position window.
+    Gp = 4,
 }
 
 /// The prompt kernel launches take from now on ([`PromptKernel`]; `legion qsa-bench`).
@@ -1180,7 +1184,8 @@ mod cuda {
         /// the reference kernel).
         pub hgroups: i32,
         /// The F16 prompt kernel on sm_80+ ([`super::PromptKernel`] as i32): 0 the launcher's
-        /// choice, 1 `attn_mma_kernel`, 2 `attn_gb_kernel`, 3 `attn_gw_kernel`.
+        /// choice, 1 `attn_mma_kernel`, 2 `attn_gb_kernel`, 3 `attn_gw_kernel`, 4
+        /// `attn_gp_kernel`.
         pub mma_kernel: i32,
     }
 
@@ -1450,9 +1455,15 @@ unsafe fn cuda_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), S
         hgroups: decode_hgroups(),
         mma_kernel: PROMPT_KERNEL.load(std::sync::atomic::Ordering::Relaxed) as i32,
     };
-    launched("qsa_attn", unsafe {
+    let r = launched("qsa_attn", unsafe {
         cuda::legion_qsa_attn_launch(&p, stream)
-    })
+    });
+    let tokens = o.n_tok * o.n_seqs;
+    if r.is_ok() && tokens as i64 > DECODE_TOKENS && sel_dump::enabled() {
+        // SAFETY: the node's selection rows, `tokens` of `sel_row` I32s.
+        unsafe { sel_dump::after(o.sel, tokens, o.sel_row, o.n_tok, stream) };
+    }
+    r
 }
 
 #[cfg(any(test, feature = "cuda"))]
@@ -1461,5 +1472,6 @@ pub mod bench;
 mod decode_tests;
 #[cfg(test)]
 mod quant_tests;
+pub mod sel_dump;
 #[cfg(test)]
 mod tests;

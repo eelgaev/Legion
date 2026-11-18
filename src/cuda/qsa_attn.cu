@@ -95,7 +95,8 @@ struct legion_qsa_attn {
     int32_t hgroups;
     // The F16 prompt kernel on sm_80+ (#828): 0 the launcher's choice (attn_gw_kernel on compute
     // capability 12.x, attn_gb_kernel on Ampere, attn_mma_kernel on the others),
-    // 1 attn_mma_kernel, 2 attn_gb_kernel, 3 attn_gw_kernel (#1183). All give the same bits.
+    // 1 attn_mma_kernel, 2 attn_gb_kernel, 3 attn_gw_kernel (#1183), 4 attn_gp_kernel (#1176).
+    // All give the same bits.
     int32_t mma_kernel;
 };
 
@@ -455,6 +456,10 @@ __device__ __forceinline__ void qrun_unpack(const char * row, int W, __half * ds
 // The GB10 prompt kernels: attn_mma_kernel's bits, two CTAs per SM (attn_gb_kernel,
 // attn_gw_kernel).
 #include "sm80/qsa_attn_gb10.cuh"
+
+// attn_gw_kernel for two neighbouring tokens a CTA, sharing the K / V rows both select
+// (attn_gp_kernel, #1176).
+#include "sm80/qsa_attn_gp.cuh"
 
 // --qsa-attn-chain on a GPU running attn_mma_kernel: said once per process.
 std::atomic<bool> chain_notice_said{false};
@@ -1453,6 +1458,19 @@ int launch_attn(const legion_qsa_attn & p, cudaStream_t st) {
                 fprintf(stderr, "legion: --qsa-attn-chain applies to the Volta QSA prompt kernel "
                                 "only; this GPU runs the mma.m16n8k16 kernel\n");
             }
+        }
+        if (p.mma_kernel == 4) {
+            // ~79 KB at HD 256: one CTA of 8 warps per SM.
+            const int bytes = (int) sizeof(GpSmem<HD>);
+            if (cudaFuncSetAttribute(attn_gp_kernel<HD>,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     bytes) != cudaSuccess) {
+                return 2;
+            }
+            const unsigned seqs = p.grid[0] / (unsigned) p.n_tok;
+            const unsigned pairs = ((unsigned) p.n_tok + 1) / 2;
+            attn_gp_kernel<HD><<<dim3(seqs * pairs, p.grid[1]), 2 * THREADS, bytes, st>>>(p);
+            return cudaGetLastError() == cudaSuccess ? 0 : 2;
         }
         const int gb = p.mma_kernel == 1 ? 0 : use_gb<HD>(p.mma_kernel);
         if (gb != 0) {

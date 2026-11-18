@@ -101,28 +101,65 @@ pub struct Timing {
     pub ms: f64,
     /// [`bits_hash`] of the output: equal for kernels that agree bit for bit.
     pub bits: u64,
+    /// Selected keys over all tokens (each kv head reads them all).
+    pub keys: u64,
+    /// Chunks of 32 selected keys over all tokens (the prompt kernels' unit of work).
+    pub chunks: u64,
+    /// K / V rows `attn_gp_kernel` loads over all tokens (each kv head,
+    /// [`super::sel_dump::pair_window`]).
+    pub pair_rows: u64,
+    /// The context and tokens run (a recorded layout's own).
+    pub ctx: usize,
+    pub tokens: usize,
 }
 
-/// Times [`attention`] on `backend` at qwen4exp's shape (head size 256, 24 heads over 2 kv
-/// heads) with caches of `types`: `n_tok` tokens at the end of an `n_ctx` context, every token
-/// with the pools of [`prompt_pools`] (2,048 keys or fewer) plus its tail. Each round runs every
-/// kernel of `kernels` in turn, one warm-up call and `reps` timed ones. Leaves the launches on
+/// The selections [`prompt_ms`] runs.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+pub enum Layout<'a> {
+    /// [`prompt_pools`], local.
+    Local,
+    /// [`prompt_pools`], spread.
+    Spread,
+    /// Recorded selection rows (`LEGION_DEBUG_QSA_SEL`): `row` I32s a token, the count, then
+    /// the positions; the block table in order.
+    Real { rows: &'a [i32], row: usize },
+}
+
+/// Times [`attention`] on `backend` at qwen4exp's shape (head size 256, `heads` = (query
+/// heads, kv heads): (24, 2) on one GPU, (12, 1) a rank of two under tensor parallelism) with
+/// caches of `types`: `n_tok` tokens at the end of an `n_ctx` context, every token with the
+/// pools of [`prompt_pools`] (2,048 keys or fewer) plus its tail, or the recorded rows of
+/// [`Layout::Real`] (their tokens and positions instead). Each round runs every kernel of
+/// `kernels` in turn, one warm-up call and `reps` timed ones. Leaves the launches on
 /// [`PromptKernel::Auto`].
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub fn prompt_ms(
     backend: &mut Backend,
     types: KvTypes,
+    heads: (i64, i64),
     n_ctx: usize,
     n_tok: usize,
     reps: usize,
     rounds: usize,
-    local: bool,
+    layout: Layout<'_>,
     kernels: &[PromptKernel],
 ) -> Vec<Timing> {
     use crate::ggml::ComputeAllocator;
+    let (n_ctx, n_tok) = match layout {
+        Layout::Real { rows, row } => {
+            let last = (0..rows.len() / row)
+                .map(|r| rows[r * row + rows[r * row].max(0) as usize])
+                .max()
+                .unwrap_or(0);
+            (last as usize + 1, rows.len() / row)
+        }
+        _ => (n_ctx, n_tok),
+    };
     let n_blocks = n_ctx / KV_BLOCK + 1;
-    let hp = hparams(256, 24, 2);
+    let (n_head, n_head_kv) = heads;
+    let hp = hparams(256, n_head, n_head_kv);
     let kv = KvPool::new_ring(&hp, backend.buffer_type(), n_blocks, &[0], None, types).unwrap();
     let (kp, vp) = kv.pools(0);
     let fill = |t: Tensor<'_>, ty: KvType, seed: u64| {
@@ -137,10 +174,13 @@ pub fn prompt_ms(
     fill(vp, types.v, 2);
     let ctx = Context::new(16, 16);
     let q = ctx
-        .new_tensor(types::F32, &[256, 24, n_tok as i64, 1])
+        .new_tensor(types::F32, &[256, n_head, n_tok as i64, 1])
         .as_input();
     let table = ctx.new_tensor(types::I32, &[n_blocks as i64, 1]).as_input();
-    let cap = 512 * 4 + 3;
+    let cap = match layout {
+        Layout::Real { row, .. } => row - 1,
+        _ => 512 * 4 + 3,
+    };
     let sel = ctx
         .new_tensor(types::I32, &[1 + cap as i64, n_tok as i64])
         .as_input();
@@ -152,19 +192,32 @@ pub fn prompt_ms(
     q.set_f32(&noise(q.elements(), 3));
     table.set_i32(&(0..n_blocks as i32).collect::<Vec<_>>());
     // Every token: its pools' members, then its tail.
-    let mut rows = Vec::with_capacity(n_tok * (1 + cap));
-    for (t, pools) in prompt_pools(n_ctx, n_tok, local).iter().enumerate() {
-        let p = n_ctx - n_tok + t;
-        let mut row: Vec<i32> = pools
-            .iter()
-            .flat_map(|&b| (0..4).map(move |k| (b * 4 + k) as i32))
-            .collect();
-        row.extend(((p + 1) / 4 * 4..=p).map(|x| x as i32));
-        let n = row.len();
-        rows.push(n as i32);
-        rows.extend(row);
-        rows.resize(rows.len() + cap - n, -1);
+    let rows = match layout {
+        Layout::Real { rows, .. } => rows.to_vec(),
+        _ => {
+            let mut rows = Vec::with_capacity(n_tok * (1 + cap));
+            let pools = prompt_pools(n_ctx, n_tok, matches!(layout, Layout::Local));
+            for (t, pools) in pools.iter().enumerate() {
+                let p = n_ctx - n_tok + t;
+                let mut row: Vec<i32> = pools
+                    .iter()
+                    .flat_map(|&b| (0..4).map(move |k| (b * 4 + k) as i32))
+                    .collect();
+                row.extend(((p + 1) / 4 * 4..=p).map(|x| x as i32));
+                let n = row.len();
+                rows.push(n as i32);
+                rows.extend(row);
+                rows.resize(rows.len() + cap - n, -1);
+            }
+            rows
+        }
+    };
+    let (mut keys, mut chunks) = (0u64, 0u64);
+    for r in rows.chunks_exact(1 + cap) {
+        keys += r[0] as u64;
+        chunks += (r[0] as u64).div_ceil(32);
     }
+    let (pair_rows, _) = super::sel_dump::pair_window(&rows, 1 + cap, n_tok);
     sel.set_i32(&rows);
     let mut out: Vec<Timing> = kernels
         .iter()
@@ -172,6 +225,11 @@ pub fn prompt_ms(
             kernel,
             ms: f64::INFINITY,
             bits: 0,
+            keys,
+            chunks,
+            pair_rows,
+            ctx: n_ctx,
+            tokens: n_tok,
         })
         .collect();
     for _ in 0..rounds.max(1) {
