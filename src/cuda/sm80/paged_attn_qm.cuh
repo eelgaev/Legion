@@ -432,12 +432,12 @@ int launch_as(const legion_paged_attn & p, cudaStream_t st) {
 
 // Prompt chunks (64 tokens a sequence or more) at 6 query heads a kv head (Qwen3.8-27B) take the
 // ping-pong (1.03-1.05x per call on a GB10 from 2K to 16K-token chunks over 0 to 119K positions,
-// #1133), unless qm_variant() is 1 (LEGION_DEBUG_QM_PINGPONG=0, benches). At 4 and 8 query heads a
-// kv head it is built but taken only in variant 2 (benches: paged-qm-bench mode + 512). The same
-// bits.
+// #1133), unless qm_variant() is 1 (LEGION_DEBUG_QM_PINGPONG=0, benches). At 2, 4, 8 and 12 query
+// heads a kv head (2: Gemma 4's sliding layers, 12: Qwen3.8-Flash-Next's MTP head) it is built but
+// taken only in variant 2 (benches: paged-qm-bench mode + 512). The same bits.
 template <int D, int G>
 int launch(const legion_paged_attn & p, cudaStream_t st) {
-    if constexpr (G == 4 || G == 6 || G == 8) {
+    if constexpr (G == 2 || G == 4 || G == 6 || G == 8 || G == 12) {
         const int v = qm_variant();
         if (p.n_tok >= 64 && (G == 6 ? v != 1 : v == 2)) {
             return launch_as<D, G, true>(p, st);

@@ -161,7 +161,7 @@ int64_t legion_paged_attn_vsplit_launches(void);
 // is faster (fa_qm::pays): `on` 1 (the default) or 0, or 2 (benches) for every group it covers,
 // for all threads (`this_thread` 0) or for the calling thread only (`this_thread` 1, tests and
 // benches; -1 ends it). Plus 256 times a variant of the kernel (the same bits): 0 the default, 1
-// without the ping-pong at 6 query heads a kv head, 2 (benches) with it at 4 and 8 too
+// without the ping-pong at 6 query heads a kv head, 2 (benches) with it at 2, 4, 8 and 12 too
 // (fa_qm::launch).
 void legion_paged_attn_set_qm(int on, int this_thread);
 
@@ -223,8 +223,8 @@ int qm_mode() {
     return qm_setting() & 0xff;
 }
 
-// The kernel's variant: 0 the default, 1 without the ping-pong, 2 (benches) with it at 4, 6 and 8
-// query heads a kv head (fa_qm::launch), the same bits.
+// The kernel's variant: 0 the default, 1 without the ping-pong, 2 (benches) with it at 2, 4, 6, 8
+// and 12 query heads a kv head (fa_qm::launch), the same bits.
 int qm_variant() {
     return qm_setting() >> 8;
 }

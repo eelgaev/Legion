@@ -28,7 +28,8 @@ pub struct PagedQmBenchArgs {
     /// The kernel's modes timed against paged_prefill_mma: 1 the default (where its grid is the
     /// faster one), 2 for every group it covers; plus 256 without the ping-pong of prompt chunks
     /// at 6 query heads a kv head (`LEGION_DEBUG_QM_PINGPONG=0`, the same bits; e.g. `2,258`),
-    /// plus 512 with it at 4 and 8 query heads a kv head too (built, not routed; e.g. `2,514`).
+    /// plus 512 with it at 2, 4, 8 and 12 query heads a kv head too (built, not routed; e.g.
+    /// `2,514`).
     #[arg(long, value_delimiter = ',', default_values_t = [1])]
     modes: Vec<i32>,
     /// Timed runs per op and round.
