@@ -374,6 +374,16 @@ pub(super) fn cpu() -> Backend {
 }
 
 #[test]
+fn prompt_kernel_named_takes_three_names() {
+    assert_eq!(prompt_kernel_named(Some("mma")), PromptKernel::Mma);
+    assert_eq!(prompt_kernel_named(Some("gb")), PromptKernel::Gb);
+    assert_eq!(prompt_kernel_named(Some("gw")), PromptKernel::Gw);
+    for v in [None, Some(""), Some("auto"), Some("GB"), Some("3")] {
+        assert_eq!(prompt_kernel_named(v), PromptKernel::Auto, "{v:?}");
+    }
+}
+
+#[test]
 fn select_row_sorts_pools_and_drops_dead_entries() {
     // Pools 0..4 of 4 (positions 0..16), token at 17: pools 3, 0 and a dead pool 4 picked.
     let members = |j: usize, k: usize| (j * 4 + k) as i32;

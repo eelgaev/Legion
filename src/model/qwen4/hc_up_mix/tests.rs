@@ -8,6 +8,15 @@ use crate::model::core::mmq_preq::tests::{noise, q8_0_matrix};
 use crate::model::core::node_fuse::{Counts, rewrite_graph};
 
 #[test]
+fn l1_offset_reads_zero_and_one() {
+    assert_eq!(l1_offset(Some("0")), 1000);
+    assert_eq!(l1_offset(Some("1")), 2000);
+    for v in [None, Some(""), Some("2"), Some("yes")] {
+        assert_eq!(l1_offset(v), 0, "{v:?}");
+    }
+}
+
+#[test]
 fn mmq_whole_tiles_follows_ggml_stream_k() {
     // qwen4exp's up matmul (10240 rows, K 320) on a GB10 (48 SMs): 4096 tokens are 2560
     // tiles, 98% of 54 waves, a CTA per tile.

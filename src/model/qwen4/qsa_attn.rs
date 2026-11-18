@@ -606,7 +606,9 @@ static CHAIN_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8
 #[repr(u8)]
 pub enum PromptKernel {
     /// The launcher's choice: [`PromptKernel::Gw`] on compute capability 12.x (the GB10),
-    /// [`PromptKernel::Gb`] on Ampere (8.0 to 8.7, #1212), [`PromptKernel::Mma`] on the others.
+    /// [`PromptKernel::Gb`] on Ampere (8.0 to 8.7, #1212) and Ada (8.9, #1213 round 30),
+    /// [`PromptKernel::Mma`] on the others. `LEGION_DEBUG_QSA_PROMPT_KERNEL` overrides it
+    /// ([`prompt_kernel_named`]).
     Auto = 0,
     /// `attn_mma_kernel`: one CTA of 4 warps per SM (two stages of K and V, q in shared memory).
     Mma = 1,
@@ -643,6 +645,33 @@ pub fn set_prompt_kernel(k: PromptKernel) {
 /// [`set_prompt_kernel`]'s choice.
 #[cfg(feature = "cuda")]
 static PROMPT_KERNEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The prompt kernel a `LEGION_DEBUG_QSA_PROMPT_KERNEL` value names (#1213 round 30, A/B runs):
+/// `mma`, `gb` or `gw` force that kernel on any sm_80+ GPU; unset or anything else leaves the
+/// launcher's choice ([`PromptKernel::Auto`]). The same bits either way.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn prompt_kernel_named(v: Option<&str>) -> PromptKernel {
+    match v {
+        Some("mma") => PromptKernel::Mma,
+        Some("gb") => PromptKernel::Gb,
+        Some("gw") => PromptKernel::Gw,
+        _ => PromptKernel::Auto,
+    }
+}
+
+/// The launches' prompt kernel: [`set_prompt_kernel`]'s choice, else
+/// `LEGION_DEBUG_QSA_PROMPT_KERNEL`'s ([`prompt_kernel_named`], read once).
+#[cfg(feature = "cuda")]
+fn prompt_kernel() -> u8 {
+    static ENV: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match PROMPT_KERNEL.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => *ENV.get_or_init(|| {
+            let v = std::env::var("LEGION_DEBUG_QSA_PROMPT_KERNEL").ok();
+            prompt_kernel_named(v.as_deref()) as u8
+        }),
+        k => k,
+    }
+}
 
 /// `LEGION_DEBUG_QSA_GW_L1=0`: `attn_gw_kernel` copies K and V with `cp.async.cg` (L2 only),
 /// the way before #1176 round 42, for A/B runs (the same bits either way).
@@ -1476,7 +1505,7 @@ unsafe fn cuda_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), S
         k_nb1: o.k_nb1 as i64,
         v_nb1: o.v_nb1 as i64,
         hgroups: decode_hgroups(),
-        mma_kernel: PROMPT_KERNEL.load(std::sync::atomic::Ordering::Relaxed) as i32,
+        mma_kernel: prompt_kernel() as i32,
         gw_cg: gw_cg() as i32,
     };
     let r = launched("qsa_attn", unsafe {
