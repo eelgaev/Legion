@@ -882,13 +882,30 @@ unsafe extern "C" {
 /// `paged_prefill_mma` as before. The same bits either way; on by default (`legion serve
 /// --no-paged-prefill-qm` turns it off). Other GPUs and ops keep their kernels. For every thread.
 pub fn set_qm_prefill(on: bool) {
+    QM_ON.store(on, Ordering::Relaxed);
     #[cfg(feature = "cuda")]
+    push_qm();
+}
+
+/// Whether the queries-as-M kernel is on ([`set_qm_prefill`]).
+static QM_ON: AtomicBool = AtomicBool::new(true);
+
+/// Whether prompt chunks (64 tokens a sequence or more) at 6 query heads a kv head (Qwen3.8-27B)
+/// run the queries-as-M kernel as a ping-pong of two 4-warp groups (#1133, 1.03-1.05x per call on
+/// a GB10); `LEGION_DEBUG_QM_PINGPONG=0` keeps the one-group kernel, for A/B runs. The same bits.
+/// Read once.
+#[cfg(feature = "cuda")]
+fn qm_pingpong() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| !std::env::var("LEGION_DEBUG_QM_PINGPONG").is_ok_and(|v| v.trim() == "0"))
+}
+
+/// [`set_qm_prefill`] and [`qm_pingpong`] to the launches (variant 1: no ping-pong).
+#[cfg(feature = "cuda")]
+fn push_qm() {
+    let on = i32::from(QM_ON.load(Ordering::Relaxed));
     // SAFETY: sets a flag the launches read.
-    unsafe {
-        legion_paged_attn_set_qm(i32::from(on), 0)
-    };
-    #[cfg(not(feature = "cuda"))]
-    let _ = on;
+    unsafe { legion_paged_attn_set_qm(on | i32::from(!qm_pingpong()) << 8, 0) };
 }
 
 /// [`set_qm_prefill`] for launches from the calling thread only (benches and tests); `None`
@@ -1003,6 +1020,10 @@ fn m884_launches() -> i64 {
 unsafe fn cuda_paged_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
     // SAFETY: a node made by `attention`, all tensors in device memory of the stream's device.
     let o = unsafe { Operands::of(dst) };
+    if !qm_pingpong() {
+        static OFF: std::sync::Once = std::sync::Once::new();
+        OFF.call_once(push_qm);
+    }
     let (Some(k_type), Some(v_type)) = (kernel_type(o.k_ty), kernel_type(o.v_ty)) else {
         return Err(format!(
             "the paged kernels do not read {} / {} caches",
