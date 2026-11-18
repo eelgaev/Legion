@@ -33,13 +33,18 @@
 //! the sets would: right behind the batch before, the layer's first place, its last places,
 //! or where its set would begin, and one that leaves the next batch such a start. A pass the
 //! ring cannot plan that way takes the two sets. `LEGION_DEBUG_TIER_PASS_RING=0` keeps a set per batch, as before.
+//!
+//! A batch's reads of experts that follow one another in the checkpoint and in their places
+//! go as one read of up to [`PASS_MERGE`] bytes (round 33): the drive gives a few percent more
+//! for 4 MiB reads than for one 1 MiB expert matrix, and a 32 GB machine's pass is the SSD's
+//! reads.
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
 use super::{GAP, HostTier, Inner, To, fatal, plan_step};
-use crate::residency::ssd_experts::io::Job;
+use crate::residency::ssd_experts::io::{Job, merge_raw};
 
 /// Where a staged pass copies an expert from: an index past the layer's VRAM slots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -309,6 +314,22 @@ fn ring_mode() -> bool {
     *RING.get_or_init(|| std::env::var("LEGION_DEBUG_TIER_PASS_RING").as_deref() != Ok("0"))
 }
 
+/// Bytes a staged pass's read takes at most: a batch's reads of experts that follow one
+/// another in the checkpoint and in their places are joined ([`merge_raw`]) up to this.
+const PASS_MERGE: u64 = 4 << 20;
+
+/// [`PASS_MERGE`], or `LEGION_DEBUG_TIER_PASS_MERGE_KIB` (0: one read per expert matrix, as
+/// before), for A/B runs.
+fn pass_merge() -> u64 {
+    static MERGE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MERGE.get_or_init(|| {
+        std::env::var("LEGION_DEBUG_TIER_PASS_MERGE_KIB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(PASS_MERGE, |kib| kib << 10)
+    })
+}
+
 #[derive(Default)]
 struct Progress {
     /// Batches read, and batches whose places the copy stream gave back.
@@ -335,6 +356,8 @@ pub(super) struct Pass {
     layers: usize,
     ram_experts: usize,
     read_experts: usize,
+    /// Reads the readers ran for them (after [`merge_raw`]).
+    reads: usize,
     ram_bytes: u64,
     read_bytes: u64,
     started: Instant,
@@ -403,6 +426,7 @@ impl Pass {
             layers = self.layers,
             ram_experts = self.ram_experts,
             read_experts = self.read_experts,
+            reads = self.reads,
             ram_gib = gib(self.ram_bytes),
             read_gib = gib(self.read_bytes),
             batches = self.batches,
@@ -528,6 +552,7 @@ impl HostTier {
         }
         let mut read_bytes = 0u64;
         let mut loads = 0u64;
+        let merge = pass_merge();
         let jobs: Vec<(Vec<Job>, Vec<Job>)> = batches
             .iter()
             .map(|b| {
@@ -544,9 +569,10 @@ impl HostTier {
                         To::Place(_) | To::At(_) => places.extend(reads),
                     }
                 }
-                (slots, places)
+                (merge_raw(slots, merge), merge_raw(places, merge))
             })
             .collect();
+        let reads: usize = jobs.iter().map(|(s, p)| s.len() + p.len()).sum();
         let read_experts: usize = batches.iter().map(Vec::len).sum();
         let c = &inner.counts;
         let relaxed = std::sync::atomic::Ordering::Relaxed;
@@ -562,6 +588,7 @@ impl HostTier {
             layers: layers.len(),
             ram_experts,
             read_experts,
+            reads,
             ram_bytes,
             read_bytes,
             started: Instant::now(),

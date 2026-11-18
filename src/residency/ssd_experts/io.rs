@@ -325,6 +325,43 @@ pub fn raw_pieces(src: FileRange, dst: usize, piece: u64) -> Vec<Job> {
     out
 }
 
+/// `jobs` with the [`Job::Raw`] reads that continue one another, in the file and in memory,
+/// joined into reads of at most `cap` bytes; other jobs as they are. The same bytes land at
+/// the same addresses, in fewer and longer reads: an NVMe drive gives a few percent more for
+/// 4 MiB reads than for the 1 MiB of one expert matrix. The order changes (by file offset), so
+/// only for jobs that are waited for together. `cap` 0: `jobs` as they are.
+pub fn merge_raw(jobs: Vec<Job>, cap: u64) -> Vec<Job> {
+    if cap == 0 {
+        return jobs;
+    }
+    let mut out = Vec::with_capacity(jobs.len());
+    let mut raw = Vec::with_capacity(jobs.len());
+    for j in jobs {
+        match j {
+            Job::Raw { src, dst } => raw.push((src, dst)),
+            j => out.push(j),
+        }
+    }
+    raw.sort_by_key(|(s, _)| (s.file, s.offset));
+    let mut open: Option<(FileRange, usize)> = None;
+    for (src, dst) in raw {
+        if let Some((o, at)) = &mut open
+            && o.file == src.file
+            && o.offset + o.len == src.offset
+            && *at + o.len as usize == dst
+            && o.len + src.len <= cap
+        {
+            o.len += src.len;
+            continue;
+        }
+        if let Some((src, dst)) = open.replace((src, dst)) {
+            out.push(Job::Raw { src, dst });
+        }
+    }
+    out.extend(open.map(|(src, dst)| Job::Raw { src, dst }));
+    out
+}
+
 /// `job` as reads of at most [`PIECE`] codes each (whole rows: a row's codes, scales and
 /// repacked bytes are contiguous); other jobs as they are.
 pub fn split(job: Job) -> Vec<Job> {

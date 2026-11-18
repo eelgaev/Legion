@@ -191,6 +191,60 @@ fn raw_pieces_cover_the_range_once_cut_at_multiples_of_the_piece() {
     assert_eq!(io::raw_pieces(none, 0, 4096).len(), 1);
 }
 
+#[test]
+fn merged_reads_join_only_what_continues_in_file_and_memory() {
+    let raw = |file: usize, offset: u64, len: u64, dst: usize| Job::Raw {
+        src: FileRange { file, offset, len },
+        dst,
+    };
+    let spans = |jobs: Vec<Job>| -> Vec<(usize, u64, u64, usize)> {
+        jobs.into_iter()
+            .map(|j| match j {
+                Job::Raw { src, dst } => (src.file, src.offset, src.len, dst),
+                Job::Copy { len, .. } => (usize::MAX, 0, len as u64, 0),
+                j => panic!("{j:?}"),
+            })
+            .collect()
+    };
+    let jobs = vec![
+        // Out of order: 100..200 comes after 0..100 in the file and in memory.
+        raw(0, 100, 100, 1100),
+        raw(0, 0, 100, 1000),
+        // Continues in the file, not in memory.
+        raw(0, 200, 100, 5000),
+        // Another file at the same offsets.
+        raw(1, 300, 100, 1300),
+        Job::Copy {
+            src: 1,
+            dst: 2,
+            len: 7,
+        },
+        // Would join 5000.. but passes the cap.
+        raw(0, 300, 250, 5100),
+    ];
+    // 0: as they are.
+    assert_eq!(spans(io::merge_raw(jobs.clone(), 0)), spans(jobs.clone()));
+    assert_eq!(
+        spans(io::merge_raw(jobs.clone(), 300)),
+        vec![
+            (usize::MAX, 0, 7, 0),
+            (0, 0, 200, 1000),
+            (0, 200, 100, 5000),
+            (0, 300, 250, 5100),
+            (1, 300, 100, 1300),
+        ]
+    );
+    assert_eq!(
+        spans(io::merge_raw(jobs, 350)),
+        vec![
+            (usize::MAX, 0, 7, 0),
+            (0, 0, 200, 1000),
+            (0, 200, 350, 5000),
+            (1, 300, 100, 1300),
+        ]
+    );
+}
+
 const ROWS: usize = 4;
 const K: usize = 128;
 const N_EXPERT: usize = 6;
