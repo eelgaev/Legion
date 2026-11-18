@@ -7523,6 +7523,11 @@ impl Worker {
             let keep = crate::model::core::LENT_SCRATCH + LENT_MICRO_MARGIN;
             let free = d.memory().0.saturating_sub(keep);
             self.tier_cap = ssd_tier::host_tier_pass_cap(free, bytes, at, KV_BLOCK);
+            let most = crate::residency::host_tier::debug_pass_tokens();
+            if most > 0 {
+                let most = (most / KV_BLOCK * KV_BLOCK).max(ssd_tier::HOST_TIER_MIN_PASS);
+                self.tier_cap = self.tier_cap.min(most);
+            }
             tracing::info!(
                 free_mib = free >> 20,
                 pass_tokens = self.tier_cap,

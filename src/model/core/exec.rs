@@ -4341,7 +4341,20 @@ impl Executor {
         if self.model.experts().is_some_and(|r| r.is_lent()) {
             return Ok(true);
         }
-        self.keep_spares();
+        // The bounded host tier with `LEGION_DEBUG_TIER_NO_SPARE=1` (#37 r24): no spare. Its
+        // passes stage every expert no kept slot holds, seconds each, and a spare (a kept verify
+        // graph's buffer, ~200 MiB) takes the VRAM of ~500 of a pass's tokens: 32K prompts with
+        // speculation take 4 passes, not 3.
+        let spares =
+            self.model.host_tier().is_none() || !crate::residency::host_tier::debug_no_spare();
+        if spares {
+            self.keep_spares();
+        } else {
+            for st in &mut self.stages {
+                st.spare = None;
+            }
+            self.mtp_spare = None;
+        }
         self.drop_mixed();
         // A long prompt's steps share one graph shape but the last: one compute buffer per
         // stage, not one per shape kept.
@@ -4351,7 +4364,9 @@ impl Executor {
             .expect("checked above")
             .lend_for(tokens)
             .map_err(|e| ModelError::Ggml(GgmlError::External(format!("expert cache: {e}"))))?;
-        self.alloc_spares();
+        if spares {
+            self.alloc_spares();
+        }
         Ok(true)
     }
 

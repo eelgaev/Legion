@@ -318,6 +318,28 @@ pub fn mem_info() -> MemInfo {
     }
 }
 
+/// `LEGION_DEBUG_TIER_NO_SPARE=1` (read once, #37 r24, see `docs/debug-env.md`): a lend of the
+/// bounded tier keeps no verify spare compute buffer (`exec/spare.rs`). Its ~200 MiB go to the
+/// staged passes, so with speculation a 32K prompt takes 3 passes instead of 4. Opt-in: another
+/// split of a prompt changes its output.
+pub fn debug_no_spare() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("LEGION_DEBUG_TIER_NO_SPARE").as_deref() == Ok("1"))
+}
+
+/// `LEGION_DEBUG_TIER_PASS_TOKENS=<n>` (read once, #37 r24, see `docs/debug-env.md`): the
+/// bounded tier's staged passes take at most `n` tokens (whole KV blocks), to see whether
+/// another split of a prompt changes its output. 0 or unset: no cap.
+pub fn debug_pass_tokens() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("LEGION_DEBUG_TIER_PASS_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// [`mem_info`]'s debug value as `(total, available)` bytes: `"<GiB>"` (both) or
 /// `"<total GiB>:<available GiB>"`; `None` when it is neither (or not positive, or more is
 /// available than there is).
