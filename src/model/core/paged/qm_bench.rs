@@ -106,9 +106,10 @@ pub fn compare(backend: &mut Backend, kv: &KvPool, g: &Group, mode: i32) -> (usi
 /// 2 tokens (verify steps) to more than one 128-row tile per token run, several sequences over
 /// shuffled tables, contexts that end before, on and after block boundaries, windows that start
 /// inside blocks (Gemma 4's sliding window of 1,024 among them), a ring. Returns (cases, cases
-/// the kernel ran, values compared, values that differ), printing each failing case.
+/// the kernel ran, values compared, values that differ), printing each failing case. A mode with
+/// a variant ([`QM_VARIANT`] and up) checks the GQA ratios the variants are built for, 4 and 6.
 pub fn edges(backend: &mut Backend, mode: i32) -> (usize, usize, usize, usize) {
-    let pairs = [
+    let pairs: Vec<(usize, usize)> = [
         (16, 16),
         (32, 16),
         (16, 4),
@@ -116,9 +117,16 @@ pub fn edges(backend: &mut Backend, mode: i32) -> (usize, usize, usize, usize) {
         (16, 2),
         (24, 2),
         (32, 2),
-    ];
+    ]
+    .into_iter()
+    .filter(|(h, kv)| mode < QM_VARIANT || matches!(h / kv, 4 | 6))
+    .collect();
     edge_cases(backend, 256, &pairs, |b, kv, g| compare(b, kv, g, mode))
 }
+
+/// A mode's step per kernel variant (`fa_qm::QV_*` in `src/cuda/sm80/paged_attn_qm.cuh`, the
+/// same bits; built for 4 and 6 query heads a kv head): mode + `QM_VARIANT` * variant.
+pub const QM_VARIANT: i32 = 256;
 
 /// [`edges`]' cases for heads of `d` at each (query heads, kv heads) of `pairs`, each checked by
 /// `check` (values that differ, values compared, whether the kernel under test ran).

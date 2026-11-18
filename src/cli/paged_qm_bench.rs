@@ -26,7 +26,10 @@ pub struct PagedQmBenchArgs {
     #[arg(long, default_value_t = 0)]
     window: usize,
     /// The kernel's modes timed against paged_prefill_mma: 1 the default (where its grid is the
-    /// faster one), 2 for every group it covers.
+    /// faster one), 2 for every group it covers; plus 256 times a variant (the same bits, 4 and
+    /// 6 query heads a kv head): 1 the chunk loads issued after a part's first MMA step, 2
+    /// chunks of 64 dims, 3 the same in 4 stages, 4 warp pairs sharing their rows' P V, 5 warp
+    /// pairs with the late loads (e.g. `2,258,1026`).
     #[arg(long, value_delimiter = ',', default_values_t = [1])]
     modes: Vec<i32>,
     /// Timed runs per op and round.
