@@ -47,7 +47,7 @@ use crate::gguf::{FileRange, GgufFile};
 use super::lookup_table::MemInfo;
 use super::ssd_experts::KINDS;
 use super::ssd_experts::cache::SlotCache;
-use super::ssd_experts::io::{Group, Job, Pool, raw_pieces};
+use super::ssd_experts::io::{Class, Group, Job, Pool, raw_pieces};
 
 mod passes;
 pub use passes::{PassHook, PassSrc, release_arg, wait_arg};
@@ -78,6 +78,45 @@ fn read_piece() -> u64 {
             .map_or(READ_PIECE, |kib| kib << 10)
     })
 }
+
+/// Steps of at most this many tokens read ahead for the next layer ([`decode_ahead`]).
+pub const AHEAD_TOKENS: usize = 8;
+
+/// Experts per token a small step's fetch reads ahead for the next layer (#37 round 34): the
+/// next layer's router over this layer's MoE input, its `n` best experts that are in no VRAM
+/// or RAM slot, read into RAM slots of that layer while this layer and the next one's
+/// attention compute. A guess of what to read only: the next layer routes by its own input
+/// and waits for what it takes. `LEGION_DEBUG_TIER_DECODE_AHEAD=<n>` (0: none, no extra
+/// matmul).
+const DECODE_AHEAD: usize = 0;
+
+pub fn decode_ahead() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("LEGION_DEBUG_TIER_DECODE_AHEAD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DECODE_AHEAD)
+    })
+}
+
+/// `LEGION_DEBUG_TIER_DECODE_AHEAD_PROBE=1`: the guess is made and scored (where the step's
+/// misses ranked in it, in the counters' report) but nothing is read ahead.
+fn ahead_probe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("LEGION_DEBUG_TIER_DECODE_AHEAD_PROBE").is_some_and(|v| v == "1")
+    })
+}
+
+/// Whether small steps guess the next layer's experts ([`decode_ahead`] or the probe).
+pub fn guesses() -> bool {
+    decode_ahead() > 0 || ahead_probe()
+}
+
+/// The ranks a guess is scored at ([`Inner::score`]): misses ranked below each, and the
+/// reads that many per token would have spent on experts the step did not take.
+const RANKS: [usize; 7] = [8, 10, 12, 14, 18, 26, 42];
 
 /// Fewest RAM slots per layer worth running with: a full decode batch's experts of a few
 /// sequences.
@@ -399,6 +438,14 @@ struct Counters {
     write_backs: AtomicU64,
     fetch_ns: AtomicU64,
     fetches: AtomicU64,
+    /// Small steps' guesses of the next layer ([`decode_ahead`]): experts read ahead, those of
+    /// them the layer then routed to, the layer's misses from the checkpoint by their rank in
+    /// the guess (below each of [`RANKS`], and past the last), and per rank the experts the
+    /// guess had below it that were in no slot and not routed to (reads it would waste).
+    guess_reads: AtomicU64,
+    guess_used: AtomicU64,
+    guess_misses: [AtomicU64; RANKS.len() + 1],
+    guess_spare: [AtomicU64; RANKS.len()],
 }
 
 struct LayerMem {
@@ -434,6 +481,10 @@ struct Inner {
     /// Pinned ids in and out of the fetch (CUDA), `cap` ids each.
     xchg: Option<(usize, usize)>,
     cap: usize,
+    /// Pinned next-layer router logits of a small step (CUDA, [`decode_ahead`]): `n_expert`
+    /// per token, [`AHEAD_TOKENS`] tokens.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    gxchg: Option<usize>,
     pool: Pool,
     state: Mutex<State>,
     /// The staged prompt pass whose reads are under way ([`HostTier::stage_pass`]).
@@ -457,6 +508,19 @@ struct State {
     last_big: Vec<Vec<usize>>,
     /// The read ahead under way, if any.
     ahead: Option<Ahead>,
+    /// A small step's guess of the next layer ([`decode_ahead`]): its reads under way.
+    guess: Option<Guess>,
+}
+
+/// A small step's guess of a layer's experts, made by the layer before
+/// ([`Inner::guess_next`]).
+struct Guess {
+    layer: usize,
+    /// Per expert its best rank over the step's tokens (`u16::MAX`: past what was ranked).
+    rank: Vec<u16>,
+    /// The reads into RAM slots (pinned until they are done), as `(expert, slot)`.
+    loads: Vec<(usize, usize)>,
+    group: Option<Arc<Group>>,
 }
 
 /// Experts of a layer being read into staging places ahead of the big step that is one layer
@@ -511,6 +575,42 @@ pub(crate) fn assign_places(
         })
         .collect();
     Some((at, n > own))
+}
+
+/// Per expert its best rank (0: the highest logit) over a step's tokens' `logits` (`n` experts
+/// per token), ranks below `top` only (`u16::MAX`: none); ties go to the lower expert id.
+pub(crate) fn guess_ranks(logits: &[f32], n: usize, top: usize) -> Vec<u16> {
+    let top = top.min(n);
+    let mut rank = vec![u16::MAX; n];
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    for tok in logits.chunks_exact(n) {
+        order.clear();
+        order.extend(0..n);
+        let by = |a: &usize, b: &usize| tok[*b].total_cmp(&tok[*a]).then(a.cmp(b));
+        if top < n {
+            order.select_nth_unstable_by(top, by);
+        }
+        order[..top].sort_unstable_by(by);
+        for (r, &e) in order[..top].iter().enumerate() {
+            rank[e] = rank[e].min(r as u16);
+        }
+    }
+    rank
+}
+
+/// The experts a guess reads ahead: ranked below `ahead` ([`guess_ranks`]) and in no VRAM
+/// slot (`in_vram`) or RAM slot (`cache`), best first.
+pub(crate) fn guess_misses(
+    rank: &[u16],
+    ahead: usize,
+    in_vram: &[bool],
+    cache: &SlotCache,
+) -> Vec<usize> {
+    let mut want: Vec<usize> = (0..rank.len())
+        .filter(|&e| (rank[e] as usize) < ahead && !in_vram[e] && cache.slot(e).is_none())
+        .collect();
+    want.sort_by_key(|&e| (rank[e], e));
+    want
 }
 
 /// One VRAM swap's RAM slots while its copies are under way.
@@ -635,7 +735,7 @@ impl HostTier {
                 .max_by_key(|&il| (sizes[il][k], std::cmp::Reverse(il)))
                 .unwrap_or(0)
         });
-        let ctx = Context::new(srcs.len() * 3 + 3 + 2, 0);
+        let ctx = Context::new(srcs.len() * 3 + 3 + 3, 0);
         let shape = |t: &crate::gguf::TensorInfo, n: usize| {
             [t.shape[0] as i64, t.shape[1] as i64, n as i64]
         };
@@ -656,6 +756,8 @@ impl HostTier {
             .named("host_tier.ids_in");
         ctx.new_tensor(types::I32, &[cap as i64])
             .named("host_tier.ids_out");
+        ctx.new_tensor(types::F32, &[(n_expert * AHEAD_TOKENS) as i64])
+            .named("host_tier.guess");
         ctx.alloc_tensors(buft)
             .map_err(|e| format!("host expert tier: {e}"))?;
         let t = |name: &str| ctx.tensor(name).expect("tier tensor");
@@ -727,6 +829,7 @@ impl HostTier {
         }
         let cuda = cfg!(feature = "cuda") && !buft.is_plain_cpu();
         let xchg = cuda.then(|| (addr("host_tier.ids_in"), addr("host_tier.ids_out")));
+        let gxchg = cuda.then(|| addr("host_tier.guess"));
         let files: Vec<std::path::PathBuf> = gguf.shard_paths().map(|p| p.to_path_buf()).collect();
         let pool = Pool::new(&files, READERS, true)?;
         let inner = Arc::new(Inner {
@@ -742,10 +845,12 @@ impl HostTier {
                 in_vram: vec![vec![false; n_expert]; layers.len()],
                 last_big: vec![Vec::new(); layers.len()],
                 ahead: None,
+                guess: None,
             }),
             layers,
             xchg,
             cap,
+            gxchg,
             pool,
             pass: Mutex::new(None),
             counts: Counters::default(),
@@ -827,13 +932,16 @@ impl HostTier {
     }
 
     /// `ids` (I32 `[n_used, n]`: a VRAM slot below `n_slots`, or `n_slots + expert`) as the
-    /// indices the matmuls read, after the reads that takes.
+    /// indices the matmuls read, after the reads that takes. `guess`: the next layer's router
+    /// logits for this step (F32 `[n_expert, n]`, [`decode_ahead`]), whose best experts in no
+    /// slot the fetch starts reading for that layer.
     pub fn fetch<'a>(
         &self,
         ctx: &'a Context,
         il: usize,
         ids: Tensor<'a>,
         n_slots: usize,
+        guess: Option<Tensor<'a>>,
     ) -> Result<Tensor<'a>, String> {
         let [n_used, n_tok, _, _] = ids.ne();
         let pairs = (n_used * n_tok) as usize;
@@ -848,13 +956,29 @@ impl HostTier {
         } else {
             ctx.cont(ids)
         };
+        let guess = guess.filter(|g| {
+            g.ne()[0] == self.inner.n_expert as i64
+                && g.ne()[1] == n_tok
+                && n_tok as usize <= AHEAD_TOKENS
+                && il + 1 < self.inner.layers.len()
+        });
+        let srcs: Vec<Tensor<'a>> = match guess {
+            Some(g) => vec![ids, if g.is_contiguous() { g } else { ctx.cont(g) }],
+            None => vec![ids],
+        };
         Ok(ctx.external_with(
             &FETCH,
             types::I32,
             ids.ne(),
-            &[ids],
+            &srcs,
             &[self.id, il as i32, n_slots as i32],
         ))
+    }
+
+    /// Whether a step of `n` tokens guesses the next layer's experts in this layer's fetch
+    /// ([`Self::fetch`]'s `guess`, [`decode_ahead`]).
+    pub fn guesses(&self, il: usize, n: i64) -> bool {
+        guesses() && n >= 1 && n as usize <= AHEAD_TOKENS && il + 1 < self.inner.layers.len()
     }
 
     /// Where the VRAM cache copies `experts` of layer `il` from, as indices past the layer's
@@ -1134,6 +1258,7 @@ impl Inner {
     /// layer's read ahead is dropped, its places free again. So are those of a staged prompt
     /// pass, done by now ([`Self::settle`]).
     fn take_ahead(&self, st: &mut State, il: Option<usize>) -> Result<Vec<(usize, usize)>, String> {
+        self.settle_guess(st)?;
         self.settle();
         let Some(a) = st.ahead.take() else {
             return Ok(Vec::new());
@@ -1146,8 +1271,102 @@ impl Inner {
         })
     }
 
-    /// The fetch of layer `il` for a step's `ids` into `out`.
-    fn fetch(&self, il: usize, n_slots: usize, ids: &[i32], out: &mut [i32]) -> Result<(), String> {
+    /// Waits for a small step's reads ahead ([`Self::guess_next`]), if any, and unpins their
+    /// RAM slots: their experts are there now. Anything that reads RAM slots starts with this
+    /// ([`Self::take_ahead`]).
+    fn settle_guess(&self, st: &mut State) -> Result<Option<Guess>, String> {
+        let Some(g) = st.guess.take() else {
+            return Ok(None);
+        };
+        if let Some(group) = &g.group {
+            self.pool.promote(group);
+            group.wait()?;
+        }
+        for &(_, s) in &g.loads {
+            st.caches[g.layer].pin(s, false);
+        }
+        Ok(Some(g))
+    }
+
+    /// Layer `il + 1`'s guess from a small step's `logits` there (`n_expert` per token): each
+    /// expert's best rank over the tokens, and, unless probing, reads of the experts ranked
+    /// below [`decode_ahead`] that no VRAM or RAM slot of that layer holds, into its RAM slots
+    /// (pinned until [`Self::settle_guess`]), behind every read a step waits for.
+    fn guess_next(&self, st: &mut State, il: usize, logits: &[f32]) {
+        let next = il + 1;
+        let n = self.n_expert;
+        let ahead = if ahead_probe() { 0 } else { decode_ahead() };
+        let rank = guess_ranks(logits, n, RANKS[RANKS.len() - 1].max(ahead));
+        let mut loads = Vec::new();
+        let mut group = None;
+        if ahead > 0 {
+            let want = guess_misses(&rank, ahead, &st.in_vram[next], &st.caches[next]);
+            let cache = &mut st.caches[next];
+            loads = cache.prefetch(&want, want.len());
+            for &(_, s) in &loads {
+                cache.pin(s, true);
+            }
+            if !loads.is_empty() {
+                let piece = read_piece();
+                let jobs: Vec<Job> = loads
+                    .iter()
+                    .flat_map(|&(e, s)| self.reads(next, e, To::Slot(s)))
+                    .flat_map(|j| match j {
+                        Job::Raw { src, dst } if piece > 0 => raw_pieces(src, dst, piece),
+                        j => vec![j],
+                    })
+                    .collect();
+                self.counts
+                    .guess_reads
+                    .fetch_add(loads.len() as u64, Ordering::Relaxed);
+                group = Some(self.pool.submit_as(jobs, Class::Ahead));
+            }
+        }
+        st.guess = Some(Guess {
+            layer: next,
+            rank,
+            loads,
+            group,
+        });
+    }
+
+    /// Scores layer `il`'s guess `g` against the step: the experts read ahead that it routed
+    /// to, its misses from the checkpoint (`misses`) by rank, and per rank the experts the
+    /// guess had that no slot holds and the step did not take.
+    fn score(&self, st: &State, il: usize, g: &Guess, seen: &[bool], misses: &[usize]) {
+        let c = &self.counts;
+        let used = g.loads.iter().filter(|&&(e, _)| seen[e]).count();
+        c.guess_used.fetch_add(used as u64, Ordering::Relaxed);
+        for &e in misses {
+            let b = RANKS
+                .iter()
+                .position(|&r| (g.rank[e] as usize) < r)
+                .unwrap_or(RANKS.len());
+            c.guess_misses[b].fetch_add(1, Ordering::Relaxed);
+        }
+        let cache = &st.caches[il];
+        for (e, &r) in g.rank.iter().enumerate() {
+            if r == u16::MAX || seen[e] || st.in_vram[il][e] || cache.slot(e).is_some() {
+                continue;
+            }
+            for (i, &top) in RANKS.iter().enumerate() {
+                if (r as usize) < top {
+                    c.guess_spare[i].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// The fetch of layer `il` for a step's `ids` into `out`; `guess`: the next layer's router
+    /// logits for the step ([`HostTier::fetch`]).
+    fn fetch(
+        &self,
+        il: usize,
+        n_slots: usize,
+        ids: &[i32],
+        out: &mut [i32],
+        guess: Option<&[f32]>,
+    ) -> Result<(), String> {
         let t0 = Instant::now();
         let mut seen = vec![false; self.n_expert];
         let mut need = Vec::new();
@@ -1167,10 +1386,31 @@ impl Inner {
         if need.is_empty() {
             out.copy_from_slice(ids);
             c.vram_pairs.fetch_add(ids.len() as u64, Ordering::Relaxed);
+            if let Some(g) = guess {
+                let mut st = self.state.lock().unwrap();
+                let st = &mut *st;
+                if let Some(old) = self.settle_guess(st)?
+                    && old.layer == il
+                {
+                    self.score(st, il, &old, &seen, &[]);
+                }
+                self.guess_next(st, il, g);
+            }
             return Ok(());
         }
         let mut st = self.state.lock().unwrap();
         let st = &mut *st;
+        // This layer's guess (made by the layer before): its reads are in their RAM slots.
+        if let Some(g) = self.settle_guess(st)?
+            && g.layer == il
+        {
+            let misses: Vec<usize> = need
+                .iter()
+                .copied()
+                .filter(|&e| st.caches[il].slot(e).is_none())
+                .collect();
+            self.score(st, il, &g, &seen, &misses);
+        }
         // The experts read ahead for this layer are in their places.
         let ready = self.take_ahead(st, Some(il))?;
         let mut place = vec![usize::MAX; self.n_expert];
@@ -1246,6 +1486,10 @@ impl Inner {
                 group: self.pool.submit(jobs),
                 at,
             });
+        }
+        // A small step: the next layer's likely misses start now, behind this layer's reads.
+        if let Some(g) = guess {
+            self.guess_next(st, il, g);
         }
         group.wait()?;
         let (mut vram, mut ram, mut ssd) = (0u64, 0u64, 0u64);
@@ -1372,6 +1616,17 @@ impl Inner {
             fetches = l(&c.fetches),
             "host expert tier"
         );
+        if guesses() {
+            let all = |a: &[AtomicU64]| a.iter().map(l).collect::<Vec<_>>();
+            tracing::info!(
+                reads = l(&c.guess_reads),
+                used = l(&c.guess_used),
+                misses_by_rank = ?all(&c.guess_misses),
+                spare_by_rank = ?all(&c.guess_spare),
+                ranks = ?RANKS,
+                "host expert tier: next-layer guesses"
+            );
+        }
     }
 }
 
@@ -1396,15 +1651,21 @@ unsafe fn fetch_cpu(dst: &ffi::ggml_tensor, ith: usize, _nth: usize) {
     let inner = lookup(p[0]);
     let n = (dst.ne[0] * dst.ne[1]) as usize;
     // SAFETY: the op's I32 source (the step's ids, contiguous) and output (`n` ids), in host
-    // memory.
-    let (ids, out) = unsafe {
+    // memory; its second source, if any, the next layer's F32 logits (`n_expert` per token,
+    // contiguous).
+    let (ids, out, guess) = unsafe {
         let s = &*dst.src[0];
+        let g = dst.src[1];
         (
             std::slice::from_raw_parts(s.data as *const i32, n),
             std::slice::from_raw_parts_mut(dst.data as *mut i32, n),
+            (!g.is_null()).then(|| {
+                let tokens = dst.ne[1] as usize;
+                std::slice::from_raw_parts((*g).data as *const f32, inner.n_expert * tokens)
+            }),
         )
     };
-    if let Err(e) = inner.fetch(p[1] as usize, p[2] as usize, ids, out) {
+    if let Err(e) = inner.fetch(p[1] as usize, p[2] as usize, ids, out, guess) {
         fatal(&e);
     }
 }
@@ -1463,7 +1724,8 @@ mod cuda {
                 std::slice::from_raw_parts_mut(ids_out as *mut i32, job.n),
             )
         };
-        if let Err(e) = job.inner.fetch(job.layer, job.n_slots, ids, out) {
+        // No guess of the next layer on this path.
+        if let Err(e) = job.inner.fetch(job.layer, job.n_slots, ids, out, None) {
             fatal(&e);
         }
     }
@@ -1492,13 +1754,28 @@ mod cuda {
             return Err(format!("{n} ids, room for {}", inner.cap));
         }
         if !as_host_function() {
-            // SAFETY: device and pinned buffers of `n` ids; after the wait the stream is done
-            // with everything before this op (the copy in, the layer before and the copy out
-            // of its fetch), so this thread reads and writes the exchange buffers alone.
+            // The next layer's logits, if the op has them ([`super::HostTier::fetch`]).
+            let tokens = dst.ne[1] as usize;
+            let g = dst.src[1];
+            let guess = inner
+                .gxchg
+                .filter(|_| !g.is_null() && tokens <= super::AHEAD_TOKENS);
+            let g_len = inner.n_expert * tokens;
+            // SAFETY: device and pinned buffers of `n` ids (and of `g_len` logits); after the
+            // wait the stream is done with everything before this op (the copy in, the layer
+            // before and the copy out of its fetch), so this thread reads and writes the
+            // exchange buffers alone.
             unsafe {
                 let e = cudaMemcpyAsync(ids_in as *mut c_void, src.data, n * 4, DEFAULT, stream);
                 if e != 0 {
                     return Err(format!("ids to host: CUDA error {e}"));
+                }
+                if let Some(at) = guess {
+                    let e =
+                        cudaMemcpyAsync(at as *mut c_void, (*g).data, g_len * 4, DEFAULT, stream);
+                    if e != 0 {
+                        return Err(format!("logits to host: CUDA error {e}"));
+                    }
                 }
                 let e = cudaStreamSynchronize(stream);
                 if e != 0 {
@@ -1506,7 +1783,8 @@ mod cuda {
                 }
                 let ids = std::slice::from_raw_parts(ids_in as *const i32, n);
                 let out = std::slice::from_raw_parts_mut(ids_out as *mut i32, n);
-                if let Err(e) = inner.fetch(p[1] as usize, p[2] as usize, ids, out) {
+                let guess = guess.map(|at| std::slice::from_raw_parts(at as *const f32, g_len));
+                if let Err(e) = inner.fetch(p[1] as usize, p[2] as usize, ids, out, guess) {
                     fatal(&e);
                 }
                 let e = cudaMemcpyAsync(dst.data, ids_out as *const c_void, n * 4, DEFAULT, stream);

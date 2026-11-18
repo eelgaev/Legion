@@ -1140,6 +1140,34 @@ impl<'a> TieredLayer<'a> {
         n: i64,
         rows: Option<Tensor<'a>>,
     ) -> Tensor<'a> {
+        self.remap_rows_guess(ctx, graph, selected, n, rows, None)
+    }
+
+    /// The layer's index in its bounded host tier, if it has one.
+    pub fn tier_layer(&self) -> Option<usize> {
+        self.host.map(|h| h.1)
+    }
+
+    /// Whether a step of `n` tokens hands this layer's bounded host tier fetch a guess of the
+    /// next layer's experts ([`Self::remap_rows_guess`], [`super::host_tier::decode_ahead`]).
+    pub fn guesses(&self, n: i64) -> bool {
+        self.host
+            .filter(|_| !self.stages(n))
+            .is_some_and(|(h, il)| h.guesses(il, n))
+    }
+
+    /// [`Self::remap_rows`] with `guess`: the next layer's router logits over this step
+    /// (F32 `[n_expert, n]`), from which the bounded host tier's fetch starts reading that
+    /// layer's likely misses. It changes no id and no byte a matmul reads.
+    pub fn remap_rows_guess(
+        &self,
+        ctx: &'a Context,
+        graph: &std::cell::RefCell<crate::ggml::Graph<'a>>,
+        selected: Tensor<'a>,
+        n: i64,
+        rows: Option<Tensor<'a>>,
+        guess: Option<Tensor<'a>>,
+    ) -> Tensor<'a> {
         use crate::model::core::pad_rows::{self, Probe};
         let used = selected.ne()[0];
         let chosen = match rows {
@@ -1191,7 +1219,7 @@ impl<'a> TieredLayer<'a> {
         // copies bring every miss into VRAM ([`ExpertResidency::begin_pass`]).
         match self.host.filter(|_| !self.stages(n)) {
             Some((h, il)) => h
-                .fetch(ctx, il, ids, self.n_slots())
+                .fetch(ctx, il, ids, self.n_slots(), guess)
                 .unwrap_or_else(|e| panic!("host expert tier: {e}")),
             None => ids,
         }

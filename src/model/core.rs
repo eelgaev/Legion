@@ -4253,6 +4253,34 @@ impl Model {
         Ok(self.linear.mul_mat_multi(ctx, &refs, h, norm))
     }
 
+    /// The bounded host tier's guess of a small step at layer `il` (#37 round 34,
+    /// [`crate::residency::host_tier::decode_ahead`]): the next layer's router over this
+    /// layer's MoE input `h`, its logits (F32 `[n_expert, n]`), for this layer's fetch to start
+    /// reading the experts that layer will likely miss. Only a guess of what to read: the next
+    /// layer routes by its own input, and no matmul reads other ids or bytes.
+    fn tier_guess<'a>(
+        &'a self,
+        ctx: &'a Context,
+        t: &crate::residency::experts::TieredLayer<'a>,
+        il: usize,
+        h: Tensor<'a>,
+        n: i64,
+    ) -> Option<Tensor<'a>> {
+        if !t.guesses(n) {
+            return None;
+        }
+        let next = self.experts.as_ref()?.layer(il + 1)?;
+        if next.tier_layer()? != t.tier_layer()? + 1 {
+            return None;
+        }
+        let w = self
+            .plain_weight(il + 1, "ffn_gate_inp.weight")
+            .filter(|w| !w.is_host() && !w.is_meta())
+            .filter(|w| w.ne()[0] == h.ne()[0] && w.ne()[1] == self.hp.n_expert)?;
+        let w = self.router_bf16(il + 1, w).unwrap_or(w);
+        Some(ctx.mul_mat(w, h))
+    }
+
     pub(crate) fn moe<'a>(
         &'a self,
         ctx: &'a Context,
@@ -4450,7 +4478,8 @@ impl Model {
             let pad = mv_rows.filter(|_| pad_rows::tiered());
             let skip =
                 mv_rows.filter(|&r| pad_rows::skip_tiered() && expert_mv::pad_fits(r, selected));
-            let ids = t.remap_rows(ctx, graph, selected, n, pad);
+            let guess = self.tier_guess(ctx, &t, il, h, n);
+            let ids = t.remap_rows_guess(ctx, graph, selected, n, pad, guess);
             let refs = |w: [Tensor<'a>; 3]| moe_ffn::ExpertRefs {
                 up: w[0],
                 gate: w[1],

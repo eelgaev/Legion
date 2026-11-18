@@ -218,6 +218,38 @@ fn a_step_takes_cached_experts_from_their_slots() {
 }
 
 #[test]
+fn a_guess_ranks_each_expert_by_its_best_token() {
+    // Two tokens over 6 experts: token 0 likes 4 > 1 > 0, token 1 likes 2 > 4 > 5.
+    let logits = [
+        0.5, 0.9, -1.0, 0.0, 2.0, -0.5, //
+        0.0, -2.0, 3.0, -1.0, 1.0, 0.25,
+    ];
+    let rank = guess_ranks(&logits, 6, 3);
+    assert_eq!(rank, vec![2, 1, 0, u16::MAX, 0, 2]);
+    // Ties go to the lower id; `top` past the experts ranks them all.
+    assert_eq!(guess_ranks(&[1.0, 1.0, 0.0], 3, 9), vec![0, 1, 2]);
+}
+
+#[test]
+fn a_guess_reads_only_its_best_experts_in_no_slot() {
+    let rank = vec![3, 0, u16::MAX, 1, 2, 4];
+    let mut in_vram = vec![false; 6];
+    in_vram[1] = true;
+    let mut c = SlotCache::new(6, 2);
+    plan_step(&mut c, 6, &[4]);
+    // Ranked below 4: experts 1 (in VRAM), 3, 4 (in a RAM slot) and 0, best first.
+    assert_eq!(guess_misses(&rank, 4, &in_vram, &c), vec![3, 0]);
+    assert_eq!(guess_misses(&rank, 1, &in_vram, &c), Vec::<usize>::new());
+    // Read ahead into RAM slots (the empty one, then the least recently used), the next
+    // step finds them cached.
+    let loads = c.prefetch(&[3, 0], 2);
+    assert_eq!(loads, vec![(3, 1), (0, 0)]);
+    assert_eq!(c.slot(4), None);
+    let t = plan_step(&mut c, 6, &[3, 0]);
+    assert!(t.cached[3] && t.cached[0] && t.loads.is_empty());
+}
+
+#[test]
 fn a_step_evicts_the_least_recently_used() {
     let mut c = SlotCache::new(8, 2);
     plan_step(&mut c, 8, &[0]);
