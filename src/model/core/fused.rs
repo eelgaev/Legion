@@ -568,6 +568,26 @@ struct ConvSilu {
 #[cfg(feature = "cuda")]
 unsafe extern "C" {
     fn legion_conv_silu_launch(p: *const ConvSilu, stream: *mut c_void) -> i32;
+    fn legion_stream_hints_set(mask: i32);
+}
+
+/// Streaming hints of the once-streamed prompt-step kernels (#1176 round 44, off by default; A/B
+/// runs): `LEGION_DEBUG_HC_POST_NORM_CS=1` (qwen4exp's BF16-stream combine-and-norm),
+/// `LEGION_DEBUG_CONV_SILU_CS=1` (the gated DeltaNet conv) and `LEGION_DEBUG_GATED_NORM_CS=1`
+/// (its gated norm) read and write the bytes they stream once evict-first (`ld/st.global.cs`),
+/// the conv with eight inputs a thread in flight. The same values either way. Applied before
+/// the first launch of any of them.
+#[cfg(feature = "cuda")]
+pub(crate) fn stream_hints() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let on = |name: &str| std::env::var_os(name).is_some_and(|v| v == "1");
+        let mask = i32::from(on("LEGION_DEBUG_HC_POST_NORM_CS"))
+            | i32::from(on("LEGION_DEBUG_CONV_SILU_CS")) << 1
+            | i32::from(on("LEGION_DEBUG_GATED_NORM_CS")) << 2;
+        // SAFETY: sets a flag the launchers read.
+        unsafe { legion_stream_hints_set(mask) };
+    });
 }
 
 #[cfg(feature = "cuda")]
@@ -624,6 +644,7 @@ unsafe fn cuda_conv_silu(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
                 p.pf_bytes = params[5] as i64 * 4096;
             }
         }
+        stream_hints();
         match legion_conv_silu_launch(&p, stream) {
             0 => Ok(()),
             -1 => Err(format!("conv_silu: kernel width {} unsupported", w.ne[0])),
@@ -1393,6 +1414,7 @@ unsafe fn cuda_gated_norm(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
             eps: f32::from_bits(p[2] as u32),
             out_bf16: i32::from(dst.type_ == types::BF16),
         };
+        stream_hints();
         match legion_gated_norm_launch(&g, stream) {
             0 => Ok(()),
             -1 => Err(format!(

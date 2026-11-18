@@ -281,6 +281,12 @@ struct legion_gated_norm {
 
 int legion_gated_norm_launch(const legion_gated_norm * p, void * stream);
 
+// Streaming hints (#1176 round 44, A/B runs): launches from now on of the kernels whose bit is
+// set move the bytes they stream once with evict-first loads and stores (ld/st.global.cs) and,
+// for conv_silu, eight inputs a thread in flight: 1 hc_post_norm_b16_kernel, 2 conv_silu_kernel,
+// 4 gated_norm_kernel. The same values either way (only the cache hints and the load order).
+void legion_stream_hints_set(int mask);
+
 // rms_norm_bf16: mul(rms_norm(x, eps), w) per row, as ggml-cuda's rms_norm_f32 fused with the
 // mul computes it (1024 threads per row from 1024 columns on, 256 below: each thread sums x^2
 // over columns tid, tid + block, ..., warp_reduce_sum, the warp sums reduced by warp 0, mean =
@@ -346,16 +352,45 @@ __device__ __forceinline__ float warp_sum(float x) {
 
 constexpr int PREP_BLOCK = 256;  // ggml-cuda's rms_norm block for rows under 1024
 
-// Input j of channel c in [state | x] time order (j < d - 1: the state).
+// Input j of channel c in [state | x] time order (j < d - 1: the state). CS: x read evict-first.
+template <bool CS = false>
 __device__ __forceinline__ float conv_in(const legion_conv_silu & p, int j, int c, int s) {
-    return j < p.d - 1 ? p.state[j + c * p.st_ld + s * p.st_sd] : p.x[c + (int64_t) (j - p.d + 1) * p.x_ld + s * p.x_sd];
+    if (j < p.d - 1) {
+        return p.state[j + c * p.st_ld + s * p.st_sd];
+    }
+    const float * x = p.x + c + (int64_t) (j - p.d + 1) * p.x_ld + s * p.x_sd;
+    if constexpr (CS) {
+        return __ldcs(x);
+    } else {
+        return *x;
+    }
+}
+
+// Streaming hints (legion_stream_hints_set): an evict-first load / store where CS.
+template <bool CS, typename T> __device__ __forceinline__ T ld_s(const T * a) {
+    if constexpr (CS) {
+        return __ldcs(a);
+    } else {
+        return *a;
+    }
+}
+
+template <bool CS, typename T> __device__ __forceinline__ void st_s(T * a, T v) {
+    if constexpr (CS) {
+        __stcs(a, v);
+    } else {
+        *a = v;
+    }
 }
 
 // One thread per (channel, run of `chunk` tokens, sequence): a sliding window of d inputs in
 // registers; reads and writes are coalesced over the channels. A norm block (one q or k head,
 // blockDim == norm_head) sums each token's squares as delta_prep_kernel's 256-thread block
 // does (the warps past the head add zeros there: s_sum's tail is zero here), so its outputs
-// are delta_prep's q and k, and the separate pass over them is saved.
+// are delta_prep's q and k, and the separate pass over them is saved. CS (#1176 round 44): x
+// read and out written evict-first, a thread's next eight inputs loaded before their outputs are
+// made (the same values, in the same order).
+template <bool CS>
 __global__ void conv_silu_kernel(legion_conv_silu p) {
     __shared__ float s_sum[PREP_BLOCK / 32];
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -393,8 +428,9 @@ __global__ void conv_silu_kernel(legion_conv_silu p) {
     for (int k = 0; k < MAX_D - 1; k++) {
         win[k] = k < d - 1 ? conv_in(p, t0 + k, c, s) : 0.0f;
     }
-    for (int t = t0; t < t1; t++) {
-        win[d - 1] = conv_in(p, t + d - 1, c, s);
+    // Output t from input t + d - 1 (the window's last).
+    auto step = [&](float in, int t) {
+        win[d - 1] = in;
         float acc = 0.0f;
 #pragma unroll
         for (int k = 0; k < MAX_D; k++) {
@@ -419,10 +455,30 @@ __global__ void conv_silu_kernel(legion_conv_silu p) {
             const float scale = rsqrtf(mean + p.norm_eps);
             y = p.norm_scale * (scale * y);
         }
-        p.out[c + (int64_t) t * p.C + (int64_t) s * p.C * p.nt] = y;
+        st_s<CS>(p.out + c + (int64_t) t * p.C + (int64_t) s * p.C * p.nt, y);
 #pragma unroll
         for (int k = 0; k < MAX_D - 1; k++) {
             win[k] = win[k + 1];
+        }
+    };
+    if constexpr (CS) {
+        constexpr int B = 8;
+        for (int tb = t0; tb < t1; tb += B) {
+            float in[B];
+#pragma unroll
+            for (int j = 0; j < B; j++) {
+                in[j] = tb + j < t1 ? conv_in<true>(p, tb + j + d - 1, c, s) : 0.0f;
+            }
+#pragma unroll
+            for (int j = 0; j < B; j++) {
+                if (tb + j < t1) {  // the same for the whole block (a norm block's barriers)
+                    step(in[j], tb + j);
+                }
+            }
+        }
+    } else {
+        for (int t = t0; t < t1; t++) {
+            step(conv_in(p, t + d - 1, c, s), t);
         }
     }
     if (blockIdx.y == 0) {
@@ -772,7 +828,9 @@ __global__ void delta_prep_kernel(legion_delta_prep p) {
     }
 }
 
-// Blocks (head, token), 256 threads as ggml's rms_norm block: thread i holds column i.
+// Blocks (head, token), 256 threads as ggml's rms_norm block: thread i holds column i. CS
+// (#1176 round 44): o and z read evict-first (z with o, before the sums), out written so.
+template <bool CS>
 __global__ void gated_norm_kernel(legion_gated_norm p) {
     __shared__ float s_sum[PREP_BLOCK / 32];
     const int h = blockIdx.x;
@@ -781,8 +839,12 @@ __global__ void gated_norm_kernel(legion_gated_norm p) {
     const int col = h * p.head_v + tid;
     float x = 0.0f;
     float tmp = 0.0f;
+    float zv = 0.0f;
     if (tid < p.head_v) {
-        x = p.o[t * p.o_ld + col];
+        x = ld_s<CS>(p.o + t * p.o_ld + col);
+        if constexpr (CS) {
+            zv = __ldcs(p.z + t * p.z_ld + col);
+        }
         tmp += x * x;
     }
     tmp = warp_sum(tmp);
@@ -796,13 +858,15 @@ __global__ void gated_norm_kernel(legion_gated_norm p) {
     const float scale = rsqrtf(mean + p.eps);
     if (tid < p.head_v) {
         const float y = scale * x * p.w[tid];
-        const float zv = p.z[t * p.z_ld + col];
+        if constexpr (!CS) {
+            zv = p.z[t * p.z_ld + col];
+        }
         const float g = p.silu ? zv / (1.0f + expf(-zv)) : 1.0f / (1.0f + expf(-zv));
         const int64_t i = t * (int64_t) p.head_v * p.n_v + col;
         if (p.out_bf16) {
-            ((__nv_bfloat16 *) p.out)[i] = __float2bfloat16(y * g);
+            st_s<CS>((__nv_bfloat16 *) p.out + i, __float2bfloat16(y * g));
         } else {
-            ((float *) p.out)[i] = y * g;
+            st_s<CS>((float *) p.out + i, y * g);
         }
     }
 }
@@ -1650,8 +1714,8 @@ __device__ __forceinline__ float moe_fold_step(float o, float v, float w, bool f
 
 // moe_fold_row for the pair layout: token t's MoE tail for this thread's B16_PS column pairs of
 // the e = 2560 columns into ov. Each column's value is moe_fold_row's (the same experts in the
-// same order, the same roundings), loaded two columns at a time.
-template <bool FMA, bool W, bool X16>
+// same order, the same roundings), loaded two columns at a time (CS: evict-first).
+template <bool FMA, bool W, bool X16, bool CS = false>
 __device__ __forceinline__ void moe_fold_pairs(const legion_moe_fold & f, int64_t t, float2 * ov) {
     constexpr int E = 2 * B16_PS * HC_THREADS;
     const float2 * x = (const float2 *) (f.x + t * (int64_t) f.k * E);
@@ -1668,7 +1732,7 @@ __device__ __forceinline__ void moe_fold_pairs(const legion_moe_fold & f, int64_
 #pragma unroll
                 for (int r = 0; r < B16_PS; r++) {
                     const int64_t at = row + threadIdx.x + r * HC_THREADS;
-                    v[q][r] = X16 ? __bfloat1622float2(x16[at]) : x[at];
+                    v[q][r] = X16 ? __bfloat1622float2(ld_s<CS>(x16 + at)) : ld_s<CS>(x + at);
                 }
             }
         }
@@ -1686,7 +1750,7 @@ __device__ __forceinline__ void moe_fold_pairs(const legion_moe_fold & f, int64_
     const float2 * sh = (const float2 *) (f.sh + t * E);
 #pragma unroll
     for (int r = 0; r < B16_PS; r++) {
-        const float2 s = sh[threadIdx.x + r * HC_THREADS];
+        const float2 s = ld_s<CS>(sh + threadIdx.x + r * HC_THREADS);
         ov[r].x = __fadd_rn(ov[r].x, __fmul_rn(s.x, sgate));
         ov[r].y = __fadd_rn(ov[r].y, __fmul_rn(s.y, sgate));
     }
@@ -1697,8 +1761,9 @@ __device__ __forceinline__ void moe_fold_pairs(const legion_moe_fold & f, int64_
 // BF16 and written as BF16, the rounded values normed, rounded to BF16 into xnb and injected.
 // Half the bytes of the streams written (and with IN16 read); the pair layout makes every
 // access a full 128-byte line per warp (a BF16 one per value would move 64). FOLD: out is a
-// folded MoE tail (moe_fold_pairs), as hc_post_norm_fold_kernel makes it.
-template <bool IN16, bool FOLD, bool FMA = false, bool W = false, bool X16 = false>
+// folded MoE tail (moe_fold_pairs), as hc_post_norm_fold_kernel makes it. CS (#1176 round 44):
+// the bytes read once (out or the tail's rows, the old streams) read evict-first.
+template <bool IN16, bool FOLD, bool FMA = false, bool W = false, bool X16 = false, bool CS = false>
 __global__ void __launch_bounds__(HC_THREADS, 4) hc_post_norm_b16_kernel(legion_hc_post_norm p, legion_moe_fold f) {
     constexpr int HC = B16_HC, NINJ = 4, PS = B16_PS, PAIRS = B16_PAIRS;
     constexpr int n = 2 * PAIRS * HC_THREADS;
@@ -1715,19 +1780,19 @@ __global__ void __launch_bounds__(HC_THREADS, 4) hc_post_norm_b16_kernel(legion_
     }
     float2 ov[PS] = {};
     if constexpr (FOLD) {
-        moe_fold_pairs<FMA, W, X16>(f, t, ov);
+        moe_fold_pairs<FMA, W, X16, CS>(f, t, ov);
     } else {
         const float * out = p.out + t * p.out_ld;
         if ((((uintptr_t) out) & 7) == 0) {
 #pragma unroll
             for (int r = 0; r < PS; r++) {
-                ov[r] = ((const float2 *) out)[threadIdx.x + r * HC_THREADS];
+                ov[r] = ld_s<CS>((const float2 *) out + threadIdx.x + r * HC_THREADS);
             }
         } else {
 #pragma unroll
             for (int r = 0; r < PS; r++) {
                 const int c = 2 * (threadIdx.x + r * HC_THREADS);
-                ov[r] = make_float2(out[c], out[c + 1]);
+                ov[r] = make_float2(ld_s<CS>(out + c), ld_s<CS>(out + c + 1));
             }
         }
     }
@@ -1738,13 +1803,13 @@ __global__ void __launch_bounds__(HC_THREADS, 4) hc_post_norm_b16_kernel(legion_
         const __nv_bfloat162 * res = (const __nv_bfloat162 *) ((const __nv_bfloat16 *) p.res + t * p.res_ld);
 #pragma unroll
         for (int i = 0; i < PAIRS; i++) {
-            vb[i] = res[threadIdx.x + i * HC_THREADS];
+            vb[i] = ld_s<CS>(res + threadIdx.x + i * HC_THREADS);
         }
     } else {
         const float2 * res = (const float2 *) (p.res + t * p.res_ld);
 #pragma unroll
         for (int i = 0; i < PAIRS; i++) {
-            vf[i] = res[threadIdx.x + i * HC_THREADS];
+            vf[i] = ld_s<CS>(res + threadIdx.x + i * HC_THREADS);
         }
     }
     float wpost[HC];
@@ -1831,6 +1896,12 @@ __global__ void __launch_bounds__(HC_THREADS, 4) hc_post_norm_b16_kernel(legion_
 
 }  // namespace
 
+static int g_stream_hints = 0;
+
+void legion_stream_hints_set(int mask) {
+    __atomic_store_n(&g_stream_hints, mask, __ATOMIC_RELAXED);
+}
+
 int legion_moe_combine_launch(const legion_moe_combine * p, void * stream) {
     if (p->n_tok < 1) {
         return -1;
@@ -1855,7 +1926,12 @@ int legion_gated_norm_launch(const legion_gated_norm * p, void * stream) {
     if (p->head_v > PREP_BLOCK || p->n_tok < 1 || p->n_tok > 65535) {
         return -1;
     }
-    gated_norm_kernel<<<dim3(p->n_v, p->n_tok), PREP_BLOCK, 0, (cudaStream_t) stream>>>(*p);
+    const dim3 grid(p->n_v, p->n_tok);
+    if (__atomic_load_n(&g_stream_hints, __ATOMIC_RELAXED) & 4) {
+        gated_norm_kernel<true><<<grid, PREP_BLOCK, 0, (cudaStream_t) stream>>>(*p);
+    } else {
+        gated_norm_kernel<false><<<grid, PREP_BLOCK, 0, (cudaStream_t) stream>>>(*p);
+    }
     return (int) cudaGetLastError();
 }
 
@@ -2112,21 +2188,21 @@ int legion_hc_post_norm_fold_launch(const legion_hc_post_norm * p, const legion_
 
 // hc_post_norm_b16_kernel of a folded MoE tail, the fold's variant picked as
 // legion_hc_post_norm_fold_launch picks it.
-template <bool IN16>
+template <bool IN16, bool CS>
 static void hc_post_norm_b16_fold(const legion_hc_post_norm * p, const legion_moe_fold * f, cudaStream_t st) {
     const unsigned grid = (unsigned) p->n_tok;
     if (f->x16 != nullptr) {
         if (f->fma != 0) {
-            hc_post_norm_b16_kernel<IN16, true, true, true, true><<<grid, HC_THREADS, 0, st>>>(*p, *f);
+            hc_post_norm_b16_kernel<IN16, true, true, true, true, CS><<<grid, HC_THREADS, 0, st>>>(*p, *f);
         } else {
-            hc_post_norm_b16_kernel<IN16, true, false, true, true><<<grid, HC_THREADS, 0, st>>>(*p, *f);
+            hc_post_norm_b16_kernel<IN16, true, false, true, true, CS><<<grid, HC_THREADS, 0, st>>>(*p, *f);
         }
     } else if (f->w == nullptr) {
-        hc_post_norm_b16_kernel<IN16, true, false, false><<<grid, HC_THREADS, 0, st>>>(*p, *f);
+        hc_post_norm_b16_kernel<IN16, true, false, false, false, CS><<<grid, HC_THREADS, 0, st>>>(*p, *f);
     } else if (f->fma != 0) {
-        hc_post_norm_b16_kernel<IN16, true, true, true><<<grid, HC_THREADS, 0, st>>>(*p, *f);
+        hc_post_norm_b16_kernel<IN16, true, true, true, false, CS><<<grid, HC_THREADS, 0, st>>>(*p, *f);
     } else {
-        hc_post_norm_b16_kernel<IN16, true, false, true><<<grid, HC_THREADS, 0, st>>>(*p, *f);
+        hc_post_norm_b16_kernel<IN16, true, false, true, false, CS><<<grid, HC_THREADS, 0, st>>>(*p, *f);
     }
 }
 
@@ -2147,11 +2223,17 @@ int legion_hc_post_norm_b16_launch(const legion_hc_post_norm * p, const legion_m
         return -1;
     }
     const cudaStream_t st = (cudaStream_t) stream;
+    const bool cs = (__atomic_load_n(&g_stream_hints, __ATOMIC_RELAXED) & 1) != 0;
     if (f == nullptr) {
-        if (in16) {
-            hc_post_norm_b16_kernel<true, false><<<p->n_tok, HC_THREADS, 0, st>>>(*p, legion_moe_fold{});
+        const legion_moe_fold none{};
+        if (in16 && cs) {
+            hc_post_norm_b16_kernel<true, false, false, false, false, true><<<p->n_tok, HC_THREADS, 0, st>>>(*p, none);
+        } else if (in16) {
+            hc_post_norm_b16_kernel<true, false><<<p->n_tok, HC_THREADS, 0, st>>>(*p, none);
+        } else if (cs) {
+            hc_post_norm_b16_kernel<false, false, false, false, false, true><<<p->n_tok, HC_THREADS, 0, st>>>(*p, none);
         } else {
-            hc_post_norm_b16_kernel<false, false><<<p->n_tok, HC_THREADS, 0, st>>>(*p, legion_moe_fold{});
+            hc_post_norm_b16_kernel<false, false><<<p->n_tok, HC_THREADS, 0, st>>>(*p, none);
         }
         return (int) cudaGetLastError();
     }
@@ -2161,10 +2243,14 @@ int legion_hc_post_norm_b16_launch(const legion_hc_post_norm * p, const legion_m
         (f->x != nullptr && (uintptr_t) f->x % 8 != 0) || (f->x16 != nullptr && (uintptr_t) f->x16 % 4 != 0)) {
         return -1;
     }
-    if (in16) {
-        hc_post_norm_b16_fold<true>(p, f, st);
+    if (in16 && cs) {
+        hc_post_norm_b16_fold<true, true>(p, f, st);
+    } else if (in16) {
+        hc_post_norm_b16_fold<true, false>(p, f, st);
+    } else if (cs) {
+        hc_post_norm_b16_fold<false, true>(p, f, st);
     } else {
-        hc_post_norm_b16_fold<false>(p, f, st);
+        hc_post_norm_b16_fold<false, false>(p, f, st);
     }
     return (int) cudaGetLastError();
 }
@@ -2243,6 +2329,11 @@ int legion_conv_silu_launch(const legion_conv_silu * p, void * stream) {
                                (int64_t) p->norm_blocks * p->norm_head > p->C)) {
         return -2;
     }
-    conv_silu_kernel<<<dim3(p->grid[0], p->grid[1], p->grid[2]), p->block, 0, (cudaStream_t) stream>>>(*p);
+    const dim3 grid(p->grid[0], p->grid[1], p->grid[2]);
+    if (__atomic_load_n(&g_stream_hints, __ATOMIC_RELAXED) & 2) {
+        conv_silu_kernel<true><<<grid, p->block, 0, (cudaStream_t) stream>>>(*p);
+    } else {
+        conv_silu_kernel<false><<<grid, p->block, 0, (cudaStream_t) stream>>>(*p);
+    }
     return (int) cudaGetLastError();
 }
