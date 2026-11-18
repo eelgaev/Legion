@@ -1310,8 +1310,9 @@ pub fn force_tokens_tile(nt: Option<i32>) {
 pub const TWO_CTAS_4: i32 = 0x104;
 
 /// Launches every dense TMA-fed W4A4 GEMM (token tile 8) from now on with tile `variant`
-/// (`legion_nvfp4_a4`'s `variant`: 1 the kernel before #1133 r12, 2 to 5 one tile; bits 8-9 a
-/// probe of tiles 2 and 4, whose outputs are not the GEMM's), or the default choice for 0:
+/// (`legion_nvfp4_a4`'s `variant`: 1 the kernel before #1133 r12, 2 to 18 one tile, 20 to 23
+/// the multicast probe; bits 8-9 a probe of some tiles, whose outputs are not the GEMM's), or
+/// the default choice for 0:
 /// for `legion nvfp4-a4-bench`.
 #[doc(hidden)]
 pub fn force_dense_variant(variant: i32) {
