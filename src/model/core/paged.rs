@@ -138,13 +138,20 @@ fn d512_pair_for(
     }
 }
 
-/// Whether small groups with heads of 256 at 6 query heads a kv head run on the wide-grid kernel
-/// ([`verify_grid`]): on unless `LEGION_DEBUG_PAGED_VERIFY_GRID=0` (read once), which keeps
-/// `paged_prefill_mma`. The same bits either way.
+/// The default wide-grid choice for small groups with heads of 256 at 6 query heads a kv head
+/// (read once): `-1` [`verify_grid_kind`]'s pick; `LEGION_DEBUG_PAGED_VERIFY_GRID=1` `-2`, its
+/// pick without the quad kernel (the pair kernel where its grid fits); `=0` `0`, always
+/// `paged_prefill_mma`. The same bits in every case.
 #[cfg(feature = "cuda")]
-fn verify_grid_on() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("LEGION_DEBUG_PAGED_VERIFY_GRID").as_deref() != Ok("0"))
+fn verify_grid_default() -> i32 {
+    static V: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *V.get_or_init(
+        || match std::env::var("LEGION_DEBUG_PAGED_VERIFY_GRID").as_deref() {
+            Ok("0") => 0,
+            Ok("1") => -2,
+            _ => -1,
+        },
+    )
 }
 
 thread_local! {
@@ -153,26 +160,41 @@ thread_local! {
 }
 
 /// The wide-grid kernel's choice for the calling thread's launches (benches): `Some(0)`
-/// `paged_prefill_mma`, `Some(1)` the wide-grid kernel for every group it covers, `Some(-1)`
-/// [`verify_grid`]'s pick; `None` follows the default again.
+/// `paged_prefill_mma`, `Some(1)` the pair kernel and `Some(2)` the quad kernel for every group
+/// they cover, `Some(-1)` [`verify_grid_kind`]'s pick, `Some(-2)` its pick without the quad
+/// kernel; `None` follows the default again.
 pub fn set_verify_grid_here(mode: Option<i32>) {
     GRID_HERE.with(|c| c.set(mode));
 }
 
-/// Whether a group of `n_tok` tokens per sequence, `n_seqs` sequences and `n_head_kv` kv heads of
-/// 6 query heads each (heads of 256: Qwen3.8-27B) runs on the wide-grid kernel on a GPU of `sms`
-/// SMs (#689). `paged_prefill_mma` puts 64 query columns (token x head) in a CTA, so a speculative
-/// verify step of one sequence is one CTA per kv head, each walking the whole context.
-/// `paged_prefill_grid` (src/cuda/sm80/paged_attn_grid.cuh) puts 2 groups of 8 columns in a CTA,
-/// each on a warp pair: `ceil(6 n_tok / 16) × n_head_kv × n_seqs` CTAs. It is picked where that
-/// grid fits on the SMs in one wave (one CTA an SM: its 96 KB ring), for 2 to
-/// [`VERIFY_SPLIT_TOKENS`] tokens. On a GB10 that is 1.3-2.0x per call at 1 or 2 sequences and
-/// about even at 4 or more (the context's reads already at DRAM speed there); larger grids lose
-/// on short contexts.
+/// The kernel for a group of `n_tok` tokens per sequence, `n_seqs` sequences and `n_head_kv` kv
+/// heads of 6 query heads each (heads of 256: Qwen3.8-27B) on a GPU of `sms` SMs (#689): 0
+/// `paged_prefill_mma`, 1 `paged_prefill_grid` (the pair kernel), 2 `paged_prefill_quad` (both in
+/// src/cuda/sm80/paged_attn_grid.cuh). `paged_prefill_mma` puts 64 query columns (token x head) in
+/// a CTA, so a speculative verify step of one sequence is one CTA per kv head, each walking the
+/// whole context. The pair kernel puts 2 groups of 8 columns in a CTA, each on a warp pair:
+/// `ceil(6 n_tok / 16) × n_head_kv × n_seqs` CTAs, picked where that grid fits on the SMs in one
+/// wave (one CTA an SM: its 96 KB ring). The quad kernel puts one group on 4 warps:
+/// `ceil(6 n_tok / 8) × n_head_kv × n_seqs` CTAs, picked where that grid is at most half the SMs.
+/// Both for 2 to [`VERIFY_SPLIT_TOKENS`] tokens. On a GB10 the pair kernel is 1.3-2.0x per call at
+/// 1 or 2 sequences and about even at 4 or more (the context's reads already at DRAM speed there);
+/// the quad kernel another 1.15x at 1 sequence of up to 8 tokens and even at 2 sequences, and
+/// slower than the pair kernel on larger grids.
+pub fn verify_grid_kind(n_tok: usize, n_seqs: usize, n_head_kv: usize, sms: usize) -> i32 {
+    if !(2..=VERIFY_SPLIT_TOKENS).contains(&n_tok) || sms == 0 {
+        0
+    } else if (6 * n_tok).div_ceil(8) * n_head_kv * n_seqs <= sms / 2 {
+        2
+    } else if (6 * n_tok).div_ceil(16) * n_head_kv * n_seqs <= sms {
+        1
+    } else {
+        0
+    }
+}
+
+/// Whether [`verify_grid_kind`] picks a wide-grid kernel (the pair or the quad kernel).
 pub fn verify_grid(n_tok: usize, n_seqs: usize, n_head_kv: usize, sms: usize) -> bool {
-    (2..=VERIFY_SPLIT_TOKENS).contains(&n_tok)
-        && sms > 0
-        && (6 * n_tok).div_ceil(16) * n_head_kv * n_seqs <= sms
+    verify_grid_kind(n_tok, n_seqs, n_head_kv, sms) > 0
 }
 
 /// The launch's `verify_grid`: 0 unless the group has heads of 256 at 6 query heads a kv head in
@@ -192,12 +214,15 @@ fn verify_grid_for(
         return 0;
     }
     let mode = GRID_HERE.with(|c| c.get());
-    match mode.unwrap_or(if verify_grid_on() { -1 } else { 0 }) {
-        -1 => {
+    match mode.unwrap_or_else(verify_grid_default) {
+        m @ (-2 | -1) => {
             let sms = crate::hw::per_device::current().map_or(0, crate::hw::per_device::sm_count);
-            verify_grid(n_tok, n_seqs, n_head_kv, sms.max(0) as usize) as i32
+            let kind = verify_grid_kind(n_tok, n_seqs, n_head_kv, sms.max(0) as usize);
+            // Without the quad kernel: the pair kernel wherever the quad's grid fits too (half
+            // the pair's), so exactly the pair kernel's own routing.
+            if m == -2 { kind.min(1) } else { kind }
         }
-        m => (m > 0) as i32,
+        m => m.max(0),
     }
 }
 
@@ -835,8 +860,8 @@ struct LaunchParams {
     /// Heads of 512 at 8 query heads a kv head on sm_80+: 1 runs the group on the warp-pair
     /// prefill kernel ([`d512_pair_for`]); 0: `paged_prefill_mma`.
     d512_pair: i32,
-    /// Heads of 256 at 6 query heads a kv head on sm_80+: 1 runs the group on the wide-grid
-    /// prefill kernel ([`verify_grid_for`]); 0: `paged_prefill_mma`.
+    /// Heads of 256 at 6 query heads a kv head on sm_80+: 1 runs the group on the pair kernel, 2 on
+    /// the quad kernel ([`verify_grid_for`]); 0: `paged_prefill_mma`.
     verify_grid: i32,
 }
 

@@ -124,8 +124,9 @@ struct legion_paged_attn {
     int32_t d512_pair;
     // Heads of 256 at 6 query heads a kv head, not compact, on sm_80+ without a split (Qwen3.8-27B's
     // attention layers, #689): 1 runs the group on paged_prefill_grid (sm80/paged_attn_grid.cuh,
-    // groups of 8 query columns on warp pairs over more CTAs) instead of paged_prefill_mma; the
-    // same bits. Picked on the Rust side (paged::verify_grid) for small groups.
+    // groups of 8 query columns on warp pairs over more CTAs), 2 on paged_prefill_quad (a group on
+    // 4 warps, a CTA each) instead of paged_prefill_mma; the same bits. Picked on the Rust side
+    // (paged::verify_grid_kind) for small groups.
     int32_t verify_grid;
 };
 

@@ -46,9 +46,9 @@ pub struct PagedQmBenchArgs {
     /// blocks as `--paged-verify-split`; other bits, timed for reference).
     #[arg(long, value_delimiter = ',')]
     d512: Vec<String>,
-    /// The wide-grid kernel for small groups at 6 query heads a kv head (`--heads 24,4`:
-    /// Qwen3.8-27B) against `paged_prefill_mma` (#689), `--modes` ignored: `auto` (where the
-    /// default picks it), `grid` (the wide-grid kernel for every group it covers), `split` (over
+    /// The wide-grid kernels for small groups at 6 query heads a kv head (`--heads 24,4`:
+    /// Qwen3.8-27B) against `paged_prefill_mma` (#689), `--modes` ignored: `auto` (the default's
+    /// pick), `pair` / `quad` (the pair / quad kernel for every group it covers), `split` (over
     /// the key blocks as `--paged-verify-split`; other bits, timed for reference).
     #[arg(long, value_delimiter = ',')]
     grid: Vec<String>,

@@ -1,7 +1,7 @@
 //! Heads of 256 at 6 query heads a kv head (Qwen3.8-27B's attention layers) on the wide-grid
-//! kernel of [`verify_grid`] (#689) against `paged_prefill_mma`: the op over the same inputs with
-//! each kernel choice for the calling thread ([`set_verify_grid_here`]), every output value
-//! compared bit for bit, and the time of each; the split over the key blocks
+//! kernels of [`verify_grid_kind`] (#689) against `paged_prefill_mma`: the op over the same
+//! inputs with each kernel choice for the calling thread ([`set_verify_grid_here`]), every output
+//! value compared bit for bit, and the time of each; the split over the key blocks
 //! (`--paged-verify-split`, other bits) is timed for reference. Used by `legion paged-qm-bench
 //! --grid`, which runs them from a release build on the GPU it is given.
 
@@ -11,15 +11,16 @@ use super::*;
 use crate::ggml::Backend;
 use crate::model::core::KvPool;
 
-/// The kernel choices: `main` (`paged_prefill_mma`), `auto` ([`verify_grid`]'s pick), `grid`
-/// (the wide-grid kernel for every group it covers), `split` (over the key blocks).
-pub const KERNELS: [&str; 4] = ["main", "auto", "grid", "split"];
+/// The kernel choices: `main` (`paged_prefill_mma`), `auto` ([`verify_grid_kind`]'s pick),
+/// `pair` / `quad` (the pair / quad kernel for every group they cover), `split` (over the key
+/// blocks).
+pub const KERNELS: [&str; 5] = ["main", "auto", "pair", "quad", "split"];
 
-/// Whether `kernel` runs `g` on the wide-grid kernel on a GPU of `sms` SMs.
+/// Whether `kernel` runs `g` on a wide-grid kernel on a GPU of `sms` SMs.
 pub fn on_grid(g: &Group, kernel: &str, sms: usize) -> bool {
     match kernel {
         "auto" => verify_grid(g.n_tok, g.n_past.len(), g.heads.2, sms),
-        "grid" => g.n_tok > 1,
+        "pair" | "quad" => g.n_tok > 1,
         _ => false,
     }
 }
@@ -39,7 +40,8 @@ pub fn run(
     let mode = match kernel {
         "main" => 0,
         "auto" => -1,
-        "grid" => 1,
+        "pair" => 1,
+        "quad" => 2,
         "split" => {
             let (d, h, hk) = (d as i64, n_head as i64, n_head_kv as i64);
             scratch = split_scratch_shape(d, h, hk, g.n_tok, g.n_past.len());
