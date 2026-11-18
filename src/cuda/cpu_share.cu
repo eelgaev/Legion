@@ -82,6 +82,10 @@ namespace {
 
 constexpr int MAX_PAIRS = 128;  // ops::MAX_TOKENS x ops::MAX_USED
 constexpr int HOST_PAIR = -2;
+// Loads a thread keeps in flight from host memory (#37): `collect`'s 256 threads take a
+// 2560-value row in one pass, `activate`'s 128 a 640-row pair's gate and up.
+constexpr int COPY_ILP = 10;
+constexpr int ACT_ILP  = 5;
 
 // Value `el` of a column `col` (k values, k a multiple of 32) as quantize_x writes it
 // (src/cuda/expert_mv/common.cuh, the same operations): the warp holds one 32-value block.
@@ -223,8 +227,23 @@ __global__ void collect(const legion_cpu_share_collect p) {
     if (src == dst) {
         return;  // in place: the GPU pair's row is already there
     }
-    for (int r = threadIdx.x; r < p.rows; r += blockDim.x) {
-        dst[r] = src[r];
+    // A host row comes over the link, ~1 us a load: each thread issues its COPY_ILP loads before
+    // any store (one store before the next load would wait out every load in turn, src and dst
+    // being plain pointers the compiler cannot tell apart). The same values are copied.
+    for (int r0 = threadIdx.x; r0 < p.rows; r0 += COPY_ILP * blockDim.x) {
+        float v[COPY_ILP];
+#pragma unroll
+        for (int i = 0; i < COPY_ILP; ++i) {
+            const int r = r0 + i * blockDim.x;
+            v[i] = r < p.rows ? src[r] : 0.0f;
+        }
+#pragma unroll
+        for (int i = 0; i < COPY_ILP; ++i) {
+            const int r = r0 + i * blockDim.x;
+            if (r < p.rows) {
+                dst[r] = v[i];
+            }
+        }
     }
 }
 
@@ -255,10 +274,26 @@ __global__ void activate(const legion_cpu_share_activate p) {
     const float * g = p.gu + (int64_t) pair * 2 * p.rows;
     const float * u = g + p.rows;
     block_q8_1 * col = (block_q8_1 *) p.aq + (int64_t) pair * (p.rows / QK8_1);
-    for (int r = threadIdx.x; r < p.rows; r += blockDim.x) {
-        const float v = swiglu(g[r], u[r], p.limit);
-        dst[r] = v;
-        quantize_q8_1_el(v, col, r);
+    // The host's sums come over the link: all of a pass's loads first (as `collect`), then each
+    // value as before. `r < rows` holds for a whole warp or none of it (rows and the block are
+    // whole warps), so every warp still reduces whole blocks: the same rows and blocks.
+    for (int r0 = threadIdx.x; r0 < p.rows; r0 += ACT_ILP * blockDim.x) {
+        float gv[ACT_ILP], uv[ACT_ILP];
+#pragma unroll
+        for (int i = 0; i < ACT_ILP; ++i) {
+            const int r = r0 + i * blockDim.x;
+            gv[i] = r < p.rows ? g[r] : 0.0f;
+            uv[i] = r < p.rows ? u[r] : 0.0f;
+        }
+#pragma unroll
+        for (int i = 0; i < ACT_ILP; ++i) {
+            const int r = r0 + i * blockDim.x;
+            if (r < p.rows) {
+                const float v = swiglu(gv[i], uv[i], p.limit);
+                dst[r] = v;
+                quantize_q8_1_el(v, col, r);
+            }
+        }
     }
 }
 

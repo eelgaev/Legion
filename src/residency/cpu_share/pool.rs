@@ -497,6 +497,7 @@ fn coordinate(s: &Shared) {
         if job.exchange.exact.is_some() {
             let st = run_exact(s, &job);
             done.store(job.seq, Ordering::Release);
+            laps::record(job.seq, job.layer, st.experts, st.laps);
             exact_stats(&st);
             continue;
         }
@@ -549,6 +550,81 @@ struct ExactStats {
     gpu_waited: bool,
     /// The layer's share after the job.
     thr: u32,
+    /// [`laps`]' clock (0 when off) when the job was picked, at "gate/up done", when "act
+    /// ready" was seen and when the down rows were written.
+    laps: [u64; 4],
+}
+
+/// Whether the pool prefetches the down rows while it waits for the GPU's SwiGLU blocks (on;
+/// `LEGION_DEBUG_SHARE_PREFETCH=0` turns it off, for A/B runs). The same rows and sums either
+/// way.
+fn prefetch_down() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LEGION_DEBUG_SHARE_PREFETCH").map_or(true, |v| v != "0"))
+}
+
+/// Per-job timestamps of the exact share for a decode attribution (`LEGION_DEBUG_SHARE_LAPS=
+/// <file>`): one line a job, `seq layer experts picked gu_done act_seen down_done`, in
+/// CLOCK_REALTIME nanoseconds (the clock a CUPTI trace's host stamps use), appended in batches.
+pub(super) mod laps {
+    use std::io::Write;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    fn path() -> Option<&'static str> {
+        static P: OnceLock<Option<String>> = OnceLock::new();
+        P.get_or_init(|| {
+            std::env::var("LEGION_DEBUG_SHARE_LAPS")
+                .ok()
+                .filter(|p| !p.is_empty())
+        })
+        .as_deref()
+    }
+
+    /// The clock in nanoseconds, or 0 when the laps are off.
+    pub fn now() -> u64 {
+        if path().is_none() {
+            return 0;
+        }
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64)
+    }
+
+    /// Records one job (when on), writing the batch out every 16,384 jobs.
+    pub fn record(seq: u32, layer: u32, experts: usize, t: [u64; 4]) {
+        let Some(p) = path() else {
+            return;
+        };
+        static BUF: Mutex<Vec<[u64; 7]>> = Mutex::new(Vec::new());
+        let mut b = BUF.lock().unwrap();
+        b.push([
+            u64::from(seq),
+            u64::from(layer),
+            experts as u64,
+            t[0],
+            t[1],
+            t[2],
+            t[3],
+        ]);
+        if b.len() >= 16_384 {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+            {
+                let mut s = String::with_capacity(b.len() * 80);
+                for r in b.iter() {
+                    s.push_str(&format!(
+                        "{} {} {} {} {} {} {}\n",
+                        r[0], r[1], r[2], r[3], r[4], r[5], r[6]
+                    ));
+                }
+                let _ = f.write_all(s.as_bytes());
+            }
+            b.clear();
+        }
+    }
 }
 
 /// How fast a layer's cost per expert follows its jobs (a running mean over about 16).
@@ -626,6 +702,7 @@ fn run_exact(s: &Shared, job: &Job) -> ExactStats {
     let mut st = ExactStats {
         miss,
         thr: thr_of(layer).unwrap_or(0),
+        laps: [laps::now(), 0, 0, 0],
         ..Default::default()
     };
     let groups = groups(ids, n_used);
@@ -660,17 +737,25 @@ fn run_exact(s: &Shared, job: &Job) -> ExactStats {
     // SAFETY: the flag lives in the buffer.
     st.gpu_waited_act = reached(unsafe { &*e.act_arrived }, job.seq);
     gu_done.store(job.seq, Ordering::Release);
+    st.laps[1] = laps::now();
     let t = Instant::now();
+    split_rows(s, ne);
+    // While the GPU makes the host pairs' SwiGLU blocks, every thread pulls the down rows of
+    // its first task into its cache ([`prefetch_down`]); placement of reads only.
+    if prefetch_down() {
+        run_phase(s, 2);
+    }
     // The GPU's `activate` follows its SwiGLU op at once; stopping leaves the rows undone (the
     // share is going away, see `Pool::stop`).
     if !wait_for(&s.stop, || reached(act_ready, job.seq)) {
         return st;
     }
     st.wait = t.elapsed();
+    st.laps[2] = laps::now();
     let t = Instant::now();
-    split_rows(s, ne);
     run_phase(s, 3);
     st.down = t.elapsed();
+    st.laps[3] = laps::now();
     // SAFETY: as above (null when the buffer has no such flag: tests).
     st.gpu_waited = unsafe { ex.arrived.as_ref() }.is_some_and(|a| reached(a, job.seq));
     // A step the pool takes whole ([`ExactExchange::all_upto`]) says nothing about the race.
@@ -857,6 +942,13 @@ fn work(s: &Shared, i: usize, phase: u64) {
     // SAFETY: in a phase every thread only reads the current job; outputs go through raw
     // pointers to fields or rows of the task's own.
     let c = unsafe { &*s.current.0.get() };
+    if phase == 2 && c.exact {
+        // The prefetch: each thread the task it takes first in phase 3 (task `i`), no claims.
+        if i < c.n_tasks {
+            prefetch_task(c, i);
+        }
+        return;
+    }
     let mut task = i;
     while task < c.n_tasks {
         // SAFETY: the task is this thread's alone (claimed once).
@@ -938,6 +1030,42 @@ unsafe fn run_task(c: &Current, phase: u64, task: usize) {
                 }
             }
         }
+    }
+}
+
+/// An exact job's prefetch (phase 2): the down rows of phase 3's task `task` into this thread's
+/// caches, a cache line at a time, until done or the GPU raised "act ready" (then phase 3 starts
+/// at once and reads the rest from memory as without it). Reads only: no row or sum changes.
+fn prefetch_task(c: &Current, task: usize) {
+    let Some(job) = c.job.as_ref() else {
+        return;
+    };
+    let Some(e) = job.exchange.exact else {
+        return;
+    };
+    let ex = &job.experts;
+    let Task { group, r0, r1 } = c.tasks[task];
+    let Some(rb) = ex.down.row_bytes(ex.n_ff) else {
+        return;
+    };
+    // SAFETY: live host experts (the pool's owner keeps them mapped); the flag lives in the
+    // exchange buffer.
+    let (down, act_ready) = unsafe { (ex.expert(2, c.groups[group].expert), &*e.act_ready) };
+    let rows = &down[r0 * rb..r1 * rb];
+    const LINE: usize = 64;
+    const CHECK_EVERY: usize = 32;
+    for (n, at) in (0..rows.len()).step_by(LINE).enumerate() {
+        if n % CHECK_EVERY == 0 && reached(act_ready, job.seq) {
+            return;
+        }
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: a prefetch hint of an address inside `rows`; it never faults or writes.
+        unsafe {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            _mm_prefetch::<_MM_HINT_T0>(rows.as_ptr().add(at).cast());
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = at;
     }
 }
 
