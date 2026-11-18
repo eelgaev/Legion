@@ -270,6 +270,23 @@ fn stages_entry(real: Option<&[usize]>, il: usize, limit: usize, all: bool) -> b
     r < limit && !(all && r != il)
 }
 
+/// The slots below which a lend copies the bounded host tier's RAM-held experts into a
+/// refilled layer's emptied slots ([`ExpertResidency::fill_from_ram`]): only those it keeps.
+/// `lends`: the layer's device stages (else it keeps every slot); a [`Lend::Tail`] layer keeps
+/// its slots below `keep` ([`Layer::keep`]), all of them when the lend re-packs them (`repack`:
+/// [`super::policy::LayerSlots::repack_kept`] may copy from the tail's bytes); a
+/// [`Lend::Whole`] layer none.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn fill_below(lends: bool, mode: Lend, keep: usize, repack: bool) -> usize {
+    match mode {
+        _ if !lends => usize::MAX,
+        Lend::Keep => usize::MAX,
+        Lend::Tail if repack => usize::MAX,
+        Lend::Tail => keep,
+        Lend::Whole => 0,
+    }
+}
+
 /// How many experts a staging entry may copy in a pass at most, for the staging buffers' size
 /// ([`auto_keep_carved`]): every expert of the layer when it computes them all ([`stages_all`],
 /// `all`), else those it owns (`owned`; `None`: all).
@@ -3279,15 +3296,17 @@ impl ExpertResidency {
             return Ok(());
         }
         let t0 = std::time::Instant::now();
+        // The refilled layers, without the bounded host tier's RAM fill: it is done below for
+        // the slots the lend keeps only ([`fill_below`]).
         #[cfg(feature = "cuda")]
-        {
+        let refilled = {
             // `settle` (#1165): the refill runs to its end, so the layers it gave back do not
             // follow when the prompt came.
             if !self.settle {
                 self.stop_refill.store(true, Ordering::Relaxed);
             }
-            self.refill(None, true)?;
-        }
+            self.refill_backed(None, true)?
+        };
         self.sync_copies()?;
         self.complete_copies(None)?;
         #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
@@ -3356,6 +3375,27 @@ impl ExpertResidency {
                     mode[il] = Lend::Tail;
                 }
             }
+            // The bounded host tier's RAM fill of the refilled layers, now that each layer's
+            // mode is known: the bytes only for the slots it keeps.
+            let t_fill = std::time::Instant::now();
+            let (mut from_ram, mut fill_skipped) = (0, 0);
+            if let Some((tier, n, t_refill)) = refilled {
+                let below: Vec<usize> = (self.layers.iter().zip(&mode))
+                    .map(|(l, &m)| match l {
+                        Some(l) => fill_below(staging[l.dev], m, l.keep.unwrap_or(0), repack_kept),
+                        None => 0,
+                    })
+                    .collect();
+                (from_ram, fill_skipped) = self.fill_from_ram(&tier, &|il| below[il])?;
+                tracing::debug!(
+                    waited_ms = t_refill.elapsed().as_secs_f64() * 1e3,
+                    layers = n,
+                    from_ram,
+                    skipped_lent = fill_skipped,
+                    "expert cache refilled"
+                );
+            }
+            let fill_ms = t_fill.elapsed().as_secs_f64() * 1e3;
             let kept = mode.iter().filter(|m| **m == Lend::Keep).count();
             // Staging kept across lends: not with whole kept layers (`lend_keep`).
             let reuse = self.stage_reuse && kept == 0;
@@ -3513,6 +3553,9 @@ impl ExpertResidency {
                 unrefilled,
                 kept,
                 sync_ms = ms(t_sync),
+                fill_ms,
+                from_ram,
+                fill_skipped,
                 tables_ms = ms(t_tables - t_sync),
                 devices_ms = ms(t0.elapsed() - t_tables),
                 unback_max_ms = unback_ms,
@@ -3899,6 +3942,28 @@ impl ExpertResidency {
     /// layers' wait for a call that covers them (nothing to do when no restore is under way).
     #[cfg(feature = "cuda")]
     fn refill(&mut self, scope: Option<&dyn Fn(usize) -> bool>, wait: bool) -> Result<(), String> {
+        let Some((tier, n, t0)) = self.refill_backed(scope, wait)? else {
+            return Ok(());
+        };
+        let (from_ram, _) = self.fill_from_ram(&tier, &|_| usize::MAX)?;
+        tracing::debug!(
+            waited_ms = t0.elapsed().as_secs_f64() * 1e3,
+            layers = n,
+            from_ram,
+            "expert cache refilled"
+        );
+        Ok(())
+    }
+
+    /// [`Self::refill`] but the bounded host tier's RAM fill: marks the refilled layers
+    /// backed and returns the tiered ones among them (for [`Self::fill_from_ram`]), how many
+    /// layers it marked and when it started; `None` when no layer was refilled.
+    #[cfg(feature = "cuda")]
+    fn refill_backed(
+        &mut self,
+        scope: Option<&dyn Fn(usize) -> bool>,
+        wait: bool,
+    ) -> Result<Option<(Vec<usize>, usize, std::time::Instant)>, String> {
         // `settle` (#1165): the next after-step takes the whole refill, not what is done by then.
         let wait = wait || self.settle;
         if self
@@ -3911,7 +3976,7 @@ impl ExpertResidency {
             self.refilled.extend(done);
         }
         if self.refilled.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let t0 = std::time::Instant::now();
         let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.refilled)
@@ -3943,33 +4008,49 @@ impl ExpertResidency {
             }
             l.dirty = true;
         }
-        // The bounded host tier: the emptied slots take the most routed experts its RAM
-        // slots hold (copies over the link, no checkpoint read); the swaps bring the others.
-        let mut from_ram = 0;
-        if let Some(h) = self.host.clone() {
-            for il in tier {
-                let in_ram = h.in_ram(il);
-                let l = self.layers[il].as_mut().expect("tiered layer");
-                let Some(ranked) = l.slots.ranked() else {
-                    continue;
-                };
-                let hot: Vec<u32> = ranked.into_iter().filter(|&e| in_ram[e as usize]).collect();
-                let fills = l.slots.refill(&hot);
-                from_ram += fills.len();
-                self.copy_from_host(il, &fills)?;
-                let l = self.layers[il].as_mut().expect("tiered layer");
-                for &(s, _) in &fills {
-                    l.slots.complete(s);
-                }
+        Ok(Some((tier, n, t0)))
+    }
+
+    /// The bounded host tier's fill of refilled layers `tier` ([`Self::refill_backed`]): their
+    /// emptied slots take the most routed experts its RAM slots hold (copies over the link, no
+    /// checkpoint read); the swaps bring the others. Only the slots below `below(layer)` get
+    /// the bytes: the others take the same experts as filling, for a [`Self::lend`] that
+    /// empties them right after (it lends them, [`fill_below`]), so the experts it hands back
+    /// are the same as with the copies, which it would throw away (~7 ms a layer on a 4090).
+    /// Returns how many experts it copied and how many it left uncopied.
+    #[cfg(feature = "cuda")]
+    fn fill_from_ram(
+        &mut self,
+        tier: &[usize],
+        below: &dyn Fn(usize) -> usize,
+    ) -> Result<(usize, usize), String> {
+        let (mut from_ram, mut skipped) = (0, 0);
+        let Some(h) = self.host.clone() else {
+            return Ok((0, 0));
+        };
+        for &il in tier {
+            let in_ram = h.in_ram(il);
+            let l = self.layers[il].as_mut().expect("tiered layer");
+            let Some(ranked) = l.slots.ranked() else {
+                continue;
+            };
+            let hot: Vec<u32> = ranked.into_iter().filter(|&e| in_ram[e as usize]).collect();
+            let mut fills = l.slots.refill(&hot);
+            // In slot order: the copies past `below` stay filling until the lend clears them.
+            let n = fills.partition_point(|&(s, _)| (s as usize) < below(il));
+            skipped += fills.len() - n;
+            fills.truncate(n);
+            if fills.is_empty() {
+                continue;
+            }
+            from_ram += fills.len();
+            self.copy_from_host(il, &fills)?;
+            let l = self.layers[il].as_mut().expect("tiered layer");
+            for &(s, _) in &fills {
+                l.slots.complete(s);
             }
         }
-        tracing::debug!(
-            waited_ms = t0.elapsed().as_secs_f64() * 1e3,
-            layers = n,
-            from_ram,
-            "expert cache refilled"
-        );
-        Ok(())
+        Ok((from_ram, skipped))
     }
 
     /// The routing counted so far as a profile (every routed pair, most routed first).
