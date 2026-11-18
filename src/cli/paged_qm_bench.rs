@@ -77,7 +77,8 @@ pub struct PagedQmBenchArgs {
     /// With `--cold`: blocks per layer (0: the deepest group's).
     #[arg(long, default_value_t = 0)]
     pool_blocks: usize,
-    /// Block i of sequence s sits in pool block (i * stride + s * 11) mod the pool's blocks.
+    /// Block i of sequence s sits in pool block (i * stride + s * 11) mod the pool's blocks (with
+    /// `--cold`: s times the deepest group's blocks, in a pool of at least that many a sequence).
     #[arg(long, default_value_t = 37)]
     stride: usize,
 }
@@ -400,11 +401,14 @@ fn run_cold(
     };
     let mut gpu = legion::ggml::backend_by_name("CUDA0")?;
     let max_ctx = chunks.iter().map(|(p, t)| p + t).max().unwrap_or(0);
-    let n_blocks = max_ctx.div_ceil(64).max(args.pool_blocks).max(1);
+    let seqs = args.seqs.max(1);
+    // Each sequence its own run of blocks, as in a model's pool: block i of sequence s in pool
+    // block (i * stride + s * the deepest group's blocks) mod the pool's blocks.
+    let run = max_ctx.div_ceil(64);
+    let n_blocks = (seqs * run).max(args.pool_blocks).max(1);
     let layers = args.layers.max(1);
     let kv = pools(&gpu, heads, n_blocks, layers);
     let flush = cold::Flush::new(&gpu);
-    let seqs = args.seqs.max(1);
     println!(
         "{layers} layers of {n_blocks} blocks, table stride {}, {} calls a graph",
         args.stride, layers
@@ -416,7 +420,7 @@ fn run_cold(
         let tables: Vec<Vec<u32>> = (0..seqs)
             .map(|s| {
                 (0..len)
-                    .map(|i| ((i * args.stride + s * 11) % n_blocks) as u32)
+                    .map(|i| ((i * args.stride + s * run) % n_blocks) as u32)
                     .collect()
             })
             .collect();
