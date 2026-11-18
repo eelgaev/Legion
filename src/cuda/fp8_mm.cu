@@ -82,6 +82,10 @@ struct legion_fp8_mm8 {
     // into an FMA): dst then holds the bits of the plain matmul followed by ggml's add. Taken by
     // the large-batch GEMM only (more than 64 tokens on E4M3 tensor cores); null: none.
     const float * res;
+    // The TMA-fed wide prefill GEMM's kernel (#1133 r16, for A/B runs and `legion
+    // fp8-gemm-bench`): 0 the default; the low byte a8p's V_* variant, bits 8 and 11 its P_*
+    // probes (outputs not the GEMM's). Other GEMMs ignore it.
+    int32_t variant;
 };
 int legion_fp8_quant_launch(const float * x, int64_t x_ld, uint8_t * out, int64_t k, int64_t n,
                             const float * scale, void * stream);
@@ -536,6 +540,8 @@ __global__ void __launch_bounds__(128) fp8_gemv8(const legion_fp8_mm8 p) {
 #include "sm89/fp8_mm.cuh"
 // sm_90 and newer: fp8_gemm8 fed by TMA (fp8_gemm8_tma).
 #include "sm90/fp8_gemm8_tma.cuh"
+// sm_90 and newer: the wide tile as a persistent kernel (fp8_gemm8_pp).
+#include "sm90/fp8_gemm8_pp.cuh"
 
 template <int BN, int W, bool RES, int STAGES>
 void launch_gemm8_skinny_w(const legion_fp8_mm8 & p, cudaStream_t st) {
@@ -610,14 +616,30 @@ bool gemm8_tma_map(CUtensorMap * map, const uint8_t * base, int64_t k, int64_t r
 // tile's time: 123 us at k 6,144 on the GB10, where 60 us gained about half as much).
 constexpr int64_t GEMM8_STAGGER_NS_PER_K = 20;
 
-// fp8_gemm8_tma where the device and the operands allow it (4 warps: and two CTAs fit an SM);
-// false: not launched.
-template <bool RES, class C>
+// The kernel launch_gemm8_tma runs: fp8_gemm8_tma, or for V (a8p's V_STG / V_BULK, maybe with
+// probe bits) the persistent fp8_gemm8_pp.
+template <bool RES, class C, int V>
+constexpr auto gemm8_tma_kernel() {
+    if constexpr (V == 0) {
+        return fp8_gemm8_tma<RES, C>;
+    } else {
+        return fp8_gemm8_pp<RES, C, V>;
+    }
+}
+
+// fp8_gemm8_tma (V 0) or fp8_gemm8_pp (V a8p's persistent variant) where the device and the
+// operands allow it (4 warps: and two CTAs fit an SM); false: not launched.
+template <bool RES, class C, int V = 0>
 bool launch_gemm8_tma(const legion_fp8_mm8 & p, cudaStream_t st) {
-    constexpr size_t SMEM = gemm8_tma_smem<C>();
+    constexpr bool PP = V != 0;
+    constexpr size_t SMEM = PP ? gemm8_pp_smem<C>() : gemm8_tma_smem<C>();
     static_assert(SMEM <= 99 * 1024, "shared memory");
+    const auto kernel = gemm8_tma_kernel<RES, C, V>();
     if (!gemm8_tma_device()) {
         return false;
+    }
+    if (PP && ((uintptr_t) p.dst & 15) != 0) {
+        return false;  // the bulk copies' rows start on 16 bytes
     }
     // The kernel image the device runs must be built for sm_90 or newer: one JIT-compiled from
     // older PTX (a build without a 12.x target) traps.
@@ -629,7 +651,7 @@ bool launch_gemm8_tma(const legion_fp8_mm8 & p, cudaStream_t st) {
     int8_t ok = image_ok[dev].load(std::memory_order_relaxed);
     if (ok == 0) {
         cudaFuncAttributes attr;
-        const bool sm90 = cudaFuncGetAttributes(&attr, fp8_gemm8_tma<RES, C>) == cudaSuccess &&
+        const bool sm90 = cudaFuncGetAttributes(&attr, kernel) == cudaSuccess &&
                           attr.binaryVersion >= 90 && attr.ptxVersion >= 90;
         ok = sm90 ? 1 : -1;
         image_ok[dev].store(ok, std::memory_order_relaxed);
@@ -642,11 +664,11 @@ bool launch_gemm8_tma(const legion_fp8_mm8 & p, cudaStream_t st) {
         return false;
     }
     static std::atomic<int8_t> opted_in[GGML_CUDA_MAX_DEVICES];
-    if (!legion_device::smem_opt_in(opted_in, fp8_gemm8_tma<RES, C>, (int) SMEM)) {
+    if (!legion_device::smem_opt_in(opted_in, kernel, (int) SMEM)) {
         return false;
     }
     a8t::Stagger stagger;
-    if constexpr (C::WARPS == 4) {
+    if constexpr (!PP && C::WARPS == 4) {
         // All of the SM's shared memory as shared memory, then whether two CTAs fit (once per
         // device).
         static std::atomic<int8_t> pair_ok[GGML_CUDA_MAX_DEVICES];
@@ -668,9 +690,50 @@ bool launch_gemm8_tma(const legion_fp8_mm8 & p, cudaStream_t st) {
         stagger.ctas = 2 * sm_count();
         stagger.ns   = (uint32_t) (GEMM8_STAGGER_NS_PER_K * p.k / stagger.ctas);
     }
-    const dim3 grid((unsigned) ((p.n + a8::BN - 1) / a8::BN), (unsigned) ((p.m + C::TM - 1) / C::TM));
-    fp8_gemm8_tma<RES, C><<<grid, 32 * C::WARPS, SMEM, st>>>(p, maps, stagger);
+    const int64_t tiles_n = (p.n + a8::BN - 1) / a8::BN, tiles_m = (p.m + C::TM - 1) / C::TM;
+    if constexpr (PP) {
+        // One CTA per SM, each walking its share of the tiles.
+        const unsigned ctas = (unsigned) std::min<int64_t>(tiles_n * tiles_m, sm_count());
+        kernel<<<ctas, 32 * C::WARPS, SMEM, st>>>(p, maps, stagger);
+    } else {
+        kernel<<<dim3((unsigned) tiles_n, (unsigned) tiles_m), 32 * C::WARPS, SMEM, st>>>(p, maps, stagger);
+    }
     return true;
+}
+
+// The default pick (V_AUTO) of the persistent wide tile with bulk stores (#1133 r16, GB10,
+// Qwen3.8-27B at 4,096 to 16,384 tokens): the residual GEMMs with k of at least
+// GEMM8_PP_RES_MIN_K. The FFN down projection (17,408 -> 5,120) runs at 155-164 TFLOPS there
+// against 115-128 for the two 4-warp 128 x 128 CTAs (1.25-1.35x: the wide tile reads 1.33x
+// fewer L2 bytes per MMA, the residual's loads and the stores leave the mainloop); the output
+// projection (6,144 -> 5,120) is 0.93-0.96x of the 4-warp pair, which overlaps its shorter
+// mainloops with the other CTA's epilogue. Without the residual the persistent tile is no
+// faster than fp8_gemm8_tma (0.95-1.03x), which keeps those.
+constexpr int64_t GEMM8_PP_RES_MIN_K = 8192;
+template <bool RES> bool gemm8_pp_auto(const legion_fp8_mm8 & p) {
+    return RES && p.k >= GEMM8_PP_RES_MIN_K;
+}
+
+// The wide tile's kernel for p.variant (a8p): V_AUTO the persistent one where gemm8_pp_auto
+// picks it, else fp8_gemm8_tma (V_MAIN); V_STG, V_BULK and the probes for the bench.
+template <bool RES, class C>
+bool launch_gemm8_wide(const legion_fp8_mm8 & p, cudaStream_t st) {
+    switch (p.variant) {
+        case a8p::V_AUTO:
+            return (gemm8_pp_auto<RES>(p) && launch_gemm8_tma<RES, C, a8p::V_BULK>(p, st)) ||
+                   launch_gemm8_tma<RES, C>(p, st);
+        case a8p::V_BULK: return launch_gemm8_tma<RES, C, a8p::V_BULK>(p, st);
+        case a8p::V_STG: return launch_gemm8_tma<RES, C, a8p::V_STG>(p, st);
+        case a8p::V_STG | a8p::P_NO_STORE: return launch_gemm8_tma<RES, C, a8p::V_STG | a8p::P_NO_STORE>(p, st);
+        case a8p::V_STG | a8p::P_NO_REFILL: return launch_gemm8_tma<RES, C, a8p::V_STG | a8p::P_NO_REFILL>(p, st);
+        case a8p::V_STG | a8p::P_NO_REFILL | a8p::P_NO_STORE:
+            return launch_gemm8_tma<RES, C, a8p::V_STG | a8p::P_NO_REFILL | a8p::P_NO_STORE>(p, st);
+        case a8p::V_BULK | a8p::P_NO_STORE: return launch_gemm8_tma<RES, C, a8p::V_BULK | a8p::P_NO_STORE>(p, st);
+        case a8p::V_BULK | a8p::P_NO_REFILL: return launch_gemm8_tma<RES, C, a8p::V_BULK | a8p::P_NO_REFILL>(p, st);
+        case a8p::V_BULK | a8p::P_NO_REFILL | a8p::P_NO_STORE:
+            return launch_gemm8_tma<RES, C, a8p::V_BULK | a8p::P_NO_REFILL | a8p::P_NO_STORE>(p, st);
+        default: return launch_gemm8_tma<RES, C>(p, st);
+    }
 }
 
 // The large-batch GEMM: 256-row tiles (WM 4) where their rows divide m and they make at least
@@ -689,6 +752,8 @@ bool launch_gemm8_tma(const legion_fp8_mm8 & p, cudaStream_t st) {
 // stages, 48 KiB each, #1133 r11), whose epilogues overlap the other CTA's MMAs: on the GB10, the
 // output projection (6,144 -> 5,120) at 4,096 to 16,384 tokens 1.11-1.13x the wide tile's speed;
 // without the residual they are no faster than it (0.99-1.02x), so it keeps the wide tile.
+// With the residual and k of at least GEMM8_PP_RES_MIN_K (the FFN down projection) the wide
+// tile runs as the persistent fp8_gemm8_pp instead (#1133 r16, see gemm8_pp_auto).
 constexpr int64_t GEMM8_WIDE_WAVES = 8;
 template <bool RES>
 void launch_gemm8(const legion_fp8_mm8 & p, cudaStream_t st) {
@@ -696,11 +761,12 @@ void launch_gemm8(const legion_fp8_mm8 & p, cudaStream_t st) {
     if (p.m % 256 == 0 && wide_tiles >= GEMM8_WIDE_WAVES * sm_count()) {
         if (p.k % 128 == 0) {
             if constexpr (RES) {
-                if (launch_gemm8_tma<RES, a8::Cfg<2, 3, 64, true, 4>>(p, st)) {
+                const bool pair = p.variant == a8p::V_MAIN || (p.variant == a8p::V_AUTO && !gemm8_pp_auto<RES>(p));
+                if (pair && launch_gemm8_tma<RES, a8::Cfg<2, 3, 64, true, 4>>(p, st)) {
                     return;
                 }
             }
-            if (!launch_gemm8_tma<RES, a8::Cfg<4, 2, 128, true>>(p, st)) {
+            if (!launch_gemm8_wide<RES, a8::Cfg<4, 2, 128, true>>(p, st)) {
                 launch_gemm8_w<RES, a8::Cfg<4, 2, 128, true>>(p, st);
             }
         } else {
