@@ -95,6 +95,23 @@ fn gather_stops_at_the_cap() {
 }
 
 #[test]
+fn drain_takes_only_what_is_queued() {
+    let (tx, rx) = channel();
+    let mut held = Vec::new();
+    assert_eq!(drain(&rx, &mut held), (0, true));
+    tx.send(1).unwrap();
+    tx.send(2).unwrap();
+    let t = Instant::now();
+    assert_eq!(drain(&rx, &mut held), (2, true));
+    assert!(t.elapsed() < Duration::from_millis(100));
+    assert_eq!(held, vec![1, 2]);
+    tx.send(3).unwrap();
+    drop(tx);
+    assert_eq!(drain(&rx, &mut held), (1, false));
+    assert_eq!(held, vec![1, 2, 3]);
+}
+
+#[test]
 fn gather_reports_a_closed_channel() {
     let (tx, rx) = channel::<u32>();
     tx.send(7).unwrap();
