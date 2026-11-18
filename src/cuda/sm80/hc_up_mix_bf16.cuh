@@ -216,7 +216,10 @@ __global__ void __launch_bounds__(WARPS * 32) up_mix_bf16(const legion_hc_up_mix
 // A cost more than up_mix_bf16's staging; the launch keeps up_mix_bf16 there.
 // PRE: as up_mix_bf16's (lazy streams, #1183); the attention block's output rows are
 // prefetched with the streams.
-template <int KS, int CG, int TT, int MINB, int PD, bool RB, bool S16, bool PRE = false>
+// L1 (#1176 r43): lo's rows copied through L1 (cp.async.ca) instead of L2 only (cp.async.cg).
+// Every column block of a token run stages the same lo rows (e / 32 CTAs of them, lo most of a
+// CTA's bytes), so an SM's CTAs of one run can share them in its L1. The same bytes either way.
+template <int KS, int CG, int TT, int MINB, int PD, bool RB, bool S16, bool PRE = false, bool L1 = false>
 __global__ void __launch_bounds__(CG * HC * 32, MINB) up_mix_bf16_reg(const legion_hc_up_mix p, const int chunk) {
     static_assert(RB || !S16, "up_mix_bf16_reg: BF16 streams in the rebuilt form only");
     static_assert(!PRE || (RB && !S16), "up_mix_bf16_reg: lazy streams of F32 streams in the rebuilt form only");
@@ -255,8 +258,13 @@ __global__ void __launch_bounds__(CG * HC * 32, MINB) up_mix_bf16_reg(const legi
             const bool     ok  = tok < t_end;
             const char *   src = (const char *) p.lob + (int64_t) (ok ? tok : t_begin) * (KS * 32) + v * 16;
             const uint32_t dst = (uint32_t) __cvta_generic_to_shared(lb + (buf * TT + r) * LW + v * 4);
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src), "r"(ok ? 16 : 0)
-                         : "memory");
+            if constexpr (L1) {
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src), "r"(ok ? 16 : 0)
+                             : "memory");
+            } else {
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src), "r"(ok ? 16 : 0)
+                             : "memory");
+            }
         }
         asm volatile("cp.async.commit_group;" ::: "memory");
     };

@@ -71,6 +71,9 @@ struct legion_hc_up_mix {
     int32_t       skip_f32;
     // BF16 up only (#1183, `legion hc-up-mix-bench`): 0 the default kernel for the shape, 1
     // up_mix_bf16, 2 up_mix_bf16_reg at any token count (2 + 100 R: runs of R tiles a CTA).
+    // Plus 1000 (#1176 r43, LEGION_DEBUG_HC_UP_MIX_L1=0): up_mix_bf16_reg copies lo through L2
+    // only (cp.async.cg) instead of through L1 (compute capability 12.x; L2 only elsewhere);
+    // the same bits.
     int32_t       kernel;
     // BF16 up with F32 streams only (#1183, lazy streams, src/model/core/node_fuse/fold.rs):
     // null, or res holds the streams before the attention block's combine, which is made
@@ -179,9 +182,13 @@ template <bool RB, bool S16, bool PRE = false> bool launch_reg(const legion_hc_u
     constexpr int THREADS = REG_CG * HC * 32;
     constexpr int COLS    = REG_CG * ROWS;
     constexpr int SMEM = (2 * REG_TT * (REG_KS * 8 + PAD / 4) + HC * REG_TT * (COLS + 4)) * (int) sizeof(float);
-    const auto    kernel = up_mix_bf16_reg<REG_KS, REG_CG, REG_TT, REG_MINB, REG_PD, RB, S16, PRE>;
-    static std::atomic<int8_t> opt[GGML_CUDA_MAX_DEVICES];
-    if (!legion_device::smem_opt_in(opt, kernel, SMEM)) {
+    // lo's copies through L1 on compute capability 12.x (#1176 r43: measured on the GB10 only)
+    // unless p.kernel says L2 only (1000 and up).
+    const auto cg     = up_mix_bf16_reg<REG_KS, REG_CG, REG_TT, REG_MINB, REG_PD, RB, S16, PRE>;
+    const bool ca     = p.kernel < 1000 && legion_device::sm12x_device(cg);
+    const auto kernel = ca ? up_mix_bf16_reg<REG_KS, REG_CG, REG_TT, REG_MINB, REG_PD, RB, S16, PRE, true> : cg;
+    static std::atomic<int8_t> opt[2][GGML_CUDA_MAX_DEVICES];
+    if (!legion_device::smem_opt_in(opt[ca], kernel, SMEM)) {
         return false;
     }
     const int  chunk = run * REG_TT;
@@ -197,18 +204,18 @@ std::atomic<int> last_kernel{ 0 };
 // kernel 2 takes it; false when up_mix_bf16 should run. Kernel 2 + 100 R: runs of R tiles
 // (`legion hc-up-mix-bench`).
 bool launch_bf16_reg(const legion_hc_up_mix & p, cudaStream_t s) {
-    if (p.kernel == 1 || p.rank != REG_KS * 16 || p.e % (REG_CG * ROWS) != 0 ||
-        (p.kernel == 0 && p.n < REG_MIN_N)) {
+    const int k = p.kernel % 1000;  // 1000 and up: the same kernel with L2-only copies of lo
+    if (k == 1 || p.rank != REG_KS * 16 || p.e % (REG_CG * ROWS) != 0 || (k == 0 && p.n < REG_MIN_N)) {
         return false;
     }
     const bool rb = p.res != nullptr, s16 = rb && p.res_bf16 != 0;
-    const int  r  = p.kernel / 100 > 0 ? p.kernel / 100 : s16 ? REG_RUN_16 : REG_RUN;
+    const int  r  = k / 100 > 0 ? k / 100 : s16 ? REG_RUN_16 : REG_RUN;
     const bool ok = s16                    ? launch_reg<true, true>(p, s, r) :
                     p.pre_out != nullptr   ? launch_reg<true, false, true>(p, s, r) :
                     rb                     ? launch_reg<true, false>(p, s, r) :
                                              launch_reg<false, false>(p, s, r);
     if (ok) {
-        last_kernel.store(p.kernel % 100 == 2 ? p.kernel : 2, std::memory_order_relaxed);
+        last_kernel.store((k % 100 == 2 ? k : 2) + (p.kernel >= 1000 ? 1000 : 0), std::memory_order_relaxed);
     }
     return ok;
 }
