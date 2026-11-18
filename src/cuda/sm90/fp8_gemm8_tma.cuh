@@ -47,7 +47,8 @@ template <class C> __host__ __device__ constexpr size_t gemm8_tma_smem() {
 // loads of a whole wave then hit memory at once (on the GB10 that ran 0.94x the wide tile): so
 // the first wave starts staggered (a8t::Stagger) over about one tile's time, and each tile's
 // residual prefetch is spread over its last steps (gemm8_res_prefetch).
-template <bool RES, class C>
+// JG (#1133 r25): 0 gemm8_epilogue, else gemm8_epilogue_stream with JG token tiles at a time.
+template <bool RES, class C, int JG = 0>
 __global__ void __launch_bounds__(32 * C::WARPS, 8 / C::WARPS)
     fp8_gemm8_tma(const legion_fp8_mm8 p, const __grid_constant__ a8t::Maps maps, const a8t::Stagger stagger) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
@@ -146,7 +147,11 @@ __global__ void __launch_bounds__(32 * C::WARPS, 8 / C::WARPS)
             __syncwarp();
         }
     }
-    gemm8_epilogue<RES, C>(p, m0, n0, wm, wn, lane, acc);
+    if constexpr (JG == 0) {
+        gemm8_epilogue<RES, C>(p, m0, n0, wm, wn, lane, acc);
+    } else {
+        gemm8_epilogue_stream<RES, C, JG>(p, m0, n0, wm, wn, lane, acc);
+    }
 #else
     __trap();  // launch_gemm8_tma checks the image is sm_90+ first
 #endif

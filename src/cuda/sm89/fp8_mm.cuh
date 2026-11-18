@@ -166,6 +166,78 @@ __device__ __forceinline__ void gemm8_epilogue(const legion_fp8_mm8 & p, int64_t
     }
 }
 
+// gemm8_epilogue's outputs by token pairs (#1133 r25, fp8_gemm8_tma): JG n8 token tiles at a
+// time, their residuals (JG x 16 a thread) loaded with ld.global.cs just before their stores
+// (st.global.cs); gemm8_epilogue loads a whole row group's (NJ x 4) first and computes every
+// element's address and scales from scratch, which takes the 4-warp residual tile to 255
+// registers and a stack. The row scales are loaded once (8 a thread), the token scales per
+// token pair, and each token's outputs are one base pointer plus the row. The same products in
+// the same order (the sum times the scale, the scale the token's times the row's, then
+// __fadd_rn with the residual): the same bits.
+template <bool RES, class C, int JG, int NJ>
+__device__ __forceinline__ void gemm8_epilogue_stream(const legion_fp8_mm8 & p, int64_t m0, int64_t n0, int wm,
+                                                      int wn, int lane, const float (&acc)[4][NJ][4]) {
+    static_assert(NJ == a8::BN / 8 / C::WN, "n8 tiles per warp");
+    static_assert(JG >= 1 && NJ % JG == 0, "token tiles a group");
+    const float s = a8_static(p);
+    const bool uni = p.scale_stride == 0 && p.wscale_stride == 0;
+    const bool rowsc = !uni && p.wscale != nullptr;
+    // Rows of the tile from m0 that exist (a tile has at most 256 rows).
+    const int rows_left = (int) (p.m - m0 < (int64_t) C::TM ? p.m - m0 : (int64_t) C::TM);
+    const int rbase = wm * 64 + lane / 4;  // row of i 0, e 0 (from m0)
+    float wr[4][2];
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            const int row = rbase + i * 16 + h * 8;
+            wr[i][h] = rowsc && row < rows_left ? p.wscale[(m0 + row) * p.wscale_stride] : 0.0f;
+        }
+    const int64_t tbase = n0 + wn * NJ * 8 + (lane % 4) * 2;  // token of j 0, e 0
+#pragma unroll
+    for (int j0 = 0; j0 < NJ; j0 += JG) {
+        int64_t o[JG][2];  // the token's output at m0 (dst and res)
+        float sc[JG][2];
+        bool ok[JG][2];
+#pragma unroll
+        for (int jj = 0; jj < JG; jj++)
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const int64_t tok = tbase + (j0 + jj) * 8 + h;
+                ok[jj][h] = tok < p.n;
+                o[jj][h] = tok * p.m + m0;
+                sc[jj][h] = !uni && ok[jj][h] ? p.scale[tok * p.scale_stride] : s;
+            }
+        float rv[JG][4][4];
+        if constexpr (RES) {
+#pragma unroll
+            for (int jj = 0; jj < JG; jj++)
+#pragma unroll
+                for (int i = 0; i < 4; i++)
+#pragma unroll
+                    for (int e = 0; e < 4; e++) {
+                        const int row = rbase + i * 16 + (e / 2) * 8;
+                        rv[jj][i][e] =
+                            ok[jj][e % 2] && row < rows_left ? __ldcs(p.res + o[jj][e % 2] + row) : 0.0f;
+                    }
+        }
+#pragma unroll
+        for (int jj = 0; jj < JG; jj++)
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int row = rbase + i * 16 + (e / 2) * 8;
+                    if (ok[jj][e % 2] && row < rows_left) {
+                        // a8_scale: s0, else the token's scale times the row's (or the token's).
+                        const float f = uni ? s : rowsc ? sc[jj][e % 2] * wr[i][e / 2] : sc[jj][e % 2];
+                        const float v = acc[i][j0 + jj][e] * f;
+                        __stcs(p.dst + o[jj][e % 2] + row, RES ? __fadd_rn(v, rv[jj][i][e]) : v);
+                    }
+                }
+    }
+}
+
 // RES: p.res added to every output (the residual add fused into the epilogue).
 template <bool RES, class C>
 __global__ void __launch_bounds__(256) fp8_gemm8(const legion_fp8_mm8 p) {
