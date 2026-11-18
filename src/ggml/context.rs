@@ -1754,6 +1754,13 @@ impl ComputeAllocator {
         Self::over(buft, super::padded::Pad::Quarter)
     }
 
+    /// [`Self::padded`] for the bounded host tier's staged passes (#37): where the quarter
+    /// does not pad, [`super::PASS_PAD`] as far as 512 MiB stays free, room for the next
+    /// pass's slightly bigger graph.
+    pub fn pass(buft: BufferType) -> Self {
+        Self::over(buft, super::padded::Pad::Pass)
+    }
+
     /// [`Self::padded`] with a little headroom only (a sixty-fourth and 16 MiB): for graphs that
     /// each need a few KiB more than the one before (#363: an integrated GPU's prompt chunks,
     /// whose 1.5 GiB buffer was freed and allocated again for every second chunk).

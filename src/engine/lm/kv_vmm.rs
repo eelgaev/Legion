@@ -53,7 +53,9 @@ pub(super) fn apply(
 /// The lend of the pools' tails to the expert cache (`--kv-vmm-keep`, #814): blocks
 /// `keep..n_blocks` of every stage's pool have no memory behind them (the cache was sized
 /// with it) until a sequence needs one of them. Then [`Self::grow`] maps them all (the caller
-/// lends the expert cache first, which frees that VRAM), and once none of them is in use
+/// lends the expert cache first, which frees that VRAM; under the bounded host tier, #37, a
+/// long prompt's lend maps only the pieces its blocks need, and the VRAM left goes to its
+/// passes), and once none of them is in use
 /// again [`Self::shrink`] gives their memory back (the caller then restores the cache).
 /// The block allocator hands out blocks below `keep` first
 /// ([`crate::kv::BlockPool::with_fast`]), so the pool grows only when those run out.
@@ -84,6 +86,39 @@ pub(super) struct KvLend {
     /// Whether the GPUs can map host memory into the pools: then a grow with no VRAM left
     /// for a piece backs it with host memory instead of failing (#1216).
     host_ok: bool,
+    /// The bounded host tier (#37): a grow maps only the pieces the blocks asked for need,
+    /// and a later one maps more ([`Self::grow`]); `leave` is then what is mapped in VRAM.
+    /// Else every grow maps the whole tail, and `leave` is all of it.
+    partial: bool,
+    /// Blocks below this have memory behind them in every pool: `keep` while the tail is
+    /// lent, `n_blocks` once all of it is mapped (the block pool hands out none past it,
+    /// [`crate::kv::BlockPool::set_slow_limit`]).
+    pub(super) mapped: usize,
+    /// Per stage: its GPU's CUDA index, the bytes its whole tail takes, and those mapped in
+    /// VRAM now.
+    stages: Vec<(Option<usize>, usize, usize)>,
+}
+
+/// Blocks below which every cache tensor of `tails` has memory once each one's pieces that
+/// start below `blocks` blocks (`block` rows each) are mapped: per tensor, up to its first
+/// piece that starts at or past that, or all of its `n_blocks` blocks when none does. At
+/// least `blocks` (at most `n_blocks`); `n_blocks` with no tensors.
+pub(super) fn covered_blocks(
+    tails: &[Tail],
+    blocks: usize,
+    block: usize,
+    n_blocks: usize,
+) -> usize {
+    let blocks = blocks.min(n_blocks);
+    (tails.iter())
+        .filter(|t| t.row > 0 && block > 0)
+        .map(|t| {
+            let upto = blocks * block * t.row;
+            (t.pieces.iter().find(|p| p.0 >= upto)).map_or(n_blocks, |p| p.0 / (block * t.row))
+        })
+        .min()
+        .unwrap_or(n_blocks)
+        .clamp(blocks, n_blocks)
 }
 
 /// A cache tensor's lent pieces.
@@ -291,11 +326,15 @@ impl KvLend {
     /// would be (`keep` covers the pool, or the pools are not `--kv-vmm` ones).
     /// The host budget is [`default_host_budget`] (0 where the GPUs cannot map host memory
     /// into the pools).
+    ///
+    /// `partial` (the bounded host tier, #37): a sequence past `keep` maps only the pieces
+    /// the blocks it needs are in ([`Self::grow`]).
     pub(super) fn at_load(
         exec: &Executor,
         layout: &layout::Layout,
         keep: usize,
         n_blocks: usize,
+        partial: bool,
     ) -> Result<Option<(Self, Vec<usize>)>, LoadError> {
         if keep >= n_blocks {
             return Ok(None);
@@ -309,6 +348,9 @@ impl KvLend {
             host_budget: 0,
             host_held: 0,
             host_ok: false,
+            partial,
+            mapped: n_blocks,
+            stages: Vec::new(),
         };
         let (bytes, tails) = lend
             .unmap(exec, None)
@@ -328,24 +370,62 @@ impl KvLend {
                  tokens are evicted when the tail goes back to the expert cache"
             );
         }
-        lend.leave = layout
-            .stages
-            .iter()
-            .zip(&bytes)
-            .filter_map(|((d, _), &b)| Some((d.and_then(cuda_index)?, b as u64)))
-            .filter(|&(_, b)| b > 0)
+        lend.stages = (layout.stages.iter().zip(&bytes))
+            .map(|((d, _), &b)| (d.and_then(cuda_index), b, 0))
             .collect();
-        tracing::info!(
-            pool_tokens = n_blocks * KV_BLOCK,
-            vram_tokens = keep * KV_BLOCK,
-            lent_mib = ?bytes.iter().map(|b| b >> 20).collect::<Vec<_>>(),
-            host_mib = lend.host_budget >> 20,
-            "KV cache: each GPU's pool keeps its first vram_tokens in VRAM; the rest (lent_mib \
-             a GPU) serves the expert cache until a sequence needs it; when it goes back, the \
-             chats cached on it move to host memory (up to host_mib in all) and come back to \
-             VRAM when resumed"
-        );
+        lend.leave = lend.leave_now();
+        if partial {
+            tracing::info!(
+                pool_tokens = n_blocks * KV_BLOCK,
+                vram_tokens = keep * KV_BLOCK,
+                lent_mib = ?bytes.iter().map(|b| b >> 20).collect::<Vec<_>>(),
+                host_mib = lend.host_budget >> 20,
+                "KV cache: each GPU's pool keeps its first vram_tokens in VRAM; the rest (lent_mib \
+                 a GPU) serves the expert cache, and the sequences past vram_tokens take back \
+                 only the 4 MiB pieces of it they need (the expert cache keeps the rest); when \
+                 it goes back, the chats cached on it move to host memory (up to host_mib in \
+                 all) and come back to VRAM when resumed"
+            );
+        } else {
+            tracing::info!(
+                pool_tokens = n_blocks * KV_BLOCK,
+                vram_tokens = keep * KV_BLOCK,
+                lent_mib = ?bytes.iter().map(|b| b >> 20).collect::<Vec<_>>(),
+                host_mib = lend.host_budget >> 20,
+                "KV cache: each GPU's pool keeps its first vram_tokens in VRAM; the rest (lent_mib \
+                 a GPU) serves the expert cache until a sequence needs it; when it goes back, the \
+                 chats cached on it move to host memory (up to host_mib in all) and come back to \
+                 VRAM when resumed"
+            );
+        }
         Ok(Some((lend, bytes)))
+    }
+
+    /// What a restore of the expert cache leaves without VRAM for the tail while it is
+    /// mapped: per stage's CUDA GPU, all of its tail, or (`partial`) what is mapped in VRAM.
+    fn leave_now(&self) -> Vec<(usize, u64)> {
+        (self.stages.iter())
+            .filter_map(|&(cuda, all, vram)| {
+                Some((cuda?, if self.partial { vram } else { all } as u64))
+            })
+            .filter(|&(_, b)| b > 0)
+            .collect()
+    }
+
+    /// Whether every block of the pools has memory behind it (no grow maps more).
+    pub(super) fn full(&self) -> bool {
+        self.grown && self.mapped >= self.n_blocks
+    }
+
+    /// The tail's VRAM bytes not mapped now while part of it is (`partial`): what the VRAM a
+    /// lend leaves free has more than with all of it mapped. 0 while none of it is mapped.
+    pub(super) fn unmapped_vram(&self) -> usize {
+        if !self.partial || !self.grown {
+            return 0;
+        }
+        (self.stages.iter())
+            .map(|&(_, all, vram)| all.saturating_sub(vram))
+            .sum()
     }
 
     /// The host copy a shrink would keep for blocks `held` (ascending, all past `keep`).
@@ -360,8 +440,13 @@ impl KvLend {
         exec: &Executor,
         host: Option<&HostPlan>,
     ) -> Result<(Vec<usize>, Vec<Tail>), String> {
-        // Even if a piece fails: the next grow maps whatever is unmapped.
+        // Even if a piece fails: the next grow maps whatever is unmapped, and the block pool
+        // hands out nothing past `keep` until then.
         self.grown = false;
+        self.mapped = self.keep;
+        for s in &mut self.stages {
+            s.2 = 0;
+        }
         let mut tails = Vec::new();
         let mut k = 0;
         let mut bytes = Vec::new();
@@ -381,6 +466,7 @@ impl KvLend {
             bytes.push(sum);
         }
         self.grown = false;
+        self.leave = self.leave_now();
         Ok((bytes, tails))
     }
 
@@ -392,21 +478,47 @@ impl KvLend {
     /// may have been built over the blocks without memory yet. `reserve`: VRAM a piece must
     /// leave free to be mapped there rather than in host memory (a lent cache's long prompt
     /// step buffers); 0 maps as before wherever VRAM is not out.
+    ///
+    /// `blocks` (`partial`, #37): only the pieces that start below block `blocks` are mapped
+    /// (those mapped before stay); [`Self::mapped`] is then the first block some tensor has
+    /// no memory for. Called again with more, it maps more. Without `partial`, all of them.
     pub(super) fn grow(
         &mut self,
         exec: &Executor,
         reserve: usize,
+        blocks: usize,
     ) -> Result<(usize, usize, usize), String> {
+        let blocks = if self.partial {
+            blocks.clamp(self.keep, self.n_blocks)
+        } else {
+            self.n_blocks
+        };
         let (mut bytes, mut restored, mut host) = (0, 0, 0);
         let fallback = self.host_ok.then_some(reserve);
-        for t in exec.kv_block_tensors().into_iter().flatten() {
-            let (b, r, h) = remap(t, fallback)?;
-            bytes += b;
-            restored += r;
-            host += h;
+        for (s, tensors) in exec.kv_block_tensors().into_iter().enumerate() {
+            for t in tensors {
+                let upto = if blocks >= self.n_blocks {
+                    usize::MAX
+                } else {
+                    blocks * KV_BLOCK * t.nb()[1]
+                };
+                let (b, r, h) = remap(t, fallback, upto)?;
+                bytes += b;
+                restored += r;
+                host += h;
+                if let Some(st) = self.stages.get_mut(s) {
+                    st.2 += b;
+                }
+            }
         }
+        self.mapped = if blocks >= self.n_blocks {
+            self.n_blocks
+        } else {
+            covered_blocks(&self.tails, blocks, KV_BLOCK, self.n_blocks)
+        };
         self.grown = true;
         self.host_held = 0;
+        self.leave = self.leave_now();
         Ok((bytes, restored, host))
     }
 
@@ -451,13 +563,18 @@ fn unmap(
 fn remap(
     t: crate::ggml::Tensor<'_>,
     host_below: Option<usize>,
+    upto: usize,
 ) -> Result<(usize, usize, usize), String> {
-    let r = crate::residency::cuda::kv_vmm_remap(t, host_below)?;
+    let r = crate::residency::cuda::kv_vmm_remap(t, host_below, upto)?;
     Ok((r.vram, r.restored, r.host))
 }
 
 #[cfg(not(feature = "cuda"))]
-fn remap(_: crate::ggml::Tensor<'_>, _: Option<usize>) -> Result<(usize, usize, usize), String> {
+fn remap(
+    _: crate::ggml::Tensor<'_>,
+    _: Option<usize>,
+    _: usize,
+) -> Result<(usize, usize, usize), String> {
     Ok((0, 0, 0))
 }
 

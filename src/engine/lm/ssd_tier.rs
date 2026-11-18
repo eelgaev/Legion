@@ -203,6 +203,92 @@ pub fn host_tier_pass_cap(free: usize, bytes: usize, tokens: usize, block: usize
     (fits / block.max(1) * block.max(1)).max(HOST_TIER_MIN_PASS)
 }
 
+/// The bounded host tier's pass step on one GPU (#37): a prompt step of `tokens` tokens after
+/// `past` took `bytes` when measured at load (the cache not lent), and `lent` bytes measured
+/// as lent, for the first lone prompt longer than `tokens` ([`crate::model::core::Executor::measure_lent_prompt_step`]: the passes'
+/// real buffers, ~7.5% more on Qwen3.8-Flash-Next).
+#[derive(Clone, Copy)]
+pub struct TierStep {
+    pub device: Option<crate::ggml::Device>,
+    pub bytes: usize,
+    pub tokens: usize,
+    pub past: usize,
+    pub lent: Option<usize>,
+}
+
+/// The token caps of a lend's staged passes ([`host_tier_passes`]; all 0: no cap).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TierPasses {
+    /// What the load's step and a margin leave of the VRAM with the KV tail mapped in full:
+    /// the passes' count, and with it their split and the output, as before the tail was
+    /// mapped in parts.
+    pub planned: usize,
+    /// What the lent step and a pass's pad fit in the VRAM left now (`planned` before the lent
+    /// step was measured).
+    pub fit: usize,
+}
+
+impl TierPasses {
+    /// The cap of the next pass of a prompt with `left` tokens to read: `planned`, or `fit`
+    /// where it is smaller and the prompt still takes as many passes. The same count is the
+    /// same split ([`super::even::even_take`]: each pass a whole block over an equal share,
+    /// which `fit`, in whole blocks, holds), so the output never changes. Where `fit` would
+    /// take a pass more, `planned`: a pass's buffer may then spill into host memory, as before.
+    /// `fit_only` (`LEGION_DEBUG_TIER_FIT_ONLY=1`): `fit` whatever the count.
+    pub fn take(self, left: usize, fit_only: bool) -> usize {
+        if fit_only {
+            return self.fit;
+        }
+        if self.fit < self.planned && self.same_count(left) {
+            self.fit
+        } else {
+            self.planned
+        }
+    }
+
+    /// Whether `left` tokens take as many passes of `fit` as of `planned` tokens.
+    pub fn same_count(self, left: usize) -> bool {
+        left.div_ceil(self.fit.max(1)) == left.div_ceil(self.planned.max(1))
+    }
+}
+
+/// The bounded host tier's pass caps for `free` bytes of VRAM a lend left beside its scratch
+/// (`LENT_SCRATCH`; [`TierStep`]: the steps measured; `block`: the KV block). `planned` keeps
+/// `margin` more free and the `unmapped` bytes a KV tail mapped in full would take; `fit`
+/// keeps a pass's pad ([`crate::ggml::PASS_PAD`]).
+pub fn host_tier_passes(
+    free: usize,
+    margin: usize,
+    unmapped: usize,
+    step: &TierStep,
+    block: usize,
+) -> TierPasses {
+    let planned = host_tier_pass_cap(
+        free.saturating_sub(margin + unmapped),
+        step.bytes,
+        step.tokens,
+        block,
+    );
+    let fit = match step.lent {
+        Some(lent) if lent > 0 && planned > 0 => host_tier_pass_cap(
+            free.saturating_sub(crate::ggml::PASS_PAD),
+            lent,
+            step.tokens,
+            block,
+        ),
+        _ => planned,
+    };
+    TierPasses { planned, fit }
+}
+
+/// `LEGION_DEBUG_TIER_FIT_ONLY=1` (#37, for A/B runs): a lend's staged passes take
+/// [`TierPasses::fit`] even where that is a different pass count than [`TierPasses::planned`]
+/// (the output then changes).
+pub fn tier_fit_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_TIER_FIT_ONLY").is_some_and(|v| v == "1"))
+}
+
 /// The bounded host tier of a load: its layers' expert tensors and its memory.
 pub struct HostTierPlan {
     pub srcs: Vec<[crate::gguf::TensorInfo; 3]>,

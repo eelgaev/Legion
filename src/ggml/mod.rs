@@ -41,6 +41,7 @@ pub(crate) use external::{make_external, op_of, retarget, set_external_param};
 pub(crate) use graph_uid::leafs as graph_leafs;
 pub use ops_gemma4::ROPE_NEOX;
 pub use ops_vision::{ROPE_VISION, SCALE_ALIGN_CORNERS, SCALE_BILINEAR};
+pub use padded::PASS_PAD;
 pub use rows_at::RowsAt;
 
 #[allow(

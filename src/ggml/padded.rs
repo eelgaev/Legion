@@ -37,6 +37,32 @@ pub(super) enum Pad {
     /// A sixty-fourth and 16 MiB ([`light`]): steps whose graphs grow by a few KiB per new KV
     /// length (#363: an integrated GPU's prompt chunks, ~0.04 MiB per shape).
     Light,
+    /// [`Pad::Quarter`] where it pads; else [`PASS_PAD`] as far as [`PASS_KEEPS_FREE`] stays
+    /// free ([`pass`]): the bounded host tier's staged passes (#37), sized to the VRAM a lend
+    /// left (less than [`PAD_KEEPS_FREE`] beside them), whose next pass's graph needs up to
+    /// ~1 MiB more than the one before.
+    Pass,
+}
+
+/// What [`Pad::Pass`] adds where the quarter does not pad: a pass's graph needs ~0.1-1 MiB
+/// more than the pass before (a longer past); reallocating its 4 GiB buffer for that took
+/// 80-166 ms and could not leave [`PASS_KEEPS_FREE`] (#37: the buffer spilled into host memory).
+pub const PASS_PAD: usize = 16 << 20;
+
+/// Device memory [`Pad::Pass`]'s pad leaves free: what a lent cache's step buffers must leave
+/// (`LENT_SCRATCH`).
+const PASS_KEEPS_FREE: usize = 512 << 20;
+
+/// Bytes to allocate for a staged pass's buffer of `size` with `free` bytes free: [`padded`]
+/// where that pads, else `size` and up to [`PASS_PAD`] more, as far as [`PASS_KEEPS_FREE`]
+/// stays free.
+fn pass(size: usize, free: usize) -> usize {
+    let quarter = padded(size, free);
+    if quarter > size {
+        return quarter;
+    }
+    let room = free.saturating_sub(size).saturating_sub(PASS_KEEPS_FREE);
+    size + PASS_PAD.min(room)
 }
 
 /// Bytes to allocate for a request of `size` with `free` bytes free on the device: a quarter of
@@ -104,6 +130,7 @@ unsafe extern "C" fn alloc_buffer(
         let size = match pad_of(buft) {
             Pad::Quarter => padded(size, free_on(inner)),
             Pad::Light => light(size, free_on(inner)),
+            Pad::Pass => pass(size, free_on(inner)),
         };
         ffi::ggml_backend_buft_alloc_buffer(inner, size)
     }

@@ -25,9 +25,12 @@ pub struct BlockPool {
     block_size: u32,
     ref_counts: Vec<u32>,
     free: Vec<BlockId>,
-    /// Free blocks from `fast` on.
+    /// Free blocks from `fast` on, below `slow_limit` (the ones that can be handed out).
     free_slow: Vec<BlockId>,
     fast: u32,
+    /// Blocks from here on are not handed out ([`Self::set_slow_limit`]): the pool's size by
+    /// default. The free ones among them still count in [`Self::free_blocks`].
+    slow_limit: u32,
     /// Blocks per slot of a slotted pool ([`Self::slotted`]); 0 otherwise.
     slot_blocks: u32,
     /// A slotted pool's free blocks (it keeps no free lists).
@@ -53,6 +56,7 @@ impl BlockPool {
             free: (0..fast).rev().map(BlockId).collect(),
             free_slow: (fast..num_blocks).rev().map(BlockId).collect(),
             fast,
+            slow_limit: num_blocks,
             slot_blocks: 0,
             slotted_free: 0,
             slotted_cap: 0,
@@ -68,6 +72,7 @@ impl BlockPool {
         let num_blocks = slots * slot_blocks;
         let mut pool = Self::with_fast(0, block_size, 0);
         pool.ref_counts = vec![0; num_blocks as usize];
+        pool.slow_limit = num_blocks;
         pool.slot_blocks = slot_blocks;
         pool.slotted_free = num_blocks;
         pool.slotted_cap = num_blocks;
@@ -98,7 +103,8 @@ impl BlockPool {
             return 0;
         }
         let slow = (self.ref_counts.len() as u32).saturating_sub(self.fast);
-        slow - self.free_slow.len() as u32
+        // The free ones past the limit are not in `free_slow` (#37).
+        slow - self.free_slow.len() as u32 - self.free_past_limit()
     }
 
     /// The allocated blocks from `fast` on, ascending (none for a slotted pool).
@@ -122,7 +128,79 @@ impl BlockPool {
                 .slotted_free
                 .min(self.slotted_cap.saturating_sub(in_use));
         }
+        (self.free.len() + self.free_slow.len()) as u32 + self.free_past_limit()
+    }
+
+    /// Free blocks that can be handed out now: [`Self::free_blocks`] but those past the slow
+    /// limit ([`Self::set_slow_limit`]).
+    pub fn allocatable(&self) -> u32 {
+        if self.slot_blocks > 0 {
+            return self.free_blocks();
+        }
         (self.free.len() + self.free_slow.len()) as u32
+    }
+
+    /// The free blocks from the slow limit on.
+    fn free_past_limit(&self) -> u32 {
+        let from = self.slow_limit.max(self.fast) as usize;
+        (self.ref_counts.get(from..).unwrap_or_default().iter())
+            .filter(|&&c| c == 0)
+            .count() as u32
+    }
+
+    /// The slow limit: blocks from `limit` on (at least `fast`, at most the pool's size) are
+    /// not handed out, though the free ones still count as free (#37: a KV pool's tail mapped
+    /// only as far as its sequences need, `limit` the first block without memory). Raised, the
+    /// free blocks it adds are handed out after every free block below the old limit, lowest
+    /// first, as a pool that never had a limit would; lowered, the free ones past it are taken
+    /// off the free list (blocks in use stay in use).
+    pub fn set_slow_limit(&mut self, limit: u32) {
+        if self.slot_blocks > 0 {
+            return;
+        }
+        let n = self.ref_counts.len() as u32;
+        let limit = limit.clamp(self.fast, n);
+        let old = self.slow_limit.clamp(self.fast, n);
+        if limit > old {
+            let added: Vec<BlockId> = (old..limit)
+                .rev()
+                .filter(|&b| self.ref_counts[b as usize] == 0)
+                .map(BlockId)
+                .collect();
+            self.free_slow.splice(0..0, added);
+        } else if limit < old {
+            self.free_slow.retain(|b| b.0 < limit);
+        }
+        self.slow_limit = limit;
+    }
+
+    /// The slow limit ([`Self::set_slow_limit`]).
+    pub fn slow_limit(&self) -> u32 {
+        self.slow_limit
+    }
+
+    /// The lowest slow limit at which [`Self::allocatable`] is at least `need` (the free
+    /// blocks past the current limit counted lowest first); the current limit when it already
+    /// is, the pool's size when even all of them are too few (or the pool is slotted).
+    pub fn limit_for(&self, need: u32) -> u32 {
+        let n = self.ref_counts.len() as u32;
+        if self.slot_blocks > 0 {
+            return n;
+        }
+        let have = self.allocatable();
+        if have >= need {
+            return self.slow_limit;
+        }
+        let mut more = need - have;
+        for b in self.slow_limit.max(self.fast)..n {
+            if self.ref_counts[b as usize] == 0 {
+                more -= 1;
+                if more == 0 {
+                    return b + 1;
+                }
+            }
+        }
+        n
     }
 
     /// Allocate one block with a reference count of one.
@@ -163,7 +241,7 @@ impl BlockPool {
                 self.slotted_free += 1;
             } else if b.0 < self.fast {
                 self.free.push(b);
-            } else {
+            } else if b.0 < self.slow_limit {
                 self.free_slow.push(b);
             }
             true
@@ -218,7 +296,7 @@ impl BlockTable {
     pub fn append(&mut self, pool: &mut BlockPool, n: u32) -> Result<(), OutOfBlocks> {
         let num_tokens = self.num_tokens.checked_add(n).ok_or(OutOfBlocks)?;
         let needed = num_tokens.div_ceil(pool.block_size()) as usize - self.blocks.len();
-        if needed > pool.free_blocks() as usize {
+        if needed > pool.allocatable() as usize {
             return Err(OutOfBlocks);
         }
         for _ in 0..needed {

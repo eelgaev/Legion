@@ -361,6 +361,64 @@ fn fast_blocks_go_first_and_come_back_to_their_list() {
     assert_eq!(plain.allocate(), Some(BlockId(0)));
 }
 
+/// #37: a KV pool's tail mapped only as far as its sequences need. The blocks past the limit
+/// count as free but are never handed out; raising the limit hands them out in the order a
+/// pool without one would.
+#[test]
+fn slow_limit_hands_out_blocks_below_it_only() {
+    let mut pool = BlockPool::with_fast(8, 16, 2);
+    pool.set_slow_limit(2);
+    assert_eq!((pool.free_blocks(), pool.allocatable()), (8, 2));
+    // Free blocks past the limit are not in use.
+    assert_eq!(pool.slow_in_use(), 0);
+    let mut t = BlockTable::new();
+    assert_eq!(t.append(&mut pool, 3 * 16), Err(OutOfBlocks));
+    assert_eq!(pool.allocatable(), 2);
+    pool.set_slow_limit(5);
+    assert_eq!((pool.free_blocks(), pool.allocatable()), (8, 5));
+    t.append(&mut pool, 4 * 16).unwrap();
+    let ids: Vec<u32> = t.blocks().iter().map(|b| b.0).collect();
+    assert_eq!(ids, [0, 1, 2, 3]);
+    // A slow block freed below the limit is handed out first, as without a limit.
+    assert!(pool.decref(BlockId(3)));
+    pool.set_slow_limit(8);
+    let next: Vec<u32> = (0..4).map(|_| pool.allocate().unwrap().0).collect();
+    assert_eq!(next, [3, 4, 5, 6]);
+    let mut plain = BlockPool::with_fast(8, 16, 2);
+    let all: Vec<u32> = (0..7).map(|_| plain.allocate().unwrap().0).collect();
+    assert_eq!(all, [0, 1, 2, 3, 4, 5, 6]);
+    // Lowered: the free ones past it leave the free list, the ones in use stay in use.
+    assert!(pool.decref(BlockId(5)));
+    pool.set_slow_limit(4);
+    assert_eq!((pool.free_blocks(), pool.allocatable()), (2, 0));
+    assert_eq!(pool.slow_in_use(), 4);
+    assert!(pool.decref(BlockId(6)));
+    assert!(pool.allocate().is_none());
+    assert_eq!(pool.free_blocks(), 3);
+    pool.set_slow_limit(8);
+    let back: Vec<u32> = (0..3).map(|_| pool.allocate().unwrap().0).collect();
+    assert_eq!(back, [5, 6, 7]);
+    // The limit that makes enough of them allocatable: free ones past it counted lowest first.
+    let mut p = BlockPool::with_fast(10, 16, 2);
+    p.set_slow_limit(4);
+    let held: Vec<BlockId> = (0..4).map(|_| p.allocate().unwrap()).collect();
+    assert_eq!(p.limit_for(0), 4);
+    assert_eq!(p.limit_for(1), 5);
+    assert_eq!(p.limit_for(3), 7);
+    assert_eq!(p.limit_for(6), 10);
+    assert_eq!(p.limit_for(7), 10);
+    assert!(p.decref(held[1]));
+    assert_eq!(p.limit_for(1), 4);
+    assert_eq!(p.limit_for(2), 5);
+    assert_eq!(BlockPool::slotted(2, 2, 16).limit_for(1), 4);
+    // The limit never cuts the fast blocks; a slotted pool has none.
+    pool.set_slow_limit(0);
+    assert_eq!(pool.slow_limit(), 2);
+    let mut slotted = BlockPool::slotted(2, 2, 16);
+    slotted.set_slow_limit(1);
+    assert_eq!(slotted.allocatable(), 4);
+}
+
 #[test]
 fn slow_blocks_in_use_are_counted() {
     let mut pool = BlockPool::with_fast(6, 16, 3);

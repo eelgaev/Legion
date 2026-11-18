@@ -94,6 +94,44 @@ fn a_host_tier_pass_takes_the_tokens_the_free_vram_fits() {
     assert_eq!(host_tier_pass_cap(gib, 0, 8704, 64), 0);
 }
 
+/// #37 on an RTX 4090 at 64 GB: 3,114 MiB measured at load and 3,348 MiB lent for 8,704
+/// tokens; 192 MiB of the KV tail left unmapped for a 32K prompt.
+#[test]
+fn host_tier_passes_keep_the_planned_count_and_fit_the_lent_step() {
+    let mib = 1usize << 20;
+    let mut step = TierStep {
+        device: None,
+        bytes: 3114 * mib,
+        tokens: 8704,
+        past: 32256,
+        lent: None,
+    };
+    let margin = 64 * mib;
+    // Before the lent step is measured: as the tail mapped in full.
+    let p = host_tier_passes(4401 * mib, margin, 192 * mib, &step, 64);
+    assert_eq!((p.planned, p.fit), (11584, 11584));
+    assert_eq!(p.take(32746, false), 11584);
+    step.lent = Some(3348 * mib);
+    // The plain docs command: the lent step fits fewer, a 32K prompt still in three passes
+    // (the same split: 10,944 each).
+    let p = host_tier_passes(4401 * mib, margin, 192 * mib, &step, 64);
+    assert_eq!((p.planned, p.fit), (11584, 11392));
+    assert_eq!(p.take(32746, false), 11392);
+    assert_eq!(p.take(8227, false), 11392);
+    // At 32 GB with --spec suffix: three passes of 10,944 just fit.
+    let p = host_tier_passes(4247 * mib, margin, 192 * mib, &step, 64);
+    assert_eq!((p.planned, p.fit), (11136, 10944));
+    assert_eq!(p.take(32746, false), 10944);
+    // A prompt the fit would read in a pass more keeps the planned count.
+    assert!(!p.same_count(33000));
+    assert_eq!(p.take(33000, false), 11136);
+    assert_eq!(p.take(33000, true), 10944);
+    // Nothing measured at load: no cap.
+    step.bytes = 0;
+    let p = host_tier_passes(4401 * mib, margin, 0, &step, 64);
+    assert_eq!(p, TierPasses::default());
+}
+
 #[test]
 fn the_host_tier_is_off_on_power9_and_arm_hosts() {
     let gpu = Some(DeviceKind::Gpu);

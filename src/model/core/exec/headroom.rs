@@ -18,10 +18,18 @@ pub(super) fn roomy(kind: DeviceKind, decode: bool) -> bool {
     !decode && kind == DeviceKind::IntegratedGpu
 }
 
-/// A new compute allocator for a step graph in `buft`: padded while the expert cache is `lent`,
-/// with headroom when `roomy`, else exact.
-pub(super) fn step_allocator(buft: BufferType, lent: bool, roomy: bool) -> ComputeAllocator {
-    if lent {
+/// A new compute allocator for a step graph in `buft`: padded while the expert cache is `lent`
+/// (as a staged pass, [`ComputeAllocator::pass`], under the bounded host tier: `pass`), with
+/// headroom when `roomy`, else exact.
+pub(super) fn step_allocator(
+    buft: BufferType,
+    lent: bool,
+    roomy: bool,
+    pass: bool,
+) -> ComputeAllocator {
+    if lent && pass {
+        ComputeAllocator::pass(buft)
+    } else if lent {
         ComputeAllocator::padded(buft)
     } else if roomy {
         ComputeAllocator::headroom(buft)

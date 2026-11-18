@@ -554,6 +554,12 @@ pub struct Executor {
     /// Mixed graphs each stage keeps: [`MIXED_KEPT`], or [`LENT_MIXED_KEPT`] while a long
     /// prompt borrows the expert cache.
     mixed_kept: usize,
+    /// The bounded host tier (#37): lent steps' buffers pad as staged passes
+    /// ([`ComputeAllocator::pass`]; [`Self::set_tier_passes`]).
+    tier_passes: bool,
+    /// New step buffers are exact even while the cache is lent: a measurement of a lent step
+    /// ([`Self::measure_lent_prompt_step`]).
+    exact_steps: bool,
     /// Kept mixed graphs set aside while another is built, which count against
     /// [`Self::mixed_kept`] all the same ([`prompt_ahead`]).
     mixed_aside: usize,
@@ -879,6 +885,8 @@ impl Executor {
             kv_tiers: Vec::new(),
             kv_bufts: Vec::new(),
             mixed_kept: MIXED_KEPT,
+            tier_passes: false,
+            exact_steps: false,
             mixed_aside: 0,
             prompt_next: None,
             hidden_from: 0,
@@ -1285,6 +1293,27 @@ impl Executor {
         n_past: usize,
     ) -> Result<Vec<usize>, ModelError> {
         self.measure_step(1, tokens, n_past, false)
+    }
+
+    /// [`Self::measure_prompt_step`] while the expert cache is lent, in exact buffers (#37: a
+    /// lent step's graph stages its experts and takes ~7.5% more than an unlent one; the
+    /// bounded host tier sizes its passes to it).
+    pub fn measure_lent_prompt_step(
+        &mut self,
+        tokens: usize,
+        n_past: usize,
+    ) -> Result<Vec<usize>, ModelError> {
+        self.exact_steps = true;
+        let out = self.measure_prompt_step(tokens, n_past);
+        self.exact_steps = false;
+        out
+    }
+
+    /// The bounded host tier (#37): a lent step's new buffer pads as a staged pass
+    /// ([`ComputeAllocator::pass`]): where a quarter does not fit, 16 MiB as far as 512 MiB
+    /// stays free, for the next pass's graph a little bigger than the one before.
+    pub fn set_tier_passes(&mut self, on: bool) {
+        self.tier_passes = on;
     }
 
     /// Allocates now, on each stage that keeps its prompt graphs' buffers with headroom (an
@@ -3780,6 +3809,9 @@ impl Executor {
         }
         let captured = self.captured(s);
         let lent = self.mixed_kept == LENT_MIXED_KEPT;
+        // New buffers: padded while lent (as staged passes under the bounded host tier),
+        // exact for a measurement.
+        let (padded, passes) = (lent && !self.exact_steps, self.tier_passes);
         let verify_budget = self.verify_budget.get(s).copied().unwrap_or(0);
         let stage = &mut self.stages[s];
         // A meta backend (tensor parallelism) re-initializes a kept graph whenever another ran
@@ -3902,7 +3934,7 @@ impl Executor {
                         Some(a)
                     })
                     // Long prompts' graphs grow a little with every chunk: headroom.
-                    .unwrap_or_else(|| headroom::step_allocator(buft, lent, roomy)),
+                    .unwrap_or_else(|| headroom::step_allocator(buft, padded, roomy, passes)),
             ),
         };
         let mut allocator = allocator;
@@ -3958,7 +3990,7 @@ impl Executor {
                                 "out of memory for a step's compute buffer: waited for the \
                                  restore to free the prompt's graphs, allocating again"
                             );
-                            allocator = Some(headroom::step_allocator(buft, lent, roomy));
+                            allocator = Some(headroom::step_allocator(buft, padded, roomy, passes));
                             continue;
                         }
                         Err(GgmlError::Alloc { bytes, .. }) => {
@@ -4005,7 +4037,8 @@ impl Executor {
                                 stage.decode.clear();
                                 stage.mixed.clear();
                                 retry = false;
-                                allocator = Some(headroom::step_allocator(buft, lent, roomy));
+                                allocator =
+                                    Some(headroom::step_allocator(buft, padded, roomy, passes));
                                 continue;
                             }
                             if let Some(spill) = (!spilled).then(|| spill_type(stage)).flatten() {

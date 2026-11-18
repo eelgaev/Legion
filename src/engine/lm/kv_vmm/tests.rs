@@ -16,6 +16,24 @@ fn tails() -> Vec<Tail> {
     vec![lent(1024, 4), lent(2048, 8)]
 }
 
+/// #37: a partial grow maps each tensor's pieces that start below the blocks asked for; the
+/// pool may then hand out blocks up to the first one some tensor has no memory for.
+#[test]
+fn a_partial_grow_covers_up_to_the_first_unmapped_piece() {
+    let t = tails();
+    // Nothing past the kept blocks asked: their first pieces start there.
+    assert_eq!(covered_blocks(&t, 8, KV_BLOCK, 72), 8);
+    // Block 10: the first tensor maps its piece of blocks 8..24, the second 8..16.
+    assert_eq!(covered_blocks(&t, 10, KV_BLOCK, 72), 16);
+    assert_eq!(covered_blocks(&t, 16, KV_BLOCK, 72), 16);
+    assert_eq!(covered_blocks(&t, 30, KV_BLOCK, 72), 32);
+    // The first tensor is all mapped; the second up to its last piece.
+    assert_eq!(covered_blocks(&t, 60, KV_BLOCK, 72), 64);
+    assert_eq!(covered_blocks(&t, 70, KV_BLOCK, 72), 72);
+    assert_eq!(covered_blocks(&t, 100, KV_BLOCK, 72), 72);
+    assert_eq!(covered_blocks(&[], 10, KV_BLOCK, 72), 72);
+}
+
 #[test]
 fn only_the_pieces_holding_blocks_in_use_move() {
     let t = tails();

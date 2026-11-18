@@ -5278,7 +5278,7 @@ impl LmEngine {
                 if kv_vmm_all && plain {
                     let keep = crate::residency::kv_vmm::keep_blocks(tokens, KV_BLOCK, n_blocks);
                     if let Some((lend, bytes)) =
-                        kv_vmm::KvLend::at_load(&exec, &layout, keep, n_blocks)?
+                        kv_vmm::KvLend::at_load(&exec, &layout, keep, n_blocks, kv_tier)?
                     {
                         for (l, b) in long.iter_mut().zip(&bytes) {
                             *l += b;
@@ -5698,13 +5698,19 @@ impl LmEngine {
         // The bounded host tier (one GPU): the pass step measured at load, which caps a
         // lend's passes to the VRAM it left free.
         let tier_step = match (&measured_long[..], &layout.stages[..]) {
-            (&[bytes], [(device, _)]) if exec.model().host_tier().is_some() => Some((
-                *device,
-                bytes,
-                ssd_tier::HOST_TIER_PASS.min(cfg.ctx_size / 2),
-            )),
+            (&[bytes], [(device, _)]) if exec.model().host_tier().is_some() => {
+                let tokens = ssd_tier::HOST_TIER_PASS.min(cfg.ctx_size / 2);
+                Some(ssd_tier::TierStep {
+                    device: *device,
+                    bytes,
+                    tokens,
+                    past: cfg.ctx_size.saturating_sub(tokens),
+                    lent: None,
+                })
+            }
             _ => None,
         };
+        exec.set_tier_passes(tier_step.is_some());
         let worker = Worker {
             exec,
             tokenizer: tokenizer.clone(),
@@ -5723,7 +5729,12 @@ impl LmEngine {
                 let fast = kv_lend
                     .as_ref()
                     .map_or(hbm_blocks, |l| l.keep.min(hbm_blocks));
-                BlockPool::with_fast(n_blocks as u32, KV_BLOCK as u32, fast as u32)
+                let mut pool = BlockPool::with_fast(n_blocks as u32, KV_BLOCK as u32, fast as u32);
+                // None of them is handed out before it has memory (#37).
+                if let Some(l) = &kv_lend {
+                    pool.set_slow_limit(l.mapped as u32);
+                }
+                pool
             },
             kv_lend,
             // A prefix hit would need the sliding-window layers' ring at the cut point, or
@@ -5806,7 +5817,8 @@ impl LmEngine {
                 ..Default::default()
             },
             tier_step,
-            tier_cap: 0,
+            tier_cap: Default::default(),
+            tier_fresh: false,
             warming: warming.clone(),
             warming_seen: false,
             clock: Default::default(),
@@ -6224,12 +6236,15 @@ struct Worker {
     kv_tail_used: Instant,
     /// The run's chat lengths, for the next load's lend.
     kv_use: kv_vmm::TierUse,
-    /// The bounded host tier on one GPU: the device, and the bytes a prompt step of that many
-    /// tokens took when measured at load.
-    tier_step: Option<(Option<crate::ggml::Device>, usize, usize)>,
+    /// The bounded host tier on one GPU: the device, and the bytes a prompt step took when
+    /// measured at load and as lent (the first long lone prompt).
+    tier_step: Option<ssd_tier::TierStep>,
     /// The most tokens a staged pass of the current lend takes
-    /// ([`ssd_tier::host_tier_pass_cap`]; 0: no cap).
-    tier_cap: usize,
+    /// ([`ssd_tier::host_tier_passes`]; 0: no cap).
+    tier_cap: ssd_tier::TierPasses,
+    /// No staged pass of the current lend has been planned yet: mapping more of the KV tail
+    /// may size its passes again (later the split stays, and with it the output).
+    tier_fresh: bool,
     /// [`Engine::set_warming`], and what the expert cache was last told of it
     /// ([`Self::warming_changed`]).
     warming: Arc<AtomicBool>,
@@ -7087,7 +7102,9 @@ impl Worker {
             return Ok(());
         }
         let before = seq.table.blocks().len();
-        if let Some(l) = self.kv_lend.as_ref().filter(|l| !l.grown) {
+        // The bounded host tier (#37) maps the tail as far as the sequences need: one that
+        // needs more maps more.
+        if let Some(l) = self.kv_lend.as_ref().filter(|l| !l.full()) {
             // #1196: a resumed prefix with blocks the last shrink kept in host memory gets
             // them back in VRAM before this step reads them.
             let keep = l.keep as u32;
@@ -7229,27 +7246,31 @@ impl Worker {
     /// `resume` (#1196): a sequence resumes blocks past the kept ones that the last shrink
     /// kept in host memory: the tail is mapped whatever `need`, and those
     /// blocks are copied back into VRAM before a step reads them.
-    fn kv_make_room(&mut self, need: usize, resume: bool) -> Result<(), String> {
-        let short = |w: &Self| need > w.pool.free_fast_blocks() as usize;
+    ///
+    /// The bounded host tier (#37) maps only the pieces of the tail the `need` blocks are in
+    /// (the expert cache keeps the rest of its VRAM), and maps more when a sequence needs
+    /// more. Whether anything was mapped.
+    fn kv_make_room(&mut self, need: usize, resume: bool) -> Result<bool, String> {
+        let short = |w: &Self| need > w.pool.allocatable() as usize;
         if !resume {
             if need == 0 || !short(self) {
-                return Ok(());
+                return Ok(false);
             }
         }
         // The bounded host tier's lend (#37) evicts no cached chat for the tail's sake:
         // reading a chat again costs seconds, the mapped tail a few percent of decode.
-        let evicts = !self.kv_tier || self.kv_lend.as_ref().is_some_and(|l| l.grown);
+        let evicts = !self.kv_tier || self.kv_lend.as_ref().is_some_and(|l| l.full());
         if !resume && evicts {
             // Everything they hold is a kept block while the tail is lent, but blocks the
             // last shrink kept in host memory (#1196).
             let host_held = self.kv_lend.as_ref().is_some_and(|l| l.host_held > 0);
             if let Some(radix) = &mut self.radix {
-                let n = need - self.pool.free_fast_blocks() as usize;
+                let n = need - self.pool.allocatable() as usize;
                 radix.evict(&mut self.pool, n as u32);
                 // Evicting an entry on the host-held tail frees no kept block: go on, least
                 // recently used first, until enough kept blocks are free.
                 while host_held
-                    && need > self.pool.free_fast_blocks() as usize
+                    && need > self.pool.allocatable() as usize
                     && radix.evict(&mut self.pool, 1) > 0
                 {}
             }
@@ -7260,11 +7281,20 @@ impl Worker {
                 }
             }
             if !short(self) {
-                return Ok(());
+                return Ok(false);
             }
+        }
+        // The blocks to map below: as many free ones as `need` asks, and every one in use
+        // (a resumed prefix's blocks held in host memory go back to VRAM).
+        let mut blocks = self.pool.limit_for(need as u32) as usize;
+        if resume {
+            blocks = blocks.max(self.pool.slow_used().last().map_or(0, |&b| b as usize + 1));
         }
         let t = Instant::now();
         if !self.lent && self.can_lend {
+            // Lent for the mapping alone (most of a second): all of the tail at once, as the
+            // next sequence would lend it again for more. Only a long prompt's lend maps parts.
+            blocks = usize::MAX;
             self.lend_cache(0, usize::MAX);
             if self.lent {
                 self.lent_short = true;
@@ -7276,12 +7306,15 @@ impl Worker {
         let lend = self.kv_lend.as_mut().expect("a lent KV tail");
         let host_held = lend.host_held;
         let reserve = self.long_reserve;
-        let (bytes, restored, host) = match lend.grow(&self.exec, reserve) {
+        let grown = lend.grow(&self.exec, reserve, blocks);
+        let (mapped, unmapped) = (lend.mapped, lend.unmapped_vram());
+        self.pool.set_slow_limit(mapped as u32);
+        let (bytes, restored, host) = match grown {
             Ok(b) => b,
             Err(e) => {
                 // Blocks kept in host memory may have lost their bytes: nothing resumes them.
                 if host_held > 0 {
-                    let keep = lend.keep as u32;
+                    let keep = self.kv_lend.as_ref().map_or(0, |l| l.keep as u32);
                     self.kv_evict_tail(keep);
                 }
                 return Err(format!("--kv-vmm-keep: cannot map the KV pools' tail: {e}"));
@@ -7292,9 +7325,12 @@ impl Worker {
             mib = bytes >> 20,
             from_host_mib = restored >> 20,
             host_mib = host >> 20,
+            mapped_tokens = mapped * KV_BLOCK,
+            unmapped_mib = unmapped >> 20,
             cache_lent = self.lent,
             resume,
-            "KV pools' tail mapped for a sequence past the kept blocks (--kv-vmm-keep)"
+            "KV pools' tail mapped for a sequence past the kept blocks (--kv-vmm-keep); the \
+             pools hand out blocks up to mapped_tokens, the expert cache keeps unmapped_mib"
         );
         if host > 0 {
             tracing::warn!(
@@ -7303,7 +7339,7 @@ impl Worker {
                  (slower attention past the kept blocks) instead of failing the request"
             );
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Tells the expert cache when the startup warmup begins or is over
@@ -7453,8 +7489,12 @@ impl Worker {
             shrunk = if self.pool.slow_in_use() == 0 {
                 lend.shrink(&mut self.exec, None)
             } else {
-                lend.grow(&self.exec, 0).and(Err(e))
+                lend.grow(&self.exec, 0, usize::MAX).and(Err(e))
             };
+        }
+        // The pool hands out only blocks with memory behind them (#37).
+        if let Some(l) = &self.kv_lend {
+            self.pool.set_slow_limit(l.mapped as u32);
         }
         match shrunk {
             Ok(bytes) => {
@@ -7497,9 +7537,10 @@ impl Worker {
             Ok(true) => {
                 self.lent = true;
                 (self.long_cap, self.long_reserve) = self.long_micro_cap(end);
-                self.size_tier_pass();
                 self.exec.set_pipeline_micro(self.capped(self.long.micro));
                 self.exec.set_micro_taper(self.long.taper);
+                self.tier_fresh = true;
+                self.size_tier_pass();
                 tracing::info!(
                     ms = t.elapsed().as_secs_f64() * 1e3,
                     "expert cache lent to a long prompt"
@@ -7518,17 +7559,55 @@ impl Worker {
 
     /// The bounded host tier: a pass's step buffer stays in the VRAM the lend left free now
     /// (the host's memory is the experts'). Sized again once the KV tail is mapped out of it.
+    /// #37: as many passes as the tail mapped in full would leave room for (the split, and
+    /// with it the output, of before the tail was mapped in parts), checked against the lent
+    /// step's real buffer and a pass's pad ([`ssd_tier::host_tier_passes`]).
     fn size_tier_pass(&mut self) {
-        if let Some((Some(d), bytes, at)) = self.tier_step {
-            let keep = crate::model::core::LENT_SCRATCH + LENT_MICRO_MARGIN;
-            let free = d.memory().0.saturating_sub(keep);
-            self.tier_cap = ssd_tier::host_tier_pass_cap(free, bytes, at, KV_BLOCK);
-            tracing::info!(
-                free_mib = free >> 20,
-                pass_tokens = self.tier_cap,
-                "host expert tier: staged passes sized to the lent VRAM"
-            );
-        }
+        let Some(step) = self.tier_step else { return };
+        let Some(d) = step.device else { return };
+        let scratch = crate::model::core::LENT_SCRATCH;
+        let free = d.memory().0.saturating_sub(scratch);
+        let lend = self.kv_lend.as_ref();
+        let unmapped = lend.map_or(0, kv_vmm::KvLend::unmapped_vram);
+        self.tier_cap =
+            ssd_tier::host_tier_passes(free, LENT_MICRO_MARGIN, unmapped, &step, KV_BLOCK);
+        tracing::info!(
+            free_mib = free.saturating_sub(LENT_MICRO_MARGIN) >> 20,
+            unmapped_mib = unmapped >> 20,
+            pass_tokens = self.tier_cap.planned,
+            fit_tokens = self.tier_cap.fit,
+            "host expert tier: staged passes sized to the lent VRAM (a prompt fit_tokens \
+             reads in as many passes takes those)"
+        );
+    }
+
+    /// The bounded host tier (#37): the first lone prompt past the measured step's tokens
+    /// measures a pass's step as lent, in an exact buffer ([`ssd_tier::TierStep::lent`]); its
+    /// passes and every later lend's are sized to it.
+    fn measure_tier_pass(&mut self) {
+        let Some(step) = self.tier_step.filter(|s| s.lent.is_none()) else {
+            return;
+        };
+        let t = Instant::now();
+        // Measured once (0: not measured, the passes as planned).
+        let lent = match self.exec.measure_lent_prompt_step(step.tokens, step.past) {
+            Ok(v) => v.first().copied().unwrap_or(0),
+            Err(e) => {
+                tracing::warn!(error = %e, "host expert tier: cannot measure a lent pass step");
+                0
+            }
+        };
+        tracing::info!(
+            ms = t.elapsed().as_secs_f64() * 1e3,
+            tokens = step.tokens,
+            load_mib = step.bytes >> 20,
+            lent_mib = lent >> 20,
+            "host expert tier: a lent pass step measured"
+        );
+        self.tier_step = Some(ssd_tier::TierStep {
+            lent: Some(lent),
+            ..step
+        });
     }
 
     /// Takes the expert cache's VRAM back after a long prompt; the slots refill in the
@@ -7553,7 +7632,8 @@ impl Worker {
         self.lent_short = false;
         self.long_cap = 0;
         self.long_reserve = 0;
-        self.tier_cap = 0;
+        self.tier_cap = Default::default();
+        self.tier_fresh = false;
         self.exec.set_pipeline_micro(self.micro);
         self.exec.set_micro_taper(0);
         tracing::info!(
@@ -7858,7 +7938,7 @@ impl Worker {
             if long
                 && self.lent
                 && (self.exec.model().glm_par.is_some() || self.kv_tier)
-                && self.kv_lend.as_ref().is_some_and(|l| !l.grown)
+                && self.kv_lend.as_ref().is_some_and(|l| !l.full())
             {
                 let need = prefilling
                     .iter()
@@ -7875,8 +7955,9 @@ impl Worker {
                             .iter()
                             .any(|s| s.blocks.iter().any(|&b| b >= l.keep as u32))
                 });
-                self.kv_make_room(need, resume)?;
-                if self.kv_tier && self.kv_lend.as_ref().is_some_and(|l| l.grown) {
+                let first = self.kv_lend.as_ref().is_some_and(|l| !l.grown);
+                let mapped = self.kv_make_room(need, resume)?;
+                if mapped && self.kv_tier && (first || self.tier_fresh) {
                     self.size_tier_pass();
                 }
             }
@@ -7885,14 +7966,19 @@ impl Worker {
         // (`max_tokens`) will pass the kept blocks map the tail while the prompt is read,
         // before the first token. Mapped in the middle of a reply, the lend and restore of
         // the expert cache around it stalled the stream for half a second.
-        if self.kv_tier && !prefilling.is_empty() && self.kv_lend.as_ref().is_some_and(|l| !l.grown)
+        // Passes are sized again when the tail is first mapped, and when more of it is before
+        // the lend's first pass (#37: mapped in parts); later the split stays.
+        if self.kv_tier
+            && !prefilling.is_empty()
+            && self.kv_lend.as_ref().is_some_and(|l| !l.full())
         {
             let ahead = kv_vmm::tier_blocks_ahead(
                 (prefilling.iter().chain(decoding.iter()))
                     .map(|s| (s.need, s.table.blocks().len())),
             );
-            self.kv_make_room(ahead, false)?;
-            if self.lent && self.kv_lend.as_ref().is_some_and(|l| l.grown) {
+            let first = self.kv_lend.as_ref().is_some_and(|l| !l.grown);
+            let mapped = self.kv_make_room(ahead, false)?;
+            if mapped && self.lent && (first || self.tier_fresh) {
                 self.size_tier_pass();
             }
         }
@@ -7915,9 +8001,40 @@ impl Worker {
             self.long.batch_tokens
         };
         // The bounded host tier: passes of what the lend left free, the prompt in equal ones.
-        let tier_pass = big && self.tier_cap > 0;
+        let tier_pass = big && self.tier_cap.planned > 0;
         let max_batch = if tier_pass {
-            self.tier_cap
+            // #37: a lone prompt's passes take the fit where that is as many (the same split);
+            // beside other prompts the planned cap (their share of the budget stays).
+            let left: usize = prefilling.iter().map(|s| s.prompt.len() - s.n_past).sum();
+            // The lent step is measured for the first lone prompt longer than the step
+            // measured (a shorter one's buffer is smaller than the step's): an 8K prompt's
+            // lend pays no measure and no reallocation for it.
+            let unmeasured = self
+                .tier_step
+                .is_some_and(|s| s.lent.is_none() && left > s.tokens);
+            if self.tier_fresh && prefilling.len() == 1 && unmeasured {
+                self.measure_tier_pass();
+                self.size_tier_pass();
+            }
+            let fit_only = ssd_tier::tier_fit_only();
+            let p = self.tier_cap;
+            let take = if prefilling.len() == 1 {
+                p.take(left, fit_only)
+            } else {
+                p.planned
+            };
+            let short = p.fit < p.planned && !p.same_count(left);
+            if self.tier_fresh && !fit_only && prefilling.len() == 1 && short {
+                tracing::warn!(
+                    tokens = left,
+                    pass_tokens = p.planned,
+                    fit_tokens = p.fit,
+                    "host expert tier: a staged pass may spill into host memory (fitting \
+                     the VRAM left would take a pass more)"
+                );
+            }
+            self.tier_fresh = false;
+            take
         } else if big {
             long_batch.max(self.max_batch_tokens)
         } else {

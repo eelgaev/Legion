@@ -447,9 +447,16 @@ pub struct Remapped {
 /// bytes. The blocks keep their address either way, so a sequence past the kept blocks is
 /// served from host memory over the link instead of failing for want of VRAM. `None`: VRAM
 /// or an error, as before.
-pub fn kv_vmm_remap(t: Tensor<'_>, host_below: Option<usize>) -> Result<Remapped, String> {
+///
+/// `upto` (#37): only the pieces that start below this many bytes of `t` are backed; the
+/// rest stay as they are (`usize::MAX`: every piece).
+pub fn kv_vmm_remap(
+    t: Tensor<'_>,
+    host_below: Option<usize>,
+    upto: usize,
+) -> Result<Remapped, String> {
     let (b, at) = vmm_of(t).ok_or("not a --kv-vmm tensor")?;
-    let end = at + t.nbytes();
+    let end = at + t.nbytes().min(upto);
     use_device(b.device)?;
     let ours = |p: &Piece| p.off >= at && p.off < end;
     if b.maps

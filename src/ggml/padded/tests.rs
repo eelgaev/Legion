@@ -1,4 +1,4 @@
-use super::{PAD_KEEPS_FREE, light, padded};
+use super::{PAD_KEEPS_FREE, PASS_PAD, light, padded, pass};
 
 const MIB: usize = 1 << 20;
 const GIB: usize = 1 << 30;
@@ -42,4 +42,18 @@ fn light_padding_leaves_the_reserve_free() {
     let (size, free) = (4 * GIB, 4 * GIB + PAD_KEEPS_FREE + 10 * MIB);
     assert_eq!(light(size, free), size + 10 * MIB);
     assert_eq!(light(size, size), size);
+}
+
+/// #37: a 10,944-token staged pass of 4,209 MiB with 4,913 MiB free (a 32K prompt's three
+/// passes on an RTX 4090): no quarter, the pass pad within the 512 MiB it leaves.
+#[test]
+fn a_pass_pads_a_little_where_the_quarter_does_not() {
+    let (size, free) = (4209 * MIB, 4913 * MIB);
+    assert_eq!(pass(size, free), size + PASS_PAD);
+    // Only as far as 512 MiB stays free; never below the request.
+    assert_eq!(pass(size, size + 520 * MIB), size + 8 * MIB);
+    assert_eq!(pass(size, size), size);
+    // Room for the quarter: as a lent cache's other steps.
+    let roomy = 16 * GIB;
+    assert_eq!(pass(400 * MIB, roomy), padded(400 * MIB, roomy));
 }
