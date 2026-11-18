@@ -29,6 +29,11 @@ pub struct DenseMvBenchArgs {
     /// shape and step (how cuBLAS's kernel sums).
     #[arg(long, conflicts_with = "check")]
     wide_probe: bool,
+    /// Prompt steps (#1176): each BF16 group of two or more weights stored back to back and read
+    /// as one cuBLAS GEMM, against each weight's own GEMM: differing outputs and both times, per
+    /// group and step (`--tokens` e.g. 1031,2048,8192,16384); fails on any differing output.
+    #[arg(long, conflicts_with_all = ["check", "wide_probe"])]
+    prompt_joined: bool,
 }
 
 pub fn run(args: DenseMvBenchArgs) -> anyhow::Result<()> {
@@ -40,6 +45,28 @@ pub fn run(args: DenseMvBenchArgs) -> anyhow::Result<()> {
     };
     if !args.groups.is_empty() {
         cfg.groups = args.groups;
+    }
+    if args.prompt_joined {
+        println!(
+            "{:<26} {:>6} {:>10} {:>11} {:>10} {:>7}",
+            "group", "tokens", "differing", "separate µs", "joined µs", "ratio"
+        );
+        let rows = bench::check_prompt_joined(&mut gpu, &cfg).map_err(anyhow::Error::msg)?;
+        for r in &rows {
+            println!(
+                "{:<26} {:>6} {:>10} {:>11.1} {:>10.1} {:>7.3}",
+                r.group,
+                r.n_tok,
+                r.differing,
+                r.separate_secs * 1e6,
+                r.joined_secs * 1e6,
+                r.joined_secs / r.separate_secs
+            );
+        }
+        let bad = rows.iter().filter(|r| r.differing > 0).count();
+        anyhow::ensure!(bad == 0, "{bad} cases differ from the separate GEMMs' bits");
+        println!("all joined bits equal to the separate GEMMs'");
+        return Ok(());
     }
     if args.wide_probe {
         println!(

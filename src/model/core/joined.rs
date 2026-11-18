@@ -29,7 +29,9 @@
 //! consumers (the gated norm, ggml's sigmoid and mul) read its rows strided in place. A
 //! full-attention layer's query + gate, key and value projections lie back to back too: one
 //! GEMM of the three (key and value are 512 rows each in Qwen3.8-Flash-Next, too few to fill
-//! the GPU alone), whose rows the norm + RoPE and K/V append kernels read strided.
+//! the GPU alone), whose rows the norm + RoPE and K/V append kernels read strided. The
+//! DeltaNet layer's `qkv` projection lies right before `z`: prompt steps read all four as one
+//! GEMM (#1176), whose `qkv` rows the conv reads strided.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
@@ -65,10 +67,18 @@ pub(super) const PAIRS: [(&str, &str); 3] = [
 /// the NVFP4 checkpoints keep in BF16 back to back (#836). Prompt steps only
 /// ([`takes_prompt`]); the alpha / beta pair inside it stays a pair of its own. A
 /// full-attention layer's query + output gate (`attn_q`, heads interleaved), key and value
-/// projections, which the checkpoints store in that order (BF16 in the NVFP4 ones).
-pub(super) const RUNS: [&[&str]; 2] = [
+/// projections, which the checkpoints store in that order (BF16 in the NVFP4 ones). A gated
+/// DeltaNet layer's `qkv` projection (`attn_qkv`), stored right before `z`, with `z`, alpha and
+/// beta (#1176): all four of the layer's input projections as one GEMM.
+pub(super) const RUNS: [&[&str]; 3] = [
     &["attn_gate.weight", "ssm_alpha.weight", "ssm_beta.weight"],
     &["attn_q.weight", "attn_k.weight", "attn_v.weight"],
+    &[
+        "attn_qkv.weight",
+        "attn_gate.weight",
+        "ssm_alpha.weight",
+        "ssm_beta.weight",
+    ],
 ];
 
 /// [`RUNS`]' DeltaNet z, alpha and beta.
@@ -76,6 +86,20 @@ pub(super) const RUN_Z: usize = 0;
 
 /// [`RUNS`]' attention query + gate, key and value.
 pub(super) const RUN_QKV: usize = 1;
+
+/// [`RUNS`]' DeltaNet qkv, z, alpha and beta.
+pub(super) const RUN_QKVZ: usize = 2;
+
+/// Whether prompt steps read [`RUN_QKVZ`] as one GEMM where it is joined (and [`prompt_z`]
+/// holds): yes unless `LEGION_DEBUG_GDN_QKVZ=0` (an A/B probe: qkv apart, z, alpha and beta as
+/// one GEMM); read once.
+pub(super) fn prompt_qkvz() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let v = std::env::var("LEGION_DEBUG_GDN_QKVZ").ok();
+        !v.is_some_and(|v| v.trim() == "0")
+    })
+}
 
 /// Most tokens a joined matmul takes: ggml-cuda's F32 vector kernel takes up to 3 tokens on
 /// every NVIDIA GPU (Volta, Ampere and later: 3; Turing: 4).

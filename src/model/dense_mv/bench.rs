@@ -7,8 +7,9 @@
 //! `dense_mv::tests::cuda_matches_ggml_bits` does (one graph holding the op and ggml's
 //! `mul_mat`; comparing outputs across the timed graphs differs even between two runs of ggml's
 //! own graph), for a release binary on the GPU box. Groups of F32 weights (`f32:k:m...`) are the
-//! MoE router's kind. Used by the hidden `legion dense-mv-bench` subcommand (a build tree's
-//! binary on the GPU box).
+//! MoE router's kind. [`check_prompt_joined`]: prompt steps' groups read as one cuBLAS GEMM
+//! (#1176). Used by the hidden `legion dense-mv-bench` subcommand (a build tree's binary on the
+//! GPU box).
 
 use super::{
     CHAIN_MAX_ROWS, CHAIN_MIN_TOKENS, MAX_TOKENS, MAX_WEIGHTS, MIN_BYTES, MIN_TOKENS,
@@ -719,6 +720,121 @@ pub struct WideCheck {
     pub differing: usize,
     pub ggml_secs: f64,
     pub op_secs: f64,
+}
+
+/// One group at one prompt step in [`check_prompt_joined`].
+#[derive(Clone, Debug)]
+pub struct PromptJoined {
+    pub group: String,
+    pub n_tok: usize,
+    /// Outputs of the joined GEMM whose bits differ from their weight's own GEMM.
+    pub differing: usize,
+    /// Best time of the weights' GEMMs one after the other (one graph launch and its wait).
+    pub separate_secs: f64,
+    /// Best time of the joined GEMM (one graph launch and its wait).
+    pub joined_secs: f64,
+}
+
+/// Prompt steps (#1176): each BF16 group of two or more weights of `cfg`, stored back to back
+/// and read as one GEMM (ggml's `mul_mat`, cuBLAS, on one BF16 cast of the input, as the
+/// model's joined runs in `core::joined`), against each weight's own GEMM on the same cast:
+/// the bits of every output in one graph, then each way timed in a graph of its own.
+pub fn check_prompt_joined(gpu: &mut Backend, cfg: &Config) -> Result<Vec<PromptJoined>, String> {
+    let mut out = Vec::new();
+    for group in cfg.groups.iter().filter(|g| g.ms.len() > 1 && !g.f32) {
+        let k = group.k as i64;
+        let total = group.ms.iter().sum::<usize>() as i64;
+        let weights_ctx = Context::new(1, 0);
+        let j = weights_ctx.new_tensor(types::BF16, &[k, total]);
+        weights_ctx
+            .alloc_tensors(gpu.buffer_type())
+            .map_err(|e| e.to_string())?;
+        j.set_bytes(&weights(j.nbytes(), 7, false));
+        for &n_tok in &cfg.toks {
+            let xs = noise(group.k * n_tok, 3000 + n_tok as u64);
+            let ctx = Context::new(64, 64);
+            let (x, graph, pairs) = prompt_graph(&ctx, j, &group.ms, n_tok, true, true);
+            ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+                .map_err(|e| e.to_string())?;
+            x.set_f32(&xs);
+            gpu.compute(&graph)
+                .map_err(|e| format!("{group} {n_tok}: {e}"))?;
+            let mut differing = 0;
+            for (a, b) in pairs.iter().filter_map(|&(a, b)| a.zip(b)) {
+                let (a, b) = (a.to_f32(), b.to_f32());
+                differing += a
+                    .iter()
+                    .zip(&b)
+                    .filter(|(p, q)| p.to_bits() != q.to_bits())
+                    .count();
+            }
+            let mut secs = [f64::MAX; 2];
+            for (i, joined) in [false, true].into_iter().enumerate() {
+                let ctx = Context::new(64, 64);
+                let (x, graph, _) = prompt_graph(&ctx, j, &group.ms, n_tok, !joined, joined);
+                ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+                    .map_err(|e| e.to_string())?;
+                x.set_f32(&xs);
+                // A warm-up run, then the rounds.
+                for round in 0..=cfg.rounds {
+                    let t = std::time::Instant::now();
+                    gpu.compute(&graph)
+                        .map_err(|e| format!("{group} {n_tok}: {e}"))?;
+                    if round > 0 {
+                        secs[i] = secs[i].min(t.elapsed().as_secs_f64());
+                    }
+                }
+            }
+            out.push(PromptJoined {
+                group: group.to_string(),
+                n_tok,
+                differing,
+                separate_secs: secs[0],
+                joined_secs: secs[1],
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// A member's GEMM (`separate`) and its rows of the joined GEMM (`joined`), either one or both.
+type MemberPair<'a> = (Option<Tensor<'a>>, Option<Tensor<'a>>);
+
+/// [`check_prompt_joined`]'s graph of `n_tok` tokens on the joined weight `j` (members of `ms`
+/// rows): the input, the graph, and per member its [`MemberPair`]. With both, each joined
+/// member's rows are copied out to compare; the joined GEMM alone outputs its result as is.
+fn prompt_graph<'a>(
+    ctx: &'a Context,
+    j: Tensor<'a>,
+    ms: &[usize],
+    n_tok: usize,
+    separate: bool,
+    joined: bool,
+) -> (Tensor<'a>, Graph<'a>, Vec<MemberPair<'a>>) {
+    let (k, nb1) = (j.ne()[0], j.nb()[1]);
+    let x = ctx.new_tensor(types::F32, &[k, n_tok as i64]).as_input();
+    let x16 = ctx.cast(x, types::BF16);
+    let r = joined.then(|| ctx.mul_mat(j, x16));
+    let mut graph = ctx.new_graph(8 * ms.len() + 16);
+    let mut pairs = Vec::new();
+    let mut row = 0;
+    for &m in ms {
+        let w = ctx.view_2d(j, [k, m as i64], nb1, row * nb1);
+        let a = separate.then(|| ctx.mul_mat(w, x16).as_output());
+        let b = r.filter(|_| separate).map(|r| {
+            let v = ctx.view_2d(r, [m as i64, n_tok as i64], r.nb()[1], row * 4);
+            ctx.cont(v).as_output()
+        });
+        for t in a.iter().chain(&b) {
+            graph.expand(*t);
+        }
+        pairs.push((a, b));
+        row += m;
+    }
+    if let Some(r) = r.filter(|_| !separate) {
+        graph.expand(r.as_output());
+    }
+    (x, graph, pairs)
 }
 
 #[cfg(test)]

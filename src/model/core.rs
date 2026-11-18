@@ -3367,19 +3367,30 @@ impl Model {
         // alpha in it too where ggml would run them on cuBLAS (`dense_mv::fits_chain`). Prompt
         // steps: z, alpha and beta stored back to back as one GEMM (#836, `joined::RUNS`),
         // whose strided rows the gated norm and the op read in place.
+        // Prompt steps: qkv stored right before z, so all four as one GEMM (#1176), whose
+        // strided qkv rows the conv reads in place.
         let mut ab = None;
-        let zab = (prep && joined::prompt_z() && h.ne()[1] > joined::MAX_TOKENS)
+        let prompt_z = prep && joined::prompt_z() && h.ne()[1] > joined::MAX_TOKENS;
+        let qkvz = (prompt_z && joined::prompt_qkvz())
+            .then(|| self.lmm_joined_run(ctx, il, joined::RUNS[joined::RUN_QKVZ], h))
+            .flatten();
+        let zab = (prompt_z && qkvz.is_none())
             .then(|| self.lmm_joined_run(ctx, il, joined::RUNS[joined::RUN_Z], h))
             .flatten();
         let (qkv, z) = match (
             self.lmm_dense(ctx, il, &users, h).as_deref(),
             zab.as_deref(),
+            qkvz.as_deref(),
         ) {
-            (Some(&[qkv, z, beta, alpha]), _) => {
+            (_, _, Some(&[qkv, z, alpha, beta])) => {
                 ab = Some((alpha, beta));
                 (qkv, z)
             }
-            (_, Some(&[z, alpha, beta])) => {
+            (Some(&[qkv, z, beta, alpha]), _, _) => {
+                ab = Some((alpha, beta));
+                (qkv, z)
+            }
+            (_, Some(&[z, alpha, beta]), _) => {
                 ab = Some((alpha, beta));
                 (self.lmm_q(ctx, il, "attn_qkv.weight", h, hq)?, z)
             }
@@ -3487,7 +3498,18 @@ impl Model {
         for (off, sh) in pass.groups() {
             let (nt, ns) = (sh.n_tok as i64, sh.n_seqs as i64);
             let ng = nt * ns;
-            let qkv = ctx.reshape_3d(cols(ctx, qkv, off, ng), qkv_dim, nt, ns);
+            let qkv = if qkv.is_contiguous() {
+                ctx.reshape_3d(cols(ctx, qkv, off, ng), qkv_dim, nt, ns)
+            } else {
+                // Rows of the joined GEMM's height apart (#1176): the conv reads them strided.
+                let nb1 = qkv.nb()[1];
+                ctx.view_3d(
+                    qkv,
+                    [qkv_dim, nt, ns],
+                    [nb1, nb1 * nt as usize],
+                    off as usize * nb1,
+                )
+            };
 
             // Causal depthwise conv over [history | this chunk], per sequence; the last
             // d_conv - 1 inputs are the next step's history.
