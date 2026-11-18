@@ -1338,6 +1338,10 @@ impl Inner {
             }
         }
         if defer {
+            // The pads behind the places in use now too: the host pairs of the experts already
+            // in place may run before the reads land (round 36); [`Inner::land`] zeroes them again
+            // once the reads, which may write over them, are done.
+            self.zero_pads(il, &t.index);
             let at = t.loads.iter().map(|l| t.index[l.0]).collect();
             *self.landing.lock().unwrap() = Some(Landing {
                 layer: il,

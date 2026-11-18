@@ -511,8 +511,10 @@ mod cuda {
     pub(super) unsafe fn glu(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
         // SAFETY: the caller's; a node made by `glu_tiered`.
         unsafe {
-            glu_launches(dst, stream, false)?;
-            activate(dst, stream)
+            if glu_launches(dst, stream, false)? {
+                activate(dst, stream, true)?;
+            }
+            Ok(())
         }
     }
 
@@ -523,51 +525,217 @@ mod cuda {
     ) -> Result<(), String> {
         // SAFETY: the caller's; a node made by `glu_tiered_preq`.
         unsafe {
-            glu_launches(dst, stream, true)?;
-            activate(dst, stream)
+            if glu_launches(dst, stream, true)? {
+                activate(dst, stream, true)?;
+            }
+            Ok(())
         }
     }
 
-    /// The SwiGLU op's launches. When the bounded host tier's fetch of the step left its reads
-    /// running (#37 round 35, [`host_tier::defer_reads`]): the VRAM experts' pairs first, then
-    /// the wait for the reads, then the host experts' pairs, so the GPU computes the first while
-    /// the SSD reads the misses (and the host its share of the experts in RAM).
+    /// The SwiGLU op's launches; returns whether [`activate`] follows them now (else the down
+    /// op runs it, [`down_around`]). When the bounded host tier's fetch of the step left its
+    /// reads running (#37 round 35, [`host_tier::defer_reads`]): the VRAM experts' pairs first,
+    /// and the wait for the reads and the host experts' pairs in the down op after its own VRAM
+    /// pairs (round 36, [`land_later`]), or here (round 35's order), so the GPU computes the
+    /// VRAM pairs while the SSD reads the misses (and the host its share of the experts in RAM).
     unsafe fn glu_launches(
         act: &ffi::ggml_tensor,
         stream: *mut c_void,
         preq: bool,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         // SAFETY: a SwiGLU op's node: its source 2 the published ids, whose source 0 the
         // router's ids (the fetch's output).
         let fetch = unsafe { (*act.src[2]).src[0] };
         // SAFETY: the caller's.
         unsafe {
             if !host_tier::reads_pending(fetch) {
-                return if preq {
-                    expert_mv::cuda_expert_mv_preq(act, stream)
+                if preq {
+                    expert_mv::cuda_expert_mv_preq(act, stream)?;
                 } else {
-                    expert_mv::cuda_expert_mv(act, stream)
-                };
+                    expert_mv::cuda_expert_mv(act, stream)?;
+                }
+                return Ok(true);
             }
-            expert_mv::cuda_expert_mv_around(act, stream, preq, &mut || host_tier::land(fetch))
+            // Not with the shared expert's nodes moved between this op and the down op: they
+            // may take memory this op's host pairs read.
+            if land_later() != 0
+                && super::super::shexp::shexp_at() != super::super::shexp::ShexpAt::BeforeDown
+                && expert_mv::cuda_expert_mv_splits(act)
+            {
+                expert_mv::cuda_expert_mv_part(act, stream, preq, 1, &[])?;
+                LANDS_IN_DOWN.set(act as *const ffi::ggml_tensor);
+                return Ok(false);
+            }
+            expert_mv::cuda_expert_mv_around(act, stream, preq, &mut || host_tier::land(fetch))?;
+            Ok(true)
         }
+    }
+
+    thread_local! {
+        /// The SwiGLU op whose host pairs and [`activate`] its down op runs ([`down_around`]).
+        static LANDS_IN_DOWN: std::cell::Cell<*const ffi::ggml_tensor> =
+            const { std::cell::Cell::new(std::ptr::null()) };
+    }
+
+    /// Where the exact share's layers wait for a small step's SSD reads (#37):
+    /// `LEGION_DEBUG_TIER_LAND_LATER=0` in the SwiGLU op after its VRAM pairs (round 35); `1` in
+    /// the down op after its VRAM pairs, [`activate`] after the SwiGLU's host pairs; `2` as `1`
+    /// with [`activate`] ahead of the wait; `3` (the default) as `2` with the SwiGLU's host pairs
+    /// whose experts are in place (RAM slots, places read ahead) ahead of the wait too.
+    fn land_later() -> u8 {
+        static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        *MODE.get_or_init(|| {
+            std::env::var("LEGION_DEBUG_TIER_LAND_LATER")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3)
+        })
+    }
+
+    /// The down op of a SwiGLU op `act` that left the step's SSD reads running (#37 round 36,
+    /// [`glu_launches`]): the down's VRAM pairs, then the wait for the reads, then the SwiGLU's
+    /// host pairs and the down's, each pair by the same code as in one launch, and [`activate`]
+    /// (from `LEGION_DEBUG_TIER_LAND_LATER=2` on ahead of the wait: it only writes the pool's
+    /// pairs, so the pool starts its down rows before the reads are in; from `3` on the host
+    /// pairs of the experts the reads do not write too). A down op that does not split runs
+    /// whole after the SwiGLU's host pairs.
+    unsafe fn down_around(
+        down: &ffi::ggml_tensor,
+        act: &ffi::ggml_tensor,
+        stream: *mut c_void,
+    ) -> Result<(), String> {
+        // SAFETY: as in `glu_launches`.
+        let fetch = unsafe { (*act.src[2]).src[0] };
+        // SAFETY: a node with an op, or none.
+        let preq = unsafe { crate::ggml::op_of(act) }
+            .is_some_and(|op| std::ptr::eq(op, &super::SHARE_GLU_PREQ));
+        // SAFETY: the caller's; `act` ran its part 1 in this stream.
+        unsafe {
+            let mut split = expert_mv::cuda_expert_mv_splits(down);
+            if split && !down_first_ok(down, act) {
+                split = false;
+                static SAID: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::debug!(
+                        target: "legion::residency::cpu_share",
+                        "down op shares memory with its SwiGLU op's sources: lands before its VRAM pairs"
+                    );
+                }
+            }
+            if split {
+                expert_mv::cuda_expert_mv_part(down, stream, false, 1, &[])?;
+            }
+            let early = split && land_later() >= 2;
+            if early {
+                activate(act, stream, false)?;
+            }
+            // The pairs of the experts the reads write after the wait, the others before it.
+            let pend = if land_later() >= 3 {
+                host_tier::pending_at(fetch)
+            } else {
+                Vec::new()
+            };
+            let ready_first = !pend.is_empty() && pend.len() <= expert_mv::MAX_PEND;
+            if ready_first {
+                expert_mv::cuda_expert_mv_part(act, stream, preq, 5, &pend)?;
+            }
+            host_tier::land(fetch)?;
+            if early {
+                arrive_now()?;
+            }
+            if ready_first {
+                expert_mv::cuda_expert_mv_part(act, stream, preq, 6, &pend)?;
+            } else {
+                expert_mv::cuda_expert_mv_part(act, stream, preq, 2, &[])?;
+            }
+            if !early {
+                activate(act, stream, true)?;
+            }
+            if split {
+                expert_mv::cuda_expert_mv_part(down, stream, false, 2, &[])
+            } else {
+                expert_mv::cuda_expert_mv(down, stream)
+            }
+        }
+    }
+
+    /// Whether the down op `down` may run its VRAM pairs ahead of the SwiGLU op `act`'s host
+    /// pairs: none of the memory the down op writes (its output and its activations' blocks,
+    /// source 3) is memory the SwiGLU op reads or writes. ggml's allocator may give the down op
+    /// memory of a source of the SwiGLU op, whose last reader it was.
+    ///
+    /// # Safety
+    /// Nodes of an allocated graph.
+    unsafe fn down_first_ok(down: &ffi::ggml_tensor, act: &ffi::ggml_tensor) -> bool {
+        let range = |t: *const ffi::ggml_tensor| {
+            // SAFETY: the caller's; null or a tensor.
+            unsafe {
+                (!t.is_null() && !(*t).data.is_null()).then(|| {
+                    let a = (*t).data as usize;
+                    (a, a + ffi::ggml_nbytes(t))
+                })
+            }
+        };
+        let writes = [range(down), range(down.src[3])];
+        let used = std::iter::once(act as *const ffi::ggml_tensor)
+            .chain(act.src.iter().map(|&s| s as *const ffi::ggml_tensor));
+        !used
+            .filter_map(range)
+            .any(|(a0, a1)| writes.iter().flatten().any(|&(b0, b1)| a0 < b1 && b0 < a1))
     }
 
     /// [`super::SHARE_DOWN`]: the down op's launches, then [`collect`].
     pub(super) unsafe fn down(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
-        // SAFETY: the caller's; a node made by `mul_mat_id_tiered`.
+        // SAFETY: the caller's; a node made by `mul_mat_id_tiered`, its source 1 the SwiGLU op.
         unsafe {
-            expert_mv::cuda_expert_mv(dst, stream)?;
+            let act = dst.src[1];
+            if LANDS_IN_DOWN.replace(std::ptr::null()) == act as *const ffi::ggml_tensor {
+                down_around(dst, &*act, stream)?;
+            } else {
+                expert_mv::cuda_expert_mv(dst, stream)?;
+            }
             collect(dst, stream)?;
             // The layer's share of the expert cache's swap copies starts behind it (#37).
             crate::residency::cuda::swap_pace_layer(current_device()?, stream)
         }
     }
 
+    /// Whether anything reads the "GPU reached activate" flag: `auto` steers the share by who
+    /// waited ([`super::pool::nudge`]); otherwise only the debug statistics.
+    fn arrival_read(share: &super::DeviceShare) -> bool {
+        share.exchange.exact.is_some_and(|x| x.auto)
+            || tracing::enabled!(target: "legion::residency::cpu_share", tracing::Level::DEBUG)
+    }
+
+    /// Raises the "GPU reached activate" flag from the host, now (#37 round 36): with
+    /// [`activate`] queued ahead of the wait for the step's SSD reads
+    /// (`LEGION_DEBUG_TIER_LAND_LATER=2`), the stream reaches it long before it needs the pool's
+    /// rows, which would read as the GPU waiting for the pool and shrink the `auto` share. The
+    /// reads landing is when the GPU's own host pairs can start, the point the flag stood for.
+    fn arrive_now() -> Result<(), String> {
+        let share = device(current_device()?).ok_or("cpu share: device not registered")?;
+        if !arrival_read(&share) {
+            return Ok(());
+        }
+        let x = share
+            .exchange
+            .exact
+            .ok_or("cpu share: arrival without the exact share")?;
+        // SAFETY: the flag lives in the exchange buffer, which the share keeps.
+        unsafe { &*x.act_arrived }.store(share.seq.last(), std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
     /// The exact share's SwiGLU output `act` (the node, F32 `[n_ff, n_used, n]`, the published
     /// ids its source 2): waits for the host's gate and up sums, writes its pairs' SwiGLU rows
-    /// (which the SwiGLU op skipped) and blocks, raises "act ready".
-    unsafe fn activate(act: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
+    /// (which the SwiGLU op skipped) and blocks, raises "act ready". `arrival`: flags the GPU's
+    /// arrival in the stream first (else the caller does, [`arrive_now`]).
+    unsafe fn activate(
+        act: &ffi::ggml_tensor,
+        stream: *mut c_void,
+        arrival: bool,
+    ) -> Result<(), String> {
         let share = device(current_device()?).ok_or("cpu share: device not registered")?;
         let e = share
             .exact
@@ -584,11 +752,7 @@ mod cuda {
         }
         let base = share.device_base;
         let seq = share.seq.last();
-        // `auto` steers the share by who waited ([`super::pool::nudge`]); otherwise only the
-        // debug statistics read the flag.
-        if share.exchange.exact.is_some_and(|x| x.auto)
-            || tracing::enabled!(target: "legion::residency::cpu_share", tracing::Level::DEBUG)
-        {
+        if arrival && arrival_read(&share) {
             // SAFETY: the flag's device address, in the exchange buffer.
             let r = unsafe { cuStreamWriteValue32_v2(stream, base + e.act_arrived as u64, seq, 0) };
             if r != 0 {

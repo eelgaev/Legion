@@ -1525,7 +1525,7 @@ int launch(const legion_expert_mv & p, int smem, cudaStream_t stream) {
             return e;
         }
     }
-    if (p.vram_kernel == 1 && p.vram_below > 0 && p.part != 2 && p.part != 4) {
+    if (p.vram_kernel == 1 && p.vram_below > 0 && (p.part == 0 || p.part == 1 || p.part == 3)) {
         const int rpc = THREADS / WARP_SIZE * VRAM_ROWS;
         const dim3 grid((p.rows + rpc - 1) / rpc, pairs);
         bool split = false;
