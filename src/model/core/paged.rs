@@ -162,9 +162,63 @@ fn verify_prefetch() -> bool {
     *V.get_or_init(|| std::env::var("LEGION_DEBUG_PAGED_VERIFY_PREFETCH").as_deref() != Ok("0"))
 }
 
+/// `LaunchParams::prefetch` bits (`LEGION_PF_*` in paged_attn/common.cuh, #689 r20): the kernels
+/// whose CTAs prefetch the first line of every K and V block of their keys into L2 at the start,
+/// as the quad kernel does ([`verify_prefetch`]). The same bits either way.
+pub const PF_DECODE: i32 = 1;
+/// `paged_prefill_grid`, the pair kernel of heads of 256 at 6 query heads a kv head.
+pub const PF_GRID: i32 = 2;
+/// `paged_prefill_pair`, heads of 512 ([`set_d512_pair`]).
+pub const PF_PAIR: i32 = 4;
+/// `paged_prefill_mma`.
+pub const PF_MMA: i32 = 8;
+/// `paged_prefill_qm`.
+pub const PF_QM: i32 = 16;
+
+/// Each kernel's bit, its switch and whether it prefetches by default.
+#[cfg(feature = "cuda")]
+const PF_SWITCHES: [(i32, &str, bool); 5] = [
+    (PF_DECODE, "LEGION_DEBUG_PAGED_DECODE_PREFETCH", true),
+    (PF_GRID, "LEGION_DEBUG_PAGED_GRID_PREFETCH", true),
+    (PF_PAIR, "LEGION_DEBUG_PAGED_D512_PREFETCH", true),
+    (PF_MMA, "LEGION_DEBUG_PAGED_MMA_PREFETCH", true),
+    (PF_QM, "LEGION_DEBUG_PAGED_QM_PREFETCH", true),
+];
+
+/// The default prefetch bits (read once): each kernel's default, `=0` / `=1` of its switch
+/// ([`PF_SWITCHES`]) off / on.
+#[cfg(feature = "cuda")]
+fn prefetch_default() -> i32 {
+    static V: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        PF_SWITCHES
+            .iter()
+            .filter(|(_, var, on)| match std::env::var(var).as_deref() {
+                Ok("0") => false,
+                Ok("1") => true,
+                _ => *on,
+            })
+            .fold(0, |bits, (bit, _, _)| bits | bit)
+    })
+}
+
 thread_local! {
     /// The calling thread's wide-grid choice ([`set_verify_grid_here`]).
     static GRID_HERE: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    /// The calling thread's prefetch bits ([`set_prefetch_here`]).
+    static PF_HERE: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The prefetch bits ([`PF_DECODE`]...) of the calling thread's launches (benches); `None`
+/// follows the default again.
+pub fn set_prefetch_here(bits: Option<i32>) {
+    PF_HERE.with(|c| c.set(bits));
+}
+
+/// The launch's `prefetch` ([`set_prefetch_here`], else the default).
+#[cfg(feature = "cuda")]
+fn prefetch_bits() -> i32 {
+    PF_HERE.with(|c| c.get()).unwrap_or_else(prefetch_default)
 }
 
 /// The wide-grid kernel's choice for the calling thread's launches (benches): `Some(0)`
@@ -878,6 +932,8 @@ struct LaunchParams {
     /// Heads of 256 at 6 query heads a kv head on sm_80+: 1 runs the group on the pair kernel, 2 on
     /// the quad kernel ([`verify_grid_for`]); 0: `paged_prefill_mma`.
     verify_grid: i32,
+    /// The kernels that prefetch their keys' pages at the start ([`PF_DECODE`]...).
+    prefetch: i32,
 }
 
 /// The kernels' code for a cache type (`LEGION_KV_*` in paged_attn.cu), if they read it.
@@ -1112,6 +1168,7 @@ unsafe fn cuda_paged_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
         vsplit_chunk: 0,
         d512_pair: 0,
         verify_grid: 0,
+        prefetch: prefetch_bits(),
     };
     // A multi-token group runs split over the key blocks (sm_80+) only with a scratch made for
     // it (split_scratch_shape); the placeholder and a tier's scratch have one split.

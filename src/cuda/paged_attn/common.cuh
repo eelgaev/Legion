@@ -128,9 +128,25 @@ struct legion_paged_attn {
     // 4 warps, a CTA each) instead of paged_prefill_mma; the same bits. Picked on the Rust side
     // (paged::verify_grid_kind) for small groups.
     int32_t verify_grid;
+    // LEGION_PF_* bits (#689 r20): the kernels whose CTAs prefetch the first line of every K and V
+    // block of their keys into L2 at the start (prefetch_walk below), so the keys' pages are
+    // translated before the loop reaches them. The same bits either way. Picked on the Rust side
+    // (paged::prefetch_bits). The quad kernel's prefetch is its own (verify_grid 2 / 3).
+    int32_t prefetch;
 };
 
 enum { LEGION_KV_F16 = 0, LEGION_KV_Q8_0 = 1, LEGION_KV_Q4_0 = 2 };
+
+// legion_paged_attn::prefetch: paged_decode, paged_prefill_grid (heads of 256 at 6 query heads a
+// kv head, the pair kernel), paged_prefill_pair (heads of 512), paged_prefill_mma and
+// paged_prefill_qm.
+enum {
+    LEGION_PF_DECODE = 1,
+    LEGION_PF_GRID   = 2,
+    LEGION_PF_PAIR   = 4,
+    LEGION_PF_MMA    = 8,
+    LEGION_PF_QM     = 16,
+};
 
 // Whether the current device's paged kernels read quantized caches (the sm_80+ prefill kernel;
 // the WMMA one reads F16 only).
@@ -308,6 +324,24 @@ __device__ __forceinline__ bool piece_idle(const legion_paged_attn & p, const Wa
     return p.piece > 0 && (*p.piece_cnt == 0 || w.i0 >= w.i1);
 }
 
+// Where p.prefetch has `bit` (#689 r20; paged_prefill_quad's prefetch, r19, for the other kernels):
+// one prefetch.global.L2 of the first line of every K and V block of walk entries [w.i0, w.i1), the
+// CTA's `nt` threads in turn, issued right after the kernel's first loads. In a model each call
+// comes after other layers' traffic and meets its keys' page translations cold; this has them
+// translated before the loop gets there. Reads nothing into registers and writes nothing: the
+// same bits.
+__device__ __forceinline__ void prefetch_walk(const legion_paged_attn & p, const Walk & w, int bit, int nt) {
+    if (!(p.prefetch & bit)) {
+        return;
+    }
+    const int n = (w.i1 - w.i0) * 2;
+    for (int x = threadIdx.x; x < n; x += nt) {
+        const int    i = w.i0 + x / 2;
+        const char * a = x % 2 == 0 ? w.cells(p.k, p.k_stage, i, p.k_cell) : w.cells(p.v, p.v_stage, i, p.v_cell);
+        asm volatile("prefetch.global.L2 [%0];\n" ::"l"(a));
+    }
+}
+
 // The first element of kv head kvh in a cell: kvh * D, or in Gemma 4's compact cache (C, #551)
 // kvh * p.head_stride. Only the C instantiations read p.head_stride.
 template <int D, bool C>
@@ -477,6 +511,7 @@ __global__ void __launch_bounds__(128) paged_decode(const legion_paged_attn p) {
         return;
     }
     const int b0 = bf + split * nblk / ns, b1 = bf + (split + 1) * nblk / ns;
+    prefetch_walk(p, walk(p, seq, b0, b1 - 1), LEGION_PF_DECODE, 128);
 
     __shared__ float s[G][BLK];
     __shared__ float alpha[G], stat_m[G], stat_l[G];

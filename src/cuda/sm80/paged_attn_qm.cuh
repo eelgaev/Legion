@@ -202,6 +202,7 @@ __global__ void __launch_bounds__(Shape<D, PP>::NW * 32, 1) paged_prefill_qm(con
             issue(j);
         }
     }
+    prefetch_walk(p, wk, LEGION_PF_QM, NW * 32);
 
     // Q's rows in F16 (as paged_prefill_mma rounds them), rows of QU swizzled 16-byte units.
     for (int x = threadIdx.x; x < ROWS * QU; x += NW * 32) {

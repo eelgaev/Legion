@@ -204,6 +204,7 @@ __global__ void __launch_bounds__(NG * 64, 1) paged_prefill_grid(const legion_pa
     for (int j = 0; j < NS - 1; j++) {
         issue(j);
     }
+    prefetch_walk(p, wk, LEGION_PF_GRID, NW * 32);
     int j = 0;
     for (int wi = wk.i0; wi < wk.i1; wi++) {
         const int k0 = wk.block(wi) * BLK;

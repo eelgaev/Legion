@@ -17,12 +17,21 @@
 //! Parts join with `+` (`rot+read+pt64k`). A call's time is the graph's time less the same graph
 //! without the calls (the flushes alone), over the calls; the flushes are ggml's `sum_rows` /
 //! `cont`. Nothing here changes a kernel.
+//!
+//! The kernels (#689 r20, [`pick`]): at heads of 256 those of [`grid_bench::KERNELS`] but `split`,
+//! plus `mma` (`paged_prefill_mma` without the queries-as-M kernel); at heads of 512 `main` /
+//! `mma` (`paged_prefill_mma`), `pair` (the warp-pair kernel), `auto` (the default's pick). A
+//! group of one token a sequence is a decode step whatever the kernel (`paged_decode`, split
+//! over the key blocks as a model's). Each runs with the calling thread's prefetch bits
+//! ([`set_prefetch_here`]).
 
 use super::grid_bench;
 use super::wmma_bench::{Group, fill};
 use super::*;
 use crate::ggml::{Backend, ComputeAllocator};
 use crate::model::core::KvPool;
+
+pub use super::set_prefetch_here;
 
 /// The flush buffer's bytes.
 const FLUSH_BYTES: usize = 8 << 30;
@@ -115,6 +124,43 @@ fn flush_nodes<'a>(
     out
 }
 
+/// The kernels a cold run takes at heads of `d` ([`pick`]).
+pub fn kernels(d: usize) -> &'static [&'static str] {
+    if d == 512 {
+        &["main", "mma", "auto", "pair"]
+    } else {
+        &["main", "mma", "auto", "pair", "quad", "quad0"]
+    }
+}
+
+/// `kernel` ([`kernels`]) at heads of `d` for the calling thread's launches; `""` follows the
+/// defaults again.
+pub fn pick(d: usize, kernel: &str) {
+    if kernel.is_empty() {
+        set_d512_pair_here(None);
+        set_qm_prefill_here(None);
+        grid_bench::set_here("");
+        return;
+    }
+    assert!(
+        kernels(d).contains(&kernel),
+        "no kernel {kernel} at heads of {d}; one of {:?}",
+        kernels(d)
+    );
+    if d == 512 {
+        set_d512_pair_here(Some(match kernel {
+            "pair" => 1,
+            "auto" => -1,
+            _ => 0,
+        }));
+    } else if kernel == "mma" {
+        grid_bench::set_here("main");
+        set_qm_prefill_here(Some(false));
+    } else {
+        grid_bench::set_here(kernel);
+    }
+}
+
 /// One graph of `calls` calls of `kernel` on `g` in `mode` (`op` false: the flushes alone),
 /// computed `reps` times a round: the best round's ms per call, and call 0's output (empty
 /// without the calls).
@@ -147,7 +193,14 @@ fn graph_ms(
         .new_tensor(types::I32, &[g.width as i64, ns as i64])
         .as_input();
     let past = ctx.new_tensor(types::I32, &[ns as i64]).as_input();
-    let scratch = ctx.new_tensor(types::F32, &[1, 1, 1, 1]).as_input();
+    // A decode step's splits over the key blocks, as a model's (a placeholder otherwise).
+    let shape = if g.n_tok == 1 {
+        let (h, hk) = (n_head as i64, g.heads.2 as i64);
+        scratch_shape(d as i64, h, hk, 1, ns)
+    } else {
+        [1, 1, 1, 1]
+    };
+    let scratch = ctx.new_tensor(types::F32, &shape).as_input();
     let buf = flush.buf();
     let mut graph = ctx.new_graph(16 * calls + 16);
     let mut first = None;
@@ -177,7 +230,7 @@ fn graph_ms(
         fill(q, tab, past, g);
         o.set_f32(&vec![f32::NAN; o.elements()]);
     }
-    grid_bench::set_here(kernel);
+    pick(d, kernel);
     backend.compute(&graph).expect("compute");
     let out = first.map(|o| o.to_f32()).unwrap_or_default();
     let mut best = f64::INFINITY;
@@ -193,7 +246,7 @@ fn graph_ms(
         let ms = busy / (reps.max(1) * calls) as f64;
         best = best.min(ms);
     }
-    grid_bench::set_here("");
+    pick(d, "");
     (best, out)
 }
 

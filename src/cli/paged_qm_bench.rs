@@ -53,13 +53,21 @@ pub struct PagedQmBenchArgs {
     /// `--paged-verify-split`; other bits, timed for reference).
     #[arg(long, value_delimiter = ',')]
     grid: Vec<String>,
-    /// With `--grid`: time each kernel per call as a model's step meets it (#689), in these
-    /// modes instead of the plain timing: `warm` (nothing between calls), `rot` (the layers'
-    /// pools in turn), `read` (a 1 GiB read before each call), `rotread` (both), `l2` (a 48 MiB
-    /// read), `tlb` / `tlb64k` (one 4-byte read every 2 MiB / 64 KiB over 8 GiB), `pt64k` /
-    /// `pt2m` (the call's own K/V pools touched every 64 KiB / 2 MiB first); parts join with +.
+    /// With `--grid` or `--d512`: time each kernel per call as a model's step meets it (#689), in
+    /// these modes instead of the plain timing: `warm` (nothing between calls), `rot` (the
+    /// layers' pools in turn), `read` (a 1 GiB read before each call), `rotread` (both), `l2` (a
+    /// 48 MiB read), `tlb` / `tlb64k` (one 4-byte read every 2 MiB / 64 KiB over 8 GiB), `pt64k`
+    /// / `pt2m` (the call's own K/V pools touched every 64 KiB / 2 MiB first); parts join with +.
+    /// Kernels: `--grid` main, mma (no queries-as-M kernel), auto, pair, quad, quad0; `--d512`
+    /// main / mma, auto, pair. Groups of one token a sequence are decode steps.
     #[arg(long, value_delimiter = ',')]
     cold: Vec<String>,
+    /// With `--cold`: run each kernel under each of these sets of start-of-kernel page prefetches
+    /// (#689; sums of 1 the decode kernel, 2 the pair kernel at heads of 256, 4 the warp-pair
+    /// kernel at heads of 512, 8 `paged_prefill_mma`, 16 the queries-as-M kernel; e.g. `0,31`).
+    /// None given: the default's.
+    #[arg(long, value_delimiter = ',')]
+    pf: Vec<i32>,
     /// With `--cold`: the host sleeps this long before each graph (an idle GPU in between).
     #[arg(long, default_value_t = 0)]
     gap_ms: u64,
@@ -116,6 +124,15 @@ pub fn run(args: PagedQmBenchArgs) -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("--chunks takes n_past:n_tok, not {c}"))?;
         chunks.push((p.trim().parse::<usize>()?, t.trim().parse::<usize>()?));
     }
+    if !args.cold.is_empty() {
+        let (d, picked) = if args.d512.is_empty() {
+            (256, &args.grid)
+        } else {
+            (512, &args.d512)
+        };
+        anyhow::ensure!(!picked.is_empty(), "--cold takes --grid or --d512 kernels");
+        return run_cold(&args, (d, n_head, n_head_kv), picked, &chunks);
+    }
     if !args.d512.is_empty() {
         use legion::model::core::paged_d512_bench as d512;
         let alt = Alt {
@@ -142,9 +159,6 @@ pub fn run(args: PagedQmBenchArgs) -> anyhow::Result<()> {
             on: grid::on_grid,
             edges: grid::edges,
         };
-        if !args.cold.is_empty() {
-            return run_cold(&args, heads, &chunks);
-        }
         return run_alt(&args, &alt, heads, &chunks);
     }
     let mut gpu = legion::ggml::backend_by_name("CUDA0")?;
@@ -346,22 +360,25 @@ fn run_alt(
     Ok(())
 }
 
-/// `--grid` with `--cold` (#689): each kernel's ms per call in each cold mode, call 0's output
-/// checked against `paged_prefill_mma`'s bits.
+/// `--grid` or `--d512` with `--cold` (#689): each kernel's ms per call in each cold mode under
+/// each `--pf` prefetch set, call 0's output checked against the first run's bits (every kernel
+/// and prefetch set computes the same values).
 #[cfg(feature = "cuda")]
 fn run_cold(
     args: &PagedQmBenchArgs,
     heads: (usize, usize, usize),
+    picked: &[String],
     chunks: &[(usize, usize)],
 ) -> anyhow::Result<()> {
     use legion::model::core::paged_cold_bench as cold;
-    use legion::model::core::paged_grid_bench as grid;
+    use legion::model::core::paged_cold_bench::set_prefetch_here;
     use legion::model::core::paged_split_bench::{Group, pools};
-    for k in &args.grid {
+    let flag = if heads.0 == 512 { "--d512" } else { "--grid" };
+    for k in picked {
         anyhow::ensure!(
-            k != "main" && k != "split" && grid::KERNELS.contains(&k.as_str()),
-            "--cold takes --grid kernels of {:?} but split",
-            &grid::KERNELS[1..]
+            cold::kernels(heads.0).contains(&k.as_str()),
+            "--cold takes {flag} kernels of {:?}",
+            cold::kernels(heads.0)
         );
     }
     for m in &args.cold {
@@ -371,10 +388,16 @@ fn run_cold(
             cold::PARTS
         );
     }
+    let ratio = if heads.0 == 512 { 8 } else { 6 };
     anyhow::ensure!(
-        heads.1 == 6 * heads.2,
-        "--cold takes 6 query heads a kv head"
+        heads.1 == ratio * heads.2,
+        "--cold {flag} takes {ratio} query heads a kv head"
     );
+    let pfs: Vec<Option<i32>> = if args.pf.is_empty() {
+        vec![None]
+    } else {
+        args.pf.iter().map(|&b| Some(b)).collect()
+    };
     let mut gpu = legion::ggml::backend_by_name("CUDA0")?;
     let max_ctx = chunks.iter().map(|(p, t)| p + t).max().unwrap_or(0);
     let n_blocks = max_ctx.div_ceil(64).max(args.pool_blocks).max(1);
@@ -407,50 +430,57 @@ fn run_cold(
             ring: 0,
             scale: 1.0 / (heads.0 as f32).sqrt(),
         };
-        let (want, _) = grid::run(&mut gpu, &kv, &g, "main", 0, 0);
         println!("{n_past}:{n_tok} x{seqs}: ms per call (flush ms per call)");
-        print!("{:>8}", "kernel");
+        print!("{:>12}", "kernel/pf");
         for m in &args.cold {
             print!(" {m:>9}");
         }
         println!("  bits");
         let mut flush_ms = vec![0.0; args.cold.len()];
-        for k in &args.grid {
-            print!("{k:>8}");
-            let mut bad = 0;
-            for (mi, m) in args.cold.iter().enumerate() {
-                let (ms, f, out) = cold::time(
-                    &mut gpu,
-                    &kv,
-                    layers,
-                    &flush,
-                    &g,
-                    k,
-                    m,
-                    layers,
-                    args.reps,
-                    args.rounds,
-                    args.gap_ms,
-                );
-                flush_ms[mi] = f;
-                bad += want
-                    .iter()
-                    .zip(&out)
-                    .filter(|(x, y)| x.to_bits() != y.to_bits())
-                    .count();
-                print!(" {ms:>9.3}");
+        let mut want: Option<Vec<f32>> = None;
+        for k in picked {
+            for &pf in &pfs {
+                let label = pf.map_or(k.clone(), |b| format!("{k}/{b}"));
+                print!("{label:>12}");
+                set_prefetch_here(pf);
+                let mut bad = 0;
+                for (mi, m) in args.cold.iter().enumerate() {
+                    let (ms, f, out) = cold::time(
+                        &mut gpu,
+                        &kv,
+                        layers,
+                        &flush,
+                        &g,
+                        k,
+                        m,
+                        layers,
+                        args.reps,
+                        args.rounds,
+                        args.gap_ms,
+                    );
+                    flush_ms[mi] = f;
+                    let want = want.get_or_insert_with(|| out.clone());
+                    anyhow::ensure!(want.len() == out.len(), "no output to compare");
+                    bad += want
+                        .iter()
+                        .zip(&out)
+                        .filter(|(x, y)| x.to_bits() != y.to_bits())
+                        .count();
+                    print!(" {ms:>9.3}");
+                }
+                set_prefetch_here(None);
+                differ += bad;
+                println!("  {}", if bad == 0 { "same" } else { "DIFFER" });
             }
-            differ += bad;
-            println!("  {}", if bad == 0 { "same" } else { "DIFFER" });
         }
-        print!("{:>8}", "flush");
+        print!("{:>12}", "flush");
         for f in flush_ms {
             print!(" {f:>9.3}");
         }
         println!();
     }
     if differ > 0 {
-        anyhow::bail!("{differ} values differ from paged_prefill_mma's bits");
+        anyhow::bail!("{differ} values differ from the first run's bits");
     }
     Ok(())
 }
