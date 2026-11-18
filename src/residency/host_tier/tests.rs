@@ -364,6 +364,72 @@ fn a_staged_pass_reads_into_the_ram_slots_it_was_given() {
 }
 
 #[test]
+fn a_staged_pass_ring_puts_a_batch_behind_the_one_before() {
+    use passes::{Geo, ring_places};
+    // One expert size (1 byte a kind), places 0..8 (two sets of 4). Batches of 4, 2, 4, 3, 1
+    // places, one layer each; a batch of RAM slot reads takes none.
+    let g = Geo {
+        first: 0,
+        end: 8,
+        stage: [0, 100, 200],
+        bytes: [1, 1, 1],
+    };
+    let batch =
+        |l: usize, n: usize| -> passes::Batch { (0..n).map(|i| (l, i, To::Place(i))).collect() };
+    let batches = vec![
+        batch(0, 4),
+        batch(0, 2),
+        vec![(1, 0, To::Slot(3))],
+        batch(2, 4),
+        batch(3, 3),
+        batch(4, 1),
+    ];
+    let (at, need) = ring_places(&batches, &[g; 5]).unwrap();
+    assert_eq!(
+        at,
+        vec![
+            vec![0, 1, 2, 3],
+            vec![4, 5],
+            vec![],
+            // 6..10 passes the end: from the start again, over batch 0's places.
+            vec![0, 1, 2, 3],
+            // 4..7 overlaps batch 1's.
+            vec![4, 5, 6],
+            vec![7]
+        ]
+    );
+    // The reader waits only for the batches whose places it overwrites (and those before).
+    assert_eq!(need, vec![0, 0, 0, 1, 2, 0]);
+}
+
+#[test]
+fn a_staged_pass_ring_waits_for_any_kind_of_another_size() {
+    use passes::{Geo, ring_places};
+    // Layer 0's experts are 2 bytes in kind 1, layer 1's 1: layer 0's places 0..2 end at
+    // byte 4 there, so layer 1 starts at its place 4; when it wraps to its first place (2), it
+    // overlaps layer 0's bytes in kind 1 only, and waits for them.
+    let a = Geo {
+        first: 0,
+        end: 6,
+        stage: [0, 0, 0],
+        bytes: [1, 2, 1],
+    };
+    let b = Geo {
+        first: 2,
+        end: 10,
+        stage: [0, 0, 0],
+        bytes: [1, 1, 1],
+    };
+    let batch =
+        |l: usize, n: usize| -> passes::Batch { (0..n).map(|i| (l, i, To::Place(i))).collect() };
+    let (at, need) = ring_places(&[batch(0, 2), batch(1, 6), batch(1, 2)], &[a, b]).unwrap();
+    assert_eq!(at, vec![vec![0, 1], vec![4, 5, 6, 7, 8, 9], vec![2, 3]]);
+    assert_eq!(need, vec![0, 0, 1]);
+    // A batch bigger than its layer's places is a planning error.
+    assert!(ring_places(&[batch(0, 7)], &[a]).is_err());
+}
+
+#[test]
 fn a_staged_pass_without_places_reads_nothing() {
     use passes::{Held, plan_pass};
     assert!(plan_pass(&[vec![Held::Ram(0)]], 4, 0, 0).is_ok());

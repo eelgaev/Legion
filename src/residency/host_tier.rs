@@ -1056,11 +1056,13 @@ pub(crate) fn plan_prefill(cache: &mut SlotCache, experts: &[usize]) -> Vec<(usi
     loads
 }
 
-/// Where a read puts an expert: a RAM slot, or a staging place.
+/// Where a read puts an expert: a RAM slot, a staging place (`set * places + i`), or the
+/// place at this index past the gap (a staged pass's ring, [`passes::ring_places`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum To {
     Slot(usize),
     Place(usize),
+    At(usize),
 }
 
 impl Inner {
@@ -1121,6 +1123,7 @@ impl Inner {
                 dst: match to {
                     To::Slot(s) => mem.ram[k] + s * n,
                     To::Place(p) => mem.stage[k] + self.place_at(il, p) * n,
+                    To::At(q) => mem.stage[k] + q * n,
                 },
             }
         })
