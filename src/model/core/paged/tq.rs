@@ -558,6 +558,7 @@ unsafe fn cuda_tq_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<()
             vsplit_chunk: 0,
             d512_pair: 0,
             verify_grid: 0,
+            prefetch: 0,
         };
         // An upper bound on the pieces: every table entry walked (idle pieces return early).
         let pieces = tw.div_ceil(pl.cap).max(1);
