@@ -149,6 +149,8 @@ fn verify_grid_default() -> i32 {
         || match std::env::var("LEGION_DEBUG_PAGED_VERIFY_GRID").as_deref() {
             Ok("0") => 0,
             Ok("1") => -2,
+            // Probe (#689 r18): the pick with the quad kernel replaced by variant 3..7.
+            Ok(v) if matches!(v.parse::<i32>(), Ok(3..=7)) => -10 - v.parse::<i32>().unwrap(),
             _ => -1,
         },
     )
@@ -221,6 +223,11 @@ fn verify_grid_for(
             // Without the quad kernel: the pair kernel wherever the quad's grid fits too (half
             // the pair's), so exactly the pair kernel's own routing.
             if m == -2 { kind.min(1) } else { kind }
+        }
+        m @ -17..=-13 => {
+            let sms = crate::hw::per_device::current().map_or(0, crate::hw::per_device::sm_count);
+            let kind = verify_grid_kind(n_tok, n_seqs, n_head_kv, sms.max(0) as usize);
+            if kind == 2 { -10 - m } else { kind }
         }
         m => m.max(0),
     }

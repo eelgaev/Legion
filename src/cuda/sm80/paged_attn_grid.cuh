@@ -468,9 +468,23 @@ __device__ __forceinline__ void grid_quad_sync(int id) {
 }
 #endif
 
-template <int D, int G, int NG, int CH_, int NS_>
-__global__ void __launch_bounds__(NG * 128, 1) paged_prefill_quad(const legion_paged_attn p) {
+constexpr int QCL = 6;  // CTAs a cluster in paged_prefill_quad_lock
+
 #ifdef LEGION_PAGED_MMA
+// The cluster barrier's halves (sm_90+; the LOCK > 0 instantiations only).
+__device__ __forceinline__ void quad_cl_arrive() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;\n" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void quad_cl_wait() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("barrier.cluster.wait.aligned;\n" ::: "memory");
+#endif
+}
+
+template <int D, int G, int NG, int CH_, int NS_, int LOCK, int PD>
+__device__ __forceinline__ void quad_body(const legion_paged_attn & p) {
     using SH = QShape<D, NG, CH_, NS_>;
     using fa::cp_async16;
     using fa::ldsm;
@@ -597,12 +611,54 @@ __global__ void __launch_bounds__(NG * 128, 1) paged_prefill_quad(const legion_p
         v_x[r] = ((2 * r + lane / 8 % 2) ^ (lane % 8)) << 4;
     }
 
+    // L2 prefetch (PD > 0, F16 cache): the kv head's CTAs together ask L2 for tile wi + PD's K and
+    // V rows while they stream tile wi (a hint, no data moves to the SM).
+    auto prefetch = [&](int i) {
+        if constexpr (PD > 0) {
+            if (i < wk.i1 && p.k_type == LEGION_KV_F16 && p.v_type == LEGION_KV_F16) {
+                const int e0 = head_at<D, false>(p, kvh);
+                const half * kb = (const half *) wk.cells(p.k, p.k_stage, i, p.k_cell) + e0;
+                const half * vb = (const half *) wk.cells(p.v, p.v_stage, i, p.v_cell) + e0;
+                constexpr int RL = D * 2 / 128, LINES = 2 * BLK * RL;  // 128-byte lines
+                for (int x = blockIdx.x * NW * 32 + threadIdx.x; x < LINES; x += gridDim.x * NW * 32) {
+                    const int r = x % (BLK * RL) / RL, u = x % RL;
+                    const half * a = (x < BLK * RL ? kb : vb) + (int64_t) r * p.kv_row + u * 64;
+                    asm volatile("prefetch.global.L2 [%0];\n" ::"l"(a));
+                }
+            }
+        }
+    };
+    // Lock-step (LOCK > 0, the cluster kernel): the cluster's CTAs (column groups of one kv head)
+    // pass a cluster barrier every LOCK tiles (arrive, then wait one interval later), so none runs
+    // more than LOCK tiles ahead. Without pieces or a window every CTA starts at key block 0 and
+    // the cluster's first CTA has the most tiles; the others pad to its count.
+    const bool lock = LOCK > 0 && !p.piece_blk && !p.ml && p.window == 0;
+    int n_all = 0;
+    if constexpr (LOCK > 0) {
+        if (lock) {
+            const int c0_hi = (gridDim.x - 1 - blockIdx.x / QCL * QCL) * COLS;
+            n_all = pos_of(c0_hi + COLS - 1) / BLK + 1;
+        }
+    }
+    for (int t = 0; t < PD; t++) {
+        prefetch(wk.i0 + t);
+    }
+
     for (int j = 0; j < NS - 1; j++) {
         issue(j);
     }
     int j = 0;
     for (int wi = wk.i0; wi < wk.i1; wi++) {
         const int k0 = wk.block(wi) * BLK;
+        if constexpr (LOCK > 0) {
+            if (lock && (wi - wk.i0) % LOCK == 0) {
+                if (wi > wk.i0) {
+                    quad_cl_wait();
+                }
+                quad_cl_arrive();
+            }
+        }
+        prefetch(wi + PD);
         // Whether any column of the group sees a key of the tile, and whether all see all.
         const bool active = w_cols && k0 <= w_pos_hi && k0 + BLK - 1 >= w_first_lo;
         const bool whole  = k0 >= w_first_hi && k0 + BLK - 1 <= w_pos_lo;
@@ -728,6 +784,17 @@ __global__ void __launch_bounds__(NG * 128, 1) paged_prefill_quad(const legion_p
         }
     }
     asm volatile("cp.async.wait_group 0;\n" ::);
+    if constexpr (LOCK > 0) {
+        if (lock) {
+            for (int t = wk.i1 - wk.i0; t < n_all; t++) {
+                if (t % LOCK == 0) {
+                    quad_cl_wait();
+                    quad_cl_arrive();
+                }
+            }
+            quad_cl_wait();
+        }
+    }
 
     // The sums' lane tree as in paged_prefill_mma (warp 3's, then to the others).
     if (h == 3) {
@@ -783,6 +850,41 @@ __global__ void __launch_bounds__(NG * 128, 1) paged_prefill_quad(const legion_p
             }
         }
     }
+}
+#endif
+
+template <int D, int G, int NG, int CH_, int NS_>
+__global__ void __launch_bounds__(NG * 128, 1) paged_prefill_quad(const legion_paged_attn p) {
+#ifdef LEGION_PAGED_MMA
+    quad_body<D, G, NG, CH_, NS_, 0, 0>(p);
+#else
+    __trap();
+#endif
+}
+
+// Probe (#689 r18): the quad kernel with an L2 prefetch PD tiles ahead.
+template <int D, int G, int PD>
+__global__ void __launch_bounds__(128, 1) paged_prefill_quad_pf(const legion_paged_attn p) {
+#ifdef LEGION_PAGED_MMA
+    quad_body<D, G, 1, 256, 3, 0, PD>(p);
+#else
+    __trap();
+#endif
+}
+
+// The cluster of QCL quad CTAs (sm_90+); no cluster attribute where the device code has none.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+#define LEGION_QUAD_CLUSTER
+#else
+#define LEGION_QUAD_CLUSTER __cluster_dims__(6, 1, 1)
+#endif
+
+// Probe (#689 r18): the quad kernel on clusters of QCL CTAs of a kv head in lock-step every LOCK
+// tiles, with an L2 prefetch PD tiles ahead (0: none).
+template <int D, int G, int LOCK, int PD>
+__global__ void LEGION_QUAD_CLUSTER __launch_bounds__(128, 1) paged_prefill_quad_lock(const legion_paged_attn p) {
+#if defined(LEGION_PAGED_MMA) && __CUDA_ARCH__ >= 900
+    quad_body<D, G, 1, 256, 3, LOCK, PD>(p);
 #else
     __trap();
 #endif
@@ -806,7 +908,30 @@ int launch_with(K kernel, std::atomic<int8_t> * opted_in, const legion_paged_att
 // (paged_prefill_mma instead).
 template <int D, int G>
 int launch(const legion_paged_attn & p, cudaStream_t st) {
-    if (p.verify_grid == 2) {
+    using Q = QShape<D, 1, 256, 3>;
+    // Probe variants (#689 r18); the cluster ones only where the grid's x is whole clusters.
+    const bool whole_cl = (p.n_tok * G + Q::COLS - 1) / Q::COLS % QCL == 0;
+    if (p.verify_grid == 3 && whole_cl) {
+        static std::atomic<int8_t> o3[GGML_CUDA_MAX_DEVICES];
+        return launch_with<Q>(paged_prefill_quad_lock<D, G, 1, 0>, o3, p, G, st);
+    }
+    if (p.verify_grid == 4 && whole_cl) {
+        static std::atomic<int8_t> o4[GGML_CUDA_MAX_DEVICES];
+        return launch_with<Q>(paged_prefill_quad_lock<D, G, 4, 0>, o4, p, G, st);
+    }
+    if (p.verify_grid == 5) {
+        static std::atomic<int8_t> o5[GGML_CUDA_MAX_DEVICES];
+        return launch_with<Q>(paged_prefill_quad_pf<D, G, 8>, o5, p, G, st);
+    }
+    if (p.verify_grid == 6) {
+        static std::atomic<int8_t> o6[GGML_CUDA_MAX_DEVICES];
+        return launch_with<Q>(paged_prefill_quad_pf<D, G, 16>, o6, p, G, st);
+    }
+    if (p.verify_grid == 7 && whole_cl) {
+        static std::atomic<int8_t> o7[GGML_CUDA_MAX_DEVICES];
+        return launch_with<Q>(paged_prefill_quad_lock<D, G, 1, 16>, o7, p, G, st);
+    }
+    if (p.verify_grid >= 2) {
         static std::atomic<int8_t> o2[GGML_CUDA_MAX_DEVICES];
         return launch_with<QShape<D, 1, 256, 3>>(paged_prefill_quad<D, G, 1, 256, 3>, o2, p, G, st);
     }
