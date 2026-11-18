@@ -4510,6 +4510,25 @@ impl Executor {
             .map_err(|e| ModelError::Ggml(GgmlError::External(format!("expert cache: {e}"))))
     }
 
+    /// Before a step that does not lend the expert cache (#37): takes in the refill the last
+    /// restore started and starts the bounded host tier's RAM fill, so its copies run with the
+    /// step ([`ExpertResidency::step_unlent`]). Nothing to do (no wait) once it was taken in.
+    ///
+    /// [`ExpertResidency::step_unlent`]: crate::residency::experts::ExpertResidency::step_unlent
+    pub fn experts_step_unlent(&mut self) -> Result<(), ModelError> {
+        if !self.model.experts().is_some_and(|r| r.refill_at_admit()) {
+            return Ok(());
+        }
+        self.wait_commit();
+        self.flush_deferred()?;
+        match self.model.experts_mut() {
+            Some(r) => r
+                .step_unlent()
+                .map_err(|e| ModelError::Ggml(GgmlError::External(format!("expert cache: {e}")))),
+            None => Ok(()),
+        }
+    }
+
     /// Refills the expert slots [`Self::restore_experts_leaving`] left without VRAM, while the
     /// cache is not lent (the steps' graphs stay: they look experts up in the tables).
     pub fn refill_experts(&mut self) -> Result<(), ModelError> {

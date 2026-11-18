@@ -6522,41 +6522,66 @@ impl Worker {
                 self.fail_all(&e, &mut pipe, &mut decoding, &mut prefilling);
             }
 
-            while !waiting.is_empty()
-                && decoding.len() + pipe.len() + prefilling.len() < self.max_seqs
-                && prefilling.len() < self.prefill_slots
-            {
-                let slot = (self.max_seqs..self.max_seqs + self.prefill_slots)
-                    .find(|s| prefilling.iter().all(|q| q.slot != *s))
-                    .expect("a free prefill slot");
-                let running = decoding
-                    .iter()
-                    .chain(pipe.seqs())
-                    .chain(prefilling.iter())
-                    .map(|s| s.ticket.scheduling().share_key);
-                let (item, ticket) = waiting.pop(self.max_seqs, running).unwrap();
-                let admitted = match item {
-                    Waiting::New(job) => match self.admit(&tokenizer, job, ticket, slot) {
-                        Admission::Admitted(seq) => Ok(seq),
-                        Admission::Wait(job) => Err(Waiting::New(job)),
-                        Admission::Failed(job, e) => {
-                            let _ = job.out.send(TokenEvent::Error(e));
-                            continue;
+            // Requests that reached the queue while the ones before them were admitted join the
+            // same step (#37): requests sent together arrive a fraction of a millisecond
+            // apart, and one that landed just after the drain above started its prompt a whole
+            // step (on a 4090 with experts in host memory, ~0.9 s) after the others.
+            // `--deterministic` holds them for the next wave instead ([`waves`]).
+            loop {
+                let mut short = false;
+                while !waiting.is_empty()
+                    && decoding.len() + pipe.len() + prefilling.len() < self.max_seqs
+                    && prefilling.len() < self.prefill_slots
+                {
+                    let slot = (self.max_seqs..self.max_seqs + self.prefill_slots)
+                        .find(|s| prefilling.iter().all(|q| q.slot != *s))
+                        .expect("a free prefill slot");
+                    let running = decoding
+                        .iter()
+                        .chain(pipe.seqs())
+                        .chain(prefilling.iter())
+                        .map(|s| s.ticket.scheduling().share_key);
+                    let (item, ticket) = waiting.pop(self.max_seqs, running).unwrap();
+                    let admitted = match item {
+                        Waiting::New(job) => match self.admit(&tokenizer, job, ticket, slot) {
+                            Admission::Admitted(seq) => Ok(seq),
+                            Admission::Wait(job) => Err(Waiting::New(job)),
+                            Admission::Failed(job, e) => {
+                                let _ = job.out.send(TokenEvent::Error(e));
+                                continue;
+                            }
+                        },
+                        Waiting::Preempted(seq) => match self.resume(seq, slot) {
+                            preempt::Resume::Admitted(seq) => Ok(seq),
+                            preempt::Resume::Wait(seq) => Err(Waiting::Preempted(seq)),
+                            preempt::Resume::Failed => continue,
+                        },
+                    };
+                    match admitted {
+                        Ok(seq) => prefilling.push(*seq),
+                        Err(item) => {
+                            waiting.put_back(item, ticket);
+                            short = true;
+                            break;
                         }
-                    },
-                    Waiting::Preempted(seq) => match self.resume(seq, slot) {
-                        preempt::Resume::Admitted(seq) => Ok(seq),
-                        preempt::Resume::Wait(seq) => Err(Waiting::Preempted(seq)),
-                        preempt::Resume::Failed => continue,
-                    },
-                };
-                match admitted {
-                    Ok(seq) => prefilling.push(*seq),
-                    Err(item) => {
-                        waiting.put_back(item, ticket);
-                        break;
                     }
                 }
+                let room = decoding.len() + pipe.len() + prefilling.len() < self.max_seqs
+                    && prefilling.len() < self.prefill_slots;
+                if short || !room || self.gather.is_some() {
+                    break;
+                }
+                let mut arrived = Vec::new();
+                let (late, still) = waves::drain(&rx, &mut arrived);
+                open &= still;
+                if late == 0 {
+                    break;
+                }
+                for job in arrived {
+                    queue(&mut waiting, job);
+                }
+                waiting.retain(|w| w.keep(&mut self.outbox));
+                tracing::debug!(late, "requests that arrived during admission join the step");
             }
             // Prefill budget goes to prompts in `prefilling`'s order: the queue's under
             // `priority` (a stable sort, so prompts already in order stay put).
@@ -7986,6 +8011,13 @@ impl Worker {
         // rest of a long prompt keeps big steps).
         if long {
             self.lent_short = false;
+        }
+        // #37: a step that runs without the lend lets the expert cache's lent tails take
+        // their VRAM back as it starts, so its after-step can swap over every slot.
+        if !self.lent
+            && let Err(e) = self.exec.experts_step_unlent()
+        {
+            tracing::warn!(error = %e, "could not refill the expert cache");
         }
         // Plan as a long prompt: big steps over the borrowed cache.
         let big = self.lent && !self.lent_short;

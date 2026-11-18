@@ -128,6 +128,11 @@ struct legion_paged_attn {
     // 4 warps, a CTA each) instead of paged_prefill_mma; the same bits. Picked on the Rust side
     // (paged::verify_grid_kind) for small groups.
     int32_t verify_grid;
+    // 1: paged_prefill_pair's CTAs prefetch the first line of every K and V block of their keys
+    // into L2 at the start (prefetch_walk below, #689), so the keys' pages are translated before
+    // the loop reaches them. The same bits either way. Picked on the Rust side
+    // (paged::d512_prefetch_for). The quad kernel's prefetch is its own (verify_grid 2 / 3).
+    int32_t prefetch;
 };
 
 enum { LEGION_KV_F16 = 0, LEGION_KV_Q8_0 = 1, LEGION_KV_Q4_0 = 2 };
@@ -306,6 +311,24 @@ __device__ __forceinline__ Walk walk(const legion_paged_attn & p, int seq, int b
 // Whether a prefill CTA of a later piece has nothing to add (its rows keep their output).
 __device__ __forceinline__ bool piece_idle(const legion_paged_attn & p, const Walk & w) {
     return p.piece > 0 && (*p.piece_cnt == 0 || w.i0 >= w.i1);
+}
+
+// With p.prefetch (#689; paged_prefill_quad's prefetch for the other kernels): one
+// prefetch.global.L2 of the first line of every K and V block of walk entries [w.i0, w.i1), the
+// CTA's `nt` threads in turn, issued right after the kernel's first loads. In a model each call
+// comes after other layers' traffic and meets its keys' page translations cold; this has them
+// translated before the loop gets there. Reads nothing into registers and writes nothing: the
+// same bits.
+__device__ __forceinline__ void prefetch_walk(const legion_paged_attn & p, const Walk & w, int nt) {
+    if (!p.prefetch) {
+        return;
+    }
+    const int n = (w.i1 - w.i0) * 2;
+    for (int x = threadIdx.x; x < n; x += nt) {
+        const int    i = w.i0 + x / 2;
+        const char * a = x % 2 == 0 ? w.cells(p.k, p.k_stage, i, p.k_cell) : w.cells(p.v, p.v_stage, i, p.v_cell);
+        asm volatile("prefetch.global.L2 [%0];\n" ::"l"(a));
+    }
 }
 
 // The first element of kv head kvh in a cell: kvh * D, or in Gemma 4's compact cache (C, #551)

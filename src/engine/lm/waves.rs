@@ -8,7 +8,7 @@
 //! that arrive while a wave runs are held until the engine is idle again. A client that sends
 //! its requests together (the det client's C=16) then gets the same steps every run.
 
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
 /// The gather window's cap, in windows: a client that keeps sending at shorter gaps than the
@@ -28,6 +28,22 @@ pub(super) fn gather<T>(rx: &Receiver<T>, quiet: Duration, held: &mut Vec<T>) ->
             Ok(item) => held.push(item),
             Err(RecvTimeoutError::Timeout) => return true,
             Err(RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+}
+
+/// Takes what is in `rx` now into `held`, without waiting: how many, and false once the
+/// sender is gone.
+pub(super) fn drain<T>(rx: &Receiver<T>, held: &mut Vec<T>) -> (usize, bool) {
+    let mut n = 0;
+    loop {
+        match rx.try_recv() {
+            Ok(item) => {
+                held.push(item);
+                n += 1;
+            }
+            Err(TryRecvError::Empty) => return (n, true),
+            Err(TryRecvError::Disconnected) => return (n, false),
         }
     }
 }
