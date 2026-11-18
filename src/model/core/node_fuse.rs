@@ -123,11 +123,26 @@ pub(crate) struct Counts {
 /// Graphs whose rewrite was logged (the first few only).
 static LOGGED: AtomicUsize = AtomicUsize::new(0);
 
-/// The pass on CUDA graphs ([`crate::ggml::post_alloc::set_rewrite`]).
+/// The pass on CUDA graphs ([`crate::ggml::post_alloc::set_rewrite`]). Then the CPU share's
+/// layers get their shared expert moved to run while the pool works
+/// ([`crate::residency::cpu_share::shexp`]), with the pass's choices made.
 ///
 /// # Safety
 /// As [`crate::ggml::post_alloc::Rewrite`].
 pub unsafe fn rewrite(graph: *mut ffi::ggml_cgraph) {
+    // SAFETY: the caller's.
+    unsafe {
+        fuse(graph);
+        #[cfg(feature = "cuda")]
+        crate::residency::cpu_share::shexp::place_shexp(graph);
+    }
+}
+
+/// [`rewrite`]'s fusion pass.
+///
+/// # Safety
+/// As [`rewrite`].
+unsafe fn fuse(graph: *mut ffi::ggml_cgraph) {
     // With ggml-cuda's fusions off, every sum runs unfused; left alone rather than modelled.
     if !ON.load(Ordering::Relaxed) || std::env::var_os("GGML_CUDA_DISABLE_FUSION").is_some() {
         return;

@@ -690,3 +690,140 @@ fn share_keeps_the_plain_layout() {
         }
     }
 }
+
+/// The shared expert moves ahead of the pool's SwiGLU (or down) op in each share layer, its
+/// outputs (and views of them) into the region, every other tensor's memory and the tail's
+/// order as allocated; [`super::shexp::ShexpAt::After`] leaves the graph alone.
+#[test]
+fn shexp_moves_into_its_region() {
+    use super::ops::{MAX_PAIRS, ShareLayer, share_nodes};
+    use super::shexp::{ALIGN, ShexpAt, place};
+    use crate::ggml::{Backend, ComputeAllocator, Context, ffi, op_of};
+
+    let (k, rows, n_expert, n_used, n_tok, ff) = (256i64, 64i64, 6i64, 3i64, 2i64, 32i64);
+    let name = |t: *mut ffi::ggml_tensor| {
+        // SAFETY: a node of the live graph.
+        unsafe { op_of(t) }.map_or("", |op| op.name)
+    };
+    for mode in [ShexpAt::After, ShexpAt::BeforeDown, ShexpAt::BeforeGlu] {
+        let b = Backend::cpu().unwrap();
+        let weights = Context::new(16, 0);
+        let stacks: Vec<_> = (0..3)
+            .map(|_| {
+                [
+                    weights.new_tensor(types::Q4_K, &[k, rows, n_expert]),
+                    weights.new_tensor(types::Q4_K, &[k, rows, n_expert]),
+                    weights.new_tensor(types::Q5_1, &[rows, k, n_expert]),
+                    weights.new_tensor(types::F32, &[k, ff]),
+                    weights.new_tensor(types::F32, &[ff, k]),
+                    weights.new_tensor(types::F32, &[k, 1]),
+                ]
+            })
+            .collect();
+        let ids_at = weights.new_tensor(types::I32, &[3 * MAX_PAIRS as i64]);
+        weights.alloc_tensors(b.buffer_type()).unwrap();
+        let ctx = Context::new(160, 0);
+        let x = ctx.new_tensor(types::F32, &[k, 1, n_tok]).as_input();
+        let it = ctx.new_tensor(types::I32, &[n_used, n_tok]).as_input();
+        let wts = ctx.new_tensor(types::F32, &[1, n_used, n_tok]).as_input();
+        let mut h = x;
+        let mut shexp = Vec::new();
+        for (l, &[g, u, d, sg, sd, gi]) in stacks.iter().enumerate() {
+            let layer = ShareLayer {
+                n_slots: 3,
+                n_expert: 3,
+                layer: l,
+                threshold: 512,
+            };
+            let at = (ids_at, l * MAX_PAIRS * 4);
+            let out = share_nodes(&ctx, [g, u, d], (h, it, None), at, layer, true);
+            let out = ctx.mul(out, wts);
+            let sum = ctx.sum_rows(ctx.cont(ctx.permute(out, [1, 0, 2, 3])));
+            let routed = ctx.add(ctx.scale(h, 0.5), ctx.reshape_3d(sum, k, 1, n_tok));
+            // The shared expert: two matvecs and its gate's, from the layer's input.
+            let hx = ctx.reshape_2d(h, k, n_tok);
+            let a = ctx.mul_mat(sg, hx);
+            let sh = ctx.mul_mat(sd, a);
+            let gl = ctx.mul_mat(gi, hx);
+            shexp.push([a.raw(), sh.raw(), gl.raw()]);
+            let gated = ctx.mul(sh, ctx.sigmoid(gl));
+            h = ctx.add(routed, ctx.reshape_3d(gated, k, 1, n_tok));
+        }
+        let mut gr = ctx.new_graph(256);
+        gr.expand(h);
+        ctx.alloc_graph(&gr, ComputeAllocator::new(b.buffer_type()))
+            .unwrap();
+        let g = gr.raw();
+        // SAFETY: an allocated graph none of whose nodes ran; the region is host memory the
+        // graph does not use, which the test only reads addresses of.
+        unsafe {
+            let nodes = |g| {
+                let n = ffi::ggml_graph_n_nodes(g);
+                (0..n)
+                    .map(|i| ffi::ggml_graph_node(g, i))
+                    .collect::<Vec<_>>()
+            };
+            let before = nodes(g);
+            let data: Vec<_> = before.iter().map(|&t| (*t).data as usize).collect();
+            let mut region = vec![0u8; 0];
+            let mut asked = 0;
+            let p = place(g, mode, &mut |_, bytes| {
+                asked += 1;
+                region = vec![0u8; bytes + ALIGN];
+                Some((region.as_ptr() as usize).div_ceil(ALIGN) * ALIGN)
+            });
+            let after = nodes(g);
+            if mode == ShexpAt::After {
+                assert_eq!(p, Default::default());
+                assert_eq!(after, before);
+                continue;
+            }
+            assert_eq!((p.moved, p.left, asked), (3, 0, 1), "{mode:?}");
+            assert!(p.bytes >= 3 * 4 * (ff + k + 1) as usize * n_tok as usize);
+            // The same nodes, reordered.
+            let mut s0 = before.clone();
+            let mut s1 = after.clone();
+            s0.sort();
+            s1.sort();
+            assert_eq!(s0, s1);
+            let lo = region.as_ptr() as usize;
+            let hi = lo + region.len();
+            let pos = |t| after.iter().position(|&n| n == t).unwrap();
+            for (l, ts) in shexp.iter().enumerate() {
+                let glus: Vec<_> = after
+                    .iter()
+                    .copied()
+                    .filter(|&t| name(t) == "cpu_share_glu")
+                    .collect();
+                let downs: Vec<_> = after
+                    .iter()
+                    .copied()
+                    .filter(|&t| name(t) == "cpu_share_down")
+                    .collect();
+                let publish: Vec<_> = after
+                    .iter()
+                    .copied()
+                    .filter(|&t| name(t) == "cpu_share_publish")
+                    .collect();
+                assert_eq!((glus.len(), downs.len(), publish.len()), (3, 3, 3));
+                for &t in ts {
+                    assert!((lo..hi).contains(&((*t).data as usize)), "layer {l}");
+                    assert!(pos(t) > pos(publish[l]), "layer {l}");
+                    match mode {
+                        ShexpAt::BeforeGlu => assert!(pos(t) < pos(glus[l]), "layer {l}"),
+                        _ => {
+                            assert!(pos(t) > pos(glus[l]) && pos(t) < pos(downs[l]), "layer {l}")
+                        }
+                    }
+                }
+            }
+            // Every other node's memory as allocated.
+            let moved: Vec<_> = shexp.iter().flatten().copied().collect();
+            for (i, &t) in before.iter().enumerate() {
+                if !moved.contains(&t) {
+                    assert_eq!((*t).data as usize, data[i], "node {i}");
+                }
+            }
+        }
+    }
+}

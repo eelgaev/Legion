@@ -12,7 +12,7 @@ use super::pool::Pool;
 use crate::ggml::{Context, ExternalOp, Tensor, ffi, retarget, types};
 use crate::model::core::expert_mv;
 
-static PUBLISH: ExternalOp = ExternalOp {
+pub(super) static PUBLISH: ExternalOp = ExternalOp {
     name: "cpu_share_publish",
     cpu: cpu_pass,
     #[cfg(feature = "cuda")]
@@ -23,7 +23,7 @@ static PUBLISH: ExternalOp = ExternalOp {
 
 /// The exact share's SwiGLU op: `expert_mv_glu`'s launches, then the host pairs' rows and
 /// blocks made from the host's gate and up sums (`activate`), in place.
-static SHARE_GLU: ExternalOp = ExternalOp {
+pub(super) static SHARE_GLU: ExternalOp = ExternalOp {
     name: "cpu_share_glu",
     cpu: expert_mv::cpu_expert_mv,
     #[cfg(feature = "cuda")]
@@ -33,7 +33,7 @@ static SHARE_GLU: ExternalOp = ExternalOp {
 };
 
 /// [`SHARE_GLU`] of a pre-quantized SwiGLU op ([`expert_mv::glu_tiered_preq`]).
-static SHARE_GLU_PREQ: ExternalOp = ExternalOp {
+pub(super) static SHARE_GLU_PREQ: ExternalOp = ExternalOp {
     name: "cpu_share_glu",
     cpu: expert_mv::cpu_expert_mv,
     #[cfg(feature = "cuda")]
@@ -44,7 +44,7 @@ static SHARE_GLU_PREQ: ExternalOp = ExternalOp {
 
 /// The share's down op: `expert_mv`'s launches, then the host's rows for its pairs once they
 /// are done (`collect`), in place.
-static SHARE_DOWN: ExternalOp = ExternalOp {
+pub(super) static SHARE_DOWN: ExternalOp = ExternalOp {
     name: "cpu_share_down",
     cpu: expert_mv::cpu_expert_mv,
     #[cfg(feature = "cuda")]

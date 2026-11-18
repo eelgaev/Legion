@@ -121,6 +121,7 @@
 pub mod bench;
 pub mod ops;
 pub mod pool;
+pub mod shexp;
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
