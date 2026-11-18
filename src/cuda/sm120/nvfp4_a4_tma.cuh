@@ -28,6 +28,61 @@ namespace a4t {
 struct Maps {
     CUtensorMap w, w2, xq, xs;
 };
+
+#ifdef LEGION_FP4_MMA
+// a4_epilogue's dense F32 outputs (RES: plus the residual, __fadd_rn) by token pairs (#1133 r23
+// and r24): JG n8 token tiles at a time, their JG x MI x 4 residuals loaded before their stores.
+// a4_epilogue loads a whole row group's (NT x 4) first, which takes the 128 x 96 residual tile
+// from 148 to 202 registers. The stores and residual loads are streaming (st.global.cs /
+// ld.global.cs, evict first), so the outputs do not push the operands out of L2. The same
+// products in the same order: the same bits.
+template <int MI, int NT, bool RES, int JG>
+__device__ __forceinline__ void epilogue(const legion_nvfp4_a4 & p, const float (&acc)[MI][NT][4], int64_t m0,
+                                         int64_t n0, int n_tok, const float * x_dec, float sc, int wm, int wn, int g,
+                                         int t) {
+    static_assert(NT % JG == 0, "token tiles a group");
+    const int rows_left = (int) min(p.m - m0, (int64_t) 1024);  // a tile has at most 128 rows
+#pragma unroll
+    for (int j0 = 0; j0 < NT; j0 += JG) {
+        float * d[JG][2];
+        const float * r[JG][2];
+#pragma unroll
+        for (int jj = 0; jj < JG; jj++)
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const int64_t o = (n0 + wn * 8 * NT + (j0 + jj) * 8 + t * 2 + h) * p.m + m0;
+                d[jj][h] = (float *) p.dst + o;
+                r[jj][h] = RES ? p.res + o : nullptr;
+            }
+        float rv[JG][MI][4];
+        if constexpr (RES) {
+#pragma unroll
+            for (int jj = 0; jj < JG; jj++)
+#pragma unroll
+                for (int i = 0; i < MI; i++)
+#pragma unroll
+                    for (int e = 0; e < 4; e++) {
+                        const int row = wm * 16 * MI + i * 16 + g + (e / 2) * 8;
+                        const int tk = wn * 8 * NT + (j0 + jj) * 8 + t * 2 + e % 2;
+                        rv[jj][i][e] = row < rows_left && tk < n_tok ? __ldcs(r[jj][e % 2] + row) : 0.0f;
+                    }
+        }
+#pragma unroll
+        for (int jj = 0; jj < JG; jj++)
+#pragma unroll
+            for (int i = 0; i < MI; i++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int row = wm * 16 * MI + i * 16 + g + (e / 2) * 8;
+                    const int tk = wn * 8 * NT + (j0 + jj) * 8 + t * 2 + e % 2;
+                    if (row < rows_left && tk < n_tok) {
+                        const float v = acc[i][j0 + jj][e] * sc * x_dec[tk];
+                        __stcs(d[jj][e % 2] + row, RES ? __fadd_rn(v, rv[jj][i][e]) : v);
+                    }
+                }
+    }
+}
+#endif
 }  // namespace a4t
 
 // The tile: 8 warps, 4 over the weight rows x 2 over the tokens, each 32 weight rows (MI 2) x
@@ -52,7 +107,9 @@ template <int NT_, int ST_> struct TmaTile {
 // the pointer's state space: every A fragment and scale word is a generic load (LD.E) and each
 // TMA issue checks its destination's window. Else the base is the shared array plus an offset,
 // and those reads are LDS.
-template <int NT, int ST, bool GLU, bool RES, int PROBE = 0, bool GEN = false>
+// JG (#1133 r23 and r24, dense F32 outputs only): 0 a4_epilogue, else a4t::epilogue with JG
+// token tiles at a time.
+template <int NT, int ST, bool GLU, bool RES, int PROBE = 0, bool GEN = false, int JG = 0>
 __global__ void __launch_bounds__(256, 1) nvfp4_a4_gemm_tma(const legion_nvfp4_a4 p, const __grid_constant__ a4t::Maps maps) {
 #ifdef LEGION_FP4_MMA
     using T = TmaTile<NT, ST>;
@@ -254,7 +311,10 @@ __global__ void __launch_bounds__(256, 1) nvfp4_a4_gemm_tma(const legion_nvfp4_a
         }
     }
     // The probes without stores keep their sums alive by a store no launch asks for.
-    if (PROBE == 0 || PROBE == 2 || p.act == 99) {
+    if constexpr (JG != 0) {
+        static_assert(!GLU && PROBE == 0, "a4t::epilogue: dense F32 outputs");
+        a4t::epilogue<MI, NT, RES, JG>(p, acc, m0, n0, n_tok, x_dec, sc, wm, wn, g, t);
+    } else if (PROBE == 0 || PROBE == 2 || p.act == 99) {
         a4_epilogue<MI, NT, false, GLU, RES>(p, acc, m0, n0, n_tok, x_dec, nullptr, sc, sc2, wm, wn, g, t);
     }
 #else
@@ -280,10 +340,12 @@ inline bool a4_tma_map(CUtensorMap * map, const void * base, int64_t row_bytes, 
 
 // nvfp4_a4_gemm_tma for a dense GEMM (SwiGLU, residual or plain) of whole stages (k % 256 == 0);
 // -1 when it does not apply or a tensor map cannot be made (nothing launched). PROBE: plain
-// GEMMs only.
-template <int NT, int ST, int PROBE = 0, bool GEN = false> int dense_tma(const legion_nvfp4_a4 & p0, cudaStream_t st) {
+// GEMMs only. JG (nvfp4_a4_gemm_tma's): plain and residual GEMMs with F32 outputs only.
+template <int NT, int ST, int PROBE = 0, bool GEN = false, int JG = 0>
+int dense_tma(const legion_nvfp4_a4 & p0, cudaStream_t st) {
     using T = TmaTile<NT, ST>;
-    if (p0.plan || p0.k % 256 != 0 || p0.n <= 0 || p0.m <= 0 || (PROBE != 0 && (p0.w2 || p0.res))) {
+    if (p0.plan || p0.k % 256 != 0 || p0.n <= 0 || p0.m <= 0 || (PROBE != 0 && (p0.w2 || p0.res)) ||
+        (JG != 0 && (p0.w2 || p0.act != 0))) {
         return -1;
     }
     legion_nvfp4_a4 p = p0;
@@ -306,6 +368,12 @@ template <int NT, int ST, int PROBE = 0, bool GEN = false> int dense_tma(const l
     };
     if constexpr (PROBE != 0) {
         go(nvfp4_a4_gemm_tma<NT, ST, false, false, PROBE, GEN>);
+    } else if constexpr (JG != 0) {
+        if (p.res) {
+            go(nvfp4_a4_gemm_tma<NT, ST, false, true, 0, GEN, JG>);
+        } else {
+            go(nvfp4_a4_gemm_tma<NT, ST, false, false, 0, GEN, JG>);
+        }
     } else if (p.w2) {
         go(nvfp4_a4_gemm_tma<NT, ST, true, false, 0, GEN>);
     } else if (p.res) {
