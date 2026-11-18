@@ -128,14 +128,18 @@ struct legion_paged_attn {
     // 4 warps, a CTA each) instead of paged_prefill_mma; the same bits. Picked on the Rust side
     // (paged::verify_grid_kind) for small groups.
     int32_t verify_grid;
-    // 1: paged_prefill_pair's CTAs prefetch the first line of every K and V block of their keys
-    // into L2 at the start (prefetch_walk below, #689), so the keys' pages are translated before
-    // the loop reaches them. The same bits either way. Picked on the Rust side
-    // (paged::d512_prefetch_for). The quad kernel's prefetch is its own (verify_grid 2 / 3).
+    // LEGION_PF_* bits: the kernels whose CTAs prefetch the first line of every K and V block of
+    // their keys into L2 at the start (prefetch_walk below, #689), so the keys' pages are
+    // translated before the loop reaches them. The same bits either way. Picked on the Rust side
+    // (paged::prefetch_for). The quad kernel's prefetch is its own (verify_grid 2 / 3).
     int32_t prefetch;
 };
 
 enum { LEGION_KV_F16 = 0, LEGION_KV_Q8_0 = 1, LEGION_KV_Q4_0 = 2 };
+
+// legion_paged_attn::prefetch (#689): paged_prefill_pair (heads of 512), paged_prefill_grid (the
+// pair kernel of heads of 256 at 6 query heads a kv head), paged_decode.
+enum { LEGION_PF_PAIR = 1, LEGION_PF_GRID = 2, LEGION_PF_DECODE = 4 };
 
 // Whether the current device's paged kernels read quantized caches (the sm_80+ prefill kernel;
 // the WMMA one reads F16 only).
@@ -313,14 +317,14 @@ __device__ __forceinline__ bool piece_idle(const legion_paged_attn & p, const Wa
     return p.piece > 0 && (*p.piece_cnt == 0 || w.i0 >= w.i1);
 }
 
-// With p.prefetch (#689; paged_prefill_quad's prefetch for the other kernels): one
-// prefetch.global.L2 of the first line of every K and V block of walk entries [w.i0, w.i1), the
-// CTA's `nt` threads in turn, issued right after the kernel's first loads. In a model each call
-// comes after other layers' traffic and meets its keys' page translations cold; this has them
-// translated before the loop gets there. Reads nothing into registers and writes nothing: the
-// same bits.
-__device__ __forceinline__ void prefetch_walk(const legion_paged_attn & p, const Walk & w, int nt) {
-    if (!p.prefetch) {
+// Where p.prefetch has the kernel's `bit` (LEGION_PF_*, #689; paged_prefill_quad's prefetch for
+// the other kernels): one prefetch.global.L2 of the first line of every K and V block of walk
+// entries [w.i0, w.i1), the CTA's `nt` threads in turn, issued right after the kernel's first
+// loads. In a model each call comes after other layers' traffic and meets its keys' page
+// translations cold; this has them translated before the loop gets there. Reads nothing into
+// registers and writes nothing: the same bits.
+__device__ __forceinline__ void prefetch_walk(const legion_paged_attn & p, const Walk & w, int bit, int nt) {
+    if (!(p.prefetch & bit)) {
         return;
     }
     const int n = (w.i1 - w.i0) * 2;
@@ -500,6 +504,7 @@ __global__ void __launch_bounds__(128) paged_decode(const legion_paged_attn p) {
         return;
     }
     const int b0 = bf + split * nblk / ns, b1 = bf + (split + 1) * nblk / ns;
+    prefetch_walk(p, walk(p, seq, b0, b1 - 1), LEGION_PF_DECODE, 128);
 
     __shared__ float s[G][BLK];
     __shared__ float alpha[G], stat_m[G], stat_l[G];

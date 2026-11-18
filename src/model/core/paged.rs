@@ -162,47 +162,61 @@ fn verify_prefetch() -> bool {
     *V.get_or_init(|| std::env::var("LEGION_DEBUG_PAGED_VERIFY_PREFETCH").as_deref() != Ok("0"))
 }
 
-/// Sequences up to which the warp-pair kernel prefetches its keys' pages by default
-/// ([`d512_prefetch_for`]).
+/// The kernels with a start-of-kernel page prefetch besides the quad kernel's (`LEGION_PF_*` in
+/// paged_attn/common.cuh, #689): each one's bit in `LaunchParams::prefetch`, its switch, and the
+/// sequences a group may have for it to prefetch by default (0: never). The warp-pair kernel of
+/// heads of 512 (`paged_prefill_pair`, r20): on a GB10 a cold call of Gemma 4 31B's global
+/// attention at one sequence runs 8-10% faster with it from 32K keys on, while 4 sequences' pages
+/// at once ran up to 8% slower. The pair kernel of heads of 256 (`paged_prefill_grid`) and
+/// `paged_decode` (r21): off by default, for A/B runs. The same bits either way.
 #[cfg(feature = "cuda")]
-const D512_PREFETCH_SEQS: usize = 2;
+const PF_KERNELS: [(i32, &str, usize); 3] = [
+    (1, "LEGION_DEBUG_PAGED_D512_PREFETCH", 2),
+    (2, "LEGION_DEBUG_PAGED_GRID_PREFETCH", 0),
+    (4, "LEGION_DEBUG_PAGED_DECODE_PREFETCH", 0),
+];
 
-/// Whether the warp-pair kernel of heads of 512 prefetches its keys' pages at the start where
-/// the group has at most [`D512_PREFETCH_SEQS`] sequences (#689 r20; default on,
-/// `LEGION_DEBUG_PAGED_D512_PREFETCH=0` off, read once). The same bits either way.
+/// Each [`PF_KERNELS`] kernel's sequence gate, read once: its switch `=0` off, `=<n>` up to `n`
+/// sequences, else its default.
 #[cfg(feature = "cuda")]
-fn d512_prefetch() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("LEGION_DEBUG_PAGED_D512_PREFETCH").as_deref() != Ok("0"))
+fn prefetch_seqs() -> [usize; 3] {
+    static V: std::sync::OnceLock<[usize; 3]> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        PF_KERNELS.map(|(_, var, def)| {
+            std::env::var(var)
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(def)
+        })
+    })
 }
 
 thread_local! {
     /// The calling thread's wide-grid choice ([`set_verify_grid_here`]).
     static GRID_HERE: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
-    /// The calling thread's warp-pair prefetch ([`set_d512_prefetch_here`]).
-    static PF_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// The calling thread's prefetch bits ([`set_prefetch_here`]).
+    static PF_HERE: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
 }
 
-/// Whether the warp-pair kernel prefetches its keys' pages in the calling thread's launches
-/// (benches), for every group it runs; `None` follows the default again ([`d512_prefetch_for`]).
-pub fn set_d512_prefetch_here(on: Option<bool>) {
-    PF_HERE.with(|c| c.set(on));
+/// The prefetch bits (1 the warp-pair kernel of heads of 512, 2 the pair kernel of heads of 256,
+/// 4 `paged_decode`) of the calling thread's launches (benches), for every group those kernels
+/// run; `None` follows the defaults again ([`prefetch_for`]).
+pub fn set_prefetch_here(bits: Option<i32>) {
+    PF_HERE.with(|c| c.set(bits));
 }
 
-/// The launch's `prefetch` (#689 r20): 1 where the group runs on the warp-pair kernel
-/// (`d512_pair` 1) and [`set_d512_prefetch_here`] says so, else by default with at most
-/// [`D512_PREFETCH_SEQS`] sequences. On a GB10 a cold call of Gemma 4 31B's global attention at
-/// one sequence runs 8-10% faster with it from 32K keys on, while 4 sequences' pages at once
-/// run up to 8% slower.
+/// The launch's `prefetch` (#689): [`set_prefetch_here`]'s bits, else each [`PF_KERNELS`]
+/// kernel's bit where the group has at most its gate's sequences. A bit reaches only its own
+/// kernel.
 #[cfg(feature = "cuda")]
-fn d512_prefetch_for(d512_pair: i32, n_seqs: usize) -> i32 {
-    if d512_pair == 0 {
-        return 0;
-    }
-    let on = PF_HERE
-        .with(|c| c.get())
-        .unwrap_or_else(|| d512_prefetch() && n_seqs <= D512_PREFETCH_SEQS);
-    i32::from(on)
+fn prefetch_for(n_seqs: usize) -> i32 {
+    PF_HERE.with(|c| c.get()).unwrap_or_else(|| {
+        PF_KERNELS
+            .iter()
+            .zip(prefetch_seqs())
+            .filter(|(_, seqs)| n_seqs <= *seqs)
+            .fold(0, |bits, ((bit, _, _), _)| bits | bit)
+    })
 }
 
 /// The wide-grid kernel's choice for the calling thread's launches (benches): `Some(0)`
@@ -916,7 +930,7 @@ struct LaunchParams {
     /// Heads of 256 at 6 query heads a kv head on sm_80+: 1 runs the group on the pair kernel, 2 on
     /// the quad kernel ([`verify_grid_for`]); 0: `paged_prefill_mma`.
     verify_grid: i32,
-    /// 1: the warp-pair kernel prefetches its keys' pages at the start ([`d512_prefetch_for`]).
+    /// The kernels that prefetch their keys' pages at the start ([`prefetch_for`]).
     prefetch: i32,
 }
 
@@ -1168,7 +1182,7 @@ unsafe fn cuda_paged_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
         o.compact,
         p.max_split,
     );
-    p.prefetch = d512_prefetch_for(p.d512_pair, o.n_seqs);
+    p.prefetch = prefetch_for(o.n_seqs);
     p.verify_grid = verify_grid_for(
         o.d,
         o.n_head,

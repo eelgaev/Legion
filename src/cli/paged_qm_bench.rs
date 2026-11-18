@@ -55,18 +55,25 @@ pub struct PagedQmBenchArgs {
     grid: Vec<String>,
     /// With `--grid` or `--d512`: time each kernel per call as a model's step meets it (#689), in
     /// these modes instead of the plain timing: `warm` (nothing between calls), `rot` (the
-    /// layers' pools in turn), `read` (a 1 GiB read before each call), `rotread` (both), `l2` (a
-    /// 48 MiB read), `tlb` / `tlb64k` (one 4-byte read every 2 MiB / 64 KiB over 8 GiB), `pt64k`
-    /// / `pt2m` (the call's own K/V pools touched every 64 KiB / 2 MiB first); parts join with +.
-    /// Kernels: `--grid` main, mma (no queries-as-M kernel), auto, pair, quad, quad0; `--d512`
-    /// main / mma, auto, pair. Groups of one token a sequence are decode steps.
+    /// layers' pools in turn), `read` (a 1 GiB read before each call), `rotread` (both), `weights`
+    /// (the flush buffer read once a graph, its share before each call: a model's weights between
+    /// its attention calls), `l2` (a 48 MiB read), `tlb` / `tlb64k` (one 4-byte read every 2 MiB /
+    /// 64 KiB over the flush buffer), `pt64k` / `pt2m` (the call's own K/V pools touched every 64
+    /// KiB / 2 MiB first); parts join with +. Kernels: `--grid` main, mma (no queries-as-M
+    /// kernel), auto, pair, quad, quad0; `--d512` main / mma, auto, pair. Groups of one token a
+    /// sequence are decode steps.
     #[arg(long, value_delimiter = ',')]
     cold: Vec<String>,
-    /// With `--cold --d512`: run each kernel with each of these start-of-kernel page prefetches
-    /// of the warp-pair kernel (#689): 0 off, 1 on for every group, -1 the default's (on up to
-    /// two sequences); e.g. `0,1`. None given: the default's.
+    /// With `--cold`: run each kernel with each of these start-of-kernel page prefetches (#689),
+    /// as bits: 1 the warp-pair kernel of heads of 512, 2 the pair kernel of heads of 256, 4
+    /// `paged_decode` (each for every group it runs; 0 none), or -1 the defaults; e.g. `0,7`.
+    /// None given: the defaults.
     #[arg(long, value_delimiter = ',', allow_negative_numbers = true)]
     pf: Vec<i32>,
+    /// With `--cold`: the flush buffer's GiB (the `weights` part reads it once a graph; size it as
+    /// the model's weights).
+    #[arg(long, default_value_t = 8)]
+    flush_gib: usize,
     /// With `--cold`: the host sleeps this long before each graph (an idle GPU in between).
     #[arg(long, default_value_t = 0)]
     gap_ms: u64,
@@ -371,7 +378,7 @@ fn run_cold(
     chunks: &[(usize, usize)],
 ) -> anyhow::Result<()> {
     use legion::model::core::paged_cold_bench as cold;
-    use legion::model::core::paged_cold_bench::set_d512_prefetch_here;
+    use legion::model::core::paged_cold_bench::set_prefetch_here;
     use legion::model::core::paged_split_bench::{Group, pools};
     let flag = if heads.0 == 512 { "--d512" } else { "--grid" };
     for k in picked {
@@ -393,15 +400,16 @@ fn run_cold(
         heads.1 == ratio * heads.2,
         "--cold {flag} takes {ratio} query heads a kv head"
     );
-    // (label, the thread's prefetch): None the default's.
-    let pfs: Vec<(String, Option<bool>)> = if args.pf.is_empty() {
+    anyhow::ensure!(args.flush_gib > 0, "--flush-gib takes 1 or more GiB");
+    // (label, the thread's prefetch bits): None the defaults.
+    let pfs: Vec<(String, Option<i32>)> = if args.pf.is_empty() {
         vec![(String::new(), None)]
     } else {
         args.pf
             .iter()
             .map(|&b| match b {
                 b if b < 0 => ("/def".to_string(), None),
-                b => (format!("/{b}"), Some(b > 0)),
+                b => (format!("/{b}"), Some(b)),
             })
             .collect()
     };
@@ -414,10 +422,10 @@ fn run_cold(
     let n_blocks = (seqs * run).max(args.pool_blocks).max(1);
     let layers = args.layers.max(1);
     let kv = pools(&gpu, heads, n_blocks, layers);
-    let flush = cold::Flush::new(&gpu);
+    let flush = cold::Flush::new(&gpu, args.flush_gib << 30);
     println!(
-        "{layers} layers of {n_blocks} blocks, table stride {}, {} calls a graph",
-        args.stride, layers
+        "{layers} layers of {n_blocks} blocks, table stride {}, {} calls a graph, flush {} GiB",
+        args.stride, layers, args.flush_gib
     );
     let mut differ = 0;
     for &(n_past, n_tok) in chunks {
@@ -451,7 +459,7 @@ fn run_cold(
         for k in picked {
             for (suffix, pf) in &pfs {
                 print!("{:>12}", format!("{k}{suffix}"));
-                set_d512_prefetch_here(*pf);
+                set_prefetch_here(*pf);
                 let mut bad = 0;
                 for (mi, m) in args.cold.iter().enumerate() {
                     let (ms, f, out) = cold::time(
@@ -477,7 +485,7 @@ fn run_cold(
                         .count();
                     print!(" {ms:>9.3}");
                 }
-                set_d512_prefetch_here(None);
+                set_prefetch_here(None);
                 differ += bad;
                 println!("  {}", if bad == 0 { "same" } else { "DIFFER" });
             }

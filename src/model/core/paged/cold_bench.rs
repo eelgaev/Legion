@@ -6,11 +6,15 @@
 //! after what the mode puts in front of it:
 //! - `warm`: nothing, layer 0 each time (the plain bench);
 //! - `rot`: nothing, the layers' pools in turn (one buffer, as a model's KvPool);
-//! - `read`: a 1 GiB streaming read (a different GiB of an 8 GiB buffer each call), layer 0;
+//! - `read`: a 1 GiB streaming read (a different GiB of the flush buffer each call), layer 0;
+//! - `weights` (#689 r21): the flush buffer's share of one call (its bytes over the graph's calls,
+//!   each call the next share), so a graph reads the whole buffer once, as a model's step reads
+//!   its weights between its attention layers' calls (size the buffer as the weights);
 //! - `rotread`: the read and the pools in turn (closest to the model);
 //! - `l2`: a 48 MiB read (twice the GB10's L2, few pages), layer 0;
-//! - `tlb`: one 4-byte read every 2 MiB over the 8 GiB (4,096 pages, ~128 KiB of L2), layer 0;
-//! - `tlb64k`: one every 64 KiB over the 8 GiB;
+//! - `tlb`: one 4-byte read every 2 MiB over the flush buffer (8 GiB: 4,096 pages, ~128 KiB of
+//!   L2), layer 0;
+//! - `tlb64k`: one every 64 KiB over the flush buffer;
 //! - `pt64k` / `pt2m`: one element every 64 KiB / 2 MiB of the call's own K and V pools, right
 //!   before it.
 //!
@@ -22,8 +26,8 @@
 //! plus `mma` (`paged_prefill_mma` without the queries-as-M kernel); at heads of 512 `main` /
 //! `mma` (`paged_prefill_mma`), `pair` (the warp-pair kernel), `auto` (the default's pick). A
 //! group of one token a sequence is a decode step whatever the kernel (`paged_decode`, split
-//! over the key blocks as a model's). The warp-pair kernel prefetches its keys' pages as the
-//! calling thread says ([`set_d512_prefetch_here`]).
+//! over the key blocks as a model's). The kernels with a page prefetch take it as the calling
+//! thread says ([`set_prefetch_here`]).
 
 use super::grid_bench;
 use super::wmma_bench::{Group, fill};
@@ -31,25 +35,32 @@ use super::*;
 use crate::ggml::{Backend, ComputeAllocator};
 use crate::model::core::KvPool;
 
-pub use super::set_d512_prefetch_here;
+pub use super::set_prefetch_here;
 
-/// The flush buffer's bytes.
+/// The flush buffer's default bytes ([`Flush::new`]).
 const FLUSH_BYTES: usize = 8 << 30;
 
-/// The flushes' buffer (F32, [`FLUSH_BYTES`], zeroed), kept for every graph.
+/// The flushes' buffer (F32, zeroed), kept for every graph.
 pub struct Flush {
     ctx: Context,
+    bytes: usize,
 }
 
 impl Flush {
-    pub fn new(backend: &Backend) -> Self {
+    /// A buffer of `bytes` (whole GiB; 0: [`FLUSH_BYTES`]).
+    pub fn new(backend: &Backend, bytes: usize) -> Self {
+        let bytes = if bytes == 0 { FLUSH_BYTES } else { bytes };
+        assert!(
+            bytes >= 1 << 30 && bytes % (1 << 30) == 0,
+            "the flush buffer takes whole GiB"
+        );
         let ctx = Context::new(1, 1);
-        ctx.new_tensor(types::F32, &[(FLUSH_BYTES / 4) as i64])
+        ctx.new_tensor(types::F32, &[(bytes / 4) as i64])
             .named("cold_flush");
         ctx.alloc_tensors(backend.buffer_type())
             .expect("flush buffer");
         ctx.clear_buffers(0);
-        Self { ctx }
+        Self { ctx, bytes }
     }
 
     fn buf(&self) -> Tensor<'_> {
@@ -60,8 +71,8 @@ impl Flush {
 /// The parts a mode joins with `+` (`rotread` is `rot+read`); `pt64k` / `pt2m` touch the call's
 /// own layer's K and V pools (one element every 64 KiB / 2 MiB of each) right before it, after
 /// the other parts.
-pub const PARTS: [&str; 8] = [
-    "warm", "rot", "read", "l2", "tlb", "tlb64k", "pt64k", "pt2m",
+pub const PARTS: [&str; 9] = [
+    "warm", "rot", "read", "weights", "l2", "tlb", "tlb64k", "pt64k", "pt2m",
 ];
 
 /// `mode`'s parts, checked.
@@ -83,32 +94,39 @@ pub fn valid(mode: &str) -> bool {
     m.split('+').all(|x| PARTS.contains(&x))
 }
 
-/// The nodes in front of call `c` (on layer pools `kp`, `vp`) in `mode`.
+/// The nodes in front of call `c` of `calls` (on layer pools `kp`, `vp`) in `mode`, reading
+/// `buf` (`flush` bytes).
+#[allow(clippy::too_many_arguments)]
 fn flush_nodes<'a>(
     ctx: &'a Context,
     buf: Tensor<'a>,
+    flush: usize,
     kp: Tensor<'a>,
     vp: Tensor<'a>,
     mode: &str,
     c: usize,
+    calls: usize,
 ) -> Vec<Tensor<'a>> {
-    let read = |bytes: usize, slot: usize| {
+    // `bytes` (whole 4 KiB rows) at `off`.
+    let read_at = |bytes: usize, off: usize| {
         let rows = (bytes / 4096) as i64;
-        let off = (slot % (FLUSH_BYTES / bytes)) * bytes;
         ctx.sum_rows(ctx.view_2d(buf, [1024, rows], 4096, off))
     };
+    let read = |bytes: usize, slot: usize| read_at(bytes, (slot % (flush / bytes)) * bytes);
     let touch = |t: Tensor<'a>, bytes: usize, stride: usize, off: usize| {
         let n = (bytes / stride) as i64;
         ctx.cont(ctx.view_2d(t, [1, n], stride, off))
     };
+    let share = flush / calls.max(1) / 4096 * 4096;
     let mut out = Vec::new();
     let p = parts(mode);
     for x in &p {
         match *x {
             "read" => out.push(read(1 << 30, c)),
+            "weights" => out.push(read_at(share, c % calls.max(1) * share)),
             "l2" => out.push(read(48 << 20, c)),
-            "tlb" => out.push(touch(buf, FLUSH_BYTES, 2 << 20, (c % 16) * 128)),
-            "tlb64k" => out.push(touch(buf, FLUSH_BYTES, 64 << 10, (c % 16) * 128)),
+            "tlb" => out.push(touch(buf, flush, 2 << 20, (c % 16) * 128)),
+            "tlb64k" => out.push(touch(buf, flush, 64 << 10, (c % 16) * 128)),
             _ => {}
         }
     }
@@ -208,7 +226,7 @@ fn graph_ms(
     for c in 0..calls {
         let il = if rotate { c % layers.max(1) } else { 0 };
         let (kp, vp) = kv.pools(il);
-        for f in flush_nodes(&ctx, buf, kp, vp, mode, c) {
+        for f in flush_nodes(&ctx, buf, flush.bytes, kp, vp, mode, c, calls) {
             graph.expand(f.as_output());
             flushes += 1;
         }

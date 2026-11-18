@@ -189,7 +189,7 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, 1) paged_prefill_pair(const
     for (int j = 0; j < NS - 1; j++) {
         issue(j);
     }
-    prefetch_walk(p, wk, NW * 32);
+    prefetch_walk(p, wk, LEGION_PF_PAIR, NW * 32);
     int j = 0;
     for (int wi = wk.i0; wi < wk.i1; wi++) {
         const int k0 = wk.block(wi) * BLK;
