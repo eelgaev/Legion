@@ -923,9 +923,12 @@ pub enum DeviceChoice {
 #[derive(Debug, Clone)]
 pub struct LmConfig {
     pub model_path: std::path::PathBuf,
-    /// `--mmproj`: a vision tower for the model (Qwen3.5 / Qwen3.6, #146); requests may then
-    /// carry images.
+    /// `--mmproj`: a vision tower for the model (Qwen3.5 / Qwen3.6, #146; Qwen3.8-Flash-Next,
+    /// #1195); requests may then carry images. Without it, an HF checkpoint's own tower
+    /// (`model.visual.*`) is loaded unless [`Self::no_mmproj`].
     pub mmproj: Option<std::path::PathBuf>,
+    /// `--no-mmproj`: text only, an HF checkpoint's vision tower is not loaded.
+    pub no_mmproj: bool,
     /// Model id reported by /v1/models; `None` takes `general.name` or the file name.
     pub model_name: Option<String>,
     pub device: DeviceChoice,
@@ -1374,6 +1377,7 @@ impl LmConfig {
         Self {
             model_path: model_path.into(),
             mmproj: None,
+            no_mmproj: false,
             model_name: None,
             device,
             ctx_size: 8192,
@@ -5651,7 +5655,10 @@ impl LmEngine {
                 let layers = exec.stage_layers().iter().map(|r| r.len()).collect();
                 Arc::new(Mutex::new(pipe_split::Probe::new(layers)))
             });
-        // `--mmproj`: the vision tower (#146). Other ranks and nodes get no images' rows.
+        // `--mmproj`: the vision tower (#146), else an HF checkpoint's own (#1195). Other
+        // ranks and nodes get no images' rows.
+        let arch = gguf.architecture().unwrap_or_default();
+        let n_embd = exec.hp().n_embd as usize;
         let vision = match &cfg.mmproj {
             Some(_) if cfg.tp_net.is_some() || cfg.node.is_some() => {
                 return Err(LoadError::Device(
@@ -5660,12 +5667,32 @@ impl LmEngine {
             }
             Some(path) => Some(Arc::new(vision::Vision::load(
                 path,
-                &gguf.architecture().unwrap_or_default(),
-                exec.hp().n_embd as usize,
+                &arch,
+                n_embd,
                 &tokenizer,
                 cfg.threads,
             )?)),
-            None => None,
+            None if cfg.no_mmproj || !cfg.model_path.is_dir() => None,
+            None if cfg.tp_net.is_some() || cfg.node.is_some() => {
+                tracing::info!(
+                    "vision: the checkpoint's vision tower is not loaded with --tp-rank or \
+                     --node-rank (yet): text only"
+                );
+                None
+            }
+            None => match vision::Vision::from_checkpoint(
+                &cfg.model_path,
+                &arch,
+                n_embd,
+                &tokenizer,
+                cfg.threads,
+            ) {
+                Ok(v) => v.map(Arc::new),
+                Err(e) => {
+                    tracing::warn!(error = %e, "vision: the checkpoint's vision tower did not load; text only");
+                    None
+                }
+            },
         };
         let slot_host_budget = exec.kv_slot_host_budget();
         let slot_lend = exec.kv_slot_lend();
@@ -6742,6 +6769,10 @@ impl Worker {
         self.next_id += 1;
         if self.drafting.is_on() {
             seq.active.spec = Some(SpecCounters::default());
+        }
+        // The MTP head takes in an image's rows at its positions, as the target does (#1195).
+        if let (Drafting::Mtp(d), Some((media, _))) = (&mut self.drafting, &seq.media) {
+            d.set_media(seq.id, media.clone());
         }
         seq.active.cached = resumed as u32;
         if let Ok(mut s) = self.stats.lock() {

@@ -854,8 +854,9 @@ pub struct Inputs<'a> {
     /// A stage before the last: the residual stream going out, `[width, n]`.
     res_out: Option<Tensor<'a>>,
     /// The first stage of a step with image tokens ([`GroupShape::img`]): their input rows
-    /// (F32 `[n_embd, n_img]`) and the step rows they replace (I32 `[n_img]`).
-    img: Option<(Tensor<'a>, Tensor<'a>)>,
+    /// (F32 `[n_embd, n_img]`) and the step rows they replace (I32 `[n_img]`); an MTP head's
+    /// pass takes them in place of its token embeddings too.
+    pub(crate) img: Option<(Tensor<'a>, Tensor<'a>)>,
     /// The sliding window of the gather masks' second half, 0 for none (see [`AttnInputs`]).
     swa: usize,
     /// The gather masks hide each query's own position too: it sees the keys before it only

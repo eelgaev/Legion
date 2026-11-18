@@ -29,8 +29,8 @@ use super::{Executor, Kept, Stage, bounce_for, read_rows};
 use crate::ggml::model_bytes::{Kind, Phase};
 use crate::ggml::{ComputeAllocator, Context, GgmlError, KeptGraph, KeptParts};
 use crate::model::core::{
-    Group, GroupShape, Inputs, Logits, ModelError, SeqInput, StepOpts, StepOutput, batch_shape,
-    graph_size, with_kv,
+    Group, GroupShape, Inputs, Logits, Media, ModelError, SeqInput, StepOpts, StepOutput,
+    batch_shape, graph_size, with_kv,
 };
 
 /// Default graphs a stage keeps for pieces ([`Executor::set_pipe_graphs`]).
@@ -43,6 +43,8 @@ struct OwnedSeq {
     blocks: Vec<u32>,
     ring: usize,
     logits: Logits,
+    /// Its images, for the positions after them (a clone shares the rows).
+    media: Option<Media>,
 }
 
 /// A [`Group`] owned.
@@ -66,6 +68,7 @@ fn own(groups: &[Group<'_>]) -> Vec<OwnedGroup> {
                     blocks: s.blocks.to_vec(),
                     ring: s.ring,
                     logits: s.logits,
+                    media: s.media.cloned(),
                 })
                 .collect(),
             verify: g.verify,
@@ -87,7 +90,7 @@ fn view(groups: &[OwnedGroup]) -> Vec<Group<'_>> {
                     blocks: &s.blocks,
                     ring: s.ring,
                     logits: s.logits,
-                    media: None,
+                    media: s.media.as_ref(),
                 })
                 .collect(),
             verify: g.verify,

@@ -3736,7 +3736,7 @@ impl Executor {
                         blocks: seq.blocks,
                         ring: seq.ring,
                         logits: if end == n { seq.logits } else { Logits::None },
-                        media: None,
+                        media: seq.media,
                     }],
                     verify: false,
                 }]

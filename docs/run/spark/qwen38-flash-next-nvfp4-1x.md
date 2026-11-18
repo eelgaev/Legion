@@ -53,6 +53,15 @@ values to BF16, so greedy text can move after prompts of over 64 tokens. The tab
 - The opt-in prefill numbers (8K 1,749 / 32K 1,800) add `--nvfp4-a4 prefill --prefill-even` to the command
   without `--spec` (an earlier build).
 
+### Images
+
+The checkpoint ships its vision tower (`model.visual.*`), and the command above loads it: requests may carry
+images, and `/v1/models` lists `vision`. The tower runs on the CPU, one image at a time (2026-11-18): a
+1024 × 768 image (768 image tokens) encodes in 11.3-11.8 s, and its first token comes 12.5 s after the
+request; 640 × 480 takes 3.2 s, 800 × 600 5.8 s. Text-only requests give the same output as with
+`--no-mmproj`, at the same speed (8K prefill 2,350-2,358 tok/s against 2,358-2,367, 1 user 41.2-41.5 tok/s
+against 41.5-41.7).
+
 ## What each flag does
 
 - `--max-seqs` (`16`): How many requests are decoded at once (continuous batching). Set to the highest concurrency the benchmark uses.

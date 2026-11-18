@@ -28,11 +28,13 @@ fn the_pass_after_the_first_follows_the_rounds_rows() {
             at: 10,
             blocks: &blocks,
             ring: 0,
+            media: None,
         },
         Row {
             at: 20,
             blocks: &blocks,
             ring: 0,
+            media: None,
         },
     ];
     let g = next_pass(&rows, &[4, 4], [(0, 0), (1, 0)].into_iter()).expect("both go on");

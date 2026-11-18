@@ -1,4 +1,5 @@
-//! Images in prompts (#146, `--mmproj`): the vision tower of a Qwen3.5 / Qwen3.6 mmproj, and how a
+//! Images in prompts (#146, `--mmproj`; #1195): the vision tower of a Qwen3.5 / Qwen3.6 /
+//! Qwen3.8-Flash-Next mmproj, or the one an HF checkpoint ships (`model.visual.*`), and how a
 //! request's images become its tokens and their input rows.
 //!
 //! The chat template renders one `<|vision_start|><|image_pad|><|vision_end|>` per image, in the
@@ -16,6 +17,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::ggml::Backend;
+use crate::gguf::GgufFile;
 use crate::model::core::{ImageSpan, Media};
 use crate::tokenizer::Tokenizer;
 use crate::vision::{Encoder, Preprocessed};
@@ -29,8 +31,10 @@ const IMAGE_PAD: &str = "<|image_pad|>";
 /// Most CPU threads the tower takes, so other work on the host keeps some cores.
 const MAX_THREADS: usize = 8;
 
-/// The language models whose positions are Qwen-VL's M-RoPE.
-const ARCHS: [&str; 2] = ["qwen35", "qwen35moe"];
+/// The language models whose positions are Qwen-VL's M-RoPE: Qwen3.5 / Qwen3.6 and
+/// Qwen3.8-Flash-Next (`qwen4exp`, whose image tokens' n-gram rows hash `<|image_pad|>` as the
+/// reference does: the placeholders stay in the token stream).
+const ARCHS: [&str; 3] = ["qwen35", "qwen35moe", "qwen4exp"];
 
 pub(super) struct Vision {
     encoder: Mutex<Encoder>,
@@ -47,7 +51,8 @@ pub(super) struct Pending {
 }
 
 impl Vision {
-    /// Loads `path` for a language model of architecture `arch` and width `n_embd`.
+    /// Loads the mmproj `path` (`--mmproj`) for a language model of architecture `arch` and
+    /// width `n_embd`.
     pub(super) fn load(
         path: &Path,
         arch: &str,
@@ -56,26 +61,60 @@ impl Vision {
         threads: usize,
     ) -> Result<Self, LoadError> {
         let err = |e: String| LoadError::Device(format!("--mmproj {}: {e}", path.display()));
-        if !ARCHS.contains(&arch) {
-            return Err(err(format!(
-                "images need a Qwen3.5 / Qwen3.6 language model ({}), not {arch}",
-                ARCHS.join(", ")
-            )));
+        Self::check_arch(arch).map_err(err)?;
+        let g = GgufFile::open(path).map_err(|e| err(e.to_string()))?;
+        Self::from_gguf(&g, n_embd, tokenizer, threads).map_err(err)
+    }
+
+    /// The vision tower the HF checkpoint `dir` ships (`model.visual.*`), if it has one, for a
+    /// language model of architecture `arch` and width `n_embd`.
+    pub(super) fn from_checkpoint(
+        dir: &Path,
+        arch: &str,
+        n_embd: usize,
+        tokenizer: &Tokenizer,
+        threads: usize,
+    ) -> Result<Option<Self>, String> {
+        if Self::check_arch(arch).is_err() {
+            return Ok(None);
         }
+        let Some(g) = crate::hf::open_vision(dir).map_err(|e| e.to_string())? else {
+            return Ok(None);
+        };
+        Self::from_gguf(&g, n_embd, tokenizer, threads).map(Some)
+    }
+
+    fn check_arch(arch: &str) -> Result<(), String> {
+        if ARCHS.contains(&arch) {
+            return Ok(());
+        }
+        Err(format!(
+            "images need a Qwen3.5 / Qwen3.6 / Qwen3.8-Flash-Next language model ({}), not {arch}",
+            ARCHS.join(", ")
+        ))
+    }
+
+    /// The tower `g` (an mmproj, or a checkpoint's tower opened as one).
+    fn from_gguf(
+        g: &GgufFile,
+        n_embd: usize,
+        tokenizer: &Tokenizer,
+        threads: usize,
+    ) -> Result<Self, String> {
         let image_pad = tokenizer
             .token_id(IMAGE_PAD)
-            .ok_or_else(|| err(format!("the tokenizer has no {IMAGE_PAD}")))?;
-        let mut backend = Backend::cpu()?;
+            .ok_or_else(|| format!("the tokenizer has no {IMAGE_PAD}"))?;
+        let mut backend = Backend::cpu().map_err(|e| e.to_string())?;
         backend.set_threads(threads.clamp(1, MAX_THREADS));
-        let encoder = Encoder::load(path, backend).map_err(|e| err(e.to_string()))?;
+        let encoder = Encoder::from_gguf(g, backend).map_err(|e| e.to_string())?;
         let out = encoder.config().n_out;
         if out != n_embd {
-            return Err(err(format!(
+            return Err(format!(
                 "its rows are {out} wide, the language model's embeddings {n_embd}"
-            )));
+            ));
         }
         tracing::info!(
-            mmproj = %path.display(),
+            tower = %g.path().display(),
             layers = encoder.config().n_layer,
             "vision: images accepted (the vision tower runs on the CPU)"
         );
@@ -144,6 +183,7 @@ impl Vision {
         let mut spans = Vec::with_capacity(pending.len());
         let mut n_embd = 0;
         for p in pending {
+            let t = std::time::Instant::now();
             let e = blocking(|| {
                 self.encoder
                     .lock()
@@ -152,6 +192,11 @@ impl Vision {
             })
             .map_err(|e| EngineError::Internal(format!("vision encoder: {e}")))?;
             assert_eq!((e.nx, e.ny), (p.nx, p.ny), "the tower's grid");
+            tracing::info!(
+                tokens = e.n_tokens(),
+                ms = t.elapsed().as_millis() as u64,
+                "vision: image encoded"
+            );
             n_embd = e.n_embd;
             for (i, k) in key[p.start..p.start + e.n_tokens()].iter_mut().enumerate() {
                 *k = image_key(p.hash, i);

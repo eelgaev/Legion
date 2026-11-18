@@ -134,6 +134,11 @@ impl Model {
 
         // [enorm(embedding) ; hnorm(h)] per stream, projected back to the residual width.
         let tok = ctx.get_rows(self.w("token_embd.weight")?, inputs.tokens);
+        // Image tokens take their vision rows, as in the target's step (#1195).
+        let tok = match inputs.img {
+            Some((rows, idx)) => ctx.set_rows(tok, rows, idx),
+            None => tok,
+        };
         let hn = ctx.mul(
             ctx.rms_norm(ctx.reshape_3d(h, e, hc, n), hp.rms_eps),
             ctx.reshape_2d(w("nextn.hnorm.weight")?, e, hc),

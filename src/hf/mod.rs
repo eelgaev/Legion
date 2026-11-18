@@ -23,7 +23,10 @@ mod nemotron_h;
 pub mod nvfp4;
 mod qwen35;
 mod qwen4;
+mod vision;
 mod vocab;
+
+pub use vision::open_vision;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

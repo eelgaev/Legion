@@ -24,7 +24,8 @@
 //!
 //! ModelOpt NVFP4 routed experts are repacked and stacked with their per-expert scales as for
 //! Nemotron-H ([`super::nemotron_h::stack_nvfp4`]); every other weight is used as shipped
-//! (BF16). The vision tower is not loaded. The MTP head (`mtp.*`) is a model of its own,
+//! (BF16). The vision tower (`model.visual.*`) is not part of it: [`super::open_vision`] opens
+//! it as an mmproj of its own. The MTP head (`mtp.*`) is a model of its own,
 //! opened by [`build_mtp`] (`--spec mtp` without `--spec-draft`), with its block-scaled FP8
 //! experts kept as shipped.
 

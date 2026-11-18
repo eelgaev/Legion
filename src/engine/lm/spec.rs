@@ -3,10 +3,11 @@
 //! `Worker::step` (see `crate::spec` for the design).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::engine::sampling::{Dist, Sampler};
-use crate::model::core::{Executor, Group, Logits, SeqInput};
+use crate::model::core::{Executor, Group, Logits, Media, SeqInput};
 use crate::spec::accept::Target;
 use crate::spec::dflash::{DflashDrafter, DflashOptions};
 use crate::spec::draft::DraftModel;
@@ -260,6 +261,9 @@ pub(super) struct MtpDrafter {
     p_min: f32,
     /// Per sequence: the target's residual at its last position taken in.
     pending: HashMap<SeqId, Vec<f32>>,
+    /// The sequences with images: the head embeds their image rows and places every position
+    /// as the target does (M-RoPE, #1195).
+    media: HashMap<SeqId, Arc<Media>>,
 }
 
 impl MtpDrafter {
@@ -267,6 +271,7 @@ impl MtpDrafter {
         Self {
             p_min,
             pending: HashMap::new(),
+            media: HashMap::new(),
         }
     }
 
@@ -274,8 +279,13 @@ impl MtpDrafter {
         self.p_min = p_min;
     }
 
+    pub(super) fn set_media(&mut self, seq: SeqId, media: Arc<Media>) {
+        self.media.insert(seq, media);
+    }
+
     pub(super) fn release(&mut self, seq: SeqId) {
         self.pending.remove(&seq);
+        self.media.remove(&seq);
     }
 
     /// Starts reading the per-layer n-gram rows of `r`'s newest token for the verify step
@@ -352,7 +362,7 @@ impl MtpDrafter {
                             blocks: blocks[i],
                             ring: rings[i],
                             logits: Logits::None,
-                            media: None,
+                            media: self.media.get(&r.seq).map(|m| &**m),
                         }],
                         verify: false,
                     };
@@ -404,7 +414,7 @@ impl MtpDrafter {
                         blocks: blocks[i],
                         ring: rings[i],
                         logits: Logits::None,
-                        media: None,
+                        media: self.media.get(&r.seq).map(|m| &**m),
                     }],
                     verify: false,
                 };
@@ -466,6 +476,11 @@ impl MtpDrafter {
                 h.extend_from_slice(&hidden[..(rows - 1) * w]);
             }
         }
+        // Each request's images, held here: `self.chain` below borrows `self` mutably.
+        let media: Vec<Option<Arc<Media>>> = batch
+            .iter()
+            .map(|r| self.media.get(&r.seq).cloned())
+            .collect();
         let groups: Vec<Group<'_>> = order
             .iter()
             .zip(&fed)
@@ -483,7 +498,7 @@ impl MtpDrafter {
                         } else {
                             Logits::None
                         },
-                        media: None,
+                        media: media[i].as_deref(),
                     }],
                     verify: false,
                 }
@@ -550,7 +565,7 @@ impl MtpDrafter {
                             blocks: blocks[*i],
                             ring: rings[*i],
                             logits: Logits::Last,
-                            media: None,
+                            media: self.media.get(&r.seq).map(|m| &**m),
                         }
                     })
                     .collect(),
@@ -741,7 +756,7 @@ impl MtpDrafter {
                             blocks: blocks[*i],
                             ring: rings[*i],
                             logits: Logits::Last,
-                            media: None,
+                            media: self.media.get(&r.seq).map(|m| &**m),
                         }
                     })
                     .collect(),

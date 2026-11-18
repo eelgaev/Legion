@@ -427,12 +427,26 @@ fn nvfp4_random(rng: &mut Rng, blocks: usize, q: TinyNvfp4) -> Vec<u8> {
 
 /// Byte-level tokenizer metadata (see the module docs).
 pub(crate) fn byte_tokenizer(w: &mut GgufWriter) -> Result<(), GgufError> {
+    byte_tokenizer_with(w, &[], None)
+}
+
+/// [`byte_tokenizer`] plus user-defined tokens `user` (ids from 259 on) and a chat template.
+pub(crate) fn byte_tokenizer_with(
+    w: &mut GgufWriter,
+    user: &[&str],
+    chat_template: Option<&str>,
+) -> Result<(), GgufError> {
     let mut tokens: Vec<Value> = (0..=255u8)
         .map(|b| Value::String(byte_char(b).to_string()))
         .collect();
     tokens.extend(SPECIAL_TOKENS.iter().map(|t| Value::String(t.to_string())));
+    tokens.extend(user.iter().map(|t| Value::String(t.to_string())));
     let mut kinds = vec![Value::I32(1); 256];
     kinds.extend(SPECIAL_TOKENS.iter().map(|_| Value::I32(3)));
+    kinds.extend(user.iter().map(|_| Value::I32(4)));
+    if let Some(template) = chat_template {
+        w.set("tokenizer.chat_template", &Value::String(template.into()))?;
+    }
     w.set("tokenizer.ggml.model", &Value::String("gpt2".into()))?;
     w.set("tokenizer.ggml.pre", &Value::String("qwen2".into()))?;
     w.set("tokenizer.ggml.tokens", &Value::Array(tokens))?;

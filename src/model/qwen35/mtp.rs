@@ -93,6 +93,11 @@ impl Model {
         };
         let w = |name: &str| self.lw(il, name);
         let tok = ctx.get_rows(self.w("token_embd.weight")?, inputs.tokens);
+        // Image tokens take their vision rows, as in the target's step (#1195).
+        let tok = match inputs.img {
+            Some((rows, idx)) => ctx.set_rows(tok, rows, idx),
+            None => tok,
+        };
         let en = ctx.mul(ctx.rms_norm(tok, hp.rms_eps), w("nextn.enorm.weight")?);
         let hn = ctx.mul(ctx.rms_norm(h, hp.rms_eps), w("nextn.hnorm.weight")?);
         let cur = self.lmm(ctx, il, "nextn.eh_proj.weight", ctx.concat(en, hn, 0))?;

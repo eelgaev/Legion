@@ -1,4 +1,5 @@
-//! The Qwen3-VL vision tower of a `qwen3vl_merger` mmproj (Qwen3.5 / Qwen3.6): one image's
+//! The Qwen3-VL vision tower of a `qwen3vl_merger` mmproj (Qwen3.5 / Qwen3.6 /
+//! Qwen3.8-Flash-Next): one image's
 //! preprocessed pixels to the language model's input embeddings, one row per merged 2×2 patch.
 //!
 //! The graph is mtmd's, op for op, so that on the same backend it computes the same values:
@@ -144,10 +145,17 @@ impl Encoder {
     pub fn load(path: &Path, backend: Backend) -> Result<Self, VisionError> {
         let g = GgufFile::open(path)
             .map_err(|e| VisionError::Metadata(format!("{}: {e}", path.display())))?;
-        let hp = VisionHparams::from_gguf(&g)?;
-        let cfg = EncoderConfig::from_gguf(&g, &hp)?;
+        Self::from_gguf(&g, backend)
+    }
+
+    /// Loads the projector `g` (an mmproj GGUF, or a checkpoint's tower opened as one by
+    /// [`crate::hf::open_vision`]) onto `backend`.
+    pub fn from_gguf(g: &GgufFile, backend: Backend) -> Result<Self, VisionError> {
+        let path = g.path();
+        let hp = VisionHparams::from_gguf(g)?;
+        let cfg = EncoderConfig::from_gguf(g, &hp)?;
         let buft = backend.buffer_type();
-        let weights = Weights::load(&g, |_| buft)
+        let weights = Weights::load(g, |_| buft)
             .map_err(|e| VisionError::Metadata(format!("{}: {e}", path.display())))?;
         let enc = Self {
             cfg,

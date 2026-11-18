@@ -18,6 +18,7 @@ use std::time::Instant;
 use super::mtp_ahead::{self, Ahead};
 use super::mtp_pipe::Pass;
 use super::{Executor, Group, Logits, ModelError, SeqInput};
+use crate::model::core::Media;
 use crate::node::Request;
 
 #[cfg(test)]
@@ -41,6 +42,8 @@ struct Row<'b> {
     at: usize,
     blocks: &'b [u32],
     ring: usize,
+    /// Its images: the positions after them are shifted (M-RoPE, #1195).
+    media: Option<&'b Media>,
 }
 
 /// The pass after one over the rows `(k, drafts)` (row `k` of `rows` with `drafts` drafts
@@ -51,10 +54,16 @@ fn next_pass<'b>(
     caps: &[u32],
     drafted: impl Iterator<Item = (usize, usize)>,
 ) -> Option<Group<'b>> {
-    mtp_ahead::predict(drafted.map(|(k, d)| {
+    let mut media = Vec::new();
+    let mut g = mtp_ahead::predict(drafted.map(|(k, d)| {
         let d = d + 1;
+        media.push(rows[k].media);
         (d < caps[k] as usize).then_some((rows[k].at + d, rows[k].blocks, rows[k].ring))
-    }))
+    }))?;
+    for (s, m) in g.seqs.iter_mut().zip(media) {
+        s.media = m;
+    }
+    Some(g)
 }
 
 /// Where each row of the round goes in the first pass, given `first` (per output row of the
@@ -142,6 +151,7 @@ impl Executor {
                 at: s.n_past + s.tokens.len() - 1,
                 blocks: s.blocks,
                 ring: s.ring,
+                media: s.media,
             })
             .collect();
         if in_pass.len() != caps.len() || first.len() != caps.len() {
@@ -265,7 +275,7 @@ impl Executor {
                         blocks: rows[k].blocks,
                         ring: rows[k].ring,
                         logits: Logits::Last,
-                        media: None,
+                        media: rows[k].media,
                     })
                     .collect(),
                 verify: false,

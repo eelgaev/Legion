@@ -90,6 +90,7 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     cfg.ngram = m.ngram_options()?;
     cfg.residency = residency;
     cfg.mmproj = m.mmproj.clone();
+    cfg.no_mmproj = m.no_mmproj;
     cfg.gpus = m.gpus;
     cfg.tp = m.tp;
     cfg.tp_per_gpu = m.tp_per_gpu;

@@ -44,7 +44,21 @@ struct Builder {
     n_ff: i64,
     /// The DeltaNet heads' size (keys and values).
     ssm_state: i64,
+    /// The vocabulary adds [`VISION_TOKENS`] and the tokenizer [`VISION_TEMPLATE`].
+    vision: bool,
 }
+
+/// [`write_vision`]'s extra tokens (ids 259, 260, 261).
+pub const VISION_TOKENS: [&str; 3] = ["<|vision_start|>", "<|image_pad|>", "<|vision_end|>"];
+
+/// [`write_vision`]'s chat template: HF's content parts, as Qwen's template renders them (one
+/// placeholder per image part).
+pub const VISION_TEMPLATE: &str = "{%- for m in messages %}<|im_start|>{{ m.role }}\n\
+{%- if m.content is string %}{{ m.content }}\
+{%- else %}{%- for p in m.content %}\
+{%- if p.type == 'image' %}<|vision_start|><|image_pad|><|vision_end|>\
+{%- else %}{{ p.text }}{%- endif %}{%- endfor %}{%- endif %}<|im_end|>\n\
+{%- endfor %}{%- if add_generation_prompt %}<|im_start|>assistant\n{%- endif %}";
 
 /// The indexer shape of [`write`]: small.
 const IDX_SMALL: (i64, u32) = (IDX_DIM, 2);
@@ -175,7 +189,11 @@ impl Builder {
             .set("general.architecture", &Value::String(ARCH.into()))?;
         self.g
             .set("general.name", &Value::String("tiny-qwen4exp".into()))?;
-        byte_tokenizer(&mut self.g)?;
+        if self.vision {
+            byte_tokenizer_with(&mut self.g, &VISION_TOKENS, Some(VISION_TEMPLATE))?;
+        } else {
+            byte_tokenizer(&mut self.g)?;
+        }
         let u = Value::U32;
         self.key("block_count", u(blocks as u32))?;
         if nextn > 0 {
@@ -229,14 +247,23 @@ impl Builder {
 
 /// Writes the tiny target model to `path` and, with `mtp`, its MTP head there.
 pub fn write(path: impl AsRef<Path>, mtp: Option<&Path>, seed: u64) -> Result<(), GgufError> {
-    write_with(path, mtp, seed, IDX_SMALL, HEAD_DIM, false)
+    write_with(path, mtp, seed, IDX_SMALL, HEAD_DIM, false, false)
+}
+
+/// [`write`] with [`VISION_TOKENS`] and [`VISION_TEMPLATE`], for images in prompts (#1195).
+pub fn write_vision(
+    path: impl AsRef<Path>,
+    mtp: Option<&Path>,
+    seed: u64,
+) -> Result<(), GgufError> {
+    write_with(path, mtp, seed, IDX_SMALL, HEAD_DIM, false, true)
 }
 
 /// [`write`] with experts of twice the FFN rows and DeltaNet heads of twice the size, so that
 /// two ranks of tensor parallelism over machines (#733) each take whole Q8_0 blocks of every
 /// expert's down projection and of the DeltaNet output projection.
 pub fn write_tp(path: impl AsRef<Path>, mtp: Option<&Path>, seed: u64) -> Result<(), GgufError> {
-    write_with(path, mtp, seed, IDX_SMALL, HEAD_DIM, true)
+    write_with(path, mtp, seed, IDX_SMALL, HEAD_DIM, true, false)
 }
 
 /// [`write`] with the sparse-attention indexer in the shape ggml-cuda's lightning indexer
@@ -247,10 +274,10 @@ pub fn write_cuda_indexer(
     mtp: Option<&Path>,
     seed: u64,
 ) -> Result<(), GgufError> {
-    write_with(path, mtp, seed, IDX_CUDA, HEAD_DIM_CUDA, false)
+    write_with(path, mtp, seed, IDX_CUDA, HEAD_DIM_CUDA, false, false)
 }
 
-/// `wide`: [`write_tp`]'s shapes.
+/// `wide`: [`write_tp`]'s shapes; `vision`: [`write_vision`]'s vocabulary.
 fn write_with(
     path: impl AsRef<Path>,
     mtp: Option<&Path>,
@@ -258,6 +285,7 @@ fn write_with(
     idx: (i64, u32),
     head_dim: i64,
     wide: bool,
+    vision: bool,
 ) -> Result<(), GgufError> {
     let (n_ff, ssm_state) = if wide {
         (2 * N_FF, 2 * SSM_STATE)
@@ -271,6 +299,7 @@ fn write_with(
         head_dim,
         n_ff,
         ssm_state,
+        vision,
     };
     b.common(N_LAYER, 0)?;
     let sizes: Vec<u64> = (0..PLE_HEADS as u64).map(|h| 1009 + 2 * h).collect();
@@ -311,7 +340,7 @@ fn write_with(
         Value::Array(sizes.into_iter().map(Value::U64).collect()),
     )?;
 
-    let n_vocab = 256 + SPECIAL_TOKENS.len() as i64;
+    let n_vocab = 256 + SPECIAL_TOKENS.len() as i64 + if vision { 3 } else { 0 };
     let hc_dim = HC * E;
     b.tensor("token_embd.weight", types::Q8_0, &[E, n_vocab], 1.0, 0.0)?;
     b.weight("output.weight", types::Q8_0, &[E, n_vocab])?;
@@ -371,6 +400,7 @@ fn write_with(
         head_dim,
         n_ff,
         ssm_state,
+        vision,
     };
     b.common(N_LAYER + 1, 1)?;
     b.g.set("qwen4exp.nextn_shared_target_tensors", &Value::Bool(true))?;
