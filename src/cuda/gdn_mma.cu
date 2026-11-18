@@ -79,12 +79,27 @@ struct legion_gdn_mma_args {
     int64_t sb2;
     int64_t sb3;
     float   scale;
+
+    // The gated output norm in the delta rule (#1176 round 44, gdn_split's GN form; one
+    // sequence): gout (BF16, [head_v * H, n_tokens] contiguous) gets fused.cu's
+    // gated_norm_kernel's values of the tokens' outputs, which are not written to dst: the
+    // norm over each head's head_v values times norm_w times sigmoid or (silu) SiLU of z
+    // (F32, token t's row at z + t * z_ld), rounded to BF16. Unused by the other kernels.
+    const float * z;
+    int64_t       z_ld;
+    const float * norm_w;
+    void *        gout;
+    float         eps;
+    int32_t       silu;
+    int32_t       head_v;
 };
 
 }  // extern "C"
 
-static_assert(sizeof(legion_gdn_mma_args) == 184 && offsetof(legion_gdn_mma_args, H) == 64 &&
-                  offsetof(legion_gdn_mma_args, sq1) == 104 && offsetof(legion_gdn_mma_args, scale) == 176,
+static_assert(sizeof(legion_gdn_mma_args) == 232 && offsetof(legion_gdn_mma_args, H) == 64 &&
+                  offsetof(legion_gdn_mma_args, sq1) == 104 && offsetof(legion_gdn_mma_args, scale) == 176 &&
+                  offsetof(legion_gdn_mma_args, z) == 184 && offsetof(legion_gdn_mma_args, eps) == 216 &&
+                  offsetof(legion_gdn_mma_args, head_v) == 224,
               "gdn_mma.rs's Args has this layout");
 
 namespace {
@@ -876,7 +891,14 @@ static_assert(sizeof(split_shared<64, 1>) == 48384, "gdn_mma.rs's split smem(64,
 static_assert(sizeof(split_shared<128, 1>) == 60672, "gdn_mma.rs's split smem(128, 1)");
 static_assert(sizeof(split_shared<128, 2>) == 85376, "gdn_mma.rs's split smem(128, 2)");
 
-template <int COLS, int WARPS, int CB, int MINB, int STAGES>
+// GN (#1176 round 44, whole heads with two input buffers only): the gated output norm in the
+// kernel (legion_gdn_mma_args::gout). A chunk's outputs go to its q stage (free once converted)
+// instead of dst, and its z rows land in its k stage (cp.async, issued once the stages are
+// converted); after a block barrier warp t norms token t as fused.cu's gated_norm_w128_kernel
+// does (lane l holds columns l, 32 + l, 64 + l, 96 + l: gated_norm_kernel's sums and values)
+// and writes the BF16 row. The next chunk's inputs are issued after the top barrier, once every
+// warp has read the stages of the chunk before.
+template <int COLS, int WARPS, int CB, int MINB, int STAGES, bool GN = false>
 static __global__ __launch_bounds__(32 * WARPS, MINB) void gdn_split(legion_gdn_mma_args a) {
 #ifdef LEGION_GDN_MMA_AVAILABLE
     constexpr int C       = 16;
@@ -884,6 +906,8 @@ static __global__ __launch_bounds__(32 * WARPS, MINB) void gdn_split(legion_gdn_
     constexpr int THREADS = 32 * WARPS;
     constexpr int SLICES  = D / COLS;
     static_assert(COLS == N * WARPS * CB && D % COLS == 0, "warps own whole 8-column blocks");
+    static_assert(!GN || (COLS == D && STAGES == 2 && WARPS == C && C * D == 4 * THREADS),
+                  "GN: whole heads, two buffers, a warp a token, a 16-byte piece a thread");
     extern __shared__ __align__(128) unsigned char bytes[];
     auto & s = *reinterpret_cast<split_shared<COLS, STAGES> *>(bytes);
     static_assert(STAGES == 1 || STAGES == 2, "one buffer in two groups, or two buffers");
@@ -951,7 +975,7 @@ static __global__ __launch_bounds__(32 * WARPS, MINB) void gdn_split(legion_gdn_
     for (int64_t t0 = 0; t0 < a.n_tokens; t0 += C, buf ^= STAGES - 1) {
         const int  valid = min((int64_t) C, a.n_tokens - t0);
         const bool more  = t0 + C < a.n_tokens;
-        if constexpr (STAGES == 2) {
+        if constexpr (STAGES == 2 && !GN) {
             // The other buffer was last read before the previous chunk's solve.
             if (more) {
                 issue_qk(buf ^ 1, t0 + C);
@@ -960,11 +984,23 @@ static __global__ __launch_bounds__(32 * WARPS, MINB) void gdn_split(legion_gdn_
                 asm volatile("cp.async.commit_group;" ::: "memory");
             }
         }
-        // In flight: this chunk's q/k group, then its v group (STAGES 1); this chunk's group,
-        // then the next one's (STAGES 2).
-        asm volatile("cp.async.wait_group 1;" ::: "memory");
+        if constexpr (GN) {
+            // In flight: this chunk's group only (the previous chunk's z rows were waited for).
+            asm volatile("cp.async.wait_group 0;" ::: "memory");
+        } else {
+            // In flight: this chunk's q/k group, then its v group (STAGES 1); this chunk's
+            // group, then the next one's (STAGES 2).
+            asm volatile("cp.async.wait_group 1;" ::: "memory");
+        }
         // Also orders the previous chunk's state update reads of k before the writes below.
         __syncthreads();
+        if constexpr (GN) {
+            // The other buffer's stages (the previous chunk's outputs and z rows) are read.
+            if (more) {
+                issue_qk(buf ^ 1, t0 + C);
+                issue_v(buf ^ 1, t0 + C);
+            }
+        }
         const auto & st = s.stage[buf];
         for (int t = warp; t < C; t += WARPS) {
             const int    d = 4 * lane;
@@ -1004,6 +1040,14 @@ static __global__ __launch_bounds__(32 * WARPS, MINB) void gdn_split(legion_gdn_
             } else {
                 asm volatile("cp.async.commit_group;" ::: "memory");
             }
+        }
+        if constexpr (GN) {
+            // This chunk's z rows into its k stage (zeros past the end), a 16-byte piece a thread.
+            const int     t = tid / (D / 4), d = 4 * (tid % (D / 4));
+            const bool    ok = t0 + t < a.n_tokens;
+            const int64_t tt = ok ? t0 + t : 0;
+            cp_async16(s.stage[buf].k + t * D + d, a.z + tt * a.z_ld + h * D + d, ok);
+            asm volatile("cp.async.commit_group;" ::: "memory");
         }
         // A = beta * strict_tril(K K^T * decay), P = tril(Q K^T * decay)
         for (int ti = warp; ti < 2 * (C / 16) * (C / N); ti += WARPS) {
@@ -1128,9 +1172,47 @@ static __global__ __launch_bounds__(32 * WARPS, MINB) void gdn_split(legion_gdn_
 #pragma unroll
                 for (int i = 0; i < acc::ne; ++i) {
                     const int t = acc::get_i(i), v = c + acc::get_j(i);
-                    if (t < valid) {
+                    if constexpr (GN) {
+                        s.stage[buf].q[t * D + v] = base_output[cb].x[i] + x.x[i];
+                    } else if (t < valid) {
                         out[(t0 + t) * a.H * D + v] = base_output[cb].x[i] + x.x[i];
                     }
+                }
+            }
+        }
+        if constexpr (GN) {
+            // The chunk's outputs and z rows in place.
+            asm volatile("cp.async.wait_group 0;" ::: "memory");
+            __syncthreads();
+            const int t = warp;
+            if (t < valid) {
+                const float * o = s.stage[buf].q + t * D;
+                const float * z = s.stage[buf].k + t * D;
+                float         x[4], sum[4];
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    x[j] = o[32 * j + lane];
+                }
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    float tmp = 0.0f;
+                    tmp += x[j] * x[j];
+#pragma unroll
+                    for (int offset = 16; offset > 0; offset >>= 1) {
+                        tmp += __shfl_xor_sync(0xffffffff, tmp, offset, 32);
+                    }
+                    sum[j] = tmp;
+                }
+                const float   tot   = (sum[0] + sum[2]) + (sum[1] + sum[3]);
+                const float   mean  = tot / a.head_v;
+                const float   scale = rsqrtf(mean + a.eps);
+                const int64_t row   = (t0 + t) * a.H * D + h * D;
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    const float zv = z[32 * j + lane];
+                    const float y  = scale * x[j] * a.norm_w[32 * j + lane];
+                    const float g  = a.silu ? zv / (1.0f + expf(-zv)) : 1.0f / (1.0f + expf(-zv));
+                    __stcs((__nv_bfloat16 *) a.gout + row + 32 * j + lane, __float2bfloat16(y * g));
                 }
             }
         }
@@ -1196,9 +1278,10 @@ static __global__ __launch_bounds__(32 * WARPS, MINB) void gdn_split(legion_gdn_
 // The kernels as the CUDA runtime knows them (their host stubs), for Rust's cudaLaunchKernel, in
 // the order of gdn_mma.rs's `Schedule`: value slices of 32 at one and two blocks an SM, whole
 // heads, whole heads staged, then the split kernels (two CTAs a head, 16 warps a head, 8 warps
-// a head, 16 warps a head with two input buffers). They sit in an anonymous namespace: with relocatable device code the device link left
+// a head, 16 warps a head with two input buffers), and last the latter with the gated output
+// norm (GN, #1176 round 44). They sit in an anonymous namespace: with relocatable device code the device link left
 // extern "C" kernels out of the linked image.
-extern "C" const void * const legion_gdn_mma_kernels[8] = {
+extern "C" const void * const legion_gdn_mma_kernels[9] = {
     reinterpret_cast<const void *>(&gdn_single<16, 32, 1>),
     reinterpret_cast<const void *>(&gdn_single<16, 32, 2>),
     reinterpret_cast<const void *>(&gdn_single<16, 128>),
@@ -1207,4 +1290,5 @@ extern "C" const void * const legion_gdn_mma_kernels[8] = {
     reinterpret_cast<const void *>(&gdn_split<128, 16, 1, 1, 1>),
     reinterpret_cast<const void *>(&gdn_split<128, 8, 2, 1, 1>),
     reinterpret_cast<const void *>(&gdn_split<128, 16, 1, 1, 2>),
+    reinterpret_cast<const void *>(&gdn_split<128, 16, 1, 1, 2, true>),
 };

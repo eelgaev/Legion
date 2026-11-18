@@ -1426,6 +1426,46 @@ unsafe fn cuda_gated_norm(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
     }
 }
 
+/// [`gated_norm_bf16`]'s kernel on raw device rows (`super::gdn_mma`'s gated output norm when
+/// its fused kernel does not run): `o` and `z` rows of `head_v * n_v` floats `o_ld` and `z_ld`
+/// floats apart, `w` `head_v` floats, `out` `n_tok` contiguous BF16 rows.
+///
+/// # Safety
+/// Device memory of the stream's device, of those sizes.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn gated_norm_bf16_rows(
+    (o, o_ld): (*const f32, i64),
+    (z, z_ld): (*const f32, i64),
+    w: *const f32,
+    out: *mut c_void,
+    (head_v, n_v, n_tok): (i32, i32, i32),
+    silu: bool,
+    eps: f32,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    let g = GatedNorm {
+        o,
+        o_ld,
+        w,
+        z,
+        z_ld,
+        out,
+        head_v,
+        n_v,
+        n_tok,
+        silu: i32::from(silu),
+        eps,
+        out_bf16: 1,
+    };
+    stream_hints();
+    // SAFETY: the caller's.
+    match unsafe { legion_gated_norm_launch(&g, stream) } {
+        0 => Ok(()),
+        e => Err(format!("gated_norm: error {e}")),
+    }
+}
+
 /// Whether graphs built from now on use [`moe_combine`].
 static MOE_COMBINE_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
