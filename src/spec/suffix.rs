@@ -128,6 +128,12 @@ impl Trie {
         Some(node)
     }
 
+    /// Whether `ctx` was seen followed by a token.
+    fn continues(&self, ctx: &[u32]) -> bool {
+        self.find(ctx)
+            .is_some_and(|n| !self.nodes[n as usize].children.is_empty())
+    }
+
     /// Adds the continuation counts of `ctx` into `acc`.
     fn continuations(&self, ctx: &[u32], acc: &mut HashMap<u32, u32>) {
         if let Some(node) = self.find(ctx) {
@@ -222,6 +228,8 @@ pub struct SuffixDrafter {
     local: Vec<u32>,
     local_trie: Trie,
     local_active: Vec<u32>,
+    /// The context length the last proposal's first draft matched (0: no draft).
+    matched: usize,
 }
 
 impl SuffixDrafter {
@@ -232,6 +240,7 @@ impl SuffixDrafter {
             local: Vec::new(),
             local_trie: Trie::new(depth),
             local_active: Vec::new(),
+            matched: 0,
         }
     }
 
@@ -257,19 +266,40 @@ impl SuffixDrafter {
 
 impl TokenDrafter for SuffixDrafter {
     fn propose(&mut self, tokens: &[u32], max: usize, out: &mut Vec<u32>) {
+        self.matched = 0;
         if max == 0 || tokens.is_empty() {
             return;
         }
         self.sync_local(tokens);
         let cache = self.cache.lock();
         let depth = cache.trie.max_depth - 1;
-        let mut seq = tokens.to_vec();
+        // Contexts are at most `depth` tokens: the tail of the sequence is all a lookup reads.
+        let mut seq = tokens[tokens.len().saturating_sub(depth)..].to_vec();
         let mut acc: HashMap<u32, u32> = HashMap::new();
-        for _ in 0..max {
-            // Longest suffix of `seq` with at least one observed continuation.
+        let local = &self.local_trie;
+        let continues = |ctx: &[u32]| cache.trie.continues(ctx) || local.continues(ctx);
+        for i in 0..max {
+            // Longest suffix of `seq` with at least one observed continuation. Both tries hold
+            // every substring of what they index, so a suffix that continues has every shorter
+            // one continue too: a binary search over the length finds the one a scan from the
+            // longest down would (#37: the scan cost ~0.4 ms a step on the critical path).
             let mut best: Option<(u32, u32)> = None; // (count, token) with ties to the smaller id
             let mut total = 0u64;
-            for l in (1..=depth.min(seq.len())).rev() {
+            let mut len = 0;
+            let longest = depth.min(seq.len());
+            let found = (longest > 0 && continues(&seq[seq.len() - 1..])).then(|| {
+                let (mut lo, mut hi) = (1, longest);
+                while lo < hi {
+                    let mid = (lo + hi).div_ceil(2);
+                    if continues(&seq[seq.len() - mid..]) {
+                        lo = mid;
+                    } else {
+                        hi = mid - 1;
+                    }
+                }
+                lo
+            });
+            for l in found {
                 let ctx = &seq[seq.len() - l..];
                 acc.clear();
                 cache.trie.continuations(ctx, &mut acc);
@@ -285,15 +315,23 @@ impl TokenDrafter for SuffixDrafter {
                         a
                     }
                 });
+                len = l;
                 break;
             }
             let Some((count, tok)) = best else { break };
             if (count as f64) / (total as f64) < MIN_SHARE {
                 break;
             }
+            if i == 0 {
+                self.matched = len;
+            }
             out.push(tok);
             seq.push(tok);
         }
+    }
+
+    fn matched(&self) -> usize {
+        self.matched
     }
 }
 

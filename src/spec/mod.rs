@@ -89,6 +89,7 @@ pub mod mtp_ngram;
 pub mod ngram;
 pub(crate) mod q4_head;
 pub mod suffix;
+pub mod token_gate;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -100,6 +101,12 @@ pub trait TokenDrafter: Send {
     fn propose(&mut self, tokens: &[u32], max: usize, out: &mut Vec<u32>);
     /// After verification: the tokens actually appended this step (accepted drafts + the bonus token).
     fn accepted(&mut self, _appended: &[u32]) {}
+    /// The tokens of context the last [`Self::propose`] matched for its first draft (0: it
+    /// drafted nothing, or the drafter does not say). The cost-aware gate ([`token_gate`])
+    /// learns acceptance by it.
+    fn matched(&self) -> usize {
+        0
+    }
 }
 
 /// Makes the [`TokenDrafter`] of one sequence, when it starts decoding.
@@ -347,6 +354,10 @@ impl TokenDrafter for SuffixSeq {
         if let Some(d) = self.drafter.as_mut() {
             d.accepted(appended);
         }
+    }
+
+    fn matched(&self) -> usize {
+        self.drafter.as_ref().map_or(0, |d| d.matched())
     }
 }
 

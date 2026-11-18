@@ -294,6 +294,13 @@ impl DepthModel {
         self.nearest(|c| predict(&c.step, rows))
     }
 
+    /// Whether a target step of exactly `rows` rows was measured, in the active bucket or the
+    /// nearest one that has it.
+    pub fn measured(&self, rows: usize) -> bool {
+        self.nearest(|c| c.step.get(rows).filter(|m| m.n > 0).map(|m| m.ms))
+            .is_some()
+    }
+
     /// Predicted time of one draft pass over `seqs` sequences (as [`Self::step_ms`]).
     pub fn pass_ms(&self, seqs: usize) -> Option<f64> {
         self.nearest(|c| predict(&c.pass, seqs))

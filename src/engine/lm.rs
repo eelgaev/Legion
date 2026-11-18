@@ -5589,6 +5589,14 @@ impl LmEngine {
                     crate::spec::depth::DepthModel::new(!exec.mtp_shares_kv())
                 }
             });
+        // `LEGION_DEBUG_TOKEN_GATE=1`: the cost-aware gate, for A/B runs. It stays off: on an RTX 4090 with the
+        // experts in host memory it learns that verify windows cost more than they accept and drafts nothing,
+        // which gives up the acceptance rule's gain in repetitive chats.
+        let token_gate = (matches!(drafting, Drafting::Tokens(_))
+            && !cfg.spec.fixed
+            && exec.model().experts().is_some()
+            && std::env::var("LEGION_DEBUG_TOKEN_GATE").as_deref() == Ok("1"))
+        .then(crate::spec::token_gate::TokenGate::default);
         // Sequence slots (`--kv-slots`): one per admitted sequence, its blocks in order.
         let slot_blocks = exec.kv_slot_blocks();
         // Prefix caching where the radix tree cannot serve (rings, slots): warm sequences,
@@ -5781,6 +5789,7 @@ impl LmEngine {
             stats: stats.clone(),
             depth,
             mtp_k: spec_k.min(cfg.spec.k),
+            token_gate,
             drafting,
             spec_k,
             spec_config: cfg.spec.clone(),
@@ -6186,6 +6195,9 @@ struct Worker {
     /// The depth the drafts in flight were made for: verify steps take `1 +` this many rows per
     /// sequence (with `depth`; otherwise `1 + spec_k`).
     mtp_k: usize,
+    /// `--spec ngram|suffix` on a target that streams its experts, without `--spec-fixed`: the
+    /// cost-aware gate (#37, [`crate::spec::token_gate`]) in place of the acceptance rule.
+    token_gate: Option<crate::spec::token_gate::TokenGate>,
     /// The next sequence's [`SeqId`].
     next_id: SeqId,
     long: LongPrompts,
@@ -6310,6 +6322,8 @@ struct Seq<'t> {
     ngram: Option<crate::spec::mtp_ngram::MtpNgram>,
     /// Whether `draft` is the n-gram's, and its match-length class.
     draft_ngram: Option<usize>,
+    /// Its part of the token drafters' cost-aware gate ([`Worker::token_gate`]).
+    gate: crate::spec::token_gate::SeqGate,
     /// Its place in the waiting queue: fair share's key, and under `--scheduling-policy
     /// priority` the order prompts get the prefill budget in.
     ticket: Ticket,
@@ -6692,6 +6706,7 @@ impl Worker {
             ngram: (self.spec_config.mtp_ngram > 0 && matches!(self.drafting, Drafting::Mtp(_)))
                 .then(|| crate::spec::mtp_ngram::MtpNgram::new(self.spec_config.mtp_ngram)),
             draft_ngram: None,
+            gate: Default::default(),
             ticket,
             need,
             resuming: false,
@@ -7784,8 +7799,12 @@ impl Worker {
         let mut depths = adaptive::StepDepth::default();
         let decode_batch = batch;
         if self.spec_k > 0 {
+            let gate = self.token_gate.is_some();
             for seq in decoding.iter_mut() {
-                let cap = if seq.drafter.is_some() {
+                let cap = if seq.drafter.is_some() && gate {
+                    // The gate below decides from the drafts themselves.
+                    seq.depth_cap(self.spec_k, self.max_ctx, &mut depths)
+                } else if seq.drafter.is_some() {
                     seq.adaptive_cap(&self.spec_config, decode_batch, self.max_ctx, &mut depths)
                 } else {
                     // Model drafts were selected after the previous target step. Recheck
@@ -7819,6 +7838,9 @@ impl Worker {
                 seq.draft.probs.truncate(n);
                 n_tok = n_tok.max(1 + seq.draft.tokens.len());
             }
+            if let Some(g) = &mut self.token_gate {
+                n_tok = 1 + gate_drafts(g, decoding);
+            }
         }
         let verify = n_tok > 1;
         if verify {
@@ -7826,7 +7848,7 @@ impl Worker {
                 n_tok - 1,
                 self.depth.is_some().then_some(self.mtp_k),
                 self.spec_k,
-                self.spec_config.pad_longest,
+                self.spec_config.pad_longest || self.token_gate.is_some(),
             );
         }
         for seq in decoding.iter_mut() {
@@ -8148,6 +8170,11 @@ impl Worker {
                 }
                 step_spec.record(verified, o.accepted);
                 crate::dashboard::hub::record_spec(verified, o.accepted);
+                if let Some(g) = &mut self.token_gate
+                    && let Some(c) = seq.gate.verified(verified, o.accepted)
+                {
+                    g.learn(c);
+                }
                 // The n-gram's drafts teach the n-gram's estimates, not the head's.
                 if !seq.ngram_verified(drafts.tokens.len(), o.accepted) {
                     seq.adaptive.record(drafts.tokens.len(), o.accepted);
@@ -8187,6 +8214,11 @@ impl Worker {
                 }
                 if let Some(ng) = &mut seq.ngram {
                     ng.appended(&appended);
+                }
+                if let Some(g) = &mut self.token_gate
+                    && let Some(c) = seq.gate.appended(&appended)
+                {
+                    g.learn(c);
                 }
             }
             if finished {
@@ -8300,8 +8332,14 @@ impl Worker {
                 tokens = n_tok,
                 seqs = decoding.len(),
                 commit_ms,
+                drafted = step_spec.drafted,
+                accepted = step_spec.accepted,
+                prompt = !chunks.is_empty(),
                 "verify step"
             );
+            if let (Some(g), Some(rows)) = (&mut self.token_gate, timed_rows) {
+                g.record_step(span, rows, step_ms + commit_ms);
+            }
             if let (Some(d), Some(rows)) = (&mut self.depth, timed_rows) {
                 d.set_context(span);
                 let ms = step_ms + commit_ms + sample_ms;
@@ -8310,9 +8348,17 @@ impl Worker {
                     d.record_fill(rows, drafted, ms);
                 }
             }
-        } else if let (Some(d), Some(rows)) = (&mut self.depth, timed_rows) {
-            d.set_context(span);
-            d.record_step(rows, step_ms + sample_ms);
+        } else {
+            if let Some(rows) = timed_rows.filter(|_| self.spec_k > 0) {
+                tracing::debug!(step_ms, rows, "decode step");
+                if let Some(g) = &mut self.token_gate {
+                    g.record_step(span, rows, step_ms);
+                }
+            }
+            if let (Some(d), Some(rows)) = (&mut self.depth, timed_rows) {
+                d.set_context(span);
+                d.record_step(rows, step_ms + sample_ms);
+            }
         }
         if matches!(self.drafting, Drafting::Model(_) | Drafting::Mtp(_)) {
             let k = self.spec_k;
@@ -8713,6 +8759,36 @@ fn verify_rows(longest: usize, depth: Option<usize>, spec_k: usize, pad_longest:
             None => spec_k,
         }
     }
+}
+
+/// The token drafters' cost-aware gate (#37, [`crate::spec::token_gate`]) over the drafts just
+/// proposed: each sequence keeps at most the `K` the gate picks for the batch, and one whose
+/// drafts it turns down follows them as a shadow. The longest draft left.
+fn gate_drafts(g: &mut crate::spec::token_gate::TokenGate, decoding: &mut [Seq<'_>]) -> usize {
+    use crate::spec::token_gate::{Offer, class};
+    let offers: Vec<Offer> = (decoding.iter())
+        .map(|s| Offer {
+            class: class(s.drafter.as_ref().map_or(0, |d| d.matched())),
+            drafts: s.draft.tokens.len(),
+        })
+        .collect();
+    let span = decoding.iter().map(|s| s.n_past + 1).max().unwrap_or(0);
+    let k = g.choose(span, &offers);
+    let mut longest = 0;
+    for (s, o) in decoding.iter_mut().zip(&offers) {
+        if o.drafts == 0 {
+            s.gate.plain();
+        } else if k == 0 {
+            s.gate.follow(o.class, &s.draft.tokens);
+            s.draft = Draft::default();
+        } else {
+            s.gate.drafting(o.class);
+            s.draft.tokens.truncate(k);
+            s.draft.probs.truncate(k);
+        }
+        longest = longest.max(s.draft.tokens.len());
+    }
+    longest
 }
 
 /// A verify step's tokens per decoding sequence: [next, drafts.., padding up to n_tok]

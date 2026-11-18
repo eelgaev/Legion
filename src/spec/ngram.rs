@@ -11,13 +11,19 @@ use super::TokenDrafter;
 pub struct NgramDrafter {
     min_n: usize,
     max_n: usize,
+    /// The n-gram the last proposal matched (0: none).
+    matched: usize,
 }
 
 impl NgramDrafter {
     /// Panics if `min_n == 0` or `min_n > max_n`.
     pub fn new(min_n: usize, max_n: usize) -> Self {
         assert!(min_n > 0 && min_n <= max_n, "require 0 < min_n <= max_n");
-        Self { min_n, max_n }
+        Self {
+            min_n,
+            max_n,
+            matched: 0,
+        }
     }
 }
 
@@ -29,6 +35,7 @@ impl Default for NgramDrafter {
 
 impl TokenDrafter for NgramDrafter {
     fn propose(&mut self, tokens: &[u32], max: usize, out: &mut Vec<u32>) {
+        self.matched = 0;
         if max == 0 {
             return;
         }
@@ -44,11 +51,19 @@ impl TokenDrafter for NgramDrafter {
                 continue;
             };
             let follow = start + n;
+            let before = out.len();
             out.extend_from_slice(&tokens[follow..(follow + max).min(len)]);
+            if out.len() > before {
+                self.matched = n;
+            }
             return;
         }
     }
-    // `accepted` stays the default no-op: the drafter is stateless.
+    // `accepted` stays the default no-op: the drafter keeps nothing between proposals.
+
+    fn matched(&self) -> usize {
+        self.matched
+    }
 }
 
 #[cfg(test)]

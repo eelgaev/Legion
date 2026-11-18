@@ -920,9 +920,11 @@ impl AfterLaps {
         }
     }
 
-    fn log(&mut self, swaps: usize) {
+    /// `chosen`: a logged step's distinct experts over its layers, (in VRAM slots, not).
+    fn log(&mut self, swaps: usize, chosen: Option<(usize, usize)>) {
         if self.at.take().is_some() {
-            tracing::debug!(swaps, laps = ?self.laps, "expert cache after-step us");
+            let (vram, host) = chosen.unwrap_or_default();
+            tracing::debug!(swaps, vram, host, laps = ?self.laps, "expert cache after-step us");
         }
     }
 }
@@ -2678,6 +2680,8 @@ impl ExpertResidency {
             }
         }
         let held = self.held();
+        // Debug log only: the step's distinct experts, in VRAM slots and not.
+        let mut chosen = (self.laps.at.is_some() && n > 0 && n <= LOG_TOKENS).then_some((0, 0));
         if n > 0 && n <= LOG_TOKENS {
             if count {
                 self.logged += 1;
@@ -2740,6 +2744,15 @@ impl ExpertResidency {
                         mine
                     };
                     l.read(mine, gathered, staged(l));
+                    if let Some((vram, host)) = chosen.as_mut() {
+                        let n_slots = l.slots.n_slots() as i32;
+                        let mut ids: Vec<i32> = mine.iter().copied().filter(|&i| i >= 0).collect();
+                        ids.sort_unstable();
+                        ids.dedup();
+                        let v = ids.iter().filter(|&&i| i < n_slots).count();
+                        *vram += v;
+                        *host += ids.len() - v;
+                    }
                     if let Some(g) = &guesses {
                         let guess = &g[(l.row - lo) * cap..][..per];
                         predicted |= predict_entry(&mut self.predict, l, gpu, mine, guess);
@@ -2836,7 +2849,7 @@ impl ExpertResidency {
             self.issue_swaps(d, &swaps)?;
         }
         self.laps.lap("later");
-        self.laps.log((self.swaps - swaps0) as usize);
+        self.laps.log((self.swaps - swaps0) as usize, chosen);
         r
     }
 
