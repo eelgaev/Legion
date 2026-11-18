@@ -44,6 +44,36 @@ pub struct PagedQmBenchArgs {
     /// blocks as `--paged-verify-split`; other bits, timed for reference).
     #[arg(long, value_delimiter = ',')]
     d512: Vec<String>,
+    /// The wide-grid kernel for small groups at 6 query heads a kv head (`--heads 24,4`:
+    /// Qwen3.8-27B) against `paged_prefill_mma` (#689), `--modes` ignored: `auto` (where the
+    /// default picks it), `grid` (the wide-grid kernel for every group it covers), `split` (over
+    /// the key blocks as `--paged-verify-split`; other bits, timed for reference).
+    #[arg(long, value_delimiter = ',')]
+    grid: Vec<String>,
+}
+
+/// A kernel family timed and checked against `paged_prefill_mma` (`--d512`, `--grid`).
+#[cfg(feature = "cuda")]
+struct Alt<'a> {
+    /// The flag and the kernels it was given.
+    flag: &'static str,
+    picked: &'a [String],
+    /// Every kernel name the family knows, `main` first.
+    kernels: &'static [&'static str],
+    /// The family's kernel name in the bits column and the edge-case line.
+    name: &'static str,
+    /// Query heads per kv head it covers.
+    ratio: usize,
+    run: fn(
+        &mut legion::ggml::Backend,
+        &legion::model::core::KvPool,
+        &legion::model::core::paged_split_bench::Group,
+        &str,
+        usize,
+        usize,
+    ) -> (Vec<f32>, f64),
+    on: fn(&legion::model::core::paged_split_bench::Group, &str, usize) -> bool,
+    edges: fn(&mut legion::ggml::Backend, &str, usize) -> (usize, usize, usize, usize),
 }
 
 #[cfg(feature = "cuda")]
@@ -65,7 +95,32 @@ pub fn run(args: PagedQmBenchArgs) -> anyhow::Result<()> {
         chunks.push((p.trim().parse::<usize>()?, t.trim().parse::<usize>()?));
     }
     if !args.d512.is_empty() {
-        return run_d512(&args, (512, n_head, n_head_kv), &chunks);
+        use legion::model::core::paged_d512_bench as d512;
+        let alt = Alt {
+            flag: "--d512",
+            picked: &args.d512,
+            kernels: &d512::KERNELS,
+            name: "pair",
+            ratio: 8,
+            run: d512::run,
+            on: d512::on_pair,
+            edges: d512::edges,
+        };
+        return run_alt(&args, &alt, (512, n_head, n_head_kv), &chunks);
+    }
+    if !args.grid.is_empty() {
+        use legion::model::core::paged_grid_bench as grid;
+        let alt = Alt {
+            flag: "--grid",
+            picked: &args.grid,
+            kernels: &grid::KERNELS,
+            name: "grid",
+            ratio: 6,
+            run: grid::run,
+            on: grid::on_grid,
+            edges: grid::edges,
+        };
+        return run_alt(&args, &alt, heads, &chunks);
     }
     let mut gpu = legion::ggml::backend_by_name("CUDA0")?;
     let mut differ = 0;
@@ -156,36 +211,39 @@ pub fn run(args: PagedQmBenchArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `--d512`: the warp-pair kernel (#1181) and the split against `paged_prefill_mma` at heads of
-/// 512.
+/// `--d512`: the warp-pair kernel (#1181), `--grid`: the wide-grid kernel (#689), each with the
+/// split, against `paged_prefill_mma`.
 #[cfg(feature = "cuda")]
-fn run_d512(
+fn run_alt(
     args: &PagedQmBenchArgs,
+    alt: &Alt,
     heads: (usize, usize, usize),
     chunks: &[(usize, usize)],
 ) -> anyhow::Result<()> {
-    use legion::model::core::paged_d512_bench as bench;
     use legion::model::core::paged_split_bench::{Group, pool};
-    for k in &args.d512 {
+    let flag = alt.flag;
+    for k in alt.picked {
         anyhow::ensure!(
-            k != "main" && bench::KERNELS.contains(&k.as_str()),
-            "--d512 takes {:?}, not {k}",
-            &bench::KERNELS[1..]
+            k != "main" && alt.kernels.contains(&k.as_str()),
+            "{flag} takes {:?}, not {k}",
+            &alt.kernels[1..]
         );
     }
     anyhow::ensure!(
-        heads.1 == 8 * heads.2,
-        "--d512 takes 8 query heads a kv head"
+        heads.1 == alt.ratio * heads.2,
+        "{flag} takes {} query heads a kv head",
+        alt.ratio
     );
     let mut gpu = legion::ggml::backend_by_name("CUDA0")?;
     let sms = legion::hw::per_device::sm_count(0).max(0) as usize;
     println!("{sms} SMs");
     let mut differ = 0;
     if !args.no_edges {
-        for k in args.d512.iter().filter(|k| *k != "split") {
-            let (cases, ran, total, bad) = bench::edges(&mut gpu, k, sms);
+        for k in alt.picked.iter().filter(|k| *k != "split") {
+            let (cases, ran, total, bad) = (alt.edges)(&mut gpu, k, sms);
             println!(
-                "edges, {k}: {cases} cases ({ran} on the pair kernel), {bad} of {total} values differ"
+                "edges, {k}: {cases} cases ({ran} on the {} kernel), {bad} of {total} values differ",
+                alt.name
             );
             differ += bad;
         }
@@ -204,7 +262,7 @@ fn run_d512(
         "{:>7} {:>6} {:>4} {:>9}",
         "n_past", "n_tok", "seqs", "main ms"
     );
-    for k in &args.d512 {
+    for k in alt.picked {
         print!(" {:>9} {:>6} {:>6}", format!("{k} ms"), "x", "bits");
     }
     println!();
@@ -224,11 +282,11 @@ fn run_d512(
         };
         let finite = |v: &[f32]| v.iter().all(|x| x.is_finite());
         // main, each kernel twice, main: each one's faster run kept.
-        let mut t = |k: &str| bench::run(&mut gpu, &kv, &g, k, args.reps, args.rounds);
+        let mut t = |k: &str| (alt.run)(&mut gpu, &kv, &g, k, args.reps, args.rounds);
         let (a1, m1) = t("main");
         anyhow::ensure!(finite(&a1), "{n_past}:{n_tok}: non-finite main output");
         let mut cols = Vec::new();
-        for k in &args.d512 {
+        for k in alt.picked {
             let (b1, q1) = t(k);
             anyhow::ensure!(finite(&b1), "{n_past}:{n_tok}: non-finite {k} output");
             let (_, q2) = t(k);
@@ -246,7 +304,7 @@ fn run_d512(
             let bits = match (k.as_str(), bad) {
                 ("split", 0) => "same",
                 ("split", _) => "other",
-                (_, 0) if bench::on_pair(&g, k, sms) => "pair",
+                (_, 0) if (alt.on)(&g, k, sms) => alt.name,
                 (_, 0) => "mma",
                 _ => {
                     differ += bad;

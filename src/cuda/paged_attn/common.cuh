@@ -122,6 +122,11 @@ struct legion_paged_attn {
     // each column's output over a warp pair) instead of paged_prefill_mma; the same bits. Picked
     // on the Rust side (paged::d512_pair) for small groups.
     int32_t d512_pair;
+    // Heads of 256 at 6 query heads a kv head, not compact, on sm_80+ without a split (Qwen3.8-27B's
+    // attention layers, #689): 1 runs the group on paged_prefill_grid (sm80/paged_attn_grid.cuh,
+    // groups of 8 query columns on warp pairs over more CTAs) instead of paged_prefill_mma; the
+    // same bits. Picked on the Rust side (paged::verify_grid) for small groups.
+    int32_t verify_grid;
 };
 
 enum { LEGION_KV_F16 = 0, LEGION_KV_Q8_0 = 1, LEGION_KV_Q4_0 = 2 };
@@ -860,6 +865,9 @@ __global__ void __launch_bounds__(256) paged_prefill(const legion_paged_attn p) 
 // (#1181).
 #include "../sm80/paged_attn_pair.cuh"
 
+// Prefill on sm_80+ for small groups of heads of 256 on a wider grid: namespace fa_grid (#689).
+#include "../sm80/paged_attn_grid.cuh"
+
 // Prefill on sm_70 (Volta): mma.sync m8n8k4, namespace v70.
 #include "../sm70/paged_attn.cuh"
 
@@ -893,6 +901,15 @@ int launch(const legion_paged_attn & p, cudaStream_t st) {
         // A split scratch (--paged-verify-split): small groups split over the key blocks.
         if (p.max_split > 1 && !p.piece_blk && !p.ml) {
             return fa::launch_split<D, G, C>(p, st);
+        }
+        // Heads of 256, 6 query heads a kv head (Qwen3.8-27B): a small group takes the wide-grid
+        // kernel where p.verify_grid says so (#689), the same bits.
+        if constexpr (D == 256 && G == 6 && !C) {
+            if (p.verify_grid > 0) {
+                if (const int rc = fa_grid::launch<D, G>(p, st); rc >= 0) {
+                    return rc;
+                }
+            }
         }
         // Heads of 256 on compute capability 12.x: queries as M where it covers the op, the same
         // bits (-1: no shared memory for it, paged_prefill_mma instead).

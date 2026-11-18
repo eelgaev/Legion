@@ -138,6 +138,69 @@ fn d512_pair_for(
     }
 }
 
+/// Whether small groups with heads of 256 at 6 query heads a kv head run on the wide-grid kernel
+/// ([`verify_grid`]): on unless `LEGION_DEBUG_PAGED_VERIFY_GRID=0` (read once), which keeps
+/// `paged_prefill_mma`. The same bits either way.
+#[cfg(feature = "cuda")]
+fn verify_grid_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("LEGION_DEBUG_PAGED_VERIFY_GRID").as_deref() != Ok("0"))
+}
+
+thread_local! {
+    /// The calling thread's wide-grid choice ([`set_verify_grid_here`]).
+    static GRID_HERE: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The wide-grid kernel's choice for the calling thread's launches (benches): `Some(0)`
+/// `paged_prefill_mma`, `Some(1)` the wide-grid kernel for every group it covers, `Some(-1)`
+/// [`verify_grid`]'s pick; `None` follows the default again.
+pub fn set_verify_grid_here(mode: Option<i32>) {
+    GRID_HERE.with(|c| c.set(mode));
+}
+
+/// Whether a group of `n_tok` tokens per sequence, `n_seqs` sequences and `n_head_kv` kv heads of
+/// 6 query heads each (heads of 256: Qwen3.8-27B) runs on the wide-grid kernel on a GPU of `sms`
+/// SMs (#689). `paged_prefill_mma` puts 64 query columns (token x head) in a CTA, so a speculative
+/// verify step of one sequence is one CTA per kv head, each walking the whole context.
+/// `paged_prefill_grid` (src/cuda/sm80/paged_attn_grid.cuh) puts 2 groups of 8 columns in a CTA,
+/// each on a warp pair: `ceil(6 n_tok / 16) × n_head_kv × n_seqs` CTAs. It is picked where that
+/// grid fits on the SMs in one wave (one CTA an SM: its 96 KB ring), for 2 to
+/// [`VERIFY_SPLIT_TOKENS`] tokens. On a GB10 that is 1.3-2.0x per call at 1 or 2 sequences and
+/// about even at 4 or more (the context's reads already at DRAM speed there); larger grids lose
+/// on short contexts.
+pub fn verify_grid(n_tok: usize, n_seqs: usize, n_head_kv: usize, sms: usize) -> bool {
+    (2..=VERIFY_SPLIT_TOKENS).contains(&n_tok)
+        && sms > 0
+        && (6 * n_tok).div_ceil(16) * n_head_kv * n_seqs <= sms
+}
+
+/// The launch's `verify_grid`: 0 unless the group has heads of 256 at 6 query heads a kv head in
+/// a cache that is not compact, more than one token per sequence and no split over the key
+/// blocks; then the calling thread's choice ([`set_verify_grid_here`]) or the default.
+#[cfg(feature = "cuda")]
+fn verify_grid_for(
+    d: usize,
+    n_head: usize,
+    n_head_kv: usize,
+    n_tok: usize,
+    n_seqs: usize,
+    compact: bool,
+    max_split: i32,
+) -> i32 {
+    if d != 256 || n_head != 6 * n_head_kv || compact || n_tok < 2 || max_split > 1 {
+        return 0;
+    }
+    let mode = GRID_HERE.with(|c| c.get());
+    match mode.unwrap_or(if verify_grid_on() { -1 } else { 0 }) {
+        -1 => {
+            let sms = crate::hw::per_device::current().map_or(0, crate::hw::per_device::sm_count);
+            verify_grid(n_tok, n_seqs, n_head_kv, sms.max(0) as usize) as i32
+        }
+        m => (m > 0) as i32,
+    }
+}
+
 /// [`attention_tiered`] without a tier (tests).
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
@@ -772,6 +835,9 @@ struct LaunchParams {
     /// Heads of 512 at 8 query heads a kv head on sm_80+: 1 runs the group on the warp-pair
     /// prefill kernel ([`d512_pair_for`]); 0: `paged_prefill_mma`.
     d512_pair: i32,
+    /// Heads of 256 at 6 query heads a kv head on sm_80+: 1 runs the group on the wide-grid
+    /// prefill kernel ([`verify_grid_for`]); 0: `paged_prefill_mma`.
+    verify_grid: i32,
 }
 
 /// The kernels' code for a cache type (`LEGION_KV_*` in paged_attn.cu), if they read it.
@@ -984,6 +1050,7 @@ unsafe fn cuda_paged_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
         head_stride: o.head_stride as i64,
         vsplit_chunk: 0,
         d512_pair: 0,
+        verify_grid: 0,
     };
     // A multi-token group runs split over the key blocks (sm_80+) only with a scratch made for
     // it (split_scratch_shape); the placeholder and a tier's scratch have one split.
@@ -991,6 +1058,15 @@ unsafe fn cuda_paged_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
         p.max_split = 1;
     }
     p.d512_pair = d512_pair_for(
+        o.d,
+        o.n_head,
+        o.n_head_kv,
+        o.n_tok,
+        o.n_seqs,
+        o.compact,
+        p.max_split,
+    );
+    p.verify_grid = verify_grid_for(
         o.d,
         o.n_head,
         o.n_head_kv,
@@ -1164,6 +1240,9 @@ mod d512_tests;
 mod ffma_tests;
 #[cfg(test)]
 mod granule_tests;
+pub mod grid_bench;
+#[cfg(test)]
+mod grid_tests;
 pub mod hopper;
 #[cfg(all(test, feature = "cuda"))]
 mod m884_tests;
