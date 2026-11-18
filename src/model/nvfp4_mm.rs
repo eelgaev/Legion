@@ -1546,9 +1546,13 @@ mod cuda {
                 Kernel::Mv { nt, rtw, kw, rpt } => {
                     legion_nvfp4_mv_launch(p, nt, rtw, kw, rpt, stream)
                 }
-                Kernel::Gemm { mi, nt } => {
-                    legion_nvfp4_gemm_launch(p, mi, nt, tune.code() + 100 * forced_pf(), stream)
-                }
+                Kernel::Gemm { mi, nt } => legion_nvfp4_gemm_launch(
+                    p,
+                    mi,
+                    nt,
+                    tune.code() + 100 * (forced_pf() | l1()),
+                    stream,
+                ),
             }
         };
         match code {
@@ -1569,6 +1573,20 @@ mod cuda {
 
     fn forced_pf() -> i32 {
         FORCED_PF.load(Ordering::Relaxed) as i32
+    }
+
+    /// [`super::force_gemm_l1`]'s copies plus one (0: none forced).
+    pub(super) static FORCED_L1: AtomicU64 = AtomicU64::new(0);
+
+    /// The GEMMs' copies (#1176 r43) as `DIAG_CAW` / `DIAG_CAX` bits of `nvfp4_gemm`: the
+    /// L2-only `cp.async.cg` copies (0) unless [`super::force_gemm_l1`] forces L1 ones (where
+    /// compiled: the tiles and tunes prefill runs; not with a prefetch or diagnostic run). The
+    /// same sums either way.
+    fn l1() -> i32 {
+        match FORCED_L1.load(Ordering::Relaxed) {
+            0 => 0,
+            v => v as i32 - 1,
+        }
     }
 
     fn forced_tune() -> Option<GemmTune> {
@@ -1677,7 +1695,12 @@ mod cuda {
                 legion_nvfp4_swiglu_mv_launch(&p, nt, stream)
             } else {
                 let tune = forced_tune().unwrap_or(GEMM_DEFAULT);
-                legion_nvfp4_swiglu_gemm_launch(&p, nt, tune.code() + 100 * forced_pf(), stream)
+                legion_nvfp4_swiglu_gemm_launch(
+                    &p,
+                    nt,
+                    tune.code() + 100 * (forced_pf() | l1()),
+                    stream,
+                )
             }
         };
         match code {
@@ -2039,7 +2062,7 @@ mod cuda {
             0 if pf32() && matches!((nt, tune.code()), (16, 31) | (8, 31) | (8, 41)) => 2048,
             d => d,
         };
-        let code = tune.code() + 100 * diag;
+        let code = tune.code() + 100 * (diag | l1());
         // SAFETY: parameters checked by the caller; the node's stream.
         match unsafe { legion_nvfp4_swiglu_gemm_launch(p, nt, code, stream) } {
             0 => Ok(()),
@@ -2096,6 +2119,26 @@ pub fn force_gemm_pf(pf: i32) {
     cuda::FORCED_PF.store(bit as u64, std::sync::atomic::Ordering::Relaxed);
     #[cfg(not(feature = "cuda"))]
     let _ = bit;
+}
+
+/// `nvfp4_gemm`'s `DIAG_CAW`: the weight copies through L1 (`cp.async.ca`).
+pub const L1_W: i32 = 4096;
+/// `nvfp4_gemm`'s `DIAG_CAX`: the activation copies through L1.
+pub const L1_X: i32 = 8192;
+
+/// Launches every NVFP4 GEMM from now on with the copies `l1` (0: L2 only, or [`L1_W`] and / or
+/// [`L1_X`]) where compiled; `None`: the default (L2 only: on a GB10 the weights through L1 are
+/// 2-10% slower a call, the activations within 1% either way, #1176 r43). `legion
+/// nvfp4-gemm-bench` only; the same bits either way.
+#[doc(hidden)]
+pub fn force_gemm_l1(l1: Option<i32>) {
+    #[cfg(feature = "cuda")]
+    cuda::FORCED_L1.store(
+        l1.map_or(0, |v| v as u64 + 1),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    #[cfg(not(feature = "cuda"))]
+    let _ = l1;
 }
 
 /// Launches every grouped SwiGLU GEMM from now on with the parts `diag` left out (`DIAG_*` of

@@ -4,7 +4,11 @@
 
 int legion_nvfp4::launch_swiglu_gemm(const legion_nvfp4_mm & p, int nt, int variant, cudaStream_t st) {
     switch (nt) {
-        case 4: return variant == 31 ? gemm<2, 4, true>(p, st) : -1;
+        case 4:
+            if (const int r = gemm_l1<2, 4, true>(p, variant, st); r != -2) {
+                return r;
+            }
+            return variant == 31 ? gemm<2, 4, true>(p, st) : -1;
         case 8: return gemm_variant<2, 8, true>(p, variant, st);
         case 16: return variant >= 100 ? gemm_diag<2, 16, true>(p, variant, st) : gemm_variant<2, 16, true>(p, variant, st);
         default: return -1;

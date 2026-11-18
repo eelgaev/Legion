@@ -99,6 +99,16 @@ pub fn force_kernel(kernel: i32) {
     KERNEL.store(kernel, Ordering::Relaxed);
 }
 
+/// Whether `up_mix_bf16_reg` copies `lo` through L1 (#1176 r43, on by default on compute
+/// capability 12.x, the GB10, where it was measured; L2 only elsewhere; kernel codes
+/// [`force_kernel`] forces plus 1000 copy it through L2 only). `LEGION_DEBUG_HC_UP_MIX_L1=0`:
+/// L2 only, for A/B runs. The same bits either way.
+#[cfg(feature = "cuda")]
+fn l1() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_HC_UP_MIX_L1").is_none_or(|v| v != "0"))
+}
+
 /// Sets whether graphs built from now on run the mixer's up matmul and gated mix as one op for
 /// BF16 `up` weights where it fits (on by default; [`set_up_mix`] off turns it off too); `false`
 /// keeps ggml's cuBLAS `mul_mat` and `hc_pre`.
@@ -914,7 +924,7 @@ pub(crate) unsafe fn launch_mix(
                 c => (*c).data as *mut u16,
             },
             skip_f32: params[P_SKIP_F32],
-            kernel: KERNEL.load(Ordering::Relaxed),
+            kernel: KERNEL.load(Ordering::Relaxed) + if l1() { 0 } else { 1000 },
             pre_out: std::ptr::null(),
             pre_out_ld: 0,
             pre_inj: std::ptr::null(),

@@ -203,15 +203,27 @@ __device__ __forceinline__ void cp_async4(void * s, const void * g, bool valid) 
     asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" ::"r"(a), "l"(g), "r"(valid ? 4 : 0));
 }
 
+// CA: through L1 (cp.async.ca, the line kept in the SM's L1 for the next reads of it) instead of
+// L2 only (cp.async.cg); the same bytes either way (#1176 r43).
+template <bool CA = false>
 __device__ __forceinline__ void cp_async16(void * s, const void * g, bool valid) {
     const uint32_t a = (uint32_t) __cvta_generic_to_shared(s);
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(a), "l"(g), "r"(valid ? 16 : 0));
+    if constexpr (CA) {
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;\n" ::"r"(a), "l"(g), "r"(valid ? 16 : 0));
+    } else {
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(a), "l"(g), "r"(valid ? 16 : 0));
+    }
 }
 
 // The first `bytes` (0 to 16) of a 16-byte word; the rest of the shared word is zeroed.
+template <bool CA = false>
 __device__ __forceinline__ void cp_async16_n(void * s, const void * g, int bytes) {
     const uint32_t a = (uint32_t) __cvta_generic_to_shared(s);
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(a), "l"(g), "r"(bytes));
+    if constexpr (CA) {
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;\n" ::"r"(a), "l"(g), "r"(bytes));
+    } else {
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(a), "l"(g), "r"(bytes));
+    }
 }
 
 // A UE4M3 sub-block scale times 2^116 as a BF16 pair (ggml: sign ignored, 0x7f is 0).
@@ -345,8 +357,11 @@ __device__ __forceinline__ bool find_tile(const int32_t * offs, int n_expert, in
 // epilogue; DIAG_NOW / DIAG_NOX: no weight / activation copies (no L2 prefetch with NOW);
 // DIAG_NOK: no k loop (the tile lookup and the epilogue alone). DIAG_PF4 / 8 / 16 / 32: the
 // same sums (exact), the weights' L2 prefetch in runs of 4 / 8 / 16 / 32 blocks (see PF).
+// DIAG_CAW / DIAG_CAX (#1176 r43, exact, the default's own sums): the weight / activation
+// copies through L1 (cp.async.ca) instead of L2 only (cp.async.cg); see gemm_l1.
 constexpr int DIAG_NODEC = 1, DIAG_NOMMA = 2, DIAG_NOEPI = 4, DIAG_NOW = 8, DIAG_NOX = 16, DIAG_NOK = 64,
-              DIAG_PF16 = 256, DIAG_PF4 = 512, DIAG_PF8 = 1024, DIAG_PF32 = 2048;
+              DIAG_PF16 = 256, DIAG_PF4 = 512, DIAG_PF8 = 1024, DIAG_PF32 = 2048, DIAG_CAW = 4096,
+              DIAG_CAX = 8192;
 template <int MI, int NT, bool GROUPED, bool GLU, int ST = STAGES, int MINB = 1, int DIAG = 0>
 __global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -459,7 +474,7 @@ __global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p)
                 const uint8_t * start = row_src(r) + step * 36;
                 const uint8_t * src = (const uint8_t *) ((uintptr_t) start & ~(uintptr_t) 15) + part * 16;
                 const int bytes = row_ok(r) ? min(16, (int) (start + 36 - src)) : 0;
-                cp_async16_n(ws + r * LDW + part * 16, src, bytes);
+                cp_async16_n<(DIAG & DIAG_CAW) != 0>(ws + r * LDW + part * 16, src, bytes);
             }
         }
 #pragma unroll
@@ -469,7 +484,7 @@ __global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p)
                 const int t = c / 8, col = c % 8 * 8;
                 const bool ok = t < n_tok;
                 const int64_t off = !ok ? 0 : GROUPED ? x_off[t] : (n0 + t) * p.x_ld;
-                cp_async16(xs + t * LDX + col, p.x + off + step * BK + col, ok);
+                cp_async16<(DIAG & DIAG_CAX) != 0>(xs + t * LDX + col, p.x + off + step * BK + col, ok);
             }
         }
     };
@@ -1230,10 +1245,34 @@ int gemm_pf(const legion_nvfp4_mm & p, int variant, cudaStream_t st) {
     return -1;
 }
 
+// The L1 copies (#1176 r43): variant tune + 100 * (DIAG_CAW and / or DIAG_CAX), the tune's
+// kernel with its weight and / or activation copies through L1 (cp.async.ca), the same sums.
+// Compiled for gemm_pf1's tiles and tunes (the ones prefill runs). -2 where it does not apply:
+// no CA bit, other DIAG bits with them, or a tile or tune without the L1 kernel; `variant` is
+// then the .cg kernel's (the CA bits taken out), which the caller launches.
+template <int MI, int NT, bool GLU>
+int gemm_l1(const legion_nvfp4_mm & p, int & variant, cudaStream_t st) {
+    const int d = variant / 100, ca = d & (DIAG_CAW | DIAG_CAX);
+    if (ca == 0) {
+        return -2;
+    }
+    variant -= 100 * ca;
+    if (d != ca) {
+        return -2;
+    }
+    const int r = ca == DIAG_CAW   ? gemm_pf1<MI, NT, GLU, DIAG_CAW>(p, variant, st)
+                  : ca == DIAG_CAX ? gemm_pf1<MI, NT, GLU, DIAG_CAX>(p, variant, st)
+                                   : gemm_pf1<MI, NT, GLU, DIAG_CAW | DIAG_CAX>(p, variant, st);
+    return r == -1 ? -2 : r;
+}
+
 // stages * 10 + CTAs per SM: 31 is the default kernel (gemm); the others for 64- and 128-token
-// tiles. 100 and up: gemm_pf's prefetch runs.
+// tiles. 100 and up: gemm_pf's prefetch runs and gemm_l1's L1 copies.
 template <int MI, int NT, bool GLU>
 int gemm_variant(const legion_nvfp4_mm & p, int variant, cudaStream_t st) {
+    if (const int r = gemm_l1<MI, NT, GLU>(p, variant, st); r != -2) {
+        return r;
+    }
     if (variant >= 100) {
         return gemm_pf<MI, NT, GLU>(p, variant, st);
     }
@@ -1265,6 +1304,12 @@ int gemm_diag1(const legion_nvfp4_mm & p, cudaStream_t st) {
 
 template <int MI, int NT, bool GLU>
 int gemm_diag(const legion_nvfp4_mm & p, int variant, cudaStream_t st) {
+    if (const int r = gemm_l1<MI, NT, GLU>(p, variant, st); r != -2) {
+        return r;
+    }
+    if (variant < 100) {
+        return gemm_variant<MI, NT, GLU>(p, variant, st);
+    }
     switch (variant / 100) {
         case DIAG_PF4:
         case DIAG_PF8:
