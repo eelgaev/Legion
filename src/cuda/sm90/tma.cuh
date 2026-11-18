@@ -48,5 +48,49 @@ __device__ __forceinline__ void tma_2d(void * dst, const CUtensorMap * map, int 
         "l"((uint64_t) map), "r"(c0), "r"(c1), "r"(saddr(bar))
         : "memory");
 }
+
+// Thread-block clusters (#1133 r20, legion nvfp4-a4-bench variants).
+__device__ __forceinline__ uint32_t cluster_rank() {
+    uint32_t r;
+    asm volatile("mov.u32 %0, %%cluster_ctarank;\n" : "=r"(r));
+    return r;
+}
+// Every thread of every CTA of the cluster (release / acquire at cluster scope).
+__device__ __forceinline__ void cluster_sync() {
+    asm volatile("barrier.cluster.arrive.release.aligned;\n" ::: "memory");
+    asm volatile("barrier.cluster.wait.acquire.aligned;\n" ::: "memory");
+}
+// tma_2d into the same offset of every CTA in `mask`'s shared memory, completing on the barrier
+// at `bar`'s offset in each of them.
+__device__ __forceinline__ void tma_2d_mc(void * dst, const CUtensorMap * map, int c0, int c1, uint64_t * bar,
+                                          uint16_t mask) {
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster [%0], [%1, "
+        "{%2, %3}], [%4], %5;\n" ::"r"(saddr(dst)),
+        "l"((uint64_t) map), "r"(c0), "r"(c1), "r"(saddr(bar)), "h"(mask)
+        : "memory");
+}
+// An arrival (release at cluster scope) on this CTA's barrier `bar`, and on the barrier at the
+// same offset in CTA `peer` of the cluster.
+__device__ __forceinline__ void bar_arrive_cluster(uint64_t * bar) {
+    asm volatile("mbarrier.arrive.release.cluster.shared::cta.b64 _, [%0];\n" ::"r"(saddr(bar)) : "memory");
+}
+__device__ __forceinline__ void bar_arrive_peer(uint64_t * bar, uint32_t peer) {
+    uint32_t remote;
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;\n" : "=r"(remote) : "r"(saddr(bar)), "r"(peer));
+    asm volatile("mbarrier.arrive.release.cluster.shared::cluster.b64 _, [%0];\n" ::"r"(remote) : "memory");
+}
+// bar_wait with acquire at cluster scope (arrivals from other CTAs of the cluster).
+__device__ __forceinline__ void bar_wait_cluster(uint64_t * bar, uint32_t parity) {
+    asm volatile(
+        "{\n"
+        ".reg .pred done;\n"
+        "WAITC:\n"
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 done, [%0], %1;\n"
+        "@!done bra WAITC;\n"
+        "}\n" ::"r"(saddr(bar)),
+        "r"(parity)
+        : "memory");
+}
 }  // namespace legion_tma
 #endif

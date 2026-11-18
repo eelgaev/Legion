@@ -72,8 +72,10 @@ struct legion_nvfp4_a4 {
     // (nothing reads their rows); zero: the CTAs past the last tile store them.
     int32_t unread_skips;
     // The dense TMA-fed GEMM's tile (nt 8; see legion_nvfp4_a4_gemm_launch): 0 the default, 1 the
-    // kernel before #1133 r12, 2 to 5 one tile forced (A/B and the bench). Bits 8-9: a probe of
-    // tiles 2 and 4 (legion nvfp4-a4-bench; not the GEMM's outputs).
+    // kernel before #1133 r12, 2 to 18 and 30 to 37 one tile forced (A/B and the bench), 20 to
+    // 23 the multicast probe. Bits 8-9: a probe of tiles 2, 3, 4, 6, 13, 14 and 30 to 32
+    // (legion nvfp4-a4-bench; not the GEMM's outputs). Bit 10: the default with #1133 r23's
+    // streaming epilogue for the long-k residual GEMMs (LEGION_DEBUG_NVFP4_A4_STREAM_EPI=1).
     int32_t variant;
 };
 
@@ -1281,6 +1283,8 @@ int status() {
 // The TMA-fed dense GEMM (nvfp4_a4_gemm_tma, dense_tma).
 #include "../sm90/tma.cuh"
 #include "nvfp4_a4_tma.cuh"
+#include "nvfp4_a4_wide.cuh"
+#include "nvfp4_a4_pp.cuh"
 
 // GROUPED_ONLY: the grouped kernels only (dense calls are -1).
 template <class T, bool GROUPED_ONLY = false>
@@ -1485,10 +1489,55 @@ int legion_nvfp4_a4_gemm_launch(const legion_nvfp4_a4 * p, int nt, void * stream
                     break;
                 }
                 case 2: r = dense_tma_probe<8, 2, false>(*p, st, probe); break;
-                case 3: r = dense_tma<6, 3>(*p, st); break;
+                case 3: r = dense_tma_probe<6, 3, false>(*p, st, probe); break;
                 case 4: r = dense_tma_probe<8, 2, true>(*p, st, probe); break;
                 case 5: r = dense_tma<6, 3, 0, true>(*p, st); break;
-                default: r = deep ? dense_tma<6, 3>(*p, st) : dense_tma<8, 2>(*p, st); break;
+                // #1133 r20 (legion nvfp4-a4-bench, plain and residual GEMMs): 6 192 x 128 x 2
+                // stages with nvfp4_a4_gemm_tma's per-element epilogue.
+                case 6: r = dense_tma_probe<8, 2, false, 3>(*p, st, probe); break;
+                // #1133 r21 (the bench, plain and residual F32 GEMMs): nvfp4_a4_gemm_wide, 192 x
+                // 128 with the epilogue through shared memory: 13 persistent, 4 blocks a stage x 2
+                // stages, groups of 8 row tiles; 14 persistent, 2 blocks x 3 stages; 15 and 16
+                // the same tiles one per CTA; 17 / 18 13 in groups of 16 / 4 row tiles; 10, 11
+                // and 12 13, 18 and 15 with the residual read from global memory by every thread.
+                case 10: r = dense_wide<4, 2, true, 8, 0, true>(*p, st); break;
+                case 11: r = dense_wide<4, 2, true, 4, 0, true>(*p, st); break;
+                case 12: r = dense_wide<4, 2, false, 8, 0, true>(*p, st); break;
+                case 13: r = dense_wide_probe<4, 2, true, 8>(*p, st, probe); break;
+                case 14: r = dense_wide_probe<2, 3, true, 8>(*p, st, probe); break;
+                case 15: r = dense_wide<4, 2, false, 8>(*p, st); break;
+                case 16: r = dense_wide<2, 3, false, 8>(*p, st); break;
+                case 17: r = dense_wide<4, 2, true, 16>(*p, st); break;
+                case 18: r = dense_wide<4, 2, true, 4>(*p, st); break;
+                // 20 to 23: nvfp4_a4_mc_probe's modes 0 to 3 (outputs not the GEMM's).
+                case 20: r = mc_probe<0>(*p, st); break;
+                case 21: r = mc_probe<1>(*p, st); break;
+                case 22: r = mc_probe<2>(*p, st); break;
+                case 23: r = mc_probe<3>(*p, st); break;
+                // #1133 r23 (the bench, plain and residual F32 GEMMs): nvfp4_a4_gemm_pp, two
+                // groups of 4 warps taking turns on their own tiles (persistent, 4 blocks a
+                // stage): 30 96 x 128 x 3 stages, 31 128 x 96 x 3, 32 128 x 128 x 2 (one fragment
+                // set), groups of 8 row tiles; 33 and 34 30 and 31 in groups of 4.
+                case 30: r = dense_pp_probe<3, 8, 2, 3, 8>(*p, st, probe); break;
+                case 31: r = dense_pp_probe<2, 12, 4, 3, 8>(*p, st, probe); break;
+                case 32: r = dense_pp_probe<4, 8, 2, 2, 8>(*p, st, probe); break;
+                case 33: r = dense_pp<3, 8, 2, 3, 4>(*p, st); break;
+                case 34: r = dense_pp<2, 12, 4, 3, 4>(*p, st); break;
+                // 35 32 with streaming epilogue stores and residual loads; 36 and 37 the default
+                // 128 x 96 x 3 stages with a4t::epilogue, plain and streaming.
+                case 35: r = dense_pp<4, 8, 2, 2, 8, 0, true>(*p, st); break;
+                case 36: r = dense_tma<6, 3, 0, false, 2, 0, 4, 1>(*p, st); break;
+                case 37: r = dense_tma<6, 3, 0, false, 2, 0, 4, 2>(*p, st); break;
+                default:
+                    // #1133 r23: under bit 10 (LEGION_DEBUG_NVFP4_A4_STREAM_EPI=1) the long-k
+                    // residual GEMMs (Qwen3.5-family ffn_down) take a4t::epilogue's streaming
+                    // stores (variant 37), the same bits.
+                    if (deep && p->res && p->act == 0 && p->k >= 16384 && (p->variant & 0x400)) {
+                        r = dense_tma<6, 3, 0, false, 2, 0, 4, 2>(*p, st);
+                    } else {
+                        r = deep ? dense_tma<6, 3>(*p, st) : dense_tma<8, 2>(*p, st);
+                    }
+                    break;
             }
             if (r == -1 && forced >= 2) {
                 return -1;  // a forced tile that does not apply: no other kernel stands in
