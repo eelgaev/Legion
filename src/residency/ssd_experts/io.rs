@@ -85,6 +85,14 @@ impl Group {
         }
     }
 
+    /// Blocks until every job ran (or was cancelled), leaving any error to [`Self::wait`].
+    pub fn wait_landed(&self) {
+        let mut left = self.left.lock().unwrap();
+        while *left > 0 {
+            left = self.done.wait(left).unwrap();
+        }
+    }
+
     /// Drops the jobs no thread took yet; [`Self::wait`] then returns once the running ones
     /// end.
     pub fn cancel(&self) {

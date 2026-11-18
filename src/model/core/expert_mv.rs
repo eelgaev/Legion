@@ -1473,7 +1473,7 @@ pub(crate) unsafe fn cuda_expert_mv(
 ) -> Result<(), String> {
     // SAFETY: the caller's.
     unsafe {
-        cuda_expert_mv_as(dst, stream, false)?;
+        cuda_expert_mv_as(dst, stream, false, None)?;
         if dump::enabled() {
             dump::after(dst, stream, false);
         }
@@ -1489,9 +1489,34 @@ pub(crate) unsafe fn cuda_expert_mv_preq(
 ) -> Result<(), String> {
     // SAFETY: the caller's.
     unsafe {
-        cuda_expert_mv_as(dst, stream, true)?;
+        cuda_expert_mv_as(dst, stream, true, None)?;
         if dump::enabled() {
             dump::after(dst, stream, true);
+        }
+    }
+    Ok(())
+}
+
+/// [`cuda_expert_mv`] (`preq`: [`cuda_expert_mv_preq`]) around `between` (#37 round 35, the
+/// bounded host tier's reads of the step's misses landing): the VRAM experts' pairs, then
+/// `between`, then the host experts' pairs, each pair by the same tile code from the same
+/// bytes as in one launch (the `part`s the split ops take, [`overlap`]). An op that splits
+/// otherwise runs `between` first, then its launches.
+///
+/// # Safety
+/// As [`cuda_expert_mv`].
+#[cfg(feature = "cuda")]
+pub(crate) unsafe fn cuda_expert_mv_around(
+    dst: &ffi::ggml_tensor,
+    stream: *mut c_void,
+    preq: bool,
+    between: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    // SAFETY: the caller's.
+    unsafe {
+        cuda_expert_mv_as(dst, stream, preq, Some(between))?;
+        if dump::enabled() {
+            dump::after(dst, stream, preq);
         }
     }
     Ok(())
@@ -1504,6 +1529,7 @@ unsafe fn cuda_expert_mv_as(
     dst: &ffi::ggml_tensor,
     stream: *mut c_void,
     preq: bool,
+    mut between: Option<&mut dyn FnMut() -> Result<(), String>>,
 ) -> Result<(), String> {
     // SAFETY: a node made by `mul_mat_id`; weights in memory the GPU can read.
     let o = unsafe { Operands::of(dst) };
@@ -1567,6 +1593,9 @@ unsafe fn cuda_expert_mv_as(
         pad_rows: std::ptr::null(),
     };
     if o.halves != 0 {
+        if let Some(b) = between.take() {
+            b()?;
+        }
         // A split op (`--glm-pair-split`): every pair through `expert_mv_split`'s tiles, in one
         // launch on this stream.
         split_check(&o, rows_per_cta, mats)?;
@@ -1630,6 +1659,27 @@ unsafe fn cuda_expert_mv_as(
             _ => Ok(()),
         }
     };
+    if let Some(b) = between {
+        // The VRAM pairs (and all of the activations' blocks: the gate/up op's x is per token,
+        // quantize_x skips none), then `between`, then the host pairs. Only the plain one-launch
+        // path: the others run `between` first.
+        if o.split == overlap::NONE
+            && pp.is_none()
+            && !pad
+            && o.n_x != o.n_used
+            && o.ahead.is_none()
+        {
+            launch(LaunchParams { part: 1, ..p }, stream)?;
+            b()?;
+            let host = LaunchParams {
+                part: 2,
+                steps: 2,
+                ..p
+            };
+            return launch(host, stream);
+        }
+        b()?;
+    }
     match o.split {
         overlap::FORK | overlap::JOIN => {
             // SAFETY: the compute stream ggml hands the op, on the current device; the staging

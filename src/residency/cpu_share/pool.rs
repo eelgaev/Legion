@@ -731,6 +731,7 @@ fn run_exact(s: &Shared, job: &Job) -> ExactStats {
             .collect();
     }
     let t = Instant::now();
+    await_reads(s, layer);
     split_rows(s, nf);
     run_phase(s, 1);
     st.gate_up = t.elapsed();
@@ -848,6 +849,18 @@ fn exact_stats(st: &ExactStats) {
 }
 
 /// Runs `job` over the pool; returns its host pairs.
+/// Waits for the bounded host tier's reads under way into the current job's experts (#37 round
+/// 35: a small step's fetch leaves them running; the rest of the job's experts are in RAM).
+fn await_reads(s: &Shared, layer: usize) {
+    // SAFETY: no phase runs: this thread has the current job alone.
+    let experts: Vec<usize> = unsafe { &*s.current.0.get() }
+        .groups
+        .iter()
+        .map(|g| g.expert)
+        .collect();
+    crate::residency::host_tier::await_reads(layer, &experts);
+}
+
 fn run_job(s: &Shared, job: &Job) -> usize {
     let ex = job.exchange;
     let (n_tok, n_used) = (job.n_tok.min(ex.max_tok), job.n_used.min(ex.max_used));
@@ -881,6 +894,7 @@ fn run_job(s: &Shared, job: &Job) -> usize {
             .collect();
         c.n_tasks = c.groups.len();
     }
+    await_reads(s, job.layer as usize);
     run_phase(s, 0);
     split_rows(s, nf);
     run_phase(s, 1);

@@ -399,6 +399,9 @@ struct Counters {
     write_backs: AtomicU64,
     fetch_ns: AtomicU64,
     fetches: AtomicU64,
+    /// Fetches whose reads landed in the SwiGLU op ([`Landing`]), and the time it waited.
+    landed: AtomicU64,
+    land_ns: AtomicU64,
 }
 
 struct LayerMem {
@@ -438,7 +441,23 @@ struct Inner {
     state: Mutex<State>,
     /// The staged prompt pass whose reads are under way ([`HostTier::stage_pass`]).
     pass: Mutex<Option<passes::Running>>,
+    /// A decode step's reads its fetch left running ([`Landing`]).
+    landing: Mutex<Option<Landing>>,
     counts: Counters,
+}
+
+/// The reads of a small step's fetch whose layer computes its other experts meanwhile (#37
+/// round 35, [`defer_reads`]): the fetch returns with the ids, the layer's shared expert, its
+/// VRAM experts and the CPU share's RAM-slot experts start, and the SwiGLU op waits for these
+/// reads ([`land`]) before it launches the host experts' pairs; the share's pool waits for
+/// them only for an expert they write ([`await_reads`]).
+struct Landing {
+    layer: usize,
+    group: Arc<Group>,
+    /// The indices past the VRAM slots (RAM slots and staging places) the reads write.
+    at: Vec<usize>,
+    /// The step's index of every expert ([`Inner::zero_pads`] once the reads are done).
+    index: Vec<usize>,
 }
 
 /// The RAM slots of every layer, and the VRAM swaps whose copies are under way.
@@ -748,6 +767,7 @@ impl HostTier {
             cap,
             pool,
             pass: Mutex::new(None),
+            landing: Mutex::new(None),
             counts: Counters::default(),
         });
         let id = {
@@ -1133,7 +1153,43 @@ impl Inner {
     /// layer `il`'s. Anything that writes or reads staging places starts with this: another
     /// layer's read ahead is dropped, its places free again. So are those of a staged prompt
     /// pass, done by now ([`Self::settle`]).
+    /// Waits for a small step's reads its fetch left running ([`Landing`]), if any, and zeroes
+    /// the pads behind its staging places. Returns whether there were any.
+    fn land(&self) -> Result<bool, String> {
+        let Some(group) = self
+            .landing
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|l| l.group.clone())
+        else {
+            return Ok(false);
+        };
+        let t = Instant::now();
+        let r = group.wait();
+        // Taken only now: the share's pool looks the reads up until they are done.
+        let l = self.landing.lock().unwrap().take();
+        r?;
+        if let Some(l) = l {
+            self.zero_pads(l.layer, &l.index);
+        }
+        let ns = t.elapsed().as_nanos() as u64;
+        let c = &self.counts;
+        c.fetch_ns.fetch_add(ns, Ordering::Relaxed);
+        c.land_ns.fetch_add(ns, Ordering::Relaxed);
+        c.landed.fetch_add(1, Ordering::Relaxed);
+        Ok(true)
+    }
+
+    /// The reads under way that write layer `il`'s indices `at` (past its VRAM slots), if any.
+    fn reads_of(&self, il: usize, at: &[usize]) -> Option<Arc<Group>> {
+        let g = self.landing.lock().unwrap();
+        let l = g.as_ref().filter(|l| l.layer == il)?;
+        at.iter().any(|i| l.at.contains(i)).then(|| l.group.clone())
+    }
+
     fn take_ahead(&self, st: &mut State, il: Option<usize>) -> Result<Vec<(usize, usize)>, String> {
+        self.land()?;
         self.settle();
         let Some(a) = st.ahead.take() else {
             return Ok(Vec::new());
@@ -1146,8 +1202,16 @@ impl Inner {
         })
     }
 
-    /// The fetch of layer `il` for a step's `ids` into `out`.
-    fn fetch(&self, il: usize, n_slots: usize, ids: &[i32], out: &mut [i32]) -> Result<(), String> {
+    /// The fetch of layer `il` for a step's `ids` into `out`. `defer`: a small step's reads
+    /// may land after it returns ([`Landing`]; the layer's SwiGLU op waits for them).
+    fn fetch(
+        &self,
+        il: usize,
+        n_slots: usize,
+        ids: &[i32],
+        out: &mut [i32],
+        defer: bool,
+    ) -> Result<(), String> {
         let t0 = Instant::now();
         let mut seen = vec![false; self.n_expert];
         let mut need = Vec::new();
@@ -1209,6 +1273,7 @@ impl Inner {
         // A small step waits for a few experts, three reads each: cut into pieces they keep
         // every reader busy. A big step's reads do already.
         let piece = if big { 0 } else { read_piece() };
+        let defer = defer && !big && !jobs.is_empty();
         if piece > 0 {
             jobs = jobs
                 .into_iter()
@@ -1247,7 +1312,9 @@ impl Inner {
                 at,
             });
         }
-        group.wait()?;
+        if !defer {
+            group.wait()?;
+        }
         let (mut vram, mut ram, mut ssd) = (0u64, 0u64, 0u64);
         for (o, &id) in out.iter_mut().zip(ids) {
             match (id as usize).checked_sub(n_slots) {
@@ -1270,7 +1337,17 @@ impl Inner {
                 }
             }
         }
-        self.zero_pads(il, &t.index);
+        if defer {
+            let at = t.loads.iter().map(|l| t.index[l.0]).collect();
+            *self.landing.lock().unwrap() = Some(Landing {
+                layer: il,
+                group,
+                at,
+                index: std::mem::take(&mut t.index),
+            });
+        } else {
+            self.zero_pads(il, &t.index);
+        }
         let staged = t.loads.iter().filter(|l| l.1.is_none()).count() as u64;
         c.vram_pairs.fetch_add(vram, Ordering::Relaxed);
         c.ram_pairs.fetch_add(ram, Ordering::Relaxed);
@@ -1370,13 +1447,126 @@ impl Inner {
             read_gib = self.pool.bytes_read() as f64 / (1u64 << 30) as f64,
             fetch_wait_s = l(&c.fetch_ns) as f64 / 1e9,
             fetches = l(&c.fetches),
+            landed = l(&c.landed),
+            land_wait_s = l(&c.land_ns) as f64 / 1e9,
             "host expert tier"
         );
     }
 }
 
+/// The fetch op's parameter that lets a small step's reads land after it ([`defer_reads`]).
+const DEFER_PARAM: usize = 3;
+
+/// Whether a fetch may leave its reads running: `LEGION_DEBUG_TIER_HIT_OVERLAP=0` turns it off
+/// (the fetch waits for its reads, the way before); `=1` overlaps without the share's pool
+/// leaving the experts being read to the link ([`pending_at`]).
+fn hit_overlap() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        std::env::var("LEGION_DEBUG_TIER_HIT_OVERLAP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2)
+    })
+}
+
+/// The fetch node behind `node` (itself, or a reshape or view of it), if it is one.
+fn fetch_node(node: *const ffi::ggml_tensor) -> Option<*mut ffi::ggml_tensor> {
+    let mut n = node as *mut ffi::ggml_tensor;
+    // SAFETY: graph nodes; a view's or reshape's source is its first.
+    unsafe {
+        for _ in 0..4 {
+            if n.is_null() {
+                return None;
+            }
+            if crate::ggml::op_of(n).is_some_and(|op| std::ptr::eq(op, &FETCH)) {
+                return Some(n);
+            }
+            if !matches!(
+                (*n).op,
+                ffi::ggml_op_GGML_OP_VIEW | ffi::ggml_op_GGML_OP_RESHAPE
+            ) {
+                return None;
+            }
+            n = (*n).src[0];
+        }
+    }
+    None
+}
+
+/// Lets the fetch op behind `ids` leave a small step's reads running (#37 round 35): the
+/// layer's SwiGLU op must call [`land`] before its host experts' pairs read anything, and
+/// whoever else reads the layer's RAM slots or staging places in the step must wait with
+/// [`await_reads`]. Returns whether `ids` came from a fetch (and the overlap is on).
+pub fn defer_reads(ids: Tensor<'_>) -> bool {
+    if hit_overlap() == 0 {
+        return false;
+    }
+    let Some(n) = fetch_node(ids.raw()) else {
+        return false;
+    };
+    // SAFETY: a fetch node of a graph not yet run.
+    unsafe { crate::ggml::set_external_param(n, DEFER_PARAM, 1) };
+    true
+}
+
+/// The tier and layer of the fetch behind `node`, if its reads may land late.
+fn deferred(node: *const ffi::ggml_tensor) -> Option<(Arc<Inner>, usize)> {
+    let n = fetch_node(node)?;
+    // SAFETY: a fetch node.
+    let p = external_params(unsafe { &*n });
+    (p[DEFER_PARAM] != 0).then(|| (lookup(p[0]), p[1] as usize))
+}
+
+/// Whether the fetch behind `node` left reads running for its layer (none landed yet).
+pub fn reads_pending(node: *const ffi::ggml_tensor) -> bool {
+    deferred(node).is_some_and(|(inner, il)| {
+        inner
+            .landing
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|l| l.layer == il)
+    })
+}
+
+/// The indices past the VRAM slots that the reads the fetch behind `node` left running write
+/// (empty when none are, or with `LEGION_DEBUG_TIER_HIT_OVERLAP=1`).
+pub fn pending_at(node: *const ffi::ggml_tensor) -> Vec<usize> {
+    if hit_overlap() == 1 {
+        return Vec::new();
+    }
+    deferred(node)
+        .and_then(|(inner, il)| {
+            let g = inner.landing.lock().unwrap();
+            g.as_ref().filter(|l| l.layer == il).map(|l| l.at.clone())
+        })
+        .unwrap_or_default()
+}
+
+/// Waits for the reads the fetch behind `node` left running (the layer's SwiGLU op, before its
+/// host experts' pairs). Errors when a read failed.
+pub fn land(node: *const ffi::ggml_tensor) -> Result<(), String> {
+    match deferred(node) {
+        Some((inner, _)) => inner.land().map(|_| ()),
+        None => Ok(()),
+    }
+}
+
+/// Waits until no read of a small step under way writes layer `il`'s indices `at` (past its
+/// VRAM slots) of any tier: the CPU share's pool before it reads its experts.
+pub fn await_reads(il: usize, at: &[usize]) {
+    let tiers: Vec<Arc<Inner>> = REGISTRY.lock().unwrap().iter().flatten().cloned().collect();
+    for t in tiers {
+        if let Some(g) = t.reads_of(il, at) {
+            g.wait_landed();
+        }
+    }
+}
+
 /// The fetch op: `src[0]` the step's ids (`[n_used, n_tokens]` I32), out the indices the
-/// matmuls read; params `[tier id, layer, the layer's VRAM slots]`.
+/// matmuls read; params `[tier id, layer, the layer's VRAM slots, defer]` (defer: see
+/// [`defer_reads`]).
 pub static FETCH: ExternalOp = ExternalOp {
     name: "host_expert_fetch",
     cpu: fetch_cpu,
@@ -1404,7 +1594,7 @@ unsafe fn fetch_cpu(dst: &ffi::ggml_tensor, ith: usize, _nth: usize) {
             std::slice::from_raw_parts_mut(dst.data as *mut i32, n),
         )
     };
-    if let Err(e) = inner.fetch(p[1] as usize, p[2] as usize, ids, out) {
+    if let Err(e) = inner.fetch(p[1] as usize, p[2] as usize, ids, out, false) {
         fatal(&e);
     }
 }
@@ -1422,7 +1612,7 @@ mod cuda {
     use std::os::raw::{c_int, c_void};
     use std::sync::{Arc, OnceLock};
 
-    use super::{Inner, external_params, fatal, lookup};
+    use super::{DEFER_PARAM, Inner, external_params, fatal, lookup};
     use crate::ggml::ffi;
 
     unsafe extern "C" {
@@ -1463,7 +1653,7 @@ mod cuda {
                 std::slice::from_raw_parts_mut(ids_out as *mut i32, job.n),
             )
         };
-        if let Err(e) = job.inner.fetch(job.layer, job.n_slots, ids, out) {
+        if let Err(e) = job.inner.fetch(job.layer, job.n_slots, ids, out, false) {
             fatal(&e);
         }
     }
@@ -1506,7 +1696,8 @@ mod cuda {
                 }
                 let ids = std::slice::from_raw_parts(ids_in as *const i32, n);
                 let out = std::slice::from_raw_parts_mut(ids_out as *mut i32, n);
-                if let Err(e) = inner.fetch(p[1] as usize, p[2] as usize, ids, out) {
+                let defer = p[DEFER_PARAM] != 0;
+                if let Err(e) = inner.fetch(p[1] as usize, p[2] as usize, ids, out, defer) {
                     fatal(&e);
                 }
                 let e = cudaMemcpyAsync(dst.data, ids_out as *const c_void, n * 4, DEFAULT, stream);

@@ -938,6 +938,36 @@ fn reader_queues_take_demand_first_and_drop_cancelled_groups() {
     assert!(!ahead.done() && !ahead.skipped());
 }
 
+/// #37 round 35: `wait_landed` returns once every job ran, the bytes in place, and leaves a
+/// failed read's error to `wait`.
+#[test]
+fn wait_landed_returns_after_the_jobs_and_keeps_the_error() {
+    use super::io::{Job, Pool};
+    let dir = scratch();
+    let path = dir.path().join("f.bin");
+    std::fs::write(&path, [7u8; 16]).unwrap();
+    let pool = Pool::with_threads(&[path], 2, false).unwrap();
+    let mut buf = [0u8; 8];
+    let at = buf.as_mut_ptr() as usize;
+    let read = |offset, len| Job::Raw {
+        src: FileRange {
+            file: 0,
+            offset,
+            len,
+        },
+        dst: at,
+    };
+    let g = pool.submit(vec![read(0, 4)]);
+    g.wait_landed();
+    assert!(g.done());
+    assert!(g.wait().is_ok());
+    assert_eq!(buf[..4], [7u8; 4]);
+    // Past the file's end: the read fails, `wait_landed` still returns.
+    let g = pool.submit(vec![read(64, 4)]);
+    g.wait_landed();
+    assert!(g.wait().is_err());
+}
+
 /// #615: a slot with a read in flight is never a victim, of a step or of a prefetch.
 #[test]
 fn pinned_slots_are_never_victims() {

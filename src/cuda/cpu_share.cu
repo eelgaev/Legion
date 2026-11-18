@@ -24,6 +24,9 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
+// Pending reads `publish` ranks last (ops.rs MAX_PENDING; more: routing order alone).
+#define LEGION_CPU_SHARE_MAX_PENDING 16
+
 extern "C" {
 
 struct legion_cpu_share_publish {
@@ -44,6 +47,11 @@ struct legion_cpu_share_publish {
     void * xq_host;       // [n_tok][k / 32] block_q8_1 of x (the exchange buffer)
     uint32_t * n_miss;    // the step's distinct host experts (the exchange buffer)
     uint32_t all_upto;    // the host takes every host expert of a step with at most this many
+    // The host experts (id - n_slots) whose reads from the checkpoint are still under way
+    // (#37 round 35): the exact share ranks them after the others, so the host takes the ones
+    // already in RAM first and the link the ones being read.
+    int32_t n_pending;
+    int32_t pending[LEGION_CPU_SHARE_MAX_PENDING];
 };
 
 struct legion_cpu_share_activate {
@@ -152,8 +160,14 @@ __global__ void publish(const legion_cpu_share_publish p) {
             }
         }
         first_of[i] = first;
-        // Exact: routing order (the host takes the first experts, the link reads the last).
-        key[i] = p.exact ? (uint32_t) i : users << 20 | (uint32_t) (id - p.n_slots);
+        // Exact: routing order (the host takes the first experts, the link reads the last),
+        // the experts still being read after the others.
+        bool pending = false;
+        for (int q = 0; q < p.n_pending; ++q) {
+            pending = pending || p.pending[q] == id - p.n_slots;
+        }
+        key[i] = p.exact ? (uint32_t) i + (pending ? (uint32_t) MAX_PAIRS : 0u)
+                         : users << 20 | (uint32_t) (id - p.n_slots);
     }
     __syncthreads();
     const uint32_t threshold = p.thr != nullptr ? *(const volatile uint32_t *) p.thr : p.threshold;

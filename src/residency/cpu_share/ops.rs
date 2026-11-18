@@ -151,6 +151,8 @@ pub(super) fn share_nodes<'a>(
     unsafe {
         if exact {
             retarget(act.raw(), glu);
+            // The SwiGLU op waits for the step's SSD reads, between its VRAM and host pairs.
+            crate::residency::host_tier::defer_reads(ids);
         }
         retarget(out.raw(), &SHARE_DOWN);
         let node = &mut *out.raw();
@@ -284,6 +286,7 @@ mod cuda {
     use super::device;
     use crate::ggml::{external_params, ffi};
     use crate::model::core::expert_mv;
+    use crate::residency::host_tier;
 
     #[repr(C)]
     struct Publish {
@@ -306,7 +309,13 @@ mod cuda {
         xq_host: *mut c_void,
         n_miss: *mut u32,
         all_upto: u32,
+        n_pending: i32,
+        pending: [i32; MAX_PENDING],
     }
+
+    /// Experts still being read `publish` ranks last (`LEGION_CPU_SHARE_MAX_PENDING`); with
+    /// more, routing order alone.
+    const MAX_PENDING: usize = 16;
 
     #[repr(C)]
     struct Activate {
@@ -421,6 +430,20 @@ mod cuda {
         let lay = &share.layout;
         let base = share.device_base;
         let el = share.exact.as_ref();
+        // The bounded host tier's reads of this step still under way (#37 round 35): the
+        // exact share leaves those experts to the link, which waits for them in the SwiGLU op,
+        // and the pool computes the others meanwhile.
+        let mut pending = [0i32; MAX_PENDING];
+        let mut n_pending = 0;
+        if el.is_some() {
+            let at = host_tier::pending_at(ids);
+            if at.len() <= MAX_PENDING {
+                for (p, &i) in pending.iter_mut().zip(&at) {
+                    *p = i as i32;
+                }
+                n_pending = at.len() as i32;
+            }
+        }
         let n_layers = ex.exact.map_or(0, |x| x.n_layers);
         if el.is_some() && (k % 32 != 0 || layer as usize >= n_layers) {
             return Err(format!(
@@ -453,6 +476,8 @@ mod cuda {
                 (base + e.n_miss as u64) as *mut u32
             }),
             all_upto: ex.exact.map_or(0, |x| x.all_upto),
+            n_pending,
+            pending,
         };
         // SAFETY: device tensors of the stream's device; the exchange is mapped for it.
         let e = unsafe { legion_cpu_share_publish_launch(&p, stream) };
@@ -486,7 +511,7 @@ mod cuda {
     pub(super) unsafe fn glu(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
         // SAFETY: the caller's; a node made by `glu_tiered`.
         unsafe {
-            expert_mv::cuda_expert_mv(dst, stream)?;
+            glu_launches(dst, stream, false)?;
             activate(dst, stream)
         }
     }
@@ -498,8 +523,33 @@ mod cuda {
     ) -> Result<(), String> {
         // SAFETY: the caller's; a node made by `glu_tiered_preq`.
         unsafe {
-            expert_mv::cuda_expert_mv_preq(dst, stream)?;
+            glu_launches(dst, stream, true)?;
             activate(dst, stream)
+        }
+    }
+
+    /// The SwiGLU op's launches. When the bounded host tier's fetch of the step left its reads
+    /// running (#37 round 35, [`host_tier::defer_reads`]): the VRAM experts' pairs first, then
+    /// the wait for the reads, then the host experts' pairs, so the GPU computes the first while
+    /// the SSD reads the misses (and the host its share of the experts in RAM).
+    unsafe fn glu_launches(
+        act: &ffi::ggml_tensor,
+        stream: *mut c_void,
+        preq: bool,
+    ) -> Result<(), String> {
+        // SAFETY: a SwiGLU op's node: its source 2 the published ids, whose source 0 the
+        // router's ids (the fetch's output).
+        let fetch = unsafe { (*act.src[2]).src[0] };
+        // SAFETY: the caller's.
+        unsafe {
+            if !host_tier::reads_pending(fetch) {
+                return if preq {
+                    expert_mv::cuda_expert_mv_preq(act, stream)
+                } else {
+                    expert_mv::cuda_expert_mv(act, stream)
+                };
+            }
+            expert_mv::cuda_expert_mv_around(act, stream, preq, &mut || host_tier::land(fetch))
         }
     }
 
