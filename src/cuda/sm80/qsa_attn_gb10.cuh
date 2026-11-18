@@ -324,8 +324,21 @@ __device__ __forceinline__ int ld_issue(const int32_t * a) {
     return v;
 }
 
-template <int HD>
+// PROBE (#1176 r40, `legion qsa-bench` only): bit 0 drops every refill after the first chunk
+// (the products run on stale K / V), bit 1 drops the mma.sync products (each becomes one add of
+// a fragment register, so the ldmatrix loads stay); both give wrong output. Bit 2 looks the
+// cells up one chunk earlier (a refill's cells were loaded a whole chunk before it, not at the
+// top of the chunk that issues it); bit 3 refills in halves, each half as soon as this warp has
+// read it (K: the first half of the dims mid-scores; V: the chunk's first 16 rows between the
+// p.v K steps); bits 2 and 3 keep the output bits. 0 is the kernel the model runs.
+template <int HD, int PROBE = 0>
 __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) {
+    constexpr bool FILL = (PROBE & 1) == 0, MMA = (PROBE & 2) == 0, EARLY = (PROBE & 4) != 0;
+    constexpr bool PROG = (PROBE & 8) != 0;
+    // Bit 4 (with bit 3; wrong output): after the first chunk, only the halves issued first
+    // (half the bytes, the same round trips: is the feed bytes or latency bound?).
+    constexpr bool HALFB = (PROBE & 16) != 0;
+    static_assert(!HALFB || PROG, "bit 4 needs bit 3");
     extern __shared__ __align__(16) unsigned char smem_raw[];
     GbSmem<HD> & S = *reinterpret_cast<GbSmem<HD> *>(smem_raw);
     constexpr int NW = THREADS / 32;          // warps
@@ -384,12 +397,53 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
         }
         cp_async_commit();
     };
-    int pos_n = -1;  // the next chunk's positions
+    // PROG: half h of issue_k (dims [h HD / 2, (h + 1) HD / 2) of this warp's rows) and of
+    // issue_v (chunk rows [h MCH / 2, (h + 1) MCH / 2) of this warp's dims), a group each.
+    auto issue_k_h = [&](int cell, int h) {
+        __syncwarp();
+#pragma unroll
+        for (int i = 0; i < KPL / 2; ++i) {
+            const int q = lane + 32 * i, c = warp * KR + q / (PIECES / 2);
+            const int pc = q % (PIECES / 2) + h * (PIECES / 2);
+            const int cl = __shfl_sync(0xffffffffu, cell, c);
+            const bool valid = cl >= 0;
+            const long long r = valid ? (long long) cl * p.kv_row + (long long) kvh * HD : 0;
+            cp_async16(&S.k[c][pc * 8], reinterpret_cast<const uint4 *>(p.k + r) + pc, valid);
+        }
+        cp_async_commit();
+    };
+    auto issue_v_h = [&](int cell, int h) {
+        __syncwarp();
+#pragma unroll
+        for (int i = h * (VPL / 2); i < (h + 1) * (VPL / 2); ++i) {
+            const int q = lane + 32 * i, c = q / VP, pc = warp * VP + q % VP;
+            const int cl = __shfl_sync(0xffffffffu, cell, c);
+            const bool valid = cl >= 0;
+            const long long r = valid ? (long long) cl * p.kv_row + (long long) kvh * HD : 0;
+            cp_async16(&S.v[c][pc * 8], reinterpret_cast<const uint4 *>(p.v + r) + pc, valid);
+        }
+        cp_async_commit();
+    };
+    static_assert(!PROG || (KPL % 2 == 0 && VPL % 2 == 0 && PIECES % 2 == 0), "half refills");
+    int pos_n = -1;   // the next chunk's positions (EARLY: the one after next)
+    int cell_nn = -1;  // EARLY: the next chunk's cells
     if (n > 0) {
         const int cell0 = cell_of(pos_at(0));
-        issue_k(cell0);
-        issue_v(cell0);
-        pos_n = pos_at(MCH);
+        if constexpr (PROG) {
+            issue_k_h(cell0, 0);
+            issue_k_h(cell0, 1);
+            issue_v_h(cell0, 0);
+            issue_v_h(cell0, 1);
+        } else {
+            issue_k(cell0);
+            issue_v(cell0);
+        }
+        if constexpr (EARLY) {
+            cell_nn = cell_of(pos_at(MCH));
+            pos_n = pos_at(2 * MCH);
+        } else {
+            pos_n = pos_at(MCH);
+        }
     }
 
     // q: as attn_gb_kernel.
@@ -444,10 +498,17 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
         const bool more = c0 + MCH < n;
         // The next chunk's cells (their loads land during the scores), and the positions of
         // the one after.
-        const int cell_n = cell_of(pos_n);
-        pos_n = pos_at(c0 + 2 * MCH);
+        int cell_n;
+        if constexpr (EARLY) {
+            cell_n = cell_nn;
+            cell_nn = cell_of(pos_n);
+            pos_n = pos_at(c0 + 3 * MCH);
+        } else {
+            cell_n = cell_of(pos_n);
+            pos_n = pos_at(c0 + 2 * MCH);
+        }
         // This warp's K rows (its V dims may still be on their way).
-        cp_async_wait<1>();
+        cp_async_wait<PROG ? 2 : 1>();
         __syncwarp();
         // scores: warp w = cells 8w..8w+7, every dim
         {
@@ -456,16 +517,25 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
             if (cb < nh) {
 #pragma unroll
                 for (int ks = 0; ks < KS; ks += 2) {
+                    if (PROG && FILL && more && ks == KS / 2) {
+                        // (more: every warp has its 8 rows, so every warp gets here)
+                        issue_k_h(cell_n, 0);
+                    }
                     uint32_t b[4];
                     ldmatrix_x4(b, &S.k[cb + (lane & 7)][ks * 16 + 8 * (lane >> 3)]);
 #pragma unroll
                     for (int h = 0; h < 2; ++h) {
-                        float tg[4] = {0.f, 0.f, 0.f, 0.f};
-                        mma16816(tg, qh[ks + h], b + 2 * h);
-                        mma16816(tg, ql[ks + h], b + 2 * h);
+                        if constexpr (MMA) {
+                            float tg[4] = {0.f, 0.f, 0.f, 0.f};
+                            mma16816(tg, qh[ks + h], b + 2 * h);
+                            mma16816(tg, ql[ks + h], b + 2 * h);
 #pragma unroll
-                        for (int i = 0; i < 4; ++i) {
-                            sc[i] += tg[i];
+                            for (int i = 0; i < 4; ++i) {
+                                sc[i] += tg[i];
+                            }
+                        } else {
+                            sc[h] += __uint_as_float(b[2 * h] & 0x3fffffffu);
+                            sc[h + 2] += __uint_as_float(b[2 * h + 1] & 0x3fffffffu);
                         }
                     }
                 }
@@ -477,8 +547,16 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
             S.s[gid + 8][c + 1] = c + 1 < nh ? sc[3] * qdown : -INFINITY;
         }
         // This warp's K rows are free: the next chunk's come in during the softmax and p.v.
-        if (more) {
-            issue_k(cell_n);
+        if (FILL && more) {
+            if constexpr (PROG) {
+                if constexpr (HALFB) {
+                    cp_async_commit();  // an empty group: the waits count the same
+                } else {
+                    issue_k_h(cell_n, 1);
+                }
+            } else {
+                issue_k(cell_n);
+            }
         }
         __syncthreads();
         // online softmax: as attn_gb_kernel
@@ -523,7 +601,7 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
         // This warp's V dims of this chunk (the next chunk's K rows may stay in flight); every
         // warp's p and alpha.
         if (more) {
-            cp_async_wait<1>();
+            cp_async_wait<PROG ? 2 : 1>();
         } else {
             cp_async_wait<0>();
         }
@@ -547,10 +625,20 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
                 for (int j = 0; j < NT; j += 2) {
                     uint32_t b[4];
                     ldmatrix_x4_trans(b, &S.v[k0 + lr][warp * DW + j * 8 + lc]);
-                    mma16816(tmp[j], ah, b);
-                    mma16816(tmp[j], al, b);
-                    mma16816(tmp[j + 1], ah, b + 2);
-                    mma16816(tmp[j + 1], al, b + 2);
+                    if constexpr (MMA) {
+                        mma16816(tmp[j], ah, b);
+                        mma16816(tmp[j], al, b);
+                        mma16816(tmp[j + 1], ah, b + 2);
+                        mma16816(tmp[j + 1], al, b + 2);
+                    } else {
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            tmp[j + (i >> 1)][i & 1] += __uint_as_float((b[i] ^ ah[i] ^ al[i]) & 0x3fffffffu);
+                        }
+                    }
+                }
+                if (PROG && FILL && more && k0 == 0) {
+                    issue_v_h(cell_n, 0);  // rows 0..15 of this warp's dims are read
                 }
             }
             const float a0 = S.alpha[gid], a1 = S.alpha[gid + 8];
@@ -563,8 +651,16 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
             }
         }
         // This warp's V dims are free: the next chunk's come in during the next scores.
-        if (more) {
-            issue_v(cell_n);
+        if (FILL && more) {
+            if constexpr (PROG) {
+                if constexpr (HALFB) {
+                    cp_async_commit();
+                } else {
+                    issue_v_h(cell_n, 1);
+                }
+            } else {
+                issue_v(cell_n);
+            }
         }
     }
     const float l0 = S.lsum[gid], l1 = S.lsum[gid + 8];
@@ -581,4 +677,189 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
                 make_float2(acc[j][2] * i1, acc[j][3] * i1);
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// #1176 r40: register-only probes of attn_gw_kernel's mma.sync patterns (`legion qsa-bench`
+// only, wrong output). Same grid and block as attn_gw_kernel and the same shared-memory request
+// (two CTAs per SM), or about 60 KB (one CTA per SM, the launcher's choice); for every 32-key
+// chunk of a token's selection each warp issues 64 mma.m16n8k16, as attn_gw_kernel does, from
+// registers only (q's hi / lo fragments as attn_gw_kernel holds them, B fragments made fresh per
+// chunk by a few integer ops, so no two products are the same). PAT:
+// 0 d1: every product from a zero fragment, added to the F32 sums
+// 1 pair: attn_gw_kernel's scores twice (hi then lo into one fragment from zero, then added)
+// 2 pv: attn_gw_kernel's p.v twice (8 fragments, each a chain of 4 from zero, then an FMA)
+// 3 gw: the scores once and the p.v once, independent of each other
+// 4 chain: all 64 into one fragment (the mma latency)
+// 5 pair16 / 6 pv16: 1 and 2 with F16 accumulation (m16n8k16.f16.f16.f16.f16)
+// 7 gwdep: 3 with p made from the scores and attn_gw_kernel's two CTA barriers per chunk
+__device__ __forceinline__ void mma16816_h(uint32_t * c, const uint32_t * a, const uint32_t * b) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, "
+        "{%0,%1};\n"
+        : "+r"(c[0]), "+r"(c[1])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#else
+    __trap();
+#endif
+}
+
+__device__ __forceinline__ float h2sum(uint32_t x) {
+    const __half2 h = *reinterpret_cast<const __half2 *>(&x);
+    return __low2float(h) + __high2float(h);
+}
+
+template <int PAT>
+__global__ void __launch_bounds__(THREADS, 2) attn_pipe_kernel(legion_qsa_attn p) {
+    constexpr int KS = 16, NT = 8;
+    constexpr float VDOWN = 1.0f / 16384.0f;
+    const int tok = blockIdx.x;
+    const int n = p.sel[(size_t) tok * p.sel_row];
+    const int t = threadIdx.x;
+    // Halves in [1, 2) (hi) and about 2^-11 (lo); a B fragment's mantissas change per chunk.
+    auto mant = [](uint32_t v) { return (v & 0x3ffu) * 0x00010001u; };
+    uint32_t qh[KS][4], ql[KS][4];
+#pragma unroll
+    for (int ks = 0; ks < KS; ++ks) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            qh[ks][i] = 0x3c003c00u | mant(t * 7 + ks * 4 + i);
+            ql[ks][i] = 0x10001000u | mant(t * 5 + ks * 3 + i);
+        }
+    }
+    uint32_t kb[4], vb[4], pb[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        kb[i] = 0x3c003c00u | mant(t * 3 + i);
+        vb[i] = 0x38003800u | mant(t * 11 + i);
+        pb[i] = 0x3c003c00u | mant(t * 13 + i);
+    }
+    float sc[4] = {0.f, 0.f, 0.f, 0.f};
+    float acc[NT][4];
+#pragma unroll
+    for (int j = 0; j < NT; ++j) {
+        acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.0f;
+    }
+    // attn_gw_kernel's scores of one chunk (salt: which pass of which chunk)
+    auto scores = [&](uint32_t salt) {
+#pragma unroll
+        for (int ks = 0; ks < KS; ks += 2) {
+            uint32_t b[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                b[i] = kb[i] ^ mant(salt + ks);
+            }
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                if constexpr (PAT == 5) {
+                    uint32_t tg[2] = {0u, 0u};
+                    mma16816_h(tg, qh[ks + h], b + 2 * h);
+                    mma16816_h(tg, ql[ks + h], b + 2 * h);
+                    sc[h] += h2sum(tg[0]);
+                    sc[h + 2] += h2sum(tg[1]);
+                } else if constexpr (PAT == 0) {
+                    float tg[4] = {0.f, 0.f, 0.f, 0.f}, tl[4] = {0.f, 0.f, 0.f, 0.f};
+                    mma16816(tg, qh[ks + h], b + 2 * h);
+                    mma16816(tl, ql[ks + h], b + 2 * h);
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        sc[i] += tg[i] + tl[i];
+                    }
+                } else {
+                    float tg[4] = {0.f, 0.f, 0.f, 0.f};
+                    mma16816(tg, qh[ks + h], b + 2 * h);
+                    mma16816(tg, ql[ks + h], b + 2 * h);
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        sc[i] += tg[i];
+                    }
+                }
+            }
+        }
+    };
+    // attn_gw_kernel's p.v of one chunk (pd: what p depends on)
+    auto pv = [&](uint32_t salt, uint32_t pd) {
+        float tmp[NT][4];
+        uint32_t th[NT][2];
+#pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            tmp[j][0] = tmp[j][1] = tmp[j][2] = tmp[j][3] = 0.0f;
+            th[j][0] = th[j][1] = 0u;
+        }
+#pragma unroll
+        for (int k0 = 0; k0 < 2; ++k0) {
+            uint32_t ah[4], al[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                ah[i] = pb[i] ^ mant(salt + k0 + pd);
+                al[i] = (pb[i] ^ mant(salt + k0 + 7)) & 0x13ff13ffu;
+            }
+#pragma unroll
+            for (int j = 0; j < NT; j += 2) {
+                uint32_t b[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    b[i] = vb[i] ^ mant(salt + k0 * 8 + j);
+                }
+                if constexpr (PAT == 6) {
+                    mma16816_h(th[j], ah, b);
+                    mma16816_h(th[j], al, b);
+                    mma16816_h(th[j + 1], ah, b + 2);
+                    mma16816_h(th[j + 1], al, b + 2);
+                } else {
+                    mma16816(tmp[j], ah, b);
+                    mma16816(tmp[j], al, b);
+                    mma16816(tmp[j + 1], ah, b + 2);
+                    mma16816(tmp[j + 1], al, b + 2);
+                }
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            if constexpr (PAT == 6) {
+                acc[j][0] = fmaf(acc[j][0], 0.75f, h2sum(th[j][0]) * VDOWN);
+                acc[j][2] = fmaf(acc[j][2], 0.75f, h2sum(th[j][1]) * VDOWN);
+            } else {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    acc[j][i] = fmaf(acc[j][i], 0.75f, tmp[j][i] * VDOWN);
+                }
+            }
+        }
+    };
+    float tc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll 1
+    for (int c0 = 0; c0 < n; c0 += MCH) {
+        const uint32_t salt = (uint32_t) c0 >> 3;
+        if constexpr (PAT == 0 || PAT == 1 || PAT == 5) {
+            scores(salt);
+            scores(salt + 1);
+        } else if constexpr (PAT == 2 || PAT == 6) {
+            pv(salt, 0);
+            pv(salt + 1, 0);
+        } else if constexpr (PAT == 3) {
+            scores(salt);
+            pv(salt, 0);
+        } else if constexpr (PAT == 7) {
+            scores(salt);
+            __syncthreads();
+            const uint32_t pd = __float_as_uint(sc[0] + sc[1] + sc[2] + sc[3]);
+            __syncthreads();
+            pv(salt, pd);
+        } else {
+#pragma unroll
+            for (int k = 0; k < 64; ++k) {
+                const uint32_t b[2] = {kb[0] ^ mant(salt + k), kb[1]};
+                mma16816(tc, (k & 1) ? ql[k >> 2] : qh[k >> 2], b);
+            }
+        }
+    }
+    float r = sc[0] + sc[1] + sc[2] + sc[3] + tc[0] + tc[1] + tc[2] + tc[3];
+#pragma unroll
+    for (int j = 0; j < NT; ++j) {
+        r += acc[j][0] + acc[j][1] + acc[j][2] + acc[j][3];
+    }
+    p.dst[((size_t) tok * p.n_head + (size_t) blockIdx.y * (p.n_head / p.n_head_kv)) * p.head_dim +
+          t] = r;
 }

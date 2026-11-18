@@ -603,25 +603,46 @@ static CHAIN_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8
 /// The F16 prompt kernel on compute capability 8.0+ (#828). All kernels give the same bits;
 /// they differ in speed only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
 pub enum PromptKernel {
     /// The launcher's choice: [`PromptKernel::Gw`] on compute capability 12.x (the GB10),
     /// [`PromptKernel::Gb`] on Ampere (8.0 to 8.7, #1212), [`PromptKernel::Mma`] on the others.
-    Auto = 0,
+    Auto,
     /// `attn_mma_kernel`: one CTA of 4 warps per SM (two stages of K and V, q in shared memory).
-    Mma = 1,
+    Mma,
     /// `attn_gb_kernel`: the same arithmetic in ~39 KB, two CTAs per SM (q in registers, one K
     /// and one V buffer filled out of phase).
-    Gb = 2,
+    Gb,
     /// `attn_gw_kernel` (#1183): `attn_gb_kernel` with warp-local copies (each warp refills the
     /// K rows and V dims it reads itself), two CTA barriers per chunk instead of three.
-    Gw = 3,
+    Gw,
+    /// A probe of `legion qsa-bench` (#1176 r40; wrong output by design), by its launcher code:
+    /// 17-19 `attn_gw_kernel` without refills / without products / without both, 30 with half
+    /// of each refill, 32 + p and 48 + p `attn_pipe_kernel` pattern p (0-7) at two / one CTA
+    /// per SM.
+    Probe(u8),
+    /// An `attn_gw_kernel` variant of `legion qsa-bench` (#1176 r40; the same bits), by its
+    /// launcher code: 20 the cells looked up a chunk earlier, 24 refills in halves, 28 both,
+    /// 31 `attn_gw_kernel` itself at one CTA per SM.
+    Variant(u8),
+}
+
+impl PromptKernel {
+    /// `legion_qsa_attn::mma_kernel`'s value for this choice.
+    pub fn code(self) -> u8 {
+        match self {
+            PromptKernel::Auto => 0,
+            PromptKernel::Mma => 1,
+            PromptKernel::Gb => 2,
+            PromptKernel::Gw => 3,
+            PromptKernel::Probe(c) | PromptKernel::Variant(c) => c,
+        }
+    }
 }
 
 /// The prompt kernel launches take from now on ([`PromptKernel`]; `legion qsa-bench`).
 #[cfg(feature = "cuda")]
 pub fn set_prompt_kernel(k: PromptKernel) {
-    PROMPT_KERNEL.store(k as u8, std::sync::atomic::Ordering::Relaxed);
+    PROMPT_KERNEL.store(k.code(), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// [`set_prompt_kernel`]'s choice.
@@ -1179,8 +1200,9 @@ mod cuda {
         /// Decode steps: CTAs per kv head's query heads, 0 the launcher's choice (tests: -1
         /// the reference kernel).
         pub hgroups: i32,
-        /// The F16 prompt kernel on sm_80+ ([`super::PromptKernel`] as i32): 0 the launcher's
-        /// choice, 1 `attn_mma_kernel`, 2 `attn_gb_kernel`, 3 `attn_gw_kernel`.
+        /// The F16 prompt kernel on sm_80+ ([`super::PromptKernel::code`]): 0 the launcher's
+        /// choice, 1 `attn_mma_kernel`, 2 `attn_gb_kernel`, 3 `attn_gw_kernel`, 16 and up
+        /// `legion qsa-bench`'s probes and variants.
         pub mma_kernel: i32,
     }
 

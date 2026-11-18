@@ -1433,6 +1433,51 @@ __global__ void __launch_bounds__(128) qsa_scores_kernel(const legion_qsa_scores
     }
 }
 
+// The prompt kernel probes of `legion qsa-bench` (#1176 r40), by legion_qsa_attn::mma_kernel:
+// 17 to 19 attn_gw_kernel's PROBE 1 to 3 (wrong output by design); 20, 24, 28 its PROBE 4, 8,
+// 12 (the same bits); 30 its PROBE 24 (wrong output); 31 the kernel itself at one CTA per SM
+// (the same bits); 32 + PAT / 48 + PAT attn_pipe_kernel<PAT> at two / one CTA per SM (wrong
+// output by design).
+template <int HD>
+int launch_probe(const legion_qsa_attn & p, cudaStream_t st) {
+    const int k = p.mma_kernel;
+    const dim3 grid(p.grid[0], p.grid[1]);
+    void (*kern)(legion_qsa_attn) = nullptr;
+    int bytes = (int) sizeof(GbSmem<HD>);
+    switch (k) {
+        case 17: kern = attn_gw_kernel<HD, 1>; break;
+        case 18: kern = attn_gw_kernel<HD, 2>; break;
+        case 19: kern = attn_gw_kernel<HD, 3>; break;
+        case 20: kern = attn_gw_kernel<HD, 4>; break;
+        case 24: kern = attn_gw_kernel<HD, 8>; break;
+        case 28: kern = attn_gw_kernel<HD, 12>; break;
+        case 30: kern = attn_gw_kernel<HD, 24>; break;
+        case 31: kern = attn_gw_kernel<HD>; bytes = 60 * 1024; break;
+        default: break;
+    }
+    if (k >= 32 && k < 64 && (k & 15) < 8) {
+        void (*const pipe[8])(legion_qsa_attn) = {
+            attn_pipe_kernel<0>, attn_pipe_kernel<1>, attn_pipe_kernel<2>, attn_pipe_kernel<3>,
+            attn_pipe_kernel<4>, attn_pipe_kernel<5>, attn_pipe_kernel<6>, attn_pipe_kernel<7>,
+        };
+        kern = pipe[k & 15];
+        if (k >= 48) {
+            bytes = 60 * 1024;
+        }
+    }
+    if (kern == nullptr) {
+        return 1;
+    }
+    if (cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) !=
+            cudaSuccess ||
+        cudaFuncSetAttribute(kern, cudaFuncAttributePreferredSharedMemoryCarveout,
+                             cudaSharedmemCarveoutMaxShared) != cudaSuccess) {
+        return 2;
+    }
+    kern<<<grid, THREADS, bytes, st>>>(p);
+    return cudaGetLastError() == cudaSuccess ? 0 : 2;
+}
+
 template <int HD>
 int launch_attn(const legion_qsa_attn & p, cudaStream_t st) {
     // A quantized cache: the m8n8k4 kernel on every device (attn_mma_kernel reads F16).
@@ -1453,6 +1498,9 @@ int launch_attn(const legion_qsa_attn & p, cudaStream_t st) {
                 fprintf(stderr, "legion: --qsa-attn-chain applies to the Volta QSA prompt kernel "
                                 "only; this GPU runs the mma.m16n8k16 kernel\n");
             }
+        }
+        if (p.mma_kernel >= 16) {
+            return launch_probe<HD>(p, st);
         }
         const int gb = p.mma_kernel == 1 ? 0 : use_gb<HD>(p.mma_kernel);
         if (gb != 0) {
