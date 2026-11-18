@@ -283,8 +283,9 @@ int legion_gated_norm_launch(const legion_gated_norm * p, void * stream);
 
 // Streaming hints (#1176 round 44, A/B runs): launches from now on of the kernels whose bit is
 // set move the bytes they stream once with evict-first loads and stores (ld/st.global.cs) and,
-// for conv_silu, eight inputs a thread in flight: 1 hc_post_norm_b16_kernel, 2 conv_silu_kernel,
-// 4 gated_norm_kernel. The same values either way (only the cache hints and the load order).
+// for conv_silu, eight inputs a thread in flight (gated_norm with heads of 128: a warp a row):
+// 1 hc_post_norm_b16_kernel, 2 conv_silu_kernel, 4 gated_norm_kernel. The same values either
+// way (only the cache hints, the load order and the threads that hold the values).
 void legion_stream_hints_set(int mask);
 
 // rms_norm_bf16: mul(rms_norm(x, eps), w) per row, as ggml-cuda's rms_norm_f32 fused with the
@@ -867,6 +868,48 @@ __global__ void gated_norm_kernel(legion_gated_norm p) {
             st_s<CS>((__nv_bfloat16 *) p.out + i, __float2bfloat16(y * g));
         } else {
             st_s<CS>((float *) p.out + i, y * g);
+        }
+    }
+}
+
+// gated_norm_kernel for heads of 128 with the hints (#1176 round 44): a warp a (head, token),
+// lane l holding columns l, 32 + l, 64 + l and 96 + l, all eight loads issued before the sums,
+// o and z read and out written evict-first. The same values: each of gated_norm_kernel's four
+// column warps sums as one of our butterflies, and its second pass adds their sums as
+// (s0 + s2) + (s1 + s3) (warps 4-7 hold no column and add zeros).
+__global__ void __launch_bounds__(PREP_BLOCK) gated_norm_w128_kernel(legion_gated_norm p) {
+    constexpr int HV = 128;
+    const int64_t row = (int64_t) blockIdx.x * (PREP_BLOCK / 32) + threadIdx.x / 32;
+    if (row >= (int64_t) p.n_tok * p.n_v) {
+        return;
+    }
+    const int lane = threadIdx.x % 32;
+    const int64_t t = row / p.n_v;
+    const int col = (int) (row % p.n_v) * HV + lane;
+    float x[4], zv[4], s[4];
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+        x[j] = __ldcs(p.o + t * p.o_ld + col + 32 * j);
+        zv[j] = __ldcs(p.z + t * p.z_ld + col + 32 * j);
+    }
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+        float tmp = 0.0f;
+        tmp += x[j] * x[j];
+        s[j] = warp_sum(tmp);
+    }
+    const float tot = (s[0] + s[2]) + (s[1] + s[3]);
+    const float mean = tot / p.head_v;
+    const float scale = rsqrtf(mean + p.eps);
+    const int64_t i0 = t * (int64_t) HV * p.n_v + col;
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+        const float y = scale * x[j] * p.w[lane + 32 * j];
+        const float g = p.silu ? zv[j] / (1.0f + expf(-zv[j])) : 1.0f / (1.0f + expf(-zv[j]));
+        if (p.out_bf16) {
+            __stcs((__nv_bfloat16 *) p.out + i0 + 32 * j, __float2bfloat16(y * g));
+        } else {
+            __stcs((float *) p.out + i0 + 32 * j, y * g);
         }
     }
 }
@@ -1927,7 +1970,11 @@ int legion_gated_norm_launch(const legion_gated_norm * p, void * stream) {
         return -1;
     }
     const dim3 grid(p->n_v, p->n_tok);
-    if (__atomic_load_n(&g_stream_hints, __ATOMIC_RELAXED) & 4) {
+    const bool cs = (__atomic_load_n(&g_stream_hints, __ATOMIC_RELAXED) & 4) != 0;
+    if (cs && p->head_v == 128) {
+        const int64_t rows = (int64_t) p->n_v * p->n_tok, per = PREP_BLOCK / 32;
+        gated_norm_w128_kernel<<<(unsigned) ((rows + per - 1) / per), PREP_BLOCK, 0, (cudaStream_t) stream>>>(*p);
+    } else if (cs) {
         gated_norm_kernel<true><<<grid, PREP_BLOCK, 0, (cudaStream_t) stream>>>(*p);
     } else {
         gated_norm_kernel<false><<<grid, PREP_BLOCK, 0, (cudaStream_t) stream>>>(*p);
