@@ -191,6 +191,13 @@ fn staged_needs_aligned_rows() {
         sv: [128, 10240, 10240 * 4096],
         sb: [1, 48, 48 * 4096],
         scale: 1.0,
+        z: base,
+        z_ld: 6144,
+        norm_w: base,
+        gout: std::ptr::null_mut(),
+        eps: 1e-6,
+        silu: 1,
+        head_v: 128,
     };
     assert!(args(2048, 128).staged_aligned());
     assert!(!args(2049, 128).staged_aligned());
@@ -251,10 +258,13 @@ fn launch_sizes_match_the_kernels() {
     assert_eq!((Schedule::Wide.warps(), Schedule::Pair.warps()), (16, 8));
     // Two pair CTAs (and the driver's 1 KiB each) fit a GB10 SM's 100 KiB.
     assert!(2 * (Schedule::Pair.smem() + 1024) <= 100 * 1024);
-    assert_eq!(std::mem::size_of::<Args>(), 184);
+    assert_eq!(std::mem::size_of::<Args>(), 232);
     assert_eq!(std::mem::offset_of!(Args, h), 64);
     assert_eq!(std::mem::offset_of!(Args, sq), 104);
     assert_eq!(std::mem::offset_of!(Args, scale), 176);
+    assert_eq!(std::mem::offset_of!(Args, z), 184);
+    assert_eq!(std::mem::offset_of!(Args, eps), 216);
+    assert_eq!(std::mem::offset_of!(Args, head_v), 224);
 }
 
 #[test]

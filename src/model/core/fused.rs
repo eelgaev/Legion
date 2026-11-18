@@ -568,6 +568,44 @@ struct ConvSilu {
 #[cfg(feature = "cuda")]
 unsafe extern "C" {
     fn legion_conv_silu_launch(p: *const ConvSilu, stream: *mut c_void) -> i32;
+    fn legion_stream_hints_set(mask: i32);
+}
+
+/// Streaming hints of the once-streamed prompt-step kernels (#1176 round 44): qwen4exp's
+/// BF16-stream combine-and-norm (bit 1), the gated DeltaNet conv (bit 2) and its gated norm
+/// (bit 4) read and write the bytes they stream once evict-first (`ld/st.global.cs`), the conv
+/// with eight inputs a thread in flight, the norm a warp a head of 128. The same values either
+/// way. On by default where `cc12` (the GPU of the first launch is compute capability 12.x, where
+/// they were measured); `LEGION_DEBUG_HC_POST_NORM_CS`, `LEGION_DEBUG_CONV_SILU_CS` and
+/// `LEGION_DEBUG_GATED_NORM_CS` from `var` turn one off with `0` or on with `1` (A/B runs).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn stream_hint_mask(
+    cc12: bool,
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> i32 {
+    let on = |name: &str| match var(name) {
+        Some(v) if v == "0" => false,
+        Some(v) if v == "1" => true,
+        _ => cc12,
+    };
+    i32::from(on("LEGION_DEBUG_HC_POST_NORM_CS"))
+        | i32::from(on("LEGION_DEBUG_CONV_SILU_CS")) << 1
+        | i32::from(on("LEGION_DEBUG_GATED_NORM_CS")) << 2
+}
+
+/// Sets [`stream_hint_mask`] for the launchers, before the first launch of any of its kernels.
+#[cfg(feature = "cuda")]
+pub(crate) fn stream_hints() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        use crate::hw::per_device;
+        let cc12 = per_device::current()
+            .and_then(per_device::cc)
+            .is_some_and(|(major, _)| major == 12);
+        let mask = stream_hint_mask(cc12, |name| std::env::var_os(name));
+        // SAFETY: sets a flag the launchers read.
+        unsafe { legion_stream_hints_set(mask) };
+    });
 }
 
 #[cfg(feature = "cuda")]
@@ -624,6 +662,7 @@ unsafe fn cuda_conv_silu(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
                 p.pf_bytes = params[5] as i64 * 4096;
             }
         }
+        stream_hints();
         match legion_conv_silu_launch(&p, stream) {
             0 => Ok(()),
             -1 => Err(format!("conv_silu: kernel width {} unsupported", w.ne[0])),
@@ -1393,6 +1432,7 @@ unsafe fn cuda_gated_norm(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
             eps: f32::from_bits(p[2] as u32),
             out_bf16: i32::from(dst.type_ == types::BF16),
         };
+        stream_hints();
         match legion_gated_norm_launch(&g, stream) {
             0 => Ok(()),
             -1 => Err(format!(
@@ -1401,6 +1441,46 @@ unsafe fn cuda_gated_norm(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
             )),
             e => Err(format!("gated_norm: CUDA error {e}")),
         }
+    }
+}
+
+/// [`gated_norm_bf16`]'s kernel on raw device rows (`super::gdn_mma`'s gated output norm when
+/// its fused kernel does not run): `o` and `z` rows of `head_v * n_v` floats `o_ld` and `z_ld`
+/// floats apart, `w` `head_v` floats, `out` `n_tok` contiguous BF16 rows.
+///
+/// # Safety
+/// Device memory of the stream's device, of those sizes.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn gated_norm_bf16_rows(
+    (o, o_ld): (*const f32, i64),
+    (z, z_ld): (*const f32, i64),
+    w: *const f32,
+    out: *mut c_void,
+    (head_v, n_v, n_tok): (i32, i32, i32),
+    silu: bool,
+    eps: f32,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    let g = GatedNorm {
+        o,
+        o_ld,
+        w,
+        z,
+        z_ld,
+        out,
+        head_v,
+        n_v,
+        n_tok,
+        silu: i32::from(silu),
+        eps,
+        out_bf16: 1,
+    };
+    stream_hints();
+    // SAFETY: the caller's.
+    match unsafe { legion_gated_norm_launch(&g, stream) } {
+        0 => Ok(()),
+        e => Err(format!("gated_norm: error {e}")),
     }
 }
 

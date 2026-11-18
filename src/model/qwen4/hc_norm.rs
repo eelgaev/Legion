@@ -1722,6 +1722,7 @@ unsafe fn cuda_hc_post_norm(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
             let f = fold
                 .as_ref()
                 .map_or(std::ptr::null(), |f| f as *const MoeFold);
+            crate::model::core::fused::stream_hints();
             legion_hc_post_norm_b16_launch(&p, f, i32::from(res16), stream)
         } else if let Some(f) = &fold {
             legion_hc_post_norm_fold_launch(&p, f, stream)

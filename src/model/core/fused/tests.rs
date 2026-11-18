@@ -983,6 +983,22 @@ fn shexp_gate_matches_the_chain() {
     }
 }
 
+/// The streaming hints: on by default on compute capability 12.x only; each switch's `0` / `1`
+/// overrides its own bit, other values keep the default.
+#[test]
+fn stream_hint_mask_defaults_and_overrides() {
+    let none = |_: &str| None;
+    assert_eq!(stream_hint_mask(true, none), 7);
+    assert_eq!(stream_hint_mask(false, none), 0);
+    let conv_off = |n: &str| (n == "LEGION_DEBUG_CONV_SILU_CS").then(|| "0".into());
+    assert_eq!(stream_hint_mask(true, conv_off), 5);
+    let hc_on = |n: &str| (n == "LEGION_DEBUG_HC_POST_NORM_CS").then(|| "1".into());
+    assert_eq!(stream_hint_mask(false, hc_on), 1);
+    let norm_odd = |n: &str| (n == "LEGION_DEBUG_GATED_NORM_CS").then(|| "yes".into());
+    assert_eq!(stream_hint_mask(true, norm_odd), 7);
+    assert_eq!(stream_hint_mask(false, norm_odd), 0);
+}
+
 /// On a GPU the op is ggml-cuda's sigmoid, broadcast mul and add bit for bit.
 #[cfg(feature = "cuda")]
 #[test]
