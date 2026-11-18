@@ -537,6 +537,110 @@ impl SwapRule {
 /// first, and marks them started (old entries leave the table now; new ones join on
 /// [`LayerSlots::complete`]). The caller copies each new expert into its slot.
 pub fn plan_swaps(layers: &mut [Option<&mut LayerSlots>], rule: SwapRule) -> Vec<Swap> {
+    static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *FULL.get_or_init(|| std::env::var("LEGION_DEBUG_PLAN_FULL").is_ok_and(|v| v == "1")) {
+        plan_swaps_full(layers, rule)
+    } else {
+        plan_swaps_lazy(layers, rule)
+    }
+}
+
+/// [`LayerSlots::candidates`]'s first pair, found by one pass over the layer's heats and slots
+/// without ranking them, and a bound on every candidate's gain: `None` when the layer has no
+/// candidate at all (no host expert above the floor, no slot to take, or the first pair fails
+/// the margin, which ends the candidates there), else `Some(bound)` with every candidate's
+/// gain `<= bound` (the hottest newcomer's heat less the least `max(h_old, 0)` of any slot:
+/// subtraction rounds monotonically). Candidate gains are never NaN (a NaN gain fails the
+/// margin, and an empty slot's gain is a newcomer's positive heat), so the bound orders them
+/// as `total_cmp` does.
+fn best_gain(l: &LayerSlots, margin: f32, ratio: f32) -> Option<f32> {
+    let empty = l.slots[..l.limit].iter().any(|s| matches!(s, Slot::Empty));
+    let floor = if empty { 0.0 } else { margin.max(0.0) };
+    // The hottest host expert above the floor, ties to the lowest id (`candidates`'s order).
+    let mut new: Option<u32> = None;
+    for (e, (&h, s)) in l.heat.iter().zip(&l.slot_of).enumerate() {
+        if s.is_none() && h > floor && new.is_none_or(|n| h.total_cmp(&l.heat[n as usize]).is_gt())
+        {
+            new = Some(e as u32);
+        }
+    }
+    let h_new = l.heat[new? as usize];
+    // The coldest slot (empty first, ties to the lowest index), and the least `max(h_old, 0)`.
+    let mut cold: Option<(f32, Option<u32>)> = None;
+    let mut least = f32::INFINITY;
+    for slot in &l.slots[..l.limit] {
+        let (h, e) = match *slot {
+            Slot::Empty => (f32::NEG_INFINITY, None),
+            Slot::Ready(e) => (l.heat[e as usize], Some(e)),
+            Slot::Filling(_) => continue,
+        };
+        least = least.min(h.max(0.0));
+        if cold.is_none_or(|(c, _)| h.total_cmp(&c).is_lt()) {
+            cold = Some((h, e));
+        }
+    }
+    let (h_old, old) = cold?;
+    let gain = h_new - h_old.max(0.0);
+    (old.is_none() || (gain > margin && h_new > h_old * (1.0 + ratio))).then_some(h_new - least)
+}
+
+/// [`plan_swaps_full`]'s plan, from the candidates of only the layers that can still place one
+/// within the budget: layers in order of [`best_gain`]'s bound, stopping once `budget`
+/// candidates are in hand and the next bound is below the `budget`-th best gain. The gains
+/// are then ordered as the full plan's stable sort orders them (gain, then layer, then the
+/// layer's own order), so the plan is the same swaps in the same order.
+fn plan_swaps_lazy(layers: &mut [Option<&mut LayerSlots>], rule: SwapRule) -> Vec<Swap> {
+    if rule.budget == 0 {
+        return Vec::new();
+    }
+    let mut order: Vec<(f32, usize)> = layers
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| Some((best_gain(l.as_deref()?, rule.margin, rule.ratio)?, i)))
+        .collect();
+    order.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    let mut all: Vec<(f32, usize, usize, Swap)> = Vec::new();
+    let mut gains: Vec<f32> = Vec::new();
+    for &(bound, layer) in &order {
+        if all.len() >= rule.budget {
+            gains.clear();
+            gains.extend(all.iter().map(|c| c.0));
+            let k = rule.budget - 1;
+            let (_, kth, _) = gains.select_nth_unstable_by(k, |a, b| b.total_cmp(a));
+            if bound.total_cmp(kth).is_lt() {
+                break;
+            }
+        }
+        let Some(l) = layers[layer].as_deref() else {
+            continue;
+        };
+        for (i, (gain, slot, old, new)) in l
+            .candidates(rule.margin, rule.ratio, rule.budget)
+            .into_iter()
+            .enumerate()
+        {
+            let swap = Swap {
+                layer,
+                slot,
+                old,
+                new,
+            };
+            all.push((gain, layer, i, swap));
+        }
+    }
+    all.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    all.truncate(rule.budget);
+    for (_, _, _, s) in &all {
+        if let Some(l) = layers[s.layer].as_mut() {
+            l.start(s.slot, s.old, s.new);
+        }
+    }
+    all.into_iter().map(|(_, _, _, s)| s).collect()
+}
+
+/// Plans from every layer's candidates (`LEGION_DEBUG_PLAN_FULL=1`; the default
+/// [`plan_swaps_lazy`] plans the same swaps).
+pub fn plan_swaps_full(layers: &mut [Option<&mut LayerSlots>], rule: SwapRule) -> Vec<Swap> {
     let mut all: Vec<(f32, Swap)> = Vec::new();
     for (layer, l) in layers.iter().enumerate() {
         let Some(l) = l else { continue };

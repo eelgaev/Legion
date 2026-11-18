@@ -391,6 +391,58 @@ pub fn matvec(
     matvec_scalar(format, w, xq, k, out)
 }
 
+/// An activation column of [`matvec_prepared`], unpacked once for several matrices (the CPU
+/// share's gate and up rows of one token, and the tasks of one thread, #37).
+pub struct Prepared {
+    len: usize,
+    #[cfg(target_arch = "x86_64")]
+    acts: x86::Acts,
+}
+
+impl Prepared {
+    /// `xq` (`block_q8_1`s) unpacked as [`matvec`] unpacks it for every call.
+    pub fn new(xq: &[u8]) -> Self {
+        Self {
+            len: xq.len(),
+            #[cfg(target_arch = "x86_64")]
+            acts: x86::Acts::new(xq),
+        }
+    }
+}
+
+/// [`matvec`] with the activations `xq` already unpacked in `prep` ([`Prepared::new`] of the
+/// same bytes): the same values, without unpacking them again.
+pub fn matvec_prepared(
+    format: QuantFormat,
+    w: &[u8],
+    xq: &[u8],
+    prep: &Prepared,
+    k: usize,
+    out: &mut [f32],
+) -> Result<(), Error> {
+    debug_assert_eq!(prep.len, xq.len(), "prepared from other activations");
+    #[cfg(target_arch = "x86_64")]
+    {
+        let (row, _, lanes) = shape(format, w, xq, k, out.len())?;
+        let blocks = k / format.block_len();
+        let whole = match format {
+            QuantFormat::Q4K | QuantFormat::Q5K => lanes == 32 && blocks.is_multiple_of(2),
+            QuantFormat::Q5_1 => lanes == 8 && blocks.is_multiple_of(4),
+            QuantFormat::Q8_0 => lanes == 16 && blocks.is_multiple_of(4),
+            _ => false,
+        };
+        if whole && simd() && prep.len == xq.len() {
+            let _ftz = FlushToZero::new();
+            // SAFETY: `simd` detected AVX2, FMA and F16C.
+            unsafe { x86::matvec_acts(format, w, &prep.acts, row, blocks, out) };
+            return Ok(());
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = prep;
+    matvec_scalar(format, w, xq, k, out)
+}
+
 /// Compares [`matvec`] with [`matvec_scalar`] on `rounds` random matrices per format, of the
 /// decode shapes (2560-value rows for Q4_K and Q5_K, 640 for Q5_1 and Q8_0), with scales that
 /// reach f16's subnormals and quants that reach -128. Returns the first difference.
@@ -469,7 +521,7 @@ mod x86 {
 
     /// An activation column unpacked once for all the rows: the quants, each block's scale and
     /// sum as f32 and as f16 bits, and (the K-quants' `dot2`) the quants' sums per unit.
-    struct Acts {
+    pub(super) struct Acts {
         qs: Vec<i8>,
         d: Vec<f32>,
         s: Vec<f32>,
@@ -478,7 +530,7 @@ mod x86 {
     }
 
     impl Acts {
-        fn new(xq: &[u8]) -> Self {
+        pub(super) fn new(xq: &[u8]) -> Self {
             let n = xq.len() / Q8_1_BLOCK_BYTES;
             let mut a = Self {
                 qs: Vec::with_capacity(n * 32),
@@ -515,14 +567,30 @@ mod x86 {
         blocks: usize,
         out: &mut [f32],
     ) {
-        let x = Acts::new(xq);
+        // SAFETY: the caller's guarantee.
+        unsafe { matvec_acts(format, w, &Acts::new(xq), row, blocks, out) }
+    }
+
+    /// [`matvec`] of activations already unpacked.
+    ///
+    /// # Safety
+    /// As [`matvec`]'s.
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub(super) unsafe fn matvec_acts(
+        format: QuantFormat,
+        w: &[u8],
+        x: &Acts,
+        row: usize,
+        blocks: usize,
+        out: &mut [f32],
+    ) {
         for (r, o) in out.iter_mut().enumerate() {
             let rw = &w[r * row..][..row];
             *o = match format {
-                QuantFormat::Q4K => row_k::<false>(rw, &x, blocks),
-                QuantFormat::Q5K => row_k::<true>(rw, &x, blocks),
-                QuantFormat::Q5_1 => row_q5_1(rw, &x, blocks),
-                _ => row_q8_0(rw, &x, blocks),
+                QuantFormat::Q4K => row_k::<false>(rw, x, blocks),
+                QuantFormat::Q5K => row_k::<true>(rw, x, blocks),
+                QuantFormat::Q5_1 => row_q5_1(rw, x, blocks),
+                _ => row_q8_0(rw, x, blocks),
             };
         }
     }

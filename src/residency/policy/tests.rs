@@ -360,6 +360,83 @@ fn margin_floor_plans_the_full_sorts_swaps() {
     }
 }
 
+/// The lazy plan (only the layers whose bound can still place a swap) is the full plan, over
+/// many layers of different sizes and rounds of skewed random routing with copies completing
+/// in between, budgets from binding hard to loose, and a few hand-set odd heats (ties, an
+/// infinity, a NaN) mixed in.
+#[test]
+fn lazy_plan_is_the_full_plan() {
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut rnd = move |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    for (budget, margin, ratio) in [
+        (1, 1.5, 0.0),
+        (4, 1.5, 0.0),
+        (24, 1.5, 0.0),
+        (24, 0.0, 0.25),
+    ] {
+        let rule = SwapRule {
+            budget,
+            margin,
+            ratio,
+        };
+        let n_expert = 96;
+        let mut a: Vec<LayerSlots> = (0..16)
+            .map(|i| {
+                let n_slots = 6 + i * 3 % 17;
+                let mut l = LayerSlots::new(n_expert, n_slots);
+                let held = if i % 5 == 0 { n_slots - 2 } else { n_slots };
+                l.fill(
+                    &(0..held as u32)
+                        .map(|e| (e * 7 + i as u32) % n_expert as u32)
+                        .collect::<Vec<_>>(),
+                );
+                l
+            })
+            .collect();
+        let mut b = a.clone();
+        for step in 0..300 {
+            for (i, (la, lb)) in a.iter_mut().zip(b.iter_mut()).enumerate() {
+                let ids: Vec<i32> = (0..10)
+                    .map(|_| {
+                        let e = (rnd(24) * rnd(5) + i as u64) as usize % n_expert;
+                        la.table()[e]
+                    })
+                    .collect();
+                la.record(&ids);
+                lb.record(&ids);
+                la.decay(0.95);
+                lb.decay(0.95);
+                if step % 97 == 13 && i % 4 == 1 {
+                    let odd = [f32::INFINITY, f32::NAN, 2.0][(step / 97) % 3];
+                    let e = rnd(n_expert as u64) as usize;
+                    la.heat[e] = odd;
+                    lb.heat[e] = odd;
+                }
+            }
+            let mut va: Vec<Option<&mut LayerSlots>> = a.iter_mut().map(Some).collect();
+            va[3] = None;
+            let got = plan_swaps_lazy(&mut va, rule);
+            let mut vb: Vec<Option<&mut LayerSlots>> = b.iter_mut().map(Some).collect();
+            vb[3] = None;
+            let want = plan_swaps_full(&mut vb, rule);
+            assert_eq!(got, want, "budget {budget} margin {margin} step {step}");
+            for s in got.iter().filter(|_| rnd(4) > 0) {
+                a[s.layer].complete(s.slot);
+                b[s.layer].complete(s.slot);
+            }
+        }
+        // The layers' states stayed equal too (the same swaps were started).
+        for (la, lb) in a.iter().zip(&b) {
+            assert_eq!(la.table(), lb.table());
+        }
+    }
+}
+
 #[test]
 fn clear_from_keeps_the_first_slots() {
     let mut l = LayerSlots::new(8, 4);

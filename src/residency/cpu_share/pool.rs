@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::HostExperts;
+use crate::cpu::gpu_exact::Prepared;
 use crate::cpu::{Q8Activations, matmul_q8};
 
 /// One layer's share of one step.
@@ -286,6 +287,22 @@ struct Shared {
     quit: AtomicBool,
     threads: usize,
     split: Split,
+    /// The threads' laps of the last phase (with [`laps`] on only): [`ThreadLap`].
+    tlaps: Vec<ThreadLap>,
+    /// [`ThreadLap`]'s clock, and when the coordinator released the last phase on it.
+    epoch: Instant,
+    released: AtomicU64,
+}
+
+/// One thread's part of the last phase (with [`laps`] on only), in nanoseconds of
+/// [`Shared::epoch`]: when it saw the phase and when it left it, the time inside its tasks and
+/// how many it ran. Written by the thread, read by the coordinator after the phase.
+#[derive(Default)]
+struct ThreadLap {
+    start: AtomicU64,
+    end: AtomicU64,
+    busy: AtomicU64,
+    tasks: AtomicU32,
 }
 
 /// Raises its flag when dropped (the coordinator's `quit`, also when it panics).
@@ -323,6 +340,9 @@ impl Pool {
             quit: AtomicBool::new(false),
             threads,
             split,
+            tlaps: (0..threads).map(|_| ThreadLap::default()).collect(),
+            epoch: Instant::now(),
+            released: AtomicU64::new(0),
         });
         let handles = (0..threads)
             .map(|i| {
@@ -581,6 +601,11 @@ pub(super) mod laps {
         .as_deref()
     }
 
+    /// Whether the laps are on.
+    pub fn on() -> bool {
+        path().is_some()
+    }
+
     /// The clock in nanoseconds, or 0 when the laps are off.
     pub fn now() -> u64 {
         if path().is_none() {
@@ -678,6 +703,59 @@ pub fn all_upto_with(auto: bool, tiered: bool, debug: Option<u32>) -> u32 {
 /// [`all_upto`]'s default.
 pub const ALL_UPTO: u32 = 3;
 
+/// The threads' laps of an exact job's gate/up (`k` 0) or down (1) phase, just over (with
+/// [`laps`] on only), added up and logged per 4,096 jobs as each thread's mean microseconds:
+/// from the release to its start (`start`), inside its tasks (`busy`), from the release to its
+/// end (`end`), its tasks, and the phase's wall time to the coordinator's return (`wall`).
+fn thread_laps(s: &Shared, k: usize) {
+    #[derive(Default)]
+    struct Acc {
+        jobs: u64,
+        wall: f64,
+        start: Vec<f64>,
+        busy: Vec<f64>,
+        end: Vec<f64>,
+        tasks: Vec<f64>,
+    }
+    static ACC: Mutex<Option<[Acc; 2]>> = Mutex::new(None);
+    let now = s.epoch.elapsed().as_nanos() as u64;
+    let rel = s.released.load(Ordering::Relaxed);
+    let mut g = ACC.lock().unwrap();
+    let a = &mut g.get_or_insert_with(Default::default)[k];
+    let n = s.threads;
+    for v in [&mut a.start, &mut a.busy, &mut a.end, &mut a.tasks] {
+        v.resize(n, 0.0);
+    }
+    a.jobs += 1;
+    a.wall += now.saturating_sub(rel) as f64 / 1e3;
+    for (i, l) in s.tlaps.iter().enumerate() {
+        let (st, en) = (
+            l.start.load(Ordering::Relaxed),
+            l.end.load(Ordering::Relaxed),
+        );
+        a.start[i] += st.saturating_sub(rel) as f64 / 1e3;
+        a.end[i] += en.saturating_sub(rel) as f64 / 1e3;
+        a.busy[i] += l.busy.load(Ordering::Relaxed) as f64 / 1e3;
+        a.tasks[i] += f64::from(l.tasks.load(Ordering::Relaxed));
+    }
+    if a.jobs.is_multiple_of(4096) {
+        let j = a.jobs as f64;
+        let mean =
+            |v: &[f64]| -> Vec<f64> { v.iter().map(|x| (x / j * 10.0).round() / 10.0).collect() };
+        tracing::debug!(
+            phase = if k == 0 { "gate_up" } else { "down" },
+            jobs = a.jobs,
+            wall_us = a.wall / j,
+            start_us = ?mean(&a.start),
+            busy_us = ?mean(&a.busy),
+            end_us = ?mean(&a.end),
+            tasks = ?mean(&a.tasks),
+            "cpu share thread laps"
+        );
+        *a = Acc::default();
+    }
+}
+
 /// Runs an exact job (see the `cpu_share` module docs): the pairs' gate and up sums, "gate/up
 /// done", the wait for the GPU's SwiGLU blocks, the down rows. The caller raises "done".
 fn run_exact(s: &Shared, job: &Job) -> ExactStats {
@@ -738,6 +816,9 @@ fn run_exact(s: &Shared, job: &Job) -> ExactStats {
     st.gpu_waited_act = reached(unsafe { &*e.act_arrived }, job.seq);
     gu_done.store(job.seq, Ordering::Release);
     st.laps[1] = laps::now();
+    if laps::on() {
+        thread_laps(s, 0);
+    }
     let t = Instant::now();
     split_rows(s, ne);
     // While the GPU makes the host pairs' SwiGLU blocks, every thread pulls the down rows of
@@ -756,6 +837,9 @@ fn run_exact(s: &Shared, job: &Job) -> ExactStats {
     run_phase(s, 3);
     st.down = t.elapsed();
     st.laps[3] = laps::now();
+    if laps::on() {
+        thread_laps(s, 1);
+    }
     // SAFETY: as above (null when the buffer has no such flag: tests).
     st.gpu_waited = unsafe { ex.arrived.as_ref() }.is_some_and(|a| reached(a, job.seq));
     // A step the pool takes whole ([`ExactExchange::all_upto`]) says nothing about the race.
@@ -915,6 +999,10 @@ fn run_phase(s: &Shared, phase: u64) {
     s.finished.store(0, Ordering::Relaxed);
     s.next.store(s.threads, Ordering::Relaxed);
     let g = s.phase_gen.load(Ordering::Relaxed);
+    if laps::on() {
+        s.released
+            .store(s.epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
     s.phase_gen
         .store((((g >> 2) + 1) << 2) | phase, Ordering::Release);
     work(s, 0, phase);
@@ -950,6 +1038,25 @@ fn work(s: &Shared, i: usize, phase: u64) {
         return;
     }
     let mut task = i;
+    if laps::on() {
+        let at = || s.epoch.elapsed().as_nanos() as u64;
+        let start = at();
+        let (mut busy, mut n) = (0u64, 0u32);
+        while task < c.n_tasks {
+            let t = Instant::now();
+            // SAFETY: as below.
+            unsafe { run_task(c, phase, task) };
+            busy += t.elapsed().as_nanos() as u64;
+            n += 1;
+            task = s.next.fetch_add(1, Ordering::Relaxed);
+        }
+        let l = &s.tlaps[i];
+        l.start.store(start, Ordering::Relaxed);
+        l.end.store(at(), Ordering::Relaxed);
+        l.busy.store(busy, Ordering::Relaxed);
+        l.tasks.store(n, Ordering::Relaxed);
+        return;
+    }
     while task < c.n_tasks {
         // SAFETY: the task is this thread's alone (claimed once).
         unsafe { run_task(c, phase, task) };
@@ -1076,7 +1183,7 @@ fn prefetch_task(c: &Current, task: usize) {
 /// # Safety
 /// The task must be the calling thread's alone in the phase.
 unsafe fn run_exact_task(c: &Current, job: &Job, phase: u64, task: usize) {
-    use crate::cpu::gpu_exact::{Q8_1_BLOCK_BYTES, matvec};
+    use crate::cpu::gpu_exact::{Q8_1_BLOCK_BYTES, matvec, matvec_prepared};
     let ex = &job.experts;
     let e = job.exchange.exact.expect("an exact exchange");
     let (ne, nf) = (ex.n_embd, ex.n_ff);
@@ -1084,6 +1191,7 @@ unsafe fn run_exact_task(c: &Current, job: &Job, phase: u64, task: usize) {
     let g = &c.groups[group];
     let n = r1 - r0;
     let (xq_bytes, aq_bytes) = (ne / 32 * Q8_1_BLOCK_BYTES, nf / 32 * Q8_1_BLOCK_BYTES);
+    let prep = prepare_once();
     if phase == 1 {
         let rb = ex.up_gate.row_bytes(ne).expect("gate rows");
         // SAFETY: live host experts (the pool's owner keeps them mapped).
@@ -1096,9 +1204,18 @@ unsafe fn run_exact_task(c: &Current, job: &Job, phase: u64, task: usize) {
                 let xq = std::slice::from_raw_parts(e.xq.add(t * xq_bytes), xq_bytes);
                 let sums = e.gu.add(pair * 2 * nf);
                 let g_out = std::slice::from_raw_parts_mut(sums.add(r0), n);
-                matvec(ex.up_gate, &gate[r0 * rb..r1 * rb], xq, ne, g_out).expect("gate");
-                let u_out = std::slice::from_raw_parts_mut(sums.add(nf + r0), n);
-                matvec(ex.up_gate, &up[r0 * rb..r1 * rb], xq, ne, u_out).expect("up");
+                let (gw, uw) = (&gate[r0 * rb..r1 * rb], &up[r0 * rb..r1 * rb]);
+                if prep {
+                    prepared(xq, |p| {
+                        matvec_prepared(ex.up_gate, gw, xq, p, ne, g_out).expect("gate");
+                        let u_out = std::slice::from_raw_parts_mut(sums.add(nf + r0), n);
+                        matvec_prepared(ex.up_gate, uw, xq, p, ne, u_out).expect("up");
+                    });
+                } else {
+                    matvec(ex.up_gate, gw, xq, ne, g_out).expect("gate");
+                    let u_out = std::slice::from_raw_parts_mut(sums.add(nf + r0), n);
+                    matvec(ex.up_gate, uw, xq, ne, u_out).expect("up");
+                }
             }
         }
     } else {
@@ -1112,10 +1229,62 @@ unsafe fn run_exact_task(c: &Current, job: &Job, phase: u64, task: usize) {
             unsafe {
                 let aq = std::slice::from_raw_parts(e.aq.add(pair * aq_bytes), aq_bytes);
                 let out = std::slice::from_raw_parts_mut(job.exchange.out.add(pair * ne + r0), n);
-                matvec(ex.down, &down[r0 * rb..r1 * rb], aq, nf, out).expect("down");
+                let dw = &down[r0 * rb..r1 * rb];
+                if prep {
+                    prepared(aq, |p| {
+                        matvec_prepared(ex.down, dw, aq, p, nf, out).expect("down")
+                    });
+                } else {
+                    matvec(ex.down, dw, aq, nf, out).expect("down");
+                }
             }
         }
     }
+}
+
+/// Whether the exact tasks unpack each activation column once per thread ([`prepared`]: on;
+/// `LEGION_DEBUG_SHARE_PREP=0` unpacks it for every matvec, as before, for A/B runs). The same
+/// unpacked values either way, so the same sums.
+fn prepare_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LEGION_DEBUG_SHARE_PREP").map_or(true, |v| v != "0"))
+}
+
+/// Activation columns a thread unpacked lately, by their bytes ([`prepared`]).
+const PREPARED_KEPT: usize = 4;
+
+/// Runs `f` with `cols` (`block_q8_1`s) unpacked for [`matvec_prepared`]: a thread's tasks of
+/// one job read the same few columns (a decode step's x for every gate and up range, each
+/// pair's SwiGLU blocks for its down ranges), so each is unpacked once per thread and job, not
+/// once per matvec. Keyed by the bytes themselves (a column the GPU rewrote is unpacked
+/// again), so what `f` gets is always [`Prepared::new`] of `cols`.
+fn prepared<R>(cols: &[u8], f: impl FnOnce(&Prepared) -> R) -> R {
+    type Kept = Vec<(Vec<u8>, Prepared)>;
+    thread_local! {
+        static KEPT: std::cell::RefCell<(Kept, usize)> = const {
+            std::cell::RefCell::new((Vec::new(), 0))
+        };
+    }
+    KEPT.with(|k| {
+        let (kept, next) = &mut *k.borrow_mut();
+        let at = match kept.iter().position(|(b, _)| b[..] == *cols) {
+            Some(i) => i,
+            None if kept.len() < PREPARED_KEPT => {
+                kept.push((cols.to_vec(), Prepared::new(cols)));
+                kept.len() - 1
+            }
+            None => {
+                let i = *next;
+                *next = (i + 1) % PREPARED_KEPT;
+                let (bytes, prep) = &mut kept[i];
+                bytes.clear();
+                bytes.extend_from_slice(cols);
+                *prep = Prepared::new(cols);
+                i
+            }
+        };
+        f(&kept[at].1)
+    })
 }
 
 /// Runs `job` on `pool` as the GPU would (raises "ready", waits for "done"), with the job's
