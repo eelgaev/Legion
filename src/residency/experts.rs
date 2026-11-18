@@ -271,7 +271,7 @@ fn stages_entry(real: Option<&[usize]>, il: usize, limit: usize, all: bool) -> b
 }
 
 /// The slots below which a lend copies the bounded host tier's RAM-held experts into a
-/// refilled layer's emptied slots ([`ExpertResidency::fill_from_ram`]): only those it keeps.
+/// refilled layer's emptied slots ([`ExpertResidency::copy_planned`]): only those it keeps.
 /// `lends`: the layer's device stages (else it keeps every slot); a [`Lend::Tail`] layer keeps
 /// its slots below `keep` ([`Layer::keep`]), all of them when the lend re-packs them (`repack`:
 /// [`super::policy::LayerSlots::repack_kept`] may copy from the tail's bytes); a
@@ -850,6 +850,22 @@ pub struct ExpertResidency {
     /// the next after-step that covers it ([`Self::after_step_only`] covers only its own).
     #[cfg(feature = "cuda")]
     refilled: Vec<(usize, Result<(), String>)>,
+    /// When the restoring thread gives the lent tails (`lend_spread`) their VRAM back: once a
+    /// step ran or something waits for it ([`TailGate`]).
+    #[cfg(feature = "cuda")]
+    tail_gate: Arc<TailGate>,
+    /// The bounded host tier: refilled layers' RAM fills planned (their slots filling) but
+    /// not copied yet, `(layer, (slot, expert))`; the next after-steps copy them a few layers
+    /// each ([`Self::copy_planned`]).
+    #[cfg(feature = "cuda")]
+    planned: Vec<(usize, Vec<(u32, u32)>)>,
+    /// Layers of [`Self::planned`] one after-step copies (0: all; `LEGION_DEBUG_RAM_FILL_LAYERS`).
+    #[cfg(feature = "cuda")]
+    fill_per_step: usize,
+    /// `LEGION_DEBUG_REFILL_TAILS_EAGER=1`: the restoring thread gives the tails their VRAM
+    /// back at once, as before #37 round 27.
+    #[cfg(feature = "cuda")]
+    eager_tails: bool,
     /// Layers at or past it are never staged ([`Self::stage_below`]).
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     stage_limit: usize,
@@ -1988,6 +2004,18 @@ impl ExpertResidency {
             stop_refill: Arc::default(),
             #[cfg(feature = "cuda")]
             refilled: Vec::new(),
+            #[cfg(feature = "cuda")]
+            tail_gate: Arc::new(TailGate::new(true)),
+            #[cfg(feature = "cuda")]
+            planned: Vec::new(),
+            #[cfg(feature = "cuda")]
+            fill_per_step: std::env::var("LEGION_DEBUG_RAM_FILL_LAYERS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(RAM_FILL_LAYERS),
+            #[cfg(feature = "cuda")]
+            eager_tails: std::env::var_os("LEGION_DEBUG_REFILL_TAILS_EAGER")
+                .is_some_and(|v| v == "1"),
             stage_limit: cfg.stage_below.unwrap_or(usize::MAX),
             ring: cfg.ring.max(super::PREFILL_RING),
             stage_pieces: cfg.stage_pieces,
@@ -3378,15 +3406,18 @@ impl ExpertResidency {
             // The bounded host tier's RAM fill of the refilled layers, now that each layer's
             // mode is known: the bytes only for the slots it keeps.
             let t_fill = std::time::Instant::now();
-            let (mut from_ram, mut fill_skipped) = (0, 0);
-            if let Some((tier, n, t_refill)) = refilled {
-                let below: Vec<usize> = (self.layers.iter().zip(&mode))
-                    .map(|(l, &m)| match l {
-                        Some(l) => fill_below(staging[l.dev], m, l.keep.unwrap_or(0), repack_kept),
-                        None => 0,
-                    })
-                    .collect();
-                (from_ram, fill_skipped) = self.fill_from_ram(&tier, &|il| below[il])?;
+            // With the fills earlier refills planned and after-steps have not copied yet.
+            if let Some((tier, _, _)) = &refilled {
+                self.plan_ram_fill(tier);
+            }
+            let below: Vec<usize> = (self.layers.iter().zip(&mode))
+                .map(|(l, &m)| match l {
+                    Some(l) => fill_below(staging[l.dev], m, l.keep.unwrap_or(0), repack_kept),
+                    None => 0,
+                })
+                .collect();
+            let (from_ram, fill_skipped) = self.copy_planned(None, usize::MAX, &|il| below[il])?;
+            if let Some((_, n, t_refill)) = refilled {
                 tracing::debug!(
                     waited_ms = t_refill.elapsed().as_secs_f64() * 1e3,
                     layers = n,
@@ -3610,9 +3641,23 @@ impl ExpertResidency {
         // Leaving layers drops the staging instead of parking it: its frees and the slots'
         // fresh VRAM on the slot thread broke a CUDA graph the next step captured meanwhile
         // (2 V100s, #814). Done before the next step (once per sequence past the kept blocks).
+        // The bounded host tier's RAM fill is only planned here and copied by the next
+        // after-steps, a few layers each (#37 round 27: ~335 ms of copies blocked the next
+        // decode step of the sequences live meanwhile on a 4090).
         #[cfg(feature = "cuda")]
         if !leave.is_empty() {
-            self.refill(None, true)?;
+            if let Some((tier, n, t0)) = self.refill_backed(None, true)? {
+                self.plan_ram_fill(&tier);
+                tracing::debug!(
+                    waited_ms = t0.elapsed().as_secs_f64() * 1e3,
+                    layers = n,
+                    fill_left = self.planned.len(),
+                    "expert cache refilled"
+                );
+            }
+            if self.settle || self.fill_per_step == 0 {
+                self.copy_planned(None, usize::MAX, &|_| usize::MAX)?;
+            }
         }
         Ok(())
     }
@@ -3890,8 +3935,18 @@ impl ExpertResidency {
                     }
                 }
                 let device = self.devices[l.dev].place.cuda.expect("a CUDA layer");
-                work.push((il, (device, (slots, copies))));
+                // Only its tail was lent (`lend_spread`): it waits for the gate.
+                let tail = l.tail_lent;
+                work.push((il, (device, (tail, (slots, copies)))));
             }
+            // The layers lent whole first, the tails last (in layer order each).
+            work.sort_by_key(|(il, (_, (tail, _)))| (*tail, *il));
+            // The tails wait for a step, unless something waits for the whole refill right
+            // away: a restore that leaves the KV tail's share (`restore_leaving` refills before
+            // the next step), one that was not a lend's, or `settle` (#1165).
+            let defer = was_lent && leave.is_empty() && !self.settle && !self.eager_tails;
+            let gate = Arc::new(TailGate::new(!defer));
+            self.tail_gate = gate.clone();
             // Started by the engine thread: off its core (#250).
             let pin = crate::hw::host_core::off_host_core(&[]);
             let stop = Arc::new(AtomicBool::new(false));
@@ -3913,7 +3968,7 @@ impl ExpertResidency {
                     let done = refill_per_device(by_device(work), |device, work| {
                         crate::hw::host_core::pin_helper(&pin);
                         let freed = take_device(&lent, device).map(|l| l.free(device));
-                        refill_device(device, work, freed, &stop)
+                        refill_device(device, work, freed, &stop, &gate)
                     });
                     // A device with nothing to refill.
                     for (device, l) in lent.into_inner().unwrap_or_else(|e| e.into_inner()) {
@@ -3940,23 +3995,49 @@ impl ExpertResidency {
     /// After [`Self::restore`]: once its thread is done (`wait`: waits for it), points the table
     /// entries of the layers `scope` selects (all: None) at their refilled slots; the other
     /// layers' wait for a call that covers them (nothing to do when no restore is under way).
+    ///
+    /// The bounded host tier's RAM fill of the refilled layers is planned at once (which
+    /// experts go to which slots), but copied a few layers a call ([`Self::copy_planned`]),
+    /// unless the caller waits (`wait`, `settle`).
     #[cfg(feature = "cuda")]
     fn refill(&mut self, scope: Option<&dyn Fn(usize) -> bool>, wait: bool) -> Result<(), String> {
-        let Some((tier, n, t0)) = self.refill_backed(scope, wait)? else {
+        let refilled = self.refill_backed(scope, wait)?;
+        if let Some((tier, _, _)) = &refilled {
+            self.plan_ram_fill(tier);
+        }
+        if refilled.is_none() && self.planned.is_empty() {
             return Ok(());
+        }
+        let t = std::time::Instant::now();
+        let layers = if wait || self.settle || self.fill_per_step == 0 {
+            usize::MAX
+        } else {
+            self.fill_per_step
         };
-        let (from_ram, _) = self.fill_from_ram(&tier, &|_| usize::MAX)?;
-        tracing::debug!(
-            waited_ms = t0.elapsed().as_secs_f64() * 1e3,
-            layers = n,
-            from_ram,
-            "expert cache refilled"
-        );
+        let (from_ram, _) = self.copy_planned(scope, layers, &|_| usize::MAX)?;
+        let fill_ms = t.elapsed().as_secs_f64() * 1e3;
+        if let Some((_, n, t0)) = refilled {
+            tracing::debug!(
+                waited_ms = t0.elapsed().as_secs_f64() * 1e3,
+                layers = n,
+                from_ram,
+                fill_ms,
+                fill_left = self.planned.len(),
+                "expert cache refilled"
+            );
+        } else if from_ram > 0 {
+            tracing::debug!(
+                from_ram,
+                fill_ms,
+                fill_left = self.planned.len(),
+                "expert cache RAM fill"
+            );
+        }
         Ok(())
     }
 
     /// [`Self::refill`] but the bounded host tier's RAM fill: marks the refilled layers
-    /// backed and returns the tiered ones among them (for [`Self::fill_from_ram`]), how many
+    /// backed and returns the tiered ones among them (for [`Self::plan_ram_fill`]), how many
     /// layers it marked and when it started; `None` when no layer was refilled.
     #[cfg(feature = "cuda")]
     fn refill_backed(
@@ -3966,6 +4047,9 @@ impl ExpertResidency {
     ) -> Result<Option<(Vec<usize>, usize, std::time::Instant)>, String> {
         // `settle` (#1165): the next after-step takes the whole refill, not what is done by then.
         let wait = wait || self.settle;
+        // Every caller lets the lent tails go ([`TailGate`]): a step ran (an after-step), the
+        // caller waits for the whole refill, or a lend stopped the thread first.
+        self.tail_gate.open();
         if self
             .restoring
             .as_ref()
@@ -4013,20 +4097,12 @@ impl ExpertResidency {
 
     /// The bounded host tier's fill of refilled layers `tier` ([`Self::refill_backed`]): their
     /// emptied slots take the most routed experts its RAM slots hold (copies over the link, no
-    /// checkpoint read); the swaps bring the others. Only the slots below `below(layer)` get
-    /// the bytes: the others take the same experts as filling, for a [`Self::lend`] that
-    /// empties them right after (it lends them, [`fill_below`]), so the experts it hands back
-    /// are the same as with the copies, which it would throw away (~7 ms a layer on a 4090).
-    /// Returns how many experts it copied and how many it left uncopied.
+    /// checkpoint read); the swaps bring the others. Planned here (the slots filling, so no
+    /// swap plans them meanwhile), copied by [`Self::copy_planned`].
     #[cfg(feature = "cuda")]
-    fn fill_from_ram(
-        &mut self,
-        tier: &[usize],
-        below: &dyn Fn(usize) -> usize,
-    ) -> Result<(usize, usize), String> {
-        let (mut from_ram, mut skipped) = (0, 0);
+    fn plan_ram_fill(&mut self, tier: &[usize]) {
         let Some(h) = self.host.clone() else {
-            return Ok((0, 0));
+            return;
         };
         for &il in tier {
             let in_ram = h.in_ram(il);
@@ -4035,7 +4111,36 @@ impl ExpertResidency {
                 continue;
             };
             let hot: Vec<u32> = ranked.into_iter().filter(|&e| in_ram[e as usize]).collect();
-            let mut fills = l.slots.refill(&hot);
+            let fills = l.slots.refill(&hot);
+            if !fills.is_empty() {
+                self.planned.push((il, fills));
+            }
+        }
+    }
+
+    /// Copies the planned RAM fills ([`Self::plan_ram_fill`]) of at most `layers` layers that
+    /// `scope` selects (all: None), from where the tier holds each expert now. Only the slots
+    /// below `below(layer)` get the bytes: the others stay filling with the same experts, for
+    /// a [`Self::lend`] that empties them right after (it lends them, [`fill_below`]), so the
+    /// experts it hands back are the same as with the copies, which it would throw away (~7 ms
+    /// a layer on a 4090). Returns how many experts it copied and how many it left uncopied.
+    #[cfg(feature = "cuda")]
+    fn copy_planned(
+        &mut self,
+        scope: Option<&dyn Fn(usize) -> bool>,
+        layers: usize,
+        below: &dyn Fn(usize) -> usize,
+    ) -> Result<(usize, usize), String> {
+        let (mut from_ram, mut skipped) = (0, 0);
+        let mut now = Vec::new();
+        for p in std::mem::take(&mut self.planned) {
+            if now.len() < layers && scope.is_none_or(|f| f(p.0)) {
+                now.push(p);
+            } else {
+                self.planned.push(p);
+            }
+        }
+        for (il, mut fills) in now {
             // In slot order: the copies past `below` stay filling until the lend clears them.
             let n = fills.partition_point(|&(s, _)| (s as usize) < below(il));
             skipped += fills.len() - n;
@@ -4049,6 +4154,7 @@ impl ExpertResidency {
             for &(s, _) in &fills {
                 l.slots.complete(s);
             }
+            l.dirty = true;
         }
         Ok((from_ram, skipped))
     }
@@ -4116,6 +4222,8 @@ impl Drop for ExpertResidency {
         // The slot thread maps memory into ranges the tensors below own.
         #[cfg(feature = "cuda")]
         if let Some(thread) = self.restoring.take() {
+            // Tails still waiting for a step: they go now, as the rest.
+            self.tail_gate.open();
             let _ = thread.join();
         }
         let _ = self.sync_copies();
@@ -4586,23 +4694,85 @@ fn stage_footprint(bytes: [usize; 3], ring: usize) -> u64 {
     ring as u64 * bytes.iter().map(|&b| b as u64 + (2 << 20)).sum::<u64>()
 }
 
-/// The slot thread's loop ([`ExpertResidency::restore`]): `refill` gives each layer of `work`
-/// its slots back, in order, until `stop` is set. Layers not reached are left out of the
-/// result: they stay without VRAM and keep their held experts for the next restore.
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+/// [`refill_gated`] with nothing gated.
+#[cfg(test)]
 fn refill_until<W>(
     work: Vec<(usize, W)>,
     stop: &AtomicBool,
+    refill: impl FnMut(W) -> Result<(), String>,
+) -> Vec<(usize, Result<(), String>)> {
+    refill_gated(work, stop, &TailGate::new(true), |_| false, refill)
+}
+
+/// The slot thread's loop ([`ExpertResidency::restore`]): `refill` gives each layer of `work`
+/// its slots back, in order, until `stop` is set. Layers not reached are left out of the
+/// result: they stay without VRAM and keep their held experts for the next restore. The work
+/// from the first item `tail` says on (the lent tails, last in `work`) waits for `gate` to
+/// open first, then goes on unless `stop` was set meanwhile.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn refill_gated<W>(
+    work: Vec<(usize, W)>,
+    stop: &AtomicBool,
+    gate: &TailGate,
+    tail: impl Fn(&W) -> bool,
     mut refill: impl FnMut(W) -> Result<(), String>,
 ) -> Vec<(usize, Result<(), String>)> {
     let mut done = Vec::with_capacity(work.len());
+    let mut waited = false;
     for (il, w) in work {
+        if !waited && tail(&w) {
+            gate.wait();
+            waited = true;
+        }
         if stop.load(Ordering::Relaxed) {
             break;
         }
         done.push((il, refill(w)));
     }
     done
+}
+
+/// Layers of planned RAM fills (the bounded host tier) one after-step copies (#37 round 27):
+/// ~7 ms a layer on an RTX 4090 (~57 experts over PCIe), so ~55 ms a step instead of one
+/// ~335 ms stall for all 48 layers of Qwen3.8-Flash-Next.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+const RAM_FILL_LAYERS: usize = 8;
+
+/// When the slot thread of a restore ([`ExpertResidency::restore`]) gives the lent tails
+/// (`lend_spread`: the slots past [`Layer::keep`]) their VRAM back (#37 round 27). The kept
+/// slots' layers (lent whole) go first, at once; the tails wait until a step runs (an
+/// after-step opens the gate) or something needs the whole refill. A long prompt that comes
+/// before that (back-to-back prompts, or after an idle gap) finds the tails still lent and
+/// has nothing to unmap: on a 4090 the thread re-backed all 48 tails during a 3 s gap and the
+/// next lend unmapped them again (~2 ms a layer each way, 85-101 ms of its lend).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+struct TailGate {
+    open: std::sync::Mutex<bool>,
+    opened: std::sync::Condvar,
+}
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+impl TailGate {
+    fn new(open: bool) -> Self {
+        Self {
+            open: std::sync::Mutex::new(open),
+            opened: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Lets the tails go (a stop set before it is seen by the thread it wakes).
+    fn open(&self) {
+        *self.open.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.opened.notify_all();
+    }
+
+    /// Blocks until [`Self::open`].
+    fn wait(&self) {
+        let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        while !*open {
+            open = self.opened.wait(open).unwrap_or_else(|e| e.into_inner());
+        }
+    }
 }
 
 /// The work of [`refill_per_device`]: per device, its layers (in their order) with their work.
@@ -5138,20 +5308,23 @@ impl Lent {
     }
 }
 
-/// Gives one device's layers their VRAM and experts back, in order, until `stop` ([`refill_until`]),
+/// Gives one device's layers their VRAM and experts back, in order, until `stop` ([`refill_gated`]),
 /// on a copy stream of the device's own; waits for the copies before it reports. `free_ms`: how
 /// long freeing the device's staging took first (for the log).
 #[cfg(feature = "cuda")]
 fn refill_device(
     device: usize,
-    work: Vec<(usize, SlotWork)>,
+    work: Vec<(usize, (bool, SlotWork))>,
     free_ms: Option<f64>,
     stop: &AtomicBool,
+    gate: &TailGate,
 ) -> Vec<(usize, Result<(), String>)> {
     let t0 = std::time::Instant::now();
     let mut copier: Option<super::cuda::Copier> = None;
     let (mut map_ms, mut map_max_ms) = (0f64, 0f64);
-    let mut done = refill_until(work, stop, |(slots, copies)| {
+    let tails = work.iter().filter(|(_, (tail, _))| *tail).count();
+    let tail = |w: &(bool, SlotWork)| w.0;
+    let mut done = refill_gated(work, stop, gate, tail, |(_, (slots, copies))| {
         let t = std::time::Instant::now();
         slots.iter().try_for_each(|s| s.reback())?;
         let ms = t.elapsed().as_secs_f64() * 1e3;
@@ -5178,6 +5351,7 @@ fn refill_device(
     tracing::debug!(
         device,
         layers = done.len(),
+        tails,
         free_ms = free_ms.unwrap_or(0.0),
         ms = ms(t0.elapsed()),
         map_ms,

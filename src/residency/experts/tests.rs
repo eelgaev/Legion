@@ -2,10 +2,63 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Barrier, Mutex};
 
 use super::{
-    by_device, move_runs, per_device_thread, pick_cover, pick_parts, piece_groups, plan_staging,
-    refill_per_device, refill_until, run_rows, runs_of, stage_width, stages_all, stages_entry,
-    take_device,
+    TailGate, by_device, move_runs, per_device_thread, pick_cover, pick_parts, piece_groups,
+    plan_staging, refill_gated, refill_per_device, refill_until, run_rows, runs_of, stage_width,
+    stages_all, stages_entry, take_device,
 };
+
+/// #37 round 27: the layers lent whole are refilled at once; the lent tails wait for the
+/// gate (a step), then go on.
+#[test]
+fn a_gated_refill_does_the_tails_once_the_gate_opens() {
+    let stop = AtomicBool::new(false);
+    let gate = TailGate::new(false);
+    let seen = Mutex::new(Vec::new());
+    let work = vec![
+        (0, (false, 'a')),
+        (2, (false, 'b')),
+        (1, (true, 'c')),
+        (3, (true, 'd')),
+    ];
+    let tail = |w: &(bool, char)| w.0;
+    let done = std::thread::scope(|s| {
+        let t = s.spawn(|| {
+            refill_gated(work, &stop, &gate, tail, |w| {
+                seen.lock().unwrap().push(w.1);
+                Ok(())
+            })
+        });
+        // The whole layers go before the gate opens; the tails wait.
+        while seen.lock().unwrap().len() < 2 {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(*seen.lock().unwrap(), ['a', 'b']);
+        gate.open();
+        t.join().unwrap()
+    });
+    assert_eq!(*seen.lock().unwrap(), ['a', 'b', 'c', 'd']);
+    let layers: Vec<usize> = done.iter().map(|d| d.0).collect();
+    assert_eq!(layers, [0, 2, 1, 3]);
+}
+
+/// A lend while the tails wait (back-to-back prompts, or an idle gap): it sets the stop, then
+/// opens the gate; the tails stay lent and are not reported.
+#[test]
+fn a_lend_while_the_tails_wait_leaves_them_lent() {
+    let stop = AtomicBool::new(false);
+    let gate = TailGate::new(false);
+    let work = vec![(0, (false, ())), (1, (true, ())), (2, (true, ()))];
+    let tail = |w: &(bool, ())| w.0;
+    let done = std::thread::scope(|s| {
+        let t = s.spawn(|| refill_gated(work, &stop, &gate, tail, |_| Ok(())));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        stop.store(true, Ordering::Relaxed);
+        gate.open();
+        t.join().unwrap()
+    });
+    assert_eq!(done, vec![(0, Ok(()))]);
+}
 
 #[test]
 fn refill_runs_every_layer_in_order_unless_stopped() {
