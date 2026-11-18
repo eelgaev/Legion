@@ -82,6 +82,10 @@ struct legion_fp8_mm8 {
     // into an FMA): dst then holds the bits of the plain matmul followed by ggml's add. Taken by
     // the large-batch GEMM only (more than 64 tokens on E4M3 tensor cores); null: none.
     const float * res;
+    // The TMA-fed large-batch GEMM's kernel variant (#1133 r15, for A/B runs and
+    // `legion fp8-gemm-bench`): 0 the default; the low byte a8t's V_* variant, bits 8-11 its
+    // P_* probes (outputs not the GEMM's). Other GEMMs ignore it.
+    int32_t variant;
 };
 int legion_fp8_quant_launch(const float * x, int64_t x_ld, uint8_t * out, int64_t k, int64_t n,
                             const float * scale, void * stream);
@@ -612,7 +616,7 @@ constexpr int64_t GEMM8_STAGGER_NS_PER_K = 20;
 
 // fp8_gemm8_tma where the device and the operands allow it (4 warps: and two CTAs fit an SM);
 // false: not launched.
-template <bool RES, class C>
+template <bool RES, class C, int V = 0>
 bool launch_gemm8_tma(const legion_fp8_mm8 & p, cudaStream_t st) {
     constexpr size_t SMEM = gemm8_tma_smem<C>();
     static_assert(SMEM <= 99 * 1024, "shared memory");
@@ -629,7 +633,7 @@ bool launch_gemm8_tma(const legion_fp8_mm8 & p, cudaStream_t st) {
     int8_t ok = image_ok[dev].load(std::memory_order_relaxed);
     if (ok == 0) {
         cudaFuncAttributes attr;
-        const bool sm90 = cudaFuncGetAttributes(&attr, fp8_gemm8_tma<RES, C>) == cudaSuccess &&
+        const bool sm90 = cudaFuncGetAttributes(&attr, fp8_gemm8_tma<RES, C, V>) == cudaSuccess &&
                           attr.binaryVersion >= 90 && attr.ptxVersion >= 90;
         ok = sm90 ? 1 : -1;
         image_ok[dev].store(ok, std::memory_order_relaxed);
@@ -642,7 +646,7 @@ bool launch_gemm8_tma(const legion_fp8_mm8 & p, cudaStream_t st) {
         return false;
     }
     static std::atomic<int8_t> opted_in[GGML_CUDA_MAX_DEVICES];
-    if (!legion_device::smem_opt_in(opted_in, fp8_gemm8_tma<RES, C>, (int) SMEM)) {
+    if (!legion_device::smem_opt_in(opted_in, fp8_gemm8_tma<RES, C, V>, (int) SMEM)) {
         return false;
     }
     a8t::Stagger stagger;
@@ -654,9 +658,9 @@ bool launch_gemm8_tma(const legion_fp8_mm8 & p, cudaStream_t st) {
         if (two == 0) {
             int per_sm = 0;
             const bool fits =
-                cudaFuncSetAttribute(fp8_gemm8_tma<RES, C>, cudaFuncAttributePreferredSharedMemoryCarveout, 100) ==
+                cudaFuncSetAttribute(fp8_gemm8_tma<RES, C, V>, cudaFuncAttributePreferredSharedMemoryCarveout, 100) ==
                     cudaSuccess &&
-                cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, fp8_gemm8_tma<RES, C>, 32 * C::WARPS, SMEM) ==
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, fp8_gemm8_tma<RES, C, V>, 32 * C::WARPS, SMEM) ==
                     cudaSuccess &&
                 per_sm >= 2;
             two = fits ? 1 : -1;
@@ -669,8 +673,32 @@ bool launch_gemm8_tma(const legion_fp8_mm8 & p, cudaStream_t st) {
         stagger.ns   = (uint32_t) (GEMM8_STAGGER_NS_PER_K * p.k / stagger.ctas);
     }
     const dim3 grid((unsigned) ((p.n + a8::BN - 1) / a8::BN), (unsigned) ((p.m + C::TM - 1) / C::TM));
-    fp8_gemm8_tma<RES, C><<<grid, 32 * C::WARPS, SMEM, st>>>(p, maps, stagger);
+    fp8_gemm8_tma<RES, C, V><<<grid, 32 * C::WARPS, SMEM, st>>>(p, maps, stagger);
     return true;
+}
+
+// launch_gemm8_tma with p.variant's kernel (a8t's V_* and P_*; an unknown one: the default).
+template <bool RES, class C>
+bool launch_gemm8_tma_v(const legion_fp8_mm8 & p, cudaStream_t st) {
+    switch (p.variant) {
+        case a8t::V_EPI: return launch_gemm8_tma<RES, C, a8t::V_EPI>(p, st);
+        case a8t::V_EARLY: return launch_gemm8_tma<RES, C, a8t::V_EARLY>(p, st);
+        case a8t::V_BOTH: return launch_gemm8_tma<RES, C, a8t::V_BOTH>(p, st);
+        case a8t::V_WIDE:
+            if constexpr (C::WARPS == 8) {
+                return launch_gemm8_tma<RES, C, a8t::V_BOTH>(p, st);
+            } else {
+                return launch_gemm8_tma<RES, C>(p, st);
+            }
+        case a8t::P_NO_STORE: return launch_gemm8_tma<RES, C, a8t::P_NO_STORE>(p, st);
+        case a8t::P_NO_MMA: return launch_gemm8_tma<RES, C, a8t::P_NO_MMA>(p, st);
+        case a8t::P_NO_LDSM: return launch_gemm8_tma<RES, C, a8t::P_NO_LDSM>(p, st);
+        case a8t::P_NO_MMA | a8t::P_NO_LDSM: return launch_gemm8_tma<RES, C, a8t::P_NO_MMA | a8t::P_NO_LDSM>(p, st);
+        case a8t::P_NO_REFILL: return launch_gemm8_tma<RES, C, a8t::P_NO_REFILL>(p, st);
+        case a8t::P_NO_REFILL | a8t::P_NO_STORE:
+            return launch_gemm8_tma<RES, C, a8t::P_NO_REFILL | a8t::P_NO_STORE>(p, st);
+        default: return launch_gemm8_tma<RES, C>(p, st);
+    }
 }
 
 // The large-batch GEMM: 256-row tiles (WM 4) where their rows divide m and they make at least
@@ -696,11 +724,18 @@ void launch_gemm8(const legion_fp8_mm8 & p, cudaStream_t st) {
     if (p.m % 256 == 0 && wide_tiles >= GEMM8_WIDE_WAVES * sm_count()) {
         if (p.k % 128 == 0) {
             if constexpr (RES) {
-                if (launch_gemm8_tma<RES, a8::Cfg<2, 3, 64, true, 4>>(p, st)) {
+                if (launch_gemm8_tma_v<RES, a8::Cfg<2, 3, 64, true, 4>>(p, st)) {
                     return;
                 }
             }
-            if (!launch_gemm8_tma<RES, a8::Cfg<4, 2, 128, true>>(p, st)) {
+            // With the residual this tile is only the fallback: no variants.
+            bool tma;
+            if constexpr (RES) {
+                tma = launch_gemm8_tma<RES, a8::Cfg<4, 2, 128, true>>(p, st);
+            } else {
+                tma = launch_gemm8_tma_v<RES, a8::Cfg<4, 2, 128, true>>(p, st);
+            }
+            if (!tma) {
                 launch_gemm8_w<RES, a8::Cfg<4, 2, 128, true>>(p, st);
             }
         } else {

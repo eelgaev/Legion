@@ -711,6 +711,38 @@ unsafe fn cuda_fp8_mm(
     launch(stream)
 }
 
+/// A TMA-fed W8A8 GEMM variant forced by [`force_gemm_variant`]; 0 is none.
+#[cfg(feature = "cuda")]
+static FORCED_GEMM_VARIANT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Launches every TMA-fed W8A8 prefill GEMM from now on with kernel `variant`
+/// (`legion_fp8_mm8`'s `variant`: 1 the default kernel by name, 2 and up one change; bits 8-11
+/// probes whose outputs are not the GEMM's), or the default choice for 0: for
+/// `legion fp8-gemm-bench`.
+#[doc(hidden)]
+pub fn force_gemm_variant(variant: i32) {
+    #[cfg(feature = "cuda")]
+    FORCED_GEMM_VARIANT.store(variant, Ordering::Relaxed);
+    #[cfg(not(feature = "cuda"))]
+    let _ = variant;
+}
+
+/// The TMA-fed W8A8 GEMM's kernel variant: a forced one, else `LEGION_DEBUG_FP8_GEMM_VARIANT`
+/// (a number, for A/B runs), else 0 (the default).
+#[cfg(feature = "cuda")]
+fn gemm_variant() -> i32 {
+    static ENV: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    match FORCED_GEMM_VARIANT.load(Ordering::Relaxed) {
+        0 => *ENV.get_or_init(|| {
+            std::env::var("LEGION_DEBUG_FP8_GEMM_VARIANT")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0)
+        }),
+        v => v,
+    }
+}
+
 #[cfg(feature = "cuda")]
 #[repr(C)]
 struct LaunchParams8 {
@@ -725,6 +757,7 @@ struct LaunchParams8 {
     scale_stride: i64,
     wscale_stride: i64,
     res: *const f32,
+    variant: i32,
 }
 
 #[cfg(feature = "cuda")]
@@ -853,6 +886,7 @@ unsafe fn cuda_fp8_mm8(
             } else {
                 std::ptr::null()
             },
+            variant: gemm_variant(),
         }
     };
     // `--hopper-gemm` (untested on hardware): prompt GEMMs on the Hopper wgmma kernels where
