@@ -66,6 +66,12 @@ the same output; two servers, 2 rounds each): 8K 2,697, 32K 2,309 and 123K 1,438
 16 users 235.2 (227.5-244.0). Greedy text at 8 or more users changes (other
 drafts, other verify shapes), and so does a prompt longer than 4,096 tokens (other step sums). Below 8 users,
 and for prompts up to 4,096 tokens, the output is the same as without the flags.
+With the FP8 prompt-step GEMMs' streaming epilogue (2026-11-18, default, the same output; one binary, the old
+epilogue by `LEGION_DEBUG_FP8_STREAM_EPI=0`, off / on / on / off, one server each): 8K 2,843 / 2,826 against
+2,733 / 2,733 (three prompts of 8K: 2,826-2,863 against 2,733-2,803), 32K 2,466 / 2,460 against 2,420 / 2,421,
+123K 1,548 / 1,546 against 1,529 / 1,527. Decode does not use these GEMMs: 1 user 35.4 / 35.6 against
+35.4 / 35.5 (the same tokens), 4 users 101.5 / 100.0 against 98.7 / 102.4, 16 users 249.5 / 233.1 against
+242.6 / 234.5.
 
 ## What each flag does
 

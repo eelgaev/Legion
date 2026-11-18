@@ -711,6 +711,37 @@ unsafe fn cuda_fp8_mm(
     launch(stream)
 }
 
+/// A TMA-fed W8A8 GEMM epilogue forced by [`force_gemm_variant`]; 0 is none.
+#[cfg(feature = "cuda")]
+static FORCED_GEMM_VARIANT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Launches every TMA-fed W8A8 prefill GEMM from now on with epilogue `variant`
+/// (`legion_fp8_mm8`'s `variant`: 1 the plain epilogue, 2 and 3 the streaming one with one or
+/// two token tiles at a time, 0x100 the pick without the streaming route), or the default
+/// choice for 0: for `legion fp8-gemm-bench`.
+#[doc(hidden)]
+pub fn force_gemm_variant(variant: i32) {
+    #[cfg(feature = "cuda")]
+    FORCED_GEMM_VARIANT.store(variant, Ordering::Relaxed);
+    #[cfg(not(feature = "cuda"))]
+    let _ = variant;
+}
+
+/// The TMA-fed W8A8 GEMM's epilogue variant: a forced one, else 0x100 under
+/// `LEGION_DEBUG_FP8_STREAM_EPI=0` (no GEMM takes #1133 r25's streaming epilogue), else 0
+/// (the default: the routed GEMMs take it).
+#[cfg(feature = "cuda")]
+fn gemm_variant() -> i32 {
+    static ENV: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    match FORCED_GEMM_VARIANT.load(Ordering::Relaxed) {
+        0 => *ENV.get_or_init(|| {
+            let off = std::env::var_os("LEGION_DEBUG_FP8_STREAM_EPI").is_some_and(|v| v == "0");
+            if off { 0x100 } else { 0 }
+        }),
+        v => v,
+    }
+}
+
 #[cfg(feature = "cuda")]
 #[repr(C)]
 struct LaunchParams8 {
@@ -725,6 +756,7 @@ struct LaunchParams8 {
     scale_stride: i64,
     wscale_stride: i64,
     res: *const f32,
+    variant: i32,
 }
 
 #[cfg(feature = "cuda")]
@@ -853,6 +885,7 @@ unsafe fn cuda_fp8_mm8(
             } else {
                 std::ptr::null()
             },
+            variant: gemm_variant(),
         }
     };
     // `--hopper-gemm` (untested on hardware): prompt GEMMs on the Hopper wgmma kernels where
