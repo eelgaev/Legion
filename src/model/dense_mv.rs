@@ -574,6 +574,26 @@ pub fn mul_mat<'a>(ctx: &'a Context, ws: &[Tensor<'a>], x: Tensor<'a>) -> Vec<Te
         .collect()
 }
 
+/// The parameter of a [`mul_mat_spread`] node that spreads its row tiles over clusters.
+const P_SPREAD: usize = 6;
+
+/// [`mul_mat`] of one weight whose few row tiles spread over thread-block clusters as
+/// [`set_split`] would have every launch do (#1176: a hyper-connection mixer's down matrix split
+/// over tensor-parallel ranks, 160 rows a rank): the same bits.
+pub fn mul_mat_spread<'a>(ctx: &'a Context, w: Tensor<'a>, x: Tensor<'a>) -> Tensor<'a> {
+    assert!(chain_count(&[w], x) == Some(0), "dense_mv: shapes");
+    let mut params = [0i32; P_SPREAD + 1];
+    params[P_SPREAD] = 1;
+    let n = x.ne()[1];
+    ctx.external_with(
+        &DENSE_MV,
+        types::F32,
+        [w.ne()[1], n, 1, 1],
+        &[x, w],
+        &params,
+    )
+}
+
 /// The `[m, n]` result of weight `i` of a node made by [`mul_mat`]: its offset in `dst.data`.
 fn out_offset(dst: &ffi::ggml_tensor, i: usize) -> usize {
     // SAFETY: a node made by `mul_mat`: src[0] the input, src[1..] the weights.
@@ -735,7 +755,7 @@ mod cuda {
                         .filter(|&i| (*dst.src[1 + i]).ne[1] % 32 != 0)
                         .count() as i32
                 },
-                split: i32::from(SPLIT.load(Ordering::Relaxed)),
+                split: i32::from(SPLIT.load(Ordering::Relaxed) || params[P_SPREAD] != 0),
                 warps: 0,
                 // Wide chains: the order of `mul_mat_wide_chain_order`'s node.
                 kslice: params[1],

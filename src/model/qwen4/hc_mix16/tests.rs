@@ -465,3 +465,101 @@ fn cuda_hc_pre_is_ggml_bit_for_bit() {
         assert_eq!(diff, 0, "{e} x {n}: {diff} bytes moved");
     }
 }
+
+/// [`hc_pre`] of `n` tokens of `e` columns and 4 streams, and [`hc_pre_part`] of each of
+/// `ranks` row ranges (each stream's gate rows its own tensor) on `backend`: the bits of both,
+/// the parts in place.
+fn part_case(backend: &mut Backend, e: i64, n: i64, ranks: i64) -> (Vec<u32>, Vec<u32>) {
+    let hc = 4;
+    let eh = e / ranks;
+    let ctx = Context::new(64, 64);
+    let gate = ctx.new_tensor(types::F32, &[hc * e, n]).as_input();
+    let xn = ctx.new_tensor(types::F32, &[hc * e, n]).as_input();
+    let (x3, g3) = (ctx.reshape_3d(xn, e, hc, n), ctx.reshape_3d(gate, e, hc, n));
+    let whole = ctx.cont(hc_pre(&ctx, x3, g3, 1.0 / hc as f32)).as_output();
+    let parts: Vec<_> = (0..ranks)
+        .map(|r| {
+            // Stream c's rows r · eh.. of every token, contiguous.
+            let gates: Vec<_> = (0..hc)
+                .map(|c| {
+                    let at = ((c * e + r * eh) * 4) as usize;
+                    ctx.cont(ctx.view_2d(gate, [eh, n], gate.nb()[1], at))
+                })
+                .collect();
+            hc_pre_part(&ctx, xn, &gates, r * eh, 1.0 / hc as f32).as_output()
+        })
+        .collect();
+    let mut graph = ctx.new_graph(64);
+    graph.expand(whole);
+    for &p in &parts {
+        graph.expand(p);
+    }
+    ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+        .unwrap();
+    let mut g = noise((hc * e * n) as usize, 93);
+    g.iter_mut().step_by(5).for_each(|v| *v *= 30.0);
+    gate.set_f32(&g);
+    xn.set_f32(&noise((hc * e * n) as usize, 94));
+    backend.compute(&graph).unwrap();
+    let bits = |v: Vec<f32>| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+    let mut placed = vec![0u32; (e * n) as usize];
+    for (r, p) in parts.iter().enumerate() {
+        let v = bits(p.to_f32());
+        for t in 0..n as usize {
+            for i in 0..eh as usize {
+                placed[t * e as usize + r * eh as usize + i] = v[t * eh as usize + i];
+            }
+        }
+    }
+    (bits(whole.to_f32()), placed)
+}
+
+/// Every rank's rows of the mix are the whole mix's rows, bit for bit, on the CPU.
+#[test]
+fn cpu_hc_pre_parts_are_the_whole_mix() {
+    let mut cpu = Backend::cpu().unwrap();
+    cpu.set_threads(3);
+    for (e, n, ranks) in [(64, 3, 2), (2560, 12, 2), (96, 1, 3)] {
+        let (whole, parts) = part_case(&mut cpu, e, n, ranks);
+        assert_eq!(whole, parts, "{e} x {n}, {ranks} ranks");
+    }
+}
+
+/// The node: `[eh, n]` F32, `xn` and the gates its sources in order.
+#[test]
+fn hc_pre_part_node_shape() {
+    let ctx = Context::new(16, 16);
+    let xn = ctx.new_tensor(types::F32, &[4 * 64, 3]);
+    let gates: Vec<_> = (0..4)
+        .map(|_| ctx.new_tensor(types::F32, &[32, 3]))
+        .collect();
+    let p = hc_pre_part(&ctx, xn, &gates, 32, 0.25);
+    assert_eq!(p.ne(), [32, 3, 1, 1]);
+    assert_eq!(p.ty(), types::F32);
+    // SAFETY: live nodes of `ctx`.
+    unsafe {
+        let d = &*p.raw();
+        assert_eq!(d.src[0], xn.raw());
+        for (c, g) in gates.iter().enumerate() {
+            assert_eq!(d.src[1 + c], g.raw());
+        }
+    }
+}
+
+/// On any CUDA GPU the parts are the whole op's rows bit for bit (the four-a-thread kernel's
+/// sums at qwen4exp's shape, decode and verify step sizes).
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_hc_pre_parts_are_the_whole_mix() {
+    use crate::ggml::{DeviceKind, device_by_kind};
+    let mut gpu = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU device")
+        .init()
+        .unwrap();
+    for n in [2, 3, 12, 16] {
+        let (whole, parts) = part_case(&mut gpu, 2560, n, 2);
+        assert_eq!(whole, parts, "2560 x {n}");
+    }
+}

@@ -133,6 +133,146 @@ pub(super) fn hc_pre<'a>(
     )
 }
 
+static HC_PRE_PART: ExternalOp = ExternalOp {
+    name: "hc_pre_part",
+    cpu: cpu_hc_pre_part,
+    #[cfg(feature = "cuda")]
+    cuda: Some(cuda_hc_pre_part),
+    #[cfg(not(feature = "cuda"))]
+    cuda: None,
+};
+
+/// One rank's rows of [`hc_pre`] when the up matmul is split over tensor-parallel ranks (#1176):
+/// `xn` the normed streams (F32 `[e · hc, n]` contiguous, all of them) and `gates` each stream's
+/// gate rows `first..first + eh` (F32 `[eh, n]` contiguous each, in stream order);
+/// `mixed[first..first + eh]`, F32 `[eh, n]`, with the bits of [`hc_pre`]'s values there (the
+/// same expressions in the same order).
+pub(super) fn hc_pre_part<'a>(
+    ctx: &'a Context,
+    xn: Tensor<'a>,
+    gates: &[Tensor<'a>],
+    first: i64,
+    scale: f32,
+) -> Tensor<'a> {
+    let hc = gates.len() as i64;
+    assert!((1..=4).contains(&hc), "hc_pre_part: 1 to 4 streams");
+    let [eh, n, _, _] = gates[0].ne();
+    let [k, xn_n, _, _] = xn.ne();
+    assert_eq!(xn_n, n, "hc_pre_part: tokens");
+    assert!(k % hc == 0 && first + eh <= k / hc, "hc_pre_part: rows");
+    for t in gates.iter().chain([&xn]) {
+        assert_eq!(t.ty(), types::F32, "hc_pre_part: F32 operands");
+        assert!(t.is_contiguous(), "hc_pre_part: contiguous operands");
+    }
+    for g in gates {
+        assert_eq!(g.ne(), [eh, n, 1, 1], "hc_pre_part: gate shapes");
+    }
+    let mut src = vec![xn];
+    src.extend_from_slice(gates);
+    let p = |v: i64| i32::try_from(v).expect("hc_pre_part: sizes");
+    ctx.external_with(
+        &HC_PRE_PART,
+        types::F32,
+        [eh, n, 1, 1],
+        &src,
+        &[scale.to_bits() as i32, p(hc), p(first)],
+    )
+}
+
+/// A [`hc_pre_part`] node's operands: `xn`, the gates, `(e, eh, n, first)` and the scale.
+///
+/// # Safety
+/// `dst` is a node made by [`hc_pre_part`].
+unsafe fn part_operands(
+    dst: &ffi::ggml_tensor,
+) -> (
+    *const ffi::ggml_tensor,
+    Vec<*const ffi::ggml_tensor>,
+    (usize, usize, usize, usize),
+    f32,
+) {
+    let params = crate::ggml::external_params(dst);
+    let hc = params[1] as usize;
+    // SAFETY: the caller's: `1 + hc` live sources.
+    let xn = dst.src[0] as *const ffi::ggml_tensor;
+    let gates = (1..=hc)
+        .map(|c| dst.src[c] as *const ffi::ggml_tensor)
+        .collect();
+    let k = unsafe { (*xn).ne[0] as usize };
+    let shape = (
+        k / hc,
+        dst.ne[0] as usize,
+        dst.ne[1] as usize,
+        params[2] as usize,
+    );
+    (xn, gates, shape, f32::from_bits(params[0] as u32))
+}
+
+unsafe fn cpu_hc_pre_part(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
+    // SAFETY: a node made by `hc_pre_part`, host tensors. `cpu_hc_mix16`'s sums on the rows.
+    unsafe {
+        let (xn, gates, (e, eh, n, first), scale) = part_operands(dst);
+        let hc = gates.len();
+        let xp = ((*xn).data as *const f32).add(first);
+        let gp: Vec<*const f32> = gates.iter().map(|g| (**g).data as *const f32).collect();
+        let out = dst.data as *mut f32;
+        for t in (ith..n).step_by(nth) {
+            for i in 0..eh {
+                let mut sum = 0f32;
+                for (c, g) in gp.iter().enumerate() {
+                    let xv = *xp.add(t * e * hc + c * e + i);
+                    sum += xv * (1.0 / (1.0 + (-*g.add(t * eh + i)).exp()));
+                }
+                *out.add(t * eh + i) = scale * sum;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[repr(C)]
+struct HcPrePart {
+    gate: [*const f32; 4],
+    xn: *const f32,
+    mixed: *mut f32,
+    e: i64,
+    eh: i64,
+    hc: i64,
+    n: i64,
+    scale: f32,
+}
+
+#[cfg(feature = "cuda")]
+unsafe extern "C" {
+    fn legion_hc_pre_part_launch(p: *const HcPrePart, stream: *mut c_void) -> i32;
+}
+
+#[cfg(feature = "cuda")]
+unsafe fn cuda_hc_pre_part(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
+    // SAFETY: a node made by `hc_pre_part`, device tensors of the stream's device.
+    unsafe {
+        let (xn, gates, (e, eh, n, first), scale) = part_operands(dst);
+        let mut gate = [std::ptr::null::<f32>(); 4];
+        for (g, t) in gate.iter_mut().zip(&gates) {
+            *g = (**t).data as *const f32;
+        }
+        let p = HcPrePart {
+            gate,
+            xn: ((*xn).data as *const f32).add(first),
+            mixed: dst.data as *mut f32,
+            e: e as i64,
+            eh: eh as i64,
+            hc: gates.len() as i64,
+            n: n as i64,
+            scale,
+        };
+        match legion_hc_pre_part_launch(&p, stream) {
+            0 => Ok(()),
+            e => Err(format!("hc_pre_part: error {e}")),
+        }
+    }
+}
+
 /// A node's gate, its `xn` (or streams) and `(e, n)`: [`hc_pre`]'s (param 3 set: `[x, gate]`,
 /// ggml's order, `[e, hc, n]` both) or the others' (`[gate, xn or res, ..]`, `[hc · e, n]`).
 ///

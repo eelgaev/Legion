@@ -123,7 +123,8 @@ impl Model {
                     Some((out, inject[j]))
                 }
             };
-            let (res, h, inject) = self.hc_mix_after(ctx, st.res[j], pending, prefix, false)?;
+            let (res, h, inject) =
+                self.hc_mix_after(ctx, st.res[j], pending, prefix, false, None)?;
             st.res[j] = res;
             let g = micro::all_gather_start(ctx, st.comm, h, st.n, j, compact);
             Self::add(pass, g.node);

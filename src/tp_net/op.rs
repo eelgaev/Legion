@@ -112,6 +112,16 @@ pub(super) mod cuda {
         n: i64,
     }
 
+    /// `tp_rows_args` of `src/cuda/tp_net.cu`.
+    #[repr(C)]
+    struct RowsArgs {
+        src: [*const f32; super::super::MAX_RANKS],
+        dst: *mut f32,
+        piece: i64,
+        cols: i64,
+        n_src: i32,
+    }
+
     unsafe extern "C" {
         /// The kernels as the CUDA runtime knows them (their host stubs): the F32 sum, the sum
         /// of BF16 partials (also the BF16 to F32 copy, with one source) and the BF16 rounding.
@@ -120,6 +130,8 @@ pub(super) mod cuda {
         static legion_tp_net_pack_bf16_kernel: *const c_void;
         /// The BF16 copy of an all-gather with a BF16 output (#1176).
         static legion_tp_net_copy_bf16_kernel: *const c_void;
+        /// The row all-gather's copy (#1176).
+        static legion_tp_net_gather_rows_kernel: *const c_void;
         fn cudaLaunchKernel(
             func: *const c_void,
             grid: Dim3,
@@ -386,6 +398,9 @@ pub(super) mod cuda {
         /// source (the send buffer keeps each value at its offset there), an all-gather's output.
         span: usize,
         wire: Wire,
+        /// A row all-gather (`seq_par::all_gather_rows`): every rank's piece's rows and the
+        /// output's columns.
+        rows: Option<(usize, usize)>,
         /// Per rank: its piece `(first value, values)` of the source (all-reduce,
         /// reduce-scatter) or of the output (all-gather).
         pieces: Vec<(usize, usize)>,
@@ -411,10 +426,17 @@ pub(super) mod cuda {
         let n_ranks = comm.n_ranks();
         // The full tensor: the same on every rank, so the type on the wire is, and the buffers
         // grow at the same exchange.
+        // A row all-gather (`seq_par::all_gather_rows`) is a gather of one column a rank, each
+        // rank's whole piece, put in place row-wise by `finish`.
+        let rows = match kind {
+            Kind::AllGather => crate::tp_net::seq_par::rows_of(dst),
+            _ => 0,
+        };
         let (row, cols) = match kind {
             // SAFETY: the caller's.
             Kind::AllReduce => unsafe { (ffi::ggml_nelements(dst) as usize, 1) },
             Kind::ReduceScatter => (src.ne[0] as usize, src.ne[1] as usize),
+            Kind::AllGather if rows > 0 => (rows * dst.ne[1] as usize, n_ranks),
             Kind::AllGather => (dst.ne[0] as usize, dst.ne[1] as usize),
         };
         let full = row * cols;
@@ -435,11 +457,13 @@ pub(super) mod cuda {
             .collect();
         // An I32 all-gather (`seq_par::all_gather_i32`) copies its 4-byte values as they are:
         // the F32 wire's plain copies, whatever `--tp-wire` says.
-        let exact = kind == Kind::AllGather && dst.type_ == crate::ggml::types::I32;
+        // So does a row all-gather.
+        let exact = kind == Kind::AllGather && (dst.type_ == crate::ggml::types::I32 || rows > 0);
         Plan {
             kind,
             span: full,
             wire: if exact { Wire::F32 } else { comm.wire(full) },
+            rows: (rows > 0).then(|| (rows, dst.ne[1] as usize)),
             pieces,
             pack_whole: true,
             out_bf16: kind == Kind::AllGather && dst.type_ == crate::ggml::types::BF16,
@@ -474,6 +498,7 @@ pub(super) mod cuda {
             span: row * cols,
             // As the plain exchange of the step's whole tensor.
             wire: comm.wire(row * m.n),
+            rows: None,
             pieces,
             pack_whole: false,
             out_bf16: false,
@@ -608,6 +633,32 @@ pub(super) mod cuda {
         let mut argv = [(&raw mut args).cast::<c_void>()];
         // SAFETY: the caller's.
         unsafe { launch_1d(legion_tp_net_copy_bf16_kernel, &mut argv, n, stream) }
+    }
+
+    /// Copies every rank's piece (`srcs`, rank order, `[piece, cols]` F32 each) into its rows
+    /// of `dst` (`[piece · srcs.len(), cols]`) on `stream`.
+    ///
+    /// # Safety
+    /// Device-readable sources and a device-writable `dst` of those sizes, on `stream`.
+    unsafe fn gather_rows(
+        srcs: &[*const f32],
+        dst: *mut f32,
+        piece: usize,
+        cols: usize,
+        stream: *mut c_void,
+    ) -> Result<(), String> {
+        let mut args = RowsArgs {
+            src: [std::ptr::null(); super::super::MAX_RANKS],
+            dst,
+            piece: piece as i64,
+            cols: cols as i64,
+            n_src: srcs.len() as i32,
+        };
+        args.src[..srcs.len()].copy_from_slice(srcs);
+        let mut argv = [(&raw mut args).cast::<c_void>()];
+        let n = piece * cols * srcs.len();
+        // SAFETY: the caller's; the kernel reads `args` from the launch's copy.
+        unsafe { launch_1d(legion_tp_net_gather_rows_kernel, &mut argv, n, stream) }
     }
 
     /// Rounds `n` F32 values at `src` to BF16 at `dst` on `stream`.
@@ -985,6 +1036,25 @@ pub(super) mod cuda {
         let dst16 = |i: usize| dst + i * 2;
         // SAFETY: as in `start`.
         unsafe {
+            // A row all-gather: every rank's piece, its own from `src`, into its rows of `dst`
+            // in one kernel after the waits (F32 on the wire).
+            if let Some((piece, cols)) = plan.rows {
+                for peer in (0..n_ranks).filter(|&q| q != rank) {
+                    check(
+                        "cuStreamWaitValue32",
+                        cuStreamWaitValue32_v2(stream, fd + recv_flag(peer) as u64, seq, WAIT_GEQ),
+                    )?;
+                }
+                let srcs: Vec<*const f32> = (0..n_ranks)
+                    .map(|r| if r == rank { src_at(0) } else { recv_dev(r) })
+                    .collect();
+                gather_rows(&srcs, dst as *mut f32, piece, cols, stream)?;
+                check(
+                    "cuStreamWriteValue32",
+                    cuStreamWriteValue32_v2(stream, fd + CONSUMED as u64, seq, 0),
+                )?;
+                return Ok(());
+            }
             // An all-gather's own share needs nothing from the peers.
             if kind == Kind::AllGather {
                 if plan.out_bf16 {

@@ -1797,6 +1797,17 @@ impl Model {
         crate::tp_net::seq_par::active(c, n).map(|(rank, ranks)| (c, rank, ranks))
     }
 
+    /// The communicator, this rank and the rank count over machines (`--tp`, not a GPU pair):
+    /// for work the ranks would otherwise mirror, split by rows and gathered (#1176).
+    pub(crate) fn tp_ranks(&self) -> Option<(i32, usize, usize)> {
+        if self.tp_pair.is_some() {
+            return None;
+        }
+        let c = self.tp_comm?;
+        let comm = crate::tp_net::comm(c)?;
+        Some((c, comm.rank(), comm.n_ranks()))
+    }
+
     /// [`Self::tp_sum`], or with `sp` ([`Self::tp_seq_par`]) the sum of this rank's share of
     /// `x`'s columns only.
     pub(crate) fn tp_sum_split<'a>(

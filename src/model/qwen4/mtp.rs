@@ -154,7 +154,7 @@ impl Model {
             n,
         );
 
-        let (x, inject) = self.hc_mix(ctx, res, &format!("blk.{il}.hc_attn"), true, true)?;
+        let (x, inject) = self.hc_mix(ctx, res, &format!("blk.{il}.hc_attn"), true, true, None)?;
         if n_out == 0 {
             // No row gives an output (a prompt's take-in before its last piece): the head is
             // one layer, so its K/V rows are all the pass leaves behind.
@@ -195,7 +195,7 @@ impl Model {
         let attn = self.tp_sum(ctx, attn);
         let gpu = super::hc_chain::on_gpu(w("hc_ffn_up.weight")?);
         let res = self.hc_combine(ctx, res, attn, inject, gpu);
-        let (x, inject) = self.hc_mix(ctx, res, &format!("blk.{il}.hc_ffn"), true, true)?;
+        let (x, inject) = self.hc_mix(ctx, res, &format!("blk.{il}.hc_ffn"), true, true, None)?;
         let ffn = self.tp_sum(
             ctx,
             self.moe(ctx, &pass.tap, &pass.graph, il, x, n, pass.prompt_only())?,
@@ -211,6 +211,7 @@ impl Model {
             &format!("blk.{il}.nextn.hc_head"),
             false,
             false,
+            None,
         )?;
         // Drafts over the first `draft_vocab` tokens only (a view of the head's first rows):
         // the head reads 644 MB per pass over the whole vocabulary on Qwen3.8-Flash-Next.

@@ -544,3 +544,56 @@ fn a_bf16_gather_holds_the_f32_gathers_values() {
         assert!(f32_wire, "rank {r}");
     }
 }
+
+#[test]
+fn place_rows_puts_each_piece_in_its_rows() {
+    // Two ranks' [2, 3] pieces of a [4, 3] tensor.
+    let all: Vec<i32> = (0..12).map(|v| (v as f32).to_bits() as i32).collect();
+    let mut out = vec![0f32; 12];
+    place_rows(&all, &mut out, 2, 4);
+    let want = [0., 1., 6., 7., 2., 3., 8., 9., 4., 5., 10., 11.];
+    assert_eq!(out, want);
+}
+
+#[test]
+fn a_row_gather_copies_every_piece_exactly_on_the_bf16_wire() {
+    // #1176: a mixer's rows split over the ranks; the values travel as they are, though every
+    // other F32 exchange of the size would be rounded to BF16.
+    for n in [2usize, 3] {
+        let (rows, cols) = (6 * n, 5usize);
+        let piece = rows / n;
+        let full: Vec<f32> = values(9, 0, rows * cols)
+            .iter()
+            .map(|v| v * 1.000_123)
+            .collect();
+        let got = on_ranks(n, Wire::Bf16, move |r, c| {
+            let mine: Vec<f32> = (0..cols)
+                .flat_map(|j| full[j * rows + r * piece..j * rows + (r + 1) * piece].to_vec())
+                .collect();
+            let handle = register(c);
+            let mut backend = Backend::cpu().unwrap();
+            backend.set_threads(2);
+            let ctx = Context::new(16, 16);
+            let x = ctx
+                .new_tensor(types::F32, &[piece as i64, cols as i64])
+                .as_input();
+            let y = all_gather_rows(&ctx, handle.id(), x, rows as i64).as_output();
+            let mut graph = ctx.new_graph(16);
+            graph.expand(y);
+            ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+                .unwrap();
+            x.set_f32(&mine);
+            backend.compute(&graph).unwrap();
+            assert!(handle.comm().error().is_none());
+            (y.ne(), y.to_f32())
+        });
+        let full = values(9, 0, rows * cols)
+            .iter()
+            .map(|v| v * 1.000_123)
+            .collect::<Vec<f32>>();
+        for (r, (ne, y)) in got.into_iter().enumerate() {
+            assert_eq!(ne, [rows as i64, cols as i64, 1, 1], "rank {r}");
+            assert_eq!(bits(&y), bits(&full), "rank {r} of {n}");
+        }
+    }
+}

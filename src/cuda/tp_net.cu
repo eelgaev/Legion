@@ -77,6 +77,30 @@ __global__ void tp_copy_bf16(const tp_copy_args a) {
     }
 }
 
+struct tp_rows_args {
+    const float * src[MAX_RANKS];
+    float * dst;
+    int64_t piece;  // rows of every rank's piece
+    int64_t cols;
+    int32_t n_src;
+};
+
+// A row all-gather (#1176, a hyper-connection mixer split by rows): rank r's piece ([piece][cols]
+// of src[r], contiguous) into rows r * piece.. of every column of dst ([cols][piece * n_src]),
+// the values copied as they are.
+__global__ void tp_gather_rows(const tp_rows_args a) {
+    const int64_t per = a.piece * a.cols;
+    const int64_t n = per * a.n_src;
+    const int64_t rows = a.piece * a.n_src;
+    const int64_t stride = (int64_t) gridDim.x * blockDim.x;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        const int64_t r = i / per;
+        const int64_t j = i - r * per;
+        const int64_t c = j / a.piece;
+        a.dst[c * rows + r * a.piece + (j - c * a.piece)] = a.src[r][j];
+    }
+}
+
 }  // namespace
 
 // The kernels as the CUDA runtime knows them (their host stubs), for Rust's cudaLaunchKernel.
@@ -87,3 +111,5 @@ extern "C" const void * const legion_tp_net_pack_bf16_kernel =
     reinterpret_cast<const void *>(&tp_pack_bf16);
 extern "C" const void * const legion_tp_net_copy_bf16_kernel =
     reinterpret_cast<const void *>(&tp_copy_bf16);
+extern "C" const void * const legion_tp_net_gather_rows_kernel =
+    reinterpret_cast<const void *>(&tp_gather_rows);

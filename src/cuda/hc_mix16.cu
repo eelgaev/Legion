@@ -37,6 +37,19 @@ struct legion_hc_mix16 {
 // Launches the kernel on `stream`; returns a cudaError_t.
 int legion_hc_mix16_launch(const legion_hc_mix16 * p, void * stream);
 
+// One rank's rows of the plain hc_pre (#1176, a mixer split over tensor-parallel ranks): the
+// values first..first + eh of every token, each stream's gate rows its own [n][eh] block.
+struct legion_hc_pre_part {
+    const float * gate[4];  // F32 [n][eh] per stream c
+    const float * xn;       // F32 [n][hc][e], at row `first` of stream 0
+    float *       mixed;    // F32 [n][eh]
+    int64_t       e, eh, hc, n;
+    float         scale;
+};
+
+// Launches the part kernel on `stream`; returns a cudaError_t.
+int legion_hc_pre_part_launch(const legion_hc_pre_part * p, void * stream);
+
 }  // extern "C"
 
 namespace {
@@ -104,7 +117,36 @@ __global__ void hc_pre_x4_kernel(const legion_hc_mix16 p) {
     ((float4 *) p.mixed)[t * e4 + i4] = m;
 }
 
+// hc_mix16_kernel<false, false> on one rank's rows: the same expressions in the same order per
+// value, so the bits of the whole op's values there.
+__global__ void hc_pre_part_kernel(const legion_hc_pre_part p) {
+    const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (ir >= p.eh * p.n) {
+        return;
+    }
+    const int64_t i = ir % p.eh;
+    const int64_t t = ir / p.eh;
+    const int64_t k = p.e * p.hc;
+    float sum = 0.0f;
+    for (int64_t c = 0; c < p.hc; ++c) {
+        const float xv = p.xn[t * k + c * p.e + i];
+        const float wv = 1.0f / (1.0f + expf(-p.gate[c][t * p.eh + i]));
+        sum += xv * wv;
+    }
+    p.mixed[t * p.eh + i] = p.scale * sum;
+}
+
 }  // namespace
+
+extern "C" int legion_hc_pre_part_launch(const legion_hc_pre_part * p, void * stream) {
+    if (p->e < 1 || p->eh < 1 || p->n < 1 || p->hc < 1 || p->hc > 4 || p->xn == nullptr) {
+        return (int) cudaErrorInvalidValue;
+    }
+    constexpr int threads = 256;
+    const int64_t blocks = (p->eh * p->n + threads - 1) / threads;
+    hc_pre_part_kernel<<<(unsigned) blocks, threads, 0, (cudaStream_t) stream>>>(*p);
+    return (int) cudaGetLastError();
+}
 
 extern "C" int legion_hc_mix16_launch(const legion_hc_mix16 * p, void * stream) {
     if (p->e < 1 || p->n < 1 || p->hc < 1) {

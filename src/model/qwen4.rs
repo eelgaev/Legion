@@ -30,6 +30,7 @@ pub use hc_chain::set_hc_chain;
 mod hc_mix16;
 pub use hc_mix16::{set_hc_pre, set_mix16, set_rebuild_bf16 as set_mix_rebuild_bf16};
 mod hc_norm;
+mod hc_split;
 pub use hc_norm::lazy_bench as hc_lazy_bench;
 pub(crate) use hc_norm::{
     FoldSum, compact_plan, fold_moe, fold_target, lazy_fold_target, lazy_parts, lazy_streams,
@@ -873,6 +874,7 @@ impl Model {
         prefix: &str,
         inject: bool,
         fused: bool,
+        tp: Option<hc_split::Split>,
     ) -> Result<(Tensor<'a>, Option<Tensor<'a>>), ModelError> {
         let hp = &self.hp;
         let hc = &self.qwen4().hc;
@@ -925,7 +927,10 @@ impl Model {
             };
             (xn, inject)
         };
-        Ok((self.hc_mix_tail(ctx, xn, None, prefix, fused, n)?, inject))
+        Ok((
+            self.hc_mix_tail(ctx, xn, None, prefix, fused, n, tp)?,
+            inject,
+        ))
     }
 
     /// The mixer after its norm: from the normed streams `xn` (`[n_embd · hc, n]`), the
@@ -933,6 +938,10 @@ impl Model {
     /// projection `mul_mat(down, xn)` if the caller has it from [`hc_norm::hc_post_norm`]'s
     /// extra outputs, the same bits (on a V100 the F16 GEMM from its F16 `xn` and weights,
     /// [`hc_norm::xn16_fits`]; on a GB10 MMQ from its quantized `xn`, [`mmq_preq::fits`]).
+    ///
+    /// `tp`: a layer mixer of a step whose tokens every tensor-parallel rank has, split over
+    /// them where [`hc_split`] takes it (#1176).
+    #[allow(clippy::too_many_arguments)]
     fn hc_mix_tail<'a>(
         &'a self,
         ctx: &'a Context,
@@ -941,12 +950,20 @@ impl Model {
         prefix: &str,
         fused: bool,
         n: i64,
+        tp: Option<hc_split::Split>,
     ) -> Result<Tensor<'a>, ModelError> {
         let hp = &self.hp;
         let hc = &self.qwen4().hc;
         let e = hp.n_embd;
         let w = |s: &str| self.w(&format!("{prefix}_{s}.weight"));
-        let lo = match lo {
+        let scale = 1.0 / hc.n as f32;
+        // Under --tp, each rank's rows of the down matmul and their activation, gathered.
+        let split_lo = match (lo, tp) {
+            (None, Some(t)) => hc_split::down_lo(ctx, w("down")?, w("up")?, xn, scale, t),
+            _ => None,
+        };
+        // (The split's `lo` is activated already.)
+        let lo = match lo.or(split_lo) {
             Some(lo) => lo,
             // Steps of 2-16 tokens on a GB10: Legion's dense matvec, ggml's bits (#860).
             None if dense_mv::takes_small(&[w("down")?], xn) => {
@@ -956,10 +973,21 @@ impl Model {
             None if q8_mmq::takes(w("down")?, xn) => q8_mmq::mul_mat(ctx, w("down")?, xn),
             None => ctx.mul_mat(w("down")?, xn),
         };
-        let lo = hc_chain::lo_act(ctx, lo, 1.0 / hc.n as f32, hc_chain::on_gpu(w("up")?));
+        let lo = if split_lo.is_some() {
+            lo
+        } else {
+            hc_chain::lo_act(ctx, lo, scale, hc_chain::on_gpu(w("up")?))
+        };
         // On a GB10, the up matmul and the gated mix as one op: ggml's bits (#526).
         if fused && hc_up_mix::fits(w("up")?, lo, xn, hc.n) {
             let mixed = hc_up_mix::up_mix(ctx, w("up")?, lo, xn, hc.n, 1.0 / hc.n as f32);
+            return Ok(mixed);
+        }
+        // Under --tp, each rank's rows of the up matmul and the gated mix, gathered (#1176).
+        if fused
+            && let Some(t) = tp
+            && let Some(mixed) = hc_split::up_mix(ctx, w("up")?, lo, xn, hc.n, scale, t)
+        {
             return Ok(mixed);
         }
         let gate = if q8_mmq::takes(w("up")?, lo) {
@@ -1002,6 +1030,7 @@ impl Model {
         pending: Option<(Tensor<'a>, Tensor<'a>)>,
         prefix: &str,
         bf16: bool,
+        tp: Option<hc_split::Split>,
     ) -> Result<(Tensor<'a>, Tensor<'a>, Tensor<'a>), ModelError> {
         let w = |s: &str| self.w(&format!("{prefix}_{s}.weight"));
         let (norm, down, up, inj) = (w("norm")?, w("down")?, w("up")?, w("inject")?);
@@ -1236,7 +1265,7 @@ impl Model {
                 (None, None, Some(xnb)) => Some(ctx.mul_mat(down, xnb)),
                 (None, None, None) => None,
             };
-            let mixed = self.hc_mix_tail(ctx, p.xn, lo, prefix, true, n)?;
+            let mixed = self.hc_mix_tail(ctx, p.xn, lo, prefix, true, n, tp)?;
             return Ok((p.res, mixed, p.inject));
         }
         let res = f32_streams(res);
@@ -1244,7 +1273,7 @@ impl Model {
             Some((out, inject)) => self.hc_combine(ctx, res, out, inject, hc_chain::on_gpu(up)),
             None => res,
         };
-        let (mixed, inject) = self.hc_mix(ctx, res, prefix, true, true)?;
+        let (mixed, inject) = self.hc_mix(ctx, res, prefix, true, true, tp)?;
         Ok((res, mixed, inject.expect("inject")))
     }
 
@@ -1360,6 +1389,13 @@ impl Model {
         // `--hc-bf16` (#1183): BF16 streams between the mixers, in prompt-only passes without
         // the sequence-parallel split.
         let bf16 = hc_norm::hc_bf16() && pass.prompt_only() && sp.is_none() && !tap.on;
+        // Under --tp, in steps every rank runs whole (no sequence-parallel split), each rank's
+        // share of the layer mixers, gathered (#1176, `hc_split`).
+        let tp = if sp.is_none() && !tap.on {
+            self.tp_ranks()
+        } else {
+            None
+        };
         let ple_layer = q4.ple.as_ref().map(|p| p.layer);
         let (mut split, n_all) = (false, n);
         // `--tp-overlap` (#758): the split layers in two micro-batches.
@@ -1430,7 +1466,7 @@ impl Model {
                 continue;
             }
             let pre = format!("blk.{il}.hc_attn");
-            let (r, h, mut inject) = self.hc_mix_after(ctx, res, pending.take(), &pre, bf16)?;
+            let (r, h, mut inject) = self.hc_mix_after(ctx, res, pending.take(), &pre, bf16, tp)?;
             res = r;
             let h = if !split {
                 h
@@ -1460,7 +1496,7 @@ impl Model {
             let attn = self.tp_sum_split(ctx, attn, sp.filter(|_| split));
             pending = Some((attn, inject));
             let pre = format!("blk.{il}.hc_ffn");
-            let (r, h, inject) = self.hc_mix_after(ctx, res, pending.take(), &pre, bf16)?;
+            let (r, h, inject) = self.hc_mix_after(ctx, res, pending.take(), &pre, bf16, tp)?;
             res = r;
             let h = if split {
                 gather_in(h, il, "ffn_up_shexp.weight")
@@ -1501,7 +1537,10 @@ impl Model {
             let flat = ctx.get_rows(ctx.reshape_2d(res, e * hc.n, n), rows);
             res = ctx.reshape_3d(flat, e, hc.n, n_out);
         }
-        Ok((self.hc_mix(ctx, res, "output_hc", false, false)?.0, all))
+        Ok((
+            self.hc_mix(ctx, res, "output_hc", false, false, None)?.0,
+            all,
+        ))
     }
 
     /// Adds the per-layer n-gram embedding to the residual streams `res` in layer `il`.

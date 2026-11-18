@@ -268,7 +268,7 @@ pub(crate) unsafe fn is_all_gather(t: *const ffi::ggml_tensor) -> bool {
 pub(crate) unsafe fn take_mix(ag: *mut ffi::ggml_tensor, mix: *mut ffi::ggml_tensor) -> bool {
     // SAFETY: the caller's.
     unsafe {
-        if !is_all_gather(ag) || external_params(&*ag)[P_MIX] != 0 {
+        if !is_all_gather(ag) || external_params(&*ag)[P_MIX] != 0 || rows_of(&*ag) != 0 {
             return false;
         }
         let src = (*ag).src[0];
@@ -446,6 +446,81 @@ pub fn all_gather<'a>(ctx: &'a Context, comm: i32, x: Tensor<'a>, cols: i64) -> 
     ctx.external_with(&ALL_GATHER, types::F32, [row, cols, 1, 1], &[x], &[comm])
 }
 
+/// The parameter of a [`all_gather_rows`] node: the rows of every rank's piece (0 for the
+/// column gathers).
+pub(crate) const P_ROWS: usize = 2;
+
+/// Every rank's share of the rows of a `[rows, cols]` tensor, from this rank's `x` (F32
+/// `[rows / n_ranks, cols]`, the rows `[r · rows / n_ranks, (r + 1) · rows / n_ranks)` of every
+/// column): `[rows, cols]` (#1176: a hyper-connection mixer split by rows over the ranks). The
+/// values travel as they are (F32 on the wire whatever `--tp-wire` says), so every rank gets
+/// the same bits. Equal pieces: `rows` a multiple of the rank count.
+pub fn all_gather_rows<'a>(ctx: &'a Context, comm: i32, x: Tensor<'a>, rows: i64) -> Tensor<'a> {
+    assert_eq!(x.ty(), types::F32, "tp row all-gather: F32 only");
+    let [piece, cols, a, b] = x.ne();
+    assert_eq!((a, b), (1, 1), "tp row all-gather: a 2-D tensor");
+    if let Some(c) = super::comm(comm) {
+        assert_eq!(
+            piece * c.n_ranks() as i64,
+            rows,
+            "tp row all-gather: equal pieces"
+        );
+    }
+    let x = if x.is_contiguous() { x } else { ctx.cont(x) };
+    let p = i32::try_from(piece).expect("tp row all-gather: the piece");
+    ctx.external_with(
+        &ALL_GATHER,
+        types::F32,
+        [rows, cols, 1, 1],
+        &[x],
+        &[comm, 0, p],
+    )
+}
+
+/// The rows of every rank's piece of a node made by [`all_gather_rows`]; 0 for the column
+/// gathers.
+pub(crate) fn rows_of(dst: &ffi::ggml_tensor) -> usize {
+    if dst.type_ != types::F32 {
+        return 0;
+    }
+    usize::try_from(external_params(dst)[P_ROWS]).unwrap_or(0)
+}
+
+/// [`cpu_all_gather`] of an [`all_gather_rows`] node: each rank's piece as one column of a
+/// gather of exact 4-byte values, then put in place row-wise.
+///
+/// # Safety
+/// A node of [`all_gather_rows`] on the CPU.
+unsafe fn cpu_all_gather_rows(dst: &ffi::ggml_tensor, piece: usize) {
+    // SAFETY: the caller's: a contiguous F32 source and output with host data.
+    let (src, out) = unsafe {
+        let src = &*dst.src[0];
+        (
+            std::slice::from_raw_parts(src.data as *const i32, ffi::ggml_nelements(src) as usize),
+            std::slice::from_raw_parts_mut(dst.data as *mut f32, ffi::ggml_nelements(dst) as usize),
+        )
+    };
+    let Some(c) = super::comm(external_params(dst)[0]) else {
+        tracing::error!("tp all-gather: the communicator is gone");
+        out.fill(0.0);
+        return;
+    };
+    let mut all = vec![0i32; out.len()];
+    let _ = c.all_gather_host_i32(src, &mut all, src.len(), 0);
+    let rows = dst.ne[0] as usize;
+    place_rows(&all, out, piece, rows);
+}
+
+/// The rank pieces `all` (rank order, each `[piece, cols]` of 4-byte values) into `out`
+/// (`[rows, cols]`), rank `r`'s at rows `r · piece..`.
+pub(crate) fn place_rows(all: &[i32], out: &mut [f32], piece: usize, rows: usize) {
+    let cols = out.len() / rows;
+    for (k, v) in all.iter().enumerate() {
+        let (r, j) = (k / (piece * cols), k % (piece * cols));
+        out[(j / piece) * rows + r * piece + j % piece] = f32::from_bits(*v as u32);
+    }
+}
+
 /// [`all_gather`] of I32 columns (#560 r9: the sparse attention's selection rows of every
 /// rank's share of the tokens), copied exactly: 4 bytes a value on the wire whatever
 /// `--tp-wire` says. `x` is I32 `[row, share]`, the share [`share_cut`]`(cols, rank, n, cut)`
@@ -552,6 +627,11 @@ unsafe fn cpu_all_gather(dst: &ffi::ggml_tensor, ith: usize, _nth: usize) {
     if dst.type_ == types::I32 {
         // SAFETY: a node of `all_gather_i32`.
         return unsafe { cpu_all_gather_i32(dst) };
+    }
+    let piece = rows_of(dst);
+    if piece > 0 {
+        // SAFETY: a node of `all_gather_rows`.
+        return unsafe { cpu_all_gather_rows(dst, piece) };
     }
     // SAFETY: a node of `all_gather`.
     let (src, out, row) = unsafe { host_io(dst) };
