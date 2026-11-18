@@ -14,7 +14,7 @@
 //
 // The prompt kernels per architecture live in sm70/qsa_attn.cuh (mma.sync.m8n8k4, attn_kernel),
 // sm80/qsa_attn.cuh (mma.sync.m16n8k16, attn_mma_kernel) and sm80/qsa_attn_gb10.cuh
-// (attn_gb_kernel on 8.0-8.7, attn_gw_kernel on compute capability 12.x: attn_mma_kernel's
+// (attn_gb_kernel on 8.0-8.9, attn_gw_kernel on compute capability 12.x: attn_mma_kernel's
 // bits, two CTAs per SM),
 // included below; launch_attn picks one per device at run time (use_mma, use_gb). The other
 // kernels are portable and stay here.
@@ -94,7 +94,7 @@ struct legion_qsa_attn {
     // reference the fast kernel matches bit for bit.
     int32_t hgroups;
     // The F16 prompt kernel on sm_80+ (#828): 0 the launcher's choice (attn_gw_kernel on compute
-    // capability 12.x, attn_gb_kernel on Ampere, attn_mma_kernel on the others),
+    // capability 12.x, attn_gb_kernel on Ampere and Ada, attn_mma_kernel on the others),
     // 1 attn_mma_kernel, 2 attn_gb_kernel, 3 attn_gw_kernel (#1183); 4-10 attn_gw_kernel's
     // variants for `legion qsa-bench` (#1176 round 42, launch_gw_variant; 4 its cp.async.cg
     // copies). All give the same bits.
@@ -489,9 +489,10 @@ bool use_mma() {
 }
 
 // Whether the current device takes attn_gb_kernel<HD> by default: compute capability 12.x (the
-// GB10 and the other consumer Blackwell GPUs, 100 KB of shared memory per SM) or Ampere, 8.0 to
+// GB10 and the other consumer Blackwell GPUs, 100 KB of shared memory per SM), Ampere, 8.0 to
 // 8.7 (#1212: the sm_86 code took 0.48-0.51x attn_mma_kernel's time at 8K-32K, 4096-token
-// steps; not 8.9), running attn_mma_kernel (use_mma). 12.x takes its warp-local variant,
+// steps), or Ada, 8.9 (#1213 round 30: the sm_89 code on an RTX 4090 took 0.48-0.51x too,
+// attn_gw_kernel 0.68x), running attn_mma_kernel (use_mma). 12.x takes its warp-local variant,
 // attn_gw_kernel (#1183: 0.88x attn_gb_kernel's time at 8K-123K, 4096-token steps, on a GB10;
 // not measured on Ampere). Returns 0 (neither), 2 (attn_gb_kernel) or 3 (attn_gw_kernel), as
 // legion_qsa_attn::mma_kernel, whose 2 and 3 force either on any sm_80+.
@@ -510,11 +511,10 @@ int use_gb(int forced) {
     }
     int s = state[dev].load(std::memory_order_acquire) - 1;
     if (s < 0) {
-        int major = 0, minor = 0;
+        int major = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
-        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
         (void) cudaGetLastError();
-        s = major == 12 ? 3 : major == 8 && minor <= 7 ? 2 : 0;
+        s = major == 12 ? 3 : major == 8 ? 2 : 0;
         state[dev].store(s + 1, std::memory_order_release);
     }
     return s;

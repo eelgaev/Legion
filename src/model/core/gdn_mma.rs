@@ -27,7 +27,7 @@
 //! value heads of Qwen3.8-Flash-Next) come here by default for it ([`set_gdn_staged`]; `legion
 //! serve --gdn-prompt-ggml` keeps ggml's op).
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, AtomicI8, Ordering};
 
@@ -88,7 +88,12 @@ pub(super) enum Schedule {
 
 /// Kernels in `legion_gdn_mma_kernels`.
 #[cfg(feature = "cuda")]
-const KERNELS: usize = 8;
+const KERNELS: usize = 9;
+
+/// The table's [`Schedule::WideTwo`] with the gated output norm (`gdn_split<128, 16, 1, 1, 2,
+/// true>`, the same shared memory; [`gdn_mma_gn`]).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+const GN_KERNEL: usize = 8;
 
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 impl Schedule {
@@ -366,11 +371,13 @@ pub(super) fn gdn_mma<'a>(
 }
 
 /// The kernel's argument, `legion_gdn_mma_args` in `src/cuda/gdn_mma.cu` (ggml's
-/// `ggml_cuda_gdn_mma_args` without `eligible`; 184 bytes, checked on both sides): q/k element
-/// (i, head, t, seq) at `i + head * sq[0] + t * sq[1] + (seq / rq3) * sq[2]` floats, key head
-/// `h % h_k` for value head `h`; v at `i + h * sv[0] + t * sv[1] + seq * sv[2]`; g and beta
-/// (h, t, seq) at `h * sb[0] + t * sb[1] + seq * sb[2]`; `state` and `state_out` `[128, 128, h,
-/// n_seqs]` contiguous; `dst` the tokens' outputs, `[128 * h, n_tokens * n_seqs]`.
+/// `ggml_cuda_gdn_mma_args` without `eligible`, then the gated output norm's; 232 bytes,
+/// checked on both sides): q/k element (i, head, t, seq) at `i + head * sq[0] + t * sq[1] +
+/// (seq / rq3) * sq[2]` floats, key head `h % h_k` for value head `h`; v at `i + h * sv[0] + t *
+/// sv[1] + seq * sv[2]`; g and beta (h, t, seq) at `h * sb[0] + t * sb[1] + seq * sb[2]`;
+/// `state` and `state_out` `[128, 128, h, n_seqs]` contiguous; `dst` the tokens' outputs, `[128
+/// * h, n_tokens * n_seqs]`. The norm (one sequence, [`GN_KERNEL`] only): token t's z row at `z
+/// + t * z_ld`, `norm_w` `head_v` floats, BF16 rows `[128 * h, n_tokens]` to `gout`.
 #[cfg(any(feature = "cuda", test))]
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 #[repr(C)]
@@ -392,6 +399,13 @@ pub(super) struct Args {
     sv: [i64; 3],
     sb: [i64; 3],
     scale: f32,
+    z: *const f32,
+    z_ld: i64,
+    norm_w: *const f32,
+    gout: *mut c_void,
+    eps: f32,
+    silu: i32,
+    head_v: i32,
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -405,6 +419,11 @@ impl Args {
             .all(|p| (*p as usize).is_multiple_of(16))
             && self.sq.iter().chain(&self.sv).all(|s| s % 4 == 0)
     }
+
+    /// Whether [`GN_KERNEL`] can copy the z rows in 16-byte pieces (one sequence).
+    fn gn_aligned(&self) -> bool {
+        self.n_seqs == 1 && (self.z as usize).is_multiple_of(16) && self.z_ld % 4 == 0
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -412,7 +431,7 @@ mod launch {
     use std::os::raw::{c_int, c_void};
     use std::sync::atomic::{AtomicI8, AtomicI32, Ordering};
 
-    use super::{Args, FORCE, KERNELS, STAGED, Schedule, staged_for};
+    use super::{Args, FORCE, GN_KERNEL, KERNELS, STAGED, Schedule, staged_for};
 
     /// `dim3`.
     #[repr(C)]
@@ -491,15 +510,16 @@ mod launch {
         }
     }
 
-    /// Gives kernel `s` its dynamic shared memory on device `dev`, once (ggml's `init`); the
-    /// two-CTAs-an-SM kernel also asks for the whole shared-memory carveout.
-    fn opt_in(dev: usize, s: Schedule) -> bool {
-        let slot = &SMEM[dev][s as usize];
+    /// Gives kernel `k` of the table (schedule `s`'s, or [`GN_KERNEL`]) its dynamic shared
+    /// memory on device `dev`, once (ggml's `init`); the two-CTAs-an-SM kernel also asks for the
+    /// whole shared-memory carveout.
+    fn opt_in(dev: usize, s: Schedule, k: usize) -> bool {
+        let slot = &SMEM[dev][k];
         let mut state = slot.load(Ordering::Relaxed);
         if state == 0 {
             // SAFETY: a kernel of the table and its shared memory size.
             state = unsafe {
-                let func = legion_gdn_mma_kernels[s as usize];
+                let func = legion_gdn_mma_kernels[k];
                 if cudaFuncSetAttribute(func, FUNC_ATTR_MAX_DYNAMIC_SHARED, s.smem() as c_int) == 0
                     && (s != Schedule::Pair
                         || cudaFuncSetAttribute(func, FUNC_ATTR_CARVEOUT, CARVEOUT_MAX_SHARED) == 0)
@@ -532,8 +552,9 @@ mod launch {
 
     /// Launches `a` on `stream` with ggml's schedule for the current device; whole heads on
     /// [`Schedule::WideTwo`] where [`STAGED`] is on, on a device [`staged_for`] picks, and
-    /// [`Args::staged_aligned`].
-    pub(super) fn run(a: &mut Args, stream: *mut c_void) -> Result<(), String> {
+    /// [`Args::staged_aligned`]. With `gn` (a gated output norm in `a`), [`GN_KERNEL`] where
+    /// that schedule is picked and [`Args::gn_aligned`]; returns whether it ran.
+    pub(super) fn run(a: &mut Args, stream: *mut c_void, gn: bool) -> Result<bool, String> {
         let (dev, sms) = device()?;
         let s = match forced() {
             Some(s) => s,
@@ -553,7 +574,9 @@ mod launch {
                 "gdn_mma: {s:?} needs 16-byte aligned q, k and v rows"
             ));
         }
-        if !opt_in(dev, s) {
+        let gn = gn && s == Schedule::WideTwo && a.gn_aligned();
+        let k = if gn { GN_KERNEL } else { s as usize };
+        if !opt_in(dev, s, k) {
             return Err(format!(
                 "gdn_mma: the GPU cannot give {} bytes of shared memory",
                 s.smem()
@@ -574,7 +597,7 @@ mod launch {
         // device memory of the stream's device (the caller's node).
         match unsafe {
             cudaLaunchKernel(
-                legion_gdn_mma_kernels[s as usize],
+                legion_gdn_mma_kernels[k],
                 grid,
                 block,
                 argv.as_mut_ptr(),
@@ -582,7 +605,7 @@ mod launch {
                 stream,
             )
         } {
-            0 => Ok(()),
+            0 => Ok(gn),
             e => Err(format!("gdn_mma: CUDA error {e}")),
         }
     }
@@ -596,6 +619,11 @@ unsafe fn cuda_gdn_mma(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<()
         let [q, k, v, g, beta, s0] = [0, 1, 2, 3, 4, 5].map(|i| &*dst.src[i]);
         let (s_v, h, nt, ns) = (v.ne[0], v.ne[1], v.ne[2], v.ne[3]);
         let out = dst.data as *mut f32;
+        // A node of `gdn_mma_gn` whose norm `norm_on` switched on: z and the norm's weight.
+        let params = crate::ggml::external_params(dst);
+        let gn = (!dst.src[6].is_null() && params[0] == 1).then(|| (&*dst.src[6], &*dst.src[7]));
+        let (silu, eps) = (params[1] != 0, f32::from_bits(params[2] as u32));
+        let gout = out.add((s_v * h * nt * ns + s_v * s_v * h * ns) as usize);
         let mut a = Args {
             q: q.data as *const f32,
             k: k.data as *const f32,
@@ -615,9 +643,112 @@ unsafe fn cuda_gdn_mma(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<()
             sb: gdn_scan::strides(beta),
             // ggml: 1.0f / sqrtf((float) S_v)
             scale: 1.0 / (s_v as f32).sqrt(),
+            z: gn.map_or(std::ptr::null(), |(z, _)| z.data as *const f32),
+            z_ld: gn.map_or(0, |(z, _)| (z.nb[1] / 4) as i64),
+            norm_w: gn.map_or(std::ptr::null(), |(_, w)| w.data as *const f32),
+            gout: if gn.is_some() {
+                gout.cast()
+            } else {
+                std::ptr::null_mut()
+            },
+            eps,
+            silu: i32::from(silu),
+            head_v: s_v as i32,
         };
-        launch::run(&mut a, stream)
+        let normed = launch::run(&mut a, stream, gn.is_some())?;
+        match gn {
+            // The norm from the tokens' F32 outputs, as `fused::gated_norm_bf16`.
+            Some((z, w)) if !normed => super::fused::gated_norm_bf16_rows(
+                (out, s_v * h),
+                (z.data as *const f32, (z.nb[1] / 4) as i64),
+                w.data as *const f32,
+                gout.cast(),
+                (s_v as i32, h as i32, nt as i32),
+                silu,
+                eps,
+                stream,
+            ),
+            _ => Ok(()),
+        }
     }
+}
+
+/// Whether prompt steps fuse the gated output norm into [`gdn_mma`] ([`gdn_mma_gn`]):
+/// on by default (#1176 round 44); `LEGION_DEBUG_GDN_GATED_NORM=0` runs the norm's own kernel
+/// after [`gdn_mma`] (A/B runs).
+pub(super) fn gn_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_GDN_GATED_NORM").is_none_or(|v| v != "0"))
+}
+
+/// Whether [`gdn_mma_gn`] takes this prompt group: [`fits`], one sequence, and z (the gate,
+/// F32 `[128 * h, n_tokens]`) with rows of whole 16-byte pieces.
+pub(super) fn gn_fits(
+    [q, k, v, g, beta]: [Tensor<'_>; 5],
+    state: Tensor<'_>,
+    z: Tensor<'_>,
+    norm_w: Tensor<'_>,
+) -> bool {
+    let [s_v, h, nt, ns] = v.ne();
+    fits(q, k, v, g, beta, state)
+        && ns == 1
+        && z.ty() == types::F32
+        && z.ne()[..2] == [s_v * h, nt]
+        && z.nb()[0] == 4
+        && z.nb()[1] % 16 == 0
+        && norm_w.ty() == types::F32
+        && norm_w.is_contiguous()
+        && norm_w.elements() == s_v as usize
+        && !norm_w.is_host()
+        && !norm_w.is_meta()
+}
+
+/// [`gdn_mma`] (the same outputs and states at the same offsets) that can also write the
+/// layer's gated output norm, `fused::gated_norm_bf16(tokens, norm_w, z, 128, eps, silu)`'s
+/// BF16 rows: in the same kernel ([`GN_KERNEL`], the norm's bits from the outputs in shared
+/// memory) where it runs, else the norm's own kernel after it. The norm is off until
+/// [`norm_on`] (the reader that takes the rows decides); the second tensor is its rows,
+/// `[128 * h, n_tokens]` BF16. With the norm on the fused kernel does not write the tokens'
+/// F32 outputs: nothing may read them.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn gdn_mma_gn<'a>(
+    ctx: &'a Context,
+    [q, k, v, g, beta]: [Tensor<'a>; 5],
+    state: Tensor<'a>,
+    z: Tensor<'a>,
+    norm_w: Tensor<'a>,
+    eps: f32,
+    silu: bool,
+) -> (Tensor<'a>, Tensor<'a>) {
+    assert!(
+        gn_fits([q, k, v, g, beta], state, z, norm_w),
+        "gdn_mma_gn: shapes"
+    );
+    let [s_v, h, nt, _] = v.ne();
+    // F32 rows: the tokens', the states', then the BF16 rows two to a row.
+    let (rows, half) = (nt + s_v, (nt + 1) / 2);
+    let out = ctx.external_with(
+        &GDN_MMA,
+        types::F32,
+        [s_v * h, rows + half, 1, 1],
+        &[q, k, v, g, beta, state, z, norm_w],
+        &[0, i32::from(silu), eps.to_bits() as i32],
+    );
+    let es = out.element_size();
+    let tail = ctx.view_2d(
+        out,
+        [s_v * h, half],
+        out.nb()[1],
+        rows as usize * (s_v * h) as usize * es,
+    );
+    let bf = ctx.reinterpret(tail, types::BF16, [s_v * h, 2 * half, 1, 1]);
+    (out, ctx.view_2d(bf, [s_v * h, nt], bf.nb()[1], 0))
+}
+
+/// Switches the norm of a [`gdn_mma_gn`] node on: a reader takes its BF16 rows.
+pub(super) fn norm_on(node: Tensor<'_>) {
+    // SAFETY: an external op node of `gdn_mma_gn`; parameter 0 is its norm switch.
+    unsafe { crate::ggml::set_external_param(node.raw(), 0, 1) };
 }
 
 #[cfg(test)]

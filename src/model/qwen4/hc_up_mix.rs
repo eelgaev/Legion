@@ -101,12 +101,24 @@ pub fn force_kernel(kernel: i32) {
 
 /// Whether `up_mix_bf16_reg` copies `lo` through L1 (#1176 r43, on by default on compute
 /// capability 12.x, the GB10, where it was measured; L2 only elsewhere; kernel codes
-/// [`force_kernel`] forces plus 1000 copy it through L2 only). `LEGION_DEBUG_HC_UP_MIX_L1=0`:
-/// L2 only, for A/B runs. The same bits either way.
+/// [`force_kernel`] forces plus 1000 copy it through L2 only, plus 2000 through L1 on any GPU).
+/// `LEGION_DEBUG_HC_UP_MIX_L1=0`: L2 only, `=1`: through L1 on any GPU (#1213 round 30), for
+/// A/B runs; the offset [`l1_offset`] gives. The same bits either way.
 #[cfg(feature = "cuda")]
-fn l1() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_HC_UP_MIX_L1").is_none_or(|v| v != "0"))
+fn l1() -> i32 {
+    static ON: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| l1_offset(std::env::var("LEGION_DEBUG_HC_UP_MIX_L1").ok().as_deref()))
+}
+
+/// The kernel code offset a `LEGION_DEBUG_HC_UP_MIX_L1` value asks for: 1000 for `0` (L2
+/// only), 2000 for `1` (through L1 on any GPU), else 0 (the device's default).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn l1_offset(v: Option<&str>) -> i32 {
+    match v {
+        Some("0") => 1000,
+        Some("1") => 2000,
+        _ => 0,
+    }
 }
 
 /// Sets whether graphs built from now on run the mixer's up matmul and gated mix as one op for
@@ -924,7 +936,7 @@ pub(crate) unsafe fn launch_mix(
                 c => (*c).data as *mut u16,
             },
             skip_f32: params[P_SKIP_F32],
-            kernel: KERNEL.load(Ordering::Relaxed) + if l1() { 0 } else { 1000 },
+            kernel: KERNEL.load(Ordering::Relaxed) + l1(),
             pre_out: std::ptr::null(),
             pre_out_ld: 0,
             pre_inj: std::ptr::null(),

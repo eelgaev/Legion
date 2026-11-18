@@ -1,6 +1,7 @@
 // qsa_attn.cu, the GB10 (compute capability 12.x) prompt kernel: attn_mma_kernel's arithmetic
 // with two CTAs per SM (attn_gb_kernel, #828). Ampere (8.0-8.7) takes it too (#1212): sm_86 has
 // the GB10's 100 KB per SM, the A100 164 KB (still one attn_mma_kernel CTA per SM at HD 256).
+// So does Ada (8.9, 100 KB per SM; #1213 round 30).
 //
 // Not a standalone header: qsa_attn.cu includes it inside its anonymous namespace, after
 // sm80/qsa_attn.cuh (MCH, mma16816, cp_async16, ...). The ldmatrix wrappers keep the

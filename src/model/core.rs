@@ -3483,6 +3483,14 @@ impl Model {
             (ctx.mul(alpha, ssm_a), beta)
         });
 
+        // #1176 round 44 (`LEGION_DEBUG_GDN_GATED_NORM=0` = off): a MoE model's prompt step of one
+        // group can run the gated output norm in the delta rule's kernel
+        // ([`gdn_mma::gdn_mma_gn`]); its BF16 rows go to the output projection below in place
+        // of `fused::gated_norm_bf16`'s, the same values.
+        let gn_w = (gdn_mma::gn_on() && !tap.on && z_join.is_none() && hp.moe)
+            .then(|| self.lw(il, "ssm_norm.weight").ok())
+            .flatten();
+        let mut gn_node = None;
         let mut outs = Vec::new();
         for (off, sh) in pass.groups() {
             let (nt, ns) = (sh.n_tok as i64, sh.n_seqs as i64);
@@ -3689,7 +3697,21 @@ impl Model {
                 outs.push(concat_tree(ctx, rows));
                 continue;
             }
-            let out = delta_rule([q, k, v, g, beta], ssm_state, nt);
+            let parts = [q, k, v, g, beta];
+            let out = match gn_w {
+                Some(w)
+                    if nt == n
+                        && !gdn_scan::fits(q, v, g, ssm_state, nt, true)
+                        && gdn_mma::gn_fits(parts, ssm_state, z, w) =>
+                {
+                    let silu = !hp.arch.sigmoid_gate();
+                    let (out, ob) =
+                        gdn_mma::gdn_mma_gn(ctx, parts, ssm_state, z, w, hp.rms_eps, silu);
+                    gn_node = Some((out, ob));
+                    out
+                }
+                _ => delta_rule(parts, ssm_state, nt),
+            };
             let final_state = state_of(out, ng);
             // A decode step's states are updated in place; others are copied back.
             let in_place =
@@ -3790,7 +3812,14 @@ impl Model {
             && fused::gated_norm_bf16_fits(o2, norm_w, z_rows, head_v, n)
         {
             let silu = !hp.arch.sigmoid_gate();
-            let ob = fused::gated_norm_bf16(ctx, o2, norm_w, z_rows, head_v, hp.rms_eps, silu);
+            let ob = match gn_node {
+                // The delta rule's node writes them (o's own values are then not computed).
+                Some((node, ob)) => {
+                    gdn_mma::norm_on(node);
+                    ob
+                }
+                None => fused::gated_norm_bf16(ctx, o2, norm_w, z_rows, head_v, hp.rms_eps, silu),
+            };
             ctx.set_shared_cast(o, types::BF16, ob);
         }
         fp8_codes(o);
