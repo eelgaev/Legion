@@ -553,6 +553,32 @@ struct ExactStats {
     /// [`laps`]' clock (0 when off) when the job was picked, at "gate/up done", when "act
     /// ready" was seen and when the down rows were written.
     laps: [u64; 4],
+    /// The experts the pool computed for this layer in its previous job, and how many of
+    /// them it computes again ([`repeats`]).
+    repeat_of: usize,
+    repeated: usize,
+}
+
+/// Per layer, the experts of the pool's last job (debug logging only, [`repeats`]).
+static LAST_EXPERTS: Mutex<Vec<Vec<usize>>> = Mutex::new(Vec::new());
+
+/// With debug logging on: the experts the pool computed for `layer` in its previous job and
+/// how many of them `groups` has again, i.e. how well "the same experts as the last step"
+/// would guess this job's experts ahead of it (#37 round 21). `(0, 0)` otherwise.
+fn repeats(layer: usize, groups: &[(usize, Vec<(usize, usize)>)]) -> (usize, usize) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return (0, 0);
+    }
+    let mut last = LAST_EXPERTS.lock().unwrap();
+    if last.len() <= layer {
+        last.resize(layer + 1, Vec::new());
+    }
+    let prev = std::mem::replace(&mut last[layer], groups.iter().map(|g| g.0).collect());
+    let again = prev
+        .iter()
+        .filter(|e| groups.iter().any(|g| g.0 == **e))
+        .count();
+    (prev.len(), again)
 }
 
 /// Whether the pool prefetches the down rows while it waits for the GPU's SwiGLU blocks (on;
@@ -706,6 +732,7 @@ fn run_exact(s: &Shared, job: &Job) -> ExactStats {
         ..Default::default()
     };
     let groups = groups(ids, n_used);
+    (st.repeat_of, st.repeated) = repeats(layer, &groups);
     if groups.is_empty() {
         gu_done.store(job.seq, Ordering::Release);
         return st;
@@ -811,6 +838,8 @@ fn exact_stats(st: &ExactStats) {
         waited_act: u64,
         waited: u64,
         thr: u64,
+        repeat_of: u64,
+        repeated: u64,
     }
     static ACC: Mutex<Option<Acc>> = Mutex::new(None);
     let mut g = ACC.lock().unwrap();
@@ -826,6 +855,8 @@ fn exact_stats(st: &ExactStats) {
     a.waited_act += u64::from(st.gpu_waited_act);
     a.waited += u64::from(st.gpu_waited);
     a.thr += u64::from(st.thr);
+    a.repeat_of += st.repeat_of as u64;
+    a.repeated += st.repeated as u64;
     if a.jobs.is_multiple_of(4096) {
         let n = a.jobs as f64;
         let busy = a.busy.max(1) as f64;
@@ -841,6 +872,10 @@ fn exact_stats(st: &ExactStats) {
             gpu_waited_act = a.waited_act as f64 / n,
             gpu_waited = a.waited as f64 / n,
             share = a.thr as f64 / n / super::THRESHOLD_ONE as f64,
+            // Of the layer's previous job's experts, the share computed again (precision of
+            // that guess), and the share of this job's experts it names (recall).
+            repeat_precision = a.repeated as f64 / a.repeat_of.max(1) as f64,
+            repeat_recall = a.repeated as f64 / a.experts.max(1) as f64,
             "cpu share exact jobs"
         );
         *a = Acc::default();

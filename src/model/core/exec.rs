@@ -3403,7 +3403,10 @@ impl Executor {
                     _ => None,
                 };
                 front.lap("ahead");
-                let sync = n_stages == 1 && ahead.is_none() && prompt_ahead.is_none();
+                // The last step's swaps, planned while this one computes (`plan_late`).
+                let plan_late =
+                    n_stages == 1 && self.model.experts().is_some_and(|r| r.late_armed());
+                let sync = n_stages == 1 && ahead.is_none() && prompt_ahead.is_none() && !plan_late;
                 for &(s, k) in &active {
                     if !launched[s] {
                         self.launch_stage(s, &shapes[k], sync)?;
@@ -3426,6 +3429,12 @@ impl Executor {
                     let t = std::time::Instant::now();
                     self.build_prompt_ahead(0, &shapes[0], next);
                     ahead_ms = t.elapsed().as_secs_f64() * 1e3;
+                    self.stages[0].backend.synchronize();
+                }
+                if plan_late {
+                    if let Some(r) = self.model.experts_mut() {
+                        r.plan_late();
+                    }
                     self.stages[0].backend.synchronize();
                 }
                 drop(idle);
@@ -3612,6 +3621,12 @@ impl Executor {
                 self.deferred_target = Some((n, kind));
             } else {
                 let t = std::time::Instant::now();
+                // One stage without MTP: the next step's launch plans this step's swaps while
+                // it computes (`plan_late`, `LEGION_DEBUG_SHARE_LATE_PLAN=1`).
+                let late = n_stages == 1 && !self.mtp_enabled && self.remote.is_none() && !prompt;
+                if let Some(r) = self.model.experts_mut() {
+                    r.set_late_next(late);
+                }
                 self.after_pass(n, |il| il < n_layer, kind)?;
                 if let Some((launched, rounds_end)) = tail_at {
                     // From the first launch's return (the GPU work of a synchronized

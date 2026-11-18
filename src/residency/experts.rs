@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::policy::{
     LayerSlots, LendLayer, MAX_FIT_TRIES, Swap, SwapRule, allocate_slots_in, auto_keep_carved,
-    hottest_experts, layers_left_coldest, layers_left_for, lowest_experts, plan_swaps,
+    hottest_experts, layers_left_coldest, layers_left_for, lowest_experts, pick_swaps, plan_swaps,
     shrunk_budget,
 };
 use super::profile::Profile;
@@ -890,6 +890,18 @@ pub struct ExpertResidency {
     tables_first: bool,
     /// The swaps planned this after-step whose copies start after the table write, per device.
     later: Vec<(usize, Vec<Swap>)>,
+    /// The one-step-late plan (#37, `LEGION_DEBUG_SHARE_LATE_PLAN=1`): a decode step's swaps
+    /// are planned while the next step computes ([`Self::plan_late`]) and marked started at
+    /// that step's after-step, so the plan's ~0.1-0.3 ms of host time leaves the gap between
+    /// steps. Every device effect (table write, copies) still happens between steps.
+    late_on: bool,
+    /// Set by the caller before an after-step that a [`Self::plan_late`] follows.
+    late_next: bool,
+    /// The after-step left its devices' plan to [`Self::plan_late`] (the logged step's
+    /// count).
+    late_armed: Option<u64>,
+    /// [`Self::plan_late`]'s swaps per device, and the logged step they follow.
+    late: Option<(u64, Vec<(usize, Vec<Swap>)>)>,
     /// The bounded host tier (#37) the layers' host parts are, if any: RAM slots and a staging
     /// buffer in place of every expert's host bytes. Last: dropped after the tiered ranges
     /// that map its memory.
@@ -1958,6 +1970,10 @@ impl ExpertResidency {
             laps: AfterLaps::default(),
             tables_first: std::env::var_os("LEGION_DEBUG_SWAP_COPIES_FIRST").is_none(),
             later: Vec::new(),
+            late_on: std::env::var("LEGION_DEBUG_SHARE_LATE_PLAN").is_ok_and(|v| v == "1"),
+            late_next: false,
+            late_armed: None,
+            late: None,
             cold: tier_prof.is_none(),
             split_misses: cfg.split_misses.clone(),
             swaps: 0,
@@ -2649,6 +2665,10 @@ impl ExpertResidency {
         count: bool,
     ) -> Result<(), String> {
         let swaps0 = self.swaps;
+        // The one-step-late plan: the last step's swaps, planned while this step computed.
+        let late = std::mem::take(&mut self.late_next) && self.late_on && scope.is_none() && count;
+        let planned = self.late.take();
+        self.late_armed = None;
         self.complete_copies(scope)?;
         self.laps.lap("complete");
         // Model bytes (#391): whether the pass gathered its experts or read staged copies.
@@ -2792,10 +2812,25 @@ impl ExpertResidency {
             // warmup's routing either.
             self.laps.lap("heat");
             if self.lent.is_none() && !held {
+                // Planned after the step before this one's after-step, so only then.
+                let mut planned = planned
+                    .filter(|(at, _)| late && at + 1 == self.logged)
+                    .map(|(_, p)| p)
+                    .unwrap_or_default();
                 for d in 0..self.devices.len() {
                     if self.rule.on_device(&self.device_swaps, d).budget > 0 {
+                        if late && self.late_device(d) {
+                            if let Some(i) = planned.iter().position(|(pd, _)| *pd == d) {
+                                let (_, swaps) = planned.swap_remove(i);
+                                self.start_late(d, swaps);
+                            }
+                            continue;
+                        }
                         self.start_swaps(d, scope)?;
                     }
+                }
+                if late {
+                    self.late_armed = Some(self.logged);
                 }
             }
             self.laps.lap("copies");
@@ -3012,6 +3047,78 @@ impl ExpertResidency {
             return Ok(());
         }
         self.issue_swaps(d, &swaps)
+    }
+
+    /// Whether device `d`'s swaps may be planned one step late: their copies start after the
+    /// table write (`tables_first`), so planning touches only host state.
+    fn late_device(&self, d: usize) -> bool {
+        self.tables_first && self.host.is_none() && self.devices[d].place.cuda.is_some()
+    }
+
+    /// Marks the swaps [`Self::plan_late`] planned for device `d` started, as
+    /// [`Self::start_swaps`] would have a step earlier; their copies start after the table
+    /// write. A swap the slots no longer allow is dropped.
+    fn start_late(&mut self, d: usize, swaps: Vec<Swap>) {
+        let mut started = Vec::with_capacity(swaps.len());
+        for s in swaps {
+            if let Some(l) = self.layers[s.layer].as_mut()
+                && l.slots.start_planned(&s)
+            {
+                l.dirty = true;
+                started.push(s);
+            }
+        }
+        if !started.is_empty() {
+            self.swaps += started.len() as u64;
+            self.later.push((d, started));
+        }
+    }
+
+    /// The caller's next call is a decode step's [`Self::after_step`] that a
+    /// [`Self::plan_late`] beside the next step will follow (`LEGION_DEBUG_SHARE_LATE_PLAN`).
+    pub fn set_late_next(&mut self, on: bool) {
+        self.late_next = on;
+    }
+
+    /// Whether the last after-step left its plan to [`Self::plan_late`].
+    pub fn late_armed(&self) -> bool {
+        self.late_armed.is_some()
+    }
+
+    /// The last decode step's swaps, planned while the next step computes: host state only
+    /// (the heat and slots that step's after-step wrote); its after-step marks them started
+    /// and writes the tables.
+    pub fn plan_late(&mut self) {
+        let Some(at) = self.late_armed.take() else {
+            return;
+        };
+        let t = std::time::Instant::now();
+        let mut per = Vec::new();
+        for d in 0..self.devices.len() {
+            let rule = self.rule.on_device(&self.device_swaps, d);
+            if rule.budget == 0 || !self.late_device(d) {
+                continue;
+            }
+            let view: Vec<Option<&LayerSlots>> = self
+                .layers
+                .iter()
+                .map(|l| {
+                    l.as_ref()
+                        .filter(|l| l.dev == d && l.backed)
+                        .map(|l| &l.slots)
+                })
+                .collect();
+            let swaps = pick_swaps(&view, cold_rule(rule, self.host.is_some() && self.cold));
+            if !swaps.is_empty() {
+                per.push((d, swaps));
+            }
+        }
+        tracing::debug!(
+            us = t.elapsed().as_micros() as u64,
+            swaps = per.iter().map(|(_, s)| s.len()).sum::<usize>(),
+            "expert cache late plan"
+        );
+        self.late = Some((at, per));
     }
 
     /// Starts the copies of device `d`'s planned `swaps` (already out of the tables).

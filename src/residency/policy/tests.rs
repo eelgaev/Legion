@@ -118,6 +118,32 @@ fn swap_takes_slot_out_of_table_until_complete() {
 }
 
 #[test]
+fn late_plan_starts_what_plan_swaps_would() {
+    let mut l = LayerSlots::new(4, 1);
+    l.fill(&[0]);
+    l.record(&[1 + 2; 10]);
+    let rule = SwapRule {
+        budget: 4,
+        margin: 1.0,
+        ratio: 0.1,
+    };
+    let picked = pick_swaps(&[Some(&l)], rule);
+    // Picking leaves the slots as they were.
+    assert_eq!(l.table(), vec![0, 2, 3, 4]);
+    let mut planned = l.clone();
+    assert_eq!(plan_swaps(&mut [Some(&mut planned)], rule), picked);
+    assert!(l.start_planned(&picked[0]));
+    assert_eq!(l.table(), planned.table());
+    // Started once: the slot no longer holds the old expert.
+    assert!(!l.start_planned(&picked[0]));
+    // A newcomer already in a slot is not started again elsewhere.
+    let mut other = LayerSlots::new(4, 2);
+    other.fill(&[0, 2]);
+    assert!(!other.start_planned(&picked[0]));
+    assert_eq!(other.table(), vec![0, 3, 1, 5]);
+}
+
+#[test]
 fn swaps_need_a_clear_gain_and_respect_the_budget() {
     let mut a = LayerSlots::new(4, 1);
     a.fill(&[0]);

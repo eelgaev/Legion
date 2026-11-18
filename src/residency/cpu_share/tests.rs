@@ -705,7 +705,12 @@ fn shexp_moves_into_its_region() {
         // SAFETY: a node of the live graph.
         unsafe { op_of(t) }.map_or("", |op| op.name)
     };
-    for mode in [ShexpAt::After, ShexpAt::BeforeDown, ShexpAt::BeforeGlu] {
+    for mode in [
+        ShexpAt::After,
+        ShexpAt::BeforeDown,
+        ShexpAt::BeforeGlu,
+        ShexpAt::Split,
+    ] {
         let b = Backend::cpu().unwrap();
         let weights = Context::new(16, 0);
         let stacks: Vec<_> = (0..3)
@@ -806,17 +811,28 @@ fn shexp_moves_into_its_region() {
                     .filter(|&t| name(t) == "cpu_share_publish")
                     .collect();
                 assert_eq!((glus.len(), downs.len(), publish.len()), (3, 3, 3));
-                for &t in ts {
+                for (i, &t) in ts.iter().enumerate() {
                     assert!((lo..hi).contains(&((*t).data as usize)), "layer {l}");
                     assert!(pos(t) > pos(publish[l]), "layer {l}");
-                    match mode {
-                        ShexpAt::BeforeGlu => assert!(pos(t) < pos(glus[l]), "layer {l}"),
-                        _ => {
-                            assert!(pos(t) > pos(glus[l]) && pos(t) < pos(downs[l]), "layer {l}")
-                        }
+                    // Split: the first matvec (the gate and up's stand-in) before the SwiGLU op,
+                    // the down's and the gate's after it.
+                    let early = mode == ShexpAt::BeforeGlu || (mode == ShexpAt::Split && i == 0);
+                    if early {
+                        assert!(pos(t) < pos(glus[l]), "{mode:?} layer {l} node {i}");
+                    } else {
+                        assert!(
+                            pos(t) > pos(glus[l]) && pos(t) < pos(downs[l]),
+                            "{mode:?} layer {l} node {i}"
+                        );
                     }
                 }
             }
+            let (early, late) = match mode {
+                ShexpAt::BeforeGlu => (9, 0),
+                ShexpAt::Split => (3, 6),
+                _ => (0, 9),
+            };
+            assert_eq!((p.before_glu, p.after_glu), (early, late), "{mode:?}");
             // Every other node's memory as allocated.
             let moved: Vec<_> = shexp.iter().flatten().copied().collect();
             for (i, &t) in before.iter().enumerate() {

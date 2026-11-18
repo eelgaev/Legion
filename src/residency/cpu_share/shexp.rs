@@ -33,16 +33,23 @@ pub enum ShexpAt {
     BeforeDown,
     /// Between `publish` and the SwiGLU op: while the pool runs the gate and up rows.
     BeforeGlu,
+    /// Split over both waits: its gate and up (with their SwiGLU) between `publish` and the
+    /// SwiGLU op, the rest (its down and its gate's matvec) between the SwiGLU op and the down
+    /// op, so `activate` hands the pool its down rows sooner.
+    Split,
 }
 
 /// [`ShexpAt`] of the share's layers: [`ShexpAt::BeforeGlu`]; `LEGION_DEBUG_SHARE_SHEXP=0`
-/// (as built), `1` (before the down op) or `2` (before the SwiGLU op), for A/B runs.
+/// (as built), `1` (before the down op), `2` (before the SwiGLU op) or `3` (split), for A/B
+/// runs.
 pub fn shexp_at() -> ShexpAt {
     static AT: std::sync::OnceLock<ShexpAt> = std::sync::OnceLock::new();
     *AT.get_or_init(
         || match std::env::var("LEGION_DEBUG_SHARE_SHEXP").as_deref() {
             Ok("0") => ShexpAt::After,
             Ok("1") => ShexpAt::BeforeDown,
+            Ok("2") => ShexpAt::BeforeGlu,
+            Ok("3") => ShexpAt::Split,
             _ => ShexpAt::BeforeGlu,
         },
     )
@@ -124,21 +131,24 @@ unsafe fn overlap(a: *mut ffi::ggml_tensor, b: *mut ffi::ggml_tensor) -> bool {
     a0 < a1 && b0 < b1 && a0 < b1 && b0 < a1
 }
 
-/// One layer's move: `nodes[at..=last]` becomes the `moving` nodes then the `jumped` ones (each
-/// in graph order).
+/// One layer's move: `nodes[at..=last]` becomes the nodes `order` names (the `moving` nodes
+/// and the ones they jump, each part in graph order).
 struct Move {
     at: usize,
     last: usize,
     moving: Vec<usize>,
-    jumped: Vec<usize>,
+    order: Vec<usize>,
 }
 
-/// What [`place`] did: layers moved, layers left as built, the region's bytes.
+/// What [`place`] did: layers moved, layers left as built, the region's bytes, and the moved
+/// nodes that compute (not views) before the SwiGLU op and after it.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Placed {
     pub moved: usize,
     pub left: usize,
     pub bytes: usize,
+    pub before_glu: usize,
+    pub after_glu: usize,
 }
 
 /// The share layer's move whose down op is `nodes[d]`, `None` when it has no shared expert to
@@ -165,7 +175,11 @@ unsafe fn plan(nodes: &[*mut ffi::ggml_tensor], d: usize, mode: ShexpAt) -> Opti
             return None;
         }
         let input = base(x);
-        let at = if mode == ShexpAt::BeforeGlu { a } else { a + 1 };
+        let at = if mode == ShexpAt::BeforeDown {
+            a + 1
+        } else {
+            a
+        };
         // Nodes the moved ones would run ahead of and must not read: the routed experts' work
         // and what reads it, or a node not moved.
         let mut stay: std::collections::HashSet<*mut ffi::ggml_tensor> =
@@ -225,11 +239,35 @@ unsafe fn plan(nodes: &[*mut ffi::ggml_tensor], d: usize, mode: ShexpAt) -> Opti
                 view_op((*t).op) || (*t).op == ffi::ggml_op_GGML_OP_NONE || !overlap(t, s)
             })
         });
+        // Split: the moving nodes another moving node reads (the gate and up with their SwiGLU,
+        // and views) run before the SwiGLU op `nodes[a]` (`jumped[0]`), the others (the down
+        // and the gate's matvec, read only by the tail) right after it. Those jump fewer nodes
+        // than the check above covers, and none they did not jump as built.
+        let order = if mode == ShexpAt::Split {
+            let mut fed = std::collections::HashSet::new();
+            for &m in &moving {
+                for s in (*nodes[m]).src.iter().copied().filter(|s| !s.is_null()) {
+                    fed.insert(s);
+                    fed.insert(base(s));
+                }
+            }
+            let (first, rest): (Vec<usize>, Vec<usize>) =
+                moving.iter().partition(|&&j| fed.contains(&nodes[j]));
+            first
+                .iter()
+                .chain(&jumped[..1])
+                .chain(&rest)
+                .chain(&jumped[1..])
+                .copied()
+                .collect()
+        } else {
+            moving.iter().chain(&jumped).copied().collect()
+        };
         Some(safe.then_some(Move {
             at,
             last,
             moving,
-            jumped,
+            order,
         }))
     }
 }
@@ -306,12 +344,22 @@ pub(super) unsafe fn place(
             }
         }
         for m in &moves {
-            let seg: Vec<_> = m
-                .moving
-                .iter()
-                .chain(&m.jumped)
-                .map(|&j| nodes[j])
-                .collect();
+            // The SwiGLU op is `nodes[m.at]` unless the nodes move past it.
+            let glu = if mode == ShexpAt::BeforeDown {
+                0
+            } else {
+                m.order.iter().position(|&j| j == m.at).unwrap_or(0)
+            };
+            for (i, &j) in m.order.iter().enumerate() {
+                if m.moving.contains(&j) && !view_op((*nodes[j]).op) {
+                    if i < glu {
+                        placed.before_glu += 1;
+                    } else {
+                        placed.after_glu += 1;
+                    }
+                }
+            }
+            let seg: Vec<_> = m.order.iter().map(|&j| nodes[j]).collect();
             nodes[m.at..=m.last].copy_from_slice(&seg);
         }
         placed.moved = moves.len();
@@ -343,6 +391,8 @@ pub(crate) unsafe fn place_shexp(graph: *mut ffi::ggml_cgraph) {
             moved = p.moved,
             left = p.left,
             bytes = p.bytes,
+            before_glu = p.before_glu,
+            after_glu = p.after_glu,
             "cpu share: the shared expert runs while the pool works (layers moved, left as built)"
         );
     }

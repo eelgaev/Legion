@@ -440,6 +440,26 @@ impl LayerSlots {
         self.slots[slot as usize] = Slot::Filling(new);
         self.slot_of[new as usize] = Some(slot);
     }
+
+    /// Marks a swap [`pick_swaps`] planned a step ago started, if the slots still allow it:
+    /// its slot still holds `old` (or is still empty) and `new` is still in no slot. Whether
+    /// it did.
+    pub fn start_planned(&mut self, s: &Swap) -> bool {
+        let Some(&holder) = self.slots.get(s.slot as usize) else {
+            return false;
+        };
+        let held = match s.old {
+            Some(o) => {
+                holder == Slot::Ready(o) && self.slot_of.get(o as usize) == Some(&Some(s.slot))
+            }
+            None => holder == Slot::Empty,
+        };
+        if !held || !matches!(self.slot_of.get(s.new as usize), Some(None)) {
+            return false;
+        }
+        self.start(s.slot, s.old, s.new);
+        true
+    }
 }
 
 /// The first expert of the window of `keep` consecutive experts inside `owned` that holds the
@@ -537,6 +557,22 @@ impl SwapRule {
 /// first, and marks them started (old entries leave the table now; new ones join on
 /// [`LayerSlots::complete`]). The caller copies each new expert into its slot.
 pub fn plan_swaps(layers: &mut [Option<&mut LayerSlots>], rule: SwapRule) -> Vec<Swap> {
+    let all = {
+        let view: Vec<Option<&LayerSlots>> = layers.iter().map(|l| l.as_deref()).collect();
+        pick_swaps(&view, rule)
+    };
+    for s in &all {
+        if let Some(l) = layers[s.layer].as_mut() {
+            l.start(s.slot, s.old, s.new);
+        }
+    }
+    all
+}
+
+/// The swaps [`plan_swaps`] would plan over `layers`, without marking them started (the
+/// one-step-late plan, `LEGION_DEBUG_SHARE_LATE_PLAN`: [`LayerSlots::start_planned`] marks
+/// them after the next step).
+pub fn pick_swaps(layers: &[Option<&LayerSlots>], rule: SwapRule) -> Vec<Swap> {
     let mut all: Vec<(f32, Swap)> = Vec::new();
     for (layer, l) in layers.iter().enumerate() {
         let Some(l) = l else { continue };
@@ -554,11 +590,6 @@ pub fn plan_swaps(layers: &mut [Option<&mut LayerSlots>], rule: SwapRule) -> Vec
     }
     all.sort_by(|a, b| b.0.total_cmp(&a.0));
     all.truncate(rule.budget);
-    for (_, s) in &all {
-        if let Some(l) = layers[s.layer].as_mut() {
-            l.start(s.slot, s.old, s.new);
-        }
-    }
     all.into_iter().map(|(_, s)| s).collect()
 }
 
