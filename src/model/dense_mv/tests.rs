@@ -570,3 +570,70 @@ fn cuda_wide_chains_are_each_weights_chain() {
         wide_chains_case(&mut gpu, 256, &[80, 48, 16], n);
     }
 }
+
+/// A mixer's down and up through `lo_act_node` (`[kd, kl]` then `[kl, m]` weights, `n` tokens),
+/// and as ggml's scale, silu and `mul_mat` of the down's result (`up @ silu(scale · lo)`).
+/// The two results as bits.
+fn lo_act_case(backend: &mut Backend, kd: i64, kl: i64, m: i64, n: i64) -> (Vec<u32>, Vec<u32>) {
+    let scale = 0.25;
+    let ctx = Context::new(32, 32);
+    let x = ctx.new_tensor(types::F32, &[kd, n]).as_input();
+    let down = ctx.new_tensor(types::BF16, &[kd, kl]).as_input();
+    let up = ctx.new_tensor(types::BF16, &[kl, m]).as_input();
+    let lo = mul_mat(&ctx, &[down], x)[0];
+    let got = lo_act_node(&ctx, up, lo, scale).as_output();
+    let want = ctx
+        .mul_mat(up, ctx.silu(ctx.scale(ctx.cont(lo), scale)))
+        .as_output();
+    let mut graph = ctx.new_graph(32);
+    graph.expand(got);
+    graph.expand(want);
+    ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+        .unwrap();
+    x.set_f32(&noise((kd * n) as usize, 3000 + n as u64));
+    down.set_bytes(&bf16_noise((kd * kl) as usize, 3100).0);
+    up.set_bytes(&bf16_noise((kl * m) as usize, 3200).0);
+    backend.compute(&graph).unwrap();
+    let bits = |t: Tensor<'_>| t.to_f32().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    (bits(got), bits(want))
+}
+
+/// On the CPU the lo_act op is ggml's chain up to the order of the F32 sums.
+#[test]
+fn cpu_lo_act_is_ggml_chain() {
+    let mut backend = Backend::cpu().unwrap();
+    backend.set_threads(4);
+    for n in [2, 9] {
+        let (a, b) = lo_act_case(&mut backend, 256, 64, 96, n);
+        for (p, q) in a.iter().zip(&b) {
+            let (p, q) = (f32::from_bits(*p), f32::from_bits(*q));
+            assert!(
+                (p - q).abs() <= 1e-4 * (1.0 + q.abs()),
+                "{n} tokens: {p} vs {q}"
+            );
+        }
+    }
+}
+
+/// On a GPU where the op runs, a mixer's up projection with lo_act inside it (launched as a
+/// programmatic dependent of the down where the device takes it) gives the bits of hc_chain's
+/// lo_act (ggml's scale and silu) and ggml-cuda's `mul_mat`, for 2-16 tokens.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_lo_act_matches_ggml_bits() {
+    use crate::ggml::{DeviceKind, device_by_kind};
+    let mut gpu = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU device")
+        .init()
+        .unwrap();
+    if !device_supported() {
+        eprintln!("dense_mv: not supported on this GPU, skipped");
+        return;
+    }
+    for n in MIN_TOKENS..=MAX_TOKENS {
+        let (a, b) = lo_act_case(&mut gpu, 10240, 320, 10240, n);
+        assert!(a == b, "{n} tokens");
+    }
+}

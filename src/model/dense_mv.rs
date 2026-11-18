@@ -574,6 +574,88 @@ pub fn mul_mat<'a>(ctx: &'a Context, ws: &[Tensor<'a>], x: Tensor<'a>) -> Vec<Te
         .collect()
 }
 
+/// Node params of [`mul_mat_lo_act`]'s nodes and of the [`mul_mat`] node before it, after the
+/// wide chains' 0-5: the `pdl` bits ([`PDL_EARLY`], [`PDL_WAIT`]), the activation flag, the bits
+/// of its scale.
+const P_PDL: usize = 6;
+const P_ACT: usize = 7;
+const P_SCALE: usize = 8;
+
+/// `pdl` bit: the kernel lets the next one on the stream launch at its start.
+const PDL_EARLY: i32 = 1;
+/// `pdl` bit: the kernel loads its first weight rows and then waits for the kernel ahead.
+const PDL_WAIT: i32 = 2;
+
+/// Whether [`mul_mat_lo_act`] takes a mixer's up projection (#1176): on unless
+/// `LEGION_DEBUG_HC_MIX_PDL=0`, which keeps lo_act and ggml's matmul.
+pub fn lo_act_chain() -> bool {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| !std::env::var("LEGION_DEBUG_HC_MIX_PDL").is_ok_and(|v| v.trim() == "0"))
+}
+
+/// Whether `t` is a node of this op.
+fn ours(t: Tensor<'_>) -> bool {
+    // SAFETY: a valid tensor of a live context.
+    unsafe { crate::ggml::op_of(t.raw()) }.is_some_and(|op| std::ptr::eq(op, &DENSE_MV))
+}
+
+/// Whether [`mul_mat_lo_act`] takes `w` after `lo`: [`lo_act_chain`], `lo` a node of one weight
+/// made by [`mul_mat`] (BF16, no chain weight), and `w @ lo` as [`takes_small`] takes it.
+pub fn takes_lo_act(w: Tensor<'_>, lo: Tensor<'_>) -> bool {
+    lo_act_chain()
+        && ours(lo)
+        && w.ty() == types::BF16
+        && lo.ne()[1] >= MIN_TOKENS
+        && lo.ne()[1] <= MAX_TOKENS
+        && lo.ne()[0] % 32 == 0
+        && takes_small(&[w], lo)
+}
+
+/// `w @ silu(scale · lo)`: a hyper-connection mixer's up projection of its low-rank values `lo`
+/// (the down projection's [`mul_mat`] node of one weight, [`takes_lo_act`]) in one op with
+/// hc_chain's lo_act (#1176): the same arithmetic as each value is staged, so the same bits as
+/// lo_act and then the matmul, without lo_act's launch. On compute capability 12.x the op is a
+/// programmatic dependent launch: `lo`'s kernel lets it launch at its start, and its CTAs load
+/// their weight rows while that kernel runs (the down projection takes 20 of a GB10's 48 SMs at
+/// up to 8 tokens), then wait for it before they read `lo`.
+pub fn mul_mat_lo_act<'a>(
+    ctx: &'a Context,
+    w: Tensor<'a>,
+    lo: Tensor<'a>,
+    scale: f32,
+) -> Tensor<'a> {
+    assert!(takes_lo_act(w, lo), "dense_mv: lo_act chain shapes");
+    lo_act_node(ctx, w, lo, scale)
+}
+
+/// [`mul_mat_lo_act`]'s nodes without its checks of the switches and the device (tests).
+fn lo_act_node<'a>(ctx: &'a Context, w: Tensor<'a>, lo: Tensor<'a>, scale: f32) -> Tensor<'a> {
+    assert!(
+        ours(lo) && fits(w, lo),
+        "dense_mv: lo_act after a dense_mv node"
+    );
+    // SAFETY: `lo` is a node of this op; P_PDL is below EXTERNAL_PARAMS.
+    unsafe { crate::ggml::set_external_param(lo.raw(), P_PDL, PDL_EARLY) };
+    let mut params = [0; P_SCALE + 1];
+    params[P_PDL] = PDL_WAIT;
+    params[P_ACT] = 1;
+    params[P_SCALE] = scale.to_bits() as i32;
+    ctx.external_with(
+        &DENSE_MV,
+        types::F32,
+        [w.ne()[1], lo.ne()[1], 1, 1],
+        &[lo, w],
+        &params,
+    )
+}
+
+/// lo_act of hc_chain (ggml's scale with bias 0, then silu) on one value: the CPU reference of
+/// [`mul_mat_lo_act`]'s activation.
+fn lo_act(v: f32, scale: f32) -> f32 {
+    let s = scale * v + 0.0;
+    s / (1.0 + (-s).exp())
+}
+
 /// The `[m, n]` result of weight `i` of a node made by [`mul_mat`]: its offset in `dst.data`.
 fn out_offset(dst: &ffi::ggml_tensor, i: usize) -> usize {
     // SAFETY: a node made by `mul_mat`: src[0] the input, src[1..] the weights.
@@ -597,6 +679,8 @@ unsafe fn cpu_dense_mv(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
     unsafe {
         let x = &*dst.src[0];
         let (k, n) = (x.ne[0] as usize, x.ne[1] as usize);
+        let params = crate::ggml::external_params(dst);
+        let act = (params[P_ACT] != 0).then(|| f32::from_bits(params[P_SCALE] as u32));
         for i in 0..weights(dst) {
             let w = &*dst.src[1 + i];
             let m = w.ne[1] as usize;
@@ -613,7 +697,8 @@ unsafe fn cpu_dense_mv(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
                         } else {
                             f32::from_bits(u32::from(*(row as *const u16).add(c)) << 16)
                         };
-                        s += wv * *col.add(c);
+                        let xv = *col.add(c);
+                        s += wv * act.map_or(xv, |sc| lo_act(xv, sc));
                     }
                     *out.add(t * m + r) = s;
                 }
@@ -649,6 +734,10 @@ mod cuda {
         kgroup: i32,
         kmma: i32,
         kred: i32,
+        pdl: i32,
+        act: i32,
+        act_scale: f32,
+        act_bias: f32,
     }
 
     unsafe extern "C" {
@@ -743,6 +832,11 @@ mod cuda {
                 kgroup: params[3],
                 kmma: params[4],
                 kred: params[5],
+                // `mul_mat_lo_act`'s node and the node it follows; lo_act's bias is 0.
+                pdl: params[P_PDL],
+                act: params[P_ACT],
+                act_scale: f32::from_bits(params[P_SCALE] as u32),
+                act_bias: 0.0,
             };
             for i in 0..nw {
                 let w = &*dst.src[1 + i];

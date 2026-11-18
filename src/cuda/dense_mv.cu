@@ -80,6 +80,19 @@ struct legion_dense_mv {
     int32_t kmma;
     // Probe only: how the accumulators are added (0 in order, 1 pairwise, 2 last to first).
     int32_t kred;
+    // Programmatic dependent launch (BF16, 2-16 tokens, no chain weights; a hyper-connection
+    // mixer's down projection and then its up projection, #1176): PDL_EARLY, the kernel lets the
+    // next one on the stream launch at its start; PDL_WAIT, it is launched as a dependent of the
+    // kernel ahead (compute capability 12.x), loads its first chunks of weight rows and waits for
+    // that kernel before it reads x. The same products and sums either way.
+    int32_t pdl;
+    // Nonzero (BF16, 2-16 tokens, no chain weights): x holds a mixer's low-rank values before
+    // hc_chain.cu's lo_act, and each is taken as silu(act_scale * x + act_bias), that kernel's
+    // arithmetic, as it is staged (the one rounding to BF16 after it): the same bits as lo_act
+    // and then the matmul.
+    int32_t act;
+    float act_scale;
+    float act_bias;
 };
 
 // Enqueues dst[i] = w[i] . x for every weight on `stream`. 0 on success; 1 for a shape the
@@ -108,6 +121,16 @@ constexpr int MAX_WIDE_N = 48;
 constexpr int PAD = 36;
 // ggml's largest CTA for mul_mat_f (NVIDIA): 256 threads.
 constexpr int MAX_THREADS = 256;
+// legion_dense_mv::pdl bits.
+constexpr int PDL_EARLY = 1;
+constexpr int PDL_WAIT  = 2;
+
+// hc_chain.cu's lo_act_kernel (ggml's scale_f32 then silu) on one value, the same expression
+// under the same build flags.
+__device__ __forceinline__ float lo_act(const float v, const float scale, const float bias) {
+    const float s = scale * v + bias;
+    return s / (1.0f + expf(-s));
+}
 
 // The weight among the first `nw` that unit `u` (a row or a row tile of `per` rows) of the launch
 // falls in, from weight `i`; `u` becomes its index within that weight.
@@ -298,6 +321,44 @@ int launch_typed(const legion_dense_mv & p, cudaStream_t s, int f) {
     return p.n <= 8 ? launch_mmf<1, 1, 4, F>(p, s) : launch_mmf<2, 2, 2, F>(p, s);
 }
 
+// BF16 weights with lo_act on x (p.act) or launched as a dependent (p.pdl & PDL_WAIT): a
+// hyper-connection mixer's up projection (#1176, 10,240 rows of 320). One CTA per 16-row tile;
+// 2 chunks in flight per warp, which holds every chunk of such short rows (5 chunks over ggml's
+// 3 warps) before the wait, with fewer registers than the default 4 so more of the CTAs are
+// resident while the kernel ahead (the down projection) runs. A programmatic dependent launch
+// where the device takes it (legion_device::pdl_device), else a plain one.
+template <int NTB, bool A>
+int launch_dep(const legion_dense_mv & p, cudaStream_t s) {
+    static std::atomic<int8_t> opt[GGML_CUDA_MAX_DEVICES];
+    const auto kernel = mmf<NTB, 1, 2, false, 1, false, A>;
+    const int  nw     = mmf_warps(p.k);
+    if (!legion_device::smem_opt_in(opt, kernel, mmf_smem<NTB, 1>(MAX_THREADS / 32))) {
+        return 1;
+    }
+    int64_t tiles = 0;
+    for (int i = 0; i < p.nw; i++) {
+        tiles += p.rows[i] / 16;
+    }
+    cudaLaunchAttribute attr{};
+    attr.id                                         = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr.val.programmaticStreamSerializationAllowed = 1;
+    cudaLaunchConfig_t cfg{};
+    cfg.gridDim          = dim3((unsigned) tiles);
+    cfg.blockDim         = dim3(32, nw);
+    cfg.dynamicSmemBytes = mmf_smem<NTB, 1>(nw);
+    cfg.stream           = s;
+    cfg.attrs            = &attr;
+    cfg.numAttrs         = (p.pdl & PDL_WAIT) != 0 && legion_device::pdl_device(kernel) ? 1 : 0;
+    return (int) cudaLaunchKernelEx(&cfg, kernel, p);
+}
+
+int launch_dep_any(const legion_dense_mv & p, cudaStream_t s) {
+    if (p.n <= 8) {
+        return p.act != 0 ? launch_dep<1, true>(p, s) : launch_dep<1, false>(p, s);
+    }
+    return p.act != 0 ? launch_dep<2, true>(p, s) : launch_dep<2, false>(p, s);
+}
+
 // Wide chains (chain_wide): every weight a chain weight (nchain = nw), BF16, 17 to MAX_WIDE_N
 // tokens, rows a multiple of 16.
 int launch_wide(const legion_dense_mv & p, cudaStream_t s) {
@@ -411,6 +472,19 @@ int legion_dense_mv_launch(const legion_dense_mv * p, void * stream) {
     }
     if (!mma_code()) {
         return 1;
+    }
+    // PDL and the activation: BF16 weights without chain weights only.
+    if (p->pdl < 0 || p->pdl > (PDL_EARLY | PDL_WAIT) || p->act < 0 || p->act > 1 ||
+        ((p->pdl != 0 || p->act != 0) && (f32 || p->nchain != 0))) {
+        return 1;
+    }
+    if (p->act != 0 || (p->pdl & PDL_WAIT) != 0) {
+        const int r = launch_dep_any(*p, s);
+        if (r != 0) {
+            return r;
+        }
+        const cudaError_t e = cudaGetLastError();
+        return e == cudaSuccess ? 0 : (int) e;
     }
     const int f = forced.load(std::memory_order_relaxed);
     const int r = wb ? launch_typed<true, true>(*p, s, f) :

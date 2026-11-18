@@ -956,16 +956,22 @@ impl Model {
             None if q8_mmq::takes(w("down")?, xn) => q8_mmq::mul_mat(ctx, w("down")?, xn),
             None => ctx.mul_mat(w("down")?, xn),
         };
-        let lo = hc_chain::lo_act(ctx, lo, 1.0 / hc.n as f32, hc_chain::on_gpu(w("up")?));
-        // On a GB10, the up matmul and the gated mix as one op: ggml's bits (#526).
-        if fused && hc_up_mix::fits(w("up")?, lo, xn, hc.n) {
-            let mixed = hc_up_mix::up_mix(ctx, w("up")?, lo, xn, hc.n, 1.0 / hc.n as f32);
-            return Ok(mixed);
-        }
-        let gate = if q8_mmq::takes(w("up")?, lo) {
-            q8_mmq::mul_mat(ctx, w("up")?, lo)
+        let gate = if dense_mv::takes_lo_act(w("up")?, lo) {
+            // Steps of 2-16 tokens on a GB10, after the dense matvec's down: lo_act inside the
+            // up matmul, launched while the down runs (#1176). The same bits.
+            dense_mv::mul_mat_lo_act(ctx, w("up")?, lo, 1.0 / hc.n as f32)
         } else {
-            ctx.mul_mat(w("up")?, lo)
+            let lo = hc_chain::lo_act(ctx, lo, 1.0 / hc.n as f32, hc_chain::on_gpu(w("up")?));
+            // On a GB10, the up matmul and the gated mix as one op: ggml's bits (#526).
+            if fused && hc_up_mix::fits(w("up")?, lo, xn, hc.n) {
+                let mixed = hc_up_mix::up_mix(ctx, w("up")?, lo, xn, hc.n, 1.0 / hc.n as f32);
+                return Ok(mixed);
+            }
+            if q8_mmq::takes(w("up")?, lo) {
+                q8_mmq::mul_mat(ctx, w("up")?, lo)
+            } else {
+                ctx.mul_mat(w("up")?, lo)
+            }
         };
         let mixed = if fused {
             let (x3, g3) = (

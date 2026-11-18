@@ -434,13 +434,22 @@ constexpr int mmf_smem(int nw) {
 // BF16, all of them exact there; each is widened to its F32 bits (`bf16 << 16`) as it is staged,
 // so the staged words, and so every product and sum, are the F32 kernel's. Half the bytes: a lane
 // loads one 32-bit word (two values) of one of two rows per load, R / 2 loads per chunk.
-template <int NTB, int NTA, int D, bool F = false, int S = 1, bool WB = false>
+// A (BF16, S == 1, p.act): each x value is lo_act's silu(act_scale * x + act_bias) as it is staged
+// (#1176, a hyper-connection mixer's up projection without its lo_act launch).
+// p.pdl (sm_90+ code): PDL_EARLY lets the next kernel launch at once; PDL_WAIT waits for the
+// kernel ahead after the first D chunks of weight rows are loaded, before x is read.
+template <int NTB, int NTA, int D, bool F = false, int S = 1, bool WB = false, bool A = false>
 __global__ void __launch_bounds__(MAX_THREADS) mmf(const legion_dense_mv p) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     static_assert(!WB || (F && S == 1), "WB widens F32 values stored as BF16");
+    static_assert(!A || (!F && S == 1), "the activation for BF16 weights without clusters");
 #if __CUDA_ARCH__ < 900
     if constexpr (S > 1) {
         __trap();
+    }
+#else
+    if (p.pdl & PDL_EARLY) {
+        asm volatile("griddepcontrol.launch_dependents;");
     }
 #endif
     constexpr int R = NTA * 16;
@@ -503,6 +512,12 @@ __global__ void __launch_bounds__(MAX_THREADS) mmf(const legion_dense_mv p) {
     for (int d = 0; d < D; ++d) {
         load(ar[d], c0 + d * nw);
     }
+#if __CUDA_ARCH__ >= 900
+    // The weights do not depend on the kernel ahead; x does.
+    if (p.pdl & PDL_WAIT) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+#endif
     for (int base = c0; base < nc; base += D * nw) {
 #pragma unroll
         for (int d = 0; d < D; ++d) {
@@ -534,7 +549,13 @@ __global__ void __launch_bounds__(MAX_THREADS) mmf(const legion_dense_mv p) {
             } else {
 #pragma unroll
                 for (int j = 0; j < NTB * 8; ++j) {
-                    const float2 t = j < n ? y2[j * y_ld2 + c * 32 + lane] : make_float2(0.0f, 0.0f);
+                    float2 t = j < n ? y2[j * y_ld2 + c * 32 + lane] : make_float2(0.0f, 0.0f);
+                    if constexpr (A) {
+                        if (j < n) {
+                            t = make_float2(lo_act(t.x, p.act_scale, p.act_bias),
+                                            lo_act(t.y, p.act_scale, p.act_bias));
+                        }
+                    }
                     Bs[j * PAD + lane] = __float22bfloat162_rn(t);
                 }
             }
