@@ -864,6 +864,35 @@ impl HostTier {
         self.inner.sources(il, experts)
     }
 
+    /// [`Self::sources`] for a refill's RAM fill whose copies run while steps do (#37 round
+    /// 28): the RAM slots of `experts` of layer `il` (indices past its VRAM slots), each
+    /// pinned until [`Self::unpin`] (its expert stays there after, as with [`Self::sources`]);
+    /// None for an expert not in RAM now (nothing pinned: the caller copies it with
+    /// [`Self::sources`]).
+    pub fn pin_fills(&self, il: usize, experts: &[u32]) -> Result<Vec<Option<usize>>, String> {
+        let mut st = self.inner.state.lock().unwrap();
+        let st = &mut *st;
+        self.inner.take_ahead(st, None)?;
+        Ok(experts
+            .iter()
+            .map(|&e| {
+                let s = st.caches[il].slot(e as usize)?;
+                st.caches[il].pin(s, true);
+                st.in_vram[il][e as usize] = true;
+                Some(s)
+            })
+            .collect())
+    }
+
+    /// The copies out of RAM slots `slots` of layer `il` that [`Self::pin_fills`] pinned are
+    /// done.
+    pub fn unpin(&self, il: usize, slots: &[usize]) {
+        let mut st = self.inner.state.lock().unwrap();
+        for &s in slots {
+            st.caches[il].pin(s, false);
+        }
+    }
+
     /// A VRAM slot of layer `il` swaps `old` (what it held, if anything) for `new`: where
     /// the copies go. The caller queues, in this order, the slot's bytes to
     /// [`SwapAt::back`] and [`SwapAt::src`]'s to the slot, then closes its batch of swaps

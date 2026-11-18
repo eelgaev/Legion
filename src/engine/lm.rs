@@ -7987,6 +7987,13 @@ impl Worker {
         if long {
             self.lent_short = false;
         }
+        // #37: a step that runs without the lend lets the expert cache's lent tails take
+        // their VRAM back as it starts, so its after-step can swap over every slot.
+        if !self.lent
+            && let Err(e) = self.exec.experts_step_unlent()
+        {
+            tracing::warn!(error = %e, "could not refill the expert cache");
+        }
         // Plan as a long prompt: big steps over the borrowed cache.
         let big = self.lent && !self.lent_short;
         if self.lent && !big {
