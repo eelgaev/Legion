@@ -13,13 +13,13 @@ use crate::model::core::KvPool;
 
 /// The kernel choices: `main` (`paged_prefill_mma`), `auto` ([`verify_grid`]'s pick), `grid`
 /// (the wide-grid kernel for every group it covers), `split` (over the key blocks).
-pub const KERNELS: [&str; 4] = ["main", "auto", "grid", "split"];
+pub const KERNELS: [&str; 7] = ["main", "auto", "grid", "q1", "q1r", "q2r", "split"];
 
 /// Whether `kernel` runs `g` on the wide-grid kernel on a GPU of `sms` SMs.
 pub fn on_grid(g: &Group, kernel: &str, sms: usize) -> bool {
     match kernel {
         "auto" => verify_grid(g.n_tok, g.n_past.len(), g.heads.2, sms),
-        "grid" => g.n_tok > 1,
+        "grid" | "q1" | "q1r" | "q2r" => g.n_tok > 1,
         _ => false,
     }
 }
@@ -40,6 +40,9 @@ pub fn run(
         "main" => 0,
         "auto" => -1,
         "grid" => 1,
+        "q1" => 2,
+        "q1r" => 3,
+        "q2r" => 4,
         "split" => {
             let (d, h, hk) = (d as i64, n_head as i64, n_head_kv as i64);
             scratch = split_scratch_shape(d, h, hk, g.n_tok, g.n_past.len());

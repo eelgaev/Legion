@@ -197,7 +197,7 @@ fn verify_grid_for(
             let sms = crate::hw::per_device::current().map_or(0, crate::hw::per_device::sm_count);
             verify_grid(n_tok, n_seqs, n_head_kv, sms.max(0) as usize) as i32
         }
-        m => (m > 0) as i32,
+        m => m.max(0),
     }
 }
 
