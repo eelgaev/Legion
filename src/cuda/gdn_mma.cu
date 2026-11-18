@@ -1173,7 +1173,10 @@ static __global__ __launch_bounds__(32 * WARPS, MINB) void gdn_split(legion_gdn_
                 for (int i = 0; i < acc::ne; ++i) {
                     const int t = acc::get_i(i), v = c + acc::get_j(i);
                     if constexpr (GN) {
-                        s.stage[buf].q[t * D + v] = base_output[cb].x[i] + x.x[i];
+                        // Never merged into a multiply-add with base_output's product: the
+                        // plain kernel adds the rounded product (ptxas fused one of the four
+                        // here without __fadd_rn).
+                        s.stage[buf].q[t * D + v] = __fadd_rn(base_output[cb].x[i], x.x[i]);
                     } else if (t < valid) {
                         out[(t0 + t) * a.H * D + v] = base_output[cb].x[i] + x.x[i];
                     }
