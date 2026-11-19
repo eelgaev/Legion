@@ -35,7 +35,7 @@ legion serve \
 
 Deterministic client: the same 8 fixed prompts as the 1x row, temperature 0, 256 tokens each (2026-11-19, one
 session). 1 user 32.3 (story) to 58.2 (code), median 42.2, mean accepted length 3.32, the same tokens as the 1x
-command over two Sparks without the last three flags; 113.9 tok/s at 4 users; 323.7 at 16 users (one round).
+command over two Sparks without `--tp-head-split`, `--tp-rails 2` and `--tp-wire bf16`; 113.9 tok/s at 4 users; 323.7 at 16 users (one round).
 Prefill 8K 2,373 and 32K 2,166 tok/s, one request each after an 8K warm-up, from the same server. 123K was not
 measured (one Spark ran too hot during the long prefills).
 
