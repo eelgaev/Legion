@@ -3927,6 +3927,11 @@ impl LmEngine {
         if tier_whole && layout.stages.len() == 1 {
             cfg.residency.route_gate = crate::residency::route_gate::gate_upto();
         }
+        // With the bounded host tier too, whose passes then read from the checkpoint only the
+        // experts the tokens route to (`LEGION_DEBUG_ROUTE_GATE_TIER=0`: every one, as before).
+        if host_tier.is_some() && layout.stages.len() == 1 {
+            cfg.residency.route_gate = crate::residency::route_gate::tier_gate_upto();
+        }
         // Its one GPU's reserve beside the cache, where `--expert-cache-reserve-mib` is at its
         // default: what was measured in use there, not the layer splits' share.
         if (host_tier.is_some() || tier_whole)

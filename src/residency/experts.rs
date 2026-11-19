@@ -651,6 +651,36 @@ impl Layer {
         )
     }
 
+    /// [`Self::gate_row`] with the bounded host tier's sources ([`Self::tier_copies`]): expert
+    /// `i` of [`Self::stage_misses`] from `srcs[i]`, those read from the checkpoint after
+    /// their batch. `None` if the rows do not match.
+    #[cfg(feature = "cuda")]
+    fn tier_gate_row(
+        &self,
+        srcs: &[super::host_tier::PassSrc],
+    ) -> Option<super::route_gate::GateRow> {
+        use super::host_tier::PassSrc;
+        let n_slots = self.slots.n_slots();
+        let experts: Vec<u32> = self.stage_misses().iter().map(|m| m.0).collect();
+        let src = srcs
+            .iter()
+            .map(|s| {
+                let at = match *s {
+                    PassSrc::Ram(at) | PassSrc::Read { at, .. } => at,
+                };
+                std::array::from_fn(|k| self.addr(k, n_slots + at))
+            })
+            .collect();
+        let batch = srcs
+            .iter()
+            .map(|s| match *s {
+                PassSrc::Ram(_) => None,
+                PassSrc::Read { batch, .. } => Some(batch),
+            })
+            .collect();
+        self.gate_row().with_reads(&experts, src, batch)
+    }
+
     /// [`Self::stage_copies`] with the bounded host tier: expert `i` of [`Self::stage_misses`]
     /// comes from `srcs[i]` ([`super::host_tier::HostTier::stage_pass`]). In order: the zeroed
     /// pads, the experts in RAM slots, then each batch of experts read from the checkpoint
@@ -1401,7 +1431,7 @@ impl<'a> TieredLayer<'a> {
             }
             let w = |k: usize| self.layer.staged[k].tensor(KINDS[k]).expect("staged");
             let (wait_name, done_name) = st.op_names(self.layer.row);
-            let gated = self.host.is_none() && self.pieces == 0 && n as usize <= self.route_gate;
+            let gated = self.pieces == 0 && n as usize <= self.route_gate;
             let wait = match selected.filter(|s| gated && s.ty() == types::I32) {
                 Some(s) => ctx.external(&WAIT, types::F32, [1, 1, 1, 1], &[x, s]),
                 None => ctx.external(&WAIT, types::F32, [1, 1, 1, 1], &[x]),
@@ -2263,19 +2293,27 @@ impl ExpertResidency {
         #[cfg(feature = "cuda")]
         if n as i64 >= self.stage_min {
             for d in 0..self.devices.len() {
+                // A routing-gated pass over the bounded host tier: its rows' copies and the
+                // reader's reads wait for each layer's routing.
+                let mut tier_gates = None;
                 let plan = match self.host.clone() {
                     // The bounded host tier: the pass's copies with the tier's sources, its
                     // checkpoint reads started; the pass before's copies are done first, as
                     // they read the staging places these reads fill.
                     Some(h) => {
-                        match self.devices[d].stage_mut() {
-                            Some(st) => st.sync()?,
+                        let help = match self.devices[d].stage_mut() {
+                            Some(st) => {
+                                st.sync()?;
+                                st.peer().is_some_and(|p| self.idle.contains(&p))
+                            }
                             None => continue,
-                        }
-                        let (plan, hook) = self.tier_plan(d, &ran, &h)?;
+                        };
+                        let gate = (!help && self.gates(n)).then_some(n);
+                        let (plan, hook, gates) = self.tier_plan(d, &ran, &h, gate)?;
                         if let (Some(st), Some(hook)) = (self.devices[d].stage_mut(), hook) {
                             st.set_hook(hook)?;
                         }
+                        tier_gates = gates;
                         plan
                     }
                     None => self.stage_plan(d, &ran),
@@ -2286,8 +2324,11 @@ impl ExpertResidency {
                     // (`--prefill-peer-stage`).
                     let help = st.peer().is_some_and(|p| idle.contains(&p));
                     // A short step copies only the experts its tokens route to
-                    // (`super::route_gate`).
-                    let gated = !help && self.gates(n);
+                    // (`super::route_gate`); over the bounded host tier, as `tier_plan` chose.
+                    let gated = match &self.host {
+                        Some(_) => tier_gates.is_some(),
+                        None => !help && self.gates(n),
+                    };
                     // Model bytes (#391): the experts copied over the link (not the zeroed
                     // pads, whose source is 0); a gated pass's show in the staging stats.
                     for (il, _, copies) in plan.iter().filter(|_| !gated) {
@@ -2296,17 +2337,19 @@ impl ExpertResidency {
                             l.traffic.staged += bytes as u64;
                         }
                     }
-                    let gates: Vec<super::route_gate::GateRow> = if gated {
-                        let layers = &self.layers;
-                        let row = |il: usize| layers[il].as_ref().map(Layer::gate_row);
-                        plan.iter().filter_map(|p| row(p.0)).collect()
-                    } else {
-                        Vec::new()
+                    let (gates, router) = match tier_gates.take() {
+                        Some((gates, router)) => (gates, Some(router)),
+                        None if gated => {
+                            let layers = &self.layers;
+                            let row = |il: usize| layers[il].as_ref().map(Layer::gate_row);
+                            (plan.iter().filter_map(|p| row(p.0)).collect(), None)
+                        }
+                        None => (Vec::new(), None),
                     };
                     let st = self.devices[d].stage_mut().expect("staging checked above");
                     let plan = plan.into_iter().map(|(_, row, c)| (row, c)).collect();
                     if gated {
-                        st.begin_gated(plan, gates, n)?;
+                        st.begin_gated(plan, gates, n, router)?;
                     } else {
                         st.begin(plan, help)?;
                     }
@@ -2344,10 +2387,11 @@ impl ExpertResidency {
     }
 
     /// Whether a staged pass of `n` tokens is routing-gated ([`super::route_gate`]): up to
-    /// [`ResidencyConfig::route_gate`] tokens, without the bounded host tier or split waits.
+    /// [`ResidencyConfig::route_gate`] tokens, without split waits (with the bounded host
+    /// tier, its reads gated too).
     #[cfg(feature = "cuda")]
     fn gates(&self, n: usize) -> bool {
-        n <= self.route_gate && self.host.is_none() && self.stage_pieces == 0
+        n <= self.route_gate && self.stage_pieces == 0
     }
 
     /// Device `d`'s staged layers among `ran`, in order: `(layer, row, copies)`.
@@ -2375,6 +2419,10 @@ impl ExpertResidency {
 
     /// [`Self::stage_plan`] with the bounded host tier `h`, and the calls its copies make
     /// ([`super::host_tier::HostTier::stage_pass`]): none when no layer is staged.
+    ///
+    /// `gate`: a routing-gated pass of that many tokens ([`super::route_gate`]): also every
+    /// row's gate and what tells the pass's reader each row's routing. `None` there when the
+    /// rows cannot gate (the reader is then told every expert is routed).
     #[cfg(feature = "cuda")]
     #[allow(clippy::type_complexity)]
     fn tier_plan(
@@ -2382,10 +2430,12 @@ impl ExpertResidency {
         d: usize,
         ran: &impl Fn(usize) -> bool,
         h: &super::host_tier::HostTier,
+        gate: Option<usize>,
     ) -> Result<
         (
             Vec<(usize, usize, Vec<super::staging::Copy>)>,
             Option<super::host_tier::PassHook>,
+            Option<(Vec<super::route_gate::GateRow>, super::host_tier::PassRoute)>,
         ),
         String,
     > {
@@ -2397,20 +2447,52 @@ impl ExpertResidency {
             .filter(|(il, l)| l.dev == d && ran(*il) && !l.staged.is_empty())
             .collect();
         if rows.is_empty() {
-            return Ok((Vec::new(), None));
+            return Ok((Vec::new(), None, None));
         }
         rows.sort_by_key(|r| r.1.row);
         let misses: Vec<(usize, Vec<u32>)> = rows
             .iter()
             .map(|(il, l)| (*il, l.stage_misses().iter().map(|m| m.0).collect()))
             .collect();
-        let (srcs, hook) = h.stage_pass(&misses)?;
+        // The reader reads the hottest experts of a layer ahead of its router.
+        let pass_gate = gate.map(|n| super::host_tier::PassGate {
+            heat: rows
+                .iter()
+                .zip(&misses)
+                .map(|((_, l), (_, experts))| {
+                    let heat = l.slots.heat();
+                    let h = |e: u32| heat.get(e as usize).copied().unwrap_or(0.0);
+                    experts.iter().map(|&e| h(e)).collect()
+                })
+                .collect(),
+            ahead: n.saturating_mul(super::route_gate::read_ahead_per_token()) as u64,
+            min_read: (n as u64).saturating_mul(super::route_gate::TIER_READ_PER_TOKEN),
+        });
+        let (srcs, hook, route) = h.stage_pass(&misses, pass_gate)?;
         let plan = rows
             .iter()
             .zip(&srcs)
             .map(|((il, l), s)| (*il, l.row, l.tier_copies(s)))
             .collect();
-        Ok((plan, Some(hook)))
+        let gates = match route {
+            Some(route) => {
+                let rows: Option<Vec<_>> = rows
+                    .iter()
+                    .zip(&srcs)
+                    .map(|((_, l), s)| l.tier_gate_row(s))
+                    .collect();
+                match rows {
+                    Some(rows) => Some((rows, route)),
+                    None => {
+                        // An empty mask: every expert.
+                        (0..srcs.len()).for_each(|q| route(q, &[]));
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        Ok((plan, Some(hook), gates))
     }
 
     /// The bytes of routed experts the layers `layers` read since the start, by where (#391's

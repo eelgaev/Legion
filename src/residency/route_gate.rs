@@ -15,6 +15,13 @@
 //! ([`GateRow::ahead`]). The next layer's own gate then copies the chosen experts that are
 //! still missing.
 //!
+//! With the bounded host tier (#37 round 40, a machine with less RAM than the experts) a row's
+//! experts come from RAM slots or from the checkpoint, read into pinned staging places by the
+//! pass's reader thread ([`super::host_tier`]). There the gate also tells the reader which
+//! experts the layer's tokens route to, so it reads only those from the SSD (the reader reads
+//! the layer's hottest ones ahead while the router runs), and the row's copies out of the
+//! places wait for the reads as before ([`GateRow::with_reads`]).
+//!
 //! This module plans the copies (plain functions, CPU-tested); [`super::staging`] queues them.
 
 #[cfg(test)]
@@ -70,6 +77,9 @@ pub struct GateRow {
     hot: Vec<u32>,
     /// The staged id past the last one: `fixed` zeroes its pad.
     end: usize,
+    /// With the bounded host tier, per entry the read batch that fills its source (`None`: a
+    /// RAM slot); empty: every source is in host memory ([`Self::with_reads`]).
+    batch: Vec<Option<usize>>,
 }
 
 impl GateRow {
@@ -105,7 +115,40 @@ impl GateRow {
             guard,
             hot,
             end,
+            batch: Vec::new(),
         }
+    }
+
+    /// The row with the bounded host tier's sources: entry `i` (expert `experts[i]`) copies
+    /// from `src[i]`, once read batch `batch[i]` is in (`None`: a RAM slot, nothing to wait
+    /// for). `None` when the lists do not name this row's entries in order.
+    pub fn with_reads(
+        mut self,
+        experts: &[u32],
+        src: Vec<[usize; 3]>,
+        batch: Vec<Option<usize>>,
+    ) -> Option<Self> {
+        let n = self.entries.len();
+        let same = experts.len() == n
+            && experts
+                .iter()
+                .zip(&self.entries)
+                .all(|(&e, x)| x.expert == e);
+        if !same || src.len() != n || batch.len() != n {
+            return None;
+        }
+        for (e, s) in self.entries.iter_mut().zip(src) {
+            e.src = s;
+        }
+        // Only RAM sources are copied ahead ([`Self::ahead`]): a read one waits for its batch.
+        self.hot.retain(|&i| batch[i as usize].is_none());
+        self.batch = batch;
+        Some(self)
+    }
+
+    /// Whether the entry's source is read from the checkpoint first ([`Self::with_reads`]).
+    fn read(&self, i: usize) -> bool {
+        self.batch.get(i).is_some_and(Option::is_some)
     }
 
     /// Staged experts.
@@ -135,10 +178,11 @@ impl GateRow {
         want
     }
 
-    /// The hottest entries whose bytes fit in `budget`.
+    /// The hottest entries whose bytes fit in `budget` (with the tier's reads, of those in
+    /// RAM slots).
     pub fn ahead(&self, budget: usize) -> Vec<bool> {
         let mut want = vec![false; self.entries.len()];
-        let n = (budget / self.entry_bytes().max(1)).min(self.entries.len());
+        let n = (budget / self.entry_bytes().max(1)).min(self.hot.len());
         for &i in &self.hot[..n] {
             want[i as usize] = true;
         }
@@ -149,26 +193,12 @@ impl GateRow {
     /// kind by kind, neighbours in the staged tensors and in host memory joined up to
     /// [`PIECE`]. With `pads`, then the fixed pads, a zeroed pad at every guarded id not
     /// copied, and one at the id after every copied entry (`want` or `done`) whose next id is
-    /// neither copied nor the end.
+    /// neither copied nor the end. Entries read from the checkpoint are not among them
+    /// ([`Self::read_copies`]), but their pads are.
     pub fn copies(&self, want: &[bool], done: &[bool], pads: bool) -> Vec<Copy> {
         let at = |v: &[bool], i: usize| v.get(i).copied().unwrap_or(false);
         let mut out: Vec<Copy> = Vec::new();
-        for (k, kind) in self.kinds.iter().enumerate() {
-            let b = kind.bytes;
-            let start = out.len();
-            for (i, e) in self.entries.iter().enumerate() {
-                if !at(want, i) || at(done, i) {
-                    continue;
-                }
-                let (dst, src) = (kind.staged + e.id * b, e.src[k]);
-                match out[start..].last_mut() {
-                    Some(c) if c.0 + c.2 == dst && c.1 + c.2 == src && c.2 + b <= PIECE => {
-                        c.2 += b;
-                    }
-                    _ => out.push((dst, src, b)),
-                }
-            }
-        }
+        self.kind_copies(&mut out, |i| at(want, i) && !at(done, i) && !self.read(i));
         if !pads {
             return out;
         }
@@ -197,6 +227,51 @@ impl GateRow {
         }
         out
     }
+
+    /// The copies of the entries read from the checkpoint ([`Self::with_reads`]) in `want` and
+    /// not in `done`, batch by batch: `call(wait)` before a batch's copies and `call(release)`
+    /// after them, for every batch of the row (one with nothing routed gives its places back
+    /// too). `call(batch, release)` makes the marker. Empty without the tier's reads.
+    pub fn read_copies(
+        &self,
+        want: &[bool],
+        done: &[bool],
+        call: impl Fn(usize, bool) -> Copy,
+    ) -> Vec<Copy> {
+        let at = |v: &[bool], i: usize| v.get(i).copied().unwrap_or(false);
+        let mut batches: Vec<usize> = self.batch.iter().flatten().copied().collect();
+        batches.sort_unstable();
+        batches.dedup();
+        let mut out = Vec::new();
+        for b in batches {
+            out.push(call(b, false));
+            let of = |i: usize| self.batch.get(i).copied().flatten() == Some(b);
+            self.kind_copies(&mut out, |i| of(i) && at(want, i) && !at(done, i));
+            out.push(call(b, true));
+        }
+        out
+    }
+
+    /// Kind by kind, the copies of the entries `pick` takes, neighbours in the staged tensors
+    /// and in host memory joined up to [`PIECE`].
+    fn kind_copies(&self, out: &mut Vec<Copy>, pick: impl Fn(usize) -> bool) {
+        for (k, kind) in self.kinds.iter().enumerate() {
+            let b = kind.bytes;
+            let start = out.len();
+            for (i, e) in self.entries.iter().enumerate() {
+                if !pick(i) {
+                    continue;
+                }
+                let (dst, src) = (kind.staged + e.id * b, e.src[k]);
+                match out[start..].last_mut() {
+                    Some(c) if c.0 + c.2 == dst && c.1 + c.2 == src && c.2 + b <= PIECE => {
+                        c.2 += b;
+                    }
+                    _ => out.push((dst, src, b)),
+                }
+            }
+        }
+    }
 }
 
 /// Bytes the copies move over the link (zeroed pads not counted).
@@ -219,6 +294,41 @@ pub fn ahead_per_token() -> usize {
         let kib = parse_env(
             std::env::var("LEGION_DEBUG_ROUTE_GATE_AHEAD").ok(),
             AHEAD_PER_TOKEN >> 10,
+        );
+        kib << 10
+    })
+}
+
+/// Default bytes the bounded host tier's reader reads ahead per token of the step, of a layer
+/// whose router has not run yet: its hottest experts in the checkpoint, while it would
+/// otherwise wait (the router's choices drop the reads not routed that have not started).
+pub const READ_AHEAD_PER_TOKEN: usize = 256 << 10;
+
+/// With the bounded host tier, a pass is gated only when it would read at least this many bytes
+/// per token from the checkpoint: below that the SSD does not hold the pass up (an RTX 4090 with
+/// 64 GB of RAM: 2.5 MiB a token at 8K, a tie gated; 5 MiB at 4K, 28% faster gated).
+pub const TIER_READ_PER_TOKEN: u64 = 4 << 20;
+
+/// `LEGION_DEBUG_ROUTE_GATE_TIER`: with the bounded host tier, the largest gated step (unset:
+/// as [`gate_upto`]; `0`: the tier's passes read and copy every expert, as before).
+pub fn tier_gate_upto() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        parse_env(
+            std::env::var("LEGION_DEBUG_ROUTE_GATE_TIER").ok(),
+            gate_upto(),
+        )
+    })
+}
+
+/// `LEGION_DEBUG_ROUTE_GATE_READ_AHEAD`: KiB per token of the step the bounded host tier's
+/// reader reads ahead of a layer's router (unset: [`READ_AHEAD_PER_TOKEN`]; 0: none).
+pub fn read_ahead_per_token() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let kib = parse_env(
+            std::env::var("LEGION_DEBUG_ROUTE_GATE_READ_AHEAD").ok(),
+            READ_AHEAD_PER_TOKEN >> 10,
         );
         kib << 10
     })

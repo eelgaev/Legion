@@ -511,6 +511,23 @@ fn prefill_takes_the_empty_slots_in_order() {
 }
 
 #[test]
+fn gated_reads_ahead_the_share_routed_before() {
+    use passes::ahead_count;
+    let big = u64::MAX;
+    // Half before any batch is routed (rounded up).
+    assert_eq!(ahead_count(73, 0, 0, EXPERT, big), 37);
+    // 40 of 100 routed so far: 40.5% (Laplace) of 73.
+    assert_eq!(ahead_count(73, 100, 40, EXPERT, big), 30);
+    // All routed: all of them; none routed: one.
+    assert_eq!(ahead_count(73, 1000, 1000, EXPERT, big), 73);
+    assert_eq!(ahead_count(73, 1000, 0, EXPERT, big), 1);
+    // The byte budget caps it; no budget, none.
+    assert_eq!(ahead_count(73, 0, 0, EXPERT, 10 * EXPERT + 1), 10);
+    assert_eq!(ahead_count(73, 0, 0, EXPERT, 0), 0);
+    assert_eq!(ahead_count(0, 0, 0, EXPERT, big), 0);
+}
+
+#[test]
 fn sources_are_named_like_the_models_tensors() {
     assert_eq!(
         skipped_tensors(1),

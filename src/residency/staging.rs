@@ -107,6 +107,9 @@ struct Core {
     ring: usize,
     /// The planned row whose hottest experts the copy stream took ahead, and which.
     ahead_of: Option<(usize, Vec<bool>)>,
+    /// A gated pass over the bounded host tier: tells its reader each row's routing (by
+    /// planned row) before the row's copies out of the staging places are queued.
+    router: Option<super::host_tier::PassRoute>,
     /// Since the last [`Staging::take_stats`].
     stats: StageStats,
 }
@@ -209,9 +212,14 @@ impl Core {
         !self.gates.is_empty()
     }
 
-    /// Queues `copies` (no marks or calls) on the copy stream.
+    /// Queues `copies` (no marks; [`CALL`]s run the hook) on the copy stream.
     fn put(&mut self, copies: &[Copy]) -> Result<(), String> {
         for &(dst, src, n) in copies {
+            if dst == CALL {
+                let hook = self.hook.clone().ok_or("a staging call without a hook")?;
+                self.copier.call(hook, src)?;
+                continue;
+            }
             // SAFETY: inside the row's staged range and the arena; the buffer is free (the copy
             // stream waited for the compute that read it last).
             unsafe {
@@ -222,8 +230,19 @@ impl Core {
                 }
             }
         }
-        self.stats.copies += copies.len() as u64;
+        self.stats.copies += copies.iter().filter(|c| c.0 != CALL).count() as u64;
         Ok(())
+    }
+
+    /// Queues the next planned row's whole plan ([`Self::queue_next`]); in a gated pass over
+    /// the bounded host tier, after telling the reader that every expert of it is routed (the
+    /// plan copies them all, so it waits for all their reads).
+    fn queue_whole(&mut self) -> Result<(), String> {
+        let q = self.queued;
+        if let (Some(r), Some(g)) = (self.router.as_ref(), self.gates.get(q)) {
+            r(q, &vec![true; g.len()]);
+        }
+        self.queue_next()
     }
 
     /// The next planned row of a gated pass, its tokens routed to the experts `ids`: queues the
@@ -240,19 +259,30 @@ impl Core {
             Some((i, v)) if i == q => v,
             _ => Vec::new(),
         };
+        // The bounded host tier's reader reads the routed experts of the row's batches.
+        if let Some(r) = self.router.as_ref() {
+            r(q, &want);
+        }
         let copies = gate.copies(&want, &ahead, true);
+        let reads = gate.read_copies(&want, &ahead, |b, release| {
+            use super::host_tier::{release_arg, wait_arg};
+            let arg = if release { release_arg(b) } else { wait_arg(b) };
+            (CALL, arg, 0)
+        });
         let unused =
             ahead.iter().zip(&want).filter(|&(&a, &w)| a && !w).count() * gate.entry_bytes();
         let full = copied_bytes(&self.plan[q].1);
         self.stats.rows += 1;
         self.stats.gated += 1;
         self.stats.full_bytes += full as u64;
-        self.stats.gated_bytes += copied_bytes(&copies) as u64;
+        self.stats.gated_bytes += copied_bytes(&copies) as u64 + copied_bytes(&reads) as u64;
         self.stats.ahead_unused += unused as u64;
         self.put(&copies)?;
         self.queued += 1;
-        let r = self.rows[row].as_ref().expect("planned rows stage");
-        self.copier.record(&r.copied)?;
+        if reads.is_empty() {
+            let r = self.rows[row].as_ref().expect("planned rows stage");
+            self.copier.record(&r.copied)?;
+        }
         let budget = self
             .tokens
             .saturating_mul(super::route_gate::ahead_per_token());
@@ -265,6 +295,13 @@ impl Core {
             self.stats.gated_bytes += copied_bytes(&copies) as u64;
             self.put(&copies)?;
             self.ahead_of = Some((q + 1, pick));
+        }
+        // With the tier's reads: the next row's copies from RAM slots go ahead of this row's
+        // waits for the SSD, so the link works while they are read.
+        if !reads.is_empty() {
+            self.put(&reads)?;
+            let r = self.rows[row].as_ref().expect("planned rows stage");
+            self.copier.record(&r.copied)?;
         }
         self.stats.queue_ms += t0.elapsed().as_secs_f64() * 1e3;
         Ok(())
@@ -298,6 +335,7 @@ impl Parker {
         c.missed = 0;
         c.gates.clear();
         c.ahead_of = None;
+        c.router = None;
         Ok(())
     }
 }
@@ -371,6 +409,7 @@ impl Staging {
             tokens: 0,
             ring,
             ahead_of: None,
+            router: None,
             stats: StageStats::default(),
         }));
         let id = {
@@ -498,6 +537,7 @@ impl Staging {
         c.help = help;
         c.gates.clear();
         c.ahead_of = None;
+        c.router = None;
         if let Some(start) = c.ahead.take()
             && c.plan[start..] == plan[..]
         {
@@ -526,13 +566,22 @@ impl Staging {
     /// op reads its layer's router choices and queues the copies of only the staged experts
     /// they name; this queues the first row's hottest experts ahead. A pass [`Self::chain`]
     /// already queued runs as [`Self::begin`] has it.
+    ///
+    /// `router`: the pass is over the bounded host tier, whose reader reads a row's experts
+    /// once told its routing ([`super::host_tier::PassRoute`], by planned row); a pass run as
+    /// [`Self::begin`] has it tells it every row's experts are routed.
     pub fn begin_gated(
         &mut self,
         plan: Vec<(usize, Vec<Copy>)>,
         gates: Vec<GateRow>,
         tokens: usize,
+        router: Option<super::host_tier::PassRoute>,
     ) -> Result<(), String> {
         if gates.len() != plan.len() || self.core.lock().unwrap().ahead.is_some() {
+            if let Some(r) = &router {
+                // An empty mask: every expert.
+                (0..plan.len()).for_each(|q| r(q, &[]));
+            }
             return self.begin(plan, false);
         }
         let ring = self.ring();
@@ -545,6 +594,7 @@ impl Staging {
         c.tokens = tokens;
         c.gates = gates;
         c.ahead_of = None;
+        c.router = router;
         let budget = tokens.saturating_mul(super::route_gate::ahead_per_token());
         if budget > 0 && !c.gates.is_empty() {
             let pick = c.gates[0].ahead(budget);
@@ -740,7 +790,7 @@ unsafe fn cuda_stage(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), 
                     // Not the row planned next: the whole rows up to this one, as without
                     // the gate.
                     while let Some(&(r, _)) = c.plan.get(c.queued) {
-                        c.queue_next()?;
+                        c.queue_whole()?;
                         if r == row {
                             break;
                         }

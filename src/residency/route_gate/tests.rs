@@ -135,6 +135,77 @@ fn runs_stop_at_a_piece() {
     assert!(c.iter().all(|c| c.2 <= PIECE));
 }
 
+/// [`row`] with the bounded host tier's sources: entry `e` from `5_000_000 * (k + 1) + e * b`,
+/// read in `batch[e]` (`None`: a RAM slot).
+fn tier_row(n: usize, heat: &[f32], batch: Vec<Option<usize>>) -> GateRow {
+    let experts: Vec<u32> = (0..n as u32).collect();
+    let src = (0..n)
+        .map(|e| std::array::from_fn(|k| 5_000_000 * (k + 1) + e * B[k]))
+        .collect();
+    row(n, 0, heat).with_reads(&experts, src, batch).unwrap()
+}
+
+#[test]
+fn with_reads_checks_the_entries() {
+    let ok = |experts: &[u32], n_src: usize| {
+        let r = row(3, 0, &[]);
+        r.with_reads(experts, vec![[0; 3]; n_src], vec![None; 3])
+            .is_some()
+    };
+    assert!(!ok(&[0, 1], 3));
+    assert!(!ok(&[0, 2, 1], 3));
+    assert!(!ok(&[0, 1, 2], 2));
+    assert!(ok(&[0, 1, 2], 3));
+}
+
+#[test]
+fn read_entries_wait_for_their_batch() {
+    const CALL: usize = usize::MAX;
+    let r = tier_row(5, &[], vec![None, Some(3), Some(3), None, Some(4)]);
+    let want = vec![true, true, false, true, false];
+    // From RAM: entries 0 and 3, plus the pads of every copied entry, read ones included.
+    let ram = r.copies(&want, &[], true);
+    let srcs: Vec<usize> = ram.iter().map(|c| c.1).filter(|&s| s != 0).collect();
+    let expect: Vec<usize> = (1..=3)
+        .flat_map(|k| [0, 3].map(|e| 5_000_000 * k + e * B[k - 1]))
+        .collect();
+    assert_eq!(srcs, expect);
+    let pads: Vec<usize> = ram
+        .iter()
+        .filter(|c| c.1 == 0)
+        .map(|c| (c.0 - 30_000_000) / 60)
+        .collect();
+    assert_eq!(pads, vec![5, 2, 4]);
+    // Read: each batch between its wait and its release, the unrouted batch 4 released too.
+    let reads = r.read_copies(&want, &[], |b, rel| (CALL, b * 2 + rel as usize, 0));
+    assert_eq!(
+        reads,
+        vec![
+            (CALL, 6, 0),
+            (10_000_000 + 100, 5_000_000 + 100, 100),
+            (20_000_000 + 100, 10_000_000 + 100, 100),
+            (30_000_000 + 60, 15_000_000 + 60, 60),
+            (CALL, 7, 0),
+            (CALL, 8, 0),
+            (CALL, 9, 0),
+        ]
+    );
+    // Without the tier's reads: none.
+    let plain = row(3, 0, &[]).read_copies(&[true; 3], &[], |b, _| (CALL, b, 0));
+    assert!(plain.is_empty());
+}
+
+#[test]
+fn ahead_takes_ram_entries_only() {
+    let heat = [0.0, 9.0, 1.0, 8.0, 0.5];
+    let r = tier_row(5, &heat, vec![None, Some(0), None, None, None]);
+    // Expert 1 is the hottest but read: experts 3 and 2 instead.
+    let ahead = r.ahead(2 * r.entry_bytes() + 10);
+    assert_eq!(ahead, vec![false, false, true, true, false]);
+    // Every one fits: still not the read one.
+    assert_eq!(r.ahead(usize::MAX / 2), vec![true, false, true, true, true]);
+}
+
 #[test]
 fn env_values() {
     assert_eq!(parse_env(None, 7), 7);

@@ -50,7 +50,7 @@ use super::ssd_experts::cache::SlotCache;
 use super::ssd_experts::io::{Group, Job, Pool, raw_pieces};
 
 mod passes;
-pub use passes::{PassHook, PassSrc, release_arg, wait_arg};
+pub use passes::{PassGate, PassHook, PassRoute, PassSrc, release_arg, wait_arg};
 
 #[cfg(test)]
 mod tests;

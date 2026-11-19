@@ -44,7 +44,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use super::{GAP, HostTier, Inner, To, fatal, plan_step};
-use crate::residency::ssd_experts::io::{Job, merge_raw};
+use crate::residency::ssd_experts::io::{Class, Group, Job, merge_raw};
 
 /// Where a staged pass copies an expert from: an index past the layer's VRAM slots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +58,39 @@ pub enum PassSrc {
 /// The copy stream's calls of a pass, in the stream's order: [`wait_arg`] before the copies
 /// out of a batch's places, [`release_arg`] after them.
 pub type PassHook = Arc<dyn Fn(usize) + Send + Sync>;
+
+/// A routing-gated pass's message to its reader ([`HostTier::stage_pass`] with a [`PassGate`]):
+/// the pass's layer `l` (its position in the pass) routes its tokens to the experts marked in
+/// the mask (per expert the layer copies, in the pass's order). The reader reads only those
+/// into staging places.
+pub type PassRoute = Arc<dyn Fn(usize, &[bool]) + Send + Sync>;
+
+/// What a routing-gated pass ([`crate::residency::route_gate`]) gives its reader: per layer of
+/// the pass, per expert it copies, its routing heat (which it reads ahead first), and how many
+/// bytes per batch it may read ahead of the layer's router. A pass that would read less than
+/// `min_read` bytes from the checkpoint is not gated: the SSD does not hold it up, and waiting
+/// for each layer's routing would.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PassGate {
+    pub heat: Vec<Vec<f32>>,
+    pub ahead: u64,
+    pub min_read: u64,
+}
+
+/// How many of a gated batch's `places` experts (hottest first, `bytes` each) its reader reads
+/// ahead of the layer's routing: the share the pass's batches before routed (`hit` of
+/// `seen`, half before any), rounded up, at most `budget` bytes.
+pub(crate) fn ahead_count(
+    places: usize,
+    seen: usize,
+    hit: usize,
+    bytes: u64,
+    budget: u64,
+) -> usize {
+    let share = (places * (2 * hit + 1)).div_ceil(2 * seen + 2);
+    let fit = usize::try_from(budget.checked_div(bytes).unwrap_or(0)).unwrap_or(usize::MAX);
+    share.min(places).min(fit)
+}
 
 /// [`PassHook`]'s argument that waits for read `batch`.
 pub fn wait_arg(batch: usize) -> usize {
@@ -341,6 +374,27 @@ struct Progress {
     read_ns: u64,
     set_wait_ns: u64,
     gate_ns: u64,
+    /// A gated pass: per layer, the experts its tokens route to, once its staging wait read
+    /// them ([`PassRoute`]).
+    routed: Vec<Option<Vec<bool>>>,
+    /// A gated pass's reads: experts and bytes read into places (ahead included), experts read
+    /// ahead and those of them no token routed to, and the reader's wait for the routing.
+    gated_experts: usize,
+    gated_bytes: u64,
+    ahead_experts: usize,
+    ahead_unused: usize,
+    route_wait_ns: u64,
+}
+
+/// A gated pass's batch for its reader: its layer (position in the pass), the reads into RAM
+/// slots (read whatever the routing), and per expert read into a place its position in the
+/// layer's list and its reads, hottest first.
+pub(super) struct GatedBatch {
+    layer: usize,
+    slots: Vec<Job>,
+    places: Vec<(usize, [Job; 3])>,
+    /// One expert's bytes.
+    bytes: u64,
 }
 
 /// A pass's reads under way.
@@ -361,9 +415,153 @@ pub(super) struct Pass {
     ram_bytes: u64,
     read_bytes: u64,
     started: Instant,
+    /// Routing-gated ([`PassGate`]): the bytes a batch may read ahead of its layer's router.
+    gated: Option<u64>,
 }
 
 impl Pass {
+    /// [`PassRoute`]: layer `l` routes to the experts in `mask`.
+    fn route(&self, l: usize, mask: &[bool]) {
+        let mut p = self.progress.lock().unwrap();
+        if let Some(r) = p.routed.get_mut(l) {
+            *r = Some(mask.to_vec());
+        }
+        self.moved.notify_all();
+    }
+
+    /// Layer `l`'s routing if known; `Err` once the pass stops.
+    fn routing(&self, l: usize) -> Result<Option<Vec<bool>>, ()> {
+        let p = self.progress.lock().unwrap();
+        match p.routed.get(l) {
+            Some(Some(m)) => Ok(Some(m.clone())),
+            _ if p.stop => Err(()),
+            _ => Ok(None),
+        }
+    }
+
+    /// Waits for the batches `b` overwrites to be given back; whether the pass stopped.
+    fn wait_need(&self, b: usize) -> bool {
+        let t0 = Instant::now();
+        let mut p = self.progress.lock().unwrap();
+        while !p.stop && p.released < self.need[b] {
+            p = self.moved.wait(p).unwrap();
+        }
+        p.set_wait_ns += t0.elapsed().as_nanos() as u64;
+        p.stop
+    }
+
+    /// Layer `l`'s routing, once its staging wait sends it ([`Self::route`]); `None` if the
+    /// pass stops first. The wait's time is added to `ns`.
+    fn wait_routing(&self, l: usize, ns: &mut u64) -> Option<Vec<bool>> {
+        let t0 = Instant::now();
+        let mut p = self.progress.lock().unwrap();
+        while p.routed[l].is_none() && !p.stop {
+            p = self.moved.wait(p).unwrap();
+        }
+        *ns += t0.elapsed().as_nanos() as u64;
+        p.routed[l].clone()
+    }
+
+    /// The reader of a gated pass: batch by batch, the reads into RAM slots, then those into
+    /// places of the experts the layer's tokens route to. While the layer's staging wait has
+    /// not told it the routing yet ([`Self::route`]), the readers read the layer's hottest
+    /// experts ahead (each its own group of [`Class::Ahead`], up to `ahead` bytes a batch);
+    /// the routing then drops those not routed that no reader took yet. A pass given up reads
+    /// only the RAM slots' experts.
+    fn read_gated(&self, inner: &Inner, batches: Vec<GatedBatch>, ahead: u64) {
+        let relaxed = std::sync::atomic::Ordering::Relaxed;
+        let merge = pass_merge();
+        // The pass's batches so far: experts read into places and how many of them routed.
+        let (mut seen, mut hit) = (0usize, 0usize);
+        for (b, gb) in batches.into_iter().enumerate() {
+            let stopped = self.wait_need(b);
+            let t0 = Instant::now();
+            let mut groups: Vec<Arc<Group>> = Vec::new();
+            if !gb.slots.is_empty() {
+                groups.push(inner.pool.submit(gb.slots));
+            }
+            // Per place read: its group if read ahead.
+            let mut sent: Vec<Option<Arc<Group>>> = vec![None; gb.places.len()];
+            let mut route_ns = 0u64;
+            let mut mask = None;
+            if !stopped && !gb.places.is_empty() {
+                mask = match self.routing(gb.layer) {
+                    Ok(Some(m)) => Some(m),
+                    Err(()) => None,
+                    Ok(None) => {
+                        // As many of the hottest as the batches before routed (half at first):
+                        // more are mostly not routed, and would hold up the SSD when the
+                        // routing comes.
+                        let n = ahead_count(gb.places.len(), seen, hit, gb.bytes, ahead);
+                        for (s, (_, reads)) in sent.iter_mut().zip(&gb.places).take(n) {
+                            *s = Some(inner.pool.submit_as(reads.to_vec(), Class::Ahead));
+                        }
+                        self.wait_routing(gb.layer, &mut route_ns)
+                    }
+                };
+            }
+            if let Some(m) = &mask {
+                seen += gb.places.len();
+                hit += gb
+                    .places
+                    .iter()
+                    .filter(|(pos, _)| m.get(*pos).copied().unwrap_or(true))
+                    .count();
+            }
+            let routed = |m: &Option<Vec<bool>>, pos: usize| {
+                m.as_ref()
+                    .is_some_and(|m| m.get(pos).copied().unwrap_or(true))
+            };
+            let mut jobs = Vec::new();
+            let mut rest = 0usize;
+            for ((pos, reads), s) in gb.places.iter().zip(&sent) {
+                match (s, routed(&mask, *pos)) {
+                    (None, true) => {
+                        jobs.extend(*reads);
+                        rest += 1;
+                    }
+                    (Some(g), false) => g.cancel(),
+                    _ => {}
+                }
+            }
+            if !jobs.is_empty() {
+                groups.push(inner.pool.submit(merge_raw(jobs, merge)));
+            }
+            let mut err = None;
+            for g in groups.iter().chain(sent.iter().flatten()) {
+                if let Err(e) = g.wait() {
+                    err.get_or_insert(e);
+                }
+            }
+            // Read ahead: those no cancel dropped a job of.
+            let (mut ahead_n, mut unused) = (0usize, 0usize);
+            for ((pos, _), s) in gb.places.iter().zip(&sent) {
+                if s.as_ref().is_some_and(|g| !g.skipped()) {
+                    ahead_n += 1;
+                    unused += usize::from(!routed(&mask, *pos));
+                }
+            }
+            let n = ahead_n + rest;
+            inner.counts.stage_loads.fetch_add(n as u64, relaxed);
+            let mut p = self.progress.lock().unwrap();
+            // The reads ahead run while it waits for the routing.
+            p.read_ns += t0.elapsed().as_nanos() as u64;
+            p.gated_experts += n;
+            p.gated_bytes += n as u64 * gb.bytes;
+            p.ahead_experts += ahead_n;
+            p.ahead_unused += unused;
+            p.route_wait_ns += route_ns;
+            match err {
+                None => p.read = b + 1,
+                Some(e) => p.err = Some(e),
+            }
+            self.moved.notify_all();
+            if p.err.is_some() {
+                return;
+            }
+        }
+    }
+
     fn call(&self, arg: usize) {
         let (batch, release) = (arg / 2, arg % 2 == 1);
         let mut p = self.progress.lock().unwrap();
@@ -422,6 +620,11 @@ impl Pass {
         let p = self.progress.lock().unwrap();
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         let s = |ns: u64| ns as f64 / 1e9;
+        // A gated pass reads fewer than it planned.
+        let read_bytes = match self.gated {
+            Some(_) => p.gated_bytes,
+            None => self.read_bytes,
+        };
         tracing::info!(
             layers = self.layers,
             ram_experts = self.ram_experts,
@@ -433,12 +636,23 @@ impl Pass {
             ring = self.ring,
             read = p.read,
             read_s = s(p.read_ns),
-            read_gib_s = gib(self.read_bytes) / s(p.read_ns).max(1e-9),
+            read_gib_s = gib(read_bytes) / s(p.read_ns).max(1e-9),
             reader_waited_for_a_set_s = s(p.set_wait_ns),
             copies_waited_for_reads_s = s(p.gate_ns),
             pass_s = self.started.elapsed().as_secs_f64(),
             "host expert tier: staged pass"
         );
+        if self.gated.is_some() {
+            tracing::info!(
+                planned_read_experts = self.read_experts,
+                read_experts = p.gated_experts,
+                read_gib = gib(p.gated_bytes),
+                read_ahead = p.ahead_experts,
+                read_ahead_unused = p.ahead_unused,
+                reader_waited_for_routing_s = s(p.route_wait_ns),
+                "host expert tier: routing-gated pass read what the prompt's tokens route to"
+            );
+        }
     }
 }
 
@@ -468,10 +682,17 @@ impl HostTier {
     /// copy stream makes around each read batch's copies. The copy stream must have run the
     /// pass before's calls, and nothing else may read or swap experts until this pass's
     /// copies are done: the RAM slots keep their experts meanwhile.
+    ///
+    /// With `gate` (a routing-gated pass, [`crate::residency::route_gate`]) the reader reads
+    /// a layer's experts into staging places only once the returned [`PassRoute`] names the
+    /// ones its tokens route to (reading the hottest ahead meanwhile); every layer of the pass
+    /// must be routed that way (all experts, where its copies are not gated), or the copy
+    /// stream's waits for its reads never end. Reads into RAM slots are never gated.
     pub fn stage_pass(
         &self,
         layers: &[(usize, Vec<u32>)],
-    ) -> Result<(Vec<Vec<PassSrc>>, PassHook), String> {
+        gate: Option<PassGate>,
+    ) -> Result<(Vec<Vec<PassSrc>>, PassHook, Option<PassRoute>), String> {
         let inner = &self.inner;
         let mut st = inner.state.lock().unwrap();
         let st = &mut *st;
@@ -577,10 +798,47 @@ impl HostTier {
         let c = &inner.counts;
         let relaxed = std::sync::atomic::Ordering::Relaxed;
         c.ram_loads.fetch_add(loads, relaxed);
-        c.stage_loads
-            .fetch_add(read_experts as u64 - loads, relaxed);
+        let gate = gate.filter(|g| read_bytes >= g.min_read);
+        // A gated pass's reader counts the reads into places it ran.
+        if gate.is_none() {
+            c.stage_loads
+                .fetch_add(read_experts as u64 - loads, relaxed);
+        }
+        // A gated pass's reader: per batch the reads into places expert by expert, hottest
+        // first, to pick the routed ones (and merge them) as it reads.
+        let gated: Option<Vec<GatedBatch>> = gate.as_ref().map(|g| {
+            batches
+                .iter()
+                .map(|b| {
+                    let layer = b.first().map_or(0, |r| r.0);
+                    let il = layers[layer].0;
+                    let heat = |i: usize| g.heat.get(layer).and_then(|h| h.get(i)).copied();
+                    let mut slots = Vec::new();
+                    let mut places: Vec<(usize, [Job; 3])> = Vec::new();
+                    for &(l, i, to) in b {
+                        let reads = inner.reads(layers[l].0, layers[l].1[i] as usize, to);
+                        match to {
+                            To::Slot(_) => slots.extend(reads),
+                            To::Place(_) | To::At(_) => places.push((i, reads)),
+                        }
+                    }
+                    let h = |p: &(usize, [Job; 3])| heat(p.0).unwrap_or(0.0);
+                    places.sort_by(|a, b| h(b).total_cmp(&h(a)));
+                    GatedBatch {
+                        layer,
+                        slots: merge_raw(slots, merge),
+                        places,
+                        bytes: per(il),
+                    }
+                })
+                .collect()
+        });
+        let progress = Progress {
+            routed: vec![None; if gate.is_some() { layers.len() } else { 0 }],
+            ..Progress::default()
+        };
         let pass = Arc::new(Pass {
-            progress: Mutex::new(Progress::default()),
+            progress: Mutex::new(progress),
             moved: Condvar::new(),
             need,
             ring: in_ring,
@@ -592,15 +850,24 @@ impl HostTier {
             ram_bytes,
             read_bytes,
             started: Instant::now(),
+            gated: gate.as_ref().map(|g| g.ahead),
         });
         let (p, i) = (pass.clone(), inner.clone());
+        let ahead = gate.as_ref().map_or(0, |g| g.ahead);
         let reader = std::thread::Builder::new()
             .name("legion-tier-pass".into())
-            .spawn(move || p.read(&i, jobs))
+            .spawn(move || match gated {
+                Some(batches) => p.read_gated(&i, batches, ahead),
+                None => p.read(&i, jobs),
+            })
             .map_err(|e| format!("cannot start the staged pass reader: {e}"))?;
         *inner.pass.lock().unwrap() = Some((pass.clone(), reader));
+        let route: Option<PassRoute> = gate.is_some().then(|| {
+            let p = pass.clone();
+            Arc::new(move |l: usize, mask: &[bool]| p.route(l, mask)) as PassRoute
+        });
         let hook: PassHook = Arc::new(move |arg| pass.call(arg));
-        Ok((srcs, hook))
+        Ok((srcs, hook, route))
     }
 
     /// The VRAM cache dropped `experts` of layer `il` without a swap (a lend unmapped their
