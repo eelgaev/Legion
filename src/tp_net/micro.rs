@@ -290,6 +290,88 @@ pub fn finish<'a>(ctx: &'a Context, s: Started<'a>, into: Option<Tensor<'a>>) ->
     out
 }
 
+/// The params after [`Params::list`]'s that [`finish_add`] sets: whether the node adds a
+/// residual (its source 2) and the column of its output it writes from.
+const ADD_PARAMS: usize = 6;
+
+/// The finish of the all-reduce `s` ([`all_reduce_start`]) with `res` (F32, `s`'s source's
+/// shape `[row, cols]`) added to every sum, after the partials, in the sum's kernel (#1133 r2):
+/// `add(finish(s), res)`'s bits, without the add's pass over the sum. The output has `width`
+/// columns (at least `at + cols`) and the sums go to columns `at..at + cols`; with `into` (a
+/// [`finish_add`] of the same `width` ahead of this one, holding the other columns) the output
+/// is a view of `into`'s memory, so that two halves of a step's tokens end in one tensor
+/// without a concatenation. Columns no finish writes are undefined.
+pub fn finish_add<'a>(
+    ctx: &'a Context,
+    s: Started<'a>,
+    res: Tensor<'a>,
+    width: i64,
+    at: i64,
+    into: Option<Tensor<'a>>,
+) -> Tensor<'a> {
+    assert!(
+        s.p.reduce,
+        "tp micro exchange: only an all-reduce adds a residual"
+    );
+    let [row, cols] = [s.x.ne()[0], s.x.ne()[1]];
+    assert_eq!(res.ty(), types::F32, "tp micro exchange: an F32 residual");
+    assert_eq!(
+        res.ne(),
+        [row, cols, 1, 1],
+        "tp micro exchange: the residual's shape"
+    );
+    assert!(
+        at >= 0 && at + cols <= width,
+        "tp micro exchange: columns {at}..{} of {width}",
+        at + cols
+    );
+    let res = if res.is_contiguous() {
+        res
+    } else {
+        ctx.cont(res)
+    };
+    let mut args = vec![s.x, s.node, res];
+    if let Some(t) = into {
+        assert_eq!(
+            t.ne(),
+            [row, width, 1, 1],
+            "tp micro exchange: the shared output"
+        );
+        assert!(
+            t.is_contiguous(),
+            "tp micro exchange: a contiguous shared output"
+        );
+        args.push(t);
+    }
+    let mut p = s.p.list().to_vec();
+    p.extend([1, at as i32]);
+    let out = ctx.external_with(&FINISH, types::F32, [row, width, 1, 1], &args, &p);
+    if let Some(t) = into {
+        // As in `finish`: the node writes its columns into `t`'s memory.
+        // SAFETY: a fresh node, not allocated yet; `t` is a node of the same graph, ahead of
+        // it (one of its sources) and of its shape.
+        unsafe {
+            let raw = out.raw();
+            (*raw).view_src = t.raw();
+            (*raw).view_offs = 0;
+        }
+    }
+    out
+}
+
+/// A finish node's residual (the device address of its source 2, [`finish_add`]) and the
+/// column its sums go to (0 without a residual).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn add_of(dst: &ffi::ggml_tensor) -> (Option<usize>, usize) {
+    let p = external_params(dst);
+    if p[ADD_PARAMS] == 0 {
+        return (None, 0);
+    }
+    // SAFETY: a node of `finish_add`, whose source 2 is its residual.
+    let res = unsafe { (*dst.src[2]).data as usize };
+    (Some(res), p[ADD_PARAMS + 1] as usize)
+}
+
 unsafe fn cpu_start(_dst: &ffi::ggml_tensor, _ith: usize, _nth: usize) {
     // The CPU's finish runs the whole exchange.
 }
@@ -300,19 +382,27 @@ unsafe fn cpu_finish(dst: &ffi::ggml_tensor, ith: usize, _nth: usize) {
         return;
     }
     let p = Params::of(dst);
-    // SAFETY: a node of `finish` on the CPU: contiguous F32 source and output with host data.
-    let (src, out, row) = unsafe {
+    let (res, at) = add_of(dst);
+    // SAFETY: a node of `finish` or `finish_add` on the CPU: contiguous F32 source, output
+    // (and residual, of the source's size) with host data.
+    let (src, out, row, res) = unsafe {
         let src = &*dst.src[0];
+        let len = ffi::ggml_nelements(src) as usize;
         (
-            std::slice::from_raw_parts(src.data as *const f32, ffi::ggml_nelements(src) as usize),
+            std::slice::from_raw_parts(src.data as *const f32, len),
             std::slice::from_raw_parts_mut(dst.data as *mut f32, ffi::ggml_nelements(dst) as usize),
             dst.ne[0] as usize,
+            res.map(|r| std::slice::from_raw_parts(r as *const f32, len)),
         )
     };
     match super::comm(p.comm) {
         // A failure stays in the communicator, for the step to report.
         Some(c) if p.reduce => {
+            let out = &mut out[at * row..at * row + src.len()];
             let _ = c.all_reduce_host_as(src, out, row * p.n);
+            if let Some(res) = res {
+                super::op::add_host(out, res);
+            }
         }
         Some(c) => {
             let ranks = c.n_ranks();

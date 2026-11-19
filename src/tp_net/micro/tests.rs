@@ -156,3 +156,70 @@ fn lower_floor_splits_tail_steps() {
     assert!(!worth_at(4095, 2, 4096));
     assert_eq!(worth_at(4095, 2, 2048), worth(4095, 2));
 }
+
+/// `finish_add` (#1133 r2) of an odd step's two halves through a CPU graph on two ranks: each
+/// half's sum with its residual added lands in its columns of one output, the bits of ggml's
+/// add of the whole step's all-reduce and the residual, on both ranks.
+#[test]
+fn halves_finish_add_into_one_output() {
+    use crate::ggml::{Backend, ComputeAllocator};
+    let (row, n) = (6usize, 9i64);
+    let (n0, n1) = (n / 2, n - n / 2);
+    let len = row * n as usize;
+    let value = |r: usize, k: usize, i: usize| {
+        let x = ((i * 7 + k * 13 + r * 31) % 97) as f32;
+        if r == 0 { x * 1e7 } else { x * 0.3 + 1e-3 }
+    };
+    let comms = super::super::tests::comms(2, std::time::Duration::from_secs(20));
+    let threads: Vec<_> = comms
+        .into_iter()
+        .enumerate()
+        .map(|(r, c)| {
+            std::thread::spawn(move || {
+                let handle = super::super::register(c);
+                let mut backend = Backend::cpu().unwrap();
+                let ctx = Context::new(32, 32);
+                let x = ctx.new_tensor(types::F32, &[row as i64, n]).as_input();
+                let res = ctx.new_tensor(types::F32, &[row as i64, n]).as_input();
+                let half = |t, a: i64, c: i64| {
+                    ctx.view_2d(t, [row as i64, c], row * 4, a as usize * row * 4)
+                };
+                let mut graph = ctx.new_graph(32);
+                let s0 = all_reduce_start(&ctx, handle.id(), half(x, 0, n0), n as usize);
+                let s1 = all_reduce_start(&ctx, handle.id(), half(x, n0, n1), n as usize);
+                graph.expand(s0.node);
+                graph.expand(s1.node);
+                let y0 = finish_add(&ctx, s0, half(res, 0, n0), n, 0, None).as_output();
+                graph.expand(y0);
+                let y = finish_add(&ctx, s1, half(res, n0, n1), n, n0, Some(y0)).as_output();
+                graph.expand(y);
+                let plain = ctx
+                    .add(super::super::all_reduce(&ctx, handle.id(), x), res)
+                    .as_output();
+                graph.expand(plain);
+                ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+                    .unwrap();
+                let mut out = Vec::new();
+                for k in 0..3 {
+                    x.set_f32(&(0..len).map(|i| value(r, k, i)).collect::<Vec<_>>());
+                    res.set_f32(&(0..len).map(|i| value(1, k + 5, i)).collect::<Vec<_>>());
+                    backend.compute(&graph).unwrap();
+                    out.push((y.to_f32(), plain.to_f32()));
+                }
+                assert!(handle.comm().error().is_none());
+                out
+            })
+        })
+        .collect();
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    for k in 0..3 {
+        let want: Vec<f32> = (0..len)
+            .map(|i| (value(0, k, i) + value(1, k, i)) + value(1, k + 5, i))
+            .collect();
+        for r in &results {
+            assert_eq!(bits(&r[k].0), bits(&want), "halves, round {k}");
+            assert_eq!(bits(&r[k].1), bits(&want), "plain, round {k}");
+        }
+    }
+}

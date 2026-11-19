@@ -169,8 +169,9 @@ impl Arch for Qwen35 {
             let split = halves
                 .filter(|_| halves::ffn_fits(m, il, n))
                 .map(|c| (c, halves::views(pass, x)));
-            // A gated DeltaNet layer's input feeds BF16 (beta / alpha) and FP8 matmuls.
-            let both = fuse && hp.is_recurrent(il);
+            // A gated DeltaNet layer's input feeds BF16 (beta / alpha) and FP8 matmuls; a rank's
+            // share's too (#1133 r2: its two ops' bits from one op).
+            let both = (fuse || m.tp_net_comm().is_some()) && hp.is_recurrent(il);
             let h = m.norm_mul_with(pass, x, m.lw(il, "attn_norm.weight")?, both);
             if fuse {
                 let x_attn = if hp.is_recurrent(il) {
@@ -202,19 +203,24 @@ impl Arch for Qwen35 {
                 }
                 continue;
             }
-            // A rank's share of the heads gives a partial output (`--tp 2`; `attn` without).
-            let attn = m.tp_sum(ctx, attn);
-            let x_attn = ctx.add(attn, x);
+            // A rank's share of the heads gives a partial output (`--tp 2`; `attn` without);
+            // over machines the residual is added in the sum's kernel (#1133 r2, the same
+            // bits).
+            let x_attn = m.tp_sum_add(ctx, attn, x);
             pass.tap.tap("attn_residual", il, x_attn);
             let h = m.norm_mul(pass, x_attn, m.lw(il, "post_attention_norm.weight")?);
             pass.tap.tap("attn_post_norm", il, h);
-            let ffn = if hp.moe {
-                m.moe(ctx, &pass.tap, &pass.graph, il, h, n, pass.prompt_only())?
+            if !hp.moe && !pass.tap.on {
+                x = m.tp_sum_add(ctx, m.ffn(ctx, il, h)?, x_attn);
             } else {
-                m.tp_sum(ctx, m.ffn(ctx, il, h)?)
-            };
-            pass.tap.tap("ffn_out", il, ffn);
-            x = ctx.add(ffn, x_attn);
+                let ffn = if hp.moe {
+                    m.moe(ctx, &pass.tap, &pass.graph, il, h, n, pass.prompt_only())?
+                } else {
+                    m.tp_sum(ctx, m.ffn(ctx, il, h)?)
+                };
+                pass.tap.tap("ffn_out", il, ffn);
+                x = ctx.add(ffn, x_attn);
+            }
             pass.tap.tap("l_out", il, x);
             if capture.contains(&il) {
                 hidden.push((il, x));

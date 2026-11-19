@@ -1831,6 +1831,20 @@ impl Model {
         }
     }
 
+    /// `add(tp_sum(x), res)`: over machines the residual is added in the sum's kernel
+    /// ([`crate::tp_net::all_reduce_add`], the same bits, #1133 r2).
+    pub(crate) fn tp_sum_add<'a>(
+        &self,
+        ctx: &'a Context,
+        x: Tensor<'a>,
+        res: Tensor<'a>,
+    ) -> Tensor<'a> {
+        match self.tp_net_comm() {
+            Some(c) if res.ne() == x.ne() => crate::tp_net::all_reduce_add(ctx, c, x, res),
+            _ => ctx.add(self.tp_sum(ctx, x), res),
+        }
+    }
+
     /// The communicator [`Self::tp_sum`] sums over with tensor parallelism over machines
     /// ([`Self::set_tp_comm`]), not over a GPU pair.
     pub(crate) fn tp_net_comm(&self) -> Option<i32> {

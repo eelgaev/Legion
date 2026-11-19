@@ -56,6 +56,14 @@ rank 0 about 4,100 -> 3,560 ms. Decode does not change (1, 4 and 16 users within
 bits: the same text at 1, 4 and 16 users and the same log probabilities for 8K and 32K prompts. Prefill is still
 below one Spark's: the halves hide about half of the sums' wire time.
 
+Each sum also adds the layer's residual in the same kernel (one Spark adds it in the GEMM epilogue), the halves
+write their FFN sums straight into one output, and the post-attention and DeltaNet input norms ride in the
+quantization as on one Spark (#1133, no flag, same bits). That takes about 380 ms of kernels out of an 8K prompt
+step on each rank. With the command above plus `--deterministic`, two sessions in ABBA order (before / after,
+after / before): prefill 8K 2,167-2,198 / 2,415-2,453, 2,413-2,458 / 2,161-2,186 and 32K 1,767 / 2,016,
+2,030 / 1,820 tok/s. Decode does not change (1, 4 and 16 users within 1%), and text and log probabilities are
+the same bits.
+
 Optional, output-moving: `--tp-wire bf16` on both ranks sends sums of at least 1 MiB in BF16, half the bytes:
 prompt steps, the 16-user verify steps and short prompts (all ranks still agree). On top of the command above
 (same session day, one session): prefill 8K 2,676 / 2,728 and 32K 2,252 / 2,539 tok/s (an 8K prompt step on rank 0

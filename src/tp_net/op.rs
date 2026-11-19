@@ -19,7 +19,36 @@ static ALL_REDUCE: ExternalOp = ExternalOp {
 pub fn all_reduce<'a>(ctx: &'a Context, comm: i32, x: Tensor<'a>) -> Tensor<'a> {
     assert_eq!(x.ty(), types::F32, "tp all-reduce: F32 only");
     let x = if x.is_contiguous() { x } else { ctx.cont(x) };
-    ctx.external_with(&ALL_REDUCE, types::F32, x.ne(), &[x], &[comm])
+    ctx.external_with(&ALL_REDUCE, types::F32, x.ne(), &[x], &[comm, 0])
+}
+
+/// `add(all_reduce(x), res)` in one op (#1133 r2): the residual (F32, `x`'s shape) added to
+/// every value's sum in the sum's kernel, after the partials. The same bits as the two ops (the
+/// sum in rank order, then one addition), without the add's pass over the sum.
+pub fn all_reduce_add<'a>(
+    ctx: &'a Context,
+    comm: i32,
+    x: Tensor<'a>,
+    res: Tensor<'a>,
+) -> Tensor<'a> {
+    assert_eq!(x.ty(), types::F32, "tp all-reduce: F32 only");
+    assert_eq!(res.ty(), types::F32, "tp all-reduce: an F32 residual");
+    assert_eq!(res.ne(), x.ne(), "tp all-reduce: the residual's shape");
+    let x = if x.is_contiguous() { x } else { ctx.cont(x) };
+    let res = if res.is_contiguous() {
+        res
+    } else {
+        ctx.cont(res)
+    };
+    ctx.external_with(&ALL_REDUCE, types::F32, x.ne(), &[x, res], &[comm, 1])
+}
+
+/// `out[i] += res[i]`: the residual of [`all_reduce_add`] and `micro::finish_add` on the CPU,
+/// ggml's add of the sum and the residual.
+pub(super) fn add_host(out: &mut [f32], res: &[f32]) {
+    for (o, r) in out.iter_mut().zip(res) {
+        *o += *r;
+    }
 }
 
 unsafe fn cpu_all_reduce(dst: &ffi::ggml_tensor, ith: usize, _nth: usize) {
@@ -27,16 +56,19 @@ unsafe fn cpu_all_reduce(dst: &ffi::ggml_tensor, ith: usize, _nth: usize) {
     if ith != 0 {
         return;
     }
-    // SAFETY: a node made by `all_reduce` on the CPU: a contiguous F32 source of its own
-    // shape, both with host data, which ggml gives the node for its compute.
-    let (src, out) = unsafe {
+    let p = external_params(dst);
+    // SAFETY: a node made by `all_reduce` or `all_reduce_add` on the CPU: a contiguous F32
+    // source (and residual) of its own shape, all with host data, which ggml gives the node
+    // for its compute.
+    let (src, out, res) = unsafe {
         let n = ffi::ggml_nelements(dst) as usize;
         (
             std::slice::from_raw_parts((*dst.src[0]).data as *const f32, n),
             std::slice::from_raw_parts_mut(dst.data as *mut f32, n),
+            (p[1] != 0).then(|| std::slice::from_raw_parts((*dst.src[1]).data as *const f32, n)),
         )
     };
-    match super::comm(external_params(dst)[0]) {
+    match super::comm(p[0]) {
         // A failure stays in the communicator, for the step to report.
         Some(c) => {
             let _ = c.all_reduce_host(src, out);
@@ -45,6 +77,9 @@ unsafe fn cpu_all_reduce(dst: &ffi::ggml_tensor, ith: usize, _nth: usize) {
             tracing::error!("tp all-reduce: the communicator is gone");
             out.copy_from_slice(src);
         }
+    }
+    if let Some(res) = res {
+        add_host(out, res);
     }
 }
 
@@ -129,6 +164,7 @@ pub(super) mod cuda {
     struct SumArgs {
         src: [*const f32; super::super::MAX_RANKS],
         dst: *mut f32,
+        res: *const f32,
         n: i64,
         n_src: i32,
     }
@@ -388,19 +424,14 @@ pub(super) mod cuda {
         // SAFETY: the caller's.
         let src = unsafe { &*dst.src[0] };
         let plan = micro_plan(&comm, &m, src);
+        // An all-reduce's residual and the column it writes from (`micro::finish_add`).
+        let (res, at) = crate::tp_net::micro::add_of(dst);
+        // SAFETY: the caller's; `finish_add` sizes the output for the columns from `at`.
+        let out = dst.data as usize + at * src.ne[0] as usize * 4;
         let seq = comm.in_flight.lock().expect("in-flight lock").pop_front();
         let r = match seq {
             // SAFETY: the caller's.
-            Some(seq) => unsafe {
-                finish(
-                    &comm,
-                    &plan,
-                    seq,
-                    src.data as usize,
-                    dst.data as usize,
-                    stream,
-                )
-            },
+            Some(seq) => unsafe { finish(&comm, &plan, seq, src.data as usize, out, res, stream) },
             None => Err("tp exchange: a finish without its start".into()),
         };
         if let Err(e) = &r {
@@ -591,11 +622,14 @@ pub(super) mod cuda {
             let started = tail.and_then(|tail| {
                 mix.and_then(|mix| start(&comm, &plan, src, stream, false, tail, mix))
             });
+            // An all-reduce's residual ([`super::all_reduce_add`]).
+            let res = (kind == Kind::AllReduce && external_params(dst)[1] != 0)
+                .then(|| (*dst.src[1]).data as usize);
             started.and_then(|seq| {
                 if defer {
                     hand_over(&comm, &plan, seq, stream)
                 } else {
-                    finish(&comm, &plan, seq, src, dst.data as usize, stream)
+                    finish(&comm, &plan, seq, src, dst.data as usize, res, stream)
                 }
             })
         };
@@ -617,9 +651,26 @@ pub(super) mod cuda {
         n: usize,
         stream: *mut c_void,
     ) -> Result<(), String> {
+        // SAFETY: the caller's.
+        unsafe { sum_add(kernel, srcs, None, dst, n, stream) }
+    }
+
+    /// [`sum`] with `res` (`n` device-readable values) added to every sum, after the partials.
+    ///
+    /// # Safety
+    /// As [`sum`].
+    unsafe fn sum_add(
+        kernel: *const c_void,
+        srcs: &[*const f32],
+        res: Option<*const f32>,
+        dst: *mut f32,
+        n: usize,
+        stream: *mut c_void,
+    ) -> Result<(), String> {
         let mut args = SumArgs {
             src: [std::ptr::null(); super::super::MAX_RANKS],
             dst,
+            res: res.unwrap_or(std::ptr::null()),
             n: n as i64,
             n_src: srcs.len() as i32,
         };
@@ -1016,19 +1067,24 @@ pub(super) mod cuda {
     }
 
     /// The second half of exchange `seq` ([`start`]): waits for every peer's share, adds them
-    /// in rank order (or copies them, an all-gather) into `dst`, raises "consumed".
+    /// in rank order (or copies them, an all-gather) into `dst`, raises "consumed". `res`: an
+    /// all-reduce's residual (#1133 r2), added to every sum after the partials.
     ///
     /// # Safety
     /// `src` and `dst` are the device addresses of the plan's source and output on `stream`'s
-    /// device.
+    /// device, `res` of the source's values to add (an all-reduce's only).
     unsafe fn finish(
         comm: &super::super::Comm,
         plan: &Plan,
         seq: u32,
         src: usize,
         dst: usize,
+        res: Option<usize>,
         stream: *mut c_void,
     ) -> Result<(), String> {
+        if res.is_some() && plan.kind != Kind::AllReduce {
+            return Err("tp exchange: only an all-reduce adds a residual".into());
+        }
         let (rank, n_ranks) = (comm.rank(), comm.n_ranks());
         let kind = plan.kind;
         let eb = plan.wire.bytes();
@@ -1139,7 +1195,9 @@ pub(super) mod cuda {
                 } else {
                     legion_tp_net_sum_kernel
                 };
-                sum(kernel, &srcs, dst as *mut f32, mine.1, stream)?;
+                // An all-reduce's piece is all of its values.
+                let res = res.map(|r| r as *const f32);
+                sum_add(kernel, &srcs, res, dst as *mut f32, mine.1, stream)?;
             }
             check(
                 "cuStreamWriteValue32",

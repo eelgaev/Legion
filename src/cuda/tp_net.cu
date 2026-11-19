@@ -14,16 +14,48 @@ constexpr int MAX_RANKS = 8;  // tp_net::MAX_RANKS
 struct tp_sum_args {
     const float * src[MAX_RANKS];
     float * dst;
+    // A residual added to every sum after the partials (#1133 r2): ggml's add of the sum and
+    // the residual, one rounding more; null without.
+    const float * res;
     int64_t n;
     int32_t n_src;
 };
 
+// The sum, 16 bytes a thread where every pointer is 16-byte aligned (#1133 r2: a prompt step's
+// sums are long and read memory-bound): every value the same additions in the same order.
 __global__ void tp_sum(const tp_sum_args a) {
     const int64_t stride = (int64_t) gridDim.x * blockDim.x;
-    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < a.n; i += stride) {
+    const int64_t first = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    uintptr_t align = (uintptr_t) a.dst | (uintptr_t) a.res;
+    for (int r = 0; r < a.n_src; ++r) {
+        align |= (uintptr_t) a.src[r];
+    }
+    const int64_t nv = (align & 15) == 0 ? a.n / 4 : 0;
+    for (int64_t i = first; i < nv; i += stride) {
+        float4 acc = ((const float4 *) a.src[0])[i];
+        for (int r = 1; r < a.n_src; ++r) {
+            const float4 v = ((const float4 *) a.src[r])[i];
+            acc.x = __fadd_rn(acc.x, v.x);
+            acc.y = __fadd_rn(acc.y, v.y);
+            acc.z = __fadd_rn(acc.z, v.z);
+            acc.w = __fadd_rn(acc.w, v.w);
+        }
+        if (a.res) {
+            const float4 v = ((const float4 *) a.res)[i];
+            acc.x = __fadd_rn(acc.x, v.x);
+            acc.y = __fadd_rn(acc.y, v.y);
+            acc.z = __fadd_rn(acc.z, v.z);
+            acc.w = __fadd_rn(acc.w, v.w);
+        }
+        ((float4 *) a.dst)[i] = acc;
+    }
+    for (int64_t i = nv * 4 + first; i < a.n; i += stride) {
         float acc = a.src[0][i];
         for (int r = 1; r < a.n_src; ++r) {
             acc = __fadd_rn(acc, a.src[r][i]);
+        }
+        if (a.res) {
+            acc = __fadd_rn(acc, a.res[i]);
         }
         a.dst[i] = acc;
     }
@@ -37,6 +69,9 @@ __global__ void tp_sum_bf16(const tp_sum_args a) {
         float acc = __bfloat162float(((const __nv_bfloat16 *) a.src[0])[i]);
         for (int r = 1; r < a.n_src; ++r) {
             acc = __fadd_rn(acc, __bfloat162float(((const __nv_bfloat16 *) a.src[r])[i]));
+        }
+        if (a.res) {
+            acc = __fadd_rn(acc, a.res[i]);
         }
         a.dst[i] = acc;
     }

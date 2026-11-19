@@ -485,6 +485,56 @@ fn the_graph_op_sums_on_the_cpu() {
     }
 }
 
+/// `all_reduce_add` (#1133 r2) through a CPU graph on every rank: the bits of ggml's add of the
+/// all-reduce and the residual, on every rank.
+#[test]
+fn the_graph_op_adds_a_residual_on_the_cpu() {
+    let cs = comms(2, Duration::from_secs(20));
+    let threads: Vec<_> = cs
+        .into_iter()
+        .enumerate()
+        .map(|(r, c)| {
+            std::thread::spawn(move || {
+                let handle = register(c);
+                let mut backend = Backend::cpu().unwrap();
+                let ctx = Context::new(16, 16);
+                let x = ctx.new_tensor(types::F32, &[6, 5]).as_input();
+                let res = ctx.new_tensor(types::F32, &[6, 5]).as_input();
+                let fused = all_reduce_add(&ctx, handle.id(), x, res).as_output();
+                let plain = ctx.add(all_reduce(&ctx, handle.id(), x), res).as_output();
+                let mut graph = ctx.new_graph(16);
+                graph.expand(fused);
+                graph.expand(plain);
+                ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+                    .unwrap();
+                let mut out = Vec::new();
+                for k in 0..3 {
+                    x.set_f32(&partial(r, k, 30));
+                    // The same residual on every rank (a layer's input).
+                    res.set_f32(&partial(1, k + 5, 30));
+                    backend.compute(&graph).unwrap();
+                    out.push((fused.to_f32(), plain.to_f32()));
+                }
+                assert!(handle.comm().error().is_none());
+                out
+            })
+        })
+        .collect();
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    for k in 0..3 {
+        let want: Vec<f32> = rank_order_sum(2, k, 30)
+            .iter()
+            .zip(partial(1, k + 5, 30))
+            .map(|(s, x)| s + x)
+            .collect();
+        for r in &results {
+            assert_eq!(bits(&r[k].0), bits(&want));
+            assert_eq!(bits(&r[k].1), bits(&want));
+        }
+    }
+}
+
 #[test]
 fn handles_unregister() {
     let cs = comms(2, Duration::from_secs(5));

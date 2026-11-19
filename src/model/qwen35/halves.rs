@@ -14,7 +14,7 @@
 mod tests;
 
 use crate::ggml::Tensor;
-use crate::model::core::{Model, ModelError, Pass, cols};
+use crate::model::core::{FfnFusion, Model, ModelError, Pass, cols};
 use crate::tp_net::micro;
 
 /// Tokens each half of a prompt step needs (a shorter step has little wire time to hide; the
@@ -78,7 +78,7 @@ pub(super) fn views<'a>(pass: &Pass<'a>, x: Tensor<'a>) -> [Tensor<'a>; 2] {
 /// and the halves `xs` of its input ([`views`]): per half the mixer's sum, the residual add,
 /// the post-attention norm, the FFN, its sum and the residual add, the sums started over
 /// `comm` in the order that overlaps them with the other half's FFN. Returns the layer's
-/// output with the halves joined.
+/// output, both halves' FFN sums written into one tensor (#1133 r2: no concatenation).
 pub(super) fn tail<'a>(
     m: &'a Model,
     pass: &Pass<'a>,
@@ -105,24 +105,25 @@ pub(super) fn tail<'a>(
     let s0 = start(cols(ctx, attn, 0, n0));
     let s1 = start(cols(ctx, attn, n0, n1));
     let norm_w = m.lw(il, "post_attention_norm.weight")?;
-    // A half's mixer sum finished, its residual, and its FFN's sum started.
-    let ffn = |s: micro::Started<'a>, x: Tensor<'a>| -> Result<_, ModelError> {
-        let a = micro::finish(ctx, s, None);
-        add(a);
-        let x_attn = ctx.add(a, x);
+    // A half's mixer sum finished with its residual added (#1133 r2: in the sum's kernel),
+    // and its FFN's sum started. The post-attention norm rides in the W4A4 SwiGLU's
+    // quantization, as on one GPU (ggml's bits).
+    let ffn = |s: micro::Started<'a>, x: Tensor<'a>, width: i64| -> Result<_, ModelError> {
+        let x_attn = micro::finish_add(ctx, s, x, width, 0, None);
+        add(x_attn);
         let h = m.norm_mul(pass, x_attn, norm_w);
-        Ok((x_attn, start(m.ffn(ctx, il, h)?)))
+        let fusion = FfnFusion {
+            res: None,
+            norm: Some((x_attn, norm_w, m.hp.rms_eps)),
+        };
+        Ok((x_attn, start(m.ffn_fused(ctx, il, h, fusion)?)))
     };
-    let (xa0, f0) = ffn(s0, xs[0])?;
-    let (xa1, f1) = ffn(s1, xs[1])?;
-    let out = |s: micro::Started<'a>, x_attn: Tensor<'a>| {
-        let f = micro::finish(ctx, s, None);
-        add(f);
-        let y = ctx.add(f, x_attn);
-        add(y);
-        y
-    };
-    let y0 = out(f0, xa0);
-    let y1 = out(f1, xa1);
-    Ok(ctx.concat(y0, y1, 1))
+    let (xa0, f0) = ffn(s0, xs[0], n0)?;
+    let (xa1, f1) = ffn(s1, xs[1], n1)?;
+    // The FFN sums with their residuals, both halves into one `[n_embd, n]` output.
+    let y0 = micro::finish_add(ctx, f0, xa0, n, 0, None);
+    add(y0);
+    let y = micro::finish_add(ctx, f1, xa1, n, n0, Some(y0));
+    add(y);
+    Ok(y)
 }
