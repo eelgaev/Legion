@@ -184,6 +184,123 @@ fn the_mtp_head_is_cut_like_the_target() {
     }
 }
 
+fn f32s(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
+}
+
+/// `whole` as a checkpoint with channel-wise FP8 weights opens: plus a computed F32 per-row
+/// scale `<name>.scale` (values 0.5, 1.5, ...: row `i` holds `i + 0.5`) for each weight of `of`.
+fn with_row_scales(whole: &GgufFile, of: &[&str]) -> GgufFile {
+    let mut meta = GgufWriter::new();
+    for (k, v) in whole.metadata() {
+        meta.set(&k, &v).unwrap();
+    }
+    let paths: Vec<PathBuf> = whole.shard_paths().map(|p| p.to_path_buf()).collect();
+    let mut tensors = whole.tensors();
+    let mut recipes = HashMap::new();
+    for w in of {
+        let rows = whole.tensor(w).unwrap().shape[1];
+        let v: Vec<u8> = (0..rows)
+            .flat_map(|i| (0.5 + i as f32).to_le_bytes())
+            .collect();
+        let name = format!("{}.scale", w.strip_suffix(".weight").unwrap());
+        tensors.push(TensorInfo {
+            name: name.clone(),
+            ggml_type: crate::ggml::types::F32,
+            shape: vec![rows],
+            file_index: 0,
+            offset: 0,
+            size: 4 * rows,
+        });
+        recipes.insert(
+            name,
+            Recipe::Computed(std::sync::Arc::new(move || Ok(v.clone()))),
+        );
+    }
+    GgufFile::synthetic(meta, whole.path().to_path_buf(), paths, tensors, recipes).unwrap()
+}
+
+#[test]
+fn per_row_scales_are_cut_with_their_weights_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let (whole, _) = tiny(dir.path());
+    let d = Dims::of_arch(&whole, "qwen35").unwrap();
+    let down = |il: usize| {
+        whole
+            .tensor(&format!("blk.{il}.ffn_down.weight"))
+            .map(|t| t.ggml_type)
+    };
+    // Cut by rows (queries, keys, DeltaNet q/k/v and gate, FFN gate) and by columns (the
+    // attention, DeltaNet and FFN outputs, whose rows are the embedding).
+    let weights = [
+        "blk.3.attn_q.weight",
+        "blk.3.attn_k.weight",
+        "blk.3.attn_output.weight",
+        "blk.0.attn_qkv.weight",
+        "blk.0.attn_gate.weight",
+        "blk.0.ssm_out.weight",
+        "blk.1.ffn_gate.weight",
+        "blk.1.ffn_down.weight",
+    ];
+    let synth = with_row_scales(&whole, &weights);
+    let (mut by_rows, mut whole_scales) = (0, 0);
+    for rank in 0..2 {
+        let plain = view(&whole, rank, 2).unwrap();
+        let share = view(&synth, rank, 2).unwrap();
+        for w in weights {
+            assert_eq!(bytes(&share, w), bytes(&plain, w), "{w} rank {rank}");
+            let s = format!("{}.scale", w.strip_suffix(".weight").unwrap());
+            let t = whole.tensor(w).unwrap();
+            let want: Vec<f32> = match piece(&d, &t, &down, 2, rank).unwrap() {
+                Piece::Rows(r) => {
+                    by_rows += 1;
+                    r.iter()
+                        .flat_map(|&(a, l)| (a..a + l).map(|i| 0.5 + i as f32))
+                        .collect()
+                }
+                _ => {
+                    whole_scales += 1;
+                    (0..t.shape[1]).map(|i| 0.5 + i as f32).collect()
+                }
+            };
+            let got = f32s(&bytes(&share, &s));
+            assert_eq!(got.len() as u64, share.tensor(w).unwrap().shape[1], "{s}");
+            assert_eq!(got, want, "{s} rank {rank}");
+        }
+    }
+    assert_eq!((by_rows, whole_scales), (10, 6));
+}
+
+#[test]
+fn a_per_row_scale_must_match_its_weights_rows() {
+    let t = |name: &str, shape: Vec<u64>| TensorInfo {
+        name: name.into(),
+        ggml_type: crate::ggml::types::F32,
+        shape,
+        file_index: 0,
+        offset: 0,
+        size: 0,
+    };
+    let w = t("blk.0.attn_q.weight", vec![64, 32]);
+    let rows = Piece::Rows(vec![(0, 8), (16, 8)]);
+    assert_eq!(
+        scale_piece(&t("blk.0.attn_q.scale", vec![32]), &w, rows.clone()),
+        Ok(Piece::Cols(vec![(0, 8), (16, 8)]))
+    );
+    assert_eq!(
+        scale_piece(
+            &t("blk.0.attn_q.scale", vec![32]),
+            &w,
+            Piece::Cols(vec![(0, 32)])
+        ),
+        Ok(Piece::Mirrored)
+    );
+    assert!(scale_piece(&t("blk.0.attn_q.scale", vec![64]), &w, rows.clone()).is_err());
+    assert!(scale_piece(&t("blk.0.attn_q.scale", vec![32, 1]), &w, rows).is_err());
+}
+
 #[test]
 fn shares_refuse_other_architectures_and_odd_splits() {
     let dir = tempfile::tempdir().unwrap();

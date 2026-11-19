@@ -9,6 +9,9 @@
 //! - **FFN (SwiGLU):** `ffn_gate`/`ffn_up` by rows, `ffn_down` by the same columns, in whole
 //!   [`super::ffn_rows`] (256-row granules when they divide evenly, else whole blocks of the
 //!   down projection's type).
+//! - **Per-row weight scales** (a channel-wise FP8 weight's `.scale`, F32 `[rows]`, as in
+//!   unsloth's Qwen3.8-27B NVFP4 checkpoint, whose attention and DeltaNet projections are FP8):
+//!   with their weight's rows ([`scale_piece`]); whole for a weight cut by columns.
 //! - Everything else (embeddings, norms, the output head, the MTP head's `nextn.*`): mirrored.
 //!
 //! The mixture-of-experts sibling (`qwen35moe`) is refused: its experts would need expert
@@ -128,6 +131,38 @@ pub fn piece(
     qwen4::piece(d, t, &|_, _| None, n, rank)
 }
 
+/// The weight `<name>.weight` whose per-row scale `t` is: a `<name>.scale` of more than one
+/// value (a channel-wise FP8 weight's, F32 `[rows]`); `None` for any other tensor (a
+/// per-tensor scale is mirrored like any vector).
+fn scaled_weight<'a>(
+    t: &TensorInfo,
+    by_name: &HashMap<&str, &'a TensorInfo>,
+) -> Option<&'a TensorInfo> {
+    let base = t.name.strip_suffix(".scale")?;
+    if t.shape.iter().product::<u64>() <= 1 {
+        return None;
+    }
+    by_name.get(format!("{base}.weight").as_str()).copied()
+}
+
+/// How the per-row scale `scale` of weight `w` is cut when `w` is cut as `p`: the scale's
+/// values are `w`'s rows, so it keeps the rows `w` keeps (cut by rows), or all of them (`w`
+/// cut by columns, or mirrored).
+pub fn scale_piece(scale: &TensorInfo, w: &TensorInfo, p: Piece) -> Result<Piece, String> {
+    let rows = w.shape.get(1).copied().unwrap_or(1);
+    if w.shape.len() != 2 || scale.shape.len() != 1 || scale.shape[0] != rows {
+        return Err(format!(
+            "{}: shape {:?} is not one scale per row of {} {:?}",
+            scale.name, scale.shape, w.name, w.shape
+        ));
+    }
+    match p {
+        Piece::Rows(r) => Ok(Piece::Cols(r)),
+        Piece::Cols(_) | Piece::Mirrored => Ok(Piece::Mirrored),
+        Piece::Experts(_) => Err(format!("{}: per-row scales of whole experts", scale.name)),
+    }
+}
+
 /// Every tensor of `gguf` cut by `d` into rank `rank`'s share over `n`, with metadata `meta`
 /// (and this rank's `feed_forward_length`).
 fn cut(
@@ -147,9 +182,14 @@ fn cut(
     let mut out = Vec::with_capacity(tensors.len());
     let mut recipes = HashMap::new();
     let mut n_ff = None;
-    for t in tensors {
-        let p = piece(d, &t, &down, n, rank)?;
-        let s = qwen4::apply(gguf, &paths, &t, p, &mut recipes)?;
+    let by_name: HashMap<&str, &TensorInfo> =
+        tensors.iter().map(|t| (t.name.as_str(), t)).collect();
+    for t in &tensors {
+        let p = match scaled_weight(t, &by_name) {
+            Some(w) => scale_piece(t, w, piece(d, w, &down, n, rank)?)?,
+            None => piece(d, t, &down, n, rank)?,
+        };
+        let s = qwen4::apply(gguf, &paths, t, p, &mut recipes)?;
         if t.name.ends_with(".ffn_down.weight") {
             n_ff.get_or_insert(s.shape[0]);
         }
