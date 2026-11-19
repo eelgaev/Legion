@@ -371,6 +371,12 @@ pub struct ResidencyConfig {
     /// a long prompt reads the experts already cached and copies in only the others. The
     /// engine measures it at load; empty: every slot is lent.
     pub lend_need: Vec<u64>,
+    /// With the automatic keep ([`Self::lend_need`]): the longest prompt (tokens still to
+    /// read) whose one step fits beside the kept slots (#37: one GPU with every expert in host
+    /// memory, measured at load). A lend for a longer one keeps nothing and lends every slot
+    /// whole, as without a keep: its one big step needs the room. The engine sets it;
+    /// `usize::MAX`: every lend keeps.
+    pub lend_spread_upto: usize,
     /// Layers from this one read their experts in place during a long prompt and lend all
     /// their slots (an MTP head's; see [`experts::ExpertResidency::stage_below`]); `None`:
     /// every layer stages.
@@ -451,6 +457,7 @@ impl Default for ResidencyConfig {
             lend_spread: false,
             lend_repack: 40960,
             lend_need: Vec::new(),
+            lend_spread_upto: usize::MAX,
             stage_below: None,
             learn_long: true,
             cpu_share: cpu_share::CpuShareConfig::default(),
