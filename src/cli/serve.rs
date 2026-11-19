@@ -759,14 +759,15 @@ pub(super) struct ModelArgs {
     /// With --tp-mtp-chain, a decode draft round's rows from the verify step too (#1176).
     #[arg(long)]
     pub tp_mtp_local_rows: bool,
-    /// With --tp-rank on two machines, on rank 0, Qwen3.8-Flash-Next (qwen4exp) with a plain
-    /// output head (the NVFP4 checkpoint's BF16 head): a decode or verify step whose rows are
+    /// With --tp-rank on two machines, on rank 0, Qwen3.8-Flash-Next (qwen4exp) or Gemma 4
+    /// with a plain output head (the NVFP4 checkpoints' BF16 heads; Gemma's is tied to the
+    /// embeddings, 2.8 GB on the 31B): a decode or verify step whose rows are
     /// all greedy picks computes its output head as two shares of the vocabulary, one on each
     /// rank, instead of all of it on rank 0 while the other rank waits. Each rank finds its
     /// share's best token per row (by value, then the device argmax's tie order), rank 1
     /// answers the step with its candidates and rank 0 keeps the better one: the same pick as
-    /// the whole head's. The head reads its whole weight every step (1.27 GB on this model),
-    /// so each rank reads half of it. Steps with sampled rows, log probabilities or picks below
+    /// the whole head's. The head reads its whole weight every step (1.27 GB on
+    /// Qwen3.8-Flash-Next), so each rank reads half of it. Steps with sampled rows, log probabilities or picks below
     /// min_tokens keep the whole head on rank 0. Off (default): rank 0 computes the head.
     #[arg(long)]
     pub tp_head_split: bool,
