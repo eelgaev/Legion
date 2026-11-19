@@ -70,7 +70,7 @@ use mtp_graphs::{MtpGraphs, take_in_waits_for_reuse};
 use mtp_pipe::{InFlight, Pass};
 use rows::DeferredRows;
 
-pub use mtp_chain::ChainOutput;
+pub use mtp_chain::{ChainOutput, PassRow};
 pub use mtp_graphs::set_kept as set_mtp_kept_graphs;
 pub use prompt_ahead::PromptNext;
 pub use prompt_ahead::set_enabled as set_prompt_build_ahead;

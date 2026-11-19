@@ -28,7 +28,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// Frames before this version are refused: both ranks must run the same build.
-const VERSION: u32 = 8;
+const VERSION: u32 = 9;
 
 /// The node settings of a `legion serve` (`--node-rank`, `--node-peer`, `--node-split`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,7 +150,9 @@ pub enum Request {
     /// row stops. The first pass's residual rows come in `parts` as [`Self::TpMtpRows`]'
     /// (all sent unless `--tp-mtp-local-rows`). `tails`: per output row, the last tokens fed
     /// up to its bonus token (at most 8), so every rank reads the n-gram rows of the round's
-    /// tokens while it drafts, as rank 0 does (empty: none read).
+    /// tokens while it drafts, as rank 0 does (empty: none read). `pad_to`: the rows each
+    /// sequence feeds the verify step after the round (its bonus token, drafts and padding;
+    /// 0: not known), so the rows of the padding are read ahead too (#1176).
     TpMtpChain {
         groups: Vec<WireGroup>,
         gather_budget: u64,
@@ -159,6 +161,7 @@ pub enum Request {
         caps: Vec<u32>,
         p_min: u32,
         tails: Vec<Vec<u32>>,
+        pad_to: u32,
     },
     /// [`Self::TpMtp`] whose residual rows come in `parts`, one after another
     /// (`--tp-mtp-local-rows`, #780): sent ones are the next floats of `h`, the others a range
@@ -513,6 +516,7 @@ impl Request {
                 caps,
                 p_min,
                 tails,
+                pad_to,
             } => {
                 put_groups(&mut head, &groups);
                 head.extend_from_slice(&gather_budget.to_le_bytes());
@@ -523,6 +527,7 @@ impl Request {
                 for t in &tails {
                     put_u32s(&mut head, t);
                 }
+                put_u32(&mut head, pad_to);
                 bulk = h;
                 K_TP_MTP_CHAIN
             }
@@ -643,6 +648,7 @@ impl Request {
                     caps,
                     p_min,
                     tails,
+                    pad_to: r.u32()?,
                 }
             }
             K_TP_MTP_ROWS => Request::TpMtpRows {

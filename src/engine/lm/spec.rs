@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::engine::sampling::{Dist, Sampler};
-use crate::model::core::{Executor, Group, Logits, Media, SeqInput};
+use crate::model::core::{Executor, Group, Logits, Media, PassRow, SeqInput};
 use crate::spec::accept::Target;
 use crate::spec::dflash::{DflashDrafter, DflashOptions};
 use crate::spec::draft::DraftModel;
@@ -219,17 +219,75 @@ pub(super) fn ngram_tail(fed: &[u32]) -> &[u32] {
     &fed[fed.len().saturating_sub(8)..]
 }
 
-/// [`MtpDrafter::prefetch_rows`] for a sequence fed `fed` (up to its bonus token) and drafted
-/// `drafts` so far.
-pub(super) fn prefetch_after(exec: &Executor, fed: &[u32], drafts: &[(u32, f32)]) {
-    let all: Vec<u32> = ngram_tail(fed)
-        .iter()
-        .copied()
-        .chain(drafts.iter().map(|d| d.0))
+/// The tokens of a draft round's row whose n-gram rows a pass leaves to read (`(all, n)`: the
+/// last `n` of `all`, which also holds the tokens before them): its new draft, and once it is
+/// done the padding the verify step feeds after its drafts (its bonus token again, up to
+/// `pad_to` rows a sequence, as the engine's `fed_tokens` pads). `fed`: its tokens up to its
+/// bonus token. `padded`: whether the step after the round verifies (some row drafted).
+pub(super) fn pass_tokens(
+    fed: &[u32],
+    row: &PassRow<'_>,
+    pad_to: usize,
+    padded: bool,
+) -> (Vec<u32>, usize) {
+    let Some(&bonus) = fed.last() else {
+        return (Vec::new(), 0);
+    };
+    let pads = if row.done && padded {
+        pad_to.saturating_sub(1 + row.drafts.len())
+    } else {
+        0
+    };
+    let all: Vec<u32> = (ngram_tail(fed).iter().copied())
+        .chain(row.drafts.iter().map(|d| d.0))
+        .chain(std::iter::repeat_n(bonus, pads))
         .collect();
-    let (tok, before) = all.split_last().expect("the bonus token at least");
-    exec.model()
-        .prefetch_ngram(before, std::slice::from_ref(tok));
+    (all, usize::from(row.new) + pads)
+}
+
+/// Starts reading the n-gram rows a draft pass's rows `seen` add to the verify step after the
+/// round, all in one batch ([`pass_tokens`]; `fed(k)`: row `k`'s tokens up to its bonus
+/// token). Read one batch per sequence and with no padding, a 16-sequence verify step on two
+/// DGX Sparks still missed ~16 rows (the padding's, median; p90 64) and the second rank asked
+/// the first for the rows 16 times a pass (#1176).
+pub(super) fn prefetch_pass<'f>(
+    exec: &Executor,
+    fed: impl Fn(usize) -> &'f [u32],
+    seen: &[PassRow<'_>],
+    pad_to: usize,
+) {
+    // A round where no row drafted is followed by a decode step: nothing padded.
+    let padded = seen.iter().any(|r| !r.drafts.is_empty());
+    let reads: Vec<(Vec<u32>, usize)> = (seen.iter())
+        .map(|r| pass_tokens(fed(r.k), r, pad_to, padded))
+        .filter(|(_, n)| *n > 0)
+        .collect();
+    if reads.is_empty() {
+        return;
+    }
+    let seqs: Vec<(&[u32], &[u32])> = (reads.iter())
+        .map(|(all, n)| all.split_at(all.len() - n))
+        .collect();
+    exec.model().prefetch_ngram_seqs(&seqs);
+}
+
+/// Whether a draft round reads the verify step's padding rows ahead (#1176):
+/// `LEGION_DEBUG_NGRAM_PADS=0` leaves them to the verify step's fill, as before (A/B only).
+pub(super) fn pads_ahead() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_NGRAM_PADS").is_none_or(|v| v != "0"))
+}
+
+/// Starts reading the n-gram rows of the bonus tokens `alls` end with (each after the tokens
+/// before it there), in one batch.
+pub(super) fn prefetch_bonus(exec: &Executor, alls: &[Vec<u32>]) {
+    let seqs: Vec<(&[u32], &[u32])> = (alls.iter())
+        .filter_map(|a| a.split_last())
+        .map(|(tok, before)| (before, std::slice::from_ref(tok)))
+        .collect();
+    if !seqs.is_empty() {
+        exec.model().prefetch_ngram_seqs(&seqs);
+    }
 }
 
 /// Whether an MTP take-in pass orders its sequences by their rows ([`MtpDrafter::step`], #858;
@@ -264,6 +322,9 @@ pub(super) struct MtpDrafter {
     /// The sequences with images: the head embeds their image rows and places every position
     /// as the target does (M-RoPE, #1195).
     media: HashMap<SeqId, Arc<Media>>,
+    /// The rows each sequence feeds the verify step after this round, padding included
+    /// ([`Self::set_verify_rows`]; 0: not known).
+    verify_rows: usize,
 }
 
 impl MtpDrafter {
@@ -272,11 +333,19 @@ impl MtpDrafter {
             p_min,
             pending: HashMap::new(),
             media: HashMap::new(),
+            verify_rows: 0,
         }
     }
 
     pub(super) fn set_p_min(&mut self, p_min: f32) {
         self.p_min = p_min;
+    }
+
+    /// The rows a sequence feeds the verify step after the next round (its bonus token, its
+    /// drafts and the padding after them), where that does not depend on the round's drafts:
+    /// a round run as a chain reads the padding's n-gram rows ahead too (#1176). 0: none.
+    pub(super) fn set_verify_rows(&mut self, rows: usize) {
+        self.verify_rows = rows;
     }
 
     pub(super) fn set_media(&mut self, seq: SeqId, media: Arc<Media>) {
@@ -432,9 +501,24 @@ impl MtpDrafter {
                 "mtp take-in pieces"
             );
         }
-        // The bonus tokens' n-gram rows, read while the head runs.
-        for r in batch.iter().filter(|r| r.max > 0) {
-            Self::prefetch_rows(exec, r);
+        // The bonus tokens' n-gram rows, read while the head runs: in one batch for a round
+        // run as a chain (#1176).
+        if exec.mtp_chains() || exec.mtp_ahead() {
+            let alls: Vec<Vec<u32>> = (batch.iter().filter(|r| r.max > 0))
+                .map(|r| {
+                    let fed = &r.tokens[..r.start + r.ran + 1];
+                    ngram_tail(fed)
+                        .iter()
+                        .chain(&r.out.tokens)
+                        .copied()
+                        .collect()
+                })
+                .collect();
+            prefetch_bonus(exec, &alls);
+        } else {
+            for r in batch.iter().filter(|r| r.max > 0) {
+                Self::prefetch_rows(exec, r);
+            }
         }
         // Take in, and the first draft. The sequences go in order of their rows (stable), so
         // the pass's shape is the multiset of their take-in rows, not their order: at 4
@@ -685,6 +769,7 @@ impl MtpDrafter {
         } else {
             Vec::new()
         };
+        let pad_to = self.verify_rows;
         let out = exec
             .mtp_chain(
                 groups,
@@ -693,7 +778,8 @@ impl MtpDrafter {
                 &first,
                 self.p_min,
                 &tails,
-                |exec, k, drafts| prefetch_after(exec, fed[k], drafts),
+                pad_to,
+                |exec, seen| prefetch_pass(exec, |k| fed[k], seen, pad_to),
             )
             .map_err(|e| e.to_string())?;
         for r in batch.iter() {

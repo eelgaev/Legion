@@ -772,6 +772,7 @@ fn handle(
             caps,
             p_min,
             tails,
+            pad_to,
         } => {
             // Rank 0's whole draft round: the same passes from the same picks (#771), reading
             // this rank's copy of the step's rows where rank 0 names them (#780).
@@ -781,11 +782,11 @@ fn handle(
             let t0 = std::time::Instant::now();
             comm.mark_step(profile);
             // The n-gram rows the verify step after the round reads, started as rank 0 starts
-            // its own (#1176): the bonus tokens' now, each draft's once drafted.
-            for t in tails.iter().filter(|t| !t.is_empty()) {
-                super::spec::prefetch_after(exec, t, &[]);
-            }
+            // its own (#1176): the bonus tokens' now, each pass's drafts (and the padding of
+            // the rows done) once drafted, one batch each.
+            super::spec::prefetch_bonus(exec, &tails);
             let first: Vec<usize> = (0..caps.len()).collect();
+            let pad_to = pad_to as usize;
             exec.mtp_chain(
                 &groups,
                 &parts,
@@ -793,10 +794,10 @@ fn handle(
                 &first,
                 f32::from_bits(p_min),
                 &[],
-                |exec, k, drafts| {
-                    if let Some(t) = tails.get(k) {
-                        super::spec::prefetch_after(exec, t, drafts);
-                    }
+                0,
+                |exec, seen| {
+                    let fed = |k: usize| tails.get(k).map_or(&[][..], Vec::as_slice);
+                    super::spec::prefetch_pass(exec, fed, seen, pad_to);
                 },
             )
             .map_err(|e| e.to_string())?;

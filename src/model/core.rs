@@ -115,8 +115,8 @@ mod window_attn;
 
 pub use arch::{Arch, ArchRef, Recurrent, TokenConv};
 pub use exec::{
-    ChainOutput, Executor, LENT_SCRATCH, Pool, PromptNext, Remote, StateCapture, StepPart, TpLead,
-    default_verify_budget, from_wire, set_mtp_kept_graphs, set_prompt_buffer_reserve,
+    ChainOutput, Executor, LENT_SCRATCH, PassRow, Pool, PromptNext, Remote, StateCapture, StepPart,
+    TpLead, default_verify_budget, from_wire, set_mtp_kept_graphs, set_prompt_buffer_reserve,
     set_prompt_build_ahead, set_prompt_step_stats, set_verify_kept_graphs, verify_kept_graphs,
 };
 pub use kv_type::{KvType, KvTypes};

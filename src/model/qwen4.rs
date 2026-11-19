@@ -1704,26 +1704,32 @@ impl Model {
         self.prefetch_ngram_for(before, tokens, true);
     }
 
+    /// [`Self::prefetch_ngram`] of several sequences' tokens at once (`(before, tokens)` each):
+    /// one read-ahead batch for all of them, as a draft pass's tokens (#1176: one ask of rank
+    /// 0 per pass instead of one per sequence).
+    pub fn prefetch_ngram_seqs(&self, seqs: &[(&[u32], &[u32])]) {
+        let ple = params(&self.hp).and_then(|p| p.ple.as_ref());
+        let (Some(ple), Some(store)) = (ple, &self.ngram) else {
+            return;
+        };
+        let mut rows = Vec::new();
+        for &(before, tokens) in seqs {
+            ngram_rows_after(ple, before, tokens, &mut rows);
+        }
+        if rows.is_empty() {
+            return;
+        }
+        let rows: Vec<u32> = rows.iter().map(|&r| r as u32).collect();
+        store.prefetch(&rows);
+    }
+
     fn prefetch_ngram_for(&self, before: &[u32], tokens: &[u32], next: bool) {
         let ple = params(&self.hp).and_then(|p| p.ple.as_ref());
         let (Some(ple), Some(store)) = (ple, &self.ngram) else {
             return;
         };
-        let n_prev = ple.ngram - 1;
-        let mut prev: Vec<u32> = std::iter::repeat_n(crate::model::core::state::NO_TOKEN, n_prev)
-            .chain(
-                before[before.len().saturating_sub(n_prev)..]
-                    .iter()
-                    .copied(),
-            )
-            .collect();
-        prev.drain(..prev.len() - n_prev);
         let mut rows = Vec::new();
-        for &tok in tokens {
-            ple.rows(tok, &prev, &mut rows);
-            prev.remove(0);
-            prev.push(tok);
-        }
+        ngram_rows_after(ple, before, tokens, &mut rows);
         let rows: Vec<u32> = rows.iter().map(|&r| r as u32).collect();
         if next {
             store.prefetch_next(&rows);
@@ -1928,6 +1934,25 @@ impl Model {
             });
         }
         out
+    }
+}
+
+/// Adds to `rows` the n-gram table rows of `tokens`, which follow `before` in a sequence (its
+/// tokens so far; empty at its start).
+fn ngram_rows_after(ple: &PleParams, before: &[u32], tokens: &[u32], rows: &mut Vec<i32>) {
+    let n_prev = ple.ngram - 1;
+    let mut prev: Vec<u32> = std::iter::repeat_n(crate::model::core::state::NO_TOKEN, n_prev)
+        .chain(
+            before[before.len().saturating_sub(n_prev)..]
+                .iter()
+                .copied(),
+        )
+        .collect();
+    prev.drain(..prev.len() - n_prev);
+    for &tok in tokens {
+        ple.rows(tok, &prev, rows);
+        prev.remove(0);
+        prev.push(tok);
     }
 }
 

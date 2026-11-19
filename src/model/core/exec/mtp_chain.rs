@@ -34,6 +34,20 @@ pub struct ChainOutput {
     pub passes: usize,
 }
 
+/// A row of a draft round after one of its passes, as [`Executor::mtp_chain`]'s `on_pass`
+/// sees it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PassRow<'d> {
+    /// Its index in the round's order (the order of its caps).
+    pub k: usize,
+    /// Its drafts so far.
+    pub drafts: &'d [(u32, f32)],
+    /// Whether this pass drafted one more (the last of `drafts`).
+    pub new: bool,
+    /// Whether it drafts no more: this pass's pick fell under the floor, or it is at its cap.
+    pub done: bool,
+}
+
 /// One output row of the first pass: where its next draft goes.
 #[derive(Clone, Copy)]
 struct Row<'b> {
@@ -93,12 +107,15 @@ impl Executor {
     /// output row of the first pass (the sequences with logits, in order), its row `k`; the
     /// further passes run their rows in the order of `k`, so a first pass whose sequences are
     /// ordered otherwise (`MtpDrafter`'s take-in sort, `crate::engine::lm`) is followed by the
-    /// passes of a round without that order. `on_draft(exec, k, drafts)` sees each row's
-    /// drafts so far after each new one (rank 0 starts reading the drafts' n-gram rows there).
+    /// passes of a round without that order. `on_pass(exec, rows)` sees, after each pass, the
+    /// rows that pass ran ([`PassRow`]: their drafts so far, whether it drafted one more and
+    /// whether they are done), so the n-gram rows of a whole pass's new tokens are read in
+    /// one batch.
     /// Every pass runs on this rank only, except that a rank 0 of [`Self::mtp_chains`] first
     /// sends the round to the other ranks, which run the same passes (there `first` must be
     /// `0..`: the request carries no order) and read the n-gram rows of its tokens from
-    /// `tails` (per row `k`, its last tokens fed up to the bonus token; see
+    /// `tails` (per row `k`, its last tokens fed up to the bonus token) and `pad_to` (the rows
+    /// per sequence of the verify step after the round, padding included; see
     /// [`Request::TpMtpChain`]).
     #[allow(clippy::too_many_arguments)]
     pub fn mtp_chain(
@@ -109,10 +126,11 @@ impl Executor {
         first: &[usize],
         p_min: f32,
         tails: &[&[u32]],
-        on_draft: impl FnMut(&Executor, usize, &[(u32, f32)]),
+        pad_to: usize,
+        on_pass: impl FnMut(&Executor, &[PassRow<'_>]),
     ) -> Result<ChainOutput, ModelError> {
         if !self.mtp_chains() {
-            return self.mtp_chain_here(groups, parts, caps, first, p_min, on_draft);
+            return self.mtp_chain_here(groups, parts, caps, first, p_min, on_pass);
         }
         if first.iter().enumerate().any(|(j, &k)| j != k) {
             return Err(ModelError::Node(
@@ -128,9 +146,10 @@ impl Executor {
             caps: caps.to_vec(),
             p_min: p_min.to_bits(),
             tails: tails.iter().map(|t| t.to_vec()).collect(),
+            pad_to: pad_to as u32,
         };
         self.tp_run(&req, |e| {
-            e.mtp_chain_here(groups, parts, caps, first, p_min, on_draft)
+            e.mtp_chain_here(groups, parts, caps, first, p_min, on_pass)
         })
     }
 
@@ -142,7 +161,7 @@ impl Executor {
         caps: &[u32],
         first: &[usize],
         p_min: f32,
-        mut on_draft: impl FnMut(&Executor, usize, &[(u32, f32)]),
+        mut on_pass: impl FnMut(&Executor, &[PassRow<'_>]),
     ) -> Result<ChainOutput, ModelError> {
         let in_pass: Vec<Row<'_>> = (groups.iter())
             .flat_map(|g| &g.seqs)
@@ -225,19 +244,33 @@ impl Executor {
             // Per row going on: its index and its residual for the next pass.
             let mut live: Vec<(usize, &[f32])> = Vec::new();
             let mut all_on = true;
+            // Per row of the pass: (k, drafted one more, done).
+            let mut ran: Vec<(usize, bool, bool)> = Vec::with_capacity(cur_rows.len());
             for (j, &k) in cur_rows.iter().enumerate() {
                 if o.pmax[j] < p_min {
                     all_on = false;
+                    ran.push((k, false, true));
                     continue;
                 }
                 out.drafts[k].push((o.argmax[j], o.pmax[j]));
-                on_draft(self, k, &out.drafts[k]);
                 if out.drafts[k].len() < caps[k] as usize {
                     live.push((k, &o.hidden[j * w..(j + 1) * w]));
+                    ran.push((k, true, false));
                 } else {
                     all_on = false;
+                    ran.push((k, true, true));
                 }
             }
+            let seen: Vec<PassRow<'_>> = (ran.iter())
+                .map(|&(k, new, done)| PassRow {
+                    k,
+                    drafts: &out.drafts[k],
+                    new,
+                    done,
+                })
+                .collect();
+            on_pass(self, &seen);
+            drop(seen);
             // The further passes in the round's order (the first pass's may differ; after it
             // the rows are in order already).
             live.sort_by_key(|&(k, _)| k);

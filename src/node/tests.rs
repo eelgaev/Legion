@@ -117,6 +117,7 @@ fn requests_round_trip() {
             caps: vec![8, 1, 0],
             p_min: 0.35f32.to_bits(),
             tails: vec![vec![5, 6, 7], vec![], vec![u32::MAX]],
+            pad_to: 3,
         },
         Request::TpMtpRows {
             groups: match step() {

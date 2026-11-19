@@ -166,3 +166,34 @@ fn device_take_in_room_covers_the_bonus_token_and_drafts() {
     );
     assert!(device_take_in_room(prompt, prompt - TAKE_IN_TAIL - 2, TAKE_IN_TAIL + 2, k).is_some());
 }
+
+#[test]
+fn a_pass_reads_its_new_drafts_and_the_padding_of_rows_done() {
+    let fed: Vec<u32> = (1..=10).collect();
+    let row = |drafts, new, done| PassRow {
+        k: 0,
+        drafts,
+        new,
+        done,
+    };
+    let d = [(50, 0.9), (51, 0.8)];
+    // Going on: its new draft, after the last 8 tokens fed and its drafts before it.
+    let (all, n) = pass_tokens(&fed, &row(&d[..1], true, false), 3, true);
+    assert_eq!((all, n), (vec![3, 4, 5, 6, 7, 8, 9, 10, 50], 1));
+    // At its cap: the new draft only (a verify step of 3 rows: bonus and two drafts).
+    let (all, n) = pass_tokens(&fed, &row(&d, true, true), 3, true);
+    assert_eq!((all, n), (vec![3, 4, 5, 6, 7, 8, 9, 10, 50, 51], 1));
+    // Under the floor after one draft: the bonus token again, as the verify step pads.
+    let (all, n) = pass_tokens(&fed, &row(&d[..1], false, true), 3, true);
+    assert_eq!((all, n), (vec![3, 4, 5, 6, 7, 8, 9, 10, 50, 10], 1));
+    // Under the floor at once: two pads.
+    let (all, n) = pass_tokens(&fed, &row(&[], false, true), 3, true);
+    assert_eq!((all, n), (vec![3, 4, 5, 6, 7, 8, 9, 10, 10, 10], 2));
+    // No row drafted (a decode step follows) or the padding unknown: nothing.
+    assert_eq!(pass_tokens(&fed, &row(&[], false, true), 3, false).1, 0);
+    assert_eq!(pass_tokens(&fed, &row(&[], false, true), 0, true).1, 0);
+    // At its cap of one with three rows a sequence: the new draft and one pad.
+    let (all, n) = pass_tokens(&fed, &row(&d[..1], true, true), 3, true);
+    assert_eq!((all, n), (vec![3, 4, 5, 6, 7, 8, 9, 10, 50, 10], 2));
+    assert_eq!(pass_tokens(&[], &row(&[], false, true), 3, true).1, 0);
+}

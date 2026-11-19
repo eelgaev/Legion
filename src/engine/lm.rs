@@ -8713,6 +8713,14 @@ impl Worker {
                     }
                     Drafting::Mtp(d) => {
                         let t = Instant::now();
+                        // The next verify step's rows a sequence, padding included, where
+                        // the round's drafts do not decide them (`verify_rows`).
+                        d.set_verify_rows(if self.spec_config.pad_longest || !spec::pads_ahead() {
+                            0
+                        } else {
+                            let depth = self.depth.is_some().then_some(self.mtp_k);
+                            verify_rows(0, depth, self.spec_k, false)
+                        });
                         let passes = if self.exec.has_remote() {
                             d.step_remote(&mut self.exec, &mut batch, &blocks, &rings, &offs)?
                         } else {
