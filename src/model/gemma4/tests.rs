@@ -975,3 +975,13 @@ fn assistant_rings_are_allocated_first() {
     // Nothing to put first: the order as it was.
     assert_eq!(KvPool::hot_first(&hp, attn.clone(), &[]), attn);
 }
+
+/// The halves of a prompt step under tensor parallelism over machines (#619) are on unless
+/// `LEGION_DEBUG_GEMMA_TP_HALVES` is 0, and need 1,024 tokens a half.
+#[test]
+fn tp_halves_switch() {
+    assert!(tp_halves_of(None));
+    assert!(tp_halves_of(Some("1")));
+    assert!(!tp_halves_of(Some("0")));
+    assert_eq!(TP_HALF_MIN, 1024);
+}

@@ -302,7 +302,7 @@ pub(super) mod cuda {
     /// raised, the exchange queued with the writers and readers. The GPU goes on with the
     /// graph while the shares travel; [`launch_micro_finish`] waits for them.
     ///
-    /// With `--tp-overlap` there are 4 buffer sets, and an exchange starts only while at most
+    /// With micro-batch exchanges there are 4 buffer sets, and an exchange starts only while at most
     /// one other is in flight (started, not finished), so `s - 2` was finished before `s`
     /// started. Then nothing is overwritten in use: set `s % 4` was last used by `s - 4`,
     /// which this rank finished before it started `s - 2`; a peer sends partial `s` only after
@@ -458,6 +458,19 @@ pub(super) mod cuda {
     ) -> Plan {
         let n_ranks = comm.n_ranks();
         let row = src.ne[0] as usize;
+        if m.reduce {
+            // All of the source, on every rank, as the plain all-reduce's (whole-source pack).
+            let span = row * src.ne[1] as usize;
+            return Plan {
+                kind: Kind::AllReduce,
+                span,
+                wire: comm.wire(row * m.n),
+                pieces: vec![(0, span); n_ranks],
+                pack_whole: true,
+                out_bf16: false,
+                widen: None,
+            };
+        }
         let cols = crate::tp_net::micro::span_cols(m.n, n_ranks, m.j, m.compact);
         let pieces = (0..n_ranks)
             .map(|r| {
@@ -702,13 +715,25 @@ pub(super) mod cuda {
             ));
         }
         let mut guard = comm.pinned.lock().expect("pinned lock");
-        if guard.as_ref().is_none_or(|p| p.cap < bytes) {
+        // A micro-batch exchange needs 4 buffer sets (see `launch_micro_start`): with
+        // `--tp-overlap` from the first exchange, else (a model's own micro-batches, #619) from
+        // the first micro-batch exchange, which then grows the buffers as a larger one would.
+        let sets = if micro || comm.overlap() != crate::tp_net::Overlap::Off {
+            4
+        } else {
+            2
+        };
+        if guard
+            .as_ref()
+            .is_none_or(|p| p.cap < bytes || p.nbuf < sets)
+        {
             if let Some(&f) = in_flight.front() {
                 return Err(format!(
                     "tp exchange {seq} needs larger buffers while exchange {f} is in flight"
                 ));
             }
             let old = guard.take();
+            let (old_cap, old_sets) = old.as_ref().map_or((0, 2), |p| (p.cap, p.nbuf));
             let flags = match old {
                 Some(p) => {
                     // Everything before this all-reduce is done with the old buffers.
@@ -729,12 +754,8 @@ pub(super) mod cuda {
                     f
                 }
             };
-            let nbuf = if comm.overlap() == crate::tp_net::Overlap::Off {
-                2
-            } else {
-                4
-            };
-            let cap = bytes.next_multiple_of(1 << 20);
+            let nbuf = sets.max(old_sets);
+            let cap = bytes.next_multiple_of(1 << 20).max(old_cap);
             let size = (nbuf + nbuf * n_ranks) * cap;
             let data = HostMem::new(size)?;
             // The RDMA peers write into it directly (nothing without them).
