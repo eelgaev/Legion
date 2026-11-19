@@ -903,17 +903,31 @@ impl DflashDrafter {
     /// the other ranks' round ends at once and every rank's communicator stays in step (a sum
     /// left out would hold the others until the timeout and fail the communicator for good).
     /// The others' drafts of the round are lost; this rank returns its error. Sums of a failed
-    /// device (the communicator's error) are not retried.
+    /// device (the communicator's error) are not retried. If the zeros cannot go either, the
+    /// communicator fails and cuts its connections ([`crate::tp_net::Comm::abort`]): the
+    /// others' sums fail at once rather than at the timeout. A round whose sums failed (the
+    /// communicator's error, here or on another rank) fails.
     fn round_end(
         &mut self,
         batch: &[DraftRequest<'_>],
         before: Option<u32>,
         r: Result<(), String>,
     ) -> Result<(), String> {
-        let (Err(e), Some(before), Some(t)) = (&r, before, self.opts.tp) else {
+        let Some(t) = self.opts.tp else {
             return r;
         };
-        let Some(comm) = crate::tp_net::comm(t.comm).filter(|c| c.error().is_none()) else {
+        let comm = crate::tp_net::comm(t.comm);
+        if r.is_ok()
+            && let Some(e) = comm.as_ref().and_then(|c| c.error())
+        {
+            return Err(format!(
+                "--tp-draft-split: the draft round's sums failed: {e}"
+            ));
+        }
+        let (Err(e), Some(before)) = (&r, before) else {
+            return r;
+        };
+        let Some(comm) = comm.filter(|c| c.error().is_none()) else {
             return r;
         };
         let c = &self.model.cfg;
@@ -927,19 +941,31 @@ impl DflashDrafter {
         let sums = round_sums(shape, batch.iter().map(|r| (r.max, !r.tokens.is_empty())));
         let left = sums_left(&sums, comm.all_reduces().wrapping_sub(before));
         match send_zero_sums(&mut self.backend, t.comm, left) {
-            Ok(()) => tracing::warn!(
-                error = %e,
-                sums = left.len(),
-                "--tp-draft-split: a draft round failed here, its other sums went as zeros"
-            ),
-            Err(z) => tracing::error!(
-                error = %e,
-                zeros = %z,
-                "--tp-draft-split: a draft round failed here, and so did its other sums"
-            ),
+            Ok(()) => {
+                tracing::warn!(
+                    error = %e,
+                    sums = left.len(),
+                    "--tp-draft-split: a draft round failed here, its other sums went as zeros"
+                );
+                r
+            }
+            // The others wait for sums this rank cannot send: the communicator fails and cuts
+            // its connections, as a rank that died, so that theirs fail now (not at the
+            // timeout) and the session ends as it does when a rank goes.
+            Err(z) => {
+                let e = format!("{e}; its other --tp-draft-split sums failed too: {z}");
+                tracing::error!(error = %e, "--tp-draft-split: a draft round failed here");
+                comm.abort(e.clone());
+                Err(e)
+            }
         }
-        r
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: [`send_zero_sums`] on this thread fails as if it could not make its graph.
+    pub(crate) static FAIL_ZERO_SUMS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// What a draft round's FFN sums depend on besides its requests ([`round_sums`]).
@@ -994,6 +1020,10 @@ pub(crate) fn send_zero_sums(
     let Some(&max) = sizes.iter().max() else {
         return Ok(());
     };
+    #[cfg(test)]
+    if FAIL_ZERO_SUMS.get() {
+        return Err("no graph for the zero sums (test)".into());
+    }
     let size = 16 + 4 * sizes.len();
     let ctx = Context::new(size, size);
     let zeros = ctx

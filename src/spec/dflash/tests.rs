@@ -1061,6 +1061,78 @@ fn a_failed_draft_split_round_ends_the_other_ranks() {
     }
 }
 
+/// `--tp-draft-split` over two ranks: when rank 0's round fails and so do the zero sums it
+/// owes (no graph for them, injected), its communicator fails and cuts the connections, so
+/// rank 1's round fails at once (not at the 30 s timeout) with a failed communicator too.
+#[test]
+fn a_failed_draft_split_cleanup_fails_the_other_ranks_at_once() {
+    use std::net::{TcpListener, TcpStream};
+    use std::time::{Duration, Instant};
+
+    let fx = Fixture::new();
+    let c = TinyDraft {
+        n_ff: 128,
+        ..TinyDraft::default()
+    };
+    let hf = fx.root.join("hf");
+    tiny::write_hf(&hf, &c, HfDtype::F32).unwrap();
+    let tokens = tokens_to(13);
+
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let a = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+    let (b, _) = l.accept().unwrap();
+    let ranks: Vec<_> = [a, b]
+        .into_iter()
+        .enumerate()
+        .map(|(rank, stream)| {
+            let (info, tokens) = (fx.info(&hf), tokens.clone());
+            std::thread::spawn(move || {
+                let mut data = vec![None, None];
+                data[1 - rank] = Some(stream);
+                let comm = crate::tp_net::Comm::new(rank, data, Duration::from_secs(30)).unwrap();
+                let handle = crate::tp_net::register(comm);
+                let tp = TpShare {
+                    comm: handle.id(),
+                    rank,
+                    n_ranks: 2,
+                };
+                let opts = DflashOptions {
+                    tp: Some(tp),
+                    ..sampling(64)
+                };
+                let mut d = DflashDrafter::load(&info, opts).unwrap();
+                // Rank 0's rows are one short (its round fails before any sum), and its zero
+                // sums fail.
+                FAIL_ZERO_SUMS.set(rank == 0);
+                let rows: Vec<Vec<f32>> = (0..2)
+                    .map(|li| (0..12).flat_map(|p| hidden(p, li, 0)).collect())
+                    .collect();
+                let n = if rank == 0 { 11 * 64 } else { 12 * 64 };
+                let mut out = Draft::default();
+                let t = Instant::now();
+                let r = d.step(&mut [DraftRequest {
+                    seq: 1,
+                    tokens: &tokens,
+                    start: 0,
+                    ran: 12,
+                    hidden: rows.iter().map(|v| &v[..n]).collect(),
+                    max: 7,
+                    out: &mut out,
+                }]);
+                (r, t.elapsed(), handle.comm().error())
+            })
+        })
+        .collect();
+    let got: Vec<_> = ranks.into_iter().map(|t| t.join().unwrap()).collect();
+    for (rank, (r, took, error)) in got.iter().enumerate() {
+        assert!(r.is_err(), "rank {rank}");
+        assert!(error.is_some(), "rank {rank}");
+        assert!(*took < Duration::from_secs(5), "rank {rank}: {took:?}");
+    }
+    let e = got[0].0.as_ref().unwrap_err();
+    assert!(e.contains("no graph for the zero sums"), "{e}");
+}
+
 /// `--tp-draft-split`'s shares: whole 32-value blocks per rank, every rank's rows once.
 #[test]
 fn tp_share_rows() {
