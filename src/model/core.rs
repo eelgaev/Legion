@@ -4504,7 +4504,8 @@ impl Model {
                     moe_ffn::moe_ffn_staged_shexp(ctx, x, ids, w2, refs(ws), pair, stage, shexp)
                 });
                 if summed.is_none() {
-                    summed = t.staged(ctx, graph, h, n, |x, ws| {
+                    // A short step copies only the experts it routes to (`route_gate`).
+                    summed = t.staged_routed(ctx, graph, h, Some(selected), n, |x, ws| {
                         let pair = self.moe_pair_out;
                         moe_ffn::moe_ffn_shexp(ctx, x, ids, w2, refs(ws), pair, shexp)
                     });
@@ -4529,7 +4530,7 @@ impl Model {
             if summed.is_some() {
                 None
             } else {
-                match t.staged_experts(ctx, graph, x, ids, n) {
+                match t.staged_experts(ctx, graph, x, ids, selected, n) {
                     Some(out) => Some(out),
                     None => {
                         // Small steps: Legion's expert matvec reads the misses at the link rate.

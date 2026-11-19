@@ -43,6 +43,7 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use super::cuda::{Copier, DeviceMem, Event, Mapping, PeerPuller, zero_async};
+use super::route_gate::{GateRow, copied_bytes};
 use crate::ggml::{ExternalOp, ffi};
 
 /// One planned copy: `(dst, src, bytes)` device-addressable addresses; `src == 0` zeroes
@@ -99,6 +100,13 @@ struct Core {
     help: bool,
     /// What the plans' [`CALL`]s run.
     hook: Option<super::cuda::StreamCall>,
+    /// A routing-gated pass ([`Staging::begin_gated`]): per planned row, what its gate copies
+    /// from (empty: the rows queue their whole plans), the pass's tokens, and the ring.
+    gates: Vec<GateRow>,
+    tokens: usize,
+    ring: usize,
+    /// The planned row whose hottest experts the copy stream took ahead, and which.
+    ahead_of: Option<(usize, Vec<bool>)>,
     /// Since the last [`Staging::take_stats`].
     stats: StageStats,
 }
@@ -112,6 +120,14 @@ pub struct StageStats {
     pub copies: u64,
     pub queue_ms: f64,
     pub lock_wait_ms: f64,
+    /// Routing-gated rows ([`super::route_gate`]); the bytes they copied (those copied ahead
+    /// included) and the bytes their whole plans copy; the bytes copied ahead that no token
+    /// routed to; and the time the gates waited for the router's choices.
+    pub gated: u64,
+    pub gated_bytes: u64,
+    pub full_bytes: u64,
+    pub ahead_unused: u64,
+    pub route_ms: f64,
 }
 
 // SAFETY: CUDA handles, used under the mutex.
@@ -187,6 +203,72 @@ impl Core {
         self.stats.queue_ms += t0.elapsed().as_secs_f64() * 1e3;
         recorded
     }
+
+    /// Whether the pass is routing-gated ([`Staging::begin_gated`]).
+    fn gating(&self) -> bool {
+        !self.gates.is_empty()
+    }
+
+    /// Queues `copies` (no marks or calls) on the copy stream.
+    fn put(&mut self, copies: &[Copy]) -> Result<(), String> {
+        for &(dst, src, n) in copies {
+            // SAFETY: inside the row's staged range and the arena; the buffer is free (the copy
+            // stream waited for the compute that read it last).
+            unsafe {
+                if src == 0 {
+                    self.copier.zero(dst, n)?;
+                } else {
+                    self.copier.copy(dst, src, n)?;
+                }
+            }
+        }
+        self.stats.copies += copies.len() as u64;
+        Ok(())
+    }
+
+    /// The next planned row of a gated pass, its tokens routed to the experts `ids`: queues the
+    /// copies of those of its staged experts not copied ahead, and its pads, records its
+    /// `copied`; then copies the next row's hottest staged experts ahead
+    /// ([`GateRow::ahead`]), where that row's buffer is not this one's.
+    fn queue_gated(&mut self, ids: &[i32]) -> Result<(), String> {
+        let t0 = std::time::Instant::now();
+        let q = self.queued;
+        let row = self.plan[q].0;
+        let gate = &self.gates[q];
+        let want = gate.routed(ids);
+        let ahead = match self.ahead_of.take() {
+            Some((i, v)) if i == q => v,
+            _ => Vec::new(),
+        };
+        let copies = gate.copies(&want, &ahead, true);
+        let unused =
+            ahead.iter().zip(&want).filter(|&(&a, &w)| a && !w).count() * gate.entry_bytes();
+        let full = copied_bytes(&self.plan[q].1);
+        self.stats.rows += 1;
+        self.stats.gated += 1;
+        self.stats.full_bytes += full as u64;
+        self.stats.gated_bytes += copied_bytes(&copies) as u64;
+        self.stats.ahead_unused += unused as u64;
+        self.put(&copies)?;
+        self.queued += 1;
+        let r = self.rows[row].as_ref().expect("planned rows stage");
+        self.copier.record(&r.copied)?;
+        let budget = self
+            .tokens
+            .saturating_mul(super::route_gate::ahead_per_token());
+        if let Some(next) = self.gates.get(q + 1)
+            && budget > 0
+            && self.plan[q + 1].0 % self.ring != row % self.ring
+        {
+            let pick = next.ahead(budget);
+            let copies = next.copies(&pick, &[], false);
+            self.stats.gated_bytes += copied_bytes(&copies) as u64;
+            self.put(&copies)?;
+            self.ahead_of = Some((q + 1, pick));
+        }
+        self.stats.queue_ms += t0.elapsed().as_secs_f64() * 1e3;
+        Ok(())
+    }
 }
 
 /// A device's staging buffers and the state of the current pass.
@@ -214,6 +296,8 @@ impl Parker {
         c.queued = 0;
         c.ahead = None;
         c.missed = 0;
+        c.gates.clear();
+        c.ahead_of = None;
         Ok(())
     }
 }
@@ -283,6 +367,10 @@ impl Staging {
             peer,
             help: false,
             hook: None,
+            gates: Vec::new(),
+            tokens: 0,
+            ring,
+            ahead_of: None,
             stats: StageStats::default(),
         }));
         let id = {
@@ -408,6 +496,8 @@ impl Staging {
         let ring = self.ring();
         let mut c = self.lock_timed();
         c.help = help;
+        c.gates.clear();
+        c.ahead_of = None;
         if let Some(start) = c.ahead.take()
             && c.plan[start..] == plan[..]
         {
@@ -431,6 +521,41 @@ impl Staging {
         Ok(())
     }
 
+    /// [`Self::begin`] for a routing-gated pass of `tokens` tokens ([`super::route_gate`];
+    /// no peer help, no split waits): `gates[i]` describes `plan[i]`'s row. Each row's `wait`
+    /// op reads its layer's router choices and queues the copies of only the staged experts
+    /// they name; this queues the first row's hottest experts ahead. A pass [`Self::chain`]
+    /// already queued runs as [`Self::begin`] has it.
+    pub fn begin_gated(
+        &mut self,
+        plan: Vec<(usize, Vec<Copy>)>,
+        gates: Vec<GateRow>,
+        tokens: usize,
+    ) -> Result<(), String> {
+        if gates.len() != plan.len() || self.core.lock().unwrap().ahead.is_some() {
+            return self.begin(plan, false);
+        }
+        let ring = self.ring();
+        let mut c = self.lock_timed();
+        c.help = false;
+        c.plan = plan;
+        c.queued = 0;
+        c.missed = 0;
+        c.ring = ring;
+        c.tokens = tokens;
+        c.gates = gates;
+        c.ahead_of = None;
+        let budget = tokens.saturating_mul(super::route_gate::ahead_per_token());
+        if budget > 0 && !c.gates.is_empty() {
+            let pick = c.gates[0].ahead(budget);
+            let copies = c.gates[0].copies(&pick, &[], false);
+            c.stats.gated_bytes += copied_bytes(&copies) as u64;
+            c.put(&copies)?;
+            c.ahead_of = Some((0, pick));
+        }
+        Ok(())
+    }
+
     /// Plans the pass after the running one (as [`Self::begin`] would): the `done` ops of the
     /// running pass's last rows queue its first rows' copies, each after the compute that last
     /// read its buffer. Does nothing if a pass is already chained, or where a row would not
@@ -439,7 +564,8 @@ impl Staging {
         let ring = self.ring();
         let mut c = self.lock_timed();
         let start = c.plan.len();
-        if c.ahead.is_some() || start < ring || plan.is_empty() {
+        // A gated pass's `done` ops queue nothing.
+        if c.ahead.is_some() || c.gating() || start < ring || plan.is_empty() {
             return Ok(());
         }
         let row_at = |i: usize| {
@@ -584,8 +710,44 @@ unsafe fn cuda_stage(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), 
             // SAFETY: the event lives in `c.rows`, which `wait` does not touch.
             c.copier.wait(unsafe { &*ev })?;
         }
-        c.queue_next()?;
+        // A gated pass's rows are queued by their own `wait`s.
+        if !c.gating() {
+            c.queue_next()?;
+        }
     } else {
+        if c.gating() {
+            // SAFETY: the op's sources are live tensors.
+            let sel = unsafe { dst.src[1].as_ref() };
+            let next = c.plan.get(c.queued).map(|p| p.0);
+            match sel.filter(|_| next == Some(row)) {
+                Some(sel) => {
+                    // The router's choices, `[n_used, n]` I32 (a view's rows may be apart).
+                    let (used, n) = (sel.ne[0].max(0) as usize, sel.ne[1].max(0) as usize);
+                    let mut ids = vec![0i32; used * n];
+                    drop(c);
+                    let t0 = std::time::Instant::now();
+                    // SAFETY: the tensor's data on the compute stream's device; the lock is
+                    // not held while the stream drains to the router.
+                    unsafe {
+                        super::cuda::read_i32_on(stream, sel.data, sel.nb[1], n, &mut ids)?;
+                    }
+                    let ms = t0.elapsed().as_secs_f64() * 1e3;
+                    c = core.lock().unwrap();
+                    c.stats.route_ms += ms;
+                    c.queue_gated(&ids)?;
+                }
+                None => {
+                    // Not the row planned next: the whole rows up to this one, as without
+                    // the gate.
+                    while let Some(&(r, _)) = c.plan.get(c.queued) {
+                        c.queue_next()?;
+                        if r == row {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         let r = c.rows[row].as_ref().ok_or("row does not stage")?;
         // SAFETY: as above.
         unsafe { r.copied.wait_on(stream)? };

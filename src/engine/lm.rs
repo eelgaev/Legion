@@ -3921,6 +3921,12 @@ impl LmEngine {
         cfg.residency.tier_heat_sizes = tier_whole
             && cfg.residency.tier_heat.is_some()
             && std::env::var_os("LEGION_DEBUG_HEAT_SIZES").is_none_or(|v| v != "0");
+        // #37: there, prompt steps up to a few thousand tokens copy only the experts their
+        // tokens route to (`crate::residency::route_gate`; `LEGION_DEBUG_ROUTE_GATE=0` copies
+        // every uncached expert, as before). The output is the same either way.
+        if tier_whole && layout.stages.len() == 1 {
+            cfg.residency.route_gate = crate::residency::route_gate::gate_upto();
+        }
         // Its one GPU's reserve beside the cache, where `--expert-cache-reserve-mib` is at its
         // default: what was measured in use there, not the layer splits' share.
         if (host_tier.is_some() || tier_whole)

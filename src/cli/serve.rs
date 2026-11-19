@@ -1098,6 +1098,7 @@ impl ModelArgs {
             lend_repack: self.prefill_keep_repack,
             lend_need: Vec::new(),
             lend_spread_upto: usize::MAX,
+            route_gate: 0,
             stage_below: None,
             learn_long: !self.no_prefill_learn,
             cpu_share: legion::residency::cpu_share::CpuShareConfig {

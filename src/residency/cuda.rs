@@ -2525,6 +2525,43 @@ pub fn read_rows_i32(
     }
 }
 
+/// Reads `rows` rows of `out.len() / rows` I32 values, `pitch` bytes apart from `src` in
+/// device memory, into `out` (row after row) on `stream`, and waits for the stream: a
+/// staging op's look at the router's choices ([`super::route_gate`]).
+///
+/// # Safety
+/// `src` must hold the rows on `stream`'s device; `stream` must be live.
+pub unsafe fn read_i32_on(
+    stream: *mut c_void,
+    src: *const c_void,
+    pitch: usize,
+    rows: usize,
+    out: &mut [i32],
+) -> Result<(), String> {
+    let width = out.len() / rows.max(1);
+    assert!(width * rows == out.len(), "read_i32_on shape");
+    if rows == 0 || width == 0 {
+        return Ok(());
+    }
+    // SAFETY: the caller's.
+    unsafe {
+        rt(
+            cudaMemcpy2DAsync(
+                out.as_mut_ptr().cast(),
+                width * 4,
+                src,
+                pitch.max(width * 4),
+                width * 4,
+                rows,
+                2,
+                stream,
+            ),
+            "cudaMemcpy2DAsync",
+        )?;
+        rt(cudaStreamSynchronize(stream), "cudaStreamSynchronize")
+    }
+}
+
 /// VRAM allocated through VMM, to be mapped into ranges (prefill staging buffers): one or
 /// more physical allocations, mapped back to back.
 pub struct DeviceMem {
