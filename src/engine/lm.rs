@@ -5655,14 +5655,15 @@ impl LmEngine {
                 let layers = exec.stage_layers().iter().map(|r| r.len()).collect();
                 Arc::new(Mutex::new(pipe_split::Probe::new(layers)))
             });
-        // `--mmproj`: the vision tower (#146), else an HF checkpoint's own (#1195). Other
-        // ranks and nodes get no images' rows.
+        // `--mmproj`: the vision tower (#146), else an HF checkpoint's own (#1195). Under
+        // tensor parallelism only rank 0 gets here: it encodes, and the other ranks get the
+        // images' rows with the steps (#1195 stage D). A model split by layers takes none yet.
         let arch = gguf.architecture().unwrap_or_default();
         let n_embd = exec.hp().n_embd as usize;
         let vision = match &cfg.mmproj {
-            Some(_) if cfg.tp_net.is_some() || cfg.node.is_some() => {
+            Some(_) if cfg.node.is_some() => {
                 return Err(LoadError::Device(
-                    "--mmproj: not with --tp-rank or --node-rank (yet)".into(),
+                    "--mmproj: not with --node-rank (yet)".into(),
                 ));
             }
             Some(path) => Some(Arc::new(vision::Vision::load(
@@ -5673,10 +5674,10 @@ impl LmEngine {
                 cfg.threads,
             )?)),
             None if cfg.no_mmproj || !cfg.model_path.is_dir() => None,
-            None if cfg.tp_net.is_some() || cfg.node.is_some() => {
+            None if cfg.node.is_some() => {
                 tracing::info!(
-                    "vision: the checkpoint's vision tower is not loaded with --tp-rank or \
-                     --node-rank (yet): text only"
+                    "vision: the checkpoint's vision tower is not loaded with --node-rank \
+                     (yet): text only"
                 );
                 None
             }

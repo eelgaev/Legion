@@ -60,6 +60,7 @@ mod step_fill;
 mod step_front;
 mod taper;
 mod tp_lead;
+mod tp_media;
 mod verify_ahead;
 mod verify_kept;
 
@@ -76,8 +77,9 @@ pub use prompt_ahead::PromptNext;
 pub use prompt_ahead::set_enabled as set_prompt_build_ahead;
 pub use prompt_stats::set_logging as set_prompt_step_stats;
 pub use ready_buffers::set_enabled as set_prompt_buffer_reserve;
-pub use remote::{Remote, from_wire};
+pub use remote::{Remote, from_wire, from_wire_with};
 pub use tp_lead::TpLead;
+pub use tp_media::MediaTable;
 pub use verify_kept::default_budget as default_verify_budget;
 pub use verify_kept::kept as verify_kept_graphs;
 pub use verify_kept::set_kept as set_verify_kept_graphs;
