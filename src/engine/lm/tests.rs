@@ -179,6 +179,23 @@ fn short_prompts_borrow_the_cache_for_staging() {
     assert_eq!(with(4096, 2048).short_from(), None);
 }
 
+/// #37: short prompts borrow the cache by default only where the prompt steps are
+/// routing-gated: one stage with a route gate and no split waits (`--prefill-stage-pieces`,
+/// which the residency's gate does not take either).
+#[test]
+fn short_lends_need_route_gated_steps() {
+    assert!(short_gate_steps(8704, 0, 1));
+    assert!(short_gate_steps(8704, crate::residency::STAGE_PIECES, 1));
+    // Split waits: the steps wait for every uncached expert's copy, not gated.
+    assert!(!short_gate_steps(8704, 4, 1));
+    // No route gate, or several stages.
+    assert!(!short_gate_steps(0, 0, 1));
+    assert!(!short_gate_steps(8704, 0, 2));
+    // So the default stays off there.
+    let gated = short_gate_steps(8704, 4, 1);
+    assert_eq!(short_prompt_default(false, 1, gated), 0);
+}
+
 /// `--long-micro-even`: micro_for's count of micro-chunks, of equal size in whole KV blocks.
 #[test]
 fn even_micro_chunks_share_a_step_out() {

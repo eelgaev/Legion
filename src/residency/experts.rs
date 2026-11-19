@@ -3608,8 +3608,8 @@ impl ExpertResidency {
     }
 
     /// The fewest tokens a pass stages: [`ResidencyConfig::stage_min_tokens`], or in a short
-    /// prompt's lend [`short_stage_min`] if fewer.
-    fn stage_from(&self) -> i64 {
+    /// prompt's lend [`short_stage_min`] if fewer. Steps of fewer tokens never stage.
+    pub fn stage_from(&self) -> i64 {
         if self.short_lend && self.lent.is_some() {
             self.stage_min.min(short_stage_min())
         } else {

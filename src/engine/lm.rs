@@ -1433,6 +1433,15 @@ pub fn short_gate_ram(slots: usize, experts: usize) -> bool {
     2 * slots >= experts
 }
 
+/// Whether prompt steps are routing-gated, so short prompts may borrow the cache by default
+/// ([`SHORT_GATE_PROMPT`]): one stage with a route gate (`route_gate` tokens), and without split
+/// waits (`--prefill-stage-pieces`), which the gate does not take (the residency's own check,
+/// `ExpertResidency::gates`): there a short prompt's staged steps would wait for every
+/// uncached expert's copy, so short prompts read their experts in place as before.
+fn short_gate_steps(route_gate: usize, stage_pieces: usize, stages: usize) -> bool {
+    route_gate > 0 && stage_pieces == 0 && stages == 1
+}
+
 /// Whether short prompts' lends build an unlent step's ops over the staged copies (#37,
 /// [`crate::residency::experts::ExpertResidency::set_short_lend`]): models on the shared expert
 /// graph (not GLM-5.3-Flash's or DeepSeek's own), unless `LEGION_DEBUG_SHORT_GATE=0` (staged
@@ -4046,7 +4055,11 @@ impl LmEngine {
             cfg.residency.route_gate = crate::residency::route_gate::tier_gate_upto();
         }
         // There, short prompts borrow the cache for routing-gated staging too (#37).
-        let route_gated = cfg.residency.route_gate > 0 && layout.stages.len() == 1;
+        let route_gated = short_gate_steps(
+            cfg.residency.route_gate,
+            cfg.residency.stage_pieces,
+            layout.stages.len(),
+        );
         // Its one GPU's reserve beside the cache, where `--expert-cache-reserve-mib` is at its
         // default: what was measured in use there, not the layer splits' share.
         if (host_tier.is_some() || tier_whole)
@@ -8208,10 +8221,12 @@ impl Worker {
             self.lent_short = false;
             self.short_gated = false;
         }
-        // #37: a short prompt's lend builds an unlent step's ops over the staged copies.
-        if let Err(e) = self.exec.set_short_lend(self.short_gated) {
-            tracing::warn!(error = %e, "could not mark the short prompt's lend");
-        }
+        // #37: a short prompt's lend builds an unlent step's ops over the staged copies. When
+        // that fails (its flush of the last step's work), the cache keeps the other kind of
+        // lend's ops, which this plan's chunks do not match: the step fails instead.
+        self.exec
+            .set_short_lend(self.short_gated)
+            .map_err(|e| format!("could not mark the short prompt's lend: {e}"))?;
         // #37: a step that runs without the lend lets the expert cache's lent tails take
         // their VRAM back as it starts, so its after-step can swap over every slot.
         if !self.lent
