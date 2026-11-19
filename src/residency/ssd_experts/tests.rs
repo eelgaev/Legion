@@ -46,6 +46,26 @@ fn a_step_never_evicts_its_own_experts() {
 }
 
 #[test]
+fn evict_order_follows_the_victims() {
+    let mut c = SlotCache::new(8, 4);
+    c.plan(&[4, 1, 6]);
+    c.plan(&[1]);
+    // Least recently used first (4 and 6 tie: lowest slot); slot 3 is empty, not listed.
+    assert_eq!(c.evict_order(), vec![0, 2, 1]);
+    c.pin(2, true);
+    assert_eq!(c.evict_order(), vec![0, 1]);
+    c.pin(2, false);
+    // By heat: the coldest first, whatever the recency.
+    c.set_heat(&[0.0, 0.5, 0.0, 0.0, 3.0, 0.0, 2.0, 0.0]);
+    assert_eq!(c.evict_order(), vec![1, 2, 0]);
+    // A learned slot holds its new expert, used now.
+    c.learn(7, 1);
+    assert_eq!((c.slot(1), c.slot(7)), (None, Some(1)));
+    c.set_heat(&[]);
+    assert_eq!(c.evict_order(), vec![0, 2, 1]);
+}
+
+#[test]
 fn empty_slots_take_experts_without_evicting() {
     let mut c = SlotCache::new(8, 2);
     c.plan(&[3]);

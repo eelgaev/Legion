@@ -50,7 +50,7 @@ use super::ssd_experts::cache::SlotCache;
 use super::ssd_experts::io::{Group, Job, Pool, raw_pieces};
 
 mod passes;
-pub use passes::{PassGate, PassHook, PassRoute, PassSrc, release_arg, wait_arg};
+pub use passes::{PassGate, PassHook, PassRoute, PassSrc, release_arg, slot_learn, wait_arg};
 
 #[cfg(test)]
 mod tests;
@@ -1190,7 +1190,7 @@ impl Inner {
 
     fn take_ahead(&self, st: &mut State, il: Option<usize>) -> Result<Vec<(usize, usize)>, String> {
         self.land()?;
-        self.settle();
+        self.settle_into(st);
         let Some(a) = st.ahead.take() else {
             return Ok(Vec::new());
         };

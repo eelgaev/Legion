@@ -678,7 +678,8 @@ impl Layer {
                 PassSrc::Read { batch, .. } => Some(batch),
             })
             .collect();
-        self.gate_row().with_reads(&experts, src, batch)
+        let ram = std::array::from_fn(|k| self.addr(k, n_slots));
+        self.gate_row().with_reads(&experts, src, batch, ram)
     }
 
     /// [`Self::stage_copies`] with the bounded host tier: expert `i` of [`Self::stage_misses`]
@@ -2509,7 +2510,9 @@ impl ExpertResidency {
                     Some(rows) => Some((rows, route)),
                     None => {
                         // An empty mask: every expert.
-                        (0..srcs.len()).for_each(|q| route(q, &[]));
+                        (0..srcs.len()).for_each(|q| {
+                            route(q, &[], &[]);
+                        });
                         None
                     }
                 }

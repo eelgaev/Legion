@@ -1342,11 +1342,13 @@ pub fn short_prompt_default(glm: bool, stages: usize, gated: bool) -> usize {
 }
 
 /// Whether the bounded host tier's short prompts borrow the cache by default
-/// ([`SHORT_GATE_PROMPT`]): where its RAM slots hold at least half of each layer's experts.
-/// With fewer, the in-place reads of a short prompt's misses are what keep the RAM slots on
-/// what recent prompts route to, and staging them instead costs the next prompts more
-/// checkpoint reads (#37 round 41 on an RTX 4090: 2K-8K prompts 0.3-0.5 s slower with 111 of
-/// 512 slots a layer, a tie with 320).
+/// ([`SHORT_GATE_PROMPT`]) when their staged passes do not learn RAM slots
+/// (`LEGION_DEBUG_SLOT_LEARN=0`, [`crate::residency::host_tier::slot_learn`]; they do by
+/// default, and short prompts then borrow it at any size): where its RAM slots hold at least
+/// half of each layer's experts. With fewer, the in-place reads of a short prompt's misses are
+/// what keep the RAM slots on what recent prompts route to, and staging them instead costs the
+/// next prompts more checkpoint reads (#37 round 41 on an RTX 4090: 2K-8K prompts 0.3-0.5 s
+/// slower with 111 of 512 slots a layer, a tie with 320).
 pub fn short_gate_ram(slots: usize, experts: usize) -> bool {
     2 * slots >= experts
 }
@@ -4070,9 +4072,10 @@ impl LmEngine {
         let short_gate =
             short_gate_on(glm || crate::model::deepseek41::params(&model.hp).is_some());
         let route_gated = route_gated
-            && host_tier
-                .as_ref()
-                .is_none_or(|t| short_gate_ram(t.plan.slots, model.hp.n_expert as usize));
+            && host_tier.as_ref().is_none_or(|t| {
+                crate::residency::host_tier::slot_learn()
+                    || short_gate_ram(t.plan.slots, model.hp.n_expert as usize)
+            });
         let long_prompts = LongPrompts {
             short_min_tokens: Some(cfg.long_prompts.short_min_tokens.unwrap_or_else(|| {
                 short_prompt_default(glm, layout.stages.len(), short_gate && route_gated)

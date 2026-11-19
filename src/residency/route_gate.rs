@@ -80,6 +80,8 @@ pub struct GateRow {
     /// With the bounded host tier, per entry the read batch that fills its source (`None`: a
     /// RAM slot); empty: every source is in host memory ([`Self::with_reads`]).
     batch: Vec<Option<usize>>,
+    /// With the bounded host tier, per kind the first RAM slot's address ([`Self::to_slot`]).
+    ram: [usize; 3],
 }
 
 impl GateRow {
@@ -116,17 +118,20 @@ impl GateRow {
             hot,
             end,
             batch: Vec::new(),
+            ram: [0; 3],
         }
     }
 
     /// The row with the bounded host tier's sources: entry `i` (expert `experts[i]`) copies
     /// from `src[i]`, once read batch `batch[i]` is in (`None`: a RAM slot, nothing to wait
-    /// for). `None` when the lists do not name this row's entries in order.
+    /// for); `ram` per kind the first RAM slot's address. `None` when the lists do not name
+    /// this row's entries in order.
     pub fn with_reads(
         mut self,
         experts: &[u32],
         src: Vec<[usize; 3]>,
         batch: Vec<Option<usize>>,
+        ram: [usize; 3],
     ) -> Option<Self> {
         let n = self.entries.len();
         let same = experts.len() == n
@@ -143,7 +148,21 @@ impl GateRow {
         // Only RAM sources are copied ahead ([`Self::ahead`]): a read one waits for its batch.
         self.hot.retain(|&i| batch[i as usize].is_none());
         self.batch = batch;
+        self.ram = ram;
         Some(self)
+    }
+
+    /// Entry `i`, read from the checkpoint, is read into RAM slot `slot` instead of a place
+    /// ([`super::host_tier::PassRoute`]): its copies read it there, after its batch as before.
+    /// Nothing without the tier's reads, or for an entry not read.
+    pub fn to_slot(&mut self, i: usize, slot: usize) {
+        if !self.read(i) {
+            return;
+        }
+        let e = &mut self.entries[i];
+        for (k, kind) in self.kinds.iter().enumerate() {
+            e.src[k] = self.ram[k] + slot * kind.bytes;
+        }
     }
 
     /// Whether the entry's source is read from the checkpoint first ([`Self::with_reads`]).
