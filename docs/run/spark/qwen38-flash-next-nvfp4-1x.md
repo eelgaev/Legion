@@ -56,11 +56,12 @@ values to BF16, so greedy text can move after prompts of over 64 tokens. The tab
 ### Images
 
 The checkpoint ships its vision tower (`model.visual.*`), and the command above loads it: requests may carry
-images, and `/v1/models` lists `vision`. The tower runs on the CPU, one image at a time (2026-11-18): a
-1024 × 768 image (768 image tokens) encodes in 11.3-11.8 s, and its first token comes 12.5 s after the
-request; 640 × 480 takes 3.2 s, 800 × 600 5.8 s. Text-only requests give the same output as with
-`--no-mmproj`, at the same speed (8K prefill 2,350-2,358 tok/s against 2,358-2,367, 1 user 41.2-41.5 tok/s
-against 41.5-41.7).
+images, and `/v1/models` lists `vision`. The tower runs on the GPU (2026-11-19): a 1024 × 768 image (768
+image tokens) encodes in 0.35-0.44 s and its first token comes 1.1-1.4 s after the request (11.8-12.0 s and
+12.4-12.7 s on the CPU tower, `LEGION_DEBUG_VISION_CPU=1`); 800 × 600 takes 0.15 s (TTFT 0.6-0.8 s),
+640 × 480 0.08 s (0.4-0.6 s). An image sent again takes its rows from a cache (TTFT 0.55-0.73 s). Text-only
+requests give the same output as with `--no-mmproj`, at the same speed (8K prefill 2,316 tok/s against
+2,323, 1 user 41.3 tok/s against 40.8).
 
 ## What each flag does
 
