@@ -143,6 +143,44 @@ pub struct DflashOptions {
     /// DFlash 2: the batched draft pass attends every sequence in one flash attention per
     /// layer, over caches that share one pool (`--spec-draft-batched-attn`).
     pub batched_attn: bool,
+    /// Tensor parallelism over machines: this rank's share of the drafter's FFN
+    /// (`--tp-draft-split`); `None`: all of it.
+    pub tp: Option<TpShare>,
+}
+
+/// A DFlash drafter's FFN split over the ranks of tensor parallelism over machines
+/// (`--tp-draft-split`, #619). Each rank holds its share of every layer's intermediate rows
+/// (gate and up rows, down columns) and the rest whole; a draft pass adds the ranks' FFN
+/// outputs with one all-reduce per layer, so every rank's residual stream, and with it the
+/// drafter's caches, stays the same. Every rank runs every take-in and draft pass; rank 0
+/// alone computes the head and picks the drafts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TpShare {
+    /// The communicator of the all-reduces ([`crate::tp_net::register`]).
+    pub comm: i32,
+    pub rank: usize,
+    pub n_ranks: usize,
+}
+
+impl TpShare {
+    /// This rank's intermediate rows of `n_ff`, or why they do not split: every share whole
+    /// Q8_0 blocks (32 values) of the down projection's rows.
+    pub fn rows(&self, n_ff: usize) -> Result<std::ops::Range<usize>, String> {
+        if self.rank >= self.n_ranks || !n_ff.is_multiple_of(32 * self.n_ranks) {
+            return Err(format!(
+                "--tp-draft-split: the drafter's {n_ff} intermediate rows do not split into {} \
+                 shares of whole 32-value blocks",
+                self.n_ranks
+            ));
+        }
+        let share = n_ff / self.n_ranks;
+        Ok(self.rank * share..(self.rank + 1) * share)
+    }
+
+    /// Whether this rank computes the head and picks the drafts (rank 0).
+    pub fn leads(&self) -> bool {
+        self.rank == 0
+    }
 }
 
 impl Default for DflashOptions {
@@ -156,6 +194,7 @@ impl Default for DflashOptions {
             draft_vocab: 0,
             lm_head: Default::default(),
             batched_attn: false,
+            tp: None,
         }
     }
 }
@@ -219,9 +258,25 @@ impl DflashDrafter {
             .as_deref()
             .ok_or_else(|| format!("--spec {name} needs --spec-draft <drafter checkpoint>"))?;
         let source = Source::open(path)?;
-        let cfg = source
+        let mut cfg = source
             .config(flavor)
             .map_err(|e| format!("{}: {e}", path.display()))?;
+        // `--tp-draft-split`: this rank's intermediate rows of every layer's FFN.
+        let ffn = match opts.tp {
+            Some(_) if flavor != Flavor::Dflash => {
+                return Err("--tp-draft-split: a DFlash drafter only".into());
+            }
+            Some(t) => {
+                let rows = t.rows(cfg.n_ff)?;
+                let cut = weights::FfnCut {
+                    n_ff: cfg.n_ff,
+                    rows,
+                };
+                cfg.n_ff = cut.rows.len();
+                Some(cut)
+            }
+            None => None,
+        };
         let names = source.tensor_names();
         if flavor == Flavor::Dflash
             && let Some(n) = names
@@ -280,7 +335,7 @@ impl DflashDrafter {
                  is read as stored"
             );
         }
-        let mut store = source.load(buft, opts.weights)?;
+        let mut store = source.load_share(buft, opts.weights, ffn.as_ref())?;
         let own = |n: &str| names.iter().any(|t| t == n);
         // `--spec-draft-vocab` / `--spec-draft-lm-head` cut down the target's head a DFlash
         // borrows; a drafter's own head (often a reduced vocabulary with `d2t`) and DSpark's
@@ -347,7 +402,7 @@ impl DflashDrafter {
         {
             window = window.min(w + 2 * cfg.block_size);
         }
-        let model = Model::new(
+        let mut model = Model::new(
             cfg,
             store,
             target.n_embd,
@@ -358,6 +413,7 @@ impl DflashDrafter {
             cut_head && borrowed_head,
         )
         .map_err(|e| format!("{}: {e}", path.display()))?;
+        model.set_tp(opts.tp);
         if opts.min_confidence > 0.0 && !model.has_confidence() {
             return Err(format!(
                 "{}: the drafter has no confidence head to apply a minimum confidence of {}",
@@ -777,6 +833,10 @@ impl DflashDrafter {
             (sampling || markov) && !v2,
             self.opts.min_confidence > 0.0,
         )?;
+        // A rank above 0 of `--tp-draft-split` ran its share of the pass: rank 0 picks.
+        if self.opts.tp.is_some_and(|t| !t.leads()) {
+            return Ok(());
+        }
         if v2 {
             // DFlash 2: the block's candidates, chosen in order.
             self.pick_block(r, last, rows);

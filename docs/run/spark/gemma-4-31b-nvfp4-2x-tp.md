@@ -46,12 +46,21 @@ The 1x command over two Sparks as it is (only `--tp-rank`/`--tp-peers` and `--tp
 262.8 / 265.5, prefill 8K 1,970 / 1,954 vs 1,751 / 1,752, 32K 1,804 / 1,804 vs 1,634 / 1,636. With
 `--deterministic` the text is the same with and without them at 1, 4 and 16 users.
 
+Optional, `--tp-draft-split` on both ranks: the DFlash drafter's FFN is split over the two Sparks like the target's,
+so rank 1 no longer waits while rank 0 drafts. The time between verify steps drops from about 19 / 25 / 33 ms to
+15-18 / 19 / 25 ms at 1 / 4 / 16 users. On top of the command above, two sessions in ABBA order: 1 user 45.3 / 45.6
+vs 42.4 / 42.6, 4 users 117.6 / 117.7 vs 114.8 / 113.6, 16 users 339.7 / 336.3 vs 320.0 / 319.9; prefill does
+not use the drafter's split (8K 2,328 vs 2,387, 32K 2,146 vs 2,155, one request each). The sums run in a different
+order, so the drafts can differ in bits. With `--deterministic` the text is still the same at 1 and 4 users and the
+mean accepted length about the same; without it, at 4 users the depth policy drafts less per step (4.5-4.9 vs
+6.3-6.8 tokens, mean accepted length 3.03-3.07 vs 3.31-3.33) and still comes out ahead.
+
 ## What each flag does
 
 - `--max-seqs` (`16`): How many requests are decoded at once (continuous batching). Set to the highest concurrency the benchmark uses.
 - `--ctx-size` (`262144`): Maximum tokens per sequence (prompt plus output). The model's full native context (also the default when the flag is left out). The KV cache is shared, so short requests do not reserve it.
 - `--prefix-cache-states` (`0`): Saved recurrent states for prefix caching; `0` turns prefix caching off. Measurement only, so repeated benchmark prompts are not answered from the cache. Drop it for normal use.
-- `--spec` (`dflash`) and the next six flags: as in the [1x command](gemma-4-31b-nvfp4-1x.md#what-each-flag-does). Under tensor parallelism the DFlash drafter runs on rank 0 only, between verify steps.
+- `--spec` (`dflash`) and the next six flags: as in the [1x command](gemma-4-31b-nvfp4-1x.md#what-each-flag-does). Under tensor parallelism the DFlash drafter runs on rank 0 only, between verify steps (`--tp-draft-split` splits it over both, see above).
 - `--tp-profile` (`1`): Logs where step time goes (compute, waiting for the other rank, sends) every N steps. Measurement only, not needed for normal use.
 - `--tp-head-split`: Gemma's output head is tied to the embeddings (262,144 rows, 2.8 GB in BF16, soft-capped) and both Sparks ran all of it every step (~12 ms of a ~65 ms 1-user verify step). With this, a greedy decode or verify step computes it as two halves of the vocabulary, one on each Spark, each half soft-capped before its candidates, and rank 0 keeps the better of the two per row. Same output (the pick and its tie order are the whole head's). Requests with sampling, log probabilities or `min_tokens` keep the whole head.
 - `--tp-rails` (`2`): Each Spark's QSFP port is two RDMA devices, one per PCIe link of about 108 Gb/s. With `2`, sums of at least 1 MiB go in 1 MiB pieces over both devices instead of only the one on the `--tp-peers` address (the second needs no IP address). The same bytes arrive, so output does not change.

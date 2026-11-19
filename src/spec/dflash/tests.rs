@@ -953,3 +953,56 @@ fn hugging_face_names_and_configs() {
     v["dflash_config"]["target_layer_ids"] = serde_json::json!([]);
     assert!(matches!(cfg(v), Err(ConfigError::Invalid(_))));
 }
+
+/// `--tp-draft-split`'s shares: whole 32-value blocks per rank, every rank's rows once.
+#[test]
+fn tp_share_rows() {
+    let share = |rank, n_ranks| TpShare {
+        comm: 0,
+        rank,
+        n_ranks,
+    };
+    assert_eq!(share(0, 2).rows(21_504), Ok(0..10_752));
+    assert_eq!(share(1, 2).rows(21_504), Ok(10_752..21_504));
+    assert!(share(0, 2).leads() && !share(1, 2).leads());
+    assert_eq!(share(2, 3).rows(96 * 3), Ok(192..288));
+    // A share not of whole blocks, or a rank past the last.
+    assert!(share(0, 2).rows(96).is_err());
+    assert!(share(2, 2).rows(128).is_err());
+}
+
+/// The FFN matrices a rank keeps a share of, and their bytes after the cut.
+#[test]
+fn ffn_cut() {
+    use super::weights::{Cut, FfnCut, cut_matrix, ffn_cut_of};
+    let cut = FfnCut {
+        rows: 4..8,
+        n_ff: 8,
+    };
+    assert_eq!(
+        ffn_cut_of("blk.3.ffn_gate.weight", &[2, 8], &cut),
+        Ok(Some((Cut::Rows(4..8), vec![2, 4])))
+    );
+    assert_eq!(
+        ffn_cut_of("blk.0.ffn_up.weight", &[2, 8], &cut),
+        Ok(Some((Cut::Rows(4..8), vec![2, 4])))
+    );
+    assert_eq!(
+        ffn_cut_of("blk.0.ffn_down.weight", &[8, 2], &cut),
+        Ok(Some((Cut::Cols(4..8), vec![4, 2])))
+    );
+    for name in ["blk.0.attn_q.weight", "output_norm.weight", "fc.weight"] {
+        assert_eq!(ffn_cut_of(name, &[8, 8], &cut), Ok(None));
+    }
+    assert!(ffn_cut_of("blk.0.ffn_down.weight", &[2, 8], &cut).is_err());
+    // Two-byte values: a 3 x 4 matrix (rows of 4).
+    let m: Vec<u8> = (0..24).collect();
+    assert_eq!(
+        cut_matrix(&m, 2, 4, &Cut::Rows(1..3)),
+        (8..24).collect::<Vec<u8>>()
+    );
+    assert_eq!(
+        cut_matrix(&m, 2, 4, &Cut::Cols(2..4)),
+        vec![4, 5, 6, 7, 12, 13, 14, 15, 20, 21, 22, 23]
+    );
+}

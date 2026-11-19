@@ -771,6 +771,16 @@ pub(super) struct ModelArgs {
     /// min_tokens keep the whole head on rank 0. Off (default): rank 0 computes the head.
     #[arg(long)]
     pub tp_head_split: bool,
+    /// With --tp-rank and --spec dflash (a Hugging Face drafter checkpoint): split the
+    /// drafter's FFN over the ranks like the target's. Without it rank 0 runs every draft
+    /// pass alone while the other ranks wait. With it each rank holds its share of every
+    /// drafter layer's FFN rows (the rest of the drafter whole, the head on rank 0 only in
+    /// use), every rank runs each draft round, and one all-reduce per drafter layer adds the
+    /// FFN outputs. The sums' order changes, so drafts (and with them acceptance and greedy
+    /// output) may differ in bits from rank 0 drafting alone. Every rank must pass it. Off
+    /// by default.
+    #[arg(long, requires = "tp_rank")]
+    pub tp_draft_split: bool,
     /// With --tp-rank, Qwen3.8-Flash-Next (qwen4exp): expert parallelism for the routed
     /// experts. Rank r of n holds the experts r*E/n .. (r+1)*E/n whole (the checkpoint's bytes
     /// as shipped, cut by expert index) instead of every expert's 1/n of the rows, and runs
@@ -2219,6 +2229,7 @@ pub async fn run(
                     moe_ep: e.model.tp_moe_ep,
                     overlap: e.model.tp_overlap,
                     moe_ep_place: moe_ep_place.clone(),
+                    draft_split: e.model.tp_draft_split,
                 }),
                 glm_parallel_decode: e.model.glm_parallel_decode,
                 tp_per_gpu: e.model.tp_per_gpu,
