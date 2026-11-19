@@ -4388,6 +4388,25 @@ impl Executor {
         Ok(true)
     }
 
+    /// Marks the lend as a short prompt's, or not ([`ExpertResidency::set_short_lend`], #37):
+    /// its steps build an unlent step's ops over the staged copies. A change drops the kept
+    /// prompt graphs first (built for the other kind of lend). Nothing without a lend.
+    ///
+    /// [`ExpertResidency::set_short_lend`]: crate::residency::experts::ExpertResidency::set_short_lend
+    pub fn set_short_lend(&mut self, on: bool) -> Result<(), ModelError> {
+        let on = on && self.model.experts().is_some_and(|r| r.is_lent());
+        if self.model.experts().is_none_or(|r| r.short_lend() == on) {
+            return Ok(());
+        }
+        self.wait_commit();
+        self.flush_deferred()?;
+        self.drop_mixed();
+        if let Some(r) = self.model.experts_mut() {
+            r.set_short_lend(on);
+        }
+        Ok(())
+    }
+
     /// Whether stage `s` keeps a spare compute buffer through a lend ([`spare`]): it runs
     /// verify steps and has buffers of its own per kept graph (not a meta backend's shared one).
     fn wants_spare(&self, s: usize) -> bool {

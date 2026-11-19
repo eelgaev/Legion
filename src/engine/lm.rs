@@ -1321,14 +1321,42 @@ const EVEN_STEP: usize = KV_BLOCK;
 /// only moves where an expert is read from: the same outputs.
 pub const GLM_SHORT_PROMPT: usize = crate::residency::STAGE_MIN_TOKENS;
 
+/// One GPU whose prompt steps are routing-gated (every routed expert in host memory, or the
+/// bounded host tier where [`short_gate_ram`], #37): a prompt borrows the cache for staging from this many tokens left
+/// ([`LongPrompts::short_min_tokens`]). Its steps then copy only the experts they route to, by
+/// DMA, instead of reading every uncached one in place, with an unlent step's chunks and ops
+/// ([`crate::residency::experts::ExpertResidency::set_short_lend`]): the same outputs.
+pub const SHORT_GATE_PROMPT: usize = crate::residency::STAGE_MIN_TOKENS;
+
 /// [`LongPrompts::short_min_tokens`]' default: [`GLM_SHORT_PROMPT`] for GLM-5.3-Flash over
-/// several stages, else 0 (Qwen and Gemma unchanged).
-pub fn short_prompt_default(glm: bool, stages: usize) -> usize {
+/// several stages, [`SHORT_GATE_PROMPT`] where `gated` (one GPU with routing-gated prompt
+/// steps, a model whose graph builds an unlent step's ops in a short lend), else 0.
+pub fn short_prompt_default(glm: bool, stages: usize, gated: bool) -> usize {
     if glm && stages > 1 {
         GLM_SHORT_PROMPT
+    } else if gated {
+        SHORT_GATE_PROMPT
     } else {
         0
     }
+}
+
+/// Whether the bounded host tier's short prompts borrow the cache by default
+/// ([`SHORT_GATE_PROMPT`]): where its RAM slots hold at least half of each layer's experts.
+/// With fewer, the in-place reads of a short prompt's misses are what keep the RAM slots on
+/// what recent prompts route to, and staging them instead costs the next prompts more
+/// checkpoint reads (#37 round 41 on an RTX 4090: 2K-8K prompts 0.3-0.5 s slower with 111 of
+/// 512 slots a layer, a tie with 320).
+pub fn short_gate_ram(slots: usize, experts: usize) -> bool {
+    2 * slots >= experts
+}
+
+/// Whether short prompts' lends build an unlent step's ops over the staged copies (#37,
+/// [`crate::residency::experts::ExpertResidency::set_short_lend`]): models on the shared expert
+/// graph (not GLM-5.3-Flash's or DeepSeek's own), unless `LEGION_DEBUG_SHORT_GATE=0` (staged
+/// steps take the fused expert op, and short prompts lend only where asked, as before).
+fn short_gate_on(own_graph: bool) -> bool {
+    !own_graph && std::env::var_os("LEGION_DEBUG_SHORT_GATE").is_none_or(|v| v != "0")
 }
 
 impl LongPrompts {
@@ -3932,6 +3960,8 @@ impl LmEngine {
         if host_tier.is_some() && layout.stages.len() == 1 {
             cfg.residency.route_gate = crate::residency::route_gate::tier_gate_upto();
         }
+        // There, short prompts borrow the cache for routing-gated staging too (#37).
+        let route_gated = cfg.residency.route_gate > 0 && layout.stages.len() == 1;
         // Its one GPU's reserve beside the cache, where `--expert-cache-reserve-mib` is at its
         // default: what was measured in use there, not the layer splits' share.
         if (host_tier.is_some() || tier_whole)
@@ -4036,12 +4066,16 @@ impl LmEngine {
         if cfg.gemma4_compact_global_kv {
             gemma4_compact_global_kv(&mut model, cfg.cache_types);
         }
+        let glm = crate::model::glm5next::params(&model.hp).is_some();
+        let short_gate =
+            short_gate_on(glm || crate::model::deepseek41::params(&model.hp).is_some());
+        let route_gated = route_gated
+            && host_tier
+                .as_ref()
+                .is_none_or(|t| short_gate_ram(t.plan.slots, model.hp.n_expert as usize));
         let long_prompts = LongPrompts {
             short_min_tokens: Some(cfg.long_prompts.short_min_tokens.unwrap_or_else(|| {
-                short_prompt_default(
-                    crate::model::glm5next::params(&model.hp).is_some(),
-                    layout.stages.len(),
-                )
+                short_prompt_default(glm, layout.stages.len(), short_gate && route_gated)
             })),
             ..cfg.long_prompts
         };
@@ -5853,6 +5887,8 @@ impl LmEngine {
             split_probe: split_probe.clone(),
             lent: false,
             lent_short: false,
+            short_gate,
+            short_gated: false,
             can_lend: cfg.long_prompts.min_tokens > 0,
             long_step,
             long_past,
@@ -6267,6 +6303,12 @@ struct Worker {
     /// Whether the cache is lent to short prompts only (`LongPrompts::short_min_tokens`):
     /// steps are planned as with the cache.
     lent_short: bool,
+    /// Whether a short prompt's lend builds an unlent step's ops over the staged copies
+    /// ([`short_gate_on`], #37).
+    short_gate: bool,
+    /// Whether the cache is lent for a short prompt (not a long one, nor only for mapping the
+    /// KV pools' tail) with [`Self::short_gate`] on: its steps build an unlent step's ops.
+    short_gated: bool,
     /// Whether lending is possible (cleared after a failure).
     can_lend: bool,
     /// #1216: per stage, its long prompt step's compute buffers as measured at load (empty:
@@ -7708,6 +7750,7 @@ impl Worker {
         }
         self.lent = false;
         self.lent_short = false;
+        self.short_gated = false;
         self.long_cap = 0;
         self.long_reserve = 0;
         self.tier_cap = Default::default();
@@ -8006,6 +8049,7 @@ impl Worker {
             // Every prompt's tokens: they share the big steps a lend sizes for (#37).
             self.lend_cache(prefilling.iter().map(left).sum(), end);
             self.lent_short = !long;
+            self.short_gated = self.lent && !long && self.short_gate;
             // `--kv-vmm-keep` with `--glm-parallel-decode` (#1174): a long prompt that will
             // pass the kept blocks maps the KV pools' tail now, while the VRAM the lend just
             // freed is free. Mapped mid-prompt, the prompt steps' buffers had taken it first
@@ -8065,6 +8109,11 @@ impl Worker {
         // rest of a long prompt keeps big steps).
         if long {
             self.lent_short = false;
+            self.short_gated = false;
+        }
+        // #37: a short prompt's lend builds an unlent step's ops over the staged copies.
+        if let Err(e) = self.exec.set_short_lend(self.short_gated) {
+            tracing::warn!(error = %e, "could not mark the short prompt's lend");
         }
         // #37: a step that runs without the lend lets the expert cache's lent tails take
         // their VRAM back as it starts, so its after-step can swap over every slot.

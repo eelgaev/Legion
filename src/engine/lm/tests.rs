@@ -140,15 +140,32 @@ fn long_prompts_pick_their_micro_chunk() {
     };
     assert_eq!(small.micro_for(10291, 2), 1024);
 }
-/// `--short-prompt-tokens` (#579): short prompts borrow the cache for staging, by default only
-/// for GLM-5.3-Flash over several stages, and only below `--long-prompt-tokens`.
+/// `--short-prompt-tokens` (#579): short prompts borrow the cache for staging, by default for
+/// GLM-5.3-Flash over several stages and one GPU with routing-gated prompt steps (#37), and only
+/// below `--long-prompt-tokens`.
 #[test]
 fn short_prompts_borrow_the_cache_for_staging() {
-    // Qwen, Gemma and one-stage GLM: off.
-    assert_eq!(short_prompt_default(false, 4), 0);
-    assert_eq!(short_prompt_default(true, 1), 0);
-    assert_eq!(short_prompt_default(true, 4), GLM_SHORT_PROMPT);
+    // Qwen, Gemma and one-stage GLM without a gate: off.
+    assert_eq!(short_prompt_default(false, 4, false), 0);
+    assert_eq!(short_prompt_default(true, 1, false), 0);
+    assert_eq!(short_prompt_default(true, 4, false), GLM_SHORT_PROMPT);
     assert_eq!(GLM_SHORT_PROMPT, crate::residency::STAGE_MIN_TOKENS);
+    // One GPU with routing-gated steps.
+    assert_eq!(short_prompt_default(false, 1, true), SHORT_GATE_PROMPT);
+    assert_eq!(short_prompt_default(true, 4, true), GLM_SHORT_PROMPT);
+    assert_eq!(SHORT_GATE_PROMPT, crate::residency::STAGE_MIN_TOKENS);
+    // GLM's and DeepSeek's own graphs keep the fused op in a short lend.
+    assert!(!short_gate_on(true));
+    // The bounded tier only with RAM slots for at least half of each layer's experts.
+    assert!(short_gate_ram(320, 512));
+    assert!(short_gate_ram(256, 512));
+    assert!(!short_gate_ram(255, 512));
+    assert!(!short_gate_ram(111, 512));
+    // A short lend's steps stage past every small step's own kernels.
+    let floor = crate::residency::experts::short_stage_min();
+    assert!(floor > crate::model::core::expert_mv::max_tokens());
+    assert!(floor > crate::residency::cpu_share::ops::MAX_TOKENS as i64);
+    assert!(floor <= crate::residency::STAGE_MIN_TOKENS as i64);
     assert_eq!(LongPrompts::default().short_from(), None);
     let with = |short: usize, min: usize| LongPrompts {
         short_min_tokens: Some(short),

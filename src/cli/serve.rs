@@ -1340,7 +1340,9 @@ struct EngineArgs {
     /// least this many tokens left borrows the expert cache too, for staging only: its steps
     /// keep the chunks they have without a lend, so the same outputs (0: never). Default: 128
     /// for GLM-5.3-Flash over several GPUs, where a short prompt's in-place expert reads are
-    /// slow, 0 for other models.
+    /// slow, and on one GPU whose prompt steps copy only the experts they route to (every
+    /// routed expert in host memory, or the host expert tier with RAM slots for at least half
+    /// of each layer's experts), 0 otherwise.
     #[arg(long, value_name = "N")]
     short_prompt_tokens: Option<usize>,
     /// Model engine: tokens per forward pass while a long prompt borrows the cache.

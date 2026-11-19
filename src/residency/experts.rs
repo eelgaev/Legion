@@ -1047,6 +1047,9 @@ pub struct ExpertResidency {
     /// [`ResidencyConfig::stage_min_tokens`].
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     stage_min: i64,
+    /// A short prompt's lend ([`Self::set_short_lend`]): its steps build an unlent step's ops
+    /// over the staged copies, and stage from [`short_stage_min`] tokens.
+    short_lend: bool,
     /// [`ResidencyConfig::lend_keep`].
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     lend_keep: Vec<u64>,
@@ -1149,6 +1152,8 @@ pub struct TieredLayer<'a> {
     /// [`ResidencyConfig::route_gate`].
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     route_gate: usize,
+    /// [`ExpertResidency::set_short_lend`].
+    short_lend: bool,
     /// The bounded host tier and this layer in it ([`ExpertResidency::host_tier`]).
     host: Option<(&'a super::host_tier::HostTier, usize)>,
 }
@@ -1156,7 +1161,24 @@ pub struct TieredLayer<'a> {
 /// Steps of at most this many tokens gather their experts first with [`Fetch::Copy`].
 const COPY_MAX_TOKENS: i64 = 8;
 
+/// The fewest tokens a step of a short prompt's lend stages ([`ExpertResidency::set_short_lend`],
+/// #37): one more than any small step's own kernels take (the gather, Legion's expert matvec and
+/// the host's share), so every staged step builds the same products as unlent.
+pub fn short_stage_min() -> i64 {
+    COPY_MAX_TOKENS
+        .max(crate::model::core::expert_mv::max_tokens())
+        .max(super::cpu_share::ops::MAX_TOKENS as i64)
+        + 1
+}
+
 impl<'a> TieredLayer<'a> {
+    /// Whether this step runs in a short prompt's lend ([`ExpertResidency::set_short_lend`]):
+    /// its graph then builds the ops of an unlent step over the staged copies (the fused expert
+    /// op only where an unlent step takes it too), so the output stays that of an unlent cache.
+    pub fn short_lend(&self) -> bool {
+        self.short_lend
+    }
+
     /// The tiered tensor of expert kind `k` ([`KINDS`] order).
     pub fn weight(&self, k: usize) -> Tensor<'a> {
         self.layer.tensor(k)
@@ -2222,6 +2244,7 @@ impl ExpertResidency {
             lend_spread_upto: cfg.lend_spread_upto,
             route_gate: cfg.route_gate,
             stage_min: cfg.stage_min_tokens as i64,
+            short_lend: false,
             idle: Vec::new(),
             lend_keep: cfg.lend_keep.clone(),
             settle: cfg.settles(),
@@ -2291,7 +2314,7 @@ impl ExpertResidency {
     #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     pub fn begin_pass(&mut self, n: usize, ran: impl Fn(usize) -> bool) -> Result<(), String> {
         #[cfg(feature = "cuda")]
-        if n as i64 >= self.stage_min {
+        if n as i64 >= self.stage_from() {
             for d in 0..self.devices.len() {
                 // A routing-gated pass over the bounded host tier: its rows' copies and the
                 // reader's reads wait for each layer's routing.
@@ -2375,7 +2398,8 @@ impl ExpertResidency {
         // the running pass's copies still read. Nor for a routing-gated pass, whose rows wait
         // for their router's choices.
         #[cfg(feature = "cuda")]
-        if self.is_lent() && n as i64 >= self.stage_min && self.host.is_none() && !self.gates(n) {
+        if self.is_lent() && n as i64 >= self.stage_from() && self.host.is_none() && !self.gates(n)
+        {
             for d in 0..self.devices.len() {
                 let plan = self.stage_plan(d, &ran);
                 if let (Some(st), false) = (self.devices[d].stage_mut(), plan.is_empty()) {
@@ -2556,8 +2580,9 @@ impl ExpertResidency {
             fetch: self.fetch,
             share: self.share,
             pieces: self.stage_pieces,
-            stage_min: self.stage_min,
+            stage_min: self.stage_from(),
             route_gate: self.route_gate,
+            short_lend: self.short_lend && self.lent.is_some(),
             host: self.host.as_deref().map(|h| (h, il)),
         })
     }
@@ -2977,11 +3002,13 @@ impl ExpertResidency {
         let gathered = self.fetch == Fetch::Copy && n as i64 <= COPY_MAX_TOKENS;
         #[cfg(feature = "cuda")]
         let devices = &self.devices;
+        #[cfg(feature = "cuda")]
+        let stage_from = self.stage_from();
         #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
         let staged = |l: &Layer| -> bool {
             #[cfg(feature = "cuda")]
             return devices[l.dev].stage().is_some()
-                && n as i64 >= self.stage_min
+                && n as i64 >= stage_from
                 && !l.staged.is_empty();
             #[cfg(not(feature = "cuda"))]
             false
@@ -3567,6 +3594,29 @@ impl ExpertResidency {
         self.lent.is_some()
     }
 
+    /// Marks the lend as a short prompt's (#37, `--short-prompt-tokens`): its steps keep an
+    /// unlent cache's chunks, build an unlent step's ops over the staged copies
+    /// ([`TieredLayer::short_lend`]) and stage from [`short_stage_min`] tokens, so the outputs
+    /// are those of an unlent cache. Cleared by the restore.
+    pub fn set_short_lend(&mut self, on: bool) {
+        self.short_lend = on;
+    }
+
+    /// Whether [`Self::set_short_lend`] is on.
+    pub fn short_lend(&self) -> bool {
+        self.short_lend
+    }
+
+    /// The fewest tokens a pass stages: [`ResidencyConfig::stage_min_tokens`], or in a short
+    /// prompt's lend [`short_stage_min`] if fewer.
+    fn stage_from(&self) -> i64 {
+        if self.short_lend && self.lent.is_some() {
+            self.stage_min.min(short_stage_min())
+        } else {
+            self.stage_min
+        }
+    }
+
     /// Whether [`Self::step_unlent`] has work: a refill after the last restore is under way
     /// (its thread waits for the lent tails, [`TailGate`]).
     pub fn refill_at_admit(&self) -> bool {
@@ -3984,6 +4034,7 @@ impl ExpertResidency {
         free_first: impl FnOnce() + Send + 'static,
         leave: &[(usize, u64)],
     ) -> Result<(), String> {
+        self.short_lend = false;
         let Some(held) = self.lent.take() else {
             free_first();
             return Ok(());
