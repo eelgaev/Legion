@@ -77,6 +77,7 @@ struct Op {
     kpad: i32,
     chunk: i32,
     cm: i32,
+    pool: i32,
     eps: f32,
     sfx: f32,
     sfy: f32,
@@ -107,6 +108,7 @@ impl Default for Op {
             kpad: 0,
             chunk: 0,
             cm: 0,
+            pool: 0,
             eps: 0.0,
             sfx: 1.0,
             sfy: 1.0,
@@ -131,11 +133,19 @@ enum Kernel {
     Norm,
     Rope,
     Softmax,
+    // Gemma 4's (#1217).
+    G4Im2col,
+    G4Pos,
+    Rms,
+    RmsAdd,
+    G4Qkv,
+    Geglu,
+    G4Pool,
 }
 
 unsafe extern "C" {
     /// The kernels as the CUDA runtime knows them (their host stubs), in [`Kernel`] order.
-    static legion_vision_kernels: [*const c_void; 6];
+    static legion_vision_kernels: [*const c_void; 13];
     fn cudaLaunchKernel(
         func: *const c_void,
         grid: Dim3,
@@ -349,8 +359,109 @@ struct Block {
     down: Linear,
 }
 
-/// The tower on one GPU.
-pub struct GpuEncoder {
+/// The tower on one GPU: Qwen3-VL's, or Gemma 4's ([`gemma4v`], #1217).
+pub enum GpuEncoder {
+    Qwen(QwenGpu),
+    Gemma(gemma4v::GemmaGpu),
+}
+
+impl GpuEncoder {
+    /// The CPU tower `enc`'s weights on CUDA device `device`. `Ok(None)`: the device or the
+    /// tower's shapes do not fit the kernels (the CPU tower runs then).
+    pub fn new(enc: &Encoder, device: usize) -> Result<Option<Self>, VisionError> {
+        Ok(match enc.hparams().projector {
+            super::Projector::Gemma4v => gemma4v::GemmaGpu::new(enc, device)?.map(Self::Gemma),
+            super::Projector::Qwen3vl => QwenGpu::new(enc, device)?.map(Self::Qwen),
+        })
+    }
+
+    pub fn config(&self) -> &EncoderConfig {
+        match self {
+            Self::Qwen(g) => &g.cfg,
+            Self::Gemma(g) => &g.cfg,
+        }
+    }
+
+    pub fn hparams(&self) -> &VisionHparams {
+        match self {
+            Self::Qwen(g) => &g.hp,
+            Self::Gemma(g) => &g.hp,
+        }
+    }
+
+    pub fn device(&self) -> usize {
+        match self {
+            Self::Qwen(g) => g.device as usize,
+            Self::Gemma(g) => g.device as usize,
+        }
+    }
+
+    /// Device memory the largest image's scratch takes (`image_max_pixels`), beside the
+    /// weights: for the language model's budgets.
+    pub fn scratch_bytes(&self) -> usize {
+        match self {
+            Self::Qwen(g) => g.scratch_bytes(),
+            Self::Gemma(g) => g.scratch_bytes(),
+        }
+    }
+
+    /// The tower's output for `p`, as [`Encoder::encode`] gives it.
+    pub fn encode(&mut self, p: &Preprocessed) -> Result<ImageEmbedding, VisionError> {
+        match self {
+            Self::Qwen(g) => g.encode(p),
+            Self::Gemma(g) => g.encode(p),
+        }
+    }
+}
+
+/// Launches kernel `k` of the table on `stream`, `args` its one parameter.
+fn launch<T>(
+    stream: *mut c_void,
+    k: Kernel,
+    grid: (usize, usize, usize),
+    block: u32,
+    args: &mut T,
+) -> Result<(), VisionError> {
+    if grid.0 == 0 || grid.1 == 0 || grid.2 == 0 {
+        return Ok(());
+    }
+    let mut argv = [(args as *mut T).cast::<c_void>()];
+    // SAFETY: a kernel of the table taking `T` by value (the launch copies it); its pointers
+    // are device memory of the stream's device.
+    let e = unsafe {
+        cudaLaunchKernel(
+            legion_vision_kernels[k as usize],
+            Dim3 {
+                x: grid.0 as u32,
+                y: grid.1 as u32,
+                z: grid.2 as u32,
+            },
+            Dim3 {
+                x: block,
+                y: 1,
+                z: 1,
+            },
+            argv.as_mut_ptr(),
+            0,
+            stream,
+        )
+    };
+    ok(e, "vision kernel launch")
+}
+
+/// The GEMM kernel over `batch` products on `stream`.
+fn gemm_on(stream: *mut c_void, mut g: Gemm, batch: usize) -> Result<(), VisionError> {
+    debug_assert!(g.k % 8 == 0 && g.lda % 8 == 0 && g.ldb % 8 == 0);
+    let grid = (
+        (g.n as usize).div_ceil(TILE),
+        (g.m as usize).div_ceil(TILE),
+        batch,
+    );
+    launch(stream, Kernel::Gemm, grid, 256, &mut g)
+}
+
+/// Qwen3-VL's tower on one GPU.
+pub struct QwenGpu {
     cfg: EncoderConfig,
     hp: VisionHparams,
     device: i32,
@@ -369,12 +480,10 @@ pub struct GpuEncoder {
 
 // SAFETY: the raw pointers are device / pinned allocations and a stream owned by the encoder,
 // used by one thread at a time (callers hold it behind a Mutex).
-unsafe impl Send for GpuEncoder {}
+unsafe impl Send for QwenGpu {}
 
-impl GpuEncoder {
-    /// The CPU tower `enc`'s weights on CUDA device `device`. `Ok(None)`: the device or the
-    /// tower's shapes do not fit the kernels (the CPU tower runs then).
-    pub fn new(enc: &Encoder, device: usize) -> Result<Option<Self>, VisionError> {
+impl QwenGpu {
+    fn new(enc: &Encoder, device: usize) -> Result<Option<Self>, VisionError> {
         let c = enc.config().clone();
         let d_head = c.n_embd / c.n_head;
         let pp3 = 3 * c.patch_size * c.patch_size;
@@ -465,18 +574,6 @@ impl GpuEncoder {
         }))
     }
 
-    pub fn config(&self) -> &EncoderConfig {
-        &self.cfg
-    }
-
-    pub fn hparams(&self) -> &VisionHparams {
-        &self.hp
-    }
-
-    pub fn device(&self) -> usize {
-        self.device as usize
-    }
-
     fn launch<T>(
         &self,
         k: Kernel,
@@ -484,41 +581,11 @@ impl GpuEncoder {
         block: u32,
         args: &mut T,
     ) -> Result<(), VisionError> {
-        if grid.0 == 0 || grid.1 == 0 || grid.2 == 0 {
-            return Ok(());
-        }
-        let mut argv = [(args as *mut T).cast::<c_void>()];
-        // SAFETY: a kernel of the table taking `T` by value (the launch copies it); its
-        // pointers are device memory of the encoder's device.
-        let e = unsafe {
-            cudaLaunchKernel(
-                legion_vision_kernels[k as usize],
-                Dim3 {
-                    x: grid.0 as u32,
-                    y: grid.1 as u32,
-                    z: grid.2 as u32,
-                },
-                Dim3 {
-                    x: block,
-                    y: 1,
-                    z: 1,
-                },
-                argv.as_mut_ptr(),
-                0,
-                self.stream,
-            )
-        };
-        ok(e, "vision kernel launch")
+        launch(self.stream, k, grid, block, args)
     }
 
-    fn gemm(&self, mut g: Gemm, batch: usize) -> Result<(), VisionError> {
-        debug_assert!(g.k % 8 == 0 && g.lda % 8 == 0 && g.ldb % 8 == 0);
-        let grid = (
-            (g.n as usize).div_ceil(TILE),
-            (g.m as usize).div_ceil(TILE),
-            batch,
-        );
-        self.launch(Kernel::Gemm, grid, 256, &mut g)
+    fn gemm(&self, g: Gemm, batch: usize) -> Result<(), VisionError> {
+        gemm_on(self.stream, g, batch)
     }
 
     /// `y = x W^T + b` of `lin` over `m` rows of F16 `x`, then GELU (`flags`) or `+ res`.
@@ -929,7 +996,7 @@ impl GpuEncoder {
     }
 }
 
-impl Drop for GpuEncoder {
+impl Drop for QwenGpu {
     fn drop(&mut self) {
         // SAFETY: our own stream, idle after every encode.
         unsafe {
@@ -938,6 +1005,8 @@ impl Drop for GpuEncoder {
         }
     }
 }
+
+mod gemma4v;
 
 #[cfg(test)]
 mod tests;

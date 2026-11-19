@@ -60,3 +60,44 @@ fn rows_and_counts() {
     assert_eq!(m.first_image(), Some(2));
     assert!(Media::default().is_empty());
 }
+
+/// Gemma 4 (#1217): every token at its own index, images or not; an image token's last key on
+/// the sliding-window layers is its image's last token.
+#[test]
+fn sequential_positions_and_image_ends() {
+    let m = Media::sequential(vec![span(2, 3, 2, 1), span(10, 1, 1, 1)], 1);
+    assert_eq!(m.layout(), ImageLayout::Sequential);
+    for i in 0..14 {
+        assert_eq!(m.rope(i), [i as i32, i as i32, i as i32, 0]);
+    }
+    assert_eq!(m.span_end(1), None);
+    assert_eq!(m.span_end(2), Some(7));
+    assert_eq!(m.span_end(7), Some(7));
+    assert_eq!(m.span_end(8), None);
+    assert_eq!(m.span_end(10), Some(10));
+    assert_eq!(m.row(3), Some(&[1.0f32][..]));
+    // The M-RoPE layout's spans end at the same tokens.
+    let q = Media::new(vec![span(2, 3, 2, 1)], 1);
+    assert_eq!(q.layout(), ImageLayout::MRope);
+    assert_eq!(q.span_end(5), Some(7));
+}
+
+/// A prompt chunk never ends inside an image: it stops before an image it reaches, or takes
+/// the whole of one it starts with when that fits `cap`.
+#[test]
+fn chunks_do_not_cut_images() {
+    let m = Media::sequential(vec![span(10, 4, 5, 1), span(40, 2, 2, 1)], 1);
+    // Ends before, at the start of, or right after an image: as asked.
+    assert_eq!(m.uncut(0, 8, 64), 8);
+    assert_eq!(m.uncut(0, 10, 64), 10);
+    assert_eq!(m.uncut(0, 30, 64), 30);
+    // Inside an image the chunk reaches: back to the image's start.
+    assert_eq!(m.uncut(0, 15, 64), 10);
+    assert_eq!(m.uncut(30, 42, 64), 40);
+    // Inside an image the chunk starts with (or resumes in): on to its end, within `cap`.
+    assert_eq!(m.uncut(10, 15, 64), 30);
+    assert_eq!(m.uncut(12, 15, 64), 30);
+    assert_eq!(m.uncut(10, 15, 20), 30);
+    assert_eq!(m.uncut(10, 15, 19), 15, "longer than cap: cut");
+    assert_eq!(Media::default().uncut(0, 5, 1), 5);
+}

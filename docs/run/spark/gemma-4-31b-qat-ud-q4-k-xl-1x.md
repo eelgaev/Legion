@@ -12,7 +12,8 @@ legion serve \
   --prefix-cache-states 0 \
   --spec mtp \
   --spec-draft mtp-gemma-4-31B-it-Q8_0.gguf \
-  --spec-gate-cost-model off
+  --spec-gate-cost-model off \
+  --mmproj mmproj-F16.gguf
 ```
 
 Deterministic client: 8 fixed prompts (prose, code, lists, chats, a story; thinking off and on), temperature 0,
@@ -24,6 +25,15 @@ Without `--spec-gate-cost-model off` (the same build, the run before): 16 users 
 from 8 decoding sequences; 1 and 4 users 35.1 / 97.1, prefill 871 / 767 / 544 (a cooler GPU; the flag does not
 touch prompt steps).
 
+### Images
+
+With `--mmproj` requests may carry images, and `/v1/models` lists `vision`. The tower runs on the GPU
+(2026-11-19): a 1024 × 768 image (336 image tokens) encodes in 0.39-0.40 s and its first token comes 0.8-1.0 s
+after the request (encode 13.0 s, TTFT 13.4 s on the CPU tower, `LEGION_DEBUG_VISION_CPU=1`). Smaller images
+(102-221 tokens) encode in 66-194 ms, TTFT 0.27-0.74 s. An image sent again takes its rows from a cache (TTFT
+0.43-0.63 s). Text-only requests give the same output as without `--mmproj`, at the same speed (`--deterministic`
+4 users 82.2 tok/s against 82.1, 1 user 30.2 against 30.2, 8K prefill 880 against 884).
+
 ## What each flag does
 
 - `--max-seqs` (`16`): How many requests are decoded at once (continuous batching). Set to the highest concurrency the benchmark uses.
@@ -32,3 +42,4 @@ touch prompt steps).
 - `--spec` (`mtp`): Speculative decoding drafter. `mtp` uses the model's own multi-token-prediction head to draft tokens that one verify step then checks, which raises decode speed without changing greedy output.
 - `--spec-draft` (`mtp-gemma-4-31B-it-Q8_0.gguf`): The MTP head's weights, for models whose main GGUF does not include it (the `mtp-*.gguf` file in the same Hugging Face repo).
 - `--spec-gate-cost-model` (`off`): lets MTP keep drafting at `--spec-max-batch` (8) or more decoding sequences, at the depth its step-cost model picks. Output-moving at 8 or more users.
+- `--mmproj` (`mmproj-F16.gguf`): The vision tower (the `mmproj-F16.gguf` file in the same Hugging Face repo), so requests may carry images. It runs on the GPU. Leave it out for text only.

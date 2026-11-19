@@ -42,6 +42,7 @@ fn shape(n_pool: usize, n_new: usize) -> GroupShape {
         pair: false,
         head_half: 0,
         img: 0,
+        spans: false,
         captures: Vec::new(),
     }
 }

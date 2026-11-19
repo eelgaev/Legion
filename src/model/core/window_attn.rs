@@ -67,9 +67,37 @@ impl Model {
                     };
                     // TurboQuant caches (#552): their own op. A compact cache (Gemma 4, #551):
                     // granules `d + r` wide (never TurboQuant, `turboquant::check`).
+                    // Image tokens that see their whole image (`GroupShape::spans`): each
+                    // token's last key follows the sequences' first positions in `n_past`.
+                    let spans = (sh.spans && swa && !pass.exclusive)
+                        .then(|| ctx.view_1d(n_past, nt * ns, ns as usize * 4));
+                    if spans.is_some() && (pass.kv.tq(il).is_some() || pass.kv.compact(il) > 0) {
+                        static CAUSAL: std::sync::Once = std::sync::Once::new();
+                        CAUSAL.call_once(|| {
+                            tracing::warn!(
+                                "images: a TurboQuant or compact sliding-window cache attends \
+                                 causally over an image's tokens (the reference sees the whole \
+                                 image there)"
+                            )
+                        });
+                    }
                     let o = match (pass.kv.tq(il), pass.kv.compact(il)) {
                         (Some(tq), _) => paged::tq::attention(
                             ctx, q, k, v, table, n_past, tq, scale, window, ring,
+                        ),
+                        (None, 0) if spans.is_some() => paged::attention_spans(
+                            ctx,
+                            q,
+                            k,
+                            v,
+                            table,
+                            n_past,
+                            scratch,
+                            scale,
+                            window,
+                            ring,
+                            pass.kv.paged_tier(il),
+                            spans.unwrap(),
                         ),
                         (None, 0) => paged::attention_tiered(
                             ctx,

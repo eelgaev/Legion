@@ -11,6 +11,11 @@ fn span(start: usize, nx: usize, ny: usize, n_embd: usize, v: f32) -> ImageSpan 
 
 /// Rank 0's request, as rank 1 takes it.
 fn take(table: &mut MediaTable, req: Request) -> u32 {
+    take_as(table, req, ImageLayout::MRope)
+}
+
+/// [`take`] for a model whose images take the positions of `layout`.
+fn take_as(table: &mut MediaTable, req: Request, layout: ImageLayout) -> u32 {
     let Request::TpMedia {
         id,
         n_embd,
@@ -20,8 +25,23 @@ fn take(table: &mut MediaTable, req: Request) -> u32 {
     else {
         panic!("not images: {req:?}")
     };
-    table.add(id, n_embd, &spans, &rows).unwrap();
+    table.add(id, n_embd, &spans, &rows, layout).unwrap();
     id
+}
+
+/// Gemma's images (#1217): the wire is the same, rank 1 places them as its model does.
+#[test]
+fn sequential_images_arrive_sequential() {
+    let a = Media::sequential(vec![span(3, 2, 3, 4, 0.5)], 4);
+    let mut sent = SentMedia::default();
+    let mut table = MediaTable::default();
+    let ia = take_as(&mut table, sent.id(&a).1.unwrap(), ImageLayout::Sequential);
+    let got = table.get(ia).unwrap().unwrap();
+    assert_eq!(got, &a);
+    for i in 0..12 {
+        assert_eq!(got.rope(i), [i as i32, i as i32, i as i32, 0]);
+        assert_eq!(got.span_end(i), a.span_end(i));
+    }
 }
 
 #[test]
@@ -156,21 +176,25 @@ fn cached_rows_are_forgotten_with_their_sequences() {
 fn bad_images_fail_where_they_arrive() {
     let mut t = MediaTable::default();
     let rows = vec![0.0f32; 12];
-    assert!(t.add(NONE, 2, &[(0, 2, 3)], &rows).is_err());
-    assert!(t.add(1, 2, &[(0, 2, 2)], &rows).is_err(), "rows left over");
-    assert!(t.add(1, 2, &[(0, 2, 4)], &rows).is_err(), "rows missing");
-    assert!(t.add(1, 2, &[(0, 0, 6)], &[]).is_err(), "an empty image");
+    let m = ImageLayout::MRope;
+    assert!(t.add(NONE, 2, &[(0, 2, 3)], &rows, m).is_err());
     assert!(
-        t.add(1, 2, &[(0, 1, 3), (2, 1, 3)], &rows).is_err(),
+        t.add(1, 2, &[(0, 2, 2)], &rows, m).is_err(),
+        "rows left over"
+    );
+    assert!(t.add(1, 2, &[(0, 2, 4)], &rows, m).is_err(), "rows missing");
+    assert!(t.add(1, 2, &[(0, 0, 6)], &[], m).is_err(), "an empty image");
+    assert!(
+        t.add(1, 2, &[(0, 1, 3), (2, 1, 3)], &rows, m).is_err(),
         "overlap"
     );
-    assert!(t.add(1, 0, &[(0, 2, 3)], &[]).is_err(), "rows 0 wide");
+    assert!(t.add(1, 0, &[(0, 2, 3)], &[], m).is_err(), "rows 0 wide");
     assert!(
-        t.add(1, 2, &[(u32::MAX, u32::MAX, u32::MAX)], &rows)
+        t.add(1, 2, &[(u32::MAX, u32::MAX, u32::MAX)], &rows, m)
             .is_err(),
         "past the end"
     );
     assert!(t.media.is_empty());
-    t.add(1, 2, &[(0, 1, 3), (3, 1, 3)], &rows).unwrap();
+    t.add(1, 2, &[(0, 1, 3), (3, 1, 3)], &rows, m).unwrap();
     assert_eq!(t.get(1).unwrap().unwrap().spans().len(), 2);
 }
