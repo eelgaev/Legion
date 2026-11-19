@@ -78,10 +78,19 @@ struct FillJob {
     queued: Option<(Copier, CopyEvent)>,
     /// The copies are done (the RAM slots unpinned, the stream back for the next job).
     landed: bool,
-    /// The filling VRAM slots `(layer, slot)` not complete yet.
+    /// The filling VRAM slots `(layer, slot)`, in copy order.
     slots: Vec<(usize, u32)>,
-    /// The RAM slots the copies read, pinned until they land, `(layer, RAM slot)`.
+    /// The RAM slots the copies read, pinned until they land, `(layer, RAM slot)`, in copy
+    /// order.
     pinned: Vec<(usize, usize)>,
+    /// How many experts' copies the thread found done (it waits for every batch), in copy
+    /// order.
+    done: Arc<std::sync::atomic::AtomicUsize>,
+    /// How many of [`Self::slots`] landed already (their RAM slots unpinned, the slots
+    /// complete or in [`Self::late`]).
+    seen: usize,
+    /// Landed slots of layers a scoped call left filling.
+    late: Vec<(usize, u32)>,
 }
 
 struct Device {
@@ -1007,6 +1016,18 @@ pub struct ExpertResidency {
     /// by device, for the next.
     #[cfg(feature = "cuda")]
     fill_jobs: Vec<FillJob>,
+    /// The RAM fill goes demand-first (#37 round 44, `LEGION_DEBUG_FILL_FIRST=0` turns it
+    /// off): its threads copy every layer's most routed experts before any layer's next ones,
+    /// the slots of the copies done are complete at the next after-step (not when the whole
+    /// fill is), and the threads queue no batch while [`Self::issue_swaps`] runs
+    /// ([`Self::fill_hold`]).
+    #[cfg(feature = "cuda")]
+    fill_first: bool,
+    /// Set while [`Self::issue_swaps`] runs with a RAM fill under way: the fill's threads
+    /// wait before their next batch, so the swaps' copies (a staged one is waited for) do
+    /// not queue behind the fill's on the link.
+    #[cfg(feature = "cuda")]
+    fill_hold: Arc<AtomicBool>,
     /// Tiered layers [`Self::step_unlent`] refilled, their RAM fill not planned yet (the
     /// next after-step or lend plans it, [`Self::plan_ram_fill`]).
     #[cfg(feature = "cuda")]
@@ -2232,6 +2253,10 @@ impl ExpertResidency {
             #[cfg(feature = "cuda")]
             fill_jobs: Vec::new(),
             #[cfg(feature = "cuda")]
+            fill_first: std::env::var_os("LEGION_DEBUG_FILL_FIRST").is_none_or(|v| v != "0"),
+            #[cfg(feature = "cuda")]
+            fill_hold: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "cuda")]
             unplanned: Vec::new(),
             #[cfg(feature = "cuda")]
             fill_streams: Vec::new(),
@@ -3419,8 +3444,25 @@ impl ExpertResidency {
         self.issue_swaps(d, &swaps)
     }
 
-    /// Starts the copies of device `d`'s planned `swaps` (already out of the tables).
+    /// Starts the copies of device `d`'s planned `swaps` (already out of the tables). A RAM
+    /// fill under way queues no batch meanwhile ([`Self::fill_hold`]).
     fn issue_swaps(&mut self, d: usize, swaps: &[Swap]) -> Result<(), String> {
+        #[cfg(feature = "cuda")]
+        let hold = self.fill_first && self.fill_jobs.iter().any(|j| !j.landed);
+        #[cfg(feature = "cuda")]
+        if hold {
+            self.fill_hold.store(true, Ordering::Release);
+        }
+        let r = self.queue_swaps(d, swaps);
+        #[cfg(feature = "cuda")]
+        if hold {
+            self.fill_hold.store(false, Ordering::Release);
+        }
+        r
+    }
+
+    /// [`Self::issue_swaps`]'s copies.
+    fn queue_swaps(&mut self, d: usize, swaps: &[Swap]) -> Result<(), String> {
         let tier = self.host.clone();
         for s in swaps {
             match &tier {
@@ -4666,13 +4708,10 @@ impl ExpertResidency {
         let Some(h) = self.host.clone() else {
             return Ok((0, 0));
         };
-        // Copies (to, from, bytes), slots and pinned RAM slots by device.
-        type Job = (
-            Vec<(usize, usize, usize)>,
-            Vec<(usize, u32)>,
-            Vec<(usize, usize)>,
-        );
-        let mut jobs: Vec<Job> = (0..self.devices.len()).map(|_| Job::default()).collect();
+        // One expert's copies (to, from, bytes), its VRAM slot and its pinned RAM slot.
+        type Fill = ([(usize, usize, usize); 3], (usize, u32), (usize, usize));
+        // By device, by layer in plan order (each layer's most routed first).
+        let mut jobs: Vec<Vec<Vec<Fill>>> = (0..self.devices.len()).map(|_| Vec::new()).collect();
         let (mut queued, mut copied) = (0, 0);
         for (il, fills) in self.take_planned(None, usize::MAX) {
             let d = self.layers[il].as_ref().expect("tiered layer").dev;
@@ -4684,20 +4723,20 @@ impl ExpertResidency {
                 let at = h.pin_fills(il, &experts)?;
                 let l = self.layers[il].as_ref().expect("tiered layer");
                 let n_slots = l.slots.n_slots();
-                let job = &mut jobs[d];
+                let mut layer = Vec::with_capacity(fills.len());
                 for (&(s, e), r) in fills.iter().zip(at) {
                     let Some(r) = r else {
                         now.push((s, e));
                         continue;
                     };
-                    for k in 0..3 {
+                    let copy = |k: usize| {
                         let (to, from) = (l.addr(k, s as usize), l.addr(k, n_slots + r));
-                        job.0.push((to, from, l.expert_bytes[k]));
-                    }
-                    job.1.push((il, s));
-                    job.2.push((il, r));
+                        (to, from, l.expert_bytes[k])
+                    };
+                    layer.push(([copy(0), copy(1), copy(2)], (il, s), (il, r)));
                     queued += 1;
                 }
+                jobs[d].push(layer);
             }
             if !now.is_empty() {
                 copied += now.len();
@@ -4709,29 +4748,48 @@ impl ExpertResidency {
                 l.dirty = true;
             }
         }
-        for (d, (copies, slots, pinned)) in jobs.into_iter().enumerate() {
-            if slots.is_empty() {
+        for (d, layers) in jobs.into_iter().enumerate() {
+            // Demand-first (#37 round 44): every layer's most routed expert, then every
+            // layer's next one, so the first batches land what the next steps route to most.
+            let fills = if self.fill_first {
+                rank_major(layers)
+            } else {
+                layers.into_iter().flatten().collect()
+            };
+            if fills.is_empty() {
                 continue;
             }
+            let copies: Vec<[(usize, usize, usize); 3]> = fills.iter().map(|f| f.0).collect();
+            let slots = fills.iter().map(|f| f.1).collect();
+            let pinned = fills.iter().map(|f| f.2).collect();
             let c = match self.fill_streams.iter().position(|s| s.0 == d) {
                 Some(i) => self.fill_streams.swap_remove(i).1,
                 None => Copier::new(self.devices[d].place.cuda.expect("a CUDA device"))?,
             };
+            let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (count, hold) = (done.clone(), self.fill_hold.clone());
             let thread = std::thread::Builder::new()
                 .name("legion-ram-fill".into())
                 .spawn(move || {
                     let mut c = c;
+                    let mut n = 0;
                     // A few experts at a time: a full driver queue would hold the engine's
                     // own copies (the swaps) as long as the whole fill.
-                    for batch in copies.chunks(3 * RAM_FILL_BATCH) {
-                        for &(to, from, n) in batch {
+                    for batch in copies.chunks(RAM_FILL_BATCH) {
+                        // The engine's swaps first ([`ExpertResidency::fill_hold`]).
+                        while hold.load(Ordering::Acquire) {
+                            std::thread::sleep(std::time::Duration::from_micros(20));
+                        }
+                        for &(to, from, bytes) in batch.iter().flatten() {
                             // SAFETY: `to` is in a filling slot (no table names it, no swap
-                            // plans it) and `from` in a RAM slot pinned until the copies
+                            // plans it) and `from` in a RAM slot pinned until its copies
                             // land; a lend or a drop waits for them first
                             // ([`ExpertResidency::finish_fills`]).
-                            unsafe { c.copy(to, from, n)? };
+                            unsafe { c.copy(to, from, bytes)? };
                         }
                         c.sync()?;
+                        n += batch.len();
+                        count.store(n, Ordering::Release);
                     }
                     let event = c.mark()?;
                     Ok((c, event))
@@ -4744,6 +4802,9 @@ impl ExpertResidency {
                 landed: false,
                 slots,
                 pinned,
+                done,
+                seen: 0,
+                late: Vec::new(),
             });
         }
         Ok((queued, copied))
@@ -4762,35 +4823,48 @@ impl ExpertResidency {
         while i < self.fill_jobs.len() {
             let j = &mut self.fill_jobs[i];
             if !j.landed {
-                if j.queued.is_none() {
-                    if !wait && !j.thread.as_ref().is_some_and(|t| t.is_finished()) {
-                        i += 1;
-                        continue;
-                    }
+                if j.queued.is_none()
+                    && (wait || j.thread.as_ref().is_some_and(|t| t.is_finished()))
+                {
                     let thread = j.thread.take().expect("the RAM fill thread");
                     let queued = thread
                         .join()
                         .map_err(|_| "the RAM fill thread panicked".to_string())?;
                     j.queued = Some(queued?);
                 }
-                let (c, event) = j.queued.as_mut().expect("joined");
-                if wait {
-                    c.sync()?;
-                } else if !event.done()? {
-                    i += 1;
-                    continue;
+                if let Some((c, event)) = j.queued.as_mut() {
+                    if wait {
+                        c.sync()?;
+                        j.landed = true;
+                    } else {
+                        j.landed = event.done()?;
+                    }
                 }
-                j.landed = true;
-                let (c, _) = j.queued.take().expect("joined");
-                self.fill_streams.push((j.device, c));
+                if j.landed {
+                    let (c, _) = j.queued.take().expect("joined");
+                    self.fill_streams.push((j.device, c));
+                }
+            }
+            // The experts whose copies are done: every one once the fill landed; demand-first
+            // (#37 round 44), those of the batches the thread waited for so far.
+            let upto = if j.landed {
+                j.slots.len()
+            } else if self.fill_first {
+                j.done.load(Ordering::Acquire).min(j.slots.len())
+            } else {
+                j.seen
+            };
+            if upto > j.seen {
                 if let Some(h) = &self.host {
-                    for &(il, r) in &j.pinned {
+                    for &(il, r) in &j.pinned[j.seen..upto] {
                         h.unpin(il, &[r]);
                     }
                 }
+                j.late.extend_from_slice(&j.slots[j.seen..upto]);
+                j.seen = upto;
             }
             let layers = &mut self.layers;
-            j.slots.retain(|&(il, s)| {
+            j.late.retain(|&(il, s)| {
                 if !scope.is_none_or(|f| f(il)) {
                     return true;
                 }
@@ -4799,7 +4873,7 @@ impl ExpertResidency {
                 l.dirty = true;
                 false
             });
-            if j.slots.is_empty() {
+            if j.landed && j.late.is_empty() {
                 self.fill_jobs.remove(i);
             } else {
                 i += 1;
@@ -5393,6 +5467,22 @@ const RAM_FILL_LAYERS: usize = 8;
 /// [`ExpertResidency::start_planned`]): ~2 ms of copies on an RTX 4090.
 #[cfg(feature = "cuda")]
 const RAM_FILL_BATCH: usize = 16;
+
+/// The items of `groups` (a RAM fill's experts by layer, each layer's most routed first)
+/// rank by rank: every group's first, then every group's second, and so on, in group order
+/// (#37 round 44, [`ExpertResidency::start_planned`]).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn rank_major<T>(groups: Vec<Vec<T>>) -> Vec<T> {
+    let n = groups.iter().map(Vec::len).sum();
+    let mut iters: Vec<_> = groups.into_iter().map(Vec::into_iter).collect();
+    let mut out = Vec::with_capacity(n);
+    while out.len() < n {
+        for it in &mut iters {
+            out.extend(it.next());
+        }
+    }
+    out
+}
 
 /// When the slot thread of a restore ([`ExpertResidency::restore`]) gives the lent tails
 /// (`lend_spread`: the slots past [`Layer::keep`]) their VRAM back (#37 round 27). The kept

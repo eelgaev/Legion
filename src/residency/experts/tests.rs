@@ -602,3 +602,15 @@ fn a_lend_fills_from_ram_only_the_slots_it_keeps() {
     assert_eq!(fill_below(false, Lend::Whole, 40, false), usize::MAX);
     assert_eq!(fill_below(false, Lend::Tail, 40, false), usize::MAX);
 }
+
+/// #37 round 44: a restore's RAM fill copies every layer's most routed expert first, then
+/// every layer's next one; layers with fewer fills drop out, nothing is lost or repeated.
+#[test]
+fn a_demand_first_fill_goes_rank_by_rank_over_the_layers() {
+    use super::rank_major;
+    let groups = vec![vec!["a0", "a1", "a2"], vec![], vec!["c0"], vec!["d0", "d1"]];
+    assert_eq!(rank_major(groups), vec!["a0", "c0", "d0", "a1", "d1", "a2"]);
+    assert!(rank_major::<u32>(Vec::new()).is_empty());
+    assert!(rank_major::<u32>(vec![vec![], vec![]]).is_empty());
+    assert_eq!(rank_major(vec![vec![1, 2, 3]]), vec![1, 2, 3]);
+}
