@@ -662,9 +662,10 @@ impl Layer {
     /// Plans packed staging for this lend ([`Self::stage_ids`]) from the current table: the
     /// first packed id is the first whole expert past every kind's kept slots. Returns the
     /// staging buffer bytes per kind it needs (one expert more for the matmuls' reads past
-    /// the last row).
+    /// the last row); `whole`: what a lend that keeps no slot needs, if more (every expert it
+    /// stages packed, [`whole_takes_staging`]).
     #[cfg(feature = "cuda")]
-    fn pack(&mut self) -> [usize; 3] {
+    fn pack(&mut self, whole: bool) -> [usize; 3] {
         let n_slots = self.slots.n_slots();
         let geometry: Vec<(usize, usize)> = (0..3)
             .map(|k| super::cuda::tiered_split(self.tensor(k)).unwrap_or((0, 0)))
@@ -688,7 +689,15 @@ impl Layer {
                 self.stage_miss.push(e as u32);
             }
         }
-        let n_ids = self.stage_first + self.stage_miss.len() + 1;
+        let staged = if whole {
+            let n = self.stage_ids.len() as u32;
+            (0..n)
+                .filter(|&e| self.stage_all || self.slots.owns(e))
+                .count()
+        } else {
+            self.stage_miss.len()
+        };
+        let n_ids = self.stage_first + staged + 1;
         std::array::from_fn(|k| {
             (geometry[k].0 + n_ids * self.expert_bytes[k]).saturating_sub(geometry[k].1)
         })
@@ -918,6 +927,9 @@ pub struct ExpertResidency {
     /// [`ResidencyConfig::lend_repack`].
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     lend_repack: usize,
+    /// [`ResidencyConfig::lend_spread_upto`].
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    lend_spread_upto: usize,
     /// CUDA devices idle during the passes [`Self::begin_pass`] starts ([`Self::set_idle`]).
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     idle: Vec<usize>,
@@ -1690,8 +1702,11 @@ impl ExpertResidency {
                         })
                         .max()
                         .unwrap_or(n_expert);
+                    // #37: a longer prompt's whole lend takes the kept staging
+                    // ([`ExpertResidency::lend_for`]): its buffers hold every expert.
+                    let whole = whole_takes_staging(cfg.stage_reuse, cfg.lend_spread_upto);
                     let (keep, by_bytes) =
-                        auto_keep_carved(&layers, n_staged, cfg.ring, need, cfg.stage_reuse);
+                        auto_keep_carved(&layers, n_staged, cfg.ring, need, cfg.stage_reuse, whole);
                     let bytes_of = |keep: &[usize]| -> u64 {
                         staged
                             .iter()
@@ -2069,6 +2084,7 @@ impl ExpertResidency {
             stage_pieces: cfg.stage_pieces,
             stage_reuse: cfg.stage_reuse,
             lend_repack: cfg.lend_repack,
+            lend_spread_upto: cfg.lend_spread_upto,
             stage_min: cfg.stage_min_tokens as i64,
             idle: Vec::new(),
             lend_keep: cfg.lend_keep.clone(),
@@ -3455,7 +3471,10 @@ impl ExpertResidency {
             let staged: Vec<bool> = (0..self.layers.len())
                 .map(|il| self.stages_entry(il))
                 .collect();
-            let spread = self.layers.iter().flatten().any(|l| l.keep.is_some());
+            // `lend_spread_upto` (#37): a prompt whose one step outgrows what the kept slots
+            // leave lends every slot whole, as without a keep.
+            let keeps = self.layers.iter().flatten().any(|l| l.keep.is_some());
+            let spread = keeps && tokens <= self.lend_spread_upto;
             let mut budget: Vec<u64> = self
                 .devices
                 .iter()
@@ -3522,7 +3541,16 @@ impl ExpertResidency {
             let fill_ms = t_fill.elapsed().as_secs_f64() * 1e3;
             let kept = mode.iter().filter(|m| **m == Lend::Keep).count();
             // Staging kept across lends: not with whole kept layers (`lend_keep`).
-            let reuse = self.stage_reuse && kept == 0;
+            // Nor made by such a whole lend: its buffers would hold the kept slots' heads,
+            // which a lend that keeps them cannot stage into (it takes the kept staging of
+            // the last lend that kept instead, `adopt` below).
+            let reuse = self.stage_reuse && kept == 0 && (spread || !keeps);
+            // #37: with a keep and longer prompts that lend whole, every lend packs its staged
+            // experts into buffers sized for all of them ([`whole_takes_staging`]): a whole
+            // lend then takes the kept staging made of the slot tails as it is (with its
+            // ranges, the heads they map unmapped), instead of making its own.
+            let grow = keeps && whole_takes_staging(self.stage_reuse, self.lend_spread_upto);
+            let adopt = grow && kept == 0;
             // `lend_repack` (#778): per device, the copies that re-pack its layers' kept slots,
             // and how many experts came from host memory and from VRAM.
             let n_dev = self.devices.len();
@@ -3557,14 +3585,20 @@ impl ExpertResidency {
             let mut packed_bytes: Vec<Option<[usize; 3]>> = vec![None; self.devices.len()];
             // Per device: the runs of consecutive experts its staged layers copy each pass.
             let mut runs = vec![0usize; n_dev];
+            // Sized for every expert (`grow`), a layer's buffers are the same size in every
+            // lend: each buffer only its rows' size ([`ring_bytes`], as unpacked staging).
+            let mut packed_rows: Vec<Vec<(usize, [usize; 3])>> = vec![Vec::new(); n_dev];
             for (il, l) in self.layers.iter_mut().enumerate() {
-                let Some(l) = l.as_mut().filter(|l| spread && staging[l.dev]) else {
+                let Some(l) = l.as_mut().filter(|l| (spread || grow) && staging[l.dev]) else {
                     continue;
                 };
                 if !staged[il] {
                     continue;
                 }
-                let need = l.pack();
+                let need = l.pack(grow);
+                if grow {
+                    packed_rows[l.dev].push((l.row, need));
+                }
                 runs[l.dev] += runs_of(&l.stage_miss).len();
                 let bytes = packed_bytes[l.dev].get_or_insert([0; 3]);
                 for (b, n) in bytes.iter_mut().zip(need) {
@@ -3607,15 +3641,21 @@ impl ExpertResidency {
                 .filter(|(d, _)| staging[*d])
                 .map(|(d, dev)| {
                     let parked = dev.staging.take().filter(|_| dev.kept);
-                    let bytes = if spread {
+                    let packs = spread || grow;
+                    let bytes = if packs {
                         packed_bytes[d]
                     } else {
                         dev.lend_bytes
                     };
                     // #1216: each buffer sized for the layers whose rows use it (packed
-                    // staging: every buffer its most uncached layer's size, as before).
-                    let need = bytes
-                        .map(|b| ring_bytes(b, ring, if spread { &[] } else { &ring_rows[d][..] }));
+                    // staging: every buffer its most uncached layer's size, as before, unless
+                    // sized for every expert).
+                    let rows = match (packs, grow) {
+                        (false, _) => &ring_rows[d][..],
+                        (true, true) => &packed_rows[d][..],
+                        (true, false) => &[],
+                    };
+                    let need = bytes.map(|b| ring_bytes(b, ring, rows));
                     let stage = dev.place.cuda.zip(need);
                     let stage = stage.map(|(c, need)| (c, need, dev.rows));
                     let layers = Vec::new();
@@ -3646,14 +3686,18 @@ impl ExpertResidency {
                 }
             }
             let (ring, pieces) = (self.ring, self.stage_pieces);
-            let done = per_device_thread("legion-lend", work, |_, w| w.lend(ring, pieces, reuse));
+            let done = per_device_thread("legion-lend", work, |_, w| {
+                w.lend(ring, pieces, reuse, adopt)
+            });
             let mut first_err = None;
             let (mut unback_ms, mut alloc_ms, mut repack_ms) = (0f64, 0f64, 0f64);
+            let mut ranges_ms = 0f64;
             for (d, r) in done {
                 let r = r.and_then(|r| {
                     unback_ms = unback_ms.max(r.unback_ms);
                     alloc_ms = alloc_ms.max(r.alloc_ms);
                     repack_ms = repack_ms.max(r.repack_ms);
+                    ranges_ms = ranges_ms.max(r.ranges_ms);
                     r.staging
                 });
                 let dev = &mut self.devices[d];
@@ -3684,6 +3728,7 @@ impl ExpertResidency {
                 devices_ms = ms(t0.elapsed() - t_tables),
                 unback_max_ms = unback_ms,
                 staging_alloc_max_ms = alloc_ms,
+                ranges_max_ms = ranges_ms,
                 repack_max_ms = repack_ms,
                 "expert cache lend"
             );
@@ -5354,14 +5399,22 @@ enum Lend {
 }
 
 /// What a device's [`LendWork`] made: its staging buffers (none if it does not stage) and
-/// whether they are kept for the next lend, and the milliseconds its unback and its staging
-/// allocation took.
+/// whether they are kept for the next lend, and the milliseconds its unback, its staging
+/// allocation and its staged ranges (mapped, or kept ones wrapped again) took.
 #[cfg(feature = "cuda")]
 struct LendDone {
     staging: Result<(Option<super::staging::Staging>, bool), String>,
     unback_ms: f64,
     alloc_ms: f64,
+    ranges_ms: f64,
     repack_ms: f64,
+}
+
+/// Whether a whole lend takes the kept staging of a lend that kept slots (#37): with kept
+/// staging (`stage_reuse`) where longer prompts lend whole (`spread_upto`,
+/// [`ResidencyConfig::lend_spread_upto`]), the buffers are sized for every expert.
+fn whole_takes_staging(stage_reuse: bool, spread_upto: usize) -> bool {
+    stage_reuse && spread_upto < usize::MAX
 }
 
 #[cfg(feature = "cuda")]
@@ -5374,7 +5427,11 @@ impl LendWork<'_> {
     /// slots map those allocations again in between ([`Layer::shared`]). A lend with kept
     /// buffers big enough only unmaps the slots, zeroes the buffers and wraps the ranges in
     /// tensors again. The same buffers and ranges, so the same outputs.
-    fn lend(self, ring: usize, pieces: usize, reuse: bool) -> LendDone {
+    ///
+    /// `adopt` (#37): kept buffers big enough serve this lend too, though it keeps none made
+    /// (a whole lend after one that kept slots: the buffers are the slot tails, which it lends
+    /// as well; the ranges unmap the slot heads it frees).
+    fn lend(self, ring: usize, pieces: usize, reuse: bool, adopt: bool) -> LendDone {
         let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1e3;
         let LendWork {
             stage,
@@ -5393,10 +5450,11 @@ impl LendWork<'_> {
                 staging: Err(format!("re-packing the kept slots: {e}")),
                 unback_ms: 0.0,
                 alloc_ms: 0.0,
+                ranges_ms: 0.0,
                 repack_ms,
             };
         }
-        let reused = reuse
+        let reused = (reuse || adopt)
             && match (&parked, &stage) {
                 (Some(st), Some((_, need, _))) => st.fits(need),
                 _ => false,
@@ -5430,7 +5488,7 @@ impl LendWork<'_> {
                 })
             });
         let unback_ms = ms(t);
-        let mut alloc_ms = 0.0;
+        let (mut alloc_ms, mut ranges_ms) = (0.0, 0.0);
         let staging = unback.and_then(|()| {
             let Some((c, need, rows)) = stage else {
                 return Ok((None, false));
@@ -5452,18 +5510,30 @@ impl LendWork<'_> {
                 (st, true, pooled)
             };
             alloc_ms = ms(t);
+            let t = std::time::Instant::now();
+            // Kept ranges whose head changed, and ranges made.
+            let (mut reheaded, mut made) = (0usize, 0usize);
             for (_, mode, l) in layers.iter_mut().filter(|(stages, _, _)| *stages) {
                 let n_ids = l.stage_first + l.stage_miss.len().max(1);
                 let packed = !l.stage_ids.is_empty();
                 for (k, kind) in KINDS.iter().enumerate() {
                     // A kept layer's range maps its slots again: cached experts read them.
                     let buf = st.buffer(k, l.row);
-                    let ctx = if reuse && *mode != Lend::Keep {
-                        if !l
-                            .ranges
-                            .get(k)
-                            .is_some_and(|r| r.serves(l.tensor(k), packed))
-                        {
+                    let ctx = if (reuse || reused) && *mode != Lend::Keep {
+                        let tiered = l.tensors[k].tensor(kind).expect("tiered tensor");
+                        // Only the slots' head changed (#37: a whole lend freed it, or the
+                        // restore after one made it new): the range maps it again.
+                        let serves = match l.ranges.get_mut(k) {
+                            Some(r) if r.serves(tiered, packed) => true,
+                            Some(r) => {
+                                let reheads = r.rehead(tiered, packed)?;
+                                reheaded += usize::from(reheads);
+                                reheads
+                            }
+                            None => false,
+                        };
+                        if !serves {
+                            made += 1;
                             let r = super::cuda::staged_range(c, l.tensor(k), buf, packed)?;
                             if k < l.ranges.len() {
                                 l.ranges[k] = r;
@@ -5489,6 +5559,16 @@ impl LendWork<'_> {
                 if fresh {
                     st.add_row(l.row, pieces)?;
                 }
+            }
+            ranges_ms = ms(t);
+            if reheaded + made > 0 {
+                tracing::debug!(
+                    device = c,
+                    reheaded,
+                    made,
+                    ranges_ms,
+                    "expert cache staged ranges"
+                );
             }
             let kept = if fresh {
                 // Kept only if every buffer is the slots' memory (a new allocation would hold
@@ -5539,6 +5619,7 @@ impl LendWork<'_> {
             staging,
             unback_ms,
             alloc_ms,
+            ranges_ms,
             repack_ms,
         }
     }

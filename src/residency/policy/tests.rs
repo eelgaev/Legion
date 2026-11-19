@@ -410,7 +410,7 @@ fn auto_keep_leaves_the_ring_and_the_need() {
 /// What a lend with `keep` makes of `layers` ([`lend_parts`], [`plan_staging`]): the bytes no
 /// staging buffer takes and the new VRAM the buffers need.
 fn carve(layers: &[LendLayer], keep: &[usize], n_expert: usize, cover: bool) -> (u64, u64) {
-    let (parts, bytes) = lend_parts(layers, keep, n_expert, GRANULE as usize);
+    let (parts, bytes) = lend_parts(layers, keep, n_expert, GRANULE as usize, false);
     let plan = crate::residency::experts::plan_staging(&parts, bytes, 2, cover);
     let mut taken = vec![false; parts.len()];
     let mut new = 0;
@@ -465,11 +465,49 @@ fn a_slot_ending_at_the_tail_is_not_kept() {
         over: [0, 0, over],
         staged: true,
     };
-    let (_, without) = lend_parts(&[layer(0)], &[237], 512, gran);
-    let (_, with) = lend_parts(&[layer(DOWN_OVER)], &[237], 512, gran);
+    let (_, without) = lend_parts(&[layer(0)], &[237], 512, gran, false);
+    let (_, with) = lend_parts(&[layer(DOWN_OVER)], &[237], 512, gran, false);
     for k in 0..3 {
         assert_eq!(with[k], without[k] + [GATE, GATE, DOWN][k]);
     }
+}
+
+/// #37: staging buffers sized for a whole lend too hold every expert past the kept slots' ids,
+/// and the keep goes down until those buffers still leave the need.
+#[test]
+fn whole_sized_staging_holds_every_expert() {
+    const MIB: u64 = 1 << 20;
+    let gran = GRANULE as usize;
+    let layer = LendLayer {
+        slots: 105,
+        bytes: [GATE, GATE, DOWN],
+        over: [0; 3],
+        staged: true,
+    };
+    let (_, packed) = lend_parts(&[layer], &[50], 256, gran, false);
+    let (_, whole) = lend_parts(&[layer], &[50], 256, gran, true);
+    for k in 0..3 {
+        let b = layer.bytes[k];
+        let vram = (105 * b).next_multiple_of(gran);
+        let first = vram - 105 * b;
+        let split = (first + 50 * b) / gran * gran;
+        let stage_first = (0..3)
+            .map(|j| {
+                let bj = layer.bytes[j];
+                let vj = (105 * bj).next_multiple_of(gran);
+                let fj = vj - 105 * bj;
+                ((fj + 50 * bj) / gran * gran - fj).div_ceil(bj)
+            })
+            .max()
+            .unwrap();
+        assert_eq!(whole[k], first + (stage_first + 257) * b - split);
+        assert!(whole[k] > packed[k]);
+    }
+    let layers = vec![layer; 48];
+    let need = 4555 * MIB;
+    let (keep, _) = auto_keep_carved(&layers, 256, 4, need, true, false);
+    let (sized, _) = auto_keep_carved(&layers, 256, 4, need, true, true);
+    assert!(sized[0] <= keep[0], "{sized:?} {keep:?}");
 }
 
 /// #767: a 4-GPU AC922's last stage at `--layer-split 14,28,42` (layers 42..48 and the MTP head, 486
@@ -496,7 +534,7 @@ fn auto_keep_carved_leaves_a_short_stage_its_need() {
         over: [0; 3],
         staged: false,
     });
-    let (keep, by_bytes) = auto_keep_carved(&layers, 512, 2, need, true);
+    let (keep, by_bytes) = auto_keep_carved(&layers, 512, 2, need, true, false);
     assert_eq!(by_bytes, vec![486; 6]);
     // By bytes: no VRAM left for the prompt, new VRAM for the buffers.
     let (left, new) = carve(&layers, &by_bytes, 512, true);
@@ -538,7 +576,7 @@ fn auto_keep_carved_keeps_an_even_split() {
             staged: false,
         }));
         for cover in [true, false] {
-            let (keep, by_bytes) = auto_keep_carved(&layers, 512, 2, need, cover);
+            let (keep, by_bytes) = auto_keep_carved(&layers, 512, 2, need, cover, false);
             assert_eq!(keep, by_bytes, "{slots} {mtp:?} {cover}");
             assert!(keep[0] > 0, "{slots}");
         }
