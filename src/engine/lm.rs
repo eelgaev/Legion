@@ -7362,7 +7362,7 @@ impl Worker {
             // Lent for the mapping alone (most of a second): all of the tail at once, as the
             // next sequence would lend it again for more. Only a long prompt's lend maps parts.
             blocks = usize::MAX;
-            self.lend_cache(0, usize::MAX);
+            self.lend_cache(0, 0, usize::MAX);
             if self.lent {
                 self.lent_short = true;
                 self.exec.set_pipeline_micro(self.micro);
@@ -7584,7 +7584,7 @@ impl Worker {
                 // its full size again by a lend and the restore the loop runs next.
                 let cut = (self.exec.model().experts()).is_some_and(|x| x.cut_slots() > 0);
                 if cut && !self.lent && self.can_lend {
-                    self.lend_cache(0, usize::MAX);
+                    self.lend_cache(0, 0, usize::MAX);
                     self.lent_short = self.lent;
                 }
             }
@@ -7596,11 +7596,13 @@ impl Worker {
     }
 
     /// Lends the expert cache's VRAM to the long prompt about to be read (see [`LongPrompts`]);
-    /// on failure the cache keeps it and lending stays off. `tokens`: the longest prompt's
-    /// tokens still to read.
-    fn lend_cache(&mut self, tokens: usize, end: usize) {
+    /// on failure the cache keeps it and lending stays off. `tokens`: every prompt's tokens
+    /// still to read (they share the big steps the lend sizes for); `longest`: the longest
+    /// prompt's (its re-pack threshold, [`crate::residency::ResidencyConfig::lend_repack`],
+    /// is per prompt).
+    fn lend_cache(&mut self, tokens: usize, longest: usize, end: usize) {
         let t = Instant::now();
-        match self.exec.lend_experts(tokens) {
+        match self.exec.lend_experts(tokens, longest) {
             Ok(true) => {
                 self.lent = true;
                 (self.long_cap, self.long_reserve) = self.long_micro_cap(end);
@@ -7993,7 +7995,8 @@ impl Worker {
         if (long || short) && !self.lent {
             let end = prefilling.iter().map(|s| s.prompt.len()).max().unwrap_or(0);
             // Every prompt's tokens: they share the big steps a lend sizes for (#37).
-            self.lend_cache(prefilling.iter().map(left).sum(), end);
+            let longest = prefilling.iter().map(left).max().unwrap_or(0);
+            self.lend_cache(prefilling.iter().map(left).sum(), longest, end);
             self.lent_short = !long;
             // `--kv-vmm-keep` with `--glm-parallel-decode` (#1174): a long prompt that will
             // pass the kept blocks maps the KV pools' tail now, while the VRAM the lend just
