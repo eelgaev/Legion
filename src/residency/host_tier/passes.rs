@@ -828,6 +828,8 @@ impl HostTier {
         let mut st = inner.state.lock().unwrap();
         let st = &mut *st;
         inner.take_ahead(st, None)?;
+        // The pass's reads take the SSD: refills not started are dropped (#37 round 43).
+        inner.cancel_refills(st)?;
         // Before the pass marks its RAM slots used: the order they go out in ([`Learn`]).
         let learning = gate.is_some() && slot_learn();
         let evict: Vec<Vec<usize>> = layers

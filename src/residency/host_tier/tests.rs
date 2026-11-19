@@ -541,6 +541,50 @@ fn gated_reads_take_the_ram_slots_no_token_routes_to() {
 }
 
 #[test]
+fn dup_refill_reads_hot_experts_into_the_slots_vram_copies_hold() {
+    use refill::plan_dup_refill;
+    // Slots 0-3 hold 1, 2, 3, 4 (used in that order); VRAM holds 2, 4 and 7.
+    let mut cache = SlotCache::new(10, 4);
+    for e in 1..=4 {
+        cache.plan(&[e]);
+    }
+    let mut in_vram = [false; 10];
+    for e in [2, 4, 7] {
+        in_vram[e] = true;
+    }
+    let mut flying = [false; 10];
+    flying[6] = true;
+    // Slot 3's copy is pinned (a fill reads it): only slot 1 goes; 7 is in VRAM, 2 in RAM
+    // and 6 being read, so 5 takes it.
+    cache.pin(3, true);
+    let ranked = [7, 5, 2, 6, 8];
+    assert_eq!(
+        plan_dup_refill(&cache, &in_vram, &flying, &ranked),
+        vec![(5, 1)]
+    );
+    // Unpinned, slot 3 goes second (used later), to the next one in neither tier.
+    cache.pin(3, false);
+    assert_eq!(
+        plan_dup_refill(&cache, &in_vram, &flying, &ranked),
+        vec![(5, 1), (8, 3)]
+    );
+    // No copies of VRAM experts: nothing moves.
+    assert_eq!(
+        plan_dup_refill(&cache, &[false; 10], &flying, &ranked),
+        vec![]
+    );
+}
+
+#[test]
+fn dup_refill_needs_ram_slots_for_half_the_experts() {
+    use refill::dup_refill_ram;
+    assert!(dup_refill_ram(320, 512));
+    assert!(dup_refill_ram(256, 512));
+    assert!(!dup_refill_ram(255, 512));
+    assert!(!dup_refill_ram(111, 512));
+}
+
+#[test]
 fn gated_reads_ahead_the_share_routed_before() {
     use passes::ahead_count;
     let big = u64::MAX;
