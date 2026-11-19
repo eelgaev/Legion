@@ -67,9 +67,11 @@ fn a_rung_bell_is_seen_once() {
 
 #[test]
 fn a_ring_ends_a_nap_and_spins_again() {
-    // Long naps: only a ring ends one early.
+    // Long naps: only a ring ends one early. The spin outlasts the 5 ms
+    // between the ring and the send (the send does not ring), but not the
+    // 50 ms before the ring, so the waiter is napping when it comes.
     const SLOW: Pace = Pace {
-        spin: Duration::from_micros(100),
+        spin: Duration::from_millis(20),
         nap: Duration::from_secs(2),
         nap_for: Duration::from_secs(30),
     };
