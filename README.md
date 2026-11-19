@@ -32,7 +32,8 @@ is no other choice (ggml provides the quantized kernels underneath).
   Legion also saves their recurrent states, including one past each reply, so a multi-turn chat or
   an agent loop computes only its new tokens: a repeated 5.8K-token prompt starts in 0.07 s instead
   of 3.6 s on a DGX Spark.
-- **Images.** Qwen3.5 / 3.6 models take images through `--mmproj` (all three APIs and the web UI).
+- **Images.** Qwen3.5 / 3.6, Qwen3.8-27B and Qwen3.8-Flash-Next take images through `--mmproj`, or through the
+  vision tower a checkpoint ships (all three APIs and the web UI).
 - **Fast prefill.** Fused expert kernels, sparse attention and pipelined prompt chunks over several
   GPUs.
 - **Easy to use.** One binary: point `legion serve` at a GGUF file or a checkpoint directory.

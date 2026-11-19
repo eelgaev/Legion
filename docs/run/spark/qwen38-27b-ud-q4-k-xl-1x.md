@@ -22,6 +22,20 @@ prefill 880 / 822 / 652 tok/s at 8K / 32K / 123K.
 
 With `--spec-k 2` and without `--spec-draft-vocab` (every row of the MTP head): 1 user 21.3-25.9 (median 23.8), 4 users 70.2, 16 users 120.4; prefill 879 / 825 / 657.
 
+### Images
+
+Add the vision projector from the same Hugging Face repo:
+
+```sh
+  --mmproj mmproj-BF16.gguf
+```
+
+Requests may then carry images, and `/v1/models` lists `vision`. The tower runs on the GPU (2026-11-19): a
+1024 × 768 image (768 image tokens) encodes in 0.34 s and its first token comes 1.17 s after the request,
+against 1.75 s from llama.cpp's `llama-server` with the same files; sent again, its rows come from a cache
+(TTFT 0.81 s). Smaller images encode in 0.05-0.15 s (TTFT 0.33-0.69 s). The MTP head drafts the image answers
+as it drafts text. Text-only requests give the same output as without `--mmproj`.
+
 ## What each flag does
 
 - `--max-seqs` (`16`): How many requests are decoded at once (continuous batching). Set to the highest concurrency the benchmark uses.
@@ -31,3 +45,4 @@ With `--spec-k 2` and without `--spec-draft-vocab` (every row of the MTP head): 
 - `--spec-draft` (`mtp-Qwen3.8-27B-Q4_0.gguf`): The MTP head's weights, for models whose main GGUF does not include it (the `mtp-*.gguf` file in the same Hugging Face repo).
 - `--spec-k` (`8`): Lets the depth policy draft up to 8 tokens a step; it picks the depth from measured step costs. Output-moving (other drafts, other verify shapes); every token is still verified by the full model.
 - `--spec-draft-vocab` (`65536`): Each draft pass scores only the first 65,536 tokens of the MTP head's output layer, a cheaper pass over the 248,320-token vocabulary. Output-moving, as `--spec-k`.
+- `--mmproj` (`mmproj-BF16.gguf`, opt-in above): The vision projector (`qwen3vl_merger`), so requests may carry images. Text-only output does not change.
