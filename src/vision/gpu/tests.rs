@@ -81,6 +81,10 @@ fn gpu_tower_on_a_checkpoint() {
         let got = gpu.encode(&p).unwrap();
         let t_gpu = t.elapsed().as_secs_f64();
         assert_eq!(got.data.len(), want.data.len());
+        assert!(
+            got.data.iter().chain(&want.data).all(|v| v.is_finite()),
+            "{f:?}: rows not finite"
+        );
         let scale = want.data.iter().fold(0f32, |m, v| m.max(v.abs()));
         let err = got
             .data

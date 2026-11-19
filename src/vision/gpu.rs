@@ -289,6 +289,23 @@ fn vector(t: Tensor<'_>) -> Result<DevBuf, VisionError> {
     DevBuf::f32s(&values(t)?)
 }
 
+/// Byte offsets into an image's scratch, its size and the queries per attention chunk.
+struct Scratch {
+    pix: usize,
+    cs: usize,
+    x: usize,
+    h: usize,
+    big: usize,
+    q: usize,
+    k: usize,
+    vt: usize,
+    s: usize,
+    p: usize,
+    out: usize,
+    total: usize,
+    chunk: usize,
+}
+
 struct Linear {
     w: DevBuf,
     b: DevBuf,
@@ -379,6 +396,18 @@ impl GpuEncoder {
             || !n_ff.is_multiple_of(8)
         {
             return Ok(None);
+        }
+        // Every linear's input width too (the merger's are its own), before any upload.
+        let mut linears = vec!["mm.0".to_string(), "mm.2".to_string()];
+        for il in 0..c.n_layer {
+            for l in ["attn_qkv", "attn_out", "ffn_up", "ffn_down"] {
+                linears.push(format!("v.blk.{il}.{l}"));
+            }
+        }
+        for name in &linears {
+            if !(enc.weight(&format!("{name}.weight"))?.shape()[0] as usize).is_multiple_of(8) {
+                return Ok(None);
+            }
         }
         let w0 = values(enc.weight("v.patch_embd.weight")?)?;
         let w1 = values(enc.weight("v.patch_embd.weight.1")?)?;
@@ -540,6 +569,73 @@ impl GpuEncoder {
         self.launch(Kernel::Norm, (rows.div_ceil(8), 1, 1), 256, &mut o)
     }
 
+    /// The scratch of an image of `n` patches, `n_pix` pixel values and a rotation table of
+    /// `n_cs` values.
+    fn scratch(&self, n: usize, n_pix: usize, n_cs: usize) -> Scratch {
+        let c = &self.cfg;
+        let (e, heads) = (c.n_embd, c.n_head);
+        let d = e / heads;
+        let pp3 = 3 * c.patch_size * c.patch_size;
+        let kpad = n.next_multiple_of(8);
+        let n_tok = n / 4;
+        // Whole tiles of queries where the budget takes one, fewer queries where it does not
+        // (the GEMM takes partial tiles).
+        let per = ATTN_BUDGET / (heads * kpad * 6);
+        let chunk = if per >= TILE {
+            per / TILE * TILE
+        } else {
+            per.max(1)
+        }
+        .min(n.next_multiple_of(TILE));
+        let mut at = 0usize;
+        let mut take = |bytes: usize| {
+            let o = at;
+            at += bytes.next_multiple_of(256);
+            o
+        };
+        let pix = take(n_pix * 4);
+        let cs = take(n_cs * 4);
+        let x = take(n * e * 4);
+        let h = take(n * e * 2);
+        let big = take(
+            (n * pp3 * 2)
+                .max(n * 3 * e * 4)
+                .max(n * self.n_ff * 2)
+                .max(n_tok * self.mm0.n * 2),
+        );
+        let q = take(heads * n * d * 2);
+        let k = take(heads * n * d * 2);
+        let vt = take(heads * d * kpad * 2);
+        let s = take(heads * chunk * kpad * 4);
+        let p = take(heads * chunk * kpad * 2);
+        let out = take(n_tok * c.n_out * 4);
+        Scratch {
+            pix,
+            cs,
+            x,
+            h,
+            big,
+            q,
+            k,
+            vt,
+            s,
+            p,
+            out,
+            total: at,
+            chunk,
+        }
+    }
+
+    /// Device memory the largest image's scratch takes (`image_max_pixels`), beside the
+    /// weights: for the language model's budgets.
+    pub fn scratch_bytes(&self) -> usize {
+        let c = &self.cfg;
+        let px = self.hp.image_max_pixels as usize;
+        let n = px / (c.patch_size * c.patch_size);
+        // A rotation table of at most one row per patch.
+        self.scratch(n, 3 * px, n * (c.n_embd / c.n_head) / 2).total
+    }
+
     /// The tower's output for `p`, as [`Encoder::encode`] gives it.
     pub fn encode(&mut self, p: &Preprocessed) -> Result<ImageEmbedding, VisionError> {
         let c = self.cfg.clone();
@@ -563,9 +659,6 @@ impl GpuEncoder {
         let kpad = n.next_multiple_of(8);
         let n_tok = n / 4;
         let n_out = c.n_out;
-        let chunk = (ATTN_BUDGET / (heads * kpad * 6) / TILE * TILE)
-            .max(TILE)
-            .min(n.next_multiple_of(TILE));
 
         // Rotation table: ggml's `ggml_mrope_cache_init` for GGML_ROPE_TYPE_VISION, each
         // section's theta restarting at the patch's row (column) and multiplied down per pair.
@@ -582,28 +675,21 @@ impl GpuEncoder {
         }
 
         // Scratch, one stream-ordered allocation.
-        let mut at = 0usize;
-        let mut take = |bytes: usize| {
-            let o = at;
-            at += bytes.next_multiple_of(256);
-            o
-        };
-        let o_pix = take(p.pixels.len() * 4);
-        let o_cs = take(cs.len() * 4);
-        let o_x = take(n * e * 4);
-        let o_h = take(n * e * 2);
-        let big = (n * pp3 * 2)
-            .max(n * 3 * e * 4)
-            .max(n * self.n_ff * 2)
-            .max(n_tok * self.mm0.n * 2);
-        let o_big = take(big);
-        let o_q = take(heads * n * d * 2);
-        let o_k = take(heads * n * d * 2);
-        let o_vt = take(heads * d * kpad * 2);
-        let o_s = take(heads * chunk * kpad * 4);
-        let o_p = take(heads * chunk * kpad * 2);
-        let o_out = take(n_tok * n_out * 4);
-        let total = at;
+        let Scratch {
+            pix: o_pix,
+            cs: o_cs,
+            x: o_x,
+            h: o_h,
+            big: o_big,
+            q: o_q,
+            k: o_k,
+            vt: o_vt,
+            s: o_s,
+            p: o_p,
+            out: o_out,
+            total,
+            chunk,
+        } = self.scratch(n, p.pixels.len(), cs.len());
 
         let in_bytes = (p.pixels.len() + cs.len()) * 4;
         let out_bytes = n_tok * n_out * 4;
@@ -630,10 +716,22 @@ impl GpuEncoder {
             unsafe { base.cast::<u8>().add(o).cast() }
         };
         let result = (|| -> Result<(), VisionError> {
-            // SAFETY: copies into the scratch from the pinned buffers, on the stream.
+            // SAFETY: copies into the scratch from the pinned buffers, on the stream; the
+            // pixels and the rotation table each to their own (aligned) offset.
             unsafe {
+                let px_bytes = p.pixels.len() * 4;
                 ok(
-                    cudaMemcpyAsync(ptr(o_pix), pin_in, in_bytes, H2D, st),
+                    cudaMemcpyAsync(ptr(o_pix), pin_in, px_bytes, H2D, st),
+                    "cudaMemcpyAsync",
+                )?;
+                ok(
+                    cudaMemcpyAsync(
+                        ptr(o_cs),
+                        pin_in.cast::<u8>().add(px_bytes).cast(),
+                        in_bytes - px_bytes,
+                        H2D,
+                        st,
+                    ),
                     "cudaMemcpyAsync",
                 )?;
                 ok(

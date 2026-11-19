@@ -101,6 +101,15 @@ impl Tower {
         Tower::Cpu(enc)
     }
 
+    /// Device memory the largest image's scratch takes on the GPU (0 on the CPU).
+    fn scratch_bytes(&self) -> usize {
+        match self {
+            Tower::Cpu(_) => 0,
+            #[cfg(feature = "cuda")]
+            Tower::Gpu(e) => e.scratch_bytes(),
+        }
+    }
+
     fn place_name(&self) -> String {
         match self {
             Tower::Cpu(_) => "the CPU".into(),
@@ -234,6 +243,12 @@ impl Vision {
             image_pad,
             rows: Mutex::new(RowCache::default()),
         })
+    }
+
+    /// Device memory the GPU tower's largest image's scratch takes (0 on the CPU), for the
+    /// language model's budgets on that GPU.
+    pub(super) fn gpu_scratch_bytes(&self) -> usize {
+        self.tower.lock().unwrap().scratch_bytes()
     }
 
     /// Expands each `<|image_pad|>` of `tokens` (one per image, in order) to its image's tokens.

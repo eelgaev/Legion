@@ -5057,6 +5057,57 @@ impl LmEngine {
                 }
             }
         }
+        // `--mmproj`: the vision tower (#146), else an HF checkpoint's own (#1195). Other
+        // ranks and nodes get no images' rows. Loaded before the expert cache takes what the
+        // GPU has left: the GPU tower's weights are in use then, and its largest image's
+        // scratch is kept free of the cache.
+        let arch = gguf.architecture().unwrap_or_default();
+        let n_embd = exec.hp().n_embd as usize;
+        // The tower runs on the first stage's GPU (#1195), the CPU without one.
+        let vision_gpu = layout
+            .stages
+            .first()
+            .and_then(|(d, _)| *d)
+            .and_then(cuda_index);
+        let vision = match &cfg.mmproj {
+            Some(_) if cfg.tp_net.is_some() || cfg.node.is_some() => {
+                return Err(LoadError::Device(
+                    "--mmproj: not with --tp-rank or --node-rank (yet)".into(),
+                ));
+            }
+            Some(path) => Some(Arc::new(vision::Vision::load(
+                path,
+                &arch,
+                n_embd,
+                &tokenizer,
+                cfg.threads,
+                vision_gpu,
+            )?)),
+            None if cfg.no_mmproj || !cfg.model_path.is_dir() => None,
+            None if cfg.tp_net.is_some() || cfg.node.is_some() => {
+                tracing::info!(
+                    "vision: the checkpoint's vision tower is not loaded with --tp-rank or \
+                     --node-rank (yet): text only"
+                );
+                None
+            }
+            None => match vision::Vision::from_checkpoint(
+                &cfg.model_path,
+                &arch,
+                n_embd,
+                &tokenizer,
+                cfg.threads,
+                vision_gpu,
+            ) {
+                Ok(v) => v.map(Arc::new),
+                Err(e) => {
+                    tracing::warn!(error = %e, "vision: the checkpoint's vision tower did not load; text only");
+                    None
+                }
+            },
+        };
+        // The GPU tower's scratch at the largest image, on the first stage (0 on the CPU).
+        let vision_scratch = vision.as_ref().map_or(0, |v| v.gpu_scratch_bytes());
         // The measured step compute buffers per stage (for the startup report).
         let mut measured_compute: Vec<usize> = Vec::new();
         // Per stage: a long prompt's micro-chunk step buffer as measured (#1216).
@@ -5260,6 +5311,10 @@ impl LmEngine {
             if let Some(last) = cache_compute.last_mut() {
                 *last += mtp_head + head_pool;
             }
+            // The vision tower's scratch (#1195): its images run beside the steps.
+            if let Some(first) = cache_compute.first_mut() {
+                *first += vision_scratch;
+            }
             planned_compute = cache_compute.clone();
             let mut pinned = vec![0; cache_compute.len()];
             if let Some(last) = pinned.last_mut() {
@@ -5321,10 +5376,13 @@ impl LmEngine {
                 let budget: Vec<usize> = layout
                     .stages
                     .iter()
-                    .map(|(d, _)| {
+                    .enumerate()
+                    .map(|(i, (d, _))| {
+                        // The vision tower's scratch stays free on the first stage (#1195).
+                        let vision = if i == 0 { vision_scratch } else { 0 };
                         vram::free_budget(
                             d.map_or(0, |d| d.memory().0),
-                            cfg.residency.cache_reserve as usize,
+                            cfg.residency.cache_reserve as usize + vision,
                         )
                     })
                     .collect();
@@ -5655,53 +5713,6 @@ impl LmEngine {
                 let layers = exec.stage_layers().iter().map(|r| r.len()).collect();
                 Arc::new(Mutex::new(pipe_split::Probe::new(layers)))
             });
-        // `--mmproj`: the vision tower (#146), else an HF checkpoint's own (#1195). Other
-        // ranks and nodes get no images' rows.
-        let arch = gguf.architecture().unwrap_or_default();
-        let n_embd = exec.hp().n_embd as usize;
-        // The tower runs on the first stage's GPU (#1195), the CPU without one.
-        let vision_gpu = layout
-            .stages
-            .first()
-            .and_then(|(d, _)| *d)
-            .and_then(cuda_index);
-        let vision = match &cfg.mmproj {
-            Some(_) if cfg.tp_net.is_some() || cfg.node.is_some() => {
-                return Err(LoadError::Device(
-                    "--mmproj: not with --tp-rank or --node-rank (yet)".into(),
-                ));
-            }
-            Some(path) => Some(Arc::new(vision::Vision::load(
-                path,
-                &arch,
-                n_embd,
-                &tokenizer,
-                cfg.threads,
-                vision_gpu,
-            )?)),
-            None if cfg.no_mmproj || !cfg.model_path.is_dir() => None,
-            None if cfg.tp_net.is_some() || cfg.node.is_some() => {
-                tracing::info!(
-                    "vision: the checkpoint's vision tower is not loaded with --tp-rank or \
-                     --node-rank (yet): text only"
-                );
-                None
-            }
-            None => match vision::Vision::from_checkpoint(
-                &cfg.model_path,
-                &arch,
-                n_embd,
-                &tokenizer,
-                cfg.threads,
-                vision_gpu,
-            ) {
-                Ok(v) => v.map(Arc::new),
-                Err(e) => {
-                    tracing::warn!(error = %e, "vision: the checkpoint's vision tower did not load; text only");
-                    None
-                }
-            },
-        };
         let slot_host_budget = exec.kv_slot_host_budget();
         let slot_lend = exec.kv_slot_lend();
         let ring_ckpt_slots = exec.ring_save_slots();
