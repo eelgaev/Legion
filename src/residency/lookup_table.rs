@@ -24,8 +24,9 @@
 //!   need the same rows as rank 0; a rank whose copy of the file is slow to read (another
 //!   machine's disk over NFS) asks rank 0 for the rows it misses instead ([`PeerRows`],
 //!   [`LookupTable::set_peer`]), which reads them from its own disk
-//!   ([`LookupTable::read_for_peer`]); the same bytes, and its own reads if rank 0 fails. A
-//!   batch AIO takes (a decode step's) it still reads itself: sooner than the round trip.
+//!   ([`LookupTable::read_for_peer`]); the same bytes, and its own reads if rank 0 fails. That
+//!   includes the small batches AIO takes (a decode or verify step's, a draft's read-ahead):
+//!   over NFS their reads came back later than rank 0's answer.
 //! - **auto:** ram when the table fits in available memory with a margin and may be locked;
 //!   otherwise direct, with a RAM cache sized to what is free. On a GPU that shares the host's
 //!   memory (GB10) always direct: the GPU's KV cache and buffers come later out of the same RAM
@@ -44,7 +45,9 @@ use std::fs::File;
 use std::io;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
 
 use serde::Serialize;
 
@@ -52,6 +55,53 @@ use crate::hw::numa::{Topology, pin_current_thread};
 
 mod aio;
 mod keep_awake;
+
+/// What the direct tier's fetches in this process waited for so far, for `--tp-profile`'s
+/// per-step `ngram_laps`: an [`LookupTable::issue`] for the read-ahead still out
+/// ([`LookupTable::prefetch`]), the rows it then missed, and a fetch's collect for its reads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FetchWaits {
+    pub ahead_ns: u64,
+    pub missed: u64,
+    pub collect_ns: u64,
+}
+
+/// [`FetchWaits`]' counters, in its fields' order.
+static WAITS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+impl FetchWaits {
+    pub fn now() -> Self {
+        let at = |i: usize| WAITS[i].load(Ordering::Relaxed);
+        Self {
+            ahead_ns: at(0),
+            missed: at(1),
+            collect_ns: at(2),
+        }
+    }
+
+    /// The waits from `a` to `self`.
+    pub fn since(&self, a: &Self) -> Self {
+        Self {
+            ahead_ns: self.ahead_ns.saturating_sub(a.ahead_ns),
+            missed: self.missed.saturating_sub(a.missed),
+            collect_ns: self.collect_ns.saturating_sub(a.collect_ns),
+        }
+    }
+}
+
+fn add_wait(i: usize, v: u64) {
+    WAITS[i].fetch_add(v, Ordering::Relaxed);
+}
+
+/// Whether a direct tier with a peer asks it for the small batches AIO would take too (a
+/// decode or verify step's rows, a draft's read-ahead). On two DGX Sparks the second rank's
+/// copy of the table is the first's disk over NFS, whose 4 KiB direct reads take ~0.5 ms
+/// against ~0.1 ms on the first rank's own disk, so those rows came last to the second rank's
+/// verify steps (#1176). `LEGION_DEBUG_TP_ROWS_SMALL=0` keeps them on AIO here (A/B only).
+fn small_to_peer() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_TP_ROWS_SMALL").is_none_or(|v| v != "0"))
+}
 
 /// How a lookup table's rows are read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum, Serialize)]
@@ -633,8 +683,12 @@ impl LookupTable {
                 prefetch: false,
             },
             Tier::Direct(d) => {
+                let t0 = Instant::now();
                 self.take_prefetched(d);
-                d.issue(&self.parts, rows, Ask::Fetch)
+                add_wait(0, t0.elapsed().as_nanos() as u64);
+                let t = d.issue(&self.parts, rows, Ask::Fetch);
+                add_wait(1, t.missed.len() as u64);
+                t
             }
         }
     }
@@ -1496,10 +1550,9 @@ impl Direct {
         }
         let mut pages: Vec<_> = by_page.into_iter().collect();
         pages.sort_unstable_by_key(|(p, _)| *p);
-        // A peer reads the misses (never for another peer: that rank asked this one), except a
-        // batch AIO takes (a decode step's few pages): those come back sooner from here than
-        // over the peer's connection and its reads.
-        let small = self.aio.is_some() && pages.len() <= self.aio_max;
+        // A peer reads the misses (never for another peer: that rank asked this one), a batch
+        // AIO takes (a decode step's few pages) too unless `small_to_peer` is off.
+        let small = self.aio.is_some() && pages.len() <= self.aio_max && !small_to_peer();
         let peer = match ask {
             Ask::Peer { .. } => None,
             _ => self.peer.get().filter(|_| !pages.is_empty() && !small),
@@ -1589,6 +1642,7 @@ impl Direct {
 
     fn collect(&self, t: Ticket, rb: usize) -> io::Result<Vec<u8>> {
         let pending = t.pending.expect("a direct ticket");
+        let t0 = (!t.prefetch).then(Instant::now);
         let mut st = pending.state.lock().unwrap_or_else(|e| e.into_inner());
         while st.jobs > 0 {
             match &self.aio {
@@ -1600,6 +1654,9 @@ impl Direct {
                 }
                 _ => st = pending.done.wait(st).unwrap_or_else(|e| e.into_inner()),
             }
+        }
+        if let Some(t0) = t0 {
+            add_wait(2, t0.elapsed().as_nanos() as u64);
         }
         if let Some(e) = st.error.take() {
             return Err(io::Error::other(e));
