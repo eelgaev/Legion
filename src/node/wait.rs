@@ -49,6 +49,36 @@ pub fn bells() -> bool {
     *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_NODE_LINK_BELL").is_none_or(|v| v != "0"))
 }
 
+/// The timer slack a link thread asks for ([`tight_slack`]): 1 µs instead of Linux's default
+/// 50 µs.
+pub const SLACK_NS: u64 = 1_000;
+
+/// Gives the calling thread (a link thread) a 1 µs timer slack (#1176 r51), so a 50 µs nap
+/// lasts ~50 µs instead of ~0.1 ms; with `LEGION_DEBUG_NODE_LINK_BELL=0` (or no spinning) it
+/// keeps the default. Only the calling thread's timers change. True when it was set.
+pub fn tight_slack() -> bool {
+    if !(spins() && bells()) {
+        return false;
+    }
+    set_slack(SLACK_NS)
+}
+
+/// Sets the calling thread's timer slack to `ns` (Linux; elsewhere it does nothing).
+pub fn set_slack(ns: u64) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: PR_SET_TIMERSLACK takes the slack in ns by value and changes only the
+        // calling thread.
+        let none: libc::c_ulong = 0;
+        unsafe { libc::prctl(libc::PR_SET_TIMERSLACK, ns as libc::c_ulong, none, none, none) == 0 }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = ns;
+        false
+    }
+}
+
 /// A wait's doorbell (#1176 r51): another thread rings it when a frame is about to come, and
 /// the wait spins again from then on, woken at once if it was napping. A verify step's commit
 /// comes some 40-100 ms after the step's request, long after the wait stopped spinning, and a

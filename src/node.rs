@@ -954,6 +954,7 @@ impl Link {
         let writer = std::thread::Builder::new()
             .name("legion-node-tx".into())
             .spawn(move || {
+                wait::tight_slack();
                 let mut w = BufWriter::with_capacity(1 << 20, out);
                 while let Some(f) = wait::recv(&rx, pace, rung.as_deref()) {
                     write_frame(&mut w, &f)?;
@@ -1092,6 +1093,7 @@ pub fn serve_one(
     let reader = std::thread::Builder::new()
         .name("legion-node-rx".into())
         .spawn(move || {
+            wait::tight_slack();
             let mut r = BufReader::with_capacity(1 << 20, input);
             loop {
                 wait::for_frame(&r, pace, rung.as_deref());

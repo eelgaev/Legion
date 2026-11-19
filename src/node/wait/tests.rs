@@ -118,3 +118,22 @@ fn a_socket_is_readable_once_bytes_or_its_end_come() {
     drop(a);
     assert!(until(QUICK, || readable(r.get_ref())));
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn set_slack_changes_only_the_calling_thread() {
+    fn get() -> libc::c_int {
+        let none: libc::c_ulong = 0;
+        // SAFETY: PR_GET_TIMERSLACK takes no pointer and returns the calling thread's slack.
+        unsafe { libc::prctl(libc::PR_GET_TIMERSLACK, none, none, none, none) }
+    }
+    let before = get();
+    let inner = std::thread::spawn(|| {
+        assert!(set_slack(SLACK_NS));
+        get()
+    })
+    .join()
+    .unwrap();
+    assert_eq!(u64::try_from(inner).unwrap(), SLACK_NS);
+    assert_eq!(get(), before);
+}
