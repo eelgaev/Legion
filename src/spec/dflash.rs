@@ -89,7 +89,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::engine::sampling::Rng;
-use crate::ggml::{Backend, ComputeAllocator, gpu_device};
+use crate::ggml::{Backend, ComputeAllocator, Context, gpu_device, types};
 use crate::spec::{
     DeviceHidden, Draft, DraftRequest, ModelDrafter, ModelDrafterFactory, SeqId, TargetInfo,
 };
@@ -890,6 +890,125 @@ impl DflashDrafter {
         *r.out = out;
         Ok(())
     }
+
+    /// `--tp-draft-split`: the all-reduces the communicator issued before a round. `None`
+    /// without the split.
+    fn round_start(&self) -> Option<u32> {
+        let t = self.opts.tp?;
+        Some(crate::tp_net::comm(t.comm)?.all_reduces())
+    }
+
+    /// `--tp-draft-split`: a round of `batch` that failed on this rank still runs the FFN sums
+    /// it left ([`round_sums`]: the same on every rank), with zeros for its partials, so that
+    /// the other ranks' round ends at once and every rank's communicator stays in step (a sum
+    /// left out would hold the others until the timeout and fail the communicator for good).
+    /// The others' drafts of the round are lost; this rank returns its error. Sums of a failed
+    /// device (the communicator's error) are not retried.
+    fn round_end(
+        &mut self,
+        batch: &[DraftRequest<'_>],
+        before: Option<u32>,
+        r: Result<(), String>,
+    ) -> Result<(), String> {
+        let (Err(e), Some(before), Some(t)) = (&r, before, self.opts.tp) else {
+            return r;
+        };
+        let Some(comm) = crate::tp_net::comm(t.comm).filter(|c| c.error().is_none()) else {
+            return r;
+        };
+        let c = &self.model.cfg;
+        let shape = RoundShape {
+            v2: self.model.selector().is_some(),
+            n_layer: c.n_layer,
+            n_embd: c.n_embd,
+            block: c.block_size,
+            first: self.model.first_row,
+        };
+        let sums = round_sums(shape, batch.iter().map(|r| (r.max, !r.tokens.is_empty())));
+        let left = sums_left(&sums, comm.all_reduces().wrapping_sub(before));
+        match send_zero_sums(&mut self.backend, t.comm, left) {
+            Ok(()) => tracing::warn!(
+                error = %e,
+                sums = left.len(),
+                "--tp-draft-split: a draft round failed here, its other sums went as zeros"
+            ),
+            Err(z) => tracing::error!(
+                error = %e,
+                zeros = %z,
+                "--tp-draft-split: a draft round failed here, and so did its other sums"
+            ),
+        }
+        r
+    }
+}
+
+/// What a draft round's FFN sums depend on besides its requests ([`round_sums`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RoundShape {
+    /// DFlash 2: one pass over every asking sequence's block.
+    pub v2: bool,
+    pub n_layer: usize,
+    pub n_embd: usize,
+    pub block: usize,
+    /// The block's first row that gives a draft ([`model::first_row`]).
+    pub first: usize,
+}
+
+/// `--tp-draft-split`: the values of each FFN sum (one a layer of every draft pass, in order)
+/// a round runs for requests `(max, has tokens)`, as [`DflashDrafter::step_from`] runs them:
+/// DFlash 2 one pass over the blocks of every request asking for drafts, DFlash one pass per
+/// such request of `max` rows after the first (at most the block). Take-ins sum nothing.
+pub(crate) fn round_sums(s: RoundShape, reqs: impl Iterator<Item = (usize, bool)>) -> Vec<usize> {
+    let asking: Vec<usize> = reqs
+        .filter(|&(max, tokens)| max > 0 && tokens)
+        .map(|(max, _)| max)
+        .collect();
+    let passes: Vec<usize> = if s.v2 {
+        let rows = s.block * asking.len();
+        (rows > 0).then_some(rows).into_iter().collect()
+    } else {
+        asking
+            .iter()
+            .map(|&max| (max + s.first).min(s.block))
+            .filter(|&n| n > s.first)
+            .collect()
+    };
+    passes
+        .iter()
+        .flat_map(|&rows| std::iter::repeat_n(rows * s.n_embd, s.n_layer))
+        .collect()
+}
+
+/// The sums of a round's `sums` after the first `done` (a failed round's left).
+pub(crate) fn sums_left(sums: &[usize], done: u32) -> &[usize] {
+    sums.get(done as usize..).unwrap_or_default()
+}
+
+/// Runs an all-reduce of `n` zeros on communicator `comm` for each `n` of `sizes`, in order,
+/// through the op a draft pass sums with (the same exchanges as the other ranks' pass).
+pub(crate) fn send_zero_sums(
+    backend: &mut Backend,
+    comm: i32,
+    sizes: &[usize],
+) -> Result<(), String> {
+    let Some(&max) = sizes.iter().max() else {
+        return Ok(());
+    };
+    let size = 16 + 4 * sizes.len();
+    let ctx = Context::new(size, size);
+    let zeros = ctx
+        .new_tensor(types::F32, &[max as i64])
+        .named("zeros")
+        .as_input();
+    let mut graph = ctx.new_graph(size);
+    for &n in sizes {
+        let x = ctx.view_1d(zeros, n as i64, 0);
+        graph.expand(crate::tp_net::all_reduce(&ctx, comm, x));
+    }
+    ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+        .map_err(|e| e.to_string())?;
+    zeros.set_f32(&vec![0.0; max]);
+    backend.compute(&graph).map_err(|e| e.to_string())
 }
 
 /// The first position whose row a ring of `window` positions still holds when a sequence of
@@ -973,7 +1092,9 @@ impl ModelDrafter for DflashDrafter {
     }
 
     fn step(&mut self, batch: &mut [DraftRequest<'_>]) -> Result<(), String> {
-        self.step_from(batch, Src::Host)
+        let before = self.round_start();
+        let r = self.step_from(batch, Src::Host);
+        self.round_end(batch, before, r)
     }
 
     /// The take-in graph gathers the rows it needs where the target's step left them: the
@@ -987,14 +1108,17 @@ impl ModelDrafter for DflashDrafter {
         batch: &mut [DraftRequest<'_>],
         rows: &DeviceHidden<'_>,
     ) -> Result<(), String> {
-        if rows.first.len() != batch.len() {
-            return Err(format!(
+        let before = self.round_start();
+        let r = if rows.first.len() != batch.len() {
+            Err(format!(
                 "{} first rows for {} requests",
                 rows.first.len(),
                 batch.len()
-            ));
-        }
-        self.step_from(batch, Src::Device(rows))
+            ))
+        } else {
+            self.step_from(batch, Src::Device(rows))
+        };
+        self.round_end(batch, before, r)
     }
 
     fn release(&mut self, seq: SeqId) {

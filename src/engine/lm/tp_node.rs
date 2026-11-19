@@ -702,11 +702,12 @@ fn run_draft(
     let mut batch = Vec::with_capacity(reqs.len());
     for ((r, tokens), out) in reqs.iter().zip(&tokens).zip(&mut outs) {
         let (off, ran) = (r.off as usize, r.ran as usize);
+        // Rows past the last step's: none, which the drafter's round refuses after it has run
+        // its sums (rank 0's round waits for them), not before.
         let hidden = step
             .iter()
-            .map(|h| h.get(off * w..(off + ran) * w))
-            .collect::<Option<Vec<_>>>()
-            .ok_or("a draft round of --tp-draft-split: rows past the last step's")?;
+            .map(|h| h.get(off * w..(off + ran) * w).unwrap_or_default())
+            .collect();
         batch.push(crate::spec::DraftRequest {
             seq: r.seq,
             tokens,

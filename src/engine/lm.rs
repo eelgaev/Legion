@@ -8827,7 +8827,10 @@ impl Worker {
                 match &mut self.drafting {
                     Drafting::Model(d) => {
                         let t = Instant::now();
-                        // `--tp-draft-split`: every rank runs the round, its share of the FFN.
+                        // `--tp-draft-split`: every rank runs the round, its share of the FFN. A
+                        // round that fails on any rank still runs all its sums there (zeros), so
+                        // the others' ends and the communicator stays usable (`DflashDrafter`'s
+                        // `round_end`).
                         let wire = || {
                             (batch.iter().zip(&offs))
                                 .map(|(r, &off)| crate::node::WireDraft {
