@@ -63,6 +63,11 @@ image tokens) encodes in 0.35-0.44 s and its first token comes 1.1-1.4 s after t
 requests give the same output as with `--no-mmproj`, at the same speed (8K prefill 2,316 tok/s against
 2,323, 1 user 41.3 tok/s against 40.8).
 
+An encode leaves room for the other users' decode: its kernels run on capped grids (one GEMM block per SM).
+With 4 users decoding, they keep about 72% of their rate while a 1024 × 768 image encodes (56% with one block
+per tile), their longest stall drops from 0.37 s to 0.24 s, and the encode takes 0.75 s instead of 0.53 s
+(TTFT 1.44 s against 1.22 s). The image's own prefill step (0.6 s for its 805 tokens) still pauses them.
+
 ## What each flag does
 
 - `--max-seqs` (`16`): How many requests are decoded at once (continuous batching). Set to the highest concurrency the benchmark uses.

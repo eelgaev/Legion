@@ -4,7 +4,8 @@
 //! The weights are uploaded once from the CPU tower's: matrices as F16 (as ggml's CPU rounds an
 //! F16 matrix's activations, every product here is F16 x F16 into F32), the two temporal patch
 //! kernels added into one, vectors and the position table F32. An image then runs on a stream
-//! of its own, so the language model's steps on other streams go on meanwhile: patches to rows
+//! of its own, so the language model's steps on other streams go on meanwhile, its kernels on
+//! capped grids so theirs find room beside them ([`super::share`]): patches to rows
 //! (one GEMM), positions added, each block's LayerNorm, `qkv` GEMM, the 2-D rotation, full
 //! attention per head in chunks of queries (scores GEMM, softmax, values GEMM), output GEMM
 //! with the residual, LayerNorm and the GELU MLP; then the merger. Its scratch memory is
@@ -19,6 +20,7 @@ use crate::cpu::gpu_exact::{f16_to_f32, f32_to_f16};
 use crate::ggml::{Tensor, types};
 
 use super::qwen3vl::{Encoder, EncoderConfig, ImageEmbedding};
+use super::share::Share;
 use super::{Preprocessed, VisionError, VisionHparams};
 
 /// Scores and probabilities of one chunk of queries (all heads) take at most this much.
@@ -47,6 +49,7 @@ struct Gemm {
     k: i32,
     alpha: f32,
     flags: i32,
+    batch: i32,
 }
 
 const OUT_F16: i32 = 1;
@@ -170,6 +173,7 @@ const H2D: c_int = 1;
 const D2H: c_int = 2;
 const NON_BLOCKING: u32 = 1;
 const CC_MAJOR: c_int = 75;
+const SM_COUNT: c_int = 16;
 
 fn ok(e: c_int, what: &str) -> Result<(), VisionError> {
     if e == 0 {
@@ -365,6 +369,14 @@ pub struct GpuEncoder {
     n_ff: usize,
     pin_in: Pinned,
     pin_out: Pinned,
+    /// The device's SM count.
+    sms: usize,
+    /// The shares of the GPU to encode with, in turn ([`super::share`]), and the encodes so far.
+    shares: Vec<Share>,
+    encodes: usize,
+    /// The share of the encode under way: most blocks of a GEMM and of a small kernel (0: one
+    /// per work item).
+    caps: (usize, usize),
 }
 
 // SAFETY: the raw pointers are device / pinned allocations and a stream owned by the encoder,
@@ -378,12 +390,16 @@ impl GpuEncoder {
         let c = enc.config().clone();
         let d_head = c.n_embd / c.n_head;
         let pp3 = 3 * c.patch_size * c.patch_size;
-        let mut major = 0;
+        let (mut major, mut sms) = (0, 0);
         // SAFETY: plain device queries and the calling thread's current device.
         unsafe {
             ok(cudaSetDevice(device as c_int), "cudaSetDevice")?;
             ok(
                 cudaDeviceGetAttribute(&mut major, CC_MAJOR, device as c_int),
+                "cudaDeviceGetAttribute",
+            )?;
+            ok(
+                cudaDeviceGetAttribute(&mut sms, SM_COUNT, device as c_int),
                 "cudaDeviceGetAttribute",
             )?;
         }
@@ -462,7 +478,17 @@ impl GpuEncoder {
             cfg: c,
             pin_in,
             pin_out,
+            sms: sms.max(1) as usize,
+            shares: super::share::from_env(),
+            encodes: 0,
+            caps: (0, 0),
         }))
+    }
+
+    /// Encodes with `share` from now on (tests).
+    #[cfg(test)]
+    pub(crate) fn set_share(&mut self, share: Share) {
+        self.shares = vec![share];
     }
 
     pub fn config(&self) -> &EncoderConfig {
@@ -477,16 +503,25 @@ impl GpuEncoder {
         self.device as usize
     }
 
+    /// Launches kernel `k` over `items` work items (tiles, patches, rows), with a 1-D grid of
+    /// one block per item capped at the encode's share (`caps`): each block loops over
+    /// items at a stride of the grid.
     fn launch<T>(
         &self,
         k: Kernel,
-        grid: (usize, usize, usize),
+        items: usize,
         block: u32,
         args: &mut T,
     ) -> Result<(), VisionError> {
-        if grid.0 == 0 || grid.1 == 0 || grid.2 == 0 {
+        if items == 0 {
             return Ok(());
         }
+        let cap = match k {
+            Kernel::Gemm => self.caps.0,
+            _ => self.caps.1,
+        };
+        let grid = if cap == 0 { items } else { items.min(cap) };
+        let grid = u32::try_from(grid).map_err(|_| VisionError::Dimensions)?;
         let mut argv = [(args as *mut T).cast::<c_void>()];
         // SAFETY: a kernel of the table taking `T` by value (the launch copies it); its
         // pointers are device memory of the encoder's device.
@@ -494,9 +529,9 @@ impl GpuEncoder {
             cudaLaunchKernel(
                 legion_vision_kernels[k as usize],
                 Dim3 {
-                    x: grid.0 as u32,
-                    y: grid.1 as u32,
-                    z: grid.2 as u32,
+                    x: grid,
+                    y: 1,
+                    z: 1,
                 },
                 Dim3 {
                     x: block,
@@ -513,12 +548,9 @@ impl GpuEncoder {
 
     fn gemm(&self, mut g: Gemm, batch: usize) -> Result<(), VisionError> {
         debug_assert!(g.k % 8 == 0 && g.lda % 8 == 0 && g.ldb % 8 == 0);
-        let grid = (
-            (g.n as usize).div_ceil(TILE),
-            (g.m as usize).div_ceil(TILE),
-            batch,
-        );
-        self.launch(Kernel::Gemm, grid, 256, &mut g)
+        g.batch = batch as i32;
+        let tiles = (g.n as usize).div_ceil(TILE) * (g.m as usize).div_ceil(TILE) * batch;
+        self.launch(Kernel::Gemm, tiles, 256, &mut g)
     }
 
     /// `y = x W^T + b` of `lin` over `m` rows of F16 `x`, then GELU (`flags`) or `+ res`.
@@ -550,6 +582,7 @@ impl GpuEncoder {
                 k: lin.k as i32,
                 alpha: 1.0,
                 flags,
+                batch: 1,
             },
             1,
         )
@@ -566,7 +599,7 @@ impl GpuEncoder {
             eps: self.cfg.eps,
             ..Op::default()
         };
-        self.launch(Kernel::Norm, (rows.div_ceil(8), 1, 1), 256, &mut o)
+        self.launch(Kernel::Norm, rows.div_ceil(8), 256, &mut o)
     }
 
     /// The scratch of an image of `n` patches, `n_pix` pixel values and a rotation table of
@@ -695,6 +728,12 @@ impl GpuEncoder {
         let out_bytes = n_tok * n_out * 4;
         // SAFETY: the calling thread's current device.
         unsafe { ok(cudaSetDevice(self.device), "cudaSetDevice")? };
+        let share = self.shares[self.encodes % self.shares.len()];
+        self.encodes += 1;
+        self.caps = (share.gemm_ctas(self.sms), share.small_blocks(self.sms));
+        if self.shares.len() > 1 || self.shares[0] != super::share::DEFAULT {
+            tracing::info!(share = %share, "vision: GPU encode share (LEGION_DEBUG_VISION_SHARE)");
+        }
         let pin_in = self.pin_in.reserve(in_bytes)?;
         let pin_out = self.pin_out.reserve(out_bytes)?;
         // SAFETY: the pinned buffers hold at least these many bytes.
@@ -769,7 +808,7 @@ impl GpuEncoder {
                 h0: bigp.cast(),
                 ..geo
             };
-            self.launch(Kernel::Im2col, (n, 1, 1), 256, &mut o)?;
+            self.launch(Kernel::Im2col, n, 256, &mut o)?;
             self.gemm(
                 Gemm {
                     a: bigp,
@@ -789,6 +828,7 @@ impl GpuEncoder {
                     k: pp3 as i32,
                     alpha: 1.0,
                     flags: 0,
+                    batch: 1,
                 },
                 1,
             )?;
@@ -808,7 +848,7 @@ impl GpuEncoder {
                 sfy: sf(gy, c.pos_side),
                 ..geo
             };
-            self.launch(Kernel::PosAdd, (n, 1, 1), 256, &mut o)?;
+            self.launch(Kernel::PosAdd, n, 256, &mut o)?;
 
             let scale = 1.0 / (d as f32).sqrt();
             for blk in &self.blocks {
@@ -822,7 +862,7 @@ impl GpuEncoder {
                     h2: vt,
                     ..geo
                 };
-                self.launch(Kernel::Rope, (n, 1, 1), 256, &mut o)?;
+                self.launch(Kernel::Rope, n, 256, &mut o)?;
                 let mut q0 = 0;
                 while q0 < n {
                     let cm = chunk.min(n - q0);
@@ -847,6 +887,7 @@ impl GpuEncoder {
                             k: d as i32,
                             alpha: scale,
                             flags: 0,
+                            batch: 1,
                         },
                         heads,
                     )?;
@@ -856,7 +897,7 @@ impl GpuEncoder {
                         cm: cm as i32,
                         ..geo
                     };
-                    self.launch(Kernel::Softmax, (heads * chunk, 1, 1), 256, &mut o)?;
+                    self.launch(Kernel::Softmax, heads * chunk, 256, &mut o)?;
                     // Their values, into the attention output [patch][head * d].
                     self.gemm(
                         Gemm {
@@ -878,6 +919,7 @@ impl GpuEncoder {
                             k: kpad as i32,
                             alpha: 1.0,
                             flags: OUT_F16,
+                            batch: 1,
                         },
                         heads,
                     )?;

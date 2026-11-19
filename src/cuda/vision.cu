@@ -2,9 +2,14 @@
 // Rust by `src/vision/gpu.rs` from the `legion_vision_kernels` table with `cudaLaunchKernel`.
 //
 // - `gemm_kernel`: C = alpha * A B^T (+ bias, then GELU or + a residual), A [m][k] and B [n][k]
-//   F16 rows, F32 accumulators, F32 or F16 out, batched over blockIdx.z. Every linear of the
-//   tower and both products of attention. WMMA 16x16x16 (valid on every sm_70+ target), 128x128
-//   tiles, k steps of 32 double-buffered through registers.
+//   F16 rows, F32 accumulators, F32 or F16 out, batched. Every linear of the tower and both
+//   products of attention. WMMA 16x16x16 (valid on every sm_70+ target), 128x128 tiles, k steps
+//   of 32 double-buffered through registers.
+//
+// Every kernel takes a 1-D grid of any size and loops over its work items (tiles, patches, rows)
+// at a stride of the grid, in the order a grid of one block per item would place them. The host
+// caps the grid (src/vision/gpu.rs) so an encode holds only part of the GPU and the language
+// model's kernels beside it find room at once; an item's math does not depend on the grid.
 // - `im2col_kernel`: an image's patches as F16 rows, in merge order (each 2x2 block's four
 //   patches next to each other, blocks row by row).
 // - `pos_add_kernel`: the patch bias and the learned position table, resampled bilinearly with
@@ -35,6 +40,7 @@ struct Gemm {
     int            m, n, k;     // k a multiple of 8, lda and ldb too
     float          alpha;
     int            flags;
+    int            batch;  // products, at strides sa, sb, sc
 };
 
 enum { OUT_F16 = 1, GELU = 2 };
@@ -80,17 +86,18 @@ __device__ __forceinline__ void patch_rc(int i, int gx, int & row, int & col) {
     col = (blk % bw) * 2 + (q & 1);
 }
 
-__global__ void __launch_bounds__(256) gemm_kernel(const Gemm g) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+// One 128x128 tile of product z = `tile / (tx * ty)`: rows m0 = `tile / tx % ty * BM`, columns
+// n0 = `tile % tx * BN`.
+__device__ __forceinline__ void gemm_tile(const Gemm & g, long long tile, int tx, int ty,
+                                          __half (&sa)[2][BM * LDS], __half (&sb)[2][BN * LDS]) {
     using namespace nvcuda;
-    __shared__ __align__(128) __half sa[2][BM * LDS];
-    __shared__ __align__(128) __half sb[2][BN * LDS];
     const int       tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int       wm = warp >> 2, wn = warp & 3;  // 2 x 4 warps, 64 x 32 each
-    const long long z  = blockIdx.z;
+    const long long z  = tile / ((long long) tx * ty);
     const __half *  A  = g.a + z * g.sa;
     const __half *  B  = g.b + z * g.sb;
-    const int       m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
+    const int       m0 = (int) (tile / tx % ty) * BM, n0 = (int) (tile % tx) * BN;
 
     uint4      ra[2], rb[2];
     const auto load = [&](int k0) {
@@ -194,31 +201,47 @@ __global__ void __launch_bounds__(256) gemm_kernel(const Gemm g) {
             __syncwarp();
         }
     }
+}
+#endif
+
+__global__ void __launch_bounds__(256) gemm_kernel(const Gemm g) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    __shared__ __align__(128) __half sa[2][BM * LDS];
+    __shared__ __align__(128) __half sb[2][BN * LDS];
+    const int       tx = (g.n + BN - 1) / BN, ty = (g.m + BM - 1) / BM;
+    const long long tiles = (long long) tx * ty * g.batch;
+    // Tiles in the order of a (tx, ty, batch) grid: n fastest, then m, then the product.
+    for (long long tile = blockIdx.x; tile < tiles; tile += gridDim.x) {
+        if (tile != blockIdx.x) {
+            __syncthreads();  // the last tile's epilogue is done with sa
+        }
+        gemm_tile(g, tile, tx, ty, sa, sb);
+    }
 #else
     __trap();
 #endif
 }
 
-// One block per patch: its pixels (x = image [3][h_px][w_px] F32) as row `i` of h0 [n][3 p p],
+// A block per patch i: its pixels (x = image [3][h_px][w_px] F32) as row `i` of h0 [n][3 p p],
 // in the kernel's order (channel, then row, then column).
 __global__ void im2col_kernel(const Op o) {
-    const int i = blockIdx.x;
-    int       row, col;
-    patch_rc(i, o.gx, row, col);
-    const int pp = o.p * o.p, kn = 3 * pp;
-    for (int k = threadIdx.x; k < kn; k += blockDim.x) {
-        const int c = k / pp, r = k % pp, ky = r / o.p, kx = r % o.p;
-        const float v = o.x[((long long) c * o.h_px + row * o.p + ky) * o.w_px + col * o.p + kx];
-        o.h0[(long long) i * kn + k] = __float2half_rn(v);
+    for (int i = blockIdx.x; i < o.n; i += gridDim.x) {
+        int row, col;
+        patch_rc(i, o.gx, row, col);
+        const int pp = o.p * o.p, kn = 3 * pp;
+        for (int k = threadIdx.x; k < kn; k += blockDim.x) {
+            const int c = k / pp, r = k % pp, ky = r / o.p, kx = r % o.p;
+            const float v = o.x[((long long) c * o.h_px + row * o.p + ky) * o.w_px + col * o.p + kx];
+            o.h0[(long long) i * kn + k] = __float2half_rn(v);
+        }
     }
 }
 
-// One block per patch: y [n][e] (the patch products) += bias, then + the position table `w`
-// ([side * side][e]) at the patch, resampled when the grid is not side x side: ggml's bilinear
-// `upscale` with corners aligned (scale factors sfx, sfy from the host).
-__global__ void pos_add_kernel(const Op o) {
-    const int i = blockIdx.x;
-    int       row, col;
+// Patch i: y [n][e] (the patch products) += bias, then + the position table `w` ([side * side][e])
+// at the patch, resampled when the grid is not side x side: ggml's bilinear `upscale` with corners
+// aligned (scale factors sfx, sfy from the host).
+__device__ __forceinline__ void pos_add_patch(const Op & o, int i) {
+    int row, col;
     patch_rc(i, o.gx, row, col);
     float * y = o.y + (long long) i * o.e;
     if (o.gx == o.side && o.gy == o.side) {
@@ -248,12 +271,16 @@ __global__ void pos_add_kernel(const Op o) {
     }
 }
 
-// A warp per row of x [n][e]: ((x - mean) / sqrt(var + eps)) * w + b, to F16 rows of h0.
-__global__ void norm_kernel(const Op o) {
-    const int r = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
-    if (r >= o.n) {
-        return;
+// A block per patch: pos_add_patch.
+__global__ void pos_add_kernel(const Op o) {
+    for (int i = blockIdx.x; i < o.n; i += gridDim.x) {
+        pos_add_patch(o, i);
     }
+}
+
+// A warp per row r of x [n][e]: ((x - mean) / sqrt(var + eps)) * w + b, to F16 row r of h0.
+__device__ __forceinline__ void norm_row(const Op & o, int r) {
+    const int lane = threadIdx.x & 31;
     const float * x = o.x + (long long) r * o.e;
     float         s = 0.0f;
     for (int c = lane; c < o.e; c += 32) {
@@ -272,12 +299,21 @@ __global__ void norm_kernel(const Op o) {
     }
 }
 
-// One block per patch of x = qkv [n][3 e] (q, k, v of `heads` heads of d): q and k rotated by
-// the patch's row (first d/4 pairs) and column (next d/4), pairs (j, j + d/2), cos / sin from
-// cs [max(gx, gy)][d/4]; q to h0 and k to h1 as [head][n][d], v to h2 as [head][d][kpad].
-__global__ void rope_kernel(const Op o) {
-    const int i = blockIdx.x;
-    int       row, col;
+// A block per 8 rows (a warp each): norm_row.
+__global__ void norm_kernel(const Op o) {
+    for (int g = blockIdx.x; g * 8 < o.n; g += gridDim.x) {
+        const int r = g * 8 + (threadIdx.x >> 5);
+        if (r < o.n) {
+            norm_row(o, r);
+        }
+    }
+}
+
+// Patch i of x = qkv [n][3 e] (q, k, v of `heads` heads of d): q and k rotated by the patch's row
+// (first d/4 pairs) and column (next d/4), pairs (j, j + d/2), cos / sin from cs [max(gx, gy)][d/4];
+// q to h0 and k to h1 as [head][n][d], v to h2 as [head][d][kpad].
+__device__ __forceinline__ void rope_patch(const Op & o, int i) {
+    int row, col;
     patch_rc(i, o.gx, row, col);
     const int     half = o.d / 2, quarter = o.d / 4;
     const float * src  = o.x + (long long) i * 3 * o.e;
@@ -298,6 +334,13 @@ __global__ void rope_kernel(const Op o) {
     }
 }
 
+// A block per patch: rope_patch.
+__global__ void rope_kernel(const Op o) {
+    for (int i = blockIdx.x; i < o.n; i += gridDim.x) {
+        rope_patch(o, i);
+    }
+}
+
 __device__ float block_reduce(float v, bool is_max, float * sh) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
     v = is_max ? warp_max(v) : warp_sum(v);
@@ -310,14 +353,9 @@ __device__ float block_reduce(float v, bool is_max, float * sh) {
     return is_max ? warp_max(v) : warp_sum(v);
 }
 
-// One block per row of scores x [heads * chunk][kpad] (the first cm rows of each head's chunk
-// are live, n columns): softmax to F16 h0 (same layout), zeros in columns n..kpad.
-__global__ void softmax_kernel(const Op o) {
-    __shared__ float sh[32];
-    const long long  r = blockIdx.x;
-    if ((int) (r % o.chunk) >= o.cm) {
-        return;
-    }
+// Row r of scores x [heads * chunk][kpad] (n columns): softmax to F16 h0 (same layout), zeros in
+// columns n..kpad. The whole block, `sh` its reduction scratch.
+__device__ __forceinline__ void softmax_row(const Op & o, long long r, float * sh) {
     const float * x  = o.x + r * o.kpad;
     __half *      y  = o.h0 + r * o.kpad;
     float         mx = -INFINITY;
@@ -333,6 +371,16 @@ __global__ void softmax_kernel(const Op o) {
     const float inv = 1.0f / s;
     for (int c = threadIdx.x; c < o.kpad; c += blockDim.x) {
         y[c] = c < o.n ? __float2half_rn(expf(x[c] - mx) * inv) : __float2half_rn(0.0f);
+    }
+}
+
+// A block per row of the scores (the first cm rows of each head's chunk are live): softmax_row.
+__global__ void softmax_kernel(const Op o) {
+    __shared__ float sh[32];
+    for (long long r = blockIdx.x; r < (long long) o.heads * o.chunk; r += gridDim.x) {
+        if ((int) (r % o.chunk) < o.cm) {
+            softmax_row(o, r, sh);
+        }
     }
 }
 

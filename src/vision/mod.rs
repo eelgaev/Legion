@@ -6,6 +6,7 @@ mod decode;
 mod gpu;
 mod preprocess;
 mod qwen3vl;
+pub mod share;
 pub mod tiny;
 
 #[cfg(feature = "cuda")]

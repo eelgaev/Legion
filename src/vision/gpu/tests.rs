@@ -43,6 +43,12 @@ fn gpu_tower_matches_the_cpu_tower() {
             got,
             "{w} x {h}: the same bits again"
         );
+        // The grid's cap moves no bits: one CTA (it loops over every tile), half an SM's worth,
+        // uncapped, the default.
+        for share in ["1/1000", "1/2", "0", "1"] {
+            gpu.set_share(crate::vision::share::parse(share).unwrap()[0]);
+            assert_eq!(gpu.encode(&p).unwrap(), got, "{w} x {h}: share {share}");
+        }
     }
 }
 
@@ -104,14 +110,18 @@ fn gpu_tower_on_a_checkpoint() {
             .fold(1f64, f64::min);
         println!(
             "{}: {} x {} px, {} x {} rows, CPU {t_cpu:.3} s, GPU {t_gpu:.4} s, max abs {err:.4e}, \
-             max rel {:.4e} (of {scale:.3}), min row cosine {cos:.6}, bit-identical {}",
+             max rel {:.4e} (of {scale:.3}), min row cosine {cos:.6}, bit-identical {}, GPU rows \
+             {:016x}",
             f.file_name().unwrap().to_string_lossy(),
             p.width,
             p.height,
             got.nx,
             got.ny,
             err / scale,
-            got == want
+            got == want,
+            got.data.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, v| {
+                (h ^ u64::from(v.to_bits())).wrapping_mul(0x0000_0100_0000_01b3)
+            })
         );
         assert!(cos > 0.99, "{f:?}: min row cosine {cos}");
     }
