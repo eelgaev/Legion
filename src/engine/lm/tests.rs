@@ -354,6 +354,31 @@ fn uma_free_moves_only_the_shared_memory_reserve() {
 }
 
 #[test]
+fn tower_scratch_is_kept_free_of_the_pool_with_every_expert_in_vram() {
+    use crate::ggml::DeviceKind::{Gpu, IntegratedGpu};
+    let s = 649usize << 20;
+    // Every expert in a discrete GPU: the first stage keeps the tower's largest image's scratch.
+    assert_eq!(tower_kv_reserve(ExpertMode::Device, Gpu, 0, s), s);
+    // The tower runs on the first stage's GPU only.
+    assert_eq!(tower_kv_reserve(ExpertMode::Device, Gpu, 1, s), 0);
+    // The cache's and the kept step graphs' budgets keep it instead.
+    assert_eq!(tower_kv_reserve(ExpertMode::Cache, Gpu, 0, s), 0);
+    assert_eq!(tower_kv_reserve(ExpertMode::Host, Gpu, 0, s), 0);
+    // A GPU sharing the host's memory: the OS's share covers it, the fit is unchanged.
+    assert_eq!(tower_kv_reserve(ExpertMode::Device, IntegratedGpu, 0, s), 0);
+    // No GPU tower (none loaded, or the CPU's): the fit is unchanged.
+    assert_eq!(tower_kv_reserve(ExpertMode::Device, Gpu, 0, 0), 0);
+}
+
+#[test]
+fn tower_loads_before_the_pool_on_a_discrete_gpu_only() {
+    use crate::ggml::DeviceKind;
+    assert!(tower_before_kv(Some(DeviceKind::Gpu)));
+    assert!(!tower_before_kv(Some(DeviceKind::IntegratedGpu)));
+    assert!(!tower_before_kv(None));
+}
+
+#[test]
 fn request_timings_split_prompt_and_decode() {
     let t0 = Instant::now();
     let first = t0 + std::time::Duration::from_millis(500);

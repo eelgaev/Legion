@@ -57,7 +57,7 @@ HTTP clients ──► src/server ──► src/engine (trait Engine) ──► 
 | `src/engine/lm/bandwidth.rs` | Each pipeline stage's bandwidth roofline at load, and the request-done line's model-bytes fields. |
 | `src/engine/lm/vram.rs` | What the load leaves each GPU: the KV fit with the MTP head's own pool and a given `--expert-cache-gib`, the cache's size check, the kept step graphs' budget with host experts (#433). |
 | `src/engine/lm/stream.rs` | Sequences' text (detokenizer, reasoning and tool-call parsers, log probabilities, the stream sends) on a thread of its own once `--stream-thread-seqs` sequences run (#47); stop-string and grammar requests keep theirs on the engine thread. |
-| `src/engine/lm/vision.rs` | `--mmproj` (#146), or an HF checkpoint's own tower (#1195): a request's images as `<|image_pad|>` tokens (one per merged patch), the vision tower's rows and M-RoPE positions (`src/model/core/media.rs`) and a prefix-cache key that tells images apart. |
+| `src/engine/lm/vision.rs` | `--mmproj` (#146), or an HF checkpoint's own tower (#1195): a request's images as `<\|image_pad\|>` tokens (one per merged patch), the vision tower's rows and M-RoPE positions (`src/model/core/media.rs`) and a prefix-cache key that tells images apart. The tower runs on the first stage's GPU (`src/vision/gpu.rs`), the CPU without one or with `LEGION_DEBUG_VISION_CPU=1`; images sent again take their rows from a 256 MiB cache by image hash. |
 | `src/engine/lm/host_time.rs` | The engine thread's time per step by phase (plan, pack, step, sample, device calls, finish), logged at debug level as host microseconds per step (#47), and published to the dashboard per step while one is attached (#1198). |
 | `src/engine/reasoning.rs` | Streaming `<think>...</think>` splitter: turns model text into `TokenEvent::Reasoning` and `TokenEvent::Text` events. |
 | `src/engine/sampling.rs` | Token sampling from logits: penalties, temperature, top-k, top-p, min-p and a seeded RNG. |
@@ -234,7 +234,8 @@ HTTP clients ──► src/server ──► src/engine (trait Engine) ──► 
 | `src/vision/` | Vision for Qwen3-VL mmproj files (`--mmproj`, #146): preprocessing and the vision tower. |
 | `src/vision/decode.rs` | Image decoding and normalization. |
 | `src/vision/preprocess.rs` | Image resizing and cropping. |
-| `src/vision/qwen3vl.rs` | The `qwen3vl_merger` vision tower as a ggml graph, mtmd's op for op: patch convolutions, resampled learned positions, ViT blocks with 2D RoPE, the 2 × 2 merger; one row per merged patch in the language model's width. |
+| `src/vision/qwen3vl.rs` | The `qwen3vl_merger` vision tower as a ggml graph, mtmd's op for op: patch convolutions, resampled learned positions, ViT blocks with 2D RoPE, the 2 × 2 merger; one row per merged patch in the language model's width. The CPU tower, and the oracle of the GPU one. |
+| `src/vision/gpu.rs` | The same tower on a CUDA GPU (#1195; CUDA kernels in `src/cuda/vision.cu`, kernels only, launched from the `legion_vision_kernels` table): weights uploaded once as F16 matrices (the two patch kernels summed), each image on a stream of its own with stream-ordered scratch; a WMMA F16 GEMM (sm_70+) for every linear and both attention products (queries in chunks, all heads a launch), LayerNorm, ggml's vision rotation, softmax, the bilinear position resample. Rows within F16 rounding of the CPU tower's, not its bits. |
 | `src/vision/tiny.rs` | A tiny random projector (and BMP test images) for tests. |
 | `src/weights.rs` | Model weights: every tensor of a GGUF file in ggml backend memory. |
 | `src/cli/` | The `legion` command line. One file per subcommand. |

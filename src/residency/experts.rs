@@ -3679,14 +3679,15 @@ impl ExpertResidency {
     /// reach have no VRAM yet and keep the experts they held, which the next restore refills.
     /// Every expert is read from host memory or staged while lent either way.
     pub fn lend(&mut self) -> Result<(), String> {
-        self.lend_for(usize::MAX)
+        self.lend_for(usize::MAX, usize::MAX)
     }
 
-    /// [`Self::lend`] for a prompt of `tokens` tokens still to read: kept slots are re-packed
-    /// ([`ResidencyConfig::lend_repack`]) only for a prompt of at least that many.
-    pub fn lend_for(&mut self, tokens: usize) -> Result<(), String> {
+    /// [`Self::lend`] for prompts with `tokens` tokens still to read in all (the spread,
+    /// [`ResidencyConfig::lend_spread_upto`]), the longest with `longest`: kept slots are
+    /// re-packed ([`ResidencyConfig::lend_repack`]) only for a prompt of at least that many.
+    pub fn lend_for(&mut self, tokens: usize, longest: usize) -> Result<(), String> {
         #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
-        let repack_kept = self.lend_repack > 0 && tokens >= self.lend_repack;
+        let repack_kept = self.lend_repack > 0 && longest >= self.lend_repack;
         if self.lent.is_some() || !self.can_lend() {
             return Ok(());
         }

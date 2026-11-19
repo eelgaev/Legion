@@ -4359,12 +4359,12 @@ impl Executor {
     /// Lends the expert cache's VRAM to a long prompt ([`ExpertResidency::lend`]): its slots
     /// become staging buffers and room for the prompt's big step buffers. The kept prompt
     /// graphs are dropped first (their buffers are freed; graphs built from now on stage).
-    /// `false` when the cache does not stage. `tokens`: the prompt's tokens still to read
-    /// ([`ExpertResidency::lend_for`]).
+    /// `false` when the cache does not stage. `tokens`: the prompts' tokens still to read,
+    /// `longest`: the longest one's ([`ExpertResidency::lend_for`]).
     ///
     /// [`ExpertResidency::lend`]: crate::residency::experts::ExpertResidency::lend
     /// [`ExpertResidency::lend_for`]: crate::residency::experts::ExpertResidency::lend_for
-    pub fn lend_experts(&mut self, tokens: usize) -> Result<bool, ModelError> {
+    pub fn lend_experts(&mut self, tokens: usize, longest: usize) -> Result<bool, ModelError> {
         self.wait_commit();
         self.flush_deferred()?;
         let can = self.model.experts().is_some_and(|r| r.can_lend());
@@ -4382,7 +4382,7 @@ impl Executor {
         self.model
             .experts_mut()
             .expect("checked above")
-            .lend_for(tokens)
+            .lend_for(tokens, longest)
             .map_err(|e| ModelError::Ggml(GgmlError::External(format!("expert cache: {e}"))))?;
         self.alloc_spares();
         Ok(true)
