@@ -57,6 +57,49 @@ pub fn set_head_rope_fused(on: bool) {
     HEAD_ROPE_FUSED.store(on, Ordering::Relaxed);
 }
 
+/// Tokens each half of a prompt step needs for [`Model::gemma4_layers_halves`] (#619): a
+/// shorter step has little wire time to hide.
+pub const TP_HALF_MIN: i64 = 1024;
+
+/// Whether prompt steps under tensor parallelism over machines may run their layers in two
+/// halves ([`Model::gemma4_layers_halves`], #619): on, the same bits as whole;
+/// `LEGION_DEBUG_GEMMA_TP_HALVES=0` keeps them whole. Read once.
+fn tp_halves_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        tp_halves_of(
+            std::env::var("LEGION_DEBUG_GEMMA_TP_HALVES")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// [`tp_halves_on`] for the variable's value `v`.
+fn tp_halves_of(v: Option<&str>) -> bool {
+    v != Some("0")
+}
+
+/// A layer's input in [`Model::gemma4_layers_halves`].
+enum Input<'a> {
+    /// The whole residual (the first layer's, or a captured layer's output).
+    Whole(Tensor<'a>),
+    /// The previous layer's output in halves, half 1's not made yet.
+    Open(Open<'a>),
+}
+
+/// A layer whose half 1 waits for its FFN sum ([`Input::Open`]).
+struct Open<'a> {
+    /// Half 0's output.
+    x0: Tensor<'a>,
+    /// Half 1's FFN sum, started.
+    f1: crate::tp_net::micro::Started<'a>,
+    /// Half 1's attention output (its residual).
+    attn_out1: Tensor<'a>,
+    /// The layer.
+    il: usize,
+}
+
 /// The Gemma 4 specifics of [`Hparams`] (its [`Hparams::arch`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Gemma4Params {
@@ -599,6 +642,9 @@ impl Model {
             pass.graph.borrow_mut().expand(pos);
             pos
         });
+        if let Some(comm) = self.gemma4_tp_halves(pass, per_layer.is_some(), &layers) {
+            return self.gemma4_layers_halves(pass, x, comm, capture, layers, pos);
+        }
         let mut hidden = Vec::new();
         for il in layers {
             let h = norm(x, il, "attn_norm.weight")?;
@@ -648,6 +694,197 @@ impl Model {
                 hidden.push((il, x));
             }
         }
+        Ok((x, hidden))
+    }
+
+    /// Whether this pass's `layers` run as [`Self::gemma4_layers_halves`] (#619), and over
+    /// which communicator: a prompt step of at least twice [`TP_HALF_MIN`] tokens under tensor
+    /// parallelism over machines (not sequence-parallel), dense layers without per-layer inputs
+    /// or taps, every matmul of every layer on the W4A4 dense kernels at the halves' and the
+    /// whole step's batch ([`Model::a4_dense`]: every token the same bits at any of them), and
+    /// [`tp_halves_on`]. The same answer on every rank.
+    fn gemma4_tp_halves(&self, pass: &Pass<'_>, ple: bool, layers: &Range<usize>) -> Option<i32> {
+        if !tp_halves_on() || pass.tap.on || ple || self.hp.moe {
+            return None;
+        }
+        let comm = self.tp_net_comm()?;
+        let n = pass.n;
+        let n0 = n / 2;
+        if n0 < TP_HALF_MIN || self.tp_seq_par(n).is_some() {
+            return None;
+        }
+        const DENSE: [&str; 4] = [
+            "attn_output.weight",
+            "ffn_gate.weight",
+            "ffn_up.weight",
+            "ffn_down.weight",
+        ];
+        let fits = layers.clone().all(|il| {
+            let qkv = self.gemma4_qkv_names(il);
+            self.w(&format!("blk.{il}.ffn_gate_inp.weight")).is_err()
+                && qkv.len() >= 2
+                && qkv
+                    .iter()
+                    .chain(&DENSE)
+                    .all(|name| [n0, n - n0, n].iter().all(|&c| self.a4_dense(il, name, c)))
+        });
+        fits.then_some(comm)
+    }
+
+    /// [`Self::gemma4_layers`] of a prompt step in two halves of its tokens, its sums started
+    /// and finished per half ([`crate::tp_net::micro::all_reduce_start`], #619), so that the
+    /// sums' transfers run while the GPU computes the other half: half 0's attention output
+    /// travels during half 1's output projection, half 1's during half 0's FFN, half 0's FFN
+    /// output during half 1's FFN, and half 1's during half 0's layer tail and its next-layer
+    /// q, k and v projections. The attention runs whole, its projections in halves into one
+    /// output ([`crate::model::nvfp4_a4::mul_mat_multi_part`]). Everything split is per-token
+    /// work (RMS norms, adds, the W4A4 matmuls, [`Self::gemma4_tp_halves`]) and every sum gives
+    /// each value the plain all-reduce's bits, so the step's outputs are the plain one's bit for
+    /// bit. Captured layers and the last one join their halves.
+    #[allow(clippy::type_complexity)]
+    fn gemma4_layers_halves<'a>(
+        &'a self,
+        pass: &Pass<'a>,
+        x: Tensor<'a>,
+        comm: i32,
+        capture: &[usize],
+        layers: Range<usize>,
+        pos: Option<Tensor<'a>>,
+    ) -> Result<(Tensor<'a>, Vec<(usize, Tensor<'a>)>), ModelError> {
+        use crate::model::core::cols;
+        use crate::tp_net::micro;
+        let (ctx, n) = (pass.ctx, pass.n);
+        let eps = self.hp.rms_eps;
+        let (n0, n1) = (n / 2, n - n / 2);
+        let whole = n as usize;
+        let add = |t: Tensor<'a>| pass.graph.borrow_mut().expand(t);
+        let norm = |t: Tensor<'a>, il: usize, name: &str| -> Result<Tensor<'a>, ModelError> {
+            Ok(ctx.mul(ctx.rms_norm(t, eps), self.lw(il, name)?))
+        };
+        let half = |t: Tensor<'a>, j: usize| {
+            if j == 0 {
+                cols(ctx, t, 0, n0)
+            } else {
+                cols(ctx, t, n0, n1)
+            }
+        };
+        // A half's layer output from its summed FFN output `f` and attention output `attn_out`
+        // (the plain loop's ops).
+        let tail = |il: usize, f: Tensor<'a>, attn_out: Tensor<'a>| -> Result<_, ModelError> {
+            let ffn = norm(f, il, "post_ffw_norm.weight")?;
+            let mut cur = ctx.add(ffn, attn_out);
+            if let Ok(s) = self.lw(il, "layer_output_scale.weight") {
+                cur = ctx.mul(cur, s);
+            }
+            Ok(cur)
+        };
+        // Half 1's layer output, its FFN sum finished, and the halves joined.
+        let close = |open: Open<'a>| -> Result<_, ModelError> {
+            let f = micro::finish(ctx, open.f1, None);
+            add(f);
+            let x1 = tail(open.il, f, open.attn_out1)?;
+            Ok(ctx.concat(open.x0, x1, 1))
+        };
+        // The whole input's projections, as the plain loop makes them.
+        let whole_qkv = |il: usize, x: Tensor<'a>, names: &[&str]| -> Result<_, ModelError> {
+            let h = norm(x, il, "attn_norm.weight")?;
+            let pre = (x, self.lw(il, "attn_norm.weight")?, eps);
+            let multi: Vec<Option<Tensor<'a>>> =
+                match self.lmm_multi(ctx, il, names, h, Some(pre))? {
+                    Some(outs) => outs.into_iter().map(Some).collect(),
+                    None => vec![None; names.len()],
+                };
+            Ok((Some(h), multi))
+        };
+        let mut x = Input::Whole(x);
+        let mut hidden = Vec::new();
+        for il in layers {
+            let names = self.gemma4_qkv_names(il);
+            let (h, multi, xs) = match x {
+                Input::Whole(x) => {
+                    let (h, multi) = whole_qkv(il, x, &names)?;
+                    // The halves' views in the graph now: placed later, a view would sit
+                    // between the attention output's norm and its residual add and keep
+                    // ggml-cuda from fusing them as it does in the plain loop (other bits).
+                    let xs = [half(x, 0), half(x, 1)];
+                    xs.iter().for_each(|&v| add(v));
+                    (h, multi, xs)
+                }
+                Input::Open(open) => {
+                    // Half 0's projections while half 1's FFN sum travels, then half 1's.
+                    let nw = self.lw(il, "attn_norm.weight")?;
+                    let p0 =
+                        self.lmm_multi_part(ctx, il, &names, (open.x0, nw, eps), n, 0, None)?;
+                    if let Some(p) = p0 {
+                        add(p);
+                    }
+                    let f = micro::finish(ctx, open.f1, None);
+                    add(f);
+                    let x1 = tail(open.il, f, open.attn_out1)?;
+                    add(x1);
+                    let p1 = match p0 {
+                        Some(p0) => {
+                            self.lmm_multi_part(ctx, il, &names, (x1, nw, eps), n, n0, Some(p0))?
+                        }
+                        None => None,
+                    };
+                    match p1 {
+                        Some(p1) => {
+                            add(p1);
+                            let ws = self.lmm_multi_weights(il, &names)?;
+                            let outs = crate::model::nvfp4_a4::multi_part_outputs(ctx, p1, &ws, n);
+                            (None, outs.into_iter().map(Some).collect(), [open.x0, x1])
+                        }
+                        None => {
+                            // Not as parts after all: over the halves joined.
+                            let (h, multi) = whole_qkv(il, ctx.concat(open.x0, x1, 1), &names)?;
+                            (h, multi, [open.x0, x1])
+                        }
+                    }
+                }
+            };
+            let o = self.gemma4_attend_qkv(pass, il, h, multi, pos)?;
+            let o0 = self.lmm(ctx, il, "attn_output.weight", half(o, 0))?;
+            let so0 = micro::all_reduce_start(ctx, comm, o0, whole);
+            add(so0.node);
+            let o1 = self.lmm(ctx, il, "attn_output.weight", half(o, 1))?;
+            let so1 = micro::all_reduce_start(ctx, comm, o1, whole);
+            add(so1.node);
+            let a0 = micro::finish(ctx, so0, None);
+            add(a0);
+            let attn_out0 = ctx.add(norm(a0, il, "post_attention_norm.weight")?, xs[0]);
+            let f0 = self.gemma4_ffn_partial(ctx, il, attn_out0, eps)?;
+            let sf0 = micro::all_reduce_start(ctx, comm, f0, whole);
+            add(sf0.node);
+            let a1 = micro::finish(ctx, so1, None);
+            add(a1);
+            let attn_out1 = ctx.add(norm(a1, il, "post_attention_norm.weight")?, xs[1]);
+            let f1 = self.gemma4_ffn_partial(ctx, il, attn_out1, eps)?;
+            let sf1 = micro::all_reduce_start(ctx, comm, f1, whole);
+            add(sf1.node);
+            let fin0 = micro::finish(ctx, sf0, None);
+            add(fin0);
+            let x0 = tail(il, fin0, attn_out0)?;
+            add(x0);
+            let open = Open {
+                x0,
+                f1: sf1,
+                attn_out1,
+                il,
+            };
+            x = if capture.contains(&il) {
+                let joined = close(open)?;
+                add(joined);
+                hidden.push((il, joined));
+                Input::Whole(joined)
+            } else {
+                Input::Open(open)
+            };
+        }
+        let x = match x {
+            Input::Whole(x) => x,
+            Input::Open(open) => close(open)?,
+        };
         Ok((x, hidden))
     }
 
@@ -701,28 +938,53 @@ impl Model {
         pre: (Tensor<'a>, Tensor<'a>, f32),
         pos: Option<Tensor<'a>>,
     ) -> Result<Tensor<'a>, ModelError> {
-        let (ctx, tap, n) = (pass.ctx, &pass.tap, pass.n);
-        let hp = &self.hp;
-        let (d, n_kv) = hp.kv_dims(il);
-        let eps = hp.rms_eps;
+        let ctx = pass.ctx;
         // `--nvfp4-a4` prompt steps: q, k and v from one quantization of `h` (`pre`: the
         // residual and attn_norm, `h` being their norm), normed in it.
+        let names = self.gemma4_qkv_names(il);
+        let multi: Vec<Option<Tensor<'a>>> = match self.lmm_multi(ctx, il, &names, h, Some(pre))? {
+            Some(outs) => outs.into_iter().map(Some).collect(),
+            None => vec![None; names.len()],
+        };
+        let o = self.gemma4_attend_qkv(pass, il, Some(h), multi, pos)?;
+        let o = self.lmm(ctx, il, "attn_output.weight", o)?;
+        Ok(self.tp_sum(ctx, o))
+    }
+
+    /// Layer `il`'s projections of the normed residual, in [`Self::lmm_multi`]'s order: the
+    /// queries, and the keys and values (if any) unless the layer reads another layer's.
+    fn gemma4_qkv_names(&self, il: usize) -> Vec<&'static str> {
         let mut names = vec!["attn_q.weight"];
-        if hp.owns_kv(il) {
+        if self.hp.owns_kv(il) {
             names.push("attn_k.weight");
             if self.w(&format!("blk.{il}.attn_v.weight")).is_ok() {
                 names.push("attn_v.weight");
             }
         }
-        let multi: Vec<Option<Tensor<'a>>> = match self.lmm_multi(ctx, il, &names, h, Some(pre))? {
-            Some(outs) => outs.into_iter().map(Some).collect(),
-            None => vec![None; names.len()],
-        };
+        names
+    }
+
+    /// [`Self::gemma4_attention`] from its projections on: `multi` holds those made already
+    /// ([`Self::gemma4_qkv_names`]' order; `None`: [`Self::lmm`] of `h` here). Returns the
+    /// attention's output before the output projection.
+    fn gemma4_attend_qkv<'a>(
+        &'a self,
+        pass: &Pass<'a>,
+        il: usize,
+        h: Option<Tensor<'a>>,
+        multi: Vec<Option<Tensor<'a>>>,
+        pos: Option<Tensor<'a>>,
+    ) -> Result<Tensor<'a>, ModelError> {
+        let (ctx, tap, n) = (pass.ctx, &pass.tap, pass.n);
+        let hp = &self.hp;
+        let (d, n_kv) = hp.kv_dims(il);
+        let eps = hp.rms_eps;
         let mut multi = multi.into_iter();
         let mut proj = |name: &str| -> Result<Tensor<'a>, ModelError> {
-            match multi.next().flatten() {
-                Some(t) => Ok(t),
-                None => self.lmm(ctx, il, name, h),
+            match (multi.next().flatten(), h) {
+                (Some(t), _) => Ok(t),
+                (None, Some(h)) => self.lmm(ctx, il, name, h),
+                (None, None) => panic!("gemma4: {name} of layer {il} neither made nor to make"),
             }
         };
         let q = proj("attn_q.weight")?;
@@ -760,8 +1022,7 @@ impl Model {
         }
         let o = self.gemma4_attend(pass, il, self.gemma().swa[il], hp.n_head, q)?;
         tap.tap("kqv_out", il, o);
-        let o = self.lmm(ctx, il, "attn_output.weight", o)?;
-        Ok(self.tp_sum(ctx, o))
+        Ok(o)
     }
 
     /// Unscaled causal attention of every group's queries `q` (`[d, n_head, n]`) over the
@@ -820,17 +1081,29 @@ impl Model {
         x: Tensor<'a>,
         eps: f32,
     ) -> Result<Tensor<'a>, ModelError> {
+        let down = self.gemma4_ffn_partial(ctx, il, x, eps)?;
+        Ok(self.tp_sum(ctx, down))
+    }
+
+    /// [`Self::gemma4_ffn`] before the sum over the tensor-parallel ranks (this rank's
+    /// partial; without them the FFN itself).
+    fn gemma4_ffn_partial<'a>(
+        &'a self,
+        ctx: &'a Context,
+        il: usize,
+        x: Tensor<'a>,
+        eps: f32,
+    ) -> Result<Tensor<'a>, ModelError> {
         let nw = self.lw(il, "ffn_norm.weight")?;
         let h = ctx.mul(ctx.rms_norm(x, eps), nw);
         // NVFP4 prompt steps: gate, up and the GELU as one op (the same bits; under
         // `--nvfp4-a4` the W4A4 one, with the norm in its activations' quantization).
         if let Some(down) = self.geglu_ffn_fused(ctx, il, h, Some((x, nw, eps)))? {
-            return Ok(self.tp_sum(ctx, down));
+            return Ok(down);
         }
         let up = self.lmm(ctx, il, "ffn_up.weight", h)?;
         let gate = self.lmm(ctx, il, "ffn_gate.weight", h)?;
-        let down = self.lmm(ctx, il, "ffn_down.weight", ctx.geglu_split(gate, up))?;
-        Ok(self.tp_sum(ctx, down))
+        Ok(self.lmm(ctx, il, "ffn_down.weight", ctx.geglu_split(gate, up))?)
     }
 
     /// The routed experts of a MoE layer over `h` (the residual after `pre_ffw_norm_2`). The

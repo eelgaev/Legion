@@ -48,6 +48,9 @@ unsafe fn cpu_all_reduce(dst: &ffi::ggml_tensor, ith: usize, _nth: usize) {
     }
 }
 
+#[cfg(test)]
+mod tests;
+
 /// Whether the CUDA exchanges copy an F32 partial into the pinned send buffer with the copy
 /// kernel (the values' bits as 16-bit words, the BF16 all-gather's kernel) rather than
 /// `cudaMemcpyAsync`, for a `LEGION_DEBUG_TP_SEND_KERNEL` value (#1176): "0" the copy (as
@@ -57,6 +60,40 @@ unsafe fn cpu_all_reduce(dst: &ffi::ggml_tensor, ith: usize, _nth: usize) {
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(super) fn send_kernel_of(v: Option<&str>) -> bool {
     v.is_none_or(|s| s.trim() != "0")
+}
+
+/// Values the buffers of a micro all-reduce of `cols` of a step's `n` columns (`row` values
+/// each) are reserved for (#619): the larger of its own and the rest of the step's. A later part
+/// of the step (an odd step's second half has one more column than the first) then never needs
+/// larger buffers while this one is in flight.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(super) fn reduce_reserve(row: usize, cols: usize, n: usize) -> usize {
+    row * cols.max(n.saturating_sub(cols))
+}
+
+/// The pinned buffers an exchange of `bytes` starts on, with `want` bytes reserved
+/// ([`reduce_reserve`], else `bytes`) and `sets` buffer sets: `have` (`(cap, sets)`, none yet:
+/// `None`) as it is (`Ok(None)`), or grown to `Ok(Some((cap, sets)))` (`cap` in whole MiB, never
+/// smaller than before). `busy`: another exchange is in flight, so the buffers grow only if this
+/// one cannot start without (then `Err`).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(super) fn buffers_for(
+    have: Option<(usize, usize)>,
+    bytes: usize,
+    want: usize,
+    sets: usize,
+    busy: bool,
+) -> Result<Option<(usize, usize)>, ()> {
+    let short = have.is_none_or(|(cap, n)| cap < bytes || n < sets);
+    if short && busy {
+        return Err(());
+    }
+    if !short && (busy || have.is_some_and(|(cap, _)| cap >= want)) {
+        return Ok(None);
+    }
+    let (old_cap, old_sets) = have.unwrap_or((0, 2));
+    let cap = bytes.max(want).next_multiple_of(1 << 20).max(old_cap);
+    Ok(Some((cap, sets.max(old_sets))))
 }
 
 #[cfg(feature = "cuda")]
@@ -302,7 +339,7 @@ pub(super) mod cuda {
     /// raised, the exchange queued with the writers and readers. The GPU goes on with the
     /// graph while the shares travel; [`launch_micro_finish`] waits for them.
     ///
-    /// With `--tp-overlap` there are 4 buffer sets, and an exchange starts only while at most
+    /// With micro-batch exchanges there are 4 buffer sets, and an exchange starts only while at most
     /// one other is in flight (started, not finished), so `s - 2` was finished before `s`
     /// started. Then nothing is overwritten in use: set `s % 4` was last used by `s - 4`,
     /// which this rank finished before it started `s - 2`; a peer sends partial `s` only after
@@ -392,6 +429,9 @@ pub(super) mod cuda {
         /// BF16: the whole source rounded into the send buffer (the plain all-reduce and
         /// reduce-scatter), not only the pieces (a micro-batch's).
         pack_whole: bool,
+        /// Values the buffers are reserved for when they grow, at least `span`
+        /// ([`super::reduce_reserve`] for a micro all-reduce).
+        reserve: usize,
         /// An all-gather with a BF16 output (`seq_par::all_gather_bf16`): the BF16 values
         /// copied as they travelled, not widened to F32.
         out_bf16: bool,
@@ -442,6 +482,7 @@ pub(super) mod cuda {
             wire: if exact { Wire::F32 } else { comm.wire(full) },
             pieces,
             pack_whole: true,
+            reserve: full,
             out_bf16: kind == Kind::AllGather && dst.type_ == crate::ggml::types::BF16,
             widen: match kind {
                 Kind::AllGather => crate::tp_net::seq_par::cast_of(dst),
@@ -458,6 +499,22 @@ pub(super) mod cuda {
     ) -> Plan {
         let n_ranks = comm.n_ranks();
         let row = src.ne[0] as usize;
+        if m.reduce {
+            // All of the source, on every rank, as the plain all-reduce's (whole-source pack).
+            let span = row * src.ne[1] as usize;
+            return Plan {
+                kind: Kind::AllReduce,
+                span,
+                wire: comm.wire(row * m.n),
+                pieces: vec![(0, span); n_ranks],
+                pack_whole: true,
+                // An odd step's second half is one column larger: buffers for it from the
+                // first half on, as they cannot grow while the first half is in flight.
+                reserve: super::reduce_reserve(row, src.ne[1] as usize, m.n),
+                out_bf16: false,
+                widen: None,
+            };
+        }
         let cols = crate::tp_net::micro::span_cols(m.n, n_ranks, m.j, m.compact);
         let pieces = (0..n_ranks)
             .map(|r| {
@@ -476,6 +533,7 @@ pub(super) mod cuda {
             wire: comm.wire(row * m.n),
             pieces,
             pack_whole: false,
+            reserve: row * cols,
             out_bf16: false,
             widen: None,
         }
@@ -702,12 +760,22 @@ pub(super) mod cuda {
             ));
         }
         let mut guard = comm.pinned.lock().expect("pinned lock");
-        if guard.as_ref().is_none_or(|p| p.cap < bytes) {
-            if let Some(&f) = in_flight.front() {
-                return Err(format!(
-                    "tp exchange {seq} needs larger buffers while exchange {f} is in flight"
-                ));
-            }
+        // A micro-batch exchange needs 4 buffer sets (see `launch_micro_start`): with
+        // `--tp-overlap` from the first exchange, else (a model's own micro-batches, #619) from
+        // the first micro-batch exchange, which then grows the buffers as a larger one would.
+        let sets = if micro || comm.overlap() != crate::tp_net::Overlap::Off {
+            4
+        } else {
+            2
+        };
+        let have = guard.as_ref().map(|p| (p.cap, p.nbuf));
+        let want = plan.reserve.max(plan.span) * eb;
+        let grow =
+            super::buffers_for(have, bytes, want, sets, !in_flight.is_empty()).map_err(|()| {
+                let f = in_flight.front().copied().unwrap_or_default();
+                format!("tp exchange {seq} needs larger buffers while exchange {f} is in flight")
+            })?;
+        if let Some((cap, nbuf)) = grow {
             let old = guard.take();
             let flags = match old {
                 Some(p) => {
@@ -729,12 +797,6 @@ pub(super) mod cuda {
                     f
                 }
             };
-            let nbuf = if comm.overlap() == crate::tp_net::Overlap::Off {
-                2
-            } else {
-                4
-            };
-            let cap = bytes.next_multiple_of(1 << 20);
             let size = (nbuf + nbuf * n_ranks) * cap;
             let data = HostMem::new(size)?;
             // The RDMA peers write into it directly (nothing without them).
