@@ -906,6 +906,8 @@ pub struct Link {
     tx: Option<mpsc::Sender<Frame>>,
     writer: Option<std::thread::JoinHandle<std::io::Result<()>>>,
     rd: BufReader<TcpStream>,
+    /// The writer's doorbell, rung for each frame queued ([`wait::Bell`]; `None`: never rung).
+    bell: Option<std::sync::Arc<wait::Bell>>,
     /// Replies not read yet, with when their request was queued.
     pending: std::collections::VecDeque<Instant>,
     pub times: LinkTimes,
@@ -947,11 +949,13 @@ impl Link {
         let out = stream.try_clone()?;
         let (tx, rx) = mpsc::channel::<Frame>();
         let pace = wait::spins().then_some(wait::LINK);
+        let bell = (pace.is_some() && wait::bells()).then(std::sync::Arc::<wait::Bell>::default);
+        let rung = bell.clone();
         let writer = std::thread::Builder::new()
             .name("legion-node-tx".into())
             .spawn(move || {
                 let mut w = BufWriter::with_capacity(1 << 20, out);
-                while let Some(f) = wait::recv(&rx, pace) {
+                while let Some(f) = wait::recv(&rx, pace, rung.as_deref()) {
                     write_frame(&mut w, &f)?;
                 }
                 Ok(())
@@ -960,6 +964,7 @@ impl Link {
             tx: Some(tx),
             writer: Some(writer),
             rd: BufReader::with_capacity(1 << 20, stream),
+            bell,
             pending: Default::default(),
             times: LinkTimes::default(),
         })
@@ -970,6 +975,9 @@ impl Link {
         let tx = self.tx.as_ref().ok_or("the node link is closed")?;
         if tx.send(req.encode()).is_err() {
             return Err(self.writer_error());
+        }
+        if let Some(b) = &self.bell {
+            b.ring();
         }
         self.pending.push_back(Instant::now());
         Ok(())
@@ -984,7 +992,7 @@ impl Link {
     }
 
     fn read_reply(&mut self) -> Result<Reply, String> {
-        wait::for_frame(&self.rd, wait::spins().then_some(wait::LINK));
+        wait::for_frame(&self.rd, wait::spins().then_some(wait::LINK), None);
         match read_frame(&mut self.rd) {
             Ok(Some((k, h, b))) => Reply::decode(k, &h, b),
             Ok(None) => Err("node rank 1 closed the connection".into()),
@@ -1077,12 +1085,16 @@ pub fn serve_one(
     // A few frames ahead: the next prompt chunk's residual arrives while this one computes.
     let (tx, rx) = mpsc::sync_channel::<std::io::Result<Request>>(4);
     let pace = wait::spins().then_some(wait::LINK);
+    // Rung for each reply written: the next requests come right after one (a verify step's
+    // commit and draft round after its reply).
+    let bell = (pace.is_some() && wait::bells()).then(std::sync::Arc::<wait::Bell>::default);
+    let rung = bell.clone();
     let reader = std::thread::Builder::new()
         .name("legion-node-rx".into())
         .spawn(move || {
             let mut r = BufReader::with_capacity(1 << 20, input);
             loop {
-                wait::for_frame(&r, pace);
+                wait::for_frame(&r, pace, rung.as_deref());
                 let item = match read_frame(&mut r) {
                     Ok(Some((k, h, b))) => Request::decode(k, &h, b).map_err(invalid),
                     Ok(None) => return,
@@ -1096,7 +1108,7 @@ pub fn serve_one(
         })?;
     let mut w = BufWriter::with_capacity(1 << 20, stream);
     let mut out = Ok(());
-    while let Some(req) = wait::recv(&rx, pace) {
+    while let Some(req) = wait::recv(&rx, pace, None) {
         let req = match req {
             Ok(r) => r,
             Err(e) => {
@@ -1104,7 +1116,12 @@ pub fn serve_one(
                 break;
             }
         };
-        if let Err(e) = write_frame(&mut w, &handle(req).encode()) {
+        let reply = handle(req).encode();
+        // Before the write: the reader wakes while the reply goes out.
+        if let Some(b) = &bell {
+            b.ring();
+        }
+        if let Err(e) = write_frame(&mut w, &reply) {
             out = Err(e);
             break;
         }
