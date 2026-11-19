@@ -67,10 +67,10 @@ pub fn tight_slack() -> bool {
 pub fn set_slack(ns: u64) -> bool {
     #[cfg(target_os = "linux")]
     {
+        let (ns, none) = (ns as libc::c_ulong, 0 as libc::c_ulong);
         // SAFETY: PR_SET_TIMERSLACK takes the slack in ns by value and changes only the
         // calling thread.
-        let none: libc::c_ulong = 0;
-        unsafe { libc::prctl(libc::PR_SET_TIMERSLACK, ns as libc::c_ulong, none, none, none) == 0 }
+        unsafe { libc::prctl(libc::PR_SET_TIMERSLACK, ns, none, none, none) == 0 }
     }
     #[cfg(not(target_os = "linux"))]
     {
