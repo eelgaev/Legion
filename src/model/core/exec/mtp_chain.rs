@@ -121,7 +121,7 @@ impl Executor {
         }
         let (wire_parts, h) = self.tp_rows_wire(parts);
         let req = Request::TpMtpChain {
-            groups: super::remote::to_wire(groups),
+            groups: self.tp_wire(groups)?,
             gather_budget: self.gather_budget as u64,
             parts: wire_parts,
             h,

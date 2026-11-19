@@ -936,18 +936,24 @@ pub(crate) fn tower_kv_reserve(
 
 /// `--mmproj`: the vision tower (#146), else an HF checkpoint's own (#1195), for a language
 /// model of architecture `arch` and width `n_embd`, on CUDA device `gpu` (the CPU without
-/// one). Other ranks and nodes get no images' rows.
+/// one). Under tensor parallelism over ranks only rank 0 loads it (`follower`: a rank above
+/// 0, which loads none): it encodes, and the other ranks get the images' rows with the steps
+/// (#1195 stage D). A model split by layers (`--node-rank`) takes no images yet.
 fn load_vision(
     cfg: &LmConfig,
     arch: &str,
     n_embd: usize,
     tokenizer: &Tokenizer,
     gpu: Option<usize>,
+    follower: bool,
 ) -> Result<Option<Arc<vision::Vision>>, LoadError> {
+    if follower {
+        return Ok(None);
+    }
     Ok(match &cfg.mmproj {
-        Some(_) if cfg.tp_net.is_some() || cfg.node.is_some() => {
+        Some(_) if cfg.node.is_some() => {
             return Err(LoadError::Device(
-                "--mmproj: not with --tp-rank or --node-rank (yet)".into(),
+                "--mmproj: not with --node-rank (yet)".into(),
             ));
         }
         Some(path) => Some(Arc::new(vision::Vision::load(
@@ -959,10 +965,10 @@ fn load_vision(
             gpu,
         )?)),
         None if cfg.no_mmproj || !cfg.model_path.is_dir() => None,
-        None if cfg.tp_net.is_some() || cfg.node.is_some() => {
+        None if cfg.node.is_some() => {
             tracing::info!(
-                "vision: the checkpoint's vision tower is not loaded with --tp-rank or \
-                 --node-rank (yet): text only"
+                "vision: the checkpoint's vision tower is not loaded with --node-rank \
+                 (yet): text only"
             );
             None
         }
@@ -4389,6 +4395,8 @@ impl LmEngine {
         let vision_dev = layout.stages.first().and_then(|(d, _)| *d);
         let vision_gpu = vision_dev.and_then(cuda_index);
         let vision_early = tower_before_kv(vision_dev.map(|d| d.kind()));
+        // Under tensor parallelism only rank 0 loads it (#1195 stage D).
+        let vision_follower = tp_start.as_ref().is_some_and(|s| s.rank() > 0);
         let mut vision = if vision_early {
             load_vision(
                 &cfg,
@@ -4396,6 +4404,7 @@ impl LmEngine {
                 hp.n_embd as usize,
                 &tokenizer,
                 vision_gpu,
+                vision_follower,
             )?
         } else {
             None
@@ -5213,6 +5222,7 @@ impl LmEngine {
                 exec.hp().n_embd as usize,
                 &tokenizer,
                 vision_gpu,
+                vision_follower,
             )?;
         }
         // The GPU tower's scratch at the largest image, on the first stage (0 on the CPU).
