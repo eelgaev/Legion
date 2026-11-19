@@ -23,31 +23,23 @@ pub const NONE: u32 = 0;
 /// What rank 0 has sent ([`SentMedia::id`]).
 struct Sent {
     id: u32,
-    n_embd: usize,
-    /// `(start, nx, ny)` per image.
-    spans: Vec<(usize, usize, usize)>,
-    /// Each image's rows, held weakly: a held [`Weak`] keeps the allocation, so no other rows
-    /// can take its address while it is here, and its strong count says whether any
-    /// [`Media`] still holds them.
-    rows: Vec<Weak<[f32]>>,
+    /// The sent [`Media`]'s [`Media::holders`]: a held [`Weak`] keeps the allocation, so no
+    /// other media can take its address while it is here, and its strong count says whether
+    /// that media or a clone of it still exists. Not the rows: the image-row cache keeps those
+    /// past the sequences, and shares them between requests of the same image.
+    held: Weak<()>,
 }
 
 impl Sent {
-    /// Whether `m` is these images (the same rows, not a copy of them, at the same places).
+    /// Whether `m` is these images (that media or a clone of it, not other media of the same
+    /// rows).
     fn is(&self, m: &Media) -> bool {
-        self.n_embd == m.n_embd()
-            && self.spans.len() == m.spans().len()
-            && (self.spans.iter().zip(&self.rows).zip(m.spans())).all(
-                |((&(start, nx, ny), w), s)| {
-                    (start, nx, ny) == (s.start, s.nx, s.ny)
-                        && std::ptr::addr_eq(w.as_ptr(), Arc::as_ptr(&s.rows))
-                },
-            )
+        Weak::ptr_eq(&self.held, &m.holders())
     }
 
     /// Whether a [`Media`] can still hold these images.
     fn alive(&self) -> bool {
-        self.rows.iter().all(|w| w.strong_count() > 0)
+        self.held.strong_count() > 0
     }
 }
 
@@ -82,9 +74,7 @@ impl SentMedia {
         }
         self.sent.push(Sent {
             id,
-            n_embd: m.n_embd(),
-            spans: spans.iter().map(|s| (s.start, s.nx, s.ny)).collect(),
-            rows: spans.iter().map(|s| Arc::downgrade(&s.rows)).collect(),
+            held: m.holders(),
         });
         let req = Request::TpMedia {
             id,
