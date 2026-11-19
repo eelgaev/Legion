@@ -46,6 +46,13 @@ The 1x command over two Sparks as it is (only `--tp-rank`/`--tp-peers` and `--tp
 262.8 / 265.5, prefill 8K 1,970 / 1,954 vs 1,751 / 1,752, 32K 1,804 / 1,804 vs 1,634 / 1,636. With
 `--deterministic` the text is the same with and without them at 1, 4 and 16 users.
 
+Prompt steps of 2,048 tokens or more run each layer in two halves of their tokens, so one half's sums travel
+while the GPU computes the other half (#619, no flag). With the command above plus `--deterministic`, four
+sessions in ABBA order (whole / halves / halves / whole): prefill 8K 2,274 / 2,660 / 2,659 / 2,266 and 32K
+2,130 / 2,466 / 2,466 / 2,138 tok/s (each includes `--deterministic`'s 200 ms gather), a 32K prompt step on rank 0
+1,886 -> 1,634 ms. Decode does not change (1, 4 and 16 users within 1%), and the output is the same bits:
+the same text and log probabilities at 1, 4 and 16 users, at 8K depth and for 8K and 32K prompts.
+
 ## What each flag does
 
 - `--max-seqs` (`16`): How many requests are decoded at once (continuous batching). Set to the highest concurrency the benchmark uses.

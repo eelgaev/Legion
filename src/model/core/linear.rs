@@ -626,6 +626,62 @@ impl Linear {
         })
     }
 
+    /// Whether the weight `name` (`w`, its `scale`) runs [`Self::mul_mat`] (and
+    /// [`Self::mul_mat_multi`], [`Self::geglu_ffn_fused`]) on a batch of `n` tokens as Legion's
+    /// W4A4 dense kernels, which give every token the same bits at every such batch (#619: a
+    /// step's per-token work in parts).
+    pub(crate) fn a4_dense(
+        &self,
+        name: &str,
+        w: Tensor<'_>,
+        scale: Option<Tensor<'_>>,
+        n: i64,
+    ) -> bool {
+        !self.fp8.contains(name)
+            && self.w4a16(name, w, scale, n)
+            && w.ne()[2] == 1
+            && self.w4a4(w, n, false)
+    }
+
+    /// [`Self::mul_mat_multi`] of a part of a step ([`crate::model::nvfp4_a4::mul_mat_multi_part`]:
+    /// `x`'s columns from `col0` of the step's `n`, `into` the node of another part): the node,
+    /// or `None` where [`Self::mul_mat_multi`] would not run as one W4A4 op, or the norm would
+    /// not go into its quantization.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mul_mat_multi_part<'a>(
+        &self,
+        ctx: &'a Context,
+        ws: &[(&str, Tensor<'a>, Option<Tensor<'a>>)],
+        x: Tensor<'a>,
+        norm: (Tensor<'a>, Tensor<'a>, f32),
+        n: i64,
+        col0: i64,
+        into: Option<Tensor<'a>>,
+    ) -> Option<Tensor<'a>> {
+        use crate::model::nvfp4_a4;
+        let cols: i64 = x.ne()[1..].iter().product();
+        let (h, nw, eps) = norm;
+        let fits = ws.len() >= 2
+            && ws.len() <= nvfp4_a4::MULTI_MAX
+            && ws
+                .iter()
+                .all(|&(name, w, s)| self.a4_dense(name, w, s, cols) && w.ne()[0] == x.ne()[0])
+            && nvfp4_a4::rms_norm_fits(h, nw);
+        if !fits {
+            return None;
+        }
+        let pairs: Vec<_> = ws.iter().map(|&(_, w, s)| (w, s)).collect();
+        Some(nvfp4_a4::mul_mat_multi_part(
+            ctx,
+            &pairs,
+            h,
+            Some((nw, eps)),
+            n,
+            col0,
+            into,
+        ))
+    }
+
     /// [`Self::swiglu_ffn`] for routed experts (`x` `[k, 1 or n_used, n_tok]`, `ids` `[n_used,
     /// n_tok]`, per-expert scales): the gate and up matmuls and the activation as one grouped
     /// W4A16 op ([`crate::model::nvfp4_mm::swiglu_id`], BF16 out, the same bits as the unfused
