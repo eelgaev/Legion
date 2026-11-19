@@ -229,6 +229,42 @@ fn whole_experts_take_half_the_stack() {
 
 /// `--tp-moe-ep-place` (#803): each rank's experts of a placed layer, gathered in ascending
 /// order, their bytes as shipped; unnamed layers keep the contiguous halves.
+/// `--tp-moe-ep-decode-rows` (#1176): the whole experts as `--tp-moe-ep` cuts them, and beside
+/// them the routed stacks cut by rows as the row split cuts them, under their row names.
+#[test]
+fn row_copies_sit_beside_whole_experts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (whole, mtp) = tiny(dir.path());
+    let head_il = crate::model::qwen4::tiny::N_LAYER;
+    for rank in 0..2 {
+        for (g, layers) in [(&whole, vec![0, 3]), (&mtp, vec![head_il])] {
+            let both = view_with_rows(g, rank, 2, Experts::Whole, true).unwrap();
+            let ep = view_with(g, rank, 2, Experts::Whole).unwrap();
+            let rows = view(g, rank, 2).unwrap();
+            assert_eq!(
+                both.get_u64("qwen4exp.expert_feed_forward_length"),
+                ep.get_u64("qwen4exp.expert_feed_forward_length")
+            );
+            for il in layers {
+                for k in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"] {
+                    let name = format!("blk.{il}.{k}.weight");
+                    assert_eq!(bytes(&both, &name), bytes(&ep, &name), "{name}");
+                    let copy = tp_ep::rows_name(&name).unwrap();
+                    assert_eq!(
+                        both.tensor(&copy).unwrap().shape,
+                        rows.tensor(&name).unwrap().shape,
+                        "{copy}"
+                    );
+                    assert_eq!(bytes(&both, &copy), bytes(&rows, &name), "{copy}");
+                }
+            }
+            // Off: no copies.
+            let off = view_with_rows(g, rank, 2, Experts::Whole, false).unwrap();
+            assert_eq!(off.tensors().len(), ep.tensors().len());
+        }
+    }
+}
+
 #[test]
 fn placed_experts_gather_each_ranks_experts() {
     let dir = tempfile::tempdir().unwrap();

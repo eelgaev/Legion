@@ -251,7 +251,7 @@ pub(super) fn start(
         if gguf.architecture().as_deref() != Some("qwen4exp") {
             return Err(device("--tp-moe-ep: Qwen3.8-Flash-Next (qwen4exp) only"));
         }
-        tp_net::shard::qwen4::view_with(&gguf, t.rank, n, experts(cfg))
+        tp_net::shard::qwen4::view_with_rows(&gguf, t.rank, n, experts(cfg), ep_rows(cfg) > 0)
     } else {
         tp_net::shard::view(&gguf, t.rank, n)
     }
@@ -304,8 +304,14 @@ pub(super) fn mtp_share(
     };
     if gguf.architecture().as_deref() == Some("qwen4exp") {
         // qwen4exp's head is one more block of the target's shape: cut as the target's are.
-        return tp_net::shard::qwen4::view_with(&gguf, rank, n, experts(cfg))
-            .map_err(|e| device(format!("--spec-draft: {e}")));
+        return tp_net::shard::qwen4::view_with_rows(
+            &gguf,
+            rank,
+            n,
+            experts(cfg),
+            ep_rows(cfg) > 0,
+        )
+        .map_err(|e| device(format!("--spec-draft: {e}")));
     }
     if gguf.architecture().as_deref() == Some("qwen35") {
         // So is a dense qwen35's (#1163); its file has no shapes of its own, the target's.
@@ -340,6 +346,15 @@ fn experts(cfg: &LmConfig) -> tp_net::shard::qwen4::Experts {
         },
         _ => tp_net::shard::qwen4::Experts::Rows,
     }
+}
+
+/// `--tp-moe-ep-decode-rows` (#1176): the most tokens of a step whose MoE runs on the routed
+/// experts' row copies; 0 without (or without `--tp-moe-ep`).
+pub(super) fn ep_rows(cfg: &LmConfig) -> usize {
+    cfg.tp_net
+        .as_ref()
+        .filter(|t| t.moe_ep)
+        .map_or(0, |t| t.moe_ep_rows)
 }
 
 /// The routed experts this rank holds under `--tp-moe-ep` (#798): `(rank, ranks, placement)`,

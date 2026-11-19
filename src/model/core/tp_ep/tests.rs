@@ -9,6 +9,41 @@ use crate::model::moe_ffn::{ExpertRefs, PairOut, moe_ffn};
 use crate::tp_net::ep_place::{self, Placement};
 
 #[test]
+fn row_copies_name_the_routed_stacks_only() {
+    assert_eq!(
+        rows_name("blk.7.ffn_up_exps.weight").as_deref(),
+        Some("blk.7.ffn_up_rows_exps.weight")
+    );
+    assert_eq!(
+        rows_name("blk.48.ffn_down_exps.scale").as_deref(),
+        Some("blk.48.ffn_down_rows_exps.scale")
+    );
+    assert_eq!(
+        rows_name("blk.0.ffn_gate_exps.weight").as_deref(),
+        Some("blk.0.ffn_gate_rows_exps.weight")
+    );
+    for other in [
+        "blk.0.ffn_up_shexp.weight",
+        "blk.0.ffn_gate_inp.weight",
+        "blk.0.ffn_up_rows_exps.weight",
+    ] {
+        assert_eq!(rows_name(other), None, "{other}");
+    }
+    // Only while a row step lives, and nested ones restore the outer state.
+    assert!(!row_step());
+    {
+        let _a = RowStep::begin();
+        assert!(row_step());
+        {
+            let _b = RowStep::begin();
+            assert!(row_step());
+        }
+        assert!(row_step());
+    }
+    assert!(!row_step());
+}
+
+#[test]
 fn tables_map_the_share() {
     let (slot, ids, keep) = tables(8, 4, 4);
     assert_eq!(slot, [-1, -1, -1, -1, 0, 1, 2, 3]);

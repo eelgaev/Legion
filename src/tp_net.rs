@@ -112,6 +112,10 @@ pub struct TpNetConfig {
     /// With `moe_ep`: which rank holds each routed expert, per layer (`--tp-moe-ep-place`,
     /// #803, [`ep_place`]); `None`: the contiguous split.
     pub moe_ep_place: Option<std::sync::Arc<ep_place::Placement>>,
+    /// With `moe_ep`: steps of up to this many tokens run every chosen expert on this rank's
+    /// rows instead, from row copies of the routed experts each rank also holds
+    /// (`--tp-moe-ep-decode-rows`, #1176); 0: never.
+    pub moe_ep_rows: usize,
 }
 
 /// What a `--tp-seq-par` step runs in two micro-batches (`--tp-overlap`, [`micro`]).

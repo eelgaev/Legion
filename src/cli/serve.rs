@@ -808,6 +808,16 @@ pub(super) struct ModelArgs {
     /// contiguous split. Every rank must pass the same file. Off by default.
     #[arg(long, requires = "tp_moe_ep", value_name = "FILE")]
     pub tp_moe_ep_place: Option<PathBuf>,
+    /// With --tp-moe-ep (Qwen3.8-Flash-Next): steps of up to N tokens (decode, MTP verify)
+    /// run every chosen expert on this rank's share of its rows, as the row split does, so
+    /// neither rank waits on the other drawing more of a token's experts; bigger steps keep
+    /// the whole experts. Every rank also holds a row-split copy of the routed experts: about
+    /// half the expert weights again per rank, and a slower load (an MTP head whose FP8 expert
+    /// blocks do not split by rows keeps its whole experts). The
+    /// MoE sum's order changes, so output differs in bits from --tp-moe-ep alone. Every rank
+    /// must pass the same N. Off by default.
+    #[arg(long, requires = "tp_moe_ep", value_name = "N")]
+    pub tp_moe_ep_decode_rows: Option<usize>,
     /// Appends every MoE layer's router choices (the top-k expert ids of each token of each
     /// step, decode, prompts and MTP drafts alike) to FILE, for `legion ep-place`. Each step's
     /// ids are copied to the host before the step goes on, so the server runs slower while
@@ -2218,6 +2228,7 @@ pub async fn run(
                     moe_ep: e.model.tp_moe_ep,
                     overlap: e.model.tp_overlap,
                     moe_ep_place: moe_ep_place.clone(),
+                    moe_ep_rows: e.model.tp_moe_ep_decode_rows.unwrap_or(0),
                 }),
                 glm_parallel_decode: e.model.glm_parallel_decode,
                 tp_per_gpu: e.model.tp_per_gpu,

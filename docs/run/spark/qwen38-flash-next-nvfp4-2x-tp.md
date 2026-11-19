@@ -54,6 +54,14 @@ top (such steps also leave the states unwritten while the stored tokens have roo
 256-268, 1 and 4 users 49.4 and 120.7), same output: about 1 ms less per verify step, which these rounds cannot
 tell from the flag alone.
 
+Optional, opt-in: `--tp-moe-ep-decode-rows 3` on both ranks. Steps of up to 3 tokens (1-user decode and its MTP
+verify) then run every chosen expert on each Spark's half of its rows, as the plain row split does, instead of
+each Spark running only its own whole experts, so neither Spark waits on the other drawing more of a token's
+experts. Bigger steps keep `--tp-moe-ep`, and so does the MTP head (its FP8 experts' 128-row scale blocks do not
+split in two). Each Spark holds a row-split copy of the routed experts next to its
+whole ones (about 31.6 GiB more per Spark, KV cache unchanged) and the load takes longer. The MoE sum's order
+changes, so output differs in bits from the command above.
+
 ### Images
 
 The checkpoint's vision tower (`model.visual.*`) loads on rank 0 only, and rank 0 encodes on its GPU; rank 1

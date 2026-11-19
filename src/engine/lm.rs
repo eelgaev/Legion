@@ -4092,6 +4092,7 @@ impl LmEngine {
         }
         if let Some((rank, ranks, place)) = tp_node::moe_ep(&cfg) {
             model.set_tp_moe_ep(rank, ranks, place)?;
+            model.set_tp_moe_ep_rows(tp_node::ep_rows(&cfg))?;
         }
         if let Some(layers) = &ssd_layers {
             let tier = ssd_tier::build(&cfg, &gguf, &layout, &model.hp, layers)?;

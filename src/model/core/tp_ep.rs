@@ -57,6 +57,44 @@ pub(crate) fn active() -> bool {
     ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+thread_local! {
+    static ROWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The routed experts' names of `--tp-moe-ep-decode-rows`' row copies (#1176): the rank's
+/// share of every expert's rows, beside its whole experts
+/// ([`crate::tp_net::shard::qwen4::view_with_rows`]). `blk.{il}.ffn_up_exps.weight` (or its
+/// `.scale`) gives `blk.{il}.ffn_up_rows_exps.weight`; `None` for any other tensor.
+pub fn rows_name(name: &str) -> Option<String> {
+    ["gate", "up", "down"].iter().find_map(|k| {
+        let from = format!(".ffn_{k}_exps.");
+        name.contains(&from)
+            .then(|| name.replacen(&from, &format!(".ffn_{k}_rows_exps."), 1))
+    })
+}
+
+/// While it lives, this thread's model graphs read the routed experts' row copies
+/// ([`rows_name`]) in place of the rank's whole experts: a small step's MoE built as a plain
+/// row split (`--tp-moe-ep-decode-rows`, #1176).
+pub(crate) struct RowStep(bool);
+
+impl RowStep {
+    pub(crate) fn begin() -> Self {
+        Self(ROWS.with(|r| r.replace(true)))
+    }
+}
+
+impl Drop for RowStep {
+    fn drop(&mut self) {
+        ROWS.with(|r| r.set(self.0));
+    }
+}
+
+/// Whether a [`RowStep`] of this thread is live.
+pub(crate) fn row_step() -> bool {
+    ROWS.with(std::cell::Cell::get)
+}
+
 /// Names of the tables in [`TpEp`]'s context.
 const SLOT: &str = "tp_ep.slot";
 const IDS: &str = "tp_ep.ids";

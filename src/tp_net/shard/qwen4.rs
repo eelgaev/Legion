@@ -40,6 +40,7 @@ use crate::ggml::{self, ffi};
 use crate::gguf::{
     Compute, FileRange, GgufFile, GgufWriter, Nvfp4Stack, Recipe, TensorInfo, Value,
 };
+use crate::model::core::tp_ep;
 use crate::tp_net::ep_place::{self, Placement};
 
 const ARCH: &str = "qwen4exp";
@@ -372,6 +373,20 @@ pub fn view_with(
     n: usize,
     experts: Experts,
 ) -> Result<GgufFile, String> {
+    view_with_rows(gguf, rank, n, experts, false)
+}
+
+/// [`view_with`]; with `rows` and whole experts, also every routed stack (and its scales) cut
+/// by rows as [`view`] cuts it, under the name [`tp_ep::rows_name`] gives
+/// (`--tp-moe-ep-decode-rows`, #1176): small steps run every chosen expert on this rank's
+/// rows, bigger ones the rank's whole experts.
+pub fn view_with_rows(
+    gguf: &GgufFile,
+    rank: usize,
+    n: usize,
+    experts: Experts,
+    rows: bool,
+) -> Result<GgufFile, String> {
     let arch = gguf.architecture().unwrap_or_default();
     if arch != ARCH {
         return Err(format!("architecture {arch:?}: not {ARCH}"));
@@ -407,6 +422,25 @@ pub fn view_with(
     let mut out = Vec::with_capacity(tensors.len());
     let mut recipes = HashMap::new();
     let (mut ff_exp, mut ff_sh) = (None, None);
+    // The layers whose routed stacks the row split cannot cut (an MTP head's FP8 experts: their
+    // 128-row scale blocks do not split in two at 640 rows) get no row copies: their small
+    // steps keep the whole experts.
+    let layer = |name: &str| -> Option<String> {
+        let (il, rest) = name.strip_prefix("blk.")?.split_once('.')?;
+        routed(rest).then(|| il.to_string())
+    };
+    let uncut: std::collections::HashSet<String> = if rows && experts.whole() {
+        tensors
+            .iter()
+            .filter(|t| layer(&t.name).is_some() && piece(&d, t, &down, n, rank).is_err())
+            .filter_map(|t| layer(&t.name))
+            .collect()
+    } else {
+        Default::default()
+    };
+    if !uncut.is_empty() {
+        tracing::info!(layers = ?uncut, "--tp-moe-ep-decode-rows: no row copies (cannot split)");
+    }
     for t in tensors {
         let whole_experts = match t.name.strip_prefix("blk.").and_then(|r| r.split_once('.')) {
             Some((il, name)) if experts.whole() => {
@@ -416,6 +450,21 @@ pub fn view_with(
                 expert_piece(&t.name, il, name, &t.shape, n_expert, n, rank, &experts)?
             }
             _ => None,
+        };
+        let row_copy = if rows
+            && whole_experts.is_some()
+            && layer(&t.name).is_some_and(|il| !uncut.contains(&il))
+        {
+            let mut cut = HashMap::new();
+            let p = piece(&d, &t, &down, n, rank)?;
+            let mut c = apply(gguf, &paths, &t, p, &mut cut)?;
+            c.name = tp_ep::rows_name(&t.name).ok_or_else(|| format!("{}: no row copy", t.name))?;
+            if let Some(r) = cut.remove(&t.name) {
+                recipes.insert(c.name.clone(), r);
+            }
+            Some(c)
+        } else {
+            None
         };
         let p = match whole_experts {
             Some(p) => p,
@@ -474,6 +523,7 @@ pub fn view_with(
             ff_sh.get_or_insert(s.shape[0]);
         }
         out.push(s);
+        out.extend(row_copy);
     }
     if let Some(f) = ff_exp {
         set(&mut meta, "expert_feed_forward_length", u(f))?;

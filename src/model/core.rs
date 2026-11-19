@@ -439,6 +439,10 @@ pub struct Model {
     /// Expert parallelism of the routed experts under tensor parallelism (`--tp-moe-ep`,
     /// [`tp_ep`]): this rank's experts and their lookup tables.
     tp_ep: Option<tp_ep::TpEp>,
+    /// With `tp_ep`: steps of up to this many tokens run the routed experts on their row
+    /// copies, every chosen expert on this rank's rows (`--tp-moe-ep-decode-rows`, #1176;
+    /// [`tp_ep::RowStep`]); 0: never.
+    tp_ep_rows: i64,
     /// GLM's parallel decode (`--glm-parallel-decode`): who does what and the GPUs' exchange.
     pub(crate) glm_par: Option<crate::model::glm5next::par::GlmPar>,
     /// Pair parallelism of the routed experts (`--pair-tp`, [`pair`]).
@@ -1632,6 +1636,7 @@ impl Model {
             tp_comm: None,
             tp_pair: None,
             tp_ep: None,
+            tp_ep_rows: 0,
             glm_par: None,
             pair: None,
         })
@@ -1684,6 +1689,7 @@ impl Model {
             tp_comm: None,
             tp_pair: None,
             tp_ep: None,
+            tp_ep_rows: 0,
             glm_par: None,
             pair: None,
         })
@@ -1786,6 +1792,34 @@ impl Model {
         )?);
         tp_ep::ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+
+    /// `--tp-moe-ep-decode-rows` (#1176): with [`Self::set_tp_moe_ep`], steps of up to
+    /// `max_tokens` tokens run every chosen expert on this rank's rows, from the row copies
+    /// the share holds beside its whole experts ([`tp_ep::rows_name`]); 0 turns it off.
+    pub fn set_tp_moe_ep_rows(&mut self, max_tokens: usize) -> Result<(), ModelError> {
+        if max_tokens > 0 {
+            let has = (0..self.hp.n_layer).any(|il| {
+                self.tp_ep
+                    .as_ref()
+                    .is_some_and(|_| self.lw(il, "ffn_up_rows_exps.weight").is_ok())
+            });
+            if !has {
+                return Err(ModelError::Layout(
+                    "--tp-moe-ep-decode-rows: no row copies of the routed experts".into(),
+                ));
+            }
+        }
+        self.tp_ep_rows = max_tokens as i64;
+        Ok(())
+    }
+
+    /// Whether layer `il`'s MoE of a step of `n` tokens runs on its row copies
+    /// ([`Self::set_tp_moe_ep_rows`]).
+    fn tp_ep_row_step(&self, il: usize, n: i64) -> bool {
+        self.tp_ep.is_some()
+            && n <= self.tp_ep_rows
+            && self.w(&format!("blk.{il}.ffn_up_rows_exps.weight")).is_ok()
     }
 
     /// The communicator, this rank and the rank count when a step of `n` tokens runs its
@@ -2202,6 +2236,18 @@ impl Model {
     }
 
     pub(crate) fn w(&self, name: &str) -> Result<Tensor<'_>, ModelError> {
+        // A small step's MoE under `--tp-moe-ep-decode-rows` (#1176): the routed experts' row
+        // copies (the layer has them: `Self::tp_ep_row_step`).
+        if tp_ep::row_step()
+            && let Some(rows) = tp_ep::rows_name(name)
+        {
+            return self.w_as(&rows);
+        }
+        self.w_as(name)
+    }
+
+    /// [`Self::w`] by `name` as it is.
+    fn w_as(&self, name: &str) -> Result<Tensor<'_>, ModelError> {
         self.requant
             .as_ref()
             .and_then(|c| c.tensor(name))
@@ -4323,8 +4369,12 @@ impl Model {
         let router = !tap.on && hp.n_expert <= fused::ROUTER_MAX_EXPERTS;
         let gate_w = self.lw(il, "ffn_gate_inp_shexp.weight")?;
         let gate_op = !tap.on && fused::shexp_gate_on(gate_w);
+        // `--tp-moe-ep-decode-rows` (#1176): a small step reads the experts' row copies, so
+        // its MoE is the plain row split (no expert-parallel share below).
+        let row_step = self.tp_ep_row_step(il, n);
+        let _rows = row_step.then(tp_ep::RowStep::begin);
         // `--tp-moe-ep` (#798): this rank holds a share of the layer's experts.
-        let ep = self.tp_ep.as_ref().filter(|ep| {
+        let ep = self.tp_ep.as_ref().filter(|_| !row_step).filter(|ep| {
             self.lw(il, "ffn_up_exps.weight")
                 .is_ok_and(|up| ep.cuts(up))
         });
