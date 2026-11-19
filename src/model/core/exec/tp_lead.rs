@@ -132,6 +132,9 @@ pub struct TpLead {
     step_dev: Option<crate::ggml::RowsAt>,
     /// The images the other ranks hold, which steps name by id (#1195).
     media: SentMedia,
+    /// Every rank holds a share of the DFlash drafter's FFN and runs each draft round
+    /// (`--tp-draft-split`, [`Executor::tp_draft`]).
+    draft_split: bool,
 }
 
 /// The MTP head's take-in of a prompt chunk copies its pieces' rows on the device on every rank
@@ -210,6 +213,7 @@ impl TpLead {
             prev_held: None,
             step_dev: None,
             media: SentMedia::default(),
+            draft_split: false,
         }
     }
 
@@ -233,7 +237,14 @@ impl TpLead {
             prev_held: None,
             step_dev: None,
             media: SentMedia::default(),
+            draft_split: false,
         }
+    }
+
+    /// Every rank runs each DFlash draft round with its share of the drafter's FFN
+    /// (`--tp-draft-split`, [`Executor::tp_draft`]).
+    pub fn set_draft_split(&mut self, on: bool) {
+        self.draft_split = on;
     }
 
     /// Sends each draft round to the other ranks as one request, whose further passes every
@@ -561,6 +572,28 @@ impl Executor {
         }
         lead.failed()?;
         out
+    }
+
+    /// Sends a DFlash draft round to the other ranks before this rank runs it, when each holds
+    /// a share of the drafter's FFN (`--tp-draft-split`): the pass's sums wait for every rank.
+    /// Nothing otherwise. Its answer is read with a later step's.
+    pub fn tp_draft(
+        &mut self,
+        reqs: impl FnOnce() -> Vec<crate::node::WireDraft>,
+    ) -> Result<(), ModelError> {
+        let Some(lead) = self.tp.as_mut().filter(|l| l.draft_split) else {
+            return Ok(());
+        };
+        lead.failed()?;
+        lead.settle(STEPS_AHEAD)?;
+        lead.send(&Request::TpDraft { reqs: reqs() })
+    }
+
+    /// The other ranks' mirror of a drafter's release of `seq` under `--tp-draft-split`.
+    pub fn tp_draft_release(&mut self, seq: u64) {
+        if let Some(lead) = self.tp.as_mut().filter(|l| l.draft_split) {
+            lead.mirror(&Request::TpDraftRelease { seq });
+        }
     }
 
     /// The other ranks' mirror of [`Self::save_ring`].

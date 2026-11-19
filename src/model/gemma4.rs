@@ -441,6 +441,12 @@ impl Arch for Gemma4Params {
         m.build_assistant(ctx, kv, rec, shape)
     }
 
+    /// Two DGX Sparks, Gemma 4 31B NVFP4's BF16 head tied to the embeddings (262,144 rows,
+    /// 2.8 GB), each share soft-capped before its candidates: the same text split (#619).
+    fn head_splits(&self) -> bool {
+        true
+    }
+
     /// The soft-cap of [`Self::logits`] (0: none).
     fn logit_softcap(&self) -> Option<f32> {
         Some(self.softcap.max(0.0))

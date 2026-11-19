@@ -200,6 +200,34 @@ fn requests_round_trip() {
             p_min: 0,
         },
         Request::DraftRelease { seq: 1 << 40 },
+        Request::TpDraft {
+            reqs: vec![
+                WireDraft {
+                    seq: 9,
+                    base: 4_095,
+                    tokens: vec![262_143],
+                    start: 4_090,
+                    ran: 6,
+                    off: 24,
+                    max: 7,
+                    blocks: Vec::new(),
+                    ring: 0,
+                },
+                WireDraft {
+                    seq: u64::MAX,
+                    base: 0,
+                    tokens: Vec::new(),
+                    start: 0,
+                    ran: 0,
+                    off: 0,
+                    max: 0,
+                    blocks: Vec::new(),
+                    ring: 0,
+                },
+            ],
+        },
+        Request::TpDraft { reqs: Vec::new() },
+        Request::TpDraftRelease { seq: 3 },
     ] {
         assert_eq!(round_trip_request(r.clone()), r);
     }

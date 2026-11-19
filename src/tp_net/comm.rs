@@ -1439,6 +1439,13 @@ impl Comm {
         Ok(parts)
     }
 
+    /// Fails the communicator with `e` and cuts its connections at once, as a rank that died
+    /// does: the peers' exchanges waiting for this rank fail now rather than at their timeout.
+    pub fn abort(&self, e: String) {
+        self.shared.fail(e);
+        self.shutdown();
+    }
+
     /// Stops the threads. The writers first send what is still queued, for up to
     /// [`DRAIN_FOR`] (unless the communicator failed): a rank's all-reduce ends once the peers'
     /// partials arrived, maybe before its own went out, and a peer still reading it would see

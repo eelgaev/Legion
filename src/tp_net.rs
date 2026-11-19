@@ -112,6 +112,10 @@ pub struct TpNetConfig {
     /// With `moe_ep`: which rank holds each routed expert, per layer (`--tp-moe-ep-place`,
     /// #803, [`ep_place`]); `None`: the contiguous split.
     pub moe_ep_place: Option<std::sync::Arc<ep_place::Placement>>,
+    /// `--spec dflash`: every rank holds its share of the drafter's FFN and runs every draft
+    /// round with rank 0 (`--tp-draft-split`, #619; [`crate::spec::dflash::TpShare`]); off:
+    /// rank 0 drafts alone.
+    pub draft_split: bool,
 }
 
 /// What a `--tp-seq-par` step runs in two micro-batches (`--tp-overlap`, [`micro`]).

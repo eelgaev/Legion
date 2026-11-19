@@ -4455,9 +4455,12 @@ impl LmEngine {
             max_seqs: max_seqs + prefill_slots,
             use_ref: cfg.use_ref,
         };
-        let drafting = match tp_node::rank0_drafting(&cfg)? {
+        let mut drafting = match tp_node::rank0_drafting(&cfg)? {
             Some(d) => d,
-            None => Drafting::new(&cfg.spec, &target, dflash_vocab).map_err(LoadError::Device)?,
+            None => {
+                let share = tp_node::draft_share(&cfg, tp_start.as_ref());
+                Drafting::new(&cfg.spec, &target, dflash_vocab, share).map_err(LoadError::Device)?
+            }
         };
         // A block drafter drafts its whole block in one pass: up to all of it without `--spec-k`
         // (the depth policy picks less where verify rows cost).
@@ -5696,11 +5699,17 @@ impl LmEngine {
             // blocks past the device's in its steps, as one GPU alone does.
             tp_node::check_exec(&exec, cfg.tp_pair.is_none() && n_blocks > hbm_blocks)?;
             if start.rank() > 0 {
+                // `--tp-draft-split`: its share of the drafter runs rank 0's draft rounds.
+                let drafter = match std::mem::replace(&mut drafting, Drafting::Off) {
+                    Drafting::Model(d) => Some(d),
+                    _ => None,
+                };
                 return Err(tp_node::follow(
                     exec,
                     start,
                     n_blocks,
                     ring_save_bufts(&layout),
+                    drafter,
                 ));
             }
             let blocks = tp_node::lead(&mut exec, start, n_blocks)?;
@@ -7394,7 +7403,11 @@ impl Worker {
         self.reserved -= seq.reserved;
         seq.reserved = 0;
         match &mut self.drafting {
-            Drafting::Model(d) => d.release(seq.id),
+            Drafting::Model(d) => {
+                d.release(seq.id);
+                // The other ranks' shares of it (`--tp-draft-split`).
+                self.exec.tp_draft_release(seq.id);
+            }
             Drafting::Mtp(d) => {
                 d.release(seq.id);
                 // The head's drafter on node rank 1 (#560).
@@ -8881,6 +8894,26 @@ impl Worker {
                 match &mut self.drafting {
                     Drafting::Model(d) => {
                         let t = Instant::now();
+                        // `--tp-draft-split`: every rank runs the round, its share of the FFN. A
+                        // round that fails on any rank still runs all its sums there (zeros), so
+                        // the others' ends and the communicator stays usable (`DflashDrafter`'s
+                        // `round_end`).
+                        let wire = || {
+                            (batch.iter().zip(&offs))
+                                .map(|(r, &off)| crate::node::WireDraft {
+                                    seq: r.seq,
+                                    base: r.tokens.len().saturating_sub(1) as u32,
+                                    tokens: r.tokens.last().copied().into_iter().collect(),
+                                    start: r.start as u32,
+                                    ran: r.ran as u32,
+                                    off: off as u32,
+                                    max: r.max as u32,
+                                    blocks: Vec::new(),
+                                    ring: 0,
+                                })
+                                .collect()
+                        };
+                        self.exec.tp_draft(wire).map_err(|e| e.to_string())?;
                         if hidden_dev.is_empty() {
                             d.step(&mut batch)?;
                         } else {
