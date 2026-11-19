@@ -54,6 +54,15 @@ top (such steps also leave the states unwritten while the stored tokens have roo
 256-268, 1 and 4 users 49.4 and 120.7), same output: about 1 ms less per verify step, which these rounds cannot
 tell from the flag alone.
 
+### Images
+
+The checkpoint's vision tower (`model.visual.*`) loads on rank 0 only, and rank 0 encodes on its CPU; rank 1
+gets each image's rows from rank 0 over the control connection, once per request. 2026-11-19, the command
+above: a 1024 × 768 image (768 image tokens) encodes in 11.3-12.0 s and its first token comes 11.9-12.7 s after
+the request, as on one Spark (11.8-12.7 s). Greedy answers to the five test images equal one Spark's word for
+word. Text-only requests give the same output as with `--no-mmproj`, at the same speed (8K prefill 3,515-3,546
+tok/s against 3,528-3,530, 32K 3,526-3,552 against 3,532-3,545, 1 user 52.1-52.4 tok/s against 51.7-52.1).
+
 ## What each flag does
 
 - `--max-seqs` (`16`): How many requests are decoded at once (continuous batching). Set to the highest concurrency the benchmark uses.
