@@ -47,6 +47,10 @@ impl ImageSpan {
 pub struct Media {
     spans: Vec<ImageSpan>,
     n_embd: usize,
+    /// Shared by this media and its clones only, not by other media of the same rows (the
+    /// image-row cache hands one image's rows to every request that sends it): whether any of
+    /// them still exists ([`Self::holders`]).
+    held: Arc<()>,
 }
 
 impl Media {
@@ -59,7 +63,17 @@ impl Media {
             assert!(s.nx > 0 && s.ny > 0, "an empty image");
             assert_eq!(s.rows.len(), s.n_tokens() * n_embd, "image rows");
         }
-        Self { spans, n_embd }
+        Self {
+            spans,
+            n_embd,
+            held: Arc::default(),
+        }
+    }
+
+    /// A handle on this media and its clones: its strong count says whether any of them
+    /// still exists, and while it is held no other media takes its address.
+    pub fn holders(&self) -> std::sync::Weak<()> {
+        Arc::downgrade(&self.held)
     }
 
     pub fn is_empty(&self) -> bool {

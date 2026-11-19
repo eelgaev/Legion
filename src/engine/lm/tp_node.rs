@@ -14,7 +14,7 @@ use super::{LmConfig, LoadError};
 use crate::ggml::BufferType;
 use crate::gguf::GgufFile;
 use crate::model::core::pair::sum::PairSum;
-use crate::model::core::{Executor, Model, Pool, TpLead};
+use crate::model::core::{Executor, MediaTable, Model, Pool, TpLead, from_wire_with};
 use crate::node::{Link, Reply, Request, RowsPart};
 use crate::tp_net::{self, CommHandle, ControlListener, StepLaps, StepProfile, TpNetConfig};
 
@@ -503,8 +503,9 @@ pub(super) fn follow(
             let mine = (2, rank, exec.model().hp.n_layer);
             let mut profile = StepProfile::new(0);
             let mut rows = Default::default();
+            let mut media = MediaTable::default();
             serve.serve(&mut |req| {
-                let state = (&mut blocks, &mut profile, &mut rows);
+                let state = (&mut blocks, &mut profile, &mut rows, &mut media);
                 handle(&mut exec, req, mine, state, &ring_bufts, &Sums::Pair(&sum))
                     .unwrap_or_else(Reply::Error)
             });
@@ -522,8 +523,9 @@ pub(super) fn follow(
     take_rows(&exec, control);
     let mut profile = StepProfile::new(cfg.profile);
     let mut rows = Default::default();
+    let mut media = MediaTable::default();
     let r = crate::node::serve_one(stream, &mut |req| {
-        let state = (&mut blocks, &mut profile, &mut rows);
+        let state = (&mut blocks, &mut profile, &mut rows, &mut media);
         handle(&mut exec, req, mine, state, &ring_bufts, &Sums::Net(&comm))
             .unwrap_or_else(Reply::Error)
     });
@@ -536,9 +538,14 @@ pub(super) fn follow(
     ))
 }
 
-/// What a rank above 0 keeps between requests: its KV blocks, its `--tp-profile`, and the
-/// rows its last steps captured ([`FollowRows`]).
-type FollowState<'s> = (&'s mut usize, &'s mut StepProfile, &'s mut FollowRows);
+/// What a rank above 0 keeps between requests: its KV blocks, its `--tp-profile`, the rows
+/// its last steps captured ([`FollowRows`]), and the images rank 0 sent (#1195).
+type FollowState<'s> = (
+    &'s mut usize,
+    &'s mut StepProfile,
+    &'s mut FollowRows,
+    &'s mut MediaTable,
+);
 
 /// The rows a rank above 0's last steps captured, which [`Request::TpMtpRows`] reads.
 #[derive(Default)]
@@ -621,11 +628,20 @@ fn rows_of<'a>(
     Ok(out)
 }
 
+/// Groups borrowing `wire`, a sequence's images those of `media` its id names (rank 0 sent
+/// them before the request, #1195).
+fn groups_of<'a>(
+    wire: &'a [crate::node::WireGroup],
+    media: &'a MediaTable,
+) -> Result<Vec<crate::model::core::Group<'a>>, String> {
+    from_wire_with(wire, |id| media.get(id))
+}
+
 fn handle(
     exec: &mut Executor,
     req: Request,
     mine: (usize, usize, usize),
-    (blocks, profile, rows): FollowState<'_>,
+    (blocks, profile, rows, media): FollowState<'_>,
     ring_bufts: &[BufferType],
     comm: &Sums<'_>,
 ) -> Result<Reply, String> {
@@ -660,7 +676,7 @@ fn handle(
             exec.set_pipeline_micro(micro as usize);
             exec.set_micro_taper(taper as usize);
             exec.set_gather_budget(gather_budget as usize);
-            let mut groups = crate::model::core::from_wire(&groups)?;
+            let mut groups = groups_of(&groups, media)?;
             // A greedy step's head split with rank 0 (`--tp-head-split`): this rank's share
             // of the vocabulary, its candidates the answer.
             let split = head != 0;
@@ -712,7 +728,7 @@ fn handle(
             h,
         } => {
             exec.set_gather_budget(gather_budget as usize);
-            let groups = crate::model::core::from_wire(&groups)?;
+            let groups = groups_of(&groups, media)?;
             let t0 = std::time::Instant::now();
             comm.mark_step(profile);
             exec.mtp_step(&groups, &h).map_err(|e| e.to_string())?;
@@ -731,7 +747,7 @@ fn handle(
             // A prompt chunk's take-in reads this rank's copy of the step's rows (#780), its
             // pieces' rows on the device where the step left them there (#1176).
             exec.set_gather_budget(gather_budget as usize);
-            let groups = crate::model::core::from_wire(&groups)?;
+            let groups = groups_of(&groups, media)?;
             let (parts, dev) = split_device(&parts)?;
             let parts = rows_of(parts, &h, &rows.host[..])?;
             let t0 = std::time::Instant::now();
@@ -776,7 +792,7 @@ fn handle(
             // Rank 0's whole draft round: the same passes from the same picks (#771), reading
             // this rank's copy of the step's rows where rank 0 names them (#780).
             exec.set_gather_budget(gather_budget as usize);
-            let groups = crate::model::core::from_wire(&groups)?;
+            let groups = groups_of(&groups, media)?;
             let parts = rows_of(&parts, &h, &rows.host[..])?;
             let t0 = std::time::Instant::now();
             comm.mark_step(profile);
@@ -819,6 +835,26 @@ fn handle(
             // that chunk's step finds them read instead of waiting for the SSD.
             exec.model().prefetch_ngram_next(&before, &tokens);
             exec.model().prefetch_engram(&before, &tokens);
+            Reply::Done
+        }
+        Request::TpMedia {
+            id,
+            n_embd,
+            spans,
+            rows,
+        } => {
+            // A sequence's images, which rank 0 encoded, for the steps that name them (#1195).
+            if n_embd as usize != exec.hp().n_embd as usize {
+                return Err(format!(
+                    "images of rows {n_embd} wide for a model {} wide",
+                    exec.hp().n_embd
+                ));
+            }
+            media.add(id, n_embd, &spans, &rows)?;
+            Reply::Done
+        }
+        Request::TpMediaDrop { ids } => {
+            media.forget(&ids);
             Reply::Done
         }
         Request::SaveRing {

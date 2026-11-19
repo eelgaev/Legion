@@ -13,7 +13,7 @@
 use std::collections::VecDeque;
 
 use super::Executor;
-use crate::model::core::{Group, Logits, ModelError, SeqInput, StepOutput, batch_shape};
+use crate::model::core::{Group, Logits, Media, ModelError, SeqInput, StepOutput, batch_shape};
 use crate::node::{Link, Reply, Request, WireDraft, WireGroup, WireSeq};
 
 /// Rank 0's link to the layers on rank 1.
@@ -61,8 +61,15 @@ pub fn logits_of(tag: (u8, u32)) -> Result<Logits, String> {
     })
 }
 
-/// `groups` as they go over the link.
+/// `groups` as they go over the link of a model split by layers, which sends no images (a
+/// sequence with images is named by an id the other end does not know: its step fails there).
 pub fn to_wire(groups: &[Group<'_>]) -> Vec<WireGroup> {
+    to_wire_with(groups, |_| u32::MAX)
+}
+
+/// `groups` as they go over the link, a sequence's images as the id `media` gives them
+/// ([`super::tp_media`], #1195).
+pub fn to_wire_with(groups: &[Group<'_>], mut media: impl FnMut(&Media) -> u32) -> Vec<WireGroup> {
     groups
         .iter()
         .map(|g| WireGroup {
@@ -77,14 +84,27 @@ pub fn to_wire(groups: &[Group<'_>]) -> Vec<WireGroup> {
                     blocks: s.blocks.to_vec(),
                     ring: s.ring as u32,
                     logits: logits_tag(s.logits),
+                    media: s.media.map_or(super::tp_media::NONE, &mut media),
                 })
                 .collect(),
         })
         .collect()
 }
 
-/// Groups borrowing `wire` (see [`to_wire`]).
+/// Groups borrowing `wire` (see [`to_wire`]), without images: a sequence that names some fails.
 pub fn from_wire(wire: &[WireGroup]) -> Result<Vec<Group<'_>>, String> {
+    from_wire_with(wire, |id| match id {
+        super::tp_media::NONE => Ok(None),
+        _ => Err("a sequence with images: not over this link".into()),
+    })
+}
+
+/// Groups borrowing `wire` (see [`to_wire_with`]), a sequence's images those `media` finds
+/// for its id.
+pub fn from_wire_with<'a>(
+    wire: &'a [WireGroup],
+    media: impl Fn(u32) -> Result<Option<&'a Media>, String>,
+) -> Result<Vec<Group<'a>>, String> {
     wire.iter()
         .map(|g| {
             Ok(Group {
@@ -100,7 +120,7 @@ pub fn from_wire(wire: &[WireGroup]) -> Result<Vec<Group<'_>>, String> {
                             blocks: &s.blocks,
                             ring: s.ring as usize,
                             logits: logits_of(s.logits)?,
-                            media: None,
+                            media: media(s.media)?,
                         })
                     })
                     .collect::<Result<_, String>>()?,

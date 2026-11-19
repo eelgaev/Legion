@@ -266,6 +266,16 @@ pub fn write_tp(path: impl AsRef<Path>, mtp: Option<&Path>, seed: u64) -> Result
     write_with(path, mtp, seed, IDX_SMALL, HEAD_DIM, true, false)
 }
 
+/// [`write_tp`]'s shapes with [`write_vision`]'s vocabulary: images under tensor parallelism
+/// over machines (#1195).
+pub fn write_tp_vision(
+    path: impl AsRef<Path>,
+    mtp: Option<&Path>,
+    seed: u64,
+) -> Result<(), GgufError> {
+    write_with(path, mtp, seed, IDX_SMALL, HEAD_DIM, true, true)
+}
+
 /// [`write`] with the sparse-attention indexer in the shape ggml-cuda's lightning indexer
 /// supports and attention heads the paged sparse-attention kernels take (128), for tests of
 /// the model on a GPU.

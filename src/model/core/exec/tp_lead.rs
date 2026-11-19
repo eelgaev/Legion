@@ -13,10 +13,11 @@
 use std::sync::Arc;
 
 use super::Executor;
+use super::tp_media::SentMedia;
 use crate::model::core::pair::sum::PairSum;
 use crate::model::core::{Group, ModelError, MtpOutput, StepOutput, head_split};
 use crate::node::local::LocalLink;
-use crate::node::{Link, Reply, Request, RowsPart};
+use crate::node::{Link, Reply, Request, RowsPart, WireGroup};
 use crate::tp_net::{CommHandle, StepProfile};
 
 #[cfg(test)]
@@ -129,6 +130,8 @@ pub struct TpLead {
     /// ([`StepOutput::hidden_dev`]) for the MTP head's take-in, which every other rank did too
     /// (#1176): its pieces name their rows in it ([`RowsPart::Device`]).
     step_dev: Option<crate::ggml::RowsAt>,
+    /// The images the other ranks hold, which steps name by id (#1195).
+    media: SentMedia,
 }
 
 /// The MTP head's take-in of a prompt chunk copies its pieces' rows on the device on every rank
@@ -206,6 +209,7 @@ impl TpLead {
             prev_rows: Vec::new(),
             prev_held: None,
             step_dev: None,
+            media: SentMedia::default(),
         }
     }
 
@@ -228,6 +232,7 @@ impl TpLead {
             prev_rows: Vec::new(),
             prev_held: None,
             step_dev: None,
+            media: SentMedia::default(),
         }
     }
 
@@ -257,6 +262,26 @@ impl TpLead {
                 .map_err(|e| err(format!("rank {}: {e}", i + 1)))?;
         }
         Ok(())
+    }
+
+    /// `groups` as the other ranks read them. Images they do not hold yet go out first, on
+    /// the same connection (#1195), and the ones no sequence here holds any more are forgotten
+    /// there: nothing more without images.
+    fn wire(&mut self, groups: &[Group<'_>]) -> Result<Vec<WireGroup>, ModelError> {
+        if let Some(gone) = self.media.gone() {
+            self.send(&gone)?;
+        }
+        let mut new = Vec::new();
+        let media = &mut self.media;
+        let wire = super::remote::to_wire_with(groups, |m| {
+            let (id, req) = media.id(m);
+            new.extend(req);
+            id
+        });
+        for req in &new {
+            self.send(req)?;
+        }
+        Ok(wire)
     }
 
     /// Reads every answer owed by ranks with at least `owed` of them.
@@ -324,6 +349,12 @@ impl Executor {
         self.tp.as_mut()
     }
 
+    /// `groups` as the other ranks read them, their images sent to them first where they do
+    /// not hold them yet ([`TpLead::wire`]).
+    pub(super) fn tp_wire(&mut self, groups: &[Group<'_>]) -> Result<Vec<WireGroup>, ModelError> {
+        (self.tp.as_mut().expect("tensor-parallel lead")).wire(groups)
+    }
+
     /// [`Self::step`] on every rank (see the module docs).
     pub(super) fn tp_step(&mut self, groups: &[Group<'_>]) -> Result<StepOutput, ModelError> {
         // A greedy decode or verify step's output head, half the vocabulary on each of two
@@ -337,7 +368,7 @@ impl Executor {
             _ => 0,
         };
         let req = Request::TpStep {
-            groups: super::remote::to_wire(groups),
+            groups: self.tp_wire(groups)?,
             micro: self.pipeline_micro as u32,
             taper: self.micro_taper as u32,
             gather_budget: self.gather_budget as u64,
@@ -407,7 +438,7 @@ impl Executor {
             rows: rows.rows as u64,
         });
         let req = Request::TpMtpRows {
-            groups: super::remote::to_wire(groups),
+            groups: self.tp_wire(groups)?,
             gather_budget: self.gather_budget as u64,
             parts,
             h,
@@ -467,18 +498,19 @@ impl Executor {
         groups: &[Group<'_>],
         parts: &[&[f32]],
     ) -> Result<MtpOutput, ModelError> {
+        let wire = self.tp_wire(groups)?;
         let lead = self.tp.as_ref().expect("tensor-parallel lead");
         let req = if lead.local_rows {
             let (parts, h) = self.tp_rows_wire(parts);
             Request::TpMtpRows {
-                groups: super::remote::to_wire(groups),
+                groups: wire,
                 gather_budget: self.gather_budget as u64,
                 parts,
                 h,
             }
         } else {
             Request::TpMtp {
-                groups: super::remote::to_wire(groups),
+                groups: wire,
                 gather_budget: self.gather_budget as u64,
                 h: parts.concat(),
             }

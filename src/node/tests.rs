@@ -28,6 +28,7 @@ fn step() -> Request {
                         blocks: vec![9, 4],
                         ring: 0,
                         logits: (1, 0),
+                        media: 0,
                     },
                     WireSeq {
                         tokens: vec![],
@@ -35,6 +36,7 @@ fn step() -> Request {
                         blocks: vec![],
                         ring: 2,
                         logits: (4, 7),
+                        media: u32::MAX,
                     },
                 ],
             },
@@ -96,6 +98,20 @@ fn requests_round_trip() {
             before: vec![],
             tokens: vec![9],
         },
+        Request::TpMedia {
+            id: 7,
+            n_embd: 2,
+            spans: vec![(3, 2, 1), (9, 1, 1)],
+            rows: vec![0.5, -1.25, f32::MIN_POSITIVE, 3e38, -0.0, 7.0],
+        },
+        Request::TpMedia {
+            id: 2,
+            n_embd: 4096,
+            spans: vec![],
+            rows: vec![],
+        },
+        Request::TpMediaDrop { ids: vec![7, 2] },
+        Request::TpMediaDrop { ids: vec![] },
         Request::TpMtpChain {
             groups: match step() {
                 Request::Step { groups, .. } => groups,
