@@ -133,6 +133,12 @@ struct legion_paged_attn {
     // the loop reaches them. The same bits either way. Picked on the Rust side
     // (paged::d512_prefetch_for). The quad kernel's prefetch is its own (verify_grid 2 / 3).
     int32_t prefetch;
+    // Non-null (a prefill group with images, on a sliding-window layer of a model whose image
+    // tokens see each other both ways, Gemma 4, #1217): [n_tok, n_seqs], each token's last
+    // visible key when that is past its own position (an image token: its image's last token),
+    // else at most its position. Only paged_prefill and paged_prefill_mma read it (the launcher
+    // takes them for such a group); the window still starts from the token's own position.
+    const int32_t * span;
 };
 
 enum { LEGION_KV_F16 = 0, LEGION_KV_Q8_0 = 1, LEGION_KV_Q4_0 = 2 };
@@ -476,6 +482,12 @@ __device__ __forceinline__ int first_key(int pos, int window) {
     return window > 0 ? max(0, pos - window + 1) : 0;
 }
 
+// The last key position token t (at `pos`) of sequence seq sees: `pos`, or its image's last
+// token through p.span (Gemma 4's image tokens on sliding-window layers, #1217).
+__device__ __forceinline__ int span_limit(const legion_paged_attn & p, int seq, int t, int pos) {
+    return p.span ? max(pos, p.span[(int64_t) seq * p.n_tok + min(t, p.n_tok - 1)]) : pos;
+}
+
 // Decode: the blocks [*b_first, *b_end) holding the keys of a sequence of `len` positions.
 __device__ __forceinline__ void decode_blocks(int len, int window, int * b_first, int * b_end) {
     *b_first = first_key(len - 1, window) / BLK;
@@ -726,7 +738,8 @@ __global__ void __launch_bounds__(256) paged_prefill(const legion_paged_attn p) 
     const int dh = warp / RT;  // part: key columns for S, output dims for P V
     const int n_past = p.n_past[seq];
     const int t_last = min(t0 + QT, p.n_tok) - 1;
-    const int nblk = (n_past + t_last) / BLK + 1;
+    // The tile's last query sees the latest keys (span_limit rises with the token).
+    const int nblk = span_limit(p, seq, t_last, n_past + t_last) / BLK + 1;
     // The tile's first query sees the earliest keys; blocks before them are skipped.
     const int b_first = first_key(n_past + t0, p.window) / BLK;
     const Walk wk = walk(p, seq, b_first, nblk - 1);
@@ -779,8 +792,8 @@ __global__ void __launch_bounds__(256) paged_prefill(const legion_paged_attn p) 
     // so the rows' shuffles stay within active warps).
     const int r = threadIdx.x / 4, part = threadIdx.x % 4;
     const bool row_on = ROWS == 64 || r < ROWS;
-    const int limit = n_past + t0 + r / G;  // last visible key of row r
-    const int lo    = first_key(limit, p.window);  // first visible key of row r
+    const int limit = span_limit(p, seq, t0 + r / G, n_past + t0 + r / G);  // last visible key of row r
+    const int lo    = first_key(n_past + t0 + r / G, p.window);  // first visible key of row r
 
     // Pass 1: each row's max and sum of exp.
     float m = -INFINITY, l = 0.0f;
@@ -924,20 +937,24 @@ int launch(const legion_paged_attn & p, cudaStream_t st) {
         if (p.max_split > 1) {
             paged_combine<D><<<dim3(p.n_head, p.n_seqs), D, 0, st>>>(p);
         }
-    } else if (const int rc = use_m884() && p.k_type == LEGION_KV_F16 && p.v_type == LEGION_KV_F16
+    } else if (const int rc = use_m884() && p.k_type == LEGION_KV_F16 && p.v_type == LEGION_KV_F16 && !p.span
                                   ? v70::launch<D, G, C>(p, st)
                                   : -1;
                rc >= 0) {
         return rc;
-    } else if (const int rc = use_ffma() && p.k_type == LEGION_KV_F16 && p.v_type == LEGION_KV_F16 && !p.split
+    } else if (const int rc = use_ffma() && p.k_type == LEGION_KV_F16 && p.v_type == LEGION_KV_F16 && !p.split && !p.span
                                   ? tu75::launch<D, G, C>(p, st)
                                   : -1;
                rc >= 0) {
         return rc;  // -1: Q's rows unaligned, the default kernels instead
     } else if (fa::available()) {
         // A split scratch (--paged-verify-split): small groups split over the key blocks.
-        if (p.max_split > 1 && !p.piece_blk && !p.ml) {
+        if (p.max_split > 1 && !p.piece_blk && !p.ml && !p.span) {
             return fa::launch_split<D, G, C>(p, st);
+        }
+        // Image spans (#1217): paged_prefill_mma reads them, the variants below do not.
+        if (p.span) {
+            return fa::launch<D, G, C>(p, st);
         }
         // Heads of 256, 6 query heads a kv head (Qwen3.8-27B): a small group takes the wide-grid
         // kernel where p.verify_grid says so (#689), the same bits.
@@ -969,9 +986,9 @@ int launch(const legion_paged_attn & p, cudaStream_t st) {
         return fa::launch<D, G, C>(p, st);
     } else if (p.k_type != LEGION_KV_F16 || p.v_type != LEGION_KV_F16) {
         return 1;  // the WMMA kernel reads F16 only (legion_paged_attn_quant_ok)
-    } else if (p.split && p.split_seqs > 0 && !p.piece_blk && p.vsplit_chunk == 0) {
+    } else if (p.split && p.split_seqs > 0 && !p.piece_blk && p.vsplit_chunk == 0 && !p.span) {
         return split::launch<D, G, C>(p, st);
-    } else if (const int rc = p.split && p.split_seqs > 0 && !p.piece_blk && !p.ml && p.vsplit_chunk > 0
+    } else if (const int rc = p.split && p.split_seqs > 0 && !p.piece_blk && !p.ml && p.vsplit_chunk > 0 && !p.span
                                   ? vsplit::launch<D, G, C>(p, st)
                                   : -1;
                rc >= 0) {

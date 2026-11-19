@@ -29,10 +29,19 @@ pub fn preprocess(hp: &VisionHparams, bytes: &[u8]) -> Result<Preprocessed, Visi
     )?;
 
     // Ported from llama.cpp's tools/mtmd/mtmd-image.cpp (MIT),
-    // img_tool::resize with PAD_CEIL and mtmd_image_preprocessor_dyn_size.
-    let scale = (width as f32 / img.width() as f32).min(height as f32 / img.height() as f32);
-    let resized_w = ((img.width() as f32 * scale).ceil() as u32).min(width);
-    let resized_h = ((img.height() as f32 * scale).ceil() as u32).min(height);
+    // img_tool::resize with PAD_CEIL (Qwen3-VL) or PAD_NONE (Gemma 4: straight to the aligned
+    // size, the aspect ratio as near as alignment allows) and mtmd_image_preprocessor_dyn_size.
+    let (resized_w, resized_h) = match hp.projector {
+        super::Projector::Gemma4v => (width, height),
+        super::Projector::Qwen3vl => {
+            let scale =
+                (width as f32 / img.width() as f32).min(height as f32 / img.height() as f32);
+            (
+                ((img.width() as f32 * scale).ceil() as u32).min(width),
+                ((img.height() as f32 * scale).ceil() as u32).min(height),
+            )
+        }
+    };
     let rgb = resize_bicubic(
         img.as_raw(),
         img.width() as usize,

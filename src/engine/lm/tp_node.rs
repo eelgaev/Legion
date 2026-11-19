@@ -934,7 +934,8 @@ fn handle(
                     exec.hp().n_embd
                 ));
             }
-            media.add(id, n_embd, &spans, &rows)?;
+            let layout = exec.model().hp.arch.image_layout();
+            media.add(id, n_embd, &spans, &rows, layout)?;
             Reply::Done
         }
         Request::TpMediaDrop { ids } => {

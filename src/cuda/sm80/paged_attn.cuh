@@ -138,7 +138,9 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, Shape<D>::MINB) paged_prefi
     // 5 tokens, 60 columns), repeat the tile's last token and are not written.
     auto tok_of = [&](int c) { return min(t0 + min(c / G, QT - 1), p.n_tok - 1); };
     auto pos_of = [&](int c) { return n_past + tok_of(c); };
-    const int k_end   = pos_of(COLS - 1) + 1;  // keys at or past k_end are never visible
+    // Column c's last visible key: its position, or later for an image token (span_limit).
+    auto lim_of = [&](int c) { return span_limit(p, seq, tok_of(c), pos_of(c)); };
+    const int k_end   = lim_of(COLS - 1) + 1;  // keys at or past k_end are never visible
     const int b_first = first_key(pos_of(0), p.window) / BLK;
     const int b_last  = (k_end - 1) / BLK;
     // SPLIT: this CTA's run of the tile's blocks (split_blocks).
@@ -156,13 +158,15 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, Shape<D>::MINB) paged_prefi
 
     // This warp's columns (for skipping and unmasked tiles) and this thread's two columns of
     // the S^T / O^T fragments, 2 tq + {0, 1}.
-    const int w_pos_lo = pos_of(warp * 8), w_pos_hi = pos_of(warp * 8 + 7);
-    const int w_first_lo = first_key(w_pos_lo, p.window), w_first_hi = first_key(w_pos_hi, p.window);
+    // (The limits rise with the column, as the positions do: an image's tokens see up to its
+    // last one, the text after it is past that.)
+    const int w_pos_lo = lim_of(warp * 8), w_pos_hi = lim_of(warp * 8 + 7);
+    const int w_first_lo = first_key(pos_of(warp * 8), p.window), w_first_hi = first_key(pos_of(warp * 8 + 7), p.window);
     int c_pos[2], c_first[2];
 #pragma unroll
     for (int j = 0; j < 2; j++) {
-        c_pos[j]   = pos_of(warp * 8 + 2 * tq + j);
-        c_first[j] = first_key(c_pos[j], p.window);
+        c_pos[j]   = lim_of(warp * 8 + 2 * tq + j);
+        c_first[j] = first_key(pos_of(warp * 8 + 2 * tq + j), p.window);
     }
 
     // Q as B fragments (k = dims, n = columns): column gq, dims 2 tq + {0, 1} and + 8.

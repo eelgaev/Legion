@@ -1,14 +1,16 @@
-//! Images in prompts (#146, `--mmproj`; #1195): the vision tower of a Qwen3.5 / Qwen3.6 /
-//! Qwen3.8-Flash-Next mmproj, or the one an HF checkpoint ships (`model.visual.*`), and how a
-//! request's images become its tokens and their input rows.
+//! Images in prompts (#146, `--mmproj`; #1195; #1217): the vision tower of a Qwen3.5 / Qwen3.6 /
+//! Qwen3.8-Flash-Next or Gemma 4 mmproj, or the one an HF checkpoint ships (`model.visual.*`,
+//! `model.vision_tower.*`), and how a request's images become its tokens and their input rows.
 //!
-//! The chat template renders one `<|vision_start|><|image_pad|><|vision_end|>` per image, in the
-//! order the messages carry them. Each `<|image_pad|>` becomes `nx × ny` of itself, one per
-//! merged patch: [`Vision::expand`] needs only the preprocessed size, so token counting does not
-//! run the tower. [`Vision::encode`] then runs it, giving the sequence's [`Media`] (the rows
-//! and M-RoPE positions the model reads) and its prefix-cache key: the prompt with every image
-//! token replaced by an id from the image's hash, above any vocabulary, so the prefix cache
-//! matches an image only against the same image.
+//! Qwen's chat template renders one `<|vision_start|><|image_pad|><|vision_end|>` per image, in
+//! the order the messages carry them. Each `<|image_pad|>` becomes `nx × ny` of itself, one per
+//! merged patch. Gemma 4's renders one `<|image|>`, which becomes `<|image>`, `nx × ny` of
+//! itself and `<image|>` (as llama.cpp's mtmd places Gemma 4's images). [`Vision::expand`] needs
+//! only the preprocessed size, so token counting does not run the tower. [`Vision::encode`]
+//! then runs it, giving the sequence's [`Media`] (the rows and positions the model reads) and
+//! its prefix-cache key: the prompt with every image token replaced by an id from the image's
+//! hash, above any vocabulary, so the prefix cache matches an image only against the same
+//! image.
 //!
 //! The tower runs one image at a time on the language model's first GPU (Legion's kernels on a
 //! stream of its own, so other sequences keep decoding; #1195), or on the CPU without one
@@ -21,7 +23,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::ggml::Backend;
 use crate::gguf::GgufFile;
-use crate::model::core::{ImageSpan, Media};
+use crate::model::core::{ImageLayout, ImageSpan, Media};
 use crate::tokenizer::Tokenizer;
 use crate::vision::{
     Encoder, EncoderConfig, ImageEmbedding, Preprocessed, VisionError, VisionHparams,
@@ -30,8 +32,14 @@ use crate::vision::{
 use super::super::{EngineError, ImageInput};
 use super::LoadError;
 
-/// The placeholder token each image's tokens repeat.
+/// The placeholder token each image's tokens repeat (Qwen-VL).
 const IMAGE_PAD: &str = "<|image_pad|>";
+
+/// Gemma 4's image placeholder (one per image in its template, repeated per image token), and
+/// the tokens around an image's tokens (llama.cpp's mtmd, `PROJECTOR_TYPE_GEMMA4V`).
+const GEMMA_IMAGE: &str = "<|image|>";
+const GEMMA_IMAGE_OPEN: &str = "<|image>";
+const GEMMA_IMAGE_CLOSE: &str = "<image|>";
 
 /// Most CPU threads the tower takes, so other work on the host keeps some cores.
 const MAX_THREADS: usize = 8;
@@ -45,11 +53,73 @@ const ROW_CACHE_BYTES: usize = 256 << 20;
 /// reference does: the placeholders stay in the token stream).
 const ARCHS: [&str; 3] = ["qwen35", "qwen35moe", "qwen4exp"];
 
+/// Gemma 4 (#1217): one position per image token, `<|image>` and `<image|>` around them.
+const GEMMA_ARCH: &str = "gemma4";
+
 pub(super) struct Vision {
     tower: Mutex<Tower>,
     hp: VisionHparams,
-    image_pad: u32,
+    marks: Marks,
     rows: Mutex<RowCache>,
+}
+
+/// How a model's prompts mark images.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Marks {
+    /// The placeholder the template renders once per image, repeated once per image token.
+    pad: u32,
+    /// Tokens put before and after an image's tokens (the template's placeholder has none).
+    open: Option<u32>,
+    close: Option<u32>,
+    layout: ImageLayout,
+}
+
+impl Marks {
+    /// The marks of language models of architecture `arch`, from `tokenizer`.
+    fn of(arch: &str, tokenizer: &Tokenizer) -> Result<Self, String> {
+        let id =
+            |t: &str| (tokenizer.token_id(t)).ok_or_else(|| format!("the tokenizer has no {t}"));
+        Ok(if arch == GEMMA_ARCH {
+            Marks {
+                pad: id(GEMMA_IMAGE)?,
+                open: Some(id(GEMMA_IMAGE_OPEN)?),
+                close: Some(id(GEMMA_IMAGE_CLOSE)?),
+                layout: ImageLayout::Sequential,
+            }
+        } else {
+            Marks {
+                pad: id(IMAGE_PAD)?,
+                open: None,
+                close: None,
+                layout: ImageLayout::MRope,
+            }
+        })
+    }
+}
+
+/// `tokens` with each placeholder of `marks` (one per image, in order) expanded to its image's
+/// tokens, for images of `grids` (`nx × ny` tokens each), and where each image's tokens start.
+fn expand_tokens(
+    tokens: &[u32],
+    marks: &Marks,
+    grids: &[(usize, usize)],
+) -> (Vec<u32>, Vec<usize>) {
+    let n: usize = grids.iter().map(|&(x, y)| x * y + 2).sum();
+    let mut out = Vec::with_capacity(tokens.len() + n);
+    let mut starts = Vec::with_capacity(grids.len());
+    let mut grids = grids.iter();
+    for &t in tokens {
+        if t != marks.pad {
+            out.push(t);
+            continue;
+        }
+        let &(nx, ny) = grids.next().expect("a grid per placeholder");
+        out.extend(marks.open);
+        starts.push(out.len());
+        out.extend(std::iter::repeat_n(marks.pad, nx * ny));
+        out.extend(marks.close);
+    }
+    (out, starts)
 }
 
 /// Where the tower runs.
@@ -175,7 +245,7 @@ impl Vision {
         let err = |e: String| LoadError::Device(format!("--mmproj {}: {e}", path.display()));
         Self::check_arch(arch).map_err(err)?;
         let g = GgufFile::open(path).map_err(|e| err(e.to_string()))?;
-        Self::from_gguf(&g, n_embd, tokenizer, threads, gpu).map_err(err)
+        Self::from_gguf(&g, arch, n_embd, tokenizer, threads, gpu).map_err(err)
     }
 
     /// The vision tower the HF checkpoint `dir` ships (`model.visual.*`), if it has one, for a
@@ -195,33 +265,41 @@ impl Vision {
         let Some(g) = crate::hf::open_vision(dir).map_err(|e| e.to_string())? else {
             return Ok(None);
         };
-        Self::from_gguf(&g, n_embd, tokenizer, threads, gpu).map(Some)
+        Self::from_gguf(&g, arch, n_embd, tokenizer, threads, gpu).map(Some)
     }
 
     fn check_arch(arch: &str) -> Result<(), String> {
-        if ARCHS.contains(&arch) {
+        if ARCHS.contains(&arch) || arch == GEMMA_ARCH {
             return Ok(());
         }
         Err(format!(
-            "images need a Qwen3.5 / Qwen3.6 / Qwen3.8-Flash-Next language model ({}), not {arch}",
+            "images need a Qwen3.5 / Qwen3.6 / Qwen3.8-Flash-Next or Gemma 4 language model \
+             ({}, {GEMMA_ARCH}), not {arch}",
             ARCHS.join(", ")
         ))
     }
 
-    /// The tower `g` (an mmproj, or a checkpoint's tower opened as one).
+    /// The tower `g` (an mmproj, or a checkpoint's tower opened as one) for a language model
+    /// of architecture `arch`.
     fn from_gguf(
         g: &GgufFile,
+        arch: &str,
         n_embd: usize,
         tokenizer: &Tokenizer,
         threads: usize,
         gpu: Option<usize>,
     ) -> Result<Self, String> {
-        let image_pad = tokenizer
-            .token_id(IMAGE_PAD)
-            .ok_or_else(|| format!("the tokenizer has no {IMAGE_PAD}"))?;
+        let marks = Marks::of(arch, tokenizer)?;
         let mut backend = Backend::cpu().map_err(|e| e.to_string())?;
         backend.set_threads(threads.clamp(1, MAX_THREADS));
         let encoder = Encoder::from_gguf(g, backend).map_err(|e| e.to_string())?;
+        let gemma = encoder.hparams().projector == crate::vision::Projector::Gemma4v;
+        if gemma != (arch == GEMMA_ARCH) {
+            return Err(format!(
+                "a {} vision tower for a {arch} language model",
+                if gemma { "Gemma 4" } else { "Qwen-VL" }
+            ));
+        }
         let out = encoder.config().n_out;
         if out != n_embd {
             return Err(format!(
@@ -241,7 +319,7 @@ impl Vision {
         Ok(Self {
             tower: Mutex::new(tower),
             hp,
-            image_pad,
+            marks,
             rows: Mutex::new(RowCache::default()),
         })
     }
@@ -252,13 +330,14 @@ impl Vision {
         self.tower.lock().unwrap().scratch_bytes()
     }
 
-    /// Expands each `<|image_pad|>` of `tokens` (one per image, in order) to its image's tokens.
+    /// Expands each image placeholder of `tokens` (one per image, in order) to its image's
+    /// tokens (with Gemma 4's `<|image>` and `<image|>` around them).
     pub(super) fn expand(
         &self,
         tokens: Vec<u32>,
         images: &[&ImageInput],
     ) -> Result<(Vec<u32>, Vec<Pending>), EngineError> {
-        let pads = tokens.iter().filter(|&&t| t == self.image_pad).count();
+        let pads = tokens.iter().filter(|&&t| t == self.marks.pad).count();
         if pads != images.len() {
             return Err(EngineError::InvalidRequest(format!(
                 "{} images, but the prompt has {pads} image placeholders",
@@ -267,15 +346,8 @@ impl Vision {
         }
         let hp = &self.hp;
         let merge = hp.spatial_merge_size as usize;
-        let mut out = Vec::with_capacity(tokens.len());
         let mut pending = Vec::with_capacity(images.len());
-        let mut images = images.iter();
-        for t in tokens {
-            if t != self.image_pad {
-                out.push(t);
-                continue;
-            }
-            let img = images.next().expect("as many images as placeholders");
+        for img in images {
             let pixels = crate::vision::preprocess(hp, &img.bytes)
                 .map_err(|e| EngineError::InvalidRequest(format!("image: {e}")))?;
             let (nx, ny) = (
@@ -285,13 +357,17 @@ impl Vision {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             img.bytes.hash(&mut h);
             pending.push(Pending {
-                start: out.len(),
+                start: 0,
                 nx,
                 ny,
                 pixels,
                 hash: h.finish(),
             });
-            out.extend(std::iter::repeat_n(self.image_pad, nx * ny));
+        }
+        let grids: Vec<_> = pending.iter().map(|p| (p.nx, p.ny)).collect();
+        let (out, starts) = expand_tokens(&tokens, &self.marks, &grids);
+        for (p, s) in pending.iter_mut().zip(starts) {
+            p.start = s;
         }
         Ok((out, pending))
     }
@@ -353,7 +429,8 @@ impl Vision {
                 rows,
             });
         }
-        Ok((Arc::new(Media::new(spans, n_embd)), key))
+        let media = Media::with_layout(spans, n_embd, self.marks.layout);
+        Ok((Arc::new(media), key))
     }
 }
 

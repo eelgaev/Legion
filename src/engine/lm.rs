@@ -8292,6 +8292,7 @@ impl Worker {
             budget = KV_BLOCK;
         }
         let mut chunks = Vec::new();
+        let bidir = self.exec.model().hp.arch.image_tokens_bidirectional();
         for (i, seq) in prefilling.iter_mut().enumerate() {
             let take = if riders && !chunks.is_empty() {
                 chunk.min(budget).min(ride)
@@ -8301,6 +8302,8 @@ impl Worker {
             if take == 0 {
                 break;
             }
+            // The most this step can hold of the prompt (the batch, rings and riders allow it).
+            let room = take;
             let take = if self.prefill_even || tier_pass {
                 even::even_take(
                     seq.prompt.len() - seq.n_past,
@@ -8311,12 +8314,17 @@ impl Worker {
                 take
             };
             let end = self.save_cut(seq, (seq.n_past + take).min(seq.prompt.len()));
+            // An image whose tokens see each other runs in one step when it fits one (#1217).
+            let end = match seq.media() {
+                Some(m) if bidir => m.uncut(seq.n_past, end, room),
+                _ => end,
+            };
             let len = end - seq.n_past;
             if len == 0 {
                 continue;
             }
             self.grow(seq, end)?;
-            budget -= len;
+            budget = budget.saturating_sub(len);
             // A lead of at most a micro-chunk runs in one graph with the riders: they share it.
             if !chunks.is_empty() || len <= micro {
                 ride = ride.saturating_sub(len);

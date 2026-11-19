@@ -339,6 +339,17 @@ impl Arch for Gemma4Params {
         self.window
     }
 
+    /// As llama.cpp's Gemma 4 (non-causal image batches on the sliding-window layers only):
+    /// an image's tokens see the whole image there; the global layers stay causal. The small
+    /// models with per-layer embeddings (E2B, E4B) stay causal throughout, as there.
+    fn image_tokens_bidirectional(&self) -> bool {
+        self.n_embd_per_layer == 0
+    }
+
+    fn image_layout(&self) -> crate::model::core::ImageLayout {
+        crate::model::core::ImageLayout::Sequential
+    }
+
     fn fill_inputs(
         &self,
         m: &Model,
