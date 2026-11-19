@@ -40,6 +40,7 @@ mod early;
 mod freeing;
 mod headroom;
 mod launch_ahead;
+mod lend_decode;
 mod mtp_ahead;
 mod mtp_chain;
 mod mtp_graphs;
@@ -4390,6 +4391,48 @@ impl Executor {
         Ok(true)
     }
 
+    /// Marks the lend as a short prompt's, or not ([`ExpertResidency::set_short_lend`], #37):
+    /// its steps build an unlent step's ops over the staged copies. A change drops the kept
+    /// prompt graphs first (built for the other kind of lend), and the kept decode graphs big
+    /// enough to stage on either side of it ([`lend_decode`]). Nothing without a lend.
+    ///
+    /// [`ExpertResidency::set_short_lend`]: crate::residency::experts::ExpertResidency::set_short_lend
+    pub fn set_short_lend(&mut self, on: bool) -> Result<(), ModelError> {
+        let on = on && self.model.experts().is_some_and(|r| r.is_lent());
+        if self.model.experts().is_none_or(|r| r.short_lend() == on) {
+            return Ok(());
+        }
+        self.wait_commit();
+        self.flush_deferred()?;
+        self.drop_mixed();
+        let Some(r) = self.model.experts_mut() else {
+            return Ok(());
+        };
+        let before = r.stage_from();
+        r.set_short_lend(on);
+        let floor = before.min(r.stage_from());
+        drop(self.take_staging_decode(floor));
+        Ok(())
+    }
+
+    /// Takes every stage's kept decode graphs of at least `floor` tokens out
+    /// ([`lend_decode::take_staging`]), for the caller to drop (a meta backend's, which share its
+    /// buffer, are dropped here), and drops the MTP head's decode-pass graphs of as many.
+    fn take_staging_decode(&mut self, floor: i64) -> Vec<Box<dyn Send>> {
+        let mut taken: Vec<Box<dyn Send>> = Vec::new();
+        for s in &mut self.stages {
+            let gone = lend_decode::take_staging(&mut s.decode, floor);
+            if !s.backend.is_meta() {
+                taken.extend(gone.into_iter().map(|g| Box::new(g) as Box<dyn Send>));
+            }
+        }
+        self.mtp_decode.drop_staging(floor);
+        for g in &mut self.par_mtp {
+            g.decode.drop_staging(floor);
+        }
+        taken
+    }
+
     /// Whether stage `s` keeps a spare compute buffer through a lend ([`spare`]): it runs
     /// verify steps and has buffers of its own per kept graph (not a meta backend's shared one).
     fn wants_spare(&self, s: usize) -> bool {
@@ -4470,7 +4513,10 @@ impl Executor {
             return Ok(());
         }
         let t = std::time::Instant::now();
-        let mut graphs: Vec<Box<dyn Send>> = Vec::new();
+        // Decode graphs big enough to have staged in this lend read its staging, which the
+        // restore releases ([`lend_decode`]): built again on their next step.
+        let floor = self.model.experts().map_or(i64::MAX, |r| r.stage_from());
+        let mut graphs = self.take_staging_decode(floor);
         for s in &mut self.stages {
             // A meta backend's kept graphs share its buffers: dropped here, as before.
             if s.backend.is_meta() {
