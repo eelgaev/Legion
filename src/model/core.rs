@@ -4579,21 +4579,26 @@ impl Model {
                 } else {
                     None
                 };
+                // The bounded host tier has no staged copies: its prompt chunks run the fused
+                // op in place, over the RAM slots and the staging buffer.
+                let in_place = t.bounded() && n >= HOST_TIER_FUSED_TOKENS;
+                // A short prompt's lend (#37) stages with an unlent step's ops: the fused op
+                // only where an unlent step runs it in place, else the products below.
+                let staged_fused = !t.short_lend() || fused == Some(MoeKernel::Fused) || in_place;
                 // With split waits, the op itself waits for each piece of the layer's copy.
-                summed = t.staged_split(ctx, graph, h, n, |x, ws, stage| {
-                    let (pair, stage) = (self.moe_pair_out, Some(stage));
-                    moe_ffn::moe_ffn_staged_shexp(ctx, x, ids, w2, refs(ws), pair, stage, shexp)
-                });
-                if summed.is_none() {
+                if staged_fused {
+                    summed = t.staged_split(ctx, graph, h, n, |x, ws, stage| {
+                        let (pair, stage) = (self.moe_pair_out, Some(stage));
+                        moe_ffn::moe_ffn_staged_shexp(ctx, x, ids, w2, refs(ws), pair, stage, shexp)
+                    });
+                }
+                if summed.is_none() && staged_fused {
                     // A short step copies only the experts it routes to (`route_gate`).
                     summed = t.staged_routed(ctx, graph, h, Some(selected), n, |x, ws| {
                         let pair = self.moe_pair_out;
                         moe_ffn::moe_ffn_shexp(ctx, x, ids, w2, refs(ws), pair, shexp)
                     });
                 }
-                // The bounded host tier has no staged copies: its prompt chunks run the fused
-                // op in place, over the RAM slots and the staging buffer.
-                let in_place = t.bounded() && n >= HOST_TIER_FUSED_TOKENS;
                 if summed.is_none() && (fused == Some(MoeKernel::Fused) || in_place) {
                     // Forced: in place (on a GPU, host experts over the link).
                     summed = Some(moe_ffn::moe_ffn_shexp(
@@ -4611,7 +4616,26 @@ impl Model {
             if summed.is_some() {
                 None
             } else {
-                match t.staged_experts(ctx, graph, x, ids, selected, n) {
+                let staged = if t.short_lend() {
+                    // A short prompt's lend: the products `mm` below takes for steps past the
+                    // small steps' kernels (`residency::experts::short_stage_min`), over the
+                    // staged copies (indexed like the tiered tensors).
+                    t.staged_routed(ctx, graph, x, Some(selected), n, |x, ws| {
+                        let mm = |w: Tensor<'a>, x: Tensor<'a>| {
+                            if mmq_ids::usable(w, x, ids) {
+                                mmq_ids::mul_mat_id(ctx, w, x, ids)
+                            } else {
+                                ctx.mul_mat_id(w, x, ids)
+                            }
+                        };
+                        let up = mm(ws[0], x);
+                        let gate = mm(ws[1], x);
+                        mm(ws[2], ctx.mul(ctx.silu(gate), up))
+                    })
+                } else {
+                    t.staged_experts(ctx, graph, x, ids, selected, n)
+                };
+                match staged {
                     Some(out) => Some(out),
                     None => {
                         // Small steps: Legion's expert matvec reads the misses at the link rate.
