@@ -164,6 +164,8 @@ off. llama.cpp runs across two DGX Sparks with its RPC backend (layer split).
 | Engine | Weights | Drafting | Decode, 1 user | 4 users | 16 users | Prefill 8K | 32K | 123K |
 |---|---|---|--:|--:|--:|--:|--:|--:|
 | Legion | QAT UD-Q4_K_XL GGUF | MTP ¹¹ | 37-66 | 119.9 | 202.6 | 975 | 925 | 744 |
+| Legion | NVFP4 | DFlash 2 ¹⁹ | 32-58 | 117.6 | **329.6** | **2,787** | **2,525** | — |
+| vLLM 0.33.0 | NVFP4 | DFlash 2 ⁶ | 35-60 | 124.2 | 290.1 | 2,381 | 1,612 | — |
 
 #### AC922, 2x V100
 
@@ -238,7 +240,10 @@ right after the load, not the fixed benchmark prompts; prefill is one request ea
 ¹⁸ Strata's own speculative decoding (`--spec 4`) and int8 KV; its output differs from Legion's. 64 and 32 GB with
 `--resident-budget-gib 40` and `8` (see the run command).
 
-Measured 2026-10-20 to 2026-11-15. Each new speed record is added here.
+¹⁹ Tensor parallel over one QSFP link, with output-moving opt-in flags (see the run command). 123K was not measured
+for either engine: the prompt takes both Sparks above 80 C within a minute.
+
+Measured 2026-10-20 to 2026-11-20. Each new speed record is added here.
 
 ## Roadmap
 
@@ -275,6 +280,7 @@ The exact `legion serve` command behind every row of the tables, and how it was 
 - [Gemma 4 31B QAT UD-Q4_K_XL, 2x Spark (tensor parallel)](docs/run/spark/gemma-4-31b-qat-ud-q4-k-xl-2x-tp.md)
 - [Gemma 4 31B QAT UD-Q4_K_XL, 1x Spark](docs/run/spark/gemma-4-31b-qat-ud-q4-k-xl-1x.md)
 - [Gemma 4 31B NVFP4 (RedHatAI), 1x Spark](docs/run/spark/gemma-4-31b-nvfp4-1x.md)
+- [Gemma 4 31B NVFP4 (RedHatAI), 2x Spark (tensor parallel)](docs/run/spark/gemma-4-31b-nvfp4-2x-tp.md)
 
 **IBM AC922**
 

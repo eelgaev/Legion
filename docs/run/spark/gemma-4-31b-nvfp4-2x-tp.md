@@ -33,11 +33,16 @@ legion serve \
 # rank 1: the same without --port, with --tp-rank 1
 ```
 
-Deterministic client: the same 8 fixed prompts as the 1x row, temperature 0, 256 tokens each (2026-11-19, one
-session). 1 user 32.3 (story) to 58.2 (code), median 42.2, mean accepted length 3.32, the same tokens as the 1x
-command over two Sparks without `--tp-head-split`, `--tp-rails 2` and `--tp-wire bf16`; 113.9 tok/s at 4 users; 323.7 at 16 users (one round).
-Prefill 8K 2,373 and 32K 2,166 tok/s, one request each after an 8K warm-up, from the same server. 123K was not
-measured (one Spark ran too hot during the long prefills).
+Deterministic client: the same 8 fixed prompts as the 1x row, temperature 0, 256 tokens each (2026-11-20, one
+session, after the prompt-step halves below). 1 user 31.8 (story) to 58.2 (code), median 41.8 over 2 rounds, mean
+accepted length 3.30, the same tokens in both rounds; 117.6 tok/s at 4 users (2 rounds, 117.4 / 117.8); 329.6 at
+16 users (the median of 4 rounds, 272.0-339.4; mean accepted length 3.10). Prefill 8K 2,787 and 32K 2,525 tok/s,
+one request each after an 8K warm-up, from the same server. 123K was not measured: it took both Sparks from 69 to
+80 and 86 C within a minute, and the run stopped at 85 C.
+
+The 2026-11-19 numbers before the halves (one session): 1 user 32.3-58.2, median 42.2 (the same tokens as the 1x
+command over two Sparks without `--tp-head-split`, `--tp-rails 2` and `--tp-wire bf16`), 113.9 tok/s at 4 users,
+323.7 at 16 users (one round), prefill 8K 2,373 and 32K 2,166.
 
 The 1x command over two Sparks as it is (only `--tp-rank`/`--tp-peers` and `--tp-profile 1` added), same day:
 1 user 29.6-53.8 (median 38.7-39.1 in five runs), 4 users 105.2-109.4, 16 users 259.9-274.9, prefill 8K
