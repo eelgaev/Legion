@@ -32,15 +32,15 @@ fn kinds_pick_their_drafters() {
         ..Default::default()
     };
     assert!(matches!(
-        Drafting::new(&cfg(SpecKind::None), &info, 0),
+        Drafting::new(&cfg(SpecKind::None), &info, 0, None),
         Ok(Drafting::Off)
     ));
     assert!(matches!(
-        Drafting::new(&cfg(SpecKind::Ngram), &info, 0),
+        Drafting::new(&cfg(SpecKind::Ngram), &info, 0, None),
         Ok(Drafting::Tokens(_))
     ));
     assert!(matches!(
-        Drafting::new(&cfg(SpecKind::Mtp), &info, 0),
+        Drafting::new(&cfg(SpecKind::Mtp), &info, 0, None),
         Ok(Drafting::Mtp(_))
     ));
 }

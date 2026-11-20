@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::engine::sampling::{Dist, Sampler};
 use crate::model::core::{Executor, Group, Logits, Media, PassRow, SeqInput};
 use crate::spec::accept::Target;
-use crate::spec::dflash::{DflashDrafter, DflashOptions};
+use crate::spec::dflash::{DflashDrafter, DflashOptions, TpShare};
 use crate::spec::draft::DraftModel;
 use crate::spec::dspark::{DsparkDrafter, DsparkOptions};
 use crate::spec::eagle3::{Eagle3Drafter, Eagle3Options};
@@ -37,10 +37,12 @@ pub(super) enum Drafting {
 impl Drafting {
     /// The drafter `cfg` asks for, or why there is none yet. A DFlash drafter scores its drafts
     /// with the first `dflash_vocab` rows of the target's head (`--spec-draft-vocab`; 0: all).
+    /// `tp`: this rank's share of a DFlash drafter's FFN (`--tp-draft-split`).
     pub(super) fn new(
         cfg: &SpecConfig,
         target: &TargetInfo,
         dflash_vocab: usize,
+        tp: Option<TpShare>,
     ) -> Result<Self, String> {
         if !cfg.enabled() {
             return Ok(Drafting::Off);
@@ -65,6 +67,7 @@ impl Drafting {
                 draft_vocab: dflash_vocab,
                 lm_head: cfg.draft_lm_head,
                 batched_attn: cfg.draft_batched_attn,
+                tp,
                 ..Default::default()
             };
             if cfg.draft_window > 0 {

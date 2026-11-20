@@ -953,3 +953,235 @@ fn hugging_face_names_and_configs() {
     v["dflash_config"]["target_layer_ids"] = serde_json::json!([]);
     assert!(matches!(cfg(v), Err(ConfigError::Invalid(_))));
 }
+
+/// `--tp-draft-split`: the FFN sums of a round, one a layer of each draft pass.
+#[test]
+fn round_sums_follow_the_draft_passes() {
+    let s = RoundShape {
+        v2: false,
+        n_layer: 5,
+        n_embd: 4,
+        block: 8,
+        first: 1,
+    };
+    // DFlash: a pass per request asking for drafts, `max` rows after the first, the block at
+    // most; none for a request without drafts or tokens.
+    let reqs = [(3, true), (0, true), (5, false), (20, true)];
+    assert_eq!(round_sums(s, reqs.into_iter()), [[16; 5], [32; 5]].concat());
+    // DFlash 2: one pass over every asking request's block.
+    let v2 = RoundShape { v2: true, ..s };
+    assert_eq!(
+        round_sums(v2, [(3, true), (0, true), (20, true)].into_iter()),
+        vec![64; 5]
+    );
+    assert!(round_sums(v2, [(0, true), (4, false)].into_iter()).is_empty());
+    assert_eq!(sums_left(&[1, 2, 3], 1), &[2, 3]);
+    assert!(sums_left(&[1, 2, 3], 7).is_empty());
+}
+
+/// `--tp-draft-split` over two ranks (threads, loopback): a round that fails on rank 0 before
+/// its sums (rows it refuses) still ends rank 1's round at once, leaves both communicators
+/// usable, and the next sequence drafts as one whole drafter does.
+#[test]
+fn a_failed_draft_split_round_ends_the_other_ranks() {
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Barrier;
+    use std::time::{Duration, Instant};
+
+    let fx = Fixture::new();
+    let c = TinyDraft {
+        n_ff: 128,
+        ..TinyDraft::default()
+    };
+    let hf = fx.root.join("hf");
+    tiny::write_hf(&hf, &c, HfDtype::F32).unwrap();
+    let tokens = tokens_to(13);
+    let whole = step(&mut fx.load(&hf, sampling(64)), 2, &tokens, 0, 12, 7, 0);
+
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let a = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+    let (b, _) = l.accept().unwrap();
+    let done = Arc::new(Barrier::new(2));
+    let ranks: Vec<_> = [a, b]
+        .into_iter()
+        .enumerate()
+        .map(|(rank, stream)| {
+            let (info, tokens, done) = (fx.info(&hf), tokens.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut data = vec![None, None];
+                data[1 - rank] = Some(stream);
+                let comm = crate::tp_net::Comm::new(rank, data, Duration::from_secs(20)).unwrap();
+                let handle = crate::tp_net::register(comm);
+                let tp = TpShare {
+                    comm: handle.id(),
+                    rank,
+                    n_ranks: 2,
+                };
+                let opts = DflashOptions {
+                    tp: Some(tp),
+                    ..sampling(64)
+                };
+                let mut d = DflashDrafter::load(&info, opts).unwrap();
+                // Rank 0's rows are one short: its take-in refuses them before any sum.
+                let rows: Vec<Vec<f32>> = (0..2)
+                    .map(|li| (0..12).flat_map(|p| hidden(p, li, 0)).collect())
+                    .collect();
+                let n = if rank == 0 { 11 * 64 } else { 12 * 64 };
+                let mut out = Draft::default();
+                let t = Instant::now();
+                let failed = d.step(&mut [DraftRequest {
+                    seq: 1,
+                    tokens: &tokens,
+                    start: 0,
+                    ran: 12,
+                    hidden: rows.iter().map(|v| &v[..n]).collect(),
+                    max: 7,
+                    out: &mut out,
+                }]);
+                let took = t.elapsed();
+                // The engine releases a failed round's sequences on every rank.
+                d.release(1);
+                assert!(handle.comm().error().is_none(), "rank {rank}");
+                let next = step(&mut d, 2, &tokens, 0, 12, 7, 0);
+                assert!(handle.comm().error().is_none(), "rank {rank}");
+                // Every rank's last partials are out before a communicator stops.
+                done.wait();
+                (failed, took, next)
+            })
+        })
+        .collect();
+    let got: Vec<_> = ranks.into_iter().map(|t| t.join().unwrap()).collect();
+    assert!(got[0].0.is_err());
+    assert!(got[1].0.is_ok());
+    assert!(got[1].1 < Duration::from_secs(5), "{:?}", got[1].1);
+    // Rank 0 picks the drafts: the whole drafter's, up to the order of the FFN's sums.
+    assert_eq!(got[0].2.probs.len(), whole.probs.len());
+    for (i, (a, b)) in got[0].2.probs.iter().zip(&whole.probs).enumerate() {
+        assert!(max_diff(a, b) < 1e-4, "position {i}");
+    }
+}
+
+/// `--tp-draft-split` over two ranks: when rank 0's round fails and so do the zero sums it
+/// owes (no graph for them, injected), its communicator fails and cuts the connections, so
+/// rank 1's round fails at once (not at the 30 s timeout) with a failed communicator too.
+#[test]
+fn a_failed_draft_split_cleanup_fails_the_other_ranks_at_once() {
+    use std::net::{TcpListener, TcpStream};
+    use std::time::{Duration, Instant};
+
+    let fx = Fixture::new();
+    let c = TinyDraft {
+        n_ff: 128,
+        ..TinyDraft::default()
+    };
+    let hf = fx.root.join("hf");
+    tiny::write_hf(&hf, &c, HfDtype::F32).unwrap();
+    let tokens = tokens_to(13);
+
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let a = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+    let (b, _) = l.accept().unwrap();
+    let ranks: Vec<_> = [a, b]
+        .into_iter()
+        .enumerate()
+        .map(|(rank, stream)| {
+            let (info, tokens) = (fx.info(&hf), tokens.clone());
+            std::thread::spawn(move || {
+                let mut data = vec![None, None];
+                data[1 - rank] = Some(stream);
+                let comm = crate::tp_net::Comm::new(rank, data, Duration::from_secs(30)).unwrap();
+                let handle = crate::tp_net::register(comm);
+                let tp = TpShare {
+                    comm: handle.id(),
+                    rank,
+                    n_ranks: 2,
+                };
+                let opts = DflashOptions {
+                    tp: Some(tp),
+                    ..sampling(64)
+                };
+                let mut d = DflashDrafter::load(&info, opts).unwrap();
+                // Rank 0's rows are one short (its round fails before any sum), and its zero
+                // sums fail.
+                FAIL_ZERO_SUMS.set(rank == 0);
+                let rows: Vec<Vec<f32>> = (0..2)
+                    .map(|li| (0..12).flat_map(|p| hidden(p, li, 0)).collect())
+                    .collect();
+                let n = if rank == 0 { 11 * 64 } else { 12 * 64 };
+                let mut out = Draft::default();
+                let t = Instant::now();
+                let r = d.step(&mut [DraftRequest {
+                    seq: 1,
+                    tokens: &tokens,
+                    start: 0,
+                    ran: 12,
+                    hidden: rows.iter().map(|v| &v[..n]).collect(),
+                    max: 7,
+                    out: &mut out,
+                }]);
+                (r, t.elapsed(), handle.comm().error())
+            })
+        })
+        .collect();
+    let got: Vec<_> = ranks.into_iter().map(|t| t.join().unwrap()).collect();
+    for (rank, (r, took, error)) in got.iter().enumerate() {
+        assert!(r.is_err(), "rank {rank}");
+        assert!(error.is_some(), "rank {rank}");
+        assert!(*took < Duration::from_secs(5), "rank {rank}: {took:?}");
+    }
+    let e = got[0].0.as_ref().unwrap_err();
+    assert!(e.contains("no graph for the zero sums"), "{e}");
+}
+
+/// `--tp-draft-split`'s shares: whole 32-value blocks per rank, every rank's rows once.
+#[test]
+fn tp_share_rows() {
+    let share = |rank, n_ranks| TpShare {
+        comm: 0,
+        rank,
+        n_ranks,
+    };
+    assert_eq!(share(0, 2).rows(21_504), Ok(0..10_752));
+    assert_eq!(share(1, 2).rows(21_504), Ok(10_752..21_504));
+    assert!(share(0, 2).leads() && !share(1, 2).leads());
+    assert_eq!(share(2, 3).rows(96 * 3), Ok(192..288));
+    // A share not of whole blocks, or a rank past the last.
+    assert!(share(0, 2).rows(96).is_err());
+    assert!(share(2, 2).rows(128).is_err());
+}
+
+/// The FFN matrices a rank keeps a share of, and their bytes after the cut.
+#[test]
+fn ffn_cut() {
+    use super::weights::{Cut, FfnCut, cut_matrix, ffn_cut_of};
+    let cut = FfnCut {
+        rows: 4..8,
+        n_ff: 8,
+    };
+    assert_eq!(
+        ffn_cut_of("blk.3.ffn_gate.weight", &[2, 8], &cut),
+        Ok(Some((Cut::Rows(4..8), vec![2, 4])))
+    );
+    assert_eq!(
+        ffn_cut_of("blk.0.ffn_up.weight", &[2, 8], &cut),
+        Ok(Some((Cut::Rows(4..8), vec![2, 4])))
+    );
+    assert_eq!(
+        ffn_cut_of("blk.0.ffn_down.weight", &[8, 2], &cut),
+        Ok(Some((Cut::Cols(4..8), vec![4, 2])))
+    );
+    for name in ["blk.0.attn_q.weight", "output_norm.weight", "fc.weight"] {
+        assert_eq!(ffn_cut_of(name, &[8, 8], &cut), Ok(None));
+    }
+    assert!(ffn_cut_of("blk.0.ffn_down.weight", &[2, 8], &cut).is_err());
+    // Two-byte values: a 3 x 4 matrix (rows of 4).
+    let m: Vec<u8> = (0..24).collect();
+    assert_eq!(
+        cut_matrix(&m, 2, 4, &Cut::Rows(1..3)),
+        (8..24).collect::<Vec<u8>>()
+    );
+    assert_eq!(
+        cut_matrix(&m, 2, 4, &Cut::Cols(2..4)),
+        vec![4, 5, 6, 7, 12, 13, 14, 15, 20, 21, 22, 23]
+    );
+}

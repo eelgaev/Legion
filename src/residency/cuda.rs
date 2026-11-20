@@ -2525,6 +2525,43 @@ pub fn read_rows_i32(
     }
 }
 
+/// Reads `rows` rows of `out.len() / rows` I32 values, `pitch` bytes apart from `src` in
+/// device memory, into `out` (row after row) on `stream`, and waits for the stream: a
+/// staging op's look at the router's choices ([`super::route_gate`]).
+///
+/// # Safety
+/// `src` must hold the rows on `stream`'s device; `stream` must be live.
+pub unsafe fn read_i32_on(
+    stream: *mut c_void,
+    src: *const c_void,
+    pitch: usize,
+    rows: usize,
+    out: &mut [i32],
+) -> Result<(), String> {
+    let width = out.len() / rows.max(1);
+    assert!(width * rows == out.len(), "read_i32_on shape");
+    if rows == 0 || width == 0 {
+        return Ok(());
+    }
+    // SAFETY: the caller's.
+    unsafe {
+        rt(
+            cudaMemcpy2DAsync(
+                out.as_mut_ptr().cast(),
+                width * 4,
+                src,
+                pitch.max(width * 4),
+                width * 4,
+                rows,
+                2,
+                stream,
+            ),
+            "cudaMemcpy2DAsync",
+        )?;
+        rt(cudaStreamSynchronize(stream), "cudaStreamSynchronize")
+    }
+}
+
 /// VRAM allocated through VMM, to be mapped into ranges (prefill staging buffers): one or
 /// more physical allocations, mapped back to back.
 pub struct DeviceMem {
@@ -3128,6 +3165,62 @@ impl StagedRange {
             0
         };
         self.packed == packed && self.head == head
+    }
+
+    /// Makes a packed range serve `tiered_t` again when only the slots' head allocation it maps
+    /// changed (#37): a whole lend unmapped and freed it, or the restore after one made a new
+    /// one. The old head is unmapped from the range, the new one mapped in its place; the
+    /// staging buffer's part stays. Only while lending (no step runs, as for [`unback_keep`]):
+    /// nothing reads the range then. Whether it serves now (false: a range of another layout,
+    /// made again).
+    pub fn rehead(&mut self, tiered_t: Tensor<'_>, packed: bool) -> Result<bool, String> {
+        let Some(b) = tiered_of(tiered_t) else {
+            return Ok(false);
+        };
+        // SAFETY: reading the fields of the tensor's live tiered buffer.
+        let b = unsafe { &*b };
+        let r = &mut self.range;
+        if !packed || !self.packed || b.split != r.vram_bytes {
+            return Ok(false);
+        }
+        let head = packed_head(b);
+        let split = r.vram_bytes;
+        if head == self.head {
+            return Ok(true);
+        }
+        // SAFETY: the range's own head part, unmapped before anything else maps there.
+        unsafe {
+            use_device(r.device)?;
+            if self.head != 0 && split > 0 {
+                cu(
+                    timed("cuMemUnmap", r.device, split, || cuMemUnmap(r.va, split)),
+                    "cuMemUnmap(staged range head)",
+                )?;
+            }
+            self.head = 0;
+            r.hole = true;
+            if head != 0 && split > 0 {
+                cu(
+                    timed("cuMemMap", r.device, split, || {
+                        cuMemMap(r.va, split, 0, head, 0)
+                    }),
+                    "cuMemMap(staged range head)",
+                )?;
+                let a = range_access(r.device);
+                if let Err(e) = cu(
+                    cuMemSetAccess(r.va, split, a.as_ptr(), a.len()),
+                    "cuMemSetAccess(staged range head)",
+                ) {
+                    cuMemUnmap(r.va, split);
+                    return Err(e);
+                }
+            }
+            if head != 0 {
+                self.head = head;
+                r.hole = false;
+            }
+        }
+        Ok(true)
     }
 
     /// A tensor over it as [`staged_packed`] (`n_ids` experts) or [`staged_over_hole`] (`None`)

@@ -926,12 +926,16 @@ pub fn even_cuts(
 }
 
 /// Returns the keep, and [`auto_keep`]'s byte-count keep (the same unless it was lowered).
+/// `whole`: the buffers are sized for a lend that keeps no slot too (every expert packed, #37:
+/// a longer prompt's whole lend takes the kept staging), so the share goes down until those
+/// leave `need`.
 pub fn auto_keep_carved(
     layers: &[LendLayer],
     n_expert: usize,
     ring: usize,
     need: u64,
     cover: bool,
+    whole: bool,
 ) -> (Vec<usize>, Vec<usize>) {
     let slot = |l: &LendLayer| l.bytes.iter().sum::<usize>() as u64;
     let staged: Vec<(usize, u64)> = layers
@@ -952,7 +956,7 @@ pub fn auto_keep_carved(
     let bufs = ring.max(super::PREFILL_RING);
     let pads = 3 * GRANULE * staged.len() as u64;
     let fits = |keep: &[usize]| {
-        let (parts, bytes) = lend_parts(layers, keep, n_expert, GRANULE as usize);
+        let (parts, bytes) = lend_parts(layers, keep, n_expert, GRANULE as usize, whole);
         let plan = super::experts::plan_staging(&parts, bytes, bufs, cover);
         let mut taken = vec![false; parts.len()];
         let mut new = 0u64;
@@ -983,12 +987,14 @@ pub fn auto_keep_carved(
 /// unmaps them (per layer, per kind; the sizes a tiered range of `gran` granules gives its
 /// slot tail, or all of an unstaged layer's slots), and the staging buffer bytes per kind
 /// (the most a staged layer packs: its kept slots' ids, every other expert of `n_expert`, and
-/// one expert more; as `Layer::pack`).
+/// one expert more; as `Layer::pack`; `whole`: every expert of `n_expert` past the kept slots'
+/// ids, as a lend that keeps none packs them).
 fn lend_parts(
     layers: &[LendLayer],
     keep: &[usize],
     n_expert: usize,
     gran: usize,
+    whole: bool,
 ) -> (Vec<usize>, [usize; 3]) {
     let mut parts = Vec::new();
     let mut bytes = [0usize; 3];
@@ -1026,7 +1032,12 @@ fn lend_parts(
             .map(|k| head(k).0.div_ceil(head(k).1))
             .max()
             .unwrap_or(0);
-        let n_ids = stage_first + n_expert.saturating_sub(n_kept) + 1;
+        let staged = if whole {
+            n_expert
+        } else {
+            n_expert.saturating_sub(n_kept)
+        };
+        let n_ids = stage_first + staged + 1;
         for k in 0..3 {
             let (_, first, split) = geo[k];
             bytes[k] = bytes[k].max((first + n_ids * l.bytes[k]).saturating_sub(split));

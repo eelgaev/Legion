@@ -115,9 +115,10 @@ mod window_attn;
 
 pub use arch::{Arch, ArchRef, Recurrent, TokenConv};
 pub use exec::{
-    ChainOutput, Executor, LENT_SCRATCH, PassRow, Pool, PromptNext, Remote, StateCapture, StepPart,
-    TpLead, default_verify_budget, from_wire, set_mtp_kept_graphs, set_prompt_buffer_reserve,
-    set_prompt_build_ahead, set_prompt_step_stats, set_verify_kept_graphs, verify_kept_graphs,
+    ChainOutput, Executor, LENT_SCRATCH, MediaTable, PassRow, Pool, PromptNext, Remote,
+    StateCapture, StepPart, TpLead, default_verify_budget, from_wire, from_wire_with,
+    set_mtp_kept_graphs, set_prompt_buffer_reserve, set_prompt_build_ahead,
+    set_prompt_step_stats, set_verify_kept_graphs, verify_kept_graphs,
 };
 pub use kv_type::{KvType, KvTypes};
 pub use linear::{FfnFusion, Fp8Act, Linear, Nvfp4A4, Nvfp4Act, Nvfp4Mm};
@@ -1830,6 +1831,12 @@ impl Model {
         }
     }
 
+    /// The communicator [`Self::tp_sum`] sums over with tensor parallelism over machines
+    /// ([`Self::set_tp_comm`]), not over a GPU pair.
+    pub(crate) fn tp_net_comm(&self) -> Option<i32> {
+        self.tp_comm.filter(|_| self.tp_pair.is_none())
+    }
+
     /// Whether [`Self::tp_sum`] sums over tensor-parallel ranks (else it is `x` itself).
     pub(crate) fn tp_on(&self) -> bool {
         self.tp_pair.is_some() || self.tp_comm.is_some()
@@ -2518,10 +2525,14 @@ impl Model {
     /// Whether a greedy step's head may run as two shares of the vocabulary on the two ranks
     /// of tensor parallelism ([`head_split`], `--tp-head-split`): an architecture whose split
     /// head was shown to keep the text ([`Arch::head_splits`]), with the core's head as a
-    /// plain matmul of `output.weight` (no scale, no FP8 activation scale) in one GPU's
+    /// plain matmul of `output.weight` (or of `token_embd.weight` for a head tied to the
+    /// embeddings, as the head is built) (no scale, no FP8 activation scale) in one GPU's
     /// memory, and a vocabulary that splits ([`head_split::vocab_fits`]).
     pub(crate) fn head_splits(&self) -> bool {
-        let name = "output.weight";
+        let (name, input_scale) = match self.w("output.weight") {
+            Ok(_) => ("output.weight", "output.input_scale"),
+            Err(_) => ("token_embd.weight", "token_embd.input_scale"),
+        };
         let Ok(w) = self.w(name) else {
             return false;
         };
@@ -2533,7 +2544,7 @@ impl Model {
             && w.ne()[1] == self.hp.n_vocab
             && head_split::vocab_fits(w.ne()[1] as usize)
             && linear::scale_name(name).is_none_or(|s| self.w(&s).is_err())
-            && self.w("output.input_scale").is_err()
+            && self.w(input_scale).is_err()
     }
 
     /// Whether the LM head `name` (`w`) for `x` runs on [`head_mm`]: [`head_mm::takes`], and
@@ -4283,6 +4294,62 @@ impl Model {
         Ok(self.linear.mul_mat_multi(ctx, &refs, h, norm))
     }
 
+    /// [`Self::lmm_multi`] of a part of a step, normed in its quantization
+    /// ([`linear::Linear::mul_mat_multi_part`]): `norm`'s residual holds the step's columns
+    /// from `col0` of `n`; `into`: the node of another part. The node, or `None` where it does
+    /// not run so.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn lmm_multi_part<'a>(
+        &'a self,
+        ctx: &'a Context,
+        il: usize,
+        names: &[&str],
+        norm: (Tensor<'a>, Tensor<'a>, f32),
+        n: i64,
+        col0: i64,
+        into: Option<Tensor<'a>>,
+    ) -> Result<Option<Tensor<'a>>, ModelError> {
+        let mut ws = Vec::new();
+        for name in names {
+            let name = format!("blk.{il}.{name}");
+            let scale = linear::scale_name(&name).and_then(|s| self.w(&s).ok());
+            ws.push((self.w(&name)?, scale, name));
+        }
+        let refs: Vec<_> = ws.iter().map(|(w, s, n)| (n.as_str(), *w, *s)).collect();
+        let x = norm.0;
+        Ok(self
+            .linear
+            .mul_mat_multi_part(ctx, &refs, x, norm, n, col0, into))
+    }
+
+    /// The weights `names` of layer `il` for which [`Self::lmm_multi_part`] makes its node
+    /// ([`crate::model::nvfp4_a4::multi_part_outputs`] reads the outputs).
+    pub(crate) fn lmm_multi_weights<'a>(
+        &'a self,
+        il: usize,
+        names: &[&str],
+    ) -> Result<Vec<(Tensor<'a>, Option<Tensor<'a>>)>, ModelError> {
+        names
+            .iter()
+            .map(|name| {
+                let name = format!("blk.{il}.{name}");
+                let scale = linear::scale_name(&name).and_then(|s| self.w(&s).ok());
+                Ok((self.w(&name)?, scale))
+            })
+            .collect()
+    }
+
+    /// Whether layer `il`'s weight `name` runs on Legion's W4A4 dense kernels at a batch of `n`
+    /// tokens ([`linear::Linear::a4_dense`]: every token the same bits at every such batch).
+    pub(crate) fn a4_dense(&self, il: usize, name: &str, n: i64) -> bool {
+        let name = format!("blk.{il}.{name}");
+        let Ok(w) = self.w(&name) else {
+            return false;
+        };
+        let scale = linear::scale_name(&name).and_then(|s| self.w(&s).ok());
+        self.linear.a4_dense(&name, w, scale, n)
+    }
+
     pub(crate) fn moe<'a>(
         &'a self,
         ctx: &'a Context,
@@ -4498,20 +4565,26 @@ impl Model {
                 } else {
                     None
                 };
+                // The bounded host tier has no staged copies: its prompt chunks run the fused
+                // op in place, over the RAM slots and the staging buffer.
+                let in_place = t.bounded() && n >= HOST_TIER_FUSED_TOKENS;
+                // A short prompt's lend (#37) stages with an unlent step's ops: the fused op
+                // only where an unlent step runs it in place, else the products below.
+                let staged_fused = !t.short_lend() || fused == Some(MoeKernel::Fused) || in_place;
                 // With split waits, the op itself waits for each piece of the layer's copy.
-                summed = t.staged_split(ctx, graph, h, n, |x, ws, stage| {
-                    let (pair, stage) = (self.moe_pair_out, Some(stage));
-                    moe_ffn::moe_ffn_staged_shexp(ctx, x, ids, w2, refs(ws), pair, stage, shexp)
-                });
-                if summed.is_none() {
-                    summed = t.staged(ctx, graph, h, n, |x, ws| {
+                if staged_fused {
+                    summed = t.staged_split(ctx, graph, h, n, |x, ws, stage| {
+                        let (pair, stage) = (self.moe_pair_out, Some(stage));
+                        moe_ffn::moe_ffn_staged_shexp(ctx, x, ids, w2, refs(ws), pair, stage, shexp)
+                    });
+                }
+                if summed.is_none() && staged_fused {
+                    // A short step copies only the experts it routes to (`route_gate`).
+                    summed = t.staged_routed(ctx, graph, h, Some(selected), n, |x, ws| {
                         let pair = self.moe_pair_out;
                         moe_ffn::moe_ffn_shexp(ctx, x, ids, w2, refs(ws), pair, shexp)
                     });
                 }
-                // The bounded host tier has no staged copies: its prompt chunks run the fused
-                // op in place, over the RAM slots and the staging buffer.
-                let in_place = t.bounded() && n >= HOST_TIER_FUSED_TOKENS;
                 if summed.is_none() && (fused == Some(MoeKernel::Fused) || in_place) {
                     // Forced: in place (on a GPU, host experts over the link).
                     summed = Some(moe_ffn::moe_ffn_shexp(
@@ -4529,7 +4602,26 @@ impl Model {
             if summed.is_some() {
                 None
             } else {
-                match t.staged_experts(ctx, graph, x, ids, n) {
+                let staged = if t.short_lend() {
+                    // A short prompt's lend: the products `mm` below takes for steps past the
+                    // small steps' kernels (`residency::experts::short_stage_min`), over the
+                    // staged copies (indexed like the tiered tensors).
+                    t.staged_routed(ctx, graph, x, Some(selected), n, |x, ws| {
+                        let mm = |w: Tensor<'a>, x: Tensor<'a>| {
+                            if mmq_ids::usable(w, x, ids) {
+                                mmq_ids::mul_mat_id(ctx, w, x, ids)
+                            } else {
+                                ctx.mul_mat_id(w, x, ids)
+                            }
+                        };
+                        let up = mm(ws[0], x);
+                        let gate = mm(ws[1], x);
+                        mm(ws[2], ctx.mul(ctx.silu(gate), up))
+                    })
+                } else {
+                    t.staged_experts(ctx, graph, x, ids, selected, n)
+                };
+                match staged {
                     Some(out) => Some(out),
                     None => {
                         // Small steps: Legion's expert matvec reads the misses at the link rate.

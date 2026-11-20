@@ -140,15 +140,32 @@ fn long_prompts_pick_their_micro_chunk() {
     };
     assert_eq!(small.micro_for(10291, 2), 1024);
 }
-/// `--short-prompt-tokens` (#579): short prompts borrow the cache for staging, by default only
-/// for GLM-5.3-Flash over several stages, and only below `--long-prompt-tokens`.
+/// `--short-prompt-tokens` (#579): short prompts borrow the cache for staging, by default for
+/// GLM-5.3-Flash over several stages and one GPU with routing-gated prompt steps (#37), and only
+/// below `--long-prompt-tokens`.
 #[test]
 fn short_prompts_borrow_the_cache_for_staging() {
-    // Qwen, Gemma and one-stage GLM: off.
-    assert_eq!(short_prompt_default(false, 4), 0);
-    assert_eq!(short_prompt_default(true, 1), 0);
-    assert_eq!(short_prompt_default(true, 4), GLM_SHORT_PROMPT);
+    // Qwen, Gemma and one-stage GLM without a gate: off.
+    assert_eq!(short_prompt_default(false, 4, false), 0);
+    assert_eq!(short_prompt_default(true, 1, false), 0);
+    assert_eq!(short_prompt_default(true, 4, false), GLM_SHORT_PROMPT);
     assert_eq!(GLM_SHORT_PROMPT, crate::residency::STAGE_MIN_TOKENS);
+    // One GPU with routing-gated steps.
+    assert_eq!(short_prompt_default(false, 1, true), SHORT_GATE_PROMPT);
+    assert_eq!(short_prompt_default(true, 4, true), GLM_SHORT_PROMPT);
+    assert_eq!(SHORT_GATE_PROMPT, crate::residency::STAGE_MIN_TOKENS);
+    // GLM's and DeepSeek's own graphs keep the fused op in a short lend.
+    assert!(!short_gate_on(true));
+    // The bounded tier only with RAM slots for at least half of each layer's experts.
+    assert!(short_gate_ram(320, 512));
+    assert!(short_gate_ram(256, 512));
+    assert!(!short_gate_ram(255, 512));
+    assert!(!short_gate_ram(111, 512));
+    // A short lend's steps stage past every small step's own kernels.
+    let floor = crate::residency::experts::short_stage_min();
+    assert!(floor > crate::model::core::expert_mv::max_tokens());
+    assert!(floor > crate::residency::cpu_share::ops::MAX_TOKENS as i64);
+    assert!(floor <= crate::residency::STAGE_MIN_TOKENS as i64);
     assert_eq!(LongPrompts::default().short_from(), None);
     let with = |short: usize, min: usize| LongPrompts {
         short_min_tokens: Some(short),
@@ -160,6 +177,23 @@ fn short_prompts_borrow_the_cache_for_staging() {
     // At or above the long-prompt threshold, a prompt is a long one.
     assert_eq!(with(2048, 2048).short_from(), None);
     assert_eq!(with(4096, 2048).short_from(), None);
+}
+
+/// #37: short prompts borrow the cache by default only where the prompt steps are
+/// routing-gated: one stage with a route gate and no split waits (`--prefill-stage-pieces`,
+/// which the residency's gate does not take either).
+#[test]
+fn short_lends_need_route_gated_steps() {
+    assert!(short_gate_steps(8704, 0, 1));
+    assert!(short_gate_steps(8704, crate::residency::STAGE_PIECES, 1));
+    // Split waits: the steps wait for every uncached expert's copy, not gated.
+    assert!(!short_gate_steps(8704, 4, 1));
+    // No route gate, or several stages.
+    assert!(!short_gate_steps(0, 0, 1));
+    assert!(!short_gate_steps(8704, 0, 2));
+    // So the default stays off there.
+    let gated = short_gate_steps(8704, 4, 1);
+    assert_eq!(short_prompt_default(false, 1, gated), 0);
 }
 
 /// `--long-micro-even`: micro_for's count of micro-chunks, of equal size in whole KV blocks.
@@ -334,6 +368,31 @@ fn uma_free_moves_only_the_shared_memory_reserve() {
         kv_headroom(DeviceKind::Gpu, 4096, 8 * gib),
         COMPUTE_HEADROOM
     );
+}
+
+#[test]
+fn tower_scratch_is_kept_free_of_the_pool_with_every_expert_in_vram() {
+    use crate::ggml::DeviceKind::{Gpu, IntegratedGpu};
+    let s = 649usize << 20;
+    // Every expert in a discrete GPU: the first stage keeps the tower's largest image's scratch.
+    assert_eq!(tower_kv_reserve(ExpertMode::Device, Gpu, 0, s), s);
+    // The tower runs on the first stage's GPU only.
+    assert_eq!(tower_kv_reserve(ExpertMode::Device, Gpu, 1, s), 0);
+    // The cache's and the kept step graphs' budgets keep it instead.
+    assert_eq!(tower_kv_reserve(ExpertMode::Cache, Gpu, 0, s), 0);
+    assert_eq!(tower_kv_reserve(ExpertMode::Host, Gpu, 0, s), 0);
+    // A GPU sharing the host's memory: the OS's share covers it, the fit is unchanged.
+    assert_eq!(tower_kv_reserve(ExpertMode::Device, IntegratedGpu, 0, s), 0);
+    // No GPU tower (none loaded, or the CPU's): the fit is unchanged.
+    assert_eq!(tower_kv_reserve(ExpertMode::Device, Gpu, 0, 0), 0);
+}
+
+#[test]
+fn tower_loads_before_the_pool_on_a_discrete_gpu_only() {
+    use crate::ggml::DeviceKind;
+    assert!(tower_before_kv(Some(DeviceKind::Gpu)));
+    assert!(!tower_before_kv(Some(DeviceKind::IntegratedGpu)));
+    assert!(!tower_before_kv(None));
 }
 
 #[test]

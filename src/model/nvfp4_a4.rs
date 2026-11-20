@@ -459,6 +459,84 @@ pub fn mul_mat_multi<'a>(
     x: Tensor<'a>,
     norm: Option<(Tensor<'a>, f32)>,
 ) -> Vec<Tensor<'a>> {
+    let [_, n1, n2, n3] = x.ne();
+    let node = multi_node(ctx, ws, x, norm, None);
+    multi_views(ctx, node, ws, [n1, n2, n3])
+}
+
+/// [`mul_mat_multi`] over the `x.ne()[1]` columns from `col0` of a step's `n` (a part of
+/// them, e.g. half; `x` 2-D): the node writes its outputs at those columns of the step's
+/// outputs, `[m_i, n]` each back to back. `into`: the node of another part of the same step
+/// and weights, whose memory this node's outputs go into (a view of it); `None`: the node
+/// holds every part's outputs. Each column gets the bits of [`mul_mat_multi`] over the step's
+/// whole `x` (per-token quantization, the same MMAs at every batch over
+/// [`crate::model::core::linear::NVFP4_A4_MIN_N`]). [`multi_part_outputs`] takes the outputs
+/// from the last part's node. For models that run a step's per-token work in parts (#619).
+pub fn mul_mat_multi_part<'a>(
+    ctx: &'a Context,
+    ws: &[(Tensor<'a>, Option<Tensor<'a>>)],
+    x: Tensor<'a>,
+    norm: Option<(Tensor<'a>, f32)>,
+    n: i64,
+    col0: i64,
+    into: Option<Tensor<'a>>,
+) -> Tensor<'a> {
+    let [_, cols, a, b] = x.ne();
+    assert!(
+        (a, b) == (1, 1) && col0 >= 0 && col0 + cols <= n,
+        "an NVFP4 W4A4 part: 2-D x of {cols} columns from {col0} of {n}"
+    );
+    multi_node(ctx, ws, x, norm, Some((n, col0, into)))
+}
+
+/// The outputs (`[m_i, n]`, F32) of the parts of [`mul_mat_multi_part`] whose last node is
+/// `node`: every part's columns, read after that node.
+pub fn multi_part_outputs<'a>(
+    ctx: &'a Context,
+    node: Tensor<'a>,
+    ws: &[(Tensor<'a>, Option<Tensor<'a>>)],
+    n: i64,
+) -> Vec<Tensor<'a>> {
+    multi_views(ctx, node, ws, [n, 1, 1])
+}
+
+/// Views of the back-to-back outputs `[m_i, n1, n2, n3]` of a multi node.
+fn multi_views<'a>(
+    ctx: &'a Context,
+    node: Tensor<'a>,
+    ws: &[(Tensor<'a>, Option<Tensor<'a>>)],
+    [n1, n2, n3]: [i64; 3],
+) -> Vec<Tensor<'a>> {
+    let rows = n1 * n2 * n3;
+    let mut off = 0usize;
+    ws.iter()
+        .map(|&(w, _)| {
+            let m = w.ne()[1];
+            let out = ctx.view_4d(
+                node,
+                [m, n1, n2, n3],
+                [
+                    m as usize * 4,
+                    (m * n1) as usize * 4,
+                    (m * n1 * n2) as usize * 4,
+                ],
+                off,
+            );
+            off += (m * rows) as usize * 4;
+            out
+        })
+        .collect()
+}
+
+/// The node of [`mul_mat_multi`] (`part`: None) or of [`mul_mat_multi_part`] (`(n, col0,
+/// into)`).
+fn multi_node<'a>(
+    ctx: &'a Context,
+    ws: &[(Tensor<'a>, Option<Tensor<'a>>)],
+    x: Tensor<'a>,
+    norm: Option<(Tensor<'a>, f32)>,
+    part: Option<(i64, i64, Option<Tensor<'a>>)>,
+) -> Tensor<'a> {
     assert!(
         !ws.is_empty() && ws.len() <= MULTI_MAX,
         "{} weights for one NVFP4 W4A4 input",
@@ -481,7 +559,8 @@ pub fn mul_mat_multi<'a>(
     }
     let x = input(ctx, x);
     let [_, n1, n2, n3] = x.ne();
-    let rows = n1 * n2 * n3;
+    // The step's columns: the outputs' and (any part's) scratch rows.
+    let rows = part.map_or(n1 * n2 * n3, |(n, ..)| n);
     let m_sum: i64 = ws.iter().map(|(w, _)| w.ne()[1]).sum();
     let (_, total) = layout((m_sum * rows) as usize * 4, rows, k, 0);
     let mut args: Vec<Tensor<'a>> = ws.iter().map(|&(w, _)| w).collect();
@@ -502,42 +581,59 @@ pub fn mul_mat_multi<'a>(
         args.push(nw);
         params.extend([1, eps.to_bits() as i32]);
     }
-    let node = ctx.external_with(
-        &A4_MM_MULTI,
-        types::F32,
-        [(total / 4) as i64, 1, 1, 1],
-        &args,
-        &params,
-    );
-    let mut off = 0usize;
-    ws.iter()
-        .map(|&(w, _)| {
-            let m = w.ne()[1];
-            let out = ctx.view_4d(
-                node,
-                [m, n1, n2, n3],
-                [
-                    m as usize * 4,
-                    (m * n1) as usize * 4,
-                    (m * n1 * n2) as usize * 4,
-                ],
-                off,
+    let shape = [(total / 4) as i64, 1, 1, 1];
+    let mut into = None;
+    if let Some((n, col0, other)) = part {
+        // Params 4 and 5: the step's columns and this part's first (0, 0: a whole node).
+        params.resize(4, 0);
+        params.extend([n as i32, col0 as i32]);
+        if let Some(t) = other {
+            assert_eq!(
+                t.ne(),
+                shape,
+                "an NVFP4 W4A4 part of another step or weights"
             );
-            off += (m * rows) as usize * 4;
-            out
-        })
-        .collect()
+            // A source past the ones the kernels read: this node runs after it.
+            args.push(t);
+            into = Some(t);
+        }
+    }
+    let node = ctx.external_with(&A4_MM_MULTI, types::F32, shape, &args, &params);
+    if let Some(t) = into {
+        // The node writes into `t`'s memory: ggml's allocator gives a view no memory of its
+        // own and keeps `t` alive while the view is used (as `tp_net::micro::finish`).
+        // SAFETY: a fresh node, not allocated yet; `t` is a node of the same graph, ahead of
+        // it (one of its sources) and of its shape.
+        unsafe {
+            let raw = node.raw();
+            let t = t.raw();
+            // A part into a part: the memory's owner.
+            (*raw).view_src = if (*t).view_src.is_null() {
+                t
+            } else {
+                (*t).view_src
+            };
+            (*raw).view_offs = 0;
+        }
+    }
+    node
 }
 
 /// The CPU implementation of [`mul_mat_multi`].
 unsafe fn cpu_mm_multi(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
-    let [count, mask, has_norm, eps, ..] = external_params(dst);
+    let [count, mask, has_norm, eps, whole, col0, ..] = external_params(dst);
     let count = count as usize;
     // SAFETY: a node made by `mul_mat_multi`: host tensors, x contiguous.
     unsafe {
         let x = &*dst.src[count];
         let k = x.ne[0] as usize;
         let n = (x.ne[1] * x.ne[2] * x.ne[3]) as usize;
+        // A part's outputs: its columns from `col0` of the step's `whole` (`mul_mat_multi_part`).
+        let (n_out, col0) = if whole > 0 {
+            (whole as usize, col0 as usize)
+        } else {
+            (n, 0)
+        };
         let n_scales = (mask as u32).count_ones() as usize;
         let xq = if has_norm != 0 {
             let nw = values(&*dst.src[count + 1 + n_scales], k);
@@ -563,10 +659,10 @@ unsafe fn cpu_mm_multi(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
             for j in (ith..m).step_by(nth) {
                 let row = weight_row(w, 0, j);
                 for (t, xr) in xq.iter().enumerate() {
-                    *out.add(t * m + j) = dot(&row, xr) * scale;
+                    *out.add((col0 + t) * m + j) = dot(&row, xr) * scale;
                 }
             }
-            out = out.add(m * n);
+            out = out.add(m * n_out);
         }
     }
 }
@@ -1656,15 +1752,22 @@ mod cuda {
         dst: &ffi::ggml_tensor,
         stream: *mut c_void,
     ) -> Result<(), String> {
-        let [count, mask, has_norm, eps, ..] = external_params(dst);
+        let [count, mask, has_norm, eps, whole, col0, ..] = external_params(dst);
         let count = count as usize;
         // SAFETY: a node made by `mul_mat_multi`, tensors in device memory of the stream's
         // device.
         let x = unsafe { &*dst.src[count] };
         let (k, n) = (x.ne[0], x.ne[1] * x.ne[2] * x.ne[3]);
+        // A part's outputs: its columns from `col0` of the step's `whole`
+        // (`mul_mat_multi_part`); its scratch after all of them.
+        let (n_out, col0) = if whole > 0 {
+            (whole as i64, col0 as i64)
+        } else {
+            (n, 0)
+        };
         // SAFETY: the node's first `count` sources are its weights.
         let ws: Vec<&ffi::ggml_tensor> = (0..count).map(|i| unsafe { &*dst.src[i] }).collect();
-        let out_bytes = ws.iter().map(|w| (w.ne[1] * n) as usize * 4).sum();
+        let out_bytes = ws.iter().map(|w| (w.ne[1] * n_out) as usize * 4).sum();
         let n_scales = (mask as u32).count_ones() as usize;
         let xq = if has_norm != 0 {
             // SAFETY: the norm weight follows the scales (see `mul_mat_multi`).
@@ -1689,10 +1792,12 @@ mod cuda {
                 (m + BM - 1) / BM,
                 (n + 16 * nt as i64 - 1) / (16 * nt as i64),
             );
-            let p = params(w, xq, scale, out as *mut c_void, (k, m, n), tiles, 0);
+            // SAFETY: inside this weight's output (a part's columns of it).
+            let at = unsafe { out.add((col0 * m) as usize * 4) };
+            let p = params(w, xq, scale, at as *mut c_void, (k, m, n), tiles, 0);
             launch(&p, nt, stream)?;
             // SAFETY: the outputs lie back to back at the start of the node (see `layout`).
-            out = unsafe { out.add((m * n) as usize * 4) };
+            out = unsafe { out.add((m * n_out) as usize * 4) };
         }
         Ok(())
     }

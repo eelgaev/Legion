@@ -73,6 +73,16 @@ epilogue by `LEGION_DEBUG_FP8_STREAM_EPI=0`, off / on / on / off, one server eac
 35.4 / 35.5 (the same tokens), 4 users 101.5 / 100.0 against 98.7 / 102.4, 16 users 249.5 / 233.1 against
 242.6 / 234.5.
 
+### Images
+
+The checkpoint ships its vision tower (`model.visual.*`, BF16), and the command above loads it: requests may
+carry images, and `/v1/models` lists `vision` (`--no-mmproj` leaves it out). The tower runs on the GPU
+(2026-11-19): a 1024 × 768 image (768 image tokens) encodes in 0.35 s and its first token comes 0.70 s after
+the request; sent again, its rows come from a cache (TTFT 0.34 s). Smaller images encode in 0.05-0.15 s (TTFT
+0.21-0.39 s). DFlash 2 drafts the image answers as it drafts text (mean accepted length 3.9 on the picture
+description). Text-only requests give the same output as with `--no-mmproj`, at the same speed (1 user 36.5
+against 36.6 tok/s, prefill 8K 2,767 against 2,751, 32K 2,407 against 2,415).
+
 ## What each flag does
 
 - `--max-seqs` (`16`): How many requests are decoded at once (continuous batching). Set to the highest concurrency the benchmark uses.

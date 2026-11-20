@@ -1,6 +1,7 @@
 //! Images in prompts (#146): the vision tower's rows enter the language model in place of the
 //! image tokens' embeddings, a chat with images runs end to end through the engine, and the
-//! prefix cache tells images apart.
+//! prefix cache tells images apart. The dense model (Qwen3.8-27B's path, #1218) answers an
+//! image the same with drafts from its MTP head or a DFlash 2 drafter.
 
 use std::os::unix::fs::FileExt;
 
@@ -14,6 +15,8 @@ use legion::ggml::Backend;
 use legion::gguf::GgufFile;
 use legion::model::core::{Executor, Group, ImageSpan, KV_BLOCK, Logits, Media, Model, SeqInput};
 use legion::model::qwen35::tiny::{self, TinyConfig};
+use legion::spec::dflash::tiny::{self as tiny_draft, TINY_V2, TinyDraft};
+use legion::spec::{SpecConfig, SpecKind};
 use legion::vision::tiny as tiny_mmproj;
 use tokio_util::sync::CancellationToken;
 
@@ -220,5 +223,96 @@ async fn images_need_a_projector() {
         Err(EngineError::InvalidRequest(e)) => assert!(e.contains("images"), "{e}"),
         Err(e) => panic!("{e}"),
         Ok(_) => panic!("accepted an image"),
+    }
+}
+
+/// (generated text, drafted tokens) of a 24-token greedy answer about image `seed`.
+async fn answer(engine: &LmEngine, seed: u8) -> (String, u64) {
+    let mut req = request(vec![image(seed)]);
+    req.max_tokens = 24;
+    let mut s = engine.generate(req).unwrap();
+    let mut text = String::new();
+    loop {
+        match s.next().await.expect("stream ended without Finished") {
+            TokenEvent::Text(t) => text += &t,
+            TokenEvent::Finished { usage, .. } => {
+                return (text, usage.spec.map_or(0, |c| c.drafted));
+            }
+            TokenEvent::Error(e) => panic!("engine error: {e}"),
+            _ => {}
+        }
+    }
+}
+
+/// The dense model as Qwen3.8-27B runs it (#1218): an image answers the same in one prompt step
+/// and in steps that cut the image, with drafts from its MTP head in a file of its own (k 1
+/// and 3; the head's take-in embeds the image rows at the target's M-RoPE positions) and from
+/// a DFlash 2 drafter (which reads the image through the target's hidden states).
+#[tokio::test(flavor = "multi_thread")]
+async fn dense_image_answers_are_the_same_with_mtp_and_dflash_drafts() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let cfg = tiny_cfg();
+    tiny::write(d.join("tiny.gguf"), &cfg).unwrap();
+    tiny::write_mtp_head(d.join("mtp.gguf"), &TinyConfig { mtp: true, ..cfg }).unwrap();
+    tiny_mmproj::write(d.join("mmproj.gguf"), cfg.n_embd, 3, false).unwrap();
+    let gguf = GgufFile::open(d.join("tiny.gguf")).unwrap();
+    let drafter = TinyDraft {
+        v2: Some(TINY_V2),
+        // The byte vocabulary and the vision tokens.
+        target_vocab: gguf.tensor("token_embd.weight").unwrap().shape[1] as usize,
+        ..Default::default()
+    };
+    tiny_draft::write_gguf(d.join("dflash2.gguf"), &drafter).unwrap();
+    let load = |spec: SpecConfig, max_batch_tokens: usize| {
+        LmEngine::load(LmConfig {
+            model_name: Some("tiny".into()),
+            mmproj: Some(d.join("mmproj.gguf")),
+            ctx_size: 512,
+            threads: 2,
+            max_seqs: 2,
+            max_batch_tokens,
+            spec,
+            use_ref: true,
+            ..LmConfig::new(d.join("tiny.gguf"), DeviceChoice::Cpu)
+        })
+        .unwrap()
+    };
+
+    let plain = load(SpecConfig::default(), 512);
+    assert!(plain.models()[0].vision);
+    let (want, _) = answer(&plain, 1).await;
+    assert!(!want.is_empty());
+    drop(plain);
+    // 16-token steps: the 64-token image spans five of them.
+    let chunked = load(SpecConfig::default(), 16);
+    assert_eq!(answer(&chunked, 1).await.0, want, "chunked");
+    drop(chunked);
+
+    let mut specs = Vec::new();
+    for k in [1, 3] {
+        let mtp = SpecConfig {
+            kind: SpecKind::Mtp,
+            k,
+            draft: Some(d.join("mtp.gguf")),
+            p_min: 0.0,
+            ..Default::default()
+        };
+        specs.push((format!("mtp k {k}"), mtp));
+    }
+    let dflash = SpecConfig {
+        kind: SpecKind::Dflash,
+        k: 4,
+        draft: Some(d.join("dflash2.gguf")),
+        ..Default::default()
+    };
+    specs.push(("dflash 2".into(), dflash));
+    for (name, spec) in specs {
+        for batch in [512, 16] {
+            let e = load(spec.clone(), batch);
+            let (got, drafted) = answer(&e, 1).await;
+            assert_eq!(got, want, "{name}, batch {batch}");
+            assert!(drafted > 0, "{name}, batch {batch}: nothing drafted");
+        }
     }
 }

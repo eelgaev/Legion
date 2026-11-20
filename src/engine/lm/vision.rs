@@ -10,7 +10,10 @@
 //! token replaced by an id from the image's hash, above any vocabulary, so the prefix cache
 //! matches an image only against the same image.
 //!
-//! The tower runs on the CPU, one image at a time.
+//! The tower runs one image at a time on the language model's first GPU (Legion's kernels on a
+//! stream of its own, so other sequences keep decoding; #1195), or on the CPU without one
+//! (`LEGION_DEBUG_VISION_CPU=1` keeps it there, for A/B runs). An image sent again (the same
+//! bytes, as a chat resends its images every turn) takes its rows from a small cache instead.
 
 use std::hash::{Hash, Hasher};
 use std::path::Path;
@@ -20,7 +23,9 @@ use crate::ggml::Backend;
 use crate::gguf::GgufFile;
 use crate::model::core::{ImageSpan, Media};
 use crate::tokenizer::Tokenizer;
-use crate::vision::{Encoder, Preprocessed};
+use crate::vision::{
+    Encoder, EncoderConfig, ImageEmbedding, Preprocessed, VisionError, VisionHparams,
+};
 
 use super::super::{EngineError, ImageInput};
 use super::LoadError;
@@ -31,14 +36,120 @@ const IMAGE_PAD: &str = "<|image_pad|>";
 /// Most CPU threads the tower takes, so other work on the host keeps some cores.
 const MAX_THREADS: usize = 8;
 
+/// Host memory the encoded images' rows may keep (a 1024 × 768 image's are 7.5 MiB at the
+/// width of Qwen3.8-Flash-Next).
+const ROW_CACHE_BYTES: usize = 256 << 20;
+
 /// The language models whose positions are Qwen-VL's M-RoPE: Qwen3.5 / Qwen3.6 and
 /// Qwen3.8-Flash-Next (`qwen4exp`, whose image tokens' n-gram rows hash `<|image_pad|>` as the
 /// reference does: the placeholders stay in the token stream).
 const ARCHS: [&str; 3] = ["qwen35", "qwen35moe", "qwen4exp"];
 
 pub(super) struct Vision {
-    encoder: Mutex<Encoder>,
+    tower: Mutex<Tower>,
+    hp: VisionHparams,
     image_pad: u32,
+    rows: Mutex<RowCache>,
+}
+
+/// Where the tower runs.
+enum Tower {
+    Cpu(Encoder),
+    #[cfg(feature = "cuda")]
+    Gpu(crate::vision::GpuEncoder),
+}
+
+impl Tower {
+    fn config(&self) -> &EncoderConfig {
+        match self {
+            Tower::Cpu(e) => e.config(),
+            #[cfg(feature = "cuda")]
+            Tower::Gpu(e) => e.config(),
+        }
+    }
+
+    fn encode(&mut self, p: &Preprocessed) -> Result<ImageEmbedding, VisionError> {
+        match self {
+            Tower::Cpu(e) => e.encode(p),
+            #[cfg(feature = "cuda")]
+            Tower::Gpu(e) => e.encode(p),
+        }
+    }
+
+    /// The CPU tower `enc`, or its weights on CUDA device `gpu` when the kernels take it.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+    fn place(enc: Encoder, gpu: Option<usize>) -> Self {
+        #[cfg(feature = "cuda")]
+        {
+            let cpu_only = std::env::var_os("LEGION_DEBUG_VISION_CPU").is_some_and(|v| v == "1");
+            if let Some(dev) = gpu.filter(|_| !cpu_only) {
+                match crate::vision::GpuEncoder::new(&enc, dev) {
+                    Ok(Some(g)) => return Tower::Gpu(g),
+                    Ok(None) => tracing::info!(
+                        device = dev,
+                        "vision: the GPU tower does not take this device or tower; it runs on \
+                         the CPU"
+                    ),
+                    Err(e) => tracing::warn!(
+                        device = dev,
+                        error = %e,
+                        "vision: the tower did not load on the GPU; it runs on the CPU"
+                    ),
+                }
+            }
+        }
+        Tower::Cpu(enc)
+    }
+
+    /// Device memory the largest image's scratch takes on the GPU (0 on the CPU).
+    fn scratch_bytes(&self) -> usize {
+        match self {
+            Tower::Cpu(_) => 0,
+            #[cfg(feature = "cuda")]
+            Tower::Gpu(e) => e.scratch_bytes(),
+        }
+    }
+
+    fn place_name(&self) -> String {
+        match self {
+            Tower::Cpu(_) => "the CPU".into(),
+            #[cfg(feature = "cuda")]
+            Tower::Gpu(e) => format!("GPU {}", e.device()),
+        }
+    }
+}
+
+/// Encoded images' rows by the image's hash and grid, least recently used first.
+#[derive(Default)]
+struct RowCache {
+    entries: Vec<(u64, usize, usize, Arc<[f32]>)>,
+    bytes: usize,
+}
+
+impl RowCache {
+    fn get(&mut self, hash: u64, nx: usize, ny: usize) -> Option<Arc<[f32]>> {
+        let i = self
+            .entries
+            .iter()
+            .position(|e| (e.0, e.1, e.2) == (hash, nx, ny))?;
+        let e = self.entries.remove(i);
+        let rows = e.3.clone();
+        self.entries.push(e);
+        Some(rows)
+    }
+
+    fn put(&mut self, hash: u64, nx: usize, ny: usize, rows: Arc<[f32]>, limit: usize) {
+        let size = rows.len() * 4;
+        if size > limit || self.get(hash, nx, ny).is_some() {
+            return;
+        }
+        while self.bytes + size > limit {
+            let e = self.entries.remove(0);
+            self.bytes -= e.3.len() * 4;
+        }
+        self.bytes += size;
+        self.entries.push((hash, nx, ny, rows));
+    }
 }
 
 /// An image of a prompt, placed and preprocessed, not yet encoded.
@@ -52,28 +163,31 @@ pub(super) struct Pending {
 
 impl Vision {
     /// Loads the mmproj `path` (`--mmproj`) for a language model of architecture `arch` and
-    /// width `n_embd`.
+    /// width `n_embd`, onto CUDA device `gpu` when there is one.
     pub(super) fn load(
         path: &Path,
         arch: &str,
         n_embd: usize,
         tokenizer: &Tokenizer,
         threads: usize,
+        gpu: Option<usize>,
     ) -> Result<Self, LoadError> {
         let err = |e: String| LoadError::Device(format!("--mmproj {}: {e}", path.display()));
         Self::check_arch(arch).map_err(err)?;
         let g = GgufFile::open(path).map_err(|e| err(e.to_string()))?;
-        Self::from_gguf(&g, n_embd, tokenizer, threads).map_err(err)
+        Self::from_gguf(&g, n_embd, tokenizer, threads, gpu).map_err(err)
     }
 
     /// The vision tower the HF checkpoint `dir` ships (`model.visual.*`), if it has one, for a
-    /// language model of architecture `arch` and width `n_embd`.
+    /// language model of architecture `arch` and width `n_embd`, onto CUDA device `gpu` when
+    /// there is one.
     pub(super) fn from_checkpoint(
         dir: &Path,
         arch: &str,
         n_embd: usize,
         tokenizer: &Tokenizer,
         threads: usize,
+        gpu: Option<usize>,
     ) -> Result<Option<Self>, String> {
         if Self::check_arch(arch).is_err() {
             return Ok(None);
@@ -81,7 +195,7 @@ impl Vision {
         let Some(g) = crate::hf::open_vision(dir).map_err(|e| e.to_string())? else {
             return Ok(None);
         };
-        Self::from_gguf(&g, n_embd, tokenizer, threads).map(Some)
+        Self::from_gguf(&g, n_embd, tokenizer, threads, gpu).map(Some)
     }
 
     fn check_arch(arch: &str) -> Result<(), String> {
@@ -100,6 +214,7 @@ impl Vision {
         n_embd: usize,
         tokenizer: &Tokenizer,
         threads: usize,
+        gpu: Option<usize>,
     ) -> Result<Self, String> {
         let image_pad = tokenizer
             .token_id(IMAGE_PAD)
@@ -113,15 +228,28 @@ impl Vision {
                 "its rows are {out} wide, the language model's embeddings {n_embd}"
             ));
         }
+        let hp = encoder.hparams().clone();
+        // The GPU tower keeps its own copy of the weights: the CPU tower's are dropped then.
+        let tower = Tower::place(encoder, gpu);
         tracing::info!(
             tower = %g.path().display(),
-            layers = encoder.config().n_layer,
-            "vision: images accepted (the vision tower runs on the CPU)"
+            layers = tower.config().n_layer,
+            largest_image_scratch_mib = tower.scratch_bytes() >> 20,
+            "vision: images accepted (the vision tower runs on {})",
+            tower.place_name()
         );
         Ok(Self {
-            encoder: Mutex::new(encoder),
+            tower: Mutex::new(tower),
+            hp,
             image_pad,
+            rows: Mutex::new(RowCache::default()),
         })
+    }
+
+    /// Device memory the GPU tower's largest image's scratch takes (0 on the CPU), for the
+    /// language model's budgets on that GPU.
+    pub(super) fn gpu_scratch_bytes(&self) -> usize {
+        self.tower.lock().unwrap().scratch_bytes()
     }
 
     /// Expands each `<|image_pad|>` of `tokens` (one per image, in order) to its image's tokens.
@@ -137,12 +265,7 @@ impl Vision {
                 images.len()
             )));
         }
-        let hp = self
-            .encoder
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .hparams()
-            .clone();
+        let hp = &self.hp;
         let merge = hp.spatial_merge_size as usize;
         let mut out = Vec::with_capacity(tokens.len());
         let mut pending = Vec::with_capacity(images.len());
@@ -153,7 +276,7 @@ impl Vision {
                 continue;
             }
             let img = images.next().expect("as many images as placeholders");
-            let pixels = crate::vision::preprocess(&hp, &img.bytes)
+            let pixels = crate::vision::preprocess(hp, &img.bytes)
                 .map_err(|e| EngineError::InvalidRequest(format!("image: {e}")))?;
             let (nx, ny) = (
                 pixels.grid_w as usize / merge,
@@ -183,29 +306,51 @@ impl Vision {
         let mut spans = Vec::with_capacity(pending.len());
         let mut n_embd = 0;
         for p in pending {
-            let t = std::time::Instant::now();
-            let e = blocking(|| {
-                self.encoder
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .encode(&p.pixels)
-            })
-            .map_err(|e| EngineError::Internal(format!("vision encoder: {e}")))?;
-            assert_eq!((e.nx, e.ny), (p.nx, p.ny), "the tower's grid");
-            tracing::info!(
-                tokens = e.n_tokens(),
-                ms = t.elapsed().as_millis() as u64,
-                "vision: image encoded"
-            );
-            n_embd = e.n_embd;
-            for (i, k) in key[p.start..p.start + e.n_tokens()].iter_mut().enumerate() {
+            let cached = self
+                .rows
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(p.hash, p.nx, p.ny);
+            let rows = match cached {
+                Some(rows) => {
+                    tracing::info!(tokens = p.nx * p.ny, "vision: image rows from the cache");
+                    rows
+                }
+                None => {
+                    let t = std::time::Instant::now();
+                    let e = blocking(|| {
+                        self.tower
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .encode(&p.pixels)
+                    })
+                    .map_err(|e| EngineError::Internal(format!("vision encoder: {e}")))?;
+                    assert_eq!((e.nx, e.ny), (p.nx, p.ny), "the tower's grid");
+                    tracing::info!(
+                        tokens = e.n_tokens(),
+                        ms = t.elapsed().as_millis() as u64,
+                        "vision: image encoded"
+                    );
+                    let rows: Arc<[f32]> = e.data.into();
+                    self.rows.lock().unwrap_or_else(|e| e.into_inner()).put(
+                        p.hash,
+                        p.nx,
+                        p.ny,
+                        rows.clone(),
+                        ROW_CACHE_BYTES,
+                    );
+                    rows
+                }
+            };
+            n_embd = rows.len() / (p.nx * p.ny);
+            for (i, k) in key[p.start..p.start + p.nx * p.ny].iter_mut().enumerate() {
                 *k = image_key(p.hash, i);
             }
             spans.push(ImageSpan {
                 start: p.start,
-                nx: e.nx,
-                ny: e.ny,
-                rows: e.data.into(),
+                nx: p.nx,
+                ny: p.ny,
+                rows,
             });
         }
         Ok((Arc::new(Media::new(spans, n_embd)), key))
