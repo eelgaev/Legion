@@ -37,7 +37,9 @@ pub mod shard;
 pub use profile::{StepLaps, StepProfile};
 
 pub use comm::{ArStats, Comm, StepMarks};
-pub use op::{all_reduce, all_reduce_add, all_reduce_ahead};
+pub use op::{
+    Norm, Normed, all_reduce, all_reduce_add, all_reduce_add_norm, all_reduce_ahead, normed,
+};
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};

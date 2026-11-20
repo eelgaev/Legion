@@ -540,9 +540,10 @@ fn handles_unregister() {
     let cs = comms(2, Duration::from_secs(5));
     let h = register(cs[0].clone());
     let id = h.id();
-    assert!(comm(id).is_some());
+    assert!(comm(id).is_some_and(|c| Arc::ptr_eq(&c, &cs[0])));
     drop(h);
-    assert!(comm(id).is_none());
+    // Another test running at the same time may take the freed slot: only ours must be gone.
+    assert!(comm(id).is_none_or(|c| !Arc::ptr_eq(&c, &cs[0])));
 }
 
 /// Every byte of `t` as the loader reads it from `g` (its recipe, or its file range).

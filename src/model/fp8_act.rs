@@ -334,6 +334,139 @@ struct Fp8Act {
     silu: i32,
     eps: f32,
     bf: *mut u16,
+    srcs: [*const c_void; 8],
+    n_src: i32,
+    src_bf16: i32,
+    res: *const f32,
+    xs: *mut f32,
+}
+
+#[cfg(feature = "cuda")]
+impl Fp8Act {
+    /// A row kind's arguments with every pointer null and every count 0.
+    fn of(kind: i32) -> Self {
+        Self {
+            kind,
+            x: std::ptr::null(),
+            x_ld: 0,
+            x_hd: 0,
+            w: std::ptr::null(),
+            g: std::ptr::null(),
+            g_ld: 0,
+            out: std::ptr::null_mut(),
+            scales: std::ptr::null_mut(),
+            k: 0,
+            n: 0,
+            d: 0,
+            silu: 0,
+            eps: 0.0,
+            bf: std::ptr::null_mut(),
+            srcs: [std::ptr::null(); 8],
+            n_src: 0,
+            src_bf16: 0,
+            res: std::ptr::null(),
+            xs: std::ptr::null_mut(),
+        }
+    }
+}
+
+/// `sum_norm` of `src/cuda/fp8_act.cu`.
+#[cfg(feature = "cuda")]
+const SUM_NORM: i32 = 4;
+
+/// Where [`sum_rms_norm`] writes a piece of `n` tokens: the sums `xs` (F32 `[k, n]`), the
+/// packed codes `out` (`[k, n]`) and their `scales` (`[n]`), and with `bf` the normed rows in
+/// BF16 (`[k, n]`), all device pointers at the piece's first token.
+#[cfg(feature = "cuda")]
+pub(crate) struct SumNormOut {
+    pub xs: *mut f32,
+    pub out: *mut u8,
+    pub scales: *mut f32,
+    pub bf: *mut u16,
+}
+
+/// The finish of a tensor-parallel all-reduce with the next layer's input norm (#1133): `xs`
+/// = the sum of `srcs` (rank order; F32, or BF16 with `src_bf16`) plus `res` per value, the
+/// bits of `src/cuda/tp_net.cu`'s sums, and of `xs` [`rms_norm`]'s packed activations for the
+/// weight `w` (and with `bf` [`rms_norm_bf16`]'s BF16 rows), the bits of those ops on `xs`, in
+/// one pass: `xs` is not read back. `k` values a token, `n` tokens, rows contiguous. The
+/// launch's result (0 on success; 1: a shape the kernel does not take).
+///
+/// # Safety
+/// Device-readable `srcs` (1 to 8 of them), `res` and `w`, device-writable `o`, sized as
+/// documented, on the stream's device.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn sum_rms_norm(
+    srcs: &[*const c_void],
+    src_bf16: bool,
+    res: Option<*const f32>,
+    w: *const f32,
+    eps: f32,
+    o: &SumNormOut,
+    (k, n): (usize, usize),
+    stream: *mut c_void,
+) -> i32 {
+    if srcs.is_empty() || srcs.len() > 8 || k as i64 > MAX_K || n > i32::MAX as usize {
+        return 1;
+    }
+    let mut a = Fp8Act::of(SUM_NORM);
+    a.srcs[..srcs.len()].copy_from_slice(srcs);
+    a.n_src = srcs.len() as i32;
+    a.src_bf16 = i32::from(src_bf16);
+    a.res = res.unwrap_or(std::ptr::null());
+    a.xs = o.xs;
+    a.w = w;
+    a.eps = eps;
+    a.out = o.out;
+    a.scales = o.scales;
+    a.bf = o.bf;
+    a.k = k as i32;
+    a.n = n as i32;
+    // SAFETY: the caller's pointers, as documented.
+    unsafe { legion_fp8_act_launch(&a, stream) }
+}
+
+/// [`sum_rms_norm`]'s norm on the CPU, for tokens `t0..t0 + n` of `xs` (`k` values each, the
+/// sums already there): the packed codes and scales of a node of `total` tokens at `aux` (with
+/// `bf` the BF16 rows first, as [`rms_norm_bf16`]'s node), as [`rms_norm`]'s CPU reference.
+///
+/// # Safety
+/// `aux` holds the node's packed activations (and BF16 rows) for `total` tokens of `k` values.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn rms_norm_host(
+    xs: &[f32],
+    w: &[f32],
+    eps: f32,
+    k: usize,
+    (t0, total): (usize, usize),
+    aux: *mut u8,
+    bf: bool,
+) {
+    let (codes, _) = fp8::dynamic_layout(k as i64, total as i64);
+    // SAFETY: the caller's.
+    unsafe {
+        let out = aux.add(if bf { 2 * k * total } else { 0 });
+        let scales = out.add(codes) as *mut f32;
+        let mut row = vec![0f32; k];
+        for (i, x) in xs.chunks_exact(k).enumerate() {
+            let t = t0 + i;
+            let mean = x.iter().map(|v| v * v).sum::<f32>() / k as f32;
+            let scale = 1.0 / (mean + eps).sqrt();
+            for (j, v) in row.iter_mut().enumerate() {
+                *v = scale * x[j] * w[j];
+            }
+            if bf {
+                let b = aux as *mut u16;
+                for (j, v) in row.iter().enumerate() {
+                    *b.add(t * k + j) = crate::model::nvfp4_mm::bf16_bits(*v);
+                }
+            }
+            let (q, s) = fp8::quantize_token(&row);
+            std::ptr::copy_nonoverlapping(q.as_ptr(), out.add(t * k), k);
+            scales.add(t).write_unaligned(s);
+        }
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -361,21 +494,13 @@ pub(crate) unsafe fn quantize_plain(
         return None;
     }
     let p = Fp8Act {
-        kind: 0,
         x,
         x_ld,
-        x_hd: 0,
-        w: std::ptr::null(),
-        g: std::ptr::null(),
-        g_ld: 0,
         out,
         scales,
         k: k as i32,
         n: n as i32,
-        d: 0,
-        silu: 0,
-        eps: 0.0,
-        bf: std::ptr::null_mut(),
+        ..Fp8Act::of(0)
     };
     // SAFETY: the caller's pointers, as documented.
     match unsafe { legion_fp8_act_launch(&p, stream) } {
@@ -403,21 +528,14 @@ unsafe fn cuda_fp8_act(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<()
             2 * k as usize * n as usize
         });
         let mut a = Fp8Act {
-            kind: p[0],
             x: x.data as *const f32,
             x_ld: (x.nb[1] / 4) as i64,
-            x_hd: 0,
-            w: std::ptr::null(),
-            g: std::ptr::null(),
-            g_ld: 0,
             out,
             scales: out.add(codes) as *mut f32,
             k,
             n: n as i32,
-            d: 0,
-            silu: 0,
-            eps: 0.0,
             bf,
+            ..Fp8Act::of(p[0])
         };
         if p[0] == Kind::RmsNorm as i32 {
             a.w = (*dst.src[1]).data as *const f32;

@@ -165,6 +165,28 @@ impl Arch for Qwen35 {
         // Prompt steps under tensor parallelism over machines: the sums in two halves of the
         // tokens where a layer's FFN allows (#1133, the same bits).
         let halves = if fuse { None } else { halves::comm(m, pass) };
+        // Under tensor parallelism over machines, the norm that reads a sum's output computed by
+        // the sum's finish where it can (#1133, the same bits): layer `il`'s input norm by the
+        // previous layer's FFN sum (`pre`), and a whole layer's post-attention norm.
+        let end = layers.end.min(hp.n_layer);
+        let mut pre: Option<crate::tp_net::Normed<'a>> = None;
+        // The fold of layer `nl`'s input norm into the sum that makes `like`'s shape.
+        let in_norm = |nl: usize, like: Tensor<'a>| -> Result<_, ModelError> {
+            if nl >= end {
+                return Ok(None);
+            }
+            let w = m.lw(nl, "attn_norm.weight")?;
+            let rec = hp.is_recurrent(nl);
+            let both = m.tp_net_comm().is_some() && rec;
+            let reader = if rec {
+                "attn_qkv.weight"
+            } else {
+                "attn_q.weight"
+            };
+            let eps = hp.rms_eps;
+            Ok(m.norm_fold(pass, like, w, both, (nl, reader))
+                .map(|bf16| crate::tp_net::Norm { w, eps, bf16 }))
+        };
         for il in layers {
             let split = halves
                 .filter(|_| halves::ffn_fits(m, il, n))
@@ -172,7 +194,11 @@ impl Arch for Qwen35 {
             // A gated DeltaNet layer's input feeds BF16 (beta / alpha) and FP8 matmuls; a rank's
             // share's too (#1133 r2: its two ops' bits from one op).
             let both = (fuse || m.tp_net_comm().is_some()) && hp.is_recurrent(il);
-            let h = m.norm_mul_with(pass, x, m.lw(il, "attn_norm.weight")?, both);
+            let attn_norm = m.lw(il, "attn_norm.weight")?;
+            let h = match pre.take() {
+                Some(nd) => m.norm_mul_folded(pass, x, attn_norm, nd.q, nd.b),
+                None => m.norm_mul_with(pass, x, attn_norm, both),
+            };
             if fuse {
                 let x_attn = if hp.is_recurrent(il) {
                     m.delta_net_res(pass, il, h, Some(x))?
@@ -197,7 +223,10 @@ impl Arch for Qwen35 {
                 m.attention(pass, il, h)?
             };
             if let Some((comm, xs)) = split {
-                x = halves::tail(m, pass, il, xs, attn, comm)?;
+                let next = in_norm(il + 1, x)?;
+                let (y, nd) = halves::tail(m, pass, il, xs, attn, comm, next)?;
+                x = y;
+                pre = nd;
                 if capture.contains(&il) {
                     hidden.push((il, x));
                 }
@@ -205,13 +234,45 @@ impl Arch for Qwen35 {
             }
             // A rank's share of the heads gives a partial output (`--tp 2`; `attn` without);
             // over machines the residual is added in the sum's kernel (#1133 r2, the same
-            // bits).
-            let x_attn = m.tp_sum_add(ctx, attn, x);
+            // bits), and the post-attention norm where its FFN reads its FP8 codes (#1133).
+            let post_w = m.lw(il, "post_attention_norm.weight")?;
+            let comm = m.tp_net_comm().filter(|_| attn.ne() == x.ne());
+            let post = match comm {
+                Some(_) => m.norm_fold(pass, x, post_w, false, (il, "ffn_gate.weight")),
+                None => None,
+            };
+            let (x_attn, h) = match (comm, post) {
+                (Some(comm), Some(bf16)) => {
+                    let eps = hp.rms_eps;
+                    let nm = crate::tp_net::Norm {
+                        w: post_w,
+                        eps,
+                        bf16,
+                    };
+                    let nd = crate::tp_net::all_reduce_add_norm(ctx, comm, attn, x, nm);
+                    (nd.y, m.norm_mul_folded(pass, nd.y, post_w, nd.q, nd.b))
+                }
+                _ => {
+                    let x_attn = m.tp_sum_add(ctx, attn, x);
+                    (x_attn, m.norm_mul(pass, x_attn, post_w))
+                }
+            };
             pass.tap.tap("attn_residual", il, x_attn);
-            let h = m.norm_mul(pass, x_attn, m.lw(il, "post_attention_norm.weight")?);
             pass.tap.tap("attn_post_norm", il, h);
             if !hp.moe && !pass.tap.on {
-                x = m.tp_sum_add(ctx, m.ffn(ctx, il, h)?, x_attn);
+                let ffn = m.ffn(ctx, il, h)?;
+                let next = match m.tp_net_comm().filter(|_| ffn.ne() == x_attn.ne()) {
+                    Some(comm) => in_norm(il + 1, x_attn)?.map(|nm| (comm, nm)),
+                    None => None,
+                };
+                x = match next {
+                    Some((comm, nm)) => {
+                        let nd = crate::tp_net::all_reduce_add_norm(ctx, comm, ffn, x_attn, nm);
+                        pre = Some(nd);
+                        nd.y
+                    }
+                    None => m.tp_sum_add(ctx, ffn, x_attn),
+                };
             } else {
                 let ffn = if hp.moe {
                     m.moe(ctx, &pass.tap, &pass.graph, il, h, n, pass.prompt_only())?
