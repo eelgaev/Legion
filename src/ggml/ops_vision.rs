@@ -51,4 +51,32 @@ impl Context {
             ffi::ggml_soft_max_ext(self.raw(), a.raw(), std::ptr::null_mut(), scale, 0.0)
         })
     }
+
+    /// The RoPE node `a` (a `rope_ext` result) rotating the dimensions from `offset` on
+    /// instead of from 0 (`ggml_rope_set_offset`); `a` itself.
+    pub fn rope_offset<'a>(&'a self, a: Tensor<'a>, offset: i32) -> Tensor<'a> {
+        self.wrap(unsafe { ffi::ggml_rope_set_offset(a.raw(), offset) })
+    }
+
+    /// Average pooling of `a` (`[w, h, c, n]`) over `k × k` windows at stride `k`, no padding.
+    pub fn avg_pool_2d<'a>(&'a self, a: Tensor<'a>, k: i32) -> Tensor<'a> {
+        self.wrap(unsafe {
+            ffi::ggml_pool_2d(
+                self.raw(),
+                a.raw(),
+                ffi::ggml_op_pool_GGML_OP_POOL_AVG,
+                k,
+                k,
+                k,
+                k,
+                0.0,
+                0.0,
+            )
+        })
+    }
+
+    /// `a` made contiguous as `[ne0, ne1, ne2, ne3]`.
+    pub fn cont_4d<'a>(&'a self, a: Tensor<'a>, ne: [i64; 4]) -> Tensor<'a> {
+        self.wrap(unsafe { ffi::ggml_cont_4d(self.raw(), a.raw(), ne[0], ne[1], ne[2], ne[3]) })
+    }
 }

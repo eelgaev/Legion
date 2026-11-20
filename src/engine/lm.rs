@@ -989,6 +989,35 @@ fn load_vision(
     })
 }
 
+/// The most tokens one image takes when the language model's image tokens see each other
+/// (Gemma 4, `bidirectional`; #1217): such an image runs whole in one step and one micro-chunk,
+/// so the sliding-window rings must hold a step of that many tokens. From the pixel limits of
+/// the tower [`load_vision`] loads, read from its metadata alone (on a GPU sharing the host's
+/// memory the rings are sized before the tower loads), also on the ranks that load none (they
+/// run rank 0's steps). 0 without a tower, or with images that read causally (Qwen-VL): the
+/// rings and steps as without images.
+fn largest_image(cfg: &LmConfig, bidirectional: bool) -> usize {
+    if !bidirectional || cfg.node.is_some() {
+        return 0;
+    }
+    let tower = match &cfg.mmproj {
+        Some(path) => GgufFile::open(path).ok(),
+        None if cfg.no_mmproj || !cfg.model_path.is_dir() => None,
+        None => crate::hf::open_vision(&cfg.model_path).ok().flatten(),
+    };
+    tower
+        .and_then(|g| crate::vision::VisionHparams::from_gguf(&g).ok())
+        .map_or(0, |hp| hp.max_image_tokens())
+}
+
+/// The ring step [`KvRing::for_window`] sizes the sliding-window rings for: a prompt step of
+/// `ring_step` tokens, a verify step of `spec_k + 1`, or an image of `image` tokens
+/// ([`largest_image`]) in a step or micro-chunk of its own, whichever is longest. Without
+/// images (`image` 0) the step as before #1217.
+pub(crate) fn ring_hold(ring_step: usize, spec_k: usize, image: usize) -> usize {
+    ring_step.max(spec_k + 1).max(image)
+}
+
 /// With the expert cache, the default KV pool: at least `--ctx-size`, at most this many tokens
 /// (Strata's `--kv-resident` default). Sequences wait for KV blocks when it is full; the VRAM
 /// goes to expert slots, which every step reads. `--kv-cache-tokens` overrides it.
@@ -4427,6 +4456,9 @@ impl LmEngine {
         };
         // The GPU tower's scratch at the largest image (0 on the CPU, or not loaded yet).
         let early_scratch = vision.as_ref().map_or(0, |v| v.gpu_scratch_bytes());
+        // An image whose tokens see each other runs whole (#1217): steps and micro-chunks of
+        // up to this many tokens for it, and rings that hold them.
+        let image_step = largest_image(&cfg, hp.arch.image_tokens_bidirectional());
         let max_seqs = cfg.max_seqs.max(1);
         let prefill_slots = cfg.prefill_slots.max(1);
         let saved_slots = cfg.prefix_cache_states;
@@ -4533,9 +4565,21 @@ impl LmEngine {
         );
         let rings_on = use_rings(&hp, &cfg, paged);
         let ring_for = |step: usize| {
-            rings_on.then(|| KvRing::for_window(window, step.max(spec_k + 1), max_seqs))
+            rings_on
+                .then(|| KvRing::for_window(window, ring_hold(step, spec_k, image_step), max_seqs))
         };
         let mut ring = ring_for(ring_step);
+        if rings_on && image_step > ring_hold(ring_step, spec_k, 0) {
+            tracing::info!(
+                ring_step,
+                image_tokens = image_step,
+                ring_positions_text =
+                    KvRing::for_window(window, ring_hold(ring_step, spec_k, 0), 1).positions(),
+                ring_positions = ring.map_or(0, |r| r.positions()),
+                "sliding-window rings hold the largest image (its tokens see each other: it \
+                 runs in one step)"
+            );
+        }
         // Per stage: what its states take, and how many KV blocks fit next to them.
         let ctx_blocks = cfg.ctx_size.div_ceil(KV_BLOCK);
         let shared = layout
@@ -4895,6 +4939,8 @@ impl LmEngine {
             None => cfg.pipeline_micro,
         };
         exec.set_pipeline_micro(micro);
+        // An image in one micro-chunk even past it (the rings hold it, `ring_hold`).
+        exec.set_image_step(image_step);
         let pipeline_prompt = if layout.stages.len() > 1 && micro > 0 {
             cfg.pipeline_prompt
         } else {
@@ -5989,6 +6035,7 @@ impl LmEngine {
             prefill_chunk: cfg.prefill_chunk.max(1),
             prefill_even: cfg.prefill_even,
             ring_step,
+            image_step,
             max_ctx: cfg.ctx_size,
             reserved: 0,
             stats: stats.clone(),
@@ -6363,6 +6410,9 @@ struct Worker {
     prefill_even: bool,
     /// With rings: the most prompt tokens a sequence takes per step ([`LmConfig::ring_step`]).
     ring_step: usize,
+    /// The most tokens one image whose tokens see each other takes ([`largest_image`]; 0
+    /// without): a step holds such an image whole even past its room (the rings hold it).
+    image_step: usize,
     /// Max tokens per sequence.
     max_ctx: usize,
     /// Blocks promised to admitted sequences and not yet allocated: admission only counts free
@@ -8359,6 +8409,7 @@ impl Worker {
             budget = KV_BLOCK;
         }
         let mut chunks = Vec::new();
+        let bidir = self.exec.model().hp.arch.image_tokens_bidirectional();
         for (i, seq) in prefilling.iter_mut().enumerate() {
             let take = if riders && !chunks.is_empty() {
                 chunk.min(budget).min(ride)
@@ -8368,6 +8419,8 @@ impl Worker {
             if take == 0 {
                 break;
             }
+            // The most this step can hold of the prompt (the batch, rings and riders allow it).
+            let room = take;
             let take = if self.prefill_even || tier_pass {
                 even::even_take(
                     seq.prompt.len() - seq.n_past,
@@ -8378,12 +8431,19 @@ impl Worker {
                 take
             };
             let end = self.save_cut(seq, (seq.n_past + take).min(seq.prompt.len()));
+            // An image whose tokens see each other runs in one step (#1217): a step stops at
+            // its start, the next takes it whole, past the room when it is longer (up to the
+            // largest image, which the rings hold). Text steps keep their room.
+            let end = match seq.media() {
+                Some(m) if bidir => m.uncut(seq.n_past, end, room.max(self.image_step)),
+                _ => end,
+            };
             let len = end - seq.n_past;
             if len == 0 {
                 continue;
             }
             self.grow(seq, end)?;
-            budget -= len;
+            budget = budget.saturating_sub(len);
             // A lead of at most a micro-chunk runs in one graph with the riders: they share it.
             if !chunks.is_empty() || len <= micro {
                 ride = ride.saturating_sub(len);

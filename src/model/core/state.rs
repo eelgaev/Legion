@@ -66,6 +66,12 @@ impl KvRing {
     pub fn positions(&self) -> usize {
         self.blocks * KV_BLOCK
     }
+
+    /// Whether these rings, for a sliding window of `window` positions, hold steps of `step`
+    /// tokens (as [`Self::for_window`] sizes them).
+    pub fn holds(&self, window: usize, step: usize) -> bool {
+        Self::for_window(window, step, self.sets).blocks <= self.blocks
+    }
 }
 
 /// K and V of every attention layer, `n_blocks × KV_BLOCK` cells.

@@ -53,6 +53,16 @@ gives most of the prefill and 16-user gain (16 users ~187); the 8-bit drafter an
 draft pass cheaper (16 users ~212 with both). `--spec-draft-vocab 131072` on top cuts the accepted length
 to ~2.3 and is slower at every concurrency.
 
+### Images
+
+The checkpoint ships its vision tower unquantized (`model.vision_tower.*`), and the command above loads it:
+requests may carry images, and `/v1/models` lists `vision` (`--no-mmproj` leaves it out). The tower runs on the
+GPU (2026-11-19): a 1024 × 768 image (336 image tokens) encodes in 0.39 s and its first token comes 0.78 s after
+the request (0.38 s when the same image is sent again); smaller images (102-221 tokens) encode in 65-194 ms,
+TTFT 0.39-0.56 s. Image rows reach the DFlash drafter through the target's hidden states as text does. Text-only
+requests give the same output as the build without the tower, at the same speed (`--deterministic` 4 users 81.1
+tok/s against 82.0, 1 user 28.8 against 28.7, 8K prefill 2,006 against 1,995).
+
 ## What each flag does
 
 - `--max-seqs` (`16`): How many requests are decoded at once (continuous batching). Set to the highest concurrency the benchmark uses.

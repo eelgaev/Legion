@@ -5,6 +5,7 @@
 //! SwiGLU FFN. The blocks are the core's ([`crate::model::core`]); this module stacks them,
 //! following llama.cpp's `src/models/qwen35moe.cpp` and `qwen35.cpp` (MIT) op for op.
 
+mod halves;
 mod mtp;
 pub mod tiny;
 
@@ -161,7 +162,13 @@ impl Arch for Qwen35 {
         // Not on a rank's share (`--tp 2`, #1163): its partial outputs are summed before the
         // residual add.
         let fuse = !pass.tap.on && !hp.moe && !m.tp_active() && m.linear.residual_fusion(n);
+        // Prompt steps under tensor parallelism over machines: the sums in two halves of the
+        // tokens where a layer's FFN allows (#1133, the same bits).
+        let halves = if fuse { None } else { halves::comm(m, pass) };
         for il in layers {
+            let split = halves
+                .filter(|_| halves::ffn_fits(m, il, n))
+                .map(|c| (c, halves::views(pass, x)));
             // A gated DeltaNet layer's input feeds BF16 (beta / alpha) and FP8 matmuls.
             let both = fuse && hp.is_recurrent(il);
             let h = m.norm_mul_with(pass, x, m.lw(il, "attn_norm.weight")?, both);
@@ -188,6 +195,13 @@ impl Arch for Qwen35 {
             } else {
                 m.attention(pass, il, h)?
             };
+            if let Some((comm, xs)) = split {
+                x = halves::tail(m, pass, il, xs, attn, comm)?;
+                if capture.contains(&il) {
+                    hidden.push((il, x));
+                }
+                continue;
+            }
             // A rank's share of the heads gives a partial output (`--tp 2`; `attn` without).
             let attn = m.tp_sum(ctx, attn);
             let x_attn = ctx.add(attn, x);

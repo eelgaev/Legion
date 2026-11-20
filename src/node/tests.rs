@@ -60,7 +60,7 @@ fn requests_round_trip() {
         Request::CopyStates {
             copies: vec![(1, 2, 0, 3), (0, 9, 1, 0)],
         },
-        tp_hello(3, 2, 60, 999),
+        tp_hello(3, 2, 60, 999, 1120),
         Request::TpStep {
             groups: match step() {
                 Request::Step { groups, .. } => groups,
@@ -257,6 +257,21 @@ fn tp_hello_checks_the_build_ranks_and_model() {
     assert!(check_tp_hello((VERSION, 3, 1, 60), mine).is_err());
     assert!(check_tp_hello((VERSION, 2, 0, 60), mine).is_err());
     assert!(check_tp_hello((VERSION, 2, 1, 48), mine).is_err());
+}
+
+/// A rank takes rank 0's whole-image steps (#1217) only when its rings hold them: rings sized
+/// for 512-token steps of a 1,024-position window hold no 1,120-token image, rings sized for
+/// it (or 2,048-token steps) do; no rings, or no images, always.
+#[test]
+fn tp_hello_checks_the_rings_hold_whole_images() {
+    use crate::model::core::KvRing;
+    let ring = |step| Some(KvRing::for_window(1024, step, 16));
+    assert!(check_tp_image_step(ring(512), 1024, 1120).is_err());
+    assert!(check_tp_image_step(ring(512), 1024, 512).is_ok());
+    assert!(check_tp_image_step(ring(1120), 1024, 1120).is_ok());
+    assert!(check_tp_image_step(ring(2048), 1024, 1120).is_ok());
+    assert!(check_tp_image_step(ring(512), 1024, 0).is_ok());
+    assert!(check_tp_image_step(None, 1024, 1120).is_ok());
 }
 
 #[test]

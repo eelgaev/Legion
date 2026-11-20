@@ -225,6 +225,9 @@ pub struct Model {
     selector: Option<Selector>,
     /// `--tp-draft-split`: the FFN's share this rank holds ([`super::TpShare`]).
     tp: Option<super::TpShare>,
+    /// `--tp-draft-split` on two ranks, DFlash 2: the head split over them
+    /// ([`super::tp_head`]).
+    tp_head: Option<super::tp_head::Split>,
 }
 
 /// `n` values of `ty` in `bytes` as floats (F32 has no conversion function in ggml's table).
@@ -273,6 +276,36 @@ fn conv<'a>(
 fn part<T: Clone>(v: &[T], n: usize, s: usize) -> Vec<T> {
     let len = v.len() / n;
     v[s * len..(s + 1) * len].to_vec()
+}
+
+/// A batched pass's output rows `all` as each of its `n_seq` sequences' rows.
+fn per_seq(all: Rows, n_seq: usize) -> Vec<Rows> {
+    if n_seq == 1 {
+        return vec![all];
+    }
+    (0..n_seq)
+        .map(|s| Rows {
+            argmax: part(&all.argmax, n_seq, s),
+            logits: all.logits.as_deref().map(|l| part(l, n_seq, s)),
+            hidden: all.hidden.as_deref().map(|h| part(h, n_seq, s)),
+            selector: all
+                .selector
+                .as_ref()
+                .map(|(t, u, p)| (part(t, n_seq, s), part(u, n_seq, s), part(p, n_seq, s))),
+        })
+        .collect()
+}
+
+/// No rows for each of `n_seq` sequences (a pass on a rank above 0 of `--tp-draft-split`).
+fn no_rows(n_seq: usize) -> Vec<Rows> {
+    (0..n_seq)
+        .map(|_| Rows {
+            argmax: Vec::new(),
+            logits: None,
+            hidden: None,
+            selector: None,
+        })
+        .collect()
 }
 
 /// Sequence `s`'s block of `n` positions in a batched `[a, b, n_seq · n]` tensor: a contiguous
@@ -598,14 +631,44 @@ impl Model {
             markov,
             selector,
             tp: None,
+            tp_head: None,
         })
     }
 
     /// Makes the draft passes add the ranks' FFN outputs (`--tp-draft-split`): the store
     /// holds this rank's share of every layer's FFN. On a rank above 0 a pass stops after
-    /// the last layer (rank 0 computes the head and picks the drafts) and returns no rows.
+    /// the last layer (rank 0 computes the head and picks the drafts) and returns no rows,
+    /// unless the head is split too ([`Self::set_tp_head`]).
     pub fn set_tp(&mut self, tp: Option<super::TpShare>) {
         self.tp = tp;
+    }
+
+    /// With `on` and [`Self::set_tp`]'s share of two ranks: DFlash 2's passes split the head
+    /// over the two ranks where [`super::tp_head::Split::takes`] them. Only a Q4_K head
+    /// (`--spec-draft-weights q4`: its matmul's sums of a row do not depend on how many rows
+    /// it runs) with at most one scale for all rows, whose shares are whole tiles of rows.
+    /// Returns whether the split is set; the same on every rank (the same checkpoint and
+    /// flags).
+    pub fn set_tp_head(&mut self, on: bool) -> bool {
+        let head = self.head();
+        let plain = head.ty() == types::Q4_K && self.head_scale().is_none_or(|s| s.elements() == 1);
+        self.tp_head = match (&self.selector, self.tp) {
+            (Some(s), Some(t)) if on && plain && t.n_ranks == 2 => {
+                super::tp_head::Split::new(s.top_k, self.n_vocab)
+            }
+            _ => None,
+        };
+        self.tp_head.is_some()
+    }
+
+    /// The head split of a pass of `rows` output rows ([`Self::set_tp_head`]), if it splits.
+    pub fn tp_head(&self, rows: usize) -> Option<super::tp_head::Split> {
+        self.tp_head.filter(|h| h.takes(rows))
+    }
+
+    /// The head split [`Self::set_tp_head`] set, if any (whether a pass takes it: its rows).
+    pub fn tp_head_split(&self) -> Option<super::tp_head::Split> {
+        self.tp_head
     }
 
     /// DFlash 2's selector.
@@ -647,6 +710,15 @@ impl Model {
             .or_else(|| self.store.get("target.output.weight"))
             .or_else(|| self.store.get("target.token_embd.weight"))
             .unwrap_or_else(|| self.embeddings())
+    }
+
+    /// The logits of the head's rows `w` (the head or a view of its rows; not FP8) for `x`.
+    fn head_logits<'a>(&'a self, ctx: &'a Context, w: Tensor<'a>, x: Tensor<'a>) -> Tensor<'a> {
+        let logits = q4k_mv(ctx, w, x, true).unwrap_or_else(|| mul_mat(ctx, w, x));
+        match self.head_scale() {
+            Some(s) => ctx.mul(logits, s),
+            None => logits,
+        }
     }
 
     /// The per-tensor scale of the output head (an NVFP4 head's `weight_scale_2`), if any:
@@ -1221,8 +1293,16 @@ impl Model {
             let down = self.conv_out(&ctx, il, "ffn", down, ffn_dynamic, nb);
             h = ctx.add(down, h_attn);
         }
-        // A rank above 0 of `--tp-draft-split`: the pass ends with the last layer's sum.
-        if self.tp.is_some_and(|t| !t.leads()) {
+        let lead = self.tp.is_none_or(|t| t.leads());
+        // `--tp-draft-split` on two ranks: each computes its share of the head (#666).
+        let split = if want_logits {
+            None
+        } else {
+            self.tp_head((n - first) * n_seq)
+        };
+        // A rank above 0 of `--tp-draft-split` otherwise: the pass ends with the last layer's
+        // sum.
+        if !lead && split.is_none() {
             graph.expand(h);
             let allocator = alloc.take().unwrap_or_else(|| drafter_allocator(backend));
             ctx.alloc_graph(&graph, allocator)
@@ -1230,15 +1310,7 @@ impl Model {
             self.set_block_inputs(seqs, n, [tokens, pos], cells, pooled.as_ref(), &masks);
             backend.compute(&graph).map_err(|e| e.to_string())?;
             *alloc = ctx.into_allocator();
-            return Ok(seqs
-                .iter()
-                .map(|_| Rows {
-                    argmax: Vec::new(),
-                    logits: None,
-                    hidden: None,
-                    selector: None,
-                })
-                .collect());
+            return Ok(no_rows(n_seq));
         }
         let x = ctx.mul(ctx.rms_norm(h, c.rms_eps), self.w("output_norm.weight"));
         // Output rows: every sequence's block positions `first..n`, in order.
@@ -1258,16 +1330,77 @@ impl Model {
             );
             ctx.cont_2d(x, e, n_out)
         };
-        let hidden = want_hidden.then(|| ctx.cont(x).as_output());
+        let hidden = (lead && want_hidden).then(|| ctx.cont(x).as_output());
         let head = self.head();
+        if let Some(sp) = split {
+            let t = self.tp.expect("a split head is --tp-draft-split's");
+            let k = sp.k as i64;
+            let (col0, cols) = sp.share(t.rank);
+            let nb1 = head.nb()[1];
+            let w = ctx.view_2d(head, [head.ne()[0], cols as i64], nb1, col0 * nb1);
+            let logits = self.head_logits(&ctx, w, x);
+            // This share's candidates (the top-k op's, as the whole head takes it) and logits,
+            // in this rank's half of the exchange; `-0.0` in the other half adds nothing.
+            let top = super::fused::top_k(&ctx, logits, k, head);
+            let vals = ctx.get_rows(ctx.reshape_3d(logits, 1, cols as i64, n_out), top);
+            let own = ctx.concat(ctx.cast(top, types::F32), ctx.reshape_2d(vals, k, n_out), 0);
+            let identity = input(types::F32, &[2 * k, n_out], "head_identity");
+            let both = if t.rank == 0 {
+                ctx.concat(own, identity, 1)
+            } else {
+                ctx.concat(identity, own, 1)
+            };
+            // Rank 0's own outputs first: computed before it waits for the other rank's share.
+            let proj = lead.then(|| ctx.mul_mat(self.w("selector_hidden.weight"), x).as_output());
+            for out in proj.into_iter().chain(hidden) {
+                graph.expand(out);
+            }
+            let all = crate::tp_net::all_reduce(&ctx, t.comm, both).as_output();
+            graph.expand(all);
+            // `LEGION_DEBUG_TP_DRAFT_HEAD_CHECK`: the whole head's candidates too.
+            let whole = (lead && super::tp_head::checking()).then(|| {
+                let logits = self.head_logits(&ctx, head, x);
+                let top = super::fused::top_k(&ctx, logits, k, head);
+                let vals = ctx.get_rows(ctx.reshape_3d(logits, 1, self.n_vocab as i64, n_out), top);
+                (top.as_output(), vals.as_output())
+            });
+            for out in whole.into_iter().flat_map(|(a, b)| [a, b]) {
+                graph.expand(out);
+            }
+            let allocator = alloc.take().unwrap_or_else(|| drafter_allocator(backend));
+            ctx.alloc_graph(&graph, allocator)
+                .map_err(|e| e.to_string())?;
+            self.set_block_inputs(seqs, n, [tokens, pos], cells, pooled.as_ref(), &masks);
+            identity.set_f32(&vec![-0.0; identity.elements()]);
+            backend.compute(&graph).map_err(|e| e.to_string())?;
+            let rows = (n - first) * n_seq;
+            let out = lead.then(|| {
+                let shares = [sp.share(0), sp.share(1)];
+                let (cands, unary) = super::tp_head::unpack(&all.to_f32(), sp.k, rows, shares);
+                if let Some((top, vals)) = whole {
+                    let top: Vec<u32> = top.to_i32().into_iter().map(|i| i as u32).collect();
+                    let differ =
+                        super::tp_head::rows_differ((&cands, &unary), (&top, &vals.to_f32()), sp.k);
+                    super::tp_head::note_check(rows, differ);
+                }
+                let proj = proj.expect("made on rank 0").to_f32();
+                Rows {
+                    argmax: Vec::new(),
+                    logits: None,
+                    hidden: hidden.map(|h| h.to_f32()),
+                    selector: Some((cands, unary, proj)),
+                }
+            });
+            *alloc = ctx.into_allocator();
+            return Ok(match out {
+                Some(all) => per_seq(all, n_seq),
+                None => no_rows(n_seq),
+            });
+        }
         let logits = if head.ty() == types::I8 {
             crate::model::fp8::mul_mat(&ctx, head, x, self.head_scale())
         } else {
-            let logits = q4k_mv(&ctx, head, x, true).unwrap_or_else(|| mul_mat(&ctx, head, x));
-            match self.head_scale() {
-                Some(s) => ctx.mul(logits, s),
-                None => logits,
-            }
+            self.head_logits(&ctx, head, x)
         };
         // DFlash 2: the head's top-k tokens of every position, their logits and the selector's
         // hidden projection; the selector itself runs on the host (`Selector::walk`).
@@ -1310,20 +1443,7 @@ impl Model {
             selector: selector.map(|(top, unary, proj)| (ids(top), unary.to_f32(), proj.to_f32())),
         };
         *alloc = ctx.into_allocator();
-        if n_seq == 1 {
-            return Ok(vec![all]);
-        }
-        Ok((0..n_seq)
-            .map(|s| Rows {
-                argmax: part(&all.argmax, n_seq, s),
-                logits: all.logits.as_deref().map(|l| part(l, n_seq, s)),
-                hidden: all.hidden.as_deref().map(|h| part(h, n_seq, s)),
-                selector: all
-                    .selector
-                    .as_ref()
-                    .map(|(t, u, p)| (part(t, n_seq, s), part(u, n_seq, s), part(p, n_seq, s))),
-            })
-            .collect())
+        Ok(per_seq(all, n_seq))
     }
 
     /// Whether the drafter has a Markov head (DSpark).

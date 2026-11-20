@@ -182,6 +182,18 @@ pub trait Arch: Debug + Send + Sync + Any {
         false
     }
 
+    /// The positions a sequence's image tokens take ([`super::Media`]): Qwen-VL's M-RoPE, or
+    /// one per token (Gemma 4, #1217).
+    fn image_layout(&self) -> super::ImageLayout {
+        super::ImageLayout::MRope
+    }
+
+    /// Whether an image's tokens see the whole image on the sliding-window layers (Gemma 4,
+    /// #1217; [`super::Media::span_end`]) instead of attending causally.
+    fn image_tokens_bidirectional(&self) -> bool {
+        false
+    }
+
     /// The sliding window of the sliding-window layers, 0 for none.
     fn swa_window(&self) -> usize {
         0
