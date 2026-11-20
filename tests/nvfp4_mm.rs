@@ -573,10 +573,10 @@ mod cuda {
             for rtw in [1, 2] {
                 for kw in [4, 8] {
                     if 8 * nt as usize >= n.min(32) {
-                        let rpts: &[i32] = if (rtw, kw) == (1, 8) {
-                            &[1, 2, 4, 8, 16]
-                        } else {
-                            &[1]
+                        let rpts: &[i32] = match (rtw, kw) {
+                            (1, 8) => &[1, 2, 4, 8, 16],
+                            (2, 8) => &[1, 2, 4],
+                            _ => &[1],
                         };
                         for &rpt in rpts {
                             out.push(Some(Kernel::Mv { nt, rtw, kw, rpt }));
@@ -761,14 +761,24 @@ mod cuda {
             }
             println!("k {k} m {m} experts {n_expert} x{n_used} tokens {n_tok}: bitwise");
         }
-        for (k, m, n) in [(2560, 4096, 16), (640, 200, 3), (5120, 17408, 32)] {
+        // Dense, also the row tiles of 32 rows (`rtw` 2, one to four per CTA): Gemma 4 31B's
+        // shapes over two GPUs at verify batches among them.
+        for (k, m, n) in [
+            (2560, 4096, 16),
+            (640, 200, 3),
+            (5120, 17408, 32),
+            (5376, 10752, 32),
+            (10752, 5376, 24),
+            (5376, 4096, 20),
+            (4096, 5376, 9),
+        ] {
             let wq = weights(k, m, (k + m) as u64);
             let xs = activations(k, n, n as u64);
             for nt in [1, 2, 4] {
-                let mut go = |rpt| {
+                let mut go = |rtw, rpt| {
                     nvfp4_mm::force_kernel(Some(Kernel::Mv {
                         nt,
-                        rtw: 1,
+                        rtw,
                         kw: 8,
                         rpt,
                     }));
@@ -776,9 +786,12 @@ mod cuda {
                     nvfp4_mm::force_kernel(None);
                     bits(r)
                 };
-                let want = go(1);
-                for rpt in [2, 4, 8, 16] {
-                    assert!(go(rpt) == want, "dense k {k} m {m} n {n} nt {nt} rpt {rpt}");
+                let want = go(1, 1);
+                for (rtw, rpt) in [(1, 2), (1, 4), (1, 8), (1, 16), (2, 1), (2, 2), (2, 4)] {
+                    assert!(
+                        go(rtw, rpt) == want,
+                        "dense k {k} m {m} n {n} nt {nt} rtw {rtw} rpt {rpt}"
+                    );
                 }
             }
             println!("dense k {k} m {m} n {n}: bitwise");
@@ -843,6 +856,194 @@ mod cuda {
             let e = rel_err(&got, &want);
             println!("geglu k {k} m {m} n {n}: relative error {e:.2e}");
             assert!(e < 1e-2, "k {k} m {m} n {n}: {e}");
+        }
+    }
+
+    /// The GeGLU FFN's unfused chain as a model graph runs it: the gate and up `mul_mat`s
+    /// (F32), ggml's `geglu_split` and the cast to BF16 (the down matmul's input), read back
+    /// as F32.
+    fn run_geglu_chain(
+        backend: &mut Backend,
+        (wg, wu): (&[u8], &[u8]),
+        xs: &[f32],
+        (sg, su): (Option<f32>, Option<f32>),
+        (k, m, n): (usize, usize, usize),
+    ) -> Vec<f32> {
+        let weights = Context::new(4, 0);
+        let g = weights.new_tensor(types::NVFP4, &[k as i64, m as i64]);
+        let u = weights.new_tensor(types::NVFP4, &[k as i64, m as i64]);
+        let tg = weights.new_tensor(types::F32, &[1]);
+        let tu = weights.new_tensor(types::F32, &[1]);
+        weights.alloc_tensors(backend.buffer_type()).unwrap();
+        g.set_bytes(wg);
+        u.set_bytes(wu);
+        tg.set_f32(&[sg.unwrap_or(1.0)]);
+        tu.set_f32(&[su.unwrap_or(1.0)]);
+        let ctx = Context::new(8, 16);
+        let x = ctx.new_tensor(types::F32, &[k as i64, n as i64]).as_input();
+        let gate = nvfp4_mm::mul_mat(&ctx, g, x, sg.map(|_| tg));
+        let up = nvfp4_mm::mul_mat(&ctx, u, x, su.map(|_| tu));
+        let act = ctx.cast(ctx.geglu_split(gate, up), types::BF16);
+        let out = ctx.cast(act, types::F32).as_output();
+        let mut graph = ctx.new_graph(16);
+        graph.expand(out);
+        ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+            .unwrap();
+        x.set_f32(xs);
+        backend.compute(&graph).unwrap();
+        out.to_f32()
+    }
+
+    /// The fused GeGLU at the mv kernel's batches gives the unfused chain's bits (Gemma 4's
+    /// FFN at verify batches, #1181), with the chain's matmuls in their default kernel and in
+    /// the 32-row tiles.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn cuda_geglu_mv_matches_the_chain() {
+        let Some(mut gpu) = gpu() else { return };
+        let bits = |v: Vec<f32>| v.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+        for (k, m, n, scales) in [
+            (5376, 10752, 32, (Some(0.02), Some(0.5))),
+            (5376, 10752, 24, (Some(0.02), None)),
+            (5376, 2688, 16, (Some(0.3), Some(0.05))),
+            (512, 130, 9, (None, Some(0.7))),
+            (1024, 200, 5, (Some(0.1), Some(0.1))),
+        ] {
+            let (wg, wu) = (weights(k, m, 3 * k as u64), weights(k, m, m as u64));
+            let xs = activations(k, n, n as u64);
+            let (ws, sh) = ((&wg[..], &wu[..]), (k, m, n));
+            let fused = bits(run_glu(&mut gpu, ws, &xs, scales, sh, true));
+            let chain = bits(run_geglu_chain(&mut gpu, ws, &xs, scales, sh));
+            let off = fused.iter().zip(&chain).filter(|(a, b)| a != b).count();
+            assert!(off == 0, "geglu k {k} m {m} n {n}: {off} outputs differ");
+            let nt = [1, 2, 4].into_iter().find(|&nt| 8 * nt >= n).unwrap_or(4) as i32;
+            nvfp4_mm::force_kernel(Some(Kernel::Mv {
+                nt,
+                rtw: 2,
+                kw: 8,
+                rpt: 2,
+            }));
+            let wide = bits(run_geglu_chain(&mut gpu, ws, &xs, scales, sh));
+            nvfp4_mm::force_kernel(None);
+            assert!(wide == chain, "geglu k {k} m {m} n {n}: 32-row tiles");
+            println!("geglu mv k {k} m {m} n {n}: the chain's bits");
+        }
+    }
+
+    /// Gemma 4 31B's dense matmuls over two GPUs (one rank's half: gate / up 5376 -> 10752,
+    /// down 10752 -> 5376, q 5376 -> 4096 / 8192, k / v 5376 -> 2048 / 1024, o 4096 / 8192 ->
+    /// 5376) and Qwen3.8-27B's MLP at verify batches: us per matmul in the mv kernel's variants
+    /// that give the same bits (`rRpP`: row tiles of 16 * R rows, P of them per CTA; `def` the
+    /// default), and Gemma's gate and up as the fused GeGLU against the chain (two matmuls,
+    /// `geglu_split`, the cast to BF16) per pair (#1181). 8 weight copies per graph;
+    /// `LEGION_NVFP4_TIMING_N` (comma list) picks the batch sizes.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn cuda_verify_mv_timings() {
+        const L: usize = 8;
+        const REPS: usize = 30;
+        let ns: Vec<usize> = std::env::var("LEGION_NVFP4_TIMING_N")
+            .unwrap_or_else(|_| "9,16,20,24,28,32".into())
+            .split(',')
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let variants = [(1, 1), (1, 2), (1, 4), (2, 1), (2, 2), (2, 4)];
+        let Some(mut gpu) = gpu() else { return };
+        for (k, m) in [
+            (5376, 10752),
+            (10752, 5376),
+            (5376, 4096),
+            (4096, 5376),
+            (5376, 8192),
+            (8192, 5376),
+            (5376, 2048),
+            (5376, 1024),
+            (5120, 17408),
+            (17408, 5120),
+        ] {
+            let wq = weights(k, m, 5);
+            let weights = Context::new(2 * L + 1, 0);
+            let ws: Vec<_> = (0..2 * L)
+                .map(|_| weights.new_tensor(types::NVFP4, &[k as i64, m as i64]))
+                .collect();
+            let st = weights.new_tensor(types::F32, &[1]);
+            weights.alloc_tensors(gpu.buffer_type()).unwrap();
+            for w in &ws {
+                w.set_bytes(&wq);
+            }
+            st.set_f32(&[0.01]);
+            for &n in &ns {
+                let nt = [1, 2, 4].into_iter().find(|&nt| 8 * nt >= n).unwrap_or(4) as i32;
+                let ctx = Context::new(8 * L + 4, 8 * L + 4);
+                let x = ctx
+                    .new_tensor(types::BF16, &[k as i64, n as i64])
+                    .as_input();
+                let mut graph = ctx.new_graph(8 * L + 4);
+                for w in &ws[..L] {
+                    graph.expand(nvfp4_mm::mul_mat(&ctx, *w, x, Some(st)).as_output());
+                }
+                ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+                    .unwrap();
+                x.set_bytes(&vec![0u8; k * n * 2]);
+                let mut line = format!("mul_mat k {k:5} m {m:5} n {n:2}:");
+                let s = time(&mut gpu, &graph, REPS) / L as f64;
+                line += &format!(" def {:6.1}", s * 1e6);
+                for (rtw, rpt) in variants {
+                    nvfp4_mm::force_kernel(Some(Kernel::Mv {
+                        nt,
+                        rtw,
+                        kw: 8,
+                        rpt,
+                    }));
+                    let s = time(&mut gpu, &graph, REPS) / L as f64;
+                    line += &format!(" r{rtw}p{rpt} {:6.1}", s * 1e6);
+                }
+                nvfp4_mm::force_kernel(None);
+                println!("{line} us");
+                if (k, m) != (5376, 10752) {
+                    continue;
+                }
+                // The gate and up: fused, and the chain in each variant.
+                let mut line = format!("geglu   k {k:5} m {m:5} n {n:2}:");
+                for fused in [true, false] {
+                    let ctx = Context::new(8 * L + 4, 8 * L + 4);
+                    let x = ctx
+                        .new_tensor(types::BF16, &[k as i64, n as i64])
+                        .as_input();
+                    let mut graph = ctx.new_graph(8 * L + 4);
+                    for i in 0..L {
+                        let (g, u) = (ws[2 * i], ws[2 * i + 1]);
+                        let out = if fused {
+                            nvfp4_mm::geglu(&ctx, g, u, x, Some(st), Some(st))
+                        } else {
+                            let gate = nvfp4_mm::mul_mat(&ctx, g, x, Some(st));
+                            let up = nvfp4_mm::mul_mat(&ctx, u, x, Some(st));
+                            ctx.cast(ctx.geglu_split(gate, up), types::BF16)
+                        };
+                        graph.expand(out.as_output());
+                    }
+                    ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+                        .unwrap();
+                    x.set_bytes(&vec![0u8; k * n * 2]);
+                    let s = time(&mut gpu, &graph, REPS) / L as f64;
+                    line += &format!(" {} {:6.1}", if fused { "fused" } else { "def" }, s * 1e6);
+                    if fused {
+                        continue;
+                    }
+                    for (rtw, rpt) in variants {
+                        nvfp4_mm::force_kernel(Some(Kernel::Mv {
+                            nt,
+                            rtw,
+                            kw: 8,
+                            rpt,
+                        }));
+                        let s = time(&mut gpu, &graph, REPS) / L as f64;
+                        line += &format!(" r{rtw}p{rpt} {:6.1}", s * 1e6);
+                    }
+                    nvfp4_mm::force_kernel(None);
+                }
+                println!("{line} us");
+            }
         }
     }
 
