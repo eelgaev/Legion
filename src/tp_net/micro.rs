@@ -30,6 +30,7 @@ use crate::ggml::{Context, ExternalOp, Tensor, external_params, ffi, types};
 use super::Overlap;
 use super::seq_par::share;
 
+pub(crate) mod send_gemm;
 #[cfg(test)]
 mod tests;
 
