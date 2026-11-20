@@ -36,6 +36,9 @@ legion serve \
 
 The README row is the MTP command.
 
+- `--mmproj mmproj-F16.gguf` (the file in the same Hugging Face repo) lets requests carry images; the tower runs
+  on the first GPU. Not measured on the AC922 yet; see [one Spark's numbers](../spark/gemma-4-31b-qat-ud-q4-k-xl-1x.md#images).
+
 - `--max-seqs 16 --ctx-size 262144` gives each of the 16 sequences its own context of up to 262,144 tokens.
   That is 4,194,304 tokens of KV cache in all.
 - The cache lives in a KV host tier in pinned memory on the GPUs' NUMA node, backed as the sequences grow.

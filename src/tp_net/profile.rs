@@ -6,9 +6,22 @@
 use std::time::Duration;
 
 use super::{ArStats, Comm};
+use crate::residency::lookup_table::FetchWaits;
 
 #[cfg(test)]
 mod tests;
+
+/// The n-gram table fetches' waits `w` over `steps` steps, per step: the fills' wait for the
+/// read-ahead still out (ms), the rows they then missed, and the wait for their reads (ms).
+pub fn ngram_laps(w: &FetchWaits, steps: u64) -> String {
+    let n = steps.max(1) as f64;
+    format!(
+        "{:.2}/{:.1}/{:.2}",
+        w.ahead_ns as f64 / 1e6 / n,
+        w.missed as f64 / n,
+        w.collect_ns as f64 / 1e6 / n
+    )
+}
 
 /// One window of steps, as logged.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -175,6 +188,8 @@ pub struct StepProfile {
     marked: u64,
     /// The stepping thread's counters at the window's start.
     counts: Option<ThreadCounts>,
+    /// The n-gram table fetches' waits at the window's start.
+    waits: Option<FetchWaits>,
 }
 
 impl StepProfile {
@@ -191,6 +206,7 @@ impl StepProfile {
             after_last: Duration::ZERO,
             marked: 0,
             counts: None,
+            waits: None,
         }
     }
 
@@ -208,6 +224,8 @@ impl StepProfile {
         let marks = comm.step_marks();
         let counts = ThreadCounts::now();
         let start = *self.counts.get_or_insert(counts);
+        let waits = FetchWaits::now();
+        let waits_from = *self.waits.get_or_insert(waits);
         self.steps += 1;
         self.step += step;
         self.send += send;
@@ -228,6 +246,7 @@ impl StepProfile {
         let per = |d: Duration, n: u64| d.as_secs_f64() * 1e3 / n.max(1) as f64;
         let c = counts.since(&start);
         let cpu = |c: Option<u32>| c.map_or(-1, |c| c as i64);
+        let ngram = ngram_laps(&waits.since(&waits_from), self.steps);
         let laps = if self.lapped > 0 {
             self.laps.per_step(self.lapped)
         } else {
@@ -246,6 +265,7 @@ impl StepProfile {
             to_first_ms = format!("{:.2}", per(self.before_first, self.marked)),
             after_last_ms = format!("{:.2}", per(self.after_last, self.marked)),
             host_laps = %laps,
+            ngram_laps = %ngram,
             cpu = cpu(nix::sched::sched_getcpu().ok().map(|c| c as u32)),
             tx_cpu = cpu(marks.tx_cpu),
             rx_cpu = cpu(marks.rx_cpu),
@@ -257,6 +277,7 @@ impl StepProfile {
         *self = Self {
             last: now,
             counts: Some(counts),
+            waits: Some(waits),
             ..Self::new(self.every)
         };
     }

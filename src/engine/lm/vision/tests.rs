@@ -1,5 +1,30 @@
 use super::*;
 
+/// Qwen's placeholder repeats per image token; Gemma 4's too, between `<|image>` and
+/// `<image|>`, its tokens starting after `<|image>`.
+#[test]
+fn placeholders_expand_to_image_tokens() {
+    let qwen = Marks {
+        pad: 9,
+        open: None,
+        close: None,
+        layout: ImageLayout::MRope,
+    };
+    let (t, starts) = expand_tokens(&[1, 9, 2, 9], &qwen, &[(2, 1), (1, 3)]);
+    assert_eq!(t, [1, 9, 9, 2, 9, 9, 9]);
+    assert_eq!(starts, [1, 4]);
+    let gemma = Marks {
+        pad: 9,
+        open: Some(7),
+        close: Some(8),
+        layout: ImageLayout::Sequential,
+    };
+    let (t, starts) = expand_tokens(&[1, 9, 2, 9], &gemma, &[(2, 1), (1, 3)]);
+    assert_eq!(t, [1, 7, 9, 9, 8, 2, 7, 9, 9, 9, 8]);
+    assert_eq!(starts, [2, 7]);
+    assert_eq!(expand_tokens(&[1, 2], &gemma, &[]), (vec![1, 2], vec![]));
+}
+
 /// Image keys sit above any vocabulary, differ between the tokens of an image and between
 /// images, and are the same for the same image.
 #[test]

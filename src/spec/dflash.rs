@@ -71,6 +71,7 @@ mod fused;
 mod head;
 mod model;
 pub mod tiny;
+mod tp_head;
 mod v2;
 mod weights;
 
@@ -414,6 +415,10 @@ impl DflashDrafter {
         )
         .map_err(|e| format!("{}: {e}", path.display()))?;
         model.set_tp(opts.tp);
+        // The head split over the ranks too where it can (#666): greedy drafts only.
+        if model.set_tp_head(opts.temperature == 0.0 && tp_head::enabled()) {
+            tracing::info!("--tp-draft-split: the drafter's head split over the two ranks");
+        }
         if opts.min_confidence > 0.0 && !model.has_confidence() {
             return Err(format!(
                 "{}: the drafter has no confidence head to apply a minimum confidence of {}",
@@ -937,6 +942,7 @@ impl DflashDrafter {
             n_embd: c.n_embd,
             block: c.block_size,
             first: self.model.first_row,
+            head: self.model.tp_head_split(),
         };
         let sums = round_sums(shape, batch.iter().map(|r| (r.max, !r.tokens.is_empty())));
         let left = sums_left(&sums, comm.all_reduces().wrapping_sub(before));
@@ -978,12 +984,15 @@ pub(crate) struct RoundShape {
     pub block: usize,
     /// The block's first row that gives a draft ([`model::first_row`]).
     pub first: usize,
+    /// DFlash 2's head split over the ranks ([`tp_head`]), if set.
+    pub head: Option<tp_head::Split>,
 }
 
-/// `--tp-draft-split`: the values of each FFN sum (one a layer of every draft pass, in order)
-/// a round runs for requests `(max, has tokens)`, as [`DflashDrafter::step_from`] runs them:
-/// DFlash 2 one pass over the blocks of every request asking for drafts, DFlash one pass per
-/// such request of `max` rows after the first (at most the block). Take-ins sum nothing.
+/// `--tp-draft-split`: the values of each sum (one a layer of every draft pass, in order, then
+/// the pass's head exchange where its head splits, [`tp_head`]) a round runs for requests
+/// `(max, has tokens)`, as [`DflashDrafter::step_from`] runs them: DFlash 2 one pass over the
+/// blocks of every request asking for drafts, DFlash one pass per such request of `max` rows
+/// after the first (at most the block). Take-ins sum nothing.
 pub(crate) fn round_sums(s: RoundShape, reqs: impl Iterator<Item = (usize, bool)>) -> Vec<usize> {
     let asking: Vec<usize> = reqs
         .filter(|&(max, tokens)| max > 0 && tokens)
@@ -1001,7 +1010,15 @@ pub(crate) fn round_sums(s: RoundShape, reqs: impl Iterator<Item = (usize, bool)
     };
     passes
         .iter()
-        .flat_map(|&rows| std::iter::repeat_n(rows * s.n_embd, s.n_layer))
+        .flat_map(|&rows| {
+            // A DFlash 2 pass's output rows: each block's after its first.
+            let out = rows / s.block * (s.block - s.first);
+            let head = s
+                .head
+                .filter(|h| s.v2 && h.takes(out))
+                .map(|h| h.values(out));
+            std::iter::repeat_n(rows * s.n_embd, s.n_layer).chain(head)
+        })
         .collect()
 }
 

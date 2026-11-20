@@ -304,6 +304,218 @@ fn sliding_window_and_scale_match_gather() {
 /// See [`check`]: covers ggml's F16 accumulation on aarch64 with ~10x margin.
 const GATHER_TOLERANCE: f32 = 2e-3;
 
+/// Gemma 4's images (#1217, [`attention_spans`]): a token at `p` with last key `span[t]`
+/// (absolute, at least `p`) sees keys `(p - window, span[t]]` and stays exact against an f64
+/// oracle and the gather path with that mask.
+#[test]
+fn image_spans_see_their_whole_image() {
+    // One sequence of a chunk with an image at tokens 3..9 (positions 63..69) after text.
+    let span = |n_past: usize, n_tok: usize, img: std::ops::Range<usize>| -> Vec<i32> {
+        (0..n_tok)
+            .map(|t| {
+                let p = n_past + t;
+                let last = if img.contains(&p) { img.end - 1 } else { p };
+                last as i32
+            })
+            .collect()
+    };
+    let s0 = span(60, 12, 63..69);
+    check_spans(32, 4, 2, 12, &[60], &[vec![3, 1]], 0.3, 40, &s0);
+    // Two sequences, no window (global layers would not take spans, but the op does), an
+    // image across a block boundary; the second sequence text only.
+    let mut s = span(120, 10, 124..133);
+    s.extend(span(5, 10, 0..0));
+    check_spans(
+        32,
+        8,
+        2,
+        10,
+        &[120, 5],
+        &[vec![2, 0, 4], vec![1]],
+        0.25,
+        0,
+        &s,
+    );
+    // A window shorter than the image: the window starts at the token, the span still ends at
+    // the image's end.
+    let s = span(0, 16, 2..14);
+    check_spans(32, 4, 4, 16, &[0], &[vec![0]], 0.5, 4, &s);
+}
+
+/// [`check_with`] through [`attention_spans`]: `span` holds each token's last key, sequence by
+/// sequence (`n_tok` each).
+#[allow(clippy::too_many_arguments)]
+fn check_spans(
+    head_dim: i64,
+    n_head: i64,
+    n_head_kv: i64,
+    n_tok: usize,
+    n_past: &[usize],
+    tables: &[Vec<u32>],
+    scale: f32,
+    window: usize,
+    span: &[i32],
+) {
+    let hp = hparams(head_dim, n_head, n_head_kv);
+    let mut backend = Backend::cpu().unwrap();
+    backend.set_threads(4);
+    let n_blocks = tables.iter().flatten().max().unwrap() + 1;
+    let kv = KvPool::new(&hp, backend.buffer_type(), n_blocks as usize).unwrap();
+    let (kp, vp) = kv.pools(0);
+    let (mut kdat, mut vdat) = (noise(kp.elements(), 1), noise(vp.elements(), 2));
+    kp.set_bytes(&f16_bytes(&kdat));
+    vp.set_bytes(&f16_bytes(&vdat));
+    round_f16(&mut kdat);
+    round_f16(&mut vdat);
+
+    let ns = n_past.len();
+    let (d, nt) = (head_dim, n_tok as i64);
+    let end = n_past.iter().max().unwrap() + n_tok;
+    let n_kv = end.div_ceil(KV_BLOCK) * KV_BLOCK;
+    let width = tables.iter().map(Vec::len).max().unwrap();
+
+    let ctx = Context::new(64, 64);
+    let q = ctx
+        .new_tensor(types::F32, &[d, n_head, nt, ns as i64])
+        .as_input();
+    let table = ctx
+        .new_tensor(types::I32, &[width as i64, ns as i64])
+        .as_input();
+    // As the model feeds it: the first positions, then the spans, in one input.
+    let past = ctx
+        .new_tensor(types::I32, &[(ns + n_tok * ns) as i64])
+        .as_input();
+    let spans = ctx.view_1d(past, nt * ns as i64, ns * 4);
+    let scratch_ne = scratch_shape(d, n_head, n_head_kv, n_tok, ns);
+    let scratch = ctx.new_tensor(types::F32, &scratch_ne).as_input();
+    let paged = attention_spans(
+        &ctx, q, kp, vp, table, past, scratch, scale, window, 0, None, spans,
+    )
+    .as_output();
+
+    let blocks = ctx
+        .new_tensor(types::I32, &[(n_kv / KV_BLOCK * ns) as i64])
+        .as_input();
+    let mask = ctx
+        .new_tensor(types::F32, &[n_kv as i64, nt, 1, ns as i64])
+        .as_input();
+    let (k, vt) = kv.read(&ctx, 0, blocks, n_kv as i64, ns as i64);
+    let kq = ctx.mul_mat(ctx.permute(k, [0, 2, 1, 3]), ctx.permute(q, [0, 2, 1, 3]));
+    let kq = ctx.soft_max_ext(kq, mask, scale, 0.0);
+    let gathered = ctx
+        .cont(ctx.permute(ctx.mul_mat(vt, kq), [0, 2, 1, 3]))
+        .as_output();
+
+    let mut graph = ctx.new_graph(64);
+    graph.expand(paged);
+    graph.expand(gathered);
+    ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+        .unwrap();
+
+    let qdat = noise(q.elements(), 3);
+    q.set_f32(&qdat);
+    let mut t = Vec::new();
+    let mut b = Vec::new();
+    let mut m = vec![0f32; n_kv * n_tok * ns];
+    for (s, tab) in tables.iter().enumerate() {
+        t.extend(tab.iter().map(|&x| x as i32));
+        t.resize((s + 1) * width, 0);
+        let used = (n_past[s] + n_tok).div_ceil(KV_BLOCK);
+        b.extend((0..n_kv / KV_BLOCK).map(|i| tab[i.min(used - 1)] as i32));
+        for tok in 0..n_tok {
+            let p = n_past[s] + tok;
+            let last = (span[s * n_tok + tok] as usize).max(p);
+            let row = &mut m[(s * n_tok + tok) * n_kv..][..n_kv];
+            row[last + 1..].fill(f32::NEG_INFINITY);
+            if window > 0 {
+                row[..(p + 1).saturating_sub(window)].fill(f32::NEG_INFINITY);
+            }
+        }
+    }
+    table.set_i32(&t);
+    let mut p: Vec<i32> = n_past.iter().map(|&p| p as i32).collect();
+    p.extend_from_slice(span);
+    past.set_i32(&p);
+    blocks.set_i32(&b);
+    mask.set_f32(&m);
+    backend.compute(&graph).unwrap();
+    let (a, g) = (paged.to_f32(), gathered.to_f32());
+
+    // The f64 oracle (see [`oracle`]) with each token's keys `(p - window, last]`.
+    let g_heads = (n_head / n_head_kv) as usize;
+    let (d, n_head) = (d as usize, n_head as usize);
+    let kv_row = d * n_head_kv as usize;
+    let mut want = Vec::new();
+    for (s, tab) in tables.iter().enumerate() {
+        for tok in 0..n_tok {
+            let pos = n_past[s] + tok;
+            let last = (span[s * n_tok + tok] as usize).max(pos);
+            let first = if window > 0 {
+                (pos + 1).saturating_sub(window)
+            } else {
+                0
+            };
+            for h in 0..n_head {
+                let at = ((s * n_tok + tok) * n_head + h) * d;
+                let mut qr = qdat[at..at + d].to_vec();
+                round_f16(&mut qr);
+                let cell = |p: usize| {
+                    (tab[p / KV_BLOCK] as usize * KV_BLOCK + p % KV_BLOCK) * kv_row
+                        + h / g_heads * d
+                };
+                let scores: Vec<f64> = (first..=last)
+                    .map(|p| {
+                        let dot: f64 = (0..d)
+                            .map(|i| qr[i] as f64 * kdat[cell(p) + i] as f64)
+                            .sum();
+                        dot * scale as f64
+                    })
+                    .collect();
+                let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let exp: Vec<f64> = scores.iter().map(|x| (x - max).exp()).collect();
+                let sum: f64 = exp.iter().sum();
+                let mut w: Vec<f32> = exp.iter().map(|x| (x / sum) as f32).collect();
+                round_f16(&mut w);
+                for i in 0..d {
+                    let acc: f64 = (first..=last)
+                        .zip(&w)
+                        .map(|(p, &w)| w as f64 * vdat[cell(p) + i] as f64)
+                        .sum();
+                    want.push(acc as f32);
+                }
+            }
+        }
+    }
+    let label = format!("{n_tok} tokens, window {window}, spans {span:?}");
+    let vs_oracle = max_abs_diff(&a, &want);
+    assert!(
+        vs_oracle < 1e-5,
+        "{label}: max |paged - oracle| {vs_oracle}"
+    );
+    let vs_gather = max_abs_diff(&a, &g);
+    assert!(
+        vs_gather < GATHER_TOLERANCE,
+        "{label}: max |paged - gather| {vs_gather}"
+    );
+    // The spans do change what an image token sees.
+    let causal = oracle(
+        &Shape {
+            d,
+            n_head,
+            n_head_kv: n_head_kv as usize,
+            n_tok,
+            scale: scale as f64,
+            window,
+        },
+        &qdat,
+        &kdat,
+        &vdat,
+        n_past,
+        tables,
+    );
+    assert!(max_abs_diff(&a, &causal) > 1e-3, "{label}: as causal");
+}
+
 #[test]
 fn decode_matches_gather() {
     // Two sequences over interleaved, out-of-order blocks; GQA 4.

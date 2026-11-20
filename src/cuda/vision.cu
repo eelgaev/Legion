@@ -19,6 +19,11 @@
 //   the host computes as ggml's CPU does), q and k to [head][patch][d], v to [head][d][patch].
 // - `softmax_kernel`: rows of attention scores to F16 probabilities.
 //
+// Gemma 4's tower (`gemma4v`, #1217) shares the GEMM and the softmax and has its own: patches
+// in raster order scaled to [-1, 1], the column and row position tables, RMS norms (to F16 rows,
+// or a post-norm added to the residual), per-head q / k / v norms with the half-and-half NEOX
+// rotation, the gated GELU and the 3x3 average pool with its standardization and norm.
+//
 // The CPU tower (`src/vision/qwen3vl.rs`, ggml's CPU backend) is the oracle; these kernels compute
 // the same graph, not its bits (F16 products everywhere, as ggml's CPU rounds the activations of
 // its F16 matrices, but F16 attention products and a GELU without ggml's F16 table).
@@ -54,7 +59,7 @@ struct Op {
     __half *       h0;
     __half *       h1;
     __half *       h2;
-    int            n, e, heads, d, gx, gy, side, p, w_px, h_px, kpad, chunk, cm;
+    int            n, e, heads, d, gx, gy, side, p, w_px, h_px, kpad, chunk, cm, pool;
     float          eps, sfx, sfy;
 };
 
@@ -384,12 +389,206 @@ __global__ void softmax_kernel(const Op o) {
     }
 }
 
+// Gemma 4's tower (`gemma4v`, #1217). Patches are in raster order (row by row). Like the
+// kernels above, each loops over its items at the grid's stride.
+
+// A block per patch i: its pixels scaled to [-1, 1] (2 x - 1) as row `i` of h0 [n][3 p p].
+__global__ void g4_im2col_kernel(const Op o) {
+    for (int i = blockIdx.x; i < o.n; i += gridDim.x) {
+        const int row = i / o.gx, col = i % o.gx;
+        const int pp = o.p * o.p, kn = 3 * pp;
+        for (int k = threadIdx.x; k < kn; k += blockDim.x) {
+            const int   c = k / pp, r = k % pp, ky = r / o.p, kx = r % o.p;
+            const float v = o.x[((long long) c * o.h_px + row * o.p + ky) * o.w_px + col * o.p + kx];
+            o.h0[(long long) i * kn + k] = __float2half_rn(v * 2.0f - 1.0f);
+        }
+    }
+}
+
+// A block per patch i: y [n][e] += the column table's row `col`, then the row table's row `row`
+// (w = [2][side][e]: columns, then rows).
+__global__ void g4_pos_kernel(const Op o) {
+    for (int i = blockIdx.x; i < o.n; i += gridDim.x) {
+        const int     row = i / o.gx, col = i % o.gx;
+        float *       y  = o.y + (long long) i * o.e;
+        const float * px = o.w + (long long) col * o.e;
+        const float * py = o.w + ((long long) o.side + row) * o.e;
+        for (int c = threadIdx.x; c < o.e; c += blockDim.x) {
+            y[c] = (y[c] + px[c]) + py[c];
+        }
+    }
+}
+
+// A warp per row r of x [n][e]: x / sqrt(mean(x^2) + eps) (* w when there is one), to F16 row r
+// of h0.
+__device__ __forceinline__ void rms_row(const Op & o, int r) {
+    const int     lane = threadIdx.x & 31;
+    const float * x    = o.x + (long long) r * o.e;
+    float         s    = 0.0f;
+    for (int c = lane; c < o.e; c += 32) {
+        s += x[c] * x[c];
+    }
+    const float scale = 1.0f / sqrtf(warp_sum(s) / o.e + o.eps);
+    __half *    h     = o.h0 + (long long) r * o.e;
+    for (int c = lane; c < o.e; c += 32) {
+        h[c] = __float2half_rn(o.w ? (x[c] * scale) * o.w[c] : x[c] * scale);
+    }
+}
+
+// A block per 8 rows (a warp each): rms_row.
+__global__ void rms_kernel(const Op o) {
+    for (int g = blockIdx.x; g * 8 < o.n; g += gridDim.x) {
+        const int r = g * 8 + (threadIdx.x >> 5);
+        if (r < o.n) {
+            rms_row(o, r);
+        }
+    }
+}
+
+// A warp per row r: y [n][e] += rms(x) * w, x [n][e] a block's output (the post-norms).
+__device__ __forceinline__ void rms_add_row(const Op & o, int r) {
+    const int     lane = threadIdx.x & 31;
+    const float * x    = o.x + (long long) r * o.e;
+    float *       y    = o.y + (long long) r * o.e;
+    float         s    = 0.0f;
+    for (int c = lane; c < o.e; c += 32) {
+        s += x[c] * x[c];
+    }
+    const float scale = 1.0f / sqrtf(warp_sum(s) / o.e + o.eps);
+    for (int c = lane; c < o.e; c += 32) {
+        y[c] = (x[c] * scale) * o.w[c] + y[c];
+    }
+}
+
+// A block per 8 rows (a warp each): rms_add_row.
+__global__ void rms_add_kernel(const Op o) {
+    for (int g = blockIdx.x; g * 8 < o.n; g += gridDim.x) {
+        const int r = g * 8 + (threadIdx.x >> 5);
+        if (r < o.n) {
+            rms_add_row(o, r);
+        }
+    }
+}
+
+// Patch i of x = qkv [n][3 e] (q, k, v of `heads` heads of d <= 128): q and k RMS-normed per head
+// with their weights (w for q, b for k), v without; q and k then rotated, the first half of each
+// head by the patch's column and the second by its row, NEOX pairs (j, j + d/4) within each half,
+// cos / sin from cs [max(gx, gy)][d/4]; q to h0 and k to h1 as [head][n][d], v to h2 as
+// [head][d][kpad]. A warp per head, a row of `sh` its scratch.
+__device__ __forceinline__ void g4_qkv_patch(const Op & o, int i, float (&sh)[8][128]) {
+    const int row = i / o.gx, col = i % o.gx;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int half = o.d / 2, q4 = o.d / 4;
+    float *   s = sh[warp];
+    for (int h = warp; h < o.heads; h += 8) {
+#pragma unroll
+        for (int which = 0; which < 3; ++which) {
+            const float * src = o.x + (long long) i * 3 * o.e + which * o.e + h * o.d;
+            float         ss  = 0.0f;
+            for (int c = lane; c < o.d; c += 32) {
+                const float v = src[c];
+                s[c]          = v;
+                ss += v * v;
+            }
+            const float   scale = 1.0f / sqrtf(warp_sum(ss) / o.d + o.eps);
+            const float * nw    = which == 0 ? o.w : o.b;
+            __syncwarp();
+            for (int c = lane; c < o.d; c += 32) {
+                s[c] = which == 2 ? s[c] * scale : (s[c] * scale) * nw[c];
+            }
+            __syncwarp();
+            if (which == 2) {
+                for (int c = lane; c < o.d; c += 32) {
+                    o.h2[((long long) h * o.d + c) * o.kpad + i] = __float2half_rn(s[c]);
+                }
+            } else {
+                __half * d = (which ? o.h1 : o.h0) + ((long long) h * o.n + i) * o.d;
+                for (int t = lane; t < half; t += 32) {
+                    const int    sec = t / q4, j = t % q4, base = sec * half;
+                    const float2 c   = o.cs[(sec ? row : col) * q4 + j];
+                    const float  x0 = s[base + j], x1 = s[base + j + q4];
+                    d[base + j]      = __float2half_rn(x0 * c.x - x1 * c.y);
+                    d[base + j + q4] = __float2half_rn(x0 * c.y + x1 * c.x);
+                }
+            }
+            __syncwarp();
+        }
+    }
+}
+
+// A block per patch: g4_qkv_patch. The warps' last __syncwarp leaves `sh` free for the next.
+__global__ void g4_qkv_kernel(const Op o) {
+    __shared__ float sh[8][128];
+    for (int i = blockIdx.x; i < o.n; i += gridDim.x) {
+        g4_qkv_patch(o, i, sh);
+    }
+}
+
+// A warp per row r of x [n][2 ff] F16 (the gate's ff columns, then the up's): gelu(gate) * up to
+// F16 row r of h0 [n][ff] (ff = e).
+__device__ __forceinline__ void geglu_row(const Op & o, int r) {
+    const int      lane = threadIdx.x & 31;
+    const __half * x    = o.h1 + (long long) r * 2 * o.e;
+    __half *       y    = o.h0 + (long long) r * o.e;
+    for (int c = lane; c < o.e; c += 32) {
+        y[c] = __float2half_rn(gelu(__half2float(x[c])) * __half2float(x[o.e + c]));
+    }
+}
+
+// A block per 8 rows (a warp each): geglu_row.
+__global__ void geglu_kernel(const Op o) {
+    for (int g = blockIdx.x; g * 8 < o.n; g += gridDim.x) {
+        const int r = g * 8 + (threadIdx.x >> 5);
+        if (r < o.n) {
+            geglu_row(o, r);
+        }
+    }
+}
+
+// Pooled row t (raster over the gx / pool x gy / pool grid): the mean of its pool x pool patches
+// of x [n][e], * sqrt(e), (- b) * w (the standardization), into y [rows][e] F32, then RMS-normed
+// without a weight to F16 rows of h0. The whole block, `sh` its reduction scratch.
+__device__ __forceinline__ void g4_pool_row(const Op & o, int t, float * sh) {
+    const int   ox = o.gx / o.pool, tx = t % ox, ty = t / ox;
+    const float inv = 1.0f / (float) (o.pool * o.pool), se = sqrtf((float) o.e);
+    float *     y  = o.y + (long long) t * o.e;
+    float       ss = 0.0f;
+    for (int c = threadIdx.x; c < o.e; c += blockDim.x) {
+        float m = 0.0f;
+        for (int dy = 0; dy < o.pool; ++dy) {
+            for (int dx = 0; dx < o.pool; ++dx) {
+                m += o.x[((long long) (ty * o.pool + dy) * o.gx + tx * o.pool + dx) * o.e + c];
+            }
+        }
+        const float v = ((m * inv) * se - o.b[c]) * o.w[c];
+        y[c]          = v;
+        ss += v * v;
+    }
+    const float scale = 1.0f / sqrtf(block_reduce(ss, false, sh) / o.e + o.eps);
+    for (int c = threadIdx.x; c < o.e; c += blockDim.x) {
+        o.h0[(long long) t * o.e + c] = __float2half_rn(y[c] * scale);
+    }
+}
+
+// A block per pooled row: g4_pool_row (block_reduce syncs before it reuses `sh`).
+__global__ void g4_pool_kernel(const Op o) {
+    __shared__ float sh[32];
+    const int        rows = (o.gx / o.pool) * (o.gy / o.pool);
+    for (int t = blockIdx.x; t < rows; t += gridDim.x) {
+        g4_pool_row(o, t, sh);
+    }
+}
+
 }  // namespace
 
 // The kernels as the CUDA runtime knows them (their host stubs), for Rust's cudaLaunchKernel, in
 // the order of src/vision/gpu.rs's `Kernel`.
-extern "C" const void * const legion_vision_kernels[6] = {
-    reinterpret_cast<const void *>(&gemm_kernel),    reinterpret_cast<const void *>(&im2col_kernel),
-    reinterpret_cast<const void *>(&pos_add_kernel), reinterpret_cast<const void *>(&norm_kernel),
-    reinterpret_cast<const void *>(&rope_kernel),    reinterpret_cast<const void *>(&softmax_kernel),
+extern "C" const void * const legion_vision_kernels[13] = {
+    reinterpret_cast<const void *>(&gemm_kernel),      reinterpret_cast<const void *>(&im2col_kernel),
+    reinterpret_cast<const void *>(&pos_add_kernel),   reinterpret_cast<const void *>(&norm_kernel),
+    reinterpret_cast<const void *>(&rope_kernel),      reinterpret_cast<const void *>(&softmax_kernel),
+    reinterpret_cast<const void *>(&g4_im2col_kernel), reinterpret_cast<const void *>(&g4_pos_kernel),
+    reinterpret_cast<const void *>(&rms_kernel),       reinterpret_cast<const void *>(&rms_add_kernel),
+    reinterpret_cast<const void *>(&g4_qkv_kernel),    reinterpret_cast<const void *>(&geglu_kernel),
+    reinterpret_cast<const void *>(&g4_pool_kernel),
 };

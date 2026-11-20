@@ -19,6 +19,7 @@ fn group(n_tok: usize, verify: bool, n_pool: usize) -> GroupShape {
         pair: false,
         head_half: 0,
         img: 0,
+        spans: false,
         captures: Vec::new(),
     }
 }

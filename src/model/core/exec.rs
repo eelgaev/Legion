@@ -547,6 +547,8 @@ pub struct Executor {
     pipeline_micro: usize,
     /// See [`Self::set_pipeline_riders`].
     pipeline_riders: bool,
+    /// See [`Self::set_image_step`].
+    image_step: usize,
     /// See [`Self::set_micro_taper`].
     micro_taper: usize,
     /// Per stage: its KV pool's host tier, if any ([`Self::set_kv_tiers`]).
@@ -884,6 +886,7 @@ impl Executor {
             mtp_kv: None,
             pipeline_micro: 0,
             pipeline_riders: false,
+            image_step: 0,
             micro_taper: 0,
             kv_tiers: Vec::new(),
             kv_bufts: Vec::new(),
@@ -2855,6 +2858,19 @@ impl Executor {
         self.pipeline_micro = tokens;
     }
 
+    /// The most tokens one image takes, when the model's image tokens see each other (#1217,
+    /// [`super::Arch::image_tokens_bidirectional`]): such an image runs in one micro-chunk of
+    /// up to this many tokens, even past the micro-chunk (the sliding-window rings hold it,
+    /// `LmConfig::ring_step`). 0 (the default): without images.
+    pub fn set_image_step(&mut self, tokens: usize) {
+        self.image_step = tokens;
+    }
+
+    /// See [`Self::set_image_step`].
+    pub fn image_step(&self) -> usize {
+        self.image_step
+    }
+
     /// Pipelines a step whose last group is one prompt chunk longer than the micro-chunk and
     /// whose other groups (decoding sequences, other prompts' chunks: the riders) come before
     /// it: the riders run as a micro-chunk of their own ahead of the prompt's micro-chunks
@@ -3723,7 +3739,15 @@ impl Executor {
         if self.stages.len() < 2 || micro == 0 || n <= micro || g.verify || !last_only {
             return whole;
         }
-        let sizes = taper::micro_sizes(n, micro, self.micro_taper);
+        let mut sizes = taper::micro_sizes(n, micro, self.micro_taper);
+        // An image whose tokens see each other stays in one micro-chunk (#1217): the planner's
+        // `Media::uncut` keeps it in one step, this in one piece of it (of up to the
+        // micro-chunk or the largest image, which the rings hold).
+        if let Some(m) = seq.media
+            && self.model.hp.arch.image_tokens_bidirectional()
+        {
+            sizes = m.uncut_sizes(seq.n_past, &sizes, self.image_step);
+        }
         sizes
             .iter()
             .scan(0, |at, &len| {

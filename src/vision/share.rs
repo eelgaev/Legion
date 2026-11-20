@@ -73,6 +73,51 @@ pub fn parse(v: &str) -> Option<Vec<Share>> {
     (!out.is_empty()).then_some(out)
 }
 
+/// One encode's caps: most blocks of a GEMM launch and of a small kernel's (0: one per work
+/// item).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Caps {
+    pub gemm: usize,
+    pub small: usize,
+}
+
+/// The shares a GPU tower encodes with, in turn, on a device of `sms` SMs.
+pub struct Turns {
+    sms: usize,
+    shares: Vec<Share>,
+    encodes: usize,
+}
+
+impl Turns {
+    /// [`from_env`]'s shares on a device of `sms` SMs.
+    pub fn new(sms: usize) -> Self {
+        Self {
+            sms: sms.max(1),
+            shares: from_env(),
+            encodes: 0,
+        }
+    }
+
+    /// Encodes with `share` from now on (tests).
+    #[cfg(test)]
+    pub fn set(&mut self, share: Share) {
+        self.shares = vec![share];
+    }
+
+    /// The next encode's caps.
+    pub fn next_caps(&mut self) -> Caps {
+        let share = self.shares[self.encodes % self.shares.len()];
+        self.encodes += 1;
+        if self.shares.len() > 1 || self.shares[0] != DEFAULT {
+            tracing::info!(share = %share, "vision: GPU encode share (LEGION_DEBUG_VISION_SHARE)");
+        }
+        Caps {
+            gemm: share.gemm_ctas(self.sms),
+            small: share.small_blocks(self.sms),
+        }
+    }
+}
+
 /// The shares to use in turn: `LEGION_DEBUG_VISION_SHARE`'s, else [`DEFAULT`].
 pub fn from_env() -> Vec<Share> {
     match std::env::var("LEGION_DEBUG_VISION_SHARE") {

@@ -32,3 +32,17 @@ fn caps_by_the_sm_count() {
     assert_eq!(half.gemm_ctas(1), 1);
     assert_eq!(parse("1/4").unwrap()[0].gemm_ctas(48), 12);
 }
+
+#[test]
+fn turns_give_each_encode_its_caps() {
+    let mut t = Turns::new(48);
+    t.set(parse("1/2").unwrap()[0]);
+    let half = Caps {
+        gemm: 24,
+        small: 48,
+    };
+    assert_eq!(t.next_caps(), half);
+    assert_eq!(t.next_caps(), half);
+    t.set(Share::FULL);
+    assert_eq!(t.next_caps(), Caps::default());
+}

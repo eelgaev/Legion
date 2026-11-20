@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
-use crate::model::core::{ImageSpan, Media};
+use crate::model::core::{ImageLayout, ImageSpan, Media};
 use crate::node::Request;
 
 #[cfg(test)]
@@ -112,13 +112,16 @@ pub struct MediaTable {
 }
 
 impl MediaTable {
-    /// A [`Request::TpMedia`]'s images, checked (a bad request fails here, not in a step).
+    /// A [`Request::TpMedia`]'s images, checked (a bad request fails here, not in a step), at
+    /// the positions of `layout` (the model's: rank 0's are the same, so the wire does not
+    /// carry it).
     pub fn add(
         &mut self,
         id: u32,
         n_embd: u32,
         spans: &[(u32, u32, u32)],
         rows: &[f32],
+        layout: ImageLayout,
     ) -> Result<(), String> {
         if id == NONE {
             return Err("images with the id of none".into());
@@ -163,7 +166,8 @@ impl MediaTable {
                 rows.len()
             ));
         }
-        self.media.insert(id, Media::new(out, n_embd));
+        self.media
+            .insert(id, Media::with_layout(out, n_embd, layout));
         Ok(())
     }
 

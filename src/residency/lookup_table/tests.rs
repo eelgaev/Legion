@@ -1059,3 +1059,45 @@ fn a_peer_reads_the_rows_this_rank_misses() {
     );
     assert_eq!(t.stats().peer_rows, 0);
 }
+
+/// With a peer, a batch small enough for AIO (a verify step's few rows) goes to the peer too,
+/// none of it read here; the rows are the file's, and the fetch's misses count in
+/// [`FetchWaits`].
+#[test]
+fn a_peer_reads_small_batches_too() {
+    let base = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"));
+    std::fs::create_dir_all(&base).unwrap();
+    let dir = tempfile::tempdir_in(&base).unwrap();
+    let n_rows = 6000u64;
+    let (file, rows) = table(dir.path(), n_rows);
+    let t = LookupTable::open(
+        file,
+        &TableOptions {
+            io: TableIo::Direct,
+            ram_cache_bytes: Some(16 << 20),
+            inflight: 8,
+            aio_max: 128,
+            keep_awake_ms: 0,
+            ..TableOptions::default()
+        },
+        None,
+    )
+    .unwrap();
+    let peer = Arc::new(FakePeer {
+        rows: rows.clone(),
+        fail: false,
+        asks: Mutex::new(Vec::new()),
+    });
+    assert!(t.set_peer(peer.clone()));
+    let picks = [3u32, 901, 900, 5999, 3];
+    let before = FetchWaits::now();
+    assert!(t.fetch(&picks).unwrap() == want(&rows, &picks));
+    assert!(FetchWaits::now().since(&before).missed >= picks.len() as u64);
+    assert_eq!(
+        peer.asks.lock().unwrap().as_slice(),
+        &[(vec![3, 900, 901, 5999], true)]
+    );
+    assert_eq!(t.stats().reads, 0);
+}

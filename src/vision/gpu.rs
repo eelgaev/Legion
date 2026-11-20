@@ -20,7 +20,9 @@ use crate::cpu::gpu_exact::{f16_to_f32, f32_to_f16};
 use crate::ggml::{Tensor, types};
 
 use super::qwen3vl::{Encoder, EncoderConfig, ImageEmbedding};
+#[cfg(test)]
 use super::share::Share;
+use super::share::{Caps, Turns};
 use super::{Preprocessed, VisionError, VisionHparams};
 
 /// Scores and probabilities of one chunk of queries (all heads) take at most this much.
@@ -80,6 +82,7 @@ struct Op {
     kpad: i32,
     chunk: i32,
     cm: i32,
+    pool: i32,
     eps: f32,
     sfx: f32,
     sfy: f32,
@@ -110,6 +113,7 @@ impl Default for Op {
             kpad: 0,
             chunk: 0,
             cm: 0,
+            pool: 0,
             eps: 0.0,
             sfx: 1.0,
             sfy: 1.0,
@@ -134,11 +138,19 @@ enum Kernel {
     Norm,
     Rope,
     Softmax,
+    // Gemma 4's (#1217).
+    G4Im2col,
+    G4Pos,
+    Rms,
+    RmsAdd,
+    G4Qkv,
+    Geglu,
+    G4Pool,
 }
 
 unsafe extern "C" {
     /// The kernels as the CUDA runtime knows them (their host stubs), in [`Kernel`] order.
-    static legion_vision_kernels: [*const c_void; 6];
+    static legion_vision_kernels: [*const c_void; 13];
     fn cudaLaunchKernel(
         func: *const c_void,
         grid: Dim3,
@@ -353,8 +365,137 @@ struct Block {
     down: Linear,
 }
 
-/// The tower on one GPU.
-pub struct GpuEncoder {
+/// The tower on one GPU: Qwen3-VL's, or Gemma 4's ([`gemma4v`], #1217).
+pub enum GpuEncoder {
+    Qwen(QwenGpu),
+    Gemma(gemma4v::GemmaGpu),
+}
+
+impl GpuEncoder {
+    /// The CPU tower `enc`'s weights on CUDA device `device`. `Ok(None)`: the device or the
+    /// tower's shapes do not fit the kernels (the CPU tower runs then).
+    pub fn new(enc: &Encoder, device: usize) -> Result<Option<Self>, VisionError> {
+        Ok(match enc.hparams().projector {
+            super::Projector::Gemma4v => gemma4v::GemmaGpu::new(enc, device)?.map(Self::Gemma),
+            super::Projector::Qwen3vl => QwenGpu::new(enc, device)?.map(Self::Qwen),
+        })
+    }
+
+    pub fn config(&self) -> &EncoderConfig {
+        match self {
+            Self::Qwen(g) => &g.cfg,
+            Self::Gemma(g) => &g.cfg,
+        }
+    }
+
+    pub fn hparams(&self) -> &VisionHparams {
+        match self {
+            Self::Qwen(g) => &g.hp,
+            Self::Gemma(g) => &g.hp,
+        }
+    }
+
+    pub fn device(&self) -> usize {
+        match self {
+            Self::Qwen(g) => g.device as usize,
+            Self::Gemma(g) => g.device as usize,
+        }
+    }
+
+    /// Device memory the largest image's scratch takes (`image_max_pixels`), beside the
+    /// weights: for the language model's budgets.
+    pub fn scratch_bytes(&self) -> usize {
+        match self {
+            Self::Qwen(g) => g.scratch_bytes(),
+            Self::Gemma(g) => g.scratch_bytes(),
+        }
+    }
+
+    /// The tower's output for `p`, as [`Encoder::encode`] gives it.
+    pub fn encode(&mut self, p: &Preprocessed) -> Result<ImageEmbedding, VisionError> {
+        match self {
+            Self::Qwen(g) => g.encode(p),
+            Self::Gemma(g) => g.encode(p),
+        }
+    }
+
+    /// Encodes with `share` from now on (tests).
+    #[cfg(test)]
+    pub(crate) fn set_share(&mut self, share: Share) {
+        match self {
+            Self::Qwen(g) => g.turns.set(share),
+            Self::Gemma(g) => g.turns.set(share),
+        }
+    }
+}
+
+/// The device's SM count, for the encode's share ([`super::share`]).
+fn sm_count(device: usize) -> Result<usize, VisionError> {
+    let mut sms = 0;
+    // SAFETY: a plain device query.
+    unsafe {
+        ok(
+            cudaDeviceGetAttribute(&mut sms, SM_COUNT, device as c_int),
+            "cudaDeviceGetAttribute",
+        )?
+    };
+    Ok(sms.max(1) as usize)
+}
+
+/// Launches kernel `k` of the table on `stream` over `items` work items (tiles, patches, rows),
+/// `args` its one parameter: a 1-D grid of one block per item capped at the encode's share
+/// (`caps`), each block looping over the items at a stride of the grid.
+fn launch<T>(
+    stream: *mut c_void,
+    caps: Caps,
+    k: Kernel,
+    items: usize,
+    block: u32,
+    args: &mut T,
+) -> Result<(), VisionError> {
+    if items == 0 {
+        return Ok(());
+    }
+    let cap = match k {
+        Kernel::Gemm => caps.gemm,
+        _ => caps.small,
+    };
+    let grid = if cap == 0 { items } else { items.min(cap) };
+    let grid = u32::try_from(grid).map_err(|_| VisionError::Dimensions)?;
+    let mut argv = [(args as *mut T).cast::<c_void>()];
+    // SAFETY: a kernel of the table taking `T` by value (the launch copies it); its pointers
+    // are device memory of the stream's device.
+    let e = unsafe {
+        cudaLaunchKernel(
+            legion_vision_kernels[k as usize],
+            Dim3 {
+                x: grid,
+                y: 1,
+                z: 1,
+            },
+            Dim3 {
+                x: block,
+                y: 1,
+                z: 1,
+            },
+            argv.as_mut_ptr(),
+            0,
+            stream,
+        )
+    };
+    ok(e, "vision kernel launch")
+}
+
+/// The GEMM kernel over `batch` products on `stream`, its tiles under `caps`.
+fn gemm_on(stream: *mut c_void, caps: Caps, mut g: Gemm, batch: usize) -> Result<(), VisionError> {
+    debug_assert!(g.k % 8 == 0 && g.lda % 8 == 0 && g.ldb % 8 == 0);
+    g.batch = batch as i32;
+    let tiles = (g.n as usize).div_ceil(TILE) * (g.m as usize).div_ceil(TILE) * batch;
+    launch(stream, caps, Kernel::Gemm, tiles, 256, &mut g)
+}
+
+/// Qwen3-VL's tower on one GPU.
+pub struct QwenGpu {
     cfg: EncoderConfig,
     hp: VisionHparams,
     device: i32,
@@ -369,28 +510,22 @@ pub struct GpuEncoder {
     n_ff: usize,
     pin_in: Pinned,
     pin_out: Pinned,
-    /// The device's SM count.
-    sms: usize,
-    /// The shares of the GPU to encode with, in turn ([`super::share`]), and the encodes so far.
-    shares: Vec<Share>,
-    encodes: usize,
-    /// The share of the encode under way: most blocks of a GEMM and of a small kernel (0: one
-    /// per work item).
-    caps: (usize, usize),
+    /// The shares of the GPU to encode with, in turn ([`super::share`]).
+    turns: Turns,
+    /// The share of the encode under way.
+    caps: Caps,
 }
 
 // SAFETY: the raw pointers are device / pinned allocations and a stream owned by the encoder,
 // used by one thread at a time (callers hold it behind a Mutex).
-unsafe impl Send for GpuEncoder {}
+unsafe impl Send for QwenGpu {}
 
-impl GpuEncoder {
-    /// The CPU tower `enc`'s weights on CUDA device `device`. `Ok(None)`: the device or the
-    /// tower's shapes do not fit the kernels (the CPU tower runs then).
-    pub fn new(enc: &Encoder, device: usize) -> Result<Option<Self>, VisionError> {
+impl QwenGpu {
+    fn new(enc: &Encoder, device: usize) -> Result<Option<Self>, VisionError> {
         let c = enc.config().clone();
         let d_head = c.n_embd / c.n_head;
         let pp3 = 3 * c.patch_size * c.patch_size;
-        let (mut major, mut sms) = (0, 0);
+        let mut major = 0;
         // SAFETY: plain device queries and the calling thread's current device.
         unsafe {
             ok(cudaSetDevice(device as c_int), "cudaSetDevice")?;
@@ -398,11 +533,8 @@ impl GpuEncoder {
                 cudaDeviceGetAttribute(&mut major, CC_MAJOR, device as c_int),
                 "cudaDeviceGetAttribute",
             )?;
-            ok(
-                cudaDeviceGetAttribute(&mut sms, SM_COUNT, device as c_int),
-                "cudaDeviceGetAttribute",
-            )?;
         }
+        let sms = sm_count(device)?;
         let n_ff = enc.weight("v.blk.0.ffn_up.weight")?.shape()[1] as usize;
         // The kernels: tensor cores (sm_70+), rows of a multiple of 8 halves.
         if major < 7
@@ -478,34 +610,11 @@ impl GpuEncoder {
             cfg: c,
             pin_in,
             pin_out,
-            sms: sms.max(1) as usize,
-            shares: super::share::from_env(),
-            encodes: 0,
-            caps: (0, 0),
+            turns: Turns::new(sms),
+            caps: Caps::default(),
         }))
     }
 
-    /// Encodes with `share` from now on (tests).
-    #[cfg(test)]
-    pub(crate) fn set_share(&mut self, share: Share) {
-        self.shares = vec![share];
-    }
-
-    pub fn config(&self) -> &EncoderConfig {
-        &self.cfg
-    }
-
-    pub fn hparams(&self) -> &VisionHparams {
-        &self.hp
-    }
-
-    pub fn device(&self) -> usize {
-        self.device as usize
-    }
-
-    /// Launches kernel `k` over `items` work items (tiles, patches, rows), with a 1-D grid of
-    /// one block per item capped at the encode's share (`caps`): each block loops over
-    /// items at a stride of the grid.
     fn launch<T>(
         &self,
         k: Kernel,
@@ -513,44 +622,11 @@ impl GpuEncoder {
         block: u32,
         args: &mut T,
     ) -> Result<(), VisionError> {
-        if items == 0 {
-            return Ok(());
-        }
-        let cap = match k {
-            Kernel::Gemm => self.caps.0,
-            _ => self.caps.1,
-        };
-        let grid = if cap == 0 { items } else { items.min(cap) };
-        let grid = u32::try_from(grid).map_err(|_| VisionError::Dimensions)?;
-        let mut argv = [(args as *mut T).cast::<c_void>()];
-        // SAFETY: a kernel of the table taking `T` by value (the launch copies it); its
-        // pointers are device memory of the encoder's device.
-        let e = unsafe {
-            cudaLaunchKernel(
-                legion_vision_kernels[k as usize],
-                Dim3 {
-                    x: grid,
-                    y: 1,
-                    z: 1,
-                },
-                Dim3 {
-                    x: block,
-                    y: 1,
-                    z: 1,
-                },
-                argv.as_mut_ptr(),
-                0,
-                self.stream,
-            )
-        };
-        ok(e, "vision kernel launch")
+        launch(self.stream, self.caps, k, items, block, args)
     }
 
-    fn gemm(&self, mut g: Gemm, batch: usize) -> Result<(), VisionError> {
-        debug_assert!(g.k % 8 == 0 && g.lda % 8 == 0 && g.ldb % 8 == 0);
-        g.batch = batch as i32;
-        let tiles = (g.n as usize).div_ceil(TILE) * (g.m as usize).div_ceil(TILE) * batch;
-        self.launch(Kernel::Gemm, tiles, 256, &mut g)
+    fn gemm(&self, g: Gemm, batch: usize) -> Result<(), VisionError> {
+        gemm_on(self.stream, self.caps, g, batch)
     }
 
     /// `y = x W^T + b` of `lin` over `m` rows of F16 `x`, then GELU (`flags`) or `+ res`.
@@ -728,12 +804,7 @@ impl GpuEncoder {
         let out_bytes = n_tok * n_out * 4;
         // SAFETY: the calling thread's current device.
         unsafe { ok(cudaSetDevice(self.device), "cudaSetDevice")? };
-        let share = self.shares[self.encodes % self.shares.len()];
-        self.encodes += 1;
-        self.caps = (share.gemm_ctas(self.sms), share.small_blocks(self.sms));
-        if self.shares.len() > 1 || self.shares[0] != super::share::DEFAULT {
-            tracing::info!(share = %share, "vision: GPU encode share (LEGION_DEBUG_VISION_SHARE)");
-        }
+        self.caps = self.turns.next_caps();
         let pin_in = self.pin_in.reserve(in_bytes)?;
         let pin_out = self.pin_out.reserve(out_bytes)?;
         // SAFETY: the pinned buffers hold at least these many bytes.
@@ -971,7 +1042,7 @@ impl GpuEncoder {
     }
 }
 
-impl Drop for GpuEncoder {
+impl Drop for QwenGpu {
     fn drop(&mut self) {
         // SAFETY: our own stream, idle after every encode.
         unsafe {
@@ -980,6 +1051,8 @@ impl Drop for GpuEncoder {
         }
     }
 }
+
+mod gemma4v;
 
 #[cfg(test)]
 mod tests;

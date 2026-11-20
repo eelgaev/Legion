@@ -67,6 +67,20 @@ fn laps_log_per_step_in_order() {
 }
 
 #[test]
+fn ngram_laps_log_per_step() {
+    let w = FetchWaits {
+        ahead_ns: 3_000_000,
+        missed: 45,
+        collect_ns: 500_000,
+    };
+    assert_eq!(ngram_laps(&w, 2), "1.50/22.5/0.25");
+    assert_eq!(ngram_laps(&FetchWaits::default(), 0), "0.00/0.0/0.00");
+    let later = FetchWaits { missed: 50, ..w };
+    assert_eq!(later.since(&w).missed, 5);
+    assert_eq!(w.since(&later), FetchWaits::default());
+}
+
+#[test]
 fn thread_counts_count_up() {
     let a = ThreadCounts::now();
     // Touch fresh pages and give up the CPU: the counters only grow.
