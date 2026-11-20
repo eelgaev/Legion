@@ -164,7 +164,7 @@ off. llama.cpp runs across two DGX Sparks with its RPC backend (layer split).
 | Engine | Weights | Drafting | Decode, 1 user | 4 users | 16 users | Prefill 8K | 32K | 123K |
 |---|---|---|--:|--:|--:|--:|--:|--:|
 | Legion | QAT UD-Q4_K_XL GGUF | MTP ¹¹ | 37-66 | 119.9 | 202.6 | 975 | 925 | 744 |
-| Legion | NVFP4 | DFlash 2 ¹⁹ | 32-58 | 117.6 | **329.6** | **2,787** | **2,525** | — |
+| Legion | NVFP4 | DFlash 2 ¹⁹ | **37-66** | **126.4** | **363.8** | **2,777** | **2,498** | — |
 | vLLM 0.33.0 | NVFP4 | DFlash 2 ⁶ | 35-60 | 124.2 | 290.1 | 2,381 | 1,612 | — |
 
 #### AC922, 2x V100
