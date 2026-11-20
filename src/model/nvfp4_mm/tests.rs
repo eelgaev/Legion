@@ -321,6 +321,42 @@ fn gemm_tune_codes() {
     assert!(gemm_tune_fits(2, 16, GemmTune::from_code(21)));
     assert!(!gemm_tune_fits(2, 16, GEMM_DOWN));
     assert!(!gemm_tune_fits(2, 16, GemmTune::from_code(41)));
+    // The dense GEMM's 64-token tiles (#1181): warps in the thousands.
+    assert_eq!(GEMM_VERIFY.code(), 4042);
+    for v in [4031, 4042, 8032, 8041] {
+        assert_eq!(GemmTune::from_code(v).code(), v);
+    }
+    assert_eq!(GEMM_VERIFY.rows(128), 64);
+    assert_eq!(GemmTune::from_code(8041).rows(128), 128);
+    assert_eq!(GEMM_DEFAULT.rows(256), 256);
+    assert!(!gemm_tune_fits(1, 8, GEMM_VERIFY));
+}
+
+#[test]
+fn dense_gemm_tune_at_33_64_tokens() {
+    // Gemma 4 31B's verify steps of 5-8 users (33-64 rows) on matrices of 4096-8192 rows.
+    for n in 33..=64 {
+        assert_eq!(
+            pick_dense(5376, 8192, n, 48, MV_MAX_N),
+            Kernel::Gemm { mi: 1, nt: 8 }
+        );
+        assert_eq!(dense_gemm_tune(8192, n, 8, false), GEMM_VERIFY);
+        assert_eq!(dense_gemm_tune(4096, n, 8, false), GEMM_VERIFY);
+        assert_eq!(dense_gemm_tune(5376, n, 8, false), GEMM_VERIFY);
+        assert_eq!(dense_gemm_tune(2048, n, 8, false), GEMM_DEFAULT);
+        assert_eq!(dense_gemm_tune(16384, n, 8, false), GEMM_DEFAULT);
+        assert_eq!(dense_gemm_tune(21504, n, 8, true), GEMM_DEFAULT);
+    }
+    for n in [1, 32, 65, 128, 4096] {
+        assert_eq!(
+            dense_gemm_tune(8192, n, tokens_tile(n, 16).max(4), false),
+            GEMM_DEFAULT
+        );
+        assert_eq!(
+            dense_gemm_tune(21504, n, tokens_tile(n, 16).max(4), true),
+            GEMM_DEFAULT
+        );
+    }
 }
 
 #[test]

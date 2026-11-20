@@ -156,7 +156,13 @@ const TUNES: [(i32, i32); 5] = [(3, 1), (2, 1), (2, 2), (3, 2), (4, 1)];
 /// own choice and its small tiles at any size and the mv kernel at each widest token tile; each
 /// default's exact grid right after it.
 pub fn variants() -> Vec<Variant> {
-    let tune = |(stages, ctas): (i32, i32)| Some(GemmTune { stages, ctas });
+    let tune = |(stages, ctas): (i32, i32)| {
+        Some(GemmTune {
+            stages,
+            ctas,
+            warps: 0,
+        })
+    };
     let v = |op, tile, tune, family| Variant {
         op,
         tile,

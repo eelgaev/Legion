@@ -6,9 +6,14 @@
 //! steps ([`force_gemm_pf`], #1176 r36), for plain matmuls and the fused SwiGLU (`glu`).
 
 use super::{
-    Kernel, dense_mv_max_n, force_gemm_pf, force_kernel, mul_mat, pick_dense, swiglu, tokens_tile,
+    GemmTune, Kernel, dense_mv_max_n, force_gemm_pf, force_gemm_tune, force_kernel, mul_mat,
+    pick_dense, swiglu, tokens_tile,
 };
 use crate::ggml::{Backend, ComputeAllocator, Context, types};
+
+/// The dense GEMM's other shapes at 64-token tiles ([`GemmTune`]'s codes of `gemm_dense` in
+/// `src/cuda/nvfp4_mm/common.cuh`: warps * 1000 + stages * 10 + CTAs per SM).
+pub const GEMM_DENSE_TUNES: [i32; 8] = [31, 8032, 8041, 8022, 4031, 4032, 4023, 4042];
 
 /// One measured variant.
 #[derive(Clone, Debug)]
@@ -22,6 +27,8 @@ pub struct DenseRow {
     pub default: bool,
     /// The default kernel's weight prefetch forced to runs of `pf` blocks; 0: its own.
     pub pf: i32,
+    /// The GEMM forced to this tune ([`GEMM_DENSE_TUNES`]); `None`: its own.
+    pub tune: Option<GemmTune>,
     /// The fused SwiGLU (`[k, m]` gate and up weights) instead of a plain matmul.
     pub glu: bool,
     /// Best seconds per matmul; `None`: the variant does not launch.
@@ -161,31 +168,51 @@ pub fn run(
                     nt: tokens_tile(n as i64, 16).max(4),
                 }
             };
-            let mut kernels: Vec<(Option<Kernel>, i32)> = vec![(None, 0), (None, 0)];
+            let mut kernels: Vec<(Option<Kernel>, i32, Option<GemmTune>)> =
+                vec![(None, 0, None), (None, 0, None)];
             if !glu {
-                kernels.extend(variants(n).into_iter().map(|k| (Some(k), 0)));
+                kernels.extend(variants(n).into_iter().map(|k| (Some(k), 0, None)));
             }
-            if matches!(default_kernel, Kernel::Gemm { .. }) {
-                kernels.extend(pfs.iter().map(|&pf| (None, pf)));
+            if let Kernel::Gemm { mi, nt } = default_kernel {
+                kernels.extend(pfs.iter().map(|&pf| (None, pf, None)));
+                // The GEMM's other shapes at 64-token tiles (#1181): the same bits.
+                if nt == 8 {
+                    for code in GEMM_DENSE_TUNES {
+                        let tune = Some(GemmTune::from_code(code));
+                        if glu {
+                            kernels.push((None, 0, tune));
+                        } else {
+                            for mi2 in [1, 2] {
+                                kernels.push((Some(Kernel::Gemm { mi: mi2, nt }), 0, tune));
+                            }
+                        }
+                    }
+                    if !glu {
+                        kernels.push((Some(Kernel::Gemm { mi: 3 - mi, nt }), 0, None));
+                        kernels.push((Some(Kernel::Gemm { mi, nt: 4 }), 0, None));
+                    }
+                }
             }
-            let set = |(kernel, pf): (Option<Kernel>, i32)| {
+            let set = |(kernel, pf, tune): (Option<Kernel>, i32, Option<GemmTune>)| {
                 force_kernel(kernel);
                 force_gemm_pf(pf);
+                force_gemm_tune(tune, None);
             };
             let elem = if glu { 2 } else { 4 };
             let mut reference: Vec<u8> = Vec::new();
             let first = rows.len();
-            for &(kernel, pf) in &kernels {
-                set((kernel, pf));
+            for &(kernel, pf, tune) in &kernels {
+                set((kernel, pf, tune));
                 let ok = gpu.compute(&graph).is_ok();
                 let got: Vec<u8> = if ok {
                     outs.iter().flat_map(|o| o.bytes()).collect()
                 } else {
                     Vec::new()
                 };
-                if rows.len() == first {
+                // The reference: the default's second run (a first run can give other bits).
+                if rows.len() <= first + 1 {
                     if !ok {
-                        set((None, 0));
+                        set((None, 0, None));
                         return Err(format!("k {k} m {m} n {n}: the default does not run"));
                     }
                     reference = got.clone();
@@ -203,8 +230,9 @@ pub fn run(
                     m,
                     n,
                     kernel: kernel.unwrap_or(default_kernel),
-                    default: kernel.is_none() && pf == 0,
+                    default: kernel.is_none() && pf == 0 && tune.is_none(),
                     pf,
+                    tune,
                     glu,
                     secs: ok.then_some(f64::INFINITY),
                     bytes,
@@ -225,7 +253,7 @@ pub fn run(
                     row.secs = Some(best.min(s));
                 }
             }
-            set((None, 0));
+            set((None, 0, None));
         }
     }
     Ok(rows)

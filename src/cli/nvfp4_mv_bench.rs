@@ -103,6 +103,8 @@ fn run_dense(args: &Nvfp4MvBenchArgs) -> anyhow::Result<()> {
             r.kernel,
             if r.pf != 0 {
                 format!(" pf{}", r.pf)
+            } else if let Some(t) = r.tune {
+                format!(" t{}", t.code())
             } else {
                 String::new()
             }

@@ -1348,30 +1348,76 @@ fn wide_down(k: i64, n_expert: i64) -> bool {
 /// A stage count and occupancy of the GEMM (`nvfp4_gemm`): `stages` cp.async stages of one
 /// NVFP4 block (64 of k), registers limited for `ctas` CTAs per SM. Every variant gives the same
 /// bits (each output is the same MMAs over k in the same order); the non-default ones are
-/// compiled for grouped tiles of 64 and 128 tokens (#824).
+/// compiled for grouped tiles of 64 and 128 tokens (#824). `warps` 0: those (8 warps); 8 or 4:
+/// the dense GEMM's 64-token tiles of that many warps (`gemm_dense` in
+/// `src/cuda/nvfp4_mm/common.cuh`, #1181; 4 warps: half the rows a CTA).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GemmTune {
     pub stages: i32,
     pub ctas: i32,
+    pub warps: i32,
 }
 
 impl GemmTune {
     /// The launch functions' `variant`.
     pub fn code(self) -> i32 {
-        self.stages * 10 + self.ctas
+        self.warps * 1000 + self.stages * 10 + self.ctas
     }
 
     /// The tune of a launch function's `variant`.
     pub fn from_code(v: i32) -> Self {
         Self {
-            stages: v / 10,
+            stages: v % 1000 / 10,
             ctas: v % 10,
+            warps: v / 1000,
         }
+    }
+
+    /// Output rows of a CTA of `rows` with 8 warps.
+    pub fn rows(self, rows: i64) -> i64 {
+        if self.warps == 4 { rows / 2 } else { rows }
     }
 }
 
 /// The GEMM's default: three stages, one CTA per SM.
-pub const GEMM_DEFAULT: GemmTune = GemmTune { stages: 3, ctas: 1 };
+pub const GEMM_DEFAULT: GemmTune = GemmTune {
+    stages: 3,
+    ctas: 1,
+    warps: 0,
+};
+
+/// The dense GEMM at 33-64 tokens on matrices of [`MV_RTW2_MIN_M`] to [`VERIFY_MAX_M`] rows (a
+/// verify step of 5-8 users' drafts, #1181): 64-row CTAs (4 warps) in four stages, two per SM.
+/// GB10, Gemma 4 31B at 33-64 tokens: 0.85-0.98 of the default's time on its own
+/// (`legion nvfp4-mv-bench --dense`); in a 16-user server's verify steps k / v 0.96, o / down
+/// 0.95, q 1.00 of the default's time; the same bits.
+pub const GEMM_VERIFY: GemmTune = GemmTune {
+    stages: 4,
+    ctas: 2,
+    warps: 4,
+};
+
+/// The most rows [`GEMM_VERIFY`] takes: Gemma 4 31B's global q (16384 rows) took 1.03 of the
+/// default's time with it, and the fused GLU (2 x 21504) stays on the default too.
+pub const VERIFY_MAX_M: i64 = 8192;
+
+/// The tune of a dense GEMM (`glu`: the fused GLU's) of 64-token tiles over `m` rows and `n`
+/// tokens: [`GEMM_VERIFY`] at 33-64 tokens on [`MV_RTW2_MIN_M`] to [`VERIFY_MAX_M`] rows (not the
+/// GLU), otherwise the default.
+/// `LEGION_DEBUG_NVFP4_VERIFY_TUNE=0`: the default everywhere (the way before), for A/B runs.
+pub fn dense_gemm_tune(m: i64, n: i64, nt: i32, glu: bool) -> GemmTune {
+    let rows = (MV_RTW2_MIN_M..=VERIFY_MAX_M).contains(&m);
+    if !glu && nt == 8 && n > MV_MAX_N && n <= 64 && rows && verify_tune() {
+        GEMM_VERIFY
+    } else {
+        GEMM_DEFAULT
+    }
+}
+
+fn verify_tune() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_NVFP4_VERIFY_TUNE").is_none_or(|v| v != "0"))
+}
 
 /// Whether the GEMM has `tune` for tiles of `128 * mi` rows by `8 * nt` tokens: the default
 /// always; the others at 64 and 128 tokens where `ctas` CTAs' stages fit an sm_120 / sm_121 SM's
@@ -1379,6 +1425,9 @@ pub const GEMM_DEFAULT: GemmTune = GemmTune { stages: 3, ctas: 1 };
 pub fn gemm_tune_fits(mi: i32, nt: i32, tune: GemmTune) -> bool {
     if tune == GEMM_DEFAULT {
         return true;
+    }
+    if tune.warps != 0 {
+        return false;
     }
     // One stage: 48 bytes per weight row, 144 per token row; then x_off/d_off and the CTA's
     // reserved KiB.
@@ -1389,7 +1438,11 @@ pub fn gemm_tune_fits(mi: i32, nt: i32, tune: GemmTune) -> bool {
 }
 
 /// Two stages, two CTAs per SM: [`pick_grouped`]'s 256-row by 64-token down projection tile.
-pub const GEMM_DOWN: GemmTune = GemmTune { stages: 2, ctas: 2 };
+pub const GEMM_DOWN: GemmTune = GemmTune {
+    stages: 2,
+    ctas: 2,
+    warps: 0,
+};
 
 /// The variant of a grouped GEMM (`glu`: the fused SwiGLU's) of `128 * mi` rows by `8 * nt`
 /// tokens over `k` on `n_expert` experts.
@@ -1403,7 +1456,11 @@ pub fn grouped_gemm_tune(k: i64, n_expert: i64, mi: i32, nt: i32, glu: bool) -> 
 
 /// Four stages, one CTA per SM: the grouped SwiGLU GEMM's tile of 64 tokens at up to
 /// [`MV_MAX_N`] pairs per expert (the GEMM there only under [`set_expert_mv_max`]).
-pub const GEMM_GLU_SHORT: GemmTune = GemmTune { stages: 4, ctas: 1 };
+pub const GEMM_GLU_SHORT: GemmTune = GemmTune {
+    stages: 4,
+    ctas: 1,
+    warps: 0,
+};
 
 /// The grouped SwiGLU GEMM's token tile (`8 * nt` tokens) and its variant at `per` pairs per
 /// expert. Up to [`MV_MAX_N`] pairs (short prompt steps, on the GEMM only under
@@ -1546,13 +1603,20 @@ mod cuda {
     }
 
     fn launch(p: &mut Params, kernel: Kernel, stream: *mut c_void) -> Result<(), String> {
-        let (rows, _) = kernel.tile();
-        p.tiles_m = ((p.m + rows - 1) / rows) as i32;
         let tune = match kernel {
             Kernel::Gemm { mi, nt } if !p.plan.is_null() => forced_tune()
                 .unwrap_or_else(|| grouped_gemm_tune(p.k, p.n_expert as i64, mi, nt, false)),
+            Kernel::Gemm { mi: 1, nt } => {
+                forced_tune().unwrap_or_else(|| dense_tune(p.m, p.n, nt, false))
+            }
             _ => forced_tune().unwrap_or(GEMM_DEFAULT),
         };
+        let (rows, _) = kernel.tile();
+        let rows = match kernel {
+            Kernel::Gemm { .. } => tune.rows(rows),
+            _ => rows,
+        };
+        p.tiles_m = ((p.m + rows - 1) / rows) as i32;
         // SAFETY: parameters checked by the callers; the node's stream.
         let code = unsafe {
             match kernel {
@@ -1599,6 +1663,16 @@ mod cuda {
         match FORCED_L1.load(Ordering::Relaxed) {
             0 => 0,
             v => v as i32 - 1,
+        }
+    }
+
+    /// [`dense_gemm_tune`], where no bench forces the copies or the prefetch (those variants
+    /// are the default tune's).
+    fn dense_tune(m: i64, n: i64, nt: i32, glu: bool) -> GemmTune {
+        if forced_pf() | l1() == 0 {
+            dense_gemm_tune(m, n, nt, glu)
+        } else {
+            GEMM_DEFAULT
         }
     }
 
@@ -1673,7 +1747,8 @@ mod cuda {
         } else {
             (false, tokens_tile(n, 16).max(4))
         };
-        let rows = if mv { 16 } else { 128 };
+        let tune = forced_tune().unwrap_or_else(|| dense_tune(m, n, nt, true));
+        let rows = if mv { 16 } else { tune.rows(128) };
         let p = Params {
             w: wg.data as *const u8,
             x: x.data as *const u16,
@@ -1707,7 +1782,6 @@ mod cuda {
             if mv {
                 legion_nvfp4_swiglu_mv_launch(&p, nt, stream)
             } else {
-                let tune = forced_tune().unwrap_or(GEMM_DEFAULT);
                 legion_nvfp4_swiglu_gemm_launch(
                     &p,
                     nt,

@@ -1201,6 +1201,45 @@ mod cuda {
         }
     }
 
+    /// Gemma 4 31B's dense shapes at 33-64 tokens (#1181: a verify step of 5-8 users' drafts):
+    /// the default kernels against the GEMM these batches ran before (128-row tiles of 64
+    /// tokens, 3 stages, one CTA per SM), bit for bit, matmuls and the fused GeGLU.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn cuda_verify_33_64_keeps_the_gemm_bits() {
+        let Some(mut gpu) = gpu() else { return };
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let ns: Vec<usize> = (33..=64).collect();
+        for (k, m) in [(5376, 8192), (5376, 4096), (8192, 5376), (21504, 5376)] {
+            let w = weights(k, m, (k * 3 + m) as u64);
+            for &n in &ns {
+                let xs = activations(k, n, (n * 7 + k) as u64);
+                nvfp4_mm::force_kernel(Some(Kernel::Gemm { mi: 1, nt: 8 }));
+                nvfp4_mm::force_gemm_tune(Some(nvfp4_mm::GEMM_DEFAULT), None);
+                let want = bits(&run(&mut gpu, &w, &xs, Some(0.03), (k, m, n)));
+                nvfp4_mm::force_kernel(None);
+                nvfp4_mm::force_gemm_tune(None, None);
+                let got = bits(&run(&mut gpu, &w, &xs, Some(0.03), (k, m, n)));
+                assert!(got == want, "k {k} m {m} n {n}: bits differ");
+            }
+            println!("k {k} m {m}: 33-64 tokens bitwise");
+        }
+        let (k, m) = (5376, 21504);
+        let (wg, wu) = (weights(k, m, 51), weights(k, m, 52));
+        for &n in &ns {
+            let xs = activations(k, n, n as u64);
+            let s = (Some(0.02), Some(0.04));
+            nvfp4_mm::force_gemm_tune(Some(nvfp4_mm::GEMM_DEFAULT), None);
+            let want = bits(&run_glu(&mut gpu, (&wg, &wu), &xs, s, (k, m, n), true));
+            // The bench's 8-warp tune of the fused GLU (not a default).
+            nvfp4_mm::force_gemm_tune(Some(nvfp4_mm::GemmTune::from_code(8041)), None);
+            let got = bits(&run_glu(&mut gpu, (&wg, &wu), &xs, s, (k, m, n), true));
+            nvfp4_mm::force_gemm_tune(None, None);
+            assert!(got == want, "geglu k {k} m {m} n {n}: bits differ");
+        }
+        println!("geglu k {k} m {m}: 33-64 tokens bitwise");
+    }
+
     /// Qwen3.8-Flash-Next's routed experts at prefill chunks (512 experts, 10 used): the fused
     /// gate/up/SwiGLU GEMM against the chain, and the down GEMM's tiles.
     #[test]
