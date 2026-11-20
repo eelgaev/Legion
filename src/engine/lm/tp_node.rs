@@ -14,7 +14,7 @@ use super::{LmConfig, LoadError};
 use crate::ggml::BufferType;
 use crate::gguf::GgufFile;
 use crate::model::core::pair::sum::PairSum;
-use crate::model::core::{Executor, Model, Pool, TpLead};
+use crate::model::core::{Executor, MediaTable, Model, Pool, TpLead, from_wire_with};
 use crate::node::{Link, Reply, Request, RowsPart};
 use crate::tp_net::{self, CommHandle, ControlListener, StepLaps, StepProfile, TpNetConfig};
 
@@ -199,6 +199,11 @@ pub(super) fn check_config(cfg: &LmConfig) -> Result<(), LoadError> {
         // other ranks.
         return no("speculative decoding other than --spec mtp|dflash|dspark");
     }
+    if cfg.tp_net.as_ref().is_some_and(|t| t.draft_split)
+        && !(cfg.spec.kind == crate::spec::SpecKind::Dflash && drafts_on_rank0(cfg))
+    {
+        return Err(device("--tp-draft-split needs --spec dflash"));
+    }
     if cfg.kv_host_tokens.is_some_and(|n| n > 0) {
         return no("--kv-host-tokens");
     }
@@ -361,8 +366,8 @@ pub(super) fn moe_ep(
 /// Whether `cfg` drafts with a model drafter that runs on rank 0 alone (`--spec dflash|dspark`).
 /// It reads the target's hidden states, which every rank has whole after the all-reduces: rank
 /// 0 drafts with them and sends the drafts in its verify steps, ordinary steps of k + 1 rows
-/// per sequence. Splitting the drafter too would halve its weight reads per pass, at the price
-/// of every drafter state change sent to the others.
+/// per sequence. `--tp-draft-split` splits the drafter's FFN too ([`draft_share`]): every
+/// rank then runs each draft round, which rank 0 sends ([`Request::TpDraft`]).
 fn drafts_on_rank0(cfg: &LmConfig) -> bool {
     use crate::spec::SpecKind;
     matches!(cfg.spec.kind, SpecKind::Dflash | SpecKind::Dspark)
@@ -372,10 +377,11 @@ fn drafts_on_rank0(cfg: &LmConfig) -> bool {
 
 /// A rank above 0's drafting when rank 0 alone drafts ([`drafts_on_rank0`]): the drafter's
 /// whole block read from its config (rank 0 sizes its verify rows by it), its weights left
-/// unread. `None`: this rank makes its drafter as usual.
+/// unread. `None`: this rank makes its drafter as usual (with `--tp-draft-split`, its share
+/// of it, [`draft_share`]).
 pub(super) fn rank0_drafting(cfg: &LmConfig) -> Result<Option<super::spec::Drafting>, LoadError> {
     match &cfg.tp_net {
-        Some(t) if t.rank > 0 && drafts_on_rank0(cfg) => {}
+        Some(t) if t.rank > 0 && !t.draft_split && drafts_on_rank0(cfg) => {}
         _ => return Ok(None),
     }
     let block = match cfg.spec.kind {
@@ -390,6 +396,24 @@ pub(super) fn rank0_drafting(cfg: &LmConfig) -> Result<Option<super::spec::Draft
         }
     };
     Ok(Some(super::spec::Drafting::Rank0(block)))
+}
+
+/// This rank's share of the DFlash drafter's FFN under `--tp-draft-split` (#619): every rank
+/// loads one and runs rank 0's draft rounds ([`Request::TpDraft`]), the pass's FFN sums
+/// through the model's communicator. `None`: without it (or with `--tp-per-gpu`).
+pub(super) fn draft_share(
+    cfg: &LmConfig,
+    start: Option<&Start>,
+) -> Option<crate::spec::dflash::TpShare> {
+    let t = cfg.tp_net.as_ref().filter(|t| t.draft_split)?;
+    match &start?.via {
+        Via::Net { comm, .. } => Some(crate::spec::dflash::TpShare {
+            comm: comm.id(),
+            rank: t.rank,
+            n_ranks: t.n_ranks(),
+        }),
+        Via::Pair { .. } => None,
+    }
 }
 
 /// What every rank's executor must be (checked after the load).
@@ -438,6 +462,7 @@ pub(super) fn lead(exec: &mut Executor, start: Start, n_blocks: usize) -> Result
             let mut lead = TpLead::new(links, comm, cfg.profile);
             lead.set_mtp_chains(cfg.mtp_chain);
             lead.set_mtp_local_rows(cfg.mtp_local_rows);
+            lead.set_draft_split(cfg.draft_split);
             exec.set_tp_lead(lead);
             if cfg.head_split {
                 let on = n == 2 && exec.set_tp_head_split(true);
@@ -481,11 +506,13 @@ pub(super) fn lead(exec: &mut Executor, start: Start, n_blocks: usize) -> Result
 
 /// A rank above 0: answers rank 0's requests with `exec` until rank 0 disconnects (the
 /// connections are made once: the rank then stops). `ring_bufts`: where its rings are saved.
+/// `drafter`: its share of the DFlash drafter under `--tp-draft-split`.
 pub(super) fn follow(
     mut exec: Executor,
     start: Start,
     n_blocks: usize,
     ring_bufts: Vec<BufferType>,
+    mut drafter: Option<Box<dyn crate::spec::ModelDrafter>>,
 ) -> LoadError {
     let rank = start.rank;
     tracing::info!(
@@ -503,8 +530,15 @@ pub(super) fn follow(
             let mine = (2, rank, exec.model().hp.n_layer);
             let mut profile = StepProfile::new(0);
             let mut rows = Default::default();
+            let mut media = MediaTable::default();
             serve.serve(&mut |req| {
-                let state = (&mut blocks, &mut profile, &mut rows);
+                let state = (
+                    &mut blocks,
+                    &mut profile,
+                    &mut rows,
+                    &mut media,
+                    &mut drafter,
+                );
                 handle(&mut exec, req, mine, state, &ring_bufts, &Sums::Pair(&sum))
                     .unwrap_or_else(Reply::Error)
             });
@@ -522,8 +556,15 @@ pub(super) fn follow(
     take_rows(&exec, control);
     let mut profile = StepProfile::new(cfg.profile);
     let mut rows = Default::default();
+    let mut media = MediaTable::default();
     let r = crate::node::serve_one(stream, &mut |req| {
-        let state = (&mut blocks, &mut profile, &mut rows);
+        let state = (
+            &mut blocks,
+            &mut profile,
+            &mut rows,
+            &mut media,
+            &mut drafter,
+        );
         handle(&mut exec, req, mine, state, &ring_bufts, &Sums::Net(&comm))
             .unwrap_or_else(Reply::Error)
     });
@@ -536,9 +577,16 @@ pub(super) fn follow(
     ))
 }
 
-/// What a rank above 0 keeps between requests: its KV blocks, its `--tp-profile`, and the
-/// rows its last steps captured ([`FollowRows`]).
-type FollowState<'s> = (&'s mut usize, &'s mut StepProfile, &'s mut FollowRows);
+/// What a rank above 0 keeps between requests: its KV blocks, its `--tp-profile`, the rows
+/// its last steps captured ([`FollowRows`]), the images rank 0 sent (#1195), and its share of
+/// the DFlash drafter (`--tp-draft-split`).
+type FollowState<'s> = (
+    &'s mut usize,
+    &'s mut StepProfile,
+    &'s mut FollowRows,
+    &'s mut MediaTable,
+    &'s mut Option<Box<dyn crate::spec::ModelDrafter>>,
+);
 
 /// The rows a rank above 0's last steps captured, which [`Request::TpMtpRows`] reads.
 #[derive(Default)]
@@ -621,11 +669,63 @@ fn rows_of<'a>(
     Ok(out)
 }
 
+/// Groups borrowing `wire`, a sequence's images those of `media` its id names (rank 0 sent
+/// them before the request, #1195).
+fn groups_of<'a>(
+    wire: &'a [crate::node::WireGroup],
+    media: &'a MediaTable,
+) -> Result<Vec<crate::model::core::Group<'a>>, String> {
+    from_wire_with(wire, |id| media.get(id))
+}
+
+const NO_DRAFT_SPLIT: &str = "a draft round of --tp-draft-split: pass it on every rank";
+
+/// Rank 0's draft round `reqs` (`--tp-draft-split`) on this rank's share of the drafter: the
+/// same passes with the same rows (`step`, the last step's captured layers, `w` floats a row),
+/// their drafts dropped (rank 0 picks). The drafter reads a sequence's length and last token
+/// only: the tokens before it are zeros here.
+fn run_draft(
+    d: &mut dyn crate::spec::ModelDrafter,
+    reqs: &[crate::node::WireDraft],
+    step: &[Vec<f32>],
+    w: usize,
+) -> Result<(), String> {
+    let tokens: Vec<Vec<u32>> = reqs
+        .iter()
+        .map(|r| {
+            let mut t = vec![0; r.base as usize];
+            t.extend_from_slice(&r.tokens);
+            t
+        })
+        .collect();
+    let mut outs: Vec<crate::spec::Draft> = reqs.iter().map(|_| Default::default()).collect();
+    let mut batch = Vec::with_capacity(reqs.len());
+    for ((r, tokens), out) in reqs.iter().zip(&tokens).zip(&mut outs) {
+        let (off, ran) = (r.off as usize, r.ran as usize);
+        // Rows past the last step's: none, which the drafter's round refuses after it has run
+        // its sums (rank 0's round waits for them), not before.
+        let hidden = step
+            .iter()
+            .map(|h| h.get(off * w..(off + ran) * w).unwrap_or_default())
+            .collect();
+        batch.push(crate::spec::DraftRequest {
+            seq: r.seq,
+            tokens,
+            start: r.start as usize,
+            ran,
+            hidden,
+            max: r.max as usize,
+            out,
+        });
+    }
+    d.step(&mut batch)
+}
+
 fn handle(
     exec: &mut Executor,
     req: Request,
     mine: (usize, usize, usize),
-    (blocks, profile, rows): FollowState<'_>,
+    (blocks, profile, rows, media, drafter): FollowState<'_>,
     ring_bufts: &[BufferType],
     comm: &Sums<'_>,
 ) -> Result<Reply, String> {
@@ -660,7 +760,7 @@ fn handle(
             exec.set_pipeline_micro(micro as usize);
             exec.set_micro_taper(taper as usize);
             exec.set_gather_budget(gather_budget as usize);
-            let mut groups = crate::model::core::from_wire(&groups)?;
+            let mut groups = groups_of(&groups, media)?;
             // A greedy step's head split with rank 0 (`--tp-head-split`): this rank's share
             // of the vocabulary, its candidates the answer.
             let split = head != 0;
@@ -712,7 +812,7 @@ fn handle(
             h,
         } => {
             exec.set_gather_budget(gather_budget as usize);
-            let groups = crate::model::core::from_wire(&groups)?;
+            let groups = groups_of(&groups, media)?;
             let t0 = std::time::Instant::now();
             comm.mark_step(profile);
             exec.mtp_step(&groups, &h).map_err(|e| e.to_string())?;
@@ -731,7 +831,7 @@ fn handle(
             // A prompt chunk's take-in reads this rank's copy of the step's rows (#780), its
             // pieces' rows on the device where the step left them there (#1176).
             exec.set_gather_budget(gather_budget as usize);
-            let groups = crate::model::core::from_wire(&groups)?;
+            let groups = groups_of(&groups, media)?;
             let (parts, dev) = split_device(&parts)?;
             let parts = rows_of(parts, &h, &rows.host[..])?;
             let t0 = std::time::Instant::now();
@@ -776,7 +876,7 @@ fn handle(
             // Rank 0's whole draft round: the same passes from the same picks (#771), reading
             // this rank's copy of the step's rows where rank 0 names them (#780).
             exec.set_gather_budget(gather_budget as usize);
-            let groups = crate::model::core::from_wire(&groups)?;
+            let groups = groups_of(&groups, media)?;
             let parts = rows_of(&parts, &h, &rows.host[..])?;
             let t0 = std::time::Instant::now();
             comm.mark_step(profile);
@@ -821,6 +921,26 @@ fn handle(
             exec.model().prefetch_engram(&before, &tokens);
             Reply::Done
         }
+        Request::TpMedia {
+            id,
+            n_embd,
+            spans,
+            rows,
+        } => {
+            // A sequence's images, which rank 0 encoded, for the steps that name them (#1195).
+            if n_embd as usize != exec.hp().n_embd as usize {
+                return Err(format!(
+                    "images of rows {n_embd} wide for a model {} wide",
+                    exec.hp().n_embd
+                ));
+            }
+            media.add(id, n_embd, &spans, &rows)?;
+            Reply::Done
+        }
+        Request::TpMediaDrop { ids } => {
+            media.forget(&ids);
+            Reply::Done
+        }
         Request::SaveRing {
             ring,
             slot,
@@ -857,6 +977,16 @@ fn handle(
                 .map(|(a, i, b, j)| (pool(a), i as usize, pool(b), j as usize))
                 .collect();
             exec.copy_states(&copies).map_err(|e| e.to_string())?;
+            Reply::Done
+        }
+        Request::TpDraft { reqs } => {
+            let d = drafter.as_mut().ok_or(NO_DRAFT_SPLIT)?;
+            let w = exec.model().hp.n_embd as usize;
+            run_draft(d.as_mut(), &reqs, &rows.host[0], w)?;
+            Reply::Done
+        }
+        Request::TpDraftRelease { seq } => {
+            drafter.as_mut().ok_or(NO_DRAFT_SPLIT)?.release(seq);
             Reply::Done
         }
         Request::Hello { .. }

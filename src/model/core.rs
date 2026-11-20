@@ -115,9 +115,10 @@ mod window_attn;
 
 pub use arch::{Arch, ArchRef, Recurrent, TokenConv};
 pub use exec::{
-    ChainOutput, Executor, LENT_SCRATCH, Pool, PromptNext, Remote, StateCapture, StepPart, TpLead,
-    default_verify_budget, from_wire, set_mtp_kept_graphs, set_prompt_buffer_reserve,
-    set_prompt_build_ahead, set_prompt_step_stats, set_verify_kept_graphs, verify_kept_graphs,
+    ChainOutput, Executor, LENT_SCRATCH, MediaTable, Pool, PromptNext, Remote, StateCapture,
+    StepPart, TpLead, default_verify_budget, from_wire, from_wire_with, set_mtp_kept_graphs,
+    set_prompt_buffer_reserve, set_prompt_build_ahead, set_prompt_step_stats,
+    set_verify_kept_graphs, verify_kept_graphs,
 };
 pub use kv_type::{KvType, KvTypes};
 pub use linear::{FfnFusion, Fp8Act, Linear, Nvfp4A4, Nvfp4Act, Nvfp4Mm};
@@ -2518,10 +2519,14 @@ impl Model {
     /// Whether a greedy step's head may run as two shares of the vocabulary on the two ranks
     /// of tensor parallelism ([`head_split`], `--tp-head-split`): an architecture whose split
     /// head was shown to keep the text ([`Arch::head_splits`]), with the core's head as a
-    /// plain matmul of `output.weight` (no scale, no FP8 activation scale) in one GPU's
+    /// plain matmul of `output.weight` (or of `token_embd.weight` for a head tied to the
+    /// embeddings, as the head is built) (no scale, no FP8 activation scale) in one GPU's
     /// memory, and a vocabulary that splits ([`head_split::vocab_fits`]).
     pub(crate) fn head_splits(&self) -> bool {
-        let name = "output.weight";
+        let (name, input_scale) = match self.w("output.weight") {
+            Ok(_) => ("output.weight", "output.input_scale"),
+            Err(_) => ("token_embd.weight", "token_embd.input_scale"),
+        };
         let Ok(w) = self.w(name) else {
             return false;
         };
@@ -2533,7 +2538,7 @@ impl Model {
             && w.ne()[1] == self.hp.n_vocab
             && head_split::vocab_fits(w.ne()[1] as usize)
             && linear::scale_name(name).is_none_or(|s| self.w(&s).is_err())
-            && self.w("output.input_scale").is_err()
+            && self.w(input_scale).is_err()
     }
 
     /// Whether the LM head `name` (`w`) for `x` runs on [`head_mm`]: [`head_mm::takes`], and

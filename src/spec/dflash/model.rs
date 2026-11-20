@@ -223,6 +223,8 @@ pub struct Model {
     markov: Option<Markov>,
     /// DFlash 2's selector codebooks.
     selector: Option<Selector>,
+    /// `--tp-draft-split`: the FFN's share this rank holds ([`super::TpShare`]).
+    tp: Option<super::TpShare>,
 }
 
 /// `n` values of `ty` in `bytes` as floats (F32 has no conversion function in ggml's table).
@@ -595,7 +597,15 @@ impl Model {
             first_row,
             markov,
             selector,
+            tp: None,
         })
+    }
+
+    /// Makes the draft passes add the ranks' FFN outputs (`--tp-draft-split`): the store
+    /// holds this rank's share of every layer's FFN. On a rank above 0 a pass stops after
+    /// the last layer (rank 0 computes the head and picks the drafts) and returns no rows.
+    pub fn set_tp(&mut self, tp: Option<super::TpShare>) {
+        self.tp = tp;
     }
 
     /// DFlash 2's selector.
@@ -988,6 +998,45 @@ impl Model {
         Ok(rows.pop().expect("one sequence"))
     }
 
+    /// Sets a [`Self::draft_many`] graph's inputs, after it is allocated: each block's tokens
+    /// (the last token, then masks) and positions, its cells, and the attention masks.
+    #[allow(clippy::type_complexity)]
+    fn set_block_inputs(
+        &self,
+        seqs: &[BlockSeq<'_>],
+        n: usize,
+        [tokens, pos]: [Tensor<'_>; 2],
+        cells: Option<Tensor<'_>>,
+        pooled: Option<&Pooled<'_>>,
+        masks: &[(Option<Tensor<'_>>, Option<Tensor<'_>>)],
+    ) {
+        let c = &self.cfg;
+        let mut ids = Vec::with_capacity(n * seqs.len());
+        let mut positions = Vec::with_capacity(n * seqs.len());
+        for s in seqs {
+            ids.push(s.last as i32);
+            ids.extend(std::iter::repeat_n(c.mask_token as i32, n - 1));
+            positions.extend((0..n).map(|j| (s.anchor_pos + j) as i32));
+        }
+        tokens.set_i32(&ids);
+        pos.set_i32(&positions);
+        if let Some(cells) = cells {
+            cells.set_i32(&(0..n as i32).collect::<Vec<_>>());
+        }
+        if let Some(pa) = pooled {
+            pa.set_inputs(self, seqs, n);
+        }
+        for (s, &(mask_full, mask_swa)) in seqs.iter().zip(masks) {
+            let n_att = s.cache.used_cells();
+            if let Some(t) = mask_full {
+                t.set_f32(&self.mask(s.cache, s.anchor_pos, n, n_att, None));
+            }
+            if let (Some(t), Some((w, _))) = (mask_swa, &c.sliding_window) {
+                t.set_f32(&self.mask(s.cache, s.anchor_pos, n, n_att, Some(*w)));
+            }
+        }
+    }
+
     /// [`Self::draft`] for several sequences in one pass, `n` block positions each (#521): the
     /// matmuls read the weights once for all of them; the attention is per sequence (each reads
     /// its own cache). One sequence is exactly [`Self::draft`]'s graph. Returns one [`Rows`] per
@@ -1163,8 +1212,33 @@ impl Model {
             };
             let act = ctx.mul(ctx.silu(gu[0]), gu[1]);
             let down = mul_mat(&ctx, self.lw(il, "ffn_down.weight"), act);
+            // `--tp-draft-split`: this rank's share of the intermediate rows, summed over the
+            // ranks (the same bits on every rank).
+            let down = match self.tp {
+                Some(t) => crate::tp_net::all_reduce(&ctx, t.comm, down),
+                None => down,
+            };
             let down = self.conv_out(&ctx, il, "ffn", down, ffn_dynamic, nb);
             h = ctx.add(down, h_attn);
+        }
+        // A rank above 0 of `--tp-draft-split`: the pass ends with the last layer's sum.
+        if self.tp.is_some_and(|t| !t.leads()) {
+            graph.expand(h);
+            let allocator = alloc.take().unwrap_or_else(|| drafter_allocator(backend));
+            ctx.alloc_graph(&graph, allocator)
+                .map_err(|e| e.to_string())?;
+            self.set_block_inputs(seqs, n, [tokens, pos], cells, pooled.as_ref(), &masks);
+            backend.compute(&graph).map_err(|e| e.to_string())?;
+            *alloc = ctx.into_allocator();
+            return Ok(seqs
+                .iter()
+                .map(|_| Rows {
+                    argmax: Vec::new(),
+                    logits: None,
+                    hidden: None,
+                    selector: None,
+                })
+                .collect());
         }
         let x = ctx.mul(ctx.rms_norm(h, c.rms_eps), self.w("output_norm.weight"));
         // Output rows: every sequence's block positions `first..n`, in order.
@@ -1225,30 +1299,7 @@ impl Model {
         let allocator = alloc.take().unwrap_or_else(|| drafter_allocator(backend));
         ctx.alloc_graph(&graph, allocator)
             .map_err(|e| e.to_string())?;
-        let mut ids = Vec::with_capacity(total);
-        let mut positions = Vec::with_capacity(total);
-        for s in seqs {
-            ids.push(s.last as i32);
-            ids.extend(std::iter::repeat_n(c.mask_token as i32, n - 1));
-            positions.extend((0..n).map(|j| (s.anchor_pos + j) as i32));
-        }
-        tokens.set_i32(&ids);
-        pos.set_i32(&positions);
-        if let Some(cells) = cells {
-            cells.set_i32(&(0..n as i32).collect::<Vec<_>>());
-        }
-        if let Some(pa) = &pooled {
-            pa.set_inputs(self, seqs, n);
-        }
-        for (s, &(mask_full, mask_swa)) in seqs.iter().zip(&masks) {
-            let n_att = s.cache.used_cells();
-            if let Some(t) = mask_full {
-                t.set_f32(&self.mask(s.cache, s.anchor_pos, n, n_att, None));
-            }
-            if let (Some(t), Some((w, _))) = (mask_swa, &c.sliding_window) {
-                t.set_f32(&self.mask(s.cache, s.anchor_pos, n, n_att, Some(*w)));
-            }
-        }
+        self.set_block_inputs(seqs, n, [tokens, pos], cells, pooled.as_ref(), &masks);
         backend.compute(&graph).map_err(|e| e.to_string())?;
         let ids =
             |t: Tensor<'_>| -> Vec<u32> { t.to_i32().into_iter().map(|i| i as u32).collect() };

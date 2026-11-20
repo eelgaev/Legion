@@ -109,8 +109,23 @@ impl Source {
     /// a Hugging Face checkpoint's are left out (read them with [`Self::host_tensor`]). `weights`:
     /// a Hugging Face checkpoint's [`q8_matrix`] tensors as stored, as Q8_0 or as 4-bit copies
     /// (a GGUF's are read as stored).
+    #[cfg(test)]
     pub fn load(&self, buft: BufferType, weights: DraftWeights) -> Result<Store, String> {
+        self.load_share(buft, weights, None)
+    }
+
+    /// [`Self::load`] with only `ffn`'s share of every layer's FFN (`--tp-draft-split`; a
+    /// Hugging Face checkpoint of float matrices only).
+    pub fn load_share(
+        &self,
+        buft: BufferType,
+        weights: DraftWeights,
+        ffn: Option<&FfnCut>,
+    ) -> Result<Store, String> {
         match self {
+            Source::Gguf(_) if ffn.is_some() => {
+                Err("--tp-draft-split: the drafter must be a Hugging Face checkpoint".into())
+            }
             Source::Gguf(g) => {
                 let host = crate::ggml::device_by_kind(crate::ggml::DeviceKind::Cpu)
                     .ok_or("no CPU device")?
@@ -128,7 +143,7 @@ impl Source {
                     ctxs: Vec::new(),
                 })
             }
-            Source::Hf(c) => load_hf(c, buft, weights),
+            Source::Hf(c) => load_hf(c, buft, weights, ffn),
         }
     }
 
@@ -423,7 +438,73 @@ fn fp8_block(config: Option<&serde_json::Value>) -> Result<[usize; 2], String> {
 /// [`DraftWeights::Q8_0`] / [`DraftWeights::Q4`] the [`q8_matrix`] ones become Q8_0 / Q4_K
 /// (Q4_0 for rows not a multiple of 256 wide); FP8 block-scaled matrices become Q8_0 in every
 /// case (see the module docs). The [`HOST_ONLY`] tensors are left out.
-fn load_hf(c: &Checkpoint, buft: BufferType, weights: DraftWeights) -> Result<Store, String> {
+/// The share of a drafter's FFN one rank loads (`--tp-draft-split`,
+/// [`super::TpShare`]): intermediate rows `rows` of the checkpoint's `n_ff`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FfnCut {
+    pub rows: std::ops::Range<usize>,
+    pub n_ff: usize,
+}
+
+/// Which part of a matrix a rank keeps ([`ffn_cut_of`]), in ggml order (`ne0` the values of a
+/// row): rows `ne1` or columns `ne0` in the range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cut {
+    Rows(std::ops::Range<usize>),
+    Cols(std::ops::Range<usize>),
+}
+
+/// How `cut` cuts the tensor `name` (GGUF naming, ggml `shape`), and its shape after:
+/// `ffn_gate` and `ffn_up` keep their rows (outputs) in the share, `ffn_down` its columns
+/// (inputs); every other tensor stays whole (`None`).
+pub fn ffn_cut_of(
+    name: &str,
+    shape: &[i64],
+    cut: &FfnCut,
+) -> Result<Option<(Cut, Vec<i64>)>, String> {
+    let Some(stem) = name
+        .strip_prefix("blk.")
+        .and_then(|n| n.split_once('.'))
+        .map(|(_, s)| s)
+    else {
+        return Ok(None);
+    };
+    let n_ff = cut.n_ff as i64;
+    let share = cut.rows.len() as i64;
+    let (dim, out) = match stem {
+        "ffn_gate.weight" | "ffn_up.weight" => (1, Cut::Rows(cut.rows.clone())),
+        "ffn_down.weight" => (0, Cut::Cols(cut.rows.clone())),
+        _ => return Ok(None),
+    };
+    if shape.len() != 2 || shape[dim] != n_ff {
+        return Err(format!(
+            "--tp-draft-split: `{name}` is {shape:?}, expected {n_ff} intermediate rows"
+        ));
+    }
+    let mut cut_shape = shape.to_vec();
+    cut_shape[dim] = share;
+    Ok(Some((out, cut_shape)))
+}
+
+/// `bytes`, a matrix of rows of `ne0` values of `es` bytes, with only `cut`'s part.
+pub fn cut_matrix(bytes: &[u8], es: usize, ne0: usize, cut: &Cut) -> Vec<u8> {
+    let row = ne0 * es;
+    match cut {
+        Cut::Rows(r) => bytes[r.start * row..r.end * row].to_vec(),
+        Cut::Cols(c) => bytes
+            .chunks_exact(row)
+            .flat_map(|x| &x[c.start * es..c.end * es])
+            .copied()
+            .collect(),
+    }
+}
+
+fn load_hf(
+    c: &Checkpoint,
+    buft: BufferType,
+    weights: DraftWeights,
+    ffn: Option<&FfnCut>,
+) -> Result<Store, String> {
     struct Item {
         name: String,
         src: String,
@@ -432,6 +513,8 @@ fn load_hf(c: &Checkpoint, buft: BufferType, weights: DraftWeights) -> Result<St
         shape: Vec<i64>,
         /// FP8: the `weight_scale_inv` tensor and its float type.
         fp8_scale: Option<(String, ffi::ggml_type)>,
+        /// `--tp-draft-split`: this rank's part of the checkpoint's matrix, `ne0` values a row.
+        cut: Option<(Cut, usize)>,
     }
     let all = c.tensors();
     let mut block = None;
@@ -455,10 +538,25 @@ fn load_hf(c: &Checkpoint, buft: BufferType, weights: DraftWeights) -> Result<St
                 ty: ffi::ggml_type_GGML_TYPE_I64,
                 shape: vec![t.numel() as i64],
                 fp8_scale: None,
+                cut: None,
             });
             continue;
         }
-        let shape: Vec<i64> = t.shape.iter().rev().map(|&d| d as i64).collect();
+        let mut shape: Vec<i64> = t.shape.iter().rev().map(|&d| d as i64).collect();
+        let cut = match ffn {
+            Some(f) => ffn_cut_of(&name, &shape, f)?.map(|(cut, cut_shape)| {
+                let ne0 = shape[0] as usize;
+                shape = cut_shape;
+                (cut, ne0)
+            }),
+            None => None,
+        };
+        if cut.is_some() && ggml_type(&t.dtype).is_none() {
+            return Err(format!(
+                "--tp-draft-split: tensor `{}` is {}: only float FFN matrices are cut",
+                t.name, t.dtype
+            ));
+        }
         if t.dtype == Dtype::F8E4M3 {
             if !q8_matrix(&name, &shape) {
                 return Err(format!(
@@ -493,6 +591,7 @@ fn load_hf(c: &Checkpoint, buft: BufferType, weights: DraftWeights) -> Result<St
                 ty: types::Q8_0,
                 shape,
                 fp8_scale: Some((src, sty.expect("checked above"))),
+                cut: None,
             });
             continue;
         }
@@ -524,6 +623,7 @@ fn load_hf(c: &Checkpoint, buft: BufferType, weights: DraftWeights) -> Result<St
             ty,
             shape,
             fp8_scale: None,
+            cut,
         });
     }
     let fused = if fuse_wanted() {
@@ -555,6 +655,15 @@ fn load_hf(c: &Checkpoint, buft: BufferType, weights: DraftWeights) -> Result<St
     ctx.alloc_tensors(buft).map_err(|e| e.to_string())?;
     for i in &items {
         let bytes = c.data(&i.src).map_err(|e| e.to_string())?;
+        let kept;
+        let bytes = match &i.cut {
+            Some((cut, ne0)) => {
+                let es = crate::ggml::row_size(ggml_type(&i.dtype).expect("checked above"), 1);
+                kept = cut_matrix(bytes, es, *ne0, cut);
+                &kept[..]
+            }
+            None => bytes,
+        };
         let t = ctx.tensor(&i.name).expect("created above");
         if let Some((src, sty)) = &i.fp8_scale {
             let s = c.data(src).map_err(|e| e.to_string())?;
