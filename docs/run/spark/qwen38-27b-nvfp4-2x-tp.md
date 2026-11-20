@@ -64,11 +64,23 @@ after / before): prefill 8K 2,167-2,198 / 2,415-2,453, 2,413-2,458 / 2,161-2,186
 2,030 / 1,820 tok/s. Decode does not change (1, 4 and 16 users within 1%), and text and log probabilities are
 the same bits.
 
+A rank holds 8 of the 16 key heads and 24 of the 48 value heads of each DeltaNet layer, a head count ggml-cuda
+runs token after token instead of on its chunked kernel. Its prompt steps now take Legion's `gdn_scan` (the V100
+kernel, ggml-cuda's arithmetic, #1133, no flag, `--gdn-scan-ggml` goes back): 285 -> 128 ms of an 8K prompt step
+on each rank. With the command above plus `--deterministic`, two sessions in ABBA order (before / after,
+after / before): prefill 8K 2,418-2,447 / 2,542-2,575, 2,535-2,583 / 2,404-2,451 and 32K 2,025-2,398 /
+2,111-2,525, 2,112-2,529 / 2,000-2,401 tok/s (two requests each, the second 32K one is the faster). Decode does
+not change (1 user 48.5-48.7, 4 users 126.8-127.7, 16 users 270.3-273.1), and text and log probabilities are the
+same bits.
+
 Optional, output-moving: `--tp-wire bf16` on both ranks sends sums of at least 1 MiB in BF16, half the bytes:
 prompt steps, the 16-user verify steps and short prompts (all ranks still agree). On top of the command above
 (same session day, one session): prefill 8K 2,676 / 2,728 and 32K 2,252 / 2,539 tok/s (an 8K prompt step on rank 0
 about 3,020 ms), 1 user 36.4 (story) to 78.2 (code), median 57.8 (other text: a short prompt's step sums move, so
 the drafts accept differently, mean accepted length 3.54), 4 users 139.6 / 137.6, 16 users 310.6 / 303.7.
+With `gdn_scan` on the ranks (the build before its final launch shape, which is ~30 ms faster per 8K step) and
+`--deterministic`, one session: prefill 8K 2,963 / 3,026 and 32K 2,584 / 2,920 tok/s (vLLM 0.33.0 TP2: 2,913 and
+2,757), 1 user median 57.7, 4 users 129.5, 16 users 303.3.
 
 ## What each flag does
 

@@ -391,12 +391,16 @@ impl Vision {
         let mut key = tokens.to_vec();
         let mut spans = Vec::with_capacity(pending.len());
         let mut n_embd = 0;
+        let reencode = reencode();
         for p in pending {
-            let cached = self
-                .rows
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(p.hash, p.nx, p.ny);
+            let cached = if reencode {
+                None
+            } else {
+                self.rows
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(p.hash, p.nx, p.ny)
+            };
             let rows = match cached {
                 Some(rows) => {
                     tracing::info!(tokens = p.nx * p.ny, "vision: image rows from the cache");
@@ -412,11 +416,17 @@ impl Vision {
                     })
                     .map_err(|e| EngineError::Internal(format!("vision encoder: {e}")))?;
                     assert_eq!((e.nx, e.ny), (p.nx, p.ny), "the tower's grid");
-                    tracing::info!(
-                        tokens = e.n_tokens(),
-                        ms = t.elapsed().as_millis() as u64,
-                        "vision: image encoded"
-                    );
+                    let ms = t.elapsed().as_millis() as u64;
+                    if reencode {
+                        tracing::info!(
+                            tokens = e.n_tokens(),
+                            ms,
+                            rows = %format!("{:016x}", rows_hash(&e.data)),
+                            "vision: image encoded"
+                        );
+                    } else {
+                        tracing::info!(tokens = e.n_tokens(), ms, "vision: image encoded");
+                    }
                     let rows: Arc<[f32]> = e.data.into();
                     self.rows.lock().unwrap_or_else(|e| e.into_inner()).put(
                         p.hash,
@@ -442,6 +452,19 @@ impl Vision {
         let media = Media::with_layout(spans, n_embd, self.marks.layout);
         Ok((Arc::new(media), key))
     }
+}
+
+/// `LEGION_DEBUG_VISION_REENCODE=1` (A/B runs): every image is encoded, the row cache unused,
+/// and the log names a hash of its rows' bits.
+fn reencode() -> bool {
+    std::env::var_os("LEGION_DEBUG_VISION_REENCODE").is_some_and(|v| v == "1")
+}
+
+/// FNV-1a over the bits of `rows`.
+fn rows_hash(rows: &[f32]) -> u64 {
+    rows.iter().fold(0xcbf2_9ce4_8422_2325, |h, v| {
+        (h ^ u64::from(v.to_bits())).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 /// The prefix-cache key of token `i` of an image hashed `hash`: above `u32::MAX / 2`, which no

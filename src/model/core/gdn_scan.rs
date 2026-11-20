@@ -1,7 +1,8 @@
 //! The gated delta rule of a prompt step's DeltaNet layers as an external op
 //! ([`crate::ggml::ExternalOp`]) with a CUDA kernel of Legion's (`src/cuda/gdn_scan.cu`): ggml's
 //! `gated_delta_net` token after token, with ggml-cuda's arithmetic and its bits, faster where
-//! that kernel waits on memory each token (compute capability 7.x: V100).
+//! that kernel waits on memory each token (compute capability 7.x: V100; 12.0 and 12.1 for the
+//! groups ggml-cuda runs token after token there, #1133).
 //!
 //! ggml-cuda runs the recurrence one token at a time per state column, eight lanes a column, and
 //! loads each token's inputs inside that token's step. `gdn_scan` keeps the lanes, the sums'
@@ -11,11 +12,13 @@
 //!
 //! It takes prompt groups only: a decode step's state update in place and an MTP verify step's
 //! replay keep ggml's op. GPUs from sm_80 on keep ggml's op too: ggml runs a chunked MMA kernel
-//! on several of them, with other bits.
+//! on several of them, with other bits. On compute capability 12.0 and 12.1 (RTX 50, the GB10)
+//! the op takes the groups ggml-cuda keeps on its per-token kernel (a tensor parallel rank's
+//! share of Qwen3.8-27B's heads) unless `--gdn-mma` takes them: the same bits there, faster.
 
 #[cfg(feature = "cuda")]
 use std::os::raw::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::ggml::{Context, ExternalOp, Tensor, ffi, types};
 
@@ -38,9 +41,43 @@ pub(super) const MIN_TOKENS: i64 = 16;
 /// it off for comparisons).
 static ON: AtomicBool = AtomicBool::new(true);
 
-/// Whether the engine's GPU is one the op is chosen for (compute capability 7.x), set when the
-/// engine loads ([`set_gpu`]): the answer for a group whose state names no device ([`gpu_for`]).
-static GPU: AtomicBool = AtomicBool::new(false);
+/// The groups a GPU gives the op ([`gpu_takes`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(super) enum Takes {
+    /// None: ggml's op (and its chunked kernel where ggml-cuda has one).
+    No = 0,
+    /// Every prompt group (compute capability 7.x).
+    All = 1,
+    /// The groups ggml-cuda runs token after token
+    /// ([`gdn_mma::ggml_per_token`](super::gdn_mma::ggml_per_token)): compute capability 12.0
+    /// and 12.1, where ggml-cuda gives other head counts its chunked kernel.
+    PerToken = 2,
+}
+
+impl Takes {
+    fn of(v: u8) -> Self {
+        match v {
+            1 => Takes::All,
+            2 => Takes::PerToken,
+            _ => Takes::No,
+        }
+    }
+
+    /// Whether a group goes to the op: `per_token`, whether ggml-cuda would run it token after
+    /// token.
+    pub(super) fn group(self, per_token: bool) -> bool {
+        match self {
+            Takes::No => false,
+            Takes::All => true,
+            Takes::PerToken => per_token,
+        }
+    }
+}
+
+/// The groups the engine's GPU gives the op ([`Takes`]), set when the engine loads
+/// ([`set_gpu`]): the answer for a group whose state names no device ([`gpu_for`]).
+static GPU: AtomicU8 = AtomicU8::new(Takes::No as u8);
 
 /// Sets whether graphs built from now on use [`gdn_scan`] where it fits (on by default; ggml's
 /// `gated_delta_net` with `false`).
@@ -48,36 +85,46 @@ pub fn set_gdn_scan(on: bool) {
     ON.store(on, Ordering::Relaxed);
 }
 
-/// The engine's GPU: [`gdn_scan`] is used on compute capability 7.x (`cc_major`), where it gives
+/// The engine's GPU (`cc`, major and minor): [`gdn_scan`] is used on compute capability 7.x,
+/// and on 12.0 and 12.1 for the groups ggml-cuda runs token after token, where it gives
 /// ggml-cuda's bits faster; elsewhere ggml's op stays (sm_80+ GPUs may run ggml's chunked
 /// kernel, other bits).
-pub fn set_gpu(cc_major: Option<i32>) {
-    GPU.store(gpu_takes(cc_major), Ordering::Relaxed);
+pub fn set_gpu(cc: Option<(i32, i32)>) {
+    GPU.store(gpu_takes(cc) as u8, Ordering::Relaxed);
 }
 
-/// Whether a GPU of compute capability major `cc_major` takes the op ([`set_gpu`]).
-pub(super) fn gpu_takes(cc_major: Option<i32>) -> bool {
-    cc_major == Some(7)
+/// The groups a GPU of compute capability `cc` gives the op ([`set_gpu`]).
+pub(super) fn gpu_takes(cc: Option<(i32, i32)>) -> Takes {
+    match cc {
+        Some((7, _)) => Takes::All,
+        Some((12, 0 | 1)) => Takes::PerToken,
+        _ => Takes::No,
+    }
 }
 
-/// Whether the GPU of device `dev` (the state's) takes the op, asked per device (#1201: a box
+/// The groups the GPU of device `dev` (the state's) gives the op, asked per device (#1201: a box
 /// may hold GPUs of different architectures); the engine's answer where `dev` is unknown.
-fn gpu_for(dev: Option<usize>) -> bool {
-    gpu_for_by(dev, GPU.load(Ordering::Relaxed), crate::hw::per_device::cc)
+fn gpu_for(dev: Option<usize>) -> Takes {
+    gpu_for_by(
+        dev,
+        Takes::of(GPU.load(Ordering::Relaxed)),
+        crate::hw::per_device::cc,
+    )
 }
 
 /// [`gpu_for`] with the engine's answer `engine` and the compute capabilities `cc_of` gives.
 pub(super) fn gpu_for_by(
     dev: Option<usize>,
-    engine: bool,
+    engine: Takes,
     cc_of: impl FnOnce(usize) -> Option<(i32, i32)>,
-) -> bool {
-    crate::hw::per_device::pick_by(dev, engine, |cc| gpu_takes(cc.map(|c| c.0)), cc_of)
+) -> Takes {
+    crate::hw::per_device::pick_by(dev, engine, gpu_takes, cc_of)
 }
 
 /// Whether [`gdn_scan`] takes this group: switched on, a prompt group (at least [`MIN_TOKENS`]
 /// tokens, not a verify group: `prompt`), heads of [`HEAD`] with a scalar gate, F32, and the
-/// state in the memory of one 7.x GPU ([`gpu_for`]).
+/// state in the memory of a GPU that gives the op this group ([`gpu_for`]: a 7.x GPU any group,
+/// a 12.0 or 12.1 GPU the groups ggml-cuda runs token after token).
 pub(super) fn fits(
     q: Tensor<'_>,
     v: Tensor<'_>,
@@ -96,7 +143,7 @@ pub(super) fn fits(
         && [q, v, g, state].iter().all(|t| t.ty() == types::F32)
         && !state.is_host()
         && !state.is_meta()
-        && gpu_for(state.cuda_device())
+        && gpu_for(state.cuda_device()).group(super::gdn_mma::ggml_per_token(q.ne()[1], v.ne()[1]))
 }
 
 /// ggml's `gated_delta_net(q, k, v, g, beta, state, 1)` as [`GDN_SCAN`]: the same shapes in

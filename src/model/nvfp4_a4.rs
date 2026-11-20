@@ -1417,6 +1417,42 @@ pub fn force_dense_variant(variant: i32) {
     let _ = variant;
 }
 
+/// The parameter of an [`A4_MM`] node that the micro all-reduce reading its output sets
+/// ([`crate::tp_net::micro::send_gemm`], #1133): the node launches nothing, and the exchange
+/// runs it ([`mul_mat_to`]) with its output straight into the send buffer.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) const P_BY_EXCHANGE: usize = 3;
+
+/// Whether `t` is an [`A4_MM`] node with an F32 output and no residual (a plain
+/// [`mul_mat`]): its `[m, n]` output ([`sendable_shape`]) at the start of its memory.
+///
+/// # Safety
+/// `t` is a valid tensor.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) unsafe fn sendable(t: *const ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's.
+    unsafe {
+        let [_, act, has_res, ..] = external_params(&*t);
+        crate::ggml::op_of(t).is_some_and(|op| std::ptr::eq(op, &A4_MM)) && act == 0 && has_res == 0
+    }
+}
+
+/// `(m, n)` of the [`sendable`] node `t`: its weight's rows and its activations' tokens.
+///
+/// # Safety
+/// `t` is a [`sendable`] node.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) unsafe fn sendable_shape(t: *const ffi::ggml_tensor) -> (usize, usize) {
+    // SAFETY: the caller's: an `A4_MM` node's sources 0 and 1 are its weight and activations.
+    unsafe {
+        let (w, x) = (&*(*t).src[0], &*(*t).src[1]);
+        (w.ne[1] as usize, (x.ne[1] * x.ne[2] * x.ne[3]) as usize)
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) use cuda::mul_mat_to;
+
 #[cfg(feature = "cuda")]
 mod cuda {
     use std::os::raw::c_void;
@@ -1723,6 +1759,44 @@ mod cuda {
         dst: &ffi::ggml_tensor,
         stream: *mut c_void,
     ) -> Result<(), String> {
+        // The exchange reading it runs it (#1133).
+        if external_params(dst)[super::P_BY_EXCHANGE] != 0 {
+            return Ok(());
+        }
+        // SAFETY: the caller's.
+        unsafe { mul_mat_into(dst, None, stream) }
+    }
+
+    /// For the micro all-reduce that took over the [`super::A4_MM`] node `dst`
+    /// ([`super::P_BY_EXCHANGE`], #1133): runs it on `stream` with its F32 output written at
+    /// the device address `out` (the send buffer) instead of the node's own memory; its
+    /// activations are quantized into the node's scratch as always.
+    ///
+    /// # Safety
+    /// `dst` is such a node (F32 out, no residual) of an allocated graph, its sources holding
+    /// their values; `out` device-writable for its `[m, n]` output.
+    pub(crate) unsafe fn mul_mat_to(
+        dst: &ffi::ggml_tensor,
+        out: u64,
+        stream: *mut c_void,
+    ) -> Result<(), String> {
+        let [_, act, has_res, ..] = external_params(dst);
+        if act != 0 || has_res != 0 {
+            return Err("nvfp4 a4: only an F32 matmul without a residual writes elsewhere".into());
+        }
+        // SAFETY: the caller's.
+        unsafe { mul_mat_into(dst, Some(out as *mut c_void), stream) }
+    }
+
+    /// The node's matmul, its output into `out` (else the node's own memory).
+    ///
+    /// # Safety
+    /// As [`mul_mat`], and `out` as [`mul_mat_to`]'s.
+    unsafe fn mul_mat_into(
+        dst: &ffi::ggml_tensor,
+        out: Option<*mut c_void>,
+        stream: *mut c_void,
+    ) -> Result<(), String> {
         let [has_scale, act, has_res, ..] = external_params(dst);
         // SAFETY: a node made by `mul_mat_act` or `mul_mat_add`, tensors in device memory of
         // the stream's device.
@@ -1739,7 +1813,7 @@ mod cuda {
             w,
             xq,
             scale_ptr(dst, has_scale, 2),
-            dst.data,
+            out.unwrap_or(dst.data),
             (k, m, n),
             tiles,
             act,

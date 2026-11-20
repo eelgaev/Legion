@@ -4,7 +4,8 @@
 //! The weights are uploaded once from the CPU tower's: matrices as F16 (as ggml's CPU rounds an
 //! F16 matrix's activations, every product here is F16 x F16 into F32), the two temporal patch
 //! kernels added into one, vectors and the position table F32. An image then runs on a stream
-//! of its own, so the language model's steps on other streams go on meanwhile: patches to rows
+//! of its own, so the language model's steps on other streams go on meanwhile, its kernels on
+//! capped grids so theirs find room beside them ([`super::share`]): patches to rows
 //! (one GEMM), positions added, each block's LayerNorm, `qkv` GEMM, the 2-D rotation, full
 //! attention per head in chunks of queries (scores GEMM, softmax, values GEMM), output GEMM
 //! with the residual, LayerNorm and the GELU MLP; then the merger. Its scratch memory is
@@ -19,6 +20,9 @@ use crate::cpu::gpu_exact::{f16_to_f32, f32_to_f16};
 use crate::ggml::{Tensor, types};
 
 use super::qwen3vl::{Encoder, EncoderConfig, ImageEmbedding};
+#[cfg(test)]
+use super::share::Share;
+use super::share::{Caps, Turns};
 use super::{Preprocessed, VisionError, VisionHparams};
 
 /// Scores and probabilities of one chunk of queries (all heads) take at most this much.
@@ -47,6 +51,7 @@ struct Gemm {
     k: i32,
     alpha: f32,
     flags: i32,
+    batch: i32,
 }
 
 const OUT_F16: i32 = 1;
@@ -180,6 +185,7 @@ const H2D: c_int = 1;
 const D2H: c_int = 2;
 const NON_BLOCKING: u32 = 1;
 const CC_MAJOR: c_int = 75;
+const SM_COUNT: c_int = 16;
 
 fn ok(e: c_int, what: &str) -> Result<(), VisionError> {
     if e == 0 {
@@ -412,19 +418,50 @@ impl GpuEncoder {
             Self::Gemma(g) => g.encode(p),
         }
     }
+
+    /// Encodes with `share` from now on (tests).
+    #[cfg(test)]
+    pub(crate) fn set_share(&mut self, share: Share) {
+        match self {
+            Self::Qwen(g) => g.turns.set(share),
+            Self::Gemma(g) => g.turns.set(share),
+        }
+    }
 }
 
-/// Launches kernel `k` of the table on `stream`, `args` its one parameter.
+/// The device's SM count, for the encode's share ([`super::share`]).
+fn sm_count(device: usize) -> Result<usize, VisionError> {
+    let mut sms = 0;
+    // SAFETY: a plain device query.
+    unsafe {
+        ok(
+            cudaDeviceGetAttribute(&mut sms, SM_COUNT, device as c_int),
+            "cudaDeviceGetAttribute",
+        )?
+    };
+    Ok(sms.max(1) as usize)
+}
+
+/// Launches kernel `k` of the table on `stream` over `items` work items (tiles, patches, rows),
+/// `args` its one parameter: a 1-D grid of one block per item capped at the encode's share
+/// (`caps`), each block looping over the items at a stride of the grid.
 fn launch<T>(
     stream: *mut c_void,
+    caps: Caps,
     k: Kernel,
-    grid: (usize, usize, usize),
+    items: usize,
     block: u32,
     args: &mut T,
 ) -> Result<(), VisionError> {
-    if grid.0 == 0 || grid.1 == 0 || grid.2 == 0 {
+    if items == 0 {
         return Ok(());
     }
+    let cap = match k {
+        Kernel::Gemm => caps.gemm,
+        _ => caps.small,
+    };
+    let grid = if cap == 0 { items } else { items.min(cap) };
+    let grid = u32::try_from(grid).map_err(|_| VisionError::Dimensions)?;
     let mut argv = [(args as *mut T).cast::<c_void>()];
     // SAFETY: a kernel of the table taking `T` by value (the launch copies it); its pointers
     // are device memory of the stream's device.
@@ -432,9 +469,9 @@ fn launch<T>(
         cudaLaunchKernel(
             legion_vision_kernels[k as usize],
             Dim3 {
-                x: grid.0 as u32,
-                y: grid.1 as u32,
-                z: grid.2 as u32,
+                x: grid,
+                y: 1,
+                z: 1,
             },
             Dim3 {
                 x: block,
@@ -449,15 +486,12 @@ fn launch<T>(
     ok(e, "vision kernel launch")
 }
 
-/// The GEMM kernel over `batch` products on `stream`.
-fn gemm_on(stream: *mut c_void, mut g: Gemm, batch: usize) -> Result<(), VisionError> {
+/// The GEMM kernel over `batch` products on `stream`, its tiles under `caps`.
+fn gemm_on(stream: *mut c_void, caps: Caps, mut g: Gemm, batch: usize) -> Result<(), VisionError> {
     debug_assert!(g.k % 8 == 0 && g.lda % 8 == 0 && g.ldb % 8 == 0);
-    let grid = (
-        (g.n as usize).div_ceil(TILE),
-        (g.m as usize).div_ceil(TILE),
-        batch,
-    );
-    launch(stream, Kernel::Gemm, grid, 256, &mut g)
+    g.batch = batch as i32;
+    let tiles = (g.n as usize).div_ceil(TILE) * (g.m as usize).div_ceil(TILE) * batch;
+    launch(stream, caps, Kernel::Gemm, tiles, 256, &mut g)
 }
 
 /// Qwen3-VL's tower on one GPU.
@@ -476,6 +510,10 @@ pub struct QwenGpu {
     n_ff: usize,
     pin_in: Pinned,
     pin_out: Pinned,
+    /// The shares of the GPU to encode with, in turn ([`super::share`]).
+    turns: Turns,
+    /// The share of the encode under way.
+    caps: Caps,
 }
 
 // SAFETY: the raw pointers are device / pinned allocations and a stream owned by the encoder,
@@ -496,6 +534,7 @@ impl QwenGpu {
                 "cudaDeviceGetAttribute",
             )?;
         }
+        let sms = sm_count(device)?;
         let n_ff = enc.weight("v.blk.0.ffn_up.weight")?.shape()[1] as usize;
         // The kernels: tensor cores (sm_70+), rows of a multiple of 8 halves.
         if major < 7
@@ -571,21 +610,23 @@ impl QwenGpu {
             cfg: c,
             pin_in,
             pin_out,
+            turns: Turns::new(sms),
+            caps: Caps::default(),
         }))
     }
 
     fn launch<T>(
         &self,
         k: Kernel,
-        grid: (usize, usize, usize),
+        items: usize,
         block: u32,
         args: &mut T,
     ) -> Result<(), VisionError> {
-        launch(self.stream, k, grid, block, args)
+        launch(self.stream, self.caps, k, items, block, args)
     }
 
     fn gemm(&self, g: Gemm, batch: usize) -> Result<(), VisionError> {
-        gemm_on(self.stream, g, batch)
+        gemm_on(self.stream, self.caps, g, batch)
     }
 
     /// `y = x W^T + b` of `lin` over `m` rows of F16 `x`, then GELU (`flags`) or `+ res`.
@@ -617,6 +658,7 @@ impl QwenGpu {
                 k: lin.k as i32,
                 alpha: 1.0,
                 flags,
+                batch: 1,
             },
             1,
         )
@@ -633,7 +675,7 @@ impl QwenGpu {
             eps: self.cfg.eps,
             ..Op::default()
         };
-        self.launch(Kernel::Norm, (rows.div_ceil(8), 1, 1), 256, &mut o)
+        self.launch(Kernel::Norm, rows.div_ceil(8), 256, &mut o)
     }
 
     /// The scratch of an image of `n` patches, `n_pix` pixel values and a rotation table of
@@ -762,6 +804,7 @@ impl QwenGpu {
         let out_bytes = n_tok * n_out * 4;
         // SAFETY: the calling thread's current device.
         unsafe { ok(cudaSetDevice(self.device), "cudaSetDevice")? };
+        self.caps = self.turns.next_caps();
         let pin_in = self.pin_in.reserve(in_bytes)?;
         let pin_out = self.pin_out.reserve(out_bytes)?;
         // SAFETY: the pinned buffers hold at least these many bytes.
@@ -836,7 +879,7 @@ impl QwenGpu {
                 h0: bigp.cast(),
                 ..geo
             };
-            self.launch(Kernel::Im2col, (n, 1, 1), 256, &mut o)?;
+            self.launch(Kernel::Im2col, n, 256, &mut o)?;
             self.gemm(
                 Gemm {
                     a: bigp,
@@ -856,6 +899,7 @@ impl QwenGpu {
                     k: pp3 as i32,
                     alpha: 1.0,
                     flags: 0,
+                    batch: 1,
                 },
                 1,
             )?;
@@ -875,7 +919,7 @@ impl QwenGpu {
                 sfy: sf(gy, c.pos_side),
                 ..geo
             };
-            self.launch(Kernel::PosAdd, (n, 1, 1), 256, &mut o)?;
+            self.launch(Kernel::PosAdd, n, 256, &mut o)?;
 
             let scale = 1.0 / (d as f32).sqrt();
             for blk in &self.blocks {
@@ -889,7 +933,7 @@ impl QwenGpu {
                     h2: vt,
                     ..geo
                 };
-                self.launch(Kernel::Rope, (n, 1, 1), 256, &mut o)?;
+                self.launch(Kernel::Rope, n, 256, &mut o)?;
                 let mut q0 = 0;
                 while q0 < n {
                     let cm = chunk.min(n - q0);
@@ -914,6 +958,7 @@ impl QwenGpu {
                             k: d as i32,
                             alpha: scale,
                             flags: 0,
+                            batch: 1,
                         },
                         heads,
                     )?;
@@ -923,7 +968,7 @@ impl QwenGpu {
                         cm: cm as i32,
                         ..geo
                     };
-                    self.launch(Kernel::Softmax, (heads * chunk, 1, 1), 256, &mut o)?;
+                    self.launch(Kernel::Softmax, heads * chunk, 256, &mut o)?;
                     // Their values, into the attention output [patch][head * d].
                     self.gemm(
                         Gemm {
@@ -945,6 +990,7 @@ impl QwenGpu {
                             k: kpad as i32,
                             alpha: 1.0,
                             flags: OUT_F16,
+                            batch: 1,
                         },
                         heads,
                     )?;

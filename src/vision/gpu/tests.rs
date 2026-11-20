@@ -43,6 +43,12 @@ fn gpu_tower_matches_the_cpu_tower() {
             got,
             "{w} x {h}: the same bits again"
         );
+        // The grid's cap moves no bits: one CTA (it loops over every tile), half an SM's worth,
+        // uncapped, the default.
+        for share in ["1/1000", "1/2", "0", "1"] {
+            gpu.set_share(crate::vision::share::parse(share).unwrap()[0]);
+            assert_eq!(gpu.encode(&p).unwrap(), got, "{w} x {h}: share {share}");
+        }
     }
 }
 
@@ -87,6 +93,36 @@ fn gpu_gemma_tower_matches_the_cpu_tower() {
             got,
             "{w} x {h}: the same bits again"
         );
+    }
+}
+
+/// The tiny Gemma 4 tower's rows do not depend on its share of the GPU: uncapped grids (one
+/// block per work item) against one GEMM CTA and two blocks per small kernel (each loops over
+/// every item), half an SM's worth and the default.
+#[test]
+#[ignore = "needs a GPU"]
+fn gpu_gemma_tower_rows_do_not_depend_on_the_share() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mmproj.gguf");
+    tiny::write_gemma4v(&path, 64, 5).unwrap();
+    let mut cpu = Backend::cpu().unwrap();
+    cpu.set_threads(2);
+    let enc = Encoder::load(&path, cpu).unwrap();
+    let Some(mut gpu) = GpuEncoder::new(&enc, 0).unwrap() else {
+        return;
+    };
+    assert!(matches!(gpu, GpuEncoder::Gemma(_)));
+    for (w, h) in [(16, 16), (240, 60), (400, 400)] {
+        let img = tiny::bmp(w, h, |x, y| {
+            [(x * 13) as u8, (y * 29) as u8, ((x + y) * 7) as u8]
+        });
+        let p = super::super::preprocess(enc.hparams(), &img).unwrap();
+        gpu.set_share(crate::vision::share::Share::FULL);
+        let want = gpu.encode(&p).unwrap();
+        for share in ["1/1000", "1/2", "1"] {
+            gpu.set_share(crate::vision::share::parse(share).unwrap()[0]);
+            assert_eq!(gpu.encode(&p).unwrap(), want, "{w} x {h}: share {share}");
+        }
     }
 }
 
@@ -148,14 +184,18 @@ fn gpu_tower_on_a_checkpoint() {
             .fold(1f64, f64::min);
         println!(
             "{}: {} x {} px, {} x {} rows, CPU {t_cpu:.3} s, GPU {t_gpu:.4} s, max abs {err:.4e}, \
-             max rel {:.4e} (of {scale:.3}), min row cosine {cos:.6}, bit-identical {}",
+             max rel {:.4e} (of {scale:.3}), min row cosine {cos:.6}, bit-identical {}, GPU rows \
+             {:016x}",
             f.file_name().unwrap().to_string_lossy(),
             p.width,
             p.height,
             got.nx,
             got.ny,
             err / scale,
-            got == want
+            got == want,
+            got.data.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, v| {
+                (h ^ u64::from(v.to_bits())).wrapping_mul(0x0000_0100_0000_01b3)
+            })
         );
         assert!(cos > 0.99, "{f:?}: min row cosine {cos}");
     }

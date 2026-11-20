@@ -8,7 +8,8 @@
 //! rotation, full attention at scale 1 in chunks of queries, the output GEMM and its post-norm
 //! into the residual, an RMS norm, the gate-and-up GEMM, the gated GELU, the down GEMM and its
 //! post-norm into the residual; then the 3×3 pool, its standardization and norm, and the
-//! projection. Every kernel is sm_70+ (WMMA 16×16×16 and plain CUDA).
+//! projection. Every kernel is sm_70+ (WMMA 16×16×16 and plain CUDA), on capped grids like
+//! Qwen3-VL's, so the language model's kernels find room beside them ([`crate::vision::share`]).
 //!
 //! The CPU tower is the oracle: the rows are close to its rows, not the same bits.
 
@@ -18,10 +19,11 @@ use super::{
     ATTN_BUDGET, CC_MAJOR, D2H, DevBuf, Gemm, H2D, Kernel, NON_BLOCKING, OUT_F16, Op, Pinned, TILE,
     cudaDeviceGetAttribute, cudaFreeAsync, cudaMallocAsync, cudaMemcpyAsync, cudaMemsetAsync,
     cudaSetDevice, cudaStreamCreateWithFlags, cudaStreamDestroy, cudaStreamSynchronize, gemm_on,
-    launch, ok, values, vector,
+    launch, ok, sm_count, values, vector,
 };
 use crate::vision::gemma4v::ROPE_THETA;
 use crate::vision::qwen3vl::{Encoder, EncoderConfig, ImageEmbedding};
+use crate::vision::share::{Caps, Turns};
 use crate::vision::{Preprocessed, VisionError, VisionHparams};
 
 /// A bias-free matrix as F16 rows on the device: `n` rows of `k`.
@@ -106,6 +108,10 @@ pub struct GemmaGpu {
     n_ff: usize,
     pin_in: Pinned,
     pin_out: Pinned,
+    /// The shares of the GPU to encode with, in turn ([`crate::vision::share`]).
+    pub(super) turns: Turns,
+    /// The share of the encode under way.
+    caps: Caps,
 }
 
 // SAFETY: as `QwenGpu`: device / pinned allocations and a stream owned by the encoder, used by
@@ -126,6 +132,7 @@ impl GemmaGpu {
                 "cudaDeviceGetAttribute",
             )?;
         }
+        let sms = sm_count(device)?;
         let n_ff = enc.weight("v.blk.0.ffn_gate.weight")?.shape()[1] as usize;
         // Tensor cores (sm_70+), rows of a multiple of 8 halves, heads of at most 128 (the
         // q / k / v kernel's shared rows), halves of whole pairs.
@@ -202,17 +209,25 @@ impl GemmaGpu {
             stream,
             pin_in,
             pin_out,
+            turns: Turns::new(sms),
+            caps: Caps::default(),
         }))
     }
 
+    /// Kernel `k` over `items` work items, on the encoder's stream under the encode's caps.
     fn launch<T>(
         &self,
         k: Kernel,
-        grid: (usize, usize, usize),
+        items: usize,
         block: u32,
         args: &mut T,
     ) -> Result<(), VisionError> {
-        launch(self.stream, k, grid, block, args)
+        launch(self.stream, self.caps, k, items, block, args)
+    }
+
+    /// The GEMM kernel over `batch` products, as [`Self::launch`].
+    fn gemm(&self, g: Gemm, batch: usize) -> Result<(), VisionError> {
+        gemm_on(self.stream, self.caps, g, batch)
     }
 
     /// `y = x W^T` of `w` over `m` rows of F16 `x` (row stride `w.k`), F32 or F16 (`flags`).
@@ -224,8 +239,7 @@ impl GemmaGpu {
         y: *mut c_void,
         flags: i32,
     ) -> Result<(), VisionError> {
-        gemm_on(
-            self.stream,
+        self.gemm(
             Gemm {
                 a: x,
                 b: w.w.0,
@@ -244,14 +258,15 @@ impl GemmaGpu {
                 k: w.k as i32,
                 alpha: 1.0,
                 flags,
+                batch: 1,
             },
             1,
         )
     }
 
-    /// A warp-per-row kernel over `rows` rows.
+    /// A warp-per-row kernel over `rows` rows: a block per 8 rows.
     fn rows(&self, k: Kernel, rows: usize, o: &mut Op) -> Result<(), VisionError> {
-        self.launch(k, (rows.div_ceil(8), 1, 1), 256, o)
+        self.launch(k, rows.div_ceil(8), 256, o)
     }
 
     /// The scratch of an image of `n` patches, `n_pix` pixel values and a rotation table of
@@ -377,6 +392,7 @@ impl GemmaGpu {
         let out_bytes = n_tok * n_out * 4;
         // SAFETY: the calling thread's current device.
         unsafe { ok(cudaSetDevice(self.device), "cudaSetDevice")? };
+        self.caps = self.turns.next_caps();
         let pin_in = self.pin_in.reserve(in_bytes)?;
         let pin_out = self.pin_out.reserve(out_bytes)?;
         // SAFETY: the pinned buffers hold at least these many bytes.
@@ -453,14 +469,14 @@ impl GemmaGpu {
                 h0: bigp.cast(),
                 ..geo
             };
-            self.launch(Kernel::G4Im2col, (n, 1, 1), 256, &mut o)?;
+            self.launch(Kernel::G4Im2col, n, 256, &mut o)?;
             self.linear(&self.patch, bigp, n, x.cast(), 0)?;
             let mut o = Op {
                 y: x,
                 w: self.pos.0.cast(),
                 ..geo
             };
-            self.launch(Kernel::G4Pos, (n, 1, 1), 256, &mut o)?;
+            self.launch(Kernel::G4Pos, n, 256, &mut o)?;
 
             for blk in &self.blocks {
                 let mut o = Op {
@@ -481,13 +497,12 @@ impl GemmaGpu {
                     h2: vt,
                     ..geo
                 };
-                self.launch(Kernel::G4Qkv, (n, 1, 1), 256, &mut o)?;
+                self.launch(Kernel::G4Qkv, n, 256, &mut o)?;
                 let mut q0 = 0;
                 while q0 < n {
                     let cm = chunk.min(n - q0);
                     // Scores of the chunk's queries, every head (batch), at scale 1.
-                    gemm_on(
-                        st,
+                    self.gemm(
                         Gemm {
                             // SAFETY: within q.
                             a: unsafe { q.add(q0 * d) }.cast(),
@@ -507,6 +522,7 @@ impl GemmaGpu {
                             k: d as i32,
                             alpha: 1.0,
                             flags: 0,
+                            batch: 1,
                         },
                         heads,
                     )?;
@@ -516,10 +532,9 @@ impl GemmaGpu {
                         cm: cm as i32,
                         ..geo
                     };
-                    self.launch(Kernel::Softmax, (heads * chunk, 1, 1), 256, &mut o)?;
+                    self.launch(Kernel::Softmax, heads * chunk, 256, &mut o)?;
                     // Their values, into the attention output [patch][head * d].
-                    gemm_on(
-                        st,
+                    self.gemm(
                         Gemm {
                             a: ptr(o_p),
                             b: vt.cast(),
@@ -539,6 +554,7 @@ impl GemmaGpu {
                             k: kpad as i32,
                             alpha: 1.0,
                             flags: OUT_F16,
+                            batch: 1,
                         },
                         heads,
                     )?;
@@ -585,7 +601,7 @@ impl GemmaGpu {
                 h0: h,
                 ..geo
             };
-            self.launch(Kernel::G4Pool, (n_tok, 1, 1), 256, &mut o)?;
+            self.launch(Kernel::G4Pool, n_tok, 256, &mut o)?;
             self.linear(&self.proj, h.cast(), n_tok, ptr(o_out), 0)?;
             // SAFETY: into the pinned output buffer, on the stream.
             unsafe {

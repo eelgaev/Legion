@@ -840,34 +840,107 @@ unsafe fn cuda_fp8_quant_dyn(
     }
 }
 
+/// The parameter of an [`FP8_MM8`] node that the micro all-reduces reading its output set
+/// ([`crate::tp_net::micro::send_gemm`], #1133): the node launches nothing, and each exchange
+/// runs its own columns of it ([`launch_cols`]), straight into its send buffer.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) const P_BY_EXCHANGE: usize = 2;
+
+/// Whether `t` is an [`FP8_MM8`] node without a residual ([`mul_mat_a8`],
+/// [`mul_mat_a8_dynamic`]): its F32 output `[m, n, ..]` is all it writes, column by column.
+///
+/// # Safety
+/// `t` is a valid tensor.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) unsafe fn sendable(t: *const ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's.
+    unsafe {
+        crate::ggml::op_of(t).is_some_and(|op| std::ptr::eq(op, &FP8_MM8))
+            && crate::ggml::external_params(&*t)[1] == 0
+            && (*t).type_ == types::F32
+            && ffi::ggml_is_contiguous(t)
+    }
+}
+
 #[cfg(feature = "cuda")]
 unsafe fn cuda_fp8_mm8(
     dst: &ffi::ggml_tensor,
     stream: *mut std::os::raw::c_void,
 ) -> Result<(), String> {
+    // The exchanges reading it run it (#1133).
+    if crate::ggml::external_params(dst)[P_BY_EXCHANGE] != 0 {
+        return Ok(());
+    }
+    // SAFETY: the caller's.
+    unsafe { mm8_cols(dst, None, None, stream) }
+}
+
+/// For a micro all-reduce that took over the [`FP8_MM8`] node `dst` ([`P_BY_EXCHANGE`]): runs
+/// its output columns (tokens) `cols` `(first, count)` on `stream`, into the node's own output
+/// at their place (`out` `None`) or at the device address `out` (`count` contiguous columns,
+/// the send buffer). Every output is the whole launch's: each is its own sum over k, whatever
+/// the other columns (the GEMMs' tiles all give the same bits).
+///
+/// # Safety
+/// `dst` is such a node (without a residual) of an allocated graph, its sources holding their
+/// values; `out` device-writable for `count` columns; `cols` within the node's.
+#[cfg(feature = "cuda")]
+pub(crate) unsafe fn launch_cols(
+    dst: &ffi::ggml_tensor,
+    cols: (usize, usize),
+    out: Option<u64>,
+    stream: *mut std::os::raw::c_void,
+) -> Result<(), String> {
+    // SAFETY: the caller's.
+    unsafe { mm8_cols(dst, Some(cols), out, stream) }
+}
+
+/// The GEMM of the [`FP8_MM8`] node `dst`: all of it (`cols` `None`, into its own output), or
+/// the columns and output [`launch_cols`] says.
+///
+/// # Safety
+/// As [`launch_cols`].
+#[cfg(feature = "cuda")]
+unsafe fn mm8_cols(
+    dst: &ffi::ggml_tensor,
+    cols: Option<(usize, usize)>,
+    out: Option<u64>,
+    stream: *mut std::os::raw::c_void,
+) -> Result<(), String> {
     let [mode, res_at, ..] = crate::ggml::external_params(dst);
     let dynamic = mode == 1;
+    let all = dst.ne[1] * dst.ne[2] * dst.ne[3];
+    let (c0, n) = match cols {
+        None => (0, all),
+        Some((a, c)) if res_at == 0 && (a + c) as i64 <= all => (a as i64, c as i64),
+        Some(_) => return Err("fp8_mm8: columns past the node's, or with a residual".into()),
+    };
     // SAFETY: a node made by `mul_mat_a8` (src: w, xq, the input scale, the weight's
     // per-tensor scale or nothing) or `mul_mat_a8_dynamic` (src: w, the packed codes and token
     // scales, the weight's scale or nothing, then the residual at `res_at` or nothing), device
-    // tensors.
+    // tensors; columns `c0..c0 + n` within its tokens (k code bytes each, one scale each when
+    // dynamic).
     let p = unsafe {
         let (w, x) = (&*dst.src[0], &*dst.src[1]);
-        let (k, n) = (w.ne[0], dst.ne[1] * dst.ne[2] * dst.ne[3]);
+        let (k, m) = (w.ne[0], w.ne[1]);
         let (scale, ws) = if dynamic {
-            let (codes, _) = dynamic_layout(k, n);
-            ((x.data as *const u8).add(codes) as *const f32, 2)
+            let (codes, _) = dynamic_layout(k, all);
+            let s = (x.data as *const u8).add(codes) as *const f32;
+            (s.add(c0 as usize), 2)
         } else {
             ((*dst.src[2]).data as *const f32, 3)
         };
         let has_ws = ws != res_at as usize && !dst.src[ws].is_null();
         LaunchParams8 {
             w: w.data as *const u8,
-            x: x.data as *const u8,
+            x: (x.data as *const u8).add((c0 * k) as usize),
             scale,
-            dst: dst.data as *mut f32,
+            dst: match out {
+                Some(o) => o as *mut f32,
+                None => (dst.data as *mut f32).add((c0 * m) as usize),
+            },
             k,
-            m: w.ne[1],
+            m,
             n,
             wscale: if has_ws {
                 (*dst.src[ws]).data as *const f32

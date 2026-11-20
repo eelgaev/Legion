@@ -561,8 +561,13 @@ pub(super) mod cuda {
         // SAFETY: the caller's.
         let src = unsafe { &*dst.src[0] };
         let plan = micro_plan(&comm, &m, src);
-        // SAFETY: the caller's.
-        let r = unsafe { start(&comm, &plan, src.data as usize, stream, true, None, None) };
+        // SAFETY: the caller's; a start the send-buffer rewrite marked runs its matmul's
+        // columns, whose inputs the graph's order keeps (`micro::send_gemm::take`).
+        let r = unsafe {
+            let gemm = crate::tp_net::micro::send_gemm::taken(dst);
+            let src = src.data as usize;
+            start(&comm, &plan, src, stream, true, None, None, gemm.as_ref())
+        };
         if let Err(e) = &r {
             comm.fail(e.clone());
         }
@@ -595,12 +600,17 @@ pub(super) mod cuda {
         // And its norm (`micro::finish_add_norm`), for its tokens from `at`.
         let norm = crate::tp_net::micro::norm_of(dst)
             .map(|(nm, width)| norm_at(&nm, dst.data as usize, row, width, at));
+        // This rank's values in the send buffer only: its start ran their matmul there (#1133).
+        // SAFETY: the caller's: a finish's source 1 is its start node.
+        let sent = plan.wire == Wire::F32
+            && plan.kind == Kind::AllReduce
+            && unsafe { crate::tp_net::micro::send_gemm::taken(&*dst.src[1]) }.is_some();
         let seq = comm.in_flight.lock().expect("in-flight lock").pop_front();
         let r = match seq {
             // SAFETY: the caller's.
             Some(seq) => unsafe {
                 let s = src.data as usize;
-                finish(&comm, &plan, seq, s, out, res, norm.as_ref(), stream)
+                finish(&comm, &plan, seq, s, out, res, sent, norm.as_ref(), stream)
             },
             None => Err("tp exchange: a finish without its start".into()),
         };
@@ -821,7 +831,7 @@ pub(super) mod cuda {
                 m => Ok(m),
             };
             let started = tail.and_then(|tail| {
-                mix.and_then(|mix| start(&comm, &plan, src, stream, false, tail, mix))
+                mix.and_then(|mix| start(&comm, &plan, src, stream, false, tail, mix, None))
             });
             // An all-reduce's residual ([`super::all_reduce_add`]).
             let res = (kind == Kind::AllReduce && external_params(dst)[1] != 0)
@@ -844,7 +854,7 @@ pub(super) mod cuda {
                     hand_over(&comm, &plan, seq, stream)
                 } else {
                     let d = dst.data as usize;
-                    finish(&comm, &plan, seq, src, d, res, norm.as_ref(), stream)
+                    finish(&comm, &plan, seq, src, d, res, false, norm.as_ref(), stream)
                 }
             })
         };
@@ -983,7 +993,9 @@ pub(super) mod cuda {
     /// # Safety
     /// `src` is the device address of the plan's source on `stream`'s device; `tail` as
     /// [`crate::model::core::node_fuse::launch_tail`]'s node, `mix` as
-    /// [`crate::model::qwen4::launch_mix`]'s.
+    /// [`crate::model::qwen4::launch_mix`]'s; `gemm` as [`crate::tp_net::micro::send_gemm`]'s
+    /// `Taken::launch`.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn start(
         comm: &super::super::Comm,
         plan: &Plan,
@@ -992,7 +1004,27 @@ pub(super) mod cuda {
         micro: bool,
         tail: Option<&ffi::ggml_tensor>,
         mix: Option<&ffi::ggml_tensor>,
+        gemm: Option<&crate::tp_net::micro::send_gemm::Taken<'_>>,
     ) -> Result<u32, String> {
+        // The matmul columns this exchange runs (#1133): with F32 on the wire straight into the
+        // send buffer, else (the rewrite saw F32) into their own output first, sent from there.
+        let gemm = match gemm {
+            Some(g) if plan.wire == Wire::F32 && plan.kind == Kind::AllReduce => {
+                if g.values != plan.span {
+                    return Err(format!(
+                        "tp exchange: a matmul of {} values for a sum of {}",
+                        g.values, plan.span
+                    ));
+                }
+                Some(g)
+            }
+            Some(g) => {
+                // SAFETY: the caller's (`launch_micro_start`).
+                unsafe { g.launch(None, stream)? };
+                None
+            }
+            None => None,
+        };
         // Only the BF16 whole-source pack below runs a tail; anywhere else its node (a no-op
         // now) would leave stale values to send. Checked before the sequence number moves.
         if tail.is_some()
@@ -1135,6 +1167,9 @@ pub(super) mod cuda {
                 for (i, c) in packs {
                     pack(src + i * 4, dd + (send + i * eb) as u64, c, stream)?;
                 }
+            } else if let Some(g) = gemm {
+                // This rank's partial made in the send buffer, never in `src` (#1133).
+                g.launch(Some(dd + send as u64), stream)?;
             } else {
                 let copies: Vec<(usize, usize)> = match kind {
                     Kind::AllReduce => vec![(0, plan.span)],
@@ -1287,8 +1322,10 @@ pub(super) mod cuda {
     ///
     /// # Safety
     /// `src` and `dst` are the device addresses of the plan's source and output on `stream`'s
-    /// device, `res` of the source's values to add (an all-reduce's only). `norm`: the sums'
-    /// norm too, in the sum's kernel (an all-reduce with a residual; `dst` is its `xs`).
+    /// device, `res` of the source's values to add (an all-reduce's only). `sent`: the start
+    /// made this rank's F32 values in the send buffer only (#1133), where the sum reads them.
+    /// `norm`: the sums' norm too, in the sum's kernel (an all-reduce with a residual; `dst` is
+    /// its `xs`).
     #[allow(clippy::too_many_arguments)]
     unsafe fn finish(
         comm: &super::super::Comm,
@@ -1297,6 +1334,7 @@ pub(super) mod cuda {
         src: usize,
         dst: usize,
         res: Option<usize>,
+        sent: bool,
         norm: Option<&NormAt>,
         stream: *mut c_void,
     ) -> Result<(), String> {
@@ -1403,7 +1441,7 @@ pub(super) mod cuda {
                 }
             } else {
                 // Every rank's share of this rank's values, in rank order.
-                let own = if bf16 {
+                let own = if bf16 || sent {
                     send_dev(mine.0)
                 } else {
                     src_at(mine.0)
