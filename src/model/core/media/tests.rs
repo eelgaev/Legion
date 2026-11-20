@@ -106,11 +106,15 @@ fn chunks_do_not_cut_images() {
 /// ones asked for (text-only steps keep theirs).
 #[test]
 fn micro_chunks_do_not_cut_images() {
-    // An image of 300 tokens at 3,000: the cut at 3,072 moves back to its start.
+    // An image of 300 tokens at 3,000: the cut at 3,072 moves back to its start, the image
+    // is a piece of its own and the next one goes on to the next cut.
     let m = Media::sequential(vec![span(3000, 20, 15, 1)], 1);
-    assert_eq!(m.uncut_sizes(0, &[3072, 3072, 784]), vec![3000, 3144, 784]);
+    assert_eq!(
+        m.uncut_sizes(0, &[3072, 3072, 784]),
+        vec![3000, 300, 2844, 784]
+    );
     // The same prompt from n_past 100: the image is at 2,900..3,200 of the chunk.
-    assert_eq!(m.uncut_sizes(100, &[3072, 3072]), vec![2900, 3244]);
+    assert_eq!(m.uncut_sizes(100, &[3072, 3072]), vec![2900, 300, 2944]);
     // No cut inside the image: the same pieces.
     assert_eq!(
         m.uncut_sizes(0, &[2048, 2048, 2048]),
@@ -119,17 +123,59 @@ fn micro_chunks_do_not_cut_images() {
     assert_eq!(m.uncut_sizes(3300, &[3072, 1000]), vec![3072, 1000]);
     // A chunk that starts inside the image: its cuts move past its end.
     assert_eq!(m.uncut_sizes(3100, &[50, 50, 900]), vec![200, 800]);
-    // An image longer than a piece: one piece holds it, the cuts inside it go.
+    // An image longer than the largest piece (4,000 tokens > 3,072): cut where the pieces
+    // were, none longer.
     let m = Media::sequential(vec![span(1000, 100, 40, 1)], 1);
-    assert_eq!(m.uncut_sizes(0, &[3072, 3072, 784]), vec![1000, 5144, 784]);
-    // An image to the chunk's end: one piece from its start.
-    assert_eq!(m.uncut_sizes(0, &[3072, 1928]), vec![1000, 4000]);
-    assert_eq!(m.uncut_sizes(1000, &[3072, 928]), vec![4000]);
+    for (from, sizes) in [
+        (0, &[3072, 3072, 784][..]),
+        (0, &[3072, 1928]),
+        (1000, &[3072, 928]),
+    ] {
+        assert_eq!(m.uncut_sizes(from, sizes), sizes.to_vec());
+    }
+    // A chunk that starts inside it with less than a piece of it left: one piece to its end.
+    assert_eq!(m.uncut_sizes(4000, &[500, 1500]), vec![1000, 1000]);
+    assert_eq!(m.uncut_sizes(3000, &[500, 1500]), vec![500, 1500]);
     // Two images, each cut: each whole in one piece.
     let m = Media::sequential(vec![span(10, 4, 5, 1), span(40, 2, 2, 1)], 1);
-    assert_eq!(m.uncut_sizes(0, &[16, 26, 8]), vec![10, 30, 10]);
+    assert_eq!(m.uncut_sizes(0, &[16, 26, 8]), vec![10, 20, 10, 4, 6]);
     // No images: the same pieces.
     let sizes = [3072, 2048, 1024, 17];
     assert_eq!(Media::default().uncut_sizes(5, &sizes), sizes.to_vec());
     assert_eq!(m.uncut_sizes(0, &[7]), vec![7]);
+}
+
+/// A lone prompt over several stages with rings: the step is longer than the ring step and
+/// its micro-chunks are at most the ring step (512 here). An image after a full window of
+/// text stays whole when it fits a piece, and is cut where the pieces were when it does not
+/// (700 tokens): no piece is longer than 512, so none overwrites a key its first row still
+/// reads (a 700-token piece would).
+#[test]
+fn micro_chunks_fit_the_rings() {
+    let (window, step) = (1024, 512);
+    let positions = crate::model::core::KvRing::for_window(window, step, 1).positions();
+    // A piece's last key lands on the cell of the key `positions` before it; its first row
+    // reads `window - 1` keys back, so the two must be under `positions` apart.
+    let fits = |len: usize| len + window - 2 < positions;
+    assert!(fits(step) && !fits(700));
+    let micro = vec![512; 8];
+    // 1,300 text tokens (more than the window), then a 700-token image (28 × 25), then text.
+    let m = Media::sequential(vec![span(1300, 28, 25, 1)], 1);
+    assert_eq!(m.uncut_sizes(0, &micro), micro);
+    // A 300-token image (20 × 15) there: a piece of its own.
+    let m = Media::sequential(vec![span(1300, 20, 15, 1)], 1);
+    let v = m.uncut_sizes(0, &micro);
+    assert_eq!(v, vec![512, 512, 276, 300, 448, 512, 512, 512, 512]);
+    assert!(v.iter().all(|&len| fits(len)));
+    // The same from n_past 2,000 (the window already full of text before the step).
+    let m = Media::sequential(vec![span(2300, 20, 15, 1)], 1);
+    let v = m.uncut_sizes(2000, &micro);
+    assert_eq!(v, vec![300, 300, 424, 512, 512, 512, 512, 512, 512]);
+    assert!(v.iter().all(|&len| fits(len)));
+    // Its 512-token piece from the image's start; a 513-token image is cut where the pieces
+    // were.
+    let m = Media::sequential(vec![span(2300, 32, 16, 1)], 1);
+    assert_eq!(m.uncut_sizes(2000, &micro)[..3], [300, 512, 212]);
+    let m = Media::sequential(vec![span(2300, 513, 1, 1)], 1);
+    assert_eq!(m.uncut_sizes(2000, &micro), micro);
 }

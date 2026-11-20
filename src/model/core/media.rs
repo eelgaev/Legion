@@ -186,31 +186,42 @@ impl Media {
         }
     }
 
-    /// `sizes`, pieces of a prompt chunk from token `from` on, with no cut inside an image (a
-    /// step's micro-chunks run one after another, so an image cut there would see only its
-    /// first part's keys): a cut inside an image moves back to the image's start, or past its
-    /// end when the piece before would be empty (a piece then holds more than its size). The
-    /// same pieces when no cut falls inside an image.
+    /// `sizes`, pieces of a prompt chunk from token `from` on, with no cut inside an image that
+    /// fits a piece (a step's micro-chunks run one after another, so an image cut there would
+    /// see only its first part's keys). No piece is longer than the largest of `sizes` (the
+    /// sliding-window rings hold a micro-chunk, [`KvRing`](super::KvRing)): each runs to the
+    /// next cut of `sizes`, at most that far on; a cut inside an image that fits moves back to
+    /// the image's start, or, when the piece starts with the image, on to its end. An image
+    /// longer than the largest size keeps the cuts, as a step cuts one longer than the step
+    /// ([`Self::uncut`]). The same pieces when no cut falls inside an image that fits.
     pub fn uncut_sizes(&self, from: usize, sizes: &[usize]) -> Vec<usize> {
         let n: usize = sizes.iter().sum();
+        let cap = sizes.iter().copied().max().unwrap_or(0);
+        let cuts: Vec<usize> = (sizes.iter())
+            .scan(0, |at, &len| {
+                *at += len;
+                Some(*at)
+            })
+            .collect();
         let mut out = Vec::with_capacity(sizes.len());
-        let mut prev = 0;
-        let mut cut = 0;
-        for &len in &sizes[..sizes.len().saturating_sub(1)] {
-            cut += len;
-            let at = from + cut;
-            let c = match (self.spans.iter()).find(|s| s.start < at && at < s.end()) {
-                Some(s) if s.start > from + prev => s.start - from,
-                Some(s) => s.end() - from,
-                None => cut,
-            };
-            if c > prev && c < n {
-                out.push(c - prev);
-                prev = c;
+        let mut p = 0;
+        while p < n {
+            let next = cuts.iter().copied().find(|&c| c > p).unwrap_or(n);
+            let mut c = next.min(p + cap);
+            let at = from + c;
+            if c < n
+                && let Some(s) = (self.spans.iter()).find(|s| s.start < at && at < s.end())
+            {
+                if s.start > from + p {
+                    if s.end() - s.start <= cap {
+                        c = s.start - from;
+                    }
+                } else if s.end() - (from + p) <= cap {
+                    c = (s.end() - from).min(n);
+                }
             }
-        }
-        if n > prev {
-            out.push(n - prev);
+            out.push(c - p);
+            p = c;
         }
         out
     }

@@ -3725,7 +3725,8 @@ impl Executor {
         }
         let mut sizes = taper::micro_sizes(n, micro, self.micro_taper);
         // An image whose tokens see each other stays in one micro-chunk (#1217): the planner's
-        // `Media::uncut` keeps it in one step, this in one piece of it.
+        // `Media::uncut` keeps it in one step, this in one piece of it when it fits one (no
+        // piece longer than the micro-chunk: the rings hold no more).
         if let Some(m) = seq.media
             && self.model.hp.arch.image_tokens_bidirectional()
         {
