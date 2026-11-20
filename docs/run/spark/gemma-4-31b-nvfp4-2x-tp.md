@@ -62,6 +62,14 @@ order, so the drafts can differ in bits. With `--deterministic` the text is stil
 mean accepted length about the same; without it, at 4 users the depth policy drafts less per step (4.5-4.9 vs
 6.3-6.8 tokens, mean accepted length 3.03-3.07 vs 3.31-3.33) and still comes out ahead.
 
+### Images
+
+As on [one Spark](gemma-4-31b-nvfp4-1x.md#images), the command above loads the checkpoint's own vision tower, so
+requests may carry images. Rank 0 encodes them on its GPU (2026-11-20): a 1024 × 768 image encodes in 0.39 s and its
+first token comes 0.60 s after the request (0.20 s when the same image is sent again). Six test images give the same
+answers as on one Spark with `--deterministic`, and text-only requests give the same output as the build without the
+tower.
+
 ## What each flag does
 
 - `--max-seqs` (`16`): How many requests are decoded at once (continuous batching). Set to the highest concurrency the benchmark uses.
