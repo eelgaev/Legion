@@ -688,7 +688,12 @@ bool launch_gemm8_tma(const legion_fp8_mm8 & p, cudaStream_t st) {
 // without it. Its k and v projections (1,024 rows, on the wide tile from 16,384 tokens) were
 // 0.97x in one session and 1.07x in the other: not routed.
 constexpr int64_t GEMM8_STREAM_MIN_M = 2048;
+// Outputs into mapped host memory (GEMM8_STAGED, the TP send buffer) on the wide tile without
+// the residual: -1, gemm8_epilogue_staged.
 template <bool RES, class C> int gemm8_stream_jg(const legion_fp8_mm8 & p) {
+    if (!RES && C::WM == 4 && (p.variant & GEMM8_STAGED)) {
+        return -1;
+    }
     switch (p.variant & 0xff) {
         case 2: return 1;
         case 3: return 2;
@@ -700,6 +705,11 @@ template <bool RES, class C> int gemm8_stream_jg(const legion_fp8_mm8 & p) {
 // launch_gemm8_tma with gemm8_stream_jg's epilogue.
 template <bool RES, class C> bool launch_gemm8_tma_jg(const legion_fp8_mm8 & p, cudaStream_t st) {
     switch (gemm8_stream_jg<RES, C>(p)) {
+        case -1:
+            if constexpr (!RES && C::WM == 4) {
+                return launch_gemm8_tma<RES, C, -1>(p, st);
+            }
+            return false;
         case 1: return launch_gemm8_tma<RES, C, 1>(p, st);
         case 2: return launch_gemm8_tma<RES, C, 2>(p, st);
         default: return launch_gemm8_tma<RES, C>(p, st);

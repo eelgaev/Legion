@@ -881,6 +881,9 @@ unsafe fn cuda_fp8_mm8(
 /// the send buffer). Every output is the whole launch's: each is its own sum over k, whatever
 /// the other columns (the GEMMs' tiles all give the same bits).
 ///
+/// `staged`: `out` is mapped host memory, which the TMA-fed GEMM then writes by whole runs of a
+/// token's rows (`gemm8_epilogue_staged`, [`VARIANT_STAGED`]); the same values.
+///
 /// # Safety
 /// `dst` is such a node (without a residual) of an allocated graph, its sources holding their
 /// values; `out` device-writable for `count` columns; `cols` within the node's.
@@ -889,11 +892,17 @@ pub(crate) unsafe fn launch_cols(
     dst: &ffi::ggml_tensor,
     cols: (usize, usize),
     out: Option<u64>,
+    staged: bool,
     stream: *mut std::os::raw::c_void,
 ) -> Result<(), String> {
     // SAFETY: the caller's.
-    unsafe { mm8_cols(dst, Some(cols), out, stream) }
+    unsafe { mm8_cols(dst, Some(cols), out.map(|o| (o, staged)), stream) }
 }
+
+/// `legion_fp8_mm8`'s variant bit for [`launch_cols`]'s `staged` (`GEMM8_STAGED` in
+/// sm90/fp8_gemm8_tma.cuh).
+#[cfg(feature = "cuda")]
+const VARIANT_STAGED: i32 = 0x200;
 
 /// The GEMM of the [`FP8_MM8`] node `dst`: all of it (`cols` `None`, into its own output), or
 /// the columns and output [`launch_cols`] says.
@@ -904,7 +913,7 @@ pub(crate) unsafe fn launch_cols(
 unsafe fn mm8_cols(
     dst: &ffi::ggml_tensor,
     cols: Option<(usize, usize)>,
-    out: Option<u64>,
+    out: Option<(u64, bool)>,
     stream: *mut std::os::raw::c_void,
 ) -> Result<(), String> {
     let [mode, res_at, ..] = crate::ggml::external_params(dst);
@@ -936,7 +945,7 @@ unsafe fn mm8_cols(
             x: (x.data as *const u8).add((c0 * k) as usize),
             scale,
             dst: match out {
-                Some(o) => o as *mut f32,
+                Some((o, _)) => o as *mut f32,
                 None => (dst.data as *mut f32).add((c0 * m) as usize),
             },
             k,
@@ -958,7 +967,7 @@ unsafe fn mm8_cols(
             } else {
                 std::ptr::null()
             },
-            variant: gemm_variant(),
+            variant: gemm_variant() | (out.is_some_and(|o| o.1) as i32 * VARIANT_STAGED),
         }
     };
     // `--hopper-gemm` (untested on hardware): prompt GEMMs on the Hopper wgmma kernels where

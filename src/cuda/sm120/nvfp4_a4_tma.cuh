@@ -45,6 +45,63 @@ template <int NT_, int ST_> struct TmaTile {
     static_assert(SMEM + 1024 <= 99 * 1024, "shared memory");
 };
 
+// legion_nvfp4_a4's variant bit 10: the outputs go to mapped host memory (the TP send buffer,
+// #1133), through a4_epilogue_staged.
+constexpr int32_t A4_STAGED = 0x400;
+
+#ifdef LEGION_FP4_MMA
+// a4_epilogue's dense F32 outputs without an act or a residual (each sum times sc times the
+// token's decode scale) by whole runs of a token's rows (#1133), as fp8_gemm8_tma's
+// gemm8_epilogue_staged: the MMA layout's 32-byte pieces go out alone into mapped host memory
+// on the GB10, at about half the speed of whole lines. Each warp puts one n8 token tile of its
+// 16 * MI rows at a time into its own piece of shared memory (`stage`, 8 x (16 * MI + 4)
+// floats of the stages' memory, free once every warp is past the K loop) and writes it 16 bytes
+// a lane, whole 128-byte runs. The same values at the same places: the same bits.
+template <int MI, int NT>
+__device__ __forceinline__ void a4_epilogue_staged(const legion_nvfp4_a4 & p, const float (&acc)[MI][NT][4],
+                                                   int64_t m0, int64_t n0, int n_tok, const float * x_dec, float sc,
+                                                   int wm, int wn, int lane, float * stage) {
+    constexpr int R = 16 * MI, LDS = R + 4, Q = R / 4;  // a warp's rows; padded; float4s a token
+    static_assert((8 * Q) % 32 == 0, "whole stores a lane");
+    const int g = lane / 4, t = lane % 4;
+    const int64_t rbase = m0 + wm * R;
+    float * dst = (float *) p.dst;
+    // All R rows exist and 16-byte stores are aligned.
+    const bool whole = rbase + R <= p.m && p.m % 4 == 0 && ((uintptr_t) dst & 15) == 0;
+#pragma unroll
+    for (int j = 0; j < NT; j++) {
+        const int tk0 = wn * 8 * NT + j * 8;
+#pragma unroll
+        for (int i = 0; i < MI; i++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int r = i * 16 + g + (e / 2) * 8, tl = t * 2 + e % 2, tk = tk0 + tl;
+                stage[tl * LDS + r] = rbase + r < p.m && tk < n_tok ? acc[i][j][e] * sc * x_dec[tk] : 0.0f;
+            }
+        __syncwarp();
+#pragma unroll
+        for (int q = 0; q < 8 * Q / 32; q++) {
+            const int idx = q * 32 + lane, tl = idx / Q, c = idx % Q, tk = tk0 + tl;
+            if (tk < n_tok) {
+                float * o = dst + (n0 + tk) * p.m + rbase + c * 4;
+                const float * v = stage + tl * LDS + c * 4;
+                if (whole) {
+                    *(float4 *) o = *(const float4 *) v;
+                } else {
+#pragma unroll
+                    for (int u = 0; u < 4; u++) {
+                        if (rbase + c * 4 + u < p.m) {
+                            o[u] = v[u];
+                        }
+                    }
+                }
+            }
+        }
+        __syncwarp();
+    }
+}
+#endif
+
 // PROBE (legion nvfp4-a4-bench only; its outputs are not the GEMM's): 1 the loads alone (no
 // MMAs, no stores), 2 no refills (the first ST stages' data computed on over and over: the MMAs
 // and fragment reads without the memory system), 3 no epilogue stores.
@@ -52,7 +109,8 @@ template <int NT_, int ST_> struct TmaTile {
 // the pointer's state space: every A fragment and scale word is a generic load (LD.E) and each
 // TMA issue checks its destination's window. Else the base is the shared array plus an offset,
 // and those reads are LDS.
-template <int NT, int ST, bool GLU, bool RES, int PROBE = 0, bool GEN = false>
+// STAGED: a4_epilogue_staged (a plain F32 product: no GLU, residual, act or probe).
+template <int NT, int ST, bool GLU, bool RES, int PROBE = 0, bool GEN = false, bool STAGED = false>
 __global__ void __launch_bounds__(256, 1) nvfp4_a4_gemm_tma(const legion_nvfp4_a4 p, const __grid_constant__ a4t::Maps maps) {
 #ifdef LEGION_FP4_MMA
     using T = TmaTile<NT, ST>;
@@ -254,7 +312,14 @@ __global__ void __launch_bounds__(256, 1) nvfp4_a4_gemm_tma(const legion_nvfp4_a
         }
     }
     // The probes without stores keep their sums alive by a store no launch asks for.
-    if (PROBE == 0 || PROBE == 2 || p.act == 99) {
+    if constexpr (STAGED) {
+        static_assert(PROBE == 0 && !GLU && !RES, "staged: a plain product");
+        // Every warp's reads of the stages are done (and every stage's copy landed: each was
+        // waited for), so their memory takes the staged outputs.
+        __syncthreads();
+        a4_epilogue_staged<MI, NT>(p, acc, m0, n0, n_tok, x_dec, sc, wm, wn, lane,
+                                   (float *) smem + warp * 8 * (16 * MI + 4));
+    } else if (PROBE == 0 || PROBE == 2 || p.act == 99) {
         a4_epilogue<MI, NT, false, GLU, RES>(p, acc, m0, n0, n_tok, x_dec, nullptr, sc, sc2, wm, wn, g, t);
     }
 #else
@@ -310,6 +375,10 @@ template <int NT, int ST, int PROBE = 0, bool GEN = false> int dense_tma(const l
         go(nvfp4_a4_gemm_tma<NT, ST, true, false, 0, GEN>);
     } else if (p.res) {
         go(nvfp4_a4_gemm_tma<NT, ST, false, true, 0, GEN>);
+    } else if (!GEN && (p.variant & A4_STAGED) && p.act == 0) {
+        if constexpr (!GEN) {
+            go(nvfp4_a4_gemm_tma<NT, ST, false, false, 0, false, true>);
+        }
     } else {
         go(nvfp4_a4_gemm_tma<NT, ST, false, false, 0, GEN>);
     }

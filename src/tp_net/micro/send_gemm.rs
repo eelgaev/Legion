@@ -46,6 +46,16 @@ fn on_of(v: Option<&str>) -> bool {
     v.is_none_or(|s| s.trim() != "0")
 }
 
+/// Whether the matmuls write the send buffer (mapped host memory) by whole runs of a token's
+/// rows (the GEMMs' staged epilogues): on, unless `LEGION_DEBUG_TP_SEND_STAGED=0` (their
+/// usual stores, about twice as slow into that memory on the GB10). The same bits either way.
+/// Read once.
+#[cfg(feature = "cuda")]
+fn staged() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| on_of(std::env::var("LEGION_DEBUG_TP_SEND_STAGED").ok().as_deref()))
+}
+
 /// The matmuls a start may run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -311,7 +321,8 @@ pub(crate) unsafe fn taken(start: &ffi::ggml_tensor) -> Option<Taken<'_>> {
 #[cfg(feature = "cuda")]
 impl Taken<'_> {
     /// Runs the columns on `stream`: into the send buffer at the device address `out`
-    /// (`values` F32s), else into the matmul's own output.
+    /// (`values` F32s, mapped host memory: staged, [`staged`]), else into the matmul's own
+    /// output.
     ///
     /// # Safety
     /// The graph's memory holds the matmul's inputs (nothing between it and its last start
@@ -321,16 +332,22 @@ impl Taken<'_> {
         out: Option<u64>,
         stream: *mut std::os::raw::c_void,
     ) -> Result<(), String> {
+        let staged = out.is_some() && staged();
         // SAFETY: the caller's.
         unsafe {
             match (self.kind, out) {
                 (Kind::Fp8, out) => {
-                    crate::model::fp8::launch_cols(self.gemm, self.cols, out, stream)
+                    crate::model::fp8::launch_cols(self.gemm, self.cols, out, staged, stream)
                 }
-                (Kind::A4, Some(o)) => crate::model::nvfp4_a4::mul_mat_to(self.gemm, o, stream),
-                (Kind::A4, None) => {
-                    crate::model::nvfp4_a4::mul_mat_to(self.gemm, self.gemm.data as u64, stream)
+                (Kind::A4, Some(o)) => {
+                    crate::model::nvfp4_a4::mul_mat_to(self.gemm, o, staged, stream)
                 }
+                (Kind::A4, None) => crate::model::nvfp4_a4::mul_mat_to(
+                    self.gemm,
+                    self.gemm.data as u64,
+                    false,
+                    stream,
+                ),
             }
         }
     }

@@ -1775,9 +1775,13 @@ mod cuda {
     /// # Safety
     /// `dst` is such a node (F32 out, no residual) of an allocated graph, its sources holding
     /// their values; `out` device-writable for its `[m, n]` output.
+    ///
+    /// `staged`: `out` is mapped host memory, which the TMA-fed GEMM then writes by whole runs
+    /// of a token's rows (`a4_epilogue_staged`, `VARIANT_STAGED`); the same values.
     pub(crate) unsafe fn mul_mat_to(
         dst: &ffi::ggml_tensor,
         out: u64,
+        staged: bool,
         stream: *mut c_void,
     ) -> Result<(), String> {
         let [_, act, has_res, ..] = external_params(dst);
@@ -1785,16 +1789,21 @@ mod cuda {
             return Err("nvfp4 a4: only an F32 matmul without a residual writes elsewhere".into());
         }
         // SAFETY: the caller's.
-        unsafe { mul_mat_into(dst, Some(out as *mut c_void), stream) }
+        unsafe { mul_mat_into(dst, Some((out as *mut c_void, staged)), stream) }
     }
 
-    /// The node's matmul, its output into `out` (else the node's own memory).
+    /// `legion_nvfp4_a4`'s variant bit for [`mul_mat_to`]'s `staged` (`A4_STAGED` in
+    /// nvfp4_a4_tma.cuh).
+    const VARIANT_STAGED: i32 = 0x400;
+
+    /// The node's matmul, its output into `out` (else the node's own memory), staged or not
+    /// ([`mul_mat_to`]).
     ///
     /// # Safety
     /// As [`mul_mat`], and `out` as [`mul_mat_to`]'s.
     unsafe fn mul_mat_into(
         dst: &ffi::ggml_tensor,
-        out: Option<*mut c_void>,
+        out: Option<(*mut c_void, bool)>,
         stream: *mut c_void,
     ) -> Result<(), String> {
         let [has_scale, act, has_res, ..] = external_params(dst);
@@ -1813,12 +1822,15 @@ mod cuda {
             w,
             xq,
             scale_ptr(dst, has_scale, 2),
-            out.unwrap_or(dst.data),
+            out.map_or(dst.data, |o| o.0),
             (k, m, n),
             tiles,
             act,
         );
         p.res = scale_ptr(dst, has_res, 2 + has_scale as usize);
+        if out.is_some_and(|o| o.1) {
+            p.variant |= VARIANT_STAGED;
+        }
         launch(&p, nt, stream)
     }
 

@@ -41,13 +41,73 @@ template <class C> __host__ __device__ constexpr size_t gemm8_tma_smem() {
     return C::SMEM + (C::WARPS == 4 ? 0 : 1024) + 2 * C::STAGES * sizeof(uint64_t);
 }
 
+// legion_fp8_mm8's variant bit 9: the outputs go to mapped host memory (the TP send buffer,
+// #1133), through gemm8_epilogue_staged.
+constexpr int32_t GEMM8_STAGED = 0x200;
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+// The tile's outputs without a residual (gemm8_epilogue's values: each sum times a8_scale) by
+// whole runs of a token's rows (#1133). The MMA layout stores 4 bytes a lane, 32 bytes of each
+// of 4 tokens a store; into device memory L2 merges those pieces into lines, but into mapped
+// host memory on the GB10 each piece goes out alone, at about half the speed of whole lines (a
+// 168 MB F32 output: ~94 against ~180 GB/s). Here each warp puts one n8 token tile of its 64
+// rows at a time into its own piece of shared memory (`stage`, 8 x 68 floats: the stages' memory,
+// free once every warp is past the K loop) and writes it 16 bytes a lane, two tokens' 256-byte
+// runs a store. The same values at the same places: the same bits.
+template <class C, int NJ>
+__device__ __forceinline__ void gemm8_epilogue_staged(const legion_fp8_mm8 & p, int64_t m0, int64_t n0, int wm,
+                                                      int wn, int lane, const float (&acc)[4][NJ][4],
+                                                      float * stage) {
+    static_assert(NJ == a8::BN / 8 / C::WN, "n8 tiles per warp");
+    constexpr int LDS = 64 + 4;  // a token's 64 rows, padded: the lanes' writes hit 32 banks
+    const float s = a8_static(p);
+    const int g = lane / 4, t = lane % 4;
+    const int64_t rbase = m0 + wm * 64, tbase = n0 + wn * NJ * 8;
+    // All 64 rows exist and 16-byte stores are aligned.
+    const bool whole = rbase + 64 <= p.m && p.m % 4 == 0 && ((uintptr_t) p.dst & 15) == 0;
+#pragma unroll
+    for (int j = 0; j < NJ; j++) {
+#pragma unroll
+        for (int i = 0; i < 4; i++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int r = i * 16 + g + (e / 2) * 8, tk = 2 * t + e % 2;
+                const int64_t row = rbase + r, tok = tbase + j * 8 + tk;
+                stage[tk * LDS + r] = row < p.m && tok < p.n ? acc[i][j][e] * a8_scale(p, s, row, tok) : 0.0f;
+            }
+        __syncwarp();
+#pragma unroll
+        for (int q = 0; q < 4; q++) {
+            const int idx = q * 32 + lane, tk = idx / 16, c = idx % 16;
+            const int64_t tok = tbase + j * 8 + tk;
+            if (tok < p.n) {
+                float * o = p.dst + tok * p.m + rbase + c * 4;
+                const float * v = stage + tk * LDS + c * 4;
+                if (whole) {
+                    __stcs((float4 *) o, *(const float4 *) v);
+                } else {
+#pragma unroll
+                    for (int u = 0; u < 4; u++) {
+                        if (rbase + c * 4 + u < p.m) {
+                            __stcs(o + u, v[u]);
+                        }
+                    }
+                }
+            }
+        }
+        __syncwarp();
+    }
+}
+#endif
+
 // 4 warps (#1133 r11): two 128 x 128 CTAs per SM instead of one 256 x 128 one, so one CTA's
 // epilogue (the fused residual's loads and the stores) runs while the other's MMAs do. Started
 // together, the two drift into step and finish their tiles at the same time, and the residual
 // loads of a whole wave then hit memory at once (on the GB10 that ran 0.94x the wide tile): so
 // the first wave starts staggered (a8t::Stagger) over about one tile's time, and each tile's
 // residual prefetch is spread over its last steps (gemm8_res_prefetch).
-// JG (#1133 r25): 0 gemm8_epilogue, else gemm8_epilogue_stream with JG token tiles at a time.
+// JG (#1133 r25): 0 gemm8_epilogue, -1 gemm8_epilogue_staged (no residual), else
+// gemm8_epilogue_stream with JG token tiles at a time.
 template <bool RES, class C, int JG = 0>
 __global__ void __launch_bounds__(32 * C::WARPS, 8 / C::WARPS)
     fp8_gemm8_tma(const legion_fp8_mm8 p, const __grid_constant__ a8t::Maps maps, const a8t::Stagger stagger) {
@@ -147,7 +207,13 @@ __global__ void __launch_bounds__(32 * C::WARPS, 8 / C::WARPS)
             __syncwarp();
         }
     }
-    if constexpr (JG == 0) {
+    if constexpr (JG < 0) {
+        static_assert(!RES && C::WM == 4, "staged: no residual, 64 rows a warp");
+        // Every warp's reads of the stages are done (and every stage's copy landed: each was
+        // waited for), so their memory takes the staged outputs.
+        __syncthreads();
+        gemm8_epilogue_staged<C>(p, m0, n0, wm, wn, lane, acc, (float *) smem + warp * 8 * (64 + 4));
+    } else if constexpr (JG == 0) {
         gemm8_epilogue<RES, C>(p, m0, n0, wm, wn, lane, acc);
     } else {
         gemm8_epilogue_stream<RES, C, JG>(p, m0, n0, wm, wn, lane, acc);
