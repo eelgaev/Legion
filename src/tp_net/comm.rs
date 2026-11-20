@@ -1218,9 +1218,20 @@ impl Comm {
     /// The sum over the ranks of every rank's `src`, in rank order, into `dst` (host memory;
     /// the CPU op). On failure `dst` gets `src` and the communicator keeps the error.
     pub fn all_reduce_host(&self, src: &[f32], dst: &mut [f32]) -> Result<(), String> {
+        self.all_reduce_host_as(src, dst, src.len())
+    }
+
+    /// [`Comm::all_reduce_host`] of part of a tensor of `wire_values` values (a micro-batch's,
+    /// [`super::micro::all_reduce_start`]): the wire type the whole tensor's exchange takes.
+    pub fn all_reduce_host_as(
+        &self,
+        src: &[f32],
+        dst: &mut [f32],
+        wire_values: usize,
+    ) -> Result<(), String> {
         assert_eq!(src.len(), dst.len(), "all-reduce lengths");
         let r: Result<(), String> = (|| {
-            let wire = self.wire(src.len());
+            let wire = self.wire(wire_values);
             let mine = Arc::new(encode(src, wire));
             let parts = self.exchange_host(|_| mine.clone(), |_| mine.len())?;
             sum_parts(&parts, self.rank, &mine, wire, dst);
@@ -1437,6 +1448,13 @@ impl Comm {
             }
         }
         Ok(parts)
+    }
+
+    /// Fails the communicator with `e` and cuts its connections at once, as a rank that died
+    /// does: the peers' exchanges waiting for this rank fail now rather than at their timeout.
+    pub fn abort(&self, e: String) {
+        self.shared.fail(e);
+        self.shutdown();
     }
 
     /// Stops the threads. The writers first send what is still queued, for up to

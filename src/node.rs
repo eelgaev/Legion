@@ -28,7 +28,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// Frames before this version are refused: both ranks must run the same build.
-const VERSION: u32 = 8;
+const VERSION: u32 = 11;
 
 /// The node settings of a `legion serve` (`--node-rank`, `--node-peer`, `--node-split`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +61,9 @@ pub struct WireSeq {
     pub ring: u32,
     /// [`crate::model::core::Logits`] as a tag and its count.
     pub logits: (u8, u32),
+    /// The sequence's images ([`crate::model::core::Media`]) by the id a [`Request::TpMedia`]
+    /// gave them before, 0 for none (#1195).
+    pub media: u32,
 }
 
 /// A group of a step on the wire (see [`crate::model::core::Group`]).
@@ -184,6 +187,20 @@ pub enum Request {
         before: Vec<u32>,
         tokens: Vec<u32>,
     },
+    /// A sequence's images under tensor parallelism over machines (#1195): rank 0 encodes
+    /// them, and the steps that follow name them by `id` ([`WireSeq::media`]) for their input
+    /// rows and M-RoPE positions. `spans`: `(start, nx, ny)` per image in token order, `rows`
+    /// their input rows one image after another (`nx × ny × n_embd` floats each).
+    TpMedia {
+        id: u32,
+        n_embd: u32,
+        spans: Vec<(u32, u32, u32)>,
+        rows: Vec<f32>,
+    },
+    /// No step names these images any more: the other ranks forget them.
+    TpMediaDrop {
+        ids: Vec<u32>,
+    },
     /// The MTP drafts after the last step (`--spec mtp` over two nodes, #560): rank 1 holds the
     /// head and the residual rows the step captured, so only the sequences go over the link.
     /// `p_min` (as bits): the head confidence under which a sequence stops drafting.
@@ -195,9 +212,23 @@ pub enum Request {
     DraftRelease {
         seq: u64,
     },
+    /// The same draft round as rank 0's, of a DFlash drafter whose FFN is split over the ranks
+    /// (`--tp-draft-split`, #619): every rank runs the round's take-in and draft pass on its
+    /// copy of the drafter's state, with the rows its last [`Self::TpStep`] captured (each
+    /// request's from row `off`), so the pass's all-reduces line up. Each request's `tokens`
+    /// hold the sequence's last token only (`base`: the tokens before it): the drafter reads
+    /// no others. Rank 0 alone picks the drafts.
+    TpDraft {
+        reqs: Vec<WireDraft>,
+    },
+    /// A sequence has ended: the other ranks free its state in their split drafter.
+    TpDraftRelease {
+        seq: u64,
+    },
 }
 
-/// One sequence of a [`Request::Draft`] (see [`crate::spec::DraftRequest`]).
+/// One sequence of a [`Request::Draft`] or [`Request::TpDraft`] (see
+/// [`crate::spec::DraftRequest`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireDraft {
     pub seq: u64,
@@ -287,6 +318,10 @@ const K_TP_MTP_ROWS: u32 = 13;
 const K_DRAFT: u32 = 14;
 const K_DRAFT_RELEASE: u32 = 15;
 const K_TP_PREFETCH: u32 = 16;
+const K_TP_MEDIA: u32 = 17;
+const K_TP_MEDIA_DROP: u32 = 18;
+const K_TP_DRAFT: u32 = 19;
+const K_TP_DRAFT_RELEASE: u32 = 20;
 const R_HELLO: u32 = 101;
 const R_DONE: u32 = 102;
 const R_STEP: u32 = 103;
@@ -309,6 +344,39 @@ fn put_u32s(b: &mut Vec<u8>, v: &[u32]) {
     for &x in v {
         put_u32(b, x);
     }
+}
+
+fn put_drafts(head: &mut Vec<u8>, reqs: &[WireDraft]) {
+    put_u32(head, reqs.len() as u32);
+    for d in reqs {
+        head.extend_from_slice(&d.seq.to_le_bytes());
+        put_u32(head, d.base);
+        put_u32s(head, &d.tokens);
+        for v in [d.start, d.ran, d.off, d.max] {
+            put_u32(head, v);
+        }
+        put_u32s(head, &d.blocks);
+        put_u32(head, d.ring);
+    }
+}
+
+fn read_drafts(r: &mut Cursor<'_>) -> Result<Vec<WireDraft>, String> {
+    let n = r.u32()? as usize;
+    let mut reqs = Vec::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        reqs.push(WireDraft {
+            seq: r.u64()?,
+            base: r.u32()?,
+            tokens: r.u32s()?,
+            start: r.u32()?,
+            ran: r.u32()?,
+            off: r.u32()?,
+            max: r.u32()?,
+            blocks: r.u32s()?,
+            ring: r.u32()?,
+        });
+    }
+    Ok(reqs)
 }
 
 fn put_parts(head: &mut Vec<u8>, parts: &[RowsPart]) {
@@ -386,6 +454,7 @@ fn put_groups(head: &mut Vec<u8>, groups: &[WireGroup]) {
             put_u32(head, s.ring);
             head.push(s.logits.0);
             put_u32(head, s.logits.1);
+            put_u32(head, s.media);
         }
     }
 }
@@ -405,6 +474,7 @@ fn get_groups(r: &mut Cursor<'_>) -> Result<Vec<WireGroup>, String> {
                 blocks: r.u32s()?,
                 ring: r.u32()?,
                 logits: (r.u8()?, r.u32()?),
+                media: r.u32()?,
             });
         }
         groups.push(WireGroup { slot, verify, seqs });
@@ -551,24 +621,43 @@ impl Request {
                 put_u32s(&mut head, &tokens);
                 K_TP_PREFETCH
             }
-            Request::Draft { reqs, p_min } => {
-                put_u32(&mut head, p_min);
-                put_u32(&mut head, reqs.len() as u32);
-                for d in reqs {
-                    head.extend_from_slice(&d.seq.to_le_bytes());
-                    put_u32(&mut head, d.base);
-                    put_u32s(&mut head, &d.tokens);
-                    for v in [d.start, d.ran, d.off, d.max] {
+            Request::TpMedia {
+                id,
+                n_embd,
+                spans,
+                rows,
+            } => {
+                put_u32(&mut head, id);
+                put_u32(&mut head, n_embd);
+                put_u32(&mut head, spans.len() as u32);
+                for (start, nx, ny) in spans {
+                    for v in [start, nx, ny] {
                         put_u32(&mut head, v);
                     }
-                    put_u32s(&mut head, &d.blocks);
-                    put_u32(&mut head, d.ring);
                 }
+                bulk = rows;
+                K_TP_MEDIA
+            }
+            Request::TpMediaDrop { ids } => {
+                put_u32s(&mut head, &ids);
+                K_TP_MEDIA_DROP
+            }
+            Request::Draft { reqs, p_min } => {
+                put_u32(&mut head, p_min);
+                put_drafts(&mut head, &reqs);
                 K_DRAFT
             }
             Request::DraftRelease { seq } => {
                 head.extend_from_slice(&seq.to_le_bytes());
                 K_DRAFT_RELEASE
+            }
+            Request::TpDraft { reqs } => {
+                put_drafts(&mut head, &reqs);
+                K_TP_DRAFT
+            }
+            Request::TpDraftRelease { seq } => {
+                head.extend_from_slice(&seq.to_le_bytes());
+                K_TP_DRAFT_RELEASE
             }
         };
         Frame { kind, head, bulk }
@@ -663,26 +752,34 @@ impl Request {
                 before: r.u32s()?,
                 tokens: r.u32s()?,
             },
+            K_TP_MEDIA => {
+                let id = r.u32()?;
+                let n_embd = r.u32()?;
+                let n = r.u32()? as usize;
+                let mut spans = Vec::with_capacity(n.min(1 << 16));
+                for _ in 0..n {
+                    spans.push((r.u32()?, r.u32()?, r.u32()?));
+                }
+                Request::TpMedia {
+                    id,
+                    n_embd,
+                    spans,
+                    rows: bulk,
+                }
+            }
+            K_TP_MEDIA_DROP => Request::TpMediaDrop { ids: r.u32s()? },
             K_DRAFT => {
                 let p_min = r.u32()?;
-                let n = r.u32()? as usize;
-                let mut reqs = Vec::with_capacity(n.min(1 << 16));
-                for _ in 0..n {
-                    reqs.push(WireDraft {
-                        seq: r.u64()?,
-                        base: r.u32()?,
-                        tokens: r.u32s()?,
-                        start: r.u32()?,
-                        ran: r.u32()?,
-                        off: r.u32()?,
-                        max: r.u32()?,
-                        blocks: r.u32s()?,
-                        ring: r.u32()?,
-                    });
+                Request::Draft {
+                    reqs: read_drafts(&mut r)?,
+                    p_min,
                 }
-                Request::Draft { reqs, p_min }
             }
             K_DRAFT_RELEASE => Request::DraftRelease { seq: r.u64()? },
+            K_TP_DRAFT => Request::TpDraft {
+                reqs: read_drafts(&mut r)?,
+            },
+            K_TP_DRAFT_RELEASE => Request::TpDraftRelease { seq: r.u64()? },
             k => return Err(format!("unknown request kind {k}")),
         };
         r.end()?;

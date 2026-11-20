@@ -2,10 +2,14 @@
 //! ([`Encoder`]).
 
 mod decode;
+#[cfg(feature = "cuda")]
+mod gpu;
 mod preprocess;
 mod qwen3vl;
 pub mod tiny;
 
+#[cfg(feature = "cuda")]
+pub use gpu::GpuEncoder;
 pub use preprocess::{Preprocessed, preprocess};
 pub use qwen3vl::{Encoder, EncoderConfig, ImageEmbedding};
 

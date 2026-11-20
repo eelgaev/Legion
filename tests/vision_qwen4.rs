@@ -351,6 +351,29 @@ fn checkpoint_tower_is_the_converted_mmproj() {
                 .all(|(x, y)| x.to_bits() == y.to_bits())
         );
     }
+    // A dense Qwen3.5 / Qwen3.8-27B checkpoint (`qwen3_5`, #1218) ships the same tower.
+    let config = ckpt.join("config.json");
+    let mut c: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    c["model_type"] = json!("qwen3_5");
+    std::fs::write(&config, c.to_string()).unwrap();
+    let dense = legion::hf::open_vision(&ckpt)
+        .unwrap()
+        .expect("a qwen3_5 vision tower");
+    for t in mmproj.tensors() {
+        let s = dense.tensor(&t.name).unwrap();
+        assert_eq!(
+            (s.shape.as_slice(), s.ggml_type),
+            (t.shape.as_slice(), t.ggml_type)
+        );
+    }
+    let (a, b) = (encode(&mmproj, &image(3)), encode(&dense, &image(3)));
+    assert!(
+        a.data
+            .iter()
+            .zip(&b.data)
+            .all(|(x, y)| x.to_bits() == y.to_bits())
+    );
     // Not a vision checkpoint: none.
     let text = dir.path().join("text");
     std::fs::create_dir(&text).unwrap();

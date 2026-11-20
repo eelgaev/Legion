@@ -84,6 +84,12 @@ impl MtpGraphs {
         (std::mem::take(&mut self.kept), self.shared.take())
     }
 
+    /// Drops the kept graphs of passes of at least `floor` tokens ([`super::lend_decode`]); the
+    /// others and the shared compute buffer stay.
+    pub(super) fn drop_staging(&mut self, floor: i64) {
+        drop(super::lend_decode::take_staging(&mut self.kept, floor));
+    }
+
     /// Drops every kept graph and takes the compute buffer out (to keep, #491).
     pub(super) fn take_buffer(&mut self) -> Option<ComputeAllocator> {
         self.kept.clear();

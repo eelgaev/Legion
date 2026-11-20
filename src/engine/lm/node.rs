@@ -635,7 +635,11 @@ impl Follower {
             | Request::TpMtp { .. }
             | Request::TpMtpChain { .. }
             | Request::TpMtpRows { .. }
-            | Request::TpPrefetch { .. } => {
+            | Request::TpPrefetch { .. }
+            | Request::TpMedia { .. }
+            | Request::TpMediaDrop { .. }
+            | Request::TpDraft { .. }
+            | Request::TpDraftRelease { .. } => {
                 return Err(
                     "a request of tensor parallelism over machines (--tp-rank): this rank \
                         runs a model split by layers (--node-rank)"

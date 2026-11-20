@@ -37,6 +37,19 @@ fn shares_cover_the_vocabulary_at_a_tie_boundary() {
 }
 
 #[test]
+fn gemma4_head_splits_in_halves() {
+    // Gemma 4's vocabulary (31B: the head tied to the embeddings), a DFlash 2 verify step of
+    // 8 rows a sequence.
+    let n = 262_144;
+    assert!(vocab_fits(n));
+    assert_eq!(range(n, 1), (0, 131_072));
+    assert_eq!(range(n, 2), (131_072, 131_072));
+    let t = [1u32; 8];
+    let verify = group(vec![seq(&t, Logits::FirstGreedy(8))]);
+    assert!(fits(std::slice::from_ref(&verify), 16));
+}
+
+#[test]
 fn only_greedy_decode_and_verify_steps_split() {
     let t = [1u32, 2, 3];
     let greedy = group(vec![
