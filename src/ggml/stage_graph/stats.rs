@@ -215,6 +215,16 @@ pub(crate) fn count_update(ok: bool) {
     }
 }
 
+/// Small spares held now on all devices and their CUDA graph nodes ([`super::spare`], #1176).
+static SMALL_HELD: AtomicU64 = AtomicU64::new(0);
+static SMALL_HELD_NODES: AtomicU64 = AtomicU64::new(0);
+
+/// Notes the small spares held now: `n` of them, `nodes` CUDA graph nodes in all (CUDA only).
+pub(crate) fn note_small_spares(n: usize, nodes: usize) {
+    SMALL_HELD.store(n as u64, Relaxed);
+    SMALL_HELD_NODES.store(nodes as u64, Relaxed);
+}
+
 /// Counts one executable graph taken over from a kept capture ([`super::spare`], CUDA only).
 pub(crate) fn count_steal() {
     STEALS.fetch_add(1, Relaxed);
@@ -371,6 +381,8 @@ fn log_due(now: Instant) {
             spares_updated = d.updates,
             spare_updates_refused = d.update_fails,
             execs_taken_over = d.steals,
+            small_spares = SMALL_HELD.load(Relaxed),
+            small_spare_nodes = SMALL_HELD_NODES.load(Relaxed),
             captures_new = d.why[Why::New as usize],
             captures_lost = d.why[Why::Lost as usize],
             captures_changed = d.why[Why::Changed as usize],

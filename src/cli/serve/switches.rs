@@ -1373,10 +1373,12 @@ pub(in crate::cli) struct SwitchArgs {
     /// of instantiating its graph (~18 ms each for a Qwen3.8-Flash-Next verify step on a DGX
     /// Spark (GB10), ~11 of them per 256 tokens at 4 parallel requests). The updated graph runs
     /// the new capture's kernels with its arguments (the same bits); where CUDA refuses the
-    /// update, the capture is instantiated. Only captures of 256+ CUDA graph nodes are kept;
-    /// lower it to save their memory. While this or --stage-graph-exec-steal-ms is on, a big
-    /// capture's device-to-device memcpy nodes run as copy kernels (the same bytes), which an
-    /// update may move to other addresses (it refuses that for a 2-D memcpy).
+    /// update, the capture is instantiated. This counts captures of 256+ CUDA graph nodes;
+    /// lower it to save their memory. Smaller ones (the ~100 pieces between a tensor-parallel
+    /// step's exchanges) stay in a list of their own, up to 320 per GPU while this is on. While
+    /// this or --stage-graph-exec-steal-ms is on, a big capture's device-to-device memcpy
+    /// nodes run as copy kernels (the same bytes), which an update may move to other addresses
+    /// (it refuses that for a 2-D memcpy); with this on, a small one's too.
     #[arg(long, help_heading = HEADING, value_name = "EXECS", value_parser = clap::value_parser!(u16).range(0..=256))]
     stage_graph_spare_execs: Option<u16>,
     /// A new big stage-graph capture with no spare of its topology (see

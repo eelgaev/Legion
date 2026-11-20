@@ -160,19 +160,28 @@ impl ExecCell {
 }
 
 impl Drop for ExecCell {
-    /// A big one becomes a spare ([`super::spare`]) that a capture of the same topology may
-    /// update; the rest (and spares past the cap) are destroyed.
+    /// It becomes a spare ([`super::spare`]; a small one while small spares are on) that a
+    /// capture of the same topology may update; the rest (and spares past the cap) are
+    /// destroyed.
     fn drop(&mut self) {
         let Some(h) = self.x.get_mut().unwrap_or_else(|e| e.into_inner()).take() else {
             return;
         };
-        let gone = SPARES.lock().unwrap_or_else(|e| e.into_inner()).put(
+        let cap = super::spare_execs();
+        let mut spares = SPARES.lock().unwrap_or_else(|e| e.into_inner());
+        let gone = spares.put(
             self.dev,
             self.nodes,
             self.clusters,
             h,
-            super::spare_execs(),
+            cap,
+            super::spare::small_cap(cap, super::spare::small_enabled()),
         );
+        if self.nodes < super::spare::MIN_NODES && stats::logging() {
+            let (n, nodes) = spares.small_held();
+            stats::note_small_spares(n, nodes);
+        }
+        drop(spares);
         // Destroyed outside the lock.
         drop(gone);
     }
@@ -204,6 +213,11 @@ impl Drop for Handle {
 
 /// The spare executable graphs of every device ([`super::spare`]).
 static SPARES: LazyLock<Mutex<super::spare::Spares<Handle>>> = LazyLock::new(Mutex::default);
+
+/// Whether small captures are kept as spares and updated from them ([`super::spare`], #1176).
+fn small_spares() -> bool {
+    super::spare::small_cap(super::spare_execs(), super::spare::small_enabled()) > 0
+}
 
 /// The big captures still held by a set ([`ExecCell::new`]), which [`steal`] may take over.
 static LIVE: LazyLock<Mutex<Vec<Weak<ExecCell>>>> = LazyLock::new(Mutex::default);
@@ -1023,8 +1037,10 @@ impl Run<'_> {
                 (dev, nodes) = (-1, 0);
             }
             let big = dev >= 0 && nodes >= super::spare::MIN_NODES;
+            // A small one may update a small spare, or become one (#1176).
+            let small = dev >= 0 && nodes > 0 && !big && small_spares();
             let mut clusters = 0;
-            if big && (super::spare_execs() > 0 || super::exec_steal_ms() > 0) {
+            if (big && (super::spare_execs() > 0 || super::exec_steal_ms() > 0)) || small {
                 // A copy's node as a kernel node, which an update may move (node count kept).
                 let (made, left) = copy_node::convert(graph, dev);
                 if stats::logging() && made + left > 0 {
@@ -1065,8 +1081,9 @@ impl Run<'_> {
 /// cluster kernel, which then runs without its cluster) updated with captured `graph`'s node
 /// parameters, if one is at hand and CUDA performs the update: launched, it
 /// runs `graph`'s nodes with their parameters, as an instantiation of `graph` would. First a
-/// spare ([`super::spare`]), else (or if CUDA refused the spare's update) one taken over from
-/// a capture unlaunched for `--stage-graph-exec-steal-ms` ([`steal`]). One whose update CUDA
+/// spare ([`super::spare`]; a small one only while small spares are on), else (or if CUDA
+/// refused the spare's update) for a big capture one taken over from a capture unlaunched for
+/// `--stage-graph-exec-steal-ms` ([`steal`]). One whose update CUDA
 /// refuses (another topology, or a change it cannot apply; the exec is left as it was) is
 /// destroyed.
 ///
@@ -1078,15 +1095,19 @@ unsafe fn update_spare(
     clusters: u64,
     graph: *mut c_void,
 ) -> Option<*mut c_void> {
-    if dev < 0 || nodes < super::spare::MIN_NODES {
+    let big = nodes >= super::spare::MIN_NODES;
+    if dev < 0 || nodes == 0 || (!big && !small_spares()) {
         return None;
     }
     let spare = (super::spare_execs() > 0)
         .then(|| {
-            SPARES
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take(dev, nodes, clusters)
+            let mut spares = SPARES.lock().unwrap_or_else(|e| e.into_inner());
+            let h = spares.take(dev, nodes, clusters);
+            if !big && stats::logging() {
+                let (n, nodes) = spares.small_held();
+                stats::note_small_spares(n, nodes);
+            }
+            h
         })
         .flatten();
     if let Some(h) = spare {
@@ -1096,7 +1117,7 @@ unsafe fn update_spare(
         }
     }
     let ms = super::exec_steal_ms();
-    if ms == 0 {
+    if ms == 0 || !big {
         return None;
     }
     let h = steal(dev, nodes, clusters, ms.saturating_mul(1_000_000))?;
