@@ -1373,9 +1373,28 @@ impl GemmTune {
         }
     }
 
-    /// Output rows of a CTA of `rows` with 8 warps.
+    /// Output rows of a CTA of `rows` with 8 warps. (The streaming GEMM sets its own row tiles
+    /// and falls back to the default kernel, so it keeps the default's.)
     pub fn rows(self, rows: i64) -> i64 {
         if self.warps == 4 { rows / 2 } else { rows }
+    }
+
+    /// The dense streaming GEMM of 64-token tiles (`nvfp4_vstream` in
+    /// `src/cuda/nvfp4_mm/common.cuh`, #1181): `rtw` 16-row weight tiles per warp (2 for the
+    /// fused GLU: gate and up), activation stages of `xb` blocks, `xs` of them; one CTA per SM
+    /// sized to the rows. Its code: `(rtw + 10 * xb + 100 * xs) * 1000 + 99`. The same bits as
+    /// every other tune.
+    pub const fn stream(rtw: i32, xb: i32, xs: i32) -> Self {
+        Self {
+            stages: 9,
+            ctas: 9,
+            warps: rtw + 10 * xb + 100 * xs,
+        }
+    }
+
+    /// Whether this is a [`GemmTune::stream`] tune.
+    pub fn is_stream(self) -> bool {
+        self.stages == 9 && self.ctas == 9
     }
 }
 
@@ -1406,17 +1425,45 @@ pub const VERIFY_MAX_M: i64 = 8192;
 /// GLU), otherwise the default.
 /// `LEGION_DEBUG_NVFP4_VERIFY_TUNE=0`: the default everywhere (the way before), for A/B runs.
 pub fn dense_gemm_tune(m: i64, n: i64, nt: i32, glu: bool) -> GemmTune {
+    let verify = nt == 8 && n > MV_MAX_N && n <= 64;
+    if verify && verify_stream() {
+        if glu {
+            return GEMM_STREAM_GLU;
+        }
+        if m >= STREAM_MIN_M {
+            return GEMM_STREAM;
+        }
+    }
     let rows = (MV_RTW2_MIN_M..=VERIFY_MAX_M).contains(&m);
-    if !glu && nt == 8 && n > MV_MAX_N && n <= 64 && rows && verify_tune() {
+    if !glu && verify && rows && verify_tune() {
         GEMM_VERIFY
     } else {
         GEMM_DEFAULT
     }
 }
 
+/// The dense streaming GEMM ([`GemmTune::stream`]) of a plain matmul at 33-64 tokens: one
+/// 16-row weight tile per warp, activation stages of one block, four in flight.
+pub const GEMM_STREAM: GemmTune = GemmTune::stream(1, 1, 4);
+
+/// The streaming GEMM of the fused GLU at 33-64 tokens (gate and up tiles per warp).
+pub const GEMM_STREAM_GLU: GemmTune = GemmTune::stream(2, 1, 4);
+
+/// The fewest rows [`GEMM_STREAM`] takes (fewer: [`GEMM_VERIFY`] or the default).
+pub const STREAM_MIN_M: i64 = 4096;
+
 fn verify_tune() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_NVFP4_VERIFY_TUNE").is_none_or(|v| v != "0"))
+}
+
+/// `LEGION_DEBUG_NVFP4_VERIFY_STREAM=0`: no [`GEMM_STREAM`] / [`GEMM_STREAM_GLU`] (the way
+/// before), for A/B runs.
+fn verify_stream() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("LEGION_DEBUG_NVFP4_VERIFY_STREAM").is_none_or(|v| v != "0")
+    })
 }
 
 /// Whether the GEMM has `tune` for tiles of `128 * mi` rows by `8 * nt` tokens: the default

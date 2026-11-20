@@ -15,6 +15,17 @@ use crate::ggml::{Backend, ComputeAllocator, Context, types};
 /// `src/cuda/nvfp4_mm/common.cuh`: warps * 1000 + stages * 10 + CTAs per SM).
 pub const GEMM_DENSE_TUNES: [i32; 8] = [31, 8032, 8041, 8022, 4031, 4032, 4023, 4042];
 
+/// The streaming GEMM's variants at 64-token tiles ([`GemmTune::stream`] codes; `nvfp4_vstream`):
+/// shapes, then the diagnostics (1 ...: no copies, 2 ...: no MMAs, 3 ...: no weight copies, 4 ...:
+/// no activation copies; wrong outputs, timing only).
+pub const GEMM_STREAM_TUNES: [i32; 11] = [
+    411_099, 311_099, 321_099, 412_099, 322_099, 1_411_099, 2_411_099, 3_411_099, 4_411_099,
+    1_412_099, 3_412_099,
+];
+
+/// The streaming GEMM's variants of the fused GLU.
+pub const GEMM_STREAM_GLU_TUNES: [i32; 3] = [412_099, 312_099, 322_099];
+
 /// One measured variant.
 #[derive(Clone, Debug)]
 pub struct DenseRow {
@@ -186,6 +197,16 @@ pub fn run(
                                 kernels.push((Some(Kernel::Gemm { mi: mi2, nt }), 0, tune));
                             }
                         }
+                    }
+                    let stream: &[i32] = if glu {
+                        &GEMM_STREAM_GLU_TUNES
+                    } else {
+                        &GEMM_STREAM_TUNES
+                    };
+                    for &code in stream {
+                        let tune = Some(GemmTune::from_code(code));
+                        let kernel = (!glu).then_some(Kernel::Gemm { mi: 1, nt });
+                        kernels.push((kernel, 0, tune));
                     }
                     if !glu {
                         kernels.push((Some(Kernel::Gemm { mi: 3 - mi, nt }), 0, None));
