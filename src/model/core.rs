@@ -1885,6 +1885,30 @@ impl Model {
         self.tp_pair.is_some() || self.tp_comm.is_some()
     }
 
+    /// [`Self::tp_sum`] of `x` (a step of `n` tokens) with the first bytes of `ws` (the weights
+    /// the GPU reads next, in its order; `together`: one kernel reads them all at once) read
+    /// into L2 on the side stream while this rank waits for the others' partials
+    /// ([`l2_prefetch::tp`], #1181), forked between its send and its wait. Over machines
+    /// (`--tp-rank`, not a GPU pair) where [`l2_prefetch::tp::plan`] takes it, else the plain
+    /// sum; the same bits either way.
+    pub(crate) fn tp_sum_ahead<'a>(
+        &self,
+        ctx: &'a Context,
+        x: Tensor<'a>,
+        n: i64,
+        ws: &[Tensor<'a>],
+        together: bool,
+    ) -> Tensor<'a> {
+        let Some(c) = self.tp_net_comm() else {
+            return self.tp_sum(ctx, x);
+        };
+        let plan = l2_prefetch::tp::plan(ws, n, together);
+        if plan.is_empty() {
+            return self.tp_sum(ctx, x);
+        }
+        crate::tp_net::all_reduce_ahead(ctx, c, x, None, &plan)
+    }
+
     pub fn set_attention(&mut self, a: Attention) {
         self.attention = a;
     }

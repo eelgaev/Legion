@@ -51,6 +51,43 @@ pub(super) fn add_host(out: &mut [f32], res: &[f32]) {
     }
 }
 
+/// [`all_reduce`] (with `res`: [`all_reduce_add`]) that also reads the first bytes of the
+/// weights `ws` (each with its bytes, whole [`crate::model::core::l2_prefetch::CHUNK`]s, from
+/// [`crate::model::core::l2_prefetch::tp::plan`]) into L2 on the side stream while it waits
+/// for the peers: on CUDA, launched after this rank's partial is on its way and before the
+/// wait. The sum is [`all_reduce`]'s, bit for bit; the CPU ignores `ws`.
+pub fn all_reduce_ahead<'a>(
+    ctx: &'a Context,
+    comm: i32,
+    x: Tensor<'a>,
+    res: Option<Tensor<'a>>,
+    ws: &[(Tensor<'a>, usize)],
+) -> Tensor<'a> {
+    use crate::model::core::l2_prefetch::{CHUNK, tp::MAX_WEIGHTS};
+    assert_eq!(x.ty(), types::F32, "tp all-reduce: F32 only");
+    assert!(
+        ws.len() <= MAX_WEIGHTS,
+        "tp all-reduce: too many weights ahead"
+    );
+    let x = if x.is_contiguous() { x } else { ctx.cont(x) };
+    let mut srcs = vec![x];
+    let mut params = vec![comm, i32::from(res.is_some()), ws.len() as i32];
+    if let Some(res) = res {
+        assert_eq!(res.ty(), types::F32, "tp all-reduce: an F32 residual");
+        assert_eq!(res.ne(), x.ne(), "tp all-reduce: the residual's shape");
+        srcs.push(if res.is_contiguous() {
+            res
+        } else {
+            ctx.cont(res)
+        });
+    }
+    for &(w, bytes) in ws {
+        srcs.push(w);
+        params.push((bytes / CHUNK) as i32);
+    }
+    ctx.external_with(&ALL_REDUCE, types::F32, x.ne(), &srcs, &params)
+}
+
 unsafe fn cpu_all_reduce(dst: &ffi::ggml_tensor, ith: usize, _nth: usize) {
     // One thread runs it; ggml's barrier after the node holds the others.
     if ith != 0 {
@@ -638,6 +675,12 @@ pub(super) mod cuda {
             let res = (kind == Kind::AllReduce && external_params(dst)[1] != 0)
                 .then(|| (*dst.src[1]).data as usize);
             started.and_then(|seq| {
+                // Weights an `all_reduce_ahead` reads into L2 while it waits: forked now, with
+                // this rank's partial already queued to go.
+                if kind == Kind::AllReduce && external_params(dst)[2] > 0 {
+                    let first = 1 + usize::from(res.is_some());
+                    crate::model::core::l2_prefetch::tp::launch_beside(dst, first, stream)?;
+                }
                 if defer {
                     hand_over(&comm, &plan, seq, stream)
                 } else {

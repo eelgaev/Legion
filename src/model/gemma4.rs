@@ -646,6 +646,7 @@ impl Model {
             return self.gemma4_layers_halves(pass, x, comm, capture, layers, pos);
         }
         let mut hidden = Vec::new();
+        let end = layers.end;
         for il in layers {
             let h = norm(x, il, "attn_norm.weight")?;
             tap.tap("attn_norm", il, h);
@@ -666,7 +667,14 @@ impl Model {
                 tap.tap("ffn_moe", il, moe);
                 ctx.add(mlp, moe)
             } else {
-                self.gemma4_ffn(ctx, il, attn_out, eps)?
+                // Over machines: the next layer's q, k and v read into L2 during the sum's
+                // wait (#1181; not with per-layer inputs, whose projection comes first).
+                let down = self.gemma4_ffn_partial(ctx, il, attn_out, eps)?;
+                let next = match per_layer {
+                    None if il + 1 < end => self.gemma4_qkv_weights(il + 1),
+                    _ => Vec::new(),
+                };
+                self.tp_sum_ahead(ctx, down, n, &next, false)
             };
             let ffn = norm(ffn, il, "post_ffw_norm.weight")?;
             tap.tap("ffn_post_norm", il, ffn);
@@ -948,7 +956,26 @@ impl Model {
         };
         let o = self.gemma4_attend_qkv(pass, il, Some(h), multi, pos)?;
         let o = self.lmm(ctx, il, "attn_output.weight", o)?;
-        Ok(self.tp_sum(ctx, o))
+        // Over machines: the dense FFN's gate and up read into L2 during the sum's wait
+        // (#1181); the steps that do it (9+ tokens) read both in one kernel (the fused GeGLU).
+        let ffn = if self.w(&format!("blk.{il}.ffn_gate_inp.weight")).is_ok() {
+            Vec::new()
+        } else {
+            vec![
+                self.lw(il, "ffn_gate.weight")?,
+                self.lw(il, "ffn_up.weight")?,
+            ]
+        };
+        Ok(self.tp_sum_ahead(ctx, o, pass.n, &ffn, true))
+    }
+
+    /// Layer `il`'s projection weights of [`Self::gemma4_qkv_names`], in that order (those it
+    /// has).
+    fn gemma4_qkv_weights(&self, il: usize) -> Vec<Tensor<'_>> {
+        self.gemma4_qkv_names(il)
+            .iter()
+            .filter_map(|name| self.lw(il, name).ok())
+            .collect()
     }
 
     /// Layer `il`'s projections of the normed residual, in [`Self::lmm_multi`]'s order: the
