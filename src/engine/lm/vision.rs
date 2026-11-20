@@ -354,6 +354,16 @@ impl Vision {
                 pixels.grid_w as usize / merge,
                 pixels.grid_h as usize / merge,
             );
+            // Gemma 4's steps and rings hold an image of up to this many tokens whole (#1217):
+            // a bigger one is refused, never cut (the resize keeps every image within it).
+            // Qwen-VL's images read causally, so a step may cut them.
+            if hp.projector == crate::vision::Projector::Gemma4v && nx * ny > hp.max_image_tokens()
+            {
+                return Err(EngineError::InvalidRequest(format!(
+                    "image: {nx} x {ny} tokens, more than the {} one image may take",
+                    hp.max_image_tokens()
+                )));
+            }
             let mut h = std::collections::hash_map::DefaultHasher::new();
             img.bytes.hash(&mut h);
             pending.push(Pending {

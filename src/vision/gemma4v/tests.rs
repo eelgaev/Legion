@@ -277,9 +277,34 @@ fn thin_images_stay_within_the_pixel_budget() {
                 assert!(rw * rh <= max, "{w}x{h}: {rw}x{rh}");
                 assert!((rw / 16).max(rh / 16) <= gpu_rows, "{w}x{h}: {rw}x{rh}");
                 assert_eq!((rw % f, rh % f), (0, 0), "{w}x{h}");
+                // Tokens: at most the tower's largest image (the steps and rings hold it).
+                assert!((rw / f) * (rh / f) <= 1120, "{w}x{h}: {rw}x{rh}");
             }
         }
     }
+}
+
+/// The most tokens a Gemma 4 image takes, from the tower's pixel limits: the steps and the
+/// sliding-window rings are sized to hold it whole (#1217).
+#[test]
+fn the_largest_image_is_the_pixel_budget_in_tokens() {
+    let mut hp = crate::vision::VisionHparams {
+        projector: crate::vision::Projector::Gemma4v,
+        patch_size: 16,
+        spatial_merge_size: 3,
+        image_min_pixels: 70 * 48 * 48,
+        image_max_pixels: 1120 * 48 * 48,
+        image_mean: [0.5; 3],
+        image_std: [0.5; 3],
+    };
+    assert_eq!(hp.max_image_tokens(), 1120);
+    // An mmproj's own limit, not a whole number of tokens: rounded down.
+    hp.image_max_pixels = 600 * 48 * 48 + 47;
+    assert_eq!(hp.max_image_tokens(), 600);
+    // Qwen3-VL's 2×2 merge of 16-pixel patches, 4,096 tokens.
+    hp.spatial_merge_size = 2;
+    hp.image_max_pixels = 4096 * 32 * 32;
+    assert_eq!(hp.max_image_tokens(), 4096);
 }
 
 /// A Gemma 4 checkpoint's tower (`LEGION_TEST_VISION_HF=<dir>`, opened by

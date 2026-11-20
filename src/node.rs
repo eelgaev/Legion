@@ -28,7 +28,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// Frames before this version are refused: both ranks must run the same build.
-const VERSION: u32 = 11;
+const VERSION: u32 = 12;
 
 /// The node settings of a `legion serve` (`--node-rank`, `--node-peer`, `--node-split`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,12 +102,15 @@ pub enum Request {
     },
     /// Tensor parallelism over machines ([`crate::tp_net`]), rank 0 to each other rank: the
     /// first frame on the control connection (answered with [`Reply::Hello`]).
+    /// `image_step`: the most tokens of one image rank 0's steps take whole (#1217, 0 without
+    /// images): the rank's sliding-window rings must hold such a step.
     TpHello {
         version: u32,
         n_ranks: u32,
         rank: u32,
         n_layer: u32,
         n_blocks: u32,
+        image_step: u32,
     },
     /// The same step as rank 0's, with the executor settings that cut a step into passes
     /// (each pass's all-reduces must line up on every rank): the micro-chunk and its taper,
@@ -527,8 +530,9 @@ impl Request {
                 rank,
                 n_layer,
                 n_blocks,
+                image_step,
             } => {
-                for v in [version, n_ranks, rank, n_layer, n_blocks] {
+                for v in [version, n_ranks, rank, n_layer, n_blocks, image_step] {
                     put_u32(&mut head, v);
                 }
                 K_TP_HELLO
@@ -692,6 +696,7 @@ impl Request {
                 rank: r.u32()?,
                 n_layer: r.u32()?,
                 n_blocks: r.u32()?,
+                image_step: r.u32()?,
             },
             K_TP_STEP => Request::TpStep {
                 groups: get_groups(&mut r)?,
@@ -1223,13 +1228,39 @@ pub fn hello(n_layer: usize, split: usize, n_blocks: usize) -> Request {
 }
 
 /// The `TpHello` rank 0 sends each other rank of tensor parallelism over machines.
-pub fn tp_hello(n_ranks: usize, rank: usize, n_layer: usize, n_blocks: usize) -> Request {
+pub fn tp_hello(
+    n_ranks: usize,
+    rank: usize,
+    n_layer: usize,
+    n_blocks: usize,
+    image_step: usize,
+) -> Request {
     Request::TpHello {
         version: VERSION,
         n_ranks: n_ranks as u32,
         rank: rank as u32,
         n_layer: n_layer as u32,
         n_blocks: n_blocks as u32,
+        image_step: image_step as u32,
+    }
+}
+
+/// A rank's check that its sliding-window rings (`ring`, for a window of `window` positions)
+/// hold rank 0's image steps of up to `image_step` tokens (#1217): `Ok` without rings (the
+/// whole context is kept) or images.
+pub fn check_tp_image_step(
+    ring: Option<crate::model::core::KvRing>,
+    window: usize,
+    image_step: usize,
+) -> Result<(), String> {
+    match ring {
+        Some(r) if image_step > 0 && !r.holds(window, image_step) => Err(format!(
+            "rank 0 runs images of up to {image_step} tokens in one step, this rank's \
+             sliding-window rings ({} positions for a {window}-position window) hold less: \
+             give every rank the same --mmproj (the other ranks only read its image limits)",
+            r.positions()
+        )),
+        _ => Ok(()),
     }
 }
 

@@ -172,7 +172,8 @@ impl Media {
     /// tokens see each other must be in one step, as llama.cpp's non-causal image batch):
     /// `end` itself, or the start of the image it cuts, or for an image the chunk starts with,
     /// its end when that is at most `cap` tokens past `from` (else `end`: such an image is
-    /// cut).
+    /// cut). The planner's `cap` is the step's room or the largest image the tower takes,
+    /// whichever is more (the rings hold both), so no image is cut.
     pub fn uncut(&self, from: usize, end: usize, cap: usize) -> usize {
         let Some(s) = (self.spans.iter()).find(|s| s.start < end && end < s.end()) else {
             return end;
@@ -186,17 +187,19 @@ impl Media {
         }
     }
 
-    /// `sizes`, pieces of a prompt chunk from token `from` on, with no cut inside an image that
-    /// fits a piece (a step's micro-chunks run one after another, so an image cut there would
-    /// see only its first part's keys). No piece is longer than the largest of `sizes` (the
-    /// sliding-window rings hold a micro-chunk, [`KvRing`](super::KvRing)): each runs to the
-    /// next cut of `sizes`, at most that far on; a cut inside an image that fits moves back to
-    /// the image's start, or, when the piece starts with the image, on to its end. An image
-    /// longer than the largest size keeps the cuts, as a step cuts one longer than the step
-    /// ([`Self::uncut`]). The same pieces when no cut falls inside an image that fits.
-    pub fn uncut_sizes(&self, from: usize, sizes: &[usize]) -> Vec<usize> {
+    /// `sizes`, pieces of a prompt chunk from token `from` on, with no image cut (a step's
+    /// micro-chunks run one after another, so an image cut there would see only its first
+    /// part's keys). Each piece runs to the next cut of `sizes`, at most the largest of them
+    /// on; a cut inside an image moves back to the image's start, or, when the piece starts
+    /// with the image, on to its end. An image's piece is so at most the largest of `sizes` or
+    /// `image` tokens (the largest image the tower takes), which the sliding-window rings hold
+    /// ([`KvRing`](super::KvRing)); an image longer than both keeps the cuts, as a step cuts
+    /// one longer than its cap ([`Self::uncut`]). The same pieces when no cut falls inside an
+    /// image.
+    pub fn uncut_sizes(&self, from: usize, sizes: &[usize], image: usize) -> Vec<usize> {
         let n: usize = sizes.iter().sum();
         let cap = sizes.iter().copied().max().unwrap_or(0);
+        let whole = cap.max(image);
         let cuts: Vec<usize> = (sizes.iter())
             .scan(0, |at, &len| {
                 *at += len;
@@ -213,10 +216,10 @@ impl Media {
                 && let Some(s) = (self.spans.iter()).find(|s| s.start < at && at < s.end())
             {
                 if s.start > from + p {
-                    if s.end() - s.start <= cap {
+                    if s.end() - s.start <= whole {
                         c = s.start - from;
                     }
-                } else if s.end() - (from + p) <= cap {
+                } else if s.end() - (from + p) <= whole {
                     c = (s.end() - from).min(n);
                 }
             }

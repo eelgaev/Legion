@@ -985,3 +985,132 @@ fn tp_halves_switch() {
     assert!(!tp_halves_of(Some("0")));
     assert_eq!(TP_HALF_MIN, 1024);
 }
+
+/// #1217: an image's tokens see the whole image on the sliding-window layers, so the
+/// planner's steps give the outputs of one step of the whole prompt only when no step cuts the
+/// image and the rings hold its step. 40 text tokens, a 12 × 12 image (144 tokens, longer than
+/// the 16-token steps and than rings sized for them hold past the 8-position window: 128
+/// positions), 10 text tokens. Steps of 16 that cut the image differ; steps that stop at it
+/// and take it whole through rings sized for 16-token steps differ (the step overwrites keys
+/// its first rows read); the same steps through rings that hold it ([`ring_hold`]) match.
+///
+/// [`ring_hold`]: crate::engine::lm::ring_hold
+#[test]
+fn whole_images_match_one_step() {
+    use crate::ggml::Backend;
+    use crate::model::core::{
+        Attention, Executor, Group, ImageSpan, KvRing, Logits, Media, SeqInput,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tiny.gguf");
+    tiny::write_dense(&path, 5).unwrap();
+    let gguf = crate::gguf::GgufFile::open(&path).unwrap();
+    let window = tiny::WINDOW as usize;
+    let (start, nx, ny, room) = (40, 12, 12, 16);
+    let image = nx * ny;
+    let n = start + image + 10;
+    let prompt: Vec<u32> = (0..n).map(|i| ((i * 7 + 3) % 50) as u32).collect();
+    let blocks: Vec<u32> = (0..8).collect();
+    let run = |ring: Option<KvRing>, steps: &[usize]| -> Vec<f32> {
+        assert_eq!(steps.iter().sum::<usize>(), n);
+        let mut b = Backend::cpu().unwrap();
+        b.set_threads(2);
+        let host = Backend::cpu().unwrap().buffer_type();
+        let mut m = Model::load(&gguf, |info| match Model::placement(&info.name, false) {
+            crate::model::core::Placement::Host => host,
+            crate::model::core::Placement::Device => b.buffer_type(),
+        })
+        .unwrap();
+        assert!(m.hp.arch.image_tokens_bidirectional());
+        m.set_cell_gather(true);
+        let n_layer = m.hp.n_layer;
+        let n_embd = m.hp.n_embd as usize;
+        let rows: Vec<f32> = (0..image * n_embd)
+            .map(|i| ((i * 37 + 11) % 101) as f32 / 50.0 - 1.0)
+            .collect();
+        let media = Media::sequential(
+            vec![ImageSpan {
+                start,
+                nx,
+                ny,
+                rows: rows.into(),
+            }],
+            n_embd,
+        );
+        let mut exec =
+            Executor::new_staged_ring(m, vec![(b, 0..n_layer)], 8, 2, 0, ring, Default::default())
+                .unwrap();
+        exec.set_attention(Attention::Gather);
+        exec.capture_hidden(vec![n_layer - 1]);
+        let mut hidden = Vec::new();
+        let mut n_past = 0;
+        for &len in steps {
+            let r = exec
+                .step(&[Group {
+                    slot: 0,
+                    verify: false,
+                    seqs: vec![SeqInput {
+                        tokens: &prompt[n_past..n_past + len],
+                        n_past,
+                        blocks: &blocks,
+                        ring: 0,
+                        logits: Logits::Greedy,
+                        media: Some(&media),
+                    }],
+                }])
+                .unwrap();
+            hidden.extend_from_slice(&r.hidden[0]);
+            n_past += len;
+        }
+        hidden
+    };
+    // The planner's steps (`Worker::plan_step`) with the largest image `image_step`.
+    let plan = |image_step: usize| {
+        let m = Media::sequential(
+            vec![ImageSpan {
+                start,
+                nx,
+                ny,
+                rows: vec![0.0; image].into(),
+            }],
+            1,
+        );
+        let mut steps = Vec::new();
+        let mut p = 0;
+        while p < n {
+            let end = m.uncut(p, (p + room).min(n), room.max(image_step));
+            steps.push(end - p);
+            p = end;
+        }
+        steps
+    };
+    let whole = plan(image);
+    assert_eq!(whole, vec![16, 16, 8, 144, 10]);
+    let cut = plan(0);
+    assert!(cut.iter().all(|&s| s <= room), "{cut:?}");
+    let reference = run(None, &[n]);
+    let diff = |h: &[f32]| {
+        assert_eq!(h.len(), reference.len());
+        let d = (reference.iter().zip(h))
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        d / reference
+            .iter()
+            .map(|a| a.abs())
+            .fold(0.0, f32::max)
+            .max(1.0)
+    };
+    let text_rings = KvRing::for_window(window, room, 1);
+    assert_eq!(text_rings.positions(), 128);
+    let rings = KvRing::for_window(window, crate::engine::lm::ring_hold(room, 0, image), 1);
+    assert!(rings.holds(window, image) && !text_rings.holds(window, image));
+    let d = diff(&run(Some(text_rings), &cut));
+    assert!(d > 1e-2, "cut image: relative max |diff| {d}");
+    let d = diff(&run(Some(text_rings), &whole));
+    assert!(
+        d > 1e-2,
+        "whole image, rings too short: relative max |diff| {d}"
+    );
+    let d = diff(&run(Some(rings), &whole));
+    assert!(d <= 1e-3, "whole image: relative max |diff| {d}");
+}

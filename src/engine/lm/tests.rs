@@ -278,6 +278,32 @@ fn ring_steps_shrink_only_until_the_context_fits() {
     assert_eq!(fitting_ring_step(300, 512, |_| false), 300);
 }
 
+/// #1217: with a Gemma 4 tower the sliding-window rings hold its largest image (1,120 tokens)
+/// in one step; without one (0) the ring steps as before. Gemma 4 31B (a 1,024-position
+/// window, 819,200 bytes a position over its sliding layers at F16): 512-token steps grow
+/// from 1,600 to 2,240 positions, 500 MiB a sequence; 2,048- and 4,096-token steps (a GPU
+/// sharing the host's memory) already hold it.
+#[test]
+fn rings_hold_the_largest_image() {
+    assert_eq!(ring_hold(512, 0, 0), 512);
+    assert_eq!(ring_hold(512, 3, 0), 512);
+    assert_eq!(ring_hold(2, 3, 0), 4);
+    assert_eq!(ring_hold(512, 3, 1120), 1120);
+    assert_eq!(ring_hold(2048, 3, 1120), 2048);
+    let positions = |step, image| KvRing::for_window(1024, ring_hold(step, 3, image), 16);
+    assert_eq!(positions(512, 0).positions(), 1600);
+    assert_eq!(positions(512, 1120).positions(), 2240);
+    assert_eq!((2240 - 1600) * 819_200, 500 << 20);
+    for step in [2048, 4096] {
+        assert_eq!(positions(step, 1120), positions(step, 0));
+    }
+    assert_eq!(positions(2048, 1120).positions(), 3136);
+    assert_eq!(positions(4096, 1120).positions(), 5184);
+    // Rings sized so hold the image step, text-sized ones do not.
+    assert!(positions(512, 1120).holds(1024, 1120));
+    assert!(!positions(512, 0).holds(1024, 1120));
+}
+
 /// `--tp` plans dense Gemma 4 only, and sizes the cache itself: other architectures, Gemma 4
 /// with experts, drafter models and `--kv-cache-tokens` are load errors (before any GPU is
 /// looked for).

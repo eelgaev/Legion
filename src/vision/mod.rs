@@ -124,6 +124,14 @@ impl VisionHparams {
         Ok(hp)
     }
 
+    /// The most tokens one image takes: the pixel budget over a token's pixels (the resize
+    /// keeps every image within the budget, [`preprocess`], and each token is a merged patch).
+    /// Gemma 4's: 1,120 by default.
+    pub fn max_image_tokens(&self) -> usize {
+        let f = self.patch_size as usize * self.spatial_merge_size as usize;
+        self.image_max_pixels as usize / (f * f).max(1)
+    }
+
     pub(super) fn validate(&self) -> Result<(), VisionError> {
         if self.patch_size == 0
             || self.spatial_merge_size == 0
