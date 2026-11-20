@@ -359,6 +359,89 @@ pub fn finish_add<'a>(
     out
 }
 
+/// [`finish_add`] with the norm `norm` of the sums too, in the same kernel
+/// ([`super::Norm`], #1133): the node holds [`super::op::norm_layout`]'s bytes for `width` tokens,
+/// this finish writes its tokens `at..at + cols` of each part; `into` is a normed finish of the
+/// same `width` and norm ahead of this one (the node then writes into its memory). Returns the
+/// node; [`super::normed`] of the last finish gives the views.
+pub fn finish_add_norm<'a>(
+    ctx: &'a Context,
+    s: Started<'a>,
+    res: Tensor<'a>,
+    width: i64,
+    at: i64,
+    into: Option<Tensor<'a>>,
+    norm: super::Norm<'a>,
+) -> Tensor<'a> {
+    assert!(
+        s.p.reduce,
+        "tp micro exchange: only an all-reduce adds a residual"
+    );
+    let [row, cols] = [s.x.ne()[0], s.x.ne()[1]];
+    assert_eq!(res.ty(), types::F32, "tp micro exchange: an F32 residual");
+    assert_eq!(
+        res.ne(),
+        [row, cols, 1, 1],
+        "tp micro exchange: the residual's shape"
+    );
+    assert!(
+        at >= 0 && at + cols <= width,
+        "tp micro exchange: columns {at}..{} of {width}",
+        at + cols
+    );
+    assert_eq!(
+        norm.w.elements(),
+        row as usize,
+        "tp micro exchange: the norm's weight"
+    );
+    let res = if res.is_contiguous() {
+        res
+    } else {
+        ctx.cont(res)
+    };
+    let (_, _, total) = super::op::norm_layout(row as usize, width as usize, norm.bf16);
+    let mut args = vec![s.x, s.node, res, norm.w];
+    if let Some(t) = into {
+        assert_eq!(
+            (t.ty(), t.ne()),
+            (types::I8, [total as i64, 1, 1, 1]),
+            "tp micro exchange: the shared normed output"
+        );
+        args.push(t);
+    }
+    let mut p = s.p.list().to_vec();
+    p.extend([1, at as i32]);
+    p.extend(norm.params());
+    let out = ctx.external_with(&FINISH, types::I8, [total as i64, 1, 1, 1], &args, &p);
+    if let Some(t) = into {
+        // As in `finish`: the node writes its parts into `t`'s memory.
+        // SAFETY: a fresh node, not allocated yet; `t` is a node of the same graph, ahead of
+        // it (one of its sources) and of its size.
+        unsafe {
+            let raw = out.raw();
+            (*raw).view_src = t.raw();
+            (*raw).view_offs = 0;
+        }
+    }
+    out
+}
+
+/// A finish node's norm ([`finish_add_norm`]) and its node's tokens.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn norm_of(dst: &ffi::ggml_tensor) -> Option<(super::op::NormParams, usize)> {
+    let p = external_params(dst);
+    if p[ADD_PARAMS] == 0 {
+        return None;
+    }
+    // SAFETY: a node of `finish_add_norm`, whose source 3 is the norm's weight.
+    let nm = super::op::NormParams::of([p[ADD_PARAMS + 2], p[ADD_PARAMS + 3]], || unsafe {
+        (*dst.src[3]).data as usize
+    })?;
+    // SAFETY: as above; its source 0 is the partial.
+    let row = unsafe { (*dst.src[0]).ne[0] as usize };
+    Some((nm, super::op::norm_width(dst.ne[0] as usize, row, nm.bf16)))
+}
+
 /// A finish node's residual (the device address of its source 2, [`finish_add`]) and the
 /// column its sums go to (0 without a residual).
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
@@ -383,15 +466,20 @@ unsafe fn cpu_finish(dst: &ffi::ggml_tensor, ith: usize, _nth: usize) {
     }
     let p = Params::of(dst);
     let (res, at) = add_of(dst);
-    // SAFETY: a node of `finish` or `finish_add` on the CPU: contiguous F32 source, output
-    // (and residual, of the source's size) with host data.
+    let norm = norm_of(dst);
+    // SAFETY: a node of `finish`, `finish_add` or `finish_add_norm` on the CPU: contiguous F32
+    // source, output (its sums; and residual, of the source's size) with host data.
     let (src, out, row, res) = unsafe {
         let src = &*dst.src[0];
         let len = ffi::ggml_nelements(src) as usize;
+        let (row, vals) = match norm {
+            Some((_, width)) => (src.ne[0] as usize, src.ne[0] as usize * width),
+            None => (dst.ne[0] as usize, ffi::ggml_nelements(dst) as usize),
+        };
         (
             std::slice::from_raw_parts(src.data as *const f32, len),
-            std::slice::from_raw_parts_mut(dst.data as *mut f32, ffi::ggml_nelements(dst) as usize),
-            dst.ne[0] as usize,
+            std::slice::from_raw_parts_mut(dst.data as *mut f32, vals),
+            row,
             res.map(|r| std::slice::from_raw_parts(r as *const f32, len)),
         )
     };
@@ -402,6 +490,11 @@ unsafe fn cpu_finish(dst: &ffi::ggml_tensor, ith: usize, _nth: usize) {
             let _ = c.all_reduce_host_as(src, out, row * p.n);
             if let Some(res) = res {
                 super::op::add_host(out, res);
+            }
+            if let Some((nm, width)) = norm {
+                // SAFETY: the node holds `norm_layout`'s bytes for `width` tokens; the weight
+                // has a row of host values.
+                unsafe { super::op::norm_host(out, &nm, row, (at, width), dst.data as *mut u8) };
             }
         }
         Some(c) => {

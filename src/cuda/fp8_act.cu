@@ -13,6 +13,10 @@
 //                                                       of fused.cu's rms_norm_bf16_kernel)
 // - gate:       y = op(x) * g, op sigmoid or SiLU       (the attention output gate, SwiGLU)
 // - gated_norm: y = rms_norm(o) * w * gate(z) per head  (a gated DeltaNet layer's output norm)
+// - sum_norm:   rms_norm's row of x = the tensor-parallel sum of the ranks' partials (+ a
+//               residual), x written out too (#1133: the finish of an all-reduce, src/tp_net,
+//               with the next layer's input norm; x has the bits of tp_net.cu's sums, every
+//               value the same additions in the same order)
 //
 // y has the bits of the ggml chain the graph builds otherwise (and of fused.cu's BF16 kernels,
 // which compute the same values before their cast): thread tid holds columns tid, tid + BLOCK,
@@ -47,7 +51,14 @@ struct legion_fp8_act {
     int32_t d;         // gate: the head width; gated_norm: head_v
     int32_t silu;      // gate, gated_norm: SiLU instead of sigmoid
     float eps;         // rms_norm, gated_norm
-    uint16_t * bf;     // rms_norm: also y in BF16, [k, n] contiguous (null: not)
+    uint16_t * bf;     // rms_norm, sum_norm: also y in BF16, [k, n] contiguous (null: not)
+    // sum_norm: x's row t is the sum of srcs[0..n_src] (rows of k values, F32 or with src_bf16
+    // BF16) in that order, then + res's (null: none); written to xs (F32 [k, n] contiguous).
+    const void * srcs[8];
+    int32_t n_src;
+    int32_t src_bf16;
+    const float * res;
+    float * xs;
 };
 
 // 0 on success; 1 for a shape this file does not take (the caller builds the unfused ops);
@@ -62,6 +73,7 @@ constexpr int FP8_ACT_PLAIN = 0;
 constexpr int FP8_ACT_RMS_NORM = 1;
 constexpr int FP8_ACT_GATE = 2;
 constexpr int FP8_ACT_GATED_NORM = 3;
+constexpr int FP8_ACT_SUM_NORM = 4;
 
 // Most values per thread (columns per row: 24 * 1024).
 constexpr int MAX_NV = 24;
@@ -89,6 +101,33 @@ __device__ __forceinline__ float gate_of(float v, int silu) {
     return silu ? v / (1.0f + expf(-v)) : 1.0f / (1.0f + expf(-v));
 }
 
+// sum_norm's x at offset o: tp_net.cu's tp_sum (F32) or tp_sum_bf16 (BF16 partials), the
+// partials in rank order, then the residual, one rounding each.
+__device__ __forceinline__ float sum_at(const legion_fp8_act & p, int64_t o) {
+    float acc;
+    if (p.src_bf16) {
+        acc = __bfloat162float(((const __nv_bfloat16 *) p.srcs[0])[o]);
+#pragma unroll
+        for (int r = 1; r < 8; ++r) {
+            if (r < p.n_src) {
+                acc = __fadd_rn(acc, __bfloat162float(((const __nv_bfloat16 *) p.srcs[r])[o]));
+            }
+        }
+    } else {
+        acc = ((const float *) p.srcs[0])[o];
+#pragma unroll
+        for (int r = 1; r < 8; ++r) {
+            if (r < p.n_src) {
+                acc = __fadd_rn(acc, ((const float *) p.srcs[r])[o]);
+            }
+        }
+    }
+    if (p.res != nullptr) {
+        acc = __fadd_rn(acc, p.res[o]);
+    }
+    return acc;
+}
+
 template <int BLOCK, int NV, int KIND>
 __global__ void __launch_bounds__(BLOCK) fp8_act_kernel(const legion_fp8_act p) {
     __shared__ float s_sum[KIND == FP8_ACT_GATED_NORM ? NV : 1][32];
@@ -99,22 +138,30 @@ __global__ void __launch_bounds__(BLOCK) fp8_act_kernel(const legion_fp8_act p) 
     const int k = p.k;
     float v[NV];
 
-    if constexpr (KIND == FP8_ACT_PLAIN || KIND == FP8_ACT_RMS_NORM) {
-        const float * row = p.x + t * p.x_ld;
+    if constexpr (KIND == FP8_ACT_PLAIN || KIND == FP8_ACT_RMS_NORM || KIND == FP8_ACT_SUM_NORM) {
+        constexpr bool NORM = KIND != FP8_ACT_PLAIN;
+        const float * row = KIND == FP8_ACT_SUM_NORM ? nullptr : p.x + t * p.x_ld;
         float tmp = 0.0f;
 #pragma unroll
         for (int i = 0; i < NV; i++) {
             const int col = tid + i * BLOCK;
             v[i] = 0.0f;
             if (col < k) {
-                const float xi = row[col];
+                float xi;
+                if constexpr (KIND == FP8_ACT_SUM_NORM) {
+                    const int64_t o = t * k + col;
+                    xi = sum_at(p, o);
+                    p.xs[o] = xi;
+                } else {
+                    xi = row[col];
+                }
                 v[i] = xi;
-                if constexpr (KIND == FP8_ACT_RMS_NORM) {
+                if constexpr (NORM) {
                     tmp += xi * xi;
                 }
             }
         }
-        if constexpr (KIND == FP8_ACT_RMS_NORM) {
+        if constexpr (NORM) {
             // ggml-cuda's rms_norm_f32: block_reduce (warp sums, then warp 0's sum of them).
             tmp = warp_sum(tmp);
             if (BLOCK > 32) {
@@ -271,6 +318,13 @@ int legion_fp8_act_launch(const legion_fp8_act * p, void * stream) {
             // ggml-cuda's rms_norm block: 256 threads below 1024 columns, 1024 from there on.
             return p->k < 1024 ? launch_nv<256, FP8_ACT_RMS_NORM, 4>(*p, st)
                                : launch_nv<1024, FP8_ACT_RMS_NORM, MAX_NV>(*p, st);
+        case FP8_ACT_SUM_NORM:
+            // rms_norm's blocks (its sums' order).
+            if (p->n_src < 1 || p->n_src > 8) {
+                return 1;
+            }
+            return p->k < 1024 ? launch_nv<256, FP8_ACT_SUM_NORM, 4>(*p, st)
+                               : launch_nv<1024, FP8_ACT_SUM_NORM, MAX_NV>(*p, st);
         case FP8_ACT_GATE:
             if (p->d < 1) {
                 return 1;

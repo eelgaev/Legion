@@ -296,6 +296,22 @@ impl Linear {
         }
     }
 
+    /// Whether [`Self::mul_mat`] of the FP8 weight `name` (`w`; `has_input_scale`: it has a
+    /// static activation scale) over an F32 batch of `n` tokens reads per-token FP8 activations
+    /// ([`Fp8Route::Dynamic`]), e.g. the packed activations a norm shares
+    /// ([`crate::model::fp8_act::share`]).
+    pub(crate) fn reads_dynamic(
+        &self,
+        name: &str,
+        w: Tensor<'_>,
+        has_input_scale: bool,
+        n: i64,
+    ) -> bool {
+        let dynamic_ok = || !w.is_host() && crate::model::fp8::fp8_mma();
+        self.fp8.contains(name)
+            && self.fp8_route(n, w.ne()[0], has_input_scale, dynamic_ok) == Fp8Route::Dynamic
+    }
+
     /// Whether `w @ x` for `n` tokens runs on Legion's W4A16 NVFP4 kernels
     /// ([`crate::model::nvfp4_mm`]): an NVFP4 weight on a GPU that keeps 8-bit or wider
     /// activations, a batch [`Nvfp4Mm`] gives to them and a per-tensor (or per-expert) scale.

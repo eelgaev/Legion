@@ -223,3 +223,86 @@ fn halves_finish_add_into_one_output() {
         }
     }
 }
+
+/// The finishes that compute the next norm too (#1133): an odd step's halves
+/// (`finish_add_norm`, with the BF16 rows) and the plain `all_reduce_add_norm` (codes only)
+/// give the sums, codes, scales and BF16 rows of the separate ops (the all-reduce plus the
+/// residual, then `fp8_act`'s norm ops) through a CPU graph on two ranks.
+#[test]
+fn finishes_with_the_norm_match_the_separate_ops() {
+    use crate::ggml::{Backend, ComputeAllocator};
+    use crate::model::fp8_act;
+    use crate::tp_net::{Norm, all_reduce, all_reduce_add_norm, normed};
+    let (row, n) = (8usize, 9i64);
+    let (n0, n1) = (n / 2, n - n / 2);
+    let len = row * n as usize;
+    let eps = 1e-6f32;
+    let value = |r: usize, k: usize, i: usize| {
+        let x = ((i * 7 + k * 13 + r * 31) % 97) as f32;
+        if r == 0 {
+            x * 1e3 - 4e4
+        } else {
+            x * 0.3 + 1e-3
+        }
+    };
+    let comms = super::super::tests::comms(2, std::time::Duration::from_secs(20));
+    let threads: Vec<_> = comms
+        .into_iter()
+        .enumerate()
+        .map(|(r, c)| {
+            std::thread::spawn(move || {
+                let handle = super::super::register(c);
+                let id = handle.id();
+                let mut backend = Backend::cpu().unwrap();
+                let ctx = Context::new(64, 64);
+                let x = ctx.new_tensor(types::F32, &[row as i64, n]).as_input();
+                let res = ctx.new_tensor(types::F32, &[row as i64, n]).as_input();
+                let w = ctx.new_tensor(types::F32, &[row as i64]).as_input();
+                let half = |t, a: i64, c: i64| {
+                    ctx.view_2d(t, [row as i64, c], row * 4, a as usize * row * 4)
+                };
+                let norm = |bf16| Norm { w, eps, bf16 };
+                let mut graph = ctx.new_graph(64);
+                let s0 = all_reduce_start(&ctx, id, half(x, 0, n0), n as usize);
+                let s1 = all_reduce_start(&ctx, id, half(x, n0, n1), n as usize);
+                graph.expand(s0.node);
+                graph.expand(s1.node);
+                let f0 = finish_add_norm(&ctx, s0, half(res, 0, n0), n, 0, None, norm(true));
+                graph.expand(f0);
+                let f1 = finish_add_norm(&ctx, s1, half(res, n0, n1), n, n0, Some(f0), norm(true));
+                graph.expand(f1);
+                let hv = normed(&ctx, f1, row as i64, n, true);
+                let pv = all_reduce_add_norm(&ctx, id, x, res, norm(false));
+                let y = ctx.add(all_reduce(&ctx, id, x), res);
+                let (q, b) = fp8_act::rms_norm_bf16(&ctx, y, w, eps);
+                let q2 = fp8_act::rms_norm(&ctx, y, w, eps);
+                let outs = [hv.y, hv.q, hv.b.unwrap(), pv.y, pv.q, y, q, b, q2];
+                for t in outs {
+                    graph.expand(t.as_output());
+                }
+                ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+                    .unwrap();
+                w.set_f32(&(0..row).map(|i| 0.5 + i as f32 * 0.25).collect::<Vec<_>>());
+                let mut out = Vec::new();
+                for k in 0..3 {
+                    x.set_f32(&(0..len).map(|i| value(r, k, i)).collect::<Vec<_>>());
+                    res.set_f32(&(0..len).map(|i| value(1, k + 5, i)).collect::<Vec<_>>());
+                    backend.compute(&graph).unwrap();
+                    out.push(outs.map(|t| t.bytes()));
+                }
+                assert!(handle.comm().error().is_none());
+                out
+            })
+        })
+        .collect();
+    let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    for (k, r0) in results[0].iter().enumerate() {
+        let [hy, hq, hb, py, pq, y, q, b, q2] = r0;
+        assert_eq!(hy, y, "halves' sums, round {k}");
+        assert_eq!(hq, q, "halves' codes, round {k}");
+        assert_eq!(hb, b, "halves' BF16 rows, round {k}");
+        assert_eq!(py, y, "plain sums, round {k}");
+        assert_eq!(pq, q2, "plain codes, round {k}");
+        assert_eq!(&results[1][k], r0, "rank 1, round {k}");
+    }
+}
