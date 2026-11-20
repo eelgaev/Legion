@@ -131,10 +131,11 @@ pub(super) struct ModelArgs {
         conflicts_with = "model"
     )]
     pub hfmodel: Option<String>,
-    /// A vision projector (mmproj GGUF, `qwen3vl_merger`, e.g. unsloth's `mmproj-F16.gguf`) for
-    /// a Qwen3.5 / Qwen3.6 / Qwen3.8-Flash-Next model: requests may then carry images (all
-    /// three APIs and the web UI), and the model advertises vision. Its tower runs on the CPU
-    /// (up to 8 threads), seconds per image. Default: an HF checkpoint's own vision tower
+    /// A vision projector (mmproj GGUF, `qwen3vl_merger`, e.g. unsloth's `mmproj-F16.gguf` or
+    /// `mmproj-BF16.gguf`) for a Qwen3.5 / Qwen3.6 / Qwen3.8-27B / Qwen3.8-Flash-Next model:
+    /// requests may then carry images (all three APIs and the web UI), and the model advertises
+    /// vision. Its tower runs on the model's first GPU (sm_70 or newer), else on the CPU (up to
+    /// 8 threads, seconds per image). Default: an HF checkpoint's own vision tower
     /// (`model.visual.*`) when it ships one, else none (text only).
     #[arg(long, value_name = "GGUF", conflicts_with = "no_mmproj")]
     pub mmproj: Option<PathBuf>,
@@ -759,17 +760,28 @@ pub(super) struct ModelArgs {
     /// With --tp-mtp-chain, a decode draft round's rows from the verify step too (#1176).
     #[arg(long)]
     pub tp_mtp_local_rows: bool,
-    /// With --tp-rank on two machines, on rank 0, Qwen3.8-Flash-Next (qwen4exp) with a plain
-    /// output head (the NVFP4 checkpoint's BF16 head): a decode or verify step whose rows are
+    /// With --tp-rank on two machines, on rank 0, Qwen3.8-Flash-Next (qwen4exp) or Gemma 4
+    /// with a plain output head (the NVFP4 checkpoints' BF16 heads; Gemma's is tied to the
+    /// embeddings, 2.8 GB on the 31B): a decode or verify step whose rows are
     /// all greedy picks computes its output head as two shares of the vocabulary, one on each
     /// rank, instead of all of it on rank 0 while the other rank waits. Each rank finds its
     /// share's best token per row (by value, then the device argmax's tie order), rank 1
     /// answers the step with its candidates and rank 0 keeps the better one: the same pick as
-    /// the whole head's. The head reads its whole weight every step (1.27 GB on this model),
-    /// so each rank reads half of it. Steps with sampled rows, log probabilities or picks below
+    /// the whole head's. The head reads its whole weight every step (1.27 GB on
+    /// Qwen3.8-Flash-Next), so each rank reads half of it. Steps with sampled rows, log probabilities or picks below
     /// min_tokens keep the whole head on rank 0. Off (default): rank 0 computes the head.
     #[arg(long)]
     pub tp_head_split: bool,
+    /// With --tp-rank and --spec dflash (a Hugging Face drafter checkpoint): split the
+    /// drafter's FFN over the ranks like the target's. Without it rank 0 runs every draft
+    /// pass alone while the other ranks wait. With it each rank holds its share of every
+    /// drafter layer's FFN rows (the rest of the drafter whole, the head on rank 0 only in
+    /// use), every rank runs each draft round, and one all-reduce per drafter layer adds the
+    /// FFN outputs. The sums' order changes, so drafts (and with them acceptance and greedy
+    /// output) may differ in bits from rank 0 drafting alone. Every rank must pass it. Off
+    /// by default.
+    #[arg(long, requires = "tp_rank")]
+    pub tp_draft_split: bool,
     /// With --tp-rank, Qwen3.8-Flash-Next (qwen4exp): expert parallelism for the routed
     /// experts. Rank r of n holds the experts r*E/n .. (r+1)*E/n whole (the checkpoint's bytes
     /// as shipped, cut by expert index) instead of every expert's 1/n of the rows, and runs
@@ -1097,6 +1109,8 @@ impl ModelArgs {
             lend_spread: self.prefill_keep_spread,
             lend_repack: self.prefill_keep_repack,
             lend_need: Vec::new(),
+            lend_spread_upto: usize::MAX,
+            route_gate: 0,
             stage_below: None,
             learn_long: !self.no_prefill_learn,
             cpu_share: legion::residency::cpu_share::CpuShareConfig {
@@ -1338,7 +1352,8 @@ struct EngineArgs {
     /// least this many tokens left borrows the expert cache too, for staging only: its steps
     /// keep the chunks they have without a lend, so the same outputs (0: never). Default: 128
     /// for GLM-5.3-Flash over several GPUs, where a short prompt's in-place expert reads are
-    /// slow, 0 for other models.
+    /// slow, and on one GPU whose prompt steps copy only the experts they route to (every
+    /// routed expert in host memory, or the host expert tier), 0 otherwise.
     #[arg(long, value_name = "N")]
     short_prompt_tokens: Option<usize>,
     /// Model engine: tokens per forward pass while a long prompt borrows the cache.
@@ -2216,6 +2231,7 @@ pub async fn run(
                     moe_ep: e.model.tp_moe_ep,
                     overlap: e.model.tp_overlap,
                     moe_ep_place: moe_ep_place.clone(),
+                    draft_split: e.model.tp_draft_split,
                 }),
                 glm_parallel_decode: e.model.glm_parallel_decode,
                 tp_per_gpu: e.model.tp_per_gpu,

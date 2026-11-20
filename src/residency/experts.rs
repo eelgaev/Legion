@@ -573,6 +573,115 @@ impl Layer {
             .collect()
     }
 
+    /// The experts [`Self::stage_copies`] copies, as a routing-gated row
+    /// ([`super::route_gate`]; no pieces): each with its staged id and host bytes, and the
+    /// pads it zeroes for the quantized matmuls' reads past an expert's last row.
+    #[cfg(feature = "cuda")]
+    fn gate_row(&self) -> super::route_gate::GateRow {
+        use super::route_gate::{Entry, GateRow, Kind};
+        let n_slots = self.slots.n_slots();
+        let n_expert = self.slots.n_expert();
+        let packed = !self.stage_ids.is_empty();
+        let kinds: [Kind; 3] = std::array::from_fn(|k| {
+            // SAFETY: reading the data pointer of a live tensor.
+            let staged =
+                unsafe { (*self.staged[k].tensor(KINDS[k]).expect("staged").raw()).data } as usize;
+            let bytes = self.expert_bytes[k];
+            let pad = if self.tensor(k).ne()[0] % 512 != 0 {
+                4096.min(bytes)
+            } else {
+                0
+            };
+            Kind { staged, bytes, pad }
+        });
+        let staged: Vec<(u32, usize)> = if packed {
+            let first = self.stage_first;
+            let ids = self.stage_miss.iter().enumerate();
+            ids.map(|(i, &e)| (e, first + i)).collect()
+        } else {
+            // As `stage_copies`: expert parallelism stages only this entry's own experts.
+            let table = self.slots.table();
+            (0..table.len() as u32)
+                .filter(|&e| {
+                    table[e as usize] as usize >= n_slots && (self.stage_all || self.slots.owns(e))
+                })
+                .map(|e| (e, n_slots + e as usize))
+                .collect()
+        };
+        let entries = staged
+            .into_iter()
+            .map(|(e, id)| Entry {
+                expert: e,
+                id,
+                src: std::array::from_fn(|k| self.addr(k, n_slots + e as usize)),
+            })
+            .collect();
+        let mut fixed = Vec::new();
+        let mut guard = Vec::new();
+        let end = if packed {
+            // As `packed_copies`: the last kept slot's reads into the buffer's head, and the
+            // last packed expert's into its tail.
+            for (k, kind) in kinds.iter().enumerate().filter(|(_, k)| k.pad > 0) {
+                let (at, split) = super::cuda::tiered_split(self.tensor(k)).unwrap_or((0, 0));
+                let head = (at + self.stage_first * kind.bytes).saturating_sub(split);
+                if head > 0 {
+                    fixed.push((kind.staged - at + split, 0, kind.pad.min(head)));
+                }
+            }
+            // Those reads can reach the first packed id, copied in a full pass.
+            guard.push(self.stage_first);
+            self.stage_first + self.stage_miss.len()
+        } else {
+            // As `stage_copies`: the last slot's reads into expert 0's entry, and the last
+            // expert's into the tail.
+            guard.push(n_slots);
+            n_slots + n_expert
+        };
+        for kind in kinds.iter().filter(|k| k.pad > 0) {
+            fixed.push((kind.staged + end * kind.bytes, 0, kind.pad));
+        }
+        GateRow::new(
+            kinds,
+            entries,
+            n_expert,
+            fixed,
+            guard,
+            end,
+            self.slots.heat(),
+        )
+    }
+
+    /// [`Self::gate_row`] with the bounded host tier's sources ([`Self::tier_copies`]): expert
+    /// `i` of [`Self::stage_misses`] from `srcs[i]`, those read from the checkpoint after
+    /// their batch. `None` if the rows do not match.
+    #[cfg(feature = "cuda")]
+    fn tier_gate_row(
+        &self,
+        srcs: &[super::host_tier::PassSrc],
+    ) -> Option<super::route_gate::GateRow> {
+        use super::host_tier::PassSrc;
+        let n_slots = self.slots.n_slots();
+        let experts: Vec<u32> = self.stage_misses().iter().map(|m| m.0).collect();
+        let src = srcs
+            .iter()
+            .map(|s| {
+                let at = match *s {
+                    PassSrc::Ram(at) | PassSrc::Read { at, .. } => at,
+                };
+                std::array::from_fn(|k| self.addr(k, n_slots + at))
+            })
+            .collect();
+        let batch = srcs
+            .iter()
+            .map(|s| match *s {
+                PassSrc::Ram(_) => None,
+                PassSrc::Read { batch, .. } => Some(batch),
+            })
+            .collect();
+        let ram = std::array::from_fn(|k| self.addr(k, n_slots));
+        self.gate_row().with_reads(&experts, src, batch, ram)
+    }
+
     /// [`Self::stage_copies`] with the bounded host tier: expert `i` of [`Self::stage_misses`]
     /// comes from `srcs[i]` ([`super::host_tier::HostTier::stage_pass`]). In order: the zeroed
     /// pads, the experts in RAM slots, then each batch of experts read from the checkpoint
@@ -662,9 +771,10 @@ impl Layer {
     /// Plans packed staging for this lend ([`Self::stage_ids`]) from the current table: the
     /// first packed id is the first whole expert past every kind's kept slots. Returns the
     /// staging buffer bytes per kind it needs (one expert more for the matmuls' reads past
-    /// the last row).
+    /// the last row); `whole`: what a lend that keeps no slot needs, if more (every expert it
+    /// stages packed, [`whole_takes_staging`]).
     #[cfg(feature = "cuda")]
-    fn pack(&mut self) -> [usize; 3] {
+    fn pack(&mut self, whole: bool) -> [usize; 3] {
         let n_slots = self.slots.n_slots();
         let geometry: Vec<(usize, usize)> = (0..3)
             .map(|k| super::cuda::tiered_split(self.tensor(k)).unwrap_or((0, 0)))
@@ -688,7 +798,15 @@ impl Layer {
                 self.stage_miss.push(e as u32);
             }
         }
-        let n_ids = self.stage_first + self.stage_miss.len() + 1;
+        let staged = if whole {
+            let n = self.stage_ids.len() as u32;
+            (0..n)
+                .filter(|&e| self.stage_all || self.slots.owns(e))
+                .count()
+        } else {
+            self.stage_miss.len()
+        };
+        let n_ids = self.stage_first + staged + 1;
         std::array::from_fn(|k| {
             (geometry[k].0 + n_ids * self.expert_bytes[k]).saturating_sub(geometry[k].1)
         })
@@ -918,12 +1036,21 @@ pub struct ExpertResidency {
     /// [`ResidencyConfig::lend_repack`].
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     lend_repack: usize,
+    /// [`ResidencyConfig::lend_spread_upto`].
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    lend_spread_upto: usize,
+    /// [`ResidencyConfig::route_gate`].
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    route_gate: usize,
     /// CUDA devices idle during the passes [`Self::begin_pass`] starts ([`Self::set_idle`]).
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     idle: Vec<usize>,
     /// [`ResidencyConfig::stage_min_tokens`].
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     stage_min: i64,
+    /// A short prompt's lend ([`Self::set_short_lend`]): its steps build an unlent step's ops
+    /// over the staged copies, and stage from [`short_stage_min`] tokens.
+    short_lend: bool,
     /// [`ResidencyConfig::lend_keep`].
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     lend_keep: Vec<u64>,
@@ -1023,6 +1150,11 @@ pub struct TieredLayer<'a> {
     /// [`ResidencyConfig::stage_min_tokens`].
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     stage_min: i64,
+    /// [`ResidencyConfig::route_gate`].
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    route_gate: usize,
+    /// [`ExpertResidency::set_short_lend`].
+    short_lend: bool,
     /// The bounded host tier and this layer in it ([`ExpertResidency::host_tier`]).
     host: Option<(&'a super::host_tier::HostTier, usize)>,
 }
@@ -1030,7 +1162,24 @@ pub struct TieredLayer<'a> {
 /// Steps of at most this many tokens gather their experts first with [`Fetch::Copy`].
 const COPY_MAX_TOKENS: i64 = 8;
 
+/// The fewest tokens a step of a short prompt's lend stages ([`ExpertResidency::set_short_lend`],
+/// #37): one more than any small step's own kernels take (the gather, Legion's expert matvec and
+/// the host's share), so every staged step builds the same products as unlent.
+pub fn short_stage_min() -> i64 {
+    COPY_MAX_TOKENS
+        .max(crate::model::core::expert_mv::max_tokens())
+        .max(super::cpu_share::ops::MAX_TOKENS as i64)
+        + 1
+}
+
 impl<'a> TieredLayer<'a> {
+    /// Whether this step runs in a short prompt's lend ([`ExpertResidency::set_short_lend`]):
+    /// its graph then builds the ops of an unlent step over the staged copies (the fused expert
+    /// op only where an unlent step takes it too), so the output stays that of an unlent cache.
+    pub fn short_lend(&self) -> bool {
+        self.short_lend
+    }
+
     /// The tiered tensor of expert kind `k` ([`KINDS`] order).
     pub fn weight(&self, k: usize) -> Tensor<'a> {
         self.layer.tensor(k)
@@ -1248,15 +1397,18 @@ impl<'a> TieredLayer<'a> {
     /// The routed experts' outputs `down(silu(gate x) * up x)` (`[n_embd, n_used, n]`) from
     /// staged copies, for a step of `n` tokens big enough to stage (see [`super::staging`]).
     /// `None` when the step is small or the layer does not stage.
+    /// `selected`: the router's choices (expert ids, `[n_used, n]`), for a routing-gated step
+    /// ([`Self::staged_routed`]).
     pub fn staged_experts(
         &self,
         ctx: &'a Context,
         graph: &std::cell::RefCell<crate::ggml::Graph<'a>>,
         x: Tensor<'a>,
         ids: Tensor<'a>,
+        selected: Tensor<'a>,
         n: i64,
     ) -> Option<Tensor<'a>> {
-        self.staged(ctx, graph, x, n, |x, w| {
+        self.staged_routed(ctx, graph, x, Some(selected), n, |x, w| {
             let up = ctx.mul_mat_id(w[0], x, ids);
             let gate = ctx.mul_mat_id(w[1], x, ids);
             let act = ctx.mul(ctx.silu(gate), up);
@@ -1269,12 +1421,27 @@ impl<'a> TieredLayer<'a> {
     /// for a step of `n` tokens big enough to stage (see [`super::staging`]): waits for this
     /// layer's copy before `f`'s products and frees its buffer after them. `None` when the step
     /// is small or the layer does not stage.
-    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     pub fn staged(
         &self,
         ctx: &'a Context,
         graph: &std::cell::RefCell<crate::ggml::Graph<'a>>,
         x: Tensor<'a>,
+        n: i64,
+        f: impl FnOnce(Tensor<'a>, [Tensor<'a>; 3]) -> Tensor<'a>,
+    ) -> Option<Tensor<'a>> {
+        self.staged_routed(ctx, graph, x, None, n, f)
+    }
+
+    /// [`Self::staged`] with the router's choices `selected` (expert ids, `[n_used, n]`): in a
+    /// routing-gated step ([`super::route_gate`]) the wait op reads them and has only the
+    /// staged experts they name copied.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+    pub fn staged_routed(
+        &self,
+        ctx: &'a Context,
+        graph: &std::cell::RefCell<crate::ggml::Graph<'a>>,
+        x: Tensor<'a>,
+        selected: Option<Tensor<'a>>,
         n: i64,
         f: impl FnOnce(Tensor<'a>, [Tensor<'a>; 3]) -> Tensor<'a>,
     ) -> Option<Tensor<'a>> {
@@ -1287,9 +1454,12 @@ impl<'a> TieredLayer<'a> {
             }
             let w = |k: usize| self.layer.staged[k].tensor(KINDS[k]).expect("staged");
             let (wait_name, done_name) = st.op_names(self.layer.row);
-            let wait = ctx
-                .external(&WAIT, types::F32, [1, 1, 1, 1], &[x])
-                .named(&wait_name);
+            let gated = self.pieces == 0 && n as usize <= self.route_gate;
+            let wait = match selected.filter(|s| gated && s.ty() == types::I32) {
+                Some(s) => ctx.external(&WAIT, types::F32, [1, 1, 1, 1], &[x, s]),
+                None => ctx.external(&WAIT, types::F32, [1, 1, 1, 1], &[x]),
+            }
+            .named(&wait_name);
             let x = ctx.add(x, wait);
             let out = f(x, [w(0), w(1), w(2)]);
             let done = ctx
@@ -1690,8 +1860,11 @@ impl ExpertResidency {
                         })
                         .max()
                         .unwrap_or(n_expert);
+                    // #37: a longer prompt's whole lend takes the kept staging
+                    // ([`ExpertResidency::lend_for`]): its buffers hold every expert.
+                    let whole = whole_takes_staging(cfg.stage_reuse, cfg.lend_spread_upto);
                     let (keep, by_bytes) =
-                        auto_keep_carved(&layers, n_staged, cfg.ring, need, cfg.stage_reuse);
+                        auto_keep_carved(&layers, n_staged, cfg.ring, need, cfg.stage_reuse, whole);
                     let bytes_of = |keep: &[usize]| -> u64 {
                         staged
                             .iter()
@@ -2069,7 +2242,10 @@ impl ExpertResidency {
             stage_pieces: cfg.stage_pieces,
             stage_reuse: cfg.stage_reuse,
             lend_repack: cfg.lend_repack,
+            lend_spread_upto: cfg.lend_spread_upto,
+            route_gate: cfg.route_gate,
             stage_min: cfg.stage_min_tokens as i64,
+            short_lend: false,
             idle: Vec::new(),
             lend_keep: cfg.lend_keep.clone(),
             settle: cfg.settles(),
@@ -2139,21 +2315,29 @@ impl ExpertResidency {
     #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     pub fn begin_pass(&mut self, n: usize, ran: impl Fn(usize) -> bool) -> Result<(), String> {
         #[cfg(feature = "cuda")]
-        if n as i64 >= self.stage_min {
+        if n as i64 >= self.stage_from() {
             for d in 0..self.devices.len() {
+                // A routing-gated pass over the bounded host tier: its rows' copies and the
+                // reader's reads wait for each layer's routing.
+                let mut tier_gates = None;
                 let plan = match self.host.clone() {
                     // The bounded host tier: the pass's copies with the tier's sources, its
                     // checkpoint reads started; the pass before's copies are done first, as
                     // they read the staging places these reads fill.
                     Some(h) => {
-                        match self.devices[d].stage_mut() {
-                            Some(st) => st.sync()?,
+                        let help = match self.devices[d].stage_mut() {
+                            Some(st) => {
+                                st.sync()?;
+                                st.peer().is_some_and(|p| self.idle.contains(&p))
+                            }
                             None => continue,
-                        }
-                        let (plan, hook) = self.tier_plan(d, &ran, &h)?;
+                        };
+                        let gate = (!help && self.gates(n)).then_some(n);
+                        let (plan, hook, gates) = self.tier_plan(d, &ran, &h, gate)?;
                         if let (Some(st), Some(hook)) = (self.devices[d].stage_mut(), hook) {
                             st.set_hook(hook)?;
                         }
+                        tier_gates = gates;
                         plan
                     }
                     None => self.stage_plan(d, &ran),
@@ -2163,15 +2347,36 @@ impl ExpertResidency {
                     // A staging peer idle while this pass runs takes half of its copies
                     // (`--prefill-peer-stage`).
                     let help = st.peer().is_some_and(|p| idle.contains(&p));
+                    // A short step copies only the experts its tokens route to
+                    // (`super::route_gate`); over the bounded host tier, as `tier_plan` chose.
+                    let gated = match &self.host {
+                        Some(_) => tier_gates.is_some(),
+                        None => !help && self.gates(n),
+                    };
                     // Model bytes (#391): the experts copied over the link (not the zeroed
-                    // pads, whose source is 0).
-                    for (il, _, copies) in &plan {
+                    // pads, whose source is 0); a gated pass's show in the staging stats.
+                    for (il, _, copies) in plan.iter().filter(|_| !gated) {
                         let bytes: usize = copies.iter().filter(|c| c.1 != 0).map(|c| c.2).sum();
                         if let Some(l) = self.layers[*il].as_mut() {
                             l.traffic.staged += bytes as u64;
                         }
                     }
-                    st.begin(plan.into_iter().map(|(_, row, c)| (row, c)).collect(), help)?;
+                    let (gates, router) = match tier_gates.take() {
+                        Some((gates, router)) => (gates, Some(router)),
+                        None if gated => {
+                            let layers = &self.layers;
+                            let row = |il: usize| layers[il].as_ref().map(Layer::gate_row);
+                            (plan.iter().filter_map(|p| row(p.0)).collect(), None)
+                        }
+                        None => (Vec::new(), None),
+                    };
+                    let st = self.devices[d].stage_mut().expect("staging checked above");
+                    let plan = plan.into_iter().map(|(_, row, c)| (row, c)).collect();
+                    if gated {
+                        st.begin_gated(plan, gates, n, router)?;
+                    } else {
+                        st.begin(plan, help)?;
+                    }
                 }
             }
         }
@@ -2191,9 +2396,11 @@ impl ExpertResidency {
     #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     pub fn stage_ahead(&mut self, n: usize, ran: impl Fn(usize) -> bool) -> Result<(), String> {
         // Not with the bounded host tier: a pass's checkpoint reads take the staging places
-        // the running pass's copies still read.
+        // the running pass's copies still read. Nor for a routing-gated pass, whose rows wait
+        // for their router's choices.
         #[cfg(feature = "cuda")]
-        if self.is_lent() && n as i64 >= self.stage_min && self.host.is_none() {
+        if self.is_lent() && n as i64 >= self.stage_from() && self.host.is_none() && !self.gates(n)
+        {
             for d in 0..self.devices.len() {
                 let plan = self.stage_plan(d, &ran);
                 if let (Some(st), false) = (self.devices[d].stage_mut(), plan.is_empty()) {
@@ -2202,6 +2409,14 @@ impl ExpertResidency {
             }
         }
         Ok(())
+    }
+
+    /// Whether a staged pass of `n` tokens is routing-gated ([`super::route_gate`]): up to
+    /// [`ResidencyConfig::route_gate`] tokens, without split waits (with the bounded host
+    /// tier, its reads gated too).
+    #[cfg(feature = "cuda")]
+    fn gates(&self, n: usize) -> bool {
+        n <= self.route_gate && self.stage_pieces == 0
     }
 
     /// Device `d`'s staged layers among `ran`, in order: `(layer, row, copies)`.
@@ -2229,6 +2444,10 @@ impl ExpertResidency {
 
     /// [`Self::stage_plan`] with the bounded host tier `h`, and the calls its copies make
     /// ([`super::host_tier::HostTier::stage_pass`]): none when no layer is staged.
+    ///
+    /// `gate`: a routing-gated pass of that many tokens ([`super::route_gate`]): also every
+    /// row's gate and what tells the pass's reader each row's routing. `None` there when the
+    /// rows cannot gate (the reader is then told every expert is routed).
     #[cfg(feature = "cuda")]
     #[allow(clippy::type_complexity)]
     fn tier_plan(
@@ -2236,10 +2455,12 @@ impl ExpertResidency {
         d: usize,
         ran: &impl Fn(usize) -> bool,
         h: &super::host_tier::HostTier,
+        gate: Option<usize>,
     ) -> Result<
         (
             Vec<(usize, usize, Vec<super::staging::Copy>)>,
             Option<super::host_tier::PassHook>,
+            Option<(Vec<super::route_gate::GateRow>, super::host_tier::PassRoute)>,
         ),
         String,
     > {
@@ -2251,20 +2472,54 @@ impl ExpertResidency {
             .filter(|(il, l)| l.dev == d && ran(*il) && !l.staged.is_empty())
             .collect();
         if rows.is_empty() {
-            return Ok((Vec::new(), None));
+            return Ok((Vec::new(), None, None));
         }
         rows.sort_by_key(|r| r.1.row);
         let misses: Vec<(usize, Vec<u32>)> = rows
             .iter()
             .map(|(il, l)| (*il, l.stage_misses().iter().map(|m| m.0).collect()))
             .collect();
-        let (srcs, hook) = h.stage_pass(&misses)?;
+        // The reader reads the hottest experts of a layer ahead of its router.
+        let pass_gate = gate.map(|n| super::host_tier::PassGate {
+            heat: rows
+                .iter()
+                .zip(&misses)
+                .map(|((_, l), (_, experts))| {
+                    let heat = l.slots.heat();
+                    let h = |e: u32| heat.get(e as usize).copied().unwrap_or(0.0);
+                    experts.iter().map(|&e| h(e)).collect()
+                })
+                .collect(),
+            ahead: n.saturating_mul(super::route_gate::read_ahead_per_token()) as u64,
+            min_read: (n as u64).saturating_mul(super::route_gate::TIER_READ_PER_TOKEN),
+        });
+        let (srcs, hook, route) = h.stage_pass(&misses, pass_gate)?;
         let plan = rows
             .iter()
             .zip(&srcs)
             .map(|((il, l), s)| (*il, l.row, l.tier_copies(s)))
             .collect();
-        Ok((plan, Some(hook)))
+        let gates = match route {
+            Some(route) => {
+                let rows: Option<Vec<_>> = rows
+                    .iter()
+                    .zip(&srcs)
+                    .map(|((_, l), s)| l.tier_gate_row(s))
+                    .collect();
+                match rows {
+                    Some(rows) => Some((rows, route)),
+                    None => {
+                        // An empty mask: every expert.
+                        (0..srcs.len()).for_each(|q| {
+                            route(q, &[], &[]);
+                        });
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        Ok((plan, Some(hook), gates))
     }
 
     /// The bytes of routed experts the layers `layers` read since the start, by where (#391's
@@ -2328,7 +2583,9 @@ impl ExpertResidency {
             fetch: self.fetch,
             share: self.share,
             pieces: self.stage_pieces,
-            stage_min: self.stage_min,
+            stage_min: self.stage_from(),
+            route_gate: self.route_gate,
+            short_lend: self.short_lend && self.lent.is_some(),
             host: self.host.as_deref().map(|h| (h, il)),
         })
     }
@@ -2748,11 +3005,13 @@ impl ExpertResidency {
         let gathered = self.fetch == Fetch::Copy && n as i64 <= COPY_MAX_TOKENS;
         #[cfg(feature = "cuda")]
         let devices = &self.devices;
+        #[cfg(feature = "cuda")]
+        let stage_from = self.stage_from();
         #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
         let staged = |l: &Layer| -> bool {
             #[cfg(feature = "cuda")]
             return devices[l.dev].stage().is_some()
-                && n as i64 >= self.stage_min
+                && n as i64 >= stage_from
                 && !l.staged.is_empty();
             #[cfg(not(feature = "cuda"))]
             false
@@ -3338,6 +3597,29 @@ impl ExpertResidency {
         self.lent.is_some()
     }
 
+    /// Marks the lend as a short prompt's (#37, `--short-prompt-tokens`): its steps keep an
+    /// unlent cache's chunks, build an unlent step's ops over the staged copies
+    /// ([`TieredLayer::short_lend`]) and stage from [`short_stage_min`] tokens, so the outputs
+    /// are those of an unlent cache. Cleared by the restore.
+    pub fn set_short_lend(&mut self, on: bool) {
+        self.short_lend = on;
+    }
+
+    /// Whether [`Self::set_short_lend`] is on.
+    pub fn short_lend(&self) -> bool {
+        self.short_lend
+    }
+
+    /// The fewest tokens a pass stages: [`ResidencyConfig::stage_min_tokens`], or in a short
+    /// prompt's lend [`short_stage_min`] if fewer. Steps of fewer tokens never stage.
+    pub fn stage_from(&self) -> i64 {
+        if self.short_lend && self.lent.is_some() {
+            self.stage_min.min(short_stage_min())
+        } else {
+            self.stage_min
+        }
+    }
+
     /// Whether [`Self::step_unlent`] has work: a refill after the last restore is under way
     /// (its thread waits for the lent tails, [`TailGate`]).
     pub fn refill_at_admit(&self) -> bool {
@@ -3400,14 +3682,15 @@ impl ExpertResidency {
     /// reach have no VRAM yet and keep the experts they held, which the next restore refills.
     /// Every expert is read from host memory or staged while lent either way.
     pub fn lend(&mut self) -> Result<(), String> {
-        self.lend_for(usize::MAX)
+        self.lend_for(usize::MAX, usize::MAX)
     }
 
-    /// [`Self::lend`] for a prompt of `tokens` tokens still to read: kept slots are re-packed
-    /// ([`ResidencyConfig::lend_repack`]) only for a prompt of at least that many.
-    pub fn lend_for(&mut self, tokens: usize) -> Result<(), String> {
+    /// [`Self::lend`] for prompts with `tokens` tokens still to read in all (the spread,
+    /// [`ResidencyConfig::lend_spread_upto`]), the longest with `longest`: kept slots are
+    /// re-packed ([`ResidencyConfig::lend_repack`]) only for a prompt of at least that many.
+    pub fn lend_for(&mut self, tokens: usize, longest: usize) -> Result<(), String> {
         #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
-        let repack_kept = self.lend_repack > 0 && tokens >= self.lend_repack;
+        let repack_kept = self.lend_repack > 0 && longest >= self.lend_repack;
         if self.lent.is_some() || !self.can_lend() {
             return Ok(());
         }
@@ -3455,7 +3738,10 @@ impl ExpertResidency {
             let staged: Vec<bool> = (0..self.layers.len())
                 .map(|il| self.stages_entry(il))
                 .collect();
-            let spread = self.layers.iter().flatten().any(|l| l.keep.is_some());
+            // `lend_spread_upto` (#37): a prompt whose one step outgrows what the kept slots
+            // leave lends every slot whole, as without a keep.
+            let keeps = self.layers.iter().flatten().any(|l| l.keep.is_some());
+            let spread = keeps && tokens <= self.lend_spread_upto;
             let mut budget: Vec<u64> = self
                 .devices
                 .iter()
@@ -3522,7 +3808,16 @@ impl ExpertResidency {
             let fill_ms = t_fill.elapsed().as_secs_f64() * 1e3;
             let kept = mode.iter().filter(|m| **m == Lend::Keep).count();
             // Staging kept across lends: not with whole kept layers (`lend_keep`).
-            let reuse = self.stage_reuse && kept == 0;
+            // Nor made by such a whole lend: its buffers would hold the kept slots' heads,
+            // which a lend that keeps them cannot stage into (it takes the kept staging of
+            // the last lend that kept instead, `adopt` below).
+            let reuse = self.stage_reuse && kept == 0 && (spread || !keeps);
+            // #37: with a keep and longer prompts that lend whole, every lend packs its staged
+            // experts into buffers sized for all of them ([`whole_takes_staging`]): a whole
+            // lend then takes the kept staging made of the slot tails as it is (with its
+            // ranges, the heads they map unmapped), instead of making its own.
+            let grow = keeps && whole_takes_staging(self.stage_reuse, self.lend_spread_upto);
+            let adopt = grow && kept == 0;
             // `lend_repack` (#778): per device, the copies that re-pack its layers' kept slots,
             // and how many experts came from host memory and from VRAM.
             let n_dev = self.devices.len();
@@ -3557,14 +3852,20 @@ impl ExpertResidency {
             let mut packed_bytes: Vec<Option<[usize; 3]>> = vec![None; self.devices.len()];
             // Per device: the runs of consecutive experts its staged layers copy each pass.
             let mut runs = vec![0usize; n_dev];
+            // Sized for every expert (`grow`), a layer's buffers are the same size in every
+            // lend: each buffer only its rows' size ([`ring_bytes`], as unpacked staging).
+            let mut packed_rows: Vec<Vec<(usize, [usize; 3])>> = vec![Vec::new(); n_dev];
             for (il, l) in self.layers.iter_mut().enumerate() {
-                let Some(l) = l.as_mut().filter(|l| spread && staging[l.dev]) else {
+                let Some(l) = l.as_mut().filter(|l| (spread || grow) && staging[l.dev]) else {
                     continue;
                 };
                 if !staged[il] {
                     continue;
                 }
-                let need = l.pack();
+                let need = l.pack(grow);
+                if grow {
+                    packed_rows[l.dev].push((l.row, need));
+                }
                 runs[l.dev] += runs_of(&l.stage_miss).len();
                 let bytes = packed_bytes[l.dev].get_or_insert([0; 3]);
                 for (b, n) in bytes.iter_mut().zip(need) {
@@ -3607,15 +3908,21 @@ impl ExpertResidency {
                 .filter(|(d, _)| staging[*d])
                 .map(|(d, dev)| {
                     let parked = dev.staging.take().filter(|_| dev.kept);
-                    let bytes = if spread {
+                    let packs = spread || grow;
+                    let bytes = if packs {
                         packed_bytes[d]
                     } else {
                         dev.lend_bytes
                     };
                     // #1216: each buffer sized for the layers whose rows use it (packed
-                    // staging: every buffer its most uncached layer's size, as before).
-                    let need = bytes
-                        .map(|b| ring_bytes(b, ring, if spread { &[] } else { &ring_rows[d][..] }));
+                    // staging: every buffer its most uncached layer's size, as before, unless
+                    // sized for every expert).
+                    let rows = match (packs, grow) {
+                        (false, _) => &ring_rows[d][..],
+                        (true, true) => &packed_rows[d][..],
+                        (true, false) => &[],
+                    };
+                    let need = bytes.map(|b| ring_bytes(b, ring, rows));
                     let stage = dev.place.cuda.zip(need);
                     let stage = stage.map(|(c, need)| (c, need, dev.rows));
                     let layers = Vec::new();
@@ -3646,14 +3953,18 @@ impl ExpertResidency {
                 }
             }
             let (ring, pieces) = (self.ring, self.stage_pieces);
-            let done = per_device_thread("legion-lend", work, |_, w| w.lend(ring, pieces, reuse));
+            let done = per_device_thread("legion-lend", work, |_, w| {
+                w.lend(ring, pieces, reuse, adopt)
+            });
             let mut first_err = None;
             let (mut unback_ms, mut alloc_ms, mut repack_ms) = (0f64, 0f64, 0f64);
+            let mut ranges_ms = 0f64;
             for (d, r) in done {
                 let r = r.and_then(|r| {
                     unback_ms = unback_ms.max(r.unback_ms);
                     alloc_ms = alloc_ms.max(r.alloc_ms);
                     repack_ms = repack_ms.max(r.repack_ms);
+                    ranges_ms = ranges_ms.max(r.ranges_ms);
                     r.staging
                 });
                 let dev = &mut self.devices[d];
@@ -3684,6 +3995,7 @@ impl ExpertResidency {
                 devices_ms = ms(t0.elapsed() - t_tables),
                 unback_max_ms = unback_ms,
                 staging_alloc_max_ms = alloc_ms,
+                ranges_max_ms = ranges_ms,
                 repack_max_ms = repack_ms,
                 "expert cache lend"
             );
@@ -3726,6 +4038,7 @@ impl ExpertResidency {
         free_first: impl FnOnce() + Send + 'static,
         leave: &[(usize, u64)],
     ) -> Result<(), String> {
+        self.short_lend = false;
         let Some(held) = self.lent.take() else {
             free_first();
             return Ok(());
@@ -3933,6 +4246,18 @@ impl ExpertResidency {
                         lock_wait_ms = s.lock_wait_ms,
                         "expert cache staging queued"
                     );
+                    if s.gated > 0 {
+                        let mib = |b: u64| b >> 20;
+                        tracing::info!(
+                            device = c,
+                            rows = s.gated,
+                            copied_mib = mib(s.gated_bytes),
+                            whole_mib = mib(s.full_bytes),
+                            ahead_unused_mib = mib(s.ahead_unused),
+                            route_wait_ms = s.route_ms,
+                            "routing-gated staging: copied what the prompt's tokens route to"
+                        );
+                    }
                 }
                 // Kept staging stays, parked by the refill thread before the slots map its
                 // buffers' memory again.
@@ -5354,14 +5679,22 @@ enum Lend {
 }
 
 /// What a device's [`LendWork`] made: its staging buffers (none if it does not stage) and
-/// whether they are kept for the next lend, and the milliseconds its unback and its staging
-/// allocation took.
+/// whether they are kept for the next lend, and the milliseconds its unback, its staging
+/// allocation and its staged ranges (mapped, or kept ones wrapped again) took.
 #[cfg(feature = "cuda")]
 struct LendDone {
     staging: Result<(Option<super::staging::Staging>, bool), String>,
     unback_ms: f64,
     alloc_ms: f64,
+    ranges_ms: f64,
     repack_ms: f64,
+}
+
+/// Whether a whole lend takes the kept staging of a lend that kept slots (#37): with kept
+/// staging (`stage_reuse`) where longer prompts lend whole (`spread_upto`,
+/// [`ResidencyConfig::lend_spread_upto`]), the buffers are sized for every expert.
+fn whole_takes_staging(stage_reuse: bool, spread_upto: usize) -> bool {
+    stage_reuse && spread_upto < usize::MAX
 }
 
 #[cfg(feature = "cuda")]
@@ -5374,7 +5707,11 @@ impl LendWork<'_> {
     /// slots map those allocations again in between ([`Layer::shared`]). A lend with kept
     /// buffers big enough only unmaps the slots, zeroes the buffers and wraps the ranges in
     /// tensors again. The same buffers and ranges, so the same outputs.
-    fn lend(self, ring: usize, pieces: usize, reuse: bool) -> LendDone {
+    ///
+    /// `adopt` (#37): kept buffers big enough serve this lend too, though it keeps none made
+    /// (a whole lend after one that kept slots: the buffers are the slot tails, which it lends
+    /// as well; the ranges unmap the slot heads it frees).
+    fn lend(self, ring: usize, pieces: usize, reuse: bool, adopt: bool) -> LendDone {
         let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1e3;
         let LendWork {
             stage,
@@ -5393,10 +5730,11 @@ impl LendWork<'_> {
                 staging: Err(format!("re-packing the kept slots: {e}")),
                 unback_ms: 0.0,
                 alloc_ms: 0.0,
+                ranges_ms: 0.0,
                 repack_ms,
             };
         }
-        let reused = reuse
+        let reused = (reuse || adopt)
             && match (&parked, &stage) {
                 (Some(st), Some((_, need, _))) => st.fits(need),
                 _ => false,
@@ -5430,7 +5768,7 @@ impl LendWork<'_> {
                 })
             });
         let unback_ms = ms(t);
-        let mut alloc_ms = 0.0;
+        let (mut alloc_ms, mut ranges_ms) = (0.0, 0.0);
         let staging = unback.and_then(|()| {
             let Some((c, need, rows)) = stage else {
                 return Ok((None, false));
@@ -5452,18 +5790,30 @@ impl LendWork<'_> {
                 (st, true, pooled)
             };
             alloc_ms = ms(t);
+            let t = std::time::Instant::now();
+            // Kept ranges whose head changed, and ranges made.
+            let (mut reheaded, mut made) = (0usize, 0usize);
             for (_, mode, l) in layers.iter_mut().filter(|(stages, _, _)| *stages) {
                 let n_ids = l.stage_first + l.stage_miss.len().max(1);
                 let packed = !l.stage_ids.is_empty();
                 for (k, kind) in KINDS.iter().enumerate() {
                     // A kept layer's range maps its slots again: cached experts read them.
                     let buf = st.buffer(k, l.row);
-                    let ctx = if reuse && *mode != Lend::Keep {
-                        if !l
-                            .ranges
-                            .get(k)
-                            .is_some_and(|r| r.serves(l.tensor(k), packed))
-                        {
+                    let ctx = if (reuse || reused) && *mode != Lend::Keep {
+                        let tiered = l.tensors[k].tensor(kind).expect("tiered tensor");
+                        // Only the slots' head changed (#37: a whole lend freed it, or the
+                        // restore after one made it new): the range maps it again.
+                        let serves = match l.ranges.get_mut(k) {
+                            Some(r) if r.serves(tiered, packed) => true,
+                            Some(r) => {
+                                let reheads = r.rehead(tiered, packed)?;
+                                reheaded += usize::from(reheads);
+                                reheads
+                            }
+                            None => false,
+                        };
+                        if !serves {
+                            made += 1;
                             let r = super::cuda::staged_range(c, l.tensor(k), buf, packed)?;
                             if k < l.ranges.len() {
                                 l.ranges[k] = r;
@@ -5489,6 +5839,16 @@ impl LendWork<'_> {
                 if fresh {
                     st.add_row(l.row, pieces)?;
                 }
+            }
+            ranges_ms = ms(t);
+            if reheaded + made > 0 {
+                tracing::debug!(
+                    device = c,
+                    reheaded,
+                    made,
+                    ranges_ms,
+                    "expert cache staged ranges"
+                );
             }
             let kept = if fresh {
                 // Kept only if every buffer is the slots' memory (a new allocation would hold
@@ -5539,6 +5899,7 @@ impl LendWork<'_> {
             staging,
             unback_ms,
             alloc_ms,
+            ranges_ms,
             repack_ms,
         }
     }

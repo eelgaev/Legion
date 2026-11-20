@@ -50,7 +50,7 @@ use super::ssd_experts::cache::SlotCache;
 use super::ssd_experts::io::{Group, Job, Pool, raw_pieces};
 
 mod passes;
-pub use passes::{PassHook, PassSrc, release_arg, wait_arg};
+pub use passes::{PassGate, PassHook, PassRoute, PassSrc, release_arg, slot_learn, wait_arg};
 
 #[cfg(test)]
 mod tests;
@@ -1190,7 +1190,7 @@ impl Inner {
 
     fn take_ahead(&self, st: &mut State, il: Option<usize>) -> Result<Vec<(usize, usize)>, String> {
         self.land()?;
-        self.settle();
+        self.settle_into(st);
         let Some(a) = st.ahead.take() else {
             return Ok(Vec::new());
         };
@@ -1338,6 +1338,10 @@ impl Inner {
             }
         }
         if defer {
+            // The pads behind the places in use now too: the host pairs of the experts already
+            // in place may run before the reads land (round 36); [`Inner::land`] zeroes them again
+            // once the reads, which may write over them, are done.
+            self.zero_pads(il, &t.index);
             let at = t.loads.iter().map(|l| t.index[l.0]).collect();
             *self.landing.lock().unwrap() = Some(Landing {
                 layer: il,

@@ -1454,7 +1454,16 @@ struct LaunchParams {
     half_tiles: i32,
     /// Non-null: a verify step's row map ([`Operands::pad`]); its dead padding pairs skipped.
     pad_rows: *const i32,
+    /// Parts 5 and 6: the host experts whose reads are under way, `n_pend` of them
+    /// ([`cuda_expert_mv_pend`]).
+    n_pend: i32,
+    pend: [i32; MAX_PEND],
 }
+
+/// The most host experts with reads under way that parts 5 and 6 take
+/// (`LEGION_EXPERT_MV_MAX_PEND` in the kernels).
+#[cfg(feature = "cuda")]
+pub(crate) const MAX_PEND: usize = 32;
 
 #[cfg(feature = "cuda")]
 unsafe extern "C" {
@@ -1473,7 +1482,7 @@ pub(crate) unsafe fn cuda_expert_mv(
 ) -> Result<(), String> {
     // SAFETY: the caller's.
     unsafe {
-        cuda_expert_mv_as(dst, stream, false, None)?;
+        cuda_expert_mv_as(dst, stream, false, None, 0, &[])?;
         if dump::enabled() {
             dump::after(dst, stream, false);
         }
@@ -1489,7 +1498,7 @@ pub(crate) unsafe fn cuda_expert_mv_preq(
 ) -> Result<(), String> {
     // SAFETY: the caller's.
     unsafe {
-        cuda_expert_mv_as(dst, stream, true, None)?;
+        cuda_expert_mv_as(dst, stream, true, None, 0, &[])?;
         if dump::enabled() {
             dump::after(dst, stream, true);
         }
@@ -1514,7 +1523,7 @@ pub(crate) unsafe fn cuda_expert_mv_around(
 ) -> Result<(), String> {
     // SAFETY: the caller's.
     unsafe {
-        cuda_expert_mv_as(dst, stream, preq, Some(between))?;
+        cuda_expert_mv_as(dst, stream, preq, Some(between), 0, &[])?;
         if dump::enabled() {
             dump::after(dst, stream, preq);
         }
@@ -1522,14 +1531,69 @@ pub(crate) unsafe fn cuda_expert_mv_around(
     Ok(())
 }
 
+/// Whether an expert op launches in the two parts [`cuda_expert_mv_part`] takes: one of no
+/// split, row map, staged-ahead pairs or PTX kernel (#37 round 36).
+///
+/// # Safety
+/// As [`cuda_expert_mv`].
+#[cfg(feature = "cuda")]
+pub(crate) unsafe fn cuda_expert_mv_splits(dst: &ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's.
+    let o = unsafe { Operands::of(dst) };
+    o.halves == 0
+        && o.split == overlap::NONE
+        && o.pad.is_null()
+        && o.ahead.is_none()
+        && ptx::params_for(&o).is_none()
+}
+
+/// One part of [`cuda_expert_mv`] (`preq`: [`cuda_expert_mv_preq`]) (#37 round 36): `part` 1
+/// the VRAM experts' pairs (and of an op whose x is per token, all of x's blocks), 2 the host
+/// experts' pairs, each pair by the same tile code from the same bytes as in one launch (the
+/// `part`s the split ops take, [`overlap`]). Parts 5 and 6 split part 2: the host experts whose
+/// reads are done, then those at `pend` (indices past the VRAM slots) whose reads are under way.
+/// Only an op [`cuda_expert_mv_splits`] takes; part 1 first, 6 last.
+///
+/// # Safety
+/// As [`cuda_expert_mv`].
+#[cfg(feature = "cuda")]
+pub(crate) unsafe fn cuda_expert_mv_part(
+    dst: &ffi::ggml_tensor,
+    stream: *mut c_void,
+    preq: bool,
+    part: i32,
+    pend: &[usize],
+) -> Result<(), String> {
+    if !matches!(part, 1 | 2 | 5 | 6) {
+        return Err(format!("expert_mv: no part {part}"));
+    }
+    if pend.len() > MAX_PEND || (part >= 5) == pend.is_empty() {
+        return Err(format!(
+            "expert_mv: part {part} with {} pending",
+            pend.len()
+        ));
+    }
+    // SAFETY: the caller's.
+    unsafe {
+        cuda_expert_mv_as(dst, stream, preq, None, part, pend)?;
+        if (part == 2 || part == 6) && dump::enabled() {
+            dump::after(dst, stream, preq);
+        }
+    }
+    Ok(())
+}
+
 /// The launches of an expert op; `preq`: its `xq` source holds the activations' Q8_1 blocks
-/// already ([`glu_tiered_preq`]), so no `quantize_x`.
+/// already ([`glu_tiered_preq`]), so no `quantize_x`. `only`: 0 every pair, else that part
+/// alone ([`cuda_expert_mv_part`], with its `pend`).
 #[cfg(feature = "cuda")]
 unsafe fn cuda_expert_mv_as(
     dst: &ffi::ggml_tensor,
     stream: *mut c_void,
     preq: bool,
     mut between: Option<&mut dyn FnMut() -> Result<(), String>>,
+    only: i32,
+    pend: &[usize],
 ) -> Result<(), String> {
     // SAFETY: a node made by `mul_mat_id`; weights in memory the GPU can read.
     let o = unsafe { Operands::of(dst) };
@@ -1591,8 +1655,19 @@ unsafe fn cuda_expert_mv_as(
         balance: i32::from(balance()),
         half_tiles: i32::from(half_tiles_for(o.ty, mats == 2, o.n_tok)),
         pad_rows: std::ptr::null(),
+        n_pend: pend.len() as i32,
+        pend: {
+            let mut a = [-1; MAX_PEND];
+            for (d, &i) in a.iter_mut().zip(pend) {
+                *d = o.vram_below + i as i32;
+            }
+            a
+        },
     };
     if o.halves != 0 {
+        if only != 0 {
+            return Err("expert_mv: a part of a split op".into());
+        }
         if let Some(b) = between.take() {
             b()?;
         }
@@ -1659,16 +1734,33 @@ unsafe fn cuda_expert_mv_as(
             _ => Ok(()),
         }
     };
+    // The plain one-launch path, which runs in parts.
+    let plain = o.split == overlap::NONE && pp.is_none() && !pad && o.ahead.is_none();
+    if only != 0 {
+        if !plain {
+            return Err("expert_mv: a part of an op that does not split".into());
+        }
+        // Part 1 quantizes all of a per-token x (quantize_x skips none), so part 2 only computes;
+        // a column per pair (the down op's) is quantized by the part of its pair.
+        let steps = if only != 1 && o.n_x != o.n_used {
+            2
+        } else {
+            p.steps
+        };
+        return launch(
+            LaunchParams {
+                part: only,
+                steps,
+                ..p
+            },
+            stream,
+        );
+    }
     if let Some(b) = between {
         // The VRAM pairs (and all of the activations' blocks: the gate/up op's x is per token,
         // quantize_x skips none), then `between`, then the host pairs. Only the plain one-launch
         // path: the others run `between` first.
-        if o.split == overlap::NONE
-            && pp.is_none()
-            && !pad
-            && o.n_x != o.n_used
-            && o.ahead.is_none()
-        {
+        if plain && o.n_x != o.n_used {
             launch(LaunchParams { part: 1, ..p }, stream)?;
             b()?;
             let host = LaunchParams {

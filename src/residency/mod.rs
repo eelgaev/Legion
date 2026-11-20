@@ -37,6 +37,7 @@ pub mod fallback;
 pub mod host_tier;
 pub mod kv_vmm;
 pub mod miss_split;
+pub mod route_gate;
 pub mod split;
 pub mod ssd_experts;
 #[cfg(feature = "cuda")]
@@ -371,6 +372,16 @@ pub struct ResidencyConfig {
     /// a long prompt reads the experts already cached and copies in only the others. The
     /// engine measures it at load; empty: every slot is lent.
     pub lend_need: Vec<u64>,
+    /// With the automatic keep ([`Self::lend_need`]): the longest prompt (tokens still to
+    /// read) whose one step fits beside the kept slots (#37: one GPU with every expert in host
+    /// memory, measured at load). A lend for a longer one keeps nothing and lends every slot
+    /// whole, as without a keep: its one big step needs the room. The engine sets it;
+    /// `usize::MAX`: every lend keeps.
+    pub lend_spread_upto: usize,
+    /// Routing-gated staging ([`route_gate`], #37): prompt steps of up to this many tokens copy
+    /// only the uncached experts their tokens route to. The engine sets it (one GPU with every
+    /// routed expert in host memory); 0: every staged step copies every uncached expert.
+    pub route_gate: usize,
     /// Layers from this one read their experts in place during a long prompt and lend all
     /// their slots (an MTP head's; see [`experts::ExpertResidency::stage_below`]); `None`:
     /// every layer stages.
@@ -451,6 +462,8 @@ impl Default for ResidencyConfig {
             lend_spread: false,
             lend_repack: 40960,
             lend_need: Vec::new(),
+            lend_spread_upto: usize::MAX,
+            route_gate: 0,
             stage_below: None,
             learn_long: true,
             cpu_share: cpu_share::CpuShareConfig::default(),

@@ -907,6 +907,88 @@ pub(crate) fn kv_headroom(
     }
 }
 
+/// Whether the vision tower loads before the KV pool is sized (#1195): when the first stage
+/// (where it runs) is a discrete GPU, so the fit's free memory has its weights already. On a
+/// GPU sharing the host's memory it loads after the pool, as it did on the CPU: what it takes
+/// there is host memory, which [`kv_headroom`]'s share for the OS and the host side covers.
+pub(crate) fn tower_before_kv(first: Option<crate::ggml::DeviceKind>) -> bool {
+    first == Some(crate::ggml::DeviceKind::Gpu)
+}
+
+/// What the KV fit keeps free on stage `stage` (a device of `kind`) beside [`kv_headroom`] for
+/// the GPU vision tower's largest image (`scratch`, 0 without a GPU tower; #1195). Only with
+/// every expert in VRAM (`ExpertMode::Device`) on a discrete GPU: nothing sized after the pool
+/// leaves the scratch room there. With the expert cache it is kept out of the cache's budget,
+/// with host experts out of the kept step graphs' budget; on a GPU sharing the host's memory
+/// the OS's share covers it ([`tower_before_kv`]).
+pub(crate) fn tower_kv_reserve(
+    mode: ExpertMode,
+    kind: crate::ggml::DeviceKind,
+    stage: usize,
+    scratch: usize,
+) -> usize {
+    if mode == ExpertMode::Device && stage == 0 && tower_before_kv(Some(kind)) {
+        scratch
+    } else {
+        0
+    }
+}
+
+/// `--mmproj`: the vision tower (#146), else an HF checkpoint's own (#1195), for a language
+/// model of architecture `arch` and width `n_embd`, on CUDA device `gpu` (the CPU without
+/// one). Under tensor parallelism over ranks only rank 0 loads it (`follower`: a rank above
+/// 0, which loads none): it encodes, and the other ranks get the images' rows with the steps
+/// (#1195 stage D). A model split by layers (`--node-rank`) takes no images yet.
+fn load_vision(
+    cfg: &LmConfig,
+    arch: &str,
+    n_embd: usize,
+    tokenizer: &Tokenizer,
+    gpu: Option<usize>,
+    follower: bool,
+) -> Result<Option<Arc<vision::Vision>>, LoadError> {
+    if follower {
+        return Ok(None);
+    }
+    Ok(match &cfg.mmproj {
+        Some(_) if cfg.node.is_some() => {
+            return Err(LoadError::Device(
+                "--mmproj: not with --node-rank (yet)".into(),
+            ));
+        }
+        Some(path) => Some(Arc::new(vision::Vision::load(
+            path,
+            arch,
+            n_embd,
+            tokenizer,
+            cfg.threads,
+            gpu,
+        )?)),
+        None if cfg.no_mmproj || !cfg.model_path.is_dir() => None,
+        None if cfg.node.is_some() => {
+            tracing::info!(
+                "vision: the checkpoint's vision tower is not loaded with --node-rank \
+                 (yet): text only"
+            );
+            None
+        }
+        None => match vision::Vision::from_checkpoint(
+            &cfg.model_path,
+            arch,
+            n_embd,
+            tokenizer,
+            cfg.threads,
+            gpu,
+        ) {
+            Ok(v) => v.map(Arc::new),
+            Err(e) => {
+                tracing::warn!(error = %e, "vision: the checkpoint's vision tower did not load; text only");
+                None
+            }
+        },
+    })
+}
+
 /// With the expert cache, the default KV pool: at least `--ctx-size`, at most this many tokens
 /// (Strata's `--kv-resident` default). Sequences wait for KV blocks when it is full; the VRAM
 /// goes to expert slots, which every step reads. `--kv-cache-tokens` overrides it.
@@ -1321,14 +1403,53 @@ const EVEN_STEP: usize = KV_BLOCK;
 /// only moves where an expert is read from: the same outputs.
 pub const GLM_SHORT_PROMPT: usize = crate::residency::STAGE_MIN_TOKENS;
 
+/// One GPU whose prompt steps are routing-gated (every routed expert in host memory, or the
+/// bounded host tier where [`short_gate_ram`], #37): a prompt borrows the cache for staging from this many tokens left
+/// ([`LongPrompts::short_min_tokens`]). Its steps then copy only the experts they route to, by
+/// DMA, instead of reading every uncached one in place, with an unlent step's chunks and ops
+/// ([`crate::residency::experts::ExpertResidency::set_short_lend`]): the same outputs.
+pub const SHORT_GATE_PROMPT: usize = crate::residency::STAGE_MIN_TOKENS;
+
 /// [`LongPrompts::short_min_tokens`]' default: [`GLM_SHORT_PROMPT`] for GLM-5.3-Flash over
-/// several stages, else 0 (Qwen and Gemma unchanged).
-pub fn short_prompt_default(glm: bool, stages: usize) -> usize {
+/// several stages, [`SHORT_GATE_PROMPT`] where `gated` (one GPU with routing-gated prompt
+/// steps, a model whose graph builds an unlent step's ops in a short lend), else 0.
+pub fn short_prompt_default(glm: bool, stages: usize, gated: bool) -> usize {
     if glm && stages > 1 {
         GLM_SHORT_PROMPT
+    } else if gated {
+        SHORT_GATE_PROMPT
     } else {
         0
     }
+}
+
+/// Whether the bounded host tier's short prompts borrow the cache by default
+/// ([`SHORT_GATE_PROMPT`]) when their staged passes do not learn RAM slots
+/// (`LEGION_DEBUG_SLOT_LEARN=0`, [`crate::residency::host_tier::slot_learn`]; they do by
+/// default, and short prompts then borrow it at any size): where its RAM slots hold at least
+/// half of each layer's experts. With fewer, the in-place reads of a short prompt's misses are
+/// what keep the RAM slots on what recent prompts route to, and staging them instead costs the
+/// next prompts more checkpoint reads (#37 round 41 on an RTX 4090: 2K-8K prompts 0.3-0.5 s
+/// slower with 111 of 512 slots a layer, a tie with 320).
+pub fn short_gate_ram(slots: usize, experts: usize) -> bool {
+    2 * slots >= experts
+}
+
+/// Whether prompt steps are routing-gated, so short prompts may borrow the cache by default
+/// ([`SHORT_GATE_PROMPT`]): one stage with a route gate (`route_gate` tokens), and without split
+/// waits (`--prefill-stage-pieces`), which the gate does not take (the residency's own check,
+/// `ExpertResidency::gates`): there a short prompt's staged steps would wait for every
+/// uncached expert's copy, so short prompts read their experts in place as before.
+fn short_gate_steps(route_gate: usize, stage_pieces: usize, stages: usize) -> bool {
+    route_gate > 0 && stage_pieces == 0 && stages == 1
+}
+
+/// Whether short prompts' lends build an unlent step's ops over the staged copies (#37,
+/// [`crate::residency::experts::ExpertResidency::set_short_lend`]): models on the shared expert
+/// graph (not GLM-5.3-Flash's or DeepSeek's own), unless `LEGION_DEBUG_SHORT_GATE=0` (staged
+/// steps take the fused expert op, and short prompts lend only where asked, as before).
+fn short_gate_on(own_graph: bool) -> bool {
+    !own_graph && std::env::var_os("LEGION_DEBUG_SHORT_GATE").is_none_or(|v| v != "0")
 }
 
 impl LongPrompts {
@@ -3474,6 +3595,8 @@ struct LoadFacts<'a> {
     state_bytes: &'a dyn Fn(&std::ops::Range<usize>) -> usize,
     /// Per stage: the measured step compute buffers (empty when not measured).
     compute: &'a [usize],
+    /// The GPU vision tower's largest image's scratch (0 without one), as the KV fit kept it.
+    vision_scratch: usize,
     ngram: Option<report::NgramPlacement>,
     engram: Option<report::NgramPlacement>,
     /// Saved prefix-cache states in pinned host memory, all stages.
@@ -3514,8 +3637,9 @@ fn load_report(
                 ..Default::default()
             };
             if let Some(d) = d {
-                s.kv_reserve_bytes =
-                    Some(kv_headroom(d.kind(), cfg.max_batch_tokens, cfg.uma_free) as u64);
+                let kv_reserve = kv_headroom(d.kind(), cfg.max_batch_tokens, cfg.uma_free)
+                    + tower_kv_reserve(f.mode, d.kind(), si, f.vision_scratch);
+                s.kv_reserve_bytes = Some(kv_reserve as u64);
                 if f.mode == ExpertMode::Cache && cfg.residency.cache_bytes.is_none() {
                     // As `build_expert_cache`'s budget: the measured buffers and a margin, or
                     // the fixed headroom, then the reserve.
@@ -3921,6 +4045,23 @@ impl LmEngine {
         cfg.residency.tier_heat_sizes = tier_whole
             && cfg.residency.tier_heat.is_some()
             && std::env::var_os("LEGION_DEBUG_HEAT_SIZES").is_none_or(|v| v != "0");
+        // #37: there, prompt steps up to a few thousand tokens copy only the experts their
+        // tokens route to (`crate::residency::route_gate`; `LEGION_DEBUG_ROUTE_GATE=0` copies
+        // every uncached expert, as before). The output is the same either way.
+        if tier_whole && layout.stages.len() == 1 {
+            cfg.residency.route_gate = crate::residency::route_gate::gate_upto();
+        }
+        // With the bounded host tier too, whose passes then read from the checkpoint only the
+        // experts the tokens route to (`LEGION_DEBUG_ROUTE_GATE_TIER=0`: every one, as before).
+        if host_tier.is_some() && layout.stages.len() == 1 {
+            cfg.residency.route_gate = crate::residency::route_gate::tier_gate_upto();
+        }
+        // There, short prompts borrow the cache for routing-gated staging too (#37).
+        let route_gated = short_gate_steps(
+            cfg.residency.route_gate,
+            cfg.residency.stage_pieces,
+            layout.stages.len(),
+        );
         // Its one GPU's reserve beside the cache, where `--expert-cache-reserve-mib` is at its
         // default: what was measured in use there, not the layer splits' share.
         if (host_tier.is_some() || tier_whole)
@@ -4025,12 +4166,17 @@ impl LmEngine {
         if cfg.gemma4_compact_global_kv {
             gemma4_compact_global_kv(&mut model, cfg.cache_types);
         }
+        let glm = crate::model::glm5next::params(&model.hp).is_some();
+        let short_gate =
+            short_gate_on(glm || crate::model::deepseek41::params(&model.hp).is_some());
+        let route_gated = route_gated
+            && host_tier.as_ref().is_none_or(|t| {
+                crate::residency::host_tier::slot_learn()
+                    || short_gate_ram(t.plan.slots, model.hp.n_expert as usize)
+            });
         let long_prompts = LongPrompts {
             short_min_tokens: Some(cfg.long_prompts.short_min_tokens.unwrap_or_else(|| {
-                short_prompt_default(
-                    crate::model::glm5next::params(&model.hp).is_some(),
-                    layout.stages.len(),
-                )
+                short_prompt_default(glm, layout.stages.len(), short_gate && route_gated)
             })),
             ..cfg.long_prompts
         };
@@ -4256,6 +4402,31 @@ impl LmEngine {
             tracing::info!(?layers, weights_gib = ?gib, weights_fp16 = ?cfg.fp16.mode, "weights per stage");
         }
         let hp = model.hp.clone();
+        // The vision tower: on a discrete GPU loaded before the KV pool and the expert cache
+        // are sized, so its weights are in use then, and its largest image's scratch is kept
+        // free of the pool (every expert in VRAM, `tower_kv_reserve`), of the cache or of the
+        // kept step graphs (host experts). Elsewhere after the pool (`tower_before_kv`).
+        let vision_arch = gguf.architecture().unwrap_or_default();
+        // The tower runs on the first stage's GPU (#1195), the CPU without one.
+        let vision_dev = layout.stages.first().and_then(|(d, _)| *d);
+        let vision_gpu = vision_dev.and_then(cuda_index);
+        let vision_early = tower_before_kv(vision_dev.map(|d| d.kind()));
+        // Under tensor parallelism only rank 0 loads it (#1195 stage D).
+        let vision_follower = tp_start.as_ref().is_some_and(|s| s.rank() > 0);
+        let mut vision = if vision_early {
+            load_vision(
+                &cfg,
+                &vision_arch,
+                hp.n_embd as usize,
+                &tokenizer,
+                vision_gpu,
+                vision_follower,
+            )?
+        } else {
+            None
+        };
+        // The GPU tower's scratch at the largest image (0 on the CPU, or not loaded yet).
+        let early_scratch = vision.as_ref().map_or(0, |v| v.gpu_scratch_bytes());
         let max_seqs = cfg.max_seqs.max(1);
         let prefill_slots = cfg.prefill_slots.max(1);
         let saved_slots = cfg.prefix_cache_states;
@@ -4284,9 +4455,12 @@ impl LmEngine {
             max_seqs: max_seqs + prefill_slots,
             use_ref: cfg.use_ref,
         };
-        let drafting = match tp_node::rank0_drafting(&cfg)? {
+        let mut drafting = match tp_node::rank0_drafting(&cfg)? {
             Some(d) => d,
-            None => Drafting::new(&cfg.spec, &target, dflash_vocab).map_err(LoadError::Device)?,
+            None => {
+                let share = tp_node::draft_share(&cfg, tp_start.as_ref());
+                Drafting::new(&cfg.spec, &target, dflash_vocab, share).map_err(LoadError::Device)?
+            }
         };
         // A block drafter drafts its whole block in one pass: up to all of it without `--spec-k`
         // (the depth policy picks less where verify rows cost).
@@ -4426,7 +4600,8 @@ impl LmEngine {
                 .filter_map(|(si, (d, layers))| {
                     let dev = (*d)?;
                     let state_bytes = state_bytes_with(layers, ring);
-                    let reserve = kv_headroom(dev.kind(), cfg.max_batch_tokens, cfg.uma_free);
+                    let reserve = kv_headroom(dev.kind(), cfg.max_batch_tokens, cfg.uma_free)
+                        + tower_kv_reserve(mode, dev.kind(), si, early_scratch);
                     let free = layout.free_for_split(si, 0);
                     let room = layout
                         .free_for_split(si, reserve)
@@ -5057,55 +5232,18 @@ impl LmEngine {
                 }
             }
         }
-        // `--mmproj`: the vision tower (#146), else an HF checkpoint's own (#1195). Other
-        // ranks and nodes get no images' rows. Loaded before the expert cache takes what the
-        // GPU has left: the GPU tower's weights are in use then, and its largest image's
-        // scratch is kept free of the cache.
-        let arch = gguf.architecture().unwrap_or_default();
-        let n_embd = exec.hp().n_embd as usize;
-        // The tower runs on the first stage's GPU (#1195), the CPU without one.
-        let vision_gpu = layout
-            .stages
-            .first()
-            .and_then(|(d, _)| *d)
-            .and_then(cuda_index);
-        let vision = match &cfg.mmproj {
-            Some(_) if cfg.tp_net.is_some() || cfg.node.is_some() => {
-                return Err(LoadError::Device(
-                    "--mmproj: not with --tp-rank or --node-rank (yet)".into(),
-                ));
-            }
-            Some(path) => Some(Arc::new(vision::Vision::load(
-                path,
-                &arch,
-                n_embd,
+        // On a GPU sharing the host's memory (or the CPU) the tower loads here, after the KV
+        // pool and before the expert cache takes what the GPU has left.
+        if !vision_early {
+            vision = load_vision(
+                &cfg,
+                &vision_arch,
+                exec.hp().n_embd as usize,
                 &tokenizer,
-                cfg.threads,
                 vision_gpu,
-            )?)),
-            None if cfg.no_mmproj || !cfg.model_path.is_dir() => None,
-            None if cfg.tp_net.is_some() || cfg.node.is_some() => {
-                tracing::info!(
-                    "vision: the checkpoint's vision tower is not loaded with --tp-rank or \
-                     --node-rank (yet): text only"
-                );
-                None
-            }
-            None => match vision::Vision::from_checkpoint(
-                &cfg.model_path,
-                &arch,
-                n_embd,
-                &tokenizer,
-                cfg.threads,
-                vision_gpu,
-            ) {
-                Ok(v) => v.map(Arc::new),
-                Err(e) => {
-                    tracing::warn!(error = %e, "vision: the checkpoint's vision tower did not load; text only");
-                    None
-                }
-            },
-        };
+                vision_follower,
+            )?;
+        }
         // The GPU tower's scratch at the largest image, on the first stage (0 on the CPU).
         let vision_scratch = vision.as_ref().map_or(0, |v| v.gpu_scratch_bytes());
         // The measured step compute buffers per stage (for the startup report).
@@ -5161,16 +5299,27 @@ impl LmEngine {
                 // The bounded host tier (one GPU): a whole pass's step, as a kept slot's
                 // experts are neither copied nor read from the checkpoint.
                 let tier = exec.model().host_tier().is_some() && layout.stages.len() == 1;
+                // #37: one GPU with every expert in host memory reads a prompt in one step.
+                // The same pass-sized step sizes the slots its lends keep; a longer prompt's
+                // lend keeps none (`ResidencyConfig::lend_spread_upto`), as before.
+                // `LEGION_DEBUG_WHOLE_KEEP=0` lends every slot for every long prompt, as before
+                // (A/B runs; the output is the same either way).
+                let whole = tier_whole
+                    && layout.stages.len() == 1
+                    && std::env::var_os("LEGION_DEBUG_WHOLE_KEEP").is_none_or(|v| v != "0");
                 let long = if cfg.residency.staging
                     && cfg.residency.lend_keep.is_empty()
                     && cfg.long_prompts.min_tokens > 0
-                    && (layout.stages.len() > 1 || tier)
+                    && (layout.stages.len() > 1 || tier || whole)
                 {
-                    let tokens = if tier {
+                    let tokens = if tier || whole {
                         ssd_tier::HOST_TIER_PASS.min(cfg.ctx_size / 2)
                     } else {
                         cfg.long_prompts.micro
                     };
+                    if whole {
+                        cfg.residency.lend_spread_upto = tokens;
+                    }
                     exec.measure_prompt_step(tokens, cfg.ctx_size.saturating_sub(tokens))
                         .map_err(err(format!("a {tokens}-token long prompt step")))?
                 } else {
@@ -5550,11 +5699,17 @@ impl LmEngine {
             // blocks past the device's in its steps, as one GPU alone does.
             tp_node::check_exec(&exec, cfg.tp_pair.is_none() && n_blocks > hbm_blocks)?;
             if start.rank() > 0 {
+                // `--tp-draft-split`: its share of the drafter runs rank 0's draft rounds.
+                let drafter = match std::mem::replace(&mut drafting, Drafting::Off) {
+                    Drafting::Model(d) => Some(d),
+                    _ => None,
+                };
                 return Err(tp_node::follow(
                     exec,
                     start,
                     n_blocks,
                     ring_save_bufts(&layout),
+                    drafter,
                 ));
             }
             let blocks = tp_node::lead(&mut exec, start, n_blocks)?;
@@ -5606,6 +5761,7 @@ impl LmEngine {
                 ring,
                 state_bytes: &stage_state_bytes,
                 compute: &measured_compute,
+                vision_scratch,
                 ngram,
                 engram,
                 saved_host_bytes,
@@ -5850,6 +6006,8 @@ impl LmEngine {
             split_probe: split_probe.clone(),
             lent: false,
             lent_short: false,
+            short_gate,
+            short_gated: false,
             can_lend: cfg.long_prompts.min_tokens > 0,
             long_step,
             long_past,
@@ -6264,6 +6422,12 @@ struct Worker {
     /// Whether the cache is lent to short prompts only (`LongPrompts::short_min_tokens`):
     /// steps are planned as with the cache.
     lent_short: bool,
+    /// Whether a short prompt's lend builds an unlent step's ops over the staged copies
+    /// ([`short_gate_on`], #37).
+    short_gate: bool,
+    /// Whether the cache is lent for a short prompt (not a long one, nor only for mapping the
+    /// KV pools' tail) with [`Self::short_gate`] on: its steps build an unlent step's ops.
+    short_gated: bool,
     /// Whether lending is possible (cleared after a failure).
     can_lend: bool,
     /// #1216: per stage, its long prompt step's compute buffers as measured at load (empty:
@@ -7239,7 +7403,11 @@ impl Worker {
         self.reserved -= seq.reserved;
         seq.reserved = 0;
         match &mut self.drafting {
-            Drafting::Model(d) => d.release(seq.id),
+            Drafting::Model(d) => {
+                d.release(seq.id);
+                // The other ranks' shares of it (`--tp-draft-split`).
+                self.exec.tp_draft_release(seq.id);
+            }
             Drafting::Mtp(d) => {
                 d.release(seq.id);
                 // The head's drafter on node rank 1 (#560).
@@ -7370,7 +7538,7 @@ impl Worker {
             // Lent for the mapping alone (most of a second): all of the tail at once, as the
             // next sequence would lend it again for more. Only a long prompt's lend maps parts.
             blocks = usize::MAX;
-            self.lend_cache(0, usize::MAX);
+            self.lend_cache(0, 0, usize::MAX);
             if self.lent {
                 self.lent_short = true;
                 self.exec.set_pipeline_micro(self.micro);
@@ -7592,7 +7760,7 @@ impl Worker {
                 // its full size again by a lend and the restore the loop runs next.
                 let cut = (self.exec.model().experts()).is_some_and(|x| x.cut_slots() > 0);
                 if cut && !self.lent && self.can_lend {
-                    self.lend_cache(0, usize::MAX);
+                    self.lend_cache(0, 0, usize::MAX);
                     self.lent_short = self.lent;
                 }
             }
@@ -7604,11 +7772,13 @@ impl Worker {
     }
 
     /// Lends the expert cache's VRAM to the long prompt about to be read (see [`LongPrompts`]);
-    /// on failure the cache keeps it and lending stays off. `tokens`: the longest prompt's
-    /// tokens still to read.
-    fn lend_cache(&mut self, tokens: usize, end: usize) {
+    /// on failure the cache keeps it and lending stays off. `tokens`: every prompt's tokens
+    /// still to read (they share the big steps the lend sizes for); `longest`: the longest
+    /// prompt's (its re-pack threshold, [`crate::residency::ResidencyConfig::lend_repack`],
+    /// is per prompt).
+    fn lend_cache(&mut self, tokens: usize, longest: usize, end: usize) {
         let t = Instant::now();
-        match self.exec.lend_experts(tokens) {
+        match self.exec.lend_experts(tokens, longest) {
             Ok(true) => {
                 self.lent = true;
                 (self.long_cap, self.long_reserve) = self.long_micro_cap(end);
@@ -7705,6 +7875,7 @@ impl Worker {
         }
         self.lent = false;
         self.lent_short = false;
+        self.short_gated = false;
         self.long_cap = 0;
         self.long_reserve = 0;
         self.tier_cap = Default::default();
@@ -8000,8 +8171,11 @@ impl Worker {
                 .is_some_and(|n| prefilling.iter().any(|s| left(s) >= n));
         if (long || short) && !self.lent {
             let end = prefilling.iter().map(|s| s.prompt.len()).max().unwrap_or(0);
-            self.lend_cache(prefilling.iter().map(left).max().unwrap_or(0), end);
+            // Every prompt's tokens: they share the big steps a lend sizes for (#37).
+            let longest = prefilling.iter().map(left).max().unwrap_or(0);
+            self.lend_cache(prefilling.iter().map(left).sum(), longest, end);
             self.lent_short = !long;
+            self.short_gated = self.lent && !long && self.short_gate;
             // `--kv-vmm-keep` with `--glm-parallel-decode` (#1174): a long prompt that will
             // pass the kept blocks maps the KV pools' tail now, while the VRAM the lend just
             // freed is free. Mapped mid-prompt, the prompt steps' buffers had taken it first
@@ -8061,7 +8235,14 @@ impl Worker {
         // rest of a long prompt keeps big steps).
         if long {
             self.lent_short = false;
+            self.short_gated = false;
         }
+        // #37: a short prompt's lend builds an unlent step's ops over the staged copies. When
+        // that fails (its flush of the last step's work), the cache keeps the other kind of
+        // lend's ops, which this plan's chunks do not match: the step fails instead.
+        self.exec
+            .set_short_lend(self.short_gated)
+            .map_err(|e| format!("could not mark the short prompt's lend: {e}"))?;
         // #37: a step that runs without the lend lets the expert cache's lent tails take
         // their VRAM back as it starts, so its after-step can swap over every slot.
         if !self.lent
@@ -8713,6 +8894,26 @@ impl Worker {
                 match &mut self.drafting {
                     Drafting::Model(d) => {
                         let t = Instant::now();
+                        // `--tp-draft-split`: every rank runs the round, its share of the FFN. A
+                        // round that fails on any rank still runs all its sums there (zeros), so
+                        // the others' ends and the communicator stays usable (`DflashDrafter`'s
+                        // `round_end`).
+                        let wire = || {
+                            (batch.iter().zip(&offs))
+                                .map(|(r, &off)| crate::node::WireDraft {
+                                    seq: r.seq,
+                                    base: r.tokens.len().saturating_sub(1) as u32,
+                                    tokens: r.tokens.last().copied().into_iter().collect(),
+                                    start: r.start as u32,
+                                    ran: r.ran as u32,
+                                    off: off as u32,
+                                    max: r.max as u32,
+                                    blocks: Vec::new(),
+                                    ring: 0,
+                                })
+                                .collect()
+                        };
+                        self.exec.tp_draft(wire).map_err(|e| e.to_string())?;
                         if hidden_dev.is_empty() {
                             d.step(&mut batch)?;
                         } else {

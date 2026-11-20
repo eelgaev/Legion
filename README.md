@@ -32,7 +32,8 @@ is no other choice (ggml provides the quantized kernels underneath).
   Legion also saves their recurrent states, including one past each reply, so a multi-turn chat or
   an agent loop computes only its new tokens: a repeated 5.8K-token prompt starts in 0.07 s instead
   of 3.6 s on a DGX Spark.
-- **Images.** Qwen3.5 / 3.6 models take images through `--mmproj` (all three APIs and the web UI).
+- **Images.** Qwen3.5 / 3.6, Qwen3.8-27B and Qwen3.8-Flash-Next take images through `--mmproj`, or through the
+  vision tower a checkpoint ships (all three APIs and the web UI).
 - **Fast prefill.** Fused expert kernels, sparse attention and pipelined prompt chunks over several
   GPUs.
 - **Easy to use.** One binary: point `legion serve` at a GGUF file or a checkpoint directory.
@@ -74,7 +75,7 @@ benchmark client. One section per model, one table per machine, one row per engi
 and 16 users: per request at 1 user, the total over all requests at 4 and 16. **Prefill** is one prompt of 8K,
 32K or 123K tokens, in tokens per second. With drafting (MTP, DFlash 2) the 1-user speed
 depends on the prompt: a range such as 23-51 is the slowest to the fastest of the fixed benchmark prompts (prose,
-code, lists, chats), from the 2026-11-03 runs. `—`: not measured or did not finish (see the notes). **Bold**: Legion beats the other engine on the same machine with the same kind of weights (llama.cpp or Project Maya for GGUF,
+code, lists, chats), from each row's latest run (the run pages give the dates). `—`: not measured or did not finish (see the notes). **Bold**: Legion beats the other engine on the same machine with the same kind of weights (llama.cpp or Project Maya for GGUF,
 vLLM for NVFP4, Strata on gaming PCs; at 1 user by median). Legion's greedy output is identical to the run without the opt-in flags unless a note
 says otherwise. Every command, Legion's and the other engines', is
 in [Run commands](#run-commands).
@@ -102,7 +103,7 @@ off. llama.cpp runs across two DGX Sparks with its RPC backend (layer split).
 |---|---|---|--:|--:|--:|--:|--:|--:|
 | Legion | UD-Q4_K_XL GGUF | MTP ⁴ | **55-70** | **112.6** | **216.9** | **2,933** | **2,940** | **2,758** |
 | llama.cpp b12062 | UD-Q4_K_XL GGUF | none ⁵ | 23-26 | 47.4 | 75.0 | 1,066 | 1,064 | 1,014 |
-| Legion | NVFP4 | MTP ⁴ | 44-58 | **121.8** | 248.6 | **3,469** | **3,380** | 3,127 |
+| Legion | NVFP4 | MTP ⁴ | **46-60** | **125.3** | **262.3** | **3,515** | **3,551** | **3,381** |
 | vLLM 0.33.0 | NVFP4 | MTP ⁶ | 43-58 | 116.8 | 248.5 | 3,174 | 3,257 | 3,135 |
 
 #### AC922, 2x V100
@@ -164,6 +165,8 @@ off. llama.cpp runs across two DGX Sparks with its RPC backend (layer split).
 | Engine | Weights | Drafting | Decode, 1 user | 4 users | 16 users | Prefill 8K | 32K | 123K |
 |---|---|---|--:|--:|--:|--:|--:|--:|
 | Legion | QAT UD-Q4_K_XL GGUF | MTP ¹¹ | 37-66 | 119.9 | 202.6 | 975 | 925 | 744 |
+| Legion | NVFP4 | DFlash 2 ¹⁹ | 32-58 | 117.6 | **329.6** | **2,787** | **2,525** | — |
+| vLLM 0.33.0 | NVFP4 | DFlash 2 ⁶ | 35-60 | 124.2 | 290.1 | 2,381 | 1,612 | — |
 
 #### AC922, 2x V100
 
@@ -238,7 +241,10 @@ right after the load, not the fixed benchmark prompts; prefill is one request ea
 ¹⁸ Strata's own speculative decoding (`--spec 4`) and int8 KV; its output differs from Legion's. 64 and 32 GB with
 `--resident-budget-gib 40` and `8` (see the run command).
 
-Measured 2026-10-20 to 2026-11-15. Each new speed record is added here.
+¹⁹ Tensor parallel over one QSFP link, with output-moving opt-in flags (see the run command). 123K was not measured
+for either engine: the prompt takes both Sparks above 80 C within a minute.
+
+Measured 2026-10-20 to 2026-11-20. Each new speed record is added here.
 
 ## Roadmap
 
@@ -275,6 +281,7 @@ The exact `legion serve` command behind every row of the tables, and how it was 
 - [Gemma 4 31B QAT UD-Q4_K_XL, 2x Spark (tensor parallel)](docs/run/spark/gemma-4-31b-qat-ud-q4-k-xl-2x-tp.md)
 - [Gemma 4 31B QAT UD-Q4_K_XL, 1x Spark](docs/run/spark/gemma-4-31b-qat-ud-q4-k-xl-1x.md)
 - [Gemma 4 31B NVFP4 (RedHatAI), 1x Spark](docs/run/spark/gemma-4-31b-nvfp4-1x.md)
+- [Gemma 4 31B NVFP4 (RedHatAI), 2x Spark (tensor parallel)](docs/run/spark/gemma-4-31b-nvfp4-2x-tp.md)
 
 **IBM AC922**
 

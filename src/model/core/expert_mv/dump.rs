@@ -571,6 +571,8 @@ mod hook {
                     balance: i32::from(super::super::balance()),
                     half_tiles: i32::from(super::super::half_tiles_for(o.ty, false, o.n_tok)),
                     pad_rows: std::ptr::null(),
+                    n_pend: 0,
+                    pend: [-1; super::super::MAX_PEND],
                 };
                 // SAFETY: the op's own operands (checked by its launch), one matrix, the scratch
                 // as output.

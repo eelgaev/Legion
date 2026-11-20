@@ -18,6 +18,10 @@
 //! mixers' and experts' matmuls round differently and long prompts' greedy output differs
 //! from `--tp-overlap off` (on the CPU, the reference, it is the same; #758 measured it).
 //!
+//! A model whose steps are not sequence-parallel splits an all-reduce the same way
+//! ([`all_reduce_start`]): a start and a finish per column range of its own (Gemma 4's prompt
+//! steps over two halves of their tokens, #619).
+//!
 //! On a GPU the finishes run in the order of the starts and at most two exchanges are in
 //! flight; on the CPU (the reference) the start does nothing and the finish the whole exchange.
 
@@ -107,16 +111,20 @@ pub struct Params {
     pub j: usize,
     /// The compact layout (else the natural one).
     pub compact: bool,
+    /// An all-reduce of the micro-batch's own tensor ([`all_reduce_start`]): every rank sends
+    /// all of it and gets the sum of all of it; `gather`, `j` and `compact` unused.
+    pub reduce: bool,
 }
 
 impl Params {
-    fn list(&self) -> [i32; 5] {
+    fn list(&self) -> [i32; 6] {
         [
             self.comm,
             self.gather as i32,
             self.n as i32,
             self.j as i32,
             self.compact as i32,
+            self.reduce as i32,
         ]
     }
 
@@ -129,6 +137,7 @@ impl Params {
             n: p[2] as usize,
             j: p[3] as usize,
             compact: p[4] != 0,
+            reduce: p[5] != 0,
         }
     }
 }
@@ -186,6 +195,25 @@ pub fn reduce_scatter_start<'a>(
         n,
         j,
         compact,
+        reduce: false,
+    };
+    start(ctx, x, p)
+}
+
+/// Starts the all-reduce of `x` (F32 `[row, cols]`, this rank's partial of some of a step's
+/// `n` columns, e.g. half of them): its finish is the sum over the ranks of all of `x`, every
+/// value the bits the plain [`super::all_reduce`] of the step's whole `[row, n]` tensor gives
+/// it (the same wire type, chosen by the whole tensor's values, and the same sum in rank
+/// order). For models that split a step's per-token work into column ranges themselves
+/// ([`crate::model::gemma4`]'s prompt steps, #619).
+pub fn all_reduce_start<'a>(ctx: &'a Context, comm: i32, x: Tensor<'a>, n: usize) -> Started<'a> {
+    let p = Params {
+        comm,
+        gather: false,
+        n,
+        j: 0,
+        compact: false,
+        reduce: true,
     };
     start(ctx, x, p)
 }
@@ -205,19 +233,27 @@ pub fn all_gather_start<'a>(
         n,
         j,
         compact,
+        reduce: false,
     };
     start(ctx, x, p)
 }
 
 /// The finish of `s`: a reduce-scatter's sum of this rank's piece (`[row, piece]`), an
-/// all-gather's `[row, span]` ([`span_cols`]) with every rank's piece. `into`: an all-gather
-/// in the natural layout writes into that tensor (the other micro-batch's finished
-/// all-gather, which holds its own pieces), and the result is a view of it holding both.
+/// all-gather's `[row, span]` ([`span_cols`]) with every rank's piece, an all-reduce's sum of
+/// its whole source. `into`: an all-gather in the natural layout writes into that tensor (the
+/// other micro-batch's finished all-gather, which holds its own pieces), and the result is a
+/// view of it holding both.
 pub fn finish<'a>(ctx: &'a Context, s: Started<'a>, into: Option<Tensor<'a>>) -> Tensor<'a> {
     let c = super::comm(s.p.comm).expect("tp micro exchange: the communicator");
     let (rank, ranks) = (c.rank(), c.n_ranks());
     let row = s.x.ne()[0];
-    let cols = if s.p.gather {
+    let cols = if s.p.reduce {
+        assert!(
+            into.is_none(),
+            "tp micro exchange: an all-reduce has its own output"
+        );
+        s.x.ne()[1] as usize
+    } else if s.p.gather {
         span_cols(s.p.n, ranks, s.p.j, s.p.compact)
     } else {
         piece(s.p.n, rank, ranks, s.p.j, s.p.compact).1
@@ -274,6 +310,10 @@ unsafe fn cpu_finish(dst: &ffi::ggml_tensor, ith: usize, _nth: usize) {
         )
     };
     match super::comm(p.comm) {
+        // A failure stays in the communicator, for the step to report.
+        Some(c) if p.reduce => {
+            let _ = c.all_reduce_host_as(src, out, row * p.n);
+        }
         Some(c) => {
             let ranks = c.n_ranks();
             let pieces = |r: usize| piece(p.n, r, ranks, p.j, p.compact);

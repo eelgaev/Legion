@@ -234,6 +234,7 @@ impl Vision {
         tracing::info!(
             tower = %g.path().display(),
             layers = tower.config().n_layer,
+            largest_image_scratch_mib = tower.scratch_bytes() >> 20,
             "vision: images accepted (the vision tower runs on {})",
             tower.place_name()
         );

@@ -511,6 +511,53 @@ fn prefill_takes_the_empty_slots_in_order() {
 }
 
 #[test]
+fn gated_reads_take_the_ram_slots_no_token_routes_to() {
+    use passes::{Learn, learn_pairs};
+    // Positions 0-2 in RAM slots 5, 3, 8 (slot 3 goes out first, then 8, then 5); 3-6 in
+    // the checkpoint, hottest first 6, 4, 3, 5.
+    let learn = Learn {
+        il: 2,
+        experts: vec![10, 11, 12, 13, 14, 15, 16],
+        victims: vec![(1, 3), (2, 8), (0, 5)],
+        incoming: vec![6, 4, 3, 5],
+    };
+    let none = [false; 7];
+    // Positions 1 and 2 unrouted: the two hottest routed reads take their slots.
+    let routed = [true, false, false, true, true, true, true];
+    assert_eq!(
+        learn_pairs(&learn, &routed, &none, &none),
+        vec![(6, 3), (4, 8)]
+    );
+    // Position 1 copied ahead keeps its slot; 6 read ahead into a place is not moved.
+    let mut busy = none;
+    busy[1] = true;
+    let mut claimed = none;
+    claimed[6] = true;
+    assert_eq!(learn_pairs(&learn, &routed, &busy, &claimed), vec![(4, 8)]);
+    // Unrouted reads take nothing; every expert routed (an empty mask), nothing moves.
+    let routed = [false, false, false, false, true, false, false];
+    assert_eq!(learn_pairs(&learn, &routed, &none, &none), vec![(4, 3)]);
+    assert_eq!(learn_pairs(&learn, &[], &none, &none), vec![]);
+}
+
+#[test]
+fn gated_reads_ahead_the_share_routed_before() {
+    use passes::ahead_count;
+    let big = u64::MAX;
+    // Half before any batch is routed (rounded up).
+    assert_eq!(ahead_count(73, 0, 0, EXPERT, big), 37);
+    // 40 of 100 routed so far: 40.5% (Laplace) of 73.
+    assert_eq!(ahead_count(73, 100, 40, EXPERT, big), 30);
+    // All routed: all of them; none routed: one.
+    assert_eq!(ahead_count(73, 1000, 1000, EXPERT, big), 73);
+    assert_eq!(ahead_count(73, 1000, 0, EXPERT, big), 1);
+    // The byte budget caps it; no budget, none.
+    assert_eq!(ahead_count(73, 0, 0, EXPERT, 10 * EXPERT + 1), 10);
+    assert_eq!(ahead_count(73, 0, 0, EXPERT, 0), 0);
+    assert_eq!(ahead_count(0, 0, 0, EXPERT, big), 0);
+}
+
+#[test]
 fn sources_are_named_like_the_models_tensors() {
     assert_eq!(
         skipped_tensors(1),

@@ -81,6 +81,9 @@
 
 extern "C" {
 
+// legion_expert_mv::pend's entries (`MAX_PEND` in expert_mv.rs).
+#define LEGION_EXPERT_MV_MAX_PEND 32
+
 struct legion_expert_mv {
     const char * w;        // expert 0
     const char * w2;       // with SwiGLU: the up projection (same layout as w), else null
@@ -151,6 +154,10 @@ struct legion_expert_mv {
     // padding row when pad_rows[t] != t. A padding row's pair whose expert no real row's pair chose
     // is skipped (expert_of), its rows written 0 (zero_skipped is set with it).
     const int32_t * pad_rows;
+    // Parts 5 and 6 (#37 round 36): the host experts whose reads are still under way, n_pend of
+    // them. Part 5 computes the other host experts' pairs, part 6 these.
+    int32_t n_pend;
+    int32_t pend[LEGION_EXPERT_MV_MAX_PEND];
 };
 
 // stage_copy: copies the host experts of a step's pairs (each expert once, its first pair's,
@@ -648,8 +655,16 @@ __device__ __forceinline__ int expert_of(const legion_expert_mv & p, int pair) {
 }
 
 // Whether expert `e` is one of the pairs `part` computes: VRAM (1) or host (2, 4) ones, or any
-// (0, 3). Parts 3 and 4 also look at the staging table (tile_one).
+// (0, 3); host ones whose reads are done (5) or under way (6, `pend`). Parts 3 and 4 also look at
+// the staging table (tile_one).
 __device__ __forceinline__ bool in_part(const legion_expert_mv & p, int e) {
+    if (p.part >= 5) {
+        bool pending = false;
+        for (int i = 0; i < p.n_pend; i++) {
+            pending |= p.pend[i] == e;
+        }
+        return e >= p.vram_below && (p.part == 6) == pending;
+    }
     return p.part == 0 || p.part == 3 || (p.part == 1) == (e < p.vram_below);
 }
 
