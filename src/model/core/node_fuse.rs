@@ -135,6 +135,9 @@ pub unsafe fn rewrite(graph: *mut ffi::ggml_cgraph) {
         fuse(graph);
         #[cfg(feature = "cuda")]
         crate::residency::cpu_share::shexp::place_shexp(graph);
+        // Last: the matmuls a TP all-reduce sends straight from (#1133), as the graph runs.
+        #[cfg(feature = "cuda")]
+        crate::tp_net::micro::send_gemm::take(graph);
     }
 }
 
