@@ -74,7 +74,7 @@ benchmark client. One section per model, one table per machine, one row per engi
 and 16 users: per request at 1 user, the total over all requests at 4 and 16. **Prefill** is one prompt of 8K,
 32K or 123K tokens, in tokens per second. With drafting (MTP, DFlash 2) the 1-user speed
 depends on the prompt: a range such as 23-51 is the slowest to the fastest of the fixed benchmark prompts (prose,
-code, lists, chats), from the 2026-11-03 runs. `—`: not measured or did not finish (see the notes). **Bold**: Legion beats the other engine on the same machine with the same kind of weights (llama.cpp or Project Maya for GGUF,
+code, lists, chats), from each row's latest run (the run pages give the dates). `—`: not measured or did not finish (see the notes). **Bold**: Legion beats the other engine on the same machine with the same kind of weights (llama.cpp or Project Maya for GGUF,
 vLLM for NVFP4, Strata on gaming PCs; at 1 user by median). Legion's greedy output is identical to the run without the opt-in flags unless a note
 says otherwise. Every command, Legion's and the other engines', is
 in [Run commands](#run-commands).
@@ -102,7 +102,7 @@ off. llama.cpp runs across two DGX Sparks with its RPC backend (layer split).
 |---|---|---|--:|--:|--:|--:|--:|--:|
 | Legion | UD-Q4_K_XL GGUF | MTP ⁴ | **55-70** | **112.6** | **216.9** | **2,933** | **2,940** | **2,758** |
 | llama.cpp b12062 | UD-Q4_K_XL GGUF | none ⁵ | 23-26 | 47.4 | 75.0 | 1,066 | 1,064 | 1,014 |
-| Legion | NVFP4 | MTP ⁴ | 44-58 | **121.8** | 248.6 | **3,469** | **3,380** | 3,127 |
+| Legion | NVFP4 | MTP ⁴ | **46-60** | **125.3** | **262.3** | **3,515** | **3,551** | **3,381** |
 | vLLM 0.33.0 | NVFP4 | MTP ⁶ | 43-58 | 116.8 | 248.5 | 3,174 | 3,257 | 3,135 |
 
 #### AC922, 2x V100
