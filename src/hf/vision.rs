@@ -30,6 +30,10 @@ const MODEL_TYPES: [&str; 3] = ["qwen3_5", "qwen3_5_moe", "qwen4_exp"];
 
 const PREFIX: &str = "model.visual.";
 
+/// Gemma 4 checkpoints (#1217): `model.vision_tower.*` and `model.embed_vision.*`.
+const GEMMA_MODEL_TYPE: &str = "gemma4";
+const GEMMA_PREFIX: &str = "model.vision_tower.";
+
 /// The vision tower of the checkpoint in `dir` as a synthetic mmproj, or `None` when it has
 /// none (a text-only checkpoint, or a model type without a Qwen3-VL tower).
 pub fn open_vision(dir: &Path) -> Result<Option<GgufFile>, GgufError> {
@@ -42,9 +46,20 @@ pub fn open_vision(dir: &Path) -> Result<Option<GgufFile>, GgufError> {
         return Ok(None);
     };
     let model_type = config.get("model_type").and_then(Json::as_str);
-    let Some(vision) = config.get("vision_config") else {
+    let Some(vision) = config.get("vision_config").filter(|v| !v.is_null()) else {
         return Ok(None);
     };
+    if model_type == Some(GEMMA_MODEL_TYPE) {
+        if ckpt
+            .locate(&format!("{GEMMA_PREFIX}patch_embedder.input_proj.weight"))
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let mut b = Builder::new(Arc::new(ckpt));
+        build_gemma(&mut b, vision, dir).map_err(err)?;
+        return b.finish(dir.to_path_buf()).map(Some);
+    }
     if !model_type.is_some_and(|t| MODEL_TYPES.contains(&t))
         || ckpt
             .locate(&format!("{PREFIX}patch_embed.proj.weight"))
@@ -90,35 +105,7 @@ fn build(b: &mut Builder, config: &Json, v: &Json, dir: &Path) -> Result<(), Str
         .get("image_size")
         .and_then(Json::as_u64)
         .unwrap_or((n_pos as f64).sqrt() as u64 * patch);
-    // The image processor's mean and std (`preprocessor_config.json`, else
-    // `processor_config.json`'s `image_processor`), as the converter reads them.
-    let mut mean_std = None;
-    for (file, key) in [
-        ("preprocessor_config.json", None),
-        ("processor_config.json", Some("image_processor")),
-    ] {
-        let Ok(s) = std::fs::read_to_string(dir.join(file)) else {
-            continue;
-        };
-        let j: Json = serde_json::from_str(&s).map_err(|e| format!("{file}: {e}"))?;
-        let j = key.and_then(|k| j.get(k)).unwrap_or(&j);
-        let three = |k: &str| -> Option<Vec<Value>> {
-            let a = j.get(k)?.as_array()?;
-            (a.len() == 3)
-                .then(|| {
-                    a.iter()
-                        .map(|x| Some(Value::F32(x.as_f64()? as f32)))
-                        .collect()
-                })
-                .flatten()
-        };
-        if let (Some(m), Some(s)) = (three("image_mean"), three("image_std")) {
-            mean_std = Some((m, s));
-            break;
-        }
-    }
-    let (mean, std) = mean_std
-        .ok_or("no image_mean / image_std in preprocessor_config.json or processor_config.json")?;
+    let (mean, std) = image_mean_std(dir)?;
 
     let u = Value::U32;
     b.set("general.architecture", Value::String("clip".into()))?;
@@ -182,6 +169,187 @@ fn build(b: &mut Builder, config: &Json, v: &Json, dir: &Path) -> Result<(), Str
         linear(b, name, &src(from))?;
     }
     Ok(())
+}
+
+/// A Gemma 4 checkpoint's tower (`vision_config` `v`) as the `gemma4v` mmproj llama.cpp's
+/// converter writes for it (`Gemma4VisionAudioModel` in `conversion/gemma.py`, and its
+/// `tensor_mapping.py` names, MIT): `encoder.layers.{i}.input_layernorm` /
+/// `pre_feedforward_layernorm` -> `v.blk.{i}.ln1` / `ln2`, `post_attention_layernorm` /
+/// `post_feedforward_layernorm` -> `attn_post_norm` / `ffn_post_norm`, `self_attn.{q,k,v,o}_proj`
+/// -> `attn_q/k/v/out`, `self_attn.{q,k}_norm` -> `attn_{q,k}_norm`, `mlp.{gate,up,down}_proj`
+/// -> `ffn_gate/up/down`; `patch_embedder.input_proj` (a linear over a patch's `p × p × 3`
+/// values) -> the conv kernel `v.patch_embd.weight` (`[n, 3, p, p]`), its position table ->
+/// `v.position_embd.weight` (F32, as the converter forces), `std_bias` / `std_scale` ->
+/// `v.std_bias` / `v.std_scale`, and `model.embed_vision.embedding_projection` ->
+/// `mm.input_projection.weight`. Clipped linears (`use_clipped_linears`) are refused, as the
+/// encoder refuses them.
+fn build_gemma(b: &mut Builder, v: &Json, dir: &Path) -> Result<(), String> {
+    let vu = |k: &str| num_u(v, k).map_err(|e| format!("vision_config: {e}"));
+    if v.get("use_clipped_linears").and_then(Json::as_bool) == Some(true) {
+        return Err("vision_config: clipped linears are not supported".into());
+    }
+    let depth = vu("num_hidden_layers")?;
+    let width = vu("hidden_size")?;
+    let patch = vu("patch_size")?;
+    let pool = v
+        .get("pooling_kernel_size")
+        .and_then(Json::as_u64)
+        .unwrap_or(3);
+    let (mean, std) = image_mean_std(dir)?;
+    let u = Value::U32;
+    b.set("general.architecture", Value::String("clip".into()))?;
+    b.set("general.type", Value::String("mmproj".into()))?;
+    b.set("clip.has_vision_encoder", Value::Bool(true))?;
+    b.set("clip.use_gelu", Value::Bool(true))?;
+    b.set(
+        "clip.vision.projector_type",
+        Value::String("gemma4v".into()),
+    )?;
+    for (k, val) in [
+        ("image_size", u(224)),
+        ("patch_size", u(patch as u32)),
+        ("embedding_length", u(width as u32)),
+        ("feed_forward_length", u(vu("intermediate_size")? as u32)),
+        ("block_count", u(depth as u32)),
+        ("attention.head_count", u(vu("num_attention_heads")? as u32)),
+        (
+            "attention.layer_norm_epsilon",
+            Value::F32(num_f(v, "rms_norm_eps").unwrap_or(1e-6) as f32),
+        ),
+        ("projector.scale_factor", u(pool as u32)),
+        ("image_mean", Value::Array(mean)),
+        ("image_std", Value::Array(std)),
+    ] {
+        b.set(&format!("clip.vision.{k}"), val)?;
+    }
+    let src = |s: &str| format!("{GEMMA_PREFIX}{s}");
+    gemma_patch_kernel(b, &src("patch_embedder.input_proj.weight"))?;
+    widened(
+        b,
+        "v.position_embd.weight",
+        &src("patch_embedder.position_embedding_table"),
+    )?;
+    widened(b, "v.std_bias", &src("std_bias"))?;
+    widened(b, "v.std_scale", &src("std_scale"))?;
+    weight(
+        b,
+        "mm.input_projection.weight",
+        "model.embed_vision.embedding_projection.weight",
+    )?;
+    for il in 0..depth {
+        let blk = |s: &str| src(&format!("encoder.layers.{il}.{s}.weight"));
+        let to = |s: &str| format!("v.blk.{il}.{s}.weight");
+        for (from, name) in [
+            ("input_layernorm", "ln1"),
+            ("pre_feedforward_layernorm", "ln2"),
+            ("post_attention_layernorm", "attn_post_norm"),
+            ("post_feedforward_layernorm", "ffn_post_norm"),
+            ("self_attn.q_proj.linear", "attn_q"),
+            ("self_attn.k_proj.linear", "attn_k"),
+            ("self_attn.v_proj.linear", "attn_v"),
+            ("self_attn.o_proj.linear", "attn_out"),
+            ("self_attn.q_norm", "attn_q_norm"),
+            ("self_attn.k_norm", "attn_k_norm"),
+            ("mlp.gate_proj.linear", "ffn_gate"),
+            ("mlp.up_proj.linear", "ffn_up"),
+            ("mlp.down_proj.linear", "ffn_down"),
+        ] {
+            weight(b, &to(name), &blk(from))?;
+        }
+    }
+    Ok(())
+}
+
+/// `name` from `src` without a bias: a 1-D weight widened to F32, a BF16 matrix F16, any
+/// other as shipped ([`linear`]).
+fn weight(b: &mut Builder, name: &str, src: &str) -> Result<(), String> {
+    let (_, t) = b.source(src)?;
+    if t.shape.len() == 1 {
+        widened(b, name, src)
+    } else if t.dtype == Dtype::BF16 {
+        f16_matrix(b, name, src)
+    } else {
+        b.direct(name, src, None)
+    }
+}
+
+/// Gemma 4's patch linear `src` (`[n, p × p × 3]`, a patch's values row by row, channels
+/// last) as the conv kernel `v.patch_embd.weight` (`[n, 3, p, p]`, ggml `[p, p, 3, n]`), F32:
+/// the converter's `reshape(n, p, p, 3).permute(0, 3, 1, 2)`.
+fn gemma_patch_kernel(b: &mut Builder, src: &str) -> Result<(), String> {
+    let (_, t) = b.source(src)?;
+    let [n, k] = t.shape[..] else {
+        return Err(format!(
+            "`{src}`: shape {:?}, expected [n, p * p * 3]",
+            t.shape
+        ));
+    };
+    let p = (1..=k).find(|p| p * p * 3 >= k).unwrap_or(0);
+    if p * p * 3 != k {
+        return Err(format!("`{src}`: {k} values a patch, not p * p * 3"));
+    }
+    let (n, p) = (n as usize, p as usize);
+    let ckpt = b.ckpt.clone();
+    let from = src.to_string();
+    let compute: Compute = Arc::new(move || {
+        let (_, t) = ckpt.locate(&from).ok_or("tensor disappeared")?;
+        let bytes = ckpt.data(&from).map_err(|e| e.to_string())?;
+        let x = to_f32(&t.dtype, bytes).ok_or_else(|| format!("`{from}`: not a float tensor"))?;
+        let mut out = Vec::with_capacity(x.len() * 4);
+        for row in x.chunks_exact(p * p * 3).take(n) {
+            for c in 0..3 {
+                for y in 0..p {
+                    for xx in 0..p {
+                        out.extend_from_slice(&row[(y * p + xx) * 3 + c].to_le_bytes());
+                    }
+                }
+            }
+        }
+        Ok(out)
+    });
+    b.push(
+        "v.patch_embd.weight",
+        types::F32,
+        vec![p as u64, p as u64, 3, n as u64],
+        0,
+        0,
+    );
+    b.recipes
+        .insert("v.patch_embd.weight".to_string(), Recipe::Computed(compute));
+    Ok(())
+}
+
+/// The image processor's mean and std (`preprocessor_config.json`, else
+/// `processor_config.json`'s `image_processor`), as the converter reads them.
+fn image_mean_std(dir: &Path) -> Result<(Vec<Value>, Vec<Value>), String> {
+    let mut mean_std = None;
+    for (file, key) in [
+        ("preprocessor_config.json", None),
+        ("processor_config.json", Some("image_processor")),
+    ] {
+        let Ok(s) = std::fs::read_to_string(dir.join(file)) else {
+            continue;
+        };
+        let j: Json = serde_json::from_str(&s).map_err(|e| format!("{file}: {e}"))?;
+        let j = key.and_then(|k| j.get(k)).unwrap_or(&j);
+        let three = |k: &str| -> Option<Vec<Value>> {
+            let a = j.get(k)?.as_array()?;
+            (a.len() == 3)
+                .then(|| {
+                    a.iter()
+                        .map(|x| Some(Value::F32(x.as_f64()? as f32)))
+                        .collect()
+                })
+                .flatten()
+        };
+        if let (Some(m), Some(s)) = (three("image_mean"), three("image_std")) {
+            mean_std = Some((m, s));
+            break;
+        }
+    }
+    mean_std.ok_or_else(|| {
+        "no image_mean / image_std in preprocessor_config.json or processor_config.json".into()
+    })
 }
 
 /// `name.weight` / `name.bias` from `src.weight` / `src.bias`: a 1-D weight (a norm's) widened

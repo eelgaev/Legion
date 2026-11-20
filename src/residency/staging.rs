@@ -240,7 +240,7 @@ impl Core {
     fn queue_whole(&mut self) -> Result<(), String> {
         let q = self.queued;
         if let (Some(r), Some(g)) = (self.router.as_ref(), self.gates.get(q)) {
-            r(q, &vec![true; g.len()]);
+            r(q, &vec![true; g.len()], &[]);
         }
         self.queue_next()
     }
@@ -253,16 +253,19 @@ impl Core {
         let t0 = std::time::Instant::now();
         let q = self.queued;
         let row = self.plan[q].0;
-        let gate = &self.gates[q];
-        let want = gate.routed(ids);
+        let want = self.gates[q].routed(ids);
         let ahead = match self.ahead_of.take() {
             Some((i, v)) if i == q => v,
             _ => Vec::new(),
         };
-        // The bounded host tier's reader reads the routed experts of the row's batches.
+        // The bounded host tier's reader reads the routed experts of the row's batches, some
+        // into RAM slots, which their copies then read.
         if let Some(r) = self.router.as_ref() {
-            r(q, &want);
+            for (i, slot) in r(q, &want, &ahead) {
+                self.gates[q].to_slot(i, slot);
+            }
         }
+        let gate = &self.gates[q];
         let copies = gate.copies(&want, &ahead, true);
         let reads = gate.read_copies(&want, &ahead, |b, release| {
             use super::host_tier::{release_arg, wait_arg};
@@ -580,7 +583,9 @@ impl Staging {
         if gates.len() != plan.len() || self.core.lock().unwrap().ahead.is_some() {
             if let Some(r) = &router {
                 // An empty mask: every expert.
-                (0..plan.len()).for_each(|q| r(q, &[]));
+                (0..plan.len()).for_each(|q| {
+                    r(q, &[], &[]);
+                });
             }
             return self.begin(plan, false);
         }

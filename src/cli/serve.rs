@@ -131,10 +131,11 @@ pub(super) struct ModelArgs {
         conflicts_with = "model"
     )]
     pub hfmodel: Option<String>,
-    /// A vision projector (mmproj GGUF, `qwen3vl_merger`, e.g. unsloth's `mmproj-F16.gguf`) for
-    /// a Qwen3.5 / Qwen3.6 / Qwen3.8-Flash-Next model: requests may then carry images (all
-    /// three APIs and the web UI), and the model advertises vision. Its tower runs on the CPU
-    /// (up to 8 threads), seconds per image. Default: an HF checkpoint's own vision tower
+    /// A vision projector (mmproj GGUF, `qwen3vl_merger`, e.g. unsloth's `mmproj-F16.gguf` or
+    /// `mmproj-BF16.gguf`) for a Qwen3.5 / Qwen3.6 / Qwen3.8-27B / Qwen3.8-Flash-Next model:
+    /// requests may then carry images (all three APIs and the web UI), and the model advertises
+    /// vision. Its tower runs on the model's first GPU (sm_70 or newer), else on the CPU (up to
+    /// 8 threads, seconds per image). Default: an HF checkpoint's own vision tower
     /// (`model.visual.*`) when it ships one, else none (text only).
     #[arg(long, value_name = "GGUF", conflicts_with = "no_mmproj")]
     pub mmproj: Option<PathBuf>,
@@ -774,11 +775,14 @@ pub(super) struct ModelArgs {
     /// With --tp-rank and --spec dflash (a Hugging Face drafter checkpoint): split the
     /// drafter's FFN over the ranks like the target's. Without it rank 0 runs every draft
     /// pass alone while the other ranks wait. With it each rank holds its share of every
-    /// drafter layer's FFN rows (the rest of the drafter whole, the head on rank 0 only in
-    /// use), every rank runs each draft round, and one all-reduce per drafter layer adds the
-    /// FFN outputs. The sums' order changes, so drafts (and with them acceptance and greedy
-    /// output) may differ in bits from rank 0 drafting alone. Every rank must pass it. Off
-    /// by default.
+    /// drafter layer's FFN rows (the rest of the drafter whole), every rank runs each draft
+    /// round, and one all-reduce per drafter layer adds the FFN outputs. On two ranks with a
+    /// DFlash 2 drafter, greedy drafts (--spec-draft-temperature 0) and a Q4_K head
+    /// (--spec-draft-weights q4), the head is split too: each rank takes the top candidates
+    /// of half the vocabulary and rank 0 keeps the best of both, the same candidates as the
+    /// whole head's; otherwise the head runs on rank 0 only. The FFN sums' order changes, so
+    /// drafts (and with them acceptance and greedy output) may differ in bits from rank 0
+    /// drafting alone. Every rank must pass it. Off by default.
     #[arg(long, requires = "tp_rank")]
     pub tp_draft_split: bool,
     /// With --tp-rank, Qwen3.8-Flash-Next (qwen4exp): expert parallelism for the routed
@@ -1352,8 +1356,7 @@ struct EngineArgs {
     /// keep the chunks they have without a lend, so the same outputs (0: never). Default: 128
     /// for GLM-5.3-Flash over several GPUs, where a short prompt's in-place expert reads are
     /// slow, and on one GPU whose prompt steps copy only the experts they route to (every
-    /// routed expert in host memory, or the host expert tier with RAM slots for at least half
-    /// of each layer's experts), 0 otherwise.
+    /// routed expert in host memory, or the host expert tier), 0 otherwise.
     #[arg(long, value_name = "N")]
     short_prompt_tokens: Option<usize>,
     /// Model engine: tokens per forward pass while a long prompt borrows the cache.

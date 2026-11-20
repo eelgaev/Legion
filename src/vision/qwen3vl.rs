@@ -45,7 +45,8 @@ pub struct EncoderConfig {
     pub eps: f32,
     pub patch_size: usize,
     pub merge: usize,
-    /// Side of the learned position grid (`v.position_embd.weight` has `side²` rows).
+    /// Side of the learned position grid (`v.position_embd.weight` has `side²` rows); Gemma
+    /// 4's tables' rows (one table for columns, one for rows).
     pub pos_side: usize,
     /// Width of an output row: the language model's embedding width.
     pub n_out: usize,
@@ -61,6 +62,9 @@ impl EncoderConfig {
                 .ok_or_else(|| meta(&format!("clip.vision.{k}")))
         };
         let n_layer = int("block_count")?;
+        if hp.projector == super::Projector::Gemma4v {
+            return super::gemma4v::config(g, hp, n_layer);
+        }
         if let Some(v) = g.get("clip.vision.is_deepstack_layers")
             && v.as_array()
                 .is_some_and(|a| a.iter().any(|x| x.as_bool() == Some(true)))
@@ -105,7 +109,7 @@ impl EncoderConfig {
         Ok(cfg)
     }
 
-    fn d_head(&self) -> usize {
+    pub(super) fn d_head(&self) -> usize {
         self.n_embd / self.n_head
     }
 }
@@ -133,11 +137,11 @@ impl ImageEmbedding {
 
 /// The tower's weights on a backend, and the backend.
 pub struct Encoder {
-    cfg: EncoderConfig,
-    hp: VisionHparams,
-    weights: Weights,
-    backend: Backend,
-    alloc: Option<ComputeAllocator>,
+    pub(super) cfg: EncoderConfig,
+    pub(super) hp: VisionHparams,
+    pub(super) weights: Weights,
+    pub(super) backend: Backend,
+    pub(super) alloc: Option<ComputeAllocator>,
 }
 
 impl Encoder {
@@ -186,6 +190,9 @@ impl Encoder {
     }
 
     fn names(&self) -> Vec<String> {
+        if self.hp.projector == super::Projector::Gemma4v {
+            return super::gemma4v::names(self.cfg.n_layer);
+        }
         let mut v: Vec<String> = [
             "v.patch_embd.weight",
             "v.patch_embd.weight.1",
@@ -222,6 +229,9 @@ impl Encoder {
 
     /// The tower's output for `p` (see the module docs).
     pub fn encode(&mut self, p: &Preprocessed) -> Result<ImageEmbedding, VisionError> {
+        if self.hp.projector == super::Projector::Gemma4v {
+            return super::gemma4v::encode(self, p);
+        }
         let c = &self.cfg;
         let (px, py) = (p.grid_w as usize, p.grid_h as usize);
         if px % c.merge != 0 || py % c.merge != 0 || px == 0 || py == 0 {
@@ -363,7 +373,7 @@ impl Encoder {
     }
 }
 
-fn weight<'w>(weights: &'w Weights, name: &str) -> Result<Tensor<'w>, VisionError> {
+pub(super) fn weight<'w>(weights: &'w Weights, name: &str) -> Result<Tensor<'w>, VisionError> {
     weights
         .get(name)
         .ok_or_else(|| VisionError::Metadata(format!("the mmproj has no tensor `{name}`")))

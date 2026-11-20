@@ -60,3 +60,194 @@ fn rows_and_counts() {
     assert_eq!(m.first_image(), Some(2));
     assert!(Media::default().is_empty());
 }
+
+/// Gemma 4 (#1217): every token at its own index, images or not; an image token's last key on
+/// the sliding-window layers is its image's last token.
+#[test]
+fn sequential_positions_and_image_ends() {
+    let m = Media::sequential(vec![span(2, 3, 2, 1), span(10, 1, 1, 1)], 1);
+    assert_eq!(m.layout(), ImageLayout::Sequential);
+    for i in 0..14 {
+        assert_eq!(m.rope(i), [i as i32, i as i32, i as i32, 0]);
+    }
+    assert_eq!(m.span_end(1), None);
+    assert_eq!(m.span_end(2), Some(7));
+    assert_eq!(m.span_end(7), Some(7));
+    assert_eq!(m.span_end(8), None);
+    assert_eq!(m.span_end(10), Some(10));
+    assert_eq!(m.row(3), Some(&[1.0f32][..]));
+    // The M-RoPE layout's spans end at the same tokens.
+    let q = Media::new(vec![span(2, 3, 2, 1)], 1);
+    assert_eq!(q.layout(), ImageLayout::MRope);
+    assert_eq!(q.span_end(5), Some(7));
+}
+
+/// A prompt chunk never ends inside an image: it stops before an image it reaches, or takes
+/// the whole of one it starts with when that fits `cap`.
+#[test]
+fn chunks_do_not_cut_images() {
+    let m = Media::sequential(vec![span(10, 4, 5, 1), span(40, 2, 2, 1)], 1);
+    // Ends before, at the start of, or right after an image: as asked.
+    assert_eq!(m.uncut(0, 8, 64), 8);
+    assert_eq!(m.uncut(0, 10, 64), 10);
+    assert_eq!(m.uncut(0, 30, 64), 30);
+    // Inside an image the chunk reaches: back to the image's start.
+    assert_eq!(m.uncut(0, 15, 64), 10);
+    assert_eq!(m.uncut(30, 42, 64), 40);
+    // Inside an image the chunk starts with (or resumes in): on to its end, within `cap`.
+    assert_eq!(m.uncut(10, 15, 64), 30);
+    assert_eq!(m.uncut(12, 15, 64), 30);
+    assert_eq!(m.uncut(10, 15, 20), 30);
+    assert_eq!(m.uncut(10, 15, 19), 15, "longer than cap: cut");
+    assert_eq!(Media::default().uncut(0, 5, 1), 5);
+}
+
+/// A step's micro-chunks never cut an image either; with no image cut, the pieces are the
+/// ones asked for (text-only steps keep theirs). An image's piece is at most the largest
+/// piece, or the largest image the tower takes when that is more.
+#[test]
+fn micro_chunks_do_not_cut_images() {
+    // An image of 300 tokens at 3,000: the cut at 3,072 moves back to its start, the image
+    // is a piece of its own and the next one goes on to the next cut.
+    let m = Media::sequential(vec![span(3000, 20, 15, 1)], 1);
+    assert_eq!(
+        m.uncut_sizes(0, &[3072, 3072, 784], 0),
+        vec![3000, 300, 2844, 784]
+    );
+    // The same prompt from n_past 100: the image is at 2,900..3,200 of the chunk.
+    assert_eq!(m.uncut_sizes(100, &[3072, 3072], 0), vec![2900, 300, 2944]);
+    // No cut inside the image: the same pieces.
+    assert_eq!(
+        m.uncut_sizes(0, &[2048, 2048, 2048], 1120),
+        vec![2048, 2048, 2048]
+    );
+    assert_eq!(m.uncut_sizes(3300, &[3072, 1000], 0), vec![3072, 1000]);
+    // A chunk that starts inside the image: its cuts move past its end.
+    assert_eq!(m.uncut_sizes(3100, &[50, 50, 900], 0), vec![200, 800]);
+    // An image of 4,000 tokens, longer than the largest piece (3,072): whole when the tower
+    // takes images that long, its own piece from its start to its end.
+    let m = Media::sequential(vec![span(1000, 100, 40, 1)], 1);
+    assert_eq!(
+        m.uncut_sizes(0, &[3072, 3072, 784], 4000),
+        vec![1000, 4000, 1144, 784]
+    );
+    assert_eq!(m.uncut_sizes(0, &[3072, 1928], 4000), vec![1000, 4000]);
+    assert_eq!(m.uncut_sizes(1000, &[3072, 928], 4000), vec![4000]);
+    assert_eq!(m.uncut_sizes(3000, &[500, 1500], 4000), vec![2000]);
+    // Longer than both (no such image is taken, `Vision::expand`): cut where the pieces were,
+    // none longer.
+    for (from, sizes) in [
+        (0, &[3072, 3072, 784][..]),
+        (0, &[3072, 1928]),
+        (1000, &[3072, 928]),
+    ] {
+        assert_eq!(m.uncut_sizes(from, sizes, 3999), sizes.to_vec());
+    }
+    // A chunk that starts inside it with less than a piece of it left: one piece to its end.
+    assert_eq!(m.uncut_sizes(4000, &[500, 1500], 0), vec![1000, 1000]);
+    assert_eq!(m.uncut_sizes(3000, &[500, 1500], 0), vec![500, 1500]);
+    // Two images, each cut: each whole in one piece.
+    let m = Media::sequential(vec![span(10, 4, 5, 1), span(40, 2, 2, 1)], 1);
+    assert_eq!(m.uncut_sizes(0, &[16, 26, 8], 20), vec![10, 20, 10, 4, 6]);
+    // No images: the same pieces.
+    let sizes = [3072, 2048, 1024, 17];
+    assert_eq!(
+        Media::default().uncut_sizes(5, &sizes, 1120),
+        sizes.to_vec()
+    );
+    assert_eq!(m.uncut_sizes(0, &[7], 20), vec![7]);
+}
+
+/// A lone prompt over several stages with rings: the step is longer than the ring step and
+/// its micro-chunks are the ring step (512 here). With a Gemma 4 tower (images of up to
+/// 1,120 tokens) the rings hold a 1,120-token step: an image after a full window of text is a
+/// piece of its own, of up to 1,120 tokens, and the text pieces stay at most 512. Every piece
+/// fits the rings (the text-sized rings do not hold a 700-token piece, which would overwrite
+/// keys its first rows still read), and a text-only step keeps its pieces.
+#[test]
+fn micro_chunks_fit_the_rings() {
+    use crate::model::core::KvRing;
+    let (window, step, image) = (1024, 512, 1120);
+    let text = KvRing::for_window(window, step, 1).positions();
+    let rings = KvRing::for_window(window, step.max(image), 1).positions();
+    assert_eq!((text, rings), (1600, 2240));
+    // A piece's last key lands on the cell of the key `positions` before it; its first row
+    // reads `window - 1` keys back, so the two must be under `positions` apart.
+    let fits = |len: usize, positions: usize| len + window - 2 < positions;
+    assert!(fits(step, text) && !fits(700, text));
+    assert!(fits(image, rings) && !fits(1218, rings));
+    let micro = vec![512; 8];
+    let check = |v: &[usize], len: usize| {
+        assert_eq!(v.iter().sum::<usize>(), 4096);
+        assert!(
+            v.iter().all(|&l| fits(l, rings) && (l <= step || l == len)),
+            "{v:?}"
+        );
+    };
+    // 1,300 text tokens (more than the window), then a 700-token image (28 × 25), then text.
+    let m = Media::sequential(vec![span(1300, 28, 25, 1)], 1);
+    let v = m.uncut_sizes(0, &micro, image);
+    assert_eq!(v, vec![512, 512, 276, 700, 48, 512, 512, 512, 512]);
+    check(&v, 700);
+    // The largest image (35 × 32) there.
+    let m = Media::sequential(vec![span(1300, 35, 32, 1)], 1);
+    let v = m.uncut_sizes(0, &micro, image);
+    assert_eq!(v, vec![512, 512, 276, 1120, 140, 512, 512, 512]);
+    check(&v, 1120);
+    // A 300-token image (20 × 15): a piece of its own within the micro-chunk.
+    let m = Media::sequential(vec![span(1300, 20, 15, 1)], 1);
+    let v = m.uncut_sizes(0, &micro, image);
+    assert_eq!(v, vec![512, 512, 276, 300, 448, 512, 512, 512, 512]);
+    check(&v, 300);
+    // From n_past 2,000 (the window already full of text before the step).
+    let m = Media::sequential(vec![span(2300, 28, 25, 1)], 1);
+    let v = m.uncut_sizes(2000, &micro, image);
+    assert_eq!(v, vec![300, 700, 24, 512, 512, 512, 512, 512, 512]);
+    check(&v, 700);
+    // Text only: the micro-chunks.
+    assert_eq!(Media::default().uncut_sizes(2000, &micro, image), micro);
+}
+
+/// The planner's steps (`Worker::plan_step`: `Media::uncut` with the step's room or the
+/// largest image, whichever is more) never cut an image: a step stops at an image's start,
+/// the next takes it whole, past the room (the ring step, or what the batch leaves) when it is
+/// longer. Text steps keep their room; without the largest image (0) an image longer than the
+/// room is cut, as before #1217.
+#[test]
+fn steps_keep_images_whole() {
+    let plan = |m: &Media, n: usize, room: usize, image: usize| {
+        let mut steps = Vec::new();
+        let mut p = 0;
+        while p < n {
+            let end = m.uncut(p, (p + room).min(n), room.max(image));
+            steps.push(end - p);
+            p = end;
+        }
+        steps
+    };
+    // A 700-token image at 1,300 of a 4,096-token prompt, 512-token steps.
+    let m = Media::sequential(vec![span(1300, 28, 25, 1)], 1);
+    assert_eq!(
+        plan(&m, 4096, 512, 1120),
+        vec![512, 512, 276, 700, 512, 512, 512, 512, 48]
+    );
+    // Before: cut at 1,812.
+    assert_eq!(plan(&m, 4096, 512, 0)[..5], [512, 512, 276, 512, 512]);
+    // A full decode batch leaves a block a step: the image still runs whole.
+    let steps = plan(&m, 2100, 64, 1120);
+    assert!(steps.contains(&700), "{steps:?}");
+    assert!(steps.iter().all(|&s| s <= 64 || s == 700), "{steps:?}");
+    // The largest image, and one at the prompt's start.
+    let m = Media::sequential(vec![span(1300, 35, 32, 1)], 1);
+    assert_eq!(plan(&m, 3000, 512, 1120)[..5], [512, 512, 276, 1120, 512]);
+    let m = Media::sequential(vec![span(0, 28, 25, 1)], 1);
+    assert_eq!(plan(&m, 1500, 512, 1120), vec![700, 512, 288]);
+    // An image within the room: steps as for text.
+    let m = Media::sequential(vec![span(100, 10, 10, 1)], 1);
+    assert_eq!(plan(&m, 1024, 512, 1120), vec![512, 512]);
+    // Text only.
+    assert_eq!(
+        plan(&Media::default(), 1300, 512, 1120),
+        vec![512, 512, 276]
+    );
+}

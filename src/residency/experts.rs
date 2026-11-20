@@ -678,7 +678,8 @@ impl Layer {
                 PassSrc::Read { batch, .. } => Some(batch),
             })
             .collect();
-        self.gate_row().with_reads(&experts, src, batch)
+        let ram = std::array::from_fn(|k| self.addr(k, n_slots));
+        self.gate_row().with_reads(&experts, src, batch, ram)
     }
 
     /// [`Self::stage_copies`] with the bounded host tier: expert `i` of [`Self::stage_misses`]
@@ -1012,6 +1013,10 @@ pub struct ExpertResidency {
     unplanned: Vec<usize>,
     #[cfg(feature = "cuda")]
     fill_streams: Vec<(usize, Copier)>,
+    /// A restore's RAM fill left RAM slots holding copies of VRAM experts: once it is done,
+    /// the bounded host tier reads other experts into them ([`Self::refill_dups`]).
+    #[cfg(feature = "cuda")]
+    dup_due: bool,
     /// `LEGION_DEBUG_REFILL_TAILS_EAGER=1`: the restoring thread gives the tails their VRAM
     /// back at once, as before #37 round 27.
     #[cfg(feature = "cuda")]
@@ -2231,6 +2236,8 @@ impl ExpertResidency {
             #[cfg(feature = "cuda")]
             fill_streams: Vec::new(),
             #[cfg(feature = "cuda")]
+            dup_due: false,
+            #[cfg(feature = "cuda")]
             eager_tails: std::env::var_os("LEGION_DEBUG_REFILL_TAILS_EAGER")
                 .is_some_and(|v| v == "1"),
             #[cfg(feature = "cuda")]
@@ -2509,7 +2516,9 @@ impl ExpertResidency {
                     Some(rows) => Some((rows, route)),
                     None => {
                         // An empty mask: every expert.
-                        (0..srcs.len()).for_each(|q| route(q, &[]));
+                        (0..srcs.len()).for_each(|q| {
+                            route(q, &[], &[]);
+                        });
                         None
                     }
                 }
@@ -2873,7 +2882,54 @@ impl ExpertResidency {
         #[cfg(feature = "cuda")]
         self.refill(None, false)?;
         self.laps.lap("refill");
-        self.learn(n, &ran, None, true)
+        self.learn(n, &ran, None, true)?;
+        #[cfg(feature = "cuda")]
+        self.refill_dups()?;
+        Ok(())
+    }
+
+    /// The bounded host tier, once a restore's refill and RAM fill are done (#37 round 43): the
+    /// RAM slots whose experts the fill copied into VRAM slots take the hottest experts in
+    /// neither tier, read behind every other read
+    /// ([`super::host_tier::HostTier::refill_dups`]). The device is idle here (the
+    /// after-step's wait), so no step reads those slots any more.
+    #[cfg(feature = "cuda")]
+    fn refill_dups(&mut self) -> Result<(), String> {
+        if !self.dup_due
+            || self.restoring.is_some()
+            || !self.refilled.is_empty()
+            || !self.planned.is_empty()
+            || !self.unplanned.is_empty()
+            || !self.fill_jobs.is_empty()
+        {
+            return Ok(());
+        }
+        self.dup_due = false;
+        let Some(h) = self.host.clone() else {
+            return Ok(());
+        };
+        let t = std::time::Instant::now();
+        let mut experts = 0;
+        for (il, l) in self.layers.iter().enumerate() {
+            let Some(l) = l.as_ref().filter(|l| l.tier && l.backed) else {
+                continue;
+            };
+            let Some(ranked) = l.slots.ranked() else {
+                continue;
+            };
+            let heat = l.slots.heat();
+            let hot: Vec<u32> = ranked
+                .into_iter()
+                .take_while(|&e| heat[e as usize] > 0.0)
+                .collect();
+            experts += h.refill_dups(il, &hot)?;
+        }
+        tracing::debug!(
+            experts,
+            ms = t.elapsed().as_secs_f64() * 1e3,
+            "host expert tier: reading experts into the RAM slots the refill copied out of"
+        );
+        Ok(())
     }
 
     /// The bounded host tier: waits for the devices before the after-step work. Without the
@@ -4192,6 +4248,7 @@ impl ExpertResidency {
         self.learn_tally(&|_| true);
         #[cfg(feature = "cuda")]
         {
+            self.dup_due = self.host.as_ref().is_some_and(|h| h.refills_dups());
             let t0 = std::time::Instant::now();
             // `leave`: layers kept without VRAM, and the devices whose staging goes (parked,
             // it would hold their lent slots' memory).

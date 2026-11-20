@@ -345,6 +345,7 @@ pub fn attention_tiered<'a>(
         tier,
         None,
         0,
+        None,
     )
 }
 
@@ -374,6 +375,7 @@ pub fn attention_granules<'a>(
         tier,
         None,
         head_stride,
+        None,
     )
 }
 
@@ -407,12 +409,14 @@ pub fn attention_last<'a>(
         tier,
         Some(split),
         0,
+        None,
     )
 }
 
 /// The op's node. Parameters: scale, window, ring, the tier's (hbm_blocks, stage_blocks) (0 and
-/// 0 without), the `src` index of the split scratch (0 without), and with a compact cache the
-/// head stride (absent: the head size).
+/// 0 without), the `src` index of the split scratch (0 without), with a compact cache the head
+/// stride (0 or absent: the head size), and the `src` index of the image spans (0 or absent:
+/// none, [`attention_spans`]).
 #[allow(clippy::too_many_arguments)]
 fn build<'a>(
     ctx: &'a Context,
@@ -423,11 +427,12 @@ fn build<'a>(
     tier: Option<Tier<'a>>,
     split: Option<Tensor<'a>>,
     head_stride: usize,
+    span: Option<Tensor<'a>>,
 ) -> Tensor<'a> {
     let q = args[0];
     let mut args = args.to_vec();
     let mut params = vec![scale.to_bits() as i32, window as i32, ring as i32, 0, 0, 0];
-    if head_stride > 0 {
+    if head_stride > 0 || span.is_some() {
         params.push(head_stride as i32);
     }
     if let Some(t) = tier.filter(|t| t.stage_blocks > 0 && ring == 0) {
@@ -439,7 +444,44 @@ fn build<'a>(
         params[5] = args.len() as i32;
         args.push(s);
     }
+    if let Some(s) = span {
+        params.push(args.len() as i32);
+        args.push(s);
+    }
     ctx.external_with(&PAGED_ATTN, types::F32, q.ne(), &args, &params)
+}
+
+/// [`attention_tiered`] where image tokens see past their position (Gemma 4's sliding-window
+/// layers, #1217): `span` (I32 `[n_tok, n_seqs]`) gives each token's last visible key, used
+/// where it is past the token's own position (an image token: its image's last token); the
+/// window still starts from the token's position. A prefill group only (the plain prefill
+/// kernels; F16 caches on CUDA).
+#[allow(clippy::too_many_arguments)]
+pub fn attention_spans<'a>(
+    ctx: &'a Context,
+    q: Tensor<'a>,
+    k: Tensor<'a>,
+    v: Tensor<'a>,
+    table: Tensor<'a>,
+    n_past: Tensor<'a>,
+    scratch: Tensor<'a>,
+    scale: f32,
+    window: usize,
+    ring: usize,
+    tier: Option<Tier<'a>>,
+    span: Tensor<'a>,
+) -> Tensor<'a> {
+    build(
+        ctx,
+        [q, k, v, table, n_past, scratch],
+        scale,
+        window,
+        ring,
+        tier,
+        None,
+        0,
+        Some(span),
+    )
 }
 
 /// Rows of a split scratch's query tile (sm70/paged_split.cuh): the last token's query heads of
@@ -709,6 +751,8 @@ struct Operands {
     stage_bytes: usize,
     /// The split scratch ([`attention_last`]) and its elements.
     split: Option<(*mut f32, usize)>,
+    /// The image spans ([`attention_spans`]): `[n_tok, n_seqs]`.
+    span: Option<*const i32>,
 }
 
 impl Operands {
@@ -767,6 +811,7 @@ impl Operands {
                     let t = src(params[5] as usize);
                     (t.data as *mut f32, t.ne.iter().product::<i64>() as usize)
                 }),
+                span: (params[7] > 0).then(|| src(params[7] as usize).data as *const i32),
             }
         }
     }
@@ -807,11 +852,16 @@ unsafe fn cpu_paged_attn(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
                 o.d,
             ));
             round_f16(&mut q);
-            let visible = *o.n_past.add(s) as usize + t + 1;
+            let pos = *o.n_past.add(s) as usize + t;
             let first = if o.window > 0 {
-                visible.saturating_sub(o.window)
+                (pos + 1).saturating_sub(o.window)
             } else {
                 0
+            };
+            // An image token sees on to its image's last token ([`attention_spans`]).
+            let visible = match o.span {
+                Some(sp) => pos.max(*sp.add(s * o.n_tok + t) as usize) + 1,
+                None => pos + 1,
             };
             let cell = |p: usize| {
                 let entry = if o.ring > 0 {
@@ -918,6 +968,9 @@ struct LaunchParams {
     verify_grid: i32,
     /// 1: the warp-pair kernel prefetches its keys' pages at the start ([`d512_prefetch_for`]).
     prefetch: i32,
+    /// Each token's last visible key past its position ([`attention_spans`], #1217); null:
+    /// causal.
+    span: *const i32,
 }
 
 /// The kernels' code for a cache type (`LEGION_KV_*` in paged_attn.cu), if they read it.
@@ -1153,7 +1206,13 @@ unsafe fn cuda_paged_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
         d512_pair: 0,
         verify_grid: 0,
         prefetch: 0,
+        span: o.span.unwrap_or(std::ptr::null()),
     };
+    // Image spans (#1217): the plain prefill kernels read them, none of the variants.
+    let spans = o.span.is_some() && o.n_tok > 1;
+    if spans {
+        p.max_split = 1;
+    }
     // A multi-token group runs split over the key blocks (sm_80+) only with a scratch made for
     // it (split_scratch_shape); the placeholder and a tier's scratch have one split.
     if o.n_tok > 1 && o.scratch_len < (o.d + 2) * o.max_split * o.n_head * o.n_tok * o.n_seqs {
@@ -1231,7 +1290,7 @@ unsafe fn cuda_paged_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
             v_cells: unsafe { (*dst.src[2]).ne[1] } as usize,
         };
         // SAFETY: the op's parameters and pools, on the stream's device.
-        if unsafe { hopper::run(&p, &shape, stream) }? {
+        if !spans && unsafe { hopper::run(&p, &shape, stream) }? {
             return Ok(());
         }
         return check(unsafe { legion_paged_attn_launch(&p, stream) });

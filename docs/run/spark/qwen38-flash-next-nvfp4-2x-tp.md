@@ -4,8 +4,9 @@
 
 `--model` is the downloaded snapshot of `nvidia/Qwen3.8-Flash-Next-NVFP4` on each Spark. One process per Spark.
 Rank 0 serves HTTP; `--tp-peers` lists the two ranks' addresses on the QSFP link (rank 0 first) and is the same on
-both. MTP uses the checkpoint's own head, so there is no `--spec-draft` file. Decode (44-58 tok/s at 1 user, 121.8 at 4,
-248.6 at 16; deterministic client) and prefill (3,469 / 3,380 / 3,127 tok/s at 8K / 32K / 123K):
+both. MTP uses the checkpoint's own head, so there is no `--spec-draft` file. Decode (46-60 tok/s at 1 user, median
+53.4; 125.3 at 4, 262.3 at 16; deterministic client) and prefill (3,515 / 3,551 / 3,381 tok/s at 8K / 32K / 123K),
+2026-11-20, medians over three sessions:
 
 ```sh
 # rank 0
@@ -40,7 +41,7 @@ legion serve \
 ```
 
 Measured against vLLM 0.33.0 with tensor parallel 2, MTP and CUDA graphs on the same two Sparks (2026-11-04:
-43-58 / 116.8 / 248.5 tok/s decode, 3,174 / 3,257 / 3,135 tok/s prefill); its command is in
+43-58 (median 48.2) / 116.8 / 248.5 tok/s decode, 3,174 / 3,257 / 3,135 tok/s prefill); its command is in
 [other engines](../other-engines.md).
 
 Optional, for many users: `--tp-commit-in-verify-min-seqs 8` on both ranks. After a verify step of 8 or more
@@ -52,7 +53,9 @@ output. Steps of fewer sequences run as without the flag (1 and 4 users: 49.2 ->
 what the rounds spread), so the numbers above are without it. `--gdn-state-defer --gdn-state-defer-min-seqs 8` on
 top (such steps also leave the states unwritten while the stored tokens have room) reads 257.0 at 16 users (rounds
 256-268, 1 and 4 users 49.4 and 120.7), same output: about 1 ms less per verify step, which these rounds cannot
-tell from the flag alone.
+tell from the flag alone. On 2026-11-20's main the flag alone is a tie at 16 users. In two sessions in alternating
+order it measured 263.1 / 264.7 tok/s against 263.0 / 256.8 without it. The 16-user cycle shrinks only about 1%,
+because the commit moves into the verify step instead of going away. 1 and 4 users and prefill were unchanged.
 
 ### Images
 

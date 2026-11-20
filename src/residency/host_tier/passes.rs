@@ -61,9 +61,57 @@ pub type PassHook = Arc<dyn Fn(usize) + Send + Sync>;
 
 /// A routing-gated pass's message to its reader ([`HostTier::stage_pass`] with a [`PassGate`]):
 /// the pass's layer `l` (its position in the pass) routes its tokens to the experts marked in
-/// the mask (per expert the layer copies, in the pass's order). The reader reads only those
-/// into staging places.
-pub type PassRoute = Arc<dyn Fn(usize, &[bool]) + Send + Sync>;
+/// the first mask (per expert the layer copies, in the pass's order; empty: all of them), and
+/// the copy stream already copies those of the second (ahead of the routing, from their RAM
+/// slots). The reader reads only the routed ones from the checkpoint. Returns `(expert, slot)`
+/// for those it reads into a RAM slot instead of a staging place ([`slot_learn`]): the copy
+/// stream copies them from index `slot` past the VRAM slots (after their batch, as before).
+pub type PassRoute = Arc<dyn Fn(usize, &[bool], &[bool]) -> Vec<(usize, usize)> + Send + Sync>;
+
+/// A gated pass's RAM-slot learning for one layer (#37 round 42): its RAM slots the pass may
+/// give up, `(expert, slot)` in the order a step's fetch evicts them
+/// ([`crate::residency::ssd_experts::cache::SlotCache::evict_order`]), and the experts it
+/// reads from the checkpoint, hottest first (positions in the layer's list).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct Learn {
+    pub il: usize,
+    pub experts: Vec<u32>,
+    pub victims: Vec<(usize, usize)>,
+    pub incoming: Vec<usize>,
+}
+
+/// Which of a gated layer's checkpoint reads go into RAM slots ([`Learn`]): the routed ones
+/// (`routed`; shorter: routed) that no reader took ahead into a place (`claimed`), hottest
+/// first, each into the next slot whose expert no token routes to and the copy stream does not
+/// copy ahead (`busy`). As a step's fetch, which reads a miss into the coldest slot the step
+/// does not use, so the RAM slots follow what the prompts route to. `(expert, slot)`.
+pub(crate) fn learn_pairs(
+    learn: &Learn,
+    routed: &[bool],
+    busy: &[bool],
+    claimed: &[bool],
+) -> Vec<(usize, usize)> {
+    let at = |v: &[bool], i: usize, d: bool| v.get(i).copied().unwrap_or(d);
+    let victims = learn
+        .victims
+        .iter()
+        .filter(|&&(i, _)| !at(routed, i, true) && !at(busy, i, false))
+        .map(|&(_, s)| s);
+    let incoming = learn
+        .incoming
+        .iter()
+        .copied()
+        .filter(|&i| at(routed, i, true) && !at(claimed, i, false));
+    incoming.zip(victims).collect()
+}
+
+/// `LEGION_DEBUG_SLOT_LEARN=0`: a gated pass reads every routed expert without a RAM slot into
+/// a staging place and gives up no RAM slot, and the bounded host tier's short prompts borrow
+/// the cache only where [`crate::engine::lm::short_gate_ram`] holds, as before round 42.
+pub fn slot_learn() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("LEGION_DEBUG_SLOT_LEARN").is_none_or(|v| v != "0"))
+}
 
 /// What a routing-gated pass ([`crate::residency::route_gate`]) gives its reader: per layer of
 /// the pass, per expert it copies, its routing heat (which it reads ahead first), and how many
@@ -384,6 +432,13 @@ struct Progress {
     ahead_experts: usize,
     ahead_unused: usize,
     route_wait_ns: u64,
+    /// RAM-slot learning ([`Learn`]): per layer, the experts the reader took ahead into
+    /// places before the routing came, and the `(expert, slot)` the routing sends into RAM
+    /// slots; the `(layer, slot, expert)` read so far, for the slots' caches
+    /// ([`Inner::settle`]).
+    claimed: Vec<Vec<bool>>,
+    to_slots: Vec<Vec<(usize, usize)>>,
+    learned: Vec<(usize, usize, usize)>,
 }
 
 /// A gated pass's batch for its reader: its layer (position in the pass), the reads into RAM
@@ -417,26 +472,63 @@ pub(super) struct Pass {
     started: Instant,
     /// Routing-gated ([`PassGate`]): the bytes a batch may read ahead of its layer's router.
     gated: Option<u64>,
+    /// Per layer, its RAM-slot learning (empty: none, [`slot_learn`]).
+    learn: Vec<Learn>,
 }
 
 impl Pass {
-    /// [`PassRoute`]: layer `l` routes to the experts in `mask`.
-    fn route(&self, l: usize, mask: &[bool]) {
+    /// [`PassRoute`]: layer `l` routes to the experts in `mask`, the copy stream copies those
+    /// in `busy` ahead; the experts read into RAM slots.
+    fn route(&self, l: usize, mask: &[bool], busy: &[bool]) -> Vec<(usize, usize)> {
         let mut p = self.progress.lock().unwrap();
-        if let Some(r) = p.routed.get_mut(l) {
+        let p = &mut *p;
+        let mut out = Vec::new();
+        if let Some(r) = p.routed.get_mut(l)
+            && r.is_none()
+        {
+            if let Some(learn) = self.learn.get(l) {
+                let claimed = p.claimed.get(l).map_or(&[][..], |c| &c[..]);
+                out = learn_pairs(learn, mask, busy, claimed);
+                p.to_slots[l] = out.clone();
+            }
             *r = Some(mask.to_vec());
         }
         self.moved.notify_all();
+        out
     }
 
-    /// Layer `l`'s routing if known; `Err` once the pass stops.
-    fn routing(&self, l: usize) -> Result<Option<Vec<bool>>, ()> {
-        let p = self.progress.lock().unwrap();
+    /// Layer `l`'s routing if known; `Err` once the pass stops. Otherwise its experts at
+    /// `ahead` (positions in its list) are the reader's to read into places
+    /// ([`learn_pairs`]'s `claimed`).
+    fn routing(&self, l: usize, ahead: &[usize]) -> Result<Option<Vec<bool>>, ()> {
+        let mut p = self.progress.lock().unwrap();
         match p.routed.get(l) {
             Some(Some(m)) => Ok(Some(m.clone())),
             _ if p.stop => Err(()),
-            _ => Ok(None),
+            _ => {
+                if let Some(c) = p.claimed.get_mut(l) {
+                    for &i in ahead {
+                        if let Some(x) = c.get_mut(i) {
+                            *x = true;
+                        }
+                    }
+                }
+                Ok(None)
+            }
         }
+    }
+
+    /// Where the routing sends layer `l`'s reads into RAM slots: per position in its list,
+    /// the slot (`n` positions).
+    fn to_slots(&self, l: usize, n: usize) -> Vec<Option<usize>> {
+        let p = self.progress.lock().unwrap();
+        let mut out = vec![None; n];
+        for &(i, s) in p.to_slots.get(l).into_iter().flatten() {
+            if let Some(o) = out.get_mut(i) {
+                *o = Some(s);
+            }
+        }
+        out
     }
 
     /// Waits for the batches `b` overwrites to be given back; whether the pass stopped.
@@ -485,14 +577,14 @@ impl Pass {
             let mut route_ns = 0u64;
             let mut mask = None;
             if !stopped && !gb.places.is_empty() {
-                mask = match self.routing(gb.layer) {
+                // As many of the hottest as the batches before routed (half at first): more
+                // are mostly not routed, and would hold up the SSD when the routing comes.
+                let n = ahead_count(gb.places.len(), seen, hit, gb.bytes, ahead);
+                let claim: Vec<usize> = gb.places.iter().take(n).map(|p| p.0).collect();
+                mask = match self.routing(gb.layer, &claim) {
                     Ok(Some(m)) => Some(m),
                     Err(()) => None,
                     Ok(None) => {
-                        // As many of the hottest as the batches before routed (half at first):
-                        // more are mostly not routed, and would hold up the SSD when the
-                        // routing comes.
-                        let n = ahead_count(gb.places.len(), seen, hit, gb.bytes, ahead);
                         for (s, (_, reads)) in sent.iter_mut().zip(&gb.places).take(n) {
                             *s = Some(inner.pool.submit_as(reads.to_vec(), Class::Ahead));
                         }
@@ -514,10 +606,24 @@ impl Pass {
             };
             let mut jobs = Vec::new();
             let mut rest = 0usize;
+            // The routed experts the routing sent into RAM slots ([`Learn`]).
+            let learn = self.learn.get(gb.layer).filter(|_| mask.is_some());
+            let slot_of = learn.map(|l| self.to_slots(gb.layer, l.experts.len()));
+            let mut learned = Vec::new();
             for ((pos, reads), s) in gb.places.iter().zip(&sent) {
                 match (s, routed(&mask, *pos)) {
                     (None, true) => {
-                        jobs.extend(*reads);
+                        let to = slot_of
+                            .as_ref()
+                            .and_then(|v| v.get(*pos).copied().flatten());
+                        match (learn, to) {
+                            (Some(l), Some(slot)) => {
+                                let e = l.experts[*pos] as usize;
+                                jobs.extend(inner.reads(l.il, e, To::Slot(slot)));
+                                learned.push((l.il, slot, e));
+                            }
+                            _ => jobs.extend(*reads),
+                        }
                         rest += 1;
                     }
                     (Some(g), false) => g.cancel(),
@@ -542,7 +648,12 @@ impl Pass {
                 }
             }
             let n = ahead_n + rest;
-            inner.counts.stage_loads.fetch_add(n as u64, relaxed);
+            let slots = learned.len();
+            inner.counts.ram_loads.fetch_add(slots as u64, relaxed);
+            inner
+                .counts
+                .stage_loads
+                .fetch_add((n - slots) as u64, relaxed);
             let mut p = self.progress.lock().unwrap();
             // The reads ahead run while it waits for the routing.
             p.read_ns += t0.elapsed().as_nanos() as u64;
@@ -552,7 +663,10 @@ impl Pass {
             p.ahead_unused += unused;
             p.route_wait_ns += route_ns;
             match err {
-                None => p.read = b + 1,
+                None => {
+                    p.read = b + 1;
+                    p.learned.append(&mut learned);
+                }
                 Some(e) => p.err = Some(e),
             }
             self.moved.notify_all();
@@ -649,6 +763,7 @@ impl Pass {
                 read_gib = gib(p.gated_bytes),
                 read_ahead = p.ahead_experts,
                 read_ahead_unused = p.ahead_unused,
+                read_into_ram_slots = p.learned.len(),
                 reader_waited_for_routing_s = s(p.route_wait_ns),
                 "host expert tier: routing-gated pass read what the prompt's tokens route to"
             );
@@ -662,16 +777,25 @@ pub(super) type Running = (Arc<Pass>, JoinHandle<()>);
 impl Inner {
     /// Ends the staged pass under way, if any: its reader is done once the copy stream ran
     /// the pass's calls (a pass given up before that stops here). The staging places are
-    /// free again.
-    pub(super) fn settle(&self) {
+    /// free again. Returns the `(layer, slot, expert)` the pass read into RAM slots in place of
+    /// what they held ([`Learn`]), for [`Self::settle_into`].
+    pub(super) fn settle(&self) -> Vec<(usize, usize, usize)> {
         let Some((pass, reader)) = self.pass.lock().unwrap().take() else {
-            return;
+            return Vec::new();
         };
         pass.stop();
         if reader.join().is_err() {
             fatal("the staged pass reader panicked");
         }
         pass.log();
+        std::mem::take(&mut pass.progress.lock().unwrap().learned)
+    }
+
+    /// [`Self::settle`], and the RAM slots' caches take what the pass read into them.
+    pub(super) fn settle_into(&self, st: &mut super::State) {
+        for (il, s, e) in self.settle() {
+            st.caches[il].learn(e, s);
+        }
     }
 }
 
@@ -688,6 +812,13 @@ impl HostTier {
     /// ones its tokens route to (reading the hottest ahead meanwhile); every layer of the pass
     /// must be routed that way (all experts, where its copies are not gated), or the copy
     /// stream's waits for its reads never end. Reads into RAM slots are never gated.
+    ///
+    /// A gated pass's RAM slots also learn what the prompt routes to (#37 round 42,
+    /// [`slot_learn`]): the routed experts it reads from the checkpoint go into the RAM slots of
+    /// the layer's experts no token routes to and the copy stream does not copy ahead (coldest
+    /// first, as a step's fetch evicts), not into staging places, and stay there; the copy
+    /// stream copies them from those slots ([`PassRoute`]). Only those slots change, which no
+    /// copy of the pass reads; the slots' caches take them when the pass ends.
     pub fn stage_pass(
         &self,
         layers: &[(usize, Vec<u32>)],
@@ -697,6 +828,17 @@ impl HostTier {
         let mut st = inner.state.lock().unwrap();
         let st = &mut *st;
         inner.take_ahead(st, None)?;
+        // The pass's reads take the SSD: refills not started are dropped (#37 round 43).
+        inner.cancel_refills(st)?;
+        // Before the pass marks its RAM slots used: the order they go out in ([`Learn`]).
+        let learning = gate.is_some() && slot_learn();
+        let evict: Vec<Vec<usize>> = layers
+            .iter()
+            .map(|(il, _)| match learning {
+                true => st.caches[*il].evict_order(),
+                false => Vec::new(),
+            })
+            .collect();
         // The experts in the checkpoint take the RAM slots the pass does not use (free ones,
         // then the least recently used, as a step's fetch fills them), and stay there.
         let held: Vec<Vec<Held>> = layers
@@ -833,8 +975,43 @@ impl HostTier {
                 })
                 .collect()
         });
+        // RAM-slot learning: per layer the RAM slots of the experts it copies, in the order
+        // they go out, and its experts in the checkpoint, hottest first (the reader's order).
+        let learn: Vec<Learn> = match &gate {
+            Some(g) if learning => layers
+                .iter()
+                .enumerate()
+                .map(|(l, (il, experts))| {
+                    let mut pos_of = vec![None; inner.slots];
+                    let mut incoming = Vec::new();
+                    for (i, h) in held[l].iter().enumerate() {
+                        match *h {
+                            Held::Ram(s) => pos_of[s] = Some(i),
+                            Held::Stage => incoming.push(i),
+                            Held::Load(_) => {}
+                        }
+                    }
+                    let heat = |i: usize| g.heat.get(l).and_then(|h| h.get(i)).copied();
+                    let h = |i: usize| heat(i).unwrap_or(0.0);
+                    incoming.sort_by(|&a, &b| h(b).total_cmp(&h(a)));
+                    let victims = evict[l]
+                        .iter()
+                        .filter_map(|&s| Some((pos_of.get(s).copied().flatten()?, s)))
+                        .collect();
+                    Learn {
+                        il: *il,
+                        experts: experts.clone(),
+                        victims,
+                        incoming,
+                    }
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
         let progress = Progress {
             routed: vec![None; if gate.is_some() { layers.len() } else { 0 }],
+            claimed: learn.iter().map(|l| vec![false; l.experts.len()]).collect(),
+            to_slots: vec![Vec::new(); learn.len()],
             ..Progress::default()
         };
         let pass = Arc::new(Pass {
@@ -851,6 +1028,7 @@ impl HostTier {
             read_bytes,
             started: Instant::now(),
             gated: gate.as_ref().map(|g| g.ahead),
+            learn,
         });
         let (p, i) = (pass.clone(), inner.clone());
         let ahead = gate.as_ref().map_or(0, |g| g.ahead);
@@ -864,7 +1042,8 @@ impl HostTier {
         *inner.pass.lock().unwrap() = Some((pass.clone(), reader));
         let route: Option<PassRoute> = gate.is_some().then(|| {
             let p = pass.clone();
-            Arc::new(move |l: usize, mask: &[bool]| p.route(l, mask)) as PassRoute
+            Arc::new(move |l: usize, mask: &[bool], busy: &[bool]| p.route(l, mask, busy))
+                as PassRoute
         });
         let hook: PassHook = Arc::new(move |arg| pass.call(arg));
         Ok((srcs, hook, route))
@@ -879,9 +1058,11 @@ impl HostTier {
         }
     }
 
-    /// Per expert of layer `il`: whether a RAM slot holds it.
+    /// Per expert of layer `il`: whether a RAM slot holds it (a staged pass done by now has
+    /// ended, [`Inner::settle_into`]).
     pub fn in_ram(&self, il: usize) -> Vec<bool> {
-        let st = self.inner.state.lock().unwrap();
+        let mut st = self.inner.state.lock().unwrap();
+        self.inner.settle_into(&mut st);
         let cache = &st.caches[il];
         (0..self.inner.n_expert)
             .map(|e| cache.slot(e).is_some())

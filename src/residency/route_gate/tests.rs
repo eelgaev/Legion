@@ -142,14 +142,17 @@ fn tier_row(n: usize, heat: &[f32], batch: Vec<Option<usize>>) -> GateRow {
     let src = (0..n)
         .map(|e| std::array::from_fn(|k| 5_000_000 * (k + 1) + e * B[k]))
         .collect();
-    row(n, 0, heat).with_reads(&experts, src, batch).unwrap()
+    let ram = std::array::from_fn(|k| 7_000_000 * (k + 1));
+    row(n, 0, heat)
+        .with_reads(&experts, src, batch, ram)
+        .unwrap()
 }
 
 #[test]
 fn with_reads_checks_the_entries() {
     let ok = |experts: &[u32], n_src: usize| {
         let r = row(3, 0, &[]);
-        r.with_reads(experts, vec![[0; 3]; n_src], vec![None; 3])
+        r.with_reads(experts, vec![[0; 3]; n_src], vec![None; 3], [0; 3])
             .is_some()
     };
     assert!(!ok(&[0, 1], 3));
@@ -193,6 +196,29 @@ fn read_entries_wait_for_their_batch() {
     // Without the tier's reads: none.
     let plain = row(3, 0, &[]).read_copies(&[true; 3], &[], |b, _| (CALL, b, 0));
     assert!(plain.is_empty());
+}
+
+#[test]
+fn a_read_entry_sent_to_a_ram_slot_copies_from_it_after_its_batch() {
+    const CALL: usize = usize::MAX;
+    let mut r = tier_row(3, &[], vec![None, Some(2), Some(2)]);
+    // Entry 2 goes to RAM slot 4; entry 0 (a RAM slot already) keeps its source.
+    r.to_slot(2, 4);
+    r.to_slot(0, 9);
+    let want = vec![true, false, true];
+    let ram: Vec<usize> = r.copies(&want, &[], false).iter().map(|c| c.1).collect();
+    assert_eq!(ram, vec![5_000_000, 10_000_000, 15_000_000]);
+    let reads = r.read_copies(&want, &[], |b, rel| (CALL, b * 2 + rel as usize, 0));
+    assert_eq!(
+        reads,
+        vec![
+            (CALL, 4, 0),
+            (10_000_000 + 200, 7_000_000 + 4 * 100, 100),
+            (20_000_000 + 200, 14_000_000 + 4 * 100, 100),
+            (30_000_000 + 120, 21_000_000 + 4 * 60, 60),
+            (CALL, 5, 0),
+        ]
+    );
 }
 
 #[test]

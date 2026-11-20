@@ -220,6 +220,36 @@ impl SlotCache {
         self.pinned[s] = false;
     }
 
+    /// The filled slots no read is in flight into, in the order [`Self::victim`] gives them up
+    /// when the step uses none of them: the coldest expert first ([`Self::set_heat`]), the
+    /// least recently used of those, then the lowest slot (without heat: least recently used
+    /// first).
+    pub fn evict_order(&self) -> Vec<usize> {
+        let heat = |s: usize| {
+            self.heat
+                .get(self.owner[s] as usize)
+                .copied()
+                .unwrap_or(0.0)
+        };
+        let mut order: Vec<usize> = (0..self.n_slots())
+            .filter(|&s| self.owner[s] >= 0 && !self.pinned[s])
+            .collect();
+        order.sort_by(|&a, &b| {
+            heat(a)
+                .total_cmp(&heat(b))
+                .then(self.used[a].cmp(&self.used[b]))
+                .then(a.cmp(&b))
+        });
+        order
+    }
+
+    /// Slot `s` now holds `expert` (in no slot before), used this step: what it held is
+    /// evicted (a staged pass read `expert` into it, #37 round 42).
+    pub fn learn(&mut self, expert: usize, s: usize) {
+        debug_assert!(self.slot(expert).is_none());
+        self.assign(expert, s);
+    }
+
     fn victim(&self) -> Option<usize> {
         if let Some(s) = (0..self.n_slots()).find(|&s| self.owner[s] < 0 && !self.pinned[s]) {
             return Some(s);

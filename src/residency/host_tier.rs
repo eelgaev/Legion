@@ -50,7 +50,9 @@ use super::ssd_experts::cache::SlotCache;
 use super::ssd_experts::io::{Group, Job, Pool, raw_pieces};
 
 mod passes;
-pub use passes::{PassGate, PassHook, PassRoute, PassSrc, release_arg, wait_arg};
+pub use passes::{PassGate, PassHook, PassRoute, PassSrc, release_arg, slot_learn, wait_arg};
+mod refill;
+pub use refill::dup_refill;
 
 #[cfg(test)]
 mod tests;
@@ -402,6 +404,8 @@ struct Counters {
     /// Fetches whose reads landed in the SwiGLU op ([`Landing`]), and the time it waited.
     landed: AtomicU64,
     land_ns: AtomicU64,
+    /// Experts read into RAM slots that held copies of VRAM experts ([`refill`]).
+    dup_refills: AtomicU64,
 }
 
 struct LayerMem {
@@ -476,6 +480,9 @@ struct State {
     last_big: Vec<Vec<usize>>,
     /// The read ahead under way, if any.
     ahead: Option<Ahead>,
+    /// Per layer, the reads under way into RAM slots that held copies of VRAM experts
+    /// ([`HostTier::refill_dups`]).
+    refills: Vec<Vec<refill::Refill>>,
 }
 
 /// Experts of a layer being read into staging places ahead of the big step that is one layer
@@ -761,6 +768,7 @@ impl HostTier {
                 in_vram: vec![vec![false; n_expert]; layers.len()],
                 last_big: vec![Vec::new(); layers.len()],
                 ahead: None,
+                refills: (0..layers.len()).map(|_| Vec::new()).collect(),
             }),
             layers,
             xchg,
@@ -993,6 +1001,10 @@ impl HostTier {
 
 impl Drop for HostTier {
     fn drop(&mut self) {
+        {
+            let mut st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = self.inner.cancel_refills(&mut st);
+        }
         self.inner.settle();
         self.inner.report();
         REGISTRY.lock().unwrap()[self.id as usize] = None;
@@ -1190,7 +1202,7 @@ impl Inner {
 
     fn take_ahead(&self, st: &mut State, il: Option<usize>) -> Result<Vec<(usize, usize)>, String> {
         self.land()?;
-        self.settle();
+        self.settle_into(st);
         let Some(a) = st.ahead.take() else {
             return Ok(Vec::new());
         };
@@ -1237,6 +1249,7 @@ impl Inner {
         let st = &mut *st;
         // The experts read ahead for this layer are in their places.
         let ready = self.take_ahead(st, Some(il))?;
+        self.land_refills(st, il, &need)?;
         let mut place = vec![usize::MAX; self.n_expert];
         for &(e, p) in &ready {
             place[e] = p;
@@ -1371,6 +1384,8 @@ impl Inner {
         let mut st = self.state.lock().unwrap();
         let st = &mut *st;
         self.take_ahead(st, None)?;
+        let want: Vec<usize> = experts.iter().map(|&e| e as usize).collect();
+        self.land_refills(st, il, &want)?;
         let mut jobs = Vec::new();
         let mut used = 0;
         let mut at = Vec::with_capacity(experts.len());
@@ -1397,6 +1412,7 @@ impl Inner {
         let mut st = self.state.lock().unwrap();
         let st = &mut *st;
         self.take_ahead(st, None)?;
+        self.land_refills(st, il, &[new])?;
         let f = plan_swap(&mut st.caches[il], il, new, old);
         st.in_vram[il][new] = true;
         if let Some(o) = old {
@@ -1453,6 +1469,7 @@ impl Inner {
             fetches = l(&c.fetches),
             landed = l(&c.landed),
             land_wait_s = l(&c.land_ns) as f64 / 1e9,
+            dup_refills = l(&c.dup_refills),
             "host expert tier"
         );
     }

@@ -2,7 +2,7 @@
 //! the vision tower's graph but no real projector: two blocks of width 16 (two heads), patches
 //! of 4 pixels, an 8 × 8 learned position grid (resampled for any other grid), F32 weights.
 //! Its outputs are meaningless; what it computes is the same as for a real projector.
-//! Also [`bmp`], a 24-bit BMP of any size for test images (decoded by stb_image like a PNG).
+//! [`write_gemma4v`] writes a tiny `gemma4v` one the same way. Also [`bmp`], a 24-bit BMP of any size for test images (decoded by stb_image like a PNG).
 
 use std::path::Path;
 
@@ -98,6 +98,77 @@ pub fn write(
     add("mm.0.bias", &[4 * e], 0.1)?;
     add("mm.2.weight", &[4 * e, o], scale(4 * e))?;
     add("mm.2.bias", &[o], 0.1)?;
+    w.write(path)
+}
+
+/// Rows of each of the tiny Gemma 4 tower's two position tables (patch grids up to this side).
+pub const GEMMA_POS_ROWS: u32 = 128;
+
+/// Writes a tiny `gemma4v` projector (Gemma 4's tower, #1217) for a language model of width
+/// `n_out`: two blocks of width 16 (two heads of 8), patches of 4 pixels pooled 3 × 3, F32
+/// weights, mean 0 and std 1 as Gemma's.
+pub fn write_gemma4v(path: impl AsRef<Path>, n_out: u32, seed: u64) -> Result<(), GgufError> {
+    let mut w = GgufWriter::new();
+    let u32v = Value::U32;
+    let f3 = |v: f32| Value::Array(vec![Value::F32(v); 3]);
+    w.set("general.architecture", &Value::String("clip".into()))?;
+    w.set("general.type", &Value::String("mmproj".into()))?;
+    w.set("clip.has_vision_encoder", &Value::Bool(true))?;
+    w.set("clip.use_gelu", &Value::Bool(true))?;
+    w.set(
+        "clip.vision.projector_type",
+        &Value::String("gemma4v".into()),
+    )?;
+    for (k, v) in [
+        ("projection_dim", u32v(n_out)),
+        ("image_size", u32v(224)),
+        ("patch_size", u32v(PATCH)),
+        ("embedding_length", u32v(N_EMBD)),
+        ("feed_forward_length", u32v(N_FF)),
+        ("block_count", u32v(N_LAYER)),
+        ("attention.head_count", u32v(N_HEAD)),
+        ("attention.layer_norm_epsilon", Value::F32(1e-6)),
+        ("image_mean", f3(0.0)),
+        ("image_std", f3(1.0)),
+    ] {
+        w.set(&format!("clip.vision.{k}"), &v)?;
+    }
+    let mut rng = Rng::new(seed);
+    let mut add = |name: &str, shape: &[i64], base: f32, a: f32| -> Result<(), GgufError> {
+        let n: i64 = shape.iter().product();
+        let data: Vec<u8> = (0..n)
+            .flat_map(|_| (base + (rng.next_f64() as f32 * 2.0 - 1.0) * a).to_ne_bytes())
+            .collect();
+        w.add_tensor(name, types::F32, shape, &data).map(|_| ())
+    };
+    let (e, p, ff, o) = (N_EMBD as i64, PATCH as i64, N_FF as i64, n_out as i64);
+    let d = e / N_HEAD as i64;
+    let scale = |fan_in: i64| 1.0 / (fan_in as f32).sqrt();
+    add("v.patch_embd.weight", &[p, p, 3, e], 0.0, scale(3 * p * p))?;
+    add(
+        "v.position_embd.weight",
+        &[e, GEMMA_POS_ROWS as i64, 2],
+        0.0,
+        0.5,
+    )?;
+    for il in 0..N_LAYER {
+        let t = |n: &str| format!("v.blk.{il}.{n}.weight");
+        for ln in ["ln1", "ln2", "attn_post_norm", "ffn_post_norm"] {
+            add(&t(ln), &[e], 1.0, 0.2)?;
+        }
+        for qk in ["attn_q_norm", "attn_k_norm"] {
+            add(&t(qk), &[d], 1.0, 0.2)?;
+        }
+        for m in ["attn_q", "attn_k", "attn_v", "attn_out"] {
+            add(&t(m), &[e, e], 0.0, scale(e))?;
+        }
+        add(&t("ffn_gate"), &[e, ff], 0.0, scale(e))?;
+        add(&t("ffn_up"), &[e, ff], 0.0, scale(e))?;
+        add(&t("ffn_down"), &[ff, e], 0.0, scale(ff))?;
+    }
+    add("v.std_bias", &[e], 0.0, 0.5)?;
+    add("v.std_scale", &[e], 1.0, 0.3)?;
+    add("mm.input_projection.weight", &[e, o], 0.0, scale(e))?;
     w.write(path)
 }
 

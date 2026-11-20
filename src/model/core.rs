@@ -122,7 +122,7 @@ pub use exec::{
 };
 pub use kv_type::{KvType, KvTypes};
 pub use linear::{FfnFusion, Fp8Act, Linear, Nvfp4A4, Nvfp4Act, Nvfp4Mm};
-pub use media::{ImageSpan, Media};
+pub use media::{ImageLayout, ImageSpan, Media};
 pub use mtp::{DraftHeadType, MtpGraph, MtpOutput};
 pub use spec::{
     Replay, SpecPool, set_commit_in_verify, set_commit_slots, set_state_defer,
@@ -645,6 +645,11 @@ pub struct GroupShape {
     /// Image tokens of the group's sequences ([`Media`]), whose input rows replace their token
     /// embeddings.
     pub(crate) img: usize,
+    /// Image tokens see their whole image on the sliding-window layers
+    /// ([`Arch::image_tokens_bidirectional`], [`Media::span_end`]): the paged attention's
+    /// per-sequence `n_past` input also holds each token's last key there (see
+    /// [`AttnInputs::Paged`]).
+    pub(crate) spans: bool,
     /// A prompt group's recurrent states saved inside the step ([`capture`]), ascending.
     pub(crate) captures: Vec<capture::Capture>,
 }
@@ -667,6 +672,12 @@ impl GroupShape {
             );
         }
         let (n_pool, n_new) = arch.map_or((0, 0), |a| a.group_pools(g));
+        let img = (g.seqs.iter())
+            .map(|s| {
+                s.media
+                    .map_or(0, |m| m.image_tokens(s.n_past..s.n_past + n_tok))
+            })
+            .sum();
         Self {
             slot: g.slot,
             n_seqs: g.seqs.len(),
@@ -687,14 +698,8 @@ impl GroupShape {
             par: false,
             pair: false,
             head_half: 0,
-            img: g
-                .seqs
-                .iter()
-                .map(|s| {
-                    s.media
-                        .map_or(0, |m| m.image_tokens(s.n_past..s.n_past + n_tok))
-                })
-                .sum(),
+            img,
+            spans: img > 0 && n_tok > 1 && arch.is_some_and(|a| a.image_tokens_bidirectional()),
             captures: Vec::new(),
         }
     }
@@ -796,7 +801,9 @@ pub(crate) enum AttnInputs<'a> {
     },
     /// Block tables `[table, n_seqs]`, each sequence's first position `[n_seqs]`, the decode
     /// kernel's scratch (never filled), and with rings the ring tables `[ring, n_seqs]` of the
-    /// sliding-window layers ([`KvRing`]).
+    /// sliding-window layers ([`KvRing`]). With [`GroupShape::spans`], `n_past` is
+    /// `[n_seqs + n_tok × n_seqs]`: after the first positions, each token's last key on the
+    /// sliding-window layers ([`paged::attention_spans`]; the kernels read the first part only).
     Paged {
         table: Tensor<'a>,
         n_past: Tensor<'a>,
@@ -1320,15 +1327,35 @@ impl<'a> Inputs<'a> {
                     // Exclusive: the kernels' causal limit one position earlier (a query at 0
                     // keeps key 0, as the masks below).
                     let ex = usize::from(self.exclusive);
-                    let p: Vec<i32> = (g.seqs.iter())
+                    let mut p: Vec<i32> = (g.seqs.iter())
                         .map(|s| s.n_past.saturating_sub(ex) as i32)
                         .collect();
+                    // Each token's last key on the sliding-window layers: its image's last
+                    // token (within the step: the prompt's chunks do not cut an image, see
+                    // `Media::uncut`), a text token's own position.
+                    if sh.spans {
+                        for s in &g.seqs {
+                            let last = s.n_past + sh.n_tok - 1;
+                            p.extend((s.n_past..=last).map(|q| {
+                                let end = s.media.and_then(|m| m.span_end(q)).unwrap_or(q);
+                                end.min(last) as i32
+                            }));
+                        }
+                    }
                     sink.i32(n_past, &p);
                     continue;
                 }
             };
             let n_kv = sh.n_kv;
             let n_blk = n_kv / KV_BLOCK;
+            // The last key a sliding-window layer's query at `p` sees past the causal limit:
+            // its image's last token with `GroupShape::spans` (not exclusive), else `p`.
+            let swa_limit = |s: &SeqInput<'_>, p: usize| match s.media {
+                Some(m) if sh.spans && !self.exclusive => (m.span_end(p).unwrap_or(p))
+                    .min(s.n_past + sh.n_tok - 1)
+                    .max(p),
+                _ => p,
+            };
             // The sliding-window masks in their own tensor (rings), else a second half.
             let halves = if self.swa > 0 && swa_mask.is_none() {
                 2
@@ -1351,13 +1378,14 @@ impl<'a> Inputs<'a> {
                     row[end(s.n_past + q)..].fill(f32::NEG_INFINITY);
                 }
                 // Sliding window: also keys `window` or more positions back (llama.cpp's
-                // `is_masked_swa`, standard type).
+                // `is_masked_swa`, standard type); an image token sees its whole image
+                // (`GroupShape::spans`).
                 if self.swa > 0 && swa_mask.is_none() {
                     let half = n_kv * sh.n_tok * sh.n_seqs;
                     for q in 0..sh.n_tok {
                         let p = s.n_past + q;
                         let row = &mut m[half + (si * sh.n_tok + q) * n_kv..][..n_kv];
-                        row[end(p)..].fill(f32::NEG_INFINITY);
+                        row[end(swa_limit(s, p))..].fill(f32::NEG_INFINITY);
                         row[..(p + 1).saturating_sub(self.swa)].fill(f32::NEG_INFINITY);
                     }
                 }
@@ -1407,9 +1435,10 @@ impl<'a> Inputs<'a> {
                     for q in 0..sh.n_tok {
                         let p = s.n_past + q;
                         let row = &mut sm_rows[(si * sh.n_tok + q) * n_swa..][..n_swa];
-                        // Positions in (p - window, p] (or before p, exclusive) are seen.
+                        // Positions in (p - window, p] (or before p, exclusive) are seen, and
+                        // an image token's whole image.
                         let lo = (p + 1).saturating_sub(self.swa).max(first);
-                        let hi = end(p).min(first + n_swa);
+                        let hi = end(swa_limit(s, p)).min(first + n_swa);
                         if lo < hi {
                             row[lo - first..hi - first].fill(0.0);
                         }
@@ -3005,7 +3034,11 @@ impl Model {
                                 &[g.table as i64, ns],
                                 &format!("kv_table-{i}"),
                             ),
-                            n_past: input(types::I32, &[ns], &format!("kv_n_past-{i}")),
+                            n_past: input(
+                                types::I32,
+                                &[ns + if g.spans { g.n_tok as i64 * ns } else { 0 }],
+                                &format!("kv_n_past-{i}"),
+                            ),
                             scratch: input(types::F32, &scratch, &format!("attn_scratch-{i}")),
                             ring: (g.ring > 0).then(|| {
                                 input(types::I32, &[g.ring as i64, ns], &format!("kv_ring-{i}"))

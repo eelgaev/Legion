@@ -54,10 +54,32 @@ vllm serve unsloth/Qwen3.8-27B-NVFP4 --port 8090 \
   --speculative-config.num_speculative_tokens 7
 ```
 
+vLLM, 2x DGX Spark, tensor parallel 2 with the DFlash 2 drafter, set up the same way as the
+[2x Qwen3.8-Flash-Next command](#qwen38-flash-next). It was ready about 4 minutes after the start. Measured
+2026-11-20: 1 user 37-76 (median 49.0), 4 users 125.6, 16 users 248.0, prefill 8K 2,913, 32K 2,757, mean accepted
+length 3.5-3.6. 123K was not run because of heat.
+
+```sh
+# both ranks
+export HF_HUB_OFFLINE=1 TORCHINDUCTOR_COMPILE_THREADS=1 \
+  NCCL_SOCKET_IFNAME=<qsfp-if> GLOO_SOCKET_IFNAME=<qsfp-if> TP_SOCKET_IFNAME=<qsfp-if> NCCL_IB_HCA=<roce-dev> \
+  VLLM_HOST_IP=<this-rank-ip>
+# rank 0
+vllm serve unsloth/Qwen3.8-27B-NVFP4 --port 8090 \
+  --tensor-parallel-size 2 --nnodes 2 --node-rank 0 --master-addr <rank0-ip> --master-port 29500 \
+  --distributed-executor-backend mp \
+  --max-num-seqs 16 --max-model-len 262144 --no-enable-prefix-caching \
+  --gpu-memory-utilization 0.85 --trust-remote-code \
+  --speculative-config.method dflash --speculative-config.model z-lab/Qwen3.8-27B-DFlash2 \
+  --speculative-config.num_speculative_tokens 7
+# rank 1: the same with --node-rank 1 --headless (no --port)
+```
+
 ## Gemma 4 31B
 
 Legion: [1x DGX Spark](spark/gemma-4-31b-qat-ud-q4-k-xl-1x.md), [2x DGX Spark](spark/gemma-4-31b-qat-ud-q4-k-xl-2x-tp.md),
-[2x V100](ac922/gemma-4-31b-qat-ud-q4-k-xl-2x.md), [NVFP4 + DFlash 2](spark/gemma-4-31b-nvfp4-1x.md).
+[2x V100](ac922/gemma-4-31b-qat-ud-q4-k-xl-2x.md), [NVFP4 + DFlash 2](spark/gemma-4-31b-nvfp4-1x.md),
+[NVFP4 + DFlash 2, 2x DGX Spark](spark/gemma-4-31b-nvfp4-2x-tp.md).
 
 llama.cpp, 1x DGX Spark:
 
@@ -86,6 +108,27 @@ vllm serve RedHatAI/gemma-4-31B-it-NVFP4 --port 8090 \
   --gpu-memory-utilization 0.85 --trust-remote-code --language-model-only \
   --speculative-config.method dflash --speculative-config.model RedHatAI/gemma-4-31B-it-speculator.dflash2 \
   --speculative-config.num_speculative_tokens 7
+```
+
+vLLM, 2x DGX Spark, tensor parallel 2 with the DFlash 2 speculator: the 1x command plus the multi-node flags of the
+[2x Qwen3.8-Flash-Next command](#qwen38-flash-next) (the `mp` backend, no Ray; NCCL over RoCE on the QSFP link),
+with torch.compile and CUDA graphs. In 0.33.0 the speculator runs under multi-node tensor parallelism with no
+changes. It was ready about 3.5 minutes after the start (2026-11-20).
+
+```sh
+# both ranks
+export HF_HUB_OFFLINE=1 TORCHINDUCTOR_COMPILE_THREADS=1 \
+  NCCL_SOCKET_IFNAME=<qsfp-if> GLOO_SOCKET_IFNAME=<qsfp-if> TP_SOCKET_IFNAME=<qsfp-if> NCCL_IB_HCA=<roce-dev> \
+  VLLM_HOST_IP=<this-rank-ip>
+# rank 0
+vllm serve RedHatAI/gemma-4-31B-it-NVFP4 --port 8090 \
+  --tensor-parallel-size 2 --nnodes 2 --node-rank 0 --master-addr <rank0-ip> --master-port 29500 \
+  --distributed-executor-backend mp \
+  --max-num-seqs 16 --max-model-len 262144 --no-enable-prefix-caching \
+  --gpu-memory-utilization 0.85 --trust-remote-code --language-model-only \
+  --speculative-config.method dflash --speculative-config.model RedHatAI/gemma-4-31B-it-speculator.dflash2 \
+  --speculative-config.num_speculative_tokens 7
+# rank 1: the same with --node-rank 1 --headless (no --port)
 ```
 
 ## Qwen3.8-Flash-Next
