@@ -41,9 +41,11 @@ pub(in crate::cli) struct SwitchArgs {
     /// fewer per layer). For comparisons. Replaces LEGION_DELTA_PREP=0.
     #[arg(long, help_heading = HEADING)]
     delta_prep_ggml: bool,
-    /// CUDA, gated DeltaNet layers, prompt steps on compute capability 7.x GPUs (V100): ggml's
-    /// gated_delta_net kernel instead of Legion's gdn_scan (the default there: ggml's bits, about
-    /// 1.5x faster per call; other GPUs always run ggml's). For comparisons.
+    /// CUDA, gated DeltaNet layers, prompt steps on compute capability 7.x GPUs (V100), and on
+    /// 12.0/12.1 (the GB10) the groups ggml-cuda runs token after token (a tensor parallel rank's
+    /// share of Qwen3.8-27B) unless --gdn-mma takes them: ggml's gated_delta_net kernel instead
+    /// of Legion's gdn_scan (the default there: ggml's bits, faster per call; other GPUs always
+    /// run ggml's). For comparisons.
     #[arg(long, help_heading = HEADING)]
     gdn_scan_ggml: bool,
     /// CUDA sm_80+, gated DeltaNet layers, prompt groups of 64+ tokens whose head counts

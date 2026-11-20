@@ -280,6 +280,13 @@ fn ggml_takes(n_k: i64, n_v: i64) -> bool {
     n_k == 16 && [16, 32, 48, 64].contains(&n_v)
 }
 
+/// Whether ggml-cuda runs a group of `n_k` key and `n_v` value heads token after token and
+/// [`gdn_mma`] leaves it there (`--gdn-mma` off): the groups [`gdn_scan`] takes on compute
+/// capability 12.x (#1133: a tensor parallel rank's share).
+pub(super) fn ggml_per_token(n_k: i64, n_v: i64) -> bool {
+    !ggml_takes(n_k, n_v) && !ON.load(Ordering::Relaxed)
+}
+
 /// Whether [`gdn_mma`] takes a group of `n_k` key and `n_v` value heads: the ones ggml-cuda keeps
 /// on its per-token kernel with `--gdn-mma`; ggml-cuda's own with [`set_gdn_staged`] on a
 /// compute capability 12.x GPU (device `dev`'s, [`staged_for`]).
