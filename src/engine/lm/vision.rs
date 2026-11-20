@@ -138,11 +138,14 @@ impl Tower {
         }
     }
 
-    fn encode(&mut self, p: &Preprocessed) -> Result<ImageEmbedding, VisionError> {
+    /// `p`'s rows; `alone`: the engine runs nothing else meanwhile, so a GPU encode may take
+    /// the whole GPU ([`crate::vision::share`]).
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+    fn encode(&mut self, p: &Preprocessed, alone: bool) -> Result<ImageEmbedding, VisionError> {
         match self {
             Tower::Cpu(e) => e.encode(p),
             #[cfg(feature = "cuda")]
-            Tower::Gpu(e) => e.encode(p),
+            Tower::Gpu(e) => e.encode_with(p, alone),
         }
     }
 
@@ -383,10 +386,13 @@ impl Vision {
     }
 
     /// Runs the tower over `pending` (of `tokens`): the sequence's [`Media`] and prefix-cache key.
+    /// `alone()`: whether the engine runs nothing else, asked as each image's encode starts
+    /// (holding the tower).
     pub(super) fn encode(
         &self,
         tokens: &[u32],
         pending: Vec<Pending>,
+        alone: impl Fn() -> bool,
     ) -> Result<(Arc<Media>, Vec<u32>), EngineError> {
         let mut key = tokens.to_vec();
         let mut spans = Vec::with_capacity(pending.len());
@@ -408,11 +414,13 @@ impl Vision {
                 }
                 None => {
                     let t = std::time::Instant::now();
+                    let mut was_alone = false;
                     let e = blocking(|| {
-                        self.tower
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .encode(&p.pixels)
+                        let mut tower = self.tower.lock().unwrap_or_else(|e| e.into_inner());
+                        // Asked once the tower is ours: an encode queued behind another one
+                        // sees the engine as it is when its own encode starts.
+                        was_alone = alone();
+                        tower.encode(&p.pixels, was_alone)
                     })
                     .map_err(|e| EngineError::Internal(format!("vision encoder: {e}")))?;
                     assert_eq!((e.nx, e.ny), (p.nx, p.ny), "the tower's grid");
@@ -421,11 +429,17 @@ impl Vision {
                         tracing::info!(
                             tokens = e.n_tokens(),
                             ms,
+                            alone = was_alone,
                             rows = %format!("{:016x}", rows_hash(&e.data)),
                             "vision: image encoded"
                         );
                     } else {
-                        tracing::info!(tokens = e.n_tokens(), ms, "vision: image encoded");
+                        tracing::info!(
+                            tokens = e.n_tokens(),
+                            ms,
+                            alone = was_alone,
+                            "vision: image encoded"
+                        );
                     }
                     let rows: Arc<[f32]> = e.data.into();
                     self.rows.lock().unwrap_or_else(|e| e.into_inner()).put(

@@ -11,9 +11,16 @@
 //! not depend on the grid: the rows are the same bits. (Raising the language model's stream
 //! priority meanwhile measured no better.)
 //!
+//! The cap only pays when something else runs. An encode that starts while the engine has no
+//! sequence decoding, prefilling or waiting runs uncapped ([`choose`]): alone, the cap made the
+//! encode 6-10% slower for nothing. The decision is made once, at the encode's start (a launch
+//! cannot be re-gridded once queued, and the whole encode is about half a second): a request
+//! that arrives during an uncapped encode waits for the rest of it, as it did before the cap.
+//!
 //! `LEGION_DEBUG_VISION_SHARE` overrides the default, for A/B runs: a comma-separated list
-//! used in turn, one entry per encode. An entry is `0` (one block per tile, the grids as they
-//! were) or a CTA count per SM (`1`, or `1/2`).
+//! used in turn, one entry per encode, whether or not anything else runs. An entry is `0` (one
+//! block per tile, the grids as they were) or a CTA count per SM (`1`, or `1/2`).
+//! `LEGION_DEBUG_VISION_IDLE_FULL=0` keeps the default share on an idle engine too.
 
 #[cfg(test)]
 mod tests;
@@ -81,10 +88,24 @@ pub struct Caps {
     pub small: usize,
 }
 
+/// One encode's share: `explicit` (`LEGION_DEBUG_VISION_SHARE`'s turn) if set; else none
+/// ([`Share::FULL`]) when the engine runs nothing else (`alone`) and the idle rule is on
+/// (`idle_full`); else [`DEFAULT`].
+pub fn choose(explicit: Option<Share>, idle_full: bool, alone: bool) -> Share {
+    match explicit {
+        Some(share) => share,
+        None if idle_full && alone => Share::FULL,
+        None => DEFAULT,
+    }
+}
+
 /// The shares a GPU tower encodes with, in turn, on a device of `sms` SMs.
 pub struct Turns {
     sms: usize,
+    /// `LEGION_DEBUG_VISION_SHARE`'s list (empty: [`choose`] decides by what else runs).
     shares: Vec<Share>,
+    /// [`choose`]'s idle rule (`LEGION_DEBUG_VISION_IDLE_FULL=0` turns it off).
+    idle_full: bool,
     encodes: usize,
 }
 
@@ -94,22 +115,27 @@ impl Turns {
         Self {
             sms: sms.max(1),
             shares: from_env(),
+            idle_full: std::env::var_os("LEGION_DEBUG_VISION_IDLE_FULL").is_none_or(|v| v != "0"),
             encodes: 0,
         }
     }
 
-    /// Encodes with `share` from now on (tests).
+    /// Encodes with `share` from now on, whatever else runs (tests).
     #[cfg(test)]
     pub fn set(&mut self, share: Share) {
         self.shares = vec![share];
     }
 
-    /// The next encode's caps.
-    pub fn next_caps(&mut self) -> Caps {
-        let share = self.shares[self.encodes % self.shares.len()];
+    /// The next encode's caps; `alone`: the engine runs nothing else meanwhile.
+    pub fn next_caps(&mut self, alone: bool) -> Caps {
+        let explicit =
+            (!self.shares.is_empty()).then(|| self.shares[self.encodes % self.shares.len()]);
         self.encodes += 1;
-        if self.shares.len() > 1 || self.shares[0] != DEFAULT {
+        let share = choose(explicit, self.idle_full, alone);
+        if explicit.is_some() {
             tracing::info!(share = %share, "vision: GPU encode share (LEGION_DEBUG_VISION_SHARE)");
+        } else {
+            tracing::debug!(share = %share, alone, "vision: GPU encode share");
         }
         Caps {
             gemm: share.gemm_ctas(self.sms),
@@ -118,13 +144,13 @@ impl Turns {
     }
 }
 
-/// The shares to use in turn: `LEGION_DEBUG_VISION_SHARE`'s, else [`DEFAULT`].
+/// The shares `LEGION_DEBUG_VISION_SHARE` sets, in turn; empty when unset (or not a list).
 pub fn from_env() -> Vec<Share> {
     match std::env::var("LEGION_DEBUG_VISION_SHARE") {
         Ok(v) => parse(&v).unwrap_or_else(|| {
             tracing::warn!("LEGION_DEBUG_VISION_SHARE={v}: not a share list; the default runs");
-            vec![DEFAULT]
+            Vec::new()
         }),
-        Err(_) => vec![DEFAULT],
+        Err(_) => Vec::new(),
     }
 }
