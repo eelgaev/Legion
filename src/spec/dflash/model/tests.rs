@@ -30,7 +30,8 @@ fn bf16_noise(n: usize, seed: u64) -> Vec<u8> {
 /// ingest fit the dense op, four sequences' blocks (32 rows) its wide chain.
 #[test]
 fn gemma_dflash2_projections_fit_the_dense_op() {
-    let ctx = Context::new(64, 0);
+    // 14 tensors per shape: the weight, 5 narrow inputs, 2 per wide row count.
+    let ctx = Context::new(128, 0);
     let shapes = [
         (5376, 8192),
         (5376, 4096),
