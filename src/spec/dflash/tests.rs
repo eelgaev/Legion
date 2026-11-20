@@ -963,6 +963,7 @@ fn round_sums_follow_the_draft_passes() {
         n_embd: 4,
         block: 8,
         first: 1,
+        head: None,
     };
     // DFlash: a pass per request asking for drafts, `max` rows after the first, the block at
     // most; none for a request without drafts or tokens.
