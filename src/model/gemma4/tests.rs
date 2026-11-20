@@ -992,7 +992,9 @@ fn tp_halves_switch() {
 /// the 16-token steps and than rings sized for them hold past the 8-position window: 128
 /// positions), 10 text tokens. Steps of 16 that cut the image differ; steps that stop at it
 /// and take it whole through rings sized for 16-token steps differ (the step overwrites keys
-/// its first rows read); the same steps through rings that hold it ([`ring_hold`]) match.
+/// its first rows read); the same steps through rings that hold it ([`ring_hold`]) match: as
+/// the same steps without rings, and within the rounding noise of steps of other sizes, which
+/// the same prompt as text in the same steps measures (the control).
 ///
 /// [`ring_hold`]: crate::engine::lm::ring_hold
 #[test]
@@ -1011,7 +1013,8 @@ fn whole_images_match_one_step() {
     let n = start + image + 10;
     let prompt: Vec<u32> = (0..n).map(|i| ((i * 7 + 3) % 50) as u32).collect();
     let blocks: Vec<u32> = (0..8).collect();
-    let run = |ring: Option<KvRing>, steps: &[usize]| -> Vec<f32> {
+    // `image_rows`: the image's rows in its tokens' place, else the prompt as text only.
+    let run = |image_rows: bool, ring: Option<KvRing>, steps: &[usize]| -> Vec<f32> {
         assert_eq!(steps.iter().sum::<usize>(), n);
         let mut b = Backend::cpu().unwrap();
         b.set_threads(2);
@@ -1055,7 +1058,7 @@ fn whole_images_match_one_step() {
                         blocks: &blocks,
                         ring: 0,
                         logits: Logits::Greedy,
-                        media: Some(&media),
+                        media: image_rows.then_some(&media),
                     }],
                 }])
                 .unwrap();
@@ -1088,8 +1091,8 @@ fn whole_images_match_one_step() {
     assert_eq!(whole, vec![16, 16, 8, 144, 10]);
     let cut = plan(0);
     assert!(cut.iter().all(|&s| s <= room), "{cut:?}");
-    let reference = run(None, &[n]);
-    let diff = |h: &[f32]| {
+    // The largest difference, relative to `reference`'s largest value (at least 1).
+    let diff = |reference: &[f32], h: &[f32]| {
         assert_eq!(h.len(), reference.len());
         let d = (reference.iter().zip(h))
             .map(|(a, b)| (a - b).abs())
@@ -1104,13 +1107,29 @@ fn whole_images_match_one_step() {
     assert_eq!(text_rings.positions(), 128);
     let rings = KvRing::for_window(window, crate::engine::lm::ring_hold(room, 0, image), 1);
     assert!(rings.holds(window, image) && !text_rings.holds(window, image));
-    let d = diff(&run(Some(text_rings), &cut));
-    assert!(d > 1e-2, "cut image: relative max |diff| {d}");
-    let d = diff(&run(Some(text_rings), &whole));
-    assert!(
-        d > 1e-2,
-        "whole image, rings too short: relative max |diff| {d}"
+    let reference = run(true, None, &[n]);
+    let stepped = run(true, Some(rings), &whole);
+    let cut_d = diff(&reference, &run(true, Some(text_rings), &cut));
+    let short_d = diff(&reference, &run(true, Some(text_rings), &whole));
+    let whole_d = diff(&reference, &stepped);
+    // The same steps without rings: what the rings change (nothing, as the whole step).
+    let rings_d = diff(&run(true, None, &whole), &stepped);
+    // The control: the prompt as text in the same steps and rings against one step. Steps of
+    // other sizes round differently (other matmul shapes, then the F16 the cache and the
+    // attention's matmuls take), the same noise the image's steps carry.
+    let text_d = diff(&run(false, None, &[n]), &run(false, Some(rings), &whole));
+    eprintln!(
+        "relative max |diff| vs one step: cut {cut_d:.3e}, rings too short {short_d:.3e}, \
+         whole {whole_d:.3e}; rings vs none {rings_d:.3e}; text control {text_d:.3e}"
     );
-    let d = diff(&run(Some(rings), &whole));
-    assert!(d <= 1e-3, "whole image: relative max |diff| {d}");
+    assert!(rings_d <= 1e-3, "the rings change the outputs: {rings_d}");
+    // The steps' rounding noise, well under what a cut image or overwritten keys give.
+    assert!(text_d <= 3e-3, "text control: {text_d}");
+    let limit = (3.0 * text_d).max(1e-3);
+    assert!(cut_d > 1e-2, "cut image: {cut_d}");
+    assert!(short_d > 1e-2, "whole image, rings too short: {short_d}");
+    assert!(
+        whole_d <= limit,
+        "whole image: {whole_d}, over {limit} (3 × the text control {text_d})"
+    );
 }
