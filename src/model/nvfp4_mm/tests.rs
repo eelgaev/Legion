@@ -701,10 +701,14 @@ fn skipping_grids_keep_a_spare_tile() {
 #[test]
 fn unread_skips_only_on_marked_expert_chains() {
     let (k, m, n_expert, n_used, n_tok) = (128i64, 64i64, 8i64, 2i64, 4i64);
+    let cpu = crate::ggml::Backend::cpu().unwrap();
     let weights = Context::new(4, 0);
     let wg = weights.new_tensor(types::NVFP4, &[k, m, n_expert]);
     let wu = weights.new_tensor(types::NVFP4, &[k, m, n_expert]);
     let wd = weights.new_tensor(types::NVFP4, &[m, k, n_expert]);
+    // In host memory: `supports` takes them on any machine (unallocated weights would need a
+    // GPU with BF16 tensor cores).
+    weights.alloc_tensors(cpu.buffer_type()).unwrap();
     let ctx = Context::new(64, 128);
     let x = ctx.new_tensor(types::F32, &[k, 1, n_tok]);
     let ids = ctx.new_tensor(types::I32, &[n_used, n_tok]);
