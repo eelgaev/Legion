@@ -1096,7 +1096,7 @@ impl Model {
     ) -> Result<Tensor<'a>, ModelError> {
         let nw = self.lw(il, "ffn_norm.weight")?;
         let h = ctx.mul(ctx.rms_norm(x, eps), nw);
-        // NVFP4 prompt steps: gate, up and the GELU as one op (the same bits; under
+        // NVFP4 prompt and verify steps: gate, up and the GELU as one op (the same bits; under
         // `--nvfp4-a4` the W4A4 one, with the norm in its activations' quantization).
         if let Some(down) = self.geglu_ffn_fused(ctx, il, h, Some((x, nw, eps)))? {
             return Ok(down);

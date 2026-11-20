@@ -58,6 +58,17 @@ const WIDE_MV_RTW2_N: i64 = 40;
 /// the time, gate/up 409 -> 329 us; at 16 tokens it is slower, so not below 24).
 const MV_RPT4_MIN_N: i64 = 24;
 
+/// Dense batches of more than this many tokens up to [`MV_MAX_N`] on matrices of at least
+/// [`MV_RTW2_MIN_M`] rows take row tiles of 32 rows (four per CTA): each activation load serves
+/// twice the rows, and the 32 tokens' activations (re-read through L2 for every row tile) are
+/// read half as often. The same sums: a block goes to the same warp whatever the tile (a DGX
+/// Spark (GB10), Gemma 4 31B's shapes over two Sparks at 32 tokens, #1181: down 175 -> 158 us,
+/// o 78 -> 69 us; smaller matrices would leave SMs without a CTA).
+const MV_RTW2_MIN_N: i64 = 24;
+
+/// See [`MV_RTW2_MIN_N`]: 128 rows per CTA, at least 32 CTAs.
+const MV_RTW2_MIN_M: i64 = 4096;
+
 static WIDE_MV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `legion serve --nvfp4-wide-mv`: dense matmuls (and fused SwiGLUs) of 33 to
@@ -1121,10 +1132,12 @@ pub fn pick_dense(_k: i64, m: i64, n: i64, sms: i64, mv_max_n: i64) -> Kernel {
     if n <= mv_max_n {
         // Above 40 tokens (--nvfp4-wide-mv) 32 rows per CTA: each weight stage serves twice
         // the rows for the same activations (GB10, 27B MLP shapes at 64 tokens: 17408 -> 5120
-        // 461 -> 379 us, 5120 -> 17408 446 -> 324 us; 336 against 288 us at 33).
+        // 461 -> 379 us, 5120 -> 17408 446 -> 324 us; 336 against 288 us at 33); so at 25-32
+        // tokens on large matrices ([`MV_RTW2_MIN_N`]).
+        let rtw2 = n > WIDE_MV_RTW2_N || (n > MV_RTW2_MIN_N && n <= MV_MAX_N && m >= MV_RTW2_MIN_M);
         return Kernel::Mv {
             nt: tokens_tile(n, 8),
-            rtw: if n > WIDE_MV_RTW2_N { 2 } else { 1 },
+            rtw: if rtw2 { 2 } else { 1 },
             kw: 8,
             rpt: if (MV_RPT4_MIN_N..=MV_MAX_N).contains(&n) {
                 4

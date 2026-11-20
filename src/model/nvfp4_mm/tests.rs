@@ -48,8 +48,18 @@ fn dense_kernel_choice() {
     };
     assert_eq!(pick_dense(5120, 17408, 23, 48, MV_MAX_N), mv(4, 1));
     assert_eq!(pick_dense(5120, 17408, 24, 48, MV_MAX_N), rpt4);
-    assert_eq!(pick_dense(17408, 5120, 32, 48, MV_MAX_N), rpt4);
-    assert_eq!(pick_dense(5120, 17408, 32, 48, WIDE_MV_MAX_N), rpt4);
+    // 25-32 tokens on matrices of 4096 rows or more: four row tiles of 32 rows (#1181).
+    let rtw2 = Kernel::Mv {
+        nt: 4,
+        rtw: 2,
+        kw: 8,
+        rpt: 4,
+    };
+    assert_eq!(pick_dense(17408, 5120, 32, 48, MV_MAX_N), rtw2);
+    assert_eq!(pick_dense(5120, 17408, 25, 48, MV_MAX_N), rtw2);
+    assert_eq!(pick_dense(5376, 4096, 32, 48, MV_MAX_N), rtw2);
+    assert_eq!(pick_dense(5376, 2048, 32, 48, MV_MAX_N), rpt4);
+    assert_eq!(pick_dense(5120, 17408, 32, 48, WIDE_MV_MAX_N), rtw2);
     assert_eq!(pick_dense(5120, 17408, 33, 48, WIDE_MV_MAX_N), mv(8, 1));
     assert_eq!(pick_dense(5120, 17408, 40, 48, WIDE_MV_MAX_N), mv(8, 1));
     assert_eq!(pick_dense(5120, 17408, 41, 48, WIDE_MV_MAX_N), mv(8, 2));

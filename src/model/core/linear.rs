@@ -540,9 +540,9 @@ impl Linear {
     /// The GeGLU FFN `down @ (gelu(gate @ x) * (up @ x))` (Gemma 4) with the gate and up
     /// matmuls and the tanh GELU as one W4A16 op ([`crate::model::nvfp4_mm::geglu`], BF16 out:
     /// the bits of the two matmuls, ggml's `geglu_split` and the down matmul's cast to BF16),
-    /// then the down matmul, in batches the GEMMs run (more than
-    /// [`crate::model::nvfp4_mm::dense_mv_max_n`] tokens: prompt steps). The hidden activations
-    /// never take the two F32 matmul outputs, the F32 GeGLU and the cast through memory. `None`
+    /// then the down matmul: prompt steps on the GEMMs, verify steps on the mv kernel (#1181:
+    /// one activation load for both weights' rows). The hidden activations never take the two
+    /// F32 matmul outputs, the F32 GeGLU and the cast through memory. `None`
     /// (run it unfused) unless all three weights take Legion's W4A16 kernels at this batch.
     /// Batches [`Nvfp4A4`] gives 4-bit activations take the W4A4 GeGLU
     /// ([`crate::model::nvfp4_a4::geglu`], with `norm` (`(h, w, eps)`, `x` being
@@ -583,9 +583,6 @@ impl Linear {
                 _ => nvfp4_a4::geglu(ctx, gate.1, up.1, x, gate.2, up.2),
             };
             return Some(nvfp4_a4::mul_mat(ctx, down.1, act, down.2));
-        }
-        if n <= crate::model::nvfp4_mm::dense_mv_max_n() {
-            return None;
         }
         let act = crate::model::nvfp4_mm::geglu(ctx, gate.1, up.1, x, gate.2, up.2);
         Some(crate::model::nvfp4_mm::mul_mat(ctx, down.1, act, down.2))

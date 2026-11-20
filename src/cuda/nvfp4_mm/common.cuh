@@ -1441,15 +1441,16 @@ constexpr int MV_SB = 16, MV_NS = 2;
 
 template <int NT, int RTW>
 int mv_kw(const legion_nvfp4_mm & p, int kw, int rpt, cudaStream_t st) {
-    // Several row tiles per CTA: only the 8-warp, one-tile-wide kernel (grouped decode).
-    if (rpt != 1 && (RTW != 1 || kw != 8)) {
+    // Several row tiles per CTA: only the 8-warp kernel; 2 or 4 tiles of 32 rows (dense verify
+    // batches of 2x DGX Spark tensor parallel, #1181), up to 16 of 16 rows (grouped decode).
+    if (rpt != 1 && (kw != 8 || (RTW != 1 && rpt > 4))) {
         return -1;
     }
     switch (kw * 16 + rpt) {
         case 4 * 16 + 1: return mvs<NT, RTW, 4, MV_SB, MV_NS, true>(p, st);
         case 8 * 16 + 1: return mvs<NT, RTW, 8, MV_SB, MV_NS, true>(p, st);
-        case 8 * 16 + 2: return mvs<NT, 1, 8, MV_SB, MV_NS, true, false, 2>(p, st);
-        case 8 * 16 + 4: return mvs<NT, 1, 8, MV_SB, MV_NS, true, false, 4>(p, st);
+        case 8 * 16 + 2: return mvs<NT, RTW, 8, MV_SB, MV_NS, true, false, 2>(p, st);
+        case 8 * 16 + 4: return mvs<NT, RTW, 8, MV_SB, MV_NS, true, false, 4>(p, st);
         case 8 * 16 + 8: return mvs<NT, 1, 8, MV_SB, MV_NS, true, false, 8>(p, st);
         case 8 * 16 + 16: return mvs<NT, 1, 8, MV_SB, MV_NS, true, false, 16>(p, st);
         default: return -1;
