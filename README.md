@@ -74,7 +74,7 @@ benchmark client. One section per model, one table per machine, one row per engi
 and 16 users: per request at 1 user, the total over all requests at 4 and 16. **Prefill** is one prompt of 8K,
 32K or 123K tokens, in tokens per second. With drafting (MTP, DFlash 2) the 1-user speed
 depends on the prompt: a range such as 23-51 is the slowest to the fastest of the fixed benchmark prompts (prose,
-code, lists, chats), from the 2026-11-03 runs. `—`: not measured or did not finish (see the notes). **Bold**: Legion beats the other engine on the same machine with the same kind of weights (llama.cpp or Project Maya for GGUF,
+code, lists, chats), from each row's latest run (the run pages give the dates). `—`: not measured or did not finish (see the notes). **Bold**: Legion beats the other engine on the same machine with the same kind of weights (llama.cpp or Project Maya for GGUF,
 vLLM for NVFP4, Strata on gaming PCs; at 1 user by median). Legion's greedy output is identical to the run without the opt-in flags unless a note
 says otherwise. Every command, Legion's and the other engines', is
 in [Run commands](#run-commands).
@@ -238,7 +238,7 @@ right after the load, not the fixed benchmark prompts; prefill is one request ea
 ¹⁸ Strata's own speculative decoding (`--spec 4`) and int8 KV; its output differs from Legion's. 64 and 32 GB with
 `--resident-budget-gib 40` and `8` (see the run command).
 
-Measured 2026-10-20 to 2026-11-15. Each new speed record is added here.
+Measured 2026-10-20 to 2026-11-20. Each new speed record is added here.
 
 ## Roadmap
 
