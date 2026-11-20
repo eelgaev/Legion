@@ -60,6 +60,9 @@ pub struct TinyDraft {
     pub quant: Option<ffi::ggml_type>,
     /// DFlash 2: convolutions and a candidate selector.
     pub v2: Option<Dflash2>,
+    /// The target's vocabulary (the selector's and the Markov head's rows): [`TARGET_VOCAB`], or
+    /// more for a tiny target with tokens of its own (`TinyConfig::user_tokens`).
+    pub target_vocab: usize,
     pub seed: u64,
 }
 
@@ -86,6 +89,7 @@ impl Default for TinyDraft {
             sample_from_anchor: true,
             quant: None,
             v2: None,
+            target_vocab: TARGET_VOCAB,
             seed: 7,
         }
     }
@@ -188,8 +192,8 @@ pub fn tensors(c: &TinyDraft) -> Vec<Tensor> {
         let r = v2.selector_rank as i64;
         mat(&mut out, "selector_hidden.weight".into(), e, r);
         for book in ["selector_predecessor.weight", "selector_successor.weight"] {
-            let v = uniform(v2.selector_rank * TARGET_VOCAB, 1.0);
-            out.push((book.into(), vec![r, TARGET_VOCAB as i64], v));
+            let v = uniform(v2.selector_rank * c.target_vocab, 1.0);
+            out.push((book.into(), vec![r, c.target_vocab as i64], v));
         }
     }
     if let Some(ids) = &c.draft_vocab {
@@ -207,9 +211,13 @@ pub fn tensors(c: &TinyDraft) -> Vec<Tensor> {
     }
     if let Some(rank) = c.markov_rank {
         let r = rank as i64;
-        let n_out = c.draft_vocab.as_ref().map_or(TARGET_VOCAB, Vec::len) as i64;
-        let w1 = uniform(rank * TARGET_VOCAB, 1.0);
-        out.push(("markov_w1.weight".into(), vec![r, TARGET_VOCAB as i64], w1));
+        let n_out = c.draft_vocab.as_ref().map_or(c.target_vocab, Vec::len) as i64;
+        let w1 = uniform(rank * c.target_vocab, 1.0);
+        out.push((
+            "markov_w1.weight".into(),
+            vec![r, c.target_vocab as i64],
+            w1,
+        ));
         let w2 = uniform(rank * n_out as usize, 2.0 / (rank as f32).sqrt());
         out.push(("markov_w2.weight".into(), vec![r, n_out], w2));
         if c.confidence {

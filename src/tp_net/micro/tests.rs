@@ -46,8 +46,87 @@ fn params_round_trip() {
         n: 4096,
         j: 1,
         compact: true,
+        reduce: false,
     };
-    assert_eq!(p.list(), [3, 1, 4096, 1, 1]);
+    assert_eq!(p.list(), [3, 1, 4096, 1, 1, 0]);
+    let r = Params { reduce: true, ..p };
+    assert_eq!(r.list()[5], 1);
+}
+
+/// A micro-batch all-reduce (#619) of each half of a tensor gives the halves of the whole
+/// tensor's all-reduce bit for bit: the wire type goes by the whole tensor's values, even
+/// where a half alone would travel in F32.
+#[test]
+fn halves_all_reduce_as_whole() {
+    use super::super::Wire;
+    let (row, cols) = (5, 12);
+    let len = row * cols;
+    let comms = super::super::tests::comms(2, std::time::Duration::from_secs(10));
+    let threads: Vec<_> = comms
+        .into_iter()
+        .enumerate()
+        .map(|(r, c)| {
+            std::thread::spawn(move || {
+                c.set_collectives(Wire::Bf16, 0);
+                // BF16 for the whole tensor's exchange, F32 for a half's alone.
+                c.set_bf16_min(len);
+                assert_eq!((c.wire(len), c.wire(len / 2)), (Wire::Bf16, Wire::F32));
+                let src: Vec<f32> = (0..len)
+                    .map(|i| 1.0 + (i * 7 + r * 31) as f32 / 1024.0 + r as f32 * 1e-3)
+                    .collect();
+                let mut whole = vec![0f32; len];
+                c.all_reduce_host(&src, &mut whole).unwrap();
+                let mut halves = vec![0f32; len];
+                let cut = row * (cols / 2);
+                let (a, b) = halves.split_at_mut(cut);
+                c.all_reduce_host_as(&src[..cut], a, len).unwrap();
+                c.all_reduce_host_as(&src[cut..], b, len).unwrap();
+                (whole, halves)
+            })
+        })
+        .collect();
+    for t in threads {
+        let (whole, halves) = t.join().unwrap();
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&whole), bits(&halves));
+    }
+}
+
+/// An odd step's halves (#619): half 1 has one more column than half 0; the sums are still the
+/// whole all-reduce's bits.
+#[test]
+fn odd_halves_all_reduce_as_whole() {
+    use super::super::Wire;
+    let (row, cols) = (5, 13);
+    let len = row * cols;
+    let comms = super::super::tests::comms(2, std::time::Duration::from_secs(10));
+    let threads: Vec<_> = comms
+        .into_iter()
+        .enumerate()
+        .map(|(r, c)| {
+            std::thread::spawn(move || {
+                c.set_collectives(Wire::Bf16, 0);
+                c.set_bf16_min(len);
+                let src: Vec<f32> = (0..len)
+                    .map(|i| 1.0 + (i * 7 + r * 31) as f32 / 1024.0 + r as f32 * 1e-3)
+                    .collect();
+                let mut whole = vec![0f32; len];
+                c.all_reduce_host(&src, &mut whole).unwrap();
+                let mut halves = vec![0f32; len];
+                let cut = row * (cols / 2);
+                assert_eq!((cut, len - cut), (row * 6, row * 7));
+                let (a, b) = halves.split_at_mut(cut);
+                c.all_reduce_host_as(&src[..cut], a, len).unwrap();
+                c.all_reduce_host_as(&src[cut..], b, len).unwrap();
+                (whole, halves)
+            })
+        })
+        .collect();
+    for t in threads {
+        let (whole, halves) = t.join().unwrap();
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&whole), bits(&halves));
+    }
 }
 
 /// `--tp-overlap` splits only steps whose every micro-batch has at least `MIN_COLS` columns

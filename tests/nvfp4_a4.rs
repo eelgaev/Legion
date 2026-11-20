@@ -311,16 +311,26 @@ fn run_swiglu_norm(
     read(out)
 }
 
+/// How [`run_multi`] runs the matmuls.
+#[derive(Clone, Copy, PartialEq)]
+enum MultiWay {
+    /// (ggml's norm and `mul`, then) one `mul_mat` each.
+    Plain,
+    /// One `mul_mat_multi` node.
+    Fused,
+    /// Two `mul_mat_multi_part` nodes, the tokens before the given one and the rest (#619).
+    Parts(usize),
+}
+
 /// Matmuls of the weights `ws` (rows `ms`, scales 0.5, none, 0.25, ..) over
-/// `mul(rms_norm(x, 1e-6), nw)` (or `x` without `nws`) on `backend`, concatenated: one
-/// `mul_mat_multi` node (`fused`), or (ggml's norm and `mul`, then) one `mul_mat` each.
+/// `mul(rms_norm(x, 1e-6), nw)` (or `x` without `nws`) on `backend`, concatenated, run `way`.
 fn run_multi(
     backend: &mut Backend,
     ws: &[Vec<u8>],
     ms: &[usize],
     (xs, nws): (&[f32], Option<&[f32]>),
     (k, n): (usize, usize),
-    fused: bool,
+    way: MultiWay,
 ) -> Vec<f32> {
     let weights = Context::new(2 * ws.len() + 1, 0);
     let wt: Vec<_> = ms
@@ -343,23 +353,41 @@ fn run_multi(
     }
     let ctx = Context::new(16, 32);
     let x = ctx.new_tensor(types::F32, &[k as i64, n as i64]).as_input();
+    let cut = match way {
+        MultiWay::Parts(c) => c,
+        _ => n,
+    };
+    let x0 = ctx
+        .new_tensor(types::F32, &[k as i64, cut as i64])
+        .as_input();
+    let x1 = ctx
+        .new_tensor(types::F32, &[k as i64, (n - cut).max(1) as i64])
+        .as_input();
     let pairs: Vec<_> = wt
         .iter()
         .zip(&st)
         .enumerate()
         .map(|(i, (&w, &s))| (w, scale_of(i).map(|_| s)))
         .collect();
-    let outs = if fused {
-        nvfp4_a4::mul_mat_multi(&ctx, &pairs, x, nws.map(|_| (nw, 1e-6)))
-    } else {
-        let h = match nws {
-            Some(_) => ctx.mul(ctx.rms_norm(x, 1e-6), nw),
-            None => x,
-        };
-        pairs
-            .iter()
-            .map(|&(w, s)| nvfp4_a4::mul_mat(&ctx, w, h, s))
-            .collect()
+    let norm = nws.map(|_| (nw, 1e-6));
+    let outs = match way {
+        MultiWay::Fused => nvfp4_a4::mul_mat_multi(&ctx, &pairs, x, norm),
+        MultiWay::Parts(_) => {
+            let (n_, c) = (n as i64, cut as i64);
+            let p0 = nvfp4_a4::mul_mat_multi_part(&ctx, &pairs, x0, norm, n_, 0, None);
+            let p1 = nvfp4_a4::mul_mat_multi_part(&ctx, &pairs, x1, norm, n_, c, Some(p0));
+            nvfp4_a4::multi_part_outputs(&ctx, p1, &pairs, n_)
+        }
+        MultiWay::Plain => {
+            let h = match nws {
+                Some(_) => ctx.mul(ctx.rms_norm(x, 1e-6), nw),
+                None => x,
+            };
+            pairs
+                .iter()
+                .map(|&(w, s)| nvfp4_a4::mul_mat(&ctx, w, h, s))
+                .collect()
+        }
     };
     let outs: Vec<_> = outs.into_iter().map(|o| ctx.cont(o).as_output()).collect();
     let mut graph = ctx.new_graph(32);
@@ -368,7 +396,13 @@ fn run_multi(
     }
     ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
         .unwrap();
-    x.set_f32(xs);
+    match way {
+        MultiWay::Parts(_) => {
+            x0.set_f32(&xs[..k * cut]);
+            x1.set_f32(&xs[k * cut..]);
+        }
+        _ => x.set_f32(xs),
+    }
     backend.compute(&graph).unwrap();
     outs.into_iter().flat_map(read).collect()
 }
@@ -507,9 +541,17 @@ fn cpu_fused_residual_and_norm_match_unfused() {
         let ms = [m, m + 16, 2 * m];
         let ws: Vec<_> = ms.iter().map(|&mi| weights(k, mi, mi as u64)).collect();
         for norm in [None, Some(&nws[..])] {
-            let plain = run_multi(&mut cpu, &ws, &ms, (&xs, norm), (k, n), false);
-            let fused = run_multi(&mut cpu, &ws, &ms, (&xs, norm), (k, n), true);
+            let plain = run_multi(&mut cpu, &ws, &ms, (&xs, norm), (k, n), MultiWay::Plain);
+            let fused = run_multi(&mut cpu, &ws, &ms, (&xs, norm), (k, n), MultiWay::Fused);
             assert!(same_bits(&plain, &fused), "k {k} m {m} n {n}: multi");
+            if n > 1 {
+                let way = MultiWay::Parts(n / 2);
+                let parts = run_multi(&mut cpu, &ws, &ms, (&xs, norm), (k, n), way);
+                assert!(
+                    same_bits(&fused, &parts),
+                    "k {k} m {m} n {n}: multi in parts"
+                );
+            }
         }
     }
 }
@@ -1063,9 +1105,18 @@ mod cuda {
             let ms = [m, m + 16, 2 * m];
             let ws: Vec<_> = ms.iter().map(|&mi| weights(k, mi, mi as u64)).collect();
             for norm in [None, Some(&nws[..])] {
-                let plain = run_multi(&mut gpu, &ws, &ms, (&xs, norm), (k, n), false);
-                let fused = run_multi(&mut gpu, &ws, &ms, (&xs, norm), (k, n), true);
+                let plain = run_multi(&mut gpu, &ws, &ms, (&xs, norm), (k, n), MultiWay::Plain);
+                let fused = run_multi(&mut gpu, &ws, &ms, (&xs, norm), (k, n), MultiWay::Fused);
                 assert!(same_bits(&plain, &fused), "k {k} m {m} n {n}: multi");
+                // Halves of a prompt step (#619): both over 64 tokens, the step's bits.
+                if n / 2 > 64 {
+                    let way = MultiWay::Parts(n / 2);
+                    let parts = run_multi(&mut gpu, &ws, &ms, (&xs, norm), (k, n), way);
+                    assert!(
+                        same_bits(&fused, &parts),
+                        "k {k} m {m} n {n}: multi in parts"
+                    );
+                }
             }
             println!("fusions k {k} m {m} n {n}: bit-exact");
         }

@@ -131,10 +131,11 @@ pub(super) struct ModelArgs {
         conflicts_with = "model"
     )]
     pub hfmodel: Option<String>,
-    /// A vision projector (mmproj GGUF, `qwen3vl_merger`, e.g. unsloth's `mmproj-F16.gguf`) for
-    /// a Qwen3.5 / Qwen3.6 / Qwen3.8-Flash-Next model: requests may then carry images (all
-    /// three APIs and the web UI), and the model advertises vision. Its tower runs on the CPU
-    /// (up to 8 threads), seconds per image. Default: an HF checkpoint's own vision tower
+    /// A vision projector (mmproj GGUF, `qwen3vl_merger`, e.g. unsloth's `mmproj-F16.gguf` or
+    /// `mmproj-BF16.gguf`) for a Qwen3.5 / Qwen3.6 / Qwen3.8-27B / Qwen3.8-Flash-Next model:
+    /// requests may then carry images (all three APIs and the web UI), and the model advertises
+    /// vision. Its tower runs on the model's first GPU (sm_70 or newer), else on the CPU (up to
+    /// 8 threads, seconds per image). Default: an HF checkpoint's own vision tower
     /// (`model.visual.*`) when it ships one, else none (text only).
     #[arg(long, value_name = "GGUF", conflicts_with = "no_mmproj")]
     pub mmproj: Option<PathBuf>,

@@ -1831,6 +1831,12 @@ impl Model {
         }
     }
 
+    /// The communicator [`Self::tp_sum`] sums over with tensor parallelism over machines
+    /// ([`Self::set_tp_comm`]), not over a GPU pair.
+    pub(crate) fn tp_net_comm(&self) -> Option<i32> {
+        self.tp_comm.filter(|_| self.tp_pair.is_none())
+    }
+
     /// Whether [`Self::tp_sum`] sums over tensor-parallel ranks (else it is `x` itself).
     pub(crate) fn tp_on(&self) -> bool {
         self.tp_pair.is_some() || self.tp_comm.is_some()
@@ -4286,6 +4292,62 @@ impl Model {
         }
         let refs: Vec<_> = ws.iter().map(|(w, s, n)| (n.as_str(), *w, *s)).collect();
         Ok(self.linear.mul_mat_multi(ctx, &refs, h, norm))
+    }
+
+    /// [`Self::lmm_multi`] of a part of a step, normed in its quantization
+    /// ([`linear::Linear::mul_mat_multi_part`]): `norm`'s residual holds the step's columns
+    /// from `col0` of `n`; `into`: the node of another part. The node, or `None` where it does
+    /// not run so.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn lmm_multi_part<'a>(
+        &'a self,
+        ctx: &'a Context,
+        il: usize,
+        names: &[&str],
+        norm: (Tensor<'a>, Tensor<'a>, f32),
+        n: i64,
+        col0: i64,
+        into: Option<Tensor<'a>>,
+    ) -> Result<Option<Tensor<'a>>, ModelError> {
+        let mut ws = Vec::new();
+        for name in names {
+            let name = format!("blk.{il}.{name}");
+            let scale = linear::scale_name(&name).and_then(|s| self.w(&s).ok());
+            ws.push((self.w(&name)?, scale, name));
+        }
+        let refs: Vec<_> = ws.iter().map(|(w, s, n)| (n.as_str(), *w, *s)).collect();
+        let x = norm.0;
+        Ok(self
+            .linear
+            .mul_mat_multi_part(ctx, &refs, x, norm, n, col0, into))
+    }
+
+    /// The weights `names` of layer `il` for which [`Self::lmm_multi_part`] makes its node
+    /// ([`crate::model::nvfp4_a4::multi_part_outputs`] reads the outputs).
+    pub(crate) fn lmm_multi_weights<'a>(
+        &'a self,
+        il: usize,
+        names: &[&str],
+    ) -> Result<Vec<(Tensor<'a>, Option<Tensor<'a>>)>, ModelError> {
+        names
+            .iter()
+            .map(|name| {
+                let name = format!("blk.{il}.{name}");
+                let scale = linear::scale_name(&name).and_then(|s| self.w(&s).ok());
+                Ok((self.w(&name)?, scale))
+            })
+            .collect()
+    }
+
+    /// Whether layer `il`'s weight `name` runs on Legion's W4A4 dense kernels at a batch of `n`
+    /// tokens ([`linear::Linear::a4_dense`]: every token the same bits at every such batch).
+    pub(crate) fn a4_dense(&self, il: usize, name: &str, n: i64) -> bool {
+        let name = format!("blk.{il}.{name}");
+        let Ok(w) = self.w(&name) else {
+            return false;
+        };
+        let scale = linear::scale_name(&name).and_then(|s| self.w(&s).ok());
+        self.linear.a4_dense(&name, w, scale, n)
     }
 
     pub(crate) fn moe<'a>(
