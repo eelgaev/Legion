@@ -1184,11 +1184,15 @@ fn whole_images_match_one_step() {
 /// shared-KV layers (4-6) and the layers whose caches they read (2, 3) are on the second.
 /// Against one step on one stage: micro-chunks that cut the image differ (image step 0, rings
 /// sized for 16-token steps); the image in one 144-token micro-chunk through those rings
-/// differs (it overwrites keys its first rows read); through rings that hold it, it matches:
-/// as without rings, and within the noise of the prompt as text on the same stages and rings.
+/// differs (it overwrites keys its first rows read). Through rings that hold it, the stages
+/// give what one stage gives in steps of the micro-chunks' sizes (16, 16, 8, 144, 8, 2)
+/// through the same rings: the same shapes, so the same rounding (no difference expected; at
+/// most 1e-5), and the same as without rings. Against one step of the whole prompt the
+/// difference is the steps' rounding noise ([`whole_images_match_one_step`]), printed with
+/// the prompt as text on the same stages and rings (its micro-chunks of other sizes, so noisier).
 #[test]
 fn whole_images_match_over_two_stages() {
-    use crate::model::core::{Hparams, KvRing};
+    use crate::model::core::{Hparams, ImageSpan, KvRing, Media};
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tiny.gguf");
     tiny::write_dense(&path, 5).unwrap();
@@ -1213,8 +1217,25 @@ fn whole_images_match_over_two_stages() {
             &[n],
         )
     };
+    // The micro-chunks the executor cuts the step into (no taper: full ones, then the rest),
+    // the image in one (`Media::uncut_sizes`).
+    let mut plain = vec![micro; n / micro];
+    plain.push(n % micro);
+    let span = ImageSpan {
+        start: IMAGE_AT,
+        nx: IMAGE_SIDE,
+        ny: IMAGE_SIDE,
+        rows: vec![0.0; image].into(),
+    };
+    let pieces = Media::sequential(vec![span], 1).uncut_sizes(0, &plain, image);
+    assert_eq!(pieces, vec![16, 16, 8, 144, 8, 2]);
     let reference = image_prompt_rows(&gguf, true, None, None, &[n]);
     let whole = staged(true, Some(rings), image);
+    // One stage, steps of the micro-chunks' sizes, the same rings.
+    let same_d = rel_diff(
+        &image_prompt_rows(&gguf, true, Some(rings), None, &pieces),
+        &whole,
+    );
     let cut_d = rel_diff(&reference, &staged(true, Some(text_rings), 0));
     let short_d = rel_diff(&reference, &staged(true, Some(text_rings), image));
     let whole_d = rel_diff(&reference, &whole);
@@ -1224,17 +1245,16 @@ fn whole_images_match_over_two_stages() {
         &staged(false, Some(rings), image),
     );
     eprintln!(
-        "two stages, relative max |diff| vs one step on one stage: cut {cut_d:.3e}, rings too \
-         short {short_d:.3e}, whole {whole_d:.3e}; rings vs none {rings_d:.3e}; text control \
-         {text_d:.3e}"
+        "two stages, relative max |diff|: vs one stage in the micro-chunks' steps \
+         {same_d:.3e}; vs one step on one stage: cut {cut_d:.3e}, rings too short \
+         {short_d:.3e}, whole {whole_d:.3e}, text control {text_d:.3e}; rings vs none \
+         {rings_d:.3e}"
     );
-    assert!(rings_d <= 1e-3, "the rings change the outputs: {rings_d}");
-    assert!(text_d <= 3e-3, "text control: {text_d}");
-    let limit = (3.0 * text_d).max(1e-3);
+    assert!(
+        same_d <= 1e-5,
+        "two stages vs one in the same steps: {same_d}"
+    );
+    assert!(rings_d <= 1e-5, "the rings change the outputs: {rings_d}");
     assert!(cut_d > 1e-2, "cut image: {cut_d}");
     assert!(short_d > 1e-2, "whole image, rings too short: {short_d}");
-    assert!(
-        whole_d <= limit,
-        "whole image: {whole_d}, over {limit} (3 × the text control {text_d})"
-    );
 }
