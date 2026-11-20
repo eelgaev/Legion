@@ -43,6 +43,138 @@ pub fn all_reduce_add<'a>(
     ctx.external_with(&ALL_REDUCE, types::F32, x.ne(), &[x, res], &[comm, 1])
 }
 
+/// The next layer's input norm, `mul(rms_norm(y, eps), w)`, that a finish of an all-reduce
+/// with a residual computes from its sums `y` in the same pass (#1133): the packed per-token FP8
+/// activations of [`crate::model::fp8_act::rms_norm`] (and with `bf16` the BF16 rows of
+/// [`crate::model::fp8_act::rms_norm_bf16`]), the bits of those ops on `y`, without reading `y`
+/// back. GPUs only ([`crate::model::fp8_act::rms_norm_fits`]); the CPU's are references.
+#[derive(Clone, Copy)]
+pub struct Norm<'a> {
+    pub w: Tensor<'a>,
+    pub eps: f32,
+    pub bf16: bool,
+}
+
+impl Norm<'_> {
+    /// Its params: the eps bits and the flags ([`NORM_ON`], [`NORM_BF16`]).
+    pub(super) fn params(&self) -> [i32; 2] {
+        let flags = NORM_ON | if self.bf16 { NORM_BF16 } else { 0 };
+        [self.eps.to_bits() as i32, flags]
+    }
+}
+
+/// A finish's [`Norm`] flags: on, and the BF16 rows too.
+pub(super) const NORM_ON: i32 = 1;
+pub(super) const NORM_BF16: i32 = 2;
+
+/// A node's [`Norm`] as the kernels read it: the weight's address, eps, BF16 rows.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[derive(Clone, Copy)]
+pub(crate) struct NormParams {
+    pub w: usize,
+    pub eps: f32,
+    pub bf16: bool,
+}
+
+impl NormParams {
+    /// The norm of params `[eps bits, flags]` (`None` without [`NORM_ON`]), its weight `w`.
+    pub(super) fn of(p: [i32; 2], w: impl FnOnce() -> usize) -> Option<Self> {
+        (p[1] & NORM_ON != 0).then(|| Self {
+            w: w(),
+            eps: f32::from_bits(p[0] as u32),
+            bf16: p[1] & NORM_BF16 != 0,
+        })
+    }
+}
+
+/// The byte offsets in a normed finish's node of `row` values x `width` tokens: the sums
+/// (F32) first, then the BF16 rows (with `bf16`), then the packed FP8 activations
+/// ([`crate::model::fp8::dynamic_layout`]): `(BF16 rows, packed activations, total)`.
+pub(crate) fn norm_layout(row: usize, width: usize, bf16: bool) -> (usize, usize, usize) {
+    let y = 4 * row * width;
+    let b = if bf16 { 2 * row * width } else { 0 };
+    let (_, q) = crate::model::fp8::dynamic_layout(row as i64, width as i64);
+    (y, y + b, y + b + q)
+}
+
+/// The tokens of a normed finish's node of `bytes` bytes and rows of `row` values
+/// ([`norm_layout`]).
+pub(crate) fn norm_width(bytes: usize, row: usize, bf16: bool) -> usize {
+    bytes / (row * (5 + if bf16 { 2 } else { 0 }) + 4)
+}
+
+/// What a normed finish's node holds, as views: the sums `y` (F32 `[row, width]`), the packed
+/// activations `q` and the BF16 rows `b` (with [`Norm::bf16`]).
+#[derive(Clone, Copy)]
+pub struct Normed<'a> {
+    pub y: Tensor<'a>,
+    pub q: Tensor<'a>,
+    pub b: Option<Tensor<'a>>,
+}
+
+/// The views of `node` (a normed finish of `row` x `width`, the last one to write it).
+pub fn normed<'a>(
+    ctx: &'a Context,
+    node: Tensor<'a>,
+    row: i64,
+    width: i64,
+    bf16: bool,
+) -> Normed<'a> {
+    let (b_at, q_at, total) = norm_layout(row as usize, width as usize, bf16);
+    let vals = row * width;
+    let y = ctx.reinterpret(
+        ctx.view_1d(node, 4 * vals, 0),
+        types::F32,
+        [row, width, 1, 1],
+    );
+    let q = ctx.view_1d(node, (total - q_at) as i64, q_at);
+    let b = bf16.then(|| {
+        ctx.reinterpret(
+            ctx.view_1d(node, 2 * vals, b_at),
+            types::BF16,
+            [row, width, 1, 1],
+        )
+    });
+    Normed { y, q, b }
+}
+
+/// [`all_reduce_add`] with `norm` computed from the sums in the same kernel ([`Norm`]): `x`
+/// and `res` F32 `[row, n]`.
+pub fn all_reduce_add_norm<'a>(
+    ctx: &'a Context,
+    comm: i32,
+    x: Tensor<'a>,
+    res: Tensor<'a>,
+    norm: Norm<'a>,
+) -> Normed<'a> {
+    let [row, n, a, b] = x.ne();
+    assert_eq!((a, b), (1, 1), "tp all-reduce: a 2-D tensor to norm");
+    assert_eq!(x.ty(), types::F32, "tp all-reduce: F32 only");
+    assert_eq!(res.ty(), types::F32, "tp all-reduce: an F32 residual");
+    assert_eq!(res.ne(), x.ne(), "tp all-reduce: the residual's shape");
+    assert_eq!(
+        norm.w.elements(),
+        row as usize,
+        "tp all-reduce: the norm's weight"
+    );
+    let x = if x.is_contiguous() { x } else { ctx.cont(x) };
+    let res = if res.is_contiguous() {
+        res
+    } else {
+        ctx.cont(res)
+    };
+    let (_, _, total) = norm_layout(row as usize, n as usize, norm.bf16);
+    let [eps, flags] = norm.params();
+    let node = ctx.external_with(
+        &ALL_REDUCE,
+        types::I8,
+        [total as i64, 1, 1, 1],
+        &[x, res, norm.w],
+        &[comm, 1, eps, flags],
+    );
+    normed(ctx, node, row, n, norm.bf16)
+}
+
 /// `out[i] += res[i]`: the residual of [`all_reduce_add`] and `micro::finish_add` on the CPU,
 /// ggml's add of the sum and the residual.
 pub(super) fn add_host(out: &mut [f32], res: &[f32]) {
@@ -57,17 +189,19 @@ unsafe fn cpu_all_reduce(dst: &ffi::ggml_tensor, ith: usize, _nth: usize) {
         return;
     }
     let p = external_params(dst);
-    // SAFETY: a node made by `all_reduce` or `all_reduce_add` on the CPU: a contiguous F32
-    // source (and residual) of its own shape, all with host data, which ggml gives the node
-    // for its compute.
+    // SAFETY: a node made by `all_reduce`, `all_reduce_add` or `all_reduce_add_norm` on the
+    // CPU: a contiguous F32 source (and residual) of the sums' shape, all with host data, which
+    // ggml gives the node for its compute.
     let (src, out, res) = unsafe {
-        let n = ffi::ggml_nelements(dst) as usize;
+        let n = ffi::ggml_nelements(dst.src[0]) as usize;
         (
             std::slice::from_raw_parts((*dst.src[0]).data as *const f32, n),
             std::slice::from_raw_parts_mut(dst.data as *mut f32, n),
             (p[1] != 0).then(|| std::slice::from_raw_parts((*dst.src[1]).data as *const f32, n)),
         )
     };
+    // SAFETY: `all_reduce_add_norm`'s weight is its source 2.
+    let norm = NormParams::of([p[2], p[3]], || unsafe { (*dst.src[2]).data as usize });
     match super::comm(p[0]) {
         // A failure stays in the communicator, for the step to report.
         Some(c) => {
@@ -80,6 +214,35 @@ unsafe fn cpu_all_reduce(dst: &ffi::ggml_tensor, ith: usize, _nth: usize) {
     }
     if let Some(res) = res {
         add_host(out, res);
+    }
+    if let Some(nm) = norm {
+        // SAFETY: as above; the weight has a row of values and the node holds `norm_layout`'s
+        // bytes.
+        unsafe {
+            let src = &*dst.src[0];
+            let (row, cols) = (src.ne[0] as usize, src.ne[1] as usize);
+            norm_host(out, &nm, row, (0, cols), dst.data as *mut u8);
+        }
+    }
+}
+
+/// A normed finish's norm on the CPU: of the sums `ys` (tokens `t0..`) of a node of `width`
+/// tokens of `row` values at `base` ([`norm_layout`]).
+///
+/// # Safety
+/// `nm.w` holds `row` host F32 values; `base` the node's bytes.
+pub(super) unsafe fn norm_host(
+    ys: &[f32],
+    nm: &NormParams,
+    row: usize,
+    (t0, width): (usize, usize),
+    base: *mut u8,
+) {
+    // SAFETY: the caller's.
+    unsafe {
+        let w = std::slice::from_raw_parts(nm.w as *const f32, row);
+        let aux = base.add(4 * row * width);
+        crate::model::fp8_act::rms_norm_host(ys, w, nm.eps, row, (t0, width), aux, nm.bf16);
     }
 }
 
@@ -427,17 +590,54 @@ pub(super) mod cuda {
         // An all-reduce's residual and the column it writes from (`micro::finish_add`).
         let (res, at) = crate::tp_net::micro::add_of(dst);
         // SAFETY: the caller's; `finish_add` sizes the output for the columns from `at`.
-        let out = dst.data as usize + at * src.ne[0] as usize * 4;
+        let row = src.ne[0] as usize;
+        let out = dst.data as usize + at * row * 4;
+        // And its norm (`micro::finish_add_norm`), for its tokens from `at`.
+        let norm = crate::tp_net::micro::norm_of(dst)
+            .map(|(nm, width)| norm_at(&nm, dst.data as usize, row, width, at));
         let seq = comm.in_flight.lock().expect("in-flight lock").pop_front();
         let r = match seq {
             // SAFETY: the caller's.
-            Some(seq) => unsafe { finish(&comm, &plan, seq, src.data as usize, out, res, stream) },
+            Some(seq) => unsafe {
+                let s = src.data as usize;
+                finish(&comm, &plan, seq, s, out, res, norm.as_ref(), stream)
+            },
             None => Err("tp exchange: a finish without its start".into()),
         };
         if let Err(e) = &r {
             comm.fail(e.clone());
         }
         r
+    }
+
+    /// Where a normed finish's kernel writes ([`super::Norm`]): the norm's weight and eps, the
+    /// row size, and the piece's sums, packed activations and BF16 rows.
+    struct NormAt {
+        w: *const f32,
+        eps: f32,
+        row: usize,
+        out: crate::model::fp8_act::SumNormOut,
+    }
+
+    /// [`NormAt`] of the tokens from `at` in a normed node at `base` of `width` tokens of `row`
+    /// values ([`super::norm_layout`]).
+    fn norm_at(nm: &super::NormParams, base: usize, row: usize, width: usize, at: usize) -> NormAt {
+        let (b_at, q_at, _) = super::norm_layout(row, width, nm.bf16);
+        NormAt {
+            w: nm.w as *const f32,
+            eps: nm.eps,
+            row,
+            out: crate::model::fp8_act::SumNormOut {
+                xs: (base + 4 * row * at) as *mut f32,
+                out: (base + q_at + row * at) as *mut u8,
+                scales: (base + q_at + row * width + 4 * at) as *mut f32,
+                bf: if nm.bf16 {
+                    (base + b_at + 2 * row * at) as *mut u16
+                } else {
+                    std::ptr::null_mut()
+                },
+            },
+        }
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -483,8 +683,9 @@ pub(super) mod cuda {
         // The full tensor: the same on every rank, so the type on the wire is, and the buffers
         // grow at the same exchange.
         let (row, cols) = match kind {
+            // The source's values (a normed node's output holds more, `all_reduce_add_norm`).
             // SAFETY: the caller's.
-            Kind::AllReduce => unsafe { (ffi::ggml_nelements(dst) as usize, 1) },
+            Kind::AllReduce => unsafe { (ffi::ggml_nelements(src) as usize, 1) },
             Kind::ReduceScatter => (src.ne[0] as usize, src.ne[1] as usize),
             Kind::AllGather => (dst.ne[0] as usize, dst.ne[1] as usize),
         };
@@ -625,11 +826,25 @@ pub(super) mod cuda {
             // An all-reduce's residual ([`super::all_reduce_add`]).
             let res = (kind == Kind::AllReduce && external_params(dst)[1] != 0)
                 .then(|| (*dst.src[1]).data as usize);
+            // And its norm ([`super::all_reduce_add_norm`]).
+            let norm = match kind {
+                Kind::AllReduce if res.is_some() => {
+                    let p = external_params(dst);
+                    super::NormParams::of([p[2], p[3]], || (*dst.src[2]).data as usize)
+                }
+                _ => None,
+            }
+            .map(|nm| {
+                let s = &*dst.src[0];
+                let (row, width) = (s.ne[0] as usize, s.ne[1] as usize);
+                norm_at(&nm, dst.data as usize, row, width, 0)
+            });
             started.and_then(|seq| {
                 if defer {
                     hand_over(&comm, &plan, seq, stream)
                 } else {
-                    finish(&comm, &plan, seq, src, dst.data as usize, res, stream)
+                    let d = dst.data as usize;
+                    finish(&comm, &plan, seq, src, d, res, norm.as_ref(), stream)
                 }
             })
         };
@@ -1072,7 +1287,9 @@ pub(super) mod cuda {
     ///
     /// # Safety
     /// `src` and `dst` are the device addresses of the plan's source and output on `stream`'s
-    /// device, `res` of the source's values to add (an all-reduce's only).
+    /// device, `res` of the source's values to add (an all-reduce's only). `norm`: the sums'
+    /// norm too, in the sum's kernel (an all-reduce with a residual; `dst` is its `xs`).
+    #[allow(clippy::too_many_arguments)]
     unsafe fn finish(
         comm: &super::super::Comm,
         plan: &Plan,
@@ -1080,10 +1297,14 @@ pub(super) mod cuda {
         src: usize,
         dst: usize,
         res: Option<usize>,
+        norm: Option<&NormAt>,
         stream: *mut c_void,
     ) -> Result<(), String> {
         if res.is_some() && plan.kind != Kind::AllReduce {
             return Err("tp exchange: only an all-reduce adds a residual".into());
+        }
+        if norm.is_some_and(|nm| res.is_none() || nm.out.xs as usize != dst) {
+            return Err("tp exchange: a norm needs a residual and its sums' address".into());
         }
         let (rank, n_ranks) = (comm.rank(), comm.n_ranks());
         let kind = plan.kind;
@@ -1197,7 +1418,25 @@ pub(super) mod cuda {
                 };
                 // An all-reduce's piece is all of its values.
                 let res = res.map(|r| r as *const f32);
-                sum_add(kernel, &srcs, res, dst as *mut f32, mine.1, stream)?;
+                match norm {
+                    Some(nm) => {
+                        let srcs: Vec<*const c_void> = srcs.iter().map(|&p| p.cast()).collect();
+                        let code = crate::model::fp8_act::sum_rms_norm(
+                            &srcs,
+                            bf16,
+                            res,
+                            nm.w,
+                            nm.eps,
+                            &nm.out,
+                            (nm.row, mine.1 / nm.row),
+                            stream,
+                        );
+                        if code != 0 {
+                            return Err(format!("tp all-reduce: the sum's norm: error {code}"));
+                        }
+                    }
+                    None => sum_add(kernel, &srcs, res, dst as *mut f32, mine.1, stream)?,
+                }
             }
             check(
                 "cuStreamWriteValue32",

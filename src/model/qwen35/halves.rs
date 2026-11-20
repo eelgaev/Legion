@@ -86,7 +86,8 @@ pub(super) fn tail<'a>(
     xs: [Tensor<'a>; 2],
     attn: Tensor<'a>,
     comm: i32,
-) -> Result<Tensor<'a>, ModelError> {
+    next: Option<crate::tp_net::Norm<'a>>,
+) -> Result<(Tensor<'a>, Option<crate::tp_net::Normed<'a>>), ModelError> {
     let (ctx, n) = (pass.ctx, pass.n);
     let (n0, n1) = (n / 2, n - n / 2);
     let whole = n as usize;
@@ -120,10 +121,19 @@ pub(super) fn tail<'a>(
     };
     let (xa0, f0) = ffn(s0, xs[0], n0)?;
     let (xa1, f1) = ffn(s1, xs[1], n1)?;
-    // The FFN sums with their residuals, both halves into one `[n_embd, n]` output.
+    // The FFN sums with their residuals, both halves into one `[n_embd, n]` output; with
+    // `next`, the next layer's input norm in the same kernels (its sums' bits, #1133).
+    if let Some(nm) = next {
+        let y0 = micro::finish_add_norm(ctx, f0, xa0, n, 0, None, nm);
+        add(y0);
+        let y = micro::finish_add_norm(ctx, f1, xa1, n, n0, Some(y0), nm);
+        add(y);
+        let nd = crate::tp_net::normed(ctx, y, xa0.ne()[0], n, nm.bf16);
+        return Ok((nd.y, Some(nd)));
+    }
     let y0 = micro::finish_add(ctx, f0, xa0, n, 0, None);
     add(y0);
     let y = micro::finish_add(ctx, f1, xa1, n, n0, Some(y0));
     add(y);
-    Ok(y)
+    Ok((y, None))
 }

@@ -1562,6 +1562,18 @@ pub(crate) struct StepOpts<'a> {
     pub(crate) par_rank: usize,
 }
 
+/// Whether a tensor-parallel sum's finish may compute the next norm ([`Model::norm_fold`]):
+/// on, the same bits; `LEGION_DEBUG_TP_SUM_NORM=0` keeps the separate ops. Read once.
+fn sum_norm_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| sum_norm_on_of(std::env::var("LEGION_DEBUG_TP_SUM_NORM").ok().as_deref()))
+}
+
+/// [`sum_norm_on`] for the variable's value `v`.
+pub(crate) fn sum_norm_on_of(v: Option<&str>) -> bool {
+    v.is_none_or(|s| s.trim() != "0")
+}
+
 /// Columns `off..off + n` of the 2-D contiguous `t` (one column per token).
 pub(crate) fn cols<'a>(ctx: &'a Context, t: Tensor<'a>, off: i64, n: i64) -> Tensor<'a> {
     let nb1 = t.nb()[1];
@@ -2542,6 +2554,66 @@ impl Model {
         if fp8 {
             fp8_act::share(ctx, h, fp8_act::rms_norm(ctx, x, w, eps));
         }
+        h
+    }
+
+    /// Whether the norm [`Self::norm_mul_with`] would build for `x` (`[k, n]`, or a tensor of
+    /// its shape and type) and `w` can be computed instead by the finish of the tensor-parallel
+    /// sum that makes `x` ([`crate::tp_net::Norm`], #1133): over machines, with the norm's FP8
+    /// codes from one op (`--fp8-act a8-dynamic` prefill) and `reader` (layer `il`'s weight that
+    /// reads the norm) reading them. `Some(bf16)`: the finish computes the codes, and with
+    /// `bf16` the BF16 rows too (what `norm_mul_with` computes in one op with them); then
+    /// [`Self::norm_mul_folded`] builds the norm on the finish's outputs, with the same bits.
+    /// `LEGION_DEBUG_TP_SUM_NORM=0` keeps the separate ops.
+    pub(crate) fn norm_fold(
+        &self,
+        pass: &Pass<'_>,
+        x: Tensor<'_>,
+        w: Tensor<'_>,
+        both: bool,
+        (il, reader): (usize, &str),
+    ) -> Option<bool> {
+        let n = x.ne()[1];
+        let plain = !pass.tap.on && !self.hp.moe;
+        if !sum_norm_on() || self.tp_net_comm().is_none() || !plain {
+            return None;
+        }
+        if !self.linear.dynamic_batch(n) || !fp8_act::rms_norm_fits(x, w) {
+            return None;
+        }
+        let name = format!("blk.{il}.{reader}");
+        let base = name.strip_suffix(".weight").unwrap_or(&name);
+        let has_input_scale = self.w(&format!("{base}.input_scale")).is_ok();
+        let rw = self.w(&name).ok()?;
+        if !self.linear.reads_dynamic(&name, rw, has_input_scale, n) {
+            return None;
+        }
+        let bf16 = fused::rms_norm_bf16_fits(x, w);
+        Some(both && bf16 && fp8_act::rms_norm_bf16_fits(x, w))
+    }
+
+    /// [`Self::norm_mul_with`] of `y` (the sums of a finish that computed the norm,
+    /// [`Self::norm_fold`]): `mul(rms_norm(y, eps), w)` with the finish's packed FP8 codes `q`
+    /// and BF16 rows `b` shared as `norm_mul_with` shares its ops' (without `b`, the BF16 rows
+    /// as there: their own op, run if a BF16 matmul reads them).
+    pub(crate) fn norm_mul_folded<'a>(
+        &'a self,
+        pass: &Pass<'a>,
+        y: Tensor<'a>,
+        w: Tensor<'a>,
+        q: Tensor<'a>,
+        b: Option<Tensor<'a>>,
+    ) -> Tensor<'a> {
+        let (ctx, eps) = (pass.ctx, self.hp.rms_eps);
+        let h = ctx.mul(ctx.rms_norm(y, eps), w);
+        match b {
+            Some(b) => ctx.set_shared_cast(h, types::BF16, b),
+            None if fused::rms_norm_bf16_fits(y, w) => {
+                ctx.set_shared_cast(h, types::BF16, fused::rms_norm_bf16(ctx, y, w, eps));
+            }
+            None => {}
+        }
+        fp8_act::share(ctx, h, q);
         h
     }
 
