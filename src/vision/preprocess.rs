@@ -76,7 +76,7 @@ pub fn preprocess(hp: &VisionHparams, bytes: &[u8]) -> Result<Preprocessed, Visi
 // Ported from img_tool::calc_size_preserved_ratio in
 // llama.cpp's tools/mtmd/mtmd-image.cpp (MIT). Keep f32 arithmetic
 // and round-half-away-from-zero, including the one-factor floor on thin images.
-fn smart_resize(
+pub(super) fn smart_resize(
     width: u32,
     height: u32,
     factor: u32,
@@ -101,6 +101,17 @@ fn smart_resize(
     }
     if !(1.0..=65536.0).contains(&rw) || !(1.0..=65536.0).contains(&rh) {
         return Err(VisionError::Dimensions);
+    }
+    // Not in llama.cpp: the one-factor floor of a thin image can leave the area over `max`
+    // (48 × 60000 px to 48 × 56784 at Gemma 4's 2,580,480); the long side then shrinks to fit,
+    // so every image is within the budget the GPU towers size their tables and buffers for
+    // (#1217). Qwen3-VL's own limits never get here (32 × 65536 px is under its budget).
+    if rw as f64 * rh as f64 > max as f64 {
+        if rw <= rh {
+            rh = (max as f32 / rw / f).floor().max(1.0) * f;
+        } else {
+            rw = (max as f32 / rh / f).floor().max(1.0) * f;
+        }
     }
     Ok((rw as u32, rh as u32))
 }

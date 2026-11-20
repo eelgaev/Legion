@@ -101,3 +101,35 @@ fn chunks_do_not_cut_images() {
     assert_eq!(m.uncut(10, 15, 19), 15, "longer than cap: cut");
     assert_eq!(Media::default().uncut(0, 5, 1), 5);
 }
+
+/// A step's micro-chunks never cut an image either; with no image cut, the pieces are the
+/// ones asked for (text-only steps keep theirs).
+#[test]
+fn micro_chunks_do_not_cut_images() {
+    // An image of 300 tokens at 3,000: the cut at 3,072 moves back to its start.
+    let m = Media::sequential(vec![span(3000, 20, 15, 1)], 1);
+    assert_eq!(m.uncut_sizes(0, &[3072, 3072, 784]), vec![3000, 3144, 784]);
+    // The same prompt from n_past 100: the image is at 2,900..3,200 of the chunk.
+    assert_eq!(m.uncut_sizes(100, &[3072, 3072]), vec![2900, 3244]);
+    // No cut inside the image: the same pieces.
+    assert_eq!(
+        m.uncut_sizes(0, &[2048, 2048, 2048]),
+        vec![2048, 2048, 2048]
+    );
+    assert_eq!(m.uncut_sizes(3300, &[3072, 1000]), vec![3072, 1000]);
+    // A chunk that starts inside the image: its cuts move past its end.
+    assert_eq!(m.uncut_sizes(3100, &[50, 50, 900]), vec![200, 800]);
+    // An image longer than a piece: one piece holds it, the cuts inside it go.
+    let m = Media::sequential(vec![span(1000, 100, 40, 1)], 1);
+    assert_eq!(m.uncut_sizes(0, &[3072, 3072, 784]), vec![1000, 5144, 784]);
+    // An image to the chunk's end: one piece from its start.
+    assert_eq!(m.uncut_sizes(0, &[3072, 1928]), vec![1000, 4000]);
+    assert_eq!(m.uncut_sizes(1000, &[3072, 928]), vec![4000]);
+    // Two images, each cut: each whole in one piece.
+    let m = Media::sequential(vec![span(10, 4, 5, 1), span(40, 2, 2, 1)], 1);
+    assert_eq!(m.uncut_sizes(0, &[16, 26, 8]), vec![10, 30, 10]);
+    // No images: the same pieces.
+    let sizes = [3072, 2048, 1024, 17];
+    assert_eq!(Media::default().uncut_sizes(5, &sizes), sizes.to_vec());
+    assert_eq!(m.uncut_sizes(0, &[7]), vec![7]);
+}

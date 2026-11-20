@@ -186,6 +186,35 @@ impl Media {
         }
     }
 
+    /// `sizes`, pieces of a prompt chunk from token `from` on, with no cut inside an image (a
+    /// step's micro-chunks run one after another, so an image cut there would see only its
+    /// first part's keys): a cut inside an image moves back to the image's start, or past its
+    /// end when the piece before would be empty (a piece then holds more than its size). The
+    /// same pieces when no cut falls inside an image.
+    pub fn uncut_sizes(&self, from: usize, sizes: &[usize]) -> Vec<usize> {
+        let n: usize = sizes.iter().sum();
+        let mut out = Vec::with_capacity(sizes.len());
+        let mut prev = 0;
+        let mut cut = 0;
+        for &len in &sizes[..sizes.len().saturating_sub(1)] {
+            cut += len;
+            let at = from + cut;
+            let c = match (self.spans.iter()).find(|s| s.start < at && at < s.end()) {
+                Some(s) if s.start > from + prev => s.start - from,
+                Some(s) => s.end() - from,
+                None => cut,
+            };
+            if c > prev && c < n {
+                out.push(c - prev);
+                prev = c;
+            }
+        }
+        if n > prev {
+            out.push(n - prev);
+        }
+        out
+    }
+
     /// How many of tokens `range` are image tokens.
     pub fn image_tokens(&self, range: std::ops::Range<usize>) -> usize {
         self.spans

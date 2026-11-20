@@ -3723,7 +3723,14 @@ impl Executor {
         if self.stages.len() < 2 || micro == 0 || n <= micro || g.verify || !last_only {
             return whole;
         }
-        let sizes = taper::micro_sizes(n, micro, self.micro_taper);
+        let mut sizes = taper::micro_sizes(n, micro, self.micro_taper);
+        // An image whose tokens see each other stays in one micro-chunk (#1217): the planner's
+        // `Media::uncut` keeps it in one step, this in one piece of it.
+        if let Some(m) = seq.media
+            && self.model.hp.arch.image_tokens_bidirectional()
+        {
+            sizes = m.uncut_sizes(seq.n_past, &sizes);
+        }
         sizes
             .iter()
             .scan(0, |at, &len| {

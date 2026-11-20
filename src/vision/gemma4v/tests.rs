@@ -248,6 +248,40 @@ fn resizes_without_padding() {
     assert!(p.pixels.iter().all(|&v| (v - 1.0).abs() < 1e-6));
 }
 
+/// Every size Gemma 4's resize returns is within its pixel budget, so its longest side is at
+/// most the GPU tower's position rows (`image_max_pixels / 48 / 16`, a 48-pixel-wide image that
+/// tall) and both towers take the same grids; thin images llama.cpp leaves over the budget
+/// shrink to it, the rest keep llama.cpp's sizes.
+#[test]
+fn thin_images_stay_within_the_pixel_budget() {
+    use crate::vision::preprocess::smart_resize;
+    let (f, min, max) = (48, 70 * 48 * 48, 1120 * 48 * 48);
+    let gpu_rows = max / f / 16;
+    assert_eq!(gpu_rows, 3360);
+    // llama.cpp: 48 × 56784 (3,549 rows); here the long side shrinks to the budget.
+    assert_eq!(smart_resize(48, 60000, f, min, max).unwrap(), (48, 53760));
+    assert_eq!(smart_resize(60000, 48, f, min, max).unwrap(), (53760, 48));
+    // Within the budget: llama.cpp's sizes.
+    assert_eq!(smart_resize(1024, 768, f, min, max).unwrap(), (1008, 768));
+    assert_eq!(smart_resize(48, 50000, f, min, max).unwrap(), (48, 50016));
+    assert_eq!(smart_resize(4000, 3000, f, min, max).unwrap(), (1824, 1344));
+    for w in [1, 16, 47, 48, 60, 95] {
+        for h in [
+            1, 100, 5_000, 53_760, 55_000, 60_000, 65_000, 70_000, 1_000_000,
+        ] {
+            for (w, h) in [(w, h), (h, w)] {
+                // Too thin even for llama.cpp (a side over 65,536 px): refused, as before.
+                let Ok((rw, rh)) = smart_resize(w, h, f, min, max) else {
+                    continue;
+                };
+                assert!(rw * rh <= max, "{w}x{h}: {rw}x{rh}");
+                assert!((rw / 16).max(rh / 16) <= gpu_rows, "{w}x{h}: {rw}x{rh}");
+                assert_eq!((rw % f, rh % f), (0, 0), "{w}x{h}");
+            }
+        }
+    }
+}
+
 /// A Gemma 4 checkpoint's tower (`LEGION_TEST_VISION_HF=<dir>`, opened by
 /// [`crate::hf::open_vision`]) against the converter's mmproj of the same model
 /// (`LEGION_TEST_GEMMA_MMPROJ=<mmproj-F16.gguf>`): the same keys and every tensor the graph reads
