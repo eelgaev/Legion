@@ -50,7 +50,7 @@ takes only a plain matmul of the head.
 Prompt steps of 2,048 tokens or more run each layer's sums in two halves of their tokens, so half 1's mixer sum
 travels during half 0's FFN and half 0's FFN sum during half 1's (#1133, no flag; the mixer runs whole, and the
 FP8 MLPs of layers 56-63 stay whole). With the command above plus `--deterministic`, two sessions in ABBA order
-(whole / halves, halves / whole): prefill 8K 1,885-1,926 / 2,156-2,195, 2,156-2,202 / 1,909-1,929 and 32K
+(whole / halves, halves / whole; whole = `LEGION_DEBUG_QWEN35_TP_HALVES=0` on both ranks): prefill 8K 1,885-1,926 / 2,156-2,195, 2,156-2,202 / 1,909-1,929 and 32K
 1,755 / 1,847, 1,831 / 1,789 tok/s (each includes `--deterministic`'s 200 ms gather), an 8K prompt step on
 rank 0 about 4,100 -> 3,560 ms. Decode does not change (1, 4 and 16 users within 1%), and the output is the same
 bits: the same text at 1, 4 and 16 users and the same log probabilities for 8K and 32K prompts. Prefill is still
