@@ -20,13 +20,7 @@ pub struct Preprocessed {
 pub fn preprocess(hp: &VisionHparams, bytes: &[u8]) -> Result<Preprocessed, VisionError> {
     hp.validate()?;
     let img = super::decode::decode(bytes)?;
-    let (width, height) = smart_resize(
-        img.width(),
-        img.height(),
-        hp.patch_size * hp.spatial_merge_size,
-        hp.image_min_pixels,
-        hp.image_max_pixels,
-    )?;
+    let (width, height) = resize_for(hp, img.width(), img.height())?;
 
     // Ported from llama.cpp's tools/mtmd/mtmd-image.cpp (MIT),
     // img_tool::resize with PAD_CEIL (Qwen3-VL) or PAD_NONE (Gemma 4: straight to the aligned
@@ -102,18 +96,41 @@ pub(super) fn smart_resize(
     if !(1.0..=65536.0).contains(&rw) || !(1.0..=65536.0).contains(&rh) {
         return Err(VisionError::Dimensions);
     }
-    // Not in llama.cpp: the one-factor floor of a thin image can leave the area over `max`
-    // (48 × 60000 px to 48 × 56784 at Gemma 4's 2,580,480); the long side then shrinks to fit,
-    // so every image is within the budget the GPU towers size their tables and buffers for
-    // (#1217). Qwen3-VL's own limits never get here (32 × 65536 px is under its budget).
-    if rw as f64 * rh as f64 > max as f64 {
-        if rw <= rh {
-            rh = (max as f32 / rw / f).floor().max(1.0) * f;
-        } else {
-            rw = (max as f32 / rh / f).floor().max(1.0) * f;
-        }
-    }
     Ok((rw as u32, rh as u32))
+}
+
+/// The size `hp`'s tower takes a `width × height` image at: [`smart_resize`] at its limits,
+/// as llama.cpp. Gemma 4's (Gemma4v) also stays within the pixel budget ([`within_budget`]):
+/// its images see each other, so each must fit the steps and rings sized for the largest one
+/// (#1217). Qwen-VL's sizes are the reference's, thin images over the budget included.
+pub(super) fn resize_for(
+    hp: &VisionHparams,
+    width: u32,
+    height: u32,
+) -> Result<(u32, u32), VisionError> {
+    let factor = hp.patch_size * hp.spatial_merge_size;
+    let (min, max) = (hp.image_min_pixels, hp.image_max_pixels);
+    let size = smart_resize(width, height, factor, min, max)?;
+    Ok(match hp.projector {
+        super::Projector::Gemma4v => within_budget(size, factor, max),
+        super::Projector::Qwen3vl => size,
+    })
+}
+
+/// Not in llama.cpp: [`smart_resize`]'s one-factor floor on a thin image can leave the area
+/// over `max` (48 × 60000 px to 48 × 56784 at Gemma 4's 2,580,480); the long side then
+/// shrinks to fit, so the image is within the budget the steps, the rings and the GPU tower's
+/// tables are sized for (#1217). Sizes within the budget stay.
+pub(super) fn within_budget((w, h): (u32, u32), factor: u32, max: u32) -> (u32, u32) {
+    if w as u64 * h as u64 <= max as u64 {
+        return (w, h);
+    }
+    let (rw, rh, f) = (w as f32, h as f32, factor as f32);
+    if w <= h {
+        (w, ((max as f32 / rw / f).floor().max(1.0) * f) as u32)
+    } else {
+        (((max as f32 / rh / f).floor().max(1.0) * f) as u32, h)
+    }
 }
 
 // Ported from img_tool::resize_pillow in

@@ -986,6 +986,116 @@ fn tp_halves_switch() {
     assert_eq!(TP_HALF_MIN, 1024);
 }
 
+/// The prompt of the whole-image tests (#1217): [`IMAGE_AT`] text tokens (more than the
+/// tiny model's 8-position window), an [`IMAGE_SIDE`] × [`IMAGE_SIDE`] image (144 tokens),
+/// 10 text tokens.
+const IMAGE_AT: usize = 40;
+const IMAGE_SIDE: usize = 12;
+const IMAGE_PROMPT: usize = IMAGE_AT + IMAGE_SIDE * IMAGE_SIDE + 10;
+
+/// The tiny dense gemma4's ([`tiny::write_dense`], images bidirectional) last-layer rows for
+/// every token of the whole-image tests' prompt, run in `steps` with gather attention and the
+/// sliding-window caches in `ring` (none: the whole span). `image_rows`: the image's rows in
+/// its tokens' place, else the prompt as text only. `stages`: two CPU stages split at layer
+/// `.0`, a step in micro-chunks of `.1` tokens, an image in one micro-chunk of up to `.2`
+/// ([`crate::model::core::Executor::set_image_step`]); one CPU stage without.
+fn image_prompt_rows(
+    gguf: &crate::gguf::GgufFile,
+    image_rows: bool,
+    ring: Option<crate::model::core::KvRing>,
+    stages: Option<(usize, usize, usize)>,
+    steps: &[usize],
+) -> Vec<f32> {
+    use crate::ggml::Backend;
+    use crate::model::core::{Attention, Executor, Group, ImageSpan, Logits, Media, SeqInput};
+    let n = IMAGE_PROMPT;
+    assert_eq!(steps.iter().sum::<usize>(), n);
+    let prompt: Vec<u32> = (0..n).map(|i| ((i * 7 + 3) % 50) as u32).collect();
+    let blocks: Vec<u32> = (0..8).collect();
+    let cpu = || {
+        let mut b = Backend::cpu().unwrap();
+        b.set_threads(2);
+        b
+    };
+    let b = cpu();
+    let (mut m, b1) = match stages {
+        None => {
+            let host = Backend::cpu().unwrap().buffer_type();
+            let m = Model::load(gguf, |info| match Model::placement(&info.name, false) {
+                crate::model::core::Placement::Host => host,
+                crate::model::core::Placement::Device => b.buffer_type(),
+            });
+            (m.unwrap(), None)
+        }
+        // Both stages read host memory.
+        Some(_) => (Model::load(gguf, |_| b.buffer_type()).unwrap(), Some(cpu())),
+    };
+    assert!(m.hp.arch.image_tokens_bidirectional());
+    m.set_cell_gather(true);
+    let n_layer = m.hp.n_layer;
+    let n_embd = m.hp.n_embd as usize;
+    let image = IMAGE_SIDE * IMAGE_SIDE;
+    let rows: Vec<f32> = (0..image * n_embd)
+        .map(|i| ((i * 37 + 11) % 101) as f32 / 50.0 - 1.0)
+        .collect();
+    let media = Media::sequential(
+        vec![ImageSpan {
+            start: IMAGE_AT,
+            nx: IMAGE_SIDE,
+            ny: IMAGE_SIDE,
+            rows: rows.into(),
+        }],
+        n_embd,
+    );
+    let layout = match (stages, b1) {
+        (Some((split, ..)), Some(b1)) => vec![(b, 0..split), (b1, split..n_layer)],
+        _ => vec![(b, 0..n_layer)],
+    };
+    let mut exec = Executor::new_staged_ring(m, layout, 8, 2, 0, ring, Default::default()).unwrap();
+    exec.set_attention(Attention::Gather);
+    exec.capture_hidden(vec![n_layer - 1]);
+    if let Some((_, micro, image_step)) = stages {
+        exec.set_pipeline_micro(micro);
+        exec.set_image_step(image_step);
+    }
+    let mut hidden = Vec::new();
+    let mut n_past = 0;
+    for &len in steps {
+        let r = exec
+            .step(&[Group {
+                slot: 0,
+                verify: false,
+                seqs: vec![SeqInput {
+                    tokens: &prompt[n_past..n_past + len],
+                    n_past,
+                    blocks: &blocks,
+                    ring: 0,
+                    logits: Logits::Greedy,
+                    media: image_rows.then_some(&media),
+                }],
+            }])
+            .unwrap();
+        hidden.extend_from_slice(&r.hidden[0]);
+        n_past += len;
+    }
+    assert_eq!(hidden.len(), n * n_embd);
+    hidden
+}
+
+/// The largest difference of `h` from `reference`, relative to `reference`'s largest value
+/// (at least 1).
+fn rel_diff(reference: &[f32], h: &[f32]) -> f32 {
+    assert_eq!(h.len(), reference.len());
+    let d = (reference.iter().zip(h))
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f32::max);
+    d / reference
+        .iter()
+        .map(|a| a.abs())
+        .fold(0.0, f32::max)
+        .max(1.0)
+}
+
 /// #1217: an image's tokens see the whole image on the sliding-window layers, so the
 /// planner's steps give the outputs of one step of the whole prompt only when no step cuts the
 /// image and the rings hold its step. 40 text tokens, a 12 × 12 image (144 tokens, longer than
@@ -999,74 +1109,20 @@ fn tp_halves_switch() {
 /// [`ring_hold`]: crate::engine::lm::ring_hold
 #[test]
 fn whole_images_match_one_step() {
-    use crate::ggml::Backend;
-    use crate::model::core::{
-        Attention, Executor, Group, ImageSpan, KvRing, Logits, Media, SeqInput,
-    };
+    use crate::model::core::{ImageSpan, KvRing, Media};
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tiny.gguf");
     tiny::write_dense(&path, 5).unwrap();
     let gguf = crate::gguf::GgufFile::open(&path).unwrap();
     let window = tiny::WINDOW as usize;
-    let (start, nx, ny, room) = (40, 12, 12, 16);
+    let (start, nx, ny, room) = (IMAGE_AT, IMAGE_SIDE, IMAGE_SIDE, 16);
     let image = nx * ny;
-    let n = start + image + 10;
-    let prompt: Vec<u32> = (0..n).map(|i| ((i * 7 + 3) % 50) as u32).collect();
-    let blocks: Vec<u32> = (0..8).collect();
+    let n = IMAGE_PROMPT;
     // `image_rows`: the image's rows in its tokens' place, else the prompt as text only.
-    let run = |image_rows: bool, ring: Option<KvRing>, steps: &[usize]| -> Vec<f32> {
-        assert_eq!(steps.iter().sum::<usize>(), n);
-        let mut b = Backend::cpu().unwrap();
-        b.set_threads(2);
-        let host = Backend::cpu().unwrap().buffer_type();
-        let mut m = Model::load(&gguf, |info| match Model::placement(&info.name, false) {
-            crate::model::core::Placement::Host => host,
-            crate::model::core::Placement::Device => b.buffer_type(),
-        })
-        .unwrap();
-        assert!(m.hp.arch.image_tokens_bidirectional());
-        m.set_cell_gather(true);
-        let n_layer = m.hp.n_layer;
-        let n_embd = m.hp.n_embd as usize;
-        let rows: Vec<f32> = (0..image * n_embd)
-            .map(|i| ((i * 37 + 11) % 101) as f32 / 50.0 - 1.0)
-            .collect();
-        let media = Media::sequential(
-            vec![ImageSpan {
-                start,
-                nx,
-                ny,
-                rows: rows.into(),
-            }],
-            n_embd,
-        );
-        let mut exec =
-            Executor::new_staged_ring(m, vec![(b, 0..n_layer)], 8, 2, 0, ring, Default::default())
-                .unwrap();
-        exec.set_attention(Attention::Gather);
-        exec.capture_hidden(vec![n_layer - 1]);
-        let mut hidden = Vec::new();
-        let mut n_past = 0;
-        for &len in steps {
-            let r = exec
-                .step(&[Group {
-                    slot: 0,
-                    verify: false,
-                    seqs: vec![SeqInput {
-                        tokens: &prompt[n_past..n_past + len],
-                        n_past,
-                        blocks: &blocks,
-                        ring: 0,
-                        logits: Logits::Greedy,
-                        media: image_rows.then_some(&media),
-                    }],
-                }])
-                .unwrap();
-            hidden.extend_from_slice(&r.hidden[0]);
-            n_past += len;
-        }
-        hidden
+    let run = |image_rows: bool, ring: Option<KvRing>, steps: &[usize]| {
+        image_prompt_rows(&gguf, image_rows, ring, None, steps)
     };
+    let diff = rel_diff;
     // The planner's steps (`Worker::plan_step`) with the largest image `image_step`.
     let plan = |image_step: usize| {
         let m = Media::sequential(
@@ -1091,18 +1147,6 @@ fn whole_images_match_one_step() {
     assert_eq!(whole, vec![16, 16, 8, 144, 10]);
     let cut = plan(0);
     assert!(cut.iter().all(|&s| s <= room), "{cut:?}");
-    // The largest difference, relative to `reference`'s largest value (at least 1).
-    let diff = |reference: &[f32], h: &[f32]| {
-        assert_eq!(h.len(), reference.len());
-        let d = (reference.iter().zip(h))
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0, f32::max);
-        d / reference
-            .iter()
-            .map(|a| a.abs())
-            .fold(0.0, f32::max)
-            .max(1.0)
-    };
     let text_rings = KvRing::for_window(window, room, 1);
     assert_eq!(text_rings.positions(), 128);
     let rings = KvRing::for_window(window, crate::engine::lm::ring_hold(room, 0, image), 1);
@@ -1124,6 +1168,67 @@ fn whole_images_match_one_step() {
     );
     assert!(rings_d <= 1e-3, "the rings change the outputs: {rings_d}");
     // The steps' rounding noise, well under what a cut image or overwritten keys give.
+    assert!(text_d <= 3e-3, "text control: {text_d}");
+    let limit = (3.0 * text_d).max(1e-3);
+    assert!(cut_d > 1e-2, "cut image: {cut_d}");
+    assert!(short_d > 1e-2, "whole image, rings too short: {short_d}");
+    assert!(
+        whole_d <= limit,
+        "whole image: {whole_d}, over {limit} (3 × the text control {text_d})"
+    );
+}
+
+/// #1217, [`whole_images_match_one_step`] over two pipeline stages: the prompt (an image after
+/// more than a window of text) in one step, which a lone prompt on several stages runs as
+/// 16-token micro-chunks (`Executor::micro_chunks`). The stages split at layer 2, so the
+/// shared-KV layers (4-6) and the layers whose caches they read (2, 3) are on the second.
+/// Against one step on one stage: micro-chunks that cut the image differ (image step 0, rings
+/// sized for 16-token steps); the image in one 144-token micro-chunk through those rings
+/// differs (it overwrites keys its first rows read); through rings that hold it, it matches:
+/// as without rings, and within the noise of the prompt as text on the same stages and rings.
+#[test]
+fn whole_images_match_over_two_stages() {
+    use crate::model::core::{Hparams, KvRing};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tiny.gguf");
+    tiny::write_dense(&path, 5).unwrap();
+    let gguf = crate::gguf::GgufFile::open(&path).unwrap();
+    let hp = Hparams::from_gguf(&gguf).unwrap();
+    let (split, micro) = (2, 16);
+    for il in 0..hp.n_layer {
+        assert_eq!(il < split, hp.kv_source(il) < split, "layer {il}");
+    }
+    assert!((split..hp.n_layer).any(|il| hp.kv_source(il) != il));
+    let (window, image, n) = (tiny::WINDOW as usize, IMAGE_SIDE * IMAGE_SIDE, IMAGE_PROMPT);
+    let text_rings = KvRing::for_window(window, micro, 1);
+    let rings = KvRing::for_window(window, crate::engine::lm::ring_hold(micro, 0, image), 1);
+    assert!(rings.holds(window, image) && !text_rings.holds(window, image));
+    // The prompt in one step on the two stages, images in one micro-chunk of up to `image_step`.
+    let staged = |image_rows: bool, ring: Option<KvRing>, image_step: usize| {
+        image_prompt_rows(
+            &gguf,
+            image_rows,
+            ring,
+            Some((split, micro, image_step)),
+            &[n],
+        )
+    };
+    let reference = image_prompt_rows(&gguf, true, None, None, &[n]);
+    let whole = staged(true, Some(rings), image);
+    let cut_d = rel_diff(&reference, &staged(true, Some(text_rings), 0));
+    let short_d = rel_diff(&reference, &staged(true, Some(text_rings), image));
+    let whole_d = rel_diff(&reference, &whole);
+    let rings_d = rel_diff(&staged(true, None, image), &whole);
+    let text_d = rel_diff(
+        &image_prompt_rows(&gguf, false, None, None, &[n]),
+        &staged(false, Some(rings), image),
+    );
+    eprintln!(
+        "two stages, relative max |diff| vs one step on one stage: cut {cut_d:.3e}, rings too \
+         short {short_d:.3e}, whole {whole_d:.3e}; rings vs none {rings_d:.3e}; text control \
+         {text_d:.3e}"
+    );
+    assert!(rings_d <= 1e-3, "the rings change the outputs: {rings_d}");
     assert!(text_d <= 3e-3, "text control: {text_d}");
     let limit = (3.0 * text_d).max(1e-3);
     assert!(cut_d > 1e-2, "cut image: {cut_d}");

@@ -254,24 +254,26 @@ fn resizes_without_padding() {
 /// shrink to it, the rest keep llama.cpp's sizes.
 #[test]
 fn thin_images_stay_within_the_pixel_budget() {
-    use crate::vision::preprocess::smart_resize;
+    use crate::vision::preprocess::{resize_for, smart_resize};
+    let hp = gemma_limits();
     let (f, min, max) = (48, 70 * 48 * 48, 1120 * 48 * 48);
     let gpu_rows = max / f / 16;
     assert_eq!(gpu_rows, 3360);
     // llama.cpp: 48 × 56784 (3,549 rows); here the long side shrinks to the budget.
-    assert_eq!(smart_resize(48, 60000, f, min, max).unwrap(), (48, 53760));
-    assert_eq!(smart_resize(60000, 48, f, min, max).unwrap(), (53760, 48));
+    assert_eq!(smart_resize(48, 60000, f, min, max).unwrap(), (48, 56784));
+    assert_eq!(resize_for(&hp, 48, 60000).unwrap(), (48, 53760));
+    assert_eq!(resize_for(&hp, 60000, 48).unwrap(), (53760, 48));
     // Within the budget: llama.cpp's sizes.
-    assert_eq!(smart_resize(1024, 768, f, min, max).unwrap(), (1008, 768));
-    assert_eq!(smart_resize(48, 50000, f, min, max).unwrap(), (48, 50016));
-    assert_eq!(smart_resize(4000, 3000, f, min, max).unwrap(), (1824, 1344));
+    assert_eq!(resize_for(&hp, 1024, 768).unwrap(), (1008, 768));
+    assert_eq!(resize_for(&hp, 48, 50000).unwrap(), (48, 50016));
+    assert_eq!(resize_for(&hp, 4000, 3000).unwrap(), (1824, 1344));
     for w in [1, 16, 47, 48, 60, 95] {
         for h in [
             1, 100, 5_000, 53_760, 55_000, 60_000, 65_000, 70_000, 1_000_000,
         ] {
             for (w, h) in [(w, h), (h, w)] {
                 // Too thin even for llama.cpp (a side over 65,536 px): refused, as before.
-                let Ok((rw, rh)) = smart_resize(w, h, f, min, max) else {
+                let Ok((rw, rh)) = resize_for(&hp, w, h) else {
                     continue;
                 };
                 assert!(rw * rh <= max, "{w}x{h}: {rw}x{rh}");
@@ -284,11 +286,9 @@ fn thin_images_stay_within_the_pixel_budget() {
     }
 }
 
-/// The most tokens a Gemma 4 image takes, from the tower's pixel limits: the steps and the
-/// sliding-window rings are sized to hold it whole (#1217).
-#[test]
-fn the_largest_image_is_the_pixel_budget_in_tokens() {
-    let mut hp = crate::vision::VisionHparams {
+/// Gemma 4's tower limits: 16-pixel patches merged 3 × 3, 70 to 1,120 tokens.
+fn gemma_limits() -> crate::vision::VisionHparams {
+    crate::vision::VisionHparams {
         projector: crate::vision::Projector::Gemma4v,
         patch_size: 16,
         spatial_merge_size: 3,
@@ -296,7 +296,58 @@ fn the_largest_image_is_the_pixel_budget_in_tokens() {
         image_max_pixels: 1120 * 48 * 48,
         image_mean: [0.5; 3],
         image_std: [0.5; 3],
+    }
+}
+
+/// Only Gemma 4's resize keeps thin images within the pixel budget (#1217): Qwen-VL's sizes
+/// stay llama.cpp's (`calc_size_preserved_ratio`), as before the budget clamp, also a thin
+/// image the one-factor floor leaves over a checkpoint's small budget. 16-pixel patches merged
+/// 2 × 2 and a 32,768-pixel budget: 32 × 2000 px stays 32 × 1408 (45,056 pixels), where the
+/// clamp would give 32 × 1024.
+#[test]
+fn only_gemma_images_shrink_to_the_pixel_budget() {
+    use crate::vision::preprocess::{resize_for, smart_resize};
+    let mut qwen = crate::vision::VisionHparams {
+        projector: crate::vision::Projector::Qwen3vl,
+        patch_size: 16,
+        spatial_merge_size: 2,
+        image_min_pixels: 8192,
+        image_max_pixels: 32768,
+        image_mean: [0.5; 3],
+        image_std: [0.5; 3],
     };
+    for (w, h, size) in [
+        (32, 2000, (32, 1408)),
+        (2000, 32, (1408, 32)),
+        (1, 3000, (32, 9888)),
+        (300, 300, (160, 160)),
+        (64, 128, (64, 128)),
+    ] {
+        assert_eq!(resize_for(&qwen, w, h).unwrap(), size, "{w}x{h}");
+        assert_eq!(
+            smart_resize(w, h, 32, 8192, 32768).unwrap(),
+            size,
+            "{w}x{h}"
+        );
+    }
+    // The same limits through Gemma 4's path: within the budget.
+    let mut gemma = qwen.clone();
+    gemma.projector = crate::vision::Projector::Gemma4v;
+    assert_eq!(resize_for(&gemma, 32, 2000).unwrap(), (32, 1024));
+    assert_eq!(resize_for(&gemma, 2000, 32).unwrap(), (1024, 32));
+    assert_eq!(resize_for(&gemma, 1, 3000).unwrap(), (32, 1024));
+    assert_eq!(resize_for(&gemma, 300, 300).unwrap(), (160, 160));
+    // Qwen3-VL's own budget: the reference's sizes (`preprocess::tests::smart_resize_table`).
+    qwen.image_max_pixels = 4194304;
+    assert_eq!(resize_for(&qwen, 1, 4096).unwrap(), (32, 4096));
+    assert_eq!(resize_for(&qwen, 8192, 2048).unwrap(), (4096, 1024));
+}
+
+/// The most tokens a Gemma 4 image takes, from the tower's pixel limits: the steps and the
+/// sliding-window rings are sized to hold it whole (#1217).
+#[test]
+fn the_largest_image_is_the_pixel_budget_in_tokens() {
+    let mut hp = gemma_limits();
     assert_eq!(hp.max_image_tokens(), 1120);
     // An mmproj's own limit, not a whole number of tokens: rounded down.
     hp.image_max_pixels = 600 * 48 * 48 + 47;
