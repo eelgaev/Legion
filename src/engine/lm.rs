@@ -1654,6 +1654,9 @@ pub struct LmEngine {
     max_waiting: usize,
     /// Requests submitted and not yet admitted.
     queued: Arc<AtomicUsize>,
+    /// Admitted sequences not yet done (prefilling, decoding or preempted), the worker's
+    /// [`stream::Outbox::live`].
+    live: Arc<AtomicUsize>,
     stats: Arc<Mutex<EngineStats>>,
     /// `None` only while dropping.
     submit: Option<std::sync::mpsc::Sender<Job>>,
@@ -6075,6 +6078,7 @@ impl LmEngine {
             clock: Default::default(),
             outbox: stream::Outbox::new(tokenizer.clone(), cfg.stream_thread_seqs),
         };
+        let live = worker.outbox.live();
         let worker = std::thread::Builder::new()
             .name("legion-qwen35".into())
             .spawn(move || {
@@ -6108,6 +6112,7 @@ impl LmEngine {
             ctx_size: cfg.ctx_size,
             max_waiting: cfg.max_waiting,
             queued: Arc::new(AtomicUsize::new(0)),
+            live,
             stats,
             submit: Some(submit),
             worker: Some(worker),
@@ -6198,6 +6203,13 @@ impl LmEngine {
         }
     }
 
+    /// No request waits and no sequence runs: an image encode starting now has the GPU to
+    /// itself (#1195, [`crate::vision::share`]). The queue is read first: a request moves from
+    /// it to the live sequences, counted there before it leaves the queue.
+    fn idle(&self) -> bool {
+        self.queued.load(Ordering::Acquire) == 0 && self.live.load(Ordering::Acquire) == 0
+    }
+
     /// `generate`'s first half: the request checked, its grammars compiled and its prompt
     /// tokenized, for [`Self::submit_prepared`] on this engine or on a replica of it
     /// (`--tp-replicas`: every replica loads the same model, so tokenizes alike).
@@ -6224,7 +6236,7 @@ impl LmEngine {
         }
         // The images through the vision tower, once the request is known to fit.
         let media = match &self.vision {
-            Some(v) if !images.is_empty() => Some(v.encode(&prompt, images)?),
+            Some(v) if !images.is_empty() => Some(v.encode(&prompt, images, || self.idle())?),
             _ => None,
         };
         let tools = match req.prompt {

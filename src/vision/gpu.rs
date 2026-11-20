@@ -411,11 +411,22 @@ impl GpuEncoder {
         }
     }
 
-    /// The tower's output for `p`, as [`Encoder::encode`] gives it.
+    /// The tower's output for `p`, as [`Encoder::encode`] gives it, on the share of the GPU
+    /// that leaves room for other work ([`super::share`]).
     pub fn encode(&mut self, p: &Preprocessed) -> Result<ImageEmbedding, VisionError> {
+        self.encode_with(p, false)
+    }
+
+    /// [`Self::encode`]; `alone`: nothing else runs on the GPU meanwhile, so the encode may take
+    /// all of it ([`super::share::choose`]).
+    pub fn encode_with(
+        &mut self,
+        p: &Preprocessed,
+        alone: bool,
+    ) -> Result<ImageEmbedding, VisionError> {
         match self {
-            Self::Qwen(g) => g.encode(p),
-            Self::Gemma(g) => g.encode(p),
+            Self::Qwen(g) => g.encode(p, alone),
+            Self::Gemma(g) => g.encode(p, alone),
         }
     }
 
@@ -745,8 +756,9 @@ impl QwenGpu {
         self.scratch(n, 3 * px, n * (c.n_embd / c.n_head) / 2).total
     }
 
-    /// The tower's output for `p`, as [`Encoder::encode`] gives it.
-    pub fn encode(&mut self, p: &Preprocessed) -> Result<ImageEmbedding, VisionError> {
+    /// The tower's output for `p`, as [`Encoder::encode`] gives it; `alone`: nothing else runs
+    /// on the GPU meanwhile.
+    pub fn encode(&mut self, p: &Preprocessed, alone: bool) -> Result<ImageEmbedding, VisionError> {
         let c = self.cfg.clone();
         let (gx, gy) = (p.grid_w as usize, p.grid_h as usize);
         if gx % c.merge != 0 || gy % c.merge != 0 || gx == 0 || gy == 0 || c.merge != 2 {
@@ -804,7 +816,7 @@ impl QwenGpu {
         let out_bytes = n_tok * n_out * 4;
         // SAFETY: the calling thread's current device.
         unsafe { ok(cudaSetDevice(self.device), "cudaSetDevice")? };
-        self.caps = self.turns.next_caps();
+        self.caps = self.turns.next_caps(alone);
         let pin_in = self.pin_in.reserve(in_bytes)?;
         let pin_out = self.pin_out.reserve(out_bytes)?;
         // SAFETY: the pinned buffers hold at least these many bytes.

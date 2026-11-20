@@ -349,6 +349,11 @@ impl Outbox {
         }
     }
 
+    /// The count of live sequences ([`Live`]), for other threads to read.
+    pub(super) fn live(&self) -> Arc<AtomicUsize> {
+        self.live.clone()
+    }
+
     /// A new sequence's text, here or away: away once `min_seqs` sequences (this one included)
     /// are live, unless the sequence has stop strings (their match ends it, which the engine
     /// thread must know before the next step) or a grammar (it follows the reasoning parser).

@@ -41,8 +41,47 @@ fn turns_give_each_encode_its_caps() {
         gemm: 24,
         small: 48,
     };
-    assert_eq!(t.next_caps(), half);
-    assert_eq!(t.next_caps(), half);
+    // A set share holds whether or not anything else runs.
+    assert_eq!(t.next_caps(false), half);
+    assert_eq!(t.next_caps(true), half);
     t.set(Share::FULL);
-    assert_eq!(t.next_caps(), Caps::default());
+    assert_eq!(t.next_caps(false), Caps::default());
+}
+
+#[test]
+fn an_encode_alone_runs_uncapped() {
+    let half = Share { num: 1, den: 2 };
+    // Nothing set: uncapped alone, the default share beside other work.
+    assert_eq!(choose(None, true, true), Share::FULL);
+    assert_eq!(choose(None, true, false), DEFAULT);
+    // The idle rule off: the default share either way.
+    assert_eq!(choose(None, false, true), DEFAULT);
+    assert_eq!(choose(None, false, false), DEFAULT);
+    // A share set for A/B runs wins in every case, the default share too.
+    for idle_full in [false, true] {
+        for alone in [false, true] {
+            assert_eq!(choose(Some(half), idle_full, alone), half);
+            assert_eq!(choose(Some(DEFAULT), idle_full, alone), DEFAULT);
+            assert_eq!(choose(Some(Share::FULL), idle_full, alone), Share::FULL);
+        }
+    }
+}
+
+#[test]
+fn turns_follow_the_engine_when_nothing_is_set() {
+    let mut t = Turns {
+        sms: 48,
+        shares: Vec::new(),
+        idle_full: true,
+        encodes: 0,
+    };
+    let capped = Caps {
+        gemm: 48,
+        small: 96,
+    };
+    assert_eq!(t.next_caps(true), Caps::default());
+    assert_eq!(t.next_caps(false), capped);
+    assert_eq!(t.next_caps(true), Caps::default());
+    t.idle_full = false;
+    assert_eq!(t.next_caps(true), capped);
 }
