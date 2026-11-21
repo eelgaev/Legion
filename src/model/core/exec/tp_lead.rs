@@ -206,7 +206,8 @@ pub(super) fn rows_from() -> bool {
     *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_TP_ROWS_FROM").is_none_or(|v| v != "0"))
 }
 
-/// Under `--tp-draft-split` a decode or verify step leaves its captured rows on the device on
+/// Under `--tp-draft-split` a decode or verify step (and a lone prompt chunk's, where the engine
+/// asks) leaves its captured rows on the device on
 /// every rank, where each rank's share of the DFlash drafter takes them in (`TpStep`'s
 /// `draft_dev`, #1133), as one GPU does (#1181); `LEGION_DEBUG_TP_DRAFT_DEVICE_ROWS=0` on rank
 /// 0 turns that off (for A/B runs only: every rank then reads them back and its drafter

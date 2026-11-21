@@ -8146,8 +8146,16 @@ impl Worker {
         self.exec.set_hidden_from(from);
         // A decode or verify step: a drafter that gathers its take-in on the device reads the
         // captured rows where the step left them, not a copy of all of them on the host (#1181).
-        let on_device = match &self.drafting {
-            Drafting::Model(d) if plan.chunks.is_empty() => d.reads_device_rows(),
+        // So does a step of one prompt's chunk alone (#1133): no readback of the window's rows,
+        // and the take-in runs at once from them (`draft_defer::PromptRows`).
+        let on_device = match (&self.drafting, &plan.chunks[..]) {
+            (Drafting::Model(d), []) => d.reads_device_rows(),
+            (Drafting::Model(d), &[(i, len)]) if decoding.is_empty() => {
+                let s = &prefilling[i];
+                let last = s.n_past + len == s.prompt.len();
+                d.reads_device_rows()
+                    .filter(|_| draft_defer::prompt_rows().stays(last))
+            }
             _ => None,
         };
         self.exec.set_hidden_on_device(on_device);

@@ -13,7 +13,14 @@
 //! from the others' sums, so each rank decides by itself, and every rank still runs the same
 //! take-ins of a sequence in the same order before its first drafts: the same drafts and the
 //! same text. `LEGION_DEBUG_DFLASH_DEFER_TAKE_IN=0` (on every rank) runs them at once again.
+//!
+//! A step of one prompt's chunk alone now leaves its captured rows on the device for a drafter
+//! that reads them there ([`PromptRows`]), as a decode step does (#1181): no readback of the
+//! window's rows after the step and no host gather and upload in the take-in, which then runs
+//! at once (rows left on the device are gone by the next step) and only its GPU part. Such a
+//! round waits only where the step read its rows back after all.
 
+use std::ffi::OsStr;
 use std::sync::Arc;
 
 use crate::spec::{Draft, DraftRequest, ModelDrafter, SeqId};
@@ -28,6 +35,47 @@ pub(super) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var_os("LEGION_DEBUG_DFLASH_DEFER_TAKE_IN").is_none_or(|v| v != "0")
+    })
+}
+
+/// Which steps of one prompt's chunk alone leave their captured rows on the device for a
+/// drafter that takes them in there ([`ModelDrafter::reads_device_rows`], #1133).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PromptRows {
+    /// None: every prompt step reads them back (the way before).
+    Host,
+    /// The prompt's last chunk only; an earlier chunk's take-in still waits for the next round.
+    Last,
+    /// Every chunk (the default): an earlier chunk's take-in runs at once, on the device.
+    All,
+}
+
+impl PromptRows {
+    /// `LEGION_DEBUG_DFLASH_PROMPT_DEVICE_ROWS`: `0` [`Self::Host`], `last` [`Self::Last`],
+    /// anything else or unset [`Self::All`].
+    pub(super) fn parse(v: Option<&OsStr>) -> Self {
+        match v.and_then(OsStr::to_str) {
+            Some("0") => PromptRows::Host,
+            Some("last") => PromptRows::Last,
+            _ => PromptRows::All,
+        }
+    }
+
+    /// Whether a lone chunk's step (`last`: the prompt's last one) leaves its rows on the device.
+    pub(super) fn stays(self, last: bool) -> bool {
+        match self {
+            PromptRows::Host => false,
+            PromptRows::Last => last,
+            PromptRows::All => true,
+        }
+    }
+}
+
+/// [`PromptRows`] as `LEGION_DEBUG_DFLASH_PROMPT_DEVICE_ROWS` sets it (for A/B runs only).
+pub(super) fn prompt_rows() -> PromptRows {
+    static ROWS: std::sync::OnceLock<PromptRows> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| {
+        PromptRows::parse(std::env::var_os("LEGION_DEBUG_DFLASH_PROMPT_DEVICE_ROWS").as_deref())
     })
 }
 

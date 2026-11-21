@@ -18,6 +18,21 @@ fn only_take_in_rounds_that_read_rows_wait() {
 }
 
 #[test]
+fn prompt_rows_stay_on_the_device_as_set() {
+    use std::ffi::OsStr;
+    let parse = |v: Option<&str>| PromptRows::parse(v.map(OsStr::new));
+    assert_eq!(parse(None), PromptRows::All);
+    assert_eq!(parse(Some("1")), PromptRows::All);
+    assert_eq!(parse(Some("0")), PromptRows::Host);
+    assert_eq!(parse(Some("last")), PromptRows::Last);
+    // `(last chunk, earlier chunk)`.
+    let stays = |p: PromptRows| (p.stays(true), p.stays(false));
+    assert_eq!(stays(PromptRows::All), (true, true));
+    assert_eq!(stays(PromptRows::Last), (true, false));
+    assert_eq!(stays(PromptRows::Host), (false, false));
+}
+
+#[test]
 fn rows_of_slices_each_layer() {
     // Two layers of a 3-position step, 2 floats a row.
     let hidden = vec![

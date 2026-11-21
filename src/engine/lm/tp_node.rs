@@ -905,8 +905,9 @@ fn handle(
                 exec.set_hidden_on_device(exec.mtp_rows_device());
                 exec.set_hidden_on_device_from(from as usize);
             } else if draft_dev && let Some(d) = drafter.as_ref() {
-                // A decode or verify step's rows for this rank's share of the drafter: on the
-                // device where it reads them there, as rank 0 leaves its own (#1133).
+                // A decode or verify step's rows for this rank's share of the drafter, or a lone
+                // prompt chunk's: on the device where it reads them there, as rank 0 leaves its
+                // own (#1133). A take-in of them then runs at once (`defers`).
                 exec.set_hidden_on_device(d.reads_device_rows());
             }
             // A DFlash prompt step: the rows from rank 0's first one read back on, the ones
