@@ -648,8 +648,10 @@ fn a_kept_features_buffer_takes_in_as_a_fresh_one() {
     let max = c.block_size - 1;
     let (ta, tb, tc) = (tokens_to(701), tokens_to(601), tokens_to(604));
     // A prompt of two pieces (512 + 188 rows) fills the kept buffer; another sequence's
-    // prompt and a decode step after it take in through the same one.
+    // prompt and a decode step after it take in through the same one (rows gathered on the
+    // host, not copied from the captured layers).
     let mut d = fx.load(&path, sampling(1024));
+    d.direct = false;
     step(&mut d, 1, &ta, 0, 700, max, 0);
     let kept = d.feats.as_ptr();
     if keep_feats() {
@@ -663,6 +665,32 @@ fn a_kept_features_buffer_takes_in_as_a_fresh_one() {
     let mut fresh = fx.load(&path, sampling(1024));
     assert_eq!(b1.probs, step(&mut fresh, 2, &tb, 0, 600, max, 1).probs);
     assert_eq!(b2.probs, step(&mut fresh, 2, &tc, 600, 3, max, 1).probs);
+}
+
+#[test]
+fn every_take_in_path_drafts_the_same() {
+    let fx = Fixture::new();
+    let c = TinyDraft::default();
+    let path = fx.gguf("d.gguf", &c);
+    let max = c.block_size - 1;
+    let tokens = tokens_to(1504);
+    // A prompt of three pieces (512 + 512 + 476 rows) then a decode step, through each way of
+    // taking them in (#1133): pieces queued on two allocators in turn or each waited for; rows
+    // copied from the captured layers or gathered on the host first.
+    let run = |pipe: bool, direct: bool| {
+        let mut d = fx.load(&path, sampling(1600));
+        (d.pipe, d.direct) = (pipe, direct);
+        let a = step(&mut d, 1, &tokens, 0, 1500, max, 0);
+        let b = step(&mut d, 1, &tokens, 1500, 3, max, 1);
+        (a, b)
+    };
+    let (a, b) = run(false, false);
+    assert_eq!(a.tokens.len(), max);
+    for (pipe, direct) in [(true, true), (true, false), (false, true)] {
+        let (a2, b2) = run(pipe, direct);
+        assert_eq!(a2, a, "pipe {pipe} direct {direct}");
+        assert_eq!(b2, b, "pipe {pipe} direct {direct}");
+    }
 }
 
 #[test]

@@ -52,6 +52,15 @@ pub struct Rows {
 pub enum Feats<'f> {
     /// `[row][n_layers × n_embd]` floats on the host.
     Host(&'f [f32]),
+    /// A target step's captured layers on the host (`width` floats a row each): the ingest's
+    /// row `j` is row `from + j` of every layer, side by side, as [`Feats::Host`] lays them
+    /// out. Copied into the graph's input layer by layer, one strided copy each, without
+    /// gathering them on the host first (#1133).
+    Rows {
+        layers: &'f [&'f [f32]],
+        width: usize,
+        from: usize,
+    },
     /// A target step's captured layers left on the drafter's device (#1181): the ingest's row
     /// `j` is row `rows[j]` of every layer, side by side. Those rows must stay in place until
     /// the ingest's graph is done.
@@ -896,35 +905,16 @@ impl Model {
     }
 
     /// Runs the fused target features `feats` (`n_layers × n_embd` per row) through the
-    /// drafter's `fc` and layers and writes K/V of rows at `positions` to `cache`.
-    pub fn ingest(
-        &self,
-        backend: &mut Backend,
-        alloc: &mut Option<ComputeAllocator>,
-        cache: &mut SeqCache,
-        feats: Feats<'_>,
-        positions: &[usize],
-    ) -> Result<(), String> {
-        self.ingest_many(
-            backend,
-            alloc,
-            &mut [cache],
-            None,
-            feats,
-            &[positions],
-            true,
-        )
-    }
-
-    /// [`Self::ingest`] for several sequences in one graph (#521): `feats` holds their rows in
-    /// order, `positions[s]` sequence `s`'s positions (at most a window each). One sequence is
-    /// exactly [`Self::ingest`]'s graph. With `pool`, when the caches are all its slots, several
+    /// drafter's `fc` and layers and writes K/V of rows at `positions[s]` to `caches[s]`: one
+    /// sequence, or several in one graph (#521; `feats` holds their rows in order, at most a
+    /// window each). With `pool`, when the caches are all its slots, several
     /// sequences' K/V go to it in one write per layer and kind, the same values to the same
     /// cells.
     ///
     /// Without `wait` the graph may still run on the backend's stream when this returns: the
     /// next graph on that stream runs after it, and `alloc`'s buffer stays its own until the
-    /// backend is synchronized (a graph built meanwhile takes another allocator).
+    /// graph is done (a graph built meanwhile takes another allocator). Returns the time the
+    /// features input took to write.
     #[allow(clippy::too_many_arguments)]
     pub fn ingest_many(
         &self,
@@ -935,13 +925,22 @@ impl Model {
         feats: Feats<'_>,
         positions: &[&[usize]],
         wait: bool,
-    ) -> Result<(), String> {
+    ) -> Result<std::time::Duration, String> {
         let c = &self.cfg;
         assert_eq!(caches.len(), positions.len());
         let n: usize = positions.iter().map(|p| p.len()).sum();
         assert!(n > 0);
         match feats {
             Feats::Host(f) => assert!(!f.is_empty() && f.len() % n == 0),
+            Feats::Rows {
+                layers,
+                width,
+                from,
+            } => assert!(
+                !layers.is_empty()
+                    && width > 0
+                    && layers.iter().all(|l| l.len() >= (from + n) * width)
+            ),
             Feats::Device { layers, rows } => assert!(!layers.is_empty() && rows.len() == n),
         }
         for (cache, p) in caches.iter().zip(positions) {
@@ -954,6 +953,13 @@ impl Model {
         let (x_in, rows_in) = match feats {
             Feats::Host(f) => {
                 let n_in = f.len() / n;
+                (
+                    input(types::F32, &[n_in as i64, n as i64], "features"),
+                    None,
+                )
+            }
+            Feats::Rows { layers, width, .. } => {
+                let n_in = layers.len() * width;
                 (
                     input(types::F32, &[n_in as i64, n as i64], "features"),
                     None,
@@ -1007,11 +1013,28 @@ impl Model {
         let allocator = alloc.take().unwrap_or_else(|| drafter_allocator(backend));
         ctx.alloc_graph(&graph, allocator)
             .map_err(|e| e.to_string())?;
+        let t_up = std::time::Instant::now();
         match (feats, rows_in) {
             (Feats::Host(f), _) => x_in.set_f32(f),
+            (
+                Feats::Rows {
+                    layers,
+                    width,
+                    from,
+                },
+                _,
+            ) => {
+                // Layer `l`'s rows go to floats `l × width..` of every input row.
+                let n_in = layers.len() * width;
+                for (l, rows) in layers.iter().enumerate() {
+                    let rows = &rows[from * width..(from + n) * width];
+                    x_in.set_f32_strided(l * width, width, n, n_in, rows, width);
+                }
+            }
             (_, Some((idx, rows))) => idx.set_i32(rows),
             (Feats::Device { .. }, None) => unreachable!("an index input for device rows"),
         }
+        let upload = t_up.elapsed();
         let all: Vec<i32> = positions
             .iter()
             .flat_map(|p| p.iter())
@@ -1044,7 +1067,7 @@ impl Model {
                 cache.store(p);
             }
         }
-        Ok(())
+        Ok(upload)
     }
 
     /// Runs the noise block of `n` positions (`last` at `anchor_pos`, then masks) and returns

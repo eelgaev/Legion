@@ -88,9 +88,10 @@ mod tests_v2;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::engine::sampling::Rng;
-use crate::ggml::{Backend, ComputeAllocator, Context, gpu_device, types};
+use crate::ggml::{Backend, ComputeAllocator, Context, Event, gpu_device, types};
 use crate::spec::{
     DeviceHidden, Draft, DraftRequest, ModelDrafter, ModelDrafterFactory, SeqId, TargetInfo,
 };
@@ -236,10 +237,36 @@ pub struct DflashDrafter {
     /// of every fused layer is tens of MB (512 × 5 × 5,376 floats, 55 MB), more than glibc
     /// keeps on its heap: a fresh vector was mapped, faulted in and unmapped every prompt.
     feats: Vec<f32>,
+    /// A take-in of several pieces queues each piece but the last without waiting for it, on
+    /// `alloc` and `draft_alloc` in turn ([`ingest_pipe`], #1133).
+    pipe: bool,
+    /// A take-in of host rows copies them into its graph's input straight from the captured
+    /// layers, without gathering them in `feats` ([`ingest_rows`], #1133).
+    direct: bool,
+    /// Recorded after a queued take-in piece on `alloc` (0) or `draft_alloc` (1), made on first
+    /// use; none on the CPU.
+    piece_done: Vec<Event>,
 }
 
 /// Most idle caches kept for the next sequences.
 const SPARE_CACHES: usize = 4;
+
+/// MiB of an allocator's buffer (0 for none).
+fn mib(a: &Option<ComputeAllocator>) -> usize {
+    a.as_ref().map_or(0, |a| a.buffer_size() >> 20)
+}
+
+/// Where a take-in's host time went ([`DflashDrafter::ingest`], logged at debug level).
+#[derive(Default)]
+struct TakeInTimes {
+    pieces: usize,
+    /// Gathering host rows into the features buffer.
+    gather: Duration,
+    /// Writing the pieces' features inputs (host to device).
+    upload: Duration,
+    /// Waiting for a piece queued before to free its allocator.
+    wait: Duration,
+}
 
 /// A take-in's host features go to the buffer the drafter keeps ([`DflashDrafter::feats`]);
 /// `LEGION_DEBUG_DFLASH_KEEP_FEATS=0`: a fresh vector every take-in, as before (A/B runs only;
@@ -247,6 +274,24 @@ const SPARE_CACHES: usize = 4;
 fn keep_feats() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_DFLASH_KEEP_FEATS").is_none_or(|v| v != "0"))
+}
+
+/// A take-in of several pieces queues each piece but the last without waiting for it, the
+/// pieces taking two allocators in turn, so that a piece's input is written while the piece
+/// before runs (#1133); `LEGION_DEBUG_DFLASH_INGEST_PIPE=0`: waits for every piece, one
+/// allocator, as before (A/B runs only; the same graphs in the same order on the same stream,
+/// so the same bits either way).
+fn ingest_pipe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_DFLASH_INGEST_PIPE").is_none_or(|v| v != "0"))
+}
+
+/// A take-in of host rows copies each captured layer's rows into its graph's input, one
+/// strided copy each (#1133); `LEGION_DEBUG_DFLASH_INGEST_ROWS=0`: gathers them on the host
+/// first and uploads the gathered rows, as before (A/B runs only; the same floats either way).
+fn ingest_rows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_DFLASH_INGEST_ROWS").is_none_or(|v| v != "0"))
 }
 
 /// Empties `buf` with room for `n` values. One too small is replaced, not grown: growing would
@@ -482,6 +527,9 @@ impl DflashDrafter {
             max_seqs: target.max_seqs.max(1),
             pool_failed: false,
             feats: Vec::new(),
+            pipe: ingest_pipe(),
+            direct: ingest_rows(),
+            piece_done: Vec::new(),
         })
     }
 
@@ -630,39 +678,136 @@ impl DflashDrafter {
     }
 
     /// Takes in the target step's rows of request `i` (`r`), one sequence.
+    ///
+    /// In pieces of [`INGEST_CHUNK`] rows. Host rows go into each piece's input straight from
+    /// the captured layers with [`Self::direct`], else gathered in `feats` first. With
+    /// [`Self::pipe`] each piece but the last is queued without waiting, on `alloc` and
+    /// `draft_alloc` in turn: a piece's graph is built and its inputs written while the piece
+    /// before runs, once the piece two before (on the same allocator) is done (#1133). The same
+    /// graphs with the same inputs in the same order on the backend's stream as waiting for
+    /// each piece, so the cache gets the same bits; the last piece waits, so the take-in is
+    /// done on return either way, and neither allocator is in use.
     fn ingest(&mut self, r: &DraftRequest<'_>, i: usize, src: Src<'_>) -> Result<(), String> {
         self.check_hidden(r, i, src)?;
+        let t0 = Instant::now();
         let mut cache = self.caches.remove(&r.seq).expect("made by cache_for");
         cache.rollback(r.start);
-        let mut at = ingest_from(r.tokens.len(), r.start, r.ran, cache.window());
+        let first = ingest_from(r.tokens.len(), r.start, r.ran, cache.window());
+        let mut at = first;
+        let direct = self.direct && matches!(src, Src::Host);
         let piece = INGEST_CHUNK.min(r.ran.saturating_sub(at)) * self.feats_width();
         let mut feats = match src {
-            Src::Host if keep_feats() => self.kept_feats(piece),
+            Src::Host if !direct && keep_feats() => self.kept_feats(piece),
             _ => Vec::new(),
         };
         let mut idx = Vec::new();
         let mut result = Ok(());
+        // Whether a piece queued without waiting for it holds allocator 0 (`alloc`) or 1.
+        let mut queued = [false; 2];
+        let mut t = TakeInTimes::default();
         while at < r.ran {
             let n = INGEST_CHUNK.min(r.ran - at);
-            feats.clear();
-            idx.clear();
-            self.features(r, i, src, at..at + n, &mut feats, &mut idx);
-            let positions: Vec<usize> = (r.start + at..r.start + at + n).collect();
-            result = self.model.ingest(
-                &mut self.backend,
-                &mut self.alloc,
-                &mut cache,
-                feats_of(src, &feats, &idx),
-                &positions,
-            );
-            if result.is_err() {
-                break;
+            let last = at + n >= r.ran;
+            if !direct {
+                feats.clear();
+                idx.clear();
+                let tg = Instant::now();
+                self.features(r, i, src, at..at + n, &mut feats, &mut idx);
+                t.gather += tg.elapsed();
             }
+            let slot = if self.pipe { t.pieces % 2 } else { 0 };
+            if queued[slot] {
+                let tw = Instant::now();
+                self.wait_piece(slot);
+                t.wait += tw.elapsed();
+                queued[slot] = false;
+            }
+            let positions: Vec<usize> = (r.start + at..r.start + at + n).collect();
+            let block = !self.pipe || last;
+            let feats_in = if direct {
+                Feats::Rows {
+                    layers: &r.hidden,
+                    width: self.n_embd,
+                    from: at,
+                }
+            } else {
+                feats_of(src, &feats, &idx)
+            };
+            let alloc = if slot == 0 {
+                &mut self.alloc
+            } else {
+                &mut self.draft_alloc
+            };
+            let up = self.model.ingest_many(
+                &mut self.backend,
+                alloc,
+                &mut [&mut cache],
+                None,
+                feats_in,
+                &[&positions],
+                block,
+            );
+            match up {
+                Ok(up) => t.upload += up,
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            }
+            if !block {
+                self.piece_queued(slot);
+                queued[slot] = true;
+            }
+            t.pieces += 1;
             at += n;
+        }
+        if self.pipe && result.is_err() {
+            // Nothing left running after a failed piece (the last piece waits otherwise).
+            self.backend.synchronize();
+        }
+        let rows = r.ran - first.min(r.ran);
+        if rows >= INGEST_CHUNK {
+            tracing::debug!(
+                seq = r.seq,
+                rows,
+                pieces = t.pieces,
+                pipe = self.pipe,
+                direct,
+                ms = t0.elapsed().as_secs_f64() * 1e3,
+                gather_ms = t.gather.as_secs_f64() * 1e3,
+                upload_ms = t.upload.as_secs_f64() * 1e3,
+                wait_ms = t.wait.as_secs_f64() * 1e3,
+                // The two allocators' buffers (the second also DFlash 2's draft pass's).
+                alloc_mib = mib(&self.alloc),
+                draft_alloc_mib = mib(&self.draft_alloc),
+                "dflash take-in"
+            );
         }
         self.caches.insert(r.seq, cache);
         self.keep_feats_buf(src, feats);
         result
+    }
+
+    /// Marks the end of the take-in piece just queued on allocator `slot` ([`Self::ingest`]).
+    fn piece_queued(&mut self, slot: usize) {
+        if self.piece_done.is_empty() {
+            // Both or none.
+            if let (Some(a), Some(b)) = (self.backend.new_event(), self.backend.new_event()) {
+                self.piece_done = vec![a, b];
+            }
+        }
+        if let Some(e) = self.piece_done.get(slot) {
+            self.backend.record(e);
+        }
+    }
+
+    /// Waits for the take-in piece queued on allocator `slot`, not for those queued after it
+    /// (all of them where the backend has no events).
+    fn wait_piece(&mut self, slot: usize) {
+        match self.piece_done.get(slot) {
+            Some(e) => e.synchronize(),
+            None => self.backend.synchronize(),
+        }
     }
 
     /// Floats of one row of [`Self::features`] on the host: every fused layer's.
@@ -732,15 +877,18 @@ impl DflashDrafter {
         let positions: Vec<&[usize]> = positions.iter().map(Vec::as_slice).collect();
         let mut refs: Vec<&mut cache::SeqCache> = caches.iter_mut().collect();
         // The draft pass that follows (`step`) is built while this runs.
-        let result = self.model.ingest_many(
-            &mut self.backend,
-            &mut self.alloc,
-            &mut refs,
-            self.pool.as_ref(),
-            feats_of(src, &feats, &idx),
-            &positions,
-            false,
-        );
+        let result = self
+            .model
+            .ingest_many(
+                &mut self.backend,
+                &mut self.alloc,
+                &mut refs,
+                self.pool.as_ref(),
+                feats_of(src, &feats, &idx),
+                &positions,
+                false,
+            )
+            .map(|_| ());
         for (&i, c) in take.iter().zip(caches) {
             self.caches.insert(batch[i].seq, c);
         }

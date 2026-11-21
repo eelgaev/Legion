@@ -921,6 +921,68 @@ impl<'a> Tensor<'a> {
         self.set_bytes(as_bytes(values));
     }
 
+    /// For F32 tensors: writes `runs` runs of `len` floats, run `i` from `values[i * src_step..]`
+    /// to float `at + i * dst_step` of the tensor, in one strided copy where the buffer has one
+    /// (CUDA: a `cudaMemcpy2D` on its own stream, synchronous), else one copy per run. The
+    /// floats written are `values`' bits.
+    ///
+    /// Panics if the tensor has no memory yet or a run is out of bounds.
+    pub fn set_f32_strided(
+        self,
+        at: usize,
+        len: usize,
+        runs: usize,
+        dst_step: usize,
+        values: &[f32],
+        src_step: usize,
+    ) {
+        assert_eq!(
+            self.ty(),
+            ffi::ggml_type_GGML_TYPE_F32,
+            "set_f32_strided on a non-F32 tensor"
+        );
+        assert!(
+            self.is_allocated(),
+            "tensor `{}` has no memory yet",
+            self.name()
+        );
+        if runs == 0 || len == 0 {
+            return;
+        }
+        let end = |start: usize, step: usize| {
+            step.checked_mul(runs - 1)
+                .and_then(|o| o.checked_add(start))
+                .and_then(|o| o.checked_add(len))
+        };
+        assert!(
+            len <= dst_step || runs == 1,
+            "tensor `{}`: overlapping runs",
+            self.name()
+        );
+        assert!(
+            end(at, dst_step).is_some_and(|e| e * 4 <= self.nbytes()),
+            "tensor `{}`: strided write out of bounds",
+            self.name()
+        );
+        assert!(
+            end(0, src_step).is_some_and(|e| e <= values.len()),
+            "set_f32_strided: runs past the values"
+        );
+        // SAFETY: an allocated tensor; every run is inside it and inside `values` (checked
+        // above), which the copy reads before it returns.
+        unsafe {
+            ffi::ggml_backend_tensor_set_2d(
+                self.raw(),
+                values.as_ptr().cast(),
+                at * 4,
+                len * 4,
+                runs,
+                dst_step * 4,
+                src_step * 4,
+            )
+        }
+    }
+
     /// For F32 tensors.
     pub fn to_f32(self) -> Vec<f32> {
         assert_eq!(

@@ -482,3 +482,30 @@ fn with_f32_range_via_sees_what_f32_range_reads() {
         assert_eq!(t.with_f32_range_via(via, 6, 0, |s| s.len()), 0);
     }
 }
+
+/// #1133: strided runs of a host vector land where a gather on the host would put them, the
+/// floats between them left alone.
+#[test]
+fn set_f32_strided_writes_runs_as_a_gather_would() {
+    let cpu = Backend::cpu().unwrap();
+    let ctx = Context::new(1, 0);
+    // Two layers of 3 rows of width 2 side by side: rows of 4 floats.
+    let t = ctx.new_tensor(types::F32, &[4, 3]);
+    ctx.alloc_tensors(cpu.buffer_type()).unwrap();
+    t.set_f32(&[9.0; 12]);
+    let a = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
+    let b = [10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0];
+    t.set_f32_strided(0, 2, 3, 4, &a, 2);
+    // Layer b from its second row on.
+    t.set_f32_strided(2, 2, 3, 4, &b[2..], 2);
+    let mut want = Vec::new();
+    for row in 0..3 {
+        want.extend_from_slice(&a[row * 2..row * 2 + 2]);
+        want.extend_from_slice(&b[(row + 1) * 2..(row + 1) * 2 + 2]);
+    }
+    assert_eq!(t.to_f32(), want);
+    // One run of one float, the rest as they were.
+    t.set_f32_strided(5, 1, 1, 4, &[-1.0], 1);
+    want[5] = -1.0;
+    assert_eq!(t.to_f32(), want);
+}
