@@ -82,3 +82,36 @@ fn a_take_ins_device_rows_are_its_last_part_only() {
     let e = rows_of(&[dev, RowsPart::Sent { len: 0 }], &[], &steps).unwrap_err();
     assert!(e.contains("last part"), "{e}");
 }
+
+fn take_in(seq: u64, off: u32, start: u32, ran: u32) -> crate::node::WireDraft {
+    crate::node::WireDraft {
+        seq,
+        base: start + ran,
+        tokens: vec![1],
+        start,
+        ran,
+        off,
+        max: 0,
+        blocks: Vec::new(),
+        ring: 0,
+    }
+}
+
+#[test]
+fn a_draft_round_reading_rows_its_step_skipped_is_named() {
+    // A 32K prompt's second 16K chunk: rank 0 read back from row 12,288 on.
+    let reqs = [take_in(4, 0, 16_384, 16_384)];
+    // This rank's drafter reads the same rows (the same ring): nothing to say.
+    assert_eq!(first_unread(&reqs, 12_288, |_| 12_288), None);
+    assert_eq!(first_unread(&reqs, 12_288, |_| 14_336), None);
+    // A bigger ring here reads rows the step did not read back.
+    assert_eq!(first_unread(&reqs, 12_288, |_| 8_192), Some(4));
+    // A chunk the ring overwrites: nothing read back, nothing taken in.
+    let first = [take_in(4, 0, 0, 16_384)];
+    assert_eq!(first_unread(&first, 16_384, |r| r.ran as usize), None);
+    // Every row read back (decode steps, or the switch off): never.
+    assert_eq!(first_unread(&reqs, 0, |_| 0), None);
+    // A request that takes nothing in reads no rows.
+    let none = [take_in(9, 0, 16_384, 0)];
+    assert_eq!(first_unread(&none, 12_288, |_| 0), None);
+}

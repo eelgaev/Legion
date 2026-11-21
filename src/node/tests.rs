@@ -71,6 +71,7 @@ fn requests_round_trip() {
             gather_budget: u64::MAX - 1,
             head: 2,
             rows_dev: 4_536,
+            rows_from: 12_288,
         },
         Request::SaveRing {
             ring: 4,

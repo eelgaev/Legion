@@ -623,6 +623,11 @@ struct FollowRows {
     /// The last step's left on the device ([`crate::model::core::StepOutput::hidden_dev`],
     /// [`RowsPart::Device`]): valid until the next step.
     dev: Vec<crate::ggml::RowsAt>,
+    /// The last step's first row read back to `host[0]` (`TpStep`'s `rows_from`, #1133): the
+    /// rows before it hold anything.
+    from: usize,
+    /// A draft round read rows the last step did not read back (warned once).
+    warned: bool,
 }
 
 /// [`Request::TpMtpRows`]' parts split into the ones [`rows_of`] reads and a last
@@ -748,6 +753,24 @@ fn run_draft(
     d.step(&mut batch)
 }
 
+/// The first request of draft round `reqs` that takes in rows its step did not read back here
+/// (the step's rows before `from`, `TpStep`'s `rows_from`, #1133): `read_from` gives the first
+/// of a request's rows this rank's drafter reads ([`crate::spec::ModelDrafter::rows_read_from`]
+/// of the request's tokens). `None` when the drafters of every rank keep the same ring (rank 0
+/// named the first row its own drafter reads).
+fn first_unread(
+    reqs: &[crate::node::WireDraft],
+    from: usize,
+    read_from: impl Fn(&crate::node::WireDraft) -> usize,
+) -> Option<u64> {
+    if from == 0 {
+        return None;
+    }
+    reqs.iter()
+        .find(|r| r.ran > 0 && (r.off as usize).saturating_add(read_from(r)) < from)
+        .map(|r| r.seq)
+}
+
 fn handle(
     exec: &mut Executor,
     req: Request,
@@ -792,6 +815,7 @@ fn handle(
             gather_budget,
             head,
             rows_dev,
+            rows_from,
         } => {
             exec.set_pipeline_micro(micro as usize);
             exec.set_micro_taper(taper as usize);
@@ -825,6 +849,12 @@ fn handle(
                 exec.set_hidden_on_device(exec.mtp_rows_device());
                 exec.set_hidden_on_device_from(from as usize);
             }
+            // A DFlash prompt step: the rows from rank 0's first one read back on, the ones
+            // this rank's share of the drafter takes in (#1133); a 16K step of a 32K prompt
+            // read 1.7 GB back here (five captured layers), its last 4,096 rows or none now.
+            let rows_from = rows_from as usize;
+            exec.set_hidden_from(rows_from);
+            rows.from = rows_from;
             let out = exec.step(&groups).map_err(|e| e.to_string())?;
             rows.host[0] = out.hidden;
             rows.dev = out.hidden_dev;
@@ -1020,6 +1050,24 @@ fn handle(
         Request::TpDraft { reqs } => {
             let d = drafter.as_mut().ok_or(NO_DRAFT_SPLIT)?;
             let w = exec.model().hp.n_embd as usize;
+            // Rank 0 named the first row its drafter reads; this rank's reads the same ones
+            // unless its ring differs (another --ctx-size or drafter window here). Its drafts
+            // then differ (rank 0 still verifies them): said once, the round runs anyway, so
+            // that its sums line up with rank 0's.
+            if !rows.warned
+                && let Some(seq) = first_unread(&reqs, rows.from, |r| {
+                    let n = r.base as usize + r.tokens.len();
+                    d.rows_read_from(n, r.start as usize, r.ran as usize)
+                })
+            {
+                rows.warned = true;
+                tracing::warn!(
+                    seq,
+                    from = rows.from,
+                    "--tp-draft-split: this rank's drafter takes in rows rank 0's does not \
+                     (another --ctx-size or drafter window on this rank?): its drafts may differ"
+                );
+            }
             run_draft(d.as_mut(), &reqs, &rows.host[0], w)?;
             Reply::Done
         }

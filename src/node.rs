@@ -28,7 +28,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// Frames before this version are refused: both ranks must run the same build.
-const VERSION: u32 = 13;
+const VERSION: u32 = 14;
 
 /// The node settings of a `legion serve` (`--node-rank`, `--node-peer`, `--node-split`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,7 +120,10 @@ pub enum Request {
     /// the one row of `rows`, their values). `rows_dev`: 0, or `n + 1` when rank 0 leaves
     /// its captured rows on the device for the MTP head's take-in of a prompt chunk and reads
     /// back only rows `n` on (#1176): this rank does the same where it can, and the take-in's
-    /// pieces name those rows as [`RowsPart::Device`].
+    /// pieces name those rows as [`RowsPart::Device`]. `rows_from`: the first captured row
+    /// rank 0 reads back (0: all), for a DFlash drafter that takes in only a prompt chunk's
+    /// last rows (its ring, #1133): this rank reads back the same rows, the ones its share of
+    /// the drafter (`--tp-draft-split`) takes in.
     TpStep {
         groups: Vec<WireGroup>,
         micro: u32,
@@ -128,6 +131,7 @@ pub enum Request {
         gather_budget: u64,
         head: u32,
         rows_dev: u64,
+        rows_from: u64,
     },
     /// Save ring `ring`'s first `n` positions in copy `slot`, or (`restore`) put that copy
     /// back.
@@ -547,6 +551,7 @@ impl Request {
                 gather_budget,
                 head: share,
                 rows_dev,
+                rows_from,
             } => {
                 put_groups(&mut head, &groups);
                 put_u32(&mut head, micro);
@@ -554,6 +559,7 @@ impl Request {
                 head.extend_from_slice(&gather_budget.to_le_bytes());
                 put_u32(&mut head, share);
                 head.extend_from_slice(&rows_dev.to_le_bytes());
+                head.extend_from_slice(&rows_from.to_le_bytes());
                 K_TP_STEP
             }
             Request::SaveRing {
@@ -710,6 +716,7 @@ impl Request {
                 gather_budget: r.u64()?,
                 head: r.u32()?,
                 rows_dev: r.u64()?,
+                rows_from: r.u64()?,
             },
             K_SAVE_RING => Request::SaveRing {
                 ring: r.u32()?,

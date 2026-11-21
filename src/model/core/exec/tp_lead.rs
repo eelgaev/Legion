@@ -197,6 +197,15 @@ pub(super) fn device_rows() -> bool {
     *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_TP_DEVICE_ROWS").is_none_or(|v| v != "0"))
 }
 
+/// A DFlash prompt step over machines reads its captured rows back from the first row the
+/// drafter takes in on every rank ([`Executor::set_hidden_from`], `TpStep`'s `rows_from`,
+/// #1133), as one GPU does; `LEGION_DEBUG_TP_ROWS_FROM=0` on rank 0 turns that off (for A/B
+/// runs only: every rank then reads all of them back, as before).
+pub(super) fn rows_from() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_TP_ROWS_FROM").is_none_or(|v| v != "0"))
+}
+
 impl Drop for TpLead {
     fn drop(&mut self) {
         // Rank 1 stops when its link closes; wait for it to free its GPU's memory, which it
@@ -461,6 +470,8 @@ impl Executor {
             gather_budget: self.gather_budget as u64,
             head: if split { 2 } else { 0 },
             rows_dev,
+            // Kept by [`Executor::step`] only with [`rows_from`] on.
+            rows_from: self.hidden_from as u64,
         };
         let lead = self.tp.as_mut().expect("tensor-parallel lead");
         lead.step_dev = None;

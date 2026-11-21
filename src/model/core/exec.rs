@@ -288,7 +288,7 @@ fn read_rows_from(
 ) -> Vec<f32> {
     let width = t.ne()[0] as usize;
     let n = t.nbytes() / 4;
-    let skip = (from * width).min(n);
+    let skip = from.saturating_mul(width).min(n);
     if skip == 0 {
         return read_rows(bounce, small, spare, backend, t);
     }
@@ -2976,7 +2976,12 @@ impl Executor {
         self.applied.clear();
         if self.tp.is_some() {
             self.prompt_next = None;
-            self.hidden_from = 0;
+            // A DFlash prompt step's first row read back goes to every rank (`tp_step`): each
+            // reads back the rows from it on, the ones its drafter (rank 0's, or a share of it
+            // with `--tp-draft-split`) takes in (#1133).
+            if !tp_lead::rows_from() {
+                self.hidden_from = 0;
+            }
             // Only the MTP head's take-in leaves the rows on the device over machines (every
             // rank alike, `tp_step`), where it may ([`Self::mtp_rows_device`]).
             if self.hidden_dev_from.is_none() || self.mtp_rows_device().is_none() {
@@ -2985,6 +2990,7 @@ impl Executor {
             }
             self.captures.clear();
             let out = self.tp_step(groups);
+            self.hidden_from = 0;
             self.hidden_on_device = None;
             self.hidden_dev_from = None;
             return out;
@@ -3081,6 +3087,8 @@ impl Executor {
     /// `row` on only: the rows before it keep their length in the output but hold anything (an
     /// earlier step's rows, or zeros). For a drafter that reads only a prompt chunk's last rows
     /// (DFlash's ring, #1133); a step of one micro-chunk applies it, others read every row.
+    /// Over machines rank 0 sends it with the step and every rank applies it (each one's
+    /// rows feed its drafter: rank 0's, or a share of it with `--tp-draft-split`).
     /// Only the next step reads it.
     pub fn set_hidden_from(&mut self, row: usize) {
         self.hidden_from = row;
