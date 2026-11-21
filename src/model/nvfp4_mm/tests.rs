@@ -341,6 +341,9 @@ fn gemm_tune_codes() {
     }
     // A diagnostic variant (the bench's): the thousands above the shape.
     assert_eq!(GemmTune::from_code(1_411_099).warps, 1411);
+    // CTAs of a set warp count (the bench's): ten thousands above the shape, still the stream.
+    assert_eq!(GemmTune::from_code(60_412_099).warps, 60_412);
+    assert!(GemmTune::from_code(120_411_099).is_stream());
     assert!(!GEMM_VERIFY.is_stream() && !GEMM_DEFAULT.is_stream());
 }
 

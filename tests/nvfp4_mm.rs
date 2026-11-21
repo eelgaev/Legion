@@ -1302,7 +1302,8 @@ mod cuda {
     /// 33-64 tokens: Gemma 4 31B's matrices, a global layer's 16384 rows, rows past a tile and
     /// a k whose rows are not 16-byte aligned (the default kernel's fallback), and a rank's
     /// halves over two machines (--tp-head-split: the o and global o projections' 4096 and 8192
-    /// columns, the down matmul's 10752, the GLU's 10752 rows); then the fused GLU. Last, one
+    /// columns, the down matmul's 10752, the GLU's 10752 rows); then the fused GLU; each also in
+    /// CTAs of a set warp count (the bits do not depend on the CTA's size). Last, one
     /// graph of launches of different token counts back to back, computed twice (nothing kept
     /// from one launch to the next).
     #[test]
@@ -1311,7 +1312,10 @@ mod cuda {
         use nvfp4_mm::{GEMM_DEFAULT, GemmTune};
         let Some(mut gpu) = gpu() else { return };
         let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-        let plain = [411_099, 311_099, 321_099, 412_099, 322_099];
+        // The shapes, then the default one in CTAs of a set 4 / 8 warps (the bench's).
+        let plain = [
+            411_099, 311_099, 321_099, 412_099, 322_099, 40_411_099, 80_411_099,
+        ];
         let shapes = [
             (5376, 8192),
             (5376, 4096),
@@ -1349,7 +1353,7 @@ mod cuda {
                 let s = (Some(0.02), Some(0.04));
                 nvfp4_mm::force_gemm_tune(Some(GEMM_DEFAULT), None);
                 let want = bits(&run_glu(&mut gpu, (&wg, &wu), &xs, s, (k, m, n), true));
-                for code in [412_099, 312_099, 322_099] {
+                for code in [412_099, 312_099, 322_099, 20_412_099, 60_412_099] {
                     nvfp4_mm::force_gemm_tune(Some(GemmTune::from_code(code)), None);
                     let got = bits(&run_glu(&mut gpu, (&wg, &wu), &xs, s, (k, m, n), true));
                     assert!(got == want, "geglu k {k} m {m} n {n} t{code}: bits differ");

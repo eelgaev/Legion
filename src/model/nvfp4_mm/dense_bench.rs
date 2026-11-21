@@ -17,14 +17,17 @@ pub const GEMM_DENSE_TUNES: [i32; 8] = [31, 8032, 8041, 8022, 4031, 4032, 4023, 
 
 /// The streaming GEMM's variants at 64-token tiles ([`GemmTune::stream`] codes; `nvfp4_vstream`):
 /// shapes, then the diagnostics (1 ...: no copies, 2 ...: no MMAs, 3 ...: no weight copies, 4 ...:
-/// no activation copies; wrong outputs, timing only).
-pub const GEMM_STREAM_TUNES: [i32; 11] = [
+/// no activation copies; wrong outputs, timing only), then the default shape in CTAs of 4 / 6 /
+/// 8 warps (10 million * warps above the code; the same bits).
+pub const GEMM_STREAM_TUNES: [i32; 14] = [
     411_099, 311_099, 321_099, 412_099, 322_099, 1_411_099, 2_411_099, 3_411_099, 4_411_099,
-    1_412_099, 3_412_099,
+    1_412_099, 3_412_099, 40_411_099, 60_411_099, 80_411_099,
 ];
 
-/// The streaming GEMM's variants of the fused GLU.
-pub const GEMM_STREAM_GLU_TUNES: [i32; 3] = [412_099, 312_099, 322_099];
+/// The streaming GEMM's variants of the fused GLU, then its default in CTAs of 2-6 warps.
+pub const GEMM_STREAM_GLU_TUNES: [i32; 8] = [
+    412_099, 312_099, 322_099, 20_412_099, 30_412_099, 40_412_099, 50_412_099, 60_412_099,
+];
 
 /// One measured variant.
 #[derive(Clone, Debug)]

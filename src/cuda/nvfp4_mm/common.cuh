@@ -1503,14 +1503,21 @@ int gemm_dense_variant(const legion_nvfp4_mm & p, int variant, cudaStream_t st) 
     return -1;
 }
 
+// A CTA of fewer warps streams no faster per warp: an SM's weight stream needs about this many
+// warps' copies in flight. GB10, the fused GLU over 10752 rows (a rank's half of Gemma 4 31B's
+// 21504 over two machines) at 33-64 tokens: 2 warps (the fewest warp-rounds without this floor)
+// 811 us, the GEMM's default 561 us.
+constexpr int VS_MIN_WARPS = 4;
+
 // Warps per CTA of nvfp4_vstream over `units` warp tiles on `sms` SMs: the fewest warp-rounds
-// (rounds of every SM's CTA times its warps; ties: more warps), within the shared memory.
+// (rounds of every SM's CTA times its warps, a CTA counted as at least VS_MIN_WARPS; ties: more
+// warps), within the shared memory.
 inline int vs_warps(int64_t units, int sms, int rtw, int xb, int xs) {
     int best = 0;
     int64_t cost = INT64_MAX;
     for (int w = 1; w * 16 * rtw <= VS_MAX_ROWS && vs_smem(w * 16 * rtw, xb, xs) <= VS_SMEM_MAX; w++) {
         const int64_t per = (int64_t) w * sms;
-        const int64_t c = (units + per - 1) / per * w;
+        const int64_t c = (units + per - 1) / per * (w < VS_MIN_WARPS ? VS_MIN_WARPS : w);
         if (c <= cost) {
             cost = c;
             best = w;
@@ -1520,10 +1527,11 @@ inline int vs_warps(int64_t units, int sms, int rtw, int xb, int xs) {
 }
 
 // nvfp4_vstream's launch: the CTA size from the rows and the SM count (p.tiles_m set here, to
-// its row tiles), one CTA per SM. Weights not 16-byte aligned (rows or base): nvfp4_gemm's
-// default instead (p.tiles_m as the caller set it for that).
+// its row tiles), one CTA per SM; `fw` > 0: CTAs of that many warps instead (the bench's; -1
+// when they do not fit). Weights not 16-byte aligned (rows or base): nvfp4_gemm's default
+// instead (p.tiles_m as the caller set it for that).
 template <int RTW, bool GLU, int XB, int XS, int DIAG>
-int vstream(const legion_nvfp4_mm & p0, cudaStream_t st) {
+int vstream(const legion_nvfp4_mm & p0, cudaStream_t st, int fw = 0) {
     constexpr int MI = GLU ? 2 : 1;
     if (p0.plan) {
         return -1;
@@ -1534,8 +1542,8 @@ int vstream(const legion_nvfp4_mm & p0, cudaStream_t st) {
     const int sm_count = legion_cuda_sm_count();
     const int sms = sm_count > 0 ? sm_count : 1;
     const int64_t ow = GLU ? 16 : 16 * RTW;
-    const int warps = vs_warps((p0.m + ow - 1) / ow, sms, RTW, XB, XS);
-    if (warps == 0) {
+    const int warps = fw > 0 ? fw : vs_warps((p0.m + ow - 1) / ow, sms, RTW, XB, XS);
+    if (warps == 0 || warps * 16 * RTW > VS_MAX_ROWS || vs_smem(warps * 16 * RTW, XB, XS) > VS_SMEM_MAX) {
         return -1;
     }
     legion_nvfp4_mm p = p0;
@@ -1551,29 +1559,31 @@ int vstream(const legion_nvfp4_mm & p0, cudaStream_t st) {
 
 // nvfp4_vstream's variants (GemmTune::stream in src/model/nvfp4_mm.rs): variant % 1000 == 99,
 // variant / 1000 = RTW + 10 * XB + 100 * XS + 1000 * diagnostic (1: DIAG_NOW | DIAG_NOX, 2:
-// DIAG_NOMMA, 3: DIAG_NOW, 4: DIAG_NOX; the bench's). 64-token tiles: the plain matmul (MI 1)
-// and the fused GLU (MI 2, RTW 2). -2: not such a variant; -1: not compiled.
+// DIAG_NOMMA, 3: DIAG_NOW, 4: DIAG_NOX; the bench's) + 10000 * CTA warps (0: vs_warps'; the
+// bench's). 64-token tiles: the plain matmul (MI 1) and the fused GLU (MI 2, RTW 2). -2: not
+// such a variant; -1: not compiled.
 template <int MI, int NT, bool GLU>
 int vstream_variant(const legion_nvfp4_mm & p, int variant, cudaStream_t st) {
     if (variant < 1000 || variant % 1000 != 99) {
         return -2;
     }
     if constexpr (NT == 8 && MI == (GLU ? 2 : 1)) {
-        const int v = variant / 1000;
+        const int v = variant / 1000 % 10000;
+        const int fw = variant / 10000000;
         if constexpr (GLU) {
             switch (v) {
-                case 412: return vstream<2, true, 1, 4, 0>(p, st);
-                case 312: return vstream<2, true, 1, 3, 0>(p, st);
-                case 322: return vstream<2, true, 2, 3, 0>(p, st);
+                case 412: return vstream<2, true, 1, 4, 0>(p, st, fw);
+                case 312: return vstream<2, true, 1, 3, 0>(p, st, fw);
+                case 322: return vstream<2, true, 2, 3, 0>(p, st, fw);
                 default: return -1;
             }
         } else {
             switch (v) {
-                case 411: return vstream<1, false, 1, 4, 0>(p, st);
-                case 311: return vstream<1, false, 1, 3, 0>(p, st);
-                case 321: return vstream<1, false, 2, 3, 0>(p, st);
-                case 412: return vstream<2, false, 1, 4, 0>(p, st);
-                case 322: return vstream<2, false, 2, 3, 0>(p, st);
+                case 411: return vstream<1, false, 1, 4, 0>(p, st, fw);
+                case 311: return vstream<1, false, 1, 3, 0>(p, st, fw);
+                case 321: return vstream<1, false, 2, 3, 0>(p, st, fw);
+                case 412: return vstream<2, false, 1, 4, 0>(p, st, fw);
+                case 322: return vstream<2, false, 2, 3, 0>(p, st, fw);
                 case 1411: return vstream<1, false, 1, 4, DIAG_NOW | DIAG_NOX>(p, st);
                 case 2411: return vstream<1, false, 1, 4, DIAG_NOMMA>(p, st);
                 case 3411: return vstream<1, false, 1, 4, DIAG_NOW>(p, st);
