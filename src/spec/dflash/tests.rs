@@ -640,6 +640,46 @@ fn a_long_prompt_skips_rows_its_later_chunks_overwrite() {
 }
 
 #[test]
+fn a_kept_features_buffer_takes_in_as_a_fresh_one() {
+    let fx = Fixture::new();
+    let c = TinyDraft::default();
+    let path = fx.gguf("d.gguf", &c);
+    let width = 64 * c.target_layers.len();
+    let max = c.block_size - 1;
+    let (ta, tb, tc) = (tokens_to(701), tokens_to(601), tokens_to(604));
+    // A prompt of two pieces (512 + 188 rows) fills the kept buffer; another sequence's
+    // prompt and a decode step after it take in through the same one.
+    let mut d = fx.load(&path, sampling(1024));
+    step(&mut d, 1, &ta, 0, 700, max, 0);
+    let kept = d.feats.as_ptr();
+    if keep_feats() {
+        assert_eq!(d.feats.capacity(), INGEST_CHUNK * width);
+    }
+    let b1 = step(&mut d, 2, &tb, 0, 600, max, 1);
+    let b2 = step(&mut d, 2, &tc, 600, 3, max, 1);
+    if keep_feats() {
+        assert_eq!(d.feats.as_ptr(), kept);
+    }
+    let mut fresh = fx.load(&path, sampling(1024));
+    assert_eq!(b1.probs, step(&mut fresh, 2, &tb, 0, 600, max, 1).probs);
+    assert_eq!(b2.probs, step(&mut fresh, 2, &tc, 600, 3, max, 1).probs);
+}
+
+#[test]
+fn empty_with_room_grows_by_replacing_and_never_shrinks() {
+    let mut v = vec![1.0f32; 3];
+    empty_with_room(&mut v, 2);
+    assert!(v.is_empty() && v.capacity() >= 3);
+    empty_with_room(&mut v, 100);
+    assert!(v.is_empty() && v.capacity() >= 100);
+    let (cap, at) = (v.capacity(), v.as_ptr());
+    v.extend_from_slice(&[2.0; 7]);
+    empty_with_room(&mut v, 10);
+    assert!(v.is_empty());
+    assert_eq!((v.capacity(), v.as_ptr()), (cap, at));
+}
+
+#[test]
 fn hugging_face_checkpoints_load_like_gguf() {
     let fx = Fixture::new();
     let c = TinyDraft::default();

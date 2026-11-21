@@ -231,10 +231,34 @@ pub struct DflashDrafter {
     /// The CUDA device its backend runs on (`None`: the CPU): a step's rows left in that
     /// device's memory are gathered by its take-in graph ([`ModelDrafter::step_device`]).
     device: Option<usize>,
+    /// The host features a take-in fills ([`Self::features`]), kept from one take-in to the
+    /// next and grown to the most it needed (#1133). A prompt's piece of [`INGEST_CHUNK`] rows
+    /// of every fused layer is tens of MB (512 × 5 × 5,376 floats, 55 MB), more than glibc
+    /// keeps on its heap: a fresh vector was mapped, faulted in and unmapped every prompt.
+    feats: Vec<f32>,
 }
 
 /// Most idle caches kept for the next sequences.
 const SPARE_CACHES: usize = 4;
+
+/// A take-in's host features go to the buffer the drafter keeps ([`DflashDrafter::feats`]);
+/// `LEGION_DEBUG_DFLASH_KEEP_FEATS=0`: a fresh vector every take-in, as before (A/B runs only;
+/// the same values either way).
+fn keep_feats() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_DFLASH_KEEP_FEATS").is_none_or(|v| v != "0"))
+}
+
+/// Empties `buf` with room for `n` values. One too small is replaced, not grown: growing would
+/// copy the old allocation, whose values are not needed. It never shrinks.
+fn empty_with_room(buf: &mut Vec<f32>, n: usize) {
+    buf.clear();
+    if buf.capacity() < n {
+        // The old one goes first: the two are never held together.
+        *buf = Vec::new();
+        *buf = Vec::with_capacity(n);
+    }
+}
 
 impl DflashDrafter {
     /// Loads the checkpoint at `target.draft` onto the target's device, and the token embeddings
@@ -457,6 +481,7 @@ impl DflashDrafter {
             pool: None,
             max_seqs: target.max_seqs.max(1),
             pool_failed: false,
+            feats: Vec::new(),
         })
     }
 
@@ -609,8 +634,13 @@ impl DflashDrafter {
         self.check_hidden(r, i, src)?;
         let mut cache = self.caches.remove(&r.seq).expect("made by cache_for");
         cache.rollback(r.start);
-        let (mut feats, mut idx) = (Vec::new(), Vec::new());
         let mut at = ingest_from(r.tokens.len(), r.start, r.ran, cache.window());
+        let piece = INGEST_CHUNK.min(r.ran.saturating_sub(at)) * self.feats_width();
+        let mut feats = match src {
+            Src::Host if keep_feats() => self.kept_feats(piece),
+            _ => Vec::new(),
+        };
+        let mut idx = Vec::new();
         let mut result = Ok(());
         while at < r.ran {
             let n = INGEST_CHUNK.min(r.ran - at);
@@ -631,7 +661,27 @@ impl DflashDrafter {
             at += n;
         }
         self.caches.insert(r.seq, cache);
+        self.keep_feats_buf(src, feats);
         result
+    }
+
+    /// Floats of one row of [`Self::features`] on the host: every fused layer's.
+    fn feats_width(&self) -> usize {
+        self.n_embd * self.model.cfg.target_layers.len()
+    }
+
+    /// The kept features buffer ([`Self::feats`]), empty, with room for `n` floats.
+    fn kept_feats(&mut self, n: usize) -> Vec<f32> {
+        let mut f = std::mem::take(&mut self.feats);
+        empty_with_room(&mut f, n);
+        f
+    }
+
+    /// Keeps a take-in's host features buffer for the next one (the larger, when it holds one).
+    fn keep_feats_buf(&mut self, src: Src<'_>, f: Vec<f32>) {
+        if matches!(src, Src::Host) && keep_feats() && f.capacity() >= self.feats.capacity() {
+            self.feats = f;
+        }
     }
 
     /// Takes in the target step's rows of every sequence of `batch`: in one graph when they fit
@@ -656,9 +706,8 @@ impl DflashDrafter {
                 .try_for_each(|i| self.ingest(&batch[i], i, src));
         }
         let mut feats = match src {
-            Src::Host => {
-                Vec::with_capacity(rows * self.n_embd * self.model.cfg.target_layers.len())
-            }
+            Src::Host if keep_feats() => self.kept_feats(rows * self.feats_width()),
+            Src::Host => Vec::with_capacity(rows * self.feats_width()),
             Src::Device(_) => Vec::new(),
         };
         let mut idx = Vec::with_capacity(rows);
@@ -695,6 +744,7 @@ impl DflashDrafter {
         for (&i, c) in take.iter().zip(caches) {
             self.caches.insert(batch[i].seq, c);
         }
+        self.keep_feats_buf(src, feats);
         result
     }
 
