@@ -576,6 +576,31 @@ fn dup_refill_reads_hot_experts_into_the_slots_vram_copies_hold() {
 }
 
 #[test]
+fn swap_read_takes_an_empty_then_the_coldest_unpinned_slot() {
+    use refill::plan_swap_read;
+    // Three slots: 1 and 2 cached (1 used first), slot 2 empty.
+    let mut cache = SlotCache::new(10, 3);
+    cache.plan(&[1]);
+    cache.plan(&[2]);
+    // Cached already, or a read of it under way: no new read.
+    assert_eq!(plan_swap_read(&mut cache, 1, false), None);
+    assert_eq!(plan_swap_read(&mut cache, 5, true), Some(None));
+    // The empty slot first, left empty and pinned.
+    assert_eq!(plan_swap_read(&mut cache, 5, false), Some(Some(2)));
+    assert_eq!(cache.slot(5), None);
+    // A new step: then the least recently used expert's slot (1's), not the pinned one.
+    cache.plan(&[]);
+    assert_eq!(plan_swap_read(&mut cache, 6, false), Some(Some(0)));
+    assert_eq!(cache.slot(1), None);
+    cache.pin(1, true);
+    // Every slot pinned: the swap copies now.
+    assert_eq!(plan_swap_read(&mut cache, 7, false), None);
+    // A landed read takes its slot, unpinned.
+    cache.put(5, 2);
+    assert_eq!(cache.slot(5), Some(2));
+}
+
+#[test]
 fn dup_refill_needs_ram_slots_for_half_the_experts() {
     use refill::dup_refill_ram;
     assert!(dup_refill_ram(320, 512));

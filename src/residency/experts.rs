@@ -1091,6 +1091,13 @@ pub struct ExpertResidency {
     tables_first: bool,
     /// The swaps planned this after-step whose copies start after the table write, per device.
     later: Vec<(usize, Vec<Swap>)>,
+    /// The bounded host tier's swaps (per device) whose new expert is being read into a RAM
+    /// slot in the background (#37 round 45, [`super::host_tier::HostTier::read_for_swap`]):
+    /// their copies start at the next after-step ([`Self::issue_deferred`]).
+    deferred: Vec<(usize, Swap)>,
+    /// [`super::host_tier::swap_overlap`] on a CUDA device, never with `settle`: 0 off, 1 the
+    /// deferred copies are waited for, 2 they land on their own.
+    swap_overlap: u8,
     /// The bounded host tier (#37) the layers' host parts are, if any: RAM slots and a staging
     /// buffer in place of every expert's host bytes. Last: dropped after the tiered ranges
     /// that map its memory.
@@ -2205,6 +2212,12 @@ impl ExpertResidency {
             laps: AfterLaps::default(),
             tables_first: std::env::var_os("LEGION_DEBUG_SWAP_COPIES_FIRST").is_none(),
             later: Vec::new(),
+            deferred: Vec::new(),
+            swap_overlap: if cfg.settles() {
+                0
+            } else {
+                super::host_tier::swap_overlap()
+            },
             cold: tier_prof.is_none(),
             split_misses: cfg.split_misses.clone(),
             swaps: 0,
@@ -3052,6 +3065,10 @@ impl ExpertResidency {
         count: bool,
     ) -> Result<(), String> {
         let swaps0 = self.swaps;
+        // The last after-step's swaps that read in the background start their copies (#37
+        // round 45), ahead of the completion below.
+        self.issue_deferred()?;
+        self.laps.lap("deferred");
         self.complete_copies(scope)?;
         self.laps.lap("complete");
         // Model bytes (#391): whether the pass gathered its experts or read staged copies.
@@ -3238,7 +3255,7 @@ impl ExpertResidency {
                 self.pace_swaps(d, cd, &swaps)?;
                 continue;
             }
-            self.issue_swaps(d, &swaps)?;
+            self.issue_swaps(d, &swaps, true)?;
         }
         self.laps.lap("later");
         self.laps.log((self.swaps - swaps0) as usize);
@@ -3416,14 +3433,48 @@ impl ExpertResidency {
             self.later.push((d, swaps));
             return Ok(());
         }
-        self.issue_swaps(d, &swaps)
+        self.issue_swaps(d, &swaps, true)
     }
 
-    /// Starts the copies of device `d`'s planned `swaps` (already out of the tables).
-    fn issue_swaps(&mut self, d: usize, swaps: &[Swap]) -> Result<(), String> {
+    /// Starts the copies of the swaps [`Self::issue_swaps`] left to their background reads
+    /// (#37 round 45), at the start of the after-step after theirs or before a lend: from the
+    /// RAM slots those reads filled (waiting for a read only if it has not landed), and with
+    /// `swap_overlap` 1 waits for the copies, so this after-step completes the slots and the
+    /// next step finds them filled, as it found them when the swap read and copied in its own
+    /// after-step. The slots stay out of the tables meanwhile, as any slot whose copy is under
+    /// way: the steps in between compute the same bits.
+    fn issue_deferred(&mut self) -> Result<(), String> {
+        if self.deferred.is_empty() {
+            return Ok(());
+        }
+        let all = std::mem::take(&mut self.deferred);
+        for d in 0..self.devices.len() {
+            let swaps: Vec<Swap> = all.iter().filter(|x| x.0 == d).map(|x| x.1).collect();
+            if !swaps.is_empty() {
+                self.issue_swaps(d, &swaps, false)?;
+            }
+        }
+        if self.swap_overlap == 1 {
+            self.sync_copies()?;
+        }
+        Ok(())
+    }
+
+    /// Starts the copies of device `d`'s planned `swaps` (already out of the tables). `defer`:
+    /// the bounded host tier's swaps whose new expert no RAM slot holds read it in the
+    /// background and wait in `deferred` (`swap_overlap`).
+    fn issue_swaps(&mut self, d: usize, swaps: &[Swap], defer: bool) -> Result<(), String> {
         let tier = self.host.clone();
+        let defer = defer && self.swap_overlap != 0 && self.devices[d].place.cuda.is_some();
+        let mut filled: Vec<(usize, u32)> = Vec::with_capacity(swaps.len());
         for s in swaps {
             match &tier {
+                // #37 round 45: the read runs while the next step computes; the copies start
+                // at the next after-step ([`Self::issue_deferred`]).
+                Some(h) if defer && h.read_for_swap(s.layer, s.new, s.old)? => {
+                    self.deferred.push((d, *s));
+                    continue;
+                }
                 // The bounded host tier: the dropped expert's bytes go to a RAM slot first,
                 // the new one's come from its RAM slot (or, read first, its staging place:
                 // those bytes only stay until the next read, so that copy is waited for).
@@ -3440,6 +3491,7 @@ impl ExpertResidency {
                 }
                 None => self.copy_from_host(s.layer, &[(s.slot, s.new)])?,
             }
+            filled.push((s.layer, s.slot));
         }
         if let Some(h) = &tier {
             h.swaps_queued();
@@ -3447,7 +3499,6 @@ impl ExpertResidency {
                 h.swaps_landed();
             }
         }
-        let filled: Vec<(usize, u32)> = swaps.iter().map(|s| (s.layer, s.slot)).collect();
         let dev = &mut self.devices[d];
         match dev.place.cuda {
             #[cfg(feature = "cuda")]
@@ -3748,6 +3799,9 @@ impl ExpertResidency {
             return Ok(());
         }
         let t0 = std::time::Instant::now();
+        // Swaps whose reads ran in the background (#37 round 45): copied now, so the syncs
+        // below take them in as any swap's.
+        self.issue_deferred()?;
         // The refilled layers, without the bounded host tier's RAM fill: it is done below for
         // the slots the lend keeps only ([`fill_below`]).
         #[cfg(feature = "cuda")]

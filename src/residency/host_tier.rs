@@ -52,7 +52,7 @@ use super::ssd_experts::io::{Group, Job, Pool, raw_pieces};
 mod passes;
 pub use passes::{PassGate, PassHook, PassRoute, PassSrc, release_arg, slot_learn, wait_arg};
 mod refill;
-pub use refill::dup_refill;
+pub use refill::{dup_refill, swap_overlap};
 
 #[cfg(test)]
 mod tests;
@@ -406,6 +406,8 @@ struct Counters {
     land_ns: AtomicU64,
     /// Experts read into RAM slots that held copies of VRAM experts ([`refill`]).
     dup_refills: AtomicU64,
+    /// VRAM swaps' new experts read in the background ([`HostTier::read_for_swap`]).
+    swap_reads: AtomicU64,
 }
 
 struct LayerMem {
@@ -1470,6 +1472,7 @@ impl Inner {
             landed = l(&c.landed),
             land_wait_s = l(&c.land_ns) as f64 / 1e9,
             dup_refills = l(&c.dup_refills),
+            swap_reads = l(&c.swap_reads),
             "host expert tier"
         );
     }

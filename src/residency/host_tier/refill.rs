@@ -16,6 +16,16 @@
 //! a staged pass drops the reads not started. The same bytes land wherever an expert is read
 //! from, so the outputs do not change. Only where the RAM slots hold at least half of each
 //! layer's experts ([`dup_refill_ram`]); `LEGION_DEBUG_DUP_REFILL=0` leaves the copies as before.
+//!
+//! The same reads carry a VRAM swap's new expert that no RAM slot holds (#37 round 45,
+//! [`HostTier::read_for_swap`]). Such a swap used to read it into a staging place and wait for
+//! the read and the copy in the after-step, one swap after the other: right after a lend on a
+//! 32 GB 4090 that was 30-90 ms in each of the first decode steps (the lend drops the VRAM
+//! tail, whose experts no RAM slot holds). Now the read runs in the background while the next
+//! step computes, into a RAM slot, and the swap's copies start at the start of the next
+//! after-step, from that slot (waiting for the read only if it has not landed). Those copies
+//! land on their own, as any copy from a RAM slot: the slot fills an after-step later than it
+//! did, and the steps in between leave it out of the tables, as any slot whose copy is under way.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -29,6 +39,24 @@ pub(super) struct Refill {
     pub expert: usize,
     pub slot: usize,
     pub group: Arc<Group>,
+    /// A VRAM swap's read ([`HostTier::read_for_swap`]), not a refill of a copy's slot.
+    pub swap: bool,
+}
+
+/// `LEGION_DEBUG_SWAP_OVERLAP`: `0` reads a VRAM swap's new expert that no RAM slot holds in
+/// the after-step, waiting for it, as before round 45; `1` reads it in the background as by
+/// default but waits for the swap's copies at the next after-step (the slot fills there, as
+/// before); anything else (the default): [`HostTier::read_for_swap`], and the copies land on
+/// their own, as any copy from a RAM slot (the slot fills an after-step later).
+pub fn swap_overlap() -> u8 {
+    static V: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *V.get_or_init(
+        || match std::env::var("LEGION_DEBUG_SWAP_OVERLAP").as_deref() {
+            Ok("0") => 0,
+            Ok("1") => 1,
+            _ => 2,
+        },
+    )
 }
 
 /// `LEGION_DEBUG_DUP_REFILL=0`: the RAM slots a restore's fill left holding copies of VRAM
@@ -72,6 +100,24 @@ pub(crate) fn plan_dup_refill(
     incoming.zip(victims).collect()
 }
 
+/// Where [`HostTier::read_for_swap`] reads a swap's `new` expert into `cache` (`flying`: a read
+/// of it is under way already): `None`, nowhere (a slot holds it, or every slot is pinned or
+/// the step's: the swap copies now); `Some(None)`, the read under way; `Some(Some(s))`, into
+/// slot `s`, taken empty and pinned ([`SlotCache::reserve`]).
+pub(crate) fn plan_swap_read(
+    cache: &mut SlotCache,
+    new: usize,
+    flying: bool,
+) -> Option<Option<usize>> {
+    if cache.slot(new).is_some() {
+        return None;
+    }
+    if flying {
+        return Some(None);
+    }
+    cache.reserve().map(Some)
+}
+
 impl Inner {
     /// Lands layer `il`'s refills that are done, after waiting for those of the experts `need`
     /// (moved ahead of every other queued read first): each expert goes into its RAM slot
@@ -110,7 +156,9 @@ impl Inner {
             let cache = &mut st.caches[il];
             if read && cache.slot(r.expert).is_none() && !st.in_vram[il][r.expert] {
                 cache.put(r.expert, r.slot);
-                self.counts.dup_refills.fetch_add(1, Ordering::Relaxed);
+                if !r.swap {
+                    self.counts.dup_refills.fetch_add(1, Ordering::Relaxed);
+                }
             } else {
                 cache.drop_slot(r.slot);
             }
@@ -176,8 +224,56 @@ impl HostTier {
                 expert: e,
                 slot: s,
                 group: inner.pool.submit_as(jobs, Class::Extra),
+                swap: false,
             });
         }
         Ok(pairs.len())
+    }
+
+    /// A VRAM swap of layer `il` that brings in `new` and drops `old` (#37 round 45): when no
+    /// RAM slot holds `new`, starts its read from the checkpoint into a RAM slot (an empty one,
+    /// else the coldest one no step or copy pins, [`SlotCache::reserve`]) behind every step's
+    /// own read, and returns `true`: the caller starts the swap's copies at the next
+    /// after-step, where [`Self::swap`] takes `new` from that slot (a step that wants `new`
+    /// meanwhile waits for this read instead of reading it again; a staged pass drops it if it
+    /// has not started, and then the swap reads `new` as before). `false`: `new` is in a RAM
+    /// slot, or every slot is pinned: swap now. Where the experts come from does not change
+    /// what the steps compute: the same bytes land in the same VRAM slot.
+    pub fn read_for_swap(&self, il: usize, new: u32, old: Option<u32>) -> Result<bool, String> {
+        let inner = &self.inner;
+        let mut st = inner.state.lock().unwrap();
+        let st = &mut *st;
+        inner.take_ahead(st, None)?;
+        inner.land_refills(st, il, &[])?;
+        let new = new as usize;
+        let flying = st.refills[il].iter().any(|r| r.expert == new);
+        let Some(to) = plan_swap_read(&mut st.caches[il], new, flying) else {
+            return Ok(false);
+        };
+        if let Some(s) = to {
+            let piece = read_piece();
+            let jobs: Vec<Job> = inner
+                .reads(il, new, To::Slot(s))
+                .into_iter()
+                .flat_map(|j| match j {
+                    Job::Raw { src, dst } => raw_pieces(src, dst, piece),
+                    j => vec![j],
+                })
+                .collect();
+            st.refills[il].push(Refill {
+                expert: new,
+                slot: s,
+                group: inner.pool.submit_as(jobs, Class::Ahead),
+                swap: true,
+            });
+            inner.counts.swap_reads.fetch_add(1, Ordering::Relaxed);
+        }
+        // As [`Self::swap`] has it: the dropped expert is no VRAM slot's from now on (its slot
+        // is out of the tables). `new` counts as in VRAM only once its copy is queued, so the
+        // read above lands in its RAM slot.
+        if let Some(o) = old {
+            st.in_vram[il][o as usize] = false;
+        }
+        Ok(true)
     }
 }
