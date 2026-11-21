@@ -331,6 +331,61 @@ pub(super) fn buffers_for(
     Ok(Some((cap, sets.max(old_sets))))
 }
 
+/// The buffers `have` (`(cap, sets)`, none yet: `None`) are after an exchange of `bytes` with
+/// `want` bytes reserved and `sets` buffer sets when no other is in flight ([`buffers_for`]).
+/// Folded over a graph's exchanges in any order it gives the buffers its run leaves at the most
+/// (#1133: what [`super::Comm::planned`] sizes them for at load).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(super) fn fold_need(
+    have: Option<(usize, usize)>,
+    bytes: usize,
+    want: usize,
+    sets: usize,
+) -> Option<(usize, usize)> {
+    match buffers_for(have, bytes, want, sets, false) {
+        Ok(Some(grown)) => Some(grown),
+        _ => have,
+    }
+}
+
+/// The larger of two ranks' planned buffers (`(cap, sets)` each, none: `None`), cap and sets
+/// apart: what every rank sizes its buffers for at load, so that they all grow (and register
+/// with their RDMA peers) at the same exchanges afterwards.
+pub(super) fn merge_planned(
+    a: Option<(usize, usize)>,
+    b: Option<(usize, usize)>,
+) -> Option<(usize, usize)> {
+    match (a, b) {
+        (Some((c0, s0)), Some((c1, s1))) => Some((c0.max(c1), s0.max(s1))),
+        (x, None) | (None, x) => x,
+    }
+}
+
+/// Marks a message of [`encode_planned`] ("TPBZ").
+const PLANNED_MAGIC: u32 = 0x5a42_5054;
+
+/// A rank's planned buffers ([`merge_planned`]) as its RDMA peers read them at load: the magic,
+/// the sets (0: none) and the cap in bytes.
+pub(super) fn encode_planned(p: Option<(usize, usize)>) -> [u8; 16] {
+    let (cap, sets) = p.unwrap_or((0, 0));
+    let mut b = [0u8; 16];
+    b[0..4].copy_from_slice(&PLANNED_MAGIC.to_le_bytes());
+    b[4..8].copy_from_slice(&(sets as u32).to_le_bytes());
+    b[8..16].copy_from_slice(&(cap as u64).to_le_bytes());
+    b
+}
+
+/// [`encode_planned`]'s message back.
+pub(super) fn decode_planned(b: &[u8; 16]) -> Result<Option<(usize, usize)>, String> {
+    let magic = u32::from_le_bytes(b[0..4].try_into().expect("4 bytes"));
+    if magic != PLANNED_MAGIC {
+        return Err("a peer's pinned buffer plan: the ranks are out of step".into());
+    }
+    let sets = u32::from_le_bytes(b[4..8].try_into().expect("4 bytes")) as usize;
+    let cap = u64::from_le_bytes(b[8..16].try_into().expect("8 bytes")) as usize;
+    Ok((sets > 0).then_some((cap, sets)))
+}
+
 #[cfg(feature = "cuda")]
 pub(super) mod cuda {
     use std::os::raw::{c_int, c_uint, c_void};
@@ -520,6 +575,130 @@ pub(super) mod cuda {
         }
         fn recv(&self, peer: usize, k: usize) -> usize {
             (self.nbuf + self.nbuf * peer + k) * self.cap
+        }
+    }
+
+    /// `comm`'s buffers of `nbuf` sets of `cap` bytes: on `flags` (the old buffers', else new
+    /// ones, which the readers are told of), registered with the RDMA peers for exchange `seq`
+    /// (every peer registers its own at the same exchange).
+    fn make(
+        comm: &super::super::Comm,
+        flags: Option<HostMem>,
+        cap: usize,
+        nbuf: usize,
+        seq: u32,
+    ) -> Result<Pinned, String> {
+        let (rank, n_ranks) = (comm.rank(), comm.n_ranks());
+        let flags = match flags {
+            Some(f) => f,
+            None => {
+                let f = HostMem::new(recv_flag(n_ranks))?;
+                let peers: Vec<usize> = (0..n_ranks)
+                    .filter(|&p| p != rank)
+                    .map(|p| f.host + recv_flag(p))
+                    .collect();
+                comm.add_gpu_flags(&peers);
+                f
+            }
+        };
+        let size = (nbuf + nbuf * n_ranks) * cap;
+        let data = HostMem::new(size)?;
+        // The RDMA peers write into it directly (nothing without them).
+        let mrs = comm.register_region(data.host, size, seq)?;
+        Ok(Pinned {
+            flags,
+            _mrs: mrs,
+            data,
+            cap,
+            nbuf,
+        })
+    }
+
+    /// Makes `comm`'s first buffers at load (#1133) for `planned` (`(cap, sets)`, the ranks'
+    /// [`super::merge_planned`]), so that the first long prompt does not grow them: the
+    /// allocation (`cudaHostAlloc`, its pages zeroed) and the registration with the RDMA peers
+    /// took ~2 s of its first chunk. Every rank calls it at the same point with the same
+    /// `planned`, before any exchange (each RDMA peer's registration message is read here).
+    /// Returns the bytes taken, `None` when there were buffers already or none are planned.
+    pub(crate) fn presize(
+        comm: &super::super::Comm,
+        planned: Option<(usize, usize)>,
+    ) -> Result<Option<usize>, String> {
+        let Some((cap, sets)) = planned else {
+            return Ok(None);
+        };
+        if !comm.in_flight.lock().expect("in-flight lock").is_empty() {
+            return Err("tp buffers at load: an exchange is in flight".into());
+        }
+        let mut guard = comm.pinned.lock().expect("pinned lock");
+        if guard.is_some() {
+            return Ok(None);
+        }
+        let Ok(Some((cap, nbuf))) = super::buffers_for(None, cap, cap, sets, false) else {
+            return Ok(None);
+        };
+        *guard = Some(make(comm, None, cap, nbuf, comm.issued())?);
+        Ok(Some((nbuf + nbuf * comm.n_ranks()) * cap))
+    }
+
+    /// Notes in its communicator what each exchange of `graph` needs of the pinned buffers, as
+    /// [`start`] sizes them for it ([`super::super::Comm::note_need`], #1133). Run on every
+    /// CUDA graph right after its allocation (`crate::ggml::post_alloc::set_note`): the steps
+    /// measured at load (the longest prompt step, a full decode and verify batch) give
+    /// [`presize`] its sizes.
+    ///
+    /// # Safety
+    /// A live graph.
+    pub(crate) unsafe fn note_graph(graph: *mut ffi::ggml_cgraph) {
+        // SAFETY: the caller's: a live graph whose node array holds `n` valid tensors.
+        let nodes = unsafe {
+            let n = ffi::ggml_graph_n_nodes(graph) as usize;
+            std::slice::from_raw_parts(ffi::ggml_graph_nodes(graph), n)
+        };
+        let mut last: Option<(i32, std::sync::Arc<super::super::Comm>)> = None;
+        for &t in nodes {
+            // SAFETY: a valid tensor of the graph.
+            let node = unsafe { &*t };
+            // SAFETY: as above.
+            let Some(op) = (unsafe { crate::ggml::op_of(node) }) else {
+                continue;
+            };
+            let kind = match op.name {
+                "tp_all_reduce" => Some(Kind::AllReduce),
+                "tp_reduce_scatter" => Some(Kind::ReduceScatter),
+                "tp_all_gather" => Some(Kind::AllGather),
+                "tp_micro_start" => None,
+                _ => continue,
+            };
+            let id = external_params(node)[0];
+            let comm = match &last {
+                Some((i, c)) if *i == id => c.clone(),
+                _ => match super::super::comm(id) {
+                    Some(c) => {
+                        last = Some((id, c.clone()));
+                        c
+                    }
+                    None => continue,
+                },
+            };
+            let plan = match kind {
+                // SAFETY: an exchange node of that kind, as `run` gets it.
+                Some(k) => unsafe { plain_plan(&comm, k, node) },
+                // SAFETY: a micro start node's source 0 is its source, as
+                // `launch_micro_start`'s.
+                None => unsafe {
+                    let m = crate::tp_net::micro::Params::of(node);
+                    micro_plan(&comm, &m, &*node.src[0])
+                },
+            };
+            let eb = plan.wire.bytes();
+            // As `start`'s sets.
+            let sets = if kind.is_none() || comm.overlap() != crate::tp_net::Overlap::Off {
+                4
+            } else {
+                2
+            };
+            comm.note_need(plan.span * eb, plan.reserve.max(plan.span) * eb, sets);
         }
     }
 
@@ -1126,29 +1305,21 @@ pub(super) mod cuda {
                         cudaStreamSynchronize(stream)
                     })?;
                     comm.wait_sent(seq.wrapping_sub(1))?;
-                    p.flags
+                    Some(p.flags)
                 }
-                None => {
-                    let f = HostMem::new(recv_flag(n_ranks))?;
-                    let peers: Vec<usize> = (0..n_ranks)
-                        .filter(|&p| p != rank)
-                        .map(|p| f.host + recv_flag(p))
-                        .collect();
-                    comm.add_gpu_flags(&peers);
-                    f
-                }
+                None => None,
             };
-            let size = (nbuf + nbuf * n_ranks) * cap;
-            let data = HostMem::new(size)?;
-            // The RDMA peers write into it directly (nothing without them).
-            let mrs = comm.register_region(data.host, size, seq)?;
-            *guard = Some(Pinned {
-                flags,
-                _mrs: mrs,
-                data,
-                cap,
-                nbuf,
-            });
+            let t = std::time::Instant::now();
+            *guard = Some(make(comm, flags, cap, nbuf, seq)?);
+            // Past the buffers made at load (`presize`): a step larger than the load measured.
+            tracing::debug!(
+                seq,
+                mib = ((nbuf + nbuf * n_ranks) * cap) >> 20,
+                buffer_mib = cap >> 20,
+                sets = nbuf,
+                seconds = format!("{:.2}", t.elapsed().as_secs_f64()),
+                "tensor parallelism over machines: pinned exchange buffers grew"
+            );
         }
         let p = guard.as_ref().expect("pinned buffers");
         let k = seq as usize % p.nbuf;

@@ -431,8 +431,13 @@ pub(super) fn check_exec(exec: &Executor, host_tier: bool) -> Result<(), LoadErr
 }
 
 /// Rank 0: connects to the other ranks once they have loaded and makes `exec` lead them.
-/// Returns the KV blocks every rank keeps (the fewest of any).
-pub(super) fn lead(exec: &mut Executor, start: Start, n_blocks: usize) -> Result<usize, LoadError> {
+/// Returns the KV blocks every rank keeps (the fewest of any) and the pinned exchange buffers
+/// made at load ([`tp_net::presize_buffers`]).
+pub(super) fn lead(
+    exec: &mut Executor,
+    start: Start,
+    n_blocks: usize,
+) -> Result<(usize, Option<tp_net::Presized>), LoadError> {
     let n_layer = exec.model().hp.n_layer;
     // Every rank's rings must hold rank 0's whole-image steps (#1217).
     let image_step = exec.image_step();
@@ -445,6 +450,7 @@ pub(super) fn lead(exec: &mut Executor, start: Start, n_blocks: usize) -> Result
         Ok(r) => Err(device(format!("rank {to} answered hello with {r:?}"))),
         Err(e) => Err(device(format!("rank {to}: {e}"))),
     };
+    let mut presized = None;
     let n = match start.via {
         Via::Net { cfg, comm, .. } => {
             let n = cfg.n_ranks();
@@ -453,13 +459,16 @@ pub(super) fn lead(exec: &mut Executor, start: Start, n_blocks: usize) -> Result
                 let s = tp_net::dial_control(&cfg, to, WAIT)
                     .map_err(|e| device(format!("rank {to}: {e}")))?;
                 let mut link = Link::over(s).map_err(|e| device(format!("rank {to}: {e}")))?;
-                hello(
-                    link.call(crate::node::tp_hello(n, to, n_layer, n_blocks, image_step)),
-                    to,
-                    &mut blocks,
-                )?;
+                link.send(crate::node::tp_hello(n, to, n_layer, n_blocks, image_step))
+                    .map_err(|e| device(format!("rank {to}: {e}")))?;
                 links.push(link);
             }
+            // Every rank makes its pinned exchange buffers on the hello, together (#1133).
+            let made = presize(comm.comm());
+            for (link, to) in links.iter_mut().zip(1..) {
+                hello(link.wait(), to, &mut blocks)?;
+            }
+            presized = made.map_err(device)?;
             serve_rows(exec, &cfg);
             let mut lead = TpLead::new(links, comm, cfg.profile);
             lead.set_mtp_chains(cfg.mtp_chain);
@@ -503,7 +512,23 @@ pub(super) fn lead(exec: &mut Executor, start: Start, n_blocks: usize) -> Result
         kv_cache_tokens = blocks * crate::model::core::KV_BLOCK,
         "tensor parallelism over machines: rank 0 leads"
     );
-    Ok(blocks)
+    Ok((blocks, presized))
+}
+
+/// This rank's part of [`tp_net::presize_buffers`] (#1133), logged.
+fn presize(comm: &tp_net::Comm) -> Result<Option<tp_net::Presized>, String> {
+    let made = tp_net::presize_buffers(comm).map_err(|e| format!("pinned TP buffers: {e}"))?;
+    if let Some(p) = made {
+        tracing::info!(
+            rank = comm.rank(),
+            mib = p.bytes >> 20,
+            buffer_mib = p.cap >> 20,
+            sets = p.sets,
+            seconds = format!("{:.2}", p.seconds),
+            "tensor parallelism over machines: pinned exchange buffers made for the largest step"
+        );
+    }
+    Ok(made)
 }
 
 /// A rank above 0: answers rank 0's requests with `exec` until rank 0 disconnects (the
@@ -740,6 +765,11 @@ fn handle(
             n_blocks,
             image_step,
         } => {
+            // With rank 0 and the other ranks, before anything else (#1133): rank 0 sent every
+            // rank its hello first.
+            if let Sums::Net(c) = comm {
+                presize(c.comm())?;
+            }
             crate::node::check_tp_hello((version, n_ranks, rank, n_layer), mine)?;
             let window = exec.model().hp.arch.swa_window();
             crate::node::check_tp_image_step(exec.kv_ring(), window, image_step as usize)?;

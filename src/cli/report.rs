@@ -436,6 +436,7 @@ fn host_use(h: &HostMemory) -> String {
         HostUse::HostWeights => "host weights",
         HostUse::KvHostTier => "KV host tier",
         HostUse::SavedStates => "pinned saved prefix-cache states",
+        HostUse::TpBuffers => "pinned TP exchange buffers",
     };
     match h.tokens {
         Some(t) => format!("{what} {} ({} tokens)", gib(h.bytes), count(t)),

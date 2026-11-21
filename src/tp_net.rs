@@ -444,6 +444,56 @@ pub(crate) fn comm(id: i32) -> Option<Arc<Comm>> {
     c.get(usize::try_from(id).ok()?).cloned().flatten()
 }
 
+/// The pinned exchange buffers [`presize_buffers`] made at load.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Presized {
+    /// Bytes taken (every buffer set's send and receive buffers).
+    pub bytes: usize,
+    /// Bytes per buffer.
+    pub cap: usize,
+    /// Buffer sets.
+    pub sets: usize,
+    /// The plans' swap, the allocation and the registration with the RDMA peers.
+    pub seconds: f64,
+}
+
+/// Makes `comm`'s pinned exchange buffers at load (#1133), as large as the CUDA graphs
+/// allocated so far need ([`Comm::planned`]: the load measures the longest prompt step and a
+/// full decode and verify batch), the largest of every rank's plan, so that the first long
+/// prompt does not grow them (a step bigger than those still grows them, as before). Every
+/// rank calls it once, at the same point (rank 0 after it sent its hello, the others on the
+/// hello), before any step: the ranks swap plans and memory regions here. `None`: nothing
+/// planned (no CUDA graph, a pair over NVLink) or buffers made already.
+pub fn presize_buffers(comm: &Comm) -> Result<Option<Presized>, String> {
+    let t = Instant::now();
+    let planned = comm.agree_planned(comm.planned())?;
+    #[cfg(feature = "cuda")]
+    let bytes = op::cuda::presize(comm, planned)?;
+    #[cfg(not(feature = "cuda"))]
+    let bytes: Option<usize> = None;
+    Ok(bytes.zip(planned).map(|(bytes, (cap, sets))| Presized {
+        bytes,
+        cap: cap.next_multiple_of(1 << 20),
+        sets: sets.max(2),
+        seconds: t.elapsed().as_secs_f64(),
+    }))
+}
+
+/// The look at every CUDA graph just allocated ([`crate::ggml::post_alloc::set_note`]) that
+/// notes what its exchanges need of the pinned buffers ([`presize_buffers`]).
+///
+/// # Safety
+/// A live graph.
+pub(crate) unsafe fn note_graph(graph: *mut crate::ggml::ffi::ggml_cgraph) {
+    // SAFETY: the caller's.
+    #[cfg(feature = "cuda")]
+    unsafe {
+        op::cuda::note_graph(graph)
+    }
+    #[cfg(not(feature = "cuda"))]
+    let _ = graph;
+}
+
 /// A registered communicator: ops find it by [`Self::id`]; dropping the handle unregisters it
 /// and stops its threads.
 pub struct CommHandle {

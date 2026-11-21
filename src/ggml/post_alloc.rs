@@ -44,6 +44,15 @@ pub fn set_order(f: Rewrite) {
     let _ = ORDER.set(f);
 }
 
+static NOTE: OnceLock<Rewrite> = OnceLock::new();
+
+/// Sets a look at every CUDA graph allocated from now on, after [`set_rewrite`]'s pass (the
+/// first call wins). It changes nothing in the graph (#1133: the pinned buffers its
+/// tensor-parallel exchanges need, `tp_net::op::cuda::note_graph`).
+pub fn set_note(f: Rewrite) {
+    let _ = NOTE.set(f);
+}
+
 /// Whether graphs allocated in `buft` are computed by ggml's CUDA backend: device memory of a
 /// CUDA device (not pinned host memory, not a split or meta buffer).
 fn is_cuda(buft: BufferType) -> bool {
@@ -65,6 +74,12 @@ pub(crate) unsafe fn run(graph: *mut ffi::ggml_cgraph, buft: BufferType) {
         unsafe { f(graph) }
     }
     if let Some(f) = REWRITE.get()
+        && is_cuda(buft)
+    {
+        // SAFETY: the caller's.
+        unsafe { f(graph) }
+    }
+    if let Some(f) = NOTE.get()
         && is_cuda(buft)
     {
         // SAFETY: the caller's.

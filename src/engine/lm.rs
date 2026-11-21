@@ -3633,6 +3633,8 @@ struct LoadFacts<'a> {
     engram: Option<report::NgramPlacement>,
     /// Saved prefix-cache states in pinned host memory, all stages.
     saved_host_bytes: u64,
+    /// Tensor parallelism over machines: the pinned exchange buffers made at load (#1133).
+    tp_buffer_bytes: u64,
 }
 
 /// Where a load put everything: the layout's stages and weight bytes, the KV pools and host
@@ -3782,6 +3784,7 @@ fn load_report(
         }
     }
     add_host(&mut host, None, HostUse::SavedStates, f.saved_host_bytes);
+    add_host(&mut host, None, HostUse::TpBuffers, f.tp_buffer_bytes);
     host.sort_by_key(|h| (h.node.is_none(), h.node, h.kind));
     let types = exec.kv_types();
     report::LoadReport {
@@ -5743,6 +5746,7 @@ impl LmEngine {
         }
         // Tensor parallelism over machines (#619): the ranks above 0 run rank 0's steps from
         // here on; rank 0 connects to them, and every rank keeps the fewest KV blocks.
+        let mut tp_buffer_bytes = 0u64;
         if let Some(start) = tp_start.take() {
             // `--tp-per-gpu`'s ranks keep host tiers of their own (#1131): each reads its own
             // blocks past the device's in its steps, as one GPU alone does.
@@ -5761,7 +5765,8 @@ impl LmEngine {
                     drafter,
                 ));
             }
-            let blocks = tp_node::lead(&mut exec, start, n_blocks)?;
+            let (blocks, presized) = tp_node::lead(&mut exec, start, n_blocks)?;
+            tp_buffer_bytes = presized.map_or(0, |p| p.bytes as u64);
             n_blocks = n_blocks.min(blocks);
             hbm_blocks = hbm_blocks.min(blocks);
         }
@@ -5814,6 +5819,7 @@ impl LmEngine {
                 ngram,
                 engram,
                 saved_host_bytes,
+                tp_buffer_bytes,
             },
         );
         log_memory_plan(
