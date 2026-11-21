@@ -281,6 +281,34 @@ fn use_device(device: usize) -> Result<(), String> {
     }
 }
 
+/// Makes `device` current on this thread until dropped, then the device that was current
+/// before (#125). ggml frees a buffer from whatever thread drops it (a graph rebuild, a meta
+/// device over several GPUs), and its own CUDA buffers' free leaves the current device alone;
+/// ours sync and release on their own device, then put the caller's back. (The set, get and
+/// clear callbacks make their device current and leave it, as ggml-cuda's do.)
+struct OnDevice(Option<c_int>);
+
+impl OnDevice {
+    fn new(device: usize) -> Self {
+        let mut was: c_int = -1;
+        // SAFETY: plain runtime calls; the first writes one int.
+        unsafe {
+            let had = cudaGetDevice(&mut was) == 0 && was >= 0;
+            cudaSetDevice(device as c_int);
+            Self((had && was != device as c_int).then_some(was))
+        }
+    }
+}
+
+impl Drop for OnDevice {
+    fn drop(&mut self) {
+        if let Some(was) = self.0 {
+            // SAFETY: a plain runtime call.
+            unsafe { cudaSetDevice(was) };
+        }
+    }
+}
+
 /// Memory calls at least this slow are logged (debug). #450: they take milliseconds, but each
 /// waits for the driver's global lock, which another process pinning host memory (a model
 /// loading) holds for seconds; every call of ours then takes tens of milliseconds.
@@ -1609,14 +1637,17 @@ fn tiered_ctx<'a>(buffer: ffi::ggml_backend_buffer_t) -> &'a TieredBuffer {
 unsafe extern "C" fn tiered_free(buffer: ffi::ggml_backend_buffer_t) {
     let b = tiered_ctx(buffer);
     let n = b.vram_bytes + b.host_bytes;
+    // As it was: its own device for the sync and the release, the caller's back after them.
+    let mut on = None;
     // SAFETY: no kernel may still read the range.
     if !SYNCED.with(|s| s.get()) {
+        on = Some(OnDevice::new(b.device));
         timed("cudaDeviceSynchronize", b.device, n, || unsafe {
-            cudaSetDevice(b.device as c_int);
             cudaDeviceSynchronize();
         });
     }
     timed("release range", b.device, n, || b.release());
+    drop(on);
     // SAFETY: frees the box handed to ggml in `tiered`.
     drop(unsafe { Box::from_raw((*buffer).context as *mut TieredBuffer) });
 }

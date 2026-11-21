@@ -279,7 +279,8 @@ unsafe extern "C" fn tier_free(buffer: ffi::ggml_backend_buffer_t) {
     // SAFETY: no kernel may still read the range; then frees the box handed to ggml.
     unsafe {
         if !b.alias {
-            cudaSetDevice(b.device as c_int);
+            // The caller's device back after the release (#125).
+            let _on = OnDevice::new(b.device);
             cudaDeviceSynchronize();
             b.release();
         }

@@ -43,6 +43,9 @@ pub struct MockConfig {
     /// Sequences decoded together; the rest wait in the queue.
     pub max_batch: usize,
     pub context_length: u32,
+    /// The KV cache's tokens: a request whose prompt and `max_tokens` need more fails with
+    /// [`EngineError::KvOverflow`], as the model engine's does. `None`: no such limit.
+    pub kv_tokens: Option<u32>,
     /// Requests allowed to wait for a batch slot. When this many are queued (not yet
     /// admitted), `generate` fails with [`EngineError::Overloaded`]. A waiting request that
     /// is cancelled frees its slot when the loop next sweeps the queue (once per step).
@@ -62,6 +65,7 @@ impl Default for MockConfig {
             step: Duration::from_millis(5),
             max_batch: 64,
             context_length: 32768,
+            kv_tokens: None,
             max_waiting: 1024,
             vision: true,
             sampling: Default::default(),
@@ -215,6 +219,15 @@ impl Engine for MockEngine {
                 prompt: prompt_tokens,
                 context: self.cfg.context_length,
             });
+        }
+        if let Some(holds) = self.cfg.kv_tokens {
+            let need = prompt_tokens as usize + req.max_tokens as usize;
+            if need > holds as usize {
+                return Err(EngineError::KvOverflow {
+                    need,
+                    holds: holds as usize,
+                });
+            }
         }
         let tool_call = match &req.prompt {
             Prompt::Chat { tools, .. } if last_role == Some(Role::User) => {

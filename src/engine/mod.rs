@@ -269,6 +269,11 @@ pub enum EngineError {
     InvalidRequest(String),
     #[error("prompt is {prompt} tokens, the context is {context}")]
     ContextOverflow { prompt: u32, context: u32 },
+    /// The prompt and `max_tokens` need more KV cache than the whole pool holds.
+    #[error(
+        "the request needs {need} KV cache tokens (prompt + max_tokens), the cache holds {holds}"
+    )]
+    KvOverflow { need: usize, holds: usize },
     #[error("server is overloaded, try again later")]
     Overloaded,
     #[error("{0}")]

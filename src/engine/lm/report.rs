@@ -207,3 +207,30 @@ pub(super) fn add_host(host: &mut Vec<HostMemory>, node: Option<u32>, kind: Host
         }),
     }
 }
+
+/// Adds the expert cache's slots to `stages`: each entry `(layer, CUDA device, slots, bytes)`
+/// ([`crate::residency::experts::ExpertResidency::layer_slots`]) under the stage on the GPU
+/// that holds it (`stage_cuda`: each stage's CUDA index), else under its layer's stage
+/// (`stage_of`). `--pair-tp`'s copies are entries past the model's layers on the pair's
+/// other GPU, which `stage_of` alone put all on the last stage (#125).
+pub(super) fn add_expert_slots(
+    stages: &mut [StageMemory],
+    stage_cuda: &[Option<usize>],
+    entries: &[(usize, Option<usize>, usize, u64)],
+    stage_of: impl Fn(usize) -> usize,
+) {
+    for &(il, cuda, slots, bytes) in entries {
+        let si = cuda
+            .and_then(|c| stage_cuda.iter().position(|&s| s == Some(c)))
+            .unwrap_or_else(|| stage_of(il));
+        let Some(s) = stages.get_mut(si) else {
+            continue;
+        };
+        s.expert_layers += 1;
+        s.expert_slots += slots;
+        s.expert_slot_bytes += bytes;
+    }
+}
+
+#[cfg(test)]
+mod tests;

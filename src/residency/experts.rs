@@ -2625,8 +2625,10 @@ impl ExpertResidency {
         s
     }
 
-    /// Per tiered layer: (layer id, slots, bytes its slots take).
-    pub fn layer_slots(&self) -> Vec<(usize, usize, u64)> {
+    /// Per tiered layer: (layer id, the CUDA device (ggml index) whose memory holds its slots
+    /// (`None` on the CPU backend), slots, bytes its slots take). Expert parallelism's copies
+    /// (`--pair-tp`) are entries past the model's layers, on their own GPU.
+    pub fn layer_slots(&self) -> Vec<(usize, Option<usize>, usize, u64)> {
         self.layers
             .iter()
             .enumerate()
@@ -2635,6 +2637,7 @@ impl ExpertResidency {
                 let n = l.slots.n_slots();
                 Some((
                     il,
+                    self.devices[l.dev].place.cuda,
                     n,
                     n as u64 * l.expert_bytes.iter().sum::<usize>() as u64,
                 ))
@@ -2646,9 +2649,8 @@ impl ExpertResidency {
     /// by index (for the load's memory plan). Layers on the CPU backend are left out.
     pub fn slot_bytes_by_cuda(&self) -> Vec<(usize, u64)> {
         let mut out: std::collections::BTreeMap<usize, u64> = Default::default();
-        for (il, _, bytes) in self.layer_slots() {
-            let dev = self.layers[il].as_ref().map(|l| l.dev);
-            if let Some(cuda) = dev.and_then(|d| self.devices[d].place.cuda) {
+        for (_, cuda, _, bytes) in self.layer_slots() {
+            if let Some(cuda) = cuda {
                 *out.entry(cuda).or_default() += bytes;
             }
         }

@@ -633,9 +633,11 @@ unsafe extern "C" fn vmm_free(buffer: ffi::ggml_backend_buffer_t) {
     let b = vmm_buffer(buffer);
     // SAFETY: no kernel may still read the range; then frees the box handed to ggml.
     unsafe {
-        cudaSetDevice(b.device as c_int);
+        // The caller's device back after the release (#125).
+        let on = OnDevice::new(b.device);
         cudaDeviceSynchronize();
         b.release();
+        drop(on);
         drop(Box::from_raw((*buffer).context as *mut VmmBuffer));
     }
 }

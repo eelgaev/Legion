@@ -25,6 +25,8 @@ fn json_overrides_thinking_and_template_kwargs() {
         ),
         grammars: Mutex::new(GrammarCache::default()),
         ctx_size: 128,
+        kv_blocks: 2,
+        spec_k: 0,
         max_waiting: 1,
         queued: Default::default(),
         live: Default::default(),

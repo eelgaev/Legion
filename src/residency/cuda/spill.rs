@@ -234,12 +234,14 @@ fn spill_wrap(
 
 unsafe extern "C" fn spill_free(buffer: ffi::ggml_backend_buffer_t) {
     let b = spill_ctx(buffer);
+    // Its own device for the sync and the release, the caller's back after them.
+    let on = OnDevice::new(b.device);
     // SAFETY: no kernel may still use the range.
     timed("cudaDeviceSynchronize", b.device, b.size, || unsafe {
-        cudaSetDevice(b.device as c_int);
         cudaDeviceSynchronize();
     });
     timed("release range", b.device, b.size, || b.release());
+    drop(on);
     // SAFETY: frees the box handed to ggml in `spill_wrap`.
     drop(unsafe { Box::from_raw((*buffer).context as *mut SpillBuffer) });
 }

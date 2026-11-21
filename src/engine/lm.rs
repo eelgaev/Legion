@@ -34,6 +34,7 @@ mod first_rows;
 mod fit;
 mod host_tier;
 mod host_time;
+mod kv_fit;
 mod kv_vmm;
 mod layout;
 mod mtp_ngram;
@@ -1651,6 +1652,10 @@ pub struct LmEngine {
     chat_format: ChatFormat,
     grammars: Mutex<GrammarCache>,
     ctx_size: usize,
+    /// The KV pool's blocks and the drafts per verify step, as the worker's admission counts
+    /// them ([`kv_fit`]): a request that can never fit is refused before it queues.
+    kv_blocks: usize,
+    spec_k: usize,
     max_waiting: usize,
     /// Requests submitted and not yet admitted.
     queued: Arc<AtomicUsize>,
@@ -3710,15 +3715,15 @@ fn load_report(
         };
         if let Some(r) = exec.experts_mut() {
             let layers = r.layer_slots();
-            for &(il, slots, bytes) in &layers {
-                let s = &mut stages[layout.stage_of(il)];
-                s.expert_layers += 1;
-                s.expert_slots += slots;
-                s.expert_slot_bytes += bytes;
-            }
+            let stage_cuda: Vec<Option<usize>> = layout
+                .stages
+                .iter()
+                .map(|(d, _)| d.and_then(cuda_index))
+                .collect();
+            report::add_expert_slots(&mut stages, &stage_cuda, &layers, |il| layout.stage_of(il));
             summary.cached_layers = layers.len();
-            summary.slots_min = layers.iter().map(|l| l.1).min().unwrap_or(0);
-            summary.slots_max = layers.iter().map(|l| l.1).max().unwrap_or(0);
+            summary.slots_min = layers.iter().map(|l| l.2).min().unwrap_or(0);
+            summary.slots_max = layers.iter().map(|l| l.2).max().unwrap_or(0);
             // Staging VRAM by CUDA index; the stages run on CUDA0, CUDA1, ... in order.
             for (cuda, bytes) in r.stage_bytes() {
                 if let Some(s) = stages.get_mut(cuda) {
@@ -6085,6 +6090,7 @@ impl LmEngine {
             outbox: stream::Outbox::new(tokenizer.clone(), cfg.stream_thread_seqs),
         };
         let live = worker.outbox.live();
+        let (kv_blocks, spec_k) = (worker.pool_blocks(), worker.spec_k);
         let worker = std::thread::Builder::new()
             .name("legion-qwen35".into())
             .spawn(move || {
@@ -6116,6 +6122,8 @@ impl LmEngine {
             chat_format,
             grammars: Mutex::new(GrammarCache::default()),
             ctx_size: cfg.ctx_size,
+            kv_blocks,
+            spec_k,
             max_waiting: cfg.max_waiting,
             queued: Arc::new(AtomicUsize::new(0)),
             live,
@@ -6240,6 +6248,15 @@ impl LmEngine {
                 context: self.ctx_size as u32,
             });
         }
+        // Nor one whose prompt and `max_tokens` need more KV cache than the pool holds: the
+        // worker's admission would refuse it after it queued (#125).
+        kv_fit::check(
+            prompt.len(),
+            req.max_tokens,
+            self.ctx_size,
+            self.spec_k,
+            self.kv_blocks,
+        )?;
         // The images through the vision tower, once the request is known to fit.
         let media = match &self.vision {
             Some(v) if !images.is_empty() => Some(v.encode(&prompt, images, || self.idle())?),
@@ -6942,16 +6959,16 @@ impl Worker {
         slot: usize,
     ) -> Admission<'t> {
         let len = job.prompt.len();
-        let max_len = (len + job.max_tokens as usize).min(self.max_ctx);
-        // A verify step writes up to k positions past the last one kept.
-        let need = (max_len + self.spec_k).div_ceil(KV_BLOCK);
-        if need > self.pool_blocks() {
-            let e = format!(
-                "the sequence needs {} KV cache tokens, the cache holds {}",
-                need * KV_BLOCK,
-                self.pool_blocks() * KV_BLOCK
-            );
-            return Admission::Failed(job, e);
+        // `LmEngine::prepare` refused a request this large already; this stays as the guard.
+        let need = kv_fit::blocks(len, job.max_tokens, self.max_ctx, self.spec_k);
+        if let Err(e) = kv_fit::check(
+            len,
+            job.max_tokens,
+            self.max_ctx,
+            self.spec_k,
+            self.pool_blocks(),
+        ) {
+            return Admission::Failed(job, e.to_string());
         }
         let take = self.admit_blocks(len, need);
         let Placed {

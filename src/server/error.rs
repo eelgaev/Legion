@@ -113,9 +113,9 @@ impl From<EngineError> for ApiError {
     fn from(e: EngineError) -> Self {
         let kind = match &e {
             EngineError::ModelNotFound(_) => ErrorKind::NotFound,
-            EngineError::InvalidRequest(_) | EngineError::ContextOverflow { .. } => {
-                ErrorKind::InvalidRequest
-            }
+            EngineError::InvalidRequest(_)
+            | EngineError::ContextOverflow { .. }
+            | EngineError::KvOverflow { .. } => ErrorKind::InvalidRequest,
             EngineError::Overloaded => ErrorKind::Overloaded,
             EngineError::Internal(_) => ErrorKind::Internal,
         };
