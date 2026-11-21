@@ -87,10 +87,13 @@ after / before): prefill 8K 2,418-2,447 / 2,542-2,575, 2,535-2,583 / 2,404-2,451
 not change (1 user 48.5-48.7, 4 users 126.8-127.7, 16 users 270.3-273.1), and text and log probabilities are the
 same bits.
 
-Half 1's FFN then runs in two parts, three quarters and a quarter of its tokens, so the last sum of each layer
-that travels with nothing left to compute is a quarter of the halves' (#1133, no flag, same bits; parts under
-512 tokens are not made: a 4K step's half 1 goes in 1,536 + 512). `LEGION_DEBUG_QWEN35_TP_PARTS=2` on both ranks
-goes back to the halves.
+Half 1's FFN then runs in three parts, 5/8, 1/4 and 1/8 of its tokens, so the last sum of each layer that travels
+with nothing left to compute is an eighth of the halves' (#1133, no flag; an 8K step goes 4,096 + 2,560 + 1,024 +
+512, and parts under 512 tokens are not made: a 4K step's half 1 goes in 1,536 + 512). With the command above,
+two sessions in ABBA order, a fresh server per arm (halves = `LEGION_DEBUG_QWEN35_TP_PARTS=2` on both ranks):
+prefill 8K about 3,050 -> 3,255 tok/s (+6.7%) and 32K about 2,848 -> 3,028 (+6.4%); half 1 in two parts (`=3`)
+gets 3,225 and 2,990. Decode does not change (1 user 49.2-50.1 in every arm), and the output is the same bits: the
+same log probabilities for 8K and 32K prompts and the same 1-user text.
 
 Optional, output-moving: `--tp-wire bf16` on both ranks sends sums of at least 1 MiB in BF16, half the bytes:
 prompt steps, the 16-user verify steps and short prompts (all ranks still agree). On top of the command above

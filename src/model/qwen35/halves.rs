@@ -8,7 +8,7 @@
 //! The FFN runs on half 0 whole and on half 1 in [`plan`]'s parts, the last of them small: the
 //! last part's sum travels while the GPU has nothing left to do in the layer, so a small last
 //! part leaves less of the wire time in sight (an 8K step over two DGX Sparks: half 1 in
-//! 3,072 + 1,024 tokens, its last sum a quarter of the halves' last one). The mixer sum stays
+//! 2,560 + 1,024 + 512 tokens, its last sum an eighth of the halves' last one). The mixer sum stays
 //! in two halves: the output projection writes both straight into the send buffer
 //! ([`micro::send_gemm`]), which needs every start of it right behind it, and at most two
 //! exchanges are in flight.
@@ -38,8 +38,10 @@ pub(super) const TP_PART_MIN: i64 = 512;
 /// The most FFN parts a step takes ([`parts`]).
 pub(super) const TP_PARTS_MAX: usize = 4;
 
-/// FFN parts by default ([`parts`]): half 0, and half 1 in two.
-const TP_PARTS: usize = 3;
+/// FFN parts by default ([`parts`]): half 0, and half 1 in three (5/8, 1/4 and 1/8 of it).
+/// Over two DGX Sparks an 8K prompt step's prefill gains ~6.7% on the halves, a 32K prompt's
+/// ~6.4%, and half 1 in two (`3`) ~5.8% and ~5.1%.
+const TP_PARTS: usize = 4;
 
 /// The FFN weights of a layer that runs in parts ([`ffn_fits`]).
 const FFN: [&str; 3] = ["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"];

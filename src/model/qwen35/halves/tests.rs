@@ -9,15 +9,16 @@ fn halves_are_on_unless_the_debug_variable_is_0() {
     assert_eq!(FFN, ["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"]);
 }
 
-/// Three FFN parts by default; `LEGION_DEBUG_QWEN35_TP_PARTS=2` the halves, at most four.
+/// Four FFN parts by default; `LEGION_DEBUG_QWEN35_TP_PARTS=2` the halves, at most four.
 #[test]
 fn parts_default_to_three_and_stay_in_range() {
-    assert_eq!(parts_of(None), 3);
+    assert_eq!(parts_of(None), 4);
+    assert_eq!(parts_of(Some("3")), 3);
     assert_eq!(parts_of(Some("2")), 2);
     assert_eq!(parts_of(Some(" 4 ")), 4);
     assert_eq!(parts_of(Some("1")), 2);
     assert_eq!(parts_of(Some("9")), TP_PARTS_MAX);
-    assert_eq!(parts_of(Some("x")), 3);
+    assert_eq!(parts_of(Some("x")), 4);
 }
 
 /// Half 0 whole, half 1 with its smallest part last; the parts cover the step once, in order.
