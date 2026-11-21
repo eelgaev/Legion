@@ -206,6 +206,18 @@ pub(super) fn rows_from() -> bool {
     *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_TP_ROWS_FROM").is_none_or(|v| v != "0"))
 }
 
+/// Under `--tp-draft-split` a decode or verify step leaves its captured rows on the device on
+/// every rank, where each rank's share of the DFlash drafter takes them in (`TpStep`'s
+/// `draft_dev`, #1133), as one GPU does (#1181); `LEGION_DEBUG_TP_DRAFT_DEVICE_ROWS=0` on rank
+/// 0 turns that off (for A/B runs only: every rank then reads them back and its drafter
+/// uploads the rows it takes in, as before).
+pub(super) fn draft_device_rows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("LEGION_DEBUG_TP_DRAFT_DEVICE_ROWS").is_none_or(|v| v != "0")
+    })
+}
+
 impl Drop for TpLead {
     fn drop(&mut self) {
         // Rank 1 stops when its link closes; wait for it to free its GPU's memory, which it
@@ -472,6 +484,8 @@ impl Executor {
             rows_dev,
             // Kept by [`Executor::step`] only with [`rows_from`] on.
             rows_from: self.hidden_from as u64,
+            // Kept by [`Executor::step`] only for the drafter's split ([`draft_device_rows`]).
+            draft_dev: self.hidden_on_device.is_some() && self.hidden_dev_from.is_none(),
         };
         let lead = self.tp.as_mut().expect("tensor-parallel lead");
         lead.step_dev = None;
@@ -659,6 +673,18 @@ impl Executor {
         }
         lead.failed()?;
         out
+    }
+
+    /// Whether the next step leaves its captured rows on the device for the DFlash drafter as
+    /// asked ([`Executor::set_hidden_on_device`] without [`Executor::set_hidden_on_device_from`],
+    /// a decode or verify step's), every rank alike: with `--tp-draft-split`, where every
+    /// rank's share of the drafter takes them in ([`draft_device_rows`], #1133). Without the
+    /// split they are read back, as before.
+    pub(super) fn tp_keeps_draft_rows(&self) -> bool {
+        self.hidden_on_device.is_some()
+            && self.hidden_dev_from.is_none()
+            && self.tp.as_ref().is_some_and(|l| l.draft_split)
+            && draft_device_rows()
     }
 
     /// Sends a DFlash draft round to the other ranks before this rank runs it, when each holds

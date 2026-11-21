@@ -72,6 +72,7 @@ fn requests_round_trip() {
             head: 2,
             rows_dev: 4_536,
             rows_from: 12_288,
+            draft_dev: true,
         },
         Request::SaveRing {
             ring: 4,
