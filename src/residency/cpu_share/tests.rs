@@ -609,7 +609,8 @@ fn share_keeps_the_plain_layout() {
     // `share`: None for the share-off path, else whether the share is exact.
     let layout = |share: Option<bool>, preq: bool| {
         let b = Backend::cpu().unwrap();
-        let weights = Context::new(9, 0);
+        // Three layers' gate/up/down stacks and the ids' places.
+        let weights = Context::new(3 * 3 + 1, 0);
         let stacks: Vec<_> = (0..3)
             .map(|_| {
                 [
@@ -707,7 +708,8 @@ fn shexp_moves_into_its_region() {
     };
     for mode in [ShexpAt::After, ShexpAt::BeforeDown, ShexpAt::BeforeGlu] {
         let b = Backend::cpu().unwrap();
-        let weights = Context::new(16, 0);
+        // Three layers' six weights each and the ids' places.
+        let weights = Context::new(3 * 6 + 1, 0);
         let stacks: Vec<_> = (0..3)
             .map(|_| {
                 [
