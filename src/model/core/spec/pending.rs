@@ -87,6 +87,11 @@ impl Pending {
         (0..self.keep.len()).map(|s| self.word(s)).collect()
     }
 
+    /// Whether verify steps may leave the states as they are ([`Self::with_room`]'s `leave`).
+    pub(super) fn may_leave(&self) -> bool {
+        self.leave
+    }
+
     /// Whether any slot's state waits for a deferred commit.
     pub(super) fn any(&self) -> bool {
         self.keep.iter().any(|&k| k > 0)

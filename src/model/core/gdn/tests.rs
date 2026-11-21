@@ -539,6 +539,123 @@ fn cpu_rows_replay_leaves_the_states_it_may() {
     }
 }
 
+/// A verify step's fused replay against the same step whose deferred commits ran first on their
+/// own (#1176: in an exchange's wait, [`commit_replay_beside`], or [`commit_replay`] with
+/// `beside` false) and whose fused verify then reads zero count words: `[fused, committed
+/// first]`, each `[rows, states, packed rows]`. `nt` packed rows per slot, `nt2` tokens a step.
+fn run_committed_first(
+    backend: &mut Backend,
+    (h, nk, nt, nt2): (i64, i64, i64, i64),
+    keep: &[i32],
+    beside: bool,
+) -> [[Vec<f32>; 3]; 2] {
+    let ns = keep.len() as i64;
+    let data = Context::new(32, 0);
+    let t = |ne: &[i64]| data.new_tensor(types::F32, ne);
+    let [q, k, v, g, beta] = [
+        t(&[S, nk, nt2, ns]),
+        t(&[S, nk, nt2, ns]),
+        t(&[S, h, nt2, ns]),
+        t(&[1, h, nt2, ns]),
+        t(&[1, h, nt2, ns]),
+    ];
+    let row = replay_row(nk, h);
+    let replays = [t(&[row, nt, ns]), t(&[row, nt, ns])];
+    let states = [t(&[S, S, h, ns]), t(&[S, S, h, ns])];
+    let words = data.new_tensor(types::I32, &[ns]);
+    let zeros = data.new_tensor(types::I32, &[ns]);
+    let arrive = [
+        data.new_tensor(types::I32, &[nk * ns]),
+        data.new_tensor(types::I32, &[nk * ns]),
+    ];
+    data.alloc_tensors(backend.buffer_type()).unwrap();
+    let scaled = |n: usize, seed: u64, a: f32| -> Vec<f32> {
+        noise(n, seed).iter().map(|x| x * a).collect()
+    };
+    let gate = |n: usize, seed: u64, a: f32, b: f32| -> Vec<f32> {
+        noise(n, seed).iter().map(|x| a * (x + b)).collect()
+    };
+    q.set_f32(&scaled(q.elements(), 1, 0.15));
+    k.set_f32(&scaled(k.elements(), 2, 0.15));
+    v.set_f32(&noise(v.elements(), 3));
+    g.set_f32(&gate(g.elements(), 4, -0.5, 1.0));
+    beta.set_f32(&gate(beta.elements(), 5, 0.5, 1.0));
+    let packed = scaled((row * nt * ns) as usize, 6, 0.15);
+    let s0 = scaled(states[0].elements(), 7, 0.1);
+    for (r, s) in replays.iter().zip(&states) {
+        r.set_f32(&packed);
+        s.set_f32(&s0);
+    }
+    let w: Vec<i32> = keep
+        .iter()
+        .map(|&k| count_word(k as usize, 0, false))
+        .collect();
+    words.set_i32(&w);
+    zeros.set_i32(&vec![0; ns as usize]);
+    for a in arrive {
+        a.set_i32(&vec![0; a.elements()]);
+    }
+    let ctx = Context::new(32, 32);
+    let mut graph = ctx.new_graph(32);
+    let [(r0, s0t, a0), (r1, s1t, a1)] = [
+        (replays[0], states[0], arrive[0]),
+        (replays[1], states[1], arrive[1]),
+    ];
+    let fused = rows_replay(&ctx, q, k, v, g, beta, s0t, words, r0, (a0, 0), None).as_output();
+    let commit = if beside {
+        commit_replay_beside(&ctx, r1, s1t, words, nk)
+    } else {
+        commit_replay(&ctx, r1, s1t, words, nk)
+    }
+    .as_output();
+    let rows = rows_replay(&ctx, q, k, v, g, beta, s1t, zeros, r1, (a1, 0), None).as_output();
+    // The commit first: the verify after it reads its states and stores over its rows.
+    for t in [fused, commit, rows] {
+        graph.expand(t);
+    }
+    ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+        .unwrap();
+    backend.compute(&graph).unwrap();
+    [
+        [fused.to_f32(), s0t.to_f32(), r0.to_f32()],
+        [rows.to_f32(), s1t.to_f32(), r1.to_f32()],
+    ]
+}
+
+/// The deferred commits run on their own before the verify step (#1176: in the wait of the
+/// exchange before the layer) and the verify step replaying nothing give the fused replay's
+/// rows, states and stored rows bit for bit; only the exchange's node reads as one it runs.
+#[test]
+fn cpu_commit_first_then_zero_counts_is_the_fused_replay() {
+    let mut backend = Backend::cpu().unwrap();
+    backend.set_threads(4);
+    for keep in SLOT_KEEPS {
+        for nt2 in [1, 4] {
+            let [fused, first] = run_committed_first(&mut backend, (4, 2, 9, nt2), keep, true);
+            for (i, what) in ["rows", "states", "packed rows"].iter().enumerate() {
+                let same = fused[i].len() == first[i].len()
+                    && fused[i]
+                        .iter()
+                        .zip(&first[i])
+                        .all(|(x, y)| x.to_bits() == y.to_bits());
+                assert!(same, "{keep:?} x {nt2}: {what}");
+            }
+        }
+    }
+    let ctx = Context::new(16, 16);
+    let replay = ctx.new_tensor(types::F32, &[replay_row(2, 4), 9, 2]);
+    let state = ctx.new_tensor(types::F32, &[S, S, 4, 2]);
+    let keep = ctx.new_tensor(types::I32, &[2]);
+    let plain = commit_replay(&ctx, replay, state, keep, 2);
+    let beside = commit_replay_beside(&ctx, replay, state, keep, 2);
+    // SAFETY: tensors of a live context.
+    unsafe {
+        assert!(is_beside(beside.raw()));
+        assert!(!is_beside(plain.raw()));
+        assert!(!is_beside(replay.raw()));
+    }
+}
+
 /// Real tokens per slot for the padding tests: 1 to `nt2`, varied over the slots.
 fn pad_reals(n_slots: usize, nt2: i64) -> Vec<usize> {
     (0..n_slots).map(|s| 1 + (s * 3) % nt2 as usize).collect()
@@ -741,6 +858,37 @@ fn cuda_rows_replay_is_commit_then_rows_and_stores() {
             }
         }
     }
+    force_warps(0);
+}
+
+/// The deferred commits on their own and then a verify step replaying nothing (#1176) on the
+/// GPU, every replay kernel and CTA shape: the fused replay's rows, states and stored rows bit for
+/// bit. (A commit an exchange runs is this commit's kernel, launched by the exchange.)
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_commit_first_then_zero_counts_is_the_fused_replay() {
+    let mut gpu = gpu();
+    let variants = std::iter::once((-1, "default")).chain(bench::REPLAY_VARIANTS);
+    for (variant, name) in variants {
+        set_replay_variant(variant);
+        for warps in [0, 1, 2, 4] {
+            force_warps(warps);
+            for (h, nk) in [(48, 16), (4, 2)] {
+                for keep in SLOT_KEEPS {
+                    for nt2 in [1, 4, 9] {
+                        let c = (h, nk, 9, nt2);
+                        let [fused, first] = run_committed_first(&mut gpu, c, keep, false);
+                        for (i, what) in ["rows", "states", "packed rows"].iter().enumerate() {
+                            let at = format!("{name}, warps {warps}, {h} heads, {keep:?} x {nt2}");
+                            assert!(same_bits(&fused[i], &first[i]), "{at}: {what}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    set_replay_variant(-1);
     force_warps(0);
 }
 

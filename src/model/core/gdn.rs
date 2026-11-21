@@ -65,6 +65,10 @@ const MODE_REPLAY: i32 = 16;
 /// ninth and the counters' address (already at the group's first counter) goes in the third and
 /// fourth params; the counters are a pool's own buffer, at a fixed address.
 const MODE_PAD: i32 = 32;
+/// With [`MODE_KEEP`] (a [`commit_replay_beside`] node): on CUDA the node launches nothing; the
+/// exchange that reads it runs it in its wait ([`launch_beside`]). The CPU op computes it as its
+/// own node.
+const MODE_BESIDE: i32 = 64;
 
 /// Whether graphs built from now on use [`rows`] and [`commit`].
 static GDN_ON: AtomicBool = AtomicBool::new(true);
@@ -494,6 +498,33 @@ pub(super) fn commit_replay<'a>(
     keep: Tensor<'a>,
     n_k: i64,
 ) -> Tensor<'a> {
+    commit_replay_mode(ctx, replay, state, keep, n_k, MODE_STATE | MODE_KEEP)
+}
+
+/// [`commit_replay`] for an exchange over machines to run in its wait (#1176,
+/// [`crate::tp_net::all_reduce_beside`]): on CUDA this node launches nothing and the exchange
+/// that reads it launches the same kernel on the same sources ([`launch_beside`]), once its own
+/// partial is on its way and before it waits for the peers'. The same bits.
+pub(crate) fn commit_replay_beside<'a>(
+    ctx: &'a Context,
+    replay: Tensor<'a>,
+    state: Tensor<'a>,
+    keep: Tensor<'a>,
+    n_k: i64,
+) -> Tensor<'a> {
+    let mode = MODE_STATE | MODE_KEEP | MODE_BESIDE;
+    commit_replay_mode(ctx, replay, state, keep, n_k, mode)
+}
+
+/// [`commit_replay`]'s node with its op's `mode`.
+fn commit_replay_mode<'a>(
+    ctx: &'a Context,
+    replay: Tensor<'a>,
+    state: Tensor<'a>,
+    keep: Tensor<'a>,
+    n_k: i64,
+    mode: i32,
+) -> Tensor<'a> {
     let [row, t, ns, _] = replay.ne();
     let h = state.ne()[2];
     assert!(
@@ -520,8 +551,40 @@ pub(super) fn commit_replay<'a>(
         types::F32,
         [1, 1, 1, 1],
         &[q, k, v, g, beta, state, keep],
-        &[MODE_STATE | MODE_KEEP],
+        &[mode],
     )
+}
+
+/// Whether `node` is a [`commit_replay_beside`] node.
+///
+/// # Safety
+/// `node` is a valid tensor.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) unsafe fn is_beside(node: *const ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's.
+    unsafe {
+        crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &GDN))
+            && crate::ggml::external_params(&*node)[0] & MODE_BESIDE != 0
+    }
+}
+
+/// Launches the [`commit_replay_beside`] node `node` on `stream`: what its own launch leaves to
+/// the exchange reading it.
+///
+/// # Safety
+/// `node` is a node of an allocated graph whose sources hold device memory of `stream`'s device.
+#[cfg(feature = "cuda")]
+pub(crate) unsafe fn launch_beside(
+    node: &ffi::ggml_tensor,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    // SAFETY: the caller's.
+    unsafe {
+        if !is_beside(node) {
+            return Err("gdn: an exchange's commit is not a commit_replay_beside node".into());
+        }
+        launch(node, stream)
+    }
 }
 
 /// ggml's `gated_delta_net(q, k, v, g, beta, state, 1)` for one token per sequence: the same
@@ -901,6 +964,20 @@ pub(super) fn force_warps(n: i32) {
 
 #[cfg(feature = "cuda")]
 unsafe fn cuda_gdn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
+    // An exchange runs it ([`launch_beside`]).
+    if crate::ggml::external_params(dst)[0] & MODE_BESIDE != 0 {
+        return Ok(());
+    }
+    // SAFETY: the caller's.
+    unsafe { launch(dst, stream) }
+}
+
+/// The op's kernel for `dst` on `stream`.
+///
+/// # Safety
+/// As [`cuda_gdn`].
+#[cfg(feature = "cuda")]
+unsafe fn launch(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
     // SAFETY: a node made by `node`, device tensors of the stream's device.
     unsafe {
         let mode = crate::ggml::external_params(dst)[0];
