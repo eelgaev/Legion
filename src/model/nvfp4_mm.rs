@@ -1420,26 +1420,26 @@ pub const GEMM_VERIFY: GemmTune = GemmTune {
 /// default's time with it, and the fused GLU (2 x 21504) stays on the default too.
 pub const VERIFY_MAX_M: i64 = 8192;
 
-/// The tune of a dense GEMM (`glu`: the fused GLU's) of 64-token tiles over `m` rows and `n`
-/// tokens: [`GEMM_VERIFY`] at 33-64 tokens on [`MV_RTW2_MIN_M`] to [`VERIFY_MAX_M`] rows (not the
-/// GLU), otherwise the default.
+/// The tune of a dense GEMM (`glu`: the fused GLU's) of 64-token tiles over `k` by `m` rows and
+/// `n` tokens: at 33-64 tokens the streaming GEMM ([`GEMM_STREAM`] / [`GEMM_STREAM_GLU`]) on the
+/// GLU and on [`STREAM_MIN_M`] rows and more (not a matmul of rows 3x as long as it has rows at
+/// up to [`STREAM_LONG_K_MAX_N`] tokens), [`GEMM_VERIFY`] on the rest of [`MV_RTW2_MIN_M`] to
+/// [`VERIFY_MAX_M`] rows (not the GLU), otherwise the default.
 /// `LEGION_DEBUG_NVFP4_VERIFY_TUNE=0`: the default everywhere (the way before), for A/B runs.
-pub fn dense_gemm_tune(m: i64, n: i64, nt: i32, glu: bool) -> GemmTune {
+pub fn dense_gemm_tune(k: i64, m: i64, n: i64, nt: i32, glu: bool) -> GemmTune {
     let verify = nt == 8 && n > MV_MAX_N && n <= 64;
+    let rows = (MV_RTW2_MIN_M..=VERIFY_MAX_M).contains(&m);
+    let on_verify = !glu && verify && rows && verify_tune();
     if verify && verify_stream() {
         if glu {
             return GEMM_STREAM_GLU;
         }
-        if m >= STREAM_MIN_M {
+        let long = k >= 3 * m && n <= STREAM_LONG_K_MAX_N;
+        if m >= STREAM_MIN_M && !(long && on_verify) {
             return GEMM_STREAM;
         }
     }
-    let rows = (MV_RTW2_MIN_M..=VERIFY_MAX_M).contains(&m);
-    if !glu && verify && rows && verify_tune() {
-        GEMM_VERIFY
-    } else {
-        GEMM_DEFAULT
-    }
+    if on_verify { GEMM_VERIFY } else { GEMM_DEFAULT }
 }
 
 /// The dense streaming GEMM ([`GemmTune::stream`]) of a plain matmul at 33-64 tokens: one
@@ -1451,6 +1451,13 @@ pub const GEMM_STREAM_GLU: GemmTune = GemmTune::stream(2, 1, 4);
 
 /// The fewest rows [`GEMM_STREAM`] takes (fewer: [`GEMM_VERIFY`] or the default).
 pub const STREAM_MIN_M: i64 = 4096;
+
+/// The most tokens of a matmul with rows at least 3x as long as it has rows (k >= 3m: Gemma 4
+/// 31B's down projection 21504:5376) that stay off the stream, on [`GEMM_VERIFY`] (where it takes
+/// the rows). GB10 at 33 / 40 / 48 tokens: 426 / 435 / 449 us there against the stream's 468 /
+/// 476 / 476; 56 and 64 tokens and the shorter rows (o 8192:5376, a rank's down 10752:5376
+/// over two machines, k / v 5376:4096) tie or favour the stream. The same bits either way.
+pub const STREAM_LONG_K_MAX_N: i64 = 48;
 
 fn verify_tune() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1654,7 +1661,7 @@ mod cuda {
             Kernel::Gemm { mi, nt } if !p.plan.is_null() => forced_tune()
                 .unwrap_or_else(|| grouped_gemm_tune(p.k, p.n_expert as i64, mi, nt, false)),
             Kernel::Gemm { mi: 1, nt } => {
-                forced_tune().unwrap_or_else(|| dense_tune(p.m, p.n, nt, false))
+                forced_tune().unwrap_or_else(|| dense_tune(p.k, p.m, p.n, nt, false))
             }
             _ => forced_tune().unwrap_or(GEMM_DEFAULT),
         };
@@ -1715,9 +1722,9 @@ mod cuda {
 
     /// [`dense_gemm_tune`], where no bench forces the copies or the prefetch (those variants
     /// are the default tune's).
-    fn dense_tune(m: i64, n: i64, nt: i32, glu: bool) -> GemmTune {
+    fn dense_tune(k: i64, m: i64, n: i64, nt: i32, glu: bool) -> GemmTune {
         if forced_pf() | l1() == 0 {
-            dense_gemm_tune(m, n, nt, glu)
+            dense_gemm_tune(k, m, n, nt, glu)
         } else {
             GEMM_DEFAULT
         }
@@ -1794,7 +1801,7 @@ mod cuda {
         } else {
             (false, tokens_tile(n, 16).max(4))
         };
-        let tune = forced_tune().unwrap_or_else(|| dense_tune(m, n, nt, true));
+        let tune = forced_tune().unwrap_or_else(|| dense_tune(k, m, n, nt, true));
         let rows = if mv { 16 } else { tune.rows(128) };
         let p = Params {
             w: wg.data as *const u8,

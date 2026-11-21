@@ -350,26 +350,38 @@ fn gemm_tune_codes() {
 #[test]
 fn dense_gemm_tune_at_33_64_tokens() {
     // Gemma 4 31B's verify steps of 5-8 users (33-64 rows): the streaming GEMM from 4096
-    // rows and for the fused GLU.
+    // rows and for the fused GLU; the down projection (21504:5376, rows 4x as long as it has
+    // rows) on #180's tune up to 48 tokens.
     for n in 33..=64 {
         assert_eq!(
             pick_dense(5376, 8192, n, 48, MV_MAX_N),
             Kernel::Gemm { mi: 1, nt: 8 }
         );
-        assert_eq!(dense_gemm_tune(8192, n, 8, false), GEMM_STREAM);
-        assert_eq!(dense_gemm_tune(4096, n, 8, false), GEMM_STREAM);
-        assert_eq!(dense_gemm_tune(5376, n, 8, false), GEMM_STREAM);
-        assert_eq!(dense_gemm_tune(16384, n, 8, false), GEMM_STREAM);
-        assert_eq!(dense_gemm_tune(2048, n, 8, false), GEMM_DEFAULT);
-        assert_eq!(dense_gemm_tune(21504, n, 8, true), GEMM_STREAM_GLU);
+        assert_eq!(dense_gemm_tune(5376, 8192, n, 8, false), GEMM_STREAM);
+        assert_eq!(dense_gemm_tune(5376, 4096, n, 8, false), GEMM_STREAM);
+        assert_eq!(dense_gemm_tune(4096, 5376, n, 8, false), GEMM_STREAM);
+        assert_eq!(dense_gemm_tune(5376, 16384, n, 8, false), GEMM_STREAM);
+        assert_eq!(dense_gemm_tune(5376, 2048, n, 8, false), GEMM_DEFAULT);
+        assert_eq!(dense_gemm_tune(5376, 21504, n, 8, true), GEMM_STREAM_GLU);
+        // o 8192:5376 and a rank's down 10752:5376 over two machines: the stream.
+        assert_eq!(dense_gemm_tune(8192, 5376, n, 8, false), GEMM_STREAM);
+        assert_eq!(dense_gemm_tune(10752, 5376, n, 8, false), GEMM_STREAM);
+        let down = if n <= STREAM_LONG_K_MAX_N {
+            GEMM_VERIFY
+        } else {
+            GEMM_STREAM
+        };
+        assert_eq!(dense_gemm_tune(21504, 5376, n, 8, false), down, "n {n}");
+        // Past GEMM_VERIFY's rows: the stream still.
+        assert_eq!(dense_gemm_tune(65536, 16384, n, 8, false), GEMM_STREAM);
     }
     for n in [1, 32, 65, 128, 4096] {
         assert_eq!(
-            dense_gemm_tune(8192, n, tokens_tile(n, 16).max(4), false),
+            dense_gemm_tune(5376, 8192, n, tokens_tile(n, 16).max(4), false),
             GEMM_DEFAULT
         );
         assert_eq!(
-            dense_gemm_tune(21504, n, tokens_tile(n, 16).max(4), true),
+            dense_gemm_tune(5376, 21504, n, tokens_tile(n, 16).max(4), true),
             GEMM_DEFAULT
         );
     }
