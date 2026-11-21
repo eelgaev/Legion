@@ -298,12 +298,13 @@ pub(super) fn send_kernel_of(v: Option<&str>) -> bool {
 }
 
 /// Values the buffers of a micro all-reduce of `cols` of a step's `n` columns (`row` values
-/// each) are reserved for (#619): the larger of its own and the rest of the step's. A later part
-/// of the step (an odd step's second half has one more column than the first) then never needs
-/// larger buffers while this one is in flight.
+/// each) are reserved for (#619): the larger of its own and the step's larger half. A later part
+/// of a step summed in halves or in smaller parts (an odd step's second half has one more column
+/// than the first; Qwen3.5+'s FFN parts, #1133) then never needs larger buffers while this one
+/// is in flight, and a small part does not reserve the rest of the step.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(super) fn reduce_reserve(row: usize, cols: usize, n: usize) -> usize {
-    row * cols.max(n.saturating_sub(cols))
+    row * cols.max(n.div_ceil(2))
 }
 
 /// The pinned buffers an exchange of `bytes` starts on, with `want` bytes reserved

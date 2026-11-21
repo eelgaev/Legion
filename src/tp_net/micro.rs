@@ -282,13 +282,31 @@ pub fn finish<'a>(ctx: &'a Context, s: Started<'a>, into: Option<Tensor<'a>>) ->
         // of its own and keeps `t` alive while the view is used.
         // SAFETY: a fresh node, not allocated yet; `t` is a node of the same graph, ahead of
         // it (one of its sources) and of its shape.
-        unsafe {
-            let raw = out.raw();
-            (*raw).view_src = t.raw();
-            (*raw).view_offs = 0;
-        }
+        unsafe { view_into(out, t) };
     }
     out
+}
+
+/// Points the fresh node `out` at `t`'s memory (`t` one of its sources, ahead of it, of its
+/// size): `t`'s own, or, where `t` is itself a finish into another ([`finish_add`] of three or
+/// more parts, #1133), the memory `t` views. ggml's allocator frees a tensor once its readers
+/// and the views naming it as `view_src` are done, so a view must name the tensor that owns
+/// the memory, as ggml's own views do; the source keeps the finishes in order.
+///
+/// # Safety
+/// `out` is a fresh node, not allocated yet; `t` a node of the same graph ahead of it.
+unsafe fn view_into<'a>(out: Tensor<'a>, t: Tensor<'a>) {
+    // SAFETY: the caller's.
+    unsafe {
+        let (raw, t) = (out.raw(), t.raw());
+        let (src, offs) = if (*t).view_src.is_null() {
+            (t, 0)
+        } else {
+            ((*t).view_src, (*t).view_offs)
+        };
+        (*raw).view_src = src;
+        (*raw).view_offs = offs;
+    }
 }
 
 /// The params after [`Params::list`]'s that [`finish_add`] sets: whether the node adds a
@@ -351,11 +369,7 @@ pub fn finish_add<'a>(
         // As in `finish`: the node writes its columns into `t`'s memory.
         // SAFETY: a fresh node, not allocated yet; `t` is a node of the same graph, ahead of
         // it (one of its sources) and of its shape.
-        unsafe {
-            let raw = out.raw();
-            (*raw).view_src = t.raw();
-            (*raw).view_offs = 0;
-        }
+        unsafe { view_into(out, t) };
     }
     out
 }
@@ -418,11 +432,7 @@ pub fn finish_add_norm<'a>(
         // As in `finish`: the node writes its parts into `t`'s memory.
         // SAFETY: a fresh node, not allocated yet; `t` is a node of the same graph, ahead of
         // it (one of its sources) and of its size.
-        unsafe {
-            let raw = out.raw();
-            (*raw).view_src = t.raw();
-            (*raw).view_offs = 0;
-        }
+        unsafe { view_into(out, t) };
     }
     out
 }

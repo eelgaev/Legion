@@ -29,6 +29,18 @@ fn odd_halves_reserve_the_larger() {
     assert_eq!(buffers_for(Some(alone), b1, want1, 4, true), Err(()));
 }
 
+/// A step's smaller parts (#1133: Qwen3.5+'s FFN in half 0 and three quarters and a quarter of
+/// half 1) reserve the larger half, not the rest of the step; a whole step its own.
+#[test]
+fn small_parts_reserve_the_larger_half() {
+    let (row, n) = (5120, 8193);
+    assert_eq!(reduce_reserve(row, 1024, n), row * 4097);
+    assert_eq!(reduce_reserve(row, 3073, n), row * 4097);
+    assert_eq!(reduce_reserve(row, 4096, n), row * 4097);
+    assert_eq!(reduce_reserve(row, n, n), row * n);
+    assert_eq!(reduce_reserve(row, 1, 1), row);
+}
+
 /// Buffers sized for half 0 alone (an earlier, smaller step) grow to the reserve at half 0's
 /// start when nothing is in flight; never shrink; and an exchange that fits starts on them as
 /// they are while another is in flight even below its reserve.

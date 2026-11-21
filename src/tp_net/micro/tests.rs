@@ -224,6 +224,92 @@ fn halves_finish_add_into_one_output() {
     }
 }
 
+/// Three parts of a step (#1133: Qwen3.5+'s FFN parts) finish with their residuals into one
+/// output, each later finish into the one before (a view of the first's memory): the plain
+/// all-reduce's bits through a CPU graph on two ranks, at most two exchanges in flight, only the
+/// last finish an output (ggml's allocator keeps the first's memory for the later ones).
+#[test]
+fn three_parts_finish_add_into_one_output() {
+    use crate::ggml::{Backend, ComputeAllocator};
+    let (row, n) = (6usize, 11i64);
+    let parts = [(0i64, 5i64), (5, 4), (9, 2)];
+    let len = row * n as usize;
+    let value = |r: usize, k: usize, i: usize| {
+        let x = ((i * 11 + k * 17 + r * 29) % 89) as f32;
+        if r == 0 { x * 1e7 } else { x * 0.3 + 1e-3 }
+    };
+    let comms = super::super::tests::comms(2, std::time::Duration::from_secs(20));
+    let threads: Vec<_> = comms
+        .into_iter()
+        .enumerate()
+        .map(|(r, c)| {
+            std::thread::spawn(move || {
+                let handle = super::super::register(c);
+                let mut backend = Backend::cpu().unwrap();
+                let ctx = Context::new(48, 48);
+                let x = ctx.new_tensor(types::F32, &[row as i64, n]).as_input();
+                let res = ctx.new_tensor(types::F32, &[row as i64, n]).as_input();
+                let part = |t, a: i64, c: i64| {
+                    ctx.view_2d(t, [row as i64, c], row * 4, a as usize * row * 4)
+                };
+                // Each part's partial its own node (a matmul's output in the model).
+                let p: Vec<_> = parts
+                    .iter()
+                    .map(|&(a, c)| ctx.scale(part(x, a, c), 1.0))
+                    .collect();
+                let mut graph = ctx.new_graph(48);
+                let start = |j: usize| all_reduce_start(&ctx, handle.id(), p[j], n as usize);
+                let (s0, s1) = (start(0), start(1));
+                graph.expand(s0.node);
+                graph.expand(s1.node);
+                let (a, c) = parts[0];
+                let y0 = finish_add(&ctx, s0, part(res, a, c), n, a, None);
+                graph.expand(y0);
+                let s2 = start(2);
+                graph.expand(s2.node);
+                let (a, c) = parts[1];
+                let y1 = finish_add(&ctx, s1, part(res, a, c), n, a, Some(y0));
+                graph.expand(y1);
+                let (a, c) = parts[2];
+                let y = finish_add(&ctx, s2, part(res, a, c), n, a, Some(y1)).as_output();
+                graph.expand(y);
+                // SAFETY: nodes of `ctx`, not freed.
+                unsafe {
+                    assert_eq!((*y1.raw()).view_src, y0.raw());
+                    assert_eq!((*y.raw()).view_src, y0.raw(), "the memory's owner");
+                    assert_eq!((*y.raw()).view_offs, 0);
+                }
+                let plain = ctx
+                    .add(super::super::all_reduce(&ctx, handle.id(), x), res)
+                    .as_output();
+                graph.expand(plain);
+                ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+                    .unwrap();
+                let mut out = Vec::new();
+                for k in 0..3 {
+                    x.set_f32(&(0..len).map(|i| value(r, k, i)).collect::<Vec<_>>());
+                    res.set_f32(&(0..len).map(|i| value(1, k + 5, i)).collect::<Vec<_>>());
+                    backend.compute(&graph).unwrap();
+                    out.push((y.to_f32(), plain.to_f32()));
+                }
+                assert!(handle.comm().error().is_none());
+                out
+            })
+        })
+        .collect();
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    for k in 0..3 {
+        let want: Vec<f32> = (0..len)
+            .map(|i| (value(0, k, i) + value(1, k, i)) + value(1, k + 5, i))
+            .collect();
+        for r in &results {
+            assert_eq!(bits(&r[k].0), bits(&want), "parts, round {k}");
+            assert_eq!(bits(&r[k].1), bits(&want), "plain, round {k}");
+        }
+    }
+}
+
 /// The finishes that compute the next norm too (#1133): an odd step's halves
 /// (`finish_add_norm`, with the BF16 rows) and the plain `all_reduce_add_norm` (codes only)
 /// give the sums, codes, scales and BF16 rows of the separate ops (the all-reduce plus the
