@@ -125,6 +125,9 @@ pub enum HostUse {
     KvHostTier,
     /// Prefix caching's saved recurrent states, in pinned memory (#441).
     SavedStates,
+    /// Tensor parallelism over machines: the pinned buffers the exchanges send from and
+    /// receive into, made at load for the largest step (#1133).
+    TpBuffers,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

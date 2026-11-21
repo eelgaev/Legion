@@ -84,6 +84,8 @@ pub(super) struct HostPlan {
     pub kv_host_tier: u64,
     /// Saved prefix-cache states in pinned host memory.
     pub saved_states: u64,
+    /// Tensor parallelism over machines: the pinned exchange buffers made at load.
+    pub tp_buffers: u64,
     /// Routed experts in host memory (pinned arenas, or mapped from the model file).
     pub expert_host: u64,
     /// Other weights in host memory.
@@ -201,6 +203,7 @@ pub(super) fn host_from_report(r: &LoadReport) -> HostPlan {
     HostPlan {
         kv_host_tier: sum(&[HostUse::KvHostTier]),
         saved_states: sum(&[HostUse::SavedStates]),
+        tp_buffers: sum(&[HostUse::TpBuffers]),
         expert_host: sum(&[HostUse::ExpertArena, HostUse::MappedExperts]),
         host_weights: sum(&[HostUse::SharedWeights, HostUse::HostWeights]),
         ngram_table: ngram(&r.ngram) + ngram(&r.engram),
@@ -255,6 +258,7 @@ pub(super) fn log(p: &MemoryPlan) {
         kv_spill_max_mib = mib(h.kv_spill_max),
         kv_host_tier_mib = mib(h.kv_host_tier),
         saved_states_mib = mib(h.saved_states),
+        tp_buffers_mib = mib(h.tp_buffers),
         expert_host_mib = mib(h.expert_host),
         host_weights_mib = mib(h.host_weights),
         ngram_table_mib = mib(h.ngram_table),

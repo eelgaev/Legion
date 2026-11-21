@@ -716,6 +716,7 @@ impl Switches {
         crate::ggml::post_alloc::set_order(crate::tp_net::seq_par::order_pass);
         crate::ggml::post_alloc::set_rewrite(core::node_fuse::rewrite);
         crate::ggml::post_alloc::set_relayout(core::node_fuse::fold::RELAYOUT);
+        crate::ggml::post_alloc::set_note(crate::tp_net::note_graph);
         if let Some(p) = self.moe_pair_out {
             PairOut::set_default(p);
         }

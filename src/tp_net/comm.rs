@@ -931,7 +931,11 @@ pub struct Comm {
     seq_par: AtomicUsize,
     /// `--tp-overlap` ([`Comm::set_overlap`]).
     overlap: AtomicU8,
-    /// The pinned buffers of the CUDA path, made by its first all-reduce.
+    /// The pinned buffers the CUDA graphs allocated so far would grow them to, `(cap, sets)`
+    /// (none yet: `None`; [`Comm::note_need`], #1133).
+    planned: Mutex<Option<(usize, usize)>>,
+    /// The pinned buffers of the CUDA path, made at load ([`super::presize_buffers`]) or by its
+    /// first all-reduce.
     #[cfg(feature = "cuda")]
     pub(super) pinned: Mutex<Option<super::op::cuda::Pinned>>,
     /// The CUDA path's exchanges started ([`super::micro`]) and not finished yet, in order.
@@ -1059,6 +1063,7 @@ impl Comm {
             bf16_min: AtomicUsize::new(usize::MAX),
             seq_par: AtomicUsize::new(0),
             overlap: AtomicU8::new(Overlap::Off as u8),
+            planned: Mutex::new(None),
             #[cfg(feature = "cuda")]
             pinned: Mutex::new(None),
             #[cfg(feature = "cuda")]
@@ -1511,6 +1516,55 @@ impl Comm {
             }
         }
         Ok(())
+    }
+
+    /// Notes an exchange of a graph just allocated: `bytes` on the wire, `want` reserved, in
+    /// `sets` buffer sets ([`super::op::fold_need`], #1133).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(super) fn note_need(&self, bytes: usize, want: usize, sets: usize) {
+        let mut p = self.planned.lock().expect("planned lock");
+        *p = super::op::fold_need(*p, bytes, want, sets);
+    }
+
+    /// The pinned buffers the graphs noted so far need ([`Comm::note_need`]): `(cap, sets)`.
+    pub fn planned(&self) -> Option<(usize, usize)> {
+        *self.planned.lock().expect("planned lock")
+    }
+
+    /// The last exchange's sequence number (the same on every rank between steps).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(super) fn issued(&self) -> u32 {
+        self.shared.issued.load(Ordering::Acquire)
+    }
+
+    /// `mine` (this rank's [`Comm::planned`]) swapped with every RDMA peer over the data
+    /// connections, and the largest of them ([`super::op::merge_planned`]): the buffers every
+    /// rank makes at load, so that they register (and later grow) together. Without RDMA peers
+    /// `mine` (each rank's buffers are its own then).
+    pub(super) fn agree_planned(
+        &self,
+        mine: Option<(usize, usize)>,
+    ) -> Result<Option<(usize, usize)>, String> {
+        let msg = super::op::encode_planned(mine);
+        for (peer, link) in self.rdma.iter().enumerate() {
+            let Some((_, _, s)) = link else { continue };
+            s.lock()
+                .expect("stream lock")
+                .write_all(&msg)
+                .map_err(|e| format!("sending the pinned buffer plan to rank {peer}: {e}"))?;
+        }
+        let mut most = mine;
+        for (peer, link) in self.rdma.iter().enumerate() {
+            let Some((_, _, s)) = link else { continue };
+            let mut s = s.lock().expect("stream lock");
+            let mut b = [0u8; 16];
+            s.set_read_timeout(Some(self.shared.timeout))
+                .and_then(|_| s.read_exact(&mut b))
+                .map_err(|e| format!("rank {peer}'s pinned buffer plan: {e}"))?;
+            let theirs = super::op::decode_planned(&b).map_err(|e| format!("rank {peer}: {e}"))?;
+            most = super::op::merge_planned(most, theirs);
+        }
+        Ok(most)
     }
 
     /// Registers this rank's pinned buffers (`len` bytes at host address `host`) with every RDMA
