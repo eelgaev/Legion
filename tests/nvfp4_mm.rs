@@ -1411,6 +1411,86 @@ mod cuda {
         }
     }
 
+    /// The streaming GEMM's TMA weights (#1181 follow-up) in each of its variants against the
+    /// default GEMM's bits at 33-64 tokens, on cuda_verify_stream_keeps_the_gemm_bits' shapes
+    /// (5376: 84 blocks, a last stage of 4 blocks in the 8-block variants; 4104 rows: rows
+    /// past m in a warp's tile; 5184: rows not 16-byte aligned, the fallback), each also in
+    /// CTAs of a set warp count.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn cuda_verify_stream_tma_keeps_the_gemm_bits() {
+        use nvfp4_mm::{GEMM_DEFAULT, GemmTune};
+        let Some(mut gpu) = gpu() else { return };
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let plain = [
+            11_331_098,
+            11_341_098,
+            11_431_098,
+            11_441_098,
+            12_231_098,
+            12_331_098,
+            13_331_098,
+            21_321_098,
+            11_332_098,
+            411_331_098,
+            811_331_098,
+        ];
+        let shapes = [
+            (5376, 8192),
+            (5376, 4096),
+            (8192, 5376),
+            (21504, 5376),
+            (5376, 16384),
+            (5376, 4104),
+            (5184, 4096),
+            (4096, 5376),
+            (10752, 5376),
+        ];
+        for (k, m) in shapes {
+            let w = weights(k, m, (k * 5 + m) as u64);
+            for n in 33..=64 {
+                let xs = activations(k, n, (n * 11 + k) as u64);
+                nvfp4_mm::force_kernel(Some(Kernel::Gemm { mi: 1, nt: 8 }));
+                nvfp4_mm::force_gemm_tune(Some(GEMM_DEFAULT), None);
+                let want = bits(&run(&mut gpu, &w, &xs, Some(0.03), (k, m, n)));
+                for code in plain {
+                    nvfp4_mm::force_gemm_tune(Some(GemmTune::from_code(code)), None);
+                    let got = bits(&run(&mut gpu, &w, &xs, Some(0.03), (k, m, n)));
+                    assert!(got == want, "k {k} m {m} n {n} t{code}: bits differ");
+                }
+                nvfp4_mm::force_kernel(None);
+                nvfp4_mm::force_gemm_tune(None, None);
+            }
+            println!("k {k} m {m}: TMA streaming 33-64 tokens bitwise");
+        }
+        let glu = [
+            11_332_098,
+            11_232_098,
+            11_342_098,
+            12_232_098,
+            13_332_098,
+            21_222_098,
+            311_332_098,
+            411_332_098,
+        ];
+        for (k, m) in [(5376, 21504), (5376, 4104), (5376, 10752)] {
+            let (wg, wu) = (weights(k, m, 61), weights(k, m, 62));
+            for n in 33..=64 {
+                let xs = activations(k, n, 3 * n as u64);
+                let s = (Some(0.02), Some(0.04));
+                nvfp4_mm::force_gemm_tune(Some(GEMM_DEFAULT), None);
+                let want = bits(&run_glu(&mut gpu, (&wg, &wu), &xs, s, (k, m, n), true));
+                for code in glu {
+                    nvfp4_mm::force_gemm_tune(Some(GemmTune::from_code(code)), None);
+                    let got = bits(&run_glu(&mut gpu, (&wg, &wu), &xs, s, (k, m, n), true));
+                    assert!(got == want, "geglu k {k} m {m} n {n} t{code}: bits differ");
+                }
+                nvfp4_mm::force_gemm_tune(None, None);
+            }
+            println!("geglu k {k} m {m}: TMA streaming 33-64 tokens bitwise");
+        }
+    }
+
     /// Qwen3.8-Flash-Next's routed experts at prefill chunks (512 experts, 10 used): the fused
     /// gate/up/SwiGLU GEMM against the chain, and the down GEMM's tiles.
     #[test]

@@ -1392,9 +1392,24 @@ impl GemmTune {
         }
     }
 
-    /// Whether this is a [`GemmTune::stream`] tune.
+    /// The streaming GEMM with its weights brought in by the TMA (`nvfp4_vstream_tma`, sm_90+):
+    /// each warp's 16 * `rtw` weight rows in `ws` slots of its own (`ws - 1` stages in flight
+    /// while it computes, apart from the activations), stages of 4 blocks (`weights` 1; 2: of 8;
+    /// 3, 4: the same without the L2 prefetch), activation stages of one block, `xs` of them,
+    /// `cps` CTAs per SM. Its code: `(rtw + 10 * xs + 100 * ws + 1000 * weights + 10000 * cps) *
+    /// 1000 + 98`. The same bits as every other tune (devices without sm_90 code: the
+    /// [`GemmTune::stream`] kernel).
+    pub const fn stream_tma(rtw: i32, xs: i32, ws: i32, weights: i32, cps: i32) -> Self {
+        Self {
+            stages: 9,
+            ctas: 8,
+            warps: rtw + 10 * xs + 100 * ws + 1000 * weights + 10000 * cps,
+        }
+    }
+
+    /// Whether this is a [`GemmTune::stream`] or [`GemmTune::stream_tma`] tune.
     pub fn is_stream(self) -> bool {
-        self.stages == 9 && self.ctas == 9
+        self.stages == 9 && (self.ctas == 9 || self.ctas == 8)
     }
 }
 
@@ -1420,26 +1435,31 @@ pub const GEMM_VERIFY: GemmTune = GemmTune {
 /// default's time with it, and the fused GLU (2 x 21504) stays on the default too.
 pub const VERIFY_MAX_M: i64 = 8192;
 
-/// The tune of a dense GEMM (`glu`: the fused GLU's) of 64-token tiles over `m` rows and `n`
-/// tokens: [`GEMM_VERIFY`] at 33-64 tokens on [`MV_RTW2_MIN_M`] to [`VERIFY_MAX_M`] rows (not the
-/// GLU), otherwise the default.
+/// The tune of a dense GEMM (`glu`: the fused GLU's) of 64-token tiles over `k` by `m` rows and
+/// `n` tokens: at 33-64 tokens the streaming GEMM ([`GEMM_STREAM_TMA`] / [`GEMM_STREAM_TMA_GLU`])
+/// on the GLU and on [`STREAM_MIN_M`] rows and more (not a matmul of rows 1.5x as long as it has
+/// rows at up to [`STREAM_LONG_K_MAX_N`] tokens), [`GEMM_VERIFY`] on the rest of [`MV_RTW2_MIN_M`] to
+/// [`VERIFY_MAX_M`] rows (not the GLU), otherwise the default.
 /// `LEGION_DEBUG_NVFP4_VERIFY_TUNE=0`: the default everywhere (the way before), for A/B runs.
-pub fn dense_gemm_tune(m: i64, n: i64, nt: i32, glu: bool) -> GemmTune {
+pub fn dense_gemm_tune(k: i64, m: i64, n: i64, nt: i32, glu: bool) -> GemmTune {
     let verify = nt == 8 && n > MV_MAX_N && n <= 64;
-    if verify && verify_stream() {
-        if glu {
-            return GEMM_STREAM_GLU;
-        }
-        if m >= STREAM_MIN_M {
-            return GEMM_STREAM;
-        }
-    }
     let rows = (MV_RTW2_MIN_M..=VERIFY_MAX_M).contains(&m);
-    if !glu && verify && rows && verify_tune() {
-        GEMM_VERIFY
-    } else {
-        GEMM_DEFAULT
+    let on_verify = !glu && verify && rows && verify_tune();
+    if verify && verify_stream() {
+        let tma = vstream_tma();
+        if glu {
+            return if tma {
+                GEMM_STREAM_TMA_GLU
+            } else {
+                GEMM_STREAM_GLU
+            };
+        }
+        let long = 2 * k >= 3 * m && n <= STREAM_LONG_K_MAX_N;
+        if m >= STREAM_MIN_M && !(long && on_verify) {
+            return if tma { GEMM_STREAM_TMA } else { GEMM_STREAM };
+        }
     }
+    if on_verify { GEMM_VERIFY } else { GEMM_DEFAULT }
 }
 
 /// The dense streaming GEMM ([`GemmTune::stream`]) of a plain matmul at 33-64 tokens: one
@@ -1451,6 +1471,22 @@ pub const GEMM_STREAM_GLU: GemmTune = GemmTune::stream(2, 1, 4);
 
 /// The fewest rows [`GEMM_STREAM`] takes (fewer: [`GEMM_VERIFY`] or the default).
 pub const STREAM_MIN_M: i64 = 4096;
+
+/// The most tokens of a matmul with rows at least 1.5x as long as it has rows (2k >= 3m: Gemma 4
+/// 31B's o 8192:5376 and down 21504:5376, a rank's down 10752:5376 over two machines; not k / v
+/// 5376:4096) that stay off the stream, on [`GEMM_VERIFY`] (where it takes the rows): GB10 at
+/// 33 / 48 tokens, the cp.async stream took 1.09 / 1.07 of #180's tune's time on the down
+/// projection and 1.02 / 0.98 on the o projection (0.99 and 0.92 at 64 tokens). The same bits
+/// either way.
+pub const STREAM_LONG_K_MAX_N: i64 = 48;
+
+/// [`GemmTune::stream_tma`] for a plain matmul at 33-64 tokens: one 16-row weight tile per
+/// warp, three activation stages, three weight slots of 4 blocks (8 blocks of each row in
+/// flight), one CTA per SM.
+pub const GEMM_STREAM_TMA: GemmTune = GemmTune::stream_tma(1, 3, 3, 1, 1);
+
+/// [`GemmTune::stream_tma`] for the fused GLU at 33-64 tokens (gate and up tiles per warp).
+pub const GEMM_STREAM_TMA_GLU: GemmTune = GemmTune::stream_tma(2, 3, 3, 1, 1);
 
 fn verify_tune() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1464,6 +1500,13 @@ fn verify_stream() -> bool {
     *ON.get_or_init(|| {
         std::env::var_os("LEGION_DEBUG_NVFP4_VERIFY_STREAM").is_none_or(|v| v != "0")
     })
+}
+
+/// `LEGION_DEBUG_NVFP4_VSTREAM_TMA=0`: the streaming GEMM's cp.async weights ([`GEMM_STREAM`] /
+/// [`GEMM_STREAM_GLU`], the way before) instead of the TMA's, for A/B runs.
+fn vstream_tma() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_NVFP4_VSTREAM_TMA").is_none_or(|v| v != "0"))
 }
 
 /// Whether the GEMM has `tune` for tiles of `128 * mi` rows by `8 * nt` tokens: the default
@@ -1654,7 +1697,7 @@ mod cuda {
             Kernel::Gemm { mi, nt } if !p.plan.is_null() => forced_tune()
                 .unwrap_or_else(|| grouped_gemm_tune(p.k, p.n_expert as i64, mi, nt, false)),
             Kernel::Gemm { mi: 1, nt } => {
-                forced_tune().unwrap_or_else(|| dense_tune(p.m, p.n, nt, false))
+                forced_tune().unwrap_or_else(|| dense_tune(p.k, p.m, p.n, nt, false))
             }
             _ => forced_tune().unwrap_or(GEMM_DEFAULT),
         };
@@ -1715,9 +1758,9 @@ mod cuda {
 
     /// [`dense_gemm_tune`], where no bench forces the copies or the prefetch (those variants
     /// are the default tune's).
-    fn dense_tune(m: i64, n: i64, nt: i32, glu: bool) -> GemmTune {
+    fn dense_tune(k: i64, m: i64, n: i64, nt: i32, glu: bool) -> GemmTune {
         if forced_pf() | l1() == 0 {
-            dense_gemm_tune(m, n, nt, glu)
+            dense_gemm_tune(k, m, n, nt, glu)
         } else {
             GEMM_DEFAULT
         }
@@ -1794,7 +1837,7 @@ mod cuda {
         } else {
             (false, tokens_tile(n, 16).max(4))
         };
-        let tune = forced_tune().unwrap_or_else(|| dense_tune(m, n, nt, true));
+        let tune = forced_tune().unwrap_or_else(|| dense_tune(k, m, n, nt, true));
         let rows = if mv { 16 } else { tune.rows(128) };
         let p = Params {
             w: wg.data as *const u8,

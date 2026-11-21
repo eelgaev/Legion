@@ -42,6 +42,7 @@
 
 #pragma once
 
+#include <cuda.h>
 #include <cuda_bf16.h>
 #include <atomic>
 #include <cstdint>
@@ -185,6 +186,8 @@ extern std::atomic<int> pdl_state[PDL_DEVICES];
 }  // namespace legion_nvfp4
 
 namespace {
+#include "../sm90/tma.cuh"
+
 constexpr int BK = 64, STAGES = 3;
 // smem bytes per weight row: the three 16-byte words holding the row's 36-byte block (it starts
 // 0, 4, 8 or 12 bytes into the first), conflict-free for the fragment reads.
@@ -719,6 +722,107 @@ __host__ __device__ constexpr int vs_smem(int wrows, int xb, int xs) {
     return xs * 64 * vs_ldx(xb) * 2 + 2 * wrows * VS_LDS;
 }
 
+// nvfp4_vstream's MMAs of one block (nvfp4_gemm's mma_stage): ws, the warp's first weight row's
+// block in shared memory (its 16 * RTW rows LDS bytes apart, RTW tiles of 16); xs, the block's
+// activations (LDXS BF16 a token). FULL: a tile of 64 tokens.
+template <int RTW, int LDS, int LDXS, int DIAG, bool FULL>
+__device__ __forceinline__ void vs_mma_block(float (&acc)[RTW][8][4], const unsigned char * ws,
+                                             const __nv_bfloat16 * xs, int lane, int n_tok) {
+    constexpr int NT = 8;
+    const unsigned char * rows[RTW][2];
+    uint32_t ssc[RTW][2];
+#pragma unroll
+    for (int i = 0; i < RTW; i++)
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            rows[i][h] = ws + (i * 16 + h * 8 + lane / 4) * LDS;
+            ssc[i][h] = scale_bf16x2(rows[i][h][lane % 4]);
+        }
+#pragma unroll
+    for (int s = 0; s < 4; s++) {
+        uint32_t a[RTW][4];
+#pragma unroll
+        for (int i = 0; i < RTW; i++)
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const uint32_t q = *(const uint16_t *) (rows[i][h] + 4 + 8 * s + 2 * (lane % 4));
+                const uint32_t d = __shfl_sync(0xffffffffu, ssc[i][h], (lane & ~3) | s);
+                uint32_t lo, hi;
+                codes_bf16x2(__byte_perm(q, 0, 0x4140), lo, hi);
+                a[i][h] = mul_bf16x2(lo, d);
+                a[i][2 + h] = mul_bf16x2(hi, d);
+            }
+        uint32_t b[NT][2];
+#pragma unroll
+        for (int j = 0; j < NT / 2; j++) {
+            if (!FULL && j * 16 >= n_tok) {
+                break;
+            }
+            const int tok = j * 16 + lane % 8 + (lane / 16) * 8;
+            const __nv_bfloat16 * src = xs + tok * LDXS + s * 16 + ((lane / 8) % 2) * 8;
+            const uint32_t addr = (uint32_t) __cvta_generic_to_shared(src);
+            asm("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                : "=r"(b[2 * j][0]), "=r"(b[2 * j][1]), "=r"(b[2 * j + 1][0]), "=r"(b[2 * j + 1][1])
+                : "r"(addr));
+        }
+#pragma unroll
+        for (int i = 0; i < RTW; i++)
+#pragma unroll
+            for (int j = 0; j < NT; j++) {
+                if (FULL || j * 8 < n_tok) {
+                    if constexpr ((DIAG & DIAG_NOMMA) != 0) {
+                        asm volatile("" ::"r"(a[i][0]), "r"(a[i][1]), "r"(a[i][2]), "r"(a[i][3]), "r"(b[j][0]),
+                                     "r"(b[j][1]));
+                    } else {
+                        mma(acc[i][j], a[i], b[j][0], b[j][1]);
+                    }
+                }
+            }
+    }
+}
+
+// nvfp4_vstream's outputs of one warp: r0, its first output row (the GLU: gate tile acc[0], up
+// tile acc[1], silu or GELU of the gate times the up, BF16); rows past m and tokens past n_tok
+// are not stored.
+template <int RTW, bool GLU>
+__device__ __forceinline__ void vs_store(const legion_nvfp4_mm & p, const float (&acc)[RTW][8][4], int64_t r0,
+                                         int64_t n0, int n_tok, int lane, float sc, float sc2) {
+    constexpr int NT = 8;
+    if constexpr (GLU) {
+#pragma unroll
+        for (int j = 0; j < NT; j++) {
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int64_t row = r0 + lane / 4 + (e / 2) * 8;
+                const int t = j * 8 + (lane % 4) * 2 + e % 2;
+                if (row < p.m && t < n_tok) {
+                    float gate = acc[0][j][e] * sc, up = acc[1][j][e] * sc2;
+                    if (p.limit > 0.0f) {
+                        gate = fminf(gate, p.limit);
+                        up = fminf(fmaxf(up, -p.limit), p.limit);
+                    }
+                    ((__nv_bfloat16 *) p.dst)[(n0 + t) * p.m + row] = __float2bfloat16_rn(glu_gate(gate, p.act) * up);
+                }
+            }
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < RTW; i++) {
+#pragma unroll
+            for (int j = 0; j < NT; j++) {
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int64_t row = r0 + i * 16 + lane / 4 + (e / 2) * 8;
+                    const int t = j * 8 + (lane % 4) * 2 + e % 2;
+                    if (row < p.m && t < n_tok) {
+                        store_out(p, (n0 + t) * p.m + row, acc[i][j][e] * sc);
+                    }
+                }
+            }
+        }
+    }
+}
+
 template <int RTW, bool GLU, int XB, int XS, int DIAG>
 __global__ void __launch_bounds__(VS_MAX_ROWS / (16 * RTW) * 32, 1) nvfp4_vstream(const legion_nvfp4_mm p) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -796,62 +900,6 @@ __global__ void __launch_bounds__(VS_MAX_ROWS / (16 * RTW) * 32, 1) nvfp4_vstrea
     };
 
     float acc[RTW][NT][4];
-    // One block's MMAs (nvfp4_gemm's mma_stage): ws, this warp's rows' block in the weight slot;
-    // xs, the block's activations. FULL: a tile of BN tokens.
-    auto mma_block = [&](const unsigned char * ws, const __nv_bfloat16 * xs, auto full) {
-        constexpr bool FULL = decltype(full)::value;
-        const unsigned char * rows[RTW][2];
-        uint32_t ssc[RTW][2];
-#pragma unroll
-        for (int i = 0; i < RTW; i++)
-#pragma unroll
-            for (int h = 0; h < 2; h++) {
-                rows[i][h] = ws + (warp * 16 * RTW + i * 16 + h * 8 + lane / 4) * VS_LDS;
-                ssc[i][h] = scale_bf16x2(rows[i][h][lane % 4]);
-            }
-#pragma unroll
-        for (int s = 0; s < 4; s++) {
-            uint32_t a[RTW][4];
-#pragma unroll
-            for (int i = 0; i < RTW; i++)
-#pragma unroll
-                for (int h = 0; h < 2; h++) {
-                    const uint32_t q = *(const uint16_t *) (rows[i][h] + 4 + 8 * s + 2 * (lane % 4));
-                    const uint32_t d = __shfl_sync(0xffffffffu, ssc[i][h], (lane & ~3) | s);
-                    uint32_t lo, hi;
-                    codes_bf16x2(__byte_perm(q, 0, 0x4140), lo, hi);
-                    a[i][h] = mul_bf16x2(lo, d);
-                    a[i][2 + h] = mul_bf16x2(hi, d);
-                }
-            uint32_t b[NT][2];
-#pragma unroll
-            for (int j = 0; j < NT / 2; j++) {
-                if (!FULL && j * 16 >= n_tok) {
-                    break;
-                }
-                const int tok = j * 16 + lane % 8 + (lane / 16) * 8;
-                const __nv_bfloat16 * src = xs + tok * LDXS + s * 16 + ((lane / 8) % 2) * 8;
-                const uint32_t addr = (uint32_t) __cvta_generic_to_shared(src);
-                asm("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                    : "=r"(b[2 * j][0]), "=r"(b[2 * j][1]), "=r"(b[2 * j + 1][0]), "=r"(b[2 * j + 1][1])
-                    : "r"(addr));
-            }
-#pragma unroll
-            for (int i = 0; i < RTW; i++)
-#pragma unroll
-                for (int j = 0; j < NT; j++) {
-                    if (FULL || j * 8 < n_tok) {
-                        if constexpr ((DIAG & DIAG_NOMMA) != 0) {
-                            asm volatile("" ::"r"(a[i][0]), "r"(a[i][1]), "r"(a[i][2]), "r"(a[i][3]), "r"(b[j][0]),
-                                         "r"(b[j][1]));
-                        } else {
-                            mma(acc[i][j], a[i], b[j][0], b[j][1]);
-                        }
-                    }
-                }
-        }
-    };
-
     const int64_t rows_out = (int64_t) warps * OW;
     for (int tile = blockIdx.x; tile < p.tiles_m; tile += gridDim.x) {
         const int64_t m0 = (int64_t) tile * rows_out;
@@ -895,56 +943,206 @@ __global__ void __launch_bounds__(VS_MAX_ROWS / (16 * RTW) * 32, 1) nvfp4_vstrea
                 if (b >= nblk) {
                     break;
                 }
-                const unsigned char * ws = wsm + (b / VS_SB % 2) * wrows * VS_LDS + b % VS_SB * 36;
+                const unsigned char * ws =
+                    wsm + (b / VS_SB % 2) * wrows * VS_LDS + b % VS_SB * 36 + warp * 16 * RTW * VS_LDS;
                 const __nv_bfloat16 * xs = xsm + (u % XS) * XSTAGE + bi * BK;
                 if (n_tok == BN) {
-                    mma_block(ws, xs, std::true_type{});
+                    vs_mma_block<RTW, VS_LDS, LDXS, DIAG, true>(acc, ws, xs, lane, n_tok);
                 } else {
-                    mma_block(ws, xs, std::false_type{});
+                    vs_mma_block<RTW, VS_LDS, LDXS, DIAG, false>(acc, ws, xs, lane, n_tok);
                 }
             }
         }
         asm volatile("cp.async.wait_group 0;\n" ::);
         __syncthreads();  // every warp is done with the stages before the next tile's copies
 
-        if constexpr (GLU) {
-            const int64_t r0 = m0 + warp * 16 + lane / 4;
-#pragma unroll
-            for (int j = 0; j < NT; j++) {
-#pragma unroll
-                for (int e = 0; e < 4; e++) {
-                    const int64_t row = r0 + (e / 2) * 8;
-                    const int t = j * 8 + (lane % 4) * 2 + e % 2;
-                    if (row < p.m && t < n_tok) {
-                        float gate = acc[0][j][e] * sc, up = acc[1][j][e] * sc2;
-                        if (p.limit > 0.0f) {
-                            gate = fminf(gate, p.limit);
-                            up = fminf(fmaxf(up, -p.limit), p.limit);
-                        }
-                        ((__nv_bfloat16 *) p.dst)[(n0 + t) * p.m + row] = __float2bfloat16_rn(glu_gate(gate, p.act) * up);
-                    }
-                }
-            }
-        } else {
-#pragma unroll
-            for (int i = 0; i < RTW; i++) {
-                const int64_t r0 = m0 + warp * 16 * RTW + i * 16 + lane / 4;
-#pragma unroll
-                for (int j = 0; j < NT; j++) {
-#pragma unroll
-                    for (int e = 0; e < 4; e++) {
-                        const int64_t row = r0 + (e / 2) * 8;
-                        const int t = j * 8 + (lane % 4) * 2 + e % 2;
-                        if (row < p.m && t < n_tok) {
-                            store_out(p, (n0 + t) * p.m + row, acc[i][j][e] * sc);
-                        }
-                    }
-                }
-            }
-        }
+        vs_store<RTW, GLU>(p, acc, m0 + warp * OW, n0, n_tok, lane, sc, sc2);
     }
 #else
     __trap();  // device_supported() launches it on compute capability 8.0+ only
+#endif
+}
+
+// nvfp4_vstream with its weights brought in by the TMA (sm_90+, #1181 follow-up). In
+// nvfp4_vstream every weight stage is in the same cp.async group as an activation stage, so it
+// has to land within XS - 1 blocks of being issued, and the SM's weight stream stalls at every
+// stage (~140-155 GB/s on a GB10, whose LPDDR5X streams ~270). Here each warp brings its own
+// 16 * RTW weight rows, one bulk copy (cp.async.bulk) a row and stage of WSB blocks, into WS
+// slots of its own that complete on its own mbarriers, so WS - 1 stages ((WS - 1) * WSB blocks)
+// are in flight while it computes, apart from the activations (cp.async in XS stages of one
+// block, shared by the CTA's warps, as there). The weight stream runs on across the CTA's row
+// tiles. Rows go to the CTAs in even runs of 16-row units (warp tiles; a CTA's last tile may
+// have idle warps), so no SM gets a whole extra tile (the 8192 rows of a q projection: 10-11
+// units each on 48 SMs, not 6 or 12). PF: nvfp4_vstream's L2 bulk prefetch of 32 blocks ahead.
+// The MMAs and the epilogue are nvfp4_vstream's (vs_mma_block, vs_store): each output takes
+// nvfp4_gemm's MMA chain, so the same bits. Rows past m get no copies (their slot rows hold
+// stale bytes, whose sums are never stored). Needs w_ld % 16 == 0 and 16-byte aligned
+// weights (the launch falls back to nvfp4_gemm).
+__host__ __device__ constexpr int vs_lds(int wsb) {
+    return wsb * 36 + (wsb % 8 == 0 ? 16 : 0);  // 144 or 304 bytes: rows 36 or 76 words apart, no bank conflicts
+}
+__host__ __device__ constexpr int vs_smem_tma(int warps, int rtw, int xs, int ws, int wsb) {
+    return xs * 64 * vs_ldx(1) * 2 + ws * warps * 16 * rtw * vs_lds(wsb) + 8 * ws * warps;
+}
+
+template <int RTW, bool GLU, int XS, int WS, int WSB, bool PF>
+__global__ void __launch_bounds__(VS_MAX_ROWS / (16 * RTW) * 32, 1) nvfp4_vstream_tma(const legion_nvfp4_mm p) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    using namespace legion_tma;
+    static_assert(!GLU || RTW == 2, "SwiGLU: gate and up tiles");
+    static_assert(XS >= 2 && WS >= 2 && (WSB == 4 || WSB == 8), "stages");
+    constexpr int NT = 8, BN = 8 * NT, LDXS = vs_ldx(1), XSTAGE = 64 * LDXS;  // XSTAGE in BF16
+    constexpr int LDS = vs_lds(WSB), WR = 16 * RTW;                             // WR: weight rows per warp
+    constexpr int OW = GLU ? 16 : WR;                                           // output rows per warp
+    extern __shared__ __align__(16) unsigned char smem[];
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int threads = blockDim.x, warps = threads / 32;
+    const int wrows = warps * WR;
+    __nv_bfloat16 * xsm = (__nv_bfloat16 *) smem;
+    unsigned char * wsm = smem + XS * XSTAGE * 2;                             // [slot][row] of LDS bytes
+    uint64_t * bar = (uint64_t *) (wsm + WS * wrows * LDS) + warp * WS;      // this warp's WS slots
+    const int64_t n0 = (int64_t) blockIdx.y * BN;
+    const int n_tok = (int) min((int64_t) BN, p.n - n0);
+    const float sc = (p.scale ? *p.scale : 1.0f) * 1024.0f;  // 2^10 undoes the decoding's 2^-10
+    const float sc2 = (p.scale2 ? *p.scale2 : 1.0f) * 1024.0f;
+    const int nblk = (int) (p.k / BK);
+    const int nst = (nblk + WSB - 1) / WSB;  // weight stages of a row tile
+    // This CTA's units (warp tiles of OW output rows): [u0, u1), in tiles of `warps` units.
+    const int64_t units = (p.m + OW - 1) / OW;
+    const int64_t u0 = (int64_t) blockIdx.x * units / gridDim.x;
+    const int64_t u1 = (int64_t) (blockIdx.x + 1) * units / gridDim.x;
+    const int tiles = (int) ((u1 - u0 + warps - 1) / warps);
+    const int stages = tiles * nst;
+
+    // Weight row r (0 .. WR - 1) of warp wp in tile i, and whether it exists (rows past the CTA's
+    // units or past m: no).
+    auto w_row = [&](int i, int wp, int r, bool & ok) -> const uint8_t * {
+        const int64_t unit = u0 + (int64_t) i * warps + wp;
+        const int64_t row = GLU ? unit * 16 + r % 16 : unit * WR + r;
+        ok = unit < u1 && row < p.m;
+        return (GLU && r / 16 ? p.w2 : p.w) + (ok ? row : 0) * p.w_ld;
+    };
+    // Weight stage g (tile g / nst, blocks WSB * (g % nst) on) of this warp's rows into its slot
+    // g % WS, lane r copying row r; the whole warp calls it.
+    auto issue = [&](int g) {
+        const int i = g / nst, q = g % nst, s = g % WS;
+        const int blocks = min(WSB, nblk - q * WSB);
+        // A row's last stage of a k that is not a multiple of 4 blocks: up to the 16-byte word
+        // that holds its end (w_ld % 16 == 0, so inside the row's pitch).
+        const uint32_t bytes = (uint32_t) (blocks * 36 + 15) & ~15u;
+        bool ok = false;
+        const uint8_t * row = lane < WR ? w_row(i, warp, lane, ok) : p.w;
+        const unsigned rows = __ballot_sync(0xffffffffu, ok);
+        if (lane == 0) {
+            bar_expect_tx(bar + s, bytes * (uint32_t) __popc(rows));  // the warp's one arrival
+        }
+        __syncwarp();
+        if (ok) {
+            // The slot's last reads (this warp's, a stage ago) before the TMA writes it.
+            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+            asm volatile(
+                "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n" ::"r"(
+                    saddr(wsm + (s * wrows + warp * WR + lane) * LDS)),
+                "l"(row + (int64_t) q * WSB * 36), "r"(bytes), "r"(saddr(bar + s))
+                : "memory");
+        }
+    };
+    // Activation stage u (block u) of the tile's tokens into slot u % XS (tokens past the last
+    // one: zeros).
+    auto load_x = [&](int u) {
+        __nv_bfloat16 * xs = xsm + (u % XS) * XSTAGE;
+        for (int c = threadIdx.x; c < BN * 8; c += threads) {
+            const int t = c / 8, col = c % 8 * 8;
+            const bool ok = t < n_tok;
+            const int64_t off = ok ? (n0 + t) * p.x_ld + (int64_t) u * BK + col : 0;
+            cp_async16(xs + t * LDXS + col, p.x + off, ok);
+        }
+    };
+    // Each of tile i's rows' next 32 blocks (from block b) in one L2 bulk prefetch.
+    auto prefetch = [&](int i, int b) {
+        for (int r = threadIdx.x; PF && r < wrows && b < nblk; r += threads) {
+            bool ok;
+            const uint8_t * row = w_row(i, r / WR, r % WR, ok);
+            if (ok) {
+                const uintptr_t a = (uintptr_t) (row + (int64_t) b * 36);
+                const uintptr_t e = a + min(32, nblk - b) * 36;
+                const uintptr_t a16 = a & ~(uintptr_t) 15;
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(a16),
+                             "r"((uint32_t) ((e - a16 + 15) & ~(uintptr_t) 15)));
+            }
+        }
+    };
+
+    if (lane == 0) {
+        for (int s = 0; s < WS; s++) {
+            bar_init(bar + s, 1);
+        }
+        bar_init_fence();
+    }
+    __syncwarp();
+    for (int g = 0; g < WS - 1 && g < stages; g++) {
+        issue(g);
+    }
+
+    float acc[RTW][NT][4];
+    int g = 0;  // the warp's weight stage being computed, plus one
+    for (int i = 0; i < tiles; i++) {
+        const int64_t unit = u0 + (int64_t) i * warps + warp;
+        const bool active = unit < u1;
+#pragma unroll
+        for (int r = 0; r < RTW; r++)
+#pragma unroll
+            for (int j = 0; j < NT; j++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) acc[r][j][e] = 0.0f;
+        prefetch(i, 0);
+        prefetch(i, 32);
+        // Activation groups: the prologue's XS - 1, then one per block.
+#pragma unroll
+        for (int s = 0; s < XS - 1; s++) {
+            if (s < nblk) {
+                load_x(s);
+            }
+            asm volatile("cp.async.commit_group;\n" ::);
+        }
+        for (int u = 0; u < nblk; u++) {
+            asm volatile("cp.async.wait_group %0;\n" ::"n"(XS - 2));
+            __syncthreads();
+            if (u + XS - 1 < nblk) {
+                load_x(u + XS - 1);
+            }
+            asm volatile("cp.async.commit_group;\n" ::);
+            if (u % WSB == 0) {
+                // Stage g's first block: refill the slot of stage g - 1 (done) with stage
+                // g + WS - 1, then wait for stage g.
+                if (g + WS - 1 < stages) {
+                    issue(g + WS - 1);
+                }
+                bar_wait(bar + g % WS, (uint32_t) (g / WS) & 1);
+                g++;
+            }
+            if (u > 0 && u % 32 == 0) {
+                prefetch(i, u + 32);
+            }
+            if (active) {
+                const unsigned char * ws = wsm + ((g - 1) % WS * wrows + warp * WR) * LDS + u % WSB * 36;
+                const __nv_bfloat16 * xs = xsm + (u % XS) * XSTAGE;
+                if (n_tok == BN) {
+                    vs_mma_block<RTW, LDS, LDXS, 0, true>(acc, ws, xs, lane, n_tok);
+                } else {
+                    vs_mma_block<RTW, LDS, LDXS, 0, false>(acc, ws, xs, lane, n_tok);
+                }
+            }
+        }
+        asm volatile("cp.async.wait_group 0;\n" ::);
+        __syncthreads();  // every warp is done with the activation stages before the next tile's copies
+
+        if (active) {
+            vs_store<RTW, GLU>(p, acc, unit * OW, n0, n_tok, lane, sc, sc2);
+        }
+    }
+#else
+    __trap();  // vstream_tma launches it only where pdl_code says the device runs sm_90+ code
 #endif
 }
 
@@ -1597,6 +1795,111 @@ int vstream_variant(const legion_nvfp4_mm & p, int variant, cudaStream_t st) {
     return -1;
 }
 
+template <typename K> bool pdl_code(K kernel);
+
+// Warps per CTA of nvfp4_vstream_tma over `units` warp tiles on `slots` CTAs (SMs times CTAs per
+// SM): vs_warps' fewest warp-rounds (each CTA's run of units in tiles of its warps), within
+// `smem_max` bytes of shared memory.
+inline int vs_warps_tma(int64_t units, int64_t slots, int rtw, int xs, int ws, int wsb, int smem_max) {
+    int best = 0;
+    int64_t cost = INT64_MAX;
+    const int64_t per = (units + slots - 1) / slots;
+    for (int w = 1; w * 16 * rtw <= VS_MAX_ROWS && vs_smem_tma(w, rtw, xs, ws, wsb) <= smem_max; w++) {
+        const int64_t c = (per + w - 1) / w * (w < VS_MIN_WARPS ? VS_MIN_WARPS : w);
+        if (c <= cost) {
+            cost = c;
+            best = w;
+        }
+    }
+    return best;
+}
+
+// nvfp4_vstream_tma's launch: CPS CTAs per SM (2: up to half an SM's shared memory each, fewer
+// when the registers do not fit two), each a run of units (p.tiles_m set here, to the units);
+// `fw` > 0: CTAs of that many warps (the bench's; -1 when they do not fit). Weights not 16-byte
+// aligned: nvfp4_gemm's default, as nvfp4_vstream. A device that does not run this file's sm_90+
+// code (an AC922's V100s): nvfp4_vstream's default variant (the same bits).
+template <int RTW, bool GLU, int XS, int WS, int WSB, bool PF, int CPS>
+int vstream_tma(const legion_nvfp4_mm & p0, cudaStream_t st, int fw = 0) {
+    constexpr int MI = GLU ? 2 : 1;
+    if (p0.plan) {
+        return -1;
+    }
+    if (p0.w_ld % 16 != 0 || ((uintptr_t) p0.w | (uintptr_t) (GLU ? p0.w2 : p0.w)) % 16 != 0) {
+        return gemm<MI, 8, GLU>(p0, st);
+    }
+    auto kernel = nvfp4_vstream_tma<RTW, GLU, XS, WS, WSB, PF>;
+    if (!pdl_code(kernel)) {
+        return vstream<RTW, GLU, 1, 4, 0>(p0, st);
+    }
+    const int sm_count = legion_cuda_sm_count();
+    const int sms = sm_count > 0 ? sm_count : 1;
+    const int64_t ow = GLU ? 16 : 16 * RTW;
+    const int64_t units = (p0.m + ow - 1) / ow;
+    const int smem_max = CPS == 1 ? VS_SMEM_MAX : 100 * 1024 / CPS - 1024;
+    const int warps = fw > 0 ? fw : vs_warps_tma(units, (int64_t) CPS * sms, RTW, XS, WS, WSB, smem_max);
+    if (warps == 0 || warps * 16 * RTW > VS_MAX_ROWS || vs_smem_tma(warps, RTW, XS, WS, WSB) > smem_max) {
+        return -1;
+    }
+    const int smem = vs_smem_tma(warps, RTW, XS, WS, WSB);
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    int cps = 1;
+    if constexpr (CPS > 1) {
+        cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+        int fit = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&fit, kernel, warps * 32, smem) != cudaSuccess) {
+            return status();
+        }
+        cps = fit < 1 ? 1 : fit < CPS ? fit : CPS;
+    }
+    legion_nvfp4_mm p = p0;
+    p.tiles_m = (int32_t) units;
+    const int64_t slots = (int64_t) cps * sms;
+    const dim3 grid((unsigned) (units < slots ? units : slots), (unsigned) p.tiles_n);
+    kernel<<<grid, warps * 32, smem, st>>>(p);
+    return status();
+}
+
+// nvfp4_vstream_tma's variants (GemmTune::stream_tma in src/model/nvfp4_mm.rs): variant % 1000
+// == 98, variant / 1000 = RTW + 10 * XS + 100 * WS + 1000 * weights (1: stages of 4 blocks, 2:
+// of 8; 3, 4: the same without the L2 prefetch) + 10000 * CTAs per SM + 100000 * CTA warps (0:
+// vs_warps_tma's; the bench's). -2: not such a variant; -1: not compiled.
+template <int MI, int NT, bool GLU>
+int vstream_tma_variant(const legion_nvfp4_mm & p, int variant, cudaStream_t st) {
+    if (variant < 1000 || variant % 1000 != 98) {
+        return -2;
+    }
+    if constexpr (NT == 8 && MI == (GLU ? 2 : 1)) {
+        const int v = variant / 1000 % 100000;
+        const int fw = variant / 100000000;
+        if constexpr (GLU) {
+            switch (v) {
+                case 11332: return vstream_tma<2, true, 3, 3, 4, true, 1>(p, st, fw);
+                case 11232: return vstream_tma<2, true, 3, 2, 4, true, 1>(p, st, fw);
+                case 11342: return vstream_tma<2, true, 4, 3, 4, true, 1>(p, st, fw);
+                case 12232: return vstream_tma<2, true, 3, 2, 8, true, 1>(p, st, fw);
+                case 13332: return vstream_tma<2, true, 3, 3, 4, false, 1>(p, st, fw);
+                case 21222: return vstream_tma<2, true, 2, 2, 4, true, 2>(p, st, fw);
+                default: return -1;
+            }
+        } else {
+            switch (v) {
+                case 11331: return vstream_tma<1, false, 3, 3, 4, true, 1>(p, st, fw);
+                case 11341: return vstream_tma<1, false, 4, 3, 4, true, 1>(p, st, fw);
+                case 11431: return vstream_tma<1, false, 3, 4, 4, true, 1>(p, st, fw);
+                case 11441: return vstream_tma<1, false, 4, 4, 4, true, 1>(p, st, fw);
+                case 12231: return vstream_tma<1, false, 3, 2, 8, true, 1>(p, st, fw);
+                case 12331: return vstream_tma<1, false, 3, 3, 8, true, 1>(p, st, fw);
+                case 13331: return vstream_tma<1, false, 3, 3, 4, false, 1>(p, st, fw);
+                case 21321: return vstream_tma<1, false, 2, 3, 4, true, 2>(p, st, fw);
+                case 11332: return vstream_tma<2, false, 3, 3, 4, true, 1>(p, st, fw);
+                default: return -1;
+            }
+        }
+    }
+    return -1;
+}
+
 // The bench's prefetch runs (legion nvfp4-gemm-bench, nvfp4-mv-bench --dense; #1176 r36):
 // variant tune + 100 * DIAG_PF*, the tune's kernel with the weights' L2 prefetch in runs of
 // 4 / 8 / 16 / 32 blocks, the same sums. Compiled for the tiles prefill uses: 128 tokens (the
@@ -1663,6 +1966,9 @@ int gemm_l1(const legion_nvfp4_mm & p, int & variant, cudaStream_t st) {
 template <int MI, int NT, bool GLU>
 int gemm_variant(const legion_nvfp4_mm & p, int variant, cudaStream_t st) {
     if (const int r = vstream_variant<MI, NT, GLU>(p, variant, st); r != -2) {
+        return r;
+    }
+    if (const int r = vstream_tma_variant<MI, NT, GLU>(p, variant, st); r != -2) {
         return r;
     }
     if (const int r = gemm_l1<MI, NT, GLU>(p, variant, st); r != -2) {

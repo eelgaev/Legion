@@ -345,31 +345,60 @@ fn gemm_tune_codes() {
     assert_eq!(GemmTune::from_code(60_412_099).warps, 60_412);
     assert!(GemmTune::from_code(120_411_099).is_stream());
     assert!(!GEMM_VERIFY.is_stream() && !GEMM_DEFAULT.is_stream());
+    // Its TMA weights (... 98): RTW, XS, WS, weight stages, CTAs per SM; CTA warps above.
+    assert_eq!(GEMM_STREAM_TMA.code(), 11_331_098);
+    assert_eq!(GEMM_STREAM_TMA_GLU.code(), 11_332_098);
+    for t in [
+        GEMM_STREAM_TMA,
+        GEMM_STREAM_TMA_GLU,
+        GemmTune::stream_tma(1, 2, 3, 1, 2),
+    ] {
+        assert!(t.is_stream());
+        assert_eq!(GemmTune::from_code(t.code()), t);
+        assert_eq!(t.rows(128), 128);
+        assert!(!gemm_tune_fits(1, 8, t));
+    }
+    assert!(GemmTune::from_code(611_331_098).is_stream());
+    assert_eq!(GemmTune::from_code(611_331_098).warps, 611_331);
 }
 
 #[test]
 fn dense_gemm_tune_at_33_64_tokens() {
     // Gemma 4 31B's verify steps of 5-8 users (33-64 rows): the streaming GEMM from 4096
-    // rows and for the fused GLU.
+    // rows and for the fused GLU; a matmul with longer rows than it has rows (o 8192:5376, down
+    // 21504:5376, a rank's down 10752:5376) on #180's tune up to 48 tokens.
     for n in 33..=64 {
         assert_eq!(
             pick_dense(5376, 8192, n, 48, MV_MAX_N),
             Kernel::Gemm { mi: 1, nt: 8 }
         );
-        assert_eq!(dense_gemm_tune(8192, n, 8, false), GEMM_STREAM);
-        assert_eq!(dense_gemm_tune(4096, n, 8, false), GEMM_STREAM);
-        assert_eq!(dense_gemm_tune(5376, n, 8, false), GEMM_STREAM);
-        assert_eq!(dense_gemm_tune(16384, n, 8, false), GEMM_STREAM);
-        assert_eq!(dense_gemm_tune(2048, n, 8, false), GEMM_DEFAULT);
-        assert_eq!(dense_gemm_tune(21504, n, 8, true), GEMM_STREAM_GLU);
+        assert_eq!(dense_gemm_tune(5376, 8192, n, 8, false), GEMM_STREAM_TMA);
+        assert_eq!(dense_gemm_tune(5376, 4096, n, 8, false), GEMM_STREAM_TMA);
+        assert_eq!(dense_gemm_tune(4096, 5376, n, 8, false), GEMM_STREAM_TMA);
+        assert_eq!(dense_gemm_tune(5376, 16384, n, 8, false), GEMM_STREAM_TMA);
+        assert_eq!(dense_gemm_tune(5376, 2048, n, 8, false), GEMM_DEFAULT);
+        assert_eq!(
+            dense_gemm_tune(5376, 21504, n, 8, true),
+            GEMM_STREAM_TMA_GLU
+        );
+        let long = if n <= STREAM_LONG_K_MAX_N {
+            GEMM_VERIFY
+        } else {
+            GEMM_STREAM_TMA
+        };
+        for k in [8192, 10752, 21504] {
+            assert_eq!(dense_gemm_tune(k, 5376, n, 8, false), long, "k {k} n {n}");
+        }
+        // Past GEMM_VERIFY's rows: the stream still.
+        assert_eq!(dense_gemm_tune(32768, 16384, n, 8, false), GEMM_STREAM_TMA);
     }
     for n in [1, 32, 65, 128, 4096] {
         assert_eq!(
-            dense_gemm_tune(8192, n, tokens_tile(n, 16).max(4), false),
+            dense_gemm_tune(5376, 8192, n, tokens_tile(n, 16).max(4), false),
             GEMM_DEFAULT
         );
         assert_eq!(
-            dense_gemm_tune(21504, n, tokens_tile(n, 16).max(4), true),
+            dense_gemm_tune(5376, 21504, n, tokens_tile(n, 16).max(4), true),
             GEMM_DEFAULT
         );
     }
