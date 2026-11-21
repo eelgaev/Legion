@@ -2982,9 +2982,12 @@ impl Executor {
             if !tp_lead::rows_from() {
                 self.hidden_from = 0;
             }
-            // Only the MTP head's take-in leaves the rows on the device over machines (every
-            // rank alike, `tp_step`), where it may ([`Self::mtp_rows_device`]).
-            if self.hidden_dev_from.is_none() || self.mtp_rows_device().is_none() {
+            // Over machines the rows stay on the device (every rank alike, `tp_step`) for the
+            // MTP head's take-in, where it may ([`Self::mtp_rows_device`]), and for the DFlash
+            // drafter's under `--tp-draft-split` (#1133).
+            if !self.tp_keeps_draft_rows()
+                && (self.hidden_dev_from.is_none() || self.mtp_rows_device().is_none())
+            {
                 self.hidden_on_device = None;
                 self.hidden_dev_from = None;
             }

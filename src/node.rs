@@ -28,7 +28,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// Frames before this version are refused: both ranks must run the same build.
-const VERSION: u32 = 14;
+const VERSION: u32 = 15;
 
 /// The node settings of a `legion serve` (`--node-rank`, `--node-peer`, `--node-split`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,7 +123,10 @@ pub enum Request {
     /// pieces name those rows as [`RowsPart::Device`]. `rows_from`: the first captured row
     /// rank 0 reads back (0: all), for a DFlash drafter that takes in only a prompt chunk's
     /// last rows (its ring, #1133): this rank reads back the same rows, the ones its share of
-    /// the drafter (`--tp-draft-split`) takes in.
+    /// the drafter (`--tp-draft-split`) takes in. `draft_dev`: rank 0 leaves a decode or verify
+    /// step's captured rows on the device for its share of the DFlash drafter
+    /// (`--tp-draft-split`, #1133): this rank does the same where its share reads them there,
+    /// and the draft round after the step takes them in from there.
     TpStep {
         groups: Vec<WireGroup>,
         micro: u32,
@@ -132,6 +135,7 @@ pub enum Request {
         head: u32,
         rows_dev: u64,
         rows_from: u64,
+        draft_dev: bool,
     },
     /// Save ring `ring`'s first `n` positions in copy `slot`, or (`restore`) put that copy
     /// back.
@@ -552,6 +556,7 @@ impl Request {
                 head: share,
                 rows_dev,
                 rows_from,
+                draft_dev,
             } => {
                 put_groups(&mut head, &groups);
                 put_u32(&mut head, micro);
@@ -560,6 +565,7 @@ impl Request {
                 put_u32(&mut head, share);
                 head.extend_from_slice(&rows_dev.to_le_bytes());
                 head.extend_from_slice(&rows_from.to_le_bytes());
+                head.push(u8::from(draft_dev));
                 K_TP_STEP
             }
             Request::SaveRing {
@@ -717,6 +723,7 @@ impl Request {
                 head: r.u32()?,
                 rows_dev: r.u64()?,
                 rows_from: r.u64()?,
+                draft_dev: r.u8()? != 0,
             },
             K_SAVE_RING => Request::SaveRing {
                 ring: r.u32()?,

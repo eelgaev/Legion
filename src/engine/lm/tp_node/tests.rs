@@ -115,3 +115,23 @@ fn a_draft_round_reading_rows_its_step_skipped_is_named() {
     let none = [take_in(9, 0, 16_384, 0)];
     assert_eq!(first_unread(&none, 12_288, |_| 0), None);
 }
+
+#[test]
+fn a_step_hands_back_the_rows_no_request_names() {
+    let rows = |x: f32| vec![vec![x; 4], vec![x; 2]];
+    let mut r = FollowRows::default();
+    // MTP passes name the last two steps' rows: the step before the last's go back.
+    r.host[0] = rows(1.0);
+    assert!(r.start_step(false).is_empty());
+    r.host[0] = rows(2.0);
+    assert_eq!(r.start_step(false), rows(1.0));
+    assert_eq!(r.host[1], rows(2.0));
+    // A draft round reads the last step's only (`--tp-draft-split`): those go back too.
+    r.host[0] = rows(3.0);
+    let gone = r.start_step(true);
+    assert_eq!(gone, [rows(3.0), rows(2.0)].concat());
+    assert!(r.host.iter().all(Vec::is_empty));
+    r.host[0] = rows(4.0);
+    assert_eq!(r.start_step(true), rows(4.0));
+    assert!(r.host.iter().all(Vec::is_empty));
+}
