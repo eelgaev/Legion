@@ -50,6 +50,48 @@ pub(super) fn mirror_empty_copies() -> bool {
     *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_TP_EMPTY_COPIES").is_some_and(|v| v == "1"))
 }
 
+/// Whether a step's (or pass's) send leaves unread the answers of the last one sent and of the
+/// state changes after it ([`settle_left`]); `LEGION_DEBUG_TP_SEND_AHEAD=0` reads every answer
+/// once two are owed, as before (for A/B runs only). Before, a verify step after a draft round
+/// waited there for the round's answer (the commit's and the round's were owed), so rank 1
+/// got the step a round trip after it finished the round (#1176).
+fn send_ahead() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_TP_SEND_AHEAD").is_none_or(|v| v != "0"))
+}
+
+/// Whether [`Executor::mirror_commit`] sends a verify step's commit to the other ranks as soon
+/// as the engine knows its counts, before the step's text is made (#1176);
+/// `LEGION_DEBUG_TP_EARLY_COMMIT=0` sends it with the commit, after the text, as before (for
+/// A/B runs only). The same commit either way.
+fn early_commit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_TP_EARLY_COMMIT").is_none_or(|v| v != "0"))
+}
+
+/// Before a step (or pass) goes out with `owed` answers unread, `sent` requests sent since
+/// (and with) the last step: the answers to leave unread after reading the others, `None` to
+/// read none. With `ahead` the last step's answer and those of the state changes after it
+/// (rank 1 may still be running that step; the older answers are in, it answers in order);
+/// else every answer once [`STEPS_AHEAD`] are owed (the way before).
+pub(super) fn settle_left(owed: usize, sent: usize, ahead: bool) -> Option<usize> {
+    if ahead {
+        (owed > sent).then_some(sent)
+    } else {
+        (owed >= STEPS_AHEAD).then_some(0)
+    }
+}
+
+/// [`Executor::commit`]'s `(slot, keep)` pairs as the other ranks mirror them.
+pub(super) fn commit_wire(commits: &[(usize, usize)]) -> Request {
+    Request::TpCommit {
+        commits: commits
+            .iter()
+            .map(|&(slot, keep)| (slot as u32, keep as u32))
+            .collect(),
+    }
+}
+
 /// A control connection to another rank: over the network, or to a thread of this process.
 enum RankLink {
     Net(Link),
@@ -68,6 +110,13 @@ impl RankLink {
         match self {
             Self::Net(l) => l.wait(),
             Self::Local(l) => l.wait(),
+        }
+    }
+
+    fn wait_older(&mut self, left: usize) -> Result<(), String> {
+        match self {
+            Self::Net(l) => l.wait_older(left),
+            Self::Local(l) => l.wait_older(left),
         }
     }
 
@@ -135,6 +184,8 @@ pub struct TpLead {
     /// Every rank holds a share of the DFlash drafter's FFN and runs each draft round
     /// (`--tp-draft-split`, [`Executor::tp_draft`]).
     draft_split: bool,
+    /// Requests sent since (and with) the last step, pass or draft round ([`settle_left`]).
+    since_run: usize,
 }
 
 /// The MTP head's take-in of a prompt chunk copies its pieces' rows on the device on every rank
@@ -214,6 +265,7 @@ impl TpLead {
             step_dev: None,
             media: SentMedia::default(),
             draft_split: false,
+            since_run: 0,
         }
     }
 
@@ -238,6 +290,7 @@ impl TpLead {
             step_dev: None,
             media: SentMedia::default(),
             draft_split: false,
+            since_run: 0,
         }
     }
 
@@ -268,11 +321,34 @@ impl TpLead {
 
     /// Queues `req` to every other rank.
     fn send(&mut self, req: &Request) -> Result<(), ModelError> {
+        self.since_run += 1;
         for (i, l) in self.links.iter_mut().enumerate() {
             l.send(req.clone())
                 .map_err(|e| err(format!("rank {}: {e}", i + 1)))?;
         }
         Ok(())
+    }
+
+    /// Before a step, pass or draft round goes out ([`Self::send_run`]): reads the answers
+    /// [`settle_left`] says to.
+    fn settle_runs(&mut self) -> Result<(), ModelError> {
+        if !send_ahead() {
+            return self.settle(STEPS_AHEAD);
+        }
+        let sent = self.since_run;
+        for (i, l) in self.links.iter_mut().enumerate() {
+            if let Some(left) = settle_left(l.owed(), sent, true) {
+                l.wait_older(left)
+                    .map_err(|e| err(format!("rank {}: {e}", i + 1)))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Queues a step, pass or draft round to every other rank ([`Self::settle_runs`] first).
+    fn send_run(&mut self, req: &Request) -> Result<(), ModelError> {
+        self.since_run = 0;
+        self.send(req)
     }
 
     /// `groups` as the other ranks read them. Images they do not hold yet go out first, on
@@ -555,13 +631,13 @@ impl Executor {
     ) -> Result<T, ModelError> {
         let lead = self.tp.as_mut().expect("tensor-parallel lead");
         lead.failed()?;
-        lead.settle(STEPS_AHEAD)?;
+        lead.settle_runs()?;
         let t0 = std::time::Instant::now();
         let profiling = lead.profile.enabled();
         if profiling && let Some(c) = lead.comm.net() {
             c.comm().mark_step();
         }
-        lead.send(req)?;
+        lead.send_run(req)?;
         let send = t0.elapsed();
         let out = run(self);
         let lead = self.tp.as_mut().expect("tensor-parallel lead");
@@ -585,8 +661,8 @@ impl Executor {
             return Ok(());
         };
         lead.failed()?;
-        lead.settle(STEPS_AHEAD)?;
-        lead.send(&Request::TpDraft { reqs: reqs() })
+        lead.settle_runs()?;
+        lead.send_run(&Request::TpDraft { reqs: reqs() })
     }
 
     /// The other ranks' mirror of a drafter's release of `seq` under `--tp-draft-split`.
@@ -614,6 +690,29 @@ impl Executor {
         if let Some(lead) = self.tp.as_mut() {
             lead.mirror(&req());
         }
+    }
+
+    /// Whether [`Self::mirror_commit`] sends: rank 0 of tensor parallelism over machines (not
+    /// also a model split by layers) with recurrent states, unless
+    /// `LEGION_DEBUG_TP_EARLY_COMMIT=0`.
+    pub fn early_commits(&self) -> bool {
+        self.tp.is_some()
+            && self.remote.is_none()
+            && self.model.hp.has_slot_state()
+            && early_commit()
+    }
+
+    /// Sends the other ranks the mirror of the verify step's commit of `commits` now, ahead of
+    /// [`Self::commit_mirrored`] of the same pairs here (#1176): they start their commit while
+    /// the engine makes the step's text. Whether it was sent ([`Self::early_commits`]); if not,
+    /// [`Self::commit`] sends it as before. The engine sends nothing to the other ranks in
+    /// between that reads or writes those slots' states.
+    pub fn mirror_commit(&mut self, commits: &[(usize, usize)]) -> bool {
+        if !self.early_commits() {
+            return false;
+        }
+        self.tp_mirror_states(|| commit_wire(commits));
+        true
     }
 
     /// The other ranks' read-ahead of a prompt's next chunk's table rows (`tokens`, after

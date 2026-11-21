@@ -2635,23 +2635,31 @@ impl Executor {
     /// GPUs' graphs start beside the next MTP pass instead (`commit_par`). Adapted from
     /// Strata-AC922's async commit on a layer split (eelgaev/Strata-AC922 d775be3, MIT).
     pub fn commit(&mut self, commits: &[(usize, usize)]) -> Result<(), ModelError> {
+        self.commit_with(commits, true)
+    }
+
+    /// [`Self::commit`] of `commits` whose mirror [`Self::mirror_commit`] already sent to the
+    /// other ranks.
+    pub fn commit_mirrored(&mut self, commits: &[(usize, usize)]) -> Result<(), ModelError> {
+        self.commit_with(commits, false)
+    }
+
+    /// [`Self::commit`], its mirror to the other ranks sent first if `mirror`.
+    fn commit_with(&mut self, commits: &[(usize, usize)], mirror: bool) -> Result<(), ModelError> {
         let model = &self.model;
         // Without recurrent layers a verify step has nothing to replay: the KV rows past the
         // kept tokens are simply never read again.
         if !model.hp.has_slot_state() {
             return Ok(());
         }
-        let wire = || crate::node::Request::TpCommit {
-            commits: commits
-                .iter()
-                .map(|&(slot, keep)| (slot as u32, keep as u32))
-                .collect(),
-        };
+        let wire = || tp_lead::commit_wire(commits);
         // Rank 1 of a split model commits its layers' states the same way (#560).
-        if let Some(r) = self.remote.as_mut() {
+        if mirror && let Some(r) = self.remote.as_mut() {
             r.mirror(wire());
         }
-        self.tp_mirror_states(wire);
+        if mirror {
+            self.tp_mirror_states(wire);
+        }
         // Not waited for: every stage's commit runs at once on its own device, and the next
         // step (or MTP pass) runs after it on the same stream. Anything that touches the states
         // another way waits first (`wait_commit`). Pending from the first launch on, so a later

@@ -281,6 +281,15 @@ impl Text<'_> {
         }
     }
 
+    /// Whether stop strings can end the sequence ([`Self::token`]): a sequence with any keeps
+    /// its text here.
+    pub(super) fn has_stops(&self) -> bool {
+        match self {
+            Text::Here(text) => !text.stop.is_empty(),
+            Text::Away(_) => false,
+        }
+    }
+
     /// [`TextState::end`] where the text is.
     pub(super) fn end(&mut self, outbox: &mut Outbox, end: End) {
         match self {

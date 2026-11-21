@@ -1112,9 +1112,24 @@ impl Link {
     /// Reads every reply still owed and returns the last one; an error reply (of any of
     /// them) is the error.
     pub fn wait(&mut self) -> Result<Reply, String> {
+        self.drain(0)?
+            .ok_or_else(|| "no request to wait for".into())
+    }
+
+    /// Reads the replies owed but the last `left` (the requests sent last, which may still
+    /// run on rank 1): nothing when no more are owed. An error reply among them is the error.
+    pub fn wait_older(&mut self, left: usize) -> Result<(), String> {
+        self.drain(left).map(|_| ())
+    }
+
+    /// Reads the replies owed until `left` are, and returns the last one read.
+    fn drain(&mut self, left: usize) -> Result<Option<Reply>, String> {
         let mut last = None;
         let mut err = None;
-        while let Some(sent) = self.pending.pop_front() {
+        while self.pending.len() > left {
+            let Some(sent) = self.pending.pop_front() else {
+                break;
+            };
             let r = self.read_reply()?;
             let waited = |ms: f32| (sent.elapsed().as_secs_f64() * 1e3 - f64::from(ms)).max(0.0);
             match &r {
@@ -1141,7 +1156,7 @@ impl Link {
         }
         match err {
             Some(e) => Err(format!("node rank 1: {e}")),
-            None => last.ok_or_else(|| "no request to wait for".into()),
+            None => Ok(last),
         }
     }
 

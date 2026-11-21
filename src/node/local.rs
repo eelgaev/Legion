@@ -67,9 +67,21 @@ impl LocalLink {
     /// Reads every reply still owed and returns the last one; an error reply (of any of them)
     /// is the error.
     pub fn wait(&mut self) -> Result<Reply, String> {
+        self.drain(0)?
+            .ok_or_else(|| "no request to wait for".into())
+    }
+
+    /// Reads the replies owed but the last `left` (the requests sent last, which the rank may
+    /// still run): nothing when no more are owed. An error reply among them is the error.
+    pub fn wait_older(&mut self, left: usize) -> Result<(), String> {
+        self.drain(left).map(|_| ())
+    }
+
+    /// Reads the replies owed until `left` are, and returns the last one read.
+    fn drain(&mut self, left: usize) -> Result<Option<Reply>, String> {
         let mut last = None;
         let mut err = None;
-        while self.pending > 0 {
+        while self.pending > left {
             let r = recv(&self.rx).ok_or("the rank stopped")?;
             self.pending -= 1;
             match r {
@@ -79,7 +91,7 @@ impl LocalLink {
         }
         match err {
             Some(e) => Err(e),
-            None => last.ok_or_else(|| "no request to wait for".into()),
+            None => Ok(last),
         }
     }
 

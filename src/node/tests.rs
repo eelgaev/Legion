@@ -399,6 +399,19 @@ fn link_answers_in_order_over_tcp() {
     link.send(Request::ClearSlot { slot: 99 }).unwrap();
     link.send(Request::ClearSlot { slot: 1 }).unwrap();
     assert!(link.wait().unwrap_err().contains("bad slot"));
+    // The older replies read, the last request's left owed; then it is the wait's.
+    link.send(Request::ClearSlot { slot: 2 }).unwrap();
+    link.send(Request::Step {
+        groups: Vec::new(),
+        rows: vec![2.0, 3.0],
+    })
+    .unwrap();
+    link.wait_older(1).unwrap();
+    assert_eq!(link.owed(), 1);
+    match link.wait().unwrap() {
+        Reply::Step { argmax, .. } => assert_eq!(argmax, vec![6, 2]),
+        r => panic!("{r:?}"),
+    }
     drop(link);
-    assert_eq!(server.join().unwrap(), 4);
+    assert_eq!(server.join().unwrap(), 6);
 }

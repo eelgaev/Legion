@@ -29,6 +29,7 @@ mod adaptive;
 mod bandwidth;
 mod captures;
 mod chat_format;
+mod early_commit;
 mod even;
 mod first_rows;
 mod fit;
@@ -8548,6 +8549,30 @@ impl Worker {
         let keep_history = self.spec_k > 0 || self.warm_on || self.on_demand() || self.end_saves;
         // Whether a row's device argmax is the host argmax of its logits (#695).
         let exact = self.exec.model().hp.arch.argmax_first_of_ties();
+        // A verify step over machines (#1176): every sequence's drafts are verified before any
+        // of the step's text is made, so the other ranks get the commit as soon as its counts
+        // are known instead of after the detokenizer, the stream sends and the stop strings
+        // ([`early_commit`]). `early`: the pairs sent, which this rank then commits.
+        let mut verified_early = Vec::new();
+        let mut early = None;
+        if verify
+            && self.exec.early_commits()
+            && decoding.iter().all(|s| early_commit::plain(&s.active))
+        {
+            verified_early = (decoding.iter_mut())
+                .map(|seq| verify_drafts(seq, &mut rows, n_tok, exact, &self.stop_tokens))
+                .collect();
+            let stop = &self.stop_tokens[..];
+            let ends = (decoding.iter().zip(&verified_early))
+                .any(|(s, v)| early_commit::may_end(&s.active, s.n_past, &v.o.appended, stop));
+            if !ends {
+                let pairs = early_commit::pairs(base, &verified_early);
+                if self.exec.mirror_commit(&pairs) {
+                    early = Some(pairs);
+                }
+            }
+        }
+        let mut verified_early = verified_early.into_iter();
         for (i, seq) in decoding.iter_mut().enumerate() {
             let start = seq.n_past;
             let mut appended = Vec::new();
@@ -8576,24 +8601,10 @@ impl Worker {
                     self.trim(seq, seq.n_past);
                 }
             } else {
-                let drafts = std::mem::take(&mut seq.draft);
-                let a = &mut seq.active;
-                let mut mine: Vec<_> = rows.by_ref().take(n_tok).collect();
-                mine.truncate(1 + drafts.tokens.len());
-                let mut target = SeqTarget {
-                    keep_raw: a.logprobs.is_some(),
-                    device_picks: exact && a.logprobs.is_none() && a.sampler.is_greedy(),
-                    rows: mine,
-                    sampler: &mut a.sampler,
-                    raw: Vec::new(),
-                    mask_rows: a.min_tokens.saturating_sub(a.generated) as usize,
-                    stop_tokens: &self.stop_tokens,
+                let Verified { drafts, o, mut raw } = match verified_early.next() {
+                    Some(v) => v,
+                    None => verify_drafts(seq, &mut rows, n_tok, exact, &self.stop_tokens),
                 };
-                let (stop, ignore_eos) = (&self.stop_tokens, a.ignore_eos);
-                let o = accept::verify(&mut target, &drafts.tokens, &drafts.probs, |t| {
-                    !ignore_eos && stop.contains(&t)
-                });
-                let mut raw = target.raw;
                 // Drafts after an accepted end-of-generation token were never verified (the
                 // step ended on an accepted draft: no token was picked after it).
                 let verified = if o.appended.len() == o.accepted {
@@ -8649,9 +8660,16 @@ impl Worker {
             }
             if finished {
                 // A verify step left the state where the step started (finished sequences
-                // are not committed); a decode step advanced it.
+                // are not committed), unless its commit went out early; a decode step
+                // advanced it.
                 done.push(i);
-                done_at.push(if verify { start } else { seq.n_past });
+                let committed = early.is_some();
+                if committed {
+                    tracing::debug!(slot = base + i, "a sequence ended after its early commit");
+                }
+                done_at.push(early_commit::end_state(
+                    verify, committed, start, seq.n_past,
+                ));
             }
             sampled += appended.len() as u64 + u64::from(finished);
             ran.push((start, appended.len()));
@@ -8750,7 +8768,16 @@ impl Worker {
             // Before any slot moves: the verify group's states are those of slots `base..`.
             self.clock.lap(host_time::Phase::Finish, &mut at);
             let t = Instant::now();
-            self.exec.commit(&commits).map_err(|e| e.to_string())?;
+            match &early {
+                // The pairs the other ranks commit: every slot of the group, a sequence that
+                // ended after all included (its end save skipped, [`early_commit::end_state`]).
+                Some(sent) => {
+                    debug_assert!(early_commit::covers(sent, &commits));
+                    self.exec.commit_mirrored(sent)
+                }
+                None => self.exec.commit(&commits),
+            }
+            .map_err(|e| e.to_string())?;
             let commit_ms = t.elapsed().as_secs_f64() * 1e3;
             self.clock.lap(host_time::Phase::Device, &mut at);
             tracing::debug!(
@@ -9065,7 +9092,9 @@ impl Worker {
         for (&i, &state_at) in done.iter().zip(&done_at).rev() {
             let mut seq = decoding.swap_remove(i);
             self.log_done(&seq);
-            self.save_end(&seq, state_at, &mut copies);
+            if let Some(state_at) = state_at {
+                self.save_end(&seq, state_at, &mut copies);
+            }
             self.release(&mut seq);
             if i < decoding.len() {
                 copies.push((Pool::Seq, base + decoding.len(), Pool::Seq, base + i));
@@ -9309,6 +9338,45 @@ fn verify_logits(kind: Logits, n: usize, generated: u32, min_tokens: u32) -> Log
     }
 }
 
+/// A sequence's drafts verified against its rows of a verify step ([`verify_drafts`]).
+struct Verified {
+    drafts: Draft,
+    o: accept::Outcome,
+    /// Per appended token, its row's raw logits when kept (log probabilities).
+    raw: Vec<Option<Vec<f32>>>,
+}
+
+/// Verifies `seq`'s drafts (taken from it) against its `n_tok` rows of a verify step, the next
+/// of `rows` ([`accept::verify`]). Touches nothing but `seq`'s drafts and sampler, so the
+/// sequences of a step may be verified before any of them advances.
+fn verify_drafts(
+    seq: &mut Seq<'_>,
+    rows: &mut impl Iterator<Item = (u32, Vec<f32>)>,
+    n_tok: usize,
+    exact: bool,
+    stop_tokens: &[u32],
+) -> Verified {
+    let drafts = std::mem::take(&mut seq.draft);
+    let a = &mut seq.active;
+    let mut mine: Vec<_> = rows.by_ref().take(n_tok).collect();
+    mine.truncate(1 + drafts.tokens.len());
+    let mut target = SeqTarget {
+        keep_raw: a.logprobs.is_some(),
+        device_picks: exact && a.logprobs.is_none() && a.sampler.is_greedy(),
+        rows: mine,
+        sampler: &mut a.sampler,
+        raw: Vec::new(),
+        mask_rows: a.min_tokens.saturating_sub(a.generated) as usize,
+        stop_tokens,
+    };
+    let ignore_eos = a.ignore_eos;
+    let o = accept::verify(&mut target, &drafts.tokens, &drafts.probs, |t| {
+        !ignore_eos && stop_tokens.contains(&t)
+    });
+    let raw = target.raw;
+    Verified { drafts, o, raw }
+}
+
 /// One sequence being generated: everything but the model state.
 struct Active<'t> {
     sampler: Sampler,
@@ -9539,8 +9607,9 @@ impl<'t> Active<'t> {
             self.finish(outbox, FinishReason::StopSequence, Some(stop));
             return None;
         }
-        // The fed-back token needs a cache slot: stop when the context is full.
-        if self.generated >= self.max_tokens || n_past >= self.max_ctx {
+        // The fed-back token needs a cache slot: stop when the context is full. The same test
+        // as a verify step's early commit makes ([`early_commit::may_end`]).
+        if early_commit::at_limit(self.generated, self.max_tokens, n_past, self.max_ctx) {
             self.end(outbox, FinishReason::Length, false);
             return None;
         }

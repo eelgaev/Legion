@@ -51,6 +51,36 @@ fn an_error_reply_is_the_error() {
 }
 
 #[test]
+fn older_replies_are_read_and_the_last_ones_left() {
+    let (mut link, serve) = local_link();
+    let rank = std::thread::spawn(move || {
+        serve.serve(&mut |req| match req {
+            Request::ClearSlot { slot: 1 } => Reply::Error("slot 1".into()),
+            Request::Resize { n_blocks } => Reply::Hello { n_blocks },
+            _ => Reply::Done,
+        })
+    });
+    for n in 1..=4 {
+        link.send(Request::Resize { n_blocks: n }).unwrap();
+    }
+    // Nothing to read with no more owed than left.
+    link.wait_older(4).unwrap();
+    assert_eq!(link.owed(), 4);
+    link.wait_older(1).unwrap();
+    assert_eq!(link.owed(), 1);
+    // The one left is the last request's.
+    assert_eq!(link.wait().unwrap(), Reply::Hello { n_blocks: 4 });
+    // An error among the older ones is the error; the ones after it stay owed.
+    link.send(Request::ClearSlot { slot: 1 }).unwrap();
+    link.send(Request::ClearSlot { slot: 2 }).unwrap();
+    assert_eq!(link.wait_older(1).unwrap_err(), "slot 1");
+    assert_eq!(link.owed(), 1);
+    assert_eq!(link.wait().unwrap(), Reply::Done);
+    drop(link);
+    rank.join().unwrap();
+}
+
+#[test]
 fn a_stopped_rank_is_an_error() {
     let (mut link, serve) = local_link();
     drop(serve);
