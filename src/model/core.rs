@@ -3469,8 +3469,32 @@ impl Model {
         h: Tensor<'a>,
         res: Option<Tensor<'a>>,
     ) -> Result<Tensor<'a>, ModelError> {
+        self.delta_net_opts(pass, il, h, res, false)
+    }
+
+    /// [`Self::delta_net`] of a layer whose verify groups' deferred commits ran already, in the
+    /// wait of the exchange before it (#1176, [`SpecPool::commits_beside`]): their delta rule
+    /// replays nothing ([`SpecPool::zero_counts`]) and still stores the step's inputs.
+    pub(crate) fn delta_net_committed<'a>(
+        &'a self,
+        pass: &Pass<'a>,
+        il: usize,
+        h: Tensor<'a>,
+    ) -> Result<Tensor<'a>, ModelError> {
+        self.delta_net_opts(pass, il, h, None, true)
+    }
+
+    /// [`Self::delta_net_res`]; `committed`: as [`Self::delta_net_committed`].
+    fn delta_net_opts<'a>(
+        &'a self,
+        pass: &Pass<'a>,
+        il: usize,
+        h: Tensor<'a>,
+        res: Option<Tensor<'a>>,
+        committed: bool,
+    ) -> Result<Tensor<'a>, ModelError> {
         let pf_join = std::cell::Cell::new(None);
-        let out = self.delta_net_layer(pass, il, h, res, &pf_join)?;
+        let out = self.delta_net_layer(pass, il, h, res, &pf_join, committed)?;
         // The side stream's z prefetch ([`l2_prefetch`]) joins the compute stream
         // behind the output projection (z never waits for it), in the layer's capture.
         if let Some(pf) = pf_join.get() {
@@ -3488,6 +3512,7 @@ impl Model {
         h: Tensor<'a>,
         res: Option<Tensor<'a>>,
         pf_join: &std::cell::Cell<Option<Tensor<'a>>>,
+        committed: bool,
     ) -> Result<Tensor<'a>, ModelError> {
         let (ctx, tap, n) = (pass.ctx, &pass.tap, pass.n);
         debug_assert!(
@@ -3766,7 +3791,13 @@ impl Model {
                 let rows = if let Some((keep, replay, arrive)) = replay {
                     // The last commit deferred into this step (#836 part 14): a pool that
                     // defers has no other way to run it. The op then stores this step's inputs
-                    // there for the next one (part 39).
+                    // there for the next one (part 39). Where an exchange before the layer ran
+                    // it in its wait (#1176), it replays nothing.
+                    let keep = if committed {
+                        spec.zero_counts(ctx, sh.slot, sh.n_seqs)
+                    } else {
+                        keep
+                    };
                     assert!(
                         gdn::replay_fits(q, k, v, g, beta, ssm_state, keep, replay, arrive),
                         "a verify step that cannot replay its deferred commits"

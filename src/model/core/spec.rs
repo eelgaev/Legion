@@ -349,7 +349,7 @@ impl SpecPool {
             .clone()
             .filter(|&il| il < hp.n_layer && hp.is_recurrent(il))
             .collect();
-        let ctx = Context::new(7 * layers.len().max(1) + 3, 0);
+        let ctx = Context::new(7 * layers.len().max(1) + 4, 0);
         let conv_dim = hp.ssm_d_inner + 2 * hp.ssm_n_group * hp.ssm_d_state;
         let n_v = hp.ssm_dt_rank;
         let head_v = hp.ssm_d_inner / n_v;
@@ -416,6 +416,9 @@ impl SpecPool {
             // launches. One set for every layer: the layers run one after another.
             ctx.new_tensor(types::I32, &[hp.ssm_n_group * s])
                 .named("spec_arrive");
+            // Zero counts for the verify steps whose deferred commits ran already (#1176,
+            // [`Self::commits_beside`]). Never written.
+            ctx.new_tensor(types::I32, &[s]).named("spec_zero");
         }
         let ple = match hp.arch.token_conv(hp) {
             Some(c) if stage.contains(&c.layer) => {
@@ -1084,6 +1087,53 @@ impl SpecPool {
             .tensor("spec_arrive")
             .expect("a pool that defers its commits");
         Some((keep, rows, (arrive, slot)))
+    }
+
+    /// Whether a verify step's deferred commits may run before it, on their own
+    /// ([`Self::commits_beside`]): a pool whose verify steps replay them and never leave a state
+    /// as it is (#836: a step that may leave it decides so in the delta rule).
+    pub fn commits_ahead(&self) -> bool {
+        self.defer && !self.pending.lock().unwrap().may_leave()
+    }
+
+    /// Layer `il`'s deferred commits of the verify groups `groups` ((first slot, sequences))
+    /// that replay them ([`Self::replays`]), each group's as one node for an exchange over
+    /// machines to run in its wait (#1176, [`super::gdn::commit_replay_beside`], over
+    /// [`Self::replay_views`]' counts and rows and `rec`'s states): the commits that group's
+    /// verify step would replay first. Those steps then read [`Self::zero_counts`] instead;
+    /// the other groups' commits ran at once. None where [`Self::commits_ahead`] says no or
+    /// the layer has no state here.
+    pub fn commits_beside<'a>(
+        &'a self,
+        ctx: &'a Context,
+        rec: &'a StatePool,
+        il: usize,
+        groups: &[(usize, usize)],
+    ) -> Vec<Tensor<'a>> {
+        if !self.commits_ahead() || !self.layers.contains(&il) {
+            return Vec::new();
+        }
+        groups
+            .iter()
+            .filter_map(|&(slot, n)| {
+                let (keep, rows, _) = self.replay_views(ctx, il, slot, n)?;
+                let state = rec.ssm_slots(ctx, il, slot, n);
+                Some(super::gdn::commit_replay_beside(
+                    ctx, rows, state, keep, self.n_k,
+                ))
+            })
+            .collect()
+    }
+
+    /// Zero counts for the `n` slots from `slot` (I32 `[n]`): what a verify step whose deferred
+    /// commits ran already ([`Self::commits_beside`]) replays.
+    pub fn zero_counts<'a>(&'a self, ctx: &'a Context, slot: usize, n: usize) -> Tensor<'a> {
+        self.check(slot, 1, n as i64);
+        let z = self
+            .ctx
+            .tensor("spec_zero")
+            .expect("a pool that defers its commits");
+        ctx.view_1d(z, n as i64, slot * z.nb()[0])
     }
 
     /// Queues the upload of `counts` (one per slot) into the device's deferred counts.

@@ -23,6 +23,7 @@
 //!   `KvPool`); a pool's key is computed once, in the step that completes it. Up to `top_k`
 //!   tokens every visible key is selected, so the result equals dense attention.
 
+mod commit_wait;
 pub mod hc;
 mod hc_chain;
 pub mod hc_down;
@@ -1304,6 +1305,31 @@ impl Model {
         ctx.hc_post(out, res, w)
     }
 
+    /// The communicator and the nodes of layer `next`'s deferred commits that the MoE sum
+    /// before it runs in its wait ([`commit_wait`], #1176): under tensor parallelism over
+    /// machines on a rank [`commit_wait::takes`], `next` a DeltaNet layer of this stage (before
+    /// `stage_end`) and a step whose verify groups replay their commits
+    /// ([`SpecPool::commits_beside`]). That layer then runs [`Model::delta_net_committed`].
+    fn commits_beside<'a>(
+        &'a self,
+        pass: &Pass<'a>,
+        next: usize,
+        stage_end: usize,
+    ) -> Option<(i32, Vec<Tensor<'a>>)> {
+        if next >= stage_end || !self.hp.is_recurrent(next) {
+            return None;
+        }
+        let c = self.tp_net_comm()?;
+        if !commit_wait::takes(crate::tp_net::comm(c)?.rank()) {
+            return None;
+        }
+        let spec = pass.spec?;
+        let shape = pass.shape.iter().map(|g| (g.verify, g.slot, g.n_seqs));
+        let groups = commit_wait::verify_groups(shape, crate::tp_net::MAX_BESIDE);
+        let side = spec.commits_beside(pass.ctx, pass.rec, next, &groups);
+        (!side.is_empty()).then_some((c, side))
+    }
+
     /// The decoder stack of a hyper-connection model, from the token embeddings `x`
     /// (`[n_embd, n]`). With logits to compute, the last layer runs its FFN on the output rows
     /// only and the result is the final mixer's output for those rows (`[n_embd, n_out]`);
@@ -1330,6 +1356,10 @@ impl Model {
             ctx.reshape_3d(x, e, hc.n, n)
         };
         let last = layers.end == hp.n_layer;
+        let stage_end = layers.end;
+        // The previous layer's MoE sum ran this DeltaNet layer's deferred commits in its wait
+        // ([`commit_wait`]).
+        let mut committed = false;
         // A block's output waits to be combined into the streams until the next mixer, which
         // does both in one op on a GPU (see `hc_mix_after`).
         let mut pending: Option<(Tensor<'a>, Tensor<'a>)> = None;
@@ -1439,7 +1469,9 @@ impl Model {
             } else {
                 gather_in(h, il, "attn_q.weight")
             };
-            let mut attn = if hp.is_recurrent(il) {
+            let mut attn = if hp.is_recurrent(il) && std::mem::take(&mut committed) {
+                self.delta_net_committed(pass, il, h)?
+            } else if hp.is_recurrent(il) {
                 self.delta_net(pass, il, h)?
             } else {
                 self.attention(pass, il, h)?
@@ -1475,7 +1507,20 @@ impl Model {
                     self.moe_rows(ctx, tap, &pass.graph, il, h, n, rows, pass.prompt_only())?
                 }
             };
-            let ffn = self.tp_sum_split(ctx, ffn, sp.filter(|_| split));
+            // Over machines, the next DeltaNet layer's deferred commits may run in this sum's
+            // wait ([`commit_wait`]).
+            let beside = if sp.is_none() && !tap.on {
+                self.commits_beside(pass, il + 1, stage_end)
+            } else {
+                None
+            };
+            let ffn = match beside {
+                Some((c, side)) => {
+                    committed = true;
+                    crate::tp_net::all_reduce_beside(ctx, c, ffn, &side)
+                }
+                None => self.tp_sum_split(ctx, ffn, sp.filter(|_| split)),
+            };
             tap.tap("ffn_out", il, ffn);
             pending = Some((ffn, inject));
             if tap.on {

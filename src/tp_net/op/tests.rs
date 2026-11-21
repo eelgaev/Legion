@@ -121,3 +121,48 @@ fn planned_buffers_merge_and_travel() {
     other[0] ^= 1;
     assert!(decode_planned(&other).is_err());
 }
+
+/// An all-reduce that runs deferred commits in its wait (#1176) names them as its last
+/// sources; the other all-reduces run none.
+#[test]
+fn a_sum_runs_the_commits_it_was_given() {
+    use crate::ggml::{Context, types};
+    let ctx = Context::new(64, 64);
+    let (s, h, nk, ns) = (128, 4, 2, 3);
+    let row = 2 * s * nk + s * h + 2 * h;
+    let commit = || {
+        let replay = ctx.new_tensor(types::F32, &[row, 9, ns]);
+        let state = ctx.new_tensor(types::F32, &[s, s, h, ns]);
+        let keep = ctx.new_tensor(types::I32, &[ns]);
+        crate::model::core::gdn::commit_replay_beside(&ctx, replay, state, keep, nk)
+    };
+    let x = ctx.new_tensor(types::F32, &[8, 5]);
+    let side = [commit(), commit()];
+    let sum = super::all_reduce_beside(&ctx, 0, x, &side);
+    // SAFETY: nodes of a live context.
+    let (got, plain, ahead) = unsafe {
+        let w = ctx.new_tensor(types::F32, &[1 << 20]);
+        let ahead = super::all_reduce_ahead(&ctx, 0, x, None, &[(w, 1 << 17)]);
+        (
+            super::beside_of(&*sum.raw()),
+            super::beside_of(&*super::all_reduce(&ctx, 0, x).raw()),
+            super::beside_of(&*ahead.raw()),
+        )
+    };
+    assert_eq!(got, side.map(|t| t.raw()).to_vec());
+    assert!(plain.is_empty() && ahead.is_empty());
+    let none = super::all_reduce_beside(&ctx, 0, x, &[]);
+    // SAFETY: as above.
+    assert!(unsafe { super::beside_of(&*none.raw()) }.is_empty());
+}
+
+/// Only deferred commits run beside a sum.
+#[test]
+#[should_panic(expected = "only deferred commits")]
+fn a_sum_runs_no_other_node() {
+    use crate::ggml::{Context, types};
+    let ctx = Context::new(16, 16);
+    let x = ctx.new_tensor(types::F32, &[8, 5]);
+    let other = ctx.add(x, x);
+    super::all_reduce_beside(&ctx, 0, x, &[other]);
+}

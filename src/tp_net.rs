@@ -38,7 +38,8 @@ pub use profile::{StepLaps, StepProfile};
 
 pub use comm::{ArStats, Comm, StepMarks};
 pub use op::{
-    Norm, Normed, all_reduce, all_reduce_add, all_reduce_add_norm, all_reduce_ahead, normed,
+    MAX_BESIDE, Norm, Normed, all_reduce, all_reduce_add, all_reduce_add_norm, all_reduce_ahead,
+    all_reduce_beside, normed,
 };
 
 use std::io::{Read, Write};

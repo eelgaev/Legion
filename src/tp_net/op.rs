@@ -220,6 +220,64 @@ pub fn all_reduce_ahead<'a>(
     ctx.external_with(&ALL_REDUCE, types::F32, x.ne(), &srcs, &params)
 }
 
+/// The most nodes [`all_reduce_beside`] runs (a verify step's groups; ggml's custom ops take
+/// nine sources, the partial one of them).
+pub const MAX_BESIDE: usize = 8;
+
+/// The parameter of an [`all_reduce_beside`] node that holds how many nodes it runs (its last
+/// sources), past [`all_reduce_ahead`]'s.
+const P_BESIDE: usize = 3 + crate::model::core::l2_prefetch::tp::MAX_WEIGHTS;
+
+/// [`all_reduce`] of `x` whose node also runs `side` on CUDA (#1176): deferred GatedDeltaNet
+/// commits of the next layer ([`crate::model::core::gdn::is_beside`] nodes, at most
+/// [`MAX_BESIDE`]), launched on the compute stream once this rank's partial is on its way and
+/// before the wait for the peers'. Those nodes launch nothing themselves; as this node's
+/// sources they come before it in the graph. On a rank that waits for its peer at that sum the
+/// commits take part of the wait instead of their own time in the next layer's delta rule. The
+/// same kernels on the same values: every output keeps its bits. The CPU op runs them as their
+/// own nodes, before this one.
+pub fn all_reduce_beside<'a>(
+    ctx: &'a Context,
+    comm: i32,
+    x: Tensor<'a>,
+    side: &[Tensor<'a>],
+) -> Tensor<'a> {
+    assert_eq!(x.ty(), types::F32, "tp all-reduce: F32 only");
+    assert!(
+        side.len() <= MAX_BESIDE,
+        "tp all-reduce: too many nodes to run"
+    );
+    // SAFETY: tensors of a live context.
+    let gdn = side
+        .iter()
+        .all(|t| unsafe { crate::model::core::gdn::is_beside(t.raw()) });
+    assert!(gdn, "tp all-reduce: only deferred commits run beside a sum");
+    let x = if x.is_contiguous() { x } else { ctx.cont(x) };
+    let mut srcs = vec![x];
+    srcs.extend_from_slice(side);
+    let mut params = vec![0; P_BESIDE + 1];
+    params[0] = comm;
+    params[P_BESIDE] = side.len() as i32;
+    ctx.external_with(&ALL_REDUCE, types::F32, x.ne(), &srcs, &params)
+}
+
+/// The nodes an [`all_reduce_beside`] node `dst` runs: as many of its last sources as its
+/// [`P_BESIDE`] parameter says (none for any other all-reduce node).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn beside_of(dst: &ffi::ggml_tensor) -> Vec<*mut ffi::ggml_tensor> {
+    let side = (external_params(dst)[P_BESIDE].max(0) as usize).min(MAX_BESIDE);
+    let srcs: Vec<_> = dst
+        .src
+        .iter()
+        .copied()
+        .take_while(|s| !s.is_null())
+        .collect();
+    if side == 0 || side >= srcs.len() {
+        return Vec::new();
+    }
+    srcs[srcs.len() - side..].to_vec()
+}
+
 unsafe fn cpu_all_reduce(dst: &ffi::ggml_tensor, ith: usize, _nth: usize) {
     // One thread runs it; ggml's barrier after the node holds the others.
     if ith != 0 {
@@ -1071,6 +1129,13 @@ pub(super) mod cuda {
                 if kind == Kind::AllReduce && external_params(dst)[2] > 0 {
                     let first = 1 + usize::from(res.is_some());
                     crate::model::core::l2_prefetch::tp::launch_beside(dst, first, stream)?;
+                }
+                // Deferred commits an `all_reduce_beside` runs while it waits (#1176): queued
+                // behind this rank's send, ahead of the wait for the peers'.
+                if kind == Kind::AllReduce {
+                    for node in super::beside_of(dst) {
+                        crate::model::core::gdn::launch_beside(&*node, stream)?;
+                    }
                 }
                 if defer {
                     hand_over(&comm, &plan, seq, stream)
