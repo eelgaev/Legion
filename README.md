@@ -142,6 +142,13 @@ off. llama.cpp runs across two DGX Sparks with its RPC backend (layer split).
 | Legion | [NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) | DFlash 2 ⁹ | **23-51** | **97.0** | **235.2** | **2,697** | **2,309** | 1,438 |
 | vLLM 0.33.0 | NVFP4 | DFlash 2 | 20-45 | 84.2 | 193.1 | 2,548 | 2,140 | — |
 
+#### 2x DGX Spark
+
+| Engine | Weights | Drafting | Decode, 1 user | 4 users | 16 users | Prefill 8K | 32K | 123K |
+|---|---|---|--:|--:|--:|--:|--:|--:|
+| Legion | NVFP4 | DFlash 2 ¹⁹ | **36-80** | **136.9** | **295.9** | **3,002** | **2,780** | — |
+| vLLM 0.33.0 | NVFP4 | DFlash 2 ⁶ | 38-76 | 125.6 | 248.0 | 2,913 | 2,757 | — |
+
 #### AC922, 2x V100
 
 | Engine | Weights | Drafting | Decode, 1 user | 4 users | 16 users | Prefill 8K | 32K | 123K |
@@ -165,7 +172,7 @@ off. llama.cpp runs across two DGX Sparks with its RPC backend (layer split).
 | Engine | Weights | Drafting | Decode, 1 user | 4 users | 16 users | Prefill 8K | 32K | 123K |
 |---|---|---|--:|--:|--:|--:|--:|--:|
 | Legion | QAT UD-Q4_K_XL GGUF | MTP ¹¹ | 37-66 | 119.9 | 202.6 | 975 | 925 | 744 |
-| Legion | NVFP4 | DFlash 2 ¹⁹ | **37-66** | **126.4** | **363.8** | **2,777** | **2,498** | — |
+| Legion | NVFP4 | DFlash 2 ¹⁹ | **38-69** | **136.5** | **385.8** | **2,776** | **2,508** | — |
 | vLLM 0.33.0 | NVFP4 | DFlash 2 ⁶ | 35-60 | 124.2 | 290.1 | 2,381 | 1,612 | — |
 
 #### AC922, 2x V100
@@ -244,7 +251,7 @@ right after the load, not the fixed benchmark prompts; prefill is one request ea
 ¹⁹ Tensor parallel over one QSFP link, with output-moving opt-in flags (see the run command). 123K was not measured
 for either engine: the prompt takes both Sparks above 80 C within a minute.
 
-Measured 2026-10-20 to 2026-11-20. Each new speed record is added here.
+Measured 2026-10-20 to 2026-11-21. Each new speed record is added here.
 
 ## Roadmap
 
@@ -278,6 +285,7 @@ The exact `legion serve` command behind every row of the tables, and how it was 
 - [GLM-5.3-Flash Maya-S v2 (IQ2_XXS), 1x Spark](docs/run/spark/glm-53-flash-maya-s-v2-iq2-xxs-1x.md)
 - [Qwen3.8-27B UD-Q4_K_XL, 1x Spark](docs/run/spark/qwen38-27b-ud-q4-k-xl-1x.md)
 - [Qwen3.8-27B NVFP4, 1x Spark](docs/run/spark/qwen38-27b-nvfp4-1x.md)
+- [Qwen3.8-27B NVFP4, 2x Spark (tensor parallel)](docs/run/spark/qwen38-27b-nvfp4-2x-tp.md)
 - [Gemma 4 31B QAT UD-Q4_K_XL, 2x Spark (tensor parallel)](docs/run/spark/gemma-4-31b-qat-ud-q4-k-xl-2x-tp.md)
 - [Gemma 4 31B QAT UD-Q4_K_XL, 1x Spark](docs/run/spark/gemma-4-31b-qat-ud-q4-k-xl-1x.md)
 - [Gemma 4 31B NVFP4 (RedHatAI), 1x Spark](docs/run/spark/gemma-4-31b-nvfp4-1x.md)

@@ -36,8 +36,15 @@ legion serve \
 # rank 1: the same without --port, with --tp-rank 1
 ```
 
-Deterministic client: the same 8 fixed prompts as the 1x row, temperature 0, 256 tokens each (2026-11-19, one
-session, the build before the halves below). 1 user 36.6 (story) to 80.4 (code), median 50.2, mean accepted length 3.36; 136.1 tok/s at 4 users
+Deterministic client: the same 8 fixed prompts as the 1x row, temperature 0, 256 tokens each (2026-11-21, two
+sessions, 2 rounds each, with everything below that has no flag). 1 user 36.1 (story) to 80.3 (code), median
+49.2-49.8 per round, mean accepted length 3.36, the same tokens in every round; 136.9 tok/s at 4 users (the median
+of 4 rounds, 136.1-138.0); 295.9 at 16 users (294.0-302.0). Prefill 8K 2,972-3,051 (median 3,002) and 32K
+2,745-2,814 (2,780) tok/s, two requests each per session after an 8K warm-up, from the same servers. 123K was not
+measured. vLLM 0.33.0 TP2 (2026-11-20, [its command](../other-engines.md#qwen38-27b)): 1 user 37.5-75.5 (median
+49.0), 125.6 at 4 users, 248.0 at 16 users, prefill 8K 2,913 and 32K 2,757.
+
+The first measurement (2026-11-19, one session, the build before the halves below): 1 user 36.6 (story) to 80.4 (code), median 50.2, mean accepted length 3.36; 136.1 tok/s at 4 users
 (2 rounds: 136.4 / 135.8); 283.1 at 16 users (282.9 / 283.4). Prefill 8K 2,074 / 2,008 and 32K 1,794 / 1,939
 tok/s, one request each after an 8K warm-up, from the same server. 123K was not measured. Against the 1x row,
 decode gains 47% at 1 user (median 34.1), 40% at 4 users (97.5) and 20% at 16 users (235.2), but prefill is

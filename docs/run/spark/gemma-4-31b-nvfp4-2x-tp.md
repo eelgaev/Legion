@@ -34,12 +34,13 @@ legion serve \
 # rank 1: the same without --port, with --tp-rank 1
 ```
 
-Deterministic client: the same 8 fixed prompts as the 1x row, temperature 0, 256 tokens each (2026-11-20, two
-sessions, 2 rounds each). 1 user 36.5 to 66.0 tok/s by prompt, median 46.6 over the 4 rounds, mean accepted length
-3.27-3.32, the same tokens in every round; 126.4 tok/s at 4 users (the median of 4 rounds, 120.7-129.1); 363.8 at
-16 users (the median of 4 rounds, 353.4-381.5). Prefill 8K 2,765 / 2,789 (mean 2,777) and 32K 2,496 / 2,500
-(2,498) tok/s, one request each per session after an 8K warm-up, from the same servers. 123K was not measured
-(heat, below).
+Deterministic client: the same 8 fixed prompts as the 1x row, temperature 0, 256 tokens each (2026-11-21, two
+sessions, 2 rounds each). 1 user 37.5 (story) to 68.5 (code) tok/s by prompt, median 47.7-48.6 per round, mean
+accepted length 3.28-3.31, the same tokens in every round; 136.5 tok/s at 4 users (the median of 4 rounds,
+131.4-139.7); 385.8 at 16 users (the median of 4 rounds, 381.7-388.7). Prefill 8K 2,767-2,794 (median 2,776) and
+32K 2,499-2,514 (2,508) tok/s, two requests each per session after an 8K warm-up, from the same servers. 123K was
+not measured (heat, below). vLLM 0.33.0 TP2 (2026-11-20, [its command](../other-engines.md#gemma-4-31b)): 1 user
+35.0-59.7 (median 45.1), 124.2 at 4 users, 290.1 at 16 users, prefill 8K 2,381 and 32K 1,612.
 
 `--tp-draft-split` and `--spec-draft-weights q4` (2026-11-20): the drafter's FFN split over the two Sparks and its
 matrices in 4 bits instead of Q8_0 cut the time between verify steps (the draft pass and host work, on rank 0)
