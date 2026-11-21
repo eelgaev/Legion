@@ -35,16 +35,19 @@ legion serve \
   --prefill-slots 16 \
   --tp-rails 2 \
   --tp-head-split \
+  --tp-commit-in-verify-min-seqs 8 \
   --tp-rank 0 \
   --tp-peers <rank0-ip>:7619,<rank1-ip>:7619
 # rank 1: the same without --port, with --tp-rank 1
 ```
 
+With `--tp-commit-in-verify-min-seqs 8` (2026-11-21, 2x ABBA vs the command without it): 16 users 260.6 -> 268.2 tok/s (+2.9%), 4 users / 1 user / prefill tie, same --deterministic output.
+
 Measured against vLLM 0.33.0 with tensor parallel 2, MTP and CUDA graphs on the same two Sparks (2026-11-04:
 43-58 (median 48.2) / 116.8 / 248.5 tok/s decode, 3,174 / 3,257 / 3,135 tok/s prefill); its command is in
 [other engines](../other-engines.md).
 
-Optional, for many users: `--tp-commit-in-verify-min-seqs 8` on both ranks. After a verify step of 8 or more
+`--tp-commit-in-verify-min-seqs 8` (in the command since 2026-11-21, on both ranks). After a verify step of 8 or more
 sequences, each rank advances its gated DeltaNet states inside the next verify step instead of in a commit of its
 own, so the states go through memory once less per round. 16 users: 248.2 -> 256.3 tok/s (median of 6 rounds
 each from one binary, three sessions in alternating order; every round is above the round without the flag at the
@@ -110,5 +113,6 @@ the CPU tower).
   keeps the better of the two candidates per row. Same output (the pick and its tie order are the whole head's).
   Decode 41-53 / 116.4 / 242.8 -> 44-58 / 121.8 / 248.6 tok/s at 1 / 4 / 16 users in the same sessions; prefill
   unchanged. Requests with sampling, log probabilities or `min_tokens` keep the whole head on rank 0.
+- `--tp-commit-in-verify-min-seqs` (`8`): After a verify step of 8 or more sequences, each rank advances its gated DeltaNet states inside the next verify step instead of in a separate commit pass. Same output; steps of fewer sequences run as without it.
 - `--tp-rank` (`0`): This process's rank in tensor parallelism across machines (one process per DGX Spark). Rank 0 serves HTTP.
 - `--tp-peers`: Every rank's `ip:port` on the QSFP link, in rank order, identical on all ranks.
