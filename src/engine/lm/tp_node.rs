@@ -628,6 +628,20 @@ struct FollowRows {
     from: usize,
     /// A draft round read rows the last step did not read back (warned once).
     warned: bool,
+    /// DFlash prompt chunks' take-in-only rounds left for the next round that runs at once,
+    /// with their steps' rows, oldest first (`--tp-draft-split`, [`super::draft_defer`]).
+    held: Vec<HeldRound>,
+}
+
+/// A draft round left for later on this rank's share of the drafter, with its step's rows.
+type HeldRound = (Vec<crate::node::WireDraft>, Vec<Vec<f32>>);
+
+/// `seq` is gone: its requests leave the held rounds, and rounds left with none go.
+fn release_held(held: &mut Vec<HeldRound>, seq: u64) {
+    held.retain_mut(|(reqs, _)| {
+        reqs.retain(|r| r.seq != seq);
+        !reqs.is_empty()
+    });
 }
 
 impl FollowRows {
@@ -1114,11 +1128,40 @@ fn handle(
                      (another --ctx-size or drafter window on this rank?): its drafts may differ"
                 );
             }
-            run_draft(d.as_mut(), &reqs, &rows.host[0], &rows.dev, w)?;
+            // A round of prompt chunks' take-ins only waits for the next round, which runs it
+            // first, as rank 0's does (#1133): the last chunk's step no longer waits for it
+            // here. Every rank decides by itself; such a round has no sums.
+            let wait = rows.held.len() < super::draft_defer::MAX_ROUNDS
+                && super::draft_defer::defers(
+                    super::draft_defer::on(),
+                    !rows.dev.is_empty(),
+                    reqs.iter().map(|r| r.max as usize),
+                    reqs.iter().map(|r| {
+                        let n = r.base as usize + r.tokens.len();
+                        let ran = r.ran as usize;
+                        (d.rows_read_from(n, r.start as usize, ran), ran)
+                    }),
+                );
+            if wait {
+                let step = std::mem::take(&mut rows.host[0]);
+                rows.held.push((reqs, step));
+                return Ok(Reply::Done);
+            }
+            // The held ones first, in their order; one that fails still lets this round run,
+            // whose sums rank 0 waits for.
+            let mut left = Ok(());
+            for (held, step) in std::mem::take(&mut rows.held) {
+                left = left.and(run_draft(d.as_mut(), &held, &step, &[], w));
+                exec.recycle_rows(step);
+            }
+            let ran = run_draft(d.as_mut(), &reqs, &rows.host[0], &rows.dev, w);
+            left?;
+            ran?;
             Reply::Done
         }
         Request::TpDraftRelease { seq } => {
             drafter.as_mut().ok_or(NO_DRAFT_SPLIT)?.release(seq);
+            release_held(&mut rows.held, seq);
             Reply::Done
         }
         Request::Hello { .. }

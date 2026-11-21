@@ -29,6 +29,7 @@ mod adaptive;
 mod bandwidth;
 mod captures;
 mod chat_format;
+mod draft_defer;
 mod early_commit;
 mod even;
 mod first_rows;
@@ -6059,6 +6060,7 @@ impl LmEngine {
             drafting,
             spec_k,
             spec_config: cfg.spec.clone(),
+            draft_deferred: Vec::new(),
             next_id: 0,
             long: long_prompts,
             micro,
@@ -6459,6 +6461,9 @@ struct Worker {
     /// Max drafts per sequence and step (0: speculation off).
     spec_k: usize,
     spec_config: SpecConfig,
+    /// DFlash prompt chunks' take-in-only rounds left for the next round that runs at once
+    /// ([`draft_defer`], #1133), oldest first.
+    draft_deferred: Vec<draft_defer::Round>,
     /// Rings of the sliding-window layers no sequence holds (with rings; empty without).
     free_rings: Vec<usize>,
     /// KV sequence slots no sequence holds (with slots; empty without).
@@ -7491,6 +7496,8 @@ impl Worker {
         match &mut self.drafting {
             Drafting::Model(d) => {
                 d.release(seq.id);
+                // Its take-ins still waiting go with its state (#1133).
+                self.draft_deferred.retain_mut(|r| r.release(seq.id));
                 // The other ranks' shares of it (`--tp-draft-split`).
                 self.exec.tp_draft_release(seq.id);
             }
@@ -8911,6 +8918,11 @@ impl Worker {
             let defer = matches!(self.drafting, Drafting::Mtp(_))
                 && !self.exec.mtp_shares_kv()
                 && !self.exec.has_remote();
+            // A DFlash round of prompt chunks alone may wait for the next round
+            // ([`draft_defer`], #1133); not with sequences decoding, whose take-ins are short.
+            let dflash_waits = self.spec_config.kind == crate::spec::SpecKind::Dflash
+                && self.spec_config.model_drafter.is_none()
+                && (0..decoding.len()).all(|i| done.contains(&i));
             let mut off = decoding.len() * n_tok;
             let ngram_step = mtp_ngram::NgramStep {
                 depth: self.depth.as_ref(),
@@ -9015,7 +9027,7 @@ impl Worker {
                 self.clock.lap(host_time::Phase::Finish, &mut at);
                 match &mut self.drafting {
                     Drafting::Model(d) => {
-                        let t = Instant::now();
+                        let mut t = Instant::now();
                         // `--tp-draft-split`: every rank runs the round, its share of the FFN. A
                         // round that fails on any rank still runs all its sums there (zeros), so
                         // the others' ends and the communicator stays usable (`DflashDrafter`'s
@@ -9036,21 +9048,69 @@ impl Worker {
                                 .collect()
                         };
                         self.exec.tp_draft(wire).map_err(|e| e.to_string())?;
-                        if hidden_dev.is_empty() {
-                            d.step(&mut batch)?;
+                        // A DFlash round of prompt chunks' take-ins only waits for the next
+                        // round, which runs it first (#1133): after the prompt's first token.
+                        let wait = dflash_waits
+                            && self.draft_deferred.len() < draft_defer::MAX_ROUNDS
+                            && draft_defer::defers(
+                                draft_defer::on(),
+                                !hidden_dev.is_empty(),
+                                batch.iter().map(|r| r.max),
+                                (batch.iter()).map(|r| {
+                                    (d.rows_read_from(r.tokens.len(), r.start, r.ran), r.ran)
+                                }),
+                            );
+                        if wait {
+                            let reqs = (batch.iter().zip(&offs))
+                                .map(|(r, &off)| draft_defer::Req {
+                                    seq: r.seq,
+                                    tokens: r.tokens.to_vec(),
+                                    start: r.start,
+                                    ran: r.ran,
+                                    off,
+                                })
+                                .collect();
+                            let round = draft_defer::Round::new(hidden.clone(), n_step, reqs);
+                            self.draft_deferred.push(round);
                         } else {
-                            let rows = DeviceHidden {
-                                layers: &hidden_dev,
-                                first: &offs,
+                            // The rounds left before, in their order and ahead of this one:
+                            // every rank runs a sequence's take-ins in the order it would have.
+                            // One that fails still lets this round run, whose sums (with
+                            // `--tp-draft-split`) the other ranks wait for.
+                            let waited = !self.draft_deferred.is_empty();
+                            let mut left = Ok(());
+                            for round in std::mem::take(&mut self.draft_deferred) {
+                                let t0 = Instant::now();
+                                let (r, rows) = round.run(d.as_mut());
+                                left = left.and(r);
+                                // No DFlash pass names a step's rows later: they go back now.
+                                if let Some(rows) = rows {
+                                    self.exec.recycle_rows(rows);
+                                }
+                                let ms = t0.elapsed().as_secs_f64() * 1e3;
+                                tracing::debug!(ms, "dflash deferred take-in");
+                            }
+                            if waited {
+                                t = Instant::now();
+                            }
+                            let ran = if hidden_dev.is_empty() {
+                                d.step(&mut batch)
+                            } else {
+                                let rows = DeviceHidden {
+                                    layers: &hidden_dev,
+                                    first: &offs,
+                                };
+                                d.step_device(&mut batch, &rows)
                             };
-                            d.step_device(&mut batch, &rows)?;
-                        }
-                        let ms = t.elapsed().as_secs_f64() * 1e3;
-                        tracing::debug!(ms, seqs = batch.len(), "model drafts");
-                        // A block drafter's pass, timed without a prompt's take-in.
-                        if let (Some(depth), true) = (&mut self.depth, chunks.is_empty()) {
-                            depth.set_context(draft_span);
-                            depth.record_passes(batch.len(), 1, ms);
+                            left?;
+                            ran?;
+                            let ms = t.elapsed().as_secs_f64() * 1e3;
+                            tracing::debug!(ms, seqs = batch.len(), "model drafts");
+                            // A block drafter's pass, timed without a prompt's take-in.
+                            if let (Some(depth), true) = (&mut self.depth, chunks.is_empty()) {
+                                depth.set_context(draft_span);
+                                depth.record_passes(batch.len(), 1, ms);
+                            }
                         }
                     }
                     Drafting::Mtp(d) => {

@@ -135,3 +135,26 @@ fn a_step_hands_back_the_rows_no_request_names() {
     assert_eq!(r.start_step(true), rows(4.0));
     assert!(r.host.iter().all(Vec::is_empty));
 }
+
+#[test]
+fn a_released_sequence_leaves_the_held_rounds() {
+    let step = |x: f32| vec![vec![x; 4]];
+    let mut held: Vec<HeldRound> = vec![
+        (
+            vec![take_in(1, 0, 4_096, 4_096), take_in(2, 4_096, 0, 9)],
+            step(1.0),
+        ),
+        (vec![take_in(1, 0, 8_192, 9)], step(2.0)),
+    ];
+    // A sequence no round names: nothing changes.
+    release_held(&mut held, 7);
+    assert_eq!(held.len(), 2);
+    // Its requests go, and the round it alone was in.
+    release_held(&mut held, 1);
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].0.len(), 1);
+    assert_eq!(held[0].0[0].seq, 2);
+    assert_eq!(held[0].1, step(1.0));
+    release_held(&mut held, 2);
+    assert!(held.is_empty());
+}
