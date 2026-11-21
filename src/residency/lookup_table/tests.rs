@@ -1037,7 +1037,7 @@ fn a_peer_reads_the_rows_this_rank_misses() {
         let s = t.stats();
         assert_eq!(s.peer_rows, unique.len() as u64);
         if fail {
-            assert!(s.reads > 0);
+            assert!(s.reads > 0 && s.read_bytes >= s.reads * 4096, "{s:?}");
         } else {
             assert_eq!(s.reads, 0);
         }

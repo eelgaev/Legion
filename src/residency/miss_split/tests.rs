@@ -25,8 +25,12 @@ fn layers_that_missed_more_get_more_slots_in_the_same_bytes() {
     let s = [seen(0, 10, 400), seen(1, 10, 100), seen(2, 10, 100)];
     let out = split_by_misses(&now, &bytes, &s, &[64; 3]);
     assert_eq!(out.iter().sum::<usize>(), 30);
-    assert!(out[0] > 10 && out[1] < 10 && out[1] == out[2], "{out:?}");
-    // a / n^2 equal at the optimum: 4x the misses, about 2x the slots.
+    assert!(
+        out[0] > 10 && out[1] < 10 && out[1].abs_diff(out[2]) <= 1,
+        "{out:?}"
+    );
+    // a / n^2 equal at the optimum: 4x the misses, about 2x the slots. Layers 1 and 2 share
+    // the 15 slots left; the odd one goes to the lower layer (ties: the lower layer).
     assert_eq!(out, vec![15, 8, 7]);
 }
 

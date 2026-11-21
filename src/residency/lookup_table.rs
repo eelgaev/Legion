@@ -353,6 +353,7 @@ pub struct TableStats {
     pub cache_hits: u64,
     /// Rows the hot set pins now.
     pub hot_rows: u64,
+    /// Page reads this rank made (with a peer: those after an ask of it failed).
     pub reads: u64,
     pub read_bytes: u64,
     /// Pages read only to keep the SSD awake ([`keep_awake`]).
@@ -1298,7 +1299,7 @@ struct Direct {
     cache: Mutex<RowCache>,
     queue: Arc<Queue>,
     workers: Vec<std::thread::JoinHandle<()>>,
-    stats: Mutex<TableStats>,
+    stats: Arc<Mutex<TableStats>>,
     /// Small batches' reads ([`aio`]); dropped after the workers, waiting for its reads.
     aio: Option<Box<aio::Aio>>,
     /// Batches of at most this many pages go to `aio`.
@@ -1338,6 +1339,8 @@ struct PeerAsk {
     /// The ticket's page reads, for this rank to make itself.
     jobs: Vec<Job>,
     queue: Arc<Queue>,
+    /// The direct tier's counters: the reads made on an error count there.
+    stats: Arc<Mutex<TableStats>>,
     urgent: bool,
     fifo: bool,
 }
@@ -1373,6 +1376,12 @@ impl PeerAsk {
             }
             Err(e) => {
                 tracing::warn!(error = %e, rows = self.rows.len(), "lookup table: the peer's rows failed, reading them here");
+                {
+                    // `issue` counted the rows as asked, not read: these reads count here.
+                    let mut s = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+                    s.reads += self.jobs.len() as u64;
+                    s.read_bytes += self.jobs.iter().map(|j| j.len as u64).sum::<u64>();
+                }
                 // The ask's job becomes the reads'.
                 st.jobs = st.jobs - 1 + self.jobs.len();
                 if st.jobs == 0 {
@@ -1512,7 +1521,7 @@ impl Direct {
             cache: Mutex::new(cache),
             queue,
             workers,
-            stats: Mutex::new(TableStats::default()),
+            stats: Arc::new(Mutex::new(TableStats::default())),
             aio,
             aio_max: aio_max.min(aio::DEPTH),
             keep_awake,
@@ -1611,6 +1620,7 @@ impl Direct {
                 pending: pending.clone(),
                 jobs,
                 queue: self.queue.clone(),
+                stats: self.stats.clone(),
                 urgent: ask.urgent(),
                 fifo: self.fifo,
             };
