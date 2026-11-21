@@ -1240,9 +1240,71 @@ mod cuda {
         println!("geglu k {k} m {m}: 33-64 tokens bitwise");
     }
 
+    /// One graph of `w` (k x m; with `wu`, the GeGLU of gate `w` and up `wu`) times each of
+    /// `xs` (`ns[i]` tokens), one matmul per input, computed `rounds` times: back-to-back
+    /// launches of different token counts on one stream. Each round's outputs.
+    fn run_seq(
+        backend: &mut Backend,
+        (w, wu): (&[u8], Option<&[u8]>),
+        xs: &[Vec<f32>],
+        (k, m): (usize, usize),
+        ns: &[usize],
+        rounds: usize,
+    ) -> Vec<Vec<Vec<f32>>> {
+        let weights = Context::new(4, 0);
+        let g = weights.new_tensor(types::NVFP4, &[k as i64, m as i64]);
+        let u = weights.new_tensor(types::NVFP4, &[k as i64, m as i64]);
+        let (sg, su) = (
+            weights.new_tensor(types::F32, &[1]),
+            weights.new_tensor(types::F32, &[1]),
+        );
+        weights.alloc_tensors(backend.buffer_type()).unwrap();
+        g.set_bytes(w);
+        u.set_bytes(wu.unwrap_or(w));
+        sg.set_f32(&[0.03]);
+        su.set_f32(&[0.04]);
+        let nodes = 16 * ns.len() + 16;
+        let ctx = Context::new(nodes, nodes);
+        let x: Vec<_> = ns
+            .iter()
+            .map(|&n| ctx.new_tensor(types::F32, &[k as i64, n as i64]).as_input())
+            .collect();
+        let outs: Vec<_> = x
+            .iter()
+            .map(|&x| {
+                let out = if wu.is_some() {
+                    let out = nvfp4_mm::geglu(&ctx, g, u, x, Some(sg), Some(su));
+                    ctx.cast(out, types::F32)
+                } else {
+                    nvfp4_mm::mul_mat(&ctx, g, x, Some(sg))
+                };
+                out.as_output()
+            })
+            .collect();
+        let mut graph = ctx.new_graph(nodes);
+        for &o in &outs {
+            graph.expand(o);
+        }
+        ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+            .unwrap();
+        (0..rounds)
+            .map(|_| {
+                for (x, v) in x.iter().zip(xs) {
+                    x.set_f32(v);
+                }
+                backend.compute(&graph).unwrap();
+                outs.iter().map(|o| o.to_f32()).collect()
+            })
+            .collect()
+    }
+
     /// The streaming GEMM (#1181) in each of its shapes against the default GEMM's bits at
     /// 33-64 tokens: Gemma 4 31B's matrices, a global layer's 16384 rows, rows past a tile and
-    /// a k whose rows are not 16-byte aligned (the default kernel's fallback); then the fused GLU.
+    /// a k whose rows are not 16-byte aligned (the default kernel's fallback), and a rank's
+    /// halves over two machines (--tp-head-split: the o and global o projections' 4096 and 8192
+    /// columns, the down matmul's 10752, the GLU's 10752 rows); then the fused GLU. Last, one
+    /// graph of launches of different token counts back to back, computed twice (nothing kept
+    /// from one launch to the next).
     #[test]
     #[ignore = "needs a GPU"]
     fn cuda_verify_stream_keeps_the_gemm_bits() {
@@ -1258,6 +1320,8 @@ mod cuda {
             (5376, 16384),
             (5376, 4104),
             (5184, 4096),
+            (4096, 5376),
+            (10752, 5376),
         ];
         for (k, m) in shapes {
             let w = weights(k, m, (k * 5 + m) as u64);
@@ -1278,7 +1342,7 @@ mod cuda {
             }
             println!("k {k} m {m}: streaming 33-64 tokens bitwise");
         }
-        for (k, m) in [(5376, 21504), (5376, 4104)] {
+        for (k, m) in [(5376, 21504), (5376, 4104), (5376, 10752)] {
             let (wg, wu) = (weights(k, m, 61), weights(k, m, 62));
             for n in 33..=64 {
                 let xs = activations(k, n, 3 * n as u64);
@@ -1295,6 +1359,51 @@ mod cuda {
                 assert!(got == want, "geglu k {k} m {m} n {n} default: bits differ");
             }
             println!("geglu k {k} m {m}: streaming 33-64 tokens bitwise");
+        }
+        // Back to back: 33-64-token launches between decode (8) and prompt (128) ones in one
+        // graph computed twice, each against its own launch with the default GEMM.
+        let ns = [64, 33, 57, 8, 64, 40, 128, 33, 63, 48];
+        for (k, m, glu) in [
+            (10752, 5376, false),
+            (5376, 10752, true),
+            (5376, 8192, false),
+        ] {
+            let (w, wu) = (weights(k, m, 71), weights(k, m, 72));
+            let wu = glu.then_some(wu.as_slice());
+            let xs: Vec<_> = (0..ns.len())
+                .map(|i| activations(k, ns[i], 100 + i as u64))
+                .collect();
+            let want: Vec<_> = ns
+                .iter()
+                .zip(&xs)
+                .map(|(&n, xs)| {
+                    if (33..=64).contains(&n) {
+                        if !glu {
+                            nvfp4_mm::force_kernel(Some(Kernel::Gemm { mi: 1, nt: 8 }));
+                        }
+                        nvfp4_mm::force_gemm_tune(Some(GEMM_DEFAULT), None);
+                    }
+                    let s = (Some(0.03), Some(0.04));
+                    let out = match wu {
+                        Some(wu) => run_glu(&mut gpu, (&w, wu), xs, s, (k, m, n), true),
+                        None => run(&mut gpu, &w, xs, s.0, (k, m, n)),
+                    };
+                    nvfp4_mm::force_kernel(None);
+                    nvfp4_mm::force_gemm_tune(None, None);
+                    bits(&out)
+                })
+                .collect();
+            let rounds = run_seq(&mut gpu, (&w, wu), &xs, (k, m), &ns, 2);
+            for (r, outs) in rounds.iter().enumerate() {
+                for (i, out) in outs.iter().enumerate() {
+                    let n = ns[i];
+                    assert!(
+                        bits(out) == want[i],
+                        "k {k} m {m} glu {glu} round {r} launch {i} (n {n}): bits differ"
+                    );
+                }
+            }
+            println!("k {k} m {m} glu {glu}: back-to-back launches bitwise");
         }
     }
 
