@@ -25,6 +25,7 @@
 //! flash attention off.
 
 mod assistant;
+mod parts;
 pub mod tiny;
 
 pub use assistant::AssistantParams;
@@ -749,6 +750,14 @@ impl Model {
     /// work (RMS norms, adds, the W4A4 matmuls, [`Self::gemma4_tp_halves`]) and every sum gives
     /// each value the plain all-reduce's bits, so the step's outputs are the plain one's bit for
     /// bit. Captured layers and the last one join their halves.
+    ///
+    /// Half 0's output projection runs in [`parts::mixer_plan`]'s parts (#1181: by default a
+    /// third and two thirds of its tokens), each part's sum started behind its matmul and
+    /// finished into one tensor ([`crate::tp_net::micro::finish_cols`]), so that the first,
+    /// small sum travels during the second part's projection and the second's during half 1's,
+    /// instead of half 0's whole sum waiting with only half 1's projection to hide it. At most
+    /// two exchanges are in flight; half 0's post-attention norm and residual add run on the
+    /// joined sum as before.
     #[allow(clippy::type_complexity)]
     fn gemma4_layers_halves<'a>(
         &'a self,
@@ -765,6 +774,17 @@ impl Model {
         let eps = self.hp.rms_eps;
         let (n0, n1) = (n / 2, n - n / 2);
         let whole = n as usize;
+        // The output projection's parts (half 1 last), the halves where a part's matmul would
+        // not run on the W4A4 kernels in some layer (the same answer on every rank).
+        let mixer = {
+            let plan = parts::mixer_plan(n, parts::parts());
+            let fits = layers.clone().all(|il| {
+                plan.iter()
+                    .all(|&(_, c)| self.a4_dense(il, "attn_output.weight", c))
+            });
+            if fits { plan } else { parts::mixer_plan(n, 2) }
+        };
+        let mixer_order = parts::mixer_order(mixer.len());
         let add = |t: Tensor<'a>| pass.graph.borrow_mut().expand(t);
         let norm = |t: Tensor<'a>, il: usize, name: &str| -> Result<Tensor<'a>, ModelError> {
             Ok(ctx.mul(ctx.rms_norm(t, eps), self.lw(il, name)?))
@@ -852,14 +872,35 @@ impl Model {
                 }
             };
             let o = self.gemma4_attend_qkv(pass, il, h, multi, pos)?;
-            let o0 = self.lmm(ctx, il, "attn_output.weight", half(o, 0))?;
-            let so0 = micro::all_reduce_start(ctx, comm, o0, whole);
-            add(so0.node);
-            let o1 = self.lmm(ctx, il, "attn_output.weight", half(o, 1))?;
-            let so1 = micro::all_reduce_start(ctx, comm, o1, whole);
-            add(so1.node);
-            let a0 = micro::finish(ctx, so0, None);
-            add(a0);
+            // The output projection per part, each sum started right behind its matmul, half
+            // 0's finished into one tensor `a0` (with the halves, a plain finish as before), half
+            // 1's started.
+            let last = mixer.len() - 1;
+            let mut started: Vec<Option<micro::Started<'a>>> = vec![None; mixer.len()];
+            let mut a0: Option<Tensor<'a>> = None;
+            for &op in &mixer_order {
+                match op {
+                    parts::MixerOp::Proj(j) => {
+                        let (at, c) = mixer[j];
+                        let p = self.lmm(ctx, il, "attn_output.weight", cols(ctx, o, at, c))?;
+                        let s = micro::all_reduce_start(ctx, comm, p, whole);
+                        add(s.node);
+                        started[j] = Some(s);
+                    }
+                    parts::MixerOp::Finish(j) => {
+                        let s = started[j].take().expect("a mixer part's start");
+                        let t = if last == 1 {
+                            micro::finish(ctx, s, None)
+                        } else {
+                            micro::finish_cols(ctx, s, n0, mixer[j].0, a0)
+                        };
+                        add(t);
+                        a0 = Some(t);
+                    }
+                }
+            }
+            let a0 = a0.expect("half 0's attention sum");
+            let so1 = started[last].take().expect("half 1's attention start");
             let attn_out0 = ctx.add(norm(a0, il, "post_attention_norm.weight")?, xs[0]);
             let f0 = self.gemma4_ffn_partial(ctx, il, attn_out0, eps)?;
             let sf0 = micro::all_reduce_start(ctx, comm, f0, whole);

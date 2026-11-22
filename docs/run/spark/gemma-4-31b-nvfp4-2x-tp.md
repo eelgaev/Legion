@@ -82,6 +82,12 @@ sessions in ABBA order (whole / halves / halves / whole): prefill 8K 2,274 / 2,6
 1,886 -> 1,634 ms. Decode does not change (1, 4 and 16 users within 1%), and the output is the same bits:
 the same text and log probabilities at 1, 4 and 16 users, at 8K depth and for 8K and 32K prompts.
 
+Since 2026-11-22, steps of 3,072 tokens or more also run half 0's attention output projection in two parts
+(1/3 and 2/3 of the half), so the first part's sum travels while the second part computes (no flag;
+`LEGION_DEBUG_GEMMA4_TP_PARTS=2` on both ranks gives the plain halves). The command above, two sessions in ABBA
+order: prefill 8K 2,937-2,952 -> 2,993-2,997 (+1.8%) and 32K 2,525-2,544 -> 2,560-2,575 (+1.4%); 1 user ties,
+and the 1-user text and the 8K and 32K prompts' log probabilities are the same bits.
+
 `--tp-draft-split` alone, 2026-11-19 (8-bit drafter), on both ranks: the DFlash drafter's FFN is split over the two Sparks like the target's,
 so rank 1 no longer waits while rank 0 drafts. The time between verify steps drops from about 19 / 25 / 33 ms to
 15-18 / 19 / 25 ms at 1 / 4 / 16 users. On top of the command above, two sessions in ABBA order: 1 user 45.3 / 45.6
