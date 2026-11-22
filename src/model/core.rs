@@ -4493,6 +4493,19 @@ impl Model {
         self.linear.a4_dense(&name, w, scale, n)
     }
 
+    /// Whether layer `il`'s weight `name` runs [`Self::mm`] on a batch of `n` tokens as the FP8
+    /// W8A8 GEMM with per-token activation scales ([`linear::Linear::fp8_dense`]: every token
+    /// the same bits at every such batch).
+    pub(crate) fn fp8_dense(&self, il: usize, name: &str, n: i64) -> bool {
+        let name = format!("blk.{il}.{name}");
+        let Ok(w) = self.w(&name) else {
+            return false;
+        };
+        let base = name.strip_suffix(".weight").unwrap_or(&name);
+        let has_input_scale = self.w(&format!("{base}.input_scale")).is_ok();
+        self.linear.fp8_dense(&name, w, has_input_scale, n)
+    }
+
     pub(crate) fn moe<'a>(
         &'a self,
         ctx: &'a Context,

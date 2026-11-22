@@ -656,6 +656,28 @@ impl Linear {
             && self.w4a4(w, n, false)
     }
 
+    /// Whether the FP8 weight `name` (`w`; `has_input_scale`: it has a static activation scale)
+    /// runs [`Self::mul_mat`] on an F32 batch of `n` tokens as the large-batch W8A8 GEMM with
+    /// per-token activation scales ([`Fp8Route::Dynamic`], more than [`NVFP4_A4_MIN_N`]
+    /// tokens), which gives every token the same bits at every such batch: each token's codes
+    /// and scale are its own ([`crate::model::fp8::quantize_token`]), and each output column
+    /// its own sums in one k order whatever the other columns (the GEMM's tiles all give the
+    /// same bits; the tensor-parallel send-buffer rewrite runs column ranges of it too). Not with
+    /// `--hopper-gemm`, whose kernels hand some shapes back to the default GEMM (#1133 r3: a
+    /// step's per-token work in parts).
+    pub(crate) fn fp8_dense(
+        &self,
+        name: &str,
+        w: Tensor<'_>,
+        has_input_scale: bool,
+        n: i64,
+    ) -> bool {
+        n > NVFP4_A4_MIN_N
+            && w.ne()[2] == 1
+            && !crate::model::wgmma_gemm::enabled()
+            && self.reads_dynamic(name, w, has_input_scale, n)
+    }
+
     /// [`Self::mul_mat_multi`] of a part of a step ([`crate::model::nvfp4_a4::mul_mat_multi_part`]:
     /// `x`'s columns from `col0` of the step's `n`, `into` the node of another part): the node,
     /// or `None` where [`Self::mul_mat_multi`] would not run as one W4A4 op, or the norm would

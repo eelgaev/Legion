@@ -342,3 +342,27 @@ fn down_residual_fits_the_output_shape() {
         assert!(!down_res_fits(w, act, bad), "{:?}", bad.ne());
     }
 }
+
+/// A step's FFN runs in parts on FP8 weights only where every batch takes the per-token W8A8
+/// GEMM (#1133 r3): an FP8 weight, `a8-dynamic`, more than `NVFP4_A4_MIN_N` tokens, no static
+/// input scale, and E4M3 tensor cores (never on a CPU build).
+#[test]
+fn fp8_dense_needs_the_per_token_gemm() {
+    let ctx = Context::new(4, 0);
+    let w = ctx.new_tensor(types::I8, &[128, 64]);
+    let name = "blk.56.ffn_gate.weight";
+    let n = NVFP4_A4_MIN_N;
+    let mut l = Linear::default();
+    l.set_fp8_act(Fp8Act::A8Dynamic);
+    assert!(!l.fp8_dense(name, w, false, 4096), "not an FP8 weight");
+    l.fp8.insert(name.into());
+    for small in [1, 8, n] {
+        assert!(!l.fp8_dense(name, w, false, small), "{small} tokens");
+    }
+    assert!(!l.fp8_dense(name, w, true, 4096), "a static input scale");
+    l.set_fp8_act(Fp8Act::A8);
+    assert!(!l.fp8_dense(name, w, false, 4096), "a8");
+    l.set_fp8_act(Fp8Act::A8Dynamic);
+    #[cfg(not(feature = "cuda"))]
+    assert!(!l.fp8_dense(name, w, false, 4096), "a CPU build");
+}

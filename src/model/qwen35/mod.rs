@@ -188,9 +188,9 @@ impl Arch for Qwen35 {
                 .map(|bf16| crate::tp_net::Norm { w, eps, bf16 }))
         };
         for il in layers {
-            let split = halves
-                .filter(|_| halves::ffn_fits(m, il, n))
-                .map(|c| (c, halves::views(pass, x)));
+            let split = halves.and_then(|c| {
+                halves::ffn_parts(m, il, n).map(|p| ((c, p), halves::views(pass, x)))
+            });
             // A gated DeltaNet layer's input feeds BF16 (beta / alpha) and FP8 matmuls; a rank's
             // share's too (#1133 r2: its two ops' bits from one op).
             let both = (fuse || m.tp_net_comm().is_some()) && hp.is_recurrent(il);
@@ -222,9 +222,9 @@ impl Arch for Qwen35 {
             } else {
                 m.attention(pass, il, h)?
             };
-            if let Some((comm, xs)) = split {
+            if let Some((sum, xs)) = split {
                 let next = in_norm(il + 1, x)?;
-                let (y, nd) = halves::tail(m, pass, il, xs, attn, comm, next)?;
+                let (y, nd) = halves::tail(m, pass, il, xs, attn, sum, next)?;
                 x = y;
                 pre = nd;
                 if capture.contains(&il) {

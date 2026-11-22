@@ -127,3 +127,18 @@ fn order_keeps_two_in_flight_and_the_starts_order() {
         );
     }
 }
+
+/// The FP8-MLP layers take as many parts as the others by default; `0` keeps them whole,
+/// `2` to `TP_PARTS_MAX` caps them on their own (#1133 r3).
+#[test]
+fn fp8_parts_follow_the_others_unless_set() {
+    assert_eq!(fp8_parts_of(None, 4), Some(4));
+    assert_eq!(fp8_parts_of(None, 2), Some(2));
+    assert_eq!(fp8_parts_of(Some("0"), 4), None);
+    assert_eq!(fp8_parts_of(Some(" 0 "), 4), None);
+    assert_eq!(fp8_parts_of(Some("2"), 4), Some(2));
+    assert_eq!(fp8_parts_of(Some("3"), 2), Some(3));
+    assert_eq!(fp8_parts_of(Some("1"), 4), Some(2));
+    assert_eq!(fp8_parts_of(Some("9"), 4), Some(TP_PARTS_MAX));
+    assert_eq!(fp8_parts_of(Some("x"), 3), Some(3));
+}

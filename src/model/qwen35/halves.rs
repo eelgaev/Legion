@@ -15,9 +15,11 @@
 //!
 //! The output is the plain layer's bit for bit: the parts' work is per token (the residual
 //! adds, the RMS norms and the FFN, whose matmuls must all run on the W4A4 dense kernels at
-//! every part's and the whole step's batch, [`Model::a4_dense`]: every token the same bits at
-//! any of them), and every part's sum gives each value the plain all-reduce's bits
-//! ([`micro::all_reduce_start`]). A layer whose FFN does not fit (e.g. an FP8 MLP) runs whole.
+//! every part's and the whole step's batch, [`Model::a4_dense`], or all on the FP8 W8A8 GEMM
+//! with per-token activation scales, [`Model::fp8_dense`]: every token the same bits at any of
+//! them), and every part's sum gives each value the plain all-reduce's bits
+//! ([`micro::all_reduce_start`]). An NVFP4 checkpoint's FP8 MLPs (Qwen3.8-27B's last 8 layers)
+//! take the FP8 kind (#1133 r3); a layer whose FFN fits neither runs whole.
 
 #[cfg(test)]
 mod tests;
@@ -83,6 +85,34 @@ fn parts_of(v: Option<&str>) -> usize {
         .map_or(TP_PARTS, |p| p.clamp(2, TP_PARTS_MAX))
 }
 
+/// The most FFN parts of the layers whose FFN runs on the FP8 W8A8 GEMM ([`Model::fp8_dense`],
+/// #1133 r3): `LEGION_DEBUG_QWEN35_TP_FP8_PARTS=0` keeps them whole (as before), `2` up to
+/// [`TP_PARTS_MAX`] that many, else as many as the other layers ([`parts`]). `None`: whole.
+/// Read once.
+fn fp8_parts() -> Option<usize> {
+    static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        fp8_parts_of(
+            std::env::var("LEGION_DEBUG_QWEN35_TP_FP8_PARTS")
+                .ok()
+                .as_deref(),
+            parts(),
+        )
+    })
+}
+
+/// [`fp8_parts`] for the variable's value `v` and the other layers' `parts`.
+fn fp8_parts_of(v: Option<&str>, parts: usize) -> Option<usize> {
+    match v.map(str::trim) {
+        Some("0") => None,
+        Some(s) => Some(
+            s.parse::<usize>()
+                .map_or(parts, |p| p.clamp(2, TP_PARTS_MAX)),
+        ),
+        None => Some(parts),
+    }
+}
+
 /// The FFN parts of a step of `n` tokens (at least twice [`TP_HALF_MIN`]) with at most `parts`
 /// of them, `(first token, tokens)` in token order: half 0 (`n / 2` tokens) whole, then half 1
 /// in `k` parts, `k` up to `parts - 1`: after its first (the rest of it) `n1 >> 2`, ...,
@@ -120,12 +150,22 @@ pub(super) fn comm(m: &Model, pass: &Pass<'_>) -> Option<i32> {
     Some(comm)
 }
 
-/// Whether layer `il` of a step of `n` tokens runs in parts: every FFN matmul on the W4A4
-/// dense kernels at every part's batch ([`plan`]) and the whole step's.
-pub(super) fn ffn_fits(m: &Model, il: usize, n: i64) -> bool {
-    let parts = plan(n, parts());
-    let mut batches = parts.iter().map(|&(_, c)| c).chain([n]);
-    batches.all(|c| FFN.iter().all(|name| m.a4_dense(il, name, c)))
+/// The most FFN parts layer `il` of a step of `n` tokens takes ([`plan`]), or `None` where it
+/// runs whole: every FFN matmul on the W4A4 dense kernels ([`Model::a4_dense`], [`parts`]), or
+/// every one on the FP8 W8A8 GEMM with per-token activation scales ([`Model::fp8_dense`],
+/// [`fp8_parts`]), at every part's batch and the whole step's.
+pub(super) fn ffn_parts(m: &Model, il: usize, n: i64) -> Option<usize> {
+    let fits = |p: usize, dense: &dyn Fn(&str, i64) -> bool| {
+        let parts = plan(n, p);
+        let mut batches = parts.iter().map(|&(_, c)| c).chain([n]);
+        batches.all(|c| FFN.iter().all(|name| dense(name, c)))
+    };
+    let p = parts();
+    if fits(p, &|name, c| m.a4_dense(il, name, c)) {
+        return Some(p);
+    }
+    let p = fp8_parts()?;
+    fits(p, &|name, c| m.fp8_dense(il, name, c)).then_some(p)
 }
 
 /// The halves of the layer input `x` (`[n_embd, n]`), put into the graph at the layer's start:
@@ -189,15 +229,15 @@ pub(super) fn order(half: &[usize]) -> Vec<Op> {
 /// The rest of layer `il` from its mixer's partial output `attn` (this rank's, `[n_embd, n]`)
 /// and the halves `xs` of its input ([`views`]): per half the mixer's sum and the residual add,
 /// per FFN part ([`plan`]) the post-attention norm, the FFN, its sum and the residual add, in
-/// [`order`]. Returns the layer's output, every part's FFN sum written into one tensor (#1133
-/// r2: no concatenation).
+/// [`order`], summed over `comm` in at most `parts` FFN parts ([`ffn_parts`]). Returns the
+/// layer's output, every part's FFN sum written into one tensor (#1133 r2: no concatenation).
 pub(super) fn tail<'a>(
     m: &'a Model,
     pass: &Pass<'a>,
     il: usize,
     xs: [Tensor<'a>; 2],
     attn: Tensor<'a>,
-    comm: i32,
+    (comm, parts): (i32, usize),
     next: Option<crate::tp_net::Norm<'a>>,
 ) -> Result<(Tensor<'a>, Option<crate::tp_net::Normed<'a>>), ModelError> {
     let (ctx, n) = (pass.ctx, pass.n);
@@ -220,7 +260,7 @@ pub(super) fn tail<'a>(
         Some(start(cols(ctx, attn, n0, n1))),
     ];
     let norm_w = m.lw(il, "post_attention_norm.weight")?;
-    let parts = plan(n, parts());
+    let parts = plan(n, parts);
     let half: Vec<usize> = parts.iter().map(|&(a, _)| (a >= n0) as usize).collect();
     // Per half its mixer sum finished with its residual added (#1133 r2: in the sum's kernel).
     let mut x_attn: [Option<Tensor<'a>>; 2] = [None, None];
@@ -250,7 +290,8 @@ pub(super) fn tail<'a>(
                     cols(ctx, xa, off, c)
                 };
                 // The post-attention norm rides in the W4A4 SwiGLU's quantization, as on one
-                // GPU (ggml's bits).
+                // GPU (ggml's bits); on FP8 MLPs one op writes its per-token FP8 codes, the
+                // bits the whole layer's sum computes them with (`Model::norm_fold`).
                 let hn = m.norm_mul(pass, x, norm_w);
                 let fusion = FfnFusion {
                     res: None,
