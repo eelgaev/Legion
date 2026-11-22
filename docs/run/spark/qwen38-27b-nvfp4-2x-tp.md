@@ -95,6 +95,11 @@ prefill 8K about 3,050 -> 3,255 tok/s (+6.7%) and 32K about 2,848 -> 3,028 (+6.4
 gets 3,225 and 2,990. Decode does not change (1 user 49.2-50.1 in every arm), and the output is the same bits: the
 same log probabilities for 8K and 32K prompts and the same 1-user text.
 
+The FP8-MLP layers 56-63 take the same halves and parts since 2026-11-22 (they ran whole before;
+`LEGION_DEBUG_QWEN35_TP_FP8_PARTS=0` on both ranks keeps them whole). Two sessions in ABBA order, a fresh server per
+arm: prefill 8K 3,230-3,257 -> 3,361-3,397 tok/s (+4.1%) and 32K 3,028-3,044 -> 3,140-3,168 (+3.8%); 1 user ties,
+and the 8K and 32K log probabilities and the 1-user text are the same bits.
+
 Optional, output-moving: `--tp-wire bf16` on both ranks sends sums of at least 1 MiB in BF16, half the bytes:
 prompt steps, the 16-user verify steps and short prompts (all ranks still agree). On top of the command above
 (same session day, one session): prefill 8K 2,676 / 2,728 and 32K 2,252 / 2,539 tok/s (an 8K prompt step on rank 0
