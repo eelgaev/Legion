@@ -261,9 +261,10 @@ pub(super) struct ModelArgs {
     /// Qwen3.8-Flash-Next safetensors checkpoints: keep an FP8 E4M3 copy of the BF16 dense
     /// projections (attention, DeltaNet and shared-expert weights; one scale per output row,
     /// made at load) and let decode and verify steps of up to 64 tokens read it with 16-bit
-    /// activations: half the bytes those steps stream for them. Prompt steps of any length keep
-    /// the BF16 weights and run as without the flag, and so do decode rows batched in one step
-    /// with prompt rows (see --dense-fp8-prompt). Faster decode; moves the
+    /// activations: half the bytes those steps stream for them. Prompt steps keep the BF16
+    /// weights and run as without the flag, and so do decode rows batched in one step with
+    /// prompt rows (see --dense-fp8-prompt); a prompt chunk of one token per sequence (64 tokens
+    /// or fewer in all) has a decode step's shape and reads the copy. Faster decode; moves the
     /// decoded text. The copy takes about half the dense weights' memory again (~2.7 GiB). The
     /// MTP layer keeps its BF16 weights. One machine without --tp; other models ignore it.
     #[arg(long)]
