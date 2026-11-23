@@ -1272,7 +1272,10 @@ struct EngineArgs {
     /// graphs (two, else one, with their compute buffers) when three do not leave room for
     /// `--kv-cache-tokens`, or without it for one context (the automatic pool can still grow
     /// past that, up to max(--ctx-size, 262144) tokens); the load logs it. With one kept graph
-    /// the next prompt chunk's graph is not built while the current one computes.
+    /// the next prompt chunk's graph is not built while the current one computes. Sparse
+    /// attention's indexer (Qwen3.8-Flash-Next) scores the context for at most 4096 of a
+    /// step's tokens at a time, the same output, so a bigger step's compute buffer grows with
+    /// its tokens rather than tokens times context.
     #[arg(long)]
     max_batch_tokens: Option<usize>,
     /// Model engine, on a GPU that shares memory with the host (a DGX Spark's GB10): GiB the

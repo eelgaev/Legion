@@ -269,6 +269,51 @@ fn step_pools_listed_keeps_the_shape_for_many_steps() {
     assert!(changes(&plain) >= 12);
 }
 
+/// #1183: prompt steps over 4,096 tokens score their pools in aligned chunks of at most 4,096
+/// tokens that cover the step in order, the later ones no bigger.
+#[test]
+fn qsa_score_chunks_cover_the_step_in_aligned_chunks() {
+    // Up to a chunk: one, the whole step (the graph as before).
+    for n in [1, 8, 512, 4095, QSA_SCORE_CHUNK] {
+        assert_eq!(qsa_score_chunks(n), vec![(0, n)]);
+    }
+    assert_eq!(qsa_score_chunks(8192), vec![(0, 4096), (4096, 4096)]);
+    assert_eq!(
+        qsa_score_chunks(12288),
+        vec![(0, 4096), (4096, 4096), (8192, 4096)]
+    );
+    assert_eq!(qsa_score_chunks(16384).len(), 4);
+    assert_eq!(qsa_score_chunks(4097), vec![(0, 2112), (2112, 1985)]);
+    assert_eq!(
+        qsa_score_chunks(10000),
+        vec![(0, 3392), (3392, 3392), (6784, 3216)]
+    );
+    for n in (4097..70_000)
+        .step_by(997)
+        .chain([8193, 12287, 16383, 65536])
+    {
+        let c = qsa_score_chunks(n);
+        assert_eq!(c.len(), n.div_ceil(QSA_SCORE_CHUNK), "{n}");
+        let mut next = 0;
+        for (i, &(first, count)) in c.iter().enumerate() {
+            assert_eq!(first, next, "{n}: in order, no gaps");
+            assert_eq!(
+                first % QSA_SCORE_ALIGN,
+                0,
+                "{n}: aligned to the scores' tiles"
+            );
+            assert!(count <= QSA_SCORE_CHUNK, "{n}: {count}");
+            assert!(count > 1000, "{n}: {count}");
+            assert!(
+                i == 0 || count <= c[0].1,
+                "{n}: the first chunk the biggest"
+            );
+            next += count;
+        }
+        assert_eq!(next, n, "{n}: every token");
+    }
+}
+
 /// #1176 r37: the indexer's token shares under `--tp-seq-par` are cut by their cost.
 #[test]
 fn the_qsa_share_cut_gives_the_later_tokens_fewer() {
