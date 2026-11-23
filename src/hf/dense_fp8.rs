@@ -1,37 +1,47 @@
-//! `--dense-fp8`: a Qwen3.8-Flash-Next (`qwen4_exp`) checkpoint's BF16 dense projections
-//! quantized to FP8 E4M3 as they load, so prompt steps multiply them on the FP8 tensor cores
-//! (W8A8 with per-token activation scales, [`crate::model::fp8::mul_mat_dynamic`]) instead of
-//! BF16 ones, and every step reads half their bytes. Opt-in: the outputs move.
+//! `--dense-fp8`: FP8 E4M3 copies of a Qwen3.8-Flash-Next (`qwen4_exp`) checkpoint's BF16 dense
+//! projections, made as they load, which decode-sized steps (decode and verify, up to 64
+//! tokens) multiply instead of the BF16 weights: half the bytes for the steps that stream them.
+//! Prompt steps keep the BF16 weights and every kernel, join and fusion they take today.
+//! Opt-in: decode outputs move.
 //!
-//! The scheme is llm-compressor's `FP8_DYNAMIC` (channel-wise weights, dynamic per-token
-//! activations), which vLLM runs for FP8 checkpoints: each output row `r` gets the F32 scale
-//! `s_r = amax_r / 448` (`amax_r = max |w_rj|`; 1 for an all-zero row) and the codes
-//! `e4m3(w_rj / s_r)`, IEEE division, rounded to nearest even and saturated at ±448
-//! ([`e4m3`]). The tensors are then what a channel-wise FP8 checkpoint loads as (see
-//! [`super::nvfp4`]): the codes in an `I8` tensor of the weight's shape, the F32 `<name>.scale`
-//! `[rows]` and the name in [`super::nvfp4::KEY_FP8_E4M3`], so the graphs need nothing new.
+//! Why not prompt steps too (#1183): with the FP8 weights in their place, W8A8 prompt steps
+//! measured 2-3% slower at 8K and 32K on a DGX Spark (GB10). The FP8 weights leave the BF16
+//! prompt paths: the weight runs read as one GEMM (query + gate / key / value, `z` / alpha /
+//! beta, shared-expert gate / up: 38 of 134 stayed joined), the hyper-connection mixers writing
+//! the BF16 copy their readers take instead of the F32 stream (28 of 75 casts, none of 48
+//! skipped F32 streams left), and they add one quantization pass of the F32 stream per input:
+//! together more than the FP8 tensor cores saved on these shapes.
 //!
-//! Which weights ([`takes`]): the per-layer projections that run through the model's plain
-//! matmul ([`crate::model::core::linear`]): attention Q (with its gate), K, V and output, the
-//! DeltaNet `qkv`, `z` and output projections, and the shared expert's gate, up and down. The
-//! rest stays as shipped: the hyper-connection mixers and the n-gram projections (their own
-//! kernels), the DeltaNet alpha / beta and the indexer (small), the router, the embeddings and
-//! the output head, the routed experts (NVFP4) and the MTP head (its own file). A weight whose
-//! row length is not a multiple of 64 (what the W8A8 GEMM takes) stays BF16 too.
+//! The scheme is llm-compressor's `FP8_DYNAMIC` weights (channel-wise): each output row `r`
+//! gets the F32 scale `s_r = amax_r / 448` (`amax_r = max |w_rj|`; 1 for an all-zero row) and
+//! the codes `e4m3(w_rj / s_r)`, IEEE division, rounded to nearest even and saturated at ±448
+//! ([`e4m3`]). A copy is what a channel-wise FP8 checkpoint loads as (see [`super::nvfp4`]): an
+//! `I8` tensor of the weight's shape and an F32 scale per row, named by [`copy_names`] and
+//! stored after every other tensor (the weights keep their order, which the joined runs read).
+//! [`KEY`] lists the weights that have one; [`crate::model::core`] reads the copy in place of
+//! the weight in decode-sized steps, through the FP8 matmul's W8A16 route.
+//!
+//! Which weights ([`takes`]): attention Q (with its gate), K, V and output, the DeltaNet `qkv`,
+//! `z` and output projections, and the shared expert's gate, up and down. The rest has no copy:
+//! the hyper-connection mixers and the n-gram projections (their own kernels), the DeltaNet
+//! alpha / beta and the indexer (small), the router, the embeddings and the output head, the
+//! routed experts (NVFP4) and the MTP head (its own file). Nor does a weight whose row length
+//! is not a multiple of 64.
 //!
 //! After Infernix's `qwen3_8_flash_next_nvfp4_dense8` recipe (Apache-2.0), which stores the same
-//! classes of dense weights in 8 bits (int8 in groups of 32 there) for its GB10 prefill numbers;
-//! no Infernix code is used.
+//! classes of dense weights in 8 bits (int8 in groups of 32 there); no Infernix code is used.
 
 use std::sync::{Arc, OnceLock};
 
 use super::Builder;
 use super::nvfp4::{Transform, gather, par_items};
-use crate::ggml::types;
 use crate::gguf::{Compute, Recipe};
 use crate::safetensors::{Checkpoint, Dtype, TensorInfo};
 
-/// The per-layer weights `--dense-fp8` quantizes (`blk.<il>.<name>.weight`).
+/// GGUF metadata: the names of the weights with an FP8 copy ([`copy_names`]).
+pub const KEY: &str = "legion.dense_fp8";
+
+/// The per-layer weights `--dense-fp8` copies (`blk.<il>.<name>.weight`).
 pub const PROJECTIONS: &[&str] = &[
     "attn_q",
     "attn_k",
@@ -56,6 +66,13 @@ pub fn takes(name: &str) -> bool {
                     .strip_suffix(".weight")
                     .is_some_and(|p| PROJECTIONS.contains(&p))
         })
+}
+
+/// The names of the FP8 copy of the weight `name` (`<base>.weight`): its codes
+/// `<base>.fp8.weight` and its row scales `<base>.fp8.scale`.
+pub fn copy_names(name: &str) -> (String, String) {
+    let base = name.strip_suffix(".weight").unwrap_or(name);
+    (format!("{base}.fp8.weight"), format!("{base}.fp8.scale"))
 }
 
 /// The nearest E4M3 (`fn`) code of `x`: round to nearest even, saturating at ±448, NaN to
@@ -130,9 +147,10 @@ fn with_rows<R>(
 }
 
 impl Builder {
-    /// Handles `name` (from `src`, ggml `shape` or the source's) when `--dense-fp8` quantizes
-    /// it ([`takes`]; a 2-D float source with rows of a multiple of 64): its codes and per-row
-    /// scales as described in the module docs. `None`: load it as usual.
+    /// With `--dense-fp8`, the FP8 copy of `name` (from `src`, ggml `shape` or the source's,
+    /// `rows` and `bytes` as the weight takes them) when [`takes`] picks it and its source is
+    /// a 2-D float tensor with rows of a multiple of 64: its recipes, its tensors pushed by
+    /// [`Self::finish`]. The weight itself loads as usual.
     pub(super) fn dense_fp8(
         &mut self,
         name: &str,
@@ -140,47 +158,30 @@ impl Builder {
         rows: Option<&[(u64, u64)]>,
         bytes: Option<Transform>,
         shape: Option<&[u64]>,
-    ) -> Option<Result<(), String>> {
+    ) -> Result<(), String> {
         if !self.dense_fp8_on || !takes(name) {
-            return None;
+            return Ok(());
         }
-        let (_, t) = self.ckpt.locate(src)?;
+        let Some((_, t)) = self.ckpt.locate(src) else {
+            return Ok(());
+        };
         let t: TensorInfo = t.clone();
         let float = matches!(t.dtype, Dtype::BF16 | Dtype::F16 | Dtype::F32);
         if !float || t.shape.len() != 2 || t.shape[1] % 64 != 0 {
-            return None;
+            return Ok(());
         }
         let k = t.shape[1];
         let shape = shape.map_or_else(|| super::ggml_shape(&t.shape), <[u64]>::to_vec);
         if shape.len() != 2 || shape[0] != k as u64 {
-            return None;
+            return Ok(());
         }
         let m = shape[1] as usize;
         let selected: u64 = rows.map_or(t.shape[0] as u64, |r| r.iter().map(|p| p.1).sum());
         if selected != m as u64 {
-            return Some(Err(format!(
+            return Err(format!(
                 "`{src}`: {selected} rows selected for a [{k}, {m}] tensor"
-            )));
+            ));
         }
-        Some(self.add_dense_fp8(name, src, t, rows, bytes, k, shape))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn add_dense_fp8(
-        &mut self,
-        name: &str,
-        src: &str,
-        t: TensorInfo,
-        rows: Option<&[(u64, u64)]>,
-        bytes: Option<Transform>,
-        k: usize,
-        shape: Vec<u64>,
-    ) -> Result<(), String> {
-        let scale_name = name
-            .strip_suffix(".weight")
-            .map(|b| format!("{b}.scale"))
-            .ok_or_else(|| format!("`{name}`: no .weight"))?;
-        let m = shape[1] as usize;
         let elem = t.nbytes() / t.numel();
         let row_bytes = k * elem;
         let dtype = t.dtype.clone();
@@ -241,17 +242,15 @@ impl Builder {
                 )
             })
         };
-        self.push(name, types::I8, shape, 0, 0);
-        self.recipes
-            .insert(name.to_string(), Recipe::Computed(codes));
-        self.push(&scale_name, types::F32, vec![m as u64], 0, 0);
+        let (codes_name, scale_name) = copy_names(name);
+        self.recipes.insert(codes_name, Recipe::Computed(codes));
         self.recipes.insert(
             scale_name,
             Recipe::Computed(Arc::new(move || {
                 Ok(scales()?.iter().flat_map(|v| v.to_le_bytes()).collect())
             })),
         );
-        self.dense_fp8_names.push(name.to_string());
+        self.dense_fp8_names.push((name.to_string(), shape));
         Ok(())
     }
 }

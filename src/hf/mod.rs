@@ -60,8 +60,8 @@ pub struct OpenOptions {
     /// over tensor-parallel ranks that each hold the head's share.
     /// Only the drafter reads them, so the target's tokens under greedy verify do not change.
     pub mtp_nvfp4: bool,
-    /// `--dense-fp8`: a `qwen4_exp` checkpoint's BF16 dense projections quantized to FP8 at
-    /// load ([`dense_fp8`]). Other architectures ignore it.
+    /// `--dense-fp8`: a `qwen4_exp` checkpoint's BF16 dense projections get FP8 copies made
+    /// at load, for decode-sized steps ([`dense_fp8`]). Other architectures ignore it.
     pub dense_fp8: bool,
 }
 
@@ -158,8 +158,9 @@ pub(crate) struct Builder {
     mtp_nvfp4: bool,
     /// [`OpenOptions::dense_fp8`], for this checkpoint's architecture.
     dense_fp8_on: bool,
-    /// The weights [`dense_fp8`] quantized (listed with the raw FP8 ones).
-    dense_fp8_names: Vec<String>,
+    /// The weights [`dense_fp8`] made FP8 copies of, with each copy's shape (pushed last, by
+    /// [`Self::finish`], so the weights keep their order in memory).
+    dense_fp8_names: Vec<(String, Vec<u64>)>,
 }
 
 /// The ggml type that holds a safetensors dtype unchanged.
@@ -237,9 +238,7 @@ impl Builder {
         if let Some(r) = self.quantized(name, src, None, None, shape.clone()) {
             return r;
         }
-        if let Some(r) = self.dense_fp8(name, src, None, None, shape.as_deref()) {
-            return r;
-        }
+        self.dense_fp8(name, src, None, None, shape.as_deref())?;
         let (file, t) = self.source(src)?;
         let ty = ggml_type(&t.dtype)
             .ok_or_else(|| format!("`{src}`: dtype {} is not loadable as is", t.dtype.name()))?;
@@ -268,9 +267,7 @@ impl Builder {
         if let Some(r) = self.quantized(name, src, Some(rows), None, Some(shape.clone())) {
             return r;
         }
-        if let Some(r) = self.dense_fp8(name, src, Some(rows), None, Some(&shape)) {
-            return r;
-        }
+        self.dense_fp8(name, src, Some(rows), None, Some(&shape))?;
         let (file, t) = self.source(src)?;
         let ty = ggml_type(&t.dtype)
             .ok_or_else(|| format!("`{src}`: dtype {} is not loadable as is", t.dtype.name()))?;
@@ -387,9 +384,7 @@ impl Builder {
         ) {
             return r;
         }
-        if let Some(r) = self.dense_fp8(name, src, None, Some(transform), Some(&shape)) {
-            return r;
-        }
+        self.dense_fp8(name, src, None, Some(transform), Some(&shape))?;
         let (_, t) = self.source(src)?;
         let ty = ggml_type(&t.dtype)
             .ok_or_else(|| format!("`{src}`: dtype {} is not loadable as is", t.dtype.name()))?;
@@ -411,17 +406,22 @@ impl Builder {
             .as_ref()
             .map(nvfp4::ModelOpt::metadata)
             .unwrap_or_default();
-        // `--dense-fp8`'s weights join the checkpoint's raw FP8 ones.
+        // `--dense-fp8`'s copies, after every other tensor, and the weights they copy.
         if !self.dense_fp8_names.is_empty() {
             tracing::info!(
-                "--dense-fp8: {} dense projections load as FP8 E4M3 (one scale per row)",
+                "--dense-fp8: {} dense projections get FP8 E4M3 copies (one scale per row) for \
+                 decode-sized steps",
                 self.dense_fp8_names.len()
             );
-            let names = self.dense_fp8_names.iter().cloned().map(Value::String);
-            match kv.iter_mut().find(|(k, _)| *k == nvfp4::KEY_FP8_E4M3) {
-                Some((_, Value::Array(a))) => a.extend(names),
-                _ => kv.push((nvfp4::KEY_FP8_E4M3, Value::Array(names.collect()))),
+            let mut names = Vec::new();
+            for (name, shape) in std::mem::take(&mut self.dense_fp8_names) {
+                let (codes, scale) = dense_fp8::copy_names(&name);
+                let rows = shape[1];
+                self.push(&codes, types::I8, shape, 0, 0);
+                self.push(&scale, types::F32, vec![rows], 0, 0);
+                names.push(Value::String(name));
             }
+            kv.push((dense_fp8::KEY, Value::Array(names)));
         }
         for (k, v) in kv {
             self.meta.set(k, &v)?;

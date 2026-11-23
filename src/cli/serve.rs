@@ -258,12 +258,13 @@ pub(super) struct ModelArgs {
     /// concurrent decode); moves the logits of W4A16 checkpoints.
     #[arg(long, value_enum, env = "LEGION_NVFP4_A4", default_value_t = Nvfp4A4::Off)]
     pub nvfp4_a4: Nvfp4A4,
-    /// Qwen3.8-Flash-Next safetensors checkpoints: quantize the BF16 dense projections
-    /// (attention, DeltaNet and shared-expert weights) to FP8 E4M3 at load, one scale per
-    /// output row, and run prompt steps of over 64 tokens on the FP8 tensor cores with
-    /// per-token activation scales (sm_89+; decode steps take the FP8 weights with 16-bit
-    /// activations). Faster prefill and half the dense weights' memory; moves the logits.
-    /// One machine without --tp; other models ignore it.
+    /// Qwen3.8-Flash-Next safetensors checkpoints: keep an FP8 E4M3 copy of the BF16 dense
+    /// projections (attention, DeltaNet and shared-expert weights; one scale per output row,
+    /// made at load) and let decode and verify steps of up to 64 tokens read it with 16-bit
+    /// activations: half the bytes those steps stream for them. Prompt steps keep the BF16
+    /// weights and run as without the flag. Faster decode; moves the decoded text. The copy
+    /// takes about half the dense weights' memory again (~2.7 GiB). One machine without
+    /// --tp; other models ignore it.
     #[arg(long)]
     pub dense_fp8: bool,
     /// Where a MoE model's routed experts live with --device cuda: `auto` (VRAM if they fit,

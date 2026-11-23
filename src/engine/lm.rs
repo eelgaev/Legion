@@ -690,25 +690,12 @@ fn hf_options(cfg: &LmConfig) -> crate::hf::OpenOptions {
 }
 
 /// `--dense-fp8` runs on one machine and one device per layer: tensor parallelism (over GPUs
-/// or machines) would cut the weights' rows from their per-row scales.
+/// or machines) would cut the copies' rows from their per-row scales.
 fn check_dense_fp8(cfg: &LmConfig) -> Result<(), String> {
     if cfg.dense_fp8 && (cfg.tp > 1 || cfg.tp_net.is_some()) {
         return Err("--dense-fp8 does not run under tensor parallelism yet (--tp)".into());
     }
     Ok(())
-}
-
-/// The FP8 activation mode of a load: `--dense-fp8` turns the default `a8` (W8A8 with a
-/// checkpoint's static input scales, which its weights have none of) into `a8-dynamic`, so
-/// prompt steps multiply them on E4M3 tensor cores with per-token scales; decode steps stay
-/// W8A16 either way. Any other `--fp8-act` is kept.
-fn dense_fp8_act(cfg: &LmConfig) -> crate::model::core::Fp8Act {
-    use crate::model::core::Fp8Act;
-    if cfg.dense_fp8 && cfg.fp8_act == Fp8Act::A8 {
-        Fp8Act::A8Dynamic
-    } else {
-        cfg.fp8_act
-    }
 }
 
 /// Whether the depth policy may draft for a group of decoding sequences that leaves the
@@ -1178,8 +1165,8 @@ pub struct LmConfig {
     pub fp16: crate::weights::Fp16Load,
     /// Which NVFP4 matmuls take 4-bit activations (W4A4 kernels).
     pub nvfp4_a4: crate::model::core::Nvfp4A4,
-    /// `--dense-fp8`: a Qwen3.8-Flash-Next checkpoint's BF16 dense projections quantized to
-    /// FP8 at load ([`crate::hf::dense_fp8`]), prefill on W8A8 with per-token scales.
+    /// `--dense-fp8`: FP8 copies of a Qwen3.8-Flash-Next checkpoint's BF16 dense projections,
+    /// made at load, for decode and verify steps ([`crate::hf::dense_fp8`]).
     pub dense_fp8: bool,
     /// Where the routed experts live and the VRAM expert cache (see [`crate::residency`]).
     pub residency: crate::residency::ResidencyConfig,
@@ -4305,7 +4292,7 @@ impl LmEngine {
             None => None,
         };
         model.keep_a8(cfg.nvfp4_act == crate::model::core::Nvfp4Act::A8);
-        model.set_fp8_act(dense_fp8_act(&cfg));
+        model.set_fp8_act(cfg.fp8_act);
         model.set_nvfp4_mm(cfg.nvfp4_mm);
         model.set_nvfp4_a4(cfg.nvfp4_a4);
         #[cfg(feature = "cuda")]

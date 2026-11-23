@@ -126,6 +126,9 @@ pub struct Linear {
     no_a4: HashSet<String>,
     /// FP8 E4M3 weights kept as shipped (`I8` tensors, `legion.tensor_extra.fp8_e4m3`).
     fp8: HashSet<String>,
+    /// Weights with an FP8 copy that decode-sized steps read in their place (`--dense-fp8`,
+    /// [`crate::hf::dense_fp8`]): FP8 matmuls where the tensor given is the `I8` copy.
+    dense_fp8: HashSet<String>,
     /// Every weight keeps 8-bit or wider activations ([`Self::set_all_a8`]).
     all_a8: bool,
     /// Activations of FP8 matmuls ([`Self::set_fp8_act`]).
@@ -138,8 +141,30 @@ pub struct Linear {
 
 impl Linear {
     /// Reads `general.tensor_extra.{name,prec_a4}` (llama.cpp's `llama_prec_policy::load`).
-    /// Both are optional; when present they must be arrays of the same length.
+    /// Both are optional; when present they must be arrays of the same length. Also the FP8
+    /// weight lists ([`KEY_FP8_E4M3`], [`crate::hf::dense_fp8::KEY`]).
     pub fn from_gguf(g: &GgufFile) -> Result<Self, ModelError> {
+        let mut linear = Self::from_gguf_hints(g)?;
+        let key = crate::hf::dense_fp8::KEY;
+        if let Some(v) = g.get(key) {
+            let bad = || ModelError::Metadata(key.into());
+            linear.dense_fp8 = v
+                .as_array()
+                .ok_or_else(bad)?
+                .iter()
+                .map(|n| n.as_str().map(str::to_string).ok_or_else(bad))
+                .collect::<Result<_, _>>()?;
+        }
+        Ok(linear)
+    }
+
+    /// Whether `w` (the weight `name`, or the tensor read in its place) is FP8 E4M3: a weight
+    /// kept as shipped, or a `--dense-fp8` copy.
+    fn is_fp8(&self, name: &str, w: Tensor<'_>) -> bool {
+        self.fp8.contains(name) || (w.ty() == types::I8 && self.dense_fp8.contains(name))
+    }
+
+    fn from_gguf_hints(g: &GgufFile) -> Result<Self, ModelError> {
         let bad = |k: &str| ModelError::Metadata(k.into());
         let fp8: HashSet<String> = match g.get(KEY_FP8_E4M3) {
             None => HashSet::new(),
@@ -181,6 +206,7 @@ impl Linear {
         Ok(Self {
             no_a4,
             fp8,
+            dense_fp8: HashSet::new(),
             all_a8: false,
             fp8_act: Fp8Act::default(),
             nvfp4_mm: Nvfp4Mm::default(),
@@ -308,7 +334,7 @@ impl Linear {
         n: i64,
     ) -> bool {
         let dynamic_ok = || !w.is_host() && crate::model::fp8::fp8_mma();
-        self.fp8.contains(name)
+        self.is_fp8(name, w)
             && self.fp8_route(n, w.ne()[0], has_input_scale, dynamic_ok) == Fp8Route::Dynamic
     }
 
@@ -342,7 +368,7 @@ impl Linear {
     ) -> Result<Tensor<'a>, ModelError> {
         // FP8 E4M3 bytes: Legion's FP8 matmul (W8A8 or W8A16), with the weight scale (per
         // tensor, or per row on W8A16) folded into its epilogue.
-        if self.fp8.contains(name) {
+        if self.is_fp8(name, w) {
             let n: i64 = x.ne()[1..].iter().product();
             let dynamic_ok =
                 || x.ty() == types::F32 && !w.is_host() && crate::model::fp8::fp8_mma();
@@ -444,7 +470,7 @@ impl Linear {
             && res.is_contiguous()
             && res.ne() == [w.ne()[1], n1, n2, n3]
             && w.ne()[2] == 1;
-        if res_ok && self.fp8.contains(name) {
+        if res_ok && self.is_fp8(name, w) {
             use crate::model::fp8;
             let dynamic_ok = || x.ty() == types::F32 && !w.is_host() && fp8::fp8_mma();
             let route = self.fp8_route(n, w.ne()[0], input_scale.is_some(), dynamic_ok);

@@ -18,6 +18,7 @@
 pub(crate) mod arch;
 pub mod capture;
 pub(crate) mod decode_fuse;
+pub(crate) mod dense_twins;
 pub use decode_fuse::set_decode_fuse;
 pub(crate) mod node_fuse;
 pub use node_fuse::set_node_fuse;
@@ -376,6 +377,9 @@ pub struct Model {
     /// Weight pairs read as one matrix by small steps ([`joined`]), made by the first graph
     /// that asks. Before the weights, whose memory they share.
     joined: std::cell::OnceCell<Option<joined::Joined>>,
+    /// `--dense-fp8`: whether the graph being built reads the dense projections' FP8 copies
+    /// ([`dense_twins`]).
+    dense_twins: dense_twins::DenseTwins,
     /// BF16 copies of the MoE routers whose values are exact in BF16 ([`router_bf16`]), read by
     /// small steps' router ops; made at load ([`Self::prepare_router_bf16`]) or by the first
     /// graph that asks. Each copy is checked against the router it was made from on use.
@@ -1649,6 +1653,7 @@ impl Model {
             ssd: None,
             host_tier: None,
             joined: Default::default(),
+            dense_twins: dense_twins::DenseTwins::from_gguf(gguf),
             router_bf16: Default::default(),
             host_pins: None,
             hp,
@@ -1701,6 +1706,7 @@ impl Model {
             ssd: None,
             host_tier: None,
             joined: Default::default(),
+            dense_twins: dense_twins::DenseTwins::from_gguf(gguf),
             router_bf16: Default::default(),
             host_pins: None,
             hp,
@@ -2287,6 +2293,12 @@ impl Model {
     }
 
     pub(crate) fn w(&self, name: &str) -> Result<Tensor<'_>, ModelError> {
+        // `--dense-fp8`: a decode-sized step's graph reads the FP8 copy ([`dense_twins`]).
+        if let Some(copy) = self.dense_twins.copy_of(name)
+            && let Some(t) = self.weights.get(&copy)
+        {
+            return Ok(t);
+        }
         self.requant
             .as_ref()
             .and_then(|c| c.tensor(name))
@@ -3282,6 +3294,8 @@ impl Model {
         }
         let hp = &self.hp;
         let n: i64 = shape.iter().map(|g| g.tokens() as i64).sum();
+        // `--dense-fp8`: decode-sized steps read the FP8 copies, until the graph is built.
+        let _twins = self.dense_twins.step(n);
         let last = layers.end == hp.n_layer;
         let n_out: i64 = if last {
             shape.iter().map(|g| g.out_rows() as i64).sum()
