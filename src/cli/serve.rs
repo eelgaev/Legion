@@ -1269,8 +1269,9 @@ struct EngineArgs {
     /// (default 1024; 4096 on a GPU that shares memory with the host, e.g. the GB10). Prompts
     /// longer than the step run in other step sizes when it changes, so greedy output can
     /// move. On one GPU sharing the host's memory, steps over 4096 tokens keep fewer prompt
-    /// graphs (two, else one, with their compute buffers) when three do not fit beside the
-    /// KV pool (`--kv-cache-tokens`, else one context); the load logs it. With one kept graph
+    /// graphs (two, else one, with their compute buffers) when three do not leave room for
+    /// `--kv-cache-tokens`, or without it for one context (the automatic pool can still grow
+    /// past that, up to max(--ctx-size, 262144) tokens); the load logs it. With one kept graph
     /// the next prompt chunk's graph is not built while the current one computes.
     #[arg(long)]
     max_batch_tokens: Option<usize>,
