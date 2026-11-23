@@ -48,6 +48,8 @@ fn opt_u(tc: &Json, key: &str, default: u64) -> u64 {
 pub(super) fn build(b: &mut Builder, config: &Json) -> Result<(), String> {
     let tc = text_config(config);
     let n_layer = num_u(tc, "num_hidden_layers")?;
+    // `--dense-fp8`: copies for these layers only, never for the MTP layer after them.
+    b.dense_fp8_layers = Some((n_layer, opt_u(tc, "mtp_num_hidden_layers", 0)));
     let n_embd = num_u(tc, "hidden_size")?;
     let n_head = num_u(tc, "num_attention_heads")?;
     let head_dim = opt_u(tc, "head_dim", n_embd / n_head);

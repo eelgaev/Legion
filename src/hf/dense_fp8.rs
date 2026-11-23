@@ -33,8 +33,14 @@
 //! `z` and output projections, and the shared expert's gate, up and down. The rest has no copy:
 //! the hyper-connection mixers and the n-gram projections (their own kernels), the DeltaNet
 //! alpha / beta and the indexer (small), the router, the embeddings and the output head, the
-//! routed experts (NVFP4) and the MTP head (its own file). Nor does a weight whose row length
-//! is not a multiple of 64.
+//! routed experts (NVFP4) and the MTP layer. Nor does a weight whose row length is not a
+//! multiple of 64.
+//!
+//! The MTP layer (`blk.<num_hidden_layers>`, the checkpoint's `mtp.*`) keeps its BF16 weights:
+//! only the model's own layers get copies ([`takes_trunk`]), and the head, a model of its own
+//! (`super::open_mtp`), is opened without `--dense-fp8`. The drafter's guesses are checked
+//! against the model's tokens; a head that keeps the weights it was trained with does not add
+//! its own 8-bit rounding to the target's.
 //!
 //! After Infernix's `qwen3_8_flash_next_nvfp4_dense8` recipe (Apache-2.0), which stores the same
 //! classes of dense weights in 8 bits (int8 in groups of 32 there); no Infernix code is used.
@@ -117,12 +123,29 @@ pub fn takes(name: &str) -> bool {
     name.strip_prefix("blk.")
         .and_then(|r| r.split_once('.'))
         .is_some_and(|(il, rest)| {
-            !il.is_empty()
-                && il.bytes().all(|c| c.is_ascii_digit())
+            layer_index(il).is_some()
                 && rest
                     .strip_suffix(".weight")
                     .is_some_and(|p| PROJECTIONS.contains(&p))
         })
+}
+
+/// The layer of a `blk.<il>.` tensor `name`.
+pub fn layer(name: &str) -> Option<u64> {
+    let (il, _) = name.strip_prefix("blk.")?.split_once('.')?;
+    layer_index(il)
+}
+
+/// Whether `name` is one of [`PROJECTIONS`] of the model's own `trunk` layers
+/// (`blk.0` to `blk.<trunk - 1>`): what gets a copy. The MTP layer (`blk.<trunk>`) does not.
+pub fn takes_trunk(name: &str, trunk: u64) -> bool {
+    takes(name) && layer(name).is_some_and(|il| il < trunk)
+}
+
+fn layer_index(il: &str) -> Option<u64> {
+    (!il.is_empty() && il.bytes().all(|c| c.is_ascii_digit()))
+        .then(|| il.parse().ok())
+        .flatten()
 }
 
 /// The names of the FP8 copy of the weight `name` (`<base>.weight`): its codes
@@ -217,6 +240,14 @@ impl Builder {
         shape: Option<&[u64]>,
     ) -> Result<(), String> {
         if !self.dense_fp8_on || !takes(name) {
+            return Ok(());
+        }
+        // The model's own layers only: an MTP layer keeps BF16 ([`takes_trunk`]).
+        if !self
+            .dense_fp8_layers
+            .is_some_and(|(trunk, _)| takes_trunk(name, trunk))
+        {
+            self.dense_fp8_skipped += 1;
             return Ok(());
         }
         let Some((_, t)) = self.ckpt.locate(src) else {

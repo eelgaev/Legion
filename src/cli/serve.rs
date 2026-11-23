@@ -263,8 +263,8 @@ pub(super) struct ModelArgs {
     /// made at load) and let decode and verify steps of up to 64 tokens read it with 16-bit
     /// activations: half the bytes those steps stream for them. Prompt steps keep the BF16
     /// weights and run as without the flag (see --dense-fp8-prompt). Faster decode; moves the
-    /// decoded text. The copy takes about half the dense weights' memory again (~2.7 GiB). One
-    /// machine without --tp; other models ignore it.
+    /// decoded text. The copy takes about half the dense weights' memory again (~2.7 GiB). The
+    /// MTP layer keeps its BF16 weights. One machine without --tp; other models ignore it.
     #[arg(long)]
     pub dense_fp8: bool,
     /// With --dense-fp8: prompt steps read the FP8 copies too, as W8A8 GEMMs with one FP8

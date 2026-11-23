@@ -31,6 +31,37 @@ fn takes_the_layer_projections_only() {
     }
 }
 
+/// Copies stop at the model's own layers: the MTP layer after them keeps BF16.
+#[test]
+fn the_mtp_layer_gets_no_copy() {
+    assert_eq!(layer("blk.47.attn_q.weight"), Some(47));
+    assert_eq!(layer("blk.x.attn_q.weight"), None);
+    assert_eq!(layer("output.weight"), None);
+    for name in [
+        "blk.0.attn_q.weight",
+        "blk.47.attn_v.weight",
+        "blk.47.ffn_down_shexp.weight",
+    ] {
+        assert!(takes_trunk(name, 48), "{name}");
+    }
+    for name in [
+        "blk.48.attn_q.weight",
+        "blk.48.attn_gate.weight",
+        "blk.48.attn_output.weight",
+        "blk.48.ffn_gate_shexp.weight",
+        "blk.48.ffn_up_shexp.weight",
+        "blk.48.ffn_down_shexp.weight",
+        "blk.48.nextn.eh_proj.weight",
+        "blk.0.ssm_alpha.weight",
+    ] {
+        assert!(!takes_trunk(name, 48), "{name}");
+    }
+    assert!(
+        takes("blk.48.attn_q.weight"),
+        "a projection, of the MTP layer"
+    );
+}
+
 /// The fast conversion has the reference's bits: every E4M3 value, every midpoint between
 /// neighbours (ties to even) and its two F32 neighbours, and a sweep of F32 bit patterns.
 #[test]

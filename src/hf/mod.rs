@@ -133,6 +133,9 @@ pub fn open_mtp(dir: &Path, opts: &OpenOptions) -> Result<GgufFile, GgufError> {
         .to_string();
     let mut b = Builder::new(Arc::new(ckpt));
     b.modelopt = nvfp4::ModelOpt::detect(&b.ckpt, &config, opts.fp8).map_err(err)?;
+    // Never `--dense-fp8` copies: the drafter reads the head's BF16 weights
+    // ([`dense_fp8::takes_trunk`]).
+    b.dense_fp8_on = false;
     match model_type.as_str() {
         "qwen4_exp" | "qwen4_exp_text" => qwen4::build_mtp(&mut b, &config).map_err(err)?,
         other => {
@@ -158,6 +161,11 @@ pub(crate) struct Builder {
     mtp_nvfp4: bool,
     /// [`OpenOptions::dense_fp8`], for this checkpoint's architecture.
     dense_fp8_on: bool,
+    /// `--dense-fp8`: the model's own layers (which get copies) and its MTP layers (which do
+    /// not, [`dense_fp8::takes_trunk`]), set by the architecture's build.
+    dense_fp8_layers: Option<(u64, u64)>,
+    /// Projections [`dense_fp8`] gave no copy for not being of the model's own layers.
+    dense_fp8_skipped: usize,
     /// The weights [`dense_fp8`] made FP8 copies of, with each copy's shape (pushed last, by
     /// [`Self::finish`], so the weights keep their order in memory).
     dense_fp8_names: Vec<(String, Vec<u64>)>,
@@ -184,6 +192,8 @@ impl Builder {
             stacks: HashMap::new(),
             mtp_nvfp4: false,
             dense_fp8_on: false,
+            dense_fp8_layers: None,
+            dense_fp8_skipped: 0,
             dense_fp8_names: Vec::new(),
         }
     }
@@ -408,9 +418,19 @@ impl Builder {
             .unwrap_or_default();
         // `--dense-fp8`'s copies, after every other tensor, and the weights they copy.
         if !self.dense_fp8_names.is_empty() {
+            let (trunk, mtp) = self.dense_fp8_layers.unwrap_or_default();
+            let mtp = match (mtp, self.dense_fp8_skipped) {
+                (0, 0) => String::new(),
+                (0, s) => format!("; {s} skipped"),
+                (1, _) => format!("; the MTP layer (blk.{trunk}) skipped, the drafter reads BF16"),
+                (m, _) => format!(
+                    "; the {m} MTP layers (blk.{trunk}-{}) skipped, the drafter reads BF16",
+                    trunk + m - 1
+                ),
+            };
             tracing::info!(
-                "--dense-fp8: {} dense projections get FP8 E4M3 copies (one scale per row) for \
-                 decode-sized steps",
+                "--dense-fp8: {} dense projections of {trunk} layers get FP8 E4M3 copies (one \
+                 scale per row) for decode-sized steps{mtp}",
                 self.dense_fp8_names.len()
             );
             let mut names = Vec::new();
