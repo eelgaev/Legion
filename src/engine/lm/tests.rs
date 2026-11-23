@@ -1196,6 +1196,16 @@ fn fewer_kept_prompt_graphs_leave_less_step_room() {
 }
 
 #[test]
+fn chunked_charge_only_on_the_paged_path() {
+    use crate::model::core::Attention;
+    assert!(paged_step_scores(1, Attention::Auto));
+    assert!(paged_step_scores(1, Attention::Paged));
+    assert!(!paged_step_scores(1, Attention::Gather));
+    assert!(!paged_step_scores(2, Attention::Auto));
+    assert!(!paged_step_scores(2, Attention::Paged));
+}
+
+#[test]
 fn chunked_scores_charge_less_only_past_a_chunk() {
     use crate::ggml::DeviceKind;
     let gib = 1usize << 30;

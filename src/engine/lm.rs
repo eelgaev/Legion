@@ -943,6 +943,14 @@ pub(crate) fn kv_headroom_kept(
     kv_headroom_step(kind, max_batch_tokens, uma_free, kept, false)
 }
 
+/// Whether this load's prompt steps can take the chunked QSA scores (#1183,
+/// [`crate::model::core::arch::Arch::chunks_step_scores`]): only on the paged attention path.
+/// `--attention gather` and tensor parallelism (which gathers, see the attention set at load)
+/// score a whole group through the mask, so their steps keep the unchunked charge.
+pub(crate) fn paged_step_scores(tp: usize, attention: crate::model::core::Attention) -> bool {
+    tp <= 1 && attention != crate::model::core::Attention::Gather
+}
+
 /// [`kv_headroom_kept`] for a model that does (`chunked`) or does not score its context in
 /// chunks of at most [`LEAN_STEP_TOKENS`] tokens
 /// ([`crate::model::core::arch::Arch::chunks_step_scores`], #1183): with chunks, steps of
@@ -3773,7 +3781,8 @@ fn load_report(
     let host_blocks = f.n_blocks - f.hbm_blocks;
     let gpu = layout.stages[0].0.is_some();
     let prompt_graphs = exec.prompt_graphs();
-    let chunked = hp.arch.chunks_step_scores(LEAN_STEP_TOKENS);
+    let chunked =
+        paged_step_scores(cfg.tp, cfg.attention) && hp.arch.chunks_step_scores(LEAN_STEP_TOKENS);
     let mut stages: Vec<report::StageMemory> = layout
         .stages
         .iter()
@@ -4779,8 +4788,10 @@ impl LmEngine {
             state_bytes + ring_bytes_with(layers, ring)
         };
         // Whether prompt steps past 4,096 tokens score the context in chunks (#1183): their
-        // kept graphs' buffers then grow only with their tokens past it.
-        let chunked = hp.arch.chunks_step_scores(LEAN_STEP_TOKENS);
+        // kept graphs' buffers then grow only with their tokens past it. Not on the mask path
+        // ([`paged_step_scores`]), which scores the whole group.
+        let chunked = paged_step_scores(cfg.tp, cfg.attention)
+            && hp.arch.chunks_step_scores(LEAN_STEP_TOKENS);
         // `kept`: the prompt graphs each stage keeps ([`lean_prompt_graphs`]).
         let fit_with = |ring: Option<KvRing>, log: bool, kept: usize| {
             layout
