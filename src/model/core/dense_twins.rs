@@ -20,7 +20,10 @@
 //! W8A8 GEMMs on E4M3 tensor cores with per-token activation scales (twice BF16's rate on a
 //! GB10). The activations' codes come from BF16 rows the step's ops write already where it has
 //! them ([`super::linear::Linear::mul_mat`]), and a joined run's copies, stored back to back
-//! ([`dense_fp8::RUNS`]), are one GEMM as the BF16 run is ([`Runs`]).
+//! ([`dense_fp8::RUNS`]), are one GEMM as the BF16 run is ([`Runs`]). The BF16 weights then
+//! stay out of the load ([`dense_fp8::left_out`]), and every read of them by name, in a graph
+//! build or not, gives the copy ([`DenseTwins::from_gguf`]): the graphs are the ones
+//! the flag builds with the originals loaded, which no step read.
 
 use std::cell::Cell;
 
@@ -40,15 +43,23 @@ pub(crate) struct DenseTwins {
     on: bool,
     /// Prompt steps read the copies too ([`Self::set_prompt`]).
     prompt: bool,
+    /// The weights with copies were left out of the load (`--dense-fp8-prompt`,
+    /// [`dense_fp8::left_out`]): every read gives the copy, in a graph build or not.
+    bare: bool,
     /// A graph of a step that reads the copies is being built.
     active: Cell<bool>,
 }
 
 impl DenseTwins {
-    pub(crate) fn from_gguf(g: &GgufFile) -> Self {
+    /// The state for a model loaded from `g`, whose weights `loaded` tells by name: bare (every
+    /// read gives the copy) when `g` lists weights with copies and none of them loaded
+    /// ([`originals_left_out`]).
+    pub(crate) fn from_gguf(g: &GgufFile, loaded: impl Fn(&str) -> bool) -> Self {
+        let on = g.get(dense_fp8::KEY).is_some();
         Self {
-            on: g.get(dense_fp8::KEY).is_some(),
+            on,
             prompt: false,
+            bare: on && originals_left_out(&dense_fp8::listed(g), loaded),
             active: Cell::new(false),
         }
     }
@@ -75,9 +86,11 @@ impl DenseTwins {
     }
 
     /// The tensor to read for `name` now: its copy's ([`copy_name`]) in the graph of a step
-    /// that reads them, else `None` (the tensor itself).
+    /// that reads them, or always where the originals were left out ([`Self::from_gguf`]), else
+    /// `None` (the tensor itself). A name the file has no copy of (the MTP layer's) is then
+    /// looked up as itself.
     pub(crate) fn copy_of(&self, name: &str) -> Option<String> {
-        if !self.active.get() {
+        if !(self.active.get() || self.bare) {
             return None;
         }
         copy_name(name)
@@ -230,6 +243,13 @@ pub(crate) fn prompt_rows(groups: impl IntoIterator<Item = (usize, bool)>) -> bo
 /// Whether a decode or verify step of `n` tokens reads the copies ([`STEP_MAX_TOKENS`]).
 pub(crate) fn takes_step(n: i64) -> bool {
     n <= STEP_MAX_TOKENS
+}
+
+/// Whether the weights of `listed` (those with copies, [`dense_fp8::KEY`]) were left out of
+/// the load: there are some and `loaded` finds none of them. A load that dropped only some of
+/// them (another machine's layers) keeps reading the rest as the steps choose.
+pub(crate) fn originals_left_out(listed: &[String], loaded: impl Fn(&str) -> bool) -> bool {
+    !listed.is_empty() && !listed.iter().any(|n| loaded(n.as_str()))
 }
 
 /// The copy's tensor for `name`: the codes for a copied weight `<base>.weight`, the row scales

@@ -170,3 +170,29 @@ fn copies_group_by_run() {
         vec![vec![("blk.3.attn_v.weight".to_string(), vec![64, 7])]]
     );
 }
+
+#[test]
+fn prompt_reads_leave_every_original_out() {
+    let listed: Vec<String> = [
+        "blk.0.attn_q.weight",
+        "blk.0.ssm_out.weight",
+        "blk.1.ffn_up_shexp.weight",
+    ]
+    .map(String::from)
+    .to_vec();
+    let size = |n: &str| match n {
+        "blk.0.attn_q.weight" => Some(4096),
+        "blk.0.ssm_out.weight" => Some(1024),
+        // Left out already (another machine's layer) or not in the file.
+        _ => None,
+    };
+    assert_eq!(
+        left_out(&listed, false, size),
+        (Vec::new(), 0),
+        "decode-only copies"
+    );
+    let (names, bytes) = left_out(&listed, true, size);
+    assert_eq!(names, &listed[..2]);
+    assert_eq!(bytes, 5120);
+    assert_eq!(left_out(&[], true, size), (Vec::new(), 0), "no copies");
+}

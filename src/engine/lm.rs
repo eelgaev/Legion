@@ -1221,7 +1221,8 @@ pub struct LmConfig {
     /// made at load, for decode and verify steps ([`crate::hf::dense_fp8`]).
     pub dense_fp8: bool,
     /// `--dense-fp8-prompt`: prompt steps read those copies too, as W8A8 GEMMs
-    /// ([`crate::model::core::Model::set_dense_fp8_prompt`]).
+    /// ([`crate::model::core::Model::set_dense_fp8_prompt`]); the BF16 weights they copy are
+    /// then not loaded ([`crate::hf::dense_fp8::left_out`]).
     pub dense_fp8_prompt: bool,
     /// Where the routed experts live and the VRAM expert cache (see [`crate::residency`]).
     pub residency: crate::residency::ResidencyConfig,
@@ -4242,6 +4243,30 @@ impl LmEngine {
             }
             None => (Vec::new(), None),
         };
+        // `--dense-fp8 --dense-fp8-prompt` (#1183): every step reads the FP8 copies (prompt
+        // steps where `Model::set_dense_fp8_prompt` takes the flag, below), so the BF16
+        // weights they copy stay out of the load: their bytes go to the KV pool and the step
+        // buffers, which are sized to the memory left.
+        let (dense_left, dense_bytes) = crate::hf::dense_fp8::left_out(
+            &crate::hf::dense_fp8::listed(&gguf),
+            cfg.dense_fp8_prompt && crate::model::fp8::fp8_mma(),
+            // (Not those left out already: another machine's layers.)
+            |n| {
+                if skip.iter().any(|s| s == n) {
+                    return None;
+                }
+                gguf.tensor(n).map(|t| t.size)
+            },
+        );
+        if !dense_left.is_empty() {
+            tracing::info!(
+                weights = dense_left.len(),
+                gib = dense_bytes as f64 / (1u64 << 30) as f64,
+                "--dense-fp8-prompt: the BF16 weights with FP8 copies are not loaded (every \
+                 step reads the copies)"
+            );
+            skip.extend(dense_left);
+        }
         opts.skip = &skip;
         opts.extra = &glm_extra;
         opts.extra_recipes = glm_recipes;

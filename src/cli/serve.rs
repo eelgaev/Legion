@@ -272,7 +272,10 @@ pub(super) struct ModelArgs {
     /// With --dense-fp8: prompt steps read the FP8 copies too, as W8A8 GEMMs with one FP8
     /// scale per token on FP8 tensor cores (sm_89+; elsewhere ignored), the copies of
     /// query/key/value and of the shared expert's gate/up each one GEMM as their BF16 weights
-    /// are. Aims at faster prefill; moves the output further than --dense-fp8 alone.
+    /// are. No step then reads the BF16 weights, so they are not loaded: the dense projections
+    /// take the copies' ~2.7 GiB only, about 2.7 GiB less than without --dense-fp8 (~5.4 GiB
+    /// less than --dense-fp8 alone). Aims at faster prefill; moves the output further than
+    /// --dense-fp8 alone.
     #[arg(long, requires = "dense_fp8")]
     pub dense_fp8_prompt: bool,
     /// Where a MoE model's routed experts live with --device cuda: `auto` (VRAM if they fit,

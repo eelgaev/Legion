@@ -18,6 +18,9 @@
 //! a 16-bit-activation GEMM of 8-bit weights is no faster than BF16's (Infernix measured its
 //! W8A16 GEMMs below its BF16 ones there), and FP16-accumulate MMA runs at the FP32-accumulate
 //! rate (its roadmap: ~125 TFLOP/s both), so only the 8-bit MMA (~2x) speeds prompt steps.
+//! With the flag no step reads the BF16 weights, so they stay out of the load ([`left_out`]):
+//! the dense projections then take the copies' bytes only (~2.7 GiB) instead of the
+//! originals' (~5.4 GiB) and the copies'.
 //!
 //! The scheme is llm-compressor's `FP8_DYNAMIC` weights (channel-wise): each output row `r`
 //! gets the F32 scale `s_r = amax_r / 448` (`amax_r = max |w_rj|`; 1 for an all-zero row) and
@@ -54,6 +57,41 @@ use crate::safetensors::{Checkpoint, Dtype, TensorInfo};
 
 /// GGUF metadata: the names of the weights with an FP8 copy ([`copy_names`]).
 pub const KEY: &str = "legion.dense_fp8";
+
+/// The weights `g` lists as having an FP8 copy ([`KEY`]), in its order; none without copies.
+pub fn listed(g: &crate::gguf::GgufFile) -> Vec<String> {
+    let Some(v) = g.get(KEY) else {
+        return Vec::new();
+    };
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|n| n.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `--dense-fp8-prompt` (#1183): the weights of `listed` ([`KEY`]) whose BF16 originals the
+/// load leaves out, and their bytes (`size`: a tensor's bytes in the file, by name). All of
+/// them where prompt steps read the copies (`prompt_reads`: the flag, on a GPU with E4M3
+/// tensor cores), as decode and verify steps do already: then no step reads an original.
+/// None otherwise. A name the file has no tensor for is not counted.
+pub fn left_out(
+    listed: &[String],
+    prompt_reads: bool,
+    size: impl Fn(&str) -> Option<u64>,
+) -> (Vec<String>, u64) {
+    if !prompt_reads {
+        return (Vec::new(), 0);
+    }
+    let found: Vec<(String, u64)> = listed
+        .iter()
+        .filter_map(|n| Some((n.clone(), size(n.as_str())?)))
+        .collect();
+    let bytes = found.iter().map(|(_, b)| b).sum();
+    (found.into_iter().map(|(n, _)| n).collect(), bytes)
+}
 
 /// The per-layer weights `--dense-fp8` copies (`blk.<il>.<name>.weight`).
 pub const PROJECTIONS: &[&str] = &[
