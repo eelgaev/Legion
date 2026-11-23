@@ -258,6 +258,14 @@ pub(super) struct ModelArgs {
     /// concurrent decode); moves the logits of W4A16 checkpoints.
     #[arg(long, value_enum, env = "LEGION_NVFP4_A4", default_value_t = Nvfp4A4::Off)]
     pub nvfp4_a4: Nvfp4A4,
+    /// Qwen3.8-Flash-Next safetensors checkpoints: quantize the BF16 dense projections
+    /// (attention, DeltaNet and shared-expert weights) to FP8 E4M3 at load, one scale per
+    /// output row, and run prompt steps of over 64 tokens on the FP8 tensor cores with
+    /// per-token activation scales (sm_89+; decode steps take the FP8 weights with 16-bit
+    /// activations). Faster prefill and half the dense weights' memory; moves the logits.
+    /// One machine without --tp; other models ignore it.
+    #[arg(long)]
+    pub dense_fp8: bool,
     /// Where a MoE model's routed experts live with --device cuda: `auto` (VRAM if they fit,
     /// else pinned host memory on the GPU's NUMA node with the hottest cached in VRAM, or read
     /// in place where VRAM is the same memory), `device`, `host` (read in place, no cache) or
@@ -2187,6 +2195,7 @@ pub async fn run(
                     hc_inject_f32: e.model.hc_inject_f32,
                 },
                 nvfp4_a4: e.model.nvfp4_a4,
+                dense_fp8: e.model.dense_fp8,
                 residency,
                 gpus: e.model.gpus,
                 tp: e.model.tp,
@@ -2552,6 +2561,9 @@ fn startup_report_for_model(cfg: &LmConfig, server: &ServerConfig) -> StartupRep
     }
     if cfg.nvfp4_a4 != Default::default() {
         moving.push(format!("--nvfp4-a4 {}", value_name(&cfg.nvfp4_a4)));
+    }
+    if cfg.dense_fp8 {
+        moving.push("--dense-fp8".into());
     }
     if !moving.is_empty() {
         lines.push(format!(

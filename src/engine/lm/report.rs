@@ -31,6 +31,7 @@ pub struct ModelFacts {
 pub fn inspect(cfg: &LmConfig) -> Result<ModelFacts, LoadError> {
     let hf = crate::hf::OpenOptions {
         fp8: cfg.hf_fp8,
+        dense_fp8: cfg.dense_fp8,
         ..Default::default()
     };
     let gguf = GgufFile::open_with(&cfg.model_path, &hf)?;

@@ -17,6 +17,7 @@
 //! on synthetic checkpoints, and the real-model test compares a converted GGUF byte for byte.
 
 mod deepseek41;
+pub mod dense_fp8;
 mod gemma4;
 mod glm5next;
 mod nemotron_h;
@@ -59,6 +60,9 @@ pub struct OpenOptions {
     /// over tensor-parallel ranks that each hold the head's share.
     /// Only the drafter reads them, so the target's tokens under greedy verify do not change.
     pub mtp_nvfp4: bool,
+    /// `--dense-fp8`: a `qwen4_exp` checkpoint's BF16 dense projections quantized to FP8 at
+    /// load ([`dense_fp8`]). Other architectures ignore it.
+    pub dense_fp8: bool,
 }
 
 /// Opens the checkpoint in `dir` as a synthetic GGUF model.
@@ -80,6 +84,8 @@ pub(crate) fn open(dir: &Path, opts: &OpenOptions) -> Result<GgufFile, GgufError
     let mut b = Builder::new(Arc::new(ckpt));
     b.modelopt = nvfp4::ModelOpt::detect(&b.ckpt, &config, opts.fp8).map_err(err)?;
     b.mtp_nvfp4 = opts.mtp_nvfp4;
+    b.dense_fp8_on =
+        opts.dense_fp8 && matches!(model_type.as_str(), "qwen4_exp" | "qwen4_exp_text");
     match model_type.as_str() {
         "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => {
             qwen35::build(&mut b, &config).map_err(err)?
@@ -150,6 +156,10 @@ pub(crate) struct Builder {
     stacks: HashMap<String, Arc<crate::gguf::Nvfp4Stack>>,
     /// [`OpenOptions::mtp_nvfp4`].
     mtp_nvfp4: bool,
+    /// [`OpenOptions::dense_fp8`], for this checkpoint's architecture.
+    dense_fp8_on: bool,
+    /// The weights [`dense_fp8`] quantized (listed with the raw FP8 ones).
+    dense_fp8_names: Vec<String>,
 }
 
 /// The ggml type that holds a safetensors dtype unchanged.
@@ -172,6 +182,8 @@ impl Builder {
             modelopt: None,
             stacks: HashMap::new(),
             mtp_nvfp4: false,
+            dense_fp8_on: false,
+            dense_fp8_names: Vec::new(),
         }
     }
 
@@ -225,6 +237,9 @@ impl Builder {
         if let Some(r) = self.quantized(name, src, None, None, shape.clone()) {
             return r;
         }
+        if let Some(r) = self.dense_fp8(name, src, None, None, shape.as_deref()) {
+            return r;
+        }
         let (file, t) = self.source(src)?;
         let ty = ggml_type(&t.dtype)
             .ok_or_else(|| format!("`{src}`: dtype {} is not loadable as is", t.dtype.name()))?;
@@ -251,6 +266,9 @@ impl Builder {
         shape: Vec<u64>,
     ) -> Result<(), String> {
         if let Some(r) = self.quantized(name, src, Some(rows), None, Some(shape.clone())) {
+            return r;
+        }
+        if let Some(r) = self.dense_fp8(name, src, Some(rows), None, Some(&shape)) {
             return r;
         }
         let (file, t) = self.source(src)?;
@@ -360,7 +378,16 @@ impl Builder {
     ) -> Result<(), String> {
         let f = Arc::new(f);
         let transform: nvfp4::Transform = f.clone();
-        if let Some(r) = self.quantized(name, src, None, Some(transform), Some(shape.clone())) {
+        if let Some(r) = self.quantized(
+            name,
+            src,
+            None,
+            Some(transform.clone()),
+            Some(shape.clone()),
+        ) {
+            return r;
+        }
+        if let Some(r) = self.dense_fp8(name, src, None, Some(transform), Some(&shape)) {
             return r;
         }
         let (_, t) = self.source(src)?;
@@ -379,12 +406,24 @@ impl Builder {
     }
 
     fn finish(mut self, path: PathBuf) -> Result<GgufFile, GgufError> {
-        for (k, v) in self
+        let mut kv = self
             .modelopt
             .as_ref()
             .map(nvfp4::ModelOpt::metadata)
-            .unwrap_or_default()
-        {
+            .unwrap_or_default();
+        // `--dense-fp8`'s weights join the checkpoint's raw FP8 ones.
+        if !self.dense_fp8_names.is_empty() {
+            tracing::info!(
+                "--dense-fp8: {} dense projections load as FP8 E4M3 (one scale per row)",
+                self.dense_fp8_names.len()
+            );
+            let names = self.dense_fp8_names.iter().cloned().map(Value::String);
+            match kv.iter_mut().find(|(k, _)| *k == nvfp4::KEY_FP8_E4M3) {
+                Some((_, Value::Array(a))) => a.extend(names),
+                _ => kv.push((nvfp4::KEY_FP8_E4M3, Value::Array(names.collect()))),
+            }
+        }
+        for (k, v) in kv {
             self.meta.set(k, &v)?;
         }
         let files = self

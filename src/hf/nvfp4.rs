@@ -318,7 +318,7 @@ pub fn quantize_bf16_nvfp4(bf16: &[u8], rows: usize, k: usize, scale2: f32) -> V
 const QUANT_THREADS: usize = 4;
 
 /// `f(i, item)` for every `per`-long item `i` of `out`, on a few threads (a run of items each).
-fn par_items<T: Send>(
+pub(super) fn par_items<T: Send>(
     out: &mut [T],
     per: usize,
     f: &(dyn Fn(usize, &mut [T]) -> Result<(), String> + Sync),
@@ -693,7 +693,7 @@ impl Builder {
 }
 
 /// The row ranges `(first, count)` of `data` (rows of `row` bytes), back to back.
-fn gather(data: &[u8], rows: &[(u64, u64)], row: usize) -> Vec<u8> {
+pub(super) fn gather(data: &[u8], rows: &[(u64, u64)], row: usize) -> Vec<u8> {
     let mut out = Vec::new();
     for &(r, n) in rows {
         let (a, b) = (r as usize * row, (r + n) as usize * row);

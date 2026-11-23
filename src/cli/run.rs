@@ -82,6 +82,7 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
         hc_inject_f32: m.hc_inject_f32,
     };
     cfg.nvfp4_a4 = m.nvfp4_a4;
+    cfg.dense_fp8 = m.dense_fp8;
     cfg.attention = m.attention;
     cfg.moe_kernel = m.moe_kernel;
     cfg.split_batches = m.split_batches;
