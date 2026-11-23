@@ -27,7 +27,7 @@
 //! by the graph's words and launches them as any later step does: the same pieces of the same
 //! graph recorded on the same stream, so the same bits.
 
-use super::{Executor, Group, GroupShape, KV_BLOCK, LENT_MIXED_KEPT, ModelError, SeqInput};
+use super::{Executor, Group, GroupShape, KV_BLOCK, ModelError, SeqInput};
 use super::{batch_shape, verify_kept, with_kv};
 
 #[cfg(test)]
@@ -110,7 +110,7 @@ impl Executor {
         shape: &[GroupShape],
     ) -> Option<Vec<GroupShape>> {
         if self.stages.len() != 1
-            || self.mixed_kept == LENT_MIXED_KEPT
+            || self.cache_lent
             || verify_kept::kept() < 2
             || !verify_kept::is_verify(shape)
         {

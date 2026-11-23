@@ -15,16 +15,15 @@
 //! the graph evicted is the one the next step would have evicted and its buffer is reused as it
 //! would have been. Only when the graph is built changes, not the kernels or the bits.
 //!
-//! Not on meta backends (one shared buffer per kind), not while the expert cache is lent (one
-//! kept mixed graph), not under a compute budget (`set_compute_budget`), not for steps with state captures, images or other groups (the next
-//! step's shape is not known from this one), and not when the next chunk is longer than this
-//! one. On by default; `legion serve --no-prompt-build-ahead` turns it off.
+//! Not on meta backends (one shared buffer per kind), not while the expert cache is lent or
+//! big prompt steps keep one prompt graph (one kept mixed graph, [`keeps_two`]), not under a
+//! compute budget (`set_compute_budget`), not for steps with state captures, images or other
+//! groups (the next step's shape is not known from this one), and not when the next chunk is
+//! longer than this one. On by default; `legion serve --no-prompt-build-ahead` turns it off.
 
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
-use super::{
-    Executor, Group, GroupShape, KV_BLOCK, LENT_MIXED_KEPT, Logits, SeqInput, batch_shape, with_kv,
-};
+use super::{Executor, Group, GroupShape, KV_BLOCK, Logits, SeqInput, batch_shape, with_kv};
 
 #[cfg(test)]
 mod tests;
@@ -48,6 +47,13 @@ pub fn enabled() -> bool {
 pub struct PromptNext {
     pub tokens: usize,
     pub logits: Logits,
+}
+
+/// Whether a stage keeps room for a graph built ahead: two kept mixed graphs at least (the
+/// running one and the next one's), so not while the expert cache is `lent` (one) nor when big
+/// prompt steps keep a single prompt graph ([`Executor::set_prompt_graphs`], #1183).
+pub(super) fn keeps_two(lent: bool, mixed_kept: usize) -> bool {
+    !lent && mixed_kept >= 2
 }
 
 /// The step after `groups` as [`PromptNext`] says: `groups` must be one prompt chunk of one
@@ -103,7 +109,7 @@ impl Executor {
         // running graph's, and might drop other graphs than the next step would.
         if !enabled()
             || self.stages.len() != 1
-            || self.mixed_kept <= LENT_MIXED_KEPT + 1
+            || !keeps_two(self.cache_lent, self.mixed_kept)
             || self.compute_budget.first().is_some_and(|&b| b > 0)
             || shape.iter().any(|g| !g.captures.is_empty())
         {

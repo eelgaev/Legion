@@ -87,3 +87,15 @@ fn the_next_chunk_must_fit_the_block_table() {
     assert!(next_groups(&groups, next(1024, Logits::None), Some(w)).is_some());
     assert!(next_groups(&groups, next(1024, Logits::None), Some(w - 1)).is_none());
 }
+
+#[test]
+fn a_graph_is_built_ahead_only_beside_two_kept_ones() {
+    // Three kept mixed graphs (the default) and two (big prompt steps, #1183) leave room for
+    // the running graph and the next one's.
+    assert!(keeps_two(false, 3));
+    assert!(keeps_two(false, 2));
+    // One: big prompt steps with a single kept prompt graph, or a lent expert cache.
+    assert!(!keeps_two(false, 1));
+    assert!(!keeps_two(true, 1));
+    assert!(!keeps_two(true, 3));
+}

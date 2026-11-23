@@ -379,6 +379,8 @@ fn kept_in<'k>(
 /// Mixed graphs a stage keeps: a prompt chunk's and a verify batch's two micro-batches (with
 /// `--verify-kept-graphs`, the prompt shapes' and apart from the verify ones', [`verify_kept`]).
 const MIXED_KEPT: usize = 3;
+/// The most prompt graphs [`Executor::set_prompt_graphs`] keeps per stage: [`MIXED_KEPT`].
+pub const PROMPT_GRAPHS: usize = MIXED_KEPT;
 /// [`MIXED_KEPT`] while the expert cache is lent (see [`Executor::lend_experts`]).
 const LENT_MIXED_KEPT: usize = 1;
 /// Device memory a step graph leaves free while the expert cache is lent (#490). ggml-cuda
@@ -556,9 +558,15 @@ pub struct Executor {
     /// Per stage: the buffer type its KV pool goes in when it has no host tier, in place of
     /// the backend's ([`Self::set_kv_bufts`]).
     kv_bufts: Vec<Option<BufferType>>,
-    /// Mixed graphs each stage keeps: [`MIXED_KEPT`], or [`LENT_MIXED_KEPT`] while a long
-    /// prompt borrows the expert cache.
+    /// Mixed graphs each stage keeps: [`Self::prompt_kept`], or [`LENT_MIXED_KEPT`] while a
+    /// long prompt borrows the expert cache ([`Self::cache_lent`]).
     mixed_kept: usize,
+    /// Mixed graphs each stage keeps while the expert cache is not lent: [`MIXED_KEPT`], or
+    /// fewer for big prompt steps that do not fit beside the KV pool otherwise
+    /// ([`Self::set_prompt_graphs`], #1183).
+    prompt_kept: usize,
+    /// A long prompt borrows the expert cache ([`Self::lend_experts`]): one kept mixed graph.
+    cache_lent: bool,
     /// The bounded host tier (#37): lent steps' buffers pad as staged passes
     /// ([`ComputeAllocator::pass`]; [`Self::set_tier_passes`]).
     tier_passes: bool,
@@ -891,6 +899,8 @@ impl Executor {
             kv_tiers: Vec::new(),
             kv_bufts: Vec::new(),
             mixed_kept: MIXED_KEPT,
+            prompt_kept: MIXED_KEPT,
+            cache_lent: false,
             tier_passes: false,
             exact_steps: false,
             mixed_aside: 0,
@@ -1322,6 +1332,30 @@ impl Executor {
         self.tier_passes = on;
     }
 
+    /// Mixed (prompt) graphs each stage keeps from now on while the expert cache is not lent:
+    /// `n` within `1..=`[`PROMPT_GRAPHS`] ([`PROMPT_GRAPHS`] by default). The load lowers it
+    /// for prompt steps over 4,096 tokens on a GPU sharing the host's memory when three such
+    /// graphs' buffers do not fit beside the KV pool (#1183): each kept graph holds a buffer
+    /// as big as its step, and a graph not kept is built again (the same graph, the same
+    /// bits). Below two kept graphs no graph is built ahead ([`prompt_ahead`]). Drops the
+    /// kept mixed graphs when the count changes.
+    pub fn set_prompt_graphs(&mut self, n: usize) {
+        let n = n.clamp(1, PROMPT_GRAPHS);
+        if n == self.prompt_kept {
+            return;
+        }
+        self.prompt_kept = n;
+        if !self.cache_lent {
+            self.mixed_kept = n;
+            self.drop_mixed();
+        }
+    }
+
+    /// See [`Self::set_prompt_graphs`].
+    pub fn prompt_graphs(&self) -> usize {
+        self.prompt_kept
+    }
+
     /// Allocates now, on each stage that keeps its prompt graphs' buffers with headroom (an
     /// integrated GPU's), one compute buffer per kept mixed graph, as big as a prompt step of
     /// `tokens` tokens after `n_past` needs ([`Self::measure_prompt_step`]), and writes each
@@ -1332,7 +1366,7 @@ impl Executor {
         tokens: usize,
         n_past: usize,
     ) -> Result<Vec<(usize, usize)>, ModelError> {
-        let lent = self.mixed_kept == LENT_MIXED_KEPT;
+        let lent = self.cache_lent;
         let on = ready_buffers::enabled();
         // Not where a byte budget bounds the kept graphs (`set_compute_budget`): bigger
         // buffers would count against it.
@@ -3854,7 +3888,7 @@ impl Executor {
             return Ok(());
         }
         let captured = self.captured(s);
-        let lent = self.mixed_kept == LENT_MIXED_KEPT;
+        let lent = self.cache_lent;
         // New buffers: padded while lent (as staged passes under the bounded host tier),
         // exact for a measurement.
         let (padded, passes) = (lent && !self.exact_steps, self.tier_passes);
@@ -3870,7 +3904,10 @@ impl Executor {
             (META_KEPT, META_KEPT)
         } else {
             // A graph set aside while this one is built counts as kept (`prompt_ahead`).
-            (DECODE_KEPT, self.mixed_kept - self.mixed_aside)
+            (
+                DECODE_KEPT,
+                self.mixed_kept.saturating_sub(self.mixed_aside),
+            )
         };
         let opts = StepOpts {
             spec: stage.spec.as_ref(),
@@ -4425,6 +4462,7 @@ impl Executor {
         // A long prompt's steps share one graph shape but the last: one compute buffer per
         // stage, not one per shape kept.
         self.mixed_kept = LENT_MIXED_KEPT;
+        self.cache_lent = true;
         self.model
             .experts_mut()
             .expect("checked above")
@@ -4593,7 +4631,8 @@ impl Executor {
             "prompt graphs dropped for the expert cache restore"
         );
         self.freeing = freeing;
-        self.mixed_kept = MIXED_KEPT;
+        self.mixed_kept = self.prompt_kept;
+        self.cache_lent = false;
         self.model
             .experts_mut()
             .expect("checked above")

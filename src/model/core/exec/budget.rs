@@ -8,7 +8,7 @@
 //! kept buffers outgrew the budget, ate the reserve and the GPU ran out of memory. A stage
 //! now drops its oldest kept mixed graphs once their buffers pass the budget.
 
-use super::{Executor, KeptGraph, LENT_MIXED_KEPT};
+use super::{Executor, KeptGraph};
 use crate::model::core::GroupShape;
 
 #[cfg(test)]
@@ -52,7 +52,7 @@ impl Executor {
     /// graphs while the kept buffers pass the stage's budget ([`Self::set_compute_budget`]).
     pub(super) fn fit_compute_budget(&mut self, s: usize, mixed: bool) {
         let budget = self.compute_budget.get(s).copied().unwrap_or(0);
-        if budget == 0 || self.mixed_kept == LENT_MIXED_KEPT {
+        if budget == 0 || self.cache_lent {
             return;
         }
         let st = &mut self.stages[s];

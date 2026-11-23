@@ -1266,7 +1266,12 @@ struct EngineArgs {
     #[arg(long, default_value_t = legion::engine::lm::STREAM_THREAD_SEQS)]
     stream_thread_seqs: usize,
     /// Model engine: tokens per forward pass, one per decoding sequence plus prompt chunks
-    /// (default 1024; 4096 on a GPU that shares memory with the host, e.g. the GB10).
+    /// (default 1024; 4096 on a GPU that shares memory with the host, e.g. the GB10). Prompts
+    /// longer than the step run in other step sizes when it changes, so greedy output can
+    /// move. On one GPU sharing the host's memory, steps over 4096 tokens keep fewer prompt
+    /// graphs (two, else one, with their compute buffers) when three do not fit beside the
+    /// KV pool (`--kv-cache-tokens`, else one context); the load logs it. With one kept graph
+    /// the next prompt chunk's graph is not built while the current one computes.
     #[arg(long)]
     max_batch_tokens: Option<usize>,
     /// Model engine, on a GPU that shares memory with the host (a DGX Spark's GB10): GiB the

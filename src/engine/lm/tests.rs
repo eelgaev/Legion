@@ -1152,3 +1152,69 @@ fn groups_in_flight_over_two_nodes_draft_nothing() {
     assert!(groups_drafts(false), "whole steps and one machine draft");
     assert!(!groups_drafts(true));
 }
+
+#[test]
+fn fewer_kept_prompt_graphs_leave_less_step_room() {
+    use crate::ggml::DeviceKind;
+    let gib = 1usize << 30;
+    let mib = 1usize << 20;
+    // Three kept graphs: the 1.5 GiB per 1K as before (#1183 splits it, same sum).
+    assert_eq!(UMA_STEP_BYTES_PER_1K, 3 * gib / 2);
+    for t in [1024, 4096, 8192, 16384] {
+        assert_eq!(
+            kv_headroom_kept(DeviceKind::IntegratedGpu, t, UMA_HEADROOM, PROMPT_GRAPHS),
+            kv_headroom(DeviceKind::IntegratedGpu, t, UMA_HEADROOM)
+        );
+    }
+    // 8K steps: 12 GiB of step room with three kept graphs, 8 x (2 x 434 + 234) MiB with two,
+    // 8 x (434 + 234) MiB with one.
+    assert_eq!(
+        kv_headroom(DeviceKind::IntegratedGpu, 8192, UMA_HEADROOM),
+        (2 + 16 + 2 + 12) * gib
+    );
+    assert_eq!(
+        kv_headroom_kept(DeviceKind::IntegratedGpu, 8192, UMA_HEADROOM, 2),
+        (2 + 16 + 2) * gib + 8 * 1102 * mib
+    );
+    assert_eq!(
+        kv_headroom_kept(DeviceKind::IntegratedGpu, 8192, UMA_HEADROOM, 1),
+        (2 + 16 + 2) * gib + 8 * 668 * mib
+    );
+    // Out of range counts clamp; other devices keep the compute headroom only.
+    assert_eq!(
+        kv_headroom_kept(DeviceKind::IntegratedGpu, 8192, UMA_HEADROOM, 0),
+        kv_headroom_kept(DeviceKind::IntegratedGpu, 8192, UMA_HEADROOM, 1)
+    );
+    assert_eq!(
+        kv_headroom_kept(DeviceKind::IntegratedGpu, 8192, UMA_HEADROOM, 9),
+        kv_headroom(DeviceKind::IntegratedGpu, 8192, UMA_HEADROOM)
+    );
+    assert_eq!(
+        kv_headroom_kept(DeviceKind::Gpu, 8192, UMA_HEADROOM, 1),
+        COMPUTE_HEADROOM
+    );
+}
+
+#[test]
+fn big_steps_keep_the_most_prompt_graphs_that_fit() {
+    // Not big (4K steps, a discrete GPU, ...): three, fitting or not.
+    assert_eq!(lean_prompt_graphs(false, |_| false), PROMPT_GRAPHS);
+    assert_eq!(lean_prompt_graphs(false, |k| k == 1), PROMPT_GRAPHS);
+    // Big steps that fit with three keep three.
+    assert_eq!(lean_prompt_graphs(true, |_| true), PROMPT_GRAPHS);
+    // Else the most that fit: two, else one.
+    assert_eq!(lean_prompt_graphs(true, |k| k <= 2), 2);
+    assert_eq!(lean_prompt_graphs(true, |k| k <= 1), 1);
+    // None fits: three, and the load fails as before.
+    assert_eq!(lean_prompt_graphs(true, |_| false), PROMPT_GRAPHS);
+}
+
+#[test]
+fn only_big_steps_on_one_shared_memory_gpu_are_lean() {
+    assert!(!lean_steps(true, 1, 1, MAX_BATCH_TOKENS_INTEGRATED));
+    assert!(lean_steps(true, 1, 1, 8192));
+    assert!(lean_steps(true, 1, 0, 16384));
+    assert!(!lean_steps(false, 1, 1, 8192));
+    assert!(!lean_steps(true, 2, 1, 8192));
+    assert!(!lean_steps(true, 1, 2, 8192));
+}
