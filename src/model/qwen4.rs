@@ -44,8 +44,8 @@ pub use hc_up_mix::bench as hc_up_mix_bench;
 #[cfg(feature = "cuda")]
 pub(crate) use hc_up_mix::launch_mix;
 pub(crate) use hc_up_mix::{
-    lazy_mix_target, mix_cast_reads, set_by_exchange as set_mix_by_exchange, set_lazy_streams,
-    set_mix_cast,
+    is_bf16_mix, lazy_mix_target, mix_cast_reads, set_by_exchange as set_mix_by_exchange,
+    set_lazy_streams, set_mix_cast,
 };
 pub use hc_up_mix::{
     set_gpu as set_up_mix_gpu, set_rebuild as set_up_mix_rebuild, set_up_mix, set_up_mix_bf16,

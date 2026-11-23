@@ -411,6 +411,18 @@ pub(crate) unsafe fn mix_cast_reads(node: *const ffi::ggml_tensor) -> Option<Vec
     }
 }
 
+/// Whether `t` is a mix node with a BF16 `up` ([`up_mix`], [`up_mix_rebuilt`]), whose BF16
+/// cast the node fusion lets it write itself ([`mix_cast_reads`]); for graph builds.
+pub(crate) fn is_bf16_mix(t: Tensor<'_>) -> bool {
+    // SAFETY: a live tensor of a graph being built; its sources are valid tensors or null.
+    unsafe {
+        let node = t.raw();
+        crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &HC_UP_MIX))
+            && !(*node).src[0].is_null()
+            && (*(*node).src[0]).type_ == types::BF16
+    }
+}
+
 /// The source slot of a BF16 mix node's BF16 copy ([`set_mix_cast`]).
 const MIX_CAST_SRC: usize = 5;
 

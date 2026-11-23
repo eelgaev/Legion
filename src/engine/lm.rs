@@ -1168,6 +1168,9 @@ pub struct LmConfig {
     /// `--dense-fp8`: FP8 copies of a Qwen3.8-Flash-Next checkpoint's BF16 dense projections,
     /// made at load, for decode and verify steps ([`crate::hf::dense_fp8`]).
     pub dense_fp8: bool,
+    /// `--dense-fp8-prompt`: prompt steps read those copies too, as W8A8 GEMMs
+    /// ([`crate::model::core::Model::set_dense_fp8_prompt`]).
+    pub dense_fp8_prompt: bool,
     /// Where the routed experts live and the VRAM expert cache (see [`crate::residency`]).
     pub residency: crate::residency::ResidencyConfig,
     /// GPUs to split the layers over (CUDA0, CUDA1, ...; one pipeline stage each).
@@ -1586,6 +1589,7 @@ impl LmConfig {
             fp16: Default::default(),
             nvfp4_a4: crate::model::core::Nvfp4A4::Off,
             dense_fp8: false,
+            dense_fp8_prompt: false,
             residency: Default::default(),
             gpus: 1,
             tp: 1,
@@ -4293,6 +4297,14 @@ impl LmEngine {
         };
         model.keep_a8(cfg.nvfp4_act == crate::model::core::Nvfp4Act::A8);
         model.set_fp8_act(cfg.fp8_act);
+        if model.set_dense_fp8_prompt(cfg.dense_fp8_prompt) {
+            tracing::info!("--dense-fp8-prompt: prompt steps read the FP8 copies as W8A8 GEMMs");
+        } else if cfg.dense_fp8_prompt {
+            tracing::warn!(
+                "--dense-fp8-prompt ignored: no FP8 copies in the model (--dense-fp8) or no FP8 \
+                 tensor cores on this GPU"
+            );
+        }
         model.set_nvfp4_mm(cfg.nvfp4_mm);
         model.set_nvfp4_a4(cfg.nvfp4_a4);
         #[cfg(feature = "cuda")]

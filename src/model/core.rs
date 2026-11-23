@@ -380,6 +380,10 @@ pub struct Model {
     /// `--dense-fp8`: whether the graph being built reads the dense projections' FP8 copies
     /// ([`dense_twins`]).
     dense_twins: dense_twins::DenseTwins,
+    /// `--dense-fp8-prompt`: the copies' runs read as one matrix by prompt steps
+    /// ([`dense_twins::Runs`]), made by the first graph that asks. Before the weights, whose
+    /// memory they share.
+    dense_runs: std::cell::OnceCell<Option<dense_twins::Runs>>,
     /// BF16 copies of the MoE routers whose values are exact in BF16 ([`router_bf16`]), read by
     /// small steps' router ops; made at load ([`Self::prepare_router_bf16`]) or by the first
     /// graph that asks. Each copy is checked against the router it was made from on use.
@@ -1654,6 +1658,7 @@ impl Model {
             host_tier: None,
             joined: Default::default(),
             dense_twins: dense_twins::DenseTwins::from_gguf(gguf),
+            dense_runs: Default::default(),
             router_bf16: Default::default(),
             host_pins: None,
             hp,
@@ -1707,6 +1712,7 @@ impl Model {
             host_tier: None,
             joined: Default::default(),
             dense_twins: dense_twins::DenseTwins::from_gguf(gguf),
+            dense_runs: Default::default(),
             router_bf16: Default::default(),
             host_pins: None,
             hp,
@@ -2084,6 +2090,14 @@ impl Model {
         self.linear.set_fp8_act(a);
     }
 
+    /// `--dense-fp8-prompt`: graphs built from now on read the dense projections' FP8 copies
+    /// ([`dense_twins`]) in prompt steps too, as W8A8 GEMMs, on GPUs with E4M3 tensor cores.
+    /// Whether they do: the file has copies and the GPU those tensor cores.
+    pub fn set_dense_fp8_prompt(&mut self, on: bool) -> bool {
+        self.dense_twins
+            .set_prompt(on && crate::model::fp8::fp8_mma())
+    }
+
     /// Which kernels run NVFP4 matmuls on CUDA ([`Nvfp4Mm`]); graphs built after this call use
     /// it.
     pub fn set_nvfp4_mm(&mut self, m: Nvfp4Mm) {
@@ -2153,6 +2167,7 @@ impl Model {
         ctx.index_names();
         self.widened = Some(ctx);
         self.joined = Default::default();
+        self.dense_runs = Default::default();
         Ok(picked.len())
     }
 
@@ -2258,6 +2273,7 @@ impl Model {
         ctx.index_names();
         self.requant = Some(ctx);
         self.joined = Default::default();
+        self.dense_runs = Default::default();
         let mib = |b: usize| b as f64 / (1u64 << 20) as f64;
         Ok((n, mib(before), mib(after)))
     }
@@ -2399,6 +2415,55 @@ impl Model {
         self.joined().map_or(0, |j| j.tensors().count())
     }
 
+    /// `--dense-fp8-prompt`'s joined runs of FP8 copies ([`dense_twins::Runs`]), joined on
+    /// first use.
+    fn dense_runs(&self) -> Option<&dense_twins::Runs> {
+        self.dense_runs
+            .get_or_init(|| {
+                let r = dense_twins::Runs::build(self.hp.n_layer, |n| self.weights.get(n), false);
+                tracing::info!(
+                    "dense FP8 runs read as one matrix by prompt steps: {}",
+                    r.as_ref().map_or(0, dense_twins::Runs::len)
+                );
+                r
+            })
+            .as_ref()
+    }
+
+    /// [`Self::lmm_joined_run`] for `--dense-fp8-prompt` (#1183): where the run's weights
+    /// `names` are read as their FP8 copies `ws` in this step, one W8A8 GEMM of their joined
+    /// copies (stored back to back, [`crate::hf::dense_fp8::RUNS`]) in prompt steps that join
+    /// the BF16 run; `None` otherwise, and for runs with a member that has no copy (a DeltaNet
+    /// layer's z: its copy then runs alone, alpha and beta as their BF16 pair).
+    fn lmm_twin_run<'a>(
+        &'a self,
+        ctx: &'a Context,
+        names: &[String],
+        ws: &[Tensor<'a>],
+        x: Tensor<'a>,
+        n: i64,
+    ) -> Option<Vec<Tensor<'a>>> {
+        if !joined::takes_prompt(n)
+            || !names
+                .iter()
+                .zip(ws)
+                .all(|(m, &w)| self.linear.is_dense_twin(m, w))
+        {
+            return None;
+        }
+        let scales = names
+            .iter()
+            .map(|m| self.w(&linear::scale_name(m)?).ok())
+            .collect::<Option<Vec<_>>>()?;
+        let (codes, scale) = self.dense_runs()?.get(ws, &scales)?;
+        let r = self
+            .linear
+            .mul_mat(ctx, &names[0], codes, Some(scale), None, x)
+            .ok()?;
+        let rows: Vec<i64> = ws.iter().map(|w| w.ne()[1]).collect();
+        Some(joined::split_run(ctx, r, &rows))
+    }
+
     /// Layer `il`'s `first @ x` and `second @ x` (a pair of [`joined::PAIRS`]) as one matmul,
     /// where the step is small enough and the two are joined ([`joined`]); `None` otherwise
     /// (then run [`Self::lmm`] for each). Plain matmuls only (no scale), with the members'
@@ -2432,6 +2497,20 @@ impl Model {
             return None;
         }
         let names: Vec<String> = names.iter().map(|m| format!("blk.{il}.{m}")).collect();
+        // `--dense-fp8-prompt`: a run of FP8 copies.
+        if x.ne()[1] > dense_twins::STEP_MAX_TOKENS {
+            let ws = names
+                .iter()
+                .map(|m| self.w(m).ok())
+                .collect::<Option<Vec<_>>>()?;
+            if ws
+                .iter()
+                .zip(&names)
+                .any(|(&w, m)| self.linear.is_dense_twin(m, w))
+            {
+                return self.lmm_twin_run(ctx, &names, &ws, x, n);
+            }
+        }
         let plain = |name: &String| {
             let base = name.strip_suffix(".weight").unwrap_or(name);
             linear::scale_name(name).is_none_or(|s| self.w(&s).is_err())
@@ -2655,6 +2734,15 @@ impl Model {
 
     pub(crate) fn lw(&self, il: usize, name: &str) -> Result<Tensor<'_>, ModelError> {
         self.w(&format!("blk.{il}.{name}"))
+    }
+
+    /// Whether layer `il`'s projection `name` of `x` is a `--dense-fp8-prompt` GEMM in this
+    /// step ([`linear::Linear::twin_prompt_reads`]): its input's per-token FP8 codes may come
+    /// from the op that makes it.
+    fn twin_prompt_reads(&self, il: usize, name: &str, x: Tensor<'_>) -> bool {
+        let name = format!("blk.{il}.{name}");
+        self.w(&name)
+            .is_ok_and(|w| self.linear.twin_prompt_reads(&name, w, x))
     }
 
     /// `name @ x` as llama.cpp's `build_lora_mm` runs it: with the weight's `.scale` and NVFP4
@@ -3970,11 +4058,13 @@ impl Model {
         // one op with ggml's chain's bits (`o` itself is computed only if anything reads it in
         // F32). MoE models keep the chain, whose graph layout decides ggml-cuda's MoE fusions
         // (#410), except in prompt chunks with a BF16 projection (the NVFP4 checkpoints, #469).
+        // `--dense-fp8-prompt` (#1183): the projection's FP8 codes from those BF16 rows.
         let bf16_out = || {
             n >= SHARE_BF16_MIN_N
-                && self
+                && (self
                     .lw(il, "ssm_out.weight")
                     .is_ok_and(|w| linear::bf16_join_fits(w, o))
+                    || self.twin_prompt_reads(il, "ssm_out.weight", o))
         };
         if !tap.on
             && (!hp.moe || bf16_out())
@@ -4092,10 +4182,11 @@ impl Model {
             let ob = fused::gate_bf16(ctx, gate_view, o_pre, false);
             ctx.set_shared_cast(o, types::BF16, ob);
         }
-        // `--fp8-act a8-dynamic` prefill: its per-token FP8 codes from one op too.
+        // `--fp8-act a8-dynamic` prefill: its per-token FP8 codes from one op too; with
+        // `--dense-fp8-prompt` (#1183), MoE models' too.
         if !tap.on
-            && !hp.moe
-            && self.linear.dynamic_batch(n)
+            && ((!hp.moe && self.linear.dynamic_batch(n))
+                || self.twin_prompt_reads(il, "attn_output.weight", o))
             && fp8_act::gate_fits(gate_view, o_pre)
         {
             fp8_act::share(ctx, o, fp8_act::gate(ctx, gate_view, o_pre, false));
@@ -5142,7 +5233,17 @@ impl Model {
                 .then(|| self.lmm_joined(ctx, il, names[0], names[1], h))
                 .flatten()
             {
-                Some((gate, up)) => ctx.swiglu_split(gate, up),
+                Some((gate, up)) => {
+                    let sh = ctx.swiglu_split(gate, up);
+                    // `--dense-fp8-prompt` (#1183): the down projection's per-token FP8 codes
+                    // from one op reading gate and up in place (the SwiGLU then not computed).
+                    if self.twin_prompt_reads(il, "ffn_down_shexp.weight", sh)
+                        && fp8_act::gate_fits(gate, up)
+                    {
+                        fp8_act::share(ctx, sh, fp8_act::gate(ctx, gate, up, true));
+                    }
+                    sh
+                }
                 None => ctx.swiglu_split(
                     self.lmm_q(ctx, il, names[0], h, hq)?,
                     self.lmm_q(ctx, il, names[1], h, hq)?,

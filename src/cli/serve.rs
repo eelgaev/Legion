@@ -262,11 +262,17 @@ pub(super) struct ModelArgs {
     /// projections (attention, DeltaNet and shared-expert weights; one scale per output row,
     /// made at load) and let decode and verify steps of up to 64 tokens read it with 16-bit
     /// activations: half the bytes those steps stream for them. Prompt steps keep the BF16
-    /// weights and run as without the flag. Faster decode; moves the decoded text. The copy
-    /// takes about half the dense weights' memory again (~2.7 GiB). One machine without
-    /// --tp; other models ignore it.
+    /// weights and run as without the flag (see --dense-fp8-prompt). Faster decode; moves the
+    /// decoded text. The copy takes about half the dense weights' memory again (~2.7 GiB). One
+    /// machine without --tp; other models ignore it.
     #[arg(long)]
     pub dense_fp8: bool,
+    /// With --dense-fp8: prompt steps read the FP8 copies too, as W8A8 GEMMs with one FP8
+    /// scale per token on FP8 tensor cores (sm_89+; elsewhere ignored), the copies of
+    /// query/key/value and of the shared expert's gate/up each one GEMM as their BF16 weights
+    /// are. Aims at faster prefill; moves the output further than --dense-fp8 alone.
+    #[arg(long, requires = "dense_fp8")]
+    pub dense_fp8_prompt: bool,
     /// Where a MoE model's routed experts live with --device cuda: `auto` (VRAM if they fit,
     /// else pinned host memory on the GPU's NUMA node with the hottest cached in VRAM, or read
     /// in place where VRAM is the same memory), `device`, `host` (read in place, no cache) or
@@ -2197,6 +2203,7 @@ pub async fn run(
                 },
                 nvfp4_a4: e.model.nvfp4_a4,
                 dense_fp8: e.model.dense_fp8,
+                dense_fp8_prompt: e.model.dense_fp8_prompt,
                 residency,
                 gpus: e.model.gpus,
                 tp: e.model.tp,
@@ -2565,6 +2572,9 @@ fn startup_report_for_model(cfg: &LmConfig, server: &ServerConfig) -> StartupRep
     }
     if cfg.dense_fp8 {
         moving.push("--dense-fp8".into());
+    }
+    if cfg.dense_fp8_prompt {
+        moving.push("--dense-fp8-prompt".into());
     }
     if !moving.is_empty() {
         lines.push(format!(

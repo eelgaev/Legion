@@ -155,6 +155,23 @@ fn check_rms_bf16(backend: &mut Backend, k: i64, n: i64) {
     assert!(b == b1, "rms_bf16 {k}x{n}: BF16 rows differ");
 }
 
+/// [`plain_bf16`] of BF16 rows against `quantize_dynamic` of their F32 cast.
+fn bf16_case(backend: &mut Backend, k: i64, n: i64) -> (Vec<u8>, Vec<u8>) {
+    let ctx = Context::new(32, 32);
+    let x = ctx.new_tensor(types::BF16, &[k, n]).as_input();
+    let op = plain_bf16(&ctx, x);
+    let chain = ctx.cast(x, types::F32);
+    run(backend, &ctx, op, chain, || {
+        let bits: Vec<u8> = spread(k as usize, n as usize, 91)
+            .iter()
+            .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+            .collect();
+        x.set_bytes(&bits);
+    })
+}
+
+const BF16_CASES: [(i64, i64); 3] = [(2560, 40), (6144, 9), (640, 70)];
+
 /// `silu`: SwiGLU of a plain `[k, n]` gate; else `o * sigmoid(gate)` with the gate read from
 /// interleaved `[q | gate]` heads of `d`.
 fn gate_case(backend: &mut Backend, d: i64, n_head: i64, n: i64, silu: bool) -> (Vec<u8>, Vec<u8>) {
@@ -236,6 +253,16 @@ fn rms_norm_matches_the_chain_quantized() {
     for (k, n) in RMS_CASES {
         let (op, chain) = rms_case(&mut b, k, n);
         compare(&op, &chain, k as usize, false, &format!("rms {k}x{n}"));
+    }
+}
+
+/// BF16 rows widen exactly: the bytes of the F32 cast quantized.
+#[test]
+fn plain_bf16_is_the_cast_quantized() {
+    let mut b = cpu();
+    for (k, n) in BF16_CASES {
+        let (op, chain) = bf16_case(&mut b, k, n);
+        compare(&op, &chain, k as usize, false, &format!("bf16 {k}x{n}"));
     }
 }
 
@@ -343,6 +370,7 @@ fn nothing_fits_without_cuda() {
     let w = ctx.new_tensor(types::F32, &[256]);
     assert!(!rms_norm_fits(x, w));
     assert!(!gate_fits(x, x));
+    assert!(!plain_bf16_fits(ctx.new_tensor(types::BF16, &[256, 70])));
     assert!(!gated_norm_fits(
         x,
         ctx.new_tensor(types::F32, &[128]),
@@ -373,6 +401,10 @@ fn cuda_ops_are_the_chain_quantized() {
     }
     for (k, n) in [(256, 40), (1024, 33), (5120, 700)] {
         check_rms_bf16(&mut g, k, n);
+    }
+    for (k, n) in BF16_CASES.into_iter().chain([(2560, 4096), (12288, 30)]) {
+        let (op, chain) = bf16_case(&mut g, k, n);
+        compare(&op, &chain, k as usize, true, &format!("bf16 {k}x{n}"));
     }
     for (d, h, n, silu) in GATE_CASES.into_iter().chain([(256, 24, 500, false)]) {
         let (op, chain) = gate_case(&mut g, d, h, n, silu);

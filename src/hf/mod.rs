@@ -414,12 +414,18 @@ impl Builder {
                 self.dense_fp8_names.len()
             );
             let mut names = Vec::new();
-            for (name, shape) in std::mem::take(&mut self.dense_fp8_names) {
-                let (codes, scale) = dense_fp8::copy_names(&name);
-                let rows = shape[1];
-                self.push(&codes, types::I8, shape, 0, 0);
-                self.push(&scale, types::F32, vec![rows], 0, 0);
-                names.push(Value::String(name));
+            // A run's codes back to back, then its scales (`dense_fp8::RUNS`): one matrix and
+            // one scale vector for `--dense-fp8-prompt`'s joined GEMMs.
+            for group in dense_fp8::store_groups(std::mem::take(&mut self.dense_fp8_names)) {
+                for (name, shape) in &group {
+                    let (codes, _) = dense_fp8::copy_names(name);
+                    self.push(&codes, types::I8, shape.clone(), 0, 0);
+                }
+                for (name, shape) in group {
+                    let (_, scale) = dense_fp8::copy_names(&name);
+                    self.push(&scale, types::F32, vec![shape[1]], 0, 0);
+                    names.push(Value::String(name));
+                }
             }
             kv.push((dense_fp8::KEY, Value::Array(names)));
         }

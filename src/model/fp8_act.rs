@@ -13,6 +13,10 @@
 //! - [`gated_norm`]: a gated DeltaNet layer's output norm, `rms_norm(o) * w * gate(z)` per head.
 //! - [`quantize_plain`]: `quantize_dynamic` itself in one pass (the row held in registers), for
 //!   activations no op above makes.
+//! - [`plain_bf16`]: `quantize_dynamic` of a BF16 activation's values (widened exactly), for
+//!   `--dense-fp8-prompt` (#1183): an activation whose producer writes BF16 rows already (the
+//!   hyper-connection mixers, the DeltaNet output norm) is read at half the bytes of its F32
+//!   rows, and the F32 rows need not be written.
 //!
 //! The CPU implementations are references for tests (sums in F32 order, not ggml-cuda's): the
 //! CPU graphs keep the chain and `quantize_dynamic`.
@@ -41,6 +45,8 @@ enum Kind {
     RmsNorm = 1,
     Gate = 2,
     GatedNorm = 3,
+    /// `src/cuda/fp8_act.cu`'s `plain_bf16`: the row is `x`'s BF16 values.
+    Bf16 = 5,
 }
 
 /// Most values per row the CUDA kernels hold (`MAX_NV` x 1024 threads).
@@ -207,6 +213,27 @@ pub(crate) fn gated_norm_fits(o: Tensor<'_>, w: Tensor<'_>, z: Tensor<'_>, head_
         && vector_fits(w, head_v)
 }
 
+/// `quantize_dynamic` of `x` (BF16 `[k, n]`, rows contiguous) widened to F32: each value exactly,
+/// so the codes and scales are those of `quantize_dynamic(cast(x, F32))`.
+pub(crate) fn plain_bf16<'a>(ctx: &'a Context, x: Tensor<'a>) -> Tensor<'a> {
+    let [k, n, _, _] = x.ne();
+    node(ctx, Kind::Bf16, k, n, &[x], [0, 0, 0])
+}
+
+/// Whether [`plain_bf16`] takes `x` on this GPU: BF16 `[k, n]` with contiguous rows of at most
+/// [`MAX_K`] values, `k` a multiple of 4.
+pub(crate) fn plain_bf16_fits(x: Tensor<'_>) -> bool {
+    let [k, n, x2, x3] = x.ne();
+    gpu_fits()
+        && x.ty() == types::BF16
+        && x.nb()[0] == 2
+        && x2 == 1
+        && x3 == 1
+        && k % 4 == 0
+        && k <= MAX_K
+        && n <= i32::MAX as i64
+}
+
 /// Gives every [`fp8::mul_mat_dynamic`] of `a` the packed activations `q` (one of the ops above,
 /// computed from `a`'s inputs) instead of quantizing `a`.
 pub(crate) fn share<'a>(ctx: &'a Context, a: Tensor<'a>, q: Tensor<'a>) {
@@ -243,7 +270,12 @@ unsafe fn cpu_row(dst: &ffi::ggml_tensor, t: usize, row: &mut [f32]) {
     unsafe {
         let x = &*dst.src[0];
         let xrow = |t: usize| (x.data as *const u8).add(t * x.nb[1]) as *const f32;
-        if kind == Kind::RmsNorm as i32 {
+        if kind == Kind::Bf16 as i32 {
+            let xb = (x.data as *const u8).add(t * x.nb[1]) as *const u16;
+            for (i, v) in row.iter_mut().enumerate() {
+                *v = f32::from_bits(u32::from(*xb.add(i)) << 16);
+            }
+        } else if kind == Kind::RmsNorm as i32 {
             let eps = f32::from_bits(p[2] as u32);
             let w = std::slice::from_raw_parts((*dst.src[1]).data as *const f32, k);
             let xs = std::slice::from_raw_parts(xrow(t), k);
@@ -527,9 +559,11 @@ unsafe fn cuda_fp8_act(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<()
         } else {
             2 * k as usize * n as usize
         });
+        // (BF16 rows: `x_ld` in BF16 values.)
+        let es = if p[0] == Kind::Bf16 as i32 { 2 } else { 4 };
         let mut a = Fp8Act {
             x: x.data as *const f32,
-            x_ld: (x.nb[1] / 4) as i64,
+            x_ld: (x.nb[1] / es) as i64,
             out,
             scales: out.add(codes) as *mut f32,
             k,
@@ -551,7 +585,7 @@ unsafe fn cuda_fp8_act(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<()
             a.g = g.data as *const f32;
             a.g_ld = (g.nb[1] / 4) as i64;
             a.silu = p[3];
-        } else {
+        } else if p[0] == Kind::GatedNorm as i32 {
             let z = &*dst.src[2];
             a.w = (*dst.src[1]).data as *const f32;
             a.g = z.data as *const f32;

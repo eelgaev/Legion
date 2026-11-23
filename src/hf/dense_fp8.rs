@@ -4,20 +4,28 @@
 //! Prompt steps keep the BF16 weights and every kernel, join and fusion they take today.
 //! Opt-in: decode outputs move.
 //!
-//! Why not prompt steps too (#1183): with the FP8 weights in their place, W8A8 prompt steps
-//! measured 2-3% slower at 8K and 32K on a DGX Spark (GB10). The FP8 weights leave the BF16
-//! prompt paths: the weight runs read as one GEMM (query + gate / key / value, `z` / alpha /
-//! beta, shared-expert gate / up: 38 of 134 stayed joined), the hyper-connection mixers writing
-//! the BF16 copy their readers take instead of the F32 stream (28 of 75 casts, none of 48
-//! skipped F32 streams left), and they add one quantization pass of the F32 stream per input:
-//! together more than the FP8 tensor cores saved on these shapes.
+//! Prompt steps too (`--dense-fp8-prompt`, #1183): a first try, the FP8 weights in the BF16
+//! weights' place with W8A8 prompt steps quantizing from F32, measured 2-3% slower at 8K and
+//! 32K on a DGX Spark (GB10). It lost the BF16 prompt paths: the weight runs read as one GEMM
+//! (query + gate / key / value, `z` / alpha / beta, shared-expert gate / up: 38 of 134 stayed
+//! joined), the hyper-connection mixers writing the BF16 copy their readers take instead of
+//! the F32 stream (28 of 75 casts, none of 48 skipped F32 streams left), and it added one
+//! quantization pass of the F32 stream per input. The flag keeps them: the copies of a run are
+//! stored back to back ([`RUNS`]) and read as one GEMM, and the activations' FP8 codes come
+//! from the BF16 rows the mixers and the DeltaNet output norm write (half the bytes of the F32
+//! rows, which the mixers then need not write) or from the ops that make the attention output
+//! and the shared expert's SwiGLU. Why 8-bit activations and not just 8-bit weights: on a GB10
+//! a 16-bit-activation GEMM of 8-bit weights is no faster than BF16's (Infernix measured its
+//! W8A16 GEMMs below its BF16 ones there), and FP16-accumulate MMA runs at the FP32-accumulate
+//! rate (its roadmap: ~125 TFLOP/s both), so only the 8-bit MMA (~2x) speeds prompt steps.
 //!
 //! The scheme is llm-compressor's `FP8_DYNAMIC` weights (channel-wise): each output row `r`
 //! gets the F32 scale `s_r = amax_r / 448` (`amax_r = max |w_rj|`; 1 for an all-zero row) and
 //! the codes `e4m3(w_rj / s_r)`, IEEE division, rounded to nearest even and saturated at ±448
 //! ([`e4m3`]). A copy is what a channel-wise FP8 checkpoint loads as (see [`super::nvfp4`]): an
 //! `I8` tensor of the weight's shape and an F32 scale per row, named by [`copy_names`] and
-//! stored after every other tensor (the weights keep their order, which the joined runs read).
+//! stored after every other tensor (the weights keep their order, which the joined runs read);
+//! the copies of a layer's [`RUNS`] run lie back to back, codes then scales ([`store_groups`]).
 //! [`KEY`] lists the weights that have one; [`crate::model::core`] reads the copy in place of
 //! the weight in decode-sized steps, through the FP8 matmul's W8A16 route.
 //!
@@ -54,6 +62,55 @@ pub const PROJECTIONS: &[&str] = &[
     "ffn_up_shexp",
     "ffn_down_shexp",
 ];
+
+/// Runs of [`PROJECTIONS`] that `--dense-fp8-prompt` steps read as one W8A8 GEMM (the BF16
+/// weights' joined runs: a full-attention layer's query + gate, key and value, and a shared
+/// expert's gate and up), in storage order. [`Builder::finish`] stores each layer's copies of a
+/// run back to back, codes first and then scales, so that their codes form one `[k, sum(m)]`
+/// matrix and their scales one vector of `sum(m)` rows ([`crate::model::core`]).
+pub const RUNS: &[&[&str]] = &[
+    &["attn_q", "attn_k", "attn_v"],
+    &["ffn_gate_shexp", "ffn_up_shexp"],
+];
+
+/// The copies of `names` (weights and their ggml shapes, in load order) grouped as
+/// [`Builder::finish`] stores them: each layer's members of a [`RUNS`] run together, in run
+/// order, at the place of the run's first weight to load; every other copy alone, in load
+/// order.
+pub fn store_groups(names: Vec<(String, Vec<u64>)>) -> Vec<Vec<(String, Vec<u64>)>> {
+    // (layer prefix, run) of a run member.
+    let run_of = |name: &str| -> Option<(String, usize, usize)> {
+        let base = name.strip_suffix(".weight")?;
+        let (prefix, proj) = base.rsplit_once('.')?;
+        RUNS.iter().enumerate().find_map(|(r, run)| {
+            let i = run.iter().position(|p| *p == proj)?;
+            Some((prefix.to_string(), r, i))
+        })
+    };
+    let mut groups: Vec<Vec<(String, Vec<u64>)>> = Vec::new();
+    let mut slot: std::collections::HashMap<(String, usize), usize> = Default::default();
+    let mut order: Vec<Vec<usize>> = Vec::new();
+    for (name, shape) in names {
+        let Some((prefix, r, i)) = run_of(&name) else {
+            groups.push(vec![(name, shape)]);
+            order.push(vec![0]);
+            continue;
+        };
+        let g = *slot.entry((prefix, r)).or_insert_with(|| {
+            groups.push(Vec::new());
+            order.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[g].push((name, shape));
+        order[g].push(i);
+    }
+    for (g, o) in groups.iter_mut().zip(order) {
+        let mut keyed: Vec<_> = o.into_iter().zip(std::mem::take(g)).collect();
+        keyed.sort_by_key(|(i, _)| *i);
+        *g = keyed.into_iter().map(|(_, m)| m).collect();
+    }
+    groups
+}
 
 /// Whether the GGUF tensor `name` is one of a layer's [`PROJECTIONS`].
 pub fn takes(name: &str) -> bool {

@@ -17,6 +17,9 @@
 //               residual), x written out too (#1133: the finish of an all-reduce, src/tp_net,
 //               with the next layer's input norm; x has the bits of tp_net.cu's sums, every
 //               value the same additions in the same order)
+// - plain_bf16: y = x for BF16 rows (x points at __nv_bfloat16 values, x_ld in them; each value
+//               widened exactly), for --dense-fp8-prompt (#1183): activations an op wrote in
+//               BF16 already, read at half the bytes of their F32 rows
 //
 // y has the bits of the ggml chain the graph builds otherwise (and of fused.cu's BF16 kernels,
 // which compute the same values before their cast): thread tid holds columns tid, tid + BLOCK,
@@ -74,6 +77,7 @@ constexpr int FP8_ACT_RMS_NORM = 1;
 constexpr int FP8_ACT_GATE = 2;
 constexpr int FP8_ACT_GATED_NORM = 3;
 constexpr int FP8_ACT_SUM_NORM = 4;
+constexpr int FP8_ACT_PLAIN_BF16 = 5;
 
 // Most values per thread (columns per row: 24 * 1024).
 constexpr int MAX_NV = 24;
@@ -138,7 +142,14 @@ __global__ void __launch_bounds__(BLOCK) fp8_act_kernel(const legion_fp8_act p) 
     const int k = p.k;
     float v[NV];
 
-    if constexpr (KIND == FP8_ACT_PLAIN || KIND == FP8_ACT_RMS_NORM || KIND == FP8_ACT_SUM_NORM) {
+    if constexpr (KIND == FP8_ACT_PLAIN_BF16) {
+        const __nv_bfloat16 * row = (const __nv_bfloat16 *) p.x + t * p.x_ld;
+#pragma unroll
+        for (int i = 0; i < NV; i++) {
+            const int col = tid + i * BLOCK;
+            v[i] = col < k ? __bfloat162float(row[col]) : 0.0f;
+        }
+    } else if constexpr (KIND == FP8_ACT_PLAIN || KIND == FP8_ACT_RMS_NORM || KIND == FP8_ACT_SUM_NORM) {
         constexpr bool NORM = KIND != FP8_ACT_PLAIN;
         const float * row = KIND == FP8_ACT_SUM_NORM ? nullptr : p.x + t * p.x_ld;
         float tmp = 0.0f;
@@ -314,6 +325,9 @@ int legion_fp8_act_launch(const legion_fp8_act * p, void * stream) {
             // Any order: small blocks (several per SM) up to 256 * MAX_NV columns.
             return p->k <= 256 * MAX_NV ? launch_nv<256, FP8_ACT_PLAIN, MAX_NV>(*p, st)
                                         : launch_nv<1024, FP8_ACT_PLAIN, MAX_NV>(*p, st);
+        case FP8_ACT_PLAIN_BF16:
+            return p->k <= 256 * MAX_NV ? launch_nv<256, FP8_ACT_PLAIN_BF16, MAX_NV>(*p, st)
+                                        : launch_nv<1024, FP8_ACT_PLAIN_BF16, MAX_NV>(*p, st);
         case FP8_ACT_RMS_NORM:
             // ggml-cuda's rms_norm block: 256 threads below 1024 columns, 1024 from there on.
             return p->k < 1024 ? launch_nv<256, FP8_ACT_RMS_NORM, 4>(*p, st)

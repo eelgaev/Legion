@@ -94,3 +94,48 @@ fn rows_scale_by_their_largest_magnitude() {
     assert!(row_scale(&[1.0, f32::NAN]).is_err());
     assert!(row_scale(&[f32::INFINITY]).is_err());
 }
+
+/// A run's copies are stored together in run order at its first member's place; the others
+/// alone, in load order.
+#[test]
+fn copies_group_by_run() {
+    let names = [
+        "blk.0.attn_k.weight",
+        "blk.0.attn_output.weight",
+        "blk.0.attn_q.weight",
+        "blk.0.ffn_up_shexp.weight",
+        "blk.0.attn_v.weight",
+        "blk.1.attn_qkv.weight",
+        "blk.0.ffn_gate_shexp.weight",
+        "blk.1.ffn_up_shexp.weight",
+        "blk.0.ffn_down_shexp.weight",
+    ];
+    let input = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.to_string(), vec![64, i as u64 + 1]))
+        .collect();
+    let groups: Vec<Vec<String>> = store_groups(input)
+        .into_iter()
+        .map(|g| g.into_iter().map(|(n, _)| n).collect())
+        .collect();
+    let want: Vec<Vec<&str>> = vec![
+        vec![
+            "blk.0.attn_q.weight",
+            "blk.0.attn_k.weight",
+            "blk.0.attn_v.weight",
+        ],
+        vec!["blk.0.attn_output.weight"],
+        vec!["blk.0.ffn_gate_shexp.weight", "blk.0.ffn_up_shexp.weight"],
+        vec!["blk.1.attn_qkv.weight"],
+        vec!["blk.1.ffn_up_shexp.weight"],
+        vec!["blk.0.ffn_down_shexp.weight"],
+    ];
+    assert_eq!(groups, want);
+    // Shapes travel with their names.
+    let one = store_groups(vec![("blk.3.attn_v.weight".into(), vec![64, 7])]);
+    assert_eq!(
+        one,
+        vec![vec![("blk.3.attn_v.weight".to_string(), vec![64, 7])]]
+    );
+}

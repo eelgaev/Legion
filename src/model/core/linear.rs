@@ -161,7 +161,34 @@ impl Linear {
     /// Whether `w` (the weight `name`, or the tensor read in its place) is FP8 E4M3: a weight
     /// kept as shipped, or a `--dense-fp8` copy.
     fn is_fp8(&self, name: &str, w: Tensor<'_>) -> bool {
-        self.fp8.contains(name) || (w.ty() == types::I8 && self.dense_fp8.contains(name))
+        self.fp8.contains(name) || self.is_dense_twin(name, w)
+    }
+
+    /// Whether `w` is the `--dense-fp8` copy of the weight `name` (read in its place).
+    pub(crate) fn is_dense_twin(&self, name: &str, w: Tensor<'_>) -> bool {
+        w.ty() == types::I8 && self.dense_fp8.contains(name)
+    }
+
+    /// Whether `w @ x` of the weight `name` for `n` tokens is a `--dense-fp8-prompt` prompt
+    /// GEMM: `w` its copy (which steps of more than [`NVFP4_A4_MIN_N`] tokens read only with
+    /// that flag), no static input scale, `k` a multiple of 64. It then runs as W8A8 with
+    /// per-token scales ([`Fp8Route::Dynamic`]) where `dynamic_ok` (an F32 `x`, a device
+    /// weight, E4M3 tensor cores), whatever `--fp8-act` says (that flag is for FP8
+    /// checkpoints).
+    fn twin_prompt(&self, name: &str, w: Tensor<'_>, n: i64, has_input_scale: bool) -> bool {
+        !has_input_scale && n > NVFP4_A4_MIN_N && w.ne()[0] % 64 == 0 && self.is_dense_twin(name, w)
+    }
+
+    /// Whether [`Self::mul_mat`] of the weight `name` (`w`, the tensor read for it) over `x`
+    /// is a `--dense-fp8-prompt` GEMM ([`Self::twin_prompt`]) whose per-token FP8 codes
+    /// a model may give `x` ([`crate::model::fp8_act::share`]), e.g. from BF16 rows an op
+    /// writes.
+    pub(crate) fn twin_prompt_reads(&self, name: &str, w: Tensor<'_>, x: Tensor<'_>) -> bool {
+        let n: i64 = x.ne()[1..].iter().product();
+        self.twin_prompt(name, w, n, false)
+            && x.ty() == types::F32
+            && !w.is_host()
+            && crate::model::fp8::fp8_mma()
     }
 
     fn from_gguf_hints(g: &GgufFile) -> Result<Self, ModelError> {
@@ -372,7 +399,12 @@ impl Linear {
             let n: i64 = x.ne()[1..].iter().product();
             let dynamic_ok =
                 || x.ty() == types::F32 && !w.is_host() && crate::model::fp8::fp8_mma();
-            let route = self.fp8_route(n, w.ne()[0], input_scale.is_some(), dynamic_ok);
+            let route = if self.twin_prompt_reads(name, w, x) {
+                twin_codes(ctx, x);
+                Fp8Route::Dynamic
+            } else {
+                self.fp8_route(n, w.ne()[0], input_scale.is_some(), dynamic_ok)
+            };
             return Ok(match (route, input_scale) {
                 (Fp8Route::Static, Some(s)) => {
                     let xq = crate::model::fp8::quantize(ctx, x, s);
@@ -473,8 +505,16 @@ impl Linear {
         if res_ok && self.is_fp8(name, w) {
             use crate::model::fp8;
             let dynamic_ok = || x.ty() == types::F32 && !w.is_host() && fp8::fp8_mma();
-            let route = self.fp8_route(n, w.ne()[0], input_scale.is_some(), dynamic_ok);
+            let twin = self.twin_prompt_reads(name, w, x);
+            let route = if twin {
+                Fp8Route::Dynamic
+            } else {
+                self.fp8_route(n, w.ne()[0], input_scale.is_some(), dynamic_ok)
+            };
             if route == Fp8Route::Dynamic && fp8::dynamic_add_fits(n) {
+                if twin {
+                    twin_codes(ctx, x);
+                }
                 return Ok(fp8::mul_mat_dynamic_add(ctx, w, x, scale, res));
             }
         } else if res_ok && self.w4a16(name, w, scale, n) && self.w4a4(w, n, false) {
@@ -1044,6 +1084,29 @@ fn down_res_fits(w: Tensor<'_>, act: Tensor<'_>, r: Tensor<'_>) -> bool {
     let [_, m, ..] = w.ne();
     let [_, n1, n2, n3] = act.ne();
     r.ty() == types::F32 && r.is_contiguous() && r.ne() == [m, n1, n2, n3]
+}
+
+/// `--dense-fp8-prompt` (#1183): gives `x` (F32, read by a prompt GEMM of a dense projection's
+/// FP8 copy) its per-token FP8 codes ([`crate::model::fp8::DYNAMIC_KEY`]) unless the model gave
+/// it some already ([`crate::model::fp8_act`]): from the BF16 rows of `x` where the step has
+/// them ([`Context::shared_cast`]) or a qwen4exp hyper-connection mix makes `x` (which then
+/// writes them itself, `node_fuse`'s mix cast, and not its F32 values where nothing else
+/// reads them), at half the bytes of the F32 rows; else from `x`. Every GEMM of `x` reads the
+/// same codes. From BF16 rows each value is rounded to BF16 before E4M3 (the same value or one
+/// E4M3 step from it), as the BF16 GEMMs without the flag read those rows.
+fn twin_codes<'a>(ctx: &'a Context, x: Tensor<'a>) {
+    use crate::model::{fp8, fp8_act};
+    if ctx.has_shared_node(x, fp8::DYNAMIC_KEY) {
+        return;
+    }
+    let bf16 = ctx
+        .shared_cast(x, types::BF16)
+        .or_else(|| crate::model::qwen4::is_bf16_mix(x).then(|| ctx.cast_shared(x, types::BF16)));
+    let q = match bf16.filter(|&b| b.ne() == x.ne() && fp8_act::plain_bf16_fits(b)) {
+        Some(b) => fp8_act::plain_bf16(ctx, b),
+        None => fp8::quantize_dynamic(ctx, x),
+    };
+    fp8_act::share(ctx, x, q);
 }
 
 pub(crate) fn bf16_cast_joined<'a>(
