@@ -37,12 +37,13 @@ legion serve \
 # rank 1: the same without --port, with --tp-rank 1
 ```
 
-Deterministic client: the same 8 fixed prompts as the 1x row, temperature 0, 256 tokens each (2026-11-21, two
-sessions, 2 rounds each, with everything below that has no flag). 1 user 37.8 (story) to 83.5 (code), median
-51.4-51.7 per round, mean accepted length 3.37, the same tokens in every round; 140.1 tok/s at 4 users (the median
-of 4 rounds, 139.1-142.9); 301.7 at 16 users (298.3-304.4). Prefill 8K 3,031-3,064 (median 3,048) and 32K
-2,838-2,847 (2,842) tok/s, two requests each per session after an 8K warm-up, from the same servers. 123K was not
-measured. vLLM 0.33.0 TP2 (2026-11-20, [its command](../other-engines.md#qwen38-27b)): 1 user 37.5-75.5 (median
+Deterministic client: the same 8 fixed prompts as the 1x row, temperature 0, 256 tokens each (2026-11-23, two
+sessions, 2 rounds each, with everything below that has no flag). 1 user 37.7 (story) to 81.7 (code), median
+51.6-51.8 per round, mean accepted length 3.37, the same tokens in every round; 141.0 tok/s at 4 users (the median
+of 4 rounds, 140.3-144.0); 302.2 at 16 users (289.8-311.8). Prefill 8K 3,377-3,406 (median 3,393) and 32K
+3,153-3,161 (3,159) tok/s, two requests each per session after an 8K warm-up, from the same servers. 123K was not
+measured. The 2026-11-21 measurement, before the FFN sums in four pieces and the FP8-MLP layers in parts: prefill
+8K 3,048 and 32K 2,842, 1 user median 51.4-51.7, 140.1 at 4 users, 301.7 at 16 users. vLLM 0.33.0 TP2 (2026-11-20, [its command](../other-engines.md#qwen38-27b)): 1 user 37.5-75.5 (median
 49.0), 125.6 at 4 users, 248.0 at 16 users, prefill 8K 2,913 and 32K 2,757.
 
 `--tp-draft-split` (2026-11-21): the drafter's FFN and head split over the two Sparks. Against the command without
