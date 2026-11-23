@@ -126,7 +126,7 @@ pub struct Linear {
     no_a4: HashSet<String>,
     /// FP8 E4M3 weights kept as shipped (`I8` tensors, `legion.tensor_extra.fp8_e4m3`).
     fp8: HashSet<String>,
-    /// Weights with an FP8 copy that decode-sized steps read in their place (`--dense-fp8`,
+    /// Weights with an FP8 copy that decode and verify steps read in their place (`--dense-fp8`,
     /// [`crate::hf::dense_fp8`]): FP8 matmuls where the tensor given is the `I8` copy.
     dense_fp8: HashSet<String>,
     /// Every weight keeps 8-bit or wider activations ([`Self::set_all_a8`]).

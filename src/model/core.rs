@@ -2309,7 +2309,7 @@ impl Model {
     }
 
     pub(crate) fn w(&self, name: &str) -> Result<Tensor<'_>, ModelError> {
-        // `--dense-fp8`: a decode-sized step's graph reads the FP8 copy ([`dense_twins`]).
+        // `--dense-fp8`: a decode or verify step's graph reads the FP8 copy ([`dense_twins`]).
         if let Some(copy) = self.dense_twins.copy_of(name)
             && let Some(t) = self.weights.get(&copy)
         {
@@ -3382,8 +3382,10 @@ impl Model {
         }
         let hp = &self.hp;
         let n: i64 = shape.iter().map(|g| g.tokens() as i64).sum();
-        // `--dense-fp8`: decode-sized steps read the FP8 copies, until the graph is built.
-        let _twins = self.dense_twins.step(n);
+        // `--dense-fp8`: decode and verify steps read the FP8 copies, until the graph is built
+        // (prompt rows keep BF16 without `--dense-fp8-prompt`).
+        let prompt_rows = dense_twins::prompt_rows(shape.iter().map(|g| (g.n_tok, g.verify)));
+        let _twins = self.dense_twins.step(n, prompt_rows);
         let last = layers.end == hp.n_layer;
         let n_out: i64 = if last {
             shape.iter().map(|g| g.out_rows() as i64).sum()

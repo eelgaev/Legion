@@ -31,6 +31,10 @@ fn needs_tp_2_and_one_gpu_per_rank() {
             ..cfg(2)
         },
         LmConfig {
+            dense_fp8: true,
+            ..cfg(2)
+        },
+        LmConfig {
             device: DeviceChoice::Cuda,
             attention: Attention::Gather,
             ..cfg(2)

@@ -37,18 +37,54 @@ fn only_small_steps_of_a_file_with_copies_read_them() {
     let w = "blk.0.attn_q.weight";
     assert_eq!(on.copy_of(w), None, "outside a graph build");
     {
-        let _g = on.step(64);
+        let _g = on.step(64, false);
         assert_eq!(on.copy_of(w).as_deref(), Some("blk.0.attn_q.fp8.weight"));
         {
-            let _inner = on.step(4096);
+            let _inner = on.step(4096, true);
             assert_eq!(on.copy_of(w), None, "a prompt step");
         }
         assert!(on.copy_of(w).is_some(), "the outer build's state is back");
     }
     assert_eq!(on.copy_of(w), None);
     let off = DenseTwins::default();
-    let _g = off.step(1);
+    let _g = off.step(1, false);
     assert_eq!(off.copy_of(w), None, "no copies in the file");
+}
+
+/// Without `--dense-fp8-prompt`, prompt rows read BF16 at any length, alone or batched with
+/// decode rows; decode and verify steps up to 64 tokens read the copies.
+#[test]
+fn prompt_rows_keep_bf16_at_any_length() {
+    // (tokens per sequence, verify) of each group.
+    assert!(!prompt_rows([(1, false)]), "a decode step");
+    assert!(!prompt_rows([(4, true), (1, false)]), "verify and decode");
+    assert!(prompt_rows([(5, false)]), "a short prompt chunk");
+    assert!(
+        prompt_rows([(1, false), (37, false)]),
+        "decode rows with a prompt chunk"
+    );
+    assert!(prompt_rows([(4, true), (2, false)]));
+    assert!(!prompt_rows([]));
+    let on = DenseTwins {
+        on: true,
+        prompt: false,
+        active: Cell::new(false),
+    };
+    let w = "blk.0.attn_q.weight";
+    for (n, rows, reads) in [
+        (5, true, false),
+        (64, true, false),
+        (16, false, true),
+        (64, false, true),
+        (65, false, false),
+    ] {
+        let _g = on.step(n, rows);
+        assert_eq!(
+            on.copy_of(w).is_some(),
+            reads,
+            "{n} tokens, prompt rows {rows}"
+        );
+    }
 }
 
 #[test]
@@ -62,15 +98,19 @@ fn prompt_mode_reads_the_copies_in_every_step() {
     let w = "blk.0.attn_q.weight";
     assert_eq!(on.copy_of(w), None, "outside a graph build");
     {
-        let _g = on.step(4096);
+        let _g = on.step(4096, true);
         assert_eq!(on.copy_of(w).as_deref(), Some("blk.0.attn_q.fp8.weight"));
     }
     {
-        let _g = on.step(1);
+        let _g = on.step(1, false);
         assert!(on.copy_of(w).is_some());
     }
+    {
+        let _g = on.step(5, true);
+        assert!(on.copy_of(w).is_some(), "short prompt rows too");
+    }
     assert!(!on.set_prompt(false));
-    let _g = on.step(4096);
+    let _g = on.step(4096, true);
     assert_eq!(on.copy_of(w), None, "prompt mode off");
     let mut off = DenseTwins::default();
     assert!(!off.set_prompt(true), "no copies in the file");
