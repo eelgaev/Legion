@@ -70,7 +70,7 @@ fn conv_step(
         .cont(ple_conv_time_major(&ctx, w, padded, nt, ple))
         .as_output();
     let ob = ctx
-        .cont(ple_conv_rows(&ctx, &graph, w, sb, x, ple))
+        .cont(ple_conv_rows(&ctx, &graph, w, sb, x, ple, false))
         .as_output();
     let mut graph = graph.into_inner();
     graph.expand(oa);

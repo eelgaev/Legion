@@ -4,11 +4,12 @@
 //! the model loads once per variant. Ignored: needs a GPU and the model.
 //!
 //! With `GGML_CUDA_DISABLE_FUSION=1` every scored row must be the chain's: the ops give the
-//! chain's bits. With ggml-cuda's fusions on the rows may differ, and the test only reports it:
-//! the two graphs place tensors apart, and ggml-cuda fuses an MoE layer's weighted expert sum
-//! (with FMA adds) only where its output does not overlap the router weights (on the V100,
-//! Qwen3.8-Flash-Next, 1,716-token chunks: layer 0's sum is fused beside the chain, not beside
-//! the ops).
+//! chain's bits. With ggml-cuda's fusions on the test only reports differing rows. Built as two
+//! ops, the graphs placed tensors apart, and ggml-cuda fuses an MoE layer's weighted expert sum
+//! (with FMA adds) only where its output does not overlap its inputs (on the V100,
+//! Qwen3.8-Flash-Next, 1,716-token chunks: layer 0's sum was fused beside the chain, not beside
+//! the ops). Since #1183 the graph is allocated with the chain before the ops take its nodes,
+//! so the rows should match there too. Steps of several groups keep the chain.
 //!
 //! `LEGION_TEST_HC_MODEL=<model.gguf> LEGION_TEST_HC_TEXT=<file> [LEGION_TEST_HC_TOKENS=10292]
 //!  [LEGION_TEST_HC_CHUNK=1716] [GGML_CUDA_DISABLE_FUSION=1] cargo test --release --features cuda

@@ -14,9 +14,11 @@
 // - ple_conv: the depthwise causal conv over [history | tokens] dilated by the n-gram size (one
 //   rounded product per tap, added in tap order as the chain's mul and add nodes do), silu, plus
 //   the gated value, plus the residual streams: the layer's new streams; then the last `hist`
-//   inputs back to the history.
+//   inputs back to the history. The weight may be BF16 (the NVFP4 checkpoints'), widened exactly.
 //
-// Shapes, the CPU references and the parity tests: src/model/qwen4/ple_fused.rs and its tests.rs.
+// Both run in place of the chain's nodes once the graph is allocated as built
+// (src/model/qwen4/ple_fused/rewrite.rs), so ggml-cuda's layout-dependent fusions elsewhere see
+// the chain's layout. Shapes, the CPU references and the parity tests: src/model/qwen4/ple_fused.rs and its tests.rs.
 
 #include <cuda_runtime.h>
 
@@ -48,7 +50,7 @@ struct legion_ple_conv {
     int64_t x_ld, x_sd;
     float * state;        // history j of channel c of sequence s at state[j + c * st_ld + s * st_sd]
     int64_t st_ld, st_sd;
-    const float * w;      // tap k of channel c at w[k + c * kern]
+    const void * w;       // tap k of channel c at w[k + c * kern]: F32, or BF16 when w_bf16
     const float * value;  // column i's e values at value + i * value_ld (i = t + s * nt)
     int64_t value_ld;
     const float * gate;   // column i's hc gates at gate + i * hc
@@ -56,6 +58,7 @@ struct legion_ple_conv {
     int64_t res_ld;
     float * out;          // [width, nt * ns] contiguous
     int32_t width, e, hc, nt, ns, kern, dil, hist;
+    int32_t w_bf16;
 };
 
 int legion_ple_conv_launch(const legion_ple_conv * p, void * stream);
@@ -246,7 +249,16 @@ __device__ __forceinline__ float conv_input(const legion_ple_conv & p, int j, in
                       : p.x[c + (int64_t) (j - p.hist) * p.x_ld + s * p.x_sd];
 }
 
+// Tap k of channel c's weight as F32: a BF16 one widened exactly, as ggml-cuda's cast of it
+// (__bfloat162float: the bits shifted up).
+__device__ __forceinline__ float conv_weight(const legion_ple_conv & p, int k, int c) {
+    const int64_t i = k + (int64_t) c * p.kern;
+    return p.w_bf16 ? __uint_as_float((uint32_t) ((const uint16_t *) p.w)[i] << 16)
+                    : ((const float *) p.w)[i];
+}
+
 // One thread per (channel, token, sequence); reads and writes coalesced over the channels.
+
 __global__ void ple_conv_kernel(legion_ple_conv p) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
@@ -257,7 +269,7 @@ __global__ void ple_conv_kernel(legion_ple_conv p) {
     float acc = 0.0f;
     for (int k = 0; k < p.kern; k++) {
         const int j = p.hist - (p.kern - 1 - k) * p.dil + t;
-        const float term = __fmul_rn(conv_input(p, j, c, s), p.w[k + c * p.kern]);
+        const float term = __fmul_rn(conv_input(p, j, c, s), conv_weight(p, k, c));
         acc = k == 0 ? term : __fadd_rn(acc, term);
     }
     // ggml-cuda's silu (unary.cuh), then the two adds, each rounded on its own.

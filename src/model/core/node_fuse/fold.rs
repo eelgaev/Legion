@@ -54,13 +54,16 @@ use crate::ggml::{ffi, make_external};
 use crate::model::nvfp4_mm;
 use crate::model::qwen4::{
     FoldSum, compact_plan, fold_moe, fold_target, lazy_fold_target, lazy_mix_target, lazy_parts,
-    lazy_streams, moe_fold, set_compact, set_lazy_fold, set_lazy_streams, set_no_res,
+    lazy_streams, moe_fold, ple_rewrite, set_compact, set_lazy_fold, set_lazy_streams, set_no_res,
 };
 use crate::tp_net::seq_par;
 
 /// The fold as a relayout (`crate::ggml::post_alloc::set_relayout`): only graphs holding a norm
 /// a tail may fold into ([`fold_target`]) take it, with [`crate::model::qwen4::set_moe_fold`]
-/// and the node fusion (`legion serve --node-fuse-ggml` turns both off) on.
+/// and the node fusion (`legion serve --node-fuse-ggml` turns both off) on. Graphs holding a
+/// PLE chain marked for the PLE ops take it too: the ops take the chain's nodes first
+/// ([`crate::model::qwen4::ple_rewrite`]), and the sums ggml-cuda fuses, folded or not, are
+/// the ones of the graph as built.
 pub(crate) const RELAYOUT: Relayout = Relayout { wants, rewrite };
 
 /// Relayouts whose counts were logged (the first few only).
@@ -82,6 +85,15 @@ static TAKEN: AtomicUsize = AtomicUsize::new(0);
 /// # Safety
 /// A live graph.
 unsafe fn wants(graph: *mut ffi::ggml_cgraph, cuda: bool) -> bool {
+    // SAFETY: the caller's.
+    unsafe { ple_rewrite::marked(graph) || fold_wants(graph, cuda) }
+}
+
+/// Whether the fold takes `graph` (see [`RELAYOUT`]).
+///
+/// # Safety
+/// A live graph.
+unsafe fn fold_wants(graph: *mut ffi::ggml_cgraph, cuda: bool) -> bool {
     if !moe_fold() || !ON.load(Ordering::Relaxed) {
         return false;
     }
@@ -102,12 +114,26 @@ unsafe fn wants(graph: *mut ffi::ggml_cgraph, cuda: bool) -> bool {
 /// # Safety
 /// As [`crate::ggml::post_alloc::Rewrite`].
 unsafe fn rewrite(graph: *mut ffi::ggml_cgraph, cuda: bool) -> Option<Box<dyn Relaid>> {
+    // The PLE ops first, the fold then sees the graph's readers as they run; neither moves a
+    // node's memory before the graph is planned again.
+    let mut ple_saved = Vec::new();
     // SAFETY: the caller's.
-    let (undo, folded, fma) = unsafe { fold_graph(graph, cuda) };
-    if folded == 0 {
+    let ple = unsafe { ple_rewrite::rewrite(graph, &mut ple_saved) };
+    // SAFETY: the caller's.
+    let (mut undo, folded, fma) = unsafe {
+        if fold_wants(graph, cuda) {
+            fold_graph(graph, cuda)
+        } else {
+            (unfolded(graph, cuda), 0, 0)
+        }
+    };
+    undo.saved.splice(0..0, ple_saved);
+    if folded == 0 && ple == 0 {
+        // SAFETY: the caller's; nothing was rewritten unless the fold's streams were.
+        unsafe { undo.undo(graph) };
         return None;
     }
-    if LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
+    if folded > 0 && LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
         tracing::info!(
             folded,
             fma,
@@ -165,6 +191,31 @@ pub(crate) unsafe fn fold_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> (Un
     }
 }
 
+/// How to check and undo a graph whose sums are all left as built (only its PLE chains
+/// rewritten): every sum, and whether ggml-cuda fuses it in the graph as built.
+///
+/// # Safety
+/// As [`fold_graph`].
+unsafe fn unfolded(graph: *mut ffi::ggml_cgraph, cuda: bool) -> Undo {
+    // SAFETY: the caller's: a live graph whose node array holds `n` valid tensors.
+    unsafe {
+        let n = ffi::ggml_graph_n_nodes(graph) as usize;
+        let nodes = std::slice::from_raw_parts(ffi::ggml_graph_nodes(graph), n).to_vec();
+        let g = Graph::new(graph, nodes);
+        let left = (0..n)
+            .filter(|&i| !g.none[i] && (*g.nodes[i]).op == ffi::ggml_op_GGML_OP_MUL)
+            .filter_map(|i| g.match_sum(i).map(|s| (i, cuda && g.ggml_fuses_sum(&s))))
+            .collect();
+        Undo {
+            left,
+            saved: Vec::new(),
+            cuda,
+            lazy: 0,
+            compact: 0,
+        }
+    }
+}
+
 /// What [`fold_graph`] did.
 pub(crate) struct Undo {
     /// The tails left as they were: their `mul`'s index, and whether ggml-cuda fused the sum
@@ -204,7 +255,8 @@ impl Relaid for Undo {
     }
 
     unsafe fn undo(&self, _graph: *mut ffi::ggml_cgraph) {
-        for (t, was) in &self.saved {
+        // Last saved first: a node saved twice ends as it was first.
+        for (t, was) in self.saved.iter().rev() {
             // SAFETY: the caller's: the graph's nodes, saved whole before the rewrite.
             unsafe { std::ptr::copy_nonoverlapping(was, *t, 1) };
         }

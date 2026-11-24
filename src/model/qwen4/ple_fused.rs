@@ -14,15 +14,21 @@
 //!
 //! On CUDA the kernels compute what ggml-cuda's kernels for the chain compute, bit for bit
 //! (`ple_fused/tests.rs`, and over a real model with ggml-cuda's fusions off:
-//! `engine/lm/tests/ple_ops_kl.rs`). Opt-in all the same (`legion serve --ple-ops`): the smaller
-//! graph places tensors elsewhere, and ggml-cuda fuses an MoE layer's weighted expert sum only
-//! where its output does not overlap the router weights; the fused sum adds with FMAs, so a
-//! layer near the PLE that flips between the two moves greedy output.
+//! `engine/lm/tests/ple_ops_kl.rs`). Built as two ops, the smaller graph would place tensors
+//! elsewhere, and ggml-cuda fuses an MoE layer's weighted expert sum (FMA adds) only where its
+//! output does not overlap its inputs, so a layer near the PLE could flip between the two and
+//! move greedy output. So the graph is built and allocated with the chain, and the ops take the
+//! chain's place afterwards ([`rewrite`], #1183): the sums round as without them. On with
+//! `--ple-ops` and with `--dense-fp8-prompt`.
 
 #[cfg(feature = "cuda")]
 use std::os::raw::c_void;
 
-use crate::ggml::{Context, ExternalOp, Tensor, ffi, types};
+#[cfg(test)]
+use crate::ggml::{Context, Tensor, types};
+use crate::ggml::{ExternalOp, ffi};
+
+pub(crate) mod rewrite;
 
 static PLE_GATE: ExternalOp = ExternalOp {
     name: "ple_gate",
@@ -77,7 +83,9 @@ pub(super) fn fused_ple() -> bool {
 /// contiguous) and the gammas `gk`, `gq`, `gc` (F32, `e · hc` each). As the chain: `kn =
 /// rms_norm(key) · gk`, `qn = rms_norm(res) · gq` per stream, `s = sum(kn · qn) · inv_sqrt_e`,
 /// `gate = sigmoid(sgn(s) · sqrt(clamp(|s|, clamp_min, inf)))`, `xn = rms_norm(value · gate) ·
-/// gc`. Returns `xn` (`[e · hc, n]`) and `gate` (`[hc, n]`).
+/// gc`. Returns `xn` (`[e · hc, n]`) and `gate` (`[hc, n]`). (Graphs take it through
+/// [`rewrite`], in the node of the chain's `xn`; built directly by the tests.)
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn gate_norm<'a>(
     ctx: &'a Context,
@@ -121,10 +129,12 @@ pub(super) fn gate_norm<'a>(
 
 /// One group's conv and output: `x` (F32 `[e · hc, nt · ns]`, [`gate_norm`]'s `xn` for the
 /// group's columns), its sequences' conv history `state` (F32 `[hist, e · hc, ns]`, read and
-/// then overwritten with the last `hist` inputs), the conv weight `w` (F32 `[kern, e · hc]`,
-/// `hist = (kern - 1) · dil`), and the group's `value` (`[e, nt · ns]`), `gate` (`[hc, nt ·
-/// ns]`) and streams `res` (`[e · hc, nt · ns]`). Returns `res + (value · gate + silu(conv))`,
-/// F32 `[e · hc, nt · ns]`.
+/// then overwritten with the last `hist` inputs), the conv weight `w` (F32 or BF16 `[kern, e ·
+/// hc]`, `hist = (kern - 1) · dil`), and the group's `value` (`[e, nt · ns]`), `gate` (`[hc, nt
+/// · ns]`) and streams `res` (`[e · hc, nt · ns]`, or `[e, hc, nt · ns]`). Returns `res +
+/// (value · gate + silu(conv))`, F32 `[e · hc, nt · ns]`. (Graphs take it through [`rewrite`],
+/// in the node of the chain's new streams; built directly by the tests.)
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn conv_out<'a>(
     ctx: &'a Context,
@@ -154,11 +164,14 @@ pub(super) fn conv_out<'a>(
     for (t, cols) in [(value, e), (gate, hc), (res, width)] {
         assert_eq!(t.ne()[..2], [cols, m], "ple_conv: group columns");
     }
-    for t in [x, state, w, value, gate, res] {
+    for t in [x, state, value, gate, res] {
         assert_eq!(t.ty(), types::F32, "ple_conv: F32 tensors");
         assert_eq!(t.nb()[0], 4, "ple_conv: rows contiguous");
     }
-    assert!(w.is_contiguous(), "ple_conv: weight contiguous");
+    assert!(
+        (w.ty() == types::F32 || w.ty() == types::BF16) && w.is_contiguous(),
+        "ple_conv: weight contiguous F32 or BF16"
+    );
     assert_eq!(gate.nb()[1], hc as usize * 4, "ple_conv: gates contiguous");
     ctx.external_with(
         &PLE_CONV,
@@ -175,6 +188,33 @@ pub(super) fn conv_out<'a>(
 /// `t` is a host F32 tensor holding that element.
 unsafe fn at(t: &ffi::ggml_tensor, row: usize, i: usize) -> *mut f32 {
     unsafe { ((t.data as *mut u8).add(row * t.nb[1]) as *mut f32).add(i) }
+}
+
+/// The bytes between the columns of a [`conv_out`] op's streams `res` of `width` channels a
+/// column (`[width, m]`, or `[e, hc, m]` as the chain's).
+fn res_col_bytes(res: &ffi::ggml_tensor, width: i64) -> usize {
+    if res.ne[0] == width {
+        res.nb[1]
+    } else {
+        res.nb[2]
+    }
+}
+
+/// Tap `k` of channel `c` of a [`conv_out`] op's weight `w` (`[kern, width]`, F32 or BF16) as
+/// F32: a BF16 one widened exactly.
+///
+/// # Safety
+/// `w` is a host tensor holding that element.
+unsafe fn conv_weight_at(w: &ffi::ggml_tensor, k: usize, c: usize) -> f32 {
+    let i = k + c * w.ne[0] as usize;
+    // SAFETY: the caller's.
+    unsafe {
+        if w.type_ == ffi::ggml_type_GGML_TYPE_BF16 {
+            f32::from_bits(u32::from(*(w.data as *const u16).add(i)) << 16)
+        } else {
+            *(w.data as *const f32).add(i)
+        }
+    }
 }
 
 /// RMS norm scale of `x` with `eps`.
@@ -246,10 +286,10 @@ unsafe fn cpu_ple_conv(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
         );
         let p = crate::ggml::external_params(dst);
         let (nt, dil) = (p[0] as usize, p[1] as usize);
-        let (width, m) = (x.ne[0] as usize, x.ne[1] as usize);
+        let (width, m) = (x.ne[0] as usize, (x.ne[1] * x.ne[2]) as usize);
         let (hist, ns) = (state.ne[0] as usize, state.ne[2] as usize);
         let (kern, e) = (w.ne[0] as usize, value.ne[0] as usize);
-        let wp = w.data as *const f32;
+        let res_col = res_col_bytes(res, width as i64);
         let out = dst.data as *mut f32;
         let st = |j: usize, c: usize, s: usize| {
             (state.data as *mut u8).add(j * 4 + c * state.nb[1] + s * state.nb[2]) as *mut f32
@@ -269,13 +309,14 @@ unsafe fn cpu_ple_conv(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
                     let mut acc = 0f32;
                     for k in 0..kern {
                         let term =
-                            input(hist - (kern - 1 - k) * dil + t, c, s) * *wp.add(k + c * kern);
+                            input(hist - (kern - 1 - k) * dil + t, c, s) * conv_weight_at(w, k, c);
                         acc = if k == 0 { term } else { acc + term };
                     }
                     let silu = acc / (1.0 + (-acc).exp());
                     let i = t + s * nt;
                     let gated = *at(value, i, c - h * e) * *at(gate, i, h);
-                    *out.add(c + i * width) = *at(res, i, c) + (gated + silu);
+                    let r = *((res.data as *const u8).add(i * res_col) as *const f32).add(c);
+                    *out.add(c + i * width) = r + (gated + silu);
                 }
                 for j in 0..hist {
                     let v = input(nt + j, c, s);
@@ -318,7 +359,7 @@ struct PleConv {
     state: *mut f32,
     st_ld: i64,
     st_sd: i64,
-    w: *const f32,
+    w: *const c_void,
     value: *const f32,
     value_ld: i64,
     gate: *const f32,
@@ -333,6 +374,7 @@ struct PleConv {
     kern: i32,
     dil: i32,
     hist: i32,
+    w_bf16: i32,
 }
 
 #[cfg(feature = "cuda")]
@@ -398,12 +440,12 @@ unsafe fn cuda_ple_conv(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(
             state: state.data as *mut f32,
             st_ld: (state.nb[1] / 4) as i64,
             st_sd: (state.nb[2] / 4) as i64,
-            w: w.data as *const f32,
+            w: w.data as *const c_void,
             value: value.data as *const f32,
             value_ld: (value.nb[1] / 4) as i64,
             gate: gate.data as *const f32,
             res: res.data as *const f32,
-            res_ld: (res.nb[1] / 4) as i64,
+            res_ld: (res_col_bytes(res, x.ne[0]) / 4) as i64,
             out: dst.data as *mut f32,
             width: x.ne[0] as i32,
             e: value.ne[0] as i32,
@@ -413,6 +455,7 @@ unsafe fn cuda_ple_conv(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(
             kern: w.ne[0] as i32,
             dil,
             hist: state.ne[0] as i32,
+            w_bf16: i32::from(w.type_ == ffi::ggml_type_GGML_TYPE_BF16),
         };
         match legion_ple_conv_launch(&p, stream) {
             0 => Ok(()),
