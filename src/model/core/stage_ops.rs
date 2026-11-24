@@ -44,9 +44,6 @@ pub(crate) const PURE: &[&str] = &[
     "qsa_scores_exact",
     "qsa_topk",
     "qsa_attn",
-    // The attention writing the attn_output GEMM's FP8 codes (#1183): the GB10 kernel in a
-    // cluster launch, or the attention kernel and fp8_act's gate kernel.
-    "qsa_attn_codes",
     // The shared blocks: gated DeltaNet, the fused norms and gates, the MoE router and tail.
     "gdn",
     "conv_silu",

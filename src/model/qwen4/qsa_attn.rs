@@ -670,7 +670,7 @@ pub(crate) fn gated_codes<'a>(
         let mut args: Vec<Tensor<'a>> = (0..5).map(|i| ctx.wrap((*node).src[i])).collect();
         args.push(gate);
         let (_, total) = crate::model::fp8::dynamic_layout(k, tokens);
-        let bytes = codes_scratch(total) + 4 * (k * tokens) as usize;
+        let bytes = codes_scratch(total) + 4 * (k * tokens) as usize + codes_sync(tokens);
         let node = ctx.external(&ATTN_CODES, types::I8, [bytes as i64, 1, 1, 1], &args);
         Some(ctx.view_1d(node, total as i64, 0))
     }
@@ -687,10 +687,16 @@ pub(crate) unsafe fn is_gated_codes(node: *const ffi::ggml_tensor) -> bool {
 }
 
 /// Where a [`gated_codes`] node's F32 rows start: after the packed activations (`total`
-/// bytes), aligned to 256 bytes: `tokens` rows of `d * n_head` values, attention's output
-/// where a kernel other than the GB10's CODES one ran.
+/// bytes), aligned to 256 bytes. Then `tokens` rows of `d * n_head` values (attention's output
+/// or, on the GB10 kernel, the gated values of the CTAs that finish a token first), then the
+/// kernel's per-token counters ([`codes_sync`]).
 fn codes_scratch(total: usize) -> usize {
     total.next_multiple_of(256)
+}
+
+/// Bytes of the GB10 kernel's per-token counters: a ticket, a done count and the amax bits.
+fn codes_sync(tokens: i64) -> usize {
+    12 * tokens as usize
 }
 
 /// Most tokens a step may have for the split decode kernel.
@@ -1338,6 +1344,8 @@ struct CodesOperands {
     gate_ld: usize,
     codes: *mut u8,
     scales: *mut f32,
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    sync: *mut u32,
 }
 
 impl CodesOperands {
@@ -1360,6 +1368,7 @@ impl CodesOperands {
                 gate_ld: gate.nb[2] / 4,
                 codes: base,
                 scales: base.add(codes) as *mut f32,
+                sync: base.add(scratch + 4 * k * tokens) as *mut u32,
             }
         }
     }
@@ -1477,12 +1486,13 @@ mod cuda {
         /// through L1.
         pub gw_cg: i32,
         /// [`super::gated_codes`] (null: off): the gate (strides in floats), the codes and
-        /// scales written instead of the output.
+        /// scales written instead of the output, and the kernel's zeroed per-token counters.
         pub gate: *const f32,
         pub gate_ld: i64,
         pub gate_hd: i64,
         pub codes: *mut u8,
         pub scales: *mut f32,
+        pub sync: *mut u32,
     }
 
     #[repr(C)]
@@ -1545,6 +1555,7 @@ mod cuda {
         pub fn legion_qsa_pool_mask_launch(p: *const PoolMask, stream: *mut c_void) -> i32;
         pub fn legion_qsa_select_launch(p: *const Select, stream: *mut c_void) -> i32;
         pub fn legion_qsa_attn_launch(p: *const Attn, stream: *mut c_void) -> i32;
+        pub fn cudaMemsetAsync(p: *mut c_void, v: i32, n: usize, stream: *mut c_void) -> i32;
     }
 }
 
@@ -1750,6 +1761,12 @@ unsafe fn cuda_attn_codes(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
     p.gate_ld = c.gate_ld as i64;
     p.codes = c.codes;
     p.scales = c.scales;
+    p.sync = c.sync;
+    // SAFETY: the node's counters, `codes_sync(tokens)` bytes.
+    let e = unsafe { cuda::cudaMemsetAsync(c.sync as *mut c_void, 0, codes_sync(tokens), stream) };
+    if e != 0 {
+        return Err(format!("qsa_attn_codes: cudaMemsetAsync failed ({e})"));
+    }
     // SAFETY: the parameters' device pointers.
     let r = match unsafe { cuda::legion_qsa_attn_launch(&p, stream) } {
         3 => {
@@ -1847,6 +1864,7 @@ fn attn_params(o: &Operands) -> Result<cuda::Attn, String> {
         gate_hd: 0,
         codes: std::ptr::null_mut(),
         scales: std::ptr::null_mut(),
+        sync: std::ptr::null_mut(),
     };
     Ok(p)
 }

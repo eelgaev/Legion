@@ -373,48 +373,19 @@ __device__ __forceinline__ void cp_async16_l1(void * smem, const void * gmem, bo
 #endif
 }
 
-// A thread block cluster's barrier (sm_90+), in two halves: every thread of every CTA of the
-// cluster arrives (its earlier writes released), then waits for all of them (acquired).
-__device__ __forceinline__ void cluster_arrive() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    asm volatile("barrier.cluster.arrive;\n" ::: "memory");
-#else
-    __trap();
-#endif
-}
-
-__device__ __forceinline__ void cluster_wait() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    asm volatile("barrier.cluster.wait;\n" ::: "memory");
-#else
-    __trap();
-#endif
-}
-
-// `*smem` in the shared memory of CTA `rank` of this cluster (sm_90+).
-__device__ __forceinline__ float cluster_ld(const float * smem, int rank) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    const uint32_t a = (uint32_t) __cvta_generic_to_shared(smem);
-    uint32_t r;
-    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;\n" : "=r"(r) : "r"(a), "r"(rank));
-    float v;
-    asm volatile("ld.shared::cluster.f32 %0, [%1];\n" : "=f"(v) : "r"(r) : "memory");
-    return v;
-#else
-    __trap();
-    return 0.0f;
-#endif
-}
-
 // CODES (--dense-fp8-prompt, #1183): the output gated and quantized to the attn_output GEMM's
-// FP8 codes in the epilogue (legion_qsa_attn's gate / codes / scales), with the bits of the
-// output written, gated by fp8_act.cu's gate kind and quantized there: each value is
+// FP8 codes in the epilogue (legion_qsa_attn's gate / codes / scales / sync), with the bits of
+// the output written, gated by fp8_act.cu's gate kind and quantized there: each value is
 // fp8_gated(gate, o) with o the value written otherwise, a token's amax the max of its CTAs'
-// (non-negative floats: exact in any order), and the scale and the codes fp8_act_row.cuh's
-// expressions. A 1-D grid of clusters, one per token, of its kv heads' CTAs (sm_90+,
-// launch_gw_codes): each CTA puts its amax in shared memory, reads the others' after a cluster
-// barrier and writes its own heads' codes; nothing goes through global memory but the codes.
-// The gate rows come into L2 a few chunks before the epilogue reads them.
+// (an atomicMax of the bits of non-negative floats: exact in any order), and the scale and the
+// codes fp8_act_row.cuh's expressions. The CTA of a token that arrives last (its ticket) writes
+// the token's codes: its own values from registers, the other kv heads' from `dst`, where
+// their CTAs write them after their ticket and then count themselves done. The last CTA waits
+// only for CTAs that took a ticket before it, so are running: no deadlock in any launch order.
+// The launch order is the plain kernel's (all tokens of kv head 0, then kv head 1, ...): a
+// token-major order (#1183 round 2, clusters of a token's kv heads) cost 15% more in the main
+// loop, its K/V reads sharing less of L2. The gate rows and the other heads' rows come into L2
+// a few chunks before the epilogue reads them.
 template <int HD, int VAR, bool CODES = false>
 __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
@@ -431,9 +402,7 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
     static_assert(MCH == 32 && KR == 8, "one lane per chunk row, 8 score cells per warp");
     static_assert(KR * PIECES % 32 == 0 && MCH * VP % 32 == 0, "copy layout");
     static_assert(NT % 2 == 0 && KS % 2 == 0, "ldmatrix x4 pairs");
-    // CODES: a 1-D grid, the token's kv heads next to each other (one cluster).
-    const int tok = CODES ? (int) blockIdx.x / p.n_head_kv : gw_token<VAR>();
-    const int kvh = CODES ? (int) blockIdx.x % p.n_head_kv : (int) blockIdx.y;
+    const int tok = gw_token<VAR>(), kvh = blockIdx.y;
     const int G = p.n_head / p.n_head_kv;
     const int s = tok / p.n_tok, ti = tok % p.n_tok;
     const char * qb = (const char *) p.q + (size_t) s * p.q_nb3 + (size_t) ti * p.q_nb2 +
@@ -548,15 +517,23 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
         const int cell_n = cell_of(pos_n);
         pos_n = pos_at(c0 + 2 * MCH);
         if constexpr (CODES) {
-            // The epilogue's gate rows into L2 three chunks before the end (the first chunk of
-            // a shorter selection): the epilogue's loads then hit L2 instead of waiting on
-            // DRAM with the CTA's compute done.
+            // What the epilogue reads into L2 three chunks before the end (the first chunk of a
+            // shorter selection), so it does not wait on DRAM with the CTA's compute done: its
+            // gate rows and, in the last kv head's CTA (CTAs launch kv head by kv head, so
+            // nearly always its token's last), the other kv heads' gated rows in `dst`. A line
+            // written after its prefetch is still read right: L2 holds the write.
             if (c0 + 3 * MCH >= n && (c0 == 0 || c0 + 2 * MCH < n)) {
-                constexpr int LINES = HD * 4 / 128;  // 128-byte lines per gate row
+                constexpr int LINES = HD * 4 / 128;  // 128-byte lines per row
                 const float * gt = p.gate + (size_t) tok * p.gate_ld + (size_t) kvh * G * p.gate_hd;
                 for (int i = t; i < G * LINES; i += THREADS) {
                     const float * a = gt + (size_t) (i / LINES) * p.gate_hd + (i % LINES) * 32;
                     asm volatile("prefetch.global.L2 [%0];" ::"l"(a));
+                }
+                if (kvh == p.n_head_kv - 1) {
+                    const float * rows = p.dst + (size_t) tok * p.n_head * HD;
+                    for (int i = t; i < kvh * G * LINES; i += THREADS) {
+                        asm volatile("prefetch.global.L2 [%0];" ::"l"(rows + (size_t) i * 32));
+                    }
                 }
             }
         }
@@ -698,7 +675,8 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
         }
     } else {
         __shared__ float s_max[NW];
-        __shared__ float s_amax;  // this CTA's, read by the token's other CTAs
+        __shared__ float s_amax;
+        __shared__ int s_last;
         // The gated values (fp8_act.cu's gate kind: gate of this head's gate value times the
         // output value), in place of acc, and their amax.
         const float * gt = p.gate + (size_t) tok * p.gate_ld + (size_t) kvh * G * p.gate_hd;
@@ -729,29 +707,59 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
             s_max[warp] = amax;
         }
         __syncthreads();
-        (void) out;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+        const unsigned n_tok = gridDim.x;
+        unsigned * ticket = p.sync + tok;
+        unsigned * done = p.sync + n_tok + tok;
+        unsigned * amx = p.sync + 2 * n_tok + tok;
         if (t == 0) {
             float m = s_max[0];
 #pragma unroll
             for (int w = 1; w < NW; ++w) {
                 m = fmaxf(m, s_max[w]);
             }
-            s_amax = m;
+            // Non-negative floats order as their bits.
+            atomicMax(amx, __float_as_uint(m));
+            __threadfence();
+            s_last = atomicAdd(ticket, 1u) == (unsigned) p.n_head_kv - 1;
         }
-        // Every CTA of the token's cluster has its amax in shared memory: the token's is their
-        // max (of non-negative floats: exact in any order).
-        cluster_arrive();
-        cluster_wait();
-        float m = 0.0f;
-        for (int r = 0; r < p.n_head_kv; ++r) {
-            m = fmaxf(m, cluster_ld(&s_amax, r));
+        __syncthreads();
+        if (!s_last) {
+            // The gated values for the token's last CTA, in the output's layout.
+#pragma unroll
+            for (int j = 0; j < NT; ++j) {
+                const int d = warp * DW + j * 8 + 2 * tig;
+                if (gid < G) {
+                    *reinterpret_cast<float2 *>(out + (size_t) gid * HD + d) =
+                        make_float2(acc[j][0], acc[j][1]);
+                }
+                if (gid + 8 < G) {
+                    *reinterpret_cast<float2 *>(out + (size_t) (gid + 8) * HD + d) =
+                        make_float2(acc[j][2], acc[j][3]);
+                }
+            }
+            __threadfence();
+            __syncthreads();
+            if (t == 0) {
+                atomicAdd(done, 1u);
+            }
+            return;
         }
-        // Read: the other CTAs may leave once every CTA got here.
-        cluster_arrive();
-        const float s = fp8_row_scale(m);
+        if (t == 0) {
+            // Every other CTA of the token took its ticket (so is running): wait for its rows.
+            while (atomicAdd(done, 0u) < (unsigned) p.n_head_kv - 1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+                __nanosleep(32);
+#endif
+            }
+            __threadfence();
+            s_amax = __uint_as_float(atomicAdd(amx, 0u));
+        }
+        __syncthreads();
+        const float s = fp8_row_scale(s_amax);
         const float inv = fp8_row_inv(s);
-        uint8_t * own = p.codes + (size_t) tok * p.n_head * HD + (size_t) kvh * G * HD;
+        const int k = p.n_head * HD;
+        uint8_t * codes = p.codes + (size_t) tok * k;
+        uint8_t * own = codes + (size_t) kvh * G * HD;
 #pragma unroll
         for (int j = 0; j < NT; ++j) {
             const int d = warp * DW + j * 8 + 2 * tig;
@@ -764,12 +772,18 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
                     make_uchar2(fp8_code(acc[j][2], inv), fp8_code(acc[j][3], inv));
             }
         }
-        if (kvh == 0 && t == 0) {
+        // The other kv heads' values (G * HD of them each, a multiple of 4), through L2.
+        const float * rows = p.dst + (size_t) tok * k;
+        for (int i = 4 * t; i < k; i += 4 * THREADS) {
+            if (i / (G * HD) == kvh) {
+                continue;
+            }
+            const float4 x = __ldcg(reinterpret_cast<const float4 *>(rows + i));
+            *reinterpret_cast<uchar4 *>(codes + i) = make_uchar4(
+                fp8_code(x.x, inv), fp8_code(x.y, inv), fp8_code(x.z, inv), fp8_code(x.w, inv));
+        }
+        if (t == 0) {
             p.scales[tok] = s;
         }
-        cluster_wait();
-#else
-        __trap();  // launched on compute capability 9.0+ only (launch_gw_codes)
-#endif
     }
 }
