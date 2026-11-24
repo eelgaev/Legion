@@ -79,7 +79,8 @@ fn run(s: &Shape, backend: &mut Backend) -> (Vec<u8>, Vec<u8>) {
     }
     sel.set_i32(&rows);
     backend.compute(&graph).unwrap();
-    (want.bytes(), got.bytes())
+    // `got` is not in the graph (so has no memory of its own): its bytes are the node's first.
+    (want.bytes(), node.bytes_prefix(got.nbytes()))
 }
 
 /// Where the packed activations of two runs first differ, as (token, column) or the scale's

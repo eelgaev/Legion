@@ -129,7 +129,8 @@ fn run(s: &Step, backend: &mut Backend, keep: bool) -> (Vec<u8>, bool) {
     }
     sel.set_i32(&srows);
     backend.compute(&graph).unwrap();
-    (got.bytes(), folded)
+    // `got` is not in the graph (so has no memory of its own): its bytes are the node's first.
+    (node.bytes_prefix(got.nbytes()), folded)
 }
 
 /// Where two runs' packed activations first differ.
