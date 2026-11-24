@@ -4326,9 +4326,11 @@ impl LmEngine {
             },
         );
         if !dense_left.is_empty() {
+            // (The file's sizes: under `--tp-rank` this rank leaves out only its share.)
             tracing::info!(
                 weights = dense_left.len(),
-                gib = dense_bytes as f64 / (1u64 << 30) as f64,
+                file_gib = dense_bytes as f64 / (1u64 << 30) as f64,
+                rank_share = cfg.tp_net.is_some(),
                 "--dense-fp8-prompt: the BF16 weights with FP8 copies are not loaded (every \
                  step reads the copies)"
             );

@@ -69,8 +69,16 @@ projections at load. A weight cut by output rows (query + gate, key, value, the 
 shared expert's gate and up) keeps its rows' scales. A weight cut by input columns (the attention and DeltaNet
 outputs, the shared expert's down) keeps the whole row's scale on both ranks, so each rank's codes are exactly
 the one-Spark copy's codes for its columns; only the order of the sums differs, as it does for the BF16
-weights. Each rank holds its half of the copies, and with both flags the BF16 originals of its share are not
+weights. Each rank holds its share of the copies, and with both flags the BF16 originals of its share are not
 loaded.
+
+With the command above (2026-11-24, one session per pair of arms, deterministic client, 1 user x2, 4 and 16 users
+x1, prefill two requests after the 8K warm-up): without the flags 1 user median 53.2-53.9, 4 users 124.4-124.8,
+16 users 245.1-250.0, prefill 8K 3,514-3,526 and 32K 3,526-3,549 tok/s. `--dense-fp8`: 1 user 59.5-60.4
+(+12%), 4 users 127.3, 16 users 263.5, prefill 8K 3,525 and 32K 3,517. `--dense-fp8 --dense-fp8-prompt`: 1 user
+61.5-62.3 (+16%), 4 users 127.0, 16 users 245.4, prefill 8K 3,548 and 32K 3,558. Prefill moves less than on one
+Spark: a prompt step here waits on its sums over the link, which the FP8 GEMMs do not shorten. Rank 0's free
+memory at load: 75.2 GiB without the flags, 73.1 with `--dense-fp8`, 76.4 with both.
 
 ### Images
 
