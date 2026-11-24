@@ -4271,7 +4271,7 @@ impl Model {
         }
         // The cache writes and ggml's norm chain read contiguous rows.
         let cont = |x: Tensor<'a>| if x.is_contiguous() { x } else { ctx.cont(x) };
-        let k = if norm_rope::norm_rope_fits(k, w, pos, &rope) {
+        let k = if self.norm_rope_takes(k, w, pos, &rope) {
             k
         } else {
             cont(k)
@@ -4294,10 +4294,45 @@ impl Model {
         pos: Tensor<'a>,
     ) -> Tensor<'a> {
         let rope = self.rope_params();
-        if norm_rope::norm_rope_fits(x, w, pos, &rope) {
+        if self.norm_rope_takes(x, w, pos, &rope) {
             return norm_rope::norm_rope(ctx, x, w, pos, self.hp.rms_eps, &rope);
         }
         self.rope(ctx, ctx.mul(ctx.rms_norm(x, self.hp.rms_eps), w), pos)
+    }
+
+    /// Whether [`Self::norm_rope`] of `x` is the one op: with `--norm-rope`, and in the
+    /// `--dense-fp8-prompt` prompt steps (#1183, more than [`linear::NVFP4_A4_MIN_N`] tokens).
+    /// There ggml's norm is a bandwidth-bound pass of its own over the heads (a 32K prompt's Q
+    /// rows ~80 ms on a DGX Spark) before the RoPE reads them again; the op is its bits with one
+    /// pass. Says once why a prompt step does not take it.
+    fn norm_rope_takes(
+        &self,
+        x: Tensor<'_>,
+        w: Tensor<'_>,
+        pos: Tensor<'_>,
+        rope: &norm_rope::Rope,
+    ) -> bool {
+        if norm_rope::norm_rope_fits(x, w, pos, rope) {
+            return true;
+        }
+        if self.dense_fp8_mode() != 3 || x.ne()[2] <= linear::NVFP4_A4_MIN_N {
+            return false;
+        }
+        if norm_rope::norm_rope_device_fits(x, w, pos, rope) {
+            return true;
+        }
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                ne = ?x.ne(),
+                nb = ?x.nb(),
+                n_dims = rope.n_dims,
+                "prompt attention norm + RoPE as one op off: rows on the host or a shape the \
+                 op does not take (F32 rows of at most 1023 even columns, a multi-section RoPE)"
+            );
+        }
+        false
     }
 
     /// [`Self::rope`]'s parameters, for the fused kernels.
@@ -5224,6 +5259,12 @@ impl Model {
         // As in `ffn`: one SwiGLU node, which ggml-cuda fuses with the two matvecs. Steps of
         // 2-16 tokens on a GB10 read BF16 gate and up in one dense matvec: ggml's bits (#860).
         let names = ["ffn_gate_shexp.weight", "ffn_up_shexp.weight"];
+        // `--dense-fp8-prompt` (#1183): the gate and up GEMM's FP8 codes of h and the gate logit
+        // from one op reading h once.
+        let gate_logit = match gate_logit {
+            None if h.ne()[1] > joined::MAX_TOKENS => self.shexp_codes_gate(ctx, il, h, hq),
+            g => g,
+        };
         // Q8_0 gate and up of 2-8 tokens on a V100 ([`q8_group::part`]): matvecs and SwiGLU in one launch
         // from h quantized once, ggml's bits (#819). One token stays on ggml, which fuses them
         // the same way, unless h's Q8_1 blocks are there already (the hyper-connection mixer's).
@@ -5284,6 +5325,61 @@ impl Model {
             None => self.lmm_q(ctx, il, "ffn_gate_inp_shexp.weight", h, hq)?,
         };
         Ok((sh, g))
+    }
+
+    /// For [`Self::shexp`] of a prompt step (#1183): where its gate and up are a
+    /// `--dense-fp8-prompt` GEMM whose codes come from h's BF16 cast (`twin_codes`: h a BF16
+    /// mix), the codes and the gate logit `ffn_gate_inp_shexp · h` from one op reading h
+    /// once ([`fp8_act::plain_dot`]: the codes of the cast, the logit ggml-cuda's
+    /// `mul_mat_vec_f` bits), the codes shared with the GEMM. `Some(logit)` then. Says once
+    /// why not where the GEMM takes the codes but the op does not fit.
+    fn shexp_codes_gate<'a>(
+        &'a self,
+        ctx: &'a Context,
+        il: usize,
+        h: Tensor<'a>,
+        hq: Option<shared_q8::Shared<'a>>,
+    ) -> Option<Tensor<'a>> {
+        let names = ["ffn_gate_shexp.weight", "ffn_up_shexp.weight"];
+        if !names.iter().all(|nm| self.twin_prompt_reads(il, nm, h))
+            || ctx.has_shared_node(h, crate::model::fp8::DYNAMIC_KEY)
+        {
+            return None;
+        }
+        let w = self.lw(il, "ffn_gate_inp_shexp.weight").ok()?;
+        // The logit `lmm_q` would make on ggml's `mul_mat` (F32 `w`: `mul_mat_vec_f`).
+        let ggml_logit = self.plain_weight(il, "ffn_gate_inp_shexp.weight").is_some()
+            && hq.is_none_or(|q| !q.takes(w))
+            && !crate::model::dense_mv::takes(w, h)
+            && !crate::model::dense_mv::takes_wide_chain(w, h);
+        // `twin_codes` quantizes h's BF16 cast: with none shared yet, or a plain copy of h
+        // shared (the routed experts' BF16 rows), its values are h's rounded as the op rounds
+        // them.
+        let plain_cast = ctx.shared_cast(h, types::BF16).is_none_or(|c| {
+            // SAFETY: live tensors of the graph being built.
+            unsafe {
+                let c = &*c.raw();
+                c.op == crate::ggml::ffi::ggml_op_GGML_OP_CPY && std::ptr::eq(c.src[0], h.raw())
+            }
+        });
+        let why = if !crate::model::qwen4::is_bf16_mix(h) || !plain_cast {
+            "h's codes are not its BF16 copy's (h is not a BF16 hyper-connection mix)"
+        } else if !ggml_logit || !fp8_act::plain_dot_fits(h, w) {
+            "h or the gate weight in a shape the op does not take (F32 [k, 1] in GPU memory, k a \
+             multiple of 4 with ggml's 256-thread mul_mat_vec_f block, contiguous rows)"
+        } else {
+            let (q, g) = fp8_act::plain_dot(ctx, h, w);
+            fp8_act::share(ctx, h, q);
+            return Some(g);
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                "MoE prompt layers: shared expert codes + gate logit as one op off: {why}"
+            );
+        }
+        None
     }
 }
 

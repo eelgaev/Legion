@@ -172,6 +172,43 @@ fn bf16_case(backend: &mut Backend, k: i64, n: i64) -> (Vec<u8>, Vec<u8>) {
 
 const BF16_CASES: [(i64, i64); 3] = [(2560, 40), (6144, 9), (640, 70)];
 
+/// [`plain_dot`] against the ops it replaces, in one graph on `backend`: its packed activations
+/// and `plain_bf16` of the BF16 cast's, its gate logits and `mul_mat(w, x)`'s, and the inputs
+/// `x` (`[k, n]`) and `w` (`[k, 1]`).
+#[allow(clippy::type_complexity)]
+fn dot_case(
+    backend: &mut Backend,
+    k: i64,
+    n: i64,
+) -> (
+    (Vec<u8>, Vec<u8>),
+    (Vec<f32>, Vec<f32>),
+    (Vec<f32>, Vec<f32>),
+) {
+    let ctx = Context::new(32, 32);
+    let x = ctx.new_tensor(types::F32, &[k, n]).as_input();
+    let w = ctx.new_tensor(types::F32, &[k, 1]).as_input();
+    let (q, g) = plain_dot(&ctx, x, w);
+    let (q, g) = (q.as_output(), g.as_output());
+    let cq = plain_bf16(&ctx, ctx.cast(x, types::BF16)).as_output();
+    let mm = ctx.mul_mat(w, x).as_output();
+    let mut graph = ctx.new_graph(64);
+    for t in [q, g, cq, mm] {
+        graph.expand(t);
+    }
+    ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+        .unwrap();
+    let (xv, wv) = (spread(k as usize, n as usize, 71), noise(k as usize, 72));
+    x.set_f32(&xv);
+    w.set_f32(&wv);
+    backend.compute(&graph).unwrap();
+    ((q.bytes(), cq.bytes()), (g.to_f32(), mm.to_f32()), (xv, wv))
+}
+
+/// Rows of 2560 (the Flash-Next shared expert's) and of other widths where ggml's
+/// `mul_mat_vec_f` block is 256, over more tokens than its matvec batch.
+const DOT_CASES: [(i64, i64); 3] = [(2560, 40), (2048, 9), (6144, 70)];
+
 /// `silu`: SwiGLU of a plain `[k, n]` gate; else `o * sigmoid(gate)` with the gate read from
 /// interleaved `[q | gate]` heads of `d`.
 fn gate_case(backend: &mut Backend, d: i64, n_head: i64, n: i64, silu: bool) -> (Vec<u8>, Vec<u8>) {
@@ -264,6 +301,66 @@ fn plain_bf16_is_the_cast_quantized() {
         let (op, chain) = bf16_case(&mut b, k, n);
         compare(&op, &chain, k as usize, false, &format!("bf16 {k}x{n}"));
     }
+}
+
+/// `plain_dot`'s codes are the BF16 cast's quantized (the CPU references round and quantize
+/// alike: the same bytes), its logits `mmvf_dot`'s and ggml's matmul's to its rounding.
+#[test]
+fn plain_dot_is_the_cast_quantized_and_the_logit() {
+    let mut b = cpu();
+    for (k, n) in DOT_CASES {
+        let ((q, cq), (g, mm), (x, w)) = dot_case(&mut b, k, n);
+        assert!(q == cq, "dot {k}x{n}: codes differ from the cast's");
+        let k = k as usize;
+        for (t, row) in x.chunks_exact(k).enumerate() {
+            let want = mmvf_dot(row, &w);
+            assert_eq!(g[t].to_bits(), want.to_bits(), "dot {k}x{n}: token {t}");
+            let mag: f32 = row.iter().zip(&w).map(|(a, b)| (a * b).abs()).sum();
+            assert!(
+                (g[t] - mm[t]).abs() <= mag * 1e-5,
+                "dot {k}x{n}: token {t}: {} vs ggml's {}",
+                g[t],
+                mm[t]
+            );
+        }
+    }
+}
+
+/// ggml-cuda's `mul_mat_vec_f` block: the fewest float2 steps, the smallest block on ties.
+#[test]
+fn mmvf_block_is_ggmls() {
+    for (k, b) in [
+        (2560, 256),
+        (2048, 256),
+        (6144, 256),
+        (520, 160),
+        (64, 32),
+        (200, 128),
+    ] {
+        assert_eq!(mmvf_block(k), b, "k {k}");
+    }
+    let ctx = Context::new(8, 0);
+    let x = ctx.new_tensor(types::F32, &[2560, 70]);
+    assert!(plain_dot_shapes(x, ctx.new_tensor(types::F32, &[2560, 1])));
+    assert!(!plain_dot_shapes(x, ctx.new_tensor(types::F32, &[2560, 2])));
+    let few = ctx.new_tensor(types::F32, &[2560, 8]);
+    assert!(
+        !plain_dot_shapes(few, ctx.new_tensor(types::F32, &[2560, 1])),
+        "a matvec batch"
+    );
+    let odd = ctx.new_tensor(types::F32, &[520, 70]);
+    assert!(
+        !plain_dot_shapes(odd, ctx.new_tensor(types::F32, &[520, 1])),
+        "block 160"
+    );
+    let (q, g) = plain_dot(&ctx, x, ctx.new_tensor(types::F32, &[2560, 1]));
+    assert_eq!(q.elements(), fp8::dynamic_layout(2560, 70).1);
+    assert_eq!(g.ne(), [1, 70, 1, 1]);
+    // SAFETY: a live node of `ctx` (the views' source).
+    let node = unsafe { &*(*q.raw()).view_src };
+    assert_eq!(tokens(node), 70);
+    // SAFETY: as above.
+    assert!(unsafe { is_plain_dot(node) });
 }
 
 /// The fused rows are the two ops' bytes (the CPU references share their arithmetic).
@@ -371,6 +468,8 @@ fn nothing_fits_without_cuda() {
     assert!(!rms_norm_fits(x, w));
     assert!(!gate_fits(x, x));
     assert!(!plain_bf16_fits(ctx.new_tensor(types::BF16, &[256, 70])));
+    let h = ctx.new_tensor(types::F32, &[2560, 70]);
+    assert!(!plain_dot_fits(h, ctx.new_tensor(types::F32, &[2560, 1])));
     assert!(!gated_norm_fits(
         x,
         ctx.new_tensor(types::F32, &[128]),
@@ -405,6 +504,24 @@ fn cuda_ops_are_the_chain_quantized() {
     for (k, n) in BF16_CASES.into_iter().chain([(2560, 4096), (12288, 30)]) {
         let (op, chain) = bf16_case(&mut g, k, n);
         compare(&op, &chain, k as usize, true, &format!("bf16 {k}x{n}"));
+    }
+    // The codes as the cast's, the logits with `mul_mat_vec_f`'s bits (as its reference's).
+    for (k, n) in DOT_CASES.into_iter().chain([(2560, 4096), (2560, 12288)]) {
+        let ((q, cq), (gl, mm), (x, w)) = dot_case(&mut g, k, n);
+        assert!(q == cq, "dot {k}x{n}: codes differ from the cast's");
+        for (t, row) in x.chunks_exact(k as usize).enumerate() {
+            assert_eq!(
+                gl[t].to_bits(),
+                mm[t].to_bits(),
+                "dot {k}x{n}: token {t} vs ggml"
+            );
+            let want = mmvf_dot(row, &w).to_bits();
+            assert_eq!(
+                gl[t].to_bits(),
+                want,
+                "dot {k}x{n}: token {t} vs the reference"
+            );
+        }
     }
     for (d, h, n, silu) in GATE_CASES.into_iter().chain([(256, 24, 500, false)]) {
         let (op, chain) = gate_case(&mut g, d, h, n, silu);

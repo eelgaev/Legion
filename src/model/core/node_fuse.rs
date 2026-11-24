@@ -124,6 +124,12 @@ pub(crate) struct Counts {
     /// ssm_out projection's codes ([`crate::model::core::gdn_mma::codes_on`]). Counted, not
     /// rewritten.
     pub gdn_codes: usize,
+    /// The same for the MoE layers' shared expert: its gate and up GEMM's codes of h with the
+    /// gate logit, from one op ([`crate::model::fp8_act::plain_dot`]). Counted, not rewritten.
+    pub shexp_codes: usize,
+    /// Attention norm + RoPE ops ([`super::norm_rope::norm_rope`]): with `--norm-rope`, and the
+    /// `--dense-fp8-prompt` prompt steps' (#1183). Counted, not rewritten.
+    pub norm_rope: usize,
     /// Nodes turned into `GGML_OP_NONE`.
     pub none: usize,
 }
@@ -164,7 +170,8 @@ unsafe fn fuse(graph: *mut ffi::ggml_cgraph) {
     }
     // SAFETY: the caller's.
     let c = unsafe { rewrite_graph(graph, true) };
-    let first_codes = c.fp8_codes + c.gdn_codes > 0 && !CODES_LOGGED.swap(true, Ordering::Relaxed);
+    let first_codes = c.fp8_codes + c.gdn_codes + c.shexp_codes > 0
+        && !CODES_LOGGED.swap(true, Ordering::Relaxed);
     if c != Counts::default() && (LOGGED.fetch_add(1, Ordering::Relaxed) < 4 || first_codes) {
         tracing::info!(
             sum_gate = c.sum_gate,
@@ -178,6 +185,8 @@ unsafe fn fuse(graph: *mut ffi::ggml_cgraph) {
             gather_cast = c.gather_cast,
             fp8_codes = c.fp8_codes,
             gdn_codes = c.gdn_codes,
+            shexp_codes = c.shexp_codes,
+            norm_rope = c.norm_rope,
             none = c.none,
             "node fuse: small ggml chains as Legion ops (the first graphs; --node-fuse-ggml off)"
         );
@@ -209,6 +218,12 @@ pub(crate) unsafe fn rewrite_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> 
                     }
                     if super::gdn_mma::is_codes(g.nodes[i]) {
                         c.gdn_codes += 1;
+                    }
+                    if super::norm_rope::is_norm_rope(g.nodes[i]) {
+                        c.norm_rope += 1;
+                    }
+                    if crate::model::fp8_act::is_plain_dot(g.nodes[i]) {
+                        c.shexp_codes += 1;
                     }
                     g.mix_cast(i, &mut c);
                     if cuda {
