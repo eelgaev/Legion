@@ -185,7 +185,9 @@ fn dot_case(
     (Vec<f32>, Vec<f32>),
     (Vec<f32>, Vec<f32>),
 ) {
-    let ctx = Context::new(32, 32);
+    // 9 tensors (x, w, plain_dot's node and 3 views, the cast, plain_bf16, the matmul) and
+    // the graph of 64 nodes, with room.
+    let ctx = Context::new(32, 64);
     let x = ctx.new_tensor(types::F32, &[k, n]).as_input();
     let w = ctx.new_tensor(types::F32, &[k, 1]).as_input();
     let (q, g) = plain_dot(&ctx, x, w);
@@ -339,7 +341,8 @@ fn mmvf_block_is_ggmls() {
     ] {
         assert_eq!(mmvf_block(k), b, "k {k}");
     }
-    let ctx = Context::new(8, 0);
+    // The 8 tensors made below and plain_dot's node and 3 views (12), with room.
+    let ctx = Context::new(16, 0);
     let x = ctx.new_tensor(types::F32, &[2560, 70]);
     assert!(plain_dot_shapes(x, ctx.new_tensor(types::F32, &[2560, 1])));
     assert!(!plain_dot_shapes(x, ctx.new_tensor(types::F32, &[2560, 2])));
