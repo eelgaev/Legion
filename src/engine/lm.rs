@@ -802,6 +802,15 @@ const UMA_STEP_FIXED: usize = 2 << 30;
 const UMA_STEP_GRAPH_PER_1K: usize = 434 << 20;
 const UMA_STEP_ONCE_PER_1K: usize = 234 << 20;
 const UMA_STEP_BYTES_PER_1K: usize = PROMPT_GRAPHS * UMA_STEP_GRAPH_PER_1K + UMA_STEP_ONCE_PER_1K;
+/// What a kept prompt graph's buffer grows per 1K step tokens past [`LEAN_STEP_TOKENS`] when
+/// the model scores its context in chunks of at most that many tokens
+/// ([`crate::model::core::arch::Arch::chunks_step_scores`], #1183): the four measured
+/// Qwen3.8-Flash-Next buffers (1,789 MiB at 4,096 tokens and 78K depth; 2,284, 4,550 and
+/// 6,817 MiB at 4,096, 8,192 and 12,288 tokens at the end of a 262K context) fit 0.385 MiB
+/// per token plus 0.703 bytes per token per position of context within 0.4%, and chunked
+/// steps keep the second part at a 4,096-token step's: ~394 MiB per 1K (434 at 64K depth
+/// with it).
+const UMA_STEP_CHUNKED_PER_1K: usize = 394 << 20;
 
 /// Steps of more than this many tokens (`--max-batch-tokens`) on a GPU sharing the host's
 /// memory keep fewer prompt graphs when [`PROMPT_GRAPHS`] do not fit beside the KV pool
@@ -931,20 +940,62 @@ pub(crate) fn kv_headroom_kept(
     uma_free: usize,
     kept: usize,
 ) -> usize {
+    kv_headroom_step(kind, max_batch_tokens, uma_free, kept, false)
+}
+
+/// Whether this load's prompt steps can take the chunked QSA scores (#1183,
+/// [`crate::model::core::arch::Arch::chunks_step_scores`]): only on the paged attention path.
+/// `--attention gather` and tensor parallelism (which gathers, see the attention set at load)
+/// score a whole group through the mask, so their steps keep the unchunked charge.
+pub(crate) fn paged_step_scores(tp: usize, attention: crate::model::core::Attention) -> bool {
+    tp <= 1 && attention != crate::model::core::Attention::Gather
+}
+
+/// [`kv_headroom_kept`] for a model that does (`chunked`) or does not score its context in
+/// chunks of at most [`LEAN_STEP_TOKENS`] tokens
+/// ([`crate::model::core::arch::Arch::chunks_step_scores`], #1183): with chunks, steps of
+/// more tokens charge each kept graph [`uma_step_graph_bytes`] instead of
+/// [`UMA_STEP_GRAPH_PER_1K`] per 1K. Steps of up to [`LEAN_STEP_TOKENS`] charge the same
+/// bytes either way.
+pub(crate) fn kv_headroom_step(
+    kind: crate::ggml::DeviceKind,
+    max_batch_tokens: usize,
+    uma_free: usize,
+    kept: usize,
+    chunked: bool,
+) -> usize {
     match kind {
         crate::ggml::DeviceKind::IntegratedGpu => {
             let kept = kept.clamp(1, PROMPT_GRAPHS);
-            let per_1k = if kept == PROMPT_GRAPHS {
-                UMA_STEP_BYTES_PER_1K
+            let k = max_batch_tokens.div_ceil(1024);
+            let steps = if chunked && max_batch_tokens > LEAN_STEP_TOKENS {
+                kept.saturating_mul(uma_step_graph_bytes(max_batch_tokens, true))
+                    .saturating_add(k.saturating_mul(UMA_STEP_ONCE_PER_1K))
             } else {
-                kept * UMA_STEP_GRAPH_PER_1K + UMA_STEP_ONCE_PER_1K
+                let per_1k = if kept == PROMPT_GRAPHS {
+                    UMA_STEP_BYTES_PER_1K
+                } else {
+                    kept * UMA_STEP_GRAPH_PER_1K + UMA_STEP_ONCE_PER_1K
+                };
+                k.saturating_mul(per_1k)
             };
-            COMPUTE_HEADROOM
-                + uma_free
-                + UMA_STEP_FIXED
-                + max_batch_tokens.div_ceil(1024).saturating_mul(per_1k)
+            COMPUTE_HEADROOM + uma_free + UMA_STEP_FIXED + steps
         }
         _ => COMPUTE_HEADROOM,
+    }
+}
+
+/// What the KV fit on a GPU sharing the host's memory charges each kept prompt graph's
+/// buffer for steps of `max_batch_tokens` ([`kv_headroom_step`]): [`UMA_STEP_GRAPH_PER_1K`]
+/// per 1K, or with `chunked` scores past [`LEAN_STEP_TOKENS`] a [`LEAN_STEP_TOKENS`] step's
+/// and [`UMA_STEP_CHUNKED_PER_1K`] per 1K more (the context-long part stays a chunk's).
+pub(crate) fn uma_step_graph_bytes(max_batch_tokens: usize, chunked: bool) -> usize {
+    let k = max_batch_tokens.div_ceil(1024);
+    let base = LEAN_STEP_TOKENS / 1024;
+    if chunked && k > base {
+        base * UMA_STEP_GRAPH_PER_1K + (k - base).saturating_mul(UMA_STEP_CHUNKED_PER_1K)
+    } else {
+        k.saturating_mul(UMA_STEP_GRAPH_PER_1K)
     }
 }
 
@@ -3731,6 +3782,8 @@ fn load_report(
     let host_blocks = f.n_blocks - f.hbm_blocks;
     let gpu = layout.stages[0].0.is_some();
     let prompt_graphs = exec.prompt_graphs();
+    let chunked =
+        paged_step_scores(cfg.tp, cfg.attention) && hp.arch.chunks_step_scores(LEAN_STEP_TOKENS);
     let mut stages: Vec<report::StageMemory> = layout
         .stages
         .iter()
@@ -3750,9 +3803,13 @@ fn load_report(
                 ..Default::default()
             };
             if let Some(d) = d {
-                let kv_reserve =
-                    kv_headroom_kept(d.kind(), cfg.max_batch_tokens, cfg.uma_free, prompt_graphs)
-                        + tower_kv_reserve(f.mode, d.kind(), si, f.vision_scratch);
+                let kv_reserve = kv_headroom_step(
+                    d.kind(),
+                    cfg.max_batch_tokens,
+                    cfg.uma_free,
+                    prompt_graphs,
+                    chunked,
+                ) + tower_kv_reserve(f.mode, d.kind(), si, f.vision_scratch);
                 s.kv_reserve_bytes = Some(kv_reserve as u64);
                 if f.mode == ExpertMode::Cache && cfg.residency.cache_bytes.is_none() {
                     // As `build_expert_cache`'s budget: the measured buffers and a margin, or
@@ -4755,6 +4812,11 @@ impl LmEngine {
             }
             state_bytes + ring_bytes_with(layers, ring)
         };
+        // Whether prompt steps past 4,096 tokens score the context in chunks (#1183): their
+        // kept graphs' buffers then grow only with their tokens past it. Not on the mask path
+        // ([`paged_step_scores`]), which scores the whole group.
+        let chunked = paged_step_scores(cfg.tp, cfg.attention)
+            && hp.arch.chunks_step_scores(LEAN_STEP_TOKENS);
         // `kept`: the prompt graphs each stage keeps ([`lean_prompt_graphs`]).
         let fit_with = |ring: Option<KvRing>, log: bool, kept: usize| {
             layout
@@ -4764,9 +4826,13 @@ impl LmEngine {
                 .filter_map(|(si, (d, layers))| {
                     let dev = (*d)?;
                     let state_bytes = state_bytes_with(layers, ring);
-                    let reserve =
-                        kv_headroom_kept(dev.kind(), cfg.max_batch_tokens, cfg.uma_free, kept)
-                            + tower_kv_reserve(mode, dev.kind(), si, early_scratch);
+                    let reserve = kv_headroom_step(
+                        dev.kind(),
+                        cfg.max_batch_tokens,
+                        cfg.uma_free,
+                        kept,
+                        chunked,
+                    ) + tower_kv_reserve(mode, dev.kind(), si, early_scratch);
                     let free = layout.free_for_split(si, 0);
                     let room = layout
                         .free_for_split(si, reserve)
@@ -4962,11 +5028,12 @@ impl LmEngine {
             .enumerate()
             .map(|(si, (d, layers))| {
                 let dev = (*d)?;
-                let reserve = kv_headroom_kept(
+                let reserve = kv_headroom_step(
                     dev.kind(),
                     cfg.max_batch_tokens,
                     cfg.uma_free,
                     prompt_graphs,
+                    chunked,
                 ) + pair_head_pool;
                 let spill = state_spill(
                     &layout,
@@ -5761,11 +5828,16 @@ impl LmEngine {
                 LoadError::Device(format!("cannot build a {tokens}-token prompt step: {e}"))
             })?;
             if reserved.iter().any(|&(n, _)| n > 0) {
+                // What the KV fit charged each kept graph on a GPU sharing the host's memory
+                // ([`uma_step_graph_bytes`], at 64K depth), beside what the step took here.
+                let charged = shared.then(|| uma_step_graph_bytes(cfg.max_batch_tokens, chunked));
                 tracing::info!(
                     tokens,
                     n_past,
                     buffers = ?reserved.iter().map(|r| r.0).collect::<Vec<_>>(),
                     mib_each = ?reserved.iter().map(|r| r.1 >> 20).collect::<Vec<_>>(),
+                    charged_mib_each = ?charged.map(|b| b >> 20),
+                    chunked_scores = chunked && cfg.max_batch_tokens > LEAN_STEP_TOKENS,
                     seconds = t_reserve.elapsed().as_secs_f64(),
                     "prompt compute buffers reserved"
                 );

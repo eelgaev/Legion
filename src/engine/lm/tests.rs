@@ -1196,6 +1196,82 @@ fn fewer_kept_prompt_graphs_leave_less_step_room() {
 }
 
 #[test]
+fn chunked_charge_only_on_the_paged_path() {
+    use crate::model::core::Attention;
+    assert!(paged_step_scores(1, Attention::Auto));
+    assert!(paged_step_scores(1, Attention::Paged));
+    assert!(!paged_step_scores(1, Attention::Gather));
+    assert!(!paged_step_scores(2, Attention::Auto));
+    assert!(!paged_step_scores(2, Attention::Paged));
+}
+
+#[test]
+fn chunked_scores_charge_less_only_past_a_chunk() {
+    use crate::ggml::DeviceKind;
+    let gib = 1usize << 30;
+    let mib = 1usize << 20;
+    let igpu = DeviceKind::IntegratedGpu;
+    // Up to 4,096 tokens the same bytes, chunked or not, for every kept count (#1183).
+    for t in [1, 1024, 3000, LEAN_STEP_TOKENS] {
+        for kept in 0..=PROMPT_GRAPHS + 1 {
+            assert_eq!(
+                kv_headroom_step(igpu, t, UMA_HEADROOM, kept, true),
+                kv_headroom_kept(igpu, t, UMA_HEADROOM, kept),
+                "{t} tokens, {kept} kept"
+            );
+        }
+        assert_eq!(
+            uma_step_graph_bytes(t, true),
+            uma_step_graph_bytes(t, false)
+        );
+    }
+    // Not chunked: the charge as before at any step.
+    for t in [8192, 12288, 16384] {
+        for kept in 1..=PROMPT_GRAPHS {
+            assert_eq!(
+                kv_headroom_step(igpu, t, UMA_HEADROOM, kept, false),
+                kv_headroom_kept(igpu, t, UMA_HEADROOM, kept)
+            );
+        }
+        assert_eq!(uma_step_graph_bytes(t, false), t / 1024 * 434 * mib);
+    }
+    // Chunked: a 4K step's graph plus 394 MiB per 1K past it, the once part as before.
+    assert_eq!(uma_step_graph_bytes(8192, true), (4 * 434 + 4 * 394) * mib);
+    assert_eq!(uma_step_graph_bytes(12288, true), (4 * 434 + 8 * 394) * mib);
+    assert_eq!(
+        uma_step_graph_bytes(16384, true),
+        (4 * 434 + 12 * 394) * mib
+    );
+    // A partial 1K counts whole, as the unchunked charge does.
+    assert_eq!(uma_step_graph_bytes(4097, true), (4 * 434 + 394) * mib);
+    assert_eq!(
+        kv_headroom_step(igpu, 16384, UMA_HEADROOM, 1, true),
+        (2 + 16 + 2) * gib + (4 * 434 + 12 * 394 + 16 * 234) * mib
+    );
+    assert_eq!(
+        kv_headroom_step(igpu, 8192, UMA_HEADROOM, 2, true),
+        (2 + 16 + 2) * gib + (2 * (4 * 434 + 4 * 394) + 8 * 234) * mib
+    );
+    assert_eq!(
+        kv_headroom_step(igpu, 8192, UMA_HEADROOM, 3, true),
+        (2 + 16 + 2) * gib + (3 * (4 * 434 + 4 * 394) + 8 * 234) * mib
+    );
+    for t in [8192, 12288, 16384] {
+        for kept in 1..=PROMPT_GRAPHS {
+            assert!(
+                kv_headroom_step(igpu, t, UMA_HEADROOM, kept, true)
+                    < kv_headroom_kept(igpu, t, UMA_HEADROOM, kept)
+            );
+        }
+    }
+    // Other devices keep the compute headroom only.
+    assert_eq!(
+        kv_headroom_step(DeviceKind::Gpu, 16384, UMA_HEADROOM, 1, true),
+        COMPUTE_HEADROOM
+    );
+}
+
+#[test]
 fn big_steps_keep_the_most_prompt_graphs_that_fit() {
     // Not big (4K steps, a discrete GPU, ...): three, fitting or not.
     assert_eq!(lean_prompt_graphs(false, |_| false), PROMPT_GRAPHS);

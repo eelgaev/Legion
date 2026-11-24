@@ -468,6 +468,48 @@ pub(crate) fn qsa_share_cut(n_tok: usize, n_pool: usize, kpool: usize) -> usize 
     crate::tp_net::seq_par::cost_cut(n_tok, first, last.max(first), QSA_SHARE_MIN)
 }
 
+/// Most tokens of a prompt step whose indexer scores one graph computes at once (#1183): a
+/// step of more scores, picks and selects its tokens in chunks of at most this many, one after
+/// the other in the graph, so one chunk's scores (F32 `[n_pool, tokens]`, a byte per token of
+/// context per token at a pool size of 4: 1 GiB for 4,096 tokens at 262K) are what the compute
+/// buffer holds instead of the whole step's. The default step on a GPU sharing the host's
+/// memory: steps of up to it keep the graph they had.
+pub(crate) const QSA_SCORE_CHUNK: usize = 4096;
+
+/// Tokens a [`QSA_SCORE_CHUNK`] chunk starts on a multiple of: the scores kernel's tile of
+/// tokens ([`qsa_attn::scores_exact`]), so every chunk's tiles hold the same tokens as the
+/// whole step's would.
+pub(crate) const QSA_SCORE_ALIGN: usize = 64;
+
+/// The chunks `(first, count)` a group of `n_tok` tokens scores its pools in
+/// ([`QSA_SCORE_CHUNK`]), in order: one chunk up to it, else `ceil(n_tok / QSA_SCORE_CHUNK)`
+/// chunks of the same multiple of [`QSA_SCORE_ALIGN`] tokens but the last, which is no bigger
+/// (so the later chunks' scores fit in the first's memory). Up to 64K-token steps every chunk
+/// holds over 1,000 tokens.
+pub(crate) fn qsa_score_chunks(n_tok: usize) -> Vec<(usize, usize)> {
+    if n_tok <= QSA_SCORE_CHUNK {
+        return vec![(0, n_tok)];
+    }
+    let n = n_tok.div_ceil(QSA_SCORE_CHUNK);
+    let size = n_tok.div_ceil(n).next_multiple_of(QSA_SCORE_ALIGN);
+    if size * (n - 1) >= n_tok {
+        // Too many chunks for the alignment to leave the last any tokens (not at any step
+        // size a load allows): even chunks, the first ones a token bigger.
+        let (size, more) = (n_tok / n, n_tok % n);
+        let mut first = 0;
+        return (0..n)
+            .map(|i| {
+                let count = size + usize::from(i < more);
+                first += count;
+                (first - count, count)
+            })
+            .collect();
+    }
+    (0..n)
+        .map(|i| (i * size, size.min(n_tok - i * size)))
+        .collect()
+}
+
 /// `legion serve --qsa-pool-pad-steps` (#858; 0, the default: off): decode and verify steps of
 /// several sequences pad their listed pools to cover at least this many steps' growth. A step
 /// of `t` tokens completes up to `t / kpool` pools, so at 64 pools a 16-sequence verify step
@@ -2215,6 +2257,16 @@ impl Model {
                 pos,
             ));
         }
+        let chunks = qsa_score_chunks(ng);
+        let smallest = chunks.iter().map(|c| c.1).min().unwrap_or(0);
+        if chunks.len() > 1
+            && chunks.iter().all(|c| c.0 % QSA_SCORE_ALIGN == 0)
+            && !pass.tap.on
+            && self.qsa_takes_own(ng, sh.n_pool)
+            && self.qsa_takes_own(smallest, sh.n_pool)
+        {
+            return self.qsa_select_chunked(pass, il, gi, iq, &chunks);
+        }
         let (score, top) = self.qsa_top(pass, il, gi, iq, true, None)?;
         Ok(qsa_attn::select(
             pass.ctx,
@@ -2224,6 +2276,80 @@ impl Model {
             inp.tail_idxs,
             pos,
         ))
+    }
+
+    /// Whether a group of `tokens` tokens listing `n_pool` pools takes
+    /// [`qsa_attn::scores_exact`] and [`qsa_attn::top_k`] in [`Self::qsa_top`] on the CUDA
+    /// paged path: no tensor-core scores, at least the exact scores' tokens, the own `top_k`
+    /// and more rows than the cluster `top_k` takes. Those ops give each token the same bits
+    /// whatever tokens share its graph (its scores one FMA chain over the dims and heads in
+    /// order, its picks one CTA's), which [`Self::qsa_share`] and [`Self::qsa_select_chunked`]
+    /// rely on.
+    fn qsa_takes_own(&self, tokens: usize, n_pool: usize) -> bool {
+        let Some(q) = self.qwen4().qsa.as_ref() else {
+            return false;
+        };
+        let (ng, np) = (tokens as i64, n_pool as i64);
+        let n_top = np.min(q.top_k as i64 / q.kpool as i64);
+        let row = 4 * n_pool;
+        let nb = [4, row, row * tokens, row * tokens];
+        !qsa_attn::scores_fit(q.n_head, q.head_dim, ng)
+            && qsa_attn::scores_exact_fit(q.n_head, q.head_dim, ng)
+            && qsa_attn::own_top_k()
+            && !crate::model::cluster_select::topk_fits(types::F32, [np, ng, 1, 1], nb, n_top)
+    }
+
+    /// [`Self::qsa_select`] of a prompt group of more than [`QSA_SCORE_CHUNK`] tokens, chunk by
+    /// chunk (#1183): each chunk of [`qsa_score_chunks`] scores the pools for its tokens, picks
+    /// the best and selects, then the chunks' rows join in order. The scores (F32 `[n_pool,
+    /// tokens]`, the step's one buffer that grows with tokens times context) are freed after
+    /// their chunk's select, so the chunks reuse one chunk's memory: the step's compute buffer
+    /// grows about linearly in its tokens instead of with tokens times context.
+    ///
+    /// The same rows, bit for bit, as the whole group's [`qsa_attn::scores_exact`],
+    /// [`qsa_attn::top_k`] and [`qsa_attn::select`] ([`Self::qsa_takes_own`] holds for the
+    /// group and every chunk): a token's scores are one FMA chain of its own query over the
+    /// dims and heads in order plus its mask and the pool's bias, in a tile of the same 64
+    /// tokens (chunks start on multiples of [`QSA_SCORE_ALIGN`]); its picks are one CTA's
+    /// over its row; its selection reads only its own picks, scores, tail and position. The
+    /// pooled keys, bias and pool members are the group's, shared by every chunk.
+    fn qsa_select_chunked<'a>(
+        &'a self,
+        pass: &Pass<'a>,
+        il: usize,
+        gi: usize,
+        iq: Tensor<'a>,
+        chunks: &[(usize, usize)],
+    ) -> Result<Tensor<'a>, ModelError> {
+        let (off, sh) = pass.groups().nth(gi).expect("group index");
+        let q = self.qwen4().qsa.as_ref().expect("sparse attention");
+        let ctx = pass.ctx;
+        let inp = QsaInputs::from_slice(&pass.group[gi]);
+        let (d, kpool) = (q.head_dim, q.kpool as i64);
+        let n_pool = sh.n_pool as i64;
+        let n_top = n_pool.min(q.top_k as i64 / kpool);
+        let pooled = self.qsa_pool_keys(pass, il, gi)?;
+        let keys = ctx.reshape_3d(ctx.get_rows(pooled, inp.pool_cells), d, 1, n_pool);
+        let (qnb, es) = (iq.nb(), pass.pos.element_size());
+        let parts: Vec<Tensor<'a>> = chunks
+            .iter()
+            .map(|&(a, m)| {
+                let (a, m) = (a as i64, m as i64);
+                let first = off as usize + a as usize;
+                let qg = ctx.view_3d(iq, [d, q.n_head, m], [qnb[1], qnb[2]], first * qnb[2]);
+                let w = ctx.fill(
+                    ctx.new_tensor(types::F32, &[q.n_head, m]),
+                    1.0 / (d as f32).sqrt(),
+                );
+                let vis = crate::model::core::cols(ctx, inp.pool_vis, a, m);
+                let score = qsa_attn::scores_exact(ctx, qg, keys, w, vis, inp.pool_bias);
+                let top = qsa_attn::top_k(ctx, score, n_top);
+                let tail = crate::model::core::cols(ctx, inp.tail_idxs, a, m);
+                let pos = ctx.view_2d(pass.pos, [m, 1], m as usize * es, first * es);
+                qsa_attn::select(ctx, top, score, inp.pool_idxs, tail, pos)
+            })
+            .collect();
+        Ok(crate::model::core::concat_tree(ctx, parts))
     }
 
     /// Where group `gi` of sparse-attention layer `il` runs its indexer on this rank's share of
@@ -2255,20 +2381,9 @@ impl Model {
             .map(|r| crate::tp_net::seq_par::share_cut(ng, r, ranks, cut).1)
             .min()
             .unwrap_or(0) as i64;
-        let n_pool = sh.n_pool as i64;
-        let n_top = n_pool.min(q.top_k as i64 / q.kpool as i64);
-        let row = 4 * sh.n_pool;
-        let nb = [4, row, row * ng, row * ng];
-        let whole_takes_own = !qsa_attn::scores_fit(q.n_head, q.head_dim, ng as i64)
-            && qsa_attn::scores_exact_fit(q.n_head, q.head_dim, ng as i64)
-            && qsa_attn::own_top_k()
-            && !crate::model::cluster_select::topk_fits(
-                types::F32,
-                [n_pool, ng as i64, 1, 1],
-                nb,
-                n_top,
-            );
-        if !whole_takes_own || !qsa_attn::scores_exact_fit(q.n_head, q.head_dim, fewest) {
+        if !self.qsa_takes_own(ng, sh.n_pool)
+            || !qsa_attn::scores_exact_fit(q.n_head, q.head_dim, fewest)
+        {
             return None;
         }
         let (a, m) = crate::tp_net::seq_par::share_cut(ng, rank, ranks, cut);
@@ -2495,6 +2610,19 @@ impl Arch for Qwen4Params {
 
     fn indexed(&self, il: usize) -> bool {
         self.qsa.as_ref().is_some_and(|q| q.layer(il))
+    }
+
+    fn chunks_step_scores(&self, tokens: usize) -> bool {
+        // `qsa_select`'s chunks (#1183) on the CUDA paged path: [`QSA_SCORE_CHUNK`] tokens at
+        // most, with the exact scores and the own `top_k` (not ggml's, nor Volta's
+        // tensor-core scores).
+        let chunk = QSA_SCORE_CHUNK as i64;
+        tokens >= QSA_SCORE_CHUNK
+            && self.qsa.as_ref().is_some_and(|q| {
+                !qsa_attn::scores_fit(q.n_head, q.head_dim, chunk)
+                    && qsa_attn::scores_exact_fit(q.n_head, q.head_dim, chunk)
+                    && qsa_attn::own_top_k()
+            })
     }
 
     /// The sparse attention kernels read F16, or q8_0 / q4_0 K and V (#263); dense attention

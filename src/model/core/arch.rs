@@ -472,6 +472,14 @@ pub trait Arch: Debug + Send + Sync + Any {
         false
     }
 
+    /// Whether a prompt step of more than `tokens` tokens computes its context-long scores
+    /// (a sparse-attention indexer's, tokens × pools) in chunks of at most `tokens` tokens
+    /// (#1183): its compute buffer then grows past such a step only with its tokens, not with
+    /// tokens × context, and the KV fit charges it so.
+    fn chunks_step_scores(&self, _tokens: usize) -> bool {
+        false
+    }
+
     /// The commit of a verify step's kept tokens into recurrent layer `il` of an architecture
     /// whose recurrent layers run its own ops ([`Recurrent::Kda`]): the nodes that advance the
     /// layer's states by them (see [`super::Replay`]).
