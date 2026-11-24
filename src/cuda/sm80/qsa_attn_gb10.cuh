@@ -373,7 +373,16 @@ __device__ __forceinline__ void cp_async16_l1(void * smem, const void * gmem, bo
 #endif
 }
 
-template <int HD, int VAR>
+// CODES (--dense-fp8-prompt, #1183): the output gated and quantized to the attn_output GEMM's
+// FP8 codes in the epilogue (legion_qsa_attn's gate / codes / scales / sync), with the bits of
+// the output written, gated by fp8_act.cu's gate kind and quantized there: each value is
+// fp8_gated(gate, o) with o the value written otherwise, a token's amax the max of its CTAs'
+// (an atomicMax of the bits of non-negative floats: exact in any order), and the scale and the
+// codes fp8_act_row.cuh's expressions. The CTA of a token that arrives last (its ticket) writes
+// the token's codes: its own values from registers, the other kv heads' from `dst`, where
+// their CTAs write them after their ticket and then count themselves done. The last CTA waits
+// only for CTAs that took a ticket before it, so are running: no deadlock in any launch order.
+template <int HD, int VAR, bool CODES = false>
 __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     GbSmem<HD> & S = *reinterpret_cast<GbSmem<HD> *>(smem_raw);
@@ -626,16 +635,130 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
     }
     const float l0 = S.lsum[gid], l1 = S.lsum[gid + 8];
     const float i0 = l0 > 0.0f ? 1.0f / l0 : 0.0f, i1 = l1 > 0.0f ? 1.0f / l1 : 0.0f;
+    if constexpr (!CODES) {
 #pragma unroll
-    for (int j = 0; j < NT; ++j) {
-        const int d = warp * DW + j * 8 + 2 * tig;
-        if (gid < G) {
-            *reinterpret_cast<float2 *>(out + (size_t) gid * HD + d) =
-                make_float2(acc[j][0] * i0, acc[j][1] * i0);
+        for (int j = 0; j < NT; ++j) {
+            const int d = warp * DW + j * 8 + 2 * tig;
+            if (gid < G) {
+                *reinterpret_cast<float2 *>(out + (size_t) gid * HD + d) =
+                    make_float2(acc[j][0] * i0, acc[j][1] * i0);
+            }
+            if (gid + 8 < G) {
+                *reinterpret_cast<float2 *>(out + (size_t) (gid + 8) * HD + d) =
+                    make_float2(acc[j][2] * i1, acc[j][3] * i1);
+            }
         }
-        if (gid + 8 < G) {
-            *reinterpret_cast<float2 *>(out + (size_t) (gid + 8) * HD + d) =
-                make_float2(acc[j][2] * i1, acc[j][3] * i1);
+    } else {
+        __shared__ float s_max[NW];
+        __shared__ float s_amax;
+        __shared__ int s_last;
+        // The gated values (fp8_act.cu's gate kind: gate of this head's gate value times the
+        // output value), in place of acc, and their amax.
+        const float * gt = p.gate + (size_t) tok * p.gate_ld + (size_t) kvh * G * p.gate_hd;
+        float amax = 0.0f;
+#pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            const int d = warp * DW + j * 8 + 2 * tig;
+            if (gid < G) {
+                const float * g = gt + (size_t) gid * p.gate_hd + d;
+                acc[j][0] = fp8_gated(g[0], acc[j][0] * i0, 0);
+                acc[j][1] = fp8_gated(g[1], acc[j][1] * i0, 0);
+                amax = fmaxf(amax, fabsf(acc[j][0]));
+                amax = fmaxf(amax, fabsf(acc[j][1]));
+            }
+            if (gid + 8 < G) {
+                const float * g = gt + (size_t) (gid + 8) * p.gate_hd + d;
+                acc[j][2] = fp8_gated(g[0], acc[j][2] * i1, 0);
+                acc[j][3] = fp8_gated(g[1], acc[j][3] * i1, 0);
+                amax = fmaxf(amax, fabsf(acc[j][2]));
+                amax = fmaxf(amax, fabsf(acc[j][3]));
+            }
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        }
+        if (lane == 0) {
+            s_max[warp] = amax;
+        }
+        __syncthreads();
+        const unsigned n_tok = gridDim.x;
+        unsigned * ticket = p.sync + tok;
+        unsigned * done = p.sync + n_tok + tok;
+        unsigned * amx = p.sync + 2 * n_tok + tok;
+        if (t == 0) {
+            float m = s_max[0];
+#pragma unroll
+            for (int w = 1; w < NW; ++w) {
+                m = fmaxf(m, s_max[w]);
+            }
+            // Non-negative floats order as their bits.
+            atomicMax(amx, __float_as_uint(m));
+            __threadfence();
+            s_last = atomicAdd(ticket, 1u) == (unsigned) p.n_head_kv - 1;
+        }
+        __syncthreads();
+        if (!s_last) {
+            // The gated values for the token's last CTA, in the output's layout.
+#pragma unroll
+            for (int j = 0; j < NT; ++j) {
+                const int d = warp * DW + j * 8 + 2 * tig;
+                if (gid < G) {
+                    *reinterpret_cast<float2 *>(out + (size_t) gid * HD + d) =
+                        make_float2(acc[j][0], acc[j][1]);
+                }
+                if (gid + 8 < G) {
+                    *reinterpret_cast<float2 *>(out + (size_t) (gid + 8) * HD + d) =
+                        make_float2(acc[j][2], acc[j][3]);
+                }
+            }
+            __threadfence();
+            __syncthreads();
+            if (t == 0) {
+                atomicAdd(done, 1u);
+            }
+            return;
+        }
+        if (t == 0) {
+            // Every other CTA of the token took its ticket (so is running): wait for its rows.
+            while (atomicAdd(done, 0u) < (unsigned) p.n_head_kv - 1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+                __nanosleep(32);
+#endif
+            }
+            __threadfence();
+            s_amax = __uint_as_float(atomicAdd(amx, 0u));
+        }
+        __syncthreads();
+        const float s = fp8_row_scale(s_amax);
+        const float inv = fp8_row_inv(s);
+        const int k = p.n_head * HD;
+        uint8_t * codes = p.codes + (size_t) tok * k;
+        uint8_t * own = codes + (size_t) kvh * G * HD;
+#pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            const int d = warp * DW + j * 8 + 2 * tig;
+            if (gid < G) {
+                *reinterpret_cast<uchar2 *>(own + (size_t) gid * HD + d) =
+                    make_uchar2(fp8_code(acc[j][0], inv), fp8_code(acc[j][1], inv));
+            }
+            if (gid + 8 < G) {
+                *reinterpret_cast<uchar2 *>(own + (size_t) (gid + 8) * HD + d) =
+                    make_uchar2(fp8_code(acc[j][2], inv), fp8_code(acc[j][3], inv));
+            }
+        }
+        // The other kv heads' values (G * HD of them each, a multiple of 4), through L2.
+        const float * rows = p.dst + (size_t) tok * k;
+        for (int i = 4 * t; i < k; i += 4 * THREADS) {
+            if (i / (G * HD) == kvh) {
+                continue;
+            }
+            const float4 x = __ldcg(reinterpret_cast<const float4 *>(rows + i));
+            *reinterpret_cast<uchar4 *>(codes + i) = make_uchar4(
+                fp8_code(x.x, inv), fp8_code(x.y, inv), fp8_code(x.z, inv), fp8_code(x.w, inv));
+        }
+        if (t == 0) {
+            p.scales[tok] = s;
         }
     }
 }

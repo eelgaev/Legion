@@ -116,12 +116,20 @@ pub(crate) struct Counts {
     pub gather_mix: usize,
     /// F32 copies of a BF16 all-gather's output written by the gather (#1176).
     pub gather_cast: usize,
+    /// Producers writing an FP8 GEMM's activation codes themselves (`--dense-fp8-prompt`,
+    /// #1183): the prompt attention ops that gate and quantize their output
+    /// ([`crate::model::qwen4::qsa_attn::gated_codes`]). Counted, not rewritten.
+    pub fp8_codes: usize,
     /// Nodes turned into `GGML_OP_NONE`.
     pub none: usize,
 }
 
 /// Graphs whose rewrite was logged (the first few only).
 static LOGGED: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether a graph with [`Counts::fp8_codes`] was logged (the first one is, after the first
+/// few graphs too: prompt steps may come later).
+static CODES_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// The pass on CUDA graphs ([`crate::ggml::post_alloc::set_rewrite`]). Then the CPU share's
 /// layers get their shared expert moved to run while the pool works
@@ -152,7 +160,8 @@ unsafe fn fuse(graph: *mut ffi::ggml_cgraph) {
     }
     // SAFETY: the caller's.
     let c = unsafe { rewrite_graph(graph, true) };
-    if c != Counts::default() && LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
+    let first_codes = c.fp8_codes > 0 && !CODES_LOGGED.swap(true, Ordering::Relaxed);
+    if c != Counts::default() && (LOGGED.fetch_add(1, Ordering::Relaxed) < 4 || first_codes) {
         tracing::info!(
             sum_gate = c.sum_gate,
             weighted_gate = c.weighted_gate,
@@ -163,6 +172,7 @@ unsafe fn fuse(graph: *mut ffi::ggml_cgraph) {
             mix_f32_skipped = c.mix_f32_skipped,
             gather_mix = c.gather_mix,
             gather_cast = c.gather_cast,
+            fp8_codes = c.fp8_codes,
             none = c.none,
             "node fuse: small ggml chains as Legion ops (the first graphs; --node-fuse-ggml off)"
         );
@@ -189,6 +199,9 @@ pub(crate) unsafe fn rewrite_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> 
                 ffi::ggml_op_GGML_OP_MUL => g.moe(i, cuda, &mut c),
                 ffi::ggml_op_GGML_OP_GET_ROWS => g.remap(i, &mut c),
                 ffi::ggml_op_GGML_OP_CUSTOM => {
+                    if crate::model::qwen4::qsa_attn::is_gated_codes(g.nodes[i]) {
+                        c.fp8_codes += 1;
+                    }
                     g.mix_cast(i, &mut c);
                     if cuda {
                         g.gather(i, &mut c);

@@ -37,6 +37,8 @@
 
 #include <cstdint>
 
+#include "fp8_act_row.cuh"
+
 extern "C" {
 
 struct legion_fp8_act {
@@ -100,9 +102,10 @@ __device__ __forceinline__ float warp_max(float x) {
     return x;
 }
 
-// sigmoid or SiLU as fused.cu's gate_bf16_kernel and gated_norm_kernel compute them.
+// sigmoid or SiLU as fused.cu's gate_bf16_kernel and gated_norm_kernel compute them
+// (fp8_act_row.cuh).
 __device__ __forceinline__ float gate_of(float v, int silu) {
-    return silu ? v / (1.0f + expf(-v)) : 1.0f / (1.0f + expf(-v));
+    return fp8_gate_of(v, silu);
 }
 
 // sum_norm's x at offset o: tp_net.cu's tp_sum (F32) or tp_sum_bf16 (BF16 partials), the
@@ -210,8 +213,7 @@ __global__ void __launch_bounds__(BLOCK) fp8_act_kernel(const legion_fp8_act p) 
             v[i] = 0.0f;
             if (col < k) {
                 const float xv = p.x[t * p.x_ld + (int64_t) (col / p.d) * p.x_hd + col % p.d];
-                const float a = gate_of(xv, p.silu);
-                v[i] = a * p.g[t * p.g_ld + col];
+                v[i] = fp8_gated(xv, p.g[t * p.g_ld + col], p.silu);
             }
         }
     } else {
@@ -268,14 +270,14 @@ __global__ void __launch_bounds__(BLOCK) fp8_act_kernel(const legion_fp8_act p) 
             amax = fmaxf(amax, s_max[w]);
         }
     }
-    const float s = amax > 0.0f ? __fdiv_rn(amax, 448.0f) : 0.0f;
-    const float inv = s > 0.0f ? __fdiv_rn(1.0f, s) : 0.0f;
+    const float s = fp8_row_scale(amax);
+    const float inv = fp8_row_inv(s);
     uint8_t * out = p.out + t * k;
 #pragma unroll
     for (int i = 0; i < NV; i++) {
         const int col = tid + i * BLOCK;
         if (col < k) {
-            out[col] = __nv_cvt_float_to_fp8(__fmul_rn(v[i], inv), __NV_SATFINITE, __NV_E4M3);
+            out[col] = fp8_code(v[i], inv);
         }
     }
     if (tid == 0) {

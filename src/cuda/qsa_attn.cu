@@ -28,6 +28,8 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "fp8_act_row.cuh"
+
 extern "C" {
 
 struct legion_qsa_pool_mask {
@@ -102,6 +104,19 @@ struct legion_qsa_attn {
     // attn_gw_kernel copies K and V with cp.async.cg (L2 only) instead of cp.async.ca (through
     // L1, the default): LEGION_DEBUG_QSA_GW_L1=0, for A/B runs.
     int32_t gw_cg;
+    // Prompt steps under --dense-fp8-prompt (#1183; null: off): the output gated by the sigmoid
+    // of `gate` (head h of token t at gate + t * gate_ld + h * gate_hd, F32) and quantized per
+    // token as fp8_act.cu's gate kind does it, written as `codes` (E4M3 [d * n_head, tokens])
+    // and `scales` (F32 [tokens]) instead of the output. attn_gw_kernel does that where the
+    // launcher runs it (then 0); every other kernel writes the output to `dst` as without
+    // codes (then 3: the caller quantizes it). `sync`: 3 * tokens zeroed words (attn_gw_kernel's
+    // per-token counters and amax); `dst` then holds the gated rows of the CTAs that finish a
+    // token first.
+    const float * gate;
+    int64_t gate_ld, gate_hd;  // floats
+    uint8_t * codes;
+    float * scales;
+    uint32_t * sync;
 };
 
 int legion_qsa_pool_mask_launch(const legion_qsa_pool_mask * p, void * stream);
@@ -186,6 +201,8 @@ int legion_qsa_scores_sm7x(void);
 namespace {
 
 constexpr int BLK = 64;  // positions per KV block (KV_BLOCK on the Rust side)
+// launch_attn's result where attn_gw_kernel wrote the FP8 codes (legion_qsa_attn::codes).
+constexpr int CODES_WRITTEN = 16;
 
 __global__ void pool_mask_kernel(legion_qsa_pool_mask p) {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1440,9 +1457,9 @@ __global__ void __launch_bounds__(128) qsa_scores_kernel(const legion_qsa_scores
 
 // attn_gw_kernel<HD, VAR> (sm80/qsa_attn_gb10.cuh): ~39 KB at HD 256, under the 48 KB default,
 // two CTAs per SM with the largest shared-memory carveout (GW_ONE: 64 KB, one CTA per SM).
-template <int HD, int VAR>
+template <int HD, int VAR, bool CODES = false>
 int launch_gw_variant(const legion_qsa_attn & p, cudaStream_t st) {
-    void (*kern)(legion_qsa_attn) = attn_gw_kernel<HD, VAR>;
+    void (*kern)(legion_qsa_attn) = attn_gw_kernel<HD, VAR, CODES>;
     int bytes = (int) sizeof(GbSmem<HD>);
     if constexpr ((VAR & GW_ONE) != 0) {
         bytes = 64 * 1024;  // over half of the SM's shared memory
@@ -1492,6 +1509,10 @@ int launch_attn(const legion_qsa_attn & p, cudaStream_t st) {
         }
         const int gb = p.mma_kernel == 1 ? 0 : use_gb<HD>(p.mma_kernel);
         if (gb == 3) {
+            if (p.codes != nullptr && !p.gw_cg) {
+                const int r = launch_gw_variant<HD, GW_CA, true>(p, st);
+                return r == 0 ? CODES_WRITTEN : r;
+            }
             return p.gw_cg ? launch_gw_variant<HD, 0>(p, st) : launch_gw_variant<HD, GW_CA>(p, st);
         }
         if (gb != 0) {
@@ -1874,11 +1895,18 @@ int legion_qsa_attn_launch(const legion_qsa_attn * p, void * stream) {
             default: return 1;
         }
     }
+    int r = 1;
     switch (p->head_dim) {
-        case 128: return launch_attn<128>(*p, (cudaStream_t) stream);
-        case 256: return launch_attn<256>(*p, (cudaStream_t) stream);
-        default: return 1;
+        case 128: r = launch_attn<128>(*p, (cudaStream_t) stream); break;
+        case 256: r = launch_attn<256>(*p, (cudaStream_t) stream); break;
+        default: break;
     }
+    // With codes asked for: 0 where attn_gw_kernel wrote them, 3 where a kernel wrote the
+    // output instead.
+    if (r == CODES_WRITTEN) {
+        return 0;
+    }
+    return r == 0 && p->codes != nullptr ? 3 : r;
 }
 
 int legion_qsa_topk_launch(const legion_qsa_topk * p, void * stream) {

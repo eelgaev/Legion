@@ -261,6 +261,15 @@ fn tokens(dst: &ffi::ggml_tensor) -> i64 {
     dst.ne[0] / (bf + k + 4)
 }
 
+/// [`gate`]'s value on the CPU: `sigmoid(x) * g`, or (`silu`) `silu(x) * g`. Also the CPU
+/// reference of the ops that gate and quantize their own output
+/// ([`crate::model::qwen4::qsa_attn::gated_codes`]).
+pub(crate) fn gated_host(x: f32, g: f32, silu: bool) -> f32 {
+    let e = 1.0 + (-x).exp();
+    let a = if silu { x / e } else { 1.0 / e };
+    a * g
+}
+
 /// One token's activation row (`k` values) as the chain computes it on the CPU.
 unsafe fn cpu_row(dst: &ffi::ggml_tensor, t: usize, row: &mut [f32]) {
     let p = crate::ggml::external_params(dst);
@@ -297,9 +306,7 @@ unsafe fn cpu_row(dst: &ffi::ggml_tensor, t: usize, row: &mut [f32]) {
             let gp = (g.data as *const u8).add(t * g.nb[1]) as *const f32;
             for (i, v) in row.iter_mut().enumerate() {
                 let xv = *xp.add(t * x_ld + (i / d) * x_hd + i % d);
-                let e = 1.0 + (-xv).exp();
-                let a = if silu { xv / e } else { 1.0 / e };
-                *v = a * *gp.add(i);
+                *v = gated_host(xv, *gp.add(i), silu);
             }
         } else {
             assert_eq!(kind, Kind::GatedNorm as i32, "fp8_act: kind {kind}");
@@ -539,6 +546,45 @@ pub(crate) unsafe fn quantize_plain(
         1 => None,
         r => Some(r),
     }
+}
+
+/// [`gate`]'s CUDA kernel on device pointers: the packed activations (`out` the `k * n` codes,
+/// `scales` the `n` F32 scales) of `sigmoid(x) * g` (`silu`: `silu(x) * g`), with element `i`
+/// of token `t` of `x` at `x + t * x_ld + (i / d) * x_hd + i % d` and of `g` at
+/// `g + t * g_ld + i` (strides in floats). The launch's result (0 on success; 1: a shape the
+/// kernel does not take).
+///
+/// # Safety
+/// Device pointers on the stream's device, sized as documented.
+#[cfg(feature = "cuda")]
+pub(crate) unsafe fn gate_raw(
+    (x, x_hd, x_ld, d): (*const f32, i64, i64, i32),
+    (g, g_ld): (*const f32, i64),
+    out: *mut u8,
+    scales: *mut f32,
+    (k, n): (i64, i64),
+    silu: bool,
+    stream: *mut c_void,
+) -> i32 {
+    if k > MAX_K || n > i32::MAX as i64 {
+        return 1;
+    }
+    let p = Fp8Act {
+        x,
+        x_ld,
+        x_hd,
+        d,
+        g,
+        g_ld,
+        out,
+        scales,
+        k: k as i32,
+        n: n as i32,
+        silu: i32::from(silu),
+        ..Fp8Act::of(Kind::Gate as i32)
+    };
+    // SAFETY: the caller's pointers, as documented.
+    unsafe { legion_fp8_act_launch(&p, stream) }
 }
 
 #[cfg(feature = "cuda")]
