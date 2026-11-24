@@ -392,9 +392,10 @@ __device__ __forceinline__ void cp_async16_l1(void * smem, const void * gmem, bo
 // node_fuse turned off: rms_norm_f32<256, true> (a row's squares summed per 32 columns by a
 // warp's butterfly, the 8 sums by a second butterfly with ggml's zero lanes dropped: x + 0 is
 // x; mean = sum / ncols, rsqrtf(mean + eps), scale * x * w) and rope_multi (qn_rope_cs and
-// qn_value: the pair (i, i + n_dims / 2) rotated by the cos and sin of the position of i's
-// section, the columns past n_dims as the norm left them). The tables live in S.s until the
-// first chunk's scores.
+// qn_column: the pair (i, i + n_dims / 2) rotated by the cos and sin of the position of i's
+// section, the columns past n_dims as the norm left them). The tables live in S.s and the
+// values, made once each into a q tile, in S.v until the first chunk (whose V is issued after
+// the fragments are built: still before its scores).
 
 // warp_reduce_sum's butterfly over `width` lanes (offsets width / 2 down to 1).
 template <int WIDTH>
@@ -446,24 +447,42 @@ __device__ __forceinline__ void qn_rope_cs(const legion_qsa_attn & p, int tok, i
     s = sinf(theta) * p.qn_attn_factor;
 }
 
-// Column d of a head's row xr after the norm (scale sc, weight w) and the RoPE (cos / sin of
-// pair i at cs[i] / cs[HD / 2 + i]).
-template <int HD>
-__device__ __forceinline__ float qn_value(const float * xr, const float * w, float sc,
-                                          const float * cs, int n_dims, int d) {
-    if (d >= n_dims) {
-        return sc * xr[d] * w[d];
-    }
+// Column d of every head (x: the raw values, in place; heads at or past g untouched) after the
+// norm (scales sc, weight w) and the RoPE (cos / sin of pair i at cs[i] / cs[HD / 2 + i]; the
+// pair's other raw column read from the tile qt, rows of QT floats), qm their largest |value|.
+// rope_multi's pair (i, i + n_dims / 2): x0 = norm(i), x1 = norm(i + n_dims / 2), column i is
+// x0 cos - x1 sin and column i + n_dims / 2 is x0 sin + x1 cos; past n_dims, the norm's value.
+template <int HD, int ROWS_, int QT>
+__device__ __forceinline__ void qn_column(float (&x)[ROWS_], int g, const float * w,
+                                          const float * sc, const float * cs, const float * qt,
+                                          int n_dims, int d, float & qm) {
     const int half = n_dims / 2;
-    const int i = d < half ? d : d - half;
-    const float x0 = sc * xr[i] * w[i];
-    const float x1 = sc * xr[i + half] * w[i + half];
-    const float cos_theta = cs[i];
-    const float sin_theta = cs[HD / 2 + i];
-    if (d < half) {
-        return x0 * cos_theta - x1 * sin_theta;
+    const bool rot = d < n_dims, lo = d < half;
+    const int dp = lo ? d + half : d - half;  // the pair's other column (rot)
+    const int i = lo ? d : dp;
+    const float wd = w[d];
+    const float wp = rot ? w[dp] : 0.0f;
+    const float cos_theta = rot ? cs[i] : 0.0f;
+    const float sin_theta = rot ? cs[HD / 2 + i] : 0.0f;
+#pragma unroll
+    for (int h = 0; h < ROWS_; ++h) {
+        if (h < g) {
+            float v;
+            if (!rot) {
+                v = sc[h] * x[h] * wd;
+            } else if (lo) {
+                const float x0 = sc[h] * x[h] * wd;
+                const float x1 = sc[h] * qt[h * QT + dp] * wp;
+                v = x0 * cos_theta - x1 * sin_theta;
+            } else {
+                const float x0 = sc[h] * qt[h * QT + dp] * wp;
+                const float x1 = sc[h] * x[h] * wd;
+                v = x0 * sin_theta + x1 * cos_theta;
+            }
+            x[h] = v;
+            qm = fmaxf(qm, fabsf(v));
+        }
     }
-    return x0 * sin_theta + x1 * cos_theta;
 }
 
 template <int HD, int VAR, bool CODES = false, bool QN = false>
@@ -536,67 +555,90 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
         cp_async_commit();
     };
     int pos_n = -1;  // the next chunk's positions
+    [[maybe_unused]] int cell_0 = -1;  // QN: the first chunk's V comes after the q tile
     if (n > 0) {
         const int cell0 = cell_of(pos_at(0));
         issue_k(cell0);
-        issue_v(cell0);
+        if constexpr (QN) {
+            cell_0 = cell0;
+        } else {
+            issue_v(cell0);
+        }
         pos_n = pos_at(MCH);
     }
 
-    // QN: the norm's scale per head and the RoPE's cos / sin per pair, in S.s (no chunk's
-    // scores are written before the barrier after the fragments).
+    // QN: the norm's scale per head and the RoPE's cos / sin per pair in S.s (no chunk's scores
+    // are written before the barrier after the fragments), the q tile in S.v (the first chunk's
+    // V is issued after that barrier). Each value is made once: thread t takes columns t and
+    // t + HD / 2 of every head (so warp w the 32-column segments w and w + NW, as ggml's warps).
     constexpr int QSEG = HD / 32;                  // a row's 32-column segments (ggml's warps)
+    constexpr int QT = GbSmem<HD>::R;              // floats per q tile row: conflict-free float2s
     [[maybe_unused]] float * const qn_seg = &S.s[0][0];              // [ROWS][QSEG]: the sums
     [[maybe_unused]] float * const qn_scale = qn_seg + ROWS * QSEG;  // [ROWS]
     [[maybe_unused]] float * const qn_cs = qn_scale + ROWS;  // [HD]: pair i's cos at i, sin at HD/2+i
+    [[maybe_unused]] float * const qn_t = reinterpret_cast<float *>(&S.v[0][0]);  // [ROWS][QT]
+    float qm = 0.0f;
     if constexpr (QN) {
         static_assert(HD == 256, "ggml's rms_norm block of 256 threads: one column each");
         static_assert(ROWS * QSEG + ROWS + HD <= ROWS * (MCH + 4), "the tables fit in S.s");
-        static_assert(ROWS == 4 * NW && QSEG == 8, "the second sums: 4 heads of 8 lanes per warp");
+        static_assert(ROWS == 4 * NW && QSEG == 2 * NW, "4 heads of 8 lanes per warp, 2 segments");
+        static_assert(2 * THREADS == HD, "two columns per thread");
+        static_assert(ROWS * QT * sizeof(float) <= sizeof(S.v), "the q tile fits in S.v");
         if (t < p.qn_rot / 2) {
             float c, sn;
             qn_rope_cs(p, tok, t, c, sn);
             qn_cs[t] = c;
             qn_cs[HD / 2 + t] = sn;
         }
-        for (int sg = warp; sg < G * QSEG; sg += NW) {
-            const int h = sg / QSEG, j = sg % QSEG;
-            const float xi = ((const float *) (qb + (size_t) h * p.q_nb1))[j * 32 + lane];
-            float tmp = 0.0f;
-            tmp += xi * xi;
-            tmp = qn_butterfly<32>(tmp);
-            if (lane == 0) {
-                qn_seg[h * QSEG + j] = tmp;
+        float xa[ROWS], xb[ROWS];  // columns t and t + HD / 2
+#pragma unroll
+        for (int h = 0; h < ROWS; ++h) {
+            const float * xr = (const float *) (qb + (size_t) h * p.q_nb1);
+            xa[h] = h < G ? xr[t] : 0.0f;
+            xb[h] = h < G ? xr[t + HD / 2] : 0.0f;
+        }
+#pragma unroll
+        for (int h = 0; h < ROWS; ++h) {
+            if (h < G) {
+                qn_t[h * QT + t] = xa[h];
+                qn_t[h * QT + t + HD / 2] = xb[h];
+                float ta = 0.0f, tb = 0.0f;
+                ta += xa[h] * xa[h];
+                tb += xb[h] * xb[h];
+                ta = qn_butterfly<32>(ta);
+                tb = qn_butterfly<32>(tb);
+                if (lane == 0) {
+                    qn_seg[h * QSEG + warp] = ta;
+                    qn_seg[h * QSEG + warp + NW] = tb;
+                }
             }
         }
         __syncthreads();
         // block_reduce's second butterfly: lanes 8-31 hold zeros there, so offsets 16 and 8
         // add +0 to lanes 0-7 (the sums are not -0), and 4, 2, 1 are these.
-        const int h = warp * 4 + lane / 8;
-        float v = h < G ? qn_seg[h * QSEG + lane % 8] : 0.0f;
-        v = qn_butterfly<8>(v);
-        if (lane % 8 == 0 && h < G) {
-            const float mean = v / p.head_dim;
-            qn_scale[h] = rsqrtf(mean + p.qn_eps);
+        {
+            const int h = warp * 4 + lane / 8;
+            float v = h < G ? qn_seg[h * QSEG + lane % 8] : 0.0f;
+            v = qn_butterfly<8>(v);
+            if (lane % 8 == 0 && h < G) {
+                const float mean = v / p.head_dim;
+                qn_scale[h] = rsqrtf(mean + p.qn_eps);
+            }
         }
         __syncthreads();
-    }
-    // Head h's value at column d.
-    auto q_at = [&](int h, int d) {
-        const float * xr = (const float *) (qb + (size_t) h * p.q_nb1);
-        if constexpr (QN) {
-            return qn_value<HD>(xr, p.qn_w, qn_scale[h], qn_cs, p.qn_rot, d);
-        } else {
-            return xr[d];
+        qn_column<HD, ROWS, QT>(xa, G, p.qn_w, qn_scale, qn_cs, qn_t, p.qn_rot, t, qm);
+        qn_column<HD, ROWS, QT>(xb, G, p.qn_w, qn_scale, qn_cs, qn_t, p.qn_rot, t + HD / 2, qm);
+        __syncthreads();  // every raw value read: the tile takes the final ones
+#pragma unroll
+        for (int h = 0; h < ROWS; ++h) {
+            if (h < G) {
+                qn_t[h * QT + t] = xa[h];
+                qn_t[h * QT + t + HD / 2] = xb[h];
+            }
         }
-    };
-
-    // q: as attn_gb_kernel.
-    float qm = 0.0f;
-    for (int i = t; i < G * HD; i += THREADS) {
-        if constexpr (QN) {
-            qm = fmaxf(qm, fabsf(q_at(i / HD, i % HD)));
-        } else {
+    } else {
+        // q: as attn_gb_kernel.
+        for (int i = t; i < G * HD; i += THREADS) {
             qm = fmaxf(qm,
                        fabsf(*(const float *) (qb + (size_t) (i / HD) * p.q_nb1 + (i % HD) * 4)));
         }
@@ -627,8 +669,11 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
             const int h = gid + 8 * (i & 1), d = ks * 16 + 2 * tig + 8 * (i >> 1);
             float x0, x1;
             if constexpr (QN) {
-                x0 = h < G ? q_at(h, d) * qup : 0.0f;
-                x1 = h < G ? q_at(h, d + 1) * qup : 0.0f;
+                // The tile's rows past G are not written.
+                const float2 q2 = h < G ? *reinterpret_cast<const float2 *>(&qn_t[h * QT + d])
+                                        : make_float2(0.0f, 0.0f);
+                x0 = h < G ? q2.x * qup : 0.0f;
+                x1 = h < G ? q2.y * qup : 0.0f;
             } else {
                 const float * qr = (const float *) (qb + (size_t) h * p.q_nb1) + d;
                 x0 = h < G ? qr[0] * qup : 0.0f;
@@ -643,7 +688,10 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
         }
     }
     if constexpr (QN) {
-        __syncthreads();  // every warp's fragments built: the scores may write S.s
+        __syncthreads();  // every warp's fragments built: the scores may write S.s, V S.v
+        if (n > 0) {
+            issue_v(cell_0);
+        }
     }
 
     float acc[NT][4];
