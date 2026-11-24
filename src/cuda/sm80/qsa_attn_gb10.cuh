@@ -386,8 +386,89 @@ __device__ __forceinline__ void cp_async16_l1(void * smem, const void * gmem, bo
 // token-major order (#1183 round 2, clusters of a token's kv heads) cost 15% more in the main
 // loop, its K/V reads sharing less of L2. The gate rows and the other heads' rows come into L2
 // a few chunks before the epilogue reads them.
-template <int HD, int VAR, bool CODES = false>
+//
+// QN (with CODES, #1183): q is the query before its head norm and RoPE (legion_qsa_attn's
+// qn_*), and the CTA makes each of its heads' values as ggml-cuda makes them in the nodes
+// node_fuse turned off: rms_norm_f32<256, true> (a row's squares summed per 32 columns by a
+// warp's butterfly, the 8 sums by a second butterfly with ggml's zero lanes dropped: x + 0 is
+// x; mean = sum / ncols, rsqrtf(mean + eps), scale * x * w) and rope_multi (qn_rope_cs and
+// qn_value: the pair (i, i + n_dims / 2) rotated by the cos and sin of the position of i's
+// section, the columns past n_dims as the norm left them). The tables live in S.s until the
+// first chunk's scores.
+
+// warp_reduce_sum's butterfly over `width` lanes (offsets width / 2 down to 1).
+template <int WIDTH>
+__device__ __forceinline__ float qn_butterfly(float x) {
+#pragma unroll
+    for (int o = WIDTH / 2; o > 0; o >>= 1) {
+        x += __shfl_xor_sync(0xffffffffu, x, o, 32);
+    }
+    return x;
+}
+
+// rope_multi's cos and sin of pair i (thread i0 = 2 i) of token `tok` (attn_factor applied),
+// as rope.cu computes them: theta_base / freq_factor (1), then rope_yarn with ext_factor 0.
+__device__ __forceinline__ void qn_rope_cs(const legion_qsa_attn & p, int tok, int i, float & c,
+                                           float & s) {
+    const int iw = 2 * i;
+    const int * sections = p.qn_sections;
+    const int32_t * pos = p.qn_pos + tok;
+    const int ne02 = p.qn_pos_n;
+    const int sect_dims = sections[0] + sections[1] + sections[2] + sections[3];
+    const int sec_w = sections[1] + sections[0];
+    const int sector = (iw / 2) % sect_dims;
+    float theta_base = 0.0;
+    if (p.qn_imrope) {
+        if (sector % 3 == 1 && sector < 3 * sections[1]) {
+            theta_base = pos[ne02 * 1] * powf(p.qn_theta_scale, iw / 2.0f);
+        } else if (sector % 3 == 2 && sector < 3 * sections[2]) {
+            theta_base = pos[ne02 * 2] * powf(p.qn_theta_scale, iw / 2.0f);
+        } else if (sector % 3 == 0 && sector < 3 * sections[0]) {
+            theta_base = pos[0] * powf(p.qn_theta_scale, iw / 2.0f);
+        } else {
+            theta_base = pos[ne02 * 3] * powf(p.qn_theta_scale, iw / 2.0f);
+        }
+    } else {
+        if (sector < sections[0]) {
+            theta_base = pos[0] * powf(p.qn_theta_scale, iw / 2.0f);
+        } else if (sector >= sections[0] && sector < sec_w) {
+            theta_base = pos[ne02 * 1] * powf(p.qn_theta_scale, iw / 2.0f);
+        } else if (sector >= sec_w && sector < sec_w + sections[2]) {
+            theta_base = pos[ne02 * 2] * powf(p.qn_theta_scale, iw / 2.0f);
+        } else if (sector >= sec_w + sections[2]) {
+            theta_base = pos[ne02 * 3] * powf(p.qn_theta_scale, iw / 2.0f);
+        }
+    }
+    const float freq_factor = 1.0f;
+    const float theta_extrap = theta_base / freq_factor;
+    const float theta = p.qn_freq_scale * theta_extrap;
+    c = cosf(theta) * p.qn_attn_factor;
+    s = sinf(theta) * p.qn_attn_factor;
+}
+
+// Column d of a head's row xr after the norm (scale sc, weight w) and the RoPE (cos / sin of
+// pair i at cs[i] / cs[HD / 2 + i]).
+template <int HD>
+__device__ __forceinline__ float qn_value(const float * xr, const float * w, float sc,
+                                          const float * cs, int n_dims, int d) {
+    if (d >= n_dims) {
+        return sc * xr[d] * w[d];
+    }
+    const int half = n_dims / 2;
+    const int i = d < half ? d : d - half;
+    const float x0 = sc * xr[i] * w[i];
+    const float x1 = sc * xr[i + half] * w[i + half];
+    const float cos_theta = cs[i];
+    const float sin_theta = cs[HD / 2 + i];
+    if (d < half) {
+        return x0 * cos_theta - x1 * sin_theta;
+    }
+    return x0 * sin_theta + x1 * cos_theta;
+}
+
+template <int HD, int VAR, bool CODES = false, bool QN = false>
 __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) {
+    static_assert(!QN || CODES, "the fold is the codes path's");
     extern __shared__ __align__(16) unsigned char smem_raw[];
     GbSmem<HD> & S = *reinterpret_cast<GbSmem<HD> *>(smem_raw);
     constexpr int NW = THREADS / 32;          // warps
@@ -462,10 +543,63 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
         pos_n = pos_at(MCH);
     }
 
+    // QN: the norm's scale per head and the RoPE's cos / sin per pair, in S.s (no chunk's
+    // scores are written before the barrier after the fragments).
+    constexpr int QSEG = HD / 32;                  // a row's 32-column segments (ggml's warps)
+    [[maybe_unused]] float * const qn_seg = &S.s[0][0];              // [ROWS][QSEG]: the sums
+    [[maybe_unused]] float * const qn_scale = qn_seg + ROWS * QSEG;  // [ROWS]
+    [[maybe_unused]] float * const qn_cs = qn_scale + ROWS;  // [HD]: pair i's cos at i, sin at HD/2+i
+    if constexpr (QN) {
+        static_assert(HD == 256, "ggml's rms_norm block of 256 threads: one column each");
+        static_assert(ROWS * QSEG + ROWS + HD <= ROWS * (MCH + 4), "the tables fit in S.s");
+        static_assert(ROWS == 4 * NW && QSEG == 8, "the second sums: 4 heads of 8 lanes per warp");
+        if (t < p.qn_rot / 2) {
+            float c, sn;
+            qn_rope_cs(p, tok, t, c, sn);
+            qn_cs[t] = c;
+            qn_cs[HD / 2 + t] = sn;
+        }
+        for (int sg = warp; sg < G * QSEG; sg += NW) {
+            const int h = sg / QSEG, j = sg % QSEG;
+            const float xi = ((const float *) (qb + (size_t) h * p.q_nb1))[j * 32 + lane];
+            float tmp = 0.0f;
+            tmp += xi * xi;
+            tmp = qn_butterfly<32>(tmp);
+            if (lane == 0) {
+                qn_seg[h * QSEG + j] = tmp;
+            }
+        }
+        __syncthreads();
+        // block_reduce's second butterfly: lanes 8-31 hold zeros there, so offsets 16 and 8
+        // add +0 to lanes 0-7 (the sums are not -0), and 4, 2, 1 are these.
+        const int h = warp * 4 + lane / 8;
+        float v = h < G ? qn_seg[h * QSEG + lane % 8] : 0.0f;
+        v = qn_butterfly<8>(v);
+        if (lane % 8 == 0 && h < G) {
+            const float mean = v / p.head_dim;
+            qn_scale[h] = rsqrtf(mean + p.qn_eps);
+        }
+        __syncthreads();
+    }
+    // Head h's value at column d.
+    auto q_at = [&](int h, int d) {
+        const float * xr = (const float *) (qb + (size_t) h * p.q_nb1);
+        if constexpr (QN) {
+            return qn_value<HD>(xr, p.qn_w, qn_scale[h], qn_cs, p.qn_rot, d);
+        } else {
+            return xr[d];
+        }
+    };
+
     // q: as attn_gb_kernel.
     float qm = 0.0f;
     for (int i = t; i < G * HD; i += THREADS) {
-        qm = fmaxf(qm, fabsf(*(const float *) (qb + (size_t) (i / HD) * p.q_nb1 + (i % HD) * 4)));
+        if constexpr (QN) {
+            qm = fmaxf(qm, fabsf(q_at(i / HD, i % HD)));
+        } else {
+            qm = fmaxf(qm,
+                       fabsf(*(const float *) (qb + (size_t) (i / HD) * p.q_nb1 + (i % HD) * 4)));
+        }
     }
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
@@ -491,9 +625,15 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             const int h = gid + 8 * (i & 1), d = ks * 16 + 2 * tig + 8 * (i >> 1);
-            const float * qr = (const float *) (qb + (size_t) h * p.q_nb1) + d;
-            const float x0 = h < G ? qr[0] * qup : 0.0f;
-            const float x1 = h < G ? qr[1] * qup : 0.0f;
+            float x0, x1;
+            if constexpr (QN) {
+                x0 = h < G ? q_at(h, d) * qup : 0.0f;
+                x1 = h < G ? q_at(h, d + 1) * qup : 0.0f;
+            } else {
+                const float * qr = (const float *) (qb + (size_t) h * p.q_nb1) + d;
+                x0 = h < G ? qr[0] * qup : 0.0f;
+                x1 = h < G ? qr[1] * qup : 0.0f;
+            }
             const __half h0 = __float2half_rn(x0), h1 = __float2half_rn(x1);
             const __half2 hi = __halves2half2(h0, h1);
             const __half2 lo = __halves2half2(__float2half_rn(x0 - __half2float(h0)),
@@ -501,6 +641,9 @@ __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) 
             qh[ks][i] = *reinterpret_cast<const uint32_t *>(&hi);
             ql[ks][i] = *reinterpret_cast<const uint32_t *>(&lo);
         }
+    }
+    if constexpr (QN) {
+        __syncthreads();  // every warp's fragments built: the scores may write S.s
     }
 
     float acc[NT][4];

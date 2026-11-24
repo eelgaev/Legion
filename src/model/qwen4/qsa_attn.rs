@@ -686,6 +686,140 @@ pub(crate) unsafe fn is_gated_codes(node: *const ffi::ggml_tensor) -> bool {
     unsafe { crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &ATTN_CODES)) }
 }
 
+/// The query's head norm and RoPE as ggml's nodes compute them (`rms_norm`, `mul` by the
+/// weight, `rope_multi` without frequency factors, `ext_factor` 0), for [`fold_q`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QNormRope {
+    /// The query before the norm: F32 `[d, n_head, tokens]`, columns contiguous.
+    pub raw: *mut ffi::ggml_tensor,
+    /// The norm's weight: F32 `[d]`.
+    pub w: *mut ffi::ggml_tensor,
+    /// The RoPE's positions: I32 `[4 * tokens]`.
+    pub pos: *mut ffi::ggml_tensor,
+    pub eps: f32,
+    pub n_dims: i32,
+    /// ggml's mrope sections, each at most 255.
+    pub sections: [i32; 4],
+    /// `GGML_ROPE_TYPE_IMROPE`, else `GGML_ROPE_TYPE_MROPE`.
+    pub imrope: bool,
+    pub freq_base: f32,
+    pub freq_scale: f32,
+    pub attn_factor: f32,
+    /// The attention's first token among `raw`'s (and the positions').
+    pub off: i32,
+}
+
+/// A [`gated_codes`] node's parameter 0 after [`fold_q`]: 1 (MROPE) or 2 (IMROPE); 0 before.
+const P_FOLD: usize = 0;
+
+/// Whether [`fold_q`] made `node` (a [`gated_codes`] node) read its query before the norm and
+/// RoPE.
+///
+/// # Safety
+/// `node` is a valid tensor.
+pub(crate) unsafe fn is_q_folded(node: *const ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's.
+    unsafe { is_gated_codes(node) && crate::ggml::external_params(&*node)[P_FOLD] != 0 }
+}
+
+/// Why [`fold_q`] does not take the [`gated_codes`] node `node` (`None`: it does): the fold is
+/// `attn_gw_kernel`'s codes path (the launcher's own pick on a compute capability 12.x GPU), at
+/// head size 256 over F16 K and V.
+///
+/// # Safety
+/// `node` is an allocated [`gated_codes`] node.
+pub(crate) unsafe fn fold_q_off(node: *const ffi::ggml_tensor) -> Option<&'static str> {
+    #[cfg(feature = "cuda")]
+    // SAFETY: the caller's.
+    unsafe {
+        let (q, k, v) = (&*(*node).src[0], &*(*node).src[1], &*(*node).src[2]);
+        if k.type_ != types::F16 || v.type_ != types::F16 {
+            return Some("a quantized KV cache (the fold reads F16 K and V)");
+        }
+        if q.ne[0] != 256 || !supported(q.ne[0], q.ne[1], k.ne[0] / q.ne[0]) {
+            return Some("head size not 256");
+        }
+        if prompt_kernel() != 0 {
+            return Some("a forced prompt kernel (LEGION_DEBUG_QSA_PROMPT_KERNEL)");
+        }
+        if gw_cg() {
+            return Some("LEGION_DEBUG_QSA_GW_L1=0");
+        }
+        let cc = crate::ggml::cuda_device_of(k).and_then(crate::hw::per_device::cc);
+        if cc.map(|c| c.0) != Some(12) {
+            return Some("not a compute capability 12.x GPU (the fold is attn_gw_kernel's)");
+        }
+        None
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = node;
+        Some("a build without CUDA")
+    }
+}
+
+/// Makes the [`gated_codes`] node `node` read its query before the head norm and RoPE `f`
+/// (`node_fuse`, after allocation, with ggml's nodes of them turned off): its kernel computes
+/// them as ggml-cuda does ([`fold_q_off`] says where).
+///
+/// # Safety
+/// `node` is a [`gated_codes`] node [`fold_q_off`] takes, `f`'s tensors valid and allocated, and
+/// `f` the chain whose output `node`'s query reads, `f.off` tokens in.
+pub(crate) unsafe fn fold_q(node: *mut ffi::ggml_tensor, f: &QNormRope) {
+    assert!(
+        f.sections.iter().all(|s| (0..256).contains(s)),
+        "qsa_attn_codes: RoPE sections {:?}",
+        f.sections
+    );
+    let packed = f
+        .sections
+        .iter()
+        .enumerate()
+        .fold(0u32, |a, (i, &s)| a | ((s as u32) << (8 * i)));
+    // SAFETY: the caller's.
+    unsafe {
+        let mut srcs: Vec<*mut ffi::ggml_tensor> = (0..6).map(|i| (*node).src[i]).collect();
+        srcs.extend([f.raw, f.w, f.pos]);
+        let params = [
+            1 + f.imrope as i32,
+            f.n_dims,
+            packed as i32,
+            f.eps.to_bits() as i32,
+            f.freq_base.to_bits() as i32,
+            f.freq_scale.to_bits() as i32,
+            f.attn_factor.to_bits() as i32,
+            f.off,
+        ];
+        crate::ggml::make_external(node, &ATTN_CODES, &srcs, &params);
+    }
+}
+
+/// [`fold_q`]'s parameters of a node, `None` where it did not fold the node's query.
+///
+/// # Safety
+/// `node` is a [`gated_codes`] node.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+unsafe fn folded(node: &ffi::ggml_tensor) -> Option<QNormRope> {
+    let p = crate::ggml::external_params(node);
+    if p[P_FOLD] == 0 {
+        return None;
+    }
+    let f = |i: usize| f32::from_bits(p[i] as u32);
+    Some(QNormRope {
+        raw: node.src[6],
+        w: node.src[7],
+        pos: node.src[8],
+        eps: f(3),
+        n_dims: p[1],
+        sections: std::array::from_fn(|i| (((p[2] as u32) >> (8 * i)) & 0xff) as i32),
+        imrope: p[P_FOLD] == 2,
+        freq_base: f(4),
+        freq_scale: f(5),
+        attn_factor: f(6),
+        off: p[7],
+    })
+}
+
 /// Where a [`gated_codes`] node's F32 rows start: after the packed activations (`total`
 /// bytes), aligned to 256 bytes. Then `tokens` rows of `d * n_head` values (attention's output
 /// or, on the GB10 kernel, the gated values of the CTAs that finish a token first), then the
@@ -1379,6 +1513,11 @@ impl CodesOperands {
 unsafe fn cpu_attn_codes(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
     // SAFETY: called by ggml for a node made by `gated_codes`, with host tensors.
     unsafe {
+        // `fold_q` takes CUDA nodes only.
+        assert!(
+            crate::ggml::external_params(dst)[P_FOLD] == 0,
+            "qsa_attn_codes: a folded query on the CPU"
+        );
         let c = CodesOperands::of(dst);
         let o = &c.attn;
         let (d, k, tokens) = (o.d, o.d * o.n_head, o.n_tok * o.n_seqs);
@@ -1493,6 +1632,21 @@ mod cuda {
         pub codes: *mut u8,
         pub scales: *mut f32,
         pub sync: *mut u32,
+        /// [`super::fold_q`] (null: off): `q` is the query before its head norm (weight `qn_w`)
+        /// and RoPE (positions `qn_pos`, section `s` of token `t` at `t + s * qn_pos_n`), which
+        /// the GB10 kernel computes as ggml-cuda does.
+        pub qn_w: *const f32,
+        pub qn_pos: *const i32,
+        pub qn_pos_n: i32,
+        pub qn_eps: f32,
+        pub qn_rot: i32,
+        pub qn_sections: [i32; 4],
+        pub qn_imrope: i32,
+        pub qn_freq_base: f32,
+        pub qn_freq_scale: f32,
+        pub qn_attn_factor: f32,
+        /// Set by the launcher.
+        pub qn_theta_scale: f32,
     }
 
     #[repr(C)]
@@ -1762,6 +1916,28 @@ unsafe fn cuda_attn_codes(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
     p.codes = c.codes;
     p.scales = c.scales;
     p.sync = c.sync;
+    // SAFETY: a `gated_codes` node; `fold_q`'s tensors are the node's, allocated.
+    if let Some(f) = unsafe { folded(dst) } {
+        // SAFETY: `fold_q`'s sources: the query before the norm (`f.off` tokens in, as the
+        // attention's query viewed the RoPE's output), the weight and the positions.
+        unsafe {
+            let (raw, pos) = (&*f.raw, &*f.pos);
+            p.q = (raw.data as *const u8).add(f.off as usize * raw.nb[2]) as *const f32;
+            p.q_nb1 = raw.nb[1] as i64;
+            p.q_nb2 = raw.nb[2] as i64;
+            p.q_nb3 = (raw.nb[2] * o.n_tok) as i64;
+            p.qn_w = (*f.w).data as *const f32;
+            p.qn_pos = (pos.data as *const i32).add(f.off as usize);
+            p.qn_pos_n = (pos.ne[0] / 4) as i32;
+        }
+        p.qn_eps = f.eps;
+        p.qn_rot = f.n_dims;
+        p.qn_sections = f.sections;
+        p.qn_imrope = f.imrope as i32;
+        p.qn_freq_base = f.freq_base;
+        p.qn_freq_scale = f.freq_scale;
+        p.qn_attn_factor = f.attn_factor;
+    }
     // SAFETY: the node's counters, `codes_sync(tokens)` bytes.
     let e = unsafe { cuda::cudaMemsetAsync(c.sync as *mut c_void, 0, codes_sync(tokens), stream) };
     if e != 0 {
@@ -1865,6 +2041,17 @@ fn attn_params(o: &Operands) -> Result<cuda::Attn, String> {
         codes: std::ptr::null_mut(),
         scales: std::ptr::null_mut(),
         sync: std::ptr::null_mut(),
+        qn_w: std::ptr::null(),
+        qn_pos: std::ptr::null(),
+        qn_pos_n: 0,
+        qn_eps: 0.0,
+        qn_rot: 0,
+        qn_sections: [0; 4],
+        qn_imrope: 0,
+        qn_freq_base: 0.0,
+        qn_freq_scale: 0.0,
+        qn_attn_factor: 0.0,
+        qn_theta_scale: 0.0,
     };
     Ok(p)
 }
@@ -1875,6 +2062,8 @@ pub mod bench;
 mod codes_tests;
 #[cfg(all(test, feature = "cuda"))]
 mod decode_tests;
+#[cfg(test)]
+mod fold_tests;
 #[cfg(test)]
 mod quant_tests;
 pub mod sel_dump;

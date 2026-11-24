@@ -630,6 +630,47 @@ impl Context {
     }
 }
 
+/// [`Tensor::cuda_device`] of a raw tensor (a graph's node, after allocation).
+///
+/// # Safety
+/// `t` is a live tensor; its `view_src` is null or a live tensor.
+pub(crate) unsafe fn cuda_device_of(t: *const ffi::ggml_tensor) -> Option<usize> {
+    // SAFETY: the caller's.
+    let buffer = unsafe {
+        let t = &*t;
+        if t.buffer.is_null() && !t.view_src.is_null() {
+            (*t.view_src).buffer
+        } else {
+            t.buffer
+        }
+    };
+    if buffer.is_null() {
+        return None;
+    }
+    // SAFETY: a non-null `buffer` is a live buffer; its type and device are static
+    // descriptors and the device name a NUL-terminated string they own.
+    let name = unsafe {
+        let buft = ffi::ggml_backend_buffer_get_type(buffer);
+        if buft.is_null() {
+            return None;
+        }
+        let dev = ffi::ggml_backend_buft_get_device(buft);
+        if dev.is_null() {
+            return None;
+        }
+        let name = ffi::ggml_backend_dev_name(dev);
+        if name.is_null() {
+            return None;
+        }
+        std::ffi::CStr::from_ptr(name)
+    };
+    let digits = name.to_bytes().strip_prefix(b"CUDA")?;
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(digits).ok()?.parse().ok()
+}
+
 /// A tensor (metadata in a [`Context`]; data in a buffer that context owns).
 #[derive(Clone, Copy)]
 pub struct Tensor<'a> {
@@ -808,40 +849,8 @@ impl<'a> Tensor<'a> {
     /// not placed yet answers for the tensor it views (its memory is that tensor's). No driver
     /// call: three ggml queries and the name.
     pub fn cuda_device(self) -> Option<usize> {
-        // SAFETY: a live tensor; `view_src` is null or a live tensor of the same context.
-        let buffer = unsafe {
-            let t = &*self.raw();
-            if t.buffer.is_null() && !t.view_src.is_null() {
-                (*t.view_src).buffer
-            } else {
-                t.buffer
-            }
-        };
-        if buffer.is_null() {
-            return None;
-        }
-        // SAFETY: a non-null `buffer` is a live buffer; its type and device are static
-        // descriptors and the device name a NUL-terminated string they own.
-        let name = unsafe {
-            let buft = ffi::ggml_backend_buffer_get_type(buffer);
-            if buft.is_null() {
-                return None;
-            }
-            let dev = ffi::ggml_backend_buft_get_device(buft);
-            if dev.is_null() {
-                return None;
-            }
-            let name = ffi::ggml_backend_dev_name(dev);
-            if name.is_null() {
-                return None;
-            }
-            std::ffi::CStr::from_ptr(name)
-        };
-        let digits = name.to_bytes().strip_prefix(b"CUDA")?;
-        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
-            return None;
-        }
-        std::str::from_utf8(digits).ok()?.parse().ok()
+        // SAFETY: a live tensor.
+        unsafe { cuda_device_of(self.raw()) }
     }
 
     /// The tensor's memory as a mutable byte slice, or `None` if it has no memory yet or lives

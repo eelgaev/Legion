@@ -25,6 +25,10 @@
 //!   values to BF16 (ggml's `cpy`, which the BF16 projections read) itself, rounded as
 //!   ggml-cuda's copy rounds them, into the cast's memory, and skips its F32 values where only
 //!   the cast reads them (#1183): a copy kernel per mixer gone ([`Graph::mix_cast`]).
+//! - qwen4exp's gated prompt attention (`--dense-fp8-prompt`, on a compute capability 12.x GPU)
+//!   makes its query's head norm and RoPE itself from the projection's rows, as ggml-cuda's
+//!   `rms_norm` and `rope_multi` kernels make them: two kernels per layer gone
+//!   ([`Graph::q_norm_rope`], #1183).
 //!
 //! An op runs at the position of the chain's last node, into that node's memory; the chain's
 //! other nodes become `GGML_OP_NONE`. An op reading a tensor later than the chain did is only
@@ -122,6 +126,9 @@ pub(crate) struct Counts {
     /// #1183): the prompt attention ops that gate and quantize their output
     /// ([`crate::model::qwen4::qsa_attn::gated_codes`]). Counted, not rewritten.
     pub fp8_codes: usize,
+    /// Of those, the ones that make their query's head norm and RoPE themselves, ggml's three
+    /// nodes of them turned off ([`Graph::q_norm_rope`], #1183).
+    pub q_norm_rope: usize,
     /// The same for the gated DeltaNet delta rule ops that norm their output and write the
     /// ssm_out projection's codes ([`crate::model::core::gdn_mma::codes_on`]). Counted, not
     /// rewritten.
@@ -203,6 +210,7 @@ unsafe fn fuse(graph: *mut ffi::ggml_cgraph) {
             gather_mix = c.gather_mix,
             gather_cast = c.gather_cast,
             fp8_codes = c.fp8_codes,
+            q_norm_rope = c.q_norm_rope,
             gdn_codes = c.gdn_codes,
             shexp_codes = c.shexp_codes,
             norm_rope = c.norm_rope,
@@ -236,6 +244,9 @@ pub(crate) unsafe fn rewrite_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> 
                 ffi::ggml_op_GGML_OP_CUSTOM => {
                     if crate::model::qwen4::qsa_attn::is_gated_codes(g.nodes[i]) {
                         c.fp8_codes += 1;
+                        if cuda {
+                            g.q_norm_rope(i, &mut c);
+                        }
                     }
                     if super::gdn_mma::is_codes(g.nodes[i]) {
                         c.gdn_codes += 1;
@@ -1108,7 +1119,188 @@ impl Graph {
             }
         }
     }
+
+    /// The query's head norm and RoPE of the gated prompt attention at `at` (qwen4exp under
+    /// `--dense-fp8-prompt`, [`crate::model::qwen4::qsa_attn::gated_codes`]) on CUDA: where its
+    /// query is ggml's `rms_norm`, `mul` by the weight and `rope_multi` of the projection's
+    /// rows, read by nothing else, the attention kernel makes those values itself from the
+    /// rows, as ggml-cuda's kernels make them ([`crate::model::qwen4::qsa_attn::fold_q`]), and
+    /// the three nodes become `GGML_OP_NONE` (#1183). Why it does not, logged once.
+    ///
+    /// # Safety
+    /// `at` is a node index.
+    unsafe fn q_norm_rope(&mut self, at: usize, c: &mut Counts) {
+        use crate::model::qwen4::qsa_attn;
+        // SAFETY: the caller's.
+        unsafe {
+            if qsa_attn::is_q_folded(self.nodes[at]) {
+                return;
+            }
+            match self.match_q_norm_rope(at) {
+                Ok((f, none)) => {
+                    qsa_attn::fold_q(self.nodes[at], &f);
+                    for i in none {
+                        (*self.nodes[i]).op = ffi::ggml_op_GGML_OP_NONE;
+                        self.none[i] = true;
+                    }
+                    c.q_norm_rope += 1;
+                }
+                Err(why) => {
+                    if !Q_NORM_ROPE_LOGGED.swap(true, Ordering::Relaxed) {
+                        tracing::info!(
+                            "QSA attention: the query's norm and RoPE stay ggml's nodes (logged \
+                             once): {why}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`Self::q_norm_rope`]'s chain at `at`: the fold and the nodes it turns off, or why not.
+    ///
+    /// # Safety
+    /// `at` is a node index of a gated prompt attention.
+    unsafe fn match_q_norm_rope(
+        &self,
+        at: usize,
+    ) -> Result<(crate::model::qwen4::qsa_attn::QNormRope, [usize; 3]), &'static str> {
+        use crate::model::qwen4::qsa_attn;
+        // SAFETY: the caller's; nodes and sources are valid tensors of the graph.
+        unsafe {
+            let attn = self.nodes[at];
+            if let Some(why) = qsa_attn::fold_q_off(attn) {
+                return Err(why);
+            }
+            let q = (*attn).src[0];
+            let mut rope = q;
+            while is_view_op((*rope).op) && !(*rope).src[0].is_null() {
+                rope = (*rope).src[0];
+            }
+            let idx = |t: Node| self.index.get(&(t as usize)).copied().filter(|&i| i < at);
+            let is = |t: Node, op: ffi::ggml_op| !t.is_null() && (*t).op == op;
+            if !is(rope, ffi::ggml_op_GGML_OP_ROPE) || root(q) != rope {
+                return Err("the query is not a RoPE's output");
+            }
+            let mul = (*rope).src[0];
+            let rms = if is(mul, ffi::ggml_op_GGML_OP_MUL) {
+                (*mul).src[0]
+            } else {
+                std::ptr::null_mut()
+            };
+            if !is(rms, ffi::ggml_op_GGML_OP_RMS_NORM) {
+                return Err("the RoPE's input is not an rms_norm times a weight");
+            }
+            let (Some(ri), Some(mi), Some(oi)) = (idx(rope), idx(mul), idx(rms)) else {
+                return Err("the chain's nodes are not the graph's");
+            };
+            if self.none[ri] || self.none[mi] || self.none[oi] {
+                return Err("the chain's nodes are rewritten already");
+            }
+            let (raw, w, pos) = ((*rms).src[0], (*mul).src[1], (*rope).src[1]);
+            let f32 = ffi::ggml_type_GGML_TYPE_F32;
+            let ne = (*rope).ne;
+            let d = ne[0];
+            // The RoPE: rope_multi forward, as qwen4exp builds it (no frequency factors, no
+            // YaRN, no offset), into a tensor of its own.
+            let p = &(*rope).op_params;
+            let pf = |i: usize| f32::from_bits(p[i] as u32);
+            let (n_dims, mode) = (p[1], p[2]);
+            let sections = [p[11], p[12], p[13], p[14]];
+            if (*rope).type_ != f32
+                || !(*rope).view_src.is_null()
+                || !ffi::ggml_is_contiguous(rope)
+                || ne[3] != 1
+                || !(*rope).src[2].is_null()
+                || (mode != super::ROPE_IMROPE && mode != 8)
+                || p[15] != 0
+                || pf(7) != 0.0
+                || n_dims <= 0
+                || n_dims % 2 != 0
+                || i64::from(n_dims) > d
+                || !sections.iter().all(|s| (0..256).contains(s))
+                || sections.iter().sum::<i32>() == 0
+            {
+                return Err("not rope_multi (IMROPE / MROPE, no frequency factors or YaRN)");
+            }
+            if pos.is_null()
+                || (*pos).type_ != ffi::ggml_type_GGML_TYPE_I32
+                || (*pos).data.is_null()
+                || !ffi::ggml_is_contiguous(pos)
+                || (*pos).ne != [4 * ne[2], 1, 1, 1]
+            {
+                return Err("the RoPE's positions are not 4 per token");
+            }
+            // The norm times the weight: of the query rows (columns contiguous), a weight of
+            // a row's size.
+            if (*mul).type_ != f32
+                || !(*mul).view_src.is_null()
+                || (*mul).ne != ne
+                || (*rms).type_ != f32
+                || !(*rms).view_src.is_null()
+                || (*rms).ne != ne
+                || raw.is_null()
+                || (*raw).type_ != f32
+                || (*raw).data.is_null()
+                || (*raw).ne != ne
+                || (*raw).nb[0] != 4
+                || w.is_null()
+                || (*w).type_ != f32
+                || (*w).data.is_null()
+                || (*w).ne != [d, 1, 1, 1]
+                || (*w).nb[0] != 4
+            {
+                return Err("the norm is not of the query rows times a weight of a row");
+            }
+            // The attention's query: tokens `off..` of the RoPE's output, viewed as they lie.
+            let (qt, rt) = (&*q, &*rope);
+            let bytes = (qt.data as usize).wrapping_sub(rt.data as usize);
+            let off = bytes / rt.nb[2];
+            if qt.data.is_null()
+                || (qt.data as usize) < (rt.data as usize)
+                || bytes % rt.nb[2] != 0
+                || qt.ne[0] != d
+                || qt.ne[1] != ne[1]
+                || qt.nb[..3] != rt.nb[..3]
+                || (qt.ne[3] != 1 && qt.nb[3] != qt.nb[2] * qt.ne[2] as usize)
+                || off as i64 + qt.ne[2] * qt.ne[3] > ne[2]
+            {
+                return Err("the query is not whole tokens of the RoPE's output");
+            }
+            if !self.only_read_by(rms, &[mi])
+                || !self.only_read_by(mul, &[ri])
+                || !self.only_read_by(rope, &[at])
+            {
+                return Err("the norm, the weight's product or the RoPE has other readers");
+            }
+            if !self.may_read_at(
+                at,
+                attn,
+                &[(raw, false), (w, false), (pos, false)],
+                &[oi, mi, ri],
+            ) {
+                return Err("the query rows' memory is reused before the attention");
+            }
+            let f = qsa_attn::QNormRope {
+                raw,
+                w,
+                pos,
+                eps: f32::from_bits((*rms).op_params[0] as u32),
+                n_dims,
+                sections,
+                imrope: mode == super::ROPE_IMROPE,
+                freq_base: pf(5),
+                freq_scale: pf(6),
+                attn_factor: pf(8),
+                off: off as i32,
+            };
+            Ok((f, [oi, mi, ri]))
+        }
+    }
 }
+
+/// Whether [`Graph::q_norm_rope`] said why it left a graph's chain.
+static Q_NORM_ROPE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 unsafe fn cpu_moe_sum_gate(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
     // SAFETY: a node made by the rewrite (see MOE_SUM_GATE), host tensors.

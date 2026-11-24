@@ -28,6 +28,8 @@ pub use backend::{
     Backend, BufferType, Device, DeviceKind, Event, LateInput, Launcher, backend_by_name,
     device_by_kind, devices, gpu_device,
 };
+#[cfg_attr(not(feature = "cuda"), allow(unused_imports))]
+pub(crate) use context::cuda_device_of;
 pub use context::{
     ComputeAllocator, Context, Graph, KeptGraph, KeptParts, SharedAllocator, Tensor, TensorSlot,
     mapped_tail_padding, set_fresh_plans,
