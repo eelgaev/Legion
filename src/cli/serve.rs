@@ -276,9 +276,11 @@ pub(super) struct ModelArgs {
     /// query/key/value and of the shared expert's gate/up each one GEMM as their BF16 weights
     /// are. No step then reads the BF16 weights, so they are not loaded: the dense projections
     /// take the copies' ~2.7 GiB only, about 2.7 GiB less than without --dense-fp8 (~5.4 GiB
-    /// less than --dense-fp8 alone; with --tp-rank, each rank's share of them). Aims at faster
-    /// prefill; moves the output further than --dense-fp8 alone. With --tp-rank, give every
-    /// rank both flags.
+    /// less than --dense-fp8 alone; with --tp-rank, each rank's share of them). The prompt
+    /// steps of qwen4exp models also take --ple-ops' two ops for the per-layer n-gram
+    /// embedding, and the MTP head's prompt take-ins one op for its input norms (the same bits
+    /// per op as ggml's nodes). Aims at faster prefill; moves the output further than
+    /// --dense-fp8 alone. With --tp-rank, give every rank both flags.
     #[arg(long, requires = "dense_fp8")]
     pub dense_fp8_prompt: bool,
     /// Where a MoE model's routed experts live with --device cuda: `auto` (VRAM if they fit,

@@ -51,9 +51,11 @@ pub use hc_up_mix::{
     set_gpu as set_up_mix_gpu, set_rebuild as set_up_mix_rebuild, set_up_mix, set_up_mix_bf16,
 };
 mod mtp;
+pub(crate) mod mtp_in;
 mod ple_ahead;
 pub(crate) use ple_ahead::PleAhead;
 mod ple_fused;
+pub(crate) use ple_fused::is_ple_conv;
 pub use ple_fused::set_fused_ple;
 mod ple_late;
 pub(crate) use ple_late::LateRows;
@@ -1620,7 +1622,8 @@ impl Model {
     /// in two launches per group instead of about thirty nodes), for prompt steps on a GPU:
     /// every group a prompt chunk (more than one token, not a verify), the weights and the
     /// histories in GPU memory, no tensors tapped. `None` where they do not fit or are off
-    /// (`--ple-ops`; ggml's chain).
+    /// (ggml's chain): on with `--ple-ops`, and with `--dense-fp8-prompt` (#1183: ~85 ms of
+    /// ggml's chain per 12,288-token step on a GB10, a step whose output moves anyway).
     fn ple_ops<'a>(
         &'a self,
         pass: &Pass<'a>,
@@ -1629,7 +1632,7 @@ impl Model {
         key: Tensor<'a>,
         value: Tensor<'a>,
     ) -> Result<Option<Tensor<'a>>, ModelError> {
-        if !ple_fused::fused_ple() {
+        if !(ple_fused::fused_ple() || self.dense_fp8_mode() == 3) {
             return Ok(None);
         }
         let ctx = pass.ctx;

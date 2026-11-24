@@ -139,16 +139,26 @@ impl Model {
             Some((rows, idx)) => ctx.set_rows(tok, rows, idx),
             None => tok,
         };
-        let hn = ctx.mul(
-            ctx.rms_norm(ctx.reshape_3d(h, e, hc, n), hp.rms_eps),
-            ctx.reshape_2d(w("nextn.hnorm.weight")?, e, hc),
-        );
-        let en = ctx.mul(ctx.rms_norm(tok, hp.rms_eps), w("nextn.enorm.weight")?);
-        let en = ctx.repeat_4d(ctx.reshape_3d(en, e, 1, n), [e, hc, n, 1]);
+        let (ge, gh) = (w("nextn.enorm.weight")?, w("nextn.hnorm.weight")?);
+        // A prompt's take-in under `--dense-fp8-prompt` (#1183): the norms, the repeat and the
+        // concat as one op with their bits ([`super::mtp_in`]); other passes keep the chain.
+        let fused = self.dense_fp8_mode() == 3
+            && !crate::model::core::dense_twins::takes_step(n)
+            && super::mtp_in::fits(tok, h, ge, gh, hc);
+        let cat = if fused {
+            super::mtp_in::input(ctx, tok, h, ge, gh, hc, hp.rms_eps)
+        } else {
+            let hn = ctx.mul(
+                ctx.rms_norm(ctx.reshape_3d(h, e, hc, n), hp.rms_eps),
+                ctx.reshape_2d(gh, e, hc),
+            );
+            let en = ctx.mul(ctx.rms_norm(tok, hp.rms_eps), ge);
+            let en = ctx.repeat_4d(ctx.reshape_3d(en, e, 1, n), [e, hc, n, 1]);
+            ctx.concat(en, hn, 0)
+        };
         // One matrix of `hc * n` columns: with the streams as a batch dimension (`ne[1] = hc`,
         // `ne[2] = n`) ggml ran a quantized mat-vec per token, which read the whole weight again
         // for each and took 92% of a prompt's take-in (17 ms for 1,024 tokens).
-        let cat = ctx.concat(en, hn, 0);
         let res = ctx.reshape_3d(
             ctx.mul_mat(
                 w("nextn.eh_proj.weight")?,

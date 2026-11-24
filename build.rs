@@ -313,6 +313,7 @@ fn build_cuda_kernels(ggml: &Path) {
         .file("src/cuda/decode_fuse.cu")
         .file("src/cuda/node_fuse.cu")
         .file("src/cuda/ple.cu")
+        .file("src/cuda/mtp_in.cu")
         .file("src/cuda/gdn_scan.cu")
         .file("src/cuda/gdn_mma.cu")
         .file("src/cuda/gdn.cu")

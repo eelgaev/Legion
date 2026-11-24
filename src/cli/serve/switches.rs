@@ -1116,7 +1116,8 @@ pub(in crate::cli) struct SwitchArgs {
     /// norms, causal conv, adds) as Legion's two ops instead of ggml's chain of about thirty
     /// nodes: ~10 ms less per 4,096-token chunk on the first pipeline stage of a V100. Each op
     /// gives the chain's bits, but the smaller graph can flip which MoE layers ggml-cuda fuses
-    /// the weighted expert sum in (FMA adds), so greedy output may change. Off by default.
+    /// the weighted expert sum in (FMA adds), so greedy output may change. Off by default; on
+    /// with --dense-fp8-prompt.
     #[arg(long, help_heading = HEADING)]
     ple_ops: bool,
     /// With an expert cache: the cache's work after a step or a draft pass (learning the

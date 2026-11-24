@@ -42,6 +42,16 @@ static PLE_CONV: ExternalOp = ExternalOp {
     cuda: None,
 };
 
+/// Whether `node` is a [`conv_out`] op, one per prompt group of a step that takes the PLE ops
+/// (counted on the node fuse log line).
+///
+/// # Safety
+/// `node` is a valid tensor.
+pub(crate) unsafe fn is_ple_conv(node: *const ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's.
+    unsafe { crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &PLE_CONV)) }
+}
+
 /// The streams the CUDA kernels take.
 pub(super) const PLE_HC: i64 = 4;
 /// The narrowest stream the CUDA kernels take (ggml-cuda's rms_norm takes 1,024 threads per

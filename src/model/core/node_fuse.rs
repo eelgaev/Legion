@@ -124,6 +124,13 @@ pub(crate) struct Counts {
     /// ssm_out projection's codes ([`crate::model::core::gdn_mma::codes_on`]). Counted, not
     /// rewritten.
     pub gdn_codes: usize,
+    /// qwen4exp's per-layer n-gram embedding as Legion's ops instead of ggml's chain of about
+    /// thirty nodes (`--ple-ops`, or prompt steps under `--dense-fp8-prompt`, #1183): one per
+    /// prompt group ([`crate::model::qwen4::is_ple_conv`]). Counted, not rewritten.
+    pub ple_ops: usize,
+    /// qwen4exp's MTP head input as one op instead of ggml's six nodes (prompt take-ins under
+    /// `--dense-fp8-prompt`, #1183; [`crate::model::qwen4::mtp_in`]). Counted, not rewritten.
+    pub mtp_in: usize,
     /// Nodes turned into `GGML_OP_NONE`.
     pub none: usize,
 }
@@ -131,9 +138,13 @@ pub(crate) struct Counts {
 /// Graphs whose rewrite was logged (the first few only).
 static LOGGED: AtomicUsize = AtomicUsize::new(0);
 
-/// Whether a graph with [`Counts::fp8_codes`] or [`Counts::gdn_codes`] was logged (the first
-/// one is, after the first few graphs too: prompt steps may come later).
+/// Whether a graph with [`Counts::fp8_codes`], [`Counts::gdn_codes`] or [`Counts::ple_ops`]
+/// was logged (the first one is, after the first few graphs too: prompt steps may come later).
 static CODES_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a graph with [`Counts::mtp_in`] was logged (the MTP head's take-ins are graphs of
+/// their own, after the first prompt step's).
+static MTP_IN_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// The pass on CUDA graphs ([`crate::ggml::post_alloc::set_rewrite`]). Then the CPU share's
 /// layers get their shared expert moved to run while the pool works
@@ -164,7 +175,9 @@ unsafe fn fuse(graph: *mut ffi::ggml_cgraph) {
     }
     // SAFETY: the caller's.
     let c = unsafe { rewrite_graph(graph, true) };
-    let first_codes = c.fp8_codes + c.gdn_codes > 0 && !CODES_LOGGED.swap(true, Ordering::Relaxed);
+    let first_codes = (c.fp8_codes + c.gdn_codes + c.ple_ops > 0
+        && !CODES_LOGGED.swap(true, Ordering::Relaxed))
+        | (c.mtp_in > 0 && !MTP_IN_LOGGED.swap(true, Ordering::Relaxed));
     if c != Counts::default() && (LOGGED.fetch_add(1, Ordering::Relaxed) < 4 || first_codes) {
         tracing::info!(
             sum_gate = c.sum_gate,
@@ -178,6 +191,8 @@ unsafe fn fuse(graph: *mut ffi::ggml_cgraph) {
             gather_cast = c.gather_cast,
             fp8_codes = c.fp8_codes,
             gdn_codes = c.gdn_codes,
+            ple_ops = c.ple_ops,
+            mtp_in = c.mtp_in,
             none = c.none,
             "node fuse: small ggml chains as Legion ops (the first graphs; --node-fuse-ggml off)"
         );
@@ -209,6 +224,12 @@ pub(crate) unsafe fn rewrite_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> 
                     }
                     if super::gdn_mma::is_codes(g.nodes[i]) {
                         c.gdn_codes += 1;
+                    }
+                    if crate::model::qwen4::is_ple_conv(g.nodes[i]) {
+                        c.ple_ops += 1;
+                    }
+                    if crate::model::qwen4::mtp_in::is_mtp_in(g.nodes[i]) {
+                        c.mtp_in += 1;
                     }
                     g.mix_cast(i, &mut c);
                     if cuda {

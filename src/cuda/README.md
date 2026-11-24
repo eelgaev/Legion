@@ -47,7 +47,9 @@ picks the schedule, gives the kernels their shared memory and launches them from
 `legion_gdn_mma_kernels` table. `gdn_scan.cu` is plain SIMT code that the Rust side picks on 7.x GPUs only (ggml's bits
 there). `deepseek41.cu` (DeepSeek-V4.1-Flash's own ops, `src/model/deepseek41/ops.rs`) is
 plain SIMT code too, kernels only: Rust launches them with `cudaLaunchKernel` from the
-`legion_ds4_kernels` table. `vision.cu` (the vision tower, `src/vision/gpu.rs`, #1195) is
+`legion_ds4_kernels` table. `mtp_in.cu` (qwen4exp's MTP head input of prompt take-ins,
+`src/model/qwen4/mtp_in.rs`, #1183) is plain SIMT code and kernels only the same way, from the
+`legion_mtp_in_kernels` table. `vision.cu` (the vision tower, `src/vision/gpu.rs`, #1195) is
 kernels only the same way, from the `legion_vision_kernels` table; its GEMM is WMMA, valid on
 every sm_70+ target. `q_small_m.cu` (GGUF-quantized matmuls of 2-8 tokens on a V100,
 #1210, `src/model/core/q_small_m.rs`) is kernels only too, launched from the
