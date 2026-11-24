@@ -303,3 +303,64 @@ fn fused_sum_zero_weight_rows(fma: i32) {
         }
     }
 }
+
+/// #1183: the op in its fused-sum form over BF16 rows (`fold`'s `fuse_tail` with
+/// `--nvfp4-expert-rows-bf16`) gives the bits it gives over the F32 copy of those rows, which
+/// is what the graph as built reads (the cast to F32 is exact).
+#[test]
+fn fused_sum_of_bf16_rows_is_the_f32_copys() {
+    let (e, k, n) = (16usize, 5usize, 3usize);
+    // Finite BF16 values (the top halves of F32 ones), and their exact F32 widening.
+    let bits: Vec<u16> = noise(e * k * n, 31)
+        .iter()
+        .map(|v| ((v * 300.0).to_bits() >> 16) as u16)
+        .collect();
+    let wide: Vec<f32> = bits
+        .iter()
+        .map(|&b| f32::from_bits(u32::from(b) << 16))
+        .collect();
+    let wv: Vec<f32> = noise(k * n, 32).iter().map(|v| v.abs() + 0.01).collect();
+    let shv = noise(e * n, 33);
+    let gv: Vec<f32> = noise(n, 34).iter().map(|v| v * 8.0).collect();
+    let run = |bf16: bool| {
+        let mut backend = Backend::cpu().unwrap();
+        backend.set_threads(2);
+        let ctx = Context::new(64, 64);
+        let ty = if bf16 { types::BF16 } else { types::F32 };
+        let experts = ctx
+            .new_tensor(ty, &[e as i64, k as i64, n as i64])
+            .as_input();
+        let w = ctx
+            .new_tensor(types::F32, &[1, k as i64, n as i64])
+            .as_input();
+        let sh = ctx.new_tensor(types::F32, &[e as i64, n as i64]).as_input();
+        let g = ctx.new_tensor(types::F32, &[1, n as i64]).as_input();
+        let out = ctx
+            .external_with(
+                &MOE_SUM_GATE,
+                types::F32,
+                [e as i64, n as i64, 1, 1],
+                &[experts, w, sh, g],
+                &[1, 1, k as i32, 1],
+            )
+            .as_output();
+        let mut graph = ctx.new_graph(64);
+        graph.expand(out);
+        ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+            .unwrap();
+        if bf16 {
+            let bytes: Vec<u8> = bits.iter().flat_map(|b| b.to_le_bytes()).collect();
+            experts.set_bytes(&bytes);
+        } else {
+            experts.set_f32(&wide);
+        }
+        w.set_f32(&wv);
+        sh.set_f32(&shv);
+        g.set_f32(&gv);
+        backend.compute(&graph).unwrap();
+        out.to_f32()
+    };
+    let (from16, from32) = (run(true), run(false));
+    assert!(from32.iter().all(|v| v.is_finite()));
+    assert!(same_bits(&from16, &from32), "{from16:?} vs {from32:?}");
+}

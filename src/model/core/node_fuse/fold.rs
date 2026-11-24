@@ -25,7 +25,9 @@
 //! rows of the experts the other ranks hold, which the grouped kernels stored as zeros). Where
 //! that op alone reads the experts' rows, nothing reads those rows at all, so the grouped NVFP4
 //! down matmul (and the SwiGLU on its plan that only it reads) stores no zeros for them
-//! ([`nvfp4_mm::unread_nodes`]); every value read is the same.
+//! ([`nvfp4_mm::unread_nodes`]); every value read is the same. With BF16 expert rows read back
+//! as F32 (`--nvfp4-expert-rows-bf16`, #1183) the op reads the BF16 rows and the exact cast
+//! goes, as the folded norms read them (not under `--tp-moe-ep`).
 //!
 //! Lazy streams (#1183, after the folds; `legion serve --no-hc-lazy-streams` turns them off):
 //! a layer's FFN mixer combine-and-norm makes the new residual streams `R_f = O_a · w + R_a`
@@ -342,15 +344,23 @@ impl Graph {
             let a = self.nodes[gt.add];
             let mut dead: Vec<usize> = (s.at..=s.last).collect();
             dead.extend(&gt.chain);
+            // Rows of zero weights skipped only under --tp-moe-ep, where they hold +0.0.
+            let ep = crate::model::core::tp_ep::active() && crate::model::core::tp_ep::skip();
+            let fma = if ep { FMA_SKIP } else { 1 };
+            // BF16 rows read back as F32 (`--nvfp4-expert-rows-bf16`, #1183): the op reads the
+            // BF16 rows (the cast is exact) and the cast goes too, as in `fold_tail` (not under
+            // --tp-moe-ep, whose unread rows are marked from the F32 rows' node below).
+            let (x, cast) = match (!ep).then(|| self.bf16_rows(s.experts, s.at)).flatten() {
+                Some((rows, i)) => (rows, Some(i)),
+                None => (s.experts, None),
+            };
+            dead.extend(cast);
             saved.push((a, std::ptr::read(a)));
             saved.extend(
                 dead.iter()
                     .map(|&i| (self.nodes[i], std::ptr::read(self.nodes[i]))),
             );
-            let srcs = [s.experts, s.weights, gt.sh, gt.g];
-            // Rows of zero weights skipped only under --tp-moe-ep, where they hold +0.0.
-            let ep = crate::model::core::tp_ep::active() && crate::model::core::tp_ep::skip();
-            let fma = if ep { FMA_SKIP } else { 1 };
+            let srcs = [x, s.weights, gt.sh, gt.g];
             if ep {
                 // Then nothing reads the other ranks' rows: the grouped kernels need not store
                 // their zeros (the experts' rows read by the tail's `mul` alone, so by the new
@@ -370,7 +380,7 @@ impl Graph {
                 }
             }
             make_external(a, &MOE_SUM_GATE, &srcs, &[1, 1, s.k as i32, fma]);
-            self.retire(&dead, root(s.experts));
+            self.retire(&dead, root(x));
             // The reduce-scatter reading the tail runs it, its values rounded to BF16 straight
             // into the send buffer (#1176; the graph is planned again after this rewrite).
             let rs = match *self.users(a) {

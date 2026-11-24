@@ -4678,6 +4678,17 @@ impl Model {
             "ffn_gate_inp_shexp.weight",
         ];
         let hq = self.share_q8(ctx, tap.on, il, &users, h);
+        // `--dense-fp8-prompt` (#1183): the shared expert's FP8 gate and up take their per-token
+        // codes from the BF16 cast of h, a BF16 mix (`linear::twin_codes`). That cast is made
+        // here, before the NVFP4 experts cast a reshape of h, so theirs is this one too
+        // ([`Context::cast_shared`]): one cast of h instead of two, the same values (one
+        // `__float2bfloat16` each), and the hyper-connection mix may write it itself.
+        if !tap.on
+            && crate::model::qwen4::is_bf16_mix(h)
+            && self.twin_prompt_reads(il, "ffn_gate_shexp.weight", h)
+        {
+            let _ = ctx.cast_shared(h, types::BF16);
+        }
         // The selection where `router_mv` made it with the logits.
         let mut routed = None;
         // Small steps: the router's and the shared expert's gate logits from one matmul (#256),
