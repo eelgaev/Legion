@@ -1509,7 +1509,9 @@ int launch_attn(const legion_qsa_attn & p, cudaStream_t st) {
         }
         const int gb = p.mma_kernel == 1 ? 0 : use_gb<HD>(p.mma_kernel);
         if (gb == 3) {
-            if (p.codes != nullptr && !p.gw_cg) {
+            // Codes only on the auto pick: a forced kernel (--qsa-mma-kernel) keeps the
+            // standalone gate, so A/B runs of the variants compare like with like.
+            if (p.codes != nullptr && !p.gw_cg && p.mma_kernel == 0) {
                 const int r = launch_gw_variant<HD, GW_CA, true>(p, st);
                 return r == 0 ? CODES_WRITTEN : r;
             }
