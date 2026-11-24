@@ -37,29 +37,51 @@ pub(crate) unsafe fn is_mtp_in(node: *const ffi::ggml_tensor) -> bool {
     unsafe { crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &MTP_IN)) }
 }
 
-/// Whether [`input`] takes these tensors: `tok` (`[e, n]`) and `h` (`[e · hc, n]`) F32 with
-/// contiguous rows, the gammas `ge` (`[e]`) and `gh` (`[e · hc]`) F32 and contiguous, all in GPU
-/// memory, `hc` the kernel's and `e` at least [`MTP_IN_MIN_E`].
-pub(super) fn fits(
+/// Why [`input`] does not take these tensors (the first reason found), `None` where it does:
+/// it takes `tok` (`[e, n]`) and `h` (`[e · hc, n]`) F32 with contiguous rows, the gammas `ge`
+/// (`[e]`) and `gh` (`[e · hc]`) F32 and contiguous, all in GPU memory, `hc` the kernel's and
+/// `e` at least [`MTP_IN_MIN_E`].
+pub(super) fn why_not(
     tok: Tensor<'_>,
     h: Tensor<'_>,
     ge: Tensor<'_>,
     gh: Tensor<'_>,
     hc: i64,
-) -> bool {
+) -> Option<String> {
     let on_gpu = |t: Tensor<'_>| !t.is_host() && !t.is_meta();
     let f32_rows = |t: Tensor<'_>| t.ty() == types::F32 && t.nb()[0] == 4;
     let [e, n, ..] = tok.ne();
-    cfg!(feature = "cuda")
-        && hc == MTP_IN_HC
-        && e >= MTP_IN_MIN_E
-        && h.ne()[..2] == [e * hc, n]
-        && ge.elements() == e as usize
-        && gh.elements() == (e * hc) as usize
-        && [tok, h].iter().all(|&t| f32_rows(t) && on_gpu(t))
-        && [ge, gh]
-            .iter()
-            .all(|&g| g.ty() == types::F32 && g.is_contiguous() && on_gpu(g))
+    let ty = |t: Tensor<'_>| crate::ggml::type_name(t.ty());
+    if !cfg!(feature = "cuda") {
+        Some("not a CUDA build".to_string())
+    } else if hc != MTP_IN_HC || e < MTP_IN_MIN_E {
+        Some(format!(
+            "{hc} streams of {e} (the kernel takes 4 of 1,024 or more)"
+        ))
+    } else if h.ne()[..2] != [e * hc, n] {
+        Some(format!(
+            "the streams are {:?} for {n} tokens of {e}",
+            h.ne()
+        ))
+    } else if let Some(t) = [tok, h].into_iter().find(|&t| !(f32_rows(t) && on_gpu(t))) {
+        Some(format!(
+            "{} is {} with strides {:?} (F32 rows in GPU memory wanted)",
+            t.name(),
+            ty(t),
+            t.nb()
+        ))
+    } else if let Some((g, len)) = [(ge, e), (gh, e * hc)].into_iter().find(|&(g, len)| {
+        !(g.ty() == types::F32 && g.is_contiguous() && g.elements() == len as usize && on_gpu(g))
+    }) {
+        Some(format!(
+            "{} is {} {:?} (contiguous F32 of {len} in GPU memory wanted)",
+            g.name(),
+            ty(g),
+            g.ne()
+        ))
+    } else {
+        None
+    }
 }
 
 /// `concat(repeat(rms_norm(tok) · ge, hc), rms_norm(h) · gh, 0)` for `n` tokens: `tok` (F32

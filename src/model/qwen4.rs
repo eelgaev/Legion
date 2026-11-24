@@ -71,7 +71,7 @@ pub mod tiny;
 mod tp_overlap;
 
 use std::ops::Range;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::ggml::{Context, Graph, Tensor, types};
 use crate::gguf::GgufFile;
@@ -671,6 +671,20 @@ fn ple_conv_time_major<'a>(
 }
 
 /// Tap `k` of the per-layer embedding's depthwise conv weight `w` as an F32 row of `width`.
+/// Whether [`Model::ple_ops`] said why it does not take a prompt step (once per process).
+static PLE_OPS_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Whether the MTP head said why its prompt take-ins keep ggml's input chain
+/// ([`mtp_in`]; once per process).
+static MTP_IN_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Logs once (per `flag`) that `what` is off for prompt steps, and `why`.
+fn off_once(flag: &AtomicBool, what: &str, why: &str) {
+    if !flag.swap(true, Ordering::Relaxed) {
+        tracing::info!("{what} off for prompt steps, ggml's chain instead: {why}");
+    }
+}
+
 fn ple_conv_tap<'a>(ctx: &'a Context, w: Tensor<'a>, k: i64, width: i64) -> Tensor<'a> {
     let wk = ctx.view_2d(w, [1, width], w.nb()[1], k as usize * w.nb()[0]);
     let wk = ctx.cont_2d(wk, width, 1);
@@ -1623,7 +1637,9 @@ impl Model {
     /// every group a prompt chunk (more than one token, not a verify), the weights and the
     /// histories in GPU memory, no tensors tapped. `None` where they do not fit or are off
     /// (ggml's chain): on with `--ple-ops`, and with `--dense-fp8-prompt` (#1183: ~85 ms of
-    /// ggml's chain per 12,288-token step on a GB10, a step whose output moves anyway).
+    /// ggml's chain per 12,288-token step on a GB10, a step whose output moves anyway). A BF16
+    /// conv weight (the NVFP4 checkpoints') is widened in the graph. The first prompt step that
+    /// keeps the chain logs why, once.
     fn ple_ops<'a>(
         &'a self,
         pass: &Pass<'a>,
@@ -1632,7 +1648,16 @@ impl Model {
         key: Tensor<'a>,
         value: Tensor<'a>,
     ) -> Result<Option<Tensor<'a>>, ModelError> {
+        // Decode and verify steps keep ggml's chain by design (not logged).
+        if !pass.groups().all(|(_, sh)| !sh.verify && sh.n_tok > 1) {
+            return Ok(None);
+        }
         if !(ple_fused::fused_ple() || self.dense_fp8_mode() == 3) {
+            off_once(
+                &PLE_OPS_OFF,
+                "PLE ops",
+                "neither --ple-ops nor --dense-fp8-prompt",
+            );
             return Ok(None);
         }
         let ctx = pass.ctx;
@@ -1648,32 +1673,66 @@ impl Model {
         let w = self.lw(il, "ple_conv1d.weight")?;
         let on_gpu = |t: Tensor<'_>| !t.is_host() && !t.is_meta();
         let f32_rows = |t: Tensor<'_>| t.ty() == types::F32 && t.nb()[0] == 4;
-        let groups_fit = pass.groups().all(|(_, sh)| !sh.verify && sh.n_tok > 1);
-        let states: Vec<_> = if groups_fit {
-            pass.groups()
-                .map(|(_, sh)| pass.rec.ple_slots(ctx, il, sh.slot, sh.n_seqs))
-                .collect()
-        } else {
-            Vec::new()
+        let states: Vec<_> = pass
+            .groups()
+            .map(|(_, sh)| pass.rec.ple_slots(ctx, il, sh.slot, sh.n_seqs))
+            .collect();
+        let weight_ok = |g: Tensor<'_>, bf16: bool| {
+            (g.ty() == types::F32 || (bf16 && g.ty() == types::BF16))
+                && g.is_contiguous()
+                && on_gpu(g)
         };
-        let fits = cfg!(feature = "cuda")
-            && !pass.tap.on
-            && hc == ple_fused::PLE_HC
-            && e >= ple_fused::PLE_MIN_E
-            && gammas
-                .iter()
-                .chain([&w])
-                .all(|&g| g.ty() == types::F32 && g.is_contiguous() && on_gpu(g))
-            && w.ne()[0] == ple.conv_kernel
-            && f32_rows(res)
-            && res.nb()[1] == e as usize * 4
-            && f32_rows(key)
-            && f32_rows(value)
-            && groups_fit
-            && states.iter().all(|&s| on_gpu(s));
-        if !fits {
+        // Why the ops do not take this step, the first reason found.
+        let why = if !cfg!(feature = "cuda") {
+            Some("not a CUDA build".to_string())
+        } else if pass.tap.on {
+            Some("tensors are tapped".to_string())
+        } else if hc != ple_fused::PLE_HC || e < ple_fused::PLE_MIN_E {
+            Some(format!(
+                "{hc} streams of {e} (the kernels take 4 of 1,024 or more)"
+            ))
+        } else if let Some(g) = gammas.iter().find(|&&g| !weight_ok(g, false)) {
+            Some(format!(
+                "{} is {} (contiguous F32 in GPU memory wanted)",
+                g.name(),
+                crate::ggml::type_name(g.ty())
+            ))
+        } else if !weight_ok(w, true) || w.ne()[0] != ple.conv_kernel {
+            Some(format!(
+                "{} is {} {:?} (contiguous F32 or BF16 [{}, e * hc] in GPU memory wanted)",
+                w.name(),
+                crate::ggml::type_name(w.ty()),
+                w.ne(),
+                ple.conv_kernel
+            ))
+        } else if !(f32_rows(res) && res.nb()[1] == e as usize * 4) {
+            Some(format!(
+                "the streams are {} with strides {:?}",
+                crate::ggml::type_name(res.ty()),
+                res.nb()
+            ))
+        } else if !(f32_rows(key) && f32_rows(value)) {
+            Some(format!(
+                "the key and value are {} and {}",
+                crate::ggml::type_name(key.ty()),
+                crate::ggml::type_name(value.ty())
+            ))
+        } else if !states.iter().all(|&s| on_gpu(s)) {
+            Some("the conv histories are not in GPU memory".to_string())
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            off_once(&PLE_OPS_OFF, "PLE ops", &why);
             return Ok(None);
         }
+        // The NVFP4 checkpoints ship the conv weight in BF16: widened in the graph, exactly
+        // (ggml's chain widens each tap the same way, `ple_conv_tap`).
+        let w = if w.ty() == types::BF16 {
+            ctx.cast(w, types::F32)
+        } else {
+            w
+        };
         let (xn, gate) = ple_fused::gate_norm(
             ctx,
             key,

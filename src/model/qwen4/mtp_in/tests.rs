@@ -95,9 +95,10 @@ fn mtp_in_matches_the_chain_on_the_cpu() {
 }
 
 #[test]
-fn fits_wants_the_kernels_shapes() {
+fn why_not_wants_the_kernels_shapes() {
     let ctx = Context::new(64, 0);
     let t = |shape: &[i64]| ctx.new_tensor(types::F32, shape);
+    let fits = |a, b, c, d, hc| why_not(a, b, c, d, hc).is_none();
     let (e, n) = (2560, 8);
     let ok = fits(t(&[e, n]), t(&[e * HC, n]), t(&[e]), t(&[e * HC]), HC);
     assert_eq!(ok, cfg!(feature = "cuda"));
