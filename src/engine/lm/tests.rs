@@ -1293,3 +1293,34 @@ fn only_big_steps_on_one_shared_memory_gpu_are_lean() {
     assert!(!lean_steps(true, 2, 1, 8192));
     assert!(!lean_steps(true, 1, 2, 8192));
 }
+
+/// `--dense-fp8` runs under tensor parallelism over machines (#1183: each rank copies its
+/// share), not under `--tp` on one machine.
+#[test]
+fn dense_fp8_runs_over_machines_not_one_machines_tp() {
+    let base = || LmConfig {
+        dense_fp8: true,
+        ..LmConfig::new("model.gguf", DeviceChoice::Cuda)
+    };
+    assert!(check_dense_fp8(&base()).is_ok());
+    let net = LmConfig {
+        tp_net: Some(crate::tp_net::TpNetConfig {
+            rank: 1,
+            peers: vec!["192.0.2.1:7619".into(), "192.0.2.2:7619".into()],
+            ..Default::default()
+        }),
+        dense_fp8_prompt: true,
+        ..base()
+    };
+    assert!(check_dense_fp8(&net).is_ok());
+    let e = check_dense_fp8(&LmConfig { tp: 2, ..base() }).unwrap_err();
+    assert!(e.contains("--tp"), "{e}");
+    // Without the flag nothing is checked.
+    assert!(
+        check_dense_fp8(&LmConfig {
+            tp: 2,
+            ..LmConfig::new("model.gguf", DeviceChoice::Cuda)
+        })
+        .is_ok()
+    );
+}

@@ -28,7 +28,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// Frames before this version are refused: both ranks must run the same build.
-const VERSION: u32 = 15;
+const VERSION: u32 = 16;
 
 /// The node settings of a `legion serve` (`--node-rank`, `--node-peer`, `--node-split`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,7 +103,9 @@ pub enum Request {
     /// Tensor parallelism over machines ([`crate::tp_net`]), rank 0 to each other rank: the
     /// first frame on the control connection (answered with [`Reply::Hello`]).
     /// `image_step`: the most tokens of one image rank 0's steps take whole (#1217, 0 without
-    /// images): the rank's sliding-window rings must hold such a step.
+    /// images): the rank's sliding-window rings must hold such a step. `dense`: which of
+    /// rank 0's steps read `--dense-fp8` copies ([`crate::model::core::Model::dense_fp8_mode`],
+    /// #1183), which the rank's must too.
     TpHello {
         version: u32,
         n_ranks: u32,
@@ -111,6 +113,7 @@ pub enum Request {
         n_layer: u32,
         n_blocks: u32,
         image_step: u32,
+        dense: u32,
     },
     /// The same step as rank 0's, with the executor settings that cut a step into passes
     /// (each pass's all-reduces must line up on every rank): the micro-chunk and its taper,
@@ -542,8 +545,9 @@ impl Request {
                 n_layer,
                 n_blocks,
                 image_step,
+                dense,
             } => {
-                for v in [version, n_ranks, rank, n_layer, n_blocks, image_step] {
+                for v in [version, n_ranks, rank, n_layer, n_blocks, image_step, dense] {
                     put_u32(&mut head, v);
                 }
                 K_TP_HELLO
@@ -714,6 +718,7 @@ impl Request {
                 n_layer: r.u32()?,
                 n_blocks: r.u32()?,
                 image_step: r.u32()?,
+                dense: r.u32()?,
             },
             K_TP_STEP => Request::TpStep {
                 groups: get_groups(&mut r)?,
@@ -1288,6 +1293,7 @@ pub fn tp_hello(
     n_layer: usize,
     n_blocks: usize,
     image_step: usize,
+    dense: u32,
 ) -> Request {
     Request::TpHello {
         version: VERSION,
@@ -1296,7 +1302,27 @@ pub fn tp_hello(
         n_layer: n_layer as u32,
         n_blocks: n_blocks as u32,
         image_step: image_step as u32,
+        dense,
     }
+}
+
+/// A rank's check that its steps read `--dense-fp8` copies as rank 0's do (#1183): `dense` is
+/// rank 0's [`crate::model::core::Model::dense_fp8_mode`], `mine` this rank's.
+pub fn check_tp_dense(dense: u32, mine: u32) -> Result<(), String> {
+    if dense == mine {
+        return Ok(());
+    }
+    let runs = |m: u32| match m {
+        0 => "without --dense-fp8",
+        1 => "with --dense-fp8",
+        _ => "with --dense-fp8 --dense-fp8-prompt",
+    };
+    Err(format!(
+        "rank 0 runs {}, this rank {}: give every rank the same --dense-fp8 and \
+         --dense-fp8-prompt",
+        runs(dense),
+        runs(mine)
+    ))
 }
 
 /// A rank's check that its sliding-window rings (`ring`, for a window of `window` positions)

@@ -409,3 +409,191 @@ fn nvfp4_stacks_repack_only_this_ranks_experts() {
     let want: Vec<u8> = (1..n_expert).step_by(2).flat_map(&repacked).collect();
     assert_eq!(bytes(&share, name), want);
 }
+
+/// `whole` with a `--dense-fp8` copy of each of its weights that `copy` picks (#1183): codes
+/// (I8, the weight's shape) and row scales (F32, one per row), computed at load as the
+/// checkpoint's are, with bytes that tell every code and scale apart.
+fn with_copies(whole: &GgufFile, copy: impl Fn(&str) -> bool) -> GgufFile {
+    use crate::hf::dense_fp8::{copy_names, takes};
+    let mut meta = crate::gguf::GgufWriter::new();
+    for (key, v) in whole.metadata() {
+        meta.set(&key, &v).unwrap();
+    }
+    let mut tensors = whole.tensors();
+    let weights: Vec<TensorInfo> = tensors
+        .iter()
+        .filter(|t| takes(&t.name) && t.shape.len() == 2 && copy(&t.name))
+        .cloned()
+        .collect();
+    assert!(!weights.is_empty());
+    let mut recipes = HashMap::new();
+    for (i, w) in weights.iter().enumerate() {
+        let (codes, scales) = copy_names(&w.name);
+        let (k, m) = (w.shape[0], w.shape[1]);
+        let c: Vec<u8> = (0..k * m).map(|j| (j * 7 + i as u64 * 13) as u8).collect();
+        let s: Vec<u8> = (0..m)
+            .flat_map(|r| ((i * 1000) as f32 + r as f32).to_le_bytes())
+            .collect();
+        for (name, ty, shape, b) in [
+            (codes, ggml::types::I8, vec![k, m], c),
+            (scales, ggml::types::F32, vec![m], s),
+        ] {
+            tensors.push(TensorInfo {
+                name: name.clone(),
+                ggml_type: ty,
+                shape,
+                file_index: 0,
+                offset: 0,
+                size: b.len() as u64,
+            });
+            recipes.insert(name, Recipe::Computed(Arc::new(move || Ok(b.clone()))));
+        }
+    }
+    let paths: Vec<PathBuf> = whole.shard_paths().map(|p| p.to_path_buf()).collect();
+    GgufFile::synthetic(meta, whole.path().to_path_buf(), paths, tensors, recipes).unwrap()
+}
+
+/// Each rank's share of a `--dense-fp8` copy is the copy of its share of the weight (#1183):
+/// the codes cut as the weight (rows or columns), the scales by the same rows where the rows
+/// are cut and whole where the columns are (each row keeps the whole row's scale), with or
+/// without `--tp-moe-ep`.
+#[test]
+fn dense_fp8_copies_are_cut_as_their_weights() {
+    use crate::hf::dense_fp8::copy_names;
+    let dir = tempfile::tempdir().unwrap();
+    let (plain, _) = tiny(dir.path());
+    // (The shared expert's down projection has 32 columns on each rank here: refused below.)
+    let whole = with_copies(&plain, |n| !n.ends_with("ffn_down_shexp.weight"));
+    let d = Dims::of(&whole).unwrap();
+    let types: HashMap<String, ffi::ggml_type> = whole
+        .tensors()
+        .iter()
+        .map(|t| (t.name.clone(), t.ggml_type))
+        .collect();
+    let down = |il: usize, name: &str| types.get(&format!("blk.{il}.{name}")).copied();
+    let copied: Vec<TensorInfo> = whole
+        .tensors()
+        .into_iter()
+        .filter(|t| whole.tensor(&copy_names(&t.name).0).is_some())
+        .collect();
+    let cols = |p: &Piece| matches!(p, Piece::Cols(_));
+    // Every kind of cut is there: by rows (query, DeltaNet qkv, shared gate) and by columns
+    // (attention and DeltaNet outputs).
+    let pieces: Vec<Piece> = copied
+        .iter()
+        .map(|w| piece(&d, w, &down, 2, 0).unwrap())
+        .collect();
+    assert!(pieces.iter().any(cols) && !pieces.iter().all(cols));
+    for experts in [Experts::Rows, Experts::Whole] {
+        for rank in 0..2 {
+            let share = view_with(&whole, rank, 2, experts.clone()).unwrap();
+            for w in &copied {
+                let (codes, scales) = copy_names(&w.name);
+                let (k, m) = (w.shape[0] as usize, w.shape[1] as usize);
+                let (c, s) = (bytes(&whole, &codes), bytes(&whole, &scales));
+                let at = share.tensor(&w.name).unwrap();
+                let (want_c, want_s) = match piece(&d, w, &down, 2, rank).unwrap() {
+                    Piece::Rows(r) => {
+                        let r: Vec<(usize, usize)> =
+                            r.iter().map(|&(a, l)| (a as usize, l as usize)).collect();
+                        (rows_of(&c, k, m, &r), rows_of(&s, 4, m, &r))
+                    }
+                    Piece::Cols(cs) => {
+                        let mut want = Vec::new();
+                        for row in c.chunks_exact(k) {
+                            for &(a, l) in &cs {
+                                want.extend_from_slice(&row[a as usize..(a + l) as usize]);
+                            }
+                        }
+                        (want, s.clone())
+                    }
+                    p => panic!("{}: cut as {p:?}", w.name),
+                };
+                assert_eq!(bytes(&share, &codes), want_c, "{codes} rank {rank}");
+                assert_eq!(bytes(&share, &scales), want_s, "{scales} rank {rank}");
+                let (sc, ss) = (
+                    share.tensor(&codes).unwrap(),
+                    share.tensor(&scales).unwrap(),
+                );
+                assert_eq!(sc.shape, at.shape, "{codes}");
+                assert_eq!(ss.shape, [at.shape[1]], "{scales}");
+            }
+        }
+    }
+}
+
+/// A copy whose column share is not a multiple of 64 (what the FP8 matmuls take), or whose
+/// shape is not its weight's, is refused.
+#[test]
+fn dense_fp8_copies_that_do_not_cut_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (plain, _) = tiny(dir.path());
+    let narrow = with_copies(&plain, |n| n.ends_with("ffn_down_shexp.weight"));
+    let e = view(&narrow, 0, 2).err().unwrap();
+    assert!(e.contains("not a multiple of 64"), "{e}");
+    // Codes of the wrong shape.
+    let mut meta = crate::gguf::GgufWriter::new();
+    for (key, v) in plain.metadata() {
+        meta.set(&key, &v).unwrap();
+    }
+    let mut tensors = plain.tensors();
+    let w = plain.tensor("blk.3.attn_q.weight").unwrap();
+    let name = "blk.3.attn_q.fp8.weight".to_string();
+    let size = w.shape[0] * (w.shape[1] - 1);
+    tensors.push(TensorInfo {
+        name: name.clone(),
+        ggml_type: ggml::types::I8,
+        shape: vec![w.shape[0], w.shape[1] - 1],
+        file_index: 0,
+        offset: 0,
+        size,
+    });
+    let zeros: Compute = Arc::new(move || Ok(vec![0u8; size as usize]));
+    let recipes = HashMap::from([(name, Recipe::Computed(zeros))]);
+    let paths: Vec<PathBuf> = plain.shard_paths().map(|p| p.to_path_buf()).collect();
+    let bad =
+        GgufFile::synthetic(meta, plain.path().to_path_buf(), paths, tensors, recipes).unwrap();
+    let e = view(&bad, 0, 2).err().unwrap();
+    assert!(e.contains("is not a copy of"), "{e}");
+}
+
+#[test]
+fn only_copies_of_copied_weights_are_copies() {
+    assert_eq!(
+        copy_of("blk.3.attn_q.fp8.weight"),
+        Some(("blk.3.attn_q.weight".into(), false))
+    );
+    assert_eq!(
+        copy_of("blk.0.ssm_out.fp8.scale"),
+        Some(("blk.0.ssm_out.weight".into(), true))
+    );
+    for name in [
+        "blk.3.attn_q.weight",
+        "blk.3.attn_q.scale",
+        "blk.0.ssm_alpha.fp8.weight",
+        "blk.0.ffn_up_exps.fp8.scale",
+        "output.fp8.weight",
+    ] {
+        assert_eq!(copy_of(name), None, "{name}");
+    }
+    // Scales: by the weight's rows where its rows are cut, whole where its columns are.
+    let r = vec![(4, 8)];
+    assert_eq!(
+        copy_piece(Piece::Rows(r.clone()), false),
+        Ok(Piece::Rows(r.clone()))
+    );
+    assert_eq!(
+        copy_piece(Piece::Rows(r.clone()), true),
+        Ok(Piece::Cols(r.clone()))
+    );
+    assert_eq!(
+        copy_piece(Piece::Cols(r.clone()), false),
+        Ok(Piece::Cols(r.clone()))
+    );
+    assert_eq!(
+        copy_piece(Piece::Cols(r.clone()), true),
+        Ok(Piece::Mirrored)
+    );
+    assert_eq!(copy_piece(Piece::Mirrored, true), Ok(Piece::Mirrored));
+    assert!(copy_piece(Piece::Experts(r), false).is_err());
+}

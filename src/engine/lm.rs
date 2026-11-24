@@ -689,12 +689,19 @@ fn hf_options(cfg: &LmConfig) -> crate::hf::OpenOptions {
     }
 }
 
-/// `--dense-fp8` runs on one machine and one device per layer: tensor parallelism (over GPUs
-/// or machines) would cut the copies' rows from their per-row scales.
+/// `--dense-fp8` runs on one device per layer, or under tensor parallelism over machines
+/// (`--tp-rank`, #1183), where each rank copies its share of the weights with the whole rows'
+/// scales ([`crate::tp_net::shard::qwen4::copy_piece`]). Not over one machine's GPUs: `--tp`'s
+/// meta device splits weights by its own rules, which would cut the copies' rows from their
+/// per-row scales, and `--tp-per-gpu` (the same shares in one process) is untried with them.
 fn check_dense_fp8(cfg: &LmConfig) -> Result<(), String> {
     // (A `--tp-per-gpu` rank loads with --tp 1 and its pair: `tp_pair::check` refuses first.)
-    if cfg.dense_fp8 && (cfg.tp > 1 || cfg.tp_net.is_some() || cfg.tp_pair.is_some()) {
-        return Err("--dense-fp8 does not run under tensor parallelism yet (--tp)".into());
+    if cfg.dense_fp8 && (cfg.tp > 1 || cfg.tp_pair.is_some()) {
+        return Err(
+            "--dense-fp8 does not run under tensor parallelism over one machine's GPUs yet \
+             (--tp; over machines, --tp-rank, it does)"
+                .into(),
+        );
     }
     Ok(())
 }

@@ -441,6 +441,8 @@ pub(super) fn lead(
     let n_layer = exec.model().hp.n_layer;
     // Every rank's rings must hold rank 0's whole-image steps (#1217).
     let image_step = exec.image_step();
+    // Every rank's steps must read the `--dense-fp8` copies as rank 0's do (#1183).
+    let dense = exec.model().dense_fp8_mode();
     let mut blocks = n_blocks;
     let hello = |r: Result<Reply, String>, to: usize, blocks: &mut usize| match r {
         Ok(Reply::Hello { n_blocks }) => {
@@ -459,8 +461,10 @@ pub(super) fn lead(
                 let s = tp_net::dial_control(&cfg, to, WAIT)
                     .map_err(|e| device(format!("rank {to}: {e}")))?;
                 let mut link = Link::over(s).map_err(|e| device(format!("rank {to}: {e}")))?;
-                link.send(crate::node::tp_hello(n, to, n_layer, n_blocks, image_step))
-                    .map_err(|e| device(format!("rank {to}: {e}")))?;
+                link.send(crate::node::tp_hello(
+                    n, to, n_layer, n_blocks, image_step, dense,
+                ))
+                .map_err(|e| device(format!("rank {to}: {e}")))?;
                 links.push(link);
             }
             // Every rank makes its pinned exchange buffers on the hello, together (#1133).
@@ -491,7 +495,9 @@ pub(super) fn lead(
             };
             // Rank 1 answers once it has loaded (its load error is logged on its thread).
             hello(
-                link.call(crate::node::tp_hello(2, 1, n_layer, n_blocks, image_step)),
+                link.call(crate::node::tp_hello(
+                    2, 1, n_layer, n_blocks, image_step, dense,
+                )),
                 1,
                 &mut blocks,
             )?;
@@ -846,6 +852,7 @@ fn handle(
             n_layer,
             n_blocks,
             image_step,
+            dense,
         } => {
             // With rank 0 and the other ranks, before anything else (#1133): rank 0 sent every
             // rank its hello first.
@@ -853,6 +860,7 @@ fn handle(
                 presize(c.comm())?;
             }
             crate::node::check_tp_hello((version, n_ranks, rank, n_layer), mine)?;
+            crate::node::check_tp_dense(dense, exec.model().dense_fp8_mode())?;
             let window = exec.model().hp.arch.swa_window();
             crate::node::check_tp_image_step(exec.kv_ring(), window, image_step as usize)?;
             exec.set_image_step(image_step as usize);

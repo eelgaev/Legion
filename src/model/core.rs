@@ -2098,6 +2098,13 @@ impl Model {
             .set_prompt(on && crate::model::fp8::fp8_mma())
     }
 
+    /// Which steps read the dense projections' FP8 copies (`--dense-fp8`, [`dense_twins`]): 0
+    /// none, 1 decode and verify steps, 3 prompt steps too. The ranks of tensor parallelism
+    /// over machines check that they agree (#1183).
+    pub fn dense_fp8_mode(&self) -> u32 {
+        self.dense_twins.mode()
+    }
+
     /// Which kernels run NVFP4 matmuls on CUDA ([`Nvfp4Mm`]); graphs built after this call use
     /// it.
     pub fn set_nvfp4_mm(&mut self, m: Nvfp4Mm) {

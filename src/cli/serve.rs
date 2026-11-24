@@ -266,7 +266,9 @@ pub(super) struct ModelArgs {
     /// prompt rows (see --dense-fp8-prompt); a prompt chunk of one token per sequence (64 tokens
     /// or fewer in all) has a decode step's shape and reads the copy. Faster decode; moves the
     /// decoded text. The copy takes about half the dense weights' memory again (~2.7 GiB). The
-    /// MTP layer keeps its BF16 weights. One machine without --tp; other models ignore it.
+    /// MTP layer keeps its BF16 weights. Not with --tp or --tp-per-gpu; with --tp-rank each rank
+    /// copies its share of the weights (every row keeps its whole row's scale), and every rank
+    /// must be given the flag. Other models ignore it.
     #[arg(long)]
     pub dense_fp8: bool,
     /// With --dense-fp8: prompt steps read the FP8 copies too, as W8A8 GEMMs with one FP8
@@ -274,8 +276,9 @@ pub(super) struct ModelArgs {
     /// query/key/value and of the shared expert's gate/up each one GEMM as their BF16 weights
     /// are. No step then reads the BF16 weights, so they are not loaded: the dense projections
     /// take the copies' ~2.7 GiB only, about 2.7 GiB less than without --dense-fp8 (~5.4 GiB
-    /// less than --dense-fp8 alone). Aims at faster prefill; moves the output further than
-    /// --dense-fp8 alone.
+    /// less than --dense-fp8 alone; with --tp-rank, each rank's share of them). Aims at faster
+    /// prefill; moves the output further than --dense-fp8 alone. With --tp-rank, give every
+    /// rank both flags.
     #[arg(long, requires = "dense_fp8")]
     pub dense_fp8_prompt: bool,
     /// Where a MoE model's routed experts live with --device cuda: `auto` (VRAM if they fit,

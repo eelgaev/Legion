@@ -111,10 +111,12 @@ pub(super) fn check(cfg: &LmConfig) -> Result<(), LoadError> {
     if cfg.pair_tp || cfg.glm_parallel_decode {
         return Err(err("not with --pair-tp or --glm-parallel-decode"));
     }
-    // Each rank loads with --tp 1, where `--dense-fp8`'s own check would pass: the ranks' row
-    // shares would cut the copies from their per-row scales.
+    // Each rank loads with --tp 1, where `--dense-fp8`'s own check would pass. Its shares are
+    // the ones `--tp-rank` copies (#1183), but untried on a GPU pair.
     if cfg.dense_fp8 {
-        return Err(err("not with --dense-fp8 (one machine, one GPU, no --tp)"));
+        return Err(err(
+            "not with --dense-fp8 (one GPU per layer, or one machine per rank with --tp-rank)",
+        ));
     }
     // Each rank sizes its cache as one GPU does, for the paged kernels' small compute buffers:
     // gather attention's grow with the prompt (an 8K prompt at --ctx-size 40960 ran out of

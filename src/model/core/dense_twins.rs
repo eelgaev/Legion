@@ -71,6 +71,17 @@ impl DenseTwins {
         self.on && on
     }
 
+    /// Which steps read the copies, which every rank of tensor parallelism over machines must
+    /// agree on (#1183): 0 none (no copies), 1 decode and verify steps ([`takes_step`]), 3
+    /// prompt steps too ([`Self::set_prompt`]).
+    pub(crate) fn mode(&self) -> u32 {
+        match (self.on, self.prompt) {
+            (false, _) => 0,
+            (true, false) => 1,
+            (true, true) => 3,
+        }
+    }
+
     /// While the guard lives, weights of a step of `n` tokens, with prompt rows or not
     /// ([`prompt_rows`]): the copies where the file has them and the step is a decode or verify
     /// step that [`takes_step`], or any step under [`Self::set_prompt`]. The guard puts back

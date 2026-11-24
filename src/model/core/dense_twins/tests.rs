@@ -245,3 +245,18 @@ fn runs_join_adjacent_copies_only() {
             .is_none()
     );
 }
+
+/// The mode tensor parallel ranks compare (#1183): none without copies, whatever
+/// `--dense-fp8-prompt` says; decode and verify steps with them; prompt steps too with the flag.
+#[test]
+fn the_mode_says_which_steps_read_the_copies() {
+    let mut t = DenseTwins::default();
+    assert_eq!(t.mode(), 0);
+    assert!(!t.set_prompt(true));
+    assert_eq!(t.mode(), 0, "no copies in the file");
+    t.on = true;
+    t.set_prompt(false);
+    assert_eq!(t.mode(), 1);
+    assert!(t.set_prompt(true));
+    assert_eq!(t.mode(), 3);
+}

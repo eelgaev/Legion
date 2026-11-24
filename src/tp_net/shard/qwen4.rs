@@ -24,10 +24,16 @@
 //!   expert keeps its rows.
 //! - Everything else (embeddings, hyper-connection mixers, the per-layer n-gram embedding and
 //!   its table, norms, the output head, the MTP head's `nextn.*`): mirrored.
+//! - **`--dense-fp8` copies** ([`crate::hf::dense_fp8`], #1183): each rank keeps its share of
+//!   the copy of every weight it holds a share of ([`copy_piece`]). The codes go as the weight
+//!   goes; the per-row scales by the same rows where the weight's rows are cut (Q, K, V, the
+//!   DeltaNet `qkv` and `z`, the shared expert's gate and up), whole where its columns are
+//!   (the attention and DeltaNet outputs, the shared expert's down): a row's scale is the
+//!   whole row's, so every rank's codes are the one-machine copy's codes of its columns.
 //!
 //! Row ranges of plain file tensors are gathered straight from the file; column cuts (and any
-//! tensor a safetensors checkpoint computes at load) read the whole tensor and keep this
-//! rank's columns.
+//! tensor a safetensors checkpoint computes at load, the FP8 copies among them) read the whole
+//! tensor and keep this rank's columns.
 
 #[cfg(test)]
 mod tests;
@@ -312,6 +318,75 @@ pub fn piece(
     })
 }
 
+/// `--dense-fp8` (#1183): the weight whose FP8 copy the tensor `name` is (codes
+/// `<base>.fp8.weight`, row scales `<base>.fp8.scale`, [`crate::hf::dense_fp8::copy_names`]),
+/// and whether `name` is the copy's row scales; `None` for every other tensor.
+pub fn copy_of(name: &str) -> Option<(String, bool)> {
+    let (base, scales) = match name.strip_suffix(".fp8.weight") {
+        Some(b) => (b, false),
+        None => (name.strip_suffix(".fp8.scale")?, true),
+    };
+    let weight = format!("{base}.weight");
+    crate::hf::dense_fp8::takes(&weight).then_some((weight, scales))
+}
+
+/// How the `--dense-fp8` copy of a weight this rank cuts as `weight` is cut (#1183). Its codes
+/// (I8, the weight's shape) as the weight: the same rows or columns. Its row scales (F32, one
+/// per output row): the same rows where the weight's output rows are cut, so each rank's rows
+/// keep their scales; all of them where its input columns are. Every rank's columns of row `r`
+/// then keep the whole row's scale `s_r` (`amax / 448` over the whole row, made at load before
+/// the cut), so a rank's codes are the one-machine copy's codes of its columns and the ranks'
+/// partial sums add up to one machine's `s_r · Σ_k c_rk · x_k`, in another order. (A scale of
+/// each rank's columns alone would round them on a finer grid, but then no rank's codes are
+/// one machine's.)
+pub fn copy_piece(weight: Piece, scales: bool) -> Result<Piece, String> {
+    Ok(match (weight, scales) {
+        (Piece::Experts(_), _) => return Err("an FP8 copy of whole experts".into()),
+        (p, false) => p,
+        (Piece::Rows(rows), true) => Piece::Cols(rows),
+        (Piece::Cols(_) | Piece::Mirrored, true) => Piece::Mirrored,
+    })
+}
+
+/// [`piece`] for `t`, the codes or row scales of the `--dense-fp8` copy of `weight` (`scales`,
+/// [`copy_of`]): cut by [`copy_piece`] from the weight's cut. A copy whose shape is not the
+/// weight's (codes) or one value per its rows (scales), or whose share of a column cut is not
+/// a multiple of 64 columns (what the FP8 matmuls take), is refused.
+fn copy_cut(
+    d: &Dims,
+    t: &TensorInfo,
+    weight: Option<&TensorInfo>,
+    scales: bool,
+    down: &dyn Fn(usize, &str) -> Option<ffi::ggml_type>,
+    n: usize,
+    rank: usize,
+) -> Result<Piece, String> {
+    let w = weight.ok_or_else(|| format!("{}: an FP8 copy of a weight not in the file", t.name))?;
+    let fits = if scales {
+        t.shape.len() == 1 && w.shape.get(1) == t.shape.first()
+    } else {
+        t.shape == w.shape
+    };
+    if !fits {
+        return Err(format!(
+            "{}: shape {:?} is not a copy of {} {:?}",
+            t.name, t.shape, w.name, w.shape
+        ));
+    }
+    let p = copy_piece(piece(d, w, down, n, rank)?, scales)?;
+    if let (false, Piece::Cols(cols)) = (scales, &p) {
+        let k: u64 = cols.iter().map(|c| c.1).sum();
+        if !k.is_multiple_of(64) {
+            return Err(format!(
+                "{}: --dense-fp8 under tensor parallelism: {k} columns on each rank, not a \
+                 multiple of 64",
+                t.name
+            ));
+        }
+    }
+    Ok(p)
+}
+
 /// Sets `qwen4exp.{k}` in `meta`.
 fn set(meta: &mut GgufWriter, k: &str, v: Value) -> Result<(), String> {
     meta.set(&format!("{ARCH}.{k}"), &v)
@@ -403,6 +478,12 @@ pub fn view_with(
         .map(|t| (t.name.clone(), t.ggml_type))
         .collect();
     let down = |il: usize, name: &str| types.get(&format!("blk.{il}.{name}")).copied();
+    // The weights `--dense-fp8` copies, which their copies are cut by (#1183).
+    let copied: HashMap<String, TensorInfo> = tensors
+        .iter()
+        .filter(|t| crate::hf::dense_fp8::takes(&t.name))
+        .map(|t| (t.name.clone(), t.clone()))
+        .collect();
     let paths: Vec<PathBuf> = gguf.shard_paths().map(|p| p.to_path_buf()).collect();
     let mut out = Vec::with_capacity(tensors.len());
     let mut recipes = HashMap::new();
@@ -417,9 +498,12 @@ pub fn view_with(
             }
             _ => None,
         };
-        let p = match whole_experts {
-            Some(p) => p,
-            None => piece(&d, &t, &down, n, rank)?,
+        let p = match (whole_experts, copy_of(&t.name)) {
+            (Some(p), _) => p,
+            (None, Some((weight, scales))) => {
+                copy_cut(&d, &t, copied.get(&weight), scales, &down, n, rank)?
+            }
+            (None, None) => piece(&d, &t, &down, n, rank)?,
         };
         let recipe = gguf.recipe(&t.name);
         let mut s = t.clone();

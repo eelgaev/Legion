@@ -60,7 +60,7 @@ fn requests_round_trip() {
         Request::CopyStates {
             copies: vec![(1, 2, 0, 3), (0, 9, 1, 0)],
         },
-        tp_hello(3, 2, 60, 999, 1120),
+        tp_hello(3, 2, 60, 999, 1120, 3),
         Request::TpStep {
             groups: match step() {
                 Request::Step { groups, .. } => groups,
@@ -259,6 +259,25 @@ fn tp_hello_checks_the_build_ranks_and_model() {
     assert!(check_tp_hello((VERSION, 3, 1, 60), mine).is_err());
     assert!(check_tp_hello((VERSION, 2, 0, 60), mine).is_err());
     assert!(check_tp_hello((VERSION, 2, 1, 48), mine).is_err());
+}
+
+/// Every rank reads the `--dense-fp8` copies in the same steps as rank 0 (#1183), or none.
+#[test]
+fn tp_hello_checks_the_ranks_agree_on_dense_fp8() {
+    for m in [0, 1, 3] {
+        assert!(check_tp_dense(m, m).is_ok());
+    }
+    for (theirs, mine) in [(0, 1), (1, 0), (1, 3), (3, 1), (3, 0)] {
+        let e = check_tp_dense(theirs, mine).unwrap_err();
+        assert!(e.contains("--dense-fp8-prompt"), "{e}");
+    }
+    let e = check_tp_dense(3, 1).unwrap_err();
+    assert!(
+        e.starts_with(
+            "rank 0 runs with --dense-fp8 --dense-fp8-prompt, this rank with --dense-fp8:"
+        ),
+        "{e}"
+    );
 }
 
 /// A rank takes rank 0's whole-image steps (#1217) only when its rings hold them: rings sized
