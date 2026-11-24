@@ -85,12 +85,19 @@ pub(crate) unsafe fn rewrite(
     unsafe {
         let n = ffi::ggml_graph_n_nodes(graph) as usize;
         let nodes = std::slice::from_raw_parts(ffi::ggml_graph_nodes(graph), n).to_vec();
+        // The key and the value are the matmuls' outputs in a model's graph; a graph of the
+        // chain alone (the tests) has them as leafs.
+        let named_in: Vec<Node> = nodes
+            .iter()
+            .chain(crate::ggml::graph_leafs(graph))
+            .copied()
+            .collect();
         let mut done = 0;
         for &out in &nodes {
             if !named(out, OUT) {
                 continue;
             }
-            match Chain::find(&nodes, out) {
+            match Chain::find(&nodes, &named_in, out) {
                 Ok(c) => {
                     c.apply(saved);
                     done += 1;
@@ -175,15 +182,15 @@ const MAX_CHAIN: usize = 96;
 
 impl Chain {
     /// The chain ending in `out` (named [`OUT`]) of `nodes` (the graph's, in order), or why it
-    /// does not fit.
+    /// does not fit; the key and the value are found in `named_in` (the nodes and the leafs).
     ///
     /// # Safety
     /// Valid tensors.
-    unsafe fn find(nodes: &[Node], out: Node) -> Result<Self, String> {
+    unsafe fn find(nodes: &[Node], named_in: &[Node], out: Node) -> Result<Self, String> {
         // SAFETY: the caller's; sources and view sources are valid tensors.
         unsafe {
-            let key = one(nodes, KEY)?;
-            let value = one(nodes, VALUE)?;
+            let key = one(named_in, KEY)?;
+            let value = one(named_in, VALUE)?;
             let xn = one(nodes, XN)?;
             let x = one(nodes, X)?;
             let keep = one(nodes, KEEP)?;

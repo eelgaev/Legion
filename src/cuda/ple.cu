@@ -104,11 +104,19 @@ __device__ __forceinline__ void block_sums(float (&v)[N], float (*red)[32]) {
     __syncthreads();
 }
 
-// rms_norm_f32's scale from a row's sum of squares (the same source: nvcc makes mean + eps one
-// FFMA of the sum by MUFU.RCP(ncols), then MUFU.RSQ).
+// MUFU.RCP: fast math's reciprocal, and its division's (x / y is x times it).
+__device__ __forceinline__ float rcp_approx(float x) {
+    float r;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
+    return r;
+}
+
+// rms_norm_f32's scale from a row's sum of squares. Built with fast math, its
+// `rsqrtf(tmp / ncols + eps)` is FFMA(sum, MUFU.RCP(ncols), eps), then MUFU.RSQ: spelled out
+// here, as left to nvcc the same expression kept one of the eight scales of ple_gate_kernel
+// (the query's last stream) an FMUL and an FADD, rounded twice (seen in the GB10's SASS).
 __device__ __forceinline__ float rms_scale(float tmp, int ncols, float eps) {
-    const float mean = tmp / ncols;
-    return rsqrtf(mean + eps);
+    return rsqrtf(__fmaf_rn(tmp, rcp_approx((float) ncols), eps));
 }
 
 // One block per token. SUMB: sum_rows' threads per row.
