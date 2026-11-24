@@ -126,6 +126,11 @@ unsafe fn fold_wants(graph: *mut ffi::ggml_cgraph, cuda: bool) -> bool {
 /// # Safety
 /// As [`crate::ggml::post_alloc::Rewrite`].
 unsafe fn rewrite(graph: *mut ffi::ggml_cgraph, cuda: bool) -> Option<Box<dyn Relaid>> {
+    // A graph without a marked PLE chain was taken for the fold (by [`wants`], or by the
+    // relayout a test sets): folded as before the PLE ops. One with a chain is folded too only
+    // where the fold wants it.
+    // SAFETY: the caller's.
+    let fold = unsafe { !ple_rewrite::marked(graph) || fold_wants(graph, cuda) };
     // The PLE ops first, the fold then sees the graph's readers as they run; neither moves a
     // node's memory before the graph is planned again.
     let mut ple_saved = Vec::new();
@@ -133,7 +138,7 @@ unsafe fn rewrite(graph: *mut ffi::ggml_cgraph, cuda: bool) -> Option<Box<dyn Re
     let ple = unsafe { ple_rewrite::rewrite(graph, &mut ple_saved) };
     // SAFETY: the caller's.
     let (mut undo, folded, fma) = unsafe {
-        if fold_wants(graph, cuda) {
+        if fold {
             fold_graph(graph, cuda)
         } else {
             (unfolded(graph, cuda), 0, 0)
