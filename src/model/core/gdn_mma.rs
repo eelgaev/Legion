@@ -680,6 +680,11 @@ enum Ran {
     Codes,
 }
 
+/// What the last [`codes_on`] node's launch ran, a [`Ran`] discriminant (-1: none yet): the
+/// tests' check of which path a case took.
+#[cfg(all(test, feature = "cuda"))]
+static CODES_RAN: AtomicI8 = AtomicI8::new(-1);
+
 #[cfg(feature = "cuda")]
 unsafe extern "C" {
     fn cudaMemsetAsync(p: *mut c_void, v: i32, n: usize, stream: *mut c_void) -> i32;
@@ -753,6 +758,10 @@ unsafe fn cuda_gdn_mma(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<()
             slots: codes.map_or(std::ptr::null_mut(), |c| c.2),
         };
         let ran = launch::run(&mut a, stream, gn.is_some(), codes.is_some())?;
+        #[cfg(test)]
+        if codes.is_some() {
+            CODES_RAN.store(ran as i8, Ordering::Relaxed);
+        }
         if let Some((z, w)) = gn
             && ran == Ran::Plain
         {

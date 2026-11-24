@@ -231,6 +231,7 @@ unsafe fn unfolded(graph: *mut ffi::ggml_cgraph, cuda: bool) -> Undo {
             cuda,
             lazy: 0,
             compact: 0,
+            one_cast: 0,
         }
     }
 }

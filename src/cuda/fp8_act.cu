@@ -20,6 +20,10 @@
 // - plain_bf16: y = x for BF16 rows (x points at __nv_bfloat16 values, x_ld in them; each value
 //               widened exactly), for --dense-fp8-prompt (#1183): activations an op wrote in
 //               BF16 already, read at half the bytes of their F32 rows
+// - plain_dot:  y = x's F32 values rounded to BF16 (__float2bfloat16, as ggml-cuda's copy
+//               to BF16 rounds them: plain_bf16 of that copy), and x . w per token into dot,
+//               the bits of ggml-cuda's mul_mat_vec_f for a [k, 1] F32 weight over F32 rows
+//               (#1183: a MoE layer's shared-expert codes and gate logit in one read of h)
 //
 // y has the bits of the ggml chain the graph builds otherwise (and of fused.cu's BF16 kernels,
 // which compute the same values before their cast): thread tid holds columns tid, tid + BLOCK,
@@ -64,6 +68,8 @@ struct legion_fp8_act {
     int32_t src_bf16;
     const float * res;
     float * xs;
+    // plain_dot: x . w of token t at dot + t (w [k], F32)
+    float * dot;
 };
 
 // 0 on success; 1 for a shape this file does not take (the caller builds the unfused ops);
@@ -80,6 +86,7 @@ constexpr int FP8_ACT_GATE = 2;
 constexpr int FP8_ACT_GATED_NORM = 3;
 constexpr int FP8_ACT_SUM_NORM = 4;
 constexpr int FP8_ACT_PLAIN_BF16 = 5;
+constexpr int FP8_ACT_PLAIN_DOT = 6;
 
 // Most values per thread (columns per row: 24 * 1024).
 constexpr int MAX_NV = 24;
@@ -145,7 +152,44 @@ __global__ void __launch_bounds__(BLOCK) fp8_act_kernel(const legion_fp8_act p) 
     const int k = p.k;
     float v[NV];
 
-    if constexpr (KIND == FP8_ACT_PLAIN_BF16) {
+    if constexpr (KIND == FP8_ACT_PLAIN_DOT) {
+        // ggml-cuda's mul_mat_vec_f<float, float, 1, 256> (mmvf.cu) as its transposed-vector
+        // path runs mul_mat(w [k, 1], x): a block of 256 threads per token, thread tid's float2
+        // pairs tid, tid + 256, ... of the row and w, each value one fused multiply-add (there
+        // `acc += x * y`, contracted under --use_fast_math), warp_reduce_sum, then the eight warp
+        // sums in 32 zeroed slots reduced by warp 0. The host picks the kind only where ggml's
+        // block for k is 256 (legion_fp8_act_launch checks it again).
+        static_assert(BLOCK == 256, "plain_dot: ggml's 256-thread mul_mat_vec_f block");
+        __shared__ float s_dot[32];
+        if (tid < 32) {
+            s_dot[tid] = 0.0f;
+        }
+        __syncthreads();
+        const float * row = p.x + t * p.x_ld;
+        const float2 * x2 = (const float2 *) row;
+        const float2 * w2 = (const float2 *) p.w;
+        float acc = 0.0f;
+        for (int c2 = tid; c2 < k / 2; c2 += BLOCK) {
+            const float2 a = x2[c2];
+            const float2 b = w2[c2];
+            acc = fmaf(a.x, b.x, acc);
+            acc = fmaf(a.y, b.y, acc);
+        }
+        acc = warp_sum(acc);
+        s_dot[warp] = acc;
+        __syncthreads();
+        if (tid < 32) {
+            acc = warp_sum(s_dot[tid]);
+            if (tid == 0) {
+                p.dot[t] = acc;
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < NV; i++) {
+            const int col = tid + i * BLOCK;
+            v[i] = col < k ? __bfloat162float(__float2bfloat16(row[col])) : 0.0f;
+        }
+    } else if constexpr (KIND == FP8_ACT_PLAIN_BF16) {
         const __nv_bfloat16 * row = (const __nv_bfloat16 *) p.x + t * p.x_ld;
 #pragma unroll
         for (int i = 0; i < NV; i++) {
@@ -330,6 +374,26 @@ int legion_fp8_act_launch(const legion_fp8_act * p, void * stream) {
         case FP8_ACT_PLAIN_BF16:
             return p->k <= 256 * MAX_NV ? launch_nv<256, FP8_ACT_PLAIN_BF16, MAX_NV>(*p, st)
                                         : launch_nv<1024, FP8_ACT_PLAIN_BF16, MAX_NV>(*p, st);
+        case FP8_ACT_PLAIN_DOT:
+            // ggml's mul_mat_vec_f block for k columns must be 256 (its rule: the block of 32
+            // to 256 threads, a multiple of 32, with the fewest float2 steps, the smallest on
+            // ties), and the rows float2-aligned.
+            {
+                int best = 32;
+                int64_t steps = ((int64_t) p->k + 63) / 64;
+                for (int b = 64; b <= 256; b += 32) {
+                    const int64_t s = ((int64_t) p->k + 2 * b - 1) / (2 * b);
+                    if (s < steps) {
+                        steps = s;
+                        best = b;
+                    }
+                }
+                if (best != 256 || p->k % 2 != 0 || p->x_ld % 2 != 0 || p->w == nullptr ||
+                    p->dot == nullptr || p->k > 256 * MAX_NV) {
+                    return 1;
+                }
+            }
+            return launch_nv<256, FP8_ACT_PLAIN_DOT, MAX_NV>(*p, st);
         case FP8_ACT_RMS_NORM:
             // ggml-cuda's rms_norm block: 256 threads below 1024 columns, 1024 from there on.
             return p->k < 1024 ? launch_nv<256, FP8_ACT_RMS_NORM, 4>(*p, st)

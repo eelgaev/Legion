@@ -285,6 +285,10 @@ fn cuda_norm_rope_is_bit_identical_to_ggml() {
         (128, 8, 48, true, 64),
         (64, 3, 2, false, 32),
         (512, 4, 2, true, 64),
+        // Prompt-sized steps: q, k and the indexer's q over 2K tokens.
+        (256, 24, 2048, true, 64),
+        (256, 4, 2048, true, 64),
+        (128, 2, 2048, true, 64),
     ] {
         for base in [0, 199_999] {
             let (op, chain) = norm_rope_case(&mut gpu, d, h, n, &rope(imrope, n_dims), base);

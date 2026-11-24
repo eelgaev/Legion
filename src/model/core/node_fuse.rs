@@ -126,6 +126,12 @@ pub(crate) struct Counts {
     /// ssm_out projection's codes ([`crate::model::core::gdn_mma::codes_on`]). Counted, not
     /// rewritten.
     pub gdn_codes: usize,
+    /// The same for the MoE layers' shared expert: its gate and up GEMM's codes of h with the
+    /// gate logit, from one op ([`crate::model::fp8_act::plain_dot`]). Counted, not rewritten.
+    pub shexp_codes: usize,
+    /// Attention norm + RoPE ops ([`super::norm_rope::norm_rope`], `--norm-rope`). Counted, not
+    /// rewritten.
+    pub norm_rope: usize,
     /// qwen4exp's per-layer n-gram embedding as Legion's ops instead of ggml's chain of about
     /// thirty nodes (`--ple-ops`, or prompt steps under `--dense-fp8-prompt`, #1183): one per
     /// prompt group ([`crate::model::qwen4::is_ple_conv`]). Counted, not rewritten.
@@ -140,8 +146,9 @@ pub(crate) struct Counts {
 /// Graphs whose rewrite was logged (the first few only).
 static LOGGED: AtomicUsize = AtomicUsize::new(0);
 
-/// Whether a graph with [`Counts::fp8_codes`], [`Counts::gdn_codes`] or [`Counts::ple_ops`]
-/// was logged (the first one is, after the first few graphs too: prompt steps may come later).
+/// Whether a graph with [`Counts::fp8_codes`], [`Counts::gdn_codes`], [`Counts::shexp_codes`]
+/// or [`Counts::ple_ops`] was logged (the first one is, after the first few graphs too: prompt
+/// steps may come later).
 static CODES_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Whether a graph with [`Counts::mtp_in`] was logged (the MTP head's take-ins are graphs of
@@ -177,7 +184,7 @@ unsafe fn fuse(graph: *mut ffi::ggml_cgraph) {
     }
     // SAFETY: the caller's.
     let c = unsafe { rewrite_graph(graph, true) };
-    let first_codes = (c.fp8_codes + c.gdn_codes + c.ple_ops > 0
+    let first_codes = (c.fp8_codes + c.gdn_codes + c.shexp_codes + c.ple_ops > 0
         && !CODES_LOGGED.swap(true, Ordering::Relaxed))
         | (c.mtp_in > 0 && !MTP_IN_LOGGED.swap(true, Ordering::Relaxed));
     if c != Counts::default() && (LOGGED.fetch_add(1, Ordering::Relaxed) < 4 || first_codes) {
@@ -193,6 +200,8 @@ unsafe fn fuse(graph: *mut ffi::ggml_cgraph) {
             gather_cast = c.gather_cast,
             fp8_codes = c.fp8_codes,
             gdn_codes = c.gdn_codes,
+            shexp_codes = c.shexp_codes,
+            norm_rope = c.norm_rope,
             ple_ops = c.ple_ops,
             mtp_in = c.mtp_in,
             none = c.none,
@@ -226,6 +235,12 @@ pub(crate) unsafe fn rewrite_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> 
                     }
                     if super::gdn_mma::is_codes(g.nodes[i]) {
                         c.gdn_codes += 1;
+                    }
+                    if super::norm_rope::is_norm_rope(g.nodes[i]) {
+                        c.norm_rope += 1;
+                    }
+                    if crate::model::fp8_act::is_plain_dot(g.nodes[i]) {
+                        c.shexp_codes += 1;
                     }
                     if crate::model::qwen4::is_ple_conv(g.nodes[i]) {
                         c.ple_ops += 1;

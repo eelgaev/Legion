@@ -269,6 +269,15 @@ pub(crate) fn norm_rope_fits(x: Tensor<'_>, w: Tensor<'_>, pos: Tensor<'_>, rope
     on_gpu(&[x, w, pos]) && norm_rope_shapes(x, w, pos, rope)
 }
 
+/// Whether a graph node is a [`norm_rope`] op (counted on the node fuse line).
+///
+/// # Safety
+/// `node` is a valid tensor.
+pub(crate) unsafe fn is_norm_rope(node: *const ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's.
+    unsafe { crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &NORM_ROPE)) }
+}
+
 fn norm_rope_shapes(x: Tensor<'_>, w: Tensor<'_>, pos: Tensor<'_>, rope: &Rope) -> bool {
     let [d, h, n, rest] = x.ne();
     x.ty() == types::F32

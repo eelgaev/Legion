@@ -5,6 +5,14 @@
 use super::*;
 use crate::ggml::{Backend, ComputeAllocator};
 
+/// Held by the tests that change the module's switches ([`ON`], [`STAGED`], [`FORCE`]) or read
+/// [`CODES_RAN`], or run the op on a GPU under them: one at a time.
+static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock() -> std::sync::MutexGuard<'static, ()> {
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Deterministic values in [-1, 1).
 fn noise(n: usize, seed: u64) -> Vec<f32> {
     let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
@@ -134,6 +142,7 @@ fn shapes_fit_prompt_groups_of_any_head_counts() {
 /// the staged kernel on compute capability 12.0 and 12.1 only. Restores the switches.
 #[test]
 fn takes_ggmls_groups_staged_on_consumer_blackwell_only() {
+    let _lock = lock();
     assert!(staged_gpu(Some((12, 1))));
     assert!(staged_gpu(Some((12, 0))));
     for cc in [
@@ -323,6 +332,7 @@ fn fits_no_host_group() {
 #[ignore = "needs a GPU of compute capability 8.0+"]
 fn cuda_gdn_mma_matches_ggml() {
     use crate::ggml::{DeviceKind, device_by_kind};
+    let _lock = lock();
     let mut gpu = device_by_kind(DeviceKind::Gpu)
         .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
         .expect("no GPU device")
@@ -344,101 +354,160 @@ fn cuda_gdn_mma_matches_ggml() {
     }
 }
 
-/// `--dense-fp8-prompt` (#1183): a [`gdn_mma_gn`] node switched to codes ([`codes_on`]) against
-/// one switched to BF16 rows ([`norm_on`]) and `fp8_act::plain_bf16` of them, codes and scales
-/// bit for bit: one GPU's heads of Qwen3.8-Flash-Next at token counts that are not a multiple
-/// of the chunk, and fewer heads.
+/// The GPU the codes tests run on, with the switches they need: `--gdn-mma` on and the engine's
+/// GPU device 0.
 #[cfg(feature = "cuda")]
-#[test]
-#[ignore = "needs a GPU of compute capability 8.0+"]
-fn cuda_codes_match_norm_then_fp8_act() {
+fn codes_gpu() -> Backend {
     use crate::ggml::{DeviceKind, device_by_kind};
-    use crate::model::fp8_act;
-    let mut gpu = device_by_kind(DeviceKind::Gpu)
+    let gpu = device_by_kind(DeviceKind::Gpu)
         .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
         .expect("no GPU device")
         .init()
         .unwrap();
     set_gpu(crate::hw::per_device::cc(0));
     set_gdn_mma(true);
-    for (n_k, n_v, nt) in [
+    gpu
+}
+
+/// [`force_schedule`]`(None)` when dropped: the schedule rule again, also after a failed case.
+#[cfg(feature = "cuda")]
+struct Unforce;
+
+#[cfg(feature = "cuda")]
+impl Drop for Unforce {
+    fn drop(&mut self) {
+        force_schedule(None);
+    }
+}
+
+/// `--dense-fp8-prompt` (#1183): a [`gdn_mma_gn`] node of `n_k` key and `n_v` value heads and
+/// `nt` tokens switched to codes ([`codes_on`]) against one switched to BF16 rows ([`norm_on`])
+/// and `fp8_act::plain_bf16` of them, codes and scales bit for bit, on `gpu` under the switches
+/// as they are. Returns what the codes node's launch ran ([`CODES_RAN`], a [`Ran`]).
+#[cfg(feature = "cuda")]
+fn codes_case(gpu: &mut Backend, (n_k, n_v, nt): (i64, i64, i64)) -> i8 {
+    use crate::model::fp8_act;
+    let s = HEAD;
+    let row = 2 * s * n_k + s * n_v;
+    let ctx = Context::new(64, 64);
+    let conv = ctx.new_tensor(types::F32, &[row, nt, 1]).as_input();
+    let g = ctx.new_tensor(types::F32, &[1, n_v, nt, 1]).as_input();
+    let beta = ctx.new_tensor(types::F32, &[1, n_v, nt, 1]).as_input();
+    let state = ctx.new_tensor(types::F32, &[s, s, n_v, 1]).as_input();
+    let z = ctx.new_tensor(types::F32, &[s * n_v, nt]).as_input();
+    let norm_w = ctx.new_tensor(types::F32, &[s]).as_input();
+    let es = 4usize;
+    let nb = [s as usize * es, row as usize * es, (row * nt) as usize * es];
+    let q = ctx.view_4d(conv, [s, n_k, nt, 1], nb, 0);
+    let k = ctx.view_4d(conv, [s, n_k, nt, 1], nb, (s * n_k) as usize * es);
+    let v = ctx.view_4d(conv, [s, n_v, nt, 1], nb, (2 * s * n_k) as usize * es);
+    let qkv = [q, k, v, g, beta];
+    let (rows_node, ob) = gdn_mma_gn(&ctx, qkv, state, z, norm_w, 1e-6, true);
+    norm_on(rows_node);
+    let want = fp8_act::plain_bf16(&ctx, ob).as_output();
+    let (codes_node, _) = gdn_mma_gn(&ctx, qkv, state, z, norm_w, 1e-6, true);
+    let got = codes_on(&ctx, codes_node);
+    codes_node.as_output();
+    // SAFETY: graph nodes built above.
+    unsafe {
+        assert!(is_codes(codes_node.raw()) && !is_codes(rows_node.raw()));
+    }
+    let mut graph = ctx.new_graph(64);
+    graph.expand(want);
+    graph.expand(got);
+    ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+        .unwrap();
+    let mut x = noise((row * nt) as usize, 1);
+    for tok in x.chunks_mut(row as usize) {
+        for head in tok[..(2 * s * n_k) as usize].chunks_mut(s as usize) {
+            let n = head.iter().map(|v| v * v).sum::<f32>().sqrt();
+            head.iter_mut().for_each(|v| *v /= n);
+        }
+    }
+    conv.set_f32(&x);
+    let gb = (n_v * nt) as usize;
+    let map = |seed, f: fn(f32) -> f32| noise(gb, seed).into_iter().map(f).collect::<Vec<_>>();
+    g.set_f32(&map(2, |v| 0.5 * (v - 1.0)));
+    beta.set_f32(&map(3, |v| 0.5 * (v + 1.0)));
+    let s0: Vec<f32> = noise((s * s * n_v) as usize, 4)
+        .iter()
+        .map(|v| 0.1 * v)
+        .collect();
+    state.set_f32(&s0);
+    // A gate spread over a few heads' worth of scale, so tokens' amaxes come from any head.
+    let zs: Vec<f32> = noise((s * n_v * nt) as usize, 5)
+        .iter()
+        .map(|v| 3.0 * v)
+        .collect();
+    z.set_f32(&zs);
+    norm_w.set_f32(
+        &noise(s as usize, 6)
+            .iter()
+            .map(|v| 1.0 + 0.5 * v)
+            .collect::<Vec<_>>(),
+    );
+    CODES_RAN.store(-1, Ordering::Relaxed);
+    gpu.compute(&graph).unwrap();
+    let ran = CODES_RAN.load(Ordering::Relaxed);
+    assert!(ran >= 0, "the codes node ran: {:?}", (n_k, n_v, nt));
+    let (want, got) = (want.bytes(), got.bytes());
+    assert_eq!(want.len(), got.len());
+    let (kk, n) = ((s * n_v) as usize, nt as usize);
+    let i = want.iter().zip(&got).position(|(a, b)| a != b);
+    let at = i.map(|i| {
+        if i < kk * n {
+            format!("code of token {}, column {}", i / kk, i % kk)
+        } else {
+            format!("scale of token {}", (i - kk * n) / 4)
+        }
+    });
+    assert_eq!(at, None, "{:?} ran {ran}", (n_k, n_v, nt));
+    ran
+}
+
+/// [`codes_case`] at one GPU's heads of Qwen3.8-Flash-Next at token counts that are not a
+/// multiple of the chunk, and fewer heads: [`CODES_KERNEL`] where it runs (whole heads on
+/// [`Schedule::WideTwo`], compute capability 12.x with at least as many SMs as heads).
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU of compute capability 8.0+"]
+fn cuda_codes_match_norm_then_fp8_act() {
+    let _lock = lock();
+    let mut gpu = codes_gpu();
+    for c in [
         (16, 48, 777),
         (16, 48, 4096 + 5),
         (8, 24, 300),
         (16, 48, 64),
     ] {
-        let s = HEAD;
-        let row = 2 * s * n_k + s * n_v;
-        let ctx = Context::new(64, 64);
-        let conv = ctx.new_tensor(types::F32, &[row, nt, 1]).as_input();
-        let g = ctx.new_tensor(types::F32, &[1, n_v, nt, 1]).as_input();
-        let beta = ctx.new_tensor(types::F32, &[1, n_v, nt, 1]).as_input();
-        let state = ctx.new_tensor(types::F32, &[s, s, n_v, 1]).as_input();
-        let z = ctx.new_tensor(types::F32, &[s * n_v, nt]).as_input();
-        let norm_w = ctx.new_tensor(types::F32, &[s]).as_input();
-        let es = 4usize;
-        let nb = [s as usize * es, row as usize * es, (row * nt) as usize * es];
-        let q = ctx.view_4d(conv, [s, n_k, nt, 1], nb, 0);
-        let k = ctx.view_4d(conv, [s, n_k, nt, 1], nb, (s * n_k) as usize * es);
-        let v = ctx.view_4d(conv, [s, n_v, nt, 1], nb, (2 * s * n_k) as usize * es);
-        let qkv = [q, k, v, g, beta];
-        let (rows_node, ob) = gdn_mma_gn(&ctx, qkv, state, z, norm_w, 1e-6, true);
-        norm_on(rows_node);
-        let want = fp8_act::plain_bf16(&ctx, ob).as_output();
-        let (codes_node, _) = gdn_mma_gn(&ctx, qkv, state, z, norm_w, 1e-6, true);
-        let got = codes_on(&ctx, codes_node);
-        codes_node.as_output();
-        // SAFETY: graph nodes built above.
-        unsafe {
-            assert!(is_codes(codes_node.raw()) && !is_codes(rows_node.raw()));
-        }
-        let mut graph = ctx.new_graph(64);
-        graph.expand(want);
-        graph.expand(got);
-        ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
-            .unwrap();
-        let mut x = noise((row * nt) as usize, 1);
-        for tok in x.chunks_mut(row as usize) {
-            for head in tok[..(2 * s * n_k) as usize].chunks_mut(s as usize) {
-                let n = head.iter().map(|v| v * v).sum::<f32>().sqrt();
-                head.iter_mut().for_each(|v| *v /= n);
-            }
-        }
-        conv.set_f32(&x);
-        let gb = (n_v * nt) as usize;
-        let map = |seed, f: fn(f32) -> f32| noise(gb, seed).into_iter().map(f).collect::<Vec<_>>();
-        g.set_f32(&map(2, |v| 0.5 * (v - 1.0)));
-        beta.set_f32(&map(3, |v| 0.5 * (v + 1.0)));
-        let s0: Vec<f32> = noise((s * s * n_v) as usize, 4)
-            .iter()
-            .map(|v| 0.1 * v)
-            .collect();
-        state.set_f32(&s0);
-        // A gate spread over a few heads' worth of scale, so tokens' amaxes come from any head.
-        let zs: Vec<f32> = noise((s * n_v * nt) as usize, 5)
-            .iter()
-            .map(|v| 3.0 * v)
-            .collect();
-        z.set_f32(&zs);
-        norm_w.set_f32(
-            &noise(s as usize, 6)
-                .iter()
-                .map(|v| 1.0 + 0.5 * v)
-                .collect::<Vec<_>>(),
-        );
-        gpu.compute(&graph).unwrap();
-        let (want, got) = (want.bytes(), got.bytes());
-        assert_eq!(want.len(), got.len());
-        let (kk, n) = ((s * n_v) as usize, nt as usize);
-        let i = want.iter().zip(&got).position(|(a, b)| a != b);
-        let at = i.map(|i| {
-            if i < kk * n {
-                format!("code of token {}, column {}", i / kk, i % kk)
-            } else {
-                format!("scale of token {}", (i - kk * n) / 4)
-            }
-        });
-        assert_eq!(at, None, "{:?}", (n_k, n_v, nt));
+        codes_case(&mut gpu, c);
+    }
+}
+
+/// [`codes_case`] down the fallbacks, each checked to be the path taken (#1183, the default on
+/// a GPU with fewer SMs than heads): [`GN_KERNEL`] writing the BF16 rows, then `fp8_act`'s
+/// kernel over them (more heads than [`CODES_HEADS`] on [`Schedule::WideTwo`], forced so on any
+/// GPU); the plain kernel, `gated_norm_bf16_rows` and `fp8_act`'s kernel writing the codes over
+/// the F32 rows the norm read ([`Schedule::Heads`] forced); and more heads than
+/// [`CODES_HEADS`] under the schedule rule (either of the two). The slots' memset runs in each.
+/// The force is reset after, also when a case fails.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU of compute capability 8.0+"]
+fn cuda_codes_fallbacks_match_norm_then_fp8_act() {
+    let _lock = lock();
+    let mut gpu = codes_gpu();
+    let _unforce = Unforce;
+    for c in [(8, 56, 777), (8, 64, 4096 + 5)] {
+        assert_ne!(codes_case(&mut gpu, c), Ran::Codes as i8, "{c:?}");
+    }
+    force_schedule(Some(Schedule::WideTwo));
+    for c in [(8, 56, 777), (8, 64, 4096 + 5), (1, 49, 64)] {
+        assert_eq!(codes_case(&mut gpu, c), Ran::Norm as i8, "{c:?}");
+    }
+    force_schedule(Some(Schedule::Heads));
+    for c in [(8, 48, 777), (8, 48, 4096 + 5), (8, 24, 300), (8, 56, 64)] {
+        assert_eq!(codes_case(&mut gpu, c), Ran::Plain as i8, "{c:?}");
     }
 }
 
