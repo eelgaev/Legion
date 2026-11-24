@@ -2301,7 +2301,8 @@ impl Model {
 
     /// [`Self::qsa_select`] of a prompt group of more than [`QSA_SCORE_CHUNK`] tokens, chunk by
     /// chunk (#1183): each chunk of [`qsa_score_chunks`] scores the pools for its tokens, picks
-    /// the best and selects, then the chunks' rows join in order. The scores (F32 `[n_pool,
+    /// the best and selects into its tokens' rows of the group's selection
+    /// ([`qsa_attn::select_rows`], then [`qsa_attn::select_into`] in place). The scores (F32 `[n_pool,
     /// tokens]`, the step's one buffer that grows with tokens times context) are freed after
     /// their chunk's select, so the chunks reuse one chunk's memory: the step's compute buffer
     /// grows about linearly in its tokens instead of with tokens times context.
@@ -2331,25 +2332,30 @@ impl Model {
         let pooled = self.qsa_pool_keys(pass, il, gi)?;
         let keys = ctx.reshape_3d(ctx.get_rows(pooled, inp.pool_cells), d, 1, n_pool);
         let (qnb, es) = (iq.nb(), pass.pos.element_size());
-        let parts: Vec<Tensor<'a>> = chunks
-            .iter()
-            .map(|&(a, m)| {
-                let (a, m) = (a as i64, m as i64);
-                let first = off as usize + a as usize;
-                let qg = ctx.view_3d(iq, [d, q.n_head, m], [qnb[1], qnb[2]], first * qnb[2]);
-                let w = ctx.fill(
-                    ctx.new_tensor(types::F32, &[q.n_head, m]),
-                    1.0 / (d as f32).sqrt(),
-                );
-                let vis = crate::model::core::cols(ctx, inp.pool_vis, a, m);
-                let score = qsa_attn::scores_exact(ctx, qg, keys, w, vis, inp.pool_bias);
-                let top = qsa_attn::top_k(ctx, score, n_top);
-                let tail = crate::model::core::cols(ctx, inp.tail_idxs, a, m);
-                let pos = ctx.view_2d(pass.pos, [m, 1], m as usize * es, first * es);
-                qsa_attn::select(ctx, top, score, inp.pool_idxs, tail, pos)
-            })
-            .collect();
-        Ok(crate::model::core::concat_tree(ctx, parts))
+        let ng = chunks.iter().map(|c| c.0 + c.1).max().unwrap_or(0) as i64;
+        // The first chunk's select makes the group's rows, each later one writes its rows over
+        // them in place (no concat: the rows are written once).
+        let mut rows: Option<Tensor<'a>> = None;
+        for &(a, m) in chunks {
+            let (a, m) = (a as i64, m as i64);
+            let first = off as usize + a as usize;
+            let qg = ctx.view_3d(iq, [d, q.n_head, m], [qnb[1], qnb[2]], first * qnb[2]);
+            let w = ctx.fill(
+                ctx.new_tensor(types::F32, &[q.n_head, m]),
+                1.0 / (d as f32).sqrt(),
+            );
+            let vis = crate::model::core::cols(ctx, inp.pool_vis, a, m);
+            let score = qsa_attn::scores_exact(ctx, qg, keys, w, vis, inp.pool_bias);
+            let top = qsa_attn::top_k(ctx, score, n_top);
+            let tail = crate::model::core::cols(ctx, inp.tail_idxs, a, m);
+            let pos = ctx.view_2d(pass.pos, [m, 1], m as usize * es, first * es);
+            let pidx = inp.pool_idxs;
+            rows = Some(match rows {
+                None => qsa_attn::select_rows(ctx, top, score, pidx, tail, pos, ng),
+                Some(r) => qsa_attn::select_into(ctx, r, a, top, score, pidx, tail, pos),
+            });
+        }
+        Ok(rows.expect("no chunks"))
     }
 
     /// Where group `gi` of sparse-attention layer `il` runs its indexer on this rank's share of

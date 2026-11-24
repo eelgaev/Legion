@@ -49,6 +49,15 @@ static SELECT: ExternalOp = ExternalOp {
     cuda: None,
 };
 
+static SELECT_INTO: ExternalOp = ExternalOp {
+    name: "qsa_select_into",
+    cpu: cpu_select_into,
+    #[cfg(feature = "cuda")]
+    cuda: Some(cuda_select_into),
+    #[cfg(not(feature = "cuda"))]
+    cuda: None,
+};
+
 static SELECT_ALL: ExternalOp = ExternalOp {
     name: "qsa_select_all",
     cpu: cpu_select_all,
@@ -451,14 +460,66 @@ pub fn select<'a>(
     tail: Tensor<'a>,
     pos: Tensor<'a>,
 ) -> Tensor<'a> {
-    let [n_top, ng, ..] = top.ne();
+    select_rows(ctx, top, score, pool_idxs, tail, pos, top.ne()[1])
+}
+
+/// [`select`] of the first `top.ne[1]` of a step's `tokens` tokens, in a node with a row for
+/// every token: [`select_into`] writes the later tokens' rows over it in place (#1183: a
+/// prompt step's selections chunk by chunk without a concat). The rows past `top`'s tokens
+/// are the node's until then.
+pub fn select_rows<'a>(
+    ctx: &'a Context,
+    top: Tensor<'a>,
+    score: Tensor<'a>,
+    pool_idxs: Tensor<'a>,
+    tail: Tensor<'a>,
+    pos: Tensor<'a>,
+    tokens: i64,
+) -> Tensor<'a> {
+    let n_top = top.ne()[0];
+    assert!(top.ne()[1] <= tokens, "qsa_select: more tokens than rows");
     let kpool = pool_idxs.ne()[0];
     let cap = n_top * kpool + kpool - 1;
     ctx.external(
         &SELECT,
         types::I32,
-        [1 + cap, ng, 1, 1],
+        [1 + cap, tokens, 1, 1],
         &[top, score, pool_idxs, tail, pos],
+    )
+}
+
+/// [`select`] of tokens `first..first + top.ne[1]` written over those rows of `rows` (a
+/// [`select_rows`] or [`select_into`] node of the same picks per token, read by nothing else)
+/// in place, the rest of its rows left as they are.
+#[allow(clippy::too_many_arguments)]
+pub fn select_into<'a>(
+    ctx: &'a Context,
+    rows: Tensor<'a>,
+    first: i64,
+    top: Tensor<'a>,
+    score: Tensor<'a>,
+    pool_idxs: Tensor<'a>,
+    tail: Tensor<'a>,
+    pos: Tensor<'a>,
+) -> Tensor<'a> {
+    let [n_top, ng, ..] = top.ne();
+    let kpool = pool_idxs.ne()[0];
+    assert_eq!(
+        rows.ne()[0],
+        1 + n_top * kpool + kpool - 1,
+        "qsa_select_into: row length"
+    );
+    assert!(
+        first >= 0 && first + ng <= rows.ne()[1],
+        "qsa_select_into: rows {first}..{} of {}",
+        first + ng,
+        rows.ne()[1]
+    );
+    ctx.external_inplace(
+        &SELECT_INTO,
+        rows,
+        &[top, score, pool_idxs, tail, pos],
+        &[first as i32],
     )
 }
 
@@ -609,7 +670,7 @@ pub(crate) fn gated_codes<'a>(
         let mut args: Vec<Tensor<'a>> = (0..5).map(|i| ctx.wrap((*node).src[i])).collect();
         args.push(gate);
         let (_, total) = crate::model::fp8::dynamic_layout(k, tokens);
-        let bytes = codes_scratch(total) + 4 * (k * tokens) as usize + codes_sync(tokens);
+        let bytes = codes_scratch(total) + 4 * (k * tokens) as usize;
         let node = ctx.external(&ATTN_CODES, types::I8, [bytes as i64, 1, 1, 1], &args);
         Some(ctx.view_1d(node, total as i64, 0))
     }
@@ -626,16 +687,10 @@ pub(crate) unsafe fn is_gated_codes(node: *const ffi::ggml_tensor) -> bool {
 }
 
 /// Where a [`gated_codes`] node's F32 rows start: after the packed activations (`total`
-/// bytes), aligned to 256 bytes. Then `tokens` rows of `d * n_head` values (attention's output
-/// or, on the GB10 kernel, the gated values of the CTAs that finish a token first), then the
-/// kernel's per-token counters ([`codes_sync`]).
+/// bytes), aligned to 256 bytes: `tokens` rows of `d * n_head` values, attention's output
+/// where a kernel other than the GB10's CODES one ran.
 fn codes_scratch(total: usize) -> usize {
     total.next_multiple_of(256)
-}
-
-/// Bytes of the GB10 kernel's per-token counters: a ticket, a done count and the amax bits.
-fn codes_sync(tokens: i64) -> usize {
-    12 * tokens as usize
 }
 
 /// Most tokens a step may have for the split decode kernel.
@@ -863,9 +918,25 @@ fn select_row(
 }
 
 unsafe fn cpu_select(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
-    // SAFETY: a node made by `select`, host tensors.
+    // SAFETY: a node made by `select_rows`.
+    unsafe { cpu_select_at(dst, 0, 0, ith, nth) }
+}
+
+unsafe fn cpu_select_into(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
+    let first = crate::ggml::external_params(dst)[0] as usize;
+    // SAFETY: a node made by `select_into`: its operands follow the rows it writes over.
+    unsafe { cpu_select_at(dst, 1, first, ith, nth) }
+}
+
+/// [`select`]'s rows on the host for the operands at `dst.src[s0..s0 + 5]`, token `t` of them
+/// into row `first + t` of `dst`.
+///
+/// # Safety
+/// A node made by [`select_rows`] (`s0` 0) or [`select_into`] (1), host tensors.
+unsafe fn cpu_select_at(dst: &ffi::ggml_tensor, s0: usize, first: usize, ith: usize, nth: usize) {
+    // SAFETY: the caller's.
     unsafe {
-        let src = |i: usize| &*dst.src[i];
+        let src = |i: usize| &*dst.src[s0 + i];
         let (top, score, pidx, tail, pos) = (src(0), src(1), src(2), src(3), src(4));
         let (n_top, ng) = (top.ne[0] as usize, top.ne[1] as usize);
         let kpool = pidx.ne[0] as usize;
@@ -882,7 +953,7 @@ unsafe fn cpu_select(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
             );
             let p = at_i32((pos.data as *const u8).add(t * pos.nb[0]), 0);
             let out = std::slice::from_raw_parts_mut(
-                (dst.data as *mut u8).add(t * dst.nb[1]) as *mut i32,
+                (dst.data as *mut u8).add((first + t) * dst.nb[1]) as *mut i32,
                 row_len,
             );
             select_row(
@@ -1267,8 +1338,6 @@ struct CodesOperands {
     gate_ld: usize,
     codes: *mut u8,
     scales: *mut f32,
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-    sync: *mut u32,
 }
 
 impl CodesOperands {
@@ -1291,7 +1360,6 @@ impl CodesOperands {
                 gate_ld: gate.nb[2] / 4,
                 codes: base,
                 scales: base.add(codes) as *mut f32,
-                sync: base.add(scratch + 4 * k * tokens) as *mut u32,
             }
         }
     }
@@ -1409,13 +1477,12 @@ mod cuda {
         /// through L1.
         pub gw_cg: i32,
         /// [`super::gated_codes`] (null: off): the gate (strides in floats), the codes and
-        /// scales written instead of the output, and the kernel's zeroed per-token counters.
+        /// scales written instead of the output.
         pub gate: *const f32,
         pub gate_ld: i64,
         pub gate_hd: i64,
         pub codes: *mut u8,
         pub scales: *mut f32,
-        pub sync: *mut u32,
     }
 
     #[repr(C)]
@@ -1478,7 +1545,6 @@ mod cuda {
         pub fn legion_qsa_pool_mask_launch(p: *const PoolMask, stream: *mut c_void) -> i32;
         pub fn legion_qsa_select_launch(p: *const Select, stream: *mut c_void) -> i32;
         pub fn legion_qsa_attn_launch(p: *const Attn, stream: *mut c_void) -> i32;
-        pub fn cudaMemsetAsync(p: *mut c_void, v: i32, n: usize, stream: *mut c_void) -> i32;
     }
 }
 
@@ -1517,9 +1583,32 @@ unsafe fn cuda_pool_mask(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
 
 #[cfg(feature = "cuda")]
 unsafe fn cuda_select(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
-    // SAFETY: a node made by `select`, device tensors of the stream's device.
+    // SAFETY: a node made by `select_rows`.
+    unsafe { cuda_select_at(dst, 0, 0, stream) }
+}
+
+#[cfg(feature = "cuda")]
+unsafe fn cuda_select_into(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
+    let first = crate::ggml::external_params(dst)[0] as usize;
+    // SAFETY: a node made by `select_into`: its operands follow the rows it writes over.
+    unsafe { cuda_select_at(dst, 1, first, stream) }
+}
+
+/// [`cpu_select_at`] on CUDA.
+///
+/// # Safety
+/// A node made by [`select_rows`] (`s0` 0) or [`select_into`] (1), device tensors of the
+/// stream's device.
+#[cfg(feature = "cuda")]
+unsafe fn cuda_select_at(
+    dst: &ffi::ggml_tensor,
+    s0: usize,
+    first: usize,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    // SAFETY: the caller's.
     unsafe {
-        let src = |i: usize| &*dst.src[i];
+        let src = |i: usize| &*dst.src[s0 + i];
         let (top, score, pidx, tail, pos) = (src(0), src(1), src(2), src(3), src(4));
         let n_top = top.ne[0] as usize;
         if n_top > CUDA_MAX_TOP {
@@ -1538,7 +1627,7 @@ unsafe fn cuda_select(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(),
             tail_nb1: tail.nb[1] as i64,
             pos: pos.data as *const i32,
             pos_nb0: pos.nb[0] as i64,
-            dst: dst.data as *mut i32,
+            dst: (dst.data as *mut u8).add(first * dst.nb[1]) as *mut i32,
             dst_nb1: dst.nb[1] as i64,
             n_top: n_top as i32,
             kpool: pidx.ne[0] as i32,
@@ -1661,12 +1750,6 @@ unsafe fn cuda_attn_codes(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
     p.gate_ld = c.gate_ld as i64;
     p.codes = c.codes;
     p.scales = c.scales;
-    p.sync = c.sync;
-    // SAFETY: the node's counters, `codes_sync(tokens)` bytes.
-    let e = unsafe { cuda::cudaMemsetAsync(c.sync as *mut c_void, 0, codes_sync(tokens), stream) };
-    if e != 0 {
-        return Err(format!("qsa_attn_codes: cudaMemsetAsync failed ({e})"));
-    }
     // SAFETY: the parameters' device pointers.
     let r = match unsafe { cuda::legion_qsa_attn_launch(&p, stream) } {
         3 => {
@@ -1764,7 +1847,6 @@ fn attn_params(o: &Operands) -> Result<cuda::Attn, String> {
         gate_hd: 0,
         codes: std::ptr::null_mut(),
         scales: std::ptr::null_mut(),
-        sync: std::ptr::null_mut(),
     };
     Ok(p)
 }

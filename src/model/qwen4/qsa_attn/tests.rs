@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::ggml::{Backend, ComputeAllocator};
-use crate::model::core::{KvPool, KvType, KvTypes};
+use crate::model::core::{KvPool, KvType, KvTypes, cols};
 
 pub(super) use super::bench::{f16_bytes, hparams, noise};
 
@@ -1110,7 +1110,7 @@ fn pick_all_case(
 ) -> (Vec<i32>, Vec<i32>, f64, f64) {
     let (d, nh, kpool) = (128i64, 4i64, 4usize);
     let ng = pools.len() * n_tok;
-    let ctx = Context::new(64, 64);
+    let ctx = Context::new(128, 64);
     let q = ctx.new_tensor(types::F32, &[d, nh, ng as i64]).as_input();
     let keys = ctx
         .new_tensor(types::F32, &[d, 1, n_pool as i64])
@@ -1130,12 +1130,27 @@ fn pick_all_case(
     let top = top_k(&ctx, score, n_top as i64);
     let chain = select(&ctx, top, score, pidx, tail, pos).as_output();
     let all = select_all(&ctx, vis, n_top as i64, pidx, tail, pos).as_output();
+    // The same selection in three chunks of tokens (#1183): `select_rows` of the first, then
+    // `select_into` of the others in place.
+    let ngi = ng as i64;
+    let mut rows = None;
+    for (a, b) in [(0, ngi / 3), (ngi / 3, 2 * ngi / 3), (2 * ngi / 3, ngi)] {
+        let m = b - a;
+        let (top, score) = (cols(&ctx, top, a, m), cols(&ctx, score, a, m));
+        let (tail, pos) = (cols(&ctx, tail, a, m), ctx.view_1d(pos, m, a as usize * 4));
+        rows = Some(match rows {
+            None => select_rows(&ctx, top, score, pidx, tail, pos, ngi),
+            Some(r) => select_into(&ctx, r, a, top, score, pidx, tail, pos),
+        });
+    }
+    let chunked = rows.unwrap().as_output();
     let (mut g_chain, mut g_all, mut both) =
         (ctx.new_graph(64), ctx.new_graph(64), ctx.new_graph(64));
     g_chain.expand(chain);
     g_all.expand(all);
     both.expand(chain);
     both.expand(all);
+    both.expand(chunked);
     ctx.alloc_graph(&both, ComputeAllocator::new(backend.buffer_type()))
         .unwrap();
     q.set_f32(&noise(d as usize * nh as usize * ng, 1));
@@ -1174,7 +1189,10 @@ fn pick_all_case(
         t0.elapsed().as_secs_f64() / reps.max(1) as f64
     };
     let (t_chain, t_all) = (time(&g_chain), time(&g_all));
-    (chain.to_i32(), all.to_i32(), t_chain, t_all)
+    let (chain, all) = (chain.to_i32(), all.to_i32());
+    backend.compute(&both).unwrap();
+    assert_eq!(chunked.to_i32(), chain, "chunked select_rows / select_into");
+    (chain, all, t_chain, t_all)
 }
 
 /// (pools per sequence, listed pools, picks, tokens per sequence): one decode sequence, a

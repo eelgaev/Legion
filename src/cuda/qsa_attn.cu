@@ -108,15 +108,13 @@ struct legion_qsa_attn {
     // of `gate` (head h of token t at gate + t * gate_ld + h * gate_hd, F32) and quantized per
     // token as fp8_act.cu's gate kind does it, written as `codes` (E4M3 [d * n_head, tokens])
     // and `scales` (F32 [tokens]) instead of the output. attn_gw_kernel does that where the
-    // launcher runs it (then 0); every other kernel writes the output to `dst` as without
-    // codes (then 3: the caller quantizes it). `sync`: 3 * tokens zeroed words (attn_gw_kernel's
-    // per-token counters and amax); `dst` then holds the gated rows of the CTAs that finish a
-    // token first.
+    // launcher runs it (then 0: a cluster launch on compute capability 9.0+, `dst` unused);
+    // every other kernel writes the output to `dst` as without codes (then 3: the caller
+    // quantizes it).
     const float * gate;
     int64_t gate_ld, gate_hd;  // floats
     uint8_t * codes;
     float * scales;
-    uint32_t * sync;
 };
 
 int legion_qsa_pool_mask_launch(const legion_qsa_pool_mask * p, void * stream);
@@ -1457,9 +1455,9 @@ __global__ void __launch_bounds__(128) qsa_scores_kernel(const legion_qsa_scores
 
 // attn_gw_kernel<HD, VAR> (sm80/qsa_attn_gb10.cuh): ~39 KB at HD 256, under the 48 KB default,
 // two CTAs per SM with the largest shared-memory carveout (GW_ONE: 64 KB, one CTA per SM).
-template <int HD, int VAR, bool CODES = false>
+template <int HD, int VAR>
 int launch_gw_variant(const legion_qsa_attn & p, cudaStream_t st) {
-    void (*kern)(legion_qsa_attn) = attn_gw_kernel<HD, VAR, CODES>;
+    void (*kern)(legion_qsa_attn) = attn_gw_kernel<HD, VAR>;
     int bytes = (int) sizeof(GbSmem<HD>);
     if constexpr ((VAR & GW_ONE) != 0) {
         bytes = 64 * 1024;  // over half of the SM's shared memory
@@ -1474,6 +1472,57 @@ int launch_gw_variant(const legion_qsa_attn & p, cudaStream_t st) {
     }
     kern<<<dim3(p.grid[0], p.grid[1]), THREADS, bytes, st>>>(p);
     return cudaGetLastError() == cudaSuccess ? 0 : 2;
+}
+
+// attn_gw_kernel's CODES variant (#1183): a 1-D grid of token * kv head CTAs in clusters of a
+// token's kv heads, which share their amax through distributed shared memory. 1 where the
+// device or shape cannot take it (compute capability under 9.0, over 8 kv heads, or the
+// cluster launch refused): the caller then runs the kernel without codes.
+template <int HD>
+int launch_gw_codes(const legion_qsa_attn & p, cudaStream_t st) {
+    static std::atomic<int> cc9[64];  // per device: 0 unknown, 1 sm_90+, 2 not
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
+        return 1;
+    }
+    int c = cc9[dev].load(std::memory_order_acquire);
+    if (c == 0) {
+        int major = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        (void) cudaGetLastError();
+        c = major >= 9 ? 1 : 2;
+        cc9[dev].store(c, std::memory_order_release);
+    }
+    if (c != 1 || p.n_head_kv < 1 || p.n_head_kv > 8) {
+        return 1;
+    }
+    void (*kern)(legion_qsa_attn) = attn_gw_kernel<HD, GW_CA, true>;
+    if (cudaFuncSetAttribute(kern, cudaFuncAttributePreferredSharedMemoryCarveout,
+                             cudaSharedmemCarveoutMaxShared) != cudaSuccess) {
+        return 2;
+    }
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeClusterDimension;
+    attr[0].val.clusterDim.x = (unsigned) p.n_head_kv;
+    attr[0].val.clusterDim.y = 1;
+    attr[0].val.clusterDim.z = 1;
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(p.grid[0] * p.grid[1]);
+    cfg.blockDim = dim3(THREADS);
+    cfg.dynamicSmemBytes = sizeof(GbSmem<HD>);
+    cfg.stream = st;
+    cfg.attrs = attr;
+    cfg.numAttrs = 1;
+    if (cudaLaunchKernelEx(&cfg, kern, p) != cudaSuccess) {
+        (void) cudaGetLastError();
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true)) {
+            fprintf(stderr, "legion: the QSA prompt kernel's cluster launch failed; the FP8 "
+                            "codes take fp8_act's gate kernel\n");
+        }
+        return 1;
+    }
+    return 0;
 }
 
 template <int HD>
@@ -1510,8 +1559,10 @@ int launch_attn(const legion_qsa_attn & p, cudaStream_t st) {
         const int gb = p.mma_kernel == 1 ? 0 : use_gb<HD>(p.mma_kernel);
         if (gb == 3) {
             if (p.codes != nullptr && !p.gw_cg) {
-                const int r = launch_gw_variant<HD, GW_CA, true>(p, st);
-                return r == 0 ? CODES_WRITTEN : r;
+                const int r = launch_gw_codes<HD>(p, st);
+                if (r != 1) {
+                    return r == 0 ? CODES_WRITTEN : r;
+                }
             }
             return p.gw_cg ? launch_gw_variant<HD, 0>(p, st) : launch_gw_variant<HD, GW_CA>(p, st);
         }
