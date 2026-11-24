@@ -25,7 +25,9 @@
 //! rows of the experts the other ranks hold, which the grouped kernels stored as zeros). Where
 //! that op alone reads the experts' rows, nothing reads those rows at all, so the grouped NVFP4
 //! down matmul (and the SwiGLU on its plan that only it reads) stores no zeros for them
-//! ([`nvfp4_mm::unread_nodes`]); every value read is the same.
+//! ([`nvfp4_mm::unread_nodes`]); every value read is the same. With BF16 expert rows read back
+//! as F32 (`--nvfp4-expert-rows-bf16`, #1183) the op reads the BF16 rows and the exact cast
+//! goes, as the folded norms read them (not under `--tp-moe-ep`).
 //!
 //! Lazy streams (#1183, after the folds; `legion serve --no-hc-lazy-streams` turns them off):
 //! a layer's FFN mixer combine-and-norm makes the new residual streams `R_f = O_a · w + R_a`
@@ -43,11 +45,21 @@
 //! 100), the attention mixer's (the one holding `R_a`) loses the unused rest of `xn`'s place
 //! (60 KB, not 100), so a prompt step's compute buffer is no larger than with the streams
 //! written, though `R_a` (with that node's other parts) and `O_a` live longer.
+//!
+//! One BF16 cast (#1183, after the folds; `--dense-fp8-prompt`): a MoE layer's input is cast to
+//! BF16 twice, once for the NVFP4 experts and once for the shared expert's FP8 codes
+//! ([`crate::model::fp8_act::plain_bf16`]). The later cast becomes a view of the earlier one:
+//! the same bytes (one `__float2bfloat16` a value, in order), written once, and the earlier
+//! cast stays alive until the codes are made. It is done here, not where the graph is built,
+//! because the graph as built must stay as it is: its layout decides which tails round as
+//! ggml-cuda's fused sum (a graph built with one cast fewer moved two of them).
 
+use std::collections::hash_map::Entry;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{
-    FMA_SKIP, Gate, Graph, MOE_SUM_GATE, Node, ON, Sum, f32_contiguous, is_view_op, root, span,
+    AddrMap, FMA_SKIP, Gate, Graph, MOE_SUM_GATE, Node, ON, Sum, f32_contiguous, is_view_op, root,
+    span,
 };
 use crate::ggml::post_alloc::{Relaid, Relayout};
 use crate::ggml::{ffi, make_external};
@@ -113,6 +125,7 @@ unsafe fn rewrite(graph: *mut ffi::ggml_cgraph, cuda: bool) -> Option<Box<dyn Re
             fma,
             lazy_streams = undo.lazy,
             compact = undo.compact,
+            one_cast = undo.one_cast,
             left = undo.left.len(),
             unread = UNREAD.load(Ordering::Relaxed),
             by_exchange = TAKEN.load(Ordering::Relaxed),
@@ -141,6 +154,7 @@ pub(crate) unsafe fn fold_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> (Un
             cuda,
             lazy: 0,
             compact: 0,
+            one_cast: 0,
         };
         let (mut folded, mut fma) = (0, 0);
         for i in 0..n {
@@ -161,6 +175,11 @@ pub(crate) unsafe fn fold_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> (Un
         if folded > 0 && lazy_streams() {
             (undo.lazy, undo.compact) = g.lazy_streams(cuda, &mut undo.saved);
         }
+        // After every tail's rounding is read off the graph as built (see the module doc), and
+        // only where the graph is planned again (some tail folded).
+        if folded > 0 {
+            undo.one_cast = g.one_cast(&mut undo.saved);
+        }
         (undo, folded, fma)
     }
 }
@@ -177,6 +196,8 @@ pub(crate) struct Undo {
     pub(crate) lazy: usize,
     /// Norm nodes of those laid out without their unwritten bytes (see the module doc).
     pub(crate) compact: usize,
+    /// BF16 casts that became views of an earlier cast of the same values (see the module doc).
+    pub(crate) one_cast: usize,
 }
 
 impl Relaid for Undo {
@@ -342,15 +363,23 @@ impl Graph {
             let a = self.nodes[gt.add];
             let mut dead: Vec<usize> = (s.at..=s.last).collect();
             dead.extend(&gt.chain);
+            // Rows of zero weights skipped only under --tp-moe-ep, where they hold +0.0.
+            let ep = crate::model::core::tp_ep::active() && crate::model::core::tp_ep::skip();
+            let fma = if ep { FMA_SKIP } else { 1 };
+            // BF16 rows read back as F32 (`--nvfp4-expert-rows-bf16`, #1183): the op reads the
+            // BF16 rows (the cast is exact) and the cast goes too, as in `fold_tail` (not under
+            // --tp-moe-ep, whose unread rows are marked from the F32 rows' node below).
+            let (x, cast) = match (!ep).then(|| self.bf16_rows(s.experts, s.at)).flatten() {
+                Some((rows, i)) => (rows, Some(i)),
+                None => (s.experts, None),
+            };
+            dead.extend(cast);
             saved.push((a, std::ptr::read(a)));
             saved.extend(
                 dead.iter()
                     .map(|&i| (self.nodes[i], std::ptr::read(self.nodes[i]))),
             );
-            let srcs = [s.experts, s.weights, gt.sh, gt.g];
-            // Rows of zero weights skipped only under --tp-moe-ep, where they hold +0.0.
-            let ep = crate::model::core::tp_ep::active() && crate::model::core::tp_ep::skip();
-            let fma = if ep { FMA_SKIP } else { 1 };
+            let srcs = [x, s.weights, gt.sh, gt.g];
             if ep {
                 // Then nothing reads the other ranks' rows: the grouped kernels need not store
                 // their zeros (the experts' rows read by the tail's `mul` alone, so by the new
@@ -370,7 +399,7 @@ impl Graph {
                 }
             }
             make_external(a, &MOE_SUM_GATE, &srcs, &[1, 1, s.k as i32, fma]);
-            self.retire(&dead, root(s.experts));
+            self.retire(&dead, root(x));
             // The reduce-scatter reading the tail runs it, its values rounded to BF16 straight
             // into the send buffer (#1176; the graph is planned again after this rewrite).
             let rs = match *self.users(a) {
@@ -641,6 +670,119 @@ impl Graph {
             }
             set_compact(node, c.floats);
             true
+        }
+    }
+
+    /// One BF16 cast (see the module doc): where two nodes cast all of one F32 node's values to
+    /// contiguous BF16 ([`Self::bf16_cast_source`]), no node between them writes into that node,
+    /// and one of them is read by FP8 codes made from BF16
+    /// ([`crate::model::fp8_act::plain_bf16`]), the later cast becomes a view of the
+    /// earlier one that reads nothing, and the views of it views of the earlier one: its
+    /// readers read the same bytes, and the earlier cast stays alive until they run. Saves the
+    /// nodes it changes first (each once). How many casts went.
+    ///
+    /// # Safety
+    /// This graph's nodes are valid tensors.
+    pub(crate) unsafe fn one_cast(&mut self, saved: &mut Vec<(Node, ffi::ggml_tensor)>) -> usize {
+        // SAFETY: the caller's; nodes, their sources and their readers are valid tensors.
+        unsafe {
+            let codes = |g: &Self, i: usize| {
+                g.users(g.nodes[i])
+                    .iter()
+                    .any(|&u| !g.none[u] && crate::model::fp8_act::is_plain_bf16(g.nodes[u]))
+            };
+            let output = ffi::ggml_tensor_flag_GGML_TENSOR_FLAG_OUTPUT as i32;
+            let mut first = AddrMap::default();
+            let mut gone = Vec::new();
+            for j in 0..self.nodes.len() {
+                let Some(src) = self.bf16_cast_source(j) else {
+                    continue;
+                };
+                match first.entry(src as usize) {
+                    Entry::Vacant(v) => {
+                        v.insert(j);
+                    }
+                    Entry::Occupied(o) => {
+                        let i = *o.get();
+                        // The values both casts read: no node between them writes into the
+                        // source (an op on a view of it, as ggml's in-place ops and copies
+                        // into a view make).
+                        let kept = (i + 1..j).all(|k| {
+                            let n = self.nodes[k];
+                            self.none[k]
+                                || is_view_op((*n).op)
+                                || (*n).op == ffi::ggml_op_GGML_OP_NONE
+                                || root(n) != src
+                        });
+                        if kept
+                            && (*self.nodes[j]).flags & output == 0
+                            && (codes(self, i) || codes(self, j))
+                        {
+                            gone.push((j, i));
+                        }
+                    }
+                }
+            }
+            for &(j, i) in &gone {
+                let (t, keep) = (self.nodes[j], self.nodes[i]);
+                let views: Vec<Node> = self
+                    .nodes
+                    .iter()
+                    .copied()
+                    .filter(|&v| (*v).view_src == t)
+                    .collect();
+                for v in std::iter::once(t).chain(views.iter().copied()) {
+                    if !saved.iter().any(|&(s, _)| s == v) {
+                        saved.push((v, std::ptr::read(v)));
+                    }
+                }
+                // (`t` is contiguous and as long as `keep`, so a view of it at offset 0 is one of
+                // `keep` at the same offset.)
+                for v in views {
+                    (*v).view_src = keep;
+                }
+                self.retire(&[j], keep);
+            }
+            gone.len()
+        }
+    }
+
+    /// Where node `j` casts all of an F32 node's values to BF16 (ggml's `cast`: a `cpy` into a
+    /// new contiguous tensor, of the node or of a contiguous view of all of it at offset 0):
+    /// that node.
+    ///
+    /// # Safety
+    /// `j` is a node index.
+    unsafe fn bf16_cast_source(&self, j: usize) -> Option<Node> {
+        // SAFETY: the caller's; sources are valid tensors.
+        unsafe {
+            let t = self.nodes[j];
+            if self.none[j]
+                || (*t).op != ffi::ggml_op_GGML_OP_CPY
+                || (*t).type_ != ffi::ggml_type_GGML_TYPE_BF16
+                || (*t).src[1] != t
+                || !(*t).view_src.is_null()
+                || !ffi::ggml_is_contiguous(t)
+            {
+                return None;
+            }
+            let x = (*t).src[0];
+            if x.is_null() {
+                return None;
+            }
+            let src = if (*x).view_src.is_null() {
+                x
+            } else if is_view_op((*x).op) && (*x).view_offs == 0 && ffi::ggml_is_contiguous(x) {
+                (*x).view_src
+            } else {
+                return None;
+            };
+            let n = ffi::ggml_nelements(t);
+            ((*src).view_src.is_null()
+                && f32_contiguous(src)
+                && ffi::ggml_nelements(x) == n
+                && ffi::ggml_nelements(src) == n)
+                .then_some(src)
         }
     }
 
