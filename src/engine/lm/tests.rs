@@ -1197,12 +1197,11 @@ fn fewer_kept_prompt_graphs_leave_less_step_room() {
 
 #[test]
 fn chunked_charge_only_on_the_paged_path() {
-    use crate::model::core::Attention;
-    assert!(paged_step_scores(1, Attention::Auto));
-    assert!(paged_step_scores(1, Attention::Paged));
-    assert!(!paged_step_scores(1, Attention::Gather));
-    assert!(!paged_step_scores(2, Attention::Auto));
-    assert!(!paged_step_scores(2, Attention::Paged));
+    // `paged` is the load's resolved path (`auto` that falls back to gather passes false).
+    assert!(paged_step_scores(1, true));
+    assert!(!paged_step_scores(1, false));
+    assert!(!paged_step_scores(2, true));
+    assert!(!paged_step_scores(2, false));
 }
 
 #[test]

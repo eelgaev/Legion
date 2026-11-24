@@ -2612,14 +2612,17 @@ impl Arch for Qwen4Params {
         self.qsa.as_ref().is_some_and(|q| q.layer(il))
     }
 
-    fn chunks_step_scores(&self, tokens: usize) -> bool {
+    fn chunks_step_scores(&self, hp: &Hparams, tokens: usize) -> bool {
         // `qsa_select`'s chunks (#1183) on the CUDA paged path: [`QSA_SCORE_CHUNK`] tokens at
         // most, with the exact scores and the own `top_k` (not ggml's, nor Volta's
         // tensor-core scores).
         let chunk = QSA_SCORE_CHUNK as i64;
         tokens >= QSA_SCORE_CHUNK
             && self.qsa.as_ref().is_some_and(|q| {
-                !qsa_attn::scores_fit(q.n_head, q.head_dim, chunk)
+                // The sparse layers take the paged op at all ([`Self::paged_for`]'s Auto rule).
+                qsa_attn::supported(hp.head_dim, hp.n_head, hp.n_head_kv)
+                    && q.top_k / q.kpool <= qsa_attn::CUDA_MAX_TOP
+                    && !qsa_attn::scores_fit(q.n_head, q.head_dim, chunk)
                     && qsa_attn::scores_exact_fit(q.n_head, q.head_dim, chunk)
                     && qsa_attn::own_top_k()
             })

@@ -944,11 +944,13 @@ pub(crate) fn kv_headroom_kept(
 }
 
 /// Whether this load's prompt steps can take the chunked QSA scores (#1183,
-/// [`crate::model::core::arch::Arch::chunks_step_scores`]): only on the paged attention path.
-/// `--attention gather` and tensor parallelism (which gathers, see the attention set at load)
-/// score a whole group through the mask, so their steps keep the unchunked charge.
-pub(crate) fn paged_step_scores(tp: usize, attention: crate::model::core::Attention) -> bool {
-    tp <= 1 && attention != crate::model::core::Attention::Gather
+/// [`crate::model::core::arch::Arch::chunks_step_scores`]): only on the paged attention path
+/// as the load resolved it (`paged`: `--attention`, with `auto` falling back to gather where
+/// the device, cache types or kernels do not page). Gather, and tensor parallelism (which
+/// gathers, see the attention set at load), score a whole group through the mask, so their
+/// steps keep the unchunked charge.
+pub(crate) fn paged_step_scores(tp: usize, paged: bool) -> bool {
+    tp <= 1 && paged
 }
 
 /// [`kv_headroom_kept`] for a model that does (`chunked`) or does not score its context in
@@ -3755,6 +3757,8 @@ struct LoadFacts<'a> {
     state_bytes: &'a dyn Fn(&std::ops::Range<usize>) -> usize,
     /// Per stage: the measured step compute buffers (empty when not measured).
     compute: &'a [usize],
+    /// Whether the KV fit charged chunked step scores ([`paged_step_scores`]).
+    chunked_scores: bool,
     /// The GPU vision tower's largest image's scratch (0 without one), as the KV fit kept it.
     vision_scratch: usize,
     ngram: Option<report::NgramPlacement>,
@@ -3781,8 +3785,7 @@ fn load_report(
     let host_blocks = f.n_blocks - f.hbm_blocks;
     let gpu = layout.stages[0].0.is_some();
     let prompt_graphs = exec.prompt_graphs();
-    let chunked =
-        paged_step_scores(cfg.tp, cfg.attention) && hp.arch.chunks_step_scores(LEAN_STEP_TOKENS);
+    let chunked = f.chunked_scores;
     let mut stages: Vec<report::StageMemory> = layout
         .stages
         .iter()
@@ -4790,8 +4793,8 @@ impl LmEngine {
         // Whether prompt steps past 4,096 tokens score the context in chunks (#1183): their
         // kept graphs' buffers then grow only with their tokens past it. Not on the mask path
         // ([`paged_step_scores`]), which scores the whole group.
-        let chunked = paged_step_scores(cfg.tp, cfg.attention)
-            && hp.arch.chunks_step_scores(LEAN_STEP_TOKENS);
+        let chunked =
+            paged_step_scores(cfg.tp, paged) && hp.arch.chunks_step_scores(&hp, LEAN_STEP_TOKENS);
         // `kept`: the prompt graphs each stage keeps ([`lean_prompt_graphs`]).
         let fit_with = |ring: Option<KvRing>, log: bool, kept: usize| {
             layout
@@ -6007,6 +6010,7 @@ impl LmEngine {
                 ring,
                 state_bytes: &stage_state_bytes,
                 compute: &measured_compute,
+                chunked_scores: chunked,
                 vision_scratch,
                 ngram,
                 engram,

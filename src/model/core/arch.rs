@@ -475,8 +475,9 @@ pub trait Arch: Debug + Send + Sync + Any {
     /// Whether a prompt step of more than `tokens` tokens computes its context-long scores
     /// (a sparse-attention indexer's, tokens × pools) in chunks of at most `tokens` tokens
     /// (#1183): its compute buffer then grows past such a step only with its tokens, not with
-    /// tokens × context, and the KV fit charges it so.
-    fn chunks_step_scores(&self, _tokens: usize) -> bool {
+    /// tokens × context, and the KV fit charges it so. Only meaningful for a load whose
+    /// steps page (the caller checks the resolved attention path); `hp` is the model's.
+    fn chunks_step_scores(&self, _hp: &Hparams, _tokens: usize) -> bool {
         false
     }
 
