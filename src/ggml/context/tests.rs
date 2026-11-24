@@ -95,6 +95,131 @@ fn fresh_plan_keeps_a_buffer_that_fits() {
     assert!(ctx3.alloc_graph_shared(&larger, &shared).unwrap(), "grew");
 }
 
+/// What the rejected relayout ([`REJECTED`]) does to the graph before it is planned again.
+#[derive(Clone, Copy)]
+enum Reject {
+    /// Nothing: the plan as rewritten is a fresh plan of the graph as built.
+    Keep,
+    /// The last node 64 times as long: the allocator's buffer grows for it.
+    Grow,
+    /// The last node as long as no buffer can be (16 PiB): planning it fails.
+    Fail,
+}
+
+thread_local! {
+    /// [`REJECTED`]'s [`Reject`] on this thread.
+    static REJECT: std::cell::Cell<Reject> = const { std::cell::Cell::new(Reject::Keep) };
+}
+
+/// A rewrite ([`rejected`]) that never holds: its last node as it was.
+struct Rejected {
+    t: *mut ffi::ggml_tensor,
+    was: ffi::ggml_tensor,
+}
+
+impl crate::ggml::post_alloc::Relaid for Rejected {
+    unsafe fn holds(&self, _graph: *mut ffi::ggml_cgraph) -> bool {
+        false
+    }
+
+    unsafe fn undo(&self, _graph: *mut ffi::ggml_cgraph) {
+        // SAFETY: the caller's: the graph's last node, saved whole before the rewrite.
+        unsafe { std::ptr::write(self.t, self.was) };
+    }
+}
+
+/// Takes every graph.
+unsafe fn every(_graph: *mut ffi::ggml_cgraph, _cuda: bool) -> bool {
+    true
+}
+
+/// Lengthens the graph's last node (an F32 `[256, n]` node) as [`REJECT`] says.
+unsafe fn rejected(
+    graph: *mut ffi::ggml_cgraph,
+    _cuda: bool,
+) -> Option<Box<dyn crate::ggml::post_alloc::Relaid>> {
+    // SAFETY: the caller's: an allocated graph of valid nodes.
+    unsafe {
+        let t = ffi::ggml_graph_node(graph, ffi::ggml_graph_n_nodes(graph) - 1);
+        let was = std::ptr::read(t);
+        let rows = match REJECT.get() {
+            Reject::Keep => None,
+            Reject::Grow => Some(64 * (*t).ne[1]),
+            Reject::Fail => Some(1 << 44),
+        };
+        if let Some(rows) = rows {
+            (*t).ne[1] = rows;
+            (*t).nb[2] = (*t).nb[1] * rows as usize;
+            (*t).nb[3] = (*t).nb[2];
+        }
+        Some(Box::new(Rejected { t, was }))
+    }
+}
+
+/// A relayout whose rewrite is always undone (see [`Reject`]).
+const REJECTED: crate::ggml::post_alloc::Relayout = crate::ggml::post_alloc::Relayout {
+    wants: every,
+    rewrite: rejected,
+};
+
+/// The layout of a 2-row step allocated with [`REJECTED`] doing `reject`, after an 8-row step
+/// from the same allocator (`after`) or from an allocator that served nothing before; and the
+/// allocator's buffer size then.
+fn rejected_step(buft: BufferType, reject: Reject, after: bool) -> (Vec<usize>, usize) {
+    REJECT.set(reject);
+    let mut allocator = ComputeAllocator::new(buft).with_fresh_plans(false);
+    if after {
+        let ctx = Context::new(64, 64);
+        let large = step(&ctx, 8);
+        ctx.alloc_graph(&large, allocator).unwrap();
+        allocator = ctx.into_allocator().expect("its own allocator");
+    }
+    let ctx = Context::new(64, 64);
+    let small = step(&ctx, 2);
+    ctx.alloc_graph(&small, allocator.with_relayout(REJECTED))
+        .expect("allocated as built");
+    let offsets = layout(&small);
+    let size = ctx
+        .into_allocator()
+        .expect("its own allocator")
+        .buffer_size();
+    (offsets, size)
+}
+
+/// A rewrite planned again that does not hold is undone, and the graph runs in the layout it
+/// had as built, which is what the rewrite read the fused sums off: also where that was the
+/// previous graph's plan (a fresh plan of the graph alone lays it out otherwise), and where
+/// the plan as rewritten grew the allocator's buffer (the tensors keep their offsets in it).
+#[test]
+fn undone_relayout_keeps_the_layout_as_built() {
+    let buft = Backend::cpu().unwrap().buffer_type();
+    let (reused, alone) = after_a_larger_step(buft, false);
+    assert_ne!(reused, alone, "the test needs two layouts");
+    let (kept, size) = rejected_step(buft, Reject::Keep, true);
+    assert_eq!(kept, reused, "kept: the 8-row step's offsets");
+    let (grown, grown_size) = rejected_step(buft, Reject::Grow, true);
+    assert!(
+        grown_size > size,
+        "the buffer grew ({grown_size} vs {size})"
+    );
+    assert_eq!(grown, reused, "grown: the 8-row step's offsets");
+    let (alone_kept, _) = rejected_step(buft, Reject::Keep, false);
+    assert_eq!(alone_kept, alone);
+}
+
+/// Where planning the rewritten graph fails (its buffer cannot be allocated), the rewrite is
+/// undone and the graph allocated as built, in that layout: the graph's own plan, or the
+/// previous graph's (in a buffer allocated for it again, the failed plan freed the last).
+#[test]
+fn failed_relayout_plan_allocates_the_graph_as_built() {
+    let buft = Backend::cpu().unwrap().buffer_type();
+    let (reused, alone) = after_a_larger_step(buft, false);
+    let (failed_alone, _) = rejected_step(buft, Reject::Fail, false);
+    assert_eq!(failed_alone, alone);
+    let (failed_after, _) = rejected_step(buft, Reject::Fail, true);
+    assert_eq!(failed_after, reused);
+}
+
 /// `cast_shared` gives one node per source and type in a context; views and other contexts
 /// get their own, and `shared_cast` finds only what `cast_shared` made.
 #[test]

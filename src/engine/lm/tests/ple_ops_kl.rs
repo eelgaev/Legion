@@ -3,13 +3,13 @@
 //! tokens, the next-token rows compared bit for bit. The switch acts while graphs are built, so
 //! the model loads once per variant. Ignored: needs a GPU and the model.
 //!
-//! With `GGML_CUDA_DISABLE_FUSION=1` every scored row must be the chain's: the ops give the
-//! chain's bits. With ggml-cuda's fusions on the test only reports differing rows. Built as two
-//! ops, the graphs placed tensors apart, and ggml-cuda fuses an MoE layer's weighted expert sum
-//! (with FMA adds) only where its output does not overlap its inputs (on the V100,
-//! Qwen3.8-Flash-Next, 1,716-token chunks: layer 0's sum was fused beside the chain, not beside
-//! the ops). Since #1183 the graph is allocated with the chain before the ops take its nodes,
-//! so the rows should match there too. Steps of several groups keep the chain.
+//! Every scored row must be the chain's, with ggml-cuda's fusions on or off
+//! (`GGML_CUDA_DISABLE_FUSION=1`): the ops give the chain's bits. Built as two ops, the graphs
+//! once placed tensors apart, and ggml-cuda fuses an MoE layer's weighted expert sum (with FMA
+//! adds) only where its output does not overlap its inputs (on the V100, Qwen3.8-Flash-Next,
+//! 1,716-token chunks: layer 0's sum was fused beside the chain, not beside the ops). Since
+//! #1183 the graph is allocated with the chain before the ops take its nodes, so the sums fuse
+//! as beside the chain. Steps of several groups keep the chain.
 //!
 //! `LEGION_TEST_HC_MODEL=<model.gguf> LEGION_TEST_HC_TEXT=<file> [LEGION_TEST_HC_TOKENS=10292]
 //!  [LEGION_TEST_HC_CHUNK=1716] [GGML_CUDA_DISABLE_FUSION=1] cargo test --release --features cuda
@@ -131,7 +131,5 @@ fn ple_ops_kl_against_chain() {
     compare("chain again (noise floor)", &again, &chain);
     let ops = run(true);
     let same = compare("ple ops vs chain", &ops, &chain);
-    if std::env::var_os("GGML_CUDA_DISABLE_FUSION").is_some() {
-        assert_eq!(same, ops.len(), "the ops must give the chain's rows");
-    }
+    assert_eq!(same, ops.len(), "the ops must give the chain's rows");
 }

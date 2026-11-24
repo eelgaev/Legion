@@ -46,6 +46,14 @@ pub(crate) const KEEP: &str = "ple_ops.keep";
 /// The new streams (`res + (gated + silu(conv))`).
 pub(crate) const OUT: &str = "ple_ops.out";
 
+/// The most tokens, and sequences, in a group the conv kernel takes (its grid's y and z).
+pub(crate) const PLE_CONV_MAX_GRID: i64 = 65535;
+
+/// Whether the conv kernel takes a group of `nt` tokens by `ns` sequences.
+pub(crate) fn conv_grid_fits(nt: i64, ns: i64) -> bool {
+    (1..=PLE_CONV_MAX_GRID).contains(&nt) && (1..=PLE_CONV_MAX_GRID).contains(&ns)
+}
+
 /// Whether the reason a marked chain kept ggml's nodes was logged.
 static KEPT_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -261,6 +269,12 @@ impl Chain {
                 || dil < 1
             {
                 return Err("the conv input's view".into());
+            }
+            if !conv_grid_fits(nt, ns) {
+                return Err(format!(
+                    "a group of {nt} tokens by {ns} sequences (the conv kernel takes \
+                     {PLE_CONV_MAX_GRID} of each)"
+                ));
             }
             let norm = (*xn).src[0];
             if (*xn).op != ffi::ggml_op_GGML_OP_MUL

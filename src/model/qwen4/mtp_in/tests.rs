@@ -18,9 +18,13 @@ fn noise(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-/// Max |a - b| over max |b|.
+/// Max |a - b| over max |b|, of finite values only (`f32::max` would skip a NaN).
 fn rel(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
+    assert!(
+        a.iter().chain(b).all(|v| v.is_finite()),
+        "a value is not finite"
+    );
     let scale = b.iter().fold(0f32, |m, v| m.max(v.abs()));
     a.iter()
         .zip(b)

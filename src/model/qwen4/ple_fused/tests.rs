@@ -7,7 +7,7 @@
 use std::cell::RefCell;
 
 use super::super::{PleParams, ple_conv_rows};
-use super::rewrite::{GAMMAS, KEY, OUT, VALUE, X, XN};
+use super::rewrite::{GAMMAS, KEY, OUT, PLE_CONV_MAX_GRID, VALUE, X, XN, conv_grid_fits};
 use super::*;
 use crate::ggml::{Backend, ComputeAllocator, Graph};
 use crate::model::core::node_fuse::fold::RELAYOUT;
@@ -26,9 +26,13 @@ fn noise(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-/// Max |a - b| over max |b|.
+/// Max |a - b| over max |b|, of finite values only (`f32::max` would skip a NaN).
 fn rel(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
+    assert!(
+        a.iter().chain(b).all(|v| v.is_finite()),
+        "a value is not finite"
+    );
     let scale = b.iter().fold(0f32, |m, v| m.max(v.abs()));
     a.iter()
         .zip(b)
@@ -365,6 +369,19 @@ fn run(backend: &mut Backend, e: i64, groups: &[(i64, i64)], bf16_w: bool, check
         }
         hist = a.hist;
     }
+}
+
+/// The rewrite keeps ggml's chain for a group the conv kernel's grid does not take: more than
+/// 65,535 tokens or sequences (a group of 65,535 is taken).
+#[test]
+fn conv_grid_bounds_the_groups_taken() {
+    assert_eq!(PLE_CONV_MAX_GRID, 65535);
+    assert!(conv_grid_fits(1, 1));
+    assert!(conv_grid_fits(65535, 1));
+    assert!(conv_grid_fits(1, 65535));
+    assert!(!conv_grid_fits(65536, 1));
+    assert!(!conv_grid_fits(1, 65536));
+    assert!(!conv_grid_fits(0, 1));
 }
 
 #[test]

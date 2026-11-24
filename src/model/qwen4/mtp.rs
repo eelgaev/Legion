@@ -142,12 +142,11 @@ impl Model {
         let (ge, gh) = (w("nextn.enorm.weight")?, w("nextn.hnorm.weight")?);
         // A prompt's take-in under `--dense-fp8-prompt` (#1183): the norms, the repeat and the
         // concat as one op with their bits ([`super::mtp_in`]); other passes keep the chain.
-        let fused = !crate::model::core::dense_twins::takes_step(n) && {
-            let why = if self.dense_fp8_mode() != 3 {
-                Some("prompt steps do not read the FP8 copies (--dense-fp8-prompt)".to_string())
-            } else {
-                super::mtp_in::why_not(tok, h, ge, gh, hc)
-            };
+        // Not asked for without --dense-fp8-prompt (not logged: the reasons logged are of
+        // take-ins that asked).
+        let asked = !crate::model::core::dense_twins::takes_step(n) && self.dense_fp8_mode() == 3;
+        let fused = asked && {
+            let why = super::mtp_in::why_not(tok, h, ge, gh, hc);
             if let Some(why) = &why {
                 super::off_once(&super::MTP_IN_OFF, "MTP input op", why);
             }

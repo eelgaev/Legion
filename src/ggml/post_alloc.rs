@@ -13,8 +13,9 @@
 //! of its output keeps them alive until it runs) needs the graph planned again after it
 //! ([`set_relayout`], #836). It still reads the layout of the graph as built (planned first, as
 //! without it), the graph is then planned and allocated again as rewritten, and when what the
-//! rewrite relied on no longer holds in the new layout, it is undone and the graph planned a
-//! third time as built.
+//! rewrite relied on no longer holds in the new layout, or that plan fails, it is undone and
+//! the graph runs in the layout it had as built (`ComputeAllocator::as_built`: each tensor
+//! back at its offset, so the sums ggml-cuda fuses are the ones the rewrite read).
 
 use std::sync::OnceLock;
 

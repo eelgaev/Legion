@@ -146,10 +146,13 @@ pub(crate) struct Counts {
 /// Graphs whose rewrite was logged (the first few only).
 static LOGGED: AtomicUsize = AtomicUsize::new(0);
 
-/// Whether a graph with [`Counts::fp8_codes`], [`Counts::gdn_codes`], [`Counts::shexp_codes`]
-/// or [`Counts::ple_ops`] was logged (the first one is, after the first few graphs too: prompt
-/// steps may come later).
+/// Whether a graph with [`Counts::fp8_codes`], [`Counts::gdn_codes`] or [`Counts::shexp_codes`]
+/// was logged (the first one is, after the first few graphs too: prompt steps may come later).
 static CODES_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a graph with [`Counts::ple_ops`] was logged (the first one is, whatever was logged
+/// before it).
+static PLE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Whether a graph with [`Counts::mtp_in`] was logged (the MTP head's take-ins are graphs of
 /// their own, after the first prompt step's).
@@ -184,8 +187,9 @@ unsafe fn fuse(graph: *mut ffi::ggml_cgraph) {
     }
     // SAFETY: the caller's.
     let c = unsafe { rewrite_graph(graph, true) };
-    let first_codes = (c.fp8_codes + c.gdn_codes + c.shexp_codes + c.ple_ops > 0
+    let first_codes = (c.fp8_codes + c.gdn_codes + c.shexp_codes > 0
         && !CODES_LOGGED.swap(true, Ordering::Relaxed))
+        | (c.ple_ops > 0 && !PLE_LOGGED.swap(true, Ordering::Relaxed))
         | (c.mtp_in > 0 && !MTP_IN_LOGGED.swap(true, Ordering::Relaxed));
     if c != Counts::default() && (LOGGED.fetch_add(1, Ordering::Relaxed) < 4 || first_codes) {
         tracing::info!(

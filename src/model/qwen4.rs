@@ -1684,12 +1684,8 @@ impl Model {
         if !pass.groups().all(|(_, sh)| !sh.verify && sh.n_tok > 1) {
             return Ok(false);
         }
+        // Not asked for (not logged: the reasons logged are of steps that asked).
         if !(ple_fused::fused_ple() || self.dense_fp8_mode() == 3) {
-            off_once(
-                &PLE_OPS_OFF,
-                "PLE ops",
-                "neither --ple-ops nor --dense-fp8-prompt",
-            );
             return Ok(false);
         }
         let ctx = pass.ctx;
