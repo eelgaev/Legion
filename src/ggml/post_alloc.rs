@@ -13,9 +13,13 @@
 //! of its output keeps them alive until it runs) needs the graph planned again after it
 //! ([`set_relayout`], #836). It still reads the layout of the graph as built (planned first, as
 //! without it), the graph is then planned and allocated again as rewritten, and when what the
-//! rewrite relied on no longer holds in the new layout, or that plan fails, it is undone and
-//! the graph runs in the layout it had as built (`ComputeAllocator::as_built`: each tensor
-//! back at its offset, so the sums ggml-cuda fuses are the ones the rewrite read).
+//! rewrite relied on no longer holds in the new layout, it is undone and the graph planned
+//! afresh as built. A rewrite whose undone graph must run in the layout it had as built
+//! ([`Relaid::as_built`]: the PLE ops', #1183) is undone also where the plan as rewritten
+//! fails, and the graph's tensors then go back to their offsets as built
+//! (`ComputeAllocator::as_built`), so the sums ggml-cuda fuses are the ones the rewrite read.
+//! Where they cannot (the memory cannot be had, or the layout spanned buffers a fresh plan
+//! lays out otherwise), the allocation fails with an error logged, and the graph does not run.
 
 use std::sync::OnceLock;
 
@@ -117,6 +121,11 @@ pub trait Relaid {
     /// # Safety
     /// The rewritten graph, none of whose nodes has run.
     unsafe fn undo(&self, graph: *mut ffi::ggml_cgraph);
+    /// Whether the graph, undone, runs in the layout it had as built (see the module doc);
+    /// else it is planned afresh. Not by default.
+    fn as_built(&self) -> bool {
+        false
+    }
 }
 
 static RELAYOUT: OnceLock<Relayout> = OnceLock::new();

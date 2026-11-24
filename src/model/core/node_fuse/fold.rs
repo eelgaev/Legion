@@ -140,6 +140,7 @@ unsafe fn rewrite(graph: *mut ffi::ggml_cgraph, cuda: bool) -> Option<Box<dyn Re
         }
     };
     undo.saved.splice(0..0, ple_saved);
+    undo.ple = ple > 0;
     if folded == 0 && ple == 0 {
         // SAFETY: the caller's; nothing was rewritten unless the fold's streams were.
         unsafe { undo.undo(graph) };
@@ -181,6 +182,7 @@ pub(crate) unsafe fn fold_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> (Un
             lazy: 0,
             compact: 0,
             one_cast: 0,
+            ple: false,
         };
         let (mut folded, mut fma) = (0, 0);
         for i in 0..n {
@@ -232,6 +234,7 @@ unsafe fn unfolded(graph: *mut ffi::ggml_cgraph, cuda: bool) -> Undo {
             lazy: 0,
             compact: 0,
             one_cast: 0,
+            ple: false,
         }
     }
 }
@@ -250,6 +253,9 @@ pub(crate) struct Undo {
     pub(crate) compact: usize,
     /// BF16 casts that became views of an earlier cast of the same values (see the module doc).
     pub(crate) one_cast: usize,
+    /// The PLE ops took chains of the graph: undone, it runs in the layout it had as built
+    /// ([`Relaid::as_built`]). A graph only folded is planned afresh, as before them.
+    pub(crate) ple: bool,
 }
 
 impl Relaid for Undo {
@@ -282,6 +288,10 @@ impl Relaid for Undo {
             // SAFETY: the caller's: the graph's nodes, saved whole before the rewrite.
             unsafe { std::ptr::copy_nonoverlapping(was, *t, 1) };
         }
+    }
+
+    fn as_built(&self) -> bool {
+        self.ple
     }
 }
 

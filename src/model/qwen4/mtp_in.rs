@@ -7,9 +7,11 @@
 //! 32K prompt). The op reads the embedding and the streams once and writes the concat's output
 //! (CUDA kernel in `src/cuda/mtp_in.cu`). On CUDA it computes what ggml-cuda's kernels for the
 //! chain compute, bit for bit (`mtp_in/tests.rs`): rows of 1,024 values or more, the width
-//! ggml-cuda's `rms_norm` takes 1,024 threads a row from. Taken by take-ins of more than
-//! [`crate::model::core::dense_twins::STEP_MAX_TOKENS`] tokens only, as the PLE ops
-//! ([`super::ple_fused`]) are by prompt steps: decode, verify and draft passes keep the chain.
+//! ggml-cuda's `rms_norm` takes 1,024 threads a row from. Taken by a prompt's take-in pieces
+//! only (passes without output rows of more than
+//! [`crate::model::core::dense_twins::STEP_MAX_TOKENS`] tokens), as the PLE ops
+//! ([`super::ple_fused`]) are by prompt steps: draft passes and the take-ins after decode and
+//! verify steps keep the chain.
 
 use crate::ggml::{Context, ExternalOp, Tensor, ffi, types};
 

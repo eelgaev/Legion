@@ -1,4 +1,4 @@
-use super::{ComputeAllocator, Context, Graph};
+use super::{ComputeAllocator, Context, Graph, Placement, forget_plan};
 use crate::ggml::{Backend, BufferType, ffi, types};
 
 /// Each node's offset in its compute buffer: the graph's memory layout.
@@ -109,22 +109,38 @@ enum Reject {
 thread_local! {
     /// [`REJECTED`]'s [`Reject`] on this thread.
     static REJECT: std::cell::Cell<Reject> = const { std::cell::Cell::new(Reject::Keep) };
+    /// Whether [`REJECTED`]'s rewrites run as built when undone ([`Relaid::as_built`]: the PLE
+    /// ops'), else planned afresh (the fold's).
+    ///
+    /// [`Relaid::as_built`]: crate::ggml::post_alloc::Relaid::as_built
+    static AS_BUILT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
 /// A rewrite ([`rejected`]) that never holds: its last node as it was.
 struct Rejected {
     t: *mut ffi::ggml_tensor,
     was: ffi::ggml_tensor,
+    reject: Reject,
+    as_built: bool,
 }
 
 impl crate::ggml::post_alloc::Relaid for Rejected {
     unsafe fn holds(&self, _graph: *mut ffi::ggml_cgraph) -> bool {
+        // Asked only after the plan as rewritten succeeded, which a 16 PiB node's cannot.
+        assert!(
+            !matches!(self.reject, Reject::Fail),
+            "the 16 PiB graph was planned"
+        );
         false
     }
 
     unsafe fn undo(&self, _graph: *mut ffi::ggml_cgraph) {
         // SAFETY: the caller's: the graph's last node, saved whole before the rewrite.
         unsafe { std::ptr::write(self.t, self.was) };
+    }
+
+    fn as_built(&self) -> bool {
+        self.as_built
     }
 }
 
@@ -142,7 +158,8 @@ unsafe fn rejected(
     unsafe {
         let t = ffi::ggml_graph_node(graph, ffi::ggml_graph_n_nodes(graph) - 1);
         let was = std::ptr::read(t);
-        let rows = match REJECT.get() {
+        let reject = REJECT.get();
+        let rows = match reject {
             Reject::Keep => None,
             Reject::Grow => Some(64 * (*t).ne[1]),
             Reject::Fail => Some(1 << 44),
@@ -152,7 +169,12 @@ unsafe fn rejected(
             (*t).nb[2] = (*t).nb[1] * rows as usize;
             (*t).nb[3] = (*t).nb[2];
         }
-        Some(Box::new(Rejected { t, was }))
+        Some(Box::new(Rejected {
+            t,
+            was,
+            reject,
+            as_built: AS_BUILT.get(),
+        }))
     }
 }
 
@@ -167,6 +189,7 @@ const REJECTED: crate::ggml::post_alloc::Relayout = crate::ggml::post_alloc::Rel
 /// allocator's buffer size then.
 fn rejected_step(buft: BufferType, reject: Reject, after: bool) -> (Vec<usize>, usize) {
     REJECT.set(reject);
+    AS_BUILT.set(true);
     let mut allocator = ComputeAllocator::new(buft).with_fresh_plans(false);
     if after {
         let ctx = Context::new(64, 64);
@@ -218,6 +241,126 @@ fn failed_relayout_plan_allocates_the_graph_as_built() {
     assert_eq!(failed_alone, alone);
     let (failed_after, _) = rejected_step(buft, Reject::Fail, true);
     assert_eq!(failed_after, reused);
+}
+
+/// A rewrite undone that does not run as built (the fold's, on by default on CUDA) keeps the
+/// allocator's behaviour before the PLE ops: the graph planned afresh, which after a larger
+/// step lays it out otherwise than as built; and a plan as rewritten that fails fails the
+/// allocation.
+#[test]
+fn undone_default_relayout_is_planned_afresh() {
+    let buft = Backend::cpu().unwrap().buffer_type();
+    let (reused, alone) = after_a_larger_step(buft, false);
+    let step_of = |reject: Reject, after: bool| {
+        REJECT.set(Reject::Keep);
+        let mut allocator = ComputeAllocator::new(buft).with_fresh_plans(false);
+        if after {
+            let ctx = Context::new(64, 64);
+            let large = step(&ctx, 8);
+            ctx.alloc_graph(&large, allocator).unwrap();
+            allocator = ctx.into_allocator().expect("its own allocator");
+        }
+        REJECT.set(reject);
+        AS_BUILT.set(false);
+        let ctx = Context::new(64, 64);
+        let small = step(&ctx, 2);
+        let r = ctx.alloc_graph(&small, allocator.with_relayout(REJECTED));
+        AS_BUILT.set(true);
+        r.map(|()| layout(&small))
+    };
+    let fresh = step_of(Reject::Keep, true).expect("allocated afresh");
+    assert_eq!(fresh, alone, "the 2-row step's own offsets");
+    assert_ne!(fresh, reused);
+    assert!(step_of(Reject::Fail, false).is_err(), "failed, as before");
+}
+
+/// After a plan that failed (and freed the buffer), the next allocation from a shared
+/// allocator says the buffer moved, also where the buffer allocated again is no bigger: the
+/// graphs allocated from the old one must not run again.
+#[test]
+fn shared_buffer_freed_by_a_failed_plan_moved() {
+    let buft = Backend::cpu().unwrap().buffer_type();
+    for as_built in [true, false] {
+        REJECT.set(Reject::Keep);
+        AS_BUILT.set(as_built);
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(
+            ComputeAllocator::new(buft)
+                .with_fresh_plans(false)
+                .with_relayout(REJECTED),
+        ));
+        let size = || shared.lock().unwrap().buffer_size();
+        let ctx = Context::new(64, 64);
+        let large = step(&ctx, 8);
+        assert!(ctx.alloc_graph_shared(&large, &shared).unwrap(), "first");
+        let before = size();
+        REJECT.set(Reject::Fail);
+        let ctx2 = Context::new(64, 64);
+        let small = step(&ctx2, 2);
+        let r = ctx2.alloc_graph_shared(&small, &shared);
+        REJECT.set(Reject::Keep);
+        let moved = match r {
+            // As built: allocated after the failed plan, in a buffer allocated again.
+            Ok(moved) => moved,
+            // Planned afresh: the allocation failed; the next one says it moved.
+            Err(_) => {
+                assert!(!as_built, "allocated as built");
+                let ctx3 = Context::new(64, 64);
+                let next = step(&ctx3, 2);
+                ctx3.alloc_graph_shared(&next, &shared).unwrap()
+            }
+        };
+        assert!(moved, "as built {as_built}: moved");
+        assert!(size() <= before, "no bigger ({} vs {before})", size());
+        // Told once: from now on only where the buffer grows.
+        let (ctx4, was) = (Context::new(64, 64), size());
+        let again = step(&ctx4, 2);
+        let moved = ctx4.alloc_graph_shared(&again, &shared).unwrap();
+        assert_eq!(moved, size() > was, "as built {as_built}: told once");
+    }
+    AS_BUILT.set(true);
+}
+
+/// A placement is current only where each of its buffers' tensors sit in one buffer of their
+/// own: tensors of two buffers now in one are not where they were.
+#[test]
+fn placement_keeps_buffers_apart() {
+    let buft = Backend::cpu().unwrap().buffer_type();
+    let ctx = Context::new(8, 8);
+    let a = ctx.new_tensor(types::F32, &[256]).raw();
+    let b = ctx.new_tensor(types::F32, &[256]).raw();
+    // SAFETY: CPU buffers of 4 KiB, each tensor 1 KiB at its start; nothing is computed.
+    unsafe {
+        let buffers: Vec<_> = (0..3)
+            .map(|_| ffi::ggml_backend_buft_alloc_buffer(buft.raw(), 4096))
+            .collect();
+        assert!(buffers.iter().all(|b| !b.is_null()));
+        let put = |t: *mut ffi::ggml_tensor, buffer: ffi::ggml_backend_buffer_t| {
+            let base = ffi::ggml_backend_buffer_get_base(buffer);
+            assert_eq!(
+                ffi::ggml_backend_tensor_alloc(buffer, t, base),
+                ffi::ggml_status_GGML_STATUS_SUCCESS
+            );
+        };
+        put(a, buffers[0]);
+        put(b, buffers[1]);
+        let built = Placement::of(&[a, b]);
+        assert!(built.is_current());
+        forget_plan(&[a, b]);
+        put(a, buffers[2]);
+        put(b, buffers[1]);
+        assert!(
+            built.is_current(),
+            "each buffer's tensors in one of their own"
+        );
+        forget_plan(&[a, b]);
+        put(a, buffers[2]);
+        put(b, buffers[2]);
+        assert!(!built.is_current(), "two buffers' tensors in one");
+        forget_plan(&[a, b]);
+        for buffer in buffers {
+            ffi::ggml_backend_buffer_free(buffer);
+        }
+    }
 }
 
 /// `cast_shared` gives one node per source and type in a context; views and other contexts

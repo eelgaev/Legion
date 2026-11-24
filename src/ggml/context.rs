@@ -523,8 +523,9 @@ impl Context {
 
     /// [`Self::alloc_graph`] from an allocator other graphs share: their intermediates
     /// overlap in its one buffer, so only one of them may run at a time, each with its inputs
-    /// set again first. Returns whether the buffer grew: it then moved, and the graphs
-    /// allocated from it before must not run again.
+    /// set again first. Returns whether the buffer moved (it grew, or a plan that failed since
+    /// the last call that said so freed it): the graphs allocated from it before must then not
+    /// run again.
     pub fn alloc_graph_shared(
         &self,
         graph: &Graph<'_>,
@@ -544,12 +545,16 @@ impl Context {
         // the same size did not move. (Were ggml to grow it by adding a chunk instead, the
         // size would grow too, and the earlier graphs would be dropped needlessly, not kept
         // pointing at freed memory.)
+        // A failed plan may have freed the buffer, and the next one allocated it again, no
+        // bigger (`ComputeAllocator::moved`): it moved all the same. Told once, by the first
+        // allocation that succeeds.
         let grew = a.buffer_size() > before;
+        let moved = ok && a.moved.replace(false);
         let buffer = a.buft.name();
         drop(a);
         *slot = Some(Alloc::Shared(allocator.clone()));
         if ok {
-            Ok(grew)
+            Ok(grew || moved)
         } else {
             Err(GgmlError::Alloc { bytes: 0, buffer })
         }
@@ -1659,6 +1664,13 @@ pub struct ComputeAllocator {
     fresh: bool,
     /// A relayout taken on every graph (tests); `None`: `post_alloc`'s, on CUDA graphs.
     relayout: Option<super::post_alloc::Relayout>,
+    /// A plan failed since [`Context::alloc_graph_shared`] last said the buffer moved: ggml
+    /// frees the buffer it could not grow, so the next plan allocates another, which may be
+    /// no bigger than the old one.
+    moved: std::cell::Cell<bool>,
+    /// The last plan failed: ggml keeps that plan but not its buffer, so the next graph is
+    /// planned afresh ([`Self::plan`]).
+    failed: std::cell::Cell<bool>,
 }
 
 /// The tensors of `graph` an allocation gives memory: its nodes, their sources and its leafs
@@ -1747,7 +1759,7 @@ impl Placement {
     }
 
     /// Whether the tensors are where they were: each at its offset, the tensors of one buffer
-    /// then in one buffer.
+    /// then in one buffer, and those of different buffers in different ones.
     ///
     /// # Safety
     /// The tensors are valid.
@@ -1762,6 +1774,8 @@ impl Placement {
                     o0 == o1
                         && match buffers.iter().find(|&&(x, _)| x == b0) {
                             Some(&(_, y)) => y == b1,
+                            // Another buffer's tensors are in that one.
+                            None if buffers.iter().any(|&(_, y)| y == b1) => false,
                             None => {
                                 buffers.push((b0, b1));
                                 true
@@ -1854,6 +1868,9 @@ impl Placement {
                 .collect();
             while !left.is_empty() {
                 let before = left.len();
+                // A view whose initialization failed has its buffer set all the same: failed
+                // here, not taken for placed in the next pass.
+                let mut failed = false;
                 left.retain(|&t| {
                     if !(*t).buffer.is_null() {
                         return false;
@@ -1862,9 +1879,11 @@ impl Placement {
                     if src.is_null() || (*src).buffer.is_null() {
                         return true;
                     }
-                    ffi::ggml_backend_view_init(t) != ffi::ggml_status_GGML_STATUS_SUCCESS
+                    failed |=
+                        ffi::ggml_backend_view_init(t) != ffi::ggml_status_GGML_STATUS_SUCCESS;
+                    false
                 });
-                if left.len() == before {
+                if failed || left.len() == before {
                     return false;
                 }
             }
@@ -1923,6 +1942,8 @@ impl ComputeAllocator {
             buft,
             fresh: FRESH_PLANS.load(std::sync::atomic::Ordering::Relaxed),
             relayout: None,
+            moved: std::cell::Cell::new(false),
+            failed: std::cell::Cell::new(false),
         }
     }
 
@@ -1955,16 +1976,24 @@ impl ComputeAllocator {
             // were, memory and all, but not the others').
             let built = unsafe { Placement::of(unplanned) };
             // SAFETY: as above; the tensors the plan gave memory are planned afresh, as
-            // rewritten, and if that fails or the rewrite no longer holds then, go back to
-            // the memory the plan as built gave them.
+            // rewritten. One that must run as built (`Relaid::as_built`) is undone where that
+            // plan fails or the rewrite no longer holds then, and the tensors go back to the
+            // memory the plan as built gave them; any other is undone where it no longer
+            // holds, and the graph is planned afresh.
             if let Some(relaid) = unsafe { (r.rewrite)(raw, cuda) } {
                 unsafe {
                     forget_plan(unplanned);
                     ok = self.plan(raw, true);
-                    if !(ok && relaid.holds(raw)) {
+                    if relaid.as_built() {
+                        if !(ok && relaid.holds(raw)) {
+                            relaid.undo(raw);
+                            forget_plan(unplanned);
+                            ok = self.as_built(raw, unplanned, &built);
+                        }
+                    } else if ok && !relaid.holds(raw) {
                         relaid.undo(raw);
                         forget_plan(unplanned);
-                        ok = self.as_built(raw, unplanned, &built);
+                        ok = self.plan(raw, true);
                     }
                 }
             }
@@ -2037,22 +2066,29 @@ impl ComputeAllocator {
         let t = ctx.new_tensor(super::types::I8, &[bytes.max(1) as i64]);
         let mut graph = ctx.new_graph(1);
         graph.expand(t);
-        // SAFETY: a live allocator and graph.
-        let ok = unsafe { ffi::ggml_gallocr_alloc_graph(self.raw.as_ptr(), graph.raw()) };
+        let ok = self.plan(graph.raw(), true);
         // SAFETY: `t` is a valid tensor; its buffer is the allocator's, which outlives `ctx`.
         let b = unsafe { (*t.raw()).buffer };
         (ok && !b.is_null()).then_some(b)
     }
 
     /// Plans `graph` (`fresh`: from a plan of its own, else from the previous one when it
-    /// fits) and gives its intermediates memory.
+    /// fits) and gives its intermediates memory. After a plan that failed, afresh: ggml keeps
+    /// the failed plan and frees the buffer it could not grow, and a graph fitting that plan
+    /// would get memory in no buffer.
     fn plan(&self, raw: *mut ffi::ggml_cgraph, fresh: bool) -> bool {
+        let fresh = fresh || self.failed.get();
         // SAFETY: a live allocator and graph; reserving plans the graph and grows the buffer
         // if needed, and the allocation then finds the plan valid for this graph.
-        unsafe {
+        let ok = unsafe {
             (!fresh || ffi::ggml_gallocr_reserve(self.raw.as_ptr(), raw))
                 && ffi::ggml_gallocr_alloc_graph(self.raw.as_ptr(), raw)
+        };
+        self.failed.set(!ok);
+        if !ok {
+            self.moved.set(true);
         }
+        ok
     }
 
     /// This allocator taking `r` on every graph it allocates (whatever its buffer type), as
@@ -2093,6 +2129,8 @@ impl ComputeAllocator {
             buft: BufferType(NonNull::new(over).expect("a padded buffer type")),
             fresh: FRESH_PLANS.load(std::sync::atomic::Ordering::Relaxed),
             relayout: None,
+            moved: std::cell::Cell::new(false),
+            failed: std::cell::Cell::new(false),
         }
     }
 
