@@ -223,6 +223,18 @@ pub(crate) fn plain_bf16<'a>(ctx: &'a Context, x: Tensor<'a>) -> Tensor<'a> {
     node(ctx, Kind::Bf16, k, n, &[x], [0, 0, 0])
 }
 
+/// Whether `t` is a [`plain_bf16`] node.
+///
+/// # Safety
+/// `t` is a valid tensor.
+pub(crate) unsafe fn is_plain_bf16(t: *const ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's.
+    unsafe {
+        crate::ggml::op_of(t).is_some_and(|op| std::ptr::eq(op, &FP8_ACT))
+            && crate::ggml::external_params(&*t)[0] == Kind::Bf16 as i32
+    }
+}
+
 /// Whether [`plain_bf16`] takes `x` on this GPU: BF16 `[k, n]` with contiguous rows of at most
 /// [`MAX_K`] values, `k` a multiple of 4.
 pub(crate) fn plain_bf16_fits(x: Tensor<'_>) -> bool {

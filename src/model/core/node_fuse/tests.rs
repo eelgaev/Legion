@@ -303,3 +303,128 @@ fn fused_sum_zero_weight_rows(fma: i32) {
         }
     }
 }
+
+/// #1183: the op in its fused-sum form over BF16 rows (`fold`'s `fuse_tail` with
+/// `--nvfp4-expert-rows-bf16`) gives the bits it gives over the F32 copy of those rows, which
+/// is what the graph as built reads (the cast to F32 is exact).
+#[test]
+fn fused_sum_of_bf16_rows_is_the_f32_copys() {
+    let (e, k, n) = (16usize, 5usize, 3usize);
+    // Finite BF16 values (the top halves of F32 ones), and their exact F32 widening.
+    let bits: Vec<u16> = noise(e * k * n, 31)
+        .iter()
+        .map(|v| ((v * 300.0).to_bits() >> 16) as u16)
+        .collect();
+    let wide: Vec<f32> = bits
+        .iter()
+        .map(|&b| f32::from_bits(u32::from(b) << 16))
+        .collect();
+    let wv: Vec<f32> = noise(k * n, 32).iter().map(|v| v.abs() + 0.01).collect();
+    let shv = noise(e * n, 33);
+    let gv: Vec<f32> = noise(n, 34).iter().map(|v| v * 8.0).collect();
+    let run = |bf16: bool| {
+        let mut backend = Backend::cpu().unwrap();
+        backend.set_threads(2);
+        let ctx = Context::new(64, 64);
+        let ty = if bf16 { types::BF16 } else { types::F32 };
+        let experts = ctx
+            .new_tensor(ty, &[e as i64, k as i64, n as i64])
+            .as_input();
+        let w = ctx
+            .new_tensor(types::F32, &[1, k as i64, n as i64])
+            .as_input();
+        let sh = ctx.new_tensor(types::F32, &[e as i64, n as i64]).as_input();
+        let g = ctx.new_tensor(types::F32, &[1, n as i64]).as_input();
+        let out = ctx
+            .external_with(
+                &MOE_SUM_GATE,
+                types::F32,
+                [e as i64, n as i64, 1, 1],
+                &[experts, w, sh, g],
+                &[1, 1, k as i32, 1],
+            )
+            .as_output();
+        let mut graph = ctx.new_graph(64);
+        graph.expand(out);
+        ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+            .unwrap();
+        if bf16 {
+            let bytes: Vec<u8> = bits.iter().flat_map(|b| b.to_le_bytes()).collect();
+            experts.set_bytes(&bytes);
+        } else {
+            experts.set_f32(&wide);
+        }
+        w.set_f32(&wv);
+        sh.set_f32(&shv);
+        g.set_f32(&gv);
+        backend.compute(&graph).unwrap();
+        out.to_f32()
+    };
+    let (from16, from32) = (run(true), run(false));
+    assert!(from32.iter().all(|v| v.is_finite()));
+    assert!(same_bits(&from16, &from32), "{from16:?} vs {from32:?}");
+}
+
+/// #1183: of two BF16 casts of one F32 node's values (one of a reshape of it), one read by FP8
+/// codes made from BF16, the later becomes a reshape of the earlier, and the views of it views
+/// of the earlier; a cast no such codes read, or of other values, stays; the undo puts every
+/// node back.
+#[test]
+fn one_bf16_cast_of_a_layers_input() {
+    let ctx = Context::new(64, 64);
+    let x = ctx.new_tensor(types::F32, &[64, 8]).as_input();
+    let h = ctx.scale(x, 2.0);
+    let other = ctx.scale(x, 3.0);
+    let experts = ctx.cast(ctx.reshape_4d(h, [64, 2, 4, 1]), types::BF16);
+    let shexp = ctx.cast(h, types::BF16);
+    let codes = crate::model::fp8_act::plain_bf16(&ctx, shexp);
+    let view = ctx.reshape_4d(shexp, [64, 2, 4, 1]);
+    let alone = ctx.cast(other, types::BF16);
+    let twice = ctx.cast(other, types::BF16);
+    let mut graph = ctx.new_graph(64);
+    for t in [
+        ctx.cast(experts, types::F32),
+        codes,
+        ctx.cast(view, types::F32),
+    ] {
+        graph.expand(t.as_output());
+    }
+    graph.expand(ctx.add(ctx.cast(alone, types::F32), ctx.cast(twice, types::F32)));
+    // SAFETY: a live graph; its node array holds valid tensors.
+    unsafe {
+        let raw = graph.raw();
+        let n = ffi::ggml_graph_n_nodes(raw) as usize;
+        let nodes = std::slice::from_raw_parts(ffi::ggml_graph_nodes(raw), n).to_vec();
+        let at = |t: Node| nodes.iter().position(|&u| u == t).unwrap();
+        let (first, later) = if at(experts.raw()) < at(shexp.raw()) {
+            (experts, shexp)
+        } else {
+            (shexp, experts)
+        };
+        let before: Vec<ffi::ggml_tensor> = nodes.iter().map(|&t| std::ptr::read(t)).collect();
+        let mut g = Graph::new(raw, nodes.clone());
+        let mut saved = Vec::new();
+        assert_eq!(g.one_cast(&mut saved), 1);
+        let t = &*later.raw();
+        // A view node reading the earlier cast (not `GGML_OP_NONE`, which ggml's allocator does
+        // not count as keeping it alive).
+        assert_eq!(t.op, ffi::ggml_op_GGML_OP_RESHAPE);
+        assert_eq!(t.view_src, first.raw());
+        assert_eq!(t.view_offs, 0);
+        assert_eq!(t.src[0], first.raw());
+        assert!(t.src[1..].iter().all(|s| s.is_null()));
+        assert_eq!((*first.raw()).op, ffi::ggml_op_GGML_OP_CPY);
+        assert_eq!((*view.raw()).view_src, first.raw());
+        for c in [alone, twice] {
+            assert_eq!((*c.raw()).op, ffi::ggml_op_GGML_OP_CPY);
+        }
+        for (t, was) in &saved {
+            std::ptr::copy_nonoverlapping(was, *t, 1);
+        }
+        for (&t, was) in nodes.iter().zip(&before) {
+            assert_eq!((*t).op, was.op);
+            assert_eq!((*t).src, was.src);
+            assert_eq!((*t).view_src, was.view_src);
+        }
+    }
+}

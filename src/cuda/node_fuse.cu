@@ -10,7 +10,9 @@
 //                  expert), under --tp-moe-ep zero-weight rows not read (#1176).
 //                  With out16 (#1176) the values go out rounded to BF16 instead, into the
 //                  tensor-parallel send buffer of the reduce-scatter that reads the tail.
-//   ids_remap      the routed expert ids through the layer's expert table: ggml's cont and
+//                  With x16 (#1183) the experts' BF16 rows are read in place of their exact
+//                  F32 copy.
+//   ids_remap     the routed expert ids through the layer's expert table: ggml's cont and
 //                  get_rows of the I32 ids (integers, exact).
 //
 // The same flags as ggml-cuda and fused.cu (--use_fast_math), so expf is ggml's.
@@ -35,6 +37,11 @@ struct legion_moe_sum_gate {
     // goes here rounded to BF16 (nearest even, as src/cuda/tp_net.cu's tp_pack_bf16 rounds
     // out's values into the send buffer). 8-byte aligned for the 4-column kernel.
     uint16_t *    out16;
+    // moe_tail_fma, null or the experts' outputs as BF16 [n_embd, k, n_tok] contiguous (#1183,
+    // --nvfp4-expert-rows-bf16), read instead of x: each value widened as ggml-cuda's copy to
+    // F32 widens it (exact), so the F32 rows need not be written and read back. 8-byte aligned
+    // for the 4-column kernel.
+    const uint16_t * x16;
 };
 
 struct legion_ids_remap {
@@ -104,14 +111,33 @@ template <int V> __device__ __forceinline__ void load_cols(const float * src, fl
     }
 }
 
-template <int V> __global__ void moe_tail_fma_kernel(const legion_moe_sum_gate p) {
+// load_cols of BF16 values, each widened as ggml-cuda's cpy_scalar_contiguous<nv_bfloat16,
+// float> widens it (__bfloat162float: exact), so the values of the F32 copy it would read.
+template <int V> __device__ __forceinline__ void load_cols(const uint16_t * src, float (&v)[V]) {
+    if constexpr (V == 4) {
+        const uint2 q = *(const uint2 *) src;
+        v[0]          = __bfloat162float(__ushort_as_bfloat16((unsigned short) (q.x & 0xffff)));
+        v[1]          = __bfloat162float(__ushort_as_bfloat16((unsigned short) (q.x >> 16)));
+        v[2]          = __bfloat162float(__ushort_as_bfloat16((unsigned short) (q.y & 0xffff)));
+        v[3]          = __bfloat162float(__ushort_as_bfloat16((unsigned short) (q.y >> 16)));
+    } else {
+#pragma unroll
+        for (int r = 0; r < V; ++r) {
+            v[r] = __bfloat162float(__ushort_as_bfloat16(src[r]));
+        }
+    }
+}
+
+// X16: the rows from p.x16 (BF16) instead of p.x; every other step as the F32 kernel's.
+template <int V, bool X16> __global__ void moe_tail_fma_kernel(const legion_moe_sum_gate p) {
     const int64_t t   = blockIdx.x;
     const int64_t col = ((int64_t) blockIdx.y * blockDim.x + threadIdx.x) * V;
     if (col >= p.n_embd) {
         return;
     }
     const int64_t first = t * p.k;
-    const float * x     = p.x + first * p.n_embd + col;
+    const float * x     = X16 ? nullptr : p.x + first * p.n_embd + col;
+    const uint16_t * x16 = X16 ? p.x16 + first * p.n_embd + col : nullptr;
     float         sum[V] = {};
     for (int j0 = 0; j0 < p.k; j0 += TAIL_GROUP) {
         // A group's rows in flight before their sums (the weights are the token's: uniform).
@@ -122,7 +148,11 @@ template <int V> __global__ void moe_tail_fma_kernel(const legion_moe_sum_gate p
             const int j = j0 + q;
             wj[q]       = j < p.k ? p.w[first + j] : 0.0f;
             if (j < p.k && (!p.skip_zero || wj[q] != 0.0f)) {
-                load_cols<V>(x + (int64_t) j * p.n_embd, v[q]);
+                if constexpr (X16) {
+                    load_cols<V>(x16 + (int64_t) j * p.n_embd, v[q]);
+                } else {
+                    load_cols<V>(x + (int64_t) j * p.n_embd, v[q]);
+                }
             } else {
 #pragma unroll
                 for (int r = 0; r < V; ++r) {
@@ -193,6 +223,10 @@ __global__ void ids_remap_kernel(const legion_ids_remap p) {
 extern "C" const void * const legion_moe_sum_gate_kernel = reinterpret_cast<const void *>(&moe_sum_gate_kernel);
 extern "C" const void * const legion_ids_remap_kernel    = reinterpret_cast<const void *>(&ids_remap_kernel);
 extern "C" const void * const legion_moe_tail_fma_kernel =
-    reinterpret_cast<const void *>(&moe_tail_fma_kernel<1>);
+    reinterpret_cast<const void *>(&moe_tail_fma_kernel<1, false>);
 extern "C" const void * const legion_moe_tail_fma4_kernel =
-    reinterpret_cast<const void *>(&moe_tail_fma_kernel<4>);
+    reinterpret_cast<const void *>(&moe_tail_fma_kernel<4, false>);
+extern "C" const void * const legion_moe_tail_fma_x16_kernel =
+    reinterpret_cast<const void *>(&moe_tail_fma_kernel<1, true>);
+extern "C" const void * const legion_moe_tail_fma4_x16_kernel =
+    reinterpret_cast<const void *>(&moe_tail_fma_kernel<4, true>);
