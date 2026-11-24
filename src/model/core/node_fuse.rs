@@ -127,8 +127,8 @@ pub(crate) struct Counts {
     /// The same for the MoE layers' shared expert: its gate and up GEMM's codes of h with the
     /// gate logit, from one op ([`crate::model::fp8_act::plain_dot`]). Counted, not rewritten.
     pub shexp_codes: usize,
-    /// Attention norm + RoPE ops ([`super::norm_rope::norm_rope`]): with `--norm-rope`, and the
-    /// `--dense-fp8-prompt` prompt steps' (#1183). Counted, not rewritten.
+    /// Attention norm + RoPE ops ([`super::norm_rope::norm_rope`], `--norm-rope`). Counted, not
+    /// rewritten.
     pub norm_rope: usize,
     /// Nodes turned into `GGML_OP_NONE`.
     pub none: usize,

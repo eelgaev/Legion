@@ -4271,7 +4271,7 @@ impl Model {
         }
         // The cache writes and ggml's norm chain read contiguous rows.
         let cont = |x: Tensor<'a>| if x.is_contiguous() { x } else { ctx.cont(x) };
-        let k = if self.norm_rope_takes(k, w, pos, &rope) {
+        let k = if norm_rope::norm_rope_fits(k, w, pos, &rope) {
             k
         } else {
             cont(k)
@@ -4294,45 +4294,10 @@ impl Model {
         pos: Tensor<'a>,
     ) -> Tensor<'a> {
         let rope = self.rope_params();
-        if self.norm_rope_takes(x, w, pos, &rope) {
+        if norm_rope::norm_rope_fits(x, w, pos, &rope) {
             return norm_rope::norm_rope(ctx, x, w, pos, self.hp.rms_eps, &rope);
         }
         self.rope(ctx, ctx.mul(ctx.rms_norm(x, self.hp.rms_eps), w), pos)
-    }
-
-    /// Whether [`Self::norm_rope`] of `x` is the one op: with `--norm-rope`, and in the
-    /// `--dense-fp8-prompt` prompt steps (#1183, more than [`linear::NVFP4_A4_MIN_N`] tokens).
-    /// There ggml's norm is a bandwidth-bound pass of its own over the heads (a 32K prompt's Q
-    /// rows ~80 ms on a DGX Spark) before the RoPE reads them again; the op is its bits with one
-    /// pass. Says once why a prompt step does not take it.
-    fn norm_rope_takes(
-        &self,
-        x: Tensor<'_>,
-        w: Tensor<'_>,
-        pos: Tensor<'_>,
-        rope: &norm_rope::Rope,
-    ) -> bool {
-        if norm_rope::norm_rope_fits(x, w, pos, rope) {
-            return true;
-        }
-        if self.dense_fp8_mode() != 3 || x.ne()[2] <= linear::NVFP4_A4_MIN_N {
-            return false;
-        }
-        if norm_rope::norm_rope_device_fits(x, w, pos, rope) {
-            return true;
-        }
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static SAID: AtomicBool = AtomicBool::new(false);
-        if !SAID.swap(true, Ordering::Relaxed) {
-            tracing::info!(
-                ne = ?x.ne(),
-                nb = ?x.nb(),
-                n_dims = rope.n_dims,
-                "prompt attention norm + RoPE as one op off: rows on the host or a shape the \
-                 op does not take (F32 rows of at most 1023 even columns, a multi-section RoPE)"
-            );
-        }
-        false
     }
 
     /// [`Self::rope`]'s parameters, for the fused kernels.
@@ -5363,7 +5328,10 @@ impl Model {
             }
         });
         let why = if !crate::model::qwen4::is_bf16_mix(h) || !plain_cast {
-            "h's codes are not its BF16 copy's (h is not a BF16 hyper-connection mix)"
+            // E.g. steps whose hyper-connection mixers keep F32 (no `--hc-bf16` mix at this
+            // token count): `twin_codes` quantizes h's F32 values, not their BF16 rounding.
+            "h is not a BF16 hyper-connection mix in this step (its codes come from its F32 \
+             values); other steps may still take it"
         } else if !ggml_logit || !fp8_act::plain_dot_fits(h, w) {
             "h or the gate weight in a shape the op does not take (F32 [k, 1] in GPU memory, k a \
              multiple of 4 with ggml's 256-thread mul_mat_vec_f block, contiguous rows)"
