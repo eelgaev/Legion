@@ -42,6 +42,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "fp8_act_row.cuh"
+
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 #define LEGION_GDN_MMA_AVAILABLE
 #endif
@@ -92,14 +94,24 @@ struct legion_gdn_mma_args {
     float         eps;
     int32_t       silu;
     int32_t       head_v;
+
+    // The norm's rows as the ssm_out projection's FP8 codes (--dense-fp8-prompt, #1183;
+    // gdn_split's GN form with CODES only): instead of gout, `codes` (E4M3 [head_v * H,
+    // n_tokens]) and `scales` (F32 [n_tokens]) as fp8_act.cu's plain_bf16 makes them from the
+    // BF16 rows. `slots` ([n_tokens, H] words, zeroed before the launch): CTA h's amax of
+    // token t's BF16 values of its head, as float bits plus one (0: not written yet).
+    uint8_t *     codes;
+    float *       scales;
+    uint32_t *    slots;
 };
 
 }  // extern "C"
 
-static_assert(sizeof(legion_gdn_mma_args) == 232 && offsetof(legion_gdn_mma_args, H) == 64 &&
+static_assert(sizeof(legion_gdn_mma_args) == 256 && offsetof(legion_gdn_mma_args, H) == 64 &&
                   offsetof(legion_gdn_mma_args, sq1) == 104 && offsetof(legion_gdn_mma_args, scale) == 176 &&
                   offsetof(legion_gdn_mma_args, z) == 184 && offsetof(legion_gdn_mma_args, eps) == 216 &&
-                  offsetof(legion_gdn_mma_args, head_v) == 224,
+                  offsetof(legion_gdn_mma_args, head_v) == 224 && offsetof(legion_gdn_mma_args, codes) == 232 &&
+                  offsetof(legion_gdn_mma_args, slots) == 248,
               "gdn_mma.rs's Args has this layout");
 
 namespace {
@@ -891,14 +903,62 @@ static_assert(sizeof(split_shared<64, 1>) == 48384, "gdn_mma.rs's split smem(64,
 static_assert(sizeof(split_shared<128, 1>) == 60672, "gdn_mma.rs's split smem(128, 1)");
 static_assert(sizeof(split_shared<128, 2>) == 85376, "gdn_mma.rs's split smem(128, 2)");
 
+// CODES (#1183, legion_gdn_mma_args::codes): a token's FP8 scale needs the amax over all H
+// heads, that is over all H CTAs of the grid, so a CTA writes chunk c's codes CODES_LAG chunks
+// later. Each warp keeps its token's BF16 row of the last CODES_LAG + 1 chunks (its own lanes'
+// columns: no barrier between the write and the read), and CTA h posts each token's amax of its
+// head in slot (t, h) as float bits plus one: the value is its own flag, so no fence is needed;
+// a reader that finds a slot still 0 polls it. The slots of the chunk CODES_LAG back are copied
+// in at the top of a chunk with its next inputs (cp.async.cg, from L2), so the codes step
+// waits on L2 only where a CTA is that far behind. Every CTA waits for every other: the grid
+// must be co-resident (H CTAs, at most one an SM; gdn_mma.rs checks H against the SMs).
+constexpr int CODES_LAG   = 2;
+constexpr int CODES_HEADS = 48;  // most heads (CTAs) a grid with codes takes
+
+struct alignas(16) codes_shared {
+    __nv_bfloat16 ring[CODES_LAG + 1][16][128];
+    uint32_t      slots[16 * CODES_HEADS];
+};
+
+// gdn_mma.rs's CODES_SMEM: under the 99 KiB a block may opt in to on compute capability 12.x.
+static_assert(sizeof(split_shared<128, 2>) + sizeof(codes_shared) == 100736, "gdn_mma.rs's CODES_SMEM");
+
+__device__ __forceinline__ uint32_t ld_slot(const uint32_t * p) {
+    uint32_t v;
+    asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+
+__device__ __forceinline__ void st_slot(uint32_t * p, uint32_t v) {
+    asm volatile("st.relaxed.gpu.global.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
+}
+
+// Slot p once its CTA has written it; a trap (a CUDA error, not a hang) after 2^24 polls
+// (seconds: a CTA that never became resident).
+__device__ __noinline__ uint32_t wait_slot(const uint32_t * p) {
+    for (uint32_t n = 0;; ++n) {
+        const uint32_t v = ld_slot(p);
+        if (v != 0) {
+            return v;
+        }
+        if (n > (1u << 24)) {
+            __trap();
+        }
+        __nanosleep(64);
+    }
+}
+
 // GN (#1176 round 44, whole heads with two input buffers only): the gated output norm in the
 // kernel (legion_gdn_mma_args::gout). A chunk's outputs go to its q stage (free once converted)
 // instead of dst, and its z rows land in its k stage (cp.async, issued once the stages are
 // converted); after a block barrier warp t norms token t as fused.cu's gated_norm_w128_kernel
 // does (lane l holds columns l, 32 + l, 64 + l, 96 + l: gated_norm_kernel's sums and values)
 // and writes the BF16 row. The next chunk's inputs are issued after the top barrier, once every
-// warp has read the stages of the chunk before.
-template <int COLS, int WARPS, int CB, int MINB, int STAGES, bool GN = false>
+// warp has read the stages of the chunk before. With CODES (codes_shared above) the row goes to
+// the warp's ring instead, its amax to the slots, and the warp writes the codes of its token
+// CODES_LAG chunks back (after the loop: of the last chunks), with fp8_act_row.cuh's
+// expressions on the same BF16 values, so the bits of fp8_act's plain_bf16 of the rows.
+template <int COLS, int WARPS, int CB, int MINB, int STAGES, bool GN = false, bool CODES = false>
 static __global__ __launch_bounds__(32 * WARPS, MINB) void gdn_split(legion_gdn_mma_args a) {
 #ifdef LEGION_GDN_MMA_AVAILABLE
     constexpr int C       = 16;
@@ -908,8 +968,10 @@ static __global__ __launch_bounds__(32 * WARPS, MINB) void gdn_split(legion_gdn_
     static_assert(COLS == N * WARPS * CB && D % COLS == 0, "warps own whole 8-column blocks");
     static_assert(!GN || (COLS == D && STAGES == 2 && WARPS == C && C * D == 4 * THREADS),
                   "GN: whole heads, two buffers, a warp a token, a 16-byte piece a thread");
+    static_assert(!CODES || GN, "CODES: the GN form's rows");
     extern __shared__ __align__(128) unsigned char bytes[];
     auto & s = *reinterpret_cast<split_shared<COLS, STAGES> *>(bytes);
+    [[maybe_unused]] auto & cs = *reinterpret_cast<codes_shared *>(bytes + sizeof(split_shared<COLS, STAGES>));
     static_assert(STAGES == 1 || STAGES == 2, "one buffer in two groups, or two buffers");
     const int                                      lane = threadIdx.x, warp = threadIdx.y, tid = warp * 32 + lane;
     const int                                      slice = blockIdx.x % SLICES;
@@ -968,13 +1030,52 @@ static __global__ __launch_bounds__(32 * WARPS, MINB) void gdn_split(legion_gdn_
         }
         asm volatile("cp.async.commit_group;" ::: "memory");
     };
+    // CODES: the slots of chunk cc (C rows of H words, 16-byte aligned) into cs.slots, a group.
+    auto issue_slots = [&](int64_t cc) {
+        const float * src = reinterpret_cast<const float *>(a.slots + cc * C * a.H);
+        for (int i = tid; i < C * a.H / 4; i += THREADS) {
+            cp_async16(reinterpret_cast<float *>(cs.slots) + 4 * i, src + 4 * i, true);
+        }
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    };
+    // CODES: warp t's token of chunk cc, its row in the ring: the codes of the head and (CTA 0)
+    // the scale, once every CTA's slot of the token is there (`staged`: first from cs.slots).
+    auto codes_of = [&](int64_t cc, bool staged) {
+        const int     t   = warp;
+        const int64_t tok = cc * C + t;
+        if (tok >= a.n_tokens) {
+            return;
+        }
+        uint32_t top = 0;
+        for (int i = lane; i < a.H; i += 32) {
+            uint32_t v = staged ? cs.slots[t * a.H + i] : 0u;
+            if (v == 0) {
+                v = wait_slot(a.slots + tok * a.H + i);
+            }
+            top = max(top, v);
+        }
+        // Max of the heads' amaxes: non-negative floats (fmaxf drops NaNs) order as their bits.
+        top                         = __reduce_max_sync(0xffffffff, top);
+        const float           sc    = fp8_row_scale(__uint_as_float(top - 1));
+        const float           inv   = fp8_row_inv(sc);
+        const __nv_bfloat16 * row   = cs.ring[cc % (CODES_LAG + 1)][t];
+        uint8_t *             codes = a.codes + tok * a.H * D + h * D;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            codes[32 * j + lane] = fp8_code(__bfloat162float(row[32 * j + lane]), inv);
+        }
+        if (h == 0 && lane == 0) {
+            a.scales[tok] = sc;
+        }
+    };
     // STAGES 1: q, k, g, beta in one group and v in the next; STAGES 2: a chunk in one group.
     issue_qk(0, 0);
     issue_v(0, 0);
     int buf = 0;
     for (int64_t t0 = 0; t0 < a.n_tokens; t0 += C, buf ^= STAGES - 1) {
-        const int  valid = min((int64_t) C, a.n_tokens - t0);
-        const bool more  = t0 + C < a.n_tokens;
+        const int     valid = min((int64_t) C, a.n_tokens - t0);
+        const bool    more  = t0 + C < a.n_tokens;
+        [[maybe_unused]] const int64_t chunk = t0 / C;
         if constexpr (STAGES == 2 && !GN) {
             // The other buffer was last read before the previous chunk's solve.
             if (more) {
@@ -999,6 +1100,12 @@ static __global__ __launch_bounds__(32 * WARPS, MINB) void gdn_split(legion_gdn_
             if (more) {
                 issue_qk(buf ^ 1, t0 + C);
                 issue_v(buf ^ 1, t0 + C);
+            }
+            // The chunk before's codes step read cs.slots.
+            if constexpr (CODES) {
+                if (chunk >= CODES_LAG) {
+                    issue_slots(chunk - CODES_LAG);
+                }
             }
         }
         const auto & st = s.stage[buf];
@@ -1209,13 +1316,32 @@ static __global__ __launch_bounds__(32 * WARPS, MINB) void gdn_split(legion_gdn_
                 const float   tot   = (sum[0] + sum[2]) + (sum[1] + sum[3]);
                 const float   mean  = tot / a.head_v;
                 const float   scale = rsqrtf(mean + a.eps);
-                const int64_t row   = (t0 + t) * a.H * D + h * D;
+                [[maybe_unused]] const int64_t row = (t0 + t) * a.H * D + h * D;
+                [[maybe_unused]] float amax = 0.0f;
 #pragma unroll
                 for (int j = 0; j < 4; j++) {
-                    const float zv = z[32 * j + lane];
-                    const float y  = scale * x[j] * a.norm_w[32 * j + lane];
-                    const float g  = a.silu ? zv / (1.0f + expf(-zv)) : 1.0f / (1.0f + expf(-zv));
-                    __stcs((__nv_bfloat16 *) a.gout + row + 32 * j + lane, __float2bfloat16(y * g));
+                    const float         zv = z[32 * j + lane];
+                    const float         y  = scale * x[j] * a.norm_w[32 * j + lane];
+                    const float         g  = a.silu ? zv / (1.0f + expf(-zv)) : 1.0f / (1.0f + expf(-zv));
+                    const __nv_bfloat16 b  = __float2bfloat16(y * g);
+                    if constexpr (CODES) {
+                        // fp8_act's amax: fmaxf over |value| from 0.
+                        cs.ring[chunk % (CODES_LAG + 1)][t][32 * j + lane] = b;
+                        amax = fmaxf(amax, fabsf(__bfloat162float(b)));
+                    } else {
+                        __stcs((__nv_bfloat16 *) a.gout + row + 32 * j + lane, b);
+                    }
+                }
+                if constexpr (CODES) {
+                    const uint32_t top = __reduce_max_sync(0xffffffff, __float_as_uint(amax));
+                    if (lane == 0) {
+                        st_slot(a.slots + (t0 + t) * a.H + h, top + 1);
+                    }
+                }
+            }
+            if constexpr (CODES) {
+                if (chunk >= CODES_LAG) {
+                    codes_of(chunk - CODES_LAG, true);
                 }
             }
         }
@@ -1270,6 +1396,13 @@ static __global__ __launch_bounds__(32 * WARPS, MINB) void gdn_split(legion_gdn_
             }
         }
     }
+    if constexpr (CODES) {
+        // The last CODES_LAG chunks' codes (their slots straight from L2).
+        const int64_t chunks = (a.n_tokens + C - 1) / C;
+        for (int64_t cc = max((int64_t) 0, chunks - CODES_LAG); cc < chunks; ++cc) {
+            codes_of(cc, false);
+        }
+    }
 #else
     (void) a;
     __trap();  // gdn_mma.rs launches it on compute capability 8.0+ only
@@ -1282,9 +1415,10 @@ static __global__ __launch_bounds__(32 * WARPS, MINB) void gdn_split(legion_gdn_
 // the order of gdn_mma.rs's `Schedule`: value slices of 32 at one and two blocks an SM, whole
 // heads, whole heads staged, then the split kernels (two CTAs a head, 16 warps a head, 8 warps
 // a head, 16 warps a head with two input buffers), and last the latter with the gated output
-// norm (GN, #1176 round 44). They sit in an anonymous namespace: with relocatable device code the device link left
-// extern "C" kernels out of the linked image.
-extern "C" const void * const legion_gdn_mma_kernels[9] = {
+// norm (GN, #1176 round 44), and that writing the FP8 codes (CODES, #1183). They sit in an
+// anonymous namespace: with relocatable device code the device link left extern "C" kernels out
+// of the linked image.
+extern "C" const void * const legion_gdn_mma_kernels[10] = {
     reinterpret_cast<const void *>(&gdn_single<16, 32, 1>),
     reinterpret_cast<const void *>(&gdn_single<16, 32, 2>),
     reinterpret_cast<const void *>(&gdn_single<16, 128>),
@@ -1294,4 +1428,5 @@ extern "C" const void * const legion_gdn_mma_kernels[9] = {
     reinterpret_cast<const void *>(&gdn_split<128, 8, 2, 1, 1>),
     reinterpret_cast<const void *>(&gdn_split<128, 16, 1, 1, 2>),
     reinterpret_cast<const void *>(&gdn_split<128, 16, 1, 1, 2, true>),
+    reinterpret_cast<const void *>(&gdn_split<128, 16, 1, 1, 2, true, true>),
 };

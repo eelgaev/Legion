@@ -198,6 +198,9 @@ fn staged_needs_aligned_rows() {
         eps: 1e-6,
         silu: 1,
         head_v: 128,
+        codes: std::ptr::null_mut(),
+        scales: std::ptr::null_mut(),
+        slots: std::ptr::null_mut(),
     };
     assert!(args(2048, 128).staged_aligned());
     assert!(!args(2049, 128).staged_aligned());
@@ -258,13 +261,44 @@ fn launch_sizes_match_the_kernels() {
     assert_eq!((Schedule::Wide.warps(), Schedule::Pair.warps()), (16, 8));
     // Two pair CTAs (and the driver's 1 KiB each) fit a GB10 SM's 100 KiB.
     assert!(2 * (Schedule::Pair.smem() + 1024) <= 100 * 1024);
-    assert_eq!(std::mem::size_of::<Args>(), 232);
+    assert_eq!(std::mem::size_of::<Args>(), 256);
     assert_eq!(std::mem::offset_of!(Args, h), 64);
     assert_eq!(std::mem::offset_of!(Args, sq), 104);
     assert_eq!(std::mem::offset_of!(Args, scale), 176);
     assert_eq!(std::mem::offset_of!(Args, z), 184);
     assert_eq!(std::mem::offset_of!(Args, eps), 216);
     assert_eq!(std::mem::offset_of!(Args, head_v), 224);
+    assert_eq!(std::mem::offset_of!(Args, codes), 232);
+    assert_eq!(std::mem::offset_of!(Args, slots), 248);
+    // The codes kernel: `codes_shared` after the two-buffer kernel's, under the 99 KiB a block
+    // may opt in to on compute capability 12.x, one CTA (and the driver's 1 KiB) an SM.
+    assert_eq!(CODES_SMEM, 100736);
+    assert!(CODES_SMEM <= 99 * 1024 && CODES_SMEM + 1024 <= 100 * 1024);
+}
+
+/// A codes node's packed activations and slots fit in the tokens' F32 rows the norm leaves
+/// unwritten, the slots 16-byte aligned for the kernel's copies (and the scales 4-byte).
+#[test]
+fn codes_fit_in_the_tokens_rows() {
+    for (h, nt) in [
+        (48, 64),
+        (48, 65),
+        (48, 12288),
+        (24, 777),
+        (1, 64),
+        (48, 1 << 20),
+    ] {
+        let (total, at, len) = codes_layout(h, nt);
+        let k = (HEAD * h) as usize;
+        assert_eq!(total, crate::model::fp8::dynamic_layout(k as i64, nt).1);
+        assert_eq!(len, 4 * (h * nt) as usize);
+        assert!(total <= at && at % 256 == 0 && at - total < 256, "{h} {nt}");
+        assert!(at + len <= 4 * k * nt as usize, "{h} {nt}");
+        assert_eq!((k * nt as usize) % 4, 0, "the scales after the codes");
+        // A chunk's slots (16 rows of h words) in whole 16-byte pieces.
+        assert_eq!((16 * 4 * h as usize) % 16, 0);
+    }
+    assert!(CODES_HEADS <= 48);
 }
 
 #[test]
@@ -307,6 +341,104 @@ fn cuda_gdn_mma_matches_ggml() {
         }
         let r = rel(&op, &reference);
         assert!(r < 1e-3, "{c:?}: {r:e}");
+    }
+}
+
+/// `--dense-fp8-prompt` (#1183): a [`gdn_mma_gn`] node switched to codes ([`codes_on`]) against
+/// one switched to BF16 rows ([`norm_on`]) and `fp8_act::plain_bf16` of them, codes and scales
+/// bit for bit: one GPU's heads of Qwen3.8-Flash-Next at token counts that are not a multiple
+/// of the chunk, and fewer heads.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU of compute capability 8.0+"]
+fn cuda_codes_match_norm_then_fp8_act() {
+    use crate::ggml::{DeviceKind, device_by_kind};
+    use crate::model::fp8_act;
+    let mut gpu = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU device")
+        .init()
+        .unwrap();
+    set_gpu(crate::hw::per_device::cc(0));
+    set_gdn_mma(true);
+    for (n_k, n_v, nt) in [
+        (16, 48, 777),
+        (16, 48, 4096 + 5),
+        (8, 24, 300),
+        (16, 48, 64),
+    ] {
+        let s = HEAD;
+        let row = 2 * s * n_k + s * n_v;
+        let ctx = Context::new(64, 64);
+        let conv = ctx.new_tensor(types::F32, &[row, nt, 1]).as_input();
+        let g = ctx.new_tensor(types::F32, &[1, n_v, nt, 1]).as_input();
+        let beta = ctx.new_tensor(types::F32, &[1, n_v, nt, 1]).as_input();
+        let state = ctx.new_tensor(types::F32, &[s, s, n_v, 1]).as_input();
+        let z = ctx.new_tensor(types::F32, &[s * n_v, nt]).as_input();
+        let norm_w = ctx.new_tensor(types::F32, &[s]).as_input();
+        let es = 4usize;
+        let nb = [s as usize * es, row as usize * es, (row * nt) as usize * es];
+        let q = ctx.view_4d(conv, [s, n_k, nt, 1], nb, 0);
+        let k = ctx.view_4d(conv, [s, n_k, nt, 1], nb, (s * n_k) as usize * es);
+        let v = ctx.view_4d(conv, [s, n_v, nt, 1], nb, (2 * s * n_k) as usize * es);
+        let qkv = [q, k, v, g, beta];
+        let (rows_node, ob) = gdn_mma_gn(&ctx, qkv, state, z, norm_w, 1e-6, true);
+        norm_on(rows_node);
+        let want = fp8_act::plain_bf16(&ctx, ob).as_output();
+        let (codes_node, _) = gdn_mma_gn(&ctx, qkv, state, z, norm_w, 1e-6, true);
+        let got = codes_on(&ctx, codes_node);
+        codes_node.as_output();
+        // SAFETY: graph nodes built above.
+        unsafe {
+            assert!(is_codes(codes_node.raw()) && !is_codes(rows_node.raw()));
+        }
+        let mut graph = ctx.new_graph(64);
+        graph.expand(want);
+        graph.expand(got);
+        ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+            .unwrap();
+        let mut x = noise((row * nt) as usize, 1);
+        for tok in x.chunks_mut(row as usize) {
+            for head in tok[..(2 * s * n_k) as usize].chunks_mut(s as usize) {
+                let n = head.iter().map(|v| v * v).sum::<f32>().sqrt();
+                head.iter_mut().for_each(|v| *v /= n);
+            }
+        }
+        conv.set_f32(&x);
+        let gb = (n_v * nt) as usize;
+        let map = |seed, f: fn(f32) -> f32| noise(gb, seed).into_iter().map(f).collect::<Vec<_>>();
+        g.set_f32(&map(2, |v| 0.5 * (v - 1.0)));
+        beta.set_f32(&map(3, |v| 0.5 * (v + 1.0)));
+        let s0: Vec<f32> = noise((s * s * n_v) as usize, 4)
+            .iter()
+            .map(|v| 0.1 * v)
+            .collect();
+        state.set_f32(&s0);
+        // A gate spread over a few heads' worth of scale, so tokens' amaxes come from any head.
+        let zs: Vec<f32> = noise((s * n_v * nt) as usize, 5)
+            .iter()
+            .map(|v| 3.0 * v)
+            .collect();
+        z.set_f32(&zs);
+        norm_w.set_f32(
+            &noise(s as usize, 6)
+                .iter()
+                .map(|v| 1.0 + 0.5 * v)
+                .collect::<Vec<_>>(),
+        );
+        gpu.compute(&graph).unwrap();
+        let (want, got) = (want.bytes(), got.bytes());
+        assert_eq!(want.len(), got.len());
+        let (kk, n) = ((s * n_v) as usize, nt as usize);
+        let i = want.iter().zip(&got).position(|(a, b)| a != b);
+        let at = i.map(|i| {
+            if i < kk * n {
+                format!("code of token {}, column {}", i / kk, i % kk)
+            } else {
+                format!("scale of token {}", (i - kk * n) / 4)
+            }
+        });
+        assert_eq!(at, None, "{:?}", (n_k, n_v, nt));
     }
 }
 

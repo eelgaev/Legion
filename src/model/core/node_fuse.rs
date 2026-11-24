@@ -120,6 +120,10 @@ pub(crate) struct Counts {
     /// #1183): the prompt attention ops that gate and quantize their output
     /// ([`crate::model::qwen4::qsa_attn::gated_codes`]). Counted, not rewritten.
     pub fp8_codes: usize,
+    /// The same for the gated DeltaNet delta rule ops that norm their output and write the
+    /// ssm_out projection's codes ([`crate::model::core::gdn_mma::codes_on`]). Counted, not
+    /// rewritten.
+    pub gdn_codes: usize,
     /// Nodes turned into `GGML_OP_NONE`.
     pub none: usize,
 }
@@ -127,8 +131,8 @@ pub(crate) struct Counts {
 /// Graphs whose rewrite was logged (the first few only).
 static LOGGED: AtomicUsize = AtomicUsize::new(0);
 
-/// Whether a graph with [`Counts::fp8_codes`] was logged (the first one is, after the first
-/// few graphs too: prompt steps may come later).
+/// Whether a graph with [`Counts::fp8_codes`] or [`Counts::gdn_codes`] was logged (the first
+/// one is, after the first few graphs too: prompt steps may come later).
 static CODES_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// The pass on CUDA graphs ([`crate::ggml::post_alloc::set_rewrite`]). Then the CPU share's
@@ -160,7 +164,7 @@ unsafe fn fuse(graph: *mut ffi::ggml_cgraph) {
     }
     // SAFETY: the caller's.
     let c = unsafe { rewrite_graph(graph, true) };
-    let first_codes = c.fp8_codes > 0 && !CODES_LOGGED.swap(true, Ordering::Relaxed);
+    let first_codes = c.fp8_codes + c.gdn_codes > 0 && !CODES_LOGGED.swap(true, Ordering::Relaxed);
     if c != Counts::default() && (LOGGED.fetch_add(1, Ordering::Relaxed) < 4 || first_codes) {
         tracing::info!(
             sum_gate = c.sum_gate,
@@ -173,6 +177,7 @@ unsafe fn fuse(graph: *mut ffi::ggml_cgraph) {
             gather_mix = c.gather_mix,
             gather_cast = c.gather_cast,
             fp8_codes = c.fp8_codes,
+            gdn_codes = c.gdn_codes,
             none = c.none,
             "node fuse: small ggml chains as Legion ops (the first graphs; --node-fuse-ggml off)"
         );
@@ -201,6 +206,9 @@ pub(crate) unsafe fn rewrite_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> 
                 ffi::ggml_op_GGML_OP_CUSTOM => {
                     if crate::model::qwen4::qsa_attn::is_gated_codes(g.nodes[i]) {
                         c.fp8_codes += 1;
+                    }
+                    if super::gdn_mma::is_codes(g.nodes[i]) {
+                        c.gdn_codes += 1;
                     }
                     g.mix_cast(i, &mut c);
                     if cuda {

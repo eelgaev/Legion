@@ -4081,14 +4081,29 @@ impl Model {
         {
             let silu = !hp.arch.sigmoid_gate();
             let ob = match gn_node {
+                // `--dense-fp8-prompt` (#1183): the delta rule's node writes the projection's
+                // FP8 codes of those rows instead (the same codes; no BF16 rows for anything
+                // else to read). MoE models only: a dense one's codes come from `fp8_codes`.
+                Some((node, ob))
+                    if hp.moe
+                        && fp8_act::plain_bf16_fits(ob)
+                        && self.twin_prompt_reads(il, "ssm_out.weight", o) =>
+                {
+                    fp8_act::share(ctx, o, gdn_mma::codes_on(ctx, node));
+                    None
+                }
                 // The delta rule's node writes them (o's own values are then not computed).
                 Some((node, ob)) => {
                     gdn_mma::norm_on(node);
-                    ob
+                    Some(ob)
                 }
-                None => fused::gated_norm_bf16(ctx, o2, norm_w, z_rows, head_v, hp.rms_eps, silu),
+                None => Some(fused::gated_norm_bf16(
+                    ctx, o2, norm_w, z_rows, head_v, hp.rms_eps, silu,
+                )),
             };
-            ctx.set_shared_cast(o, types::BF16, ob);
+            if let Some(ob) = ob {
+                ctx.set_shared_cast(o, types::BF16, ob);
+            }
         }
         fp8_codes(o);
         let out = self.lmm_add(ctx, il, "ssm_out.weight", o, res)?;

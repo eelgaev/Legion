@@ -548,6 +548,38 @@ pub(crate) unsafe fn quantize_plain(
     }
 }
 
+/// [`plain_bf16`]'s CUDA kernel on device pointers: the codes (`out`, `k * n`) and scales
+/// (`scales`, `n` F32) of the BF16 rows `x` (`[k, n]` contiguous, `k` a multiple of 4). The
+/// launch's result (0 on success; 1: a shape the kernel does not take).
+///
+/// # Safety
+/// Device pointers on the stream's device, sized as documented.
+#[cfg(feature = "cuda")]
+pub(crate) unsafe fn plain_bf16_raw(
+    x: *const u16,
+    k: i64,
+    out: *mut u8,
+    scales: *mut f32,
+    n: i64,
+    stream: *mut c_void,
+) -> i32 {
+    if k > MAX_K || k % 4 != 0 || n > i32::MAX as i64 {
+        return 1;
+    }
+    // (BF16 rows: `x_ld` in BF16 values.)
+    let p = Fp8Act {
+        x: x.cast(),
+        x_ld: k,
+        out,
+        scales,
+        k: k as i32,
+        n: n as i32,
+        ..Fp8Act::of(Kind::Bf16 as i32)
+    };
+    // SAFETY: the caller's pointers, as documented.
+    unsafe { legion_fp8_act_launch(&p, stream) }
+}
+
 /// [`gate`]'s CUDA kernel on device pointers: the packed activations (`out` the `k * n` codes,
 /// `scales` the `n` F32 scales) of `sigmoid(x) * g` (`silu`: `silu(x) * g`), with element `i`
 /// of token `t` of `x` at `x + t * x_ld + (i / d) * x_hd + i % d` and of `g` at
