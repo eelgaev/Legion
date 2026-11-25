@@ -633,14 +633,12 @@ __global__ void __launch_bounds__(gws2_threads<XW>(), 1) nvfp4_glu_ws2(const leg
     // The copies of global step j (local step `step` of the tile in slot b) into stage j % 3.
     auto copy_step = [&](int e, int64_t m0, int b, int n_tok, int step, uint32_t j) {
         const int stage = j % ST;
+        copy_w(e, m0, step, stage);  // this warp's own rows: free once it is done with them
         if constexpr (XW == 0) {
             // The activation rows are every warp's: all eight done with the stage (step j - 3).
             bar_wait(empty + stage, ((j / ST) & 1) ^ 1);
             copy_x(warp * 32 + lane, b, n_tok, step, stage);
-        }
-        copy_w(e, m0, step, stage);
-        if constexpr (XW == 0) {
-            arrive_copies(stage);
+            arrive_copies(stage);  // tracks the weight copies above too
         } else {
             asm volatile("cp.async.commit_group;\n" ::);
         }
