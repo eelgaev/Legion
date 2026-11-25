@@ -1243,15 +1243,16 @@ fn cuda_select_all_is_the_scored_selection() {
 
 /// A step's selection from the indexer's chain (pool mask, lightning indexer, pool bias,
 /// [`top_k`] of `n_top`) both ways on `backend`: [`select`] with the scores and
-/// [`select_vis`] with the visible ranges (#560 r12), the [`pick_all_case`] listing.
+/// [`select_vis`] with the visible ranges (#560 r12), the [`pick_all_case`] listing. Also
+/// returns the scores the selections were made from.
 fn pick_vis_case(
     backend: &mut Backend,
     pools: &[usize],
     n_pool: usize,
     n_top: usize,
     n_tok: usize,
-) -> (Vec<i32>, Vec<i32>) {
-    let (d, nh, kpool) = (128i64, 4i64, 4usize);
+) -> (Vec<i32>, Vec<i32>, Vec<f32>) {
+    let (d, nh, kpool) = (128i64, 4i64, PICK_VIS_KPOOL);
     let ng = pools.len() * n_tok;
     let ctx = Context::new(64, 64);
     let q = ctx.new_tensor(types::F32, &[d, nh, ng as i64]).as_input();
@@ -1269,7 +1270,9 @@ fn pick_vis_case(
         .as_input();
     let pos = ctx.new_tensor(types::I32, &[ng as i64]).as_input();
     let mask = pool_mask(&ctx, vis, n_pool as i64);
-    let score = ctx.add(ctx.lightning_indexer(q, keys, w, mask), bias);
+    let score = ctx
+        .add(ctx.lightning_indexer(q, keys, w, mask), bias)
+        .as_output();
     let top = top_k(&ctx, score, n_top as i64);
     let chain = select(&ctx, top, score, pidx, tail, pos).as_output();
     let picks = select_vis(&ctx, top, vis, pidx, tail, pos).as_output();
@@ -1281,6 +1284,26 @@ fn pick_vis_case(
     q.set_f32(&noise(d as usize * nh as usize * ng, 3));
     keys.set_f32(&noise(d as usize * n_pool, 4));
     w.set_f32(&vec![1.0 / (d as f32).sqrt(); nh as usize * ng]);
+    let (v, b, members, tails, ps) = pick_vis_inputs(pools, n_pool, n_tok);
+    vis.set_bytes(&bytes(&v));
+    bias.set_f32(&b);
+    pidx.set_bytes(&bytes(&members));
+    tail.set_bytes(&bytes(&tails));
+    pos.set_bytes(&bytes(&ps));
+    backend.compute(&g).unwrap();
+    (chain.to_i32(), picks.to_i32(), score.to_f32())
+}
+
+const PICK_VIS_KPOOL: usize = 4;
+
+/// [`pick_vis_case`]'s visible ranges, pool bias, pool members, tails and positions.
+#[allow(clippy::type_complexity)]
+fn pick_vis_inputs(
+    pools: &[usize],
+    n_pool: usize,
+    n_tok: usize,
+) -> (Vec<i32>, Vec<f32>, Vec<i32>, Vec<i32>, Vec<i32>) {
+    let kpool = PICK_VIS_KPOOL;
     let (mut v, mut b, mut members, mut tails, mut ps) = (vec![], vec![], vec![], vec![], vec![]);
     for &n in pools {
         let first = b.len() as i32;
@@ -1299,13 +1322,41 @@ fn pick_vis_case(
     assert!(b.len() < n_pool);
     b.resize(n_pool, 0.0);
     members.resize(n_pool * kpool, i32::MAX);
-    vis.set_bytes(&bytes(&v));
-    bias.set_f32(&b);
+    (v, b, members, tails, ps)
+}
+
+/// The CPU's [`select`] of `n_top` from given scores (another backend's), with
+/// [`pick_vis_case`]'s pools: the same picks unless the two backends' selections differ.
+fn cpu_pick_from(
+    scores: &[f32],
+    pools: &[usize],
+    n_pool: usize,
+    n_top: usize,
+    n_tok: usize,
+) -> Vec<i32> {
+    let kpool = PICK_VIS_KPOOL as i64;
+    let ng = (pools.len() * n_tok) as i64;
+    let ctx = Context::new(16, 16);
+    let score = ctx.new_tensor(types::F32, &[n_pool as i64, ng]).as_input();
+    let pidx = ctx
+        .new_tensor(types::I32, &[kpool, n_pool as i64])
+        .as_input();
+    let tail = ctx.new_tensor(types::I32, &[kpool - 1, ng]).as_input();
+    let pos = ctx.new_tensor(types::I32, &[ng]).as_input();
+    let top = top_k(&ctx, score, n_top as i64);
+    let chain = select(&ctx, top, score, pidx, tail, pos).as_output();
+    let mut g = ctx.new_graph(16);
+    g.expand(chain);
+    let mut backend = cpu();
+    ctx.alloc_graph(&g, ComputeAllocator::new(backend.buffer_type()))
+        .unwrap();
+    let (_, _, members, tails, ps) = pick_vis_inputs(pools, n_pool, n_tok);
+    score.set_f32(scores);
     pidx.set_bytes(&bytes(&members));
     tail.set_bytes(&bytes(&tails));
     pos.set_bytes(&bytes(&ps));
     backend.compute(&g).unwrap();
-    (chain.to_i32(), picks.to_i32())
+    chain.to_i32()
 }
 
 /// (pools per sequence, listed pools, picks, tokens per sequence): more visible pools than
@@ -1320,7 +1371,7 @@ const PICK_VIS_CASES: [(&[usize], usize, usize, usize); 4] = [
 #[test]
 fn cpu_select_vis_is_the_scored_selection() {
     for &(pools, n_pool, n_top, n_tok) in &PICK_VIS_CASES {
-        let (chain, picks) = pick_vis_case(&mut cpu(), pools, n_pool, n_top, n_tok);
+        let (chain, picks, _) = pick_vis_case(&mut cpu(), pools, n_pool, n_top, n_tok);
         assert_eq!(chain, picks, "{pools:?} over {n_pool}, {n_top} picks");
     }
 }
@@ -1336,9 +1387,11 @@ fn cuda_select_vis_is_the_scored_selection() {
         .init()
         .unwrap();
     for &(pools, n_pool, n_top, n_tok) in &PICK_VIS_CASES {
-        let (chain, picks) = pick_vis_case(&mut gpu, pools, n_pool, n_top, n_tok);
-        let (cpu_chain, _) = pick_vis_case(&mut cpu(), pools, n_pool, n_top, n_tok);
+        let (chain, picks, scores) = pick_vis_case(&mut gpu, pools, n_pool, n_top, n_tok);
         assert_eq!(chain, picks, "{pools:?} over {n_pool}, {n_top} picks");
+        // From CUDA's scores: the two backends' indexers round differently, so near-ties at
+        // the cut could pick other pools from their own scores.
+        let cpu_chain = cpu_pick_from(&scores, pools, n_pool, n_top, n_tok);
         assert_eq!(picks, cpu_chain, "{pools:?} over {n_pool}: CUDA vs CPU");
     }
 }
