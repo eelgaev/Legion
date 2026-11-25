@@ -253,9 +253,10 @@ fn gpu_packed_writes_land_as_copies() {
     let n_big = (pack::MAX_PIECES + 7) * pack::CHUNK / 4 + 5;
     let c = ctx.new_tensor(types::F32, &[n_big as i64]).named("c");
     let v = ctx.new_tensor(types::I32, &[16]).named("v");
-    ctx.alloc_tensors(dev.buffer_type()).unwrap();
-    // A view at an odd 4-byte offset: the kernel's unaligned path.
+    // A view at an odd 4-byte offset: the kernel's unaligned path. Made before the allocation,
+    // which places it in `v`'s memory.
     let d = ctx.view_1d(v, 5, 4);
+    ctx.alloc_tensors(dev.buffer_type()).unwrap();
     let mut io = PinnedIo::default();
     v.set_i32(&[0; 16]);
     for round in 0..3 {
