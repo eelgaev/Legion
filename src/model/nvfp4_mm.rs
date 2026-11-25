@@ -1417,12 +1417,15 @@ impl GemmTune {
         self.stages == 9 && self.ctas == 9
     }
 
-    /// The grouped fused gate/up GEMM's 128-token tile with a copy warp (`nvfp4_glu_ws` in
-    /// `src/cuda/sm90/nvfp4_glu_ws.cuh`, #1183): eight warps multiply what a ninth copies into
-    /// a ring of three stages on mbarriers. `v` 1: the activation rows by bulk copies, one CTA
-    /// per SM looping over the tiles; 2: by 16-byte copies, one CTA per SM; 3: as 1 with a CTA
-    /// per tile. Its code: `v * 1000 + 98`. The same bits as every other tune; launches it does
-    /// not take (no sm_90+ code, unaligned weights) run the default kernel.
+    /// The grouped fused gate/up GEMM's 128-token tile, warp-specialized (`src/cuda/sm90/
+    /// nvfp4_glu_ws.cuh`, #1183): eight warps multiply out of a ring of three stages on
+    /// mbarriers. `v` 1-3 (`nvfp4_glu_ws`): a ninth warp issues every copy; 1: the activation
+    /// rows by bulk copies, one CTA per SM looping over the tiles; 2: by 16-byte copies, one
+    /// CTA per SM; 3: as 1 with a CTA per tile. `v` 10 + XW (`nvfp4_glu_ws2`, XW 0, 1, 2 or 4):
+    /// each multiply warp copies its own weight rows, XW copy warps the activation rows (0: the
+    /// multiply warps too), one CTA per SM. Its code: `v * 1000 + 98`. The same bits as every
+    /// other tune; launches it does not take (no sm_90+ code, unaligned weights) run the default
+    /// kernel.
     pub const fn glu_ws(v: i32) -> Self {
         Self {
             stages: 9,
@@ -1599,9 +1602,10 @@ pub fn glu_gemm_tile(k: i64, n_expert: i64, per: i64) -> (i32, GemmTune) {
     (nt, grouped_gemm_tune(k, n_expert, 2, nt, true))
 }
 
-/// The grouped fused gate/up GEMM's kernel with a copy warp, bulk activation copies, one CTA
-/// per SM ([`GemmTune::glu_ws`] 1): the default of its 128-token tiles (see [`glu_ws_tune`]).
-pub const GEMM_GLU_WS: GemmTune = GemmTune::glu_ws(1);
+/// The grouped fused gate/up GEMM's warp-specialized kernel `--nvfp4-glu-ws` runs
+/// ([`GemmTune::glu_ws`] 10: the multiply warps copy their weight rows and the activation rows,
+/// a ninth warp finds the tiles, one CTA per SM; see [`glu_ws_tune`]).
+pub const GEMM_GLU_WS: GemmTune = GemmTune::glu_ws(10);
 
 /// The variant a grouped fused gate/up GEMM of `8 * nt`-token tiles launches for `tune`:
 /// [`GEMM_GLU_WS`] for the default tune's 128-token tiles if [`set_glu_ws`] turned it on,

@@ -351,8 +351,8 @@ fn gemm_tune_codes() {
 /// the default tune's 128-token tiles only.
 #[test]
 fn glu_ws_tunes() {
-    assert_eq!(GEMM_GLU_WS.code(), 1098);
-    for v in 1..=3 {
+    assert_eq!(GEMM_GLU_WS.code(), 10_098);
+    for v in [1, 2, 3, 10, 11, 12, 14] {
         let t = GemmTune::glu_ws(v);
         assert_eq!(t.code(), v * 1000 + 98);
         assert_eq!(GemmTune::from_code(t.code()), t);
@@ -1341,22 +1341,28 @@ fn cuda_down_x_prefetch_bench() {
     xpf_reset();
 }
 
-/// The fused gate/up GEMM's kernels the copy-warp tests compare (#1183): the plain kernel
-/// (the default), then [`GemmTune::glu_ws`] 1 (`--nvfp4-glu-ws`), 2 and 3.
+/// The fused gate/up GEMM's kernels the warp-specialized tests compare (#1183): the plain
+/// kernel (the default), `--nvfp4-glu-ws` (-1: the switch, [`GEMM_GLU_WS`]), then each
+/// [`GemmTune::glu_ws`] variant forced.
 #[cfg(feature = "cuda")]
-const GLU_WS_RUNS: [(&str, i32); 4] = [
+const GLU_WS_RUNS: [(&str, i32); 9] = [
     ("old (plain kernel)", 0),
-    ("ws bulk x, persistent", 1),
-    ("ws cp.async x, persistent", 2),
-    ("ws bulk x, CTA a tile", 3),
+    ("--nvfp4-glu-ws", -1),
+    ("1 warp copies all, bulk x", 1),
+    ("1 warp copies all", 2),
+    ("1 warp copies all, bulk x, CTA/tile", 3),
+    ("w by mma warps, x by mma warps", 10),
+    ("w by mma warps, x by 1 copy warp", 11),
+    ("w by mma warps, x by 2 copy warps", 12),
+    ("w by mma warps, x by 4 copy warps", 14),
 ];
 
 /// Launches the fused gate/up GEMM from now on as [`GLU_WS_RUNS`]'s variant `v` (0: the plain
-/// kernel), at `8 * nt`-token tiles if set.
+/// kernel; -1: `--nvfp4-glu-ws`), at `8 * nt`-token tiles if set.
 #[cfg(feature = "cuda")]
 fn glu_ws_run(v: i32, nt: Option<i32>) {
-    set_glu_ws(v != 0);
-    force_gemm_tune((v > 1).then(|| GemmTune::glu_ws(v)), nt);
+    set_glu_ws(v == -1);
+    force_gemm_tune((v > 0).then(|| GemmTune::glu_ws(v)), nt);
 }
 
 /// One copy-warp bit test case: a routed SwiGLU GEMM of `n_expert` NVFP4 experts (`hidden` by
@@ -1521,10 +1527,10 @@ fn cuda_glu_ws_keeps_bits() {
 }
 
 /// The fused gate/up GEMM (Qwen3.8-Flash-Next, 512 experts, top 10) at 12,288- and 8,067-token
-/// prompt steps on the plain kernel (old) and the copy-warp kernel's variants (#1183):
+/// prompt steps on the plain kernel (old) and the warp-specialized variants (#1183):
 /// microseconds a layer (median and best of 5 rounds, the variants taking turns, each round
 /// starting one further on), TFLOP/s and the bytes moved a second at the median, and whether
-/// the bits are the old ones. `*` marks the default.
+/// the bits are the old ones. `*` marks the default (the plain kernel).
 /// `cargo test --release --features cuda --lib -- --ignored cuda_glu_ws_bench --nocapture`.
 #[cfg(feature = "cuda")]
 #[test]
@@ -1547,10 +1553,6 @@ fn cuda_glu_ws_bench() {
     for s in scales {
         s.set_f32(&vec![0.004; n_expert]);
     }
-    let default = GLU_WS_RUNS
-        .iter()
-        .position(|&(_, v)| v == GEMM_GLU_WS.warps)
-        .unwrap();
     for n_tok in [12288usize, 8067] {
         let ctx = Context::new(16 + 24 * LAYERS, 16 * LAYERS + 16);
         let x = ctx
@@ -1634,9 +1636,9 @@ fn cuda_glu_ws_bench() {
         );
         for (vi, &(name, v)) in GLU_WS_RUNS.iter().enumerate() {
             eprintln!(
-                "  {}{name:<26} {v}: median {:>8.1} us/layer ({:>5.3}x old), min {:>8.1} \
+                "  {}{name:<36} {v:>3}: median {:>8.1} us/layer ({:>5.3}x old), min {:>8.1} \
                  ({:>5.3}x)  {:>5.1} TFLOP/s  {:>6.1} GB/s  {}",
-                if vi == default { '*' } else { ' ' },
+                if vi == 0 { '*' } else { ' ' },
                 median[vi] * 1e6,
                 median[0] / median[vi],
                 best[vi] * 1e6,
