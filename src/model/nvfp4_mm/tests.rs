@@ -482,17 +482,19 @@ fn id_layout_keeps_the_plan_aligned() {
         let (out, plan) = id_layout(1856, 6, 3, 128, esize);
         assert_eq!(out % 256, 0);
         assert!(out >= 1856 * 6 * 3 * esize);
-        // Offsets, pairs, then the token tiles of 8, 16, 32, 64 and 128 pairs (nvfp4_plan).
-        assert_eq!(plan, 129 + 18 + 5);
+        // Offsets, pairs, then the token tiles of 8, 16, 32, 64 and 128 pairs and the SwiGLU
+        // GEMM tail split's head and tail tiles (nvfp4_plan).
+        assert_eq!(plan, 129 + 18 + 7);
         assert_eq!(plan, plan_len(128, 18));
     }
 }
 
 #[test]
 fn every_grouped_token_tile_has_a_plan_count() {
-    // The plan counts tiles of 8 << j pairs (j < PLAN_TILES); a grouped launch at any other
-    // token tile would scan the plan in every CTA past the routing's last tile (#836).
-    let counted = |cols: i64| (0..PLAN_TILES).any(|j| cols == 8 << j);
+    // The plan counts tiles of 8 << j pairs (j < 5, then the tail split's two counts); a grouped
+    // launch at any other token tile would scan the plan in every CTA past the routing's last
+    // tile (#836).
+    let counted = |cols: i64| (0..5).any(|j| cols == 8 << j);
     for (k, n_expert) in [(2560, 512), (640, 512), (2048, 128), (4096, 64)] {
         for n_tok in [1, 4, 16, 36, 144, 256, 1024, 2048, 4096, 8192, 32768] {
             let pairs = 10 * n_tok;
@@ -926,6 +928,7 @@ fn xpf_reset() {
     force_kernel(None);
     force_gemm_tune(None, None);
     force_gemm_xpf(None);
+    force_glu_tail(None, None);
     set_expert_mv_max(MV_MAX_N);
 }
 
@@ -1299,6 +1302,340 @@ fn cuda_down_x_prefetch_bench() {
                 );
             }
             assert!(same.iter().all(|&s| s), "{op} at {n_tok}: bits differ");
+        }
+    }
+    xpf_reset();
+}
+
+/// The SwiGLU GEMM tail split (#1183): an expert's pairs are the head launch's 128-pair tiles
+/// and at most one tail tile of 64, together each pair once, in the columns of the one-launch
+/// 128-pair tiles; the tail tile only for a last partial tile of 1-64 pairs.
+#[test]
+fn glu_tail_split_covers_each_expert_once() {
+    for pairs in 0..1200i64 {
+        let (head, tail) = (
+            tail_tiles(pairs, GLU_TAIL_BIG, GLU_TAIL_MAX),
+            tail_tiles(pairs, GLU_TAIL_MAX, -GLU_TAIL_BIG),
+        );
+        let last = pairs % GLU_TAIL_BIG;
+        assert_eq!(tail, (last > 0 && last <= GLU_TAIL_MAX) as i64, "{pairs}");
+        // The head tiles cover the pairs up to the tail tile's first, which starts where a
+        // 128-pair tile of the one launch starts.
+        let first = pairs - if tail == 1 { last } else { 0 };
+        assert_eq!(first % GLU_TAIL_BIG, 0, "{pairs}");
+        assert_eq!(head, (first + GLU_TAIL_BIG - 1) / GLU_TAIL_BIG, "{pairs}");
+        assert_eq!(
+            head + tail,
+            tail_tiles(pairs, GLU_TAIL_BIG, 0),
+            "{pairs}: one tile less or more than the one launch"
+        );
+    }
+}
+
+/// The tail split's default (#1183): the 128-token GLU tiles of prompt steps of about one full
+/// tile per used expert and more, on unless switched off.
+#[test]
+fn glu_tail_split_on_at_big_prompt_steps() {
+    let per = |n_tok: i64| 10 * n_tok / (10 * n_tok).min(512);
+    // Qwen3.8-Flash-Next (512 experts, top 10): the GLU GEMM's tile at 8,067 and 12,288 tokens.
+    for n_tok in [8067, 12288, 32768] {
+        let (nt, _) = glu_gemm_tile(2560, 512, per(n_tok));
+        assert_eq!(nt, 16, "{n_tok}");
+        assert!(glu_tail_split(nt, per(n_tok)), "{n_tok}");
+    }
+    // Smaller steps (experts of under one full tile): one launch, as before.
+    for n_tok in [512, 4096, 6500] {
+        let (nt, _) = glu_gemm_tile(2560, 512, per(n_tok));
+        assert!(!glu_tail_split(nt, per(n_tok)), "{n_tok}");
+    }
+    assert!(!glu_tail_split(8, 400));
+    assert_eq!(GLU_TAIL_TUNE.code(), 41);
+}
+
+/// The tail launch's tunes the CUDA tests compare (all compiled for the 64-token GLU tile): the
+/// default, the plain 3 stages, and 2 stages at 2 CTAs an SM.
+#[cfg(feature = "cuda")]
+const GLU_TAIL_TUNES: [i32; 3] = [41, 31, 22];
+
+/// `got` holds `want`'s bits.
+#[cfg(feature = "cuda")]
+fn same_bits(got: &[u8], want: &[u8], what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}");
+    let differ = got.iter().zip(want).filter(|(a, b)| a != b).count();
+    assert_eq!(differ, 0, "{what}: {differ} bytes differ");
+}
+
+/// The SwiGLU GEMM of `case` on `gpu`: every expert on the grouped GEMM at 128-token tiles
+/// without the tail split (#1183), against it with each tail tune of [`GLU_TAIL_TUNES`]; then
+/// the default choice against the default without the split. The output is all NaN before each
+/// run, so a pair no tile writes shows.
+#[cfg(feature = "cuda")]
+fn glu_tail_case(gpu: &mut crate::ggml::Backend, case: &XpfCase) {
+    use crate::ggml::ComputeAllocator;
+    let (hidden, ffn, n_expert, n_used) = (case.hidden, case.ffn, case.n_expert, case.n_used);
+    let n_tok = case.ids.len() / n_used;
+    let blocks = |k: usize, m: usize| k / 64 * 36 * m * n_expert;
+    let weights = Context::new(8, 0);
+    let wg = weights.new_tensor(types::NVFP4, &[hidden as i64, ffn as i64, n_expert as i64]);
+    let wu = weights.new_tensor(types::NVFP4, &[hidden as i64, ffn as i64, n_expert as i64]);
+    let scales = [1, 2].map(|_| weights.new_tensor(types::F32, &[n_expert as i64]));
+    weights.alloc_tensors(gpu.buffer_type()).unwrap();
+    wg.set_bytes(&gemm_bench::weights(blocks(hidden, ffn), 4));
+    wu.set_bytes(&gemm_bench::weights(blocks(hidden, ffn), 5));
+    for (i, s) in scales.iter().enumerate() {
+        let v: Vec<f32> = (0..n_expert)
+            .map(|e| 0.002 + ((e * 7 + i * 3) % 1000) as f32 * 1e-5)
+            .collect();
+        s.set_f32(&v);
+    }
+    let ctx = Context::new(16, 16);
+    let xg = ctx
+        .new_tensor(types::BF16, &[hidden as i64, 1, n_tok as i64])
+        .as_input();
+    let id = ctx
+        .new_tensor(types::I32, &[n_used as i64, n_tok as i64])
+        .as_input();
+    let glu = swiglu_id(&ctx, wg, wu, xg, id, Some(scales[0]), Some(scales[1])).as_output();
+    let mut graph = ctx.new_graph(16);
+    graph.expand(glu);
+    ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+        .unwrap();
+    xg.set_bytes(&xpf_bf16(hidden * n_tok, 11));
+    id.set_i32(&case.ids);
+    let poison = vec![0xffu8; glu.bytes().len()];
+    let run = |gpu: &mut crate::ggml::Backend, split: Option<bool>, tune: Option<i32>| {
+        force_glu_tail(split, tune.map(GemmTune::from_code));
+        glu.set_bytes(&poison);
+        gpu.compute(&graph).unwrap();
+        glu.bytes()
+    };
+    // Every expert on the GEMM at 128-token tiles.
+    set_expert_mv_max(0);
+    force_gemm_tune(None, Some(16));
+    let want = run(gpu, Some(false), None);
+    assert!(
+        want.chunks_exact(2).all(|v| v != [0xffu8, 0xff].as_slice()),
+        "{}: the one launch left pairs unwritten",
+        case.name
+    );
+    for tune in GLU_TAIL_TUNES {
+        let got = run(gpu, Some(true), Some(tune));
+        same_bits(
+            &got,
+            &want,
+            &format!("{} split, tail tune {tune}", case.name),
+        );
+    }
+    // The default choice (the split only where `glu_tail_split` takes it).
+    xpf_reset();
+    let want = run(gpu, Some(false), None);
+    let got = run(gpu, None, None);
+    same_bits(&got, &want, &format!("{} default", case.name));
+    force_glu_tail(None, None);
+    xpf_reset();
+}
+
+/// The SwiGLU GEMM tail split (#1183) keeps the bits: the one-launch 128-token tiles against
+/// the head and tail launches (each tail tune), over a routing with experts of 1, 15, 16, 17,
+/// 63, 64, 65, 127, 128, 129, 200 and 300 pairs, random routings over 512 and 64 experts, a
+/// small shape (a partial k and m), and an 8,067-token step on the default choice.
+/// `cargo test --release --features cuda --lib -- --ignored cuda_glu_tail_split_keeps_bits
+/// --nocapture`.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_glu_tail_split_keeps_bits() {
+    let _lock = XPF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut gpu = xpf_gpu();
+    let special = [1, 15, 16, 17, 63, 64, 65, 127, 128, 129, 200, 300];
+    let small = [1, 15, 16, 17, 63, 64, 65, 130];
+    let flash = |name, ids| XpfCase {
+        name,
+        hidden: 2560,
+        ffn: 640,
+        n_expert: 512,
+        n_used: 10,
+        n_x: 1,
+        ids,
+    };
+    let cases = [
+        // Qwen3.8-Flash-Next's routed experts (hidden 2560, 640 per expert, 512, top 10).
+        flash(
+            "flash-next counted",
+            counted_routing(&spread_counts(&special, 512, 10, 400), 10, 400),
+        ),
+        flash(
+            "flash-next random 512",
+            gemm_bench::routing(10, 1500, 512, 512, 7),
+        ),
+        flash(
+            "flash-next random 64",
+            gemm_bench::routing(10, 700, 512, 64, 8),
+        ),
+        flash(
+            "flash-next random 512 at 8067",
+            gemm_bench::routing(10, 8067, 512, 512, 1),
+        ),
+        // A small shape: 320-wide rows, 256 per expert, 24 experts, top 4.
+        XpfCase {
+            name: "small",
+            hidden: 320,
+            ffn: 256,
+            n_expert: 24,
+            n_used: 4,
+            n_x: 1,
+            ids: counted_routing(&spread_counts(&small, 24, 4, 200), 4, 200),
+        },
+    ];
+    for case in &cases {
+        glu_tail_case(&mut gpu, case);
+        eprintln!("{}: the same bits", case.name);
+    }
+}
+
+/// The SwiGLU GEMM (Qwen3.8-Flash-Next, 512 experts, top 10) at 12,288- and 8,067-token prompt
+/// steps without (old) and with the tail split (#1183, each tail tune): microseconds a layer
+/// (median and best of 5 rounds over 4 layers' routings, the configurations taking turns, each
+/// round starting one further on), and whether the bits are the old ones. `*` marks the
+/// default. Random routings over all 512 experts, and counted ones (a few big experts, the
+/// rest 1-12 pairs).
+/// `cargo test --release --features cuda --lib -- --ignored cuda_glu_tail_split_bench
+/// --nocapture`.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU; a benchmark"]
+fn cuda_glu_tail_split_bench() {
+    use crate::ggml::ComputeAllocator;
+    let _lock = XPF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut gpu = xpf_gpu();
+    let (hidden, ffn, n_expert, n_used) = (2560usize, 640usize, 512usize, 10usize);
+    const LAYERS: usize = 4;
+    const ROUNDS: usize = 5;
+    let blocks = |k: usize, m: usize| k / 64 * 36 * m * n_expert;
+    let weights = Context::new(8, 0);
+    let wg = weights.new_tensor(types::NVFP4, &[hidden as i64, ffn as i64, n_expert as i64]);
+    let wu = weights.new_tensor(types::NVFP4, &[hidden as i64, ffn as i64, n_expert as i64]);
+    let scales = [1, 2].map(|_| weights.new_tensor(types::F32, &[n_expert as i64]));
+    weights.alloc_tensors(gpu.buffer_type()).unwrap();
+    wg.set_bytes(&gemm_bench::weights(blocks(hidden, ffn), 4));
+    wu.set_bytes(&gemm_bench::weights(blocks(hidden, ffn), 5));
+    for s in scales {
+        s.set_f32(&vec![0.004; n_expert]);
+    }
+    // (name, split, tail tune); the first is the old one launch.
+    let variants: [(&str, bool, i32); 4] = [
+        ("old (one launch)", false, 0),
+        ("split, tail 41", true, 41),
+        ("split, tail 31", true, 31),
+        ("split, tail 22", true, 22),
+    ];
+    let special = [200, 300, 129, 65, 17];
+    for n_tok in [12288usize, 8067] {
+        for counted in [false, true] {
+            let ctx = Context::new(16 + 24 * LAYERS, 16 * LAYERS + 16);
+            let x = ctx
+                .new_tensor(types::BF16, &[hidden as i64, 1, n_tok as i64])
+                .as_input();
+            let ids: Vec<_> = (0..LAYERS)
+                .map(|_| {
+                    ctx.new_tensor(types::I32, &[n_used as i64, n_tok as i64])
+                        .as_input()
+                })
+                .collect();
+            let mut graph = ctx.new_graph(16 * LAYERS + 16);
+            let outs: Vec<_> = ids
+                .iter()
+                .map(|&id| {
+                    let y = swiglu_id(&ctx, wg, wu, x, id, Some(scales[0]), Some(scales[1]))
+                        .as_output();
+                    graph.expand(y);
+                    y
+                })
+                .collect();
+            ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+                .unwrap();
+            x.set_bytes(&xpf_bf16(hidden * n_tok, 5 + n_tok as u64));
+            // Each layer's routing, and its experts' pair counts (the tail tiles it has).
+            let mut tails = 0;
+            for (l, id) in ids.iter().enumerate() {
+                let r = if counted {
+                    counted_routing(
+                        &spread_counts(&special, n_expert, n_used, n_tok),
+                        n_used,
+                        n_tok,
+                    )
+                } else {
+                    gemm_bench::routing(n_used, n_tok, n_expert, n_expert, 1 + l as u64)
+                };
+                let mut counts = vec![0i64; n_expert];
+                for &e in &r {
+                    counts[e as usize] += 1;
+                }
+                tails += counts
+                    .iter()
+                    .map(|&c| tail_tiles(c, GLU_TAIL_MAX, -GLU_TAIL_BIG))
+                    .sum::<i64>();
+                id.set_i32(&r);
+            }
+            // A warm-up run of each (its bits against the old one's), then the rounds, the
+            // variants taking turns.
+            let set = |split: bool, tune: i32| {
+                force_glu_tail(Some(split), (tune != 0).then(|| GemmTune::from_code(tune)));
+            };
+            let mut want = Vec::new();
+            let mut same = vec![true; variants.len()];
+            for (vi, &(_, split, tune)) in variants.iter().enumerate() {
+                set(split, tune);
+                gpu.compute(&graph).unwrap();
+                let got: Vec<Vec<u8>> = outs.iter().map(|o| o.bytes()).collect();
+                if vi == 0 {
+                    want = got;
+                } else {
+                    same[vi] = got == want;
+                }
+            }
+            let nv = variants.len();
+            let mut times = vec![Vec::with_capacity(ROUNDS); nv];
+            for round in 0..ROUNDS {
+                for i in 0..nv {
+                    let vi = (round + i) % nv;
+                    set(variants[vi].1, variants[vi].2);
+                    let t = std::time::Instant::now();
+                    gpu.compute(&graph).unwrap();
+                    times[vi].push(t.elapsed().as_secs_f64() / LAYERS as f64);
+                }
+            }
+            force_glu_tail(None, None);
+            for t in &mut times {
+                t.sort_by(f64::total_cmp);
+            }
+            let median: Vec<f64> = times.iter().map(|t| t[t.len() / 2]).collect();
+            let best: Vec<f64> = times.iter().map(|t| t[0]).collect();
+            let routing = if counted { "counted" } else { "random 512" };
+            eprintln!(
+                "swiglu at {n_tok} tokens, {routing}: {:.1} tail tiles a layer",
+                tails as f64 / LAYERS as f64
+            );
+            for (vi, &(name, split, tune)) in variants.iter().enumerate() {
+                eprintln!(
+                    "  {}{name:<18}: median {:>8.1} us/layer ({:>5.3}x old), \
+                     min {:>8.1} ({:>5.3}x)  {}",
+                    if split && tune == GLU_TAIL_TUNE.code() {
+                        '*'
+                    } else {
+                        ' '
+                    },
+                    median[vi] * 1e6,
+                    median[0] / median[vi],
+                    best[vi] * 1e6,
+                    best[0] / best[vi],
+                    if same[vi] { "same bits" } else { "BITS DIFFER" }
+                );
+            }
+            assert!(
+                same.iter().all(|&s| s),
+                "swiglu at {n_tok} ({routing}): bits differ"
+            );
         }
     }
     xpf_reset();

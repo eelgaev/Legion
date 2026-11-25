@@ -495,6 +495,12 @@ pub(in crate::cli) struct SwitchArgs {
     /// comparisons.
     #[arg(long, help_heading = HEADING)]
     no_nvfp4_down_x_prefetch: bool,
+    /// CUDA, NVFP4 routed experts on Legion's W4A16 kernels, prompt steps on the fused gate/up
+    /// GEMM at 128-token tiles: run each expert's last partial tile in one 128-token tile, as
+    /// before (the default: a last tile of at most 64 pairs runs as a 64-token tile in a second
+    /// launch). The same bits either way. For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_nvfp4_glu_tail_split: bool,
     /// CUDA, NVFP4 routed experts on Legion's W4A16 kernels: matmuls of up to this many (token,
     /// expert) pairs per used expert (if the routing were even) take the grouped mv kernel,
     /// more the grouped GEMM. Default 32: prompt steps of up to ~1,600 tokens on
@@ -1592,6 +1598,7 @@ impl SwitchArgs {
             nvfp4_expert_pdl: self.no_nvfp4_expert_pdl.then_some(false),
             nvfp4_expert_tile_prefetch: self.no_nvfp4_expert_tile_prefetch.then_some(false),
             nvfp4_down_x_prefetch: self.no_nvfp4_down_x_prefetch.then_some(false),
+            nvfp4_glu_tail_split: self.no_nvfp4_glu_tail_split.then_some(false),
             nvfp4_expert_mv_max: self.nvfp4_expert_mv_max.map(i64::from),
             nvfp4_expert_mv_tile: self.nvfp4_expert_mv_tile.map(i32::from),
             nvfp4_expert_mv_split: self.nvfp4_expert_mv_split,

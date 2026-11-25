@@ -116,6 +116,53 @@ pub fn set_down_x_prefetch(on: bool) {
     DOWN_X_PREFETCH.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+static GLU_TAIL_SPLIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether the routed experts' SwiGLU GEMM of prompt steps at 128-token tiles ([`swiglu_id`],
+/// [`glu_tail_split`]) runs each expert's last partial tile of at most [`GLU_TAIL_MAX`] pairs as
+/// a 64-token tile ([`GLU_TAIL_TUNE`]) in a second launch on the same plan (#1183): such a tile
+/// filled half or less no longer takes a 128-token tile's shared memory, copies and stages. Each
+/// pair keeps its column and every output its MMA chain over k and its epilogue: the same bits
+/// either way. On by default; `legion serve --no-nvfp4-glu-tail-split` turns it off for
+/// comparisons.
+pub fn set_glu_tail_split(on: bool) {
+    GLU_TAIL_SPLIT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The tail split's tiles ([`set_glu_tail_split`]): `TAIL_BIG` and `TAIL_MAX` of
+/// `src/cuda/nvfp4_mm/common.cuh`, whose plan counts the head and tail tiles of these two.
+pub const GLU_TAIL_BIG: i64 = 128;
+/// See [`GLU_TAIL_BIG`]: the most pairs of a last partial tile the tail launch takes, its tile.
+pub const GLU_TAIL_MAX: i64 = 64;
+
+/// The fewest pairs per used expert (if the routing were even) of a step the tail split runs
+/// on: experts of about one full 128-token tile and more (the prompt steps of 8,067-12,288 and
+/// more tokens it was measured on over 512 experts, top 10, #1183).
+pub const GLU_TAIL_MIN_PER: i64 = 128;
+
+/// Whether the grouped SwiGLU GEMM of `8 * nt`-token tiles at `per` pairs per used expert runs
+/// the tail split ([`set_glu_tail_split`]).
+pub fn glu_tail_split(nt: i32, per: i64) -> bool {
+    nt as i64 * 8 == GLU_TAIL_BIG
+        && per >= GLU_TAIL_MIN_PER
+        && GLU_TAIL_SPLIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// An expert's token tiles of `bn` pairs as the grouped GEMM finds them (`tail_tiles` of
+/// `src/cuda/nvfp4_mm/common.cuh`): `tail` 0, all `ceil(pairs / bn)`; above 0 (the head launch
+/// of 128-pair tiles), all but a last partial tile of at most `tail` pairs; below 0 (the tail
+/// launch of 64-pair tiles), one for such a last partial tile of `-tail`-pair tiles, else none.
+pub fn tail_tiles(pairs: i64, bn: i64, tail: i64) -> i64 {
+    match tail {
+        0 => (pairs + bn - 1) / bn,
+        t if t > 0 => pairs / bn + (pairs % bn > t) as i64,
+        t => {
+            let r = pairs % -t;
+            (r > 0 && r <= bn) as i64
+        }
+    }
+}
+
 static PAD_SKIP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Whether a routed SwiGLU FFN on the grouped mv kernels ([`swiglu_id_rows`] with a row map,
@@ -401,9 +448,10 @@ pub fn mul_mat_act<'a>(
 const P_SCALE: usize = 8;
 
 /// The I32s after the pairs in a grouped plan (`nvfp4_plan`): its token tiles of 8, 16, 32, 64
-/// and 128 pairs over every expert (each mv and GEMM token tile), so the grouped mv's and GEMM's
-/// CTAs past the routing's last tile exit at once.
-pub(crate) const PLAN_TILES: i64 = 5;
+/// and 128 pairs over every expert (each mv and GEMM token tile), then the SwiGLU GEMM tail
+/// split's head and tail tiles ([`set_glu_tail_split`]), so the grouped mv's and GEMM's CTAs
+/// past the routing's last tile exit at once.
+pub(crate) const PLAN_TILES: i64 = 7;
 
 /// The I32s of a grouped plan of `pairs` pairs over `n_expert` experts: each expert's first pair
 /// (`n_expert + 1`), the pairs grouped by expert, then [`PLAN_TILES`].
@@ -1554,6 +1602,10 @@ pub const GEMM_GLU_SHORT: GemmTune = GemmTune {
     warps: 0,
 };
 
+/// The tail split's tail launch ([`set_glu_tail_split`]): 64-token tiles in four stages, one
+/// CTA per SM, as [`GEMM_GLU_SHORT`].
+pub const GLU_TAIL_TUNE: GemmTune = GEMM_GLU_SHORT;
+
 /// The grouped SwiGLU GEMM's token tile (`8 * nt` tokens) and its variant at `per` pairs per
 /// expert. Up to [`MV_MAX_N`] pairs (short prompt steps, on the GEMM only under
 /// [`set_expert_mv_max`]): 64-token tiles in four stages. GB10, Qwen3.8-Flash-Next's gate/up at
@@ -1605,6 +1657,7 @@ mod cuda {
         sel_hi: i32,
         unread_skips: i32,
         xpf: i32,
+        tail: i32,
     }
 
     /// `Params::sel_lo`, `sel_hi` for every expert.
@@ -1837,6 +1890,7 @@ mod cuda {
             sel_hi: ALL.1,
             unread_skips: 0,
             xpf: 0,
+            tail: 0,
         };
         launch(&mut p, kernel, stream)
     }
@@ -1887,6 +1941,7 @@ mod cuda {
             sel_hi: ALL.1,
             unread_skips: 0,
             xpf: forced_xpf().unwrap_or(0),
+            tail: 0,
         };
         // SAFETY: parameters checked above; the node's stream.
         let code = unsafe {
@@ -2027,6 +2082,7 @@ mod cuda {
             sel_hi: split.map_or(ALL.1, |(cut, _)| cut),
             unread_skips: unread(dst) as i32,
             xpf: 0,
+            tail: 0,
         };
         if let Some(t) = forced_tiles() {
             p.tiles_n = p.tiles_n.min(t);
@@ -2215,6 +2271,7 @@ mod cuda {
             sel_hi: split.unwrap_or(ALL.1),
             unread_skips: unread(dst) as i32,
             xpf: forced_xpf().unwrap_or(0),
+            tail: 0,
         };
         if let Some(cut) = split {
             // The experts of more than `cut` pairs on the GEMM first, so the grouped SwiGLU mv
@@ -2244,7 +2301,48 @@ mod cuda {
         if let Some(t) = forced_tiles().filter(|_| split.is_none()) {
             p.tiles_n = p.tiles_n.min(t);
         }
+        // The tail split (#1183, `set_glu_tail_split`): the 128-token tiles without each
+        // expert's last partial tile of at most GLU_TAIL_MAX pairs, then those tiles alone at
+        // 64 tokens (at most one an expert), both on this plan. Not with a row map, a clamp or
+        // skipped pairs (the step-wide choice), nor a forced grid.
+        if !step_only && forced_tiles().is_none() && tail_split(nt, per, forced_nt) {
+            p.tail = GLU_TAIL_MAX as i32;
+            glu_gemm(&p, nt, tune_at(nt), stream)?;
+            p.tail = -(GLU_TAIL_BIG as i32);
+            p.tiles_n = pairs.min(n_expert) as i32;
+            let tune = forced_glu_tail_tune().unwrap_or(GLU_TAIL_TUNE);
+            return glu_gemm(&p, (GLU_TAIL_MAX / 8) as i32, tune, stream);
+        }
         glu_gemm(&p, nt, tune_at(nt), stream)
+    }
+
+    /// [`super::force_glu_tail`]'s split (0 the default, [`glu_tail_split`]; 1 wherever the
+    /// grouped SwiGLU GEMM runs 128-token tiles; 2 never) and the tail launch's tune
+    /// (`GemmTune::code`; 0 [`GLU_TAIL_TUNE`]).
+    pub(super) static FORCED_GLU_TAIL: AtomicU64 = AtomicU64::new(0);
+    pub(super) static FORCED_GLU_TAIL_TUNE: AtomicU64 = AtomicU64::new(0);
+
+    fn forced_glu_tail_tune() -> Option<GemmTune> {
+        let v = FORCED_GLU_TAIL_TUNE.load(Ordering::Relaxed) as i32;
+        (v != 0).then(|| GemmTune::from_code(v))
+    }
+
+    /// Whether a grouped SwiGLU GEMM of `8 * nt`-token tiles at `per` pairs per used expert runs
+    /// the tail split: [`glu_tail_split`], where no bench forces the GEMM's token tile, tune,
+    /// prefetch, copies or parts (those time or check the one-launch kernel), or as
+    /// [`super::force_glu_tail`] forces it.
+    fn tail_split(nt: i32, per: i64, forced_nt: i32) -> bool {
+        match FORCED_GLU_TAIL.load(Ordering::Relaxed) {
+            1 => nt as i64 * 8 == GLU_TAIL_BIG,
+            2 => false,
+            _ => {
+                forced_nt == 0
+                    && forced_tune().is_none()
+                    && FORCED_DIAG.load(Ordering::Relaxed) == 0
+                    && (forced_pf() | l1()) == 0
+                    && glu_tail_split(nt, per)
+            }
+        }
     }
 
     /// The grouped SwiGLU GEMM at `8 * nt` tokens per tile.
@@ -2298,6 +2396,23 @@ pub fn force_gemm_tune(tune: Option<GemmTune>, glu_nt: Option<i32>) {
     }
     #[cfg(not(feature = "cuda"))]
     let _ = (tune, glu_nt);
+}
+
+/// Runs every grouped SwiGLU GEMM of 128-token tiles from now on with the tail split
+/// ([`set_glu_tail_split`]; `Some(true)`, at any pairs per expert) or without it (`Some(false)`),
+/// its tail launch with `tail_tune` ([`GLU_TAIL_TUNE`] for `None`: tunes compiled for 64-token
+/// tiles, see [`gemm_tune_fits`]); `None`: the default ([`glu_tail_split`]). For tests and
+/// benches (#1183); the same bits either way.
+#[doc(hidden)]
+pub fn force_glu_tail(split: Option<bool>, tail_tune: Option<GemmTune>) {
+    #[cfg(feature = "cuda")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        cuda::FORCED_GLU_TAIL.store(split.map_or(0, |on| if on { 1 } else { 2 }), Relaxed);
+        cuda::FORCED_GLU_TAIL_TUNE.store(tail_tune.map_or(0, |t| t.code() as u64), Relaxed);
+    }
+    #[cfg(not(feature = "cuda"))]
+    let _ = (split, tail_tune);
 }
 
 /// Launches every NVFP4 GEMM from now on (dense, grouped and the SwiGLUs, where compiled: the

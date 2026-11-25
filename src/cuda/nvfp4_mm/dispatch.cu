@@ -17,9 +17,10 @@ namespace {
 // pairs (rows[t] != t) go to no expert; so do the pairs whose id is -1 (--tp-moe-ep's other
 // ranks' experts, #1176). Such pairs are listed after every expert's pairs instead
 // (plan[n_expert] counts the experts' pairs only), and the grouped kernels zero their results.
-// After the pairs: the token tiles of 8, 16, 32, 64 and 128 pairs over all experts (PLAN_TILES,
-// the totals find_tile counts with no pair-count selection), so the grouped mv's and GEMM's CTAs
-// past the last tile exit before the plan scan (#836).
+// After the pairs: the token tiles of 8, 16, 32, 64 and 128 pairs over all experts, then the
+// tail split's head and tail tiles (PLAN_TILES, the totals find_tile counts with no pair-count
+// selection), so the grouped mv's and GEMM's CTAs past the last tile exit before the plan scan
+// (#836).
 __global__ void __launch_bounds__(1024) nvfp4_plan(const int32_t * ids, int64_t ids_ld, const int32_t * rows,
                                                    int32_t skip_pad, int32_t n_used, int64_t n_tokens,
                                                    int32_t n_expert, int32_t * plan) {
@@ -87,11 +88,14 @@ __global__ void __launch_bounds__(1024) nvfp4_plan(const int32_t * ids, int64_t 
             plan[n_expert] = excl + c;
             routed         = excl + c;
         }
-        // The token tiles: ceil(c / bn) per expert, summed over the warp, then the block.
+        // The token tiles: ceil(c / bn) per expert, then the tail split's head and tail tiles
+        // (legion_nvfp4::tail_tiles), summed over the warp, then the block.
 #pragma unroll
         for (int j = 0; j < legion_nvfp4::PLAN_TILES; j++) {
-            const int bn = 8 << j;
-            int t = (c + bn - 1) / bn;
+            namespace l = legion_nvfp4;
+            int t = j == l::PLAN_HEAD   ? l::tail_tiles(c, l::TAIL_BIG, l::TAIL_MAX)
+                    : j == l::PLAN_TAIL ? l::tail_tiles(c, l::TAIL_MAX, -l::TAIL_BIG)
+                                        : l::tail_tiles(c, 8 << j, 0);
 #pragma unroll
             for (int o = 16; o > 0; o >>= 1) {
                 t += __shfl_down_sync(0xffffffffu, t, o);

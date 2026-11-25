@@ -58,8 +58,8 @@ struct legion_nvfp4_mm {
     int32_t group_m;           // dense GEMM tile order: groups of group_m row tiles
     // Grouped (mul_mat_id): plan = [offsets of each expert's pairs (n_expert + 1), the pairs
     // (token * n_used + slot) grouped by expert (n of them), the token tiles of 8, 16, 32,
-    // 64 and 128 pairs over every expert (PLAN_TILES)]; x has n_x (1 or n_used) rows per token, dst
-    // n_used.
+    // 64 and 128 pairs over every expert and the tail split's two counts (PLAN_TILES)]; x has
+    // n_x (1 or n_used) rows per token, dst n_used.
     const int32_t * plan;
     int32_t n_expert, n_used, n_x;
     // Fused SwiGLU (dense): w is the gate, w2 the up weight (same shape and layout), scale2 the
@@ -90,6 +90,11 @@ struct legion_nvfp4_mm {
     // bit 0 (grouped): the CTAs of row tile 0 also prefetch the whole rows of the BN plan pairs
     // xpf >> 1 token tiles past their own. 0: no activation prefetch, as before.
     int32_t xpf;
+    // The grouped GEMM's tail split (#1183; see tail_tiles): 0 each expert's ceil(pairs / BN)
+    // token tiles, as before. TAIL_MAX on a launch of TAIL_BIG-pair tiles (the head launch):
+    // without each expert's last partial tile of at most TAIL_MAX pairs. -TAIL_BIG on a launch of
+    // TAIL_MAX-pair tiles (the tail launch): those last tiles alone, one per expert.
+    int32_t tail;
 };
 
 // The GEMM: tiles_m * tiles_n CTAs of 256 threads; mi = 1 or 2 (128 * mi rows), nt = 1, 2, 4,
@@ -120,7 +125,7 @@ int legion_nvfp4_swiglu_mv_launch(const legion_nvfp4_mm * p, int nt, void * stre
 // tiles_n CTAs of 8 * nt tokens, the dense tile order; nt = 4, 8 or 16. With plan set, grouped
 // as legion_nvfp4_gemm_launch's (w2, scale2: the up experts and their per-expert scales; dst:
 // BF16 rows of m per (token, slot) pair). variant: as legion_nvfp4_gemm_launch's (grouped, nt
-// 8 or 16).
+// 8 or 16). p->tail (grouped): a tail split's head launch at nt 16 or tail launch at nt 8.
 int legion_nvfp4_swiglu_gemm_launch(const legion_nvfp4_mm * p, int nt, int variant, void * stream);
 
 // The grouped plan from ids (I32 [n_used, n_tokens], rows ids_ld apart): n_expert <= 1024.
@@ -145,12 +150,38 @@ int legion_nvfp4_read_probe_launch(const uint8_t * w0, const uint8_t * w1, const
 namespace legion_nvfp4 {
 
 // The plan's token tile counts after its pairs (bn = 8, 16, 32, 64, 128: every mv and GEMM token
-// tile): src/model/nvfp4_mm.rs's PLAN_TILES.
-constexpr int PLAN_TILES = 5;
+// tile), then the tail split's two (PLAN_HEAD, PLAN_TAIL): src/model/nvfp4_mm.rs's PLAN_TILES.
+constexpr int PLAN_TILES = 7;
+
+// The grouped SwiGLU GEMM's tail split (#1183, legion_nvfp4_mm::tail): TAIL_BIG-pair tiles for
+// each expert's pairs but a last partial tile of at most TAIL_MAX pairs, which a TAIL_MAX-pair
+// tile takes instead. The plan counts both launches' tiles: PLAN_HEAD and PLAN_TAIL.
+constexpr int TAIL_BIG = 128, TAIL_MAX = 64, PLAN_HEAD = 5, PLAN_TAIL = 6;
 
 // The index of the count of bn-pair tiles among the plan's PLAN_TILES, -1 for none.
 __host__ __device__ constexpr int plan_tile_index(int bn) {
     return bn == 8 ? 0 : bn == 16 ? 1 : bn == 32 ? 2 : bn == 64 ? 3 : bn == 128 ? 4 : -1;
+}
+
+// An expert's token tiles of `bn` pairs (see legion_nvfp4_mm::tail): `tail` 0, all of them;
+// above 0, all but a last partial tile of at most `tail` pairs; below 0, one tile for such a
+// last partial tile of the -tail-pair tiles (pairs % -tail in 1..bn), none otherwise.
+__host__ __device__ constexpr int tail_tiles(int pairs, int bn, int tail) {
+    return tail > 0   ? pairs / bn + (pairs % bn > tail ? 1 : 0)
+           : tail < 0 ? (pairs % -tail > 0 && pairs % -tail <= bn ? 1 : 0)
+                      : (pairs + bn - 1) / bn;
+}
+
+// The index of a grouped launch's own tile count among the plan's PLAN_TILES (bn = 8 << TI, and
+// its tail split), -1 for none.
+template <int TI> __device__ __forceinline__ int plan_count_index(const legion_nvfp4_mm & p) {
+    if (p.tail == 0) {
+        return TI;
+    }
+    if (TI == plan_tile_index(TAIL_BIG) && p.tail == TAIL_MAX) {
+        return PLAN_HEAD;
+    }
+    return TI == plan_tile_index(TAIL_MAX) && p.tail == -TAIL_BIG ? PLAN_TAIL : -1;
 }
 
 // Whether a grouped launch's token tile `tile` of bn = 8 << TI pairs lies past the routing's
@@ -161,7 +192,8 @@ template <int TI> __device__ __forceinline__ bool past_plan_tiles(const legion_n
     if constexpr (TI < 0) {
         return false;
     } else {
-        return p.sel_lo == 0 && p.sel_hi == INT32_MAX && tile >= p.plan[p.n_expert + 1 + p.n + TI];
+        const int i = plan_count_index<TI>(p);
+        return i >= 0 && p.sel_lo == 0 && p.sel_hi == INT32_MAX && tile >= p.plan[p.n_expert + 1 + p.n + i];
     }
 }
 
@@ -294,19 +326,21 @@ __device__ __forceinline__ float glu_gate(float x, int act) {
 // the plan's list. (A running scan of 32 experts at a time costs n_expert / 32 dependent
 // rounds per CTA: with 512 experts, a large part of a decode tile's time.) `total` (if set):
 // the number of tiles, written when `tile` is past the last one. Only the experts with more than
-// `sel_lo` and at most `sel_hi` pairs have tiles (as legion_nvfp4_mm's).
-__device__ __forceinline__ int expert_tiles(int pairs, int bn, int lo, int hi) {
-    return pairs > lo && pairs <= hi ? (pairs + bn - 1) / bn : 0;
+// `sel_lo` and at most `sel_hi` pairs have tiles (as legion_nvfp4_mm's); `tail`: the tail
+// split's head or tail tiles (legion_nvfp4::tail_tiles), 0 for all.
+__device__ __forceinline__ int expert_tiles(int pairs, int bn, int lo, int hi, int tail) {
+    return pairs > lo && pairs <= hi ? legion_nvfp4::tail_tiles(pairs, bn, tail) : 0;
 }
 
 __device__ __forceinline__ bool find_tile(const int32_t * offs, int n_expert, int bn, int tile, int lane, int sel_lo,
-                                          int sel_hi, int & expert, int & first, int & count, int * total = nullptr) {
+                                          int sel_hi, int tail, int & expert, int & first, int & count,
+                                          int * total = nullptr) {
     const int per = (n_expert + 31) / 32;
     const int e0 = min(lane * per, n_expert), e1 = min(e0 + per, n_expert);
     int t = 0;
 #pragma unroll 8
     for (int e = e0; e < e1; e++) {
-        t += expert_tiles(offs[e + 1] - offs[e], bn, sel_lo, sel_hi);
+        t += expert_tiles(offs[e + 1] - offs[e], bn, sel_lo, sel_hi, tail);
     }
     int incl = t;
 #pragma unroll
@@ -328,10 +362,12 @@ __device__ __forceinline__ bool find_tile(const int32_t * offs, int n_expert, in
         int before = lo;
         for (int e = e0; e < e1; e++) {
             const int a = offs[e], b = offs[e + 1];
-            const int te = expert_tiles(b - a, bn, sel_lo, sel_hi);
+            const int te = expert_tiles(b - a, bn, sel_lo, sel_hi, tail);
             if (tile < before + te) {
                 found = e;
-                f = a + (tile - before) * bn;
+                // The tail launch's one tile: the expert's last (b - a) % -tail pairs, where the
+                // head launch's -tail-pair tiles end; otherwise the tile's bn pairs in order.
+                f = tail < 0 ? b - (b - a) % -tail : a + (tile - before) * bn;
                 c = min(bn, b - f);
                 break;
             }
@@ -352,7 +388,10 @@ __device__ __forceinline__ bool find_tile(const int32_t * offs, int n_expert, in
 // both the tile's expert, each times its own per-expert scale).
 // A tile's n8 token groups past its last token are skipped (grouped tiles are often partly
 // filled): the other tokens' sums are the same instructions on the same values. A full tile
-// runs without those checks.
+// runs without those checks. The tail split (p.tail, #1183) runs an expert's last partial
+// 128-token tile of at most 64 pairs as a 64-token tile instead, its pairs in the same columns:
+// each output is still one MMA chain over k in the same order from the same A and B fragments,
+// with the same epilogue (neither NT nor the stages enter a sum), so the bits do not change.
 // ST: cp.async stages; MINB: CTAs per SM the registers are limited for (2: two CTAs of up to
 // ~49 KiB of stages share an SM, one's copies and epilogue overlapping the other's MMAs). Neither
 // changes any sum: every output is the same MMAs over k in the same order (#824).
@@ -402,13 +441,14 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) nvfp4_gemm(const legion_nvfp
         // (#836); but first store zeros for the plan's skipped pairs (ids of -1, listed after
         // the experts' pairs, nvfp4_plan), which no tile holds (#1176): the CTAs past the last
         // tile split them, BM_OUT rows each, so a skipped pair's result is zero without
-        // reading any expert. A plan without such pairs stores nothing here.
+        // reading any expert. A plan without such pairs stores nothing here; nor does a tail
+        // split's tail launch (its head launch does).
         constexpr int TI = legion_nvfp4::plan_tile_index(BN);
         if (legion_nvfp4::past_plan_tiles<TI>(p, tile)) {
             const int routed = p.plan[p.n_expert];
             const int skipped = (int) p.n - routed;
-            if (skipped > 0 && !p.unread_skips) {
-                const int tiles = p.plan[p.n_expert + 1 + p.n + TI];
+            if (skipped > 0 && !p.unread_skips && p.tail >= 0) {
+                const int tiles = p.plan[p.n_expert + 1 + p.n + legion_nvfp4::plan_count_index<TI>(p)];
                 const int spare = tile - tiles, n_spare = (int) (gridDim.x / p.tiles_m) - tiles;
                 const int64_t rows = min((int64_t) BM_OUT, p.m - m0);
                 for (int j = spare; j < skipped; j += n_spare) {
@@ -426,7 +466,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) nvfp4_gemm(const legion_nvfp
         }
         if (warp == 0) {
             int e, first, count;
-            if (!find_tile(p.plan, p.n_expert, BN, tile, lane, p.sel_lo, p.sel_hi, e, first, count)) {
+            if (!find_tile(p.plan, p.n_expert, BN, tile, lane, p.sel_lo, p.sel_hi, p.tail, e, first, count)) {
                 if (lane == 0) {
                     tile_expert = -1;
                 }
@@ -1072,8 +1112,8 @@ __global__ void __launch_bounds__(KW * 32) nvfp4_mvs(const legion_nvfp4_mm p) {
         }
         if (warp == 0) {
             int e, first, count, total = 0;
-            if (!find_tile(p.plan, p.n_expert, BN, blockIdx.y, lane, p.sel_lo, p.sel_hi, e, first, count,
-                           &total)) {
+            if (!find_tile(p.plan, p.n_expert, BN, blockIdx.y, lane, p.sel_lo, p.sel_hi, p.tail, e, first,
+                           count, &total)) {
                 if (lane == 0) {
                     tile_expert = -1;
                     tile_total  = total;
