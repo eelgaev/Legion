@@ -91,9 +91,10 @@ static KERNEL: AtomicI32 = AtomicI32::new(0);
 
 /// Forces the BF16 up-mix's kernel for the launches from now on (`legion hc-up-mix-bench`): 0
 /// the default (`up_mix_bf16_reg` at rank 320 and 512 tokens or more, else `up_mix_bf16`), 1
-/// `up_mix_bf16`, 2 `up_mix_bf16_reg` at any token count, 2 + 100 R its runs of R tiles a CTA
-/// (`src/cuda/hc_up_mix.cu`). Every kernel adds the same products in the same order, so the
-/// same bits.
+/// `up_mix_bf16`, 2 `up_mix_bf16_reg` at any token count, 2 + 100 R its runs of R tiles a CTA,
+/// 3 (+ 100 R) the same with each tile's mix after its matmul instead of under the next tile's
+/// (its form before #1183, `src/cuda/hc_up_mix.cu`). Every kernel adds the same products in the
+/// same order, so the same bits.
 #[doc(hidden)]
 pub fn force_kernel(kernel: i32) {
     KERNEL.store(kernel, Ordering::Relaxed);

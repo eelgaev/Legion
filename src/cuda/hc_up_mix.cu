@@ -70,7 +70,8 @@ struct legion_hc_up_mix {
     void *        mixedb;
     int32_t       skip_f32;
     // BF16 up only (#1183, `legion hc-up-mix-bench`): 0 the default kernel for the shape, 1
-    // up_mix_bf16, 2 up_mix_bf16_reg at any token count (2 + 100 R: runs of R tiles a CTA).
+    // up_mix_bf16, 2 up_mix_bf16_reg at any token count (2 + 100 R: runs of R tiles a CTA), 3
+    // (+ 100 R) the same in its form before PIPE (sm80/hc_up_mix_bf16.cuh; the same bits).
     // Plus 1000 (#1176 r43, LEGION_DEBUG_HC_UP_MIX_L1=0): up_mix_bf16_reg copies lo through L2
     // only (cp.async.cg) instead of through L1 (compute capability 12.x; L2 only elsewhere);
     // plus 2000 (#1213 r30, LEGION_DEBUG_HC_UP_MIX_L1=1): through L1 on any GPU. The same bits.
@@ -177,16 +178,18 @@ constexpr int REG_RUN_16 = 8;  // tiles a CTA, BF16 streams
 constexpr int REG_MIN_N  = 512;
 
 // One up_mix_bf16_reg launch: e / 32 column blocks times runs of `run` tiles. False (nothing
-// launched) when the kernel cannot have its shared memory.
-template <bool RB, bool S16, bool PRE = false> bool launch_reg(const legion_hc_up_mix & p, cudaStream_t s, int run) {
+// launched) when the kernel cannot have its shared memory. PIPE: the mix one tile behind the
+// matmul (the default; without it kernel code 3, the form before, for A/B runs).
+template <bool RB, bool S16, bool PRE = false, bool PIPE = true>
+bool launch_reg(const legion_hc_up_mix & p, cudaStream_t s, int run) {
     constexpr int THREADS = REG_CG * HC * 32;
     constexpr int COLS    = REG_CG * ROWS;
     constexpr int SMEM = (2 * REG_TT * (REG_KS * 8 + PAD / 4) + HC * REG_TT * (COLS + 4)) * (int) sizeof(float);
     // lo's copies through L1 on compute capability 12.x (#1176 r43: measured on the GB10 only)
     // unless p.kernel says L2 only (1000 to 1999), or on any GPU where it says L1 (2000 and up).
-    const auto cg     = up_mix_bf16_reg<REG_KS, REG_CG, REG_TT, REG_MINB, REG_PD, RB, S16, PRE>;
+    const auto cg     = up_mix_bf16_reg<REG_KS, REG_CG, REG_TT, REG_MINB, REG_PD, RB, S16, PRE, false, PIPE>;
     const bool ca     = p.kernel >= 2000 || (p.kernel < 1000 && legion_device::sm12x_device(cg));
-    const auto kernel = ca ? up_mix_bf16_reg<REG_KS, REG_CG, REG_TT, REG_MINB, REG_PD, RB, S16, PRE, true> : cg;
+    const auto kernel = ca ? up_mix_bf16_reg<REG_KS, REG_CG, REG_TT, REG_MINB, REG_PD, RB, S16, PRE, true, PIPE> : cg;
     static std::atomic<int8_t> opt[2][GGML_CUDA_MAX_DEVICES];
     if (!legion_device::smem_opt_in(opt[ca], kernel, SMEM)) {
         return false;
@@ -200,22 +203,29 @@ template <bool RB, bool S16, bool PRE = false> bool launch_reg(const legion_hc_u
 // The kernel the last BF16 launch ran (legion_hc_up_mix_last_kernel).
 std::atomic<int> last_kernel{ 0 };
 
+// up_mix_bf16_reg's launch for the streams' form p has, PIPE or not.
+template <bool PIPE> bool launch_reg_form(const legion_hc_up_mix & p, cudaStream_t s, int run) {
+    const bool rb = p.res != nullptr, s16 = rb && p.res_bf16 != 0;
+    return s16                  ? launch_reg<true, true, false, PIPE>(p, s, run) :
+           p.pre_out != nullptr ? launch_reg<true, false, true, PIPE>(p, s, run) :
+           rb                   ? launch_reg<true, false, false, PIPE>(p, s, run) :
+                                  launch_reg<false, false, false, PIPE>(p, s, run);
+}
+
 // The BF16 up-mix by p.kernel (see legion_hc_up_mix): up_mix_bf16_reg where the default or
-// kernel 2 takes it; false when up_mix_bf16 should run. Kernel 2 + 100 R: runs of R tiles
-// (`legion hc-up-mix-bench`).
+// kernel 2 takes it (kernel 3: its form before PIPE); false when up_mix_bf16 should run.
+// Kernel 2 or 3 + 100 R: runs of R tiles (`legion hc-up-mix-bench`).
 bool launch_bf16_reg(const legion_hc_up_mix & p, cudaStream_t s) {
     const int k = p.kernel % 1000;  // 1000 / 2000 and up: the same kernel, lo through L2 / L1
     if (k == 1 || p.rank != REG_KS * 16 || p.e % (REG_CG * ROWS) != 0 || (k == 0 && p.n < REG_MIN_N)) {
         return false;
     }
-    const bool rb = p.res != nullptr, s16 = rb && p.res_bf16 != 0;
-    const int  r  = k / 100 > 0 ? k / 100 : s16 ? REG_RUN_16 : REG_RUN;
-    const bool ok = s16                    ? launch_reg<true, true>(p, s, r) :
-                    p.pre_out != nullptr   ? launch_reg<true, false, true>(p, s, r) :
-                    rb                     ? launch_reg<true, false>(p, s, r) :
-                                             launch_reg<false, false>(p, s, r);
+    const bool s16  = p.res != nullptr && p.res_bf16 != 0;
+    const int  r    = k / 100 > 0 ? k / 100 : s16 ? REG_RUN_16 : REG_RUN;
+    const bool pipe = k % 100 != 3;
+    const bool ok   = pipe ? launch_reg_form<true>(p, s, r) : launch_reg_form<false>(p, s, r);
     if (ok) {
-        last_kernel.store((k % 100 == 2 ? k : 2) + p.kernel / 1000 * 1000, std::memory_order_relaxed);
+        last_kernel.store((k % 100 == 2 || k % 100 == 3 ? k : 2) + p.kernel / 1000 * 1000, std::memory_order_relaxed);
     }
     return ok;
 }

@@ -844,3 +844,48 @@ fn cpu_early_cast_is_ggmls_cast() {
         assert!(built_f32 == early_f32, "view {view}: F32 moved");
     }
 }
+
+/// `up_mix_bf16_reg` with each tile's mix under the next tile's matmul (the default and kernel 2,
+/// #1183) and in its form before (kernel 3), runs of their own length or of 2 and 3 tiles, bit
+/// for bit `up_mix_bf16`'s in every mode: a 32K prompt's steps on Qwen3.8-Flash-Next (12,288
+/// and 8,067 tokens), odd token counts (a part tile, one tile, runs cut short) and a 3-column-block
+/// mixer.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an sm_80+ GPU"]
+fn cuda_pipelined_up_mix_reg_is_the_old_one() {
+    use crate::ggml::{DeviceKind, device_by_kind};
+    let mut gpu = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU device")
+        .init()
+        .unwrap();
+    if !crate::model::fp8::bf16_mma() {
+        println!("no BF16 tensor cores: skipped");
+        return;
+    }
+    let cases: [(i64, &[i64]); 2] = [
+        (2560, &[12288, 8067, 2049, 517, 33, 16, 1]),
+        (192, &[4099, 600, 17]),
+    ];
+    for (e, tokens) in cases {
+        let cfg = bench::Config {
+            e,
+            tokens: tokens.to_vec(),
+            kernels: vec![0, 2, 3, 202, 302, 203, 303],
+            ..bench::Config::default()
+        };
+        let checks = bench::check(&mut gpu, &cfg).unwrap();
+        let want = tokens.len() * bench::MODES.len() * cfg.kernels.len();
+        assert_eq!(checks.len(), want, "e {e}: checks");
+        for c in &checks {
+            let what = format!("e {e}, {} tokens, {} kernel {}", c.tokens, c.mode, c.kernel);
+            assert!(c.values > 0, "{what}: nothing compared");
+            let (d, v) = (c.differing, c.values);
+            assert_eq!(d, 0, "{what}: {d} of {v} values differ");
+            if c.kernel != 0 {
+                assert_eq!(c.ran % 1000, c.kernel, "{what}: ran {}", c.ran);
+            }
+        }
+    }
+}

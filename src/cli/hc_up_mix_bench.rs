@@ -13,7 +13,8 @@ pub struct HcUpMixBenchArgs {
     #[arg(long, value_delimiter = ',')]
     tokens: Vec<i64>,
     /// Kernels, comma separated: 1 up_mix_bf16, 0 the default, 2 up_mix_bf16_reg at any token
-    /// count, 2 + 100 R its runs of R tiles a CTA (default: 1, 0, 2).
+    /// count, 2 + 100 R its runs of R tiles a CTA, 3 (+ 100 R) its form before the mix ran
+    /// under the next tile's matmul (default: 1, 0, 2).
     #[arg(long, value_delimiter = ',')]
     kernels: Vec<i32>,
     /// Modes timed, comma separated: f32 (F32 streams, F32 values and BF16 copy), bf16 (the

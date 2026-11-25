@@ -219,7 +219,16 @@ __global__ void __launch_bounds__(WARPS * 32) up_mix_bf16(const legion_hc_up_mix
 // L1 (#1176 r43): lo's rows copied through L1 (cp.async.ca) instead of L2 only (cp.async.cg).
 // Every column block of a token run stages the same lo rows (e / 32 CTAs of them, lo most of a
 // CTA's bytes), so an SM's CTAs of one run can share them in its L1. The same bytes either way.
-template <int KS, int CG, int TT, int MINB, int PD, bool RB, bool S16, bool PRE = false, bool L1 = false>
+// PIPE (#1183, the default): the mix of a tile runs one tile behind its matmul, between the same
+// two barriers as the next tile's matmul, so a CTA's warps overlap the tensor cores' work with
+// the mix's loads (the streams from L2, the gates from shared memory) and its exponentials
+// instead of taking turns (matmul, barrier, mix, barrier). The gates still have one buffer: a
+// warp keeps its tile's sums in registers over the mix of the tile before and stores them after
+// the second barrier. Every output's sums and mix are the same instructions on the same values
+// in the same order, so the same bits; without PIPE (kernel code 3, `legion hc-up-mix-bench`)
+// the form before it.
+template <int KS, int CG, int TT, int MINB, int PD, bool RB, bool S16, bool PRE = false, bool L1 = false,
+          bool PIPE = false>
 __global__ void __launch_bounds__(CG * HC * 32, MINB) up_mix_bf16_reg(const legion_hc_up_mix p, const int chunk) {
     static_assert(RB || !S16, "up_mix_bf16_reg: BF16 streams in the rebuilt form only");
     static_assert(!PRE || (RB && !S16), "up_mix_bf16_reg: lazy streams of F32 streams in the rebuilt form only");
@@ -340,21 +349,8 @@ __global__ void __launch_bounds__(CG * HC * 32, MINB) up_mix_bf16_reg(const legi
         gv[s] = RB ? p.g[s * p.e + ei] : 0.0f;
     }
 
-    for (int it = 0; it < tiles; it++) {
-        const int buf  = it & 1;
-        const int base = t_begin + it * TT;
-        asm volatile("cp.async.wait_group 0;" ::: "memory");
-        // Tile it's lo is in; every thread is past the last tile's matmul (buffer buf ^ 1 free)
-        // and its mix (the gates free).
-        __syncthreads();
-        if (it + 1 < tiles) {
-            stage(it + 1, buf ^ 1);
-        }
-        if (PD > 0) {
-            prefetch(it + PD);
-        }
-
-        float acc[NT][4];
+    // The warp's stream's products of the tile in buffer buf, in K order from zero.
+    auto matmul = [&](int buf, float (&acc)[NT][4]) {
 #pragma unroll
         for (int t = 0; t < NT; t++) {
 #pragma unroll
@@ -377,6 +373,9 @@ __global__ void __launch_bounds__(CG * HC * 32, MINB) up_mix_bf16_reg(const legi
                 mma_bf16(acc[t], a[k], b[t]);
             }
         }
+    };
+    // The sums as the gates of the tile, into shared memory.
+    auto gates = [&](const float (&acc)[NT][4]) {
 #pragma unroll
         for (int t = 0; t < NT; t++) {
 #pragma unroll
@@ -384,8 +383,10 @@ __global__ void __launch_bounds__(CG * HC * 32, MINB) up_mix_bf16_reg(const legi
                 gs[(c * TT + t * 8 + 2 * q + (l & 1)) * GS + gi * ROWS + g + (l >> 1) * 8] = acc[t][l];
             }
         }
-        __syncthreads();
-
+    };
+    // The thread's J outputs of tile `tile` from its gates.
+    auto mix = [&](int tile) {
+        const int base = t_begin + tile * TT;
 #pragma unroll
         for (int j = 0; j < J; j++) {
             const int tt  = er + 8 * j;
@@ -422,6 +423,56 @@ __global__ void __launch_bounds__(CG * HC * 32, MINB) up_mix_bf16_reg(const legi
                 if (p.mixedb != nullptr) {
                     ((__nv_bfloat16 *) p.mixedb)[mo] = __float2bfloat16(v);
                 }
+            }
+        }
+    };
+
+    if constexpr (!PIPE) {
+        for (int it = 0; it < tiles; it++) {
+            const int buf = it & 1;
+            asm volatile("cp.async.wait_group 0;" ::: "memory");
+            // Tile it's lo is in; every thread is past the last tile's matmul (buffer buf ^ 1
+            // free) and its mix (the gates free).
+            __syncthreads();
+            if (it + 1 < tiles) {
+                stage(it + 1, buf ^ 1);
+            }
+            if (PD > 0) {
+                prefetch(it + PD);
+            }
+            float acc[NT][4];
+            matmul(buf, acc);
+            gates(acc);
+            __syncthreads();
+            mix(it);
+        }
+    } else {
+        // Step it: tile it's matmul and tile it - 1's mix, then tile it's gates (one more step
+        // for the last tile's mix). The conditions are the CTA's, so its barriers are too.
+        for (int it = 0; it <= tiles; it++) {
+            const int  buf = it & 1;
+            const bool mm  = it < tiles;
+            asm volatile("cp.async.wait_group 0;" ::: "memory");
+            // Tile it's lo is in; every thread is past tile it - 1's matmul (buffer buf ^ 1
+            // free) and has stored its gates.
+            __syncthreads();
+            if (it + 1 < tiles) {
+                stage(it + 1, buf ^ 1);
+            }
+            if (PD > 0) {
+                prefetch(it + PD);
+            }
+            float acc[NT][4];
+            if (mm) {
+                matmul(buf, acc);
+            }
+            if (it > 0) {
+                mix(it - 1);
+            }
+            if (mm) {
+                // Every thread is past tile it - 1's mix (the gates free).
+                __syncthreads();
+                gates(acc);
             }
         }
     }
