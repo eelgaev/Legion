@@ -119,11 +119,23 @@ pub fn set_down_x_prefetch(on: bool) {
 static DOWN_WIDE_STORE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Whether the routed experts' down projection GEMM of prompt steps ([`GEMM_DOWN`]) stages its
-/// outputs through shared memory and stores them 16 bytes a thread ([`DOWN_WST`], #1183). The
-/// same values in the same places either way. On by default; `legion serve
-/// --no-nvfp4-down-wide-store` turns it off for comparisons.
+/// outputs through shared memory and stores them 16 bytes a thread ([`DOWN_WST_F32`],
+/// [`DOWN_WST_BF16`], #1183). The same values in the same places either way. On by default;
+/// `legion serve --no-nvfp4-down-wide-store` turns it off (and the BF16 rows' streaming
+/// stores with it) for comparisons.
 pub fn set_down_wide_store(on: bool) {
     DOWN_WIDE_STORE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+static DOWN_EVICT_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether the routed experts' down projection GEMM of prompt steps ([`GEMM_DOWN`]) writes BF16
+/// rows with streaming (evict-first) stores on top of the staged ones ([`DOWN_WST_BF16`],
+/// #1183). F32 rows never do ([`DOWN_WST_F32`]), and [`set_down_wide_store`] off turns both
+/// off. The same bits either way. On by default; `legion serve
+/// --no-nvfp4-down-store-evict-first` turns it off for comparisons.
+pub fn set_down_store_evict_first(on: bool) {
+    DOWN_EVICT_FIRST.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 static PAD_SKIP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -1564,22 +1576,42 @@ pub fn grouped_gemm_xpf(k: i64, n_expert: i64, mi: i32, nt: i32, glu: bool) -> i
 pub const WST_WIDE: i32 = 1;
 /// `legion_nvfp4_mm::wst` bit 1 (`EPI_CS`): the down tile's output stores streaming
 /// (`st.global.cs`, evict-first in L2), so the 0.4-0.6 GB of rows a layer writes at long prompt
-/// steps leave the weights' and the prefetched activations' lines in L2. Not on by default:
-/// the rows are read next by the weighted sum, and the GEMM's own reads are what it would help.
+/// steps leave the weights' and the prefetched activations' lines in L2. On by default for BF16
+/// rows only ([`DOWN_WST_BF16`]): on a DGX Spark (GB10) it took the staged BF16 rows' down GEMM
+/// from 1.096x to 1.124x the old one at 12,288 tokens (1.038x to 1.050x at 8,067), but F32
+/// rows' from 1.007x to 1.003x and 0.967x.
 pub const WST_CS: i32 = 2;
 
-/// The down projection's grouped GEMM's epilogue ([`GEMM_DOWN`], #1183): [`WST_WIDE`].
-pub const DOWN_WST: i32 = WST_WIDE;
+/// The down projection's grouped GEMM's epilogue ([`GEMM_DOWN`], #1183) for BF16 rows
+/// (`--nvfp4-expert-rows-bf16`): staged and streaming, [`WST_WIDE`] | [`WST_CS`].
+pub const DOWN_WST_BF16: i32 = WST_WIDE | WST_CS;
+/// The down projection's grouped GEMM's epilogue ([`GEMM_DOWN`], #1183) for F32 rows: staged,
+/// [`WST_WIDE`] (streaming stores lose there).
+pub const DOWN_WST_F32: i32 = WST_WIDE;
 
-/// The epilogue (`legion_nvfp4_mm::wst`) of a grouped GEMM's launch, as [`grouped_gemm_tune`]
-/// picks its variant: [`DOWN_WST`] for the down projection's [`GEMM_DOWN`] tile (unless
-/// [`set_down_wide_store`] turned it off), 0 (the fragments' own stores) otherwise.
-pub fn grouped_gemm_wst(k: i64, n_expert: i64, mi: i32, nt: i32, glu: bool) -> i32 {
+/// The epilogue (`legion_nvfp4_mm::wst`) of a grouped GEMM's launch writing BF16 (`bf16_rows`)
+/// or F32 rows, as [`grouped_gemm_tune`] picks its variant: for the down projection's
+/// [`GEMM_DOWN`] tile [`DOWN_WST_BF16`] or [`DOWN_WST_F32`] (without [`WST_CS`] when
+/// [`set_down_store_evict_first`] turned it off, 0 when [`set_down_wide_store`] did), 0 (the
+/// fragments' own stores) otherwise.
+pub fn grouped_gemm_wst(
+    k: i64,
+    n_expert: i64,
+    mi: i32,
+    nt: i32,
+    glu: bool,
+    bf16_rows: bool,
+) -> i32 {
+    use std::sync::atomic::Ordering::Relaxed;
     let down = !glu && grouped_gemm_tune(k, n_expert, mi, nt, glu) == GEMM_DOWN;
-    if down && DOWN_WIDE_STORE.load(std::sync::atomic::Ordering::Relaxed) {
-        DOWN_WST
-    } else {
+    if !down || !DOWN_WIDE_STORE.load(Relaxed) {
         0
+    } else if !bf16_rows {
+        DOWN_WST_F32
+    } else if DOWN_EVICT_FIRST.load(Relaxed) {
+        DOWN_WST_BF16
+    } else {
+        DOWN_WST_BF16 & !WST_CS
     }
 }
 
@@ -1756,7 +1788,8 @@ mod cuda {
         });
         p.wst = forced_wst().unwrap_or(match kernel {
             Kernel::Gemm { mi, nt } if !p.plan.is_null() => {
-                grouped_gemm_wst(p.k, p.n_expert as i64, mi, nt, false)
+                let bf16_rows = p.act == Act::Bf16.code() || p.act == Act::ReluSqr.code();
+                grouped_gemm_wst(p.k, p.n_expert as i64, mi, nt, false, bf16_rows)
             }
             _ => 0,
         });

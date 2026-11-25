@@ -498,9 +498,16 @@ pub(in crate::cli) struct SwitchArgs {
     /// CUDA, NVFP4 routed experts on Legion's W4A16 kernels, prompt steps on the grouped GEMM:
     /// the down projection's tiles store their outputs straight from the MMA fragments, 2 or 4
     /// bytes a thread (the default: staged through shared memory and stored 16 bytes a thread,
-    /// whole runs of each (token, expert) row). The same bits either way. For comparisons.
+    /// whole runs of each (token, expert) row; BF16 rows with evict-first stores too). Also
+    /// turns the evict-first stores off. The same bits either way. For comparisons.
     #[arg(long, help_heading = HEADING)]
     no_nvfp4_down_wide_store: bool,
+    /// CUDA, NVFP4 routed experts on Legion's W4A16 kernels, prompt steps on the grouped GEMM,
+    /// --nvfp4-expert-rows-bf16: the down projection's staged stores are plain ones (the
+    /// default: evict-first, so the rows written leave the weights and activations in L2; F32
+    /// rows never use them). The same bits either way. For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_nvfp4_down_store_evict_first: bool,
     /// CUDA, NVFP4 routed experts on Legion's W4A16 kernels: matmuls of up to this many (token,
     /// expert) pairs per used expert (if the routing were even) take the grouped mv kernel,
     /// more the grouped GEMM. Default 32: prompt steps of up to ~1,600 tokens on
@@ -1599,6 +1606,7 @@ impl SwitchArgs {
             nvfp4_expert_tile_prefetch: self.no_nvfp4_expert_tile_prefetch.then_some(false),
             nvfp4_down_x_prefetch: self.no_nvfp4_down_x_prefetch.then_some(false),
             nvfp4_down_wide_store: self.no_nvfp4_down_wide_store.then_some(false),
+            nvfp4_down_store_evict_first: self.no_nvfp4_down_store_evict_first.then_some(false),
             nvfp4_expert_mv_max: self.nvfp4_expert_mv_max.map(i64::from),
             nvfp4_expert_mv_tile: self.nvfp4_expert_mv_tile.map(i32::from),
             nvfp4_expert_mv_split: self.nvfp4_expert_mv_split,

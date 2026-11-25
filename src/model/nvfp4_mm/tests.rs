@@ -906,8 +906,8 @@ fn down_x_prefetch_only_on_the_down_gemm() {
     assert_eq!(grouped_gemm_xpf(640, 64, 2, 8, false), 0);
 }
 
-/// The CUDA tests of the activation prefetch share the process-wide kernel overrides.
-#[cfg(feature = "cuda")]
+/// The CUDA tests of the activation prefetch and the down epilogue share the process-wide
+/// kernel overrides and switches (so does the epilogue's dispatch test).
 static XPF_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(feature = "cuda")]
@@ -1306,21 +1306,40 @@ fn cuda_down_x_prefetch_bench() {
 }
 
 /// The staged epilogue (#1183) is the down projection's grouped GEMM tile's only: not the
-/// SwiGLU's, not a down projection of wide k or few experts.
+/// SwiGLU's, not a down projection of wide k or few experts; streaming stores for BF16 rows
+/// only; the switches turn them off. Holds [`XPF_LOCK`]: the switches are process-wide.
 #[test]
 fn down_wide_store_only_on_the_down_gemm() {
-    assert_eq!(DOWN_WST, WST_WIDE);
+    let _lock = XPF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(DOWN_WST_BF16, WST_WIDE | WST_CS);
+    assert_eq!(DOWN_WST_F32, WST_WIDE);
     assert_eq!(WST_WIDE & WST_CS, 0);
-    // Qwen3.8-Flash-Next's down projection (k 640, 512 experts) at prompt steps.
-    assert_eq!(grouped_gemm_wst(640, 512, 2, 8, false), DOWN_WST);
-    // Other tiles and the SwiGLU GEMM: none.
-    assert_eq!(grouped_gemm_wst(640, 512, 2, 16, false), 0);
-    assert_eq!(grouped_gemm_wst(640, 512, 1, 8, false), 0);
-    assert_eq!(grouped_gemm_wst(2560, 512, 2, 16, true), 0);
-    assert_eq!(grouped_gemm_wst(2560, 512, 2, 8, true), 0);
-    // Not a wide down projection's shape.
-    assert_eq!(grouped_gemm_wst(2560, 512, 2, 8, false), 0);
-    assert_eq!(grouped_gemm_wst(640, 64, 2, 8, false), 0);
+    for bf16 in [false, true] {
+        let down = if bf16 { DOWN_WST_BF16 } else { DOWN_WST_F32 };
+        // Qwen3.8-Flash-Next's down projection (k 640, 512 experts) at prompt steps.
+        assert_eq!(grouped_gemm_wst(640, 512, 2, 8, false, bf16), down);
+        // Other tiles and the SwiGLU GEMM: none.
+        assert_eq!(grouped_gemm_wst(640, 512, 2, 16, false, bf16), 0);
+        assert_eq!(grouped_gemm_wst(640, 512, 1, 8, false, bf16), 0);
+        assert_eq!(grouped_gemm_wst(2560, 512, 2, 16, true, bf16), 0);
+        assert_eq!(grouped_gemm_wst(2560, 512, 2, 8, true, bf16), 0);
+        // Not a wide down projection's shape.
+        assert_eq!(grouped_gemm_wst(2560, 512, 2, 8, false, bf16), 0);
+        assert_eq!(grouped_gemm_wst(640, 64, 2, 8, false, bf16), 0);
+    }
+    // --no-nvfp4-down-store-evict-first: staged only, either rows.
+    set_down_store_evict_first(false);
+    assert_eq!(grouped_gemm_wst(640, 512, 2, 8, false, true), WST_WIDE);
+    assert_eq!(grouped_gemm_wst(640, 512, 2, 8, false, false), WST_WIDE);
+    // --no-nvfp4-down-wide-store: neither, whatever the other says.
+    for cs in [false, true] {
+        set_down_store_evict_first(cs);
+        set_down_wide_store(false);
+        assert_eq!(grouped_gemm_wst(640, 512, 2, 8, false, true), 0);
+        assert_eq!(grouped_gemm_wst(640, 512, 2, 8, false, false), 0);
+        set_down_wide_store(true);
+    }
+    set_down_store_evict_first(true);
 }
 
 /// The epilogues the staged-store bit test compares with the fragments' own stores (0).
@@ -1342,9 +1361,9 @@ struct WstCase {
 
 /// `case`'s down projection on the down tile ([`GEMM_DOWN`], forced: the small shapes are no
 /// default down projection) with F32, BF16 and squared-ReLU BF16 rows, without and with the
-/// activation prefetch: every epilogue of [`WST_CHECKED`] (and the default) stores the bits of
-/// the fragments' own stores. The outputs are filled with a pattern before each run, so a
-/// value an epilogue leaves out shows.
+/// activation prefetch: every epilogue of [`WST_CHECKED`] (and the defaults, with and without
+/// the BF16 rows' streaming stores) stores the bits of the fragments' own stores. The outputs
+/// are filled with a pattern before each run, so a value an epilogue leaves out shows.
 #[cfg(feature = "cuda")]
 fn wst_case(gpu: &mut crate::ggml::Backend, case: &WstCase) {
     use crate::ggml::ComputeAllocator;
@@ -1389,20 +1408,28 @@ fn wst_case(gpu: &mut crate::ggml::Backend, case: &WstCase) {
         force_gemm_xpf(xpf);
         force_gemm_wst(Some(0));
         let want = run(gpu);
-        for wst in WST_CHECKED.map(Some).into_iter().chain([None]) {
+        // The forced epilogues, then the defaults (per output type) with the streaming
+        // stores on and off.
+        let tries = WST_CHECKED
+            .map(|w| (Some(w), true))
+            .into_iter()
+            .chain([(None, true), (None, false)]);
+        for (wst, cs) in tries {
             force_gemm_wst(wst);
+            set_down_store_evict_first(cs);
             for (i, (got, want)) in run(gpu).iter().zip(&want).enumerate() {
                 assert_eq!(got.len(), want.len());
                 let differ = got.iter().zip(want).filter(|(a, b)| a != b).count();
                 assert_eq!(
                     differ, 0,
-                    "{}, output {i} (F32, BF16, relu^2), xpf {xpf:?}, wst {wst:?}: \
-                     {differ} bytes differ",
+                    "{}, output {i} (F32, BF16, relu^2), xpf {xpf:?}, wst {wst:?}, \
+                     evict-first {cs}: {differ} bytes differ",
                     case.name
                 );
             }
         }
     }
+    set_down_store_evict_first(true);
     xpf_reset();
 }
 
@@ -1525,9 +1552,10 @@ fn cuda_down_wide_store_bench() {
         ("old + cs", WST_CS),
         ("wide + cs", WST_WIDE | WST_CS),
     ];
-    let default = grouped_gemm_wst(ffn as i64, n_expert as i64, 2, 8, false);
     for n_tok in [12288usize, 8067] {
         for act in [Act::Bf16, Act::None] {
+            let default =
+                grouped_gemm_wst(ffn as i64, n_expert as i64, 2, 8, false, act != Act::None);
             let ctx = Context::new(16 + 24 * LAYERS, 16 * LAYERS + 16);
             let x = ctx
                 .new_tensor(types::BF16, &[ffn as i64, n_used as i64, n_tok as i64])
