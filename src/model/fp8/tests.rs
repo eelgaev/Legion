@@ -129,3 +129,118 @@ fn mm_node_finds_the_matmul_under_a_scale() {
     let params = crate::ggml::external_params(unsafe { &*mm.raw() });
     assert_eq!(params[P_SIDE], 0);
 }
+
+/// Random E4M3 codes of a `[k, m]` weight: any sign and mantissa, exponents 3 to 10 (no NaN).
+#[cfg(feature = "cuda")]
+fn e4m3_noise(len: usize, seed: u64) -> Vec<u8> {
+    let mut s = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    let mut out = Vec::with_capacity(len + 8);
+    while out.len() < len {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        for b in s.to_le_bytes() {
+            out.push(b & 0x87 | (3 + (b >> 3) % 8) << 3);
+        }
+    }
+    out.truncate(len);
+    out
+}
+
+/// Values in [-1, 1).
+#[cfg(feature = "cuda")]
+fn unit_noise(len: usize, seed: u64) -> Vec<f32> {
+    let mut s = seed.wrapping_mul(0x2545_f491_4f6c_dd1d) | 1;
+    (0..len)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0
+        })
+        .collect()
+}
+
+/// The W8A8 prompt GEMM (`--fp8-act a8-dynamic`) at Qwen3.8-Flash-Next's dense shapes (#1183:
+/// GDN qkv / z / out, attention q+gate+k+v and out, the shared expert's gate+up and down, at
+/// 12,288 and 8,067 tokens) and ragged token counts: every epilogue variant, the two 4-warp
+/// CTAs an SM without the residual (variant bit 0x400) among them, writes the plain wide
+/// tile's bytes (variant 1).
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU with E4M3 tensor cores"]
+fn cuda_gemm8_variants_are_the_plain_bits() {
+    use crate::ggml::{ComputeAllocator, DeviceKind, device_by_kind};
+    let mut gpu = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU device")
+        .init()
+        .unwrap();
+    if !fp8_mma() {
+        eprintln!("no E4M3 tensor cores: skipped");
+        return;
+    }
+    // (k, m, n, residual)
+    let shapes: [(i64, i64, i64, bool); 12] = [
+        (2560, 10240, 12288, false),
+        (2560, 6144, 12288, false),
+        (6144, 2560, 12288, false),
+        (2560, 13312, 8067, false),
+        (6144, 2560, 8067, false),
+        (640, 2560, 12288, false),
+        (640, 2560, 8067, false),
+        (2560, 1280, 12288, false),
+        (2560, 10240, 1153, false),
+        (640, 2560, 4993, false),
+        (2560, 6144, 12289, false),
+        (6144, 2560, 8067, true),
+    ];
+    for (i, &(k, m, n, with_res)) in shapes.iter().enumerate() {
+        let wctx = Context::new(2, 0);
+        let w = wctx.new_tensor(types::I8, &[k, m]);
+        let sc = wctx.new_tensor(types::F32, &[m]);
+        wctx.alloc_tensors(gpu.buffer_type()).unwrap();
+        w.set_bytes(&e4m3_noise((k * m) as usize, 5 + i as u64));
+        let scales: Vec<f32> = unit_noise(m as usize, 0x55 + i as u64)
+            .iter()
+            .map(|v| 0.002 + 0.001 * v.abs())
+            .collect();
+        sc.set_f32(&scales);
+
+        let ctx = Context::new(16, 16);
+        let x = ctx.new_tensor(types::F32, &[k, n]).as_input().as_output();
+        let res = with_res.then(|| ctx.new_tensor(types::F32, &[m, n]).as_input().as_output());
+        let mut graph = ctx.new_graph(16);
+        let y = match res {
+            Some(r) => mul_mat_dynamic_add(&ctx, w, x, Some(sc), r),
+            None => mul_mat_dynamic(&ctx, w, x, Some(sc)),
+        }
+        .as_output();
+        graph.expand(y);
+        ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+            .unwrap();
+        x.set_f32(&unit_noise((k * n) as usize, 0x1234 + n as u64));
+        if let Some(r) = res {
+            r.set_f32(&unit_noise((m * n) as usize, 0x4321 + n as u64));
+        }
+
+        force_gemm_variant(1);
+        let ran = gpu.compute(&graph);
+        force_gemm_variant(0);
+        ran.unwrap();
+        let want = y.bytes();
+        for v in [0, 2, 3, 0x100, 0x400, 0x401, 0x402, 0x403] {
+            force_gemm_variant(v);
+            let ran = gpu.compute(&graph);
+            force_gemm_variant(0);
+            ran.unwrap();
+            let got = y.bytes();
+            let bad = got
+                .chunks_exact(4)
+                .zip(want.chunks_exact(4))
+                .filter(|(a, b)| a != b)
+                .count();
+            assert_eq!(bad, 0, "k {k} m {m} n {n} res {with_res}: variant {v:#x}");
+        }
+    }
+}

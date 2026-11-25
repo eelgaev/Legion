@@ -85,7 +85,9 @@ struct legion_fp8_mm8 {
     // The TMA-fed large-batch GEMM's epilogue (#1133 r25; other GEMMs ignore it): 0 the default
     // pick (gemm8_epilogue_stream where routed), with bit 8 (LEGION_DEBUG_FP8_STREAM_EPI=0)
     // gemm8_epilogue everywhere; forced, for `legion fp8-gemm-bench`: 1 gemm8_epilogue, 2 / 3
-    // gemm8_epilogue_stream with one / two token tiles at a time. Every value gives the same bits.
+    // gemm8_epilogue_stream with one / two token tiles at a time; with bit 10 (GEMM8_PAIR) the
+    // wide shapes without the residual on the two 4-warp CTAs an SM. Every value gives the same
+    // bits.
     int32_t variant;
 };
 int legion_fp8_quant_launch(const float * x, int64_t x_ld, uint8_t * out, int64_t k, int64_t n,
@@ -732,13 +734,17 @@ template <bool RES, class C> bool launch_gemm8_tma_jg(const legion_fp8_mm8 & p, 
 // stages, 48 KiB each, #1133 r11), whose epilogues overlap the other CTA's MMAs: on the GB10, the
 // output projection (6,144 -> 5,120) at 4,096 to 16,384 tokens 1.11-1.13x the wide tile's speed;
 // without the residual they are no faster than it (0.99-1.02x), so it keeps the wide tile.
+// Variant bit 10 (GEMM8_PAIR, `legion fp8-gemm-bench` only) puts the shapes without the residual
+// on the pair too: at k 5,120 they tie, but shorter k (2,560 and 640, Qwen3.8-Flash-Next's
+// projections) leaves the wide tile's exposed epilogue a larger share of each tile.
 constexpr int64_t GEMM8_WIDE_WAVES = 8;
+constexpr int32_t GEMM8_PAIR       = 0x400;
 template <bool RES>
 void launch_gemm8(const legion_fp8_mm8 & p, cudaStream_t st) {
     const int64_t wide_tiles = p.m / 256 * ((p.n + a8::BN - 1) / a8::BN);
     if (p.m % 256 == 0 && wide_tiles >= GEMM8_WIDE_WAVES * sm_count()) {
         if (p.k % 128 == 0) {
-            if constexpr (RES) {
+            if (RES || ((p.variant & GEMM8_PAIR) && !(p.variant & GEMM8_STAGED))) {
                 if (launch_gemm8_tma_jg<RES, a8::Cfg<2, 3, 64, true, 4>>(p, st)) {
                     return;
                 }

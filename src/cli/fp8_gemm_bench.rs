@@ -17,7 +17,9 @@ pub struct Fp8GemmBenchArgs {
     shapes: Vec<String>,
     /// Epilogue variants timed against the plain epilogue (1): 0 the default pick (the
     /// streaming route), 2 and 3 the streaming epilogue with one and two token tiles at a time,
-    /// 256 the pick without the streaming route (LEGION_DEBUG_FP8_STREAM_EPI=0).
+    /// 256 the pick without the streaming route (LEGION_DEBUG_FP8_STREAM_EPI=0); 1024 added
+    /// (1024, 1025, 1027) runs the wide shapes without a residual as two 4-warp 128 x 128 CTAs an
+    /// SM (the residual shapes' tile) with that epilogue.
     #[arg(long, value_delimiter = ',', default_values_t = [0, 2, 3, 256])]
     variants: Vec<i32>,
     /// One per-tensor weight scale instead of one per output row.

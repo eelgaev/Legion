@@ -717,8 +717,9 @@ static FORCED_GEMM_VARIANT: std::sync::atomic::AtomicI32 = std::sync::atomic::At
 
 /// Launches every TMA-fed W8A8 prefill GEMM from now on with epilogue `variant`
 /// (`legion_fp8_mm8`'s `variant`: 1 the plain epilogue, 2 and 3 the streaming one with one or
-/// two token tiles at a time, 0x100 the pick without the streaming route), or the default
-/// choice for 0: for `legion fp8-gemm-bench`.
+/// two token tiles at a time, 0x100 the pick without the streaming route; 0x400 added puts the
+/// wide shapes without a residual on two 4-warp CTAs an SM), or the default choice for 0: for
+/// `legion fp8-gemm-bench`. Every variant gives the same bits.
 #[doc(hidden)]
 pub fn force_gemm_variant(variant: i32) {
     #[cfg(feature = "cuda")]
