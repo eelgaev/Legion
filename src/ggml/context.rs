@@ -1680,6 +1680,82 @@ pub struct ComputeAllocator {
     /// The last plan failed: ggml keeps that plan but not its buffer, so the next graph is
     /// planned afresh ([`Self::plan`]).
     failed: std::cell::Cell<bool>,
+    /// Where graphs a relayout rewrites are planned as built, out of this allocator's buffer
+    /// ([`Self::headroom`]'s; [`Shadow`]).
+    shadow: Option<Shadow>,
+}
+
+/// A second graph allocator, over address space only ([`super::unbacked`]), that plans a
+/// [`ComputeAllocator`]'s graphs as built where a relayout rewrites them (#1183). ggml's
+/// buffers only grow: planned in the allocator's own buffer, the plan as built sized it
+/// whenever it peaked above the plan as rewritten (6,982 vs 5,542 MiB for a 16,384-token
+/// Qwen3.8-Flash-Next prompt step), though the graph runs as rewritten. The shadow lays the
+/// graph out where the allocator would have, so the rewrite reads the same layout:
+///
+/// - ggml plans a graph from the previous graph's plan when it fits (unless fresh), so the
+///   shadow plans what the allocator plans, in the same order: the graph as built (in the
+///   allocator only where it runs so: not rewritten), then the graph as rewritten, afresh in
+///   both. Their last plans are the same then, and so the next graph's layout as built.
+/// - Where they may differ (the shadow did not plan a graph the allocator did: one no
+///   relayout takes, or a rewrite undone, or a shadow plan failed), it is out of step
+///   ([`Self::synced`] false) and the allocator plans as built in its own buffer, as without a
+///   shadow, until the next graph as rewritten puts both in step again.
+///
+/// The graph runs in the allocator's buffer, which grows when a layout it runs in needs more:
+/// a plan as rewritten does, and a rewrite undone runs as built in a buffer grown to its offsets
+/// ([`ComputeAllocator::as_built`]) or planned afresh ([`ComputeAllocator::plan`]).
+struct Shadow {
+    raw: NonNull<ffi::ggml_gallocr>,
+    /// The shadow's last plan is the allocator's: it plans the next graph as built the same.
+    synced: std::cell::Cell<bool>,
+}
+
+impl Drop for Shadow {
+    fn drop(&mut self) {
+        // SAFETY: the shadow's own allocator; its buffers' tensors are unplanned again.
+        unsafe { ffi::ggml_gallocr_free(self.raw.as_ptr()) }
+    }
+}
+
+impl Shadow {
+    /// A shadow for an allocator of `buft`; `None` if ggml cannot make one.
+    fn new(buft: BufferType) -> Option<Self> {
+        // SAFETY: a live buffer type.
+        let raw = unsafe { ffi::ggml_gallocr_new(super::unbacked::over(buft.raw())) };
+        Some(Self {
+            raw: NonNull::new(raw)?,
+            synced: std::cell::Cell::new(true),
+        })
+    }
+
+    /// Plans `raw` as [`ComputeAllocator::plan`] does (`fresh`: the allocator's, after a failed
+    /// plan too) and gives its tensors addresses in the shadow's buffer. A failed plan puts the
+    /// shadow out of step.
+    ///
+    /// # Safety
+    /// A live graph none of whose unplanned tensors has memory yet.
+    unsafe fn plan(&self, raw: *mut ffi::ggml_cgraph, fresh: bool) -> bool {
+        // SAFETY: the caller's; as in `ComputeAllocator::plan`.
+        let ok = unsafe {
+            (!fresh || ffi::ggml_gallocr_reserve(self.raw.as_ptr(), raw))
+                && ffi::ggml_gallocr_alloc_graph(self.raw.as_ptr(), raw)
+        };
+        if !ok {
+            self.synced.set(false);
+        }
+        ok
+    }
+
+    /// Plans `raw` afresh without giving its tensors addresses, as the allocator plans it
+    /// next: in step with the allocator again if that worked.
+    ///
+    /// # Safety
+    /// As [`Self::plan`].
+    unsafe fn plan_afresh(&self, raw: *mut ffi::ggml_cgraph) {
+        // SAFETY: the caller's; reserving plans the graph without touching its tensors.
+        let ok = unsafe { ffi::ggml_gallocr_reserve(self.raw.as_ptr(), raw) };
+        self.synced.set(ok);
+    }
 }
 
 /// The tensors of `graph` an allocation gives memory: its nodes, their sources and its leafs
@@ -1953,6 +2029,7 @@ impl ComputeAllocator {
             relayout: None,
             moved: std::cell::Cell::new(false),
             failed: std::cell::Cell::new(false),
+            shadow: None,
         }
     }
 
@@ -1980,10 +2057,33 @@ impl ComputeAllocator {
         // Where each plan peaks, while a load measures its prompt step (`plan_peak`).
         // SAFETY: as above.
         let report = super::plan_peak::reporting().then(|| unsafe { self::unplanned(raw) });
-        let mut ok = self.plan(raw, self.fresh);
+        // The plan as built in the shadow, where it is in step (#1183): out of this buffer.
+        // A graph no relayout takes is planned here only, and the shadow falls out of step.
+        if relayout.is_none() {
+            self.out_of_step();
+        }
+        let shadow = self.shadow.as_ref().filter(|s| s.synced.get());
+        let mut unbacked = false;
+        let mut ok = match shadow {
+            // SAFETY: as above; the shadow's addresses are taken back off the tensors below
+            // before anything else plans them.
+            Some(s) => unsafe {
+                unbacked = s.plan(raw, self.fresh || self.failed.get());
+                if !unbacked {
+                    forget_plan(unplanned.as_deref().unwrap_or_default());
+                }
+                unbacked || self.plan(raw, self.fresh)
+            },
+            None => self.plan(raw, self.fresh),
+        };
         if ok && let Some(placed) = &report {
+            let plan = if unbacked {
+                "as built, unbacked"
+            } else {
+                "as built"
+            };
             // SAFETY: allocated just now; `placed` are its tensors.
-            unsafe { super::plan_peak::log(raw, placed, "as built", self.buffer_size()) };
+            unsafe { super::plan_peak::log(raw, placed, plan, self.buffer_size()) };
         }
         let mut rewritten = false;
         if ok && let Some((r, cuda)) = relayout {
@@ -1996,22 +2096,47 @@ impl ComputeAllocator {
             // rewritten. One that must run as built (`Relaid::as_built`) is undone where that
             // plan fails or the rewrite no longer holds then, and the tensors go back to the
             // memory the plan as built gave them; any other is undone where it no longer
-            // holds, and the graph is planned afresh.
+            // holds, and the graph is planned afresh. Either undo puts the shadow out of step.
             if let Some(relaid) = unsafe { (r.rewrite)(raw, cuda) } {
                 rewritten = true;
                 unsafe {
                     forget_plan(unplanned);
+                    // The shadow plans it afresh too, as this allocator does now: in step.
+                    if let Some(s) = &self.shadow {
+                        s.plan_afresh(raw);
+                    }
                     ok = self.plan(raw, true);
                     if relaid.as_built() {
                         if !(ok && relaid.holds(raw)) {
                             relaid.undo(raw);
                             forget_plan(unplanned);
+                            self.out_of_step();
                             ok = self.as_built(raw, unplanned, &built);
                         }
                     } else if ok && !relaid.holds(raw) {
                         relaid.undo(raw);
                         forget_plan(unplanned);
+                        self.out_of_step();
                         ok = self.plan(raw, true);
+                    }
+                }
+            } else if unbacked {
+                // Not rewritten: it runs as built, planned here as the shadow planned it (from
+                // the same last plan, so at the same offsets). Were they not, the tensors go to
+                // the shadow's offsets ([`Self::as_built`]), and the shadow out of step.
+                // SAFETY: as above.
+                unsafe {
+                    forget_plan(unplanned);
+                    ok = self.plan(raw, self.fresh);
+                    if !(ok && built.is_current()) {
+                        tracing::warn!(
+                            planned = ok,
+                            "a graph planned as built out of its buffer was laid out otherwise \
+                             in it: given the offsets planned"
+                        );
+                        forget_plan(unplanned);
+                        self.out_of_step();
+                        ok = self.as_built(raw, unplanned, &built);
                     }
                 }
             }
@@ -2062,7 +2187,8 @@ impl ComputeAllocator {
                 return false;
             };
             // ggml's buffers only grow: after a plan, the allocator's holds what an earlier
-            // one gave this graph unless a failed plan freed it.
+            // one gave this graph unless a failed plan freed it, or the plan as built was the
+            // shadow's (then it may be smaller, and grows).
             let buffer = if planned { built.buffer_now() } else { None };
             forget_plan(unplanned);
             let buffer = match buffer {
@@ -2082,6 +2208,13 @@ impl ComputeAllocator {
         }
     }
 
+    /// Puts the shadow, if any, out of step: this allocator planned a graph it did not.
+    fn out_of_step(&self) {
+        if let Some(s) = &self.shadow {
+            s.synced.set(false);
+        }
+    }
+
     /// The allocator's buffer, grown to at least `bytes` (as [`Self::reserved`] grows it).
     /// None if that allocation fails.
     fn grown(&self, bytes: usize) -> Option<ffi::ggml_backend_buffer_t> {
@@ -2091,6 +2224,7 @@ impl ComputeAllocator {
         let t = ctx.new_tensor(super::types::I8, &[bytes.max(1) as i64]);
         let mut graph = ctx.new_graph(1);
         graph.expand(t);
+        self.out_of_step();
         let ok = self.plan(graph.raw(), true);
         // SAFETY: `t` is a valid tensor; its buffer is the allocator's, which outlives `ctx`.
         let b = unsafe { (*t.raw()).buffer };
@@ -2141,9 +2275,19 @@ impl ComputeAllocator {
 
     /// [`Self::padded`] with a little headroom only (a sixty-fourth and 16 MiB): for graphs that
     /// each need a few KiB more than the one before (#363: an integrated GPU's prompt chunks,
-    /// whose 1.5 GiB buffer was freed and allocated again for every second chunk).
+    /// whose 1.5 GiB buffer was freed and allocated again for every second chunk). Graphs a
+    /// relayout rewrites are planned as built out of the buffer ([`Self::with_unbacked_plans`]),
+    /// which then holds the plans they run in (#1183).
     pub fn headroom(buft: BufferType) -> Self {
-        Self::over(buft, super::padded::Pad::Light)
+        Self::over(buft, super::padded::Pad::Light).with_unbacked_plans()
+    }
+
+    /// This allocator planning the graphs a relayout rewrites as built in a [`Shadow`] (address
+    /// space only), so its buffer is sized by the plans its graphs run in: as rewritten, or as
+    /// built where the rewrite is not taken or undone. The layouts are the same as without it.
+    pub(crate) fn with_unbacked_plans(mut self) -> Self {
+        self.shadow = Shadow::new(self.buft);
+        self
     }
 
     fn over(buft: BufferType, pad: super::padded::Pad) -> Self {
@@ -2156,6 +2300,7 @@ impl ComputeAllocator {
             relayout: None,
             moved: std::cell::Cell::new(false),
             failed: std::cell::Cell::new(false),
+            shadow: None,
         }
     }
 
@@ -2198,6 +2343,11 @@ impl ComputeAllocator {
         let t = ctx.new_tensor(super::types::I8, &[bytes.max(1) as i64]);
         let mut graph = ctx.new_graph(1);
         graph.expand(t);
+        // The shadow plans the leaf too (afresh, as this new allocator does): in step.
+        if let Some(s) = &self.shadow {
+            // SAFETY: a live graph whose leaf has no memory.
+            unsafe { s.plan_afresh(graph.raw()) };
+        }
         // SAFETY: a live allocator and graph; allocating plans the graph's one leaf, allocates
         // the buffer and points the leaf into it (the leaf is dropped with `ctx`, and the
         // allocator keeps no pointer to it past its next plan).

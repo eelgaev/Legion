@@ -1,10 +1,18 @@
-use super::{ComputeAllocator, Context, Graph, Placement, forget_plan};
+use super::{ComputeAllocator, Context, Graph, Placement, forget_plan, unplanned};
 use crate::ggml::{Backend, BufferType, ffi, types};
 
 /// Each node's offset in its compute buffer: the graph's memory layout.
 fn layout(graph: &Graph<'_>) -> Vec<usize> {
-    let g = graph.raw();
-    // SAFETY: an allocated graph; every node has its buffer and data.
+    // SAFETY: callers pass allocated graphs.
+    unsafe { offsets(graph.raw()) }
+}
+
+/// [`layout`] of a raw graph.
+///
+/// # Safety
+/// An allocated graph: every node has its buffer and data.
+unsafe fn offsets(g: *mut ffi::ggml_cgraph) -> Vec<usize> {
+    // SAFETY: the caller's.
     unsafe {
         (0..ffi::ggml_graph_n_nodes(g))
             .map(|i| {
@@ -104,6 +112,11 @@ enum Reject {
     Grow,
     /// The last node as long as no buffer can be (16 PiB): planning it fails.
     Fail,
+    /// No rewrite: the graph runs as built.
+    Skip,
+    /// Every node of more than one row one row long, and the rewrite holds: the graph runs as
+    /// rewritten, in a plan smaller than the plan as built.
+    Shrink,
 }
 
 thread_local! {
@@ -114,12 +127,13 @@ thread_local! {
     ///
     /// [`Relaid::as_built`]: crate::ggml::post_alloc::Relaid::as_built
     static AS_BUILT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// The layout as built [`REJECTED`]'s last rewrite read (its nodes' offsets).
+    static SEEN: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// A rewrite ([`rejected`]) that never holds: its last node as it was.
+/// A rewrite ([`rejected`]): the nodes it changed as they were.
 struct Rejected {
-    t: *mut ffi::ggml_tensor,
-    was: ffi::ggml_tensor,
+    saved: Vec<(*mut ffi::ggml_tensor, ffi::ggml_tensor)>,
     reject: Reject,
     as_built: bool,
 }
@@ -131,12 +145,14 @@ impl crate::ggml::post_alloc::Relaid for Rejected {
             !matches!(self.reject, Reject::Fail),
             "the 16 PiB graph was planned"
         );
-        false
+        matches!(self.reject, Reject::Shrink)
     }
 
     unsafe fn undo(&self, _graph: *mut ffi::ggml_cgraph) {
-        // SAFETY: the caller's: the graph's last node, saved whole before the rewrite.
-        unsafe { std::ptr::write(self.t, self.was) };
+        for &(t, was) in &self.saved {
+            // SAFETY: the caller's: the graph's nodes, saved whole before the rewrite.
+            unsafe { std::ptr::write(t, was) };
+        }
     }
 
     fn as_built(&self) -> bool {
@@ -149,29 +165,54 @@ unsafe fn every(_graph: *mut ffi::ggml_cgraph, _cuda: bool) -> bool {
     true
 }
 
-/// Lengthens the graph's last node (an F32 `[256, n]` node) as [`REJECT`] says.
+/// Sets `t` (an F32 `[256, n]` node) to `rows` rows.
+///
+/// # Safety
+/// A valid tensor of contiguous rows.
+unsafe fn set_rows(t: *mut ffi::ggml_tensor, rows: i64) {
+    // SAFETY: the caller's.
+    unsafe {
+        (*t).ne[1] = rows;
+        (*t).nb[2] = (*t).nb[1] * rows as usize;
+        (*t).nb[3] = (*t).nb[2];
+    }
+}
+
+/// Changes the graph's nodes (F32 `[256, n]` and `[256]` nodes) as [`REJECT`] says, after
+/// noting the layout as built ([`SEEN`]).
 unsafe fn rejected(
     graph: *mut ffi::ggml_cgraph,
     _cuda: bool,
 ) -> Option<Box<dyn crate::ggml::post_alloc::Relaid>> {
     // SAFETY: the caller's: an allocated graph of valid nodes.
     unsafe {
-        let t = ffi::ggml_graph_node(graph, ffi::ggml_graph_n_nodes(graph) - 1);
-        let was = std::ptr::read(t);
+        SEEN.set(offsets(graph));
+        let n = ffi::ggml_graph_n_nodes(graph);
         let reject = REJECT.get();
-        let rows = match reject {
-            Reject::Keep => None,
-            Reject::Grow => Some(64 * (*t).ne[1]),
-            Reject::Fail => Some(1 << 44),
-        };
-        if let Some(rows) = rows {
-            (*t).ne[1] = rows;
-            (*t).nb[2] = (*t).nb[1] * rows as usize;
-            (*t).nb[3] = (*t).nb[2];
+        let mut saved = Vec::new();
+        match reject {
+            Reject::Skip => return None,
+            Reject::Shrink => {
+                for i in 0..n {
+                    let t = ffi::ggml_graph_node(graph, i);
+                    if (*t).ne[1] > 1 {
+                        saved.push((t, std::ptr::read(t)));
+                        set_rows(t, 1);
+                    }
+                }
+            }
+            Reject::Keep | Reject::Grow | Reject::Fail => {
+                let t = ffi::ggml_graph_node(graph, n - 1);
+                saved.push((t, std::ptr::read(t)));
+                match reject {
+                    Reject::Grow => set_rows(t, 64 * (*t).ne[1]),
+                    Reject::Fail => set_rows(t, 1 << 44),
+                    _ => {}
+                }
+            }
         }
         Some(Box::new(Rejected {
-            t,
-            was,
+            saved,
             reject,
             as_built: AS_BUILT.get(),
         }))
@@ -184,23 +225,39 @@ const REJECTED: crate::ggml::post_alloc::Relayout = crate::ggml::post_alloc::Rel
     rewrite: rejected,
 };
 
+/// A new allocator taking [`REJECTED`] on every graph, without fresh plans; with `unbacked`
+/// plans as built ([`ComputeAllocator::with_unbacked_plans`]).
+fn rejecting(buft: BufferType, unbacked: bool) -> ComputeAllocator {
+    let a = ComputeAllocator::new(buft)
+        .with_fresh_plans(false)
+        .with_relayout(REJECTED);
+    if unbacked { a.with_unbacked_plans() } else { a }
+}
+
 /// The layout of a 2-row step allocated with [`REJECTED`] doing `reject`, after an 8-row step
-/// from the same allocator (`after`) or from an allocator that served nothing before; and the
-/// allocator's buffer size then.
-fn rejected_step(buft: BufferType, reject: Reject, after: bool) -> (Vec<usize>, usize) {
-    REJECT.set(reject);
+/// from the same allocator (`after`, not rewritten: [`Reject::Skip`]) or from an allocator that
+/// served nothing before; and the allocator's buffer size then. With `unbacked` plans as built.
+fn rejected_step(
+    buft: BufferType,
+    reject: Reject,
+    after: bool,
+    unbacked: bool,
+) -> (Vec<usize>, usize) {
     AS_BUILT.set(true);
-    let mut allocator = ComputeAllocator::new(buft).with_fresh_plans(false);
+    let mut allocator = rejecting(buft, unbacked);
     if after {
+        REJECT.set(Reject::Skip);
         let ctx = Context::new(64, 64);
         let large = step(&ctx, 8);
         ctx.alloc_graph(&large, allocator).unwrap();
         allocator = ctx.into_allocator().expect("its own allocator");
     }
+    REJECT.set(reject);
     let ctx = Context::new(64, 64);
     let small = step(&ctx, 2);
-    ctx.alloc_graph(&small, allocator.with_relayout(REJECTED))
+    ctx.alloc_graph(&small, allocator)
         .expect("allocated as built");
+    REJECT.set(Reject::Keep);
     let offsets = layout(&small);
     let size = ctx
         .into_allocator()
@@ -213,34 +270,130 @@ fn rejected_step(buft: BufferType, reject: Reject, after: bool) -> (Vec<usize>, 
 /// had as built, which is what the rewrite read the fused sums off: also where that was the
 /// previous graph's plan (a fresh plan of the graph alone lays it out otherwise), and where
 /// the plan as rewritten grew the allocator's buffer (the tensors keep their offsets in it).
+/// The same where the plan as built was out of the buffer (`unbacked`): the buffer then holds
+/// that layout too.
 #[test]
 fn undone_relayout_keeps_the_layout_as_built() {
     let buft = Backend::cpu().unwrap().buffer_type();
     let (reused, alone) = after_a_larger_step(buft, false);
     assert_ne!(reused, alone, "the test needs two layouts");
-    let (kept, size) = rejected_step(buft, Reject::Keep, true);
-    assert_eq!(kept, reused, "kept: the 8-row step's offsets");
-    let (grown, grown_size) = rejected_step(buft, Reject::Grow, true);
-    assert!(
-        grown_size > size,
-        "the buffer grew ({grown_size} vs {size})"
-    );
-    assert_eq!(grown, reused, "grown: the 8-row step's offsets");
-    let (alone_kept, _) = rejected_step(buft, Reject::Keep, false);
-    assert_eq!(alone_kept, alone);
+    for unbacked in [false, true] {
+        let (kept, size) = rejected_step(buft, Reject::Keep, true, unbacked);
+        assert_eq!(kept, reused, "kept: the 8-row step's offsets ({unbacked})");
+        let (grown, grown_size) = rejected_step(buft, Reject::Grow, true, unbacked);
+        assert!(
+            grown_size > size,
+            "the buffer grew ({grown_size} vs {size}, {unbacked})"
+        );
+        assert_eq!(
+            grown, reused,
+            "grown: the 8-row step's offsets ({unbacked})"
+        );
+        let (alone_kept, _) = rejected_step(buft, Reject::Keep, false, unbacked);
+        assert_eq!(alone_kept, alone, "{unbacked}");
+    }
 }
 
 /// Where planning the rewritten graph fails (its buffer cannot be allocated), the rewrite is
 /// undone and the graph allocated as built, in that layout: the graph's own plan, or the
-/// previous graph's (in a buffer allocated for it again, the failed plan freed the last).
+/// previous graph's (in a buffer allocated for it again, the failed plan freed the last). The
+/// same where the plan as built was out of the buffer (`unbacked`, whose plan as rewritten
+/// fails too: 16 PiB is more address space than there is).
 #[test]
 fn failed_relayout_plan_allocates_the_graph_as_built() {
     let buft = Backend::cpu().unwrap().buffer_type();
     let (reused, alone) = after_a_larger_step(buft, false);
-    let (failed_alone, _) = rejected_step(buft, Reject::Fail, false);
-    assert_eq!(failed_alone, alone);
-    let (failed_after, _) = rejected_step(buft, Reject::Fail, true);
-    assert_eq!(failed_after, reused);
+    for unbacked in [false, true] {
+        let (failed_alone, _) = rejected_step(buft, Reject::Fail, false, unbacked);
+        assert_eq!(failed_alone, alone, "{unbacked}");
+        let (failed_after, _) = rejected_step(buft, Reject::Fail, true, unbacked);
+        assert_eq!(failed_after, reused, "{unbacked}");
+    }
+}
+
+/// Steps of `rows` rows allocated in turn from one [`rejecting`] allocator, each rewritten as
+/// its [`Reject`] says: for each, the layout the rewrite read (as built) and the layout it runs
+/// in; and the allocator's buffer size after the last.
+fn steps(
+    buft: BufferType,
+    unbacked: bool,
+    plan: &[(i64, Reject)],
+) -> (Vec<(Vec<usize>, Vec<usize>)>, usize) {
+    AS_BUILT.set(true);
+    let mut allocator = rejecting(buft, unbacked);
+    let mut out = Vec::new();
+    for &(rows, reject) in plan {
+        REJECT.set(reject);
+        let ctx = Context::new(64, 64);
+        let g = step(&ctx, rows);
+        ctx.alloc_graph(&g, allocator).expect("allocated");
+        out.push((SEEN.take(), layout(&g)));
+        allocator = ctx.into_allocator().expect("its own allocator");
+    }
+    REJECT.set(Reject::Keep);
+    (out, allocator.buffer_size())
+}
+
+/// #1183: with the plan as built out of the buffer, a graph that runs as rewritten sizes the
+/// buffer by its plan as rewritten alone (what a new allocator gives the graph as rewritten),
+/// not by the bigger plan as built; the layouts, as built and as run, are the same.
+#[test]
+fn unbacked_plans_as_built_leave_the_buffer_to_the_plan_that_runs() {
+    let buft = Backend::cpu().unwrap().buffer_type();
+    let plan = [(8, Reject::Shrink)];
+    let (backed, backed_size) = steps(buft, false, &plan);
+    let (unbacked, unbacked_size) = steps(buft, true, &plan);
+    assert_eq!(backed, unbacked, "the same layouts");
+    assert!(
+        unbacked_size < backed_size,
+        "sized by the plan as rewritten ({unbacked_size} vs {backed_size})"
+    );
+    // The graph as rewritten (the rewrite holds), planned again by a new allocator.
+    REJECT.set(Reject::Shrink);
+    let ctx = Context::new(64, 64);
+    let g = step(&ctx, 8);
+    // SAFETY: a live graph, not allocated yet.
+    let tensors = unsafe { unplanned(g.raw()) };
+    ctx.alloc_graph(&g, rejecting(buft, true)).unwrap();
+    REJECT.set(Reject::Keep);
+    assert_eq!(ctx.allocator_size(), unbacked_size);
+    let own = ComputeAllocator::new(buft);
+    // SAFETY: allocated just now, nothing computed: its tensors planned again by `own` (they
+    // are not read before both are dropped).
+    unsafe { forget_plan(&tensors) };
+    assert!(own.plan(g.raw(), true));
+    assert_eq!(own.buffer_size(), unbacked_size);
+}
+
+/// #1183: the plan as built out of the buffer is the plan the allocator would have made: from
+/// the previous graph's plan where the graph fits it, as rewritten or as built, after rewrites
+/// held, skipped and undone (out of step with the allocator, then in step again).
+#[test]
+fn unbacked_plans_as_built_follow_the_allocators_plans() {
+    let buft = Backend::cpu().unwrap().buffer_type();
+    let (reused, _) = after_a_larger_step(buft, false);
+    let plans: [&[(i64, Reject)]; 4] = [
+        &[(8, Reject::Skip), (2, Reject::Shrink)],
+        &[
+            (8, Reject::Shrink),
+            (4, Reject::Shrink),
+            (2, Reject::Shrink),
+        ],
+        &[(8, Reject::Keep), (2, Reject::Shrink), (2, Reject::Shrink)],
+        &[
+            (8, Reject::Skip),
+            (8, Reject::Skip),
+            (2, Reject::Grow),
+            (2, Reject::Shrink),
+        ],
+    ];
+    for plan in plans {
+        let (backed, _) = steps(buft, false, plan);
+        let (unbacked, _) = steps(buft, true, plan);
+        assert_eq!(backed, unbacked, "{} steps", plan.len());
+    }
+    let (after_skip, _) = steps(buft, true, plans[0]);
+    assert_eq!(after_skip[1].0, reused, "read the 8-row step's offsets");
 }
 
 /// A rewrite undone that does not run as built (the fold's, on by default on CUDA) keeps the

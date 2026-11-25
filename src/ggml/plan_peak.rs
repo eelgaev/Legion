@@ -1,8 +1,9 @@
 //! Where a compute buffer's plan peaks (#1183): the tensors alive in the allocator's buffer at
 //! the node whose output ends highest in it, for each plan of a graph (as built, then as the
-//! relayout rewrote it: [`super::ComputeAllocator`] keeps the bigger buffer of the two). A load
-//! logs it for the prompt step whose buffers it reserves, so a log names the tensors that size
-//! those buffers. It only reads the plan: nothing it logs changes where tensors are or what runs.
+//! relayout rewrote it: ggml keeps the bigger buffer of the two, unless the plan as built was
+//! out of the buffer, "as built, unbacked": [`super::ComputeAllocator::headroom`]). A load logs
+//! it for the prompt step whose buffers it reserves, so a log names the tensors that size those
+//! buffers. It only reads the plan: nothing it logs changes where tensors are or what runs.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;

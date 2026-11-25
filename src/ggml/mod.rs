@@ -24,6 +24,7 @@ pub mod post_alloc;
 mod rows_at;
 pub mod stage_graph;
 mod uma_memory;
+mod unbacked;
 
 pub use backend::{
     Backend, BufferType, Device, DeviceKind, Event, LateInput, Launcher, backend_by_name,
