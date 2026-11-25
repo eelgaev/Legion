@@ -705,8 +705,9 @@ bool launch_gemm8_tma(const legion_fp8_mm8 & p, cudaStream_t st) {
         stagger.ctas = 2 * sm_count();
         stagger.ns   = (uint32_t) (GEMM8_STAGGER_NS_PER_K * p.k / stagger.ctas);
     } else if (p.variant & GEMM8_WIDE_STAGGER) {
-        // `legion fp8-gemm-bench` (#1183): one CTA an SM, the first wave spread over the same
-        // time, so the SMs' epilogues do not all write at once.
+        // #1183: one CTA an SM, the first wave spread over the same time, so the SMs'
+        // epilogues do not all write at once (GB10, Qwen3.8-Flash-Next at 12,288 / 8,067
+        // tokens: k 640 1.01-1.02x, k 6,144 1.02-1.05x).
         stagger.ctas = sm_count();
         stagger.ns   = (uint32_t) (GEMM8_STAGGER_NS_PER_K * p.k / stagger.ctas);
     }

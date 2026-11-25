@@ -18,8 +18,9 @@ pub struct Fp8GemmBenchArgs {
     /// Epilogue variants timed against the plain epilogue (1): 0 the pick without the TMA
     /// stores (the streaming route), 2 and 3 the streaming epilogue with one and two token tiles
     /// at a time, 256 the pick without the streaming route (LEGION_DEBUG_FP8_STREAM_EPI=0), 512
-    /// the staged epilogue (the TP send buffer's), 2048 the wide tile's TMA stores (the
-    /// default), 8192 the wide tile's staggered first wave, 10240 both; bits add up.
+    /// the staged epilogue (the TP send buffer's), 2048 the wide tile's TMA stores (the default
+    /// at k 1,025-4,095), 8192 the wide tile's staggered first wave (the default at k up to
+    /// 1,024), 10240 both (the default from k 4,096); bits add up.
     #[arg(long, value_delimiter = ',', default_values_t = [0, 3, 512, 2048, 8192])]
     variants: Vec<i32>,
     /// One per-tensor weight scale instead of one per output row.

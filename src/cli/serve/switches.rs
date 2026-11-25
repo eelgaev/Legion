@@ -431,10 +431,17 @@ pub(in crate::cli) struct SwitchArgs {
     /// CUDA, compute capability 12.x (GB10, consumer Blackwell), W8A8 FP8 prompt matmuls on the
     /// TMA-fed 256 x 128 tile without a residual (and the gated DeltaNet qkv GEMM with the conv
     /// in its epilogue): write the outputs from the MMA fragments, 4 bytes a lane, as before,
-    /// instead of staging them in shared memory and writing whole lines by TMA stores. The same
-    /// bits either way.
+    /// instead of staging them in shared memory and writing whole lines by TMA stores (by
+    /// default where the weight rows are longer than 1,024 bytes). The same bits either way.
     #[arg(long, help_heading = HEADING)]
     no_fp8_tma_store: bool,
+    /// CUDA, compute capability 12.x, W8A8 FP8 prompt matmuls on the TMA-fed 256 x 128 tile:
+    /// start every CTA of the first wave at once, as before. By default, where the weight rows
+    /// are at most 1,024 or at least 4,096 bytes long, the first wave's start is spread over
+    /// about one tile's time so the SMs' epilogues don't all write at once. The same bits either
+    /// way.
+    #[arg(long, help_heading = HEADING)]
+    no_fp8_wide_stagger: bool,
     /// As --no-fp8-tma-store, for the gated DeltaNet qkv GEMM with the conv in its epilogue
     /// only. The same bits either way.
     #[arg(long, help_heading = HEADING)]
@@ -1623,6 +1630,7 @@ impl SwitchArgs {
             fp8_sliced_k: self.fp8_sliced_k.then_some(true),
             fp8_tma_store: self.no_fp8_tma_store.then_some(false),
             fp8_conv_tma_store: self.no_fp8_conv_tma_store.then_some(false),
+            fp8_wide_stagger: self.no_fp8_wide_stagger.then_some(false),
             hopper_gemm: self.hopper_gemm.then_some(true),
             hopper_attn: self.hopper_attn.then_some(true),
             paged_prefill_qm: self.no_paged_prefill_qm.then_some(false),

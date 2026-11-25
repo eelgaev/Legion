@@ -54,8 +54,9 @@ template <class C> __host__ __device__ constexpr size_t gemm8_tma_smem() {
 constexpr int32_t GEMM8_STAGED = 0x200;
 // Bit 11 (#1183): the wide tile without a residual (8 warps, 256 x 128) stores its outputs by
 // TMA (gemm8_store_tma) instead of from the fragments; bit 12 the same in the qkv GEMM's conv
-// epilogue (fp8_gemm8_tma_conv); bit 13 (`legion fp8-gemm-bench` only) the wide tile's first
-// wave starts staggered as the 4-warp tile's does. Every value gives the same bits.
+// epilogue (fp8_gemm8_tma_conv); bit 13 the wide tile's first wave starts staggered as the
+// 4-warp tile's does. The default picks per row length are fp8.rs's default_gemm_variant. Every
+// value gives the same bits.
 constexpr int32_t GEMM8_TMA_STORE = 0x800;
 constexpr int32_t GEMM8_CONV_TMA_STORE = 0x1000;
 constexpr int32_t GEMM8_WIDE_STAGGER = 0x2000;

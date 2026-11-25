@@ -130,6 +130,46 @@ fn mm_node_finds_the_matmul_under_a_scale() {
     assert_eq!(params[P_SIDE], 0);
 }
 
+/// The default epilogue variant per row length (#1183): k up to 1,024 the staggered first wave
+/// alone, 1,025-4,095 the TMA stores alone, from 4,096 both; the conv epilogue's TMA stores
+/// whenever the TMA stores are on; the switches and the TP send buffer.
+#[test]
+fn default_gemm_variant_per_k() {
+    let all = (true, true, true, false);
+    for (k, want) in [
+        (640, 0x2000 | 0x1000),
+        (1024, 0x2000 | 0x1000),
+        (1152, 0x800 | 0x1000),
+        (2560, 0x800 | 0x1000),
+        (3968, 0x800 | 0x1000),
+        (4096, 0x2800 | 0x1000),
+        (6144, 0x2800 | 0x1000),
+        (17408, 0x2800 | 0x1000),
+    ] {
+        assert_eq!(default_gemm_variant(k, 0, all), want, "k {k}");
+        // The streaming route's off bit on top.
+        assert_eq!(default_gemm_variant(k, 0x100, all), want | 0x100, "k {k}");
+    }
+    // --no-fp8-tma-store: no TMA store anywhere, the stagger stays.
+    let no_tma = (false, true, true, false);
+    assert_eq!(default_gemm_variant(640, 0, no_tma), 0x2000);
+    assert_eq!(default_gemm_variant(2560, 0, no_tma), 0);
+    assert_eq!(default_gemm_variant(6144, 0, no_tma), 0x2000);
+    // --no-fp8-conv-tma-store.
+    let no_conv = (true, false, true, false);
+    assert_eq!(default_gemm_variant(2560, 0, no_conv), 0x800);
+    assert_eq!(default_gemm_variant(6144, 0, no_conv), 0x2800);
+    // --no-fp8-wide-stagger, and the TP send buffer (staged): no stagger.
+    for flags in [(true, true, false, false), (true, true, true, true)] {
+        assert_eq!(default_gemm_variant(640, 0, flags), 0x1000, "{flags:?}");
+        assert_eq!(default_gemm_variant(2560, 0, flags), 0x1800, "{flags:?}");
+        assert_eq!(default_gemm_variant(6144, 0, flags), 0x1800, "{flags:?}");
+    }
+    // All off: the old pick.
+    let off = (false, true, false, false);
+    assert_eq!(default_gemm_variant(6144, 0, off), 0);
+}
+
 /// Random E4M3 codes: any sign and mantissa, exponents 3 to 10 (no NaN).
 #[cfg(feature = "cuda")]
 fn e4m3_noise(len: usize, seed: u64) -> Vec<u8> {
@@ -227,7 +267,8 @@ fn gemm8_case(
     then(gpu, &graph, &outs);
 }
 
-/// The W8A8 prompt GEMM's TMA store epilogue (#1183, variant bit 0x800, the default) at
+/// The W8A8 prompt GEMM's TMA store epilogue (#1183, variant bit 0x800) and the default pick per
+/// row length ([`default_gemm_variant`]) at
 /// Qwen3.8-Flash-Next's dense shapes (GDN z and out, attention q+gate+k+v and out, the shared
 /// expert's gate+up and down; GDN qkv's GEMM alone) at 12,288 and 8,067 tokens and ragged token
 /// counts (partial token tiles, and the 128-row tile where the wide one makes too few waves),
