@@ -789,8 +789,10 @@ fn early_cast_case(early: bool, view: bool) -> (Vec<u8>, Vec<u8>, Counts) {
     let lo2 = ctx.scale(lo, 1.5);
     let res2 = ctx.scale(res, 0.5);
     let mixed = up_mix_rebuilt(&ctx, up, lo2, res2, sc, g, hc, 0.25);
+    // The mix is F32 `[e, n]` (the block input); the view is all of it as one row.
+    assert_eq!(mixed.ne(), [e, n, 1, 1]);
     let src = if view {
-        ctx.reshape_2d(mixed, k, n)
+        ctx.reshape_2d(mixed, e * n, 1)
     } else {
         mixed
     };
