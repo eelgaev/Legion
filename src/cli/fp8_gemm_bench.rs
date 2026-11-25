@@ -18,9 +18,9 @@ pub struct Fp8GemmBenchArgs {
     /// Epilogue variants timed against the plain epilogue (1): 0 the default pick (the
     /// streaming route), 2 and 3 the streaming epilogue with one and two token tiles at a time,
     /// 256 the pick without the streaming route (LEGION_DEBUG_FP8_STREAM_EPI=0); plus 1024 the
-    /// staged 16-byte stores in place of any of those where there is no residual (the shared
-    /// expert gate / up's epilogue: `--variants 0,1024 --shapes
-    /// 2560:1280:12288,2560:1280:8067`).
+    /// staged 16-byte stores in place of any of those where there is no residual and the GEMM
+    /// is not the TMA-fed one (the shared expert gate / up's epilogue: `--variants 0,1024
+    /// --shapes 2560:1280:8067`).
     #[arg(long, value_delimiter = ',', default_values_t = [0, 2, 3, 256])]
     variants: Vec<i32>,
     /// One per-tensor weight scale instead of one per output row.

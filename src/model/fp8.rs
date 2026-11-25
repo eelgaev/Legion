@@ -848,8 +848,8 @@ unsafe fn cuda_fp8_quant_dyn(
 pub(crate) const P_BY_EXCHANGE: usize = 2;
 
 /// The parameter of an [`FP8_MM8`] node without a residual that [`mark_wide_store`] sets: its
-/// GEMM's large-batch tiles store the F32 outputs 16 bytes a thread through shared memory
-/// ([`VARIANT_WIDE`]) while [`set_glu_wide_store`] is on.
+/// GEMM's cp.async large-batch tiles store the F32 outputs 16 bytes a thread through shared
+/// memory ([`VARIANT_WIDE`]) while [`set_glu_wide_store`] is on.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) const P_WIDE_STORE: usize = 3;
 
@@ -858,9 +858,11 @@ static GLU_WIDE_STORE: AtomicBool = AtomicBool::new(true);
 /// Whether the W8A8 GEMMs [`mark_wide_store`] marked (the shared expert's gate / up of a
 /// `--dense-fp8-prompt` prompt step, #1183) stage their F32 outputs through shared memory and
 /// store them 16 bytes a thread with plain stores (`gemm8_epilogue_staged`) instead of 4 bytes a
-/// thread from the MMA fragments: a quarter of the store instructions. The same values in the
-/// same places either way. On by default; `legion serve --no-fp8-glu-wide-store` turns it off
-/// for comparisons. Read at each launch.
+/// thread from the MMA fragments: a quarter of the store instructions. Only on the cp.async
+/// tiles (`fp8_gemm8`): on a GB10, the gate / up at 8,067 tokens (the 128-row tile) 1.18x;
+/// the TMA-fed 256-row tile (12,288 tokens) was 0.99x with it and keeps its own epilogue. The
+/// same values in the same places either way. On by default; `legion serve
+/// --no-fp8-glu-wide-store` turns it off for comparisons. Read at each launch.
 pub fn set_glu_wide_store(on: bool) {
     GLU_WIDE_STORE.store(on, Ordering::Relaxed);
 }
@@ -953,9 +955,9 @@ pub(crate) unsafe fn launch_cols(
 const VARIANT_STAGED: i32 = 0x200;
 
 /// `legion_fp8_mm8`'s variant bit for a node [`mark_wide_store`] marked, while
-/// [`set_glu_wide_store`] is on (`GEMM8_WIDE` in sm90/fp8_gemm8_tma.cuh, #1183): the large-batch
-/// tiles' staged 16-byte plain stores into device memory. `legion fp8-gemm-bench --variants`
-/// takes it (1024) too.
+/// [`set_glu_wide_store`] is on (`GEMM8_WIDE` in sm90/fp8_gemm8_tma.cuh, #1183): the cp.async
+/// large-batch tiles' staged 16-byte plain stores into device memory (the TMA-fed tile ignores
+/// it). `legion fp8-gemm-bench --variants` takes it (1024) too.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) const VARIANT_WIDE: i32 = 0x400;
 

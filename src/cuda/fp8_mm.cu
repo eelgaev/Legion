@@ -87,8 +87,9 @@ struct legion_fp8_mm8 {
     // pick (gemm8_epilogue_stream where routed), with bit 8 (LEGION_DEBUG_FP8_STREAM_EPI=0)
     // gemm8_epilogue everywhere; forced, for `legion fp8-gemm-bench`: 1 gemm8_epilogue, 2 / 3
     // gemm8_epilogue_stream with one / two token tiles at a time. Bit 9 (GEMM8_STAGED): mapped
-    // host memory, staged streaming stores; bit 10 (GEMM8_WIDE, #1183; fp8_gemm8 too): staged
-    // plain 16-byte stores, where there is no residual. Every value gives the same bits.
+    // host memory, staged streaming stores; bit 10 (GEMM8_WIDE, #1183; fp8_gemm8 only, not the
+    // TMA-fed tile): staged plain 16-byte stores, where there is no residual. Every value gives
+    // the same bits.
     int32_t variant;
 };
 int legion_fp8_quant_launch(const float * x, int64_t x_ld, uint8_t * out, int64_t k, int64_t n,
@@ -714,14 +715,11 @@ bool launch_gemm8_tma(const legion_fp8_mm8 & p, cudaStream_t st) {
 // 0.97x in one session and 1.07x in the other: not routed.
 constexpr int64_t GEMM8_STREAM_MIN_M = 2048;
 // Outputs into mapped host memory (GEMM8_STAGED, the TP send buffer) on the wide tile without
-// the residual: -1, gemm8_epilogue_staged with streaming stores; else GEMM8_WIDE (#1183, device
-// memory) there: -2, with plain stores.
+// the residual: -1, gemm8_epilogue_staged with streaming stores. GEMM8_WIDE (#1183) doesn't
+// change the epilogue here (fp8_gemm8's tiles only).
 template <bool RES, class C> int gemm8_stream_jg(const legion_fp8_mm8 & p) {
     if (!RES && C::WM == 4 && (p.variant & GEMM8_STAGED)) {
         return -1;
-    }
-    if (!RES && C::WM == 4 && (p.variant & GEMM8_WIDE)) {
-        return -2;
     }
     switch (p.variant & 0xff) {
         case 2: return 1;
@@ -737,11 +735,6 @@ template <bool RES, class C> bool launch_gemm8_tma_jg(const legion_fp8_mm8 & p, 
         case -1:
             if constexpr (!RES && C::WM == 4) {
                 return launch_gemm8_tma<RES, C, -1>(p, st);
-            }
-            return false;
-        case -2:
-            if constexpr (!RES && C::WM == 4) {
-                return launch_gemm8_tma<RES, C, -2>(p, st);
             }
             return false;
         case 1: return launch_gemm8_tma<RES, C, 1>(p, st);

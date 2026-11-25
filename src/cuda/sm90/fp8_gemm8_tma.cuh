@@ -46,8 +46,9 @@ template <class C> __host__ __device__ constexpr size_t gemm8_tma_smem() {
 constexpr int32_t GEMM8_STAGED = 0x200;
 // legion_fp8_mm8's variant bit 10 (#1183): a GEMM without a residual into device memory (the
 // shared expert's gate / up of --dense-fp8-prompt) through gemm8_epilogue_staged with plain
-// stores (the next op reads the rows from L2): fp8_gemm8_tma's 256-row tile and fp8_gemm8's
-// tiles. GEMM8_STAGED wins where both are set; other GEMMs ignore it. The same bits.
+// stores (the next op reads the rows from L2): fp8_gemm8's tiles only. fp8_gemm8_tma ignores
+// it: on the GB10 its 256-row tile was 0.99x with it (the gate / up at 12,288 tokens), where
+// fp8_gemm8's 128-row tile was 1.18x (8,067 tokens). The same bits.
 constexpr int32_t GEMM8_WIDE = 0x400;
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
@@ -162,8 +163,7 @@ __device__ __forceinline__ void gemm8_tma_sums(const legion_fp8_mm8 & p, const a
 // the first wave starts staggered (a8t::Stagger) over about one tile's time, and each tile's
 // residual prefetch is spread over its last steps (gemm8_res_prefetch).
 // JG (#1133 r25): 0 gemm8_epilogue, -1 gemm8_epilogue_staged with streaming stores (no
-// residual; mapped host memory), -2 the same with plain ones (#1183, GEMM8_WIDE), else
-// gemm8_epilogue_stream with JG token tiles at a time.
+// residual; mapped host memory), else gemm8_epilogue_stream with JG token tiles at a time.
 template <bool RES, class C, int JG = 0>
 __global__ void __launch_bounds__(32 * C::WARPS, 8 / C::WARPS)
     fp8_gemm8_tma(const legion_fp8_mm8 p, const __grid_constant__ a8t::Maps maps, const a8t::Stagger stagger) {
@@ -183,7 +183,7 @@ __global__ void __launch_bounds__(32 * C::WARPS, 8 / C::WARPS)
         // Every warp's reads of the stages are done (and every stage's copy landed: each was
         // waited for), so their memory takes the staged outputs.
         __syncthreads();
-        gemm8_epilogue_staged<C, JG == -1>(p, m0, n0, wm, wn, lane, acc, (float *) smem + warp * GEMM8_STAGE_FLOATS);
+        gemm8_epilogue_staged<C, true>(p, m0, n0, wm, wn, lane, acc, (float *) smem + warp * GEMM8_STAGE_FLOATS);
     } else if constexpr (JG == 0) {
         gemm8_epilogue<RES, C>(p, m0, n0, wm, wn, lane, acc);
     } else {

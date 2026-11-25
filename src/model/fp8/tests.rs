@@ -302,11 +302,12 @@ fn wide_graph<'a>(
 
 /// The shared expert gate / up GEMM's staged 16-byte stores (#1183, [`set_glu_wide_store`])
 /// keep every output bit against the fragments' own stores, at Qwen3.8-Flash-Next's shapes (k
-/// 2560, 640 gate + 640 up rows) at 12,288 tokens (the 256-row TMA tile on a GB10) and 8,067
-/// (too few waves: the 128-row tile), and at shapes that take the other tiles and tails: 200
-/// tokens (128-row tile, one partial token tile), k 2496 (the 256-row tile of four 64-byte
-/// stages), 1,000 rows (a partial row tile, rows not a multiple of 64), with per-row and
-/// per-tensor weight scales. The outputs are filled with a pattern before each run, so a value
+/// 2560, 640 gate + 640 up rows) at 8,067 tokens (too few waves for the 256-row tile: the
+/// 128-row tile) and 12,288 (on a GB10 the TMA-fed 256-row tile, which ignores the switch: a
+/// no-op there; elsewhere fp8_gemm8's 256-row tile), and at shapes that take the other tiles
+/// and tails: 200 tokens (128-row tile, one partial token tile), k 2496 (fp8_gemm8's 256-row
+/// tile of four 64-byte stages), 1,000 rows (a partial row tile, rows not a multiple of 64),
+/// with per-row and per-tensor weight scales. The outputs are filled with a pattern before each run, so a value
 /// the staged epilogue leaves out shows; the SwiGLU's codes read from them match too.
 /// `cargo test --release --features cuda --lib -- --ignored
 /// cuda_fp8_glu_wide_store_keeps_bits --nocapture`.

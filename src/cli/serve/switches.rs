@@ -430,8 +430,9 @@ pub(in crate::cli) struct SwitchArgs {
     fp8_sliced_k: bool,
     /// CUDA, compute capability 8.9+, --dense-fp8-prompt: the shared expert's gate / up W8A8 GEMM
     /// of prompt steps stores its F32 outputs straight from the MMA fragments, 4 bytes a thread
-    /// (the default: staged through shared memory and stored 16 bytes a thread, whole runs of
-    /// each token's rows). The same bits either way. For comparisons.
+    /// (the default on its cp.async tiles, e.g. 8,067-token steps on a GB10: staged through
+    /// shared memory and stored 16 bytes a thread, whole runs of each token's rows; the TMA-fed
+    /// tile always stores from the fragments). The same bits either way. For comparisons.
     #[arg(long, help_heading = HEADING)]
     no_fp8_glu_wide_store: bool,
     /// CUDA, compute capability 9.0 only (H100, H200, GH200) with a binary built for sm_90a
