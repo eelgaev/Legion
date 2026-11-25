@@ -1,4 +1,5 @@
-use super::{Span, covered, peak};
+use super::{Span, covered, peak, spans};
+use crate::ggml::{Backend, ComputeAllocator, Context, types};
 
 fn span(first: usize, last: usize, start: usize, end: usize) -> Span {
     Span {
@@ -61,4 +62,34 @@ fn covered_counts_overlaps_once() {
         span(1, 2, 300, 300),
     ];
     assert_eq!(covered(spans.into_iter()), 250);
+}
+
+/// A tensor stays alive to the graph's end where ggml never frees it: one an unread output
+/// view shares (not itself an output), and an unread node; a tensor read is alive to its last
+/// reader.
+#[test]
+fn spans_keep_what_ggml_never_frees() {
+    let buft = Backend::cpu().unwrap().buffer_type();
+    let ctx = Context::new(64, 64);
+    let x = ctx.new_tensor(types::F32, &[64]).as_input();
+    let a = ctx.scale(x, 2.0); // node 0
+    let view = ctx.view_1d(a, 32, 0).as_output(); // node 1: the last read of `a`
+    let b = ctx.scale(x, 3.0); // node 2
+    let c = ctx.add(b, b); // node 3: no node reads it
+    let mut graph = ctx.new_graph(16);
+    graph.expand(view);
+    graph.expand(c);
+    ctx.alloc_graph(&graph, ComputeAllocator::new(buft))
+        .unwrap();
+    // SAFETY: an allocated graph and its node.
+    let (buffers, spans) = unsafe { spans(graph.raw(), &[a.raw()]) };
+    assert_eq!(buffers.len(), 1);
+    let last = |t: crate::ggml::Tensor<'_>| {
+        (spans.iter())
+            .find(|s| s.1 == t.raw())
+            .map(|s| (s.2.first, s.2.last))
+    };
+    assert_eq!(last(a), Some((0, 4)), "the output view keeps it");
+    assert_eq!(last(b), Some((2, 3)), "read last by node 3");
+    assert_eq!(last(c), Some((3, 4)), "never read: never freed");
 }

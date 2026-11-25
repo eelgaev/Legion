@@ -1756,6 +1756,12 @@ impl Shadow {
         let ok = unsafe { ffi::ggml_gallocr_reserve(self.raw.as_ptr(), raw) };
         self.synced.set(ok);
     }
+
+    /// Bytes the shadow's plans need ([`ComputeAllocator::buffer_size`] of the shadow).
+    fn buffer_size(&self) -> usize {
+        // SAFETY: the shadow's own allocator.
+        unsafe { ffi::ggml_gallocr_get_buffer_size(self.raw.as_ptr(), 0) }
+    }
 }
 
 /// The tensors of `graph` an allocation gives memory: its nodes, their sources and its leafs
@@ -2077,13 +2083,13 @@ impl ComputeAllocator {
             None => self.plan(raw, self.fresh),
         };
         if ok && let Some(placed) = &report {
-            let plan = if unbacked {
-                "as built, unbacked"
-            } else {
-                "as built"
+            // The bytes of the allocator that planned it: the shadow's, for a plan out of it.
+            let (plan, buffer) = match shadow.filter(|_| unbacked) {
+                Some(s) => ("as built, unbacked", s.buffer_size()),
+                None => ("as built", self.buffer_size()),
             };
             // SAFETY: allocated just now; `placed` are its tensors.
-            unsafe { super::plan_peak::log(raw, placed, plan, self.buffer_size()) };
+            unsafe { super::plan_peak::log(raw, placed, plan, buffer) };
         }
         let mut rewritten = false;
         if ok && let Some((r, cuda)) = relayout {
@@ -2106,15 +2112,18 @@ impl ComputeAllocator {
                         s.plan_afresh(raw);
                     }
                     ok = self.plan(raw, true);
+                    // Undone, it runs as built: no plan as rewritten to log.
                     if relaid.as_built() {
                         if !(ok && relaid.holds(raw)) {
                             relaid.undo(raw);
+                            rewritten = false;
                             forget_plan(unplanned);
                             self.out_of_step();
                             ok = self.as_built(raw, unplanned, &built);
                         }
                     } else if ok && !relaid.holds(raw) {
                         relaid.undo(raw);
+                        rewritten = false;
                         forget_plan(unplanned);
                         self.out_of_step();
                         ok = self.plan(raw, true);

@@ -36,7 +36,8 @@ pub(super) fn reporting() -> bool {
 pub(crate) struct Span {
     /// The node making it (0 for a tensor the graph's nodes only read: an input).
     pub first: usize,
-    /// The last node reading it (or a view of it); the graph's node count for an output.
+    /// The last node reading it (or a view of it); the graph's node count for one ggml never
+    /// frees (an output, or one an unread node is or views: [`spans`]).
     pub last: usize,
     /// Its bytes in the buffer, `start..end`.
     pub start: usize,
@@ -119,17 +120,21 @@ unsafe fn label(t: *mut ffi::ggml_tensor, bytes: usize) -> String {
     }
 }
 
-/// Logs where the plan of `graph` (`plan`: which one), allocated just now, peaks in the
-/// buffers holding `placed` (the tensors the plan gave memory: nodes and inputs without memory
-/// before it), `buffer` the allocator's bytes now.
+/// The tensors with memory in the buffers holding `placed` (see [`log`]) and their spans, in
+/// `graph` (allocated): with those buffers, in the order first met. A tensor is alive from the
+/// node making it to the last node reading it or a view of it, or to the graph's end (its node
+/// count) where ggml's allocator never frees it: an output, or a tensor that a node no node
+/// reads is or views (an output view, say; not a `GGML_OP_NONE` view, which ggml does not
+/// count).
 ///
 /// # Safety
 /// `graph` is a live, allocated graph; `placed` its tensors.
-pub(super) unsafe fn log(
+unsafe fn spans(
     graph: *mut ffi::ggml_cgraph,
     placed: &[*mut ffi::ggml_tensor],
-    plan: &str,
-    buffer: usize,
+) -> (
+    Vec<ffi::ggml_backend_buffer_t>,
+    Vec<(ffi::ggml_backend_buffer_t, *mut ffi::ggml_tensor, Span)>,
 ) {
     // SAFETY: the caller's; nodes, their sources and leafs are valid tensors.
     unsafe {
@@ -147,6 +152,7 @@ pub(super) unsafe fn log(
         // The last node reading each tensor (by its root).
         let mut last: HashMap<usize, usize> = HashMap::new();
         let mut made: HashMap<usize, usize> = HashMap::new();
+        let mut read: HashSet<usize> = HashSet::new();
         for (i, &t) in nodes.iter().enumerate() {
             made.entry(t as usize).or_insert(i);
             if !(*t).view_src.is_null() {
@@ -154,8 +160,18 @@ pub(super) unsafe fn log(
             }
             for &s in (*t).src.iter().filter(|s| !s.is_null()) {
                 last.insert(root(s) as usize, i);
+                read.insert(s as usize);
             }
         }
+        // Kept to the end: ggml frees a tensor once its readers and its views' readers have
+        // run, so never one that a node no node reads is or views.
+        let unread_roots: HashSet<usize> = (nodes.iter())
+            .filter(|&&t| {
+                !read.contains(&(t as usize))
+                    && ((*t).view_src.is_null() || (*t).op != ffi::ggml_op_GGML_OP_NONE)
+            })
+            .map(|&t| root(t) as usize)
+            .collect();
         let mut seen: HashSet<usize> = HashSet::new();
         let mut spans: Vec<(ffi::ggml_backend_buffer_t, *mut ffi::ggml_tensor, Span)> = Vec::new();
         let all = nodes
@@ -173,15 +189,36 @@ pub(super) unsafe fn log(
             let start = (*t).data as usize - ffi::ggml_backend_buffer_get_base(b) as usize;
             let first = made.get(&(t as usize)).copied().unwrap_or(0);
             let output = (*t).flags & ffi::ggml_tensor_flag_GGML_TENSOR_FLAG_OUTPUT as i32 != 0;
+            let kept = output || unread_roots.contains(&(t as usize));
             let read = last.get(&(t as usize)).copied().unwrap_or(first);
             let span = Span {
                 first,
-                last: if output { n } else { read.max(first) },
+                last: if kept { n } else { read.max(first) },
                 start,
                 end: start + ffi::ggml_backend_buffer_get_alloc_size(b, t),
             };
             spans.push((b, t, span));
         }
+        (buffers, spans)
+    }
+}
+
+/// Logs where the plan of `graph` (`plan`: which one), allocated just now, peaks in the
+/// buffers holding `placed` (the tensors the plan gave memory: nodes and inputs without memory
+/// before it), `buffer` the bytes of the allocator that made the plan.
+///
+/// # Safety
+/// `graph` is a live, allocated graph; `placed` its tensors.
+pub(super) unsafe fn log(
+    graph: *mut ffi::ggml_cgraph,
+    placed: &[*mut ffi::ggml_tensor],
+    plan: &str,
+    buffer: usize,
+) {
+    // SAFETY: the caller's; nodes, their sources and leafs are valid tensors.
+    unsafe {
+        let n = ffi::ggml_graph_n_nodes(graph).max(0) as usize;
+        let (buffers, spans) = spans(graph, placed);
         for (k, &b) in buffers.iter().enumerate() {
             let mine: Vec<(*mut ffi::ggml_tensor, Span)> = (spans.iter())
                 .filter(|s| s.0 == b)
