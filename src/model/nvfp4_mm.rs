@@ -107,6 +107,15 @@ pub fn set_expert_tile_prefetch(on: bool) {
     EXPERT_TILE_PREFETCH.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+static DOWN_X_PREFETCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether the routed experts' down projection GEMM of prompt steps ([`GEMM_DOWN`]) prefetches
+/// its activation rows into L2 ([`DOWN_XPF`], #1183). L2 hints only: the same bits either way.
+/// On by default; `legion serve --no-nvfp4-down-x-prefetch` turns it off for comparisons.
+pub fn set_down_x_prefetch(on: bool) {
+    DOWN_X_PREFETCH.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 static PAD_SKIP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Whether a routed SwiGLU FFN on the grouped mv kernels ([`swiglu_id_rows`] with a row map,
@@ -1508,6 +1517,30 @@ pub fn grouped_gemm_tune(k: i64, n_expert: i64, mi: i32, nt: i32, glu: bool) -> 
     }
 }
 
+/// How many token tiles ahead [`DOWN_XPF`] prefetches: about the token tiles a GB10's 48 SMs
+/// run at once in [`GEMM_DOWN`]'s two CTAs each (96 CTAs over the 10 row tiles of a 2,560-row
+/// down projection), so the rows land in L2 about one wave before their CTAs start.
+pub const DOWN_XPF_AHEAD: i32 = 10;
+
+/// `legion_nvfp4_mm::xpf` of the down projection's grouped GEMM ([`GEMM_DOWN`], #1183): each
+/// tile prefetches its own activation rows into L2 with its weights (bit 0), and row tile 0
+/// the rows of the tile [`DOWN_XPF_AHEAD`] ahead. The tile's copies read each activation row
+/// 128 bytes a step from scattered rows (the pairs of one expert), with one stage ahead, so
+/// without the prefetch every step waits for DRAM. L2 hints only: the same sums.
+pub const DOWN_XPF: i32 = 1 | DOWN_XPF_AHEAD << 1;
+
+/// The activation prefetch (`legion_nvfp4_mm::xpf`) of a grouped GEMM's launch, as
+/// [`grouped_gemm_tune`] picks its variant: [`DOWN_XPF`] for the down projection's
+/// [`GEMM_DOWN`] tile (unless [`set_down_x_prefetch`] turned it off), 0 (none) otherwise.
+pub fn grouped_gemm_xpf(k: i64, n_expert: i64, mi: i32, nt: i32, glu: bool) -> i32 {
+    let down = !glu && grouped_gemm_tune(k, n_expert, mi, nt, glu) == GEMM_DOWN;
+    if down && DOWN_X_PREFETCH.load(std::sync::atomic::Ordering::Relaxed) {
+        DOWN_XPF
+    } else {
+        0
+    }
+}
+
 /// Four stages, one CTA per SM: the grouped SwiGLU GEMM's tile of 64 tokens at up to
 /// [`MV_MAX_N`] pairs per expert (the GEMM there only under [`set_expert_mv_max`]).
 pub const GEMM_GLU_SHORT: GemmTune = GemmTune {
@@ -1566,6 +1599,7 @@ mod cuda {
         sel_lo: i32,
         sel_hi: i32,
         unread_skips: i32,
+        xpf: i32,
     }
 
     /// `Params::sel_lo`, `sel_hi` for every expert.
@@ -1671,6 +1705,12 @@ mod cuda {
             _ => rows,
         };
         p.tiles_m = ((p.m + rows - 1) / rows) as i32;
+        p.xpf = forced_xpf().unwrap_or(match kernel {
+            Kernel::Gemm { mi, nt } if !p.plan.is_null() => {
+                grouped_gemm_xpf(p.k, p.n_expert as i64, mi, nt, false)
+            }
+            _ => 0,
+        });
         // SAFETY: parameters checked by the callers; the node's stream.
         let code = unsafe {
             match kernel {
@@ -1704,6 +1744,16 @@ mod cuda {
 
     fn forced_pf() -> i32 {
         FORCED_PF.load(Ordering::Relaxed) as i32
+    }
+
+    /// [`super::force_gemm_xpf`]'s activation prefetch plus one (0: none forced).
+    pub(super) static FORCED_XPF: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn forced_xpf() -> Option<i32> {
+        match FORCED_XPF.load(Ordering::Relaxed) {
+            0 => None,
+            v => Some(v as i32 - 1),
+        }
     }
 
     /// [`super::force_gemm_l1`]'s copies plus one (0: none forced).
@@ -1781,6 +1831,7 @@ mod cuda {
             sel_lo: ALL.0,
             sel_hi: ALL.1,
             unread_skips: 0,
+            xpf: 0,
         };
         launch(&mut p, kernel, stream)
     }
@@ -1830,6 +1881,7 @@ mod cuda {
             sel_lo: ALL.0,
             sel_hi: ALL.1,
             unread_skips: 0,
+            xpf: forced_xpf().unwrap_or(0),
         };
         // SAFETY: parameters checked above; the node's stream.
         let code = unsafe {
@@ -1969,6 +2021,7 @@ mod cuda {
             sel_lo: ALL.0,
             sel_hi: split.map_or(ALL.1, |(cut, _)| cut),
             unread_skips: unread(dst) as i32,
+            xpf: 0,
         };
         if let Some(t) = forced_tiles() {
             p.tiles_n = p.tiles_n.min(t);
@@ -2156,6 +2209,7 @@ mod cuda {
             sel_lo: ALL.0,
             sel_hi: split.unwrap_or(ALL.1),
             unread_skips: unread(dst) as i32,
+            xpf: forced_xpf().unwrap_or(0),
         };
         if let Some(cut) = split {
             // The experts of more than `cut` pairs on the GEMM first, so the grouped SwiGLU mv
@@ -2260,6 +2314,21 @@ pub fn force_gemm_pf(pf: i32) {
     cuda::FORCED_PF.store(bit as u64, std::sync::atomic::Ordering::Relaxed);
     #[cfg(not(feature = "cuda"))]
     let _ = bit;
+}
+
+/// Launches every NVFP4 GEMM (`nvfp4_gemm`: dense, grouped and the grouped SwiGLU's) from now
+/// on with the activation prefetch `xpf` (`legion_nvfp4_mm::xpf`: bit 0 each tile's own rows,
+/// `xpf >> 1` tiles ahead for the grouped ones; 0 none; see [`DOWN_XPF`]); `None`: the
+/// defaults ([`grouped_gemm_xpf`]). For tests and benches (#1183); the same bits either way.
+#[doc(hidden)]
+pub fn force_gemm_xpf(xpf: Option<i32>) {
+    #[cfg(feature = "cuda")]
+    cuda::FORCED_XPF.store(
+        xpf.map_or(0, |v| v.max(0) as u64 + 1),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    #[cfg(not(feature = "cuda"))]
+    let _ = xpf;
 }
 
 /// `nvfp4_gemm`'s `DIAG_CAW`: the weight copies through L1 (`cp.async.ca`).

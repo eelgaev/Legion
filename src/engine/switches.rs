@@ -185,6 +185,9 @@ pub struct Switches {
     /// The routed experts' decode mvs prefetching whole row tiles into L2
     /// ([`crate::model::nvfp4_mm::set_expert_tile_prefetch`]).
     pub nvfp4_expert_tile_prefetch: Option<bool>,
+    /// The routed experts' prompt-step down GEMM prefetching its activation rows into L2
+    /// ([`crate::model::nvfp4_mm::set_down_x_prefetch`]).
+    pub nvfp4_down_x_prefetch: Option<bool>,
     /// The most pairs per routed expert on the grouped mv kernel, more on the grouped GEMM
     /// ([`crate::model::nvfp4_mm::set_expert_mv_max`]).
     pub nvfp4_expert_mv_max: Option<i64>,
@@ -667,6 +670,10 @@ impl Switches {
         set(
             self.nvfp4_expert_tile_prefetch,
             crate::model::nvfp4_mm::set_expert_tile_prefetch,
+        );
+        set(
+            self.nvfp4_down_x_prefetch,
+            crate::model::nvfp4_mm::set_down_x_prefetch,
         );
         if let Some(n) = self.nvfp4_expert_mv_max {
             crate::model::nvfp4_mm::set_expert_mv_max(n);

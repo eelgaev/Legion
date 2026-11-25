@@ -814,3 +814,469 @@ fn unread_skips_only_on_marked_expert_chains() {
         assert!(!unread(&*node(on_rows)));
     }
 }
+
+/// Expert ids `[n_used, n_tok]` in which expert `e` has `counts[e]` pairs: the pairs laid out
+/// one expert after another, slot by slot (slot `s` of token `t` is the `s * n_tok + t`-th), so
+/// no token picks an expert twice while no count is above `n_tok`.
+fn counted_routing(counts: &[usize], n_used: usize, n_tok: usize) -> Vec<i32> {
+    assert_eq!(counts.iter().sum::<usize>(), n_used * n_tok, "pairs");
+    assert!(
+        counts.iter().all(|&c| c <= n_tok),
+        "a count above the tokens"
+    );
+    let flat: Vec<i32> = counts
+        .iter()
+        .enumerate()
+        .flat_map(|(e, &c)| std::iter::repeat_n(e as i32, c))
+        .collect();
+    let mut ids = vec![0; n_used * n_tok];
+    for t in 0..n_tok {
+        for s in 0..n_used {
+            ids[t * n_used + s] = flat[s * n_tok + t];
+        }
+    }
+    ids
+}
+
+/// Per-expert pair counts of `n_used * n_tok` pairs over `n_expert` experts: the `special`
+/// counts on experts spread over the range, the rest in small counts (1-12) on the others.
+fn spread_counts(special: &[usize], n_expert: usize, n_used: usize, n_tok: usize) -> Vec<usize> {
+    let mut counts = vec![0; n_expert];
+    let mut spare: Vec<usize> = (0..n_expert).collect();
+    for (i, &c) in special.iter().enumerate() {
+        let e = i * 37 % n_expert;
+        counts[e] = c;
+        spare.retain(|&s| s != e);
+    }
+    let mut left = n_used * n_tok - special.iter().sum::<usize>();
+    let fill = [3, 5, 9, 1, 12, 7];
+    let mut i = 0;
+    while left > 0 {
+        let e = spare[i % spare.len()];
+        let c = fill[i % fill.len()].min(left).min(n_tok - counts[e]);
+        counts[e] += c;
+        left -= c;
+        i += 1;
+    }
+    counts
+}
+
+/// The bit test's routings (#1183): experts of 1, 15, 16, 17, 64 and more pairs (each count's
+/// last token tile partial at 8, 16, 32, 64 and 128 tokens) give each expert its count, and no
+/// token an expert twice.
+#[test]
+fn counted_routing_gives_each_expert_its_pairs() {
+    let special = [
+        1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 200, 300,
+    ];
+    let (n_expert, n_used, n_tok) = (512, 10, 400);
+    let counts = spread_counts(&special, n_expert, n_used, n_tok);
+    let ids = counted_routing(&counts, n_used, n_tok);
+    let mut got = vec![0; n_expert];
+    for row in ids.chunks_exact(n_used) {
+        let mut seen = row.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), n_used, "a token picks an expert twice: {row:?}");
+        for &e in row {
+            got[e as usize] += 1;
+        }
+    }
+    assert_eq!(got, counts);
+    for (i, &c) in special.iter().enumerate() {
+        assert_eq!(counts[i * 37 % n_expert], c);
+    }
+}
+
+/// The activation prefetch (#1183) is the down projection's grouped GEMM tile's only: not the
+/// SwiGLU's, not a down projection of narrow k or few experts.
+#[test]
+fn down_x_prefetch_only_on_the_down_gemm() {
+    assert_eq!(DOWN_XPF, 21);
+    assert_eq!(DOWN_XPF >> 1, DOWN_XPF_AHEAD);
+    // Qwen3.8-Flash-Next's down projection (k 640, 512 experts) at prompt steps.
+    assert_eq!(grouped_gemm_xpf(640, 512, 2, 8, false), DOWN_XPF);
+    // Other tiles and the SwiGLU GEMM: none.
+    assert_eq!(grouped_gemm_xpf(640, 512, 2, 16, false), 0);
+    assert_eq!(grouped_gemm_xpf(640, 512, 1, 8, false), 0);
+    assert_eq!(grouped_gemm_xpf(2560, 512, 2, 16, true), 0);
+    assert_eq!(grouped_gemm_xpf(2560, 512, 2, 8, true), 0);
+    // Not a wide down projection's shape.
+    assert_eq!(grouped_gemm_xpf(2560, 512, 2, 8, false), 0);
+    assert_eq!(grouped_gemm_xpf(640, 64, 2, 8, false), 0);
+}
+
+/// The CUDA tests of the activation prefetch share the process-wide kernel overrides.
+#[cfg(feature = "cuda")]
+static XPF_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(feature = "cuda")]
+fn xpf_gpu() -> crate::ggml::Backend {
+    use crate::ggml::{DeviceKind, device_by_kind};
+    device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU device")
+        .init()
+        .unwrap()
+}
+
+/// Every override the activation prefetch tests set, back at its default.
+#[cfg(feature = "cuda")]
+fn xpf_reset() {
+    force_kernel(None);
+    force_gemm_tune(None, None);
+    force_gemm_xpf(None);
+    set_expert_mv_max(MV_MAX_N);
+}
+
+/// Random BF16 values (bits) of `n` elements.
+#[cfg(feature = "cuda")]
+fn xpf_bf16(n: usize, seed: u64) -> Vec<u8> {
+    let mut rng = gemm_bench::Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+    (0..n)
+        .flat_map(|_| bf16_bits(rng.value()).to_le_bytes())
+        .collect()
+}
+
+/// One bit test case: a routed SwiGLU FFN of `n_expert` NVFP4 experts (`hidden` by `ffn`),
+/// `n_used` per token, the routing `ids`; the down projection's input of `n_x` rows a token.
+#[cfg(feature = "cuda")]
+struct XpfCase {
+    name: &'static str,
+    hidden: usize,
+    ffn: usize,
+    n_expert: usize,
+    n_used: usize,
+    n_x: usize,
+    ids: Vec<i32>,
+}
+
+/// The activation prefetches the bit test compares with none (0): own rows only, tiles ahead
+/// only, both, the default, and a distance past every routed pair.
+#[cfg(feature = "cuda")]
+const XPF_CHECKED: [i32; 6] = [1, 2, 3, 9, DOWN_XPF, 1 | 1000 << 1];
+
+/// Runs `graph` under every activation prefetch of [`XPF_CHECKED`] (and the default) and checks
+/// that its outputs `outs` are the bits of the run without one.
+#[cfg(feature = "cuda")]
+fn xpf_check(
+    gpu: &mut crate::ggml::Backend,
+    graph: &crate::ggml::Graph<'_>,
+    outs: &[Tensor<'_>],
+    what: &str,
+) {
+    let read = |outs: &[Tensor<'_>]| -> Vec<Vec<u8>> { outs.iter().map(|o| o.bytes()).collect() };
+    force_gemm_xpf(Some(0));
+    gpu.compute(graph).unwrap();
+    let want = read(outs);
+    for xpf in XPF_CHECKED.map(Some).into_iter().chain([None]) {
+        force_gemm_xpf(xpf);
+        gpu.compute(graph).unwrap();
+        for (i, (got, want)) in read(outs).iter().zip(&want).enumerate() {
+            assert_eq!(got.len(), want.len());
+            let differ = got.iter().zip(want).filter(|(a, b)| a != b).count();
+            assert_eq!(
+                differ, 0,
+                "{what}, output {i}, xpf {xpf:?}: {differ} bytes differ"
+            );
+        }
+    }
+    force_gemm_xpf(None);
+}
+
+/// The down projection (F32 and BF16 rows) and the SwiGLU GEMM of `case` on `gpu`, each tile
+/// shape the grouped GEMM has, with and without the activation prefetch: the same bits.
+#[cfg(feature = "cuda")]
+fn xpf_case(gpu: &mut crate::ggml::Backend, case: &XpfCase) {
+    use crate::ggml::ComputeAllocator;
+    let (hidden, ffn, n_expert, n_used) = (case.hidden, case.ffn, case.n_expert, case.n_used);
+    let n_tok = case.ids.len() / n_used;
+    let blocks = |k: usize, m: usize| k / 64 * 36 * m * n_expert;
+    let weights = Context::new(8, 0);
+    let wd = weights.new_tensor(types::NVFP4, &[ffn as i64, hidden as i64, n_expert as i64]);
+    let wg = weights.new_tensor(types::NVFP4, &[hidden as i64, ffn as i64, n_expert as i64]);
+    let wu = weights.new_tensor(types::NVFP4, &[hidden as i64, ffn as i64, n_expert as i64]);
+    let scales = [0, 1, 2].map(|_| weights.new_tensor(types::F32, &[n_expert as i64]));
+    weights.alloc_tensors(gpu.buffer_type()).unwrap();
+    wd.set_bytes(&gemm_bench::weights(blocks(ffn, hidden), 3));
+    wg.set_bytes(&gemm_bench::weights(blocks(hidden, ffn), 4));
+    wu.set_bytes(&gemm_bench::weights(blocks(hidden, ffn), 5));
+    for (i, s) in scales.iter().enumerate() {
+        let v: Vec<f32> = (0..n_expert)
+            .map(|e| 0.002 + ((e * 7 + i * 3) % 1000) as f32 * 1e-5)
+            .collect();
+        s.set_f32(&v);
+    }
+    // The down projection, F32 and BF16 rows in one graph.
+    let ctx = Context::new(16, 32);
+    let xd = ctx
+        .new_tensor(types::BF16, &[ffn as i64, case.n_x as i64, n_tok as i64])
+        .as_input();
+    let id = ctx
+        .new_tensor(types::I32, &[n_used as i64, n_tok as i64])
+        .as_input();
+    let down_f32 = mul_mat_id_act(&ctx, wd, xd, id, Some(scales[0]), Act::None).as_output();
+    let down_bf16 = mul_mat_id_act(&ctx, wd, xd, id, Some(scales[0]), Act::Bf16).as_output();
+    let mut down = ctx.new_graph(32);
+    down.expand(down_f32);
+    down.expand(down_bf16);
+    ctx.alloc_graph(&down, ComputeAllocator::new(gpu.buffer_type()))
+        .unwrap();
+    xd.set_bytes(&xpf_bf16(ffn * case.n_x * n_tok, 9));
+    id.set_i32(&case.ids);
+    // The grouped GEMM's tiles (the default down tile first) and the default choice.
+    for kernel in [
+        Some(Kernel::Gemm { mi: 2, nt: 8 }),
+        Some(Kernel::Gemm { mi: 2, nt: 16 }),
+        Some(Kernel::Gemm { mi: 1, nt: 8 }),
+        Some(Kernel::Gemm { mi: 1, nt: 4 }),
+        None,
+    ] {
+        force_kernel(kernel);
+        let what = format!("{} down {kernel:?}", case.name);
+        xpf_check(gpu, &down, &[down_f32, down_bf16], &what);
+    }
+    force_kernel(None);
+    // The SwiGLU GEMM at its 64- and 128-token tiles, every expert on the GEMM.
+    let ctx = Context::new(16, 16);
+    let xg = ctx
+        .new_tensor(types::BF16, &[hidden as i64, 1, n_tok as i64])
+        .as_input();
+    let id = ctx
+        .new_tensor(types::I32, &[n_used as i64, n_tok as i64])
+        .as_input();
+    let glu = swiglu_id(&ctx, wg, wu, xg, id, Some(scales[1]), Some(scales[2])).as_output();
+    let mut swiglu = ctx.new_graph(16);
+    swiglu.expand(glu);
+    ctx.alloc_graph(&swiglu, ComputeAllocator::new(gpu.buffer_type()))
+        .unwrap();
+    xg.set_bytes(&xpf_bf16(hidden * n_tok, 11));
+    id.set_i32(&case.ids);
+    set_expert_mv_max(0);
+    for nt in [8, 16] {
+        force_gemm_tune(None, Some(nt));
+        xpf_check(
+            gpu,
+            &swiglu,
+            &[glu],
+            &format!("{} swiglu nt {nt}", case.name),
+        );
+    }
+    xpf_reset();
+}
+
+/// The activation prefetch (#1183) keeps every grouped GEMM's bits: the down projection (F32
+/// and BF16 rows, every tile shape) and the SwiGLU GEMM, with and without it, own rows and tiles
+/// ahead, over hand-made and random routings (experts of 1, 15, 16, 17, 64 and more pairs, last
+/// tiles partial at every tile width; a down projection of 320 rows: a partial row tile).
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_down_x_prefetch_keeps_bits() {
+    let _lock = XPF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut gpu = xpf_gpu();
+    let special = [
+        1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 200, 300,
+    ];
+    let small = [1, 15, 16, 17, 64, 65, 130];
+    let cases = [
+        // Qwen3.8-Flash-Next's routed experts (hidden 2560, 640 per expert, 512, top 10).
+        XpfCase {
+            name: "flash-next counted",
+            hidden: 2560,
+            ffn: 640,
+            n_expert: 512,
+            n_used: 10,
+            n_x: 10,
+            ids: counted_routing(&spread_counts(&special, 512, 10, 400), 10, 400),
+        },
+        XpfCase {
+            name: "flash-next random 512",
+            hidden: 2560,
+            ffn: 640,
+            n_expert: 512,
+            n_used: 10,
+            n_x: 10,
+            ids: gemm_bench::routing(10, 1500, 512, 512, 7),
+        },
+        XpfCase {
+            name: "flash-next random 64",
+            hidden: 2560,
+            ffn: 640,
+            n_expert: 512,
+            n_used: 10,
+            n_x: 10,
+            ids: gemm_bench::routing(10, 700, 512, 64, 8),
+        },
+        // A small shape: 320 output rows (a partial row tile), one input row per token.
+        XpfCase {
+            name: "small shared x",
+            hidden: 320,
+            ffn: 256,
+            n_expert: 24,
+            n_used: 4,
+            n_x: 1,
+            ids: counted_routing(&spread_counts(&small, 24, 4, 200), 4, 200),
+        },
+        XpfCase {
+            name: "small",
+            hidden: 320,
+            ffn: 256,
+            n_expert: 24,
+            n_used: 4,
+            n_x: 4,
+            ids: counted_routing(&spread_counts(&small, 24, 4, 200), 4, 200),
+        },
+    ];
+    for case in &cases {
+        xpf_case(&mut gpu, case);
+        eprintln!("{}: the same bits", case.name);
+    }
+}
+
+/// The down projection's grouped GEMM (Qwen3.8-Flash-Next, 512 experts, top 10, BF16 rows as
+/// `--nvfp4-expert-rows-bf16`) at 12,288- and 8,067-token prompt steps without (old) and with
+/// the activation prefetch (#1183), and the SwiGLU GEMM's at the same steps: microseconds a
+/// layer (best of the rounds), the bytes moved a second, and whether the bits are the old ones.
+/// `cargo test --release --features cuda --lib -- --ignored cuda_down_x_prefetch_bench
+/// --nocapture`.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU; a benchmark"]
+fn cuda_down_x_prefetch_bench() {
+    use crate::ggml::ComputeAllocator;
+    let _lock = XPF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut gpu = xpf_gpu();
+    let (hidden, ffn, n_expert, n_used) = (2560usize, 640usize, 512usize, 10usize);
+    const LAYERS: usize = 4;
+    const ROUNDS: usize = 5;
+    let blocks = |k: usize, m: usize| k / 64 * 36 * m * n_expert;
+    let weights = Context::new(8, 0);
+    let wd = weights.new_tensor(types::NVFP4, &[ffn as i64, hidden as i64, n_expert as i64]);
+    let wg = weights.new_tensor(types::NVFP4, &[hidden as i64, ffn as i64, n_expert as i64]);
+    let wu = weights.new_tensor(types::NVFP4, &[hidden as i64, ffn as i64, n_expert as i64]);
+    let scales = [0, 1, 2].map(|_| weights.new_tensor(types::F32, &[n_expert as i64]));
+    weights.alloc_tensors(gpu.buffer_type()).unwrap();
+    wd.set_bytes(&gemm_bench::weights(blocks(ffn, hidden), 3));
+    wg.set_bytes(&gemm_bench::weights(blocks(hidden, ffn), 4));
+    wu.set_bytes(&gemm_bench::weights(blocks(hidden, ffn), 5));
+    for s in scales {
+        s.set_f32(&vec![0.004; n_expert]);
+    }
+    let down_xpfs: [(&str, i32); 7] = [
+        ("old (none)", 0),
+        ("own rows", 1),
+        ("own + 1 ahead", 3),
+        ("own + 4 ahead", 9),
+        ("default (own + 10 ahead)", DOWN_XPF),
+        ("own + 20 ahead", 1 | 20 << 1),
+        ("10 ahead only", 10 << 1),
+    ];
+    let glu_xpfs: [(&str, i32); 4] = [
+        ("old (none, the default)", 0),
+        ("own rows", 1),
+        ("own + 1 ahead", 3),
+        ("own + 10 ahead", DOWN_XPF),
+    ];
+    for n_tok in [12288usize, 8067] {
+        for glu in [false, true] {
+            let ctx = Context::new(16 + 24 * LAYERS, 16 * LAYERS + 16);
+            let (k, x_rows) = if glu { (hidden, 1) } else { (ffn, n_used) };
+            let x = ctx
+                .new_tensor(types::BF16, &[k as i64, x_rows as i64, n_tok as i64])
+                .as_input();
+            let ids: Vec<_> = (0..LAYERS)
+                .map(|_| {
+                    ctx.new_tensor(types::I32, &[n_used as i64, n_tok as i64])
+                        .as_input()
+                })
+                .collect();
+            let mut graph = ctx.new_graph(16 * LAYERS + 16);
+            let outs: Vec<_> = ids
+                .iter()
+                .map(|&id| {
+                    let y = if glu {
+                        swiglu_id(&ctx, wg, wu, x, id, Some(scales[1]), Some(scales[2]))
+                    } else {
+                        mul_mat_id_act(&ctx, wd, x, id, Some(scales[0]), Act::Bf16)
+                    }
+                    .as_output();
+                    graph.expand(y);
+                    y
+                })
+                .collect();
+            ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+                .unwrap();
+            x.set_bytes(&xpf_bf16(k * x_rows * n_tok, 5 + n_tok as u64));
+            for (l, id) in ids.iter().enumerate() {
+                id.set_i32(&gemm_bench::routing(
+                    n_used,
+                    n_tok,
+                    n_expert,
+                    n_expert,
+                    1 + l as u64,
+                ));
+            }
+            let variants: &[(&str, i32)] = if glu { &glu_xpfs } else { &down_xpfs };
+            // A warm-up run of each (its bits against the old one's), then the rounds, the
+            // variants taking turns.
+            let mut want = Vec::new();
+            let mut same = vec![true; variants.len()];
+            for (vi, &(_, xpf)) in variants.iter().enumerate() {
+                force_gemm_xpf(Some(xpf));
+                gpu.compute(&graph).unwrap();
+                let got: Vec<Vec<u8>> = outs.iter().map(|o| o.bytes()).collect();
+                if vi == 0 {
+                    want = got;
+                } else {
+                    same[vi] = got == want;
+                }
+            }
+            let mut best = vec![f64::MAX; variants.len()];
+            for _ in 0..ROUNDS {
+                for (vi, &(_, xpf)) in variants.iter().enumerate() {
+                    force_gemm_xpf(Some(xpf));
+                    let t = std::time::Instant::now();
+                    gpu.compute(&graph).unwrap();
+                    best[vi] = best[vi].min(t.elapsed().as_secs_f64() / LAYERS as f64);
+                }
+            }
+            force_gemm_xpf(None);
+            // Bytes a layer: every expert's weights, each pair's input row and output row.
+            let pairs = (n_used * n_tok) as f64;
+            let (w_bytes, x_bytes, out_bytes) = if glu {
+                (
+                    2.0 * blocks(hidden, ffn) as f64,
+                    (n_tok * hidden * 2) as f64,
+                    pairs * ffn as f64 * 2.0,
+                )
+            } else {
+                (
+                    blocks(ffn, hidden) as f64,
+                    pairs * ffn as f64 * 2.0,
+                    pairs * hidden as f64 * 2.0,
+                )
+            };
+            let bytes = w_bytes + x_bytes + out_bytes;
+            let op = if glu { "swiglu" } else { "down (bf16 rows)" };
+            eprintln!(
+                "{op} at {n_tok} tokens ({:.0} MB a layer: {:.0} weights, {:.0} in, {:.0} out)",
+                bytes / 1e6,
+                w_bytes / 1e6,
+                x_bytes / 1e6,
+                out_bytes / 1e6
+            );
+            for (vi, &(name, xpf)) in variants.iter().enumerate() {
+                eprintln!(
+                    "  {name:<26} xpf {xpf:>3}: {:>8.1} us/layer  {:>5.3}x old  {:>6.1} GB/s  {}",
+                    best[vi] * 1e6,
+                    best[0] / best[vi],
+                    bytes / best[vi] / 1e9,
+                    if same[vi] { "same bits" } else { "BITS DIFFER" }
+                );
+            }
+            assert!(same.iter().all(|&s| s), "{op} at {n_tok}: bits differ");
+        }
+    }
+    xpf_reset();
+}

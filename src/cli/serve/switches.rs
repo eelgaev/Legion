@@ -488,6 +488,13 @@ pub(in crate::cli) struct SwitchArgs {
     /// ~3% faster expert FFNs). The same bits either way. For comparisons.
     #[arg(long, help_heading = HEADING)]
     no_nvfp4_expert_tile_prefetch: bool,
+    /// CUDA, NVFP4 routed experts on Legion's W4A16 kernels, prompt steps on the grouped GEMM:
+    /// the down projection's tiles do not prefetch their activation rows into L2 (the default:
+    /// each tile prefetches its own rows with its weights, and the tiles of the first row tile
+    /// those of the tile ten ahead, so the copies of a step stop waiting for scattered rows from
+    /// DRAM). The same bits either way. For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_nvfp4_down_x_prefetch: bool,
     /// CUDA, NVFP4 routed experts on Legion's W4A16 kernels: matmuls of up to this many (token,
     /// expert) pairs per used expert (if the routing were even) take the grouped mv kernel,
     /// more the grouped GEMM. Default 32: prompt steps of up to ~1,600 tokens on
@@ -1584,6 +1591,7 @@ impl SwitchArgs {
             nvfp4_wide_mv: self.nvfp4_wide_mv.then_some(true),
             nvfp4_expert_pdl: self.no_nvfp4_expert_pdl.then_some(false),
             nvfp4_expert_tile_prefetch: self.no_nvfp4_expert_tile_prefetch.then_some(false),
+            nvfp4_down_x_prefetch: self.no_nvfp4_down_x_prefetch.then_some(false),
             nvfp4_expert_mv_max: self.nvfp4_expert_mv_max.map(i64::from),
             nvfp4_expert_mv_tile: self.nvfp4_expert_mv_tile.map(i32::from),
             nvfp4_expert_mv_split: self.nvfp4_expert_mv_split,

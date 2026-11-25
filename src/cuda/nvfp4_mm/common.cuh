@@ -85,6 +85,11 @@ struct legion_nvfp4_mm {
     // zeros stored, because nothing reads their rows (the down matmul skips them, and the MoE
     // tail of --tp-moe-ep does not read rows of zero router weights). 0: zeros, as before.
     int32_t unread_skips;
+    // nvfp4_gemm's activation L2 prefetch (#1183; L2 hints only, the same sums; sm_90+). Bit 0:
+    // each tile's token rows in runs of the weights' prefetch (PF blocks), next to them. Above
+    // bit 0 (grouped): the CTAs of row tile 0 also prefetch the whole rows of the BN plan pairs
+    // xpf >> 1 token tiles past their own. 0: no activation prefetch, as before.
+    int32_t xpf;
 };
 
 // The GEMM: tiles_m * tiles_n CTAs of 256 threads; mi = 1 or 2 (128 * mi rows), nt = 1, 2, 4,
@@ -371,7 +376,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) nvfp4_gemm(const legion_nvfp
     constexpr int BM_OUT = GLU ? BM / 2 : BM;  // output rows per tile
     extern __shared__ __align__(16) unsigned char smem[];
     __shared__ int64_t x_off[GROUPED ? BN : 1], d_off[GROUPED ? BN : 1];
-    __shared__ int32_t tile_expert, tile_tokens;
+    __shared__ int32_t tile_expert, tile_tokens, tile_first;
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
 
     int64_t m0, n0 = 0, n_tok;
@@ -429,6 +434,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) nvfp4_gemm(const legion_nvfp
                 if (lane == 0) {
                     tile_expert = e;
                     tile_tokens = count;
+                    tile_first = first;
                 }
                 for (int i = lane; i < count; i += 32) {
                     const int q = p.plan[p.n_expert + 1 + first + i];  // token * n_used + slot
@@ -518,6 +524,17 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) nvfp4_gemm(const legion_nvfp
                 asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(a16),
                              "r"((uint32_t) ((e - a16 + 15) & ~(uintptr_t) 15)));
             }
+        }
+        // p.xpf bit 0 (#1183): the tile's token rows over the same steps. Without it each step's
+        // copies read 128 bytes of every token row, scattered rows (a grouped tile's pairs) the
+        // stage ahead has to wait for from DRAM; with it the first step waits and the rest find
+        // L2. The rows are 16-byte aligned (x_ld % 8 == 0) and BK * 2 bytes a step.
+        if (!(DIAG & DIAG_NOX) && (p.xpf & 1) && threadIdx.x < n_tok && step < steps) {
+            const int t = threadIdx.x;
+            const int64_t off = GROUPED ? x_off[t] : (n0 + t) * p.x_ld;
+            const uintptr_t a = (uintptr_t) (p.x + off + step * BK);
+            const uint32_t bytes = (uint32_t) (min((int64_t) PF, steps - step) * BK * 2);
+            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(a), "r"(bytes));
         }
 #endif
     };
@@ -627,6 +644,26 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) nvfp4_gemm(const legion_nvfp
         }
         asm volatile("cp.async.commit_group;\n" ::);
     }
+#if __CUDA_ARCH__ >= 900
+    // p.xpf >> 1 = A above 0 (#1183, grouped): the CTA of row tile 0 prefetches the whole rows of
+    // the BN pairs A tiles past its own first pair in the plan, the tile (about) A ahead in
+    // launch order, so its CTAs' first steps find their rows in L2 too. Only row tile 0: the
+    // other row tiles of a token tile read the same rows. Here, after the first stages' copies,
+    // so the plan reads it depends on overlap them. Past the routed pairs: nothing.
+    if constexpr (GROUPED) {
+        const int ahead = p.xpf >> 1;
+        if (!(DIAG & DIAG_NOX) && ahead > 0 && blockIdx.x % p.tiles_m == 0 && threadIdx.x < BN && steps > 0) {
+            const int64_t pos = (int64_t) tile_first + (int64_t) ahead * BN + threadIdx.x;
+            if (pos < p.plan[p.n_expert]) {
+                const int q = p.plan[p.n_expert + 1 + pos];
+                const int t = q / p.n_used, slot = q % p.n_used;
+                const uintptr_t a = (uintptr_t) (p.x + ((int64_t) t * p.n_x + (p.n_x == 1 ? 0 : slot)) * p.x_ld);
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(a),
+                             "r"((uint32_t) (steps * BK * 2)));
+            }
+        }
+    }
+#endif
     for (int64_t step = 0; step < steps; step++) {
         asm volatile("cp.async.wait_group %0;\n" ::"n"(ST - 2));
         __syncthreads();

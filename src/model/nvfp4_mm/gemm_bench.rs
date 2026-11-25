@@ -407,10 +407,10 @@ pub struct Row {
     pub hash: u64,
 }
 
-struct Rng(u64);
+pub(super) struct Rng(pub(super) u64);
 
 impl Rng {
-    fn next(&mut self) -> u64 {
+    pub(super) fn next(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
@@ -418,13 +418,13 @@ impl Rng {
     }
 
     /// Uniform in [-2, 2).
-    fn value(&mut self) -> f32 {
+    pub(super) fn value(&mut self) -> f32 {
         ((self.next() >> 40) as f32 / (1u64 << 24) as f32) * 4.0 - 2.0
     }
 }
 
 /// Random NVFP4 blocks: sub-block scales of moderate size, codes uniform.
-fn weights(bytes: usize, seed: u64) -> Vec<u8> {
+pub(super) fn weights(bytes: usize, seed: u64) -> Vec<u8> {
     let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
     let mut out = Vec::with_capacity(bytes);
     while out.len() < bytes {
@@ -441,7 +441,13 @@ fn weights(bytes: usize, seed: u64) -> Vec<u8> {
 }
 
 /// Each token's `n_used` distinct experts from a random pool of `pool`.
-fn routing(n_used: usize, n_tok: usize, n_expert: usize, pool: usize, seed: u64) -> Vec<i32> {
+pub(super) fn routing(
+    n_used: usize,
+    n_tok: usize,
+    n_expert: usize,
+    pool: usize,
+    seed: u64,
+) -> Vec<i32> {
     let mut rng = Rng(seed.wrapping_mul(0x2545_f491_4f6c_dd1d) | 1);
     let mut all: Vec<i32> = (0..n_expert as i32).collect();
     for i in 0..pool.min(n_expert) {
