@@ -1038,7 +1038,8 @@ fn e4m3_noise(n: usize, seed: u64) -> Vec<u8> {
 /// `row_scales`, else one) of `n` tokens of `k` features, and the conv reading its output
 /// ([`conv_silu_norm`] with `norm`, else [`conv_silu`]) with a non-zero state, on `gpu`; where
 /// `fuse`, the conv allowed into the GEMM ([`allow_gemm`]) and the graph rewritten by the node
-/// fusion (#1183): (the conv's output, its next state, convs the rewrite fused).
+/// fusion (#1183): (the conv's output, its next state, convs the rewrite fused). `then` gets the
+/// graph after its run (the microbenchmark times it).
 #[cfg(feature = "cuda")]
 fn conv_gemm_case(
     gpu: &mut Backend,
@@ -1047,6 +1048,7 @@ fn conv_gemm_case(
     n: i64,
     (norm, row_scales): (bool, bool),
     fuse: bool,
+    then: &mut dyn FnMut(&mut Backend, &crate::ggml::Graph<'_>),
 ) -> (Vec<f32>, Vec<f32>, usize) {
     let (head_k, n_k, head_v, n_v) = heads;
     let m = 2 * head_k * n_k + head_v * n_v;
@@ -1091,7 +1093,9 @@ fn conv_gemm_case(
     state.set_f32(&noise((3 * m) as usize, 24));
     cw.set_f32(&noise((4 * m) as usize, 25));
     gpu.compute(&graph).unwrap();
-    (out.to_f32(), hist.to_f32(), fused)
+    let got = (out.to_f32(), hist.to_f32(), fused);
+    then(gpu, &graph);
+    got
 }
 
 /// The FP8 qkv GEMM running the conv in its epilogue (#1183) against the two kernels, bit for
@@ -1112,6 +1116,9 @@ fn cuda_conv_in_qkv_gemm_is_bit_identical() {
         .expect("no GPU device")
         .init()
         .unwrap();
+    let _lock = crate::model::fp8::VARIANT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     conv_test::ANY_WAVES.store(true, Ordering::Relaxed);
     let heads = (128, 16, 128, 48);
     let mut cases: Vec<(i64, (bool, bool))> = [12288, 8067, 1, 3, 127, 129, 4993]
@@ -1125,9 +1132,11 @@ fn cuda_conv_in_qkv_gemm_is_bit_identical() {
     ]);
     for (n, how) in cases {
         let what = format!("{n} tokens, norm and row scales {how:?}");
-        let (plain, plain_hist, _) = conv_gemm_case(&mut gpu, heads, 2560, n, how, false);
+        let (plain, plain_hist, _) =
+            conv_gemm_case(&mut gpu, heads, 2560, n, how, false, &mut |_, _| {});
         let before = conv_test::LAUNCHES.load(Ordering::Relaxed);
-        let (out, hist, fused) = conv_gemm_case(&mut gpu, heads, 2560, n, how, true);
+        let (out, hist, fused) =
+            conv_gemm_case(&mut gpu, heads, 2560, n, how, true, &mut |_, _| {});
         let launched = conv_test::LAUNCHES.load(Ordering::Relaxed) - before;
         assert_eq!(fused, 1, "{what}: the rewrite fused the conv");
         assert_eq!(
@@ -1139,13 +1148,160 @@ fn cuda_conv_in_qkv_gemm_is_bit_identical() {
     }
 }
 
+/// The FP8 qkv GEMM with the conv in its epilogue storing its outputs by TMA (#1183, variant
+/// bit 0x1000, the default) against its fragments' stores (variant 0) and against the two
+/// kernels on the plain epilogue (variant 1, no TMA stores), bit for bit: Qwen3.8-Flash-Next's
+/// shapes at 12,288 and 8,067 tokens and ragged counts (partial tiles: the last tile's tokens
+/// past the step, the halo of every tile but the first), with the norm and without.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a compute capability 12.x GPU"]
+fn cuda_conv_tma_store_is_bit_identical() {
+    use crate::ggml::{DeviceKind, device_by_kind};
+    use crate::model::fp8::{conv_test, force_gemm_variant, unforce_gemm_variant};
+    use std::sync::atomic::Ordering;
+    let mut gpu = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU device")
+        .init()
+        .unwrap();
+    let _lock = crate::model::fp8::VARIANT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    conv_test::ANY_WAVES.store(true, Ordering::Relaxed);
+    let heads = (128, 16, 128, 48);
+    let cases: [(i64, (bool, bool)); 6] = [
+        (12288, (true, true)),
+        (8067, (true, true)),
+        (129, (true, true)),
+        (4993, (true, true)),
+        (4993, (false, true)),
+        (241, (false, false)),
+    ];
+    for (n, how) in cases {
+        let what = format!("{n} tokens, norm and row scales {how:?}");
+        let mut run = |variant: Option<i32>, fuse: bool| {
+            match variant {
+                Some(v) => force_gemm_variant(v),
+                None => unforce_gemm_variant(),
+            }
+            let before = conv_test::LAUNCHES.load(Ordering::Relaxed);
+            let (out, hist, _) =
+                conv_gemm_case(&mut gpu, heads, 2560, n, how, fuse, &mut |_, _| {});
+            let launched = conv_test::LAUNCHES.load(Ordering::Relaxed) - before;
+            unforce_gemm_variant();
+            (out, hist, launched)
+        };
+        let (want, want_hist, _) = run(Some(1), false);
+        let (old, old_hist, old_launched) = run(Some(0), true);
+        let (tma, tma_hist, tma_launched) = run(None, true);
+        let (tma2, tma2_hist, _) = run(Some(0x1800), true);
+        assert_eq!(
+            (old_launched, tma_launched),
+            (1, 1),
+            "{what}: fused kernel launches"
+        );
+        assert_bits(
+            vec![
+                (old, want.clone()),
+                (old_hist, want_hist.clone()),
+                (tma, want.clone()),
+                (tma_hist, want_hist.clone()),
+                (tma2, want),
+                (tma2_hist, want_hist),
+            ],
+            &what,
+        );
+    }
+}
+
+/// `cargo test --release --features cuda -- --ignored --nocapture cuda_conv_tma_store_microbench`
+/// (#1183): the fused qkv GEMM + conv at Qwen3.8-Flash-Next's shapes (k 2,560, 10,240 rows,
+/// with the q and k heads' norm) at 12,288 and 8,067 tokens, its fragments' stores (variant 0)
+/// against the TMA stores (0x1800) and against the two kernels with the TMA store GEMM
+/// (0x800): 5 rounds taking turns (forward and reverse order alternately), the medians.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "microbenchmark, needs a compute capability 12.x GPU"]
+fn cuda_conv_tma_store_microbench() {
+    use crate::ggml::{DeviceKind, device_by_kind};
+    let mut gpu = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU device")
+        .init()
+        .unwrap();
+    let _lock = crate::model::fp8::VARIANT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    /// A warm-up run of `graph` with variant `v`, then 5 timed ones into `into` (ms).
+    fn time(gpu: &mut Backend, graph: &crate::ggml::Graph<'_>, v: i32, into: &mut Vec<f64>) {
+        crate::model::fp8::force_gemm_variant(v);
+        gpu.compute(graph).unwrap();
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            gpu.compute(graph).unwrap();
+            into.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        crate::model::fp8::unforce_gemm_variant();
+    }
+    let heads = (128, 16, 128, 48);
+    const ROUNDS: usize = 5;
+    eprintln!("{ROUNDS} rounds, the order alternates forward/reverse");
+    for n in [12288i64, 8067] {
+        // Variant 0 and 0x1800 on the fused graph; 0x800 on the two kernels' graph.
+        let mut fused_ms: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+        let mut split_ms: Vec<f64> = Vec::new();
+        // The rounds take turns between the graphs, each graph's variants in turn; odd rounds
+        // run everything in reverse order (the two kernels first, then 0x1800 before 0).
+        for round in 0..ROUNDS {
+            let rev = round % 2 == 1;
+            let mut fused = |gpu: &mut Backend| {
+                conv_gemm_case(gpu, heads, 2560, n, (true, true), true, &mut |gpu, g| {
+                    let [old, new] = &mut fused_ms;
+                    for _ in 0..2 {
+                        if rev {
+                            time(gpu, g, 0x1800, new);
+                            time(gpu, g, 0, old);
+                        } else {
+                            time(gpu, g, 0, old);
+                            time(gpu, g, 0x1800, new);
+                        }
+                    }
+                })
+            };
+            let mut split = |gpu: &mut Backend| {
+                conv_gemm_case(gpu, heads, 2560, n, (true, true), false, &mut |gpu, g| {
+                    time(gpu, g, 0x800, &mut split_ms);
+                })
+            };
+            if rev {
+                split(&mut gpu);
+                fused(&mut gpu);
+            } else {
+                fused(&mut gpu);
+                split(&mut gpu);
+            }
+        }
+        let med = |xs: &mut Vec<f64>| {
+            xs.sort_by(f64::total_cmp);
+            xs[xs.len() / 2]
+        };
+        let (old, new) = (med(&mut fused_ms[0]), med(&mut fused_ms[1]));
+        let split = med(&mut split_ms);
+        eprintln!(
+            "qkv+conv k 2560 m 10240 n {n}: fragments {old:.3} ms, TMA stores {new:.3} ms ({:.3}x), two kernels (TMA store GEMM) {split:.3} ms",
+            old / new
+        );
+    }
+}
+
 /// The node fusion leaves a conv the graph's builder did not allow ([`allow_gemm`]) as it was.
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "needs a GPU"]
 fn cuda_conv_not_allowed_stays() {
     use crate::ggml::{DeviceKind, device_by_kind};
-    let mut gpu = device_by_kind(DeviceKind::Gpu)
+    let gpu = device_by_kind(DeviceKind::Gpu)
         .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
         .expect("no GPU device")
         .init()

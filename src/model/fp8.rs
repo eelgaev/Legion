@@ -711,15 +711,41 @@ unsafe fn cuda_fp8_mm(
     launch(stream)
 }
 
-/// A TMA-fed W8A8 GEMM epilogue forced by [`force_gemm_variant`]; 0 is none.
-#[cfg(feature = "cuda")]
-static FORCED_GEMM_VARIANT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+/// Whether the TMA-fed W8A8 prefill GEMMs store their outputs by TMA ([`set_tma_store`]).
+static TMA_STORE: AtomicBool = AtomicBool::new(true);
+/// Whether the qkv GEMM with the conv in its epilogue does ([`set_conv_tma_store`]).
+static CONV_TMA_STORE: AtomicBool = AtomicBool::new(true);
 
-/// Launches every TMA-fed W8A8 prefill GEMM from now on with epilogue `variant`
-/// (`legion_fp8_mm8`'s `variant`: 1 the plain epilogue, 2 and 3 the streaming one with one or
-/// two token tiles at a time, 0x100 the pick without the streaming route; plus [`VARIANT_WIDE`],
-/// 0x400, the staged 16-byte stores where there is no residual, also on the 128-row tile), or
-/// the default choice for 0: for `legion fp8-gemm-bench`.
+/// Whether the TMA-fed W8A8 prefill GEMMs on the 256 x 128 tile without a residual (and the
+/// gated DeltaNet's qkv GEMM with the conv in its epilogue) write their F32 outputs by TMA stores
+/// from shared memory (#1183: whole 128-byte lines, a 64 x 16 piece a store, instead of 4 bytes
+/// a lane from the MMA fragments) from now on, where [`default_gemm_variant`] picks them (rows of
+/// more than 1,024 bytes; `legion serve --no-fp8-tma-store` turns them off). On by default: the
+/// same values at the same places, so the same bits.
+pub fn set_tma_store(on: bool) {
+    TMA_STORE.store(on, Ordering::Relaxed);
+}
+
+/// Whether the gated DeltaNet's qkv GEMM with the conv in its epilogue writes its outputs by
+/// TMA stores ([`set_tma_store`], which turns both off) from now on
+/// (`legion serve --no-fp8-conv-tma-store` turns this one off). On by default: the same bits.
+pub fn set_conv_tma_store(on: bool) {
+    CONV_TMA_STORE.store(on, Ordering::Relaxed);
+}
+
+/// A TMA-fed W8A8 GEMM epilogue forced by [`force_gemm_variant`]; `i32::MIN` is none.
+#[cfg(feature = "cuda")]
+static FORCED_GEMM_VARIANT: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(i32::MIN);
+
+/// Launches every TMA-fed W8A8 prefill GEMM from now on with epilogue `variant` exactly
+/// (`legion_fp8_mm8`'s `variant`: 0 the pick without the TMA stores, 1 the plain epilogue, 2 and
+/// 3 the streaming one with one or two token tiles at a time, 0x100 the pick without the
+/// streaming route, 0x400 ([`VARIANT_WIDE`]) the staged 16-byte stores of the cp.async tiles
+/// without a residual, 0x800 the TMA stores of the wide tile, 0x1000 those of the conv
+/// epilogue, 0x2000 the wide tile's staggered first wave), until [`unforce_gemm_variant`]: for
+/// `legion fp8-gemm-bench` and the tests. A node [`mark_wide_store`] marked adds
+/// [`VARIANT_WIDE`] on top while [`set_glu_wide_store`] is on.
 #[doc(hidden)]
 pub fn force_gemm_variant(variant: i32) {
     #[cfg(feature = "cuda")]
@@ -728,20 +754,84 @@ pub fn force_gemm_variant(variant: i32) {
     let _ = variant;
 }
 
-/// The TMA-fed W8A8 GEMM's epilogue variant: a forced one, else 0x100 under
-/// `LEGION_DEBUG_FP8_STREAM_EPI=0` (no GEMM takes #1133 r25's streaming epilogue), else 0
-/// (the default: the routed GEMMs take it).
+/// The default choice of epilogue again ([`force_gemm_variant`]).
+#[doc(hidden)]
+pub fn unforce_gemm_variant() {
+    #[cfg(feature = "cuda")]
+    FORCED_GEMM_VARIANT.store(i32::MIN, Ordering::Relaxed);
+}
+
+/// Whether the wide tile's first wave starts staggered ([`set_wide_stagger`]).
+static WIDE_STAGGER: AtomicBool = AtomicBool::new(true);
+
+/// Whether the TMA-fed W8A8 prefill GEMMs on the 256 x 128 tile (one CTA an SM) start their
+/// first wave staggered over about one tile's time, as the 4-warp tile does, so the SMs'
+/// epilogues do not all write at once, from now on ([`default_gemm_variant`]; not on the TP
+/// send buffer's GEMMs; `legion serve --no-fp8-wide-stagger` turns it off). On by default: only
+/// the start times change, so the same bits.
+pub fn set_wide_stagger(on: bool) {
+    WIDE_STAGGER.store(on, Ordering::Relaxed);
+}
+
+/// The default epilogue variant of a TMA-fed W8A8 GEMM over rows of `k` bytes (#1183, GB10,
+/// Qwen3.8-Flash-Next's shapes at 12,288 and 8,067 tokens against the fragments' stores): the
+/// staggered first wave (with `stagger`) everywhere, with the TMA stores (with `tma`) above
+/// k 1,024 (k 2,560: 1.00-1.05x, k 6,144: 1.03-1.05x; the TMA store at k 640: 0.78-0.94x); the
+/// conv epilogue's TMA stores with `tma` and `conv` (1.015x); `env` (bit 0x100 or 0) on top. No
+/// stagger where the outputs go to the TP send buffer (`staged`: not measured).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn default_gemm_variant(
+    k: i64,
+    env: i32,
+    (tma, conv, stagger, staged): (bool, bool, bool, bool),
+) -> i32 {
+    let stagger = (stagger && !staged) as i32 * VARIANT_WIDE_STAGGER;
+    let store = (tma && k > 1024) as i32 * VARIANT_TMA_STORE;
+    env | stagger | store | ((tma && conv) as i32 * VARIANT_CONV_TMA_STORE)
+}
+
+/// The TMA-fed W8A8 GEMM's epilogue variant for rows of `k` bytes: a forced one, else
+/// [`default_gemm_variant`] with 0x100 under `LEGION_DEBUG_FP8_STREAM_EPI=0` (no GEMM takes
+/// #1133 r25's streaming epilogue) and the switches ([`set_tma_store`], [`set_conv_tma_store`],
+/// [`set_wide_stagger`]).
 #[cfg(feature = "cuda")]
-fn gemm_variant() -> i32 {
+fn gemm_variant(k: i64, staged: bool) -> i32 {
     static ENV: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
     match FORCED_GEMM_VARIANT.load(Ordering::Relaxed) {
-        0 => *ENV.get_or_init(|| {
-            let off = std::env::var_os("LEGION_DEBUG_FP8_STREAM_EPI").is_some_and(|v| v == "0");
-            if off { 0x100 } else { 0 }
-        }),
+        i32::MIN => {
+            let env = *ENV.get_or_init(|| {
+                let off = std::env::var_os("LEGION_DEBUG_FP8_STREAM_EPI").is_some_and(|v| v == "0");
+                if off { 0x100 } else { 0 }
+            });
+            let on = |s: &AtomicBool| s.load(Ordering::Relaxed);
+            default_gemm_variant(
+                k,
+                env,
+                (
+                    on(&TMA_STORE),
+                    on(&CONV_TMA_STORE),
+                    on(&WIDE_STAGGER),
+                    staged,
+                ),
+            )
+        }
         v => v,
     }
 }
+
+/// `legion_fp8_mm8`'s variant bits of the TMA stores and the wide tile's staggered first wave
+/// (`GEMM8_TMA_STORE`, `GEMM8_CONV_TMA_STORE`, `GEMM8_WIDE_STAGGER` in
+/// `src/cuda/sm90/fp8_gemm8_tma.cuh`).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+const VARIANT_TMA_STORE: i32 = 0x800;
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+const VARIANT_CONV_TMA_STORE: i32 = 0x1000;
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+const VARIANT_WIDE_STAGGER: i32 = 0x2000;
+
+/// Serializes the CUDA tests that force epilogue variants ([`force_gemm_variant`] is global).
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) static VARIANT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(feature = "cuda")]
 #[repr(C)]
@@ -1166,9 +1256,12 @@ unsafe fn mm8_params(
             } else {
                 std::ptr::null()
             },
-            variant: gemm_variant()
-                | (out.is_some_and(|o| o.1) as i32 * VARIANT_STAGED)
-                | node_variant(&crate::ggml::external_params(dst)),
+            variant: {
+                let staged = out.is_some_and(|o| o.1);
+                gemm_variant(k, staged)
+                    | (staged as i32 * VARIANT_STAGED)
+                    | node_variant(&crate::ggml::external_params(dst))
+            },
         }
     };
     Ok(p)

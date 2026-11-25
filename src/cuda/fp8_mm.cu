@@ -88,8 +88,9 @@ struct legion_fp8_mm8 {
     // gemm8_epilogue everywhere; forced, for `legion fp8-gemm-bench`: 1 gemm8_epilogue, 2 / 3
     // gemm8_epilogue_stream with one / two token tiles at a time. Bit 9 (GEMM8_STAGED): mapped
     // host memory, staged streaming stores; bit 10 (GEMM8_WIDE, #1183; fp8_gemm8 only, not the
-    // TMA-fed tile): staged plain 16-byte stores, where there is no residual. Every value gives
-    // the same bits.
+    // TMA-fed tile): staged plain 16-byte stores, where there is no residual. Bits 11-13
+    // (GEMM8_TMA_STORE, GEMM8_CONV_TMA_STORE, GEMM8_WIDE_STAGGER): the TMA-fed tiles' only, see
+    // sm90/fp8_gemm8_tma.cuh. Every value gives the same bits.
     int32_t variant;
 };
 int legion_fp8_quant_launch(const float * x, int64_t x_ld, uint8_t * out, int64_t k, int64_t n,
@@ -637,6 +638,22 @@ bool gemm8_tma_map(CUtensorMap * map, const uint8_t * base, int64_t k, int64_t r
                                   CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
 }
 
+// The tensor map gemm8_store_tma writes through (#1183): F32 outputs at `base`, n tokens of m
+// rows, in boxes of a8t::ST_ROWS rows x a8t::ST_TOKS tokens in the 128-byte swizzle; false where
+// the base or the rows do not allow it (16-byte aligned rows) or the driver refuses it.
+bool gemm8_tma_store_map(CUtensorMap * map, const float * base, int64_t m, int64_t n) {
+    if (((uintptr_t) base & 15) != 0 || m % 4 != 0 || m <= 0 || n <= 0) {
+        return false;
+    }
+    const cuuint64_t dims[2]    = { (cuuint64_t) m, (cuuint64_t) n };
+    const cuuint64_t strides[1] = { (cuuint64_t) m * sizeof(float) };
+    const cuuint32_t box[2]     = { (cuuint32_t) a8t::ST_ROWS, (cuuint32_t) a8t::ST_TOKS };
+    const cuuint32_t elem[2]    = { 1, 1 };
+    return cuTensorMapEncodeTiled(map, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, 2, (void *) base, dims, strides, box, elem,
+                                  CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+                                  CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
+}
+
 // 4 warps: the first wave's start spread over GEMM8_STAGGER_NS_PER_K ns per byte of k (about one
 // tile's time: 123 us at k 6,144 on the GB10, where 60 us gained about half as much).
 constexpr int64_t GEMM8_STAGGER_NS_PER_K = 20;
@@ -672,6 +689,11 @@ bool launch_gemm8_tma(const legion_fp8_mm8 & p, cudaStream_t st) {
     if (!gemm8_tma_map(&maps.w, p.w, p.k, p.m, C::BK, C::TM) || !gemm8_tma_map(&maps.x, p.x, p.k, p.n, C::BK, a8::BN)) {
         return false;
     }
+    if constexpr (JG == -2) {
+        if (!gemm8_tma_store_map(&maps.y, p.dst, p.m, p.n)) {
+            return false;
+        }
+    }
     static std::atomic<int8_t> opted_in[GGML_CUDA_MAX_DEVICES];
     if (!legion_device::smem_opt_in(opted_in, fp8_gemm8_tma<RES, C, JG>, (int) SMEM)) {
         return false;
@@ -699,6 +721,12 @@ bool launch_gemm8_tma(const legion_fp8_mm8 & p, cudaStream_t st) {
         }
         stagger.ctas = 2 * sm_count();
         stagger.ns   = (uint32_t) (GEMM8_STAGGER_NS_PER_K * p.k / stagger.ctas);
+    } else if (p.variant & GEMM8_WIDE_STAGGER) {
+        // #1183: one CTA an SM, the first wave spread over the same time, so the SMs'
+        // epilogues do not all write at once (GB10, Qwen3.8-Flash-Next at 12,288 / 8,067
+        // tokens, with the TMA store: k 2,560 1.00-1.05x, k 6,144 1.03-1.05x).
+        stagger.ctas = sm_count();
+        stagger.ns   = (uint32_t) (GEMM8_STAGGER_NS_PER_K * p.k / stagger.ctas);
     }
     const dim3 grid((unsigned) ((p.n + a8::BN - 1) / a8::BN), (unsigned) ((p.m + C::TM - 1) / C::TM));
     fp8_gemm8_tma<RES, C, JG><<<grid, 32 * C::WARPS, SMEM, st>>>(p, maps, stagger);
@@ -715,11 +743,15 @@ bool launch_gemm8_tma(const legion_fp8_mm8 & p, cudaStream_t st) {
 // 0.97x in one session and 1.07x in the other: not routed.
 constexpr int64_t GEMM8_STREAM_MIN_M = 2048;
 // Outputs into mapped host memory (GEMM8_STAGED, the TP send buffer) on the wide tile without
-// the residual: -1, gemm8_epilogue_staged with streaming stores. GEMM8_WIDE (#1183) doesn't
-// change the epilogue here (fp8_gemm8's tiles only).
+// the residual: -1, gemm8_epilogue_staged with streaming stores. Else, with GEMM8_TMA_STORE, the
+// wide tile without the residual (8 warps): -2, gemm8_store_tma (#1183). GEMM8_WIDE (#1183)
+// doesn't change the epilogue here (fp8_gemm8's tiles only).
 template <bool RES, class C> int gemm8_stream_jg(const legion_fp8_mm8 & p) {
     if (!RES && C::WM == 4 && (p.variant & GEMM8_STAGED)) {
         return -1;
+    }
+    if (!RES && C::WM == 4 && C::WARPS == 8 && (p.variant & GEMM8_TMA_STORE) && (p.variant & 0xff) == 0) {
+        return -2;
     }
     switch (p.variant & 0xff) {
         case 2: return 1;
@@ -729,12 +761,23 @@ template <bool RES, class C> int gemm8_stream_jg(const legion_fp8_mm8 & p) {
     }
 }
 
-// launch_gemm8_tma with gemm8_stream_jg's epilogue.
+// launch_gemm8_tma with gemm8_stream_jg's epilogue (the TMA store's where its tensor map cannot
+// be made, the pick without it).
 template <bool RES, class C> bool launch_gemm8_tma_jg(const legion_fp8_mm8 & p, cudaStream_t st) {
     switch (gemm8_stream_jg<RES, C>(p)) {
         case -1:
             if constexpr (!RES && C::WM == 4) {
                 return launch_gemm8_tma<RES, C, -1>(p, st);
+            }
+            return false;
+        case -2:
+            if constexpr (!RES && C::WM == 4 && C::WARPS == 8) {
+                if (launch_gemm8_tma<RES, C, -2>(p, st)) {
+                    return true;
+                }
+                legion_fp8_mm8 q = p;
+                q.variant &= ~GEMM8_TMA_STORE;
+                return launch_gemm8_tma_jg<RES, C>(q, st);
             }
             return false;
         case 1: return launch_gemm8_tma<RES, C, 1>(p, st);
@@ -803,17 +846,33 @@ void launch_gemv8(const legion_fp8_mm8 & p, cudaStream_t st) {
 // streaming epilogue (whose sums and values fp8_gemm8_tma_conv's are), one sequence, a kernel of
 // a8c::CONV_D taps keeping the last CONV_D - 1 inputs, no prefetch, the normalized heads (of
 // 128) in whole row tiles. any_waves (tests): also where the GEMM would take the 128-row tile for
-// want of waves (the same sums). False: not launched.
+// want of waves (the same sums). The pick of the streaming epilogue is made without the TMA
+// store bits (whose values are the same); GEMM8_CONV_TMA_STORE: the outputs by TMA stores where
+// cv.out's tensor map can be made. False: not launched.
+template <bool TST>
+bool launch_gemm8_conv_k(const legion_fp8_mm8 & p, const legion_conv_silu & cv, cudaStream_t st);
+
 bool launch_gemm8_conv(const legion_fp8_mm8 & p, const legion_conv_silu & cv, bool any_waves, cudaStream_t st) {
     using C = a8::Cfg<4, 2, 128, true>;
-    constexpr size_t SMEM = gemm8_tma_smem<C>();
-    static_assert(SMEM <= 99 * 1024, "shared memory");
     const int64_t wide_tiles = p.m / 256 * ((p.n + a8::BN - 1) / a8::BN);
+    legion_fp8_mm8 pick = p;
+    pick.variant &= ~(GEMM8_TMA_STORE | GEMM8_CONV_TMA_STORE);
     if (p.res != nullptr || p.k % 128 != 0 || p.n <= 64 || !fp8_mma() || gemm8_ada_skinny(p) || p.m % 256 != 0 ||
-        (!any_waves && wide_tiles < GEMM8_WIDE_WAVES * sm_count()) || gemm8_stream_jg<false, C>(p) != 2 ||
+        (!any_waves && wide_tiles < GEMM8_WIDE_WAVES * sm_count()) || gemm8_stream_jg<false, C>(pick) != 2 ||
         !gemm8_tma_device()) {
         return false;
     }
+    if ((p.variant & GEMM8_CONV_TMA_STORE) && launch_gemm8_conv_k<true>(p, cv, st)) {
+        return true;
+    }
+    return launch_gemm8_conv_k<false>(p, cv, st);
+}
+
+template <bool TST>
+bool launch_gemm8_conv_k(const legion_fp8_mm8 & p, const legion_conv_silu & cv, cudaStream_t st) {
+    using C = a8::Cfg<4, 2, 128, true>;
+    constexpr size_t SMEM = gemm8_tma_smem<C>();
+    static_assert(SMEM <= 99 * 1024, "shared memory");
     const int64_t norm_rows = (int64_t) cv.norm_blocks * cv.norm_head;
     if (cv.x != p.dst || cv.x_ld != p.m || cv.C != p.m || cv.nt != p.n || cv.ns != 1 || cv.d != a8c::CONV_D ||
         cv.keep != a8c::CONV_D - 1 || cv.pf != nullptr || cv.norm_blocks < 0 ||
@@ -829,7 +888,7 @@ bool launch_gemm8_conv(const legion_fp8_mm8 & p, const legion_conv_silu & cv, bo
     int8_t ok = image_ok[dev].load(std::memory_order_relaxed);
     if (ok == 0) {
         cudaFuncAttributes attr;
-        const bool sm90 = cudaFuncGetAttributes(&attr, fp8_gemm8_tma_conv<C>) == cudaSuccess &&
+        const bool sm90 = cudaFuncGetAttributes(&attr, fp8_gemm8_tma_conv<C, TST>) == cudaSuccess &&
                           attr.binaryVersion >= 90 && attr.ptxVersion >= 90;
         ok = sm90 ? 1 : -1;
         image_ok[dev].store(ok, std::memory_order_relaxed);
@@ -841,12 +900,17 @@ bool launch_gemm8_conv(const legion_fp8_mm8 & p, const legion_conv_silu & cv, bo
     if (!gemm8_tma_map(&maps.w, p.w, p.k, p.m, C::BK, C::TM) || !gemm8_tma_map(&maps.x, p.x, p.k, p.n, C::BK, a8::BN)) {
         return false;
     }
+    if constexpr (TST) {
+        if (!gemm8_tma_store_map(&maps.y, cv.out, cv.C, p.n)) {
+            return false;
+        }
+    }
     static std::atomic<int8_t> opted_in[GGML_CUDA_MAX_DEVICES];
-    if (!legion_device::smem_opt_in(opted_in, fp8_gemm8_tma_conv<C>, (int) SMEM)) {
+    if (!legion_device::smem_opt_in(opted_in, fp8_gemm8_tma_conv<C, TST>, (int) SMEM)) {
         return false;
     }
     const dim3 grid((unsigned) ((p.n + a8c::CONV_STRIDE - 1) / a8c::CONV_STRIDE), (unsigned) (p.m / C::TM));
-    fp8_gemm8_tma_conv<C><<<grid, 32 * C::WARPS, SMEM, st>>>(p, maps, a8t::Stagger{}, cv);
+    fp8_gemm8_tma_conv<C, TST><<<grid, 32 * C::WARPS, SMEM, st>>>(p, maps, a8t::Stagger{}, cv);
     return true;
 }
 }  // namespace

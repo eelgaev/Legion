@@ -15,13 +15,15 @@ pub struct Fp8GemmBenchArgs {
         default_value = "6144:5120:8192:res,17408:5120:8192:res,5120:10240:8192"
     )]
     shapes: Vec<String>,
-    /// Epilogue variants timed against the plain epilogue (1): 0 the default pick (the
-    /// streaming route), 2 and 3 the streaming epilogue with one and two token tiles at a time,
-    /// 256 the pick without the streaming route (LEGION_DEBUG_FP8_STREAM_EPI=0); plus 1024 the
-    /// staged 16-byte stores in place of any of those where there is no residual and the GEMM
-    /// is not the TMA-fed one (the shared expert gate / up's epilogue: `--variants 0,1024
-    /// --shapes 2560:1280:8067`).
-    #[arg(long, value_delimiter = ',', default_values_t = [0, 2, 3, 256])]
+    /// Epilogue variants timed against the plain epilogue (1): 0 the pick without the TMA
+    /// stores (the streaming route), 2 and 3 the streaming epilogue with one and two token tiles
+    /// at a time, 256 the pick without the streaming route (LEGION_DEBUG_FP8_STREAM_EPI=0), 512
+    /// the staged epilogue (the TP send buffer's), 1024 the staged 16-byte stores of the
+    /// cp.async tiles where there is no residual (the shared expert gate / up's epilogue where
+    /// the GEMM is not TMA-fed: `--variants 0,1024 --shapes 2560:1280:8067`), 2048 the wide
+    /// tile's TMA stores, 8192 the wide tile's staggered first wave (the default at k up to
+    /// 1,024), 10240 both (the default above k 1,024); bits add up.
+    #[arg(long, value_delimiter = ',', default_values_t = [0, 3, 512, 2048, 8192])]
     variants: Vec<i32>,
     /// One per-tensor weight scale instead of one per output row.
     #[arg(long)]
@@ -203,7 +205,7 @@ pub fn run(args: Fp8GemmBenchArgs) -> anyhow::Result<()> {
             // A warm-up run, then the bits.
             let ok = gpu.compute(&graph).is_ok() && gpu.compute(&graph).is_ok();
             if !ok {
-                fp8::force_gemm_variant(0);
+                fp8::unforce_gemm_variant();
                 anyhow::ensure!(v != 1, "k {k} m {m} n {n}: variant 1 does not run");
                 rows.push((v, None, None));
                 // A failed launch may leave the backend's error state; a plain run clears it.
@@ -241,7 +243,7 @@ pub fn run(args: Fp8GemmBenchArgs) -> anyhow::Result<()> {
                 times.push(t.elapsed().as_secs_f64() / layers as f64);
             }
         }
-        fp8::force_gemm_variant(0);
+        fp8::unforce_gemm_variant();
         let flops = 2.0 * (s.k * s.m * s.n) as f64;
         let op = if s.res { "res" } else { "mm" };
         let (q_med, q_min) = med_min(&quant);
