@@ -90,6 +90,12 @@ struct legion_nvfp4_mm {
     // bit 0 (grouped): the CTAs of row tile 0 also prefetch the whole rows of the BN plan pairs
     // xpf >> 1 token tiles past their own. 0: no activation prefetch, as before.
     int32_t xpf;
+    // The grouped down projection tile's epilogue (variant 22 of mi 2, nt 8, no GLU; #1183;
+    // the same values in the same places either way). Bit 0: the tile's outputs staged through
+    // the free stages' shared memory and stored 16 bytes a thread, a pair's rows a warp at a
+    // time (EPI_WIDE); bit 1: streaming (evict-first) stores (EPI_CS). 0: the fragments'
+    // 2- or 4-byte stores, as before. Other tiles ignore it.
+    int32_t wst;
 };
 
 // The GEMM: tiles_m * tiles_n CTAs of 256 threads; mi = 1 or 2 (128 * mi rows), nt = 1, 2, 4,
@@ -260,16 +266,47 @@ __device__ __forceinline__ void mma(float * c, const uint32_t (&a)[4], uint32_t 
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
-// One output element with the epilogue's activation (see legion_nvfp4_mm::act).
+// One output element with the epilogue's activation (see legion_nvfp4_mm::act). CS: a
+// streaming (evict-first) store of the same value (nvfp4_gemm's EPI_CS).
+template <bool CS = false>
 __device__ __forceinline__ void store_out(const legion_nvfp4_mm & p, int64_t i, float v) {
     if (p.act == 1) {
         const float r = fmaxf(v, 0.0f);
-        ((__nv_bfloat16 *) p.dst)[i] = __float2bfloat16_rn(r * r);
+        if constexpr (CS) {
+            __stcs((__nv_bfloat16 *) p.dst + i, __float2bfloat16_rn(r * r));
+        } else {
+            ((__nv_bfloat16 *) p.dst)[i] = __float2bfloat16_rn(r * r);
+        }
     } else if (p.act == 3) {
-        ((__nv_bfloat16 *) p.dst)[i] = __float2bfloat16_rn(v);
+        if constexpr (CS) {
+            __stcs((__nv_bfloat16 *) p.dst + i, __float2bfloat16_rn(v));
+        } else {
+            ((__nv_bfloat16 *) p.dst)[i] = __float2bfloat16_rn(v);
+        }
     } else {
-        p.dst[i] = v;
+        if constexpr (CS) {
+            __stcs(p.dst + i, v);
+        } else {
+            p.dst[i] = v;
+        }
     }
+}
+
+// store_out's BF16 value of v (act 1 or 3: whether the epilogue stores BF16), for the staged
+// epilogue (EPI_WIDE): the same expressions, so the same bits.
+__device__ __forceinline__ __nv_bfloat16 out_bf16(int act, float v) {
+    if (act == 1) {
+        const float r = fmaxf(v, 0.0f);
+        return __float2bfloat16_rn(r * r);
+    }
+    return __float2bfloat16_rn(v);
+}
+
+// The staged epilogue's (EPI_WIDE) tokens per pass: the most of bn, halving, whose rows of
+// row_bytes fit in `smem` bytes of the stages (bn itself for BF16 rows of the down tile, half of
+// it for F32 ones).
+__host__ __device__ constexpr int wide_tokens(int bn, int row_bytes, int smem) {
+    return bn * row_bytes <= smem || bn <= 8 ? bn : wide_tokens(bn / 2, row_bytes, smem);
 }
 
 // The dense fused gate / up kernels' activation of the gate (legion_nvfp4_mm::act of a GLU
@@ -364,9 +401,12 @@ __device__ __forceinline__ bool find_tile(const int32_t * offs, int n_expert, in
 // same sums (exact), the weights' L2 prefetch in runs of 4 / 8 / 16 / 32 blocks (see PF).
 // DIAG_CAW / DIAG_CAX (#1176 r43, exact, the default's own sums): the weight / activation
 // copies through L1 (cp.async.ca) instead of L2 only (cp.async.cg); see gemm_l1.
+// EPI_WIDE / EPI_CS (#1183, exact, not diagnostics: the default down tile's, see gemm_down and
+// legion_nvfp4_mm::wst): grouped tiles without GLU, the epilogue staged through shared memory
+// and stored 16 bytes a thread / the stores streaming (evict-first).
 constexpr int DIAG_NODEC = 1, DIAG_NOMMA = 2, DIAG_NOEPI = 4, DIAG_NOW = 8, DIAG_NOX = 16, DIAG_NOK = 64,
               DIAG_PF16 = 256, DIAG_PF4 = 512, DIAG_PF8 = 1024, DIAG_PF32 = 2048, DIAG_CAW = 4096,
-              DIAG_CAX = 8192;
+              DIAG_CAX = 8192, EPI_WIDE = 16384, EPI_CS = 32768;
 template <int MI, int NT, bool GROUPED, bool GLU, int ST = STAGES, int MINB = 1, int DIAG = 0, int WARPS = 8>
 __global__ void __launch_bounds__(WARPS * 32, MINB) nvfp4_gemm(const legion_nvfp4_mm p) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -710,6 +750,91 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) nvfp4_gemm(const legion_nvfp
                 }
             }
         }
+    } else if constexpr (GROUPED && (DIAG & EPI_WIDE) != 0) {
+        // EPI_WIDE (#1183): a fragment holds one output row of two tokens (c0, c1: row g,
+        // tokens 2t, 2t + 1), and a token's outputs are a pair's row in dst, so the stores above
+        // write 2 (BF16) or 4 (F32) bytes a lane, 16 or 32 bytes in each of 4 pairs' rows a warp
+        // instruction (BF16: half sectors). Here the tile's outputs go to the stages' shared
+        // memory first, a token's rows in a row of LDO (16 bytes of padding: the fragment
+        // writes are conflict-free), then each warp stores whole 512-byte runs of a pair's rows,
+        // 16 bytes a lane: an eighth (BF16) or a quarter (F32) of the store instructions, full
+        // sectors. The same values (store_out's expressions on the same sums) in the same places.
+        constexpr int DYN = smem_bytes<MI, NT, ST, WARPS>();
+        __syncthreads();  // every warp past its last stage's fragment reads: the stages are free
+        auto wide = [&](auto tag) {
+            using T = decltype(tag);
+            constexpr int E = 16 / (int) sizeof(T);  // outputs per 16-byte store
+            constexpr int LDO = BM_OUT + E;
+            constexpr int TP = wide_tokens(BN, LDO * (int) sizeof(T), DYN);  // tokens a pass
+            constexpr int JP = TP / 8, CH = BM_OUT / E;                      // n8 groups, chunks
+            static_assert(TP % 8 == 0 && TP * LDO * (int) sizeof(T) <= DYN, "staged epilogue");
+            T * so = (T *) smem;
+            const bool vec = p.m % E == 0 && ((uintptr_t) p.dst & 15) == 0;
+#pragma unroll
+            for (int pass = 0; pass < BN / TP; pass++) {
+                if (pass > 0) {
+                    __syncthreads();  // the last pass's rows read
+                }
+#pragma unroll
+                for (int i = 0; i < MI; i++) {
+                    const int r = warp * 16 * MI + i * 16 + lane / 4;  // c0's tile row
+#pragma unroll
+                    for (int jj = 0; jj < JP; jj++) {
+                        const int j = pass * JP + jj;
+                        if (j * 8 >= n_tok) {
+                            break;
+                        }
+                        const int t = jj * 8 + (lane % 4) * 2;  // c0's token in the pass
+#pragma unroll
+                        for (int h = 0; h < 2; h++) {
+                            const float v0 = acc[i][j][2 * h] * sc, v1 = acc[i][j][2 * h + 1] * sc;
+                            if constexpr (sizeof(T) == 4) {
+                                so[t * LDO + r + h * 8] = v0;
+                                so[(t + 1) * LDO + r + h * 8] = v1;
+                            } else {
+                                // Rows g and g + 1 of a token in one 4-byte word: an even-g
+                                // lane takes token 2t's (its own and lane + 4's c0), an odd-g
+                                // lane token 2t + 1's (lane - 4's and its own c1).
+                                const uint32_t mine = (uint32_t) __bfloat16_as_ushort(out_bf16(p.act, v0)) |
+                                                      (uint32_t) __bfloat16_as_ushort(out_bf16(p.act, v1)) << 16;
+                                const uint32_t other = __shfl_xor_sync(0xffffffffu, mine, 4);
+                                const int odd = (lane / 4) % 2;
+                                const uint32_t word =
+                                    odd ? __byte_perm(other, mine, 0x7632) : __byte_perm(mine, other, 0x5410);
+                                *(uint32_t *) (so + (t + odd) * LDO + r - odd + h * 8) = word;
+                            }
+                        }
+                    }
+                }
+                __syncthreads();
+                for (int c = threadIdx.x; c < TP * CH; c += THREADS) {
+                    const int tl = c / CH, col = c % CH * E, tok = pass * TP + tl;
+                    if (tok >= n_tok) {
+                        break;
+                    }
+                    const int64_t row = m0 + col;
+                    const uint4 v = *(const uint4 *) (so + tl * LDO + col);
+                    T * d = (T *) p.dst + d_off[tok] + row;
+                    if (vec && row + E <= p.m) {
+                        if constexpr ((DIAG & EPI_CS) != 0) {
+                            __stcs((uint4 *) d, v);
+                        } else {
+                            *(uint4 *) d = v;
+                        }
+                    } else {
+                        const T * s = (const T *) &v;
+                        for (int q = 0; q < E && row + q < p.m; q++) {
+                            d[q] = s[q];
+                        }
+                    }
+                }
+            }
+        };
+        if (p.act == 1 || p.act == 3) {
+            wide(__nv_bfloat16{});
+        } else {
+            wide(0.0f);
+        }
     } else {
 #pragma unroll
     for (int i = 0; i < MI; i++) {
@@ -722,7 +847,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) nvfp4_gemm(const legion_nvfp
                 const int t = j * 8 + (lane % 4) * 2 + e % 2;
                 if (row < p.m && t < n_tok) {
                     const int64_t off = GROUPED ? d_off[t] : (n0 + t) * p.m;
-                    store_out(p, off + row, acc[i][j][e] * sc);
+                    store_out<(DIAG & EPI_CS) != 0>(p, off + row, acc[i][j][e] * sc);
                 }
             }
         }
@@ -1697,6 +1822,24 @@ int gemm_l1(const legion_nvfp4_mm & p, int & variant, cudaStream_t st) {
     return r == -1 ? -2 : r;
 }
 
+// Variant 22 (two stages, two CTAs per SM): the grouped down projection's 256 x 64 tile with
+// p.wst's epilogue (#1183): bit 0 EPI_WIDE, bit 1 EPI_CS (see legion_nvfp4_mm::wst); the same
+// bits every way. Other tiles: the plain kernel, wst ignored.
+template <int MI, int NT, bool GLU>
+int gemm_down(const legion_nvfp4_mm & p, cudaStream_t st) {
+    if constexpr (MI == 2 && NT == 8 && !GLU) {
+        if (p.plan) {
+            switch (p.wst & 3) {
+                case 1: return gemm_tuned<MI, NT, GLU, 2, 2, EPI_WIDE>(p, st);
+                case 2: return gemm_tuned<MI, NT, GLU, 2, 2, EPI_CS>(p, st);
+                case 3: return gemm_tuned<MI, NT, GLU, 2, 2, EPI_WIDE | EPI_CS>(p, st);
+                default: break;
+            }
+        }
+    }
+    return gemm_tuned<MI, NT, GLU, 2, 2>(p, st);
+}
+
 // stages * 10 + CTAs per SM: 31 is the default kernel (gemm); the others for 64- and 128-token
 // tiles. 100 and up: gemm_pf's prefetch runs and gemm_l1's L1 copies.
 template <int MI, int NT, bool GLU>
@@ -1719,7 +1862,7 @@ int gemm_variant(const legion_nvfp4_mm & p, int variant, cudaStream_t st) {
     if constexpr (NT == 8 || NT == 16) {
         switch (variant) {
             case 21: return gemm_tuned<MI, NT, GLU, 2, 1>(p, st);
-            case 22: return gemm_tuned<MI, NT, GLU, 2, 2>(p, st);
+            case 22: return gemm_down<MI, NT, GLU>(p, st);
             case 32: return gemm_tuned<MI, NT, GLU, 3, 2>(p, st);
             case 41: return gemm_tuned<MI, NT, GLU, 4, 1>(p, st);
             default: return -1;

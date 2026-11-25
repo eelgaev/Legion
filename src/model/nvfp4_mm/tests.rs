@@ -926,6 +926,7 @@ fn xpf_reset() {
     force_kernel(None);
     force_gemm_tune(None, None);
     force_gemm_xpf(None);
+    force_gemm_wst(None);
     set_expert_mv_max(MV_MAX_N);
 }
 
@@ -1299,6 +1300,332 @@ fn cuda_down_x_prefetch_bench() {
                 );
             }
             assert!(same.iter().all(|&s| s), "{op} at {n_tok}: bits differ");
+        }
+    }
+    xpf_reset();
+}
+
+/// The staged epilogue (#1183) is the down projection's grouped GEMM tile's only: not the
+/// SwiGLU's, not a down projection of wide k or few experts.
+#[test]
+fn down_wide_store_only_on_the_down_gemm() {
+    assert_eq!(DOWN_WST, WST_WIDE);
+    assert_eq!(WST_WIDE & WST_CS, 0);
+    // Qwen3.8-Flash-Next's down projection (k 640, 512 experts) at prompt steps.
+    assert_eq!(grouped_gemm_wst(640, 512, 2, 8, false), DOWN_WST);
+    // Other tiles and the SwiGLU GEMM: none.
+    assert_eq!(grouped_gemm_wst(640, 512, 2, 16, false), 0);
+    assert_eq!(grouped_gemm_wst(640, 512, 1, 8, false), 0);
+    assert_eq!(grouped_gemm_wst(2560, 512, 2, 16, true), 0);
+    assert_eq!(grouped_gemm_wst(2560, 512, 2, 8, true), 0);
+    // Not a wide down projection's shape.
+    assert_eq!(grouped_gemm_wst(2560, 512, 2, 8, false), 0);
+    assert_eq!(grouped_gemm_wst(640, 64, 2, 8, false), 0);
+}
+
+/// The epilogues the staged-store bit test compares with the fragments' own stores (0).
+#[cfg(feature = "cuda")]
+const WST_CHECKED: [i32; 3] = [WST_WIDE, WST_CS, WST_WIDE | WST_CS];
+
+/// One staged-store bit test case: a down projection of `n_expert` NVFP4 experts of `m` rows by
+/// `k`, `n_used` per token, the routing `ids`, `n_x` input rows a token.
+#[cfg(feature = "cuda")]
+struct WstCase {
+    name: &'static str,
+    m: usize,
+    k: usize,
+    n_expert: usize,
+    n_used: usize,
+    n_x: usize,
+    ids: Vec<i32>,
+}
+
+/// `case`'s down projection on the down tile ([`GEMM_DOWN`], forced: the small shapes are no
+/// default down projection) with F32, BF16 and squared-ReLU BF16 rows, without and with the
+/// activation prefetch: every epilogue of [`WST_CHECKED`] (and the default) stores the bits of
+/// the fragments' own stores. The outputs are filled with a pattern before each run, so a
+/// value an epilogue leaves out shows.
+#[cfg(feature = "cuda")]
+fn wst_case(gpu: &mut crate::ggml::Backend, case: &WstCase) {
+    use crate::ggml::ComputeAllocator;
+    let (m, k, n_expert, n_used) = (case.m, case.k, case.n_expert, case.n_used);
+    let n_tok = case.ids.len() / n_used;
+    let weights = Context::new(4, 0);
+    let wd = weights.new_tensor(types::NVFP4, &[k as i64, m as i64, n_expert as i64]);
+    let scale = weights.new_tensor(types::F32, &[n_expert as i64]);
+    weights.alloc_tensors(gpu.buffer_type()).unwrap();
+    wd.set_bytes(&gemm_bench::weights(k / 64 * 36 * m * n_expert, 13));
+    let s: Vec<f32> = (0..n_expert)
+        .map(|e| 0.002 + (e * 7 % 1000) as f32 * 1e-5)
+        .collect();
+    scale.set_f32(&s);
+    let ctx = Context::new(16, 32);
+    let x = ctx
+        .new_tensor(types::BF16, &[k as i64, case.n_x as i64, n_tok as i64])
+        .as_input();
+    let id = ctx
+        .new_tensor(types::I32, &[n_used as i64, n_tok as i64])
+        .as_input();
+    let outs = [Act::None, Act::Bf16, Act::ReluSqr]
+        .map(|act| mul_mat_id_act(&ctx, wd, x, id, Some(scale), act).as_output());
+    let mut graph = ctx.new_graph(32);
+    for o in outs {
+        graph.expand(o);
+    }
+    ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+        .unwrap();
+    x.set_bytes(&xpf_bf16(k * case.n_x * n_tok, 17));
+    id.set_i32(&case.ids);
+    let run = |gpu: &mut crate::ggml::Backend| -> Vec<Vec<u8>> {
+        for o in outs {
+            o.set_bytes(&vec![0xa5; o.nbytes()]);
+        }
+        gpu.compute(&graph).unwrap();
+        outs.iter().map(|o| o.bytes()).collect()
+    };
+    force_kernel(Some(Kernel::Gemm { mi: 2, nt: 8 }));
+    force_gemm_tune(Some(GEMM_DOWN), None);
+    for xpf in [Some(0), None] {
+        force_gemm_xpf(xpf);
+        force_gemm_wst(Some(0));
+        let want = run(gpu);
+        for wst in WST_CHECKED.map(Some).into_iter().chain([None]) {
+            force_gemm_wst(wst);
+            for (i, (got, want)) in run(gpu).iter().zip(&want).enumerate() {
+                assert_eq!(got.len(), want.len());
+                let differ = got.iter().zip(want).filter(|(a, b)| a != b).count();
+                assert_eq!(
+                    differ, 0,
+                    "{}, output {i} (F32, BF16, relu^2), xpf {xpf:?}, wst {wst:?}: \
+                     {differ} bytes differ",
+                    case.name
+                );
+            }
+        }
+    }
+    xpf_reset();
+}
+
+/// The down tile's staged 16-byte stores and streaming stores (#1183) keep every output bit:
+/// F32, BF16 and squared-ReLU BF16 rows, with and without the activation prefetch, over
+/// hand-made routings (experts of 1, 15, 16, 17, 63, 64, 65 and 200 pairs: last token tiles
+/// partial and full), random ones over 512 and 64 experts, one input row per token, and down
+/// projections of 320 rows (a partial row tile) and 324 (rows not a multiple of 8: the BF16
+/// rows' element-wise tail).
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_down_wide_store_keeps_bits() {
+    let _lock = XPF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut gpu = xpf_gpu();
+    let special = [1, 15, 16, 17, 63, 64, 65, 200];
+    let small = [1, 15, 16, 17, 63, 64, 65];
+    let cases = [
+        // Qwen3.8-Flash-Next's down projection (2560 rows, k 640, 512 experts, top 10).
+        WstCase {
+            name: "flash-next counted",
+            m: 2560,
+            k: 640,
+            n_expert: 512,
+            n_used: 10,
+            n_x: 10,
+            ids: counted_routing(&spread_counts(&special, 512, 10, 400), 10, 400),
+        },
+        WstCase {
+            name: "flash-next random 512",
+            m: 2560,
+            k: 640,
+            n_expert: 512,
+            n_used: 10,
+            n_x: 10,
+            ids: gemm_bench::routing(10, 1500, 512, 512, 7),
+        },
+        WstCase {
+            name: "flash-next random 64",
+            m: 2560,
+            k: 640,
+            n_expert: 512,
+            n_used: 10,
+            n_x: 10,
+            ids: gemm_bench::routing(10, 700, 512, 64, 8),
+        },
+        WstCase {
+            name: "flash-next shared x",
+            m: 2560,
+            k: 640,
+            n_expert: 512,
+            n_used: 10,
+            n_x: 1,
+            ids: gemm_bench::routing(10, 300, 512, 512, 9),
+        },
+        // Small shapes: 320 rows (a partial row tile) and 324 (not a multiple of 8).
+        WstCase {
+            name: "small 320 rows",
+            m: 320,
+            k: 256,
+            n_expert: 24,
+            n_used: 4,
+            n_x: 4,
+            ids: counted_routing(&spread_counts(&small, 24, 4, 200), 4, 200),
+        },
+        WstCase {
+            name: "small 324 rows",
+            m: 324,
+            k: 256,
+            n_expert: 24,
+            n_used: 4,
+            n_x: 4,
+            ids: counted_routing(&spread_counts(&small, 24, 4, 200), 4, 200),
+        },
+        WstCase {
+            name: "small 324 rows shared x",
+            m: 324,
+            k: 128,
+            n_expert: 24,
+            n_used: 4,
+            n_x: 1,
+            ids: counted_routing(&spread_counts(&small, 24, 4, 200), 4, 200),
+        },
+    ];
+    for case in &cases {
+        wst_case(&mut gpu, case);
+        eprintln!("{}: the same bits", case.name);
+    }
+}
+
+/// The down projection's grouped GEMM (Qwen3.8-Flash-Next, 512 experts, top 10) at 12,288- and
+/// 8,067-token prompt steps, BF16 rows (`--nvfp4-expert-rows-bf16`) and F32 rows, with the
+/// fragments' own stores (old) and each staged / streaming epilogue (#1183), the activation
+/// prefetch at its default: microseconds a layer (median and best of the rounds, the
+/// configurations taking turns, each round starting one further on), the bytes moved a second
+/// at the median, and whether the bits are the old ones. `*` marks the default.
+/// `cargo test --release --features cuda --lib -- --ignored cuda_down_wide_store_bench
+/// --nocapture`.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU; a benchmark"]
+fn cuda_down_wide_store_bench() {
+    use crate::ggml::ComputeAllocator;
+    let _lock = XPF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    xpf_reset();
+    let mut gpu = xpf_gpu();
+    let (hidden, ffn, n_expert, n_used) = (2560usize, 640usize, 512usize, 10usize);
+    const LAYERS: usize = 4;
+    const ROUNDS: usize = 5;
+    let blocks = ffn / 64 * 36 * hidden * n_expert;
+    let weights = Context::new(4, 0);
+    let wd = weights.new_tensor(types::NVFP4, &[ffn as i64, hidden as i64, n_expert as i64]);
+    let scale = weights.new_tensor(types::F32, &[n_expert as i64]);
+    weights.alloc_tensors(gpu.buffer_type()).unwrap();
+    wd.set_bytes(&gemm_bench::weights(blocks, 3));
+    scale.set_f32(&vec![0.004; n_expert]);
+    let variants: [(&str, i32); 4] = [
+        ("old (fragments)", 0),
+        ("wide", WST_WIDE),
+        ("old + cs", WST_CS),
+        ("wide + cs", WST_WIDE | WST_CS),
+    ];
+    let default = grouped_gemm_wst(ffn as i64, n_expert as i64, 2, 8, false);
+    for n_tok in [12288usize, 8067] {
+        for act in [Act::Bf16, Act::None] {
+            let ctx = Context::new(16 + 24 * LAYERS, 16 * LAYERS + 16);
+            let x = ctx
+                .new_tensor(types::BF16, &[ffn as i64, n_used as i64, n_tok as i64])
+                .as_input();
+            let ids: Vec<_> = (0..LAYERS)
+                .map(|_| {
+                    ctx.new_tensor(types::I32, &[n_used as i64, n_tok as i64])
+                        .as_input()
+                })
+                .collect();
+            let mut graph = ctx.new_graph(16 * LAYERS + 16);
+            let outs: Vec<_> = ids
+                .iter()
+                .map(|&id| {
+                    let y = mul_mat_id_act(&ctx, wd, x, id, Some(scale), act).as_output();
+                    graph.expand(y);
+                    y
+                })
+                .collect();
+            ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+                .unwrap();
+            x.set_bytes(&xpf_bf16(ffn * n_used * n_tok, 5 + n_tok as u64));
+            for (l, id) in ids.iter().enumerate() {
+                id.set_i32(&gemm_bench::routing(
+                    n_used,
+                    n_tok,
+                    n_expert,
+                    n_expert,
+                    1 + l as u64,
+                ));
+            }
+            // A warm-up run of each (its bits against the old one's), then the rounds, the
+            // variants taking turns.
+            let mut want = Vec::new();
+            let mut same = vec![true; variants.len()];
+            for (vi, &(_, wst)) in variants.iter().enumerate() {
+                force_gemm_wst(Some(wst));
+                gpu.compute(&graph).unwrap();
+                let got: Vec<Vec<u8>> = outs.iter().map(|o| o.bytes()).collect();
+                if vi == 0 {
+                    want = got;
+                } else {
+                    same[vi] = got == want;
+                }
+            }
+            let nv = variants.len();
+            let mut times = vec![Vec::with_capacity(ROUNDS); nv];
+            for round in 0..ROUNDS {
+                for i in 0..nv {
+                    let vi = (round + i) % nv;
+                    force_gemm_wst(Some(variants[vi].1));
+                    let t = std::time::Instant::now();
+                    gpu.compute(&graph).unwrap();
+                    times[vi].push(t.elapsed().as_secs_f64() / LAYERS as f64);
+                }
+            }
+            force_gemm_wst(None);
+            for t in &mut times {
+                t.sort_by(f64::total_cmp);
+            }
+            let median: Vec<f64> = times.iter().map(|t| t[t.len() / 2]).collect();
+            let best: Vec<f64> = times.iter().map(|t| t[0]).collect();
+            // Bytes a layer: every expert's weights, each pair's input row and output row.
+            let pairs = (n_used * n_tok) as f64;
+            let f32_rows = act == Act::None;
+            let esize = if f32_rows { 4.0 } else { 2.0 };
+            let (w_bytes, x_bytes, out_bytes) = (
+                blocks as f64,
+                pairs * ffn as f64 * 2.0,
+                pairs * hidden as f64 * esize,
+            );
+            let bytes = w_bytes + x_bytes + out_bytes;
+            let rows = if f32_rows { "f32" } else { "bf16" };
+            eprintln!(
+                "down ({rows} rows) at {n_tok} tokens ({:.0} MB a layer: {:.0} weights, {:.0} in, \
+                 {:.0} out)",
+                bytes / 1e6,
+                w_bytes / 1e6,
+                x_bytes / 1e6,
+                out_bytes / 1e6
+            );
+            for (vi, &(name, wst)) in variants.iter().enumerate() {
+                eprintln!(
+                    "  {}{name:<16} wst {wst}: median {:>8.1} us/layer ({:>5.3}x old), \
+                     min {:>8.1} ({:>5.3}x)  {:>6.1} GB/s  {}",
+                    if wst == default { '*' } else { ' ' },
+                    median[vi] * 1e6,
+                    median[0] / median[vi],
+                    best[vi] * 1e6,
+                    best[0] / best[vi],
+                    bytes / median[vi] / 1e9,
+                    if same[vi] { "same bits" } else { "BITS DIFFER" }
+                );
+            }
+            assert!(
+                same.iter().all(|&s| s),
+                "down ({rows} rows) at {n_tok}: bits differ"
+            );
         }
     }
     xpf_reset();
