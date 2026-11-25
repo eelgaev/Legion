@@ -10,6 +10,13 @@
 // rms_norm-mul and the unfused rms_norm then mul both compute it. Repeat and concat only move
 // values. Built with fast math as ggml-cuda is.
 //
+// Quantized (Q): the same values written as the eh_proj matmul's MMQ input instead of F32, as
+// ggml-cuda's quantize_mmq_q8_1 (quantize.cu, MIT) writes it for a Q8_0 weight
+// (MMQ_Q8_1_DS_LAYOUT_D4) with its arithmetic: per 32 values amax, d_inv = 127 / amax,
+// q = roundf(x * d_inv), d = 1 / d_inv; value k of column j (token t, stream c: j = t hc + c)
+// in block (k / 128) * ncols + j (4 F32 scales, then 128 int8). The matmul's own quantize pass
+// goes (src/cuda/mmq_preq.cu runs ggml's MMQ on these blocks).
+//
 // The Rust side (src/model/qwen4/mtp_in.rs) decides when it runs and launches it with
 // cudaLaunchKernel from the table at the end. This file is the kernels only.
 
@@ -25,7 +32,9 @@ struct legion_mtp_in {
     int64_t h_ld;
     const float * ge;   // enorm's gamma [e]
     const float * gh;   // hnorm's gamma [e * hc]
-    float * dst;        // [2e, hc, n] contiguous: per token and stream, enorm then hnorm
+    // [2e, hc, n] F32 contiguous: per token and stream, enorm then hnorm; quantized, MMQ's
+    // blocks of those values (see above; e a multiple of 32)
+    float * dst;
     int32_t e, n;
     float eps;
 };
@@ -74,7 +83,31 @@ __device__ __forceinline__ float rms_scale(float tmp, int ncols, float eps) {
     return rsqrtf(mean + eps);
 }
 
-// One block per token.
+// quantize_mmq_q8_1's value x of its 32-value group (the calling warp's 32 lanes hold one
+// group in lane order): q and the group's scale d. fmaxf is exact, so the butterfly gives
+// ggml's amax whatever its order.
+__device__ __forceinline__ void q8_of(float x, signed char & q, float & d) {
+    float amax = fabsf(x);
+#pragma unroll
+    for (int m = 16; m >= 1; m /= 2) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, m));
+    }
+    const float d_inv = 127.0f / amax;
+    q                 = roundf(x * d_inv);
+    d                 = 1.0f / d_inv;
+}
+
+// Value k (k % 32 == lane) of column j into MMQ's blocks (see above).
+__device__ __forceinline__ void q8_put(int8_t * xq, int64_t ncols, int64_t j, int k, signed char q, float d) {
+    int8_t * blk = xq + ((int64_t) (k / 128) * ncols + j) * 144;
+    blk[16 + k % 128] = q;
+    if (k % 32 == 0) {
+        ((float *) blk)[(k % 128) / 32] = d;
+    }
+}
+
+// One block per token. Q: the output quantized (see above).
+template <bool Q>
 __global__ void __launch_bounds__(MI_THREADS) mtp_in_kernel(legion_mtp_in p) {
     __shared__ float red[MI_HC + 1][32];
     const int tid = threadIdx.x;
@@ -105,19 +138,42 @@ __global__ void __launch_bounds__(MI_THREADS) mtp_in_kernel(legion_mtp_in p) {
     block_sums(s, red);
 
     float * out = p.dst + t * (int64_t) (2 * e) * MI_HC;
+    // Quantized: column t hc + c of hc n, 2e values each (e a multiple of 32, so every warp's
+    // 32 columns col below are one group; the loops' bounds are whole warps).
+    int8_t * xq = reinterpret_cast<int8_t *>(p.dst);
+    const int64_t ncols = (int64_t) p.n * MI_HC;
     const float se = rms_scale(s[0], e, p.eps);
     for (int col = tid; col < e; col += MI_THREADS) {
         const float en = __fmul_rn(__fmul_rn(se, tok[col]), p.ge[col]);
+        if constexpr (Q) {
+            // The same values in every stream's column: one group's q and scale for all.
+            signed char q;
+            float d;
+            q8_of(en, q, d);
 #pragma unroll
-        for (int c = 0; c < MI_HC; c++) {
-            out[c * 2 * e + col] = en;
+            for (int c = 0; c < MI_HC; c++) {
+                q8_put(xq, ncols, t * MI_HC + c, col, q, d);
+            }
+        } else {
+#pragma unroll
+            for (int c = 0; c < MI_HC; c++) {
+                out[c * 2 * e + col] = en;
+            }
         }
     }
 #pragma unroll
     for (int c = 0; c < MI_HC; c++) {
         const float sc = rms_scale(s[1 + c], e, p.eps);
         for (int col = tid; col < e; col += MI_THREADS) {
-            out[c * 2 * e + e + col] = __fmul_rn(__fmul_rn(sc, h[c * e + col]), p.gh[c * e + col]);
+            const float hn = __fmul_rn(__fmul_rn(sc, h[c * e + col]), p.gh[c * e + col]);
+            if constexpr (Q) {
+                signed char q;
+                float d;
+                q8_of(hn, q, d);
+                q8_put(xq, ncols, t * MI_HC + c, e + col, q, d);
+            } else {
+                out[c * 2 * e + e + col] = hn;
+            }
         }
     }
 }
@@ -126,6 +182,8 @@ __global__ void __launch_bounds__(MI_THREADS) mtp_in_kernel(legion_mtp_in p) {
 
 // The kernel as the CUDA runtime knows it (its host stub), for Rust's cudaLaunchKernel
 // (src/model/qwen4/mtp_in.rs): one block of MI_THREADS per token, no dynamic shared memory.
-extern "C" const void * const legion_mtp_in_kernels[1] = {
-    reinterpret_cast<const void *>(&mtp_in_kernel),
+// F32 output, then quantized.
+extern "C" const void * const legion_mtp_in_kernels[2] = {
+    reinterpret_cast<const void *>(&mtp_in_kernel<false>),
+    reinterpret_cast<const void *>(&mtp_in_kernel<true>),
 };

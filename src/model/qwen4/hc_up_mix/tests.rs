@@ -766,3 +766,79 @@ fn cpu_mix_cast_is_ggmls_cast() {
         assert!(built_f32 == fused_f32, "keep_f32 {keep_f32}: F32 moved");
     }
 }
+
+/// The BF16 up-mix rebuilding `xn`, its F32 values read by another node as well as by ggml's
+/// cast to BF16 (through a reshape with `view`), its inputs freed after it, on the CPU: as
+/// built, or (`early`) with the cast made the mix's before the graph is planned again
+/// ([`EARLY_CAST_RELAYOUT`](crate::model::core::node_fuse::fold::EARLY_CAST_RELAYOUT)) and
+/// the node fusion run. The cast's bytes, the other reader's and what the fusion did.
+fn early_cast_case(early: bool, view: bool) -> (Vec<u8>, Vec<u8>, Counts) {
+    use crate::model::core::node_fuse::fold::EARLY_CAST_RELAYOUT;
+    let mut cpu = Backend::cpu().unwrap();
+    cpu.set_threads(4);
+    let (e, rank, n, hc) = (128i64, 64i64, 9i64, 4i64);
+    let k = hc * e;
+    let ctx = Context::new(64, 64);
+    let input = |ty, ne: &[i64]| ctx.new_tensor(ty, ne).as_input();
+    let up = input(types::BF16, &[rank, k]);
+    let lo = input(types::F32, &[rank, n]);
+    let res = input(types::F32, &[e, hc, n]);
+    let sc = input(types::F32, &[hc, n]);
+    let g = input(types::F32, &[k]);
+    // The mix's inputs made in the graph, so they are freed once it has read them.
+    let lo2 = ctx.scale(lo, 1.5);
+    let res2 = ctx.scale(res, 0.5);
+    let mixed = up_mix_rebuilt(&ctx, up, lo2, res2, sc, g, hc, 0.25);
+    let src = if view {
+        ctx.reshape_2d(mixed, k, n)
+    } else {
+        mixed
+    };
+    let cast = ctx.cast(src, types::BF16);
+    // Readers after both, so the cast lives past the mix's inputs.
+    let other = ctx.scale(mixed, 2.0).as_output();
+    let read = ctx.scale(ctx.cast(cast, types::F32), 1.0).as_output();
+    let mut graph = ctx.new_graph(64);
+    graph.expand(other);
+    graph.expand(read);
+    let allocator = ComputeAllocator::new(cpu.buffer_type());
+    let allocator = if early {
+        allocator.with_relayout(EARLY_CAST_RELAYOUT)
+    } else {
+        allocator
+    };
+    ctx.alloc_graph(&graph, allocator).unwrap();
+    // SAFETY: an allocated graph that has not run.
+    let c = if early {
+        unsafe { rewrite_graph(graph.raw(), false) }
+    } else {
+        Counts::default()
+    };
+    up.set_bytes(&bf16_matrix(rank as usize, k as usize, 81));
+    lo.set_f32(&noise((rank * n) as usize, 82));
+    res.set_f32(&noise((k * n) as usize, 83));
+    sc.set_f32(
+        &noise((hc * n) as usize, 84)
+            .iter()
+            .map(|v| v.abs() + 0.5)
+            .collect::<Vec<_>>(),
+    );
+    g.set_f32(&noise(k as usize, 85));
+    cpu.compute(&graph).unwrap();
+    (read.bytes(), other.bytes(), c)
+}
+
+/// The early cast (#1183) is ggml's cast bit for bit, the F32 values' other reader unmoved, and
+/// the node fusion counts it (it fuses nothing more there).
+#[test]
+fn cpu_early_cast_is_ggmls_cast() {
+    for view in [false, true] {
+        let (built, built_f32, _) = early_cast_case(false, view);
+        let (early, early_f32, c) = early_cast_case(true, view);
+        assert_eq!(c.early_cast, 1, "view {view}: the cast made early");
+        assert_eq!(c.mix_cast, 0, "view {view}: nothing fused after");
+        assert!(built.iter().any(|&b| b != 0), "nothing mixed");
+        assert!(built == early, "view {view}: the cast moved");
+        assert!(built_f32 == early_f32, "view {view}: F32 moved");
+    }
+}

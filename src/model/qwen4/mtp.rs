@@ -158,29 +158,42 @@ impl Model {
             }
             why.is_none()
         };
-        let cat = if fused {
-            super::mtp_in::input(ctx, tok, h, ge, gh, hc, hp.rms_eps)
-        } else {
-            let hn = ctx.mul(
-                ctx.rms_norm(ctx.reshape_3d(h, e, hc, n), hp.rms_eps),
-                ctx.reshape_2d(gh, e, hc),
-            );
-            let en = ctx.mul(ctx.rms_norm(tok, hp.rms_eps), ge);
-            let en = ctx.repeat_4d(ctx.reshape_3d(en, e, 1, n), [e, hc, n, 1]);
-            ctx.concat(en, hn, 0)
+        let eh = w("nextn.eh_proj.weight")?;
+        // The op's values quantized for eh_proj's MMQ where ggml-cuda would run it so: its
+        // product bit for bit, without ggml's quantize pass ([`super::mtp_in::input_q8`]).
+        let q8 = fused && {
+            let why = super::mtp_in::why_not_q8(eh, e, hc, n);
+            if let Some(why) = &why
+                && !super::MTP_IN_Q8_OFF.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                tracing::info!(
+                    "MTP input op writes F32 for eh_proj on prompt take-ins, ggml quantizes it: \
+                     {why}"
+                );
+            }
+            why.is_none()
         };
         // One matrix of `hc * n` columns: with the streams as a batch dimension (`ne[1] = hc`,
         // `ne[2] = n`) ggml ran a quantized mat-vec per token, which read the whole weight again
         // for each and took 92% of a prompt's take-in (17 ms for 1,024 tokens).
-        let res = ctx.reshape_3d(
-            ctx.mul_mat(
-                w("nextn.eh_proj.weight")?,
-                ctx.reshape_2d(cat, 2 * e, hc * n),
-            ),
-            e,
-            hc,
-            n,
-        );
+        let proj = if q8 {
+            let xq = super::mtp_in::input_q8(ctx, tok, h, ge, gh, hc, hp.rms_eps);
+            crate::model::core::mmq_preq::mul_mat_cols(ctx, eh, xq, hc * n)
+        } else {
+            let cat = if fused {
+                super::mtp_in::input(ctx, tok, h, ge, gh, hc, hp.rms_eps)
+            } else {
+                let hn = ctx.mul(
+                    ctx.rms_norm(ctx.reshape_3d(h, e, hc, n), hp.rms_eps),
+                    ctx.reshape_2d(gh, e, hc),
+                );
+                let en = ctx.mul(ctx.rms_norm(tok, hp.rms_eps), ge);
+                let en = ctx.repeat_4d(ctx.reshape_3d(en, e, 1, n), [e, hc, n, 1]);
+                ctx.concat(en, hn, 0)
+            };
+            ctx.mul_mat(eh, ctx.reshape_2d(cat, 2 * e, hc * n))
+        };
+        let res = ctx.reshape_3d(proj, e, hc, n);
 
         let (x, inject) = self.hc_mix(ctx, res, &format!("blk.{il}.hc_attn"), true, true)?;
         if n_out == 0 {

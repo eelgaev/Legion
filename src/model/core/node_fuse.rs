@@ -118,6 +118,10 @@ pub(crate) struct Counts {
     pub mix_cast: usize,
     /// Of those, mixes whose F32 values nothing else reads, so not written.
     pub mix_f32_skipped: usize,
+    /// BF16 hyper-connection mixes writing their cast to BF16 themselves, the cast planned as
+    /// their source by the fold's relayout ([`fold`]'s early casts, `--dense-fp8-prompt`,
+    /// #1183). Counted, not rewritten.
+    pub early_cast: usize,
     /// BF16 hyper-connection mixes run by the all-gather reading them (#1176).
     pub gather_mix: usize,
     /// F32 copies of a BF16 all-gather's output written by the gather (#1176).
@@ -146,6 +150,9 @@ pub(crate) struct Counts {
     /// qwen4exp's MTP head input as one op instead of ggml's six nodes (prompt take-ins under
     /// `--dense-fp8-prompt`, #1183; [`crate::model::qwen4::mtp_in`]). Counted, not rewritten.
     pub mtp_in: usize,
+    /// Of those, ops writing their output quantized for the `eh_proj` matmul's MMQ
+    /// ([`crate::model::qwen4::mtp_in::input_q8`]). Counted, not rewritten.
+    pub mtp_in_q8: usize,
     /// Nodes turned into `GGML_OP_NONE`.
     pub none: usize,
 }
@@ -207,6 +214,7 @@ unsafe fn fuse(graph: *mut ffi::ggml_cgraph) {
             remap = c.remap,
             mix_cast = c.mix_cast,
             mix_f32_skipped = c.mix_f32_skipped,
+            early_cast = c.early_cast,
             gather_mix = c.gather_mix,
             gather_cast = c.gather_cast,
             fp8_codes = c.fp8_codes,
@@ -216,6 +224,7 @@ unsafe fn fuse(graph: *mut ffi::ggml_cgraph) {
             norm_rope = c.norm_rope,
             ple_ops = c.ple_ops,
             mtp_in = c.mtp_in,
+            mtp_in_q8 = c.mtp_in_q8,
             none = c.none,
             "node fuse: small ggml chains as Legion ops (the first graphs; --node-fuse-ggml off)"
         );
@@ -262,6 +271,11 @@ pub(crate) unsafe fn rewrite_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> 
                     }
                     if crate::model::qwen4::mtp_in::is_mtp_in(g.nodes[i]) {
                         c.mtp_in += 1;
+                        c.mtp_in_q8 +=
+                            usize::from(crate::model::qwen4::mtp_in::is_quantized(g.nodes[i]));
+                    }
+                    if crate::model::qwen4::mix_cast_set(g.nodes[i]).is_some() {
+                        c.early_cast += 1;
                     }
                     g.mix_cast(i, &mut c);
                     if cuda {
@@ -370,6 +384,30 @@ unsafe fn overlap(a: Node, b: Node) -> bool {
     // SAFETY: the caller's.
     let ((a0, a1), (b0, b1)) = unsafe { (span(a), span(b)) };
     a0 < a1 && b0 < b1 && a0 < b1 && b0 < a1
+}
+
+/// The bytes node `n` writes: its own ([`span`]) and, for a BF16 mix writing a cast of its
+/// values (an early cast of [`fold`] or [`Graph::mix_cast`], #1183), the cast's.
+///
+/// # Safety
+/// A valid tensor.
+unsafe fn writes(n: Node) -> [(usize, usize); 2] {
+    // SAFETY: the caller's; a mix's cast is a valid tensor.
+    unsafe {
+        let cast = crate::model::qwen4::mix_cast_set(n).map_or((0, 0), |(c, _)| span(c));
+        [span(n), cast]
+    }
+}
+
+/// Whether node `n` writes memory of `x` ([`writes`]).
+///
+/// # Safety
+/// Valid tensors.
+unsafe fn writes_over(n: Node, x: Node) -> bool {
+    // SAFETY: the caller's.
+    let (w, (b0, b1)) = unsafe { (writes(n), span(x)) };
+    w.iter()
+        .any(|&(a0, a1)| a0 < a1 && b0 < b1 && a0 < b1 && b0 < a1)
 }
 
 /// F32 and contiguous.
@@ -518,7 +556,7 @@ impl Graph {
                     if is_view_op((*n).op) || (*n).op == ffi::ggml_op_GGML_OP_NONE {
                         continue;
                     }
-                    if overlap(n, x) {
+                    if writes_over(n, x) {
                         return false;
                     }
                     for &s in (*n).src.iter() {
@@ -1022,7 +1060,9 @@ impl Graph {
                 if self.none[k] || is_view_op((*n).op) || (*n).op == ffi::ggml_op_GGML_OP_NONE {
                     continue;
                 }
-                if overlap(n, cast) || (*n).src.iter().any(|&s| !s.is_null() && overlap(s, cast)) {
+                if writes_over(n, cast)
+                    || (*n).src.iter().any(|&s| !s.is_null() && overlap(s, cast))
+                {
                     return;
                 }
             }
@@ -1049,8 +1089,9 @@ impl Graph {
                 if self.none[k] || is_view_op((*n).op) || (*n).op == ffi::ggml_op_GGML_OP_NONE {
                     return true;
                 }
-                let (a, b) = span(n);
-                a >= b || !ranges.iter().any(|&(x, y)| x < y && x < b && a < y)
+                writes(n)
+                    .iter()
+                    .all(|&(a, b)| a >= b || !ranges.iter().any(|&(x, y)| x < y && x < b && a < y))
             })
         }
     }
@@ -1114,7 +1155,9 @@ impl Graph {
                 if self.none[k] || is_view_op((*n).op) || (*n).op == ffi::ggml_op_GGML_OP_NONE {
                     continue;
                 }
-                if overlap(n, cast) || (*n).src.iter().any(|&s| !s.is_null() && overlap(s, cast)) {
+                if writes_over(n, cast)
+                    || (*n).src.iter().any(|&s| !s.is_null() && overlap(s, cast))
+                {
                     return;
                 }
             }

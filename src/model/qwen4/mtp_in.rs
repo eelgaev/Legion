@@ -12,8 +12,17 @@
 //! [`crate::model::core::dense_twins::STEP_MAX_TOKENS`] tokens), as the PLE ops
 //! ([`super::ple_fused`]) are by prompt steps: draft passes and the take-ins after decode and
 //! verify steps keep the chain.
+//!
+//! Quantized ([`input_q8`]): where the `eh_proj` weight is Q8_0 and ggml-cuda would run its
+//! matmul through MMQ ([`mmq_preq::fits`]), the op writes its values already quantized in
+//! MMQ's layout, as ggml-cuda's `quantize_mmq_q8_1` would from the F32 values (its arithmetic,
+//! the same compiler flags), and the matmul runs ggml's MMQ on those blocks
+//! ([`mmq_preq::mul_mat_cols`]): ggml's product bit for bit, without the F32 tensor (84 MB a
+//! 1,024-token take-in) written and read back by ggml's quantize pass (about 16 ms of a 32K
+//! prompt on a GB10; 24 MB of blocks instead).
 
 use crate::ggml::{Context, ExternalOp, Tensor, ffi, types};
+use crate::model::core::mmq_preq;
 
 static MTP_IN: ExternalOp = ExternalOp {
     name: "mtp_in",
@@ -37,6 +46,47 @@ pub(super) const MTP_IN_MIN_E: i64 = 1024;
 pub(crate) unsafe fn is_mtp_in(node: *const ffi::ggml_tensor) -> bool {
     // SAFETY: the caller's.
     unsafe { crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &MTP_IN)) }
+}
+
+/// Whether the [`is_mtp_in`] `node` writes its values quantized ([`input_q8`]).
+///
+/// # Safety
+/// `node` is a valid tensor.
+pub(crate) unsafe fn is_quantized(node: *const ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's.
+    unsafe { is_mtp_in(node) && quantized(&*node) }
+}
+
+/// The [`P_Q8`] parameter of an op's node.
+fn quantized(dst: &ffi::ggml_tensor) -> bool {
+    crate::ggml::external_params(dst)[P_Q8] == 1
+}
+
+/// The op's parameter set where it writes its values quantized ([`input_q8`]).
+const P_Q8: usize = 1;
+
+/// Why [`input_q8`] and [`mmq_preq::mul_mat_cols`] do not take the `eh_proj` weight `w` for
+/// `n` tokens of `hc` streams of width `e` (the first reason found), `None` where they do:
+/// a weight [`mmq_preq::fits`] takes for `hc · n` columns, `2e` values a row, `e` a multiple
+/// of 256 (whole MMQ blocks and 32-value groups in each half).
+pub(super) fn why_not_q8(w: Tensor<'_>, e: i64, hc: i64, n: i64) -> Option<String> {
+    if w.ne()[0] != 2 * e || e % 256 != 0 {
+        Some(format!(
+            "eh_proj is {:?} for streams of {e} (rows of 2e, e a multiple of 256 wanted)",
+            w.ne()
+        ))
+    } else if !mmq_preq::fits(w, hc * n) {
+        Some(format!(
+            "eh_proj is {} {:?} for {} columns (a Q8_0 weight on a compute capability 12.x \
+             GPU, rows a multiple of 512 values and 256 columns or more wanted; off with \
+             --hc-quant-ggml)",
+            crate::ggml::type_name(w.ty()),
+            w.ne(),
+            hc * n
+        ))
+    } else {
+        None
+    }
 }
 
 /// Why [`input`] does not take these tensors (the first reason found), `None` where it does:
@@ -100,6 +150,45 @@ pub(super) fn input<'a>(
     eps: f32,
 ) -> Tensor<'a> {
     let [e, n, ..] = tok.ne();
+    check(tok, h, ge, gh, hc);
+    ctx.external_with(
+        &MTP_IN,
+        types::F32,
+        [2 * e, hc, n, 1],
+        &[tok, h, ge, gh],
+        &[eps.to_bits() as i32, 0],
+    )
+}
+
+/// [`input`]'s values quantized for ggml-cuda's MMQ of a Q8_0 `eh_proj` weight (see the module
+/// doc): `hc · n` columns of `2e` values (column `t · hc + c`: token `t`, stream `c`) in
+/// [`mmq_preq`]'s layout, an F32 node of [`mmq_preq::q8_1_bytes`] for
+/// [`mmq_preq::mul_mat_cols`]. `e` a multiple of 256 ([`why_not_q8`]).
+pub(super) fn input_q8<'a>(
+    ctx: &'a Context,
+    tok: Tensor<'a>,
+    h: Tensor<'a>,
+    ge: Tensor<'a>,
+    gh: Tensor<'a>,
+    hc: i64,
+    eps: f32,
+) -> Tensor<'a> {
+    let [e, n, ..] = tok.ne();
+    check(tok, h, ge, gh, hc);
+    assert!(e % 256 == 0, "mtp_in: {e} values a stream");
+    let floats = mmq_preq::q8_1_bytes(2 * e, hc * n).div_ceil(4) as i64;
+    ctx.external_with(
+        &MTP_IN,
+        types::F32,
+        [floats, 1, 1, 1],
+        &[tok, h, ge, gh],
+        &[eps.to_bits() as i32, 1],
+    )
+}
+
+/// [`input`]'s operands as it takes them.
+fn check(tok: Tensor<'_>, h: Tensor<'_>, ge: Tensor<'_>, gh: Tensor<'_>, hc: i64) {
+    let [e, n, ..] = tok.ne();
     assert_eq!(h.ne()[..2], [e * hc, n], "mtp_in: streams");
     for t in [tok, h] {
         assert_eq!(t.ty(), types::F32, "mtp_in: F32 inputs");
@@ -111,13 +200,6 @@ pub(super) fn input<'a>(
             "mtp_in: gammas"
         );
     }
-    ctx.external_with(
-        &MTP_IN,
-        types::F32,
-        [2 * e, hc, n, 1],
-        &[tok, h, ge, gh],
-        &[eps.to_bits() as i32],
-    )
 }
 
 /// RMS norm scale of `x` with `eps`.
@@ -134,13 +216,15 @@ unsafe fn cpu_mtp_in(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
             (*dst.src[2]).data as *const f32,
             (*dst.src[3]).data as *const f32,
         );
-        let (e, hc, n) = (
-            dst.ne[0] as usize / 2,
-            dst.ne[1] as usize,
-            dst.ne[2] as usize,
-        );
+        let (e, n) = (tok.ne[0] as usize, tok.ne[1] as usize);
+        let hc = h.ne[0] as usize / e;
         let eps = f32::from_bits(crate::ggml::external_params(dst)[0] as u32);
+        let q8 = quantized(dst);
         let out = dst.data as *mut f32;
+        // Quantized: one column's values, then its blocks ([`mmq_preq::quantize_ref`]).
+        let len = if q8 { 2 * e } else { 0 };
+        let mut col = vec![0f32; len];
+        let mut blocks = vec![0u8; len / mmq_preq::BLOCK as usize * mmq_preq::BLOCK_BYTES];
         for t in (ith..n).step_by(nth) {
             let row = |x: &ffi::ggml_tensor, len: usize| {
                 std::slice::from_raw_parts(
@@ -151,12 +235,28 @@ unsafe fn cpu_mtp_in(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
             let (tr, hr) = (row(tok, e), row(h, e * hc));
             let se = rms_scale(tr, eps);
             for c in 0..hc {
-                let o = out.add((t * hc + c) * 2 * e);
+                let o = if q8 {
+                    col.as_mut_ptr()
+                } else {
+                    out.add((t * hc + c) * 2 * e)
+                };
                 let hs = &hr[c * e..(c + 1) * e];
                 let sh = rms_scale(hs, eps);
                 for i in 0..e {
                     *o.add(i) = (se * tr[i]) * *ge.add(i);
                     *o.add(e + i) = (sh * hs[i]) * *gh.add(c * e + i);
+                }
+                if q8 {
+                    mmq_preq::quantize_ref(&col, 2 * e, 1, &mut blocks);
+                    let j = t * hc + c;
+                    for (b, blk) in blocks.chunks_exact(mmq_preq::BLOCK_BYTES).enumerate() {
+                        let at = (b * n * hc + j) * mmq_preq::BLOCK_BYTES;
+                        std::ptr::copy_nonoverlapping(
+                            blk.as_ptr(),
+                            (out as *mut u8).add(at),
+                            mmq_preq::BLOCK_BYTES,
+                        );
+                    }
                 }
             }
         }
@@ -198,7 +298,7 @@ mod cuda {
     const THREADS: u32 = 1024;
 
     unsafe extern "C" {
-        static legion_mtp_in_kernels: [*const c_void; 1];
+        static legion_mtp_in_kernels: [*const c_void; 2];
         fn cudaLaunchKernel(
             func: *const c_void,
             grid: Dim3,
@@ -213,10 +313,22 @@ mod cuda {
         // SAFETY: a node made by `input`, device tensors of the stream's device.
         unsafe {
             let (tok, h) = (&*dst.src[0], &*dst.src[1]);
-            let (e, hc, n) = (dst.ne[0] / 2, dst.ne[1], dst.ne[2]);
-            if hc != super::MTP_IN_HC || e < super::MTP_IN_MIN_E || n < 1 || n > i32::MAX as i64 {
+            let (e, n) = (tok.ne[0], tok.ne[1]);
+            let hc = h.ne[0] / e;
+            let q8 = super::quantized(dst);
+            let fits = if q8 {
+                e % 256 == 0 && ffi::ggml_nbytes(dst) >= super::mmq_preq::q8_1_bytes(2 * e, hc * n)
+            } else {
+                dst.ne[..3] == [2 * e, hc, n]
+            };
+            if !fits
+                || hc != super::MTP_IN_HC
+                || e < super::MTP_IN_MIN_E
+                || n < 1
+                || n > i32::MAX as i64
+            {
                 return Err(format!(
-                    "mtp_in: shape the kernel does not take (e {e}, hc {hc}, n {n})"
+                    "mtp_in: shape the kernel does not take (e {e}, hc {hc}, n {n}, q8 {q8})"
                 ));
             }
             let mut p = Params {
@@ -244,7 +356,7 @@ mod cuda {
             let mut args = [(&mut p as *mut Params).cast::<c_void>()];
             // SAFETY: the kernel takes one argument of type `Params`; the launch copies it.
             match cudaLaunchKernel(
-                legion_mtp_in_kernels[0],
+                legion_mtp_in_kernels[usize::from(q8)],
                 grid,
                 block,
                 args.as_mut_ptr(),

@@ -377,6 +377,40 @@ unsafe fn lob_data(lob: &ffi::ggml_tensor, rank: usize, n: usize) -> *mut u16 {
 pub(crate) unsafe fn mix_cast_reads(node: *const ffi::ggml_tensor) -> Option<Vec<(usize, usize)>> {
     // SAFETY: the caller's.
     unsafe {
+        if (*node).src[MIX_CAST_SRC].is_null() {
+            mix_reads(node)
+        } else {
+            None
+        }
+    }
+}
+
+/// For a BF16 mix node with a BF16 copy set before the graph was planned again (the early cast
+/// of [`crate::model::core::node_fuse::fold`], #1183): that copy and the bytes the node reads
+/// ([`mix_cast_reads`]'s ranges). `None` for any other node.
+///
+/// # Safety
+/// As [`mix_cast_reads`].
+pub(crate) unsafe fn mix_cast_set(
+    node: *const ffi::ggml_tensor,
+) -> Option<(*mut ffi::ggml_tensor, Vec<(usize, usize)>)> {
+    // SAFETY: the caller's.
+    unsafe {
+        let cast = (*node).src[MIX_CAST_SRC];
+        if cast.is_null() {
+            return None;
+        }
+        mix_reads(node).map(|r| (cast, r))
+    }
+}
+
+/// [`mix_cast_reads`] whether or not the node has a copy set.
+///
+/// # Safety
+/// As [`mix_cast_reads`].
+unsafe fn mix_reads(node: *const ffi::ggml_tensor) -> Option<Vec<(usize, usize)>> {
+    // SAFETY: the caller's.
+    unsafe {
         let op = crate::ggml::op_of(node)?;
         let t = &*node;
         if !std::ptr::eq(op, &HC_UP_MIX)
@@ -384,7 +418,6 @@ pub(crate) unsafe fn mix_cast_reads(node: *const ffi::ggml_tensor) -> Option<Vec
             || (*t.src[0]).type_ != types::BF16
             || t.src[1].is_null()
             || t.src[2].is_null()
-            || !t.src[MIX_CAST_SRC].is_null()
             || t.data.is_null()
         {
             return None;

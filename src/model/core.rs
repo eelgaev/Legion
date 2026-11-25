@@ -2094,8 +2094,12 @@ impl Model {
     /// ([`dense_twins`]) in prompt steps too, as W8A8 GEMMs, on GPUs with E4M3 tensor cores.
     /// Whether they do: the file has copies and the GPU those tensor cores.
     pub fn set_dense_fp8_prompt(&mut self, on: bool) -> bool {
-        self.dense_twins
-            .set_prompt(on && crate::model::fp8::fp8_mma())
+        let on = self
+            .dense_twins
+            .set_prompt(on && crate::model::fp8::fp8_mma());
+        // The prompt path's early BF16 casts of the FFN mixers (#1183).
+        node_fuse::fold::set_early_cast(on);
+        on
     }
 
     /// Which steps read the dense projections' FP8 copies (`--dense-fp8`, [`dense_twins`]): 0

@@ -44,8 +44,8 @@ pub use hc_up_mix::bench as hc_up_mix_bench;
 #[cfg(feature = "cuda")]
 pub(crate) use hc_up_mix::launch_mix;
 pub(crate) use hc_up_mix::{
-    is_bf16_mix, lazy_mix_target, mix_cast_reads, set_by_exchange as set_mix_by_exchange,
-    set_lazy_streams, set_mix_cast,
+    is_bf16_mix, lazy_mix_target, mix_cast_reads, mix_cast_set,
+    set_by_exchange as set_mix_by_exchange, set_lazy_streams, set_mix_cast,
 };
 pub use hc_up_mix::{
     set_gpu as set_up_mix_gpu, set_rebuild as set_up_mix_rebuild, set_up_mix, set_up_mix_bf16,
@@ -678,6 +678,10 @@ static PLE_OPS_OFF: AtomicBool = AtomicBool::new(false);
 /// Whether the MTP head said why its prompt take-ins keep ggml's input chain
 /// ([`mtp_in`]; once per process).
 static MTP_IN_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Whether the MTP head said why its input op writes F32 for `eh_proj` rather than MMQ's
+/// blocks ([`mtp_in::input_q8`]; once per process).
+static MTP_IN_Q8_OFF: AtomicBool = AtomicBool::new(false);
 
 /// Logs once (per `flag`) that `what` is off for prompt steps, and `why`.
 fn off_once(flag: &AtomicBool, what: &str, why: &str) {
