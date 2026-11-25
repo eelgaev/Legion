@@ -116,6 +116,16 @@ pub fn set_down_x_prefetch(on: bool) {
     DOWN_X_PREFETCH.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+static GLU_WS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether the routed experts' fused gate/up GEMM of prompt steps runs its 128-token tiles on
+/// the kernel with a copy warp ([`GEMM_GLU_WS`], #1183) instead of the plain one
+/// ([`GEMM_DEFAULT`]). The same bits either way. On by default; `legion serve
+/// --no-nvfp4-glu-ws` turns it off for comparisons.
+pub fn set_glu_ws(on: bool) {
+    GLU_WS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 static PAD_SKIP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Whether a routed SwiGLU FFN on the grouped mv kernels ([`swiglu_id_rows`] with a row map,
@@ -1405,6 +1415,25 @@ impl GemmTune {
     pub fn is_stream(self) -> bool {
         self.stages == 9 && self.ctas == 9
     }
+
+    /// The grouped fused gate/up GEMM's 128-token tile with a copy warp (`nvfp4_glu_ws` in
+    /// `src/cuda/sm90/nvfp4_glu_ws.cuh`, #1183): eight warps multiply what a ninth copies into
+    /// a ring of three stages on mbarriers. `v` 1: the activation rows by bulk copies, one CTA
+    /// per SM looping over the tiles; 2: by 16-byte copies, one CTA per SM; 3: as 1 with a CTA
+    /// per tile. Its code: `v * 1000 + 98`. The same bits as every other tune; launches it does
+    /// not take (no sm_90+ code, unaligned weights) run the default kernel.
+    pub const fn glu_ws(v: i32) -> Self {
+        Self {
+            stages: 9,
+            ctas: 8,
+            warps: v,
+        }
+    }
+
+    /// Whether this is a [`GemmTune::glu_ws`] tune.
+    pub fn is_glu_ws(self) -> bool {
+        self.stages == 9 && self.ctas == 8
+    }
 }
 
 /// The GEMM's default: three stages, one CTA per SM.
@@ -1567,6 +1596,21 @@ pub fn glu_gemm_tile(k: i64, n_expert: i64, per: i64) -> (i32, GemmTune) {
     }
     let nt = tokens_tile(per, 16).max(4);
     (nt, grouped_gemm_tune(k, n_expert, 2, nt, true))
+}
+
+/// The grouped fused gate/up GEMM's kernel with a copy warp, bulk activation copies, one CTA
+/// per SM ([`GemmTune::glu_ws`] 1): the default of its 128-token tiles (see [`glu_ws_tune`]).
+pub const GEMM_GLU_WS: GemmTune = GemmTune::glu_ws(1);
+
+/// The variant a grouped fused gate/up GEMM of `8 * nt`-token tiles launches for `tune`:
+/// [`GEMM_GLU_WS`] for the default tune's 128-token tiles unless [`set_glu_ws`] turned it off,
+/// `tune` otherwise. The same bits either way.
+pub fn glu_ws_tune(nt: i32, tune: GemmTune) -> GemmTune {
+    if nt == 16 && tune == GEMM_DEFAULT && GLU_WS.load(std::sync::atomic::Ordering::Relaxed) {
+        GEMM_GLU_WS
+    } else {
+        tune
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -2261,6 +2305,15 @@ mod cuda {
             0 if forced_pf() != 0 => forced_pf(),
             0 if pf32() && matches!((nt, tune.code()), (16, 31) | (8, 31) | (8, 41)) => 2048,
             d => d,
+        };
+        // The copy-warp kernel (#1183) for the default tune's 128-token tiles; the bench's
+        // prefetch, diagnostic and L1 runs are the plain kernel's (a forced copy-warp tune too).
+        let tune = if diag | l1() == 0 {
+            glu_ws_tune(nt, tune)
+        } else if tune.is_glu_ws() {
+            GEMM_DEFAULT
+        } else {
+            tune
         };
         let code = tune.code() + 100 * (diag | l1());
         // SAFETY: parameters checked by the caller; the node's stream.

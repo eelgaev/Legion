@@ -347,6 +347,38 @@ fn gemm_tune_codes() {
     assert!(!GEMM_VERIFY.is_stream() && !GEMM_DEFAULT.is_stream());
 }
 
+/// The fused gate/up GEMM's copy-warp kernel (#1183): its own codes (... 98), the default of
+/// the default tune's 128-token tiles only.
+#[test]
+fn glu_ws_tunes() {
+    assert_eq!(GEMM_GLU_WS.code(), 1098);
+    for v in 1..=3 {
+        let t = GemmTune::glu_ws(v);
+        assert_eq!(t.code(), v * 1000 + 98);
+        assert_eq!(GemmTune::from_code(t.code()), t);
+        assert!(t.is_glu_ws() && !t.is_stream());
+        assert!(!gemm_tune_fits(2, 16, t));
+    }
+    for t in [GEMM_DEFAULT, GEMM_DOWN, GEMM_GLU_SHORT, GEMM_STREAM_GLU] {
+        assert!(!t.is_glu_ws());
+    }
+    // On by default (set_glu_ws): the default tune's 128-token tiles; other tiles and tunes
+    // (a forced one, the short steps' 64-token tile) as they were.
+    assert_eq!(glu_ws_tune(16, GEMM_DEFAULT), GEMM_GLU_WS);
+    assert_eq!(glu_ws_tune(8, GEMM_DEFAULT), GEMM_DEFAULT);
+    assert_eq!(glu_ws_tune(4, GEMM_DEFAULT), GEMM_DEFAULT);
+    assert_eq!(glu_ws_tune(8, GEMM_GLU_SHORT), GEMM_GLU_SHORT);
+    let two = GemmTune::from_code(21);
+    assert_eq!(glu_ws_tune(16, two), two);
+    assert_eq!(glu_ws_tune(16, GemmTune::glu_ws(2)), GemmTune::glu_ws(2));
+    // Qwen3.8-Flash-Next's prompt steps of 8,067 and 12,288 tokens (157 and 240 pairs an
+    // expert): 128-token tiles on the default tune, so the copy-warp kernel.
+    for per in [157, 240] {
+        let (nt, tune) = glu_gemm_tile(2560, 512, per);
+        assert_eq!(glu_ws_tune(nt, tune), GEMM_GLU_WS);
+    }
+}
+
 #[test]
 fn dense_gemm_tune_at_33_64_tokens() {
     // Gemma 4 31B's verify steps of 5-8 users (33-64 rows): the streaming GEMM from 4096
@@ -927,6 +959,8 @@ fn xpf_reset() {
     force_gemm_tune(None, None);
     force_gemm_xpf(None);
     set_expert_mv_max(MV_MAX_N);
+    set_expert_mv_split(MvSplit::Step);
+    set_glu_ws(true);
 }
 
 /// Random BF16 values (bits) of `n` elements.
@@ -1300,6 +1334,316 @@ fn cuda_down_x_prefetch_bench() {
             }
             assert!(same.iter().all(|&s| s), "{op} at {n_tok}: bits differ");
         }
+    }
+    xpf_reset();
+}
+
+/// The fused gate/up GEMM's kernels the copy-warp tests compare (#1183): the plain kernel
+/// (`--no-nvfp4-glu-ws`), then [`GemmTune::glu_ws`] 1 (the default), 2 and 3.
+#[cfg(feature = "cuda")]
+const GLU_WS_RUNS: [(&str, i32); 4] = [
+    ("old (plain kernel)", 0),
+    ("ws bulk x, persistent", 1),
+    ("ws cp.async x, persistent", 2),
+    ("ws bulk x, CTA a tile", 3),
+];
+
+/// Launches the fused gate/up GEMM from now on as [`GLU_WS_RUNS`]'s variant `v` (0: the plain
+/// kernel), at `8 * nt`-token tiles if set.
+#[cfg(feature = "cuda")]
+fn glu_ws_run(v: i32, nt: Option<i32>) {
+    set_glu_ws(v != 0);
+    force_gemm_tune((v > 1).then(|| GemmTune::glu_ws(v)), nt);
+}
+
+/// One copy-warp bit test case: a routed SwiGLU GEMM of `n_expert` NVFP4 experts (`hidden` by
+/// `ffn`), `n_used` per token, the routing `ids` (-1: a skipped pair, the node marked by
+/// [`skips`]), `n_x` input rows a token; `split`: under `--nvfp4-expert-mv-split expert` (the
+/// GEMM takes the experts of more than the cutoff's pairs), else every expert on the GEMM;
+/// `limit` above 0: GLM-5.3-Flash's clamp.
+#[cfg(feature = "cuda")]
+struct GluWsCase {
+    name: &'static str,
+    hidden: usize,
+    ffn: usize,
+    n_expert: usize,
+    n_used: usize,
+    n_x: usize,
+    ids: Vec<i32>,
+    split: bool,
+    limit: f32,
+}
+
+/// The fused gate/up GEMM of `case` on `gpu` at 128-token tiles, every [`GLU_WS_RUNS`] variant
+/// against the plain kernel: the same bits.
+#[cfg(feature = "cuda")]
+fn glu_ws_case(gpu: &mut crate::ggml::Backend, case: &GluWsCase) {
+    use crate::ggml::ComputeAllocator;
+    let (hidden, ffn, n_expert, n_used) = (case.hidden, case.ffn, case.n_expert, case.n_used);
+    let n_tok = case.ids.len() / n_used;
+    let blocks = |k: usize, m: usize| k / 64 * 36 * m * n_expert;
+    let weights = Context::new(8, 0);
+    let wg = weights.new_tensor(types::NVFP4, &[hidden as i64, ffn as i64, n_expert as i64]);
+    let wu = weights.new_tensor(types::NVFP4, &[hidden as i64, ffn as i64, n_expert as i64]);
+    let scales = [0, 1].map(|_| weights.new_tensor(types::F32, &[n_expert as i64]));
+    weights.alloc_tensors(gpu.buffer_type()).unwrap();
+    wg.set_bytes(&gemm_bench::weights(blocks(hidden, ffn), 4));
+    wu.set_bytes(&gemm_bench::weights(blocks(hidden, ffn), 5));
+    for (i, s) in scales.iter().enumerate() {
+        let v: Vec<f32> = (0..n_expert)
+            .map(|e| 0.002 + ((e * 7 + i * 3) % 1000) as f32 * 1e-5)
+            .collect();
+        s.set_f32(&v);
+    }
+    let ctx = Context::new(16, 16);
+    let x = ctx
+        .new_tensor(types::BF16, &[hidden as i64, case.n_x as i64, n_tok as i64])
+        .as_input();
+    let id = ctx
+        .new_tensor(types::I32, &[n_used as i64, n_tok as i64])
+        .as_input();
+    let glu = swiglu_id_clamped(
+        &ctx,
+        wg,
+        wu,
+        x,
+        id,
+        Some(scales[0]),
+        Some(scales[1]),
+        case.limit,
+    );
+    let skipped = case.ids.contains(&-1);
+    let glu = if skipped { skips(glu) } else { glu }.as_output();
+    let mut graph = ctx.new_graph(16);
+    graph.expand(glu);
+    ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+        .unwrap();
+    x.set_bytes(&xpf_bf16(hidden * case.n_x * n_tok, 11));
+    id.set_i32(&case.ids);
+    if case.split {
+        set_expert_mv_split(MvSplit::Expert);
+    } else {
+        set_expert_mv_max(0);
+    }
+    let mut want = Vec::new();
+    for &(name, v) in &GLU_WS_RUNS {
+        glu_ws_run(v, Some(16));
+        gpu.compute(&graph).unwrap();
+        let got = glu.bytes();
+        if v == 0 {
+            want = got;
+            continue;
+        }
+        assert_eq!(got.len(), want.len());
+        let differ = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+        assert_eq!(differ, 0, "{}, {name}: {differ} bytes differ", case.name);
+    }
+    xpf_reset();
+}
+
+/// The fused gate/up GEMM's copy-warp kernel (#1183) keeps the plain kernel's bits at
+/// 128-token tiles, each variant: experts of 1, 15, 16, 17, 33, 64 and more pairs (last tiles
+/// partial), random routings over 512 and 64 experts, an input row per pair (n_x = n_used),
+/// partial row tiles (320 rows), skipped pairs (ids of -1: the zeros past the plan's tiles), a
+/// pair-count split (the GEMM's experts selected) and the clamp. Rows not 16-byte aligned (k
+/// 320: 180-byte rows) fall back to the plain kernel, the same bits too.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_glu_ws_keeps_bits() {
+    let _lock = XPF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut gpu = xpf_gpu();
+    let special = [
+        1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 200, 300,
+    ];
+    let small = [1, 15, 16, 17, 33, 64, 65, 130];
+    let flash = |name, ids, n_x, split, limit| GluWsCase {
+        name,
+        hidden: 2560,
+        ffn: 640,
+        n_expert: 512,
+        n_used: 10,
+        n_x,
+        ids,
+        split,
+        limit,
+    };
+    let random = |n_tok, pool, seed| gemm_bench::routing(10, n_tok, 512, pool, seed);
+    let counted = counted_routing(&spread_counts(&special, 512, 10, 400), 10, 400);
+    // A rank holding a third of the experts (--tp-moe-ep): the others' ids -1.
+    let skipping: Vec<i32> = counted
+        .iter()
+        .map(|&e| if e % 3 == 0 { e } else { -1 })
+        .collect();
+    let small_counted = counted_routing(&spread_counts(&small, 24, 4, 200), 4, 200);
+    let cases = [
+        // Qwen3.8-Flash-Next's routed experts (hidden 2560, 640 per expert, 512, top 10).
+        flash("flash-next counted", counted.clone(), 1, false, 0.0),
+        flash("flash-next a row a pair", counted.clone(), 10, false, 0.0),
+        flash("flash-next random 512", random(1500, 512, 7), 1, false, 0.0),
+        flash("flash-next random 64", random(700, 64, 8), 1, false, 0.0),
+        flash("flash-next skipped pairs", skipping, 1, false, 0.0),
+        // 300 tokens over 64 experts: ~47 pairs each, most above the cutoff (32).
+        flash("flash-next split", random(300, 64, 9), 1, true, 0.0),
+        flash("flash-next clamped", counted, 1, false, 7.0),
+        // 320 output rows (a partial row tile), 256-wide rows (144 bytes: aligned).
+        GluWsCase {
+            name: "small aligned",
+            hidden: 256,
+            ffn: 320,
+            n_expert: 24,
+            n_used: 4,
+            n_x: 1,
+            ids: small_counted.clone(),
+            split: false,
+            limit: 0.0,
+        },
+        // 320-wide rows: 180 bytes, not aligned (the plain kernel's).
+        GluWsCase {
+            name: "small unaligned",
+            hidden: 320,
+            ffn: 256,
+            n_expert: 24,
+            n_used: 4,
+            n_x: 4,
+            ids: small_counted,
+            split: false,
+            limit: 0.0,
+        },
+    ];
+    for case in &cases {
+        glu_ws_case(&mut gpu, case);
+        eprintln!("{}: the same bits", case.name);
+    }
+}
+
+/// The fused gate/up GEMM (Qwen3.8-Flash-Next, 512 experts, top 10) at 12,288- and 8,067-token
+/// prompt steps on the plain kernel (old) and the copy-warp kernel's variants (#1183):
+/// microseconds a layer (median and best of 5 rounds, the variants taking turns, each round
+/// starting one further on), TFLOP/s and the bytes moved a second at the median, and whether
+/// the bits are the old ones. `*` marks the default.
+/// `cargo test --release --features cuda --lib -- --ignored cuda_glu_ws_bench --nocapture`.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU; a benchmark"]
+fn cuda_glu_ws_bench() {
+    use crate::ggml::ComputeAllocator;
+    let _lock = XPF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut gpu = xpf_gpu();
+    let (hidden, ffn, n_expert, n_used) = (2560usize, 640usize, 512usize, 10usize);
+    const LAYERS: usize = 4;
+    const ROUNDS: usize = 5;
+    let blocks = |k: usize, m: usize| k / 64 * 36 * m * n_expert;
+    let weights = Context::new(8, 0);
+    let wg = weights.new_tensor(types::NVFP4, &[hidden as i64, ffn as i64, n_expert as i64]);
+    let wu = weights.new_tensor(types::NVFP4, &[hidden as i64, ffn as i64, n_expert as i64]);
+    let scales = [0, 1].map(|_| weights.new_tensor(types::F32, &[n_expert as i64]));
+    weights.alloc_tensors(gpu.buffer_type()).unwrap();
+    wg.set_bytes(&gemm_bench::weights(blocks(hidden, ffn), 4));
+    wu.set_bytes(&gemm_bench::weights(blocks(hidden, ffn), 5));
+    for s in scales {
+        s.set_f32(&vec![0.004; n_expert]);
+    }
+    let default = GLU_WS_RUNS
+        .iter()
+        .position(|&(_, v)| v == GEMM_GLU_WS.warps)
+        .unwrap();
+    for n_tok in [12288usize, 8067] {
+        let ctx = Context::new(16 + 24 * LAYERS, 16 * LAYERS + 16);
+        let x = ctx
+            .new_tensor(types::BF16, &[hidden as i64, 1, n_tok as i64])
+            .as_input();
+        let ids: Vec<_> = (0..LAYERS)
+            .map(|_| {
+                ctx.new_tensor(types::I32, &[n_used as i64, n_tok as i64])
+                    .as_input()
+            })
+            .collect();
+        let mut graph = ctx.new_graph(16 * LAYERS + 16);
+        let outs: Vec<_> = ids
+            .iter()
+            .map(|&id| {
+                let y =
+                    swiglu_id(&ctx, wg, wu, x, id, Some(scales[0]), Some(scales[1])).as_output();
+                graph.expand(y);
+                y
+            })
+            .collect();
+        ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+            .unwrap();
+        x.set_bytes(&xpf_bf16(hidden * n_tok, 5 + n_tok as u64));
+        for (l, id) in ids.iter().enumerate() {
+            id.set_i32(&gemm_bench::routing(
+                n_used,
+                n_tok,
+                n_expert,
+                n_expert,
+                1 + l as u64,
+            ));
+        }
+        // A warm-up run of each (its bits against the old one's), then the rounds, the
+        // variants taking turns.
+        let nv = GLU_WS_RUNS.len();
+        let mut want = Vec::new();
+        let mut same = vec![true; nv];
+        for (vi, &(_, v)) in GLU_WS_RUNS.iter().enumerate() {
+            glu_ws_run(v, None);
+            gpu.compute(&graph).unwrap();
+            let got: Vec<Vec<u8>> = outs.iter().map(|o| o.bytes()).collect();
+            if vi == 0 {
+                want = got;
+            } else {
+                same[vi] = got == want;
+            }
+        }
+        let mut times = vec![Vec::with_capacity(ROUNDS); nv];
+        for round in 0..ROUNDS {
+            for i in 0..nv {
+                let vi = (round + i) % nv;
+                glu_ws_run(GLU_WS_RUNS[vi].1, None);
+                let t = std::time::Instant::now();
+                gpu.compute(&graph).unwrap();
+                times[vi].push(t.elapsed().as_secs_f64() / LAYERS as f64);
+            }
+        }
+        xpf_reset();
+        for t in &mut times {
+            t.sort_by(f64::total_cmp);
+        }
+        let median: Vec<f64> = times.iter().map(|t| t[t.len() / 2]).collect();
+        let best: Vec<f64> = times.iter().map(|t| t[0]).collect();
+        // A layer: every expert's gate and up weights, the tokens' rows, each pair's output
+        // row; two products of k per output, gate and up.
+        let pairs = (n_used * n_tok) as f64;
+        let (w_bytes, x_bytes, out_bytes) = (
+            2.0 * blocks(hidden, ffn) as f64,
+            (n_tok * hidden * 2) as f64,
+            pairs * ffn as f64 * 2.0,
+        );
+        let bytes = w_bytes + x_bytes + out_bytes;
+        let flops = pairs * 2.0 * ffn as f64 * hidden as f64 * 2.0;
+        eprintln!(
+            "swiglu at {n_tok} tokens ({:.0} MB a layer: {:.0} weights, {:.0} in, {:.0} out)",
+            bytes / 1e6,
+            w_bytes / 1e6,
+            x_bytes / 1e6,
+            out_bytes / 1e6
+        );
+        for (vi, &(name, v)) in GLU_WS_RUNS.iter().enumerate() {
+            eprintln!(
+                "  {}{name:<26} {v}: median {:>8.1} us/layer ({:>5.3}x old), min {:>8.1} \
+                 ({:>5.3}x)  {:>5.1} TFLOP/s  {:>6.1} GB/s  {}",
+                if vi == default { '*' } else { ' ' },
+                median[vi] * 1e6,
+                median[0] / median[vi],
+                best[vi] * 1e6,
+                best[0] / best[vi],
+                flops / median[vi] / 1e12,
+                bytes / median[vi] / 1e9,
+                if same[vi] { "same bits" } else { "BITS DIFFER" }
+            );
+        }
+        assert!(same.iter().all(|&s| s), "swiglu at {n_tok}: bits differ");
     }
     xpf_reset();
 }
