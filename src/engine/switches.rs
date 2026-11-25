@@ -164,6 +164,12 @@ pub struct Switches {
     /// W8A16 FP8 matmuls of 5-64 tokens on the sliced-K GEMM
     /// ([`crate::model::fp8::set_sliced_k`]).
     pub fp8_sliced_k: Option<bool>,
+    /// W8A8 FP8 prompt GEMMs' outputs by TMA stores
+    /// ([`crate::model::fp8::set_tma_store`]; on by default).
+    pub fp8_tma_store: Option<bool>,
+    /// The qkv GEMM with the conv in its epilogue's outputs by TMA stores
+    /// ([`crate::model::fp8::set_conv_tma_store`]; on by default).
+    pub fp8_conv_tma_store: Option<bool>,
     /// W8A8 FP8 prompt matmuls on the Hopper wgmma GEMM, untested on hardware
     /// ([`crate::model::wgmma_gemm::set_enabled`]).
     pub hopper_gemm: Option<bool>,
@@ -661,6 +667,11 @@ impl Switches {
             crate::model::fp8::set_small_batch_gemv,
         );
         set(self.fp8_sliced_k, crate::model::fp8::set_sliced_k);
+        set(self.fp8_tma_store, crate::model::fp8::set_tma_store);
+        set(
+            self.fp8_conv_tma_store,
+            crate::model::fp8::set_conv_tma_store,
+        );
         set(self.hopper_gemm, crate::model::wgmma_gemm::set_enabled);
         set(
             self.hopper_attn,

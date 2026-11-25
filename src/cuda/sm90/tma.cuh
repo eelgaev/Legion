@@ -48,5 +48,28 @@ __device__ __forceinline__ void tma_2d(void * dst, const CUtensorMap * map, int 
         "l"((uint64_t) map), "r"(c0), "r"(c1), "r"(saddr(bar))
         : "memory");
 }
+// This thread's writes of shared memory visible to the async proxy: before a TMA store reads
+// them (then a barrier with the issuing thread).
+__device__ __forceinline__ void fence_async_smem() {
+    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+}
+// A 2D tile of shared memory at `src` into `map`'s tensor at (c0: element along the row, c1:
+// row), a TMA store in the issuing thread's open bulk async-group; parts of the box past the
+// tensor's bounds are not written.
+__device__ __forceinline__ void tma_store_2d(const CUtensorMap * map, const void * src, int c0, int c1) {
+    asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%1, %2}], [%3];\n" ::"l"(
+                     (uint64_t) map),
+                 "r"(c0), "r"(c1), "r"(saddr(src))
+                 : "memory");
+}
+// Closes the issuing thread's open bulk async-group (its TMA stores so far).
+__device__ __forceinline__ void bulk_commit() {
+    asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
+}
+// Waits until at most N of the thread's bulk async-groups, the latest ones, still read their
+// shared memory (which may then be written again).
+template <int N> __device__ __forceinline__ void bulk_wait_read() {
+    asm volatile("cp.async.bulk.wait_group.read %0;\n" ::"n"(N) : "memory");
+}
 }  // namespace legion_tma
 #endif

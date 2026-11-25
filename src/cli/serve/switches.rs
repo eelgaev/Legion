@@ -428,6 +428,17 @@ pub(in crate::cli) struct SwitchArgs {
     /// can differ from the default's where such steps occur. Off by default.
     #[arg(long, help_heading = HEADING)]
     fp8_sliced_k: bool,
+    /// CUDA, compute capability 12.x (GB10, consumer Blackwell), W8A8 FP8 prompt matmuls on the
+    /// TMA-fed 256 x 128 tile without a residual (and the gated DeltaNet qkv GEMM with the conv
+    /// in its epilogue): write the outputs from the MMA fragments, 4 bytes a lane, as before,
+    /// instead of staging them in shared memory and writing whole lines by TMA stores. The same
+    /// bits either way.
+    #[arg(long, help_heading = HEADING)]
+    no_fp8_tma_store: bool,
+    /// As --no-fp8-tma-store, for the gated DeltaNet qkv GEMM with the conv in its epilogue
+    /// only. The same bits either way.
+    #[arg(long, help_heading = HEADING)]
+    no_fp8_conv_tma_store: bool,
     /// CUDA, compute capability 9.0 only (H100, H200, GH200) with a binary built for sm_90a
     /// (CMAKE_CUDA_ARCHITECTURES=90a): W8A8 FP8 prompt matmuls (more than 64 tokens) on the
     /// Hopper GEMM (warpgroup MMA fed by the TMA, a warp-specialized pipeline of 128 x 128 tiles,
@@ -1610,6 +1621,8 @@ impl SwitchArgs {
             nvfp4_mmvq_glu: self.nvfp4_mmvq_glu.then_some(true),
             fp8_small_batch_gemv: self.fp8_small_batch_gemv.then_some(true),
             fp8_sliced_k: self.fp8_sliced_k.then_some(true),
+            fp8_tma_store: self.no_fp8_tma_store.then_some(false),
+            fp8_conv_tma_store: self.no_fp8_conv_tma_store.then_some(false),
             hopper_gemm: self.hopper_gemm.then_some(true),
             hopper_attn: self.hopper_attn.then_some(true),
             paged_prefill_qm: self.no_paged_prefill_qm.then_some(false),

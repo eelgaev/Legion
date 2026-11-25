@@ -32,11 +32,13 @@ constexpr int CONV_SUM_FLOATS = 4 * 2 * 128;
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 // The epilogue: acc holds the tile's sums (TM 256 rows from m0, a8::BN tokens from n0, 8 warps
-// of 64 x 64: wm = warp / 2, wn = warp % 2); outputs for tile tokens lo.. that exist.
-template <class C>
+// of 64 x 64: wm = warp / 2, wn = warp % 2); outputs for tile tokens lo.. that exist. TST
+// (#1183): the outputs go out by TMA stores into ymap (cv.out's tensor map, gemm8_store_tma).
+template <class C, bool TST>
 __device__ __forceinline__ void gemm8_conv_epilogue(const legion_fp8_mm8 & p, const legion_conv_silu & cv,
                                                     int64_t m0, int64_t n0, int lo, bool last, int wm, int wn,
-                                                    int lane, float (&acc)[4][8][4], float * smem) {
+                                                    int lane, float (&acc)[4][8][4], float * smem,
+                                                    const CUtensorMap * ymap) {
     static_assert(C::WM == 4 && C::WN == 2 && a8::BN == 128, "the wide tile");
     using conv_math::MAX_D;
     constexpr int D = a8c::CONV_D;
@@ -227,31 +229,50 @@ __device__ __forceinline__ void gemm8_conv_epilogue(const legion_fp8_mm8 & p, co
     }
 
     // The outputs of tokens lo.. of the tile that exist, evict-first (read once, by the delta
-    // rule).
+    // rule): n8 tiles j0 .. j1 - 1 of them.
+    auto store = [&](int j0, int j1) {
 #pragma unroll
-    for (int j = 0; j < 8; j++)
+        for (int j = 0; j < 8; j++)
 #pragma unroll
-        for (int e2 = 0; e2 < 2; e2++) {
-            const int u = ubase + j * 8 + e2;
-            const int64_t tok = n0 + u;
-            if (u >= lo && tok < p.n) {
+            for (int e2 = 0; e2 < 2; e2++) {
+                const int u = ubase + j * 8 + e2;
+                const int64_t tok = n0 + u;
+                if (j >= j0 && j < j1 && u >= lo && tok < p.n) {
 #pragma unroll
-                for (int i = 0; i < 4; i++)
+                    for (int i = 0; i < 4; i++)
 #pragma unroll
-                    for (int h = 0; h < 2; h++) {
-                        const int64_t c = m0 + rbase + i * 16 + h * 8;
-                        __stcs(cv.out + c + tok * cv.C, acc[i][j][2 * h + e2]);
-                    }
+                        for (int h = 0; h < 2; h++) {
+                            const int64_t c = m0 + rbase + i * 16 + h * 8;
+                            __stcs(cv.out + c + tok * cv.C, acc[i][j][2 * h + e2]);
+                        }
+                }
             }
+    };
+    if constexpr (TST) {
+        // Every warp's reads of the exchange and the norm's sums done: the stages' memory takes
+        // the boxes. The halo (tile tokens before lo, all in a wn 0 warp's first quarter) is not
+        // stored: that quarter's other tokens go out from the fragments, the rest by TMA.
+        static_assert(C::WARPS * a8t::ST_WARP_FLOATS * sizeof(float) <= C::SMEM && a8t::ST_TOKS == 16 &&
+                          a8c::CONV_HALO <= a8t::ST_TOKS,
+                      "TMA store boxes in the stages; the halo in the first quarter");
+        __syncthreads();
+        const bool skip0 = wn == 0 && lo > 0;
+        if (skip0) {
+            store(0, 2);
         }
+        gemm8_store_tma(ymap, m0 + wm * 64, n0 + wn * 64, p.n, lane, acc,
+                        smem + (wm * C::WN + wn) * a8t::ST_WARP_FLOATS, skip0);
+    } else {
+        store(0, 8);
+    }
 }
 #endif
 
 // The qkv GEMM with conv_silu in its epilogue (see the top): fp8_gemm8_tma's wide tile (8 warps,
 // TM 256) with one CTA a tile of a8c::CONV_STRIDE outputs (grid x), from its first token minus
 // a8c::CONV_HALO (but the first). One sequence; p.m rows a multiple of TM; the norm's rows whole
-// tiles.
-template <class C>
+// tiles. TST: the outputs by TMA stores (maps.y: cv.out's).
+template <class C, bool TST = false>
 __global__ void __launch_bounds__(32 * C::WARPS, 1)
     fp8_gemm8_tma_conv(const legion_fp8_mm8 p, const __grid_constant__ a8t::Maps maps, const a8t::Stagger stagger,
                        const legion_conv_silu cv) {
@@ -272,7 +293,7 @@ __global__ void __launch_bounds__(32 * C::WARPS, 1)
     const bool last = tn == (int64_t) gridDim.x - 1;
     float acc[4][NJ][4];
     gemm8_tma_sums<false, C>(p, maps, stagger, m0, n0, smem, wm, wn, lane, acc);
-    gemm8_conv_epilogue<C>(p, cv, m0, n0, lo, last, wm, wn, lane, acc, (float *) smem);
+    gemm8_conv_epilogue<C, TST>(p, cv, m0, n0, lo, last, wm, wn, lane, acc, (float *) smem, &maps.y);
 #else
     __trap();  // launch_gemm8_conv checks the image is sm_90+ first
 #endif
