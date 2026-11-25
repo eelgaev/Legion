@@ -116,12 +116,13 @@ pub fn set_down_x_prefetch(on: bool) {
     DOWN_X_PREFETCH.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
-static GLU_WS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static GLU_WS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether the routed experts' fused gate/up GEMM of prompt steps runs its 128-token tiles on
-/// the kernel with a copy warp ([`GEMM_GLU_WS`], #1183) instead of the plain one
-/// ([`GEMM_DEFAULT`]). The same bits either way. On by default; `legion serve
-/// --no-nvfp4-glu-ws` turns it off for comparisons.
+/// the warp-specialized kernel ([`GEMM_GLU_WS`], #1183) instead of the plain one
+/// ([`GEMM_DEFAULT`]). The same bits either way. Off by default (`legion serve
+/// --nvfp4-glu-ws`): the first variants were 0.43-0.80x the plain kernel's speed on a DGX
+/// Spark (GB10).
 pub fn set_glu_ws(on: bool) {
     GLU_WS.store(on, std::sync::atomic::Ordering::Relaxed);
 }
@@ -1603,10 +1604,15 @@ pub fn glu_gemm_tile(k: i64, n_expert: i64, per: i64) -> (i32, GemmTune) {
 pub const GEMM_GLU_WS: GemmTune = GemmTune::glu_ws(1);
 
 /// The variant a grouped fused gate/up GEMM of `8 * nt`-token tiles launches for `tune`:
-/// [`GEMM_GLU_WS`] for the default tune's 128-token tiles unless [`set_glu_ws`] turned it off,
+/// [`GEMM_GLU_WS`] for the default tune's 128-token tiles if [`set_glu_ws`] turned it on,
 /// `tune` otherwise. The same bits either way.
 pub fn glu_ws_tune(nt: i32, tune: GemmTune) -> GemmTune {
-    if nt == 16 && tune == GEMM_DEFAULT && GLU_WS.load(std::sync::atomic::Ordering::Relaxed) {
+    glu_ws_pick(nt, tune, GLU_WS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// [`glu_ws_tune`] with the switch `on`.
+pub fn glu_ws_pick(nt: i32, tune: GemmTune, on: bool) -> GemmTune {
+    if on && nt == 16 && tune == GEMM_DEFAULT {
         GEMM_GLU_WS
     } else {
         tune

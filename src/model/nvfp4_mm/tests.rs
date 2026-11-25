@@ -362,20 +362,23 @@ fn glu_ws_tunes() {
     for t in [GEMM_DEFAULT, GEMM_DOWN, GEMM_GLU_SHORT, GEMM_STREAM_GLU] {
         assert!(!t.is_glu_ws());
     }
-    // On by default (set_glu_ws): the default tune's 128-token tiles; other tiles and tunes
-    // (a forced one, the short steps' 64-token tile) as they were.
-    assert_eq!(glu_ws_tune(16, GEMM_DEFAULT), GEMM_GLU_WS);
-    assert_eq!(glu_ws_tune(8, GEMM_DEFAULT), GEMM_DEFAULT);
-    assert_eq!(glu_ws_tune(4, GEMM_DEFAULT), GEMM_DEFAULT);
-    assert_eq!(glu_ws_tune(8, GEMM_GLU_SHORT), GEMM_GLU_SHORT);
+    // Switched on (set_glu_ws, off by default): the default tune's 128-token tiles; other
+    // tiles and tunes (a forced one, the short steps' 64-token tile) as they were.
+    assert_eq!(glu_ws_pick(16, GEMM_DEFAULT, true), GEMM_GLU_WS);
+    assert_eq!(glu_ws_pick(16, GEMM_DEFAULT, false), GEMM_DEFAULT);
+    assert_eq!(glu_ws_pick(8, GEMM_DEFAULT, true), GEMM_DEFAULT);
+    assert_eq!(glu_ws_pick(4, GEMM_DEFAULT, true), GEMM_DEFAULT);
+    assert_eq!(glu_ws_pick(8, GEMM_GLU_SHORT, true), GEMM_GLU_SHORT);
     let two = GemmTune::from_code(21);
-    assert_eq!(glu_ws_tune(16, two), two);
-    assert_eq!(glu_ws_tune(16, GemmTune::glu_ws(2)), GemmTune::glu_ws(2));
+    assert_eq!(glu_ws_pick(16, two, true), two);
+    let forced = GemmTune::glu_ws(2);
+    assert_eq!(glu_ws_pick(16, forced, false), forced);
     // Qwen3.8-Flash-Next's prompt steps of 8,067 and 12,288 tokens (157 and 240 pairs an
-    // expert): 128-token tiles on the default tune, so the copy-warp kernel.
+    // expert): 128-token tiles on the default tune, so the warp-specialized kernel when on.
     for per in [157, 240] {
         let (nt, tune) = glu_gemm_tile(2560, 512, per);
-        assert_eq!(glu_ws_tune(nt, tune), GEMM_GLU_WS);
+        assert_eq!(glu_ws_pick(nt, tune, true), GEMM_GLU_WS);
+        assert_eq!(glu_ws_pick(nt, tune, false), GEMM_DEFAULT);
     }
 }
 
@@ -960,7 +963,7 @@ fn xpf_reset() {
     force_gemm_xpf(None);
     set_expert_mv_max(MV_MAX_N);
     set_expert_mv_split(MvSplit::Step);
-    set_glu_ws(true);
+    set_glu_ws(false);
 }
 
 /// Random BF16 values (bits) of `n` elements.
@@ -1339,7 +1342,7 @@ fn cuda_down_x_prefetch_bench() {
 }
 
 /// The fused gate/up GEMM's kernels the copy-warp tests compare (#1183): the plain kernel
-/// (`--no-nvfp4-glu-ws`), then [`GemmTune::glu_ws`] 1 (the default), 2 and 3.
+/// (the default), then [`GemmTune::glu_ws`] 1 (`--nvfp4-glu-ws`), 2 and 3.
 #[cfg(feature = "cuda")]
 const GLU_WS_RUNS: [(&str, i32); 4] = [
     ("old (plain kernel)", 0),

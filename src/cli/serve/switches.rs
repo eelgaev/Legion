@@ -496,12 +496,12 @@ pub(in crate::cli) struct SwitchArgs {
     #[arg(long, help_heading = HEADING)]
     no_nvfp4_down_x_prefetch: bool,
     /// CUDA (sm_90+), NVFP4 routed experts on Legion's W4A16 kernels, prompt steps on the
-    /// grouped GEMM: the fused gate/up GEMM's 128-token tiles run on the plain kernel (eight
-    /// warps that both copy and multiply) instead of the default one with a copy warp feeding
-    /// the eight multiply warps through a ring of stages, one CTA per SM. The same bits either
-    /// way. For comparisons.
+    /// grouped GEMM: the fused gate/up GEMM's 128-token tiles run on the warp-specialized
+    /// kernel (eight multiply warps fed through a ring of stages on mbarriers, one CTA per SM
+    /// looping over the tiles) instead of the plain one, where every warp both copies and
+    /// multiplies. The same bits either way. Experimental, off by default.
     #[arg(long, help_heading = HEADING)]
-    no_nvfp4_glu_ws: bool,
+    nvfp4_glu_ws: bool,
     /// CUDA, NVFP4 routed experts on Legion's W4A16 kernels: matmuls of up to this many (token,
     /// expert) pairs per used expert (if the routing were even) take the grouped mv kernel,
     /// more the grouped GEMM. Default 32: prompt steps of up to ~1,600 tokens on
@@ -1599,7 +1599,7 @@ impl SwitchArgs {
             nvfp4_expert_pdl: self.no_nvfp4_expert_pdl.then_some(false),
             nvfp4_expert_tile_prefetch: self.no_nvfp4_expert_tile_prefetch.then_some(false),
             nvfp4_down_x_prefetch: self.no_nvfp4_down_x_prefetch.then_some(false),
-            nvfp4_glu_ws: self.no_nvfp4_glu_ws.then_some(false),
+            nvfp4_glu_ws: self.nvfp4_glu_ws.then_some(true),
             nvfp4_expert_mv_max: self.nvfp4_expert_mv_max.map(i64::from),
             nvfp4_expert_mv_tile: self.nvfp4_expert_mv_tile.map(i32::from),
             nvfp4_expert_mv_split: self.nvfp4_expert_mv_split,
