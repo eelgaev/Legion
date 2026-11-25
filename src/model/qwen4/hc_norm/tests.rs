@@ -1402,6 +1402,13 @@ fn fold_case_on(backend: &mut Backend, c: &FoldIn, tail: Tail) -> ([Vec<u8>; 4],
     let down = ctx.new_tensor(types::BF16, &[kk, FOLD_M]).as_input();
     let p = hc_post_norm_rebuilt_xnb(&ctx, res, out, inj, gamma, wi, 1e-6, down, c.streams16);
     let outs = [p.res, p.scales, p.inject, p.xnb].map(|t| ctx.cont(t).as_output());
+    if matches!(tail, Tail::Manual(_)) {
+        // The hand fold below has the norm read these once the graph is planned, when ggml
+        // may have reused their memory after their own last readers; outputs it never frees.
+        for t in [experts, wr, sh, joined] {
+            t.as_output();
+        }
+    }
     let mut graph = ctx.new_graph(256);
     for t in outs {
         graph.expand(t);
