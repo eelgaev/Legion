@@ -927,6 +927,8 @@ fn xpf_reset() {
     force_gemm_tune(None, None);
     force_gemm_xpf(None);
     force_gemm_wst(None);
+    set_glu_wide_store(true);
+    set_glu_store_evict_first(false);
     set_expert_mv_max(MV_MAX_N);
 }
 
@@ -1654,6 +1656,389 @@ fn cuda_down_wide_store_bench() {
                 same.iter().all(|&s| s),
                 "down ({rows} rows) at {n_tok}: bits differ"
             );
+        }
+    }
+    xpf_reset();
+}
+
+/// The SwiGLU GEMM's staged epilogue (#1183): its 64- and 128-token tiles of the default kernel
+/// and the 64-token tile of [`GEMM_GLU_SHORT`], staged and plain by default, streaming only under
+/// [`set_glu_store_evict_first`]; [`set_glu_wide_store`] off turns both off. Holds
+/// [`XPF_LOCK`]: the switches are process-wide.
+#[test]
+fn glu_wide_store_on_the_swiglu_tiles() {
+    let _lock = XPF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(GLU_WST, WST_WIDE);
+    let staged = [(16, GEMM_DEFAULT), (8, GEMM_DEFAULT), (8, GEMM_GLU_SHORT)];
+    for (nt, tune) in staged {
+        assert_eq!(grouped_glu_wst(nt, tune), GLU_WST, "nt {nt} {tune:?}");
+    }
+    // The tiles prefill picks: Qwen3.8-Flash-Next's gate / up (k 2560, 512 experts) at 33-64,
+    // 65-128 and 129+ pairs an expert, and at up to 32 (on the GEMM under an mv max of 0).
+    for per in [8, 32, 33, 64, 65, 128, 240] {
+        let (nt, tune) = glu_gemm_tile(2560, 512, per);
+        assert_eq!(grouped_glu_wst(nt, tune), GLU_WST, "{per} pairs an expert");
+    }
+    // Other tiles and tunes: none.
+    let plain = [
+        (4, GEMM_DEFAULT),
+        (16, GEMM_GLU_SHORT),
+        (16, GEMM_DOWN),
+        (8, GEMM_DOWN),
+        (
+            16,
+            GemmTune {
+                stages: 3,
+                ctas: 2,
+                warps: 0,
+            },
+        ),
+        (8, GEMM_STREAM_GLU),
+    ];
+    for (nt, tune) in plain {
+        assert_eq!(grouped_glu_wst(nt, tune), 0, "nt {nt} {tune:?}");
+    }
+    // --nvfp4-glu-store-evict-first: streaming stores on top.
+    set_glu_store_evict_first(true);
+    for (nt, tune) in staged {
+        assert_eq!(grouped_glu_wst(nt, tune), GLU_WST | WST_CS);
+    }
+    assert_eq!(grouped_glu_wst(4, GEMM_DEFAULT), 0);
+    // --no-nvfp4-glu-wide-store: neither, whatever the other says.
+    for cs in [false, true] {
+        set_glu_store_evict_first(cs);
+        set_glu_wide_store(false);
+        for (nt, tune) in staged {
+            assert_eq!(grouped_glu_wst(nt, tune), 0);
+        }
+        set_glu_wide_store(true);
+    }
+    set_glu_store_evict_first(false);
+    // The down projection's epilogue does not move with the SwiGLU's switches.
+    assert_eq!(grouped_gemm_wst(640, 512, 2, 8, false, true), DOWN_WST_BF16);
+}
+
+/// The SwiGLU epilogues the bit test compares with the fragments' own stores (0); [`WST_CS`]
+/// alone is the plain kernel.
+#[cfg(feature = "cuda")]
+const GLU_WST_CHECKED: [i32; 3] = [WST_WIDE, WST_CS, WST_WIDE | WST_CS];
+
+/// The SwiGLU clamps the bit test runs: none, and two limits (GLM-5.3-Flash's clamp) that clip
+/// some of the scaled sums of the test's weights.
+#[cfg(feature = "cuda")]
+const GLU_LIMITS: [f32; 3] = [0.0, 0.05, 0.5];
+
+/// One SwiGLU staged-store bit test case: `n_expert` NVFP4 gate and up experts of `m` rows by
+/// `k`, `n_used` per token, the routing `ids`.
+#[cfg(feature = "cuda")]
+struct GluWstCase {
+    name: &'static str,
+    m: usize,
+    k: usize,
+    n_expert: usize,
+    n_used: usize,
+    ids: Vec<i32>,
+}
+
+/// `case`'s routed SwiGLU on the GEMM (every expert: an mv max of 0) at the 128- and 64-token
+/// tiles of the default kernel and the 64-token tile of [`GEMM_GLU_SHORT`], without and with
+/// the clamp ([`GLU_LIMITS`]): every epilogue of [`GLU_WST_CHECKED`] (and the defaults, with
+/// and without the streaming stores) stores the bits of the fragments' own stores. The outputs
+/// are filled with a pattern before each run, so a value an epilogue leaves out shows.
+#[cfg(feature = "cuda")]
+fn glu_wst_case(gpu: &mut crate::ggml::Backend, case: &GluWstCase) {
+    use crate::ggml::ComputeAllocator;
+    let (m, k, n_expert, n_used) = (case.m, case.k, case.n_expert, case.n_used);
+    let n_tok = case.ids.len() / n_used;
+    let blocks = k / 64 * 36 * m * n_expert;
+    let weights = Context::new(8, 0);
+    let wg = weights.new_tensor(types::NVFP4, &[k as i64, m as i64, n_expert as i64]);
+    let wu = weights.new_tensor(types::NVFP4, &[k as i64, m as i64, n_expert as i64]);
+    let scales = [0, 1].map(|_| weights.new_tensor(types::F32, &[n_expert as i64]));
+    weights.alloc_tensors(gpu.buffer_type()).unwrap();
+    wg.set_bytes(&gemm_bench::weights(blocks, 21));
+    wu.set_bytes(&gemm_bench::weights(blocks, 22));
+    for (i, s) in scales.iter().enumerate() {
+        let v: Vec<f32> = (0..n_expert)
+            .map(|e| 0.002 + ((e * 7 + i * 3) % 1000) as f32 * 1e-5)
+            .collect();
+        s.set_f32(&v);
+    }
+    let ctx = Context::new(16, 32);
+    let x = ctx
+        .new_tensor(types::BF16, &[k as i64, 1, n_tok as i64])
+        .as_input();
+    let id = ctx
+        .new_tensor(types::I32, &[n_used as i64, n_tok as i64])
+        .as_input();
+    let outs = GLU_LIMITS.map(|limit| {
+        swiglu_id_clamped(&ctx, wg, wu, x, id, Some(scales[0]), Some(scales[1]), limit).as_output()
+    });
+    let mut graph = ctx.new_graph(32);
+    for o in outs {
+        graph.expand(o);
+    }
+    ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+        .unwrap();
+    x.set_bytes(&xpf_bf16(k * n_tok, 23));
+    id.set_i32(&case.ids);
+    let run = |gpu: &mut crate::ggml::Backend| -> Vec<Vec<u8>> {
+        for o in outs {
+            o.set_bytes(&vec![0xa5; o.nbytes()]);
+        }
+        gpu.compute(&graph).unwrap();
+        outs.iter().map(|o| o.bytes()).collect()
+    };
+    set_expert_mv_max(0);
+    for (nt, tune) in [(16, GEMM_DEFAULT), (8, GEMM_DEFAULT), (8, GEMM_GLU_SHORT)] {
+        force_gemm_tune(Some(tune), Some(nt));
+        force_gemm_wst(Some(0));
+        let want = run(gpu);
+        let clipped = want[0].iter().zip(&want[1]).filter(|(a, b)| a != b).count();
+        eprintln!(
+            "  {} nt {nt} {tune:?}: limit {} moves {clipped} of {} bytes",
+            case.name,
+            GLU_LIMITS[1],
+            want[0].len()
+        );
+        // The forced epilogues, then the defaults with the streaming stores off and on.
+        let tries = GLU_WST_CHECKED
+            .map(|w| (Some(w), false))
+            .into_iter()
+            .chain([(None, false), (None, true)]);
+        for (wst, cs) in tries {
+            force_gemm_wst(wst);
+            set_glu_store_evict_first(cs);
+            for (i, (got, want)) in run(gpu).iter().zip(&want).enumerate() {
+                assert_eq!(got.len(), want.len());
+                let differ = got.iter().zip(want).filter(|(a, b)| a != b).count();
+                assert_eq!(
+                    differ, 0,
+                    "{}, nt {nt} {tune:?}, limit {}, wst {wst:?}, evict-first {cs}: {differ} \
+                     bytes differ",
+                    case.name, GLU_LIMITS[i]
+                );
+            }
+        }
+    }
+    set_glu_store_evict_first(false);
+    xpf_reset();
+}
+
+/// The SwiGLU GEMM's staged 16-byte stores and streaming stores (#1183) keep every output bit:
+/// 128- and 64-token tiles (the default kernel's and [`GEMM_GLU_SHORT`]'s), without and with
+/// GLM-5.3-Flash's clamp, over hand-made routings (experts of 1, 15, 16, 17, 63, 64, 65, 127,
+/// 128, 129 and 200 pairs: last token tiles partial and full), random ones over 512 and 64
+/// experts, and SwiGLUs of 320 rows (a partial row tile) and 324 (rows not a multiple of 8: the
+/// element-wise tail).
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_glu_wide_store_keeps_bits() {
+    let _lock = XPF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut gpu = xpf_gpu();
+    let special = [1, 15, 16, 17, 63, 64, 65, 127, 128, 129, 200];
+    let small = [1, 15, 16, 17, 63, 64, 65, 129];
+    let cases = [
+        // Qwen3.8-Flash-Next's gate / up (640 rows each, k 2560, 512 experts, top 10).
+        GluWstCase {
+            name: "flash-next counted",
+            m: 640,
+            k: 2560,
+            n_expert: 512,
+            n_used: 10,
+            ids: counted_routing(&spread_counts(&special, 512, 10, 400), 10, 400),
+        },
+        GluWstCase {
+            name: "flash-next random 512",
+            m: 640,
+            k: 2560,
+            n_expert: 512,
+            n_used: 10,
+            ids: gemm_bench::routing(10, 1500, 512, 512, 7),
+        },
+        GluWstCase {
+            name: "flash-next random 64",
+            m: 640,
+            k: 2560,
+            n_expert: 512,
+            n_used: 10,
+            ids: gemm_bench::routing(10, 700, 512, 64, 8),
+        },
+        // Small shapes: 320 rows (a partial row tile) and 324 (not a multiple of 8).
+        GluWstCase {
+            name: "small 320 rows",
+            m: 320,
+            k: 256,
+            n_expert: 24,
+            n_used: 4,
+            ids: counted_routing(&spread_counts(&small, 24, 4, 200), 4, 200),
+        },
+        GluWstCase {
+            name: "small 324 rows",
+            m: 324,
+            k: 256,
+            n_expert: 24,
+            n_used: 4,
+            ids: counted_routing(&spread_counts(&small, 24, 4, 200), 4, 200),
+        },
+    ];
+    for case in &cases {
+        glu_wst_case(&mut gpu, case);
+        eprintln!("{}: the same bits", case.name);
+    }
+}
+
+/// The routed SwiGLU's grouped GEMM (Qwen3.8-Flash-Next: 640 gate and 640 up rows, k 2560, 512
+/// experts, top 10) at 12,288- and 8,067-token prompt steps with the fragments' own stores
+/// (old), the staged stores (wide) and staged streaming ones (wide + cs), on its own and followed
+/// by the down projection that reads its rows (BF16 rows, its epilogue at the default):
+/// microseconds a layer (median and best of 5 rounds, the configurations taking turns, each
+/// round starting one further on), the bytes moved a second at the median (the SwiGLU's alone),
+/// and whether the bits are the old ones. `*` marks the default.
+/// `cargo test --release --features cuda --lib -- --ignored cuda_glu_wide_store_bench
+/// --nocapture`.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU; a benchmark"]
+fn cuda_glu_wide_store_bench() {
+    use crate::ggml::ComputeAllocator;
+    let _lock = XPF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    xpf_reset();
+    let mut gpu = xpf_gpu();
+    let (hidden, ffn, n_expert, n_used) = (2560usize, 640usize, 512usize, 10usize);
+    const LAYERS: usize = 4;
+    const ROUNDS: usize = 5;
+    let blocks = |k: usize, m: usize| k / 64 * 36 * m * n_expert;
+    let weights = Context::new(8, 0);
+    let wd = weights.new_tensor(types::NVFP4, &[ffn as i64, hidden as i64, n_expert as i64]);
+    let wg = weights.new_tensor(types::NVFP4, &[hidden as i64, ffn as i64, n_expert as i64]);
+    let wu = weights.new_tensor(types::NVFP4, &[hidden as i64, ffn as i64, n_expert as i64]);
+    let scales = [0, 1, 2].map(|_| weights.new_tensor(types::F32, &[n_expert as i64]));
+    weights.alloc_tensors(gpu.buffer_type()).unwrap();
+    wd.set_bytes(&gemm_bench::weights(blocks(ffn, hidden), 3));
+    wg.set_bytes(&gemm_bench::weights(blocks(hidden, ffn), 4));
+    wu.set_bytes(&gemm_bench::weights(blocks(hidden, ffn), 5));
+    for s in scales {
+        s.set_f32(&vec![0.004; n_expert]);
+    }
+    let variants: [(&str, i32); 3] = [
+        ("old (fragments)", 0),
+        ("wide", WST_WIDE),
+        ("wide + cs", WST_WIDE | WST_CS),
+    ];
+    for n_tok in [12288usize, 8067] {
+        let per = (n_used * n_tok) as i64 / n_expert as i64;
+        let (nt, tune) = glu_gemm_tile(hidden as i64, n_expert as i64, per);
+        let default = grouped_glu_wst(nt, tune);
+        for chain in [false, true] {
+            let ctx = Context::new(16 + 32 * LAYERS, 24 * LAYERS + 16);
+            let x = ctx
+                .new_tensor(types::BF16, &[hidden as i64, 1, n_tok as i64])
+                .as_input();
+            let ids: Vec<_> = (0..LAYERS)
+                .map(|_| {
+                    ctx.new_tensor(types::I32, &[n_used as i64, n_tok as i64])
+                        .as_input()
+                })
+                .collect();
+            let mut graph = ctx.new_graph(24 * LAYERS + 16);
+            let outs: Vec<_> = ids
+                .iter()
+                .map(|&id| {
+                    let glu = swiglu_id(&ctx, wg, wu, x, id, Some(scales[1]), Some(scales[2]));
+                    let y = if chain {
+                        mul_mat_id_act(&ctx, wd, glu, id, Some(scales[0]), Act::Bf16)
+                    } else {
+                        glu
+                    }
+                    .as_output();
+                    graph.expand(y);
+                    y
+                })
+                .collect();
+            ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+                .unwrap();
+            x.set_bytes(&xpf_bf16(hidden * n_tok, 5 + n_tok as u64));
+            for (l, id) in ids.iter().enumerate() {
+                id.set_i32(&gemm_bench::routing(
+                    n_used,
+                    n_tok,
+                    n_expert,
+                    n_expert,
+                    1 + l as u64,
+                ));
+            }
+            // A warm-up run of each (its bits against the old one's), then the rounds, the
+            // variants taking turns. The forced epilogue is the SwiGLU's; the down tile's is
+            // its default either way (a forced one would apply to it too).
+            let force = |wst: i32| {
+                force_gemm_wst(None);
+                set_glu_wide_store(wst & WST_WIDE != 0);
+                set_glu_store_evict_first(wst & WST_CS != 0);
+            };
+            let mut want = Vec::new();
+            let mut same = vec![true; variants.len()];
+            for (vi, &(_, wst)) in variants.iter().enumerate() {
+                force(wst);
+                gpu.compute(&graph).unwrap();
+                let got: Vec<Vec<u8>> = outs.iter().map(|o| o.bytes()).collect();
+                if vi == 0 {
+                    want = got;
+                } else {
+                    same[vi] = got == want;
+                }
+            }
+            let nv = variants.len();
+            let mut times = vec![Vec::with_capacity(ROUNDS); nv];
+            for round in 0..ROUNDS {
+                for i in 0..nv {
+                    let vi = (round + i) % nv;
+                    force(variants[vi].1);
+                    let t = std::time::Instant::now();
+                    gpu.compute(&graph).unwrap();
+                    times[vi].push(t.elapsed().as_secs_f64() / LAYERS as f64);
+                }
+            }
+            set_glu_wide_store(true);
+            set_glu_store_evict_first(false);
+            for t in &mut times {
+                t.sort_by(f64::total_cmp);
+            }
+            let median: Vec<f64> = times.iter().map(|t| t[t.len() / 2]).collect();
+            let best: Vec<f64> = times.iter().map(|t| t[0]).collect();
+            // The SwiGLU's bytes a layer: both weights, each token's input row, each pair's
+            // BF16 output row.
+            let pairs = (n_used * n_tok) as f64;
+            let (w_bytes, x_bytes, out_bytes) = (
+                2.0 * blocks(hidden, ffn) as f64,
+                (n_tok * hidden * 2) as f64,
+                pairs * ffn as f64 * 2.0,
+            );
+            let bytes = w_bytes + x_bytes + out_bytes;
+            let op = if chain { "swiglu + down" } else { "swiglu" };
+            eprintln!(
+                "{op} at {n_tok} tokens, tile nt {nt} {tune:?} (swiglu {:.0} MB a layer: {:.0} \
+                 weights, {:.0} in, {:.0} out)",
+                bytes / 1e6,
+                w_bytes / 1e6,
+                x_bytes / 1e6,
+                out_bytes / 1e6
+            );
+            for (vi, &(name, wst)) in variants.iter().enumerate() {
+                eprintln!(
+                    "  {}{name:<16} wst {wst}: median {:>8.1} us/layer ({:>5.3}x old), \
+                     min {:>8.1} ({:>5.3}x)  {:>6.1} GB/s  {}",
+                    if wst == default { '*' } else { ' ' },
+                    median[vi] * 1e6,
+                    median[0] / median[vi],
+                    best[vi] * 1e6,
+                    best[0] / best[vi],
+                    bytes / median[vi] / 1e9,
+                    if same[vi] { "same bits" } else { "BITS DIFFER" }
+                );
+            }
+            assert!(same.iter().all(|&s| s), "{op} at {n_tok}: bits differ");
         }
     }
     xpf_reset();
