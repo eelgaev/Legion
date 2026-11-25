@@ -5277,6 +5277,10 @@ impl Model {
                 .flatten()
             {
                 Some((gate, up)) => {
+                    // `--dense-fp8-prompt` (#1183): the W8A8 GEMM's F32 gate and up rows go
+                    // out 16 bytes a thread through shared memory (the same bits; plain stores,
+                    // as the SwiGLU's codes read them next). A BF16 GEMM is not marked.
+                    crate::model::fp8::mark_wide_store(gate);
                     let sh = ctx.swiglu_split(gate, up);
                     // `--dense-fp8-prompt` (#1183): the down projection's per-token FP8 codes
                     // from one op reading gate and up in place (the SwiGLU then not computed).

@@ -238,8 +238,78 @@ __device__ __forceinline__ void gemm8_epilogue_stream(const legion_fp8_mm8 & p, 
     }
 }
 
-// RES: p.res added to every output (the residual add fused into the epilogue).
-template <bool RES, class C>
+// gemm8_epilogue_staged's piece of shared memory a warp: one n8 token tile of its 64 rows, a
+// token's rows padded to 68 floats (the lanes' writes then hit 32 banks).
+constexpr int GEMM8_STAGE_LD = 64 + 4, GEMM8_STAGE_FLOATS = 8 * GEMM8_STAGE_LD;
+
+// The tile's outputs without a residual (gemm8_epilogue's values: each sum times a8_scale) by
+// whole runs of a token's rows (#1133). The MMA layout stores 4 bytes a lane, 32 bytes of each
+// of 4 tokens a store (128 store instructions a warp for a 64 x 64 piece of the tile); into
+// mapped host memory on the GB10 each piece goes out alone, at about half the speed of whole
+// lines (a 168 MB F32 output: ~94 against ~180 GB/s). Here each warp puts one n8 token tile of
+// its 64 rows at a time into its own piece of shared memory (`stage`, GEMM8_STAGE_FLOATS: the
+// stages' memory, free once every warp is past the K loop) and writes it 16 bytes a lane, two
+// tokens' 256-byte runs a store (32 store instructions for the same piece). CS: streaming
+// (evict-first) stores, for mapped host memory (fp8_gemm8_tma's GEMM8_STAGED); else plain ones,
+// for device memory the next op reads (GEMM8_WIDE, #1183: the shared expert's gate / up, which
+// the SwiGLU's FP8 codes read next). Every warp has 64 rows (4 m16 tiles) in every tile shape.
+// The same values at the same places: the same bits.
+template <class C, bool CS, int NJ>
+__device__ __forceinline__ void gemm8_epilogue_staged(const legion_fp8_mm8 & p, int64_t m0, int64_t n0, int wm,
+                                                      int wn, int lane, const float (&acc)[4][NJ][4],
+                                                      float * stage) {
+    static_assert(NJ == a8::BN / 8 / C::WN, "n8 tiles per warp");
+    constexpr int LDS = GEMM8_STAGE_LD;
+    const float s = a8_static(p);
+    const int g = lane / 4, t = lane % 4;
+    const int64_t rbase = m0 + wm * 64, tbase = n0 + wn * NJ * 8;
+    // All 64 rows exist and 16-byte stores are aligned.
+    const bool whole = rbase + 64 <= p.m && p.m % 4 == 0 && ((uintptr_t) p.dst & 15) == 0;
+#pragma unroll
+    for (int j = 0; j < NJ; j++) {
+#pragma unroll
+        for (int i = 0; i < 4; i++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int r = i * 16 + g + (e / 2) * 8, tk = 2 * t + e % 2;
+                const int64_t row = rbase + r, tok = tbase + j * 8 + tk;
+                stage[tk * LDS + r] = row < p.m && tok < p.n ? acc[i][j][e] * a8_scale(p, s, row, tok) : 0.0f;
+            }
+        __syncwarp();
+#pragma unroll
+        for (int q = 0; q < 4; q++) {
+            const int idx = q * 32 + lane, tk = idx / 16, c = idx % 16;
+            const int64_t tok = tbase + j * 8 + tk;
+            if (tok < p.n) {
+                float * o = p.dst + tok * p.m + rbase + c * 4;
+                const float * v = stage + tk * LDS + c * 4;
+                if (whole) {
+                    if constexpr (CS) {
+                        __stcs((float4 *) o, *(const float4 *) v);
+                    } else {
+                        *(float4 *) o = *(const float4 *) v;
+                    }
+                } else {
+#pragma unroll
+                    for (int u = 0; u < 4; u++) {
+                        if (rbase + c * 4 + u < p.m) {
+                            if constexpr (CS) {
+                                __stcs(o + u, v[u]);
+                            } else {
+                                o[u] = v[u];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        __syncwarp();
+    }
+}
+
+// RES: p.res added to every output (the residual add fused into the epilogue). WIDE (#1183, no
+// residual): the outputs through gemm8_epilogue_staged's plain 16-byte stores (GEMM8_WIDE).
+template <bool RES, class C, bool WIDE = false>
 __global__ void __launch_bounds__(256) fp8_gemm8(const legion_fp8_mm8 p) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
     using a8::BN;
@@ -306,7 +376,16 @@ __global__ void __launch_bounds__(256) fp8_gemm8(const legion_fp8_mm8 p) {
         gemm8_stage<C>(ws, ws + TM * LD, wm, wn, lane, acc);
     }
     asm volatile("cp.async.wait_group 0;\n" ::);
-    gemm8_epilogue<RES, C>(p, m0, n0, wm, wn, lane, acc);
+    if constexpr (WIDE) {
+        static_assert(!RES, "staged: no residual");
+        static_assert(C::SMEM >= 8 * GEMM8_STAGE_FLOATS * sizeof(float), "staging in the stages");
+        // Every thread's copies landed (above) and every warp's reads of the stages are done,
+        // so their memory takes the staged outputs.
+        __syncthreads();
+        gemm8_epilogue_staged<C, false>(p, m0, n0, wm, wn, lane, acc, (float *) smem + warp * GEMM8_STAGE_FLOATS);
+    } else {
+        gemm8_epilogue<RES, C>(p, m0, n0, wm, wn, lane, acc);
+    }
 #else
     __trap();
 #endif

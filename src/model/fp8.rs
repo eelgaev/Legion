@@ -717,8 +717,9 @@ static FORCED_GEMM_VARIANT: std::sync::atomic::AtomicI32 = std::sync::atomic::At
 
 /// Launches every TMA-fed W8A8 prefill GEMM from now on with epilogue `variant`
 /// (`legion_fp8_mm8`'s `variant`: 1 the plain epilogue, 2 and 3 the streaming one with one or
-/// two token tiles at a time, 0x100 the pick without the streaming route), or the default
-/// choice for 0: for `legion fp8-gemm-bench`.
+/// two token tiles at a time, 0x100 the pick without the streaming route; plus [`VARIANT_WIDE`],
+/// 0x400, the staged 16-byte stores where there is no residual, also on the 128-row tile), or
+/// the default choice for 0: for `legion fp8-gemm-bench`.
 #[doc(hidden)]
 pub fn force_gemm_variant(variant: i32) {
     #[cfg(feature = "cuda")]
@@ -846,6 +847,53 @@ unsafe fn cuda_fp8_quant_dyn(
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) const P_BY_EXCHANGE: usize = 2;
 
+/// The parameter of an [`FP8_MM8`] node without a residual that [`mark_wide_store`] sets: its
+/// GEMM's large-batch tiles store the F32 outputs 16 bytes a thread through shared memory
+/// ([`VARIANT_WIDE`]) while [`set_glu_wide_store`] is on.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) const P_WIDE_STORE: usize = 3;
+
+static GLU_WIDE_STORE: AtomicBool = AtomicBool::new(true);
+
+/// Whether the W8A8 GEMMs [`mark_wide_store`] marked (the shared expert's gate / up of a
+/// `--dense-fp8-prompt` prompt step, #1183) stage their F32 outputs through shared memory and
+/// store them 16 bytes a thread with plain stores (`gemm8_epilogue_staged`) instead of 4 bytes a
+/// thread from the MMA fragments: a quarter of the store instructions. The same values in the
+/// same places either way. On by default; `legion serve --no-fp8-glu-wide-store` turns it off
+/// for comparisons. Read at each launch.
+pub fn set_glu_wide_store(on: bool) {
+    GLU_WIDE_STORE.store(on, Ordering::Relaxed);
+}
+
+/// Whether [`set_glu_wide_store`] is on.
+pub fn glu_wide_store() -> bool {
+    GLU_WIDE_STORE.load(Ordering::Relaxed)
+}
+
+/// Marks the [`FP8_MM8`] node that `t` (the node or a view of it: a member of a joined run) is
+/// the output of for the staged 16-byte stores ([`P_WIDE_STORE`], [`set_glu_wide_store`]):
+/// `true` if it is one without a residual, else `false` (nothing marked: e.g. BF16 weights, a
+/// ggml matmul). For outputs the next op reads right away (#1183: the shared expert's gate and
+/// up, read by its SwiGLU's FP8 codes); the same bits either way.
+pub(crate) fn mark_wide_store(t: Tensor<'_>) -> bool {
+    // SAFETY: a live tensor of the graph being built; its view source is null or valid, and
+    // an external op node made by `external_with` has room for P_WIDE_STORE.
+    unsafe {
+        let raw = t.raw();
+        let node = if (*raw).view_src.is_null() {
+            raw
+        } else {
+            (*raw).view_src
+        };
+        let is_mm8 = crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &FP8_MM8));
+        if !is_mm8 || crate::ggml::external_params(&*node)[1] != 0 {
+            return false;
+        }
+        crate::ggml::set_external_param(node, P_WIDE_STORE, 1);
+    }
+    true
+}
+
 /// Whether `t` is an [`FP8_MM8`] node without a residual ([`mul_mat_a8`],
 /// [`mul_mat_a8_dynamic`]): its F32 output `[m, n, ..]` is all it writes, column by column.
 ///
@@ -903,6 +951,24 @@ pub(crate) unsafe fn launch_cols(
 /// sm90/fp8_gemm8_tma.cuh).
 #[cfg(feature = "cuda")]
 const VARIANT_STAGED: i32 = 0x200;
+
+/// `legion_fp8_mm8`'s variant bit for a node [`mark_wide_store`] marked, while
+/// [`set_glu_wide_store`] is on (`GEMM8_WIDE` in sm90/fp8_gemm8_tma.cuh, #1183): the large-batch
+/// tiles' staged 16-byte plain stores into device memory. `legion fp8-gemm-bench --variants`
+/// takes it (1024) too.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) const VARIANT_WIDE: i32 = 0x400;
+
+/// The variant bits of the [`FP8_MM8`] node with parameters `params`: [`VARIANT_WIDE`] when
+/// [`mark_wide_store`] marked it (no residual) and [`set_glu_wide_store`] is on, else 0.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) fn node_variant(params: &[i32]) -> i32 {
+    if params[1] == 0 && params[P_WIDE_STORE] != 0 && glu_wide_store() {
+        VARIANT_WIDE
+    } else {
+        0
+    }
+}
 
 /// The GEMM of the [`FP8_MM8`] node `dst`: all of it (`cols` `None`, into its own output), or
 /// the columns and output [`launch_cols`] says.
@@ -1098,7 +1164,9 @@ unsafe fn mm8_params(
             } else {
                 std::ptr::null()
             },
-            variant: gemm_variant() | (out.is_some_and(|o| o.1) as i32 * VARIANT_STAGED),
+            variant: gemm_variant()
+                | (out.is_some_and(|o| o.1) as i32 * VARIANT_STAGED)
+                | node_variant(&crate::ggml::external_params(dst)),
         }
     };
     Ok(p)

@@ -428,6 +428,12 @@ pub(in crate::cli) struct SwitchArgs {
     /// can differ from the default's where such steps occur. Off by default.
     #[arg(long, help_heading = HEADING)]
     fp8_sliced_k: bool,
+    /// CUDA, compute capability 8.9+, --dense-fp8-prompt: the shared expert's gate / up W8A8 GEMM
+    /// of prompt steps stores its F32 outputs straight from the MMA fragments, 4 bytes a thread
+    /// (the default: staged through shared memory and stored 16 bytes a thread, whole runs of
+    /// each token's rows). The same bits either way. For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_fp8_glu_wide_store: bool,
     /// CUDA, compute capability 9.0 only (H100, H200, GH200) with a binary built for sm_90a
     /// (CMAKE_CUDA_ARCHITECTURES=90a): W8A8 FP8 prompt matmuls (more than 64 tokens) on the
     /// Hopper GEMM (warpgroup MMA fed by the TMA, a warp-specialized pipeline of 128 x 128 tiles,
@@ -1610,6 +1616,7 @@ impl SwitchArgs {
             nvfp4_mmvq_glu: self.nvfp4_mmvq_glu.then_some(true),
             fp8_small_batch_gemv: self.fp8_small_batch_gemv.then_some(true),
             fp8_sliced_k: self.fp8_sliced_k.then_some(true),
+            fp8_glu_wide_store: self.no_fp8_glu_wide_store.then_some(false),
             hopper_gemm: self.hopper_gemm.then_some(true),
             hopper_attn: self.hopper_attn.then_some(true),
             paged_prefill_qm: self.no_paged_prefill_qm.then_some(false),

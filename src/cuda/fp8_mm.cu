@@ -86,7 +86,9 @@ struct legion_fp8_mm8 {
     // The TMA-fed large-batch GEMM's epilogue (#1133 r25; other GEMMs ignore it): 0 the default
     // pick (gemm8_epilogue_stream where routed), with bit 8 (LEGION_DEBUG_FP8_STREAM_EPI=0)
     // gemm8_epilogue everywhere; forced, for `legion fp8-gemm-bench`: 1 gemm8_epilogue, 2 / 3
-    // gemm8_epilogue_stream with one / two token tiles at a time. Every value gives the same bits.
+    // gemm8_epilogue_stream with one / two token tiles at a time. Bit 9 (GEMM8_STAGED): mapped
+    // host memory, staged streaming stores; bit 10 (GEMM8_WIDE, #1183; fp8_gemm8 too): staged
+    // plain 16-byte stores, where there is no residual. Every value gives the same bits.
     int32_t variant;
 };
 int legion_fp8_quant_launch(const float * x, int64_t x_ld, uint8_t * out, int64_t k, int64_t n,
@@ -587,14 +589,27 @@ bool gemm8_ada_skinny(const legion_fp8_mm8 & p) {
     return p.k % a8s::BK == 0 && tiles * 4 < sm_count() && legion_device::compute_capability() == 89;
 }
 
-template <bool RES, class C>
-void launch_gemm8_w(const legion_fp8_mm8 & p, cudaStream_t st) {
+template <bool RES, class C, bool WIDE>
+void launch_gemm8_wk(const legion_fp8_mm8 & p, cudaStream_t st) {
     constexpr size_t SMEM = C::SMEM;
     static_assert(SMEM <= 96 * 1024, "shared memory");
     static std::atomic<int8_t> opted_in[GGML_CUDA_MAX_DEVICES];
-    legion_device::smem_opt_in(opted_in, fp8_gemm8<RES, C>, (int) SMEM);
+    legion_device::smem_opt_in(opted_in, fp8_gemm8<RES, C, WIDE>, (int) SMEM);
     const dim3 grid((unsigned) ((p.n + a8::BN - 1) / a8::BN), (unsigned) ((p.m + C::TM - 1) / C::TM));
-    fp8_gemm8<RES, C><<<grid, 256, SMEM, st>>>(p);
+    fp8_gemm8<RES, C, WIDE><<<grid, 256, SMEM, st>>>(p);
+}
+
+// fp8_gemm8 with GEMM8_WIDE's staged epilogue where p asks for it (#1183; no residual), else
+// its own.
+template <bool RES, class C>
+void launch_gemm8_w(const legion_fp8_mm8 & p, cudaStream_t st) {
+    if constexpr (!RES) {
+        if (p.variant & GEMM8_WIDE) {
+            launch_gemm8_wk<RES, C, true>(p, st);
+            return;
+        }
+    }
+    launch_gemm8_wk<RES, C, false>(p, st);
 }
 
 // fp8_gemm8_tma on consumer Blackwell (compute capability 12.x: the GB10, where it was measured,
@@ -699,10 +714,14 @@ bool launch_gemm8_tma(const legion_fp8_mm8 & p, cudaStream_t st) {
 // 0.97x in one session and 1.07x in the other: not routed.
 constexpr int64_t GEMM8_STREAM_MIN_M = 2048;
 // Outputs into mapped host memory (GEMM8_STAGED, the TP send buffer) on the wide tile without
-// the residual: -1, gemm8_epilogue_staged.
+// the residual: -1, gemm8_epilogue_staged with streaming stores; else GEMM8_WIDE (#1183, device
+// memory) there: -2, with plain stores.
 template <bool RES, class C> int gemm8_stream_jg(const legion_fp8_mm8 & p) {
     if (!RES && C::WM == 4 && (p.variant & GEMM8_STAGED)) {
         return -1;
+    }
+    if (!RES && C::WM == 4 && (p.variant & GEMM8_WIDE)) {
+        return -2;
     }
     switch (p.variant & 0xff) {
         case 2: return 1;
@@ -718,6 +737,11 @@ template <bool RES, class C> bool launch_gemm8_tma_jg(const legion_fp8_mm8 & p, 
         case -1:
             if constexpr (!RES && C::WM == 4) {
                 return launch_gemm8_tma<RES, C, -1>(p, st);
+            }
+            return false;
+        case -2:
+            if constexpr (!RES && C::WM == 4) {
+                return launch_gemm8_tma<RES, C, -2>(p, st);
             }
             return false;
         case 1: return launch_gemm8_tma<RES, C, 1>(p, st);
