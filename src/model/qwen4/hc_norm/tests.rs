@@ -1175,6 +1175,7 @@ fn cuda_hc_post_norm_moe_sum_sm80_is_bit_identical() {
         return;
     }
     let mut gpu = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
         .expect("no GPU device")
         .init()
         .unwrap();
