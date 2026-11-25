@@ -131,17 +131,16 @@ fn mm_node_finds_the_matmul_under_a_scale() {
 }
 
 /// The default epilogue variant per row length (#1183): k up to 1,024 the staggered first wave
-/// alone, 1,025-4,095 the TMA stores alone, from 4,096 both; the conv epilogue's TMA stores
-/// whenever the TMA stores are on; the switches and the TP send buffer.
+/// alone, above 1,024 the TMA stores and the staggered first wave; the conv epilogue's TMA
+/// stores whenever the TMA stores are on; the switches and the TP send buffer.
 #[test]
 fn default_gemm_variant_per_k() {
     let all = (true, true, true, false);
     for (k, want) in [
         (640, 0x2000 | 0x1000),
         (1024, 0x2000 | 0x1000),
-        (1152, 0x800 | 0x1000),
-        (2560, 0x800 | 0x1000),
-        (3968, 0x800 | 0x1000),
+        (1152, 0x2800 | 0x1000),
+        (2560, 0x2800 | 0x1000),
         (4096, 0x2800 | 0x1000),
         (6144, 0x2800 | 0x1000),
         (17408, 0x2800 | 0x1000),
@@ -153,11 +152,12 @@ fn default_gemm_variant_per_k() {
     // --no-fp8-tma-store: no TMA store anywhere, the stagger stays.
     let no_tma = (false, true, true, false);
     assert_eq!(default_gemm_variant(640, 0, no_tma), 0x2000);
-    assert_eq!(default_gemm_variant(2560, 0, no_tma), 0);
+    assert_eq!(default_gemm_variant(2560, 0, no_tma), 0x2000);
     assert_eq!(default_gemm_variant(6144, 0, no_tma), 0x2000);
     // --no-fp8-conv-tma-store.
     let no_conv = (true, false, true, false);
-    assert_eq!(default_gemm_variant(2560, 0, no_conv), 0x800);
+    assert_eq!(default_gemm_variant(640, 0, no_conv), 0x2000);
+    assert_eq!(default_gemm_variant(2560, 0, no_conv), 0x2800);
     assert_eq!(default_gemm_variant(6144, 0, no_conv), 0x2800);
     // --no-fp8-wide-stagger, and the TP send buffer (staged): no stagger.
     for flags in [(true, true, false, false), (true, true, true, true)] {

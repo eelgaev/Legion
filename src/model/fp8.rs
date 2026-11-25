@@ -759,25 +759,23 @@ pub fn unforce_gemm_variant() {
     FORCED_GEMM_VARIANT.store(i32::MIN, Ordering::Relaxed);
 }
 
-/// Whether the wide tile's first wave starts staggered where [`default_gemm_variant`] picks it
-/// ([`set_wide_stagger`]).
+/// Whether the wide tile's first wave starts staggered ([`set_wide_stagger`]).
 static WIDE_STAGGER: AtomicBool = AtomicBool::new(true);
 
 /// Whether the TMA-fed W8A8 prefill GEMMs on the 256 x 128 tile (one CTA an SM) start their
-/// first wave staggered over about one tile's time where [`default_gemm_variant`] picks it
-/// (rows of at most 1,024 or at least 4,096 bytes), as the 4-warp tile does, so the SMs'
-/// epilogues do not all write at once, from now on (`legion serve --no-fp8-wide-stagger` turns
-/// it off). On by default: only the start times change, so the same bits.
+/// first wave staggered over about one tile's time, as the 4-warp tile does, so the SMs'
+/// epilogues do not all write at once, from now on ([`default_gemm_variant`]; not on the TP
+/// send buffer's GEMMs; `legion serve --no-fp8-wide-stagger` turns it off). On by default: only
+/// the start times change, so the same bits.
 pub fn set_wide_stagger(on: bool) {
     WIDE_STAGGER.store(on, Ordering::Relaxed);
 }
 
 /// The default epilogue variant of a TMA-fed W8A8 GEMM over rows of `k` bytes (#1183, GB10,
 /// Qwen3.8-Flash-Next's shapes at 12,288 and 8,067 tokens against the fragments' stores): the
-/// TMA stores (with `tma`) at k 1,025-4,095 (k 2,560: 1.00-1.07x), with the staggered first
-/// wave too (with `stagger`) from k 4,096 (k 6,144: 1.05x, the TMA store alone 0.98-1.00x);
-/// at k up to 1,024 the staggered wave alone (k 640: 1.01x, the TMA store 0.78-0.93x); the conv
-/// epilogue's TMA stores with `tma` and `conv` (1.02-1.03x); `env` (bit 0x100 or 0) on top. No
+/// staggered first wave (with `stagger`) everywhere, with the TMA stores (with `tma`) above
+/// k 1,024 (k 2,560: 1.00-1.05x, k 6,144: 1.03-1.05x; the TMA store at k 640: 0.78-0.94x); the
+/// conv epilogue's TMA stores with `tma` and `conv` (1.015x); `env` (bit 0x100 or 0) on top. No
 /// stagger where the outputs go to the TP send buffer (`staged`: not measured).
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) fn default_gemm_variant(
@@ -785,15 +783,9 @@ pub(crate) fn default_gemm_variant(
     env: i32,
     (tma, conv, stagger, staged): (bool, bool, bool, bool),
 ) -> i32 {
-    let stagger = stagger && !staged;
-    let wide = if k <= 1024 {
-        if stagger { VARIANT_WIDE_STAGGER } else { 0 }
-    } else if k >= 4096 {
-        (tma as i32 * VARIANT_TMA_STORE) | (stagger as i32 * VARIANT_WIDE_STAGGER)
-    } else {
-        tma as i32 * VARIANT_TMA_STORE
-    };
-    env | wide | ((tma && conv) as i32 * VARIANT_CONV_TMA_STORE)
+    let stagger = (stagger && !staged) as i32 * VARIANT_WIDE_STAGGER;
+    let store = (tma && k > 1024) as i32 * VARIANT_TMA_STORE;
+    env | stagger | store | ((tma && conv) as i32 * VARIANT_CONV_TMA_STORE)
 }
 
 /// The TMA-fed W8A8 GEMM's epilogue variant for rows of `k` bytes: a forced one, else

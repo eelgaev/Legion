@@ -436,10 +436,9 @@ pub(in crate::cli) struct SwitchArgs {
     #[arg(long, help_heading = HEADING)]
     no_fp8_tma_store: bool,
     /// CUDA, compute capability 12.x, W8A8 FP8 prompt matmuls on the TMA-fed 256 x 128 tile:
-    /// start every CTA of the first wave at once, as before. By default, where the weight rows
-    /// are at most 1,024 or at least 4,096 bytes long, the first wave's start is spread over
-    /// about one tile's time so the SMs' epilogues don't all write at once. The same bits either
-    /// way.
+    /// start every CTA of the first wave at once, as before. By default the first wave's start
+    /// is spread over about one tile's time so the SMs' epilogues don't all write at once. The
+    /// same bits either way.
     #[arg(long, help_heading = HEADING)]
     no_fp8_wide_stagger: bool,
     /// As --no-fp8-tma-store, for the gated DeltaNet qkv GEMM with the conv in its epilogue

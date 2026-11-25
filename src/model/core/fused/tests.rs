@@ -1301,7 +1301,7 @@ fn cuda_conv_tma_store_microbench() {
 #[ignore = "needs a GPU"]
 fn cuda_conv_not_allowed_stays() {
     use crate::ggml::{DeviceKind, device_by_kind};
-    let mut gpu = device_by_kind(DeviceKind::Gpu)
+    let gpu = device_by_kind(DeviceKind::Gpu)
         .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
         .expect("no GPU device")
         .init()
