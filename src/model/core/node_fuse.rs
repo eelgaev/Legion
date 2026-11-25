@@ -316,6 +316,10 @@ struct Graph {
     readers: Vec<usize>,
     /// Nodes this rewrite turned into `GGML_OP_NONE`.
     none: Vec<bool>,
+    /// Writes this rewrite moved earlier, which a node's own output and sources do not show:
+    /// (the node that now makes them, the tensor whose memory it writes). A cast's values
+    /// written by its mix ([`Self::mix_cast`]) or gather ([`Self::gather`]).
+    moved: Vec<(usize, Node)>,
 }
 
 /// Whether `op` only makes a view (ggml-cuda launches nothing for it).
@@ -454,6 +458,7 @@ impl Graph {
             starts,
             readers,
             none: vec![false; n],
+            moved: Vec::new(),
         }
     }
 
@@ -1025,6 +1030,7 @@ impl Graph {
             crate::model::qwen4::set_mix_cast(mix, cast, skip_f32);
             (*cast).op = ffi::ggml_op_GGML_OP_NONE;
             self.none[j] = true;
+            self.moved.push((at, cast));
             c.mix_cast += 1;
             c.mix_f32_skipped += usize::from(skip_f32);
         }
@@ -1115,6 +1121,7 @@ impl Graph {
             if seq_par::take_cast(ag, cast) {
                 (*cast).op = ffi::ggml_op_GGML_OP_NONE;
                 self.none[j] = true;
+                self.moved.push((at, cast));
                 c.gather_cast += 1;
             }
         }
@@ -1280,6 +1287,19 @@ impl Graph {
                 &[oi, mi, ri],
             ) {
                 return Err("the query rows' memory is reused before the attention");
+            }
+            // may_read_at sees each node's own output and sources; the writes mix_cast and
+            // gather moved earlier (rewrites of nodes before `at`, so already made) are not
+            // among them. None may touch what the attention now reads.
+            for x in [raw, w, pos] {
+                let from = self.index.get(&(root(x) as usize)).map_or(0, |&i| i + 1);
+                if self
+                    .moved
+                    .iter()
+                    .any(|&(k, t)| k >= from && k < at && overlap(t, x))
+                {
+                    return Err("a rewritten node writes what the attention would read");
+                }
             }
             let f = qsa_attn::QNormRope {
                 raw,

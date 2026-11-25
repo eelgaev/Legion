@@ -906,7 +906,9 @@ pub enum PromptKernel {
     GwOneL1 = 10,
 }
 
-/// The prompt kernel launches take from now on ([`PromptKernel`]; `legion qsa-bench`).
+/// The prompt kernel launches take from now on ([`PromptKernel`]; `legion qsa-bench`). A graph
+/// whose query [`fold_q`] folded (built under [`PromptKernel::Auto`]) then fails to compute
+/// rather than run another kernel: build it again after forcing one.
 #[cfg(feature = "cuda")]
 pub fn set_prompt_kernel(k: PromptKernel) {
     PROMPT_KERNEL.store(k as u8, std::sync::atomic::Ordering::Relaxed);
@@ -1918,6 +1920,13 @@ unsafe fn cuda_attn_codes(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
     p.sync = c.sync;
     // SAFETY: a `gated_codes` node; `fold_q`'s tensors are the node's, allocated.
     if let Some(f) = unsafe { folded(dst) } {
+        // ggml's norm and RoPE nodes are off, so only the fold's kernel makes this query:
+        // a kernel forced after the rewrite is refused, not silently replaced by it.
+        if p.mma_kernel != 0 || p.gw_cg != 0 {
+            let why = "qsa_attn_codes: a prompt kernel was forced after node_fuse folded the \
+                       query under the launcher's choice; build the graph again";
+            return Err(why.into());
+        }
         // SAFETY: `fold_q`'s sources: the query before the norm (`f.off` tokens in, as the
         // attention's query viewed the RoPE's output), the weight and the positions.
         unsafe {

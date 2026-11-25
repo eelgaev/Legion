@@ -1494,12 +1494,13 @@ int launch_gw_variant(const legion_qsa_attn & p, cudaStream_t st) {
 template <int HD>
 int launch_attn(const legion_qsa_attn & p, cudaStream_t st) {
     // q before its norm and RoPE (qn_w): attn_gw_kernel's codes path only, where node_fuse
-    // folds them (the launcher's own pick on a 12.x GPU, F16 K and V, head size 256). Taken
-    // whatever kernel was forced since (the other kernels read the RoPE's output, which the
-    // fold left unwritten); the variants have the same bits.
+    // folds them (the launcher's own pick on a 12.x GPU, F16 K and V, head size 256). With a
+    // kernel forced since, nothing runs (1; the caller refuses that first): the other kernels
+    // read the RoPE's output, which the fold left unwritten.
     if (p.qn_w != nullptr) {
         if constexpr (HD == 256) {
             if (p.k_type == 0 && p.v_type == 0 && p.codes != nullptr && use_mma<HD>() &&
+                p.mma_kernel == 0 && p.gw_cg == 0 &&
                 p.qn_rot > 0 && p.qn_rot % 2 == 0 && p.qn_rot <= HD) {
                 legion_qsa_attn q = p;
                 // As ggml-cuda's rope_multi_cuda (host side).

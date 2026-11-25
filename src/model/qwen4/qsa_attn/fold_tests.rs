@@ -38,8 +38,8 @@ fn picks(tokens: usize) -> Vec<Vec<i32>> {
 /// The packed activations of [`gated_codes`] over qwen4exp's query chain (`rms_norm`, `mul`,
 /// `rope_multi`, a view of the step's tokens) on `backend`, after `node_fuse`'s rewrite (as on
 /// CUDA). `keep`: the RoPE's output is a graph output, so the rewrite must leave the chain.
-/// Also whether the node's query was folded.
-fn run(s: &Step, backend: &mut Backend, keep: bool) -> (Vec<u8>, bool) {
+/// Also whether the node's query was folded and the run's [`Fold`].
+fn run(s: &Step, backend: &mut Backend, keep: bool) -> (Vec<u8>, bool, Fold) {
     let (d, nh, nkv, n) = (s.d, s.n_head, s.n_head_kv, s.n);
     let k = d * nh;
     let blocks = (n as usize).div_ceil(KV_BLOCK);
@@ -93,8 +93,12 @@ fn run(s: &Step, backend: &mut Backend, keep: bool) -> (Vec<u8>, bool) {
         .unwrap();
     // SAFETY: an allocated graph that has not run.
     unsafe { rewrite_graph(graph.raw(), true) };
-    // SAFETY: the op's node.
-    let folded = unsafe { is_q_folded(node.raw()) };
+    // SAFETY: the op's node, allocated.
+    let (folded, off) = unsafe { (is_q_folded(node.raw()), fold_q_off(node.raw())) };
+    let fold = Fold {
+        off,
+        cc12: (kp.cuda_device().and_then(crate::hw::per_device::cc)).is_some_and(|c| c.0 == 12),
+    };
 
     let rows: Vec<f32> = noise((2 * k * s.total) as usize, 21)
         .iter()
@@ -130,7 +134,24 @@ fn run(s: &Step, backend: &mut Backend, keep: bool) -> (Vec<u8>, bool) {
     sel.set_i32(&srows);
     backend.compute(&graph).unwrap();
     // `got` is not in the graph (so has no memory of its own): its bytes are the node's first.
-    (node.bytes_prefix(got.nbytes()), folded)
+    (node.bytes_prefix(got.nbytes()), folded, fold)
+}
+
+/// What decides a run's fold besides the graph's chain.
+struct Fold {
+    /// [`fold_q_off`] of the node.
+    off: Option<&'static str>,
+    /// The graph's device (its KV cache's) is of compute capability 12.x.
+    cc12: bool,
+}
+
+impl Fold {
+    /// A debug override (`LEGION_DEBUG_QSA_PROMPT_KERNEL`, `LEGION_DEBUG_QSA_GW_L1=0`) keeps the
+    /// fold off on any device.
+    fn overridden(&self) -> bool {
+        self.off
+            .is_some_and(|w| w.contains("LEGION_DEBUG_QSA_PROMPT_KERNEL") || w.contains("GW_L1"))
+    }
 }
 
 /// Where two runs' packed activations first differ.
@@ -158,8 +179,8 @@ fn cpu_fold_q_stays_off() {
         base: 0,
         imrope: true,
     };
-    let (want, kept) = run(&s, &mut backend, true);
-    let (got, folded) = run(&s, &mut backend, false);
+    let (want, kept, _) = run(&s, &mut backend, true);
+    let (got, folded, _) = run(&s, &mut backend, false);
     assert!(!kept && !folded);
     assert_eq!(
         first_diff(&want, &got, (s.d * s.n_head) as usize, s.n as usize),
@@ -181,7 +202,6 @@ fn cuda_fold_q_matches_ggml_norm_rope() {
         .expect("no GPU device")
         .init()
         .unwrap();
-    let mut gb10 = None;
     for (off, total, base, imrope) in [
         (0, 777, 0, true),
         (5, 790, 199_999, true),
@@ -197,12 +217,15 @@ fn cuda_fold_q_matches_ggml_norm_rope() {
             base,
             imrope,
         };
-        let (want, kept) = run(&s, &mut backend, true);
-        let (got, folded) = run(&s, &mut backend, false);
+        let (want, kept, _) = run(&s, &mut backend, true);
+        let (got, folded, fold) = run(&s, &mut backend, false);
         assert!(!kept, "a RoPE output with another reader was folded");
-        let cc12 =
-            *gb10.get_or_insert_with(|| crate::hw::per_device::cc(0).is_some_and(|c| c.0 == 12));
-        assert_eq!(folded, cc12, "folded on a compute capability 12.x GPU only");
+        if fold.overridden() {
+            assert!(!folded, "folded under a debug override");
+            eprintln!("skipped the folded check: {}", fold.off.unwrap_or_default());
+        } else {
+            assert_eq!(folded, fold.cc12, "folded on 12.x only");
+        }
         let (k, n) = ((s.d * s.n_head) as usize, s.n as usize);
         assert_eq!(
             first_diff(&want, &got, k, n),
