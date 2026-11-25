@@ -1517,19 +1517,21 @@ pub fn grouped_gemm_tune(k: i64, n_expert: i64, mi: i32, nt: i32, glu: bool) -> 
     }
 }
 
-/// How many token tiles ahead [`DOWN_XPF`] prefetches: about the token tiles a GB10's 48 SMs
-/// run at once in [`GEMM_DOWN`]'s two CTAs each (96 CTAs over the 10 row tiles of a 2,560-row
-/// down projection), so the rows land in L2 about one wave before their CTAs start.
-pub const DOWN_XPF_AHEAD: i32 = 10;
+/// How many token tiles ahead [`DOWN_XPF`] prefetches. A GB10's 48 SMs run about 10 token
+/// tiles at once in [`GEMM_DOWN`]'s two CTAs each (96 CTAs over the 10 row tiles of a 2,560-row
+/// down projection), but a short lead won: GB10, Qwen3.8-Flash-Next, medians of 5 interleaved
+/// rounds of `cuda_down_x_prefetch_bench`, 2 ahead took 5.9% (12,288-token steps) and 7.0%
+/// (8,067) less time than none, 4 ahead 4.4/6.4%, 6 ahead 5.0/5.6%, 10 ahead 3.6/3.8%,
+/// 16 ahead 1.8/0.8%.
+pub const DOWN_XPF_AHEAD: i32 = 2;
 
 /// `legion_nvfp4_mm::xpf` of the down projection's grouped GEMM ([`GEMM_DOWN`], #1183): the
 /// CTAs of row tile 0 prefetch the activation rows of the tile [`DOWN_XPF_AHEAD`] ahead into L2.
 /// The tile's copies read each activation row 128 bytes a step from scattered rows (the pairs of
 /// one expert), with one stage ahead, so without the prefetch every step waits for DRAM. Not
-/// the tiles' own rows (bit 0) as well: GB10, Qwen3.8-Flash-Next at 12,288- and 8,067-token
-/// steps (single runs of `cuda_down_x_prefetch_bench`), 10 ahead alone took 4.0-5.4% less time
-/// than none, own rows plus 10 ahead 2.3-2.4% (the ten row tiles of a token tile each asking
-/// for the same rows as they start). L2 hints only: the same sums.
+/// the tiles' own rows (bit 0) as well: in the same runs own rows plus 2 ahead took 3.7-4.8%
+/// less time than none and own plus 10 ahead 1.8-2.4% (the ten row tiles of a token tile each
+/// asking for the same rows as they start). L2 hints only: the same sums.
 pub const DOWN_XPF: i32 = DOWN_XPF_AHEAD << 1;
 
 /// The activation prefetch (`legion_nvfp4_mm::xpf`) of a grouped GEMM's launch, as

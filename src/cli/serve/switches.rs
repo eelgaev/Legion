@@ -490,7 +490,7 @@ pub(in crate::cli) struct SwitchArgs {
     no_nvfp4_expert_tile_prefetch: bool,
     /// CUDA, NVFP4 routed experts on Legion's W4A16 kernels, prompt steps on the grouped GEMM:
     /// the down projection's tiles do not prefetch activation rows into L2 (the default: the
-    /// tiles of the first row tile prefetch the rows of the token tile ten ahead, so the copies
+    /// tiles of the first row tile prefetch the rows of the token tile two ahead, so the copies
     /// of a step stop waiting for scattered rows from DRAM). The same bits either way. For
     /// comparisons.
     #[arg(long, help_heading = HEADING)]

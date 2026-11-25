@@ -892,7 +892,7 @@ fn counted_routing_gives_each_expert_its_pairs() {
 /// SwiGLU's, not a down projection of narrow k or few experts.
 #[test]
 fn down_x_prefetch_only_on_the_down_gemm() {
-    assert_eq!(DOWN_XPF, 20);
+    assert_eq!(DOWN_XPF, 4);
     assert_eq!(DOWN_XPF >> 1, DOWN_XPF_AHEAD);
     // Qwen3.8-Flash-Next's down projection (k 640, 512 experts) at prompt steps.
     assert_eq!(grouped_gemm_xpf(640, 512, 2, 8, false), DOWN_XPF);
@@ -954,7 +954,7 @@ struct XpfCase {
 /// The activation prefetches the bit test compares with none (0): own rows only, tiles ahead
 /// only, both, the default, and a distance past every routed pair.
 #[cfg(feature = "cuda")]
-const XPF_CHECKED: [i32; 7] = [1, 2, 3, 9, DOWN_XPF, 1 | 10 << 1, 1 | 1000 << 1];
+const XPF_CHECKED: [i32; 8] = [1, 2, 3, 9, DOWN_XPF, 10 << 1, 1 | 10 << 1, 1 | 1000 << 1];
 
 /// Runs `graph` under every activation prefetch of [`XPF_CHECKED`] (and the default) and checks
 /// that its outputs `outs` are the bits of the run without one.
