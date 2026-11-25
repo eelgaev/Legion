@@ -86,7 +86,7 @@ struct legion_nvfp4_mm {
     // tail of --tp-moe-ep does not read rows of zero router weights). 0: zeros, as before.
     int32_t unread_skips;
     // nvfp4_gemm's activation L2 prefetch (#1183; L2 hints only, the same sums; sm_90+). Bit 0:
-    // each tile's token rows in runs of the weights' prefetch (PF blocks), next to them. Above
+    // each tile's whole token rows, once at its start, after its weights' first runs. Above
     // bit 0 (grouped): the CTAs of row tile 0 also prefetch the whole rows of the BN plan pairs
     // xpf >> 1 token tiles past their own. 0: no activation prefetch, as before.
     int32_t xpf;
@@ -525,21 +525,23 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) nvfp4_gemm(const legion_nvfp
                              "r"((uint32_t) ((e - a16 + 15) & ~(uintptr_t) 15)));
             }
         }
-        // p.xpf bit 0 (#1183): the tile's token rows over the same steps. Without it each step's
-        // copies read 128 bytes of every token row, scattered rows (a grouped tile's pairs) the
-        // stage ahead has to wait for from DRAM; with it the first step waits and the rest find
-        // L2. The rows are 16-byte aligned (x_ld % 8 == 0) and BK * 2 bytes a step.
-        if (!(DIAG & DIAG_NOX) && (p.xpf & 1) && threadIdx.x < n_tok && step < steps) {
-            const int t = threadIdx.x;
-            const int64_t off = GROUPED ? x_off[t] : (n0 + t) * p.x_ld;
-            const uintptr_t a = (uintptr_t) (p.x + off + step * BK);
-            const uint32_t bytes = (uint32_t) (min((int64_t) PF, steps - step) * BK * 2);
-            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(a), "r"(bytes));
-        }
 #endif
     };
     prefetch(0);
     prefetch(PF);
+#if __CUDA_ARCH__ >= 900
+    // p.xpf bit 0 (#1183): the tile's whole token rows, once, before the first copies. Without
+    // it each step's copies read 128 bytes of every token row, scattered rows (a grouped tile's
+    // pairs) the stage ahead has to wait for from DRAM; with it the first step waits and the rest
+    // find L2. Here and not in the k loop's prefetch, where the accumulators are live (the down
+    // tile's 128 registers would spill). The rows are 16-byte aligned (x_ld % 8 == 0).
+    if (!(DIAG & DIAG_NOX) && (p.xpf & 1) && threadIdx.x < n_tok && steps > 0) {
+        const int t = threadIdx.x;
+        const int64_t off = GROUPED ? x_off[t] : (n0 + t) * p.x_ld;
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"((uintptr_t) (p.x + off)),
+                     "r"((uint32_t) (steps * BK * 2)));
+    }
+#endif
 
     float acc[MI][NT][4];
 #pragma unroll
