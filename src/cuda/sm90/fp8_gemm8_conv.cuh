@@ -261,7 +261,7 @@ __device__ __forceinline__ void gemm8_conv_epilogue(const legion_fp8_mm8 & p, co
             store(0, 2);
         }
         gemm8_store_tma(ymap, m0 + wm * 64, n0 + wn * 64, p.n, lane, acc,
-                        smem + (wm * C::WN + wn) * a8t::ST_WARP_FLOATS, skip0);
+                        smem + (wm * C::WN + wn) * a8t::ST_WARP_FLOATS, skip0, [](int) {});
     } else {
         store(0, 8);
     }

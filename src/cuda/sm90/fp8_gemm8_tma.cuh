@@ -114,18 +114,16 @@ __device__ __forceinline__ void gemm8_epilogue_staged(const legion_fp8_mm8 & p, 
     }
 }
 
-// The wide tile's sums times their scales in place (#1183, for gemm8_store_tma): each value
-// gemm8_epilogue_stream stores (the sum times a8_scale's factor: s0, else the token's scale
-// times the row's, or the token's), so the same bits. Tokens past n keep a factor of s0.
-template <class C, int NJ>
-__device__ __forceinline__ void gemm8_scale_acc(const legion_fp8_mm8 & p, int64_t m0, int64_t n0, int wm, int wn,
-                                                int lane, float (&acc)[4][NJ][4]) {
-    static_assert(NJ == a8::BN / 8 / C::WN, "n8 tiles per warp");
-    const float s = a8_static(p);
+// The wide tile's sums times their scales in place (#1183, for gemm8_store_tma), a quarter of a
+// warp's tokens at a time as gemm8_epilogue_stream's token tiles: each value it stores (the sum
+// times a8_scale's factor: s0, else the token's scale times the row's, or the token's), so the
+// same bits. Tokens past n keep a factor of s0.
+// The row factors of the warp's rows (row i 16 + 8 h + g from m0 + 64 wm): wr[i][h].
+__device__ __forceinline__ void gemm8_row_scales(const legion_fp8_mm8 & p, int64_t m0, int wm, int lane,
+                                                 float (&wr)[4][2]) {
     const bool uni = p.scale_stride == 0 && p.wscale_stride == 0;
     const bool rowsc = !uni && p.wscale != nullptr;
     const int64_t rbase = m0 + wm * 64 + lane / 4;  // row of i 0, e 0
-    float wr[4][2];
 #pragma unroll
     for (int i = 0; i < 4; i++)
 #pragma unroll
@@ -133,9 +131,19 @@ __device__ __forceinline__ void gemm8_scale_acc(const legion_fp8_mm8 & p, int64_
             const int64_t row = rbase + i * 16 + h * 8;
             wr[i][h] = rowsc && row < p.m ? p.wscale[row * p.wscale_stride] : 0.0f;
         }
+}
+
+// n8 tiles j0 .. j0 + JN - 1 of the sums times their factors (wr: gemm8_row_scales), in place.
+template <class C, int JN, int NJ>
+__device__ __forceinline__ void gemm8_scale_acc(const legion_fp8_mm8 & p, int64_t n0, int wn, int lane,
+                                                const float (&wr)[4][2], int j0, float (&acc)[4][NJ][4]) {
+    static_assert(NJ == a8::BN / 8 / C::WN, "n8 tiles per warp");
+    const float s = a8_static(p);
+    const bool uni = p.scale_stride == 0 && p.wscale_stride == 0;
+    const bool rowsc = !uni && p.wscale != nullptr;
     const int64_t tbase = n0 + wn * NJ * 8 + (lane % 4) * 2;  // token of j 0, e 0
 #pragma unroll
-    for (int j = 0; j < NJ; j++)
+    for (int j = j0; j < j0 + JN; j++)
 #pragma unroll
         for (int e2 = 0; e2 < 2; e2++) {
             const int64_t tok = tbase + j * 8 + e2;
@@ -161,9 +169,12 @@ __device__ __forceinline__ void gemm8_scale_acc(const legion_fp8_mm8 & p, int64_
 // the TMA unit, which writes whole 128-byte lines and clips tokens past the tensor's. The warp
 // fills the next quarter while those are read; the fourth reuses the first one's memory once
 // the TMA has read it. The same values at the same places: the same bits. skip0: the first
-// quarter is the caller's to store (not stored here).
+// quarter is the caller's to store (not stored here). prep(q) makes quarter q's values (n8
+// tiles 2 q, 2 q + 1 of v) final first.
+template <class Prep>
 __device__ __forceinline__ void gemm8_store_tma(const CUtensorMap * ymap, int64_t row0, int64_t tok0, int64_t n,
-                                                int lane, const float (&v)[4][8][4], float * buf, bool skip0) {
+                                                int lane, float (&v)[4][8][4], float * buf, bool skip0,
+                                                Prep && prep) {
     using namespace legion_tma;
     using a8t::ST_BUFS;
     using a8t::ST_QUARTER_FLOATS;
@@ -177,6 +188,7 @@ __device__ __forceinline__ void gemm8_store_tma(const CUtensorMap * ymap, int64_
         if ((q == 0 && skip0) || tok0 + q * ST_TOKS >= n) {
             continue;
         }
+        prep(q);
         float * b = buf + (q % ST_BUFS) * ST_QUARTER_FLOATS;
         if (q >= ST_BUFS) {
             // Quarter q - ST_BUFS's boxes read before their memory takes this one.
@@ -347,9 +359,11 @@ __global__ void __launch_bounds__(32 * C::WARPS, 8 / C::WARPS)
         // As for the staged epilogue: the stages' memory is free once every warp is past the
         // K loop.
         __syncthreads();
-        gemm8_scale_acc<C>(p, m0, n0, wm, wn, lane, acc);
+        float wr[4][2];
+        gemm8_row_scales(p, m0, wm, lane, wr);
         gemm8_store_tma(&maps.y, m0 + wm * 64, n0 + wn * NJ * 8, p.n, lane, acc,
-                        (float *) smem + warp * a8t::ST_WARP_FLOATS, false);
+                        (float *) smem + warp * a8t::ST_WARP_FLOATS, false,
+                        [&](int q) { gemm8_scale_acc<C, 2>(p, n0, wn, lane, wr, 2 * q, acc); });
     } else if constexpr (JG < 0) {
         static_assert(!RES && C::WM == 4, "staged: no residual, 64 rows a warp");
         // Every warp's reads of the stages are done (and every stage's copy landed: each was
