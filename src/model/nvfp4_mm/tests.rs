@@ -892,7 +892,7 @@ fn counted_routing_gives_each_expert_its_pairs() {
 /// SwiGLU's, not a down projection of narrow k or few experts.
 #[test]
 fn down_x_prefetch_only_on_the_down_gemm() {
-    assert_eq!(DOWN_XPF, 21);
+    assert_eq!(DOWN_XPF, 20);
     assert_eq!(DOWN_XPF >> 1, DOWN_XPF_AHEAD);
     // Qwen3.8-Flash-Next's down projection (k 640, 512 experts) at prompt steps.
     assert_eq!(grouped_gemm_xpf(640, 512, 2, 8, false), DOWN_XPF);
@@ -954,7 +954,7 @@ struct XpfCase {
 /// The activation prefetches the bit test compares with none (0): own rows only, tiles ahead
 /// only, both, the default, and a distance past every routed pair.
 #[cfg(feature = "cuda")]
-const XPF_CHECKED: [i32; 6] = [1, 2, 3, 9, DOWN_XPF, 1 | 1000 << 1];
+const XPF_CHECKED: [i32; 7] = [1, 2, 3, 9, DOWN_XPF, 1 | 10 << 1, 1 | 1000 << 1];
 
 /// Runs `graph` under every activation prefetch of [`XPF_CHECKED`] (and the default) and checks
 /// that its outputs `outs` are the bits of the run without one.
@@ -1137,7 +1137,9 @@ fn cuda_down_x_prefetch_keeps_bits() {
 /// The down projection's grouped GEMM (Qwen3.8-Flash-Next, 512 experts, top 10, BF16 rows as
 /// `--nvfp4-expert-rows-bf16`) at 12,288- and 8,067-token prompt steps without (old) and with
 /// the activation prefetch (#1183), and the SwiGLU GEMM's at the same steps: microseconds a
-/// layer (best of the rounds), the bytes moved a second, and whether the bits are the old ones.
+/// layer (median and best of the rounds, the configurations taking turns, each round starting
+/// one further on), the bytes moved a second at the median, and whether the bits are the old
+/// ones. `*` marks the default.
 /// `cargo test --release --features cuda --lib -- --ignored cuda_down_x_prefetch_bench
 /// --nocapture`.
 #[cfg(feature = "cuda")]
@@ -1163,20 +1165,24 @@ fn cuda_down_x_prefetch_bench() {
     for s in scales {
         s.set_f32(&vec![0.004; n_expert]);
     }
-    let down_xpfs: [(&str, i32); 7] = [
+    let down_xpfs: [(&str, i32); 11] = [
         ("old (none)", 0),
         ("own rows", 1),
-        ("own + 1 ahead", 3),
-        ("own + 4 ahead", 9),
-        ("default (own + 10 ahead)", DOWN_XPF),
-        ("own + 20 ahead", 1 | 20 << 1),
+        ("own + 1 ahead", 1 | 1 << 1),
+        ("own + 2 ahead", 1 | 2 << 1),
+        ("own + 4 ahead", 1 | 4 << 1),
+        ("own + 10 ahead", 1 | 10 << 1),
+        ("2 ahead only", 2 << 1),
+        ("4 ahead only", 4 << 1),
+        ("6 ahead only", 6 << 1),
         ("10 ahead only", 10 << 1),
+        ("16 ahead only", 16 << 1),
     ];
     let glu_xpfs: [(&str, i32); 4] = [
-        ("old (none, the default)", 0),
+        ("old (none)", 0),
         ("own rows", 1),
-        ("own + 1 ahead", 3),
-        ("own + 10 ahead", DOWN_XPF),
+        ("own + 1 ahead", 1 | 1 << 1),
+        ("own + 10 ahead", 1 | 10 << 1),
     ];
     for n_tok in [12288usize, 8067] {
         for glu in [false, true] {
@@ -1232,16 +1238,29 @@ fn cuda_down_x_prefetch_bench() {
                     same[vi] = got == want;
                 }
             }
-            let mut best = vec![f64::MAX; variants.len()];
-            for _ in 0..ROUNDS {
-                for (vi, &(_, xpf)) in variants.iter().enumerate() {
-                    force_gemm_xpf(Some(xpf));
+            let nv = variants.len();
+            let mut times = vec![Vec::with_capacity(ROUNDS); nv];
+            for round in 0..ROUNDS {
+                for i in 0..nv {
+                    let vi = (round + i) % nv;
+                    force_gemm_xpf(Some(variants[vi].1));
                     let t = std::time::Instant::now();
                     gpu.compute(&graph).unwrap();
-                    best[vi] = best[vi].min(t.elapsed().as_secs_f64() / LAYERS as f64);
+                    times[vi].push(t.elapsed().as_secs_f64() / LAYERS as f64);
                 }
             }
             force_gemm_xpf(None);
+            for t in &mut times {
+                t.sort_by(f64::total_cmp);
+            }
+            let median: Vec<f64> = times.iter().map(|t| t[t.len() / 2]).collect();
+            let best: Vec<f64> = times.iter().map(|t| t[0]).collect();
+            // The default of this op ([`grouped_gemm_xpf`]; the SwiGLU's is none).
+            let default = if glu {
+                0
+            } else {
+                grouped_gemm_xpf(ffn as i64, n_expert as i64, 2, 8, false)
+            };
             // Bytes a layer: every expert's weights, each pair's input row and output row.
             let pairs = (n_used * n_tok) as f64;
             let (w_bytes, x_bytes, out_bytes) = if glu {
@@ -1268,10 +1287,14 @@ fn cuda_down_x_prefetch_bench() {
             );
             for (vi, &(name, xpf)) in variants.iter().enumerate() {
                 eprintln!(
-                    "  {name:<26} xpf {xpf:>3}: {:>8.1} us/layer  {:>5.3}x old  {:>6.1} GB/s  {}",
+                    "  {}{name:<16} xpf {xpf:>3}: median {:>8.1} us/layer ({:>5.3}x old), \
+                     min {:>8.1} ({:>5.3}x)  {:>6.1} GB/s  {}",
+                    if xpf == default { '*' } else { ' ' },
+                    median[vi] * 1e6,
+                    median[0] / median[vi],
                     best[vi] * 1e6,
                     best[0] / best[vi],
-                    bytes / best[vi] / 1e9,
+                    bytes / median[vi] / 1e9,
                     if same[vi] { "same bits" } else { "BITS DIFFER" }
                 );
             }

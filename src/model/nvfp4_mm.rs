@@ -1522,12 +1522,15 @@ pub fn grouped_gemm_tune(k: i64, n_expert: i64, mi: i32, nt: i32, glu: bool) -> 
 /// down projection), so the rows land in L2 about one wave before their CTAs start.
 pub const DOWN_XPF_AHEAD: i32 = 10;
 
-/// `legion_nvfp4_mm::xpf` of the down projection's grouped GEMM ([`GEMM_DOWN`], #1183): each
-/// tile prefetches its own activation rows into L2 with its weights (bit 0), and row tile 0
-/// the rows of the tile [`DOWN_XPF_AHEAD`] ahead. The tile's copies read each activation row
-/// 128 bytes a step from scattered rows (the pairs of one expert), with one stage ahead, so
-/// without the prefetch every step waits for DRAM. L2 hints only: the same sums.
-pub const DOWN_XPF: i32 = 1 | DOWN_XPF_AHEAD << 1;
+/// `legion_nvfp4_mm::xpf` of the down projection's grouped GEMM ([`GEMM_DOWN`], #1183): the
+/// CTAs of row tile 0 prefetch the activation rows of the tile [`DOWN_XPF_AHEAD`] ahead into L2.
+/// The tile's copies read each activation row 128 bytes a step from scattered rows (the pairs of
+/// one expert), with one stage ahead, so without the prefetch every step waits for DRAM. Not
+/// the tiles' own rows (bit 0) as well: GB10, Qwen3.8-Flash-Next at 12,288- and 8,067-token
+/// steps (single runs of `cuda_down_x_prefetch_bench`), 10 ahead alone took 4.0-5.4% less time
+/// than none, own rows plus 10 ahead 2.3-2.4% (the ten row tiles of a token tile each asking
+/// for the same rows as they start). L2 hints only: the same sums.
+pub const DOWN_XPF: i32 = DOWN_XPF_AHEAD << 1;
 
 /// The activation prefetch (`legion_nvfp4_mm::xpf`) of a grouped GEMM's launch, as
 /// [`grouped_gemm_tune`] picks its variant: [`DOWN_XPF`] for the down projection's
