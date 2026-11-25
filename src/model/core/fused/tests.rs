@@ -1219,7 +1219,7 @@ fn cuda_conv_tma_store_is_bit_identical() {
 /// (#1183): the fused qkv GEMM + conv at Qwen3.8-Flash-Next's shapes (k 2,560, 10,240 rows,
 /// with the q and k heads' norm) at 12,288 and 8,067 tokens, its fragments' stores (variant 0)
 /// against the TMA stores (0x1800) and against the two kernels with the TMA store GEMM
-/// (0x800): 5 rounds taking turns, the medians.
+/// (0x800): 5 rounds taking turns (forward and reverse order alternately), the medians.
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "microbenchmark, needs a compute capability 12.x GPU"]
@@ -1246,38 +1246,41 @@ fn cuda_conv_tma_store_microbench() {
     }
     let heads = (128, 16, 128, 48);
     const ROUNDS: usize = 5;
+    eprintln!("{ROUNDS} rounds, the order alternates forward/reverse");
     for n in [12288i64, 8067] {
         // Variant 0 and 0x1800 on the fused graph; 0x800 on the two kernels' graph.
         let mut fused_ms: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
         let mut split_ms: Vec<f64> = Vec::new();
-        // The rounds take turns between the graphs, each graph's variants in turn.
-        for _ in 0..ROUNDS {
-            conv_gemm_case(
-                &mut gpu,
-                heads,
-                2560,
-                n,
-                (true, true),
-                true,
-                &mut |gpu, g| {
+        // The rounds take turns between the graphs, each graph's variants in turn; odd rounds
+        // run everything in reverse order (the two kernels first, then 0x1800 before 0).
+        for round in 0..ROUNDS {
+            let rev = round % 2 == 1;
+            let mut fused = |gpu: &mut Backend| {
+                conv_gemm_case(gpu, heads, 2560, n, (true, true), true, &mut |gpu, g| {
                     let [old, new] = &mut fused_ms;
-                    time(gpu, g, 0, old);
-                    time(gpu, g, 0x1800, new);
-                    time(gpu, g, 0, old);
-                    time(gpu, g, 0x1800, new);
-                },
-            );
-            conv_gemm_case(
-                &mut gpu,
-                heads,
-                2560,
-                n,
-                (true, true),
-                false,
-                &mut |gpu, g| {
+                    for _ in 0..2 {
+                        if rev {
+                            time(gpu, g, 0x1800, new);
+                            time(gpu, g, 0, old);
+                        } else {
+                            time(gpu, g, 0, old);
+                            time(gpu, g, 0x1800, new);
+                        }
+                    }
+                })
+            };
+            let mut split = |gpu: &mut Backend| {
+                conv_gemm_case(gpu, heads, 2560, n, (true, true), false, &mut |gpu, g| {
                     time(gpu, g, 0x800, &mut split_ms);
-                },
-            );
+                })
+            };
+            if rev {
+                split(&mut gpu);
+                fused(&mut gpu);
+            } else {
+                fused(&mut gpu);
+                split(&mut gpu);
+            }
         }
         let med = |xs: &mut Vec<f64>| {
             xs.sort_by(f64::total_cmp);

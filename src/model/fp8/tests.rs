@@ -342,7 +342,8 @@ fn cuda_gemm8_tma_store_is_the_plain_bits() {
 /// (#1183): the W8A8 prompt GEMMs of Qwen3.8-Flash-Next at 12,288 and 8,067 tokens, two
 /// distinct weights a graph (past the L2), the fragments' stores (variant 0) against the TMA
 /// stores (0x800), the staged epilogue (0x200), the staggered first wave (0x2000) and both
-/// (0x2800): 5 rounds taking turns, the medians per GEMM (with half of one quantization of
+/// (0x2800): 5 rounds taking turns (forward and reverse order alternately), the medians per
+/// GEMM (with half of one quantization of
 /// the input, the same for all).
 #[cfg(feature = "cuda")]
 #[test]
@@ -358,6 +359,7 @@ fn cuda_gemm8_tma_store_microbench() {
     const ROUNDS: usize = 5;
     const REPS: usize = 3;
     const LAYERS: usize = 2;
+    eprintln!("{ROUNDS} rounds of {REPS} runs, the variant order alternates forward/reverse");
     for n in [12288i64, 8067] {
         for (k, m) in [
             (2560, 6144),
@@ -374,8 +376,12 @@ fn cuda_gemm8_tma_store_microbench() {
                     gpu.compute(graph).unwrap();
                     unforce_gemm_variant();
                 }
-                for _ in 0..ROUNDS {
-                    for (i, &v) in VARIANTS.iter().enumerate() {
+                // Odd rounds run the variants in reverse, so no variant always goes first.
+                for round in 0..ROUNDS {
+                    let last = VARIANTS.len() - 1;
+                    for j in 0..=last {
+                        let i = if round % 2 == 0 { j } else { last - j };
+                        let v = VARIANTS[i];
                         force_gemm_variant(v);
                         for _ in 0..REPS {
                             let t = std::time::Instant::now();
