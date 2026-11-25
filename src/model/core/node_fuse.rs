@@ -29,6 +29,10 @@
 //!   makes its query's head norm and RoPE itself from the projection's rows, as ggml-cuda's
 //!   `rms_norm` and `rope_multi` kernels make them: two kernels per layer gone
 //!   ([`Graph::q_norm_rope`], #1183).
+//! - A gated DeltaNet's FP8 qkv GEMM of a prompt step runs the causal conv, SiLU and q / k head
+//!   norm reading its output (`conv_silu`) in its epilogue, with the bits of the two kernels,
+//!   on a compute capability 12.x GPU: the GEMM's F32 output is no longer written and read
+//!   back, and a kernel per layer goes ([`Graph::conv_gemm`], #1183).
 //!
 //! An op runs at the position of the chain's last node, into that node's memory; the chain's
 //! other nodes become `GGML_OP_NONE`. An op reading a tensor later than the chain did is only
@@ -153,6 +157,9 @@ pub(crate) struct Counts {
     /// Of those, ops writing their output quantized for the `eh_proj` matmul's MMQ
     /// ([`crate::model::qwen4::mtp_in::input_q8`]). Counted, not rewritten.
     pub mtp_in_q8: usize,
+    /// Gated DeltaNet convs run by their FP8 qkv GEMM, the GEMM's node turned off
+    /// ([`Graph::conv_gemm`], #1183).
+    pub conv_gemm: usize,
     /// Nodes turned into `GGML_OP_NONE`.
     pub none: usize,
 }
@@ -225,6 +232,7 @@ unsafe fn fuse(graph: *mut ffi::ggml_cgraph) {
             ple_ops = c.ple_ops,
             mtp_in = c.mtp_in,
             mtp_in_q8 = c.mtp_in_q8,
+            conv_gemm = c.conv_gemm,
             none = c.none,
             "node fuse: small ggml chains as Legion ops (the first graphs; --node-fuse-ggml off)"
         );
@@ -280,6 +288,9 @@ pub(crate) unsafe fn rewrite_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> 
                     g.mix_cast(i, &mut c);
                     if cuda {
                         g.gather(i, &mut c);
+                    }
+                    if cuda && super::fused::gemm_allowed(g.nodes[i]) {
+                        g.conv_gemm(i, &mut c);
                     }
                 }
                 _ => {}
@@ -1360,10 +1371,115 @@ impl Graph {
             Ok((f, [oi, mi, ri]))
         }
     }
+
+    /// A gated DeltaNet's conv at `at` whose input's GEMM may run it
+    /// ([`super::fused::gemm_allowed`]) on CUDA: where its input is all of the output of a
+    /// dynamic FP8 GEMM ([`crate::model::fp8::conv_gemm`]) that only the conv reads, the GEMM's
+    /// node launches nothing and the conv runs both, the conv in the GEMM's epilogue where its
+    /// kernel takes the shape, else the two kernels ([`super::fused::P_GEMM`], #1183): the
+    /// GEMM's output is no longer written and read back. The GEMM then runs at the conv's
+    /// place, so only where no node in between writes or reads (as another tensor) what the
+    /// GEMM reads.
+    ///
+    /// # Safety
+    /// `at` is a node index.
+    unsafe fn conv_gemm(&mut self, at: usize, c: &mut Counts) {
+        // SAFETY: the caller's.
+        unsafe {
+            match self.match_conv_gemm(at) {
+                Ok(mi) => {
+                    crate::ggml::set_external_param(
+                        self.nodes[at],
+                        super::fused::P_GEMM,
+                        super::fused::GEMM_FUSED,
+                    );
+                    (*self.nodes[mi]).op = ffi::ggml_op_GGML_OP_NONE;
+                    self.none[mi] = true;
+                    c.conv_gemm += 1;
+                }
+                Err(why) => {
+                    if !CONV_GEMM_LOGGED.swap(true, Ordering::Relaxed) {
+                        tracing::info!(
+                            "gated DeltaNet: the conv stays a kernel of its own after the qkv \
+                             GEMM (logged once): {why}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`Self::conv_gemm`]'s GEMM node for the conv at `at`, or why not.
+    ///
+    /// # Safety
+    /// `at` is the index of a conv node.
+    unsafe fn match_conv_gemm(&self, at: usize) -> Result<usize, &'static str> {
+        // SAFETY: the caller's; nodes and sources are valid tensors of the graph.
+        unsafe {
+            let conv = self.nodes[at];
+            let (x, w) = ((*conv).src[0], (*conv).src[2]);
+            if x.is_null() || w.is_null() || !(*conv).src[3].is_null() {
+                return Err("the conv prefetches a weight");
+            }
+            let keep = external_params(&*conv)[0];
+            if (*w).ne[0] != 4 || i64::from(keep) != (*w).ne[0] - 1 || (*x).ne[2] != 1 {
+                return Err("not one sequence's conv of 4 taps keeping its state");
+            }
+            let mm8 = root(x);
+            let Some(mi) = self.index.get(&(mm8 as usize)).copied().filter(|&i| i < at) else {
+                return Err("the conv's input is no node before it");
+            };
+            if self.none[mi] || !crate::model::fp8::conv_gemm(mm8) {
+                return Err("the conv's input is not a dynamic FP8 GEMM's output");
+            }
+            let (xt, mt) = (&*x, &*mm8);
+            let tokens = mt.ne[1] * mt.ne[2] * mt.ne[3];
+            if xt.data != mt.data
+                || xt.ne[0] != mt.ne[0]
+                || xt.ne[1] != tokens
+                || xt.nb[0] != 4
+                || xt.nb[1] != mt.nb[1]
+            {
+                return Err("the conv's input is not all of the GEMM's output");
+            }
+            if !self.only_read_by(mm8, &[at]) {
+                return Err("the GEMM's output has other readers");
+            }
+            // What the GEMM reads: its weight, codes and weight scale (a model's weights are
+            // neither the graph's nodes nor its inputs, so nothing in it writes them).
+            let input = ffi::ggml_tensor_flag_GGML_TENSOR_FLAG_INPUT as i32;
+            let ins: Vec<Node> = [mt.src[0], mt.src[1], mt.src[2]]
+                .into_iter()
+                .filter(|&t| {
+                    !t.is_null()
+                        && (self.index.contains_key(&(root(t) as usize))
+                            || (*root(t)).flags & input != 0)
+                })
+                .collect();
+            let reads: Vec<(Node, bool)> = ins.iter().map(|&t| (t, false)).collect();
+            if !self.may_read_at(at, conv, &reads, &[mi]) {
+                return Err("the GEMM's codes' memory is reused before the conv");
+            }
+            for &x in &ins {
+                let from = self.index.get(&(root(x) as usize)).map_or(0, |&i| i + 1);
+                if self
+                    .moved
+                    .iter()
+                    .any(|&(k, t)| k >= from && k < at && overlap(t, x))
+                {
+                    return Err("a rewritten node writes what the GEMM reads");
+                }
+            }
+            Ok(mi)
+        }
+    }
 }
 
 /// Whether [`Graph::q_norm_rope`] said why it left a graph's chain.
 static Q_NORM_ROPE_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Whether [`Graph::conv_gemm`] said why it left a graph's conv.
+static CONV_GEMM_LOGGED: AtomicBool = AtomicBool::new(false);
 
 unsafe fn cpu_moe_sum_gate(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
     // SAFETY: a node made by the rewrite (see MOE_SUM_GATE), host tensors.

@@ -3794,6 +3794,11 @@ impl Model {
             } else {
                 fused::conv_silu(ctx, qkv, conv_state, conv_w)
             };
+            // Prompt groups outside tensor parallelism: the FP8 qkv GEMM may run the conv in its
+            // epilogue (#1183, `node_fuse`), the same bits.
+            if !sh.verify && !self.tp_on() && fused::gemm_fits(ng) {
+                fused::allow_gemm(conv);
+            }
             let conv_in = if sh.verify {
                 Some(history)
             } else {

@@ -1021,3 +1021,152 @@ fn cuda_shexp_gate_is_the_chain() {
         );
     }
 }
+
+/// E4M3 codes of magnitude at most 30 (no NaN), deterministic.
+#[cfg(feature = "cuda")]
+fn e4m3_noise(n: usize, seed: u64) -> Vec<u8> {
+    noise(n, seed)
+        .iter()
+        .map(|v| {
+            let r = ((v + 1.0) * 32767.5) as u32;
+            (r & 0x80) as u8 | (r % 0x60) as u8
+        })
+        .collect()
+}
+
+/// A prompt group's FP8 qkv GEMM (dynamic activation scales, a weight scale per row with
+/// `row_scales`, else one) of `n` tokens of `k` features, and the conv reading its output
+/// ([`conv_silu_norm`] with `norm`, else [`conv_silu`]) with a non-zero state, on `gpu`; where
+/// `fuse`, the conv allowed into the GEMM ([`allow_gemm`]) and the graph rewritten by the node
+/// fusion (#1183): (the conv's output, its next state, convs the rewrite fused).
+#[cfg(feature = "cuda")]
+fn conv_gemm_case(
+    gpu: &mut Backend,
+    heads: DeltaHeads,
+    k: i64,
+    n: i64,
+    (norm, row_scales): (bool, bool),
+    fuse: bool,
+) -> (Vec<f32>, Vec<f32>, usize) {
+    let (head_k, n_k, head_v, n_v) = heads;
+    let m = 2 * head_k * n_k + head_v * n_v;
+    let ctx = Context::new(64, 64);
+    let h = ctx.new_tensor(types::F32, &[k, n]).as_input();
+    // Kept to the end, as a model's weights and the conv state are.
+    let kept = |ty, ne: &[i64]| ctx.new_tensor(ty, ne).as_input().as_output();
+    let w8 = kept(types::I8, &[k, m]);
+    let ws = kept(types::F32, &[if row_scales { m } else { 1 }]);
+    let state = kept(types::F32, &[3, m, 1]);
+    let cw = kept(types::F32, &[4, m]);
+    let qkv = crate::model::fp8::mul_mat_dynamic(&ctx, w8, h, Some(ws));
+    let x = ctx.reshape_3d(qkv, m, n, 1);
+    let (out, hist) = if norm {
+        conv_silu_norm(&ctx, x, state, cw, heads, 1e-6 / head_k as f32)
+    } else {
+        conv_silu(&ctx, x, state, cw)
+    };
+    if fuse {
+        allow_gemm(out);
+    }
+    let out = ctx.cont(out).as_output();
+    let hist = ctx.cont(hist).as_output();
+    let mut graph = ctx.new_graph(64);
+    graph.expand(out);
+    graph.expand(hist);
+    ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+        .unwrap();
+    let fused = if fuse {
+        // SAFETY: an allocated graph that has not run.
+        unsafe { crate::model::core::node_fuse::rewrite_graph(graph.raw(), true) }.conv_gemm
+    } else {
+        0
+    };
+    h.set_f32(&noise((k * n) as usize, 21));
+    w8.set_bytes(&e4m3_noise((k * m) as usize, 22));
+    let scales: Vec<f32> = noise(ws.elements(), 23)
+        .iter()
+        .map(|v| 0.001 + 0.01 * (v + 1.0))
+        .collect();
+    ws.set_f32(&scales);
+    state.set_f32(&noise((3 * m) as usize, 24));
+    cw.set_f32(&noise((4 * m) as usize, 25));
+    gpu.compute(&graph).unwrap();
+    (out.to_f32(), hist.to_f32(), fused)
+}
+
+/// The FP8 qkv GEMM running the conv in its epilogue (#1183) against the two kernels, bit for
+/// bit, the conv's output and next state, Qwen3.8-Flash-Next's shapes (k 2,560, 10,240 rows):
+/// a 32K prompt's steps of 12,288 and 8,067 tokens and ragged counts (those of up to 64
+/// tokens, which the fused kernel does not take, run the two kernels), with the q and k heads'
+/// norm and without, a weight scale per row and one. The fused kernel also takes steps too
+/// small for the wide tile's waves here (conv_test::ANY_WAVES), so it runs from 65 tokens on.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a compute capability 12.x GPU"]
+fn cuda_conv_in_qkv_gemm_is_bit_identical() {
+    use crate::ggml::{DeviceKind, device_by_kind};
+    use crate::model::fp8::conv_test;
+    use std::sync::atomic::Ordering;
+    let mut gpu = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU device")
+        .init()
+        .unwrap();
+    conv_test::ANY_WAVES.store(true, Ordering::Relaxed);
+    let heads = (128, 16, 128, 48);
+    let mut cases: Vec<(i64, (bool, bool))> = [12288, 8067, 1, 3, 127, 129, 4993]
+        .into_iter()
+        .map(|n| (n, (true, true)))
+        .collect();
+    cases.extend([
+        (4993, (false, true)),
+        (4993, (true, false)),
+        (129, (false, false)),
+    ]);
+    for (n, how) in cases {
+        let what = format!("{n} tokens, norm and row scales {how:?}");
+        let (plain, plain_hist, _) = conv_gemm_case(&mut gpu, heads, 2560, n, how, false);
+        let before = conv_test::LAUNCHES.load(Ordering::Relaxed);
+        let (out, hist, fused) = conv_gemm_case(&mut gpu, heads, 2560, n, how, true);
+        let launched = conv_test::LAUNCHES.load(Ordering::Relaxed) - before;
+        assert_eq!(fused, 1, "{what}: the rewrite fused the conv");
+        assert_eq!(
+            launched,
+            usize::from(n > 64),
+            "{what}: fused kernel launches"
+        );
+        assert_bits(vec![(out, plain), (hist, plain_hist)], &what);
+    }
+}
+
+/// The node fusion leaves a conv the graph's builder did not allow ([`allow_gemm`]) as it was.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_conv_not_allowed_stays() {
+    use crate::ggml::{DeviceKind, device_by_kind};
+    let mut gpu = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU device")
+        .init()
+        .unwrap();
+    let ctx = Context::new(64, 64);
+    let (k, m, n) = (256, 1024, 200);
+    let h = ctx.new_tensor(types::F32, &[k, n]).as_input();
+    let w8 = ctx.new_tensor(types::I8, &[k, m]).as_input().as_output();
+    let state = ctx
+        .new_tensor(types::F32, &[3, m, 1])
+        .as_input()
+        .as_output();
+    let cw = ctx.new_tensor(types::F32, &[4, m]).as_input().as_output();
+    let qkv = crate::model::fp8::mul_mat_dynamic(&ctx, w8, h, None);
+    let (out, _) = conv_silu(&ctx, ctx.reshape_3d(qkv, m, n, 1), state, cw);
+    let out = ctx.cont(out).as_output();
+    let mut graph = ctx.new_graph(64);
+    graph.expand(out);
+    ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+        .unwrap();
+    // SAFETY: an allocated graph that has not run.
+    let c = unsafe { crate::model::core::node_fuse::rewrite_graph(graph.raw(), true) };
+    assert_eq!(c.conv_gemm, 0);
+}

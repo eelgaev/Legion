@@ -98,41 +98,35 @@ __device__ __forceinline__ void gemm8_epilogue_staged(const legion_fp8_mm8 & p, 
         __syncwarp();
     }
 }
-#endif
 
-// 4 warps (#1133 r11): two 128 x 128 CTAs per SM instead of one 256 x 128 one, so one CTA's
-// epilogue (the fused residual's loads and the stores) runs while the other's MMAs do. Started
-// together, the two drift into step and finish their tiles at the same time, and the residual
-// loads of a whole wave then hit memory at once (on the GB10 that ran 0.94x the wide tile): so
-// the first wave starts staggered (a8t::Stagger) over about one tile's time, and each tile's
-// residual prefetch is spread over its last steps (gemm8_res_prefetch).
-// JG (#1133 r25): 0 gemm8_epilogue, -1 gemm8_epilogue_staged (no residual), else
-// gemm8_epilogue_stream with JG token tiles at a time.
-template <bool RES, class C, int JG = 0>
-__global__ void __launch_bounds__(32 * C::WARPS, 8 / C::WARPS)
-    fp8_gemm8_tma(const legion_fp8_mm8 p, const __grid_constant__ a8t::Maps maps, const a8t::Stagger stagger) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    using a8::BN;
-    using namespace legion_tma;
-    static_assert(C::SWZ && C::LD == C::BK && (C::BK == 64 || C::BK == 128), "TMA swizzle layout");
-    constexpr int WM = C::WM, BK = C::BK, STAGES = C::STAGES;
-    constexpr int WN = C::WN, NJ = BN / 8 / WN, TM = C::TM, WARPS = C::WARPS;
-    constexpr size_t TSTAGE = C::TSTAGE;
-    static_assert(TSTAGE % 1024 == 0 && (TM * BK) % 1024 == 0, "stages on swizzle boundaries");
+// fp8_gemm8_tma's dynamic shared memory, aligned to 1 KiB.
+template <class C> __device__ __forceinline__ unsigned char * gemm8_tma_smem_base() {
     extern __shared__ __align__(1024) unsigned char smem_raw[];
     unsigned char * smem = (unsigned char *) (((uintptr_t) smem_raw + 1023) & ~(uintptr_t) 1023);
-    if constexpr (WARPS == 4) {
-        if (saddr(smem_raw) % 1024 != 0) {
+    if constexpr (C::WARPS == 4) {
+        if (legion_tma::saddr(smem_raw) % 1024 != 0) {
             __trap();  // gemm8_tma_smem left no room to align
         }
     }
+    return smem;
+}
+
+// fp8_gemm8_tma's K loop: the sums of the tile of TM rows from m0 and BN tokens from n0 into
+// acc (the MMA layout of gemm8_stage), its stages in `smem` (gemm8_tma_smem_base).
+template <bool RES, class C>
+__device__ __forceinline__ void gemm8_tma_sums(const legion_fp8_mm8 & p, const a8t::Maps & maps,
+                                               const a8t::Stagger & stagger, int64_t m0, int64_t n0,
+                                               unsigned char * smem, int wm, int wn, int lane,
+                                               float (&acc)[4][a8::BN / 8 / C::WN][4]) {
+    using a8::BN;
+    using namespace legion_tma;
+    static_assert(C::SWZ && C::LD == C::BK && (C::BK == 64 || C::BK == 128), "TMA swizzle layout");
+    constexpr int BK = C::BK, STAGES = C::STAGES;
+    constexpr int WN = C::WN, NJ = BN / 8 / WN, TM = C::TM, WARPS = C::WARPS;
+    constexpr size_t TSTAGE = C::TSTAGE;
+    static_assert(TSTAGE % 1024 == 0 && (TM * BK) % 1024 == 0, "stages on swizzle boundaries");
     uint64_t * full = (uint64_t *) (smem + C::SMEM);
     uint32_t * released = (uint32_t *) (full + STAGES);
-    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int wm = warp / WN, wn = warp % WN;
-    int64_t tm, tn;
-    grouped_tile(p.n * p.k, tm, tn);  // sm80/fp8_mm.cuh
-    const int64_t m0 = tm * TM, n0 = tn * BN;
     const int64_t steps = p.k / BK;
 
     const int64_t lin = (int64_t) blockIdx.y * gridDim.x + blockIdx.x;
@@ -173,7 +167,6 @@ __global__ void __launch_bounds__(32 * C::WARPS, 8 / C::WARPS)
         }
     }
 
-    float acc[4][NJ][4];
 #pragma unroll
     for (int i = 0; i < 4; i++)
 #pragma unroll
@@ -207,6 +200,31 @@ __global__ void __launch_bounds__(32 * C::WARPS, 8 / C::WARPS)
             __syncwarp();
         }
     }
+}
+#endif
+
+// 4 warps (#1133 r11): two 128 x 128 CTAs per SM instead of one 256 x 128 one, so one CTA's
+// epilogue (the fused residual's loads and the stores) runs while the other's MMAs do. Started
+// together, the two drift into step and finish their tiles at the same time, and the residual
+// loads of a whole wave then hit memory at once (on the GB10 that ran 0.94x the wide tile): so
+// the first wave starts staggered (a8t::Stagger) over about one tile's time, and each tile's
+// residual prefetch is spread over its last steps (gemm8_res_prefetch).
+// JG (#1133 r25): 0 gemm8_epilogue, -1 gemm8_epilogue_staged (no residual), else
+// gemm8_epilogue_stream with JG token tiles at a time.
+template <bool RES, class C, int JG = 0>
+__global__ void __launch_bounds__(32 * C::WARPS, 8 / C::WARPS)
+    fp8_gemm8_tma(const legion_fp8_mm8 p, const __grid_constant__ a8t::Maps maps, const a8t::Stagger stagger) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    using a8::BN;
+    constexpr int WN = C::WN, NJ = BN / 8 / WN, TM = C::TM;
+    unsigned char * smem = gemm8_tma_smem_base<C>();
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int wm = warp / WN, wn = warp % WN;
+    int64_t tm, tn;
+    grouped_tile(p.n * p.k, tm, tn);  // sm80/fp8_mm.cuh
+    const int64_t m0 = tm * TM, n0 = tn * BN;
+    float acc[4][NJ][4];
+    gemm8_tma_sums<RES, C>(p, maps, stagger, m0, n0, smem, wm, wn, lane, acc);
     if constexpr (JG < 0) {
         static_assert(!RES && C::WM == 4, "staged: no residual, 64 rows a warp");
         // Every warp's reads of the stages are done (and every stage's copy landed: each was

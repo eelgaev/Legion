@@ -6,7 +6,8 @@
 //! - [`conv_silu`]: the gated DeltaNet's causal depthwise conv over `[history | this step]`
 //!   and its SiLU, reading the step's rows where they are (ggml's `ssm_conv` needs them
 //!   concatenated behind the history and transposed: a copy of the whole input), and the next
-//!   step's history.
+//!   step's history. In a prompt step on a compute capability 12.x GPU the FP8 qkv GEMM
+//!   making its input runs it in its epilogue, the same bits (#1183, [`P_GEMM`]).
 //! - [`router`]: a MoE layer's routing from the router logits, as `soft_max`, `argsort_top_k`,
 //!   `get_rows`, `sum_rows`, `clamp` and `div` compute it (a full sort of every token's logits
 //!   among them): the `k` best experts in descending order of logit (ties: the lower id first)
@@ -463,6 +464,52 @@ fn conv_silu_node<'a>(
     (out, hist)
 }
 
+/// The `conv_silu` node's parameter saying whether the GEMM making its input may run it in its
+/// epilogue (#1183): [`GEMM_ALLOWED`] where the graph's builder allows it ([`allow_gemm`]),
+/// [`GEMM_FUSED`] where [`super::node_fuse`] made it so (the GEMM's node then launches nothing:
+/// the conv runs both, [`cuda_conv_silu`]), 0 otherwise.
+pub(crate) const P_GEMM: usize = 6;
+/// [`P_GEMM`]: allowed.
+pub(crate) const GEMM_ALLOWED: i32 = 1;
+/// [`P_GEMM`]: fused.
+pub(crate) const GEMM_FUSED: i32 = 2;
+
+/// Whether a group of `n` tokens is a prompt group whose conv [`allow_gemm`] may take: more
+/// tokens than the GEMMs of up to 64 (the GEMVs and skinny GEMMs) take.
+pub(super) fn gemm_fits(n: i64) -> bool {
+    n > 64
+}
+
+/// Lets the GEMM making the input of the conv whose output is `out` ([`conv_silu`] or
+/// [`conv_silu_norm`]) run it in its epilogue ([`P_GEMM`]; a prompt group's conv, not under
+/// tensor parallelism). Whether it does is up to [`super::node_fuse`] and the GPU.
+pub(super) fn allow_gemm(out: Tensor<'_>) {
+    // SAFETY: a view of a conv_silu node (checked), whose params P_GEMM is one of.
+    unsafe {
+        let node = (*out.raw()).view_src;
+        assert!(
+            !node.is_null()
+                && crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &CONV_SILU)),
+            "allow_gemm: not a conv_silu output"
+        );
+        crate::ggml::set_external_param(node, P_GEMM, GEMM_ALLOWED);
+    }
+}
+
+/// Whether `t` is a `conv_silu` node whose input's GEMM may run it ([`allow_gemm`]), not yet
+/// fused.
+///
+/// # Safety
+/// `t` is a valid tensor.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) unsafe fn gemm_allowed(t: *const ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's.
+    unsafe {
+        crate::ggml::op_of(t).is_some_and(|op| std::ptr::eq(op, &CONV_SILU))
+            && crate::ggml::external_params(&*t)[P_GEMM] == GEMM_ALLOWED
+    }
+}
+
 /// Strides in floats of dims 1 and 2.
 fn strides(t: &ffi::ggml_tensor) -> (usize, usize) {
     (t.nb[1] / 4, t.nb[2] / 4)
@@ -661,6 +708,22 @@ unsafe fn cuda_conv_silu(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
                 p.pf = base as *const u8;
                 p.pf_bytes = params[5] as i64 * 4096;
             }
+        }
+        // Fused (#1183): the GEMM making x (whose node launches nothing) runs this conv in its
+        // epilogue where its kernel takes the shape; else the GEMM into x first, then the conv.
+        if params[P_GEMM] == GEMM_FUSED {
+            let mut mm8 = dst.src[0];
+            while !(*mm8).view_src.is_null() {
+                mm8 = (*mm8).view_src;
+            }
+            if crate::model::fp8::launch_with_conv(
+                &*mm8,
+                &p as *const ConvSilu as *const c_void,
+                stream,
+            )? {
+                return Ok(());
+            }
+            crate::model::fp8::launch_alone(&*mm8, stream)?;
         }
         stream_hints();
         match legion_conv_silu_launch(&p, stream) {

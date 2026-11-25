@@ -66,6 +66,12 @@
 //! reader, so it shares nothing with what the mixer reads or writes or with any node in
 //! between. The same BF16 values (the mixer's rounding is the copy's); the copy kernel goes in
 //! every layer. [`Undo::holds`] checks the new layout keeps each cast clear.
+//!
+//! Conv codes (#1183, after the folds): the node fusion lets a gated DeltaNet's FP8 qkv GEMM
+//! run the conv reading its output in its epilogue ([`Graph::conv_gemm`]), the conv then
+//! reading the GEMM's activation codes, which the allocator frees after their last GEMM. Here
+//! each such conv gets the codes as a source before the graph is planned again
+//! ([`Graph::conv_codes`]), so they stay alive until it runs.
 
 use std::collections::hash_map::Entry;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -76,12 +82,13 @@ use super::{
 };
 use crate::ggml::post_alloc::{Relaid, Relayout};
 use crate::ggml::{ffi, make_external};
-use crate::model::nvfp4_mm;
+use crate::model::core::fused;
 use crate::model::qwen4::{
     FoldSum, compact_plan, fold_moe, fold_target, lazy_fold_target, lazy_mix_target, lazy_parts,
     lazy_streams, mix_cast_reads, mix_cast_set, moe_fold, ple_rewrite, set_compact, set_lazy_fold,
     set_lazy_streams, set_mix_cast, set_no_res,
 };
+use crate::model::{fp8, nvfp4_mm};
 use crate::tp_net::seq_par;
 
 /// The fold as a relayout (`crate::ggml::post_alloc::set_relayout`): only graphs holding a norm
@@ -94,6 +101,10 @@ pub(crate) const RELAYOUT: Relayout = Relayout { wants, rewrite };
 
 /// Relayouts whose counts were logged (the first few only).
 static LOGGED: AtomicUsize = AtomicUsize::new(0);
+
+/// The source slot of a conv that [`Graph::conv_codes`] gives the GEMM's codes: past the conv's
+/// input, state, kernel and prefetched weight (left empty there).
+const CONV_CODES: usize = 4;
 
 /// Relayouts undone (logged the first time).
 static UNDONE: AtomicUsize = AtomicUsize::new(0);
@@ -188,6 +199,7 @@ unsafe fn rewrite(graph: *mut ffi::ggml_cgraph, cuda: bool) -> Option<Box<dyn Re
             compact = undo.compact,
             one_cast = undo.one_cast,
             early_cast = undo.early.len(),
+            conv_codes = undo.conv_codes,
             left = undo.left.len(),
             unread = UNREAD.load(Ordering::Relaxed),
             by_exchange = TAKEN.load(Ordering::Relaxed),
@@ -218,6 +230,7 @@ pub(crate) unsafe fn fold_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> (Un
             compact: 0,
             one_cast: 0,
             early: Vec::new(),
+            conv_codes: 0,
             ple: false,
         };
         let (mut folded, mut fma) = (0, 0);
@@ -245,6 +258,9 @@ pub(crate) unsafe fn fold_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> (Un
             undo.one_cast = g.one_cast(&mut undo.saved);
             if EARLY_CAST.load(Ordering::Relaxed) {
                 undo.early = g.early_casts(&mut undo.saved);
+            }
+            if cuda {
+                undo.conv_codes = g.conv_codes(&mut undo.saved);
             }
         }
         (undo, folded, fma)
@@ -274,6 +290,7 @@ unsafe fn unfolded(graph: *mut ffi::ggml_cgraph, cuda: bool) -> Undo {
             compact: 0,
             one_cast: 0,
             early: Vec::new(),
+            conv_codes: 0,
             ple: false,
         }
     }
@@ -296,6 +313,8 @@ pub(crate) struct Undo {
     /// Mixers that write their BF16 cast, planned as their source, and the casts (early casts,
     /// see the module doc).
     pub(crate) early: Vec<(Node, Node)>,
+    /// Convs given their input GEMM's codes as a source (conv codes, see the module doc).
+    pub(crate) conv_codes: usize,
     /// The PLE ops took chains of the graph: undone, it runs in the layout it had as built
     /// ([`Relaid::as_built`]). A graph only folded is planned afresh, as before them.
     pub(crate) ple: bool,
@@ -1013,6 +1032,39 @@ impl Graph {
                     self.retire_unread(&mut [v], mix);
                 }
                 made.push((mix, cast));
+            }
+            made
+        }
+    }
+
+    /// Conv codes (see the module doc): every gated DeltaNet conv whose input's FP8 GEMM may run
+    /// it ([`fused::gemm_allowed`], [`fp8::conv_gemm`]) gets the GEMM's activation codes as a
+    /// source too (one it does not read, past its own), so they stay alive until the conv in
+    /// the new plan. Saves the convs it changes first. How many.
+    ///
+    /// # Safety
+    /// This graph's nodes are valid tensors of an allocated graph that has not run.
+    pub(crate) unsafe fn conv_codes(&self, saved: &mut Vec<(Node, ffi::ggml_tensor)>) -> usize {
+        // SAFETY: the caller's; nodes and their sources are valid tensors.
+        unsafe {
+            let mut made = 0;
+            for (at, &conv) in self.nodes.iter().enumerate() {
+                if self.none[at] || !fused::gemm_allowed(conv) {
+                    continue;
+                }
+                let (x, src) = ((*conv).src[0], &(*conv).src);
+                if x.is_null() || !src[CONV_CODES - 1].is_null() || !src[CONV_CODES].is_null() {
+                    continue;
+                }
+                let mm8 = root(x);
+                if !self.index.contains_key(&(mm8 as usize)) || !fp8::conv_gemm(mm8) {
+                    continue;
+                }
+                if !saved.iter().any(|&(s, _)| s == conv) {
+                    saved.push((conv, std::ptr::read(conv)));
+                }
+                (*conv).src[CONV_CODES] = (*mm8).src[1];
+                made += 1;
             }
             made
         }

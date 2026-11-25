@@ -916,6 +916,137 @@ unsafe fn mm8_cols(
     out: Option<(u64, bool)>,
     stream: *mut std::os::raw::c_void,
 ) -> Result<(), String> {
+    // SAFETY: the caller's.
+    let p = unsafe { mm8_params(dst, cols, out)? };
+    // `--hopper-gemm` (untested on hardware): prompt GEMMs on the Hopper wgmma kernels where
+    // the device, the binary and the shape allow; the default GEMM otherwise.
+    if p.n > 64 && crate::model::wgmma_gemm::enabled() {
+        use crate::model::wgmma_gemm::{Args, Kind, run};
+        let mut a = Args {
+            dst: p.dst,
+            res: p.res,
+            scale: p.scale,
+            wscale: p.wscale,
+            k: p.k,
+            m: p.m,
+            n: p.n,
+            scale_stride: p.scale_stride,
+            wscale_stride: p.wscale_stride,
+            desc_hi: 0,
+            tiles_m: 0,
+            tiles_n: 0,
+        };
+        // SAFETY: the node's device tensors, as for the default GEMM below.
+        if unsafe { run(Kind::E4m3, p.w, p.x, &mut a, stream) }? {
+            return Ok(());
+        }
+    }
+    match unsafe { legion_fp8_mm8_launch(&p, stream) } {
+        0 => Ok(()),
+        1 if !p.res.is_null() => Err(format!(
+            "unsupported W8A8 matmul with a residual: n = {} (needs the sm_89+ GEMM, n > 64)",
+            p.n
+        )),
+        1 => Err(format!("unsupported W8A8 matmul shape: k = {}", p.k)),
+        e => Err(format!("CUDA launch failed ({e})")),
+    }
+}
+
+/// Whether `t` is an [`FP8_MM8`] node of [`mul_mat_a8_dynamic`] without a residual that runs
+/// itself (no exchange took it, [`P_BY_EXCHANGE`]): the GEMM [`launch_with_conv`] takes.
+///
+/// # Safety
+/// `t` is a valid tensor.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) unsafe fn conv_gemm(t: *const ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's.
+    unsafe {
+        let p = crate::ggml::external_params(&*t);
+        sendable(t) && p[0] == 1 && p[P_BY_EXCHANGE] == 0 && !(*t).src[1].is_null()
+    }
+}
+
+/// Runs the GEMM of the [`FP8_MM8`] node `dst` ([`conv_gemm`]) with the gated DeltaNet conv
+/// `conv` (a `legion_conv_silu` reading the GEMM's output) in its epilogue (#1183): the conv's
+/// outputs and next state with the bits of the GEMM and then the conv, without writing the
+/// GEMM's output. `Ok(false)`: not run (another GEMM, a shape or device the fused kernel does not
+/// take); the caller runs the two ([`launch_alone`] and the conv).
+///
+/// # Safety
+/// `dst` is such a node of an allocated graph (its op may be turned off), its sources holding
+/// their values; `conv` a valid `legion_conv_silu` whose memory is the stream's device's.
+#[cfg(feature = "cuda")]
+pub(crate) unsafe fn launch_with_conv(
+    dst: &ffi::ggml_tensor,
+    conv: *const std::os::raw::c_void,
+    stream: *mut std::os::raw::c_void,
+) -> Result<bool, String> {
+    unsafe extern "C" {
+        fn legion_fp8_mm8_conv_launch(
+            p: *const LaunchParams8,
+            cv: *const std::os::raw::c_void,
+            any_waves: i32,
+            stream: *mut std::os::raw::c_void,
+        ) -> i32;
+    }
+    // SAFETY: the caller's.
+    let p = unsafe { mm8_params(dst, None, None)? };
+    // `--hopper-gemm` runs its own GEMM (mm8_cols): not this one's sums.
+    if !p.res.is_null() || (p.n > 64 && crate::model::wgmma_gemm::enabled()) {
+        return Ok(false);
+    }
+    #[cfg(test)]
+    let any_waves = i32::from(conv_test::ANY_WAVES.load(Ordering::Relaxed));
+    #[cfg(not(test))]
+    let any_waves = 0;
+    // SAFETY: the node's device tensors and the caller's conv.
+    match unsafe { legion_fp8_mm8_conv_launch(&p, conv, any_waves, stream) } {
+        0 => {
+            #[cfg(test)]
+            conv_test::LAUNCHES.fetch_add(1, Ordering::Relaxed);
+            Ok(true)
+        }
+        1 => Ok(false),
+        e => Err(format!("fp8_mm8 + conv_silu: CUDA launch failed ({e})")),
+    }
+}
+
+/// Test hooks of [`launch_with_conv`].
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) mod conv_test {
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    /// The fused kernel also where the GEMM's tiles make too few waves for its wide tile (it
+    /// then takes the 128-row tile: the same sums), so small steps test it too.
+    pub(crate) static ANY_WAVES: AtomicBool = AtomicBool::new(false);
+    /// The fused kernel's launches.
+    pub(crate) static LAUNCHES: AtomicUsize = AtomicUsize::new(0);
+}
+
+/// The whole GEMM of the [`FP8_MM8`] node `dst` into its output, as the node runs it (where
+/// [`launch_with_conv`] did not take it).
+///
+/// # Safety
+/// As [`launch_with_conv`]'s `dst`.
+#[cfg(feature = "cuda")]
+pub(crate) unsafe fn launch_alone(
+    dst: &ffi::ggml_tensor,
+    stream: *mut std::os::raw::c_void,
+) -> Result<(), String> {
+    // SAFETY: the caller's.
+    unsafe { mm8_cols(dst, None, None, stream) }
+}
+
+/// [`mm8_cols`]'s launch parameters.
+///
+/// # Safety
+/// As [`launch_cols`].
+#[cfg(feature = "cuda")]
+unsafe fn mm8_params(
+    dst: &ffi::ggml_tensor,
+    cols: Option<(usize, usize)>,
+    out: Option<(u64, bool)>,
+) -> Result<LaunchParams8, String> {
     let [mode, res_at, ..] = crate::ggml::external_params(dst);
     let dynamic = mode == 1;
     let all = dst.ne[1] * dst.ne[2] * dst.ne[3];
@@ -970,38 +1101,7 @@ unsafe fn mm8_cols(
             variant: gemm_variant() | (out.is_some_and(|o| o.1) as i32 * VARIANT_STAGED),
         }
     };
-    // `--hopper-gemm` (untested on hardware): prompt GEMMs on the Hopper wgmma kernels where
-    // the device, the binary and the shape allow; the default GEMM otherwise.
-    if p.n > 64 && crate::model::wgmma_gemm::enabled() {
-        use crate::model::wgmma_gemm::{Args, Kind, run};
-        let mut a = Args {
-            dst: p.dst,
-            res: p.res,
-            scale: p.scale,
-            wscale: p.wscale,
-            k: p.k,
-            m: p.m,
-            n: p.n,
-            scale_stride: p.scale_stride,
-            wscale_stride: p.wscale_stride,
-            desc_hi: 0,
-            tiles_m: 0,
-            tiles_n: 0,
-        };
-        // SAFETY: the node's device tensors, as for the default GEMM below.
-        if unsafe { run(Kind::E4m3, p.w, p.x, &mut a, stream) }? {
-            return Ok(());
-        }
-    }
-    match unsafe { legion_fp8_mm8_launch(&p, stream) } {
-        0 => Ok(()),
-        1 if !p.res.is_null() => Err(format!(
-            "unsupported W8A8 matmul with a residual: n = {} (needs the sm_89+ GEMM, n > 64)",
-            p.n
-        )),
-        1 => Err(format!("unsupported W8A8 matmul shape: k = {}", p.k)),
-        e => Err(format!("CUDA launch failed ({e})")),
-    }
+    Ok(p)
 }
 
 #[cfg(test)]

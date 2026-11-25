@@ -6,6 +6,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "conv_silu.cuh"
 #include "nvfp4_plan.cuh"
 #include "router_select.cuh"
 
@@ -17,32 +18,7 @@
 
 extern "C" {
 
-// conv_silu: out[c, t, s] = silu(sum_k in[t + k, c, s] * w[k, c]) over in = [state | x] along
-// time, and hist = the last `keep` inputs (d_conv - 1: the next step's state; d_conv - 1 + nt:
-// all of [state | x], an MTP verify step's window).
-struct legion_conv_silu {
-    const float * x;      // [C, nt, ns]: element (c, t, s) at x + c + t * x_ld + s * x_sd (floats)
-    int64_t x_ld, x_sd;
-    const float * state;  // [d - 1, C, ns]: (j, c, s) at state + j + c * st_ld + s * st_sd
-    int64_t st_ld, st_sd;
-    const float * w;      // [d, C], contiguous
-    float * out;          // [C, nt, ns], contiguous
-    float * hist;         // [keep, C, ns], contiguous: the last keep inputs of [state | x]
-    int32_t C, nt, ns, d, keep;
-    int32_t chunk;        // tokens per thread
-    // With norm_blocks > 0 (blocks of norm_head threads, one head each): the first norm_blocks
-    // blocks' outputs (a gated DeltaNet's q and k heads) are l2-normalized per token as
-    // delta_prep does it (eps norm_eps, scale norm_scale), bit for bit.
-    int32_t norm_blocks, norm_head;
-    float norm_eps, norm_scale;
-    uint32_t grid[3];
-    uint32_t block;
-    // Or null (#689 round 11, LEGION_DEBUG_GDN_PF_CONV=1): pf_bytes of a weight to prefetch into
-    // L2, 16-byte aligned, 4 KiB a thread from the kernel's start (compute capability 9.0+).
-    const char * pf;
-    int64_t pf_bytes;
-};
-
+// conv_silu (legion_conv_silu: conv_silu.cuh).
 int legion_conv_silu_launch(const legion_conv_silu * p, void * stream);
 
 // router_topk: per token, the k largest of n_expert logits, ids in descending order of value
@@ -341,7 +317,7 @@ int legion_shexp_gate_launch(const legion_shexp_gate * p, void * stream);
 
 namespace {
 
-constexpr int MAX_D = 8;
+constexpr int MAX_D = conv_math::MAX_D;
 
 // ggml-cuda's warp_reduce_sum (common.cuh): butterfly over the 32 lanes.
 __device__ __forceinline__ float warp_sum(float x) {
@@ -433,18 +409,10 @@ __global__ void conv_silu_kernel(legion_conv_silu p) {
     // Output t from input t + d - 1 (the window's last).
     auto step = [&](float in, int t) {
         win[d - 1] = in;
-        float acc = 0.0f;
-#pragma unroll
-        for (int k = 0; k < MAX_D; k++) {
-            if (k < d) {
-                acc += win[k] * w[k];
-            }
-        }
-        float y = acc / (1.0f + __expf(-acc));
+        float y = conv_math::silu_dot(win, w, d);
         if (norm) {
             // delta_prep_kernel's sum, mean and scale of the head's row (it reads y back).
-            float tmp = 0.0f;
-            tmp += y * y;
+            float tmp = conv_math::square(y);
             tmp = warp_sum(tmp);
             __syncthreads();  // the previous token's s_sum reads are done
             if (threadIdx.x % 32 == 0) {
@@ -453,9 +421,7 @@ __global__ void conv_silu_kernel(legion_conv_silu p) {
             __syncthreads();
             tmp = threadIdx.x % 32 < PREP_BLOCK / 32 ? s_sum[threadIdx.x % 32] : 0.0f;
             tmp = warp_sum(tmp);
-            const float mean = tmp / p.norm_head;
-            const float scale = rsqrtf(mean + p.norm_eps);
-            y = p.norm_scale * (scale * y);
+            y = conv_math::normed(y, tmp, p.norm_head, p.norm_eps, p.norm_scale);
         }
         st_s<CS>(p.out + c + (int64_t) t * p.C + (int64_t) s * p.C * p.nt, y);
 #pragma unroll

@@ -28,6 +28,7 @@
 // Launched on the stream of ggml's CUDA backend, between graph segments (src/ggml/external.rs).
 
 #include "ggml-cuda/common.cuh"
+#include "conv_silu.cuh"
 #include "device_cache.cuh"
 #include "launch_pdl.cuh"
 
@@ -95,6 +96,13 @@ int legion_fp8_quant_launch(const float * x, int64_t x_ld, uint8_t * out, int64_
 int legion_fp8_quant_dyn_launch(const float * x, int64_t x_ld, uint8_t * out, float * scales, int64_t k,
                                 int64_t n, void * stream);
 int legion_fp8_mm8_launch(const legion_fp8_mm8 * p, void * stream);
+// The W8A8 GEMM p (a gated DeltaNet's qkv projection) with conv_silu cv of its output in the
+// epilogue (#1183, sm90/fp8_gemm8_conv.cuh): cv's outputs and next state, bit for bit, without
+// p's output. 0 launched; 1 not taken (the shape, the device, or a GEMM other than the one
+// legion_fp8_mm8_launch picks: the caller runs the two kernels); 2 a launch error. any_waves
+// (tests): the fused kernel also where the GEMM's tiles make too few waves for the wide tile.
+int legion_fp8_mm8_conv_launch(const legion_fp8_mm8 * p, const legion_conv_silu * cv, int32_t any_waves,
+                               void * stream);
 
 // Whether the current device runs the large-batch GEMM (BF16 activations): sm_80+.
 int legion_fp8_mm_bf16_gemm(void);
@@ -541,6 +549,8 @@ __global__ void __launch_bounds__(128) fp8_gemv8(const legion_fp8_mm8 p) {
 #include "sm89/fp8_mm.cuh"
 // sm_90 and newer: fp8_gemm8 fed by TMA (fp8_gemm8_tma).
 #include "sm90/fp8_gemm8_tma.cuh"
+// sm_90 and newer: the qkv GEMM with conv_silu in its epilogue (fp8_gemm8_tma_conv).
+#include "sm90/fp8_gemm8_conv.cuh"
 
 template <int BN, int W, bool RES, int STAGES>
 void launch_gemm8_skinny_w(const legion_fp8_mm8 & p, cudaStream_t st) {
@@ -770,6 +780,58 @@ template <int N>
 void launch_gemv8(const legion_fp8_mm8 & p, cudaStream_t st) {
     fp8_gemv8<N><<<(unsigned) ((p.m + 3) / 4), 128, 0, st>>>(p);
 }
+
+// fp8_gemm8_tma_conv where it makes what legion_fp8_mm8_launch then legion_conv_silu_launch
+// would: the GEMM that legion_fp8_mm8_launch routes to fp8_gemm8_tma's wide tile with the
+// streaming epilogue (whose sums and values fp8_gemm8_tma_conv's are), one sequence, a kernel of
+// a8c::CONV_D taps keeping the last CONV_D - 1 inputs, no prefetch, the normalized heads (of
+// 128) in whole row tiles. any_waves (tests): also where the GEMM would take the 128-row tile for
+// want of waves (the same sums). False: not launched.
+bool launch_gemm8_conv(const legion_fp8_mm8 & p, const legion_conv_silu & cv, bool any_waves, cudaStream_t st) {
+    using C = a8::Cfg<4, 2, 128, true>;
+    constexpr size_t SMEM = gemm8_tma_smem<C>();
+    static_assert(SMEM <= 99 * 1024, "shared memory");
+    const int64_t wide_tiles = p.m / 256 * ((p.n + a8::BN - 1) / a8::BN);
+    if (p.res != nullptr || p.k % 128 != 0 || p.n <= 64 || !fp8_mma() || gemm8_ada_skinny(p) || p.m % 256 != 0 ||
+        (!any_waves && wide_tiles < GEMM8_WIDE_WAVES * sm_count()) || gemm8_stream_jg<false, C>(p) != 2 ||
+        !gemm8_tma_device()) {
+        return false;
+    }
+    const int64_t norm_rows = (int64_t) cv.norm_blocks * cv.norm_head;
+    if (cv.x != p.dst || cv.x_ld != p.m || cv.C != p.m || cv.nt != p.n || cv.ns != 1 || cv.d != a8c::CONV_D ||
+        cv.keep != a8c::CONV_D - 1 || cv.pf != nullptr || cv.norm_blocks < 0 ||
+        (cv.norm_blocks > 0 && (cv.norm_head != 128 || norm_rows % C::TM != 0 || norm_rows > cv.C))) {
+        return false;
+    }
+    // The kernel image the device runs must be built for sm_90 or newer (launch_gemm8_tma).
+    static std::atomic<int8_t> image_ok[GGML_CUDA_MAX_DEVICES];
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= GGML_CUDA_MAX_DEVICES) {
+        return false;
+    }
+    int8_t ok = image_ok[dev].load(std::memory_order_relaxed);
+    if (ok == 0) {
+        cudaFuncAttributes attr;
+        const bool sm90 = cudaFuncGetAttributes(&attr, fp8_gemm8_tma_conv<C>) == cudaSuccess &&
+                          attr.binaryVersion >= 90 && attr.ptxVersion >= 90;
+        ok = sm90 ? 1 : -1;
+        image_ok[dev].store(ok, std::memory_order_relaxed);
+    }
+    if (ok < 0) {
+        return false;
+    }
+    a8t::Maps maps;
+    if (!gemm8_tma_map(&maps.w, p.w, p.k, p.m, C::BK, C::TM) || !gemm8_tma_map(&maps.x, p.x, p.k, p.n, C::BK, a8::BN)) {
+        return false;
+    }
+    static std::atomic<int8_t> opted_in[GGML_CUDA_MAX_DEVICES];
+    if (!legion_device::smem_opt_in(opted_in, fp8_gemm8_tma_conv<C>, (int) SMEM)) {
+        return false;
+    }
+    const dim3 grid((unsigned) ((p.n + a8c::CONV_STRIDE - 1) / a8c::CONV_STRIDE), (unsigned) (p.m / C::TM));
+    fp8_gemm8_tma_conv<C><<<grid, 32 * C::WARPS, SMEM, st>>>(p, maps, a8t::Stagger{}, cv);
+    return true;
+}
 }  // namespace
 
 int legion_fp8_mm_launch(const legion_fp8_mm * p, void * stream) {
@@ -915,6 +977,14 @@ int legion_fp8_mm8_launch(const legion_fp8_mm8 * p, void * stream) {
         launch_gemm8<true>(*p, st);
     } else {
         launch_gemm8<false>(*p, st);
+    }
+    return cudaGetLastError() == cudaSuccess ? 0 : 2;
+}
+
+int legion_fp8_mm8_conv_launch(const legion_fp8_mm8 * p, const legion_conv_silu * cv, int32_t any_waves,
+                               void * stream) {
+    if (!launch_gemm8_conv(*p, *cv, any_waves != 0, (cudaStream_t) stream)) {
+        return 1;
     }
     return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
