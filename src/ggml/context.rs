@@ -1977,7 +1977,15 @@ impl ComputeAllocator {
         };
         // SAFETY: as above.
         let unplanned = relayout.map(|_| unsafe { unplanned(raw) });
+        // Where each plan peaks, while a load measures its prompt step (`plan_peak`).
+        // SAFETY: as above.
+        let report = super::plan_peak::reporting().then(|| unsafe { self::unplanned(raw) });
         let mut ok = self.plan(raw, self.fresh);
+        if ok && let Some(placed) = &report {
+            // SAFETY: allocated just now; `placed` are its tensors.
+            unsafe { super::plan_peak::log(raw, placed, "as built", self.buffer_size()) };
+        }
+        let mut rewritten = false;
         if ok && let Some((r, cuda)) = relayout {
             let unplanned = unplanned.as_deref().unwrap_or_default();
             // SAFETY: allocated just now, nothing computed. Where the plan as built put the
@@ -1990,6 +1998,7 @@ impl ComputeAllocator {
             // memory the plan as built gave them; any other is undone where it no longer
             // holds, and the graph is planned afresh.
             if let Some(relaid) = unsafe { (r.rewrite)(raw, cuda) } {
+                rewritten = true;
                 unsafe {
                     forget_plan(unplanned);
                     ok = self.plan(raw, true);
@@ -2006,6 +2015,13 @@ impl ComputeAllocator {
                     }
                 }
             }
+        }
+        if ok
+            && rewritten
+            && let Some(placed) = &report
+        {
+            // SAFETY: as above; a tensor the rewrite added is a node or source of the graph.
+            unsafe { super::plan_peak::log(raw, placed, "rewritten", self.buffer_size()) };
         }
         if ok {
             // SAFETY: allocated just now, nothing computed yet; a graph is allocated once

@@ -1382,7 +1382,12 @@ impl Executor {
         if wanted.iter().all(|&n| n == 0) {
             return Ok(vec![(0, 0); self.stages.len()]);
         }
-        let sizes = self.measure_prompt_step(tokens, n_past)?;
+        // Logged once per load (#1183): where the step's plans peak, the tensors that size
+        // these buffers ("compute plan peak").
+        crate::ggml::set_plan_report(true);
+        let sizes = self.measure_prompt_step(tokens, n_past);
+        crate::ggml::set_plan_report(false);
+        let sizes = sizes?;
         let mut out = Vec::with_capacity(self.stages.len());
         for (s, st) in self.stages.iter_mut().enumerate() {
             let bytes = sizes.get(s).copied().unwrap_or(0);

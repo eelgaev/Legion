@@ -19,6 +19,7 @@ mod ops_mamba;
 mod ops_vision;
 mod padded;
 pub mod pinned_io;
+mod plan_peak;
 pub mod post_alloc;
 mod rows_at;
 pub mod stage_graph;
@@ -44,6 +45,7 @@ pub(crate) use graph_uid::leafs as graph_leafs;
 pub use ops_gemma4::ROPE_NEOX;
 pub use ops_vision::{ROPE_VISION, SCALE_ALIGN_CORNERS, SCALE_BILINEAR};
 pub use padded::PASS_PAD;
+pub use plan_peak::set_report as set_plan_report;
 pub use rows_at::RowsAt;
 
 #[allow(
