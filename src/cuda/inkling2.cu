@@ -34,7 +34,6 @@ namespace {
 
 using A = legion_ink_args;
 
-constexpr int TYPE_F32  = 0;
 constexpr int TYPE_F16  = 1;
 constexpr int TYPE_Q8_0 = 8;
 constexpr int TYPE_I8   = 24;

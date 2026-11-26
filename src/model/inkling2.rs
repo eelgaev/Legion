@@ -861,7 +861,7 @@ impl Model {
         let w = self.w(&name)?;
         let scale = self.w(&format!("blk.{ip}.{base}.scale")).ok();
         if w.ty() == types::NVFP4 {
-            if !nvfp4_mm::supports(w) || scale.is_some_and(|s| s.elements() != w.ne()[2]) {
+            if !nvfp4_mm::supports(w) || scale.is_some_and(|s| s.elements() as i64 != w.ne()[2]) {
                 return Err(ModelError::Unsupported(format!(
                     "`{name}`: NVFP4 experts {:?} on this device",
                     w.ne()

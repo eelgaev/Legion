@@ -31,6 +31,11 @@ struct Dim3 {
     z: u32,
 }
 
+/// `a / b` rounded up (`a >= 0`, `b > 0`).
+fn cdiv(a: i64, b: i64) -> i64 {
+    (a + b - 1) / b
+}
+
 fn dim(x: i64, y: i64) -> Dim3 {
     Dim3 {
         x: x as u32,
@@ -172,7 +177,7 @@ unsafe fn elementwise(
             k,
             name,
             dst,
-            dim(elements(dst).div_ceil(256), 1),
+            dim(cdiv(elements(dst), 256), 1),
             256,
             0,
             stream,
@@ -229,7 +234,7 @@ pub(super) unsafe fn conv(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
             Kernel::Conv,
             "ink_conv",
             dst,
-            dim(dst.ne[0].div_ceil(128), dst.ne[1] / n_tok),
+            dim(cdiv(dst.ne[0], 128), dst.ne[1] / n_tok),
             128,
             0,
             stream,
@@ -248,7 +253,7 @@ pub(super) unsafe fn clip(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
             Kernel::Clip,
             "ink_clip",
             dst,
-            dim(rows.div_ceil(8), 1),
+            dim(cdiv(rows, 8), 1),
             256,
             0,
             stream,
@@ -288,7 +293,7 @@ pub(super) unsafe fn attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
             k,
             "ink_attn",
             dst,
-            dim(nkv, n_seqs * n_tok.div_ceil(ATTN_TQ)),
+            dim(nkv, n_seqs * cdiv(n_tok, ATTN_TQ)),
             ATTN_THREADS,
             0,
             stream,
@@ -321,7 +326,7 @@ pub(super) unsafe fn mm_id(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resul
             Kernel::MmId,
             "ink_mm_id",
             dst,
-            dim(dst.ne[0].div_ceil(MM_ROWS), w.ne[2]),
+            dim(cdiv(dst.ne[0], MM_ROWS), w.ne[2]),
             256,
             shared as usize,
             stream,
