@@ -55,10 +55,10 @@ fn f32_tensor(
 /// A conv's taps `[c, 1, K]` (oldest first) as F32 ggml `[K, c]`.
 fn conv_taps(b: &mut Builder, name: &str, src: &str, k: u64) -> Result<(), String> {
     let (_, t) = b.source(src)?;
-    let c = t.shape[0] as u64;
-    if t.shape[1..] != [1, k as usize] {
-        return Err(format!("`{src}`: conv taps of shape {:?}", t.shape));
-    }
+    let c = match t.shape[..] {
+        [c, 1, kk] if kk as u64 == k => c as u64,
+        _ => return Err(format!("`{src}`: conv taps of shape {:?}", t.shape)),
+    };
     f32_tensor(b, name, src, Some(vec![k, c]))
 }
 
@@ -175,6 +175,12 @@ fn experts(
             }
             let amax = format!("{src}_amax");
             let denom = format!("{src}_outer_scale_denominator");
+            for n in [&amax, &denom] {
+                let (_, ot) = b.source(n)?;
+                if ot.dtype != Dtype::F32 {
+                    return Err(format!("`{n}`: {:?}, want F32", ot.dtype));
+                }
+            }
             let compute: Compute = Arc::new(move || {
                 let w = ckpt.data(&src).map_err(|e| e.to_string())?;
                 let s = ckpt.data(&scale_src).map_err(|e| e.to_string())?;
@@ -209,10 +215,14 @@ fn experts(
                         .collect())
                 };
                 let a = floats(&amax)?;
-                let d = floats(&denom)?;
-                let d = *d
+                let ds = floats(&denom)?;
+                let d = *ds
                     .first()
                     .ok_or_else(|| format!("`{src}`: no denominator"))?;
+                // One value (a broadcast copy is fine); never drop a differing one.
+                if ds.iter().any(|&x| x.to_bits() != d.to_bits()) {
+                    return Err(format!("`{src}`: {} differing denominators", ds.len()));
+                }
                 if a.len() != n_expert || !(d.is_finite() && d > 0.0) {
                     return Err(format!("`{src}`: {} amax values, denominator {d}", a.len()));
                 }

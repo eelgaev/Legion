@@ -169,6 +169,27 @@ fn tojson_matches_python_json_dumps() {
     );
 }
 
+/// `separators` with an indent, as `json.dumps([1, {"a": 2}], indent=1, separators=...)` gives.
+#[test]
+fn tojson_separators_with_indent() {
+    let src = r#"{{ [1, {"a": 2}] | tojson(indent=1, separators=[",", ":"]) }}|{{ [1, 2] | tojson(indent=1, separators=[", ", ": "]) }}"#;
+    assert_eq!(
+        render(src).unwrap(),
+        "[\n 1,\n {\n  \"a\":2\n }\n]|[\n 1, \n 2\n]"
+    );
+}
+
+/// `{% generation %}` tags become a plain block; the same text inside raw blocks, comments
+/// and expressions stays literal.
+#[test]
+fn generation_tags_outside_literals_only() {
+    let src = "{% raw %}{% generation %}{% endraw %}|{# {% generation %} #}|{{ '{% endgeneration %}' }}|{%- generation -%} x {%- endgeneration -%}|";
+    assert_eq!(
+        render(src).unwrap(),
+        "{% generation %}||{% endgeneration %}|x|"
+    );
+}
+
 #[test]
 fn python_string_methods_and_loop_items() {
     let src = "{% for x in ['  ab ', 'cd'] %}{{ x.strip() }}{{ loop.previtem }}{{ loop.nextitem }};{% endfor %}\

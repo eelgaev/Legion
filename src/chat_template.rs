@@ -131,15 +131,26 @@ impl ChatTemplate {
 /// `AssistantTracker` extension, which only marks the assistant's tokens for
 /// `return_assistant_tokens_mask` and renders its body unchanged) as `{% if true %}` ...
 /// `{% endif %}`, whitespace control kept. Inkling-2's template wraps assistant turns in one.
+/// Literal text is left alone: `{% raw %}` blocks, `{# #}` comments and `{{ }}` expressions
+/// are matched first and copied through unchanged.
 fn generation_blocks(source: &str) -> String {
-    let re = fancy_regex::Regex::new(r"\{%([-+]?)\s*(end)?generation\s*([-+]?)%\}").unwrap();
+    if !source.contains("generation") {
+        return source.to_owned();
+    }
+    let re = fancy_regex::Regex::new(
+        r"(?s)(?P<lit>\{%[-+]?\s*raw\s*[-+]?%\}.*?\{%[-+]?\s*endraw\s*[-+]?%\}|\{#.*?#\}|\{\{.*?\}\})|\{%(?P<l>[-+]?)\s*(?P<end>end)?generation\s*(?P<r>[-+]?)%\}",
+    )
+    .unwrap();
     re.replace_all(source, |c: &fancy_regex::Captures| {
-        let tag = if c.get(2).is_some() {
+        if let Some(lit) = c.name("lit") {
+            return lit.as_str().to_owned();
+        }
+        let tag = if c.name("end").is_some() {
             "endif"
         } else {
             "if true"
         };
-        format!("{{%{} {tag} {}%}}", &c[1], &c[3])
+        format!("{{%{} {tag} {}%}}", &c["l"], &c["r"])
     })
     .into_owned()
 }
@@ -281,8 +292,8 @@ fn tojson(value: Value, kwargs: Kwargs) -> Result<Value, Error> {
     let ensure_ascii = kwargs.get::<Option<bool>>("ensure_ascii")?.unwrap_or(false);
     let sort_keys = kwargs.get::<Option<bool>>("sort_keys")?.unwrap_or(false);
     // Python's `separators=(item, key)` (Inkling-2's template dumps compact JSON); the
-    // defaults are `", "` and `": "`.
-    let mut spaced = SpacedFormatter::default();
+    // defaults are `", "` and `": "`, or `","` and `": "` with an indent.
+    let mut separators = None;
     if let Some(sep) = kwargs
         .get::<Option<Value>>("separators")?
         .filter(|v| !v.is_none())
@@ -299,7 +310,7 @@ fn tojson(value: Value, kwargs: Kwargs) -> Result<Value, Error> {
             .map(|v| v.as_str().map(str::to_string).ok_or_else(bad))
             .collect::<Result<_, _>>()?;
         let [item, key] = <[String; 2]>::try_from(parts).map_err(|_| bad())?;
-        spaced = SpacedFormatter { item, key };
+        separators = Some(SpacedFormatter { item, key });
     }
     kwargs.assert_all_used()?;
 
@@ -321,21 +332,36 @@ fn tojson(value: Value, kwargs: Kwargs) -> Result<Value, Error> {
     let result = match indent {
         Some(n) => {
             let pad = vec![b' '; n];
-            let mut ser = serde_json::Serializer::with_formatter(
-                &mut out,
-                PyFormatter {
-                    ensure_ascii,
-                    inner: serde_json::ser::PrettyFormatter::with_indent(&pad),
-                },
-            );
-            serde::Serialize::serialize(&json, &mut ser)
+            let pretty = serde_json::ser::PrettyFormatter::with_indent(&pad);
+            match separators {
+                None => {
+                    let mut ser = serde_json::Serializer::with_formatter(
+                        &mut out,
+                        PyFormatter {
+                            ensure_ascii,
+                            inner: pretty,
+                        },
+                    );
+                    serde::Serialize::serialize(&json, &mut ser)
+                }
+                Some(sep) => {
+                    let mut ser = serde_json::Serializer::with_formatter(
+                        &mut out,
+                        PyFormatter {
+                            ensure_ascii,
+                            inner: IndentFormatter { pretty, sep },
+                        },
+                    );
+                    serde::Serialize::serialize(&json, &mut ser)
+                }
+            }
         }
         None => {
             let mut ser = serde_json::Serializer::with_formatter(
                 &mut out,
                 PyFormatter {
                     ensure_ascii,
-                    inner: spaced,
+                    inner: separators.unwrap_or_default(),
                 },
             );
             serde::Serialize::serialize(&json, &mut ser)
@@ -412,6 +438,57 @@ impl serde_json::ser::Formatter for SpacedFormatter {
     }
     fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
         w.write_all(self.key.as_bytes())
+    }
+}
+
+/// Indented output with custom separators: Python writes the item separator, then the newline
+/// and indent (`PrettyFormatter`'s first-value path), and the key separator as given.
+struct IndentFormatter<'a> {
+    pretty: serde_json::ser::PrettyFormatter<'a>,
+    sep: SpacedFormatter,
+}
+
+impl serde_json::ser::Formatter for IndentFormatter<'_> {
+    fn begin_array<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        self.pretty.begin_array(w)
+    }
+    fn end_array<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        self.pretty.end_array(w)
+    }
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if !first {
+            w.write_all(self.sep.item.as_bytes())?;
+        }
+        self.pretty.begin_array_value(w, true)
+    }
+    fn end_array_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        self.pretty.end_array_value(w)
+    }
+    fn begin_object<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        self.pretty.begin_object(w)
+    }
+    fn end_object<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        self.pretty.end_object(w)
+    }
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if !first {
+            w.write_all(self.sep.item.as_bytes())?;
+        }
+        self.pretty.begin_object_key(w, true)
+    }
+    fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        w.write_all(self.sep.key.as_bytes())
+    }
+    fn end_object_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        self.pretty.end_object_value(w)
     }
 }
 

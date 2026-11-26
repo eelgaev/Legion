@@ -25,11 +25,21 @@ fn prompt() -> Vec<u32> {
     (0..37).map(|i| (i * 37 + 11) % 250).collect()
 }
 
+/// The largest `|a - b|`: a NaN on either side, or an infinity on one only, is infinitely far
+/// (`f32::max` alone would drop a NaN).
 fn max_diff(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
     a.iter()
         .zip(b)
-        .map(|(x, y)| (x - y).abs())
+        .map(|(&x, &y)| {
+            if x.is_nan() || y.is_nan() {
+                f32::INFINITY
+            } else if x == y {
+                0.0
+            } else {
+                (x - y).abs()
+            }
+        })
         .fold(0.0, f32::max)
 }
 
@@ -132,6 +142,13 @@ fn bad_loops_and_shapes_are_refused() {
     assert!(e.contains("head sizes") || e.contains("heads of 48"), "{e}");
     let e = err(&|k| (k == "shortconv.l_cache").then_some(Value::U32(9)));
     assert!(e.contains("taps"), "{e}");
+    // A loop count whose slots overflow is an error, not a panic or a wrapped count.
+    let e = err(&|k| (k == "loop.count").then_some(Value::U64(u64::MAX)));
+    assert!(e.contains("loop.count"), "{e}");
+    let e = err(&|k| (k == "expert_used_count").then_some(Value::U32(tiny::N_EXPERT as u32 + 1)));
+    assert!(e.contains("expert_used_count"), "{e}");
+    let e = err(&|k| (k == "expert_used_count").then_some(Value::U32(0)));
+    assert!(e.contains("expert_used_count"), "{e}");
 }
 
 #[test]
@@ -655,11 +672,17 @@ fn tiny_rings_and_batches_give_the_same_tokens() {
             }
             r.argmax
         };
-        let long: Vec<u32> = (0..90).map(|i| (i * 37 + 11) % 250).collect();
+        // The long prompt runs past the ring's first reuse, and (after a first chunk of 5) one
+        // step crosses into the reused entry while its first query reads the block before.
+        let reuse = KvRing::for_window(tiny::WINDOW as usize, STEP, 2).blocks
+            * crate::model::core::KV_BLOCK;
+        let long: Vec<u32> = (0..reuse + 20)
+            .map(|i| (i * 37 + 11) as u32 % 250)
+            .collect();
         let short: Vec<u32> = prompt()[..30].to_vec();
         let mut last = [0u32; 2];
         for (s, p) in [long, short].iter().enumerate() {
-            for c in p.chunks(STEP) {
+            for c in std::iter::once(&p[..5]).chain(p[5..].chunks(STEP)) {
                 let r = step(&mut exec, &[(s, c.to_vec())]);
                 last[s] = r[0];
                 out.extend(r);
@@ -904,15 +927,16 @@ fn route_report(
 /// the same experts in another order match; where the routes differ, [`route_report`] says
 /// how (`bias`: the router's bias of a slot, when known). Returns the first tap whose worst
 /// difference is over `tol` times the CPU tensor's largest value (NaN counts as over), with
-/// that element on both, the logits' worst difference, and the tap furthest off (its worst
-/// difference over its scale, and its name).
+/// that element on both, the logits' worst difference, the tap furthest off (its worst
+/// difference over its scale, and its name), and the structural mismatches (a CPU tap missing
+/// on the GPU or of another shape), apart from the numbers.
 #[cfg(feature = "cuda")]
 fn compare_traces(
     cpu: &crate::model::core::Trace,
     gpu: &crate::model::core::Trace,
     tol: f32,
     bias: &dyn Fn(usize) -> Option<Vec<f32>>,
-) -> (Option<String>, f32, (f32, String)) {
+) -> (Option<String>, f32, (f32, String), Vec<String>) {
     let ((cl, ct), (gl, gt)) = (cpu, gpu);
     let mut by_name = HashMap::new();
     for g in gt {
@@ -923,9 +947,11 @@ fn compare_traces(
     let mut first = None;
     let mut worst = (0f32, String::new());
     let mut routes_reported = 0;
+    let mut structural = Vec::new();
     for (i, c) in ct.iter().enumerate() {
         let Some(g) = by_name.get(c.name.as_str()) else {
             eprintln!("{i:5} {:<22} {:?} not on the GPU", c.name, c.ne);
+            structural.push(format!("{}: not on the GPU", c.name));
             continue;
         };
         if g.ne != c.ne {
@@ -934,6 +960,7 @@ fn compare_traces(
                 c.name, c.ne, g.ne
             );
             first.get_or_insert_with(|| format!("{}: cpu {:?} gpu {:?}", c.name, c.ne, g.ne));
+            structural.push(format!("{}: cpu {:?} gpu {:?}", c.name, c.ne, g.ne));
             continue;
         }
         let (base, il) = c.name.rsplit_once('-').unwrap_or((c.name.as_str(), ""));
@@ -1005,7 +1032,10 @@ fn compare_traces(
         eprintln!("first mismatch: {f}");
     }
     eprintln!("furthest off: {} at {:.3e} of its scale", worst.1, worst.0);
-    (first, d, worst)
+    if !structural.is_empty() {
+        eprintln!("{} structural mismatches", structural.len());
+    }
+    (first, d, worst, structural)
 }
 
 /// The tiny model's router bias of slot `il`.
@@ -1058,7 +1088,11 @@ fn cuda_tiny_traces_match_the_cpu() {
         max_diff(&plain, &traced.0),
         max_diff(&plain, &cpu.0)
     );
-    let (_, d, worst) = compare_traces(&cpu, &traced, 5e-3, &tiny_bias);
+    let (_, d, worst, structural) = compare_traces(&cpu, &traced, 5e-3, &tiny_bias);
+    assert!(
+        structural.is_empty(),
+        "taps missing or reshaped: {structural:?}"
+    );
     let tol = 5e-3 * scale_of(&cpu.0);
     assert!(d <= tol, "logits: {d} > {tol}");
     // The GPU router's own choices against the CPU's.
@@ -1084,6 +1118,20 @@ fn cuda_tiny_traces_match_the_cpu() {
                     .collect()
             };
             let (cp, gp) = (picks(&ids), picks(&own));
+            // k distinct experts in range (any order) before the near-tie allowance.
+            let raw = &own.data[tok * k..(tok + 1) * k];
+            let mut distinct = gp.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            assert!(
+                distinct.len() == k
+                    && raw
+                        .iter()
+                        .all(|&x| x >= 0.0 && x < tiny::N_EXPERT as f32 && x.fract() == 0.0),
+                "slot {il} token {tok}: the GPU router picks {raw:?}, not {k} distinct experts \
+                 of {}",
+                tiny::N_EXPERT
+            );
             let s = route_scores(&logits, Some(bias.as_slice()), tok);
             let last = cp.iter().map(|&e| s[e]).fold(f32::MAX, f32::min);
             for &e in gp.iter().filter(|e| !cp.contains(e)) {
@@ -1117,9 +1165,7 @@ fn cuda_tiny_traces_match_the_cpu() {
 #[test]
 #[ignore = "needs a GPU and the Inkling-2-Mini GGUF"]
 fn cuda_real_gguf_matches_the_cpu() {
-    let Some(path) = std::env::var_os("LEGION_TEST_INKLING_GGUF") else {
-        return;
-    };
+    let path = std::env::var_os("LEGION_TEST_INKLING_GGUF").expect("set LEGION_TEST_INKLING_GGUF");
     let g = GgufFile::open(&path).unwrap();
     let p: Vec<u32> = (0..8).map(|i| 1000 + i * 7919).collect();
     let mut b = Backend::cpu().unwrap();
@@ -1153,15 +1199,13 @@ fn cuda_real_gguf_matches_the_cpu() {
 
 /// The real GGUFs (`LEGION_TEST_INKLING_GGUF`, llama.cpp's `inkling2_loop`;
 /// `LEGION_TEST_INKLING_OLD_GGUF`, the earlier `inkling2`): Inkling-2-Mini's shape, the same
-/// hyperparameters from both, every tensor the graph reads present.
+/// hyperparameters from both, every tensor the graph reads present. Both must be set.
 #[test]
 #[ignore = "needs the Inkling-2-Mini GGUFs"]
 fn real_ggufs_parse_to_inkling2_mini() {
     let mut seen = Vec::new();
     for var in ["LEGION_TEST_INKLING_GGUF", "LEGION_TEST_INKLING_OLD_GGUF"] {
-        let Some(path) = std::env::var_os(var) else {
-            continue;
-        };
+        let path = std::env::var_os(var).unwrap_or_else(|| panic!("set {var}"));
         let g = GgufFile::open(&path).unwrap();
         let hp = Hparams::from_gguf(&g).unwrap();
         let p = params(&hp).unwrap().clone();
@@ -1195,6 +1239,11 @@ fn real_ggufs_parse_to_inkling2_mini() {
                     "{var}: blk.{ip}.{n}"
                 );
             }
+            // `ink_layer` requires the attention mix's query after block 0.
+            if ip > 0 {
+                let n = format!("blk.{ip}.attn_res_query.weight");
+                assert!(g.tensor(&n).is_some(), "{var}: {n}");
+            }
             if p.core.contains(&ip) {
                 for c in 0..4 {
                     for part in ["down", "gain", "forget"] {
@@ -1209,9 +1258,7 @@ fn real_ggufs_parse_to_inkling2_mini() {
             ..p
         });
     }
-    if let [a, b] = &seen[..] {
-        assert_eq!(a, b);
-    }
+    assert_eq!(seen[0], seen[1], "the two layouts' hyperparameters");
 }
 
 /// The NVFP4 checkpoint (`LEGION_TEST_INKLING_HF=<dir>`, opened by [`crate::hf`]) parses to the
@@ -1219,9 +1266,7 @@ fn real_ggufs_parse_to_inkling2_mini() {
 #[test]
 #[ignore = "needs the Inkling-2-Mini NVFP4 checkpoint"]
 fn real_checkpoint_parses_like_the_gguf() {
-    let Some(dir) = std::env::var_os("LEGION_TEST_INKLING_HF") else {
-        return;
-    };
+    let dir = std::env::var_os("LEGION_TEST_INKLING_HF").expect("set LEGION_TEST_INKLING_HF");
     let g = GgufFile::open(&dir).unwrap();
     let hp = Hparams::from_gguf(&g).unwrap();
     let p = params(&hp).unwrap();

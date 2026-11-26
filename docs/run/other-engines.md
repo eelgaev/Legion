@@ -313,7 +313,8 @@ llama.cpp, 1x DGX Spark: mainline b12611 or later (the `inkling2_loop` support o
 [#32694](https://github.com/ggml-org/llama.cpp/pull/32694) and the NVFP4 scale fix of
 [#32704](https://github.com/ggml-org/llama.cpp/pull/32704)) with the `Mainline_Support` file of
 `unsloth/Inkling-2-Mini-GGUF`; the root file is Unsloth's own layout and needs their builds. No drafter: DSpark is
-still an open pull request.
+still an open pull request. Not measured yet: this is the proposed command, and the comparison is still to be run,
+so the README has no llama.cpp row for Inkling-2-Mini.
 
 ```sh
 llama-server -m Inkling-2-Mini-UD-Q4_K_XL.gguf --port 8090 --jinja \
