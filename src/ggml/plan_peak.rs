@@ -26,9 +26,22 @@ pub fn set_report(on: bool) {
     REPORT.store(on, Ordering::Relaxed);
 }
 
-/// Whether allocations log their plans' peaks now.
+/// Whether allocations log their plans' peaks now: while a load measures its prompt step, or
+/// always under `LEGION_DEBUG_PLAN_PEAK_MIB` ([`debug_mib`]).
 pub(super) fn reporting() -> bool {
-    REPORT.load(Ordering::Relaxed)
+    REPORT.load(Ordering::Relaxed) || debug_mib().is_some()
+}
+
+/// `LEGION_DEBUG_PLAN_PEAK_MIB=<n>` (#37): every allocation of a buffer of at least `n` MiB
+/// logs where its plan peaks (a 32K prompt step's, say, which no load measures).
+fn debug_mib() -> Option<usize> {
+    static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("LEGION_DEBUG_PLAN_PEAK_MIB")
+            .ok()?
+            .parse()
+            .ok()
+    })
 }
 
 /// A tensor's memory in a buffer and the nodes it is alive across.
@@ -215,6 +228,10 @@ pub(super) unsafe fn log(
     plan: &str,
     buffer: usize,
 ) {
+    // Under LEGION_DEBUG_PLAN_PEAK_MIB only: the buffers that big.
+    if !REPORT.load(Ordering::Relaxed) && debug_mib().is_some_and(|m| buffer >> 20 < m) {
+        return;
+    }
     // SAFETY: the caller's; nodes, their sources and leafs are valid tensors.
     unsafe {
         let n = ffi::ggml_graph_n_nodes(graph).max(0) as usize;
