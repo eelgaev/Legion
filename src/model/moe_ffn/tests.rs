@@ -4,6 +4,14 @@
 use super::*;
 use crate::ggml::{Backend, BufferType, ComputeAllocator};
 
+/// Held by the tests that set or read the process-wide [`set_down_sum`] flag, so a test that
+/// turns it on for a while can't flip it under another test's build and assert.
+static DOWN_SUM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn down_sum_lock() -> std::sync::MutexGuard<'static, ()> {
+    DOWN_SUM_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Deterministic values in [-1, 1).
 fn noise(n: usize, seed: u64) -> Vec<f32> {
     let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
@@ -1158,6 +1166,8 @@ fn cuda_shexp_sum_is_ggml_bit_for_bit() {
 #[ignore = "needs a GPU"]
 fn cuda_down_sum_is_the_reduce_bit_for_bit() {
     use crate::ggml::{DeviceKind, device_by_kind};
+    // Declared first, so it's released after the flag is back to the default.
+    let _lock = down_sum_lock();
     // Back to the default even when an assert fails.
     struct Reset;
     impl Drop for Reset {
@@ -1284,6 +1294,8 @@ fn pair_rows_16_bit_halve_d() {
 /// mark the op find its node either way.
 #[test]
 fn big_steps_sum_in_a_node_of_their_own() {
+    // The flag stays put from the read below through the split assert.
+    let _lock = down_sum_lock();
     let ctx = Context::new(64, 0);
     let (e, f, s) = (256, 128, 8);
     let raw = |ts: Vec<Tensor<'_>>| ts.iter().map(|t| t.raw()).collect::<Vec<_>>();
