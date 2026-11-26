@@ -177,6 +177,88 @@ pub(super) fn mul_mat<'a>(
     )
 }
 
+/// Whether the node fusion lets a down node write its up-mix's BF16 `lo` ([`set_lob`], on by
+/// default).
+static LOB: AtomicBool = AtomicBool::new(true);
+
+/// Sets whether graphs allocated from now on have the down matmul write the gate's activation
+/// as BF16 straight into the up-mix's `lo` ([`set_lob`]; on by default, `legion serve
+/// --no-hc-down-lob` turns it off: the same bits either way).
+pub fn set_down_lob(on: bool) {
+    LOB.store(on, Ordering::Relaxed);
+}
+
+/// See [`set_down_lob`].
+pub(crate) fn down_lob() -> bool {
+    LOB.load(Ordering::Relaxed)
+}
+
+/// The source slot of a down node's up-mix `lo` node ([`set_lob`]).
+const LOB_SRC: usize = 4;
+
+/// The parameter holding the activation's scale (F32 bits) with [`set_lob`].
+const P_ACT_SCALE: usize = 0;
+
+/// Whether `node` is a down node made by [`mul_mat`] that writes its F32 output yet.
+///
+/// # Safety
+/// `node` is a valid tensor.
+pub(crate) unsafe fn is_down(node: *const ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's.
+    unsafe {
+        crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &HC_DOWN))
+            && (*node).src[LOB_SRC].is_null()
+    }
+}
+
+/// Makes the down node `down` ([`is_down`]) write `silu(scale · lo)` rounded to BF16 (what the
+/// `hc_lo_act` node reading it and the `hc_up_lob` node `lob` after that make of its output,
+/// with their expressions) straight into the part of `lob` the up-mix reads, and not its F32
+/// output (#1183): the node fusion does it where nothing else reads that output, and turns the
+/// two nodes off.
+///
+/// # Safety
+/// As [`crate::ggml::make_external`]: valid nodes of an allocated graph that has not run; `lob`
+/// an `hc_up_lob` node whose `lo` has `down`'s shape.
+pub(crate) unsafe fn set_lob(down: *mut ffi::ggml_tensor, lob: *mut ffi::ggml_tensor, scale: f32) {
+    // SAFETY: the caller's.
+    unsafe {
+        (*down).src[LOB_SRC] = lob;
+        crate::ggml::set_external_param(down, P_ACT_SCALE, scale.to_bits() as i32);
+    }
+}
+
+/// For a down node with [`set_lob`]: the `hc_up_lob` node it writes.
+///
+/// # Safety
+/// `node` is a valid tensor.
+pub(crate) unsafe fn lob_of(node: *const ffi::ggml_tensor) -> Option<*mut ffi::ggml_tensor> {
+    // SAFETY: the caller's.
+    unsafe {
+        let lob = (*node).src[LOB_SRC];
+        (crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &HC_DOWN)) && !lob.is_null())
+            .then_some(lob)
+    }
+}
+
+/// [`set_lob`]'s target of the down node `dst`: where `lo` goes as BF16 and the activation's
+/// scale.
+///
+/// # Safety
+/// `dst` is a node made by [`mul_mat`] with memory, its sources valid tensors.
+unsafe fn lob_target(dst: &ffi::ggml_tensor) -> Option<(*mut u16, f32)> {
+    // SAFETY: the caller's; `set_lob` checked the shapes.
+    unsafe {
+        let lob = dst.src[LOB_SRC];
+        if lob.is_null() {
+            return None;
+        }
+        let at = super::hc_up_mix::lob_data(&*lob, dst.ne[0] as usize, dst.ne[1] as usize);
+        let scale = f32::from_bits(crate::ggml::external_params(dst)[P_ACT_SCALE] as u32);
+        Some((at, scale))
+    }
+}
+
 /// One value of `xn` as the BF16 streams' norm rounds it into `xnb` (`hc_post_norm_b16_kernel`)
 /// and the kernel rebuilds it: `bf16((v · scale) · g)`, each multiply rounded, then rounded to
 /// the nearest BF16 (even on ties). `v` holds BF16 bits.
@@ -192,6 +274,10 @@ unsafe fn cpu_hc_down(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
         let (k, m) = (w.ne[0] as usize, w.ne[1] as usize);
         let (e, hc, n) = (x.ne[0] as usize, x.ne[1] as usize, x.ne[2] as usize);
         let gp = std::slice::from_raw_parts(g.data as *const f32, k);
+        // The node fusion's BF16 `lo` (#1183): the activation and the BF16 rounding of the
+        // hc_lo_act and hc_up_lob nodes' CPU code, in their place.
+        let lob = lob_target(dst);
+        let mut out_row = vec![0f32; m];
         let mut b = vec![0f32; k];
         for t in (ith..n).step_by(nth) {
             let xr =
@@ -203,10 +289,13 @@ unsafe fn cpu_hc_down(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
                     b[i] = f32::from_bits(u32::from(rebuild(xr[i], s, gp[i])) << 16);
                 }
             }
-            let out = std::slice::from_raw_parts_mut(
-                (dst.data as *mut u8).add(t * dst.nb[1]) as *mut f32,
-                m,
-            );
+            let out: &mut [f32] = match lob {
+                Some(_) => &mut out_row,
+                None => std::slice::from_raw_parts_mut(
+                    (dst.data as *mut u8).add(t * dst.nb[1]) as *mut f32,
+                    m,
+                ),
+            };
             for (r, o) in out.iter_mut().enumerate() {
                 let wr = std::slice::from_raw_parts(
                     (w.data as *const u8).add(r * w.nb[1]) as *const u16,
@@ -215,6 +304,12 @@ unsafe fn cpu_hc_down(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
                 *o = wr.iter().zip(&b).fold(0.0f32, |s, (&wv, &bv)| {
                     f32::from_bits(u32::from(wv) << 16).mul_add(bv, s)
                 });
+            }
+            if let Some((lob, scale)) = lob {
+                for (r, &v) in out.iter().enumerate() {
+                    *lob.add(t * m + r) =
+                        crate::model::nvfp4_mm::bf16_bits(super::hc_chain::lo_act_value(v, scale));
+                }
             }
         }
     }
@@ -245,6 +340,9 @@ mod cuda {
         k: i32,
         n: i32,
         e: i32,
+        lob: *mut u16,
+        act_scale: f32,
+        act_bias: f32,
     }
 
     #[repr(C)]
@@ -398,6 +496,12 @@ mod cuda {
             if !supported() {
                 return Err("hc_down: this GPU does not run the kernel".into());
             }
+            // The node fusion's BF16 `lo` of the up-mix (#1183), 2-byte aligned as BF16 is.
+            let (lob, act_scale) = match super::lob_target(dst) {
+                Some((p, s)) if (p as usize).is_multiple_of(2) => (p, s),
+                Some(_) => return Err("hc_down: misaligned BF16 lo".into()),
+                None => (std::ptr::null_mut(), 0.0),
+            };
             let sms = crate::hw::per_device::current().map_or(0, crate::hw::per_device::sm_count);
             let nt = super::pick_nt(n, i64::from(sms));
             let i = (nt - 2) as usize;
@@ -415,6 +519,10 @@ mod cuda {
                 k: k as i32,
                 n: n as i32,
                 e: e as i32,
+                lob,
+                act_scale,
+                // hc_lo_act's: ggml_scale's bias, 0 there too (`HcChain::empty`).
+                act_bias: 0.0,
             };
             let tile = 32 * i64::from(nt);
             let grid = Dim3 {

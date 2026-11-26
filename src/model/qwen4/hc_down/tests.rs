@@ -275,3 +275,244 @@ fn cuda_rebuilt_down_reads_xnb() {
     }
     force_nt(0);
 }
+
+/// The mixer's tail of a `--hc-bf16` prompt step as qwen4exp builds it: [`mul_mat`] of the
+/// BF16 streams, the gate's activation in place on it (`hc_lo_act`), the BF16 up-mix reading it
+/// as BF16 (`hc_up_lob`, then the mix): its graph on `n` tokens of 4 streams of `e` values,
+/// rewritten by the node fusion when `fuse` (`cuda`: as on a CUDA backend). `keep_lo`: the F32
+/// `lo` is an output too, so another reader of it.
+struct Tail<'a> {
+    graph: crate::ggml::Graph<'a>,
+    /// The down weight, the up weight, the streams, their norm scales and gamma.
+    inputs: [Tensor<'a>; 5],
+    mixed: Tensor<'a>,
+    /// The `hc_up_lob` node, whose `lo` part the mix reads.
+    lob: *mut ffi::ggml_tensor,
+    counts: crate::model::core::node_fuse::Counts,
+}
+
+/// The activation's and the mix's scale (`1 / hc`, as qwen4exp's mixers).
+const TAIL_SCALE: f32 = 0.25;
+
+fn tail<'a>(
+    ctx: &'a Context,
+    backend: &Backend,
+    e: i64,
+    n: i64,
+    fuse: bool,
+    cuda: bool,
+    keep_lo: bool,
+) -> Tail<'a> {
+    let hc = 4i64;
+    let k = e * hc;
+    // Inputs kept for the whole graph (outputs too), as weights and the norm's node are while
+    // the mix runs.
+    let kept = |ty, ne: &[i64]| ctx.new_tensor(ty, ne).as_input().as_output();
+    let down = kept(types::BF16, &[k, M]);
+    let up = kept(types::BF16, &[M, k]);
+    let res = kept(types::BF16, &[e, hc, n]);
+    let sc = kept(types::F32, &[hc, n]);
+    let g = kept(types::F32, &[k]);
+    let lo = mul_mat(ctx, down, res, sc, g);
+    let lo = if keep_lo { lo.as_output() } else { lo };
+    let act = super::super::hc_chain::lo_act_op(ctx, lo, TAIL_SCALE);
+    let mixed = super::super::hc_up_mix::up_mix_rebuilt(ctx, up, act, res, sc, g, hc, TAIL_SCALE)
+        .as_output();
+    // SAFETY: a live mix node of the BF16 form: src[1] is its `hc_up_lob` node.
+    let lob = unsafe { (*mixed.raw()).src[1] };
+    let mut graph = ctx.new_graph(64);
+    graph.expand(mixed);
+    ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+        .unwrap();
+    let counts = if fuse {
+        // SAFETY: an allocated graph that has not run.
+        unsafe { crate::model::core::node_fuse::rewrite_graph(graph.raw(), cuda) }
+    } else {
+        Default::default()
+    };
+    Tail {
+        graph,
+        inputs: [down, up, res, sc, g],
+        mixed,
+        lob,
+        counts,
+    }
+}
+
+/// Fills [`tail`]'s inputs with the same values whatever the graph.
+fn fill_tail(t: &Tail<'_>, e: i64, n: i64) {
+    let k = e * 4;
+    let [down, up, res, sc, g] = t.inputs;
+    let scaled = |len: i64, seed: u64, s: f32| -> Vec<f32> {
+        noise(len as usize, seed).iter().map(|v| s * v).collect()
+    };
+    down.set_bytes(&bf16_bytes(&scaled(k * M, 91, 0.02)));
+    up.set_bytes(&bf16_bytes(&scaled(M * k, 92, 0.05)));
+    res.set_bytes(&bf16_bytes(&scaled(k * n, 93, 3.0)));
+    sc.set_f32(
+        &noise((4 * n) as usize, 94)
+            .iter()
+            .map(|v| v.abs() + 0.5)
+            .collect::<Vec<_>>(),
+    );
+    g.set_f32(
+        &noise(k as usize, 95)
+            .iter()
+            .map(|v| 1.0 + 0.3 * v)
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// The `lo` bytes the mix of `t` read (its `hc_up_lob` node's BF16 part).
+fn tail_lob(t: &Tail<'_>, n: i64) -> Vec<u8> {
+    let len = (M * n * 2) as usize;
+    let mut out = vec![0u8; len];
+    // SAFETY: an allocated node; the part lies within it (`lob_offset`).
+    unsafe {
+        let at =
+            super::super::hc_up_mix::lob_offset(ffi::ggml_nbytes(t.lob), M as usize, n as usize);
+        ffi::ggml_backend_tensor_get(t.lob, out.as_mut_ptr().cast(), at, len);
+    }
+    out
+}
+
+/// [`tail`] on `backend` as built and fused: the fusion takes the chain, and what the mix reads
+/// (`lo` as BF16) and writes are the same bytes.
+fn check_tail(backend: &mut Backend, e: i64, ns: &[i64], cuda: bool) {
+    for &n in ns {
+        let ctx_a = Context::new(64, 64);
+        let ctx_b = Context::new(64, 64);
+        let built = tail(&ctx_a, backend, e, n, false, cuda, false);
+        let fused = tail(&ctx_b, backend, e, n, true, cuda, false);
+        assert_eq!(fused.counts.down_lob, 1, "{n} tokens: the chain fused");
+        // SAFETY: live nodes of the fused graph.
+        unsafe {
+            assert_eq!(
+                (*fused.lob).op,
+                ffi::ggml_op_GGML_OP_NONE,
+                "{n} tokens: lob off"
+            );
+            assert_eq!(
+                (*(*fused.lob).src[0]).op,
+                ffi::ggml_op_GGML_OP_NONE,
+                "{n} tokens: activation off"
+            );
+        }
+        let mut out = Vec::new();
+        for t in [&built, &fused] {
+            fill_tail(t, e, n);
+            backend.compute(&t.graph).unwrap();
+            out.push((tail_lob(t, n), t.mixed.bytes()));
+        }
+        assert!(out[0].0.iter().any(|&b| b != 0), "{n} tokens: no lo");
+        assert!(
+            out[0].1.iter().any(|&b| b != 0),
+            "{n} tokens: nothing mixed"
+        );
+        let lo_diff = out[0]
+            .0
+            .chunks(2)
+            .zip(out[1].0.chunks(2))
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(lo_diff, 0, "{n} tokens: {lo_diff} BF16 lo values moved");
+        assert!(out[0].1 == out[1].1, "{n} tokens: the mix moved");
+    }
+}
+
+/// [`check_tail`] on the CPU: the down op's fused epilogue is the activation's and the BF16
+/// rounding's CPU code.
+#[test]
+fn down_lob_is_the_chain_on_the_cpu() {
+    let mut cpu = Backend::cpu().unwrap();
+    cpu.set_threads(4);
+    check_tail(&mut cpu, 256, &[1, 9], false);
+}
+
+/// Another reader of the F32 `lo` (here: an output) keeps the chain as built.
+#[test]
+fn down_lob_needs_lo_read_once() {
+    let cpu = Backend::cpu().unwrap();
+    let ctx = Context::new(64, 64);
+    let t = tail(&ctx, &cpu, 256, 9, true, false, true);
+    assert_eq!(t.counts.down_lob, 0);
+    // SAFETY: a live node of the graph.
+    assert_ne!(unsafe { (*t.lob).op }, ffi::ggml_op_GGML_OP_NONE);
+}
+
+/// The GPU, sm_80+ with the kernels.
+#[cfg(feature = "cuda")]
+fn tail_gpu() -> Option<Backend> {
+    use crate::ggml::{DeviceKind, device_by_kind};
+    let gpu = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU device")
+        .init()
+        .unwrap();
+    if !crate::model::fp8::bf16_mma() || !supported_on(0) {
+        println!("no sm_80+ kernel here: skipped");
+        return None;
+    }
+    Some(gpu)
+}
+
+/// [`check_tail`] on CUDA at qwen4exp's shape (#1183): the down kernel's epilogue writes the
+/// BF16 `lo` the `hc_lo_act` and `hc_up_lob` kernels write, byte for byte, and the mix reading
+/// it is unmoved, at a 12,288-token step (`--max-batch-tokens` of the docs command), a prompt's
+/// 8,067-token tail and 129 tokens (a partial last tile), every token tile.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an sm_80+ GPU"]
+fn cuda_down_lob_is_the_chain() {
+    let Some(mut gpu) = tail_gpu() else {
+        return;
+    };
+    for nt in [0, 2, 3, 4] {
+        force_nt(nt);
+        check_tail(&mut gpu, 2560, &[12288, 8067, 129], true);
+    }
+    force_nt(0);
+}
+
+/// The fused and the built tail timed in alternating order (graph-level: the down matmul, the
+/// activation, the BF16 rounding and the up-mix) at 12,288 and 8,067 tokens.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an sm_80+ GPU; a timing run"]
+fn cuda_down_lob_timing() {
+    let Some(mut gpu) = tail_gpu() else {
+        return;
+    };
+    const ROUNDS: usize = 20;
+    for n in [12288i64, 8067] {
+        let ctx_a = Context::new(64, 64);
+        let ctx_b = Context::new(64, 64);
+        let tails = [
+            tail(&ctx_a, &gpu, 2560, n, false, true, false),
+            tail(&ctx_b, &gpu, 2560, n, true, true, false),
+        ];
+        for t in &tails {
+            fill_tail(t, 2560, n);
+            // Warm-up.
+            gpu.compute(&t.graph).unwrap();
+        }
+        let mut secs = [Vec::new(), Vec::new()];
+        for round in 0..ROUNDS {
+            let order = if round % 2 == 0 { [0, 1] } else { [1, 0] };
+            for i in order {
+                let t0 = std::time::Instant::now();
+                gpu.compute(&tails[i].graph).unwrap();
+                secs[i].push(t0.elapsed().as_secs_f64());
+            }
+        }
+        let median = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2] * 1e3
+        };
+        let (a, b) = (median(&mut secs[0]), median(&mut secs[1]));
+        println!(
+            "{n} tokens: built {a:.3} ms, fused {b:.3} ms ({:.3}x), medians of {ROUNDS}, alternating",
+            b / a
+        );
+    }
+}

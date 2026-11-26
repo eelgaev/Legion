@@ -28,6 +28,8 @@
 
 #include <cstdint>
 
+#include "hc_lo_act.cuh"
+
 extern "C" {
 struct legion_hc_down {
     const __nv_bfloat16 * w;  // down weight [m rows][k], w_ld values apart (16-byte rows)
@@ -37,6 +39,11 @@ struct legion_hc_down {
     float * dst;              // lo [n][m], dst_ld floats apart
     int64_t w_ld, x_ld, sc_ld, dst_ld;
     int32_t m, k, n, e;       // e: values per stream (a multiple of HD_BK)
+    // Set by the node fusion (#1183): the up-mix's BF16 lo [n][m] (contiguous), written instead
+    // of dst as bf16(legion_hc_lo_act(lo, act_scale, act_bias)), the values the hc_lo_act and
+    // hc_up_lob kernels would make of dst. Null: dst as above.
+    __nv_bfloat16 * lob;
+    float act_scale, act_bias;
 };
 }
 

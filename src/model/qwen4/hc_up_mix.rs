@@ -422,11 +422,35 @@ pub(super) fn lob_offset(node_bytes: usize, rank: usize, n: usize) -> usize {
 /// # Safety
 /// `lob` is a node made by [`up_mix`] or [`up_mix_rebuilt`] with memory; `rank` and `n` its
 /// `lo`'s.
-unsafe fn lob_data(lob: &ffi::ggml_tensor, rank: usize, n: usize) -> *mut u16 {
+pub(super) unsafe fn lob_data(lob: &ffi::ggml_tensor, rank: usize, n: usize) -> *mut u16 {
     // SAFETY: the caller's; the offset stays within the node.
     unsafe {
         let bytes = ffi::ggml_nbytes(lob);
         (lob.data as *mut u8).add(lob_offset(bytes, rank, n)) as *mut u16
+    }
+}
+
+/// For an `hc_up_lob` node with memory (the BF16 form of [`up_mix`] and [`up_mix_rebuilt`]):
+/// its F32 `lo` (the source it rounds) and the bytes of the node holding `lo` as BF16, the part
+/// its mix reads, `(start, end)`. `None` for any other node.
+///
+/// # Safety
+/// `node` is a valid tensor; its sources valid tensors.
+pub(crate) unsafe fn up_lob(
+    node: *const ffi::ggml_tensor,
+) -> Option<(*mut ffi::ggml_tensor, (usize, usize))> {
+    // SAFETY: the caller's.
+    unsafe {
+        if !crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &HC_UP_LOB))
+            || (*node).data.is_null()
+            || (*node).src[0].is_null()
+        {
+            return None;
+        }
+        let lo = (*node).src[0];
+        let (rank, n) = ((*lo).ne[0] as usize, (*lo).ne[1] as usize);
+        let at = lob_data(&*node, rank, n) as usize;
+        Some((lo, (at, at + rank * n * 2)))
     }
 }
 
@@ -504,6 +528,97 @@ unsafe fn mix_reads(node: *const ffi::ggml_tensor) -> Option<Vec<(usize, usize)>
             }
         }
         Some(reads)
+    }
+}
+
+/// What one up-mix node reads and writes, per token, as it will run (for the node fusion's
+/// audit log, #1183).
+pub(crate) struct MixAudit {
+    /// Tokens of the step.
+    pub n: i64,
+    /// The input form, as `legion hc-up-mix-bench` names its modes: `s16` (BF16 streams),
+    /// `f32` (F32 streams), `pre` (F32 streams made from the block's output, lazy), `xn` (the
+    /// F32 normed streams), `q8` (a Q8_0 `up`, `xn` or streams).
+    pub mode: &'static str,
+    /// What it reads: (what, bytes a token). The weights (read once a call) are left out.
+    pub reads: Vec<(&'static str, usize)>,
+    /// What it writes: (what, bytes a token, the tensor whose readers read it; null when not
+    /// written).
+    pub writes: Vec<(&'static str, usize, *mut ffi::ggml_tensor)>,
+    /// The `hc_up_lob` node holding `lo` as BF16 (null for a Q8_0 `up`).
+    pub lob: *mut ffi::ggml_tensor,
+}
+
+/// [`MixAudit`] of `node`, an up-mix node of an allocated graph after the node fusion; `None`
+/// for any other node.
+///
+/// # Safety
+/// `node` is a valid tensor; its sources valid tensors.
+pub(crate) unsafe fn audit(node: *mut ffi::ggml_tensor) -> Option<MixAudit> {
+    // SAFETY: the caller's.
+    unsafe {
+        if !crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &HC_UP_MIX)) {
+            return None;
+        }
+        let t = &*node;
+        let (up, x) = (&*t.src[0], &*t.src[2]);
+        let params = crate::ggml::external_params(t);
+        let hc = params[1] as usize;
+        let rows = up.ne[1] as usize;
+        let n = (*lo_of(up, &*t.src[1])).ne[1];
+        let (rank, e) = (up.ne[0] as usize, rows / hc);
+        let up_bf16 = up.type_ == types::BF16;
+        let rebuilt = !t.src[3].is_null();
+        let lazy = !t.src[LAZY_OUT_SRC].is_null();
+        let x16 = x.type_ == types::BF16;
+        let mode = match (up_bf16, rebuilt, lazy, x16) {
+            (false, ..) => "q8",
+            (true, false, ..) => "xn",
+            (true, true, true, _) => "pre",
+            (true, true, false, true) => "s16",
+            (true, true, false, false) => "f32",
+        };
+        let mut reads = Vec::new();
+        if rebuilt {
+            reads.push((
+                if x16 { "streams BF16" } else { "streams F32" },
+                rows * if x16 { 2 } else { 4 },
+            ));
+            reads.push(("norm scales F32", hc * 4));
+        } else {
+            reads.push(("xn F32", rows * 4));
+        }
+        if lazy {
+            reads.push(("block output F32", e * 4));
+            reads.push(("inject weights F32", hc * 4));
+        }
+        reads.push(if up_bf16 {
+            ("lo BF16", rank * 2)
+        } else {
+            ("lo F32", rank * 4)
+        });
+        let skip_f32 = params[P_SKIP_F32] != 0 || params[P_BY_EXCHANGE] != 0;
+        let mut writes = vec![(
+            "mixed F32",
+            if skip_f32 { 0 } else { e * 4 },
+            if skip_f32 { std::ptr::null_mut() } else { node },
+        )];
+        let cast = t.src[MIX_CAST_SRC];
+        if !cast.is_null() {
+            writes.push(("mixed BF16", e * 2, cast));
+        }
+        let lob = if up_bf16 {
+            t.src[1]
+        } else {
+            std::ptr::null_mut()
+        };
+        Some(MixAudit {
+            n,
+            mode,
+            reads,
+            writes,
+            lob,
+        })
     }
 }
 

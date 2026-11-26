@@ -33,6 +33,13 @@
 //!   norm reading its output (`conv_silu`) in its epilogue, with the bits of the two kernels,
 //!   on a compute capability 12.x GPU: the GEMM's F32 output is no longer written and read
 //!   back, and a kernel per layer goes ([`Graph::conv_gemm`], #1183).
+//! - qwen4exp's mixer down matmul of prompt steps with BF16 streams (`--hc-bf16`) writes the
+//!   gate's scale and SiLU rounded to BF16 straight into the part of the `hc_up_lob` node the
+//!   up-mix reads, with the bits of the two nodes it replaces (`--no-hc-down-lob` keeps them):
+//!   the F32 `lo` is no longer written and read back twice ([`Graph::down_lob`], #1183).
+//!
+//! With `RUST_LOG=info,legion::model::core::node_fuse::audit=debug` the first graphs' up-mix
+//! nodes are logged after the rewrite: what each reads and writes and who reads it ([`audit`]).
 //!
 //! An op runs at the position of the chain's last node, into that node's memory; the chain's
 //! other nodes become `GGML_OP_NONE`. An op reading a tensor later than the chain did is only
@@ -48,6 +55,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::ggml::{ExternalOp, external_params, ffi, make_external};
 
+mod audit;
 pub(crate) mod fold;
 #[cfg(test)]
 mod tests;
@@ -160,6 +168,9 @@ pub(crate) struct Counts {
     /// Gated DeltaNet convs run by their FP8 qkv GEMM, the GEMM's node turned off
     /// ([`Graph::conv_gemm`], #1183).
     pub conv_gemm: usize,
+    /// qwen4exp mixers' down matmuls writing their up-mix's BF16 `lo` themselves, the gate's
+    /// activation and BF16 rounding nodes turned off ([`Graph::down_lob`], #1183).
+    pub down_lob: usize,
     /// Nodes turned into `GGML_OP_NONE`.
     pub none: usize,
 }
@@ -208,6 +219,14 @@ unsafe fn fuse(graph: *mut ffi::ggml_cgraph) {
     }
     // SAFETY: the caller's.
     let c = unsafe { rewrite_graph(graph, true) };
+    if audit::enabled() {
+        // SAFETY: the caller's: the rewritten graph's nodes are valid tensors.
+        unsafe {
+            let n = ffi::ggml_graph_n_nodes(graph) as usize;
+            let nodes = std::slice::from_raw_parts(ffi::ggml_graph_nodes(graph), n).to_vec();
+            audit::log(&Graph::new(graph, nodes));
+        }
+    }
     let first_codes = (c.fp8_codes + c.gdn_codes + c.shexp_codes > 0
         && !CODES_LOGGED.swap(true, Ordering::Relaxed))
         | (c.ple_ops > 0 && !PLE_LOGGED.swap(true, Ordering::Relaxed))
@@ -233,6 +252,7 @@ unsafe fn fuse(graph: *mut ffi::ggml_cgraph) {
             mtp_in = c.mtp_in,
             mtp_in_q8 = c.mtp_in_q8,
             conv_gemm = c.conv_gemm,
+            down_lob = c.down_lob,
             none = c.none,
             "node fuse: small ggml chains as Legion ops (the first graphs; --node-fuse-ggml off)"
         );
@@ -291,6 +311,10 @@ pub(crate) unsafe fn rewrite_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> 
                     }
                     if cuda && super::fused::gemm_allowed(g.nodes[i]) {
                         g.conv_gemm(i, &mut c);
+                    }
+                    // Last: it may turn the node (an `hc_up_lob`) off.
+                    if crate::model::qwen4::hc_down::down_lob() {
+                        g.down_lob(i, &mut c);
                     }
                 }
                 _ => {}
@@ -398,15 +422,17 @@ unsafe fn overlap(a: Node, b: Node) -> bool {
 }
 
 /// The bytes node `n` writes: its own ([`span`]) and, for a BF16 mix writing a cast of its
-/// values (an early cast of [`fold`] or [`Graph::mix_cast`], #1183), the cast's.
+/// values (an early cast of [`fold`] or [`Graph::mix_cast`], #1183), the cast's, for a down
+/// matmul writing its up-mix's BF16 `lo` ([`Graph::down_lob`]), that `lo` node's.
 ///
 /// # Safety
 /// A valid tensor.
-unsafe fn writes(n: Node) -> [(usize, usize); 2] {
-    // SAFETY: the caller's; a mix's cast is a valid tensor.
+unsafe fn writes(n: Node) -> [(usize, usize); 3] {
+    // SAFETY: the caller's; a mix's cast and a down node's `lo` node are valid tensors.
     unsafe {
         let cast = crate::model::qwen4::mix_cast_set(n).map_or((0, 0), |(c, _)| span(c));
-        [span(n), cast]
+        let lob = crate::model::qwen4::hc_down::lob_of(n).map_or((0, 0), |l| span(l));
+        [span(n), cast, lob]
     }
 }
 
@@ -1084,6 +1110,94 @@ impl Graph {
             self.moved.push((at, cast));
             c.mix_cast += 1;
             c.mix_f32_skipped += usize::from(skip_f32);
+        }
+    }
+
+    /// qwen4exp's mixer tail in prompt steps with BF16 streams (`--hc-bf16`): the down matmul
+    /// ([`crate::model::qwen4::hc_down::mul_mat`], F32 `lo`), the gate's scale and SiLU in
+    /// place on it (`hc_lo_act`), then `lo` rounded to BF16 by the `hc_up_lob` node at `at`,
+    /// which only the up-mix reads. Where `lo` and its activation have no other reader, the
+    /// down matmul writes the activation rounded to BF16 straight into the part of that node
+    /// the up-mix reads, with the two nodes' expressions (the same bits), and the two become
+    /// `GGML_OP_NONE` (#1183): `lo` is no longer written as F32 and read back twice (5 KB a
+    /// token a mixer at qwen4exp's rank of 320). That part is written earlier than the
+    /// `hc_up_lob` node did, so only where it shares no memory with what the down matmul reads
+    /// or writes, and no node in between writes or reads it.
+    ///
+    /// # Safety
+    /// `at` is a node index.
+    unsafe fn down_lob(&mut self, at: usize, c: &mut Counts) {
+        use crate::model::qwen4::hc_down;
+        // SAFETY: the caller's; nodes and sources are valid tensors.
+        unsafe {
+            let lob = self.nodes[at];
+            let Some((act, (l0, l1))) = crate::model::qwen4::up_lob(lob) else {
+                return;
+            };
+            let Some(ai) = self.index.get(&(act as usize)).copied() else {
+                return;
+            };
+            if ai >= at || self.none[ai] {
+                return;
+            }
+            let Some(scale) = crate::model::qwen4::lo_act_scale(act) else {
+                return;
+            };
+            let down = (*act).src[0];
+            let Some(di) = (!down.is_null())
+                .then(|| self.index.get(&(down as usize)).copied())
+                .flatten()
+            else {
+                return;
+            };
+            // The activation runs in place on all of the down matmul's F32 output.
+            if di >= ai
+                || self.none[di]
+                || !hc_down::is_down(down)
+                || span(act) != span(down)
+                || (*act).ne != (*down).ne
+                || !f32_contiguous(down)
+                || !self.only_read_by(down, &[ai])
+                || !self.only_read_by(act, &[at])
+            {
+                return;
+            }
+            let hits = |(a, b): (usize, usize)| a < b && a < l1 && l0 < b;
+            if l0 >= l1
+                || hits(span(down))
+                || (*down).src.iter().any(|&s| !s.is_null() && hits(span(s)))
+            {
+                return;
+            }
+            for k in di + 1..at {
+                let n = self.nodes[k];
+                if k == ai
+                    || self.none[k]
+                    || is_view_op((*n).op)
+                    || (*n).op == ffi::ggml_op_GGML_OP_NONE
+                {
+                    continue;
+                }
+                if writes(n).iter().any(|&w| hits(w))
+                    || (*n).src.iter().any(|&s| !s.is_null() && hits(span(s)))
+                {
+                    return;
+                }
+            }
+            if self
+                .moved
+                .iter()
+                .any(|&(k, t)| k > di && k < at && hits(span(t)))
+            {
+                return;
+            }
+            hc_down::set_lob(down, lob, scale);
+            for i in [ai, at] {
+                (*self.nodes[i]).op = ffi::ggml_op_GGML_OP_NONE;
+                self.none[i] = true;
+            }
+            self.moved.push((di, lob));
+            c.down_lob += 1;
         }
     }
 

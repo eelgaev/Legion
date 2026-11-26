@@ -404,6 +404,10 @@ pub struct Switches {
     /// That kernel staging each tile's mix operands in shared memory during its matmul
     /// ([`crate::model::qwen4::set_up_mix_stage`], on by default, the same bits).
     pub hc_up_mix_stage: Option<bool>,
+    /// qwen4exp's `--hc-bf16` down matmul writing the gate's activation as the up-mix's BF16
+    /// input itself ([`crate::model::qwen4::hc_down::set_down_lob`], on by default, the same
+    /// bits).
+    pub hc_down_lob: Option<bool>,
     /// qwen4exp's combine-and-norm writing the streams' norm scales instead of the normed
     /// streams, rebuilt by the up-mix op ([`crate::model::qwen4::set_up_mix_rebuild`]).
     pub hc_xn_rebuild: Option<bool>,
@@ -858,6 +862,7 @@ impl Switches {
         set(self.hc_up_mix_bf16, qwen4::set_up_mix_bf16);
         set(self.hc_up_mix_ldmatrix, qwen4::set_up_mix_ldmatrix);
         set(self.hc_up_mix_stage, qwen4::set_up_mix_stage);
+        set(self.hc_down_lob, qwen4::hc_down::set_down_lob);
         set(self.hc_xn_rebuild, qwen4::set_up_mix_rebuild);
         set(self.hc_streams_bf16, qwen4::set_streams_bf16);
         set(self.hc_bf16, qwen4::set_hc_bf16);

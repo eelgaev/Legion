@@ -191,7 +191,27 @@ __global__ void __launch_bounds__(HD_THREADS, 1) hc_down_gemm(const legion_hc_do
     }
     hd_wait<0>();
 
-    // C fragments: (row g, tokens 2q and 2q + 1) and (row g + 8, the same tokens).
+    // C fragments: (row g, tokens 2q and 2q + 1) and (row g + 8, the same tokens). With lob
+    // (the node fusion, #1183) each sum goes through the gate's activation and the BF16
+    // rounding of hc_lo_act and hc_up_lob instead: the same expressions, the same bits.
+    if (p.lob != nullptr) {
+#pragma unroll
+        for (int i = 0; i < MI; i++) {
+#pragma unroll
+            for (int j = 0; j < NT; j++) {
+#pragma unroll
+                for (int l = 0; l < 4; l++) {
+                    const int row = wm * (HD_M / 4) + i * 16 + g + (l >> 1) * 8;
+                    const int tok = n0 + wn * 8 * NT + j * 8 + 2 * q + (l & 1);
+                    if (tok < p.n) {
+                        const float v = legion_hc_lo_act(acc[i][j][l], p.act_scale, p.act_bias);
+                        p.lob[(int64_t) tok * p.m + row] = __float2bfloat16(v);
+                    }
+                }
+            }
+        }
+        return;
+    }
 #pragma unroll
     for (int i = 0; i < MI; i++) {
 #pragma unroll

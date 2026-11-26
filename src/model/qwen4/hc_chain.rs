@@ -189,10 +189,36 @@ unsafe fn cpu_lo_act(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
         let x = (*dst.src[0]).data as *const f32;
         let y = dst.data as *mut f32;
         for i in (ith..n).step_by(nth) {
-            let s = scale * *x.add(i);
-            *y.add(i) = s / (1.0 + (-s).exp());
+            *y.add(i) = lo_act_value(*x.add(i), scale);
         }
     }
+}
+
+/// One value of [`lo_act`] as its CPU op makes it: `silu(scale · x)` (ggml's CPU scale, then
+/// `x / (1 + exp(-x))`). Also the down matmul's where it writes the up-mix's BF16 `lo` itself
+/// ([`super::hc_down::set_lob`], #1183).
+pub(super) fn lo_act_value(x: f32, scale: f32) -> f32 {
+    let s = scale * x;
+    s / (1.0 + (-s).exp())
+}
+
+/// For an `hc_lo_act` node ([`lo_act`] on a GPU): its scale.
+///
+/// # Safety
+/// `node` is a valid tensor.
+pub(crate) unsafe fn lo_act_scale(node: *const ffi::ggml_tensor) -> Option<f32> {
+    // SAFETY: the caller's.
+    unsafe {
+        crate::ggml::op_of(node)
+            .is_some_and(|op| std::ptr::eq(op, &HC_LO_ACT))
+            .then(|| param(&*node, 0))
+    }
+}
+
+/// [`lo_act`]'s op whatever the build and backend (its CPU op is the reference), for the tests.
+#[cfg(test)]
+pub(super) fn lo_act_op<'a>(ctx: &'a Context, lo: Tensor<'a>, scale: f32) -> Tensor<'a> {
+    ctx.external_inplace(&HC_LO_ACT, lo, &[], &[scale.to_bits() as i32])
 }
 
 unsafe fn cpu_combine(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {

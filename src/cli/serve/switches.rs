@@ -1076,6 +1076,13 @@ pub(in crate::cli) struct SwitchArgs {
     /// For comparisons.
     #[arg(long, help_heading = HEADING)]
     no_hc_up_mix_stage: bool,
+    /// qwen4exp prompt steps where --hc-bf16's down matmul kernel runs (2,048+ tokens): keep
+    /// the gate's scale and SiLU and the BF16 rounding of the up-mix's input as kernels of their
+    /// own after that matmul, instead of the matmul doing both in its epilogue (the default:
+    /// the same expressions, so the same output; the F32 output is not written and read back).
+    /// For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_hc_down_lob: bool,
     /// qwen4exp prompt steps on compute capability 12.x GPUs (GB10) where the up-mix kernel
     /// runs, of 64+ tokens on a V100 (7.0) where the F16 mix of --hc-mix-f16 runs, and of 128+
     /// tokens on compute capability 8.0+ GPUs with BF16 mixer weights under --hc-mix-rebuild-bf16;
@@ -1749,6 +1756,7 @@ impl SwitchArgs {
             hc_up_mix_bf16: self.no_hc_up_mix_bf16.then_some(false),
             hc_up_mix_ldmatrix: self.no_hc_up_mix_ldmatrix.then_some(false),
             hc_up_mix_stage: self.no_hc_up_mix_stage.then_some(false),
+            hc_down_lob: self.no_hc_down_lob.then_some(false),
             hc_xn_rebuild: self.hc_xn_written.then_some(false),
             hc_streams_bf16: self.hc_streams_bf16.then_some(true),
             hc_bf16: self.hc_bf16.then_some(true),

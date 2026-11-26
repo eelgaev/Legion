@@ -23,6 +23,8 @@
 
 #include <cstdint>
 
+#include "hc_lo_act.cuh"
+
 extern "C" {
 
 struct legion_hc_chain {
@@ -49,15 +51,15 @@ namespace {
 
 constexpr int WARP = 32;
 
-// ggml's scale_f32 then ggml_cuda_op_silu_single, one value a thread (in place: x may be dst).
+// ggml's scale_f32 then ggml_cuda_op_silu_single (legion_hc_lo_act, hc_lo_act.cuh), one value a
+// thread (in place: x may be dst).
 __global__ void lo_act_kernel(const float * x, float * dst, const float scale, const float bias,
                               const int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) {
         return;
     }
-    const float s = scale * x[i] + bias;
-    dst[i] = s / (1.0f + expf(-s));
+    dst[i] = legion_hc_lo_act(x[i], scale, bias);
 }
 
 // ggml's scale, sigmoid and scale of the inject weights (each a kernel writing F32 there, the

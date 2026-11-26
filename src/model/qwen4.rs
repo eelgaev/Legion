@@ -26,6 +26,7 @@
 pub mod hc;
 mod hc_chain;
 pub mod hc_down;
+pub(crate) use hc_chain::lo_act_scale;
 pub use hc_chain::set_hc_chain;
 mod hc_mix16;
 pub use hc_mix16::{set_hc_pre, set_mix16, set_rebuild_bf16 as set_mix_rebuild_bf16};
@@ -44,8 +45,8 @@ pub use hc_up_mix::bench as hc_up_mix_bench;
 #[cfg(feature = "cuda")]
 pub(crate) use hc_up_mix::launch_mix;
 pub(crate) use hc_up_mix::{
-    is_bf16_mix, lazy_mix_target, mix_cast_reads, mix_cast_set,
-    set_by_exchange as set_mix_by_exchange, set_lazy_streams, set_mix_cast,
+    MixAudit, audit as mix_audit, is_bf16_mix, lazy_mix_target, mix_cast_reads, mix_cast_set,
+    set_by_exchange as set_mix_by_exchange, set_lazy_streams, set_mix_cast, up_lob,
 };
 pub use hc_up_mix::{
     set_gpu as set_up_mix_gpu, set_rebuild as set_up_mix_rebuild, set_up_mix, set_up_mix_bf16,
