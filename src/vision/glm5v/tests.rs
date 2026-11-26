@@ -96,14 +96,19 @@ fn mlp(enc: &Encoder, prefix: &str, x: &[f32], limit: f32) -> Vec<f32> {
     let wd = get("down.weight").unwrap();
     let ff = wg.len() / x.len();
     let n = wd.len() / ff;
-    let g = matvec(&wg, get("gate.bias").as_deref(), x, ff);
-    let u = matvec(&get("up.weight").unwrap(), get("up.bias").as_deref(), x, ff);
+    let g = matvec(&wg, get("gate.bias").ok().as_deref(), x, ff);
+    let u = matvec(
+        &get("up.weight").unwrap(),
+        get("up.bias").ok().as_deref(),
+        x,
+        ff,
+    );
     let h: Vec<f32> = g
         .iter()
         .zip(&u)
         .map(|(&g, &u)| swiglu_clamp(g, u, limit))
         .collect();
-    matvec(&wd, get("down.bias").as_deref(), &h, n)
+    matvec(&wd, get("down.bias").ok().as_deref(), &h, n)
 }
 
 /// The tower written out loop by loop from the module docs, patches row by row: the oracle of
@@ -284,7 +289,10 @@ fn refuses_an_mmproj_without_the_clamp() {
     }
     let stripped = dir.path().join("stripped.gguf");
     w.write(&stripped).unwrap();
-    let err = Encoder::load(&stripped, Backend::cpu().unwrap()).unwrap_err();
+    let err = match Encoder::load(&stripped, Backend::cpu().unwrap()) {
+        Ok(_) => panic!("an mmproj without swiglu_clamp loaded"),
+        Err(e) => e,
+    };
     assert!(err.to_string().contains("swiglu_clamp"), "{err}");
 }
 
@@ -493,8 +501,9 @@ fn checkpoint_tower_maps_to_the_mmproj_names() {
             .unwrap()
             .expect("a vision tower");
         assert_eq!(
-            g.get("clip.projector_type").and_then(|v| v.as_str()),
-            Some("glm5v")
+            g.get("clip.projector_type")
+                .and_then(|v| v.as_str().map(String::from)),
+            Some("glm5v".to_string())
         );
         let mut got = Encoder::from_gguf(&g, Backend::cpu().unwrap()).unwrap();
         assert_eq!(
