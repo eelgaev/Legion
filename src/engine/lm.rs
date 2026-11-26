@@ -4376,6 +4376,11 @@ impl LmEngine {
             gemma4_compact_global_kv(&mut model, cfg.cache_types);
         }
         let glm = crate::model::glm5next::params(&model.hp).is_some();
+        // Inkling-2's decode steps capture the GLM and DeepSeek ops of its graph (#1221);
+        // every other model's captures stay as they were.
+        crate::model::core::stage_ops::set_inkling_shared(
+            crate::model::inkling2::params(&model.hp).is_some(),
+        );
         let short_gate =
             short_gate_on(glm || crate::model::deepseek41::params(&model.hp).is_some());
         let route_gated = route_gated

@@ -8,6 +8,40 @@ fn listed_ops_are_unique() {
     assert_eq!(names.len(), PURE.len());
 }
 
+/// Inkling-2's own ops are captured in small steps (#1221); the GLM and DeepSeek ops its graph
+/// shares only with its switch on, so GLM-5.3-Flash's and DeepSeek-V4.1's graphs capture what
+/// they did before. Prompt steps keep all of them between their captures.
+#[test]
+fn inkling_ops_follow_the_small_step_mark_and_their_switch() {
+    let mut all: Vec<&str> = [PURE, SMALL, SMALL_MM, COMMIT, INKLING, INKLING_SHARED].concat();
+    let n = all.len();
+    all.sort_unstable();
+    all.dedup();
+    assert_eq!(all.len(), n, "an op in two lists");
+    for name in INKLING {
+        assert!(name.starts_with("ink_"), "{name}");
+        for inkling in [false, true] {
+            assert!(listed_as(name, true, inkling), "{name}");
+            assert!(!listed_as(name, false, inkling), "{name}");
+        }
+    }
+    for name in INKLING_SHARED {
+        assert!(
+            name.starts_with("glm_") || name.starts_with("ds4_"),
+            "{name}"
+        );
+        assert!(listed_as(name, true, true), "{name}");
+        assert!(!listed_as(name, true, false), "{name}");
+        assert!(!listed_as(name, false, true), "{name}");
+    }
+    // The other lists do not depend on the switch.
+    for inkling in [false, true] {
+        assert!(listed_as("nvfp4_mm_id", false, inkling));
+        assert!(listed_as("fp8_mm", true, inkling));
+        assert!(!listed_as("glm_mla_attn", true, inkling));
+    }
+}
+
 /// Ops that wait on the host, use side streams or change with host state between steps stay
 /// out of captures.
 #[test]

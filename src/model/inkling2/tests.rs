@@ -612,6 +612,39 @@ fn tiny_runs_the_same_in_any_chunking() {
     assert!(d <= tol, "token by token: {d} > {tol}");
 }
 
+/// #1221: every op of a decode step (one token, and four of one sequence) is one that a small
+/// step's stage graph captures once a loaded Inkling-2 turns the shared ops' switch on, so the
+/// step is one capture instead of ~2,000 launches from the host. A new op left out of the
+/// lists fails here.
+#[test]
+fn a_decode_step_is_captured_whole() {
+    use crate::model::core::stage_ops::{INKLING, INKLING_SHARED, listed_as};
+    let dir = tempfile::tempdir().unwrap();
+    let g = tiny_gguf(&dir, Layout::Mainline);
+    let mut b = backend();
+    let m = Model::load(&g, |_| b.buffer_type()).unwrap();
+    let mut st = m.new_state(b.buffer_type(), 256).unwrap();
+    let mut alloc = None;
+    m.forward(&mut b, &mut alloc, &mut st, &prompt(), false)
+        .unwrap();
+    for tokens in [&[7u32][..], &[7, 8, 9, 10]] {
+        let mut counts: HashMap<&'static str, usize> = HashMap::new();
+        m.step_external_ops(&st, tokens, |op, _| {
+            *counts.entry(op.name).or_default() += 1;
+        })
+        .unwrap();
+        let total: usize = counts.values().sum();
+        eprintln!("{} tokens: {total} external ops {counts:?}", tokens.len());
+        assert!(counts.contains_key("ink_attn") && counts.contains_key("glm_rms_norm"));
+        for name in counts.keys() {
+            assert!(listed_as(name, true, true), "`{name}` cuts the capture");
+            if INKLING.contains(name) || INKLING_SHARED.contains(name) {
+                assert!(!listed_as(name, false, true), "`{name}` in prompt steps");
+            }
+        }
+    }
+}
+
 /// The engine's batch steps (paged caches, two sequences, the sliding slots in rings or whole)
 /// give the tokens of whole caches: the conv histories are per sequence.
 #[test]

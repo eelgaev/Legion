@@ -173,6 +173,59 @@ pub(crate) const SMALL: &[&str] = &[
 /// them, a 2-3 µs gap at each cut. Prompt steps keep them between their captures, as before.
 pub(crate) const SMALL_MM: &[&str] = &["nvfp4_mvq", "fp8_mm"];
 
+/// Inkling-2's own ops (#1221, `src/cuda/inkling2.cu`), captured in small steps only, as
+/// [`SMALL`]: each launcher enqueues one `cudaLaunchKernel` on the compute stream, its grid
+/// from the node's shape and its arguments the node's tensors and parameters (the expert
+/// matmul's list counter is shared memory). Left out, every one of them cut a decode step's
+/// capture: ~2,000 launches a token ran from the host, one after another. Prompt steps keep
+/// them between their captures, as before.
+pub(crate) const INKLING: &[&str] = &[
+    "ink_mix",
+    "ink_ctrl_in",
+    "ink_ctrl_out",
+    "ink_conv",
+    "ink_clip",
+    "ink_attn",
+    "ink_sigmul",
+    "ink_situ",
+    "ink_mm_id",
+    "ink_softcap",
+];
+
+/// GLM-5.3-Flash's and DeepSeek-V4.1's ops that Inkling-2's graph is built of (#1221),
+/// captured in small steps only and only while [`set_inkling_shared`] is on (an Inkling-2
+/// model is loaded), so GLM-5.3-Flash and DeepSeek-V4.1 keep running them between captures as
+/// before. `legion_glm_launch` (`src/cuda/glm5next.cu`) picks its kernels by the node's shape,
+/// types, pointers' alignment and parameters, with settings fixed at startup and the device's
+/// attributes read once; it waits on nothing, allocates nothing and stays on the compute
+/// stream (`glm_join_cols` copies device to device on it). `ds4_cache_write` is one
+/// `cudaLaunchKernel` over the node.
+pub(crate) const INKLING_SHARED: &[&str] = &[
+    "glm_embed",
+    "glm_linear",
+    "glm_bf16",
+    "glm_f16",
+    "glm_rms_norm",
+    "glm_add",
+    "glm_router_ids",
+    "glm_router_w",
+    "glm_weighted_sum",
+    "glm_join_cols",
+    "glm_get_cols",
+    "glm_argmax",
+    "ds4_cache_write",
+];
+
+/// See [`set_inkling_shared`].
+static INKLING_SHARED_CAPTURE: AtomicBool = AtomicBool::new(false);
+
+/// Whether small steps' captures may hold the [`INKLING_SHARED`] ops from now on: on while an
+/// Inkling-2 model is loaded (#1221), off for every other model, whose graphs then capture
+/// what they did before.
+pub fn set_inkling_shared(on: bool) {
+    INKLING_SHARED_CAPTURE.store(on, Ordering::Relaxed);
+}
+
 /// Pure ops captured only while [`set_commit_capture`] is on: a verify commit's conv window
 /// copy (`legion_spec_window_launch`, one kernel picked by the node's shape) and its every-layer
 /// form (`spec_windows`, #689: the same kernel over a pointer table filled once, when the graph
@@ -204,10 +257,17 @@ pub fn capture_safe(op: &ExternalOp, node: &ffi::ggml_tensor) -> bool {
     }
 }
 
-/// Whether a capture may hold an op `name` of [`PURE`], [`SMALL`] or [`SMALL_MM`], in a small
-/// step (`small`) or a prompt step.
+/// Whether a capture may hold an op `name` of [`PURE`], [`SMALL`], [`SMALL_MM`], [`INKLING`]
+/// or [`INKLING_SHARED`], in a small step (`small`) or a prompt step.
 fn listed(name: &str, small: bool) -> bool {
-    if SMALL.contains(&name) || SMALL_MM.contains(&name) {
+    listed_as(name, small, INKLING_SHARED_CAPTURE.load(Ordering::Relaxed))
+}
+
+/// [`listed`] with [`set_inkling_shared`]'s switch given (`inkling`).
+pub(crate) fn listed_as(name: &str, small: bool, inkling: bool) -> bool {
+    if INKLING_SHARED.contains(&name) {
+        small && inkling
+    } else if SMALL.contains(&name) || SMALL_MM.contains(&name) || INKLING.contains(&name) {
         small
     } else {
         PURE.contains(&name)

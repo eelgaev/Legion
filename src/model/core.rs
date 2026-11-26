@@ -109,6 +109,8 @@ pub use router_mv::set_router_mv;
 pub(crate) mod mmvq_glu;
 pub use mmvq_glu::set_mmvq_glu;
 pub(crate) mod state;
+#[cfg(test)]
+mod step_ops;
 pub mod tp;
 pub(crate) mod tp_ep;
 pub mod traffic;

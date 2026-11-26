@@ -787,6 +787,39 @@ impl Model {
         x: Tensor<'a>,
         xh: Option<Tensor<'a>>,
     ) -> Result<Tensor<'a>, ModelError> {
+        self.glm_mm_xb(ctx, name, w, ws, x, xh, None)
+    }
+
+    /// [`Self::glm_mm`] of `name` over `x` with `xb` holding `x`'s BF16 rows for the NVFP4
+    /// products of one input (#1221, Inkling-2): the first such product makes them, the others
+    /// read them instead of rounding `x` again (the same bits, one kernel fewer each).
+    pub(crate) fn glm_mm_shared<'a>(
+        &'a self,
+        ctx: &'a Context,
+        name: &str,
+        x: Tensor<'a>,
+        xb: &mut Option<Tensor<'a>>,
+    ) -> Result<Tensor<'a>, ModelError> {
+        let w = self.w(name)?;
+        let ws = name
+            .strip_suffix(".weight")
+            .and_then(|b| self.w(&format!("{b}.scale")).ok());
+        self.glm_mm_xb(ctx, name, w, ws, x, None, Some(xb))
+    }
+
+    /// [`Self::glm_mm_w`], an NVFP4 product's BF16 rows of `x` taken from (or left in) `xb`
+    /// when given ([`Self::glm_mm_shared`]), else made for it alone.
+    #[allow(clippy::too_many_arguments)]
+    fn glm_mm_xb<'a>(
+        &'a self,
+        ctx: &'a Context,
+        name: &str,
+        w: Tensor<'a>,
+        ws: Option<Tensor<'a>>,
+        x: Tensor<'a>,
+        xh: Option<Tensor<'a>>,
+        xb: Option<&mut Option<Tensor<'a>>>,
+    ) -> Result<Tensor<'a>, ModelError> {
         if w.ty() == types::NVFP4 && nvfp4_mm::supports(w) {
             if ws.is_some_and(|s| s.elements() != 1) {
                 return Err(ModelError::Unsupported(format!(
@@ -803,7 +836,11 @@ impl Model {
                 // --nvfp4-a4 prefill / all: 4-bit activations (the dense FFN's, #575)
                 return Ok(crate::model::nvfp4_a4::mul_mat(ctx, w, x, ws));
             }
-            return Ok(nvfp4_mm::mul_mat(ctx, w, ops::bf16(ctx, x), ws));
+            let b = match xb {
+                Some(xb) => *xb.get_or_insert_with(|| ops::bf16(ctx, x)),
+                None => ops::bf16(ctx, x),
+            };
+            return Ok(nvfp4_mm::mul_mat(ctx, w, b, ws));
         }
         if w.ty() == types::I8 {
             return Ok(fp8::mul_mat(ctx, w, x, ws));

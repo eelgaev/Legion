@@ -419,7 +419,9 @@ impl Arch for Ink2Params {
         true
     }
 
-    /// The logits soft-capped and cut to the unpadded vocabulary.
+    /// The logits soft-capped and cut to the unpadded vocabulary. The greedy pick over
+    /// [`glm_ops::argmax_wide`]'s CTAs (#1221): one CTA a token read the 200K logits slowly;
+    /// the same index (the first of the largest, the soft cap leaves no NaN).
     fn head<'a>(
         &self,
         m: &'a Model,
@@ -428,7 +430,7 @@ impl Arch for Ink2Params {
     ) -> Result<Option<(Tensor<'a>, Tensor<'a>)>, ModelError> {
         let logits = m.glm_mm(ctx, "output.weight", x)?;
         let logits = ops::softcap(ctx, logits, self.softcap, self.n_vocab);
-        Ok(Some((logits, glm_ops::argmax(ctx, logits))))
+        Ok(Some((logits, glm_ops::argmax_wide(ctx, logits))))
     }
 
     fn external_drafters(&self) -> bool {
@@ -488,6 +490,27 @@ fn states<'a>(blocks: &[Tensor<'a>], cur: Tensor<'a>) -> Vec<Tensor<'a>> {
     s
 }
 
+/// The BF16 rows of the inputs of a layer's NVFP4 products (#1221): made once per input
+/// ([`Model::glm_mm_shared`]) for every product reading it, which [`Model::glm_mm`] would each
+/// round again. The same bits; an NVFP4 checkpoint's sliding layer rounds its normed input
+/// once for Q, K, V, the relative weights, the sinks and the gate instead of six times.
+#[derive(Default)]
+struct Bf16Rows<'a>(Vec<(*mut crate::ggml::ffi::ggml_tensor, Option<Tensor<'a>>)>);
+
+impl<'a> Bf16Rows<'a> {
+    /// The slot of `x`'s rows (empty until a product makes them).
+    fn of(&mut self, x: Tensor<'a>) -> &mut Option<Tensor<'a>> {
+        let i = match self.0.iter().position(|(t, _)| *t == x.raw()) {
+            Some(i) => i,
+            None => {
+                self.0.push((x.raw(), None));
+                self.0.len() - 1
+            }
+        };
+        &mut self.0[i].1
+    }
+}
+
 /// Slice `j` (`[e, n]`) of a mix of several queries (`[e, n, nq]`, [`ops::mix`]).
 fn slice<'a>(ctx: &'a Context, m: Tensor<'a>, j: usize) -> Tensor<'a> {
     let [e, n, _, _] = m.ne();
@@ -509,6 +532,18 @@ impl Model {
         x: Tensor<'a>,
     ) -> Result<Tensor<'a>, ModelError> {
         self.glm_mm(ctx, &format!("blk.{ip}.{name}"), x)
+    }
+
+    /// [`Self::ink_mm`] with an NVFP4 weight's BF16 rows of `x` shared through `rows`.
+    fn ink_mm_b<'a>(
+        &'a self,
+        ctx: &'a Context,
+        ip: usize,
+        name: &str,
+        x: Tensor<'a>,
+        rows: &mut Bf16Rows<'a>,
+    ) -> Result<Tensor<'a>, ModelError> {
+        self.glm_mm_shared(ctx, &format!("blk.{ip}.{name}"), x, rows.of(x))
     }
 
     /// `x` RMS-normed times block `ip`'s weight `name`.
@@ -634,8 +669,9 @@ impl Model {
         let p = self.ink();
         let g = ops::ctrl_in(ctx, cur, msg, MIX_EPS);
         let g = self.glm_mm(ctx, &p.ctrl_name(ip, c, "down"), g)?;
-        let gain = self.glm_mm(ctx, &p.ctrl_name(ip, c, "gain"), g)?;
-        let forget = self.glm_mm(ctx, &p.ctrl_name(ip, c, "forget"), g)?;
+        let mut rows = Bf16Rows::default();
+        let gain = self.glm_mm_shared(ctx, &p.ctrl_name(ip, c, "gain"), g, rows.of(g))?;
+        let forget = self.glm_mm_shared(ctx, &p.ctrl_name(ip, c, "forget"), g, rows.of(g))?;
         Ok(ops::ctrl_out(ctx, cur, msg, gain, forget))
     }
 
@@ -790,15 +826,16 @@ impl Model {
             |off: i64, ng: i64| ctx.view_2d(pass.pos, [ng, 1], ng as usize * es, off as usize * es);
         let [xq, xk, xv] = *inputs;
 
-        let q = self.ink_mm(ctx, ip, "attn_q.weight", xq)?;
-        let kp = self.ink_mm(ctx, ip, "attn_k.weight", xk)?;
-        let vp = self.ink_mm(ctx, ip, "attn_v.weight", xv)?;
+        let mut rows = Bf16Rows::default();
+        let q = self.ink_mm_b(ctx, ip, "attn_q.weight", xq, &mut rows)?;
+        let kp = self.ink_mm_b(ctx, ip, "attn_k.weight", xk, &mut rows)?;
+        let vp = self.ink_mm_b(ctx, ip, "attn_v.weight", xv, &mut rows)?;
         let (kdyn, vdyn) = if swa {
             (None, None)
         } else {
             (
-                Some(self.ink_mm(ctx, ip, "attn_k_conv_proj.weight", xk)?),
-                Some(self.ink_mm(ctx, ip, "attn_v_conv_proj.weight", xv)?),
+                Some(self.ink_mm_b(ctx, ip, "attn_k_conv_proj.weight", xk, &mut rows)?),
+                Some(self.ink_mm_b(ctx, ip, "attn_v_conv_proj.weight", xv, &mut rows)?),
             )
         };
         for (name, x) in [("q_proj", q), ("k_proj", kp), ("v_proj", vp)] {
@@ -813,7 +850,7 @@ impl Model {
         let v = self.ink_conv(pass, il, ip, "attn_v_conv.weight", vp, vdyn, kvw)?;
         tap.tap("k_conv", il, k);
         tap.tap("v_conv", il, v);
-        let r = self.ink_mm(ctx, ip, "attn_rel.weight", xq)?;
+        let r = self.ink_mm_b(ctx, ip, "attn_rel.weight", xq, &mut rows)?;
         tap.tap("r_proj", il, r);
 
         // The global layers' Q and relative weights scale with the log of the position.
@@ -834,7 +871,7 @@ impl Model {
             p.rel_clip,
             tau,
         );
-        let sinks = self.ink_mm(ctx, ip, "attn_sink_proj.weight", xq)?;
+        let sinks = self.ink_mm_b(ctx, ip, "attn_sink_proj.weight", xq, &mut rows)?;
         tap.tap("r_clip", il, r);
         tap.tap("sinks", il, sinks);
         tap.tap("Qcur", il, q);
@@ -905,7 +942,7 @@ impl Model {
         }
         let o = glm_ops::join_cols(ctx, &outs);
         tap.tap("kqv_out", il, o);
-        let g = self.ink_mm(ctx, ip, "attn_gate.weight", xq)?;
+        let g = self.ink_mm_b(ctx, ip, "attn_gate.weight", xq, &mut rows)?;
         tap.tap("attn_gate", il, g);
         let o = ops::sigmul(ctx, o, g);
         tap.tap("attn_gated", il, o);
