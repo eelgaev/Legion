@@ -180,6 +180,40 @@ fn gpu_glm_tower_matches_the_cpu_tower() {
     }
 }
 
+/// The tiny GLM-5.3-Flash tower refuses a grid over its pixel budget (9,216 pixels, 16 × 16
+/// patches of 6) with an error, as its scratch is reserved for the budget, and takes one at it.
+#[test]
+#[ignore = "needs a GPU"]
+fn gpu_glm_tower_refuses_a_grid_over_the_pixel_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mmproj.gguf");
+    tiny::write_glm5v(&path, 64, 11, false).unwrap();
+    let enc = Encoder::load(&path, Backend::cpu().unwrap()).unwrap();
+    assert_eq!(enc.hparams().image_max_pixels, 96 * 96);
+    let Some(mut gpu) = GpuEncoder::new(&enc, 0).unwrap() else {
+        return;
+    };
+    let grid = |gx: u32, gy: u32| {
+        let (w, h) = (gx * tiny::GLM_PATCH, gy * tiny::GLM_PATCH);
+        crate::vision::Preprocessed {
+            width: w,
+            height: h,
+            grid_w: gx,
+            grid_h: gy,
+            pixels: vec![0.0; 3 * (w * h) as usize],
+        }
+    };
+    assert!(matches!(
+        gpu.encode(&grid(18, 16)),
+        Err(VisionError::Dimensions)
+    ));
+    assert!(matches!(
+        gpu.encode(&grid(16, 18)),
+        Err(VisionError::Dimensions)
+    ));
+    assert!(gpu.encode(&grid(16, 16)).is_ok());
+}
+
 /// A checkpoint's tower (`LEGION_TEST_VISION_HF=<dir>`) on the images of
 /// `LEGION_TEST_VISION_IMAGES=<dir>`: the GPU rows against the CPU tower's, with each image's
 /// grid, both encode times, the largest absolute error, the largest error relative to the

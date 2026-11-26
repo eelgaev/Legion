@@ -141,7 +141,13 @@ pub(super) fn glm5_canvas(
     min: u32,
     max: u32,
 ) -> Result<(u32, u32), VisionError> {
-    if width == 0 || height == 0 || factor == 0 || min == 0 || max < min {
+    if width == 0
+        || height == 0
+        || factor == 0
+        || min == 0
+        || max < min
+        || u64::from(max) < u64::from(factor) * u64::from(factor)
+    {
         return Err(VisionError::Dimensions);
     }
     let (w, h, f) = (width as i64, height as i64, factor as i64);

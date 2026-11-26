@@ -497,6 +497,37 @@ fn canvas_sizes() {
     assert!(glm5_canvas(0, 5, f, min, max).is_err());
 }
 
+/// A pixel budget under one merged patch fits no canvas, in any tower: the hparams refuse it
+/// (and take one merged patch exactly), and so does GLM's canvas, which at that budget gives
+/// one merged patch even to a thin image.
+#[test]
+fn refuses_a_pixel_budget_under_one_merged_patch() {
+    use crate::vision::preprocess::glm5_canvas;
+    use crate::vision::{Projector, VisionHparams};
+    for (projector, patch, merge) in [
+        (Projector::Qwen3vl, 16, 2),
+        (Projector::Gemma4v, 16, 3),
+        (Projector::Glm5v, 14, 2),
+    ] {
+        let token = (patch * merge) * (patch * merge);
+        let hp = |max: u32| VisionHparams {
+            projector,
+            patch_size: patch,
+            spatial_merge_size: merge,
+            image_min_pixels: 1,
+            image_max_pixels: max,
+            image_mean: [0.5; 3],
+            image_std: [0.5; 3],
+        };
+        assert!(hp(token).validate().is_ok(), "{projector:?}");
+        assert!(hp(token - 1).validate().is_err(), "{projector:?}");
+        assert!(hp(patch * patch - 1).validate().is_err(), "{projector:?}");
+    }
+    assert!(glm5_canvas(10, 10, 28, 1, 783).is_err());
+    assert_eq!(glm5_canvas(10, 10, 28, 1, 784).unwrap(), (28, 28));
+    assert_eq!(glm5_canvas(100, 1, 28, 784, 784).unwrap(), (28, 28));
+}
+
 /// A fixed image on the tiny tower (factor 12, 576 to 9,216 pixels): a 32 × 20 white image keeps
 /// its size at the top left of a 36 × 24 canvas, black (normalized) on the right and below; a
 /// 9 × 5 one, under the floor, grows to 36 × 20 on the same canvas.

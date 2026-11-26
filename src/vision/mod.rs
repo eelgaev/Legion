@@ -141,6 +141,9 @@ impl VisionHparams {
     }
 
     pub(super) fn validate(&self) -> Result<(), VisionError> {
+        // Every tower's canvas is whole merged patches (`patch_size × spatial_merge_size` a
+        // side), so a pixel budget under one of them fits no image at all.
+        let token = u64::from(self.patch_size) * u64::from(self.spatial_merge_size);
         if self.patch_size == 0
             || self.spatial_merge_size == 0
             || self
@@ -149,6 +152,7 @@ impl VisionHparams {
                 .is_none_or(|v| v > 65536)
             || self.image_min_pixels == 0
             || self.image_max_pixels < self.image_min_pixels
+            || u64::from(self.image_max_pixels) < token * token
             || self.image_max_pixels > i32::MAX as u32
         {
             return Err(VisionError::Metadata(

@@ -117,7 +117,7 @@ impl Dims {
     /// probabilities (F16) for every head within [`ATTN_BUDGET`], a multiple of [`TILE`] when
     /// that fits.
     fn chunk(&self, n: usize, kpad: usize) -> usize {
-        let per = ATTN_BUDGET / (self.heads * kpad * 6);
+        let per = ATTN_BUDGET / (self.heads * kpad * 6).max(1);
         if per >= TILE {
             per / TILE * TILE
         } else {
@@ -185,9 +185,10 @@ impl Dims {
     /// the largest grid's. Every region but the attention's grows with the patch count, but
     /// the chunk does not: a smaller grid's chunk can round up to more queries, so its
     /// `chunk × kpad` can pass the largest grid's. A grid's patches are a multiple of 4 (an
-    /// even width and height); the largest count is taken too, with all `max_px` pixels.
+    /// even width and height); the largest count is taken too, with all `max_px` pixels, and
+    /// never fewer than one merged patch's 4 (the hparams refuse a budget under that).
     fn scratch_bound(&self, max_px: usize, patch: usize, d_head: usize) -> usize {
-        let n_max = max_px / (patch * patch);
+        let n_max = (max_px / (patch * patch).max(1)).max(4);
         // A rotation table of at most one row per patch.
         let at = |n: usize, n_pix: usize| self.scratch(n, n_pix, n * d_head / 2).total;
         (4..=n_max)
@@ -558,9 +559,11 @@ impl GlmGpu {
             return Err(VisionError::Dimensions);
         }
         let (w_px, h_px) = (p.width as usize, p.height as usize);
+        // Within the pixel budget too, which the scratch is reserved for (`scratch_bytes`).
         if w_px != gx * c.patch_size
             || h_px != gy * c.patch_size
             || p.pixels.len() != 3 * w_px * h_px
+            || w_px * h_px > self.hp.image_max_pixels as usize
         {
             return Err(VisionError::Dimensions);
         }
