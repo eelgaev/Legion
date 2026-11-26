@@ -77,7 +77,7 @@ fn scratch_bound_of_the_real_tower_is_its_largest_grid() {
 }
 
 /// A pixel budget under one patch (the hparams refuse it) still gives a bound, the scratch of
-/// one merged patch, and no chunk divides by zero keys.
+/// one merged patch, and a chunk of zero keys does not divide by zero.
 #[test]
 fn scratch_bound_under_one_patch_is_one_merged_patch() {
     let dims = Dims {
@@ -90,7 +90,9 @@ fn scratch_bound_under_one_patch_is_one_merged_patch() {
         mff: 32,
         n_out: 32,
     };
-    assert!(dims.chunk(0, 0) >= 1);
+    // No patches give no queries, without dividing by zero keys; one merged patch takes one.
+    assert_eq!(dims.chunk(0, 0), 0);
+    assert!(dims.chunk(4, 8) >= 1);
     let bound = dims.scratch_bound(10, 6, 8);
     assert_eq!(bound, dims.scratch_bound(4 * 36, 6, 8));
     assert!(bound >= dims.scratch(4, 3 * 4 * 36, 2 * 8 / 2).total);
