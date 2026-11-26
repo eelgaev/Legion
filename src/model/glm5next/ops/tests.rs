@@ -1709,20 +1709,20 @@ fn cuda_q6k_set_and_split_pmax_give_the_same_bits() {
         let w: Vec<f32> = noise(k * m, seed).iter().map(|v| v * 0.5).collect();
         Data::Raw(types::Q6_K, crate::ggml::quantize(types::Q6_K, &w, k))
     };
+    let shapes = ms.map(|m| [k as i64, m as i64]);
     for n in [1usize, 2, 3, 4, 7] {
+        let xs = [k as i64, n as i64];
+        let x = || Data::F32(noise(k * n, 204 + n as u64));
         let inputs = [
-            (&[k as i64, ms[0] as i64][..], q6(ms[0], 201)),
-            (&[k as i64, ms[1] as i64][..], q6(ms[1], 202)),
-            (&[k as i64, ms[2] as i64][..], q6(ms[2], 203)),
-            (
-                &[k as i64, n as i64][..],
-                Data::F32(noise(k * n, 204 + n as u64)),
-            ),
+            (&shapes[0][..], q6(ms[0], 201)),
+            (&shapes[1][..], q6(ms[1], 202)),
+            (&shapes[2][..], q6(ms[2], 203)),
+            (&xs[..], x()),
         ];
         for g in 0..3 {
-            let want = run_on(&mut gpu, &inputs, |ctx, t| {
-                linear(ctx, t[g], t[3], 1.0, None)
-            });
+            // Only the product's own inputs: an input the graph does not use gets no memory.
+            let own = [(&shapes[g][..], q6(ms[g], 201 + g as u64)), (&xs[..], x())];
+            let want = run_on(&mut gpu, &own, |ctx, t| linear(ctx, t[0], t[1], 1.0, None));
             let got = run_on(&mut gpu, &inputs, |ctx, t| {
                 assert!(linear_set_q6k_takes(&t[..3], t[3]));
                 linear_set_q6k(ctx, &t[..3], t[3])[g]
