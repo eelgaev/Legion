@@ -67,6 +67,80 @@ pub fn force_nt(nt: i32) {
     FORCE_NT.store(nt, Ordering::Relaxed);
 }
 
+/// The kernel's options (#1183, `src/cuda/sm80/hc_down.cuh`'s RS and LI): the same B values in
+/// the same products in the same order with any of them, so the same bits. Each stage's B tile
+/// rebuilt once in shared memory, each thread its own 16-byte chunk after its own copies land,
+/// instead of in registers by each of the 4 warps that read those tokens.
+pub const OPT_SHARED_REBUILD: i32 = 1;
+/// The next stage's `cp.async` copies issued after a step's first k16 products instead of right
+/// after the step's barrier.
+pub const OPT_LATE_COPIES: i32 = 2;
+/// Every option bit.
+pub const OPT_ALL: i32 = OPT_SHARED_REBUILD | OPT_LATE_COPIES;
+/// The options on by default (`legion serve --no-hc-down-shared-rebuild` and
+/// `--no-hc-down-late-copies` turn them off).
+pub const DEFAULT_OPTS: i32 = OPT_SHARED_REBUILD | OPT_LATE_COPIES;
+
+/// The options the launches run with ([`set_shared_rebuild`], [`set_late_copies`]).
+static OPTS: AtomicI32 = AtomicI32::new(DEFAULT_OPTS);
+
+/// The options [`force_opts`] forces, or -1.
+static FORCED_OPTS: AtomicI32 = AtomicI32::new(-1);
+
+/// The last launch's tile and options (`nt << 4 | options`; 0: none since [`clear_last_launch`]).
+static LAST_LAUNCH: AtomicI32 = AtomicI32::new(0);
+
+fn set_opt(bit: i32, on: bool) {
+    if on {
+        OPTS.fetch_or(bit, Ordering::Relaxed);
+    } else {
+        OPTS.fetch_and(!bit, Ordering::Relaxed);
+    }
+}
+
+/// Sets whether the kernel rebuilds each stage's B tile once in shared memory
+/// ([`OPT_SHARED_REBUILD`]; on by default, the same bits either way).
+pub fn set_shared_rebuild(on: bool) {
+    set_opt(OPT_SHARED_REBUILD, on);
+}
+
+/// Sets whether the kernel issues the next stage's copies after a step's first products
+/// ([`OPT_LATE_COPIES`]; on by default, the same bits either way).
+pub fn set_late_copies(on: bool) {
+    set_opt(OPT_LATE_COPIES, on);
+}
+
+/// Forces the kernel's options ([`OPT_ALL`] bits) for the launches from now on (`legion
+/// hc-down-bench`, tests); `None` goes back to the configured ones.
+#[doc(hidden)]
+pub fn force_opts(opts: Option<i32>) {
+    FORCED_OPTS.store(opts.map_or(-1, |o| o & OPT_ALL), Ordering::Relaxed);
+}
+
+/// The options launches run with now: forced ([`force_opts`]) or configured.
+pub fn opts() -> i32 {
+    match FORCED_OPTS.load(Ordering::Relaxed) {
+        o if o >= 0 => o,
+        _ => OPTS.load(Ordering::Relaxed),
+    }
+}
+
+/// The token tile and options of the last launch since [`clear_last_launch`], if any (for
+/// `legion hc-down-bench` and the tests, which check what ran).
+#[doc(hidden)]
+pub fn last_launch() -> Option<(i32, i32)> {
+    match LAST_LAUNCH.load(Ordering::Relaxed) {
+        0 => None,
+        v => Some((v >> 4, v & 0xf)),
+    }
+}
+
+/// Forgets the last launch ([`last_launch`] is `None` until the next one).
+#[doc(hidden)]
+pub fn clear_last_launch() {
+    LAST_LAUNCH.store(0, Ordering::Relaxed);
+}
+
 /// The token tile for `n` tokens on `sms` SMs: the fewest waves of CTAs times a CTA's cost,
 /// taken as `nt + 2` (the products grow with the tile, the weight's loads and fragments do not),
 /// the smaller tile on ties. One CTA per SM (its shared memory).
@@ -227,7 +301,11 @@ mod cuda {
     use std::os::raw::{c_int, c_void};
     use std::sync::atomic::{AtomicU8, Ordering};
 
-    use super::{BK, HC, M, ffi};
+    use super::{BK, HC, M, OPT_ALL, ffi};
+
+    /// Option forms of each tile size (`HD_FORMS`): a kernel's index is `(nt - 2) · FORMS +
+    /// options`.
+    const FORMS: usize = 4;
 
     /// `legion_hc_down` (src/cuda/hc_down.cu).
     #[repr(C)]
@@ -277,8 +355,8 @@ mod cuda {
     const THREADS: u32 = 512;
 
     unsafe extern "C" {
-        /// The GEMM for NT = 2, 3 and 4.
-        static legion_hc_down_kernels: [*const c_void; 3];
+        /// The GEMM for NT = 2, 3 and 4, each in its [`FORMS`] option forms.
+        static legion_hc_down_kernels: [*const c_void; 3 * FORMS];
         static legion_hc_down_smem: [c_int; 3];
         fn cudaLaunchKernel(
             func: *const c_void,
@@ -327,8 +405,11 @@ mod cuda {
                     && a.binary_version >= 80
                     // PTX built for sm_70 holds the __trap() body even when JIT-built for 12.x.
                     && a.ptx_version >= 80
-                    && cudaFuncSetAttribute(f, FUNC_ATTR_MAX_DYNAMIC_SMEM, legion_hc_down_smem[i])
-                        == 0;
+                    && cudaFuncSetAttribute(
+                        f,
+                        FUNC_ATTR_MAX_DYNAMIC_SMEM,
+                        legion_hc_down_smem[i / FORMS],
+                    ) == 0;
                 if ok {
                     // A hint; the kernels run without it.
                     cudaFuncSetAttribute(f, FUNC_ATTR_CARVEOUT, CARVEOUT_MAX_SHARED);
@@ -400,6 +481,7 @@ mod cuda {
             }
             let sms = crate::hw::per_device::current().map_or(0, crate::hw::per_device::sm_count);
             let nt = super::pick_nt(n, i64::from(sms));
+            let opts = super::opts() & OPT_ALL;
             let i = (nt - 2) as usize;
             let mut p = Params {
                 w: w.data as *const c_void,
@@ -430,14 +512,17 @@ mod cuda {
             let mut args = [(&mut p as *mut Params).cast::<c_void>()];
             // SAFETY: the kernel takes one argument of type `Params`; the launch copies it.
             match cudaLaunchKernel(
-                legion_hc_down_kernels[i],
+                legion_hc_down_kernels[i * FORMS + opts as usize],
                 grid,
                 block,
                 args.as_mut_ptr(),
                 legion_hc_down_smem[i] as usize,
                 stream,
             ) {
-                0 => Ok(()),
+                0 => {
+                    super::LAST_LAUNCH.store((nt << 4) | opts, Ordering::Relaxed);
+                    Ok(())
+                }
                 e => Err(format!("hc_down: CUDA error {e}")),
             }
         }

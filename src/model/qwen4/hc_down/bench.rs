@@ -8,7 +8,10 @@
 //! hc-down-bench` subcommand (a build tree's binary on the GPU box).
 
 use super::super::hc_norm;
-use super::{M, force_nt, mul_mat};
+use super::{
+    M, OPT_ALL, OPT_LATE_COPIES, OPT_SHARED_REBUILD, clear_last_launch, force_nt, force_opts,
+    last_launch, mul_mat, pick_nt,
+};
 use crate::ggml::{Backend, ComputeAllocator, Context, Graph, Tensor, types};
 use crate::model::nvfp4_mm::bf16_bits;
 
@@ -362,4 +365,149 @@ pub fn check(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Check>, String> {
         }
     }
     Ok(out)
+}
+
+/// The kernel's option forms [`ab`] takes by name: the old form (`none`) and each same-bits
+/// option set (`src/cuda/sm80/hc_down.cuh`'s RS and LI).
+pub const FORMS: [(&str, i32); 4] = [
+    ("none", 0),
+    ("rs", OPT_SHARED_REBUILD),
+    ("li", OPT_LATE_COPIES),
+    ("rs+li", OPT_ALL),
+];
+
+/// The option bits of form `name` ([`FORMS`]).
+pub fn form(name: &str) -> Option<i32> {
+    FORMS.iter().find(|(n, _)| *n == name).map(|&(_, o)| o)
+}
+
+/// The name of option bits `opts` ([`FORMS`]).
+pub fn form_name(opts: i32) -> &'static str {
+    FORMS
+        .iter()
+        .find(|(_, o)| *o == opts)
+        .map_or("?", |&(n, _)| n)
+}
+
+/// One form at one token count of [`ab`].
+#[derive(Clone, Debug)]
+pub struct AbRow {
+    pub tokens: i64,
+    /// The token tile that ran (checked after every run).
+    pub nt: i32,
+    /// The option bits that ran (checked after every run).
+    pub opts: i32,
+    /// Median and best time per call over the rounds (seconds).
+    pub median: f64,
+    pub min: f64,
+    /// The old form's median over this one's (above 1: faster).
+    pub speedup: f64,
+}
+
+fn median(v: &mut [f64]) -> f64 {
+    v.sort_by(f64::total_cmp);
+    let n = v.len();
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        0.5 * (v[n / 2 - 1] + v[n / 2])
+    }
+}
+
+/// The down matmul alone at every token count of `cfg`: the old form (no options) against each
+/// option form of `forms` ([`FORMS`] bits), [`Config::copies`] calls a graph on one step's streams
+/// with down weights of their own. Every round runs each form once, the order reversed every
+/// other round (old first, then old last); a first round warms up. The tile is `nt` (2, 3 or 4)
+/// or, 0, the step size's. After every run the tile and options that launched must be the ones
+/// asked for, else an error. Configured options and tile are back afterwards.
+pub fn ab(gpu: &mut Backend, cfg: &Config, forms: &[i32], nt: i32) -> Result<Vec<AbRow>, String> {
+    check_config(cfg)?;
+    if !(nt == 0 || (2..=4).contains(&nt)) {
+        return Err(format!("tile {nt}: 0, 2, 3 or 4"));
+    }
+    let mut all = vec![0];
+    for &o in forms {
+        let o = o & OPT_ALL;
+        if !all.contains(&o) {
+            all.push(o);
+        }
+    }
+    let k = cfg.e * 4;
+    let sms = crate::hw::per_device::sm_count(crate::hw::per_device::current().unwrap_or(0));
+    let wctx = Context::new(3 * cfg.copies + 4, 0);
+    let w = weights(&wctx, gpu, cfg)?;
+    let g = w.sets[0][0];
+    let mut rows = Vec::new();
+    for &n in &cfg.tokens {
+        let ctx = Context::new(2 * cfg.copies + 16, 2 * cfg.copies + 16);
+        // The inputs also marked as outputs, as [`inputs`]' (the graph runs again unfilled).
+        let res = ctx
+            .new_tensor(types::BF16, &[cfg.e, 4, n])
+            .as_input()
+            .as_output();
+        let sc = ctx.new_tensor(types::F32, &[4, n]).as_input().as_output();
+        let mut graph = ctx.new_graph(2 * cfg.copies + 16);
+        for set in &w.sets {
+            graph.expand(mul_mat(&ctx, set[2], res, sc, g).as_output());
+        }
+        ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+            .map_err(|e| e.to_string())?;
+        res.set_bytes(&bf16_bytes(
+            noise((k * n) as usize, 91).into_iter().map(|v| 4.0 * v),
+        ));
+        sc.set_f32(
+            &noise((4 * n) as usize, 94)
+                .iter()
+                .map(|v| 0.25 + v.abs())
+                .collect::<Vec<_>>(),
+        );
+        let want_nt = if nt == 0 {
+            pick_nt(n, i64::from(sms))
+        } else {
+            nt
+        };
+        let mut times = vec![Vec::new(); all.len()];
+        for round in 0..=cfg.rounds {
+            let order: Vec<usize> = if round % 2 == 0 {
+                (0..all.len()).collect()
+            } else {
+                (0..all.len()).rev().collect()
+            };
+            for fi in order {
+                let o = all[fi];
+                force_nt(nt);
+                force_opts(Some(o));
+                clear_last_launch();
+                let t = std::time::Instant::now();
+                let r = gpu.compute(&graph);
+                let secs = t.elapsed().as_secs_f64();
+                let ran = last_launch();
+                force_nt(0);
+                force_opts(None);
+                r.map_err(|e| format!("{n} tokens {}: {e}", form_name(o)))?;
+                if ran != Some((want_nt, o)) {
+                    return Err(format!(
+                        "{n} tokens: asked for tile {want_nt} {}, launched {ran:?}",
+                        form_name(o)
+                    ));
+                }
+                if round > 0 {
+                    times[fi].push(secs / cfg.copies as f64);
+                }
+            }
+        }
+        let base = median(&mut times[0].clone());
+        for (fi, t) in times.iter_mut().enumerate() {
+            let med = median(t);
+            rows.push(AbRow {
+                tokens: n,
+                nt: want_nt,
+                opts: all[fi],
+                median: med,
+                min: t.iter().copied().fold(f64::MAX, f64::min),
+                speedup: base / med,
+            });
+        }
+    }
+    Ok(rows)
 }

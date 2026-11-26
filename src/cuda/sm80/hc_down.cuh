@@ -6,7 +6,8 @@
 //   stored) and gamma go through HD_STAGES shared-memory stages of HD_BK k values (64-byte
 //   rows, 16-byte chunks swizzled by hd_swz);
 // - B fragments rebuilt after ldmatrix as hc_post_norm_b16_kernel makes xnb:
-//   __floats2bfloat162_rn(__fmul_rn(__fmul_rn(v, scale), g)) per value;
+//   __floats2bfloat162_rn(__fmul_rn(__fmul_rn(v, scale), g)) per value (with the RS option the
+//   same values, rebuilt once per stage in shared memory before the ldmatrix);
 // - every output is one chain of m16n8k16 over k = 0, 16, 32, ... from a zero sum.
 //
 // Not a standalone header: hc_down.cu includes it inside its anonymous namespace, after
@@ -27,6 +28,12 @@ __device__ __forceinline__ void hd_commit() {
 template <int N>
 __device__ __forceinline__ void hd_wait() {
     asm volatile("cp.async.wait_group %0;" ::"n"(N));
+}
+
+// The same wait as a compiler memory barrier (RS reads its own copies with plain loads after it).
+template <int N>
+__device__ __forceinline__ void hd_wait_mem() {
+    asm volatile("cp.async.wait_group %0;" ::"n"(N) : "memory");
 }
 
 __device__ __forceinline__ void hd_ldsm_x4(uint32_t (&r)[4], const void * p) {
@@ -61,7 +68,17 @@ __device__ __forceinline__ uint32_t hd_rebuild(uint32_t v, float s, float2 g) {
 
 // Grid ceil(n / (32 * NT)), HD_THREADS threads, hd_smem(NT) bytes of dynamic shared memory.
 // m == HD_M, k a multiple of HD_BK, e a multiple of HD_BK dividing k.
-template <int NT>
+//
+// Options (#1183, hc_down.cu's HD_OPT_*; the same B values reach the same m16n8k16 chain in the
+// same order with any of them, so the same bits):
+// - RS: each stage's B tile is rebuilt once, in shared memory, by the threads that copied it (one
+//   16-byte chunk each), at the end of the step before it is read, instead of in registers by each
+//   of the 4 warps that read the same tokens, after their ldmatrix. The step then goes from the
+//   barrier straight to ldmatrix and mma, and the rebuild runs while the step's mma drain. Gamma
+//   comes from global memory (L1) and each thread's token scale stays in a register.
+// - LI: the next stage's cp.async are issued after the step's first k16 products instead of right
+//   after the barrier, so the copies' issue does not delay the step's first ldmatrix and mma.
+template <int NT, bool RS = false, bool LI = false>
 __global__ void __launch_bounds__(HD_THREADS, 1) hc_down_gemm(const legion_hc_down p) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     constexpr int CPR = HD_BK / 8;               // 16-byte chunks a row (4: hd_swz's rows)
@@ -102,9 +119,43 @@ __global__ void __launch_bounds__(HD_THREADS, 1) hc_down_gemm(const legion_hc_do
                 hd_cp16(xs + hd_swz(r, c), p.x + tok * p.x_ld + k0 + c * 8);
             }
         }
-        if (t < G_CH) {
-            hd_cp16(gs + t, p.g + k0 + t * 4);
+        if constexpr (!RS) {
+            if (t < G_CH) {
+                hd_cp16(gs + t, p.g + k0 + t * 4);
+            }
         }
+    };
+    // The copies of the stage HD_STAGES - 1 steps after step kt into the stage step kt - 1 read
+    // (free once every thread is past step kt's barrier), as one group (empty past the last).
+    auto issue = [&](int kt) {
+        if (kt + HD_STAGES - 1 < nk) {
+            load((kt + HD_STAGES - 1) % HD_STAGES, kt + HD_STAGES - 1);
+        }
+        hd_commit();
+    };
+
+    // RS: the B chunk this thread copies every stage (load's u == t: token row own_r, k values
+    // own_c * 8 + 0..7 of the stage), its token's norm scales and gamma's 8 values there.
+    static_assert(!RS || B_CH <= HD_THREADS, "RS: one B chunk a thread at most");
+    [[maybe_unused]] const bool own = t < B_CH;
+    [[maybe_unused]] const int own_r = t / CPR, own_c = t % CPR;
+    [[maybe_unused]] const float * own_sc = p.sc + (int64_t) min(n0 + own_r, p.n - 1) * p.sc_ld;
+    [[maybe_unused]] auto own_gamma = [&](int kt, float4 & ga, float4 & gb) {
+        const float4 * gp = reinterpret_cast<const float4 *>(p.g + (int64_t) kt * HD_BK + own_c * 8);
+        ga = __ldg(gp);
+        gb = __ldg(gp + 1);
+    };
+    // RS: this thread's chunk of stage `stage` rebuilt in place: each BF16 pair (the lower k in
+    // the low half) as hd_rebuild with the token's scale s and gamma at its two k values, the
+    // values the B fragments of the register form get.
+    [[maybe_unused]] auto own_rebuild = [&](int stage, float s, const float4 & ga, const float4 & gb) {
+        uint4 * v = hd_sm + stage * STAGE + A_CH + hd_swz(own_r, own_c);
+        uint4   x = *v;
+        x.x = hd_rebuild(x.x, s, make_float2(ga.x, ga.y));
+        x.y = hd_rebuild(x.y, s, make_float2(ga.z, ga.w));
+        x.z = hd_rebuild(x.z, s, make_float2(gb.x, gb.y));
+        x.w = hd_rebuild(x.w, s, make_float2(gb.z, gb.w));
+        *v = x;
     };
 
     float acc[MI][NT][4];
@@ -119,8 +170,10 @@ __global__ void __launch_bounds__(HD_THREADS, 1) hc_down_gemm(const legion_hc_do
         }
     }
     // The norm scale of each of the lane's tokens (token g of every n8 tile) for the stream the
-    // stage's k values belong to.
-    float scl[NT];
+    // stage's k values belong to (the register form).
+    [[maybe_unused]] float scl[NT];
+    // RS: the scale of this thread's token for the stream of the stage it rebuilds next.
+    [[maybe_unused]] float own_s = 0.0f;
 
 #pragma unroll
     for (int s = 0; s < HD_STAGES - 1; s++) {
@@ -129,30 +182,56 @@ __global__ void __launch_bounds__(HD_THREADS, 1) hc_down_gemm(const legion_hc_do
         }
         hd_commit();
     }
+    if constexpr (RS) {
+        // Stage 0's chunk, once this thread's copies of it (the oldest group) are done.
+        hd_wait_mem<HD_STAGES - 2>();
+        if (own) {
+            float4 ga, gb;
+            own_gamma(0, ga, gb);
+            own_s = own_sc[0];
+            own_rebuild(0, own_s, ga, gb);
+        }
+    }
     for (int kt = 0; kt < nk; kt++) {
-        if (kt % steps == 0) {
-            const int h = kt / steps;
+        if constexpr (!RS) {
+            if (kt % steps == 0) {
+                const int h = kt / steps;
 #pragma unroll
-            for (int j = 0; j < NT; j++) {
-                const int64_t tok = min(n0 + wn * 8 * NT + j * 8 + g, p.n - 1);
-                scl[j] = p.sc[tok * p.sc_ld + h];
+                for (int j = 0; j < NT; j++) {
+                    const int64_t tok = min(n0 + wn * 8 * NT + j * 8 + g, p.n - 1);
+                    scl[j] = p.sc[tok * p.sc_ld + h];
+                }
+            }
+            hd_wait<HD_STAGES - 2>();
+        }
+        // RS: every thread's copies of this stage were waited for (and its B chunk rebuilt) at
+        // the end of the step before.
+        __syncthreads();
+        if constexpr (!LI) {
+            issue(kt);
+        }
+        // RS: gamma (and at a stream's start the scale) for the next stage's chunk, ahead of the
+        // products.
+        [[maybe_unused]] float4 nga = make_float4(0.0f, 0.0f, 0.0f, 0.0f), ngb = nga;
+        if constexpr (RS) {
+            if (own && kt + 1 < nk) {
+                own_gamma(kt + 1, nga, ngb);
+                if ((kt + 1) % steps == 0) {
+                    own_s = own_sc[(kt + 1) / steps];
+                }
             }
         }
-        hd_wait<HD_STAGES - 2>();
-        __syncthreads();
-        // The stage read in the step before is free for the step HD_STAGES - 1 ahead.
-        if (kt + HD_STAGES - 1 < nk) {
-            load((kt + HD_STAGES - 1) % HD_STAGES, kt + HD_STAGES - 1);
-        }
-        hd_commit();
         const uint4 * ws = hd_sm + (kt % HD_STAGES) * STAGE;
         const uint4 * xs = ws + A_CH;
-        const float2 * gs = reinterpret_cast<const float2 *>(xs + B_CH);
+        [[maybe_unused]] const float2 * gs = reinterpret_cast<const float2 *>(xs + B_CH);
 #pragma unroll
         for (int kk = 0; kk < HD_BK / 16; kk++) {
             // gamma at the lane's k values: kk * 16 + 2q, + 1 (b[.][0]) and + 8, + 9 (b[.][1])
-            const float2 g0 = gs[kk * 8 + q];
-            const float2 g1 = gs[kk * 8 + 4 + q];
+            [[maybe_unused]] float2 g0, g1;
+            if constexpr (!RS) {
+                g0 = gs[kk * 8 + q];
+                g1 = gs[kk * 8 + 4 + q];
+            }
             uint32_t b[NT][2];
 #pragma unroll
             for (int j = 0; j + 1 < NT; j += 2) {
@@ -171,10 +250,12 @@ __global__ void __launch_bounds__(HD_THREADS, 1) hc_down_gemm(const legion_hc_do
                 b[NT - 1][0] = r2[0];
                 b[NT - 1][1] = r2[1];
             }
+            if constexpr (!RS) {
 #pragma unroll
-            for (int j = 0; j < NT; j++) {
-                b[j][0] = hd_rebuild(b[j][0], scl[j], g0);
-                b[j][1] = hd_rebuild(b[j][1], scl[j], g1);
+                for (int j = 0; j < NT; j++) {
+                    b[j][0] = hd_rebuild(b[j][0], scl[j], g0);
+                    b[j][1] = hd_rebuild(b[j][1], scl[j], g1);
+                }
             }
             // Per output the k steps of 16 in order: one chain from 0.
 #pragma unroll
@@ -186,6 +267,20 @@ __global__ void __launch_bounds__(HD_THREADS, 1) hc_down_gemm(const legion_hc_do
                 for (int j = 0; j < NT; j++) {
                     hd_mma(acc[i][j], a, b[j][0], b[j][1]);
                 }
+            }
+            if constexpr (LI) {
+                if (kk == 0) {
+                    issue(kt);
+                }
+            }
+        }
+        if constexpr (RS) {
+            // This thread's copies of the next stage (the group before the newest) are done: its
+            // chunk rebuilt in place while the step's products drain, published by the next
+            // step's barrier. Nobody reads that stage in this step.
+            hd_wait_mem<HD_STAGES - 2>();
+            if (own && kt + 1 < nk) {
+                own_rebuild((kt + 1) % HD_STAGES, own_s, nga, ngb);
             }
         }
     }

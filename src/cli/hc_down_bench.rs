@@ -2,7 +2,8 @@
 //! with BF16 streams (#1183): main's path (the norm writes the BF16 xn, cuBLAS reads it) against
 //! the down matmul that rebuilds xn from the streams, timed on one GPU (a development tool, so a
 //! build tree's release binary can measure the box it runs on; pick the GPU with
-//! `CUDA_VISIBLE_DEVICES`). `--check` compares the rebuilt values with the norm's xn instead.
+//! `CUDA_VISIBLE_DEVICES`). `--check` compares the rebuilt values with the norm's xn instead;
+//! `--ab` times the down matmul kernel's same-bits option forms against its old form.
 
 use clap::Args;
 use legion::model::qwen4::hc_down::MIN_TOKENS;
@@ -10,7 +11,8 @@ use legion::model::qwen4::hc_down::bench::{self, Config};
 
 #[derive(Args)]
 pub struct HcDownBenchArgs {
-    /// Token counts of the step, comma separated (default 4096 and 3971).
+    /// Token counts of the step, comma separated (default 4096 and 3971; with --ab 12288 and
+    /// 8067, a 32K prompt's steps and tail).
     #[arg(long, value_delimiter = ',')]
     tokens: Vec<i64>,
     /// Mixers per timed graph, chained, each with a down weight of its own.
@@ -24,6 +26,19 @@ pub struct HcDownBenchArgs {
     /// value.
     #[arg(long)]
     check: bool,
+    /// Time the down matmul kernel alone instead: its old form (no options) against each form
+    /// of --variants, taking turns call by call (the order reversed every other round); prints
+    /// the median and best time per call and the speedup of the medians. Fails if a run
+    /// launched another tile or form than asked for.
+    #[arg(long)]
+    ab: bool,
+    /// --ab's forms, comma separated: none, rs (B rebuilt once in shared memory), li (late
+    /// copies), rs+li.
+    #[arg(long, value_delimiter = ',', default_value = "rs,li,rs+li")]
+    variants: Vec<String>,
+    /// --ab's token tile (2, 3 or 4 n8 tiles a warp; 0: the step size's).
+    #[arg(long, default_value_t = 0)]
+    nt: i32,
 }
 
 pub fn run(args: HcDownBenchArgs) -> anyhow::Result<()> {
@@ -35,6 +50,35 @@ pub fn run(args: HcDownBenchArgs) -> anyhow::Result<()> {
     };
     if !args.tokens.is_empty() {
         cfg.tokens = args.tokens.clone();
+    } else if args.ab {
+        cfg.tokens = vec![12288, 8067];
+    }
+    if args.ab {
+        let forms = args
+            .variants
+            .iter()
+            .map(|v| {
+                bench::form(v.trim())
+                    .ok_or_else(|| anyhow::anyhow!("unknown form {v} (none, rs, li, rs+li)"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let rows = bench::ab(&mut gpu, &cfg, &forms, args.nt).map_err(anyhow::Error::msg)?;
+        println!(
+            "{:>6} {:>3} {:<6} {:>10} {:>10} {:>8}",
+            "tokens", "nt", "form", "median µs", "min µs", "speedup"
+        );
+        for r in &rows {
+            println!(
+                "{:>6} {:>3} {:<6} {:>10.1} {:>10.1} {:>8.3}",
+                r.tokens,
+                r.nt,
+                bench::form_name(r.opts),
+                r.median * 1e6,
+                r.min * 1e6,
+                r.speedup
+            );
+        }
+        return Ok(());
     }
     if args.check {
         let checks = bench::check(&mut gpu, &cfg).map_err(anyhow::Error::msg)?;

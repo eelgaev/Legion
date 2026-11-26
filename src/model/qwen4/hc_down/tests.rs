@@ -275,3 +275,197 @@ fn cuda_rebuilt_down_reads_xnb() {
     }
     force_nt(0);
 }
+
+/// The kernel's options: forced ones masked to [`OPT_ALL`], `None` back to the configured ones;
+/// the last launch's tile and options read back as stored.
+#[test]
+fn kernel_options_force_and_read_back() {
+    assert_eq!(DEFAULT_OPTS & !OPT_ALL, 0);
+    assert_eq!(OPT_SHARED_REBUILD & OPT_LATE_COPIES, 0);
+    let configured = opts();
+    force_opts(Some(OPT_LATE_COPIES));
+    assert_eq!(opts(), OPT_LATE_COPIES);
+    force_opts(Some(0xff));
+    assert_eq!(opts(), OPT_ALL);
+    force_opts(Some(0));
+    assert_eq!(opts(), 0);
+    force_opts(None);
+    assert_eq!(opts(), configured);
+    LAST_LAUNCH.store((4 << 4) | OPT_SHARED_REBUILD, Ordering::Relaxed);
+    assert_eq!(last_launch(), Some((4, OPT_SHARED_REBUILD)));
+    clear_last_launch();
+    assert_eq!(last_launch(), None);
+}
+
+/// BF16 bytes of `n` deterministic values in [-scale, scale), made without an F32 copy (the
+/// 12,288-token streams are 126M values).
+#[cfg(feature = "cuda")]
+fn bf16_noise(n: usize, seed: u64, scale: f32) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut out = Vec::with_capacity(2 * n);
+    for _ in 0..n {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let v = ((x >> 40) as f32 / (1u64 << 23) as f32 - 1.0) * scale;
+        out.extend_from_slice(&bf16_bits(v).to_ne_bytes());
+    }
+    out
+}
+
+/// Every option form of the kernel (#1183: RS, LI and both) against the old form (no options),
+/// bit for bit, at the step sizes the one-Spark NVFP4 docs command's 32K prompt runs (12,288-token
+/// steps, the 8,067-token tail; 129 and 1 tokens for partial tiles, below where the model takes
+/// the kernel), with every token tile and the one chosen by step size. The output is poisoned
+/// (all ones, a NaN) before every run, so a store the kernel skips fails; each run checks that
+/// the kernel and options it asked for ran. All tiles also agree with each other (one chain over
+/// k per output).
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_kernel_option_forms_are_the_old_bits() {
+    use crate::ggml::{DeviceKind, device_by_kind};
+    let mut gpu = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU device")
+        .init()
+        .unwrap();
+    if !crate::model::fp8::bf16_mma() || !supported_on(0) {
+        println!("no sm_80+ kernel here: skipped");
+        return;
+    }
+    let (e, hc) = (2560i64, 4i64);
+    let k = e * hc;
+    let sms = crate::hw::per_device::sm_count(crate::hw::per_device::current().unwrap_or(0));
+    for n in [12288i64, 8067, 129, 1] {
+        let ctx = Context::new(16, 16);
+        let res = ctx.new_tensor(types::BF16, &[e, hc, n]).as_input();
+        let sc = ctx.new_tensor(types::F32, &[hc, n]).as_input();
+        let g = ctx.new_tensor(types::F32, &[k]).as_input();
+        let down = ctx.new_tensor(types::BF16, &[k, M]).as_input();
+        let lo = mul_mat(&ctx, down, res, sc, g).as_output();
+        let mut graph = ctx.new_graph(16);
+        graph.expand(lo);
+        ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+            .unwrap();
+        res.set_bytes(&bf16_noise((k * n) as usize, 101, 4.0));
+        // Scales differing by token and stream, so a value scaled with another's fails.
+        sc.set_f32(
+            &noise((hc * n) as usize, 102)
+                .iter()
+                .map(|v| 0.25 + v.abs())
+                .collect::<Vec<_>>(),
+        );
+        g.set_f32(
+            &noise(k as usize, 103)
+                .iter()
+                .map(|v| 1.0 + 0.3 * v)
+                .collect::<Vec<_>>(),
+        );
+        down.set_bytes(&bf16_noise((k * M) as usize, 104, 0.02));
+        let poison = vec![0xffu8; (M * n * 4) as usize];
+        let mut first: Option<Vec<u8>> = None;
+        for nt in [0, 2, 3, 4] {
+            let want_nt = if nt == 0 {
+                pick_nt(n, i64::from(sms))
+            } else {
+                nt
+            };
+            let mut base: Option<Vec<u8>> = None;
+            for o in [0, OPT_SHARED_REBUILD, OPT_LATE_COPIES, OPT_ALL] {
+                force_nt(nt);
+                force_opts(Some(o));
+                clear_last_launch();
+                lo.set_bytes(&poison);
+                let r = gpu.compute(&graph);
+                let ran = last_launch();
+                force_nt(0);
+                force_opts(None);
+                r.unwrap();
+                assert_eq!(
+                    ran,
+                    Some((want_nt, o)),
+                    "{n} tokens, tile {nt}, options {o}: launched {ran:?}"
+                );
+                let got = lo.bytes();
+                let skipped = got
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .filter(|w| **w == [0xff; 4])
+                    .count();
+                assert_eq!(
+                    skipped, 0,
+                    "{n} tokens, tile {want_nt}, options {o}: outputs not stored"
+                );
+                match &base {
+                    None => base = Some(got),
+                    Some(b) => {
+                        let differing = got
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .zip(b.as_chunks::<4>().0)
+                            .filter(|(x, y)| x != y)
+                            .count();
+                        assert_eq!(
+                            differing, 0,
+                            "{n} tokens, tile {want_nt}, options {o}: outputs differ from the old form's"
+                        );
+                    }
+                }
+            }
+            let base = base.unwrap();
+            match &first {
+                None => first = Some(base),
+                Some(f) => assert!(
+                    *f == base,
+                    "{n} tokens: tile {want_nt} differs from the step size's tile"
+                ),
+            }
+            println!("{n} tokens, tile {want_nt}: every option form equals the old form");
+        }
+    }
+}
+
+/// The microbench of the option forms ([`bench::ab`]) at a 32K prompt's step sizes: the old form
+/// against each option form, taking turns run by run (the order reversed every other round),
+/// median, best and speedup per form; it fails if a run launched another tile or form than asked
+/// for. Prints only (`--nocapture`); `legion hc-down-bench --ab` is the same from a binary.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU; a benchmark"]
+fn cuda_kernel_option_forms_ab() {
+    use crate::ggml::{DeviceKind, device_by_kind};
+    let mut gpu = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU device")
+        .init()
+        .unwrap();
+    if !crate::model::fp8::bf16_mma() || !supported_on(0) {
+        println!("no sm_80+ kernel here: skipped");
+        return;
+    }
+    let cfg = bench::Config {
+        tokens: vec![12288, 8067],
+        copies: 8,
+        rounds: 20,
+        ..bench::Config::default()
+    };
+    let forms = [OPT_SHARED_REBUILD, OPT_LATE_COPIES, OPT_ALL];
+    let rows = bench::ab(&mut gpu, &cfg, &forms, 0).unwrap();
+    assert_eq!(rows.len(), cfg.tokens.len() * (forms.len() + 1));
+    println!("tokens nt form    median_us    min_us  speedup");
+    for r in &rows {
+        assert!(r.median > 0.0 && r.min <= r.median);
+        println!(
+            "{:>6} {:>2} {:<6} {:>10.1} {:>9.1} {:>8.3}",
+            r.tokens,
+            r.nt,
+            bench::form_name(r.opts),
+            r.median * 1e6,
+            r.min * 1e6,
+            r.speedup
+        );
+    }
+}

@@ -408,6 +408,12 @@ pub struct Switches {
     /// mixers (the NVFP4 checkpoints, [`crate::model::qwen4::set_hc_bf16`], opt-in, moves
     /// output).
     pub hc_bf16: Option<bool>,
+    /// That mode's down matmul kernel rebuilding each stage's B tile once in shared memory
+    /// ([`crate::model::qwen4::hc_down::set_shared_rebuild`], on by default, the same bits).
+    pub hc_down_shared_rebuild: Option<bool>,
+    /// That kernel issuing the next stage's copies after a step's first products
+    /// ([`crate::model::qwen4::hc_down::set_late_copies`], on by default, the same bits).
+    pub hc_down_late_copies: Option<bool>,
     /// qwen4exp's mixer gated mix also writing the block input as F16 for its Q8_0 projections
     /// on a V100 ([`crate::model::qwen4::set_mix16`]).
     pub hc_mix16: Option<bool>,
@@ -853,6 +859,11 @@ impl Switches {
         set(self.hc_xn_rebuild, qwen4::set_up_mix_rebuild);
         set(self.hc_streams_bf16, qwen4::set_streams_bf16);
         set(self.hc_bf16, qwen4::set_hc_bf16);
+        set(
+            self.hc_down_shared_rebuild,
+            qwen4::hc_down::set_shared_rebuild,
+        );
+        set(self.hc_down_late_copies, qwen4::hc_down::set_late_copies);
         set(self.hc_mix16, qwen4::set_mix16);
         set(self.hc_mix_rebuild_bf16, qwen4::set_mix_rebuild_bf16);
         set(self.hc_chain, qwen4::set_hc_chain);

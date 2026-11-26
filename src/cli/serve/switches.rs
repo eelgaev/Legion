@@ -1092,6 +1092,17 @@ pub(in crate::cli) struct SwitchArgs {
     /// steps keep F32 streams (off by default).
     #[arg(long, help_heading = HEADING)]
     hc_bf16: bool,
+    /// Steps where --hc-bf16's down matmul kernel runs (no effect elsewhere): rebuild its input
+    /// in registers in each of the 4 warps that read the same tokens, after their shared-memory
+    /// loads, instead of once per stage in shared memory by the threads that copied it (the
+    /// default: the same values in the same products, so the same output). For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_hc_down_shared_rebuild: bool,
+    /// The same kernel (see --no-hc-down-shared-rebuild): issue the next stage's copies right
+    /// after each step's barrier instead of after the step's first products (the default: the
+    /// same products, so the same output). For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_hc_down_late_copies: bool,
     /// qwen4exp prompt steps of 64+ tokens on a V100 (compute capability 7.0; no effect
     /// elsewhere): the hyper-connection mix as one op that also writes the block input as F16,
     /// which its Q8_0 projections (cuBLAS F16 GEMMs) then take with an F16 copy of their weight
@@ -1738,6 +1749,8 @@ impl SwitchArgs {
             hc_xn_rebuild: self.hc_xn_written.then_some(false),
             hc_streams_bf16: self.hc_streams_bf16.then_some(true),
             hc_bf16: self.hc_bf16.then_some(true),
+            hc_down_shared_rebuild: self.no_hc_down_shared_rebuild.then_some(false),
+            hc_down_late_copies: self.no_hc_down_late_copies.then_some(false),
             hc_mix16: self.hc_mix_f16.then_some(true),
             hc_mix_rebuild_bf16: self.hc_mix_rebuild_bf16.then_some(true),
             hc_chain: self.hc_chain_ggml.then_some(false),

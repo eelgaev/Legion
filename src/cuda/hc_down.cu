@@ -22,6 +22,12 @@
 // after ldmatrix (each value: widened, times the token's scale for the stage's stream, times
 // gamma, rounded to BF16). Every output is one chain of m16n8k16 BF16 products with F32 sums
 // over k = 0, 16, 32, ... from 0.
+//
+// Each tile size comes in four forms by two options (#1183, the same bits with any of them; see
+// the kernel): RS rebuilds each stage's B tile once in shared memory (each thread its own 16-byte
+// chunk, after its own copies land) instead of in registers by each of the 4 warps reading those
+// tokens, and LI issues the next stage's copies after the step's first k16 products instead of
+// right after the barrier.
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -61,15 +67,30 @@ __device__ __forceinline__ int hd_swz(int r, int c) {
 
 #include "sm80/hc_down.cuh"
 
+// The kernel's option forms (#1183; hc_down_gemm's RS and LI, the same bits with any of them):
+// index bit 0 RS (each stage's B tile rebuilt once in shared memory), bit 1 LI (the next stage's
+// copies issued after the step's first products); hc_down.rs's OPT_* name them.
+constexpr int HD_FORMS = 4;
+
 }  // namespace
 
 // The kernels as the CUDA runtime knows them (their host stubs), for Rust's cudaLaunchKernel
-// (src/model/qwen4/hc_down.rs): the GEMM for NT = 2, 3 and 4 (64, 96 and 128 tokens a CTA).
-extern "C" const void * const legion_hc_down_kernels[3] = {
-    reinterpret_cast<const void *>(&hc_down_gemm<2>),
-    reinterpret_cast<const void *>(&hc_down_gemm<3>),
-    reinterpret_cast<const void *>(&hc_down_gemm<4>),
+// (src/model/qwen4/hc_down.rs): the GEMM for NT = 2, 3 and 4 (64, 96 and 128 tokens a CTA), each
+// in its HD_FORMS option forms, at index (NT - 2) * HD_FORMS + the option bits.
+extern "C" const void * const legion_hc_down_kernels[3 * HD_FORMS] = {
+    reinterpret_cast<const void *>(&hc_down_gemm<2, false, false>),
+    reinterpret_cast<const void *>(&hc_down_gemm<2, true, false>),
+    reinterpret_cast<const void *>(&hc_down_gemm<2, false, true>),
+    reinterpret_cast<const void *>(&hc_down_gemm<2, true, true>),
+    reinterpret_cast<const void *>(&hc_down_gemm<3, false, false>),
+    reinterpret_cast<const void *>(&hc_down_gemm<3, true, false>),
+    reinterpret_cast<const void *>(&hc_down_gemm<3, false, true>),
+    reinterpret_cast<const void *>(&hc_down_gemm<3, true, true>),
+    reinterpret_cast<const void *>(&hc_down_gemm<4, false, false>),
+    reinterpret_cast<const void *>(&hc_down_gemm<4, true, false>),
+    reinterpret_cast<const void *>(&hc_down_gemm<4, false, true>),
+    reinterpret_cast<const void *>(&hc_down_gemm<4, true, true>),
 };
 
-// Dynamic shared memory of the kernels, NT = 2, 3, 4.
+// Dynamic shared memory of the kernels, NT = 2, 3, 4 (every form of a tile size the same).
 extern "C" const int legion_hc_down_smem[3] = { hd_smem(2), hd_smem(3), hd_smem(4) };
