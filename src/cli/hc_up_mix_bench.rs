@@ -21,7 +21,9 @@ pub struct HcUpMixBenchArgs {
     /// Variants, comma separated, instead of --kernels: KERNEL or KERNEL:OPTIONS, the options
     /// up_mix_bf16_reg's, `none` or names joined by + (pd2: the streams prefetched two tiles
     /// ahead, xs: the mix's operands staged in shared memory, ld: ldmatrix.x4, cross: the
-    /// prefetch on into the next run), e.g. `2:none,2:ld,2:ld+xs`.
+    /// prefetch on into the next run; with xs and ld, xs2: the staging double-buffered, vx: the
+    /// mix's staged operands read 16 bytes at a time; per: long runs, a few CTAs a column
+    /// block; nopf: no L2 prefetch), e.g. `2:none,2:ld,2:ld+xs,2:ld+xs+xs2+vx`.
     #[arg(long, value_delimiter = ',', value_parser = Variant::parse)]
     variants: Vec<Variant>,
     /// What --check compares every variant with (default: 1, up_mix_bf16).

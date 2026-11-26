@@ -8,8 +8,9 @@
 //! subcommand (a build tree's binary on the GPU box).
 
 use super::{
-    REG_ALL, REG_CROSS, REG_LD, REG_PD2, REG_XS, force_kernel, force_reg_opts, last_kernel,
-    last_reg_opts, set_lazy_streams, set_mix_cast, up_mix, up_mix_rebuilt,
+    REG_ALL, REG_CROSS, REG_LD, REG_NOPF, REG_PD2, REG_PER, REG_VX, REG_XS, REG_XS2, force_kernel,
+    force_reg_opts, last_kernel, last_reg_opts, set_lazy_streams, set_mix_cast, up_mix,
+    up_mix_rebuilt,
 };
 use crate::ggml::{Backend, ComputeAllocator, Context, Graph, Tensor, types};
 use crate::model::nvfp4_mm::bf16_bits;
@@ -23,11 +24,15 @@ pub struct Variant {
 }
 
 /// The option names [`Variant::parse`] takes and [`Variant`]'s `Display` writes.
-const OPT_NAMES: [(&str, i32); 4] = [
+const OPT_NAMES: [(&str, i32); 8] = [
     ("pd2", REG_PD2),
     ("xs", REG_XS),
     ("ld", REG_LD),
     ("cross", REG_CROSS),
+    ("xs2", REG_XS2),
+    ("vx", REG_VX),
+    ("per", REG_PER),
+    ("nopf", REG_NOPF),
 ];
 
 impl Variant {
@@ -36,7 +41,8 @@ impl Variant {
     }
 
     /// `K` (kernel K, the configured options) or `K:OPTS`, OPTS `none`, a number or option
-    /// names joined by `+` (`pd2`, `xs`, `ld`, `cross`): `2:ld+xs`, `1002:none`.
+    /// names joined by `+` (`pd2`, `xs`, `ld`, `cross`, `xs2`, `vx`, `per`, `nopf`): `2:ld+xs`,
+    /// `2:ld+xs+xs2+vx`, `1002:none`.
     pub fn parse(s: &str) -> Result<Self, String> {
         let (k, o) = match s.split_once(':') {
             Some((k, o)) => (k, Some(o)),
@@ -58,7 +64,10 @@ impl Variant {
                         .find(|(n, _)| *n == name)
                         .map(|&(_, bit)| acc | bit)
                         .ok_or_else(|| {
-                            format!("option {name:?} in {s:?}: none, pd2, xs, ld or cross")
+                            format!(
+                                "option {name:?} in {s:?}: none, pd2, xs, ld, cross, xs2, vx, \
+                                 per or nopf"
+                            )
                         })
                 })?,
             }),

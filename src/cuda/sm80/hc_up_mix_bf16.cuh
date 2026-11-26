@@ -225,7 +225,13 @@ __global__ void __launch_bounds__(WARPS * 32) up_mix_bf16(const legion_hc_up_mix
 // CTA's bytes), so an SM's CTAs of one run can share them in its L1. The same bytes either way.
 //
 // Options (#1183, the same bits; legion_hc_up_mix::reg_opts, hc_up_mix.cu's REG_*):
-// - pd (runtime): how many tiles ahead the streams are prefetched into L2 (1 by default).
+// - pd (runtime): how many tiles ahead the streams are prefetched into L2 (1 by default; 0, no
+//   prefetch, with REG_NOPF). On sm_90+ the bulk prefetch takes uniform operands, so the
+//   compiler issues it one lane at a time (a loop of TT x HC / 2 prefetches in each of the two
+//   warps that issue them, every tile, before their matmul).
+// - chunk (runtime): the CTA's run of tokens; REG_PER picks long runs, a few CTAs a column
+//   block in whole waves, so the A fragments' 80-register prologue is paid a few times a column
+//   block instead of once per short run.
 // - cross (runtime): the prefetch runs on past the CTA's run into the next run's first tiles
 //   (the column block's next CTA), not only up to the run's end.
 // - XS: the mix's operands of the tile (its stream values, the scales and, PRE, the attention
@@ -234,15 +240,28 @@ __global__ void __launch_bounds__(WARPS * 32) up_mix_bf16(const legion_hc_up_mix
 //   them after the matmul. The same values, so the same bits.
 // - LD: lo's B fragments loaded with one ldmatrix.x4 per K step (both token tiles, both halves)
 //   instead of four 32-bit shared loads: the same 32-bit words in the same registers.
+// - XS 2 (with LD; #1183 r2): XS double-buffered. The stream values and scales of the NEXT tile
+//   are copied at a tile's start (into the other of two buffers), in the group of the next
+//   tile's lo, so they have a whole tile (matmul and mix) to arrive and the mix waits for
+//   nothing (PRE: the attention block's outputs and inject weights stay single-buffered,
+//   staged at the tile's start as XS 1 does, and the mix waits for them only).
+// - VX (with LD and XS; #1183 r2): the mix reads its operands from shared memory 16 bytes at a
+//   time: a thread mixes 4 adjacent columns of one token (TT x COLS / 4 threads mix, the rest
+//   go on to the barrier), so 4 F32 stream values (4 BF16 ones: 8 bytes), 4 gates and 4
+//   gammas are a load each, a scale (inject weight) serves 4 outputs, and its F32 values (BF16
+//   copy) are one 16-byte (8-byte) store. Each output's expressions and their order are up_mix_bf16's, so the same
+//   bits. The gammas sit in the gate rows' padding (GS - COLS floats a row), staged once.
 // smem: up_mix_bf16_reg_smem().
-template <int KS, int CG, int TT, int MINB, bool RB, bool S16, bool PRE = false, bool L1 = false, bool XS = false,
-          bool LD = false>
+template <int KS, int CG, int TT, int MINB, bool RB, bool S16, bool PRE = false, bool L1 = false, int XS = 0,
+          bool LD = false, bool VX = false>
 __global__ void __launch_bounds__(CG * HC * 32, MINB)
     up_mix_bf16_reg(const legion_hc_up_mix p, const int chunk, const int pd, const int cross) {
     static_assert(RB || !S16, "up_mix_bf16_reg: BF16 streams in the rebuilt form only");
     static_assert(!PRE || (RB && !S16), "up_mix_bf16_reg: lazy streams of F32 streams in the rebuilt form only");
     static_assert(TT % 8 == 0 && TT >= 8, "up_mix_bf16_reg: whole n8 tiles");
     static_assert(!LD || TT % 16 == 0, "up_mix_bf16_reg: ldmatrix.x4 takes two n8 tiles at a time");
+    static_assert(XS >= 0 && XS <= 2, "up_mix_bf16_reg: XS 0, 1 or 2 buffers");
+    static_assert(!VX || (XS > 0 && HC == 4 && CG * ROWS % 4 == 0), "up_mix_bf16_reg: VX reads staged operands");
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     constexpr int THREADS = CG * HC * 32;
     constexpr int COLS    = CG * ROWS;      // mixed columns of the CTA
@@ -251,14 +270,18 @@ __global__ void __launch_bounds__(CG * HC * 32, MINB)
     constexpr int GS      = COLS + 4;       // floats per staged gate row (2 GS = 8 mod 32 words)
     constexpr int J       = TT / 8;         // outputs a thread mixes per tile (TT x COLS / THREADS)
     constexpr int ES      = S16 ? 2 : 4;    // bytes per stream value
+    constexpr int XB      = XS == 2 ? 2 : 1;                  // XS: buffers of stream values and scales
+    constexpr int XSB     = XS ? TT * HC * COLS * ES : 0;     // bytes of one buffer of stream values
+    constexpr int SSF     = XS && RB ? TT * HC : 0;           // floats of one buffer of scales
+    static_assert(!VX || !RB || (COLS / 4) * HC <= HC * TT, "up_mix_bf16_reg: VX's gammas fit the gate padding");
     extern __shared__ int smem[];
     uint32_t * lb = (uint32_t *) smem;            // [2][TT][LW]: lo's BF16 pairs
     float *    gs = (float *) (lb + 2 * TT * LW);  // [HC][TT][GS]: the gates
-    // XS: [TT][HC][COLS] stream values (ES bytes each), then [TT][HC] scales (RB), then PRE's
-    // [TT][COLS] attention block outputs and [TT][HC] inject weights.
+    // XS: [XB][TT][HC][COLS] stream values (ES bytes each), then [XB][TT][HC] scales (RB), then
+    // PRE's [TT][COLS] attention block outputs and [TT][HC] inject weights.
     char *  xsm = (char *) (gs + HC * TT * GS);
-    float * ssm = (float *) (xsm + (XS ? TT * HC * COLS * ES : 0));
-    float * psm = ssm + (XS && RB ? TT * HC : 0);
+    float * ssm = (float *) (xsm + XB * XSB);
+    float * psm = ssm + XB * SSF;
     float * ism = psm + (XS && PRE ? TT * COLS : 0);
 
     const int     tid = threadIdx.x, warp = tid / 32, lane = tid % 32, g = lane / 4, q = lane % 4;
@@ -339,8 +362,9 @@ __global__ void __launch_bounds__(CG * HC * 32, MINB)
     };
 
     // XS: the mix's operands of the tile at `base` into shared memory (tokens past the run: not
-    // copied, not read), one group.
-    auto stage_x = [&](int base) {
+    // copied, not read): the stream values and scales into buffer `xb` (stage_xs), PRE's
+    // attention block outputs and inject weights (stage_xp); stage_x: both, one group.
+    auto stage_xs = [&](int base, int xb) {
         constexpr int RV = COLS * ES / 16;  // 16-byte pieces per token and stream
         for (int u = tid; u < TT * HC * RV; u += THREADS) {
             const int r = u / RV, v = u % RV;  // r: token r / HC of the tile, stream r % HC
@@ -348,7 +372,7 @@ __global__ void __launch_bounds__(CG * HC * 32, MINB)
             if (tok < t_end) {
                 const char * src =
                     (const char *) xs + ((int64_t) tok * K + (int64_t) (r % HC) * p.e + i0) * ES + v * 16;
-                const uint32_t dst = (uint32_t) __cvta_generic_to_shared(xsm + r * COLS * ES + v * 16);
+                const uint32_t dst = (uint32_t) __cvta_generic_to_shared(xsm + xb * XSB + r * COLS * ES + v * 16);
                 asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(src) : "memory");
             }
         }
@@ -358,11 +382,13 @@ __global__ void __launch_bounds__(CG * HC * 32, MINB)
                 const int tok = base + u / HC;
                 if (tok < t_end) {
                     const float *  src = p.sc + (int64_t) tok * HC + u % HC;
-                    const uint32_t dst = (uint32_t) __cvta_generic_to_shared(ssm + u);
+                    const uint32_t dst = (uint32_t) __cvta_generic_to_shared(ssm + xb * SSF + u);
                     asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(dst), "l"(src) : "memory");
                 }
             }
         }
+    };
+    auto stage_xp = [&](int base) {
         if constexpr (PRE) {
             constexpr int PV = COLS * 4 / 16;
             for (int u = tid; u < TT * PV; u += THREADS) {
@@ -382,10 +408,19 @@ __global__ void __launch_bounds__(CG * HC * 32, MINB)
                 }
             }
         }
+    };
+    auto stage_x = [&](int base) {
+        stage_xs(base, 0);
+        stage_xp(base);
         asm volatile("cp.async.commit_group;" ::: "memory");
     };
 
     stage(0, 0);
+    if constexpr (XS == 2) {
+        // The first tile's stream values and scales (the loop stages each next tile's).
+        stage_xs(t_begin, 0);
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    }
     for (int d = 0; d < pd; d++) {
         prefetch(d);
     }
@@ -410,7 +445,16 @@ __global__ void __launch_bounds__(CG * HC * 32, MINB)
     float     gv[HC];
 #pragma unroll
     for (int s = 0; s < HC; s++) {
-        gv[s] = RB ? p.g[s * p.e + ei] : 0.0f;
+        gv[s] = RB && !VX ? p.g[s * p.e + ei] : 0.0f;
+    }
+    // VX: the gammas of column quad q of stream s at the padding of gate row s * COLS / 4 + q
+    // (read after the loop's first barrier).
+    [[maybe_unused]] constexpr int QC = COLS / 4;  // column quads
+    if constexpr (VX && RB) {
+        if (tid < HC * COLS) {
+            const int s = tid / COLS, col = tid % COLS;
+            gs[(s * QC + col / 4) * GS + COLS + col % 4] = p.g[s * p.e + i0 + col];
+        }
     }
 
     for (int it = 0; it < tiles; it++) {
@@ -420,16 +464,33 @@ __global__ void __launch_bounds__(CG * HC * 32, MINB)
         // Tile it's lo is in; every thread is past the last tile's matmul (buffer buf ^ 1 free)
         // and its mix (the gates free).
         __syncthreads();
-        // XS: this tile's mix operands first (the mix needs them first), then the next tile's lo
-        // as the group after them (an empty one after the last tile), so the mix waits for its
-        // group only.
-        if constexpr (XS) {
-            stage_x(base);
-        }
-        if (it + 1 < tiles) {
-            stage(it + 1, buf ^ 1);
-        } else if constexpr (XS) {
-            asm volatile("cp.async.commit_group;" ::: "memory");
+        if constexpr (XS == 2) {
+            // PRE: this tile's attention block outputs and inject weights first, as XS 1's
+            // group. Then the next tile's stream values and scales (into the buffer the last
+            // tile's mix read) and lo, one group (PRE: an empty one after the last tile), so
+            // the mix waits for PRE's group only.
+            if constexpr (PRE) {
+                stage_xp(base);
+                asm volatile("cp.async.commit_group;" ::: "memory");
+            }
+            if (it + 1 < tiles) {
+                stage_xs(base + TT, buf ^ 1);
+                stage(it + 1, buf ^ 1);
+            } else if constexpr (PRE) {
+                asm volatile("cp.async.commit_group;" ::: "memory");
+            }
+        } else {
+            // XS: this tile's mix operands first (the mix needs them first), then the next
+            // tile's lo as the group after them (an empty one after the last tile), so the mix
+            // waits for its group only.
+            if constexpr (XS == 1) {
+                stage_x(base);
+            }
+            if (it + 1 < tiles) {
+                stage(it + 1, buf ^ 1);
+            } else if constexpr (XS == 1) {
+                asm volatile("cp.async.commit_group;" ::: "memory");
+            }
         }
         if (pd > 0) {
             prefetch(it + pd);
@@ -481,11 +542,89 @@ __global__ void __launch_bounds__(CG * HC * 32, MINB)
                 gs[(c * TT + t * 8 + 2 * q + (l & 1)) * GS + gi * ROWS + g + (l >> 1) * 8] = acc[t][l];
             }
         }
-        if constexpr (XS) {
+        if constexpr (XS == 1 || (XS == 2 && PRE)) {
             // The mix operands' group (the next tile's lo, committed after it, may still run).
+            // XS 2 without PRE: this tile's operands came with its lo.
             asm volatile("cp.async.wait_group 1;" ::: "memory");
         }
         __syncthreads();
+
+        // XS: this tile's buffer of stream values and scales.
+        [[maybe_unused]] const char *  xq = xsm + (XS == 2 ? buf * XSB : 0);
+        [[maybe_unused]] const float * sq = ssm + (XS == 2 ? buf * SSF : 0);
+        if constexpr (VX) {
+            // A thread per token and column quad (tt, 4 ec0 ..): the scalar mix's expressions
+            // per output in the same order, the operands 16 bytes at a time.
+            const int tt = tid / QC, ec0 = (tid % QC) * 4;
+            const int tok = base + tt;
+            if (tid < TT * QC && tok < t_end) {
+                float po[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                if constexpr (PRE) {
+                    const float4 v = *(const float4 *) (psm + tt * COLS + ec0);
+                    po[0] = v.x, po[1] = v.y, po[2] = v.z, po[3] = v.w;
+                }
+                float sum[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                // Not unrolled: one stream's operands live at a time (unrolled, the compiler
+                // hoists the next streams' loads and the F32 forms spill next to the 80 A
+                // registers). The streams still go in order.
+#pragma unroll 1
+                for (int s = 0; s < HC; s++) {
+                    // The token's scale and inject weight of stream s: one value for 4 outputs
+                    // (read per stream, not as a float4 up front: fewer live registers).
+                    [[maybe_unused]] const float sc = RB ? sq[tt * HC + s] : 0.0f;
+                    float xv[4];
+                    if constexpr (S16) {
+                        const uint2 r = *(const uint2 *) (xq + ((tt * HC + s) * COLS + ec0) * 2);
+                        xv[0] = __uint_as_float(r.x << 16), xv[1] = __uint_as_float(r.x & 0xffff0000u);
+                        xv[2] = __uint_as_float(r.y << 16), xv[3] = __uint_as_float(r.y & 0xffff0000u);
+                    } else {
+                        const float4 v = *(const float4 *) (xq + ((tt * HC + s) * COLS + ec0) * 4);
+                        xv[0] = v.x, xv[1] = v.y, xv[2] = v.z, xv[3] = v.w;
+                    }
+                    const float4 gt = *(const float4 *) (gs + (s * TT + tt) * GS + ec0);
+                    const float  gw[4] = { gt.x, gt.y, gt.z, gt.w };
+                    float        gm[4] = {};
+                    if constexpr (RB) {
+                        const float4 v = *(const float4 *) (gs + (s * QC + ec0 / 4) * GS + COLS);
+                        gm[0] = v.x, gm[1] = v.y, gm[2] = v.z, gm[3] = v.w;
+                    }
+                    [[maybe_unused]] float w = 0.0f;
+                    if constexpr (PRE) {
+                        w = pre_weight_of(p, ism[tt * HC + s]);
+                    }
+#pragma unroll
+                    for (int q4 = 0; q4 < 4; q4++) {
+                        float x = xv[q4];
+                        if constexpr (PRE) {
+                            x = __fmaf_rn(po[q4], w, x);
+                        }
+                        if constexpr (RB) {
+                            x = __fmul_rn(__fmul_rn(x, sc), gm[q4]);
+                        }
+                        const float wv = 1.0f / (1.0f + expf(-gw[q4]));
+                        sum[q4] += x * wv;
+                    }
+                }
+                float v[4];
+#pragma unroll
+                for (int q4 = 0; q4 < 4; q4++) {
+                    v[q4] = p.scale * sum[q4];
+                }
+                const int64_t mo = (int64_t) tok * p.e + i0 + ec0;
+                if (p.skip_f32 == 0) {
+                    *(float4 *) (p.mixed + mo) = make_float4(v[0], v[1], v[2], v[3]);
+                }
+                if (p.mixedb != nullptr) {
+                    uint2 b;
+                    b.x = (uint32_t) __bfloat16_as_ushort(__float2bfloat16(v[0])) |
+                          ((uint32_t) __bfloat16_as_ushort(__float2bfloat16(v[1])) << 16);
+                    b.y = (uint32_t) __bfloat16_as_ushort(__float2bfloat16(v[2])) |
+                          ((uint32_t) __bfloat16_as_ushort(__float2bfloat16(v[3])) << 16);
+                    *(uint2 *) ((__nv_bfloat16 *) p.mixedb + mo) = b;
+                }
+            }
+            continue;
+        }
 
 #pragma unroll
         for (int j = 0; j < J; j++) {
@@ -502,9 +641,9 @@ __global__ void __launch_bounds__(CG * HC * 32, MINB)
                 for (int s = 0; s < HC; s++) {
                     float xv;
                     if constexpr (XS && S16) {
-                        xv = __bfloat162float(((const __nv_bfloat16 *) xsm)[(tt * HC + s) * COLS + ec]);
+                        xv = __bfloat162float(((const __nv_bfloat16 *) xq)[(tt * HC + s) * COLS + ec]);
                     } else if constexpr (XS) {
-                        xv = ((const float *) xsm)[(tt * HC + s) * COLS + ec];
+                        xv = ((const float *) xq)[(tt * HC + s) * COLS + ec];
                     } else if constexpr (S16) {
                         xv = __bfloat162float(((const __nv_bfloat16 *) p.res)[at + (int64_t) s * p.e]);
                     } else {
@@ -514,7 +653,7 @@ __global__ void __launch_bounds__(CG * HC * 32, MINB)
                         xv = __fmaf_rn(po, XS ? pre_weight_of(p, ism[tt * HC + s]) : pre_weight(p, tok, s), xv);
                     }
                     if constexpr (RB) {
-                        xv = __fmul_rn(__fmul_rn(xv, XS ? ssm[tt * HC + s] : p.sc[(int64_t) tok * HC + s]), gv[s]);
+                        xv = __fmul_rn(__fmul_rn(xv, XS ? sq[tt * HC + s] : p.sc[(int64_t) tok * HC + s]), gv[s]);
                     }
                     const float wv = 1.0f / (1.0f + expf(-gs[(s * TT + tt) * GS + ec]));
                     sum += xv * wv;
@@ -536,12 +675,14 @@ __global__ void __launch_bounds__(CG * HC * 32, MINB)
 }
 
 // up_mix_bf16_reg's dynamic shared memory in bytes: lo's two buffers, the gates and (XS) the mix
-// operands of a tile.
-template <int KS, int CG, int TT, bool RB, bool S16, bool PRE, bool XS> constexpr int up_mix_bf16_reg_smem() {
+// operands of a tile (XS 2: two buffers of the stream values and scales). VX's gammas use the
+// gate rows' padding.
+template <int KS, int CG, int TT, bool RB, bool S16, bool PRE, int XS> constexpr int up_mix_bf16_reg_smem() {
     constexpr int COLS  = CG * ROWS;
     int           bytes = (2 * TT * (KS * 8 + PAD / 4) + HC * TT * (COLS + 4)) * 4;
     if (XS) {
-        bytes += TT * HC * COLS * (S16 ? 2 : 4) + (RB ? TT * HC * 4 : 0) + (PRE ? TT * COLS * 4 + TT * HC * 4 : 0);
+        bytes += (XS == 2 ? 2 : 1) * (TT * HC * COLS * (S16 ? 2 : 4) + (RB ? TT * HC * 4 : 0)) +
+                 (PRE ? TT * COLS * 4 + TT * HC * 4 : 0);
     }
     return bytes;
 }

@@ -853,12 +853,27 @@ fn bench_variants_parse() {
     assert_eq!(v("2"), Variant::new(2, None));
     assert_eq!(v("1002:none"), Variant::new(1002, Some(0)));
     assert_eq!(v("2:ld+xs"), Variant::new(2, Some(REG_LD | REG_XS)));
-    assert_eq!(v("2:15"), Variant::new(2, Some(REG_ALL)));
+    assert_eq!(v("2:255"), Variant::new(2, Some(REG_ALL)));
+    assert_eq!(
+        v("2:15"),
+        Variant::new(2, Some(REG_PD2 | REG_XS | REG_LD | REG_CROSS))
+    );
     assert_eq!(v("2:pd2+cross"), Variant::new(2, Some(REG_PD2 | REG_CROSS)));
-    for s in ["2:foo", "x", "2:16", "2:-1", "2:ld+"] {
+    assert_eq!(
+        v("2:ld+xs+xs2+vx"),
+        Variant::new(2, Some(REG_LD | REG_XS | REG_XS2 | REG_VX))
+    );
+    assert_eq!(v("2:per+nopf"), Variant::new(2, Some(REG_PER | REG_NOPF)));
+    for s in ["2:foo", "x", "2:256", "2:-1", "2:ld+"] {
         assert!(Variant::parse(s).is_err(), "{s}");
     }
-    for s in ["2", "1002:none", "2:pd2+xs+ld+cross", "2:ld"] {
+    for s in [
+        "2",
+        "1002:none",
+        "2:pd2+xs+ld+cross",
+        "2:ld",
+        "2:xs+ld+xs2+vx+per+nopf",
+    ] {
         assert_eq!(v(s).to_string(), s);
     }
     // What ran: the kernel, and the options where some were forced.
@@ -905,6 +920,22 @@ fn stage_switch_is_the_xs_bit() {
     assert_eq!(on, DEFAULT_REG_OPTS);
 }
 
+/// #1183 r2's options (double-buffered staging, vector mix reads, long runs, no prefetch) are
+/// bench-only until measured: the default stays ldmatrix + staging, and every new bit is in
+/// [`REG_ALL`] once.
+#[test]
+fn r2_options_stay_off_by_default() {
+    let r2 = [REG_XS2, REG_VX, REG_PER, REG_NOPF];
+    assert_eq!(DEFAULT_REG_OPTS & r2.iter().fold(0, |a, b| a | b), 0);
+    let mut seen = REG_PD2 | REG_XS | REG_LD | REG_CROSS;
+    for b in r2 {
+        assert_eq!(b.count_ones(), 1, "{b}");
+        assert_eq!(seen & b, 0, "{b} reused");
+        seen |= b;
+    }
+    assert_eq!(seen, REG_ALL);
+}
+
 /// Qwen3.8-Flash-Next's mixer at the token counts of the docs command's steps (#1183): 12,288
 /// (a full prompt step), 8,067 (a tail with a part tile and a part run), 129 and 1.
 fn flash_next_mixer(tokens: Vec<i64>) -> bench::Config {
@@ -919,19 +950,29 @@ fn flash_next_mixer(tokens: Vec<i64>) -> bench::Config {
 /// Every `up_mix_bf16_reg` option alone and together, with `lo` through L1 (kernel 2 on a GB10)
 /// and L2 only (1002), the default and `up_mix_bf16`: the same bits as the kernel without
 /// options in every mode, the docs command's forms (F32 streams with and without lazy streams,
-/// BF16 streams, `xn`) included. Each check must have run the options it forced.
+/// BF16 streams, `xn`) included. Each check must have run the options it forced: r2's
+/// double-buffered staging and vector mix reads (with staging and ldmatrix) included, so their
+/// forms fit two CTAs an SM.
 #[test]
 #[ignore = "needs an sm_80+ GPU"]
 fn cuda_up_mix_reg_options_are_the_same_bits() {
     use bench::Variant;
     let mut gpu = crate::ggml::backend_by_name("CUDA0").expect("no CUDA0");
+    let xl = REG_XS | REG_LD;
     let all = [
         0,
         REG_PD2,
         REG_XS,
         REG_LD,
         REG_CROSS,
-        REG_XS | REG_LD,
+        xl,
+        xl | REG_XS2,
+        xl | REG_VX,
+        xl | REG_XS2 | REG_VX,
+        xl | REG_PER,
+        xl | REG_NOPF,
+        xl | REG_XS2 | REG_VX | REG_PER | REG_NOPF,
+        REG_PER,
         REG_ALL,
     ];
     let mut cfg = flash_next_mixer(vec![12288, 8067, 129, 1]);
@@ -1000,6 +1041,44 @@ fn cuda_up_mix_reg_options_microbench() {
     .map(|o| Variant::new(2, Some(o)))
     .to_vec();
     let rows = bench::ab(&mut gpu, &cfg, &["s16", "f32", "pre", "bf16"], base).unwrap();
+    print_ab(&rows);
+}
+
+/// #1183 r2's options (double-buffered staging, vector mix reads, long runs, no prefetch, and
+/// together), with staging and ldmatrix, each against both the kernel without options and #234's
+/// default (ldmatrix + staging), call by call, which runs first alternating per round: median,
+/// min and speedup per mode and token count (with `--nocapture`). Fails only when a variant did
+/// not run as forced.
+#[test]
+#[ignore = "needs an sm_80+ GPU; a timing run"]
+fn cuda_up_mix_reg_r2_microbench() {
+    use bench::Variant;
+    let mut gpu = crate::ggml::backend_by_name("CUDA0").expect("no CUDA0");
+    let xl = REG_XS | REG_LD;
+    let mut cfg = flash_next_mixer(vec![12288, 8067]);
+    cfg.copies = 8;
+    cfg.rounds = 15;
+    cfg.variants = [
+        xl | REG_XS2,
+        xl | REG_VX,
+        xl | REG_XS2 | REG_VX,
+        xl | REG_PER,
+        xl | REG_NOPF,
+        xl | REG_XS2 | REG_NOPF,
+        xl | REG_XS2 | REG_VX | REG_PER,
+        xl | REG_XS2 | REG_VX | REG_PER | REG_NOPF,
+    ]
+    .map(|o| Variant::new(2, Some(o)))
+    .to_vec();
+    let modes = ["s16", "f32", "pre", "bf16", "xn"];
+    for base in [Variant::new(2, Some(0)), Variant::new(2, Some(xl))] {
+        println!("against {base}:");
+        print_ab(&bench::ab(&mut gpu, &cfg, &modes, base).unwrap());
+    }
+}
+
+/// The microbenches' table, then whether each row ran its variants as forced.
+fn print_ab(rows: &[bench::AbRow]) {
     println!(
         "{:>6} {:<5} {:>14} {:>9} {:>9} {:>9} {:>9} {:>7} {:>7}",
         "tokens",
@@ -1012,7 +1091,7 @@ fn cuda_up_mix_reg_options_microbench() {
         "speedup",
         "min sp"
     );
-    for r in &rows {
+    for r in rows {
         println!(
             "{:>6} {:<5} {:>14} {:>9.1} {:>9.1} {:>9.1} {:>9.1} {:>7.3} {:>7.3}",
             r.tokens,
@@ -1026,7 +1105,7 @@ fn cuda_up_mix_reg_options_microbench() {
             r.speedup_min()
         );
     }
-    for r in &rows {
+    for r in rows {
         assert!(r.base.ran_as(r.ran[0].0, r.ran[0].1), "{r:?}");
         assert!(r.variant.ran_as(r.ran[1].0, r.ran[1].1), "{r:?}");
     }

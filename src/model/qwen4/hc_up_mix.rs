@@ -133,8 +133,20 @@ pub const REG_XS: i32 = 2;
 pub const REG_LD: i32 = 4;
 /// The L2 prefetch going on past a CTA's run into the next run's first tiles.
 pub const REG_CROSS: i32 = 8;
+/// With [`REG_XS`] and [`REG_LD`]: the staged stream values and scales double-buffered, the next
+/// tile's copied while this tile's matmul and mix run, so the mix waits for none of them.
+pub const REG_XS2: i32 = 16;
+/// With [`REG_XS`] and [`REG_LD`]: the mix reads its staged operands 16 bytes at a time, 4
+/// adjacent columns of a token a thread (the same expressions per output).
+pub const REG_VX: i32 = 32;
+/// Long runs: a few CTAs a column block that fill whole waves, so each loads its A fragments
+/// (the up rows) once for many tiles.
+pub const REG_PER: i32 = 64;
+/// No L2 prefetch of the streams (over [`REG_PD2`]).
+pub const REG_NOPF: i32 = 128;
 /// Every option bit.
-pub const REG_ALL: i32 = REG_PD2 | REG_XS | REG_LD | REG_CROSS;
+pub const REG_ALL: i32 =
+    REG_PD2 | REG_XS | REG_LD | REG_CROSS | REG_XS2 | REG_VX | REG_PER | REG_NOPF;
 /// The options on by default: `ldmatrix.x4` and the mix's operands staged in shared memory
 /// (`legion serve --no-hc-up-mix-ldmatrix` and `--no-hc-up-mix-stage` turn them off; together
 /// 1-12% faster than neither on one GB10, by mode). The prefetch options stay off: both were
@@ -960,9 +972,10 @@ pub fn last_kernel() -> i32 {
     0
 }
 
-/// The `up_mix_bf16_reg` options ([`REG_ALL`] bits) the last BF16 launch ran with: [`REG_XS`]
-/// dropped where the streams are not 16-byte aligned or two CTAs an SM do not fit with it, 0
-/// after an `up_mix_bf16` launch (or no CUDA build).
+/// The `up_mix_bf16_reg` options ([`REG_ALL`] bits) the last BF16 launch ran with: [`REG_XS`],
+/// [`REG_XS2`] and [`REG_VX`] dropped where the operands are not aligned for them or two CTAs an
+/// SM do not fit with them ([`REG_XS2`] and [`REG_VX`] also without both [`REG_XS`] and
+/// [`REG_LD`]), 0 after an `up_mix_bf16` launch (or no CUDA build).
 #[doc(hidden)]
 pub fn last_reg_opts() -> i32 {
     #[cfg(feature = "cuda")]

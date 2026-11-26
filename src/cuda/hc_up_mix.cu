@@ -88,7 +88,9 @@ struct legion_hc_up_mix {
     // BF16 up, up_mix_bf16_reg only (#1183): its options, the REG_* bits below (the same bits
     // with any of them): REG_PD2 streams prefetched two tiles ahead instead of one, REG_XS the
     // mix's operands staged in shared memory during the matmul, REG_LD lo's B fragments by
-    // ldmatrix.x4, REG_CROSS the prefetch going on into the next run's tiles.
+    // ldmatrix.x4, REG_CROSS the prefetch going on into the next run's tiles; with XS and LD,
+    // REG_XS2 XS double-buffered and REG_VX the mix's staged operands 16 bytes a load; REG_PER
+    // long runs (a few CTAs a column block) and REG_NOPF no L2 prefetch.
     int32_t       reg_opts;
 };
 
@@ -104,9 +106,10 @@ int legion_hc_up_lob_launch(const legion_hc_up_mix * p, void * stream);
 // up_mix_bf16_reg), for `legion hc-up-mix-bench`.
 int legion_hc_up_mix_last_kernel(void);
 
-// The up_mix_bf16_reg options (reg_opts bits) the last launch ran with (REG_XS dropped where the
-// operands are not 16-byte aligned or two CTAs an SM do not fit with it; 0 after an up_mix_bf16
-// launch), for `legion hc-up-mix-bench`.
+// The up_mix_bf16_reg options (reg_opts bits) the last launch ran with (REG_XS, REG_XS2 and
+// REG_VX dropped where the operands are not aligned for them or two CTAs an SM do not fit with
+// them, REG_XS2 and REG_VX without both REG_XS and REG_LD; 0 after an up_mix_bf16 launch), for
+// `legion hc-up-mix-bench`.
 int legion_hc_up_mix_last_opts(void);
 
 }  // extern "C"
@@ -187,11 +190,15 @@ constexpr int REG_RUN_16 = 8;  // tiles a CTA, BF16 streams
 constexpr int REG_MIN_N  = 512;
 
 // up_mix_bf16_reg's options (legion_hc_up_mix::reg_opts, #1183; the same bits with any).
-constexpr int REG_PD2   = 1;  // the streams prefetched into L2 two tiles ahead (REG_PD: one)
-constexpr int REG_XS    = 2;  // the mix's operands staged in shared memory while the matmul runs
-constexpr int REG_LD    = 4;  // lo's B fragments by ldmatrix.x4
-constexpr int REG_CROSS = 8;  // the prefetch goes on into the next run's first tiles
-constexpr int REG_ALL   = REG_PD2 | REG_XS | REG_LD | REG_CROSS;
+constexpr int REG_PD2   = 1;   // the streams prefetched into L2 two tiles ahead (REG_PD: one)
+constexpr int REG_XS    = 2;   // the mix's operands staged in shared memory while the matmul runs
+constexpr int REG_LD    = 4;   // lo's B fragments by ldmatrix.x4
+constexpr int REG_CROSS = 8;   // the prefetch goes on into the next run's first tiles
+constexpr int REG_XS2   = 16;  // with XS and LD: XS double-buffered, the next tile's operands staged
+constexpr int REG_VX    = 32;  // with XS and LD: the mix's shared-memory operands 16 bytes a load
+constexpr int REG_PER   = 64;  // long runs: a few CTAs a column block, in whole waves
+constexpr int REG_NOPF  = 128; // no L2 prefetch of the streams (pd 0; over REG_PD2)
+constexpr int REG_ALL   = REG_PD2 | REG_XS | REG_LD | REG_CROSS | REG_XS2 | REG_VX | REG_PER | REG_NOPF;
 
 // The kernel the last BF16 launch ran (legion_hc_up_mix_last_kernel) and its options
 // (legion_hc_up_mix_last_opts).
@@ -224,45 +231,91 @@ template <typename Kernel> bool xs_pair(std::atomic<int8_t> * state, Kernel kern
     return st > 0;
 }
 
-// One up_mix_bf16_reg launch of the form L1 / XS / LD: e / 32 column blocks times runs of `run`
-// tiles. False (nothing launched) when the kernel cannot have its shared memory.
-template <bool RB, bool S16, bool PRE, bool L1, bool XS, bool LD>
+// REG_PER's run (tiles a CTA): the fewest CTAs a column block that fill whole waves of
+// REG_MINB CTAs an SM (on a GB10's 48 SMs and qwen4exp's 80 column blocks: 6, 5 waves), or
+// `run` when the SM count is unknown.
+int per_run(const legion_hc_up_mix & p, int run) {
+    const int slots = REG_MINB * legion_device::sm_count();
+    const int cbs   = p.e / (REG_CG * ROWS);
+    const int tiles = (p.n + REG_TT - 1) / REG_TT;
+    if (slots <= 0 || cbs <= 0) {
+        return run;
+    }
+    int a = slots, b = cbs;  // gcd
+    while (b != 0) {
+        const int t = a % b;
+        a = b, b = t;
+    }
+    const int per = slots / a < tiles ? slots / a : tiles;
+    return (tiles + per - 1) / per;
+}
+
+// One up_mix_bf16_reg launch of the form L1 / XS / LD / VX: e / 32 column blocks times runs of
+// `run` tiles (REG_PER: per_run's). False (nothing launched) when the kernel cannot have its
+// shared memory.
+template <bool RB, bool S16, bool PRE, bool L1, int XS, bool LD, bool VX = false>
 bool launch_reg_form(const legion_hc_up_mix & p, cudaStream_t s, int run, int opts) {
     constexpr int THREADS = REG_CG * HC * 32;
     constexpr int COLS    = REG_CG * ROWS;
     constexpr int SMEM    = up_mix_bf16_reg_smem<REG_KS, REG_CG, REG_TT, RB, S16, PRE, XS>();
-    const auto    kernel  = up_mix_bf16_reg<REG_KS, REG_CG, REG_TT, REG_MINB, RB, S16, PRE, L1, XS, LD>;
+    const auto    kernel  = up_mix_bf16_reg<REG_KS, REG_CG, REG_TT, REG_MINB, RB, S16, PRE, L1, XS, LD, VX>;
     static std::atomic<int8_t> opt[GGML_CUDA_MAX_DEVICES];
     if (!legion_device::smem_opt_in(opt, kernel, SMEM)) {
         return false;
     }
-    if constexpr (XS) {
+    if constexpr (XS > 0) {
         static std::atomic<int8_t> pair[GGML_CUDA_MAX_DEVICES];
         if (!xs_pair(pair, kernel, THREADS, SMEM)) {
             return false;
         }
     }
-    const int  chunk = run * REG_TT;
+    const int  chunk = ((opts & REG_PER) != 0 ? per_run(p, run) : run) * REG_TT;
     const dim3 grid((unsigned) (p.e / COLS), (unsigned) ((p.n + chunk - 1) / chunk));
-    kernel<<<grid, THREADS, SMEM, s>>>(p, chunk, (opts & REG_PD2) != 0 ? 2 : REG_PD, (opts & REG_CROSS) != 0);
+    const int  pd = (opts & REG_NOPF) != 0 ? 0 : (opts & REG_PD2) != 0 ? 2 : REG_PD;
+    kernel<<<grid, THREADS, SMEM, s>>>(p, chunk, pd, (opts & REG_CROSS) != 0);
     last_opts.store(opts, std::memory_order_relaxed);
     return true;
 }
 
+// XS2 / VX (with XS and LD): the form with both, else XS2 dropped, then VX, then XS (each where
+// two CTAs an SM do not fit with it).
+template <bool RB, bool S16, bool PRE, bool L1>
+bool launch_reg_xs2_vx(const legion_hc_up_mix & p, cudaStream_t s, int run, int opts) {
+    const bool xs2 = (opts & REG_XS2) != 0, vx = (opts & REG_VX) != 0;
+    if (xs2 && vx && launch_reg_form<RB, S16, PRE, L1, 2, true, true>(p, s, run, opts)) {
+        return true;
+    }
+    if (xs2 && launch_reg_form<RB, S16, PRE, L1, 2, true, false>(p, s, run, opts & ~REG_VX)) {
+        return true;
+    }
+    if (vx && launch_reg_form<RB, S16, PRE, L1, 1, true, true>(p, s, run, opts & ~REG_XS2)) {
+        return true;
+    }
+    return launch_reg_form<RB, S16, PRE, L1, 1, true, false>(p, s, run, opts & ~(REG_XS2 | REG_VX)) ||
+           launch_reg_form<RB, S16, PRE, L1, 0, true, false>(p, s, run, opts & ~(REG_XS | REG_XS2 | REG_VX));
+}
+
 template <bool RB, bool S16, bool PRE, bool L1>
 bool launch_reg_l1(const legion_hc_up_mix & p, cudaStream_t s, int run, int opts) {
+    // XS2 and VX only with XS and LD.
+    if ((opts & (REG_XS | REG_LD)) != (REG_XS | REG_LD)) {
+        opts &= ~(REG_XS2 | REG_VX);
+    }
+    if ((opts & (REG_XS2 | REG_VX)) != 0) {
+        return launch_reg_xs2_vx<RB, S16, PRE, L1>(p, s, run, opts);
+    }
     switch (opts & (REG_XS | REG_LD)) {
         // XS where two CTAs an SM fit with it (xs_pair), else the same form without it.
         case REG_XS | REG_LD:
-            return launch_reg_form<RB, S16, PRE, L1, true, true>(p, s, run, opts) ||
-                   launch_reg_form<RB, S16, PRE, L1, false, true>(p, s, run, opts & ~REG_XS);
+            return launch_reg_form<RB, S16, PRE, L1, 1, true>(p, s, run, opts) ||
+                   launch_reg_form<RB, S16, PRE, L1, 0, true>(p, s, run, opts & ~REG_XS);
         case REG_XS:
-            return launch_reg_form<RB, S16, PRE, L1, true, false>(p, s, run, opts) ||
-                   launch_reg_form<RB, S16, PRE, L1, false, false>(p, s, run, opts & ~REG_XS);
+            return launch_reg_form<RB, S16, PRE, L1, 1, false>(p, s, run, opts) ||
+                   launch_reg_form<RB, S16, PRE, L1, 0, false>(p, s, run, opts & ~REG_XS);
         case REG_LD:
-            return launch_reg_form<RB, S16, PRE, L1, false, true>(p, s, run, opts);
+            return launch_reg_form<RB, S16, PRE, L1, 0, true>(p, s, run, opts);
         default:
-            return launch_reg_form<RB, S16, PRE, L1, false, false>(p, s, run, opts);
+            return launch_reg_form<RB, S16, PRE, L1, 0, false>(p, s, run, opts);
     }
 }
 
@@ -271,6 +324,11 @@ bool xs_aligned(const legion_hc_up_mix & p) {
     const void * xs = p.res != nullptr ? (const void *) p.res : (const void *) p.xn;
     return (uintptr_t) xs % 16 == 0 &&
            (p.pre_out == nullptr || ((uintptr_t) p.pre_out % 16 == 0 && p.pre_out_ld % 4 == 0));
+}
+
+// Whether VX's 16-byte F32 stores and 8-byte BF16 stores of 4 adjacent outputs are aligned.
+bool vx_aligned(const legion_hc_up_mix & p) {
+    return (p.skip_f32 != 0 || (uintptr_t) p.mixed % 16 == 0) && (p.mixedb == nullptr || (uintptr_t) p.mixedb % 8 == 0);
 }
 
 // One up_mix_bf16_reg launch with p.reg_opts. False (nothing launched) when the kernel cannot
@@ -284,6 +342,9 @@ template <bool RB, bool S16, bool PRE = false> bool launch_reg(const legion_hc_u
     int opts = p.reg_opts & REG_ALL;
     if ((opts & REG_XS) != 0 && !xs_aligned(p)) {
         opts &= ~REG_XS;
+    }
+    if ((opts & REG_VX) != 0 && !vx_aligned(p)) {
+        opts &= ~REG_VX;
     }
     return ca ? launch_reg_l1<RB, S16, PRE, true>(p, s, run, opts) : launch_reg_l1<RB, S16, PRE, false>(p, s, run, opts);
 }
