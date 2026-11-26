@@ -126,6 +126,60 @@ fn gpu_gemma_tower_rows_do_not_depend_on_the_share() {
     }
 }
 
+/// The tiny GLM-5.3-Flash tower (#1219; 6-pixel patches, 108 values a patch padded to 112 as the
+/// real 588 are to 592) on the GPU against the CPU tower, with and without projector MLP biases,
+/// on grids from the floor of the pixel budget to its ceiling: the rows agree within 2% of the
+/// largest CPU value (F16 rounding of the matrices and activations), the same bits every time
+/// and at every share of the GPU.
+#[test]
+#[ignore = "needs a GPU"]
+fn gpu_glm_tower_matches_the_cpu_tower() {
+    for mm_bias in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mmproj.gguf");
+        tiny::write_glm5v(&path, 64, 11, mm_bias).unwrap();
+        let mut cpu = Backend::cpu().unwrap();
+        cpu.set_threads(2);
+        let mut enc = Encoder::load(&path, cpu).unwrap();
+        let Some(mut gpu) = GpuEncoder::new(&enc, 0).unwrap() else {
+            return;
+        };
+        assert!(matches!(gpu, GpuEncoder::Glm(_)));
+        for (w, h) in [(24, 24), (78, 45), (150, 90), (96, 96)] {
+            let img = tiny::bmp(w, h, |x, y| {
+                [(x * 13) as u8, (y * 29) as u8, ((x + y) * 7) as u8]
+            });
+            let p = super::super::preprocess(enc.hparams(), &img).unwrap();
+            let want = enc.encode(&p).unwrap();
+            gpu.set_share(crate::vision::share::Share::FULL);
+            let got = gpu.encode(&p).unwrap();
+            assert_eq!(
+                (got.nx, got.ny, got.n_embd),
+                (want.nx, want.ny, want.n_embd)
+            );
+            let scale = want.data.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let err = got
+                .data
+                .iter()
+                .zip(&want.data)
+                .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+            assert!(
+                err <= 0.02 * scale,
+                "{w} x {h} (biases {mm_bias}): max abs error {err} at a scale of {scale}"
+            );
+            assert_eq!(
+                gpu.encode(&p).unwrap(),
+                got,
+                "{w} x {h}: the same bits again"
+            );
+            for share in ["1/1000", "1/2", "1"] {
+                gpu.set_share(crate::vision::share::parse(share).unwrap()[0]);
+                assert_eq!(gpu.encode(&p).unwrap(), got, "{w} x {h}: share {share}");
+            }
+        }
+    }
+}
+
 /// A checkpoint's tower (`LEGION_TEST_VISION_HF=<dir>`) on the images of
 /// `LEGION_TEST_VISION_IMAGES=<dir>`: the GPU rows against the CPU tower's, with each image's
 /// grid, both encode times, the largest absolute error, the largest error relative to the

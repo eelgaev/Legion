@@ -86,6 +86,10 @@ struct Op {
     eps: f32,
     sfx: f32,
     sfy: f32,
+    /// The im2col rows' stride (0: `3 p p`), padded with zeros.
+    ld: i32,
+    /// The SwiGLU clamp (GLM-5.3-Flash's, #1219).
+    lim: f32,
 }
 
 impl Default for Op {
@@ -117,6 +121,8 @@ impl Default for Op {
             eps: 0.0,
             sfx: 1.0,
             sfy: 1.0,
+            ld: 0,
+            lim: 0.0,
         }
     }
 }
@@ -146,11 +152,15 @@ enum Kernel {
     G4Qkv,
     Geglu,
     G4Pool,
+    // GLM-5.3-Flash's (#1219).
+    GlmQkv,
+    SwigluClamp,
+    LnGelu,
 }
 
 unsafe extern "C" {
     /// The kernels as the CUDA runtime knows them (their host stubs), in [`Kernel`] order.
-    static legion_vision_kernels: [*const c_void; 13];
+    static legion_vision_kernels: [*const c_void; 16];
     fn cudaLaunchKernel(
         func: *const c_void,
         grid: Dim3,
@@ -365,10 +375,12 @@ struct Block {
     down: Linear,
 }
 
-/// The tower on one GPU: Qwen3-VL's, or Gemma 4's ([`gemma4v`], #1217).
+/// The tower on one GPU: Qwen3-VL's, Gemma 4's ([`gemma4v`], #1217) or GLM-5.3-Flash's
+/// ([`glm5v`], #1219).
 pub enum GpuEncoder {
     Qwen(QwenGpu),
     Gemma(gemma4v::GemmaGpu),
+    Glm(glm5v::GlmGpu),
 }
 
 impl GpuEncoder {
@@ -377,6 +389,7 @@ impl GpuEncoder {
     pub fn new(enc: &Encoder, device: usize) -> Result<Option<Self>, VisionError> {
         Ok(match enc.hparams().projector {
             super::Projector::Gemma4v => gemma4v::GemmaGpu::new(enc, device)?.map(Self::Gemma),
+            super::Projector::Glm5v => glm5v::GlmGpu::new(enc, device)?.map(Self::Glm),
             super::Projector::Qwen3vl => QwenGpu::new(enc, device)?.map(Self::Qwen),
         })
     }
@@ -385,6 +398,7 @@ impl GpuEncoder {
         match self {
             Self::Qwen(g) => &g.cfg,
             Self::Gemma(g) => &g.cfg,
+            Self::Glm(g) => &g.cfg,
         }
     }
 
@@ -392,6 +406,7 @@ impl GpuEncoder {
         match self {
             Self::Qwen(g) => &g.hp,
             Self::Gemma(g) => &g.hp,
+            Self::Glm(g) => &g.hp,
         }
     }
 
@@ -399,6 +414,7 @@ impl GpuEncoder {
         match self {
             Self::Qwen(g) => g.device as usize,
             Self::Gemma(g) => g.device as usize,
+            Self::Glm(g) => g.device as usize,
         }
     }
 
@@ -408,6 +424,7 @@ impl GpuEncoder {
         match self {
             Self::Qwen(g) => g.scratch_bytes(),
             Self::Gemma(g) => g.scratch_bytes(),
+            Self::Glm(g) => g.scratch_bytes(),
         }
     }
 
@@ -427,6 +444,7 @@ impl GpuEncoder {
         match self {
             Self::Qwen(g) => g.encode(p, alone),
             Self::Gemma(g) => g.encode(p, alone),
+            Self::Glm(g) => g.encode(p, alone),
         }
     }
 
@@ -436,6 +454,7 @@ impl GpuEncoder {
         match self {
             Self::Qwen(g) => g.turns.set(share),
             Self::Gemma(g) => g.turns.set(share),
+            Self::Glm(g) => g.turns.set(share),
         }
     }
 }
@@ -1065,6 +1084,7 @@ impl Drop for QwenGpu {
 }
 
 mod gemma4v;
+mod glm5v;
 
 #[cfg(test)]
 mod tests;

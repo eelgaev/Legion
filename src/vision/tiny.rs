@@ -2,7 +2,7 @@
 //! the vision tower's graph but no real projector: two blocks of width 16 (two heads), patches
 //! of 4 pixels, an 8 × 8 learned position grid (resampled for any other grid), F32 weights.
 //! Its outputs are meaningless; what it computes is the same as for a real projector.
-//! [`write_gemma4v`] writes a tiny `gemma4v` one the same way. Also [`bmp`], a 24-bit BMP of any size for test images (decoded by stb_image like a PNG).
+//! [`write_gemma4v`] and [`write_glm5v`] write tiny `gemma4v` and `glm5v` ones the same way. Also [`bmp`], a 24-bit BMP of any size for test images (decoded by stb_image like a PNG).
 
 use std::path::Path;
 
@@ -198,4 +198,110 @@ pub fn bmp(width: u32, height: u32, rgb: impl Fn(u32, u32) -> [u8; 3]) -> Vec<u8
         out.resize(start + row as usize, 0);
     }
     out
+}
+
+/// The tiny `glm5v` tower's patch side: 6 pixels, 108 values a patch, which the GPU tower pads
+/// to 112 as it pads the real tower's 588 to 592.
+pub const GLM_PATCH: u32 = 6;
+/// The tiny `glm5v` tower's merger width (the 2×2 convolution's output, GLM's `out_hidden_size`)
+/// and its projector MLP's hidden width.
+pub const GLM_MERGE_WIDTH: u32 = 24;
+pub const GLM_PROJ_FF: u32 = 40;
+/// The tiny `glm5v` tower's SwiGLU clamp: small, so the random weights reach it.
+pub const GLM_SWIGLU_CLAMP: f32 = 0.75;
+
+/// Writes a tiny `glm5v` projector (GLM-5.3-Flash's tower, #1219) for a language model of width
+/// `n_out`: two blocks of width 16 (two heads of 8), patches of 6 pixels merged 2 × 2 by a
+/// convolution, F32 weights, 4 to 64 tokens per image. `mm_bias` gives the projector MLP biases
+/// (the real tower has none; llama.cpp reads them when there).
+pub fn write_glm5v(
+    path: impl AsRef<Path>,
+    n_out: u32,
+    seed: u64,
+    mm_bias: bool,
+) -> Result<(), GgufError> {
+    let mut w = GgufWriter::new();
+    let u32v = Value::U32;
+    let f3 = |v: f32| Value::Array(vec![Value::F32(v); 3]);
+    w.set("general.architecture", &Value::String("clip".into()))?;
+    w.set("general.type", &Value::String("mmproj".into()))?;
+    w.set("clip.projector_type", &Value::String("glm5v".into()))?;
+    w.set("clip.has_vision_encoder", &Value::Bool(true))?;
+    w.set("clip.use_silu", &Value::Bool(true))?;
+    let token = GLM_PATCH * 2 * GLM_PATCH * 2;
+    for (k, v) in [
+        ("projection_dim", u32v(GLM_MERGE_WIDTH)),
+        ("image_size", u32v(GLM_PATCH * POS_SIDE)),
+        ("patch_size", u32v(GLM_PATCH)),
+        ("embedding_length", u32v(N_EMBD)),
+        ("feed_forward_length", u32v(N_FF)),
+        ("block_count", u32v(N_LAYER)),
+        ("attention.head_count", u32v(N_HEAD)),
+        ("attention.layer_norm_epsilon", Value::F32(1e-5)),
+        ("spatial_merge_size", u32v(2)),
+        ("swiglu_clamp", Value::F32(GLM_SWIGLU_CLAMP)),
+        ("image_min_pixels", u32v(4 * token)),
+        ("image_max_pixels", u32v(64 * token)),
+        ("image_mean", f3(0.5)),
+        ("image_std", f3(0.25)),
+    ] {
+        w.set(&format!("clip.vision.{k}"), &v)?;
+    }
+    let mut rng = Rng::new(seed);
+    let mut add = |name: &str, shape: &[i64], base: f32, a: f32| -> Result<(), GgufError> {
+        let n: i64 = shape.iter().product();
+        let data: Vec<u8> = (0..n)
+            .flat_map(|_| (base + (rng.next_f64() as f32 * 2.0 - 1.0) * a).to_ne_bytes())
+            .collect();
+        w.add_tensor(name, types::F32, shape, &data).map(|_| ())
+    };
+    let (e, p, ff, o) = (N_EMBD as i64, GLM_PATCH as i64, N_FF as i64, n_out as i64);
+    let (mw, mff) = (GLM_MERGE_WIDTH as i64, GLM_PROJ_FF as i64);
+    let d = e / N_HEAD as i64;
+    // Random weights at twice the usual scale, so the clamps bite.
+    let scale = |fan_in: i64| 2.0 / (fan_in as f32).sqrt();
+    add("v.patch_embd.weight", &[p, p, 3, e], 0.0, scale(3 * p * p))?;
+    add(
+        "v.patch_embd.weight.1",
+        &[p, p, 3, e],
+        0.0,
+        scale(3 * p * p),
+    )?;
+    add("v.patch_embd.bias", &[e], 0.0, 0.1)?;
+    for il in 0..N_LAYER {
+        let t = |n: &str| format!("v.blk.{il}.{n}");
+        for ln in ["ln1", "ln2"] {
+            add(&t(&format!("{ln}.weight")), &[e], 1.0, 0.2)?;
+        }
+        for qk in ["attn_q_norm", "attn_k_norm"] {
+            add(&t(&format!("{qk}.weight")), &[d], 1.0, 0.2)?;
+        }
+        for (m, k, n) in [
+            ("attn_qkv", e, 3 * e),
+            ("attn_out", e, e),
+            ("ffn_gate", e, ff),
+            ("ffn_up", e, ff),
+            ("ffn_down", ff, e),
+        ] {
+            add(&t(&format!("{m}.weight")), &[k, n], 0.0, scale(k))?;
+            add(&t(&format!("{m}.bias")), &[n], 0.0, 0.1)?;
+        }
+    }
+    add("v.post_ln.weight", &[e], 1.0, 0.2)?;
+    add("mm.patch_merger.weight", &[2, 2, e, mw], 0.0, scale(4 * e))?;
+    add("mm.patch_merger.bias", &[mw], 0.0, 0.1)?;
+    add("mm.model.fc.weight", &[mw, mw], 0.0, scale(mw))?;
+    add("mm.post_norm.weight", &[mw], 1.0, 0.2)?;
+    add("mm.post_norm.bias", &[mw], 0.0, 0.1)?;
+    for (m, k, n) in [
+        ("mm.gate", mw, mff),
+        ("mm.up", mw, mff),
+        ("mm.down", mff, o),
+    ] {
+        add(&format!("{m}.weight"), &[k, n], 0.0, scale(k))?;
+        if mm_bias {
+            add(&format!("{m}.bias"), &[n], 0.0, 0.1)?;
+        }
+    }
+    w.write(path)
 }

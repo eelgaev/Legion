@@ -1,8 +1,9 @@
-//! Vision for Qwen3-VL and Gemma 4 mmproj files: image preprocessing ([`preprocess`]) and the
-//! vision tower ([`Encoder`]).
+//! Vision for Qwen3-VL, Gemma 4 and GLM-5.3-Flash mmproj files: image preprocessing
+//! ([`preprocess`]) and the vision tower ([`Encoder`]).
 
 mod decode;
 mod gemma4v;
+mod glm5v;
 #[cfg(feature = "cuda")]
 mod gpu;
 mod preprocess;
@@ -40,11 +41,14 @@ pub enum Projector {
     Qwen3vl,
     /// Gemma 4's ViT, 3×3 average pool and projection (`gemma4v`).
     Gemma4v,
+    /// GLM-5.3-Flash's ViT, 2×2 convolution and SwiGLU projector (`glm5v`).
+    Glm5v,
 }
 
 /// Preprocessing parameters from a `clip` mmproj.
 /// Resizing uses bicubic interpolation, as in mtmd: Qwen3-VL's keeps the aspect ratio with
-/// centered black padding, Gemma 4's resizes to the aligned size itself.
+/// centered black padding, Gemma 4's resizes to the aligned size itself, GLM-5.3-Flash's
+/// places the image at the top left of an aligned black canvas.
 #[derive(Debug, Clone)]
 pub struct VisionHparams {
     pub projector: Projector,
@@ -66,6 +70,7 @@ impl VisionHparams {
         let kind = match (arch.as_str(), projector.as_str()) {
             ("clip", "qwen3vl_merger") => Projector::Qwen3vl,
             ("clip", "gemma4v") => Projector::Gemma4v,
+            ("clip", "glm5v") => Projector::Glm5v,
             _ => return Err(VisionError::Unsupported(format!("{arch}/{projector}"))),
         };
         let integer = |name: &str, default: Option<u32>| {
@@ -101,10 +106,12 @@ impl VisionHparams {
         // clip_hparams::set_limit_image_tokens: Qwen3-VL merges 2×2 patches into one token and
         // takes 8 to 4096 of them, Gemma 4 pools 3×3 (`projector.scale_factor` when present)
         // and takes 70 to 1120. image_size is a nominal model size, not the dynamic resize
-        // target.
+        // target. GLM-5.3-Flash's (GLM5V) limits are required keys of its mmproj (the
+        // processor's 16 to 8000 tokens as pixels); the defaults here are those.
         let (spatial_merge_size, tokens) = match kind {
             Projector::Qwen3vl => (integer("spatial_merge_size", Some(2))?, (8, 4096)),
             Projector::Gemma4v => (integer("projector.scale_factor", Some(3))?, (70, 1120)),
+            Projector::Glm5v => (integer("spatial_merge_size", Some(2))?, (16, 8000)),
         };
         let area = patch_size
             .checked_mul(spatial_merge_size)

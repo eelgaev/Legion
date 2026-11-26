@@ -77,6 +77,7 @@ pub(super) fn config(
         merge: hp.spatial_merge_size as usize,
         pos_side: pos.shape[1] as usize,
         n_out,
+        swiglu_limit: 0.0,
     };
     if !cfg.n_embd.is_multiple_of(cfg.n_head) || !cfg.d_head().is_multiple_of(4) {
         return Err(meta("a head width divisible by 4"));

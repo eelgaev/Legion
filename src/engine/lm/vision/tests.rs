@@ -25,6 +25,61 @@ fn placeholders_expand_to_image_tokens() {
     assert_eq!(expand_tokens(&[1, 2], &gemma, &[]), (vec![1, 2], vec![]));
 }
 
+/// GLM-5.3-Flash (#1219): its template's `<|begin_of_image|><|image|><|end_of_image|>` keeps
+/// its own marks and `<|image|>` repeats once per image token, positions one per token; with one
+/// image and with two (text between them), each image's tokens start right after its
+/// `<|begin_of_image|>`. A tokenizer without `<|image|>` is refused, and the architecture takes
+/// the `glm5v` tower.
+#[test]
+fn glm_images_expand_between_their_marks() {
+    use crate::gguf::{GgufFile, GgufWriter};
+    let dir = tempfile::tempdir().unwrap();
+    let vocab = |name: &str, user: &[&str]| {
+        let path = dir.path().join(name);
+        let mut w = GgufWriter::new();
+        crate::model::qwen35::tiny::byte_tokenizer_with(&mut w, user, None).unwrap();
+        w.write(&path).unwrap();
+        Tokenizer::from_gguf(&GgufFile::open(path).unwrap()).unwrap()
+    };
+    let tok = vocab(
+        "glm.gguf",
+        &["<|begin_of_image|>", "<|image|>", "<|end_of_image|>"],
+    );
+    let marks = Marks::of(GLM_ARCH, &tok).unwrap();
+    let id = |t: &str| tok.token_id(t).unwrap();
+    let (open, pad, close) = (
+        id("<|begin_of_image|>"),
+        id("<|image|>"),
+        id("<|end_of_image|>"),
+    );
+    assert_eq!(
+        marks,
+        Marks {
+            pad,
+            open: None,
+            close: None,
+            layout: ImageLayout::Sequential,
+        }
+    );
+    let image = "<|begin_of_image|><|image|><|end_of_image|>";
+    let one = tok.encode_with(&format!("a{image}b"), false, true);
+    assert_eq!(one, [u32::from(b'a'), open, pad, close, u32::from(b'b')]);
+    let (t, starts) = expand_tokens(&one, &marks, &[(3, 2)]);
+    let mut want = vec![u32::from(b'a'), open];
+    want.extend([pad; 6]);
+    want.extend([close, u32::from(b'b')]);
+    assert_eq!(t, want);
+    assert_eq!(starts, [2]);
+    let two = tok.encode_with(&format!("{image}c{image}"), false, true);
+    let (t, starts) = expand_tokens(&two, &marks, &[(2, 1), (1, 3)]);
+    let c = u32::from(b'c');
+    assert_eq!(t, [open, pad, pad, close, c, open, pad, pad, pad, close]);
+    assert_eq!(starts, [1, 6]);
+    let err = Marks::of(GLM_ARCH, &vocab("plain.gguf", &[])).unwrap_err();
+    assert!(err.contains("<|image|>"), "{err}");
+    assert_eq!(projector_of(GLM_ARCH), Some(Projector::Glm5v));
+}
+
 /// Image keys sit above any vocabulary, differ between the tokens of an image and between
 /// images, and are the same for the same image.
 #[test]
