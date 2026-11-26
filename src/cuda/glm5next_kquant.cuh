@@ -249,12 +249,12 @@ constexpr int KQ_STAGE = 8;
 constexpr int KQ_STAGE_V = KQ_STAGE * 210 / 16;  // uint4s per group
 constexpr int KQ_STAGE_PER = (KQ_STAGE_V + 31) / 32;
 
+// linear_mv_q6k_st's rows of block `bx` of matrix `i`, staged through `sm` (also the body of
+// linear_set_q6k_st, glm5next.cu: the same code, the same bits).
 template <int N>
-__global__ void __launch_bounds__(128) linear_mv_q6k_st(const Lin p) {
-    pdl_wait();
-    __shared__ uint4 sm[4][KQ_STAGE_V];
+__device__ __forceinline__ void q6k_st_rows(const Lin & p, int64_t bx, int64_t i, uint4 (*sm)[KQ_STAGE_V]) {
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int64_t r = (int64_t) blockIdx.x * 4 + warp, i = blockIdx.y;
+    const int64_t r = bx * 4 + warp;
     if (r >= p.m) {
         return;
     }
@@ -337,6 +337,13 @@ __global__ void __launch_bounds__(128) linear_mv_q6k_st(const Lin p) {
             p.dst[(t * p.h + i) * p.m + r] = s * sc;
         }
     }
+}
+
+template <int N>
+__global__ void __launch_bounds__(128) linear_mv_q6k_st(const Lin p) {
+    pdl_wait();
+    __shared__ uint4 sm[4][KQ_STAGE_V];
+    q6k_st_rows<N>(p, blockIdx.x, blockIdx.y, sm);
 }
 
 // linear_mv_q6k_st over R consecutive rows a warp (#1172 r3, params[7], ops::q6k_mv): the rows of

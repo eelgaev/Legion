@@ -995,6 +995,20 @@ __global__ void __launch_bounds__(128) linear_set_q8(const LinSet s) {
     }
 }
 
+// Up to LS_MAX Q6_K products of one launch (ops::linear_set_q6k, #871: KDA's q, k and v), each
+// segment's blocks running linear_mv_q6k_st's code on its rows (q6k_st_rows): the same bits as a
+// launch each, without the two kernel boundaries between them.
+template <int N>
+__global__ void __launch_bounds__(128) linear_set_q6k_st(const LinSet s) {
+    pdl_wait();
+    __shared__ uint4 sm[4][KQ_STAGE_V];
+    int g = 0;
+    while (g + 1 < s.nseg && (int64_t) blockIdx.x >= s.first[g + 1]) {
+        g++;
+    }
+    q6k_st_rows<N>(s.p[g], (int64_t) blockIdx.x - s.first[g], 0, sm);
+}
+
 // linear_set_q8 for segments of 4-block rows (k = 128: GLM's ssm_f_b and ssm_g_b, #1172 r4) at
 // 1-4 tokens. linear_set_q8's warp a row leaves 16 lanes idle on such a row and loads it in
 // 2-byte pieces, and a step's 16,384 rows take 4,096 blocks (~52 GB/s on a GB10). Here a block
@@ -2162,7 +2176,62 @@ int launch_linear(const A & a, cudaStream_t st) {
 // LINEAR_SET (linear_set in ops.rs): params [segments, each one's epilogue x3, kda_gate's lower,
 // tokens]; sources (w, x) per segment, then ssm_dt.bias and ssm_a with an LS_KDA_GATE epilogue.
 // Q8_0 matrices and up to 8 tokens; the outputs one after the other, [m, n] each.
+// ops::linear_set_q6k (#871): plain Q6_K products of one x, each one linear_mv_q6k_st's
+// (launch_linear's choice for them: the GB10 kernels, rows of whole stages, 16-byte aligned).
+int launch_linear_set_q6k(const A & a, cudaStream_t st) {
+    LinSet s{};
+    s.nseg = a.params[0];
+    const int64_t n = a.params[5];
+    if (s.nseg < 1 || s.nseg > LS_MAX || n < 1 || n > 8) {
+        return 1;
+    }
+    int64_t first = 0, off = 0;
+    for (int g = 0; g < s.nseg; g++) {
+        const int wi = 2 * g, xi = 2 * g + 1;
+        Lin & p = s.p[g];
+        p.w = (const char *) a.src[wi];
+        p.w_nb1 = a.src_nb[wi][1];
+        p.w_nb2 = 0;
+        p.wtype = a.src_type[wi];
+        p.k = a.src_ne[wi][0];
+        p.m = a.src_ne[wi][1];
+        p.h = 1;
+        p.x = (const char *) a.src[xi];
+        p.x_nbi = 0;
+        p.x_nbt = a.src_ne[xi][1] == 1 && a.src_ne[xi][2] > 1 ? a.src_nb[xi][2] : a.src_nb[xi][1];
+        p.n = n;
+        p.dst = (float *) a.dst + off;
+        p.ws = nullptr;
+        p.ws_n = 0;
+        p.scale = 1.0f;
+        if (p.wtype != T_Q6_K || a.params[1 + g] != LS_PLAIN || a.src_ne[wi][2] != 1 ||
+            p.k % (256 * KQ_STAGE) != 0 || a.src_ne[xi][0] != p.k ||
+            ((int64_t) ((uintptr_t) p.w | p.w_nb1) % 16) != 0 ||
+            ((int64_t) ((uintptr_t) p.x | p.x_nbt) % 16) != 0) {
+            return 1;
+        }
+        s.first[g] = first;
+        first += (p.m + 3) / 4;
+        off += p.m * n;
+    }
+    s.first[s.nseg] = first;
+    const unsigned grid = (unsigned) first;
+    if (n == 1) {
+        launch_pdl(linear_set_q6k_st<1>, grid, 128, 0, st, s);
+    } else if (n == 2) {
+        launch_pdl(linear_set_q6k_st<2>, grid, 128, 0, st, s);
+    } else if (n <= 4) {
+        launch_pdl(linear_set_q6k_st<4>, grid, 128, 0, st, s);
+    } else {
+        launch_pdl(linear_set_q6k_st<8>, grid, 128, 0, st, s);
+    }
+    return 0;
+}
+
 int launch_linear_set(const A & a, cudaStream_t st) {
+    if (a.src_type[0] == T_Q6_K) {
+        return launch_linear_set_q6k(a, st);
+    }
     LinSet s{};
     s.nseg = a.params[0];
     const int64_t n = a.params[5];
@@ -4614,6 +4683,99 @@ __global__ void pmax_kernel(const A a) {
     }
 }
 
+// pmax_kernel over many CTAs a column (ops::pmax, params[0], #871): its one CTA took ~86 us on a
+// 155K vocabulary, most of it its threads' FP64 sums on one SM. Here the max is taken over
+// PMAX_SPLIT chunks (pmax_max_kernel; a max is the same in any order), each of pmax_kernel's
+// PMAX_WARPS warps runs as a CTA of its own (pmax_sum_kernel: each lane sums the elements its
+// thread did, in the same order, and warp_sum adds the lanes as block_sum's first step does),
+// and pmax_fin_kernel adds the warps' sums as block_sum's second step does: the same bits.
+// dst is F32 [n, PMAX_ROWS]: row 0 the results, rows 1..PMAX_SPLIT the chunks' maxima, and from
+// float PMAX_SUM_ROW * n the warps' sums as doubles ([n][PMAX_WARPS]).
+constexpr int PMAX_SPLIT = 32;
+constexpr int PMAX_WARPS = 8;  // pmax_kernel's 256 threads
+constexpr int PMAX_SUM_ROW = 2 + PMAX_SPLIT;  // even, so the doubles are 8-byte aligned
+constexpr int PMAX_ROWS = PMAX_SUM_ROW + 2 * PMAX_WARPS;
+static_assert(PMAX_SPLIT == 32, "pmax_sum_kernel: a chunk a lane");
+
+__global__ void __launch_bounds__(256) pmax_max_kernel(const A a) {
+    pdl_wait();
+    const int64_t v = a.src_ne[0][0], n = a.ne[0], t = blockIdx.y, c = blockIdx.x;
+    const int64_t len = (v + PMAX_SPLIT - 1) / PMAX_SPLIT, i1 = min(v, (c + 1) * len);
+    const float * x = (const float *) a.src[0] + t * v;
+    float m = -INFINITY;
+    for (int64_t i0 = c * len + threadIdx.x; i0 < i1; i0 += VOCAB_UNROLL * blockDim.x) {
+        float xs[VOCAB_UNROLL];
+#pragma unroll
+        for (int u = 0; u < VOCAB_UNROLL; u++) {
+            const int64_t i = i0 + u * blockDim.x;
+            xs[u]           = i < i1 ? __ldg(x + i) : -INFINITY;
+        }
+#pragma unroll
+        for (int u = 0; u < VOCAB_UNROLL; u++) {
+            m = fmaxf(m, xs[u]);
+        }
+    }
+    __shared__ float ms[8];
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    }
+    if (threadIdx.x % 32 == 0) {
+        ms[threadIdx.x / 32] = m;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int w = 1; w < (int) blockDim.x / 32; w++) {
+            m = fmaxf(m, ms[w]);
+        }
+        ((float *) a.dst)[n + t * PMAX_SPLIT + c] = m;
+    }
+}
+
+__global__ void __launch_bounds__(32) pmax_sum_kernel(const A a) {
+    pdl_wait();
+    const int64_t v = a.src_ne[0][0], n = a.ne[0], t = blockIdx.y;
+    const int lane = threadIdx.x, w = blockIdx.x, stride = 32 * PMAX_WARPS;
+    const float * x = (const float *) a.src[0] + t * v;
+    float m = ((const float *) a.dst)[n + t * PMAX_SPLIT + lane];
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    }
+    // pmax_kernel's thread 32 w + lane: its elements, in its order.
+    double sum = 0.0;
+    for (int64_t i0 = 32 * w + lane; i0 < v; i0 += (int64_t) VOCAB_UNROLL * stride) {
+        float xs[VOCAB_UNROLL];
+#pragma unroll
+        for (int u = 0; u < VOCAB_UNROLL; u++) {
+            const int64_t i = i0 + u * stride;
+            xs[u]           = i < v ? __ldg(x + i) : 0.0f;
+        }
+#pragma unroll
+        for (int u = 0; u < VOCAB_UNROLL; u++) {
+            if (i0 + u * stride < v) {
+                sum += (double) expf(xs[u] - m);
+            }
+        }
+    }
+    sum = warp_sum(sum);
+    if (lane == 0) {
+        ((double *) ((float *) a.dst + PMAX_SUM_ROW * n))[t * PMAX_WARPS + w] = sum;
+    }
+}
+
+__global__ void __launch_bounds__(32) pmax_fin_kernel(const A a) {
+    pdl_wait();
+    const int64_t n = a.ne[0], t = blockIdx.x;
+    const int lane = threadIdx.x;
+    const double * part = (const double *) ((const float *) a.dst + PMAX_SUM_ROW * n) + t * PMAX_WARPS;
+    double sum = lane < PMAX_WARPS ? part[lane] : 0.0;
+    sum = warp_sum(sum);
+    if (lane == 0) {
+        ((float *) a.dst)[t] = (float) (1.0 / sum);
+    }
+}
+
 // MTP input: [rms(e) * enorm; rms(h) * hnorm] per token, a block per (token, half).
 __global__ void nextn_in_kernel(const A a) {
     pdl_wait();
@@ -4933,6 +5095,15 @@ extern "C" int legion_glm_launch(int op, const legion_glm_args * ap, void * stre
             launch_pdl(argmax_kernel, (unsigned) a.ne[0], 256, 0, st, a);
             break;
         case PMAX:
+            if (a.params[0]) {  // ops::pmax's split (#871)
+                if (a.params[0] != PMAX_SPLIT || a.ne[1] != PMAX_ROWS) {
+                    return 1;
+                }
+                launch_pdl(pmax_max_kernel, dim3(PMAX_SPLIT, (unsigned) a.ne[0]), 256, 0, st, a);
+                launch_pdl(pmax_sum_kernel, dim3(PMAX_WARPS, (unsigned) a.ne[0]), 32, 0, st, a);
+                launch_pdl(pmax_fin_kernel, (unsigned) a.ne[0], 32, 0, st, a);
+                break;
+            }
             launch_pdl(pmax_kernel, (unsigned) a.ne[0], 256, 0, st, a);
             break;
         case NEXTN_IN:

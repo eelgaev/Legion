@@ -1069,6 +1069,77 @@ pub fn linear_set<'a>(
         .collect()
 }
 
+/// [`qkv_set`] before the first read: the environment's choice.
+const QKV_SET_UNSET: u8 = u8::MAX;
+
+static QKV_SET: AtomicU8 = AtomicU8::new(QKV_SET_UNSET);
+
+/// Whether sibling Q6_K products of one `x` that would each take linear_mv_q6k_st go in one
+/// launch ([`linear_set_q6k`], #871: KDA's q, k and v): on unless `LEGION_DEBUG_GLM_QKV_SET=0`
+/// (an A/B switch, read once).
+pub fn qkv_set() -> bool {
+    let v = QKV_SET.load(Ordering::Relaxed);
+    if v != QKV_SET_UNSET {
+        return v != 0;
+    }
+    let v = qkv_set_of(std::env::var("LEGION_DEBUG_GLM_QKV_SET").ok().as_deref());
+    QKV_SET.store(v as u8, Ordering::Relaxed);
+    v
+}
+
+/// [`qkv_set`] given the environment's value: off only for `0`.
+pub(crate) fn qkv_set_of(env: Option<&str>) -> bool {
+    env.map(str::trim) != Some("0")
+}
+
+/// Whether [`linear_set_q6k`] takes the weights `ws` over the F32 `x`: where [`qkv_set`] is on,
+/// 1-[`SET_MAX`] Q6_K matrices without a converted F16 copy, each of whose [`linear`]s of `x`
+/// takes CUDA's linear_mv_q6k_st (the GB10 GEMV of 1-8 tokens, contiguous rows of whole stages
+/// that [`q6k_mv`] leaves on it). The caller checks that none has a weight scale.
+pub fn linear_set_q6k_takes(ws: &[Tensor<'_>], x: Tensor<'_>) -> bool {
+    let n: i64 = x.ne()[1..].iter().product();
+    let gemv = GB10_GEMV.load(Ordering::Relaxed);
+    let gb10 = gb10_kernels(GB10_LINEAR.load(Ordering::Relaxed), gemv, n);
+    gemv && gb10
+        && (1..=SET_MAX).contains(&ws.len())
+        && (1..=8).contains(&n)
+        && x.ty() == types::F32
+        && x.is_contiguous()
+        && !q6k_f16_takes(gb10, Q6K_F16.load(Ordering::Relaxed), n)
+        && ws.iter().all(|w| {
+            let [k, m, h, _] = w.ne();
+            let nb1 = w.nb()[1] as i64;
+            w.ty() == types::Q6_K
+                && h == 1
+                && k == x.ne()[0]
+                && k % (256 * Q6K_STAGE) == 0
+                && nb1 == k / 256 * 210
+                && q6k_mv_param(q6k_mv(), k, m, nb1) & 255 == 0
+        })
+        && qkv_set()
+}
+
+/// The products `w @ x` of the Q6_K weights `ws` ([`linear_set_q6k_takes`]) in one node: on CUDA
+/// one launch whose blocks run linear_mv_q6k_st's code on each product's rows, the bits of a
+/// [`linear`] each (scale 1, no weight scale). Returns F32 `[m, n]` per product.
+pub fn linear_set_q6k<'a>(ctx: &'a Context, ws: &[Tensor<'a>], x: Tensor<'a>) -> Vec<Tensor<'a>> {
+    assert!(linear_set_q6k_takes(ws, x), "glm_linear_set: Q6_K set");
+    let n: i64 = x.ne()[1..].iter().product();
+    let args: Vec<_> = ws.iter().flat_map(|&w| [w, x]).collect();
+    let params = [ws.len() as i32, 0, 0, 0, 0, n as i32, small_mv_param()];
+    let total: i64 = ws.iter().map(|w| w.ne()[1] * n).sum();
+    let node = ctx.external_with(&LINEAR_SET, types::F32, [total, 1, 1, 1], &args, &params);
+    let mut off = 0usize;
+    ws.iter()
+        .map(|w| {
+            let m = w.ne()[1];
+            let v = ctx.view_2d(node, [m, n], m as usize * 4, off);
+            off += (m * n) as usize * 4;
+            v
+        })
+        .collect()
+}
+
 /// Whether [`glu_mv`] takes the gate and up weights `gate`, `up` over `n` tokens: Q6_K
 /// matrices of one shape and layout, `k` a multiple of 256, up to 8 tokens (decode and verify
 /// steps), and the plain kernels (not the GB10 ones, [`set_gb10_linear`]), whose
@@ -1668,10 +1739,26 @@ pub fn argmax_wide_ids<'a>(ctx: &'a Context, x: Tensor<'a>, ids: Option<Tensor<'
     ctx.view_1d(node, n, 0)
 }
 
+/// Chunks a column's max is split into in CUDA's [`pmax`] (pmax_max_kernel's CTAs).
+const PMAX_SPLIT: i64 = 32;
+/// Rows of CUDA's [`pmax`] node: the results, [`PMAX_SPLIT`] chunk maxima, a pad row, and the
+/// 8 warps' F64 sums (16 rows).
+const PMAX_ROWS: i64 = 2 + PMAX_SPLIT + 16;
+
 /// Each column's largest softmax probability, `1 / Σ exp(x - max)`: F32 `[n]` from F32
-/// `[v, n]` (an MTP draft's confidence).
+/// `[v, n]` (an MTP draft's confidence). CUDA spreads a column over many CTAs (#871: one CTA
+/// took ~86 us on a 155K vocabulary), each element summed in the order and grouping of the
+/// one-CTA kernel: the same bits. The node holds their partial results past the first row.
 pub fn pmax<'a>(ctx: &'a Context, x: Tensor<'a>) -> Tensor<'a> {
-    ctx.external(&PMAX, types::F32, [x.ne()[1], 1, 1, 1], &[contiguous(x)])
+    let n = x.ne()[1];
+    let node = ctx.external_with(
+        &PMAX,
+        types::F32,
+        [n, PMAX_ROWS, 1, 1],
+        &[contiguous(x)],
+        &[PMAX_SPLIT as i32],
+    );
+    ctx.view_1d(node, n, 0)
 }
 
 /// The MTP head's input (llama.cpp's `graph_mtp`): per token, the RMS-normed embedding `e`

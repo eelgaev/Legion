@@ -1609,10 +1609,27 @@ impl Model {
             format!("attn_v.weight{s}"),
         ];
         let qkv = [qkv[0].as_str(), qkv[1].as_str(), qkv[2].as_str()];
-        let xh = self.glm_xh(ctx, il, &qkv, x);
-        let q = self.glm_lmm_h(ctx, il, qkv[0], x, xh)?;
-        let k = self.glm_lmm_h(ctx, il, qkv[1], x, xh)?;
-        let v = self.glm_lmm_h(ctx, il, qkv[2], x, xh)?;
+        let qkv_w: Vec<Tensor<'a>> = qkv
+            .iter()
+            .map(|n| self.lw(il, n))
+            .collect::<Result<_, _>>()?;
+        let scaled = qkv.iter().any(|n| {
+            n.strip_suffix(".weight")
+                .is_some_and(|b| self.lw(il, &format!("{b}.scale")).is_ok())
+        });
+        let (q, k, v) = if !scaled && ops::linear_set_q6k_takes(&qkv_w, x) {
+            // Steps of 1-8 tokens on the GB10 GEMV (#871): the three products in one launch,
+            // each row summed as its own launch sums it (the same bits).
+            let o = ops::linear_set_q6k(ctx, &qkv_w, x);
+            (o[0], o[1], o[2])
+        } else {
+            let xh = self.glm_xh(ctx, il, &qkv, x);
+            (
+                self.glm_lmm_h(ctx, il, qkv[0], x, xh)?,
+                self.glm_lmm_h(ctx, il, qkv[1], x, xh)?,
+                self.glm_lmm_h(ctx, il, qkv[2], x, xh)?,
+            )
+        };
         let (dt, ssm_a) = (
             self.lw(il, &format!("ssm_dt.bias{s}"))?,
             self.lw(il, &format!("ssm_a{s}"))?,

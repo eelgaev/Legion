@@ -1682,6 +1682,66 @@ fn cuda_glu_mv_is_linear_twice_then_glu() {
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
 
+#[test]
+fn qkv_set_takes_the_debug_switch() {
+    assert!(qkv_set_of(None));
+    assert!(qkv_set_of(Some("1")));
+    assert!(!qkv_set_of(Some(" 0\n")));
+}
+
+/// On CUDA with the GB10 kernels (#871): a Q6_K set gives each product's linear bits, and the
+/// split pmax gives the one-CTA kernel's.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_q6k_set_and_split_pmax_give_the_same_bits() {
+    use crate::ggml::{DeviceKind, device_by_kind};
+    let mut gpu = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU device")
+        .init()
+        .unwrap();
+    set_gb10_linear(true);
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let k = 4096usize;
+    let ms = [264usize, 40, 136];
+    let q6 = |m: usize, seed| {
+        let w: Vec<f32> = noise(k * m, seed).iter().map(|v| v * 0.5).collect();
+        Data::Raw(types::Q6_K, crate::ggml::quantize(types::Q6_K, &w, k))
+    };
+    for n in [1usize, 2, 3, 4, 7] {
+        let inputs = [
+            (&[k as i64, ms[0] as i64][..], q6(ms[0], 201)),
+            (&[k as i64, ms[1] as i64][..], q6(ms[1], 202)),
+            (&[k as i64, ms[2] as i64][..], q6(ms[2], 203)),
+            (
+                &[k as i64, n as i64][..],
+                Data::F32(noise(k * n, 204 + n as u64)),
+            ),
+        ];
+        for g in 0..3 {
+            let want = run_on(&mut gpu, &inputs, |ctx, t| {
+                linear(ctx, t[g], t[3], 1.0, None)
+            });
+            let got = run_on(&mut gpu, &inputs, |ctx, t| {
+                assert!(linear_set_q6k_takes(&t[..3], t[3]));
+                linear_set_q6k(ctx, &t[..3], t[3])[g]
+            });
+            assert_eq!(bits(&got), bits(&want), "n {n} product {g}");
+        }
+    }
+    set_gb10_linear(false);
+    for (v, n) in [(154_880usize, 3usize), (65_536, 1), (1000, 2), (37, 4)] {
+        let x: Vec<f32> = noise(v * n, 205).iter().map(|y| y * 8.0).collect();
+        let inputs = [(&[v as i64, n as i64][..], Data::F32(x))];
+        let want = run_on(&mut gpu, &inputs, |ctx, t| {
+            ctx.external(&PMAX, types::F32, [n as i64, 1, 1, 1], &[t[0]])
+        });
+        let got = run_on(&mut gpu, &inputs, |ctx, t| pmax(ctx, t[0]));
+        assert_eq!(bits(&got), bits(&want), "pmax v {v} n {n}");
+    }
+}
+
 /// MLA attention nodes carry the prompt kernel as their sixth parameter (#862): the launcher's
 /// choice for the model's [`mla_attn`], the one asked for by [`mla_attn_prompt`], which also
 /// turns the GB10 kernels on and the tensor-core kernel on for `Tc` only; the CPU reference
