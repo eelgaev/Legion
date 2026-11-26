@@ -57,26 +57,13 @@ unsafe fn launch(
         a.src_type[i] = s.type_ as i32;
         a.n_src = i as i32 + 1;
     }
-    let params = external_params(dst);
-    a.params.copy_from_slice(&params[..8]);
-    // SAFETY: device tensors of the stream's device (or a stream of the same device), described
-    // by `a`.
-    let run = |s: *mut c_void| match unsafe { legion_glm_launch(op, &a, s) } {
+    a.params.copy_from_slice(&external_params(dst)[..8]);
+    // SAFETY: device tensors of the stream's device, described by `a`.
+    match unsafe { legion_glm_launch(op, &a, stream) } {
         0 => Ok(()),
         1 => Err(format!("{name}: no CUDA kernel for this shape or type")),
         e => Err(format!("{name}: CUDA error {e}")),
-    };
-    // A link of a chain on the side stream (#871, [`super::shexp_side`]).
-    let side = params[super::P_SIDE];
-    if side != 0 {
-        return crate::model::core::l2_prefetch::on_side_link(
-            stream,
-            side & super::SIDE_FORK != 0,
-            side & super::SIDE_DONE != 0,
-            run,
-        );
     }
-    run(stream)
 }
 
 macro_rules! ops {

@@ -267,36 +267,6 @@ pub(crate) fn on_side(
     side::done(s)
 }
 
-/// Runs `launch` on the side stream as one link of a chain of ops there (#871, GLM's shared
-/// expert beside the routed experts): `fork` forks the side stream from `stream` first (the
-/// chain's first op), `done` records its done event after (the last op, for a [`side_join`]).
-/// The ops between keep the side stream's own order, so a kernel launched with programmatic
-/// serialization there may start while the one ahead of it on the side stream drains, as on the
-/// compute stream. In a capture, the node(s) `launch` captured keep the least priority.
-#[cfg(feature = "cuda")]
-pub(crate) fn on_side_link(
-    stream: *mut std::os::raw::c_void,
-    fork: bool,
-    done: bool,
-    launch: impl FnOnce(*mut std::os::raw::c_void) -> Result<(), String>,
-) -> Result<(), String> {
-    let s = if fork {
-        side::fork(stream)?
-    } else {
-        side::stream()?
-    };
-    launch(s)?;
-    crate::ggml::stage_graph::prio::mark_side(s);
-    if done { side::done(s) } else { Ok(()) }
-}
-
-/// Makes `stream` wait for the side stream's last done event (an op's launcher that joins
-/// outside the stage graphs' [`side_join`]).
-#[cfg(feature = "cuda")]
-pub(crate) fn join_now(stream: *mut std::os::raw::c_void) -> Result<(), String> {
-    side::join(stream)
-}
-
 #[cfg(feature = "cuda")]
 unsafe fn cuda_side_join(
     _dst: &ffi::ggml_tensor,
@@ -429,11 +399,6 @@ mod side {
             rt(cudaStreamWaitEvent(s.stream, s.fork, 0), "fork")?;
         }
         Ok(s.stream)
-    }
-
-    /// The current device's side stream, not forked again (the next link of a chain).
-    pub(super) fn stream() -> Result<*mut c_void, String> {
-        Ok(get()?.stream)
     }
 
     /// Records the done event on side stream `side` behind what it holds.

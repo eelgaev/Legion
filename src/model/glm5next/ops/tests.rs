@@ -872,51 +872,6 @@ fn q6k_f16_only_for_long_prompt_steps_on_the_gb10_kernels() {
     assert!(!q6k_f16_takes(true, false, 2048));
 }
 
-#[test]
-fn shexp_side_takes_the_debug_switch() {
-    assert!(shexp_side_of(None));
-    assert!(shexp_side_of(Some("1")));
-    assert!(!shexp_side_of(Some(" 0\n")));
-}
-
-/// The shared expert's GLU and down go on the side stream (#871): the GLU forks, the down
-/// records the done event, and the join keeps the down, the GLU's output and their input.
-/// Anything else (a down over a plain product, more than 4 tokens) is left alone.
-#[test]
-fn shexp_on_side_marks_the_glu_and_the_down() {
-    let ctx = Context::new(64, 0);
-    let (k, m) = (4096, 2048);
-    let gate = ctx.new_tensor(types::Q6_K, &[k, m]);
-    let up = ctx.new_tensor(types::Q6_K, &[k, m]);
-    let down = ctx.new_tensor(types::Q6_K, &[m, k]);
-    // SAFETY: the nodes live in `ctx`, alive here.
-    let side = |t: Tensor<'_>| unsafe { crate::ggml::external_params(&*t.raw())[P_SIDE] };
-    for n in 1..=4 {
-        let x = ctx.new_tensor(types::F32, &[k, n]);
-        let h = glu_mv(&ctx, gate, up, x, 7.0);
-        let sh = linear(&ctx, down, h, 1.0, None);
-        let keep = shexp_on_side(&ctx, sh).expect("a shared expert");
-        assert_eq!(keep.map(|t| t.raw()), [sh.raw(), h.raw(), x.raw()]);
-        assert_eq!(side(h), SIDE_ON | SIDE_FORK);
-        assert_eq!(side(sh), SIDE_ON | SIDE_DONE);
-        // Their kernels' params are untouched.
-        // SAFETY: as above.
-        let p = unsafe { crate::ggml::external_params(&*h.raw()) };
-        assert_eq!(p[0], 7.0f32.to_bits() as i32);
-        let j = side_join(&ctx, sh, &keep);
-        assert_eq!(j.ne(), [1, 1, 1, 1]);
-    }
-    let x = ctx.new_tensor(types::F32, &[k, 5]);
-    let h = glu_mv(&ctx, gate, up, x, 7.0);
-    let sh = linear(&ctx, down, h, 1.0, None);
-    assert!(shexp_on_side(&ctx, sh).is_none());
-    assert_eq!((side(h), side(sh)), (0, 0));
-    let x = ctx.new_tensor(types::F32, &[m, 2]);
-    let sh = linear(&ctx, down, x, 1.0, None);
-    assert!(shexp_on_side(&ctx, sh).is_none());
-    assert_eq!(side(sh), 0);
-}
-
 /// A linear node carries its F16 GEMM kernel ([`LinTc`]) as params[4]: 0 (the device's choice)
 /// from [`linear`] and [`linear_h`], the explicit one from [`linear_tc_kernel`] (#862).
 #[test]

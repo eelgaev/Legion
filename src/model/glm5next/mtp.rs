@@ -33,6 +33,7 @@ impl Model {
         shape: &'a [GroupShape],
     ) -> Result<(Graph<'a>, MtpGraph<'a>), ModelError> {
         let hp = &self.hp;
+        let p = self.glm();
         let (e, il) = (hp.n_embd, hp.n_layer);
         let n: i64 = shape.iter().map(|g| g.tokens() as i64).sum();
         let n_out: i64 = shape.iter().map(|g| g.out_rows() as i64).sum();
@@ -123,7 +124,8 @@ impl Model {
         }
         // A chunked SSD step's room (#1205): what the context holds past the head's rest.
         let room = ctx.tensors_left().saturating_sub(super::SSD_TAIL_TENSORS);
-        let (moe, sh) = self.glm_moe_shexp(&pass, il, x, room, None)?;
+        let moe = self.glm_moe(&pass, il, x, room, None)?;
+        let sh = self.glm_ffn(ctx, il, "_shexp", p.clamp_shexp[il], x)?;
         let out = ops::add(ctx, self.tp_sum(ctx, ops::add(ctx, moe, sh)), ffn_inp);
         let hn = ops::rms_norm(
             ctx,

@@ -1024,8 +1024,9 @@ impl Model {
                 let left = ctx.tensors_left();
                 let part = start - left;
                 let rest = most.max(2 * part) * (layers.end - il) - part + SSD_TAIL_TENSORS;
-                let (moe, sh) = self.glm_moe_shexp(pass, il, h, left.saturating_sub(rest), sp)?;
+                let moe = self.glm_moe(pass, il, h, left.saturating_sub(rest), sp)?;
                 tap.tap("ffn_moe_out", il, moe);
+                let sh = self.glm_ffn(ctx, il, "_shexp", p.clamp_shexp[il], h)?;
                 tap.tap("ffn_shexp", il, sh);
                 if self.tp_on() {
                     // This rank's rows of the routed and the shared experts: one sum of both.
@@ -1124,47 +1125,6 @@ impl Model {
         let u = self.glm_lmm_h(ctx, il, &un, x, xh)?;
         let h = ops::glu(ctx, g, u, limit);
         self.glm_lmm(ctx, il, &dn, h)
-    }
-
-    /// MoE layer `il`'s routed experts ([`Self::glm_moe`]) and shared expert ([`Self::glm_ffn`])
-    /// of `x`. In steps of 1-4 tokens on the GB10 kernels (#871, [`ops::shexp_side`]) the shared
-    /// expert runs on the side stream: put in the graph first, it streams its weights while the
-    /// router and the routed experts' small, latency-bound kernels run, and the compute stream
-    /// waits for it after the routed experts ([`ops::side_join`], which keeps its tensors
-    /// allocated until then). The same kernels on the same inputs: the same bits.
-    pub(crate) fn glm_moe_shexp<'a>(
-        &'a self,
-        pass: &Pass<'a>,
-        il: usize,
-        x: Tensor<'a>,
-        room: usize,
-        sp: Option<(i32, usize, usize)>,
-    ) -> Result<(Tensor<'a>, Tensor<'a>), ModelError> {
-        let ctx = pass.ctx;
-        let limit = self.glm().clamp_shexp[il];
-        let on = !pass.tap.on
-            && sp.is_none()
-            && !self.tp_on()
-            && self.ssd_experts().is_none()
-            && ops::shexp_side();
-        let first = on
-            .then(|| self.glm_ffn(ctx, il, "_shexp", limit, x))
-            .transpose()?;
-        let side = first.and_then(|sh| ops::shexp_on_side(ctx, sh));
-        if let Some([sh, ..]) = side {
-            pass.graph.borrow_mut().expand(sh);
-        }
-        let moe = self.glm_moe(pass, il, x, room, sp)?;
-        let sh = match (side, first) {
-            (Some(keep), _) => {
-                let j = ops::side_join(ctx, moe, &keep);
-                pass.graph.borrow_mut().expand(j);
-                keep[0]
-            }
-            (None, Some(sh)) => sh,
-            (None, None) => self.glm_ffn(ctx, il, "_shexp", limit, x)?,
-        };
-        Ok((moe, sh))
     }
 
     /// The routed experts of layer `il`: sigmoid router with the selection bias, the chosen
