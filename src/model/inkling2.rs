@@ -200,6 +200,7 @@ pub(crate) fn parse(g: &GgufFile, arch: &str) -> Result<Hparams, ModelError> {
         return unsupported("vision tower (run the text GGUF; images are not in Legion yet)");
     }
     let n_blocks = u("block_count")? as usize;
+    let count_key = if old { "num_loops" } else { "loop.count" };
     let (passes, start, end) = if old {
         (u("num_loops")?, u("loop.core_start")?, u("loop.core_end")?)
     } else {
@@ -211,9 +212,14 @@ pub(crate) fn parse(g: &GgufFile, arch: &str) -> Result<Hparams, ModelError> {
     }
     let block = u("attn_res.block_size")? as usize;
     let core_len = end.saturating_sub(start);
+    // The extra passes' slots, checked: a huge loop count must not wrap.
+    let extra = passes
+        .saturating_sub(1)
+        .checked_mul(core_len)
+        .ok_or_else(|| meta(count_key))?;
     let n_phys = if old {
         n_blocks
-            .checked_sub(passes.saturating_sub(1) * core_len)
+            .checked_sub(extra)
             .ok_or_else(|| meta("block_count"))?
     } else {
         n_blocks
@@ -231,7 +237,7 @@ pub(crate) fn parse(g: &GgufFile, arch: &str) -> Result<Hparams, ModelError> {
              passes for {n_phys} blocks"
         )));
     }
-    let n_slots = n_phys + (passes - 1) * core_len;
+    let n_slots = n_phys.checked_add(extra).ok_or_else(|| meta(count_key))?;
     let pattern = g
         .get(&key("attention.sliding_window_pattern"))
         .and_then(|v| {
@@ -273,8 +279,19 @@ pub(crate) fn parse(g: &GgufFile, arch: &str) -> Result<Hparams, ModelError> {
     let embd = g
         .tensor("token_embd.weight")
         .ok_or_else(|| ModelError::Tensor("token_embd.weight".into()))?;
-    if n_vocab == 0 || n_vocab > embd.shape[1] as i64 {
+    // The reader trims trailing unit dimensions: a missing row count is one row.
+    let embd_rows = embd.shape.get(1).copied().unwrap_or(1);
+    if n_vocab == 0 || n_vocab as u64 > embd_rows {
         return Err(meta("vocab_size_unpadded"));
+    }
+    // The head's soft-cap crops the logits to `n_vocab`: the head must have that many rows.
+    if let Some(out) = g.tensor("output.weight") {
+        let rows = out.shape.get(1).copied().unwrap_or(1);
+        if (n_vocab as u64) > rows {
+            return Err(ModelError::Layout(format!(
+                "inkling2: output.weight has {rows} rows for a vocabulary of {n_vocab}"
+            )));
+        }
     }
     let blocks_max = n_phys / block + 2;
     if blocks_max > ops::MAX_STATES {
@@ -306,6 +323,11 @@ pub(crate) fn parse(g: &GgufFile, arch: &str) -> Result<Hparams, ModelError> {
     if params.window == 0 || params.log_scale.floor <= 0.0 {
         return Err(meta("attention.sliding_window"));
     }
+    let n_expert = u("expert_count")? as i64;
+    let n_expert_used = u("expert_used_count")? as i64;
+    if !(1..=n_expert).contains(&n_expert_used) {
+        return Err(meta("expert_used_count"));
+    }
     Ok(Hparams {
         n_layer: n_slots,
         n_embd,
@@ -318,8 +340,8 @@ pub(crate) fn parse(g: &GgufFile, arch: &str) -> Result<Hparams, ModelError> {
         n_ctx_train: u("context_length")?.min(i32::MAX as u64) as i32,
         rms_eps: f("attention.layer_norm_rms_epsilon")?,
         moe: true,
-        n_expert: u("expert_count")? as i64,
-        n_expert_used: u("expert_used_count")? as i64,
+        n_expert,
+        n_expert_used,
         // No recurrent layers.
         full_attention_interval: 1,
         ssm_d_conv: 0,
@@ -734,7 +756,13 @@ impl Model {
         // The attention inputs: one mix (sliding layers) or one each for Q, K, V.
         let inp_sa = cur;
         let mut inputs = [cur; 3];
-        if let Ok(q) = self.lw(ip, "attn_res_query.weight") {
+        // Block 0 has no query (one state); every later block must have one.
+        let query = if ip == 0 {
+            self.lw(ip, "attn_res_query.weight").ok()
+        } else {
+            Some(self.lw(ip, "attn_res_query.weight")?)
+        };
+        if let Some(q) = query {
             let mixed = ops::mix(ctx, &states(blocks, cur), q, MIX_EPS);
             tap.tap("attn_mix", il, mixed);
             for (j, x) in inputs.iter_mut().enumerate() {
@@ -966,6 +994,15 @@ impl Model {
         let logits = self.ink_mm(ctx, ip, "ffn_gate_inp.weight", h)?;
         tap.tap("ffn_moe_logits", il, logits);
         let bias = self.lw(ip, "exp_probs_b.bias")?;
+        // The router's top-k needs `n_expert` logits and biases (`parse` checks k against it).
+        if logits.ne()[0] != hp.n_expert || bias.elements() as i64 != hp.n_expert {
+            return Err(ModelError::Layout(format!(
+                "inkling2: block {ip}'s router has {} experts and {} biases, want {}",
+                logits.ne()[0],
+                bias.elements(),
+                hp.n_expert
+            )));
+        }
         let ids = glm_ops::router_ids(ctx, logits, bias, hp.n_expert_used);
         // Tests only: slot `il`'s ids from the forced route (see [`FORCED_ROUTE`]), the
         // router's own traced as `ffn_moe_router`.
@@ -1010,7 +1047,9 @@ impl Model {
         let w = self.w(&name)?;
         let scale = self.w(&format!("blk.{ip}.{base}.scale")).ok();
         if w.ty() == types::NVFP4 {
-            if !nvfp4_mm::supports(w) || scale.is_some_and(|s| s.elements() as i64 != w.ne()[2]) {
+            // `mul_mat_id` asserts an F32 `[n_expert, 1, 1, 1]` scale: refuse anything else.
+            let bad_scale = |s: Tensor<'_>| s.ty() != types::F32 || s.ne() != [w.ne()[2], 1, 1, 1];
+            if !nvfp4_mm::supports(w) || scale.is_some_and(bad_scale) {
                 return Err(ModelError::Unsupported(format!(
                     "`{name}`: NVFP4 experts {:?} on this device",
                     w.ne()

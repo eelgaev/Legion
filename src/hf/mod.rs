@@ -83,7 +83,11 @@ pub(crate) fn open(dir: &Path, opts: &OpenOptions) -> Result<GgufFile, GgufError
         .unwrap_or_default()
         .to_string();
     let mut b = Builder::new(Arc::new(ckpt));
-    b.modelopt = nvfp4::ModelOpt::detect(&b.ckpt, &config, opts.fp8).map_err(err)?;
+    // Inkling-2's experts carry their own scales (`hf::inkling2`): no ModelOpt layer keys, and
+    // no quantization sidecar to parse.
+    if !matches!(model_type.as_str(), "inkling2_loop" | "inkling2_loop_text") {
+        b.modelopt = nvfp4::ModelOpt::detect(&b.ckpt, &config, opts.fp8).map_err(err)?;
+    }
     b.mtp_nvfp4 = opts.mtp_nvfp4;
     b.dense_fp8_on =
         opts.dense_fp8 && matches!(model_type.as_str(), "qwen4_exp" | "qwen4_exp_text");
@@ -96,11 +100,7 @@ pub(crate) fn open(dir: &Path, opts: &OpenOptions) -> Result<GgufFile, GgufError
         "qwen4_exp" | "qwen4_exp_text" => qwen4::build(&mut b, &config).map_err(err)?,
         "glm5_next" | "glm5_next_text" => glm5next::build(&mut b, &config).map_err(err)?,
         "deepseek_v41" | "deepseek_v41_text" => deepseek41::build(&mut b, &config).map_err(err)?,
-        "inkling2_loop" | "inkling2_loop_text" => {
-            // Its experts carry their own scales (`hf::inkling2`); no ModelOpt layer keys.
-            b.modelopt = None;
-            inkling2::build(&mut b, &config).map_err(err)?
-        }
+        "inkling2_loop" | "inkling2_loop_text" => inkling2::build(&mut b, &config).map_err(err)?,
         other => {
             return Err(err(format!(
                 "model_type `{other}` is not supported from safetensors yet (supported: qwen3_5, qwen3_5_moe, qwen4_exp, nemotron_h, gemma4, glm5_next, deepseek_v41, inkling2_loop)"

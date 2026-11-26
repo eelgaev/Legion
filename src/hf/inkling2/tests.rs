@@ -286,3 +286,65 @@ fn mxfp8_experts_keep_their_bytes_and_power_of_two_scales() {
         }
     }
 }
+
+/// Malformed taps and outer scales are errors, not panics or wrong scales.
+#[test]
+fn bad_conv_taps_and_outer_scales_are_refused() {
+    let l = "model.llm.layers.0.mlp.experts.";
+    let fixture = |amax_dtype: &str, denoms: &[f32]| {
+        let dir = tempfile::tempdir().unwrap();
+        let t = vec![
+            ("scalar".to_string(), "BF16", vec![], bf16s(1, 1.0)),
+            (
+                format!("{l}w13_weight"),
+                "U8",
+                vec![NE, ROWS, KK / 2],
+                vec![0u8; NE * ROWS * KK / 2],
+            ),
+            (
+                format!("{l}w13_weight_scale"),
+                "F8_E4M3",
+                vec![NE, ROWS, KK / 16],
+                vec![0x38u8; NE * ROWS * KK / 16],
+            ),
+            (
+                format!("{l}w13_weight_amax"),
+                amax_dtype,
+                vec![NE],
+                f32s(&[3.0, 12.0]),
+            ),
+            (
+                format!("{l}w13_weight_outer_scale_denominator"),
+                "F32",
+                vec![denoms.len()],
+                f32s(denoms),
+            ),
+        ];
+        write_checkpoint(dir.path(), &t);
+        let b = Builder::new(Arc::new(Checkpoint::open(dir.path()).unwrap()));
+        (dir, b)
+    };
+    let name = "blk.0.ffn_gate_up_exps.weight";
+    let scale = "blk.0.ffn_gate_up_exps.scale";
+
+    // A scalar named as conv taps.
+    let (_dir, mut b) = fixture("F32", &[6.0]);
+    let e = conv_taps(&mut b, "conv", "scalar", 4).unwrap_err();
+    assert!(e.contains("conv taps"), "{e}");
+    // A broadcast denominator (all one value) is fine.
+    let (_dir, mut b) = fixture("F32", &[6.0, 6.0]);
+    experts(&mut b, name, &format!("{l}w13_weight"), NE, ROWS, KK).unwrap();
+    assert_eq!(floats(&computed(&b, scale)), [0.5, 2.0]);
+    // Differing denominators.
+    let (_dir, mut b) = fixture("F32", &[6.0, 7.0]);
+    experts(&mut b, name, &format!("{l}w13_weight"), NE, ROWS, KK).unwrap();
+    let e = match b.recipes.get(scale) {
+        Some(Recipe::Computed(f)) => f().unwrap_err(),
+        r => panic!("{scale}: {r:?}"),
+    };
+    assert!(e.contains("differing denominators"), "{e}");
+    // An amax of another 4-byte dtype.
+    let (_dir, mut b) = fixture("I32", &[6.0]);
+    let e = experts(&mut b, name, &format!("{l}w13_weight"), NE, ROWS, KK).unwrap_err();
+    assert!(e.contains("want F32"), "{e}");
+}

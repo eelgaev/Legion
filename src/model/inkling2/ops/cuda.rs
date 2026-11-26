@@ -336,11 +336,19 @@ pub(super) unsafe fn attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
             Kernel::Attn128 if n_tok == 1 && pk <= ATTN_DECODE_ROWS => Kernel::Attn128Dec,
             k => k,
         };
+        // CUDA's grid y limit: a group this large is refused, not launched wrong.
+        let grid_y = n_seqs * cdiv(n_tok, ATTN_TQ);
+        if grid_y > GRID_YZ {
+            return Err(format!(
+                "ink_attn: {n_seqs} sequences of {n_tok} tokens need a grid y of {grid_y} \
+                 (CUDA takes {GRID_YZ})"
+            ));
+        }
         launch(
             k,
             "ink_attn",
             dst,
-            dim(nkv, n_seqs * cdiv(n_tok, ATTN_TQ)),
+            dim(nkv, grid_y),
             ATTN_THREADS,
             0,
             stream,

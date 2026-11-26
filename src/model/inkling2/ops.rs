@@ -333,7 +333,8 @@ pub fn situ<'a>(ctx: &'a Context, y: Tensor<'a>, beta: f32, lb: f32) -> Tensor<'
 /// `[k / 32, m, n_expert]` (a scale per 32 values of a row).
 pub fn mm_id_takes(w: Tensor<'_>, scale: Option<Tensor<'_>>) -> bool {
     let [k, m, e, w3] = w.ne();
-    if w3 != 1 || k % 32 != 0 {
+    // The readers take a row's values (blocks) as adjacent; rows and experts may be padded.
+    if w3 != 1 || k % 32 != 0 || w.nb()[0] != w.element_size() {
         return false;
     }
     match (w.ty(), scale) {
@@ -456,8 +457,11 @@ unsafe fn f16_row(t: &ffi::ggml_tensor, off: usize, n: usize) -> Vec<f32> {
 
 /// The cache cell of position `p` of sequence `s` through the block table.
 unsafe fn cell(table: &ffi::ggml_tensor, s: usize, p: usize, block: usize) -> usize {
-    let width = table.ne[0] as usize;
-    unsafe { at::<i32>(table, s * width + p / block) as usize * block + p % block }
+    // Sequence `s`'s row at its byte stride, as the CUDA kernel reads it.
+    unsafe {
+        let row = (table.data as *const u8).add(s * table.nb[1]) as *const i32;
+        *row.add(p / block) as usize * block + p % block
+    }
 }
 
 fn sigmoid(x: f32) -> f32 {
