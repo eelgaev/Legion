@@ -69,6 +69,14 @@ pub(in crate::cli) struct SwitchArgs {
     /// and 12.1 only. For comparisons.
     #[arg(long, help_heading = HEADING)]
     gdn_prompt_ggml: bool,
+    /// CUDA, gated DeltaNet layers, prompt steps whose staged whole-head kernel also writes the
+    /// gated output norm (one GPU's Qwen3.8-Flash-Next layer): that kernel as it was, which
+    /// copies a chunk's z rows once the chunk is under way and keeps 12 warps idle during the
+    /// chunk's Gram, instead of the default form, which copies them one chunk ahead with the other
+    /// inputs and runs the Gram under the other warps' projections (the same arithmetic in the
+    /// same order, so the same bits). For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_gdn_ahead: bool,
     /// CUDA, gated DeltaNet layers in MTP verify and commit steps: ggml's gated_delta_net
     /// instead of Legion's op (the default: the same bits; the verify step skips the final
     /// states it never reads, the commit writes them in place instead of computing the rows and
@@ -1569,6 +1577,7 @@ impl SwitchArgs {
             gdn_scan: self.gdn_scan_ggml.then_some(false),
             gdn_mma: self.gdn_mma.then_some(true),
             gdn_staged: self.gdn_prompt_ggml.then_some(false),
+            gdn_ahead: self.no_gdn_ahead.then_some(false),
             gdn: self.gdn_ggml.then_some(false),
             gdn_decode: self.gdn_decode_ggml.then_some(false),
             gdn_replay_staged: self.gdn_replay_smem.then_some(true),

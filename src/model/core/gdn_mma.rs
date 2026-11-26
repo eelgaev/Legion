@@ -86,7 +86,7 @@ pub(super) enum Schedule {
 
 /// Kernels in `legion_gdn_mma_kernels`.
 #[cfg(feature = "cuda")]
-const KERNELS: usize = 10;
+const KERNELS: usize = 12;
 
 /// The table's [`Schedule::WideTwo`] with the gated output norm (`gdn_split<128, 16, 1, 1, 2,
 /// true>`, the same shared memory; [`gdn_mma_gn`]).
@@ -103,6 +103,27 @@ const CODES_KERNEL: usize = 9;
 /// `gdn_mma.cu`'s `codes_shared` (static_asserted there).
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 const CODES_SMEM: usize = 85376 + 2 * 3 * 16 * 128 + 4 * 16 * CODES_HEADS as usize;
+
+/// [`GN_KERNEL`] with a chunk's z rows copied one chunk ahead and the Gram under the
+/// projections (`gdn_ahead<false>`, the same bits; [`set_gdn_ahead`]).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+const AHEAD_GN_KERNEL: usize = 10;
+
+/// [`CODES_KERNEL`] likewise (`gdn_ahead<true>`).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+const AHEAD_CODES_KERNEL: usize = 11;
+
+/// [`AHEAD_GN_KERNEL`]'s dynamic shared memory, as `gdn_mma.cu`'s `ahead_shared` (static_asserted
+/// there): q and k (BF16 halves, 16 x 128), p and the inverse (16 x 16), delta and solved (16 x
+/// 128), the Gram's lower triangle, prefix and beta (F32), then one F32 buffer of q, k, g and beta
+/// and two of v and z.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+const AHEAD_SMEM: usize =
+    4 * 4 * 16 * 128 + 2 * 4 * 16 * 16 + 4 * (16 * 16 + 2 * 16) + 4 * (6 * 16 * 128 + 2 * 16);
+
+/// [`AHEAD_CODES_KERNEL`]'s: [`AHEAD_SMEM`] and [`CODES_SMEM`]'s ring and slots.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+const AHEAD_CODES_SMEM: usize = AHEAD_SMEM + CODES_SMEM - 85376;
 
 /// Most value heads [`CODES_KERNEL`] takes (`CODES_HEADS` in `gdn_mma.cu`): one GPU's heads of
 /// Qwen3.8-Flash-Next.
@@ -275,6 +296,18 @@ static STAGED_GPU: AtomicBool = AtomicBool::new(false);
 /// run it here instead (on by default; `legion serve --gdn-prompt-ggml` turns it off).
 pub fn set_gdn_staged(on: bool) {
     STAGED.store(on, Ordering::Relaxed);
+}
+
+/// Whether the gated-norm kernels ([`GN_KERNEL`], [`CODES_KERNEL`]) run as `gdn_ahead`
+/// ([`AHEAD_GN_KERNEL`], [`AHEAD_CODES_KERNEL`]; on by default, `legion serve --no-gdn-ahead`
+/// turns it off).
+static AHEAD: AtomicBool = AtomicBool::new(true);
+
+/// Sets whether the gated-norm prompt kernels copy a chunk's z rows one chunk ahead and run the
+/// Gram under the projections (#1183: the same arithmetic in the same order, so the same bits;
+/// on by default, `legion serve --no-gdn-ahead` turns it off).
+pub fn set_gdn_ahead(on: bool) {
+    AHEAD.store(on, Ordering::Relaxed);
 }
 
 /// A kernel forced for every launch (`legion gdn-bench --prompt`): a [`Schedule`] discriminant,
@@ -458,8 +491,9 @@ mod launch {
     use std::sync::atomic::{AtomicI8, AtomicI32, Ordering};
 
     use super::{
-        Args, CODES_HEADS, CODES_KERNEL, CODES_SMEM, FORCE, GN_KERNEL, KERNELS, Ran, STAGED,
-        Schedule, staged_for,
+        AHEAD, AHEAD_CODES_KERNEL, AHEAD_CODES_SMEM, AHEAD_GN_KERNEL, AHEAD_SMEM, Args,
+        CODES_HEADS, CODES_KERNEL, CODES_SMEM, FORCE, GN_KERNEL, KERNELS, Ran, STAGED, Schedule,
+        staged_for,
     };
 
     /// `dim3`.
@@ -539,16 +573,17 @@ mod launch {
         }
     }
 
-    /// Kernel `k`'s dynamic shared memory: schedule `s`'s, or [`CODES_SMEM`].
+    /// Kernel `k`'s dynamic shared memory: schedule `s`'s, [`CODES_SMEM`] or gdn_ahead's.
     fn smem(s: Schedule, k: usize) -> usize {
-        if k == CODES_KERNEL {
-            CODES_SMEM
-        } else {
-            s.smem()
+        match k {
+            CODES_KERNEL => CODES_SMEM,
+            AHEAD_GN_KERNEL => AHEAD_SMEM,
+            AHEAD_CODES_KERNEL => AHEAD_CODES_SMEM,
+            _ => s.smem(),
         }
     }
 
-    /// Gives kernel `k` of the table (schedule `s`'s, [`GN_KERNEL`] or [`CODES_KERNEL`]) its
+    /// Gives kernel `k` of the table (schedule `s`'s, a gated-norm or a codes kernel) its
     /// dynamic shared memory on device `dev`, once (ggml's `init`); the two-CTAs-an-SM kernel
     /// also asks for the whole shared-memory carveout.
     fn opt_in(dev: usize, s: Schedule, k: usize) -> bool {
@@ -594,7 +629,8 @@ mod launch {
     /// [`Args::staged_aligned`]. With `gn` (a gated output norm in `a`), [`GN_KERNEL`] where
     /// that schedule is picked and [`Args::gn_aligned`], and with `codes` too (`a`'s codes,
     /// scales and zeroed slots) [`CODES_KERNEL`] where its grid is co-resident: at most
-    /// [`CODES_HEADS`] heads, one CTA an SM. Returns which ran.
+    /// [`CODES_HEADS`] heads, one CTA an SM; their gdn_ahead forms where [`AHEAD`] is on.
+    /// Returns which ran.
     pub(super) fn run(
         a: &mut Args,
         stream: *mut c_void,
@@ -621,13 +657,20 @@ mod launch {
             ));
         }
         let gn = gn && s == Schedule::WideTwo && a.gn_aligned();
+        let ahead = AHEAD.load(Ordering::Relaxed);
+        let codes_kernel = if ahead {
+            AHEAD_CODES_KERNEL
+        } else {
+            CODES_KERNEL
+        };
         let codes = gn
             && codes
             && a.h <= CODES_HEADS.min(sms)
             && !a.codes.is_null()
-            && opt_in(dev, s, CODES_KERNEL);
+            && opt_in(dev, s, codes_kernel);
         let k = match (gn, codes) {
-            (_, true) => CODES_KERNEL,
+            (_, true) => codes_kernel,
+            (true, false) if ahead => AHEAD_GN_KERNEL,
             (true, false) => GN_KERNEL,
             (false, false) => s as usize,
         };
@@ -647,6 +690,8 @@ mod launch {
             y: s.warps(),
             z: 1,
         };
+        #[cfg(test)]
+        super::LAST_KERNEL.store(k as i8, Ordering::Relaxed);
         let mut argv = [(a as *mut Args).cast::<c_void>()];
         // SAFETY: the kernel reads `a` from the launch's copy of it; the pointers in it are
         // device memory of the stream's device (the caller's node).
@@ -684,6 +729,11 @@ enum Ran {
 /// tests' check of which path a case took.
 #[cfg(all(test, feature = "cuda"))]
 static CODES_RAN: AtomicI8 = AtomicI8::new(-1);
+
+/// The table index of the last kernel [`launch::run`] launched (-1: none yet): the gdn_ahead
+/// tests' check of which kernel a case ran.
+#[cfg(all(test, feature = "cuda"))]
+static LAST_KERNEL: AtomicI8 = AtomicI8::new(-1);
 
 #[cfg(feature = "cuda")]
 unsafe extern "C" {

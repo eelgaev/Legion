@@ -283,6 +283,21 @@ fn launch_sizes_match_the_kernels() {
     // may opt in to on compute capability 12.x, one CTA (and the driver's 1 KiB) an SM.
     assert_eq!(CODES_SMEM, 100736);
     assert!(CODES_SMEM <= 99 * 1024 && CODES_SMEM + 1024 <= 100 * 1024);
+    // gdn_ahead's `ahead_shared` (one q/k/g/beta buffer, two v and z buffers) and with codes.
+    assert_eq!(AHEAD_SMEM, 85248);
+    assert_eq!(AHEAD_CODES_SMEM, 100608);
+    assert!(AHEAD_CODES_SMEM <= 99 * 1024);
+    assert_eq!(
+        (AHEAD_GN_KERNEL, AHEAD_CODES_KERNEL),
+        (CODES_KERNEL + 1, CODES_KERNEL + 2)
+    );
+}
+
+/// `gdn_ahead` on by default.
+#[test]
+fn ahead_is_on_by_default() {
+    let _lock = lock();
+    assert!(AHEAD.load(Ordering::Relaxed));
 }
 
 /// A codes node's packed activations and slots fit in the tokens' F32 rows the norm leaves
@@ -508,6 +523,195 @@ fn cuda_codes_fallbacks_match_norm_then_fp8_act() {
     force_schedule(Some(Schedule::Heads));
     for c in [(8, 48, 777), (8, 48, 4096 + 5), (8, 24, 300), (8, 56, 64)] {
         assert_eq!(codes_case(&mut gpu, c), Ran::Plain as i8, "{c:?}");
+    }
+}
+
+/// [`set_gdn_ahead`] back to what it was when dropped, also after a failed case.
+#[cfg(feature = "cuda")]
+struct KeepAhead(bool);
+
+#[cfg(feature = "cuda")]
+impl Drop for KeepAhead {
+    fn drop(&mut self) {
+        set_gdn_ahead(self.0);
+    }
+}
+
+/// One run of [`ahead_case`]: the bytes the node wrote that a reader may read (the final states,
+/// then the BF16 rows or the codes and scales; empty when timed), the table index of the kernel
+/// that ran ([`LAST_KERNEL`]) and the milliseconds a run took (0 when not timed).
+#[cfg(feature = "cuda")]
+type AheadRun = (Vec<u8>, i8, f64);
+
+/// A gated-norm node of `n_k` key and `n_v` value heads and `nt` tokens, codes_case's inputs (a
+/// non-zero initial state), its norm switched to BF16 rows or (`codes`) FP8 codes, built
+/// without the shape gate so any token count runs (also under [`MIN_TOKENS`]), on whole heads
+/// ([`Schedule::WideTwo`] forced). Runs it once per entry of `plan` with [`set_gdn_ahead`] set
+/// to it; with `reps` the entry's time is the mean of `reps` more runs, else its bytes are read.
+#[cfg(feature = "cuda")]
+fn ahead_case(
+    gpu: &mut Backend,
+    (n_k, n_v, nt): (i64, i64, i64),
+    codes: bool,
+    plan: &[bool],
+    reps: usize,
+) -> Vec<AheadRun> {
+    let s = HEAD;
+    let row = 2 * s * n_k + s * n_v;
+    let ctx = Context::new(64, 64);
+    let conv = ctx.new_tensor(types::F32, &[row, nt, 1]).as_input();
+    let g = ctx.new_tensor(types::F32, &[1, n_v, nt, 1]).as_input();
+    let beta = ctx.new_tensor(types::F32, &[1, n_v, nt, 1]).as_input();
+    let state = ctx.new_tensor(types::F32, &[s, s, n_v, 1]).as_input();
+    let z = ctx.new_tensor(types::F32, &[s * n_v, nt]).as_input();
+    let norm_w = ctx.new_tensor(types::F32, &[s]).as_input();
+    let es = 4usize;
+    let nb = [s as usize * es, row as usize * es, (row * nt) as usize * es];
+    let q = ctx.view_4d(conv, [s, n_k, nt, 1], nb, 0);
+    let k = ctx.view_4d(conv, [s, n_k, nt, 1], nb, (s * n_k) as usize * es);
+    let v = ctx.view_4d(conv, [s, n_v, nt, 1], nb, (2 * s * n_k) as usize * es);
+    // gdn_mma_gn's node, without its shape gate.
+    let (rows, half) = (nt + s, (nt + 1) / 2);
+    let node = ctx.external_with(
+        &GDN_MMA,
+        types::F32,
+        [s * n_v, rows + half, 1, 1],
+        &[q, k, v, g, beta, state, z, norm_w],
+        &[0, 1, 1e-6f32.to_bits() as i32],
+    );
+    if codes {
+        codes_on(&ctx, node);
+    } else {
+        norm_on(node);
+    }
+    node.as_output();
+    let mut graph = ctx.new_graph(64);
+    graph.expand(node);
+    ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+        .unwrap();
+    let mut x = noise((row * nt) as usize, 1);
+    for tok in x.chunks_mut(row as usize) {
+        for head in tok[..(2 * s * n_k) as usize].chunks_mut(s as usize) {
+            let n = head.iter().map(|v| v * v).sum::<f32>().sqrt();
+            head.iter_mut().for_each(|v| *v /= n);
+        }
+    }
+    conv.set_f32(&x);
+    let gb = (n_v * nt) as usize;
+    let map = |seed, f: fn(f32) -> f32| noise(gb, seed).into_iter().map(f).collect::<Vec<_>>();
+    g.set_f32(&map(2, |v| 0.5 * (v - 1.0)));
+    beta.set_f32(&map(3, |v| 0.5 * (v + 1.0)));
+    let s0: Vec<f32> = noise((s * s * n_v) as usize, 4)
+        .iter()
+        .map(|v| 0.1 * v)
+        .collect();
+    state.set_f32(&s0);
+    let zs: Vec<f32> = noise((s * n_v * nt) as usize, 5)
+        .iter()
+        .map(|v| 3.0 * v)
+        .collect();
+    z.set_f32(&zs);
+    norm_w.set_f32(
+        &noise(s as usize, 6)
+            .iter()
+            .map(|v| 1.0 + 0.5 * v)
+            .collect::<Vec<_>>(),
+    );
+    force_schedule(Some(Schedule::WideTwo));
+    let _unforce = Unforce;
+    let width = (s * n_v) as usize * es;
+    let states = (nt as usize * width, s as usize * width);
+    let read = if codes {
+        (0, codes_layout(n_v, nt).0)
+    } else {
+        (rows as usize * width, nt as usize * width / 2)
+    };
+    plan.iter()
+        .map(|&on| {
+            set_gdn_ahead(on);
+            LAST_KERNEL.store(-1, Ordering::Relaxed);
+            gpu.compute(&graph).unwrap();
+            let kernel = LAST_KERNEL.load(Ordering::Relaxed);
+            if reps > 0 {
+                let t0 = std::time::Instant::now();
+                for _ in 0..reps {
+                    gpu.compute(&graph).unwrap();
+                }
+                let ms = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+                return (Vec::new(), kernel, ms);
+            }
+            let mut bytes = node.bytes_at(states.0, states.1);
+            bytes.extend(node.bytes_at(read.0, read.1));
+            (bytes, kernel, 0.0)
+        })
+        .collect()
+}
+
+/// #1183: `gdn_ahead` (z rows one chunk ahead, the Gram under the projections) against
+/// `gdn_split<128, 16, 1, 1, 2, true, CODES>` bit for bit, the final states and the BF16 rows
+/// (or the FP8 codes and scales), at one GPU's heads of Qwen3.8-Flash-Next (16 key, 48 value)
+/// and a prompt step's token counts: 12288, a step's tail (8067), eight chunks and a one-token
+/// chunk (129) and one token. Needs a GPU with 48 SMs or more for the codes kernels (a GB10).
+/// Restores the switch.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU of compute capability 8.0+ with 48 SMs"]
+fn cuda_ahead_matches_split_bit_for_bit() {
+    let _lock = lock();
+    let mut gpu = codes_gpu();
+    let _keep = KeepAhead(AHEAD.load(Ordering::Relaxed));
+    for nt in [12288, 8067, 129, 1] {
+        for codes in [false, true] {
+            let runs = ahead_case(&mut gpu, (16, 48, nt), codes, &[false, true], 0);
+            let (old, new) = (&runs[0], &runs[1]);
+            let want = if codes {
+                [CODES_KERNEL, AHEAD_CODES_KERNEL]
+            } else {
+                [GN_KERNEL, AHEAD_GN_KERNEL]
+            };
+            assert_eq!(
+                [old.1, new.1],
+                want.map(|k| k as i8),
+                "{nt} tokens, codes {codes}: the kernels"
+            );
+            assert_eq!(old.0.len(), new.0.len());
+            let at = old.0.iter().zip(&new.0).position(|(a, b)| a != b);
+            assert_eq!(at, None, "{nt} tokens, codes {codes}: the first byte apart");
+        }
+    }
+}
+
+/// #1183's microbench: `gdn_split` (old) against `gdn_ahead` (new) at 12288 tokens of one GPU's
+/// heads of Qwen3.8-Flash-Next, with and without the codes, the order alternating each round
+/// (old first on even rounds); prints each one's median and best mean of a round and the
+/// speedup of the medians.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU of compute capability 8.0+ with 48 SMs; a timing"]
+fn cuda_ahead_bench() {
+    let _lock = lock();
+    let mut gpu = codes_gpu();
+    let _keep = KeepAhead(AHEAD.load(Ordering::Relaxed));
+    let (rounds, reps) = (15, 20);
+    for codes in [false, true] {
+        let plan: Vec<bool> = (0..rounds).flat_map(|r| [r % 2 == 1, r % 2 == 0]).collect();
+        let runs = ahead_case(&mut gpu, (16, 48, 12288), codes, &plan, reps);
+        let stats = |on: bool| {
+            let mut ms: Vec<f64> = plan
+                .iter()
+                .zip(&runs)
+                .filter(|(p, _)| **p == on)
+                .map(|(_, r)| r.2)
+                .collect();
+            ms.sort_by(f64::total_cmp);
+            (ms[ms.len() / 2], ms[0])
+        };
+        let ((old_med, old_min), (new_med, new_min)) = (stats(false), stats(true));
+        println!(
+            "gdn 16x48 12288 tokens, codes {codes}: old median {old_med:.3} ms min {old_min:.3} \
+             ms, new median {new_med:.3} ms min {new_min:.3} ms, speedup {:.3}x",
+            old_med / new_med
+        );
     }
 }
 

@@ -1409,16 +1409,455 @@ static __global__ __launch_bounds__(32 * WARPS, MINB) void gdn_split(legion_gdn_
 #endif  // LEGION_GDN_MMA_AVAILABLE
 }
 
+// gdn_ahead (#1183): gdn_split<128, 16, 1, 1, 2, true, CODES> (whole heads, 16 warps, the gated
+// output norm, with CODES its FP8 codes) with the same arithmetic in the same order, so its bits,
+// and a shorter chunk:
+// - A chunk's z rows are copied one chunk ahead, with its other inputs. gdn_split copies them
+//   into the chunk's k stage once it is converted, behind the next chunk's inputs, and the norm
+//   waits for them: at a GB10's DRAM rate the z rows of a chunk (48 heads) land about 4 us after
+//   the chunk's top, most of the chunk. Here q, k, g and beta have one buffer (the next chunk's
+//   are issued once this chunk's are converted), v and z two; the chunk's outputs go to its v
+//   buffer (its projections have read it by then).
+// - The Gram (warps 0 and 1) and P (warps 2 and 3) run while the other warps do their
+//   projections, and every warp does its projections before its row of the inverse, which waits
+//   for the Gram's rows only: warps 0 and 1 arrive at named barrier 1, the others sync on it
+//   (gdn_split has a block barrier between the Gram and the inverse, with 12 warps idle during
+//   the Gram). Warp 0 inverts rows 0 and 1 (they read its own Gram columns only), warp w >= 2
+//   row w.
+// Copy groups, in commit order per chunk c: after its top barrier S (CODES: the slots of chunk
+// c - CODES_LAG; empty otherwise), after its convert barrier I (chunk c + 1's q, k, g, beta and v)
+// and Z (chunk c + 1's z rows; both empty past the end). The top waits for I, the norm for Z and S.
+struct alignas(128) ahead_shared {
+    matrix<16, D>  q, k;
+    matrix<16, 16> p, inverse;
+    matrix<16, D>  delta, solved;
+    float          lower[16 * 16], prefix[16], beta[16];
+
+    static __device__ __forceinline__ int lower_index(int r, int c) { return r * 16 + c; }
+
+    float q_in[16 * D], k_in[16 * D], g_in[16], beta_in[16];
+    float v_in[2][16 * D], z_in[2][16 * D];
+};
+
+// gdn_mma.rs's AHEAD_SMEM and AHEAD_CODES_SMEM (under the 99 KiB a block may opt in to on
+// compute capability 12.x).
+static_assert(sizeof(ahead_shared) == 85248, "gdn_mma.rs's AHEAD_SMEM");
+static_assert(sizeof(ahead_shared) + sizeof(codes_shared) == 100608, "gdn_mma.rs's AHEAD_CODES_SMEM");
+
+template <bool CODES> static __global__ __launch_bounds__(512, 1) void gdn_ahead(legion_gdn_mma_args a) {
+#ifdef LEGION_GDN_MMA_AVAILABLE
+    constexpr int C       = 16;
+    constexpr int N       = 8;
+    constexpr int WARPS   = 16;
+    constexpr int CB      = 1;
+    constexpr int THREADS = 32 * WARPS;
+    static_assert(WARPS == C && C * D == 4 * THREADS && D == N * WARPS * CB,
+                  "a warp a token and an 8-column block, a 16-byte piece a thread");
+    extern __shared__ __align__(128) unsigned char bytes[];
+    auto & s = *reinterpret_cast<ahead_shared *>(bytes);
+    [[maybe_unused]] auto & cs = *reinterpret_cast<codes_shared *>(bytes + sizeof(ahead_shared));
+    const int     lane = threadIdx.x, warp = threadIdx.y, tid = warp * 32 + lane;
+    const int     h    = blockIdx.x % a.H;
+    const int     seq  = blockIdx.x / a.H;
+    const int64_t soff = ((int64_t) seq * a.H + h) * D * D;
+    const int64_t qoff = (seq / a.rq3) * a.sq3 + (h % a.H_k) * a.sq1;
+    const int64_t voff = seq * a.sv3 + h * a.sv1;
+    const int64_t goff = seq * a.sb3 + h * a.sb1;
+    // State tile kb * CB + cb: rows 16 * kb, the CTA's columns 8 * (warp + WARPS * cb).
+    acc state[(D / 16) * CB];
+#pragma unroll
+    for (int kb = 0; kb < D / 16; ++kb) {
+#pragma unroll
+        for (int cb = 0; cb < CB; ++cb) {
+            const int c = (warp + WARPS * cb) * N;
+#pragma unroll
+            for (int i = 0; i < acc::ne; ++i) {
+                state[kb * CB + cb].x[i] = a.state[soff + (c + acc::get_j(i)) * D + 16 * kb + acc::get_i(i)];
+            }
+        }
+    }
+    auto commit = [] { asm volatile("cp.async.commit_group;" ::: "memory"); };
+    // Groups I and Z of the chunk at token t0 (v and z into buffer buf): thread (warp, lane) copies
+    // token t0 + warp's 16-byte piece 4 * lane of q, k, v and z; tokens past the end are zeros
+    // (cp.async's zero fill), as gdn_single reads them.
+    auto issue = [&](int buf, int64_t t0) {
+        {
+            const int     d  = 4 * lane;
+            const bool    ok = t0 + warp < a.n_tokens;
+            const int64_t tt = ok ? t0 + warp : 0;
+            cp_async16(s.q_in + warp * D + d, a.q + qoff + tt * a.sq2 + d, ok);
+            cp_async16(s.k_in + warp * D + d, a.k + qoff + tt * a.sq2 + d, ok);
+            cp_async16(s.v_in[buf] + warp * D + d, a.v + voff + tt * a.sv2 + d, ok);
+        }
+        if (tid < 2 * C) {
+            const int     t  = tid % C;
+            const bool    ok = t0 + t < a.n_tokens;
+            const int64_t tt = ok ? t0 + t : 0;
+            if (tid < C) {
+                cp_async4(s.g_in + t, a.g + goff + tt * a.sb2, ok);
+            } else {
+                cp_async4(s.beta_in + t, a.beta + goff + tt * a.sb2, ok);
+            }
+        }
+        commit();
+        {
+            const int     d  = 4 * lane;
+            const bool    ok = t0 + warp < a.n_tokens;
+            const int64_t tt = ok ? t0 + warp : 0;
+            cp_async16(s.z_in[buf] + warp * D + d, a.z + tt * a.z_ld + h * D + d, ok);
+        }
+        commit();
+    };
+    // CODES: the slots of chunk cc (C rows of H words, 16-byte aligned) into cs.slots.
+    [[maybe_unused]] auto issue_slots = [&](int64_t cc) {
+        const float * src = reinterpret_cast<const float *>(a.slots + cc * C * a.H);
+        for (int i = tid; i < C * a.H / 4; i += THREADS) {
+            cp_async16(reinterpret_cast<float *>(cs.slots) + 4 * i, src + 4 * i, true);
+        }
+    };
+    // CODES: warp t's token of chunk cc, its row in the ring: the codes of the head and (CTA 0)
+    // the scale, once every CTA's slot of the token is there (`staged`: first from cs.slots).
+    [[maybe_unused]] auto codes_of = [&](int64_t cc, bool staged) {
+        const int     t   = warp;
+        const int64_t tok = cc * C + t;
+        if (tok >= a.n_tokens) {
+            return;
+        }
+        uint32_t top = 0;
+        for (int i = lane; i < a.H; i += 32) {
+            uint32_t v = staged ? cs.slots[t * a.H + i] : 0u;
+            if (v == 0) {
+                v = wait_slot(a.slots + tok * a.H + i);
+            }
+            top = max(top, v);
+        }
+        // Max of the heads' amaxes: non-negative floats (fmaxf drops NaNs) order as their bits.
+        top                         = __reduce_max_sync(0xffffffff, top);
+        const float           sc    = fp8_row_scale(__uint_as_float(top - 1));
+        const float           inv   = fp8_row_inv(sc);
+        const __nv_bfloat16 * row   = cs.ring[cc % (CODES_LAG + 1)][t];
+        uint8_t *             codes = a.codes + tok * a.H * D + h * D;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            codes[32 * j + lane] = fp8_code(__bfloat162float(row[32 * j + lane]), inv);
+        }
+        if (h == 0 && lane == 0) {
+            a.scales[tok] = sc;
+        }
+    };
+    issue(0, 0);
+    for (int64_t t0 = 0; t0 < a.n_tokens; t0 += C) {
+        const int64_t chunk = t0 / C;
+        const int     buf   = (int) (chunk & 1);
+        const int     valid = min((int64_t) C, a.n_tokens - t0);
+        const bool    more  = t0 + C < a.n_tokens;
+        // In flight: this chunk's I and Z groups (the slots before them were waited for).
+        asm volatile("cp.async.wait_group 1;" ::: "memory");
+        // Orders the chunk before's state update reads of k, its decay reads of the prefix and
+        // its codes step's reads of cs.slots before the writes below.
+        __syncthreads();
+        if constexpr (CODES) {
+            if (chunk >= CODES_LAG) {
+                issue_slots(chunk - CODES_LAG);
+            }
+        }
+        commit();
+        {
+            const int    t = warp, d = 4 * lane;
+            const float4 q = *reinterpret_cast<const float4 *>(s.q_in + t * D + d);
+            const float4 k = *reinterpret_cast<const float4 *>(s.k_in + t * D + d);
+            s.q.store2(t, d, make_float2(q.x * a.scale, q.y * a.scale));
+            s.q.store2(t, d + 2, make_float2(q.z * a.scale, q.w * a.scale));
+            s.k.store2(t, d, make_float2(k.x, k.y));
+            s.k.store2(t, d + 2, make_float2(k.z, k.w));
+        }
+        if (warp == 0) {
+            float carry = 0.f;
+            for (int base = 0; base < C; base += 32) {
+                const int   t    = base + lane;
+                float       g    = t < valid ? s.g_in[t] : 0.f;
+                const float beta = t < valid ? s.beta_in[t] : 0.f;
+#pragma unroll
+                for (int offset = 1; offset < 32; offset *= 2) {
+                    const float previous = __shfl_up_sync(0xffffffff, g, offset, 32);
+                    if (lane >= offset) {
+                        g += previous;
+                    }
+                }
+                g += carry;
+                if (t < C) {
+                    s.prefix[t] = g;
+                    s.beta[t]   = beta;
+                }
+                carry = __shfl_sync(0xffffffff, g, 31, 32);
+            }
+        }
+        __syncthreads();
+        // The q/k stage is converted, and the v and z buffers of the chunk before were read before
+        // the top barrier: the next chunk's inputs land while this one computes.
+        if (more) {
+            issue(buf ^ 1, t0 + C);
+        } else {
+            commit();
+            commit();
+        }
+        // A = beta * strict_tril(K K^T * decay), P = tril(Q K^T * decay)
+        for (int ti = warp; ti < 2 * (C / 16) * (C / N); ti += WARPS) {
+            const bool gram = ti < (C / 16) * (C / N);
+            const int  t = ti % ((C / 16) * (C / N)), r = (t / (C / N)) * 16, c = (t % (C / N)) * N;
+            acc        x;
+            if (gram) {
+                product<D>(x, s.k, s.k, r, c);
+            } else {
+                product<D>(x, s.q, s.k, r, c);
+            }
+#pragma unroll
+            for (int i = 0; i < acc::ne; ++i) {
+                const int   rr = r + acc::get_i(i), cc = c + acc::get_j(i);
+                const float v  = rr < valid && cc <= rr ? x.x[i] * expf(s.prefix[rr] - s.prefix[cc]) : 0.f;
+                if (gram) {
+                    if (cc < rr) {
+                        s.lower[s.lower_index(rr, cc)] = v * s.beta[rr];
+                    }
+                } else {
+                    s.p.store(rr, cc, v);
+                }
+            }
+        }
+        // The Gram's rows are stored (warps 0 and 1 wrote columns 0-7 and 8-15 of lower).
+        if (warp < 2) {
+            asm volatile("bar.arrive 1, %0;" ::"n"(THREADS) : "memory");
+        }
+        // delta = beta * (v - decay * K S), base output = decay * Q S, for the warp's columns.
+        acc base_output[CB];
+        {
+            acc qs[CB], ks[CB];
+#pragma unroll
+            for (int kb = 0; kb < D / 16; ++kb) {
+                const auto qh = load<a_tile, false>(s.q, 0, 16 * kb, false);
+                const auto ql = load<a_tile, false>(s.q, 0, 16 * kb, true);
+                const auto kh = load<a_tile, false>(s.k, 0, 16 * kb, false);
+                const auto kl = load<a_tile, false>(s.k, 0, 16 * kb, true);
+#pragma unroll
+                for (int cb = 0; cb < CB; ++cb) {
+                    b_tile bh, bl;
+                    state_b(state[kb * CB + cb], bh, bl);
+                    mma::mma(qs[cb], ql, bh);
+                    mma::mma(qs[cb], qh, bl);
+                    mma::mma(qs[cb], qh, bh);
+                    mma::mma(ks[cb], kl, bh);
+                    mma::mma(ks[cb], kh, bl);
+                    mma::mma(ks[cb], kh, bh);
+                }
+            }
+#pragma unroll
+            for (int cb = 0; cb < CB; ++cb) {
+                const int c = (warp + WARPS * cb) * N;
+#pragma unroll
+                for (int i = 0; i < acc::ne; ++i) {
+                    const int   t = acc::get_i(i), v = c + acc::get_j(i);
+                    const float decay = expf(s.prefix[t]);
+                    const float vv    = t < valid ? s.v_in[buf][t * D + v] : 0.f;
+                    s.delta.store(t, v, s.beta[t] * (vv - decay * ks[cb].x[i]));
+                    base_output[cb].x[i] = decay * qs[cb].x[i];
+                }
+            }
+        }
+        // inverse = (I + A)^-1 by forward substitution, once the Gram's rows are there: warp 0
+        // rows 0 and 1 (from its own lanes' stores), warp w >= 2 row w.
+        if (warp >= 2) {
+            asm volatile("bar.sync 1, %0;" ::"n"(THREADS) : "memory");
+        } else {
+            __syncwarp();
+        }
+        const int first = warp < 2 ? 0 : warp, rows = warp == 0 ? 2 : (warp == 1 ? 0 : 1);
+        for (int row = first; row < first + rows; ++row) {
+            float x;
+            {
+                const int col = lane;
+                x             = col == row ? 1.f : (col < row ? -s.lower[s.lower_index(row, col)] : 0.f);
+            }
+            for (int pivot = row - 1; pivot > 0; --pivot) {
+                const float xp = __shfl_sync(0xffffffff, x, pivot, 32);
+                if (lane < pivot) {
+                    x -= xp * s.lower[s.lower_index(pivot, lane)];
+                }
+            }
+            if (lane < C) {
+                s.inverse.store(row, lane, x);
+            }
+        }
+        // Orders the inverse's stores before the solves' reads and P's before the outputs'.
+        __syncthreads();
+        // solved = inverse * delta
+        {
+            const auto ih = load<a_tile, false>(s.inverse, 0, 0, false);
+            const auto il = load<a_tile, false>(s.inverse, 0, 0, true);
+#pragma unroll
+            for (int cb = 0; cb < CB; ++cb) {
+                const int  c  = (warp + WARPS * cb) * N;
+                const auto bh = load<b_tile, true>(s.delta, c, 0, false);
+                const auto bl = load<b_tile, true>(s.delta, c, 0, true);
+                acc        x;
+                mma::mma(x, il, bh);
+                mma::mma(x, ih, bl);
+                mma::mma(x, ih, bh);
+                store(s.solved, x, 0, c);
+            }
+        }
+        __syncwarp();
+        // out = base output + P * solved, into the v buffer (the warp's columns, which only its
+        // own projections read).
+        {
+            const auto ph = load<a_tile, false>(s.p, 0, 0, false);
+            const auto pl = load<a_tile, false>(s.p, 0, 0, true);
+#pragma unroll
+            for (int cb = 0; cb < CB; ++cb) {
+                const int  c  = (warp + WARPS * cb) * N;
+                const auto bh = load<b_tile, true>(s.solved, c, 0, false);
+                const auto bl = load<b_tile, true>(s.solved, c, 0, true);
+                acc        x;
+                mma::mma(x, pl, bh);
+                mma::mma(x, ph, bl);
+                mma::mma(x, ph, bh);
+#pragma unroll
+                for (int i = 0; i < acc::ne; ++i) {
+                    const int t = acc::get_i(i), v = c + acc::get_j(i);
+                    // Never merged into a multiply-add with base_output's product (gdn_split's).
+                    s.v_in[buf][t * D + v] = __fadd_rn(base_output[cb].x[i], x.x[i]);
+                }
+            }
+        }
+        // In flight: the next chunk's I and Z groups; this chunk's z rows and slots are in.
+        asm volatile("cp.async.wait_group 2;" ::: "memory");
+        // The chunk's outputs, z rows and slots in place for every warp.
+        __syncthreads();
+        {
+            const int t = warp;
+            if (t < valid) {
+                const float * o = s.v_in[buf] + t * D;
+                const float * z = s.z_in[buf] + t * D;
+                float         x[4], sum[4];
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    x[j] = o[32 * j + lane];
+                }
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    float tmp = 0.0f;
+                    tmp += x[j] * x[j];
+#pragma unroll
+                    for (int offset = 16; offset > 0; offset >>= 1) {
+                        tmp += __shfl_xor_sync(0xffffffff, tmp, offset, 32);
+                    }
+                    sum[j] = tmp;
+                }
+                const float                    tot   = (sum[0] + sum[2]) + (sum[1] + sum[3]);
+                const float                    mean  = tot / a.head_v;
+                const float                    scale = rsqrtf(mean + a.eps);
+                [[maybe_unused]] const int64_t row   = (t0 + t) * a.H * D + h * D;
+                [[maybe_unused]] float         amax  = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    const float         zv = z[32 * j + lane];
+                    const float         y  = scale * x[j] * a.norm_w[32 * j + lane];
+                    const float         g  = a.silu ? zv / (1.0f + expf(-zv)) : 1.0f / (1.0f + expf(-zv));
+                    const __nv_bfloat16 b  = __float2bfloat16(y * g);
+                    if constexpr (CODES) {
+                        // fp8_act's amax: fmaxf over |value| from 0.
+                        cs.ring[chunk % (CODES_LAG + 1)][t][32 * j + lane] = b;
+                        amax = fmaxf(amax, fabsf(__bfloat162float(b)));
+                    } else {
+                        __stcs((__nv_bfloat16 *) a.gout + row + 32 * j + lane, b);
+                    }
+                }
+                if constexpr (CODES) {
+                    const uint32_t top = __reduce_max_sync(0xffffffff, __float_as_uint(amax));
+                    if (lane == 0) {
+                        st_slot(a.slots + (t0 + t) * a.H + h, top + 1);
+                    }
+                }
+            }
+            if constexpr (CODES) {
+                if (chunk >= CODES_LAG) {
+                    codes_of(chunk - CODES_LAG, true);
+                }
+            }
+        }
+        // delta = solved * decay to chunk end, the warp's columns (gdn_single's values).
+        const float end = s.prefix[valid - 1];
+#pragma unroll
+        for (int cb = 0; cb < CB; ++cb) {
+            const int c = (warp + WARPS * cb) * N;
+#pragma unroll
+            for (int e = lane; e < C * N; e += 32) {
+                const int   t = e / N, v = c + e % N, j = s.solved.index(t, v);
+                const float x = __bfloat162float(s.solved.hi[j]) + __bfloat162float(s.solved.lo[j]);
+                s.delta.store(t, v, x * expf(end - s.prefix[t]));
+            }
+        }
+        __syncwarp();
+        // S = decay(chunk) * S + K^T * delta
+        const float decay = expf(end);
+        b_tile      dh[CB], dl[CB];
+#pragma unroll
+        for (int cb = 0; cb < CB; ++cb) {
+            const int c = (warp + WARPS * cb) * N;
+            dh[cb]      = load<b_tile, true>(s.delta, c, 0, false);
+            dl[cb]      = load<b_tile, true>(s.delta, c, 0, true);
+        }
+#pragma unroll
+        for (int kb = 0; kb < D / 16; ++kb) {
+            const auto kh = load<a_tile, true>(s.k, 16 * kb, 0, false);
+            const auto kl = load<a_tile, true>(s.k, 16 * kb, 0, true);
+#pragma unroll
+            for (int cb = 0; cb < CB; ++cb) {
+                acc & x = state[kb * CB + cb];
+#pragma unroll
+                for (int i = 0; i < acc::ne; ++i) {
+                    x.x[i] *= decay;
+                }
+                mma::mma(x, kl, dh[cb]);
+                mma::mma(x, kh, dl[cb]);
+                mma::mma(x, kh, dh[cb]);
+            }
+        }
+    }
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+#pragma unroll
+    for (int kb = 0; kb < D / 16; ++kb) {
+#pragma unroll
+        for (int cb = 0; cb < CB; ++cb) {
+            const int c = (warp + WARPS * cb) * N;
+#pragma unroll
+            for (int i = 0; i < acc::ne; ++i) {
+                a.state_out[soff + (c + acc::get_j(i)) * D + 16 * kb + acc::get_i(i)] = state[kb * CB + cb].x[i];
+            }
+        }
+    }
+    if constexpr (CODES) {
+        // The last CODES_LAG chunks' codes (their slots straight from L2).
+        const int64_t chunks = (a.n_tokens + C - 1) / C;
+        for (int64_t cc = max((int64_t) 0, chunks - CODES_LAG); cc < chunks; ++cc) {
+            codes_of(cc, false);
+        }
+    }
+#else
+    (void) a;
+    __trap();  // gdn_mma.rs launches it on compute capability 8.0+ only
+#endif  // LEGION_GDN_MMA_AVAILABLE
+}
+
 }  // namespace
 
 // The kernels as the CUDA runtime knows them (their host stubs), for Rust's cudaLaunchKernel, in
 // the order of gdn_mma.rs's `Schedule`: value slices of 32 at one and two blocks an SM, whole
 // heads, whole heads staged, then the split kernels (two CTAs a head, 16 warps a head, 8 warps
 // a head, 16 warps a head with two input buffers), and last the latter with the gated output
-// norm (GN, #1176 round 44), and that writing the FP8 codes (CODES, #1183). They sit in an
-// anonymous namespace: with relocatable device code the device link left extern "C" kernels out
-// of the linked image.
-extern "C" const void * const legion_gdn_mma_kernels[10] = {
+// norm (GN, #1176 round 44), and that writing the FP8 codes (CODES, #1183), then gdn_ahead's
+// two forms of those (#1183). They sit in an anonymous namespace: with relocatable device code
+// the device link left extern "C" kernels out of the linked image.
+extern "C" const void * const legion_gdn_mma_kernels[12] = {
     reinterpret_cast<const void *>(&gdn_single<16, 32, 1>),
     reinterpret_cast<const void *>(&gdn_single<16, 32, 2>),
     reinterpret_cast<const void *>(&gdn_single<16, 128>),
@@ -1429,4 +1868,6 @@ extern "C" const void * const legion_gdn_mma_kernels[10] = {
     reinterpret_cast<const void *>(&gdn_split<128, 16, 1, 1, 2>),
     reinterpret_cast<const void *>(&gdn_split<128, 16, 1, 1, 2, true>),
     reinterpret_cast<const void *>(&gdn_split<128, 16, 1, 1, 2, true, true>),
+    reinterpret_cast<const void *>(&gdn_ahead<false>),
+    reinterpret_cast<const void *>(&gdn_ahead<true>),
 };
