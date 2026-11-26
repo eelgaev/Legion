@@ -857,7 +857,6 @@ fn cuda_tiny_matches_the_cpu() {
 }
 
 /// The first GPU device.
-#[cfg(feature = "cuda")]
 fn gpu_backend() -> Backend {
     use crate::ggml::{DeviceKind, device_by_kind};
     device_by_kind(DeviceKind::Gpu)
@@ -1482,6 +1481,235 @@ fn cuda_real_gguf_matches_the_cpu() {
     );
     compare_traces(&cpu, &traced, 5e-2, &|_| None);
     assert_eq!(ct, gt, "greedy tokens");
+}
+
+/// One teacher-forced pass of [`cuda_real_long_text_nll`]: every position's negative
+/// log-likelihood of the next token and argmax, and the whole rows at the probed positions.
+#[derive(Default)]
+struct Scored {
+    nll: Vec<f64>,
+    top: Vec<u32>,
+    probes: HashMap<usize, Vec<f32>>,
+}
+
+impl Scored {
+    /// Scores the next position's row `row` against `ids`; rows come in position order.
+    fn add(&mut self, row: &[f32], ids: &[u32], probe: &[usize]) {
+        let pos = self.top.len();
+        let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let top = (0..row.len())
+            .max_by(|&i, &j| row[i].total_cmp(&row[j]))
+            .unwrap_or(0);
+        self.top.push(top as u32);
+        if let Some(&next) = ids.get(pos + 1) {
+            let sum: f64 = row.iter().map(|&v| (v - m).exp() as f64).sum();
+            self.nll
+                .push(sum.ln() + m as f64 - row[next as usize] as f64);
+        }
+        if probe.contains(&pos) {
+            self.probes.insert(pos, row.to_vec());
+        }
+    }
+
+    /// Mean NLL over positions `range` (NaN if a row was not finite).
+    fn mean(&self, range: Range<usize>) -> f64 {
+        let r = range.start..range.end.min(self.nll.len());
+        self.nll[r.clone()].iter().sum::<f64>() / r.len().max(1) as f64
+    }
+}
+
+/// #1221, long sequences: the real model (`LEGION_TEST_INKLING_GGUF`, else the NVFP4
+/// checkpoint `LEGION_TEST_INKLING_HF`) teacher-forced over the first
+/// `LEGION_TEST_PPL_TOKENS` (4096) tokens of the text in `LEGION_TEST_PPL_TEXT` on the GPU,
+/// through the engine's executor: as prompt steps of `LEGION_TEST_PPL_CHUNK` (256) tokens and
+/// token by token over whole caches (the serve default with prefix caching), and as prompt
+/// steps with the sliding slots in rings (`LEGION_TEST_PPL_PATHS`, a comma list of `steps`,
+/// `tokens`, `ring-steps`, `ring-tokens`); and on the CPU (the plain graph, whole caches) over
+/// the first `LEGION_TEST_PPL_CPU` (1300; 0 skips) tokens. It prints the mean NLL per
+/// 256-position bucket of every path (`nll gpu-steps bucket 1024-1279 = 2.31`), every path's
+/// largest logit difference to `gpu-steps` at positions around and past the window, its
+/// argmax agreement, and the rise of the NLL past the window over the 512-1023 positions.
+///
+/// Healthy: the buckets fall or stay level as the context grows (text-dependent, within a
+/// few tenths), the paths agree to a few hundredths of a nat and the probes to a small
+/// fraction of the logit scale. Broken position handling shows as a bucket jumping at 1024
+/// (the window, the relative-bias extent) or later (ring reuse), or one path leaving the
+/// others there. It fails only when a path disagrees with `gpu-steps` by over 0.1 nat in a
+/// bucket, or a row is not finite. Not gated on the `cuda` feature (so a CPU build checks it),
+/// but run with it.
+#[test]
+#[ignore = "needs a GPU, the Inkling-2-Mini weights and a long text"]
+fn cuda_real_long_text_nll() {
+    use std::time::Instant;
+
+    use crate::model::core::state::KvRing;
+    use crate::model::core::{Attention, Executor, KV_BLOCK, Logits, SeqInput};
+    use crate::tokenizer::Tokenizer;
+
+    let num = |k: &str, d: usize| -> usize {
+        std::env::var(k).map_or(d, |s| {
+            s.parse()
+                .unwrap_or_else(|_| panic!("{k}={s}: not a number"))
+        })
+    };
+    let (var, path) = ["LEGION_TEST_INKLING_GGUF", "LEGION_TEST_INKLING_HF"]
+        .into_iter()
+        .find_map(|v| std::env::var_os(v).map(|p| (v, p)))
+        .expect("set LEGION_TEST_INKLING_GGUF (or LEGION_TEST_INKLING_HF)");
+    let text = std::env::var_os("LEGION_TEST_PPL_TEXT").expect("set LEGION_TEST_PPL_TEXT");
+    let n = num("LEGION_TEST_PPL_TOKENS", 4096).max(2);
+    let cpu_n = num("LEGION_TEST_PPL_CPU", 1300).min(n);
+    let chunk = num("LEGION_TEST_PPL_CHUNK", 256).max(1);
+    let paths =
+        std::env::var("LEGION_TEST_PPL_PATHS").unwrap_or_else(|_| "steps,tokens,ring-steps".into());
+    let paths: Vec<&str> = paths.split(',').map(str::trim).collect();
+    for p in &paths {
+        assert!(
+            ["steps", "tokens", "ring-steps", "ring-tokens"].contains(p),
+            "LEGION_TEST_PPL_PATHS: unknown path {p}"
+        );
+    }
+    let g = GgufFile::open(&path).unwrap();
+    let tok = Tokenizer::from_gguf(&g).unwrap();
+    let text = std::fs::read_to_string(&text).unwrap();
+    let mut ids = tok.encode(&text, true);
+    assert!(
+        ids.len() >= n,
+        "the text has {} tokens, LEGION_TEST_PPL_TOKENS wants {n}",
+        ids.len()
+    );
+    ids.truncate(n);
+    const BUCKET: usize = 256;
+    let probe: Vec<usize> = [1000, 1023, 1024, 1100, 1250, 1500, 2047, 2048, 3000, 4000]
+        .into_iter()
+        .filter(|&p| p < n)
+        .collect();
+    println!("model {var}; {n} tokens, prompt steps of {chunk}, CPU over {cpu_n}; paths {paths:?}");
+    let mut done: Vec<(String, Scored)> = Vec::new();
+
+    // The CPU first (its copy of the weights dropped before the GPU's loads).
+    if cpu_n > 1 {
+        let t = Instant::now();
+        let mut b = Backend::cpu().unwrap();
+        b.set_threads(std::thread::available_parallelism().map_or(4, |n| n.get()));
+        let m = Model::load(&g, |_| b.buffer_type()).unwrap();
+        let mut st = m.new_state(b.buffer_type(), cpu_n).unwrap();
+        let mut alloc = None;
+        let mut s = Scored::default();
+        for c in ids[..cpu_n].chunks(chunk) {
+            let out = m.forward(&mut b, &mut alloc, &mut st, c, true).unwrap();
+            for row in out.chunks(out.len() / c.len()) {
+                s.add(row, &ids[..cpu_n], &probe);
+            }
+        }
+        println!("cpu: {:.1} s", t.elapsed().as_secs_f64());
+        done.push(("cpu".into(), s));
+    }
+
+    for ring in [false, true] {
+        let mine: Vec<&str> = paths
+            .iter()
+            .copied()
+            .filter(|p| p.starts_with("ring-") == ring)
+            .collect();
+        if mine.is_empty() {
+            continue;
+        }
+        let gpu = gpu_backend();
+        let m = Model::load(&g, |_| gpu.buffer_type()).unwrap();
+        let n_layer = m.hp.n_layer;
+        let rings = ring.then(|| KvRing::for_window(m.hp.arch.swa_window(), chunk, 1));
+        let blocks: Vec<u32> = (0..n.div_ceil(KV_BLOCK) as u32).collect();
+        let mut exec = Executor::new_staged_ring(
+            m,
+            vec![(gpu, 0..n_layer)],
+            blocks.len(),
+            1,
+            0,
+            rings,
+            Default::default(),
+        )
+        .unwrap();
+        exec.set_attention(Attention::Paged);
+        for p in mine {
+            let t = Instant::now();
+            exec.clear_slot(0);
+            let step = if p.ends_with("tokens") { 1 } else { chunk };
+            let mut s = Scored::default();
+            for from in (0..n).step_by(step) {
+                let to = (from + step).min(n);
+                let out = exec
+                    .step(&[Group {
+                        slot: 0,
+                        verify: false,
+                        seqs: vec![SeqInput {
+                            tokens: &ids[from..to],
+                            n_past: from,
+                            blocks: &blocks,
+                            logits: Logits::All,
+                            ring: 0,
+                            media: None,
+                        }],
+                    }])
+                    .unwrap();
+                assert_eq!(out.rows.len(), to - from, "{p}: rows of a step");
+                for row in &out.rows {
+                    s.add(row, &ids, &probe);
+                }
+            }
+            println!("gpu-{p}: {:.1} s", t.elapsed().as_secs_f64());
+            done.push((format!("gpu-{p}"), s));
+        }
+    }
+
+    let mut bad = Vec::new();
+    for (name, s) in &done {
+        for b in (0..s.nll.len()).step_by(BUCKET) {
+            let e = (b + BUCKET).min(s.nll.len());
+            println!("nll {name} bucket {b}-{} = {:.4}", e - 1, s.mean(b..e));
+        }
+        if s.nll.iter().any(|x| !x.is_finite()) {
+            bad.push(format!("{name}: a row is not finite"));
+        }
+        if s.nll.len() > 1024 {
+            let base = s.mean(512..1024);
+            let worst = (1024..s.nll.len())
+                .step_by(BUCKET)
+                .map(|b| s.mean(b..b + BUCKET))
+                .fold(f64::NEG_INFINITY, f64::max);
+            println!(
+                "nll {name} rise past 1024 = {:+.4} (worst bucket {worst:.4} vs 512-1023 {base:.4})",
+                worst - base
+            );
+        }
+    }
+    if let Some((_, base)) = done.iter().find(|(n, _)| n == "gpu-steps") {
+        for (name, s) in done.iter().filter(|(n, _)| n != "gpu-steps") {
+            let k = s.nll.len().min(base.nll.len());
+            let agree = (0..k).filter(|&i| s.top[i] == base.top[i]).count();
+            println!("argmax {name} vs gpu-steps = {agree}/{k}");
+            for b in (0..k).step_by(BUCKET) {
+                let e = (b + BUCKET).min(k);
+                let d = s.mean(b..e) - base.mean(b..e);
+                if d.abs() > 0.1 || d.is_nan() {
+                    bad.push(format!(
+                        "{name} bucket {b}-{}: {d:+.4} nat vs gpu-steps",
+                        e - 1
+                    ));
+                }
+            }
+            for &p in &probe {
+                if let (Some(a), Some(r)) = (s.probes.get(&p), base.probes.get(&p)) {
+                    println!(
+                        "diff {name} vs gpu-steps pos {p} = {:.3e} (scale {:.3e})",
+                        max_diff(a, r),
+                        scale_of(r)
+                    );
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
 }
 
 /// The real GGUFs (`LEGION_TEST_INKLING_GGUF`, llama.cpp's `inkling2_loop`;
