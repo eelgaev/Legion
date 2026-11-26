@@ -56,6 +56,21 @@ use crate::model::nvfp4_mm;
 
 use ops::LogScale;
 
+#[cfg(test)]
+thread_local! {
+    /// Tests only: the routed experts' ids of every slot (I32 `[n_expert_used, n]` per slot,
+    /// slot after slot) that a one-group step on this thread takes in place of the router's,
+    /// so two backends' experts are compared on one routing where a near tie in the router's
+    /// scores makes their own choices differ.
+    pub(crate) static FORCED_ROUTE: std::cell::RefCell<Option<Vec<i32>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn forced_route() -> Option<Vec<i32>> {
+    FORCED_ROUTE.with(|r| r.borrow().clone())
+}
+
 /// The GGUF architecture name (llama.cpp's).
 pub const ARCH: &str = "inkling2_loop";
 /// The earlier GGUF layout's architecture name.
@@ -423,6 +438,46 @@ impl Arch for Ink2Params {
     /// The head's [`glm_ops::argmax`] takes the first of the largest.
     fn argmax_first_of_ties(&self) -> bool {
         true
+    }
+
+    /// Tests only: the [`FORCED_ROUTE`] input, when set.
+    #[cfg(test)]
+    fn group_inputs_len(&self) -> usize {
+        forced_route().is_some() as usize
+    }
+
+    #[cfg(test)]
+    fn group_inputs<'a>(
+        &self,
+        ctx: &'a Context,
+        _g: &crate::model::core::GroupShape,
+        i: usize,
+    ) -> Vec<Tensor<'a>> {
+        let Some(ids) = forced_route() else {
+            return Vec::new();
+        };
+        assert_eq!(i, 0, "a forced route takes one group");
+        let t = ctx.new_tensor(types::I32, &[ids.len() as i64]);
+        vec![t.named("forced_route").as_input()]
+    }
+
+    #[cfg(test)]
+    fn fill_inputs(
+        &self,
+        _m: &Model,
+        inputs: &crate::model::core::Inputs<'_>,
+        _groups: &[Group<'_>],
+        _shape: &[crate::model::core::GroupShape],
+        _rec: &crate::model::core::StatePool,
+        _kv: &KvPool,
+        _spec: Option<&crate::model::core::SpecPool>,
+        sink: &mut dyn crate::model::core::InputSink,
+    ) {
+        if let (Some(ids), Some(&t)) =
+            (forced_route(), inputs.group.first().and_then(|g| g.first()))
+        {
+            sink.i32(t, &ids);
+        }
     }
 }
 
@@ -875,6 +930,22 @@ impl Model {
         tap.tap("ffn_moe_logits", il, logits);
         let bias = self.lw(ip, "exp_probs_b.bias")?;
         let ids = glm_ops::router_ids(ctx, logits, bias, hp.n_expert_used);
+        // Tests only: slot `il`'s ids from the forced route (see [`FORCED_ROUTE`]), the
+        // router's own traced as `ffn_moe_router`.
+        #[cfg(test)]
+        let ids = match pass.group.first().and_then(|g| g.first()) {
+            Some(&f) => {
+                tap.tap("ffn_moe_router", il, ids);
+                let k = hp.n_expert_used;
+                assert_eq!(
+                    f.ne()[0],
+                    p.n_slots() as i64 * k * n,
+                    "forced route: length"
+                );
+                ctx.view_2d(f, [k, n], 4 * k as usize, il * 4 * (k * n) as usize)
+            }
+            None => ids,
+        };
         tap.tap("ffn_moe_topk", il, ids);
         let w = glm_ops::router_w(ctx, logits, ids, true, p.weights_scale);
         tap.tap("ffn_moe_weights", il, w);

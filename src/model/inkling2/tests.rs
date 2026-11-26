@@ -4,6 +4,8 @@ use super::*;
 use crate::cpu::gpu_exact::{f16_to_f32, f32_to_f16};
 use crate::ggml::Backend;
 use crate::gguf::Value;
+#[cfg(feature = "cuda")]
+use crate::model::core::TracedTensor;
 use tiny::Layout;
 
 fn tiny_gguf(dir: &tempfile::TempDir, layout: Layout) -> GgufFile {
@@ -684,39 +686,115 @@ fn tiny_rings_and_batches_give_the_same_tokens() {
     assert_eq!(whole, run(true, true), "rings change the tokens");
 }
 
-/// The whole tiny graph on the GPU (the CUDA kernels of [`ops`] and GLM's dense ones) gives
-/// the CPU's logits up to rounding, in one prompt and token by token.
-#[cfg(feature = "cuda")]
+/// Runs `f` with `route` as this thread's [`super::FORCED_ROUTE`], cleared after (also when
+/// `f` panics).
+fn with_route<T>(route: &[i32], f: impl FnOnce() -> T) -> T {
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            super::FORCED_ROUTE.with(|r| *r.borrow_mut() = None);
+        }
+    }
+    super::FORCED_ROUTE.with(|r| *r.borrow_mut() = Some(route.to_vec()));
+    let _clear = Clear;
+    f()
+}
+
+/// The route a traced prompt took: every slot's `ffn_moe_topk`, slot after slot.
+fn route_of(trace: &crate::model::core::Trace) -> Vec<i32> {
+    (0..tiny::n_slots())
+        .flat_map(|il| {
+            let name = format!("ffn_moe_topk-{il}");
+            let t = (trace.1.iter().find(|t| t.name == name)).unwrap_or_else(|| panic!("{name}"));
+            t.data.iter().map(|&x| x as i32).collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Token `t`'s part of a prompt's route of `n` tokens: per slot its `N_USED` ids.
+fn route_at(route: &[i32], n: usize, t: usize) -> Vec<i32> {
+    let k = tiny::N_USED as usize;
+    route
+        .chunks(k * n)
+        .flat_map(|slot| slot[t * k..(t + 1) * k].to_vec())
+        .collect()
+}
+
+/// A forced route ([`super::FORCED_ROUTE`]) of the experts the router picks anyway changes
+/// nothing: the same logits and intermediates to the bit, in one prompt and token by token.
 #[test]
-#[ignore = "needs a GPU"]
-fn cuda_tiny_matches_the_cpu() {
-    use crate::ggml::{DeviceKind, device_by_kind};
+fn a_route_forced_to_its_own_choices_changes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let g = tiny_gguf(&dir, Layout::Mainline);
     let p = prompt();
     let mut b = backend();
-    let cpu = Model::load(&g, |_| b.buffer_type())
-        .unwrap()
-        .prompt_logits_all(&mut b, &p)
-        .unwrap();
-    let mut gpu = device_by_kind(DeviceKind::Gpu)
-        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
-        .expect("no GPU device")
-        .init()
-        .unwrap();
+    let m = Model::load(&g, |_| b.buffer_type()).unwrap();
+    let own = m.prompt_trace(&mut b, &p).unwrap();
+    let route = route_of(&own);
+    let forced = with_route(&route, || m.prompt_trace(&mut b, &p).unwrap());
+    assert_eq!(own.0, forced.0, "logits");
+    for t in &own.1 {
+        let f = forced.1.iter().find(|f| f.name == t.name).unwrap();
+        assert_eq!(t.data, f.data, "{}", t.name);
+    }
+    let router = forced
+        .1
+        .iter()
+        .filter(|t| t.name.starts_with("ffn_moe_router-"));
+    assert_eq!(
+        router.count(),
+        tiny::n_slots(),
+        "the router's own choices traced"
+    );
+    let mut st = m.new_state(b.buffer_type(), 256).unwrap();
+    let mut alloc = None;
+    let mut steps = Vec::new();
+    for (i, &t) in p.iter().enumerate() {
+        let r = route_at(&route, p.len(), i);
+        steps.extend(with_route(&r, || {
+            m.forward(&mut b, &mut alloc, &mut st, &[t], true).unwrap()
+        }));
+    }
+    assert_eq!(steps, chunked(&m, &p, &[]), "token by token");
+}
+
+/// The whole tiny graph on the GPU (the CUDA kernels of [`ops`] and GLM's dense ones) gives
+/// the CPU's logits up to rounding, in one prompt and token by token, on the CPU's route:
+/// the tiny model's random router has near ties that the GPU's rounding may break the other
+/// way (then every later slot differs), so the routed experts take the CPU's choices
+/// ([`super::FORCED_ROUTE`]) and [`cuda_tiny_traces_match_the_cpu`] checks the GPU router's
+/// own. The GPU's logits on its own route are printed.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_tiny_matches_the_cpu() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = tiny_gguf(&dir, Layout::Mainline);
+    let p = prompt();
+    let mut b = backend();
+    let cm = Model::load(&g, |_| b.buffer_type()).unwrap();
+    let cpu = cm.prompt_logits_all(&mut b, &p).unwrap();
+    let route = route_of(&cm.prompt_trace(&mut b, &p).unwrap());
+    let mut gpu = gpu_backend();
     let m = Model::load(&g, |_| gpu.buffer_type()).unwrap();
-    let once = m.prompt_logits_all(&mut gpu, &p).unwrap();
     let tol = 5e-3 * scale_of(&cpu);
+    let own = m.prompt_logits_all(&mut gpu, &p).unwrap();
+    eprintln!(
+        "the GPU on its own route: {:.3e} (tolerance {tol:.3e})",
+        max_diff(&own, &cpu)
+    );
+    let once = with_route(&route, || m.prompt_logits_all(&mut gpu, &p).unwrap());
     let d = max_diff(&once, &cpu);
     assert!(d <= tol, "one prompt on the GPU: {d} > {tol}");
     let mut st = m.new_state(gpu.buffer_type(), 256).unwrap();
     let mut alloc = None;
     let mut steps = Vec::new();
-    for &t in &p {
-        steps.extend(
+    for (i, &t) in p.iter().enumerate() {
+        let r = route_at(&route, p.len(), i);
+        steps.extend(with_route(&r, || {
             m.forward(&mut gpu, &mut alloc, &mut st, &[t], true)
-                .unwrap(),
-        );
+                .unwrap()
+        }));
     }
     let d = max_diff(&steps, &cpu);
     assert!(d <= tol, "token by token on the GPU: {d} > {tol}");
@@ -733,23 +811,116 @@ fn gpu_backend() -> Backend {
         .unwrap()
 }
 
+/// `t`'s per-expert entries of each token in the order of the experts' ids `ids` (`[k, n]`):
+/// `t` `[k, n]` (the ids, the weights) or `[w, k, n]` (the experts' rows).
+#[cfg(feature = "cuda")]
+fn by_expert_id(t: &TracedTensor, ids: &TracedTensor) -> Vec<f32> {
+    let (k, n) = (ids.ne[0] as usize, ids.ne[1] as usize);
+    let w = if t.data.len() == k * n {
+        1
+    } else {
+        t.ne[0] as usize
+    };
+    assert_eq!(t.data.len(), w * k * n, "{}", t.name);
+    let mut out = Vec::with_capacity(t.data.len());
+    for tok in 0..n {
+        let id = |j: usize| ids.data[tok * k + j];
+        let mut order: Vec<usize> = (0..k).collect();
+        order.sort_by(|&a, &b| id(a).total_cmp(&id(b)));
+        for j in order {
+            let at = (tok * k + j) * w;
+            out.extend_from_slice(&t.data[at..at + w]);
+        }
+    }
+    out
+}
+
+/// The router's selection scores, `sigmoid(logit) + bias`, of token `tok` (`logits` `[n_expert,
+/// n]`; no bias: 0).
+#[cfg(feature = "cuda")]
+fn route_scores(logits: &TracedTensor, bias: Option<&[f32]>, tok: usize) -> Vec<f32> {
+    let ne = logits.ne[0] as usize;
+    (0..ne)
+        .map(|e| {
+            let l = logits.data[tok * ne + e];
+            1.0 / (1.0 + (-l).exp()) + bias.map_or(0.0, |b| b[e])
+        })
+        .collect()
+}
+
+/// Where two routes `a` and `b` (`[k, n]` ids) of slot `il` first pick different experts: the
+/// token, both choices, and each one's selection scores on both sides (from the traces'
+/// `ffn_moe_logits-{il}` and `bias`), with the CPU's gap between its last pick and the best
+/// expert it left out.
+#[cfg(feature = "cuda")]
+fn route_report(
+    cpu: &[TracedTensor],
+    gpu: &[TracedTensor],
+    il: usize,
+    a: &TracedTensor,
+    b: &TracedTensor,
+    bias: Option<&[f32]>,
+) -> String {
+    let k = a.ne[0] as usize;
+    let set = |t: &TracedTensor, tok: usize| {
+        let mut v: Vec<i32> = t.data[tok * k..(tok + 1) * k]
+            .iter()
+            .map(|&x| x as i32)
+            .collect();
+        v.sort();
+        v
+    };
+    let Some(tok) = (0..a.ne[1] as usize).find(|&t| set(a, t) != set(b, t)) else {
+        return format!("slot {il}: the same experts in another order");
+    };
+    let name = format!("ffn_moe_logits-{il}");
+    let find = |ts: &[TracedTensor]| ts.iter().find(|t| t.name == name).cloned();
+    let (Some(cl), Some(gl)) = (find(cpu), find(gpu)) else {
+        return format!("slot {il} token {tok}: no {name}");
+    };
+    let (cs, gs) = (route_scores(&cl, bias, tok), route_scores(&gl, bias, tok));
+    let mut ranked: Vec<usize> = (0..cs.len()).collect();
+    ranked.sort_by(|&x, &y| cs[y].total_cmp(&cs[x]));
+    let gap = cs[ranked[k - 1]] - ranked.get(k).map_or(f32::MIN, |&e| cs[e]);
+    let (sa, sb) = (set(a, tok), set(b, tok));
+    let mut experts: Vec<i32> = sa.iter().chain(&sb).copied().collect();
+    experts.sort();
+    experts.dedup();
+    let scores: Vec<String> = experts
+        .iter()
+        .map(|&e| format!("{e}: cpu {:.6} gpu {:.6}", cs[e as usize], gs[e as usize]))
+        .collect();
+    format!(
+        "slot {il} token {tok}: cpu picks {sa:?}, gpu {sb:?}; scores {}; the CPU's gap after its \
+         last pick {gap:.3e}{}",
+        scores.join(", "),
+        if bias.is_some() { "" } else { " (no bias)" }
+    )
+}
+
 /// The GPU's traced intermediates against the CPU's, in the CPU's graph order, matched by name:
-/// a line each (see them with `--nocapture`). Returns the first whose worst difference is over
-/// `tol` times the CPU tensor's largest value (NaN counts as over), with that element on both,
-/// and the logits' worst difference.
+/// a line each (see them with `--nocapture`). The routed experts' taps (`ffn_moe_topk`,
+/// `_weights`, `_gate_up`, `_act`, `_down`) are compared in the order of the experts' ids, so
+/// the same experts in another order match; where the routes differ, [`route_report`] says
+/// how (`bias`: the router's bias of a slot, when known). Returns the first tap whose worst
+/// difference is over `tol` times the CPU tensor's largest value (NaN counts as over), with
+/// that element on both, and the logits' worst difference.
 #[cfg(feature = "cuda")]
 fn compare_traces(
     cpu: &crate::model::core::Trace,
     gpu: &crate::model::core::Trace,
     tol: f32,
+    bias: &dyn Fn(usize) -> Option<Vec<f32>>,
 ) -> (Option<String>, f32) {
     let ((cl, ct), (gl, gt)) = (cpu, gpu);
     let mut by_name = HashMap::new();
     for g in gt {
         by_name.entry(g.name.as_str()).or_insert(g);
     }
+    let cpu_named = |name: &str| ct.iter().find(|t| t.name == name);
     eprintln!("{} CPU taps, {} GPU taps", ct.len(), gt.len());
     let mut first = None;
+    let mut routes_reported = 0;
     for (i, c) in ct.iter().enumerate() {
         let Some(g) = by_name.get(c.name.as_str()) else {
             eprintln!("{i:5} {:<22} {:?} not on the GPU", c.name, c.ne);
@@ -763,11 +934,27 @@ fn compare_traces(
             first.get_or_insert_with(|| format!("{}: cpu {:?} gpu {:?}", c.name, c.ne, g.ne));
             continue;
         }
-        let scale = scale_of(&c.data).max(1e-6);
-        let (at, d) = c
-            .data
+        let (base, il) = c.name.rsplit_once('-').unwrap_or((c.name.as_str(), ""));
+        let moe = [
+            "ffn_moe_topk",
+            "ffn_moe_weights",
+            "ffn_moe_gate_up",
+            "ffn_moe_act",
+            "ffn_moe_down",
+        ];
+        let ids = format!("ffn_moe_topk-{il}");
+        let (cd, gd) = match (
+            moe.contains(&base),
+            cpu_named(&ids),
+            by_name.get(ids.as_str()),
+        ) {
+            (true, Some(ci), Some(gi)) => (by_expert_id(c, ci), by_expert_id(g, gi)),
+            _ => (c.data.clone(), g.data.clone()),
+        };
+        let scale = scale_of(&cd).max(1e-6);
+        let (at, d) = cd
             .iter()
-            .zip(&g.data)
+            .zip(&gd)
             .map(|(x, y)| (x - y).abs())
             .map(|d| if d.is_nan() { f32::INFINITY } else { d })
             .enumerate()
@@ -778,6 +965,16 @@ fn compare_traces(
             "{i:5} {:<22} {:?} diff {d:.3e} scale {scale:.3e}{mark}",
             c.name, c.ne
         );
+        let route = (bad && base == "ffn_moe_topk").then(|| {
+            let il: usize = il.parse().unwrap_or(0);
+            route_report(ct, gt, il, c, g, bias(il).as_deref())
+        });
+        if let Some(r) = &route
+            && routes_reported < 4
+        {
+            eprintln!("      route: {r}");
+            routes_reported += 1;
+        }
         if bad && first.is_none() {
             let [n0, n1, n2, _] = c.ne.map(|n| n.max(1) as usize);
             let idx = [
@@ -786,9 +983,14 @@ fn compare_traces(
                 at / (n0 * n1) % n2,
                 at / (n0 * n1 * n2),
             ];
+            let order = if cd == c.data { "" } else { " (by expert id)" };
             first = Some(format!(
-                "{} {:?} at {idx:?}: cpu {} gpu {} (diff {d}, scale {scale})",
-                c.name, c.ne, c.data[at], g.data[at]
+                "{} {:?} at {idx:?}{order}: cpu {} gpu {} (diff {d}, scale {scale}){}",
+                c.name,
+                c.ne,
+                cd[at],
+                gd[at],
+                route.map_or(String::new(), |r| format!("; {r}"))
             ));
         }
     }
@@ -800,10 +1002,29 @@ fn compare_traces(
     (first, d)
 }
 
+/// The tiny model's router bias of slot `il`.
+#[cfg(feature = "cuda")]
+fn tiny_bias(il: usize) -> Option<Vec<f32>> {
+    let ip = if il < tiny::N_PHYS {
+        il
+    } else {
+        tiny::CORE.start + (il - tiny::N_PHYS) % tiny::CORE.len()
+    };
+    let name = format!("blk.{ip}.exp_probs_b.bias");
+    tiny::tensors(7)
+        .into_iter()
+        .find(|t| t.0 == name)
+        .map(|t| t.2)
+}
+
 /// [`cuda_tiny_matches_the_cpu`] node by node: every traced intermediate of one prompt on the
-/// GPU against the CPU, failing at the first that differs (see [`compare_traces`]). It also
-/// prints how far the GPU's untraced logits are from its traced ones: the traces keep their
-/// tensors' memory, so a gap there points at memory reused too early.
+/// GPU against the CPU, failing at the first that differs (see [`compare_traces`]), on the
+/// CPU's route. The GPU router's own choices (`ffn_moe_router`) must be the CPU's up to near
+/// ties: an expert the CPU left out only with a selection score within 5e-3 of the logits'
+/// scale of its last pick's. First, for the record, the whole comparison on the GPU's own
+/// route (where the routes part, [`route_report`] shows the scores). It also prints how far
+/// the GPU's untraced logits are from its traced ones: the traces keep their tensors'
+/// memory, so a gap there points at memory reused too early.
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "needs a GPU"]
@@ -816,21 +1037,64 @@ fn cuda_tiny_traces_match_the_cpu() {
         .unwrap()
         .prompt_trace(&mut b, &p)
         .unwrap();
+    let route = route_of(&cpu);
     let mut gpu = gpu_backend();
     let m = Model::load(&g, |_| gpu.buffer_type()).unwrap();
-    let plain = m.prompt_logits_all(&mut gpu, &p).unwrap();
-    let traced = m.prompt_trace(&mut gpu, &p).unwrap();
+    eprintln!("== the GPU on its own route");
+    let own = m.prompt_trace(&mut gpu, &p).unwrap();
+    compare_traces(&cpu, &own, 5e-3, &tiny_bias);
+    eprintln!("== the GPU on the CPU's route");
+    let plain = with_route(&route, || m.prompt_logits_all(&mut gpu, &p).unwrap());
+    let traced = with_route(&route, || m.prompt_trace(&mut gpu, &p).unwrap());
     eprintln!(
         "GPU logits untraced vs traced: {:.3e}; untraced vs the CPU: {:.3e}",
         max_diff(&plain, &traced.0),
         max_diff(&plain, &cpu.0)
     );
-    let (first, d) = compare_traces(&cpu, &traced, 5e-3);
+    let (first, d) = compare_traces(&cpu, &traced, 5e-3, &tiny_bias);
     if let Some(f) = first {
         panic!("first mismatch: {f}");
     }
     let tol = 5e-3 * scale_of(&cpu.0);
     assert!(d <= tol, "logits: {d} > {tol}");
+    // The GPU router's own choices against the CPU's.
+    let k = tiny::N_USED as usize;
+    let mut ties = 0;
+    for il in 0..tiny::n_slots() {
+        let named = |ts: &[TracedTensor], name: String| {
+            ts.iter()
+                .find(|t| t.name == name)
+                .cloned()
+                .unwrap_or_else(|| panic!("{name}"))
+        };
+        let ids = named(&cpu.1[..], format!("ffn_moe_topk-{il}"));
+        let own = named(&traced.1[..], format!("ffn_moe_router-{il}"));
+        let logits = named(&cpu.1[..], format!("ffn_moe_logits-{il}"));
+        let eps = 5e-3 * scale_of(&logits.data);
+        let bias = tiny_bias(il).unwrap();
+        for tok in 0..p.len() {
+            let picks = |t: &TracedTensor| -> Vec<usize> {
+                t.data[tok * k..(tok + 1) * k]
+                    .iter()
+                    .map(|&x| x as usize)
+                    .collect()
+            };
+            let (cp, gp) = (picks(&ids), picks(&own));
+            let s = route_scores(&logits, Some(bias.as_slice()), tok);
+            let last = cp.iter().map(|&e| s[e]).fold(f32::MAX, f32::min);
+            for &e in gp.iter().filter(|e| !cp.contains(e)) {
+                assert!(
+                    s[e] >= last - eps,
+                    "slot {il} token {tok}: the GPU router picks {gp:?}, the CPU {cp:?}; \
+                     expert {e} scores {} on the CPU, its last pick {last} (not a near tie, \
+                     {eps})",
+                    s[e]
+                );
+                ties += 1;
+            }
+        }
+    }
+    eprintln!("the GPU router: the CPU's choices but {ties} near ties");
 }
 
 /// The real model (`LEGION_TEST_INKLING_GGUF`) on the GPU against the CPU over a short prompt:
@@ -872,7 +1136,7 @@ fn cuda_real_gguf_matches_the_cpu() {
         scale_of(&cpu.0),
         max_diff(&plain, &traced.0)
     );
-    compare_traces(&cpu, &traced, 5e-2);
+    compare_traces(&cpu, &traced, 5e-2, &|_| None);
     assert_eq!(ct, gt, "greedy tokens");
 }
 
