@@ -135,24 +135,37 @@ pub const REG_LD: i32 = 4;
 pub const REG_CROSS: i32 = 8;
 /// Every option bit.
 pub const REG_ALL: i32 = REG_PD2 | REG_XS | REG_LD | REG_CROSS;
-/// The options on by default: `ldmatrix.x4` (`legion serve --no-hc-up-mix-ldmatrix` turns it
-/// off).
-pub const DEFAULT_REG_OPTS: i32 = REG_LD;
+/// The options on by default: `ldmatrix.x4` and the mix's operands staged in shared memory
+/// (`legion serve --no-hc-up-mix-ldmatrix` and `--no-hc-up-mix-stage` turn them off; together
+/// 1-12% faster than neither on one GB10, by mode). The prefetch options stay off: both were
+/// slower there.
+pub const DEFAULT_REG_OPTS: i32 = REG_LD | REG_XS;
 
-/// The options the launches run with ([`set_up_mix_ldmatrix`]).
+/// The options the launches run with ([`set_up_mix_ldmatrix`], [`set_up_mix_stage`]).
 static REG_OPTS: AtomicI32 = AtomicI32::new(DEFAULT_REG_OPTS);
 
 /// The options [`force_reg_opts`] forces, or -1.
 static FORCED_REG_OPTS: AtomicI32 = AtomicI32::new(-1);
 
+/// Sets option `bit` of the configured ones on or off.
+fn set_reg_opt(bit: i32, on: bool) {
+    if on {
+        REG_OPTS.fetch_or(bit, Ordering::Relaxed);
+    } else {
+        REG_OPTS.fetch_and(!bit, Ordering::Relaxed);
+    }
+}
+
 /// Sets whether `up_mix_bf16_reg` loads `lo`'s B fragments with `ldmatrix.x4` (on by default;
 /// the same bits either way).
 pub fn set_up_mix_ldmatrix(on: bool) {
-    if on {
-        REG_OPTS.fetch_or(REG_LD, Ordering::Relaxed);
-    } else {
-        REG_OPTS.fetch_and(!REG_LD, Ordering::Relaxed);
-    }
+    set_reg_opt(REG_LD, on);
+}
+
+/// Sets whether `up_mix_bf16_reg` stages each tile's mix operands in shared memory while its
+/// matmul runs ([`REG_XS`]; on by default; the same bits either way).
+pub fn set_up_mix_stage(on: bool) {
+    set_reg_opt(REG_XS, on);
 }
 
 /// Forces `up_mix_bf16_reg`'s options ([`REG_ALL`] bits) for the launches from now on
@@ -948,8 +961,8 @@ pub fn last_kernel() -> i32 {
 }
 
 /// The `up_mix_bf16_reg` options ([`REG_ALL`] bits) the last BF16 launch ran with: [`REG_XS`]
-/// dropped where the streams are not 16-byte aligned, 0 after an `up_mix_bf16` launch (or no
-/// CUDA build).
+/// dropped where the streams are not 16-byte aligned or two CTAs an SM do not fit with it, 0
+/// after an `up_mix_bf16` launch (or no CUDA build).
 #[doc(hidden)]
 pub fn last_reg_opts() -> i32 {
     #[cfg(feature = "cuda")]

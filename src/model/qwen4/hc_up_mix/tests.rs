@@ -869,15 +869,39 @@ fn bench_variants_parse() {
     assert!(v("0").ran_as(1, 0) && v("1").ran_as(1, 0));
 }
 
+/// The options' switch tests change the same configured options: one at a time.
+static REG_OPTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The configured options with `set(false)`, then with `set(true)`.
+fn reg_opts_off_on(set: fn(bool)) -> (i32, i32) {
+    let _lock = REG_OPTS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    set(false);
+    let off = REG_OPTS.load(std::sync::atomic::Ordering::Relaxed);
+    set(true);
+    let on = REG_OPTS.load(std::sync::atomic::Ordering::Relaxed);
+    (off, on)
+}
+
 /// `--no-hc-up-mix-ldmatrix` takes ldmatrix out of the default options and nothing else.
 #[test]
 fn ldmatrix_switch_is_the_ld_bit() {
-    assert_eq!(DEFAULT_REG_OPTS, REG_LD);
-    set_up_mix_ldmatrix(false);
-    let off = REG_OPTS.load(std::sync::atomic::Ordering::Relaxed);
-    set_up_mix_ldmatrix(true);
-    let on = REG_OPTS.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(DEFAULT_REG_OPTS, REG_LD | REG_XS);
+    let (off, on) = reg_opts_off_on(set_up_mix_ldmatrix);
     assert_eq!(off, DEFAULT_REG_OPTS & !REG_LD);
+    assert_eq!(on, DEFAULT_REG_OPTS);
+}
+
+/// `--no-hc-up-mix-stage` takes the shared-memory staging out of the default options and
+/// nothing else.
+#[test]
+fn stage_switch_is_the_xs_bit() {
+    assert_eq!(
+        DEFAULT_REG_OPTS & (REG_PD2 | REG_CROSS),
+        0,
+        "the prefetch options stay off"
+    );
+    let (off, on) = reg_opts_off_on(set_up_mix_stage);
+    assert_eq!(off, DEFAULT_REG_OPTS & !REG_XS);
     assert_eq!(on, DEFAULT_REG_OPTS);
 }
 

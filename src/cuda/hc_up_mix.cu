@@ -105,7 +105,8 @@ int legion_hc_up_lob_launch(const legion_hc_up_mix * p, void * stream);
 int legion_hc_up_mix_last_kernel(void);
 
 // The up_mix_bf16_reg options (reg_opts bits) the last launch ran with (REG_XS dropped where the
-// operands are not 16-byte aligned; 0 after an up_mix_bf16 launch), for `legion hc-up-mix-bench`.
+// operands are not 16-byte aligned or two CTAs an SM do not fit with it; 0 after an up_mix_bf16
+// launch), for `legion hc-up-mix-bench`.
 int legion_hc_up_mix_last_opts(void);
 
 }  // extern "C"
@@ -197,6 +198,32 @@ constexpr int REG_ALL   = REG_PD2 | REG_XS | REG_LD | REG_CROSS;
 std::atomic<int> last_kernel{ 0 };
 std::atomic<int> last_opts{ 0 };
 
+// XS's forms (34.5-41 KB of shared memory a CTA) fit two CTAs an SM only in a carveout above
+// 64 KB (a GB10's next is 100 KB): ask for all of the SM's shared memory as shared memory, then
+// whether two CTAs fit (once per device, `state` as smem_opt_in's). False: launch without XS.
+template <typename Kernel> bool xs_pair(std::atomic<int8_t> * state, Kernel kernel, int threads, int smem) {
+    const int dev = legion_device::current();
+    if (dev < 0) {
+        return false;
+    }
+    int8_t st = state[dev].load(std::memory_order_relaxed);
+    if (st == 0) {
+        const cudaError_t before = cudaPeekAtLastError();
+        int               per_sm = 0;
+        const bool        two =
+            cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared) ==
+                cudaSuccess &&
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, threads, smem) == cudaSuccess &&
+            per_sm >= REG_MINB;
+        if (!two) {
+            legion_device::clear_own_error(before);
+        }
+        st = two ? 1 : -1;
+        state[dev].store(st, std::memory_order_relaxed);
+    }
+    return st > 0;
+}
+
 // One up_mix_bf16_reg launch of the form L1 / XS / LD: e / 32 column blocks times runs of `run`
 // tiles. False (nothing launched) when the kernel cannot have its shared memory.
 template <bool RB, bool S16, bool PRE, bool L1, bool XS, bool LD>
@@ -209,6 +236,12 @@ bool launch_reg_form(const legion_hc_up_mix & p, cudaStream_t s, int run, int op
     if (!legion_device::smem_opt_in(opt, kernel, SMEM)) {
         return false;
     }
+    if constexpr (XS) {
+        static std::atomic<int8_t> pair[GGML_CUDA_MAX_DEVICES];
+        if (!xs_pair(pair, kernel, THREADS, SMEM)) {
+            return false;
+        }
+    }
     const int  chunk = run * REG_TT;
     const dim3 grid((unsigned) (p.e / COLS), (unsigned) ((p.n + chunk - 1) / chunk));
     kernel<<<grid, THREADS, SMEM, s>>>(p, chunk, (opts & REG_PD2) != 0 ? 2 : REG_PD, (opts & REG_CROSS) != 0);
@@ -219,10 +252,13 @@ bool launch_reg_form(const legion_hc_up_mix & p, cudaStream_t s, int run, int op
 template <bool RB, bool S16, bool PRE, bool L1>
 bool launch_reg_l1(const legion_hc_up_mix & p, cudaStream_t s, int run, int opts) {
     switch (opts & (REG_XS | REG_LD)) {
+        // XS where two CTAs an SM fit with it (xs_pair), else the same form without it.
         case REG_XS | REG_LD:
-            return launch_reg_form<RB, S16, PRE, L1, true, true>(p, s, run, opts);
+            return launch_reg_form<RB, S16, PRE, L1, true, true>(p, s, run, opts) ||
+                   launch_reg_form<RB, S16, PRE, L1, false, true>(p, s, run, opts & ~REG_XS);
         case REG_XS:
-            return launch_reg_form<RB, S16, PRE, L1, true, false>(p, s, run, opts);
+            return launch_reg_form<RB, S16, PRE, L1, true, false>(p, s, run, opts) ||
+                   launch_reg_form<RB, S16, PRE, L1, false, false>(p, s, run, opts & ~REG_XS);
         case REG_LD:
             return launch_reg_form<RB, S16, PRE, L1, false, true>(p, s, run, opts);
         default:
