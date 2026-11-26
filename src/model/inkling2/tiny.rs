@@ -29,7 +29,9 @@ pub const N_REL: i64 = 4;
 pub const EXTENT: i64 = 16;
 pub const WINDOW: i64 = 8;
 pub const CONV: i64 = 4;
-pub const RANK: i64 = 8;
+/// The loop controllers' rank: the gain and forget products' K, which the CUDA linears take in
+/// multiples of 32 (the model's is 64).
+pub const RANK: i64 = 32;
 pub const N_EXPERT: i64 = 8;
 pub const N_USED: i64 = 2;
 pub const N_FF: i64 = 32;
