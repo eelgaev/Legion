@@ -29,6 +29,9 @@ pub struct Switches {
     /// Gated DeltaNet prompt groups' whole-head chunked kernel staged through shared memory
     /// ([`crate::model::core::set_gdn_staged`]).
     pub gdn_staged: Option<bool>,
+    /// That kernel's gated-norm forms copying a chunk's z rows one chunk ahead
+    /// ([`crate::model::core::set_gdn_ahead`]).
+    pub gdn_ahead: Option<bool>,
     /// Gated DeltaNet verify and commit steps' delta rule as Legion's op
     /// ([`crate::model::core::set_gdn`]).
     pub gdn: Option<bool>,
@@ -606,6 +609,7 @@ impl Switches {
         set(self.gdn_scan, core::set_gdn_scan);
         set(self.gdn_mma, core::set_gdn_mma);
         set(self.gdn_staged, core::set_gdn_staged);
+        set(self.gdn_ahead, core::set_gdn_ahead);
         set(self.gdn, core::set_gdn);
         set(self.gdn_decode, core::set_gdn_decode);
         set(self.gdn_replay_staged, core::set_gdn_replay_staged);
