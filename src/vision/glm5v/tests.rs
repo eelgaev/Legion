@@ -20,9 +20,30 @@ fn gradient(w: u32, h: u32) -> Vec<u8> {
     })
 }
 
-/// A tensor of the tiny tower as F32 values.
+/// A tensor of the tower as F32 values: the tiny tower's are F32, a checkpoint's matrices F16
+/// (BF16 also read).
 fn values(enc: &Encoder, name: &str) -> Vec<f32> {
-    enc.weight(name).unwrap().to_f32()
+    widen(enc.weight(name).unwrap())
+}
+
+fn widen(t: crate::ggml::Tensor<'_>) -> Vec<f32> {
+    use crate::cpu::gpu_exact::f16_to_f32;
+    let b = t.bytes();
+    match t.ty() {
+        crate::ggml::types::F32 => b
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        crate::ggml::types::F16 => b
+            .chunks_exact(2)
+            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        crate::ggml::types::BF16 => b
+            .chunks_exact(2)
+            .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
+            .collect(),
+        ty => panic!("`{}`: type {ty:?}", t.name()),
+    }
 }
 
 fn rms(x: &mut [f32], w: &[f32], eps: f32) {
@@ -116,7 +137,7 @@ struct Mlp {
 
 impl Mlp {
     fn load(enc: &Encoder, prefix: &str) -> Self {
-        let get = |s: &str| enc.weight(&format!("{prefix}{s}")).map(|t| t.to_f32());
+        let get = |s: &str| enc.weight(&format!("{prefix}{s}")).map(widen);
         let [w, b] =
             [".weight", ".bias"].map(|p| ["gate", "up", "down"].map(|m| get(&format!("{m}{p}"))));
         Self {
