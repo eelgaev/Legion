@@ -37,8 +37,9 @@ external_op!(SITU, "ink_situ", cpu_situ, situ);
 external_op!(MM_ID, "ink_mm_id", cpu_mm_id, mm_id);
 external_op!(SOFTCAP, "ink_softcap", cpu_softcap, softcap);
 
-/// The most states [`mix`] takes (the depth blocks and the current residual).
-pub const MAX_STATES: usize = 9;
+/// The most states [`mix`] takes (the depth blocks and the current residual): with its query,
+/// the 9 sources ggml takes.
+pub const MAX_STATES: usize = 8;
 /// The most conv taps [`conv`] takes.
 pub const MAX_TAPS: usize = 8;
 
@@ -292,7 +293,9 @@ pub fn attn<'a>(
         &ATTN,
         types::F32,
         [d, nh, ng, 1],
-        &[q, kc, vc, table, wtable, pos, r, rel, sinks, after],
+        // The cells come through `wtable` alone (the ring's table, else the block table):
+        // ggml takes at most 9 sources.
+        &[q, kc, vc, wtable, pos, r, rel, sinks, after],
         &[
             n_tok as i32,
             scale.to_bits() as i32,
@@ -601,9 +604,8 @@ unsafe fn cpu_clip(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
 unsafe fn cpu_attn(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
     unsafe {
         let s = |i: usize| &*dst.src[i];
-        let (q, kc, vc, table, wtable, pos, r, rel, sinks) =
-            (s(0), s(1), s(2), s(3), s(4), s(5), s(6), s(7), s(8));
-        let _ = table;
+        let (q, kc, vc, wtable, pos, r, rel, sinks) =
+            (s(0), s(1), s(2), s(3), s(4), s(5), s(6), s(7));
         let p = external_params(dst);
         let (n_tok, scale, window, block) =
             (p[0] as usize, f32_param(p[1]), p[2] as usize, p[3] as usize);

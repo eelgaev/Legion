@@ -77,7 +77,7 @@ enum Kernel {
 }
 
 /// `MIX_STATES`, `MIX_QUERIES`, `CONV_TAPS` of the kernels.
-const MIX_STATES: i32 = 9;
+const MIX_STATES: i32 = 8;
 const MIX_QUERIES: i64 = 4;
 const CONV_TAPS: i64 = 8;
 /// `ATTN_TQ`, `ATTN_ROWS`, `ATTN_NR` and the threads of the attention kernel.
@@ -281,10 +281,10 @@ pub(super) unsafe fn attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
         }
         let nkv = kc.ne[0] / d;
         let pk = dst.ne[1] / nkv;
-        if pk * ATTN_TQ > ATTN_ROWS || src(dst, 7).ne[0] > ATTN_NR {
+        if pk * ATTN_TQ > ATTN_ROWS || src(dst, 6).ne[0] > ATTN_NR {
             return Err(format!(
                 "ink_attn: {pk} heads per kv head, {} bias ranks (the kernel takes 4 and 16)",
-                src(dst, 7).ne[0]
+                src(dst, 6).ne[0]
             ));
         }
         let n_tok = external_params(dst)[0] as i64;

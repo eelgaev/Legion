@@ -40,7 +40,7 @@ constexpr int TYPE_I8   = 24;
 constexpr int TYPE_BF16 = 30;
 
 // ink_mix's most states and queries.
-constexpr int MIX_STATES  = 9;
+constexpr int MIX_STATES  = 8;
 constexpr int MIX_QUERIES = 4;
 // ink_conv's most taps.
 constexpr int CONV_TAPS = 8;
@@ -328,7 +328,7 @@ __device__ __forceinline__ int64_t cell(const A & a, int ts, int64_t s, int64_t 
 }
 
 // ---- ink_attn: params n_tok, scale, window, block, ring entries; sources q [d, nh, ng],
-// kc, vc [d * nkv, cells] F16, table, wtable, pos [ng], r [nr, nh, ng], rel [nr, extent],
+// kc, vc [d * nkv, cells] F16, wtable, pos [ng], r [nr, nh, ng], rel [nr, extent],
 // sinks [nh, ng], after. A block per (kv head, ATTN_TQ tokens of one sequence): its rows are
 // those tokens' heads of the kv head; each warp takes key chunks of 32 (a key per lane for the
 // scores, DPL dims per lane for the values), with an online softmax per warp, then the warps'
@@ -345,8 +345,8 @@ __global__ void attn_kernel(const A a) {
     const int64_t nh = a.ne[1];
     const int64_t nkv = a.src_ne[1][0] / D;
     const int     pk  = (int) (nh / nkv);
-    const int     nr  = (int) a.src_ne[7][0];
-    const int64_t extent = a.src_ne[7][1];
+    const int     nr  = (int) a.src_ne[6][0];
+    const int64_t extent = a.src_ne[6][1];
     const int64_t g      = blockIdx.x;
     const int64_t tiles  = (n_tok + ATTN_TQ - 1) / ATTN_TQ;
     const int64_t seq    = blockIdx.y / tiles;
@@ -361,7 +361,7 @@ __global__ void attn_kernel(const A a) {
     __shared__ float   pacc[ATTN_WARPS][ATTN_ROWS][ATTN_D];
     __shared__ int64_t tpos[ATTN_TQ], tlo[ATTN_TQ];
 
-    const int32_t * pos = (const int32_t *) src(a, 5);
+    const int32_t * pos = (const int32_t *) src(a, 4);
     if (threadIdx.x < ATTN_TQ) {
         const int     tq = threadIdx.x;
         const int64_t t  = seq * n_tok + tq0 + tq;
@@ -390,7 +390,7 @@ __global__ void attn_kernel(const A a) {
         if (r < rows && k < nr) {
             const int64_t t = seq * n_tok + tq0 + r / pk;
             const int64_t h = g * pk + r % pk;
-            v               = ((const float *) src(a, 6))[(t * nh + h) * nr + k];
+            v               = ((const float *) src(a, 5))[(t * nh + h) * nr + k];
         }
         rsm[r][k] = v;
     }
@@ -411,7 +411,7 @@ __global__ void attn_kernel(const A a) {
             acc[r][j] = 0.f;
         }
     }
-    const float * rel = (const float *) src(a, 7);
+    const float * rel = (const float *) src(a, 6);
     const size_t  kvoff = (size_t) g * D * sizeof(__half);
     for (int64_t base = kstart + warp * 32; base <= kend; base += 32 * ATTN_WARPS) {
         const int64_t key   = base + lane;
@@ -423,7 +423,7 @@ __global__ void attn_kernel(const A a) {
             s[r] = 0.f;
         }
         if (inkey) {
-            c                 = cell(a, 4, seq, key % wrap, block);
+            c                 = cell(a, 3, seq, key % wrap, block);
             const char * krow = src(a, 1) + c * a.src_nb[1][1] + kvoff;
             for (int i = 0; i < D; i += 8) {
                 const uint4    u  = *(const uint4 *) (krow + i * sizeof(__half));
@@ -513,7 +513,7 @@ __global__ void attn_kernel(const A a) {
         }
     }
     __syncthreads();
-    const float * sinks = (const float *) src(a, 8);
+    const float * sinks = (const float *) src(a, 7);
     for (int i = threadIdx.x; i < rows * D; i += blockDim.x) {
         const int     r = i / D, k = i % D;
         const int64_t t = seq * n_tok + tq0 + r / pk;
