@@ -48,6 +48,7 @@ constexpr int CONV_TAPS = 8;
 // bias ranks, the widest head.
 constexpr int ATTN_TQ   = 4;
 constexpr int ATTN_ROWS = 16;
+constexpr int ATTN_DECODE_ROWS = 4;
 constexpr int ATTN_NR   = 16;
 constexpr int ATTN_D    = 128;
 constexpr int ATTN_WARPS = 4;
@@ -118,31 +119,66 @@ __global__ void mix_kernel(const A a) {
     const float   eps = pf(a.params[1]);
     const int64_t e = a.ne[0], n = a.ne[1], nq = a.ne[2];
     const int64_t t = blockIdx.x;
-    __shared__ float red[32];
+    // Each state's sum of squares (k = 0) and query dots (k = 1 + j): every thread's partials
+    // of all of them in one pass over its elements, each in block_sum's order over them, then
+    // block_sum's tree for each (#1221: not one block_sum after another, a memory latency
+    // each, ~40 in a row for one token). The same sums, the same bits.
+    constexpr int    NK = 1 + MIX_QUERIES;
+    __shared__ float red[MIX_STATES * NK][32];
     __shared__ float sc[MIX_STATES][MIX_QUERIES];
     __shared__ float rs[MIX_STATES];
     const float inv = rsqrtf((float) e);
-    for (int s = 0; s < ns; s++) {
-        const float * x  = (const float *) (src(a, s) + t * a.src_nb[s][1]);
-        float         ss = 0.f;
-        for (int64_t i = threadIdx.x; i < e; i += blockDim.x) {
-            ss += x[i] * x[i];
+    float       part[MIX_STATES][NK];
+#pragma unroll
+    for (int s = 0; s < MIX_STATES; s++) {
+#pragma unroll
+        for (int k = 0; k < NK; k++) {
+            part[s][k] = 0.f;
         }
-        ss            = block_sum(ss, red);
-        const float r = rsqrtf(ss / (float) e + eps);
-        for (int j = 0; j < nq; j++) {
-            const float * q = (const float *) (src(a, ns) + j * a.src_nb[ns][1]);
-            float         d = 0.f;
-            for (int64_t i = threadIdx.x; i < e; i += blockDim.x) {
-                d += x[i] * q[i];
-            }
-            d = block_sum(d, red);
-            if (threadIdx.x == 0) {
-                sc[s][j] = d * r * inv;
+    }
+    for (int64_t i = threadIdx.x; i < e; i += blockDim.x) {
+#pragma unroll
+        for (int s = 0; s < MIX_STATES; s++) {
+            if (s < ns) {
+                const float * x = (const float *) (src(a, s) + t * a.src_nb[s][1]);
+                part[s][0] += x[i] * x[i];
+#pragma unroll
+                for (int j = 0; j < MIX_QUERIES; j++) {
+                    if (j < nq) {
+                        const float * q = (const float *) (src(a, ns) + j * a.src_nb[ns][1]);
+                        part[s][1 + j] += x[i] * q[i];
+                    }
+                }
             }
         }
-        if (threadIdx.x == 0) {
-            rs[s] = r;
+    }
+    const int w = threadIdx.x / 32, l = threadIdx.x % 32, nw = blockDim.x / 32;
+#pragma unroll
+    for (int s = 0; s < MIX_STATES; s++) {
+#pragma unroll
+        for (int k = 0; k < NK; k++) {
+            if (s < ns && k <= nq) {
+                const float v = warp_sum(part[s][k]);
+                if (l == 0) {
+                    red[s * NK + k][w] = v;
+                }
+            }
+        }
+    }
+    __syncthreads();
+    if (w == 0) {
+        for (int s = 0; s < ns; s++) {
+            const float ss = warp_sum(l < nw ? red[s * NK][l] : 0.f);
+            const float r  = rsqrtf(ss / (float) e + eps);
+            for (int j = 0; j < nq; j++) {
+                const float d = warp_sum(l < nw ? red[s * NK + 1 + j][l] : 0.f);
+                if (l == 0) {
+                    sc[s][j] = d * r * inv;
+                }
+            }
+            if (l == 0) {
+                rs[s] = r;
+            }
         }
     }
     __syncthreads();
@@ -213,9 +249,36 @@ __global__ void ctrl_out_kernel(const A a) {
     ((float *) a.dst)[i] = c - f * c + g * m;
 }
 
+// One output of ink_conv: win[0..K-1) the K - 1 inputs before this token's, oldest first (its
+// own, xv, goes into win[K - 1] here), tw the taps, dr the token's dynamic taps when dyn. The
+// one expression of conv_kernel and conv_prompt_kernel, so they give the same bits.
+__device__ __forceinline__ float conv_out(
+    const float (&tw)[CONV_TAPS], float (&win)[CONV_TAPS], int K, float xv, const float * dr,
+    bool dyn, float scale) {
+    float o = 0.f;
+#pragma unroll
+    for (int j = 0; j < CONV_TAPS; j++) {
+        if (j == K - 1) {
+            win[j] = xv;
+        }
+        if (j < K) {
+            o += tw[j] * win[j];
+        }
+    }
+    if (dyn) {
+#pragma unroll
+        for (int lag = 0; lag < CONV_TAPS; lag++) {
+            if (lag < K) {
+                o += dr[lag] * win[K - 1 - lag];
+            }
+        }
+    }
+    return (xv + o) * scale;
+}
+
 // ---- ink_conv: params n_tok, off, has_dyn, scale; sources x [c, ng], w [K, c],
 // state [K - 1, width, n_seqs] (written back), dyn [K * heads, ng]. One thread per (sequence,
-// channel), the window in registers. ----
+// channel), the window in registers, token after token: a decode step's. ----
 __global__ void conv_kernel(const A a) {
     const int64_t n_tok = a.params[0], off = a.params[1];
     const bool    dyn   = a.params[2] != 0;
@@ -245,26 +308,8 @@ __global__ void conv_kernel(const A a) {
     for (int64_t i = 0; i < n_tok; i++) {
         const int64_t t  = s * n_tok + i;
         const float   xv = x[t * c + ch];
-        float         o  = 0.f;
-#pragma unroll
-        for (int j = 0; j < CONV_TAPS; j++) {
-            if (j == K - 1) {
-                win[j] = xv;
-            }
-            if (j < K) {
-                o += tw[j] * win[j];
-            }
-        }
-        if (dyn) {
-            const float * dr = (const float *) (src(a, 3) + t * a.src_nb[3][1]) + K * hh;
-#pragma unroll
-            for (int lag = 0; lag < CONV_TAPS; lag++) {
-                if (lag < K) {
-                    o += dr[lag] * win[K - 1 - lag];
-                }
-            }
-        }
-        out[t * c + ch] = (xv + o) * scale;
+        const float * dr = dyn ? (const float *) (src(a, 3) + t * a.src_nb[3][1]) + K * hh : nullptr;
+        out[t * c + ch]  = conv_out(tw, win, K, xv, dr, dyn, scale);
 #pragma unroll
         for (int j = 0; j + 1 < CONV_TAPS; j++) {
             if (j + 1 < K) {
@@ -276,6 +321,76 @@ __global__ void conv_kernel(const A a) {
     for (int j = 0; j < CONV_TAPS; j++) {
         if (j < K - 1) {
             hist[j] = win[j];
+        }
+    }
+}
+
+// ink_conv's input j of K - 1 before token i (position i - (K - 1) + j of sequence s): the
+// step's own x, or the kept history for positions before the step.
+__device__ __forceinline__ float conv_in(
+    const A & a, const float * hist, int K, int64_t s, int64_t n_tok, int64_t c, int64_t ch,
+    int64_t i, int j) {
+    const int64_t p = i - (K - 1) + j;
+    return p >= 0 ? ((const float *) src(a, 0))[(s * n_tok + p) * c + ch] : hist[i + j];
+}
+
+// ---- ink_conv over a prompt step (#1221): conv_kernel's outputs, a thread per (channel,
+// token, sequence) with its window read from x and the history, instead of a thread per
+// channel walking the tokens one by one (a few CTAs for the whole GPU, a memory latency a
+// token). The history is left as it was: conv_hist_kernel writes it next. ----
+__global__ void conv_prompt_kernel(const A a) {
+    const int64_t n_tok = a.params[0], off = a.params[1];
+    const bool    dyn   = a.params[2] != 0;
+    const float   scale = pf(a.params[3]);
+    const int64_t c = a.ne[0];
+    const int     K = (int) a.src_ne[1][0];
+    const int64_t ch = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t i  = blockIdx.y;
+    const int64_t s  = blockIdx.z;
+    if (ch >= c) {
+        return;
+    }
+    const float * hist =
+        (const float *) ((const char *) a.src[2] + s * a.src_nb[2][2] + (off + ch) * a.src_nb[2][1]);
+    const float * w = (const float *) (src(a, 1) + ch * a.src_nb[1][1]);
+    float         tw[CONV_TAPS], win[CONV_TAPS];
+#pragma unroll
+    for (int j = 0; j < CONV_TAPS; j++) {
+        tw[j]  = j < K ? w[j] : 0.f;
+        win[j] = j < K - 1 ? conv_in(a, hist, K, s, n_tok, c, ch, i, j) : 0.f;
+    }
+    int64_t hh = 0;
+    if (dyn) {
+        const int64_t heads = a.src_ne[3][0] / K;
+        hh                  = ch / (c / heads);
+    }
+    const int64_t t  = s * n_tok + i;
+    const float   xv = ((const float *) src(a, 0))[t * c + ch];
+    const float * dr = dyn ? (const float *) (src(a, 3) + t * a.src_nb[3][1]) + K * hh : nullptr;
+    ((float *) a.dst)[t * c + ch] = conv_out(tw, win, K, xv, dr, dyn, scale);
+}
+
+// ---- ink_conv's history after a prompt step: the last K - 1 inputs, as conv_kernel leaves
+// it. A thread per (channel, sequence), after conv_prompt_kernel read the old one. ----
+__global__ void conv_hist_kernel(const A a) {
+    const int64_t n_tok = a.params[0], off = a.params[1];
+    const int64_t c = a.ne[0];
+    const int     K = (int) a.src_ne[1][0];
+    const int64_t ch = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t s  = blockIdx.y;
+    if (ch >= c) {
+        return;
+    }
+    float * hist = (float *) ((char *) a.src[2] + s * a.src_nb[2][2] + (off + ch) * a.src_nb[2][1]);
+    float   v[CONV_TAPS];
+#pragma unroll
+    for (int j = 0; j < CONV_TAPS; j++) {
+        v[j] = j < K - 1 ? conv_in(a, hist, K, s, n_tok, c, ch, n_tok, j) : 0.f;
+    }
+#pragma unroll
+    for (int j = 0; j < CONV_TAPS; j++) {
+        if (j < K - 1) {
+            hist[j] = v[j];
         }
     }
 }
@@ -332,9 +447,12 @@ __device__ __forceinline__ int64_t cell(const A & a, int ts, int64_t s, int64_t 
 // sinks [nh, ng], after. A block per (kv head, ATTN_TQ tokens of one sequence): its rows are
 // those tokens' heads of the kv head; each warp takes key chunks of 32 (a key per lane for the
 // scores, DPL dims per lane for the values), with an online softmax per warp, then the warps'
-// partial sums are combined with the sink. ----
-template <int DPL>
+// partial sums are combined with the sink. R bounds the rows the registers hold: ATTN_ROWS, or
+// ATTN_DECODE_ROWS for a block of one token (a decode step's), whose rows past its kv head's
+// heads are padding (#1221). Each row's sums are the same either way. ----
+template <int DPL, int R>
 __global__ void attn_kernel(const A a) {
+    static_assert(R <= ATTN_ROWS, "attn_kernel: rows");
     constexpr int D     = 32 * DPL;
     const int64_t n_tok = a.params[0];
     const float   scale = pf(a.params[1]);
@@ -401,9 +519,9 @@ __global__ void attn_kernel(const A a) {
         kend   = max(kend, tpos[tq]);
     }
 
-    float m[ATTN_ROWS], l[ATTN_ROWS], acc[ATTN_ROWS][DPL];
+    float m[R], l[R], acc[R][DPL];
 #pragma unroll
-    for (int r = 0; r < ATTN_ROWS; r++) {
+    for (int r = 0; r < R; r++) {
         m[r] = NEG;
         l[r] = 0.f;
 #pragma unroll
@@ -417,9 +535,9 @@ __global__ void attn_kernel(const A a) {
         const int64_t key   = base + lane;
         const bool    inkey = key <= kend;
         int64_t       c     = 0;
-        float         s[ATTN_ROWS];
+        float         s[R];
 #pragma unroll
-        for (int r = 0; r < ATTN_ROWS; r++) {
+        for (int r = 0; r < R; r++) {
             s[r] = 0.f;
         }
         if (inkey) {
@@ -436,7 +554,7 @@ __global__ void attn_kernel(const A a) {
                     kf[2 * j + 1]  = f.y;
                 }
 #pragma unroll
-                for (int r = 0; r < ATTN_ROWS; r++) {
+                for (int r = 0; r < R; r++) {
                     if (r < rows) {
                         float d = 0.f;
 #pragma unroll
@@ -449,9 +567,9 @@ __global__ void attn_kernel(const A a) {
             }
         }
         // Scores, bias and mask; the chunk's max per row.
-        bool valid[ATTN_ROWS];
+        bool valid[R];
 #pragma unroll
-        for (int r = 0; r < ATTN_ROWS; r++) {
+        for (int r = 0; r < R; r++) {
             valid[r] = false;
             if (r < rows && inkey) {
                 const int tq = r / pk;
@@ -491,7 +609,7 @@ __global__ void attn_kernel(const A a) {
                 vf[j] = __half2float(vr[j]);
             }
 #pragma unroll
-            for (int r = 0; r < ATTN_ROWS; r++) {
+            for (int r = 0; r < R; r++) {
                 const float p = __shfl_sync(0xffffffffu, s[r], kk);
 #pragma unroll
                 for (int j = 0; j < DPL; j++) {
@@ -501,7 +619,7 @@ __global__ void attn_kernel(const A a) {
         }
     }
 #pragma unroll
-    for (int r = 0; r < ATTN_ROWS; r++) {
+    for (int r = 0; r < R; r++) {
         const float ls = warp_sum(l[r]);
         if (lane == 0) {
             pm[warp][r] = m[r];
@@ -670,17 +788,22 @@ __global__ void softcap_kernel(const A a) {
 
 }  // namespace
 
-extern "C" const void * const legion_ink_kernels[12] = {
+extern "C" const void * const legion_ink_kernels[17] = {
     reinterpret_cast<const void *>(&mix_kernel),
     reinterpret_cast<const void *>(&ctrl_in_kernel),
     reinterpret_cast<const void *>(&ctrl_out_kernel),
     reinterpret_cast<const void *>(&conv_kernel),
     reinterpret_cast<const void *>(&clip_kernel),
-    reinterpret_cast<const void *>(&attn_kernel<1>),
-    reinterpret_cast<const void *>(&attn_kernel<2>),
-    reinterpret_cast<const void *>(&attn_kernel<4>),
+    reinterpret_cast<const void *>(&attn_kernel<1, ATTN_ROWS>),
+    reinterpret_cast<const void *>(&attn_kernel<2, ATTN_ROWS>),
+    reinterpret_cast<const void *>(&attn_kernel<4, ATTN_ROWS>),
     reinterpret_cast<const void *>(&sigmul_kernel),
     reinterpret_cast<const void *>(&situ_kernel),
     reinterpret_cast<const void *>(&mm_id_kernel),
     reinterpret_cast<const void *>(&softcap_kernel),
+    reinterpret_cast<const void *>(&conv_prompt_kernel),
+    reinterpret_cast<const void *>(&conv_hist_kernel),
+    reinterpret_cast<const void *>(&attn_kernel<1, ATTN_DECODE_ROWS>),
+    reinterpret_cast<const void *>(&attn_kernel<2, ATTN_DECODE_ROWS>),
+    reinterpret_cast<const void *>(&attn_kernel<4, ATTN_DECODE_ROWS>),
 };

@@ -844,6 +844,87 @@ fn gpu_backend() -> Backend {
         .unwrap()
 }
 
+/// #1221: a prompt step's conv on the GPU (a thread per token, then the history) gives the
+/// bits of the decode steps' token walk, outputs and history, with and without dynamic taps,
+/// for steps longer and shorter than the history.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_conv_prompt_steps_are_the_token_walk() {
+    use crate::ggml::ComputeAllocator;
+    let mut gpu = gpu_backend();
+    let vals = |n: usize, seed: u64| -> Vec<f32> {
+        let mut s = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+            })
+            .collect()
+    };
+    let (k, c, heads, width, off, scale) = (4i64, 96i64, 4i64, 160i64, 32i64, 0.75f32);
+    for (n_tok, n_seqs, dynamic) in [(37i64, 2i64, true), (37, 2, false), (2, 3, true)] {
+        let ng = n_tok * n_seqs;
+        let ctx = Context::new(64 + 16 * n_tok as usize, 64 + 16 * n_tok as usize);
+        let x = ctx.new_tensor(types::F32, &[c, ng]).as_input();
+        let w = ctx.new_tensor(types::F32, &[k, c]).as_input();
+        let d = ctx.new_tensor(types::F32, &[k * heads, ng]).as_input();
+        let st = [0, 1].map(|_| {
+            ctx.new_tensor(types::F32, &[k - 1, width, n_seqs])
+                .as_input()
+                .as_output()
+        });
+        // Token `i` of every sequence: columns `s · n_tok + i`.
+        fn col<'a>(ctx: &'a Context, t: Tensor<'a>, i: i64, n_tok: i64, n_seqs: i64) -> Tensor<'a> {
+            let rows = t.ne()[0];
+            let nb = (n_tok * rows) as usize * 4;
+            ctx.view_2d(t, [rows, n_seqs], nb, (i * rows) as usize * 4)
+        }
+        let once = ops::conv(&ctx, x, w, st[0], dynamic.then_some(d), n_tok, off, scale);
+        let once = once.as_output();
+        let mut graph = ctx.new_graph(64 + 8 * n_tok as usize);
+        graph.expand(once);
+        let mut walk = Vec::new();
+        for i in 0..n_tok {
+            let xi = col(&ctx, x, i, n_tok, n_seqs);
+            let di = dynamic.then(|| col(&ctx, d, i, n_tok, n_seqs));
+            let o = ops::conv(&ctx, xi, w, st[1], di, 1, off, scale).as_output();
+            graph.expand(o);
+            walk.push(o);
+        }
+        ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+            .unwrap();
+        x.set_f32(&vals((c * ng) as usize, 1));
+        w.set_f32(&vals((k * c) as usize, 2));
+        d.set_f32(&vals((k * heads * ng) as usize, 3));
+        let hist = vals(((k - 1) * width * n_seqs) as usize, 4);
+        for s in st {
+            s.set_f32(&hist);
+        }
+        gpu.compute(&graph).unwrap();
+        let once = once.to_f32();
+        let walk: Vec<Vec<f32>> = walk.into_iter().map(|o| o.to_f32()).collect();
+        let case = format!("{n_tok} tokens, {n_seqs} sequences, dynamic {dynamic}");
+        for s in 0..n_seqs as usize {
+            for i in 0..n_tok as usize {
+                let t = s * n_tok as usize + i;
+                let (a, b) = (
+                    &once[t * c as usize..][..c as usize],
+                    &walk[i][s * c as usize..][..c as usize],
+                );
+                assert!(
+                    a.iter().zip(b).all(|(p, q)| p.to_bits() == q.to_bits()),
+                    "{case}: token {i} of sequence {s}"
+                );
+            }
+        }
+        assert_eq!(st[0].bytes(), st[1].bytes(), "{case}: the history");
+        assert_ne!(st[0].to_f32(), hist, "{case}: the history moved");
+    }
+}
+
 /// `t`'s per-expert entries of each token in the order of the experts' ids `ids` (`[k, n]`):
 /// `t` `[k, n]` (the ids, the weights) or `[w, k, n]` (the experts' rows).
 #[cfg(feature = "cuda")]
