@@ -600,14 +600,14 @@ fn layered_heat(n_layers: usize, n_expert: usize) -> Vec<Vec<f32>> {
 }
 
 #[test]
-fn a_saved_heat_with_an_mtp_heads_layer_seeds_a_model_without_it() {
+fn a_saved_heat_with_more_layers_seeds_the_layers_a_load_has() {
     use crate::residency::profile::Profile;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("m.gguf.1.heat");
-    // A `--spec mtp` run's file: 48 layers and the head's, 8 experts each.
+    // A file of 49 layers, 8 experts each.
     let src = Profile::from_heat(&layered_heat(49, 8));
     src.write(&path).unwrap();
-    // Loaded by a run without the head (48 layers): taken, its 48 layers' heat as saved.
+    // Loaded for 48 layers: taken, its 48 layers' heat as saved.
     let got = super::read_tier_heat(&path, 48, 8).expect("a longer file seeds the layers");
     let seed = 0.5;
     assert_eq!(got.heat(seed)[..48], src.heat(seed)[..48]);
@@ -622,8 +622,8 @@ fn a_saved_heat_with_an_mtp_heads_layer_seeds_a_model_without_it() {
             .collect();
         assert_eq!(o, &want, "layer {l}");
     }
-    // The other way: a 48-layer file loaded by an MTP run (49 layers) seeds its 48 layers,
-    // the head's starts cold.
+    // The other way: a 48-layer file loaded for 49 layers seeds its 48 layers, the last one
+    // starts cold.
     let short = Profile::from_heat(&layered_heat(48, 8));
     short.write(&path).unwrap();
     let got = super::read_tier_heat(&path, 49, 8).expect("a shorter file seeds its layers");
@@ -650,17 +650,17 @@ fn a_saved_heat_of_another_expert_count_is_still_refused() {
 }
 
 #[test]
-fn a_heat_save_without_the_mtp_head_keeps_the_heads_layer() {
+fn a_heat_save_with_fewer_layers_keeps_the_files_last_layer() {
     use crate::residency::profile::Profile;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("m.gguf.1.heat");
-    // An MTP run's file has the head's layer (48) too.
+    // A file of 49 layers, with heat in layer 48.
     let mut with_head = vec![vec![0.0; 4]; 49];
     with_head[0][1] = 2.0;
     with_head[48][3] = 1.0;
     let old = Profile::from_heat(&with_head);
     old.write(&path).unwrap();
-    // A run without the head saves 48 layers: the file keeps 49, the head's pair behind.
+    // A save of 48 layers: the file keeps 49, layer 48's pair behind.
     let mut heat = vec![vec![0.0; 4]; 48];
     heat[5][2] = 4.0;
     let learned = Profile::from_heat(&heat);

@@ -5030,9 +5030,8 @@ pub(crate) fn save_heat(path: &std::path::Path, mut learned: Profile) -> std::io
 }
 
 /// `learned` with the pairs only `old` (the file it replaces) ranks, after its own. An `old`
-/// with more layers keeps them (a `--spec mtp` run's file: the head's layer is the last one),
-/// so a run without the head does not lose that layer's heat; an `old` of another expert
-/// count (another model's) is dropped.
+/// with more layers keeps them (a load that counted fewer layers does not lose the others'
+/// heat); an `old` of another expert count (another model's) is dropped.
 pub(crate) fn merge_older(mut learned: Profile, old: Profile) -> Profile {
     if old.n_expert != learned.n_expert {
         return learned;
@@ -5049,8 +5048,8 @@ pub(crate) fn merge_older(mut learned: Profile, old: Profile) -> Profile {
 /// The bounded host tier's saved heat at `path` (#37) for a model of `n_layers` layers (MTP
 /// layers included) with `n_expert` experts each: `None` when the file is missing, unreadable
 /// or another model's (another expert count), and the cache starts as without one. A file
-/// with more layers (saved by a `--spec mtp` run, the head's layer last) seeds the model's
-/// layers and its others are passed over; one with fewer seeds the layers it has.
+/// with more layers seeds this load's layers and its others are passed over; one with fewer
+/// seeds the layers it has.
 pub(crate) fn read_tier_heat(
     path: &std::path::Path,
     n_layers: usize,
@@ -5066,7 +5065,7 @@ pub(crate) fn read_tier_heat(
                     layers = n_layers,
                     dropped = prof.n_layers - n_layers,
                     "host expert tier: the saved routing heat has layers past the model's \
-                     last (an MTP head's), those are not used"
+                     last, those are not used"
                 );
             }
             Some(prof)
