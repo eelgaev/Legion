@@ -91,8 +91,12 @@ pub(super) fn clip(weights: &Weights, il: usize, m: &str) -> Result<Option<Clip>
     }))
 }
 
+/// The bounds of a side no scalar clamps (mtmd's defaults).
+pub(super) const UNCLAMPED: (f32, f32) = (-f32::MAX, f32::MAX);
+
 /// Checks a loaded tower: `v.std_bias` and `v.std_scale` both or neither, every clip readable,
-/// and the matrices of one input (`q`, `k`, `v`; `gate`, `up`) clamping it the same.
+/// and the matrices of one input (`q`, `k`, `v`; `gate`, `up`) clamping it the same (a matrix
+/// without clips, or with output bounds only, leaves it [`UNCLAMPED`]).
 pub(super) fn check(weights: &Weights, n_layer: usize) -> Result<(), VisionError> {
     if weights.get("v.std_bias").is_some() != weights.get("v.std_scale").is_some() {
         return Err(VisionError::Metadata(
@@ -103,7 +107,7 @@ pub(super) fn check(weights: &Weights, n_layer: usize) -> Result<(), VisionError
         for group in [&["attn_q", "attn_k", "attn_v"][..], &["ffn_gate", "ffn_up"]] {
             let inp: Vec<_> = group
                 .iter()
-                .map(|m| Ok(clip(weights, il, m)?.map(|c| c.inp)))
+                .map(|m| Ok(clip(weights, il, m)?.map_or(UNCLAMPED, |c| c.inp)))
                 .collect::<Result<_, VisionError>>()?;
             if inp.windows(2).any(|p| p[0] != p[1]) {
                 return Err(VisionError::Unsupported(format!(

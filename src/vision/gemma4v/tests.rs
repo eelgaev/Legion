@@ -582,6 +582,52 @@ fn refuses_towers_it_cannot_clamp_like_mtmd() {
     .unwrap();
 }
 
+/// A matrix with output bounds only leaves its input unclamped, as one with no clips does: `q`
+/// clamping its output only (`k` and `v` without clips) and `gate` likewise (`up` without) load,
+/// and encode as the reference loops do; input bounds that really differ are still refused.
+#[test]
+fn output_only_clips_share_the_unclamped_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("out-only.gguf");
+    let clip_of = |_: u32, m: &str| match m {
+        "attn_q" => [None, None, None, Some(0.25)],
+        "ffn_gate" => [None, None, Some(-0.125), None],
+        _ => [None; 4],
+    };
+    tiny::write_gemma4v_with(&path, 24, 3, false, &clip_of, &[]).unwrap();
+    let mut cpu = Backend::cpu().unwrap();
+    cpu.set_threads(1);
+    let mut enc = Encoder::load(&path, cpu).unwrap();
+    assert_eq!(
+        clip(&enc.weights, 0, "attn_q").unwrap(),
+        Some(Clip {
+            inp: UNCLAMPED,
+            out: (-f32::MAX, 0.25),
+        })
+    );
+    assert_eq!(clip(&enc.weights, 0, "attn_k").unwrap(), None);
+    let p = crate::vision::preprocess(enc.hparams(), &gradient(150, 90)).unwrap();
+    let got = enc.encode(&p).unwrap();
+    let want = reference(&enc, &p);
+    let scale = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
+    for (i, (a, b)) in got.data.iter().zip(&want).enumerate() {
+        assert!((a - b).abs() <= 2e-3 * scale, "{i}: {a} vs {b}");
+    }
+    // `k` clamping its input where `q` does not is still refused.
+    let path = dir.path().join("k-in.gguf");
+    let k_in = |il: u32, m: &str| match m {
+        "attn_k" => [Some(-1.0), None, None, None],
+        _ => clip_of(il, m),
+    };
+    tiny::write_gemma4v_with(&path, 24, 3, false, &k_in, &[]).unwrap();
+    let mut cpu = Backend::cpu().unwrap();
+    cpu.set_threads(1);
+    assert!(matches!(
+        Encoder::load(&path, cpu),
+        Err(VisionError::Unsupported(_))
+    ));
+}
+
 /// Nemotron 3.5 Bolt's tower's preprocessing (its processor's mean 0 and std 1, 16-pixel
 /// patches merged 3 × 3, mtmd's 70 to 1,120 tokens) on a fixed image: a 640 × 480 image is
 /// 624 × 480 pixels, 39 × 30 patches, 13 × 10 = 130 tokens; each pixel is `byte / 255`,

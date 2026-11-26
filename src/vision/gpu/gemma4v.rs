@@ -24,7 +24,7 @@ use super::{
     cudaMemsetAsync, cudaSetDevice, cudaStreamCreateWithFlags, cudaStreamDestroy,
     cudaStreamSynchronize, gemm_on, launch, ok, sm_count, values, vector,
 };
-use crate::vision::gemma4v::{Clip, ROPE_THETA, clip, standardizes};
+use crate::vision::gemma4v::{Clip, ROPE_THETA, UNCLAMPED, clip, standardizes};
 use crate::vision::qwen3vl::{Encoder, EncoderConfig, ImageEmbedding};
 use crate::vision::share::{Caps, Turns};
 use crate::vision::{Preprocessed, VisionError, VisionHparams};
@@ -95,8 +95,8 @@ struct Clips {
 impl Clips {
     fn of(enc: &Encoder, il: usize) -> Result<Option<Self>, VisionError> {
         let none = Clip {
-            inp: (-f32::MAX, f32::MAX),
-            out: (-f32::MAX, f32::MAX),
+            inp: UNCLAMPED,
+            out: UNCLAMPED,
         };
         let mut any = false;
         let mut c = |m: &str| -> Result<Clip, VisionError> {
