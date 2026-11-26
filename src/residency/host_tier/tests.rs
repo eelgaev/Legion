@@ -637,3 +637,60 @@ fn sources_are_named_like_the_models_tensors() {
         ]
     );
 }
+
+#[test]
+fn an_mtp_heads_layer_is_no_layer_of_the_tier() {
+    use crate::model::qwen4::tiny;
+    let dir = tempfile::tempdir().unwrap();
+    let (model, head) = (dir.path().join("tiny.gguf"), dir.path().join("mtp.gguf"));
+    tiny::write(&model, Some(&head), 11).unwrap();
+    let (model, head) = (
+        GgufFile::open(&model).unwrap(),
+        GgufFile::open(&head).unwrap(),
+    );
+    let n_layer = tiny::N_LAYER;
+    // The tier holds the model's layers: their experts are its sources, left out of the load.
+    let srcs = sources(&model, n_layer, 8).expect("plain experts");
+    assert_eq!(srcs.len(), n_layer);
+    // The head's layer (`n_layer`, a GGUF of its own) is none of them: no source, and its
+    // experts load whole, as without the tier.
+    assert!(sources(&model, n_layer + 1, 8).is_none());
+    let head_layer = format!("blk.{n_layer}.");
+    assert!(
+        !skipped_tensors(n_layer)
+            .iter()
+            .any(|n| n.starts_with(&head_layer))
+    );
+    // Their bytes, which the memory plan leaves beside the tier's: the head's three expert
+    // tensors (of the model's layers' shapes here), none in the model's file.
+    let bytes = head_expert_bytes(&head, n_layer);
+    let layer: u64 = srcs[0].iter().map(|t| t.size).sum();
+    assert!(bytes > 0);
+    assert_eq!(bytes, layer);
+    assert_eq!(head_expert_bytes(&model, n_layer), 0);
+}
+
+#[test]
+fn the_memory_plan_leaves_an_mtp_heads_experts_beside_the_tier() {
+    let m = mem(32, 27);
+    assert_eq!(beside(m, 0), m);
+    assert_eq!(beside(mem(1, 1), 2 * GIB), mem(1, 0));
+    // Qwen3.8-Flash-Next's Q4_K_M head: Q4_K up and gate, Q8_0 down, 512 experts.
+    let head = (921_600 + 921_600 + 1_740_800) * 512;
+    let left = beside(m, head);
+    assert_eq!(left.total, m.total);
+    assert_eq!(left.available, m.available - head);
+    let (Sizing::Bounded(p), Sizing::Bounded(q)) = (
+        size(m, &LAYERS, 512, table(false), 0),
+        size(left, &LAYERS, 512, table(false), 0),
+    ) else {
+        panic!("bounded");
+    };
+    // The same margin (the machine's) and staging, the head's bytes fewer RAM slots.
+    assert_eq!((q.margin, q.places, q.sets), (p.margin, p.places, p.sets));
+    assert_eq!(q.stage_bytes, p.stage_bytes);
+    let per_slot = EXPERT * LAYERS.len() as u64;
+    let fewer = (p.slots - q.slots) as u64;
+    assert!(fewer == head / per_slot || fewer == head / per_slot + 1);
+    assert!(q.slot_bytes + q.stage_bytes + q.margin + q.table + head <= m.available);
+}

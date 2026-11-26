@@ -1958,13 +1958,16 @@ impl ExpertResidency {
                 free_at[d] = super::cuda::free_vram(c).ok().map(|f| f as u64);
             }
             let n_slots = first[il].len();
+            // A layer the bounded host tier does not hold (an MTP head's, from its own GGUF)
+            // keeps every expert in its host tensor, as without the tier.
+            let in_tier = host.is_some() && super::host_tier::HostTier::of(ts[0]).is_some();
             let mut tensors = Vec::with_capacity(3);
             let mut no_vram = None;
             for (k, t) in ts.iter().enumerate() {
                 // The tier's own index of the layer (its RAM slot tensor says which).
-                let tail = host.as_deref().map(|h| {
-                    let at = super::host_tier::HostTier::of(*t).map_or(il, |(_, i)| i);
-                    (h.stage_tensor(k), h.n_host(at))
+                let tail = host.as_deref().filter(|_| in_tier).and_then(|h| {
+                    let (_, at) = super::host_tier::HostTier::of(*t)?;
+                    Some((h.stage_tensor(k), h.n_host(at)))
                 });
                 match tiered_tensor(p, *t, n_slots, keep_of[il], KINDS[k], n_expert, tail) {
                     Ok(c) => tensors.push(c),
@@ -2073,7 +2076,7 @@ impl ExpertResidency {
                 backed: true,
                 dirty: true,
                 keep,
-                tier: host.is_some(),
+                tier: in_tier,
                 tail_lent: false,
                 cut: 0,
                 stage_ids: Vec::new(),
@@ -2303,7 +2306,9 @@ impl ExpertResidency {
             let t0 = std::time::Instant::now();
             let mut read = 0;
             for il in 0..n_layers {
-                let Some(l) = &me.layers[il] else { continue };
+                let Some(l) = me.layers[il].as_ref().filter(|l| l.tier) else {
+                    continue;
+                };
                 let rest: Vec<u32> = order[il]
                     .iter()
                     .copied()
@@ -2315,7 +2320,8 @@ impl ExpertResidency {
                 me.layers
                     .iter()
                     .enumerate()
-                    .filter_map(|(il, l)| l.as_ref().map(|l| (il, l.slots.heat()))),
+                    .filter_map(|(il, l)| l.as_ref().filter(|l| l.tier).map(|l| (il, l)))
+                    .map(|(il, l)| (il, l.slots.heat())),
             );
             tracing::info!(
                 ram_experts = read,
@@ -2605,7 +2611,7 @@ impl ExpertResidency {
             stage_min: self.stage_from(),
             route_gate: self.route_gate,
             short_lend: self.short_lend && self.lent.is_some(),
-            host: self.host.as_deref().map(|h| (h, il)),
+            host: self.host.as_deref().filter(|_| l.tier).map(|h| (h, il)),
         })
     }
 
@@ -2707,14 +2713,12 @@ impl ExpertResidency {
     /// Copies the host bytes of experts into slots of layer `il` (`(slot, expert)`): from
     /// `n_slots + expert`, or with the bounded host tier from where it has them (a RAM slot,
     /// or the expert's staging place after a read), waiting for the copies there, as those
-    /// bytes only stay until the next step.
+    /// bytes only stay until the next step. A layer the tier does not hold (an MTP head's)
+    /// copies from `n_slots + expert`.
     fn copy_from_host(&mut self, il: usize, fills: &[(u32, u32)]) -> Result<(), String> {
-        let n_slots = self.layers[il]
-            .as_ref()
-            .expect("tiered layer")
-            .slots
-            .n_slots();
-        let Some(h) = self.host.clone() else {
+        let l = self.layers[il].as_ref().expect("tiered layer");
+        let (n_slots, in_tier) = (l.slots.n_slots(), l.tier);
+        let Some(h) = self.host.clone().filter(|_| in_tier) else {
             for &(s, e) in fills {
                 self.copy_expert(il, s, n_slots + e as usize)?;
             }
@@ -3470,7 +3474,9 @@ impl ExpertResidency {
         let defer = defer && self.swap_overlap != 0 && self.devices[d].place.cuda.is_some();
         let mut filled: Vec<(usize, u32)> = Vec::with_capacity(swaps.len());
         for s in swaps {
-            match &tier {
+            // A layer the tier does not hold (an MTP head's) swaps as without the tier.
+            let in_tier = self.layers[s.layer].as_ref().is_some_and(|l| l.tier);
+            match tier.as_ref().filter(|_| in_tier) {
                 // #37 round 45: the read runs while the next step computes; the copies start
                 // at the next after-step ([`Self::issue_deferred`]).
                 Some(h) if defer && h.read_for_swap(s.layer, s.new, s.old)? => {
@@ -3986,7 +3992,9 @@ impl ExpertResidency {
             }
             // The bounded host tier: the experts the slots gave up are in the checkpoint only.
             if let Some(h) = &self.host {
-                for (il, gone) in held.iter().enumerate() {
+                let layers = &self.layers;
+                let in_tier = |il: usize| layers[il].as_ref().is_some_and(|l| l.tier);
+                for (il, gone) in held.iter().enumerate().filter(|(il, _)| in_tier(*il)) {
                     h.dropped(il, gone);
                 }
             }
@@ -5129,7 +5137,15 @@ fn share_setup(
             n_expert: ts[1].ne()[2] as usize,
         };
         // The bounded host tier: the host tensors are the layer's RAM slots, the ids the share
-        // takes ([`TieredLayer::share_experts`]).
+        // takes ([`TieredLayer::share_experts`]). A layer the tier does not hold (an MTP
+        // head's) is left to the GPU: the share of a device is the tier's or not.
+        if me.host.is_some() && me.layers[il].as_ref().is_some_and(|l| !l.tier) {
+            tracing::debug!(
+                layer = il,
+                "cpu expert share: not a layer of the host tier, left to the GPU"
+            );
+            continue;
+        }
         if let Some(h) = &me.host
             && ts.iter().any(|t| t.ne()[2] as usize != h.slots())
         {
