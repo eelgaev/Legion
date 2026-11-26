@@ -199,6 +199,13 @@ impl GlmGpu {
         // The patch kernels [p, p, 3, e]: e rows of 3 p p, summed, padded to ld.
         let w0 = values(enc.weight("v.patch_embd.weight")?)?;
         let w1 = values(enc.weight("v.patch_embd.weight.1")?)?;
+        if w0.len() != e * pp3 || w1.len() != e * pp3 {
+            return Err(VisionError::Unsupported(format!(
+                "`v.patch_embd.weight`: {} and {} values, not {e} x {pp3}",
+                w0.len(),
+                w1.len()
+            )));
+        }
         let mut patch = vec![0f32; e * ld];
         for o in 0..e {
             for k in 0..pp3 {
@@ -208,6 +215,12 @@ impl GlmGpu {
         // The convolution [kw, kh, e, o] as rows [o][(kh * 2 + kw) * e + c]: a block's patch
         // (dy, dx) is its (kh, kw), its rows side by side in merge order.
         let conv = values(enc.weight("mm.patch_merger.weight")?)?;
+        if conv.is_empty() || !conv.len().is_multiple_of(4 * e) {
+            return Err(VisionError::Unsupported(format!(
+                "`mm.patch_merger.weight`: {} values, not rows of 4 x {e}",
+                conv.len()
+            )));
+        }
         let n_mw = conv.len() / (4 * e);
         let mut merger = vec![0f32; conv.len()];
         for o in 0..n_mw {
@@ -233,7 +246,7 @@ impl GlmGpu {
                 "cudaStreamCreateWithFlags",
             )?
         };
-        Ok(Some(Self {
+        let g = Self {
             patch: Lin {
                 w: DevBuf::f16s(&patch)?,
                 b: Some(vector(enc.weight("v.patch_embd.bias")?)?),
@@ -262,7 +275,41 @@ impl GlmGpu {
             pin_out,
             turns: Turns::new(sms),
             caps: Caps::default(),
-        }))
+        };
+        g.check_shapes()?;
+        Ok(Some(g))
+    }
+
+    /// Every matrix's width is the width of what feeds it (an mmproj's shapes are not checked
+    /// on load), before any encode indexes by them.
+    fn check_shapes(&self) -> Result<(), VisionError> {
+        let (e, ff) = (self.cfg.n_embd, self.n_ff);
+        let mut want: Vec<(String, &Lin, usize, usize)> = Vec::new();
+        for (il, b) in self.blocks.iter().enumerate() {
+            let t = |s: &str| format!("v.blk.{il}.{s}");
+            want.push((t("attn_qkv"), &b.qkv, 3 * e, e));
+            want.push((t("attn_out"), &b.out, e, e));
+            want.push((t("ffn_gate / ffn_up"), &b.gate_up, 2 * ff, e));
+            want.push((t("ffn_down"), &b.down, e, ff));
+        }
+        let (mw, mff) = (self.merger.n, self.mm_down.k);
+        want.push(("mm.model.fc".into(), &self.fc, self.fc.n, mw));
+        want.push((
+            "mm.gate / mm.up".into(),
+            &self.mm_gate_up,
+            2 * mff,
+            self.fc.n,
+        ));
+        want.push(("mm.down".into(), &self.mm_down, self.cfg.n_out, mff));
+        for (name, lin, n, k) in want {
+            if lin.n != n || lin.k != k {
+                return Err(VisionError::Unsupported(format!(
+                    "`{name}`: {} x {}, not {n} x {k}",
+                    lin.n, lin.k
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Kernel `k` over `items` work items, on the encoder's stream under the encode's caps.

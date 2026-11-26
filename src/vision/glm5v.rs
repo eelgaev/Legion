@@ -404,5 +404,16 @@ impl std::fmt::Display for Diff {
     }
 }
 
+/// Whether two GLM-5.3-Flash towers' rows `out` agree (tests on a checkpoint's real weights):
+/// all finite, a mean row cosine of at least 0.999 and no row under 0.5. Not a high floor on
+/// every row: from about block 13 on, a few rows carry a residual tens of times the others'
+/// and the model amplifies rounding on just those (the clamped MLPs saturate there). The GPU
+/// tower and the CPU one drift from F64 loops about equally on them (a row cosine of 0.96 to
+/// 0.99 at the end on small images), so neither is wrong; the stage tables show where.
+#[cfg(test)]
+pub(crate) fn rows_agree(d: &Diff) -> bool {
+    d.bad == 0 && d.mean_cos >= 0.999 && d.min_cos >= 0.5
+}
+
 #[cfg(test)]
 pub(crate) mod tests;

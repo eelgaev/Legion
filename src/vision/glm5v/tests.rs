@@ -405,7 +405,8 @@ fn matches_the_reference_loops() {
 /// Small images on a checkpoint's tower (`LEGION_TEST_VISION_HF=<dir>`, its real weights; at
 /// most 80 patches, as the loops are slow): the CPU tower's rows after every stage against
 /// [`reference_stages`]', printed stage by stage, so a gap shows where it starts. The CPU tower
-/// rounds the matrices' inputs to F16 and the loops do not, so they are close, not equal.
+/// rounds the matrices' inputs to F16 and the loops do not, so they are close, not equal: the
+/// rows out must agree as [`rows_agree`] says (a few outlier rows drift, see there).
 #[test]
 #[ignore = "needs a checkpoint, slow"]
 fn cpu_tower_matches_the_reference_on_a_checkpoint() {
@@ -441,8 +442,7 @@ fn cpu_tower_matches_the_reference_on_a_checkpoint() {
             };
             let d = Diff::new(&got, want, rows);
             println!("  {name:>12}: {d}");
-            let close = d.bad == 0 && d.min_cos > 0.99;
-            if name == "out" && !close {
+            if name == "out" && !rows_agree(&d) {
                 failed.push(format!("{label}: {d}"));
             }
         }

@@ -154,6 +154,9 @@ pub(super) fn glm5_canvas(
         cw = align(((w as f64 * scale).ceil() as i64).max(1));
     }
     if ch * cw > max {
+        // As mtmd's glm5v path does: the search tops out at the image's own height and does
+        // not recheck `min`, so a very thin image that grew past `max` can end under it. Kept
+        // that way to give the reference's canvas for every image.
         let (mut lo, mut hi) = (1, h);
         let mut best = (f, f);
         while lo <= hi {

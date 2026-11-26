@@ -33,7 +33,9 @@ prompt tokens, same command). The expert cache is 35.2 GiB. Without the last thr
 Images: add `--mmproj mmproj-F16.gguf` (the file in the same Hugging Face repo) and requests may carry images;
 `/v1/models` lists `vision`. The tower runs on the first GPU: about 1.1 GB of F16 weights and up to 1.5 GB of scratch
 for the largest image (8,000 tokens), both kept out of that GPU's expert cache. Text-only requests give the same output
-as without it. Not measured yet.
+as without it. The same tower, loaded from nvidia's NVFP4 checkpoint on a DGX Spark (GB10), read six test images right
+at temperature 0 (a drawn scene, three shapes, a four-bar chart with every value exact, a gradient, a word, colour
+quadrants); this mmproj file and its speed are not measured yet.
 
 ## What each flag does
 
