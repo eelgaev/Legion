@@ -30,6 +30,13 @@ prompt tokens, same command). The expert cache is 35.2 GiB. Without the last thr
 11.0, prefill 1,200 / 1,169 / 1,132, a 24.0 GiB cache (the 123K prompt maps the rest of the KV pool when it starts,
 0.55 s).
 
+Images: add `--mmproj mmproj-F16.gguf` (the file in the same Hugging Face repo) and requests may carry images;
+`/v1/models` lists `vision`. The tower runs on the first GPU: about 1.1 GB of F16 weights and up to 1.5 GB of scratch
+for the largest image (8,000 tokens), both kept out of that GPU's expert cache. Text-only requests give the same output
+as without it. The same tower, loaded from nvidia's NVFP4 checkpoint on a DGX Spark (GB10), read six test images right
+at temperature 0 (a drawn scene, three shapes, a four-bar chart with every value exact, a gradient, a word, colour
+quadrants); this mmproj file and its speed are not measured yet.
+
 ## What each flag does
 
 - `--gpus` (`4`): Splits the model over this many GPUs. Used because the model does not fit in one 16 GB V100.
@@ -44,4 +51,5 @@ prompt tokens, same command). The expert cache is 35.2 GiB. Without the last thr
 - `--glm-pair-balance`: Within each NVLink GPU pair, an expert that is not cached goes to whichever GPU has less work in that step, so the exchanges wait less for the slowest GPU.
 - `--glm-decode-mv`: Plain decode steps of up to 64 sequences run through the expert matvec, which reads each selected expert once, instead of the fused MoE op, which reads the uncached experts in place over the host link, slow for steps of more than 8 rows (verify steps already take the matvec). Each sequence decodes to the bits it gets alone, so greedy output at more than 8 sequences differs from the command without this flag.
 - `--spec-gate-cost-model` (`off`): Past `--spec-max-batch` (8 sequences) the MTP head keeps drafting and its cost model picks the depth, instead of drafting stopping there.
+- `--mmproj` (`mmproj-F16.gguf`, opt-in above): GLM-5.3-Flash's vision tower (`glm5v`), so requests may carry images. Leave it out for text only.
 - `--kv-vmm-keep` (`32768`): Only the first 32,768 tokens of each GPU's KV pool keep VRAM at load; the rest (2.9 GiB a GPU) goes to the expert cache. A prompt past them maps the rest again when it starts (its long-prompt lend frees the VRAM) and gives it back once no sequence uses it.

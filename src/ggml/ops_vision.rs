@@ -45,6 +45,17 @@ impl Context {
         })
     }
 
+    /// `silu(min(a, limit)) * clamp(b, -limit, limit)` (`ggml_swiglu_clamp`): GLM-5.3-Flash's
+    /// vision MLPs.
+    pub fn swiglu_clamp<'a>(&'a self, a: Tensor<'a>, b: Tensor<'a>, limit: f32) -> Tensor<'a> {
+        self.wrap(unsafe { ffi::ggml_swiglu_clamp(self.raw(), a.raw(), b.raw(), limit) })
+    }
+
+    /// GELU, exact (`ggml_gelu_erf`).
+    pub fn gelu_erf<'a>(&'a self, a: Tensor<'a>) -> Tensor<'a> {
+        self.wrap(unsafe { ffi::ggml_gelu_erf(self.raw(), a.raw()) })
+    }
+
     /// `soft_max(a * scale)` over rows, with no mask.
     pub fn soft_max_scaled<'a>(&'a self, a: Tensor<'a>, scale: f32) -> Tensor<'a> {
         self.wrap(unsafe {

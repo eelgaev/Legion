@@ -27,6 +27,12 @@ pub fn preprocess(hp: &VisionHparams, bytes: &[u8]) -> Result<Preprocessed, Visi
     // size, the aspect ratio as near as alignment allows) and mtmd_image_preprocessor_dyn_size.
     let (resized_w, resized_h) = match hp.projector {
         super::Projector::Gemma4v => (width, height),
+        super::Projector::Glm5v => glm5_content(
+            img.width(),
+            img.height(),
+            (width, height),
+            hp.image_min_pixels,
+        ),
         super::Projector::Qwen3vl => {
             let scale =
                 (width as f32 / img.width() as f32).min(height as f32 / img.height() as f32);
@@ -45,8 +51,11 @@ pub fn preprocess(hp: &VisionHparams, bytes: &[u8]) -> Result<Preprocessed, Visi
     );
     let n = width as usize * height as usize;
     let mut pixels = vec![0.0; 3 * n];
-    let offset_x = (width - resized_w) / 2;
-    let offset_y = (height - resized_h) / 2;
+    // GLM-5.3-Flash's image sits at the canvas' top left, Qwen-VL's in its middle.
+    let (offset_x, offset_y) = match hp.projector {
+        super::Projector::Glm5v => (0, 0),
+        _ => ((width - resized_w) / 2, (height - resized_h) / 2),
+    };
     for channel in 0..3 {
         let plane = &mut pixels[channel * n..(channel + 1) * n];
         plane.fill((0.0 - hp.image_mean[channel]) / hp.image_std[channel]);
@@ -110,11 +119,91 @@ pub(super) fn resize_for(
 ) -> Result<(u32, u32), VisionError> {
     let factor = hp.patch_size * hp.spatial_merge_size;
     let (min, max) = (hp.image_min_pixels, hp.image_max_pixels);
+    if hp.projector == super::Projector::Glm5v {
+        return glm5_canvas(width, height, factor, min, max);
+    }
     let size = smart_resize(width, height, factor, min, max)?;
     Ok(match hp.projector {
         super::Projector::Gemma4v => within_budget(size, factor, max),
-        super::Projector::Qwen3vl => size,
+        _ => size,
     })
+}
+
+/// GLM-5.3-Flash's canvas for a `width × height` image: both sides rounded up to `factor`;
+/// grown (by the same ratio, rounded up) to `min` pixels when under it; over `max`, the
+/// largest canvas within it whose content height (and the width of the same ratio, rounded
+/// down) rounds up to it. Ported from llama.cpp's `mtmd_image_preprocessor_glm5v` in
+/// `tools/mtmd/mtmd-image.cpp` (MIT); integer arithmetic as there.
+pub(super) fn glm5_canvas(
+    width: u32,
+    height: u32,
+    factor: u32,
+    min: u32,
+    max: u32,
+) -> Result<(u32, u32), VisionError> {
+    if width == 0
+        || height == 0
+        || factor == 0
+        || min == 0
+        || max < min
+        || u64::from(max) < u64::from(factor) * u64::from(factor)
+    {
+        return Err(VisionError::Dimensions);
+    }
+    let (w, h, f) = (width as i64, height as i64, factor as i64);
+    let (min, max) = (min as i64, max as i64);
+    let align = |v: i64| (v + f - 1) / f * f;
+    let (mut ch, mut cw) = (align(h), align(w));
+    if ch * cw < min {
+        let scale = (min as f64 / (h * w) as f64).sqrt();
+        ch = align(((h as f64 * scale).ceil() as i64).max(1));
+        cw = align(((w as f64 * scale).ceil() as i64).max(1));
+    }
+    if ch * cw > max {
+        // As mtmd's glm5v path does: the search tops out at the image's own height and does
+        // not recheck `min`, so a very thin image that grew past `max` can end under it. Kept
+        // that way to give the reference's canvas for every image.
+        let (mut lo, mut hi) = (1, h);
+        let mut best = (f, f);
+        while lo <= hi {
+            let mid = (lo + hi) / 2;
+            let (ah, aw) = (align(mid), align((w * mid / h).max(1)));
+            if ah * aw <= max {
+                best = (ah, aw);
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        (ch, cw) = best;
+    }
+    if !(1..=65536).contains(&cw) || !(1..=65536).contains(&ch) {
+        return Err(VisionError::Dimensions);
+    }
+    Ok((cw as u32, ch as u32))
+}
+
+/// The size GLM-5.3-Flash's image is resized to on its canvas `(canvas_w, canvas_h)`
+/// ([`glm5_canvas`]): scaled to fit it, never up unless the image is under `min` pixels, each
+/// side rounded down (at least 1). Ported from llama.cpp's `mtmd_image_preprocessor_glm5v`
+/// (MIT).
+pub(super) fn glm5_content(
+    width: u32,
+    height: u32,
+    (canvas_w, canvas_h): (u32, u32),
+    min: u32,
+) -> (u32, u32) {
+    let (w, h) = (width as i64, height as i64);
+    let mut scale = (canvas_h as f64 / h as f64).min(canvas_w as f64 / w as f64);
+    if h * w >= min as i64 {
+        scale = scale.min(1.0);
+    }
+    let side = |v: i64, canvas: u32| {
+        ((v as f64 * scale).floor() as i64)
+            .min(canvas as i64)
+            .max(1)
+    };
+    (side(w, canvas_w) as u32, side(h, canvas_h) as u32)
 }
 
 /// Not in llama.cpp: [`smart_resize`]'s one-factor floor on a thin image can leave the area
