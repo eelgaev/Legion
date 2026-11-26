@@ -1683,35 +1683,13 @@ impl ExpertResidency {
             }
             _ => None,
         };
-        // The bounded host tier's saved heat (#37): a file that is missing, unreadable or of
-        // another model is passed over, and the cache starts as without one. Set only for the
-        // tier's machine and model, with the tier or with every expert in host memory.
+        // The bounded host tier's saved heat (#37). Set only for the tier's machine and model,
+        // with the tier or with every expert in host memory.
         let tier_heat = cfg.tier_heat.as_ref().filter(|_| cfg.profile.is_none());
-        let tier_prof = tier_heat
-            .filter(|p| p.exists())
-            .and_then(|p| match Profile::read(p) {
-                Ok(prof) if prof.n_expert == n_expert && prof.n_layers <= n_layers => Some(prof),
-                Ok(prof) => {
-                    tracing::info!(
-                        layers = prof.n_layers,
-                        experts = prof.n_expert,
-                        "host expert tier: the saved routing heat is another model's, not used"
-                    );
-                    None
-                }
-                Err(e) => {
-                    tracing::info!(error = %e, "host expert tier: saved routing heat not read");
-                    None
-                }
-            });
+        let tier_prof = tier_heat.and_then(|p| read_tier_heat(p, n_layers, n_expert));
         // Per layer its experts, the most routed first.
-        let tier_order: Option<Vec<Vec<u32>>> = tier_prof.as_ref().map(|p| {
-            let mut order = vec![Vec::new(); n_layers];
-            for &(l, e) in &p.ranked {
-                order[l].push(e);
-            }
-            order
-        });
+        let tier_order: Option<Vec<Vec<u32>>> =
+            tier_prof.as_ref().map(|p| tier_heat_order(p, n_layers));
         let mut ranked: Vec<(usize, u32)> =
             profile.as_ref().map_or_else(Vec::new, |p| p.ranked.clone());
         // `tier_heat_sizes` (#37): the saved heat's hottest pairs over all layers also size the
@@ -1720,7 +1698,12 @@ impl ExpertResidency {
             && cfg.tier_heat_sizes
             && let Some(p) = &tier_prof
         {
-            ranked = p.ranked.clone();
+            ranked = p
+                .ranked
+                .iter()
+                .copied()
+                .filter(|&(l, _)| l < n_layers)
+                .collect();
         }
         // Expert parallelism: a layer's ranking goes to every entry serving it, each taking its
         // own experts.
@@ -4991,13 +4974,7 @@ impl Drop for ExpertResidency {
             // Merge with what the file held: the routing seen before counts too.
             let mut learned = self.learned_profile();
             if let Ok(old) = Profile::read(path) {
-                let mut seen = std::collections::HashSet::new();
-                learned.ranked.retain(|p| seen.insert(*p));
-                for p in old.ranked {
-                    if seen.insert(p) {
-                        learned.ranked.push(p);
-                    }
-                }
+                learned = merge_older(learned, old);
             }
             if let Err(e) = learned.write(path) {
                 tracing::warn!(path = %path.display(), error = %e, "could not save the expert profile");
@@ -5042,20 +5019,83 @@ pub(crate) fn hold_applies(hold: bool, seeded: bool) -> bool {
 /// [`Profile::write`]), the pairs only the file's older ranking holds (same model) after it.
 /// The pairs written.
 pub(crate) fn save_heat(path: &std::path::Path, mut learned: Profile) -> std::io::Result<usize> {
-    if let Ok(old) = Profile::read(path)
-        && old.n_expert == learned.n_expert
-        && old.n_layers == learned.n_layers
-    {
-        let mut seen: std::collections::HashSet<_> = learned.ranked.iter().copied().collect();
-        learned
-            .ranked
-            .extend(old.ranked.into_iter().filter(|p| seen.insert(*p)));
+    if let Ok(old) = Profile::read(path) {
+        learned = merge_older(learned, old);
     }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     learned.write(path)?;
     Ok(learned.ranked.len())
+}
+
+/// `learned` with the pairs only `old` (the file it replaces) ranks, after its own. An `old`
+/// with more layers keeps them (a `--spec mtp` run's file: the head's layer is the last one),
+/// so a run without the head does not lose that layer's heat; an `old` of another expert
+/// count (another model's) is dropped.
+pub(crate) fn merge_older(mut learned: Profile, old: Profile) -> Profile {
+    if old.n_expert != learned.n_expert {
+        return learned;
+    }
+    learned.n_layers = learned.n_layers.max(old.n_layers);
+    let mut seen = std::collections::HashSet::new();
+    learned.ranked.retain(|p| seen.insert(*p));
+    learned
+        .ranked
+        .extend(old.ranked.into_iter().filter(|p| seen.insert(*p)));
+    learned
+}
+
+/// The bounded host tier's saved heat at `path` (#37) for a model of `n_layers` layers (MTP
+/// layers included) with `n_expert` experts each: `None` when the file is missing, unreadable
+/// or another model's (another expert count), and the cache starts as without one. A file
+/// with more layers (saved by a `--spec mtp` run, the head's layer last) seeds the model's
+/// layers and its others are passed over; one with fewer seeds the layers it has.
+pub(crate) fn read_tier_heat(
+    path: &std::path::Path,
+    n_layers: usize,
+    n_expert: usize,
+) -> Option<Profile> {
+    if !path.exists() {
+        return None;
+    }
+    match Profile::read(path) {
+        Ok(prof) if prof.n_expert == n_expert => {
+            if prof.n_layers > n_layers {
+                tracing::info!(
+                    layers = n_layers,
+                    dropped = prof.n_layers - n_layers,
+                    "host expert tier: the saved routing heat has layers past the model's \
+                     last (an MTP head's), those are not used"
+                );
+            }
+            Some(prof)
+        }
+        Ok(prof) => {
+            tracing::info!(
+                layers = prof.n_layers,
+                experts = prof.n_expert,
+                "host expert tier: the saved routing heat is another model's, not used"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::info!(error = %e, "host expert tier: saved routing heat not read");
+            None
+        }
+    }
+}
+
+/// Per layer of the model's `n_layers`, the experts of the saved heat `prof`, the most routed
+/// first; pairs of layers past the model's last are passed over.
+pub(crate) fn tier_heat_order(prof: &Profile, n_layers: usize) -> Vec<Vec<u32>> {
+    let mut order = vec![Vec::new(); n_layers];
+    for &(l, e) in &prof.ranked {
+        if let Some(o) = order.get_mut(l) {
+            o.push(e);
+        }
+    }
+    order
 }
 
 /// With the bounded host tier, a round of swaps plans this many times its budget while the

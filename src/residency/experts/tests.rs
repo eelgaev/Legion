@@ -587,6 +587,89 @@ fn a_saved_heat_ranking_keeps_the_older_files_other_pairs_after_its_own() {
     assert_eq!(Profile::read(&path).unwrap(), other);
 }
 
+/// `n_layers` layers of `n_expert` experts, every layer's heat its own (layer `l`, expert `e`:
+/// `1 + (l * 7 + e * 3) % 11`), so a dropped or shifted layer shows.
+fn layered_heat(n_layers: usize, n_expert: usize) -> Vec<Vec<f32>> {
+    (0..n_layers)
+        .map(|l| {
+            (0..n_expert)
+                .map(|e| (1 + (l * 7 + e * 3) % 11) as f32)
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn a_saved_heat_with_an_mtp_heads_layer_seeds_a_model_without_it() {
+    use crate::residency::profile::Profile;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m.gguf.1.heat");
+    // A `--spec mtp` run's file: 48 layers and the head's, 8 experts each.
+    let src = Profile::from_heat(&layered_heat(49, 8));
+    src.write(&path).unwrap();
+    // Loaded by a run without the head (48 layers): taken, its 48 layers' heat as saved.
+    let got = super::read_tier_heat(&path, 48, 8).expect("a longer file seeds the layers");
+    let seed = 0.5;
+    assert_eq!(got.heat(seed)[..48], src.heat(seed)[..48]);
+    let order = super::tier_heat_order(&got, 48);
+    assert_eq!(order.len(), 48);
+    for (l, o) in order.iter().enumerate() {
+        let want: Vec<u32> = src
+            .ranked
+            .iter()
+            .filter(|p| p.0 == l)
+            .map(|p| p.1)
+            .collect();
+        assert_eq!(o, &want, "layer {l}");
+    }
+    // The other way: a 48-layer file loaded by an MTP run (49 layers) seeds its 48 layers,
+    // the head's starts cold.
+    let short = Profile::from_heat(&layered_heat(48, 8));
+    short.write(&path).unwrap();
+    let got = super::read_tier_heat(&path, 49, 8).expect("a shorter file seeds its layers");
+    assert_eq!(got, short);
+    let order = super::tier_heat_order(&got, 49);
+    assert_eq!(order.len(), 49);
+    assert!(order[..48].iter().all(|o| o.len() == 8));
+    assert!(order[48].is_empty());
+}
+
+#[test]
+fn a_saved_heat_of_another_expert_count_is_still_refused() {
+    use crate::residency::profile::Profile;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m.gguf.1.heat");
+    let src = Profile::from_heat(&layered_heat(49, 8));
+    src.write(&path).unwrap();
+    assert!(super::read_tier_heat(&path, 48, 16).is_none());
+    assert!(super::read_tier_heat(&path, 49, 4).is_none());
+    // No file, or not a profile: none either.
+    assert!(super::read_tier_heat(&dir.path().join("none.heat"), 48, 8).is_none());
+    std::fs::write(&path, b"not a profile").unwrap();
+    assert!(super::read_tier_heat(&path, 48, 8).is_none());
+}
+
+#[test]
+fn a_heat_save_without_the_mtp_head_keeps_the_heads_layer() {
+    use crate::residency::profile::Profile;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m.gguf.1.heat");
+    // An MTP run's file has the head's layer (48) too.
+    let mut with_head = vec![vec![0.0; 4]; 49];
+    with_head[0][1] = 2.0;
+    with_head[48][3] = 1.0;
+    let old = Profile::from_heat(&with_head);
+    old.write(&path).unwrap();
+    // A run without the head saves 48 layers: the file keeps 49, the head's pair behind.
+    let mut heat = vec![vec![0.0; 4]; 48];
+    heat[5][2] = 4.0;
+    let learned = Profile::from_heat(&heat);
+    assert_eq!(super::save_heat(&path, learned).unwrap(), 3);
+    let got = Profile::read(&path).unwrap();
+    assert_eq!((got.n_layers, got.n_expert), (49, 4));
+    assert_eq!(got.ranked, vec![(5, 2), (0, 1), (48, 3)]);
+}
+
 #[test]
 fn a_lend_fills_from_ram_only_the_slots_it_keeps() {
     use super::{Lend, fill_below};
