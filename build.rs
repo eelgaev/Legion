@@ -309,6 +309,7 @@ fn build_cuda_kernels(ggml: &Path) {
         .file("src/cuda/hc_down.cu")
         .file("src/cuda/hc_mix16.cu")
         .file("src/cuda/hc_chain.cu")
+        .file("src/cuda/mma_peak.cu")
         .file("src/cuda/gate_q8.cu")
         .file("src/cuda/decode_fuse.cu")
         .file("src/cuda/node_fuse.cu")

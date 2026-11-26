@@ -64,6 +64,7 @@ pub mod kv_type;
 pub mod l2_prefetch;
 mod linear;
 pub mod media;
+pub mod mma_peak;
 pub mod mmq_ids;
 pub use mmq_ids::set_mmq_ids;
 pub(crate) mod mmq_preq;

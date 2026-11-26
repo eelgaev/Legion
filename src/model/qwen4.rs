@@ -46,7 +46,8 @@ pub use hc_up_mix::bench as hc_up_mix_bench;
 pub(crate) use hc_up_mix::launch_mix;
 pub(crate) use hc_up_mix::{
     MixAudit, audit as mix_audit, is_bf16_mix, lazy_mix_target, mix_cast_reads, mix_cast_set,
-    set_by_exchange as set_mix_by_exchange, set_lazy_streams, set_mix_cast, up_lob,
+    overlap_down as mix_overlap_down, set_by_exchange as set_mix_by_exchange, set_lazy_streams,
+    set_mix_cast, set_overlap as set_mix_split, up_lob,
 };
 pub use hc_up_mix::{
     set_gpu as set_up_mix_gpu, set_rebuild as set_up_mix_rebuild, set_up_mix, set_up_mix_bf16,
