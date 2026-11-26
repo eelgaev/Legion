@@ -181,13 +181,14 @@ fn build(b: &mut Builder, config: &Json, v: &Json, dir: &Path) -> Result<(), Str
 /// values) -> the conv kernel `v.patch_embd.weight` (`[n, 3, p, p]`), its position table ->
 /// `v.position_embd.weight` (F32, as the converter forces), `std_bias` / `std_scale` ->
 /// `v.std_bias` / `v.std_scale`, and `model.embed_vision.embedding_projection` ->
-/// `mm.input_projection.weight`. Clipped linears (`use_clipped_linears`) are refused, as the
-/// encoder refuses them.
+/// `mm.input_projection.weight`. A clipped linear's scalars (`use_clipped_linears`, the
+/// E2B/E4B-sized towers, #1220) `<proj>.input_min` / `input_max` / `output_min` / `output_max`
+/// -> `v.blk.{i}.<matrix>.input_min` ..., F32 `[1]` (the converter unsqueezes them and drops
+/// `.linear` from the matrix's name); a tower without `standardize` has no `std_bias` /
+/// `std_scale`.
 fn build_gemma(b: &mut Builder, v: &Json, dir: &Path) -> Result<(), String> {
     let vu = |k: &str| num_u(v, k).map_err(|e| format!("vision_config: {e}"));
-    if v.get("use_clipped_linears").and_then(Json::as_bool) == Some(true) {
-        return Err("vision_config: clipped linears are not supported".into());
-    }
+    let clipped = v.get("use_clipped_linears").and_then(Json::as_bool) == Some(true);
     let depth = vu("num_hidden_layers")?;
     let width = vu("hidden_size")?;
     let patch = vu("patch_size")?;
@@ -229,8 +230,11 @@ fn build_gemma(b: &mut Builder, v: &Json, dir: &Path) -> Result<(), String> {
         "v.position_embd.weight",
         &src("patch_embedder.position_embedding_table"),
     )?;
-    widened(b, "v.std_bias", &src("std_bias"))?;
-    widened(b, "v.std_scale", &src("std_scale"))?;
+    // `standardize` (the 31B's): both buffers, which a tower without it lacks.
+    if b.ckpt.locate(&src("std_bias")).is_some() || b.ckpt.locate(&src("std_scale")).is_some() {
+        widened(b, "v.std_bias", &src("std_bias"))?;
+        widened(b, "v.std_scale", &src("std_scale"))?;
+    }
     weight(
         b,
         "mm.input_projection.weight",
@@ -256,8 +260,39 @@ fn build_gemma(b: &mut Builder, v: &Json, dir: &Path) -> Result<(), String> {
         ] {
             weight(b, &to(name), &blk(from))?;
         }
+        if !clipped {
+            continue;
+        }
+        for (proj, name) in GEMMA_CLIPPED {
+            for s in ["input_min", "input_max", "output_min", "output_max"] {
+                let from = src(&format!("encoder.layers.{il}.{proj}.{s}"));
+                if b.ckpt.locate(&from).is_some() {
+                    scalar(b, &format!("v.blk.{il}.{name}.{s}"), &from)?;
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// A Gemma 4 tower's clippable linears and their mmproj names.
+pub(super) const GEMMA_CLIPPED: [(&str, &str); 7] = [
+    ("self_attn.q_proj", "attn_q"),
+    ("self_attn.k_proj", "attn_k"),
+    ("self_attn.v_proj", "attn_v"),
+    ("self_attn.o_proj", "attn_out"),
+    ("mlp.gate_proj", "ffn_gate"),
+    ("mlp.up_proj", "ffn_up"),
+    ("mlp.down_proj", "ffn_down"),
+];
+
+/// The one value of `src` (a 0-D buffer, or `[1]`) as an F32 `[1]` tensor `name`.
+fn scalar(b: &mut Builder, name: &str, src: &str) -> Result<(), String> {
+    let (_, t) = b.source(src)?;
+    if t.numel() != 1 {
+        return Err(format!("`{src}`: shape {:?}, expected one value", t.shape));
+    }
+    b.computed_f32(name, src, vec![1], |x| x)
 }
 
 /// `name` from `src` without a bias: a 1-D weight widened to F32, a BF16 matrix F16, any

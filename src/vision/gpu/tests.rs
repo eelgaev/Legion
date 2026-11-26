@@ -200,3 +200,149 @@ fn gpu_tower_on_a_checkpoint() {
         assert!(cos > 0.99, "{f:?}: min row cosine {cos}");
     }
 }
+
+/// The tiny clipped Gemma 4 tower (#1220: Nemotron 3.5 Bolt's kind, clipped linears, no
+/// standardization) on the GPU against the CPU tower: the rows agree to F16 rounding (largest
+/// error within 2% of the largest CPU value, as the unclipped tower's), the same bits every
+/// time and whatever the share, and the GPU's clamps bite (the same weights without the
+/// scalars give other rows).
+#[test]
+#[ignore = "needs a GPU"]
+fn gpu_clipped_gemma_tower_matches_the_cpu_tower() {
+    let dir = tempfile::tempdir().unwrap();
+    let load = |name: &str, kind| {
+        let path = dir.path().join(name);
+        tiny::write_gemma4v_as(&path, 64, 5, kind).unwrap();
+        let mut cpu = Backend::cpu().unwrap();
+        cpu.set_threads(2);
+        Encoder::load(&path, cpu).unwrap()
+    };
+    let mut enc = load("clipped.gguf", tiny::GEMMA_E4B);
+    let plain = load(
+        "plain.gguf",
+        tiny::GemmaKind {
+            standardize: false,
+            clipped: false,
+        },
+    );
+    let Some(mut gpu) = GpuEncoder::new(&enc, 0).unwrap() else {
+        return;
+    };
+    let mut gpu_plain = GpuEncoder::new(&plain, 0).unwrap().expect("a GPU tower");
+    for (w, h) in [(16, 16), (150, 90), (240, 60), (400, 400)] {
+        let img = tiny::bmp(w, h, |x, y| {
+            [(x * 13) as u8, (y * 29) as u8, ((x + y) * 7) as u8]
+        });
+        let p = super::super::preprocess(enc.hparams(), &img).unwrap();
+        let want = enc.encode(&p).unwrap();
+        let got = gpu.encode(&p).unwrap();
+        assert_eq!(
+            (got.nx, got.ny, got.n_embd),
+            (want.nx, want.ny, want.n_embd)
+        );
+        let scale = want.data.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let err = got
+            .data
+            .iter()
+            .zip(&want.data)
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(
+            err <= 0.02 * scale,
+            "{w} x {h}: max abs error {err} at a scale of {scale}"
+        );
+        assert_eq!(gpu.encode(&p).unwrap(), got, "{w} x {h}: the same bits");
+        for share in ["1/1000", "1/2", "1"] {
+            gpu.set_share(crate::vision::share::parse(share).unwrap()[0]);
+            assert_eq!(gpu.encode(&p).unwrap(), got, "{w} x {h}: share {share}");
+        }
+        gpu.set_share(crate::vision::share::Share::FULL);
+        let other = gpu_plain.encode(&p).unwrap();
+        let diff = other
+            .data
+            .iter()
+            .zip(&got.data)
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(diff > 0.05 * scale, "{w} x {h}: the clamps changed little");
+    }
+}
+
+/// A Gemma 4 tower with clipped linears (#1220; `LEGION_TEST_VISION_HF=<checkpoint dir or
+/// mmproj GGUF>`, e.g. Nemotron 3.5 Bolt E4B's BF16 snapshot) on the images of
+/// `LEGION_TEST_VISION_IMAGES=<dir>`: GPU rows against the CPU tower's, per image the mean and
+/// smallest row cosine and the largest absolute error. Passes when every image's mean cosine is
+/// at least 0.995 and its smallest at least 0.5 (as #240's `rows_agree`: a few rows of a
+/// clipped tower may sit on a clamp's edge).
+#[test]
+#[ignore = "needs a GPU and a Gemma 4 checkpoint"]
+fn gpu_clipped_tower_rows_agree_on_a_checkpoint() {
+    let (Some(hf), Some(images)) = (
+        std::env::var_os("LEGION_TEST_VISION_HF"),
+        std::env::var_os("LEGION_TEST_VISION_IMAGES"),
+    ) else {
+        return;
+    };
+    let path = std::path::Path::new(&hf);
+    let g = if path.is_dir() {
+        crate::hf::open_vision(path)
+            .unwrap()
+            .expect("a vision tower")
+    } else {
+        crate::gguf::GgufFile::open(path).unwrap()
+    };
+    let mut cpu = Backend::cpu().unwrap();
+    cpu.set_threads(8);
+    let mut enc = Encoder::from_gguf(&g, cpu).unwrap();
+    let clipped = (0..enc.config().n_layer).any(|il| {
+        crate::vision::gemma4v::CLIPPED.iter().any(|m| {
+            crate::vision::gemma4v::clip(&enc.weights, il, m)
+                .unwrap()
+                .is_some()
+        })
+    });
+    println!(
+        "tower: {} layers, width {}, clipped linears {clipped}",
+        enc.config().n_layer,
+        enc.config().n_embd
+    );
+    let mut gpu = GpuEncoder::new(&enc, 0).unwrap().expect("a GPU tower");
+    let mut files: Vec<_> = std::fs::read_dir(images)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    files.sort();
+    let mut failed = Vec::new();
+    for f in files {
+        let p = super::super::preprocess(enc.hparams(), &std::fs::read(&f).unwrap()).unwrap();
+        let want = enc.encode(&p).unwrap();
+        let got = gpu.encode(&p).unwrap();
+        assert_eq!(got.data.len(), want.data.len());
+        let err = got
+            .data
+            .iter()
+            .zip(&want.data)
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        let cos: Vec<f64> = got
+            .data
+            .chunks(got.n_embd)
+            .zip(want.data.chunks(want.n_embd))
+            .map(|(a, b)| {
+                let dot: f64 = a.iter().zip(b).map(|(x, y)| (x * y) as f64).sum();
+                let na: f64 = a.iter().map(|x| (x * x) as f64).sum();
+                let nb: f64 = b.iter().map(|x| (x * x) as f64).sum();
+                dot / (na * nb).sqrt()
+            })
+            .collect();
+        let mean = cos.iter().sum::<f64>() / cos.len() as f64;
+        let min = cos.iter().cloned().fold(1f64, f64::min);
+        let name = f.file_name().unwrap().to_string_lossy().into_owned();
+        println!(
+            "{name}: {} x {} px, {} x {} rows, mean row cosine {mean:.6}, min row cosine \
+             {min:.6}, max abs {err:.4e}",
+            p.width, p.height, got.nx, got.ny
+        );
+        if !(mean >= 0.995 && min >= 0.5) {
+            failed.push(name);
+        }
+    }
+    assert!(failed.is_empty(), "rows disagree on {failed:?}");
+}

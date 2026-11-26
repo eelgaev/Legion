@@ -2,7 +2,8 @@
 //! the vision tower's graph but no real projector: two blocks of width 16 (two heads), patches
 //! of 4 pixels, an 8 × 8 learned position grid (resampled for any other grid), F32 weights.
 //! Its outputs are meaningless; what it computes is the same as for a real projector.
-//! [`write_gemma4v`] writes a tiny `gemma4v` one the same way. Also [`bmp`], a 24-bit BMP of any size for test images (decoded by stb_image like a PNG).
+//! [`write_gemma4v`] writes a tiny `gemma4v` one the same way ([`write_gemma4v_as`] also the
+//! smaller towers' kind, with clipped linears). Also [`bmp`], a 24-bit BMP of any size for test images (decoded by stb_image like a PNG).
 
 use std::path::Path;
 
@@ -104,10 +105,77 @@ pub fn write(
 /// Rows of each of the tiny Gemma 4 tower's two position tables (patch grids up to this side).
 pub const GEMMA_POS_ROWS: u32 = 128;
 
+/// What a tiny Gemma 4 tower has beside its matrices: the 31B's standardization, or the smaller
+/// towers' clipped linears (#1220).
+#[derive(Clone, Copy, Debug)]
+pub struct GemmaKind {
+    pub standardize: bool,
+    pub clipped: bool,
+}
+
+/// The 31B's tower: standardized, no clips.
+pub const GEMMA_31B: GemmaKind = GemmaKind {
+    standardize: true,
+    clipped: false,
+};
+
+/// The E2B/E4B-sized towers (Nemotron 3.5 Bolt's): clipped linears, no standardization.
+pub const GEMMA_E4B: GemmaKind = GemmaKind {
+    standardize: false,
+    clipped: true,
+};
+
+/// The tiny clipped tower's bounds of block `il`'s matrix `m`: `[input_min, input_max,
+/// output_min, output_max]`, `None` where a scalar is left out (block 1's `attn_out` has only
+/// `input_max` and `output_min`). Values exact in F16 that clamp a good share of the tiny
+/// tower's activations; `q`, `k` and `v` share their input bounds, as `gate` and `up` do.
+pub fn gemma_clip(il: u32, m: &str) -> [Option<f32>; 4] {
+    let s = if il == 0 { 1.0 } else { 0.75 };
+    let sym = |i: f32, o: f32| [Some(-i * s), Some(i * s * 0.875), Some(-o * s), Some(o * s)];
+    match m {
+        "attn_q" => sym(1.0, 0.5),
+        "attn_k" => sym(1.0, 0.375),
+        "attn_v" => sym(1.0, 0.25),
+        "attn_out" if il == 1 => [None, Some(0.625), Some(-0.25), None],
+        "attn_out" => sym(0.75, 0.375),
+        "ffn_gate" => sym(1.25, 0.5),
+        "ffn_up" => sym(1.25, 0.625),
+        "ffn_down" => sym(0.125, 0.0625),
+        _ => [None; 4],
+    }
+}
+
 /// Writes a tiny `gemma4v` projector (Gemma 4's tower, #1217) for a language model of width
 /// `n_out`: two blocks of width 16 (two heads of 8), patches of 4 pixels pooled 3 × 3, F32
-/// weights, mean 0 and std 1 as Gemma's.
+/// weights, mean 0 and std 1 as Gemma's; the 31B's kind ([`GEMMA_31B`]).
 pub fn write_gemma4v(path: impl AsRef<Path>, n_out: u32, seed: u64) -> Result<(), GgufError> {
+    write_gemma4v_as(path, n_out, seed, GEMMA_31B)
+}
+
+/// [`write_gemma4v`] of `kind`: the same blocks for a seed whatever the kind (the clips draw
+/// nothing), the clips' scalars F32 `[1]` as the converter writes them ([`gemma_clip`]).
+pub fn write_gemma4v_as(
+    path: impl AsRef<Path>,
+    n_out: u32,
+    seed: u64,
+    kind: GemmaKind,
+) -> Result<(), GgufError> {
+    let none = |_: u32, _: &str| -> [Option<f32>; 4] { [None; 4] };
+    let clip: &dyn Fn(u32, &str) -> [Option<f32>; 4] =
+        if kind.clipped { &gemma_clip } else { &none };
+    write_gemma4v_with(path, n_out, seed, kind.standardize, clip, &[])
+}
+
+/// [`write_gemma4v_as`] with the clips of `clip` (block, matrix -> its four scalars) and the
+/// further F32 `[1]` tensors `extra` (name, value): towers the encoder refuses.
+pub fn write_gemma4v_with(
+    path: impl AsRef<Path>,
+    n_out: u32,
+    seed: u64,
+    standardize: bool,
+    clip: &dyn Fn(u32, &str) -> [Option<f32>; 4],
+    extra: &[(&str, f32)],
+) -> Result<(), GgufError> {
     let mut w = GgufWriter::new();
     let u32v = Value::U32;
     let f3 = |v: f32| Value::Array(vec![Value::F32(v); 3]);
@@ -166,9 +234,27 @@ pub fn write_gemma4v(path: impl AsRef<Path>, n_out: u32, seed: u64) -> Result<()
         add(&t("ffn_up"), &[e, ff], 0.0, scale(e))?;
         add(&t("ffn_down"), &[ff, e], 0.0, scale(ff))?;
     }
-    add("v.std_bias", &[e], 0.0, 0.5)?;
-    add("v.std_scale", &[e], 1.0, 0.3)?;
+    if standardize {
+        add("v.std_bias", &[e], 0.0, 0.5)?;
+        add("v.std_scale", &[e], 1.0, 0.3)?;
+    }
     add("mm.input_projection.weight", &[e, o], 0.0, scale(e))?;
+    for il in 0..N_LAYER {
+        for m in [
+            "attn_q", "attn_k", "attn_v", "attn_out", "ffn_gate", "ffn_up", "ffn_down",
+        ] {
+            let names = ["input_min", "input_max", "output_min", "output_max"];
+            for (s, v) in names.iter().zip(clip(il, m)) {
+                if let Some(v) = v {
+                    let name = format!("v.blk.{il}.{m}.{s}");
+                    w.add_tensor(&name, types::F32, &[1], &v.to_ne_bytes())?;
+                }
+            }
+        }
+    }
+    for (name, v) in extra {
+        w.add_tensor(name, types::F32, &[1], &v.to_ne_bytes())?;
+    }
     w.write(path)
 }
 

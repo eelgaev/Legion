@@ -60,3 +60,87 @@ fn row_cache_keeps_recent_images_within_its_bytes() {
     assert!(c.get(4, 4, 4).is_none());
     assert_eq!(c.bytes, 32);
 }
+
+/// Nemotron 3.5 Bolt's prompts (#1220, Gemma 4's marks and sequential positions) with one and
+/// two images: each placeholder becomes `<|image>`, the image's tokens, `<image|>`; every token
+/// sits at its own index; image tokens read their tower rows and the padding token's (0)
+/// per-layer embedding row, as llama.cpp's image batches, and every other token (the marks
+/// too) its own; a prompt chunk that starts past the first image reads the same rows.
+#[test]
+fn gemma_image_tokens_with_one_and_two_images() {
+    use crate::model::core::{Logits, SeqInput};
+    // Illustrative ids: the image placeholder, its open and close marks.
+    let (pad, open, close) = (258_880, 255_999, 256_000);
+    let marks = Marks {
+        pad,
+        open: Some(open),
+        close: Some(close),
+        layout: ImageLayout::Sequential,
+    };
+    let n_embd = 2;
+    let image = |start: usize, nx: usize, ny: usize, v: f32| ImageSpan {
+        start,
+        nx,
+        ny,
+        rows: vec![v; nx * ny * n_embd].into(),
+    };
+    for grids in [&[(3, 2)][..], &[(3, 2), (2, 2)]] {
+        let prompt: Vec<u32> = if grids.len() == 1 {
+            vec![2, 105, pad, 50, 51]
+        } else {
+            vec![2, 105, pad, 50, pad, 51]
+        };
+        let (tokens, starts) = expand_tokens(&prompt, &marks, grids);
+        let mut want = vec![2, 105, open];
+        want.extend([pad; 6]);
+        want.extend([close, 50]);
+        if grids.len() == 2 {
+            want.extend([open, pad, pad, pad, pad, close]);
+        }
+        want.push(51);
+        assert_eq!(tokens, want);
+        assert_eq!(
+            starts,
+            if grids.len() == 1 {
+                vec![3]
+            } else {
+                vec![3, 12]
+            }
+        );
+        let spans = (starts.iter().zip(grids))
+            .enumerate()
+            .map(|(k, (&s, &(nx, ny)))| image(s, nx, ny, k as f32 + 1.0))
+            .collect();
+        let media = Media::with_layout(spans, n_embd, marks.layout);
+        assert_eq!(media, Media::sequential(media.spans().to_vec(), n_embd));
+        let seq = |n_past: usize| SeqInput {
+            tokens: &tokens[n_past..],
+            n_past,
+            blocks: &[],
+            ring: 0,
+            logits: Logits::Last,
+            media: Some(&media),
+        };
+        let rows: Vec<usize> = crate::model::gemma4::ple_rows(&seq(0)).collect();
+        for (i, (&t, &r)) in tokens.iter().zip(&rows).enumerate() {
+            assert_eq!(media.rope(i), [i as i32, i as i32, i as i32, 0]);
+            if t == pad {
+                assert_eq!(r, 0, "image token {i}");
+                let k = (starts.iter().rposition(|&s| s <= i).unwrap() + 1) as f32;
+                assert_eq!(media.row(i), Some(&[k, k][..]), "token {i}");
+            } else {
+                assert_eq!(r, t as usize, "token {i}");
+                assert_eq!(media.row(i), None, "token {i}");
+            }
+        }
+        let later: Vec<usize> = crate::model::gemma4::ple_rows(&seq(5)).collect();
+        assert_eq!(later, rows[5..]);
+        // Text only: every token's own row, as before.
+        let text = SeqInput {
+            media: None,
+            ..seq(0)
+        };
+        let own: Vec<usize> = crate::model::gemma4::ple_rows(&text).collect();
+        assert_eq!(own, tokens.iter().map(|&t| t as usize).collect::<Vec<_>>());
+    }
+}

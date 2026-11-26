@@ -88,6 +88,20 @@ struct Op {
     sfy: f32,
 }
 
+/// `Clamp` of `src/cuda/vision.cu` (#1220): `rows` rows of `width` F32 or F16 (`f16`) values
+/// clamped in place, column `c` to segment `min(c / seg, 2)`'s bounds.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Clamp {
+    x: *mut c_void,
+    rows: i32,
+    width: i32,
+    seg: i32,
+    f16: i32,
+    lo: [f32; 3],
+    hi: [f32; 3],
+}
+
 impl Default for Op {
     fn default() -> Self {
         use std::ptr::{null, null_mut};
@@ -146,11 +160,13 @@ enum Kernel {
     G4Qkv,
     Geglu,
     G4Pool,
+    // Clipped linears (#1220).
+    G4Clamp,
 }
 
 unsafe extern "C" {
     /// The kernels as the CUDA runtime knows them (their host stubs), in [`Kernel`] order.
-    static legion_vision_kernels: [*const c_void; 13];
+    static legion_vision_kernels: [*const c_void; 14];
     fn cudaLaunchKernel(
         func: *const c_void,
         grid: Dim3,

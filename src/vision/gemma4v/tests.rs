@@ -3,8 +3,13 @@ use crate::ggml::Backend;
 use crate::vision::tiny;
 
 fn encoder(dir: &std::path::Path) -> Encoder {
-    let path = dir.join("mmproj.gguf");
-    tiny::write_gemma4v(&path, 24, 11).unwrap();
+    encoder_as(dir, tiny::GEMMA_31B)
+}
+
+/// The tiny tower of `kind` (the 31B's, or the clipped E4B-sized one, #1220).
+fn encoder_as(dir: &std::path::Path, kind: tiny::GemmaKind) -> Encoder {
+    let path = dir.join(format!("mmproj-{}.gguf", kind.clipped as u8));
+    tiny::write_gemma4v_as(&path, 24, 11, kind).unwrap();
     let mut cpu = Backend::cpu().unwrap();
     cpu.set_threads(2);
     Encoder::load(&path, cpu).unwrap()
@@ -47,6 +52,19 @@ fn matvec(w: &[f32], x: &[f32], n: usize) -> Vec<f32> {
     let k = x.len();
     (0..n)
         .map(|o| w[o * k..][..k].iter().zip(x).map(|(a, b)| a * b).sum())
+        .collect()
+}
+
+/// A clipped linear (HF's `Gemma4ClippableLinear`): `x` clamped to `c.inp`, multiplied, the
+/// product clamped to `c.out`; without `c` a plain product.
+fn lin(w: &[f32], x: &[f32], n: usize, c: Option<Clip>) -> Vec<f32> {
+    let Some(c) = c else {
+        return matvec(w, x, n);
+    };
+    let x: Vec<f32> = x.iter().map(|v| v.min(c.inp.1).max(c.inp.0)).collect();
+    matvec(w, &x, n)
+        .into_iter()
+        .map(|v| v.min(c.out.1).max(c.out.0))
         .collect()
 }
 
@@ -105,15 +123,16 @@ fn reference(enc: &Encoder, p: &Preprocessed) -> Vec<f32> {
         let (qn, kn) = (wv("attn_q_norm"), wv("attn_k_norm"));
         let (wq, wk, wvv, wo) = (wv("attn_q"), wv("attn_k"), wv("attn_v"), wv("attn_out"));
         let (wg, wu, wd) = (wv("ffn_gate"), wv("ffn_up"), wv("ffn_down"));
+        let cl = |m: &str| clip(&enc.weights, il, m).unwrap();
         let mut q = vec![0f32; n * e];
         let mut kk = vec![0f32; n * e];
         let mut v = vec![0f32; n * e];
         for i in 0..n {
             let mut h = x[i * e..][..e].to_vec();
             rms(&mut h, Some(&ln1), c.eps);
-            q[i * e..][..e].copy_from_slice(&matvec(&wq, &h, e));
-            kk[i * e..][..e].copy_from_slice(&matvec(&wk, &h, e));
-            v[i * e..][..e].copy_from_slice(&matvec(&wvv, &h, e));
+            q[i * e..][..e].copy_from_slice(&lin(&wq, &h, e, cl("attn_q")));
+            kk[i * e..][..e].copy_from_slice(&lin(&wk, &h, e, cl("attn_k")));
+            v[i * e..][..e].copy_from_slice(&lin(&wvv, &h, e, cl("attn_v")));
             let (px, py) = ((i % gx) as i32, (i / gx) as i32);
             for hd in 0..heads {
                 let at = i * e + hd * d;
@@ -149,24 +168,29 @@ fn reference(enc: &Encoder, p: &Preprocessed) -> Vec<f32> {
             }
         }
         for i in 0..n {
-            let mut o = matvec(&wo, &attn[i * e..][..e], e);
+            let mut o = lin(&wo, &attn[i * e..][..e], e, cl("attn_out"));
             rms(&mut o, Some(&apn), c.eps);
             for (t, val) in o.iter().enumerate() {
                 x[i * e + t] += val;
             }
             let mut h = x[i * e..][..e].to_vec();
             rms(&mut h, Some(&ln2), c.eps);
-            let g = matvec(&wg, &h, ff);
-            let u = matvec(&wu, &h, ff);
+            let g = lin(&wg, &h, ff, cl("ffn_gate"));
+            let u = lin(&wu, &h, ff, cl("ffn_up"));
             let gu: Vec<f32> = g.iter().zip(&u).map(|(a, b)| gelu(*a) * b).collect();
-            let mut o = matvec(&wd, &gu, e);
+            let mut o = lin(&wd, &gu, e, cl("ffn_down"));
             rms(&mut o, Some(&fpn), c.eps);
             for (t, val) in o.iter().enumerate() {
                 x[i * e + t] += val;
             }
         }
     }
-    let (bias, scale) = (values(enc, "v.std_bias"), values(enc, "v.std_scale"));
+    // Without the standardization: `(x - 0) * 1`.
+    let (bias, scale) = if standardizes(&enc.weights) {
+        (values(enc, "v.std_bias"), values(enc, "v.std_scale"))
+    } else {
+        (vec![0.0; e], vec![1.0; e])
+    };
     let proj = values(enc, "mm.input_projection.weight");
     let (ox, oy) = (gx / k, gy / k);
     let mut out = Vec::with_capacity(ox * oy * c.n_out);
@@ -386,7 +410,17 @@ fn checkpoint_tower_matches_the_mmproj() {
         format!("{:?}", theirs.hparams())
     );
     assert_eq!(ours.config(), theirs.config());
-    for name in names(ours.config().n_layer) {
+    // The optional tensors too (#1220): the standardization's and the clips' scalars, where
+    // either side has them (both must).
+    let n_layer = ours.config().n_layer;
+    let mut optional = vec!["v.std_bias".to_string(), "v.std_scale".to_string()];
+    for il in 0..n_layer {
+        for m in CLIPPED {
+            optional.extend(CLIP_SCALARS.map(|s| format!("v.blk.{il}.{m}{s}")));
+        }
+    }
+    optional.retain(|n| ours.weights.get(n).is_some() || theirs.weights.get(n).is_some());
+    for name in names(n_layer).into_iter().chain(optional) {
         let (a, b) = (widened(&ours, &name), widened(&theirs, &name));
         assert_eq!(a.len(), b.len(), "{name}");
         // The QAT GGUF's projector is the QAT checkpoint's own (cosine 0.9996 to the base
@@ -402,5 +436,392 @@ fn checkpoint_tower_matches_the_mmproj() {
             .filter(|(x, y)| x != y && !(y.abs() < 6.2e-5 && (*x - *y).abs() < 6e-8))
             .count();
         assert_eq!(diff, 0, "{name}: {diff} of {} values differ", a.len());
+    }
+}
+
+/// The clipped tower (#1220, the E2B/E4B-sized towers' kind, no standardization) computes what
+/// the loops compute with HF's `Gemma4ClippableLinear` (clamp the input, multiply, clamp the
+/// product) on a grid that is not square; the clamps bite: the same weights without the
+/// scalars give other rows.
+#[test]
+fn clipped_tower_matches_the_reference_loops() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut enc = encoder_as(dir.path(), tiny::GEMMA_E4B);
+    let p = crate::vision::preprocess(enc.hparams(), &gradient(150, 90)).unwrap();
+    assert_ne!(p.grid_w, p.grid_h);
+    let got = enc.encode(&p).unwrap();
+    let want = reference(&enc, &p);
+    assert_eq!(got.data.len(), want.len());
+    let scale = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
+    for (i, (a, b)) in got.data.iter().zip(&want).enumerate() {
+        assert!((a - b).abs() <= 2e-3 * scale, "{i}: {a} vs {b}");
+    }
+    let plain = tiny::GemmaKind {
+        standardize: false,
+        clipped: false,
+    };
+    let mut unclipped = encoder_as(dir.path(), plain);
+    let other = unclipped.encode(&p).unwrap();
+    let diff = other
+        .data
+        .iter()
+        .zip(&got.data)
+        .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+    assert!(
+        diff > 0.05 * scale,
+        "the clamps changed little: {diff} of {scale}"
+    );
+}
+
+/// A clip's scalars as mtmd reads them: all four, or the missing ones at `±f32::MAX` (block 1's
+/// `attn_out` has only `input_max` and `output_min`); a matrix without any is a plain product;
+/// the 31B's tower has none and standardizes, the clipped one does not.
+#[test]
+fn clips_read_with_mtmd_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let e4b = encoder_as(dir.path(), tiny::GEMMA_E4B);
+    assert!(!standardizes(&e4b.weights));
+    assert_eq!(
+        clip(&e4b.weights, 0, "attn_q").unwrap(),
+        Some(Clip {
+            inp: (-1.0, 0.875),
+            out: (-0.5, 0.5),
+        })
+    );
+    assert_eq!(
+        clip(&e4b.weights, 1, "attn_out").unwrap(),
+        Some(Clip {
+            inp: (-f32::MAX, 0.625),
+            out: (-0.25, f32::MAX),
+        })
+    );
+    for il in 0..2 {
+        for m in CLIPPED {
+            let want = tiny::gemma_clip(il as u32, m);
+            let c = clip(&e4b.weights, il, m).unwrap().unwrap();
+            let got = [c.inp.0, c.inp.1, c.out.0, c.out.1];
+            let defaults = [-f32::MAX, f32::MAX, -f32::MAX, f32::MAX];
+            for ((g, w), d) in got.iter().zip(want).zip(defaults) {
+                assert_eq!(*g, w.unwrap_or(d), "{il} {m}");
+            }
+        }
+    }
+    let big = encoder(dir.path());
+    assert!(standardizes(&big.weights));
+    for m in CLIPPED {
+        assert_eq!(clip(&big.weights, 0, m).unwrap(), None, "{m}");
+    }
+}
+
+/// Towers mtmd's in-place input clamp would make order-dependent are refused (`k` clamping the
+/// input `q` and `v` share differently), as are clips the graph would not apply (on the
+/// projection) and half a standardization; an audio tower's clips are not the vision tower's.
+#[test]
+fn refuses_towers_it_cannot_clamp_like_mtmd() {
+    let dir = tempfile::tempdir().unwrap();
+    let load = |name: &str,
+                std: bool,
+                clip: &dyn Fn(u32, &str) -> [Option<f32>; 4],
+                extra: &[(&str, f32)]| {
+        let path = dir.path().join(name);
+        tiny::write_gemma4v_with(&path, 24, 3, std, clip, extra).unwrap();
+        let mut cpu = Backend::cpu().unwrap();
+        cpu.set_threads(1);
+        Encoder::load(&path, cpu)
+    };
+    let k_differs = |il: u32, m: &str| {
+        let mut c = tiny::gemma_clip(il, m);
+        if il == 1 && m == "attn_k" {
+            c[0] = Some(-2.0);
+        }
+        c
+    };
+    let gate_differs = |il: u32, m: &str| {
+        let mut c = tiny::gemma_clip(il, m);
+        if m == "ffn_up" {
+            c[1] = None;
+        }
+        c
+    };
+    assert!(matches!(
+        load("k.gguf", false, &k_differs, &[]),
+        Err(VisionError::Unsupported(_))
+    ));
+    assert!(matches!(
+        load("up.gguf", false, &gate_differs, &[]),
+        Err(VisionError::Unsupported(_))
+    ));
+    assert!(matches!(
+        load(
+            "proj.gguf",
+            false,
+            &tiny::gemma_clip,
+            &[("mm.input_projection.input_min", -1.0)]
+        ),
+        Err(VisionError::Unsupported(_))
+    ));
+    assert!(matches!(
+        load(
+            "half.gguf",
+            false,
+            &tiny::gemma_clip,
+            &[("v.std_bias", 0.5)]
+        ),
+        Err(VisionError::Metadata(_))
+    ));
+    // An unsloth mmproj's audio tower carries clips of its own: not read here.
+    load(
+        "audio.gguf",
+        false,
+        &tiny::gemma_clip,
+        &[
+            ("a.blk.0.attn_q.input_min", -3.0),
+            ("mm.a.input_projection.output_max", 3.0),
+        ],
+    )
+    .unwrap();
+}
+
+/// Nemotron 3.5 Bolt's tower's preprocessing (its processor's mean 0 and std 1, 16-pixel
+/// patches merged 3 × 3, mtmd's 70 to 1,120 tokens) on a fixed image: a 640 × 480 image is
+/// 624 × 480 pixels, 39 × 30 patches, 13 × 10 = 130 tokens; each pixel is `byte / 255`,
+/// planar (red plane, green, blue); a flat colour stays flat through the resize.
+#[test]
+fn preprocesses_a_fixed_image_for_the_e4b_tower() {
+    let mut hp = gemma_limits();
+    hp.image_mean = [0.0; 3];
+    hp.image_std = [1.0; 3];
+    let flat = tiny::bmp(640, 480, |_, _| [51, 102, 204]);
+    let p = crate::vision::preprocess(&hp, &flat).unwrap();
+    assert_eq!((p.width, p.height), (624, 480));
+    assert_eq!((p.grid_w, p.grid_h), (39, 30));
+    let k = hp.spatial_merge_size;
+    assert_eq!((p.grid_w / k) * (p.grid_h / k), 130);
+    let plane = (p.width * p.height) as usize;
+    assert_eq!(p.pixels.len(), 3 * plane);
+    for (c, byte) in [51u8, 102, 204].into_iter().enumerate() {
+        let want = byte as f32 / 255.0;
+        assert!(
+            p.pixels[c * plane..][..plane]
+                .iter()
+                .all(|&v| (v - want).abs() < 1e-6),
+            "channel {c}"
+        );
+    }
+    // A small image grows to the fewest tokens (70 → 9 × 9 = 81 at a square), a big one
+    // shrinks within 1,120.
+    let small = crate::vision::preprocess(&hp, &gradient(16, 16)).unwrap();
+    assert_eq!((small.grid_w / k, small.grid_h / k), (9, 9));
+    let big = crate::vision::preprocess(&hp, &gradient(4000, 3000)).unwrap();
+    assert_eq!((big.width, big.height), (1824, 1344));
+    assert!((big.grid_w / k) * (big.grid_h / k) <= 1120);
+}
+
+/// A tiny Gemma 4 checkpoint (BF16, as Nemotron 3.5 Bolt E4B's snapshot ships): 2 blocks of
+/// width 16, 2 heads, 32-wide MLPs, 4-pixel patches, a 64-row position table, a 24-wide text
+/// model; every value exact in BF16 and F16. With `clipped`, `use_clipped_linears` and each
+/// clippable linear's four 0-D bounds, but block 1's `down_proj` without `output_max`.
+fn write_gemma_checkpoint(dir: &std::path::Path, clipped: bool) {
+    let (e, heads, ff, p, rows, text) = (16usize, 2usize, 32usize, 4usize, 64usize, 24usize);
+    let config = serde_json::json!({
+        "model_type": "gemma4",
+        "vision_config": {
+            "hidden_size": e, "num_hidden_layers": 2, "num_attention_heads": heads,
+            "intermediate_size": ff, "patch_size": p, "pooling_kernel_size": 3,
+            "rms_norm_eps": 1e-6, "use_clipped_linears": clipped,
+        },
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    let pre = serde_json::json!({"image_mean": [0.0, 0.0, 0.0], "image_std": [1.0, 1.0, 1.0]});
+    std::fs::write(dir.join("preprocessor_config.json"), pre.to_string()).unwrap();
+    let mut tensors: Vec<(String, Vec<usize>, Vec<f32>)> = Vec::new();
+    let mut k = 0usize;
+    let mut add = |name: String, shape: Vec<usize>| {
+        let n = shape.iter().product::<usize>();
+        let v = (0..n)
+            .map(|i| ((i + k) % 7) as f32 * 0.125 - 0.375)
+            .collect();
+        k += 1;
+        tensors.push((name, shape, v));
+    };
+    let t = |s: &str| format!("model.vision_tower.{s}");
+    add(t("patch_embedder.input_proj.weight"), vec![e, p * p * 3]);
+    add(
+        t("patch_embedder.position_embedding_table"),
+        vec![2, rows, e],
+    );
+    add(
+        "model.embed_vision.embedding_projection.weight".into(),
+        vec![text, e],
+    );
+    for il in 0..2 {
+        let l = |s: &str| t(&format!("encoder.layers.{il}.{s}"));
+        for n in [
+            "input_layernorm",
+            "pre_feedforward_layernorm",
+            "post_attention_layernorm",
+            "post_feedforward_layernorm",
+        ] {
+            add(l(&format!("{n}.weight")), vec![e]);
+        }
+        for n in ["q_norm", "k_norm"] {
+            add(l(&format!("self_attn.{n}.weight")), vec![e / heads]);
+        }
+        for (n, shape) in [
+            ("self_attn.q_proj", vec![e, e]),
+            ("self_attn.k_proj", vec![e, e]),
+            ("self_attn.v_proj", vec![e, e]),
+            ("self_attn.o_proj", vec![e, e]),
+            ("mlp.gate_proj", vec![ff, e]),
+            ("mlp.up_proj", vec![ff, e]),
+            ("mlp.down_proj", vec![e, ff]),
+        ] {
+            add(l(&format!("{n}.linear.weight")), shape);
+        }
+    }
+    if clipped {
+        for il in 0..2 {
+            for (proj, m) in [
+                ("self_attn.q_proj", "attn_q"),
+                ("self_attn.k_proj", "attn_k"),
+                ("self_attn.v_proj", "attn_v"),
+                ("self_attn.o_proj", "attn_out"),
+                ("mlp.gate_proj", "ffn_gate"),
+                ("mlp.up_proj", "ffn_up"),
+                ("mlp.down_proj", "ffn_down"),
+            ] {
+                let [a, b, c, d] = tiny::gemma_clip(il as u32, m);
+                let bounds = [
+                    ("input_min", a.unwrap_or(-8.0)),
+                    ("input_max", b.unwrap_or(8.0)),
+                    ("output_min", c.unwrap_or(-8.0)),
+                    ("output_max", d.unwrap_or(8.0)),
+                ];
+                for (s, v) in bounds {
+                    if il == 1 && m == "ffn_down" && s == "output_max" {
+                        continue;
+                    }
+                    let name = t(&format!("encoder.layers.{il}.{proj}.{s}"));
+                    tensors.push((name, vec![], vec![v]));
+                }
+            }
+        }
+    }
+    let mut header = serde_json::Map::new();
+    let mut data = Vec::new();
+    for (name, shape, v) in &tensors {
+        let bytes: Vec<u8> = v
+            .iter()
+            .flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes())
+            .collect();
+        header.insert(
+            name.clone(),
+            serde_json::json!({
+                "dtype": "BF16", "shape": shape,
+                "data_offsets": [data.len(), data.len() + bytes.len()],
+            }),
+        );
+        data.extend(bytes);
+    }
+    let mut h = serde_json::to_vec(&header).unwrap();
+    while !h.len().is_multiple_of(8) {
+        h.push(b' ');
+    }
+    let mut out = (h.len() as u64).to_le_bytes().to_vec();
+    out.extend(h);
+    out.extend(data);
+    std::fs::write(dir.join("model.safetensors"), out).unwrap();
+}
+
+/// A Gemma 4 checkpoint's tower under the mmproj's names (#1217, #1220): the converter's
+/// renames (`.linear` dropped), BF16 matrices as F16, norms and the position table F32, the
+/// patch linear as the conv kernel; a clipped tower's 0-D BF16 bounds as F32 `[1]` scalars
+/// `v.blk.{i}.{m}.{input,output}_{min,max}`, a missing one at mtmd's `±f32::MAX`; no
+/// standardization when the checkpoint has none. The bounds of a checkpoint that does not
+/// use them stay out (HF's `Gemma4ClippableLinear` skips them too). Both towers run.
+#[test]
+fn checkpoint_names_map_to_the_mmproj() {
+    use crate::ggml::types;
+    for clipped in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        write_gemma_checkpoint(dir.path(), clipped);
+        if !clipped {
+            // The bounds on a checkpoint that does not use them.
+            let keep = tempfile::tempdir().unwrap();
+            write_gemma_checkpoint(keep.path(), true);
+            std::fs::copy(
+                keep.path().join("model.safetensors"),
+                dir.path().join("model.safetensors"),
+            )
+            .unwrap();
+        }
+        let g = crate::hf::open_vision(dir.path())
+            .unwrap()
+            .expect("a vision tower");
+        let ty = |n: &str| g.tensor(n).unwrap_or_else(|| panic!("no `{n}`"));
+        assert_eq!(ty("v.patch_embd.weight").shape, [4, 4, 3, 16]);
+        assert_eq!(ty("v.patch_embd.weight").ggml_type, types::F32);
+        assert_eq!(ty("v.position_embd.weight").shape, [16, 64, 2]);
+        assert_eq!(ty("v.position_embd.weight").ggml_type, types::F32);
+        assert_eq!(ty("mm.input_projection.weight").shape, [16, 24]);
+        assert_eq!(ty("mm.input_projection.weight").ggml_type, types::F16);
+        assert_eq!(ty("v.blk.1.ffn_down.weight").shape, [32, 16]);
+        assert_eq!(ty("v.blk.1.ffn_down.weight").ggml_type, types::F16);
+        assert_eq!(ty("v.blk.0.attn_q_norm.weight").shape, [8]);
+        assert_eq!(ty("v.blk.0.ln1.weight").ggml_type, types::F32);
+        assert!(g.tensor("v.std_bias").is_none() && g.tensor("v.std_scale").is_none());
+        let scalars = g
+            .tensors()
+            .iter()
+            .filter(|t| CLIP_SCALARS.iter().any(|s| t.name.ends_with(s)))
+            .count();
+        assert_eq!(scalars, if clipped { 2 * 7 * 4 - 1 } else { 0 });
+        if clipped {
+            assert_eq!(ty("v.blk.0.attn_k.input_max").shape, [1]);
+            assert_eq!(ty("v.blk.0.attn_k.input_max").ggml_type, types::F32);
+        }
+        let mut cpu = Backend::cpu().unwrap();
+        cpu.set_threads(2);
+        let mut enc = Encoder::from_gguf(&g, cpu).unwrap();
+        assert!(!standardizes(&enc.weights));
+        // The patch linear `[n, p · p · 3]` (channels last) as `[n, 3, p, p]`.
+        let shipped: Vec<f32> = (0..16 * 48)
+            .map(|i| (i % 7) as f32 * 0.125 - 0.375)
+            .collect();
+        let kernel = widened(&enc, "v.patch_embd.weight");
+        for (o, row) in shipped.chunks(48).enumerate() {
+            for c in 0..3 {
+                for y in 0..4 {
+                    for x in 0..4 {
+                        let at = ((o * 3 + c) * 4 + y) * 4 + x;
+                        assert_eq!(kernel[at], row[(y * 4 + x) * 3 + c], "{o} {c} {y} {x}");
+                    }
+                }
+            }
+        }
+        for il in 0..2 {
+            for m in CLIPPED {
+                let got = clip(&enc.weights, il, m).unwrap();
+                if !clipped {
+                    assert_eq!(got, None, "{il} {m}");
+                    continue;
+                }
+                let [a, b, c, d] = tiny::gemma_clip(il as u32, m);
+                let last = if il == 1 && m == "ffn_down" {
+                    f32::MAX
+                } else {
+                    d.unwrap_or(8.0)
+                };
+                let want = Clip {
+                    inp: (a.unwrap_or(-8.0), b.unwrap_or(8.0)),
+                    out: (c.unwrap_or(-8.0), last),
+                };
+                assert_eq!(got, Some(want), "{il} {m}");
+            }
+        }
+        let p = crate::vision::preprocess(enc.hparams(), &gradient(60, 36)).unwrap();
+        let rows = enc.encode(&p).unwrap();
+        assert_eq!(rows.n_embd, 24);
+        assert!(rows.data.iter().all(|v| v.is_finite()));
     }
 }

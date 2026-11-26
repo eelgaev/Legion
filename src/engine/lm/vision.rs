@@ -236,7 +236,9 @@ pub(super) struct Pending {
 
 impl Vision {
     /// Loads the mmproj `path` (`--mmproj`) for a language model of architecture `arch` and
-    /// width `n_embd`, onto CUDA device `gpu` when there is one.
+    /// width `n_embd`, onto CUDA device `gpu` when there is one. A directory is an HF
+    /// checkpoint whose own tower is taken (#1220: a GGUF language model with the safetensors
+    /// snapshot's tower, no converted mmproj needed).
     pub(super) fn load(
         path: &Path,
         arch: &str,
@@ -247,7 +249,7 @@ impl Vision {
     ) -> Result<Self, LoadError> {
         let err = |e: String| LoadError::Device(format!("--mmproj {}: {e}", path.display()));
         Self::check_arch(arch).map_err(err)?;
-        let g = GgufFile::open(path).map_err(|e| err(e.to_string()))?;
+        let g = open_mmproj(path).map_err(err)?;
         Self::from_gguf(&g, arch, n_embd, tokenizer, threads, gpu).map_err(err)
     }
 
@@ -466,6 +468,16 @@ impl Vision {
         let media = Media::with_layout(spans, n_embd, self.marks.layout);
         Ok((Arc::new(media), key))
     }
+}
+
+/// `--mmproj path`: an mmproj GGUF, or an HF checkpoint directory's own tower (#1220).
+pub(super) fn open_mmproj(path: &Path) -> Result<GgufFile, String> {
+    if path.is_dir() {
+        return crate::hf::open_vision(path)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "the checkpoint ships no vision tower Legion runs".to_string());
+    }
+    GgufFile::open(path).map_err(|e| e.to_string())
 }
 
 /// `LEGION_DEBUG_VISION_REENCODE=1` (A/B runs): every image is encoded, the row cache unused,
