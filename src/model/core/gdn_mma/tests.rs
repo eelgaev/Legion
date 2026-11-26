@@ -548,6 +548,8 @@ type AheadRun = (Vec<u8>, i8, f64);
 /// without the shape gate so any token count runs (also under [`MIN_TOKENS`]), on whole heads
 /// ([`Schedule::WideTwo`] forced). Runs it once per entry of `plan` with [`set_gdn_ahead`] set
 /// to it; with `reps` the entry's time is the mean of `reps` more runs, else its bytes are read.
+/// Before each run that is read, the regions read are poisoned: 0xA5 before the first, the
+/// complement of the run before's bytes after, so a store a kernel skips shows as a difference.
 #[cfg(feature = "cuda")]
 fn ahead_case(
     gpu: &mut Backend,
@@ -626,9 +628,20 @@ fn ahead_case(
     } else {
         (rows as usize * width, nt as usize * width / 2)
     };
+    let mut before: Option<Vec<u8>> = None;
     plan.iter()
         .map(|&on| {
             set_gdn_ahead(on);
+            if reps == 0 {
+                // The final states are the node's rows, not the input state's tensor, which keeps
+                // its values.
+                let poison: Vec<u8> = match &before {
+                    Some(b) => b.iter().map(|x| !x).collect(),
+                    None => vec![0xA5; states.1 + read.1],
+                };
+                node.set_bytes_at(states.0, &poison[..states.1]);
+                node.set_bytes_at(read.0, &poison[states.1..]);
+            }
             LAST_KERNEL.store(-1, Ordering::Relaxed);
             gpu.compute(&graph).unwrap();
             let kernel = LAST_KERNEL.load(Ordering::Relaxed);
@@ -642,9 +655,22 @@ fn ahead_case(
             }
             let mut bytes = node.bytes_at(states.0, states.1);
             bytes.extend(node.bytes_at(read.0, read.1));
+            before = Some(bytes.clone());
             (bytes, kernel, 0.0)
         })
         .collect()
+}
+
+/// The table index of the kernel [`ahead_case`] must run: the codes or the rows kernel, as
+/// `gdn_ahead` (`on`) or as `gdn_split`.
+#[cfg(feature = "cuda")]
+fn ahead_kernel(codes: bool, on: bool) -> i8 {
+    (match (codes, on) {
+        (true, true) => AHEAD_CODES_KERNEL,
+        (true, false) => CODES_KERNEL,
+        (false, true) => AHEAD_GN_KERNEL,
+        (false, false) => GN_KERNEL,
+    }) as i8
 }
 
 /// #1183: `gdn_ahead` (z rows one chunk ahead, the Gram under the projections) against
@@ -664,14 +690,9 @@ fn cuda_ahead_matches_split_bit_for_bit() {
         for codes in [false, true] {
             let runs = ahead_case(&mut gpu, (16, 48, nt), codes, &[false, true], 0);
             let (old, new) = (&runs[0], &runs[1]);
-            let want = if codes {
-                [CODES_KERNEL, AHEAD_CODES_KERNEL]
-            } else {
-                [GN_KERNEL, AHEAD_GN_KERNEL]
-            };
             assert_eq!(
                 [old.1, new.1],
-                want.map(|k| k as i8),
+                [ahead_kernel(codes, false), ahead_kernel(codes, true)],
                 "{nt} tokens, codes {codes}: the kernels"
             );
             assert_eq!(old.0.len(), new.0.len());
@@ -696,6 +717,15 @@ fn cuda_ahead_bench() {
     for codes in [false, true] {
         let plan: Vec<bool> = (0..rounds).flat_map(|r| [r % 2 == 1, r % 2 == 0]).collect();
         let runs = ahead_case(&mut gpu, (16, 48, 12288), codes, &plan, reps);
+        // Every timing is of the kernel it is labelled with (no fallback, say from codes to the
+        // rows and fp8_act's pack).
+        for (r, (&on, run)) in plan.iter().zip(&runs).enumerate() {
+            assert_eq!(
+                run.1,
+                ahead_kernel(codes, on),
+                "codes {codes}, ahead {on}, run {r}: the kernel"
+            );
+        }
         let stats = |on: bool| {
             let mut ms: Vec<f64> = plan
                 .iter()
