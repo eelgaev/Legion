@@ -448,6 +448,25 @@ impl GpuEncoder {
         }
     }
 
+    /// [`Self::encode`] and each stage's rows (GLM-5.3-Flash's tower only, for tests: where it
+    /// parts from the CPU tower's [`Encoder::encode_stages`]).
+    #[cfg(test)]
+    pub(crate) fn encode_stages(
+        &mut self,
+        p: &Preprocessed,
+    ) -> Result<(ImageEmbedding, Vec<(String, Vec<f32>)>), VisionError> {
+        match self {
+            Self::Glm(g) => {
+                let mut taps = Vec::new();
+                let e = g.encode_tapped(p, false, Some(&mut taps))?;
+                Ok((e, taps))
+            }
+            _ => Err(VisionError::Unsupported(
+                "stage rows: GLM-5.3-Flash's tower only".into(),
+            )),
+        }
+    }
+
     /// Encodes with `share` from now on (tests).
     #[cfg(test)]
     pub(crate) fn set_share(&mut self, share: Share) {

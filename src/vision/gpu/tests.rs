@@ -183,7 +183,8 @@ fn gpu_glm_tower_matches_the_cpu_tower() {
 /// A checkpoint's tower (`LEGION_TEST_VISION_HF=<dir>`) on the images of
 /// `LEGION_TEST_VISION_IMAGES=<dir>`: the GPU rows against the CPU tower's, with each image's
 /// grid, both encode times, the largest absolute error, the largest error relative to the
-/// largest CPU value, and the smallest cosine of a GPU row with its CPU row.
+/// largest CPU value, and the smallest cosine of a GPU row with its CPU row; every image, then
+/// the ones under a cosine of 0.99.
 #[test]
 #[ignore = "needs a GPU"]
 fn gpu_tower_on_a_checkpoint() {
@@ -205,6 +206,7 @@ fn gpu_tower_on_a_checkpoint() {
         .map(|e| e.unwrap().path())
         .collect();
     files.sort();
+    let mut failed = Vec::new();
     for f in files {
         let p = super::super::preprocess(enc.hparams(), &std::fs::read(&f).unwrap()).unwrap();
         let t = std::time::Instant::now();
@@ -251,6 +253,101 @@ fn gpu_tower_on_a_checkpoint() {
                 (h ^ u64::from(v.to_bits())).wrapping_mul(0x0000_0100_0000_01b3)
             })
         );
-        assert!(cos > 0.99, "{f:?}: min row cosine {cos}");
+        if cos.is_nan() || cos <= 0.99 {
+            failed.push(format!("{f:?}: min row cosine {cos}"));
+        }
     }
+    assert!(failed.is_empty(), "{failed:?}");
+}
+
+/// GLM-5.3-Flash's tower from a checkpoint (`LEGION_TEST_VISION_HF=<dir>`) on the GPU against
+/// the CPU tower stage by stage (the patches, each block's residual after its attention and
+/// after its MLP, the final norm, the 2×2 convolution, the projector's linear, its LayerNorm
+/// and GELU, the rows out), printed, with the first stage under a row cosine of 0.999 marked:
+/// where the two part. The images: the small ones of the CPU tower's reference test, then
+/// those of `LEGION_TEST_VISION_IMAGES=<dir>` if set. On the small ones the GPU's last rows are
+/// also held against the plain loops (`reference_stages`), so a gap shows which side is off.
+#[test]
+#[ignore = "needs a GPU and a checkpoint"]
+fn gpu_glm_stages_on_a_checkpoint() {
+    use crate::vision::glm5v::{Diff, merge_to_rows, per_patch, tests as cpu_tests};
+    let Some(hf) = std::env::var_os("LEGION_TEST_VISION_HF") else {
+        return;
+    };
+    let g = crate::hf::open_vision(std::path::Path::new(&hf))
+        .unwrap()
+        .expect("a vision tower");
+    let mut cpu = Backend::cpu().unwrap();
+    cpu.set_threads(8);
+    let mut enc = Encoder::from_gguf(&g, cpu).unwrap();
+    let mut gpu = GpuEncoder::new(&enc, 0).unwrap().expect("a GPU tower");
+    let mut images: Vec<(String, Vec<u8>, bool)> = cpu_tests::checkpoint_images()
+        .into_iter()
+        .map(|(l, b)| (l.to_string(), b, true))
+        .collect();
+    if let Some(dir) = std::env::var_os("LEGION_TEST_VISION_IMAGES") {
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        files.sort();
+        for f in files {
+            let label = f.file_name().unwrap().to_string_lossy().into_owned();
+            images.push((label, std::fs::read(&f).unwrap(), false));
+        }
+    }
+    let mut failed = Vec::new();
+    for (label, img, small) in images {
+        let p = super::super::preprocess(enc.hparams(), &img).unwrap();
+        let (gx, gy) = (p.grid_w as usize, p.grid_h as usize);
+        let n = gx * gy;
+        let (_, want) = enc.encode_stages(&p).unwrap();
+        let (_, got) = gpu.encode_stages(&p).unwrap();
+        println!(
+            "{label}: {} x {} px, {gx} x {gy} patches",
+            p.width, p.height
+        );
+        assert_eq!(got.len(), want.len());
+        let mut first = None;
+        for ((name, a), (wname, b)) in got.iter().zip(&want) {
+            assert_eq!(name, wname);
+            let d = Diff::new(a, b, if per_patch(name) { n } else { n / 4 });
+            let close = d.bad == 0 && d.min_cos > 0.999;
+            let mark = if first.is_none() && !close {
+                first = Some(name.clone());
+                "  <- first under 0.999"
+            } else {
+                ""
+            };
+            println!("  {name:>12}: {d}{mark}");
+        }
+        if small {
+            // Both towers against the loops, after each block's MLP and the projector's stages.
+            let loops = cpu_tests::reference_stages(&enc, &p);
+            println!("  against the loops (GPU; CPU):");
+            for (((name, a), (_, b)), (_, l)) in got.iter().zip(&want).zip(&loops) {
+                if name.ends_with(".attn") {
+                    continue;
+                }
+                let (rows, a, b) = if per_patch(name) {
+                    let w = a.len() / n;
+                    (n, merge_to_rows(a, gx, gy, w), merge_to_rows(b, gx, gy, w))
+                } else {
+                    (n / 4, a.clone(), b.clone())
+                };
+                println!(
+                    "  {name:>12}: {}; {}",
+                    Diff::new(&a, l, rows),
+                    Diff::new(&b, l, rows)
+                );
+            }
+        }
+        if let Some(name) = first {
+            failed.push(format!("{label}: from {name}"));
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "the GPU tower parts from the CPU's: {failed:?}"
+    );
 }

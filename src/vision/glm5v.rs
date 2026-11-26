@@ -116,6 +116,18 @@ pub(super) fn names(n_layer: usize) -> Vec<String> {
 
 /// The tower's output for `p` (see the module docs).
 pub(super) fn encode(enc: &mut Encoder, p: &Preprocessed) -> Result<ImageEmbedding, VisionError> {
+    encode_tapped(enc, p, None)
+}
+
+/// [`encode`], and with `taps` each stage's rows as well (tests: where the GPU tower parts from
+/// this one), named as [`crate::vision::GpuEncoder`]'s GLM stages: `patches`, `blk.N.attn`
+/// (the residual after block N's attention), `blk.N` (after its MLP), `post_ln`, `downsample`,
+/// `fc`, `ln_gelu`, `out`; rows in merge order (blocks of four patches), one per row of `x`.
+pub(super) fn encode_tapped(
+    enc: &mut Encoder,
+    p: &Preprocessed,
+    taps: Option<&mut Vec<(String, Vec<f32>)>>,
+) -> Result<ImageEmbedding, VisionError> {
     let c = enc.cfg.clone();
     let (px, py) = (p.grid_w as usize, p.grid_h as usize);
     if px % c.merge != 0 || py % c.merge != 0 || px == 0 || py == 0 {
@@ -137,6 +149,14 @@ pub(super) fn encode(enc: &mut Encoder, p: &Preprocessed) -> Result<ImageEmbeddi
     let weights = &enc.weights;
     let w = |name: &str| weight(weights, name);
     let ps = c.patch_size as i32;
+    // Stage rows to read back (`taps`): copies kept as outputs, so nothing reuses them.
+    let tapping = taps.is_some();
+    let mut marks = Vec::new();
+    let mut mark = |name: String, t| {
+        if tapping {
+            marks.push((name, ctx.cont(t).as_output()));
+        }
+    };
 
     // Patches: both temporal kernels over the one frame, in merge order, plus the bias.
     let conv = |k| ctx.conv_2d(k, raw, [ps, ps], [0, 0], [1, 1]);
@@ -152,6 +172,7 @@ pub(super) fn encode(enc: &mut Encoder, p: &Preprocessed) -> Result<ImageEmbeddi
         py as i64,
     );
     let mut x = ctx.add(inp, w("v.patch_embd.bias")?);
+    mark("patches".into(), x);
 
     let rms = |t, name: &str| -> Result<Tensor<'_>, VisionError> {
         Ok(ctx.mul(ctx.rms_norm(t, c.eps), w(name)?))
@@ -216,10 +237,13 @@ pub(super) fn encode(enc: &mut Encoder, p: &Preprocessed) -> Result<ImageEmbeddi
         let kqv = ctx.permute(ctx.mul_mat(v, kq), [0, 2, 1, 3]);
         let attn = ctx.cont_2d(kqv, n_embd, n_pos);
         x = ctx.add(linear(&format!("{blk}.attn_out"), attn)?, x);
+        mark(format!("blk.{il}.attn"), x);
         let cur = rms(x, &format!("{blk}.ln2.weight"))?;
         x = ctx.add(x, ffn(&blk, ".ffn_", cur)?);
+        mark(format!("blk.{il}"), x);
     }
     let x = rms(x, "v.post_ln.weight")?;
+    mark("post_ln".into(), x);
 
     // The 2×2 convolution over each block's four patches: [n_embd, 2, 2, n / 4] as images
     // [2, 2, n_embd, n / 4].
@@ -237,14 +261,20 @@ pub(super) fn encode(enc: &mut Encoder, p: &Preprocessed) -> Result<ImageEmbeddi
     );
     let t = ctx.reshape_2d(t, t.ne()[2], n_tok);
     let t = ctx.add(t, w("mm.patch_merger.bias")?);
+    mark("downsample".into(), t);
 
     // The projector: linear, LayerNorm, exact GELU, then the clamped SwiGLU MLP.
     let t = ctx.mul_mat(w("mm.model.fc.weight")?, t);
+    mark("fc".into(), t);
     let t = ctx.add(
         ctx.mul(ctx.norm(t, MERGER_EPS), w("mm.post_norm.weight")?),
         w("mm.post_norm.bias")?,
     );
     let t = ctx.gelu_erf(t);
+    mark("ln_gelu".into(), t);
+    for &(_, t) in &marks {
+        graph.expand(t);
+    }
     let out = ffn("mm", ".", t)?.as_output();
     graph.expand(out);
 
@@ -260,6 +290,14 @@ pub(super) fn encode(enc: &mut Encoder, p: &Preprocessed) -> Result<ImageEmbeddi
         .compute(&graph)
         .map_err(|e| VisionError::Compute(e.to_string()))?;
     let data = out.to_f32();
+    let stages: Vec<_> = marks
+        .into_iter()
+        .map(|(name, t)| (name, t.to_f32()))
+        .collect();
+    if let Some(taps) = taps {
+        taps.extend(stages);
+        taps.push(("out".into(), data.clone()));
+    }
     enc.alloc = ctx.into_allocator();
     Ok(ImageEmbedding {
         nx: px / c.merge,
@@ -269,5 +307,102 @@ pub(super) fn encode(enc: &mut Encoder, p: &Preprocessed) -> Result<ImageEmbeddi
     })
 }
 
+/// Whether [`encode_tapped`]'s stage `name` has a row per patch (in merge order), not one per
+/// merged block.
 #[cfg(test)]
-mod tests;
+pub(crate) fn per_patch(name: &str) -> bool {
+    name == "patches" || name == "post_ln" || name.starts_with("blk.")
+}
+
+/// Rows of `width` in merge order (blocks of four patches) for a `gx × gy` grid, row by row
+/// (tests).
+#[cfg(test)]
+pub(crate) fn merge_to_rows(v: &[f32], gx: usize, gy: usize, width: usize) -> Vec<f32> {
+    let mut out = vec![0f32; v.len()];
+    for (m, row) in v.chunks(width).enumerate().take(gx * gy) {
+        let (blk, q) = (m / 4, m % 4);
+        let (by, bx) = (blk / (gx / 2), blk % (gx / 2));
+        let i = (by * 2 + q / 2) * gx + bx * 2 + q % 2;
+        out[i * width..][..width].copy_from_slice(row);
+    }
+    out
+}
+
+/// How far rows `got` are from rows `want` (`rows` of each; tests): the values that are not
+/// finite, the largest absolute difference, the largest `want` value, the smallest cosine of
+/// a row with its row (and which row), the mean cosine.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Diff {
+    pub(crate) bad: usize,
+    pub(crate) max_abs: f32,
+    pub(crate) scale: f32,
+    pub(crate) min_cos: f64,
+    pub(crate) worst: usize,
+    pub(crate) mean_cos: f64,
+}
+
+#[cfg(test)]
+impl Diff {
+    pub(crate) fn new(got: &[f32], want: &[f32], rows: usize) -> Self {
+        assert_eq!(got.len(), want.len());
+        let width = want.len() / rows.max(1);
+        let bad = got.iter().chain(want).filter(|v| !v.is_finite()).count();
+        let scale = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let max_abs = got
+            .iter()
+            .zip(want)
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        let (mut min_cos, mut worst, mut sum) = (f64::INFINITY, 0, 0.0);
+        for (r, (a, b)) in got.chunks(width).zip(want.chunks(width)).enumerate() {
+            let dot: f64 = a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| f64::from(*x) * f64::from(*y))
+                .sum();
+            let na: f64 = a.iter().map(|x| f64::from(*x) * f64::from(*x)).sum();
+            let nb: f64 = b.iter().map(|x| f64::from(*x) * f64::from(*x)).sum();
+            let cos = if na == 0.0 && nb == 0.0 {
+                1.0
+            } else {
+                dot / (na * nb).sqrt()
+            };
+            let cos = if cos.is_nan() { -2.0 } else { cos };
+            sum += cos;
+            if cos < min_cos {
+                (min_cos, worst) = (cos, r);
+            }
+        }
+        Self {
+            bad,
+            max_abs,
+            scale,
+            min_cos,
+            worst,
+            mean_cos: sum / rows.max(1) as f64,
+        }
+    }
+}
+
+#[cfg(test)]
+impl std::fmt::Display for Diff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "max abs {:.3e} (rel {:.3e} of {:.3e}), min cos {:.6} (row {}), mean cos {:.6}",
+            self.max_abs,
+            self.max_abs / self.scale.max(f32::MIN_POSITIVE),
+            self.scale,
+            self.min_cos,
+            self.worst,
+            self.mean_cos
+        )?;
+        if self.bad > 0 {
+            write!(f, ", {} values not finite", self.bad)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests;

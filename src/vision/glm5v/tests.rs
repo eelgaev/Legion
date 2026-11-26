@@ -43,15 +43,34 @@ fn layer_norm(x: &mut [f32], w: &[f32], b: &[f32], eps: f32) {
     }
 }
 
-/// `y = W x (+ b)` for a ggml matrix `[k, n]` (row `o` is `w[o * k..]`).
+/// `y = W x (+ b)` for a ggml matrix `[k, n]` (row `o` is `w[o * k..]`), summed in F64; a big
+/// one (a checkpoint's) on all cores.
 fn matvec(w: &[f32], b: Option<&[f32]>, x: &[f32], n: usize) -> Vec<f32> {
     let k = x.len();
-    (0..n)
-        .map(|o| {
-            let y: f32 = w[o * k..][..k].iter().zip(x).map(|(a, b)| a * b).sum();
-            y + b.map_or(0.0, |b| b[o])
-        })
-        .collect()
+    let row = move |o: usize| {
+        let y: f64 = w[o * k..][..k]
+            .iter()
+            .zip(x)
+            .map(|(a, b)| f64::from(*a) * f64::from(*b))
+            .sum();
+        (y + b.map_or(0.0, |b| f64::from(b[o]))) as f32
+    };
+    if n * k < 1 << 20 {
+        return (0..n).map(row).collect();
+    }
+    let threads = std::thread::available_parallelism().map_or(1, |t| t.get());
+    let per = n.div_ceil(threads);
+    let mut y = vec![0f32; n];
+    std::thread::scope(|s| {
+        for (ci, chunk) in y.chunks_mut(per).enumerate() {
+            s.spawn(move || {
+                for (j, v) in chunk.iter_mut().enumerate() {
+                    *v = row(ci * per + j);
+                }
+            });
+        }
+    });
+    y
 }
 
 /// erf to about 1e-7 (Abramowitz and Stegun 7.1.26).
@@ -90,31 +109,47 @@ fn rope(x: &mut [f32], r: i32, c: i32) {
 }
 
 /// The SwiGLU MLP of a block or the projector: `prefix{gate,up,down}`, biases where present.
-fn mlp(enc: &Encoder, prefix: &str, x: &[f32], limit: f32) -> Vec<f32> {
-    let get = |s: &str| enc.weight(&format!("{prefix}{s}")).map(|t| t.to_f32());
-    let wg = get("gate.weight").unwrap();
-    let wd = get("down.weight").unwrap();
-    let ff = wg.len() / x.len();
-    let n = wd.len() / ff;
-    let g = matvec(&wg, get("gate.bias").ok().as_deref(), x, ff);
-    let u = matvec(
-        &get("up.weight").unwrap(),
-        get("up.bias").ok().as_deref(),
-        x,
-        ff,
-    );
-    let h: Vec<f32> = g
-        .iter()
-        .zip(&u)
-        .map(|(&g, &u)| swiglu_clamp(g, u, limit))
-        .collect();
-    matvec(&wd, get("down.bias").ok().as_deref(), &h, n)
+struct Mlp {
+    w: [Vec<f32>; 3],
+    b: [Option<Vec<f32>>; 3],
+}
+
+impl Mlp {
+    fn load(enc: &Encoder, prefix: &str) -> Self {
+        let get = |s: &str| enc.weight(&format!("{prefix}{s}")).map(|t| t.to_f32());
+        let [w, b] =
+            [".weight", ".bias"].map(|p| ["gate", "up", "down"].map(|m| get(&format!("{m}{p}"))));
+        Self {
+            w: w.map(Result::unwrap),
+            b: b.map(Result::ok),
+        }
+    }
+
+    fn apply(&self, x: &[f32], limit: f32) -> Vec<f32> {
+        let ff = self.w[0].len() / x.len();
+        let n = self.w[2].len() / ff;
+        let g = matvec(&self.w[0], self.b[0].as_deref(), x, ff);
+        let u = matvec(&self.w[1], self.b[1].as_deref(), x, ff);
+        let h: Vec<f32> = g
+            .iter()
+            .zip(&u)
+            .map(|(&g, &u)| swiglu_clamp(g, u, limit))
+            .collect();
+        matvec(&self.w[2], self.b[2].as_deref(), &h, n)
+    }
 }
 
 /// The tower written out loop by loop from the module docs, patches row by row: the oracle of
 /// the graph's layout (the two kernels, which quarter rotates by what, the 2×2 convolution's
 /// order, the output's order).
 fn reference(enc: &Encoder, p: &Preprocessed) -> Vec<f32> {
+    reference_stages(enc, p).pop().unwrap().1
+}
+
+/// [`reference`] and the rows after each stage, named as [`encode_tapped`]'s; patches row by
+/// row (not in merge order).
+pub(crate) fn reference_stages(enc: &Encoder, p: &Preprocessed) -> Vec<(String, Vec<f32>)> {
+    let mut stages = Vec::new();
     let c = enc.config().clone();
     let (gx, gy) = (p.grid_w as usize, p.grid_h as usize);
     let (e, ps) = (c.n_embd, c.patch_size);
@@ -143,12 +178,14 @@ fn reference(enc: &Encoder, p: &Preprocessed) -> Vec<f32> {
             x[i * e + o] = acc + pb[o];
         }
     }
+    stages.push(("patches".to_string(), x.clone()));
     for il in 0..c.n_layer {
         let wv = |s: &str| values(enc, &format!("v.blk.{il}.{s}"));
         let (ln1, ln2) = (wv("ln1.weight"), wv("ln2.weight"));
         let (qn, kn) = (wv("attn_q_norm.weight"), wv("attn_k_norm.weight"));
         let (wqkv, bqkv) = (wv("attn_qkv.weight"), wv("attn_qkv.bias"));
         let (wo, bo) = (wv("attn_out.weight"), wv("attn_out.bias"));
+        let ffn = Mlp::load(enc, &format!("v.blk.{il}.ffn_"));
         let mut qkv = vec![0f32; n * 3 * e];
         for i in 0..n {
             let mut h = x[i * e..][..e].to_vec();
@@ -190,18 +227,23 @@ fn reference(enc: &Encoder, p: &Preprocessed) -> Vec<f32> {
             for (t, val) in o.iter().enumerate() {
                 x[i * e + t] += val;
             }
+        }
+        stages.push((format!("blk.{il}.attn"), x.clone()));
+        for i in 0..n {
             let mut h = x[i * e..][..e].to_vec();
             rms(&mut h, &ln2, c.eps);
-            let o = mlp(enc, &format!("v.blk.{il}.ffn_"), &h, c.swiglu_limit);
+            let o = ffn.apply(&h, c.swiglu_limit);
             for (t, val) in o.iter().enumerate() {
                 x[i * e + t] += val;
             }
         }
+        stages.push((format!("blk.{il}"), x.clone()));
     }
     let post = values(enc, "v.post_ln.weight");
     for i in 0..n {
         rms(&mut x[i * e..][..e], &post, c.eps);
     }
+    stages.push(("post_ln".to_string(), x.clone()));
     // The merger: each 2×2 block's four patches through the convolution ([kw, kh, e, o]: kw
     // is the patch's column in the block, kh its row), then the projector.
     let (conv, cb) = (
@@ -214,8 +256,9 @@ fn reference(enc: &Encoder, p: &Preprocessed) -> Vec<f32> {
         values(enc, "mm.post_norm.weight"),
         values(enc, "mm.post_norm.bias"),
     );
+    let proj = Mlp::load(enc, "mm.");
     let (ox, oy) = (gx / 2, gy / 2);
-    let mut out = Vec::with_capacity(ox * oy * c.n_out);
+    let [mut down, mut fcs, mut lns, mut out] = [(); 4].map(|_| Vec::new());
     for t in 0..ox * oy {
         let (tx, ty) = (t % ox, t / ox);
         let mut m = cb.clone();
@@ -230,13 +273,24 @@ fn reference(enc: &Encoder, p: &Preprocessed) -> Vec<f32> {
             }
         }
         let mut h = matvec(&fc, None, &m, mw);
+        down.extend(m);
+        fcs.extend_from_slice(&h);
         layer_norm(&mut h, &nw, &nb, MERGER_EPS);
         for v in h.iter_mut() {
             *v = 0.5 * *v * (1.0 + erf(*v / std::f32::consts::SQRT_2));
         }
-        out.extend(mlp(enc, "mm.", &h, c.swiglu_limit));
+        lns.extend_from_slice(&h);
+        out.extend(proj.apply(&h, c.swiglu_limit));
     }
-    out
+    for (name, v) in [
+        ("downsample", down),
+        ("fc", fcs),
+        ("ln_gelu", lns),
+        ("out", out),
+    ] {
+        stages.push((name.to_string(), v));
+    }
+    stages
 }
 
 fn assert_close(got: &[f32], want: &[f32], rel: f32) {
@@ -327,6 +381,74 @@ fn matches_the_reference_loops() {
     }
 }
 
+/// Small images on a checkpoint's tower (`LEGION_TEST_VISION_HF=<dir>`, its real weights; at
+/// most 80 patches, as the loops are slow): the CPU tower's rows after every stage against
+/// [`reference_stages`]', printed stage by stage, so a gap shows where it starts. The CPU tower
+/// rounds the matrices' inputs to F16 and the loops do not, so they are close, not equal.
+#[test]
+#[ignore = "needs a checkpoint, slow"]
+fn cpu_tower_matches_the_reference_on_a_checkpoint() {
+    let Some(hf) = std::env::var_os("LEGION_TEST_VISION_HF") else {
+        return;
+    };
+    let g = crate::hf::open_vision(std::path::Path::new(&hf))
+        .unwrap()
+        .expect("a vision tower");
+    let mut cpu = Backend::cpu().unwrap();
+    cpu.set_threads(8);
+    let mut enc = Encoder::from_gguf(&g, cpu).unwrap();
+    let mut failed = Vec::new();
+    for (label, img) in checkpoint_images() {
+        let p = crate::vision::preprocess(enc.hparams(), &img).unwrap();
+        let (gx, gy) = (p.grid_w as usize, p.grid_h as usize);
+        let (_, taps) = enc.encode_stages(&p).unwrap();
+        let t = std::time::Instant::now();
+        let want = reference_stages(&enc, &p);
+        println!(
+            "{label}: {} x {} px, {gx} x {gy} patches, loops {:.1} s",
+            p.width,
+            p.height,
+            t.elapsed().as_secs_f64()
+        );
+        let n = gx * gy;
+        for ((name, got), (wname, want)) in taps.iter().zip(&want) {
+            assert_eq!(name, wname);
+            let (got, rows) = if per_patch(name) {
+                (merge_to_rows(got, gx, gy, got.len() / n), n)
+            } else {
+                (got.clone(), n / 4)
+            };
+            let d = Diff::new(&got, want, rows);
+            println!("  {name:>12}: {d}");
+            let close = d.bad == 0 && d.min_cos > 0.99;
+            if name == "out" && !close {
+                failed.push(format!("{label}: {d}"));
+            }
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "the CPU tower is not the loops': {failed:?}"
+    );
+}
+
+/// The small images of [`cpu_tower_matches_the_reference_on_a_checkpoint`] (and the GPU's
+/// stage test): smooth colours on a 140 × 112 canvas (20 tokens), and sharp stripes grown to
+/// the 16-token floor.
+pub(crate) fn checkpoint_images() -> Vec<(&'static str, Vec<u8>)> {
+    let smooth = tiny::bmp(140, 112, |x, y| {
+        [
+            (x * 255 / 139) as u8,
+            (y * 255 / 111) as u8,
+            (128 + (x as i32 - y as i32) / 2) as u8,
+        ]
+    });
+    vec![
+        ("smooth 140x112", smooth),
+        ("stripes 56x56", gradient(56, 56)),
+    ]
+}
+
 /// GLM-5.3-Flash's canvases (factor 28, 16 to 8,000 tokens): aligned up; a small image grows
 /// to the fewest tokens, a big one shrinks to the most (llama.cpp's
 /// `mtmd_image_preprocessor_glm5v`).
@@ -354,7 +476,7 @@ fn canvas_sizes() {
     assert!(glm5_canvas(0, 5, f, min, max).is_err());
 }
 
-/// A fixed image on the tiny tower (factor 12, 576 to 9,216 pixels): a 30 × 18 white image keeps
+/// A fixed image on the tiny tower (factor 12, 576 to 9,216 pixels): a 32 × 20 white image keeps
 /// its size at the top left of a 36 × 24 canvas, black (normalized) on the right and below; a
 /// 9 × 5 one, under the floor, grows to 36 × 20 on the same canvas.
 #[test]
@@ -362,7 +484,7 @@ fn places_the_image_top_left_on_a_black_canvas() {
     let dir = tempfile::tempdir().unwrap();
     let enc = encoder(dir.path());
     let hp = enc.hparams();
-    for ((w, h), (rw, rh)) in [((30, 18), (30, 18)), ((9, 5), (36, 20))] {
+    for ((w, h), (rw, rh)) in [((32, 20), (32, 20)), ((9, 5), (36, 20))] {
         let white = tiny::bmp(w, h, |_, _| [255, 255, 255]);
         let p = crate::vision::preprocess(hp, &white).unwrap();
         assert_eq!((p.width, p.height), (36, 24), "{w}x{h}");

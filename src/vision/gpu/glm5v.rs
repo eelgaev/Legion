@@ -24,6 +24,7 @@ use super::{
     cudaSetDevice, cudaStreamCreateWithFlags, cudaStreamDestroy, cudaStreamSynchronize, gemm_on,
     launch, ok, sm_count, values, vector,
 };
+use crate::cpu::gpu_exact::f16_to_f32;
 use crate::vision::glm5v::{MERGER_EPS, ROPE_THETA};
 use crate::vision::qwen3vl::{Encoder, EncoderConfig, ImageEmbedding};
 use crate::vision::share::{Caps, Turns};
@@ -397,6 +398,55 @@ impl GlmGpu {
         p: &Preprocessed,
         alone: bool,
     ) -> Result<ImageEmbedding, VisionError> {
+        self.encode_tapped(p, alone, None)
+    }
+
+    /// `count` values (F16 or F32) at `src` on the device, once the stream gets there.
+    fn read_back(
+        &self,
+        src: *const c_void,
+        count: usize,
+        half: bool,
+    ) -> Result<Vec<f32>, VisionError> {
+        let size = if half { 2 } else { 4 };
+        let mut bytes = vec![0u8; count * size];
+        // SAFETY: `count` values at `src` in the scratch, into a host buffer of that size; the
+        // stream is drained before the buffer is read.
+        unsafe {
+            ok(
+                cudaMemcpyAsync(
+                    bytes.as_mut_ptr().cast(),
+                    src,
+                    bytes.len(),
+                    D2H,
+                    self.stream,
+                ),
+                "cudaMemcpyAsync",
+            )?;
+            ok(cudaStreamSynchronize(self.stream), "cudaStreamSynchronize")?;
+        }
+        Ok(if half {
+            bytes
+                .chunks_exact(2)
+                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect()
+        } else {
+            bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        })
+    }
+
+    /// [`Self::encode`], and with `taps` each stage's rows as the CPU tower names them
+    /// ([`crate::vision::glm5v`]'s `encode_tapped`), for tests: the stream is drained after
+    /// each one.
+    pub(super) fn encode_tapped(
+        &mut self,
+        p: &Preprocessed,
+        alone: bool,
+        mut taps: Option<&mut Vec<(String, Vec<f32>)>>,
+    ) -> Result<ImageEmbedding, VisionError> {
         let c = self.cfg.clone();
         let (gx, gy) = (p.grid_w as usize, p.grid_h as usize);
         if gx % 2 != 0 || gy % 2 != 0 || gx == 0 || gy == 0 {
@@ -523,6 +573,12 @@ impl GlmGpu {
                 ..Op::default()
             };
             let null = std::ptr::null::<f32>();
+            let mut tap = |name: String, src: *mut c_void, count: usize, half: bool| match taps
+                .as_deref_mut()
+            {
+                Some(t) => self.read_back(src, count, half).map(|v| t.push((name, v))),
+                None => Ok(()),
+            };
 
             // Patches (merge order, rows of ld), then their products with the summed kernels
             // and the bias.
@@ -534,9 +590,10 @@ impl GlmGpu {
             };
             self.launch(Kernel::Im2col, n, 256, &mut o)?;
             self.linear(&self.patch, bigp, n, x.cast(), null, 0)?;
+            tap("patches".into(), x.cast::<c_void>(), n * e, false)?;
 
             let scale = 1.0 / (d as f32).sqrt();
-            for blk in &self.blocks {
+            for (il, blk) in self.blocks.iter().enumerate() {
                 let mut o = Op {
                     x,
                     w: blk.ln1.0.cast(),
@@ -619,6 +676,7 @@ impl GlmGpu {
                     q0 += cm;
                 }
                 self.linear(&blk.out, h.cast(), n, x.cast(), x, 0)?;
+                tap(format!("blk.{il}.attn"), x.cast::<c_void>(), n * e, false)?;
                 let mut o = Op {
                     x,
                     w: blk.ln2.0.cast(),
@@ -635,6 +693,7 @@ impl GlmGpu {
                 };
                 self.rows(Kernel::SwigluClamp, n, &mut o)?;
                 self.linear(&blk.down, ffp, n, x.cast(), x, 0)?;
+                tap(format!("blk.{il}"), x.cast::<c_void>(), n * e, false)?;
             }
             // The merger: the final norm; each block's four normed rows (merge order) are one
             // row of 4 e for the convolution.
@@ -645,8 +704,11 @@ impl GlmGpu {
                 ..geo
             };
             self.rows(Kernel::Rms, n, &mut o)?;
+            tap("post_ln".into(), h.cast::<c_void>(), n * e, true)?;
             self.linear(&self.merger, h.cast(), n_tok, ffp, null, OUT_F16)?;
+            tap("downsample".into(), ffp, n_tok * self.merger.n, true)?;
             self.linear(&self.fc, ffp, n_tok, bigp, null, 0)?;
+            tap("fc".into(), bigp, n_tok * self.fc.n, false)?;
             let mut o = Op {
                 x: bigp.cast(),
                 w: self.post_norm_w.0.cast(),
@@ -658,6 +720,12 @@ impl GlmGpu {
                 ..geo
             };
             self.rows(Kernel::LnGelu, n_tok, &mut o)?;
+            tap(
+                "ln_gelu".into(),
+                h.cast::<c_void>(),
+                n_tok * self.fc.n,
+                true,
+            )?;
             self.linear(&self.mm_gate_up, h.cast(), n_tok, bigp, null, OUT_F16)?;
             let mut o = Op {
                 h1: bigp.cast(),
@@ -689,6 +757,9 @@ impl GlmGpu {
         unsafe {
             std::ptr::copy_nonoverlapping(pin_out.cast::<f32>(), data.as_mut_ptr(), data.len())
         };
+        if let Some(t) = taps {
+            t.push(("out".into(), data.clone()));
+        }
         Ok(ImageEmbedding {
             nx: gx / 2,
             ny: gy / 2,

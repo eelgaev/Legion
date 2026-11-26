@@ -234,6 +234,23 @@ impl Encoder {
         self.w(name)
     }
 
+    /// [`Self::encode`] and each stage's rows (GLM-5.3-Flash's tower only, for tests: where
+    /// the GPU tower parts from this one).
+    #[cfg(test)]
+    pub(crate) fn encode_stages(
+        &mut self,
+        p: &Preprocessed,
+    ) -> Result<(ImageEmbedding, Vec<(String, Vec<f32>)>), VisionError> {
+        if self.hp.projector != super::Projector::Glm5v {
+            return Err(VisionError::Unsupported(
+                "stage rows: GLM-5.3-Flash's tower only".into(),
+            ));
+        }
+        let mut taps = Vec::new();
+        let e = super::glm5v::encode_tapped(self, p, Some(&mut taps))?;
+        Ok((e, taps))
+    }
+
     /// The tower's output for `p` (see the module docs).
     pub fn encode(&mut self, p: &Preprocessed) -> Result<ImageEmbedding, VisionError> {
         match self.hp.projector {
