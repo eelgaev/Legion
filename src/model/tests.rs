@@ -73,7 +73,7 @@ fn unknown_architectures_are_named_in_the_error() {
     let err = super::parse_hparams(&empty_gguf(), "llama").unwrap_err();
     assert_eq!(
         err.to_string(),
-        "architecture `llama` is not qwen35, qwen35moe, qwen4exp, nemotron_h, nemotron_h_moe, gemma4, glm5-next, deepseek41 or muse-glimmer"
+        "architecture `llama` is not qwen35, qwen35moe, qwen4exp, nemotron_h, nemotron_h_moe, gemma4, glm5-next, deepseek41, inkling2_loop, inkling2 or muse-glimmer"
     );
 }
 

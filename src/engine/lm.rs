@@ -6420,6 +6420,14 @@ impl LmEngine {
                 if let Some(on) = req.response_format.as_ref().map(|_| false).or(req.thinking) {
                     kwargs.insert("enable_thinking".into(), Value::Bool(on));
                 }
+                // Inkling-2's template reads `reasoning_effort` itself (the client's kwarg
+                // wins); others never see it.
+                let effort = kwargs.remove(super::EFFORT_KWARG);
+                if self.chat_format.framed()
+                    && let Some(effort) = effort
+                {
+                    kwargs.entry("reasoning_effort").or_insert(effort);
+                }
                 // Qwen templates only accept a system message first. Later ones (Claude Code
                 // sends system turns mid-conversation) become user turns at their position,
                 // which keeps the conversation's earlier prefix (and its cache) unchanged.
@@ -9731,10 +9739,15 @@ impl<'t> Active<'t> {
             reasoning: job
                 .reasoning
                 .map(|inside| chat_format.reasoning_parser(inside)),
-            tools: (job.grammar.is_none() && !job.tools.is_empty())
+            tools: (job.grammar.is_none() && (!job.tools.is_empty() || chat_format.framed()))
                 .then(|| chat_format.tool_parser(&job.tools)),
             stop: StopMatcher::new(job.stop.clone()),
             logprobs: job.sampling.logprobs,
+            // The markup only goes where a parser takes it out again.
+            shown: match job.grammar {
+                None => chat_format.shown().to_vec(),
+                Some(_) => Vec::new(),
+            },
             out: job.out.clone(),
         };
         let (text, live) = outbox.text(tokenizer, id, spec);

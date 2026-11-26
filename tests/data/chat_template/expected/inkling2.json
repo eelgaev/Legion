@@ -1,0 +1,74 @@
+{
+  "plain": {
+    "output": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hello there!<|end_message|>"
+  },
+  "plain_no_generation_prompt": {
+    "output": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hello there!<|end_message|>"
+  },
+  "system": {
+    "output": "<|message_system|><|content_text|>You are a helpful assistant.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+  },
+  "system_unicode_whitespace": {
+    "output": "<|message_system|><|content_text|>Réponds en français, s'il te plaît 日本語\n<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>  padded  \n<|end_message|>"
+  },
+  "multi_turn_reasoning": {
+    "output": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 2+2?<|end_message|><|message_model|><|content_thinking|>Simple arithmetic.<|end_message|><|message_model|><|content_text|>4.<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>And times 3?<|end_message|><|message_model|><|content_thinking|>4*3=12.<|end_message|><|message_model|><|content_text|>12.<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>Thanks, and plus 1?<|end_message|>"
+  },
+  "multi_turn_reasoning_system": {
+    "output": "<|message_system|><|content_text|>Be brief.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 2+2?<|end_message|><|message_model|><|content_thinking|>Simple arithmetic.<|end_message|><|message_model|><|content_text|>4.<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>And times 3?<|end_message|><|message_model|><|content_thinking|>4*3=12.<|end_message|><|message_model|><|content_text|>12.<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>Thanks, and plus 1?<|end_message|>"
+  },
+  "multi_turn_final_assistant": {
+    "output": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 2+2?<|end_message|><|message_model|><|content_thinking|>Simple arithmetic.<|end_message|><|message_model|><|content_text|>4.<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>And times 3?<|end_message|><|message_model|><|content_thinking|>4*3=12.<|end_message|><|message_model|><|content_text|>12.<|end_message|><|content_model_end_sampling|>"
+  },
+  "enable_thinking_false": {
+    "output": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+  },
+  "enable_thinking_true": {
+    "output": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+  },
+  "enable_thinking_true_system": {
+    "output": "<|message_system|><|content_text|>Sys.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+  },
+  "tools": {
+    "output": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get the current weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City name, e.g. Zürich\",\"type\":\"string\"},\"unit\":{\"enum\":[\"celsius\",\"fahrenheit\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Zürich?<|end_message|>"
+  },
+  "tools_system": {
+    "output": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get the current weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City name, e.g. Zürich\",\"type\":\"string\"},\"unit\":{\"enum\":[\"celsius\",\"fahrenheit\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"Search the web\",\"name\":\"search\",\"parameters\":{\"properties\":{\"limit\":{\"description\":\"Max results\",\"type\":\"integer\"},\"query\":{\"description\":\"Search query\",\"type\":\"string\"},\"tags\":{\"description\":\"Filters\",\"items\":{\"type\":\"string\"},\"type\":\"array\"}},\"required\":[\"query\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Use tools.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Zürich?<|end_message|>"
+  },
+  "tool_call_result": {
+    "output": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get the current weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City name, e.g. Zürich\",\"type\":\"string\"},\"unit\":{\"enum\":[\"celsius\",\"fahrenheit\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Zürich?<|end_message|><|message_model|><|content_thinking|>I should call the weather tool.<|end_message|><|message_model|><|content_text|>Let me check.<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Zürich\",\"unit\":\"celsius\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>{\"temp\": 18, \"sky\": \"clear\"}<|end_message|>"
+  },
+  "tool_call_result_thinking_false": {
+    "output": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get the current weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City name, e.g. Zürich\",\"type\":\"string\"},\"unit\":{\"enum\":[\"celsius\",\"fahrenheit\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Zürich?<|end_message|><|message_model|><|content_thinking|>I should call the weather tool.<|end_message|><|message_model|><|content_text|>Let me check.<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Zürich\",\"unit\":\"celsius\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>{\"temp\": 18, \"sky\": \"clear\"}<|end_message|>"
+  },
+  "tool_call_result_thinking_true": {
+    "output": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get the current weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City name, e.g. Zürich\",\"type\":\"string\"},\"unit\":{\"enum\":[\"celsius\",\"fahrenheit\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Zürich?<|end_message|><|message_model|><|content_thinking|>I should call the weather tool.<|end_message|><|message_model|><|content_text|>Let me check.<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Zürich\",\"unit\":\"celsius\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>{\"temp\": 18, \"sky\": \"clear\"}<|end_message|>"
+  },
+  "tool_call_continued": {
+    "output": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get the current weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City name, e.g. Zürich\",\"type\":\"string\"},\"unit\":{\"enum\":[\"celsius\",\"fahrenheit\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Zürich?<|end_message|><|message_model|><|content_thinking|>I should call the weather tool.<|end_message|><|message_model|><|content_text|>Let me check.<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Zürich\",\"unit\":\"celsius\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>{\"temp\": 18, \"sky\": \"clear\"}<|end_message|><|message_model|><|content_text|>It is 18 C and clear.<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>Thanks!<|end_message|>"
+  },
+  "parallel_tool_calls": {
+    "output": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get the current weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City name, e.g. Zürich\",\"type\":\"string\"},\"unit\":{\"enum\":[\"celsius\",\"fahrenheit\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"Search the web\",\"name\":\"search\",\"parameters\":{\"properties\":{\"limit\":{\"description\":\"Max results\",\"type\":\"integer\"},\"query\":{\"description\":\"Search query\",\"type\":\"string\"},\"tags\":{\"description\":\"Filters\",\"items\":{\"type\":\"string\"},\"type\":\"array\"}},\"required\":[\"query\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Use tools.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Paris and news about it?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|><|message_model|>search<|content_invoke_tool_json|>{\"name\":\"search\",\"args\":{\"limit\":3,\"opts\":{\"x\":[1,2.5,null,true]},\"query\":\"Paris news\",\"tags\":[\"a\",\"b\"]}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>sunny, 21C<|end_message|><|message_tool|>search<|content_text|>Nothing special today.<|end_message|>"
+  },
+  "parallel_tool_calls_no_generation_prompt": {
+    "output": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get the current weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City name, e.g. Zürich\",\"type\":\"string\"},\"unit\":{\"enum\":[\"celsius\",\"fahrenheit\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"Search the web\",\"name\":\"search\",\"parameters\":{\"properties\":{\"limit\":{\"description\":\"Max results\",\"type\":\"integer\"},\"query\":{\"description\":\"Search query\",\"type\":\"string\"},\"tags\":{\"description\":\"Filters\",\"items\":{\"type\":\"string\"},\"type\":\"array\"}},\"required\":[\"query\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Paris and news about it?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|><|message_model|>search<|content_invoke_tool_json|>{\"name\":\"search\",\"args\":{\"limit\":3,\"opts\":{\"x\":[1,2.5,null,true]},\"query\":\"Paris news\",\"tags\":[\"a\",\"b\"]}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>sunny, 21C<|end_message|><|message_tool|>search<|content_text|>Nothing special today.<|end_message|>"
+  },
+  "tools_unsorted_keys": {
+    "output": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Book a flight\",\"name\":\"book_flight\",\"parameters\":{\"properties\":{\"bags\":{\"description\":\"Checked bags\",\"type\":\"integer\"},\"date\":{\"description\":\"ISO date\",\"type\":\"string\"},\"from\":{\"description\":\"Origin\",\"type\":\"string\"},\"to\":{\"description\":\"Destination\",\"type\":\"string\"}},\"required\":[\"to\",\"from\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Book me to Oslo from Zürich<|end_message|>"
+  },
+  "tool_call_unsorted_keys": {
+    "output": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Book a flight\",\"name\":\"book_flight\",\"parameters\":{\"properties\":{\"bags\":{\"description\":\"Checked bags\",\"type\":\"integer\"},\"date\":{\"description\":\"ISO date\",\"type\":\"string\"},\"from\":{\"description\":\"Origin\",\"type\":\"string\"},\"to\":{\"description\":\"Destination\",\"type\":\"string\"}},\"required\":[\"to\",\"from\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Book me to Oslo from Zürich<|end_message|><|message_model|>book_flight<|content_invoke_tool_json|>{\"name\":\"book_flight\",\"args\":{\"bags\":2,\"date\":\"2026-11-02\",\"from\":\"Zürich\",\"to\":\"Oslo\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>book_flight<|content_text|>{\"status\": \"booked\"}<|end_message|>"
+  },
+  "error_reasoning_effort": {
+    "error": "Unknown reasoning_effort: huge"
+  },
+  "reasoning_effort_none": {
+    "output": "<|message_system|><|content_text|>Be brief.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+  },
+  "reasoning_effort_low_multi": {
+    "output": "<|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>What is 2+2?<|end_message|><|message_model|><|content_thinking|>Simple arithmetic.<|end_message|><|message_model|><|content_text|>4.<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>And times 3?<|end_message|><|message_model|><|content_thinking|>4*3=12.<|end_message|><|message_model|><|content_text|>12.<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>Thanks, and plus 1?<|end_message|>"
+  },
+  "reasoning_effort_number": {
+    "output": "<|message_system|><|content_text|>Thinking effort level: 0.5<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+  }
+}

@@ -9,8 +9,8 @@ use crate::api::{anthropic, openai};
 use crate::engine::queue::Scheduling;
 use crate::engine::sampling_defaults::SamplingDefaults;
 use crate::engine::{
-    GenerateRequest, ImageInput, MAX_LOGPROBS, Message, Prompt, Role, SamplingParams, Tool,
-    ToolCall,
+    EFFORT_KWARG, GenerateRequest, ImageInput, MAX_LOGPROBS, Message, Prompt, Role, SamplingParams,
+    Tool, ToolCall,
 };
 
 /// The penalty parameters of a request; `None` keeps the engine default.
@@ -301,7 +301,14 @@ pub fn chat_request(
             strict: t.function.strict == Some(true),
         })
         .collect();
-    let template_kwargs = req.chat_template_kwargs.clone().unwrap_or_default();
+    let mut template_kwargs = req.chat_template_kwargs.clone().unwrap_or_default();
+    // The effort as sent, for the templates that read it themselves (no default here).
+    if let Some(effort) = &req.reasoning_effort {
+        template_kwargs.insert(
+            EFFORT_KWARG.into(),
+            serde_json::Value::String(effort.clone()),
+        );
+    }
     // `chat_template_kwargs.enable_thinking` wins over `reasoning_effort`.
     let thinking = match template_kwargs.get("enable_thinking") {
         Some(serde_json::Value::Bool(b)) => Some(*b),
@@ -1278,6 +1285,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(r.thinking, Some(true));
+        assert_eq!(r.template_kwargs[crate::engine::EFFORT_KWARG], "high");
         assert!(chat_with(json!({})).unwrap().thinking.is_none());
         assert!(chat_with(json!({})).unwrap().template_kwargs.is_empty());
     }

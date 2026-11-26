@@ -3,7 +3,9 @@
 
 use crate::engine::Tool;
 use crate::engine::reasoning::ReasoningParser;
-use crate::engine::tool_parser::{Gemma4Parser, GlmParser, Qwen3CoderParser, ToolParser};
+use crate::engine::tool_parser::{
+    Gemma4Parser, GlmParser, InklingParser, Qwen3CoderParser, ToolParser, inkling,
+};
 use crate::tokenizer::Tokenizer;
 
 #[derive(Clone)]
@@ -15,6 +17,12 @@ pub(super) struct ChatFormat {
     /// The `<tool_call>` and `</tool_call>` tokens of a vocabulary whose tool calls are in the
     /// Qwen3-Coder format, which strict tools constrain; `None`: strict is not enforced.
     strict_tools: Option<(u32, u32)>,
+    /// Control tokens the detokenizer prints so the parsers can read them (Inkling-2's message
+    /// markup); empty for the other formats.
+    shown: Vec<u32>,
+    /// Every reply is framed in markup the tool parser takes out, so it runs without tools
+    /// too (Inkling-2).
+    framed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -29,6 +37,29 @@ enum PromptReasoning {
 
 impl ChatFormat {
     pub(super) fn detect(tok: &Tokenizer) -> Self {
+        // Inkling-2: `<|message_model|><|content_thinking|>...<|end_message|>` then
+        // `<|message_model|><|content_text|>...<|end_message|>` or a JSON tool call, all of
+        // it control tokens.
+        let shown: Vec<u32> = inkling::MARKUP
+            .iter()
+            .map(|t| tok.token_id(t))
+            .collect::<Option<_>>()
+            .unwrap_or_default();
+        if !shown.is_empty() {
+            return Self {
+                reasoning: (inkling::THINKING, inkling::END),
+                // The prompt may hold earlier turns' closed thinking, never an open one.
+                prompt_reasoning: PromptReasoning::FromPrompt,
+                tools: |tools| Box::new(InklingParser::new(tools)),
+                extra_stop_tokens: ["<|endoftext|>"]
+                    .into_iter()
+                    .filter_map(|t| tok.token_id(t))
+                    .collect(),
+                strict_tools: None,
+                shown,
+                framed: true,
+            };
+        }
         let gemma4 = ["<|channel>", "<channel|>", "<|tool_call>"]
             .iter()
             .all(|t| tok.token_id(t).is_some());
@@ -88,7 +119,20 @@ impl ChatFormat {
             tools,
             extra_stop_tokens,
             strict_tools,
+            shown: Vec::new(),
+            framed: false,
         }
+    }
+
+    /// Control tokens the detokenizer must print for this format's parsers.
+    pub(super) fn shown(&self) -> &[u32] {
+        &self.shown
+    }
+
+    /// Whether the tool parser runs on every reply, tools or not (it also takes out the
+    /// reply's framing).
+    pub(super) fn framed(&self) -> bool {
+        self.framed
     }
 
     /// The tokens that open and close a tool call, when strict tools are enforced for this

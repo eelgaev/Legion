@@ -17,6 +17,7 @@ Templates (`templates/`):
 | `gemma4.jinja` | `chat_template.jinja` of `google/gemma-4-31B-it` |
 | `nemotron35.jinja` | `chat_template.jinja` of `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4` (the same text as in llama.cpp's GGUF of it) |
 | `deepseek41.jinja` | `tokenizer.chat_template` of the DeepSeek-V4.1-Flash-1017 GSQ-RCO GGUF (the same text as the `chat_template.jinja` beside it; Unsloth's DeepSeek-V4.1 template, adapted) |
+| `inkling2.jinja` | `chat_template.jinja` of `thinkingmachines/Inkling-2-Mini` (Apache-2.0) |
 
 Only template text is committed, never model files. `bos_token` / `eos_token` per template are listed in
 `generate.py` and mirrored in the test.

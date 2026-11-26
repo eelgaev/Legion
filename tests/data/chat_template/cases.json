@@ -20,7 +20,8 @@
       "gemma3",
       "gemma4",
       "nemotron35",
-      "deepseek41"
+      "deepseek41",
+      "inkling2"
     ]
   },
   {
@@ -44,7 +45,8 @@
       "gemma3",
       "gemma4",
       "nemotron35",
-      "deepseek41"
+      "deepseek41",
+      "inkling2"
     ]
   },
   {
@@ -68,7 +70,8 @@
       "gemma3",
       "gemma4",
       "nemotron35",
-      "deepseek41"
+      "deepseek41",
+      "inkling2"
     ]
   },
   {
@@ -92,7 +95,8 @@
       "gemma3",
       "gemma4",
       "nemotron35",
-      "deepseek41"
+      "deepseek41",
+      "inkling2"
     ]
   },
   {
@@ -144,7 +148,8 @@
       "gemma3",
       "gemma4",
       "nemotron35",
-      "deepseek41"
+      "deepseek41",
+      "inkling2"
     ]
   },
   {
@@ -196,7 +201,8 @@
       "gemma3",
       "gemma4",
       "nemotron35",
-      "deepseek41"
+      "deepseek41",
+      "inkling2"
     ]
   },
   {
@@ -241,7 +247,8 @@
       "gemma3",
       "gemma4",
       "nemotron35",
-      "deepseek41"
+      "deepseek41",
+      "inkling2"
     ]
   },
   {
@@ -267,7 +274,8 @@
       "gemma3",
       "gemma4",
       "nemotron35",
-      "deepseek41"
+      "deepseek41",
+      "inkling2"
     ]
   },
   {
@@ -293,7 +301,8 @@
       "gemma3",
       "gemma4",
       "nemotron35",
-      "deepseek41"
+      "deepseek41",
+      "inkling2"
     ]
   },
   {
@@ -319,7 +328,8 @@
       "gemma3",
       "gemma4",
       "nemotron35",
-      "deepseek41"
+      "deepseek41",
+      "inkling2"
     ]
   },
   {
@@ -416,7 +426,8 @@
       "gemma3",
       "gemma4",
       "nemotron35",
-      "deepseek41"
+      "deepseek41",
+      "inkling2"
     ]
   },
   {
@@ -491,7 +502,8 @@
       "gemma3",
       "gemma4",
       "nemotron35",
-      "deepseek41"
+      "deepseek41",
+      "inkling2"
     ]
   },
   {
@@ -558,7 +570,8 @@
       "qwen36",
       "gemma4",
       "nemotron35",
-      "deepseek41"
+      "deepseek41",
+      "inkling2"
     ]
   },
   {
@@ -627,7 +640,8 @@
       "qwen36",
       "gemma4",
       "nemotron35",
-      "deepseek41"
+      "deepseek41",
+      "inkling2"
     ]
   },
   {
@@ -696,7 +710,8 @@
       "qwen36",
       "gemma4",
       "nemotron35",
-      "deepseek41"
+      "deepseek41",
+      "inkling2"
     ]
   },
   {
@@ -777,7 +792,8 @@
       "qwen36",
       "gemma4",
       "nemotron35",
-      "deepseek41"
+      "deepseek41",
+      "inkling2"
     ]
   },
   {
@@ -883,7 +899,8 @@
       "qwen36",
       "gemma4",
       "nemotron35",
-      "deepseek41"
+      "deepseek41",
+      "inkling2"
     ]
   },
   {
@@ -989,7 +1006,8 @@
       "qwen36",
       "gemma4",
       "nemotron35",
-      "deepseek41"
+      "deepseek41",
+      "inkling2"
     ]
   },
   {
@@ -1042,7 +1060,8 @@
       "qwen36",
       "gemma4",
       "nemotron35",
-      "deepseek41"
+      "deepseek41",
+      "inkling2"
     ]
   },
   {
@@ -1115,7 +1134,8 @@
       "qwen36",
       "gemma4",
       "nemotron35",
-      "deepseek41"
+      "deepseek41",
+      "inkling2"
     ]
   },
   {
@@ -1347,7 +1367,99 @@
       "reasoning_effort": "huge"
     },
     "templates": [
-      "deepseek41"
+      "deepseek41",
+      "inkling2"
+    ]
+  },
+  {
+    "name": "reasoning_effort_none",
+    "system": "Be brief.",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hi",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      }
+    ],
+    "tools": [],
+    "add_generation_prompt": true,
+    "kwargs": {
+      "reasoning_effort": "none"
+    },
+    "templates": [
+      "inkling2"
+    ]
+  },
+  {
+    "name": "reasoning_effort_low_multi",
+    "system": null,
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is 2+2?",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "assistant",
+        "content": "4.",
+        "reasoning": "Simple arithmetic.",
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "user",
+        "content": "And times 3?",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "assistant",
+        "content": "12.",
+        "reasoning": "4*3=12.",
+        "tool_calls": [],
+        "tool_call_id": null
+      },
+      {
+        "role": "user",
+        "content": "Thanks, and plus 1?",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      }
+    ],
+    "tools": [],
+    "add_generation_prompt": true,
+    "kwargs": {
+      "reasoning_effort": "low"
+    },
+    "templates": [
+      "inkling2"
+    ]
+  },
+  {
+    "name": "reasoning_effort_number",
+    "system": null,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hi",
+        "reasoning": null,
+        "tool_calls": [],
+        "tool_call_id": null
+      }
+    ],
+    "tools": [],
+    "add_generation_prompt": true,
+    "kwargs": {
+      "reasoning_effort": 0.5
+    },
+    "templates": [
+      "inkling2"
     ]
   }
 ]

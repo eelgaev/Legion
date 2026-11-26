@@ -43,6 +43,7 @@ fn template(name: &str) -> ChatTemplate {
         "gemma4" => ("<bos>", "<eos>"),
         "nemotron35" => ("<s>", "<|im_end|>"),
         "deepseek41" => ("<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>"),
+        "inkling2" => ("", "<|content_model_end_sampling|>"),
         other => panic!("unknown template {other}"),
     };
     ChatTemplate::new(&source, bos, eos).unwrap_or_else(|e| panic!("{name}: {e}"))
@@ -119,6 +120,13 @@ fn nemotron35_matches_transformers() {
 #[test]
 fn deepseek41_matches_transformers() {
     check("deepseek41");
+}
+
+/// Inkling-2's template: `{% generation %}` blocks, compact `tojson(separators=...)` and
+/// `dictsort(case_sensitive=true)`, the effort as a system turn.
+#[test]
+fn inkling2_matches_transformers() {
+    check("inkling2");
 }
 
 fn render(source: &str) -> Result<String, legion::chat_template::ChatTemplateError> {

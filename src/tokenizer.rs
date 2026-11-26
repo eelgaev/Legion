@@ -104,8 +104,8 @@ fn pre_regex(pre: &str) -> Option<(&'static str, bool)> {
         // Nemotron-H's tokenizer is `pixtral`.
         "llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "pixtral" | "midm-2.0" | "lfm2"
         | "jina-v5-nano" | "glm4" | "glm5" => Some((RE_LLAMA3, true)),
-        // Muse Glimmer's tokenizer is `llama4`.
-        "gpt-4o" | "llama4" | "kanana2" | "talkie" => Some((RE_GPT4O, false)),
+        // Muse Glimmer's tokenizer is `llama4`; Inkling-2's is GPT-4o's split.
+        "gpt-4o" | "llama4" | "kanana2" | "talkie" | "inkling2" => Some((RE_GPT4O, false)),
         "tekken" => Some((RE_TEKKEN, true)),
         // The last of three expressions (`pre_splits`).
         "deepseek-v3" | "joyai-llm" => Some((RE_DEEPSEEK3, false)),
@@ -733,6 +733,8 @@ pub struct DecodeStream<'a> {
     tok: &'a Tokenizer,
     pending: Vec<u8>,
     render_special: bool,
+    /// Control tokens printed anyway (a chat format's markup, which its parsers read).
+    shown: Vec<u32>,
 }
 
 impl<'a> DecodeStream<'a> {
@@ -741,6 +743,7 @@ impl<'a> DecodeStream<'a> {
             tok,
             pending: Vec::new(),
             render_special: false,
+            shown: Vec::new(),
         }
     }
 
@@ -750,9 +753,15 @@ impl<'a> DecodeStream<'a> {
         self
     }
 
+    /// Also print these control tokens (Inkling-2's message markup, `<|end_message|>` ...).
+    pub fn show(mut self, ids: &[u32]) -> Self {
+        self.shown = ids.to_vec();
+        self
+    }
+
     /// Feed one token; returns the text that is now complete (possibly empty).
     pub fn push(&mut self, id: u32) -> String {
-        if self.render_special || !self.tok.hidden(id) {
+        if self.render_special || !self.tok.hidden(id) || self.shown.contains(&id) {
             self.pending.extend_from_slice(self.tok.token_to_piece(id));
         }
         self.take(false)

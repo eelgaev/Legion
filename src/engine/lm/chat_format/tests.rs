@@ -207,3 +207,55 @@ fn shipped_vocabularies_select_the_expected_reasoning_markers() {
         assert_eq!(ChatFormat::detect(&tok).reasoning, markers, "{file}");
     }
 }
+
+#[test]
+fn inkling_markup_is_shown_and_parsed_on_every_reply() {
+    let markup = crate::engine::tool_parser::inkling::MARKUP;
+    let mut vocab = vec!["<|endoftext|>", "<think>", "<tool_call>", "</tool_call>"];
+    vocab.extend(markup);
+    let tok = tokenizer(&vocab, "inkling2");
+    let format = ChatFormat::detect(&tok);
+    assert_eq!(format.shown(), [4, 5, 6, 7, 8, 9, 10]);
+    assert!(format.framed());
+    assert_eq!(format.strict_tools(), None);
+    assert_eq!(
+        format.reasoning,
+        ("<|content_thinking|>", "<|end_message|>")
+    );
+    assert!(format.stop_tokens(&tok).contains(&0));
+    // Earlier turns' thinking is closed; generation starts outside it.
+    for prompt in [
+        "<|message_user|><|content_text|>Hi<|end_message|>",
+        "<|message_model|><|content_thinking|>old<|end_message|><|message_user|>",
+    ] {
+        assert_eq!(format.prompt_reasoning(prompt), Some(false), "{prompt}");
+    }
+    // Reasoning, then the framed answer, through both parsers.
+    let mut reasoning = format.reasoning_parser(false);
+    let mut parser = format.tool_parser(&[]);
+    let mut events = Vec::new();
+    let reply = "<|message_model|><|content_thinking|>plan<|end_message|>\
+                 <|message_model|><|content_text|>answer<|end_message|>";
+    for c in reply.chars() {
+        for ev in reasoning.push(&c.to_string()) {
+            match ev {
+                TokenEvent::Text(t) => events.extend(parser.push(&t)),
+                other => events.push(other),
+            }
+        }
+    }
+    events.extend(reasoning.finish());
+    events.extend(parser.finish());
+    let (mut thought, mut answer) = (String::new(), String::new());
+    for ev in events {
+        match ev {
+            TokenEvent::Reasoning(t) => thought.push_str(&t),
+            TokenEvent::Text(t) => answer.push_str(&t),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    assert_eq!((thought.as_str(), answer.as_str()), ("plan", "answer"));
+    // Without all of the markup, the other formats.
+    let tok = tokenizer(&markup[..6], "inkling2");
+    assert!(ChatFormat::detect(&tok).shown().is_empty());
+}

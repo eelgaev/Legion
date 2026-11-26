@@ -63,6 +63,7 @@ figures out the rest.
 | Gemma 4 31B | QAT Q4_0 / UD-Q4_K_XL, with MTP | NVIDIA and RedHatAI NVFP4 |
 | Qwen3.5 / 3.6, Nemotron-H | yes | BF16, FP8, NVFP4 |
 | DeepSeek4.1-Flash | yes | FP8 / MXFP4 (being tuned) |
+| Inkling-2-Mini (text) | unsloth UD-Q4_K_XL, both layouts | Thinking Machines NVFP4 |
 
 **Status:** Qwen3.5 / 3.6 (dense and MoE), Qwen3.8-Flash-Next, Qwen3.8-27B, Gemma 4, GLM5.3-Flash and
 Nemotron-H serve on CUDA, on one or several GPUs, from GGUF or safetensors. DeepSeek4.1-Flash is
@@ -290,6 +291,7 @@ The exact `legion serve` command behind every row of the tables, and how it was 
 - [Gemma 4 31B QAT UD-Q4_K_XL, 1x Spark](docs/run/spark/gemma-4-31b-qat-ud-q4-k-xl-1x.md)
 - [Gemma 4 31B NVFP4 (RedHatAI), 1x Spark](docs/run/spark/gemma-4-31b-nvfp4-1x.md)
 - [Gemma 4 31B NVFP4 (RedHatAI), 2x Spark (tensor parallel)](docs/run/spark/gemma-4-31b-nvfp4-2x-tp.md)
+- [Inkling-2-Mini UD-Q4_K_XL and NVFP4, 1x Spark](docs/run/spark/inkling-2-mini-1x.md)
 
 **IBM AC922**
 

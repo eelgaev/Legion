@@ -304,3 +304,18 @@ llama-server -m GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf --port 8090 --jinja
   -ctk q8_0 -ctv q8_0 --lazy-mode on -sm layer -fit off -b 512 -ub 128 -ts 0.85,1,1,1 \
   --spec-type draft-mtp --spec-draft-n-max 2
 ```
+
+## Inkling-2-Mini
+
+Legion: [1x DGX Spark](spark/inkling-2-mini-1x.md), GGUF and NVFP4.
+
+llama.cpp, 1x DGX Spark: mainline b12611 or later (the `inkling2_loop` support of
+[#32694](https://github.com/ggml-org/llama.cpp/pull/32694) and the NVFP4 scale fix of
+[#32704](https://github.com/ggml-org/llama.cpp/pull/32704)) with the `Mainline_Support` file of
+`unsloth/Inkling-2-Mini-GGUF`; the root file is Unsloth's own layout and needs their builds. No drafter: DSpark is
+still an open pull request.
+
+```sh
+llama-server -m Inkling-2-Mini-UD-Q4_K_XL.gguf --port 8090 --jinja \
+  -ngl 99 -fa on -np 16 -kvu --no-cache-prompt -c 65536
+```

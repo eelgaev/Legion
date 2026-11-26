@@ -24,6 +24,7 @@ TEMPLATES = {
     "gemma4": ("<bos>", "<eos>"),
     "nemotron35": ("<s>", "<|im_end|>"),
     "deepseek41": ("<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>"),
+    "inkling2": ("", "<|content_model_end_sampling|>"),
 }
 
 WEATHER = {
@@ -134,7 +135,7 @@ UNSORTED_CALL = [
 ]
 
 # Gemma 3 has no tool role: its template raises on it, which error_roles_not_alternating covers.
-TOOLS_OK = ["qwen3", "qwen36", "gemma4", "nemotron35", "deepseek41"]
+TOOLS_OK = ["qwen3", "qwen36", "gemma4", "nemotron35", "deepseek41", "inkling2"]
 
 CASES = [
     case("plain", [msg("user", "Hello there!")]),
@@ -167,7 +168,11 @@ CASES = [
     case("reasoning_effort_max", [msg("user", "Hi")], kwargs={"reasoning_effort": "max"}, templates=["deepseek41"]),
     case("reasoning_effort_numeric", [msg("user", "Hi")], kwargs={"reasoning_effort": "30"}, templates=["deepseek41"]),
     case("drop_thinking_false", MULTI, kwargs={"drop_thinking": False}, templates=["deepseek41"]),
-    case("error_reasoning_effort", [msg("user", "Hi")], kwargs={"reasoning_effort": "huge"}, templates=["deepseek41"]),
+    case("error_reasoning_effort", [msg("user", "Hi")], kwargs={"reasoning_effort": "huge"}, templates=["deepseek41", "inkling2"]),
+    # Inkling-2: the effort as a system turn before the first non-system one.
+    case("reasoning_effort_none", [msg("user", "Hi")], system="Be brief.", kwargs={"reasoning_effort": "none"}, templates=["inkling2"]),
+    case("reasoning_effort_low_multi", MULTI, kwargs={"reasoning_effort": "low"}, templates=["inkling2"]),
+    case("reasoning_effort_number", [msg("user", "Hi")], kwargs={"reasoning_effort": 0.5}, templates=["inkling2"]),
 ]
 
 

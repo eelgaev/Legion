@@ -153,6 +153,12 @@ pub enum ResponseFormat {
     JsonSchema(serde_json::Value),
 }
 
+/// The [`GenerateRequest::template_kwargs`] key that carries a chat request's
+/// `reasoning_effort` as sent. Not a template variable (a dot cannot be one): the engine takes
+/// it out and passes it on as `reasoning_effort` only to the chat formats whose templates take
+/// the OpenAI levels as they are (Inkling-2's), so other templates render as before.
+pub const EFFORT_KWARG: &str = "legion.reasoning_effort";
+
 #[derive(Debug, Clone)]
 pub struct GenerateRequest {
     /// Model id, already resolved against [`Engine::models`].

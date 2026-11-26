@@ -39,6 +39,10 @@ pub(super) struct TextSpec {
     pub(super) tools: Option<Box<dyn ToolParser>>,
     pub(super) stop: StopMatcher,
     pub(super) logprobs: Option<u32>,
+    /// Control tokens the detokenizer prints for the parsers ([`ChatFormat::shown`]).
+    ///
+    /// [`ChatFormat::shown`]: super::chat_format::ChatFormat::shown
+    pub(super) shown: Vec<u32>,
     pub(super) out: UnboundedSender<TokenEvent>,
 }
 
@@ -70,7 +74,7 @@ impl<'t> TextState<'t> {
     pub(super) fn new(tokenizer: &'t Tokenizer, spec: TextSpec) -> Self {
         Self {
             tokenizer,
-            detok: tokenizer.decode_stream(),
+            detok: tokenizer.decode_stream().show(&spec.shown),
             reasoning: spec.reasoning,
             tools: spec.tools,
             stop: spec.stop,

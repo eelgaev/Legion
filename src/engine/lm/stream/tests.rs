@@ -42,6 +42,7 @@ fn spec(kind: &Kind) -> (TextSpec, UnboundedReceiver<TokenEvent>) {
             .then(|| Box::new(HermesParser::new(&tools)) as Box<dyn ToolParser>),
         stop: StopMatcher::new(kind.stop.clone()),
         logprobs: kind.logprobs,
+        shown: Vec::new(),
         out,
     };
     (spec, rx)
