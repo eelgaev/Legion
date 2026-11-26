@@ -79,6 +79,12 @@ impl Model {
             e,
             n,
         );
+        // Image tokens take their vision rows, as in the target's step (#1219, as #1195 for
+        // Qwen's head).
+        let tok = match inputs.img {
+            Some((rows, idx)) => ctx.set_rows(tok, rows, idx),
+            None => tok,
+        };
         let cat = ops::nextn_in(
             ctx,
             tok,
