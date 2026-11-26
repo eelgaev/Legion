@@ -267,13 +267,6 @@ pub(crate) fn on_side(
     side::done(s)
 }
 
-/// Makes `stream` wait for what [`on_side`] last queued on the side stream (an op that forks
-/// and joins within its own launch, as qwen4exp's up-mix overlapping its down matmul, #1183).
-#[cfg(feature = "cuda")]
-pub(crate) fn join_side(stream: *mut std::os::raw::c_void) -> Result<(), String> {
-    side::join(stream)
-}
-
 #[cfg(feature = "cuda")]
 unsafe fn cuda_side_join(
     _dst: &ffi::ggml_tensor,

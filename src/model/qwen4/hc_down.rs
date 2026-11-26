@@ -19,7 +19,7 @@
 //! multiple of [`BK`]), steps of [`MIN_TOKENS`] or more and the kernels in the binary. The CPU
 //! implementation is a reference (the same rebuilt values, products summed in F32 in `k` order).
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use crate::ggml::{Context, ExternalOp, Tensor, ffi, types};
 
@@ -259,102 +259,6 @@ unsafe fn lob_target(dst: &ffi::ggml_tensor) -> Option<(*mut u16, f32)> {
     }
 }
 
-/// Whether the node fusion overlaps a mixer's down matmul with its up-mix in two token parts
-/// ([`split_at`]; on by default, `legion serve --no-hc-mix-overlap` turns it off: the same bits
-/// either way).
-static MIX_OVERLAP: AtomicBool = AtomicBool::new(true);
-
-/// The split forced (tests, timing runs): 0 by [`split_at`], -1 never, -2 half the tokens, more
-/// than 0 that many tokens first (where fewer than the step's).
-static FORCE_SPLIT: AtomicI64 = AtomicI64::new(0);
-
-/// Sets whether graphs allocated from now on overlap a down matmul that writes its up-mix's
-/// BF16 `lo` ([`set_lob`]) with that up-mix, in two token parts (#1183): the down matmul's
-/// first part on the compute stream, then its second part there while the up-mix of the first
-/// part runs on the side stream, then the up-mix of the second part. Every token's values are
-/// computed as without the split (each output is one chain over `k`; the up-mix's tokens are
-/// independent), so the same bits.
-pub fn set_mix_overlap(on: bool) {
-    MIX_OVERLAP.store(on, Ordering::Relaxed);
-}
-
-/// See [`set_mix_overlap`].
-pub(crate) fn mix_overlap() -> bool {
-    MIX_OVERLAP.load(Ordering::Relaxed)
-}
-
-/// Forces the split of [`set_mix_overlap`]: 0 back to [`split_at`], -1 never, -2 half the
-/// tokens, more than 0 that many tokens first (tests and timing runs).
-#[doc(hidden)]
-pub fn force_split(v: i64) {
-    FORCE_SPLIT.store(v, Ordering::Relaxed);
-}
-
-/// The tokens of the first part of [`set_mix_overlap`]'s split for a step of `n` tokens on
-/// `sms` SMs: those of the down matmul's full waves of CTAs ([`pick_nt`]'s tile, one CTA an
-/// SM) where a partial wave follows, 0 (no split) where its CTAs fill whole waves or one at
-/// most. The down matmul's CTA takes all of an SM (its shared memory and registers), so the
-/// up-mix's CTAs only run beside it on SMs the matmul leaves idle: the partial last wave's
-/// (8,067 tokens on a GB10's 48 SMs: 85 CTAs, 37 in the second wave, 11 SMs idle for a CTA's
-/// time). At 12,288 tokens the matmul is two full waves (96 CTAs), and nothing is split.
-pub fn split_at(n: i64, sms: i64) -> i64 {
-    let sms = sms.max(1);
-    let tile = 32 * i64::from(pick_nt(n, sms));
-    let ctas = (n + tile - 1) / tile;
-    let n0 = ctas / sms * sms * tile;
-    if ctas % sms == 0 || n0 == 0 || n0 >= n {
-        0
-    } else {
-        n0
-    }
-}
-
-/// [`split_at`], or the split forced by [`force_split`].
-pub(crate) fn split_for(n: i64, sms: i64) -> i64 {
-    match FORCE_SPLIT.load(Ordering::Relaxed) {
-        0 => split_at(n, sms),
-        -2 => n / 2,
-        v if v > 0 && v < n => v,
-        _ => 0,
-    }
-}
-
-/// The parameter of a down node with [`set_lob`] that runs only its first `n0` tokens
-/// ([`set_split`]); 0: all of them.
-const P_SPLIT: usize = 1;
-
-/// Makes the down node `down` (with [`set_lob`]) run only its first `n0` tokens; its up-mix
-/// runs the rest ([`launch_rest`], [`super::hc_up_mix::set_overlap`]). 0 runs all of them.
-///
-/// # Safety
-/// As [`crate::ggml::make_external`]: a valid down node of an allocated graph that has not run;
-/// `0 <= n0 <` its tokens.
-pub(crate) unsafe fn set_split(down: *mut ffi::ggml_tensor, n0: i64) {
-    // SAFETY: the caller's.
-    unsafe { crate::ggml::set_external_param(down, P_SPLIT, n0 as i32) };
-}
-
-/// The tokens a down node runs itself ([`set_split`]), 0 for all of them.
-#[cfg(any(test, feature = "cuda"))]
-pub(crate) fn split_of(down: &ffi::ggml_tensor) -> i64 {
-    i64::from(crate::ggml::external_params(down)[P_SPLIT])
-}
-
-/// Runs the tokens past [`split_of`] of the down node `down` on `stream`.
-///
-/// # Safety
-/// `down` is a down node with [`set_split`] of an allocated graph whose sources hold their
-/// values, device tensors of the stream's device.
-#[cfg(feature = "cuda")]
-pub(crate) unsafe fn launch_rest(
-    down: &ffi::ggml_tensor,
-    stream: *mut std::os::raw::c_void,
-) -> Result<(), String> {
-    let n0 = split_of(down);
-    // SAFETY: the caller's.
-    unsafe { cuda::hc_down_range(down, n0, down.ne[1], stream) }
-}
-
 /// One value of `xn` as the BF16 streams' norm rounds it into `xnb` (`hc_post_norm_b16_kernel`)
 /// and the kernel rebuilds it: `bf16((v · scale) · g)`, each multiply rounded, then rounded to
 /// the nearest BF16 (even on ties). `v` holds BF16 bits.
@@ -563,28 +467,6 @@ mod cuda {
         dst: &ffi::ggml_tensor,
         stream: *mut c_void,
     ) -> Result<(), String> {
-        // With the mix overlap (`set_split`), the up-mix node runs the rest (`launch_rest`).
-        let n = dst.ne[1];
-        let end = match super::split_of(dst) {
-            n0 if n0 > 0 && n0 < n => n0,
-            _ => n,
-        };
-        // SAFETY: the caller's.
-        unsafe { hc_down_range(dst, 0, end, stream) }
-    }
-
-    /// The down node `dst`'s tokens `t0..t1` on `stream`, with the token tile of all of its
-    /// tokens (the outputs do not depend on it).
-    ///
-    /// # Safety
-    /// As the op's: a node made by `mul_mat`, device tensors of the stream's device;
-    /// `0 <= t0 < t1 <=` its tokens.
-    pub(super) unsafe fn hc_down_range(
-        dst: &ffi::ggml_tensor,
-        t0: i64,
-        t1: i64,
-        stream: *mut c_void,
-    ) -> Result<(), String> {
         // SAFETY: a node made by `mul_mat`, device tensors of the stream's device; the kernel
         // reads and writes within the shapes checked here.
         unsafe {
@@ -607,7 +489,7 @@ mod cuda {
                 && (w.data as usize).is_multiple_of(16)
                 && (x.data as usize).is_multiple_of(16)
                 && (g.data as usize).is_multiple_of(16);
-            if !ok || !(0 <= t0 && t0 < t1 && t1 <= n) {
+            if !ok {
                 return Err("hc_down: shape or alignment the kernel does not take".into());
             }
             // Also grants the kernels' shared memory on this device.
@@ -623,26 +505,19 @@ mod cuda {
             let sms = crate::hw::per_device::current().map_or(0, crate::hw::per_device::sm_count);
             let nt = super::pick_nt(n, i64::from(sms));
             let i = (nt - 2) as usize;
-            // Token t0 first: the streams, scales, output and `lo` rows from there.
-            let t = t0 as usize;
-            let lob = if lob.is_null() {
-                lob
-            } else {
-                lob.add(t * m as usize)
-            };
             let mut p = Params {
                 w: w.data as *const c_void,
-                x: (x.data as *const u8).add(t * x.nb[2]) as *const c_void,
-                sc: (sc.data as *const u8).add(t * sc.nb[1]) as *const f32,
+                x: x.data as *const c_void,
+                sc: sc.data as *const f32,
                 g: g.data as *const f32,
-                dst: (dst.data as *mut u8).add(t * dst.nb[1]) as *mut f32,
+                dst: dst.data as *mut f32,
                 w_ld: (w.nb[1] / 2) as i64,
                 x_ld: (x.nb[2] / 2) as i64,
                 sc_ld: (sc.nb[1] / 4) as i64,
                 dst_ld: (dst.nb[1] / 4) as i64,
                 m: m as i32,
                 k: k as i32,
-                n: (t1 - t0) as i32,
+                n: n as i32,
                 e: e as i32,
                 lob,
                 act_scale,
@@ -651,7 +526,7 @@ mod cuda {
             };
             let tile = 32 * i64::from(nt);
             let grid = Dim3 {
-                x: ((t1 - t0 + tile - 1) / tile) as u32,
+                x: ((n + tile - 1) / tile) as u32,
                 y: 1,
                 z: 1,
             };

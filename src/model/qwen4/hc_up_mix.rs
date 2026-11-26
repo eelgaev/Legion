@@ -652,91 +652,7 @@ const P_BY_EXCHANGE: usize = 3;
 /// As [`crate::ggml::make_external`]: a valid mix node of an allocated graph that has not run.
 pub(crate) unsafe fn set_by_exchange(node: *mut ffi::ggml_tensor) {
     // SAFETY: the caller's.
-    unsafe {
-        crate::ggml::set_external_param(node, P_BY_EXCHANGE, 1);
-        // The exchange runs the mix whole: its down matmul runs whole too.
-        if crate::ggml::external_params(&*node)[P_SPLIT] != 0 {
-            super::hc_down::set_split(split_down(&*node), 0);
-            crate::ggml::set_external_param(node, P_SPLIT, 0);
-        }
-    }
-}
-
-/// The parameter of a BF16 mix node whose down matmul ran only its first tokens
-/// ([`set_overlap`]): that many tokens, 0 for none.
-const P_SPLIT: usize = 4;
-
-/// For a BF16 mix node `mix` of [`up_mix_rebuilt`] with BF16 streams whose `lo` its down
-/// matmul writes ([`super::hc_down::set_lob`], the `hc_lo_act` and `hc_up_lob` nodes turned
-/// off): that down node, where it reads the mix's streams, scales and gamma, the scales' rows
-/// are contiguous, the mix is not left to an all-gather ([`set_by_exchange`]) and its streams
-/// are not lazy ([`set_lazy_streams`]); for [`set_overlap`].
-///
-/// # Safety
-/// `mix` is a valid tensor; its sources valid tensors or null.
-pub(crate) unsafe fn overlap_down(mix: *mut ffi::ggml_tensor) -> Option<*mut ffi::ggml_tensor> {
-    // SAFETY: the caller's; a mix node's `lob` and activation nodes keep their sources.
-    unsafe {
-        if !crate::ggml::op_of(mix).is_some_and(|op| std::ptr::eq(op, &HC_UP_MIX)) {
-            return None;
-        }
-        let t = &*mix;
-        let params = crate::ggml::external_params(t);
-        if t.src[0].is_null()
-            || (*t.src[0]).type_ != types::BF16
-            || t.src[1..=4].iter().any(|s| s.is_null())
-            || (*t.src[2]).type_ != types::BF16
-            || params[P_BY_EXCHANGE] != 0
-            || params[P_SPLIT] != 0
-            || !t.src[LAZY_OUT_SRC].is_null()
-        {
-            return None;
-        }
-        let sc = &*t.src[3];
-        if sc.nb[0] != 4 || sc.nb[1] != 4 * sc.ne[0] as usize {
-            return None;
-        }
-        let lob = t.src[1];
-        let act = (*lob).src[0];
-        if (*lob).op != ffi::ggml_op_GGML_OP_NONE
-            || act.is_null()
-            || (*act).op != ffi::ggml_op_GGML_OP_NONE
-            || (*act).src[0].is_null()
-        {
-            return None;
-        }
-        let down = (*act).src[0];
-        (super::hc_down::lob_of(down) == Some(lob)
-            && (1..=3).all(|i| (*down).src[i] == t.src[i + 1])
-            && (*down).ne[1] == (*act).ne[1])
-            .then_some(down)
-    }
-}
-
-/// The down node of a mix node with [`set_overlap`] (through its `lob` and activation nodes).
-///
-/// # Safety
-/// `mix` is a node [`overlap_down`] took.
-unsafe fn split_down(mix: &ffi::ggml_tensor) -> *mut ffi::ggml_tensor {
-    // SAFETY: the caller's.
-    unsafe { (*(*mix.src[1]).src[0]).src[0] }
-}
-
-/// Overlaps the mix node `mix` with its down node `down` ([`overlap_down`]) in two token
-/// parts (#1183, [`super::hc_down::set_mix_overlap`]): the down node runs its first `n0`
-/// tokens, and the mix node, on CUDA, queues the down matmul of the rest on the compute stream,
-/// its own first `n0` tokens on the side stream beside it (on the SMs the matmul leaves idle),
-/// then, once both are done, its own rest. The same values either way.
-///
-/// # Safety
-/// As [`crate::ggml::make_external`]: valid nodes of an allocated graph that has not run;
-/// `0 < n0 <` the step's tokens.
-pub(crate) unsafe fn set_overlap(mix: *mut ffi::ggml_tensor, down: *mut ffi::ggml_tensor, n0: i64) {
-    // SAFETY: the caller's.
-    unsafe {
-        super::hc_down::set_split(down, n0);
-        crate::ggml::set_external_param(mix, P_SPLIT, n0 as i32);
-    }
+    unsafe { crate::ggml::set_external_param(node, P_BY_EXCHANGE, 1) };
 }
 
 /// Makes the BF16 mix node `node` ([`mix_cast_reads`]) also write its mixed values rounded to
@@ -1283,73 +1199,10 @@ pub(crate) unsafe fn launch_mix(
             p.pre_inj = j.data as *const f32;
             p.pre_inj_ld = (j.nb[1] / 4) as i64;
         }
-        let n0 = params[P_SPLIT];
-        if n0 > 0 && n0 < p.n {
-            return overlapped(dst, &p, n0, stream);
+        match legion_hc_up_mix_launch(&p, stream) {
+            0 => Ok(()),
+            e => Err(format!("hc_up_mix: error {e}")),
         }
-        mix_status(legion_hc_up_mix_launch(&p, stream))
-    }
-}
-
-#[cfg(feature = "cuda")]
-fn mix_status(e: i32) -> Result<(), String> {
-    match e {
-        0 => Ok(()),
-        e => Err(format!("hc_up_mix: error {e}")),
-    }
-}
-
-/// `p`'s tokens `t0..t0 + n` (the kernels' operands are rows of tokens; [`set_overlap`]'s
-/// nodes have the rebuilt BF16 form, `lo` already BF16).
-#[cfg(feature = "cuda")]
-fn token_part(p: &HcUpMix, t0: i32, n: i32) -> HcUpMix {
-    let t = t0 as usize;
-    let (e, hc, rank) = (p.e as usize, p.hc as usize, p.rank as usize);
-    let res_bytes = if p.res_bf16 != 0 { 2 } else { 4 };
-    HcUpMix {
-        lo: p.lo.wrapping_add(t * rank),
-        mixed: p.mixed.wrapping_add(t * e),
-        res: (p.res as *const u8).wrapping_add(t * hc * e * res_bytes) as *const f32,
-        sc: p.sc.wrapping_add(t * hc),
-        lob: p.lob.wrapping_add(t * rank),
-        mixedb: if p.mixedb.is_null() {
-            p.mixedb
-        } else {
-            p.mixedb.wrapping_add(t * e)
-        },
-        n,
-        ..*p
-    }
-}
-
-/// [`launch_mix`] of a node with [`set_overlap`] (its down node ran its first `n0` tokens): the
-/// down matmul's rest on `stream`, the mix of the first `n0` tokens on the side stream forked
-/// before it, then the mix of the rest on `stream` once both are done.
-///
-/// # Safety
-/// As [`launch_mix`]'s; `p` the node's operands, `0 < n0 < p.n`.
-#[cfg(feature = "cuda")]
-unsafe fn overlapped(
-    dst: &ffi::ggml_tensor,
-    p: &HcUpMix,
-    n0: i32,
-    stream: *mut c_void,
-) -> Result<(), String> {
-    use crate::model::core::l2_prefetch;
-    let (first, rest) = (token_part(p, 0, n0), token_part(p, n0, p.n - n0));
-    // SAFETY: the caller's: a node `overlap_down` took, whose down node's sources are the
-    // mix's own and the `lob` it writes the mix's source, so all of them hold memory now.
-    unsafe {
-        let down = &*split_down(dst);
-        l2_prefetch::on_side(stream, |side| {
-            // The matmul's rest is queued first, on the compute stream (ahead of the side's
-            // mix in a stage graph's priorities too): its CTAs take whole SMs, the mix's the
-            // SMs it leaves.
-            super::hc_down::launch_rest(down, stream)?;
-            mix_status(legion_hc_up_mix_launch(&first, side))
-        })?;
-        l2_prefetch::join_side(stream)?;
-        mix_status(legion_hc_up_mix_launch(&rest, stream))
     }
 }
 

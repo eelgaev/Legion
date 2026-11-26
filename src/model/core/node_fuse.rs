@@ -171,9 +171,6 @@ pub(crate) struct Counts {
     /// qwen4exp mixers' down matmuls writing their up-mix's BF16 `lo` themselves, the gate's
     /// activation and BF16 rounding nodes turned off ([`Graph::down_lob`], #1183).
     pub down_lob: usize,
-    /// Of those, mixers whose down matmul and up-mix overlap in two token parts
-    /// ([`Graph::mix_overlap`], #1183).
-    pub mix_overlap: usize,
     /// Nodes turned into `GGML_OP_NONE`.
     pub none: usize,
 }
@@ -256,7 +253,6 @@ unsafe fn fuse(graph: *mut ffi::ggml_cgraph) {
             mtp_in_q8 = c.mtp_in_q8,
             conv_gemm = c.conv_gemm,
             down_lob = c.down_lob,
-            mix_overlap = c.mix_overlap,
             none = c.none,
             "node fuse: small ggml chains as Legion ops (the first graphs; --node-fuse-ggml off)"
         );
@@ -319,10 +315,6 @@ pub(crate) unsafe fn rewrite_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> 
                     // Last: it may turn the node (an `hc_up_lob`) off.
                     if crate::model::qwen4::hc_down::down_lob() {
                         g.down_lob(i, &mut c);
-                    }
-                    // At the up-mix, after its `hc_up_lob` node's `down_lob`.
-                    if cuda && crate::model::qwen4::hc_down::mix_overlap() {
-                        g.mix_overlap(i, &mut c);
                     }
                 }
                 _ => {}
@@ -1206,50 +1198,6 @@ impl Graph {
             }
             self.moved.push((di, lob));
             c.down_lob += 1;
-        }
-    }
-
-    /// qwen4exp's mixer tail after [`Self::down_lob`] (`--hc-bf16` prompt steps): the down
-    /// matmul writing the up-mix's BF16 `lo`, then the up-mix at `at`, with only views and
-    /// turned-off nodes between them. Where the step's tokens leave the matmul a partial last
-    /// wave of CTAs ([`crate::model::qwen4::hc_down::split_at`]), the two overlap in two token
-    /// parts on CUDA (#1183, [`crate::model::qwen4::set_mix_split`]): the matmul's full waves,
-    /// then its rest beside the up-mix of the first part, then the up-mix of the rest. The
-    /// matmul's rest runs at the up-mix instead, so the nodes between must not run: the
-    /// matmul's sources are the up-mix's own and its `lob`, which only the up-mix reads.
-    ///
-    /// # Safety
-    /// `at` is a node index.
-    unsafe fn mix_overlap(&mut self, at: usize, c: &mut Counts) {
-        // SAFETY: the caller's; nodes and sources are valid tensors.
-        unsafe {
-            let mix = self.nodes[at];
-            let Some(down) = crate::model::qwen4::mix_overlap_down(mix) else {
-                return;
-            };
-            let Some(di) = self.index.get(&(down as usize)).copied() else {
-                return;
-            };
-            if di >= at || self.none[di] {
-                return;
-            }
-            let runs = |k: usize| {
-                let n = self.nodes[k];
-                !(self.none[k] || is_view_op((*n).op) || (*n).op == ffi::ggml_op_GGML_OP_NONE)
-            };
-            if (di + 1..at).any(runs) || self.moved.iter().any(|&(k, _)| k > di && k < at) {
-                return;
-            }
-            let Some(dev) = crate::ggml::cuda_device_of(down) else {
-                return;
-            };
-            let sms = i64::from(crate::hw::per_device::sm_count(dev));
-            let n0 = crate::model::qwen4::hc_down::split_for((*down).ne[1], sms);
-            if n0 <= 0 || n0 >= (*down).ne[1] {
-                return;
-            }
-            crate::model::qwen4::set_mix_split(mix, down, n0);
-            c.mix_overlap += 1;
         }
     }
 

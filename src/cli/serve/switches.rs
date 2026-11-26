@@ -1091,13 +1091,6 @@ pub(in crate::cli) struct SwitchArgs {
     /// For comparisons.
     #[arg(long, help_heading = HEADING)]
     no_hc_down_lob: bool,
-    /// The same steps, with that epilogue: run the down matmul whole, then the up-mix, instead
-    /// of overlapping them in two token parts where the matmul's CTAs leave a partial last
-    /// wave (the default: the up-mix of the first part runs on the SMs the matmul's rest
-    /// leaves idle; every token computed as without the split, so the same output). For
-    /// comparisons.
-    #[arg(long, help_heading = HEADING)]
-    no_hc_mix_overlap: bool,
     /// qwen4exp prompt steps on compute capability 12.x GPUs (GB10) where the up-mix kernel
     /// runs, of 64+ tokens on a V100 (7.0) where the F16 mix of --hc-mix-f16 runs, and of 128+
     /// tokens on compute capability 8.0+ GPUs with BF16 mixer weights under --hc-mix-rebuild-bf16;
@@ -1773,7 +1766,6 @@ impl SwitchArgs {
             hc_up_mix_ldmatrix: self.no_hc_up_mix_ldmatrix.then_some(false),
             hc_up_mix_stage: self.no_hc_up_mix_stage.then_some(false),
             hc_down_lob: self.no_hc_down_lob.then_some(false),
-            hc_mix_overlap: self.no_hc_mix_overlap.then_some(false),
             hc_xn_rebuild: self.hc_xn_written.then_some(false),
             hc_streams_bf16: self.hc_streams_bf16.then_some(true),
             hc_bf16: self.hc_bf16.then_some(true),
