@@ -357,7 +357,21 @@ pub fn host_tier_plan(
     let kv_spill = cfg
         .kv_host_tokens
         .map_or(0, |t| (t.div_ceil(KV_BLOCK) * per) as u64);
-    let mem = host_tier::mem_info();
+    // `--spec mtp`: the head's routed experts load whole into the pinned host arena beside
+    // the tier, which holds the model's layers only (the model's own head, else the
+    // `--spec-draft` GGUF's).
+    let head = if super::drafts_with_mtp_head(&cfg.spec) {
+        match (
+            host_tier::head_expert_bytes(gguf, hp.n_layer),
+            &cfg.spec.draft,
+        ) {
+            (0, Some(path)) => host_tier::head_expert_bytes(&GgufFile::open(path)?, hp.n_layer),
+            (own, _) => own,
+        }
+    } else {
+        0
+    };
+    let mem = host_tier::beside(host_tier::mem_info(), head);
     let mib = |b: u64| b >> 20;
     match host_tier::size(mem, &sizes, hp.n_expert as usize, table, kv_spill) {
         Sizing::Whole => Ok(None),
@@ -375,6 +389,7 @@ pub fn host_tier_plan(
                     "direct"
                 },
                 kv_spill_mib = mib(plan.kv_spill),
+                mtp_head_experts_mib = mib(head),
                 margin_mib = mib(plan.margin),
                 host_available_mib = mib(plan.available),
                 all_experts_mib = mib(per_slot * hp.n_expert as u64),

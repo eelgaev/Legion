@@ -125,11 +125,11 @@ off. llama.cpp runs across two DGX Sparks with its RPC backend (layer split).
 
 | RAM | Engine | Weights | Drafting | Decode, 1 user | Prefill 8K | 32K |
 |---|---|---|---|--:|--:|--:|
-| 128 GB DDR5-4800 | Legion | UD-Q4_K_XL GGUF | none ¹⁷ | 60-61 | 2,709 | 4,616 |
+| 128 GB DDR5-4800 | Legion | UD-Q4_K_XL GGUF | MTP ¹⁷ | **66-70** | **3,258** | **5,322** |
 | 128 GB DDR5-4800 | Strata v0.2.13.1 | UD-Q4_K_XL GGUF | its own ¹⁸ | 61-64 | 2,788 | 5,245 |
-| 64 GB DDR5-4800 | Legion | UD-Q4_K_XL GGUF | none ¹⁷ | **46-49** | **1,660** | **2,336** |
+| 64 GB DDR5-4800 | Legion | UD-Q4_K_XL GGUF | none ¹⁷ | **48-50** | **2,101** | **2,942** |
 | 64 GB DDR5-4800 | Strata v0.2.13.1 | UD-Q4_K_XL GGUF | its own ¹⁸ | 38-44 | 1,377 | 2,109 |
-| 32 GB DDR5-4800 | Legion | UD-Q4_K_XL GGUF | none ¹⁷ | **24-26** | **888** | **1,215** |
+| 32 GB DDR5-4800 | Legion | UD-Q4_K_XL GGUF | none ¹⁷ | **26-27** | **1,312** | **1,271** |
 | 32 GB DDR5-4800 | Strata v0.2.13.1 | UD-Q4_K_XL GGUF | its own ¹⁸ | 16-21 | 616 | 836 |
 
 ### Qwen3.8-27B
@@ -240,9 +240,11 @@ off. llama.cpp runs across two DGX Sparks with its RPC backend (layer split).
 
 ¹⁶ The 123K request (about 86K GLM tokens) does not fit the run command's 64K context (`-c 65536`, shared by 16 sequences).
 
-¹⁷ One RTX 4090 (24 GB, PCIe 4.0, a desktop session using 1.2 GB of it), a Ryzen 9 7950X3D and DDR5-4800 RAM. The experts that do not fit
+¹⁷ One RTX 4090 (24 GB, PCIe 4.0, a desktop session using 1.3-1.6 GB of it), a Ryzen 9 7950X3D and DDR5-4800 RAM. The experts that do not fit
 VRAM stay in RAM, and with the opt-in `--cpu-expert-share auto` the CPU computes part of the RAM misses with the GPU's
-bits (same output). 4 sequences (`--max-seqs 4`). 64 and 32 GB: the same PC under a memory limit with no swap. Decode is three single-user chats
+bits (same output). 4 sequences (`--max-seqs 4`). 128 GB with MTP drafting (`--spec mtp --spec-k 1`, the head's
+own GGUF; same greedy chats as without it). 64 and 32 GB: the same PC under a memory limit with no swap, no
+drafting. Decode is three single-user chats
 right after the load, not the fixed benchmark prompts; prefill is one request each, tok/s to the first token. 4 and
 16 users and 123K were not measured.
 

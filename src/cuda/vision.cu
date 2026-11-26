@@ -22,7 +22,12 @@
 // Gemma 4's tower (`gemma4v`, #1217) shares the GEMM and the softmax and has its own: patches
 // in raster order scaled to [-1, 1], the column and row position tables, RMS norms (to F16 rows,
 // or a post-norm added to the residual), per-head q / k / v norms with the half-and-half NEOX
-// rotation, the gated GELU and the 3x3 average pool with its standardization and norm.
+// rotation, the gated GELU and the 3x3 average pool with its standardization and norm; the
+// smaller towers' clipped linears (#1220) clamp their inputs and products in place.
+//
+// GLM-5.3-Flash's tower (`glm5v`, #1219) takes Qwen3-VL's patches and rotation with Gemma 4's
+// RMS norm, and has its own per-head q / k norms before the rotation, the clamped SwiGLU and the
+// merger's LayerNorm with an exact GELU.
 //
 // The CPU tower (`src/vision/qwen3vl.rs`, ggml's CPU backend) is the oracle; these kernels compute
 // the same graph, not its bits (F16 products everywhere, as ggml's CPU rounds the activations of
@@ -61,6 +66,8 @@ struct Op {
     __half *       h2;
     int            n, e, heads, d, gx, gy, side, p, w_px, h_px, kpad, chunk, cm, pool;
     float          eps, sfx, sfy;
+    int            ld;   // im2col's row stride (0: 3 p p), padded with zeros
+    float          lim;  // the SwiGLU clamp
 };
 
 constexpr int BM = 128, BN = 128, BK = 32, LDS = BK + 8;
@@ -227,17 +234,21 @@ __global__ void __launch_bounds__(256) gemm_kernel(const Gemm g) {
 #endif
 }
 
-// A block per patch i: its pixels (x = image [3][h_px][w_px] F32) as row `i` of h0 [n][3 p p],
-// in the kernel's order (channel, then row, then column).
+// A block per patch i: its pixels (x = image [3][h_px][w_px] F32) as row `i` of h0 [n][ld]
+// (ld = 3 p p, or `o.ld` with zeros after the pixels), in the kernel's order (channel, then row,
+// then column).
 __global__ void im2col_kernel(const Op o) {
     for (int i = blockIdx.x; i < o.n; i += gridDim.x) {
         int row, col;
         patch_rc(i, o.gx, row, col);
-        const int pp = o.p * o.p, kn = 3 * pp;
-        for (int k = threadIdx.x; k < kn; k += blockDim.x) {
-            const int c = k / pp, r = k % pp, ky = r / o.p, kx = r % o.p;
-            const float v = o.x[((long long) c * o.h_px + row * o.p + ky) * o.w_px + col * o.p + kx];
-            o.h0[(long long) i * kn + k] = __float2half_rn(v);
+        const int pp = o.p * o.p, kn = 3 * pp, ld = o.ld ? o.ld : kn;
+        for (int k = threadIdx.x; k < ld; k += blockDim.x) {
+            float v = 0.0f;
+            if (k < kn) {
+                const int c = k / pp, r = k % pp, ky = r / o.p, kx = r % o.p;
+                v = o.x[((long long) c * o.h_px + row * o.p + ky) * o.w_px + col * o.p + kx];
+            }
+            o.h0[(long long) i * ld + k] = __float2half_rn(v);
         }
     }
 }
@@ -579,16 +590,154 @@ __global__ void g4_pool_kernel(const Op o) {
     }
 }
 
+// GLM-5.3-Flash's tower (`glm5v`, #1219): Qwen3-VL's patches in merge order (im2col_kernel, rows
+// padded to whole 8s: a 14-pixel patch is 588 values) and the GEMM, softmax and RMS norm above.
+
+// Patch i (merge order) of x = qkv [n][3 e] (q, k, v of `heads` heads of d <= 128, the bias in):
+// q and k RMS-normed per head with their weights (w for q, b for k), then rotated as rope_patch
+// rotates them; v as it is. q to h0 and k to h1 as [head][n][d], v to h2 as [head][d][kpad]. A
+// warp per head, a row of `sh` its scratch.
+__device__ __forceinline__ void glm_qkv_patch(const Op & o, int i, float (&sh)[8][128]) {
+    int row, col;
+    patch_rc(i, o.gx, row, col);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int half = o.d / 2, quarter = o.d / 4;
+    float *   s = sh[warp];
+    for (int h = warp; h < o.heads; h += 8) {
+        const float * v = o.x + (long long) i * 3 * o.e + 2 * o.e + h * o.d;
+        for (int c = lane; c < o.d; c += 32) {
+            o.h2[((long long) h * o.d + c) * o.kpad + i] = __float2half_rn(v[c]);
+        }
+#pragma unroll
+        for (int which = 0; which < 2; ++which) {
+            const float * src = o.x + (long long) i * 3 * o.e + which * o.e + h * o.d;
+            float         ss  = 0.0f;
+            for (int c = lane; c < o.d; c += 32) {
+                const float x = src[c];
+                s[c]          = x;
+                ss += x * x;
+            }
+            const float   scale = 1.0f / sqrtf(warp_sum(ss) / o.d + o.eps);
+            const float * nw    = which == 0 ? o.w : o.b;
+            __syncwarp();
+            for (int c = lane; c < o.d; c += 32) {
+                s[c] = (s[c] * scale) * nw[c];
+            }
+            __syncwarp();
+            __half * d = (which ? o.h1 : o.h0) + ((long long) h * o.n + i) * o.d;
+            for (int j = lane; j < half; j += 32) {
+                const float2 c  = j < quarter ? o.cs[row * quarter + j] : o.cs[col * quarter + j - quarter];
+                const float  x0 = s[j], x1 = s[j + half];
+                d[j]            = __float2half_rn(x0 * c.x - x1 * c.y);
+                d[j + half]     = __float2half_rn(x0 * c.y + x1 * c.x);
+            }
+            __syncwarp();
+        }
+    }
+}
+
+// A block per patch: glm_qkv_patch. The warps' last __syncwarp leaves `sh` free for the next.
+__global__ void glm_qkv_kernel(const Op o) {
+    __shared__ float sh[8][128];
+    for (int i = blockIdx.x; i < o.n; i += gridDim.x) {
+        glm_qkv_patch(o, i, sh);
+    }
+}
+
+// A warp per row r of x [n][2 ff] F16 (the gate's ff columns, then the up's): ggml's
+// swiglu_clamp, silu(min(gate, lim)) * clamp(up, -lim, lim), to F16 row r of h0 [n][ff] (ff = e).
+__device__ __forceinline__ void swiglu_clamp_row(const Op & o, int r) {
+    const int      lane = threadIdx.x & 31;
+    const __half * x    = o.h1 + (long long) r * 2 * o.e;
+    __half *       y    = o.h0 + (long long) r * o.e;
+    for (int c = lane; c < o.e; c += 32) {
+        const float g = fminf(__half2float(x[c]), o.lim);
+        const float u = fminf(fmaxf(__half2float(x[o.e + c]), -o.lim), o.lim);
+        y[c]          = __float2half_rn(g / (1.0f + expf(-g)) * u);
+    }
+}
+
+// A block per 8 rows (a warp each): swiglu_clamp_row.
+__global__ void swiglu_clamp_kernel(const Op o) {
+    for (int g = blockIdx.x; g * 8 < o.n; g += gridDim.x) {
+        const int r = g * 8 + (threadIdx.x >> 5);
+        if (r < o.n) {
+            swiglu_clamp_row(o, r);
+        }
+    }
+}
+
+// A warp per row r of x [n][e]: LayerNorm (as norm_row), then ggml's exact GELU
+// (0.5 v (1 + erf(v / sqrt 2))), to F16 row r of h0.
+__device__ __forceinline__ void ln_gelu_row(const Op & o, int r) {
+    const int     lane = threadIdx.x & 31;
+    const float * x    = o.x + (long long) r * o.e;
+    float         s    = 0.0f;
+    for (int c = lane; c < o.e; c += 32) {
+        s += x[c];
+    }
+    const float mean = warp_sum(s) / o.e;
+    float       v    = 0.0f;
+    for (int c = lane; c < o.e; c += 32) {
+        const float d = x[c] - mean;
+        v += d * d;
+    }
+    const float scale = 1.0f / sqrtf(warp_sum(v) / o.e + o.eps);
+    __half *    h     = o.h0 + (long long) r * o.e;
+    for (int c = lane; c < o.e; c += 32) {
+        const float t = ((x[c] - mean) * scale) * o.w[c] + o.b[c];
+        h[c]          = __float2half_rn(0.5f * t * (1.0f + erff(t * 0.70710678118654752440f)));
+    }
+}
+
+// A block per 8 rows (a warp each): ln_gelu_row.
+__global__ void ln_gelu_kernel(const Op o) {
+    for (int g = blockIdx.x; g * 8 < o.n; g += gridDim.x) {
+        const int r = g * 8 + (threadIdx.x >> 5);
+        if (r < o.n) {
+            ln_gelu_row(o, r);
+        }
+    }
+}
+
+// A clipped linear's clamp (#1220), in place: rows [rows][width] of F32 or F16 (`f16`), column c
+// clamped to segment s = min(c / seg, 2)'s bounds, as ggml's `clamp` (min with hi, then max with
+// lo). A stacked matrix's products (q, k, v; gate, up) each take their own segment.
+struct Clamp {
+    void * x;
+    int    rows, width, seg, f16;
+    float  lo[3], hi[3];
+};
+
+// A block per row.
+__global__ void g4_clamp_kernel(const Clamp o) {
+    for (int r = blockIdx.x; r < o.rows; r += gridDim.x) {
+        for (int c = threadIdx.x; c < o.width; c += blockDim.x) {
+            const int       s = min(c / o.seg, 2);
+            const long long i = (long long) r * o.width + c;
+            if (o.f16) {
+                __half * p = static_cast<__half *>(o.x);
+                p[i]       = __float2half_rn(fmaxf(fminf(__half2float(p[i]), o.hi[s]), o.lo[s]));
+            } else {
+                float * p = static_cast<float *>(o.x);
+                p[i]      = fmaxf(fminf(p[i], o.hi[s]), o.lo[s]);
+            }
+        }
+    }
+}
+
 }  // namespace
 
 // The kernels as the CUDA runtime knows them (their host stubs), for Rust's cudaLaunchKernel, in
 // the order of src/vision/gpu.rs's `Kernel`.
-extern "C" const void * const legion_vision_kernels[13] = {
+extern "C" const void * const legion_vision_kernels[17] = {
     reinterpret_cast<const void *>(&gemm_kernel),      reinterpret_cast<const void *>(&im2col_kernel),
     reinterpret_cast<const void *>(&pos_add_kernel),   reinterpret_cast<const void *>(&norm_kernel),
     reinterpret_cast<const void *>(&rope_kernel),      reinterpret_cast<const void *>(&softmax_kernel),
     reinterpret_cast<const void *>(&g4_im2col_kernel), reinterpret_cast<const void *>(&g4_pos_kernel),
     reinterpret_cast<const void *>(&rms_kernel),       reinterpret_cast<const void *>(&rms_add_kernel),
     reinterpret_cast<const void *>(&g4_qkv_kernel),    reinterpret_cast<const void *>(&geglu_kernel),
-    reinterpret_cast<const void *>(&g4_pool_kernel),
+    reinterpret_cast<const void *>(&g4_pool_kernel),   reinterpret_cast<const void *>(&glm_qkv_kernel),
+    reinterpret_cast<const void *>(&swiglu_clamp_kernel), reinterpret_cast<const void *>(&ln_gelu_kernel),
+    reinterpret_cast<const void *>(&g4_clamp_kernel),
 };

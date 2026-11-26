@@ -4,6 +4,14 @@
 use super::*;
 use crate::ggml::{Backend, BufferType, ComputeAllocator};
 
+/// Held by the tests that set or read the process-wide [`set_down_sum`] flag, so a test that
+/// turns it on for a while can't flip it under another test's build and assert.
+static DOWN_SUM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn down_sum_lock() -> std::sync::MutexGuard<'static, ()> {
+    DOWN_SUM_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Deterministic values in [-1, 1).
 fn noise(n: usize, seed: u64) -> Vec<f32> {
     let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
@@ -1158,6 +1166,8 @@ fn cuda_shexp_sum_is_ggml_bit_for_bit() {
 #[ignore = "needs a GPU"]
 fn cuda_down_sum_is_the_reduce_bit_for_bit() {
     use crate::ggml::{DeviceKind, device_by_kind};
+    // Declared first, so it's released after the flag is back to the default.
+    let _lock = down_sum_lock();
     // Back to the default even when an assert fails.
     struct Reset;
     impl Drop for Reset {
@@ -1257,4 +1267,78 @@ fn frag_ycap_policy() {
     // prefill: at least four pairs per expert
     assert_eq!(cap(205), 0);
     assert_eq!(cap(8192), 0);
+}
+
+/// 16-bit pair rows take half of the scratch's last part: the other parts' offsets stay, the
+/// rows fit, and F32 keeps the whole scratch.
+#[test]
+fn pair_rows_16_bit_halve_d() {
+    for n in [64, 4095, 32768] {
+        let s = Scratch::new(512, 10, 2560, 640, n);
+        let pairs = n as usize * 10;
+        assert_eq!(s.bytes(PairOut::F32), s.total);
+        for p in [PairOut::F16, PairOut::Bf16] {
+            let b = s.bytes(p);
+            assert!(b >= s.d + 2 * pairs * 2560, "{n} tokens: rows fit");
+            assert!(
+                b - s.d <= (s.total - s.d) / 2 + 256,
+                "{n} tokens: half of d"
+            );
+            assert_eq!(b % 256, 0);
+        }
+    }
+}
+
+/// Steps of [`SPLIT_SUM_TOKENS`] or more (#37): the sum a [`MOE_FFN_SUM`] node over the op's
+/// node (marked) and what the sum reads besides; fewer tokens keep the view. The helpers that
+/// mark the op find its node either way.
+#[test]
+fn big_steps_sum_in_a_node_of_their_own() {
+    // The flag stays put from the read below through the split assert.
+    let _lock = down_sum_lock();
+    let ctx = Context::new(64, 0);
+    let (e, f, s) = (256, 128, 8);
+    let raw = |ts: Vec<Tensor<'_>>| ts.iter().map(|t| t.raw()).collect::<Vec<_>>();
+    for n in [SPLIT_SUM_TOKENS - 1, SPLIT_SUM_TOKENS] {
+        let x = ctx.new_tensor(types::F32, &[e, n]);
+        let ids = ctx.new_tensor(types::I32, &[2, n]);
+        let w = ctx.new_tensor(types::F32, &[2, n]);
+        let table = ctx.new_tensor(types::I32, &[16]);
+        let (sh, g) = (
+            ctx.new_tensor(types::F32, &[e, n]),
+            ctx.new_tensor(types::F32, &[1, n]),
+        );
+        let refs = ExpertRefs {
+            up: ctx.new_tensor(types::Q8_0, &[e, f, s]),
+            gate: ctx.new_tensor(types::Q8_0, &[e, f, s]),
+            down: ctx.new_tensor(types::Q8_0, &[f, e, s]),
+            table: Some(table),
+        };
+        // (--moe-down-sum, which another test turns on for a while, keeps the view)
+        let summing = down_sum();
+        let out = moe_ffn_shexp(&ctx, x, ids, w, refs, PairOut::F32, Some(Shexp { sh, g }));
+        let out = clamp(out, 7.0);
+        assert_eq!(out.ne(), [e, n, 1, 1]);
+        // SAFETY: a fresh moe_ffn result.
+        let node = unsafe { op_node(out) };
+        assert!(!node.is_null());
+        // SAFETY: the op's fresh node.
+        let p = unsafe { (*node).op_params };
+        assert_eq!(p[P_CLAMP], 7.0f32.to_bits() as i32);
+        let split = p[P_SHEXP] & SUM_SPLIT != 0;
+        assert_eq!(p[P_SHEXP] & SHEXP_ADDED, SHEXP_ADDED);
+        if n < SPLIT_SUM_TOKENS {
+            assert!(!split && deferrable(out));
+            continue;
+        }
+        if !summing && !down_sum() && !crate::model::qwen4::hc_fuse() {
+            assert!(split);
+        }
+        assert_eq!(!split, deferrable(out));
+        if split {
+            assert_eq!(out.nb()[1], e as usize * 4);
+            assert_eq!(out.srcs()[0].raw(), node);
+            assert_eq!(raw(out.srcs()[1..].to_vec()), raw(vec![ids, table, sh, g]));
+        }
+    }
 }

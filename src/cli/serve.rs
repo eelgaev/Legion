@@ -131,13 +131,15 @@ pub(super) struct ModelArgs {
         conflicts_with = "model"
     )]
     pub hfmodel: Option<String>,
-    /// A vision projector (mmproj GGUF, `qwen3vl_merger`, e.g. unsloth's `mmproj-F16.gguf` or
-    /// `mmproj-BF16.gguf`) for a Qwen3.5 / Qwen3.6 / Qwen3.8-27B / Qwen3.8-Flash-Next model:
+    /// A vision projector (mmproj GGUF, e.g. unsloth's `mmproj-F16.gguf` or `mmproj-BF16.gguf`)
+    /// for a Qwen3.5 / Qwen3.6 / Qwen3.8-27B / Qwen3.8-Flash-Next (`qwen3vl_merger`) or Gemma 4
+    /// / Nemotron 3.5 Bolt (`gemma4v`) model, or the directory of the model's HF checkpoint,
+    /// whose own vision tower is taken (a GGUF model with its safetensors snapshot's tower):
     /// requests may then carry images (all three APIs and the web UI), and the model advertises
     /// vision. Its tower runs on the model's first GPU (sm_70 or newer), else on the CPU (up to
     /// 8 threads, seconds per image). Default: an HF checkpoint's own vision tower
-    /// (`model.visual.*`) when it ships one, else none (text only).
-    #[arg(long, value_name = "GGUF", conflicts_with = "no_mmproj")]
+    /// (`model.visual.*`, `model.vision_tower.*`) when it ships one, else none (text only).
+    #[arg(long, value_name = "GGUF|DIR", conflicts_with = "no_mmproj")]
     pub mmproj: Option<PathBuf>,
     /// Text only: do not load the vision tower an HF checkpoint ships.
     #[arg(long)]

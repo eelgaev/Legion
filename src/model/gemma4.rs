@@ -42,7 +42,7 @@ use crate::model::core::{
     Arch, ArchRef, GroupShape, Hparams, Inputs, KvPool, Model, ModelError, MtpGraph, Pass,
     StatePool,
 };
-use crate::model::core::{Group, stable_fusions};
+use crate::model::core::{Group, SeqInput, stable_fusions};
 
 /// Whether graphs built from now on share one positions view across the layers' RoPEs.
 static HEAD_ROPE_FUSED: AtomicBool = AtomicBool::new(false);
@@ -1268,8 +1268,7 @@ impl Model {
         let n_rows = table.ne()[1] as usize;
         let mut out = Vec::new();
         for s in groups.iter().flat_map(|g| &g.seqs) {
-            for &tok in s.tokens {
-                let r = tok as usize;
+            for r in ple_rows(s) {
                 assert!(r < n_rows, "token {r} outside the {n_rows}-row table");
                 let src = &bytes[r * row_bytes..][..row_bytes];
                 out.extend(crate::ggml::dequantize(ty, src, dim));
@@ -1277,6 +1276,19 @@ impl Model {
         }
         t.set_f32(&out);
     }
+}
+
+/// The rows of `per_layer_token_embd` the tokens of `s` read: each token's own, an image
+/// token's the padding token's (0), as llama.cpp gives its image (embedding) batches (#1220),
+/// not the placeholder's. Text-only sequences read what they did.
+pub(crate) fn ple_rows<'s>(s: &'s SeqInput<'_>) -> impl Iterator<Item = usize> + 's {
+    s.tokens.iter().enumerate().map(|(i, &tok)| {
+        if s.media.is_some_and(|m| m.row(s.n_past + i).is_some()) {
+            0
+        } else {
+            tok as usize
+        }
+    })
 }
 
 #[cfg(test)]

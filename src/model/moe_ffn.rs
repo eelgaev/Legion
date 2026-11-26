@@ -18,7 +18,9 @@
 //!
 //! The op's result is a view at the start of a bigger node: the CUDA kernels keep their
 //! grouping, the SwiGLU rows and the per-expert outputs behind it, so the compute allocator
-//! plans that scratch with the rest of the graph and reuses it across layers.
+//! plans that scratch with the rest of the graph and reuses it across layers. Big prompt steps
+//! make the sum in a node of their own instead ([`SPLIT_SUM_TOKENS`]), so the scratch is free
+//! once that ran.
 //!
 //! The CPU implementation is a plain reference (weights dequantized to F32, activations F32,
 //! F32 sums), for tests.
@@ -58,6 +60,29 @@ const P_SHEXP: usize = 10;
 /// [`P_SHEXP`]'s bits.
 const SHEXP_ADDED: i32 = 1;
 const SUM_DEFERRED: i32 = 2;
+/// The sum is a node of its own ([`MOE_FFN_SUM`]): the op leaves its start unwritten.
+const SUM_SPLIT: i32 = 4;
+
+/// The per-token sum of a [`MOE_FFN`] node as a node of its own (#37), for steps of
+/// [`SPLIT_SUM_TOKENS`] or more: sources the op's node, then what the sum reads besides
+/// ([`sum_srcs`]'s ids, table, shared expert and its gate logits). The same sum kernel on the
+/// same pairs (the same bits), into a tensor of its own: the graph allocator frees the op's
+/// node, scratch and all, once the sum ran, instead of when the last reader of the sum did.
+static MOE_FFN_SUM: ExternalOp = ExternalOp {
+    name: "moe_ffn_sum",
+    cpu: cpu_moe_ffn_sum,
+    #[cfg(feature = "cuda")]
+    cuda: Some(cuda::launch_sum),
+    #[cfg(not(feature = "cuda"))]
+    cuda: None,
+};
+
+/// Steps of this many tokens or more get their sum as a [`MOE_FFN_SUM`] node: the op's
+/// scratch (~130 KB a token for Qwen3.8-Flash-Next) is then free for the nodes between the op
+/// and the sum's readers. On an RTX 4090 a 32K prompt step's compute buffer went from 12.6 GB
+/// (1.6 GB of it spilled into host memory) to under 11 GB. Not for `--hc-fuse` (its norm reads
+/// the op's pairs itself) or `--moe-down-sum` (the down GEMM writes the sum).
+const SPLIT_SUM_TOKENS: i64 = 4096;
 
 /// A sigmoid-gated shared expert the op adds to its sum (#526): `out[:, t] += sh[:, t] ·
 /// sigmoid(g[t])`, each step rounded as ggml's `sigmoid`, `mul` and `add` round it, so the
@@ -296,6 +321,18 @@ impl Scratch {
             total: off,
         }
     }
+
+    /// The scratch's bytes when the pair rows `d` (its last part) are kept as `pair`: half of
+    /// `d` for 16-bit rows (#37: a 32K prompt step on a 24 GB card then fits more of its
+    /// compute buffer in VRAM).
+    fn bytes(&self, pair: PairOut) -> usize {
+        match pair {
+            PairOut::F32 => self.total,
+            PairOut::F16 | PairOut::Bf16 => {
+                self.d + ((self.total - self.d) / 2).div_ceil(256) * 256
+            }
+        }
+    }
 }
 
 /// The routed-expert FFN of `x` (F32 `[n_embd, n]`) with router choices `ids` (I32
@@ -342,9 +379,9 @@ pub fn moe_ffn_clamped<'a>(
 /// Sets the SwiGLU clamp of `out`, a result of [`moe_ffn`] or [`moe_ffn_staged`] (see
 /// [`moe_ffn_clamped`]); `limit` 0 leaves it plain.
 pub fn clamp<'a>(out: Tensor<'a>, limit: f32) -> Tensor<'a> {
-    // SAFETY: `out` is a view of the fresh node `moe_ffn_with` made.
+    // SAFETY: `out` is a result of the fresh node `moe_ffn_with` made.
     unsafe {
-        let node = (*out.raw()).view_src;
+        let node = op_node(out);
         assert!(!node.is_null(), "moe_ffn::clamp: not a moe_ffn result");
         (*node).op_params[P_CLAMP] = limit.to_bits() as i32;
     }
@@ -358,9 +395,9 @@ pub fn clamp<'a>(out: Tensor<'a>, limit: f32) -> Tensor<'a> {
 /// the same order as the shared kernels (the same bits), ~1.2x faster on the GB10. Other types
 /// and GPUs take the shared kernels either way.
 pub fn glm_kernels<'a>(out: Tensor<'a>, on: bool) -> Tensor<'a> {
-    // SAFETY: `out` is a view of the fresh node `moe_ffn_with` made.
+    // SAFETY: `out` is a result of the fresh node `moe_ffn_with` made.
     unsafe {
-        let node = (*out.raw()).view_src;
+        let node = op_node(out);
         assert!(
             !node.is_null(),
             "moe_ffn::glm_kernels: not a moe_ffn result"
@@ -378,9 +415,9 @@ pub fn glm_kernels<'a>(out: Tensor<'a>, on: bool) -> Tensor<'a> {
 /// types and GPUs before sm_80 keep the F16 kernels; down takes the int8 GEMM only when it is
 /// IQ2_S or IQ3_XXS (#594; gate/up then writes the SwiGLU rows as Q8).
 pub fn glm_q8<'a>(out: Tensor<'a>, on: bool) -> Tensor<'a> {
-    // SAFETY: `out` is a view of the fresh node `moe_ffn_with` made.
+    // SAFETY: `out` is a result of the fresh node `moe_ffn_with` made.
     unsafe {
-        let node = (*out.raw()).view_src;
+        let node = op_node(out);
         assert!(!node.is_null(), "moe_ffn::glm_q8: not a moe_ffn result");
         (*node).op_params[P_GLM_Q8] = on as i32;
     }
@@ -398,9 +435,9 @@ const GLM_PDL: i32 = 2;
 /// counts and products: the same bits. Steps of more than 16 tokens, staged weights and the int8
 /// GEMMs keep the plain launches.
 pub fn glm_pdl<'a>(out: Tensor<'a>, on: bool) -> Tensor<'a> {
-    // SAFETY: `out` is a view of the fresh node `moe_ffn_with` made.
+    // SAFETY: `out` is a result of the fresh node `moe_ffn_with` made.
     unsafe {
-        let node = (*out.raw()).view_src;
+        let node = op_node(out);
         assert!(!node.is_null(), "moe_ffn::glm_pdl: not a moe_ffn result");
         let p = &mut (*node).op_params[P_GLM];
         *p = if on && *p != 0 {
@@ -556,7 +593,7 @@ fn moe_ffn_with<'a>(
     let w = if w.is_contiguous() { w } else { ctx.cont(w) };
     let out = (n_embd * n) as usize;
     let scratch = Scratch::new(n_expert, n_used, n_embd, n_ff, n)
-        .total
+        .bytes(pair)
         .div_ceil(4);
     // The scratch starts 256-byte aligned behind the result.
     let total = out.div_ceil(64) * 64 + scratch;
@@ -577,7 +614,45 @@ fn moe_ffn_with<'a>(
             (*node.raw()).op_params[P_STAGE_ROW] = row as i32;
         }
     }
+    if n >= SPLIT_SUM_TOKENS && !down_sum() && !crate::model::qwen4::hc_fuse() {
+        // SAFETY: as above.
+        unsafe { (*node.raw()).op_params[P_SHEXP] |= SUM_SPLIT };
+        let mut srcs = vec![node, ids];
+        srcs.extend(e.table);
+        if let Some(s) = shexp {
+            srcs.extend([s.sh, s.g]);
+        }
+        return ctx.external(&MOE_FFN_SUM, types::F32, [n_embd, n, 1, 1], &srcs);
+    }
     ctx.view_2d(node, [n_embd, n], n_embd as usize * 4, 0)
+}
+
+/// The [`MOE_FFN`] node of `out`, a result of [`moe_ffn`] and the like: the node `out` views,
+/// or the source of its [`MOE_FFN_SUM`] node. Null for anything else.
+///
+/// # Safety
+/// `out` is a valid tensor.
+unsafe fn op_node(out: Tensor<'_>) -> *mut ffi::ggml_tensor {
+    // SAFETY: the caller's; a sum node's first source is the op's node.
+    unsafe {
+        let t = out.raw();
+        let sum = crate::ggml::op_of(t).is_some_and(|op| std::ptr::eq(op, &MOE_FFN_SUM));
+        if sum { (*t).src[0] } else { (*t).view_src }
+    }
+}
+
+/// The CPU [`MOE_FFN_SUM`]: the op's node holds the sum at its start (the CPU op writes it
+/// either way).
+unsafe fn cpu_moe_ffn_sum(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
+    // SAFETY: a node made by `moe_ffn_with`: the op's contiguous F32 node and this [n_embd, n].
+    unsafe {
+        let e = dst.ne[0] as usize;
+        let from = (*dst.src[0]).data as *const f32;
+        let to = dst.data as *mut f32;
+        for t in (ith..dst.ne[1] as usize).step_by(nth) {
+            std::ptr::copy_nonoverlapping(from.add(t * e), to.add(t * e), e);
+        }
+    }
 }
 
 /// The CPU implementation: tokens split over threads; per used expert, its weight rows

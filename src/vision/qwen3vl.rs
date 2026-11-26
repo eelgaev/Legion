@@ -50,6 +50,8 @@ pub struct EncoderConfig {
     pub pos_side: usize,
     /// Width of an output row: the language model's embedding width.
     pub n_out: usize,
+    /// GLM-5.3-Flash's SwiGLU clamp (`clip.vision.swiglu_clamp`); 0 for the other towers.
+    pub swiglu_limit: f32,
 }
 
 impl EncoderConfig {
@@ -62,8 +64,10 @@ impl EncoderConfig {
                 .ok_or_else(|| meta(&format!("clip.vision.{k}")))
         };
         let n_layer = int("block_count")?;
-        if hp.projector == super::Projector::Gemma4v {
-            return super::gemma4v::config(g, hp, n_layer);
+        match hp.projector {
+            super::Projector::Gemma4v => return super::gemma4v::config(g, hp, n_layer),
+            super::Projector::Glm5v => return super::glm5v::config(g, hp, n_layer),
+            super::Projector::Qwen3vl => {}
         }
         if let Some(v) = g.get("clip.vision.is_deepstack_layers")
             && v.as_array()
@@ -99,6 +103,7 @@ impl EncoderConfig {
             merge: hp.spatial_merge_size as usize,
             pos_side,
             n_out,
+            swiglu_limit: 0.0,
         };
         if cfg.merge != 2
             || !cfg.n_embd.is_multiple_of(cfg.n_head)
@@ -172,6 +177,9 @@ impl Encoder {
         for name in enc.names() {
             enc.w(&name)?;
         }
+        if enc.hp.projector == super::Projector::Gemma4v {
+            super::gemma4v::check(&enc.weights, enc.cfg.n_layer)?;
+        }
         Ok(enc)
     }
 
@@ -190,8 +198,10 @@ impl Encoder {
     }
 
     fn names(&self) -> Vec<String> {
-        if self.hp.projector == super::Projector::Gemma4v {
-            return super::gemma4v::names(self.cfg.n_layer);
+        match self.hp.projector {
+            super::Projector::Gemma4v => return super::gemma4v::names(self.cfg.n_layer),
+            super::Projector::Glm5v => return super::glm5v::names(self.cfg.n_layer),
+            super::Projector::Qwen3vl => {}
         }
         let mut v: Vec<String> = [
             "v.patch_embd.weight",
@@ -227,10 +237,29 @@ impl Encoder {
         self.w(name)
     }
 
+    /// [`Self::encode`] and each stage's rows (GLM-5.3-Flash's tower only, for tests: where
+    /// the GPU tower parts from this one).
+    #[cfg(test)]
+    pub(crate) fn encode_stages(
+        &mut self,
+        p: &Preprocessed,
+    ) -> Result<(ImageEmbedding, Vec<(String, Vec<f32>)>), VisionError> {
+        if self.hp.projector != super::Projector::Glm5v {
+            return Err(VisionError::Unsupported(
+                "stage rows: GLM-5.3-Flash's tower only".into(),
+            ));
+        }
+        let mut taps = Vec::new();
+        let e = super::glm5v::encode_tapped(self, p, Some(&mut taps))?;
+        Ok((e, taps))
+    }
+
     /// The tower's output for `p` (see the module docs).
     pub fn encode(&mut self, p: &Preprocessed) -> Result<ImageEmbedding, VisionError> {
-        if self.hp.projector == super::Projector::Gemma4v {
-            return super::gemma4v::encode(self, p);
+        match self.hp.projector {
+            super::Projector::Gemma4v => return super::gemma4v::encode(self, p),
+            super::Projector::Glm5v => return super::glm5v::encode(self, p),
+            super::Projector::Qwen3vl => {}
         }
         let c = &self.cfg;
         let (px, py) = (p.grid_w as usize, p.grid_h as usize);
@@ -381,7 +410,13 @@ pub(super) fn weight<'w>(weights: &'w Weights, name: &str) -> Result<Tensor<'w>,
 
 /// Patch rows `[n_embd, px, py]` (any layout) in merge order: each 2×2 block's four patches
 /// next to each other, blocks row by row; `[n_embd, px × py]`.
-fn merge_order<'a>(ctx: &'a Context, t: Tensor<'a>, n_embd: i64, px: i64, py: i64) -> Tensor<'a> {
+pub(super) fn merge_order<'a>(
+    ctx: &'a Context,
+    t: Tensor<'a>,
+    n_embd: i64,
+    px: i64,
+    py: i64,
+) -> Tensor<'a> {
     let t = ctx.cont(t);
     let t = ctx.reshape_4d(t, [n_embd * 2, px / 2, py, 1]);
     let t = ctx.reshape_4d(t, [n_embd * 2, px / 2, 2, py / 2]);

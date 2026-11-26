@@ -171,10 +171,13 @@ fn check(a: &Args, x: &ffi::ggml_tensor, weights: [&ffi::ggml_tensor; 3]) -> Res
     Ok(())
 }
 
-/// The op's CUDA implementation (see the module docs).
-pub(super) unsafe fn launch(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
-    // SAFETY: a node made by `moe_ffn`; activations, routing and the node in device memory,
-    // weights device-visible or staged.
+/// The kernels' arguments for `dst`, a node made by `moe_ffn_with`: its sources, its result and
+/// its scratch behind it (device pointers).
+///
+/// # Safety
+/// `dst` is a node made by `moe_ffn_with`.
+unsafe fn args(dst: &ffi::ggml_tensor) -> Args {
+    // SAFETY: the caller's; the node's sources as `moe_ffn_with` placed them.
     unsafe {
         let src = |i: usize| &*dst.src[i];
         let (x, ids, w, up, gate, down) = (src(0), src(1), src(2), src(3), src(4), src(5));
@@ -186,7 +189,7 @@ pub(super) unsafe fn launch(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
         let sc = Scratch::new(n_expert, n_used, n_embd, n_ff, n);
         let out_floats = (n_embd * n) as usize;
         let base = (dst.data as *mut u8).add(out_floats.div_ceil(64) * 256);
-        let mut a = Args {
+        Args {
             up: up.data as *const u8,
             gate: gate.data as *const u8,
             down: down.data as *const u8,
@@ -230,7 +233,20 @@ pub(super) unsafe fn launch(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
             sum_cnt: std::ptr::null_mut(),
             frag_ycap: 0,
             pdl: 0,
-        };
+        }
+    }
+}
+
+/// The op's CUDA implementation (see the module docs).
+pub(super) unsafe fn launch(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
+    // SAFETY: a node made by `moe_ffn`; activations, routing and the node in device memory,
+    // weights device-visible or staged.
+    unsafe {
+        let src = |i: usize| &*dst.src[i];
+        let (x, up, gate, down) = (src(0), src(3), src(4), src(5));
+        let mut a = args(dst);
+        let (n_expert, n_used) = (a.n_expert as i64, a.n_used as i64);
+        let (n_embd, n_ff, n) = (a.n_embd, a.n_ff, a.n_tok);
         check(&a, x, [up, gate, down])?;
         // GLM-5.3-Flash's int8 GEMMs (opt-in, #603) where this step and the device take them;
         // prep then writes x as Q8 rows for them
@@ -238,10 +254,12 @@ pub(super) unsafe fn launch(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
             a.q8 = legion_moe_glm_q8(&a, up.type_ as c_int, down.type_ as c_int);
         }
         let deferred = dst.op_params[P_SHEXP] & SUM_DEFERRED != 0;
+        // The sum a node of its own (`launch_sum`).
+        let split = dst.op_params[P_SHEXP] & SUM_SPLIT != 0;
         // The down GEMM's own per-token sums (#826) where its kernel takes them: their counters
         // in x's FP16 rows, which only the gate/up GEMM reads (they are set after it), so the op
         // needs no more scratch. GLM-5.3-Flash's nodes keep the reduce kernel.
-        if down_sum() && !deferred && dst.op_params[P_GLM] == 0 {
+        if down_sum() && !deferred && !split && dst.op_params[P_GLM] == 0 {
             a.sum_cnt = a.xh.cast();
             if legion_moe_down_sum(&a, down.type_ as c_int) != 1 {
                 a.sum_cnt = std::ptr::null_mut();
@@ -327,10 +345,24 @@ pub(super) unsafe fn launch(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resu
                 gemms,
             )?,
         }
-        if deferred || !a.sum_cnt.is_null() {
-            // The reader sums the pairs itself (`defer_sum`), or the down GEMM did.
+        if deferred || split || !a.sum_cnt.is_null() {
+            // The reader sums the pairs itself (`defer_sum`), the sum node does, or the down
+            // GEMM did.
             return Ok(());
         }
+        launched("moe reduce", legion_moe_reduce(&a, stream))
+    }
+}
+
+/// The CUDA [`super::MOE_FFN_SUM`]: the op's sum kernel over its node's pairs, into `dst`.
+pub(super) unsafe fn launch_sum(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
+    // SAFETY: a node made by `moe_ffn_with`: its first source the op's node, whose pairs, ids,
+    // table and shared expert are alive (this node's sources); `dst` [n_embd, n] contiguous F32.
+    unsafe {
+        let a = Args {
+            out: dst.data as *mut f32,
+            ..args(&*dst.src[0])
+        };
         launched("moe reduce", legion_moe_reduce(&a, stream))
     }
 }

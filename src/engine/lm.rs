@@ -1126,7 +1126,7 @@ fn largest_image(cfg: &LmConfig, bidirectional: bool) -> usize {
         return 0;
     }
     let tower = match &cfg.mmproj {
-        Some(path) => GgufFile::open(path).ok(),
+        Some(path) => vision::open_mmproj(path).ok(),
         None if cfg.no_mmproj || !cfg.model_path.is_dir() => None,
         None => crate::hf::open_vision(&cfg.model_path).ok().flatten(),
     };
@@ -1160,8 +1160,9 @@ pub enum DeviceChoice {
 pub struct LmConfig {
     pub model_path: std::path::PathBuf,
     /// `--mmproj`: a vision tower for the model (Qwen3.5 / Qwen3.6, #146; Qwen3.8-Flash-Next,
-    /// #1195); requests may then carry images. Without it, an HF checkpoint's own tower
-    /// (`model.visual.*`) is loaded unless [`Self::no_mmproj`].
+    /// #1195; Gemma 4 and Nemotron 3.5 Bolt, #1217 / #1220), an mmproj GGUF or an HF
+    /// checkpoint directory whose tower is taken; requests may then carry images. Without it,
+    /// an HF checkpoint's own tower (`model.visual.*`) is loaded unless [`Self::no_mmproj`].
     pub mmproj: Option<std::path::PathBuf>,
     /// `--no-mmproj`: text only, an HF checkpoint's vision tower is not loaded.
     pub no_mmproj: bool,

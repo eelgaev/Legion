@@ -34,6 +34,9 @@ const PREFIX: &str = "model.visual.";
 const GEMMA_MODEL_TYPE: &str = "gemma4";
 const GEMMA_PREFIX: &str = "model.vision_tower.";
 
+/// GLM-5.3-Flash checkpoints (#1219): `model.visual.*`, a GLM-4V-style tower.
+const GLM_MODEL_TYPE: &str = "glm5_next";
+
 /// The vision tower of the checkpoint in `dir` as a synthetic mmproj, or `None` when it has
 /// none (a text-only checkpoint, or a model type without a Qwen3-VL tower).
 pub fn open_vision(dir: &Path) -> Result<Option<GgufFile>, GgufError> {
@@ -49,6 +52,17 @@ pub fn open_vision(dir: &Path) -> Result<Option<GgufFile>, GgufError> {
     let Some(vision) = config.get("vision_config").filter(|v| !v.is_null()) else {
         return Ok(None);
     };
+    if model_type == Some(GLM_MODEL_TYPE) {
+        if ckpt
+            .locate(&format!("{PREFIX}patch_embed.proj.weight"))
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let mut b = Builder::new(Arc::new(ckpt));
+        build_glm5(&mut b, vision, dir).map_err(err)?;
+        return b.finish(dir.to_path_buf()).map(Some);
+    }
     if model_type == Some(GEMMA_MODEL_TYPE) {
         if ckpt
             .locate(&format!("{GEMMA_PREFIX}patch_embedder.input_proj.weight"))
@@ -181,13 +195,14 @@ fn build(b: &mut Builder, config: &Json, v: &Json, dir: &Path) -> Result<(), Str
 /// values) -> the conv kernel `v.patch_embd.weight` (`[n, 3, p, p]`), its position table ->
 /// `v.position_embd.weight` (F32, as the converter forces), `std_bias` / `std_scale` ->
 /// `v.std_bias` / `v.std_scale`, and `model.embed_vision.embedding_projection` ->
-/// `mm.input_projection.weight`. Clipped linears (`use_clipped_linears`) are refused, as the
-/// encoder refuses them.
+/// `mm.input_projection.weight`. A clipped linear's scalars (`use_clipped_linears`, the
+/// E2B/E4B-sized towers, #1220) `<proj>.input_min` / `input_max` / `output_min` / `output_max`
+/// -> `v.blk.{i}.<matrix>.input_min` ..., F32 `[1]` (the converter unsqueezes them and drops
+/// `.linear` from the matrix's name); a tower without `standardize` has no `std_bias` /
+/// `std_scale`.
 fn build_gemma(b: &mut Builder, v: &Json, dir: &Path) -> Result<(), String> {
     let vu = |k: &str| num_u(v, k).map_err(|e| format!("vision_config: {e}"));
-    if v.get("use_clipped_linears").and_then(Json::as_bool) == Some(true) {
-        return Err("vision_config: clipped linears are not supported".into());
-    }
+    let clipped = v.get("use_clipped_linears").and_then(Json::as_bool) == Some(true);
     let depth = vu("num_hidden_layers")?;
     let width = vu("hidden_size")?;
     let patch = vu("patch_size")?;
@@ -229,8 +244,11 @@ fn build_gemma(b: &mut Builder, v: &Json, dir: &Path) -> Result<(), String> {
         "v.position_embd.weight",
         &src("patch_embedder.position_embedding_table"),
     )?;
-    widened(b, "v.std_bias", &src("std_bias"))?;
-    widened(b, "v.std_scale", &src("std_scale"))?;
+    // `standardize` (the 31B's): both buffers, which a tower without it lacks.
+    if b.ckpt.locate(&src("std_bias")).is_some() || b.ckpt.locate(&src("std_scale")).is_some() {
+        widened(b, "v.std_bias", &src("std_bias"))?;
+        widened(b, "v.std_scale", &src("std_scale"))?;
+    }
     weight(
         b,
         "mm.input_projection.weight",
@@ -256,8 +274,188 @@ fn build_gemma(b: &mut Builder, v: &Json, dir: &Path) -> Result<(), String> {
         ] {
             weight(b, &to(name), &blk(from))?;
         }
+        if !clipped {
+            continue;
+        }
+        for (proj, name) in GEMMA_CLIPPED {
+            for s in ["input_min", "input_max", "output_min", "output_max"] {
+                let from = src(&format!("encoder.layers.{il}.{proj}.{s}"));
+                if b.ckpt.locate(&from).is_some() {
+                    scalar(b, &format!("v.blk.{il}.{name}.{s}"), &from)?;
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// A Gemma 4 tower's clippable linears and their mmproj names.
+pub(super) const GEMMA_CLIPPED: [(&str, &str); 7] = [
+    ("self_attn.q_proj", "attn_q"),
+    ("self_attn.k_proj", "attn_k"),
+    ("self_attn.v_proj", "attn_v"),
+    ("self_attn.o_proj", "attn_out"),
+    ("mlp.gate_proj", "ffn_gate"),
+    ("mlp.up_proj", "ffn_up"),
+    ("mlp.down_proj", "ffn_down"),
+];
+
+/// The one value of `src` (a 0-D buffer, or `[1]`) as an F32 `[1]` tensor `name`.
+fn scalar(b: &mut Builder, name: &str, src: &str) -> Result<(), String> {
+    let (_, t) = b.source(src)?;
+    if t.numel() != 1 {
+        return Err(format!("`{src}`: shape {:?}, expected one value", t.shape));
+    }
+    b.computed_f32(name, src, vec![1], |x| x)
+}
+
+/// A GLM-5.3-Flash checkpoint's tower (`vision_config` `v`) as the `glm5v` mmproj llama.cpp's
+/// converter writes for it (`Glm5NextVisionModel` on `Glm4VVisionModel` in
+/// `conversion/qwen3vl.py` / `conversion/glm.py`, and its `tensor_mapping.py` names, MIT):
+/// `blocks.{i}.norm1/2` -> `v.blk.{i}.ln1/2`, `attn.qkv` / `attn.proj` -> `attn_qkv` /
+/// `attn_out`, `attn.q_norm` / `k_norm` -> `attn_q_norm` / `attn_k_norm`,
+/// `mlp.{gate,up,down}_proj` -> `ffn_gate/up/down`, `post_layernorm` -> `v.post_ln`,
+/// `downsample` -> `mm.patch_merger`, `merger.proj` -> `mm.model.fc`,
+/// `merger.post_projection_norm` -> `mm.post_norm`, `merger.{gate,up,down}_proj` ->
+/// `mm.gate/up/down`; the Conv3D patch kernel split along time as Qwen3-VL's. The norms'
+/// epsilon is the tower's `rms_norm_eps`, the SwiGLU clamp its `swiglu_limit`, the pixel limits
+/// the processor's `min_image_tokens` / `max_image_tokens` times a token's pixels.
+fn build_glm5(b: &mut Builder, v: &Json, dir: &Path) -> Result<(), String> {
+    let vu = |k: &str| num_u(v, k).map_err(|e| format!("vision_config: {e}"));
+    let depth = vu("depth")?;
+    let width = vu("hidden_size")?;
+    let patch = vu("patch_size")?;
+    let merge = v
+        .get("spatial_merge_size")
+        .and_then(Json::as_u64)
+        .unwrap_or(2);
+    let temporal = v
+        .get("temporal_patch_size")
+        .and_then(Json::as_u64)
+        .unwrap_or(2);
+    if temporal != 2 {
+        return Err(format!(
+            "vision_config: temporal_patch_size {temporal} (only 2 is supported)"
+        ));
+    }
+    let limit = num_f(v, "swiglu_limit").map_err(|e| format!("vision_config: {e}"))?;
+    let (mean, std) = image_mean_std(dir)?;
+    let u = Value::U32;
+    b.set("general.architecture", Value::String("clip".into()))?;
+    b.set("general.type", Value::String("mmproj".into()))?;
+    b.set("clip.projector_type", Value::String("glm5v".into()))?;
+    b.set("clip.has_vision_encoder", Value::Bool(true))?;
+    b.set("clip.use_silu", Value::Bool(true))?;
+    let mut keys = vec![
+        ("projection_dim", u(vu("out_hidden_size")? as u32)),
+        (
+            "image_size",
+            u(v.get("image_size").and_then(Json::as_u64).unwrap_or(448) as u32),
+        ),
+        ("patch_size", u(patch as u32)),
+        ("embedding_length", u(width as u32)),
+        ("feed_forward_length", u(vu("intermediate_size")? as u32)),
+        ("block_count", u(depth as u32)),
+        ("attention.head_count", u(vu("num_heads")? as u32)),
+        (
+            "attention.layer_norm_epsilon",
+            Value::F32(num_f(v, "rms_norm_eps").unwrap_or(1e-5) as f32),
+        ),
+        ("spatial_merge_size", u(merge as u32)),
+        ("swiglu_clamp", Value::F32(limit as f32)),
+        ("image_mean", Value::Array(mean)),
+        ("image_std", Value::Array(std)),
+    ];
+    let (min, max) = image_token_limits(dir)?;
+    let per_token = (patch * merge) * (patch * merge);
+    for (k, tokens) in [("image_min_pixels", min), ("image_max_pixels", max)] {
+        if let Some(t) = tokens {
+            let px = u32::try_from(t * per_token).map_err(|_| format!("{k}: {t} tokens"))?;
+            keys.push((k, u(px)));
+        }
+    }
+    for (k, val) in keys {
+        b.set(&format!("clip.vision.{k}"), val)?;
+    }
+
+    let src = |s: &str| format!("{PREFIX}{s}");
+    patch_kernels(b, &src("patch_embed.proj.weight"))?;
+    widened(b, "v.patch_embd.bias", &src("patch_embed.proj.bias"))?;
+    for il in 0..depth {
+        let blk = |s: &str| src(&format!("blocks.{il}.{s}"));
+        let to = |s: &str| format!("v.blk.{il}.{s}");
+        for (from, name) in [
+            ("norm1", "ln1"),
+            ("norm2", "ln2"),
+            ("attn.q_norm", "attn_q_norm"),
+            ("attn.k_norm", "attn_k_norm"),
+        ] {
+            weight(
+                b,
+                &to(&format!("{name}.weight")),
+                &blk(&format!("{from}.weight")),
+            )?;
+        }
+        for (from, name) in [
+            ("attn.qkv", "attn_qkv"),
+            ("attn.proj", "attn_out"),
+            ("mlp.gate_proj", "ffn_gate"),
+            ("mlp.up_proj", "ffn_up"),
+            ("mlp.down_proj", "ffn_down"),
+        ] {
+            linear(b, &to(name), &blk(from))?;
+        }
+    }
+    weight(b, "v.post_ln.weight", &src("post_layernorm.weight"))?;
+    weight(b, "mm.patch_merger.weight", &src("downsample.weight"))?;
+    widened(b, "mm.patch_merger.bias", &src("downsample.bias"))?;
+    weight(b, "mm.model.fc.weight", &src("merger.proj.weight"))?;
+    for p in ["weight", "bias"] {
+        widened(
+            b,
+            &format!("mm.post_norm.{p}"),
+            &src(&format!("merger.post_projection_norm.{p}")),
+        )?;
+    }
+    for (from, name) in [
+        ("gate_proj", "mm.gate"),
+        ("up_proj", "mm.up"),
+        ("down_proj", "mm.down"),
+    ] {
+        weight(
+            b,
+            &format!("{name}.weight"),
+            &src(&format!("merger.{from}.weight")),
+        )?;
+        // Biases, should a checkpoint ship them (llama.cpp reads them when there).
+        let bias = src(&format!("merger.{from}.bias"));
+        if b.ckpt.locate(&bias).is_some() {
+            widened(b, &format!("{name}.bias"), &bias)?;
+        }
+    }
+    Ok(())
+}
+
+/// GLM-5.3-Flash's processor's `min_image_tokens` / `max_image_tokens`
+/// (`preprocessor_config.json`, else `processor_config.json`'s `image_processor`), as the
+/// converter reads them; `None` for one it does not set.
+fn image_token_limits(dir: &Path) -> Result<(Option<u64>, Option<u64>), String> {
+    for (file, key) in [
+        ("preprocessor_config.json", None),
+        ("processor_config.json", Some("image_processor")),
+    ] {
+        let Ok(s) = std::fs::read_to_string(dir.join(file)) else {
+            continue;
+        };
+        let j: Json = serde_json::from_str(&s).map_err(|e| format!("{file}: {e}"))?;
+        let j = key.and_then(|k| j.get(k)).unwrap_or(&j);
+        let min = j.get("min_image_tokens").and_then(Json::as_u64);
+        let max = j.get("max_image_tokens").and_then(Json::as_u64);
+        if min.is_some() || max.is_some() {
+            return Ok((min, max));
+        }
+    }
+    Ok((None, None))
 }
 
 /// `name` from `src` without a bias: a 1-D weight widened to F32, a BF16 matrix F16, any

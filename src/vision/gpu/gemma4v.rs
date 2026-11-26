@@ -8,20 +8,23 @@
 //! rotation, full attention at scale 1 in chunks of queries, the output GEMM and its post-norm
 //! into the residual, an RMS norm, the gate-and-up GEMM, the gated GELU, the down GEMM and its
 //! post-norm into the residual; then the 3×3 pool, its standardization and norm, and the
-//! projection. Every kernel is sm_70+ (WMMA 16×16×16 and plain CUDA), on capped grids like
-//! Qwen3-VL's, so the language model's kernels find room beside them ([`crate::vision::share`]).
+//! projection. A tower without the standardization runs it with a bias of 0 and a scale of 1 (the
+//! same bits); a block with clipped linears (#1220) clamps each GEMM's input and products in place
+//! around it, one launch each, so the 31B's blocks launch what they did. Every kernel is sm_70+
+//! (WMMA 16×16×16 and plain CUDA), on capped grids like Qwen3-VL's, so the language model's
+//! kernels find room beside them ([`crate::vision::share`]).
 //!
 //! The CPU tower is the oracle: the rows are close to its rows, not the same bits.
 
 use std::os::raw::{c_int, c_void};
 
 use super::{
-    ATTN_BUDGET, CC_MAJOR, D2H, DevBuf, Gemm, H2D, Kernel, NON_BLOCKING, OUT_F16, Op, Pinned, TILE,
-    cudaDeviceGetAttribute, cudaFreeAsync, cudaMallocAsync, cudaMemcpyAsync, cudaMemsetAsync,
-    cudaSetDevice, cudaStreamCreateWithFlags, cudaStreamDestroy, cudaStreamSynchronize, gemm_on,
-    launch, ok, sm_count, values, vector,
+    ATTN_BUDGET, CC_MAJOR, Clamp, D2H, DevBuf, Gemm, H2D, Kernel, NON_BLOCKING, OUT_F16, Op,
+    Pinned, TILE, cudaDeviceGetAttribute, cudaFreeAsync, cudaMallocAsync, cudaMemcpyAsync,
+    cudaMemsetAsync, cudaSetDevice, cudaStreamCreateWithFlags, cudaStreamDestroy,
+    cudaStreamSynchronize, gemm_on, launch, ok, sm_count, values, vector,
 };
-use crate::vision::gemma4v::ROPE_THETA;
+use crate::vision::gemma4v::{Clip, ROPE_THETA, UNCLAMPED, clip, standardizes};
 use crate::vision::qwen3vl::{Encoder, EncoderConfig, ImageEmbedding};
 use crate::vision::share::{Caps, Turns};
 use crate::vision::{Preprocessed, VisionError, VisionHparams};
@@ -71,6 +74,49 @@ struct Block {
     out: Mat,
     gate_up: Mat,
     down: Mat,
+    /// The clipped linears' bounds (#1220), when the block has any.
+    clips: Option<Clips>,
+}
+
+/// A block's clipped linears: the four GEMMs' input bounds (`q`, `k` and `v` share one, as do
+/// `gate` and `up`, [`crate::vision::gemma4v::check`]) and their products' bounds per stacked
+/// matrix; `±f32::MAX` where a matrix has none.
+struct Clips {
+    qkv_in: (f32, f32),
+    qkv_out: [(f32, f32); 3],
+    out_in: (f32, f32),
+    out_out: (f32, f32),
+    gate_up_in: (f32, f32),
+    gate_up_out: [(f32, f32); 2],
+    down_in: (f32, f32),
+    down_out: (f32, f32),
+}
+
+impl Clips {
+    fn of(enc: &Encoder, il: usize) -> Result<Option<Self>, VisionError> {
+        let none = Clip {
+            inp: UNCLAMPED,
+            out: UNCLAMPED,
+        };
+        let mut any = false;
+        let mut c = |m: &str| -> Result<Clip, VisionError> {
+            let got = clip(&enc.weights, il, m)?;
+            any |= got.is_some();
+            Ok(got.unwrap_or(none))
+        };
+        let (q, k, v, o) = (c("attn_q")?, c("attn_k")?, c("attn_v")?, c("attn_out")?);
+        let (g, u, dn) = (c("ffn_gate")?, c("ffn_up")?, c("ffn_down")?);
+        Ok(any.then_some(Self {
+            qkv_in: q.inp,
+            qkv_out: [q.out, k.out, v.out],
+            out_in: o.inp,
+            out_out: o.out,
+            gate_up_in: g.inp,
+            gate_up_out: [g.out, u.out],
+            down_in: dn.inp,
+            down_out: dn.out,
+        }))
+    }
 }
 
 /// Byte offsets into an image's scratch, its size and the queries per attention chunk.
@@ -160,8 +206,21 @@ impl GemmaGpu {
                 out: Mat::one(enc, &t("attn_out"))?,
                 gate_up: Mat::stacked(enc, &[t("ffn_gate"), t("ffn_up")])?,
                 down: Mat::one(enc, &t("ffn_down"))?,
+                clips: Clips::of(enc, il)?,
             });
         }
+        // Without the standardization (the smaller towers): `(x - 0) * 1`, the same bits.
+        let (std_bias, std_scale) = if standardizes(&enc.weights) {
+            (
+                vector(enc.weight("v.std_bias")?)?,
+                vector(enc.weight("v.std_scale")?)?,
+            )
+        } else {
+            (
+                DevBuf::f32s(&vec![0.0; c.n_embd])?,
+                DevBuf::f32s(&vec![1.0; c.n_embd])?,
+            )
+        };
         // The tables' rows a grid within the pixel budget can reach (a 48-pixel-wide image
         // that tall), not all of them.
         let hp = enc.hparams().clone();
@@ -199,8 +258,8 @@ impl GemmaGpu {
             pos: DevBuf::f32s(&pos)?,
             pos_rows,
             blocks,
-            std_bias: vector(enc.weight("v.std_bias")?)?,
-            std_scale: vector(enc.weight("v.std_scale")?)?,
+            std_bias,
+            std_scale,
             proj: Mat::one(enc, "mm.input_projection.weight")?,
             n_ff,
             cfg: c,
@@ -262,6 +321,31 @@ impl GemmaGpu {
             },
             1,
         )
+    }
+
+    /// Clamps `rows` rows of `bounds.len()` equal segments, F32 or F16 (`f16`), in place: a
+    /// clipped linear's input (one segment) or its stacked products (one per matrix).
+    fn clamp(
+        &self,
+        x: *mut c_void,
+        rows: usize,
+        width: usize,
+        f16: bool,
+        bounds: &[(f32, f32)],
+    ) -> Result<(), VisionError> {
+        let mut o = Clamp {
+            x,
+            rows: rows as i32,
+            width: width as i32,
+            seg: (width / bounds.len()) as i32,
+            f16: f16 as i32,
+            lo: [-f32::MAX; 3],
+            hi: [f32::MAX; 3],
+        };
+        for (i, &(lo, hi)) in bounds.iter().take(3).enumerate() {
+            (o.lo[i], o.hi[i]) = (lo, hi);
+        }
+        self.launch(Kernel::G4Clamp, rows, 256, &mut o)
     }
 
     /// A warp-per-row kernel over `rows` rows: a block per 8 rows.
@@ -491,7 +575,14 @@ impl GemmaGpu {
                     ..geo
                 };
                 self.rows(Kernel::Rms, n, &mut o)?;
+                let cl = blk.clips.as_ref();
+                if let Some(cl) = cl {
+                    self.clamp(h.cast(), n, e, true, &[cl.qkv_in])?;
+                }
                 self.linear(&blk.qkv, h.cast(), n, bigp, 0)?;
+                if let Some(cl) = cl {
+                    self.clamp(bigp, n, 3 * e, false, &cl.qkv_out)?;
+                }
                 let mut o = Op {
                     x: bigp.cast(),
                     w: blk.q_norm.0.cast(),
@@ -565,7 +656,13 @@ impl GemmaGpu {
                     )?;
                     q0 += cm;
                 }
+                if let Some(cl) = cl {
+                    self.clamp(h.cast(), n, e, true, &[cl.out_in])?;
+                }
                 self.linear(&blk.out, h.cast(), n, bigp, 0)?;
+                if let Some(cl) = cl {
+                    self.clamp(bigp, n, e, false, &[cl.out_out])?;
+                }
                 let mut o = Op {
                     x: bigp.cast(),
                     y: x,
@@ -580,7 +677,13 @@ impl GemmaGpu {
                     ..geo
                 };
                 self.rows(Kernel::Rms, n, &mut o)?;
+                if let Some(cl) = cl {
+                    self.clamp(h.cast(), n, e, true, &[cl.gate_up_in])?;
+                }
                 self.linear(&blk.gate_up, h.cast(), n, bigp, OUT_F16)?;
+                if let Some(cl) = cl {
+                    self.clamp(bigp, n, 2 * self.n_ff, true, &cl.gate_up_out)?;
+                }
                 let mut o = Op {
                     h1: bigp.cast(),
                     h0: ffp.cast(),
@@ -588,7 +691,13 @@ impl GemmaGpu {
                     ..geo
                 };
                 self.rows(Kernel::Geglu, n, &mut o)?;
+                if let Some(cl) = cl {
+                    self.clamp(ffp, n, self.n_ff, true, &[cl.down_in])?;
+                }
                 self.linear(&blk.down, ffp, n, bigp, 0)?;
+                if let Some(cl) = cl {
+                    self.clamp(bigp, n, e, false, &[cl.down_out])?;
+                }
                 let mut o = Op {
                     x: bigp.cast(),
                     y: x,

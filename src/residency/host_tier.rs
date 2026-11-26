@@ -362,6 +362,27 @@ pub fn sources(
         .collect()
 }
 
+/// The bytes of layer `il`'s routed experts in `gguf` (0 when it has none): an MTP head's
+/// layer, past the `n_layer` layers of [`sources`]. The tier does not hold it: its experts
+/// load whole into the pinned host arena beside the tier's memory, so the memory plan is
+/// made against what they leave ([`beside`]).
+pub fn head_expert_bytes(gguf: &GgufFile, il: usize) -> u64 {
+    KINDS
+        .iter()
+        .filter_map(|k| gguf.tensor(&format!("blk.{il}.{k}.weight")))
+        .map(|t| t.size)
+        .sum()
+}
+
+/// `mem` less `bytes` of host memory that loads beside the tier ([`head_expert_bytes`]): what
+/// [`size`] plans against.
+pub fn beside(mem: MemInfo, bytes: u64) -> MemInfo {
+    MemInfo {
+        available: mem.available.saturating_sub(bytes),
+        ..mem
+    }
+}
+
 /// The names [`sources`]' tensors have: left out of the weights' load.
 pub fn skipped_tensors(n_layer: usize) -> Vec<String> {
     (0..n_layer)

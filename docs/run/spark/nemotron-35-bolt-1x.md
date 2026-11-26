@@ -41,6 +41,24 @@ tok/s at 8K / 32K. With DFlash: 1 user 59.7 (mean accepted length 2.08), 4 users
 user; DFlash verify steps run other shapes than plain decode, so long greedy answers can drift after a few dozen
 tokens.
 
+### Images
+
+Add `--mmproj` to take images: the `mmproj-F16.gguf` file from the same repo, or the BF16 checkpoint directory
+(its own vision tower, no conversion). `/v1/models` then lists `vision`. The tower (16 layers, clipped linears)
+runs on the GPU. Text-only requests give the same output as without `--mmproj`.
+
+```sh
+legion serve \
+  --model NVIDIA-Nemotron-3.5-Bolt-E4B-UD-Q4_K_XL.gguf \
+  --port 8090 \
+  --device cuda \
+  --max-seqs 4 \
+  --ctx-size 40960 \
+  --mmproj mmproj-F16.gguf
+```
+
+Serving the BF16 checkpoint directory as `--model` takes images by itself: its vision tower loads with it.
+
 ## Bolt 74B-A9B UD-Q4_K_XL
 
 Bolt 74B-A9B is a Nemotron-H MoE (`nemotron_h_moe`, 88 layers: Mamba-2, 8 attention layers, MoE) whose MoE

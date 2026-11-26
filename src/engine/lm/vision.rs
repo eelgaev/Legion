@@ -1,11 +1,14 @@
-//! Images in prompts (#146, `--mmproj`; #1195; #1217): the vision tower of a Qwen3.5 / Qwen3.6 /
-//! Qwen3.8-Flash-Next or Gemma 4 mmproj, or the one an HF checkpoint ships (`model.visual.*`,
-//! `model.vision_tower.*`), and how a request's images become its tokens and their input rows.
+//! Images in prompts (#146, `--mmproj`; #1195; #1217; #1219): the vision tower of a Qwen3.5 /
+//! Qwen3.6 / Qwen3.8-Flash-Next, Gemma 4 or GLM-5.3-Flash mmproj, or the one an HF checkpoint
+//! ships (`model.visual.*`, `model.vision_tower.*`), and how a request's images become its
+//! tokens and their input rows.
 //!
 //! Qwen's chat template renders one `<|vision_start|><|image_pad|><|vision_end|>` per image, in
 //! the order the messages carry them. Each `<|image_pad|>` becomes `nx × ny` of itself, one per
 //! merged patch. Gemma 4's renders one `<|image|>`, which becomes `<|image>`, `nx × ny` of
-//! itself and `<image|>` (as llama.cpp's mtmd places Gemma 4's images). [`Vision::expand`] needs
+//! itself and `<image|>` (as llama.cpp's mtmd places Gemma 4's images). GLM-5.3-Flash's
+//! (#1219) renders `<|begin_of_image|><|image|><|end_of_image|>`; its `<|image|>` becomes
+//! `nx × ny` of itself, one position each. [`Vision::expand`] needs
 //! only the preprocessed size, so token counting does not run the tower. [`Vision::encode`]
 //! then runs it, giving the sequence's [`Media`] (the rows and positions the model reads) and
 //! its prefix-cache key: the prompt with every image token replaced by an id from the image's
@@ -26,7 +29,7 @@ use crate::gguf::GgufFile;
 use crate::model::core::{ImageLayout, ImageSpan, Media};
 use crate::tokenizer::Tokenizer;
 use crate::vision::{
-    Encoder, EncoderConfig, ImageEmbedding, Preprocessed, VisionError, VisionHparams,
+    Encoder, EncoderConfig, ImageEmbedding, Preprocessed, Projector, VisionError, VisionHparams,
 };
 
 use super::super::{EngineError, ImageInput};
@@ -56,6 +59,22 @@ const ARCHS: [&str; 3] = ["qwen35", "qwen35moe", "qwen4exp"];
 /// Gemma 4 (#1217): one position per image token, `<|image>` and `<image|>` around them.
 const GEMMA_ARCH: &str = "gemma4";
 
+/// GLM-5.3-Flash (#1219): its template renders `<|begin_of_image|><|image|><|end_of_image|>`
+/// per image; `<|image|>` repeats once per image token (as its HF processor and llama.cpp's
+/// mtmd place them). Its text layers take no positions (NoPE), its images one per token.
+const GLM_ARCH: &str = "glm5-next";
+const GLM_IMAGE: &str = "<|image|>";
+
+/// The tower each language model architecture takes.
+fn projector_of(arch: &str) -> Option<Projector> {
+    match arch {
+        GEMMA_ARCH => Some(Projector::Gemma4v),
+        GLM_ARCH => Some(Projector::Glm5v),
+        a if ARCHS.contains(&a) => Some(Projector::Qwen3vl),
+        _ => None,
+    }
+}
+
 pub(super) struct Vision {
     tower: Mutex<Tower>,
     hp: VisionHparams,
@@ -79,20 +98,25 @@ impl Marks {
     fn of(arch: &str, tokenizer: &Tokenizer) -> Result<Self, String> {
         let id =
             |t: &str| (tokenizer.token_id(t)).ok_or_else(|| format!("the tokenizer has no {t}"));
-        Ok(if arch == GEMMA_ARCH {
-            Marks {
+        Ok(match arch {
+            GEMMA_ARCH => Marks {
                 pad: id(GEMMA_IMAGE)?,
                 open: Some(id(GEMMA_IMAGE_OPEN)?),
                 close: Some(id(GEMMA_IMAGE_CLOSE)?),
                 layout: ImageLayout::Sequential,
-            }
-        } else {
-            Marks {
+            },
+            GLM_ARCH => Marks {
+                pad: id(GLM_IMAGE)?,
+                open: None,
+                close: None,
+                layout: ImageLayout::Sequential,
+            },
+            _ => Marks {
                 pad: id(IMAGE_PAD)?,
                 open: None,
                 close: None,
                 layout: ImageLayout::MRope,
-            }
+            },
         })
     }
 }
@@ -236,7 +260,9 @@ pub(super) struct Pending {
 
 impl Vision {
     /// Loads the mmproj `path` (`--mmproj`) for a language model of architecture `arch` and
-    /// width `n_embd`, onto CUDA device `gpu` when there is one.
+    /// width `n_embd`, onto CUDA device `gpu` when there is one. A directory is an HF
+    /// checkpoint whose own tower is taken (#1220: a GGUF language model with the safetensors
+    /// snapshot's tower, no converted mmproj needed).
     pub(super) fn load(
         path: &Path,
         arch: &str,
@@ -247,7 +273,7 @@ impl Vision {
     ) -> Result<Self, LoadError> {
         let err = |e: String| LoadError::Device(format!("--mmproj {}: {e}", path.display()));
         Self::check_arch(arch).map_err(err)?;
-        let g = GgufFile::open(path).map_err(|e| err(e.to_string()))?;
+        let g = open_mmproj(path).map_err(err)?;
         Self::from_gguf(&g, arch, n_embd, tokenizer, threads, gpu).map_err(err)
     }
 
@@ -272,12 +298,12 @@ impl Vision {
     }
 
     fn check_arch(arch: &str) -> Result<(), String> {
-        if ARCHS.contains(&arch) || arch == GEMMA_ARCH {
+        if projector_of(arch).is_some() {
             return Ok(());
         }
         Err(format!(
-            "images need a Qwen3.5 / Qwen3.6 / Qwen3.8-Flash-Next or Gemma 4 language model \
-             ({}, {GEMMA_ARCH}), not {arch}",
+            "images need a Qwen3.5 / Qwen3.6 / Qwen3.8-Flash-Next, Gemma 4 or GLM-5.3-Flash \
+             language model ({}, {GEMMA_ARCH}, {GLM_ARCH}), not {arch}",
             ARCHS.join(", ")
         ))
     }
@@ -296,12 +322,14 @@ impl Vision {
         let mut backend = Backend::cpu().map_err(|e| e.to_string())?;
         backend.set_threads(threads.clamp(1, MAX_THREADS));
         let encoder = Encoder::from_gguf(g, backend).map_err(|e| e.to_string())?;
-        let gemma = encoder.hparams().projector == crate::vision::Projector::Gemma4v;
-        if gemma != (arch == GEMMA_ARCH) {
-            return Err(format!(
-                "a {} vision tower for a {arch} language model",
-                if gemma { "Gemma 4" } else { "Qwen-VL" }
-            ));
+        let projector = encoder.hparams().projector;
+        if projector_of(arch) != Some(projector) {
+            let name = match projector {
+                Projector::Qwen3vl => "Qwen-VL",
+                Projector::Gemma4v => "Gemma 4",
+                Projector::Glm5v => "GLM-5.3-Flash",
+            };
+            return Err(format!("a {name} vision tower for a {arch} language model"));
         }
         let out = encoder.config().n_out;
         if out != n_embd {
@@ -466,6 +494,16 @@ impl Vision {
         let media = Media::with_layout(spans, n_embd, self.marks.layout);
         Ok((Arc::new(media), key))
     }
+}
+
+/// `--mmproj path`: an mmproj GGUF, or an HF checkpoint directory's own tower (#1220).
+pub(super) fn open_mmproj(path: &Path) -> Result<GgufFile, String> {
+    if path.is_dir() {
+        return crate::hf::open_vision(path)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "the checkpoint ships no vision tower Legion runs".to_string());
+    }
+    GgufFile::open(path).map_err(|e| e.to_string())
 }
 
 /// `LEGION_DEBUG_VISION_REENCODE=1` (A/B runs): every image is encoded, the row cache unused,
