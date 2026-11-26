@@ -1152,6 +1152,129 @@ pub fn glu_mv<'a>(
     )
 }
 
+/// The param of a [`linear`] or [`glu_mv`] node (past the 8 the kernels read) that puts its
+/// launch on the side stream (#871, [`shexp_on_side`]): [`SIDE_ON`], with [`SIDE_FORK`] for the
+/// first op of the chain and [`SIDE_DONE`] for the last.
+pub(crate) const P_SIDE: usize = 8;
+/// [`P_SIDE`]: the op launches on the side stream.
+pub(crate) const SIDE_ON: i32 = 1;
+/// [`P_SIDE`]: the side stream forks from the compute stream before the op.
+pub(crate) const SIDE_FORK: i32 = 2;
+/// [`P_SIDE`]: the side stream records its done event after the op, for the join.
+pub(crate) const SIDE_DONE: i32 = 4;
+
+/// [`shexp_side`] before the first read: the environment's choice.
+const SHEXP_SIDE_UNSET: u8 = u8::MAX;
+
+static SHEXP_SIDE: AtomicU8 = AtomicU8::new(SHEXP_SIDE_UNSET);
+
+/// Whether a MoE layer's shared expert of a 1-4 token step runs on the side stream beside the
+/// routed experts (#871, [`shexp_on_side`]): on unless `LEGION_DEBUG_GLM_SHEXP_SIDE=0` (an A/B
+/// switch, read once), on [`set_gb10_gemv`]'s GPUs.
+pub fn shexp_side() -> bool {
+    if !GB10_GEMV.load(Ordering::Relaxed) {
+        return false;
+    }
+    let v = SHEXP_SIDE.load(Ordering::Relaxed);
+    if v != SHEXP_SIDE_UNSET {
+        return v != 0;
+    }
+    let v = shexp_side_of(std::env::var("LEGION_DEBUG_GLM_SHEXP_SIDE").ok().as_deref());
+    SHEXP_SIDE.store(v as u8, Ordering::Relaxed);
+    v
+}
+
+/// [`shexp_side`] given the environment's value: off only for `0`.
+pub(crate) fn shexp_side_of(env: Option<&str>) -> bool {
+    env.map(str::trim) != Some("0")
+}
+
+/// Sets [`shexp_side`] for graphs built from now on.
+pub fn set_shexp_side(on: bool) {
+    SHEXP_SIDE.store(on as u8, Ordering::Relaxed);
+}
+
+/// Marks a shared expert of a decode step for the side stream (#871): `down` is its down
+/// projection, a [`linear`] of Q6_K weights over a [`glu_mv`] node (gate, up and the GLU) of
+/// at most 4 tokens, both reading weights straight from the model (no converted copy). The GLU
+/// forks the side stream from the compute stream and the down records its done event; the
+/// caller puts both in the graph ahead of the routed experts and a [`side_join`] after them
+/// (before the sum reads `down`),
+/// keeping the returned tensors (the down, the GLU's output and their input) allocated until
+/// then. The routed experts never read the shared expert's tensors and it never reads theirs,
+/// so both chains compute what they did, kernel for kernel: the same bits. `None` (and nothing
+/// marked) for any other tensor.
+pub(crate) fn shexp_on_side<'a>(ctx: &'a Context, down: Tensor<'a>) -> Option<[Tensor<'a>; 3]> {
+    let is = |t: *mut ffi::ggml_tensor, op: &ExternalOp| {
+        // SAFETY: a valid tensor of the context.
+        unsafe { crate::ggml::op_of(t).is_some_and(|o| std::ptr::eq(o, op)) }
+    };
+    let leaf = |t: *mut ffi::ggml_tensor| {
+        // SAFETY: as above.
+        !t.is_null() && unsafe { (*t).op == ffi::ggml_op_GGML_OP_NONE }
+    };
+    let d = down.raw();
+    if !is(d, &LINEAR) {
+        return None;
+    }
+    // SAFETY: a LINEAR node: src[0] its weights, src[1] its input.
+    let (dw, g) = unsafe { ((*d).src[0], (*d).src[1]) };
+    if g.is_null() || !is(g, &GLU_MV) || !leaf(dw) {
+        return None;
+    }
+    // SAFETY: a GLU_MV node: gate, up, x.
+    let (gw, uw, x) = unsafe { ((*g).src[0], (*g).src[1], (*g).src[2]) };
+    // SAFETY: valid tensors.
+    if !leaf(gw) || !leaf(uw) || x.is_null() || unsafe { (*g).ne[1] } > 4 {
+        return None;
+    }
+    // SAFETY: nodes of this context; P_SIDE is past both ops' kernel params.
+    unsafe {
+        crate::ggml::set_external_param(g, P_SIDE, SIDE_ON | SIDE_FORK);
+        crate::ggml::set_external_param(d, P_SIDE, SIDE_ON | SIDE_DONE);
+    }
+    Some([down, ctx.wrap(g), ctx.wrap(x)])
+}
+
+/// The compute stream's wait for the shared expert on the side stream (#871,
+/// [`shexp_on_side`]). Not a stage-graph op (GLM's decode ops run directly): a capture of the
+/// wait alone, without the fork, would be refused.
+static SIDE_JOIN: ExternalOp = ExternalOp {
+    name: "glm_side_join",
+    cpu: cpu_side_join,
+    #[cfg(feature = "cuda")]
+    cuda: Some(cuda_side_join),
+    #[cfg(not(feature = "cuda"))]
+    cuda: None,
+};
+
+unsafe fn cpu_side_join(_dst: &ffi::ggml_tensor, _ith: usize, _nth: usize) {
+    // Nothing to compute: the result is never read.
+}
+
+#[cfg(feature = "cuda")]
+unsafe fn cuda_side_join(
+    _dst: &ffi::ggml_tensor,
+    stream: *mut std::os::raw::c_void,
+) -> Result<(), String> {
+    crate::model::core::l2_prefetch::join_now(stream)
+}
+
+/// A node after `after` (and so after every op `after` needs) at which the compute stream waits
+/// for the side stream's chain of [`shexp_on_side`]. `keep` (that function's tensors) are its
+/// sources, so they stay allocated until it: no op of the compute stream in between takes
+/// their memory while the side stream still reads or writes it. Its F32 `[1]` result holds
+/// nothing.
+pub(crate) fn side_join<'a>(
+    ctx: &'a Context,
+    after: Tensor<'a>,
+    keep: &[Tensor<'a>],
+) -> Tensor<'a> {
+    let mut srcs = vec![after];
+    srcs.extend_from_slice(keep);
+    ctx.external(&SIDE_JOIN, types::F32, [1, 1, 1, 1], &srcs)
+}
+
 /// Elementwise logistic sigmoid of `x` (F32, contiguous).
 pub fn sigmoid<'a>(ctx: &'a Context, x: Tensor<'a>) -> Tensor<'a> {
     let x = contiguous(x);
