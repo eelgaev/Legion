@@ -52,10 +52,15 @@ constexpr int ATTN_DECODE_ROWS = 4;
 constexpr int ATTN_NR   = 16;
 constexpr int ATTN_D    = 128;
 constexpr int ATTN_WARPS = 4;
-// ink_mm_id: output rows per block, pairs per pass, pair list length.
-constexpr int MM_ROWS = 64;
-constexpr int MM_P    = 4;
-constexpr int MM_LIST = 1024;
+// ink_mm_id: a prompt block's output rows, pairs at a time and K values per pass, its threads
+// and pair list length; a decode warp's rows and groups of loads ahead.
+constexpr int MM_BM      = 32;
+constexpr int MM_BN      = 16;
+constexpr int MM_KC      = 128;
+constexpr int MM_THREADS = 256;
+constexpr int MM_LIST    = 1024;
+constexpr int MM_VEC_ROWS = 4;
+constexpr int MM_VEC_U    = 4;
 
 // A finite stand-in for -inf (--use_fast_math must not see infinities).
 constexpr float NEG = -3.0e38f;
@@ -679,97 +684,244 @@ __global__ void situ_kernel(const A a) {
 }
 
 // Element `lane` of 32-value group gi of row r of expert e of the stack in source 0, times its
-// scale (a Q8_0 block's, an MXFP8 group's from source 3).
+// scale (a Q8_0 block's, an MXFP8 group's from source 3), for a stack of type TY (F32 for any
+// other).
+template <int TY>
 __device__ __forceinline__ float mm_w(const A & a, int64_t e, int64_t r, int64_t gi, int lane) {
     const char * row = src(a, 0) + e * a.src_nb[0][2] + r * a.src_nb[0][1];
-    switch (a.src_type[0]) {
-        case TYPE_Q8_0: {
-            const char * b = row + gi * 34;
-            return __half2float(*(const __half *) b) * (float) ((const int8_t *) (b + 2))[lane];
-        }
-        case TYPE_I8: {
-            const int64_t k = a.src_ne[0][0], m = a.src_ne[0][1];
-            const float   s = ((const float *) src(a, 3))[(e * m + r) * (k / 32) + gi];
-            return e4m3(((const uint8_t *) row)[gi * 32 + lane]) * s;
-        }
-        case TYPE_F16:
-            return __half2float(((const __half *) row)[gi * 32 + lane]);
-        case TYPE_BF16:
-            return __bfloat162float(((const __nv_bfloat16 *) row)[gi * 32 + lane]);
-        default:
-            return ((const float *) row)[gi * 32 + lane];
+    if constexpr (TY == TYPE_Q8_0) {
+        const char * b = row + gi * 34;
+        return __half2float(*(const __half *) b) * (float) ((const int8_t *) (b + 2))[lane];
+    } else if constexpr (TY == TYPE_I8) {
+        const int64_t k = a.src_ne[0][0], m = a.src_ne[0][1];
+        const float   s = ((const float *) src(a, 3))[(e * m + r) * (k / 32) + gi];
+        return e4m3(((const uint8_t *) row)[gi * 32 + lane]) * s;
+    } else if constexpr (TY == TYPE_F16) {
+        return __half2float(((const __half *) row)[gi * 32 + lane]);
+    } else if constexpr (TY == TYPE_BF16) {
+        return __bfloat162float(((const __nv_bfloat16 *) row)[gi * 32 + lane]);
+    } else {
+        return ((const float *) row)[gi * 32 + lane];
     }
 }
 
 // ---- ink_mm_id: sources w [k, m, E], x [k, nx, n_tok], ids [n_used, n_tok] (I32,
-// contiguous), scale. A block per (64 output rows, expert): it lists the pairs routed to its
-// expert, then runs them MM_P at a time with their inputs in shared memory, a warp per row. ----
-__global__ void mm_id_kernel(const A a) {
-    extern __shared__ float xs[];
-    __shared__ int list[MM_LIST];
-    __shared__ int cnt;
+// contiguous), scale. Every output is warp_sum over the 32 lanes of lane l's part, the sum in
+// group order of w[32 gi + l] * x[32 gi + l]; both kernels keep exactly that (#1221: they
+// replace a warp-per-row kernel with these sums), so any split of the work gives the same bits.
+//
+// mm_id_kernel, for prompt steps: a block per (MM_BM output rows, expert). It lists the pairs
+// routed to its expert, then runs them MM_BN at a time over K in passes of MM_KC, the pass's
+// weights (as floats) and inputs in shared memory, a warp per 8 rows x 8 pairs. ----
+template <int TY>
+__device__ __forceinline__ void mm_id_tile(const A & a, float (*ws)[MM_KC], float (*xs)[MM_KC],
+                                           int * list, int64_t * xrow, int * cnt) {
     const int64_t k = a.src_ne[0][0], E = a.src_ne[0][2];
     const int64_t m = a.ne[0], n_used = a.ne[1], n_tok = a.ne[2];
     const int64_t nx = a.src_ne[1][1];
-    const int64_t e = blockIdx.y, r0 = (int64_t) blockIdx.x * MM_ROWS;
-    const int     warp = threadIdx.x / 32, lane = threadIdx.x % 32, nw = blockDim.x / 32;
+    const int64_t e = blockIdx.y, r0 = (int64_t) blockIdx.x * MM_BM;
+    const int     warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int     wr = warp % (MM_BM / 8) * 8, wc = warp / (MM_BM / 8) * 8;
     const int32_t * ids = (const int32_t *) src(a, 2);
     const float *   x   = (const float *) src(a, 1);
     float *         out = (float *) a.dst;
     const int64_t   npairs = n_used * n_tok;
-    for (int64_t c0 = 0; c0 < npairs; c0 += MM_LIST) {
+    for (int64_t pos = 0; pos < npairs;) {
         if (threadIdx.x == 0) {
-            cnt = 0;
+            *cnt = 0;
         }
         __syncthreads();
-        const int64_t c1 = min(c0 + MM_LIST, npairs);
-        for (int64_t i = c0 + threadIdx.x; i < c1; i += blockDim.x) {
-            const int32_t id = ids[i];
-            if (id == e) {
-                list[atomicAdd(&cnt, 1)] = (int) i;
-            } else if (e == 0 && (id < 0 || id >= E)) {
-                for (int rr = 0; rr < MM_ROWS && r0 + rr < m; rr++) {
-                    out[i * m + r0 + rr] = 0.f;
+        // List the expert's pairs while the list can take another pass of the block.
+        int n;
+        do {
+            const int64_t i = pos + threadIdx.x;
+            if (i < npairs) {
+                const int32_t id = ids[i];
+                if (id == e) {
+                    list[atomicAdd(cnt, 1)] = (int) i;
+                } else if (e == 0 && (id < 0 || id >= E)) {
+                    for (int rr = 0; rr < MM_BM && r0 + rr < m; rr++) {
+                        out[i * m + r0 + rr] = 0.f;
+                    }
                 }
             }
-        }
-        __syncthreads();
-        const int n = cnt;
-        for (int b = 0; b < n; b += MM_P) {
-            const int np = min(MM_P, n - b);
+            pos += blockDim.x;
             __syncthreads();
-            for (int64_t i = threadIdx.x; i < (int64_t) np * k; i += blockDim.x) {
-                const int     p  = (int) (i / k);
-                const int64_t pr = list[b + p];
-                const int64_t t = pr / n_used, j = pr % n_used;
-                xs[i]            = x[(t * nx + (nx == 1 ? 0 : j)) * k + i % k];
+            n = *cnt;
+            __syncthreads();
+        } while (pos < npairs && n <= MM_LIST - (int) blockDim.x);
+        for (int b = 0; b < n; b += MM_BN) {
+            const int np = min(MM_BN, n - b);
+            if (threadIdx.x < np) {
+                const int64_t pr = list[b + threadIdx.x];
+                xrow[threadIdx.x] = (pr / n_used * nx + (nx == 1 ? 0 : pr % n_used)) * k;
             }
-            __syncthreads();
-            for (int rr = warp; rr < MM_ROWS; rr += nw) {
-                const int64_t r = r0 + rr;
-                if (r >= m) {
-                    break;
+            // This warp's pairs (none when not positive).
+            const int nj = min(8, np - wc);
+            float     acc[8][8] = {};
+            for (int64_t k0 = 0; k0 < k; k0 += MM_KC) {
+                const int kc = (int) min((int64_t) MM_KC, k - k0);
+                __syncthreads();
+                for (int i = threadIdx.x; i < MM_BM * MM_KC; i += blockDim.x) {
+                    const int     rr = i / MM_KC, kk = i % MM_KC;
+                    const int64_t r = r0 + rr, c = k0 + kk;
+                    if (kk < kc) {
+                        ws[rr][kk] = r < m ? mm_w<TY>(a, e, r, c / 32, (int) (c % 32)) : 0.f;
+                    }
                 }
-                float acc[MM_P] = {};
-                for (int64_t gi = 0; gi < k / 32; gi++) {
-                    const float v = mm_w(a, e, r, gi, lane);
+                for (int i = threadIdx.x; i < np * MM_KC; i += blockDim.x) {
+                    const int p = i / MM_KC, kk = i % MM_KC;
+                    if (kk < kc) {
+                        xs[p][kk] = x[xrow[p] + k0 + kk];
+                    }
+                }
+                __syncthreads();
+                if (nj > 0) {
+                    for (int g = 0; g < kc / 32; g++) {
+                        float wv[8], xv[8];
 #pragma unroll
-                    for (int p = 0; p < MM_P; p++) {
-                        if (p < np) {
-                            acc[p] += v * xs[p * k + gi * 32 + lane];
+                        for (int ii = 0; ii < 8; ii++) {
+                            wv[ii] = ws[wr + ii][g * 32 + lane];
+                        }
+#pragma unroll
+                        for (int jj = 0; jj < 8; jj++) {
+                            xv[jj] = jj < nj ? xs[wc + jj][g * 32 + lane] : 0.f;
+                        }
+#pragma unroll
+                        for (int ii = 0; ii < 8; ii++) {
+#pragma unroll
+                            for (int jj = 0; jj < 8; jj++) {
+                                acc[ii][jj] += wv[ii] * xv[jj];
+                            }
                         }
                     }
                 }
+            }
+            if (nj > 0) {
 #pragma unroll
-                for (int p = 0; p < MM_P; p++) {
-                    const float s = warp_sum(acc[p]);
-                    if (lane == 0 && p < np) {
-                        out[(int64_t) list[b + p] * m + r] = s;
+                for (int ii = 0; ii < 8; ii++) {
+#pragma unroll
+                    for (int jj = 0; jj < 8; jj++) {
+                        const float   s = warp_sum(acc[ii][jj]);
+                        const int64_t r = r0 + wr + ii;
+                        if (lane == 0 && jj < nj && r < m) {
+                            out[(int64_t) list[b + wc + jj] * m + r] = s;
+                        }
                     }
                 }
             }
+            __syncthreads();
         }
-        __syncthreads();
+    }
+}
+
+static_assert((MM_BM / 8) * (MM_BN / 8) * 32 == MM_THREADS, "ink_mm_id: a warp per 8 x 8");
+static_assert(MM_BN <= MM_THREADS && MM_LIST >= 2 * MM_THREADS, "ink_mm_id: list sizes");
+
+__global__ void __launch_bounds__(MM_THREADS) mm_id_kernel(const A a) {
+    __shared__ float   ws[MM_BM][MM_KC];
+    __shared__ float   xs[MM_BN][MM_KC];
+    __shared__ int     list[MM_LIST];
+    __shared__ int64_t xrow[MM_BN];
+    __shared__ int     cnt;
+    switch (a.src_type[0]) {
+        case TYPE_Q8_0:
+            mm_id_tile<TYPE_Q8_0>(a, ws, xs, list, xrow, &cnt);
+            break;
+        case TYPE_I8:
+            mm_id_tile<TYPE_I8>(a, ws, xs, list, xrow, &cnt);
+            break;
+        case TYPE_F16:
+            mm_id_tile<TYPE_F16>(a, ws, xs, list, xrow, &cnt);
+            break;
+        case TYPE_BF16:
+            mm_id_tile<TYPE_BF16>(a, ws, xs, list, xrow, &cnt);
+            break;
+        default:
+            mm_id_tile<0>(a, ws, xs, list, xrow, &cnt);
+            break;
+    }
+}
+
+// mm_id_vec_kernel, for steps of no more pairs than experts (decode): a block per (output rows,
+// pair), a warp per MM_VEC_ROWS rows reading the weights straight from memory, MM_VEC_U groups
+// of loads ahead of their sums.
+template <int TY> __device__ __forceinline__ void mm_id_vec(const A & a) {
+    const int64_t k = a.src_ne[0][0], E = a.src_ne[0][2];
+    const int64_t m = a.ne[0], n_used = a.ne[1];
+    const int64_t nx = a.src_ne[1][1];
+    const int64_t pr = blockIdx.y;
+    const int     lane = threadIdx.x % 32;
+    const int64_t r0 = ((int64_t) blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * MM_VEC_ROWS;
+    if (r0 >= m) {
+        return;
+    }
+    const int     nr  = (int) min((int64_t) MM_VEC_ROWS, m - r0);
+    float *       out = (float *) a.dst + pr * m + r0;
+    const int32_t e   = ((const int32_t *) src(a, 2))[pr];
+    if (e < 0 || e >= E) {
+        if (lane < nr) {
+            out[lane] = 0.f;
+        }
+        return;
+    }
+    const float * xr =
+        (const float *) src(a, 1) + (pr / n_used * nx + (nx == 1 ? 0 : pr % n_used)) * k;
+    const int64_t ng = k / 32;
+    float         acc[MM_VEC_ROWS] = {};
+    int64_t       gi               = 0;
+    for (; gi + MM_VEC_U <= ng; gi += MM_VEC_U) {
+        float xv[MM_VEC_U], wv[MM_VEC_U][MM_VEC_ROWS];
+#pragma unroll
+        for (int u = 0; u < MM_VEC_U; u++) {
+            xv[u] = xr[(gi + u) * 32 + lane];
+#pragma unroll
+            for (int rr = 0; rr < MM_VEC_ROWS; rr++) {
+                wv[u][rr] = rr < nr ? mm_w<TY>(a, e, r0 + rr, gi + u, lane) : 0.f;
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < MM_VEC_U; u++) {
+#pragma unroll
+            for (int rr = 0; rr < MM_VEC_ROWS; rr++) {
+                acc[rr] += wv[u][rr] * xv[u];
+            }
+        }
+    }
+    for (; gi < ng; gi++) {
+        const float xv = xr[gi * 32 + lane];
+#pragma unroll
+        for (int rr = 0; rr < MM_VEC_ROWS; rr++) {
+            const float v = rr < nr ? mm_w<TY>(a, e, r0 + rr, gi, lane) : 0.f;
+            acc[rr] += v * xv;
+        }
+    }
+#pragma unroll
+    for (int rr = 0; rr < MM_VEC_ROWS; rr++) {
+        const float s = warp_sum(acc[rr]);
+        if (lane == 0 && rr < nr) {
+            out[rr] = s;
+        }
+    }
+}
+
+__global__ void mm_id_vec_kernel(const A a) {
+    switch (a.src_type[0]) {
+        case TYPE_Q8_0:
+            mm_id_vec<TYPE_Q8_0>(a);
+            break;
+        case TYPE_I8:
+            mm_id_vec<TYPE_I8>(a);
+            break;
+        case TYPE_F16:
+            mm_id_vec<TYPE_F16>(a);
+            break;
+        case TYPE_BF16:
+            mm_id_vec<TYPE_BF16>(a);
+            break;
+        default:
+            mm_id_vec<0>(a);
+            break;
     }
 }
 
@@ -788,7 +940,7 @@ __global__ void softcap_kernel(const A a) {
 
 }  // namespace
 
-extern "C" const void * const legion_ink_kernels[17] = {
+extern "C" const void * const legion_ink_kernels[18] = {
     reinterpret_cast<const void *>(&mix_kernel),
     reinterpret_cast<const void *>(&ctrl_in_kernel),
     reinterpret_cast<const void *>(&ctrl_out_kernel),
@@ -806,4 +958,5 @@ extern "C" const void * const legion_ink_kernels[17] = {
     reinterpret_cast<const void *>(&attn_kernel<1, ATTN_DECODE_ROWS>),
     reinterpret_cast<const void *>(&attn_kernel<2, ATTN_DECODE_ROWS>),
     reinterpret_cast<const void *>(&attn_kernel<4, ATTN_DECODE_ROWS>),
+    reinterpret_cast<const void *>(&mm_id_vec_kernel),
 };

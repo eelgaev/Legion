@@ -925,6 +925,163 @@ fn cuda_conv_prompt_steps_are_the_token_walk() {
     }
 }
 
+/// #1221: the GPU expert matmul's decode (a block per pair) and prompt (a block per expert, in
+/// tiles) kernels both give the bits of the sums it always had: warp_sum over the 32 lanes of
+/// lane l's fused multiply-add chain over the groups of `w[32 gi + l] · x[32 gi + l]`. Q8_0,
+/// MXFP8 and F32 stacks, shared and per-pair inputs, out-of-range ids, a K tail past whole
+/// passes and an expert taking more pairs than its list holds at once.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_expert_matmul_keeps_its_lane_sums() {
+    use crate::ggml::ComputeAllocator;
+    let mut gpu = gpu_backend();
+    let mut s = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let (k, m, n_exp, n_used) = (320usize, 40usize, 6usize, 3usize);
+    // The weights as the kernels read them, and their bytes.
+    let q8 = |next: &mut dyn FnMut() -> u64| -> (Vec<f32>, Vec<u8>) {
+        let (mut v, mut b) = (Vec::new(), Vec::new());
+        for _ in 0..k * m * n_exp / 32 {
+            let d = f32_to_f16(((next() >> 40) as f32 / (1u64 << 24) as f32 + 0.5) / 64.0);
+            b.extend(d.to_le_bytes());
+            for _ in 0..32 {
+                let q = (next() >> 56) as u8 as i8;
+                b.push(q as u8);
+                v.push(f16_to_f32(d) * q as f32);
+            }
+        }
+        (v, b)
+    };
+    let mx = |next: &mut dyn FnMut() -> u64| -> (Vec<f32>, Vec<u8>, Vec<f32>) {
+        let sc: Vec<f32> = (0..k * m * n_exp / 32)
+            .map(|_| (1 + (next() >> 60)) as f32 / 32.0)
+            .collect();
+        let mut b = Vec::new();
+        let v = (0..k * m * n_exp)
+            .map(|i| {
+                let mut q = (next() >> 56) as u8;
+                if q & 0x7f == 0x7f {
+                    q ^= 1;
+                }
+                b.push(q);
+                crate::model::fp8::e4m3_to_f32(q) * sc[i / 32]
+            })
+            .collect();
+        (v, b, sc)
+    };
+    let f = |next: &mut dyn FnMut() -> u64, n: usize| -> Vec<f32> {
+        (0..n)
+            .map(|_| (next() >> 40) as f32 / (1u64 << 23) as f32 - 1.0)
+            .collect()
+    };
+    // Lane sums in the kernels' order.
+    let lane_sum = |w: &[f32], x: &[f32]| -> f32 {
+        let mut lanes = [0f32; 32];
+        for (l, acc) in lanes.iter_mut().enumerate() {
+            for gi in 0..k / 32 {
+                *acc = w[gi * 32 + l].mul_add(x[gi * 32 + l], *acc);
+            }
+        }
+        for o in [16, 8, 4, 2, 1] {
+            let prev = lanes;
+            for (l, v) in lanes.iter_mut().enumerate() {
+                *v = prev[l] + prev[l ^ o];
+            }
+        }
+        lanes[0]
+    };
+    for ty in [types::Q8_0, types::I8, types::F32] {
+        let (wv, wb, sc) = match ty {
+            types::Q8_0 => {
+                let (v, b) = q8(&mut next);
+                (v, b, None)
+            }
+            types::I8 => {
+                let (v, b, s) = mx(&mut next);
+                (v, b, Some(s))
+            }
+            _ => {
+                let v = f(&mut next, k * m * n_exp);
+                let b = v.iter().flat_map(|v| v.to_le_bytes()).collect();
+                (v, b, None)
+            }
+        };
+        // Decode steps, a short prompt, and a prompt routing most pairs to expert 1.
+        let cases = [
+            (1usize, true),
+            (2, false),
+            (9, true),
+            (400, false),
+            (400, true),
+        ];
+        for (n_tok, shared) in cases {
+            let ids: Vec<i32> = (0..n_tok * n_used)
+                .map(|i| match next() % 16 {
+                    0 => -1,
+                    1 => n_exp as i32,
+                    2..=4 => (next() % n_exp as u64) as i32,
+                    _ if n_tok > 100 => 1,
+                    _ => (i % n_exp) as i32,
+                })
+                .collect();
+            let nx = if shared { 1 } else { n_used };
+            let xv = f(&mut next, k * nx * n_tok);
+            let ctx = Context::new(16, 16);
+            let w = ctx
+                .new_tensor(ty, &[k as i64, m as i64, n_exp as i64])
+                .as_input();
+            let scale = sc.as_ref().map(|_| {
+                ctx.new_tensor(types::F32, &[(k / 32) as i64, m as i64, n_exp as i64])
+                    .as_input()
+            });
+            let x = ctx
+                .new_tensor(types::F32, &[k as i64, nx as i64, n_tok as i64])
+                .as_input();
+            let id = ctx
+                .new_tensor(types::I32, &[n_used as i64, n_tok as i64])
+                .as_input();
+            let y = ops::mm_id(&ctx, w, scale, x, id).as_output();
+            let mut graph = ctx.new_graph(16);
+            graph.expand(y);
+            ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+                .unwrap();
+            w.set_bytes(&wb);
+            if let (Some(t), Some(v)) = (scale, &sc) {
+                t.set_f32(v);
+            }
+            x.set_f32(&xv);
+            let id_bytes: Vec<u8> = ids.iter().flat_map(|i| i.to_le_bytes()).collect();
+            id.set_bytes(&id_bytes);
+            gpu.compute(&graph).unwrap();
+            let y = y.to_f32();
+            let tn = crate::ggml::type_name(ty);
+            let case = format!("{tn} stack, {n_tok} tokens, shared input {shared}");
+            for (pr, &e) in ids.iter().enumerate() {
+                let (t, j) = (pr / n_used, pr % n_used);
+                let xr = &xv[(t * nx + if shared { 0 } else { j }) * k..][..k];
+                for r in 0..m {
+                    let want = if e < 0 || e as usize >= n_exp {
+                        0.0
+                    } else {
+                        lane_sum(&wv[(e as usize * m + r) * k..][..k], xr)
+                    };
+                    assert_eq!(
+                        y[pr * m + r].to_bits(),
+                        want.to_bits(),
+                        "{case}: pair {pr} (expert {e}), row {r}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// `t`'s per-expert entries of each token in the order of the experts' ids `ids` (`[k, n]`):
 /// `t` `[k, n]` (the ids, the weights) or `[w, k, n]` (the experts' rows).
 #[cfg(feature = "cuda")]
