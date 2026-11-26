@@ -13,8 +13,8 @@ model stateful, so prefix caching needs saved states.
 ## UD-Q4_K_XL GGUF
 
 `Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf` from `unsloth/Inkling-2-Mini-GGUF` on Hugging Face (renamed from
-`.gguf_file`, as the repo says). The root `Inkling-2-Mini-UD-Q4_K_XL.gguf` (Unsloth's own looped layout) loads too
-and holds the same tensors.
+`.gguf_file`, as the repo says). GGUFs in Unsloth's earlier `inkling2` layout (the same tensors under other
+names) load too.
 
 ```sh
 legion serve \
