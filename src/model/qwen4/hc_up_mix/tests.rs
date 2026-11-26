@@ -844,3 +844,166 @@ fn cpu_early_cast_is_ggmls_cast() {
         assert!(built_f32 == early_f32, "view {view}: F32 moved");
     }
 }
+
+/// `legion hc-up-mix-bench`'s variants read and write `up_mix_bf16_reg`'s options by name.
+#[test]
+fn bench_variants_parse() {
+    use bench::Variant;
+    let v = |s: &str| Variant::parse(s).unwrap();
+    assert_eq!(v("2"), Variant::new(2, None));
+    assert_eq!(v("1002:none"), Variant::new(1002, Some(0)));
+    assert_eq!(v("2:ld+xs"), Variant::new(2, Some(REG_LD | REG_XS)));
+    assert_eq!(v("2:15"), Variant::new(2, Some(REG_ALL)));
+    assert_eq!(v("2:pd2+cross"), Variant::new(2, Some(REG_PD2 | REG_CROSS)));
+    for s in ["2:foo", "x", "2:16", "2:-1", "2:ld+"] {
+        assert!(Variant::parse(s).is_err(), "{s}");
+    }
+    for s in ["2", "1002:none", "2:pd2+xs+ld+cross", "2:ld"] {
+        assert_eq!(v(s).to_string(), s);
+    }
+    // What ran: the kernel, and the options where some were forced.
+    assert!(v("2:ld").ran_as(2, REG_LD));
+    assert!(!v("2:ld+xs").ran_as(2, REG_LD), "XS dropped");
+    assert!(!v("2:ld").ran_as(1, 0), "fell back to up_mix_bf16");
+    assert!(v("2").ran_as(2, REG_PD2));
+    assert!(v("0").ran_as(1, 0) && v("1").ran_as(1, 0));
+}
+
+/// `--no-hc-up-mix-ldmatrix` takes ldmatrix out of the default options and nothing else.
+#[test]
+fn ldmatrix_switch_is_the_ld_bit() {
+    assert_eq!(DEFAULT_REG_OPTS, REG_LD);
+    set_up_mix_ldmatrix(false);
+    let off = REG_OPTS.load(std::sync::atomic::Ordering::Relaxed);
+    set_up_mix_ldmatrix(true);
+    let on = REG_OPTS.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(off, DEFAULT_REG_OPTS & !REG_LD);
+    assert_eq!(on, DEFAULT_REG_OPTS);
+}
+
+/// Qwen3.8-Flash-Next's mixer at the token counts of the docs command's steps (#1183): 12,288
+/// (a full prompt step), 8,067 (a tail with a part tile and a part run), 129 and 1.
+fn flash_next_mixer(tokens: Vec<i64>) -> bench::Config {
+    bench::Config {
+        e: 2560,
+        rank: 320,
+        tokens,
+        ..bench::Config::default()
+    }
+}
+
+/// Every `up_mix_bf16_reg` option alone and together, with `lo` through L1 (kernel 2 on a GB10)
+/// and L2 only (1002), the default and `up_mix_bf16`: the same bits as the kernel without
+/// options in every mode, the docs command's forms (F32 streams with and without lazy streams,
+/// BF16 streams, `xn`) included. Each check must have run the options it forced.
+#[test]
+#[ignore = "needs an sm_80+ GPU"]
+fn cuda_up_mix_reg_options_are_the_same_bits() {
+    use bench::Variant;
+    let mut gpu = crate::ggml::backend_by_name("CUDA0").expect("no CUDA0");
+    let all = [
+        0,
+        REG_PD2,
+        REG_XS,
+        REG_LD,
+        REG_CROSS,
+        REG_XS | REG_LD,
+        REG_ALL,
+    ];
+    let mut cfg = flash_next_mixer(vec![12288, 8067, 129, 1]);
+    cfg.copies = 1;
+    cfg.reference = Variant::new(2, Some(0));
+    cfg.variants = [2, 1002]
+        .iter()
+        .flat_map(|&k| all.iter().map(move |&o| Variant::new(k, Some(o))))
+        .chain([
+            Variant::new(0, Some(DEFAULT_REG_OPTS)),
+            Variant::new(1, Some(0)),
+        ])
+        .collect();
+    let checks = bench::check(&mut gpu, &cfg).unwrap();
+    assert_eq!(checks.len(), 4 * bench::MODES.len() * cfg.variants.len());
+    for c in &checks {
+        eprintln!(
+            "{:>6} {:<5} {:>14} ran {}:{} differing {} of {}",
+            c.tokens,
+            c.mode,
+            c.variant.to_string(),
+            c.ran,
+            c.ran_opts,
+            c.differing,
+            c.values
+        );
+    }
+    for c in &checks {
+        let what = format!("{} tokens {} {}", c.tokens, c.mode, c.variant);
+        assert!(
+            c.variant.ran_as(c.ran, c.ran_opts),
+            "{what}: ran {}:{}",
+            c.ran,
+            c.ran_opts
+        );
+        assert_eq!(
+            c.differing, 0,
+            "{what}: {} of {} values",
+            c.differing, c.values
+        );
+    }
+}
+
+/// The microbench (#1183): every option against the kernel without them, call by call, which
+/// runs first alternating per round; median, min and speedup per mode and token count (with
+/// `--nocapture`). Fails only when a variant did not run as forced.
+#[test]
+#[ignore = "needs an sm_80+ GPU; a timing run"]
+fn cuda_up_mix_reg_options_microbench() {
+    use bench::Variant;
+    let mut gpu = crate::ggml::backend_by_name("CUDA0").expect("no CUDA0");
+    let base = Variant::new(2, Some(0));
+    let mut cfg = flash_next_mixer(vec![12288, 8067]);
+    cfg.copies = 8;
+    cfg.rounds = 15;
+    cfg.variants = [
+        0,
+        REG_LD,
+        REG_PD2,
+        REG_XS,
+        REG_CROSS,
+        REG_LD | REG_XS,
+        REG_LD | REG_PD2,
+        REG_ALL,
+    ]
+    .map(|o| Variant::new(2, Some(o)))
+    .to_vec();
+    let rows = bench::ab(&mut gpu, &cfg, &["s16", "f32", "pre", "bf16"], base).unwrap();
+    println!(
+        "{:>6} {:<5} {:>14} {:>9} {:>9} {:>9} {:>9} {:>7} {:>7}",
+        "tokens",
+        "mode",
+        "variant",
+        "base med",
+        "var med",
+        "base min",
+        "var min",
+        "speedup",
+        "min sp"
+    );
+    for r in &rows {
+        println!(
+            "{:>6} {:<5} {:>14} {:>9.1} {:>9.1} {:>9.1} {:>9.1} {:>7.3} {:>7.3}",
+            r.tokens,
+            r.mode,
+            r.variant.to_string(),
+            r.median[0] * 1e6,
+            r.median[1] * 1e6,
+            r.min[0] * 1e6,
+            r.min[1] * 1e6,
+            r.speedup(),
+            r.speedup_min()
+        );
+    }
+    for r in &rows {
+        assert!(r.base.ran_as(r.ran[0].0, r.ran[0].1), "{r:?}");
+        assert!(r.variant.ran_as(r.ran[1].0, r.ran[1].1), "{r:?}");
+    }
+}

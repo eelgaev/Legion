@@ -85,6 +85,11 @@ struct legion_hc_up_mix {
     int64_t       pre_out_ld;
     const float * pre_inj;
     int64_t       pre_inj_ld;
+    // BF16 up, up_mix_bf16_reg only (#1183): its options, the REG_* bits below (the same bits
+    // with any of them): REG_PD2 streams prefetched two tiles ahead instead of one, REG_XS the
+    // mix's operands staged in shared memory during the matmul, REG_LD lo's B fragments by
+    // ldmatrix.x4, REG_CROSS the prefetch going on into the next run's tiles.
+    int32_t       reg_opts;
 };
 
 // Launches the kernels on `stream`; returns a cudaError_t (cudaErrorInvalidValue for shapes the
@@ -98,6 +103,10 @@ int legion_hc_up_lob_launch(const legion_hc_up_mix * p, void * stream);
 // The BF16 up-mix kernel the last launch ran, as p->kernel numbers it (1 up_mix_bf16, 2
 // up_mix_bf16_reg), for `legion hc-up-mix-bench`.
 int legion_hc_up_mix_last_kernel(void);
+
+// The up_mix_bf16_reg options (reg_opts bits) the last launch ran with (REG_XS dropped where the
+// operands are not 16-byte aligned; 0 after an up_mix_bf16 launch), for `legion hc-up-mix-bench`.
+int legion_hc_up_mix_last_opts(void);
 
 }  // extern "C"
 
@@ -176,29 +185,72 @@ constexpr int REG_RUN    = 4;  // tiles a CTA, F32 streams
 constexpr int REG_RUN_16 = 8;  // tiles a CTA, BF16 streams
 constexpr int REG_MIN_N  = 512;
 
-// One up_mix_bf16_reg launch: e / 32 column blocks times runs of `run` tiles. False (nothing
-// launched) when the kernel cannot have its shared memory.
-template <bool RB, bool S16, bool PRE = false> bool launch_reg(const legion_hc_up_mix & p, cudaStream_t s, int run) {
+// up_mix_bf16_reg's options (legion_hc_up_mix::reg_opts, #1183; the same bits with any).
+constexpr int REG_PD2   = 1;  // the streams prefetched into L2 two tiles ahead (REG_PD: one)
+constexpr int REG_XS    = 2;  // the mix's operands staged in shared memory while the matmul runs
+constexpr int REG_LD    = 4;  // lo's B fragments by ldmatrix.x4
+constexpr int REG_CROSS = 8;  // the prefetch goes on into the next run's first tiles
+constexpr int REG_ALL   = REG_PD2 | REG_XS | REG_LD | REG_CROSS;
+
+// The kernel the last BF16 launch ran (legion_hc_up_mix_last_kernel) and its options
+// (legion_hc_up_mix_last_opts).
+std::atomic<int> last_kernel{ 0 };
+std::atomic<int> last_opts{ 0 };
+
+// One up_mix_bf16_reg launch of the form L1 / XS / LD: e / 32 column blocks times runs of `run`
+// tiles. False (nothing launched) when the kernel cannot have its shared memory.
+template <bool RB, bool S16, bool PRE, bool L1, bool XS, bool LD>
+bool launch_reg_form(const legion_hc_up_mix & p, cudaStream_t s, int run, int opts) {
     constexpr int THREADS = REG_CG * HC * 32;
     constexpr int COLS    = REG_CG * ROWS;
-    constexpr int SMEM = (2 * REG_TT * (REG_KS * 8 + PAD / 4) + HC * REG_TT * (COLS + 4)) * (int) sizeof(float);
-    // lo's copies through L1 on compute capability 12.x (#1176 r43: measured on the GB10 only)
-    // unless p.kernel says L2 only (1000 to 1999), or on any GPU where it says L1 (2000 and up).
-    const auto cg     = up_mix_bf16_reg<REG_KS, REG_CG, REG_TT, REG_MINB, REG_PD, RB, S16, PRE>;
-    const bool ca     = p.kernel >= 2000 || (p.kernel < 1000 && legion_device::sm12x_device(cg));
-    const auto kernel = ca ? up_mix_bf16_reg<REG_KS, REG_CG, REG_TT, REG_MINB, REG_PD, RB, S16, PRE, true> : cg;
-    static std::atomic<int8_t> opt[2][GGML_CUDA_MAX_DEVICES];
-    if (!legion_device::smem_opt_in(opt[ca], kernel, SMEM)) {
+    constexpr int SMEM    = up_mix_bf16_reg_smem<REG_KS, REG_CG, REG_TT, RB, S16, PRE, XS>();
+    const auto    kernel  = up_mix_bf16_reg<REG_KS, REG_CG, REG_TT, REG_MINB, RB, S16, PRE, L1, XS, LD>;
+    static std::atomic<int8_t> opt[GGML_CUDA_MAX_DEVICES];
+    if (!legion_device::smem_opt_in(opt, kernel, SMEM)) {
         return false;
     }
     const int  chunk = run * REG_TT;
     const dim3 grid((unsigned) (p.e / COLS), (unsigned) ((p.n + chunk - 1) / chunk));
-    kernel<<<grid, THREADS, SMEM, s>>>(p, chunk);
+    kernel<<<grid, THREADS, SMEM, s>>>(p, chunk, (opts & REG_PD2) != 0 ? 2 : REG_PD, (opts & REG_CROSS) != 0);
+    last_opts.store(opts, std::memory_order_relaxed);
     return true;
 }
 
-// The kernel the last BF16 launch ran (legion_hc_up_mix_last_kernel).
-std::atomic<int> last_kernel{ 0 };
+template <bool RB, bool S16, bool PRE, bool L1>
+bool launch_reg_l1(const legion_hc_up_mix & p, cudaStream_t s, int run, int opts) {
+    switch (opts & (REG_XS | REG_LD)) {
+        case REG_XS | REG_LD:
+            return launch_reg_form<RB, S16, PRE, L1, true, true>(p, s, run, opts);
+        case REG_XS:
+            return launch_reg_form<RB, S16, PRE, L1, true, false>(p, s, run, opts);
+        case REG_LD:
+            return launch_reg_form<RB, S16, PRE, L1, false, true>(p, s, run, opts);
+        default:
+            return launch_reg_form<RB, S16, PRE, L1, false, false>(p, s, run, opts);
+    }
+}
+
+// Whether XS's 16-byte copies of the streams (and PRE's attention block outputs) are aligned.
+bool xs_aligned(const legion_hc_up_mix & p) {
+    const void * xs = p.res != nullptr ? (const void *) p.res : (const void *) p.xn;
+    return (uintptr_t) xs % 16 == 0 &&
+           (p.pre_out == nullptr || ((uintptr_t) p.pre_out % 16 == 0 && p.pre_out_ld % 4 == 0));
+}
+
+// One up_mix_bf16_reg launch with p.reg_opts. False (nothing launched) when the kernel cannot
+// have its shared memory.
+template <bool RB, bool S16, bool PRE = false> bool launch_reg(const legion_hc_up_mix & p, cudaStream_t s, int run) {
+    // lo's copies through L1 on compute capability 12.x (#1176 r43: measured on the GB10 only)
+    // unless p.kernel says L2 only (1000 to 1999), or on any GPU where it says L1 (2000 and up).
+    const bool ca =
+        p.kernel >= 2000 ||
+        (p.kernel < 1000 && legion_device::sm12x_device(up_mix_bf16_reg<REG_KS, REG_CG, REG_TT, REG_MINB, RB, S16, PRE>));
+    int opts = p.reg_opts & REG_ALL;
+    if ((opts & REG_XS) != 0 && !xs_aligned(p)) {
+        opts &= ~REG_XS;
+    }
+    return ca ? launch_reg_l1<RB, S16, PRE, true>(p, s, run, opts) : launch_reg_l1<RB, S16, PRE, false>(p, s, run, opts);
+}
 
 // The BF16 up-mix by p.kernel (see legion_hc_up_mix): up_mix_bf16_reg where the default or
 // kernel 2 takes it; false when up_mix_bf16 should run. Kernel 2 + 100 R: runs of R tiles
@@ -253,6 +305,7 @@ extern "C" int legion_hc_up_mix_launch(const legion_hc_up_mix * p, void * stream
             up_mix_bf16<false><<<grid, WARPS * 32, smem, s>>>(*p);
         }
         last_kernel.store(1, std::memory_order_relaxed);
+        last_opts.store(0, std::memory_order_relaxed);
         return (int) cudaGetLastError();
     }
     // (The BF16 copy of mixed and the lazy streams are the BF16 kernels' only.)
@@ -291,4 +344,8 @@ extern "C" int legion_hc_up_lob_launch(const legion_hc_up_mix * p, void * stream
 
 extern "C" int legion_hc_up_mix_last_kernel(void) {
     return last_kernel.load(std::memory_order_relaxed);
+}
+
+extern "C" int legion_hc_up_mix_last_opts(void) {
+    return last_opts.load(std::memory_order_relaxed);
 }

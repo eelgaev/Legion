@@ -63,11 +63,15 @@ __global__ void lo_bf16(const legion_hc_up_mix p) {
 
 // Lazy streams (#1183, p.pre_out): the weight stream s of token tok takes the attention block's
 // output with, as fused.cu's hc_post_norm kernels compute their wpost (the same expressions).
-__device__ __forceinline__ float pre_weight(const legion_hc_up_mix & p, int64_t tok, int s) {
+__device__ __forceinline__ float pre_weight_of(const legion_hc_up_mix & p, float inj) {
     // ggml: scale(inject, 1 / hc), sigmoid, scale(2)
-    const float v = p.pre_inj[tok * p.pre_inj_ld + s] * (1.0f / (float) p.hc);
+    const float v = inj * (1.0f / (float) p.hc);
     const float e = 1.0f / (1.0f + expf(-v));
     return e * 2.0f;
+}
+
+__device__ __forceinline__ float pre_weight(const legion_hc_up_mix & p, int64_t tok, int s) {
+    return pre_weight_of(p, p.pre_inj[tok * p.pre_inj_ld + s]);
 }
 
 // S16 (with RB; #1183, `legion serve --hc-bf16`): the streams are BF16 (hc_post_norm_b16_kernel's),
@@ -219,11 +223,26 @@ __global__ void __launch_bounds__(WARPS * 32) up_mix_bf16(const legion_hc_up_mix
 // L1 (#1176 r43): lo's rows copied through L1 (cp.async.ca) instead of L2 only (cp.async.cg).
 // Every column block of a token run stages the same lo rows (e / 32 CTAs of them, lo most of a
 // CTA's bytes), so an SM's CTAs of one run can share them in its L1. The same bytes either way.
-template <int KS, int CG, int TT, int MINB, int PD, bool RB, bool S16, bool PRE = false, bool L1 = false>
-__global__ void __launch_bounds__(CG * HC * 32, MINB) up_mix_bf16_reg(const legion_hc_up_mix p, const int chunk) {
+//
+// Options (#1183, the same bits; legion_hc_up_mix::reg_opts, hc_up_mix.cu's REG_*):
+// - pd (runtime): how many tiles ahead the streams are prefetched into L2 (1 by default).
+// - cross (runtime): the prefetch runs on past the CTA's run into the next run's first tiles
+//   (the column block's next CTA), not only up to the run's end.
+// - XS: the mix's operands of the tile (its stream values, the scales and, PRE, the attention
+//   block's output and inject weights) are copied into shared memory by cp.async at the tile's
+//   start, while the matmul runs, so the mix reads them there instead of waiting on L2 for
+//   them after the matmul. The same values, so the same bits.
+// - LD: lo's B fragments loaded with one ldmatrix.x4 per K step (both token tiles, both halves)
+//   instead of four 32-bit shared loads: the same 32-bit words in the same registers.
+// smem: up_mix_bf16_reg_smem().
+template <int KS, int CG, int TT, int MINB, bool RB, bool S16, bool PRE = false, bool L1 = false, bool XS = false,
+          bool LD = false>
+__global__ void __launch_bounds__(CG * HC * 32, MINB)
+    up_mix_bf16_reg(const legion_hc_up_mix p, const int chunk, const int pd, const int cross) {
     static_assert(RB || !S16, "up_mix_bf16_reg: BF16 streams in the rebuilt form only");
     static_assert(!PRE || (RB && !S16), "up_mix_bf16_reg: lazy streams of F32 streams in the rebuilt form only");
     static_assert(TT % 8 == 0 && TT >= 8, "up_mix_bf16_reg: whole n8 tiles");
+    static_assert(!LD || TT % 16 == 0, "up_mix_bf16_reg: ldmatrix.x4 takes two n8 tiles at a time");
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     constexpr int THREADS = CG * HC * 32;
     constexpr int COLS    = CG * ROWS;      // mixed columns of the CTA
@@ -235,6 +254,12 @@ __global__ void __launch_bounds__(CG * HC * 32, MINB) up_mix_bf16_reg(const legi
     extern __shared__ int smem[];
     uint32_t * lb = (uint32_t *) smem;            // [2][TT][LW]: lo's BF16 pairs
     float *    gs = (float *) (lb + 2 * TT * LW);  // [HC][TT][GS]: the gates
+    // XS: [TT][HC][COLS] stream values (ES bytes each), then [TT][HC] scales (RB), then PRE's
+    // [TT][COLS] attention block outputs and [TT][HC] inject weights.
+    char *  xsm = (char *) (gs + HC * TT * GS);
+    float * ssm = (float *) (xsm + (XS ? TT * HC * COLS * ES : 0));
+    float * psm = ssm + (XS && RB ? TT * HC : 0);
+    float * ism = psm + (XS && PRE ? TT * COLS : 0);
 
     const int     tid = threadIdx.x, warp = tid / 32, lane = tid % 32, g = lane / 4, q = lane % 4;
     const int     c = warp % HC, gi = warp / HC;  // the warp's stream and column group
@@ -268,15 +293,17 @@ __global__ void __launch_bounds__(CG * HC * 32, MINB) up_mix_bf16_reg(const legi
         }
         asm volatile("cp.async.commit_group;" ::: "memory");
     };
-    // The streams of tile `tile` into L2: COLS values per token and stream.
+    // The streams of tile `tile` into L2: COLS values per token and stream. Up to the run's end,
+    // or (cross) on into the next run's tiles.
+    const int pf_end = cross != 0 ? p.n : t_end;
     auto prefetch = [&](int tile) {
-        if (tile >= tiles) {
+        const int base = t_begin + tile * TT;
+        if (base >= pf_end) {
             return;
         }
-        const int base = t_begin + tile * TT;
         for (int u = tid; u < TT * HC; u += THREADS) {
             const int tok = base + u / HC;
-            if (tok < t_end) {
+            if (tok < pf_end) {
                 const char * x = (const char *) xs + ((int64_t) tok * K + (int64_t) (u % HC) * p.e + i0) * ES;
 #if __CUDA_ARCH__ >= 900
                 if (((uintptr_t) x & 15) == 0) {
@@ -294,7 +321,7 @@ __global__ void __launch_bounds__(CG * HC * 32, MINB) up_mix_bf16_reg(const legi
             // The attention block's output: COLS F32 values per token.
             for (int u = tid; u < TT; u += THREADS) {
                 const int tok = base + u;
-                if (tok < t_end) {
+                if (tok < pf_end) {
                     const char * x = (const char *) (p.pre_out + (int64_t) tok * p.pre_out_ld + i0);
 #if __CUDA_ARCH__ >= 900
                     if (((uintptr_t) x & 15) == 0) {
@@ -311,9 +338,55 @@ __global__ void __launch_bounds__(CG * HC * 32, MINB) up_mix_bf16_reg(const legi
         }
     };
 
+    // XS: the mix's operands of the tile at `base` into shared memory (tokens past the run: not
+    // copied, not read), one group.
+    auto stage_x = [&](int base) {
+        constexpr int RV = COLS * ES / 16;  // 16-byte pieces per token and stream
+        for (int u = tid; u < TT * HC * RV; u += THREADS) {
+            const int r = u / RV, v = u % RV;  // r: token r / HC of the tile, stream r % HC
+            const int tok = base + r / HC;
+            if (tok < t_end) {
+                const char * src =
+                    (const char *) xs + ((int64_t) tok * K + (int64_t) (r % HC) * p.e + i0) * ES + v * 16;
+                const uint32_t dst = (uint32_t) __cvta_generic_to_shared(xsm + r * COLS * ES + v * 16);
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(src) : "memory");
+            }
+        }
+        // The scales and inject weights: 4 bytes a value (their rows need not be 16-byte aligned).
+        if constexpr (RB) {
+            for (int u = tid; u < TT * HC; u += THREADS) {
+                const int tok = base + u / HC;
+                if (tok < t_end) {
+                    const float *  src = p.sc + (int64_t) tok * HC + u % HC;
+                    const uint32_t dst = (uint32_t) __cvta_generic_to_shared(ssm + u);
+                    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(dst), "l"(src) : "memory");
+                }
+            }
+        }
+        if constexpr (PRE) {
+            constexpr int PV = COLS * 4 / 16;
+            for (int u = tid; u < TT * PV; u += THREADS) {
+                const int tok = base + u / PV;
+                if (tok < t_end) {
+                    const float *  src = p.pre_out + (int64_t) tok * p.pre_out_ld + i0 + (u % PV) * 4;
+                    const uint32_t dst = (uint32_t) __cvta_generic_to_shared(psm + u * 4);
+                    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(src) : "memory");
+                }
+            }
+            for (int u = tid; u < TT * HC; u += THREADS) {
+                const int tok = base + u / HC;
+                if (tok < t_end) {
+                    const float *  src = p.pre_inj + (int64_t) tok * p.pre_inj_ld + u % HC;
+                    const uint32_t dst = (uint32_t) __cvta_generic_to_shared(ism + u);
+                    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(dst), "l"(src) : "memory");
+                }
+            }
+        }
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    };
+
     stage(0, 0);
-#pragma unroll
-    for (int d = 0; d < PD; d++) {
+    for (int d = 0; d < pd; d++) {
         prefetch(d);
     }
 
@@ -347,11 +420,19 @@ __global__ void __launch_bounds__(CG * HC * 32, MINB) up_mix_bf16_reg(const legi
         // Tile it's lo is in; every thread is past the last tile's matmul (buffer buf ^ 1 free)
         // and its mix (the gates free).
         __syncthreads();
+        // XS: this tile's mix operands first (the mix needs them first), then the next tile's lo
+        // as the group after them (an empty one after the last tile), so the mix waits for its
+        // group only.
+        if constexpr (XS) {
+            stage_x(base);
+        }
         if (it + 1 < tiles) {
             stage(it + 1, buf ^ 1);
+        } else if constexpr (XS) {
+            asm volatile("cp.async.commit_group;" ::: "memory");
         }
-        if (PD > 0) {
-            prefetch(it + PD);
+        if (pd > 0) {
+            prefetch(it + pd);
         }
 
         float acc[NT][4];
@@ -363,14 +444,30 @@ __global__ void __launch_bounds__(CG * HC * 32, MINB) up_mix_bf16_reg(const legi
             }
         }
         const uint32_t * lt = lb + buf * TT * LW;
+        // LD: lane l gives row l % 8 of 8x8 matrix l / 8 = (token tile 2 tp + l / 16, half
+        // (l / 8) % 2): its 16 bytes at words k * 8 + 4 half of token row (l / 16) * 8 + l % 8.
+        // Thread T gets row T / 4 = g, word T % 4 = q of each matrix: b[t][half], words q and
+        // 4 + q of token g's row, as the loads below.
+        [[maybe_unused]] const uint32_t lm =
+            (uint32_t) __cvta_generic_to_shared(lt + ((lane >> 4) * 8 + (lane & 7)) * LW + ((lane >> 3) & 1) * 4);
 #pragma unroll
         for (int k = 0; k < KS; k++) {
             uint32_t b[NT][2];
+            if constexpr (LD) {
 #pragma unroll
-            for (int t = 0; t < NT; t++) {
-                const uint32_t * src = lt + (t * 8 + g) * LW + k * 8;
-                b[t][0]              = src[q];
-                b[t][1]              = src[4 + q];
+                for (int tp = 0; tp < NT / 2; tp++) {
+                    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                                 : "=r"(b[2 * tp][0]), "=r"(b[2 * tp][1]), "=r"(b[2 * tp + 1][0]),
+                                   "=r"(b[2 * tp + 1][1])
+                                 : "r"(lm + (uint32_t) ((tp * 16 * LW + k * 8) * 4)));
+                }
+            } else {
+#pragma unroll
+                for (int t = 0; t < NT; t++) {
+                    const uint32_t * src = lt + (t * 8 + g) * LW + k * 8;
+                    b[t][0]              = src[q];
+                    b[t][1]              = src[4 + q];
+                }
             }
 #pragma unroll
             for (int t = 0; t < NT; t++) {
@@ -384,6 +481,10 @@ __global__ void __launch_bounds__(CG * HC * 32, MINB) up_mix_bf16_reg(const legi
                 gs[(c * TT + t * 8 + 2 * q + (l & 1)) * GS + gi * ROWS + g + (l >> 1) * 8] = acc[t][l];
             }
         }
+        if constexpr (XS) {
+            // The mix operands' group (the next tile's lo, committed after it, may still run).
+            asm volatile("cp.async.wait_group 1;" ::: "memory");
+        }
         __syncthreads();
 
 #pragma unroll
@@ -395,21 +496,25 @@ __global__ void __launch_bounds__(CG * HC * 32, MINB) up_mix_bf16_reg(const legi
                 float         sum = 0.0f;
                 [[maybe_unused]] float po = 0.0f;
                 if constexpr (PRE) {
-                    po = p.pre_out[(int64_t) tok * p.pre_out_ld + ei];
+                    po = XS ? psm[tt * COLS + ec] : p.pre_out[(int64_t) tok * p.pre_out_ld + ei];
                 }
 #pragma unroll
                 for (int s = 0; s < HC; s++) {
                     float xv;
-                    if constexpr (S16) {
+                    if constexpr (XS && S16) {
+                        xv = __bfloat162float(((const __nv_bfloat16 *) xsm)[(tt * HC + s) * COLS + ec]);
+                    } else if constexpr (XS) {
+                        xv = ((const float *) xsm)[(tt * HC + s) * COLS + ec];
+                    } else if constexpr (S16) {
                         xv = __bfloat162float(((const __nv_bfloat16 *) p.res)[at + (int64_t) s * p.e]);
                     } else {
                         xv = ((const float *) xs)[at + (int64_t) s * p.e];
                     }
                     if constexpr (PRE) {
-                        xv = __fmaf_rn(po, pre_weight(p, tok, s), xv);
+                        xv = __fmaf_rn(po, XS ? pre_weight_of(p, ism[tt * HC + s]) : pre_weight(p, tok, s), xv);
                     }
                     if constexpr (RB) {
-                        xv = __fmul_rn(__fmul_rn(xv, p.sc[(int64_t) tok * HC + s]), gv[s]);
+                        xv = __fmul_rn(__fmul_rn(xv, XS ? ssm[tt * HC + s] : p.sc[(int64_t) tok * HC + s]), gv[s]);
                     }
                     const float wv = 1.0f / (1.0f + expf(-gs[(s * TT + tt) * GS + ec]));
                     sum += xv * wv;
@@ -428,4 +533,15 @@ __global__ void __launch_bounds__(CG * HC * 32, MINB) up_mix_bf16_reg(const legi
 #else
     __trap();
 #endif
+}
+
+// up_mix_bf16_reg's dynamic shared memory in bytes: lo's two buffers, the gates and (XS) the mix
+// operands of a tile.
+template <int KS, int CG, int TT, bool RB, bool S16, bool PRE, bool XS> constexpr int up_mix_bf16_reg_smem() {
+    constexpr int COLS  = CG * ROWS;
+    int           bytes = (2 * TT * (KS * 8 + PAD / 4) + HC * TT * (COLS + 4)) * 4;
+    if (XS) {
+        bytes += TT * HC * COLS * (S16 ? 2 : 4) + (RB ? TT * HC * 4 : 0) + (PRE ? TT * COLS * 4 + TT * HC * 4 : 0);
+    }
+    return bytes;
 }

@@ -398,6 +398,9 @@ pub struct Switches {
     /// The same op for BF16 mixer up weights ([`crate::model::qwen4::set_up_mix_bf16`], on by
     /// default).
     pub hc_up_mix_bf16: Option<bool>,
+    /// That op's prompt kernel loading its B fragments with `ldmatrix.x4`
+    /// ([`crate::model::qwen4::set_up_mix_ldmatrix`], on by default, the same bits).
+    pub hc_up_mix_ldmatrix: Option<bool>,
     /// qwen4exp's combine-and-norm writing the streams' norm scales instead of the normed
     /// streams, rebuilt by the up-mix op ([`crate::model::qwen4::set_up_mix_rebuild`]).
     pub hc_xn_rebuild: Option<bool>,
@@ -850,6 +853,7 @@ impl Switches {
         set(self.tu_mmq, crate::model::tu_mmq::set_tu_mmq);
         set(self.hc_up_mix, qwen4::set_up_mix);
         set(self.hc_up_mix_bf16, qwen4::set_up_mix_bf16);
+        set(self.hc_up_mix_ldmatrix, qwen4::set_up_mix_ldmatrix);
         set(self.hc_xn_rebuild, qwen4::set_up_mix_rebuild);
         set(self.hc_streams_bf16, qwen4::set_streams_bf16);
         set(self.hc_bf16, qwen4::set_hc_bf16);

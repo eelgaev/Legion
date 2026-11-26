@@ -1064,6 +1064,12 @@ pub(in crate::cli) struct SwitchArgs {
     /// +4-9% on one GB10, #836). For comparisons.
     #[arg(long, help_heading = HEADING)]
     no_hc_up_mix_bf16: bool,
+    /// qwen4exp prompt steps of 512+ tokens where the one-kernel BF16 up-mix runs (see
+    /// --no-hc-up-mix-bf16; no effect elsewhere): load its matmul's lo fragments from shared
+    /// memory with four 32-bit loads per K step instead of one ldmatrix.x4 (the default: the
+    /// same values in the same registers, so the same output). For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_hc_up_mix_ldmatrix: bool,
     /// qwen4exp prompt steps on compute capability 12.x GPUs (GB10) where the up-mix kernel
     /// runs, of 64+ tokens on a V100 (7.0) where the F16 mix of --hc-mix-f16 runs, and of 128+
     /// tokens on compute capability 8.0+ GPUs with BF16 mixer weights under --hc-mix-rebuild-bf16;
@@ -1735,6 +1741,7 @@ impl SwitchArgs {
             tu_mmq: self.tu_mmq_ggml.then_some(false),
             hc_up_mix: self.hc_up_mix_ggml.then_some(false),
             hc_up_mix_bf16: self.no_hc_up_mix_bf16.then_some(false),
+            hc_up_mix_ldmatrix: self.no_hc_up_mix_ldmatrix.then_some(false),
             hc_xn_rebuild: self.hc_xn_written.then_some(false),
             hc_streams_bf16: self.hc_streams_bf16.then_some(true),
             hc_bf16: self.hc_bf16.then_some(true),

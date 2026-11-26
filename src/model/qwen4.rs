@@ -49,6 +49,7 @@ pub(crate) use hc_up_mix::{
 };
 pub use hc_up_mix::{
     set_gpu as set_up_mix_gpu, set_rebuild as set_up_mix_rebuild, set_up_mix, set_up_mix_bf16,
+    set_up_mix_ldmatrix,
 };
 mod mtp;
 pub(crate) mod mtp_in;
