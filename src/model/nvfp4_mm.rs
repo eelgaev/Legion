@@ -1719,6 +1719,7 @@ mod cuda {
         unread_skips: i32,
         xpf: i32,
         wst: i32,
+        wpf: i32,
     }
 
     /// `Params::sel_lo`, `sel_hi` for every expert.
@@ -1892,6 +1893,9 @@ mod cuda {
         }
     }
 
+    /// [`super::force_gemm_next_prefetch`]'s depth in blocks (0: none).
+    pub(super) static FORCED_WPF: AtomicU64 = AtomicU64::new(0);
+
     /// [`super::force_gemm_l1`]'s copies plus one (0: none forced).
     pub(super) static FORCED_L1: AtomicU64 = AtomicU64::new(0);
 
@@ -1969,6 +1973,7 @@ mod cuda {
             unread_skips: 0,
             xpf: 0,
             wst: 0,
+            wpf: 0,
         };
         launch(&mut p, kernel, stream)
     }
@@ -2020,6 +2025,7 @@ mod cuda {
             unread_skips: 0,
             xpf: forced_xpf().unwrap_or(0),
             wst: 0,
+            wpf: 0,
         };
         // SAFETY: parameters checked above; the node's stream.
         let code = unsafe {
@@ -2161,6 +2167,7 @@ mod cuda {
             unread_skips: unread(dst) as i32,
             xpf: 0,
             wst: 0,
+            wpf: 0,
         };
         if let Some(t) = forced_tiles() {
             p.tiles_n = p.tiles_n.min(t);
@@ -2350,6 +2357,7 @@ mod cuda {
             unread_skips: unread(dst) as i32,
             xpf: forced_xpf().unwrap_or(0),
             wst: 0,
+            wpf: 0,
         };
         if let Some(cut) = split {
             // The experts of more than `cut` pairs on the GEMM first, so the grouped SwiGLU mv
@@ -2398,6 +2406,7 @@ mod cuda {
         stream: *mut c_void,
     ) -> Result<(), String> {
         p.wst = forced_wst().unwrap_or_else(|| grouped_glu_wst(nt, tune));
+        p.wpf = FORCED_WPF.load(Ordering::Relaxed) as i32;
         let diag = match FORCED_DIAG.load(Ordering::Relaxed) as i32 {
             0 if forced_pf() != 0 => forced_pf(),
             0 if pf32() && matches!((nt, tune.code()), (16, 31) | (8, 31) | (8, 41)) => 2048,
@@ -2518,13 +2527,40 @@ pub fn force_gemm_l1(l1: Option<i32>) {
 /// weight copies, 16 no activation copies, 64 no k loop; the combinations
 /// [`gemm_bench`] runs), at 128-token tiles and the default tune only; 0: the
 /// whole kernel. `legion nvfp4-gemm-bench` only (#1176 r35): what bounds the GEMM. The results
-/// are wrong.
+/// are wrong. Also the exact bench variants [`DIAG_TILE_ORDER`] and [`DIAG_NEXT_PREFETCH`]
+/// (#1183), the same bits.
 #[doc(hidden)]
 pub fn force_gemm_diag(diag: i32) {
     #[cfg(feature = "cuda")]
     cuda::FORCED_DIAG.store(diag as u64, std::sync::atomic::Ordering::Relaxed);
     #[cfg(not(feature = "cuda"))]
     let _ = diag;
+}
+
+/// `nvfp4_gemm`'s `DIAG_TORD` (#1183, [`force_gemm_diag`], the grouped SwiGLU's 128-token tile
+/// with the default staged epilogue only): the CTAs of each expert with its token tiles fastest
+/// (an expert's tiles of one row tile adjacent in launch order) instead of its row tiles. The
+/// same tiles, so the same bits.
+#[doc(hidden)]
+pub const DIAG_TILE_ORDER: i32 = 1 << 19;
+/// `nvfp4_gemm`'s `DIAG_NWPF`: each CTA also L2-prefetches the weights of the tile the CTA one
+/// wave on runs, [`force_gemm_next_prefetch`] blocks of each row ahead. L2 hints only, the same
+/// bits.
+#[doc(hidden)]
+pub const DIAG_NEXT_PREFETCH: i32 = 1 << 20;
+
+/// The depth (blocks of each weight row, 0: none; the k steps or more: the whole tile; at most
+/// 65,535) of [`DIAG_NEXT_PREFETCH`]'s prefetch of the next wave's tile, from now on. For the
+/// bench only (#1183, `cuda_glu_order_prefetch_bench`); the other kernels ignore it.
+#[doc(hidden)]
+pub fn force_gemm_next_prefetch(depth: i32) {
+    #[cfg(feature = "cuda")]
+    cuda::FORCED_WPF.store(
+        depth.clamp(0, 0xffff) as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    #[cfg(not(feature = "cuda"))]
+    let _ = depth;
 }
 
 /// Launches every grouped mv [`mul_mat_id`] from now on as the variant `g`, or the default for

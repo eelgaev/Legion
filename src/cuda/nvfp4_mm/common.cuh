@@ -97,6 +97,12 @@ struct legion_nvfp4_mm {
     // 2- or 4-byte stores, as before. The grouped SwiGLU GEMM's tiles of 64 and 128 tokens
     // (variants 31 and 41) the same, EPI_CS with EPI_WIDE only. Other tiles ignore it.
     int32_t wst;
+    // nvfp4_gemm's DIAG_NWPF (#1183 bench variant, L2 hints only, the same sums): bits 0-15 a
+    // depth d, the first d weight blocks of each row of the tile the CTA one wave on will run,
+    // prefetched during the CTA's last d k steps (d >= the k steps: that tile's whole rows, from
+    // the start); bits 16 and up the wave, the CTAs resident at once (set by its launch: the SM
+    // count at one CTA an SM). Other kernels ignore it.
+    int32_t wpf;
 };
 
 // The GEMM: tiles_m * tiles_n CTAs of 256 threads; mi = 1 or 2 (128 * mi rows), nt = 1, 2, 4,
@@ -394,6 +400,58 @@ __device__ __forceinline__ bool find_tile(const int32_t * offs, int n_expert, in
     return true;
 }
 
+// find_tile for nvfp4_gemm's DIAG_TORD launch order (#1183): CTA `cta` of a grouped launch of
+// tiles_m row tiles, the CTAs in expert order and, inside an expert's tiles_m * te CTAs (te: its
+// token tiles), its token tiles fastest: CTA r of the expert runs row tile r / te of token tile
+// r % te, so the expert's token tiles of one row tile are adjacent CTAs. The same warp scan with
+// each expert counted as te * tiles_m CTAs. `m_tile`: the CTA's row tile. False past the last.
+__device__ __forceinline__ bool find_cta(const int32_t * offs, int n_expert, int bn, int tiles_m, int cta, int lane,
+                                         int sel_lo, int sel_hi, int & expert, int & first, int & count,
+                                         int & m_tile) {
+    const int per = (n_expert + 31) / 32;
+    const int e0 = min(lane * per, n_expert), e1 = min(e0 + per, n_expert);
+    int t = 0;
+#pragma unroll 8
+    for (int e = e0; e < e1; e++) {
+        t += expert_tiles(offs[e + 1] - offs[e], bn, sel_lo, sel_hi);
+    }
+    t *= tiles_m;
+    int incl = t;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const int v = __shfl_up_sync(0xffffffffu, incl, o);
+        incl += lane >= o ? v : 0;
+    }
+    const int lo = incl - t;
+    const unsigned hit = __ballot_sync(0xffffffffu, cta >= lo && cta < incl);
+    if (hit == 0) {
+        return false;
+    }
+    const int src = __ffs(hit) - 1;
+    int found = 0, f = 0, c = 0, mt = 0;
+    if (lane == src) {
+        int before = lo;
+        for (int e = e0; e < e1; e++) {
+            const int a = offs[e], b = offs[e + 1];
+            const int te = expert_tiles(b - a, bn, sel_lo, sel_hi);
+            if (cta < before + te * tiles_m) {
+                const int r = cta - before;
+                found = e;
+                mt = r / te;
+                f = a + r % te * bn;
+                c = min(bn, b - f);
+                break;
+            }
+            before += te * tiles_m;
+        }
+    }
+    expert = __shfl_sync(0xffffffffu, found, src);
+    first = __shfl_sync(0xffffffffu, f, src);
+    count = __shfl_sync(0xffffffffu, c, src);
+    m_tile = __shfl_sync(0xffffffffu, mt, src);
+    return true;
+}
+
 // 128 * MI rows x 8 * NT tokens per CTA; 8 warps of 16 * MI rows x all tokens, so each weight is
 // decoded once per CTA and each decoded A fragment feeds NT n8 MMAs. K steps of one NVFP4 block
 // (64) through three cp.async stages. GROUPED: the CTA's expert and tokens come from the plan.
@@ -418,9 +476,17 @@ __device__ __forceinline__ bool find_tile(const int32_t * offs, int n_expert, in
 // see gemm_down, gemm_glu and legion_nvfp4_mm::wst): grouped tiles, the epilogue staged through
 // shared memory and stored 16 bytes a thread / the stores streaming (evict-first; the SwiGLU's
 // with EPI_WIDE only).
+// DIAG_TORD / DIAG_NWPF (#1183 bench variants of the grouped SwiGLU's 128-token tile, exact: the
+// same tiles' same sums, only their launch order or L2 hints differ; see gemm_diag). DIAG_TORD:
+// the CTAs in find_cta's order (an expert's token tiles of one row tile adjacent, instead of
+// its row tiles of one token tile). DIAG_NWPF: the CTA also L2-prefetches the first d (p.wpf)
+// weight blocks of each row of the tile the CTA one wave on (blockIdx + the SM count, one CTA
+// an SM) will run, during its own last d k steps, in the runs of PF blocks its own prefetch
+// takes, so that CTA's first steps find their weights in L2. Bits 2^19 and 2^20, clear of the
+// others here and of the #230 cluster probe's (2^16 to 2^18).
 constexpr int DIAG_NODEC = 1, DIAG_NOMMA = 2, DIAG_NOEPI = 4, DIAG_NOW = 8, DIAG_NOX = 16, DIAG_NOK = 64,
               DIAG_PF16 = 256, DIAG_PF4 = 512, DIAG_PF8 = 1024, DIAG_PF32 = 2048, DIAG_CAW = 4096,
-              DIAG_CAX = 8192, EPI_WIDE = 16384, EPI_CS = 32768;
+              DIAG_CAX = 8192, EPI_WIDE = 16384, EPI_CS = 32768, DIAG_TORD = 1 << 19, DIAG_NWPF = 1 << 20;
 template <int MI, int NT, bool GROUPED, bool GLU, int ST = STAGES, int MINB = 1, int DIAG = 0, int WARPS = 8>
 __global__ void __launch_bounds__(WARPS * 32, MINB) nvfp4_gemm(const legion_nvfp4_mm p) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -431,6 +497,10 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) nvfp4_gemm(const legion_nvfp
     extern __shared__ __align__(16) unsigned char smem[];
     __shared__ int64_t x_off[GROUPED ? BN : 1], d_off[GROUPED ? BN : 1];
     __shared__ int32_t tile_expert, tile_tokens, tile_first;
+    constexpr bool TORD = (DIAG & DIAG_TORD) != 0, NWPF = (DIAG & DIAG_NWPF) != 0;
+    static_assert(!(TORD || NWPF) || (GROUPED && GLU), "the SwiGLU's bench variants");
+    // TORD: the CTA's row tile; NWPF: the next tile's expert (-1: none) and row tile.
+    __shared__ int32_t tile_aux[TORD || NWPF ? 3 : 1];
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
 
     int64_t m0, n0 = 0, n_tok;
@@ -478,9 +548,39 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) nvfp4_gemm(const legion_nvfp
             }
             return;
         }
+        if constexpr (NWPF) {
+            // The tile of the CTA one wave on (p.wpf >> 16 CTAs on: it starts about when this
+            // one ends), found by warp 1 alongside warp 0's own scan.
+            if (warp == 1) {
+                const unsigned next = blockIdx.x + (unsigned) (p.wpf >> 16);
+                int e = -1, first, count, mt = 0;
+                bool found = false;
+                if (next < gridDim.x && !legion_nvfp4::past_plan_tiles<TI>(p, (int) (next / p.tiles_m))) {
+                    if constexpr (TORD) {
+                        found = find_cta(p.plan, p.n_expert, BN, p.tiles_m, (int) next, lane, p.sel_lo, p.sel_hi, e,
+                                         first, count, mt);
+                    } else {
+                        found = find_tile(p.plan, p.n_expert, BN, (int) (next / p.tiles_m), lane, p.sel_lo,
+                                          p.sel_hi, e, first, count);
+                        mt = (int) (next % p.tiles_m);
+                    }
+                }
+                if (lane == 0) {
+                    tile_aux[1] = found ? e : -1;
+                    tile_aux[2] = mt;
+                }
+            }
+        }
         if (warp == 0) {
-            int e, first, count;
-            if (!find_tile(p.plan, p.n_expert, BN, tile, lane, p.sel_lo, p.sel_hi, e, first, count)) {
+            int e, first, count, mt = 0;
+            bool found;
+            if constexpr (TORD) {
+                found = find_cta(p.plan, p.n_expert, BN, p.tiles_m, (int) blockIdx.x, lane, p.sel_lo, p.sel_hi, e,
+                                 first, count, mt);
+            } else {
+                found = find_tile(p.plan, p.n_expert, BN, tile, lane, p.sel_lo, p.sel_hi, e, first, count);
+            }
+            if (!found) {
                 if (lane == 0) {
                     tile_expert = -1;
                 }
@@ -489,6 +589,9 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) nvfp4_gemm(const legion_nvfp
                     tile_expert = e;
                     tile_tokens = count;
                     tile_first = first;
+                    if constexpr (TORD) {
+                        tile_aux[0] = mt;
+                    }
                 }
                 for (int i = lane; i < count; i += 32) {
                     const int q = p.plan[p.n_expert + 1 + first + i];  // token * n_used + slot
@@ -501,6 +604,9 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) nvfp4_gemm(const legion_nvfp
         __syncthreads();
         if (tile_expert < 0) {
             return;
+        }
+        if constexpr (TORD) {
+            m0 = (int64_t) tile_aux[0] * BM_OUT;
         }
         w += (int64_t) tile_expert * p.w_e;
         sc = (p.scale ? p.scale[tile_expert] : 1.0f) * 1024.0f;
@@ -581,8 +687,39 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) nvfp4_gemm(const legion_nvfp
         }
 #endif
     };
+    // NWPF: the next tile's weights (tile_aux[1], [2]), the first `depth` blocks of each row in
+    // runs of PF blocks, run j (blocks j * PF on) due at step steps - depth + j * PF (so `depth`
+    // steps ahead of that tile's own copies, if it starts when this one ends), each issued at the
+    // first multiple of PF from its due step (at 0 if due before; at the last one the rest).
+    // Called at step 0 and wherever the own prefetch runs; nothing in other variants.
+    auto next_prefetch = [&](int64_t step) {
+#if __CUDA_ARCH__ >= 900
+        if constexpr (NWPF) {
+            const int ne = tile_aux[1];
+            const int64_t depth = min((int64_t) (p.wpf & 0xffff), steps);
+            if (ne >= 0 && depth > 0 && threadIdx.x < BM) {
+                const int64_t lead = steps - depth, runs = (depth + PF - 1) / PF;
+                // The last run due by own step s (-1: none yet).
+                auto due = [&](int64_t s) -> int64_t { return s < lead ? -1 : min((s - lead) / PF, runs - 1); };
+                const int64_t j0 = step == 0 ? 0 : due(step - PF) + 1;
+                const int64_t j1 = step + PF >= steps ? runs - 1 : due(step);
+                const int r = threadIdx.x;
+                const int64_t row = (int64_t) tile_aux[2] * BM_OUT + r / 32 * 16 + r % 16;
+                if (j0 <= j1 && row < p.m) {
+                    const uint8_t * wt = (r / 16 % 2 ? p.w2 : p.w) + (int64_t) ne * p.w_e + row * p.w_ld;
+                    const uintptr_t a = (uintptr_t) (wt + j0 * PF * 36);
+                    const uintptr_t e = (uintptr_t) (wt + min((j1 + 1) * PF, depth) * 36);
+                    const uintptr_t a16 = a & ~(uintptr_t) 15;
+                    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(a16),
+                                 "r"((uint32_t) ((e - a16 + 15) & ~(uintptr_t) 15)));
+                }
+            }
+        }
+#endif
+    };
     prefetch(0);
     prefetch(PF);
+    next_prefetch(0);
 #if __CUDA_ARCH__ >= 900
     // p.xpf bit 0 (#1183): the tile's whole token rows, once, before the first copies. Without
     // it each step's copies read 128 bytes of every token row, scattered rows (a grouped tile's
@@ -708,7 +845,8 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) nvfp4_gemm(const legion_nvfp
     // so the plan reads it depends on overlap them. Past the routed pairs: nothing.
     if constexpr (GROUPED) {
         const int ahead = p.xpf >> 1;
-        if (!(DIAG & DIAG_NOX) && ahead > 0 && blockIdx.x % p.tiles_m == 0 && threadIdx.x < BN && steps > 0) {
+        const bool row0 = TORD ? m0 == 0 : blockIdx.x % p.tiles_m == 0;
+        if (!(DIAG & DIAG_NOX) && ahead > 0 && row0 && threadIdx.x < BN && steps > 0) {
             const int64_t pos = (int64_t) tile_first + (int64_t) ahead * BN + threadIdx.x;
             if (pos < p.plan[p.n_expert]) {
                 const int q = p.plan[p.n_expert + 1 + pos];
@@ -730,6 +868,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) nvfp4_gemm(const legion_nvfp
         asm volatile("cp.async.commit_group;\n" ::);
         if (step % PF == 0 && step > 0) {
             prefetch(step + PF);
+            next_prefetch(step);
         }
         const unsigned char * ws = smem + (step % ST) * STAGE;
         const __nv_bfloat16 * xs = (const __nv_bfloat16 *) (ws + W_STAGE);
@@ -1944,6 +2083,25 @@ int gemm_diag(const legion_nvfp4_mm & p, int variant, cudaStream_t st) {
     }
     if (!p.plan || variant % 100 != 31) {
         return -1;
+    }
+    // #1183's launch order and next-tile prefetch (DIAG_TORD, DIAG_NWPF; exact): the grouped
+    // SwiGLU's 128-token tile with the default's staged epilogue (p.wst 1, EPI_WIDE) only.
+    if constexpr (GLU && MI == 2 && NT == 16) {
+        const int d = variant / 100;
+        if (d == DIAG_TORD || d == DIAG_NWPF || d == (DIAG_TORD | DIAG_NWPF)) {
+            if ((p.wst & 3) != 1) {
+                return -1;
+            }
+            // p.wpf's wave: the SM count (the kernel's 90 KiB of stages: one CTA an SM).
+            legion_nvfp4_mm q = p;
+            const int sms = legion_cuda_sm_count();
+            q.wpf = (p.wpf & 0xffff) | ((sms > 0 ? sms : 1) << 16);
+            switch (d) {
+                case DIAG_TORD: return gemm_diag1<MI, NT, GLU, DIAG_TORD | EPI_WIDE>(q, st);
+                case DIAG_NWPF: return gemm_diag1<MI, NT, GLU, DIAG_NWPF | EPI_WIDE>(q, st);
+                default: return gemm_diag1<MI, NT, GLU, DIAG_TORD | DIAG_NWPF | EPI_WIDE>(q, st);
+            }
+        }
     }
     switch (variant / 100) {
         case DIAG_NODEC: return gemm_diag1<MI, NT, GLU, DIAG_NODEC>(p, st);

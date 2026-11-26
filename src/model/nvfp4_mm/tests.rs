@@ -2043,3 +2043,256 @@ fn cuda_glu_wide_store_bench() {
     }
     xpf_reset();
 }
+
+/// The SwiGLU GEMM's launch order and next-tile prefetch bench variants (#1183) sit on bits of
+/// their own: clear of the other `DIAG_*` and copy bits the GEMM's variant code carries, and
+/// any of them with the tune still an `i32` variant (`31 + 100 * diag`).
+#[test]
+fn glu_order_prefetch_bits_are_their_own() {
+    let theirs = [DIAG_TILE_ORDER, DIAG_NEXT_PREFETCH];
+    // nvfp4_gemm's DIAG_NODEC .. EPI_CS, the PF runs and L1 copies included, and the #230
+    // cluster probe's three.
+    let others = (1i32 << 19) - 1;
+    for t in theirs {
+        assert_eq!(t.count_ones(), 1);
+        assert_eq!(t & others, 0, "{t} collides");
+    }
+    assert_eq!(DIAG_TILE_ORDER & DIAG_NEXT_PREFETCH, 0);
+    assert_eq!((L1_W | L1_X) & others, L1_W | L1_X);
+    let all = (DIAG_TILE_ORDER | DIAG_NEXT_PREFETCH) as i64;
+    assert!(i32::try_from(31 + 100 * all).is_ok());
+}
+
+/// A routed SwiGLU FFN on the grouped GEMM's 128-token tile (`hidden` by `ffn`, `n_expert`
+/// experts, `n_used` a token), one layer per routing of `routings` in one graph, run once per
+/// variant `(name, diag, next-tile prefetch depth)` (a warm-up) and then `rounds` rounds of all:
+/// whether each variant's outputs are the first's, and each variant's seconds a layer per round.
+#[cfg(feature = "cuda")]
+fn glu_variant_case(
+    gpu: &mut crate::ggml::Backend,
+    (hidden, ffn, n_expert, n_used, n_tok): (usize, usize, usize, usize, usize),
+    routings: &[Vec<i32>],
+    variants: &[(&str, i32, i32)],
+    rounds: usize,
+) -> (Vec<bool>, Vec<Vec<f64>>) {
+    use crate::ggml::ComputeAllocator;
+    let layers = routings.len();
+    let blocks = hidden / 64 * 36 * ffn * n_expert;
+    let weights = Context::new(8, 0);
+    let wg = weights.new_tensor(types::NVFP4, &[hidden as i64, ffn as i64, n_expert as i64]);
+    let wu = weights.new_tensor(types::NVFP4, &[hidden as i64, ffn as i64, n_expert as i64]);
+    let scales = [0, 1].map(|_| weights.new_tensor(types::F32, &[n_expert as i64]));
+    weights.alloc_tensors(gpu.buffer_type()).unwrap();
+    wg.set_bytes(&gemm_bench::weights(blocks, 4));
+    wu.set_bytes(&gemm_bench::weights(blocks, 5));
+    for s in scales {
+        s.set_f32(&vec![0.004; n_expert]);
+    }
+    let ctx = Context::new(16 + 32 * layers, 24 * layers + 16);
+    let x = ctx
+        .new_tensor(types::BF16, &[hidden as i64, 1, n_tok as i64])
+        .as_input();
+    let ids: Vec<_> = (0..layers)
+        .map(|_| {
+            ctx.new_tensor(types::I32, &[n_used as i64, n_tok as i64])
+                .as_input()
+        })
+        .collect();
+    let mut graph = ctx.new_graph(24 * layers + 16);
+    let outs: Vec<_> = ids
+        .iter()
+        .map(|&id| {
+            let y = swiglu_id(&ctx, wg, wu, x, id, Some(scales[0]), Some(scales[1])).as_output();
+            graph.expand(y);
+            y
+        })
+        .collect();
+    ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+        .unwrap();
+    x.set_bytes(&xpf_bf16(hidden * n_tok, 5 + n_tok as u64));
+    for (id, r) in ids.iter().zip(routings) {
+        id.set_i32(r);
+    }
+    // The 128-token tile of the default tune with its default (staged) epilogue, which the
+    // variants are compiled with.
+    force_gemm_tune(Some(GEMM_DEFAULT), Some(16));
+    force_gemm_wst(None);
+    assert_eq!(grouped_glu_wst(16, GEMM_DEFAULT), WST_WIDE);
+    let force = |diag: i32, depth: i32| {
+        force_gemm_diag(diag);
+        force_gemm_next_prefetch(depth);
+    };
+    // A warm-up run of each, its bits against the plain kernel's.
+    let mut want = Vec::new();
+    let mut same = vec![true; variants.len()];
+    for (vi, &(_, diag, depth)) in variants.iter().enumerate() {
+        force(diag, depth);
+        gpu.compute(&graph).unwrap();
+        let got: Vec<Vec<u8>> = outs.iter().map(|o| o.bytes()).collect();
+        if vi == 0 {
+            want = got;
+        } else {
+            same[vi] = got == want;
+        }
+    }
+    // The rounds, the variants taking turns, each round starting one further on.
+    let nv = variants.len();
+    let mut times = vec![Vec::with_capacity(rounds); nv];
+    for round in 0..rounds {
+        for i in 0..nv {
+            let vi = (round + i) % nv;
+            force(variants[vi].1, variants[vi].2);
+            let t = std::time::Instant::now();
+            gpu.compute(&graph).unwrap();
+            times[vi].push(t.elapsed().as_secs_f64() / layers as f64);
+        }
+    }
+    force(0, 0);
+    (same, times)
+}
+
+/// The routed SwiGLU GEMM's launch order and next-tile prefetch variants (#1183) give the
+/// default's bits: experts of 1 to 4 token tiles of 128 (the last ones partial), a partial last
+/// row tile (576 rows), 16 k steps (two prefetch runs), next-tile depths of none, one run, a
+/// run and a half and the whole tile, in both launch orders, on a counted and a random routing.
+/// `cargo test --release --features cuda --lib -- cuda_glu_order_prefetch_same_bits`.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_glu_order_prefetch_same_bits() {
+    let _lock = XPF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    xpf_reset();
+    let mut gpu = xpf_gpu();
+    let (hidden, ffn, n_expert, n_used, n_tok) = (1024usize, 576usize, 64usize, 8usize, 600usize);
+    let special = [1, 127, 128, 129, 200, 256, 257, 300, 385, 512];
+    let counted = counted_routing(
+        &spread_counts(&special, n_expert, n_used, n_tok),
+        n_used,
+        n_tok,
+    );
+    let random = gemm_bench::routing(n_used, n_tok, n_expert, n_expert, 7);
+    let variants = [
+        ("plain", 0, 0),
+        ("tile order", DIAG_TILE_ORDER, 0),
+        ("next pf none", DIAG_NEXT_PREFETCH, 0),
+        ("next pf 8", DIAG_NEXT_PREFETCH, 8),
+        ("next pf 12", DIAG_NEXT_PREFETCH, 12),
+        ("next pf whole", DIAG_NEXT_PREFETCH, 4096),
+        ("order + pf 8", DIAG_TILE_ORDER | DIAG_NEXT_PREFETCH, 8),
+        (
+            "order + pf whole",
+            DIAG_TILE_ORDER | DIAG_NEXT_PREFETCH,
+            4096,
+        ),
+    ];
+    let (same, _) = glu_variant_case(
+        &mut gpu,
+        (hidden, ffn, n_expert, n_used, n_tok),
+        &[counted, random],
+        &variants,
+        0,
+    );
+    xpf_reset();
+    for (&(name, ..), s) in variants.iter().zip(same) {
+        assert!(s, "{name}: bits differ");
+    }
+}
+
+/// The routed SwiGLU GEMM's 128-token tile (#1183; Qwen3.8-Flash-Next: 640 gate and 640 up rows,
+/// k 2560, 512 experts, top 10) at 12,288- and 8,067-token prompt steps, on a counted routing
+/// (every expert 240 or 157-158 pairs: two token tiles each) and a random one: microseconds a
+/// layer (median and best of 7 rounds, the variants taking turns, each round starting one
+/// further on) of the default kernel and of two same-bits variants and their mixes. Tile order
+/// (`DIAG_TILE_ORDER`): an expert's token tiles of one row tile adjacent CTAs (the default
+/// launches its 5 row tiles of a token tile one after another, so those are 5 CTAs apart). Next
+/// prefetch (`DIAG_NEXT_PREFETCH`) at depth d: each CTA also L2-prefetches the first d blocks of
+/// each weight row of the tile the CTA one wave on (one CTA an SM) runs, d k steps ahead of
+/// that tile's own copies (none: the extra plan scan alone; whole: all 40 blocks, one run of 8
+/// every 8 steps). Bits must match the default's.
+/// `cargo test --release --features cuda --lib -- --ignored cuda_glu_order_prefetch_bench
+/// --nocapture`.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU; a benchmark"]
+fn cuda_glu_order_prefetch_bench() {
+    let _lock = XPF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    xpf_reset();
+    let mut gpu = xpf_gpu();
+    let (hidden, ffn, n_expert, n_used) = (2560usize, 640usize, 512usize, 10usize);
+    const LAYERS: usize = 4;
+    const ROUNDS: usize = 7;
+    let whole = 4096;
+    let variants = [
+        ("plain", 0, 0),
+        ("tile order", DIAG_TILE_ORDER, 0),
+        ("next pf none", DIAG_NEXT_PREFETCH, 0),
+        ("next pf 8", DIAG_NEXT_PREFETCH, 8),
+        ("next pf 16", DIAG_NEXT_PREFETCH, 16),
+        ("next pf 32", DIAG_NEXT_PREFETCH, 32),
+        ("next pf whole", DIAG_NEXT_PREFETCH, whole),
+        ("order + pf 16", DIAG_TILE_ORDER | DIAG_NEXT_PREFETCH, 16),
+        (
+            "order + pf whole",
+            DIAG_TILE_ORDER | DIAG_NEXT_PREFETCH,
+            whole,
+        ),
+    ];
+    let mut bad = Vec::new();
+    for n_tok in [12288usize, 8067] {
+        for counted in [true, false] {
+            let pairs = n_used * n_tok;
+            let routings: Vec<Vec<i32>> = (0..LAYERS)
+                .map(|l| {
+                    if counted {
+                        let (q, r) = (pairs / n_expert, pairs % n_expert);
+                        let counts: Vec<usize> =
+                            (0..n_expert).map(|e| q + (e < r) as usize).collect();
+                        counted_routing(&counts, n_used, n_tok)
+                    } else {
+                        gemm_bench::routing(n_used, n_tok, n_expert, n_expert, 1 + l as u64)
+                    }
+                })
+                .collect();
+            let (same, mut times) = glu_variant_case(
+                &mut gpu,
+                (hidden, ffn, n_expert, n_used, n_tok),
+                &routings,
+                &variants,
+                ROUNDS,
+            );
+            for t in &mut times {
+                t.sort_by(f64::total_cmp);
+            }
+            let median: Vec<f64> = times.iter().map(|t| t[t.len() / 2]).collect();
+            let best: Vec<f64> = times.iter().map(|t| t[0]).collect();
+            let kind = if counted { "counted" } else { "random" };
+            eprintln!("swiglu at {n_tok} tokens, {kind} routing");
+            for (vi, &(name, diag, depth)) in variants.iter().enumerate() {
+                eprintln!(
+                    "  {name:<17} diag {diag:>7} depth {:>5}: median {:>8.1} us/layer ({:>5.3}x \
+                     plain), min {:>8.1} ({:>5.3}x)  {}",
+                    if depth == whole {
+                        "whole".to_string()
+                    } else {
+                        depth.to_string()
+                    },
+                    median[vi] * 1e6,
+                    median[0] / median[vi],
+                    best[vi] * 1e6,
+                    best[0] / best[vi],
+                    if vi == 0 {
+                        "reference"
+                    } else if same[vi] {
+                        "same bits"
+                    } else {
+                        "BITS DIFFER"
+                    }
+                );
+                if !same[vi] {
+                    bad.push(format!("{name} at {n_tok} {kind}"));
+                }
+            }
+        }
+    }
+    xpf_reset();
+    assert!(bad.is_empty(), "bits differ: {bad:?}");
+}
