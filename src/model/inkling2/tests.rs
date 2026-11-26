@@ -722,6 +722,160 @@ fn cuda_tiny_matches_the_cpu() {
     assert!(d <= tol, "token by token on the GPU: {d} > {tol}");
 }
 
+/// The first GPU device.
+#[cfg(feature = "cuda")]
+fn gpu_backend() -> Backend {
+    use crate::ggml::{DeviceKind, device_by_kind};
+    device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU device")
+        .init()
+        .unwrap()
+}
+
+/// The GPU's traced intermediates against the CPU's, in the CPU's graph order, matched by name:
+/// a line each (see them with `--nocapture`). Returns the first whose worst difference is over
+/// `tol` times the CPU tensor's largest value (NaN counts as over), with that element on both,
+/// and the logits' worst difference.
+#[cfg(feature = "cuda")]
+fn compare_traces(
+    cpu: &crate::model::core::Trace,
+    gpu: &crate::model::core::Trace,
+    tol: f32,
+) -> (Option<String>, f32) {
+    let ((cl, ct), (gl, gt)) = (cpu, gpu);
+    let mut by_name = HashMap::new();
+    for g in gt {
+        by_name.entry(g.name.as_str()).or_insert(g);
+    }
+    eprintln!("{} CPU taps, {} GPU taps", ct.len(), gt.len());
+    let mut first = None;
+    for (i, c) in ct.iter().enumerate() {
+        let Some(g) = by_name.get(c.name.as_str()) else {
+            eprintln!("{i:5} {:<22} {:?} not on the GPU", c.name, c.ne);
+            continue;
+        };
+        if g.ne != c.ne {
+            eprintln!(
+                "{i:5} {:<22} cpu {:?} gpu {:?}  <- shape",
+                c.name, c.ne, g.ne
+            );
+            first.get_or_insert_with(|| format!("{}: cpu {:?} gpu {:?}", c.name, c.ne, g.ne));
+            continue;
+        }
+        let scale = scale_of(&c.data).max(1e-6);
+        let (at, d) = c
+            .data
+            .iter()
+            .zip(&g.data)
+            .map(|(x, y)| (x - y).abs())
+            .map(|d| if d.is_nan() { f32::INFINITY } else { d })
+            .enumerate()
+            .fold((0, 0f32), |b, (j, d)| if d > b.1 { (j, d) } else { b });
+        let bad = d > tol * scale;
+        let mark = if bad { "  <-" } else { "" };
+        eprintln!(
+            "{i:5} {:<22} {:?} diff {d:.3e} scale {scale:.3e}{mark}",
+            c.name, c.ne
+        );
+        if bad && first.is_none() {
+            let [n0, n1, n2, _] = c.ne.map(|n| n.max(1) as usize);
+            let idx = [
+                at % n0,
+                at / n0 % n1,
+                at / (n0 * n1) % n2,
+                at / (n0 * n1 * n2),
+            ];
+            first = Some(format!(
+                "{} {:?} at {idx:?}: cpu {} gpu {} (diff {d}, scale {scale})",
+                c.name, c.ne, c.data[at], g.data[at]
+            ));
+        }
+    }
+    let d = max_diff(cl, gl);
+    eprintln!("logits: diff {d:.3e} scale {:.3e}", scale_of(cl));
+    if let Some(f) = &first {
+        eprintln!("first mismatch: {f}");
+    }
+    (first, d)
+}
+
+/// [`cuda_tiny_matches_the_cpu`] node by node: every traced intermediate of one prompt on the
+/// GPU against the CPU, failing at the first that differs (see [`compare_traces`]). It also
+/// prints how far the GPU's untraced logits are from its traced ones: the traces keep their
+/// tensors' memory, so a gap there points at memory reused too early.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_tiny_traces_match_the_cpu() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = tiny_gguf(&dir, Layout::Mainline);
+    let p = prompt();
+    let mut b = backend();
+    let cpu = Model::load(&g, |_| b.buffer_type())
+        .unwrap()
+        .prompt_trace(&mut b, &p)
+        .unwrap();
+    let mut gpu = gpu_backend();
+    let m = Model::load(&g, |_| gpu.buffer_type()).unwrap();
+    let plain = m.prompt_logits_all(&mut gpu, &p).unwrap();
+    let traced = m.prompt_trace(&mut gpu, &p).unwrap();
+    eprintln!(
+        "GPU logits untraced vs traced: {:.3e}; untraced vs the CPU: {:.3e}",
+        max_diff(&plain, &traced.0),
+        max_diff(&plain, &cpu.0)
+    );
+    let (first, d) = compare_traces(&cpu, &traced, 5e-3);
+    if let Some(f) = first {
+        panic!("first mismatch: {f}");
+    }
+    let tol = 5e-3 * scale_of(&cpu.0);
+    assert!(d <= tol, "logits: {d} > {tol}");
+}
+
+/// The real model (`LEGION_TEST_INKLING_GGUF`) on the GPU against the CPU over a short prompt:
+/// the same greedy token at every position. It prints every traced intermediate's difference
+/// and the first over 5e-2 of its scale (see [`compare_traces`]; the GPU products round their
+/// inputs where the CPU's need not, so that one is a lead, not a failure). The CPU's copy of
+/// the weights is dropped before the GPU's loads.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU and the Inkling-2-Mini GGUF"]
+fn cuda_real_gguf_matches_the_cpu() {
+    let Some(path) = std::env::var_os("LEGION_TEST_INKLING_GGUF") else {
+        return;
+    };
+    let g = GgufFile::open(&path).unwrap();
+    let p: Vec<u32> = (0..8).map(|i| 1000 + i * 7919).collect();
+    let mut b = Backend::cpu().unwrap();
+    b.set_threads(std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let cm = Model::load(&g, |_| b.buffer_type()).unwrap();
+    let cpu = cm.prompt_trace(&mut b, &p).unwrap();
+    drop(cm);
+    let mut gpu = gpu_backend();
+    let m = Model::load(&g, |_| gpu.buffer_type()).unwrap();
+    let plain = m.prompt_logits_all(&mut gpu, &p).unwrap();
+    let traced = m.prompt_trace(&mut gpu, &p).unwrap();
+    let nv = cpu.0.len() / p.len();
+    let argmax = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .fold((0, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b })
+            .0
+    };
+    let tokens = |all: &[f32]| -> Vec<usize> { all.chunks(nv).map(argmax).collect() };
+    let (ct, gt) = (tokens(&cpu.0), tokens(&plain));
+    eprintln!(
+        "greedy tokens: cpu {ct:?} gpu {gt:?}; logits diff {:.3e} scale {:.3e}; \
+         GPU untraced vs traced {:.3e}",
+        max_diff(&cpu.0, &plain),
+        scale_of(&cpu.0),
+        max_diff(&plain, &traced.0)
+    );
+    compare_traces(&cpu, &traced, 5e-2);
+    assert_eq!(ct, gt, "greedy tokens");
+}
+
 /// The real GGUFs (`LEGION_TEST_INKLING_GGUF`, llama.cpp's `inkling2_loop`;
 /// `LEGION_TEST_INKLING_OLD_GGUF`, the earlier `inkling2`): Inkling-2-Mini's shape, the same
 /// hyperparameters from both, every tensor the graph reads present.

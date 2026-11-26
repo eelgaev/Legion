@@ -499,6 +499,7 @@ impl Model {
             ));
         }
         let mut cur = ctx.reshape_2d(x, hp.n_embd, pass.n);
+        tap.tap("inp_norm", 0, cur);
         let mut blocks: Vec<Tensor<'a>> = Vec::new();
         for ip in 0..p.core.start {
             cur = self.ink_layer(pass, ip, ip, cur, &mut blocks, None)?;
@@ -521,7 +522,9 @@ impl Model {
                     None
                 } else {
                     let q = self.ink_msg_query(ctx, ip)?;
-                    Some(ops::mix(ctx, &bank, q, MIX_EPS))
+                    let m = ops::mix(ctx, &bank, q, MIX_EPS);
+                    tap.tap("loop_msgs", il, m);
+                    Some(m)
                 };
                 cur = self.ink_layer(pass, il, ip, cur, &mut blocks, msgs)?;
             }
@@ -532,6 +535,7 @@ impl Model {
         blocks.push(cur);
         let x = ops::mix(ctx, &blocks, self.w("output_res_query.weight")?, MIX_EPS);
         let x = ctx.reshape_2d(x, hp.n_embd, pass.n);
+        tap.tap("result_mix", 0, x);
         let x = match pass.out_rows {
             Some(rows) => glm_ops::get_cols(ctx, x, rows),
             None => x,
@@ -641,6 +645,7 @@ impl Model {
         let mut inputs = [cur; 3];
         if let Ok(q) = self.lw(ip, "attn_res_query.weight") {
             let mixed = ops::mix(ctx, &states(blocks, cur), q, MIX_EPS);
+            tap.tap("attn_mix", il, mixed);
             for (j, x) in inputs.iter_mut().enumerate() {
                 *x = slice(ctx, mixed, if swa { 0 } else { j });
             }
@@ -648,6 +653,7 @@ impl Model {
         if let Some(m) = msgs {
             for (j, x) in inputs.iter_mut().enumerate() {
                 *x = self.ink_control(ctx, ip, j, *x, slice(ctx, m, j))?;
+                tap.tap(["attn_ctrl_q", "attn_ctrl_k", "attn_ctrl_v"][j], il, *x);
             }
         }
         let inputs = if swa && msgs.is_some() {
@@ -665,6 +671,12 @@ impl Model {
                 self.ink_rms(ctx, ip, "attn_v_inp_norm.weight", inputs[2])?,
             ]
         };
+        for (name, x) in ["attn_in_q", "attn_in_k", "attn_in_v"]
+            .into_iter()
+            .zip(inputs)
+        {
+            tap.tap(name, il, x);
+        }
 
         let out = self.ink_attn(pass, il, ip, &inputs)?;
         tap.tap("attn_out", il, out);
@@ -684,11 +696,15 @@ impl Model {
             MIX_EPS,
         );
         let mut h = ctx.reshape_2d(h, e, n);
+        tap.tap("ffn_mix", il, h);
         if let Some(m) = msgs {
             h = self.ink_control(ctx, ip, 3, h, slice(ctx, m, 3))?;
+            tap.tap("ffn_ctrl", il, h);
         }
         let h = self.ink_rms(ctx, ip, "ffn_norm.weight", h)?;
-        let y = self.ink_moe(ctx, ip, h)?;
+        tap.tap("ffn_inp_norm", il, h);
+        let y = self.ink_moe(pass, il, ip, h)?;
+        tap.tap("ffn_moe_out", il, y);
         let kvw = hp.head_dim * hp.n_head_kv;
         let y = self.ink_conv(pass, il, ip, "ffn_post_conv.weight", y, None, 2 * kvw + e)?;
         tap.tap("ffn_out", il, y);
@@ -730,9 +746,20 @@ impl Model {
                 Some(self.ink_mm(ctx, ip, "attn_v_conv_proj.weight", xv)?),
             )
         };
+        for (name, x) in [("q_proj", q), ("k_proj", kp), ("v_proj", vp)] {
+            tap.tap(name, il, x);
+        }
+        for (name, x) in [("k_dyn", kdyn), ("v_dyn", vdyn)] {
+            if let Some(x) = x {
+                tap.tap(name, il, x);
+            }
+        }
         let k = self.ink_conv(pass, il, ip, "attn_k_conv.weight", kp, kdyn, 0)?;
         let v = self.ink_conv(pass, il, ip, "attn_v_conv.weight", vp, vdyn, kvw)?;
+        tap.tap("k_conv", il, k);
+        tap.tap("v_conv", il, v);
         let r = self.ink_mm(ctx, ip, "attn_rel.weight", xq)?;
+        tap.tap("r_proj", il, r);
 
         // The global layers' Q and relative weights scale with the log of the position.
         let tau = (!swa).then_some((pos_all, p.log_scale));
@@ -753,6 +780,8 @@ impl Model {
             tau,
         );
         let sinks = self.ink_mm(ctx, ip, "attn_sink_proj.weight", xq)?;
+        tap.tap("r_clip", il, r);
+        tap.tap("sinks", il, sinks);
         tap.tap("Qcur", il, q);
         tap.tap("Kcur", il, k);
         tap.tap("Vcur", il, v);
@@ -820,30 +849,42 @@ impl Model {
             outs.push(ctx.reshape_2d(o, d * nh, ng));
         }
         let o = glm_ops::join_cols(ctx, &outs);
+        tap.tap("kqv_out", il, o);
         let g = self.ink_mm(ctx, ip, "attn_gate.weight", xq)?;
+        tap.tap("attn_gate", il, g);
         let o = ops::sigmul(ctx, o, g);
+        tap.tap("attn_gated", il, o);
         let o = self.ink_mm(ctx, ip, "attn_output.weight", o)?;
+        tap.tap("attn_proj", il, o);
         self.ink_conv(pass, il, ip, "attn_post_conv.weight", o, None, 2 * kvw)
     }
 
     /// The routed experts of block `ip` over the normed `h` (`[n_embd, n]`).
     fn ink_moe<'a>(
         &'a self,
-        ctx: &'a Context,
+        pass: &Pass<'a>,
+        il: usize,
         ip: usize,
         h: Tensor<'a>,
     ) -> Result<Tensor<'a>, ModelError> {
+        let (ctx, tap) = (pass.ctx, &pass.tap);
         let p = self.ink();
         let hp = &self.hp;
         let n = h.ne()[1];
         let logits = self.ink_mm(ctx, ip, "ffn_gate_inp.weight", h)?;
+        tap.tap("ffn_moe_logits", il, logits);
         let bias = self.lw(ip, "exp_probs_b.bias")?;
         let ids = glm_ops::router_ids(ctx, logits, bias, hp.n_expert_used);
+        tap.tap("ffn_moe_topk", il, ids);
         let w = glm_ops::router_w(ctx, logits, ids, true, p.weights_scale);
+        tap.tap("ffn_moe_weights", il, w);
         let x = ctx.reshape_3d(h, hp.n_embd, 1, n);
         let gu = self.ink_experts(ctx, ip, "ffn_gate_up_exps", x, ids)?;
+        tap.tap("ffn_moe_gate_up", il, gu);
         let a = ops::situ(ctx, gu, p.situ_beta, p.situ_lb);
+        tap.tap("ffn_moe_act", il, a);
         let y = self.ink_experts(ctx, ip, "ffn_down_exps", a, ids)?;
+        tap.tap("ffn_moe_down", il, y);
         Ok(glm_ops::weighted_sum(ctx, y, w))
     }
 
