@@ -96,6 +96,107 @@ struct Block {
     down: Lin,
 }
 
+/// The tower's widths the scratch layout depends on.
+#[derive(Clone, Copy, Debug)]
+struct Dims {
+    e: usize,
+    heads: usize,
+    /// The patch rows' padded width.
+    patch_k: usize,
+    n_ff: usize,
+    /// The 2×2 convolution's output width.
+    merger: usize,
+    /// The projector's linear width.
+    mw: usize,
+    mff: usize,
+    n_out: usize,
+}
+
+impl Dims {
+    /// The queries per attention chunk of `n` patches (`kpad` keys): its scores (F32) and
+    /// probabilities (F16) for every head within [`ATTN_BUDGET`], a multiple of [`TILE`] when
+    /// that fits.
+    fn chunk(&self, n: usize, kpad: usize) -> usize {
+        let per = ATTN_BUDGET / (self.heads * kpad * 6);
+        if per >= TILE {
+            per / TILE * TILE
+        } else {
+            per.max(1)
+        }
+        .min(n.next_multiple_of(TILE))
+    }
+
+    /// The scratch of `n` patches, `n_pix` pixel values and a rotation table of `n_cs` values.
+    fn scratch(&self, n: usize, n_pix: usize, n_cs: usize) -> Scratch {
+        let (e, heads) = (self.e, self.heads);
+        let d = e / heads;
+        let kpad = n.next_multiple_of(8);
+        let chunk = self.chunk(n, kpad);
+        let n_tok = n / 4;
+        let (mw, mff) = (self.mw, self.mff);
+        let mut at = 0usize;
+        let mut take = |bytes: usize| {
+            let o = at;
+            at += bytes.next_multiple_of(256);
+            o
+        };
+        let pix = take(n_pix * 4);
+        let cs = take(n_cs * 4);
+        let x = take(n * e * 4);
+        let h = take((n * e * 2).max(n_tok * mw * 2));
+        let big = take(
+            (n * self.patch_k * 2)
+                .max(n * 3 * e * 4)
+                .max(n * 2 * self.n_ff * 2)
+                .max(n_tok * mw * 4)
+                .max(n_tok * 2 * mff * 2),
+        );
+        let ff = take(
+            (n * self.n_ff * 2)
+                .max(n_tok * self.merger * 2)
+                .max(n_tok * mff * 2),
+        );
+        let q = take(heads * n * d * 2);
+        let k = take(heads * n * d * 2);
+        let vt = take(heads * d * kpad * 2);
+        let s = take(heads * chunk * kpad * 4);
+        let p = take(heads * chunk * kpad * 2);
+        let out = take(n_tok * self.n_out * 4);
+        Scratch {
+            pix,
+            cs,
+            x,
+            h,
+            big,
+            ff,
+            q,
+            k,
+            vt,
+            s,
+            p,
+            out,
+            total: at,
+            chunk,
+        }
+    }
+
+    /// The most scratch an image of at most `max_px` pixels (patches of `patch` pixels, heads
+    /// of `d_head`) can need: the largest over every grid up to that many patches, not just
+    /// the largest grid's. Every region but the attention's grows with the patch count, but
+    /// the chunk does not: a smaller grid's chunk can round up to more queries, so its
+    /// `chunk × kpad` can pass the largest grid's. A grid's patches are a multiple of 4 (an
+    /// even width and height); the largest count is taken too, with all `max_px` pixels.
+    fn scratch_bound(&self, max_px: usize, patch: usize, d_head: usize) -> usize {
+        let n_max = max_px / (patch * patch);
+        // A rotation table of at most one row per patch.
+        let at = |n: usize, n_pix: usize| self.scratch(n, n_pix, n * d_head / 2).total;
+        (4..=n_max)
+            .step_by(4)
+            .map(|n| at(n, 3 * n * patch * patch))
+            .fold(at(n_max, 3 * max_px), usize::max)
+    }
+}
+
 /// Byte offsets into an image's scratch, its size and the queries per attention chunk.
 struct Scratch {
     pix: usize,
@@ -369,74 +470,31 @@ impl GlmGpu {
         self.launch(k, rows.div_ceil(8), 256, o)
     }
 
-    /// The scratch of an image of `n` patches, `n_pix` pixel values and a rotation table of
-    /// `n_cs` values.
-    fn scratch(&self, n: usize, n_pix: usize, n_cs: usize) -> Scratch {
-        let c = &self.cfg;
-        let (e, heads) = (c.n_embd, c.n_head);
-        let d = e / heads;
-        let kpad = n.next_multiple_of(8);
-        let n_tok = n / 4;
-        let (mw, mff) = (self.fc.n, self.mm_down.k);
-        let per = ATTN_BUDGET / (heads * kpad * 6);
-        let chunk = if per >= TILE {
-            per / TILE * TILE
-        } else {
-            per.max(1)
-        }
-        .min(n.next_multiple_of(TILE));
-        let mut at = 0usize;
-        let mut take = |bytes: usize| {
-            let o = at;
-            at += bytes.next_multiple_of(256);
-            o
-        };
-        let pix = take(n_pix * 4);
-        let cs = take(n_cs * 4);
-        let x = take(n * e * 4);
-        let h = take((n * e * 2).max(n_tok * mw * 2));
-        let big = take(
-            (n * self.patch.k * 2)
-                .max(n * 3 * e * 4)
-                .max(n * 2 * self.n_ff * 2)
-                .max(n_tok * mw * 4)
-                .max(n_tok * 2 * mff * 2),
-        );
-        let ff = take(
-            (n * self.n_ff * 2)
-                .max(n_tok * self.merger.n * 2)
-                .max(n_tok * mff * 2),
-        );
-        let q = take(heads * n * d * 2);
-        let k = take(heads * n * d * 2);
-        let vt = take(heads * d * kpad * 2);
-        let s = take(heads * chunk * kpad * 4);
-        let p = take(heads * chunk * kpad * 2);
-        let out = take(n_tok * c.n_out * 4);
-        Scratch {
-            pix,
-            cs,
-            x,
-            h,
-            big,
-            ff,
-            q,
-            k,
-            vt,
-            s,
-            p,
-            out,
-            total: at,
-            chunk,
+    /// What the scratch layout depends on.
+    fn dims(&self) -> Dims {
+        Dims {
+            e: self.cfg.n_embd,
+            heads: self.cfg.n_head,
+            patch_k: self.patch.k,
+            n_ff: self.n_ff,
+            merger: self.merger.n,
+            mw: self.fc.n,
+            mff: self.mm_down.k,
+            n_out: self.cfg.n_out,
         }
     }
 
+    /// The scratch of an image of `n` patches, `n_pix` pixel values and a rotation table of
+    /// `n_cs` values.
+    fn scratch(&self, n: usize, n_pix: usize, n_cs: usize) -> Scratch {
+        self.dims().scratch(n, n_pix, n_cs)
+    }
+
+    /// The scratch any image the preprocessing gives can need (up to `image_max_pixels`).
     pub(super) fn scratch_bytes(&self) -> usize {
         let c = &self.cfg;
-        let px = self.hp.image_max_pixels as usize;
-        let n = px / (c.patch_size * c.patch_size);
-        // A rotation table of at most one row per patch.
-        self.scratch(n, 3 * px, n * c.d_head() / 2).total
+        self.dims()
+            .scratch_bound(self.hp.image_max_pixels as usize, c.patch_size, c.d_head())
     }
 
     /// The tower's output for `p`; `alone`: nothing else runs on the GPU meanwhile.
@@ -815,6 +873,9 @@ impl GlmGpu {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 impl Drop for GlmGpu {
     fn drop(&mut self) {
