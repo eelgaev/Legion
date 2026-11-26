@@ -876,29 +876,45 @@ fn cuda_conv_prompt_steps_are_the_token_walk() {
                 .as_input()
                 .as_output()
         });
-        // Token `i` of every sequence: columns `s · n_tok + i`.
-        fn col<'a>(ctx: &'a Context, t: Tensor<'a>, i: i64, n_tok: i64, n_seqs: i64) -> Tensor<'a> {
-            let rows = t.ne()[0];
-            let nb = (n_tok * rows) as usize * 4;
-            ctx.view_2d(t, [rows, n_seqs], nb, (i * rows) as usize * 4)
-        }
         let once = ops::conv(&ctx, x, w, st[0], dynamic.then_some(d), n_tok, off, scale);
         let once = once.as_output();
         let mut graph = ctx.new_graph(64 + 8 * n_tok as usize);
         graph.expand(once);
+        // The walk's inputs: token `i` of every sequence (columns `s · n_tok + i`), each its
+        // own contiguous `[rows, n_seqs]` tensor, as the ops take them.
         let mut walk = Vec::new();
-        for i in 0..n_tok {
-            let xi = col(&ctx, x, i, n_tok, n_seqs);
-            let di = dynamic.then(|| col(&ctx, d, i, n_tok, n_seqs));
-            let o = ops::conv(&ctx, xi, w, st[1], di, 1, off, scale).as_output();
+        let mut walk_in = Vec::new();
+        for _ in 0..n_tok {
+            let xi = ctx.new_tensor(types::F32, &[c, n_seqs]).as_input();
+            let di = dynamic.then(|| ctx.new_tensor(types::F32, &[k * heads, n_seqs]).as_input());
+            let o = ops::conv(&ctx, xi, w, st[1], di, 1, off, scale);
+            let o = o.as_output();
             graph.expand(o);
             walk.push(o);
+            walk_in.push((xi, di));
         }
         ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
             .unwrap();
-        x.set_f32(&vals((c * ng) as usize, 1));
+        let (xv, dv) = (
+            vals((c * ng) as usize, 1),
+            vals((k * heads * ng) as usize, 3),
+        );
+        x.set_f32(&xv);
         w.set_f32(&vals((k * c) as usize, 2));
-        d.set_f32(&vals((k * heads * ng) as usize, 3));
+        if dynamic {
+            d.set_f32(&dv);
+        }
+        let cols = |v: &[f32], rows: usize, i: usize| -> Vec<f32> {
+            (0..n_seqs as usize)
+                .flat_map(|s| v[(s * n_tok as usize + i) * rows..][..rows].to_vec())
+                .collect()
+        };
+        for (i, (xi, di)) in walk_in.iter().enumerate() {
+            xi.set_f32(&cols(&xv, c as usize, i));
+            if let Some(di) = di {
+                di.set_f32(&cols(&dv, (k * heads) as usize, i));
+            }
+        }
         let hist = vals(((k - 1) * width * n_seqs) as usize, 4);
         for s in st {
             s.set_f32(&hist);

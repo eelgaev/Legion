@@ -42,6 +42,8 @@ constexpr int TYPE_BF16 = 30;
 // ink_mix's most states and queries.
 constexpr int MIX_STATES  = 8;
 constexpr int MIX_QUERIES = 4;
+// ink_mix: a thread's elements loaded at a time.
+constexpr int MIX_U = 3;
 // ink_conv's most taps.
 constexpr int CONV_TAPS = 8;
 // ink_attn: query tokens per block, most rows (tokens x heads of one kv head), most relative
@@ -52,6 +54,13 @@ constexpr int ATTN_DECODE_ROWS = 4;
 constexpr int ATTN_NR   = 16;
 constexpr int ATTN_D    = 128;
 constexpr int ATTN_WARPS = 4;
+// ink_attn: keys whose value loads go out ahead of their sums.
+constexpr int ATTN_VU = 8;
+
+// N halves loaded as one access.
+template <int N> struct alignas(2 * N) HalfVec {
+    __half h[N];
+};
 // ink_mm_id: a prompt block's output rows, pairs at a time and K values per pass, its threads
 // and pair list length; a decode warp's rows and groups of loads ahead.
 constexpr int MM_BM      = 32;
@@ -141,17 +150,40 @@ __global__ void mix_kernel(const A a) {
             part[s][k] = 0.f;
         }
     }
-    for (int64_t i = threadIdx.x; i < e; i += blockDim.x) {
+    // MIX_U of the thread's elements loaded at a time, then summed in order (#1221: a decode
+    // step's one block had a memory latency per element in a row).
+    const int64_t step = blockDim.x;
+    for (int64_t i0 = threadIdx.x; i0 < e; i0 += MIX_U * step) {
+        float xv[MIX_U][MIX_STATES], qv[MIX_U][MIX_QUERIES];
 #pragma unroll
-        for (int s = 0; s < MIX_STATES; s++) {
-            if (s < ns) {
-                const float * x = (const float *) (src(a, s) + t * a.src_nb[s][1]);
-                part[s][0] += x[i] * x[i];
+        for (int u = 0; u < MIX_U; u++) {
+            const int64_t i = i0 + u * step;
 #pragma unroll
-                for (int j = 0; j < MIX_QUERIES; j++) {
-                    if (j < nq) {
-                        const float * q = (const float *) (src(a, ns) + j * a.src_nb[ns][1]);
-                        part[s][1 + j] += x[i] * q[i];
+            for (int s = 0; s < MIX_STATES; s++) {
+                xv[u][s] = s < ns && i < e
+                               ? ((const float *) (src(a, s) + t * a.src_nb[s][1]))[i]
+                               : 0.f;
+            }
+#pragma unroll
+            for (int j = 0; j < MIX_QUERIES; j++) {
+                qv[u][j] = j < nq && i < e
+                               ? ((const float *) (src(a, ns) + j * a.src_nb[ns][1]))[i]
+                               : 0.f;
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < MIX_U; u++) {
+            if (i0 + u * step < e) {
+#pragma unroll
+                for (int s = 0; s < MIX_STATES; s++) {
+                    if (s < ns) {
+                        part[s][0] += xv[u][s] * xv[u][s];
+#pragma unroll
+                        for (int j = 0; j < MIX_QUERIES; j++) {
+                            if (j < nq) {
+                                part[s][1 + j] += xv[u][s] * qv[u][j];
+                            }
+                        }
                     }
                 }
             }
@@ -171,19 +203,18 @@ __global__ void mix_kernel(const A a) {
         }
     }
     __syncthreads();
-    if (w == 0) {
-        for (int s = 0; s < ns; s++) {
-            const float ss = warp_sum(l < nw ? red[s * NK][l] : 0.f);
-            const float r  = rsqrtf(ss / (float) e + eps);
-            for (int j = 0; j < nq; j++) {
-                const float d = warp_sum(l < nw ? red[s * NK + 1 + j][l] : 0.f);
-                if (l == 0) {
-                    sc[s][j] = d * r * inv;
-                }
-            }
+    // A warp per state (blockDim.x / 32 >= MIX_STATES), the same tree for each sum.
+    for (int s = w; s < ns; s += nw) {
+        const float ss = warp_sum(l < nw ? red[s * NK][l] : 0.f);
+        const float r  = rsqrtf(ss / (float) e + eps);
+        for (int j = 0; j < nq; j++) {
+            const float d = warp_sum(l < nw ? red[s * NK + 1 + j][l] : 0.f);
             if (l == 0) {
-                rs[s] = r;
+                sc[s][j] = d * r * inv;
             }
+        }
+        if (l == 0) {
+            rs[s] = r;
         }
     }
     __syncthreads();
@@ -204,17 +235,33 @@ __global__ void mix_kernel(const A a) {
     }
     __syncthreads();
     float * out = (float *) a.dst;
-    for (int64_t i = threadIdx.x; i < e; i += blockDim.x) {
-        float xv[MIX_STATES];
-        for (int s = 0; s < ns; s++) {
-            xv[s] = ((const float *) (src(a, s) + t * a.src_nb[s][1]))[i];
-        }
-        for (int j = 0; j < nq; j++) {
-            float o = 0.f;
-            for (int s = 0; s < ns; s++) {
-                o += sc[s][j] * xv[s];
+    for (int64_t i0 = threadIdx.x; i0 < e; i0 += MIX_U * step) {
+        float xv[MIX_U][MIX_STATES];
+#pragma unroll
+        for (int u = 0; u < MIX_U; u++) {
+            const int64_t i = i0 + u * step;
+#pragma unroll
+            for (int s = 0; s < MIX_STATES; s++) {
+                xv[u][s] = s < ns && i < e
+                               ? ((const float *) (src(a, s) + t * a.src_nb[s][1]))[i]
+                               : 0.f;
             }
-            out[(j * n + t) * e + i] = o;
+        }
+#pragma unroll
+        for (int u = 0; u < MIX_U; u++) {
+            const int64_t i = i0 + u * step;
+            if (i < e) {
+                for (int j = 0; j < nq; j++) {
+                    float o = 0.f;
+#pragma unroll
+                    for (int s = 0; s < MIX_STATES; s++) {
+                        if (s < ns) {
+                            o += sc[s][j] * xv[u][s];
+                        }
+                    }
+                    out[(j * n + t) * e + i] = o;
+                }
+            }
         }
     }
 }
@@ -481,7 +528,7 @@ __global__ void attn_kernel(const A a) {
     __shared__ float   qs[ATTN_ROWS][ATTN_D];
     __shared__ float   rsm[ATTN_ROWS][ATTN_NR];
     __shared__ float   pm[ATTN_WARPS][ATTN_ROWS], pl[ATTN_WARPS][ATTN_ROWS];
-    __shared__ float   pacc[ATTN_WARPS][ATTN_ROWS][ATTN_D];
+    __shared__ float   ob[ATTN_ROWS][ATTN_D];
     __shared__ int64_t tpos[ATTN_TQ], tlo[ATTN_TQ];
 
     const int32_t * pos = (const int32_t *) src(a, 4);
@@ -603,22 +650,37 @@ __global__ void attn_kernel(const A a) {
             s[r] = valid[r] ? __expf(s[r] - mn) : 0.f;
             l[r] += s[r];
         }
-        // Values: key kk of the chunk, DPL dims per lane.
+        // Values: key kk of the chunk, DPL dims per lane, VU keys' loads ahead of their sums
+        // (#1221; the sums run in the same order). Half as many for prompt rows, which keeps
+        // their registers at 3 blocks an SM.
         const int64_t nk = min((int64_t) 32, kend - base + 1);
-        for (int kk = 0; kk < nk; kk++) {
-            const int64_t ck   = __shfl_sync(0xffffffffu, c, kk);
-            const __half * vr  = (const __half *) (src(a, 2) + ck * a.src_nb[2][1] + kvoff) + lane * DPL;
-            float          vf[DPL];
+        constexpr int VU = R > ATTN_DECODE_ROWS ? ATTN_VU / 2 : ATTN_VU;
+        for (int kk0 = 0; kk0 < nk; kk0 += VU) {
+            HalfVec<DPL> vraw[VU];
 #pragma unroll
-            for (int j = 0; j < DPL; j++) {
-                vf[j] = __half2float(vr[j]);
+            for (int u = 0; u < VU; u++) {
+                const int64_t ck = __shfl_sync(0xffffffffu, c, kk0 + u);
+                if (kk0 + u < nk) {
+                    const char * vr = src(a, 2) + ck * a.src_nb[2][1] + kvoff;
+                    vraw[u]         = ((const HalfVec<DPL> *) vr)[lane];
+                }
             }
 #pragma unroll
-            for (int r = 0; r < R; r++) {
-                const float p = __shfl_sync(0xffffffffu, s[r], kk);
+            for (int u = 0; u < VU; u++) {
+                if (kk0 + u < nk) {
+                    float vf[DPL];
 #pragma unroll
-                for (int j = 0; j < DPL; j++) {
-                    acc[r][j] += p * vf[j];
+                    for (int j = 0; j < DPL; j++) {
+                        vf[j] = __half2float(vraw[u].h[j]);
+                    }
+#pragma unroll
+                    for (int r = 0; r < R; r++) {
+                        const float p = __shfl_sync(0xffffffffu, s[r], kk0 + u);
+#pragma unroll
+                        for (int j = 0; j < DPL; j++) {
+                            acc[r][j] += p * vf[j];
+                        }
+                    }
                 }
             }
         }
@@ -630,13 +692,35 @@ __global__ void attn_kernel(const A a) {
             pm[warp][r] = m[r];
             pl[warp][r] = ls;
         }
-#pragma unroll
-        for (int j = 0; j < DPL; j++) {
-            pacc[warp][r][lane * DPL + j] = acc[r][j];
-        }
     }
     __syncthreads();
     const float * sinks = (const float *) src(a, 7);
+    // Each output's sum of the warps' parts, a warp at a time in warp order: one buffer in
+    // shared memory instead of every warp's parts (#1221), the same sums.
+#pragma unroll
+    for (int w = 0; w < ATTN_WARPS; w++) {
+        if (warp == w) {
+#pragma unroll
+            for (int r = 0; r < R; r++) {
+                if (r < rows) {
+                    const int64_t t = seq * n_tok + tq0 + r / pk;
+                    const int64_t h = g * pk + r % pk;
+                    float         M = sinks[t * nh + h];
+                    for (int w2 = 0; w2 < ATTN_WARPS; w2++) {
+                        M = fmaxf(M, pm[w2][r]);
+                    }
+                    const float f = __expf(pm[w][r] - M);
+#pragma unroll
+                    for (int j = 0; j < DPL; j++) {
+                        float o = w == 0 ? 0.f : ob[r][lane * DPL + j];
+                        o += acc[r][j] * f;
+                        ob[r][lane * DPL + j] = o;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
     for (int i = threadIdx.x; i < rows * D; i += blockDim.x) {
         const int     r = i / D, k = i % D;
         const int64_t t = seq * n_tok + tq0 + r / pk;
@@ -646,13 +730,11 @@ __global__ void attn_kernel(const A a) {
         for (int w = 0; w < ATTN_WARPS; w++) {
             M = fmaxf(M, pm[w][r]);
         }
-        float den = __expf(sink - M), o = 0.f;
+        float den = __expf(sink - M);
         for (int w = 0; w < ATTN_WARPS; w++) {
-            const float f = __expf(pm[w][r] - M);
-            den += pl[w][r] * f;
-            o += pacc[w][r][k] * f;
+            den += pl[w][r] * __expf(pm[w][r] - M);
         }
-        ((float *) a.dst)[(t * nh + h) * D + k] = o / den;
+        ((float *) a.dst)[(t * nh + h) * D + k] = ob[r][k] / den;
     }
 }
 
@@ -686,23 +768,54 @@ __global__ void situ_kernel(const A a) {
 // Element `lane` of 32-value group gi of row r of expert e of the stack in source 0, times its
 // scale (a Q8_0 block's, an MXFP8 group's from source 3), for a stack of type TY (F32 for any
 // other).
+// The element as loaded (load) and as the sums take it (value), so a kernel can have the loads
+// in flight while it computes.
+template <int TY> struct MmRaw {
+    float v;
+    __device__ __forceinline__ void load(const A & a, int64_t e, int64_t r, int64_t gi,
+                                         int lane) {
+        const char * row = src(a, 0) + e * a.src_nb[0][2] + r * a.src_nb[0][1];
+        if constexpr (TY == TYPE_Q8_0) {
+            const char * b = row + gi * 34;
+            d              = *(const __half *) b;
+            q              = ((const int8_t *) (b + 2))[lane];
+        } else if constexpr (TY == TYPE_I8) {
+            const int64_t k = a.src_ne[0][0], m = a.src_ne[0][1];
+            s               = ((const float *) src(a, 3))[(e * m + r) * (k / 32) + gi];
+            b8              = ((const uint8_t *) row)[gi * 32 + lane];
+        } else if constexpr (TY == TYPE_F16) {
+            d = ((const __half *) row)[gi * 32 + lane];
+        } else if constexpr (TY == TYPE_BF16) {
+            bf = ((const __nv_bfloat16 *) row)[gi * 32 + lane];
+        } else {
+            v = ((const float *) row)[gi * 32 + lane];
+        }
+    }
+    __device__ __forceinline__ float value() const {
+        if constexpr (TY == TYPE_Q8_0) {
+            return __half2float(d) * (float) q;
+        } else if constexpr (TY == TYPE_I8) {
+            return e4m3(b8) * s;
+        } else if constexpr (TY == TYPE_F16) {
+            return __half2float(d);
+        } else if constexpr (TY == TYPE_BF16) {
+            return __bfloat162float(bf);
+        } else {
+            return v;
+        }
+    }
+    __half        d;
+    int8_t        q;
+    uint8_t       b8;
+    float         s;
+    __nv_bfloat16 bf;
+};
+
 template <int TY>
 __device__ __forceinline__ float mm_w(const A & a, int64_t e, int64_t r, int64_t gi, int lane) {
-    const char * row = src(a, 0) + e * a.src_nb[0][2] + r * a.src_nb[0][1];
-    if constexpr (TY == TYPE_Q8_0) {
-        const char * b = row + gi * 34;
-        return __half2float(*(const __half *) b) * (float) ((const int8_t *) (b + 2))[lane];
-    } else if constexpr (TY == TYPE_I8) {
-        const int64_t k = a.src_ne[0][0], m = a.src_ne[0][1];
-        const float   s = ((const float *) src(a, 3))[(e * m + r) * (k / 32) + gi];
-        return e4m3(((const uint8_t *) row)[gi * 32 + lane]) * s;
-    } else if constexpr (TY == TYPE_F16) {
-        return __half2float(((const __half *) row)[gi * 32 + lane]);
-    } else if constexpr (TY == TYPE_BF16) {
-        return __bfloat162float(((const __nv_bfloat16 *) row)[gi * 32 + lane]);
-    } else {
-        return ((const float *) row)[gi * 32 + lane];
-    }
+    MmRaw<TY> w;
+    w.load(a, e, r, gi, lane);
+    return w.value();
 }
 
 // ---- ink_mm_id: sources w [k, m, E], x [k, nx, n_tok], ids [n_used, n_tok] (I32,
@@ -713,6 +826,110 @@ __device__ __forceinline__ float mm_w(const A & a, int64_t e, int64_t r, int64_t
 // mm_id_kernel, for prompt steps: a block per (MM_BM output rows, expert). It lists the pairs
 // routed to its expert, then runs them MM_BN at a time over K in passes of MM_KC, the pass's
 // weights (as floats) and inputs in shared memory, a warp per 8 rows x 8 pairs. ----
+// A thread's share of a pass: the 4 columns 4 (thread % MM_KQ) + i of rows thread / MM_KQ +
+// MM_RS s, loaded raw (packed words) so a pass in flight costs few registers.
+constexpr int MM_KQ = MM_KC / 4;
+constexpr int MM_RS = MM_THREADS / MM_KQ;
+constexpr int MM_WN = MM_BM / MM_RS;
+constexpr int MM_XN = MM_BN / MM_RS;
+static_assert(MM_KC % 32 == 0 && MM_THREADS % MM_KQ == 0 && MM_BM % MM_RS == 0 &&
+                  MM_BN % MM_RS == 0,
+              "mm passes");
+
+// The N / 4 words of the N bytes at p (N 4, 8 or 16; p at least 2-aligned), by the widest
+// access p's alignment allows.
+template <int N> __device__ __forceinline__ void mm_words(uint32_t (&w)[N / 4], const char * p) {
+    const uintptr_t al = (uintptr_t) p;
+    if constexpr (N == 16) {
+        if (al % 16 == 0) {
+            const uint4 v = *(const uint4 *) p;
+            w[0] = v.x, w[1] = v.y, w[2] = v.z, w[3] = v.w;
+            return;
+        }
+    }
+    if (al % 4 == 0) {
+#pragma unroll
+        for (int i = 0; i < N / 4; i++) {
+            w[i] = ((const uint32_t *) p)[i];
+        }
+        return;
+    }
+#pragma unroll
+    for (int i = 0; i < N / 4; i++) {
+        const uint16_t * h = (const uint16_t *) p;
+        w[i]               = (uint32_t) h[2 * i] | (uint32_t) h[2 * i + 1] << 16;
+    }
+}
+
+// Weights c .. c + 3 (c a multiple of 4) of a row, raw; value(i) is weight c + i, the same
+// float as mm_w gives.
+template <int TY> struct MmQuad {
+    static constexpr int NW = TY == TYPE_Q8_0 || TY == TYPE_I8              ? 1
+                              : TY == TYPE_F16 || TY == TYPE_BF16 ? 2
+                                                                  : 4;
+    uint32_t             w[NW];
+    float                s;
+    __half               d;
+    __device__ __forceinline__ void load(const A & a, int64_t e, int64_t r, int64_t c) {
+        const char *  row = src(a, 0) + e * a.src_nb[0][2] + r * a.src_nb[0][1];
+        const int64_t gi = c / 32, l0 = c % 32;
+        if constexpr (TY == TYPE_Q8_0) {
+            const char * b = row + gi * 34;
+            d              = *(const __half *) b;
+            mm_words<4>(w, b + 2 + l0);
+        } else if constexpr (TY == TYPE_I8) {
+            const int64_t k = a.src_ne[0][0], m = a.src_ne[0][1];
+            s               = ((const float *) src(a, 3))[(e * m + r) * (k / 32) + gi];
+            mm_words<4>(w, row + c);
+        } else if constexpr (NW == 2) {
+            mm_words<8>(w, row + 2 * c);
+        } else {
+            mm_words<16>(w, row + 4 * c);
+        }
+    }
+    __device__ __forceinline__ float value(int i) const {
+        if constexpr (TY == TYPE_Q8_0) {
+            return __half2float(d) * (float) (int8_t) (uint8_t) (w[0] >> 8 * i);
+        } else if constexpr (TY == TYPE_I8) {
+            return e4m3((uint8_t) (w[0] >> 8 * i)) * s;
+        } else if constexpr (TY == TYPE_F16) {
+            return __half2float(__ushort_as_half((unsigned short) (w[i / 2] >> 16 * (i % 2))));
+        } else if constexpr (TY == TYPE_BF16) {
+            const unsigned short h = (unsigned short) (w[i / 2] >> 16 * (i % 2));
+            return __bfloat162float(__ushort_as_bfloat16(h));
+        } else {
+            return __uint_as_float(w[i]);
+        }
+    }
+};
+
+// Loads the thread's share of the pass at k0: weights of rows r0 + ..., inputs of pairs ...
+template <int TY>
+__device__ __forceinline__ void mm_fetch(const A & a, MmQuad<TY> (&wq)[MM_WN],
+                                         uint32_t (&xq)[MM_XN][4], const float * x,
+                                         const int64_t * xrow, int64_t e, int64_t r0, int64_t m,
+                                         int np, int64_t k, int64_t k0) {
+    const int     kq = threadIdx.x % MM_KQ, r1 = threadIdx.x / MM_KQ;
+    const int64_t c  = k0 + 4 * kq;
+    if (c >= k) {
+        return;
+    }
+#pragma unroll
+    for (int s = 0; s < MM_WN; s++) {
+        const int64_t r = r0 + r1 + MM_RS * s;
+        if (r < m) {
+            wq[s].load(a, e, r, c);
+        }
+    }
+#pragma unroll
+    for (int s = 0; s < MM_XN; s++) {
+        const int p = r1 + MM_RS * s;
+        if (p < np) {
+            mm_words<16>(xq[s], (const char *) (x + xrow[p] + c));
+        }
+    }
+}
+
 template <int TY>
 __device__ __forceinline__ void mm_id_tile(const A & a, float (*ws)[MM_KC], float (*xs)[MM_KC],
                                            int * list, int64_t * xrow, int * cnt) {
@@ -759,23 +976,37 @@ __device__ __forceinline__ void mm_id_tile(const A & a, float (*ws)[MM_KC], floa
             // This warp's pairs (none when not positive).
             const int nj = min(8, np - wc);
             float     acc[8][8] = {};
+            // The next pass's weights and inputs, loading while this one computes.
+            MmQuad<TY> wq[MM_WN];
+            uint32_t   xq[MM_XN][4];
+            __syncthreads();
+            mm_fetch<TY>(a, wq, xq, x, xrow, e, r0, m, np, k, 0);
             for (int64_t k0 = 0; k0 < k; k0 += MM_KC) {
                 const int kc = (int) min((int64_t) MM_KC, k - k0);
                 __syncthreads();
-                for (int i = threadIdx.x; i < MM_BM * MM_KC; i += blockDim.x) {
-                    const int     rr = i / MM_KC, kk = i % MM_KC;
-                    const int64_t r = r0 + rr, c = k0 + kk;
-                    if (kk < kc) {
-                        ws[rr][kk] = r < m ? mm_w<TY>(a, e, r, c / 32, (int) (c % 32)) : 0.f;
+                const int kk = 4 * (threadIdx.x % MM_KQ), r1 = threadIdx.x / MM_KQ;
+                if (kk < kc) {
+#pragma unroll
+                    for (int s = 0; s < MM_WN; s++) {
+                        const int rr = r1 + MM_RS * s;
+                        const bool in = r0 + rr < m;
+                        *(float4 *) &ws[rr][kk] =
+                            make_float4(in ? wq[s].value(0) : 0.f, in ? wq[s].value(1) : 0.f,
+                                        in ? wq[s].value(2) : 0.f, in ? wq[s].value(3) : 0.f);
                     }
-                }
-                for (int i = threadIdx.x; i < np * MM_KC; i += blockDim.x) {
-                    const int p = i / MM_KC, kk = i % MM_KC;
-                    if (kk < kc) {
-                        xs[p][kk] = x[xrow[p] + k0 + kk];
+#pragma unroll
+                    for (int s = 0; s < MM_XN; s++) {
+                        const int p = r1 + MM_RS * s;
+                        if (p < np) {
+                            const uint32_t(&q)[4] = xq[s];
+                            *(uint4 *) &xs[p][kk] = make_uint4(q[0], q[1], q[2], q[3]);
+                        }
                     }
                 }
                 __syncthreads();
+                if (k0 + MM_KC < k) {
+                    mm_fetch<TY>(a, wq, xq, x, xrow, e, r0, m, np, k, k0 + MM_KC);
+                }
                 if (nj > 0) {
                     for (int g = 0; g < kc / 32; g++) {
                         float wv[8], xv[8];
@@ -819,8 +1050,8 @@ static_assert((MM_BM / 8) * (MM_BN / 8) * 32 == MM_THREADS, "ink_mm_id: a warp p
 static_assert(MM_BN <= MM_THREADS && MM_LIST >= 2 * MM_THREADS, "ink_mm_id: list sizes");
 
 __global__ void __launch_bounds__(MM_THREADS) mm_id_kernel(const A a) {
-    __shared__ float   ws[MM_BM][MM_KC];
-    __shared__ float   xs[MM_BN][MM_KC];
+    __shared__ __align__(16) float ws[MM_BM][MM_KC];
+    __shared__ __align__(16) float xs[MM_BN][MM_KC];
     __shared__ int     list[MM_LIST];
     __shared__ int64_t xrow[MM_BN];
     __shared__ int     cnt;
