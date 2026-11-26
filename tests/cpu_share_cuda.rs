@@ -25,7 +25,9 @@ fn host_share_matches_the_gpu() {
         (types::Q4_K, n_embd, n_ff),
         (types::Q5_1, n_ff, n_embd),
     ];
-    let dev = device_by_kind(DeviceKind::Gpu).expect("no GPU");
+    let dev = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU");
     let mut backend = dev.init().unwrap();
     expert_mv::set_enabled(true);
     let node = caps(0).map_or(0, |c| c.host_numa_id.max(0) as u32);

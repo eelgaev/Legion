@@ -11,7 +11,9 @@ use legion::ggml::{Context, DeviceKind, device_by_kind, ffi, quantize, types};
 #[test]
 #[ignore = "needs a CUDA device"]
 fn get_rows_f16_matches_get_rows_and_cast() {
-    let gpu = device_by_kind(DeviceKind::Gpu).expect("a GPU");
+    let gpu = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("a GPU");
     let mut backend = gpu.init().unwrap();
     let (row, n_rows, n_ids) = (512usize, 300usize, 777usize);
     let values: Vec<f32> = (0..row * n_rows)

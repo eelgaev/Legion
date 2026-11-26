@@ -1159,7 +1159,9 @@ fn cuda_cache(dir: &std::path::Path, slots: u64, budget: usize) -> Executor {
     use legion::residency::cuda::{caps, host_arena};
     let path = dir.join("tiny-qwen4exp.gguf");
     legion::model::qwen4::tiny::write_cuda_indexer(&path, None, 5).unwrap();
-    let dev = device_by_kind(DeviceKind::Gpu).expect("no GPU");
+    let dev = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU");
     let node = caps(0).map_or(0, |c| c.host_numa_id.max(0) as u32);
     let arena = host_arena(node, &[0]).expect("host arena");
     let gpu = dev.buffer_type();
@@ -1439,7 +1441,9 @@ fn cuda_plain_with(dir: &std::path::Path, a8: bool) -> Executor {
     use legion::ggml::{DeviceKind, device_by_kind};
     let path = dir.join("tiny-qwen4exp.gguf");
     legion::model::qwen4::tiny::write_cuda_indexer(&path, None, 5).unwrap();
-    let dev = device_by_kind(DeviceKind::Gpu).expect("no GPU");
+    let dev = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU");
     let gpu = dev.buffer_type();
     // The per-layer n-gram table is read on the host.
     let host = Backend::cpu().unwrap().buffer_type();

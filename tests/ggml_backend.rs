@@ -236,7 +236,9 @@ fn values_round_trip_through_a_host_tensor() {
 #[test]
 #[ignore = "needs a GPU"]
 fn cuda_values_round_trip_through_pinned_memory() {
-    let dev = ggml::device_by_kind(DeviceKind::Gpu).expect("no GPU");
+    let dev = ggml::device_by_kind(DeviceKind::Gpu)
+        .or_else(|| ggml::device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU");
     round_trip_via(
         dev.buffer_type(),
         dev.host_buffer_type().expect("pinned host memory"),
@@ -334,7 +336,9 @@ fn reserved_allocator_holds_a_graph_that_fits_on_cpu() {
 #[test]
 #[ignore = "needs a GPU"]
 fn cuda_reserved_allocator_holds_a_graph_that_fits() {
-    let dev = ggml::device_by_kind(DeviceKind::Gpu).expect("no GPU");
+    let dev = ggml::device_by_kind(DeviceKind::Gpu)
+        .or_else(|| ggml::device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU");
     let backend = dev.init().unwrap();
     reserved_allocator_holds_a_graph_that_fits(backend.buffer_type(), backend);
 }

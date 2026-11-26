@@ -12,7 +12,9 @@ use legion::model::qwen4::hc;
 #[test]
 #[ignore = "needs a CUDA GPU"]
 fn fused_mixer_matches_the_graph() {
-    let dev = device_by_kind(DeviceKind::Gpu).expect("no GPU");
+    let dev = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU");
     let mut gpu = dev.init().unwrap();
     let (e, nh, rank) = (2560i64, 4i64, 320i64);
     let k = e * nh;

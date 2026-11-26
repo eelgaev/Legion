@@ -319,6 +319,7 @@ fn cuda_matches_cpu() {
     let mut cpu = Backend::cpu().unwrap();
     cpu.set_threads(8);
     let mut gpu = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
         .expect("no GPU device")
         .init()
         .unwrap();
@@ -628,6 +629,7 @@ fn cuda_decode_matches_cpu() {
     let mut cpu = Backend::cpu().unwrap();
     cpu.set_threads(8);
     let mut gpu = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
         .expect("no GPU device")
         .init()
         .unwrap();

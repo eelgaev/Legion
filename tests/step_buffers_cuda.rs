@@ -17,7 +17,9 @@ fn a_batch_sharing_the_pool_bounds_every_split() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tiny-qwen4exp.gguf");
     legion::model::qwen4::tiny::write_cuda_indexer(&path, None, 3).unwrap();
-    let dev = device_by_kind(DeviceKind::Gpu).expect("no GPU");
+    let dev = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU");
     let model = Model::load(&GgufFile::open(&path).unwrap(), |_| dev.buffer_type()).unwrap();
     let (seqs, pool_tokens) = (8usize, 8192usize);
     let mut e = Executor::new(model, dev.init().unwrap(), pool_tokens / 64, seqs, 0).unwrap();

@@ -414,7 +414,11 @@ fn cuda_step_times() {
     use std::time::Instant;
     const CHUNK: usize = 512;
     let gguf = GgufFile::open(env("LEGION_TEST_QWEN35_CUDA")).unwrap();
-    let gpu = device_by_kind(DeviceKind::Gpu).unwrap().init().unwrap();
+    let gpu = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .unwrap()
+        .init()
+        .unwrap();
     let model = Model::load(&gguf, |_| gpu.buffer_type()).unwrap();
     let n_vocab = model.hp.n_vocab as u32;
     // 160k positions: room for b × ctx plus the prefilling sequence.
