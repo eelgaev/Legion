@@ -2043,3 +2043,165 @@ fn cuda_glu_wide_store_bench() {
     }
     xpf_reset();
 }
+
+/// Whether a 2-CTA cluster sharing one weight stream between two token tiles of an expert could
+/// speed up the routed SwiGLU GEMM's 128-token tile (#1183 cluster probe; Qwen3.8-Flash-Next:
+/// 640 gate and 640 up rows, k 2560, 512 experts, top 10) at 12,288- and 8,067-token prompt
+/// steps, on a counted routing (every expert 240 or 157-158 pairs: two token tiles each) and a
+/// random one. Microseconds a layer (median and best of 5 rounds, the variants taking turns,
+/// each round starting one further on) of the plain kernel (the fragments' own stores, as the
+/// probes) and of its diagnostic variants: half weights (each tile copies half its weight rows,
+/// so an expert's two tiles read them once between them: the most a shared stream could save,
+/// before its costs; wrong results), cluster sync (clusters of 2 CTAs and a cluster barrier every
+/// k step: the sync's cost, the plain bits), half + sync, and half + forward + sync (each step's
+/// half forwarded into the peer's stage through distributed shared memory: a shared stream's
+/// whole cost model). Also the share of token tiles a pairing would cover. The random routing's
+/// experts of one tile read half their rows only, so its half-weights rows flatter the probe.
+/// `cargo test --release --features cuda --lib -- --ignored cuda_glu_cluster_probe_bench
+/// --nocapture`.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU; a benchmark"]
+fn cuda_glu_cluster_probe_bench() {
+    use crate::ggml::ComputeAllocator;
+    let _lock = XPF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    xpf_reset();
+    let mut gpu = xpf_gpu();
+    let (hidden, ffn, n_expert, n_used) = (2560usize, 640usize, 512usize, 10usize);
+    const LAYERS: usize = 4;
+    const ROUNDS: usize = 5;
+    let blocks = hidden / 64 * 36 * ffn * n_expert;
+    let weights = Context::new(8, 0);
+    let wg = weights.new_tensor(types::NVFP4, &[hidden as i64, ffn as i64, n_expert as i64]);
+    let wu = weights.new_tensor(types::NVFP4, &[hidden as i64, ffn as i64, n_expert as i64]);
+    let scales = [0, 1].map(|_| weights.new_tensor(types::F32, &[n_expert as i64]));
+    weights.alloc_tensors(gpu.buffer_type()).unwrap();
+    wg.set_bytes(&gemm_bench::weights(blocks, 4));
+    wu.set_bytes(&gemm_bench::weights(blocks, 5));
+    for s in scales {
+        s.set_f32(&vec![0.004; n_expert]);
+    }
+    let variants: [(&str, i32); 5] = [
+        ("plain", 0),
+        ("half weights", DIAG_HALF_WEIGHTS),
+        ("cluster sync", DIAG_CLUSTER_SYNC),
+        ("half + sync", DIAG_HALF_WEIGHTS | DIAG_CLUSTER_SYNC),
+        (
+            "half + fwd + sync",
+            DIAG_HALF_WEIGHTS | DIAG_FORWARD | DIAG_CLUSTER_SYNC,
+        ),
+    ];
+    for n_tok in [12288usize, 8067] {
+        for counted in [true, false] {
+            let pairs = n_used * n_tok;
+            let routing = |l: usize| {
+                if counted {
+                    let (q, r) = (pairs / n_expert, pairs % n_expert);
+                    let counts: Vec<usize> = (0..n_expert).map(|e| q + (e < r) as usize).collect();
+                    counted_routing(&counts, n_used, n_tok)
+                } else {
+                    gemm_bench::routing(n_used, n_tok, n_expert, n_expert, 1 + l as u64)
+                }
+            };
+            // The token tiles a pairing of an expert's tiles covers (2 * floor(tiles / 2)).
+            let (mut tiles, mut paired) = (0usize, 0usize);
+            for l in 0..LAYERS {
+                let mut count = vec![0usize; n_expert];
+                for &e in &routing(l) {
+                    count[e as usize] += 1;
+                }
+                for c in count {
+                    let t = c.div_ceil(128);
+                    tiles += t;
+                    paired += t / 2 * 2;
+                }
+            }
+            let ctx = Context::new(16 + 32 * LAYERS, 24 * LAYERS + 16);
+            let x = ctx
+                .new_tensor(types::BF16, &[hidden as i64, 1, n_tok as i64])
+                .as_input();
+            let ids: Vec<_> = (0..LAYERS)
+                .map(|_| {
+                    ctx.new_tensor(types::I32, &[n_used as i64, n_tok as i64])
+                        .as_input()
+                })
+                .collect();
+            let mut graph = ctx.new_graph(24 * LAYERS + 16);
+            let outs: Vec<_> = ids
+                .iter()
+                .map(|&id| {
+                    let y = swiglu_id(&ctx, wg, wu, x, id, Some(scales[0]), Some(scales[1]))
+                        .as_output();
+                    graph.expand(y);
+                    y
+                })
+                .collect();
+            ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+                .unwrap();
+            x.set_bytes(&xpf_bf16(hidden * n_tok, 5 + n_tok as u64));
+            for (l, id) in ids.iter().enumerate() {
+                id.set_i32(&routing(l));
+            }
+            // The 128-token tile of the default tune, the fragments' own stores (the probes'
+            // epilogue) for every variant.
+            force_gemm_tune(Some(GEMM_DEFAULT), Some(16));
+            force_gemm_wst(Some(0));
+            let mut want = Vec::new();
+            let mut same = vec![true; variants.len()];
+            for (vi, &(_, diag)) in variants.iter().enumerate() {
+                force_gemm_diag(diag);
+                gpu.compute(&graph).unwrap();
+                let got: Vec<Vec<u8>> = outs.iter().map(|o| o.bytes()).collect();
+                if vi == 0 {
+                    want = got;
+                } else {
+                    same[vi] = got == want;
+                }
+            }
+            let nv = variants.len();
+            let mut times = vec![Vec::with_capacity(ROUNDS); nv];
+            for round in 0..ROUNDS {
+                for i in 0..nv {
+                    let vi = (round + i) % nv;
+                    force_gemm_diag(variants[vi].1);
+                    let t = std::time::Instant::now();
+                    gpu.compute(&graph).unwrap();
+                    times[vi].push(t.elapsed().as_secs_f64() / LAYERS as f64);
+                }
+            }
+            force_gemm_diag(0);
+            for t in &mut times {
+                t.sort_by(f64::total_cmp);
+            }
+            let median: Vec<f64> = times.iter().map(|t| t[t.len() / 2]).collect();
+            let best: Vec<f64> = times.iter().map(|t| t[0]).collect();
+            eprintln!(
+                "swiglu at {n_tok} tokens, {} routing: {paired} of {tiles} token tiles pairable \
+                 ({:.1}%)",
+                if counted { "counted" } else { "random" },
+                100.0 * paired as f64 / tiles.max(1) as f64
+            );
+            for (vi, &(name, diag)) in variants.iter().enumerate() {
+                eprintln!(
+                    "  {name:<18} diag {diag:>6}: median {:>8.1} us/layer ({:>5.3}x plain), \
+                     min {:>8.1} ({:>5.3}x)  {}",
+                    median[vi] * 1e6,
+                    median[0] / median[vi],
+                    best[vi] * 1e6,
+                    best[0] / best[vi],
+                    if vi == 0 {
+                        "reference"
+                    } else if same[vi] {
+                        "same bits"
+                    } else {
+                        "bits differ (diagnostic)"
+                    }
+                );
+            }
+            // The cluster sync alone keeps the sums: the cluster launch ran.
+            assert!(same[2], "cluster sync at {n_tok}: bits differ");
+        }
+    }
+    force_gemm_diag(0);
+    xpf_reset();
+}

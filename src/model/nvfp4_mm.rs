@@ -2493,6 +2493,21 @@ pub fn force_gemm_wst(wst: Option<i32>) {
     let _ = wst;
 }
 
+/// `nvfp4_gemm`'s `DIAG_HALFW` (#1183 cluster probe, [`force_gemm_diag`], the grouped SwiGLU's
+/// 128-token tile only): each token tile copies and prefetches half of its weight rows (the half
+/// of its tile index's parity), so an expert's two tiles read its rows once between them, as two
+/// CTAs sharing one weight stream would. Wrong results.
+#[doc(hidden)]
+pub const DIAG_HALF_WEIGHTS: i32 = 65536;
+/// `nvfp4_gemm`'s `DIAG_FWD`: with [`DIAG_CLUSTER_SYNC`], each step's half of the next stage's
+/// weight words forwarded into the cluster peer's stage (distributed shared memory).
+#[doc(hidden)]
+pub const DIAG_FORWARD: i32 = 131072;
+/// `nvfp4_gemm`'s `DIAG_CLSYNC`: launched as clusters of 2 CTAs with a cluster barrier every k
+/// step; alone, the default's sums.
+#[doc(hidden)]
+pub const DIAG_CLUSTER_SYNC: i32 = 262144;
+
 /// `nvfp4_gemm`'s `DIAG_CAW`: the weight copies through L1 (`cp.async.ca`).
 pub const L1_W: i32 = 4096;
 /// `nvfp4_gemm`'s `DIAG_CAX`: the activation copies through L1.
@@ -2518,7 +2533,8 @@ pub fn force_gemm_l1(l1: Option<i32>) {
 /// weight copies, 16 no activation copies, 64 no k loop; the combinations
 /// [`gemm_bench`] runs), at 128-token tiles and the default tune only; 0: the
 /// whole kernel. `legion nvfp4-gemm-bench` only (#1176 r35): what bounds the GEMM. The results
-/// are wrong.
+/// are wrong. Also the cluster probe's ([`DIAG_HALF_WEIGHTS`], [`DIAG_CLUSTER_SYNC`],
+/// [`DIAG_FORWARD`]; #1183, `cuda_glu_cluster_probe_bench`).
 #[doc(hidden)]
 pub fn force_gemm_diag(diag: i32) {
     #[cfg(feature = "cuda")]

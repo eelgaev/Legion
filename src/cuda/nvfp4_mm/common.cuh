@@ -418,9 +418,32 @@ __device__ __forceinline__ bool find_tile(const int32_t * offs, int n_expert, in
 // see gemm_down, gemm_glu and legion_nvfp4_mm::wst): grouped tiles, the epilogue staged through
 // shared memory and stored 16 bytes a thread / the stores streaming (evict-first; the SwiGLU's
 // with EPI_WIDE only).
+// DIAG_HALFW / DIAG_CLSYNC / DIAG_FWD (#1183 cluster probe, bench only, grouped SwiGLU 128-token
+// tile): what a 2-CTA cluster sharing one weight stream between two token tiles of an expert
+// could gain and what it would cost. DIAG_HALFW: each tile copies (and L2-prefetches) only half
+// of its weight rows, the half of its tile index's parity (an expert's two tiles together read
+// its rows once, as a shared stream would), the other half stale: wrong results. DIAG_CLSYNC:
+// launched as clusters of 2 CTAs (grid rounded up to even), a cluster barrier once per k step
+// (arrive after the step's MMAs, wait before the next), idle CTAs keeping step; alone, the
+// default's sums. DIAG_FWD (with DIAG_CLSYNC): after each step's MMAs, the CTA's half of the next
+// stage's weight words forwarded into the peer CTA's same stage through distributed shared
+// memory (st.shared::cluster), as a shared stream would.
 constexpr int DIAG_NODEC = 1, DIAG_NOMMA = 2, DIAG_NOEPI = 4, DIAG_NOW = 8, DIAG_NOX = 16, DIAG_NOK = 64,
               DIAG_PF16 = 256, DIAG_PF4 = 512, DIAG_PF8 = 1024, DIAG_PF32 = 2048, DIAG_CAW = 4096,
-              DIAG_CAX = 8192, EPI_WIDE = 16384, EPI_CS = 32768;
+              DIAG_CAX = 8192, EPI_WIDE = 16384, EPI_CS = 32768, DIAG_HALFW = 65536, DIAG_FWD = 131072,
+              DIAG_CLSYNC = 262144;
+
+// The cluster probe's barrier halves (DIAG_CLSYNC; sm_90+, no-ops below).
+__device__ __forceinline__ void glc_arrive() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("barrier.cluster.arrive.release.aligned;\n" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void glc_wait() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("barrier.cluster.wait.acquire.aligned;\n" ::: "memory");
+#endif
+}
 template <int MI, int NT, bool GROUPED, bool GLU, int ST = STAGES, int MINB = 1, int DIAG = 0, int WARPS = 8>
 __global__ void __launch_bounds__(WARPS * 32, MINB) nvfp4_gemm(const legion_nvfp4_mm p) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -432,6 +455,24 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) nvfp4_gemm(const legion_nvfp
     __shared__ int64_t x_off[GROUPED ? BN : 1], d_off[GROUPED ? BN : 1];
     __shared__ int32_t tile_expert, tile_tokens, tile_first;
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    constexpr bool CL = (DIAG & DIAG_CLSYNC) != 0;
+    static_assert(!(DIAG & (DIAG_HALFW | DIAG_FWD | DIAG_CLSYNC)) || (GROUPED && GLU), "cluster probe");
+    static_assert(!(DIAG & DIAG_FWD) || CL, "the forward needs the cluster barrier");
+    // DIAG_CLSYNC: every CTA of the cluster started before any shared memory of it is written;
+    // a CTA with no tile keeps step with its peer (one barrier a k step) until it leaves.
+    if constexpr (CL) {
+        glc_arrive();
+        glc_wait();
+    }
+    auto cl_idle = [&]() {
+        if constexpr (CL) {
+            for (int64_t s = 0; s < p.k / BK; s++) {
+                glc_arrive();
+                glc_wait();
+            }
+        }
+    };
+    int wh = 0;  // DIAG_HALFW: the weight rows' half this tile copies
 
     int64_t m0, n0 = 0, n_tok;
     const uint8_t * w = p.w;
@@ -451,6 +492,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) nvfp4_gemm(const legion_nvfp
         // Row tiles vary fastest: the CTAs resident at once share an expert's tokens.
         m0 = (int64_t) (blockIdx.x % p.tiles_m) * BM_OUT;
         const int tile = blockIdx.x / p.tiles_m;
+        wh = tile & 1;
         // Past the routing's last tile (the host grid is an upper bound, about a third of it
         // at prefill chunks over 512 experts): nothing to do, so leave before the plan scan
         // (#836); but first store zeros for the plan's skipped pairs (ids of -1, listed after
@@ -474,6 +516,12 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) nvfp4_gemm(const legion_nvfp
                             store_out(p, off + r, 0.0f);
                         }
                     }
+                }
+            }
+            // DIAG_CLSYNC: a peer past the last tile too leaves at once (the grid's tail).
+            if constexpr (CL) {
+                if (!legion_nvfp4::past_plan_tiles<TI>(p, (int) ((blockIdx.x ^ 1u) / p.tiles_m))) {
+                    cl_idle();
                 }
             }
             return;
@@ -500,6 +548,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) nvfp4_gemm(const legion_nvfp
         }
         __syncthreads();
         if (tile_expert < 0) {
+            cl_idle();
             return;
         }
         w += (int64_t) tile_expert * p.w_e;
@@ -530,7 +579,8 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) nvfp4_gemm(const legion_nvfp
 #pragma unroll
         for (int i = 0; i < (BM * 3 + THREADS - 1) / THREADS; i++) {
             const int c = threadIdx.x + i * THREADS;
-            if (!(DIAG & DIAG_NOW) && (BM * 3 % THREADS == 0 || c < BM * 3)) {
+            const bool own = !(DIAG & DIAG_HALFW) || (c >= BM * 3 / 2) == (wh != 0);
+            if (!(DIAG & DIAG_NOW) && own && (BM * 3 % THREADS == 0 || c < BM * 3)) {
                 const int r = c / 3, part = c % 3;
                 const uint8_t * start = row_src(r) + step * 36;
                 const uint8_t * src = (const uint8_t *) ((uintptr_t) start & ~(uintptr_t) 15) + part * 16;
@@ -567,7 +617,8 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) nvfp4_gemm(const legion_nvfp
                                                                  : 32;
     auto prefetch = [&](int64_t step) {
 #if __CUDA_ARCH__ >= 900
-        if (!(DIAG & DIAG_NOW) && threadIdx.x < BM && step < steps) {
+        const bool own = !(DIAG & DIAG_HALFW) || (int) threadIdx.x / (BM / 2) == wh;
+        if (!(DIAG & DIAG_NOW) && own && threadIdx.x < BM && step < steps) {
             const int r = threadIdx.x;
             const int64_t row = GLU ? m0 + r / 32 * 16 + r % 16 : m0 + r;
             if (row < p.m) {
@@ -721,6 +772,9 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) nvfp4_gemm(const legion_nvfp
     }
 #endif
     for (int64_t step = 0; step < steps; step++) {
+        if (CL && step > 0) {
+            glc_wait();  // the peer's last step done (DIAG_FWD: its half of this stage written)
+        }
         asm volatile("cp.async.wait_group %0;\n" ::"n"(ST - 2));
         __syncthreads();
         const int64_t next = step + ST - 1;
@@ -738,6 +792,40 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) nvfp4_gemm(const legion_nvfp
         } else {
             mma_stage(ws, xs, step, std::false_type{});
         }
+#if __CUDA_ARCH__ >= 900
+        if constexpr ((DIAG & DIAG_FWD) != 0) {
+            // This CTA's half of the next stage's weight words (its own copies, landed: only the
+            // newest group may be in flight) into the same words of the peer's stage. The peer
+            // last read that stage two steps ago, before the barrier this step started with.
+            // (The probe's peer is the next CTA, not the expert's other tile, so the words are
+            // wrong; the traffic and the instructions are a shared stream's.)
+            if (step + 1 < steps) {
+                asm volatile("cp.async.wait_group %0;\n" ::"n"(ST - 2));
+                __syncthreads();
+                uint32_t rank;
+                asm volatile("mov.u32 %0, %%cluster_ctarank;\n" : "=r"(rank));
+                const unsigned char * nws = smem + ((step + 1) % ST) * STAGE;
+                for (int c = threadIdx.x; c < BM * 3 / 2; c += THREADS) {
+                    const int cw = wh * (BM * 3 / 2) + c;
+                    const uint32_t a = (uint32_t) __cvta_generic_to_shared(nws + cw / 3 * LDW + cw % 3 * 16);
+                    uint32_t r, v0, v1, v2, v3;
+                    asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];\n"
+                                 : "=r"(v0), "=r"(v1), "=r"(v2), "=r"(v3)
+                                 : "r"(a));
+                    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;\n" : "=r"(r) : "r"(a), "r"(rank ^ 1u));
+                    asm volatile("st.shared::cluster.v4.u32 [%0], {%1, %2, %3, %4};\n" ::"r"(r), "r"(v0), "r"(v1),
+                                 "r"(v2), "r"(v3)
+                                 : "memory");
+                }
+            }
+        }
+#endif
+        if constexpr (CL) {
+            glc_arrive();
+        }
+    }
+    if (CL && steps > 0) {
+        glc_wait();  // the peer done with this CTA's shared memory before either leaves
     }
     asm volatile("cp.async.wait_group 0;\n" ::);
 
@@ -1927,6 +2015,24 @@ int gemm_diag1(const legion_nvfp4_mm & p, cudaStream_t st) {
     return status();
 }
 
+// The cluster probe's DIAG_CLSYNC kernels (#1183): clusters of 2 CTAs, the grid rounded up to
+// even (the extra CTA lies past the plan's last tile). -1 where the device takes no clusters.
+template <int MI, int NT, bool GLU, int DIAG>
+int gemm_diag_cluster(const legion_nvfp4_mm & p, cudaStream_t st) {
+    constexpr int SMEM = smem_bytes<MI, NT>();
+    auto kernel = nvfp4_gemm<MI, NT, true, GLU, STAGES, 1, DIAG>;
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    if (cudaFuncSetAttribute(kernel, cudaFuncAttributeRequiredClusterWidth, 2) != cudaSuccess ||
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeRequiredClusterHeight, 1) != cudaSuccess ||
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeRequiredClusterDepth, 1) != cudaSuccess) {
+        cudaGetLastError();
+        return -1;
+    }
+    const unsigned n = (unsigned) p.tiles_m * (unsigned) p.tiles_n;
+    kernel<<<n + n % 2, 256, SMEM, st>>>(p);
+    return status();
+}
+
 template <int MI, int NT, bool GLU>
 int gemm_diag(const legion_nvfp4_mm & p, int variant, cudaStream_t st) {
     if (const int r = gemm_l1<MI, NT, GLU>(p, variant, st); r != -2) {
@@ -1944,6 +2050,16 @@ int gemm_diag(const legion_nvfp4_mm & p, int variant, cudaStream_t st) {
     }
     if (!p.plan || variant % 100 != 31) {
         return -1;
+    }
+    if constexpr (GLU && MI == 2 && NT == 16) {
+        switch (variant / 100) {
+            case DIAG_HALFW: return gemm_diag1<MI, NT, GLU, DIAG_HALFW>(p, st);
+            case DIAG_CLSYNC: return gemm_diag_cluster<MI, NT, GLU, DIAG_CLSYNC>(p, st);
+            case DIAG_HALFW | DIAG_CLSYNC: return gemm_diag_cluster<MI, NT, GLU, DIAG_HALFW | DIAG_CLSYNC>(p, st);
+            case DIAG_HALFW | DIAG_FWD | DIAG_CLSYNC:
+                return gemm_diag_cluster<MI, NT, GLU, DIAG_HALFW | DIAG_FWD | DIAG_CLSYNC>(p, st);
+            default: break;
+        }
     }
     switch (variant / 100) {
         case DIAG_NODEC: return gemm_diag1<MI, NT, GLU, DIAG_NODEC>(p, st);
