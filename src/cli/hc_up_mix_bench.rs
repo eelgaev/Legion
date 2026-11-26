@@ -2,8 +2,8 @@
 //! NVFP4 checkpoints) at a prompt step's shape, in each of its kernels and `up_mix_bf16_reg`'s
 //! options, timed on one GPU (#1183; a development tool, so a build tree's release binary can
 //! measure the box it runs on; pick the GPU with `CUDA_VISIBLE_DEVICES`). `--check` compares
-//! every variant's bits with the reference's instead; `--ab` times every variant against one
-//! base, alternating which runs first.
+//! every variant's bits with the reference's instead; `--ab BASE` (e.g. `--ab 2:none`, the
+//! kernel without options) times every variant against that one, alternating which runs first.
 
 use clap::Args;
 use legion::model::qwen4::hc_up_mix_bench::{self as bench, Config, MODES, Variant, opts_name};

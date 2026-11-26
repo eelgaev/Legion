@@ -67,11 +67,12 @@ impl Variant {
     }
 
     /// Whether a launch that ran `kernel` ([`super::last_kernel`]) with `opts`
-    /// ([`super::last_reg_opts`]) ran this variant: its kernel (any for 0) and, for
-    /// `up_mix_bf16_reg` with options given, those options (not some fallback).
+    /// ([`super::last_reg_opts`]) ran this variant: its kernel (any for 0) and, where
+    /// `up_mix_bf16_reg` ran (forced, or picked by 0) and options were given, those options (not
+    /// some fallback).
     pub fn ran_as(self, kernel: i32, opts: i32) -> bool {
         (self.kernel == 0 || kernel == self.kernel)
-            && (self.kernel % 100 != 2 || self.opts.is_none_or(|o| o == opts))
+            && (kernel % 100 != 2 || self.opts.is_none_or(|o| o == opts))
     }
 
     /// Forces this variant for the launches from now on.
@@ -532,7 +533,8 @@ pub fn ab(
 
 /// At every token count of `cfg` and in every mode, one mixer per variant: its F32 values (where
 /// it writes them) and BF16 copy against [`Config::reference`]'s, bit for bit. The outputs are
-/// filled with NaN before each run, so a value no kernel wrote cannot match.
+/// filled with NaN before each run, so a value no kernel wrote cannot match. An error where the
+/// reference did not run as asked ([`Variant::ran_as`]).
 pub fn check(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Check>, String> {
     check_config(cfg)?;
     let one = Config {
@@ -567,7 +569,16 @@ pub fn check(gpu: &mut Backend, cfg: &Config) -> Result<Vec<Check>, String> {
                 }
                 Ok((b, (last_kernel(), last_reg_opts())))
             };
-            let (want, _) = get(cfg.reference)?;
+            // A reference that fell back to another kernel or options would check the variants
+            // against something else than asked: an error, not a check.
+            let (want, (rk, ro)) = get(cfg.reference)?;
+            if !cfg.reference.ran_as(rk, ro) {
+                return Err(format!(
+                    "{n} tokens {mode}: the reference {} ran {rk} with options {}",
+                    cfg.reference,
+                    opts_name(ro)
+                ));
+            }
             for &v in &cfg.variants {
                 let (got, (ran, ran_opts)) = get(v)?;
                 // Values: 4-byte F32 ones first, then 2-byte BF16 ones.

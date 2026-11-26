@@ -867,6 +867,15 @@ fn bench_variants_parse() {
     assert!(!v("2:ld").ran_as(1, 0), "fell back to up_mix_bf16");
     assert!(v("2").ran_as(2, REG_PD2));
     assert!(v("0").ran_as(1, 0) && v("1").ran_as(1, 0));
+    // The default picking up_mix_bf16_reg still runs the options asked for; picking
+    // up_mix_bf16 has none to run.
+    assert!(v("0:ld+xs").ran_as(2, REG_LD | REG_XS));
+    assert!(!v("0:ld+xs").ran_as(2, REG_LD), "XS dropped");
+    assert!(
+        !v("0:ld+xs").ran_as(1002, REG_LD),
+        "XS dropped, lo through L2"
+    );
+    assert!(v("0:ld+xs").ran_as(1, 0));
 }
 
 /// The options' switch tests change the same configured options: one at a time.
