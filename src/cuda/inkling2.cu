@@ -836,8 +836,8 @@ static_assert(MM_KC % 32 == 0 && MM_THREADS % MM_KQ == 0 && MM_BM % MM_RS == 0 &
                   MM_BN % MM_RS == 0,
               "mm passes");
 
-// The N / 4 words of the N bytes at p (N 4, 8 or 16; p at least 2-aligned), by the widest
-// access p's alignment allows.
+// The N / 4 words of the N bytes at p (N 4, 8 or 16), by the widest access p's alignment
+// allows (byte loads at an odd address, e.g. a padded I8 row).
 template <int N> __device__ __forceinline__ void mm_words(uint32_t (&w)[N / 4], const char * p) {
     const uintptr_t al = (uintptr_t) p;
     if constexpr (N == 16) {
@@ -851,6 +851,15 @@ template <int N> __device__ __forceinline__ void mm_words(uint32_t (&w)[N / 4], 
 #pragma unroll
         for (int i = 0; i < N / 4; i++) {
             w[i] = ((const uint32_t *) p)[i];
+        }
+        return;
+    }
+    if (al % 2 != 0) {
+        const uint8_t * u = (const uint8_t *) p;
+#pragma unroll
+        for (int i = 0; i < N / 4; i++) {
+            w[i] = (uint32_t) u[4 * i] | (uint32_t) u[4 * i + 1] << 8 |
+                   (uint32_t) u[4 * i + 2] << 16 | (uint32_t) u[4 * i + 3] << 24;
         }
         return;
     }

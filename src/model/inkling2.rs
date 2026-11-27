@@ -443,7 +443,8 @@ impl Arch for Ink2Params {
 
     /// The logits soft-capped and cut to the unpadded vocabulary. The greedy pick over
     /// [`glm_ops::argmax_wide`]'s CTAs (#1221): one CTA a token read the 200K logits slowly;
-    /// the same index (the first of the largest, the soft cap leaves no NaN).
+    /// the same index as `argmax` (the first of the largest) for NaN-free logits. The soft cap
+    /// passes a NaN through (`tanh(NaN)` is NaN), so that rests on the output projection.
     fn head<'a>(
         &self,
         m: &'a Model,
