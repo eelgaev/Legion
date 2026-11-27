@@ -211,6 +211,9 @@ int legion_qsa_scores_exact_launch(const legion_qsa_scores_exact * p, void * str
 // kernel's target).
 int legion_qsa_scores_sm7x(void);
 
+// 1 when device `dev` runs attn_mma_kernel<256> (use_mma): the folded prompt path needs it.
+int legion_qsa_attn_mma256(int dev);
+
 }  // extern "C"
 
 namespace {
@@ -500,24 +503,40 @@ std::atomic<bool> chain_notice_said{false};
 // the binary holds code for the kernel built for sm_80+ (a build for older architectures only
 // would JIT its PTX, where the MMA is a trap). Decided once per device.
 template <int HD>
-bool use_mma() {
+bool use_mma_on(int dev) {
     static std::atomic<int> state[64];  // per device: 0 unknown, 1 yes, 2 no
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
+    if (dev < 0 || dev >= 64) {
         return false;
     }
     int s = state[dev].load(std::memory_order_acquire);
     if (s == 0) {
         int major = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        // cudaFuncGetAttributes answers for the current device: switch to `dev` for the query.
+        int cur = -1;
+        const bool moved = cudaGetDevice(&cur) == cudaSuccess && cur != dev &&
+                           cudaSetDevice(dev) == cudaSuccess;
         cudaFuncAttributes a{};
         const bool code = cudaFuncGetAttributes(&a, attn_mma_kernel<HD>) == cudaSuccess &&
                           a.binaryVersion >= 80 && a.ptxVersion >= 80;
+        if (moved) {
+            cudaSetDevice(cur);
+        }
         (void) cudaGetLastError();
         s = major >= 8 && code ? 1 : 2;
         state[dev].store(s, std::memory_order_release);
     }
     return s == 1;
+}
+
+template <int HD>
+bool use_mma() {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    return use_mma_on<HD>(dev);
 }
 
 // Whether the current device takes attn_gb_kernel<HD> by default: compute capability 12.x (the
@@ -2023,6 +2042,10 @@ int legion_qsa_scores_sm7x(void) {
         }
     }
     return 1;
+}
+
+int legion_qsa_attn_mma256(int dev) {
+    return use_mma_on<256>(dev) ? 1 : 0;
 }
 
 }  // extern "C"

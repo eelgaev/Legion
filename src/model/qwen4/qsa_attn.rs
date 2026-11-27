@@ -792,9 +792,14 @@ pub(crate) unsafe fn fold_q_off(node: *const ffi::ggml_tensor) -> Option<&'stati
         if gw_cg() {
             return Some("LEGION_DEBUG_QSA_GW_L1=0");
         }
-        let cc = crate::ggml::cuda_device_of(k).and_then(crate::hw::per_device::cc);
-        if cc.map(|c| c.0) != Some(12) {
+        let dev = crate::ggml::cuda_device_of(k);
+        if dev.and_then(crate::hw::per_device::cc).map(|c| c.0) != Some(12) {
             return Some("not a compute capability 12.x GPU (the fold is attn_gw_kernel's)");
+        }
+        // The launcher takes the folded kernel only where it would run attn_mma_kernel (sm_80+
+        // code in the binary); a build without it would JIT PTX and refuse the folded node.
+        if dev.is_none_or(|d| cuda::legion_qsa_attn_mma256(d as i32) != 1) {
+            return Some("no sm_80+ attention code in this build");
         }
         None
     }
@@ -1767,6 +1772,7 @@ mod cuda {
         pub fn legion_qsa_scores_exact_launch(p: *const ScoresExact, stream: *mut c_void) -> i32;
         pub fn legion_qsa_scores_launch(p: *const Scores, stream: *mut c_void) -> i32;
         pub fn legion_qsa_scores_sm7x() -> i32;
+        pub fn legion_qsa_attn_mma256(dev: i32) -> i32;
         pub fn legion_qsa_pool_mask_launch(p: *const PoolMask, stream: *mut c_void) -> i32;
         pub fn legion_qsa_select_launch(p: *const Select, stream: *mut c_void) -> i32;
         pub fn legion_qsa_attn_launch(p: *const Attn, stream: *mut c_void) -> i32;
