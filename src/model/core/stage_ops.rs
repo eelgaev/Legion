@@ -34,7 +34,7 @@ pub(crate) const PURE: &[&str] = &[
     "hc_lo_act",
     "hc_combine",
     "hc_rms_mul",
-    // The combine over BF16 streams folded after allocation (#1183): one kernel.
+    // The combine over BF16 streams (#1183): one kernel.
     "hc_combine16",
     "ple_gate",
     "ple_conv",

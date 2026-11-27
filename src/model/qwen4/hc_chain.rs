@@ -7,10 +7,11 @@
 //!   block output into the streams (decode and verify steps of BF16 mixers without
 //!   `--hc-mix-bf16`, the MTP head): one kernel in place of ggml's scale, sigmoid, scale and
 //!   hc_post.
-//! - [`make_combine16`]: ggml's combine of BF16 streams (`--hc-bf16`) where they meet one
-//!   outside the mixers (the per-layer embedding's layer, the end of the stack for an MTP head):
-//!   their copy to F32, the inject's scale, sigmoid and scale, and `hc_post` as one kernel,
-//!   made by `node_fuse` after allocation (#1183).
+//! - [`combine16`]: the combine of BF16 streams (`--hc-bf16`) where they meet one outside the
+//!   mixers (the per-layer embedding's layer, the end of the stack for an MTP head): ggml's copy
+//!   of them to F32, the inject's scale, sigmoid and scale, and `hc_post` as one kernel reading
+//!   the BF16 values (#1183). Its graph has no F32 copy of the streams, so a smaller allocation
+//!   than ggml's.
 //! - [`rms_mul`]: the mixer's grouped norm there, `rms_norm(x) · gamma`, one kernel in place of
 //!   ggml's rms_norm and mul.
 //!
@@ -149,42 +150,54 @@ pub(super) fn combine<'a>(
     )
 }
 
-/// Turns the allocated `hc_post` node `node` of ggml's combine of BF16 streams (`--hc-bf16`,
-/// #1183) into one op: `out` (F32 `[e, n]`, rows contiguous), `res16` (the BF16 streams
-/// `[e, hc, n]`, rows contiguous, that ggml's copy widened to F32) and `inject` (F32 `[hc, n]`,
-/// rows contiguous) with the scales `s1` and `s2` of ggml's `scale(sigmoid(scale(inject, s1)),
-/// s2)`: [`combine`]'s values, each stream value widened exactly as the copy widened it, so the
-/// node's bits (`node_fuse`, after allocation).
-///
-/// # Safety
-/// As [`crate::ggml::make_external`]; the tensors valid and allocated, of those shapes.
-pub(crate) unsafe fn make_combine16(
-    node: *mut ffi::ggml_tensor,
-    out: *mut ffi::ggml_tensor,
-    res16: *mut ffi::ggml_tensor,
-    inject: *mut ffi::ggml_tensor,
-    s1: f32,
-    s2: f32,
-) {
-    // SAFETY: the caller's.
-    unsafe {
-        crate::ggml::make_external(
-            node,
-            &HC_COMBINE16,
-            &[out, res16, inject],
-            &[s1.to_bits() as i32, s2.to_bits() as i32],
-        )
-    }
+/// `LEGION_DEBUG_HC_COMBINE16=0`: BF16 streams meeting a combine outside the mixers get ggml's
+/// copy to F32 and its combine chain (the way before #1183's [`combine16`]), for A/B runs (the
+/// same bits either way).
+fn combine16_off() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("LEGION_DEBUG_HC_COMBINE16").is_some_and(|v| v == "0"))
 }
 
-/// Whether a graph node is a [`make_combine16`] op.
-///
-/// # Safety
-/// `node` is a valid tensor.
-#[cfg(test)]
-pub(crate) unsafe fn is_combine16(node: *const ffi::ggml_tensor) -> bool {
-    // SAFETY: the caller's.
-    unsafe { crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &HC_COMBINE16)) }
+/// Whether [`combine16`] takes these operands: `out` F32 `[e, n]`, `res16` BF16 `[e, hc, n]`,
+/// `inject` F32 `[hc, n]` (a view is fine: the op only reads it), rows contiguous.
+pub(super) fn combine16_fits(
+    out: Tensor<'_>,
+    res16: Tensor<'_>,
+    inject: Tensor<'_>,
+    on_gpu: bool,
+) -> bool {
+    let [e, hc, n, one] = res16.ne();
+    let f32_rows = |t: Tensor<'_>| t.ty() == types::F32 && t.nb()[0] == 4;
+    gpu(on_gpu)
+        && !combine16_off()
+        && one == 1
+        && res16.ty() == types::BF16
+        && res16.nb()[0] == 2
+        && out.ne() == [e, n, 1, 1]
+        && inject.ne() == [hc, n, 1, 1]
+        && f32_rows(out)
+        && f32_rows(inject)
+}
+
+/// `hc_post(out, cast(res16, F32), scale(sigmoid(scale(inject, 1/hc)), 2))`, ggml's combine of
+/// the block output into BF16 streams (`--hc-bf16`, #1183): F32 `[e, hc, n]`, contiguous. One
+/// kernel, [`combine`]'s values with each stream value widened exactly as ggml's copy widens it,
+/// so ggml's bits without the F32 copy written and read back. Needs [`combine16_fits`].
+pub(super) fn combine16<'a>(
+    ctx: &'a Context,
+    out: Tensor<'a>,
+    res16: Tensor<'a>,
+    inject: Tensor<'a>,
+) -> Tensor<'a> {
+    let [e, hc, n, _] = res16.ne();
+    let inv = 1.0 / hc as f32;
+    ctx.external_with(
+        &HC_COMBINE16,
+        types::F32,
+        [e, hc, n, 1],
+        &[out, res16, inject],
+        &[inv.to_bits() as i32, 2f32.to_bits() as i32],
+    )
 }
 
 /// Whether [`rms_mul`] takes `x` (F32 `[e, hc, n]`, rows contiguous) and `gamma` (F32, `e · hc`
@@ -294,7 +307,7 @@ unsafe fn cpu_combine(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
 }
 
 unsafe fn cpu_combine16(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
-    // SAFETY: a node made by `make_combine16`, host tensors of the checked shapes.
+    // SAFETY: a node made by `combine16`, host tensors of the checked shapes.
     unsafe {
         let (out, res, inj) = (&*dst.src[0], &*dst.src[1], &*dst.src[2]);
         let (s1, s2) = (param(dst, 0), param(dst, 1));
@@ -430,7 +443,7 @@ unsafe fn cuda_combine(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<()
 
 #[cfg(feature = "cuda")]
 unsafe fn cuda_combine16(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
-    // SAFETY: a node made by `make_combine16`, device tensors of the stream's device.
+    // SAFETY: a node made by `combine16`, device tensors of the stream's device.
     unsafe {
         let (out, res, inj) = (&*dst.src[0], &*dst.src[1], &*dst.src[2]);
         let mut p = HcChain::empty(dst.data as *mut f32);

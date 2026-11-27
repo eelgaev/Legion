@@ -188,8 +188,6 @@ pub(crate) struct Counts {
     pub iq_rope: usize,
     /// The indexer cache rows (raw key, zero pool-key half) in one launch.
     pub idx_rows: usize,
-    /// Combines of BF16 streams outside the mixers in one launch (no F32 copy of them).
-    pub combine16: usize,
     /// Nodes turned into `GGML_OP_NONE`.
     pub none: usize,
 }
@@ -215,12 +213,6 @@ static ROWS_LOGGED: AtomicBool = AtomicBool::new(false);
 /// The reasons [`Graph::rows_fold`] left rows of a kind ([`Rows`]) for that were logged (each
 /// once: a decode step's reason would hide a prompt step's).
 static ROWS_FOLD_WHY: std::sync::Mutex<Vec<(usize, &str)>> = std::sync::Mutex::new(Vec::new());
-
-/// Whether a graph with [`Counts::combine16`] was logged (prompt steps).
-static COMBINE16_LOGGED: AtomicBool = AtomicBool::new(false);
-
-/// The reasons [`Graph::combine16`] left a combine of BF16 streams for that were logged.
-static COMBINE16_WHY: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
 
 /// Logs `what` and `why` the first time `key` is added to `seen`.
 fn log_new<T: PartialEq>(seen: &std::sync::Mutex<Vec<T>>, key: T, what: &str, why: &str) {
@@ -287,22 +279,6 @@ unsafe fn has_name(t: Node, name: &str) -> bool {
     unsafe { std::ffi::CStr::from_ptr((*t).name.as_ptr()).to_bytes() == name.as_bytes() }
 }
 
-/// [`Graph::combine16`]'s match: the op's sources and the inject weights' two scales.
-struct Combine16 {
-    out: Node,
-    res16: Node,
-    inject: Node,
-    s1: f32,
-    s2: f32,
-}
-
-/// `LEGION_DEBUG_HC_COMBINE16=0`: qwen4exp's combines of BF16 streams outside the mixers keep
-/// ggml's nodes (the way before #1183's [`Graph::combine16`]), for A/B runs (the same bits).
-fn combine16_off() -> bool {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("LEGION_DEBUG_HC_COMBINE16").is_some_and(|v| v == "0"))
-}
-
 /// `LEGION_DEBUG_ROWS_FOLD=0`: qwen4exp's prompt-step K / V / indexer rows keep ggml's nodes
 /// (the way before #1183's [`Graph::rows_fold`]), for A/B runs (the same bits either way).
 fn rows_fold_off() -> bool {
@@ -351,8 +327,7 @@ unsafe fn fuse(graph: *mut ffi::ggml_cgraph) {
         && !CODES_LOGGED.swap(true, Ordering::Relaxed))
         | (c.ple_ops > 0 && !PLE_LOGGED.swap(true, Ordering::Relaxed))
         | (c.mtp_in > 0 && !MTP_IN_LOGGED.swap(true, Ordering::Relaxed))
-        | (c.k_rows + c.iq_rope > 0 && !ROWS_LOGGED.swap(true, Ordering::Relaxed))
-        | (c.combine16 > 0 && !COMBINE16_LOGGED.swap(true, Ordering::Relaxed));
+        | (c.k_rows + c.iq_rope > 0 && !ROWS_LOGGED.swap(true, Ordering::Relaxed));
     if c != Counts::default() && (LOGGED.fetch_add(1, Ordering::Relaxed) < 4 || first_codes) {
         tracing::info!(
             sum_gate = c.sum_gate,
@@ -379,7 +354,6 @@ unsafe fn fuse(graph: *mut ffi::ggml_cgraph) {
             v_rows = c.v_rows,
             iq_rope = c.iq_rope,
             idx_rows = c.idx_rows,
-            combine16 = c.combine16,
             none = c.none,
             "node fuse: small ggml chains as Legion ops (the first graphs; --node-fuse-ggml off)"
         );
@@ -408,7 +382,6 @@ pub(crate) unsafe fn rewrite_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> 
                 ffi::ggml_op_GGML_OP_SET_ROWS | ffi::ggml_op_GGML_OP_ROPE if cuda => {
                     g.rows_fold(i, &mut c)
                 }
-                ffi::ggml_op_GGML_OP_DSV4_HC_POST if cuda => g.combine16(i, &mut c),
                 ffi::ggml_op_GGML_OP_CUSTOM => {
                     if crate::model::qwen4::qsa_attn::is_gated_codes(g.nodes[i]) {
                         c.fp8_codes += 1;
@@ -1696,157 +1669,6 @@ impl Graph {
                     log_new(&ROWS_FOLD_WHY, (which as usize, why), what, why);
                 }
             }
-        }
-    }
-
-    /// qwen4exp's combine of BF16 streams (`--hc-bf16`, #1183) at `at`, an `hc_post` node where
-    /// the streams meet a combine outside the mixers (the per-layer embedding's layer, the end
-    /// of the stack for an MTP head): `hc_post(out, cast(res16, F32), scale(sigmoid(scale(inject,
-    /// s1)), s2))`. The node becomes one op ([`crate::model::qwen4::make_combine16`]) that reads
-    /// the BF16 streams and the inject weights itself, and the copy, the scales and the sigmoid
-    /// become `GGML_OP_NONE`: the F32 copy of the streams is no longer written and read back.
-    /// The op reads at `at` what the copy and the first scale read earlier, so only where no
-    /// node in between writes it. Only `hc_post` nodes over a copy of BF16 values match (none
-    /// without `--hc-bf16`).
-    ///
-    /// # Safety
-    /// `at` is the index of an `hc_post` node.
-    unsafe fn combine16(&mut self, at: usize, c: &mut Counts) {
-        if combine16_off() {
-            return;
-        }
-        // SAFETY: the caller's.
-        unsafe {
-            match self.match_combine16(at) {
-                Some(Ok((m, none))) => {
-                    crate::model::qwen4::make_combine16(
-                        self.nodes[at],
-                        m.out,
-                        m.res16,
-                        m.inject,
-                        m.s1,
-                        m.s2,
-                    );
-                    for i in none {
-                        (*self.nodes[i]).op = ffi::ggml_op_GGML_OP_NONE;
-                        self.none[i] = true;
-                    }
-                    c.combine16 += 1;
-                }
-                Some(Err(why)) => log_new(&COMBINE16_WHY, why, "a combine of BF16 streams", why),
-                None => {}
-            }
-        }
-    }
-
-    /// [`Self::combine16`]'s chain at `at` and the nodes it turns off, or why not; None for a
-    /// combine whose streams are no copy of BF16 values.
-    ///
-    /// # Safety
-    /// `at` is the index of an `hc_post` node.
-    #[allow(clippy::type_complexity)]
-    unsafe fn match_combine16(
-        &self,
-        at: usize,
-    ) -> Option<Result<(Combine16, Vec<usize>), &'static str>> {
-        // SAFETY: the caller's; nodes and sources are valid tensors of the graph.
-        unsafe {
-            let node = self.nodes[at];
-            let f32 = ffi::ggml_type_GGML_TYPE_F32;
-            let idx = |t: Node| self.index.get(&(t as usize)).copied().filter(|&i| i < at);
-            let (out, cast, post) = ((*node).src[0], (*node).src[1], (*node).src[2]);
-            if cast.is_null() || (*cast).op != ffi::ggml_op_GGML_OP_CPY || (*cast).src[1] != cast {
-                return None;
-            }
-            let res16 = (*cast).src[0];
-            if res16.is_null() || (*res16).type_ != ffi::ggml_type_GGML_TYPE_BF16 {
-                return None;
-            }
-            let ci = idx(cast)?;
-            let r = (|| {
-                let [e, hc, n, _] = (*node).ne;
-                if !(*node).src[3].is_null() {
-                    return Err("a combine that mixes the streams");
-                }
-                if !f32_contiguous(node) || !f32_contiguous(cast) || (*cast).ne != (*node).ne {
-                    return Err("the combine or the streams' copy is not contiguous F32");
-                }
-                if (*res16).ne != (*node).ne || (*res16).nb[0] != 2 {
-                    return Err("the BF16 streams are not the combine's rows");
-                }
-                if out.is_null()
-                    || (*out).type_ != f32
-                    || (*out).nb[0] != 4
-                    || (*out).ne != [e, n, 1, 1]
-                {
-                    return Err("the block output is not F32 rows");
-                }
-                let scale = |t: Node| {
-                    !t.is_null()
-                        && (*t).op == ffi::ggml_op_GGML_OP_SCALE
-                        && f32_contiguous(t)
-                        && (*t).ne == [hc, n, 1, 1]
-                        && f32::from_bits((*t).op_params[1] as u32) == 0.0
-                };
-                let sc2 = post;
-                if !scale(sc2) {
-                    return Err("the inject weights are not ggml's scale of a sigmoid");
-                }
-                let sig = (*sc2).src[0];
-                if sig.is_null()
-                    || (*sig).op != ffi::ggml_op_GGML_OP_UNARY
-                    || ffi::ggml_get_unary_op(sig) != ffi::ggml_unary_op_GGML_UNARY_OP_SIGMOID
-                    || !f32_contiguous(sig)
-                    || (*sig).ne != [hc, n, 1, 1]
-                {
-                    return Err("the inject weights are not ggml's scale of a sigmoid");
-                }
-                let sc1 = (*sig).src[0];
-                if !scale(sc1) {
-                    return Err("the sigmoid's input is not ggml's scale");
-                }
-                let inject = (*sc1).src[0];
-                if inject.is_null()
-                    || (*inject).type_ != f32
-                    || (*inject).nb[0] != 4
-                    || (*inject).ne != [hc, n, 1, 1]
-                {
-                    return Err("the inject weights are not F32 rows");
-                }
-                let (Some(c1), Some(si), Some(c2)) = (idx(sc1), idx(sig), idx(sc2)) else {
-                    return Err("the inject weights' ops are not nodes before the combine");
-                };
-                // The copy is its own second source (ggml_cast), so its own reader too.
-                if !self.only_read_by(cast, &[ci, at])
-                    || !self.only_read_by(sc2, &[at])
-                    || !self.only_read_by(sig, &[c2])
-                    || !self.only_read_by(sc1, &[si])
-                {
-                    return Err("the copy or the inject weights' ops have other readers");
-                }
-                let skip = [ci, c1, si, c2];
-                if !self.may_read_at(
-                    at,
-                    node,
-                    &[(out, false), (res16, false), (inject, false)],
-                    &skip,
-                ) {
-                    return Err("the op's output or a node in between overlaps what it reads");
-                }
-                self.unmoved(at, &[out, res16, inject])?;
-                let s = |t: Node| f32::from_bits((*t).op_params[0] as u32);
-                Ok((
-                    Combine16 {
-                        out,
-                        res16,
-                        inject,
-                        s1: s(sc1),
-                        s2: s(sc2),
-                    },
-                    skip.to_vec(),
-                ))
-            })();
-            Some(r)
         }
     }
 

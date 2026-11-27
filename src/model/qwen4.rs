@@ -26,8 +26,8 @@
 pub mod hc;
 mod hc_chain;
 pub mod hc_down;
+pub(crate) use hc_chain::lo_act_scale;
 pub use hc_chain::set_hc_chain;
-pub(crate) use hc_chain::{lo_act_scale, make_combine16};
 mod hc_mix16;
 pub use hc_mix16::{set_hc_pre, set_mix16, set_rebuild_bf16 as set_mix_rebuild_bf16};
 mod hc_norm;
@@ -1094,7 +1094,8 @@ impl Model {
         let (norm, down, up, inj) = (w("norm")?, w("down")?, w("up")?, w("inject")?);
         let rows_ok = |t: Tensor<'_>| t.ty() == types::F32 && t.nb()[0] == 4;
         // BF16 streams (`--hc-streams-bf16`, #826) only go into the rebuilt combine-and-norm
-        // below; every other path gets them as F32.
+        // below and a pending combine (`hc_combine` widens them as ggml's copy does); every
+        // other path gets them as F32.
         let f32_streams = |r: Tensor<'a>| {
             if r.ty() == types::BF16 {
                 ctx.cast(r, types::F32)
@@ -1326,10 +1327,9 @@ impl Model {
             let mixed = self.hc_mix_tail(ctx, p.xn, lo, prefix, true, n)?;
             return Ok((p.res, mixed, p.inject));
         }
-        let res = f32_streams(res);
         let res = match pending {
             Some((out, inject)) => self.hc_combine(ctx, res, out, inject, hc_chain::on_gpu(up)),
-            None => res,
+            None => f32_streams(res),
         };
         let (mixed, inject) = self.hc_mix(ctx, res, prefix, true, true)?;
         Ok((res, mixed, inject.expect("inject")))
@@ -1374,7 +1374,8 @@ impl Model {
     /// Adds the block output `out` (`[n_embd, n]`) to every stream of `res`, stream `h`
     /// scaled by `2 sigmoid(inject[h] / hc)`. `gpu`: the combine runs on one GPU
     /// ([`hc_chain::on_gpu`] of a mixer weight of its stage), where it is one Legion op, ggml's
-    /// bits (#836).
+    /// bits (#836). BF16 streams (`--hc-bf16`) are widened to F32 first, as ggml's copy widens
+    /// them; on one GPU the op reads them as they are (#1183).
     fn hc_combine<'a>(
         &'a self,
         ctx: &'a Context,
@@ -1384,6 +1385,12 @@ impl Model {
         gpu: bool,
     ) -> Tensor<'a> {
         let hc = self.qwen4().hc.n;
+        if res.ty() == types::BF16 {
+            if hc_chain::combine16_fits(out, res, inject, gpu) {
+                return hc_chain::combine16(ctx, out, res, inject);
+            }
+            return self.hc_combine(ctx, ctx.cast(res, types::F32), out, inject, gpu);
+        }
         if hc_chain::combine_fits(out, res, inject, gpu) {
             return hc_chain::combine(ctx, out, res, inject);
         }
@@ -1432,12 +1439,10 @@ impl Model {
         // Whether this stage's mixers run on one GPU (its first one's weights tell).
         let first = layers.start.min(hp.n_layer.saturating_sub(1));
         let gpu = hc_chain::on_gpu(self.w(&format!("blk.{first}.hc_attn_up.weight"))?);
-        let flush = |res: Tensor<'a>, p: &mut Option<(Tensor<'a>, Tensor<'a>)>| {
-            let res = f32_streams(res);
-            match p.take() {
-                Some((out, inject)) => self.hc_combine(ctx, res, out, inject, gpu),
-                None => res,
-            }
+        // (BF16 streams go into the combine as they are: it widens them itself.)
+        let flush = |res: Tensor<'a>, p: &mut Option<(Tensor<'a>, Tensor<'a>)>| match p.take() {
+            Some((out, inject)) => self.hc_combine(ctx, res, out, inject, gpu),
+            None => f32_streams(res),
         };
         // `--tp-seq-par` (#751): in a big step, from the first layer after the PLE to the one
         // before the model's last, each rank keeps its share of the tokens' streams and runs
