@@ -174,16 +174,19 @@ pub(crate) const SMALL: &[&str] = &[
 pub(crate) const SMALL_MM: &[&str] = &["nvfp4_mvq", "fp8_mm"];
 
 /// Inkling-2's own ops (#1221, `src/cuda/inkling2.cu`), captured in small steps only, as
-/// [`SMALL`]: each launcher enqueues one `cudaLaunchKernel` (a prompt step's conv two) on the
-/// compute stream, its grid
+/// [`SMALL`]: each launcher enqueues one `cudaLaunchKernelEx` (a prompt step's conv two; a
+/// programmatic dependent launch on compute capability 12.x, #1221 r5) on the compute stream,
+/// its grid
 /// from the node's shape and its arguments the node's tensors and parameters (the expert
 /// matmul's list counter is shared memory). Left out, every one of them cut a decode step's
 /// capture: ~2,000 launches a token ran from the host, one after another. Prompt steps keep
 /// them between their captures, as before.
 pub(crate) const INKLING: &[&str] = &[
     "ink_mix",
+    "ink_rms",
     "ink_ctrl_in",
     "ink_ctrl_out",
+    "ink_ctrl_gate",
     "ink_conv",
     "ink_clip",
     "ink_attn",

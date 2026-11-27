@@ -1962,7 +1962,8 @@ unsafe fn cpu_wf16(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
     }
 }
 
-unsafe fn cpu_rms_norm(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
+/// [`rms_norm`]'s CPU reference, which Inkling-2's `ink_rms` shares (the same math).
+pub(crate) unsafe fn cpu_rms_norm(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
     unsafe {
         let x = &*dst.src[0];
         let w = (!dst.src[1].is_null()).then(|| all_f32(&*dst.src[1]));

@@ -412,7 +412,7 @@ impl Arch for Ink2Params {
     ) -> Result<Option<Tensor<'a>>, ModelError> {
         let x = glm_ops::embed(ctx, m.w("token_embd.weight")?, tokens, 1);
         let x = ctx.reshape_2d(x, m.hp.n_embd, tokens.ne()[0]);
-        Ok(Some(glm_ops::rms_norm(
+        Ok(Some(ops::rms(
             ctx,
             x,
             Some(m.w("token_embd_norm.weight")?),
@@ -577,12 +577,7 @@ impl Model {
         name: &str,
         x: Tensor<'a>,
     ) -> Result<Tensor<'a>, ModelError> {
-        Ok(glm_ops::rms_norm(
-            ctx,
-            x,
-            Some(self.lw(ip, name)?),
-            self.hp.rms_eps,
-        ))
+        Ok(ops::rms(ctx, x, Some(self.lw(ip, name)?), self.hp.rms_eps))
     }
 
     /// The layers over the normed embeddings `x` (`[n_embd, n]`); ends in the head's input.
@@ -653,7 +648,7 @@ impl Model {
             Some(rows) => glm_ops::get_cols(ctx, x, rows),
             None => x,
         };
-        let x = glm_ops::rms_norm(ctx, x, Some(self.w("output_norm.weight")?), hp.rms_eps);
+        let x = ops::rms(ctx, x, Some(self.w("output_norm.weight")?), hp.rms_eps);
         tap.tap("result_norm", 0, x);
         Ok(x)
     }
@@ -692,6 +687,19 @@ impl Model {
         let p = self.ink();
         let g = ops::ctrl_in(ctx, cur, msg, MIX_EPS);
         let g = self.glm_mm(ctx, &p.ctrl_name(ip, c, "down"), g)?;
+        // Small steps: the gain and forget products and the output in one node of the same bits
+        // (#1221 r5), when the weights suit it and carry no scales (glm_mm's products of these
+        // are then scale 1).
+        let names = ["gain", "forget"].map(|part| p.ctrl_name(ip, c, part));
+        let unscaled = names.iter().all(|nm| {
+            nm.strip_suffix(".weight")
+                .is_some_and(|b| self.w(&format!("{b}.scale")).is_err())
+        });
+        if let (true, Ok(gw), Ok(fw)) = (unscaled, self.w(&names[0]), self.w(&names[1]))
+            && ops::ctrl_gate_takes(gw, fw, cur.ne()[1..].iter().product())
+        {
+            return Ok(ops::ctrl_gate(ctx, cur, msg, g, gw, fw));
+        }
         let mut rows = Bf16Rows::default();
         let gain = self.glm_mm_shared(ctx, &p.ctrl_name(ip, c, "gain"), g, rows.of(g))?;
         let forget = self.glm_mm_shared(ctx, &p.ctrl_name(ip, c, "forget"), g, rows.of(g))?;
@@ -892,7 +900,7 @@ impl Model {
             tau,
         );
         let k = ops::clip(ctx, ctx.reshape_3d(k, d, nkv, n), None, p.qk_clip, None);
-        let v = glm_ops::rms_norm(ctx, ctx.reshape_3d(v, d, nkv, n), None, hp.rms_eps);
+        let v = ops::rms(ctx, ctx.reshape_3d(v, d, nkv, n), None, hp.rms_eps);
         let r = ops::clip(
             ctx,
             ctx.reshape_3d(r, p.n_rel, nh, n),

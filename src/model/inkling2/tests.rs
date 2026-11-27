@@ -652,7 +652,7 @@ fn a_decode_step_is_captured_whole() {
         .unwrap();
         let total: usize = counts.values().sum();
         eprintln!("{} tokens: {total} external ops {counts:?}", tokens.len());
-        assert!(counts.contains_key("ink_attn") && counts.contains_key("glm_rms_norm"));
+        assert!(counts.contains_key("ink_attn") && counts.contains_key("ink_rms"));
         for name in counts.keys() {
             assert!(listed_as(name, true, true), "`{name}` cuts the capture");
             if INKLING.contains(name) || INKLING_SHARED.contains(name) {
@@ -1577,4 +1577,183 @@ fn real_checkpoint_parses_like_the_gguf() {
             (hp.n_embd, hp.n_head, hp.n_head_kv, hp.head_dim, hp.n_vocab)
         );
     }
+}
+
+/// One small step of a controller both ways on `b`: its gain and forget products through
+/// `glm_linear` (as `glm_mm` makes them) then `ink_ctrl_out`, and `ink_ctrl_gate`, from the same
+/// down projection (`ink_ctrl_in` then `glm_linear`); the outputs must match bit for bit
+/// (#1221 r5). Rows of `e` values, controllers of rank `rank`, up to 8 tokens. Every case runs;
+/// the panic names each one that does not match, with its first differing output.
+fn fused_controller_keeps_the_bits(b: &mut Backend) {
+    use crate::ggml::ComputeAllocator;
+    let mut s = 0x9e37_79b9_7f4a_7c15u64;
+    let mut vals = move |n: usize, amp: f32| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 40) as f32 / (1u64 << 23) as f32 - 1.0) * amp
+            })
+            .collect()
+    };
+    let mut bad = Vec::new();
+    for (e, rank) in [(2304i64, 64i64), (256, 32), (128, 512), (96, 160)] {
+        for n in [1i64, 2, 3, 4, 5, 8] {
+            let ctx = Context::new(64, 64);
+            let new = |ne: &[i64]| ctx.new_tensor(types::F32, ne).as_input();
+            let (cur, msg) = (new(&[e, n]), new(&[e, n]));
+            let dw = new(&[2 * e, rank]);
+            let (gw, fw) = (new(&[rank, e]), new(&[rank, e]));
+            assert!(ops::ctrl_gate_takes(gw, fw, n), "e {e} rank {rank} n {n}");
+            let g = ops::ctrl_in(&ctx, cur, msg, MIX_EPS);
+            let d = glm_ops::linear_h(&ctx, dw, g, None, 1.0, None);
+            let gain = glm_ops::linear_h(&ctx, gw, d, None, 1.0, None);
+            let forget = glm_ops::linear_h(&ctx, fw, d, None, 1.0, None);
+            let five = ops::ctrl_out(&ctx, cur, msg, gain, forget).as_output();
+            let one = ops::ctrl_gate(&ctx, cur, msg, d, gw, fw).as_output();
+            let mut graph = ctx.new_graph(64);
+            for t in [five, one] {
+                graph.expand(t);
+            }
+            ctx.alloc_graph(&graph, ComputeAllocator::new(b.buffer_type()))
+                .unwrap();
+            cur.set_f32(&vals((e * n) as usize, 4.0));
+            msg.set_f32(&vals((e * n) as usize, 1.0));
+            dw.set_f32(&vals((2 * e * rank) as usize, 0.05));
+            gw.set_f32(&vals((rank * e) as usize, 0.5));
+            fw.set_f32(&vals((rank * e) as usize, 0.5));
+            b.compute(&graph).unwrap();
+            let (x, y) = (five.to_f32(), one.to_f32());
+            assert_eq!(x.len(), y.len());
+            assert!(
+                y.iter().any(|&v| v != 0.0),
+                "e {e}, rank {rank}, {n} tokens: an output"
+            );
+            let diff = x
+                .iter()
+                .zip(&y)
+                .filter(|(p, q)| p.to_bits() != q.to_bits())
+                .count();
+            if let Some(i) = (0..x.len()).find(|&i| x[i].to_bits() != y[i].to_bits()) {
+                let line = format!(
+                    "e {e}, rank {rank}, {n} tokens: {diff} of {} differ, first [{}, {}] {:e} vs {:e}",
+                    x.len(),
+                    i as i64 % e,
+                    i as i64 / e,
+                    x[i],
+                    y[i]
+                );
+                eprintln!("ink_ctrl_gate first mismatch: {line}");
+                bad.push(line);
+            }
+        }
+    }
+    assert!(bad.is_empty(), "ink_ctrl_gate:\n{}", bad.join("\n"));
+}
+
+/// [`fused_controller_keeps_the_bits`] on the CPU references.
+#[test]
+fn fused_controller_keeps_the_cpu_bits() {
+    fused_controller_keeps_the_bits(&mut backend());
+}
+
+/// [`fused_controller_keeps_the_bits`] on the GPU: the fused kernels against `glm_linear`'s F32
+/// kernels (the split and shared-input ones, by token count).
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_fused_controller_keeps_the_bits() {
+    fused_controller_keeps_the_bits(&mut gpu_backend());
+}
+
+/// The first bitwise difference of two outputs of `rows` rows of `d`, for a test's report.
+fn first_diff(what: &str, x: &[f32], y: &[f32], d: usize) -> Option<String> {
+    assert_eq!(x.len(), y.len());
+    let diff = x
+        .iter()
+        .zip(y)
+        .filter(|(p, q)| p.to_bits() != q.to_bits())
+        .count();
+    let i = (0..x.len()).find(|&i| x[i].to_bits() != y[i].to_bits())?;
+    Some(format!(
+        "{what}: {diff} of {} differ, first [{}, {}] {:e} vs {:e}",
+        x.len(),
+        i % d,
+        i / d,
+        x[i],
+        y[i]
+    ))
+}
+
+/// #1221 r6: `ink_rms` gives `glm_rms_norm`'s bits, with no weight, a weight that is a view
+/// (its kernel reads it after the wait) and a leaf weight (read before it), over widths and
+/// row counts around Inkling-2's.
+fn rms_keeps_the_bits(b: &mut Backend) {
+    use crate::ggml::ComputeAllocator;
+    let mut s = 0x2545_f491_4f6c_dd1du64;
+    let mut vals = move |n: usize, amp: f32| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 40) as f32 / (1u64 << 23) as f32 - 1.0) * amp
+            })
+            .collect()
+    };
+    let mut bad = Vec::new();
+    for d in [2304i64, 128, 96, 257, 600, 1000, 4096] {
+        for rows in [1i64, 3, 8, 24] {
+            for wk in 0..3 {
+                let ctx = Context::new(16, 16);
+                let x = ctx.new_tensor(types::F32, &[d, rows]).as_input();
+                // Only tensors the graph reads get memory: the weight's own one per case.
+                let wsrc = match wk {
+                    0 => None,
+                    1 => Some(ctx.new_tensor(types::F32, &[d + 32]).as_input()),
+                    _ => Some(ctx.new_tensor(types::F32, &[d]).as_input()),
+                };
+                let w = match wk {
+                    1 => wsrc.map(|t| ctx.view_1d(t, d, 0)),
+                    _ => wsrc,
+                };
+                let old = glm_ops::rms_norm(&ctx, x, w, 1e-6).as_output();
+                let new = ops::rms(&ctx, x, w, 1e-6).as_output();
+                let mut graph = ctx.new_graph(16);
+                for t in [old, new] {
+                    graph.expand(t);
+                }
+                ctx.alloc_graph(&graph, ComputeAllocator::new(b.buffer_type()))
+                    .unwrap();
+                x.set_f32(&vals((d * rows) as usize, 3.0));
+                if let Some(t) = wsrc {
+                    t.set_f32(&vals(t.ne()[0] as usize, 1.5));
+                }
+                b.compute(&graph).unwrap();
+                let (p, q) = (old.to_f32(), new.to_f32());
+                assert!(q.iter().any(|&v| v != 0.0), "ink_rms d {d}: an output");
+                let what = format!("ink_rms d {d}, {rows} rows, weight {wk}");
+                if let Some(line) = first_diff(&what, &p, &q, d as usize) {
+                    eprintln!("first mismatch: {line}");
+                    bad.push(line);
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "\n{}", bad.join("\n"));
+}
+
+/// [`rms_keeps_the_bits`] on the CPU references.
+#[test]
+fn rms_keeps_the_cpu_bits() {
+    rms_keeps_the_bits(&mut backend());
+}
+
+/// [`rms_keeps_the_bits`] on the GPU: `rms_kernel` against glm5next.cu's `rms_norm_kernel`.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_rms_keeps_the_bits() {
+    rms_keeps_the_bits(&mut gpu_backend());
 }

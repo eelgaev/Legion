@@ -1,8 +1,12 @@
 //! The CUDA side of the ops: the kernels of `src/cuda/inkling2.cu`, launched from here with
-//! `cudaLaunchKernel`, each taking its node described generically (data, shape, byte strides,
-//! type) and its external params.
+//! `cudaLaunchKernelEx`, each taking its node described generically (data, shape, byte strides,
+//! type) and its external params. On compute capability 12.x (the GB10) every launch is a
+//! programmatic dependent launch (#1221 r5), as `glm5next.cu`'s kernels are: the GPU sets a
+//! kernel up while the one ahead is still running, and the kernel's first act is to wait for
+//! it (`pdl_wait`), so nothing runs in another order.
 
-use std::os::raw::c_void;
+use std::os::raw::{c_int, c_void};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::ggml::{external_params, ffi, types};
 
@@ -44,18 +48,79 @@ fn dim(x: i64, y: i64) -> Dim3 {
     }
 }
 
+/// `cudaLaunchAttribute`: the id, padding to 8 bytes, a 64-byte value union.
+#[repr(C, align(8))]
+struct LaunchAttribute {
+    id: c_int,
+    pad: [u8; 4],
+    val: [u32; 16],
+}
+
+/// `cudaLaunchConfig_t`.
+#[repr(C)]
+struct LaunchConfig {
+    grid: Dim3,
+    block: Dim3,
+    dynamic_smem: usize,
+    stream: *mut c_void,
+    attrs: *mut LaunchAttribute,
+    num_attrs: u32,
+}
+
+/// `cudaLaunchAttributeProgrammaticStreamSerialization`.
+const ATTR_PROGRAMMATIC_STREAM_SERIALIZATION: c_int = 6;
+
+/// The kernels of `legion_ink_kernels`.
+const KERNELS: usize = 23;
+
 unsafe extern "C" {
     /// The kernels as the CUDA runtime knows them (their host stubs' addresses), in
     /// [`Kernel`] order.
-    static legion_ink_kernels: [*const c_void; 18];
-    fn cudaLaunchKernel(
+    static legion_ink_kernels: [*const c_void; KERNELS];
+    fn cudaLaunchKernelExC(
+        config: *const LaunchConfig,
         func: *const c_void,
-        grid: Dim3,
-        block: Dim3,
         args: *mut *mut c_void,
-        shared: usize,
-        stream: *mut c_void,
-    ) -> i32;
+    ) -> c_int;
+    fn cudaGetDevice(device: *mut c_int) -> c_int;
+    fn cudaDeviceGetAttribute(value: *mut c_int, attr: c_int, device: c_int) -> c_int;
+    fn cudaGetLastError() -> c_int;
+}
+
+const DEV_ATTR_CC_MAJOR: c_int = 75;
+
+/// Devices [`MAJOR`] covers.
+const DEVICES: usize = 64;
+
+/// Each device's compute capability major; 0 not yet read, -1 unknown.
+static MAJOR: [AtomicI32; DEVICES] = [const { AtomicI32::new(0) }; DEVICES];
+
+/// Whether the current device takes programmatic dependent launches of these kernels: compute
+/// capability 12.x (GB10, RTX 50), read once per device. Their wait is compiled in there, since
+/// the load refuses a 9.0+ GPU whose code is older than sm_90 (`crate::hw::cuda_arch`), as for
+/// `nvfp4_once`'s kernels.
+fn pdl() -> bool {
+    let mut dev: c_int = 0;
+    // SAFETY: plain queries of the current device; an error is cleared.
+    unsafe {
+        if cudaGetDevice(&mut dev) != 0 || !(0..DEVICES as c_int).contains(&dev) {
+            cudaGetLastError();
+            return false;
+        }
+        let slot = &MAJOR[dev as usize];
+        let mut major = slot.load(Ordering::Relaxed);
+        if major == 0 {
+            let mut v: c_int = 0;
+            major = if cudaDeviceGetAttribute(&mut v, DEV_ATTR_CC_MAJOR, dev) == 0 && v > 0 {
+                v
+            } else {
+                cudaGetLastError();
+                -1
+            };
+            slot.store(major, Ordering::Relaxed);
+        }
+        major == 12
+    }
 }
 
 /// The kernels' order in `legion_ink_kernels`.
@@ -84,7 +149,18 @@ enum Kernel {
     /// The expert matmul of steps with no more pairs than experts, a warp per few rows of a
     /// pair (#1221); `MmId` runs the rest in tiles, both with the same sums.
     MmIdVec,
+    /// A controller's gain and forget products and output at small steps (#1221 r5).
+    CtrlGate,
+    /// `rms_kernel<1>`, `<3>`, `<9>`, `<16>`: `glm_rms_norm`'s sums, a thread's elements in
+    /// registers (#1221 r6).
+    Rms1,
+    Rms3,
+    Rms9,
+    Rms16,
 }
+
+/// `RMS_THREADS` of the kernels.
+const RMS_THREADS: i64 = 256;
 
 /// `MIX_STATES`, `MIX_QUERIES`, `CONV_TAPS` of the kernels.
 const MIX_STATES: i32 = 8;
@@ -151,14 +227,21 @@ unsafe fn launch(
     unsafe {
         let mut a = args(dst);
         let mut argv = [(&raw mut a).cast::<c_void>()];
-        match cudaLaunchKernel(
-            legion_ink_kernels[k as usize],
+        let mut attr = LaunchAttribute {
+            id: ATTR_PROGRAMMATIC_STREAM_SERIALIZATION,
+            pad: [0; 4],
+            val: [0; 16],
+        };
+        attr.val[0] = 1;
+        let config = LaunchConfig {
             grid,
-            dim(block as i64, 1),
-            argv.as_mut_ptr(),
-            shared,
+            block: dim(block as i64, 1),
+            dynamic_smem: shared,
             stream,
-        ) {
+            attrs: &mut attr,
+            num_attrs: u32::from(pdl()),
+        };
+        match cudaLaunchKernelExC(&config, legion_ink_kernels[k as usize], argv.as_mut_ptr()) {
             0 => Ok(()),
             e => Err(format!("{name}: CUDA error {e}")),
         }
@@ -215,6 +298,28 @@ pub(super) unsafe fn mix(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
     }
 }
 
+pub(super) unsafe fn rms(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
+    let k = match cdiv(dst.ne[0], RMS_THREADS) {
+        1 => Kernel::Rms1,
+        2..=3 => Kernel::Rms3,
+        4..=9 => Kernel::Rms9,
+        10..=16 => Kernel::Rms16,
+        _ => return Err("ink_rms: rows wider than the kernel holds".into()),
+    };
+    // SAFETY: a node of this op, in device memory.
+    unsafe {
+        launch(
+            k,
+            "ink_rms",
+            dst,
+            dim(elements(dst) / dst.ne[0], 1),
+            RMS_THREADS as u32,
+            0,
+            stream,
+        )
+    }
+}
+
 pub(super) unsafe fn ctrl_in(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
     // SAFETY: a node of this op, in device memory.
     unsafe {
@@ -233,6 +338,40 @@ pub(super) unsafe fn ctrl_in(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Res
 pub(super) unsafe fn ctrl_out(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
     // SAFETY: a node of this op, in device memory.
     unsafe { elementwise(Kernel::CtrlOut, "ink_ctrl_out", dst, stream) }
+}
+
+/// `CTRL_TOK`, `CTRL_RANK` and `CTRL_ROWS` of `ctrl_gate_kernel` (its threads twice the rows).
+const CTRL_TOK: i64 = 8;
+const CTRL_RANK: i64 = 512;
+const CTRL_ROWS: i64 = 32;
+
+/// Whether `t`'s data and row stride suit 16-byte loads of its rows.
+fn rows16(t: &ffi::ggml_tensor) -> bool {
+    (t.data as usize | t.nb[1]) % 16 == 0
+}
+
+pub(super) unsafe fn ctrl_gate(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
+    // SAFETY: a node of this op; its sources were checked by the builder.
+    unsafe {
+        let k = src(dst, 2).ne[0];
+        if dst.ne[1] > CTRL_TOK
+            || k % 32 != 0
+            || k > CTRL_RANK
+            || !rows16(src(dst, 3))
+            || !rows16(src(dst, 4))
+        {
+            return Err("ink_ctrl_gate: a shape or rows the kernel does not take".into());
+        }
+        launch(
+            Kernel::CtrlGate,
+            "ink_ctrl_gate",
+            dst,
+            dim(cdiv(dst.ne[0], CTRL_ROWS), 1),
+            2 * CTRL_ROWS as u32,
+            0,
+            stream,
+        )
+    }
 }
 
 pub(super) unsafe fn conv(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {

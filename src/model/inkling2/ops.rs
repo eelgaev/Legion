@@ -1,7 +1,8 @@
 //! Inkling-2's own ops ([`crate::ggml::ExternalOp`]): the steps of the `inkling2_loop` graph
 //! that GLM-5.3-Flash's ops ([`crate::model::glm5next::ops`]: linear, RMS norm, the router,
-//! the weighted expert sum, ...) and DeepSeek-V4.1's cache writes do not cover. ggml only holds
-//! the tensors, views and reshapes; nothing here is a ggml compute op.
+//! the weighted expert sum, ...) and DeepSeek-V4.1's cache writes do not cover, and an RMS norm
+//! with `glm_rms_norm`'s bits ([`rms`]). ggml only holds the tensors, views and reshapes;
+//! nothing here is a ggml compute op.
 //!
 //! The CPU implementations are plain references (F32 math, sums in order, norms' sums in f64),
 //! for tests and the CPU backend; the CUDA kernels are `src/cuda/inkling2.cu` ([`cuda`]),
@@ -9,6 +10,7 @@
 //! `inkling2-loop.cpp` (MIT, ggml-org/llama.cpp PRs #32694 and #32704).
 
 use crate::ggml::{Context, ExternalOp, Tensor, external_params, ffi, types};
+use crate::model::glm5next::ops::{self as glm_ops, cpu_rms_norm};
 
 #[cfg(feature = "cuda")]
 mod cuda;
@@ -27,8 +29,10 @@ macro_rules! external_op {
 }
 
 external_op!(MIX, "ink_mix", cpu_mix, mix);
+external_op!(RMS, "ink_rms", cpu_rms_norm, rms);
 external_op!(CTRL_IN, "ink_ctrl_in", cpu_ctrl_in, ctrl_in);
 external_op!(CTRL_OUT, "ink_ctrl_out", cpu_ctrl_out, ctrl_out);
+external_op!(CTRL_GATE, "ink_ctrl_gate", cpu_ctrl_gate, ctrl_gate);
 external_op!(CONV, "ink_conv", cpu_conv, conv);
 external_op!(CLIP, "ink_clip", cpu_clip, clip);
 external_op!(ATTN, "ink_attn", cpu_attn, attn);
@@ -75,6 +79,41 @@ pub fn mix<'a>(ctx: &'a Context, states: &[Tensor<'a>], query: Tensor<'a>, eps: 
     )
 }
 
+/// Whether `t` is a leaf with data of its own (no view): in Inkling-2's graphs, an RMS norm's
+/// weight, never a cache or a state, so [`rms`]'s kernel reads it before waiting for the kernel
+/// ahead (#1221 r6). A computed or viewed weight waits.
+fn weight(t: Tensor<'_>) -> bool {
+    // SAFETY: a tensor of a live context.
+    unsafe {
+        let r = &*t.raw();
+        r.op == ffi::ggml_op_GGML_OP_NONE && r.view_src.is_null()
+    }
+}
+
+/// The widest rows [`rms`] takes as its own op; wider ones are `glm_rms_norm`.
+pub const RMS_MAX: i64 = 4096;
+
+/// RMS norm over dim 0 of `x` (F32, contiguous), times the weight `w` (F32 `[ne0]`) if given:
+/// `glm_rms_norm`'s ([`glm_ops::rms_norm`]) math and, on CUDA, its sums in its order (the same
+/// bits), with a thread's elements loaded at once and a weight read before the kernel ahead
+/// completes (#1221 r6). Rows wider than [`RMS_MAX`] are `glm_rms_norm` nodes.
+pub fn rms<'a>(ctx: &'a Context, x: Tensor<'a>, w: Option<Tensor<'a>>, eps: f32) -> Tensor<'a> {
+    if x.ne()[0] > RMS_MAX {
+        return glm_ops::rms_norm(ctx, x, w, eps);
+    }
+    let x = contiguous(x);
+    let early = w.is_some_and(weight);
+    let mut args = vec![x];
+    args.extend(w.map(contiguous));
+    ctx.external_with(
+        &RMS,
+        types::F32,
+        x.ne(),
+        &args,
+        &[eps.to_bits() as i32, i32::from(early)],
+    )
+}
+
 /// A loop controller's input: `[rms(cur) | rms(msg)]` (no weight, `eps`), F32 `[2e, n]` from
 /// F32 `[e, n]` each (contiguous).
 pub fn ctrl_in<'a>(ctx: &'a Context, cur: Tensor<'a>, msg: Tensor<'a>, eps: f32) -> Tensor<'a> {
@@ -104,6 +143,59 @@ pub fn ctrl_out<'a>(
         assert_eq!(a.ne(), cur.ne(), "ink_ctrl_out: shapes");
     }
     ctx.external(&CTRL_OUT, types::F32, cur.ne(), &args)
+}
+
+/// Most tokens [`ctrl_gate`] takes: small steps.
+pub const CTRL_TOKENS: i64 = 8;
+/// The widest rank (gain and forget rows) [`ctrl_gate`] takes.
+pub const CTRL_RANK_MAX: i64 = 512;
+
+/// Whether [`ctrl_gate`] takes the F32 weights `gain` and `forget` (`[rank, e]`, no scales) over
+/// `n` tokens: up to [`CTRL_TOKENS`], the rank a multiple of 32 up to [`CTRL_RANK_MAX`], rows
+/// contiguous and 16-byte strided. Prompt steps keep `glm_linear` and [`ctrl_out`]
+/// (`glm_linear`'s prompt kernels sum in another order).
+pub fn ctrl_gate_takes(gain: Tensor<'_>, forget: Tensor<'_>, n: i64) -> bool {
+    let [rank, e, _, _] = gain.ne();
+    let rows = |w: Tensor<'_>| {
+        w.ty() == types::F32 && w.ne() == [rank, e, 1, 1] && w.nb()[0] == 4 && w.nb()[1] % 16 == 0
+    };
+    (1..=CTRL_TOKENS).contains(&n)
+        && e > 0
+        && rank % 32 == 0
+        && (32..=CTRL_RANK_MAX).contains(&rank)
+        && rows(gain)
+        && rows(forget)
+}
+
+/// A controller's output from its down projection `d` (F32 `[rank, n]`): [`ctrl_out`] of
+/// `gain @ d` and `forget @ d` in one node, the bits of two `glm_linear`s (scale 1) then
+/// [`ctrl_out`] at the small steps [`ctrl_gate_takes`] takes (#1221 r5).
+pub fn ctrl_gate<'a>(
+    ctx: &'a Context,
+    cur: Tensor<'a>,
+    msg: Tensor<'a>,
+    d: Tensor<'a>,
+    gain: Tensor<'a>,
+    forget: Tensor<'a>,
+) -> Tensor<'a> {
+    let (cur, msg, d) = (contiguous(cur), contiguous(msg), contiguous(d));
+    let [e, n, _, _] = cur.ne();
+    assert_eq!(msg.ne()[..2], [e, n], "ink_ctrl_gate: shapes");
+    assert_eq!(d.ne()[1], n, "ink_ctrl_gate: tokens");
+    for w in [gain, forget] {
+        assert_eq!(w.ne()[..2], [d.ne()[0], e], "ink_ctrl_gate: weights");
+    }
+    ctx.external_with(
+        &CTRL_GATE,
+        types::F32,
+        cur.ne(),
+        &[cur, msg, d, gain, forget],
+        &[
+            1f32.to_bits() as i32,
+            1f32.to_bits() as i32,
+            0f32.to_bits() as i32,
+        ],
+    )
 }
 
 /// The causal short conv with its residual of a group of `n_seqs · n_tok` tokens (`x` F32
@@ -527,6 +619,38 @@ unsafe fn cpu_ctrl_out(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
             let (c, m) = (at::<f32>(src(0), i), at::<f32>(src(1), i));
             let (g, f) = (at::<f32>(src(2), i).tanh(), at::<f32>(src(3), i).tanh());
             *(dst.data as *mut f32).add(i) = c - f * c + g * m;
+        }
+    }
+}
+
+/// Row `r` of the F32 matrix `w` (`k` values).
+unsafe fn f32_row(w: &ffi::ggml_tensor, r: usize, k: usize) -> &[f32] {
+    unsafe { f32s(w, r * w.nb[1], k) }
+}
+
+/// `glm_linear`'s CPU reference for one row and input: the dot in order, times the scale.
+fn linear_row(w: &[f32], x: &[f32], scale: f32) -> f32 {
+    dot(w, x) * scale
+}
+
+unsafe fn cpu_ctrl_gate(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
+    unsafe {
+        let p = external_params(dst);
+        let (sg, sf) = (f32_param(p[0]), f32_param(p[1]));
+        let (cur, msg, d) = (&*dst.src[0], &*dst.src[1], &*dst.src[2]);
+        let (gw, fw) = (&*dst.src[3], &*dst.src[4]);
+        let (e, k) = (dst.ne[0] as usize, d.ne[0] as usize);
+        let n = dst.ne[1] as usize;
+        for r in part(e, ith, nth) {
+            let (wg, wf) = (f32_row(gw, r, k), f32_row(fw, r, k));
+            for t in 0..n {
+                let x = f32s(d, t * d.nb[1], k);
+                let i = t * e + r;
+                let (c, m) = (at::<f32>(cur, i), at::<f32>(msg, i));
+                // cpu_ctrl_out of the two products as cpu_linear stores them
+                let (g, f) = (linear_row(wg, x, sg).tanh(), linear_row(wf, x, sf).tanh());
+                *(dst.data as *mut f32).add(i) = c - f * c + g * m;
+            }
         }
     }
 }

@@ -2,9 +2,10 @@
 // mix of the attention residuals, the loop controllers' input and output, the causal short convs
 // with their kept history, the L2 clips, the attention with its relative bias and per-token
 // sinks, the sigmoid gate, the SITU activation, the expert matmul of the Q8_0 / MXFP8 / plain
-// stacks and the soft-capped head. Kernel bodies only: the Rust side
-// (src/model/inkling2/ops/cuda.rs) launches them with cudaLaunchKernel, each node described
-// generically (data, shape, byte strides, type) as in legion_ink_args.
+// stacks, the soft-capped head and an RMS norm with glm_rms_norm's sums. Kernel bodies only:
+// the Rust side (src/model/inkling2/ops/cuda.rs) launches them with cudaLaunchKernelEx
+// (programmatic dependent launches on compute capability 12.x, see pdl_wait), each node
+// described generically (data, shape, byte strides, type) as in legion_ink_args.
 //
 // Correctness first (plain SIMT); sums run in another order than the CPU's, so values match it
 // to rounding, not bit for bit.
@@ -78,11 +79,32 @@ __device__ __forceinline__ const char * src(const A & a, int s) {
     return (const char *) a.src[s];
 }
 
+// Programmatic dependent launch (#1221 r5): on compute capability 12.x (the GB10) the Rust side
+// launches every kernel here with programmatic stream serialization, as glm5next.cu's kernels
+// are (launch_pdl), so the GPU sets a kernel up while the one ahead of it is still running. Each
+// kernel's first act is this wait, for the kernel ahead to complete and its writes to be
+// visible, as a plain launch does: nothing reads or writes before it, nothing triggers early,
+// so the same bits. Below sm_90 it compiles to nothing (and the launch is plain).
+__device__ __forceinline__ void pdl_wait() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+#endif
+}
+
 __device__ __forceinline__ float pf(int32_t p) {
     return __int_as_float(p);
 }
 
 __device__ __forceinline__ float warp_sum(float v) {
+    for (int o = 16; o > 0; o >>= 1) {
+        v += __shfl_xor_sync(0xffffffffu, v, o);
+    }
+    return v;
+}
+
+// glm5next.cu's warp_sum<double> (rms_norm_kernel's block_sum), the same shuffles and adds.
+__device__ __forceinline__ double warp_sum(double v) {
+#pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
         v += __shfl_xor_sync(0xffffffffu, v, o);
     }
@@ -129,6 +151,7 @@ __device__ __forceinline__ float e4m3(uint8_t b) {
 
 // ---- ink_mix: params ns, eps; sources: ns states [e, n], then the queries [e, nq] ----
 __global__ void mix_kernel(const A a) {
+    pdl_wait();
     const int     ns  = a.params[0];
     const float   eps = pf(a.params[1]);
     const int64_t e = a.ne[0], n = a.ne[1], nq = a.ne[2];
@@ -266,8 +289,71 @@ __global__ void mix_kernel(const A a) {
     }
 }
 
+// rms_kernel's block.
+constexpr int RMS_THREADS = 256;
+
+// ---- ink_rms: params eps, whether w is a weight; sources x [d, rows] (contiguous), w [d] or
+// none (#1221 r6). glm5next.cu's rms_norm_kernel (glm_rms_norm) in its order: the same 256
+// threads, thread i summing (double) x² over elements i, i + 256, ... in turn, then block_sum's
+// tree (warp sums, then warp 0's sum of them, which every warp makes here: one barrier instead
+// of three), s = 1 / sqrt(sum / d + eps), x s w. A thread's K elements are loaded at once and
+// kept for the output, and w (a weight, params[1]) before pdl_wait: rms_norm_kernel has a memory
+// latency for every few of a thread's elements, twice. The same sums: the same bits. ----
+template <int K> __global__ void __launch_bounds__(RMS_THREADS) rms_kernel(const A a) {
+    const int64_t d = a.ne[0], r = blockIdx.x;
+    const float * w = (const float *) a.src[1];
+    float         wv[K];
+    if (w && a.params[1]) {
+#pragma unroll
+        for (int k = 0; k < K; k++) {
+            const int64_t i = threadIdx.x + (int64_t) k * RMS_THREADS;
+            wv[k] = i < d ? w[i] : 0.f;
+        }
+    }
+    pdl_wait();
+    if (w && !a.params[1]) {
+#pragma unroll
+        for (int k = 0; k < K; k++) {
+            const int64_t i = threadIdx.x + (int64_t) k * RMS_THREADS;
+            wv[k] = i < d ? w[i] : 0.f;
+        }
+    }
+    const float * x = (const float *) a.src[0] + r * d;
+    float         xv[K];
+#pragma unroll
+    for (int k = 0; k < K; k++) {
+        const int64_t i = threadIdx.x + (int64_t) k * RMS_THREADS;
+        xv[k] = i < d ? x[i] : 0.f;
+    }
+    double sum = 0.0;
+#pragma unroll
+    for (int k = 0; k < K; k++) {
+        if (threadIdx.x + (int64_t) k * RMS_THREADS < d) {
+            sum += (double) xv[k] * xv[k];
+        }
+    }
+    __shared__ double part[RMS_THREADS / 32];
+    sum = warp_sum(sum);
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    if (lane == 0) {
+        part[warp] = sum;
+    }
+    __syncthreads();
+    sum = warp_sum(lane < RMS_THREADS / 32 ? part[lane] : 0.0);
+    const float s = 1.0f / sqrtf((float) (sum / d) + pf(a.params[0]));
+    float *     o = (float *) a.dst + r * d;
+#pragma unroll
+    for (int k = 0; k < K; k++) {
+        const int64_t i = threadIdx.x + (int64_t) k * RMS_THREADS;
+        if (i < d) {
+            o[i] = w ? xv[k] * s * wv[k] : xv[k] * s;
+        }
+    }
+}
+
 // ---- ink_ctrl_in: params eps; sources cur, msg [e, n]; dst [2e, n] ----
 __global__ void ctrl_in_kernel(const A a) {
+    pdl_wait();
     const float   eps = pf(a.params[0]);
     const int64_t e   = a.ne[0] / 2;
     const int64_t t   = blockIdx.x;
@@ -289,6 +375,7 @@ __global__ void ctrl_in_kernel(const A a) {
 
 // ---- ink_ctrl_out: sources cur, msg, gain, forget (all [e, n]) ----
 __global__ void ctrl_out_kernel(const A a) {
+    pdl_wait();
     const int64_t n = a.ne[0] * a.ne[1];
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) {
@@ -299,6 +386,138 @@ __global__ void ctrl_out_kernel(const A a) {
     const float g = tanhf(((const float *) src(a, 2))[i]);
     const float f = tanhf(((const float *) src(a, 3))[i]);
     ((float *) a.dst)[i] = c - f * c + g * m;
+}
+
+// ---- ink_ctrl_gate (#1221 r5): a controller's gain and forget products and its output ----
+//
+// A controller's gain and forget products (F32 rows of `rank` values, glm_linear) and
+// ink_ctrl_out in one kernel at small steps, the bits of the three. At up to 8 tokens
+// glm_linear's F32 kernels (linear_mv_f32, _split, _xs in glm5next.cu; the same bits) sum row r
+// as a warp: lane L takes the 32-value blocks L + 32 q in order of q, each as two halves, a
+// 16-term FMA chain from 0 per half added to the lane's sum (from 0), then warp_sum (xor 16, 8,
+// 4, 2, 1), times the scale. With the rank at most 512 every lane has one block at most and
+// lanes 16-31 hold 0, so the xor-16 step gives lane L < 16 its sum plus 0, and the xor 8, 4, 2,
+// 1 steps make lane 0's result a balanced tree over lanes 0-15 in bit-reversed order (lane 0,
+// 8, 4, 12, 2, ...: pairs, then pairs of pairs). Here one thread makes that tree for one row:
+// its blocks' sums in that order, each plus a zero (a parameter, so the add stays), combined as
+// a binary counter; a lane without a block adds 0, which leaves a sum as it is.
+// The scale's product is __fmul_rn: glm_linear stores it, so it must not fuse into tanhf.
+
+// Rows a block of ink_ctrl_gate (its threads twice that: the gain rows, then the forget rows),
+// its tokens and its widest rank.
+constexpr int CTRL_ROWS = 32;
+constexpr int CTRL_TOK  = 8;
+constexpr int CTRL_RANK = 512;
+
+// ink_ctrl_gate: params gain scale, forget scale, a zero; sources cur, msg [e, n], d [k, n]
+// (the down projection), gain, forget F32 [k, e]; dst [e, n]: ink_ctrl_out's expression of
+// row r's gain and forget products. k a multiple of 32, at most CTRL_RANK; n at most CTRL_TOK.
+__global__ void __launch_bounds__(2 * CTRL_ROWS) ctrl_gate_kernel(const A a) {
+    pdl_wait();
+    const float   zero = pf(a.params[2]);
+    const int64_t e = a.ne[0], n = a.ne[1], k = a.src_ne[2][0];
+    const int     nb = (int) (k / 32);
+    __shared__ float xs[CTRL_TOK * CTRL_RANK];
+    __shared__ float yf[CTRL_TOK][CTRL_ROWS];
+    for (int64_t i = threadIdx.x; i < n * k; i += blockDim.x) {
+        const int64_t t = i / k, j = i % k;
+        xs[i] = ((const float *) (src(a, 2) + t * a.src_nb[2][1]))[j];
+    }
+    __syncthreads();
+    const int     g  = threadIdx.x / CTRL_ROWS;  // 0 the gain row, 1 the forget row
+    const int     rl = threadIdx.x % CTRL_ROWS;
+    const int64_t r  = (int64_t) blockIdx.x * CTRL_ROWS + rl;
+    const bool    live = r < e;
+    // the binary counter's partial sums: 1, 2, 4 and 8 lanes
+    float s1[CTRL_TOK], s2[CTRL_TOK], s4[CTRL_TOK], s8[CTRL_TOK], y[CTRL_TOK];
+    if (live) {
+        const float4 * row = (const float4 *) (src(a, 3 + g) + r * a.src_nb[3 + g][1]);
+#pragma unroll
+        for (int i = 0; i < 16; i++) {
+            // lane l of glm_linear's warp: i bit-reversed
+            const int l = ((i & 1) << 3) | ((i & 2) << 1) | ((i & 4) >> 1) | ((i & 8) >> 3);
+            float     c[CTRL_TOK];
+#pragma unroll
+            for (int t = 0; t < CTRL_TOK; t++) {
+                c[t] = 0.0f;
+            }
+            if (l < nb) {
+                float4 w[8];
+#pragma unroll
+                for (int q = 0; q < 8; q++) {
+                    w[q] = __ldg(row + l * 8 + q);
+                }
+#pragma unroll
+                for (int t = 0; t < CTRL_TOK; t++) {
+                    if (t < n) {
+                        float acc = 0.0f;
+#pragma unroll
+                        for (int h = 0; h < 2; h++) {
+                            const float v[16] = {w[4 * h].x,     w[4 * h].y,     w[4 * h].z,     w[4 * h].w,
+                                                 w[4 * h + 1].x, w[4 * h + 1].y, w[4 * h + 1].z, w[4 * h + 1].w,
+                                                 w[4 * h + 2].x, w[4 * h + 2].y, w[4 * h + 2].z, w[4 * h + 2].w,
+                                                 w[4 * h + 3].x, w[4 * h + 3].y, w[4 * h + 3].z, w[4 * h + 3].w};
+                            const float * x = xs + t * k + l * 32 + 16 * h;
+                            float         s = 0.0f;
+#pragma unroll
+                            for (int j = 0; j < 16; j++) {
+                                s += v[j] * x[j];
+                            }
+                            acc += s;
+                        }
+                        c[t] = acc + zero;  // warp_sum's xor 16: lane l + 16 holds 0
+                    }
+                }
+            }
+#pragma unroll
+            for (int t = 0; t < CTRL_TOK; t++) {
+                float v = c[t];
+                if ((i & 1) == 0) {
+                    s1[t] = v;
+                    continue;
+                }
+                v = s1[t] + v;
+                if ((i & 2) == 0) {
+                    s2[t] = v;
+                    continue;
+                }
+                v = s2[t] + v;
+                if ((i & 4) == 0) {
+                    s4[t] = v;
+                    continue;
+                }
+                v = s4[t] + v;
+                if ((i & 8) == 0) {
+                    s8[t] = v;
+                    continue;
+                }
+                y[t] = s8[t] + v;
+            }
+        }
+        const float sc = g ? pf(a.params[1]) : pf(a.params[0]);
+#pragma unroll
+        for (int t = 0; t < CTRL_TOK; t++) {
+            y[t] = __fmul_rn(y[t], sc);
+            if (g == 1 && t < n) {
+                yf[t][rl] = y[t];
+            }
+        }
+    }
+    __syncthreads();
+    if (!live || g != 0) {
+        return;
+    }
+#pragma unroll
+    for (int t = 0; t < CTRL_TOK; t++) {
+        if (t < n) {
+            const int64_t i  = t * e + r;
+            const float   c  = ((const float *) src(a, 0))[i];
+            const float   m  = ((const float *) src(a, 1))[i];
+            const float   gt = tanhf(y[t]);
+            const float   ft = tanhf(yf[t][rl]);
+            ((float *) a.dst)[i] = c - ft * c + gt * m;
+        }
+    }
 }
 
 // One output of ink_conv: win[0..K-1) the K - 1 inputs before this token's, oldest first (its
@@ -332,6 +551,7 @@ __device__ __forceinline__ float conv_out(
 // state [K - 1, width, n_seqs] (written back), dyn [K * heads, ng]. One thread per (sequence,
 // channel), the window in registers, token after token: a decode step's. ----
 __global__ void conv_kernel(const A a) {
+    pdl_wait();
     const int64_t n_tok = a.params[0], off = a.params[1];
     const bool    dyn   = a.params[2] != 0;
     const float   scale = pf(a.params[3]);
@@ -391,6 +611,7 @@ __device__ __forceinline__ float conv_in(
 // channel walking the tokens one by one (a few CTAs for the whole GPU, a memory latency a
 // token). The history is left as it was: conv_hist_kernel writes it next. ----
 __global__ void conv_prompt_kernel(const A a) {
+    pdl_wait();
     const int64_t n_tok = a.params[0], off = a.params[1];
     const bool    dyn   = a.params[2] != 0;
     const float   scale = pf(a.params[3]);
@@ -425,6 +646,7 @@ __global__ void conv_prompt_kernel(const A a) {
 // ---- ink_conv's history after a prompt step: the last K - 1 inputs, as conv_kernel leaves
 // it. A thread per (channel, sequence), after conv_prompt_kernel read the old one. ----
 __global__ void conv_hist_kernel(const A a) {
+    pdl_wait();
     const int64_t n_tok = a.params[0], off = a.params[1];
     const int64_t c = a.ne[0];
     const int     K = (int) a.src_ne[1][0];
@@ -450,6 +672,7 @@ __global__ void conv_hist_kernel(const A a) {
 // ---- ink_clip: params thr, has_scale, has_tau, floor, alpha; sources x [d, h, n], scale [d, h],
 // pos [n]. One warp per row (d at most 128). ----
 __global__ void clip_kernel(const A a) {
+    pdl_wait();
     const float thr       = pf(a.params[0]);
     const bool  has_scale = a.params[1] != 0, has_tau = a.params[2] != 0;
     const float floor_    = pf(a.params[3]), alpha = pf(a.params[4]);
@@ -504,6 +727,7 @@ __device__ __forceinline__ int64_t cell(const A & a, int ts, int64_t s, int64_t 
 // heads are padding (#1221). Each row's sums are the same either way. ----
 template <int DPL, int R>
 __global__ void attn_kernel(const A a) {
+    pdl_wait();
     static_assert(R <= ATTN_ROWS, "attn_kernel: rows");
     constexpr int D     = 32 * DPL;
     const int64_t n_tok = a.params[0];
@@ -740,6 +964,7 @@ __global__ void attn_kernel(const A a) {
 
 // ---- ink_sigmul: x * sigmoid(g) ----
 __global__ void sigmul_kernel(const A a) {
+    pdl_wait();
     const int64_t n = a.ne[0] * a.ne[1] * a.ne[2] * a.ne[3];
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) {
@@ -750,6 +975,7 @@ __global__ void sigmul_kernel(const A a) {
 
 // ---- ink_situ: params beta, lb; source y [2f, k, n] ----
 __global__ void situ_kernel(const A a) {
+    pdl_wait();
     const float   beta = pf(a.params[0]), lb = pf(a.params[1]);
     const int64_t f = a.ne[0];
     const int64_t n = f * a.ne[1] * a.ne[2];
@@ -1059,6 +1285,7 @@ static_assert((MM_BM / 8) * (MM_BN / 8) * 32 == MM_THREADS, "ink_mm_id: a warp p
 static_assert(MM_BN <= MM_THREADS && MM_LIST >= 2 * MM_THREADS, "ink_mm_id: list sizes");
 
 __global__ void __launch_bounds__(MM_THREADS) mm_id_kernel(const A a) {
+    pdl_wait();
     __shared__ __align__(16) float ws[MM_BM][MM_KC];
     __shared__ __align__(16) float xs[MM_BN][MM_KC];
     __shared__ int     list[MM_LIST];
@@ -1146,6 +1373,7 @@ template <int TY> __device__ __forceinline__ void mm_id_vec(const A & a) {
 }
 
 __global__ void mm_id_vec_kernel(const A a) {
+    pdl_wait();
     switch (a.src_type[0]) {
         case TYPE_Q8_0:
             mm_id_vec<TYPE_Q8_0>(a);
@@ -1167,6 +1395,7 @@ __global__ void mm_id_vec_kernel(const A a) {
 
 // ---- ink_softcap: params cap; source x [v, n]; dst [n_out, n] ----
 __global__ void softcap_kernel(const A a) {
+    pdl_wait();
     const float   cap = pf(a.params[0]);
     const int64_t v = a.ne[0], n = a.ne[1];
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -1180,7 +1409,7 @@ __global__ void softcap_kernel(const A a) {
 
 }  // namespace
 
-extern "C" const void * const legion_ink_kernels[18] = {
+extern "C" const void * const legion_ink_kernels[23] = {
     reinterpret_cast<const void *>(&mix_kernel),
     reinterpret_cast<const void *>(&ctrl_in_kernel),
     reinterpret_cast<const void *>(&ctrl_out_kernel),
@@ -1199,4 +1428,9 @@ extern "C" const void * const legion_ink_kernels[18] = {
     reinterpret_cast<const void *>(&attn_kernel<2, ATTN_DECODE_ROWS>),
     reinterpret_cast<const void *>(&attn_kernel<4, ATTN_DECODE_ROWS>),
     reinterpret_cast<const void *>(&mm_id_vec_kernel),
+    reinterpret_cast<const void *>(&ctrl_gate_kernel),
+    reinterpret_cast<const void *>(&rms_kernel<1>),
+    reinterpret_cast<const void *>(&rms_kernel<3>),
+    reinterpret_cast<const void *>(&rms_kernel<9>),
+    reinterpret_cast<const void *>(&rms_kernel<16>),
 };
