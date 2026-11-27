@@ -602,11 +602,10 @@ template <class C> __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_ge
 // The variants the timing test compares (src/model/q40_mm.rs, `Kernel`).
 using q40_r3a   = q40_cfg3<128, 128, 4, 2, 3, 1, 8>;        // 8 warps of 32 x 64
 using q40_r3f   = q40_cfg3<64, 128, 2, 2, 2, 2, 16>;        // 4 warps of 32 x 64, 2 CTAs an SM
-using q40_r3f8  = q40_cfg3<64, 128, 2, 2, 2, 2, 8>;
-using q40_r3f32 = q40_cfg3<64, 128, 2, 2, 2, 2, 32>;
-using q40_r3c4  = q40_cfg3<64, 128, 2, 2, 2, 2, 4, 0, 1>;   // groups of column tiles
-using q40_r3c8  = q40_cfg3<64, 128, 2, 2, 2, 2, 8, 0, 1>;
-using q40_r3c16 = q40_cfg3<64, 128, 2, 2, 2, 2, 16, 0, 1>;
+using q40_r3c2  = q40_cfg3<64, 128, 2, 2, 2, 2, 2, 0, 1>;   // groups of column tiles
+using q40_r3c3  = q40_cfg3<64, 128, 2, 2, 2, 2, 3, 0, 1>;
+using q40_r3c4  = q40_cfg3<64, 128, 2, 2, 2, 2, 4, 0, 1>;
+using q40_r3c6  = q40_cfg3<64, 128, 2, 2, 2, 2, 6, 0, 1>;
 
 }  // namespace
 
@@ -629,15 +628,15 @@ struct legion_q40_kernel {
 
 // The op's matmul first, then the others the timing test runs (src/model/q40_mm.rs).
 extern const legion_q40_kernel legion_q40_mm_table[] = {
-    Q40_R3(q40_r3f, "r3 64x128 x2 row group 16"),
+    Q40_R3(q40_r3c4, "r3 64x128 x2 col group 4"),
     { reinterpret_cast<const void *>(&q40_quant<0>), reinterpret_cast<const void *>(&q40_gemm<q40_v1>), q40_v1::SMEM,
       256, 128, 128, "first version" },
+    Q40_R3(q40_r3f, "r3 64x128 x2 row group 16"),
+    Q40_R3(q40_r3c2, "r3 64x128 x2 col group 2"),
+    Q40_R3(q40_r3c3, "r3 64x128 x2 col group 3"),
+    Q40_R3(q40_r3c6, "r3 64x128 x2 col group 6"),
+    Q40_R3(q40_r3c4, "r3 64x128 x2 col group 4 again"),
     Q40_R3(q40_r3a, "r3 128x128 8w 32x64"),
-    Q40_R3(q40_r3f8, "r3 64x128 x2 row group 8"),
-    Q40_R3(q40_r3f32, "r3 64x128 x2 row group 32"),
-    Q40_R3(q40_r3c4, "r3 64x128 x2 col group 4"),
-    Q40_R3(q40_r3c8, "r3 64x128 x2 col group 8"),
-    Q40_R3(q40_r3c16, "r3 64x128 x2 col group 16"),
 };
 extern const int legion_q40_mm_table_len = sizeof(legion_q40_mm_table) / sizeof(legion_q40_mm_table[0]);
 
