@@ -1816,7 +1816,8 @@ impl Graph {
                 let (Some(c1), Some(si), Some(c2)) = (idx(sc1), idx(sig), idx(sc2)) else {
                     return Err("the inject weights' ops are not nodes before the combine");
                 };
-                if !self.only_read_by(cast, &[at])
+                // The copy is its own second source (ggml_cast), so its own reader too.
+                if !self.only_read_by(cast, &[ci, at])
                     || !self.only_read_by(sc2, &[at])
                     || !self.only_read_by(sig, &[c2])
                     || !self.only_read_by(sc1, &[si])

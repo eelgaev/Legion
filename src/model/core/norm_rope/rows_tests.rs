@@ -61,7 +61,9 @@ struct Out {
     folded: [usize; 4],
 }
 
-const CELLS: i64 = 1000;
+/// Cache cells: more than any step's tokens, so no two tokens share a cell (where they do,
+/// which write lands is up to the blocks' order, in ggml's chain as in the fold).
+const CELLS: i64 = 2048;
 
 fn run(s: &Step, backend: &mut Backend, mode: Mode) -> Out {
     let ctx = Context::new(128, 128);

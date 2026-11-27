@@ -31,8 +31,12 @@ fn case(backend: &mut Backend, mode: Mode, e: i64, n: i64) -> (Vec<u8>, usize) {
     let inject = ctx.view_2d(node, [hc, n], node.nb()[1], 4);
     let s1 = 1.0 / hc as f32;
     let w = ctx.scale(ctx.sigmoid(ctx.scale(inject, s1)), 2.0);
-    let y = ctx.hc_post(out, ctx.cast(res16, types::F32), w).as_output();
+    let cast = ctx.cast(res16, types::F32);
+    let y = ctx.hc_post(out, cast, w).as_output();
     let mut graph = ctx.new_graph(32);
+    // The inject's node first, as the model's comes from an earlier mixer: ggml visits the
+    // copy before the weights, so the inject's node would else land where the streams were.
+    graph.expand(node);
     graph.expand(y);
     ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
         .unwrap();
@@ -41,8 +45,16 @@ fn case(backend: &mut Backend, mode: Mode, e: i64, n: i64) -> (Vec<u8>, usize) {
         // SAFETY: an allocated graph that has not run.
         Mode::Rewrite => unsafe { rewrite_graph(graph.raw(), true).combine16 },
         Mode::Direct => {
-            // SAFETY: the allocated `hc_post` node and its sources, of the shapes the op takes.
-            unsafe { make_combine16(y.raw(), out.raw(), res16.raw(), inject.raw(), s1, 2.0) };
+            // SAFETY: the allocated `hc_post` node and its sources, of the shapes the op takes;
+            // the copy and the weights' nodes write nothing then, as after the rewrite (one of
+            // them may have been given the streams' memory once the copy read them).
+            unsafe {
+                make_combine16(y.raw(), out.raw(), res16.raw(), inject.raw(), s1, 2.0);
+                let sc1 = (*(*w.raw()).src[0]).src[0];
+                for t in [cast.raw(), w.raw(), (*w.raw()).src[0], sc1] {
+                    (*t).op = ffi::ggml_op_GGML_OP_NONE;
+                }
+            }
             0
         }
     };
