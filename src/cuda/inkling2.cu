@@ -1185,7 +1185,7 @@ __global__ void sigmul_kernel(const A a) {
     ((float *) a.dst)[i] = ((const float *) src(a, 0))[i] * sigmoidf_(((const float *) src(a, 1))[i]);
 }
 
-// ---- ink_situ: params beta, lb; source y [2f, k, n] ----
+// ---- ink_situ: params beta, lb, bf16 (BF16 out, rounded to nearest even); source y [2f, k, n] ----
 __global__ void situ_kernel(const A a) {
     pdl_wait();
     const float   beta = pf(a.params[0]), lb = pf(a.params[1]);
@@ -1200,7 +1200,11 @@ __global__ void situ_kernel(const A a) {
     const float   g = y[c], u = y[f + c];
     const float   act = beta * tanhf(g / beta) * sigmoidf_(g);
     const float   uu  = lb > 0.f ? lb * tanhf(u / lb) : u;
-    ((float *) a.dst)[i] = act * uu;
+    if (a.params[2]) {
+        ((__nv_bfloat16 *) a.dst)[i] = __float2bfloat16_rn(act * uu);
+    } else {
+        ((float *) a.dst)[i] = act * uu;
+    }
 }
 
 // Element `lane` of 32-value group gi of row r of expert e of the stack in source 0, times its
