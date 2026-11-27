@@ -71,6 +71,10 @@ const BLOCK_BYTES: usize = 18;
 /// K values per quantization CTA; `k` is a multiple of it.
 const K_STEP: i64 = 256;
 
+/// Most bytes between weight rows: the kernel offsets a thread's copies within a tile (up to 128
+/// rows) in 32-bit ints, and 127 rows of 16 MiB plus a block's bytes stay below `i32::MAX`.
+pub const MAX_ROW_BYTES: usize = 16 << 20;
+
 /// Most bytes of quantized input a node takes: 4096 columns of K 21504 (Gemma 4 31B's FFN down)
 /// take 99 MiB.
 pub const MAX_QUANT_BYTES: usize = 256 << 20;
@@ -118,8 +122,10 @@ pub fn takes(w: Tensor<'_>, x: Tensor<'_>) -> bool {
         return false;
     }
     let sms = sms_for(w) as i64;
-    // SAFETY: a valid tensor's data pointer (null before allocation: the op checks it again).
-    let aligned = (unsafe { (*w.raw()).data } as usize).is_multiple_of(16);
+    // SAFETY: a valid tensor's data pointer. Null before allocation: the address it gets then
+    // is unknown, so such a weight stays on the generic path.
+    let data = unsafe { (*w.raw()).data } as usize;
+    let aligned = data != 0 && data.is_multiple_of(16);
     sms > 0
         && !w.is_host()
         && !w.is_meta()
@@ -151,6 +157,7 @@ pub fn fits(
         && wnb[0] == BLOCK_BYTES
         && wnb[1] % 16 == 0
         && wnb[1] >= (k / QK) as usize * BLOCK_BYTES
+        && wnb[1] <= MAX_ROW_BYTES
         && xnb[0] == 4
         && xnb[1] % 4 == 0
         && n >= MIN_TOKENS

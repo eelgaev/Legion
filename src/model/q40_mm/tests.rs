@@ -116,6 +116,11 @@ fn fits_q4_0_weights_from_512_columns() {
     let (ty, ne, mut nb) = w;
     nb[1] += 4;
     assert!(!fits((ty, ne, nb), x));
+    // Padded strides up to MAX_ROW_BYTES, not past it (the kernel's 32-bit in-tile offsets).
+    nb[1] = MAX_ROW_BYTES;
+    assert!(fits((ty, ne, nb), x));
+    nb[1] = MAX_ROW_BYTES + 16;
+    assert!(!fits((ty, ne, nb), x));
 }
 
 /// Where ggml-cuda runs each tile on one CTA on a GB10 (48 SMs) at Gemma's shapes: every
