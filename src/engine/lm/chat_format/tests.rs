@@ -259,3 +259,44 @@ fn inkling_markup_is_shown_and_parsed_on_every_reply() {
     let tok = tokenizer(&markup[..6], "inkling2");
     assert!(ChatFormat::detect(&tok).shown().is_empty());
 }
+
+#[test]
+fn muse_markup_is_shown_and_parsed_on_every_reply() {
+    use crate::engine::tool_parser::muse;
+    let mut vocab = vec!["<|endoftext|>"];
+    vocab.extend(muse::MARKUP);
+    vocab.push("<atem:function_calls>");
+    let tok = tokenizer(&vocab, "llama4");
+    let format = ChatFormat::detect(&tok);
+    // `<|start|>`, `<|message|>`, `<|eom|>`, `<|eot|>`, `<atem:function_calls>`.
+    assert_eq!(format.shown(), [1, 2, 3, 4, 5]);
+    assert!(format.framed());
+    assert_eq!(format.strict_tools(), None);
+    // `<|eot|>` ends the turn; `<|eom|>` (one message of it) does not.
+    let stops = format.stop_tokens(&tok);
+    assert!(stops.contains(&4));
+    assert!(!stops.contains(&3));
+    assert_eq!(
+        format.prompt_reasoning("<|start|>user<|message|>Hi<|eot|><|start|>assistant"),
+        None
+    );
+    let mut parser = format.tool_parser(&[]);
+    let mut events = Vec::new();
+    let reply = " to=self<|message|>plan<|eom|><|start|>assistant to=user<|message|>answer";
+    for c in reply.chars() {
+        events.extend(parser.push(&c.to_string()));
+    }
+    events.extend(parser.finish());
+    let (mut thought, mut answer) = (String::new(), String::new());
+    for ev in events {
+        match ev {
+            TokenEvent::Reasoning(t) => thought.push_str(&t),
+            TokenEvent::Text(t) => answer.push_str(&t),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    assert_eq!((thought.as_str(), answer.as_str()), ("plan", "answer"));
+    // Without all of the markup, the other formats.
+    let tok = tokenizer(&muse::MARKUP[..3], "llama4");
+    assert!(ChatFormat::detect(&tok).shown().is_empty());
+}

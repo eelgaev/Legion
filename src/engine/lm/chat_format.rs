@@ -4,7 +4,7 @@
 use crate::engine::Tool;
 use crate::engine::reasoning::ReasoningParser;
 use crate::engine::tool_parser::{
-    Gemma4Parser, GlmParser, InklingParser, Qwen3CoderParser, ToolParser, inkling,
+    Gemma4Parser, GlmParser, InklingParser, MuseParser, Qwen3CoderParser, ToolParser, inkling, muse,
 };
 use crate::tokenizer::Tokenizer;
 
@@ -14,14 +14,17 @@ pub(super) struct ChatFormat {
     prompt_reasoning: PromptReasoning,
     tools: fn(&[Tool]) -> Box<dyn ToolParser>,
     extra_stop_tokens: Vec<u32>,
+    /// Tokens that never end a reply, even when the vocabulary names one its end-of-turn
+    /// token (Muse Glimmer's `<|eom|>`, which ends one message of a turn).
+    not_stop: Vec<u32>,
     /// The `<tool_call>` and `</tool_call>` tokens of a vocabulary whose tool calls are in the
     /// Qwen3-Coder format, which strict tools constrain; `None`: strict is not enforced.
     strict_tools: Option<(u32, u32)>,
-    /// Control tokens the detokenizer prints so the parsers can read them (Inkling-2's message
-    /// markup); empty for the other formats.
+    /// Control tokens the detokenizer prints so the parsers can read them (Inkling-2's and
+    /// Muse Glimmer's message markup); empty for the other formats.
     shown: Vec<u32>,
     /// Every reply is framed in markup the tool parser takes out, so it runs without tools
-    /// too (Inkling-2).
+    /// too (Inkling-2, Muse Glimmer).
     framed: bool,
 }
 
@@ -55,6 +58,24 @@ impl ChatFormat {
                     .into_iter()
                     .filter_map(|t| tok.token_id(t))
                     .collect(),
+                not_stop: Vec::new(),
+                strict_tools: None,
+                shown,
+                framed: true,
+            };
+        }
+        // Muse Glimmer: messages `<|start|>assistant to=RECIPIENT<|message|>...` ending in
+        // `<|eom|>` (more of the turn follows) or `<|eot|>` (the turn's end). The parser takes
+        // the reasoning (`to=self`) out too, so there is no reasoning parser.
+        let markup: Option<Vec<u32>> = muse::MARKUP.iter().map(|t| tok.token_id(t)).collect();
+        if let Some(mut shown) = markup {
+            shown.extend(muse::ATEM.iter().filter_map(|t| tok.token_id(t)));
+            return Self {
+                reasoning: (" to=self<|message|>", muse::EOM),
+                prompt_reasoning: PromptReasoning::Disabled,
+                tools: |tools| Box::new(MuseParser::new(tools)),
+                extra_stop_tokens: tok.token_id(muse::EOT).into_iter().collect(),
+                not_stop: tok.token_id(muse::EOM).into_iter().collect(),
                 strict_tools: None,
                 shown,
                 framed: true,
@@ -118,6 +139,7 @@ impl ChatFormat {
             prompt_reasoning,
             tools,
             extra_stop_tokens,
+            not_stop: Vec::new(),
             strict_tools,
             shown: Vec::new(),
             framed: false,
@@ -168,6 +190,7 @@ impl ChatFormat {
             .into_iter()
             .flatten()
             .chain(self.extra_stop_tokens.iter().copied())
+            .filter(|t| !self.not_stop.contains(t))
             .collect()
     }
 }

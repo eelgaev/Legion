@@ -9,14 +9,17 @@
 //! Formats follow vllm's `hermes_tool_parser.py` and `qwen3coder_tool_parser.py` (Apache-2.0);
 //! Gemma 4's (`<|tool_call>call:NAME{...}<tool_call|>`) is in [`gemma4`], GLM's
 //! (`<tool_call>NAME<arg_key>...</arg_key><arg_value>...</arg_value></tool_call>`) in [`glm`],
-//! Inkling-2's message framing and JSON calls in [`inkling`].
+//! Inkling-2's message framing and JSON calls in [`inkling`], Muse Glimmer's messages and ATEM
+//! calls in [`muse`].
 
 mod gemma4;
 mod glm;
 pub mod inkling;
+pub mod muse;
 pub use gemma4::Gemma4Parser;
 pub use glm::GlmParser;
 pub use inkling::InklingParser;
+pub use muse::MuseParser;
 
 use serde_json::{Map, Value};
 
