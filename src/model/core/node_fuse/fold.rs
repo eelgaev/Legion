@@ -54,9 +54,15 @@
 //! because the graph as built must stay as it is: its layout decides which tails round as
 //! ggml-cuda's fused sum (a graph built with one cast fewer moved two of them).
 //!
-//! Early casts (#1183, after the folds; `--dense-fp8-prompt`): a BF16 FFN mixer's values are
-//! cast to BF16 for the routed experts' NVFP4 GEMM and read as F32 by the router and the shared
-//! expert's gate. The node fusion lets the mixer write that cast itself
+//! A tail no such norm reads whose sum ggml-cuda does not fuse, with BF16 expert rows
+//! (`--nvfp4-expert-rows-bf16`, #1183; the last layer's on one GPU, read by the output's
+//! hyper-connection mix) becomes one [`MOE_SUM_GATE`] in its plain form at the gate's add,
+//! reading the BF16 rows ([`Graph::plain_tail`]): the rows' cast to F32, the `mul` and the
+//! adds go, each value rounded as ggml's nodes round it.
+//!
+//! Early casts (#1183, after the folds; on by default, `LEGION_DEBUG_EARLY_CAST=0` off): a BF16
+//! FFN mixer's values are cast to BF16 for the routed experts' NVFP4 GEMM and read as F32 by the
+//! router and the shared expert's gate. The node fusion lets the mixer write that cast itself
 //! ([`Graph::mix_cast`]) only where the allocator put the cast clear of what the mixer reads
 //! and of the nodes in between, which in a prompt step held for about half of the layers (the
 //! cast often lands in the mixer's freed inputs). Here the mixer gets the cast as a source
@@ -74,7 +80,7 @@
 //! ([`Graph::conv_codes`]), so they stay alive until it runs.
 
 use std::collections::hash_map::Entry;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{
     AddrMap, FMA_SKIP, Gate, Graph, MOE_SUM_GATE, Node, ON, Sum, f32_contiguous, is_view_op, root,
@@ -117,19 +123,29 @@ static UNREAD: AtomicUsize = AtomicUsize::new(0);
 /// relayouts).
 static TAKEN: AtomicUsize = AtomicUsize::new(0);
 
-/// Whether folded graphs get early casts (see the module doc): set with `--dense-fp8-prompt`
-/// ([`set_early_cast`]).
-static EARLY_CAST: AtomicBool = AtomicBool::new(false);
-
 /// Early casts undone because a new layout put a cast over what its mixer reads (logged the
 /// first time).
 static EARLY_UNDONE: AtomicUsize = AtomicUsize::new(0);
 
-/// Sets whether graphs the fold takes from now on have their BF16 FFN mixers write their
-/// routed experts' BF16 cast, planned as a source of the mixer (see the module doc); on with
-/// `--dense-fp8-prompt` ([`crate::model::core::Model::set_dense_fp8_prompt`]).
-pub(crate) fn set_early_cast(on: bool) {
-    EARLY_CAST.store(on, Ordering::Relaxed);
+/// Whether graphs the fold takes have their BF16 FFN mixers write their routed experts' BF16
+/// cast, planned as a source of the mixer (see the module doc): on by default since #1183 (it
+/// was `--dense-fp8-prompt`'s); `LEGION_DEBUG_EARLY_CAST=0` turns it off, for A/B runs. Unit
+/// tests take it only from [`EARLY_CAST_RELAYOUT`], so their graphs fold as before.
+fn early_cast() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_EARLY_CAST").is_none_or(|v| v != "0"))
+}
+
+/// `LEGION_DEBUG_PLAIN_TAIL=0`: a tail no norm reads whose sum ggml-cuda does not fuse, over
+/// BF16 expert rows, stays ggml's nodes (the BF16 rows' cast to F32, the `mul`, the adds) with
+/// the node fusion's op for the adds and the gate, the way before #1183's [`Graph::plain_tail`],
+/// for A/B runs (the same bits either way).
+fn plain_tail_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_PLAIN_TAIL").is_none_or(|v| v != "0"))
 }
 
 /// [`Relayout::wants`].
@@ -256,7 +272,7 @@ pub(crate) unsafe fn fold_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> (Un
         // only where the graph is planned again (some tail folded).
         if folded > 0 {
             undo.one_cast = g.one_cast(&mut undo.saved);
-            if EARLY_CAST.load(Ordering::Relaxed) {
+            if early_cast() {
                 undo.early = g.early_casts(&mut undo.saved);
             }
             if cuda {
@@ -476,8 +492,13 @@ impl Graph {
             });
             let Some((ni, view)) = into_norm else {
                 // No norm to fold into (under tensor parallelism the rank exchange reads the
-                // tail, #1176): a sum ggml-cuda fuses and its gate as one op at the gate's add.
-                return fused && self.fuse_tail(s, &gt, saved);
+                // tail, #1176): a sum ggml-cuda fuses and its gate as one op at the gate's add;
+                // one it does not, over BF16 rows, in the op's plain form (#1183).
+                return if fused {
+                    self.fuse_tail(s, &gt, saved)
+                } else {
+                    cuda && self.plain_tail(s, &gt, saved)
+                };
             };
             let norm = self.nodes[ni];
             let mut dead: Vec<usize> = (s.at..=s.last).collect();
@@ -522,6 +543,46 @@ impl Graph {
                 // ggml's cast lists itself as its second source.
                 && self.only_read_by(x, &[at, i]))
             .then_some((src, i))
+        }
+    }
+
+    /// The tail of the sum `s`, which ggml-cuda does not fuse, over BF16 rows read back as F32
+    /// (`--nvfp4-expert-rows-bf16`), with its gate `gt` as one [`MOE_SUM_GATE`] in its plain
+    /// form at the gate's add (#1183): each product rounded, the adds in expert order, then the
+    /// gate, as ggml's nodes round them, reading the BF16 rows (the cast is exact), so the
+    /// cast, the `mul` and the adds go. Not under `--tp-moe-ep` (its rows are marked from the
+    /// F32 rows' node), nor with `LEGION_DEBUG_PLAIN_TAIL=0`: there the tail is left to the
+    /// node fusion as before. Saves the nodes it changes first. Whether it did.
+    ///
+    /// # Safety
+    /// As [`Self::fuse_tail`].
+    unsafe fn plain_tail(
+        &mut self,
+        s: &Sum,
+        gt: &Gate,
+        saved: &mut Vec<(Node, ffi::ggml_tensor)>,
+    ) -> bool {
+        if !plain_tail_on() || crate::model::core::tp_ep::active() {
+            return false;
+        }
+        // SAFETY: the caller's; nodes and their sources are valid tensors.
+        unsafe {
+            let Some((rows, cast)) = self.bf16_rows(s.experts, s.at) else {
+                return false;
+            };
+            let a = self.nodes[gt.add];
+            let mut dead: Vec<usize> = (s.at..=s.last).collect();
+            dead.extend(&gt.chain);
+            dead.push(cast);
+            saved.push((a, std::ptr::read(a)));
+            saved.extend(
+                dead.iter()
+                    .map(|&i| (self.nodes[i], std::ptr::read(self.nodes[i]))),
+            );
+            let srcs = [rows, s.weights, gt.sh, gt.g];
+            make_external(a, &MOE_SUM_GATE, &srcs, &[1, 1, s.k as i32, 0]);
+            self.retire(&dead, root(rows));
+            true
         }
     }
 

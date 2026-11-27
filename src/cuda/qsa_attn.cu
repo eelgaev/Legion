@@ -118,10 +118,10 @@ struct legion_qsa_attn {
     uint8_t * codes;
     float * scales;
     uint32_t * sync;
-    // With codes on a GB10 (#1183; null: off): q is the query before its head norm and RoPE
-    // (ggml's rms_norm, mul by qn_w and rope_multi, folded into attn_gw_kernel's q load by
-    // node_fuse), and the kernel makes each value as ggml-cuda's rms_norm_f32<256, true> and
-    // rope_multi make it. Only attn_gw_kernel's codes path at head size 256 takes it; every
+    // On a GB10 (#1183; null: off): q is the query before its head norm and RoPE (ggml's
+    // rms_norm, mul by qn_w and rope_multi, folded into attn_gw_kernel's q load by node_fuse),
+    // and the kernel makes each value as ggml-cuda's rms_norm_f32<256, true> and rope_multi
+    // make it. Only attn_gw_kernel at head size 256 takes it (with codes or without); every
     // other launch returns 1.
     const float * qn_w;      // [head_dim]: the norm's weight
     const int32_t * qn_pos;  // section s of token t at qn_pos[t + s * qn_pos_n]
@@ -1493,18 +1493,20 @@ int launch_gw_variant(const legion_qsa_attn & p, cudaStream_t st) {
 
 template <int HD>
 int launch_attn(const legion_qsa_attn & p, cudaStream_t st) {
-    // q before its norm and RoPE (qn_w): attn_gw_kernel's codes path only, where node_fuse
-    // folds them (the launcher's own pick on a 12.x GPU, F16 K and V, head size 256). With a
-    // kernel forced since, nothing runs (1; the caller refuses that first): the other kernels
-    // read the RoPE's output, which the fold left unwritten.
+    // q before its norm and RoPE (qn_w): attn_gw_kernel only, with codes or without (#1183),
+    // where node_fuse folds them (the launcher's own pick on a 12.x GPU, F16 K and V, head size
+    // 256). With a kernel forced since, nothing runs (1; the caller refuses that first): the
+    // other kernels read the RoPE's output, which the fold left unwritten.
     if (p.qn_w != nullptr) {
         if constexpr (HD == 256) {
-            if (p.k_type == 0 && p.v_type == 0 && p.codes != nullptr && use_mma<HD>() &&
-                p.mma_kernel == 0 && p.gw_cg == 0 &&
-                p.qn_rot > 0 && p.qn_rot % 2 == 0 && p.qn_rot <= HD) {
+            if (p.k_type == 0 && p.v_type == 0 && use_mma<HD>() && p.mma_kernel == 0 &&
+                p.gw_cg == 0 && p.qn_rot > 0 && p.qn_rot % 2 == 0 && p.qn_rot <= HD) {
                 legion_qsa_attn q = p;
                 // As ggml-cuda's rope_multi_cuda (host side).
                 q.qn_theta_scale = powf(p.qn_freq_base, -2.0f / p.qn_rot);
+                if (p.codes == nullptr) {
+                    return launch_gw_variant<HD, GW_CA, false, true>(q, st);
+                }
                 const int r = launch_gw_variant<HD, GW_CA, true, true>(q, st);
                 return r == 0 ? CODES_WRITTEN : r;
             }

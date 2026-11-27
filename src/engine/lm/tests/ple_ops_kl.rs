@@ -1,4 +1,4 @@
-//! The PLE ops (`--ple-ops`, #439) against ggml's chain (the default) on a real model
+//! The PLE ops (`--ple-ops`, #439; the default since #1183) against ggml's chain on a real model
 //! (qwen4exp): teacher-forced over a long text in prompt chunks, then steps of one to three
 //! tokens, the next-token rows compared bit for bit. The switch acts while graphs are built, so
 //! the model loads once per variant. Ignored: needs a GPU and the model.
@@ -99,7 +99,8 @@ fn ple_ops_kl_against_chain() {
                 rows.push((to - k + i, r.clone()));
             }
         }
-        qwen4::set_fused_ple(false);
+        // Back to the default (on since #1183).
+        qwen4::set_fused_ple(true);
         rows
     };
     // Rows bit for bit equal, and the first position that is not (with its largest difference).

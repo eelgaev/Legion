@@ -365,6 +365,98 @@ fn fused_sum_of_bf16_rows_is_the_f32_copys() {
     assert!(same_bits(&from16, &from32), "{from16:?} vs {from32:?}");
 }
 
+/// The op with the weights and the gate (`fma`: its params[3]) on `backend` over `e` columns,
+/// `k` experts and `n` tokens of finite BF16 rows, read as BF16 (`bf16`) or as their exact F32
+/// widening (what the graph as built reads after ggml's copy to F32).
+fn sum_gate_of_rows(backend: &mut Backend, e: usize, bf16: bool, fma: i32) -> Vec<f32> {
+    let (k, n) = (10usize, 5usize);
+    let bits: Vec<u16> = noise(e * k * n, 41)
+        .iter()
+        .map(|v| ((v * 300.0).to_bits() >> 16) as u16)
+        .collect();
+    let ctx = Context::new(64, 64);
+    let ty = if bf16 { types::BF16 } else { types::F32 };
+    let experts = ctx
+        .new_tensor(ty, &[e as i64, k as i64, n as i64])
+        .as_input();
+    let w = ctx
+        .new_tensor(types::F32, &[1, k as i64, n as i64])
+        .as_input();
+    let sh = ctx.new_tensor(types::F32, &[e as i64, n as i64]).as_input();
+    let g = ctx.new_tensor(types::F32, &[1, n as i64]).as_input();
+    let out = ctx
+        .external_with(
+            &MOE_SUM_GATE,
+            types::F32,
+            [e as i64, n as i64, 1, 1],
+            &[experts, w, sh, g],
+            &[1, 1, k as i32, fma],
+        )
+        .as_output();
+    let mut graph = ctx.new_graph(64);
+    graph.expand(out);
+    ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+        .unwrap();
+    if bf16 {
+        let bytes: Vec<u8> = bits.iter().flat_map(|b| b.to_le_bytes()).collect();
+        experts.set_bytes(&bytes);
+    } else {
+        let wide: Vec<f32> = bits
+            .iter()
+            .map(|&b| f32::from_bits(u32::from(b) << 16))
+            .collect();
+        experts.set_f32(&wide);
+    }
+    w.set_f32(&noise(k * n, 42));
+    sh.set_f32(&noise(e * n, 43));
+    let gv: Vec<f32> = noise(n, 44).iter().map(|v| v * 8.0).collect();
+    g.set_f32(&gv);
+    backend.compute(&graph).unwrap();
+    out.to_f32()
+}
+
+/// #1183: the op in its plain form over BF16 rows (`fold`'s `plain_tail`) gives the bits it
+/// gives over their F32 copy (ggml's unfused chain's rounding), on the CPU.
+#[test]
+fn plain_sum_of_bf16_rows_is_the_f32_copys() {
+    let mut backend = Backend::cpu().unwrap();
+    backend.set_threads(2);
+    for e in [64, 33] {
+        let from16 = sum_gate_of_rows(&mut backend, e, true, 0);
+        let from32 = sum_gate_of_rows(&mut backend, e, false, 0);
+        assert!(from32.iter().all(|v| v.is_finite()));
+        assert!(same_bits(&from16, &from32), "{e}: {from16:?} vs {from32:?}");
+    }
+}
+
+/// #1183: on a GPU, the plain form over BF16 rows (the plain tail kernels, 4 columns a thread
+/// and one) against the plain form over their F32 copy (`moe_sum_gate_kernel`, ggml's unfused
+/// chain's rounding), and the fused form over BF16 rows against the fused form over F32, bit
+/// for bit.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_sum_of_bf16_rows_is_the_f32_copys() {
+    use crate::ggml::{DeviceKind, device_by_kind};
+    let mut backend = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU device")
+        .init()
+        .unwrap();
+    for fma in [0, 1] {
+        for e in [2048, 64, 33] {
+            let from16 = sum_gate_of_rows(&mut backend, e, true, fma);
+            let from32 = sum_gate_of_rows(&mut backend, e, false, fma);
+            assert!(from32.iter().all(|v| v.is_finite()));
+            let i = from16
+                .iter()
+                .zip(&from32)
+                .position(|(a, b)| a.to_bits() != b.to_bits());
+            assert_eq!(i, None, "fma {fma}, {e} columns");
+        }
+    }
+}
+
 /// #1183: of two BF16 casts of one F32 node's values (one of a reshape of it), one read by FP8
 /// codes made from BF16, the later becomes a reshape of the earlier, and the views of it views
 /// of the earlier; a cast no such codes read, or of other values, stays; the undo puts every
