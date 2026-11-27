@@ -43,6 +43,8 @@ external_op!(MM_ID, "ink_mm_id", cpu_mm_id, mm_id);
 external_op!(SOFTCAP, "ink_softcap", cpu_softcap, softcap);
 external_op!(KV, "ink_kv", cpu_kv, kv);
 external_op!(CLIP2, "ink_clip2", cpu_clip2, clip2);
+external_op!(LIN32, "ink_lin32", cpu_lin32, lin32);
+external_op!(MIX_RMS, "ink_mix_rms", cpu_mix_rms, mix_rms);
 
 /// The most states [`mix`] takes (the depth blocks and the current residual): with its query,
 /// the 9 sources ggml takes.
@@ -56,6 +58,26 @@ pub const MAX_TAPS: usize = 8;
 /// `normed · q / sqrt(e)`, and the normed states summed with the softmax of their scores. F32
 /// `[e, n, nq]`: query `j`'s mix of every token is the contiguous slice `j`.
 pub fn mix<'a>(ctx: &'a Context, states: &[Tensor<'a>], query: Tensor<'a>, eps: f32) -> Tensor<'a> {
+    mix_in(ctx, states, query, eps, false)
+}
+
+/// The most tokens [`mix_in`]'s register kernel and [`mix_rms`] take: small steps.
+pub const MIXR_TOKENS: i64 = 8;
+/// The widest rows [`mix_in`]'s register kernel and [`mix_rms`] take (`MIXR_U` elements of each
+/// of 256 threads).
+pub const MIXR_MAX: i64 = 9 * 256;
+
+/// [`mix`]; with `regs`, at small steps (up to [`MIXR_TOKENS`] tokens of rows up to
+/// [`MIXR_MAX`]) on CUDA its kernel with a thread's elements all loaded at once and kept, and a
+/// weight query read before the kernel ahead completes (#1221 r10): the same sums, the same
+/// bits.
+pub fn mix_in<'a>(
+    ctx: &'a Context,
+    states: &[Tensor<'a>],
+    query: Tensor<'a>,
+    eps: f32,
+    regs: bool,
+) -> Tensor<'a> {
     assert!(
         !states.is_empty() && states.len() <= MAX_STATES,
         "ink_mix: {} states",
@@ -71,6 +93,7 @@ pub fn mix<'a>(ctx: &'a Context, states: &[Tensor<'a>], query: Tensor<'a>, eps: 
     assert_eq!(query.ty(), types::F32, "ink_mix: F32 queries");
     assert_eq!(query.ne()[0], e, "ink_mix: query width");
     let nq = query.ne()[1];
+    let regs = regs && (1..=MIXR_TOKENS).contains(&n) && (1..=MIXR_MAX).contains(&e);
     let mut args = states.to_vec();
     args.push(query);
     ctx.external_with(
@@ -78,7 +101,70 @@ pub fn mix<'a>(ctx: &'a Context, states: &[Tensor<'a>], query: Tensor<'a>, eps: 
         types::F32,
         [e, n, nq, 1],
         &args,
-        &[states.len() as i32, eps.to_bits() as i32],
+        &[
+            states.len() as i32,
+            eps.to_bits() as i32,
+            i32::from(weight(query)),
+            i32::from(regs),
+        ],
+    )
+}
+
+/// Whether [`mix_rms`] takes these states (F32 `[e, n]`, contiguous), query (F32 `[e, nq]`,
+/// contiguous) and norm weights (one per query column, F32 `[e]`, contiguous): up to
+/// [`MIXR_TOKENS`] tokens of rows up to [`MIXR_MAX`], all of them in ggml's sources.
+pub fn mix_rms_takes(states: &[Tensor<'_>], query: Tensor<'_>, ws: &[Tensor<'_>]) -> bool {
+    let Some(s0) = states.first() else {
+        return false;
+    };
+    let [e, n, _, _] = s0.ne();
+    let f32_rows = |t: &Tensor<'_>| t.ty() == types::F32 && t.is_contiguous();
+    states.len() <= MAX_STATES
+        && states.len() + 1 + ws.len() <= ffi::GGML_MAX_SRC as usize
+        && (1..=MIXR_TOKENS).contains(&n)
+        && (1..=MIXR_MAX).contains(&e)
+        && states.iter().all(|s| f32_rows(s) && s.ne() == [e, n, 1, 1])
+        && f32_rows(&query)
+        && query.ne()[0] == e
+        && query.ne()[2..] == [1, 1]
+        && query.ne()[1] == ws.len() as i64
+        && !ws.is_empty()
+        && ws.len() <= MIX_QUERIES
+        && ws.iter().all(|w| f32_rows(w) && w.ne() == [e, 1, 1, 1])
+}
+
+/// The queries [`mix_rms`] takes (the mix kernel's).
+pub const MIX_QUERIES: usize = 4;
+
+/// [`mix`] then [`rms`] of each query's slice `j` with the weight `ws[j]` (`rms_eps`), in one
+/// node of the same bits (#1221 r10): F32 `[e, n, nq]`, slice `j` the normed mix of query `j`.
+/// Where [`mix_rms_takes`] takes the inputs (checked here).
+pub fn mix_rms<'a>(
+    ctx: &'a Context,
+    states: &[Tensor<'a>],
+    query: Tensor<'a>,
+    eps: f32,
+    ws: &[Tensor<'a>],
+    rms_eps: f32,
+) -> Tensor<'a> {
+    assert!(mix_rms_takes(states, query, ws), "ink_mix_rms: inputs");
+    let [e, n, _, _] = states[0].ne();
+    let mut args = states.to_vec();
+    args.push(query);
+    args.extend_from_slice(ws);
+    ctx.external_with(
+        &MIX_RMS,
+        types::F32,
+        [e, n, ws.len() as i64, 1],
+        &args,
+        &[
+            states.len() as i32,
+            eps.to_bits() as i32,
+            i32::from(weight(query)),
+            rms_eps.to_bits() as i32,
+            1,
+            i32::from(ws.iter().all(|&w| weight(w))),
+        ],
     )
 }
 
@@ -203,6 +289,77 @@ pub fn ctrl_gate<'a>(
             1f32.to_bits() as i32,
             0f32.to_bits() as i32,
         ],
+    )
+}
+
+/// Most tokens [`lin32`] takes: small steps.
+pub const LIN32_TOKENS: i64 = 8;
+/// The longest rows [`lin32`] takes: a 32-value block for each of its kernel's 256 threads.
+pub const LIN32_K_MAX: i64 = 256 * 32;
+
+/// Whether [`lin32`] and [`lin32_ctrl`] take the F32 weight `w` (`[k, m]`, a leaf: no kernel
+/// writes it) over `n` tokens: up to [`LIN32_TOKENS`], `k` a multiple of 32 up to
+/// [`LIN32_K_MAX`], rows contiguous and 16-byte strided. Prompt steps keep `glm_linear`.
+pub fn lin32_takes(w: Tensor<'_>, n: i64) -> bool {
+    let [k, m, h, h3] = w.ne();
+    w.ty() == types::F32
+        && [h, h3] == [1, 1]
+        && m > 0
+        && k % 32 == 0
+        && (32..=LIN32_K_MAX).contains(&k)
+        && w.nb()[0] == 4
+        && w.nb()[1] % 16 == 0
+        && weight(w)
+        && (1..=LIN32_TOKENS).contains(&n)
+}
+
+/// `w @ x` (`w` F32 `[k, m]`, `x` F32 `[k, n]` contiguous; F32 `[m, n]`) with the bits of
+/// `glm_linear` at scale 1 and no scales ([`glm_ops::linear`]'s F32 decode kernels on CUDA),
+/// in a kernel of a block a row whose threads each sum a 32-value block of it (#1221 r10).
+/// Where [`lin32_takes`] takes `w`.
+pub fn lin32<'a>(ctx: &'a Context, w: Tensor<'a>, x: Tensor<'a>) -> Tensor<'a> {
+    let x = contiguous(x);
+    let [k, m, _, _] = w.ne();
+    let n = x.ne()[1];
+    assert!(lin32_takes(w, n), "ink_lin32: the weight");
+    assert_eq!(x.ty(), types::F32, "ink_lin32: F32 input");
+    assert_eq!(x.ne(), [k, n, 1, 1], "ink_lin32: input shape");
+    ctx.external_with(
+        &LIN32,
+        types::F32,
+        [m, n, 1, 1],
+        &[w, x],
+        &[1f32.to_bits() as i32, 0, 0],
+    )
+}
+
+/// A controller's down projection over [`ctrl_in`] of `cur` and `msg` (F32 `[e, n]` each,
+/// contiguous; `w` F32 `[2e, rank]`) in one node: the bits of [`ctrl_in`] then [`lin32`]
+/// (#1221 r10), the input made in the product's kernel. Where [`lin32_takes`] takes `w` and `e`
+/// is a multiple of 32.
+pub fn lin32_ctrl<'a>(
+    ctx: &'a Context,
+    w: Tensor<'a>,
+    cur: Tensor<'a>,
+    msg: Tensor<'a>,
+    eps: f32,
+) -> Tensor<'a> {
+    let (cur, msg) = (contiguous(cur), contiguous(msg));
+    let [e, n, _, _] = cur.ne();
+    let [k, m, _, _] = w.ne();
+    assert!(lin32_takes(w, n), "ink_lin32: the weight");
+    assert_eq!(e % 32, 0, "ink_lin32: rows of 32-value blocks");
+    assert_eq!(k, 2 * e, "ink_lin32: the weight's rows");
+    for x in [cur, msg] {
+        assert_eq!(x.ty(), types::F32, "ink_lin32: F32 inputs");
+        assert_eq!(x.ne(), [e, n, 1, 1], "ink_lin32: input shapes");
+    }
+    ctx.external_with(
+        &LIN32,
+        types::F32,
+        [m, n, 1, 1],
+        &[w, cur, msg],
+        &[1f32.to_bits() as i32, eps.to_bits() as i32, 1],
     )
 }
 
@@ -792,6 +949,60 @@ unsafe fn cpu_ctrl_in(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
                 for i in 0..e {
                     o[i] = x[i] * r;
                 }
+            }
+        }
+    }
+}
+
+/// `cpu_mix`, then each output row through `cpu_rms_norm`'s math with its query's weight.
+unsafe fn cpu_mix_rms(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
+    unsafe {
+        cpu_mix(dst, ith, nth);
+        let p = external_params(dst);
+        let (ns, eps) = (p[0] as usize, f32_param(p[3]));
+        let (e, n, nq) = (dst.ne[0] as usize, dst.ne[1] as usize, dst.ne[2] as usize);
+        // cpu_mix wrote the rows of this thread's tokens
+        for t in part(n, ith, nth) {
+            for j in 0..nq {
+                let w = f32s(&*dst.src[ns + 1 + j], 0, e);
+                let o = f32s_mut(dst, (j * n + t) * e * 4, e);
+                let s = rms_scale(o, eps);
+                for i in 0..e {
+                    o[i] = o[i] * s * w[i];
+                }
+            }
+        }
+    }
+}
+
+/// `cpu_ctrl_in` (params[2]: sources 1 and 2) or the input as it is, then `cpu_linear`'s rows.
+unsafe fn cpu_lin32(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
+    unsafe {
+        let p = external_params(dst);
+        let scale = f32_param(p[0]);
+        let w = &*dst.src[0];
+        let (k, m, n) = (w.ne[0] as usize, dst.ne[0] as usize, dst.ne[1] as usize);
+        let rows: Vec<Vec<f32>> = (0..n)
+            .map(|t| {
+                if p[2] != 0 {
+                    let (eps, e) = (f32_param(p[1]), k / 2);
+                    let mut row = Vec::with_capacity(k);
+                    for s in [&*dst.src[1], &*dst.src[2]] {
+                        let x = f32s(s, t * e * 4, e);
+                        let r = rms_scale(x, eps);
+                        row.extend(x.iter().map(|v| v * r));
+                    }
+                    row
+                } else {
+                    let x = &*dst.src[1];
+                    f32s(x, t * x.nb[1], k).to_vec()
+                }
+            })
+            .collect();
+        for r in part(m, ith, nth) {
+            let wr = f32_row(w, r, k);
+            for (t, x) in rows.iter().enumerate() {
+                *(dst.data as *mut f32).add(t * m + r) = linear_row(wr, x, scale);
             }
         }
     }

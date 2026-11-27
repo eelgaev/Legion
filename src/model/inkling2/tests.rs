@@ -1824,6 +1824,219 @@ fn cuda_rms_keeps_the_bits() {
     rms_keeps_the_bits(&mut gpu_backend());
 }
 
+/// #1221 r10: `ink_lin32` gives `glm_linear`'s bits (scale 1, no scales) at 1-8 tokens, and
+/// with `ink_ctrl_in` in front those of `ink_ctrl_in` then `glm_linear`, over a controller's
+/// down projection (4608 by 64) and router (2304 by 128) and odd shapes around them.
+fn lin32_keeps_the_bits(b: &mut Backend) {
+    use crate::ggml::ComputeAllocator;
+    let mut s = 0x6a09_e667_f3bc_c909u64;
+    let mut vals = move |n: usize, amp: f32| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 40) as f32 / (1u64 << 23) as f32 - 1.0) * amp
+            })
+            .collect()
+    };
+    let mut bad = Vec::new();
+    for (k, m) in [
+        (4608i64, 64i64),
+        (2304, 128),
+        (64, 33),
+        (8192, 5),
+        (32, 7),
+        (960, 300),
+    ] {
+        for n in [1i64, 2, 3, 4, 5, 8] {
+            for fused in [false, true] {
+                let e = k / 2;
+                if fused && e % 32 != 0 {
+                    continue;
+                }
+                let ctx = Context::new(32, 32);
+                let w = ctx.new_tensor(types::F32, &[k, m]).as_input();
+                assert!(ops::lin32_takes(w, n), "k {k} m {m} n {n}");
+                let ins: Vec<Tensor<'_>> = if fused {
+                    (0..2)
+                        .map(|_| ctx.new_tensor(types::F32, &[e, n]).as_input())
+                        .collect()
+                } else {
+                    vec![ctx.new_tensor(types::F32, &[k, n]).as_input()]
+                };
+                let (old, new) = if fused {
+                    let g = ops::ctrl_in(&ctx, ins[0], ins[1], MIX_EPS);
+                    (
+                        glm_ops::linear_h(&ctx, w, g, None, 1.0, None),
+                        ops::lin32_ctrl(&ctx, w, ins[0], ins[1], MIX_EPS),
+                    )
+                } else {
+                    (
+                        glm_ops::linear_h(&ctx, w, ins[0], None, 1.0, None),
+                        ops::lin32(&ctx, w, ins[0]),
+                    )
+                };
+                let (old, new) = (old.as_output(), new.as_output());
+                let mut graph = ctx.new_graph(32);
+                for t in [old, new] {
+                    graph.expand(t);
+                }
+                ctx.alloc_graph(&graph, ComputeAllocator::new(b.buffer_type()))
+                    .unwrap();
+                w.set_f32(&vals((k * m) as usize, 0.05));
+                for (i, x) in ins.iter().enumerate() {
+                    let len = x.ne()[0] * n;
+                    x.set_f32(&vals(len as usize, if i == 0 { 4.0 } else { 1.0 }));
+                }
+                b.compute(&graph).unwrap();
+                let (p, q) = (old.to_f32(), new.to_f32());
+                assert!(q.iter().any(|&v| v != 0.0), "ink_lin32 k {k}: an output");
+                let what = format!("ink_lin32 k {k}, m {m}, {n} tokens, ctrl_in {fused}");
+                if let Some(line) = first_diff(&what, &p, &q, m as usize) {
+                    eprintln!("first mismatch: {line}");
+                    bad.push(line);
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "\n{}", bad.join("\n"));
+}
+
+/// [`lin32_keeps_the_bits`] on the CPU references.
+#[test]
+fn lin32_keeps_the_cpu_bits() {
+    lin32_keeps_the_bits(&mut backend());
+}
+
+/// [`lin32_keeps_the_bits`] on the GPU: `lin32_kernel` against glm5next.cu's F32 decode kernels
+/// (and `ctrl_in_kernel`).
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_lin32_keeps_the_bits() {
+    lin32_keeps_the_bits(&mut gpu_backend());
+}
+
+/// #1221 r10: `ink_mix` on its register kernel and `ink_mix_rms` give the bits of `ink_mix`
+/// and of `ink_mix` then `ink_rms` of each query's slice, over Inkling-2's widths and odd ones,
+/// 1-8 states, 1-4 queries, 1-8 tokens, a weight query (read before the wait) and a viewed one.
+fn mix_rms_keeps_the_bits(b: &mut Backend) {
+    use crate::ggml::ComputeAllocator;
+    let mut s = 0xbb67_ae85_84ca_a73bu64;
+    let mut vals = move |n: usize, amp: f32| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 40) as f32 / (1u64 << 23) as f32 - 1.0) * amp
+            })
+            .collect()
+    };
+    let mut bad = Vec::new();
+    for e in [2304i64, 96, 257, 2000] {
+        for (ns, nq) in [(1usize, 1i64), (3, 1), (6, 3), (8, 1), (5, 4), (2, 3), (7, 3)] {
+            for n in [1i64, 3, 8] {
+                for view_q in [false, true] {
+                    let ctx = Context::new(64, 64);
+                    let st: Vec<Tensor<'_>> = (0..ns)
+                        .map(|_| ctx.new_tensor(types::F32, &[e, n]).as_input())
+                        .collect();
+                    let qsrc = ctx
+                        .new_tensor(types::F32, &[e, nq + i64::from(view_q)])
+                        .as_input();
+                    let q = if view_q {
+                        ctx.view_2d(qsrc, [e, nq], qsrc.nb()[1], 0)
+                    } else {
+                        qsrc
+                    };
+                    let ws: Vec<Tensor<'_>> = (0..nq)
+                        .map(|_| ctx.new_tensor(types::F32, &[e]).as_input())
+                        .collect();
+                    let mixed = ops::mix(&ctx, &st, q, MIX_EPS);
+                    let regs = ops::mix_in(&ctx, &st, q, MIX_EPS, true).as_output();
+                    let olds: Vec<Tensor<'_>> = (0..nq as usize)
+                        .map(|j| {
+                            ops::rms(&ctx, slice(&ctx, mixed, j), Some(ws[j]), 1e-6).as_output()
+                        })
+                        .collect();
+                    let mixed = mixed.as_output();
+                    let fused = ops::mix_rms_takes(&st, q, &ws);
+                    assert_eq!(fused, ns + 1 + ws.len() <= 10, "e {e} ns {ns} nq {nq}");
+                    let new =
+                        fused.then(|| ops::mix_rms(&ctx, &st, q, MIX_EPS, &ws, 1e-6).as_output());
+                    let mut graph = ctx.new_graph(64);
+                    for t in [mixed, regs]
+                        .into_iter()
+                        .chain(olds.iter().copied())
+                        .chain(new)
+                    {
+                        graph.expand(t);
+                    }
+                    ctx.alloc_graph(&graph, ComputeAllocator::new(b.buffer_type()))
+                        .unwrap();
+                    for (i, x) in st.iter().enumerate() {
+                        x.set_f32(&vals((e * n) as usize, 1.0 + i as f32));
+                    }
+                    qsrc.set_f32(&vals(qsrc.elements(), 1.0));
+                    for w in &ws {
+                        w.set_f32(&vals(e as usize, 1.5));
+                    }
+                    b.compute(&graph).unwrap();
+                    let case =
+                        format!("e {e}, {ns} states, {nq} queries, {n} tokens, view {view_q}");
+                    let (p, r) = (mixed.to_f32(), regs.to_f32());
+                    assert!(r.iter().any(|&v| v != 0.0), "ink_mix {case}: an output");
+                    if let Some(line) =
+                        first_diff(&format!("ink_mix regs {case}"), &p, &r, e as usize)
+                    {
+                        eprintln!("first mismatch: {line}");
+                        bad.push(line);
+                    }
+                    if let Some(new) = new {
+                        let p: Vec<f32> = olds.iter().flat_map(|t| t.to_f32()).collect();
+                        let q = new.to_f32();
+                        assert!(q.iter().any(|&v| v != 0.0), "ink_mix_rms {case}: an output");
+                        if let Some(line) =
+                            first_diff(&format!("ink_mix_rms {case}"), &p, &q, e as usize)
+                        {
+                            eprintln!("first mismatch: {line}");
+                            bad.push(line);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "\n{}", bad.join("\n"));
+}
+
+/// [`mix_rms_keeps_the_bits`] on the CPU references.
+#[test]
+fn mix_rms_keeps_the_cpu_bits() {
+    mix_rms_keeps_the_bits(&mut backend());
+}
+
+/// [`mix_rms_keeps_the_bits`] on the GPU: `mixr_kernel` against `mix_kernel` and `rms_kernel`.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_mix_rms_keeps_the_bits() {
+    mix_rms_keeps_the_bits(&mut gpu_backend());
+}
+
+/// `LEGION_DEBUG_INK_FUSE10`: a mask of the four, all of them unset or unparsed.
+#[test]
+fn fuse10_masks() {
+    assert_eq!(fuse10_of(None), FUSE_ALL);
+    assert_eq!(fuse10_of(Some("x")), FUSE_ALL);
+    assert_eq!(fuse10_of(Some("0")), 0);
+    assert_eq!(fuse10_of(Some(" 5 ")), FUSE_CTRL | FUSE_MIX_RMS);
+    assert_eq!(fuse10_of(Some("18")), FUSE_ROUTER);
+    assert_eq!(FUSE_ALL, 15);
+}
+
 /// #1221 r6: `ink_conv` with the residual gives `glm_add(res, ink_conv(..))`'s bits and leaves
 /// the same history, at decode steps (one token, 1-4 sequences) and prompt steps, with and
 /// without dynamic taps.
