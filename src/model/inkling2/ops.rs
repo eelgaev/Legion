@@ -29,6 +29,8 @@ macro_rules! external_op {
 external_op!(MIX, "ink_mix", cpu_mix, mix);
 external_op!(CTRL_IN, "ink_ctrl_in", cpu_ctrl_in, ctrl_in);
 external_op!(CTRL_OUT, "ink_ctrl_out", cpu_ctrl_out, ctrl_out);
+external_op!(CTRL_DOWN, "ink_ctrl_down", cpu_ctrl_down, ctrl_down);
+external_op!(CTRL_GATE, "ink_ctrl_gate", cpu_ctrl_gate, ctrl_gate);
 external_op!(CONV, "ink_conv", cpu_conv, conv);
 external_op!(CLIP, "ink_clip", cpu_clip, clip);
 external_op!(ATTN, "ink_attn", cpu_attn, attn);
@@ -104,6 +106,87 @@ pub fn ctrl_out<'a>(
         assert_eq!(a.ne(), cur.ne(), "ink_ctrl_out: shapes");
     }
     ctx.external(&CTRL_OUT, types::F32, cur.ne(), &args)
+}
+
+/// Most tokens the fused controller ([`ctrl_down`], [`ctrl_gate`]) takes: small steps.
+pub const CTRL_TOKENS: i64 = 8;
+/// The widest rank (gain and forget rows) [`ctrl_gate`] takes.
+pub const CTRL_RANK_MAX: i64 = 512;
+
+/// Whether the fused controller takes the F32 weights `down` (`[2e, rank]`), `gain` and
+/// `forget` (`[rank, e]`, no scales) over `n` tokens: up to [`CTRL_TOKENS`], `e` and the rank
+/// multiples of 32, the rank at most [`CTRL_RANK_MAX`], rows contiguous and 16-byte strided.
+/// Prompt steps keep the five ops (`glm_linear`'s prompt kernels sum in another order).
+pub fn ctrl_takes(down: Tensor<'_>, gain: Tensor<'_>, forget: Tensor<'_>, n: i64) -> bool {
+    let [k2, rank, d2, d3] = down.ne();
+    let e = k2 / 2;
+    let rows = |w: Tensor<'_>, k: i64, m: i64| {
+        w.ty() == types::F32 && w.ne() == [k, m, 1, 1] && w.nb()[0] == 4 && w.nb()[1] % 16 == 0
+    };
+    (1..=CTRL_TOKENS).contains(&n)
+        && d2 == 1
+        && d3 == 1
+        && e > 0
+        && e % 32 == 0
+        && rank % 32 == 0
+        && (32..=CTRL_RANK_MAX).contains(&rank)
+        && rows(down, 2 * e, rank)
+        && rows(gain, rank, e)
+        && rows(forget, rank, e)
+}
+
+/// A controller's down projection over its input: `down @ ctrl_in(cur, msg, eps)` (F32
+/// `[rank, n]`) in one node, the bits of [`ctrl_in`] then `glm_linear` (scale 1) at the
+/// small steps [`ctrl_takes`] takes (#1221 r5).
+pub fn ctrl_down<'a>(
+    ctx: &'a Context,
+    cur: Tensor<'a>,
+    msg: Tensor<'a>,
+    down: Tensor<'a>,
+    eps: f32,
+) -> Tensor<'a> {
+    let (cur, msg) = (contiguous(cur), contiguous(msg));
+    let [e, n, _, _] = cur.ne();
+    assert_eq!(msg.ne()[..2], [e, n], "ink_ctrl_down: shapes");
+    assert_eq!(down.ne()[0], 2 * e, "ink_ctrl_down: weight rows");
+    ctx.external_with(
+        &CTRL_DOWN,
+        types::F32,
+        [down.ne()[1], n, 1, 1],
+        &[cur, msg, down],
+        &[eps.to_bits() as i32, 1f32.to_bits() as i32],
+    )
+}
+
+/// A controller's output from its down projection `d` (F32 `[rank, n]`, [`ctrl_down`]):
+/// [`ctrl_out`] of `gain @ d` and `forget @ d` in one node, the bits of two `glm_linear`s
+/// (scale 1) then [`ctrl_out`] at the small steps [`ctrl_takes`] takes (#1221 r5).
+pub fn ctrl_gate<'a>(
+    ctx: &'a Context,
+    cur: Tensor<'a>,
+    msg: Tensor<'a>,
+    d: Tensor<'a>,
+    gain: Tensor<'a>,
+    forget: Tensor<'a>,
+) -> Tensor<'a> {
+    let (cur, msg, d) = (contiguous(cur), contiguous(msg), contiguous(d));
+    let [e, n, _, _] = cur.ne();
+    assert_eq!(msg.ne()[..2], [e, n], "ink_ctrl_gate: shapes");
+    assert_eq!(d.ne()[1], n, "ink_ctrl_gate: tokens");
+    for w in [gain, forget] {
+        assert_eq!(w.ne()[..2], [d.ne()[0], e], "ink_ctrl_gate: weights");
+    }
+    ctx.external_with(
+        &CTRL_GATE,
+        types::F32,
+        cur.ne(),
+        &[cur, msg, d, gain, forget],
+        &[
+            1f32.to_bits() as i32,
+            1f32.to_bits() as i32,
+            0f32.to_bits() as i32,
+        ],
+    )
 }
 
 /// The causal short conv with its residual of a group of `n_seqs · n_tok` tokens (`x` F32
@@ -527,6 +610,63 @@ unsafe fn cpu_ctrl_out(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
             let (c, m) = (at::<f32>(src(0), i), at::<f32>(src(1), i));
             let (g, f) = (at::<f32>(src(2), i).tanh(), at::<f32>(src(3), i).tanh());
             *(dst.data as *mut f32).add(i) = c - f * c + g * m;
+        }
+    }
+}
+
+/// Row `r` of the F32 matrix `w` (`k` values).
+unsafe fn f32_row(w: &ffi::ggml_tensor, r: usize, k: usize) -> &[f32] {
+    unsafe { f32s(w, r * w.nb[1], k) }
+}
+
+/// `glm_linear`'s CPU reference for one row and input: the dot in order, times the scale.
+fn linear_row(w: &[f32], x: &[f32], scale: f32) -> f32 {
+    dot(w, x) * scale
+}
+
+unsafe fn cpu_ctrl_down(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
+    unsafe {
+        let p = external_params(dst);
+        let (eps, scale) = (f32_param(p[0]), f32_param(p[1]));
+        let (cur, msg, w) = (&*dst.src[0], &*dst.src[1], &*dst.src[2]);
+        let e = cur.ne[0] as usize;
+        let m = dst.ne[0] as usize;
+        for t in part(dst.ne[1] as usize, ith, nth) {
+            // cpu_ctrl_in's row of this token
+            let mut x = vec![0f32; 2 * e];
+            for (h, s) in [cur, msg].into_iter().enumerate() {
+                let v = f32s(s, t * e * 4, e);
+                let r = rms_scale(v, eps);
+                for i in 0..e {
+                    x[h * e + i] = v[i] * r;
+                }
+            }
+            let o = f32s_mut(dst, t * m * 4, m);
+            for (r, o) in o.iter_mut().enumerate() {
+                *o = linear_row(f32_row(w, r, 2 * e), &x, scale);
+            }
+        }
+    }
+}
+
+unsafe fn cpu_ctrl_gate(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
+    unsafe {
+        let p = external_params(dst);
+        let (sg, sf) = (f32_param(p[0]), f32_param(p[1]));
+        let (cur, msg, d) = (&*dst.src[0], &*dst.src[1], &*dst.src[2]);
+        let (gw, fw) = (&*dst.src[3], &*dst.src[4]);
+        let (e, k) = (dst.ne[0] as usize, d.ne[0] as usize);
+        let n = dst.ne[1] as usize;
+        for r in part(e, ith, nth) {
+            let (wg, wf) = (f32_row(gw, r, k), f32_row(fw, r, k));
+            for t in 0..n {
+                let x = f32s(d, t * d.nb[1], k);
+                let i = t * e + r;
+                let (c, m) = (at::<f32>(cur, i), at::<f32>(msg, i));
+                // cpu_ctrl_out of the two products as cpu_linear stores them
+                let (g, f) = (linear_row(wg, x, sg).tanh(), linear_row(wf, x, sf).tanh());
+                *(dst.data as *mut f32).add(i) = c - f * c + g * m;
+            }
         }
     }
 }

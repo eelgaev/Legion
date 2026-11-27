@@ -1578,3 +1578,77 @@ fn real_checkpoint_parses_like_the_gguf() {
         );
     }
 }
+
+/// One small step of a controller both ways on `b`: the five nodes (`ink_ctrl_in`, the down,
+/// gain and forget products through `glm_linear` as `glm_mm` makes them, `ink_ctrl_out`) and
+/// the fused two (`ink_ctrl_down`, `ink_ctrl_gate`); the down projections and the outputs must
+/// match bit for bit (#1221 r5). Rows of `e` values, controllers of rank `rank`, up to 8 tokens.
+fn fused_controller_keeps_the_bits(b: &mut Backend) {
+    use crate::ggml::ComputeAllocator;
+    let mut s = 0x9e37_79b9_7f4a_7c15u64;
+    let mut vals = move |n: usize, amp: f32| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 40) as f32 / (1u64 << 23) as f32 - 1.0) * amp
+            })
+            .collect()
+    };
+    for (e, rank) in [(2304i64, 64i64), (256, 32), (128, 512)] {
+        for n in [1i64, 2, 3, 4, 5, 8] {
+            let ctx = Context::new(64, 64);
+            let new = |ne: &[i64]| ctx.new_tensor(types::F32, ne).as_input();
+            let (cur, msg) = (new(&[e, n]), new(&[e, n]));
+            let dw = new(&[2 * e, rank]);
+            let (gw, fw) = (new(&[rank, e]), new(&[rank, e]));
+            assert!(ops::ctrl_takes(dw, gw, fw, n), "e {e} rank {rank} n {n}");
+            let g = ops::ctrl_in(&ctx, cur, msg, MIX_EPS);
+            let d5 = glm_ops::linear_h(&ctx, dw, g, None, 1.0, None).as_output();
+            let gain = glm_ops::linear_h(&ctx, gw, d5, None, 1.0, None);
+            let forget = glm_ops::linear_h(&ctx, fw, d5, None, 1.0, None);
+            let o5 = ops::ctrl_out(&ctx, cur, msg, gain, forget).as_output();
+            let d2 = ops::ctrl_down(&ctx, cur, msg, dw, MIX_EPS).as_output();
+            let o2 = ops::ctrl_gate(&ctx, cur, msg, d2, gw, fw).as_output();
+            let mut graph = ctx.new_graph(64);
+            for t in [d5, o5, d2, o2] {
+                graph.expand(t);
+            }
+            ctx.alloc_graph(&graph, ComputeAllocator::new(b.buffer_type()))
+                .unwrap();
+            cur.set_f32(&vals((e * n) as usize, 4.0));
+            msg.set_f32(&vals((e * n) as usize, 1.0));
+            dw.set_f32(&vals((2 * e * rank) as usize, 0.05));
+            gw.set_f32(&vals((rank * e) as usize, 0.5));
+            fw.set_f32(&vals((rank * e) as usize, 0.5));
+            b.compute(&graph).unwrap();
+            let case = format!("e {e}, rank {rank}, {n} tokens");
+            let same = |x: &[f32], y: &[f32]| {
+                x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits())
+            };
+            assert!(
+                same(&d5.to_f32(), &d2.to_f32()),
+                "{case}: the down projection"
+            );
+            let out = o2.to_f32();
+            assert!(same(&o5.to_f32(), &out), "{case}: the output");
+            assert!(out.iter().any(|&v| v != 0.0), "{case}: an output");
+        }
+    }
+}
+
+/// [`fused_controller_keeps_the_bits`] on the CPU references.
+#[test]
+fn fused_controller_keeps_the_cpu_bits() {
+    fused_controller_keeps_the_bits(&mut backend());
+}
+
+/// [`fused_controller_keeps_the_bits`] on the GPU: the fused kernels against `glm_linear`'s F32
+/// kernels (the split and shared-input ones, by token count).
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_fused_controller_keeps_the_bits() {
+    fused_controller_keeps_the_bits(&mut gpu_backend());
+}

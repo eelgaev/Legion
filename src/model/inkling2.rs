@@ -689,6 +689,23 @@ impl Model {
         msg: Tensor<'a>,
     ) -> Result<Tensor<'a>, ModelError> {
         let p = self.ink();
+        // Small steps: two nodes of the same bits (#1221 r5), when the weights suit them and
+        // carry no scales (glm_mm's products of these are then scale 1).
+        let names = ["down", "gain", "forget"].map(|part| p.ctrl_name(ip, c, part));
+        let unscaled = names.iter().all(|nm| {
+            nm.strip_suffix(".weight")
+                .is_some_and(|b| self.w(&format!("{b}.scale")).is_err())
+        });
+        if let (true, Ok(dw), Ok(gw), Ok(fw)) = (
+            unscaled,
+            self.w(&names[0]),
+            self.w(&names[1]),
+            self.w(&names[2]),
+        ) && ops::ctrl_takes(dw, gw, fw, cur.ne()[1..].iter().product())
+        {
+            let d = ops::ctrl_down(ctx, cur, msg, dw, MIX_EPS);
+            return Ok(ops::ctrl_gate(ctx, cur, msg, d, gw, fw));
+        }
         let g = ops::ctrl_in(ctx, cur, msg, MIX_EPS);
         let g = self.glm_mm(ctx, &p.ctrl_name(ip, c, "down"), g)?;
         let mut rows = Bf16Rows::default();
