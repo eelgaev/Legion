@@ -2655,11 +2655,10 @@ impl DeviceMem {
             let size = want - me.size;
             let prop = alloc_prop(CU_MEM_LOCATION_TYPE_DEVICE, device as i32);
             let mut handle = 0;
-            // SAFETY: creates an allocation.
+            // SAFETY: creates an allocation; pooled lent VRAM is released first when the
+            // driver is short of it.
             cu(
-                timed("cuMemCreate", device, size, || unsafe {
-                    cuMemCreate(&mut handle, size, &prop, 0)
-                }),
+                unsafe { lent_pool::create(device, &mut handle, size, &prop) },
                 "cuMemCreate(staging)",
             )?;
             me.parts.push((handle, size));

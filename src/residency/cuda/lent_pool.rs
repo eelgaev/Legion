@@ -75,18 +75,24 @@ pub(crate) fn put(mem: DeviceMem) {
         release(device, parts);
         return;
     }
+    // Opened and filled under the pool lock, so a `close_all` either drains these or runs first.
+    let mut p = pool();
     OPEN.fetch_or(bit(device), Ordering::AcqRel);
-    pool().extend(parts.into_iter().map(|(h, n)| (device, h, n)));
+    p.extend(parts.into_iter().map(|(h, n)| (device, h, n)));
 }
 
 /// Gives a step buffer's unmapped allocations back: into the pool while it is open, else
 /// released.
 pub(crate) fn give_back(device: usize, parts: Vec<(CUmemGenericAllocationHandle, usize)>) {
+    // The open check and the insert are one step under the pool lock: a `close_all` that
+    // clears `OPEN` meanwhile then drains them, or this sees the pool closed.
+    let mut p = pool();
     if is_open(device) {
-        pool().extend(parts.into_iter().map(|(h, n)| (device, h, n)));
-    } else {
-        release(device, parts);
+        p.extend(parts.into_iter().map(|(h, n)| (device, h, n)));
+        return;
     }
+    drop(p);
+    release(device, parts);
 }
 
 /// A pooled allocation of `device` of exactly `n` bytes, if there is one.
@@ -250,11 +256,13 @@ pub(crate) fn flush(device: usize) -> usize {
 
 /// Closes every device's pool (the restore is done) and releases what is left in it.
 pub fn close_all() {
-    let open = OPEN.swap(0, Ordering::AcqRel);
-    if open == 0 {
-        return;
-    }
-    let gone = std::mem::take(&mut *pool());
+    let gone = {
+        let mut p = pool();
+        if OPEN.swap(0, Ordering::AcqRel) == 0 {
+            return;
+        }
+        std::mem::take(&mut *p)
+    };
     for (device, h, n) in gone {
         release(device, [(h, n)]);
     }
