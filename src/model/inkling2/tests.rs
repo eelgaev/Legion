@@ -2181,9 +2181,11 @@ fn linear_set_keeps_the_bits(b: &mut Backend, ty: crate::ggml::ffi::ggml_type, t
             .collect()
     };
     let mut bad = Vec::new();
-    let shapes: [(i64, &[i64]); 3] = [
+    // attn_output's k, and rows that are not whole blocks of 4 (the head's 200,058; #1221 r9).
+    let shapes: [(i64, &[i64]); 4] = [
         (2304, &[3072, 384, 3072]),
         (2304, &[1024, 1024]),
+        (3072, &[2304, 1026]),
         (64, &[8, 36, 4]),
     ];
     for (k, ms) in shapes {

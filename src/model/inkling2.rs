@@ -492,13 +492,34 @@ impl Arch for Ink2Params {
     /// [`glm_ops::argmax_wide`]'s CTAs (#1221): one CTA a token read the 200K logits slowly;
     /// the same index as `argmax` (the first of the largest) for NaN-free logits. The soft cap
     /// passes a NaN through (`tanh(NaN)` is NaN), so that rests on the output projection.
+    /// The projection reads only the unpadded vocabulary's rows (#1221 r9: the padding's
+    /// logits were cut anyway), a Q8_0 head at decode steps on the staged set kernel
+    /// ([`glm_ops::linear_set_staged`], [`q8_set_stage`]): the same bits.
     fn head<'a>(
         &self,
         m: &'a Model,
         ctx: &'a Context,
         x: Tensor<'a>,
     ) -> Result<Option<(Tensor<'a>, Tensor<'a>)>, ModelError> {
-        let logits = m.glm_mm(ctx, "output.weight", x)?;
+        let name = "output.weight";
+        let w = m.w(name)?;
+        let ws = m.w("output.scale").ok();
+        let w = if w.ne()[1] > self.n_vocab && w.ne()[2] == 1 {
+            ctx.view_2d(w, [w.ne()[0], self.n_vocab], w.nb()[1], 0)
+        } else {
+            w
+        };
+        let n: i64 = x.ne()[1..].iter().product();
+        let logits = if q8_set_stage()
+            && ws.is_none()
+            && x.ty() == types::F32
+            && x.is_contiguous()
+            && glm_ops::linear_set_takes(&[w], n)
+        {
+            glm_ops::linear_set_staged(ctx, &[(w, x, glm_ops::SetEpi::Plain)]).remove(0)
+        } else {
+            m.glm_mm_w(ctx, name, w, ws, x, None)?
+        };
         let logits = ops::softcap(ctx, logits, self.softcap, self.n_vocab);
         Ok(Some((logits, glm_ops::argmax_wide(ctx, logits))))
     }
@@ -633,16 +654,32 @@ impl Model {
         rows: &mut Bf16Rows<'a>,
         own: bool,
     ) -> Result<[Tensor<'a>; N], ModelError> {
+        self.ink_mm_setx(ctx, ip, names, [x; N], rows, own)
+    }
+
+    /// [`Self::ink_mm_set`] with an input a product (`xs[j]` for `names[j]`, all of the same
+    /// tokens): a global layer's K and V read different inputs (#1221 r9).
+    fn ink_mm_setx<'a, const N: usize>(
+        &'a self,
+        ctx: &'a Context,
+        ip: usize,
+        names: [&str; N],
+        xs: [Tensor<'a>; N],
+        rows: &mut Bf16Rows<'a>,
+        own: bool,
+    ) -> Result<[Tensor<'a>; N], ModelError> {
         let ws = names
             .iter()
             .map(|n| self.w(&format!("blk.{ip}.{n}")))
             .collect::<Result<Vec<_>, _>>()?;
-        let n: i64 = x.ne()[1..].iter().product();
+        let tokens = |x: &Tensor<'_>| -> i64 { x.ne()[1..].iter().product() };
+        let n = tokens(&xs[0]);
         let staged = q8_set_stage() && glm_ops::linear_set_takes(&ws, n);
         let set = !own
             && ((2..=glm_ops::SET_MAX).contains(&N) || (N == 1 && staged))
-            && x.ty() == types::F32
-            && x.is_contiguous()
+            && xs
+                .iter()
+                .all(|x| x.ty() == types::F32 && x.is_contiguous() && tokens(x) == n)
             && (glm_ops::linear_set_takes(&ws, n)
                 || (bf16_set() && glm_ops::linear_set_bf16_takes(&ws, n)))
             && names.iter().all(|name| {
@@ -650,7 +687,11 @@ impl Model {
                     .is_some_and(|b| self.w(&format!("blk.{ip}.{b}.scale")).is_err())
             });
         let out = if set {
-            let set: Vec<_> = ws.iter().map(|&w| (w, x, glm_ops::SetEpi::Plain)).collect();
+            let set: Vec<_> = ws
+                .iter()
+                .zip(xs)
+                .map(|(&w, x)| (w, x, glm_ops::SetEpi::Plain))
+                .collect();
             if staged {
                 glm_ops::linear_set_staged(ctx, &set)
             } else {
@@ -659,7 +700,8 @@ impl Model {
         } else {
             names
                 .iter()
-                .map(|name| self.ink_mm_b(ctx, ip, name, x, rows))
+                .zip(xs)
+                .map(|(name, x)| self.ink_mm_b(ctx, ip, name, x, rows))
                 .collect::<Result<Vec<_>, _>>()?
         };
         Ok(out
@@ -1003,27 +1045,27 @@ impl Model {
             &mut rows,
             tap.on,
         )?;
-        let [kp, vp] = if xk.raw() == xv.raw() {
-            self.ink_mm_set(
-                ctx,
-                ip,
-                ["attn_k.weight", "attn_v.weight"],
-                xk,
-                &mut rows,
-                tap.on,
-            )?
-        } else {
-            let [kp] = self.ink_mm_set(ctx, ip, ["attn_k.weight"], xk, &mut rows, tap.on)?;
-            let [vp] = self.ink_mm_set(ctx, ip, ["attn_v.weight"], xv, &mut rows, tap.on)?;
-            [kp, vp]
-        };
+        // K and V one set, from one input or (a global layer's) two (#1221 r9), and so the
+        // global layers' conv projections.
+        let [kp, vp] = self.ink_mm_setx(
+            ctx,
+            ip,
+            ["attn_k.weight", "attn_v.weight"],
+            [xk, xv],
+            &mut rows,
+            tap.on,
+        )?;
         let (kdyn, vdyn) = if swa {
             (None, None)
         } else {
-            let [kd] =
-                self.ink_mm_set(ctx, ip, ["attn_k_conv_proj.weight"], xk, &mut rows, tap.on)?;
-            let [vd] =
-                self.ink_mm_set(ctx, ip, ["attn_v_conv_proj.weight"], xv, &mut rows, tap.on)?;
+            let [kd, vd] = self.ink_mm_setx(
+                ctx,
+                ip,
+                ["attn_k_conv_proj.weight", "attn_v_conv_proj.weight"],
+                [xk, xv],
+                &mut rows,
+                tap.on,
+            )?;
             (Some(kd), Some(vd))
         };
         for (name, x) in [("q_proj", q), ("k_proj", kp), ("v_proj", vp)] {
