@@ -48,24 +48,37 @@ pub fn all_reduce_add<'a>(
 /// activations of [`crate::model::fp8_act::rms_norm`] (and with `bf16` the BF16 rows of
 /// [`crate::model::fp8_act::rms_norm_bf16`]), the bits of those ops on `y`, without reading `y`
 /// back. GPUs only ([`crate::model::fp8_act::rms_norm_fits`]); the CPU's are references.
+///
+/// With `a4` the norm's rows quantized for the W4A4 SwiGLU instead of the FP8 codes (#1133:
+/// the post-attention norm of a tensor-parallel step's halves, [`crate::model::nvfp4_a4`]'s
+/// `normed_layout` after the sums, [`crate::model::nvfp4_a4::swiglu_quantized`] reads them):
+/// the bits of [`crate::model::nvfp4_a4::swiglu_norm`]'s quantization of the sums. Not with
+/// `bf16`; [`crate::tp_net::micro::finish_add_norm`] only, of a whole output.
 #[derive(Clone, Copy)]
 pub struct Norm<'a> {
     pub w: Tensor<'a>,
     pub eps: f32,
     pub bf16: bool,
+    pub a4: bool,
 }
 
 impl Norm<'_> {
-    /// Its params: the eps bits and the flags ([`NORM_ON`], [`NORM_BF16`]).
+    /// Its params: the eps bits and the flags ([`NORM_ON`], [`NORM_BF16`], [`NORM_A4`]).
     pub(super) fn params(&self) -> [i32; 2] {
-        let flags = NORM_ON | if self.bf16 { NORM_BF16 } else { 0 };
+        assert!(
+            !(self.a4 && self.bf16),
+            "tp norm: the W4A4 rows or the BF16 rows"
+        );
+        let flags =
+            NORM_ON | if self.bf16 { NORM_BF16 } else { 0 } | if self.a4 { NORM_A4 } else { 0 };
         [self.eps.to_bits() as i32, flags]
     }
 }
 
-/// A finish's [`Norm`] flags: on, and the BF16 rows too.
+/// A finish's [`Norm`] flags: on, the BF16 rows too, the W4A4 rows instead of the FP8 codes.
 pub(super) const NORM_ON: i32 = 1;
 pub(super) const NORM_BF16: i32 = 2;
+pub(super) const NORM_A4: i32 = 4;
 
 /// A node's [`Norm`] as the kernels read it: the weight's address, eps, BF16 rows.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
@@ -74,6 +87,7 @@ pub(crate) struct NormParams {
     pub w: usize,
     pub eps: f32,
     pub bf16: bool,
+    pub a4: bool,
 }
 
 impl NormParams {
@@ -83,6 +97,7 @@ impl NormParams {
             w: w(),
             eps: f32::from_bits(p[0] as u32),
             bf16: p[1] & NORM_BF16 != 0,
+            a4: p[1] & NORM_A4 != 0,
         })
     }
 }
@@ -138,6 +153,26 @@ pub fn normed<'a>(
     Normed { y, q, b }
 }
 
+/// The bytes of a normed finish's node of `row` values x `width` tokens with `norm`
+/// ([`norm_layout`]; with [`Norm::a4`], [`crate::model::nvfp4_a4`]'s `normed_layout`).
+pub(crate) fn norm_bytes(row: usize, width: usize, norm: &Norm<'_>) -> usize {
+    if norm.a4 {
+        crate::model::nvfp4_a4::normed_layout(row as i64, width as i64).1
+    } else {
+        norm_layout(row, width, norm.bf16).2
+    }
+}
+
+/// The sums of a normed finish with [`Norm::a4`] (`node`, of `row` values x `width` tokens):
+/// F32 `[row, width]`; [`crate::model::nvfp4_a4::swiglu_quantized`] reads its rows from `node`.
+pub fn normed_sums<'a>(ctx: &'a Context, node: Tensor<'a>, row: i64, width: i64) -> Tensor<'a> {
+    ctx.reinterpret(
+        ctx.view_1d(node, 4 * row * width, 0),
+        types::F32,
+        [row, width, 1, 1],
+    )
+}
+
 /// [`all_reduce_add`] with `norm` computed from the sums in the same kernel ([`Norm`]): `x`
 /// and `res` F32 `[row, n]`.
 pub fn all_reduce_add_norm<'a>(
@@ -156,6 +191,10 @@ pub fn all_reduce_add_norm<'a>(
         norm.w.elements(),
         row as usize,
         "tp all-reduce: the norm's weight"
+    );
+    assert!(
+        !norm.a4,
+        "tp all-reduce: the W4A4 rows in micro finishes only"
     );
     let x = if x.is_contiguous() { x } else { ctx.cont(x) };
     let res = if res.is_contiguous() {
@@ -278,6 +317,11 @@ pub(super) unsafe fn norm_host(
     // SAFETY: the caller's.
     unsafe {
         let w = std::slice::from_raw_parts(nm.w as *const f32, row);
+        if nm.a4 {
+            let (eps, rw) = (nm.eps, (t0, width));
+            crate::model::nvfp4_a4::rms_quant_host(ys, w, eps, row, rw, base);
+            return;
+        }
         let aux = base.add(4 * row * width);
         crate::model::fp8_act::rms_norm_host(ys, w, nm.eps, row, (t0, width), aux, nm.bf16);
     }
@@ -844,16 +888,34 @@ pub(super) mod cuda {
         eps: f32,
         row: usize,
         out: crate::model::fp8_act::SumNormOut,
+        /// [`super::Norm::a4`]: the node's address, the piece's first token and the node's
+        /// tokens (the sums at `out.xs`, the rest of `out` unused).
+        a4: Option<(usize, usize, usize)>,
     }
 
     /// [`NormAt`] of the tokens from `at` in a normed node at `base` of `width` tokens of `row`
     /// values ([`super::norm_layout`]).
     fn norm_at(nm: &super::NormParams, base: usize, row: usize, width: usize, at: usize) -> NormAt {
+        if nm.a4 {
+            return NormAt {
+                w: nm.w as *const f32,
+                eps: nm.eps,
+                row,
+                out: crate::model::fp8_act::SumNormOut {
+                    xs: (base + 4 * row * at) as *mut f32,
+                    out: std::ptr::null_mut(),
+                    scales: std::ptr::null_mut(),
+                    bf: std::ptr::null_mut(),
+                },
+                a4: Some((base, at, width)),
+            };
+        }
         let (b_at, q_at, _) = super::norm_layout(row, width, nm.bf16);
         NormAt {
             w: nm.w as *const f32,
             eps: nm.eps,
             row,
+            a4: None,
             out: crate::model::fp8_act::SumNormOut {
                 xs: (base + 4 * row * at) as *mut f32,
                 out: (base + q_at + row * at) as *mut u8,
@@ -1672,6 +1734,25 @@ pub(super) mod cuda {
                 // An all-reduce's piece is all of its values.
                 let res = res.map(|r| r as *const f32);
                 match norm {
+                    Some(nm) if nm.a4.is_some() => {
+                        let (base, at, width) = nm.a4.expect("an A4 norm");
+                        let srcs: Vec<*const c_void> = srcs.iter().map(|&p| p.cast()).collect();
+                        let code = crate::model::nvfp4_a4::sum_rms_quant(
+                            &srcs,
+                            bf16,
+                            res,
+                            (nm.w, nm.eps),
+                            nm.out.xs,
+                            base as *mut u8,
+                            (nm.row, at, mine.1 / nm.row, width),
+                            stream,
+                        );
+                        if code != 0 {
+                            return Err(format!(
+                                "tp all-reduce: the sum's W4A4 norm: error {code}"
+                            ));
+                        }
+                    }
                     Some(nm) => {
                         let srcs: Vec<*const c_void> = srcs.iter().map(|&p| p.cast()).collect();
                         let code = crate::model::fp8_act::sum_rms_norm(

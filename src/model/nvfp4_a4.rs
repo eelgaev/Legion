@@ -104,6 +104,15 @@ static A4_QUANT: ExternalOp = ExternalOp {
     cuda: None,
 };
 
+static A4_SUM_QUANT: ExternalOp = ExternalOp {
+    name: "nvfp4_a4_sum_quant",
+    cpu: cpu_sum_quant,
+    #[cfg(feature = "cuda")]
+    cuda: Some(cuda::sum_quant),
+    #[cfg(not(feature = "cuda"))]
+    cuda: None,
+};
+
 /// Bytes per 64-weight NVFP4 block: four sub-block scales and 32 bytes of codes.
 const BLOCK_BYTES: i64 = 36;
 
@@ -301,6 +310,112 @@ fn layout(out: usize, rows: i64, k: i64, plan: usize) -> ([usize; 4], usize) {
     let dec = scales + up((rows * s_ld) as usize);
     let plan_at = dec + up(rows as usize * 4);
     ([codes, scales, dec, plan_at], plan_at + plan * 4)
+}
+
+/// Byte offsets in a node that holds the F32 sums of `width` tokens of `k` values first and
+/// then their norm's quantized rows (a tensor-parallel finish with [`crate::tp_net::Norm`]'s
+/// `a4`, #1133; [`sum_rms_quant_op`]): the codes, the scales and the decode scales as the ops'
+/// scratch lays them out ([`layout`]), after the sums; and the node's bytes.
+pub(crate) fn normed_layout(k: i64, width: i64) -> ([usize; 3], usize) {
+    let base = ((4 * k * width) as usize).div_ceil(256) * 256;
+    let ([codes, scales, dec, end], _) = layout(0, width, k, 0);
+    ([base + codes, base + scales, base + dec], base + end)
+}
+
+/// The quantized rows of [`swiglu_norm`]'s CPU reference for the tokens `t0..` (their sums
+/// `ys`, `k` values each) of a node of `width` tokens at `base` ([`normed_layout`]): the rows
+/// normed by `w` as ggml's CPU ops norm them, then [`quantize`]d (padding zero).
+///
+/// # Safety
+/// `base` holds [`normed_layout`]'s bytes; `ys` is at most `width - t0` rows.
+pub(crate) unsafe fn rms_quant_host(
+    ys: &[f32],
+    w: &[f32],
+    eps: f32,
+    k: usize,
+    (t0, width): (usize, usize),
+    base: *mut u8,
+) {
+    let ([codes, scales, dec], _) = normed_layout(k as i64, width as i64);
+    let (q_ld, s_ld) = q_strides(k as i64);
+    let (q_ld, s_ld) = (q_ld as usize, s_ld as usize);
+    for (i, x) in ys.chunks_exact(k).enumerate() {
+        let t = t0 + i;
+        let q = quantize(&rms_norm_row(x, w, eps));
+        // SAFETY: the caller's: row `t` of each part is inside the node.
+        unsafe {
+            let c = base.add(codes + t * q_ld);
+            std::ptr::write_bytes(c, 0, q_ld);
+            std::ptr::copy_nonoverlapping(q.codes.as_ptr(), c, q.codes.len());
+            let s = base.add(scales + t * s_ld);
+            std::ptr::write_bytes(s, 0, s_ld);
+            std::ptr::copy_nonoverlapping(q.scales.as_ptr(), s, q.scales.len());
+            (base.add(dec + 4 * t) as *mut f32).write_unaligned(q.dec);
+        }
+    }
+}
+
+/// The sum of `srcs` (F32 `[k, n]` each, 1 to 7, in order) plus `res`, and the norm by `w`
+/// (F32 `[k]`) of the sums quantized, as a tensor-parallel finish with [`crate::tp_net::Norm`]'s
+/// `a4` computes them (#1133; tests): I8 bytes laid out as [`normed_layout`] says, the sums
+/// first. On CUDA the finish's kernel ([`sum_rms_quant`]); [`swiglu_quantized`] reads it.
+#[doc(hidden)]
+pub fn sum_rms_quant_op<'a>(
+    ctx: &'a Context,
+    srcs: &[Tensor<'a>],
+    res: Tensor<'a>,
+    w: Tensor<'a>,
+    eps: f32,
+) -> Tensor<'a> {
+    let [k, n, _, _] = res.ne();
+    assert!(
+        (1..=7).contains(&srcs.len())
+            && srcs
+                .iter()
+                .chain([&res])
+                .all(|t| t.ty() == types::F32 && t.ne() == [k, n, 1, 1] && t.is_contiguous())
+            && w.ty() == types::F32
+            && w.ne() == [k, 1, 1, 1],
+        "nvfp4 a4 sum quant: F32 [k, n] partials and residual, an F32 [k] weight"
+    );
+    let (_, total) = normed_layout(k, n);
+    let mut args = srcs.to_vec();
+    args.extend([res, w]);
+    ctx.external_with(
+        &A4_SUM_QUANT,
+        types::I8,
+        [total as i64, 1, 1, 1],
+        &args,
+        &[srcs.len() as i32, eps.to_bits() as i32],
+    )
+}
+
+/// The CPU implementation of [`sum_rms_quant_op`] (one thread).
+unsafe fn cpu_sum_quant(dst: &ffi::ggml_tensor, ith: usize, _nth: usize) {
+    if ith != 0 {
+        return;
+    }
+    let [n_src, eps, ..] = external_params(dst);
+    let n_src = n_src as usize;
+    // SAFETY: a node made by `sum_rms_quant_op`: contiguous F32 host tensors as checked there.
+    unsafe {
+        let res = &*dst.src[n_src];
+        let (k, n) = (res.ne[0] as usize, res.ne[1] as usize);
+        let mut ys = values(&*dst.src[0], k * n);
+        for i in 1..n_src {
+            for (y, v) in ys.iter_mut().zip(values(&*dst.src[i], k * n)) {
+                *y += v;
+            }
+        }
+        for (y, r) in ys.iter_mut().zip(values(res, k * n)) {
+            *y += r;
+        }
+        let w = values(&*dst.src[n_src + 1], k);
+        let base = dst.data as *mut u8;
+        std::ptr::write_bytes(base, 0, dst.ne[0] as usize);
+        std::ptr::copy_nonoverlapping(ys.as_ptr(), base as *mut f32, k * n);
+        rms_quant_host(&ys, &w, f32::from_bits(eps as u32), k, (0, n), base);
+    }
 }
 
 /// The ops' activation quantization alone (tests): `x` `[k, rows]` (F32 or BF16) to I8 bytes
@@ -872,6 +987,73 @@ pub fn swiglu_norm<'a>(
     swiglu_with(ctx, wg, wu, x, sg, su, Some((nw, eps)), false)
 }
 
+/// [`swiglu_norm`] of the tokens `at..at + rows` of a node `q` that holds the sums of `width`
+/// tokens and their norm's quantized rows already ([`normed_layout`]: a tensor-parallel finish
+/// with [`crate::tp_net::Norm`]'s `a4`, or [`sum_rms_quant_op`]), the GEMM alone: the bits of
+/// [`swiglu_norm`] of those sums with that norm (the same codes, scales and decode scales into
+/// the same GEMM at the same batch), BF16 `[m, rows]`.
+#[allow(clippy::too_many_arguments)]
+pub fn swiglu_quantized<'a>(
+    ctx: &'a Context,
+    wg: Tensor<'a>,
+    wu: Tensor<'a>,
+    q: Tensor<'a>,
+    (at, rows, width): (i64, i64, i64),
+    sg: Option<Tensor<'a>>,
+    su: Option<Tensor<'a>>,
+) -> Tensor<'a> {
+    assert!(
+        super::nvfp4_mm::supports(wg)
+            && super::nvfp4_mm::supports(wu)
+            && wg.ne() == wu.ne()
+            && wg.nb() == wu.nb()
+            && wg.ne()[2] == 1,
+        "unsupported NVFP4 gate / up {:?} {:?}",
+        wg.ne(),
+        wu.ne()
+    );
+    let [k, m, _, _] = wg.ne();
+    let (_, bytes) = normed_layout(k, width);
+    assert!(
+        q.ty() == types::I8 && q.is_contiguous() && q.elements() >= bytes,
+        "NVFP4 W4A4 SwiGLU: a normed node of {width} tokens of {k}"
+    );
+    assert!(
+        at >= 0 && rows > 0 && at + rows <= width,
+        "NVFP4 W4A4 SwiGLU: tokens {at}..{} of {width}",
+        at + rows
+    );
+    for s in [sg, su].into_iter().flatten() {
+        assert_eq!(
+            (s.ty(), s.ne()),
+            (types::F32, [1, 1, 1, 1]),
+            "a per-tensor scale"
+        );
+    }
+    let mut args = vec![wg, wu, q];
+    args.extend(sg);
+    args.extend(su);
+    let params = [
+        sg.is_some() as i32,
+        su.is_some() as i32,
+        0,
+        0,
+        0,
+        1,
+        at as i32,
+        rows as i32,
+        width as i32,
+    ];
+    let node = ctx.external_with(&A4_SWIGLU, types::BF16, [m * rows, 1, 1, 1], &args, &params);
+    ctx.view_2d(node, [m, rows], m as usize * 2, 0)
+}
+
+/// The tokens and the node's [`swiglu_quantized`] reads: `(at, rows, width)` when the node is
+/// one (its params `pre` set).
+fn quantized_part(p: &[i32]) -> Option<(usize, usize, usize)> {
+    (p[5] != 0).then(|| (p[6] as usize, p[7] as usize, p[8] as usize))
+}
+
 /// The longest row [`swiglu_norm`]'s CUDA kernel normalizes (its rows sit in shared memory).
 pub const RMS_MAX_K: i64 = 8192;
 
@@ -1242,8 +1424,9 @@ unsafe fn cpu_mm_id_weighted(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
 
 /// The CPU implementation of [`swiglu`].
 unsafe fn cpu_swiglu(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
-    let [has_g, has_u, has_norm, eps, gelu, ..] = external_params(dst);
-    // SAFETY: a node made by `swiglu_with`: host tensors, x contiguous.
+    let p = external_params(dst);
+    let [has_g, has_u, has_norm, eps, gelu, ..] = p;
+    // SAFETY: a node made by `swiglu_with` (or `swiglu_quantized`): host tensors, x contiguous.
     unsafe {
         let (wg, wu, x) = (&*dst.src[0], &*dst.src[1], &*dst.src[2]);
         let value = |on: i32, i: usize| {
@@ -1256,8 +1439,28 @@ unsafe fn cpu_swiglu(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
         let sg = value(has_g, 3);
         let su = value(has_u, 3 + has_g as usize);
         let (k, m) = (wg.ne[0] as usize, wg.ne[1] as usize);
-        let n = (x.ne[1] * x.ne[2] * x.ne[3]) as usize;
-        let xq = if has_norm != 0 {
+        let part = quantized_part(&p);
+        let n = match part {
+            Some((_, rows, _)) => rows,
+            None => (x.ne[1] * x.ne[2] * x.ne[3]) as usize,
+        };
+        let xq = if let Some((at, rows, width)) = part {
+            let ([codes, scales, dec], _) = normed_layout(k as i64, width as i64);
+            let (q_ld, s_ld) = q_strides(k as i64);
+            let base = x.data as *const u8;
+            (at..at + rows)
+                .map(|t| {
+                    let at = |off: usize, len: usize| {
+                        std::slice::from_raw_parts(base.add(off), len).to_vec()
+                    };
+                    dequantize(&Quantized {
+                        codes: at(codes + t * q_ld as usize, k / 2),
+                        scales: at(scales + t * s_ld as usize, k / 16),
+                        dec: (base.add(dec + 4 * t) as *const f32).read_unaligned(),
+                    })
+                })
+                .collect()
+        } else if has_norm != 0 {
             let nw = values(&*dst.src[3 + (has_g + has_u) as usize], k);
             let eps = f32::from_bits(eps as u32);
             values(x, k * n)
@@ -1452,6 +1655,8 @@ pub(crate) unsafe fn sendable_shape(t: *const ffi::ggml_tensor) -> (usize, usize
 
 #[cfg(feature = "cuda")]
 pub(crate) use cuda::mul_mat_to;
+#[cfg(feature = "cuda")]
+pub(crate) use cuda::sum_rms_quant;
 
 #[cfg(feature = "cuda")]
 mod cuda {
@@ -1929,14 +2134,183 @@ mod cuda {
         }
     }
 
-    pub(super) unsafe fn swiglu(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
-        let [has_g, has_u, has_norm, eps, gelu, ..] = external_params(dst);
-        // SAFETY: a node made by `swiglu_with`, tensors in device memory of the stream's
+    /// `legion_nvfp4_a4_sum` of `src/cuda/sm120/nvfp4_a4.cu`.
+    #[repr(C)]
+    struct SumArgs {
+        srcs: [*const c_void; 8],
+        res: *const f32,
+        w: *const f32,
+        xs: *mut f32,
+        q: *mut u8,
+        s: *mut u8,
+        d: *mut f32,
+        q_ld: i64,
+        s_ld: i64,
+        n_src: i32,
+        src_bf16: i32,
+        k: i32,
+        eps: f32,
+    }
+
+    #[repr(C)]
+    struct Dim3 {
+        x: u32,
+        y: u32,
+        z: u32,
+    }
+
+    unsafe extern "C" {
+        static legion_nvfp4_a4_sum_rms_quant_256: *const c_void;
+        static legion_nvfp4_a4_sum_rms_quant_1024: *const c_void;
+        fn cudaLaunchKernel(
+            func: *const c_void,
+            grid: Dim3,
+            block: Dim3,
+            args: *mut *mut c_void,
+            shared: usize,
+            stream: *mut c_void,
+        ) -> i32;
+    }
+
+    /// The finish of a tensor-parallel all-reduce with the post-attention norm in the W4A4
+    /// quantization (#1133, [`crate::tp_net::Norm`]'s `a4`): the sums of `srcs` (1 to 8, rank
+    /// order; F32, or BF16 with `src_bf16`) plus `res` for tokens `at..at + rows` of a node of
+    /// `width` tokens of `k` values at `base` ([`normed_layout`]), to `xs` (the sums of token
+    /// `at`; `tp_net.cu`'s bits), and the codes, scales and decode scales of their norm by `w`
+    /// (F32 `[k]`) into the node: [`rms_norm_quantize`]'s bits on those sums, without reading
+    /// them back. 0 on success, 1 for a shape it does not take, 2 for a launch error.
+    ///
+    /// # Safety
+    /// Device pointers on the stream's device: `srcs` and `res` of `k * rows` values, `w` of
+    /// `k`, `xs` and `base` (the node's [`normed_layout`] bytes) writable.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn sum_rms_quant(
+        srcs: &[*const c_void],
+        src_bf16: bool,
+        res: Option<*const f32>,
+        (w, eps): (*const f32, f32),
+        xs: *mut f32,
+        base: *mut u8,
+        (k, at, rows, width): (usize, usize, usize, usize),
+        stream: *mut c_void,
+    ) -> i32 {
+        if srcs.is_empty()
+            || srcs.len() > 8
+            || !k.is_multiple_of(64)
+            || k as i64 > RMS_MAX_K
+            || rows > u32::MAX as usize
+        {
+            return 1;
+        }
+        if rows == 0 {
+            return 0;
+        }
+        let ([codes, scales, dec], _) = normed_layout(k as i64, width as i64);
+        let (q_ld, s_ld) = q_strides(k as i64);
+        let mut a = SumArgs {
+            srcs: [std::ptr::null(); 8],
+            res: res.unwrap_or(std::ptr::null()),
+            w,
+            xs,
+            // SAFETY: offsets inside the node (the caller's).
+            q: unsafe { base.add(codes + at * q_ld as usize) },
+            s: unsafe { base.add(scales + at * s_ld as usize) },
+            d: unsafe { base.add(dec + 4 * at) as *mut f32 },
+            q_ld,
+            s_ld,
+            n_src: srcs.len() as i32,
+            src_bf16: i32::from(src_bf16),
+            k: k as i32,
+            eps,
+        };
+        a.srcs[..srcs.len()].copy_from_slice(srcs);
+        // As `legion_nvfp4_a4_rms_quant_launch` picks the block.
+        // SAFETY: link-time constants of the kernels' host stubs.
+        let kernel = unsafe {
+            if k < 1024 {
+                legion_nvfp4_a4_sum_rms_quant_256
+            } else {
+                legion_nvfp4_a4_sum_rms_quant_1024
+            }
+        };
+        let mut argv = [(&raw mut a).cast::<c_void>()];
+        let dim = |x| Dim3 { x, y: 1, z: 1 };
+        // SAFETY: the caller's; the kernel reads `a` from the launch's copy.
+        let code = unsafe {
+            cudaLaunchKernel(
+                kernel,
+                dim(rows as u32),
+                dim(256),
+                argv.as_mut_ptr(),
+                k * 4,
+                stream,
+            )
+        };
+        if code == 0 { 0 } else { 2 }
+    }
+
+    pub(super) unsafe fn sum_quant(
+        dst: &ffi::ggml_tensor,
+        stream: *mut c_void,
+    ) -> Result<(), String> {
+        let [n_src, eps, ..] = external_params(dst);
+        let n_src = n_src as usize;
+        // SAFETY: a node made by `sum_rms_quant_op`, tensors in device memory of the stream's
         // device.
+        let code = unsafe {
+            let res = &*dst.src[n_src];
+            let (k, n) = (res.ne[0] as usize, res.ne[1] as usize);
+            let srcs: Vec<*const c_void> = (0..n_src)
+                .map(|i| (*dst.src[i]).data as *const c_void)
+                .collect();
+            sum_rms_quant(
+                &srcs,
+                false,
+                Some(res.data as *const f32),
+                (
+                    (*dst.src[n_src + 1]).data as *const f32,
+                    f32::from_bits(eps as u32),
+                ),
+                dst.data as *mut f32,
+                dst.data as *mut u8,
+                (k, 0, n, n),
+                stream,
+            )
+        };
+        match code {
+            0 => Ok(()),
+            1 => Err("unsupported NVFP4 W4A4 sum norm".into()),
+            e => Err(format!("nvfp4 a4 sum rms quant: CUDA error {e}")),
+        }
+    }
+
+    pub(super) unsafe fn swiglu(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
+        let p = external_params(dst);
+        let [has_g, has_u, has_norm, eps, gelu, ..] = p;
+        // SAFETY: a node made by `swiglu_with` (or `swiglu_quantized`), tensors in device
+        // memory of the stream's device.
         let (wg, wu, x) = unsafe { (&*dst.src[0], &*dst.src[1], &*dst.src[2]) };
-        let (k, m, n) = (wg.ne[0], wg.ne[1], x.ne[1] * x.ne[2] * x.ne[3]);
+        let part = quantized_part(&p);
+        let (k, m) = (wg.ne[0], wg.ne[1]);
+        let n = match part {
+            Some((_, rows, _)) => rows as i64,
+            None => x.ne[1] * x.ne[2] * x.ne[3],
+        };
         let out_bytes = (m * n) as usize * 2;
-        let xq = if has_norm != 0 {
+        let xq = if let Some((at, _, width)) = part {
+            // The rows a finish quantized (`normed_layout`), from the part's first token.
+            let ([codes, scales, dec], _) = normed_layout(k, width as i64);
+            let (q_ld, s_ld) = q_strides(k);
+            let base = x.data as *const u8;
+            // SAFETY: offsets inside the node (`swiglu_quantized` checked its size).
+            unsafe {
+                (
+                    base.add(codes + at * q_ld as usize),
+                    base.add(scales + at * s_ld as usize),
+                    base.add(dec + 4 * at) as *const f32,
+                )
+            }
+        } else if has_norm != 0 {
             // SAFETY: the norm weight follows the scales (see `swiglu_norm`).
             let nw = unsafe { &*dst.src[3 + (has_g + has_u) as usize] };
             let eps = f32::from_bits(eps as u32);

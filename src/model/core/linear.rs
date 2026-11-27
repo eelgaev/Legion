@@ -117,6 +117,11 @@ pub struct FfnFusion<'a> {
     /// `(x, w, eps)` when the FFN's input is `mul(rms_norm(x, eps), w)`: the norm then rides
     /// in the W4A4 activations' quantization.
     pub norm: Option<(Tensor<'a>, Tensor<'a>, f32)>,
+    /// With `norm`, `(node, at, width)` when a tensor-parallel finish quantized that norm's
+    /// rows already ([`crate::tp_net::Norm::a4`], #1133): the input's tokens are tokens `at..`
+    /// of the finish's `node` of `width` tokens, and the W4A4 SwiGLU reads them from there
+    /// ([`crate::model::nvfp4_a4::swiglu_quantized`]). Only where [`Linear::a4_swiglu_norm`].
+    pub quant: Option<(Tensor<'a>, i64, i64)>,
 }
 
 /// The model's per-tensor matmul policy (see the module docs).
@@ -570,6 +575,43 @@ impl Linear {
         self.swiglu_ffn_fused(ctx, gate, up, down, x, FfnFusion::default())
     }
 
+    /// Whether the SwiGLU FFN of these weights over `n` tokens runs fused
+    /// ([`Self::swiglu_ffn_fused`] does not answer `None`).
+    fn swiglu_fits(
+        &self,
+        gate: (&str, Tensor<'_>, Option<Tensor<'_>>),
+        up: (&str, Tensor<'_>, Option<Tensor<'_>>),
+        down: (&str, Tensor<'_>, Option<Tensor<'_>>),
+        n: i64,
+    ) -> bool {
+        let fits = |(name, w, s): (&str, Tensor<'_>, Option<Tensor<'_>>)| {
+            self.w4a16(name, w, s, n) && w.ne()[2] == 1
+        };
+        fits(gate)
+            && fits(up)
+            && fits(down)
+            && gate.1.ne() == up.1.ne()
+            && gate.1.nb() == up.1.nb()
+            && down.1.ne()[0] == gate.1.ne()[1]
+    }
+
+    /// Whether [`Self::swiglu_ffn_fused`] of these weights over `n` tokens, with
+    /// [`FfnFusion::norm`] `(h, nw, _)`, runs the W4A4 SwiGLU with that norm in its
+    /// quantization ([`crate::model::nvfp4_a4::swiglu_norm`]), so that [`FfnFusion::quant`]
+    /// takes its place (#1133).
+    pub fn a4_swiglu_norm(
+        &self,
+        gate: (&str, Tensor<'_>, Option<Tensor<'_>>),
+        up: (&str, Tensor<'_>, Option<Tensor<'_>>),
+        down: (&str, Tensor<'_>, Option<Tensor<'_>>),
+        n: i64,
+        (h, nw): (Tensor<'_>, Tensor<'_>),
+    ) -> bool {
+        self.swiglu_fits(gate, up, down, n)
+            && self.w4a4(gate.1, n, false)
+            && crate::model::nvfp4_a4::rms_norm_fits(h, nw)
+    }
+
     /// [`Self::swiglu_ffn`] with what [`FfnFusion`] asks fused into the W4A4 kernels (other
     /// kernels: ggml's ops for it, the same bits).
     pub fn swiglu_ffn_fused<'a>(
@@ -582,25 +624,21 @@ impl Linear {
         fusion: FfnFusion<'a>,
     ) -> Option<Tensor<'a>> {
         let n: i64 = x.ne()[1..].iter().product();
-        let fits = |(name, w, s): (&str, Tensor<'_>, Option<Tensor<'_>>)| {
-            self.w4a16(name, w, s, n) && w.ne()[2] == 1
-        };
         let with_res = |out: Tensor<'a>| match fusion.res {
             Some(r) => ctx.add(out, r),
             None => out,
         };
-        if !(fits(gate)
-            && fits(up)
-            && fits(down)
-            && gate.1.ne() == up.1.ne()
-            && gate.1.nb() == up.1.nb()
-            && down.1.ne()[0] == gate.1.ne()[1])
-        {
+        if !self.swiglu_fits(gate, up, down, n) {
             return None;
         }
         if self.w4a4(gate.1, n, false) {
             use crate::model::nvfp4_a4;
             let act = match fusion.norm {
+                Some((h, nw, _)) if nvfp4_a4::rms_norm_fits(h, nw) && fusion.quant.is_some() => {
+                    let (q, at, width) = fusion.quant.expect("the finish's rows");
+                    let part = (at, n, width);
+                    nvfp4_a4::swiglu_quantized(ctx, gate.1, up.1, q, part, gate.2, up.2)
+                }
                 Some((h, nw, eps)) if nvfp4_a4::rms_norm_fits(h, nw) => {
                     nvfp4_a4::swiglu_norm(ctx, gate.1, up.1, h, nw, eps, gate.2, up.2)
                 }

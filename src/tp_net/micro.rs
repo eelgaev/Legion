@@ -469,7 +469,12 @@ pub fn finish_add_norm<'a>(
     } else {
         ctx.cont(res)
     };
-    let (_, _, total) = super::op::norm_layout(row as usize, width as usize, norm.bf16);
+    // Its node's tokens are its own ([`norm_of`]).
+    assert!(
+        !norm.a4 || (at == 0 && width == cols && into.is_none()),
+        "tp micro exchange: the W4A4 norm of a whole output"
+    );
+    let total = super::op::norm_bytes(row as usize, width as usize, &norm);
     let mut args = vec![s.x, s.node, res, norm.w];
     if let Some(t) = into {
         assert_eq!(
@@ -504,7 +509,11 @@ pub(crate) fn norm_of(dst: &ffi::ggml_tensor) -> Option<(super::op::NormParams, 
         (*dst.src[3]).data as usize
     })?;
     // SAFETY: as above; its source 0 is the partial.
-    let row = unsafe { (*dst.src[0]).ne[0] as usize };
+    let (row, cols) = unsafe { ((*dst.src[0]).ne[0] as usize, (*dst.src[0]).ne[1] as usize) };
+    if nm.a4 {
+        // A whole output (`finish_add_norm`).
+        return Some((nm, cols));
+    }
     Some((nm, super::op::norm_width(dst.ne[0] as usize, row, nm.bf16)))
 }
 

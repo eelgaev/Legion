@@ -5051,6 +5051,27 @@ impl Model {
         self.lmm_add(ctx, il, "ffn_down.weight", act, fusion.res)
     }
 
+    /// Whether [`Self::ffn_fused`] of layer `il` over `n` tokens normed from `h` by `nw`
+    /// ([`linear::FfnFusion::norm`]) runs the W4A4 SwiGLU with the norm in its quantization
+    /// ([`linear::Linear::a4_swiglu_norm`]), so that a finish can quantize the rows for it
+    /// ([`linear::FfnFusion::quant`], #1133).
+    pub(crate) fn a4_swiglu_norm(&self, il: usize, n: i64, h: Tensor<'_>, nw: Tensor<'_>) -> bool {
+        let weight = |name: &str| {
+            let name = format!("blk.{il}.{name}");
+            let scale = linear::scale_name(&name).and_then(|s| self.w(&s).ok());
+            self.w(&name).ok().map(|w| (w, scale, name))
+        };
+        let (Some((wg, sg, gn)), Some((wu, su, un)), Some((wd, sd, dn))) = (
+            weight("ffn_gate.weight"),
+            weight("ffn_up.weight"),
+            weight("ffn_down.weight"),
+        ) else {
+            return false;
+        };
+        self.linear
+            .a4_swiglu_norm((&gn, wg, sg), (&un, wu, su), (&dn, wd, sd), n, (h, nw))
+    }
+
     /// Layer `il`'s GeGLU FFN (`ffn_gate`, `ffn_up`, `ffn_down`) over `h` as
     /// [`linear::Linear::geglu_ffn_fused`] runs it, or `None` where it does not (the caller
     /// builds the unfused chain).

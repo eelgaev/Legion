@@ -34,6 +34,17 @@ fn attention_halves_are_on_unless_the_debug_variable_is_0() {
     assert!(!attn_of(Some(" 0 ")));
 }
 
+/// The post-attention norm in the mixer sums by default; `LEGION_DEBUG_QWEN35_TP_POST_NORM=0`
+/// in the SwiGLUs.
+#[test]
+fn post_norm_folds_unless_the_debug_variable_is_0() {
+    assert!(post_norm_of(None));
+    assert!(post_norm_of(Some("1")));
+    assert!(post_norm_of(Some("")));
+    assert!(!post_norm_of(Some("0")));
+    assert!(!post_norm_of(Some(" 0 ")));
+}
+
 /// Four FFN parts by default; `LEGION_DEBUG_QWEN35_TP_PARTS=2` the halves, at most four.
 #[test]
 fn parts_default_to_three_and_stay_in_range() {
