@@ -14,7 +14,8 @@ fn cut_rounds_up_to_the_kernels_tile() {
     assert_eq!(cut(8192, 10, 4096), 4100);
     assert_eq!(cut(8192, 21, 4096), 4116);
     assert_eq!(cut(8192, 10, 4100), 4100);
-    assert_eq!(cut(8192, 21, 4095), 4116);
+    assert_eq!(cut(8192, 21, 4095), 4095);
+    assert_eq!(cut(8192, 21, 4094), 4095);
     assert_eq!(cut(16384, 21, 8192), 8211);
     // Past the group: the first part is the whole group, the second nothing.
     assert_eq!(cut(25, 21, 13), 21);
