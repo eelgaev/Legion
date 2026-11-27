@@ -103,6 +103,13 @@ fn bf16_set() -> bool {
     *ON.get_or_init(|| std::env::var("LEGION_DEBUG_INK_BF16_SET").map_or(true, |v| v.trim() != "0"))
 }
 
+/// Whether the FFN norm of a layer with NVFP4 experts also writes its BF16 rows (#1221 r8):
+/// unless `LEGION_DEBUG_INK_RMS_BF16=0` (A/B runs: a cast node, as round 7).
+fn rms_bf16() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LEGION_DEBUG_INK_RMS_BF16").map_or(true, |v| v.trim() != "0"))
+}
+
 /// [`experts_flags`] given the environment's value.
 pub(crate) fn experts_flags_of(env: Option<&str>) -> u32 {
     const ALL: u32 = EXPERTS_TILE | EXPERTS_PLAN | EXPERTS_BF16_ACT | EXPERTS_TILE_GU;
@@ -935,7 +942,24 @@ impl Model {
             h = self.ink_control(ctx, ip, 3, h, slice(ctx, m, 3))?;
             tap.tap("ffn_ctrl", il, h);
         }
-        let h = self.ink_rms(ctx, ip, "ffn_norm.weight", h)?;
+        // NVFP4 gate and up rows round the normed input to BF16: the norm writes those rows
+        // too (#1221 r8; the same bits, one cast kernel less).
+        let nvfp4 = self
+            .w(&format!("blk.{ip}.ffn_gate_up_exps.weight"))
+            .is_ok_and(|w| w.ty() == types::NVFP4);
+        let both = (nvfp4 && !tap.on && rms_bf16())
+            .then(|| {
+                let w = self.lw(ip, "ffn_norm.weight").ok()?;
+                ops::rms_bf16(ctx, h, Some(w), self.hp.rms_eps)
+            })
+            .flatten();
+        let h = match both {
+            Some((f, b)) => {
+                ctx.set_shared_cast(f, types::BF16, b);
+                f
+            }
+            None => self.ink_rms(ctx, ip, "ffn_norm.weight", h)?,
+        };
         tap.tap("ffn_inp_norm", il, h);
         let y = self.ink_moe(pass, il, ip, h)?;
         tap.tap("ffn_moe_out", il, y);

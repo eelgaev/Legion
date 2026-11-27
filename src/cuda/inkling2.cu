@@ -145,18 +145,16 @@ __device__ __forceinline__ float sigmoidf_(float x) {
     return 1.f / (1.f + __expf(-x));
 }
 
-// FP8 E4M3 (FN) to float.
+// FP8 E4M3 (FN) to float: (8 + m) 2^(e - 10), m 2^-9 when e is 0. #1221 r8: the float's bits
+// put together (exponent e + 120, the mantissa's top 3 bits m) instead of ldexpf, the same
+// values (exact either way, all normal floats).
 __device__ __forceinline__ float e4m3(uint8_t b) {
-    const int s = b >> 7, e = (b >> 3) & 15, m = b & 7;
-    float v;
-    if (e == 0) {
-        v = ldexpf((float) m, -9);
-    } else if (e == 15 && m == 7) {
+    const uint32_t a = b & 0x7f, e = a >> 3, m = a & 7;
+    float          v = e ? __uint_as_float((e + 120) << 23 | m << 20) : (float) m * 0.001953125f;
+    if (a == 0x7f) {
         v = 0.f;  // NaN in E4M3FN; checkpoints have none
-    } else {
-        v = ldexpf((float) (8 + m), e - 10);
     }
-    return s ? -v : v;
+    return b & 0x80 ? -v : v;
 }
 
 // ---- ink_mix: params ns, eps; sources: ns states [e, n], then the queries [e, nq] ----
@@ -358,11 +356,19 @@ template <int K> __global__ void __launch_bounds__(RMS_THREADS) rms_kernel(const
     sum = warp_sum(lane < RMS_THREADS / 32 ? part[lane] : 0.0);
     const float s = rms_scale(sum, d, pf(a.params[0]));
     float *     o = (float *) a.dst + r * d;
+    // params[2] (#1221 r8): the rows rounded to BF16 too, after all the F32 rows (gridDim.x of
+    // them), as ggml's cast of them would be.
+    __nv_bfloat16 * ob =
+        a.params[2] ? (__nv_bfloat16 *) ((float *) a.dst + gridDim.x * d) + r * d : nullptr;
 #pragma unroll
     for (int k = 0; k < K; k++) {
         const int64_t i = threadIdx.x + (int64_t) k * RMS_THREADS;
         if (i < d) {
-            o[i] = w ? xv[k] * s * wv[k] : xv[k] * s;
+            const float v = w ? xv[k] * s * wv[k] : xv[k] * s;
+            o[i]          = v;
+            if (ob) {
+                ob[i] = __float2bfloat16_rn(v);
+            }
         }
     }
 }
@@ -1600,6 +1606,187 @@ __global__ void mm_id_vec_kernel(const A a) {
     }
 }
 
+// mm_id_stage_kernel (#1221 r8), mm_id_vec_kernel's work for Q8_0 and MXFP8 stacks with the
+// weights staged: mm_id_vec's loads are a byte a lane (32 bytes a warp load, and MXFP8's scale
+// a load of its own), which kept the decode at ~140 GB/s (Q8_0) and ~90 GB/s (MXFP8) where the
+// NVFP4 experts read ~250. Here a warp copies its rows MMS_G groups at a time into its own ring
+// of MMS_STAGES shared-memory stages, 16-byte copies (cp.async on sm_80+) running MMS_STAGES - 1
+// stages ahead of the sums, which then read the bytes and scales from shared memory. Lane l
+// still sums w[32 gi + l] · x[32 gi + l] over the groups in order, the same value for each
+// weight (mm_w's), and warp_sum adds the lanes: the same bits as mm_id_vec.
+// A stage of a row is the 16-byte chunks covering its MMS_G groups (a Q8_0 row is only 2-byte
+// aligned): each chunk holds at least one of the row's bytes, so it is inside the stack's
+// memory. MXFP8: the weights' chunks, then the scales' at MMS_SCALES.
+constexpr int MMS_ROWS   = 4;
+constexpr int MMS_G      = 8;
+constexpr int MMS_STAGES = 4;
+constexpr int MMS_WARPS  = 8;
+constexpr int MMS_SCALES = (MMS_G * 34 + 15 + 15) / 16 * 16;
+constexpr int MMS_BYTES  = MMS_SCALES + (MMS_G * 4 + 12 + 15) / 16 * 16;
+static_assert((MMS_G * 32 + 15 + 15) / 16 * 16 <= MMS_SCALES, "MXFP8 weights before the scales");
+static_assert(MMS_SCALES / 16 <= 28 && (MMS_BYTES - MMS_SCALES) / 16 <= 4,
+              "a row's chunks: weights lanes 0-27, scales lanes 28-31");
+static_assert(MMS_ROWS == MM_VEC_ROWS && MMS_WARPS * 32 == MM_THREADS, "the vec kernel's grid");
+
+// A 16-byte copy from global memory to shared memory, asynchronous on sm_80+ (and then waited
+// for by mms_wait), a plain load and store below.
+__device__ __forceinline__ void mms_copy(void * s, const void * g) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const uint32_t sa = (uint32_t) __cvta_generic_to_shared(s);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(sa),
+                 "l"(__cvta_generic_to_global(g))
+                 : "memory");
+#else
+    *(uint4 *) s = *(const uint4 *) g;
+#endif
+}
+
+__device__ __forceinline__ void mms_commit() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+#endif
+}
+
+// Until at most N of this thread's committed stages are still in flight.
+template <int N> __device__ __forceinline__ void mms_wait() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory");
+#endif
+}
+
+// The 16-byte chunks covering [p, p + n): the first chunk's address, and p's offset in it.
+__device__ __forceinline__ const char * mms_chunks(const char * p, int64_t n, int & off,
+                                                   int & nch) {
+    const uintptr_t a = (uintptr_t) p, a0 = a & ~(uintptr_t) 15;
+    off = (int) (a - a0);
+    nch = (int) ((a + n - a0 + 15) / 16);
+    return (const char *) a0;
+}
+
+template <int TY>
+__device__ __forceinline__ void mm_id_stage(const A & a, char (*ring)[MMS_ROWS][MMS_BYTES]) {
+    static_assert(TY == TYPE_Q8_0 || TY == TYPE_I8, "staged stacks");
+    constexpr int BPG = TY == TYPE_Q8_0 ? 34 : 32;
+    const int64_t k = a.src_ne[0][0], E = a.src_ne[0][2];
+    const int64_t m = a.ne[0], n_used = a.ne[1];
+    const int64_t nx = a.src_ne[1][1];
+    const int64_t pr = blockIdx.y;
+    const int     lane = threadIdx.x % 32;
+    const int64_t r0 = ((int64_t) blockIdx.x * MMS_WARPS + threadIdx.x / 32) * MMS_ROWS;
+    if (r0 >= m) {
+        return;
+    }
+    const int     nr  = (int) min((int64_t) MMS_ROWS, m - r0);
+    float *       out = (float *) a.dst + pr * m + r0;
+    const int32_t e   = ((const int32_t *) src(a, 2))[pr];
+    if (e < 0 || e >= E) {
+        if (lane < nr) {
+            out[lane] = 0.f;
+        }
+        return;
+    }
+    const float * xr =
+        (const float *) src(a, 1) + (pr / n_used * nx + (nx == 1 ? 0 : pr % n_used)) * k;
+    const int64_t ng  = k / 32;
+    const int     nst = (int) ((ng + MMS_G - 1) / MMS_G);
+    const char *  w   = src(a, 0) + e * a.src_nb[0][2] + r0 * a.src_nb[0][1];
+    const float * sc  = TY == TYPE_I8 ? (const float *) src(a, 3) + (e * m + r0) * ng : nullptr;
+    // Stage st of row rr: its groups' bytes (and scales) and where they start in the stage.
+    auto issue = [&](int st) {
+        char(*buf)[MMS_BYTES] = ring[st % MMS_STAGES];
+        const int64_t g0 = (int64_t) st * MMS_G, gn = min((int64_t) MMS_G, ng - g0);
+#pragma unroll
+        for (int rr = 0; rr < MMS_ROWS; rr++) {
+            if (rr < nr) {
+                int          off, nch;
+                const char * c = mms_chunks(w + rr * a.src_nb[0][1] + g0 * BPG, gn * BPG, off, nch);
+                if (lane < nch) {
+                    mms_copy(buf[rr] + 16 * lane, c + 16 * lane);
+                }
+                if constexpr (TY == TYPE_I8) {
+                    const char * s =
+                        mms_chunks((const char *) (sc + rr * ng + g0), gn * 4, off, nch);
+                    const int j = lane - (32 - 4);
+                    if (j >= 0 && j < nch) {
+                        mms_copy(buf[rr] + MMS_SCALES + 16 * j, s + 16 * j);
+                    }
+                }
+            }
+        }
+    };
+    float acc[MMS_ROWS] = {};
+#pragma unroll
+    for (int s = 0; s < MMS_STAGES - 1; s++) {
+        if (s < nst) {
+            issue(s);
+        }
+        mms_commit();
+    }
+    for (int st = 0; st < nst; st++) {
+        mms_wait<MMS_STAGES - 2>();
+        // Every lane's copies of stage st are in, and every lane is done with stage st - 1,
+        // whose buffers stage st + MMS_STAGES - 1 takes.
+        __syncwarp();
+        if (st + MMS_STAGES - 1 < nst) {
+            issue(st + MMS_STAGES - 1);
+        }
+        mms_commit();
+        char(*buf)[MMS_BYTES] = ring[st % MMS_STAGES];
+        const int64_t g0 = (int64_t) st * MMS_G;
+        const int     gn = (int) min((int64_t) MMS_G, ng - g0);
+        int           woff[MMS_ROWS], soff[MMS_ROWS];
+#pragma unroll
+        for (int rr = 0; rr < MMS_ROWS; rr++) {
+            int nch;
+            mms_chunks(w + rr * a.src_nb[0][1] + g0 * BPG, 0, woff[rr], nch);
+            soff[rr] = 0;
+            if constexpr (TY == TYPE_I8) {
+                mms_chunks((const char *) (sc + rr * ng + g0), 0, soff[rr], nch);
+            }
+        }
+#pragma unroll
+        for (int g = 0; g < MMS_G; g++) {
+            if (g < gn) {
+                const float xv = xr[(g0 + g) * 32 + lane];
+#pragma unroll
+                for (int rr = 0; rr < MMS_ROWS; rr++) {
+                    float v = 0.f;
+                    if (rr < nr) {
+                        const char * b = buf[rr] + woff[rr] + g * BPG;
+                        if constexpr (TY == TYPE_Q8_0) {
+                            const __half d = *(const __half *) b;
+                            v = __half2float(d) * (float) ((const int8_t *) (b + 2))[lane];
+                        } else {
+                            const float s =
+                                *(const float *) (buf[rr] + MMS_SCALES + soff[rr] + 4 * g);
+                            v = e4m3(((const uint8_t *) b)[lane]) * s;
+                        }
+                    }
+                    acc[rr] += v * xv;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int rr = 0; rr < MMS_ROWS; rr++) {
+        const float s = warp_sum(acc[rr]);
+        if (lane == 0 && rr < nr) {
+            out[rr] = s;
+        }
+    }
+}
+
+__global__ void __launch_bounds__(MMS_WARPS * 32) mm_id_stage_kernel(const A a) {
+    pdl_wait();
+    __shared__ __align__(16) char ring[MMS_WARPS][MMS_STAGES][MMS_ROWS][MMS_BYTES];
+    char(*mine)[MMS_ROWS][MMS_BYTES] = ring[threadIdx.x / 32];
+    if (a.src_type[0] == TYPE_Q8_0) {
+        mm_id_stage<TYPE_Q8_0>(a, mine);
+    } else {
+        mm_id_stage<TYPE_I8>(a, mine);
+    }
+}
+
 // ---- ink_softcap: params cap; source x [v, n]; dst [n_out, n] ----
 __global__ void softcap_kernel(const A a) {
     pdl_wait();
@@ -1616,7 +1803,7 @@ __global__ void softcap_kernel(const A a) {
 
 }  // namespace
 
-extern "C" const void * const legion_ink_kernels[25] = {
+extern "C" const void * const legion_ink_kernels[26] = {
     reinterpret_cast<const void *>(&mix_kernel),
     reinterpret_cast<const void *>(&ctrl_in_kernel),
     reinterpret_cast<const void *>(&ctrl_out_kernel),
@@ -1642,4 +1829,5 @@ extern "C" const void * const legion_ink_kernels[25] = {
     reinterpret_cast<const void *>(&rms_kernel<16>),
     reinterpret_cast<const void *>(&kv_kernel),
     reinterpret_cast<const void *>(&clip2_kernel),
+    reinterpret_cast<const void *>(&mm_id_stage_kernel),
 };
