@@ -142,14 +142,13 @@ __device__ __forceinline__ uint32_t q40_s8x16(const uint32_t nib) {
 //   + e), word w (= 2 v + f) is at word ((nt / 2 * 8 + g) * 4 + v) * 4 + nt % 2 * 2 + f of the
 //   tile's 1024 words of block kb (yq[(kb * n_pad + 128 jt) * 8 ..]); the scale at r * 32 + 2 nt
 //   + e of its 128 (yd[kb * n_pad + 128 jt ..]).
-// Grid (n, k / 256), 64 threads.
-template <int LAYOUT> __global__ void __launch_bounds__(64) q40_quant(const legion_q40_mm p) {
-    const int i0  = blockIdx.y * 256 + threadIdx.x * 4;
-    const int col = blockIdx.x;
-    const float * src = p.x + (long long) col * p.x_ld + i0;
-    const float4 xi = (reinterpret_cast<uintptr_t>(src) & 15) == 0
-        ? *reinterpret_cast<const float4 *>(src)
-        : make_float4(src[0], src[1], src[2], src[3]);
+//
+// q40_quant4 writes values i0 .. i0 + 3 (xi) of column col: the 8 lanes of an aligned group of 8
+// in a warp hold one 32-value block (i0 / 4 = the lane's index mod 8 within it), every lane of
+// the warp calls it.
+template <int LAYOUT>
+__device__ __forceinline__ void q40_quant4(int * yq, float * yd, const int n_pad, const float4 xi, const int col,
+                                           const int i0) {
     float amax = fabsf(xi.x);
     amax = fmaxf(amax, fabsf(xi.y));
     amax = fmaxf(amax, fabsf(xi.z));
@@ -167,22 +166,152 @@ template <int LAYOUT> __global__ void __launch_bounds__(64) q40_quant(const legi
     const float d = 1.0f / d_inv;
 
     const int kb = i0 / 32;
-    const int s  = threadIdx.x % 8;
+    const int s  = (i0 / 4) % 8;
     const int w  = s < 4 ? 2 * s : 2 * (s - 4) + 1;
     long long qat, dat;
     if constexpr (LAYOUT == 0) {
-        const long long at = (long long) kb * p.n_pad + col;
+        const long long at = (long long) kb * n_pad + col;
         qat = at * 8 + w;
         dat = at;
     } else {
-        const long long tile = (long long) kb * p.n_pad + (col & ~127);
+        const long long tile = (long long) kb * n_pad + (col & ~127);
         const int c = col & 127, nt = c / 8, g = c % 8;
         qat = tile * 8 + ((nt / 2 * 8 + g) * 4 + w / 2) * 4 + nt % 2 * 2 + w % 2;
         dat = tile + (g / 2) * 32 + 2 * nt + g % 2;
     }
-    p.yq[qat] = *reinterpret_cast<const int *>(&q);
+    yq[qat] = *reinterpret_cast<const int *>(&q);
     if (s == 0) {
-        p.yd[dat] = __half2float(__float2half(d));
+        yd[dat] = __half2float(__float2half(d));
+    }
+}
+
+// 4 floats from src: one 16-byte load where aligned.
+__device__ __forceinline__ float4 q40_load4(const float * src) {
+    return (reinterpret_cast<uintptr_t>(src) & 15) == 0 ? *reinterpret_cast<const float4 *>(src)
+                                                        : make_float4(src[0], src[1], src[2], src[3]);
+}
+
+// Grid (n, k / 256), 64 threads.
+template <int LAYOUT> __global__ void __launch_bounds__(64) q40_quant(const legion_q40_mm p) {
+    const int i0  = blockIdx.y * 256 + threadIdx.x * 4;
+    const int col = blockIdx.x;
+    const float4 xi = q40_load4(p.x + (long long) col * p.x_ld + i0);
+    q40_quant4<LAYOUT>(p.yq, p.yd, p.n_pad, xi, col, i0);
+}
+
+}  // namespace
+
+extern "C" {
+
+// The launch arguments of the fused quantizations (src/model/q40_mm.rs, `QuantParams`): the
+// layout-1 quantization of the values of a producer that ggml would write as F32, from its
+// inputs, without that F32 tensor.
+struct legion_q40_quant {
+    const float * x;   // GEGLU: the gate; norm: the residual (columns x_ld floats apart)
+    const float * x2;  // GEGLU: the up values (columns x2_ld floats apart); norm: its weight [k]
+    float * y;         // the F32 values quantized, columns of k floats (null: not written)
+    int * yq;          // as legion_q40_mm's
+    float * yd;
+    long long x_ld;
+    long long x2_ld;
+    float eps;         // norm: rms_norm's
+    int k;
+    int n;
+    int n_pad;
+};
+
+}
+
+namespace {
+
+// ggml-cuda's tanh GELU (ggml_cuda_op_gelu_single in ggml-cuda/unary.cuh, MIT): the same
+// expressions under the same --use_fast_math, as nvfp4_mm's GeGLU epilogue.
+__device__ __forceinline__ float q40_gelu(float x) {
+    const float GELU_COEF_A    = 0.044715f;
+    const float SQRT_2_OVER_PI = 0.79788456080286535587989211986876f;
+    return 0.5f * x * (1.0f + tanhf(SQRT_2_OVER_PI * x * (1.0f + GELU_COEF_A * x * x)));
+}
+
+// The quantization of ggml's geglu_split(gate, up) (unary_gated_op_kernel with op_gelu, MIT:
+// `op(x[j0]) * g[j1]`, the gate x and the up values g), each value as ggml's kernel computes it,
+// then q40_quant4's. Grid (n, k / 256), 64 threads, as q40_quant.
+__global__ void __launch_bounds__(64) q40_quant_geglu(const legion_q40_quant p) {
+    const int i0  = blockIdx.y * 256 + threadIdx.x * 4;
+    const int col = blockIdx.x;
+    const float4 g = q40_load4(p.x + (long long) col * p.x_ld + i0);
+    const float4 u = q40_load4(p.x2 + (long long) col * p.x2_ld + i0);
+    float4 v;
+    v.x = q40_gelu(g.x) * u.x;
+    v.y = q40_gelu(g.y) * u.y;
+    v.z = q40_gelu(g.z) * u.z;
+    v.w = q40_gelu(g.w) * u.w;
+    if (p.y) {
+        *reinterpret_cast<float4 *>(p.y + (long long) col * p.k + i0) = v;
+    }
+    q40_quant4<1>(p.yq, p.yd, p.n_pad, v, col, i0);
+}
+
+// Threads of a column of q40_quant_norm, and its warps.
+constexpr int Q40_NQ_THREADS = 256, Q40_NQ_WARPS = Q40_NQ_THREADS / 32;
+
+__device__ __forceinline__ float q40_warp_sum(float x) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        x += __shfl_xor_sync(0xffffffff, x, offset, 32);
+    }
+    return x;
+}
+
+// The quantization of mul(rms_norm(x, eps), w), one CTA of 256 threads a column. The values
+// are ggml-cuda's rms_norm_f32<BLOCK, do_multiply> (norm.cu, MIT; BLOCK 1024 from 1024 values
+// on, 256 below, as its launcher picks), as src/cuda/sm120/nvfp4_a4.cu's nvfp4_a4_rms_quant
+// computes them: thread tid of BLOCK sums the squares of values tid, tid + BLOCK, ... in that
+// order, block_reduce (warp sums, then warp 0's sum of them), mean tmp / k, scale
+// rsqrtf(mean + eps), y = scale * x * w; here lane l of warp wp plays thread
+// l + 32 * (wp + 8 j) of BLOCK. Then each value again from x (the same expression) into
+// q40_quant4, 4 a thread (a warp's 128 values a pass: k % 256 == 0 keeps the passes whole).
+template <int BLOCK> __global__ void __launch_bounds__(Q40_NQ_THREADS) q40_quant_norm(const legion_q40_quant p) {
+    constexpr int V = BLOCK / Q40_NQ_THREADS;
+    static_assert(V * Q40_NQ_THREADS == BLOCK, "block");
+    __shared__ float red[32];
+    const int col = blockIdx.x;
+    const float * xr = p.x + (long long) col * p.x_ld;
+    const float * w  = p.x2;
+    const int k = p.k, lane = threadIdx.x % 32, wp = threadIdx.x / 32;
+    float part[V];
+#pragma unroll
+    for (int j = 0; j < V; j++) {
+        const int tid = lane + 32 * (wp + Q40_NQ_WARPS * j);
+        float tmp = 0.0f;
+        for (int c = tid; c < k; c += BLOCK) {
+            const float xi = xr[c];
+            tmp += xi * xi;
+        }
+        part[j] = q40_warp_sum(tmp);
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int j = 0; j < V; j++) {
+            red[wp + Q40_NQ_WARPS * j] = part[j];
+        }
+    }
+    __syncthreads();
+    float tmp = lane < BLOCK / 32 ? red[lane] : 0.0f;
+    tmp = q40_warp_sum(tmp);
+    const float mean  = tmp / k;
+    const float scale = rsqrtf(mean + p.eps);
+    for (int i0 = threadIdx.x * 4; i0 < k; i0 += Q40_NQ_THREADS * 4) {
+        const float4 xi = q40_load4(xr + i0);
+        const float4 wi = q40_load4(w + i0);
+        float4 v;
+        v.x = scale * xi.x * wi.x;
+        v.y = scale * xi.y * wi.y;
+        v.z = scale * xi.z * wi.z;
+        v.w = scale * xi.w * wi.w;
+        if (p.y) {
+            *reinterpret_cast<float4 *>(p.y + (long long) col * k + i0) = v;
+        }
+        q40_quant4<1>(p.yq, p.yd, p.n_pad, v, col, i0);
     }
 }
 
@@ -580,5 +709,14 @@ extern const legion_q40_kernel legion_q40_mm_table[] = {
       q40_128::SMEM, q40_128::THREADS, q40_128::BM, q40_128::BN, "128 x 128 tiles" },
 };
 extern const int legion_q40_mm_table_len = sizeof(legion_q40_mm_table) / sizeof(legion_q40_mm_table[0]);
+
+// The fused quantizations (src/model/q40_mm.rs, `cuda::q40_quant`), all in layout 1 (the op's
+// matmul's): the GEGLU's (grid (n, k / 256), 64 threads), the norm's of fewer than 1024 values
+// and of 1024 or more (grid n, 256 threads). Their arguments are a legion_q40_quant.
+extern const void * const legion_q40_quant_kernels[3] = {
+    reinterpret_cast<const void *>(&q40_quant_geglu),
+    reinterpret_cast<const void *>(&q40_quant_norm<256>),
+    reinterpret_cast<const void *>(&q40_quant_norm<1024>),
+};
 
 }
