@@ -71,7 +71,7 @@ struct LaunchConfig {
 const ATTR_PROGRAMMATIC_STREAM_SERIALIZATION: c_int = 6;
 
 /// The kernels of `legion_ink_kernels`.
-const KERNELS: usize = 25;
+const KERNELS: usize = 23;
 
 unsafe extern "C" {
     /// The kernels as the CUDA runtime knows them (their host stubs' addresses), in
@@ -151,10 +151,6 @@ enum Kernel {
     MmIdVec,
     /// A controller's gain and forget products and output at small steps (#1221 r5).
     CtrlGate,
-    /// `mix_reg_kernel<3>` and `<9>`: `Mix`'s sums with a thread's 3 or 9 elements in
-    /// registers, for small steps (#1221 r6).
-    MixReg3,
-    MixReg9,
     /// `rms_kernel<1>`, `<3>`, `<9>`, `<16>`: `glm_rms_norm`'s sums, a thread's elements in
     /// registers (#1221 r6).
     Rms1,
@@ -163,8 +159,7 @@ enum Kernel {
     Rms16,
 }
 
-/// `MIX_THREADS` and `RMS_THREADS` of the kernels.
-const MIX_THREADS: i64 = 256;
+/// `RMS_THREADS` of the kernels.
 const RMS_THREADS: i64 = 256;
 
 /// `MIX_STATES`, `MIX_QUERIES`, `CONV_TAPS` of the kernels.
@@ -292,30 +287,14 @@ pub(super) unsafe fn mix(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
     // SAFETY: a node of this op, in device memory.
     unsafe {
         launch(
-            mix_kernel(dst),
+            Kernel::Mix,
             "ink_mix",
             dst,
             dim(dst.ne[1], 1),
-            MIX_THREADS as u32,
+            256,
             0,
             stream,
         )
-    }
-}
-
-/// `ink_mix`'s kernel: a register one for steps of up to `MIX_REG_TOKENS` tokens and rows up
-/// to `MIX_REG_MAX` (unless params[3] says no), else `mix_kernel`. Both make the same sums in
-/// the same order.
-fn mix_kernel(dst: &ffi::ggml_tensor) -> Kernel {
-    if external_params(dst)[3] == 0
-        || dst.ne[1] > super::MIX_REG_TOKENS
-        || dst.ne[0] > super::MIX_REG_MAX
-    {
-        Kernel::Mix
-    } else if cdiv(dst.ne[0], MIX_THREADS) <= 3 {
-        Kernel::MixReg3
-    } else {
-        Kernel::MixReg9
     }
 }
 

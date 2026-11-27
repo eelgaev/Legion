@@ -52,39 +52,7 @@ pub const MAX_TAPS: usize = 8;
 /// weight (`eps`), scored per token against each query column of `query` (F32 `[e, nq]`) as
 /// `normed · q / sqrt(e)`, and the normed states summed with the softmax of their scores. F32
 /// `[e, n, nq]`: query `j`'s mix of every token is the contiguous slice `j`.
-///
-/// On CUDA, steps of up to [`MIX_REG_TOKENS`] tokens and rows up to [`MIX_REG_MAX`] wide run a
-/// kernel that keeps a thread's elements in registers (#1221 r6): the same sums in the same
-/// order as the other's, the same bits.
 pub fn mix<'a>(ctx: &'a Context, states: &[Tensor<'a>], query: Tensor<'a>, eps: f32) -> Tensor<'a> {
-    mix_with(ctx, states, query, eps, true)
-}
-
-/// The most tokens [`mix`]'s register kernel takes: small steps (its registers would cost a
-/// prompt step's blocks occupancy).
-pub const MIX_REG_TOKENS: i64 = 32;
-/// The widest rows [`mix`]'s register kernel takes: 9 elements a thread of 256.
-pub const MIX_REG_MAX: i64 = 2304;
-
-/// Whether `t` is a leaf with data of its own (no view): in Inkling-2's graphs, a weight the
-/// ops below only read, never a cache or a state, so their kernels read it before waiting for
-/// the kernel ahead (#1221 r6). A computed or viewed tensor waits.
-fn weight(t: Tensor<'_>) -> bool {
-    // SAFETY: a tensor of a live context.
-    unsafe {
-        let r = &*t.raw();
-        r.op == ffi::ggml_op_GGML_OP_NONE && r.view_src.is_null()
-    }
-}
-
-/// [`mix`], with `reg` false keeping CUDA on the kernel of prompt steps (the tests' reference).
-pub(super) fn mix_with<'a>(
-    ctx: &'a Context,
-    states: &[Tensor<'a>],
-    query: Tensor<'a>,
-    eps: f32,
-    reg: bool,
-) -> Tensor<'a> {
     assert!(
         !states.is_empty() && states.len() <= MAX_STATES,
         "ink_mix: {} states",
@@ -107,13 +75,19 @@ pub(super) fn mix_with<'a>(
         types::F32,
         [e, n, nq, 1],
         &args,
-        &[
-            states.len() as i32,
-            eps.to_bits() as i32,
-            i32::from(weight(query)),
-            i32::from(reg),
-        ],
+        &[states.len() as i32, eps.to_bits() as i32],
     )
+}
+
+/// Whether `t` is a leaf with data of its own (no view): in Inkling-2's graphs, an RMS norm's
+/// weight, never a cache or a state, so [`rms`]'s kernel reads it before waiting for the kernel
+/// ahead (#1221 r6). A computed or viewed weight waits.
+fn weight(t: Tensor<'_>) -> bool {
+    // SAFETY: a tensor of a live context.
+    unsafe {
+        let r = &*t.raw();
+        r.op == ffi::ggml_op_GGML_OP_NONE && r.view_src.is_null()
+    }
 }
 
 /// The widest rows [`rms`] takes as its own op; wider ones are `glm_rms_norm`.

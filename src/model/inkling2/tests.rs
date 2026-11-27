@@ -1686,10 +1686,10 @@ fn first_diff(what: &str, x: &[f32], y: &[f32], d: usize) -> Option<String> {
     ))
 }
 
-/// #1221 r6: `ink_rms` gives `glm_rms_norm`'s bits (with no weight, a weight, and a weight
-/// that is a view, which its kernel reads after the wait), and `ink_mix`'s register kernel
-/// gives `mix_kernel`'s, over the widths, row counts, states and queries around theirs.
-fn rms_and_mix_keep_the_bits(b: &mut Backend) {
+/// #1221 r6: `ink_rms` gives `glm_rms_norm`'s bits, with no weight, a weight that is a view
+/// (its kernel reads it after the wait) and a leaf weight (read before it), over widths and
+/// row counts around Inkling-2's.
+fn rms_keeps_the_bits(b: &mut Backend) {
     use crate::ggml::ComputeAllocator;
     let mut s = 0x2545_f491_4f6c_dd1du64;
     let mut vals = move |n: usize, amp: f32| -> Vec<f32> {
@@ -1708,10 +1708,16 @@ fn rms_and_mix_keep_the_bits(b: &mut Backend) {
             for wk in 0..3 {
                 let ctx = Context::new(16, 16);
                 let x = ctx.new_tensor(types::F32, &[d, rows]).as_input();
-                // No weight, a view (read after the wait), a leaf (read before it).
-                let wbig = ctx.new_tensor(types::F32, &[d + 32]).as_input();
-                let wl = ctx.new_tensor(types::F32, &[d]).as_input();
-                let w = [None, Some(ctx.view_1d(wbig, d, 0)), Some(wl)][wk];
+                // Only tensors the graph reads get memory: the weight's own one per case.
+                let wsrc = match wk {
+                    0 => None,
+                    1 => Some(ctx.new_tensor(types::F32, &[d + 32]).as_input()),
+                    _ => Some(ctx.new_tensor(types::F32, &[d]).as_input()),
+                };
+                let w = match wk {
+                    1 => wsrc.map(|t| ctx.view_1d(t, d, 0)),
+                    _ => wsrc,
+                };
                 let old = glm_ops::rms_norm(&ctx, x, w, 1e-6).as_output();
                 let new = ops::rms(&ctx, x, w, 1e-6).as_output();
                 let mut graph = ctx.new_graph(16);
@@ -1721,8 +1727,9 @@ fn rms_and_mix_keep_the_bits(b: &mut Backend) {
                 ctx.alloc_graph(&graph, ComputeAllocator::new(b.buffer_type()))
                     .unwrap();
                 x.set_f32(&vals((d * rows) as usize, 3.0));
-                wbig.set_f32(&vals((d + 32) as usize, 1.5));
-                wl.set_f32(&vals(d as usize, 1.5));
+                if let Some(t) = wsrc {
+                    t.set_f32(&vals(t.ne()[0] as usize, 1.5));
+                }
                 b.compute(&graph).unwrap();
                 let (p, q) = (old.to_f32(), new.to_f32());
                 assert!(q.iter().any(|&v| v != 0.0), "ink_rms d {d}: an output");
@@ -1734,63 +1741,19 @@ fn rms_and_mix_keep_the_bits(b: &mut Backend) {
             }
         }
     }
-    for e in [2304i64, 768, 96, 1000, 2000] {
-        for (ns, nq) in [(1usize, 1i64), (2, 3), (5, 4), (8, 4), (8, 1)] {
-            for n in [1i64, 4, 32] {
-                for view in [false, true] {
-                    let ctx = Context::new(32, 32);
-                    let states: Vec<_> = (0..ns)
-                        .map(|_| ctx.new_tensor(types::F32, &[e, n]).as_input())
-                        .collect();
-                    let qbig = ctx.new_tensor(types::F32, &[e, nq + 1]).as_input();
-                    let q = if view {
-                        ctx.view_2d(qbig, [e, nq], qbig.nb()[1], 0)
-                    } else {
-                        ctx.new_tensor(types::F32, &[e, nq]).as_input()
-                    };
-                    let old = ops::mix_with(&ctx, &states, q, MIX_EPS, false).as_output();
-                    let new = ops::mix_with(&ctx, &states, q, MIX_EPS, true).as_output();
-                    let mut graph = ctx.new_graph(32);
-                    for t in [old, new] {
-                        graph.expand(t);
-                    }
-                    ctx.alloc_graph(&graph, ComputeAllocator::new(b.buffer_type()))
-                        .unwrap();
-                    for (i, st) in states.iter().enumerate() {
-                        st.set_f32(&vals((e * n) as usize, 1.0 + i as f32));
-                    }
-                    qbig.set_f32(&vals((e * (nq + 1)) as usize, 2.0));
-                    if !view {
-                        q.set_f32(&vals((e * nq) as usize, 2.0));
-                    }
-                    b.compute(&graph).unwrap();
-                    let (p, r) = (old.to_f32(), new.to_f32());
-                    assert!(r.iter().any(|&v| v != 0.0), "ink_mix e {e}: an output");
-                    let what = format!(
-                        "ink_mix e {e}, {ns} states, {nq} queries, {n} tokens, view {view}"
-                    );
-                    if let Some(line) = first_diff(&what, &p, &r, e as usize) {
-                        eprintln!("first mismatch: {line}");
-                        bad.push(line);
-                    }
-                }
-            }
-        }
-    }
     assert!(bad.is_empty(), "\n{}", bad.join("\n"));
 }
 
-/// [`rms_and_mix_keep_the_bits`] on the CPU references.
+/// [`rms_keeps_the_bits`] on the CPU references.
 #[test]
-fn rms_and_mix_keep_the_cpu_bits() {
-    rms_and_mix_keep_the_bits(&mut backend());
+fn rms_keeps_the_cpu_bits() {
+    rms_keeps_the_bits(&mut backend());
 }
 
-/// [`rms_and_mix_keep_the_bits`] on the GPU: `rms_kernel` against glm5next.cu's
-/// `rms_norm_kernel`, `mix_reg_kernel` against `mix_kernel`.
+/// [`rms_keeps_the_bits`] on the GPU: `rms_kernel` against glm5next.cu's `rms_norm_kernel`.
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "needs a GPU"]
-fn cuda_rms_and_mix_keep_the_bits() {
-    rms_and_mix_keep_the_bits(&mut gpu_backend());
+fn cuda_rms_keeps_the_bits() {
+    rms_keeps_the_bits(&mut gpu_backend());
 }

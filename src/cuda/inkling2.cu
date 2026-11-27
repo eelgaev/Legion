@@ -289,152 +289,6 @@ __global__ void mix_kernel(const A a) {
     }
 }
 
-// mix_reg_kernel's block (mix_kernel's, as the Rust side launches it).
-constexpr int MIX_THREADS = 256;
-
-// ---- ink_mix for small steps (#1221 r6): mix_kernel's sums and output, every one in its order,
-// over the same 256 threads (thread i's elements i, i + 256, ...), with all of a thread's K
-// elements loaded at once and kept for the output (mix_kernel loads MIX_U at a time and reads
-// the states twice: ~6 memory latencies in a row for a decode step's one block). Queries that
-// are weights (params[2]) are loaded before pdl_wait, while the kernel ahead still runs. The
-// same products and sums as mix_kernel's: the same bits. ----
-template <int K> __global__ void __launch_bounds__(MIX_THREADS) mix_reg_kernel(const A a) {
-    const int     ns  = a.params[0];
-    const float   eps = pf(a.params[1]);
-    const int64_t e = a.ne[0], n = a.ne[1], nq = a.ne[2];
-    const int64_t t = blockIdx.x;
-    constexpr int    NK = 1 + MIX_QUERIES;
-    __shared__ float red[MIX_STATES * NK][32];
-    __shared__ float sc[MIX_STATES][MIX_QUERIES];
-    __shared__ float rs[MIX_STATES];
-    const int64_t step = blockDim.x;
-    float qv[K][MIX_QUERIES];
-    const bool early = a.params[2] != 0;
-    if (early) {
-#pragma unroll
-        for (int u = 0; u < K; u++) {
-            const int64_t i = threadIdx.x + u * step;
-#pragma unroll
-            for (int j = 0; j < MIX_QUERIES; j++) {
-                qv[u][j] = j < nq && i < e
-                               ? ((const float *) (src(a, ns) + j * a.src_nb[ns][1]))[i]
-                               : 0.f;
-            }
-        }
-    }
-    pdl_wait();
-    if (!early) {
-#pragma unroll
-        for (int u = 0; u < K; u++) {
-            const int64_t i = threadIdx.x + u * step;
-#pragma unroll
-            for (int j = 0; j < MIX_QUERIES; j++) {
-                qv[u][j] = j < nq && i < e
-                               ? ((const float *) (src(a, ns) + j * a.src_nb[ns][1]))[i]
-                               : 0.f;
-            }
-        }
-    }
-    float xv[K][MIX_STATES];
-#pragma unroll
-    for (int u = 0; u < K; u++) {
-        const int64_t i = threadIdx.x + u * step;
-#pragma unroll
-        for (int s = 0; s < MIX_STATES; s++) {
-            xv[u][s] = s < ns && i < e
-                           ? ((const float *) (src(a, s) + t * a.src_nb[s][1]))[i]
-                           : 0.f;
-        }
-    }
-    const float inv = rsqrtf((float) e);
-    float       part[MIX_STATES][NK];
-#pragma unroll
-    for (int s = 0; s < MIX_STATES; s++) {
-#pragma unroll
-        for (int k = 0; k < NK; k++) {
-            part[s][k] = 0.f;
-        }
-    }
-#pragma unroll
-    for (int u = 0; u < K; u++) {
-        if (threadIdx.x + u * step < e) {
-#pragma unroll
-            for (int s = 0; s < MIX_STATES; s++) {
-                if (s < ns) {
-                    part[s][0] += xv[u][s] * xv[u][s];
-#pragma unroll
-                    for (int j = 0; j < MIX_QUERIES; j++) {
-                        if (j < nq) {
-                            part[s][1 + j] += xv[u][s] * qv[u][j];
-                        }
-                    }
-                }
-            }
-        }
-    }
-    const int w = threadIdx.x / 32, l = threadIdx.x % 32, nw = blockDim.x / 32;
-#pragma unroll
-    for (int s = 0; s < MIX_STATES; s++) {
-#pragma unroll
-        for (int k = 0; k < NK; k++) {
-            if (s < ns && k <= nq) {
-                const float v = warp_sum(part[s][k]);
-                if (l == 0) {
-                    red[s * NK + k][w] = v;
-                }
-            }
-        }
-    }
-    __syncthreads();
-    for (int s = w; s < ns; s += nw) {
-        const float ss = warp_sum(l < nw ? red[s * NK][l] : 0.f);
-        const float r  = rsqrtf(ss / (float) e + eps);
-        for (int j = 0; j < nq; j++) {
-            const float d = warp_sum(l < nw ? red[s * NK + 1 + j][l] : 0.f);
-            if (l == 0) {
-                sc[s][j] = d * r * inv;
-            }
-        }
-        if (l == 0) {
-            rs[s] = r;
-        }
-    }
-    __syncthreads();
-    if (threadIdx.x < nq) {
-        const int j = threadIdx.x;
-        float     m = sc[0][j];
-        for (int s = 1; s < ns; s++) {
-            m = fmaxf(m, sc[s][j]);
-        }
-        float sum = 0.f;
-        for (int s = 0; s < ns; s++) {
-            sc[s][j] = __expf(sc[s][j] - m);
-            sum += sc[s][j];
-        }
-        for (int s = 0; s < ns; s++) {
-            sc[s][j] = sc[s][j] / sum * rs[s];
-        }
-    }
-    __syncthreads();
-    float * out = (float *) a.dst;
-#pragma unroll
-    for (int u = 0; u < K; u++) {
-        const int64_t i = threadIdx.x + u * step;
-        if (i < e) {
-            for (int j = 0; j < nq; j++) {
-                float o = 0.f;
-#pragma unroll
-                for (int s = 0; s < MIX_STATES; s++) {
-                    if (s < ns) {
-                        o += sc[s][j] * xv[u][s];
-                    }
-                }
-                out[(j * n + t) * e + i] = o;
-            }
-        }
-    }
-}
-
 // rms_kernel's block.
 constexpr int RMS_THREADS = 256;
 
@@ -1546,7 +1400,7 @@ __global__ void softcap_kernel(const A a) {
 
 }  // namespace
 
-extern "C" const void * const legion_ink_kernels[25] = {
+extern "C" const void * const legion_ink_kernels[23] = {
     reinterpret_cast<const void *>(&mix_kernel),
     reinterpret_cast<const void *>(&ctrl_in_kernel),
     reinterpret_cast<const void *>(&ctrl_out_kernel),
@@ -1566,8 +1420,6 @@ extern "C" const void * const legion_ink_kernels[25] = {
     reinterpret_cast<const void *>(&attn_kernel<4, ATTN_DECODE_ROWS>),
     reinterpret_cast<const void *>(&mm_id_vec_kernel),
     reinterpret_cast<const void *>(&ctrl_gate_kernel),
-    reinterpret_cast<const void *>(&mix_reg_kernel<3>),
-    reinterpret_cast<const void *>(&mix_reg_kernel<9>),
     reinterpret_cast<const void *>(&rms_kernel<1>),
     reinterpret_cast<const void *>(&rms_kernel<3>),
     reinterpret_cast<const void *>(&rms_kernel<9>),
