@@ -161,9 +161,9 @@ fn off_without_a_gpu() {
 
 #[test]
 fn grid_and_quant_bytes_pad_columns_to_tiles() {
-    assert_eq!(grid(21504, 4096), (32, 168));
-    assert_eq!(grid(5376, 4095), (32, 42));
-    assert_eq!(grid(5376, 4097), (33, 42));
+    assert_eq!(grid(21504, 4096), (32, 336));
+    assert_eq!(grid(5376, 4095), (32, 84));
+    assert_eq!(grid(5376, 4097), (33, 84));
     assert_eq!(n_padded(4095), 4096);
     assert_eq!(n_padded(513), 640);
     // 672 blocks x 4096 columns x (32 quants + an F32 scale).
@@ -171,19 +171,19 @@ fn grid_and_quant_bytes_pad_columns_to_tiles() {
     assert!(quant_bytes(21504, 4096) <= MAX_QUANT_BYTES);
     // src/cuda/q40_mm.cu's static asserts; two of the op's CTAs (and their 1 KiB each the GPU
     // reserves) fit a GB10 SM's 100 KiB.
-    assert_eq!(SMEM_BYTES, 46464);
+    assert_eq!(SMEM_BYTES, 47616);
     assert_eq!(SMEM_BYTES_V1, 86016);
     assert!(2 * (SMEM_BYTES + 1024) <= 100 << 10);
 }
 
-/// The raster hands every tile to exactly one CTA, for grids whose row tiles are and are not a
-/// multiple of the group, in both versions' groups.
+/// The raster hands every tile to exactly one CTA, for grids whose tiles are and are not a
+/// multiple of the group, in both versions' orders.
 #[test]
 fn tile_of_covers_every_tile_once() {
-    for group in [GROUP, GROUP_V1] {
+    for (group, cols) in [(GROUP, true), (GROUP_V1, false)] {
         for (ntx, nty) in [
-            (32, 168),
-            (32, 42),
+            (32, 336),
+            (32, 84),
             (4, 64),
             (33, 42),
             (1, 1),
@@ -192,7 +192,7 @@ fn tile_of_covers_every_tile_once() {
         ] {
             let mut seen = vec![false; (ntx * nty) as usize];
             for b in 0..ntx * nty {
-                let (it, jt) = tile_of(b, ntx, nty, group);
+                let (it, jt) = tile_of(b, ntx, nty, group, cols);
                 assert!(
                     (0..nty).contains(&it) && (0..ntx).contains(&jt),
                     "{ntx}x{nty}: {b}"
@@ -206,34 +206,37 @@ fn tile_of_covers_every_tile_once() {
     }
 }
 
-/// On the FFN down's grid (32 column tiles x 42 row tiles) a wave of the op's 96 CTAs (two an
-/// SM of a GB10) reads 16 row tiles of the weight and 6 column tiles of the input, the first
-/// version's 48 CTAs 8 and 6, not 48 column tiles of one or two row tiles.
+/// On the FFN down's 4096-column grid a wave of the op's 96 CTAs (two an SM of a GB10; 32 column
+/// tiles x 84 row tiles of 64) reads 24 row tiles of the weight and 4 column tiles of the input,
+/// the first version's 48 CTAs (32 x 42 tiles of 128) 8 and 6, not 48 column tiles of one or
+/// two row tiles.
 #[test]
-fn tile_of_groups_row_tiles() {
-    let wave = |w: i64, ctas: i64, group: i64| {
+fn tile_of_groups_tiles() {
+    let wave = |w: i64, ctas: i64, (ntx, nty): (i64, i64), group: i64, cols: bool| {
         let mut rows = std::collections::BTreeSet::new();
-        let mut cols = std::collections::BTreeSet::new();
+        let mut cs = std::collections::BTreeSet::new();
         for b in w * ctas..(w + 1) * ctas {
-            let (it, jt) = tile_of(b, 32, 42, group);
+            let (it, jt) = tile_of(b, ntx, nty, group, cols);
             rows.insert(it);
-            cols.insert(jt);
+            cs.insert(jt);
         }
-        (rows.len(), cols.len())
+        (rows.len(), cs.len())
     };
-    assert_eq!(wave(0, 96, GROUP), (16, 6));
-    assert_eq!(wave(0, 48, GROUP_V1), (8, 6));
-    assert_eq!(tile_of(0, 32, 42, GROUP), (0, 0));
-    assert_eq!(tile_of(1, 32, 42, GROUP), (1, 0));
-    assert_eq!(tile_of(16, 32, 42, GROUP), (0, 1));
-    // The last group holds 42 - 32 = 10 row tiles.
-    assert_eq!(tile_of(2 * 16 * 32, 32, 42, GROUP), (32, 0));
-    assert_eq!(tile_of(2 * 16 * 32 + 9, 32, 42, GROUP), (41, 0));
-    assert_eq!(tile_of(2 * 16 * 32 + 10, 32, 42, GROUP), (32, 1));
+    assert_eq!(grid(5376, 4096), (32, 84));
+    assert_eq!(wave(0, 96, (32, 84), GROUP, true), (24, 4));
+    assert_eq!(wave(0, 48, (32, 42), GROUP_V1, false), (8, 6));
+    assert_eq!(tile_of(0, 32, 84, GROUP, true), (0, 0));
+    assert_eq!(tile_of(1, 32, 84, GROUP, true), (0, 1));
+    assert_eq!(tile_of(4, 32, 84, GROUP, true), (1, 0));
+    assert_eq!(tile_of(4 * 84, 32, 84, GROUP, true), (0, 4));
+    // At 4097 columns the last group holds 33 - 32 = 1 column tile.
+    assert_eq!(tile_of(8 * 4 * 84, 33, 84, GROUP, true), (0, 32));
+    assert_eq!(tile_of(8 * 4 * 84 + 1, 33, 84, GROUP, true), (1, 32));
     // The first version's: its last group holds 42 - 40 = 2 row tiles.
-    assert_eq!(tile_of(8, 32, 42, GROUP_V1), (0, 1));
-    assert_eq!(tile_of(5 * 8 * 32 + 1, 32, 42, GROUP_V1), (41, 0));
-    assert_eq!(tile_of(5 * 8 * 32 + 2, 32, 42, GROUP_V1), (40, 1));
+    assert_eq!(tile_of(1, 32, 42, GROUP_V1, false), (1, 0));
+    assert_eq!(tile_of(8, 32, 42, GROUP_V1, false), (0, 1));
+    assert_eq!(tile_of(5 * 8 * 32 + 1, 32, 42, GROUP_V1, false), (41, 0));
+    assert_eq!(tile_of(5 * 8 * 32 + 2, 32, 42, GROUP_V1, false), (40, 1));
 }
 
 /// Where src/cuda/q40_mm.cu's `q40_quant<1>` puts word `w` of tile column `c` among a block's
@@ -449,7 +452,7 @@ fn case(backend: &mut Backend, ours: bool, k: i64, rows: i64, n: i64) -> Vec<u8>
     y.bytes()
 }
 
-/// On a GB10 the op, and the first version's kernels, give ggml-cuda's MMQ product bit for bit
+/// On a GB10 every matmul of the table (the op's, the first version's, ...) gives ggml-cuda's MMQ product bit for bit
 /// at Gemma 4 31B's shapes and 512 to 4097 columns, wherever ggml runs a CTA per tile (the
 /// others are ggml's anyway).
 #[cfg(feature = "cuda")]
@@ -497,7 +500,7 @@ fn cuda_q40_mm_is_ggml_bit_for_bit() {
     assert!(moved.iter().all(|m| m.0 == 0), "values moved");
 }
 
-/// The time per call of ggml's MMQ, the first version's kernels and the op at Gemma 4 31B's
+/// The time per call of ggml's MMQ and of every matmul of the table at Gemma 4 31B's
 /// shapes and 4096 columns: 8 calls a graph on two inputs in turn (so every call quantizes),
 /// the second of two runs. The weight is the same for all 8 calls, so it may stay in L2 a
 /// little more than in a model. Each as a share of the GPU's S8 MMA peak ([`mma_peak`]'s).

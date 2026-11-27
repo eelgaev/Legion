@@ -1,7 +1,7 @@
 // Q4_0 prompt matmuls with ggml-cuda's MMQ bits from a pipelined main loop (src/model/q40_mm.rs):
 // the quantization of the F32 input (ggml's quantize_mmq_q8_1 values for a Q4_0 weight), then
-// the matmul, mma.sync m16n8k32 s8 x s8 -> s32 on 128 x 128 output tiles, the weights and the
-// quantized input streamed by cp.async through a three-stage shared-memory ring.
+// the matmul, mma.sync m16n8k32 s8 x s8 -> s32 on output tiles, the weights and the quantized
+// input streamed by cp.async through a shared-memory ring.
 //
 // The bits. For a Q4_0 weight ggml's MMQ (MMA path, sm_75 and newer) loads each block's quants as
 // int8 q - 8 (mmq-load-tiles.cuh, ggml_cuda_mmq_load_tiles_q4_0) and its F16 scale as F32, and
@@ -19,25 +19,22 @@
 // - t = fma(M + C, dA, -M * dA): M * dA is exact (dA has 11 significant bits, M two), so the
 //   FFMA's exact value is C * dA and its one rounding gives fl(C * dA), ggml's FMUL;
 // - sum += t * dB is ggml's FFMA, the blocks in K order.
-// The nibbles' q - 8 as int8 is ((q & 0xF) + 0x78) ^ 0x80 per byte (no carries: 0x78 + 15 <
-// 0x100), the values ggml's __vsub4 gives.
+// The first version takes the nibbles' q - 8 as int8: ((q & 0xF) + 0x78) ^ 0x80 per byte (no
+// carries: 0x78 + 15 < 0x100), the values ggml's __vsub4 gives. The op's takes 16 (q - 8):
+// (q << 4) ^ 0x80 per byte, one LOP3 a word; its MMA's result reads as the float M + 16 C
+// (|16 C| <= 32 * 128 * 127 < 2^22), and t = fma(M + 16 C, dA / 16, -M * dA / 16) has the same
+// exact value C * dA (dA / 16 and M * dA / 16 are exact), so the same one rounding.
 //
-// Layout. A CTA owns rows it * 128 .. and columns jt * 128 .. (tiles in groups of GROUP row
-// tiles, column tiles slowest in a group, so the CTAs of a wave share weight rows and input
-// columns in L2). A stage is SB K blocks: the CTA's weight rows' 18 * SB bytes each (9 copies of
-// 2 * SB bytes a row; rows WRS words apart, so a warp's fragment reads hit distinct banks), the
-// input's quants of the 128 columns (8 words a column a block) and their scales; a three-stage
-// ring.
-//
-// Two configurations (q40_cfg): the op's, 2 K blocks a stage in 45 KB of shared memory and at
-// most 128 registers a thread, so two CTAs share an SM (16 warps to hide the MMAs' and the
-// shared-memory reads' latency, where one CTA of 8 warps left the tensor cores idle most of the
-// time), warps of 16 rows x 128 columns (one A fragment a block), the input in layout 1 (one
-// 16-byte read gives a lane the B fragments of two n8 tiles, another their scales), groups of 16
-// row tiles (a wave of 96 CTAs: 16 row tiles x 6 column tiles, about as many weight bytes as
-// input bytes); and the first version's, 4 K blocks a stage, 84 KB, one CTA an SM, warps of 32
-// rows x 64 columns, layout 0, groups of 8, kept for the timing test (src/model/q40_mm/tests.rs).
-// Both run the same chains, so they give the same bits.
+// The op's matmul (q40_cfg, q40_gemm): 64 x 128 tiles, 4 warps of 32 rows x 64 columns, a
+// two-stage ring of 4 K blocks a stage in 47616 bytes of shared memory, two CTAs an SM (where a
+// CTA waits at its stage's barrier the other's MMAs run); the weights in 16-byte copies; the
+// input in layout 1 (one 16-byte read gives a lane the B fragments of two n8 tiles, another their
+// scales); tiles in groups of 4 column tiles, row tiles slowest in a group (a wave of 96 CTAs: 24
+// row tiles x 4 column tiles, the input's 4 column tiles staying in L2 over the group). The first
+// version's (q40_gemm_v1): 128 x 128 tiles, 8 warps of 32 x 64, a three-stage ring in 86016 bytes,
+// one CTA an SM, 8-byte weight copies, layout 0, groups of 8 row tiles; kept for the timing test
+// (src/model/q40_mm/tests.rs) with a 128 x 128 tile of the op's code. All run the same chains, so
+// they give the same bits.
 
 #include <cuda_fp16.h>
 
@@ -67,58 +64,41 @@ struct legion_q40_mm {
 
 namespace {
 
-constexpr int Q40_BM      = 128;  // tile rows
-constexpr int Q40_BN      = 128;  // tile columns
-constexpr int Q40_STAGES  = 3;
-constexpr int Q40_THREADS = 256;
+// The first version's matmul.
+constexpr int Q40_BM          = 128;  // tile rows
+constexpr int Q40_BN          = 128;  // tile columns
+constexpr int Q40_SB          = 4;    // K blocks a stage
+constexpr int Q40_STAGES      = 3;
+constexpr int Q40_WRS         = 20;   // words a weight row takes in a stage (18 used)
+constexpr int Q40_W_WORDS     = Q40_BM * Q40_WRS;
+constexpr int Q40_Q_WORDS     = Q40_SB * Q40_BN * 8;
+constexpr int Q40_D_WORDS     = Q40_SB * Q40_BN;
+constexpr int Q40_STAGE_WORDS = Q40_W_WORDS + Q40_Q_WORDS + Q40_D_WORDS;
+constexpr int Q40_THREADS     = 256;
 
-// A matmul configuration: SB K blocks a stage, weight rows WRS words apart in a stage (9 * SB / 2
-// used), MINB CTAs an SM, raster groups of GROUP row tiles; the 8 warps are WARPS_M along the rows
-// (16 MT rows each) by 8 / WARPS_M along the columns (8 NT each); the quantized input in layout
-// LAYOUT (q40_quant). In layout 1 a block's 128 scales sit in shared memory as 4 rows of 32, 36
-// words apart (the four 16-byte reads of a warp's lanes hit distinct banks).
-template <int SB_, int WRS_, int MINB_, int GROUP_, int MT_, int LAYOUT_> struct q40_cfg {
-    static constexpr int SB          = SB_;
-    static constexpr int WRS         = WRS_;
-    static constexpr int MINB        = MINB_;
-    static constexpr int GROUP       = GROUP_;
-    static constexpr int MT          = MT_;
-    static constexpr int LAYOUT      = LAYOUT_;
-    static constexpr int WARPS_M     = Q40_BM / (16 * MT);
-    static constexpr int NT          = Q40_BN / 8 / (Q40_THREADS / 32 / WARPS_M);  // n8 tiles a warp
-    static constexpr int D_BL        = LAYOUT == 0 ? Q40_BN : 4 * 36;  // scale words a block
-    static constexpr int W_WORDS     = Q40_BM * WRS;
-    static constexpr int Q_WORDS     = SB * Q40_BN * 8;
-    static constexpr int D_WORDS     = SB * D_BL;
-    static constexpr int STAGE_WORDS = W_WORDS + Q_WORDS + D_WORDS;
-    static constexpr int CP          = 2 * SB;  // bytes a weight copy (9 a row a stage)
-    static constexpr int SMEM        = Q40_STAGES * STAGE_WORDS * 4;
-    static_assert(SB == 2 || SB == 4, "copies of 4 or 8 bytes");
-    static_assert(9 * SB / 2 <= WRS, "a stage's weight row fits");
-    static_assert(LAYOUT == 0 || NT % 2 == 0, "layout 1 reads two n8 tiles at once");
-};
-
-using q40_op = q40_cfg<2, 12, 2, 16, 1, 1>;  // the op's
-using q40_v1 = q40_cfg<4, 20, 1, 8, 2, 0>;   // the first version's
-
-static_assert(q40_op::SMEM == 46464, "src/model/q40_mm.rs SMEM_BYTES");
-static_assert(q40_v1::SMEM == 86016, "src/model/q40_mm.rs SMEM_BYTES_V1");
+static_assert(Q40_STAGES * Q40_STAGE_WORDS * 4 == 86016, "src/model/q40_mm.rs SMEM_BYTES_V1");
 
 // The matmul's helpers: device code for sm_80 and newer only (cp.async).
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 
+constexpr int   Q40_GROUP      = 8;  // row tiles a raster group of the first version
 constexpr int   Q40_MAGIC_BITS = 0x4B400000;
 constexpr float Q40_MAGIC      = 12582912.0f;
 
-// A weight copy of N (4 or 8) bytes.
-template <int N> __device__ __forceinline__ void q40_cpw(void * smem, const void * gmem) {
+__device__ __forceinline__ void q40_cp8(void * smem, const void * gmem) {
     const unsigned s = (unsigned) __cvta_generic_to_shared(smem);
-    asm volatile("cp.async.ca.shared.global [%0], [%1], %2;\n" ::"r"(s), "l"(gmem), "n"(N));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::"r"(s), "l"(gmem));
 }
 
 __device__ __forceinline__ void q40_cp16(void * smem, const void * gmem) {
     const unsigned s = (unsigned) __cvta_generic_to_shared(smem);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(gmem));
+}
+
+// A 16-byte copy of which the first `src` bytes are read and the rest zero-filled.
+__device__ __forceinline__ void q40_cp16z(void * smem, const void * gmem, const int src) {
+    const unsigned s = (unsigned) __cvta_generic_to_shared(smem);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem), "r"(src));
 }
 
 __device__ __forceinline__ void q40_commit() {
@@ -142,6 +122,11 @@ __device__ __forceinline__ void q40_mma(int (&d)[4], const uint32_t (&a)[4], con
 // A word of 4 nibbles (0 .. 15 in the low 4 bits of each byte) as the int8 values q - 8.
 __device__ __forceinline__ uint32_t q40_s8(const uint32_t nib) {
     return ((nib & 0x0F0F0F0Fu) + 0x78787878u) ^ 0x80808080u;
+}
+
+// A word of 4 nibbles (in the high 4 bits of each byte) as the int8 values 16 (q - 8).
+__device__ __forceinline__ uint32_t q40_s8x16(const uint32_t nib) {
+    return (nib & 0xF0F0F0F0u) ^ 0x80808080u;
 }
 
 #endif
@@ -201,70 +186,60 @@ template <int LAYOUT> __global__ void __launch_bounds__(64) q40_quant(const legi
     }
 }
 
-// The matmul of configuration C: a CTA per 128 x 128 tile (grid ntx * nty), 256 threads,
-// C::SMEM bytes of dynamic shared memory.
-template <class C> __global__ void __launch_bounds__(Q40_THREADS, C::MINB) q40_gemm(const legion_q40_mm p) {
+// The first version's matmul: a CTA per 128 x 128 tile (grid ntx * nty), 256 threads, 86016
+// bytes of dynamic shared memory, the input in layout 0.
+__global__ void __launch_bounds__(Q40_THREADS, 1) q40_gemm_v1(const legion_q40_mm p) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    constexpr int SB = C::SB, WRS = C::WRS, GROUP = C::GROUP, CP = C::CP, MT = C::MT, NT = C::NT;
     extern __shared__ __align__(16) uint32_t q40_smem[];
     const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, g = lane / 4, q = lane % 4;
-    const int wm = warp % C::WARPS_M, wn = warp / C::WARPS_M;
+    const int wm = warp % 4, wn = warp / 4;
 
-    // The tile: groups of GROUP row tiles, row tiles fastest within a group.
+    // The tile: groups of Q40_GROUP row tiles, row tiles fastest within a group.
     const int b         = blockIdx.x;
-    const int per_group = GROUP * p.ntx;
+    const int per_group = Q40_GROUP * p.ntx;
     const int grp       = b / per_group;
-    const int r0        = grp * GROUP;
-    const int gsz       = min(GROUP, p.nty - r0);
+    const int r0        = grp * Q40_GROUP;
+    const int gsz       = min(Q40_GROUP, p.nty - r0);
     const int in        = b - grp * per_group;
     const int it        = r0 + in % gsz;
     const int jt        = in / gsz;
     const int row0      = it * Q40_BM;
     const int col0      = jt * Q40_BN;
-    const int nst       = p.k / (32 * SB);
+    const int nst       = p.k / (32 * Q40_SB);
 
-    // This thread's copies, the same every stage: weight row tid / 2's copies 0 .. 4 (even
-    // threads) or 5 .. 8 (odd), the quants' 16 bytes tid of every block, and (the first SB * 32
-    // threads) 16 bytes of the scales.
-    const int    wr = tid / 2, wc0 = (tid % 2) * 5, wcn = tid % 2 ? 4 : 5;
-    const char * wg = (const char *) p.w + (long long) (row0 + wr) * p.w_nb1 + wc0 * CP;
-    const int    ws = wr * WRS + wc0 * (CP / 4);
-    const int  * qg = p.yq + (long long) col0 * 8 + tid * 4;
-    const long long qstep = (long long) p.n_pad * 8;  // words a block
-    const int    dbl = tid / 32, dch = tid % 32;
-    const float * dg = p.yd + (long long) dbl * p.n_pad + col0 + dch * 4;
-    const int    ds  = dbl * C::D_BL + (C::LAYOUT == 0 ? dch * 4 : dch / 8 * 36 + dch % 8 * 4);
+    const char * wbase = (const char *) p.w + (long long) row0 * p.w_nb1;
 
     // Stage st's copies into ring slot st % 3 (an empty group past the last stage).
     auto load = [&](const int st) {
         if (st < nst) {
-            uint32_t * sw = q40_smem + (st % Q40_STAGES) * C::STAGE_WORDS;
-            uint32_t * sq = sw + C::W_WORDS;
-            uint32_t * sd = sq + C::Q_WORDS;
-            const char * w = wg + (long long) st * (SB * 18);
-#pragma unroll
-            for (int c = 0; c < 5; c++) {
-                if (c < wcn) {
-                    q40_cpw<CP>(sw + ws + c * (CP / 4), w + c * CP);
-                }
+            uint32_t * sw = q40_smem + (st % Q40_STAGES) * Q40_STAGE_WORDS;
+            uint32_t * sq = sw + Q40_W_WORDS;
+            uint32_t * sd = sq + Q40_Q_WORDS;
+            const char * ws = wbase + (long long) st * (Q40_SB * 18);
+            for (int c = tid; c < Q40_BM * 9; c += Q40_THREADS) {
+                const int r = c / 9, ch = c - r * 9;
+                q40_cp8(sw + r * Q40_WRS + ch * 2, ws + (long long) r * p.w_nb1 + ch * 8);
             }
-            const long long kb0 = (long long) st * SB;
+            const int kb0 = st * Q40_SB;
 #pragma unroll
-            for (int bl = 0; bl < SB; bl++) {
-                q40_cp16(sq + bl * Q40_BN * 8 + tid * 4, qg + (kb0 + bl) * qstep);
+            for (int c = tid; c < Q40_SB * Q40_BN * 2; c += Q40_THREADS) {
+                const int bl = c / (Q40_BN * 2), ch = c % (Q40_BN * 2);
+                q40_cp16(sq + bl * Q40_BN * 8 + ch * 4,
+                         p.yq + ((long long) (kb0 + bl) * p.n_pad + col0) * 8 + ch * 4);
             }
-            if (tid < SB * Q40_BN / 4) {
-                q40_cp16(sd + ds, dg + kb0 * p.n_pad);
+            if (tid < Q40_SB * Q40_BN / 4) {
+                const int bl = tid / (Q40_BN / 4), ch = tid % (Q40_BN / 4);
+                q40_cp16(sd + bl * Q40_BN + ch * 4, p.yd + (long long) (kb0 + bl) * p.n_pad + col0 + ch * 4);
             }
         }
         q40_commit();
     };
 
-    float acc[MT][NT][4];
+    float acc[2][8][4];
 #pragma unroll
-    for (int mt = 0; mt < MT; mt++) {
+    for (int mt = 0; mt < 2; mt++) {
 #pragma unroll
-        for (int nt = 0; nt < NT; nt++) {
+        for (int nt = 0; nt < 8; nt++) {
 #pragma unroll
             for (int l = 0; l < 4; l++) {
                 acc[mt][nt][l] = 0.0f;
@@ -279,22 +254,22 @@ template <class C> __global__ void __launch_bounds__(Q40_THREADS, C::MINB) q40_g
         __syncthreads();  // stage st landed for all; slot (st + 2) % 3 (stage st - 1) read by all
         load(st + 2);
 
-        const uint32_t * sw = q40_smem + (st % Q40_STAGES) * C::STAGE_WORDS;
-        const uint32_t * sq = sw + C::W_WORDS;
-        const float    * sd = (const float *) (sq + C::Q_WORDS);
+        const uint32_t * sw = q40_smem + (st % Q40_STAGES) * Q40_STAGE_WORDS;
+        const uint32_t * sq = sw + Q40_W_WORDS;
+        const float    * sd = (const float *) (sq + Q40_Q_WORDS);
 #pragma unroll
-        for (int bl = 0; bl < SB; bl++) {
-            // The warp's weight fragments: rows wm * 16 MT + mt * 16 + g (+ 8). Block bl starts
-            // at byte 18 bl of the row's stage: an even block's scale is the low half of word 9m
+        for (int bl = 0; bl < Q40_SB; bl++) {
+            // The warp's weight fragments: rows wm * 32 + mt * 16 + g (+ 8). Block bl starts at
+            // byte 18 bl of the row's stage: an even block's scale is the low half of word 9m
             // (m = bl / 2) and its quants straddle words 9m .. 9m + 4; an odd block's scale is
             // the high half of word 9m + 4 and its quants words 9m + 5 .. 9m + 8.
-            uint32_t a[MT][4];
-            float da[MT][2], mda[MT][2];
+            uint32_t a[2][4];
+            float da[2][2], mda[2][2];
 #pragma unroll
-            for (int mt = 0; mt < MT; mt++) {
+            for (int mt = 0; mt < 2; mt++) {
 #pragma unroll
                 for (int h = 0; h < 2; h++) {
-                    const uint32_t * rw = sw + (wm * 16 * MT + mt * 16 + h * 8 + g) * WRS + 9 * (bl / 2);
+                    const uint32_t * rw = sw + (wm * 32 + mt * 16 + h * 8 + g) * Q40_WRS + 9 * (bl / 2);
                     uint32_t qs;
                     unsigned short dh;
                     if (bl % 2 == 0) {
@@ -312,28 +287,14 @@ template <class C> __global__ void __launch_bounds__(Q40_THREADS, C::MINB) q40_g
                 }
             }
             const uint32_t * bq = sq + bl * Q40_BN * 8;
-            const float    * bd = sd + bl * C::D_BL;
-            uint4  bv2;  // layout 1: this lane's B fragments of n8 tiles nt & ~1 and nt | 1
-            float4 dv2;  // and their scales
+            const float    * bd = sd + bl * Q40_BN;
 #pragma unroll
-            for (int nt = 0; nt < NT; nt++) {
-                uint2  bv;
-                float2 dv;
-                if constexpr (C::LAYOUT == 0) {
-                    const int c = wn * 8 * NT + nt * 8;
-                    bv = *reinterpret_cast<const uint2 *>(bq + (c + g) * 8 + 2 * q);
-                    dv = *reinterpret_cast<const float2 *>(bd + c + 2 * q);
-                } else {
-                    const int pr = (wn * NT + nt) / 2;  // the pair of n8 tiles in the tile
-                    if (nt % 2 == 0) {
-                        bv2 = *reinterpret_cast<const uint4 *>(bq + ((pr * 8 + g) * 4 + q) * 4);
-                        dv2 = *reinterpret_cast<const float4 *>(bd + q * 36 + pr * 4);
-                    }
-                    bv = nt % 2 == 0 ? make_uint2(bv2.x, bv2.y) : make_uint2(bv2.z, bv2.w);
-                    dv = nt % 2 == 0 ? make_float2(dv2.x, dv2.y) : make_float2(dv2.z, dv2.w);
-                }
+            for (int nt = 0; nt < 8; nt++) {
+                const int c = wn * 64 + nt * 8;
+                const uint2  bv = *reinterpret_cast<const uint2 *>(bq + (c + g) * 8 + 2 * q);
+                const float2 dv = *reinterpret_cast<const float2 *>(bd + c + 2 * q);
 #pragma unroll
-                for (int mt = 0; mt < MT; mt++) {
+                for (int mt = 0; mt < 2; mt++) {
                     int d[4];
                     q40_mma(d, a[mt], (int) bv.x, (int) bv.y);
                     // ggml's `sum += C*dA*dB`: t = fl(C * dA) exactly as its FMUL, then its FFMA.
@@ -353,13 +314,13 @@ template <class C> __global__ void __launch_bounds__(Q40_THREADS, C::MINB) q40_g
 
     // The tile's sums to dst (ggml's write back: columns past n are left out).
 #pragma unroll
-    for (int mt = 0; mt < MT; mt++) {
+    for (int mt = 0; mt < 2; mt++) {
 #pragma unroll
-        for (int nt = 0; nt < NT; nt++) {
+        for (int nt = 0; nt < 8; nt++) {
 #pragma unroll
             for (int l = 0; l < 4; l++) {
-                const int i = row0 + wm * 16 * MT + mt * 16 + g + (l >> 1) * 8;
-                const int j = col0 + wn * 8 * NT + nt * 8 + 2 * q + (l & 1);
+                const int i = row0 + wm * 32 + mt * 16 + g + (l >> 1) * 8;
+                const int j = col0 + wn * 64 + nt * 8 + 2 * q + (l & 1);
                 if (j < p.n) {
                     p.dst[(long long) j * p.dst_ld + i] = acc[mt][nt][l];
                 }
@@ -371,10 +332,12 @@ template <class C> __global__ void __launch_bounds__(Q40_THREADS, C::MINB) q40_g
 #endif
 }
 
-// Round 3's matmul configuration: BM x BN tiles, WARPS_M x WARPS_N warps of (BM / WARPS_M) x
+// A configuration of the op's matmul: BM x BN tiles, WARPS_M x WARPS_N warps of (BM / WARPS_M) x
 // (BN / WARPS_N), a STAGES-deep ring of 4 K blocks a stage, MINB CTAs an SM, raster groups of
-// GROUP row tiles; the input in layout 1.
-template <int BM_, int BN_, int WARPS_M_, int WARPS_N_, int STAGES_, int MINB_, int GROUP_, int LATE_ = 0, int COLS_ = 0> struct q40_cfg3 {
+// GROUP row tiles (COLS 0, column tiles slowest in a group) or GROUP column tiles (COLS 1, row
+// tiles slowest).
+template <int BM_, int BN_, int WARPS_M_, int WARPS_N_, int STAGES_, int MINB_, int GROUP_, int COLS_>
+struct q40_cfg {
     static constexpr int BM          = BM_;
     static constexpr int BN          = BN_;
     static constexpr int WARPS_M     = WARPS_M_;
@@ -382,11 +345,10 @@ template <int BM_, int BN_, int WARPS_M_, int WARPS_N_, int STAGES_, int MINB_, 
     static constexpr int STAGES      = STAGES_;
     static constexpr int MINB        = MINB_;
     static constexpr int GROUP       = GROUP_;
-    static constexpr int LATE        = LATE_;            // the next stage's copies after block 0
-    static constexpr int COLS        = COLS_;            // groups of GROUP column tiles
+    static constexpr int COLS        = COLS_;
     static constexpr int THREADS     = 32 * WARPS_M * WARPS_N;
-    static constexpr int MT          = BM / WARPS_M / 16;
-    static constexpr int NT          = BN / WARPS_N / 8;
+    static constexpr int MT          = BM / WARPS_M / 16;  // m16 tiles a warp
+    static constexpr int NT          = BN / WARPS_N / 8;   // n8 tiles a warp
     static constexpr int SB          = 4;
     static constexpr int WRS         = 20;               // words a weight row (18 + 2 of the shift)
     static constexpr int D_BL        = BN / 128 * 144;   // scale words a block: 4 rows of 32, 36 apart
@@ -405,34 +367,22 @@ template <int BM_, int BN_, int WARPS_M_, int WARPS_N_, int STAGES_, int MINB_, 
     static_assert(SMEM <= 99 * 1024, "shared memory");
 };
 
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
-// A 16-byte copy of which the first `src` bytes are read and the rest zero-filled.
-__device__ __forceinline__ void q40_cp16z(void * smem, const void * gmem, const int src) {
-    const unsigned s = (unsigned) __cvta_generic_to_shared(smem);
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem), "r"(src));
-}
-#endif
-
-// Round 3's matmul: a CTA per BM x BN tile (grid ntx * nty, C::THREADS threads, C::SMEM bytes of
-// dynamic shared memory), the input in layout 1 (q40_quant<1>, n_pad a multiple of BN).
+// The op's matmul of configuration C: a CTA per BM x BN tile (grid ntx * nty, C::THREADS threads,
+// C::SMEM bytes of dynamic shared memory), the input in layout 1 (n_pad a multiple of BN).
 //
-// The weights come in 16-byte copies: a stage's 72 bytes of a row start at byte 72 st of the row,
-// 16-byte aligned on even stages, 8 bytes past it on odd ones, so the copy takes the 80 bytes
-// from the aligned byte below (the last 8 of an even stage's zero-filled: past the stage, maybe
-// past the weight) into the row's 20 words; the row's blocks start 2 words in on odd stages.
-//
-// A's int8 values are 16 (q - 8): (nibble << 4) ^ 0x80 per byte, one LOP3 a word for the high
-// nibbles (two for the low ones), and the MMA's result reads as the float M + 16 C, so
-// t = fma(M + 16 C, dA / 16, -M * dA / 16): the exact value C * dA again (dA / 16 and M * dA / 16
-// are exact), rounded once, ggml's fl(C * dA).
-template <class C> __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm3(const legion_q40_mm p) {
+// The weights come in 16-byte copies (rows 16-byte aligned: src/model/q40_mm.rs checks it): a
+// stage's 72 bytes of a row start at byte 72 st of the row, 16-byte aligned on even stages, 8
+// bytes past it on odd ones, so the copy takes the 80 bytes from the aligned byte below into the
+// row's 20 words (on even stages the last 8 are zero-filled, not read: they are past the stage,
+// maybe past the weight); the row's blocks start 2 words in on odd stages.
+template <class C> __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40_mm p) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     constexpr int SB = C::SB, MT = C::MT, NT = C::NT, BM = C::BM, BN = C::BN, S = C::STAGES;
     extern __shared__ __align__(16) uint32_t q40_smem[];
     const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, g = lane / 4, q = lane % 4;
     const int wm = warp % C::WARPS_M, wn = warp / C::WARPS_M;
 
-    // Groups of GROUP row tiles, column after column (or of GROUP column tiles, row after row).
+    // The tile (src/model/q40_mm.rs, `tile_of`).
     const int b         = blockIdx.x;
     const int nmaj      = C::COLS ? p.ntx : p.nty;
     const int nmin      = C::COLS ? p.nty : p.ntx;
@@ -464,6 +414,7 @@ template <class C> __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_ge
     const float * dg = p.yd + (long long) dbl * p.n_pad + col0 + dch * 4;
     const int ds = dbl * C::D_BL + dch / 32 * 144 + dch % 32 / 8 * 36 + dch % 8 * 4;
 
+    // Stage st's copies into ring slot st % S (an empty group past the last stage).
     auto load = [&](const int st) {
         if (st < nst) {
             uint32_t * sw = q40_smem + (st % S) * C::STAGE_WORDS;
@@ -510,9 +461,7 @@ template <class C> __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_ge
     for (int st = 0; st < nst; st++) {
         q40_wait<S - 2>();
         __syncthreads();  // stage st landed for all; slot (st - 1) % S read by all
-        if (!C::LATE) {
-            load(st + S - 1);
-        }
+        load(st + S - 1);
 
         const uint32_t * sw = q40_smem + (st % S) * C::STAGE_WORDS;
         const uint32_t * sq = sw + C::W_WORDS;
@@ -520,9 +469,9 @@ template <class C> __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_ge
         const uint32_t * sa = sw + (st & 1) * 2 + (wm * 16 * MT + g) * C::WRS;
 #pragma unroll
         for (int bl = 0; bl < SB; bl++) {
-            if (C::LATE && bl == 1) {
-                load(st + S - 1);
-            }
+            // The warp's weight fragments: rows wm * 16 MT + mt * 16 + g (+ 8), as in the first
+            // version (an even block's quants straddle words 9m .. 9m + 4, the high nibbles of
+            // slot q at bits 16 .. of its words q, q + 1; an odd block's are words 9m + 5 ..).
             uint32_t a[MT][4];
             float da[MT][2], mda[MT][2];
 #pragma unroll
@@ -542,8 +491,8 @@ template <class C> __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_ge
                         lo = hi << 4;
                         dh = (unsigned short) (rw[4] >> 16);
                     }
-                    a[mt][h]     = (lo & 0xF0F0F0F0u) ^ 0x80808080u;  // K slot q: 16 (q - 8)
-                    a[mt][h + 2] = (hi & 0xF0F0F0F0u) ^ 0x80808080u;  // K slot q + 4
+                    a[mt][h]     = q40_s8x16(lo);  // K slot q: values 4q .. 4q + 3
+                    a[mt][h + 2] = q40_s8x16(hi);  // K slot q + 4: values 16 + 4q ..
                     const float d = __half2float(__ushort_as_half(dh));
                     da[mt][h]  = __fmul_rn(d, 0.0625f);
                     mda[mt][h] = __fmul_rn(d, -0.0625f * Q40_MAGIC);
@@ -565,6 +514,7 @@ template <class C> __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_ge
                     for (int mt = 0; mt < MT; mt++) {
                         int d[4];
                         q40_mma(d, a[mt], b0, b1);
+                        // t = fl(C * dA) from M + 16 C, then ggml's FFMA.
                         const float t0 = __fmaf_rn(__int_as_float(d[0]), da[mt][0], mda[mt][0]);
                         const float t1 = __fmaf_rn(__int_as_float(d[1]), da[mt][0], mda[mt][0]);
                         const float t2 = __fmaf_rn(__int_as_float(d[2]), da[mt][1], mda[mt][1]);
@@ -580,6 +530,7 @@ template <class C> __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_ge
     }
     q40_wait<0>();
 
+    // The tile's sums to dst (ggml's write back: columns past n are left out).
 #pragma unroll
     for (int mt = 0; mt < MT; mt++) {
 #pragma unroll
@@ -599,13 +550,10 @@ template <class C> __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_ge
 #endif
 }
 
-// The variants the timing test compares (src/model/q40_mm.rs, `Kernel`).
-using q40_r3a   = q40_cfg3<128, 128, 4, 2, 3, 1, 8>;        // 8 warps of 32 x 64
-using q40_r3f   = q40_cfg3<64, 128, 2, 2, 2, 2, 16>;        // 4 warps of 32 x 64, 2 CTAs an SM
-using q40_r3c2  = q40_cfg3<64, 128, 2, 2, 2, 2, 2, 0, 1>;   // groups of column tiles
-using q40_r3c3  = q40_cfg3<64, 128, 2, 2, 2, 2, 3, 0, 1>;
-using q40_r3c4  = q40_cfg3<64, 128, 2, 2, 2, 2, 4, 0, 1>;
-using q40_r3c6  = q40_cfg3<64, 128, 2, 2, 2, 2, 6, 0, 1>;
+using q40_op  = q40_cfg<64, 128, 2, 2, 2, 2, 4, 1>;   // the op's: 4 warps of 32 x 64, 2 CTAs an SM
+using q40_128 = q40_cfg<128, 128, 4, 2, 3, 1, 8, 0>;  // 8 warps of 32 x 64, 1 CTA an SM
+
+static_assert(q40_op::SMEM == 47616, "src/model/q40_mm.rs SMEM_BYTES");
 
 }  // namespace
 
@@ -622,21 +570,14 @@ struct legion_q40_kernel {
     const char * name;
 };
 
-#define Q40_R3(C, NAME) \
-    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm3<C>), C::SMEM, \
-      C::THREADS, C::BM, C::BN, NAME }
-
-// The op's matmul first, then the others the timing test runs (src/model/q40_mm.rs).
+// The op's matmul first, then the others the timing test runs (src/model/q40_mm.rs, `Kernel`).
 extern const legion_q40_kernel legion_q40_mm_table[] = {
-    Q40_R3(q40_r3c4, "r3 64x128 x2 col group 4"),
-    { reinterpret_cast<const void *>(&q40_quant<0>), reinterpret_cast<const void *>(&q40_gemm<q40_v1>), q40_v1::SMEM,
-      256, 128, 128, "first version" },
-    Q40_R3(q40_r3f, "r3 64x128 x2 row group 16"),
-    Q40_R3(q40_r3c2, "r3 64x128 x2 col group 2"),
-    Q40_R3(q40_r3c3, "r3 64x128 x2 col group 3"),
-    Q40_R3(q40_r3c6, "r3 64x128 x2 col group 6"),
-    Q40_R3(q40_r3c4, "r3 64x128 x2 col group 4 again"),
-    Q40_R3(q40_r3a, "r3 128x128 8w 32x64"),
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op>),
+      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "q40_mm" },
+    { reinterpret_cast<const void *>(&q40_quant<0>), reinterpret_cast<const void *>(&q40_gemm_v1),
+      Q40_STAGES * Q40_STAGE_WORDS * 4, Q40_THREADS, Q40_BM, Q40_BN, "first version" },
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_128>),
+      q40_128::SMEM, q40_128::THREADS, q40_128::BM, q40_128::BN, "128 x 128 tiles" },
 };
 extern const int legion_q40_mm_table_len = sizeof(legion_q40_mm_table) / sizeof(legion_q40_mm_table[0]);
 

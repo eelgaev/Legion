@@ -9,20 +9,20 @@
 //! scaling it. On a DGX Spark (GB10) its 4096-token FFN matmuls run at ~60 TFLOPS.
 //!
 //! The op (`src/cuda/q40_mm.cu`) quantizes the input as ggml does (the same values, the scale as
-//! the F16 ggml stores) and multiplies 128 x 128 tiles from a three-stage `cp.async` ring, two
-//! CTAs of 8 warps an SM, each block's dot product an `mma.sync` m16n8k32 s8 one, scaled without
-//! the conversion: the MMA's accumulator starts at the float 1.5 * 2^23, so its result read as a
-//! float is that plus the integer exactly, and one FMA takes the offset back out while scaling,
-//! rounding once to ggml's `fl(C * dA)`. The sums are ggml's: `sum = fma(fl(C * dA), dB, sum)` over the K blocks in
-//! order from 0, each output's chain in one thread, as in ggml's CTA per tile. Only plans on
-//! which ggml runs a CTA per tile ([`ggml_tiles`]) are taken: ggml's stream-k split adds the
-//! pieces of a tile in another order. Tiles run in groups of [`GROUP`] row tiles (column tiles
-//! slowest in a group, [`tile_of`]), so a wave of CTAs reads a few weight rows and input columns
-//! from DRAM instead of every input column per wave of weight rows.
+//! the F16 ggml stores) and multiplies 64 x 128 tiles ([`TILE_ROWS`] x [`TILE`]) from a two-stage
+//! `cp.async` ring, two CTAs of 4 warps an SM, each block's dot product an `mma.sync` m16n8k32
+//! s8 one, scaled without the conversion: the MMA's accumulator starts at the float 1.5 * 2^23,
+//! so its result read as a float is that plus the integer exactly, and one FMA takes the offset
+//! back out while scaling, rounding once to ggml's `fl(C * dA)`. The sums are ggml's:
+//! `sum = fma(fl(C * dA), dB, sum)` over the K blocks in order from 0, each output's chain in one
+//! thread, as in ggml's CTA per tile. Only plans on which ggml runs a CTA per tile
+//! ([`ggml_tiles`]) are taken: ggml's stream-k split adds the pieces of a tile in another order.
+//! Tiles run in groups of [`GROUP`] column tiles (row tiles slowest in a group, [`tile_of`]), so
+//! a wave of CTAs reads a few input columns from DRAM once for all the weight's rows.
 //!
 //! Taken on compute capability 12.x (the GB10, whose ggml MMQ config the plan copies, see
-//! [`crate::model::q8_mmq::plan`]) for every Q4_0 weight in one GPU's memory with whole 128-row
-//! tiles and K a multiple of 256, at [`MIN_TOKENS`] or more columns ([`fits`]); on by default,
+//! [`crate::model::q8_mmq::plan`]) for every Q4_0 weight in one GPU's memory, 16-byte aligned,
+//! with rows a multiple of 128 and K of 256, at [`MIN_TOKENS`] or more columns ([`fits`]); on by default,
 //! `legion serve --q40-mm-ggml` keeps ggml's MMQ (the same output). Decode and verify steps
 //! (fewer columns) stay on ggml's MMVQ / MMQ. Consecutive op nodes on the same input quantize it
 //! once ([`quant_run`]). The CPU implementation is a reference for the tests: the same sums
@@ -48,12 +48,15 @@ static Q40_MM: ExternalOp = ExternalOp {
 /// Fewest columns the op takes: prompt steps (verify and decode steps keep ggml's kernels).
 pub const MIN_TOKENS: i64 = 512;
 
-/// Tile rows and columns.
+/// Tile columns (and the first version's tile rows; the weight's rows are a multiple of it).
 pub const TILE: i64 = 128;
 
-/// Row tiles of a raster group of the matmul ([`tile_of`]): a GB10's wave of 96 CTAs (two on
-/// each of its 48 SMs) is 16 row tiles x 6 column tiles.
-pub const GROUP: i64 = 16;
+/// The op's tile rows.
+pub const TILE_ROWS: i64 = 64;
+
+/// Column tiles of a raster group of the matmul ([`tile_of`]): a GB10's wave of 96 CTAs (two on
+/// each of its 48 SMs) is 24 row tiles x 4 column tiles.
+pub const GROUP: i64 = 4;
 
 /// Row tiles of a raster group of the first version's matmul (one CTA an SM), which the timing
 /// test runs beside the op's.
@@ -72,9 +75,9 @@ const K_STEP: i64 = 256;
 /// take 99 MiB.
 pub const MAX_QUANT_BYTES: usize = 256 << 20;
 
-/// The matmul kernel's dynamic shared memory: three stages of 128 weight rows of 12 words, 2 x
-/// 128 columns of 8 quant words and 2 x 4 rows of 32 scales 36 words apart.
-pub const SMEM_BYTES: usize = 3 * (128 * 12 + 2 * 128 * 8 + 2 * 4 * 36) * 4;
+/// The matmul kernel's dynamic shared memory: two stages of 64 weight rows of 20 words, 4 x 128
+/// columns of 8 quant words and 4 x 4 rows of 32 scales 36 words apart.
+pub const SMEM_BYTES: usize = 2 * (64 * 20 + 4 * 128 * 8 + 4 * 4 * 36) * 4;
 
 /// The first version's: three stages of 128 weight rows of 20 words, 4 x 128 columns of 8 quant
 /// words and 4 x 128 scales.
@@ -85,6 +88,7 @@ static ON: AtomicBool = AtomicBool::new(true);
 
 /// The matmul of `src/cuda/q40_mm.cu`'s table the op runs: 0 (the op's) but in the timing and
 /// bit tests, which run them all (the same bits).
+#[cfg(feature = "cuda")]
 static VARIANT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Whether the op runs where it applies ([`takes`]; `true`, the default); `false`
@@ -156,9 +160,9 @@ pub fn fits(
         && quant_bytes(k, n) <= MAX_QUANT_BYTES
 }
 
-/// Column tiles and row tiles of `rows` x `n`.
+/// Column tiles and row tiles of the op's matmul of `rows` x `n`.
 pub fn grid(rows: i64, n: i64) -> (i64, i64) {
-    ((n + TILE - 1) / TILE, (rows + TILE - 1) / TILE)
+    ((n + TILE - 1) / TILE, (rows + TILE_ROWS - 1) / TILE_ROWS)
 }
 
 /// Columns of the quantized input: `n` padded to whole tiles.
@@ -173,15 +177,21 @@ pub fn quant_bytes(k: i64, n: i64) -> usize {
 }
 
 /// The tile (row tile, column tile) CTA `b` of a grid of `ntx` x `nty` tiles computes, as the
-/// kernel picks it: groups of `group` row tiles ([`GROUP`], the last one shorter), each group's
-/// tiles row tile fastest.
-pub fn tile_of(b: i64, ntx: i64, nty: i64, group: i64) -> (i64, i64) {
-    let per_group = group * ntx;
+/// kernels pick it: with `cols` (the op's) groups of `group` column tiles ([`GROUP`], the last
+/// one shorter), each group's tiles column tile fastest; else (the first version's) groups of
+/// `group` row tiles ([`GROUP_V1`]), row tile fastest.
+pub fn tile_of(b: i64, ntx: i64, nty: i64, group: i64, cols: bool) -> (i64, i64) {
+    let (major, minor) = if cols { (ntx, nty) } else { (nty, ntx) };
+    let per_group = group * minor;
     let g = b / per_group;
     let r0 = g * group;
-    let size = group.min(nty - r0);
+    let size = group.min(major - r0);
     let r = b - g * per_group;
-    (r0 + r % size, r / size)
+    if cols {
+        (r / size, r0 + r % size)
+    } else {
+        (r0 + r % size, r / size)
+    }
 }
 
 /// `w @ x` (see [`takes`]) on the op: F32 `[rows, n]`, ggml's `mul_mat`'s shape, with its bits.
