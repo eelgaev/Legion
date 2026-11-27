@@ -185,7 +185,6 @@ pub(crate) const INKLING: &[&str] = &[
     "ink_mix",
     "ink_ctrl_in",
     "ink_ctrl_out",
-    "ink_ctrl_down",
     "ink_ctrl_gate",
     "ink_conv",
     "ink_clip",

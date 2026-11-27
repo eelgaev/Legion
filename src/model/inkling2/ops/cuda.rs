@@ -71,7 +71,7 @@ struct LaunchConfig {
 const ATTR_PROGRAMMATIC_STREAM_SERIALIZATION: c_int = 6;
 
 /// The kernels of `legion_ink_kernels`.
-const KERNELS: usize = 20;
+const KERNELS: usize = 19;
 
 unsafe extern "C" {
     /// The kernels as the CUDA runtime knows them (their host stubs' addresses), in
@@ -149,9 +149,7 @@ enum Kernel {
     /// The expert matmul of steps with no more pairs than experts, a warp per few rows of a
     /// pair (#1221); `MmId` runs the rest in tiles, both with the same sums.
     MmIdVec,
-    /// The fused controller of small steps (#1221 r5): its input and down projection, then
-    /// its gain and forget products and output.
-    CtrlDown,
+    /// A controller's gain and forget products and output at small steps (#1221 r5).
     CtrlGate,
 }
 
@@ -311,49 +309,34 @@ pub(super) unsafe fn ctrl_out(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Re
     unsafe { elementwise(Kernel::CtrlOut, "ink_ctrl_out", dst, stream) }
 }
 
-/// `CTRL_TOK` and `CTRL_THREADS` of the fused controller's kernels.
+/// `CTRL_TOK`, `CTRL_RANK` and `CTRL_ROWS` of `ctrl_gate_kernel` (its threads twice the rows).
 const CTRL_TOK: i64 = 8;
-const CTRL_THREADS: u32 = 256;
+const CTRL_RANK: i64 = 512;
+const CTRL_ROWS: i64 = 32;
 
 /// Whether `t`'s data and row stride suit 16-byte loads of its rows.
 fn rows16(t: &ffi::ggml_tensor) -> bool {
     (t.data as usize | t.nb[1]) % 16 == 0
 }
 
-pub(super) unsafe fn ctrl_down(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
-    // SAFETY: a node of this op; its sources were checked by the builder.
-    unsafe {
-        if src(dst, 0).ne[1] > CTRL_TOK || !rows16(src(dst, 2)) {
-            return Err(
-                "ink_ctrl_down: more tokens than the kernel takes, or unaligned rows".into(),
-            );
-        }
-        launch(
-            Kernel::CtrlDown,
-            "ink_ctrl_down",
-            dst,
-            dim(dst.ne[0], 1),
-            CTRL_THREADS,
-            0,
-            stream,
-        )
-    }
-}
-
 pub(super) unsafe fn ctrl_gate(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
     // SAFETY: a node of this op; its sources were checked by the builder.
     unsafe {
-        if dst.ne[1] > CTRL_TOK || !rows16(src(dst, 3)) || !rows16(src(dst, 4)) {
-            return Err(
-                "ink_ctrl_gate: more tokens than the kernel takes, or unaligned rows".into(),
-            );
+        let k = src(dst, 2).ne[0];
+        if dst.ne[1] > CTRL_TOK
+            || k % 32 != 0
+            || k > CTRL_RANK
+            || !rows16(src(dst, 3))
+            || !rows16(src(dst, 4))
+        {
+            return Err("ink_ctrl_gate: a shape or rows the kernel does not take".into());
         }
         launch(
             Kernel::CtrlGate,
             "ink_ctrl_gate",
             dst,
-            dim(cdiv(dst.ne[0], CTRL_THREADS as i64 / 32), 1),
-            CTRL_THREADS,
+            dim(cdiv(dst.ne[0], CTRL_ROWS), 1),
+            2 * CTRL_ROWS as u32,
             0,
             stream,
         )

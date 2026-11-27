@@ -1579,10 +1579,11 @@ fn real_checkpoint_parses_like_the_gguf() {
     }
 }
 
-/// One small step of a controller both ways on `b`: the five nodes (`ink_ctrl_in`, the down,
-/// gain and forget products through `glm_linear` as `glm_mm` makes them, `ink_ctrl_out`) and
-/// the fused two (`ink_ctrl_down`, `ink_ctrl_gate`); the down projections and the outputs must
-/// match bit for bit (#1221 r5). Rows of `e` values, controllers of rank `rank`, up to 8 tokens.
+/// One small step of a controller both ways on `b`: its gain and forget products through
+/// `glm_linear` (as `glm_mm` makes them) then `ink_ctrl_out`, and `ink_ctrl_gate`, from the same
+/// down projection (`ink_ctrl_in` then `glm_linear`); the outputs must match bit for bit
+/// (#1221 r5). Rows of `e` values, controllers of rank `rank`, up to 8 tokens. Every case runs;
+/// the panic names each one that does not match, with its first differing output.
 fn fused_controller_keeps_the_bits(b: &mut Backend) {
     use crate::ggml::ComputeAllocator;
     let mut s = 0x9e37_79b9_7f4a_7c15u64;
@@ -1596,23 +1597,23 @@ fn fused_controller_keeps_the_bits(b: &mut Backend) {
             })
             .collect()
     };
-    for (e, rank) in [(2304i64, 64i64), (256, 32), (128, 512)] {
+    let mut bad = Vec::new();
+    for (e, rank) in [(2304i64, 64i64), (256, 32), (128, 512), (96, 160)] {
         for n in [1i64, 2, 3, 4, 5, 8] {
             let ctx = Context::new(64, 64);
             let new = |ne: &[i64]| ctx.new_tensor(types::F32, ne).as_input();
             let (cur, msg) = (new(&[e, n]), new(&[e, n]));
             let dw = new(&[2 * e, rank]);
             let (gw, fw) = (new(&[rank, e]), new(&[rank, e]));
-            assert!(ops::ctrl_takes(dw, gw, fw, n), "e {e} rank {rank} n {n}");
+            assert!(ops::ctrl_gate_takes(gw, fw, n), "e {e} rank {rank} n {n}");
             let g = ops::ctrl_in(&ctx, cur, msg, MIX_EPS);
-            let d5 = glm_ops::linear_h(&ctx, dw, g, None, 1.0, None).as_output();
-            let gain = glm_ops::linear_h(&ctx, gw, d5, None, 1.0, None);
-            let forget = glm_ops::linear_h(&ctx, fw, d5, None, 1.0, None);
-            let o5 = ops::ctrl_out(&ctx, cur, msg, gain, forget).as_output();
-            let d2 = ops::ctrl_down(&ctx, cur, msg, dw, MIX_EPS).as_output();
-            let o2 = ops::ctrl_gate(&ctx, cur, msg, d2, gw, fw).as_output();
+            let d = glm_ops::linear_h(&ctx, dw, g, None, 1.0, None);
+            let gain = glm_ops::linear_h(&ctx, gw, d, None, 1.0, None);
+            let forget = glm_ops::linear_h(&ctx, fw, d, None, 1.0, None);
+            let five = ops::ctrl_out(&ctx, cur, msg, gain, forget).as_output();
+            let one = ops::ctrl_gate(&ctx, cur, msg, d, gw, fw).as_output();
             let mut graph = ctx.new_graph(64);
-            for t in [d5, o5, d2, o2] {
+            for t in [five, one] {
                 graph.expand(t);
             }
             ctx.alloc_graph(&graph, ComputeAllocator::new(b.buffer_type()))
@@ -1623,19 +1624,32 @@ fn fused_controller_keeps_the_bits(b: &mut Backend) {
             gw.set_f32(&vals((rank * e) as usize, 0.5));
             fw.set_f32(&vals((rank * e) as usize, 0.5));
             b.compute(&graph).unwrap();
-            let case = format!("e {e}, rank {rank}, {n} tokens");
-            let same = |x: &[f32], y: &[f32]| {
-                x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits())
-            };
+            let (x, y) = (five.to_f32(), one.to_f32());
+            assert_eq!(x.len(), y.len());
             assert!(
-                same(&d5.to_f32(), &d2.to_f32()),
-                "{case}: the down projection"
+                y.iter().any(|&v| v != 0.0),
+                "e {e}, rank {rank}, {n} tokens: an output"
             );
-            let out = o2.to_f32();
-            assert!(same(&o5.to_f32(), &out), "{case}: the output");
-            assert!(out.iter().any(|&v| v != 0.0), "{case}: an output");
+            let diff = x
+                .iter()
+                .zip(&y)
+                .filter(|(p, q)| p.to_bits() != q.to_bits())
+                .count();
+            if let Some(i) = (0..x.len()).find(|&i| x[i].to_bits() != y[i].to_bits()) {
+                let line = format!(
+                    "e {e}, rank {rank}, {n} tokens: {diff} of {} differ, first [{}, {}] {:e} vs {:e}",
+                    x.len(),
+                    i as i64 % e,
+                    i as i64 / e,
+                    x[i],
+                    y[i]
+                );
+                eprintln!("ink_ctrl_gate first mismatch: {line}");
+                bad.push(line);
+            }
         }
     }
+    assert!(bad.is_empty(), "ink_ctrl_gate:\n{}", bad.join("\n"));
 }
 
 /// [`fused_controller_keeps_the_bits`] on the CPU references.

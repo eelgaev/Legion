@@ -281,19 +281,6 @@ __global__ void mix_kernel(const A a) {
 }
 
 // ---- ink_ctrl_in: params eps; sources cur, msg [e, n]; dst [2e, n] ----
-
-// The scale ink_ctrl_in gives row x (e values): 1 / sqrt(mean(x^2) + eps), a thread's sum over
-// x[tid + blockDim.x j] then block_sum. Shared with ctrl_down_kernel (the same bits; both run
-// CTRL_THREADS threads a block).
-__device__ __forceinline__ float ctrl_rms(const float * x, int64_t e, float eps, float * red) {
-    float ss = 0.f;
-    for (int64_t i = threadIdx.x; i < e; i += blockDim.x) {
-        ss += x[i] * x[i];
-    }
-    ss = block_sum(ss, red);
-    return rsqrtf(ss / (float) e + eps);
-}
-
 __global__ void ctrl_in_kernel(const A a) {
     pdl_wait();
     const float   eps = pf(a.params[0]);
@@ -302,20 +289,17 @@ __global__ void ctrl_in_kernel(const A a) {
     __shared__ float red[32];
     float *          out = (float *) a.dst + t * 2 * e;
     for (int h = 0; h < 2; h++) {
-        const float * x = (const float *) src(a, h) + t * e;
-        const float   r = ctrl_rms(x, e, eps, red);
+        const float * x  = (const float *) src(a, h) + t * e;
+        float         ss = 0.f;
+        for (int64_t i = threadIdx.x; i < e; i += blockDim.x) {
+            ss += x[i] * x[i];
+        }
+        ss            = block_sum(ss, red);
+        const float r = rsqrtf(ss / (float) e + eps);
         for (int64_t i = threadIdx.x; i < e; i += blockDim.x) {
             out[h * e + i] = x[i] * r;
         }
     }
-}
-
-// A controller's output from its tanh inputs: cur - tanh(forget) * cur + tanh(gain) * msg. The
-// one expression of ctrl_out_kernel and ctrl_gate_kernel, so they give the same bits.
-__device__ __forceinline__ float ctrl_mix(float c, float m, float gain, float forget) {
-    const float g = tanhf(gain);
-    const float f = tanhf(forget);
-    return c - f * c + g * m;
 }
 
 // ---- ink_ctrl_out: sources cur, msg, gain, forget (all [e, n]) ----
@@ -328,193 +312,139 @@ __global__ void ctrl_out_kernel(const A a) {
     }
     const float c = ((const float *) src(a, 0))[i];
     const float m = ((const float *) src(a, 1))[i];
-    ((float *) a.dst)[i] = ctrl_mix(c, m, ((const float *) src(a, 2))[i], ((const float *) src(a, 3))[i]);
+    const float g = tanhf(((const float *) src(a, 2))[i]);
+    const float f = tanhf(((const float *) src(a, 3))[i]);
+    ((float *) a.dst)[i] = c - f * c + g * m;
 }
 
-// ---- The fused controller of small steps (#1221 r5): ink_ctrl_down and ink_ctrl_gate ----
+// ---- ink_ctrl_gate (#1221 r5): a controller's gain and forget products and its output ----
 //
-// A controller was ink_ctrl_in, then glm_linear (F32 weights) for its down projection, then two
-// more for gain and forget, then ink_ctrl_out: five kernels, the gain and forget products
-// running 64-value rows a block each (2 of 128 threads busy). At up to CTRL_TOK tokens
-// glm_linear's F32 kernels (linear_mv_f32, _split and _xs in glm5next.cu, the same bits) sum row
-// r as a warp: lane L takes the 32-value blocks L + 32 q in order of q, each as two halves, a
+// A controller's gain and forget products (F32 rows of `rank` values, glm_linear) and
+// ink_ctrl_out in one kernel at small steps, the bits of the three. At up to 8 tokens
+// glm_linear's F32 kernels (linear_mv_f32, _split, _xs in glm5next.cu; the same bits) sum row r
+// as a warp: lane L takes the 32-value blocks L + 32 q in order of q, each as two halves, a
 // 16-term FMA chain from 0 per half added to the lane's sum (from 0), then warp_sum (xor 16, 8,
-// 4, 2, 1), times the scale. ctrl_down_kernel and ctrl_gate_kernel make these sums in that order,
-// so the controller keeps its bits in two kernels.
+// 4, 2, 1), times the scale. With the rank at most 512 every lane has one block at most and
+// lanes 16-31 hold 0, so the xor-16 step gives lane L < 16 its sum plus 0, and the xor 8, 4, 2,
+// 1 steps make lane 0's result a balanced tree over lanes 0-15 in bit-reversed order (lane 0,
+// 8, 4, 12, 2, ...: pairs, then pairs of pairs). Here one thread makes that tree for one row:
+// its blocks' sums in that order, each plus a zero (a parameter, so the add stays), combined as
+// a binary counter; a lane without a block adds 0, which leaves a sum as it is.
+// The scale's product is __fmul_rn: glm_linear stores it, so it must not fuse into tanhf.
 
-// Most tokens the fused controller takes, and its threads a block.
-constexpr int CTRL_TOK     = 8;
-constexpr int CTRL_THREADS = 256;
-// ctrl_down_kernel: the warps of a block, each one q of a round.
-constexpr int CTRL_WARPS = CTRL_THREADS / 32;
+// Rows a block of ink_ctrl_gate (its threads twice that: the gain rows, then the forget rows),
+// its tokens and its widest rank.
+constexpr int CTRL_ROWS = 32;
+constexpr int CTRL_TOK  = 8;
+constexpr int CTRL_RANK = 512;
 
-// The 16 values of half h of a 32-value block loaded as 8 float4s.
-__device__ __forceinline__ void ctrl_half(const float4 (&w)[8], int h, float (&v)[16]) {
-#pragma unroll
-    for (int q = 0; q < 4; q++) {
-        v[4 * q]     = w[4 * h + q].x;
-        v[4 * q + 1] = w[4 * h + q].y;
-        v[4 * q + 2] = w[4 * h + q].z;
-        v[4 * q + 3] = w[4 * h + q].w;
-    }
-}
-
-// ink_ctrl_down: params eps, scale; sources cur, msg [e, n], w F32 [2e, m]; dst [m, n]: row r
-// of w times ink_ctrl_in(cur, msg) (each input value x * rms scale, as ink_ctrl_in stores it),
-// a block a row. Each block makes the tokens' rms scales as ctrl_in_kernel does; warp u takes
-// q = u of each round of CTRL_WARPS, leaves its half-block sums in shared memory, and warp 0
-// adds them in linear_mv_f32's order (q, then the half). e a multiple of 32 (no block takes
-// both inputs), at most CTRL_TOK tokens.
-__global__ void __launch_bounds__(CTRL_THREADS) ctrl_down_kernel(const A a) {
+// ink_ctrl_gate: params gain scale, forget scale, a zero; sources cur, msg [e, n], d [k, n]
+// (the down projection), gain, forget F32 [k, e]; dst [e, n]: ink_ctrl_out's expression of
+// row r's gain and forget products. k a multiple of 32, at most CTRL_RANK; n at most CTRL_TOK.
+__global__ void __launch_bounds__(2 * CTRL_ROWS) ctrl_gate_kernel(const A a) {
     pdl_wait();
-    const float   eps = pf(a.params[0]), sc = pf(a.params[1]);
-    const int64_t e = a.src_ne[0][0], n = a.src_ne[0][1], m = a.ne[0];
-    const int64_t r = blockIdx.x, nb = 2 * e / 32, nbe = e / 32;
-    const int     warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    __shared__ float red[32];
-    __shared__ float rs[CTRL_TOK][2];
-    __shared__ float part[CTRL_TOK][CTRL_WARPS][2][32];
-    for (int t = 0; t < n; t++) {
-        for (int h = 0; h < 2; h++) {
-            const float v = ctrl_rms((const float *) src(a, h) + t * e, e, eps, red);
-            if (threadIdx.x == 0) {
-                rs[t][h] = v;
+    const float   zero = pf(a.params[2]);
+    const int64_t e = a.ne[0], n = a.ne[1], k = a.src_ne[2][0];
+    const int     nb = (int) (k / 32);
+    __shared__ float xs[CTRL_TOK * CTRL_RANK];
+    __shared__ float yf[CTRL_TOK][CTRL_ROWS];
+    for (int64_t i = threadIdx.x; i < n * k; i += blockDim.x) {
+        const int64_t t = i / k, j = i % k;
+        xs[i] = ((const float *) (src(a, 2) + t * a.src_nb[2][1]))[j];
+    }
+    __syncthreads();
+    const int     g  = threadIdx.x / CTRL_ROWS;  // 0 the gain row, 1 the forget row
+    const int     rl = threadIdx.x % CTRL_ROWS;
+    const int64_t r  = (int64_t) blockIdx.x * CTRL_ROWS + rl;
+    const bool    live = r < e;
+    // the binary counter's partial sums: 1, 2, 4 and 8 lanes
+    float s1[CTRL_TOK], s2[CTRL_TOK], s4[CTRL_TOK], s8[CTRL_TOK], y[CTRL_TOK];
+    if (live) {
+        const float4 * row = (const float4 *) (src(a, 3 + g) + r * a.src_nb[3 + g][1]);
+#pragma unroll
+        for (int i = 0; i < 16; i++) {
+            // lane l of glm_linear's warp: i bit-reversed
+            const int l = ((i & 1) << 3) | ((i & 2) << 1) | ((i & 4) >> 1) | ((i & 8) >> 3);
+            float     c[CTRL_TOK];
+#pragma unroll
+            for (int t = 0; t < CTRL_TOK; t++) {
+                c[t] = 0.0f;
+            }
+            if (l < nb) {
+                float4 w[8];
+#pragma unroll
+                for (int q = 0; q < 8; q++) {
+                    w[q] = __ldg(row + l * 8 + q);
+                }
+#pragma unroll
+                for (int t = 0; t < CTRL_TOK; t++) {
+                    if (t < n) {
+                        float acc = 0.0f;
+#pragma unroll
+                        for (int h = 0; h < 2; h++) {
+                            const float v[16] = {w[4 * h].x,     w[4 * h].y,     w[4 * h].z,     w[4 * h].w,
+                                                 w[4 * h + 1].x, w[4 * h + 1].y, w[4 * h + 1].z, w[4 * h + 1].w,
+                                                 w[4 * h + 2].x, w[4 * h + 2].y, w[4 * h + 2].z, w[4 * h + 2].w,
+                                                 w[4 * h + 3].x, w[4 * h + 3].y, w[4 * h + 3].z, w[4 * h + 3].w};
+                            const float * x = xs + t * k + l * 32 + 16 * h;
+                            float         s = 0.0f;
+#pragma unroll
+                            for (int j = 0; j < 16; j++) {
+                                s += v[j] * x[j];
+                            }
+                            acc += s;
+                        }
+                        c[t] = acc + zero;  // warp_sum's xor 16: lane l + 16 holds 0
+                    }
+                }
+            }
+#pragma unroll
+            for (int t = 0; t < CTRL_TOK; t++) {
+                float v = c[t];
+                if ((i & 1) == 0) {
+                    s1[t] = v;
+                    continue;
+                }
+                v = s1[t] + v;
+                if ((i & 2) == 0) {
+                    s2[t] = v;
+                    continue;
+                }
+                v = s2[t] + v;
+                if ((i & 4) == 0) {
+                    s4[t] = v;
+                    continue;
+                }
+                v = s4[t] + v;
+                if ((i & 8) == 0) {
+                    s8[t] = v;
+                    continue;
+                }
+                y[t] = s8[t] + v;
+            }
+        }
+        const float sc = g ? pf(a.params[1]) : pf(a.params[0]);
+#pragma unroll
+        for (int t = 0; t < CTRL_TOK; t++) {
+            y[t] = __fmul_rn(y[t], sc);
+            if (g == 1 && t < n) {
+                yf[t][rl] = y[t];
             }
         }
     }
     __syncthreads();
-    const float4 * row = (const float4 *) (src(a, 2) + r * a.src_nb[2][1]);
-    float          acc[CTRL_TOK];
-#pragma unroll
-    for (int t = 0; t < CTRL_TOK; t++) {
-        acc[t] = 0.0f;
-    }
-    for (int64_t q0 = 0; 32 * q0 < nb; q0 += CTRL_WARPS) {
-        const int64_t b = lane + 32 * (q0 + warp);
-        if (b < nb) {
-            float4 w[8];
-#pragma unroll
-            for (int q = 0; q < 8; q++) {
-                w[q] = __ldg(row + b * 8 + q);
-            }
-            const int     hs = b >= nbe;  // the input the block is of: cur or msg
-            const int64_t at = b * 32 - hs * e;
-#pragma unroll
-            for (int h = 0; h < 2; h++) {
-                float v[16];
-                ctrl_half(w, h, v);
-#pragma unroll
-                for (int t = 0; t < CTRL_TOK; t++) {
-                    if (t < n) {
-                        const float * x  = (const float *) src(a, hs) + t * e + at + 16 * h;
-                        const float   rt = rs[t][hs];
-                        float         s  = 0.0f;
-#pragma unroll
-                        for (int j = 0; j < 16; j++) {
-                            const float xv = x[j] * rt;
-                            s += v[j] * xv;
-                        }
-                        part[t][warp][h][lane] = s;
-                    }
-                }
-            }
-        }
-        __syncthreads();
-        if (warp == 0) {
-#pragma unroll
-            for (int u = 0; u < CTRL_WARPS; u++) {
-                if (lane + 32 * (q0 + u) >= nb) {
-                    break;
-                }
-#pragma unroll
-                for (int h = 0; h < 2; h++) {
-#pragma unroll
-                    for (int t = 0; t < CTRL_TOK; t++) {
-                        if (t < n) {
-                            acc[t] += part[t][u][h][lane];
-                        }
-                    }
-                }
-            }
-        }
-        __syncthreads();
-    }
-    if (warp != 0) {
+    if (!live || g != 0) {
         return;
     }
 #pragma unroll
     for (int t = 0; t < CTRL_TOK; t++) {
         if (t < n) {
-            const float s = warp_sum(acc[t]);
-            if (lane == 0) {
-                ((float *) a.dst)[t * m + r] = s * sc;
-            }
-        }
-    }
-}
-
-// ink_ctrl_gate: params gain scale, forget scale, a zero; sources cur, msg [e, n], d [k, n] (the
-// down projection), gain, forget F32 [k, e]; dst [e, n]: ctrl_mix of row r's gain and forget
-// products, a warp a row. With k at most 512 (16 blocks) lanes 16-31 of linear's warp hold 0,
-// so its xor-16 step only adds 0 to lanes 0-15; here lanes 0-15 make the gain row's lanes and
-// 16-31 the forget row's, each half adds the zero (a parameter, so the add stays) and then runs
-// the xor 8, 4, 2, 1 steps among its own lanes: linear's sums, both rows at once.
-__global__ void __launch_bounds__(CTRL_THREADS) ctrl_gate_kernel(const A a) {
-    pdl_wait();
-    const float   sg = pf(a.params[0]), sf = pf(a.params[1]), zero = pf(a.params[2]);
-    const int64_t e = a.ne[0], n = a.ne[1], nb = a.src_ne[2][0] / 32;
-    const int     warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int64_t r = (int64_t) blockIdx.x * (blockDim.x / 32) + warp;
-    if (r >= e) {
-        return;
-    }
-    const int g = lane / 16, l = lane % 16;  // gain or forget, and the lane of linear's warp
-    float     acc[CTRL_TOK];
-#pragma unroll
-    for (int t = 0; t < CTRL_TOK; t++) {
-        acc[t] = 0.0f;
-    }
-    if (l < nb) {
-        const float4 * row = (const float4 *) (src(a, 3 + g) + r * a.src_nb[3 + g][1]) + l * 8;
-        float4         w[8];
-#pragma unroll
-        for (int q = 0; q < 8; q++) {
-            w[q] = __ldg(row + q);
-        }
-#pragma unroll
-        for (int h = 0; h < 2; h++) {
-            float v[16];
-            ctrl_half(w, h, v);
-#pragma unroll
-            for (int t = 0; t < CTRL_TOK; t++) {
-                if (t < n) {
-                    const float * x = (const float *) (src(a, 2) + t * a.src_nb[2][1]) + l * 32 + 16 * h;
-                    float         s = 0.0f;
-#pragma unroll
-                    for (int j = 0; j < 16; j++) {
-                        s += v[j] * x[j];
-                    }
-                    acc[t] += s;
-                }
-            }
-        }
-    }
-    const float sc = g ? sf : sg;
-#pragma unroll
-    for (int t = 0; t < CTRL_TOK; t++) {
-        if (t < n) {
-            float v = acc[t] + zero;
-            for (int o = 8; o > 0; o >>= 1) {
-                v += __shfl_xor_sync(0xffffffffu, v, o);
-            }
-            const float y = v * sc;
-            const float f = __shfl_sync(0xffffffffu, y, 16);
-            if (lane == 0) {
-                const int64_t i = t * e + r;
-                const float   c = ((const float *) src(a, 0))[i];
-                const float   m = ((const float *) src(a, 1))[i];
-                ((float *) a.dst)[i] = ctrl_mix(c, m, y, f);
-            }
+            const int64_t i  = t * e + r;
+            const float   c  = ((const float *) src(a, 0))[i];
+            const float   m  = ((const float *) src(a, 1))[i];
+            const float   gt = tanhf(y[t]);
+            const float   ft = tanhf(yf[t][rl]);
+            ((float *) a.dst)[i] = c - ft * c + gt * m;
         }
     }
 }
@@ -1399,7 +1329,7 @@ __global__ void softcap_kernel(const A a) {
 
 }  // namespace
 
-extern "C" const void * const legion_ink_kernels[20] = {
+extern "C" const void * const legion_ink_kernels[19] = {
     reinterpret_cast<const void *>(&mix_kernel),
     reinterpret_cast<const void *>(&ctrl_in_kernel),
     reinterpret_cast<const void *>(&ctrl_out_kernel),
@@ -1418,6 +1348,5 @@ extern "C" const void * const legion_ink_kernels[20] = {
     reinterpret_cast<const void *>(&attn_kernel<2, ATTN_DECODE_ROWS>),
     reinterpret_cast<const void *>(&attn_kernel<4, ATTN_DECODE_ROWS>),
     reinterpret_cast<const void *>(&mm_id_vec_kernel),
-    reinterpret_cast<const void *>(&ctrl_down_kernel),
     reinterpret_cast<const void *>(&ctrl_gate_kernel),
 };
