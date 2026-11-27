@@ -83,11 +83,21 @@ __device__ __forceinline__ const char * src(const A & a, int s) {
 // launches every kernel here with programmatic stream serialization, as glm5next.cu's kernels
 // are (launch_pdl), so the GPU sets a kernel up while the one ahead of it is still running. Each
 // kernel's first act is this wait, for the kernel ahead to complete and its writes to be
-// visible, as a plain launch does: nothing reads or writes before it, nothing triggers early,
-// so the same bits. Below sm_90 it compiles to nothing (and the launch is plain).
+// visible, as a plain launch does: nothing reads or writes before it (but rms_kernel's leaf
+// weights and l2_prefetch's hints), nothing triggers early, so the same bits. Below sm_90 it compiles to nothing (and the launch is plain).
 __device__ __forceinline__ void pdl_wait() {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.wait;\n" ::: "memory");
+#endif
+}
+
+// A decode kernel's weights (and its conv history) asked into L2 before pdl_wait (#1221 r6), so
+// their DRAM latency overlaps the kernel ahead. A prefetch moves no value into a register: L2 is
+// where every write lands, so even a line the kernel ahead then writes reads its new value after
+// the wait. The same loads, the same bits. Below sm_90 (no programmatic launches) nothing.
+__device__ __forceinline__ void l2_prefetch(const void * p) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("prefetch.global.L2 [%0];\n" ::"l"(__cvta_generic_to_global(p)));
 #endif
 }
 
@@ -419,9 +429,20 @@ constexpr int CTRL_RANK = 512;
 // (the down projection), gain, forget F32 [k, e]; dst [e, n]: ink_ctrl_out's expression of
 // row r's gain and forget products. k a multiple of 32, at most CTRL_RANK; n at most CTRL_TOK.
 __global__ void __launch_bounds__(2 * CTRL_ROWS) ctrl_gate_kernel(const A a) {
+    const int64_t e = a.ne[0], n = a.ne[1], k = a.src_ne[2][0];
+    {
+        // this thread's gain or forget row, its 128-byte lines (l2_prefetch)
+        const int64_t r = (int64_t) blockIdx.x * CTRL_ROWS + threadIdx.x % CTRL_ROWS;
+        const int     g = threadIdx.x / CTRL_ROWS;
+        if (r < e) {
+            const char * row = src(a, 3 + g) + r * a.src_nb[3 + g][1];
+            for (int64_t b = 0; b < k * 4; b += 128) {
+                l2_prefetch(row + b);
+            }
+        }
+    }
     pdl_wait();
     const float   zero = pf(a.params[2]);
-    const int64_t e = a.ne[0], n = a.ne[1], k = a.src_ne[2][0];
     const int     nb = (int) (k / 32);
     __shared__ float xs[CTRL_TOK * CTRL_RANK];
     __shared__ float yf[CTRL_TOK][CTRL_ROWS];
@@ -567,7 +588,6 @@ __device__ __forceinline__ float conv_res(const A & a, bool dyn, int64_t i, floa
 // added to the output. One thread per (sequence,
 // channel), the window in registers, token after token: a decode step's. ----
 __global__ void conv_kernel(const A a) {
-    pdl_wait();
     const int64_t n_tok = a.params[0], off = a.params[1];
     const bool    dyn   = a.params[2] != 0;
     const float   scale = pf(a.params[3]);
@@ -575,11 +595,16 @@ __global__ void conv_kernel(const A a) {
     const int     K = (int) a.src_ne[1][0];
     const int64_t ch = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t s  = blockIdx.y;
+    float * hist = (float *) ((char *) a.src[2] + s * a.src_nb[2][2] + (off + ch) * a.src_nb[2][1]);
+    const float * w = (const float *) (src(a, 1) + ch * a.src_nb[1][1]);
+    if (ch < c) {
+        l2_prefetch(w);
+        l2_prefetch(hist);
+    }
+    pdl_wait();
     if (ch >= c) {
         return;
     }
-    float * hist = (float *) ((char *) a.src[2] + s * a.src_nb[2][2] + (off + ch) * a.src_nb[2][1]);
-    const float * w = (const float *) (src(a, 1) + ch * a.src_nb[1][1]);
     float         tw[CONV_TAPS], win[CONV_TAPS];
 #pragma unroll
     for (int j = 0; j < CONV_TAPS; j++) {
@@ -749,23 +774,28 @@ __global__ void clip_kernel(const A a) {
 // floor, alpha; sources x0 [d0, h0, n], scale0 [d0, h0], x1 [d1, h1, n], scale1 [d1, h1],
 // pos [n]; dst x0's rows, then x1's. A warp per row, as clip_kernel. ----
 __global__ void clip2_kernel(const A a) {
-    pdl_wait();
     const bool    has_tau = a.params[2] != 0;
     const float   floor_  = pf(a.params[3]), alpha = pf(a.params[4]);
     const int64_t rows0 = a.src_ne[0][1] * a.src_ne[0][2];
     const int64_t rows  = rows0 + a.src_ne[2][1] * a.src_ne[2][2];
     const int     lane  = threadIdx.x % 32;
     int64_t       row   = (int64_t) blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
-    if (row >= rows) {
-        return;
-    }
+    const bool    live  = row < rows;
     const int     j   = row >= rows0 ? 1 : 0;
     const int64_t off = j ? rows0 * a.src_ne[0][0] : 0;
     row -= j * rows0;
     const int64_t   d = a.src_ne[2 * j][0], h = a.src_ne[2 * j][1];
     const int64_t   hd = row % h, t = row / h;
-    const float *   x   = (const float *) src(a, 2 * j) + row * d;
     const float *   sc  = (const float *) src(a, 2 * j + 1) + hd * d;
+    // the row's scale, a 128-byte line a lane (l2_prefetch)
+    if (live && 32 * lane < d) {
+        l2_prefetch(sc + 32 * lane);
+    }
+    pdl_wait();
+    if (!live) {
+        return;
+    }
+    const float *   x   = (const float *) src(a, 2 * j) + row * d;
     const int32_t * pos = has_tau ? (const int32_t *) src(a, 4) : nullptr;
     clip_row(x, sc, d, pf(a.params[j]), pos, t, floor_, alpha, (float *) a.dst + off + row * d, lane);
 }
@@ -782,7 +812,6 @@ __global__ void clip2_kernel(const A a) {
 // rms rms_kernel<1>'s sums (warp k of its block holds elements 32 k ..: their double warp sums,
 // then the sum of the 8 warps', 0 past the row) and rms_scale. ----
 __global__ void kv_kernel(const A a) {
-    pdl_wait();
     const int64_t base = a.params[0];
     const bool    dyn  = a.params[1] != 0;
     const float   scale = pf(a.params[2]), thr = pf(a.params[3]), eps = pf(a.params[4]);
@@ -790,12 +819,23 @@ __global__ void kv_kernel(const A a) {
     const int     K    = (int) a.src_ne[2][0];
     const int     lane = threadIdx.x % 32;
     const int64_t row  = (int64_t) blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
-    if (row >= 2 * nr * n) {
-        return;
-    }
+    const bool    live = row < 2 * nr * n;
     const int64_t t = row / (2 * nr), hr = row % (2 * nr);
     const int     vv = hr >= nr ? 1 : 0;
     const int64_t head = hr - vv * nr;
+    // the lane's conv taps and history (l2_prefetch), read in the loop below
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        const int64_t ch = head * d + lane + 32 * k;
+        if (live && lane + 32 * k < d) {
+            l2_prefetch(src(a, 2 + vv) + ch * a.src_nb[2 + vv][1]);
+            l2_prefetch((const char *) a.src[4] + t * a.src_nb[4][2] + (base + vv * kvw + ch) * a.src_nb[4][1]);
+        }
+    }
+    pdl_wait();
+    if (!live) {
+        return;
+    }
     const float * x    = (const float *) src(a, vv) + t * kvw;
     const float * dr0  = dyn ? (const float *) (src(a, 5 + vv) + t * a.src_nb[5 + vv][1]) : nullptr;
     const int64_t heads = dyn ? a.src_ne[5 + vv][0] / K : 1;
