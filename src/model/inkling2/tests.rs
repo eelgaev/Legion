@@ -1121,6 +1121,72 @@ fn cuda_expert_matmul_keeps_its_lane_sums() {
     }
 }
 
+/// #1221 r8: the GPU expert matmul decodes each of the 256 E4M3 codes (NaN, subnormals and
+/// negative zero too) to the floats of the ldexpf code before round 8: `(8 + m) 2^(e - 10)`,
+/// `m 2^-9` when e is 0, 0 for NaN. Row r of an MXFP8 stack holds code r at lane r % 32 (the
+/// rest 0), so with x 1 at that lane alone the row's sum is that float (+0 for a zero), in the
+/// decode (1, 2 tokens: two experts of the same rows) and prompt (64) kernels.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_mxfp8_codes_decode_as_before() {
+    use crate::ggml::ComputeAllocator;
+    let old = |b: u8| -> f32 {
+        let (e, m) = (((b >> 3) & 15) as i32, (b & 7) as f32);
+        let v = match (e, b & 7) {
+            (0, _) => m * 2f32.powi(-9),
+            (15, 7) => 0.0,
+            _ => (8.0 + m) * 2f32.powi(e - 10),
+        };
+        if b & 0x80 != 0 { -v } else { v }
+    };
+    let mut gpu = gpu_backend();
+    let (k, m) = (32usize, 256usize);
+    let wb: Vec<u8> = (0..2 * m)
+        .flat_map(|r| (0..k).map(move |l| if l == r % 32 { (r % m) as u8 } else { 0 }))
+        .collect();
+    // A graph per lane l: x is 1 at lane l only, so rows r with r % 32 == l give their code's
+    // float and the others 0.
+    for n_tok in [1usize, 2, 64] {
+        for l in 0..k {
+            let ctx = Context::new(16, 16);
+            let w = ctx
+                .new_tensor(types::I8, &[k as i64, m as i64, 2])
+                .as_input();
+            let scale = ctx.new_tensor(types::F32, &[1, m as i64, 2]).as_input();
+            let x = ctx
+                .new_tensor(types::F32, &[k as i64, 1, n_tok as i64])
+                .as_input();
+            let id = ctx.new_tensor(types::I32, &[1, n_tok as i64]).as_input();
+            let y = ops::mm_id(&ctx, w, Some(scale), x, id).as_output();
+            let mut graph = ctx.new_graph(16);
+            graph.expand(y);
+            ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+                .unwrap();
+            w.set_bytes(&wb);
+            scale.set_f32(&vec![1.0; 2 * m]);
+            let xv: Vec<f32> = (0..k * n_tok)
+                .map(|i| if i % k == l { 1.0 } else { 0.0 })
+                .collect();
+            x.set_f32(&xv);
+            let ids: Vec<i32> = (0..n_tok as i32).map(|t| t % 2).collect();
+            id.set_i32(&ids);
+            gpu.compute(&graph).unwrap();
+            let y = y.to_f32();
+            for t in 0..n_tok {
+                for r in 0..m {
+                    let want = if r % 32 == l { old(r as u8) + 0.0 } else { 0.0 };
+                    assert_eq!(
+                        y[t * m + r].to_bits(),
+                        want.to_bits(),
+                        "{n_tok} tokens, code {r:#04x} at lane {l}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// `t`'s per-expert entries of each token in the order of the experts' ids `ids` (`[k, n]`):
 /// `t` `[k, n]` (the ids, the weights) or `[w, k, n]` (the experts' rows).
 #[cfg(feature = "cuda")]
