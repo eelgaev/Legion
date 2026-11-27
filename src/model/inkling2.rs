@@ -103,12 +103,49 @@ fn bf16_set() -> bool {
     *ON.get_or_init(|| std::env::var("LEGION_DEBUG_INK_BF16_SET").map_or(true, |v| v.trim() != "0"))
 }
 
-/// Whether `Model::ink_mm_set` runs Q8_0 sets (and single Q8_0 products) on the staged kernel
-/// (#1221 r9, [`glm_ops::linear_set_staged`]): unless `LEGION_DEBUG_INK_Q8_STAGE=0` (A/B runs:
-/// round 8's linear_set_q8 sets and linear_mv_q8 products). The same bits either way.
-fn q8_set_stage() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("LEGION_DEBUG_INK_Q8_STAGE").map_or(true, |v| v.trim() != "0"))
+/// The grouped mv variants of the NVFP4 experts' one-token tiles an A/B run may pick (#1221 r9,
+/// [`expert_mv`]), all compiled for them (`mvg<1>` without the SwiGLU) and all the same bits:
+/// `pR` R row tiles of 16 rows a CTA (the default's p8), `wWpR` tiles of 16 * W rows, `sS`
+/// stages of S blocks (16 otherwise), `tT` whole row tiles prefetched T tiles ahead (t2 is
+/// `nvfp4_mm::DOWN_MV_TILE`, [`EXPERTS_TILE`]'s).
+pub(crate) const EXPERT_MVS: [(&str, nvfp4_mm::GroupedMv); 15] = {
+    const fn g(rtw: i32, rpt: i32, sb: i32, pft: i32) -> nvfp4_mm::GroupedMv {
+        nvfp4_mm::GroupedMv { rtw, rpt, sb, pft }
+    }
+    [
+        ("p1", g(1, 1, 16, 0)),
+        ("p2", g(1, 2, 16, 0)),
+        ("p4", g(1, 4, 16, 0)),
+        ("p8", g(1, 8, 16, 0)),
+        ("p16", g(1, 16, 16, 0)),
+        ("w2p2", g(2, 2, 16, 0)),
+        ("w2p4", g(2, 4, 16, 0)),
+        ("w4p1", g(4, 1, 16, 0)),
+        ("w4p2", g(4, 2, 16, 0)),
+        ("s24", g(1, 8, 24, 0)),
+        ("s40", g(1, 8, 40, 0)),
+        ("t1", g(1, 8, 16, 1)),
+        ("t2", g(1, 8, 16, 2)),
+        ("t1p4", g(1, 4, 16, 1)),
+        ("t1p16", g(1, 16, 16, 1)),
+    ]
+};
+
+/// The routed NVFP4 experts' grouped mv variant at one-token tiles for A/B runs (#1221 r9): the
+/// [`EXPERT_MVS`] name in `LEGION_DEBUG_INK_DOWN_MV` for the down projection,
+/// `LEGION_DEBUG_INK_GU_MV` for the gate and up rows; unset (or not a name), the default's.
+fn expert_mv(down: bool) -> Option<nvfp4_mm::GroupedMv> {
+    static MV: std::sync::OnceLock<[Option<nvfp4_mm::GroupedMv>; 2]> = std::sync::OnceLock::new();
+    MV.get_or_init(|| {
+        ["LEGION_DEBUG_INK_GU_MV", "LEGION_DEBUG_INK_DOWN_MV"]
+            .map(|var| expert_mv_of(std::env::var(var).ok().as_deref()))
+    })[down as usize]
+}
+
+/// [`expert_mv`] given the environment's value.
+pub(crate) fn expert_mv_of(env: Option<&str>) -> Option<nvfp4_mm::GroupedMv> {
+    let name = env?.trim();
+    EXPERT_MVS.iter().find(|(n, _)| *n == name).map(|&(_, g)| g)
 }
 
 /// [`experts_flags`] given the environment's value.
@@ -493,8 +530,7 @@ impl Arch for Ink2Params {
     /// the same index as `argmax` (the first of the largest) for NaN-free logits. The soft cap
     /// passes a NaN through (`tanh(NaN)` is NaN), so that rests on the output projection.
     /// The projection reads only the unpadded vocabulary's rows (#1221 r9: the padding's
-    /// logits were cut anyway), a Q8_0 head at decode steps on the staged set kernel
-    /// ([`glm_ops::linear_set_staged`], [`q8_set_stage`]): the same bits.
+    /// logits were cut anyway): the same bits.
     fn head<'a>(
         &self,
         m: &'a Model,
@@ -509,17 +545,7 @@ impl Arch for Ink2Params {
         } else {
             w
         };
-        let n: i64 = x.ne()[1..].iter().product();
-        let logits = if q8_set_stage()
-            && ws.is_none()
-            && x.ty() == types::F32
-            && x.is_contiguous()
-            && glm_ops::linear_set_takes(&[w], n)
-        {
-            glm_ops::linear_set_staged(ctx, &[(w, x, glm_ops::SetEpi::Plain)]).remove(0)
-        } else {
-            m.glm_mm_w(ctx, name, w, ws, x, None)?
-        };
+        let logits = m.glm_mm_w(ctx, name, w, ws, x, None)?;
         let logits = ops::softcap(ctx, logits, self.softcap, self.n_vocab);
         Ok(Some((logits, glm_ops::argmax_wide(ctx, logits))))
     }
@@ -642,9 +668,7 @@ impl Model {
     /// them, Q8_0 weights without a scale over up to 8 tokens (decode steps; #1221 r6) or BF16
     /// ones (the NVFP4 checkpoint's) on the GB10 kernels, at one token (linear_mv_bf16's sums,
     /// [`glm_ops::linear_set_bf16_takes`]; r7) and at 2-8 (linear_mv_bf16x's; r9), unless `own`
-    /// (traced runs keep a node a product); else a node each. Q8_0 sets run CUDA's staged
-    /// kernel ([`glm_ops::linear_set_staged`], [`q8_set_stage`]; r9), and then a single Q8_0
-    /// product (`N` 1) takes it too.
+    /// (traced runs keep a node a product); else a node each.
     fn ink_mm_set<'a, const N: usize>(
         &'a self,
         ctx: &'a Context,
@@ -674,9 +698,8 @@ impl Model {
             .collect::<Result<Vec<_>, _>>()?;
         let tokens = |x: &Tensor<'_>| -> i64 { x.ne()[1..].iter().product() };
         let n = tokens(&xs[0]);
-        let staged = q8_set_stage() && glm_ops::linear_set_takes(&ws, n);
         let set = !own
-            && ((2..=glm_ops::SET_MAX).contains(&N) || (N == 1 && staged))
+            && (2..=glm_ops::SET_MAX).contains(&N)
             && xs
                 .iter()
                 .all(|x| x.ty() == types::F32 && x.is_contiguous() && tokens(x) == n)
@@ -692,11 +715,7 @@ impl Model {
                 .zip(xs)
                 .map(|(&w, x)| (w, x, glm_ops::SetEpi::Plain))
                 .collect();
-            if staged {
-                glm_ops::linear_set_staged(ctx, &set)
-            } else {
-                glm_ops::linear_set(ctx, &set)
-            }
+            glm_ops::linear_set(ctx, &set)
         } else {
             names
                 .iter()
@@ -1133,7 +1152,7 @@ impl Model {
         } else {
             ops::clip2(ctx, [q, r], tau)
         };
-        let [sinks] = self.ink_mm_set(ctx, ip, ["attn_sink_proj.weight"], xq, &mut rows, tap.on)?;
+        let sinks = self.ink_mm_b(ctx, ip, "attn_sink_proj.weight", xq, &mut rows)?;
         tap.tap("r_clip", il, r);
         tap.tap("sinks", il, sinks);
         tap.tap("Qcur", il, q);
@@ -1234,14 +1253,7 @@ impl Model {
         tap.tap("attn_gate", il, g);
         let o = ops::sigmul(ctx, o, g);
         tap.tap("attn_gated", il, o);
-        let [o] = self.ink_mm_set(
-            ctx,
-            ip,
-            ["attn_output.weight"],
-            o,
-            &mut Bf16Rows::default(),
-            tap.on,
-        )?;
+        let o = self.ink_mm(ctx, ip, "attn_output.weight", o)?;
         tap.tap("attn_proj", il, o);
         self.ink_conv_add(pass, il, ip, "attn_post_conv.weight", o, None, 2 * kvw, res)
     }
@@ -1344,8 +1356,9 @@ impl Model {
                 None => flags & EXPERTS_TILE_GU != 0,
             };
             let plan_of = gate_up.filter(|_| flags & EXPERTS_PLAN != 0);
-            return Ok(nvfp4_mm::mul_mat_id_with(
-                ctx, w, x, ids, scale, tile, plan_of,
+            let mv = expert_mv(gate_up.is_some());
+            return Ok(nvfp4_mm::mul_mat_id_mv(
+                ctx, w, x, ids, scale, tile, plan_of, mv,
             ));
         }
         if !ops::mm_id_takes(w, scale) {

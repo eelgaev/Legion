@@ -1642,11 +1642,6 @@ static_assert((MMS_G * 32 + 15 + 15) / 16 * 16 <= MMS_SCALES, "MXFP8 weights bef
 static_assert(MMS_SCALES / 16 <= 28 && (MMS_BYTES - MMS_SCALES) / 16 <= 4,
               "a row's chunks: weights lanes 0-27, scales lanes 28-31");
 static_assert(MMS_ROWS == MM_VEC_ROWS && MMS_WARPS * 32 == MM_THREADS, "the vec kernel's grid");
-// MMS_SCALES and MMS_BYTES for G groups a stage (#1221 r9: mm_id_stage_kernel's G and ST options
-// for A/B runs, LEGION_DEBUG_INK_MM_STAGE 3 and 4; the same sums with any of them).
-__host__ __device__ constexpr int mms_scales(int G) { return (G * 34 + 15 + 15) / 16 * 16; }
-__host__ __device__ constexpr int mms_bytes(int G) { return mms_scales(G) + (G * 4 + 12 + 15) / 16 * 16; }
-static_assert(mms_scales(MMS_G) == MMS_SCALES && mms_bytes(MMS_G) == MMS_BYTES, "the defaults");
 
 // A 16-byte copy from global memory to shared memory, asynchronous on sm_80+ (and then waited
 // for by mms_wait), a plain load and store below.
@@ -1703,12 +1698,9 @@ __device__ __forceinline__ void mms_prefetch(const char * p, int64_t n, int lane
 #endif
 }
 
-template <int TY, bool PF, int G, int ST>
-__device__ __forceinline__ void mm_id_stage(const A & a, char (*ring)[MMS_ROWS][mms_bytes(G)]) {
+template <int TY, bool PF>
+__device__ __forceinline__ void mm_id_stage(const A & a, char (*ring)[MMS_ROWS][MMS_BYTES]) {
     static_assert(TY == TYPE_Q8_0 || TY == TYPE_I8, "staged stacks");
-    constexpr int SC = mms_scales(G), BY = mms_bytes(G);
-    static_assert((G * 32 + 15 + 15) / 16 * 16 <= SC && SC / 16 <= 28 && (BY - SC) / 16 <= 4 && ST >= 2,
-                  "a row's chunks: weights lanes 0-27, scales lanes 28-31");
     constexpr int BPG = TY == TYPE_Q8_0 ? 34 : 32;
     const int64_t k = a.src_ne[0][0], E = a.src_ne[0][2];
     const int64_t m = a.ne[0], n_used = a.ne[1];
@@ -1731,7 +1723,7 @@ __device__ __forceinline__ void mm_id_stage(const A & a, char (*ring)[MMS_ROWS][
     const float * xr =
         (const float *) src(a, 1) + (pr / n_used * nx + (nx == 1 ? 0 : pr % n_used)) * k;
     const int64_t ng  = k / 32;
-    const int     nst = (int) ((ng + G - 1) / G);
+    const int     nst = (int) ((ng + MMS_G - 1) / MMS_G);
     const char *  w   = src(a, 0) + e * a.src_nb[0][2] + r0 * a.src_nb[0][1];
     const float * sc  = TY == TYPE_I8 ? (const float *) src(a, 3) + (e * m + r0) * ng : nullptr;
     if constexpr (PF) {
@@ -1743,8 +1735,8 @@ __device__ __forceinline__ void mm_id_stage(const A & a, char (*ring)[MMS_ROWS][
     }
     // Stage st of row rr: its groups' bytes (and scales) and where they start in the stage.
     auto issue = [&](int st) {
-        char(*buf)[BY] = ring[st % ST];
-        const int64_t g0 = (int64_t) st * G, gn = min((int64_t) G, ng - g0);
+        char(*buf)[MMS_BYTES] = ring[st % MMS_STAGES];
+        const int64_t g0 = (int64_t) st * MMS_G, gn = min((int64_t) MMS_G, ng - g0);
 #pragma unroll
         for (int rr = 0; rr < MMS_ROWS; rr++) {
             if (rr < nr) {
@@ -1758,7 +1750,7 @@ __device__ __forceinline__ void mm_id_stage(const A & a, char (*ring)[MMS_ROWS][
                         mms_chunks((const char *) (sc + rr * ng + g0), gn * 4, off, nch);
                     const int j = lane - (32 - 4);
                     if (j >= 0 && j < nch) {
-                        mms_copy(buf[rr] + SC + 16 * j, s + 16 * j);
+                        mms_copy(buf[rr] + MMS_SCALES + 16 * j, s + 16 * j);
                     }
                 }
             }
@@ -1766,24 +1758,24 @@ __device__ __forceinline__ void mm_id_stage(const A & a, char (*ring)[MMS_ROWS][
     };
     float acc[MMS_ROWS] = {};
 #pragma unroll
-    for (int s = 0; s < ST - 1; s++) {
+    for (int s = 0; s < MMS_STAGES - 1; s++) {
         if (s < nst) {
             issue(s);
         }
         mms_commit();
     }
     for (int st = 0; st < nst; st++) {
-        mms_wait<ST - 2>();
+        mms_wait<MMS_STAGES - 2>();
         // Every lane's copies of stage st are in, and every lane is done with stage st - 1,
-        // whose buffers stage st + ST - 1 takes.
+        // whose buffers stage st + MMS_STAGES - 1 takes.
         __syncwarp();
-        if (st + ST - 1 < nst) {
-            issue(st + ST - 1);
+        if (st + MMS_STAGES - 1 < nst) {
+            issue(st + MMS_STAGES - 1);
         }
         mms_commit();
-        char(*buf)[BY] = ring[st % ST];
-        const int64_t g0 = (int64_t) st * G;
-        const int     gn = (int) min((int64_t) G, ng - g0);
+        char(*buf)[MMS_BYTES] = ring[st % MMS_STAGES];
+        const int64_t g0 = (int64_t) st * MMS_G;
+        const int     gn = (int) min((int64_t) MMS_G, ng - g0);
         int           woff[MMS_ROWS], soff[MMS_ROWS];
 #pragma unroll
         for (int rr = 0; rr < MMS_ROWS; rr++) {
@@ -1795,7 +1787,7 @@ __device__ __forceinline__ void mm_id_stage(const A & a, char (*ring)[MMS_ROWS][
             }
         }
 #pragma unroll
-        for (int g = 0; g < G; g++) {
+        for (int g = 0; g < MMS_G; g++) {
             if (g < gn) {
                 const float xv = xr[(g0 + g) * 32 + lane];
 #pragma unroll
@@ -1808,7 +1800,7 @@ __device__ __forceinline__ void mm_id_stage(const A & a, char (*ring)[MMS_ROWS][
                             v = __half2float(d) * (float) ((const int8_t *) (b + 2))[lane];
                         } else {
                             const float s =
-                                *(const float *) (buf[rr] + SC + soff[rr] + 4 * g);
+                                *(const float *) (buf[rr] + MMS_SCALES + soff[rr] + 4 * g);
                             v = e4m3_bits(((const uint8_t *) b)[lane]) * s;
                         }
                     }
@@ -1826,31 +1818,15 @@ __device__ __forceinline__ void mm_id_stage(const A & a, char (*ring)[MMS_ROWS][
     }
 }
 
-// PF: mms_prefetch of the warp's rows first (#1221 r9, LEGION_DEBUG_INK_MM_STAGE=2). G groups a
-// stage, ST stages (r9 A/B option 4 is <12, 3>).
-template <bool PF, int G = MMS_G, int ST = MMS_STAGES>
-__global__ void __launch_bounds__(MMS_WARPS * 32) mm_id_stage_kernel(const A a) {
+// PF: mms_prefetch of the warp's rows first (#1221 r9, LEGION_DEBUG_INK_MM_STAGE=2).
+template <bool PF> __global__ void __launch_bounds__(MMS_WARPS * 32) mm_id_stage_kernel(const A a) {
     pdl_wait();
-    __shared__ __align__(16) char ring[MMS_WARPS][ST][MMS_ROWS][mms_bytes(G)];
-    char(*mine)[MMS_ROWS][mms_bytes(G)] = ring[threadIdx.x / 32];
-    if (a.src_type[0] == TYPE_Q8_0) {
-        mm_id_stage<TYPE_Q8_0, PF, G, ST>(a, mine);
-    } else {
-        mm_id_stage<TYPE_I8, PF, G, ST>(a, mine);
-    }
-}
-
-// mm_id_stage_kernel with three stages of MMS_G and three blocks an SM (32 KB of shared memory
-// and at most 85 registers a thread; #1221 r9 A/B option 3). A kernel of its own: a minimum
-// block count on mm_id_stage_kernel's launch bounds changes its code even at 1.
-__global__ void __launch_bounds__(MMS_WARPS * 32, 3) mm_id_stage3_kernel(const A a) {
-    pdl_wait();
-    __shared__ __align__(16) char ring[MMS_WARPS][3][MMS_ROWS][MMS_BYTES];
+    __shared__ __align__(16) char ring[MMS_WARPS][MMS_STAGES][MMS_ROWS][MMS_BYTES];
     char(*mine)[MMS_ROWS][MMS_BYTES] = ring[threadIdx.x / 32];
     if (a.src_type[0] == TYPE_Q8_0) {
-        mm_id_stage<TYPE_Q8_0, false, MMS_G, 3>(a, mine);
+        mm_id_stage<TYPE_Q8_0, PF>(a, mine);
     } else {
-        mm_id_stage<TYPE_I8, false, MMS_G, 3>(a, mine);
+        mm_id_stage<TYPE_I8, PF>(a, mine);
     }
 }
 
@@ -1870,7 +1846,7 @@ __global__ void softcap_kernel(const A a) {
 
 }  // namespace
 
-extern "C" const void * const legion_ink_kernels[29] = {
+extern "C" const void * const legion_ink_kernels[27] = {
     reinterpret_cast<const void *>(&mix_kernel),
     reinterpret_cast<const void *>(&ctrl_in_kernel),
     reinterpret_cast<const void *>(&ctrl_out_kernel),
@@ -1898,6 +1874,4 @@ extern "C" const void * const legion_ink_kernels[29] = {
     reinterpret_cast<const void *>(&clip2_kernel),
     reinterpret_cast<const void *>(&mm_id_stage_kernel<false>),
     reinterpret_cast<const void *>(&mm_id_stage_kernel<true>),
-    reinterpret_cast<const void *>(&mm_id_stage3_kernel),
-    reinterpret_cast<const void *>(&mm_id_stage_kernel<false, 12, 3>),
 };

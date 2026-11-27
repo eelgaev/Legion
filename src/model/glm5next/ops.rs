@@ -1036,32 +1036,6 @@ pub fn linear_set<'a>(
     ctx: &'a Context,
     set: &[(Tensor<'a>, Tensor<'a>, SetEpi<'a>)],
 ) -> Vec<Tensor<'a>> {
-    linear_set_with(ctx, set, false)
-}
-
-/// [`linear_set`] of Q8_0 weights with plain epilogues on CUDA's staged kernel (#1221 r9,
-/// Inkling-2's attention; sm_80+, else the plain one): each row's weights copied through shared
-/// memory a few blocks ahead of linear_mv_q8's sums, the same bits.
-pub fn linear_set_staged<'a>(
-    ctx: &'a Context,
-    set: &[(Tensor<'a>, Tensor<'a>, SetEpi<'a>)],
-) -> Vec<Tensor<'a>> {
-    assert!(
-        set.iter()
-            .all(|s| s.0.ty() == types::Q8_0 && matches!(s.2, SetEpi::Plain)),
-        "glm_linear_set: staged, Q8_0 and plain"
-    );
-    linear_set_with(ctx, set, true)
-}
-
-/// The CUDA node's params[6] bit of [`linear_set_staged`] (above [`small_mv`]'s bits).
-const LS_STAGED: i32 = 1 << 16;
-
-fn linear_set_with<'a>(
-    ctx: &'a Context,
-    set: &[(Tensor<'a>, Tensor<'a>, SetEpi<'a>)],
-    staged: bool,
-) -> Vec<Tensor<'a>> {
     assert!(
         (1..=SET_MAX).contains(&set.len()),
         "glm_linear_set: 1-3 products"
@@ -1074,8 +1048,7 @@ fn linear_set_with<'a>(
         "glm_linear_set: Q8_0 or BF16 (plain), up to 8 tokens"
     );
     let mut args = Vec::new();
-    let mv = small_mv_param() | if staged { LS_STAGED } else { 0 };
-    let mut params = [set.len() as i32, 0, 0, 0, 0, n as i32, mv];
+    let mut params = [set.len() as i32, 0, 0, 0, 0, n as i32, small_mv_param()];
     let mut gate = None;
     for (g, &(w, x, epi)) in set.iter().enumerate() {
         assert_eq!(x.ne()[0], w.ne()[0], "glm_linear_set: x rows");

@@ -1020,101 +1020,6 @@ __global__ void __launch_bounds__(128) linear_set_q8(const LinSet s) {
     }
 }
 
-// linear_set_q8 with its weights staged (#1221 r9, Inkling-2's Q8_0 attention at decode and
-// verify steps; params[6] bit LS_STAGED, plain epilogues): linear_mv_q8_row's loads are 2 bytes
-// a lane (64 bytes a warp load). Here a warp copies its row 8 blocks (272 bytes) at a time into
-// its own ring of LSS_STAGES stages in shared memory, 16-byte copies (cp.async) LSS_STAGES - 1
-// stages ahead of the sums. Lane l still takes quarter l % 4 of blocks l / 4, l / 4 + 8, ... in
-// that order with linear_mv_q8_row's arithmetic for each (the same expressions, the bytes and
-// the scale read from shared memory instead), then warp_sum and the scale: the same bits.
-// A stage is the 16-byte chunks covering its blocks (rows are only 2-byte aligned): each holds
-// one of the row's bytes, so it is inside the matrix.
-constexpr int LSS_STAGES = 4, LSS_BYTES = (8 * 34 + 15 + 15) / 16 * 16, LS_STAGED = 1 << 16;
-
-template <int N>
-__global__ void __launch_bounds__(128) linear_set_q8s(const LinSet s) {
-    pdl_wait();
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    __shared__ __align__(16) char ring[4][LSS_STAGES][LSS_BYTES];
-    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, q = lane % 4;
-    int g = 0;
-    while (g + 1 < s.nseg && (int64_t) blockIdx.x >= s.first[g + 1]) {
-        g++;
-    }
-    const Lin & p = s.p[g];
-    const int64_t r = ((int64_t) blockIdx.x - s.first[g]) * 4 + warp;
-    if (r >= p.m) {
-        return;
-    }
-    char(*buf)[LSS_BYTES] = ring[warp];
-    const char * row = p.w + r * p.w_nb1;
-    const int64_t nb = p.k / 32, nst = (nb + 7) / 8;
-    // Stage st's chunks into buf[st % LSS_STAGES], then one commit group (empty past the last).
-    auto issue = [&](int64_t st) {
-        if (st < nst) {
-            const int64_t gn = nb - 8 * st < 8 ? nb - 8 * st : 8;
-            const uintptr_t a = (uintptr_t) (row + st * 272), a0 = a & ~(uintptr_t) 15;
-            const int nch = (int) ((a + gn * 34 - a0 + 15) / 16);
-            if (lane < nch) {
-                const uint32_t sa = (uint32_t) __cvta_generic_to_shared(buf[st % LSS_STAGES] + 16 * lane);
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(sa),
-                             "l"(__cvta_generic_to_global((const char *) a0 + 16 * lane))
-                             : "memory");
-            }
-        }
-        asm volatile("cp.async.commit_group;\n" ::: "memory");
-    };
-    float acc[N];
-#pragma unroll
-    for (int t = 0; t < N; t++) {
-        acc[t] = 0.0f;
-    }
-#pragma unroll
-    for (int st = 0; st < LSS_STAGES - 1; st++) {
-        issue(st);
-    }
-    for (int64_t st = 0; st < nst; st++) {
-        asm volatile("cp.async.wait_group %0;\n" ::"n"(LSS_STAGES - 2) : "memory");
-        // every lane's copies of stage st are in, every lane is done with stage st - 1's buffer
-        __syncwarp();
-        issue(st + LSS_STAGES - 1);
-        const int64_t b = 8 * st + lane / 4;
-        if (b < nb) {
-            const char * blk = buf[st % LSS_STAGES] + ((uintptr_t) (row + st * 272) & 15) + (lane / 4) * 34;
-            const float d = __half2float(*(const __half *) blk);
-            const uint16_t * qs = (const uint16_t *) (blk + 2 + 8 * q);
-            float v[8];
-#pragma unroll
-            for (int j = 0; j < 4; j++) {
-                const uint16_t w = qs[j];
-                v[2 * j] = (float) (int8_t) (w & 0xFF);
-                v[2 * j + 1] = (float) (int8_t) (w >> 8);
-            }
-#pragma unroll
-            for (int t = 0; t < N; t++) {
-                if (t < p.n) {
-                    const float4 * x = (const float4 *) ((const float *) (p.x + t * p.x_nbt) + b * 32 + 8 * q);
-                    const float4 a = __ldg(x), c = __ldg(x + 1);
-                    const float s = v[0] * a.x + v[1] * a.y + v[2] * a.z + v[3] * a.w + v[4] * c.x + v[5] * c.y +
-                                    v[6] * c.z + v[7] * c.w;
-                    acc[t] += d * s;
-                }
-            }
-        }
-    }
-    const float sc = lin_scale(p, r);
-#pragma unroll
-    for (int t = 0; t < N; t++) {
-        const float v = warp_sum(acc[t]);
-        if (lane == 0 && t < p.n) {
-            p.dst[t * p.m + r] = v * sc;
-        }
-    }
-#else
-    __trap();  // dev_sm80() only
-#endif
-}
-
 // linear_set_q8 for BF16 matrices (#1221 r7, Inkling-2's attention on its NVFP4 checkpoint):
 // each row as linear_mv_bf16 sums and stores it (bf16_row, bf16_store: the same bits), plain
 // epilogues only.
@@ -2553,23 +2458,6 @@ int launch_linear_set(const A & a, cudaStream_t st) {
             launch_pdl(linear_set_bf16x<4, 2, 4, 2>, grid, 128, 0, st, s);
         } else {
             launch_pdl(linear_set_bf16x<2, 2, 2, 2>, grid, 128, 0, st, s);
-        }
-        return 0;
-    }
-    // params[6] bit LS_STAGED (ops::linear_set_staged, #1221 r9): linear_set_q8s, plain epilogues
-    bool staged = (a.params[6] & LS_STAGED) && !rw && !gate && dev_sm80();
-    for (int g = 0; g < s.nseg && staged; g++) {
-        staged = s.epi[g] == LS_PLAIN;
-    }
-    if (staged) {
-        if (n == 1) {
-            launch_pdl(linear_set_q8s<1>, grid, 128, 0, st, s);
-        } else if (n == 2) {
-            launch_pdl(linear_set_q8s<2>, grid, 128, 0, st, s);
-        } else if (n <= 4) {
-            launch_pdl(linear_set_q8s<4>, grid, 128, 0, st, s);
-        } else {
-            launch_pdl(linear_set_q8s<8>, grid, 128, 0, st, s);
         }
         return 0;
     }

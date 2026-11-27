@@ -553,12 +553,13 @@ pub fn mul_mat_id_act<'a>(
     scale: Option<Tensor<'a>>,
     act: Act,
 ) -> Tensor<'a> {
-    id_node(ctx, w, x, ids, scale, act, false, None)
+    id_node(ctx, w, x, ids, scale, act, 0, None)
 }
 
 /// Where a [`mul_mat_id_with`] node keeps that its decode mv takes the whole row tile L2
 /// prefetch ([`DOWN_MV_TILE`]) on its own plan too (slots 6 and 7 follow the custom op's
-/// header; no other `mul_mat_id` parameter is there).
+/// header; no other `mul_mat_id` parameter is there): 1, or a [`mul_mat_id_mv`] variant
+/// ([`tile_param`]).
 const P_TILE: usize = 7;
 
 /// [`P_PLAN`]'s value for a node that reads the plan of an earlier [`mul_mat_id`] node of the
@@ -591,6 +592,19 @@ pub fn mul_mat_id_with<'a>(
     tile: bool,
     plan_of: Option<Tensor<'a>>,
 ) -> Tensor<'a> {
+    mul_mat_id_p(ctx, w, x, ids, scale, tile as i32, plan_of)
+}
+
+/// [`mul_mat_id_with`] with its [`P_TILE`] value `tile` ([`mul_mat_id_mv`]'s variants too).
+fn mul_mat_id_p<'a>(
+    ctx: &'a Context,
+    w: Tensor<'a>,
+    x: Tensor<'a>,
+    ids: Tensor<'a>,
+    scale: Option<Tensor<'a>>,
+    tile: i32,
+    plan_of: Option<Tensor<'a>>,
+) -> Tensor<'a> {
     let n_expert = w.ne()[2];
     // As `id_node` takes them: the routing `plan_source` compares.
     let ids = if ids.is_contiguous() {
@@ -601,6 +615,49 @@ pub fn mul_mat_id_with<'a>(
     let plan_of = plan_of.filter(|_| ids.ne()[1] <= PLAN_SHARE_MAX_TOKENS);
     let from = plan_of.and_then(|p| plan_source(ctx, p, ids, n_expert));
     id_node(ctx, w, x, ids, scale, Act::None, tile, from)
+}
+
+/// [`mul_mat_id_with`] whose mv at one token per expert tile runs the grouped mv variant `mv`
+/// (#1221 r9, Inkling-2's A/B runs of its expert shapes) where `tile` would take
+/// [`DOWN_MV_TILE`]: the same bits (every variant's warp takes the same blocks in the same
+/// order). `mv` must be one the CUDA dispatch compiles for one-token tiles without the SwiGLU
+/// (`mvg<1>`); `None` is `mul_mat_id_with`.
+#[allow(clippy::too_many_arguments)]
+pub fn mul_mat_id_mv<'a>(
+    ctx: &'a Context,
+    w: Tensor<'a>,
+    x: Tensor<'a>,
+    ids: Tensor<'a>,
+    scale: Option<Tensor<'a>>,
+    tile: bool,
+    plan_of: Option<Tensor<'a>>,
+    mv: Option<GroupedMv>,
+) -> Tensor<'a> {
+    let tile = mv.map_or(tile as i32, tile_param);
+    mul_mat_id_p(ctx, w, x, ids, scale, tile, plan_of)
+}
+
+/// [`P_TILE`]'s value for a [`mul_mat_id_mv`] variant (0 and 1 are [`mul_mat_id_with`]'s).
+fn tile_param(g: GroupedMv) -> i32 {
+    assert!(
+        (1..16).contains(&g.rtw)
+            && (1..256).contains(&g.rpt)
+            && (1..256).contains(&g.sb)
+            && (0..16).contains(&g.pft),
+        "nvfp4 mul_mat_id_mv: {g:?}"
+    );
+    2 | g.rtw << 4 | g.rpt << 8 | g.sb << 16 | g.pft << 24
+}
+
+/// The [`mul_mat_id_mv`] variant of a [`P_TILE`] value.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn tile_variant(v: i32) -> Option<GroupedMv> {
+    (v & 0xf == 2).then(|| GroupedMv {
+        rtw: (v >> 4) & 0xf,
+        rpt: (v >> 8) & 0xff,
+        sb: (v >> 16) & 0xff,
+        pft: (v >> 24) & 0xf,
+    })
 }
 
 /// The node of `t` when it is the whole result of a [`mul_mat_id`] (or [`mul_mat_id_with`])
@@ -637,7 +694,7 @@ fn plan_source<'a>(
     }
 }
 
-/// The node of [`mul_mat_id_act`] and [`mul_mat_id_with`]: `tile` sets [`P_TILE`], `from` is
+/// The node of [`mul_mat_id_act`] and [`mul_mat_id_with`]: `tile` is [`P_TILE`], `from` is
 /// the node whose plan it reads ([`plan_source`]).
 #[allow(clippy::too_many_arguments)]
 fn id_node<'a>(
@@ -647,7 +704,7 @@ fn id_node<'a>(
     ids: Tensor<'a>,
     scale: Option<Tensor<'a>>,
     act: Act,
-    tile: bool,
+    tile: i32,
     from: Option<Tensor<'a>>,
 ) -> Tensor<'a> {
     assert!(supports(w), "unsupported NVFP4 experts {:?}", w.ne());
@@ -698,7 +755,7 @@ fn id_node<'a>(
         (*node.raw()).op_params[P_SCALE] = scale.is_some() as i32;
         (*node.raw()).op_params[P_ACT] = act.code();
         (*node.raw()).op_params[P_PLAN] = shared;
-        (*node.raw()).op_params[P_TILE] = tile as i32;
+        (*node.raw()).op_params[P_TILE] = tile;
     }
     ctx.view_3d(
         node,
@@ -2254,7 +2311,9 @@ mod cuda {
             && EXPERT_TILE_PREFETCH.load(Ordering::Relaxed)
             && matches!(kernel, Kernel::Mv { nt, rtw: 1, kw: 8, rpt }
                 if rpt == GROUPED_MV_RPT && (nt == 1 || forced_nt.is_some()));
-        let grouped = forced_grouped().or(tile_prefetch.then_some(DOWN_MV_TILE));
+        // A `mul_mat_id_mv` node's own variant in place of DOWN_MV_TILE (Inkling-2's A/B runs).
+        let tile_mv = super::tile_variant(dst.op_params[P_TILE]).unwrap_or(DOWN_MV_TILE);
+        let grouped = forced_grouped().or(tile_prefetch.then_some(tile_mv));
         let (_, cols) = kernel.tile();
         let mut p = Params {
             w: w.data as *const u8,

@@ -1,5 +1,23 @@
 use super::*;
 
+/// [`mul_mat_id_mv`]'s [`P_TILE`] values (#1221 r9): every variant back from its value, and
+/// `mul_mat_id_with`'s 0 and 1 none.
+#[test]
+fn tile_params_round_trip() {
+    assert_eq!(tile_variant(0), None);
+    assert_eq!(tile_variant(1), None);
+    for g in [GLU_MV, GLU_MV_TILE, DOWN_MV_TILE] {
+        assert_eq!(tile_variant(tile_param(g)), Some(g));
+    }
+    let wide = GroupedMv {
+        rtw: 15,
+        rpt: 255,
+        sb: 255,
+        pft: 15,
+    };
+    assert_eq!(tile_variant(tile_param(wide)), Some(wide));
+}
+
 #[test]
 fn token_tiles_cover_the_batch() {
     assert_eq!(tokens_tile(1, 4), 1);

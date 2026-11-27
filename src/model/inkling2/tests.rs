@@ -2181,16 +2181,14 @@ fn linear_set_keeps_the_bits(b: &mut Backend, ty: crate::ggml::ffi::ggml_type, t
             .collect()
     };
     let mut bad = Vec::new();
-    // attn_output's k, and rows that are not whole blocks of 4 (the head's 200,058; #1221 r9).
-    let shapes: [(i64, &[i64]); 4] = [
+    let shapes: [(i64, &[i64]); 3] = [
         (2304, &[3072, 384, 3072]),
         (2304, &[1024, 1024]),
-        (3072, &[2304, 1026]),
         (64, &[8, 36, 4]),
     ];
     for (k, ms) in shapes {
         for &n in toks {
-            let ctx = Context::new(64, 64);
+            let ctx = Context::new(32, 32);
             let x = ctx.new_tensor(types::F32, &[k, n]).as_input();
             let ws: Vec<_> = ms
                 .iter()
@@ -2201,20 +2199,12 @@ fn linear_set_keeps_the_bits(b: &mut Backend, ty: crate::ggml::ffi::ggml_type, t
                 .map(|&w| glm_ops::linear_h(&ctx, w, x, None, 1.0, None).as_output())
                 .collect();
             let set: Vec<_> = ws.iter().map(|&w| (w, x, glm_ops::SetEpi::Plain)).collect();
-            let outs =
-                |v: Vec<_>| -> Vec<_> { v.into_iter().map(|t| ctx.cont(t).as_output()).collect() };
-            // The set; Q8_0 also on the staged kernel (#1221 r9), all of it and a product alone.
-            let mut news = vec![("set", outs(glm_ops::linear_set(&ctx, &set)))];
-            if ty == types::Q8_0 {
-                news.push(("staged set", outs(glm_ops::linear_set_staged(&ctx, &set))));
-                let one = set
-                    .iter()
-                    .flat_map(|s| glm_ops::linear_set_staged(&ctx, std::slice::from_ref(s)))
-                    .collect();
-                news.push(("staged, one product", outs(one)));
-            }
-            let mut graph = ctx.new_graph(32);
-            for t in old.iter().chain(news.iter().flat_map(|n| &n.1)) {
+            let new: Vec<_> = glm_ops::linear_set(&ctx, &set)
+                .into_iter()
+                .map(|t| ctx.cont(t).as_output())
+                .collect();
+            let mut graph = ctx.new_graph(16);
+            for t in old.iter().chain(&new) {
                 graph.expand(*t);
             }
             ctx.alloc_graph(&graph, ComputeAllocator::new(b.buffer_type()))
@@ -2233,15 +2223,13 @@ fn linear_set_keeps_the_bits(b: &mut Backend, ty: crate::ggml::ffi::ggml_type, t
                 }
             }
             b.compute(&graph).unwrap();
-            for (label, new) in &news {
-                for (j, &m) in ms.iter().enumerate() {
-                    let (p, q) = (old[j].to_f32(), new[j].to_f32());
-                    assert!(q.iter().any(|&v| v != 0.0), "glm_linear_set: an output");
-                    let what = format!("glm_linear_set ({label}) part {j}, {m} x {k}, {n} tokens");
-                    if let Some(line) = first_diff(&what, &p, &q, m as usize) {
-                        eprintln!("first mismatch: {line}");
-                        bad.push(line);
-                    }
+            for (j, &m) in ms.iter().enumerate() {
+                let (p, q) = (old[j].to_f32(), new[j].to_f32());
+                assert!(q.iter().any(|&v| v != 0.0), "glm_linear_set: an output");
+                let what = format!("glm_linear_set part {j}, {m} x {k}, {n} tokens");
+                if let Some(line) = first_diff(&what, &p, &q, m as usize) {
+                    eprintln!("first mismatch: {line}");
+                    bad.push(line);
                 }
             }
         }
@@ -2256,8 +2244,7 @@ fn linear_set_keeps_the_cpu_bits() {
     linear_set_keeps_the_bits(&mut backend(), types::BF16, &[1, 2, 3, 5, 8]);
 }
 
-/// [`linear_set_keeps_the_bits`] on the GPU: `linear_set_q8` and `linear_set_q8s` (staged, a set
-/// and one product alone; #1221 r9) against `linear_mv_q8`.
+/// [`linear_set_keeps_the_bits`] on the GPU: `linear_set_q8` against `linear_mv_q8`.
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "needs a GPU"]
@@ -2335,7 +2322,7 @@ fn experts_keep_the_bits(b: &mut Backend, shapes: &[(i64, i64, i64, i64)], toks:
         sd.set_f32(&scales(&mut rand));
         for &n in toks {
             for pool in [n_expert, 2 * n_used] {
-                let ctx = Context::new(64, 64);
+                let ctx = Context::new(512, 256);
                 let x = ctx.new_tensor(types::F32, &[k, 1, n]).as_input();
                 let ids = ctx.new_tensor(types::I32, &[n_used, n]).as_input();
                 let (beta, lb) = (tiny::SITU_BETA, tiny::SITU_LB);
@@ -2355,8 +2342,38 @@ fn experts_keep_the_bits(b: &mut Backend, shapes: &[(i64, i64, i64, i64)], toks:
                     ),
                     ("down", k, y0, y1),
                 ]
-                .map(|(what, d, p, q)| (what, d, ctx.cont(p).as_output(), ctx.cont(q).as_output()));
-                let mut graph = ctx.new_graph(64);
+                .map(|(what, d, p, q)| {
+                    (
+                        what.to_string(),
+                        d,
+                        ctx.cont(p).as_output(),
+                        ctx.cont(q).as_output(),
+                    )
+                });
+                // Every A/B grouped mv variant (#1221 r9) on the gate and up rows and on the
+                // down projection (of the same activations, on the gate and up rows' plan).
+                let mut pairs = Vec::from(pairs);
+                for (name, g) in EXPERT_MVS {
+                    let gu =
+                        nvfp4_mm::mul_mat_id_mv(&ctx, wgu, x, ids, Some(sgu), true, None, Some(g));
+                    let y = nvfp4_mm::mul_mat_id_mv(
+                        &ctx,
+                        wd,
+                        a1,
+                        ids,
+                        Some(sd),
+                        true,
+                        Some(gu1),
+                        Some(g),
+                    );
+                    for (what, d, p, q) in [
+                        ("gate and up", 2 * f, pairs[0].2, gu),
+                        ("down", k, pairs[2].3, y),
+                    ] {
+                        pairs.push((format!("{what} ({name})"), d, p, ctx.cont(q).as_output()));
+                    }
+                }
+                let mut graph = ctx.new_graph(256);
                 for &(_, _, p, q) in &pairs {
                     graph.expand(p);
                     graph.expand(q);
@@ -2415,6 +2432,26 @@ fn experts_flags_take_a_mask() {
     assert_eq!(experts_flags_of(Some(" 3 ")), EXPERTS_TILE | EXPERTS_PLAN);
     assert_eq!(experts_flags_of(Some("20")), EXPERTS_BF16_ACT);
     assert_eq!(experts_flags_of(Some("8")), EXPERTS_TILE_GU);
+}
+
+/// `LEGION_DEBUG_INK_DOWN_MV` / `_GU_MV` (#1221 r9): an [`EXPERT_MVS`] name, else the default's.
+#[test]
+fn expert_mv_takes_a_name() {
+    assert_eq!(expert_mv_of(None), None);
+    assert_eq!(expert_mv_of(Some("x")), None);
+    assert_eq!(expert_mv_of(Some("")), None);
+    let p4 = nvfp4_mm::GroupedMv {
+        rtw: 1,
+        rpt: 4,
+        sb: 16,
+        pft: 0,
+    };
+    assert_eq!(expert_mv_of(Some(" p4 ")), Some(p4));
+    assert_eq!(expert_mv_of(Some("t2")), Some(nvfp4_mm::DOWN_MV_TILE));
+    let mut names: Vec<_> = EXPERT_MVS.iter().map(|(n, _)| *n).collect();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), EXPERT_MVS.len(), "distinct names");
 }
 
 /// [`experts_keep_the_bits`] on the GPU at Inkling-2-Mini's shapes (2,304 wide, 1,152 per
