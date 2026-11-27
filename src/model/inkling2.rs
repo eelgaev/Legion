@@ -568,6 +568,47 @@ impl Model {
         self.glm_mm_shared(ctx, &format!("blk.{ip}.{name}"), x, rows.of(x))
     }
 
+    /// [`Self::ink_mm_b`] of block `ip`'s weights `names`, all of `x`: one glm_linear_set node
+    /// ([`glm_ops::linear_set`], linear_mv_q8's sums row by row: the same bits) where it takes
+    /// them, Q8_0 weights without a scale over up to 8 tokens (decode steps), unless `own`
+    /// (traced runs keep a node a product); else a node each (#1221 r6).
+    fn ink_mm_set<'a, const N: usize>(
+        &'a self,
+        ctx: &'a Context,
+        ip: usize,
+        names: [&str; N],
+        x: Tensor<'a>,
+        rows: &mut Bf16Rows<'a>,
+        own: bool,
+    ) -> Result<[Tensor<'a>; N], ModelError> {
+        let ws = names
+            .iter()
+            .map(|n| self.w(&format!("blk.{ip}.{n}")))
+            .collect::<Result<Vec<_>, _>>()?;
+        let n: i64 = x.ne()[1..].iter().product();
+        let set = !own
+            && (2..=glm_ops::SET_MAX).contains(&N)
+            && x.ty() == types::F32
+            && x.is_contiguous()
+            && glm_ops::linear_set_takes(&ws, n)
+            && names.iter().all(|name| {
+                name.strip_suffix(".weight")
+                    .is_some_and(|b| self.w(&format!("blk.{ip}.{b}.scale")).is_err())
+            });
+        let out = if set {
+            let set: Vec<_> = ws.iter().map(|&w| (w, x, glm_ops::SetEpi::Plain)).collect();
+            glm_ops::linear_set(ctx, &set)
+        } else {
+            names
+                .iter()
+                .map(|name| self.ink_mm_b(ctx, ip, name, x, rows))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(out
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("a product a name")))
+    }
+
     /// `x` RMS-normed times block `ip`'s weight `name`.
     fn ink_rms<'a>(
         &'a self,
@@ -893,9 +934,31 @@ impl Model {
         let [xq, xk, xv] = *inputs;
 
         let mut rows = Bf16Rows::default();
-        let q = self.ink_mm_b(ctx, ip, "attn_q.weight", xq, &mut rows)?;
-        let kp = self.ink_mm_b(ctx, ip, "attn_k.weight", xk, &mut rows)?;
-        let vp = self.ink_mm_b(ctx, ip, "attn_v.weight", xv, &mut rows)?;
+        // Q, the relative weights and the gate read xq, a sliding layer's K and V one input:
+        // a node a set where it takes them (ink_mm_set), unless traced.
+        let [q, r, g] = self.ink_mm_set(
+            ctx,
+            ip,
+            ["attn_q.weight", "attn_rel.weight", "attn_gate.weight"],
+            xq,
+            &mut rows,
+            tap.on,
+        )?;
+        let [kp, vp] = if xk.raw() == xv.raw() {
+            self.ink_mm_set(
+                ctx,
+                ip,
+                ["attn_k.weight", "attn_v.weight"],
+                xk,
+                &mut rows,
+                tap.on,
+            )?
+        } else {
+            [
+                self.ink_mm_b(ctx, ip, "attn_k.weight", xk, &mut rows)?,
+                self.ink_mm_b(ctx, ip, "attn_v.weight", xv, &mut rows)?,
+            ]
+        };
         let (kdyn, vdyn) = if swa {
             (None, None)
         } else {
@@ -943,7 +1006,6 @@ impl Model {
                 Some((k, v))
             }
         };
-        let r = self.ink_mm_b(ctx, ip, "attn_rel.weight", xq, &mut rows)?;
         tap.tap("r_proj", il, r);
 
         // The global layers' Q and relative weights scale with the log of the position.
@@ -1068,7 +1130,6 @@ impl Model {
         }
         let o = glm_ops::join_cols(ctx, &outs);
         tap.tap("kqv_out", il, o);
-        let g = self.ink_mm_b(ctx, ip, "attn_gate.weight", xq, &mut rows)?;
         tap.tap("attn_gate", il, g);
         let o = ops::sigmul(ctx, o, g);
         tap.tap("attn_gated", il, o);

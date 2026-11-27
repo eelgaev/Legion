@@ -209,6 +209,7 @@ pub(crate) const INKLING: &[&str] = &[
 pub(crate) const INKLING_SHARED: &[&str] = &[
     "glm_embed",
     "glm_linear",
+    "glm_linear_set",
     "glm_bf16",
     "glm_f16",
     "glm_rms_norm",

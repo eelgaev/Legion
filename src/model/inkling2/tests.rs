@@ -2096,3 +2096,83 @@ fn clip2_keeps_the_cpu_bits() {
 fn cuda_clip2_keeps_the_bits() {
     clip2_keeps_the_bits(&mut gpu_backend());
 }
+
+/// `Model::ink_mm_set`'s one glm_linear_set node (`glm_ops::linear_set`) for the products of
+/// one input against the node a product it replaces (`glm_ops::linear_h`, what `glm_mm`
+/// builds for Q8_0 weights): Q, the relative weights and the gate, then K and V, at Inkling-2's
+/// shapes and a small one, over the token counts it takes.
+fn linear_set_keeps_the_bits(b: &mut Backend) {
+    use crate::ggml::ComputeAllocator;
+    let mut s = 0x2545_f491_4f6c_dd1du64;
+    let mut vals = move |n: usize, amp: f32| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 40) as f32 / (1u64 << 23) as f32 - 1.0) * amp
+            })
+            .collect()
+    };
+    let mut bad = Vec::new();
+    let shapes: [(i64, &[i64]); 3] = [
+        (2304, &[3072, 384, 3072]),
+        (2304, &[1024, 1024]),
+        (64, &[8, 36, 4]),
+    ];
+    for (k, ms) in shapes {
+        for n in [1i64, 2, 3, 5, 8] {
+            let ctx = Context::new(32, 32);
+            let x = ctx.new_tensor(types::F32, &[k, n]).as_input();
+            let ws: Vec<_> = ms
+                .iter()
+                .map(|&m| ctx.new_tensor(types::Q8_0, &[k, m]).as_input())
+                .collect();
+            let old: Vec<_> = ws
+                .iter()
+                .map(|&w| glm_ops::linear_h(&ctx, w, x, None, 1.0, None).as_output())
+                .collect();
+            let set: Vec<_> = ws.iter().map(|&w| (w, x, glm_ops::SetEpi::Plain)).collect();
+            let new: Vec<_> = glm_ops::linear_set(&ctx, &set)
+                .into_iter()
+                .map(|t| ctx.cont(t).as_output())
+                .collect();
+            let mut graph = ctx.new_graph(16);
+            for t in old.iter().chain(&new) {
+                graph.expand(*t);
+            }
+            ctx.alloc_graph(&graph, ComputeAllocator::new(b.buffer_type()))
+                .unwrap();
+            x.set_f32(&vals((k * n) as usize, 3.0));
+            for (&w, &m) in ws.iter().zip(ms) {
+                let v = vals((k * m) as usize, 0.5);
+                w.set_bytes(&crate::ggml::quantize(types::Q8_0, &v, k as usize));
+            }
+            b.compute(&graph).unwrap();
+            for (j, &m) in ms.iter().enumerate() {
+                let (p, q) = (old[j].to_f32(), new[j].to_f32());
+                assert!(q.iter().any(|&v| v != 0.0), "glm_linear_set: an output");
+                let what = format!("glm_linear_set part {j}, {m} x {k}, {n} tokens");
+                if let Some(line) = first_diff(&what, &p, &q, m as usize) {
+                    eprintln!("first mismatch: {line}");
+                    bad.push(line);
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "\n{}", bad.join("\n"));
+}
+
+/// [`linear_set_keeps_the_bits`] on the CPU references.
+#[test]
+fn linear_set_keeps_the_cpu_bits() {
+    linear_set_keeps_the_bits(&mut backend());
+}
+
+/// [`linear_set_keeps_the_bits`] on the GPU: `linear_set_q8` against `linear_mv_q8`.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_linear_set_keeps_the_bits() {
+    linear_set_keeps_the_bits(&mut gpu_backend());
+}
