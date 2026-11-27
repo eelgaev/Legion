@@ -292,6 +292,12 @@ __global__ void mix_kernel(const A a) {
 // rms_kernel's block.
 constexpr int RMS_THREADS = 256;
 
+// rms_kernel's scale from the block's sum of squares, the one expression of rms_kernel and
+// kv_kernel.
+__device__ __forceinline__ float rms_scale(double sum, int64_t d, float eps) {
+    return 1.0f / sqrtf((float) (sum / d) + eps);
+}
+
 // ---- ink_rms: params eps, whether w is a weight; sources x [d, rows] (contiguous), w [d] or
 // none (#1221 r6). glm5next.cu's rms_norm_kernel (glm_rms_norm) in its order: the same 256
 // threads, thread i summing (double) x² over elements i, i + 256, ... in turn, then block_sum's
@@ -340,7 +346,7 @@ template <int K> __global__ void __launch_bounds__(RMS_THREADS) rms_kernel(const
     }
     __syncthreads();
     sum = warp_sum(lane < RMS_THREADS / 32 ? part[lane] : 0.0);
-    const float s = 1.0f / sqrtf((float) (sum / d) + pf(a.params[0]));
+    const float s = rms_scale(sum, d, pf(a.params[0]));
     float *     o = (float *) a.dst + r * d;
 #pragma unroll
     for (int k = 0; k < K; k++) {
@@ -679,6 +685,19 @@ __global__ void conv_hist_kernel(const A a) {
     }
 }
 
+// ink_clip's factor for a row whose lane l holds elements l + 32 k in v[k] (0 past the row):
+// the one expression of clip_kernel and kv_kernel.
+__device__ __forceinline__ float clip_factor(const float (&v)[4], float thr) {
+    float ss = 0.f;
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        ss += v[k] * v[k];
+    }
+    ss               = warp_sum(ss);
+    const float norm = sqrtf(ss) + 1e-6f;
+    return fminf(fmaxf(thr / norm, 0.f), 1.f);
+}
+
 // ---- ink_clip: params thr, has_scale, has_tau, floor, alpha; sources x [d, h, n], scale [d, h],
 // pos [n]. One warp per row (d at most 128). ----
 __global__ void clip_kernel(const A a) {
@@ -696,16 +715,12 @@ __global__ void clip_kernel(const A a) {
     const float * x  = (const float *) src(a, 0) + row * d;
     const float * sc = has_scale ? (const float *) src(a, 1) + hd * d : nullptr;
     float         v[4];
-    float         ss = 0.f;
 #pragma unroll
     for (int k = 0; k < 4; k++) {
         const int64_t i = lane + 32 * k;
         v[k]            = i < d ? x[i] * (sc ? sc[i] : 1.f) : 0.f;
-        ss += v[k] * v[k];
     }
-    ss               = warp_sum(ss);
-    const float norm = sqrtf(ss) + 1e-6f;
-    float       f    = fminf(fmaxf(thr / norm, 0.f), 1.f);
+    float f = clip_factor(v, thr);
     if (has_tau) {
         const int32_t p = ((const int32_t *) src(a, 1 + (has_scale ? 1 : 0)))[t];
         const float   r = fmaxf(((float) p + 1.f) * (1.f / floor_), 1.f);
@@ -717,6 +732,108 @@ __global__ void clip_kernel(const A a) {
         const int64_t i = lane + 32 * k;
         if (i < d) {
             o[i] = v[k] * f;
+        }
+    }
+}
+
+// ---- ink_kv (#1221 r6): a decode step's K and V, the nodes ink_conv (K, then V), ink_clip (K,
+// no scale or tau), ink_rms (V, no weight) and two ds4_cache_write (ratio 1) in one. Params:
+// base (the state channel of K's first; V's follow K's), has_dyn, the conv scale, the clip
+// threshold, rms eps, d; sources kp, vp [kvw, n], kw, vw [K, kvw], state [K - 1, width, n]
+// (written back), kc, vc (F16 [row, cells], written), cells I32 [n], kdyn, vdyn [K * heads, n];
+// dst [kvw, n, 2] K then V. A warp per head row (d at most 128), lane l with elements l + 32 k:
+// its conv outputs are conv_kernel's (conv_out), the clip clip_kernel's lanes (clip_factor), the
+// rms rms_kernel<1>'s sums (warp k of its block holds elements 32 k ..: their double warp sums,
+// then the sum of the 8 warps', 0 past the row) and rms_scale. ----
+__global__ void kv_kernel(const A a) {
+    pdl_wait();
+    const int64_t base = a.params[0];
+    const bool    dyn  = a.params[1] != 0;
+    const float   scale = pf(a.params[2]), thr = pf(a.params[3]), eps = pf(a.params[4]);
+    const int64_t d = a.params[5], kvw = a.ne[0], n = a.ne[1], nr = kvw / d;
+    const int     K    = (int) a.src_ne[2][0];
+    const int     lane = threadIdx.x % 32;
+    const int64_t row  = (int64_t) blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (row >= 2 * nr * n) {
+        return;
+    }
+    const int64_t t = row / (2 * nr), hr = row % (2 * nr);
+    const int     vv = hr >= nr ? 1 : 0;
+    const int64_t head = hr - vv * nr;
+    const float * x    = (const float *) src(a, vv) + t * kvw;
+    const float * dr0  = dyn ? (const float *) (src(a, 8 + vv) + t * a.src_nb[8 + vv][1]) : nullptr;
+    const int64_t heads = dyn ? a.src_ne[8 + vv][0] / K : 1;
+    float         y[4];
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        const int64_t i = lane + 32 * k;
+        y[k]            = 0.f;
+        if (i >= d) {
+            continue;
+        }
+        const int64_t ch   = head * d + i;
+        float *       hist = (float *) ((char *) a.src[4] + t * a.src_nb[4][2] +
+                                  (base + vv * kvw + ch) * a.src_nb[4][1]);
+        const float * w    = (const float *) (src(a, 2 + vv) + ch * a.src_nb[2 + vv][1]);
+        float         tw[CONV_TAPS], win[CONV_TAPS];
+#pragma unroll
+        for (int j = 0; j < CONV_TAPS; j++) {
+            tw[j]  = j < K ? w[j] : 0.f;
+            win[j] = j < K - 1 ? hist[j] : 0.f;
+        }
+        const int64_t hh = dyn ? ch / (kvw / heads) : 0;
+        const float * dr = dyn ? dr0 + K * hh : nullptr;
+        y[k]             = conv_out(tw, win, K, x[ch], dr, dyn, scale);
+#pragma unroll
+        for (int j = 0; j + 1 < CONV_TAPS; j++) {
+            if (j + 1 < K) {
+                win[j] = win[j + 1];
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < CONV_TAPS; j++) {
+            if (j < K - 1) {
+                hist[j] = win[j];
+            }
+        }
+    }
+    float o[4];
+    if (!vv) {
+        float v[4];
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            v[k] = lane + 32 * k < d ? y[k] * 1.f : 0.f;
+        }
+        const float f = clip_factor(v, thr);
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            o[k] = v[k] * f;
+        }
+    } else {
+        double p[4];
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            double sum = 0.0;
+            if (lane + 32 * k < d) {
+                sum += (double) y[k] * y[k];
+            }
+            p[k] = warp_sum(sum);
+        }
+        const double q = lane == 0 ? p[0] : lane == 1 ? p[1] : lane == 2 ? p[2] : lane == 3 ? p[3] : 0.0;
+        const float  s = rms_scale(warp_sum(q), d, eps);
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            o[k] = y[k] * s;
+        }
+    }
+    float *  out = (float *) a.dst + (vv * n + t) * kvw + head * d;
+    __half * c   = (__half *) ((char *) a.src[5 + vv] + (int64_t) ((const int32_t *) src(a, 7))[t] * a.src_nb[5 + vv][1]) + head * d;
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        const int64_t i = lane + 32 * k;
+        if (i < d) {
+            out[i] = o[k];
+            c[i]   = __float2half(o[k]);
         }
     }
 }
@@ -1410,7 +1527,7 @@ __global__ void softcap_kernel(const A a) {
 
 }  // namespace
 
-extern "C" const void * const legion_ink_kernels[23] = {
+extern "C" const void * const legion_ink_kernels[24] = {
     reinterpret_cast<const void *>(&mix_kernel),
     reinterpret_cast<const void *>(&ctrl_in_kernel),
     reinterpret_cast<const void *>(&ctrl_out_kernel),
@@ -1434,4 +1551,5 @@ extern "C" const void * const legion_ink_kernels[23] = {
     reinterpret_cast<const void *>(&rms_kernel<3>),
     reinterpret_cast<const void *>(&rms_kernel<9>),
     reinterpret_cast<const void *>(&rms_kernel<16>),
+    reinterpret_cast<const void *>(&kv_kernel),
 };

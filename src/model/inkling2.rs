@@ -912,10 +912,37 @@ impl Model {
                 tap.tap(name, il, x);
             }
         }
-        let k = self.ink_conv(pass, il, ip, "attn_k_conv.weight", kp, kdyn, 0)?;
-        let v = self.ink_conv(pass, il, ip, "attn_v_conv.weight", vp, vdyn, kvw)?;
-        tap.tap("k_conv", il, k);
-        tap.tap("v_conv", il, v);
+        // A decode step (one group, a token a sequence) makes K and V and writes them to the
+        // caches in one node, ops::kv, of the bits of the nodes below (#1221 r6). Traced
+        // runs keep those for their taps.
+        let (kcw, vcw) = (
+            self.lw(ip, "attn_k_conv.weight")?,
+            self.lw(ip, "attn_v_conv.weight")?,
+        );
+        let mut gs = pass.groups();
+        let decode = match (gs.next(), gs.next()) {
+            (Some((_, sh)), None)
+                if !tap.on
+                    && sh.n_tok == 1
+                    && d <= 128
+                    && kvw % d == 0
+                    && kcw.ne()[0] == vcw.ne()[0]
+                    && kcw.ne()[0] <= ops::MAX_TAPS as i64 =>
+            {
+                Some((sh.slot, sh.n_seqs))
+            }
+            _ => None,
+        };
+        let convs = match decode {
+            Some(_) => None,
+            None => {
+                let k = self.ink_conv(pass, il, ip, "attn_k_conv.weight", kp, kdyn, 0)?;
+                let v = self.ink_conv(pass, il, ip, "attn_v_conv.weight", vp, vdyn, kvw)?;
+                tap.tap("k_conv", il, k);
+                tap.tap("v_conv", il, v);
+                Some((k, v))
+            }
+        };
         let r = self.ink_mm_b(ctx, ip, "attn_rel.weight", xq, &mut rows)?;
         tap.tap("r_proj", il, r);
 
@@ -928,8 +955,12 @@ impl Model {
             p.qk_clip,
             tau,
         );
-        let k = ops::clip(ctx, ctx.reshape_3d(k, d, nkv, n), None, p.qk_clip, None);
-        let v = ops::rms(ctx, ctx.reshape_3d(v, d, nkv, n), None, hp.rms_eps);
+        let kv = convs.map(|(k, v)| {
+            (
+                ops::clip(ctx, ctx.reshape_3d(k, d, nkv, n), None, p.qk_clip, None),
+                ops::rms(ctx, ctx.reshape_3d(v, d, nkv, n), None, hp.rms_eps),
+            )
+        });
         let r = ops::clip(
             ctx,
             ctx.reshape_3d(r, p.n_rel, nh, n),
@@ -941,32 +972,57 @@ impl Model {
         tap.tap("r_clip", il, r);
         tap.tap("sinks", il, sinks);
         tap.tap("Qcur", il, q);
-        tap.tap("Kcur", il, k);
-        tap.tap("Vcur", il, v);
 
         let (kc, vc) = pass.kv.pools(il);
         let cells = pass.write_cells(il);
-        let kw = ds41_ops::cache_write(
-            ctx,
-            kc,
-            ctx.reshape_2d(k, kvw, n),
-            cells,
-            pos_all,
-            0,
-            1,
-            &[],
-        );
-        let vw = ds41_ops::cache_write(
-            ctx,
-            vc,
-            ctx.reshape_2d(v, kvw, n),
-            cells,
-            pos_all,
-            0,
-            1,
-            &[kw],
-        );
-        pass.graph.borrow_mut().expand(vw);
+        let written = match (kv, decode) {
+            (Some((k, v)), _) => {
+                tap.tap("Kcur", il, k);
+                tap.tap("Vcur", il, v);
+                let kw = ds41_ops::cache_write(
+                    ctx,
+                    kc,
+                    ctx.reshape_2d(k, kvw, n),
+                    cells,
+                    pos_all,
+                    0,
+                    1,
+                    &[],
+                );
+                ds41_ops::cache_write(
+                    ctx,
+                    vc,
+                    ctx.reshape_2d(v, kvw, n),
+                    cells,
+                    pos_all,
+                    0,
+                    1,
+                    &[kw],
+                )
+            }
+            (None, Some((slot, n_seqs))) => {
+                let k = kcw.ne()[0];
+                let taps = if kdyn.is_some() { 2 * k } else { k };
+                ops::kv(
+                    ctx,
+                    kp,
+                    vp,
+                    kcw,
+                    vcw,
+                    pass.rec.ple_slots(ctx, 0, slot, n_seqs),
+                    [kc, vc],
+                    cells,
+                    kdyn.zip(vdyn).map(|(a, b)| [a, b]),
+                    il as i64 * p.slot_width,
+                    d,
+                    1.0 / ((taps + 1) as f32).sqrt(),
+                    p.qk_clip,
+                    hp.rms_eps,
+                )
+            }
+            (None, None) => unreachable!("K and V come from the convs or ops::kv"),
+        };
+        pass.graph.borrow_mut().expand(written);
 
         let rel = self.lw(ip, "attn_rel_bias.weight")?;
         let scale = 1.0 / (d as f32).sqrt();
@@ -1002,7 +1058,7 @@ impl Model {
                 sh.n_tok as i64,
                 scale,
                 window,
-                vw,
+                written,
             );
             outs.push(ctx.reshape_2d(o, d * nh, ng));
         }

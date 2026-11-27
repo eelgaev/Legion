@@ -194,6 +194,7 @@ pub(crate) const INKLING: &[&str] = &[
     "ink_situ",
     "ink_mm_id",
     "ink_softcap",
+    "ink_kv",
 ];
 
 /// GLM-5.3-Flash's and DeepSeek-V4.1's ops that Inkling-2's graph is built of (#1221),

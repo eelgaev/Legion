@@ -40,6 +40,7 @@ external_op!(SIGMUL, "ink_sigmul", cpu_sigmul, sigmul);
 external_op!(SITU, "ink_situ", cpu_situ, situ);
 external_op!(MM_ID, "ink_mm_id", cpu_mm_id, mm_id);
 external_op!(SOFTCAP, "ink_softcap", cpu_softcap, softcap);
+external_op!(KV, "ink_kv", cpu_kv, kv);
 
 /// The most states [`mix`] takes (the depth blocks and the current residual): with its query,
 /// the 9 sources ggml takes.
@@ -291,6 +292,96 @@ impl LogScale {
         let v = ((p as f32 + 1.0) * (1.0 / self.floor)).max(1.0);
         v.ln() * self.alpha + 1.0
     }
+}
+
+/// A decode step's K and V (#1221 r6): [`conv`] of `kp` and `vp` (F32 `[kvw, n]`, one token a
+/// sequence) with the taps `kw`, `vw` (F32 `[K, kvw]`) and the dynamic ones `dynamic` (F32
+/// `[K * heads, n]` each), K's history at channels `base ..` of `state` and V's after it, then
+/// [`clip`] of K's rows of `d` (no scale or tau, `thr`) and [`rms`] of V's (no weight, `eps`),
+/// written as `ds41_ops::cache_write` (ratio 1) writes them into rows `cells` (I32 `[n]`) of
+/// `kc` and `vc` (F16). One node of those nodes' bits; F32 `[kvw, n, 2]`, K then V.
+#[allow(clippy::too_many_arguments)]
+pub fn kv<'a>(
+    ctx: &'a Context,
+    kp: Tensor<'a>,
+    vp: Tensor<'a>,
+    kw: Tensor<'a>,
+    vw: Tensor<'a>,
+    state: Tensor<'a>,
+    caches: [Tensor<'a>; 2],
+    cells: Tensor<'a>,
+    dynamic: Option<[Tensor<'a>; 2]>,
+    base: i64,
+    d: i64,
+    scale: f32,
+    thr: f32,
+    eps: f32,
+) -> Tensor<'a> {
+    let (kp, vp) = (contiguous(kp), contiguous(vp));
+    let [kvw, n, _, _] = kp.ne();
+    assert_eq!(vp.ne(), kp.ne(), "ink_kv: K and V shapes");
+    assert!(
+        (1..=128).contains(&d) && kvw % d == 0,
+        "ink_kv: {kvw} channels in heads of {d}"
+    );
+    let k = kw.ne()[0];
+    assert!((2..=MAX_TAPS as i64).contains(&k), "ink_kv: {k} taps");
+    for w in [kw, vw] {
+        assert_eq!(
+            (w.ty(), w.ne()[0], w.ne()[1], w.nb()[1]),
+            (types::F32, k, kvw, k as usize * 4),
+            "ink_kv: F32 [K, kvw] taps, contiguous"
+        );
+    }
+    assert_eq!(state.ty(), types::F32);
+    assert_eq!(state.ne()[0], k - 1, "ink_kv: K - 1 kept inputs");
+    assert!(base + 2 * kvw <= state.ne()[1], "ink_kv: state width");
+    assert_eq!(state.ne()[2], n, "ink_kv: a state per sequence");
+    for c in caches {
+        assert_eq!(c.ty(), types::F16, "ink_kv: F16 caches");
+        assert!(kvw <= c.ne()[0], "ink_kv: cache row width");
+    }
+    assert_eq!(
+        (cells.ty(), cells.ne()[0]),
+        (types::I32, n),
+        "ink_kv: cells"
+    );
+    let mut args = vec![
+        kp,
+        vp,
+        kw,
+        vw,
+        state,
+        caches[0],
+        caches[1],
+        contiguous(cells),
+    ];
+    if let Some(dy) = dynamic {
+        for t in dy {
+            let t = contiguous(t);
+            let heads = t.ne()[0] / k;
+            assert!(
+                t.ne()[0] == k * heads && heads > 0 && kvw % heads == 0 && t.ne()[1] == n,
+                "ink_kv: dynamic taps {:?} for {kvw} channels",
+                t.ne()
+            );
+            args.push(t);
+        }
+    }
+    ctx.external_with(
+        &KV,
+        types::F32,
+        [kvw, n, 2, 1],
+        &args,
+        &[
+            base as i32,
+            dynamic.is_some() as i32,
+            scale.to_bits() as i32,
+            thr.to_bits() as i32,
+            eps.to_bits() as i32,
+            d as i32,
+        ],
+    )
 }
 
 /// Each row (`[d]` of `x` F32 `[d, h, n]`, contiguous) times `scale` (F32 `[d, h]`) if given,
@@ -701,15 +792,8 @@ unsafe fn cpu_conv(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
             let taps = f32s(w, ch * w.nb[1], k);
             for i in 0..n_tok {
                 let t = s * n_tok + i;
-                let mut out: f32 = (0..k).map(|j| taps[j] * xs[i + j]).sum();
-                if let Some(d) = dynamic {
-                    let dr = f32s(d, t * d.nb[1], d.ne[0] as usize);
-                    let hh = ch / per_head;
-                    for lag in 0..k {
-                        out += dr[lag + k * hh] * xs[i + k - 1 - lag];
-                    }
-                }
-                let y = (xs[k - 1 + i] + out) * scale;
+                let dr = dynamic.map(|d| (f32s(d, t * d.nb[1], d.ne[0] as usize), ch / per_head));
+                let y = conv_tok(taps, &xs[i..i + k], dr, scale);
                 *(dst.data as *mut f32).add(t * c + ch) = match res {
                     Some(r) => at::<f32>(r, t * c + ch) + y,
                     None => y,
@@ -717,6 +801,75 @@ unsafe fn cpu_conv(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
             }
             for j in 0..k - 1 {
                 *hist.add(j) = xs[n_tok + j];
+            }
+        }
+    }
+}
+
+/// One output of ink_conv: `xs` the K inputs up to the token's own (oldest first), `dr` its
+/// dynamic taps and the channel's head in them.
+fn conv_tok(taps: &[f32], xs: &[f32], dr: Option<(&[f32], usize)>, scale: f32) -> f32 {
+    let k = taps.len();
+    let mut out: f32 = (0..k).map(|j| taps[j] * xs[j]).sum();
+    if let Some((dr, hh)) = dr {
+        for lag in 0..k {
+            out += dr[lag + k * hh] * xs[k - 1 - lag];
+        }
+    }
+    (xs[k - 1] + out) * scale
+}
+
+/// ink_clip's factor for a row (after its scale).
+fn clip_factor(v: &[f32], thr: f32) -> f32 {
+    let norm = v.iter().map(|a| a * a).sum::<f32>().sqrt() + 1e-6;
+    (thr / norm).clamp(0.0, 1.0)
+}
+
+unsafe fn cpu_kv(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
+    unsafe {
+        let s = |i: usize| &*dst.src[i];
+        let (state, cells) = (s(4), s(7));
+        let p = external_params(dst);
+        let (base, has_dyn, scale) = (p[0] as usize, p[1] != 0, f32_param(p[2]));
+        let (thr, eps, d) = (f32_param(p[3]), f32_param(p[4]), p[5] as usize);
+        let (kvw, n) = (dst.ne[0] as usize, dst.ne[1] as usize);
+        let k = s(2).ne[0] as usize;
+        let nr = kvw / d;
+        for row in part(2 * nr * n, ith, nth) {
+            let (t, hr) = (row / (2 * nr), row % (2 * nr));
+            let (vv, head) = (hr / nr, hr % nr);
+            let (x, w) = (s(vv), s(2 + vv));
+            let dynamic = has_dyn.then(|| s(8 + vv));
+            let per_head = dynamic.map_or(1, |dy| kvw / (dy.ne[0] as usize / k));
+            let mut y = vec![0f32; d];
+            for (i, yi) in y.iter_mut().enumerate() {
+                let ch = head * d + i;
+                let hist = (state.data as *mut u8)
+                    .add(t * state.nb[2] + (base + vv * kvw + ch) * state.nb[1])
+                    as *mut f32;
+                let mut xs: Vec<f32> = (0..k - 1).map(|j| *hist.add(j)).collect();
+                xs.push(at::<f32>(x, t * kvw + ch));
+                let dr =
+                    dynamic.map(|dy| (f32s(dy, t * dy.nb[1], dy.ne[0] as usize), ch / per_head));
+                *yi = conv_tok(f32s(w, ch * w.nb[1], k), &xs, dr, scale);
+                for j in 0..k - 1 {
+                    *hist.add(j) = xs[1 + j];
+                }
+            }
+            // ink_clip's K (no scale, no tau), ink_rms's V (no weight)
+            let o: Vec<f32> = if vv == 0 {
+                let f = clip_factor(&y, thr);
+                y.iter().map(|v| v * f).collect()
+            } else {
+                let sc = rms_scale(&y, eps);
+                y.iter().map(|v| v * sc * 1.0).collect()
+            };
+            f32s_mut(dst, ((vv * n + t) * kvw + head * d) * 4, d).copy_from_slice(&o);
+            let cache = s(5 + vv);
+            let dp =
+                (cache.data as *mut u8).add(at::<i32>(cells, t) as usize * cache.nb[1]) as *mut u16;
+            for (i, v) in o.iter().enumerate() {
+                *dp.add(head * d + i) = ffi::ggml_fp32_to_fp16(*v);
             }
         }
     }
@@ -744,8 +897,7 @@ unsafe fn cpu_clip(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
                     v[i] *= sr[i];
                 }
             }
-            let norm = v.iter().map(|a| a * a).sum::<f32>().sqrt() + 1e-6;
-            let mut f = (thr / norm).clamp(0.0, 1.0);
+            let mut f = clip_factor(&v, thr);
             if let Some(pos) = pos {
                 f *= ls.at(at::<i32>(pos, t));
             }
