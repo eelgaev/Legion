@@ -355,17 +355,11 @@ __device__ __forceinline__ int bf16_sw(int q) { return q ^ ((q >> 3) & 3); }
 // Steps of a row (2 KB each) a warp of linear_mv_bf16 keeps in flight, by tokens.
 template <int N> struct Bf16U { static constexpr int v = N <= 4 ? 2 : 1; };
 
+// linear_mv_bf16's sums of row r of matrix i (a warp's lanes, before warp_sum), its steps
+// through `s` (the warp's U * 128 uint4s of shared memory); linear_set_bf16's too.
 template <int N, int U>
-__global__ void __launch_bounds__(128) linear_mv_bf16(const Lin p) {
-    pdl_wait();
-    __shared__ uint4 sm[4][U * 128];
-    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int64_t r = (int64_t) blockIdx.x * 4 + warp, i = blockIdx.y;
-    if (r >= p.m) {
-        return;
-    }
+__device__ __forceinline__ void bf16_row(const Lin & p, int64_t r, int64_t i, uint4 * s, int lane, float (&acc)[N]) {
     const uint4 * row = (const uint4 *) (p.w + r * p.w_nb1 + i * p.w_nb2);
-    float acc[N];
 #pragma unroll
     for (int t = 0; t < N; t++) {
         acc[t] = 0.0f;
@@ -383,7 +377,6 @@ __global__ void __launch_bounds__(128) linear_mv_bf16(const Lin p) {
             }
         }
     }
-    uint4 * s = sm[warp];
     for (int64_t g = 0; g < groups; g++) {
 #pragma unroll
         for (int u = 0; u < U; u++) {
@@ -419,6 +412,19 @@ __global__ void __launch_bounds__(128) linear_mv_bf16(const Lin p) {
         }
         __syncwarp();
     }
+}
+
+template <int N, int U>
+__global__ void __launch_bounds__(128) linear_mv_bf16(const Lin p) {
+    pdl_wait();
+    __shared__ uint4 sm[4][U * 128];
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int64_t r = (int64_t) blockIdx.x * 4 + warp, i = blockIdx.y;
+    if (r >= p.m) {
+        return;
+    }
+    float acc[N];
+    bf16_row<N, U>(p, r, i, sm[warp], lane, acc);
     bf16_store<N>(p, r, i, lane, acc);
 }
 
@@ -861,6 +867,8 @@ __global__ void __launch_bounds__(256) linear_mv_f32_xs(const Lin p) {
 
 // linear_mv_f32_xs's shared memory for `n` tokens of `k` values, in bytes.
 inline int64_t lin_xs_bytes(int64_t k, int64_t n) { return n * (k / 32) * LIN_XS_F4 * 16; }
+// The most of it a launch takes (larger x goes to the other F32 kernels).
+constexpr int64_t LIN_XS_MAX = 96 * 1024;
 
 // The SMs of the current device (cached per device).
 int lin_sms() {
@@ -876,6 +884,23 @@ int lin_sms() {
         sms[dev] = v > 0 ? v : 48;
     }
     return sms[dev];
+}
+
+// linear_mv_f32_xs's dynamic shared memory limit on the current device: LIN_XS_MAX, or less where
+// a block can't opt in to that much (cached per device).
+int lin_xs_limit() {
+    static int lim[16] = {0};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 16) {
+        return 48 * 1024;
+    }
+    if (lim[dev] == 0) {
+        int v = 0;
+        cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        lim[dev] = v <= 0 ? 48 * 1024 : v < LIN_XS_MAX ? v : (int) LIN_XS_MAX;
+    }
+    return lim[dev];
 }
 
 // Q8_0 rows for a few tokens, read the way ggml's mmvq lays a warp over them: lane l takes the
@@ -993,6 +1018,28 @@ __global__ void __launch_bounds__(128) linear_set_q8(const LinSet s) {
             p.dst[t * p.m + r] = o;
         }
     }
+}
+
+// linear_set_q8 for BF16 matrices (#1221 r7, Inkling-2's attention on its NVFP4 checkpoint):
+// each row as linear_mv_bf16 sums and stores it (bf16_row, bf16_store: the same bits), plain
+// epilogues only.
+template <int N, int U>
+__global__ void __launch_bounds__(128) linear_set_bf16(const LinSet s) {
+    pdl_wait();
+    __shared__ uint4 sm[4][U * 128];
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    int g = 0;
+    while (g + 1 < s.nseg && (int64_t) blockIdx.x >= s.first[g + 1]) {
+        g++;
+    }
+    const Lin & p = s.p[g];
+    const int64_t r = ((int64_t) blockIdx.x - s.first[g]) * 4 + warp;
+    if (r >= p.m) {
+        return;
+    }
+    float acc[N];
+    bf16_row<N, U>(p, r, 0, sm[warp], lane, acc);
+    bf16_store<N>(p, r, 0, lane, acc);
 }
 
 // linear_set_q8 for segments of 4-block rows (k = 128: GLM's ssm_f_b and ssm_g_b, #1172 r4) at
@@ -2015,7 +2062,7 @@ int launch_linear(const A & a, cudaStream_t st) {
         const dim3 grid((unsigned) ((p.m + 3) / 4), (unsigned) p.h);
         launch_pdl(linear_mv<8, true>, grid, 128,0, st, p);
     } else if (p.n >= 2 && p.n <= 4 && wt == T_F32 && (a.params[7] & 1) && p.h == 1 && x16 &&
-               lin_xs_bytes(p.k, p.n) <= 96 * 1024) {
+               lin_xs_bytes(p.k, p.n) <= LIN_XS_MAX) {
         // params[7] bit 0 for F32 weights (ops::small_mv, #1172 r4): linear_mv_f32_xs, a warp a
         // row, as many rows a block as fill the SMs once (one block an SM: its x copy); from 2
         // tokens (at 1 the router's split kernel is faster: 30 vs 35 us on a GB10)
@@ -2025,7 +2072,11 @@ int launch_linear(const A & a, cudaStream_t st) {
         const unsigned g = (unsigned) ((p.m + warps - 1) / warps);
         const int smem = (int) lin_xs_bytes(p.k, p.n);
         void (*k)(const Lin) = p.n == 1 ? &linear_mv_f32_xs<1> : p.n == 2 ? &linear_mv_f32_xs<2> : &linear_mv_f32_xs<4>;
-        if (cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, smem) != cudaSuccess) {
+        // the device's limit (lin_xs_limit), not this launch's size: a graph exec keeps the limit
+        // the function had when it was made, and updating one made at a smaller size with a
+        // launch of this shape was refused (cudaErrorLaunchOutOfResources, #1221 r7)
+        const int lim = smem > lin_xs_limit() ? smem : lin_xs_limit();
+        if (cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, lim) != cudaSuccess) {
             return 1;
         }
         launch_pdl(k, g, 32 * warps, smem, st, p);
@@ -2161,7 +2212,8 @@ int launch_linear(const A & a, cudaStream_t st) {
 
 // LINEAR_SET (linear_set in ops.rs): params [segments, each one's epilogue x3, kda_gate's lower,
 // tokens]; sources (w, x) per segment, then ssm_dt.bias and ssm_a with an LS_KDA_GATE epilogue.
-// Q8_0 matrices and up to 8 tokens; the outputs one after the other, [m, n] each.
+// Q8_0 matrices and up to 8 tokens, or BF16 ones (plain) at 1 token; the outputs one after the
+// other, [m, n] each.
 int launch_linear_set(const A & a, cudaStream_t st) {
     LinSet s{};
     s.nseg = a.params[0];
@@ -2171,6 +2223,11 @@ int launch_linear_set(const A & a, cudaStream_t st) {
     }
     int64_t first = 0, off = 0;
     bool gate = false;
+    // BF16 matrices (all of them) at 1 token: linear_set_bf16
+    const bool bf = a.src_type[0] == T_BF16;
+    if (bf && n != 1) {
+        return 1;
+    }
     for (int g = 0; g < s.nseg; g++) {
         const int wi = 2 * g, xi = 2 * g + 1;
         Lin & p = s.p[g];
@@ -2189,9 +2246,9 @@ int launch_linear_set(const A & a, cudaStream_t st) {
         p.ws = nullptr;
         p.ws_n = 0;
         p.scale = 1.0f;
-        if (p.wtype != T_Q8_0 || a.src_ne[wi][2] != 1 || p.k % 32 != 0 || a.src_ne[xi][0] != p.k ||
-            ((int64_t) ((uintptr_t) p.w | p.w_nb1) % 2) != 0 ||
-            ((int64_t) ((uintptr_t) p.x | p.x_nbt) % 16) != 0) {
+        if (p.wtype != (bf ? T_BF16 : T_Q8_0) || a.src_ne[wi][2] != 1 || p.k % 32 != 0 || a.src_ne[xi][0] != p.k ||
+            ((int64_t) ((uintptr_t) p.w | p.w_nb1) % (bf ? 16 : 2)) != 0 ||
+            ((int64_t) ((uintptr_t) p.x | p.x_nbt) % 16) != 0 || (bf && a.params[1 + g] != LS_PLAIN)) {
             return 1;
         }
         s.epi[g] = a.params[1 + g];
@@ -2233,6 +2290,10 @@ int launch_linear_set(const A & a, cudaStream_t st) {
         s.lower = host_f32(a.params[4]);
     }
     const unsigned grid = (unsigned) first;
+    if (bf) {
+        launch_pdl(linear_set_bf16<1, Bf16U<1>::v>, grid, 128, 0, st, s);
+        return 0;
+    }
     if (rw) {
         if (n == 1) {
             launch_pdl(linear_set_q8_rw<1>, grid, 128, 0, st, s);
