@@ -1015,6 +1015,29 @@ pub fn linear_set<'a>(
     ctx: &'a Context,
     set: &[(Tensor<'a>, Tensor<'a>, SetEpi<'a>)],
 ) -> Vec<Tensor<'a>> {
+    linear_set_with(ctx, set, small_mv_param())
+}
+
+/// [`linear_set`] with [`small_mv`]'s default bits, whatever `LEGION_DEBUG_GLM_SMALL_MV` says:
+/// for other models' sets (Inkling-2, #1221), which GLM's A/B knob must not reach.
+pub fn linear_set_default<'a>(
+    ctx: &'a Context,
+    set: &[(Tensor<'a>, Tensor<'a>, SetEpi<'a>)],
+) -> Vec<Tensor<'a>> {
+    let small = if GB10_GEMV.load(Ordering::Relaxed) {
+        SMALL_MV_DEFAULT as i32
+    } else {
+        0
+    };
+    linear_set_with(ctx, set, small)
+}
+
+/// [`linear_set`] with `small` as the node's [`small_mv`] bits.
+fn linear_set_with<'a>(
+    ctx: &'a Context,
+    set: &[(Tensor<'a>, Tensor<'a>, SetEpi<'a>)],
+    small: i32,
+) -> Vec<Tensor<'a>> {
     assert!(
         (1..=SET_MAX).contains(&set.len()),
         "glm_linear_set: 1-3 products"
@@ -1026,7 +1049,7 @@ pub fn linear_set<'a>(
         "glm_linear_set: Q8_0, up to 8 tokens"
     );
     let mut args = Vec::new();
-    let mut params = [set.len() as i32, 0, 0, 0, 0, n as i32, small_mv_param()];
+    let mut params = [set.len() as i32, 0, 0, 0, 0, n as i32, small];
     let mut gate = None;
     for (g, &(w, x, epi)) in set.iter().enumerate() {
         assert_eq!(x.ne()[0], w.ne()[0], "glm_linear_set: x rows");

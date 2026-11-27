@@ -595,16 +595,16 @@ __global__ void conv_kernel(const A a) {
     const int     K = (int) a.src_ne[1][0];
     const int64_t ch = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t s  = blockIdx.y;
-    float * hist = (float *) ((char *) a.src[2] + s * a.src_nb[2][2] + (off + ch) * a.src_nb[2][1]);
-    const float * w = (const float *) (src(a, 1) + ch * a.src_nb[1][1]);
-    if (ch < c) {
-        l2_prefetch(w);
-        l2_prefetch(hist);
-    }
-    pdl_wait();
     if (ch >= c) {
+        pdl_wait();
         return;
     }
+    // Formed only for live channels: past c they would point beyond the taps and the state.
+    float * hist = (float *) ((char *) a.src[2] + s * a.src_nb[2][2] + (off + ch) * a.src_nb[2][1]);
+    const float * w = (const float *) (src(a, 1) + ch * a.src_nb[1][1]);
+    l2_prefetch(w);
+    l2_prefetch(hist);
+    pdl_wait();
     float         tw[CONV_TAPS], win[CONV_TAPS];
 #pragma unroll
     for (int j = 0; j < CONV_TAPS; j++) {

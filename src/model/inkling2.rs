@@ -598,7 +598,7 @@ impl Model {
             });
         let out = if set {
             let set: Vec<_> = ws.iter().map(|&w| (w, x, glm_ops::SetEpi::Plain)).collect();
-            glm_ops::linear_set(ctx, &set)
+            glm_ops::linear_set_default(ctx, &set)
         } else {
             names
                 .iter()
