@@ -96,7 +96,7 @@ fn experts_flags() -> u32 {
     })
 }
 
-/// Whether `Model::ink_mm_set` takes BF16 weights (#1221 r7): unless
+/// Whether `Model::ink_mm_set` takes BF16 weights (#1221 r7, r9 at 2-8 tokens): unless
 /// `LEGION_DEBUG_INK_BF16_SET=0` (A/B runs: a node a product, as round 6).
 fn bf16_set() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -611,9 +611,9 @@ impl Model {
     /// [`Self::ink_mm_b`] of block `ip`'s weights `names`, all of `x`: one glm_linear_set node
     /// ([`glm_ops::linear_set`], linear_mv_q8's sums row by row: the same bits) where it takes
     /// them, Q8_0 weights without a scale over up to 8 tokens (decode steps; #1221 r6) or BF16
-    /// ones (the NVFP4 checkpoint's) at one token on the GB10 kernels (linear_mv_bf16's sums,
-    /// [`glm_ops::linear_set_bf16_takes`]; r7), unless `own` (traced runs keep a node a
-    /// product); else a node each.
+    /// ones (the NVFP4 checkpoint's) on the GB10 kernels, at one token (linear_mv_bf16's sums,
+    /// [`glm_ops::linear_set_bf16_takes`]; r7) and at 2-8 (linear_mv_bf16x's; r9), unless `own`
+    /// (traced runs keep a node a product); else a node each.
     fn ink_mm_set<'a, const N: usize>(
         &'a self,
         ctx: &'a Context,

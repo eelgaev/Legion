@@ -2241,7 +2241,7 @@ fn linear_set_keeps_the_bits(b: &mut Backend, ty: crate::ggml::ffi::ggml_type, t
 #[test]
 fn linear_set_keeps_the_cpu_bits() {
     linear_set_keeps_the_bits(&mut backend(), types::Q8_0, &[1, 2, 3, 5, 8]);
-    linear_set_keeps_the_bits(&mut backend(), types::BF16, &[1]);
+    linear_set_keeps_the_bits(&mut backend(), types::BF16, &[1, 2, 3, 5, 8]);
 }
 
 /// [`linear_set_keeps_the_bits`] on the GPU: `linear_set_q8` against `linear_mv_q8`.
@@ -2252,15 +2252,16 @@ fn cuda_linear_set_keeps_the_bits() {
     linear_set_keeps_the_bits(&mut gpu_backend(), types::Q8_0, &[1, 2, 3, 5, 8]);
 }
 
-/// [`linear_set_keeps_the_bits`] on the GPU for BF16 weights at one token (#1221 r7):
-/// `linear_set_bf16` against `linear_mv_bf16` (the GB10 kernels' BF16 GEMV, which
+/// [`linear_set_keeps_the_bits`] on the GPU for BF16 weights (#1221 r7, r9): `linear_set_bf16`
+/// against `linear_mv_bf16` at one token, `linear_set_bf16x` against `linear_mv_bf16x` (or
+/// `linear_mv_bf16` at 2 tokens of the short rows) at 2-8 (the GB10 kernels' BF16 GEMV, which
 /// `glm_ops::linear_set_bf16_takes` requires).
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "needs a GPU"]
 fn cuda_linear_set_bf16_keeps_the_bits() {
     glm_ops::set_gb10_linear(true);
-    linear_set_keeps_the_bits(&mut gpu_backend(), types::BF16, &[1]);
+    linear_set_keeps_the_bits(&mut gpu_backend(), types::BF16, &[1, 2, 3, 5, 8]);
 }
 
 /// #1221 r7: the routed NVFP4 experts as `Model::ink_moe` builds them by default (gate and up

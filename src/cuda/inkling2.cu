@@ -1678,7 +1678,27 @@ __device__ __forceinline__ const char * mms_chunks(const char * p, int64_t n, in
     return (const char *) a0;
 }
 
-template <int TY>
+// mm_id_stage's PF (#1221 r9): one bulk L2 prefetch (sm_90+) of the 16-byte chunks covering
+// [p, p + n), from lane 0: DRAM reads a warp's rows as one run (the way nvfp4_mvs's PFT reads an
+// expert's row tiles) instead of as MMS_ROWS interleaved runs of a stage each. A hint: nothing
+// it moves reaches a register, so no sum changes.
+__device__ __forceinline__ void mms_prefetch(const char * p, int64_t n, int lane) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    int          off, nch;
+    const char * c = mms_chunks(p, n, off, nch);
+    if (lane == 0) {
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(__cvta_generic_to_global(c)),
+                     "r"((uint32_t) nch * 16)
+                     : "memory");
+    }
+#else
+    (void) p;
+    (void) n;
+    (void) lane;
+#endif
+}
+
+template <int TY, bool PF>
 __device__ __forceinline__ void mm_id_stage(const A & a, char (*ring)[MMS_ROWS][MMS_BYTES]) {
     static_assert(TY == TYPE_Q8_0 || TY == TYPE_I8, "staged stacks");
     constexpr int BPG = TY == TYPE_Q8_0 ? 34 : 32;
@@ -1706,6 +1726,13 @@ __device__ __forceinline__ void mm_id_stage(const A & a, char (*ring)[MMS_ROWS][
     const int     nst = (int) ((ng + MMS_G - 1) / MMS_G);
     const char *  w   = src(a, 0) + e * a.src_nb[0][2] + r0 * a.src_nb[0][1];
     const float * sc  = TY == TYPE_I8 ? (const float *) src(a, 3) + (e * m + r0) * ng : nullptr;
+    if constexpr (PF) {
+        // the warp's rows are one run of the stack (and their MXFP8 scales another)
+        mms_prefetch(w, nr * a.src_nb[0][1], lane);
+        if constexpr (TY == TYPE_I8) {
+            mms_prefetch((const char *) sc, nr * ng * 4, lane);
+        }
+    }
     // Stage st of row rr: its groups' bytes (and scales) and where they start in the stage.
     auto issue = [&](int st) {
         char(*buf)[MMS_BYTES] = ring[st % MMS_STAGES];
@@ -1791,14 +1818,15 @@ __device__ __forceinline__ void mm_id_stage(const A & a, char (*ring)[MMS_ROWS][
     }
 }
 
-__global__ void __launch_bounds__(MMS_WARPS * 32) mm_id_stage_kernel(const A a) {
+// PF: mms_prefetch of the warp's rows first (#1221 r9, LEGION_DEBUG_INK_MM_STAGE=2).
+template <bool PF> __global__ void __launch_bounds__(MMS_WARPS * 32) mm_id_stage_kernel(const A a) {
     pdl_wait();
     __shared__ __align__(16) char ring[MMS_WARPS][MMS_STAGES][MMS_ROWS][MMS_BYTES];
     char(*mine)[MMS_ROWS][MMS_BYTES] = ring[threadIdx.x / 32];
     if (a.src_type[0] == TYPE_Q8_0) {
-        mm_id_stage<TYPE_Q8_0>(a, mine);
+        mm_id_stage<TYPE_Q8_0, PF>(a, mine);
     } else {
-        mm_id_stage<TYPE_I8>(a, mine);
+        mm_id_stage<TYPE_I8, PF>(a, mine);
     }
 }
 
@@ -1818,7 +1846,7 @@ __global__ void softcap_kernel(const A a) {
 
 }  // namespace
 
-extern "C" const void * const legion_ink_kernels[26] = {
+extern "C" const void * const legion_ink_kernels[27] = {
     reinterpret_cast<const void *>(&mix_kernel),
     reinterpret_cast<const void *>(&ctrl_in_kernel),
     reinterpret_cast<const void *>(&ctrl_out_kernel),
@@ -1844,5 +1872,6 @@ extern "C" const void * const legion_ink_kernels[26] = {
     reinterpret_cast<const void *>(&rms_kernel<16>),
     reinterpret_cast<const void *>(&kv_kernel),
     reinterpret_cast<const void *>(&clip2_kernel),
-    reinterpret_cast<const void *>(&mm_id_stage_kernel),
+    reinterpret_cast<const void *>(&mm_id_stage_kernel<false>),
+    reinterpret_cast<const void *>(&mm_id_stage_kernel<true>),
 };

@@ -1010,10 +1010,11 @@ pub fn linear_set_takes(ws: &[Tensor<'_>], n: i64) -> bool {
 /// Whether [`linear_set`] takes these BF16 weights over `n` tokens with plain epilogues the way
 /// a [`linear`] each would run (#1221 r7): one token, BF16 matrices without a scale, rows
 /// 16-byte aligned, on the GB10 kernels with their BF16 GEMV ([`set_gb10_gemv`],
-/// [`bf16_gemv`]), whose linear_mv_bf16 the set sums each row with. The caller checks there is
-/// no weight scale.
+/// [`bf16_gemv`]), whose linear_mv_bf16 the set sums each row with; or 2-8 tokens with
+/// [`bf16_gemv`] 2+ (#1221 r9), summed as linear_mv_bf16x sums them (the same bits as
+/// linear_mv_bf16). The caller checks there is no weight scale.
 pub fn linear_set_bf16_takes(ws: &[Tensor<'_>], n: i64) -> bool {
-    n == 1
+    (n == 1 || ((2..=8).contains(&n) && bf16_gemv() >= 2))
         && GB10_LINEAR.load(Ordering::Relaxed)
         && GB10_GEMV.load(Ordering::Relaxed)
         && bf16_gemv() >= 1
@@ -1027,8 +1028,8 @@ fn bf16_set_matrix(w: Tensor<'_>) -> bool {
 }
 
 /// Up to [`SET_MAX`] products `w @ x` (Q8_0 `w`, F32 `x` of `n` tokens, see
-/// [`linear_set_takes`]; or BF16 `w` at one token with plain epilogues,
-/// [`linear_set_bf16_takes`]) in one node, each then through its epilogue: the bits of
+/// [`linear_set_takes`]; or BF16 `w` with plain epilogues, [`linear_set_bf16_takes`]) in one
+/// node, each then through its epilogue: the bits of
 /// [`linear`] (scale 1, no weight scale) and then [`sigmoid`] or [`kda_gate`] on its output, in
 /// one launch on CUDA (#606). Returns F32 `[m, n]` per product.
 pub fn linear_set<'a>(
@@ -1041,10 +1042,10 @@ pub fn linear_set<'a>(
     );
     let n: i64 = set[0].1.ne()[1..].iter().product();
     let ws: Vec<_> = set.iter().map(|s| s.0).collect();
-    let bf16 = n == 1 && ws.iter().all(|w| bf16_set_matrix(*w));
+    let bf16 = (1..=8).contains(&n) && ws.iter().all(|w| bf16_set_matrix(*w));
     assert!(
         linear_set_takes(&ws, n) || (bf16 && set.iter().all(|s| matches!(s.2, SetEpi::Plain))),
-        "glm_linear_set: Q8_0, up to 8 tokens (or BF16, plain, at 1)"
+        "glm_linear_set: Q8_0 or BF16 (plain), up to 8 tokens"
     );
     let mut args = Vec::new();
     let mut params = [set.len() as i32, 0, 0, 0, 0, n as i32, small_mv_param()];

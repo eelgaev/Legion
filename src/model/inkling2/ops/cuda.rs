@@ -71,7 +71,7 @@ struct LaunchConfig {
 const ATTR_PROGRAMMATIC_STREAM_SERIALIZATION: c_int = 6;
 
 /// The kernels of `legion_ink_kernels`.
-const KERNELS: usize = 26;
+const KERNELS: usize = 27;
 
 unsafe extern "C" {
     /// The kernels as the CUDA runtime knows them (their host stubs' addresses), in
@@ -164,6 +164,9 @@ enum Kernel {
     /// `MmIdVec`'s work for Q8_0 and MXFP8 stacks, the weights copied through shared memory
     /// a few groups ahead of the sums (#1221 r8); the same sums.
     MmIdStage,
+    /// `MmIdStage` with each warp's rows prefetched to L2 in one bulk hint first (#1221 r9,
+    /// `LEGION_DEBUG_INK_MM_STAGE=2`); the same sums.
+    MmIdStagePf,
 }
 
 /// `RMS_THREADS` of the kernels.
@@ -555,11 +558,21 @@ pub(super) unsafe fn situ(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
     unsafe { elementwise(Kernel::Situ, "ink_situ", dst, stream) }
 }
 
-/// Whether decode steps of Q8_0 and MXFP8 experts take `MmIdStage` (#1221 r8): unless
-/// `LEGION_DEBUG_INK_MM_STAGE=0` (A/B runs: `MmIdVec`, as round 7). The same bits either way.
-fn mm_stage() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("LEGION_DEBUG_INK_MM_STAGE").map_or(true, |v| v.trim() != "0"))
+/// The kernel of decode steps of Q8_0 and MXFP8 experts (#1221 r8, r9): `MmIdStage`, unless
+/// `LEGION_DEBUG_INK_MM_STAGE` is 0 (A/B runs: `MmIdVec`, as round 7) or 2 (`MmIdStagePf`). The
+/// same bits in all three.
+fn mm_stage() -> Kernel {
+    static K: std::sync::OnceLock<Kernel> = std::sync::OnceLock::new();
+    *K.get_or_init(|| mm_stage_of(std::env::var("LEGION_DEBUG_INK_MM_STAGE").ok().as_deref()))
+}
+
+/// [`mm_stage`] given the environment's value.
+fn mm_stage_of(env: Option<&str>) -> Kernel {
+    match env.map(str::trim) {
+        Some("0") => Kernel::MmIdVec,
+        Some("2") => Kernel::MmIdStagePf,
+        _ => Kernel::MmIdStage,
+    }
 }
 
 pub(super) unsafe fn mm_id(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
@@ -570,10 +583,10 @@ pub(super) unsafe fn mm_id(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Resul
         // Few pairs (decode): a block per pair reads only its expert's weights. More: a block
         // per expert reuses each weight for up to `MM_BN` pairs. Same sums either way.
         let (k, grid) = if pairs <= experts.min(GRID_YZ) {
-            let staged = matches!(src(dst, 0).type_, types::Q8_0 | types::I8) && mm_stage();
+            let eight_bit = matches!(src(dst, 0).type_, types::Q8_0 | types::I8);
             (
-                if staged {
-                    Kernel::MmIdStage
+                if eight_bit {
+                    mm_stage()
                 } else {
                     Kernel::MmIdVec
                 },
