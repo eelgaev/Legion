@@ -119,48 +119,25 @@ fn bf16_set() -> bool {
     *ON.get_or_init(|| std::env::var("LEGION_DEBUG_INK_BF16_SET").map_or(true, |v| v.trim() != "0"))
 }
 
-/// Round 10's fusions of small steps (#1221), all the same bits: a controller's `ink_ctrl_in`
-/// in its down projection's kernel ([`ops::lin32_ctrl`]).
-const FUSE_CTRL: u32 = 1;
-/// The router's F32 product in [`ops::lin32`]'s kernel.
-const FUSE_ROUTER: u32 = 2;
-/// A mix feeding RMS norms only and the norms in one node ([`ops::mix_rms`]).
-const FUSE_MIX_RMS: u32 = 4;
-/// The other mixes on the kernel that keeps a thread's elements in registers ([`ops::mix_in`]).
-const FUSE_MIX: u32 = 8;
-const FUSE_ALL: u32 = FUSE_CTRL | FUSE_ROUTER | FUSE_MIX_RMS | FUSE_MIX;
-
-/// The round 10 fusions on: none (round 9's nodes) unless `LEGION_DEBUG_INK_FUSE10=<mask>`
-/// takes some for A/B runs (all of them lost ~3% of GGUF decode on a GB10).
-fn fuse10() -> u32 {
-    static FLAGS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *FLAGS.get_or_init(|| fuse10_of(std::env::var("LEGION_DEBUG_INK_FUSE10").ok().as_deref()))
-}
-
-/// [`fuse10`]'s mask from the variable's value: unset or unparsed, none.
-fn fuse10_of(v: Option<&str>) -> u32 {
-    v.and_then(|v| v.trim().parse::<u32>().ok())
-        .map_or(0, |m| m & FUSE_ALL)
-}
-
 /// The Q8_0 attention sets', lone products' and head's warp layout on CUDA's deeper-load set
-/// kernel (#1221 r10, [`glm_ops::linear_set_deep`]): none (round 9's linear_set_q8 sets and
-/// linear_mv_q8 products) unless `LEGION_DEBUG_INK_Q8_DEEP` names one for A/B runs (`r1u2`,
-/// `r1u4`, `r2u2`, `r2u4`: within noise on a GB10). The same bits either way.
+/// kernel (#1221 r10, [`glm_ops::linear_set_deep`]): one row a warp and four loads a lane
+/// (about +1% GGUF decode on a GB10) unless `LEGION_DEBUG_INK_Q8_DEEP` names another for A/B
+/// runs (`r1u2`, `r2u2`, `r2u4`) or is `0` (round 9's linear_set_q8 sets and linear_mv_q8
+/// products). The same bits either way.
 fn q8_deep() -> Option<glm_ops::DeepQ8> {
     static DEEP: std::sync::OnceLock<Option<glm_ops::DeepQ8>> = std::sync::OnceLock::new();
     *DEEP.get_or_init(|| q8_deep_of(std::env::var("LEGION_DEBUG_INK_Q8_DEEP").ok().as_deref()))
 }
 
-/// [`q8_deep`]'s layout from the variable's value: unset, `0` or not a name, none.
+/// [`q8_deep`]'s layout from the variable's value: unset or not a name, `r1u4`.
 fn q8_deep_of(v: Option<&str>) -> Option<glm_ops::DeepQ8> {
     let deep = |rows, loads| Some(glm_ops::DeepQ8 { rows, loads });
     match v.map(str::trim) {
+        Some("0") => None,
         Some("r1u2") => deep(1, 2),
-        Some("r1u4") => deep(1, 4),
         Some("r2u2") => deep(2, 2),
         Some("r2u4") => deep(2, 4),
-        _ => None,
+        _ => deep(1, 4),
     }
 }
 
@@ -593,8 +570,8 @@ impl Arch for Ink2Params {
     /// the same index as `argmax` (the first of the largest) for NaN-free logits. The soft cap
     /// passes a NaN through (`tanh(NaN)` is NaN), so that rests on the output projection.
     /// The projection reads only the unpadded vocabulary's rows (#1221 r9: the padding's
-    /// logits were cut anyway), a Q8_0 head at decode steps on the deeper-load set kernel when
-    /// an A/B run picks one ([`glm_ops::linear_set_deep`], [`q8_deep`]; r10): the same bits.
+    /// logits were cut anyway), a Q8_0 head at decode steps on the deeper-load set kernel
+    /// ([`glm_ops::linear_set_deep`], [`q8_deep`]; r10): the same bits.
     fn head<'a>(
         &self,
         m: &'a Model,
@@ -744,9 +721,9 @@ impl Model {
     /// them, Q8_0 weights without a scale over up to 8 tokens (decode steps; #1221 r6) or BF16
     /// ones (the NVFP4 checkpoint's) on the GB10 kernels, at one token (linear_mv_bf16's sums,
     /// [`glm_ops::linear_set_bf16_takes`]; r7) and at 2-8 (linear_mv_bf16x's; r9), unless `own`
-    /// (traced runs keep a node a product); else a node each. When an A/B run picks it, Q8_0
-    /// sets run CUDA's deeper-load kernel ([`glm_ops::linear_set_deep`], [`q8_deep`]; r10), and
-    /// then a single Q8_0 product (`N` 1) takes it too.
+    /// (traced runs keep a node a product); else a node each. Q8_0 sets run CUDA's deeper-load
+    /// kernel ([`glm_ops::linear_set_deep`], [`q8_deep`]; r10), and then a single Q8_0 product
+    /// (`N` 1) takes it too.
     fn ink_mm_set<'a, const N: usize>(
         &'a self,
         ctx: &'a Context,
@@ -821,39 +798,6 @@ impl Model {
         Ok(ops::rms(ctx, x, Some(self.lw(ip, name)?), self.hp.rms_eps))
     }
 
-    /// [`ops::mix`] of `states` with `query`, small steps on the register kernel
-    /// ([`FUSE_MIX`]).
-    fn ink_mix<'a>(
-        &'a self,
-        ctx: &'a Context,
-        states: &[Tensor<'a>],
-        query: Tensor<'a>,
-    ) -> Tensor<'a> {
-        ops::mix_in(ctx, states, query, MIX_EPS, fuse10() & FUSE_MIX != 0)
-    }
-
-    /// [`ops::mix_rms`] of `states` with `query` and the norm weights `ws` of block `ip`, where
-    /// it takes them and [`FUSE_MIX_RMS`] is on, unless `own` (traced runs keep the mix a node).
-    fn ink_mix_rms<'a>(
-        &'a self,
-        ctx: &'a Context,
-        ip: usize,
-        states: &[Tensor<'a>],
-        query: Tensor<'a>,
-        ws: &[&str],
-        own: bool,
-    ) -> Result<Option<Tensor<'a>>, ModelError> {
-        if own || fuse10() & FUSE_MIX_RMS == 0 {
-            return Ok(None);
-        }
-        let ws = ws
-            .iter()
-            .map(|nm| self.lw(ip, nm))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(ops::mix_rms_takes(states, query, &ws)
-            .then(|| ops::mix_rms(ctx, states, query, MIX_EPS, &ws, self.hp.rms_eps)))
-    }
-
     /// The layers over the normed embeddings `x` (`[n_embd, n]`); ends in the head's input.
     fn ink_layers<'a>(
         &'a self,
@@ -904,7 +848,7 @@ impl Model {
                     None
                 } else {
                     let q = self.ink_msg_query(ctx, ip)?;
-                    let m = self.ink_mix(ctx, &bank, q);
+                    let m = ops::mix(ctx, &bank, q, MIX_EPS);
                     tap.tap("loop_msgs", il, m);
                     Some(m)
                 };
@@ -915,7 +859,7 @@ impl Model {
             cur = self.ink_layer(pass, ip, ip, cur, &mut blocks, None)?;
         }
         blocks.push(cur);
-        let x = self.ink_mix(ctx, &blocks, self.w("output_res_query.weight")?);
+        let x = ops::mix(ctx, &blocks, self.w("output_res_query.weight")?, MIX_EPS);
         let x = ctx.reshape_2d(x, hp.n_embd, pass.n);
         tap.tap("result_mix", 0, x);
         let x = match pass.out_rows {
@@ -959,33 +903,8 @@ impl Model {
         msg: Tensor<'a>,
     ) -> Result<Tensor<'a>, ModelError> {
         let p = self.ink();
-        let down = p.ctrl_name(ip, c, "down");
-        let no_scale = |nm: &str| {
-            nm.strip_suffix(".weight")
-                .is_some_and(|b| self.w(&format!("{b}.scale")).is_err())
-        };
-        // Small steps: ink_ctrl_in in the down projection's kernel (#1221 r10), F32 weights
-        // with no scales (glm_mm's product is then glm_linear's at scale 1).
-        let [e, n, n2, n3] = cur.ne();
-        let g = match self.w(&down) {
-            Ok(dw)
-                if fuse10() & FUSE_CTRL != 0
-                    && no_scale(&down)
-                    && [n2, n3] == [1, 1]
-                    && e % 32 == 0
-                    && dw.ne()[0] == 2 * e
-                    && msg.ne() == cur.ne()
-                    && cur.is_contiguous()
-                    && msg.is_contiguous()
-                    && ops::lin32_takes(dw, n) =>
-            {
-                ops::lin32_ctrl(ctx, dw, cur, msg, MIX_EPS)
-            }
-            _ => {
-                let g = ops::ctrl_in(ctx, cur, msg, MIX_EPS);
-                self.glm_mm(ctx, &down, g)?
-            }
-        };
+        let g = ops::ctrl_in(ctx, cur, msg, MIX_EPS);
+        let g = self.glm_mm(ctx, &p.ctrl_name(ip, c, "down"), g)?;
         // Small steps: the gain and forget products and the output in one node of the same bits
         // (#1221 r5), when the weights suit it and carry no scales (glm_mm's products of these
         // are then scale 1).
@@ -1089,27 +1008,11 @@ impl Model {
         } else {
             Some(self.lw(ip, "attn_res_query.weight")?)
         };
-        // Without messages the mix feeds the norms only: one node of both where it takes them
-        // (#1221 r10).
-        let mut fused = None;
         if let Some(q) = query {
-            let st = states(blocks, cur);
-            let norms: &[&str] = if swa {
-                &["attn_norm.weight"]
-            } else {
-                &[
-                    "attn_q_inp_norm.weight",
-                    "attn_k_inp_norm.weight",
-                    "attn_v_inp_norm.weight",
-                ]
-            };
-            fused = self.ink_mix_rms(ctx, ip, &st, q, norms, tap.on || msgs.is_some())?;
-            if fused.is_none() {
-                let mixed = self.ink_mix(ctx, &st, q);
-                tap.tap("attn_mix", il, mixed);
-                for (j, x) in inputs.iter_mut().enumerate() {
-                    *x = slice(ctx, mixed, if swa { 0 } else { j });
-                }
+            let mixed = ops::mix(ctx, &states(blocks, cur), q, MIX_EPS);
+            tap.tap("attn_mix", il, mixed);
+            for (j, x) in inputs.iter_mut().enumerate() {
+                *x = slice(ctx, mixed, if swa { 0 } else { j });
             }
         }
         if let Some(m) = msgs {
@@ -1118,14 +1021,7 @@ impl Model {
                 tap.tap(["attn_ctrl_q", "attn_ctrl_k", "attn_ctrl_v"][j], il, *x);
             }
         }
-        let inputs = if let Some(normed) = fused {
-            // A sliding layer's one input is one tensor, as its one norm's (shared BF16 rows).
-            if swa {
-                [slice(ctx, normed, 0); 3]
-            } else {
-                [0, 1, 2].map(|j| slice(ctx, normed, j))
-            }
-        } else if swa && msgs.is_some() {
+        let inputs = if swa && msgs.is_some() {
             let mut normed = inputs;
             for x in normed.iter_mut() {
                 *x = self.ink_rms(ctx, ip, "attn_norm.weight", *x)?;
@@ -1164,22 +1060,19 @@ impl Model {
         };
 
         let ffn_inp = cur;
-        let st = states(blocks, cur);
-        let fq = self.lw(ip, "ffn_res_query.weight")?;
-        let own = tap.on || msgs.is_some();
-        let h = match self.ink_mix_rms(ctx, ip, &st, fq, &["ffn_norm.weight"], own)? {
-            Some(normed) => ctx.reshape_2d(normed, e, n),
-            None => {
-                let h = self.ink_mix(ctx, &st, fq);
-                let mut h = ctx.reshape_2d(h, e, n);
-                tap.tap("ffn_mix", il, h);
-                if let Some(m) = msgs {
-                    h = self.ink_control(ctx, ip, 3, h, slice(ctx, m, 3))?;
-                    tap.tap("ffn_ctrl", il, h);
-                }
-                self.ink_rms(ctx, ip, "ffn_norm.weight", h)?
-            }
-        };
+        let h = ops::mix(
+            ctx,
+            &states(blocks, cur),
+            self.lw(ip, "ffn_res_query.weight")?,
+            MIX_EPS,
+        );
+        let mut h = ctx.reshape_2d(h, e, n);
+        tap.tap("ffn_mix", il, h);
+        if let Some(m) = msgs {
+            h = self.ink_control(ctx, ip, 3, h, slice(ctx, m, 3))?;
+            tap.tap("ffn_ctrl", il, h);
+        }
+        let h = self.ink_rms(ctx, ip, "ffn_norm.weight", h)?;
         tap.tap("ffn_inp_norm", il, h);
         let y = self.ink_moe(pass, il, ip, h)?;
         tap.tap("ffn_moe_out", il, y);
@@ -1443,22 +1336,7 @@ impl Model {
         let p = self.ink();
         let hp = &self.hp;
         let n = h.ne()[1];
-        // Small steps: an F32 router with no scale (glm_linear's product at scale 1) in
-        // ink_lin32's kernel (#1221 r10), the same bits.
-        let gate = format!("blk.{ip}.ffn_gate_inp");
-        let logits = match self.w(&format!("{gate}.weight")) {
-            Ok(gw)
-                if fuse10() & FUSE_ROUTER != 0
-                    && self.w(&format!("{gate}.scale")).is_err()
-                    && h.ty() == types::F32
-                    && h.is_contiguous()
-                    && h.ne() == [gw.ne()[0], n, 1, 1]
-                    && ops::lin32_takes(gw, n) =>
-            {
-                ops::lin32(ctx, gw, h)
-            }
-            _ => self.ink_mm(ctx, ip, "ffn_gate_inp.weight", h)?,
-        };
+        let logits = self.ink_mm(ctx, ip, "ffn_gate_inp.weight", h)?;
         tap.tap("ffn_moe_logits", il, logits);
         let bias = self.lw(ip, "exp_probs_b.bias")?;
         // The router's top-k needs `n_expert` logits and biases (`parse` checks k against it).

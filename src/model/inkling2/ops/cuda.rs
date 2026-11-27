@@ -71,7 +71,7 @@ struct LaunchConfig {
 const ATTR_PROGRAMMATIC_STREAM_SERIALIZATION: c_int = 6;
 
 /// The kernels of `legion_ink_kernels`.
-const KERNELS: usize = 37;
+const KERNELS: usize = 27;
 
 unsafe extern "C" {
     /// The kernels as the CUDA runtime knows them (their host stubs' addresses), in
@@ -167,20 +167,6 @@ enum Kernel {
     /// `MmIdStage` with each warp's rows prefetched to L2 in one bulk hint first (#1221 r9,
     /// `LEGION_DEBUG_INK_MM_STAGE=2`); the same sums.
     MmIdStagePf,
-    /// `lin32_kernel<1, 2, 4, 8>`, then with ink_ctrl_in in front (`<.., true>`): F32 products
-    /// of small steps with `glm_linear`'s bits, a block a row (#1221 r10).
-    Lin32x1,
-    Lin32x2,
-    Lin32x4,
-    Lin32x8,
-    Lin32In1,
-    Lin32In2,
-    Lin32In4,
-    Lin32In8,
-    /// `mixr_kernel<false>` (ink_mix of small steps, a thread's elements in registers) and
-    /// `<true>` (ink_mix_rms) (#1221 r10).
-    MixRegs,
-    MixRms,
 }
 
 /// `RMS_THREADS` of the kernels.
@@ -278,12 +264,6 @@ unsafe fn src(dst: &ffi::ggml_tensor, i: usize) -> &ffi::ggml_tensor {
     unsafe { &*dst.src[i] }
 }
 
-/// Whether the node has its first `n` sources (a kernel reading a source past them would read
-/// through a null pointer).
-fn has_srcs(dst: &ffi::ggml_tensor, n: i64) -> bool {
-    (0..n.max(0) as usize).all(|i| i < dst.src.len() && !dst.src[i].is_null())
-}
-
 /// The node's element count.
 fn elements(dst: &ffi::ggml_tensor) -> i64 {
     dst.ne.iter().product()
@@ -314,81 +294,14 @@ pub(super) unsafe fn mix(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
     if external_params(dst)[0] > MIX_STATES || dst.ne[2] > MIX_QUERIES {
         return Err("ink_mix: more states or queries than the kernel holds".into());
     }
-    if !has_srcs(dst, external_params(dst)[0] as i64 + 1) {
-        return Err("ink_mix: fewer sources than states and query".into());
-    }
-    // params[3]: small steps' rows that `mixr_kernel`'s registers hold (the builder's check)
-    let k = if external_params(dst)[3] != 0 && dst.ne[0] <= MIXR_MAX {
-        Kernel::MixRegs
-    } else {
-        Kernel::Mix
-    };
-    // SAFETY: a node of this op, in device memory.
-    unsafe { launch(k, "ink_mix", dst, dim(dst.ne[1], 1), 256, 0, stream) }
-}
-
-/// `MIXR_U` of `mixr_kernel` times its 256 threads: the widest rows it holds.
-const MIXR_MAX: i64 = 9 * 256;
-
-pub(super) unsafe fn mix_rms(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
-    if external_params(dst)[0] > MIX_STATES || dst.ne[2] > MIX_QUERIES || dst.ne[0] > MIXR_MAX {
-        return Err("ink_mix_rms: more states, queries or values than the kernel holds".into());
-    }
-    // the states, the query and (params[4]) a weight a query
-    let p = external_params(dst);
-    if !has_srcs(dst, p[0] as i64 + 1 + if p[4] != 0 { dst.ne[2] } else { 0 }) {
-        return Err("ink_mix_rms: fewer sources than states, query and weights".into());
-    }
     // SAFETY: a node of this op, in device memory.
     unsafe {
         launch(
-            Kernel::MixRms,
-            "ink_mix_rms",
+            Kernel::Mix,
+            "ink_mix",
             dst,
             dim(dst.ne[1], 1),
             256,
-            0,
-            stream,
-        )
-    }
-}
-
-/// `LIN32_THREADS` of `lin32_kernel`: a 32-value block of a row each.
-const LIN32_THREADS: i64 = 256;
-
-pub(super) unsafe fn lin32(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
-    let fused = external_params(dst)[2] != 0;
-    // the weight and the input, or (fused) the controller's cur and msg
-    if !has_srcs(dst, if fused { 3 } else { 2 }) {
-        return Err("ink_lin32: fewer sources than the kernel reads".into());
-    }
-    // SAFETY: a node of this op; its sources were checked by the builder (and above).
-    unsafe {
-        let w = src(dst, 0);
-        if w.ne[0] % 32 != 0
-            || w.ne[0] / 32 > LIN32_THREADS
-            || (fused && src(dst, 1).ne[0] % 32 != 0)
-            || !rows16(w)
-        {
-            return Err("ink_lin32: a shape or rows the kernel does not take".into());
-        }
-        let k = match (dst.ne[1], fused) {
-            (1, false) => Kernel::Lin32x1,
-            (2, false) => Kernel::Lin32x2,
-            (3..=4, false) => Kernel::Lin32x4,
-            (5..=8, false) => Kernel::Lin32x8,
-            (1, true) => Kernel::Lin32In1,
-            (2, true) => Kernel::Lin32In2,
-            (3..=4, true) => Kernel::Lin32In4,
-            (5..=8, true) => Kernel::Lin32In8,
-            _ => return Err("ink_lin32: more tokens than the kernel takes".into()),
-        };
-        launch(
-            k,
-            "ink_lin32",
-            dst,
-            dim(dst.ne[0], 1),
-            LIN32_THREADS as u32,
             0,
             stream,
         )
