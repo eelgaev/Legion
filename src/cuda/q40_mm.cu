@@ -374,7 +374,7 @@ template <class C> __global__ void __launch_bounds__(Q40_THREADS, C::MINB) q40_g
 // Round 3's matmul configuration: BM x BN tiles, WARPS_M x WARPS_N warps of (BM / WARPS_M) x
 // (BN / WARPS_N), a STAGES-deep ring of 4 K blocks a stage, MINB CTAs an SM, raster groups of
 // GROUP row tiles; the input in layout 1.
-template <int BM_, int BN_, int WARPS_M_, int WARPS_N_, int STAGES_, int MINB_, int GROUP_> struct q40_cfg3 {
+template <int BM_, int BN_, int WARPS_M_, int WARPS_N_, int STAGES_, int MINB_, int GROUP_, int LATE_ = 0> struct q40_cfg3 {
     static constexpr int BM          = BM_;
     static constexpr int BN          = BN_;
     static constexpr int WARPS_M     = WARPS_M_;
@@ -382,6 +382,7 @@ template <int BM_, int BN_, int WARPS_M_, int WARPS_N_, int STAGES_, int MINB_, 
     static constexpr int STAGES      = STAGES_;
     static constexpr int MINB        = MINB_;
     static constexpr int GROUP       = GROUP_;
+    static constexpr int LATE        = LATE_;            // the next stage's copies after block 0
     static constexpr int THREADS     = 32 * WARPS_M * WARPS_N;
     static constexpr int MT          = BM / WARPS_M / 16;
     static constexpr int NT          = BN / WARPS_N / 8;
@@ -505,7 +506,9 @@ template <class C> __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_ge
     for (int st = 0; st < nst; st++) {
         q40_wait<S - 2>();
         __syncthreads();  // stage st landed for all; slot (st - 1) % S read by all
-        load(st + S - 1);
+        if (!C::LATE) {
+            load(st + S - 1);
+        }
 
         const uint32_t * sw = q40_smem + (st % S) * C::STAGE_WORDS;
         const uint32_t * sq = sw + C::W_WORDS;
@@ -513,6 +516,9 @@ template <class C> __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_ge
         const uint32_t * sa = sw + (st & 1) * 2 + (wm * 16 * MT + g) * C::WRS;
 #pragma unroll
         for (int bl = 0; bl < SB; bl++) {
+            if (C::LATE && bl == 1) {
+                load(st + S - 1);
+            }
             uint32_t a[MT][4];
             float da[MT][2], mda[MT][2];
 #pragma unroll
@@ -590,11 +596,12 @@ template <class C> __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_ge
 }
 
 // The variants the timing test compares (src/model/q40_mm.rs, `Kernel`).
-using q40_r3a = q40_cfg3<128, 128, 4, 2, 3, 1, 8>;   // 8 warps of 32 x 64
-using q40_r3b = q40_cfg3<128, 128, 4, 4, 3, 1, 8>;   // 16 warps of 32 x 32
-using q40_r3c = q40_cfg3<256, 128, 4, 2, 2, 1, 6>;   // 8 warps of 64 x 64
-using q40_r3d = q40_cfg3<256, 128, 8, 2, 2, 1, 6>;   // 16 warps of 32 x 64
-using q40_r3e = q40_cfg3<128, 256, 2, 4, 2, 1, 8>;   // 8 warps of 64 x 64
+using q40_r3a  = q40_cfg3<128, 128, 4, 2, 3, 1, 8>;      // 8 warps of 32 x 64
+using q40_r3aL = q40_cfg3<128, 128, 4, 2, 3, 1, 8, 1>;
+using q40_r3aG = q40_cfg3<128, 128, 4, 2, 3, 1, 16>;
+using q40_r3f  = q40_cfg3<64, 128, 2, 2, 2, 2, 16>;      // 4 warps of 32 x 64, 2 CTAs an SM
+using q40_r3fL = q40_cfg3<64, 128, 2, 2, 2, 2, 16, 1>;
+using q40_r3fG = q40_cfg3<64, 128, 2, 2, 2, 2, 32, 1>;
 
 }  // namespace
 
@@ -620,10 +627,11 @@ extern const legion_q40_kernel legion_q40_mm_table[] = {
     Q40_R3(q40_r3a, "r3 128x128 8w 32x64"),
     { reinterpret_cast<const void *>(&q40_quant<0>), reinterpret_cast<const void *>(&q40_gemm<q40_v1>), q40_v1::SMEM,
       256, 128, 128, "first version" },
-    Q40_R3(q40_r3b, "r3 128x128 16w 32x32"),
-    Q40_R3(q40_r3c, "r3 256x128 8w 64x64"),
-    Q40_R3(q40_r3d, "r3 256x128 16w 32x64"),
-    Q40_R3(q40_r3e, "r3 128x256 8w 64x64"),
+    Q40_R3(q40_r3aL, "r3 128x128 8w late copy"),
+    Q40_R3(q40_r3aG, "r3 128x128 8w group 16"),
+    Q40_R3(q40_r3f, "r3 64x128 4w x2 CTAs"),
+    Q40_R3(q40_r3fL, "r3 64x128 4w x2 late copy"),
+    Q40_R3(q40_r3fG, "r3 64x128 4w x2 late group 32"),
 };
 extern const int legion_q40_mm_table_len = sizeof(legion_q40_mm_table) / sizeof(legion_q40_mm_table[0]);
 
