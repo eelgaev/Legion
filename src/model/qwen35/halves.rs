@@ -2,10 +2,10 @@
 //! in parts of its tokens (#1133), as Gemma 4's halves (#619): the mixer's output projection's
 //! partial is summed per half, and each FFN part runs as soon as its half's sum is in, so that
 //! the transfers run while the GPU computes: half 1's mixer sum during half 0's FFN, each FFN
-//! part's sum during the next part's FFN. Gated attention runs whole; gated DeltaNet runs its
-//! delta rule, gated norm and output projection per half where it can
-//! ([`Model::delta_net_halves`], [`mixer_on`]), so half 0's mixer sum travels during half 1's
-//! mixer too.
+//! part's sum during the next part's FFN. Gated DeltaNet runs its delta rule, gated norm and
+//! output projection per half where it can ([`Model::delta_net_halves`], [`mixer_on`]), and
+//! gated attention its attention, gate and output projection ([`Model::attention_halves`],
+//! [`attn_on`]), so half 0's mixer sum travels during half 1's mixer too.
 //!
 //! The FFN runs on half 0 whole and on half 1 in [`plan`]'s parts, the last of them small: the
 //! last part's sum travels while the GPU has nothing left to do in the layer, so a small last
@@ -75,6 +75,34 @@ fn on_of(v: Option<&str>) -> bool {
 /// after it). Read once ([`mixer`]).
 pub(super) fn mixer_on() -> bool {
     mixer() >= 1
+}
+
+/// Whether the gated attention layers of those steps run per half of the tokens from the
+/// attention on ([`Model::attention_halves`]: the attention in two launches, then per half the
+/// gate and the output projection), so that half 0's sum is on the wire while half 1's
+/// attention and projection run: on, the same bits as whole;
+/// `LEGION_DEBUG_QWEN35_TP_ATTN_HALVES=0` keeps the layer whole. Read once.
+pub(super) fn attn_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = attn_of(
+            std::env::var("LEGION_DEBUG_QWEN35_TP_ATTN_HALVES")
+                .ok()
+                .as_deref(),
+        );
+        if !on {
+            tracing::info!(
+                "attention parts (#1133): off, the attention layers run whole \
+                 (LEGION_DEBUG_QWEN35_TP_ATTN_HALVES=0)"
+            );
+        }
+        on
+    })
+}
+
+/// [`attn_on`] for the variable's value `v`.
+fn attn_of(v: Option<&str>) -> bool {
+    v.map(str::trim) != Some("0")
 }
 
 /// Whether those halves run the mixer's input projections and conv per half too

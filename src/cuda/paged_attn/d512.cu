@@ -5,3 +5,7 @@
 template <> int legion_paged::launch_dim<512>(const legion_paged_attn & p, cudaStream_t st) {
     return launch_d<512>(p, st);
 }
+
+template <> int legion_paged::launch_part_dim<512>(const legion_paged_attn & p, int n0, int part, cudaStream_t st) {
+    return launch_part_d<512>(p, n0, part, st);
+}

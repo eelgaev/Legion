@@ -13,6 +13,8 @@ thread_local int64_t t_vsplit_launches = 0;
 int g_qm = 1;
 thread_local int t_qm = -1;
 thread_local int64_t t_qm_launches = 0;
+thread_local int64_t t_part_launches = 0;
+thread_local int32_t t_part_info[3] = { 0, 0, 0 };
 
 }  // namespace legion_paged
 
@@ -150,6 +152,16 @@ int64_t legion_paged_attn_qm_launches(void) {
     return t_qm_launches;
 }
 
+int64_t legion_paged_attn_part_launches(void) {
+    return t_part_launches;
+}
+
+void legion_paged_attn_part_info(int32_t * out) {
+    for (int i = 0; i < 3; i++) {
+        out[i] = t_part_info[i];
+    }
+}
+
 void legion_paged_attn_set_qm(int on, int this_thread) {
     if (this_thread > 0) {
         legion_paged::t_qm = on;
@@ -192,6 +204,28 @@ int legion_paged_attn_launch(const legion_paged_attn * p, void * stream) {
         case 128: return legion_paged::launch_dim<128>(*p, st);
         case 256: return legion_paged::launch_dim<256>(*p, st);
         case 512: return legion_paged::launch_dim<512>(*p, st);
+        default: return 1;
+    }
+}
+
+int legion_paged_attn_launch_part(const legion_paged_attn * p, int32_t n0, int32_t part, void * stream) {
+    if (p->n_head_kv <= 0 || p->n_head % p->n_head_kv != 0) {
+        return 1;
+    }
+    if (p->compact) {
+        if (part != 1) {
+            return 0;
+        }
+        legion_paged::t_part_info[0] = LEGION_PART_COMPACT;
+        legion_paged::t_part_info[1] = -1;
+        legion_paged::t_part_info[2] = p->n_tok;
+        return legion_paged_attn_launch(p, stream);
+    }
+    cudaStream_t st = (cudaStream_t) stream;
+    switch (p->d) {
+        case 128: return legion_paged::launch_part_dim<128>(*p, n0, part, st);
+        case 256: return legion_paged::launch_part_dim<256>(*p, n0, part, st);
+        case 512: return legion_paged::launch_part_dim<512>(*p, n0, part, st);
         default: return 1;
     }
 }

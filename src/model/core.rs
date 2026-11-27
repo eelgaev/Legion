@@ -1648,6 +1648,19 @@ pub(crate) fn concat_tree<'a>(ctx: &'a Context, mut parts: Vec<Tensor<'a>>) -> T
     parts.pop().expect("no parts")
 }
 
+/// Logs, the first time each reason shows up, that [`Model::attention_halves`] ran a layer
+/// whole and why ([`Model::attention_halves_unfit`]).
+fn log_attention_whole(why: &'static str) {
+    static SEEN: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&why) {
+        seen.push(why);
+        tracing::info!(
+            "attention parts (#1133): a TP prompt step's attention layer ran whole ({why})"
+        );
+    }
+}
+
 /// A mixer's output projection (a rank's partial under tensor parallelism): one `[n_embd, n]`
 /// tensor, or per half of the step's tokens ([`Model::delta_net_halves`], #1133).
 #[derive(Clone, Copy)]
@@ -4491,11 +4504,148 @@ impl Model {
         h: Tensor<'a>,
         res: Option<Tensor<'a>>,
     ) -> Result<Tensor<'a>, ModelError> {
-        let (ctx, tap, n) = (pass.ctx, &pass.tap, pass.n);
         debug_assert!(
-            res.is_none() || !tap.on,
+            res.is_none() || !pass.tap.on,
             "a fused residual in a tapped pass"
         );
+        let (q, gate) = self.attention_in(pass, il, h)?;
+        // Sparse attention: the indexer query of every token, and this step's raw indexer keys
+        // cached.
+        let iq = self.hp.arch.index_query(self, pass, il, h)?;
+        let o = self.attend(pass, il, q, iq)?;
+        pass.tap.tap("attn_pregate", il, o);
+        self.attention_out(pass, il, o, gate, pass.n, res)
+    }
+
+    /// [`Self::attention`] per half of a prompt step's tokens (`0..n0`, `n0..n`) under tensor
+    /// parallelism over machines (#1133): the attention in two launches
+    /// ([`paged::attention_parts`]), then per half the gate and the output projection, so half
+    /// 0's sum travels while half 1's attention and projection run. Q, K and V and the cache
+    /// writes stay whole.
+    ///
+    /// Every token the same bits as the whole layer's: each attention row is the one launch's
+    /// (the same kernel and CTAs, [`paged::attention_parts`]), the gate is per token, and the
+    /// output projection is the FP8 W8A8 GEMM with per-token scales at the whole step and both
+    /// halves ([`Model::fp8_dense`]), its codes made the same way at each. Where the step does
+    /// not take all of it (one prompt group of one sequence over a paged pool without a host
+    /// tier or TurboQuant, no tap, a dense model with dense attention, that GEMM at every size):
+    /// the whole layer ([`Mixed::Whole`]), checked before anything is built.
+    pub(crate) fn attention_halves<'a>(
+        &'a self,
+        pass: &Pass<'a>,
+        il: usize,
+        h: Tensor<'a>,
+        n0: i64,
+    ) -> Result<Mixed<'a>, ModelError> {
+        if let Some(why) = self.attention_halves_unfit(pass, il, n0) {
+            log_attention_whole(why);
+            return Ok(Mixed::Whole(self.attention(pass, il, h)?));
+        }
+        let (ctx, n) = (pass.ctx, pass.n);
+        let hp = &self.hp;
+        let d = hp.head_dim;
+        let n1 = n - n0;
+        let (q, gate) = self.attention_in(pass, il, h)?;
+        // As the whole layer, which a sparse-attention layer stays (Qwen3.5+ has none).
+        let iq = hp.arch.index_query(self, pass, il, h)?;
+        let AttnInputs::Paged {
+            table,
+            n_past,
+            scratch,
+            ..
+        } = pass.attn[0]
+        else {
+            unreachable!("attention_halves_fit: a paged group")
+        };
+        if iq.is_some() {
+            let o = self.attend(pass, il, q, iq)?;
+            return Ok(Mixed::Whole(
+                self.attention_out(pass, il, o, gate, n, None)?,
+            ));
+        }
+        // The group's queries as [`Self::attend`] views them.
+        let qnb = q.nb();
+        let q = ctx.view_3d(q, [d, hp.n_head, n], [qnb[1], qnb[2]], 0);
+        let q = ctx.reshape_4d(q, [d, hp.n_head, n, 1]);
+        let (k, v) = pass.kv.pools(il);
+        let scale = 1.0 / (d as f32).sqrt();
+        let parts = paged::attention_parts(ctx, q, k, v, table, n_past, scratch, scale, n0);
+        let rows = |t: Tensor<'a>| ctx.reshape_2d(t, d * hp.n_head, n);
+        let gnb = gate.nb();
+        let gate_of = |at: i64, len: i64| {
+            ctx.view_3d(
+                gate,
+                [d, hp.n_head, len],
+                [gnb[1], gnb[2]],
+                at as usize * gnb[2],
+            )
+        };
+        let o0 = cols(ctx, rows(parts[0]), 0, n0);
+        let out0 = self.attention_out(pass, il, o0, gate_of(0, n0), n0, None)?;
+        let o1 = cols(ctx, rows(parts[1]), n0, n1);
+        let out1 = self.attention_out(pass, il, o1, gate_of(n0, n1), n1, None)?;
+        Ok(Mixed::Halves {
+            out: [out0, out1],
+            after: [None, None],
+        })
+    }
+
+    /// Why [`Self::attention_halves`] does not take layer `il` of this step with the cut `n0`
+    /// (`None`: it does). Not [`GroupShape::last_only`]: below the MTP head a layer's attention
+    /// computes every row either way (only the MTP head's take-in rows skip theirs).
+    fn attention_halves_unfit(&self, pass: &Pass<'_>, il: usize, n0: i64) -> Option<&'static str> {
+        let hp = &self.hp;
+        let n = pass.n;
+        let sizes = [n, n0, n - n0];
+        let mut groups = pass.groups();
+        let (Some((0, sh)), None) = (groups.next(), groups.next()) else {
+            return Some("more than one prompt group");
+        };
+        let name = "attn_output.weight";
+        let w = self.w(&format!("blk.{il}.{name}")).ok();
+        // Not a `--dense-fp8` copy (its prompt GEMM takes codes from elsewhere), not Q8_0 (the
+        // gate's quantization op, `lmm_gated`).
+        let plain_fp8 = w.is_some_and(|w| {
+            w.ty() != types::Q8_0 && !self.linear.is_dense_twin(&format!("blk.{il}.{name}"), w)
+        });
+        let dynamic = sizes.map(|c| self.linear.dynamic_batch(c));
+        let checks = [
+            (!pass.tap.on, "taps"),
+            (!hp.moe, "a MoE model"),
+            (n0 > 0 && n0 < n && n <= i32::MAX as i64, "the cut"),
+            (il != hp.n_layer, "the MTP head"),
+            (
+                sh.n_seqs == 1 && sh.n_tok as i64 == n,
+                "more than one sequence",
+            ),
+            (sh.ring == 0, "a ring cache"),
+            (!sh.verify, "a verify step"),
+            (
+                matches!(pass.attn.first(), Some(AttnInputs::Paged { .. })),
+                "not a paged cache",
+            ),
+            (pass.kv.paged_tier(il).is_none(), "a host KV tier"),
+            (pass.kv.tq(il).is_none(), "a TurboQuant cache"),
+            (plain_fp8, "the output projection's weight"),
+            (
+                sizes.iter().all(|&c| self.fp8_dense(il, name, c))
+                    && dynamic.iter().all(|&b| b == dynamic[0]),
+                "the output projection's GEMM at the halves",
+            ),
+        ];
+        checks.iter().find(|c| !c.0).map(|c| c.1)
+    }
+
+    /// [`Self::attention_res`] up to the attention: the query (normed and rotated) and the
+    /// output gate, `[head_dim, n_head, n]` each (views of the Q projection's rows), with this
+    /// step's K and V rows written to the cache.
+    fn attention_in<'a>(
+        &'a self,
+        pass: &Pass<'a>,
+        il: usize,
+        h: Tensor<'a>,
+    ) -> Result<(Tensor<'a>, Tensor<'a>), ModelError> {
+        let (ctx, tap, n) = (pass.ctx, &pass.tap, pass.n);
         let hp = &self.hp;
         let d = hp.head_dim;
         // attn_q produces query and output gate interleaved per head: [q_h | gate_h] × n_head.
@@ -4536,12 +4686,24 @@ impl Model {
             tap.tap("Kcur", il, k);
             tap.tap("Vcur", il, v);
         }
-        // Sparse attention: the indexer query of every token, and this step's raw indexer keys
-        // cached.
-        let iq = hp.arch.index_query(self, pass, il, h)?;
-        let o = self.attend(pass, il, q, iq)?;
-        tap.tap("attn_pregate", il, o);
+        Ok((q, gate))
+    }
 
+    /// [`Self::attention_res`] from the attention output `o` (`[head_dim × n_head, n]`, rows
+    /// contiguous) of `n` tokens on: the output gate `gate` (`[head_dim, n_head, n]`), the
+    /// output projection and the residual `res`.
+    fn attention_out<'a>(
+        &'a self,
+        pass: &Pass<'a>,
+        il: usize,
+        o: Tensor<'a>,
+        gate: Tensor<'a>,
+        n: i64,
+        res: Option<Tensor<'a>>,
+    ) -> Result<Tensor<'a>, ModelError> {
+        let (ctx, tap) = (pass.ctx, &pass.tap);
+        let hp = &self.hp;
+        let d = hp.head_dim;
         // The gate and the projection's quantization as one op where it fits, reading the
         // gate in place (#526).
         if !tap.on

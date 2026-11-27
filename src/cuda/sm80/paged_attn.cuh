@@ -132,7 +132,7 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, Shape<D>::MINB) paged_prefi
     const int split = SPLIT ? blockIdx.z % p.max_split : 0;
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int gq = lane / 4, tq = lane % 4;  // fragment row group, thread in quad
-    const int n_past = p.n_past[seq];
+    const int n_past = p.n_past[seq] + p.q_off;  // a later part's tokens from q_off on
 
     // Column c's token. Columns past n_tok, and past QT * G when G does not divide 64 (12:
     // 5 tokens, 60 columns), repeat the tile's last token and are not written.

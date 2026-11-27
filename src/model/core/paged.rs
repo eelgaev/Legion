@@ -451,6 +451,54 @@ fn build<'a>(
     ctx.external_with(&PAGED_ATTN, types::F32, q.ne(), &args, &params)
 }
 
+/// Parameter index of a part's cut ([`attention_parts`]).
+const P_CUT: usize = 8;
+/// Parameter index of the part: 1 or 2 ([`attention_parts`]); 0 for every other node.
+const P_PART: usize = 9;
+
+/// [`attention_tiered`] of a prompt group of one sequence (no window, not a ring, no tier) in
+/// two nodes with the one node's bits (#1133): rows `0..n0` of the first node's output are
+/// written when the first runs, rows `n0..` of the second's (a view of the first's, written in
+/// place) when the second does, so a reader of the first rows runs while the second computes.
+/// Both nodes hold the whole group's query, so every choice the launch makes from the group
+/// (the kernel, its tiles) is the one node's.
+///
+/// On CUDA: the first launch runs the tokens before the first multiple of the
+/// kernel's tokens per CTA from `n0` on, the second the rest, each through the CTAs the one
+/// launch runs for them (`legion_paged_attn_launch_part`); where the group would not take
+/// `paged_prefill_mma` or `paged_prefill_qm` whole, the first is the one launch and the second
+/// nothing. On the CPU each row is its own sum: the first `0..n0`, the second the rest.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_parts<'a>(
+    ctx: &'a Context,
+    q: Tensor<'a>,
+    k: Tensor<'a>,
+    v: Tensor<'a>,
+    table: Tensor<'a>,
+    n_past: Tensor<'a>,
+    scratch: Tensor<'a>,
+    scale: f32,
+    n0: i64,
+) -> [Tensor<'a>; 2] {
+    let args = [q, k, v, table, n_past, scratch];
+    let mut params = [0i32; P_PART + 1];
+    params[0] = scale.to_bits() as i32;
+    params[P_CUT] = n0.clamp(0, i32::MAX as i64) as i32;
+    params[P_PART] = 1;
+    let first = ctx.external_with(&PAGED_ATTN, types::F32, q.ne(), &args, &params);
+    params[P_PART] = 2;
+    let second = ctx.external_inplace(&PAGED_ATTN, first, &args, &params);
+    [first, second]
+}
+
+/// The cut of a group of `n_tok` tokens in two launches ([`attention_parts`]) whose kernel
+/// takes `qt` tokens per CTA, asked for at token `n0`: the first multiple of `qt` from `n0` on,
+/// at most `n_tok`: the rule of `launch_part` in `src/cuda/paged_attn/common.cuh`, for tests.
+#[cfg(test)]
+fn cut(n_tok: usize, qt: usize, n0: usize) -> usize {
+    n0.div_ceil(qt.max(1)).saturating_mul(qt.max(1)).min(n_tok)
+}
+
 /// [`attention_tiered`] where image tokens see past their position (Gemma 4's sliding-window
 /// layers, #1217): `span` (I32 `[n_tok, n_seqs]`) gives each token's last visible key, used
 /// where it is past the token's own position (an image token: its image's last token); the
@@ -753,6 +801,10 @@ struct Operands {
     split: Option<(*mut f32, usize)>,
     /// The image spans ([`attention_spans`]): `[n_tok, n_seqs]`.
     span: Option<*const i32>,
+    /// A part of a group in two nodes ([`attention_parts`]): 1 or 2, 0 for the whole op.
+    part: usize,
+    /// The part's cut ([`attention_parts`]'s `n0`).
+    cut: usize,
 }
 
 impl Operands {
@@ -760,10 +812,13 @@ impl Operands {
     /// `dst` must be a node made by [`attention_tiered`].
     unsafe fn of(dst: &ffi::ggml_tensor) -> Self {
         unsafe {
-            let src = |i: usize| &*dst.src[i];
+            let params = crate::ggml::external_params(dst);
+            // The second part's src 0 is the first part's node it writes in place.
+            let part = params[P_PART].max(0) as usize;
+            let base = usize::from(part == 2);
+            let src = |i: usize| &*dst.src[base + i];
             let (q, k, v, table, n_past, scratch) =
                 (src(0), src(1), src(2), src(3), src(4), src(5));
-            let params = crate::ggml::external_params(dst);
             let d = q.ne[0] as usize;
             let compact = params[6] > 0;
             let head_stride = if compact { params[6] as usize } else { d };
@@ -812,6 +867,8 @@ impl Operands {
                     (t.data as *mut f32, t.ne.iter().product::<i64>() as usize)
                 }),
                 span: (params[7] > 0).then(|| src(params[7] as usize).data as *const i32),
+                part,
+                cut: params[P_CUT].max(0) as usize,
             }
         }
     }
@@ -842,10 +899,20 @@ unsafe fn cpu_paged_attn(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
         let mut q = vec![0f32; o.d];
         let mut scores = Vec::new();
         let mut out = vec![0f32; o.d];
+        // A part's tokens ([`attention_parts`]): every row is its own sum, so any cut.
+        let cut = o.cut.min(o.n_tok);
+        let tokens = match o.part {
+            1 => 0..cut,
+            2 => cut..o.n_tok,
+            _ => 0..o.n_tok,
+        };
         for row in (ith..rows).step_by(nth) {
             let h = row % o.n_head;
             let t = row / o.n_head % o.n_tok;
             let s = row / (o.n_head * o.n_tok);
+            if !tokens.contains(&t) {
+                continue;
+            }
             let kvh = h / g;
             q.copy_from_slice(std::slice::from_raw_parts(
                 o.q.add(s * o.q_nb[3] + t * o.q_nb[2] + h * o.q_nb[1]) as *const f32,
@@ -971,6 +1038,9 @@ struct LaunchParams {
     /// Each token's last visible key past its position ([`attention_spans`], #1217); null:
     /// causal.
     span: *const i32,
+    /// Tokens of the step before this launch's first (a later part of a group in two
+    /// launches, [`attention_parts`]); 0 for every other launch.
+    q_off: i32,
 }
 
 /// The kernels' code for a cache type (`LEGION_KV_*` in paged_attn.cu), if they read it.
@@ -987,6 +1057,12 @@ pub(crate) fn kernel_type(ty: ffi::ggml_type) -> Option<i32> {
 #[cfg(feature = "cuda")]
 unsafe extern "C" {
     fn legion_paged_attn_launch(p: *const LaunchParams, stream: *mut c_void) -> i32;
+    fn legion_paged_attn_launch_part(
+        p: *const LaunchParams,
+        n0: i32,
+        part: i32,
+        stream: *mut c_void,
+    ) -> i32;
     fn legion_paged_attn_piece(
         p: *const LaunchParams,
         hbm_blocks: i32,
@@ -1005,6 +1081,78 @@ unsafe extern "C" {
     fn legion_paged_attn_vsplit_launches() -> i64;
     fn legion_paged_attn_set_qm(on: i32, this_thread: i32);
     fn legion_paged_attn_qm_launches() -> i64;
+    #[cfg(test)]
+    fn legion_paged_attn_part_launches() -> i64;
+    fn legion_paged_attn_part_info(out: *mut i32);
+}
+
+/// Why a group of [`attention_parts`] ran as the one launch, where the op decides it (the
+/// launch's own reasons are `LEGION_PART_*` in `src/cuda/paged_attn/common.cuh`, 1-14).
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+enum PartWhy {
+    Tier = 20,
+    Spans,
+    SplitScratch,
+    Hopper,
+}
+
+/// [`attention_parts`]'s outcome as `legion_paged_attn_part_info` gives it (0 or why it ran
+/// as one launch, the kernel, the cut) in words.
+#[cfg(feature = "cuda")]
+fn part_outcome(n_tok: usize, [why, kernel, cut]: [i32; 3]) -> String {
+    if why == 0 {
+        let kernel = match kernel {
+            2 => "paged_prefill_qm (ping-pong)",
+            1 => "paged_prefill_qm",
+            _ => "paged_prefill_mma",
+        };
+        return format!(
+            "a prompt group of {n_tok} tokens ran as two launches of {kernel}, cut at token {cut}"
+        );
+    }
+    let reason = match why {
+        1 => "a compact cache",
+        2 => "one token",
+        3 => "more than one sequence",
+        4 => "a query offset",
+        5 => "no sm_80+ prefill kernel",
+        6 => "the m8n8k4 kernel",
+        7 => "the FMA kernel",
+        8 => "a split over the key blocks",
+        9 | 21 => "image spans",
+        10 => "host-tier pieces",
+        11 | 22 => "a split scratch",
+        12 => "the wide-grid kernel",
+        13 => "the warp-pair kernel",
+        20 => "a host tier",
+        23 => "--hopper-attn",
+        _ => "unknown",
+    };
+    format!("a prompt group of {n_tok} tokens ran as one launch ({reason})")
+}
+
+/// Logs [`part_outcome`] the first time each outcome (each reason, each kernel) shows up.
+#[cfg(feature = "cuda")]
+fn log_part(n_tok: usize, info: [i32; 3]) {
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let key = if info[0] == 0 {
+        40 + info[1].clamp(0, 2)
+    } else {
+        info[0].clamp(1, 39)
+    };
+    let bit = 1u64 << key;
+    if SEEN.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+        tracing::info!("attention parts (#1133): {}", part_outcome(n_tok, info));
+    }
+}
+
+/// Parts of groups in two launches ([`attention_parts`]) launched as parts from the calling
+/// thread so far (tests).
+#[cfg(all(test, feature = "cuda"))]
+fn part_launches() -> i64 {
+    // SAFETY: reads a thread-local counter.
+    unsafe { legion_paged_attn_part_launches() }
 }
 
 /// Prefill groups with heads of 256 on compute capability 12.x devices (a DGX Spark's GB10, RTX
@@ -1207,6 +1355,7 @@ unsafe fn cuda_paged_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
         verify_grid: 0,
         prefetch: 0,
         span: o.span.unwrap_or(std::ptr::null()),
+        q_off: 0,
     };
     // Image spans (#1217): the plain prefill kernels read them, none of the variants.
     let spans = o.span.is_some() && o.n_tok > 1;
@@ -1289,6 +1438,38 @@ unsafe fn cuda_paged_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
             k_cells: unsafe { (*dst.src[1]).ne[1] } as usize,
             v_cells: unsafe { (*dst.src[2]).ne[1] } as usize,
         };
+        // A part of a group in two nodes ([`attention_parts`]): the launch's part where nothing
+        // else takes the group (`--hopper-attn`, a split, spans), else the whole op in part 1.
+        if o.part > 0 {
+            let why = if o.tier.is_some() {
+                Some(PartWhy::Tier)
+            } else if spans {
+                Some(PartWhy::Spans)
+            } else if !p.split.is_null() {
+                Some(PartWhy::SplitScratch)
+            } else if hopper::enabled() {
+                Some(PartWhy::Hopper)
+            } else {
+                None
+            };
+            let Some(why) = why else {
+                // SAFETY: as below.
+                let rc = check(unsafe {
+                    legion_paged_attn_launch_part(&p, o.cut as i32, o.part as i32, stream)
+                });
+                if o.part == 1 && rc.is_ok() {
+                    let mut info = [0i32; 3];
+                    // SAFETY: writes three values the calling thread's launch left.
+                    unsafe { legion_paged_attn_part_info(info.as_mut_ptr()) };
+                    log_part(o.n_tok, info);
+                }
+                return rc;
+            };
+            if o.part == 2 {
+                return Ok(());
+            }
+            log_part(o.n_tok, [why as i32, -1, o.n_tok as i32]);
+        }
         // SAFETY: the op's parameters and pools, on the stream's device.
         if !spans && unsafe { hopper::run(&p, &shape, stream) }? {
             return Ok(());
@@ -1409,6 +1590,8 @@ mod grid_tests;
 pub mod hopper;
 #[cfg(all(test, feature = "cuda"))]
 mod m884_tests;
+#[cfg(test)]
+mod parts_tests;
 pub mod qm_bench;
 #[cfg(test)]
 mod quant_tests;

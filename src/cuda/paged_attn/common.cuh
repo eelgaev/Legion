@@ -139,6 +139,11 @@ struct legion_paged_attn {
     // else at most its position. Only paged_prefill and paged_prefill_mma read it (the launcher
     // takes them for such a group); the window still starts from the token's own position.
     const int32_t * span;
+    // Tokens of the sequence's step before this launch's first (a later part of a prefill group
+    // run in two launches, legion_paged_attn_launch_part): its token t is at position
+    // n_past[seq] + q_off + t. Only paged_prefill_mma and paged_prefill_qm read it; 0 for every
+    // other launch.
+    int32_t q_off;
 };
 
 enum { LEGION_KV_F16 = 0, LEGION_KV_Q8_0 = 1, LEGION_KV_Q4_0 = 2 };
@@ -188,6 +193,42 @@ int legion_paged_attn_split_ok(void);
 // 0 on success; 1 for an unsupported shape (head size, GQA ratio); 2 for a CUDA launch error.
 int legion_paged_attn_launch(const legion_paged_attn * p, void * stream);
 
+// Part `part` (1 or 2) of a prefill group of one sequence (p's whole group, q_off 0) in two
+// launches with the bits of one (#1133): the group's kernel picked once from p, the cut at the
+// first multiple of its tokens per CTA from `n0` on (at most p->n_tok), part 1 its tokens before
+// the cut and part 2 the rest (nothing if none), each through the CTAs the one launch runs for
+// them. Where the group would not take paged_prefill_mma or paged_prefill_qm whole (a split,
+// pieces, spans, the variants for small groups, another kernel choice), part 1 is the one launch
+// and part 2 nothing. Returns as legion_paged_attn_launch.
+int legion_paged_attn_launch_part(const legion_paged_attn * p, int32_t n0, int32_t part, void * stream);
+
+// Parts launched as parts (legion_paged_attn_launch_part, not the one launch) from the calling
+// thread so far (tests).
+int64_t legion_paged_attn_part_launches(void);
+
+// What the calling thread's last legion_paged_attn_launch_part of a part 1 did, into out[3]:
+// out[0] 0 if the group ran as parts, else why it ran as the one launch (LEGION_PART_*);
+// out[1] the parts' kernel (0 paged_prefill_mma, 1 paged_prefill_qm, 2 its ping-pong); out[2]
+// the cut. For the log.
+void legion_paged_attn_part_info(int32_t * out);
+
+enum {
+    LEGION_PART_COMPACT = 1,
+    LEGION_PART_ONE_TOKEN,
+    LEGION_PART_SEQS,
+    LEGION_PART_Q_OFF,
+    LEGION_PART_NO_MMA,
+    LEGION_PART_M884,
+    LEGION_PART_FFMA,
+    LEGION_PART_KV_SPLIT,
+    LEGION_PART_SPANS,
+    LEGION_PART_PIECES,
+    LEGION_PART_SPLIT_SCRATCH,
+    LEGION_PART_GRID,
+    LEGION_PART_PAIR,
+    LEGION_PART_HEADS,
+};
+
 // Piece `piece` of a prefill over a pool whose blocks from `hbm_blocks` on are in host memory
 // (#352): the device blocks (piece 0) and the host blocks `piece * cap ..` (in the order of the
 // sequences and their positions) up to `cap` of them, the host ones copied once into p's
@@ -210,6 +251,8 @@ extern thread_local int64_t t_vsplit_launches;
 extern int g_qm;
 extern thread_local int t_qm;
 extern thread_local int64_t t_qm_launches;
+extern thread_local int64_t t_part_launches;
+extern thread_local int32_t t_part_info[3];
 }  // namespace legion_paged
 
 namespace {
@@ -223,6 +266,8 @@ using legion_paged::t_m884_launches;
 using legion_paged::t_ffma_launches;
 using legion_paged::t_vsplit_launches;
 using legion_paged::t_qm_launches;
+using legion_paged::t_part_launches;
+using legion_paged::t_part_info;
 
 // The queries-as-M prefill kernel's setting for the calling thread (legion_paged_attn_set_qm):
 // the mode in the low byte, the variant above it.
@@ -1020,6 +1065,102 @@ int launch(const legion_paged_attn & p, cudaStream_t st) {
     return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
 
+// Part `part` of a prefill group in two launches (legion_paged_attn_launch_part, #1133). A group
+// of one sequence that `launch` runs whole on paged_prefill_qm or paged_prefill_mma: that kernel
+// picked here once from the whole group (fa_qm::takes, fa_qm::pingpong on p's n_tok, the shared
+// memory opted into), the cut c the first multiple of its tokens per CTA (QT) from n0 on, part 1
+// tokens 0..c and part 2 tokens c..n_tok (q, dst and q_off from c). Every CTA of a part is a CTA
+// of the one launch: the tile at token t0 of the one launch is the part's tile t0 (part 1) or
+// t0 - c (part 2), with the same positions (n_past + q_off + the part's token), the same last
+// token (the clamp at n_tok - 1 is the group's last token in either), so the same key blocks in
+// the same order, the same masks and the same sums; it writes the same rows of dst. Any other
+// group: part 1 is the one launch, part 2 nothing.
+template <int D, int G, bool C = false>
+int launch_part(const legion_paged_attn & p, int n0, int part, cudaStream_t st) {
+    // The first reason the group would not run whole on paged_prefill_mma / paged_prefill_qm.
+    const int why = C                     ? LEGION_PART_COMPACT
+                    : p.n_tok <= 1        ? LEGION_PART_ONE_TOKEN
+                    : p.n_seqs != 1       ? LEGION_PART_SEQS
+                    : p.q_off != 0        ? LEGION_PART_Q_OFF
+                    : !fa::available()    ? LEGION_PART_NO_MMA
+                    : use_m884()          ? LEGION_PART_M884
+                    : use_ffma()          ? LEGION_PART_FFMA
+                    : p.max_split > 1     ? LEGION_PART_KV_SPLIT
+                    : p.span              ? LEGION_PART_SPANS
+                    : p.piece_blk || p.ml ? LEGION_PART_PIECES
+                    : p.split             ? LEGION_PART_SPLIT_SCRATCH
+                    : p.verify_grid != 0  ? LEGION_PART_GRID
+                    : p.d512_pair != 0    ? LEGION_PART_PAIR
+                                          : 0;
+    if (why != 0) {
+        if (part == 1) {
+            t_part_info[0] = why;
+            t_part_info[1] = -1;
+            t_part_info[2] = p.n_tok;
+            return launch<D, G, C>(p, st);
+        }
+        return 0;
+    }
+    bool qm = false;
+    [[maybe_unused]] bool pp = false;
+    if constexpr (D == 256 && !C) {
+        if (fa_qm::takes<D, G>(p)) {
+            pp = fa_qm::pingpong<D, G>(p);
+            if constexpr (G == 4 || G == 6 || G == 8) {
+                qm = pp ? fa_qm::ready<D, G, true>() : fa_qm::ready<D, G, false>();
+            } else {
+                qm = fa_qm::ready<D, G, false>();
+            }
+        }
+    }
+    const int qt = qm ? fa_qm::Shape<D>::ROWS / G : fa::Shape<D>::COLS / G;
+    const int c  = std::min(p.n_tok, (std::max(n0, 0) + qt - 1) / qt * qt);
+    legion_paged_attn h = p;
+    if (part == 1) {
+        h.n_tok        = c;
+        t_part_info[0] = 0;
+        t_part_info[1] = qm ? (pp ? 2 : 1) : 0;
+        t_part_info[2] = c;
+    } else {
+        if (c >= p.n_tok) {
+            return 0;
+        }
+        h.n_tok = p.n_tok - c;
+        h.q     = (const float *) ((const char *) p.q + (int64_t) c * p.q_nb2);
+        h.dst   = p.dst + (int64_t) c * p.n_head * D;
+        h.q_off = c;
+    }
+    if (h.n_tok <= 0) {
+        return 0;
+    }
+    t_part_launches++;
+    if constexpr (D == 256 && !C) {
+        if (qm) {
+            if constexpr (G == 4 || G == 6 || G == 8) {
+                if (pp) {
+                    return fa_qm::run<D, G, true>(h, st);
+                }
+            }
+            return fa_qm::run<D, G, false>(h, st);
+        }
+    }
+    return fa::launch<D, G, C>(h, st);
+}
+
+template <int D>
+int launch_part_d(const legion_paged_attn & p, int n0, int part, cudaStream_t st) {
+    switch (p.n_head / p.n_head_kv) {
+        case 1: return launch_part<D, 1>(p, n0, part, st);
+        case 2: return launch_part<D, 2>(p, n0, part, st);
+        case 4: return launch_part<D, 4>(p, n0, part, st);
+        case 6: return launch_part<D, 6>(p, n0, part, st);
+        case 8: return launch_part<D, 8>(p, n0, part, st);
+        case 12: return launch_part<D, 12>(p, n0, part, st);
+        case 16: return launch_part<D, 16>(p, n0, part, st);
+        default: return 1;
+    }
+}
+
 template <int D>
 int launch_d(const legion_paged_attn & p, cudaStream_t st) {
     switch (p.n_head / p.n_head_kv) {
@@ -1046,6 +1187,14 @@ int launch_dim(const legion_paged_attn & p, cudaStream_t st);
 template <> int launch_dim<128>(const legion_paged_attn & p, cudaStream_t st);
 template <> int launch_dim<256>(const legion_paged_attn & p, cudaStream_t st);
 template <> int launch_dim<512>(const legion_paged_attn & p, cudaStream_t st);
+
+// launch_part_d<D> (legion_paged_attn_launch_part), beside launch_dim<D> in its file.
+template <int D>
+int launch_part_dim(const legion_paged_attn & p, int n0, int part, cudaStream_t st);
+
+template <> int launch_part_dim<128>(const legion_paged_attn & p, int n0, int part, cudaStream_t st);
+template <> int launch_part_dim<256>(const legion_paged_attn & p, int n0, int part, cudaStream_t st);
+template <> int launch_part_dim<512>(const legion_paged_attn & p, int n0, int part, cudaStream_t st);
 
 // Gemma 4's compact global KV cache (#551): its global layers' 512-wide heads only, so the
 // other caches' kernels stay as they are. In d512_compact.cu.

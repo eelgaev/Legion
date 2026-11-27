@@ -115,7 +115,7 @@ __global__ void __launch_bounds__(Shape<D, PP>::NW * 32, 1) paged_prefill_qm(con
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int gq = lane / 4, tq = lane % 4;  // fragment row group, thread in quad
     const int grp = warp / (NW / 2);         // PP: 0 the group that fills the ring, 1 the other
-    const int n_past = p.n_past[seq];
+    const int n_past = p.n_past[seq] + p.q_off;  // a later part's tokens from q_off on
 
     // Row r's token. Rows past n_tok, and past QT * G when G does not divide 128, repeat the
     // tile's last token and are not written.
@@ -417,17 +417,27 @@ bool takes(const legion_paged_attn & p) {
            legion_device::sm12x_device(paged_prefill_qm<D, G>) && (mode >= 2 || pays<D, G>(p));
 }
 
+// Whether the device runs paged_prefill_qm<D, G, PP> (its shared memory opted into once per
+// device; the attribute is per function and device).
 template <int D, int G, bool PP>
-int launch_as(const legion_paged_attn & p, cudaStream_t st) {
-    using SH = Shape<D, PP>;
+bool ready() {
     static std::atomic<int8_t> opted_in[GGML_CUDA_MAX_DEVICES];
-    if (!legion_device::smem_opt_in(opted_in, paged_prefill_qm<D, G, PP>, (int) SH::SMEM)) {
-        return -1;
-    }
+    return legion_device::smem_opt_in(opted_in, paged_prefill_qm<D, G, PP>, (int) Shape<D, PP>::SMEM);
+}
+
+// The launch of a group the device runs it for (ready).
+template <int D, int G, bool PP>
+int run(const legion_paged_attn & p, cudaStream_t st) {
+    using SH = Shape<D, PP>;
     constexpr int QT = SH::ROWS / G;
     paged_prefill_qm<D, G, PP><<<dim3((p.n_tok + QT - 1) / QT, p.n_head_kv, p.n_seqs), SH::NW * 32, SH::SMEM, st>>>(p);
     t_qm_launches++;
     return cudaGetLastError() == cudaSuccess ? 0 : 2;
+}
+
+template <int D, int G, bool PP>
+int launch_as(const legion_paged_attn & p, cudaStream_t st) {
+    return ready<D, G, PP>() ? run<D, G, PP>(p, st) : -1;
 }
 
 // Prompt chunks (64 tokens a sequence or more) at 6 query heads a kv head (Qwen3.8-27B) take the
@@ -436,10 +446,18 @@ int launch_as(const legion_paged_attn & p, cudaStream_t st) {
 // kv head it is built but taken only in variant 2 (benches: paged-qm-bench mode + 512). The same
 // bits.
 template <int D, int G>
-int launch(const legion_paged_attn & p, cudaStream_t st) {
+bool pingpong(const legion_paged_attn & p) {
     if constexpr (G == 4 || G == 6 || G == 8) {
         const int v = qm_variant();
-        if (p.n_tok >= 64 && (G == 6 ? v != 1 : v == 2)) {
+        return p.n_tok >= 64 && (G == 6 ? v != 1 : v == 2);
+    }
+    return false;
+}
+
+template <int D, int G>
+int launch(const legion_paged_attn & p, cudaStream_t st) {
+    if constexpr (G == 4 || G == 6 || G == 8) {
+        if (pingpong<D, G>(p)) {
             return launch_as<D, G, true>(p, st);
         }
     }

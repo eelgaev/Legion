@@ -217,10 +217,14 @@ impl Arch for Qwen35 {
                 }
                 continue;
             }
-            // Under the halves, a gated DeltaNet layer's mixer per half of the tokens where it
-            // can (#1133, the same bits), so half 0's sum travels while half 1's runs.
+            // Under the halves, a layer's mixer per half of the tokens where it can (#1133, the
+            // same bits), so half 0's sum travels while half 1's runs.
             let attn = if !hp.is_recurrent(il) {
-                Mixed::Whole(m.attention(pass, il, h)?)
+                if split.is_some() && halves::attn_on() {
+                    m.attention_halves(pass, il, h, n / 2)?
+                } else {
+                    Mixed::Whole(m.attention(pass, il, h)?)
+                }
             } else if split.is_some() && halves::mixer_on() {
                 m.delta_net_halves(pass, il, h, n / 2, halves::mixer_inputs_on())?
             } else {

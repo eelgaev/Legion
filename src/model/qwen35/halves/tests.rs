@@ -23,6 +23,17 @@ fn mixer_halves_are_on_unless_the_debug_variable_is_0_or_1() {
     assert_eq!(mixer_of(Some(" 0 ")), 0);
 }
 
+/// The gated attention layers in halves by default; `LEGION_DEBUG_QWEN35_TP_ATTN_HALVES=0`
+/// whole.
+#[test]
+fn attention_halves_are_on_unless_the_debug_variable_is_0() {
+    assert!(attn_of(None));
+    assert!(attn_of(Some("1")));
+    assert!(attn_of(Some("")));
+    assert!(!attn_of(Some("0")));
+    assert!(!attn_of(Some(" 0 ")));
+}
+
 /// Four FFN parts by default; `LEGION_DEBUG_QWEN35_TP_PARTS=2` the halves, at most four.
 #[test]
 fn parts_default_to_three_and_stay_in_range() {
