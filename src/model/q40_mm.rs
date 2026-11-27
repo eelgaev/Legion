@@ -83,9 +83,9 @@ pub const SMEM_BYTES_V1: usize = 3 * (128 * 20 + 4 * 128 * 8 + 4 * 128) * 4;
 /// Whether the op runs where it applies ([`takes`]).
 static ON: AtomicBool = AtomicBool::new(true);
 
-/// Whether the op runs the first version's kernels (the timing test's; the same bits).
-#[cfg(test)]
-static V1: AtomicBool = AtomicBool::new(false);
+/// The matmul of `src/cuda/q40_mm.cu`'s table the op runs: 0 (the op's) but in the timing and
+/// bit tests, which run them all (the same bits).
+static VARIANT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Whether the op runs where it applies ([`takes`]; `true`, the default); `false`
 /// (`legion serve --q40-mm-ggml`) keeps ggml's MMQ for all.
@@ -107,21 +107,24 @@ pub fn ggml_tiles(rows: i64, k: i64, n: i64, sms: i64) -> bool {
 }
 
 /// True when `w @ x` runs on the op: on, CUDA built, a compute capability 12.x GPU holding the
-/// weight in its memory, shapes the op takes ([`fits`]) and ggml's plan a CTA per tile
-/// ([`ggml_tiles`]).
+/// weight in its memory 16-byte aligned, shapes the op takes ([`fits`]) and ggml's plan a CTA
+/// per tile ([`ggml_tiles`]).
 pub fn takes(w: Tensor<'_>, x: Tensor<'_>) -> bool {
     if !(ON.load(Ordering::Relaxed) && cfg!(feature = "cuda")) {
         return false;
     }
     let sms = sms_for(w) as i64;
+    // SAFETY: a valid tensor's data pointer (null before allocation: the op checks it again).
+    let aligned = (unsafe { (*w.raw()).data } as usize).is_multiple_of(16);
     sms > 0
         && !w.is_host()
         && !w.is_meta()
+        && aligned
         && fits((w.ty(), w.ne(), w.nb()), (x.ty(), x.ne(), x.nb()))
         && ggml_tiles(w.ne()[1], w.ne()[0], x.ne()[1], sms)
 }
 
-/// [`takes`] on shapes: a Q4_0 weight `[k, rows]` with contiguous rows 8-byte aligned (`k` a
+/// [`takes`] on shapes: a Q4_0 weight `[k, rows]` with contiguous rows 16-byte aligned (`k` a
 /// multiple of 256, `rows` of 128); an F32 `x` `[k, n]` with contiguous values, `n` at least
 /// [`MIN_TOKENS`]; at most [`MAX_QUANT_BYTES`] of quantized input.
 pub fn fits(
@@ -142,7 +145,7 @@ pub fn fits(
         && x2 == 1
         && x3 == 1
         && wnb[0] == BLOCK_BYTES
-        && wnb[1] % 8 == 0
+        && wnb[1] % 16 == 0
         && wnb[1] >= (k / QK) as usize * BLOCK_BYTES
         && xnb[0] == 4
         && xnb[1] % 4 == 0
@@ -311,12 +314,27 @@ mod cuda {
         z: u32,
     }
 
-    /// Kernels in `legion_q40_mm_kernels`: the quantization and the matmul, then the first
-    /// version's two.
-    const KERNELS: usize = 4;
+    /// `legion_q40_kernel` of `src/cuda/q40_mm.cu`: a matmul of the table.
+    #[repr(C)]
+    pub(super) struct Kernel {
+        quant: *const c_void,
+        gemm: *const c_void,
+        smem: c_int,
+        threads: c_int,
+        bm: c_int,
+        bn: c_int,
+        /// The timing test's name for it.
+        #[cfg_attr(not(test), allow(dead_code))]
+        name: *const std::os::raw::c_char,
+    }
+
+    /// Most matmuls the shared-memory cache covers.
+    const KERNELS: usize = 8;
 
     unsafe extern "C" {
-        static legion_q40_mm_kernels: [*const c_void; KERNELS];
+        /// The first of `legion_q40_mm_table_len` entries.
+        static legion_q40_mm_table: Kernel;
+        static legion_q40_mm_table_len: c_int;
         fn cudaLaunchKernel(
             func: *const c_void,
             grid: Dim3,
@@ -337,18 +355,36 @@ mod cuda {
     /// Devices the shared-memory cache covers.
     const DEVICES: usize = 64;
 
-    /// Each device's shared-memory opt-in of the matmul and of the first version's: 0 not yet, 1
-    /// done, -1 refused.
-    static SMEM: [[AtomicI8; 2]; DEVICES] = [const { [const { AtomicI8::new(0) }; 2] }; DEVICES];
+    /// Each device's shared-memory opt-in of each matmul of the table: 0 not yet, 1 done, -1
+    /// refused.
+    static SMEM: [[AtomicI8; KERNELS]; DEVICES] =
+        [const { [const { AtomicI8::new(0) }; KERNELS] }; DEVICES];
 
-    /// The quantization's and the matmul's kernels and the matmul's shared memory: the op's, or
-    /// the first version's in the timing test.
-    fn kernels() -> (usize, usize, usize) {
-        #[cfg(test)]
-        if V1.load(Ordering::Relaxed) {
-            return (2, 3, SMEM_BYTES_V1);
-        }
-        (0, 1, SMEM_BYTES)
+    /// Matmuls in the table.
+    pub(super) fn kernels() -> usize {
+        // SAFETY: a constant of src/cuda/q40_mm.cu.
+        (unsafe { legion_q40_mm_table_len } as usize).min(KERNELS)
+    }
+
+    /// The table's matmul `i` (below [`kernels`]).
+    pub(super) fn kernel(i: usize) -> &'static Kernel {
+        assert!(i < kernels());
+        // SAFETY: the table holds `legion_q40_mm_table_len` entries from its first.
+        unsafe { &*std::ptr::addr_of!(legion_q40_mm_table).add(i) }
+    }
+
+    /// The name of the table's matmul `i` (the timing test's).
+    #[cfg(test)]
+    pub(super) fn kernel_name(i: usize) -> String {
+        // SAFETY: a string literal of the table.
+        unsafe { std::ffi::CStr::from_ptr(kernel(i).name) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// The matmul the op runs: the table's first, or the tests' pick.
+    fn variant() -> usize {
+        VARIANT.load(Ordering::Relaxed)
     }
 
     /// One stream's quantized input buffer and its size.
@@ -388,26 +424,17 @@ mod cuda {
         Ok(s)
     }
 
-    /// The shared memory of matmul `kernel` (`smem` bytes) on `dev`, and all of an SM's for
-    /// shared memory, so two CTAs of the op's fit (a hint: the GPU may keep another split).
-    fn opt_in(dev: c_int, kernel: usize, smem: usize) -> Result<(), String> {
-        let slot = &SMEM[dev as usize][kernel / 2];
+    /// The shared memory of the table's matmul `i` on `dev`, and all of an SM's for shared
+    /// memory (a hint: the GPU may keep another split).
+    fn opt_in(dev: c_int, i: usize) -> Result<(), String> {
+        let k = kernel(i);
+        let slot = &SMEM[dev as usize][i];
         let mut state = slot.load(Ordering::Relaxed);
         if state == 0 {
             // SAFETY: a matmul of the table and its shared memory size.
             state = unsafe {
-                if cudaFuncSetAttribute(
-                    legion_q40_mm_kernels[kernel],
-                    FUNC_ATTR_MAX_DYNAMIC_SHARED,
-                    smem as c_int,
-                ) == 0
-                {
-                    if cudaFuncSetAttribute(
-                        legion_q40_mm_kernels[kernel],
-                        FUNC_ATTR_PREFERRED_SHARED_CARVEOUT,
-                        100,
-                    ) != 0
-                    {
+                if cudaFuncSetAttribute(k.gemm, FUNC_ATTR_MAX_DYNAMIC_SHARED, k.smem) == 0 {
+                    if cudaFuncSetAttribute(k.gemm, FUNC_ATTR_PREFERRED_SHARED_CARVEOUT, 100) != 0 {
                         cudaGetLastError();
                     }
                     1
@@ -419,13 +446,13 @@ mod cuda {
             slot.store(state, Ordering::Relaxed);
         }
         if state < 0 {
-            return Err(format!("q40_mm: {smem} bytes of shared memory"));
+            return Err(format!("q40_mm: {} bytes of shared memory", k.smem));
         }
         Ok(())
     }
 
     fn launch(
-        kernel: usize,
+        func: *const c_void,
         grid: Dim3,
         block: Dim3,
         shared: usize,
@@ -435,16 +462,7 @@ mod cuda {
         let mut argv = [(p as *mut Params).cast::<c_void>()];
         // SAFETY: a kernel of the table taking `legion_q40_mm` by value, from the launch's copy
         // of `p`; its pointers are device memory of the stream's device.
-        match unsafe {
-            cudaLaunchKernel(
-                legion_q40_mm_kernels[kernel],
-                grid,
-                block,
-                argv.as_mut_ptr(),
-                shared,
-                stream,
-            )
-        } {
+        match unsafe { cudaLaunchKernel(func, grid, block, argv.as_mut_ptr(), shared, stream) } {
             0 => Ok(()),
             e => Err(format!("q40_mm: CUDA error {e}")),
         }
@@ -491,18 +509,23 @@ mod cuda {
         unsafe {
             let (x, w) = (&*dst.src[0], &*dst.src[1]);
             let (k, n, rows) = (x.ne[0], x.ne[1], w.ne[1]);
-            if !(w.data as usize).is_multiple_of(8) {
-                return Err("q40_mm: weight not 8-byte aligned".into());
+            if !(w.data as usize).is_multiple_of(16) {
+                return Err("q40_mm: weight not 16-byte aligned".into());
             }
             let mut dev: c_int = 0;
             if cudaGetDevice(&mut dev) != 0 || !(0..DEVICES as c_int).contains(&dev) {
                 return Err("q40_mm: no current device".into());
             }
             let quant = quant_in(crate::ggml::current_cuda_graph(), dst);
-            let (quant_kernel, kernel, smem) = kernels();
-            let s = scratch(dev, stream, quant_bytes(k, n))?;
-            let (ntx, nty) = grid(rows, n);
-            let n_pad = n_padded(n);
+            let v = variant();
+            let kern = kernel(v);
+            let (bm, bn) = (kern.bm as i64, kern.bn as i64);
+            if rows % bm != 0 {
+                return Err(format!("q40_mm: {rows} rows, tiles of {bm}"));
+            }
+            let (ntx, nty) = ((n + bn - 1) / bn, rows / bm);
+            let n_pad = ntx * bn;
+            let s = scratch(dev, stream, (k / QK) as usize * n_pad as usize * 36)?;
             let yd_off = (k / QK) as usize * n_pad as usize * 32;
             let mut a = Params {
                 w: w.data as *const c_void,
@@ -527,16 +550,20 @@ mod cuda {
                     z: 1,
                 };
                 let quant_block = Dim3 { x: 64, y: 1, z: 1 };
-                launch(quant_kernel, quant_grid, quant_block, 0, &mut a, stream)?;
+                launch(kern.quant, quant_grid, quant_block, 0, &mut a, stream)?;
             }
-            opt_in(dev, kernel, smem)?;
+            opt_in(dev, v)?;
             let grid = Dim3 {
                 x: (ntx * nty) as u32,
                 y: 1,
                 z: 1,
             };
-            let block = Dim3 { x: 256, y: 1, z: 1 };
-            launch(kernel, grid, block, smem, &mut a, stream)
+            let block = Dim3 {
+                x: kern.threads as u32,
+                y: 1,
+                z: 1,
+            };
+            launch(kern.gemm, grid, block, kern.smem as usize, &mut a, stream)
         }
     }
 }

@@ -31,14 +31,14 @@ const CHECKED: [(i64, i64); 5] = [
 /// The step sizes of the GPU check (at [`GEMMA`]'s shapes): whole and partial last column tiles.
 const CHECKED_N: [i64; 5] = [512, 1024, 4095, 4096, 4097];
 
-/// The GPU tests switch [`V1`] for the whole process: one at a time.
+/// The GPU tests switch [`VARIANT`] for the whole process: one at a time.
 #[cfg(feature = "cuda")]
 static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// The op's kernels (`v1` false) or the first version's from here on.
+/// The table's matmul `i` (0 the op's) from here on.
 #[cfg(feature = "cuda")]
-fn use_v1(v1: bool) {
-    V1.store(v1, Ordering::Relaxed);
+fn use_variant(i: usize) {
+    VARIANT.store(i, Ordering::Relaxed);
 }
 
 fn shape(ty: ffi::ggml_type, ne: [i64; 4]) -> (ffi::ggml_type, [i64; 4], [usize; 4]) {
@@ -459,30 +459,42 @@ fn cuda_q40_mm_is_ggml_bit_for_bit() {
     let _one = GPU.lock().unwrap_or_else(|e| e.into_inner());
     let Some((mut gpu, sms)) = gb10() else { return };
     let mut checked = 0;
+    let mut skipped = Vec::new();
+    // Per matmul of the table: the cases with values that differ, and how many values.
+    let mut moved = vec![(0, 0); cuda::kernels()];
     for (k, rows) in GEMMA {
         for n in CHECKED_N {
             if !ggml_tiles(rows, k, n, sms) {
-                println!("{k}x{rows}, {n} columns: ggml splits the tiles, not taken");
+                skipped.push(format!("{k}x{rows} at {n}"));
                 continue;
             }
             let ggml = case(&mut gpu, false, k, rows, n);
-            for (name, v1) in [("q40_mm", false), ("first version", true)] {
-                use_v1(v1);
+            for (v, moved) in moved.iter_mut().enumerate() {
+                use_variant(v);
                 let ours = case(&mut gpu, true, k, rows, n);
-                use_v1(false);
+                use_variant(0);
                 let diff = ours
                     .chunks(4)
                     .zip(ggml.chunks(4))
                     .filter(|(a, b)| a != b)
                     .count();
-                println!("{k}x{rows}, {n} columns, {name}: {diff} values differ");
-                assert_eq!(diff, 0, "{k}x{rows}, {n} columns, {name}: values moved");
+                if diff > 0 {
+                    let name = cuda::kernel_name(v);
+                    println!("{k}x{rows}, {n} columns, {name}: {diff} values differ");
+                    *moved = (moved.0 + 1, moved.1 + diff);
+                }
             }
             checked += 1;
         }
     }
+    println!("ggml splits the tiles, not taken: {}", skipped.join(", "));
+    for (v, (cases, values)) in moved.iter().enumerate() {
+        let name = cuda::kernel_name(v);
+        println!("{name}: {checked} cases, {cases} with values that differ ({values} values)");
+    }
     // 32 on a GB10's 48 SMs.
     assert!(checked > 0, "no case taken");
+    assert!(moved.iter().all(|m| m.0 == 0), "values moved");
 }
 
 /// The time per call of ggml's MMQ, the first version's kernels and the op at Gemma 4 31B's
@@ -497,7 +509,6 @@ fn cuda_q40_mm_is_ggml_bit_for_bit() {
 fn cuda_q40_mm_time_at_4096_rows() {
     use crate::model::core::mma_peak;
     const CALLS: usize = 8;
-    const NAMES: [&str; 3] = ["ggml", "first version", "q40_mm"];
     let _one = GPU.lock().unwrap_or_else(|e| e.into_inner());
     let Some((mut gpu, _)) = gb10() else { return };
     let s8 = mma_peak::FORMS
@@ -516,11 +527,16 @@ fn cuda_q40_mm_time_at_4096_rows() {
     };
     println!("S8 MMA peak {peak:.0} TOPS");
     let n = 4096i64;
+    // ggml, then the table's matmuls.
+    let runs = 1 + cuda::kernels();
+    let v1 = (0..cuda::kernels())
+        .find(|&v| cuda::kernel_name(v) == "first version")
+        .map_or(1, |v| v + 1);
     for (k, rows) in CHECKED {
-        let mut ms = [0f64; 3];
+        let mut ms = vec![0f64; runs];
         for (i, ms) in ms.iter_mut().enumerate() {
             let ours = i > 0;
-            use_v1(i == 1);
+            use_variant(i.saturating_sub(1));
             let ctx = Context::new(64, 64);
             let w = ctx.new_tensor(types::Q4_0, &[k, rows]).as_input();
             // Outputs too, so the second run reads them as set.
@@ -548,26 +564,26 @@ fn cuda_q40_mm_time_at_4096_rows() {
             let t0 = std::time::Instant::now();
             gpu.compute(&graph).unwrap();
             *ms = t0.elapsed().as_secs_f64() * 1e3 / CALLS as f64;
-            use_v1(false);
+            use_variant(0);
         }
         let tops = |ms: f64| 2.0 * (k * rows * n) as f64 / ms / 1e9;
-        let line: Vec<String> = NAMES
-            .iter()
-            .zip(ms)
-            .map(|(name, ms)| {
-                let share = if peak > 0.0 {
-                    format!(", {:.0}% of peak", 100.0 * tops(ms) / peak)
-                } else {
-                    String::new()
-                };
-                format!("{name} {ms:.2} ms ({:.0} TOPS{share})", tops(ms))
-            })
-            .collect();
-        println!(
-            "{k}x{rows}, {n} columns: {}; q40_mm {:.2}x ggml, {:.2}x the first version",
-            line.join(", "),
-            ms[0] / ms[2],
-            ms[1] / ms[2]
-        );
+        for (i, &t) in ms.iter().enumerate() {
+            let name = if i == 0 {
+                "ggml".to_string()
+            } else {
+                cuda::kernel_name(i - 1)
+            };
+            let share = if peak > 0.0 {
+                format!(", {:.0}% of peak", 100.0 * tops(t) / peak)
+            } else {
+                String::new()
+            };
+            println!(
+                "{k}x{rows}, {n} columns, {name}: {t:.2} ms ({:.0} TOPS{share}), {:.2}x ggml, {:.2}x the first version",
+                tops(t),
+                ms[0] / t,
+                ms[v1] / t
+            );
+        }
     }
 }
