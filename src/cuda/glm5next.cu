@@ -1020,6 +1020,124 @@ __global__ void __launch_bounds__(128) linear_set_q8(const LinSet s) {
     }
 }
 
+// linear_set_q8 with more of a lane's loads in flight (#1221 r10, Inkling-2's Q8_0 attention and
+// head; ops.rs linear_set_deep, plain epilogues): a warp takes R rows (R = 2: rows 2 w and
+// 2 w + 1 of the CTA's 4 R), and a lane loads its blocks b, b + 8, .., b + 8 (U - 1) of each row
+// before it sums any of them. The sums are linear_mv_q8_row's, copied (the same lanes, blocks,
+// order and expressions; the activations' float4s loaded once for the R rows), each row then
+// stored as linear_set_q8 stores it: the same bits. With `early` (the matrices are the model's
+// weights, which no kernel writes) a lane's first U blocks are loaded before it waits for the
+// kernel ahead.
+template <int N, int R, int U>
+__global__ void __launch_bounds__(128) linear_set_q8d(const LinSet s, const int early) {
+    if (!early) {
+        pdl_wait();
+    }
+    bool waited = !early;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    int g = 0;
+    while (g + 1 < s.nseg && (int64_t) blockIdx.x >= s.first[g + 1]) {
+        g++;
+    }
+    const Lin & p = s.p[g];
+    const int64_t r0 = (((int64_t) blockIdx.x - s.first[g]) * 4 + warp) * R;
+    if (r0 >= p.m) {
+        return;
+    }
+    const int q = lane % 4;
+    const char * row[R];
+#pragma unroll
+    for (int j = 0; j < R; j++) {
+        // a last odd row's partner reads the row again (its sums are not stored)
+        row[j] = p.w + (r0 + j < p.m ? r0 + j : r0) * p.w_nb1;
+    }
+    float acc[R][N];
+#pragma unroll
+    for (int j = 0; j < R; j++) {
+#pragma unroll
+        for (int t = 0; t < N; t++) {
+            acc[j][t] = 0.0f;
+        }
+    }
+    const int64_t nb = p.k / 32;
+    for (int64_t b0 = lane / 4; b0 < nb; b0 += 8 * U) {
+        __half dh[R][U];
+        uint16_t wq[R][U][4];
+#pragma unroll
+        for (int u = 0; u < U; u++) {
+            const int64_t b = b0 + 8 * u;
+#pragma unroll
+            for (int j = 0; j < R; j++) {
+                if (b < nb) {
+                    const char * blk = row[j] + b * 34;
+                    dh[j][u] = __ldg((const __half *) blk);
+                    const uint16_t * qs = (const uint16_t *) (blk + 2 + 8 * q);
+#pragma unroll
+                    for (int i = 0; i < 4; i++) {
+                        wq[j][u][i] = __ldg(qs + i);
+                    }
+                } else {
+                    dh[j][u] = __float2half(0.0f);
+#pragma unroll
+                    for (int i = 0; i < 4; i++) {
+                        wq[j][u][i] = 0;
+                    }
+                }
+            }
+        }
+        if (!waited) {
+            pdl_wait();
+            waited = true;
+        }
+#pragma unroll
+        for (int u = 0; u < U; u++) {
+            const int64_t b = b0 + 8 * u;
+            if (b < nb) {
+                float d[R], v[R][8];
+#pragma unroll
+                for (int j = 0; j < R; j++) {
+                    d[j] = __half2float(dh[j][u]);
+#pragma unroll
+                    for (int i = 0; i < 4; i++) {
+                        const uint16_t w = wq[j][u][i];
+                        v[j][2 * i] = (float) (int8_t) (w & 0xFF);
+                        v[j][2 * i + 1] = (float) (int8_t) (w >> 8);
+                    }
+                }
+#pragma unroll
+                for (int t = 0; t < N; t++) {
+                    if (t < p.n) {
+                        const float4 * x =
+                            (const float4 *) ((const float *) (p.x + t * p.x_nbt) + b * 32 + 8 * q);
+                        const float4 a = __ldg(x), c = __ldg(x + 1);
+#pragma unroll
+                        for (int j = 0; j < R; j++) {
+                            const float sv = v[j][0] * a.x + v[j][1] * a.y + v[j][2] * a.z + v[j][3] * a.w +
+                                             v[j][4] * c.x + v[j][5] * c.y + v[j][6] * c.z + v[j][7] * c.w;
+                            acc[j][t] += d[j] * sv;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (!waited) {
+        pdl_wait();
+    }
+#pragma unroll
+    for (int j = 0; j < R; j++) {
+        const int64_t r = r0 + j;
+        const float sc = lin_scale(p, r < p.m ? r : r0);
+#pragma unroll
+        for (int t = 0; t < N; t++) {
+            const float v = warp_sum(acc[j][t]);
+            if (lane == 0 && t < p.n && r < p.m) {
+                p.dst[t * p.m + r] = v * sc;
+            }
+        }
+    }
+}
+
 // linear_set_q8 for BF16 matrices (#1221 r7, Inkling-2's attention on its NVFP4 checkpoint):
 // each row as linear_mv_bf16 sums and stores it (bf16_row, bf16_store: the same bits), plain
 // epilogues only.
@@ -2407,6 +2525,22 @@ int launch_linear_set(const A & a, cudaStream_t st) {
         }
         s.first[s.nseg] = first;
     }
+    // params[6] bit 16 (ops::linear_set_deep, #1221 r10): linear_set_q8d for Q8_0 matrices with
+    // plain epilogues, bit 17 two rows a warp, bit 18 four of a lane's blocks in flight (else two)
+    const int deep = (a.params[6] >> 16) & 7;
+    bool dq = (deep & 1) && !bf && !rw;
+    for (int g = 0; g < s.nseg && dq; g++) {
+        dq = s.epi[g] == LS_PLAIN;
+    }
+    const int64_t drows = deep & 2 ? 8 : 4;
+    if (dq) {
+        first = 0;
+        for (int g = 0; g < s.nseg; g++) {
+            s.first[g] = first;
+            first += (s.p[g].m + drows - 1) / drows;
+        }
+        s.first[s.nseg] = first;
+    }
     if (gate) {
         const int di = 2 * s.nseg;
         if (a.n_src < di + 2 || a.src_ne[di + 1][0] < 1 || a.src_ne[di][0] % a.src_ne[di + 1][0] != 0) {
@@ -2468,6 +2602,56 @@ int launch_linear_set(const A & a, cudaStream_t st) {
             launch_pdl(linear_set_q8_rw<2>, grid, 128, 0, st, s);
         } else {
             launch_pdl(linear_set_q8_rw<4>, grid, 128, 0, st, s);
+        }
+        return 0;
+    }
+    // bit 19: the matrices are the model's weights, read before the wait for the kernel ahead
+    const int early = (a.params[6] >> 19) & 1;
+    if (dq && (deep & 6) == 0) {
+        if (n == 1) {
+            launch_pdl(linear_set_q8d<1, 1, 2>, grid, 128, 0, st, s, early);
+        } else if (n == 2) {
+            launch_pdl(linear_set_q8d<2, 1, 2>, grid, 128, 0, st, s, early);
+        } else if (n <= 4) {
+            launch_pdl(linear_set_q8d<4, 1, 2>, grid, 128, 0, st, s, early);
+        } else {
+            launch_pdl(linear_set_q8d<8, 1, 2>, grid, 128, 0, st, s, early);
+        }
+        return 0;
+    }
+    if (dq && (deep & 6) == 4) {
+        if (n == 1) {
+            launch_pdl(linear_set_q8d<1, 1, 4>, grid, 128, 0, st, s, early);
+        } else if (n == 2) {
+            launch_pdl(linear_set_q8d<2, 1, 4>, grid, 128, 0, st, s, early);
+        } else if (n <= 4) {
+            launch_pdl(linear_set_q8d<4, 1, 4>, grid, 128, 0, st, s, early);
+        } else {
+            launch_pdl(linear_set_q8d<8, 1, 4>, grid, 128, 0, st, s, early);
+        }
+        return 0;
+    }
+    if (dq && (deep & 6) == 2) {
+        if (n == 1) {
+            launch_pdl(linear_set_q8d<1, 2, 2>, grid, 128, 0, st, s, early);
+        } else if (n == 2) {
+            launch_pdl(linear_set_q8d<2, 2, 2>, grid, 128, 0, st, s, early);
+        } else if (n <= 4) {
+            launch_pdl(linear_set_q8d<4, 2, 2>, grid, 128, 0, st, s, early);
+        } else {
+            launch_pdl(linear_set_q8d<8, 2, 2>, grid, 128, 0, st, s, early);
+        }
+        return 0;
+    }
+    if (dq) {
+        if (n == 1) {
+            launch_pdl(linear_set_q8d<1, 2, 4>, grid, 128, 0, st, s, early);
+        } else if (n == 2) {
+            launch_pdl(linear_set_q8d<2, 2, 4>, grid, 128, 0, st, s, early);
+        } else if (n <= 4) {
+            launch_pdl(linear_set_q8d<4, 2, 4>, grid, 128, 0, st, s, early);
+        } else {
+            launch_pdl(linear_set_q8d<8, 2, 4>, grid, 128, 0, st, s, early);
         }
         return 0;
     }

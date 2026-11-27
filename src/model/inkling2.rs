@@ -143,6 +143,27 @@ fn fuse10_of(v: Option<&str>) -> u32 {
         .map_or(FUSE_ALL, |m| m & FUSE_ALL)
 }
 
+/// The Q8_0 attention sets', lone products' and head's warp layout on CUDA's deeper-load set
+/// kernel (#1221 r10, [`glm_ops::linear_set_deep`]): two rows a warp and two loads a lane unless
+/// `LEGION_DEBUG_INK_Q8_DEEP` names another (`r1u2`, `r1u4`, `r2u2`, `r2u4`) or is `0` (round
+/// 9's linear_set_q8 sets and linear_mv_q8 products). The same bits either way.
+fn q8_deep() -> Option<glm_ops::DeepQ8> {
+    static DEEP: std::sync::OnceLock<Option<glm_ops::DeepQ8>> = std::sync::OnceLock::new();
+    *DEEP.get_or_init(|| q8_deep_of(std::env::var("LEGION_DEBUG_INK_Q8_DEEP").ok().as_deref()))
+}
+
+/// [`q8_deep`]'s layout from the variable's value: unset or not a name, `r2u2`.
+fn q8_deep_of(v: Option<&str>) -> Option<glm_ops::DeepQ8> {
+    let deep = |rows, loads| Some(glm_ops::DeepQ8 { rows, loads });
+    match v.map(str::trim) {
+        Some("0") => None,
+        Some("r1u2") => deep(1, 2),
+        Some("r1u4") => deep(1, 4),
+        Some("r2u4") => deep(2, 4),
+        _ => deep(2, 2),
+    }
+}
+
 /// The grouped mv variants of the NVFP4 experts' one-token tiles an A/B run may pick (#1221 r9,
 /// [`expert_mv`]), all compiled for them (`mvg<1>` without the SwiGLU) and all the same bits:
 /// `pR` R row tiles of 16 rows a CTA (the default's p8), `wWpR` tiles of 16 * W rows, `sS`
@@ -572,7 +593,8 @@ impl Arch for Ink2Params {
     /// the same index as `argmax` (the first of the largest) for NaN-free logits. The soft cap
     /// passes a NaN through (`tanh(NaN)` is NaN), so that rests on the output projection.
     /// The projection reads only the unpadded vocabulary's rows (#1221 r9: the padding's
-    /// logits were cut anyway): the same bits.
+    /// logits were cut anyway), a Q8_0 head at decode steps on the deeper-load set kernel
+    /// ([`glm_ops::linear_set_deep`], [`q8_deep`]; r10): the same bits.
     fn head<'a>(
         &self,
         m: &'a Model,
@@ -587,7 +609,19 @@ impl Arch for Ink2Params {
         } else {
             w
         };
-        let logits = m.glm_mm_w(ctx, name, w, ws, x, None)?;
+        let n: i64 = x.ne()[1..].iter().product();
+        let deep = q8_deep().filter(|_| {
+            ws.is_none()
+                && x.ty() == types::F32
+                && x.is_contiguous()
+                && glm_ops::linear_set_takes(&[w], n)
+        });
+        let logits = match deep {
+            Some(d) => {
+                glm_ops::linear_set_deep(ctx, &[(w, x, glm_ops::SetEpi::Plain)], d).remove(0)
+            }
+            None => m.glm_mm_w(ctx, name, w, ws, x, None)?,
+        };
         let logits = ops::softcap(ctx, logits, self.softcap, self.n_vocab);
         Ok(Some((logits, glm_ops::argmax_wide(ctx, logits))))
     }
@@ -710,7 +744,9 @@ impl Model {
     /// them, Q8_0 weights without a scale over up to 8 tokens (decode steps; #1221 r6) or BF16
     /// ones (the NVFP4 checkpoint's) on the GB10 kernels, at one token (linear_mv_bf16's sums,
     /// [`glm_ops::linear_set_bf16_takes`]; r7) and at 2-8 (linear_mv_bf16x's; r9), unless `own`
-    /// (traced runs keep a node a product); else a node each.
+    /// (traced runs keep a node a product); else a node each. Q8_0 sets run CUDA's deeper-load
+    /// kernel ([`glm_ops::linear_set_deep`], [`q8_deep`]; r10), and then a single Q8_0 product
+    /// (`N` 1) takes it too.
     fn ink_mm_set<'a, const N: usize>(
         &'a self,
         ctx: &'a Context,
@@ -740,8 +776,9 @@ impl Model {
             .collect::<Result<Vec<_>, _>>()?;
         let tokens = |x: &Tensor<'_>| -> i64 { x.ne()[1..].iter().product() };
         let n = tokens(&xs[0]);
+        let deep = q8_deep().filter(|_| glm_ops::linear_set_takes(&ws, n));
         let set = !own
-            && (2..=glm_ops::SET_MAX).contains(&N)
+            && ((2..=glm_ops::SET_MAX).contains(&N) || (N == 1 && deep.is_some()))
             && xs
                 .iter()
                 .all(|x| x.ty() == types::F32 && x.is_contiguous() && tokens(x) == n)
@@ -757,7 +794,10 @@ impl Model {
                 .zip(xs)
                 .map(|(&w, x)| (w, x, glm_ops::SetEpi::Plain))
                 .collect();
-            glm_ops::linear_set(ctx, &set)
+            match deep {
+                Some(d) => glm_ops::linear_set_deep(ctx, &set, d),
+                None => glm_ops::linear_set(ctx, &set),
+            }
         } else {
             names
                 .iter()
@@ -1278,7 +1318,7 @@ impl Model {
         } else {
             ops::clip2(ctx, [q, r], tau)
         };
-        let sinks = self.ink_mm_b(ctx, ip, "attn_sink_proj.weight", xq, &mut rows)?;
+        let [sinks] = self.ink_mm_set(ctx, ip, ["attn_sink_proj.weight"], xq, &mut rows, tap.on)?;
         tap.tap("r_clip", il, r);
         tap.tap("sinks", il, sinks);
         tap.tap("Qcur", il, q);
@@ -1379,7 +1419,14 @@ impl Model {
         tap.tap("attn_gate", il, g);
         let o = ops::sigmul(ctx, o, g);
         tap.tap("attn_gated", il, o);
-        let o = self.ink_mm(ctx, ip, "attn_output.weight", o)?;
+        let [o] = self.ink_mm_set(
+            ctx,
+            ip,
+            ["attn_output.weight"],
+            o,
+            &mut Bf16Rows::default(),
+            tap.on,
+        )?;
         tap.tap("attn_proj", il, o);
         self.ink_conv_add(pass, il, ip, "attn_post_conv.weight", o, None, 2 * kvw, res)
     }

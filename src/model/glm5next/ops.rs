@@ -1036,6 +1036,70 @@ pub fn linear_set<'a>(
     ctx: &'a Context,
     set: &[(Tensor<'a>, Tensor<'a>, SetEpi<'a>)],
 ) -> Vec<Tensor<'a>> {
+    linear_set_with(ctx, set, 0)
+}
+
+/// How [`linear_set_deep`] lays Q8_0 rows over a warp (#1221 r10): `rows` 1 or 2 rows a warp,
+/// `loads` 2 or 4 of a lane's blocks of each row loaded before it sums any of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeepQ8 {
+    pub rows: u8,
+    pub loads: u8,
+}
+
+/// [`linear_set`] of Q8_0 weights with plain epilogues on CUDA's linear_set_q8d (#1221 r10,
+/// Inkling-2's attention and head): more of a lane's loads in flight ([`DeepQ8`]), each row
+/// summed as linear_mv_q8 sums it, the same bits. One product alone is a set too.
+pub fn linear_set_deep<'a>(
+    ctx: &'a Context,
+    set: &[(Tensor<'a>, Tensor<'a>, SetEpi<'a>)],
+    deep: DeepQ8,
+) -> Vec<Tensor<'a>> {
+    assert!(
+        set.iter()
+            .all(|s| s.0.ty() == types::Q8_0 && matches!(s.2, SetEpi::Plain)),
+        "glm_linear_set: deep, Q8_0 and plain"
+    );
+    assert!(
+        matches!(deep.rows, 1 | 2) && matches!(deep.loads, 2 | 4),
+        "glm_linear_set: 1-2 rows a warp, 2 or 4 loads"
+    );
+    let bits = LS_DEEP
+        | if deep.rows == 2 { LS_DEEP_ROWS2 } else { 0 }
+        | if deep.loads == 4 { LS_DEEP_LOADS4 } else { 0 }
+        | if set.iter().all(|s| leaf_data(s.0)) {
+            LS_DEEP_EARLY
+        } else {
+            0
+        };
+    linear_set_with(ctx, set, bits)
+}
+
+/// The CUDA node's params[6] bits of [`linear_set_deep`] (above [`small_mv`]'s bits): on, two
+/// rows a warp, four loads a lane, and the matrices read before the wait for the kernel ahead.
+const LS_DEEP: i32 = 1 << 16;
+const LS_DEEP_ROWS2: i32 = 1 << 17;
+const LS_DEEP_LOADS4: i32 = 1 << 18;
+const LS_DEEP_EARLY: i32 = 1 << 19;
+
+/// Whether `t` is a leaf's data (the leaf or a view of one): a model weight in
+/// [`linear_set_deep`]'s graphs (Inkling-2's attention and head), which no kernel writes, so its
+/// kernel loads it before it waits for the kernel ahead. A computed matrix waits.
+fn leaf_data(t: Tensor<'_>) -> bool {
+    // SAFETY: a tensor of a live context, whose view source is null or a live tensor.
+    unsafe {
+        let r = &*t.raw();
+        let leaf = |r: &ffi::ggml_tensor| r.op == ffi::ggml_op_GGML_OP_NONE;
+        leaf(r)
+            && (r.view_src.is_null() || (leaf(&*r.view_src) && (*r.view_src).view_src.is_null()))
+    }
+}
+
+fn linear_set_with<'a>(
+    ctx: &'a Context,
+    set: &[(Tensor<'a>, Tensor<'a>, SetEpi<'a>)],
+    deep: i32,
+) -> Vec<Tensor<'a>> {
     assert!(
         (1..=SET_MAX).contains(&set.len()),
         "glm_linear_set: 1-3 products"
@@ -1048,7 +1112,15 @@ pub fn linear_set<'a>(
         "glm_linear_set: Q8_0 or BF16 (plain), up to 8 tokens"
     );
     let mut args = Vec::new();
-    let mut params = [set.len() as i32, 0, 0, 0, 0, n as i32, small_mv_param()];
+    let mut params = [
+        set.len() as i32,
+        0,
+        0,
+        0,
+        0,
+        n as i32,
+        small_mv_param() | deep,
+    ];
     let mut gate = None;
     for (g, &(w, x, epi)) in set.iter().enumerate() {
         assert_eq!(x.ne()[0], w.ne()[0], "glm_linear_set: x rows");
