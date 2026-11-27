@@ -167,6 +167,69 @@ fn unknown_tools_and_bad_calls_stay_text() {
     assert_eq!(text, "<atem:function_calls>");
 }
 
+/// `<|eot|>` is a stop token: generation ends before the parser sees it, so a whole call
+/// is only complete at `finish()`.
+#[test]
+fn a_call_cut_by_the_stop_token_is_still_a_call() {
+    let reply = " to=get_weather<|message|><atem:function_calls>\n\
+                 <atem:invoke name=\"get_weather\">\n\
+                 <atem:parameter name=\"city\">Oslo</atem:parameter>\n\
+                 </atem:invoke>\n</atem:function_calls>";
+    let (_, text, calls) = run(&[reply], &tools());
+    assert_eq!(text, "");
+    assert_eq!(
+        calls,
+        [("get_weather".to_string(), json!({"city": "Oslo"}))]
+    );
+    let mut p = MuseParser::new(&tools());
+    p.push(reply);
+    p.finish();
+    assert!(p.had_calls());
+}
+
+#[test]
+fn a_non_string_value_that_is_not_json_keeps_the_call_text() {
+    let body = "<atem:function_calls>\n<atem:invoke name=\"get_weather\">\n\
+                <atem:parameter name=\"days\">three</atem:parameter>\n\
+                </atem:invoke>\n</atem:function_calls>";
+    let reply = format!(" to=get_weather<|message|>{body}<|eom|>");
+    let (_, text, calls) = run(&[&reply], &tools());
+    assert!(calls.is_empty());
+    assert_eq!(text, body);
+}
+
+#[test]
+fn a_call_without_the_closing_wrapper_stays_text() {
+    let body = "<atem:function_calls>\n<atem:invoke name=\"get_weather\">\n</atem:invoke>";
+    let reply = format!(" to=get_weather<|message|>{body}<|eom|>");
+    let (_, text, calls) = run(&[&reply], &tools());
+    assert!(calls.is_empty());
+    assert_eq!(text, body);
+}
+
+#[test]
+fn unframed_text_starting_with_to_is_kept() {
+    // No `<|message|>` ever comes: all of it is text at the end.
+    let (thought, text, _) = run(&["to=alice", " is an example."], &[]);
+    assert_eq!(
+        (thought.as_str(), text.as_str()),
+        ("", "to=alice is an example.")
+    );
+    // A newline before any `<|message|>`: not a header, so it streams as text.
+    let mut p = MuseParser::new(&[]);
+    let events = p.push("to=alice is an example.\nMore");
+    let streamed: String = events
+        .into_iter()
+        .map(|ev| match ev {
+            TokenEvent::Text(t) => t,
+            other => panic!("unexpected event: {other:?}"),
+        })
+        .collect();
+    assert_eq!(streamed, "to=alice is an example.\nMore");
+    // Other markup before `<|message|>`: the text before it is text.
+    assert_eq!(run(&["to=x", EOT], &[]).1, "to=x");
+}
+
 #[test]
 fn a_next_turn_the_model_writes_is_dropped() {
     let reply = " to=user<|message|>Hi.<|eot|><|start|>user<|message|>more<|eot|>";

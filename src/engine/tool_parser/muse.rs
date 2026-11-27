@@ -57,6 +57,10 @@ const PARAM_CLOSE: &str = "</atem:parameter>";
 enum State {
     /// The reply's start: ` to=...` (the first message's header) or plain text follows.
     Start,
+    /// The reply began with `to=`: the first message's header, until `<|message|>` confirms
+    /// it. Anything else (a newline or other markup first, or the reply's end) makes it
+    /// unframed text.
+    FirstHeader,
     /// Between messages: stray text (a reply without framing) is text.
     Between,
     /// After `<|start|>`: the header (`assistant to=RECIPIENT`) up to `<|message|>`.
@@ -113,7 +117,7 @@ impl MuseParser {
         match self.state {
             State::Reasoning => events.push(TokenEvent::Reasoning(text)),
             State::Start | State::Between | State::Text => events.push(TokenEvent::Text(text)),
-            State::Header | State::Call | State::Skip => {}
+            State::FirstHeader | State::Header | State::Call | State::Skip => {}
         }
     }
 
@@ -163,7 +167,8 @@ impl MuseParser {
 
 /// `<atem:function_calls><atem:invoke name="NAME"><atem:parameter name="KEY">VALUE
 /// </atem:parameter>...</atem:invoke>...</atem:function_calls>` into `(name, arguments json)`
-/// per invoke; `None` when it does not parse or names an unknown tool.
+/// per invoke; `None` when it does not parse (a non-string value that is not JSON, a missing
+/// closing tag) or names an unknown tool.
 fn parse_atem(body: &str, tools: &[Tool]) -> Option<Vec<(String, String)>> {
     let mut rest = body.trim_start().strip_prefix(CALLS_OPEN)?;
     let mut calls = Vec::new();
@@ -190,7 +195,7 @@ fn parse_atem(body: &str, tools: &[Tool]) -> Option<Vec<(String, String)>> {
             let value = if is_string_param(tool, &key) {
                 Value::String(raw.to_string())
             } else {
-                serde_json::from_str(raw.trim()).unwrap_or_else(|_| Value::String(raw.to_string()))
+                serde_json::from_str(raw.trim()).ok()?
             };
             args.insert(key, value);
             rest = &after[close + PARAM_CLOSE.len()..];
@@ -201,11 +206,7 @@ fn parse_atem(body: &str, tools: &[Tool]) -> Option<Vec<(String, String)>> {
             serde_json::to_string(&Value::Object(args)).ok()?,
         ));
     }
-    let tail = rest.trim();
-    if !tail.is_empty() && tail != CALLS_CLOSE {
-        return None;
-    }
-    Some(calls)
+    (rest.trim() == CALLS_CLOSE).then_some(calls)
 }
 
 impl super::ToolParser for MuseParser {
@@ -219,11 +220,25 @@ impl super::ToolParser for MuseParser {
                     // ends with it); anything else is an unframed reply.
                     let t = self.held.trim_start();
                     if t.starts_with("to=") {
-                        self.state = State::Header;
+                        self.state = State::FirstHeader;
                     } else if "to=".starts_with(t) {
                         return events;
                     } else {
                         self.state = State::Between;
+                    }
+                }
+                State::FirstHeader => {
+                    let tags = [MESSAGE, START, EOM, EOT];
+                    let found = self.first(&tags);
+                    let newline = self.held.find('\n');
+                    match found {
+                        Some((at, MESSAGE)) if newline.is_none_or(|n| n > at) => {
+                            let header: String = self.held.drain(..at + MESSAGE.len()).collect();
+                            self.state = Self::body_state(&header[..at]);
+                        }
+                        // Not a header: the held text is an unframed reply's.
+                        _ if found.is_some() || newline.is_some() => self.state = State::Between,
+                        _ => return events,
                     }
                 }
                 State::Between => {
@@ -286,8 +301,11 @@ impl super::ToolParser for MuseParser {
         let rest = std::mem::take(&mut self.held);
         let mut events = Vec::new();
         match self.state {
-            // An unfinished call is text, as in the other formats.
-            State::Call => {
+            // The stop token `<|eot|>` ends generation before it reaches the parser, so a
+            // whole call can still be held; an unfinished one is text, as in the other formats.
+            State::Call => events = self.calls(&rest),
+            // `to=...` that never became a header: unframed text.
+            State::FirstHeader => {
                 if !rest.is_empty() {
                     events.push(TokenEvent::Text(rest));
                 }
