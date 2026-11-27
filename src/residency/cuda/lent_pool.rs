@@ -11,7 +11,10 @@
 //! buffers, a step buffer's rest) releases pooled allocations first ([`make_raw`], and one
 //! more after each out of memory in [`create`]); a lent
 //! step's allocation ([`flush`]) and the end of the restore ([`close_all`]) release what is
-//! left, so nothing but the pool's own takers ever waits on it.
+//! left, so nothing but the pool's own takers ever waits on it. A restore that the next lend
+//! stops (a long prompt right after another) leaves the pool open: the slots it did not map
+//! yet keep their allocations here for that lend's step buffers, so the driver does not clear
+//! them right before the lend's unmaps and the KV tail's new pieces.
 //!
 //! `LEGION_DEBUG_LEND_HANDOFF=0` releases the slots' allocations at once, as before.
 
@@ -21,8 +24,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Pooled allocations: `(device, handle, bytes)`, unmapped.
 static POOL: Mutex<Vec<(usize, CUmemGenericAllocationHandle, usize)>> = Mutex::new(Vec::new());
 
-/// The devices (bit `device`) whose pool takes allocations: from a lend's first one until the
-/// restore after it is done ([`close_all`]).
+/// The devices (bit `device`) whose pool takes allocations: from a lend's first one until a
+/// restore after it is done without a lend stopping it ([`close_all`]).
 static OPEN: AtomicU64 = AtomicU64::new(0);
 
 /// Plain free VRAM a pool's taker leaves on top of what it asked for: not all of what the

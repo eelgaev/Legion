@@ -4510,8 +4510,14 @@ impl ExpertResidency {
                     for (device, l) in lent.into_inner().unwrap_or_else(|e| e.into_inner()) {
                         l.free(device);
                     }
-                    // The lent slots' VRAM no slot took back (#37).
-                    super::cuda::lent_pool_close();
+                    // The lent slots' VRAM no slot took back (#37). Not when a lend stopped
+                    // the thread: that lend's step buffers map it (back-to-back long prompts),
+                    // instead of the driver clearing it right before the lend's own unmaps
+                    // and the KV tail's new pieces (~50 ms of a 32K prompt on an RTX 4090).
+                    // The restore after that lend releases what is left.
+                    if !stop.load(Ordering::Relaxed) {
+                        super::cuda::lent_pool_close();
+                    }
                     done
                 })
                 .map_err(|e| format!("cannot start the slot thread: {e}"))?;
