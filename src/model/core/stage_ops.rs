@@ -183,6 +183,7 @@ pub(crate) const SMALL_MM: &[&str] = &["nvfp4_mvq", "fp8_mm"];
 /// them between their captures, as before.
 pub(crate) const INKLING: &[&str] = &[
     "ink_mix",
+    "ink_rms",
     "ink_ctrl_in",
     "ink_ctrl_out",
     "ink_ctrl_gate",

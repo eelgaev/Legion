@@ -412,7 +412,7 @@ impl Arch for Ink2Params {
     ) -> Result<Option<Tensor<'a>>, ModelError> {
         let x = glm_ops::embed(ctx, m.w("token_embd.weight")?, tokens, 1);
         let x = ctx.reshape_2d(x, m.hp.n_embd, tokens.ne()[0]);
-        Ok(Some(glm_ops::rms_norm(
+        Ok(Some(ops::rms(
             ctx,
             x,
             Some(m.w("token_embd_norm.weight")?),
@@ -576,12 +576,7 @@ impl Model {
         name: &str,
         x: Tensor<'a>,
     ) -> Result<Tensor<'a>, ModelError> {
-        Ok(glm_ops::rms_norm(
-            ctx,
-            x,
-            Some(self.lw(ip, name)?),
-            self.hp.rms_eps,
-        ))
+        Ok(ops::rms(ctx, x, Some(self.lw(ip, name)?), self.hp.rms_eps))
     }
 
     /// The layers over the normed embeddings `x` (`[n_embd, n]`); ends in the head's input.
@@ -652,7 +647,7 @@ impl Model {
             Some(rows) => glm_ops::get_cols(ctx, x, rows),
             None => x,
         };
-        let x = glm_ops::rms_norm(ctx, x, Some(self.w("output_norm.weight")?), hp.rms_eps);
+        let x = ops::rms(ctx, x, Some(self.w("output_norm.weight")?), hp.rms_eps);
         tap.tap("result_norm", 0, x);
         Ok(x)
     }
@@ -904,7 +899,7 @@ impl Model {
             tau,
         );
         let k = ops::clip(ctx, ctx.reshape_3d(k, d, nkv, n), None, p.qk_clip, None);
-        let v = glm_ops::rms_norm(ctx, ctx.reshape_3d(v, d, nkv, n), None, hp.rms_eps);
+        let v = ops::rms(ctx, ctx.reshape_3d(v, d, nkv, n), None, hp.rms_eps);
         let r = ops::clip(
             ctx,
             ctx.reshape_3d(r, p.n_rel, nh, n),

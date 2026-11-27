@@ -2,10 +2,10 @@
 // mix of the attention residuals, the loop controllers' input and output, the causal short convs
 // with their kept history, the L2 clips, the attention with its relative bias and per-token
 // sinks, the sigmoid gate, the SITU activation, the expert matmul of the Q8_0 / MXFP8 / plain
-// stacks and the soft-capped head. Kernel bodies only: the Rust side
-// (src/model/inkling2/ops/cuda.rs) launches them with cudaLaunchKernelEx (programmatic
-// dependent launches on compute capability 12.x, see pdl_wait), each node described
-// generically (data, shape, byte strides, type) as in legion_ink_args.
+// stacks, the soft-capped head and an RMS norm with glm_rms_norm's sums. Kernel bodies only:
+// the Rust side (src/model/inkling2/ops/cuda.rs) launches them with cudaLaunchKernelEx
+// (programmatic dependent launches on compute capability 12.x, see pdl_wait), each node
+// described generically (data, shape, byte strides, type) as in legion_ink_args.
 //
 // Correctness first (plain SIMT); sums run in another order than the CPU's, so values match it
 // to rounding, not bit for bit.
@@ -96,6 +96,15 @@ __device__ __forceinline__ float pf(int32_t p) {
 }
 
 __device__ __forceinline__ float warp_sum(float v) {
+    for (int o = 16; o > 0; o >>= 1) {
+        v += __shfl_xor_sync(0xffffffffu, v, o);
+    }
+    return v;
+}
+
+// glm5next.cu's warp_sum<double> (rms_norm_kernel's block_sum), the same shuffles and adds.
+__device__ __forceinline__ double warp_sum(double v) {
+#pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
         v += __shfl_xor_sync(0xffffffffu, v, o);
     }
@@ -276,6 +285,214 @@ __global__ void mix_kernel(const A a) {
                     out[(j * n + t) * e + i] = o;
                 }
             }
+        }
+    }
+}
+
+// mix_reg_kernel's block (mix_kernel's, as the Rust side launches it).
+constexpr int MIX_THREADS = 256;
+
+// ---- ink_mix for small steps (#1221 r6): mix_kernel's sums and output, every one in its order,
+// over the same 256 threads (thread i's elements i, i + 256, ...), with all of a thread's K
+// elements loaded at once and kept for the output (mix_kernel loads MIX_U at a time and reads
+// the states twice: ~6 memory latencies in a row for a decode step's one block). Queries that
+// are weights (params[2]) are loaded before pdl_wait, while the kernel ahead still runs. The
+// same products and sums as mix_kernel's: the same bits. ----
+template <int K> __global__ void __launch_bounds__(MIX_THREADS) mix_reg_kernel(const A a) {
+    const int     ns  = a.params[0];
+    const float   eps = pf(a.params[1]);
+    const int64_t e = a.ne[0], n = a.ne[1], nq = a.ne[2];
+    const int64_t t = blockIdx.x;
+    constexpr int    NK = 1 + MIX_QUERIES;
+    __shared__ float red[MIX_STATES * NK][32];
+    __shared__ float sc[MIX_STATES][MIX_QUERIES];
+    __shared__ float rs[MIX_STATES];
+    const int64_t step = blockDim.x;
+    float qv[K][MIX_QUERIES];
+    const bool early = a.params[2] != 0;
+    if (early) {
+#pragma unroll
+        for (int u = 0; u < K; u++) {
+            const int64_t i = threadIdx.x + u * step;
+#pragma unroll
+            for (int j = 0; j < MIX_QUERIES; j++) {
+                qv[u][j] = j < nq && i < e
+                               ? ((const float *) (src(a, ns) + j * a.src_nb[ns][1]))[i]
+                               : 0.f;
+            }
+        }
+    }
+    pdl_wait();
+    if (!early) {
+#pragma unroll
+        for (int u = 0; u < K; u++) {
+            const int64_t i = threadIdx.x + u * step;
+#pragma unroll
+            for (int j = 0; j < MIX_QUERIES; j++) {
+                qv[u][j] = j < nq && i < e
+                               ? ((const float *) (src(a, ns) + j * a.src_nb[ns][1]))[i]
+                               : 0.f;
+            }
+        }
+    }
+    float xv[K][MIX_STATES];
+#pragma unroll
+    for (int u = 0; u < K; u++) {
+        const int64_t i = threadIdx.x + u * step;
+#pragma unroll
+        for (int s = 0; s < MIX_STATES; s++) {
+            xv[u][s] = s < ns && i < e
+                           ? ((const float *) (src(a, s) + t * a.src_nb[s][1]))[i]
+                           : 0.f;
+        }
+    }
+    const float inv = rsqrtf((float) e);
+    float       part[MIX_STATES][NK];
+#pragma unroll
+    for (int s = 0; s < MIX_STATES; s++) {
+#pragma unroll
+        for (int k = 0; k < NK; k++) {
+            part[s][k] = 0.f;
+        }
+    }
+#pragma unroll
+    for (int u = 0; u < K; u++) {
+        if (threadIdx.x + u * step < e) {
+#pragma unroll
+            for (int s = 0; s < MIX_STATES; s++) {
+                if (s < ns) {
+                    part[s][0] += xv[u][s] * xv[u][s];
+#pragma unroll
+                    for (int j = 0; j < MIX_QUERIES; j++) {
+                        if (j < nq) {
+                            part[s][1 + j] += xv[u][s] * qv[u][j];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    const int w = threadIdx.x / 32, l = threadIdx.x % 32, nw = blockDim.x / 32;
+#pragma unroll
+    for (int s = 0; s < MIX_STATES; s++) {
+#pragma unroll
+        for (int k = 0; k < NK; k++) {
+            if (s < ns && k <= nq) {
+                const float v = warp_sum(part[s][k]);
+                if (l == 0) {
+                    red[s * NK + k][w] = v;
+                }
+            }
+        }
+    }
+    __syncthreads();
+    for (int s = w; s < ns; s += nw) {
+        const float ss = warp_sum(l < nw ? red[s * NK][l] : 0.f);
+        const float r  = rsqrtf(ss / (float) e + eps);
+        for (int j = 0; j < nq; j++) {
+            const float d = warp_sum(l < nw ? red[s * NK + 1 + j][l] : 0.f);
+            if (l == 0) {
+                sc[s][j] = d * r * inv;
+            }
+        }
+        if (l == 0) {
+            rs[s] = r;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < nq) {
+        const int j = threadIdx.x;
+        float     m = sc[0][j];
+        for (int s = 1; s < ns; s++) {
+            m = fmaxf(m, sc[s][j]);
+        }
+        float sum = 0.f;
+        for (int s = 0; s < ns; s++) {
+            sc[s][j] = __expf(sc[s][j] - m);
+            sum += sc[s][j];
+        }
+        for (int s = 0; s < ns; s++) {
+            sc[s][j] = sc[s][j] / sum * rs[s];
+        }
+    }
+    __syncthreads();
+    float * out = (float *) a.dst;
+#pragma unroll
+    for (int u = 0; u < K; u++) {
+        const int64_t i = threadIdx.x + u * step;
+        if (i < e) {
+            for (int j = 0; j < nq; j++) {
+                float o = 0.f;
+#pragma unroll
+                for (int s = 0; s < MIX_STATES; s++) {
+                    if (s < ns) {
+                        o += sc[s][j] * xv[u][s];
+                    }
+                }
+                out[(j * n + t) * e + i] = o;
+            }
+        }
+    }
+}
+
+// rms_kernel's block.
+constexpr int RMS_THREADS = 256;
+
+// ---- ink_rms: params eps, whether w is a weight; sources x [d, rows] (contiguous), w [d] or
+// none (#1221 r6). glm5next.cu's rms_norm_kernel (glm_rms_norm) in its order: the same 256
+// threads, thread i summing (double) x² over elements i, i + 256, ... in turn, then block_sum's
+// tree (warp sums, then warp 0's sum of them, which every warp makes here: one barrier instead
+// of three), s = 1 / sqrt(sum / d + eps), x s w. A thread's K elements are loaded at once and
+// kept for the output, and w (a weight, params[1]) before pdl_wait: rms_norm_kernel has a memory
+// latency for every few of a thread's elements, twice. The same sums: the same bits. ----
+template <int K> __global__ void __launch_bounds__(RMS_THREADS) rms_kernel(const A a) {
+    const int64_t d = a.ne[0], r = blockIdx.x;
+    const float * w = (const float *) a.src[1];
+    float         wv[K];
+    if (w && a.params[1]) {
+#pragma unroll
+        for (int k = 0; k < K; k++) {
+            const int64_t i = threadIdx.x + (int64_t) k * RMS_THREADS;
+            wv[k] = i < d ? w[i] : 0.f;
+        }
+    }
+    pdl_wait();
+    if (w && !a.params[1]) {
+#pragma unroll
+        for (int k = 0; k < K; k++) {
+            const int64_t i = threadIdx.x + (int64_t) k * RMS_THREADS;
+            wv[k] = i < d ? w[i] : 0.f;
+        }
+    }
+    const float * x = (const float *) a.src[0] + r * d;
+    float         xv[K];
+#pragma unroll
+    for (int k = 0; k < K; k++) {
+        const int64_t i = threadIdx.x + (int64_t) k * RMS_THREADS;
+        xv[k] = i < d ? x[i] : 0.f;
+    }
+    double sum = 0.0;
+#pragma unroll
+    for (int k = 0; k < K; k++) {
+        if (threadIdx.x + (int64_t) k * RMS_THREADS < d) {
+            sum += (double) xv[k] * xv[k];
+        }
+    }
+    __shared__ double part[RMS_THREADS / 32];
+    sum = warp_sum(sum);
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    if (lane == 0) {
+        part[warp] = sum;
+    }
+    __syncthreads();
+    sum = warp_sum(lane < RMS_THREADS / 32 ? part[lane] : 0.0);
+    const float s = 1.0f / sqrtf((float) (sum / d) + pf(a.params[0]));
+    float *     o = (float *) a.dst + r * d;
+#pragma unroll
+    for (int k = 0; k < K; k++) {
+        const int64_t i = threadIdx.x + (int64_t) k * RMS_THREADS;
+        if (i < d) {
+            o[i] = w ? xv[k] * s * wv[k] : xv[k] * s;
         }
     }
 }
@@ -1329,7 +1546,7 @@ __global__ void softcap_kernel(const A a) {
 
 }  // namespace
 
-extern "C" const void * const legion_ink_kernels[19] = {
+extern "C" const void * const legion_ink_kernels[25] = {
     reinterpret_cast<const void *>(&mix_kernel),
     reinterpret_cast<const void *>(&ctrl_in_kernel),
     reinterpret_cast<const void *>(&ctrl_out_kernel),
@@ -1349,4 +1566,10 @@ extern "C" const void * const legion_ink_kernels[19] = {
     reinterpret_cast<const void *>(&attn_kernel<4, ATTN_DECODE_ROWS>),
     reinterpret_cast<const void *>(&mm_id_vec_kernel),
     reinterpret_cast<const void *>(&ctrl_gate_kernel),
+    reinterpret_cast<const void *>(&mix_reg_kernel<3>),
+    reinterpret_cast<const void *>(&mix_reg_kernel<9>),
+    reinterpret_cast<const void *>(&rms_kernel<1>),
+    reinterpret_cast<const void *>(&rms_kernel<3>),
+    reinterpret_cast<const void *>(&rms_kernel<9>),
+    reinterpret_cast<const void *>(&rms_kernel<16>),
 };

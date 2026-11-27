@@ -1,7 +1,8 @@
 //! Inkling-2's own ops ([`crate::ggml::ExternalOp`]): the steps of the `inkling2_loop` graph
 //! that GLM-5.3-Flash's ops ([`crate::model::glm5next::ops`]: linear, RMS norm, the router,
-//! the weighted expert sum, ...) and DeepSeek-V4.1's cache writes do not cover. ggml only holds
-//! the tensors, views and reshapes; nothing here is a ggml compute op.
+//! the weighted expert sum, ...) and DeepSeek-V4.1's cache writes do not cover, and an RMS norm
+//! with `glm_rms_norm`'s bits ([`rms`]). ggml only holds the tensors, views and reshapes;
+//! nothing here is a ggml compute op.
 //!
 //! The CPU implementations are plain references (F32 math, sums in order, norms' sums in f64),
 //! for tests and the CPU backend; the CUDA kernels are `src/cuda/inkling2.cu` ([`cuda`]),
@@ -9,6 +10,7 @@
 //! `inkling2-loop.cpp` (MIT, ggml-org/llama.cpp PRs #32694 and #32704).
 
 use crate::ggml::{Context, ExternalOp, Tensor, external_params, ffi, types};
+use crate::model::glm5next::ops::{self as glm_ops, cpu_rms_norm};
 
 #[cfg(feature = "cuda")]
 mod cuda;
@@ -27,6 +29,7 @@ macro_rules! external_op {
 }
 
 external_op!(MIX, "ink_mix", cpu_mix, mix);
+external_op!(RMS, "ink_rms", cpu_rms_norm, rms);
 external_op!(CTRL_IN, "ink_ctrl_in", cpu_ctrl_in, ctrl_in);
 external_op!(CTRL_OUT, "ink_ctrl_out", cpu_ctrl_out, ctrl_out);
 external_op!(CTRL_GATE, "ink_ctrl_gate", cpu_ctrl_gate, ctrl_gate);
@@ -49,7 +52,39 @@ pub const MAX_TAPS: usize = 8;
 /// weight (`eps`), scored per token against each query column of `query` (F32 `[e, nq]`) as
 /// `normed · q / sqrt(e)`, and the normed states summed with the softmax of their scores. F32
 /// `[e, n, nq]`: query `j`'s mix of every token is the contiguous slice `j`.
+///
+/// On CUDA, steps of up to [`MIX_REG_TOKENS`] tokens and rows up to [`MIX_REG_MAX`] wide run a
+/// kernel that keeps a thread's elements in registers (#1221 r6): the same sums in the same
+/// order as the other's, the same bits.
 pub fn mix<'a>(ctx: &'a Context, states: &[Tensor<'a>], query: Tensor<'a>, eps: f32) -> Tensor<'a> {
+    mix_with(ctx, states, query, eps, true)
+}
+
+/// The most tokens [`mix`]'s register kernel takes: small steps (its registers would cost a
+/// prompt step's blocks occupancy).
+pub const MIX_REG_TOKENS: i64 = 32;
+/// The widest rows [`mix`]'s register kernel takes: 9 elements a thread of 256.
+pub const MIX_REG_MAX: i64 = 2304;
+
+/// Whether `t` is a leaf with data of its own (no view): in Inkling-2's graphs, a weight the
+/// ops below only read, never a cache or a state, so their kernels read it before waiting for
+/// the kernel ahead (#1221 r6). A computed or viewed tensor waits.
+fn weight(t: Tensor<'_>) -> bool {
+    // SAFETY: a tensor of a live context.
+    unsafe {
+        let r = &*t.raw();
+        r.op == ffi::ggml_op_GGML_OP_NONE && r.view_src.is_null()
+    }
+}
+
+/// [`mix`], with `reg` false keeping CUDA on the kernel of prompt steps (the tests' reference).
+pub(super) fn mix_with<'a>(
+    ctx: &'a Context,
+    states: &[Tensor<'a>],
+    query: Tensor<'a>,
+    eps: f32,
+    reg: bool,
+) -> Tensor<'a> {
     assert!(
         !states.is_empty() && states.len() <= MAX_STATES,
         "ink_mix: {} states",
@@ -72,7 +107,36 @@ pub fn mix<'a>(ctx: &'a Context, states: &[Tensor<'a>], query: Tensor<'a>, eps: 
         types::F32,
         [e, n, nq, 1],
         &args,
-        &[states.len() as i32, eps.to_bits() as i32],
+        &[
+            states.len() as i32,
+            eps.to_bits() as i32,
+            i32::from(weight(query)),
+            i32::from(reg),
+        ],
+    )
+}
+
+/// The widest rows [`rms`] takes as its own op; wider ones are `glm_rms_norm`.
+pub const RMS_MAX: i64 = 4096;
+
+/// RMS norm over dim 0 of `x` (F32, contiguous), times the weight `w` (F32 `[ne0]`) if given:
+/// `glm_rms_norm`'s ([`glm_ops::rms_norm`]) math and, on CUDA, its sums in its order (the same
+/// bits), with a thread's elements loaded at once and a weight read before the kernel ahead
+/// completes (#1221 r6). Rows wider than [`RMS_MAX`] are `glm_rms_norm` nodes.
+pub fn rms<'a>(ctx: &'a Context, x: Tensor<'a>, w: Option<Tensor<'a>>, eps: f32) -> Tensor<'a> {
+    if x.ne()[0] > RMS_MAX {
+        return glm_ops::rms_norm(ctx, x, w, eps);
+    }
+    let x = contiguous(x);
+    let early = w.is_some_and(weight);
+    let mut args = vec![x];
+    args.extend(w.map(contiguous));
+    ctx.external_with(
+        &RMS,
+        types::F32,
+        x.ne(),
+        &args,
+        &[eps.to_bits() as i32, i32::from(early)],
     )
 }
 
