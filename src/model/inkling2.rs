@@ -71,6 +71,45 @@ fn forced_route() -> Option<Vec<i32>> {
     FORCED_ROUTE.with(|r| r.borrow().clone())
 }
 
+/// [`experts_flags`]: the NVFP4 down projection's decode mv takes whole row tiles into L2
+/// ([`nvfp4_mm::mul_mat_id_with`]'s `tile`).
+const EXPERTS_TILE: u32 = 1;
+/// [`experts_flags`]: the NVFP4 down projection reads the gate and up rows' plan of the pairs
+/// and starts while SITU ends ([`nvfp4_mm::mul_mat_id_with`]'s `plan_of`).
+const EXPERTS_PLAN: u32 = 2;
+/// [`experts_flags`]: SITU stores an NVFP4 down projection's input as BF16 ([`ops::situ`]).
+const EXPERTS_BF16_ACT: u32 = 4;
+/// [`experts_flags`]: [`EXPERTS_TILE`] for the gate and up rows.
+const EXPERTS_TILE_GU: u32 = 8;
+/// [`experts_flags`] by default: the shared plan and the BF16 SITU. On a DGX Spark (GB10) the
+/// tile prefetches gained nothing on Inkling-2-Mini (the down's cost 0.3-0.4 tok/s at decode).
+const EXPERTS_DEFAULT: u32 = EXPERTS_PLAN | EXPERTS_BF16_ACT;
+
+/// How the routed NVFP4 experts run (#1221 r7), all the same bits: [`EXPERTS_TILE`],
+/// [`EXPERTS_PLAN`], [`EXPERTS_BF16_ACT`] and [`EXPERTS_TILE_GU`]; [`EXPERTS_DEFAULT`] unless
+/// `LEGION_DEBUG_INK_EXPERTS=<mask>` takes others for A/B runs (0: as round 6).
+fn experts_flags() -> u32 {
+    static FLAGS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *FLAGS.get_or_init(|| {
+        let env = std::env::var("LEGION_DEBUG_INK_EXPERTS").ok();
+        experts_flags_of(env.as_deref())
+    })
+}
+
+/// Whether `Model::ink_mm_set` takes BF16 weights (#1221 r7): unless
+/// `LEGION_DEBUG_INK_BF16_SET=0` (A/B runs: a node a product, as round 6).
+fn bf16_set() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LEGION_DEBUG_INK_BF16_SET").map_or(true, |v| v.trim() != "0"))
+}
+
+/// [`experts_flags`] given the environment's value.
+pub(crate) fn experts_flags_of(env: Option<&str>) -> u32 {
+    const ALL: u32 = EXPERTS_TILE | EXPERTS_PLAN | EXPERTS_BF16_ACT | EXPERTS_TILE_GU;
+    env.and_then(|v| v.trim().parse::<u32>().ok())
+        .map_or(EXPERTS_DEFAULT, |v| v & ALL)
+}
+
 /// The GGUF architecture name (llama.cpp's).
 pub const ARCH: &str = "inkling2_loop";
 /// The earlier GGUF layout's architecture name.
@@ -571,8 +610,10 @@ impl Model {
 
     /// [`Self::ink_mm_b`] of block `ip`'s weights `names`, all of `x`: one glm_linear_set node
     /// ([`glm_ops::linear_set`], linear_mv_q8's sums row by row: the same bits) where it takes
-    /// them, Q8_0 weights without a scale over up to 8 tokens (decode steps), unless `own`
-    /// (traced runs keep a node a product); else a node each (#1221 r6).
+    /// them, Q8_0 weights without a scale over up to 8 tokens (decode steps; #1221 r6) or BF16
+    /// ones (the NVFP4 checkpoint's) at one token on the GB10 kernels (linear_mv_bf16's sums,
+    /// [`glm_ops::linear_set_bf16_takes`]; r7), unless `own` (traced runs keep a node a
+    /// product); else a node each.
     fn ink_mm_set<'a, const N: usize>(
         &'a self,
         ctx: &'a Context,
@@ -591,7 +632,8 @@ impl Model {
             && (2..=glm_ops::SET_MAX).contains(&N)
             && x.ty() == types::F32
             && x.is_contiguous()
-            && glm_ops::linear_set_takes(&ws, n)
+            && (glm_ops::linear_set_takes(&ws, n)
+                || (bf16_set() && glm_ops::linear_set_bf16_takes(&ws, n)))
             && names.iter().all(|name| {
                 name.strip_suffix(".weight")
                     .is_some_and(|b| self.w(&format!("blk.{ip}.{b}.scale")).is_err())
@@ -1185,17 +1227,32 @@ impl Model {
         let w = glm_ops::router_w(ctx, logits, ids, true, p.weights_scale);
         tap.tap("ffn_moe_weights", il, w);
         let x = ctx.reshape_3d(h, hp.n_embd, 1, n);
-        let gu = self.ink_experts(ctx, ip, "ffn_gate_up_exps", x, ids)?;
+        let gu = self.ink_experts(ctx, ip, "ffn_gate_up_exps", x, ids, None)?;
         tap.tap("ffn_moe_gate_up", il, gu);
-        let a = ops::situ(ctx, gu, p.situ_beta, p.situ_lb);
-        tap.tap("ffn_moe_act", il, a);
-        let y = self.ink_experts(ctx, ip, "ffn_down_exps", a, ids)?;
+        // An NVFP4 down projection rounds its input to BF16: SITU stores it so (the same
+        // bits, one cast kernel less).
+        let flags = experts_flags();
+        let bf16 = flags & EXPERTS_BF16_ACT != 0
+            && self
+                .w(&format!("blk.{ip}.ffn_down_exps.weight"))
+                .is_ok_and(|w| w.ty() == types::NVFP4);
+        let a = ops::situ(ctx, gu, p.situ_beta, p.situ_lb, bf16);
+        // Traced as F32, as before.
+        if bf16 && tap.on {
+            tap.tap("ffn_moe_act", il, ctx.cast(a, types::F32));
+        } else {
+            tap.tap("ffn_moe_act", il, a);
+        }
+        let y = self.ink_experts(ctx, ip, "ffn_down_exps", a, ids, Some(gu))?;
         tap.tap("ffn_moe_down", il, y);
         Ok(glm_ops::weighted_sum(ctx, y, w))
     }
 
     /// `mul_mat_id` of block `ip`'s expert stack `base` (NVFP4, or what [`ops::mm_id`] takes)
-    /// over `x` (F32 `[k, 1 or n_used, n]`) for the choices `ids`: F32 `[m, n_used, n]`.
+    /// over `x` (F32 `[k, 1 or n_used, n]`, or BF16 for NVFP4) for the choices `ids`: F32
+    /// `[m, n_used, n]`. `gate_up`: the down projection's, the gate and up rows of the same
+    /// routing it follows. NVFP4 experts take [`nvfp4_mm::mul_mat_id_with`] as
+    /// [`experts_flags`] says, the down projection with `plan_of` those rows.
     fn ink_experts<'a>(
         &'a self,
         ctx: &'a Context,
@@ -1203,6 +1260,7 @@ impl Model {
         base: &str,
         x: Tensor<'a>,
         ids: Tensor<'a>,
+        gate_up: Option<Tensor<'a>>,
     ) -> Result<Tensor<'a>, ModelError> {
         let name = format!("blk.{ip}.{base}.weight");
         let w = self.w(&name)?;
@@ -1216,7 +1274,15 @@ impl Model {
                     w.ne()
                 )));
             }
-            return Ok(nvfp4_mm::mul_mat_id(ctx, w, x, ids, scale));
+            let flags = experts_flags();
+            let tile = match gate_up {
+                Some(_) => flags & EXPERTS_TILE != 0,
+                None => flags & EXPERTS_TILE_GU != 0,
+            };
+            let plan_of = gate_up.filter(|_| flags & EXPERTS_PLAN != 0);
+            return Ok(nvfp4_mm::mul_mat_id_with(
+                ctx, w, x, ids, scale, tile, plan_of,
+            ));
         }
         if !ops::mm_id_takes(w, scale) {
             return Err(ModelError::Unsupported(format!(

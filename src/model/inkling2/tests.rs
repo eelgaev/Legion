@@ -1882,7 +1882,7 @@ fn kv_keeps_the_bits(b: &mut Backend) {
                 let heads = kvw / d;
                 let width = base + 2 * kvw + 16;
                 let scale = 1.0 / ((if dynamic { 2 * k } else { k } + 1) as f32).sqrt();
-                let ctx = Context::new(48, 48);
+                let ctx = Context::new(64, 64);
                 let kp = ctx.new_tensor(types::F32, &[kvw, n]).as_input();
                 let vp = ctx.new_tensor(types::F32, &[kvw, n]).as_input();
                 let kw = ctx.new_tensor(types::F32, &[k, kvw]).as_input();
@@ -2099,9 +2099,9 @@ fn cuda_clip2_keeps_the_bits() {
 
 /// `Model::ink_mm_set`'s one glm_linear_set node (`glm_ops::linear_set`) for the products of
 /// one input against the node a product it replaces (`glm_ops::linear_h`, what `glm_mm`
-/// builds for Q8_0 weights): Q, the relative weights and the gate, then K and V, at Inkling-2's
-/// shapes and a small one, over the token counts it takes.
-fn linear_set_keeps_the_bits(b: &mut Backend) {
+/// builds for Q8_0 and BF16 weights): Q, the relative weights and the gate, then K and V, at
+/// Inkling-2's shapes and a small one, `ty` weights over the token counts `toks`.
+fn linear_set_keeps_the_bits(b: &mut Backend, ty: crate::ggml::ffi::ggml_type, toks: &[i64]) {
     use crate::ggml::ComputeAllocator;
     let mut s = 0x2545_f491_4f6c_dd1du64;
     let mut vals = move |n: usize, amp: f32| -> Vec<f32> {
@@ -2121,12 +2121,12 @@ fn linear_set_keeps_the_bits(b: &mut Backend) {
         (64, &[8, 36, 4]),
     ];
     for (k, ms) in shapes {
-        for n in [1i64, 2, 3, 5, 8] {
+        for &n in toks {
             let ctx = Context::new(32, 32);
             let x = ctx.new_tensor(types::F32, &[k, n]).as_input();
             let ws: Vec<_> = ms
                 .iter()
-                .map(|&m| ctx.new_tensor(types::Q8_0, &[k, m]).as_input())
+                .map(|&m| ctx.new_tensor(ty, &[k, m]).as_input())
                 .collect();
             let old: Vec<_> = ws
                 .iter()
@@ -2146,7 +2146,15 @@ fn linear_set_keeps_the_bits(b: &mut Backend) {
             x.set_f32(&vals((k * n) as usize, 3.0));
             for (&w, &m) in ws.iter().zip(ms) {
                 let v = vals((k * m) as usize, 0.5);
-                w.set_bytes(&crate::ggml::quantize(types::Q8_0, &v, k as usize));
+                if ty == types::BF16 {
+                    let raw: Vec<u8> = v
+                        .iter()
+                        .flat_map(|&f| glm_ops::to_bf16(f).to_le_bytes())
+                        .collect();
+                    w.set_bytes(&raw);
+                } else {
+                    w.set_bytes(&crate::ggml::quantize(ty, &v, k as usize));
+                }
             }
             b.compute(&graph).unwrap();
             for (j, &m) in ms.iter().enumerate() {
@@ -2166,7 +2174,8 @@ fn linear_set_keeps_the_bits(b: &mut Backend) {
 /// [`linear_set_keeps_the_bits`] on the CPU references.
 #[test]
 fn linear_set_keeps_the_cpu_bits() {
-    linear_set_keeps_the_bits(&mut backend());
+    linear_set_keeps_the_bits(&mut backend(), types::Q8_0, &[1, 2, 3, 5, 8]);
+    linear_set_keeps_the_bits(&mut backend(), types::BF16, &[1]);
 }
 
 /// [`linear_set_keeps_the_bits`] on the GPU: `linear_set_q8` against `linear_mv_q8`.
@@ -2174,5 +2183,170 @@ fn linear_set_keeps_the_cpu_bits() {
 #[test]
 #[ignore = "needs a GPU"]
 fn cuda_linear_set_keeps_the_bits() {
-    linear_set_keeps_the_bits(&mut gpu_backend());
+    linear_set_keeps_the_bits(&mut gpu_backend(), types::Q8_0, &[1, 2, 3, 5, 8]);
+}
+
+/// [`linear_set_keeps_the_bits`] on the GPU for BF16 weights at one token (#1221 r7):
+/// `linear_set_bf16` against `linear_mv_bf16` (the GB10 kernels' BF16 GEMV, which
+/// `glm_ops::linear_set_bf16_takes` requires).
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_linear_set_bf16_keeps_the_bits() {
+    glm_ops::set_gb10_linear(true);
+    linear_set_keeps_the_bits(&mut gpu_backend(), types::BF16, &[1]);
+}
+
+/// #1221 r7: the routed NVFP4 experts as `Model::ink_moe` builds them by default (gate and up
+/// rows with whole row tiles prefetched, SITU stored as BF16, the down projection on the gate
+/// and up rows' plan) against round 6's chain (`nvfp4_mm::mul_mat_id`, F32 SITU, its cast),
+/// over the token counts of decode and verify steps (one past the plan's share too), each
+/// routing over all experts and over a few (more tokens per expert tile): the same bits of the
+/// gate and up rows, the activations and the down rows. `shapes`: `(k, f, n_expert, n_used)`,
+/// `k` the model's width and `f` the experts' (the gate and up rows `2f`).
+fn experts_keep_the_bits(b: &mut Backend, shapes: &[(i64, i64, i64, i64)], toks: &[i64]) {
+    use crate::ggml::ComputeAllocator;
+    let mut s = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    // NVFP4 blocks: 4 E4M3 scales of 2^-4 to 2^1, then 32 bytes of codes.
+    let mut weights = |bytes: usize| -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes);
+        while out.len() < bytes {
+            let r = next();
+            for i in 0..4 {
+                out.push((((3 + (r >> (8 * i)) % 6) << 3) | (r >> (32 + 3 * i)) & 7) as u8);
+            }
+            for _ in 0..4 {
+                out.extend(next().to_le_bytes());
+            }
+        }
+        out.truncate(bytes);
+        out
+    };
+    let mut r = 0x2545_f491_4f6c_dd1du64;
+    let mut rand = move || {
+        r ^= r << 13;
+        r ^= r >> 7;
+        r ^= r << 17;
+        r
+    };
+    let mut bad = Vec::new();
+    for &(k, f, n_expert, n_used) in shapes {
+        // The weights in the backend's memory first (`nvfp4_mm::supports` asks where they are).
+        let held = Context::new(4, 0);
+        let wgu = held.new_tensor(types::NVFP4, &[k, 2 * f, n_expert]);
+        let wd = held.new_tensor(types::NVFP4, &[f, k, n_expert]);
+        let sgu = held.new_tensor(types::F32, &[n_expert]);
+        let sd = held.new_tensor(types::F32, &[n_expert]);
+        held.alloc_tensors(b.buffer_type()).unwrap();
+        wgu.set_bytes(&weights(wgu.nbytes()));
+        wd.set_bytes(&weights(wd.nbytes()));
+        let scales = |rand: &mut dyn FnMut() -> u64| -> Vec<f32> {
+            (0..n_expert)
+                .map(|_| (1 + rand() % 4) as f32 / 128.0)
+                .collect()
+        };
+        sgu.set_f32(&scales(&mut rand));
+        sd.set_f32(&scales(&mut rand));
+        for &n in toks {
+            for pool in [n_expert, 2 * n_used] {
+                let ctx = Context::new(64, 64);
+                let x = ctx.new_tensor(types::F32, &[k, 1, n]).as_input();
+                let ids = ctx.new_tensor(types::I32, &[n_used, n]).as_input();
+                let (beta, lb) = (tiny::SITU_BETA, tiny::SITU_LB);
+                let gu0 = nvfp4_mm::mul_mat_id(&ctx, wgu, x, ids, Some(sgu));
+                let a0 = ops::situ(&ctx, gu0, beta, lb, false);
+                let y0 = nvfp4_mm::mul_mat_id(&ctx, wd, a0, ids, Some(sd));
+                let gu1 = nvfp4_mm::mul_mat_id_with(&ctx, wgu, x, ids, Some(sgu), true, None);
+                let a1 = ops::situ(&ctx, gu1, beta, lb, true);
+                let y1 = nvfp4_mm::mul_mat_id_with(&ctx, wd, a1, ids, Some(sd), true, Some(gu1));
+                let pairs = [
+                    ("gate and up", 2 * f, gu0, gu1),
+                    (
+                        "SITU",
+                        f,
+                        ctx.cast(ctx.cast(a0, types::BF16), types::F32),
+                        ctx.cast(a1, types::F32),
+                    ),
+                    ("down", k, y0, y1),
+                ]
+                .map(|(what, d, p, q)| (what, d, ctx.cont(p).as_output(), ctx.cont(q).as_output()));
+                let mut graph = ctx.new_graph(64);
+                for &(_, _, p, q) in &pairs {
+                    graph.expand(p);
+                    graph.expand(q);
+                }
+                ctx.alloc_graph(&graph, ComputeAllocator::new(b.buffer_type()))
+                    .unwrap();
+                let xs: Vec<f32> = (0..k * n)
+                    .map(|_| ((rand() >> 40) as f32 / (1u64 << 23) as f32 - 1.0) * 3.0)
+                    .collect();
+                x.set_f32(&xs);
+                // Each token's `n_used` distinct experts of the first `pool`.
+                let mut route = Vec::new();
+                for _ in 0..n {
+                    let mut chosen: Vec<i32> = Vec::new();
+                    while chosen.len() < n_used as usize {
+                        let e = (rand() % pool as u64) as i32;
+                        if !chosen.contains(&e) {
+                            chosen.push(e);
+                        }
+                    }
+                    route.extend(chosen);
+                }
+                ids.set_i32(&route);
+                b.compute(&graph).unwrap();
+                for (what, d, p, q) in pairs {
+                    let (p, q) = (p.to_f32(), q.to_f32());
+                    assert!(q.iter().any(|&v| v != 0.0), "experts {what}: an output");
+                    let what = format!(
+                        "experts {what}, k {k} f {f}, {n_used} of {n_expert} (pool {pool}), {n} tokens"
+                    );
+                    if let Some(line) = first_diff(&what, &p, &q, d as usize) {
+                        eprintln!("first mismatch: {line}");
+                        bad.push(line);
+                    }
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "\n{}", bad.join("\n"));
+}
+
+/// [`experts_keep_the_bits`] on the CPU references, at small shapes.
+#[test]
+fn experts_keep_the_cpu_bits() {
+    let shapes = [(128, 64, 8, 2), (256, 192, 6, 3)];
+    experts_keep_the_bits(&mut backend(), &shapes, &[1, 2, 5, 8]);
+}
+
+/// `LEGION_DEBUG_INK_EXPERTS`: a mask of the four, all of them unset or unparsed.
+#[test]
+fn experts_flags_take_a_mask() {
+    assert_eq!(experts_flags_of(None), EXPERTS_PLAN | EXPERTS_BF16_ACT);
+    assert_eq!(experts_flags_of(Some("x")), EXPERTS_PLAN | EXPERTS_BF16_ACT);
+    assert_eq!(experts_flags_of(Some("15")), 15);
+    assert_eq!(experts_flags_of(Some("0")), 0);
+    assert_eq!(experts_flags_of(Some(" 3 ")), EXPERTS_TILE | EXPERTS_PLAN);
+    assert_eq!(experts_flags_of(Some("20")), EXPERTS_BF16_ACT);
+    assert_eq!(experts_flags_of(Some("8")), EXPERTS_TILE_GU);
+}
+
+/// [`experts_keep_the_bits`] on the GPU at Inkling-2-Mini's shapes (2,304 wide, 1,152 per
+/// expert, 8 of 128) and a small one: `nvfp4_mvs` with whole row tiles prefetched and on the
+/// shared plan against the plain grouped mv, and SITU's BF16 store against ggml's cast.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_experts_keep_the_bits() {
+    experts_keep_the_bits(
+        &mut gpu_backend(),
+        &[(2304, 1152, 128, 8), (256, 192, 6, 3)],
+        &[1, 2, 3, 5, 8, 16, 65],
+    );
 }
