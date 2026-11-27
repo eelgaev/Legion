@@ -96,9 +96,12 @@ pub const RMS_MAX: i64 = 4096;
 /// RMS norm over dim 0 of `x` (F32, contiguous), times the weight `w` (F32 `[ne0]`) if given:
 /// `glm_rms_norm`'s ([`glm_ops::rms_norm`]) math and, on CUDA, its sums in its order (the same
 /// bits), with a thread's elements loaded at once and a weight read before the kernel ahead
-/// completes (#1221 r6). Rows wider than [`RMS_MAX`] are `glm_rms_norm` nodes.
+/// completes (#1221 r6). Rows wider than [`RMS_MAX`], and rows or a weight of another type or
+/// width, are `glm_rms_norm` nodes.
 pub fn rms<'a>(ctx: &'a Context, x: Tensor<'a>, w: Option<Tensor<'a>>, eps: f32) -> Tensor<'a> {
-    if x.ne()[0] > RMS_MAX {
+    let row = x.ne()[0];
+    let odd_w = w.is_some_and(|w| w.ty() != types::F32 || w.ne() != [row, 1, 1, 1]);
+    if row > RMS_MAX || row <= 0 || x.ty() != types::F32 || odd_w {
         return glm_ops::rms_norm(ctx, x, w, eps);
     }
     let x = contiguous(x);
@@ -179,9 +182,11 @@ pub fn ctrl_gate<'a>(
     forget: Tensor<'a>,
 ) -> Tensor<'a> {
     let (cur, msg, d) = (contiguous(cur), contiguous(msg), contiguous(d));
-    let [e, n, _, _] = cur.ne();
-    assert_eq!(msg.ne()[..2], [e, n], "ink_ctrl_gate: shapes");
-    assert_eq!(d.ne()[1], n, "ink_ctrl_gate: tokens");
+    let [e, n, n2, n3] = cur.ne();
+    // The callbacks walk `ne[1]` tokens of one plane.
+    assert_eq!([n2, n3], [1, 1], "ink_ctrl_gate: two-dimensional rows");
+    assert_eq!(msg.ne(), [e, n, 1, 1], "ink_ctrl_gate: shapes");
+    assert_eq!(d.ne()[1..], [n, 1, 1], "ink_ctrl_gate: tokens");
     for w in [gain, forget] {
         assert_eq!(w.ne()[..2], [d.ne()[0], e], "ink_ctrl_gate: weights");
     }

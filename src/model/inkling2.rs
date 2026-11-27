@@ -696,7 +696,8 @@ impl Model {
                 .is_some_and(|b| self.w(&format!("{b}.scale")).is_err())
         });
         if let (true, Ok(gw), Ok(fw)) = (unscaled, self.w(&names[0]), self.w(&names[1]))
-            && ops::ctrl_gate_takes(gw, fw, cur.ne()[1..].iter().product())
+            && cur.ne()[2..] == [1, 1]
+            && ops::ctrl_gate_takes(gw, fw, cur.ne()[1])
         {
             return Ok(ops::ctrl_gate(ctx, cur, msg, g, gw, fw));
         }
