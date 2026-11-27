@@ -160,23 +160,58 @@ fn combine16_off() -> bool {
 
 /// Whether [`combine16`] takes these operands: `out` F32 `[e, n]`, `res16` BF16 `[e, hc, n]`,
 /// `inject` F32 `[hc, n]` (a view is fine: the op only reads it), rows contiguous.
+/// Logs each outcome once (built, or the first failed condition), with the operands' shapes.
 pub(super) fn combine16_fits(
     out: Tensor<'_>,
     res16: Tensor<'_>,
     inject: Tensor<'_>,
     on_gpu: bool,
 ) -> bool {
+    let why = combine16_why(out, res16, inject, on_gpu);
+    static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
+    let key = why.err().unwrap_or("built");
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&key) {
+        seen.push(key);
+        let shape = |t: Tensor<'_>| format!("{:?} {:?} nb {:?}", t.ty(), t.ne(), t.nb());
+        tracing::info!(
+            out = shape(out),
+            streams = shape(res16),
+            inject = shape(inject),
+            "combine of BF16 streams (hc_combine16, each outcome logged once): {key}"
+        );
+    }
+    why.is_ok()
+}
+
+/// [`combine16_fits`]'s conditions, the first one that fails.
+fn combine16_why(
+    out: Tensor<'_>,
+    res16: Tensor<'_>,
+    inject: Tensor<'_>,
+    on_gpu: bool,
+) -> Result<(), &'static str> {
     let [e, hc, n, one] = res16.ne();
     let f32_rows = |t: Tensor<'_>| t.ty() == types::F32 && t.nb()[0] == 4;
-    gpu(on_gpu)
-        && !combine16_off()
-        && one == 1
-        && res16.ty() == types::BF16
-        && res16.nb()[0] == 2
-        && out.ne() == [e, n, 1, 1]
-        && inject.ne() == [hc, n, 1, 1]
-        && f32_rows(out)
-        && f32_rows(inject)
+    if !on() {
+        return Err("not built: --hc-chain-ggml");
+    }
+    if !cfg!(feature = "cuda") || !on_gpu {
+        return Err("not built: the stage's mixers are not on one GPU");
+    }
+    if combine16_off() {
+        return Err("not built: LEGION_DEBUG_HC_COMBINE16=0");
+    }
+    if res16.ty() != types::BF16 || res16.nb()[0] != 2 || one != 1 {
+        return Err("not built: the streams are not BF16 rows [e, hc, n]");
+    }
+    if out.ne() != [e, n, 1, 1] || !f32_rows(out) {
+        return Err("not built: the block output is not F32 rows [e, n]");
+    }
+    if inject.ne() != [hc, n, 1, 1] || !f32_rows(inject) {
+        return Err("not built: the inject weights are not F32 rows [hc, n]");
+    }
+    Ok(())
 }
 
 /// `hc_post(out, cast(res16, F32), scale(sigmoid(scale(inject, 1/hc)), 2))`, ggml's combine of
