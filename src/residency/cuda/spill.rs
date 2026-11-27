@@ -21,6 +21,8 @@ struct SpillType {
     gran: usize,
     /// VRAM its buffers leave free.
     keep: usize,
+    /// A lent step's buffers instead ([`lent_type`]): the lent slots' VRAM, then new VRAM.
+    lent: bool,
     name: CString,
     buft: ffi::ggml_backend_buffer_type,
     /// The CUDA device with this buffer type in its place ([`spill_devices`]).
@@ -38,13 +40,24 @@ struct SpillBuffer {
     host: CUmemGenericAllocationHandle,
     host_bytes: usize,
     mapped: (bool, bool),
+    /// A lent step's buffer ([`lent_type`]): its allocations, mapped back to back from `va`
+    /// as far as `lent_mapped`.
+    lent: Vec<(CUmemGenericAllocationHandle, usize)>,
+    lent_mapped: usize,
 }
 
 impl SpillBuffer {
-    /// Unmaps and releases what was mapped and created, then the range.
+    /// Unmaps and releases what was mapped and created, then the range; a lent step buffer's
+    /// allocations go back to the lent slots' pool ([`super::lent_pool::give_back`]).
     fn release(&self) {
         // SAFETY: only what this buffer created, mapped and reserved.
         unsafe {
+            if self.lent_mapped > 0 {
+                cuMemUnmap(self.va, self.lent_mapped);
+            }
+            if !self.lent.is_empty() {
+                super::lent_pool::give_back(self.device, self.lent.clone());
+            }
             if self.mapped.0 {
                 cuMemUnmap(self.va, self.vram_bytes);
             }
@@ -120,7 +133,78 @@ unsafe extern "C" fn spill_alloc(
     }
 }
 
+/// A lent step's buffer of `size` bytes ([`lent_type`]): the lent slots' allocations waiting
+/// in the pool as far as they go, then one new allocation for the rest, mapped back to back.
+fn lent_map(t: &SpillType, size: usize) -> Result<Box<SpillBuffer>, String> {
+    // ggml-cuda's own buffers are whole granules of the device too.
+    let gran = granularity(CU_MEM_LOCATION_TYPE_DEVICE, t.device as i32).max(1);
+    let total = round_up(size.max(1), gran);
+    let mut b = Box::new(SpillBuffer {
+        device: t.device,
+        va: 0,
+        size: total,
+        vram: 0,
+        vram_bytes: 0,
+        host: 0,
+        host_bytes: 0,
+        mapped: (false, false),
+        lent: super::lent_pool::take_upto(t.device, total),
+        lent_mapped: 0,
+    });
+    let t0 = std::time::Instant::now();
+    let pooled: usize = b.lent.iter().map(|p| p.1).sum();
+    // SAFETY: reserves, creates and maps within the new range; on failure releases it.
+    let r = unsafe {
+        (|| -> Result<(), String> {
+            use_device(t.device)?;
+            if pooled < total {
+                let rest = total - pooled;
+                let prop = alloc_prop(CU_MEM_LOCATION_TYPE_DEVICE, t.device as i32);
+                let mut h = 0;
+                cu(
+                    super::lent_pool::create(t.device, &mut h, rest, &prop),
+                    "cuMemCreate(lent step buffer)",
+                )?;
+                b.lent.push((h, rest));
+            }
+            cu(
+                cuMemAddressReserve(&mut b.va, total, gran, 0, 0),
+                "cuMemAddressReserve",
+            )?;
+            for i in 0..b.lent.len() {
+                let (h, n) = b.lent[i];
+                cu(
+                    cuMemMap(b.va + b.lent_mapped as u64, n, 0, h, 0),
+                    "cuMemMap(lent step buffer)",
+                )?;
+                b.lent_mapped += n;
+            }
+            let a = access(CU_MEM_LOCATION_TYPE_DEVICE, t.device as i32);
+            cu(
+                cuMemSetAccess(b.va, total, &a, 1),
+                "cuMemSetAccess(lent step buffer)",
+            )
+        })()
+    };
+    tracing::debug!(
+        device = t.device,
+        mib = total >> 20,
+        lent_mib = pooled >> 20,
+        parts = b.lent.len(),
+        us = t0.elapsed().as_micros() as u64,
+        "lent step buffer allocation"
+    );
+    if let Err(e) = r {
+        b.release();
+        return Err(e);
+    }
+    Ok(b)
+}
+
 fn spill_map(t: &SpillType, size: usize) -> Result<Box<SpillBuffer>, String> {
+    if t.lent {
+        return lent_map(t, size);
+    }
     let free = free_vram(t.device)?;
     let total = round_up(size.max(1), t.gran);
     let vram_bytes = vram_part(total, free, t.keep, t.gran);
@@ -133,6 +217,8 @@ fn spill_map(t: &SpillType, size: usize) -> Result<Box<SpillBuffer>, String> {
         host: 0,
         host_bytes: total - vram_bytes,
         mapped: (false, false),
+        lent: Vec::new(),
+        lent_mapped: 0,
     });
     // Where a step buffer's allocation time goes (debug level): VRAM part made, host part
     // made, access set.
@@ -147,9 +233,10 @@ fn spill_map(t: &SpillType, size: usize) -> Result<Box<SpillBuffer>, String> {
                 "cuMemAddressReserve",
             )?;
             if b.vram_bytes > 0 {
+                // Free VRAM counts the lent slots' waiting in the pool: theirs first.
                 let prop = alloc_prop(CU_MEM_LOCATION_TYPE_DEVICE, t.device as i32);
                 cu(
-                    cuMemCreate(&mut b.vram, b.vram_bytes, &prop, 0),
+                    super::lent_pool::create(t.device, &mut b.vram, b.vram_bytes, &prop),
                     "cuMemCreate(spill VRAM)",
                 )?;
                 cu(
@@ -414,10 +501,34 @@ unsafe extern "C" fn spill_dev_buffer_type(
 
 /// The registered spill type of `device` keeping `keep` free, made on first use.
 fn registered(device: usize, keep: usize) -> Option<&'static mut SpillType> {
+    registered_as(device, keep, false)
+}
+
+/// A buffer type for `device`'s step compute buffers while the expert cache is lent (#37):
+/// the lent slots' VRAM waiting in their pool, mapped again for the step (no release of it,
+/// no new allocation the driver clears first), then new VRAM for the rest. Freed, the
+/// allocations go back to the pool for the restore. `None` when the hand-over is off
+/// (`LEGION_DEBUG_LEND_HANDOFF=0`) or nothing was lent to the pool.
+pub fn lent_type(device: usize) -> Option<BufferType> {
+    if !super::lent_pool::is_open(device) {
+        return None;
+    }
+    registered_as(device, SPILL_KEEPS_FREE, true).map(|t| BufferType(NonNull::from(&mut t.buft)))
+}
+
+/// Whether `buft` is a [`lent_type`].
+pub fn is_lent_type(buft: BufferType) -> bool {
+    let list = SPILLS.0.lock().unwrap();
+    list.iter()
+        .any(|t| t.lent && std::ptr::eq(&t.buft, buft.0.as_ptr()))
+}
+
+/// [`registered`], or the lent step buffers' type of the device (`lent`).
+fn registered_as(device: usize, keep: usize, lent: bool) -> Option<&'static mut SpillType> {
     let mut list = SPILLS.0.lock().unwrap();
     if let Some(t) = list
         .iter_mut()
-        .find(|t| t.device == device && t.keep == keep)
+        .find(|t| t.device == device && t.keep == keep && t.lent == lent)
     {
         // SAFETY: registered for the process, never freed; ggml reaches it through raw
         // pointers as before.
@@ -441,7 +552,12 @@ fn registered(device: usize, keep: usize) -> Option<&'static mut SpillType> {
         node,
         gran: dg.max(hg),
         keep,
-        name: CString::new(if keep == SPILL_KEEPS_FREE {
+        lent,
+        // A lent step's graphs are CUDA graphs as in ggml-cuda's own buffers
+        // (`post_alloc`'s passes go by the name).
+        name: CString::new(if lent {
+            format!("CUDA{device}")
+        } else if keep == SPILL_KEEPS_FREE {
             format!("CUDA{device}_Spill")
         } else {
             format!("CUDA{device}_SpillKeep{}M", keep >> 20)

@@ -425,6 +425,52 @@ fn spill_type(_: &Stage) -> Option<BufferType> {
     None
 }
 
+/// The buffer type of `stage`'s step compute buffers while the expert cache is lent: the
+/// lent slots' VRAM mapped again (`residency::cuda::lent_type`, #37), on a CUDA device whose
+/// lend left some for it.
+#[cfg(feature = "cuda")]
+fn lent_type(stage: &Stage) -> Option<BufferType> {
+    let index = stage.backend.name().strip_prefix("CUDA")?.parse().ok()?;
+    crate::residency::cuda::lent_type(index)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn lent_type(_: &Stage) -> Option<BufferType> {
+    None
+}
+
+/// Whether a kept graph's allocator made for `had` may grow for a step allocating in `buft`:
+/// not across a lend's start or end, whose step buffers are the lent slots' VRAM
+/// ([`lent_type`]) and the others not.
+#[cfg(feature = "cuda")]
+fn same_memory(had: BufferType, buft: BufferType) -> bool {
+    use crate::residency::cuda::is_lent_type;
+    had == buft || !(is_lent_type(had) || is_lent_type(buft))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn same_memory(_: BufferType, _: BufferType) -> bool {
+    true
+}
+
+/// Once a lent step's compute buffer is allocated, or when an allocation fails: the lent
+/// slots' VRAM left in their pool (#37) is released, free for the backend's scratch (cuBLAS,
+/// ggml-cuda's pool) and its own buffers as without the hand-over. The bytes released.
+#[cfg(feature = "cuda")]
+fn lent_flush(stage: &Stage) -> usize {
+    stage
+        .backend
+        .name()
+        .strip_prefix("CUDA")
+        .and_then(|n| n.parse().ok())
+        .map_or(0, crate::residency::cuda::lent_pool_flush)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn lent_flush(_: &Stage) -> usize {
+    0
+}
+
 #[cfg(feature = "cuda")]
 fn tier_back(slot: usize, tokens: usize, lent: usize) -> Result<(), String> {
     crate::residency::cuda::tp_tier_back(slot, tokens, lent)
@@ -3890,6 +3936,9 @@ impl Executor {
                     list.push(g);
                 }
             }
+            if self.cache_lent {
+                lent_flush(&self.stages[s]);
+            }
             return Ok(());
         }
         let captured = self.captured(s);
@@ -3984,7 +4033,11 @@ impl Executor {
                 .or_else(|| full.then(oldest_verify).flatten())
                 .map(|i| stage.mixed.remove(i))
         };
-        let buft = stage.backend.buffer_type();
+        // While lent: the lent slots' VRAM where the lend left it for the step (#37).
+        let buft = lent
+            .then(|| lent_type(stage))
+            .flatten()
+            .unwrap_or_else(|| stage.backend.buffer_type());
         let roomy = headroom::roomy(stage.backend.device().kind(), decode);
         let shared = meta.then(|| {
             stage.shared[usize::from(!decode)]
@@ -3997,6 +4050,7 @@ impl Executor {
             Some(_) => None,
             None => Some(
                 old.and_then(|(_, g)| g.into_allocator())
+                    .filter(|a| same_memory(a.base_type(), buft))
                     // The first graph after an expert-cache restore: the buffer kept for it.
                     .or_else(|| {
                         let a = if lent { None } else { stage.spare.take() }?;
@@ -4067,6 +4121,17 @@ impl Executor {
                         }
                     }) {
                         Ok(()) => {}
+                        // Free VRAM counted the lent slots' waiting for the restore (#37): a
+                        // buffer that needs plain free VRAM has it once they are released.
+                        Err(GgmlError::Alloc { .. }) if lent_flush(stage) > 0 => {
+                            tracing::debug!(
+                                stage = s,
+                                "out of memory for a step's compute buffer: the lent slots' \
+                                 VRAM released, allocating again"
+                            );
+                            allocator = Some(headroom::step_allocator(buft, padded, roomy, passes));
+                            continue;
+                        }
                         // The graphs a restore hands its thread may still hold the memory.
                         // Not when even that memory could not make it fit.
                         Err(GgmlError::Alloc { bytes, .. })
@@ -4100,6 +4165,13 @@ impl Executor {
                             if !hopeless && !oldest.is_empty() {
                                 let (_, g) = oldest.remove(0);
                                 if let Some(a) = g.into_allocator() {
+                                    // Its memory is freed for this step's kind of buffer.
+                                    let a = if same_memory(a.base_type(), buft) {
+                                        a
+                                    } else {
+                                        drop(a);
+                                        headroom::step_allocator(buft, padded, roomy, passes)
+                                    };
                                     tracing::debug!(
                                         stage = s,
                                         tokens,
@@ -4160,6 +4232,9 @@ impl Executor {
             break (ctx, parts);
         };
         let after = ctx.allocator_size();
+        if lent {
+            lent_flush(stage);
+        }
         tracing::trace!(
             stage = s,
             shape = ?shape.iter().map(|g| (g.n_seqs, g.n_tok, g.n_kv)).collect::<Vec<_>>(),

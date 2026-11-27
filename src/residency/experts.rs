@@ -4510,6 +4510,8 @@ impl ExpertResidency {
                     for (device, l) in lent.into_inner().unwrap_or_else(|e| e.into_inner()) {
                         l.free(device);
                     }
+                    // The lent slots' VRAM no slot took back (#37).
+                    super::cuda::lent_pool_close();
                     done
                 })
                 .map_err(|e| format!("cannot start the slot thread: {e}"))?;
@@ -5889,6 +5891,10 @@ impl LendWork<'_> {
                     };
                     if stages && !reused {
                         pool.extend(mem);
+                    } else if let Some(mem) = mem {
+                        // Not released (#37): the long step's buffers and the restore after
+                        // it map the same allocations.
+                        super::cuda::lent_pool_put(mem);
                     }
                     Ok::<(), String>(())
                 })
