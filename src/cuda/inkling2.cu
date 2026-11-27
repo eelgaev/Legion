@@ -547,8 +547,18 @@ __device__ __forceinline__ float conv_out(
     return (xv + o) * scale;
 }
 
-// ---- ink_conv: params n_tok, off, has_dyn, scale; sources x [c, ng], w [K, c],
-// state [K - 1, width, n_seqs] (written back), dyn [K * heads, ng]. One thread per (sequence,
+// glm_add's `res + y` for ink_conv's residual (params[4], the source after the dynamic taps),
+// or y: an add of its own, never fused with conv_out's product.
+__device__ __forceinline__ float conv_res(const A & a, bool dyn, int64_t i, float y) {
+    if (a.params[4] == 0) {
+        return y;
+    }
+    return __fadd_rn(((const float *) src(a, dyn ? 4 : 3))[i], y);
+}
+
+// ---- ink_conv: params n_tok, off, has_dyn, scale, has_res; sources x [c, ng], w [K, c],
+// state [K - 1, width, n_seqs] (written back), dyn [K * heads, ng], the residual res [c, ng]
+// added to the output. One thread per (sequence,
 // channel), the window in registers, token after token: a decode step's. ----
 __global__ void conv_kernel(const A a) {
     pdl_wait();
@@ -581,7 +591,7 @@ __global__ void conv_kernel(const A a) {
         const int64_t t  = s * n_tok + i;
         const float   xv = x[t * c + ch];
         const float * dr = dyn ? (const float *) (src(a, 3) + t * a.src_nb[3][1]) + K * hh : nullptr;
-        out[t * c + ch]  = conv_out(tw, win, K, xv, dr, dyn, scale);
+        out[t * c + ch]  = conv_res(a, dyn, t * c + ch, conv_out(tw, win, K, xv, dr, dyn, scale));
 #pragma unroll
         for (int j = 0; j + 1 < CONV_TAPS; j++) {
             if (j + 1 < K) {
@@ -640,7 +650,7 @@ __global__ void conv_prompt_kernel(const A a) {
     const int64_t t  = s * n_tok + i;
     const float   xv = ((const float *) src(a, 0))[t * c + ch];
     const float * dr = dyn ? (const float *) (src(a, 3) + t * a.src_nb[3][1]) + K * hh : nullptr;
-    ((float *) a.dst)[t * c + ch] = conv_out(tw, win, K, xv, dr, dyn, scale);
+    ((float *) a.dst)[t * c + ch] = conv_res(a, dyn, t * c + ch, conv_out(tw, win, K, xv, dr, dyn, scale));
 }
 
 // ---- ink_conv's history after a prompt step: the last K - 1 inputs, as conv_kernel leaves

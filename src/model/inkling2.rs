@@ -718,6 +718,23 @@ impl Model {
         dynamic: Option<Tensor<'a>>,
         off: i64,
     ) -> Result<Tensor<'a>, ModelError> {
+        self.ink_conv_add(pass, il, ip, name, x, dynamic, off, None)
+    }
+
+    /// [`Self::ink_conv`] plus the residual `res` (F32 `[c, n]`) when given: the sum of
+    /// `glm_add(res, conv)` in the conv's own node, one launch fewer (#1221 r6).
+    #[allow(clippy::too_many_arguments)]
+    fn ink_conv_add<'a>(
+        &'a self,
+        pass: &Pass<'a>,
+        il: usize,
+        ip: usize,
+        name: &str,
+        x: Tensor<'a>,
+        dynamic: Option<Tensor<'a>>,
+        off: i64,
+        res: Option<Tensor<'a>>,
+    ) -> Result<Tensor<'a>, ModelError> {
         let ctx = pass.ctx;
         let p = self.ink();
         let w = self.lw(ip, name)?;
@@ -729,7 +746,7 @@ impl Model {
         for (at, sh) in pass.groups() {
             let ng = sh.tokens() as i64;
             let state = pass.rec.ple_slots(ctx, 0, sh.slot, sh.n_seqs);
-            outs.push(ops::conv(
+            outs.push(ops::conv_add(
                 ctx,
                 cols(ctx, x, at, ng),
                 w,
@@ -738,6 +755,7 @@ impl Model {
                 sh.n_tok as i64,
                 base,
                 scale,
+                res.map(|r| cols(ctx, r, at, ng)),
             ));
         }
         Ok(glm_ops::join_cols(ctx, &outs))
@@ -805,11 +823,17 @@ impl Model {
             tap.tap(name, il, x);
         }
 
-        let out = self.ink_attn(pass, il, ip, &inputs)?;
-        tap.tap("attn_out", il, out);
         // A block's first layer starts a new residual; its input joins the depth blocks.
-        let cur = if ip % p.block == 0 {
+        // Otherwise the residual add is the post conv's own, unless a trace wants the
+        // attention's output by itself.
+        let starts = ip % p.block == 0;
+        let fold = !starts && !tap.on;
+        let out = self.ink_attn(pass, il, ip, &inputs, fold.then_some(inp_sa))?;
+        tap.tap("attn_out", il, out);
+        let cur = if starts {
             blocks.push(inp_sa);
+            out
+        } else if fold {
             out
         } else {
             glm_ops::add(ctx, inp_sa, out)
@@ -833,21 +857,27 @@ impl Model {
         let y = self.ink_moe(pass, il, ip, h)?;
         tap.tap("ffn_moe_out", il, y);
         let kvw = hp.head_dim * hp.n_head_kv;
-        let y = self.ink_conv(pass, il, ip, "ffn_post_conv.weight", y, None, 2 * kvw + e)?;
-        tap.tap("ffn_out", il, y);
-        let out = glm_ops::add(ctx, ffn_inp, y);
+        let name = "ffn_post_conv.weight";
+        let out = if tap.on {
+            let y = self.ink_conv(pass, il, ip, name, y, None, 2 * kvw + e)?;
+            tap.tap("ffn_out", il, y);
+            glm_ops::add(ctx, ffn_inp, y)
+        } else {
+            self.ink_conv_add(pass, il, ip, name, y, None, 2 * kvw + e, Some(ffn_inp))?
+        };
         tap.tap("l_out", il, out);
         Ok(out)
     }
 
     /// Slot `il`'s attention (block `ip`) over its Q, K and V inputs (normed, `[n_embd, n]`):
-    /// gated, projected and through the post conv.
+    /// gated, projected and through the post conv, plus the residual `res` when given.
     fn ink_attn<'a>(
         &'a self,
         pass: &Pass<'a>,
         il: usize,
         ip: usize,
         inputs: &[Tensor<'a>; 3],
+        res: Option<Tensor<'a>>,
     ) -> Result<Tensor<'a>, ModelError> {
         let (ctx, tap) = (pass.ctx, &pass.tap);
         let p = self.ink();
@@ -984,7 +1014,7 @@ impl Model {
         tap.tap("attn_gated", il, o);
         let o = self.ink_mm(ctx, ip, "attn_output.weight", o)?;
         tap.tap("attn_proj", il, o);
-        self.ink_conv(pass, il, ip, "attn_post_conv.weight", o, None, 2 * kvw)
+        self.ink_conv_add(pass, il, ip, "attn_post_conv.weight", o, None, 2 * kvw, res)
     }
 
     /// The routed experts of block `ip` over the normed `h` (`[n_embd, n]`).

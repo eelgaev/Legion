@@ -216,6 +216,23 @@ pub fn conv<'a>(
     off: i64,
     scale: f32,
 ) -> Tensor<'a> {
+    conv_add(ctx, x, w, state, dynamic, n_tok, off, scale, None)
+}
+
+/// [`conv`], plus the residual `res` (F32 `[c, ng]`, contiguous) when given: `res + conv(..)`,
+/// the bits of `glm_add(res, conv(..))` in one node (#1221 r6).
+#[allow(clippy::too_many_arguments)]
+pub fn conv_add<'a>(
+    ctx: &'a Context,
+    x: Tensor<'a>,
+    w: Tensor<'a>,
+    state: Tensor<'a>,
+    dynamic: Option<Tensor<'a>>,
+    n_tok: i64,
+    off: i64,
+    scale: f32,
+    res: Option<Tensor<'a>>,
+) -> Tensor<'a> {
     let x = contiguous(x);
     let [c, ng, _, _] = x.ne();
     let k = w.ne()[0];
@@ -242,6 +259,10 @@ pub fn conv<'a>(
         );
         args.push(d);
     }
+    if let Some(r) = res {
+        assert_eq!((r.ty(), r.ne()), (types::F32, x.ne()), "ink_conv: residual");
+        args.push(contiguous(r));
+    }
     ctx.external_with(
         &CONV,
         types::F32,
@@ -252,6 +273,7 @@ pub fn conv<'a>(
             off as i32,
             dynamic.is_some() as i32,
             scale.to_bits() as i32,
+            res.is_some() as i32,
         ],
     )
 }
@@ -662,6 +684,8 @@ unsafe fn cpu_conv(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
         let (n_tok, off, has_dyn, scale) =
             (p[0] as usize, p[1] as usize, p[2] != 0, f32_param(p[3]));
         let dynamic = has_dyn.then(|| &*dst.src[3]);
+        // glm_add's sum with the residual (its `a + b`, `a` the residual)
+        let res = (p[4] != 0).then(|| &*dst.src[3 + has_dyn as usize]);
         let k = w.ne[0] as usize;
         let (c, ng) = (dst.ne[0] as usize, dst.ne[1] as usize);
         let n_seqs = ng / n_tok;
@@ -685,7 +709,11 @@ unsafe fn cpu_conv(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
                         out += dr[lag + k * hh] * xs[i + k - 1 - lag];
                     }
                 }
-                *(dst.data as *mut f32).add(t * c + ch) = (xs[k - 1 + i] + out) * scale;
+                let y = (xs[k - 1 + i] + out) * scale;
+                *(dst.data as *mut f32).add(t * c + ch) = match res {
+                    Some(r) => at::<f32>(r, t * c + ch) + y,
+                    None => y,
+                };
             }
             for j in 0..k - 1 {
                 *hist.add(j) = xs[n_tok + j];

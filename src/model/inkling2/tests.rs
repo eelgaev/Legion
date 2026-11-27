@@ -1757,3 +1757,90 @@ fn rms_keeps_the_cpu_bits() {
 fn cuda_rms_keeps_the_bits() {
     rms_keeps_the_bits(&mut gpu_backend());
 }
+
+/// #1221 r6: `ink_conv` with the residual gives `glm_add(res, ink_conv(..))`'s bits and leaves
+/// the same history, at decode steps (one token, 1-4 sequences) and prompt steps, with and
+/// without dynamic taps.
+fn conv_add_keeps_the_bits(b: &mut Backend) {
+    use crate::ggml::ComputeAllocator;
+    let mut s = 0x9e37_79b9_7f4a_7c15u64;
+    let mut vals = move |n: usize, amp: f32| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 40) as f32 / (1u64 << 23) as f32 - 1.0) * amp
+            })
+            .collect()
+    };
+    let (k, heads, off, scale) = (4i64, 4i64, 32i64, 1.0 / 5f32.sqrt());
+    let mut bad = Vec::new();
+    for c in [2304i64, 96, 200] {
+        for (n_tok, n_seqs) in [(1i64, 1i64), (1, 4), (2, 3), (37, 2)] {
+            for dynamic in [false, true] {
+                let ng = n_tok * n_seqs;
+                let width = c + 2 * off;
+                let ctx = Context::new(32, 32);
+                let x = ctx.new_tensor(types::F32, &[c, ng]).as_input();
+                let w = ctx.new_tensor(types::F32, &[k, c]).as_input();
+                let r = ctx.new_tensor(types::F32, &[c, ng]).as_input();
+                let d = dynamic.then(|| ctx.new_tensor(types::F32, &[k * heads, ng]).as_input());
+                let st = [0, 1].map(|_| {
+                    ctx.new_tensor(types::F32, &[k - 1, width, n_seqs])
+                        .as_input()
+                        .as_output()
+                });
+                let conv = ops::conv(&ctx, x, w, st[0], d, n_tok, off, scale);
+                let old = glm_ops::add(&ctx, r, conv).as_output();
+                let new = ops::conv_add(&ctx, x, w, st[1], d, n_tok, off, scale, Some(r));
+                let new = new.as_output();
+                let mut graph = ctx.new_graph(16);
+                for t in [old, new] {
+                    graph.expand(t);
+                }
+                ctx.alloc_graph(&graph, ComputeAllocator::new(b.buffer_type()))
+                    .unwrap();
+                x.set_f32(&vals((c * ng) as usize, 2.0));
+                w.set_f32(&vals((k * c) as usize, 1.0));
+                r.set_f32(&vals((c * ng) as usize, 4.0));
+                if let Some(d) = d {
+                    d.set_f32(&vals((k * heads * ng) as usize, 1.0));
+                }
+                let hist = vals(((k - 1) * width * n_seqs) as usize, 2.0);
+                for t in st {
+                    t.set_f32(&hist);
+                }
+                b.compute(&graph).unwrap();
+                let (p, q) = (old.to_f32(), new.to_f32());
+                assert!(q.iter().any(|&v| v != 0.0), "ink_conv c {c}: an output");
+                let what = format!("ink_conv c {c}, {n_tok} x {n_seqs} tokens, dynamic {dynamic}");
+                if let Some(line) = first_diff(&what, &p, &q, c as usize) {
+                    eprintln!("first mismatch: {line}");
+                    bad.push(line);
+                }
+                let (h0, h1) = (st[0].to_f32(), st[1].to_f32());
+                if let Some(line) = first_diff(&format!("{what}, history"), &h0, &h1, 3) {
+                    eprintln!("first mismatch: {line}");
+                    bad.push(line);
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "\n{}", bad.join("\n"));
+}
+
+/// [`conv_add_keeps_the_bits`] on the CPU references.
+#[test]
+fn conv_add_keeps_the_cpu_bits() {
+    conv_add_keeps_the_bits(&mut backend());
+}
+
+/// [`conv_add_keeps_the_bits`] on the GPU: `conv_kernel` and `conv_prompt_kernel` with the
+/// residual against them plus glm5next.cu's `add_kernel`.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_conv_add_keeps_the_bits() {
+    conv_add_keeps_the_bits(&mut gpu_backend());
+}
