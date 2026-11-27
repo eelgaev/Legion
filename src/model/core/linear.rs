@@ -643,6 +643,9 @@ impl Linear {
         x: Tensor<'a>,
         norm: Option<(Tensor<'a>, Tensor<'a>, f32)>,
     ) -> Option<Tensor<'a>> {
+        if let Some(down) = self.q40_geglu_ffn(ctx, gate, up, down, x, norm) {
+            return Some(down);
+        }
         let n: i64 = x.ne()[1..].iter().product();
         let fits = |(name, w, s): (&str, Tensor<'_>, Option<Tensor<'_>>)| {
             self.w4a16(name, w, s, n) && w.ne()[2] == 1
@@ -674,6 +677,88 @@ impl Linear {
         Some(crate::model::nvfp4_mm::mul_mat(ctx, down.1, act, down.2))
     }
 
+    /// Whether [`Self::mul_mat`] of the weight `name` (`w`, its `scale`) over an `x` of type,
+    /// shape and strides `x` runs the Q4_0 prompt op ([`crate::model::q40_mm`]) and nothing
+    /// after it: no scale, no FP8, a matmul the op takes.
+    fn q40_takes(
+        &self,
+        name: &str,
+        w: Tensor<'_>,
+        scale: Option<Tensor<'_>>,
+        x: (ffi::ggml_type, [i64; 4], [usize; 4]),
+    ) -> bool {
+        scale.is_none() && !self.is_fp8(name, w) && crate::model::q40_mm::takes_shape(w, x)
+    }
+
+    /// [`Self::geglu_ffn_fused`] where the gate, up and down matmuls all run the Q4_0 prompt
+    /// op (Gemma 4 QAT on a GB10): the input quantized once, with `norm` in that quantization
+    /// where it fits ([`crate::model::q40_mm::quantize_norm`]), and the GeGLU written straight
+    /// as the down matmul's quantized input ([`crate::model::q40_mm::quantize_geglu`]): the
+    /// bytes of the op's own quantizations of ggml's F32 norm and GeGLU, so the same output,
+    /// without those F32 tensors. `None` elsewhere.
+    fn q40_geglu_ffn<'a>(
+        &self,
+        ctx: &'a Context,
+        gate: (&str, Tensor<'a>, Option<Tensor<'a>>),
+        up: (&str, Tensor<'a>, Option<Tensor<'a>>),
+        down: (&str, Tensor<'a>, Option<Tensor<'a>>),
+        x: Tensor<'a>,
+        norm: Option<(Tensor<'a>, Tensor<'a>, f32)>,
+    ) -> Option<Tensor<'a>> {
+        use crate::model::q40_mm;
+        let xs = (x.ty(), x.ne(), x.nb());
+        let n = x.ne()[1];
+        let hidden = q40_mm::f32_shape([gate.1.ne()[1], n]);
+        if !(gate.1.ne() == up.1.ne()
+            && self.q40_takes(gate.0, gate.1, gate.2, xs)
+            && self.q40_takes(up.0, up.1, up.2, xs)
+            && self.q40_takes(down.0, down.1, down.2, hidden))
+        {
+            return None;
+        }
+        let xq = match norm {
+            Some((h, nw, eps)) if h.ne() == x.ne() && q40_mm::norm_fits(h, nw) => {
+                q40_mm::quantize_norm(ctx, h, nw, eps, false)
+            }
+            _ => q40_mm::quantize(ctx, x),
+        };
+        let u = q40_mm::mul_mat_q(ctx, up.1, xq, n);
+        let g = q40_mm::mul_mat_q(ctx, gate.1, xq, n);
+        let act = q40_mm::quantize_geglu(ctx, g, u, false);
+        Some(q40_mm::mul_mat_q(ctx, down.1, act, n))
+    }
+
+    /// [`Self::mul_mat_multi`] where every weight runs the Q4_0 prompt op and `norm` fits
+    /// [`crate::model::q40_mm::quantize_norm`]: one quantization of the normed input, the norm
+    /// in it (the op's bytes for ggml's F32 norm), read by each matmul. `None` elsewhere.
+    fn q40_multi<'a>(
+        &self,
+        ctx: &'a Context,
+        ws: &[(&str, Tensor<'a>, Option<Tensor<'a>>)],
+        x: Tensor<'a>,
+        norm: Option<(Tensor<'a>, Tensor<'a>, f32)>,
+    ) -> Option<Vec<Tensor<'a>>> {
+        use crate::model::q40_mm;
+        let (h, nw, eps) = norm?;
+        let xs = (x.ty(), x.ne(), x.nb());
+        if ws.is_empty()
+            || h.ne() != x.ne()
+            || !q40_mm::norm_fits(h, nw)
+            || !ws
+                .iter()
+                .all(|&(name, w, s)| self.q40_takes(name, w, s, xs))
+        {
+            return None;
+        }
+        let xq = q40_mm::quantize_norm(ctx, h, nw, eps, false);
+        let n = x.ne()[1];
+        Some(
+            ws.iter()
+                .map(|&(_, w, _)| q40_mm::mul_mat_q(ctx, w, xq, n))
+                .collect(),
+        )
+    }
+
     /// The matmuls of several weights `ws` (`(name, weight, scale)`) over one input `x` (such
     /// as attention's q, k and v projections) as one W4A4 op
     /// ([`crate::model::nvfp4_a4::mul_mat_multi`]: the activations quantized once, with `norm`
@@ -687,6 +772,9 @@ impl Linear {
         norm: Option<(Tensor<'a>, Tensor<'a>, f32)>,
     ) -> Option<Vec<Tensor<'a>>> {
         use crate::model::nvfp4_a4;
+        if let Some(outs) = self.q40_multi(ctx, ws, x, norm) {
+            return Some(outs);
+        }
         let n: i64 = x.ne()[1..].iter().product();
         if ws.len() < 2
             || ws.len() > nvfp4_a4::MULTI_MAX
