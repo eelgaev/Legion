@@ -9,16 +9,16 @@
 //! scaling it. On a DGX Spark (GB10) its 4096-token FFN matmuls run at ~60 TFLOPS.
 //!
 //! The op (`src/cuda/q40_mm.cu`) quantizes the input as ggml does (the same values, the scale as
-//! the F16 ggml stores) and multiplies 128 x 128 tiles from a three-stage `cp.async` ring, each
-//! block's dot product an `mma.sync` m16n8k32 s8 one, scaled without the conversion: the MMA's
-//! accumulator starts at the float 1.5 * 2^23, so its result read as a float is that plus the
-//! integer exactly, and one FMA takes the offset back out while scaling, rounding once to ggml's
-//! `fl(C * dA)`. The sums are ggml's: `sum = fma(fl(C * dA), dB, sum)` over the K blocks in
+//! the F16 ggml stores) and multiplies 128 x 128 tiles from a three-stage `cp.async` ring, two
+//! CTAs of 8 warps an SM, each block's dot product an `mma.sync` m16n8k32 s8 one, scaled without
+//! the conversion: the MMA's accumulator starts at the float 1.5 * 2^23, so its result read as a
+//! float is that plus the integer exactly, and one FMA takes the offset back out while scaling,
+//! rounding once to ggml's `fl(C * dA)`. The sums are ggml's: `sum = fma(fl(C * dA), dB, sum)` over the K blocks in
 //! order from 0, each output's chain in one thread, as in ggml's CTA per tile. Only plans on
 //! which ggml runs a CTA per tile ([`ggml_tiles`]) are taken: ggml's stream-k split adds the
-//! pieces of a tile in another order. Tiles run in groups of 8 row tiles (column tiles slowest
-//! in a group, [`tile_of`]), so a wave of CTAs reads a few weight rows and input columns from
-//! DRAM instead of every input column per wave of weight rows.
+//! pieces of a tile in another order. Tiles run in groups of [`GROUP`] row tiles (column tiles
+//! slowest in a group, [`tile_of`]), so a wave of CTAs reads a few weight rows and input columns
+//! from DRAM instead of every input column per wave of weight rows.
 //!
 //! Taken on compute capability 12.x (the GB10, whose ggml MMQ config the plan copies, see
 //! [`crate::model::q8_mmq::plan`]) for every Q4_0 weight in one GPU's memory with whole 128-row
@@ -51,8 +51,13 @@ pub const MIN_TOKENS: i64 = 512;
 /// Tile rows and columns.
 pub const TILE: i64 = 128;
 
-/// Row tiles of a raster group ([`tile_of`]).
-pub const GROUP: i64 = 8;
+/// Row tiles of a raster group of the matmul ([`tile_of`]): a GB10's wave of 96 CTAs (two on
+/// each of its 48 SMs) is 16 row tiles x 6 column tiles.
+pub const GROUP: i64 = 16;
+
+/// Row tiles of a raster group of the first version's matmul (one CTA an SM), which the timing
+/// test runs beside the op's.
+pub const GROUP_V1: i64 = 8;
 
 /// Values per Q4_0 / q8_1 block.
 const QK: i64 = 32;
@@ -67,12 +72,20 @@ const K_STEP: i64 = 256;
 /// take 99 MiB.
 pub const MAX_QUANT_BYTES: usize = 256 << 20;
 
-/// The matmul kernel's dynamic shared memory: three stages of 128 weight rows of 20 words, 4 x
-/// 128 columns of 8 quant words and 4 x 128 scales.
-pub const SMEM_BYTES: usize = 3 * (128 * 20 + 4 * 128 * 8 + 4 * 128) * 4;
+/// The matmul kernel's dynamic shared memory: three stages of 128 weight rows of 12 words, 2 x
+/// 128 columns of 8 quant words and 2 x 4 rows of 32 scales 36 words apart.
+pub const SMEM_BYTES: usize = 3 * (128 * 12 + 2 * 128 * 8 + 2 * 4 * 36) * 4;
+
+/// The first version's: three stages of 128 weight rows of 20 words, 4 x 128 columns of 8 quant
+/// words and 4 x 128 scales.
+pub const SMEM_BYTES_V1: usize = 3 * (128 * 20 + 4 * 128 * 8 + 4 * 128) * 4;
 
 /// Whether the op runs where it applies ([`takes`]).
 static ON: AtomicBool = AtomicBool::new(true);
+
+/// Whether the op runs the first version's kernels (the timing test's; the same bits).
+#[cfg(test)]
+static V1: AtomicBool = AtomicBool::new(false);
 
 /// Whether the op runs where it applies ([`takes`]; `true`, the default); `false`
 /// (`legion serve --q40-mm-ggml`) keeps ggml's MMQ for all.
@@ -157,13 +170,13 @@ pub fn quant_bytes(k: i64, n: i64) -> usize {
 }
 
 /// The tile (row tile, column tile) CTA `b` of a grid of `ntx` x `nty` tiles computes, as the
-/// kernel picks it: groups of [`GROUP`] row tiles (the last one shorter), each group's tiles row
-/// tile fastest.
-pub fn tile_of(b: i64, ntx: i64, nty: i64) -> (i64, i64) {
-    let per_group = GROUP * ntx;
+/// kernel picks it: groups of `group` row tiles ([`GROUP`], the last one shorter), each group's
+/// tiles row tile fastest.
+pub fn tile_of(b: i64, ntx: i64, nty: i64, group: i64) -> (i64, i64) {
+    let per_group = group * ntx;
     let g = b / per_group;
-    let r0 = g * GROUP;
-    let size = GROUP.min(nty - r0);
+    let r0 = g * group;
+    let size = group.min(nty - r0);
     let r = b - g * per_group;
     (r0 + r % size, r / size)
 }
@@ -298,8 +311,9 @@ mod cuda {
         z: u32,
     }
 
-    /// Kernels in `legion_q40_mm_kernels`: the quantization, the matmul.
-    const KERNELS: usize = 2;
+    /// Kernels in `legion_q40_mm_kernels`: the quantization and the matmul, then the first
+    /// version's two.
+    const KERNELS: usize = 4;
 
     unsafe extern "C" {
         static legion_q40_mm_kernels: [*const c_void; KERNELS];
@@ -318,12 +332,24 @@ mod cuda {
     }
 
     const FUNC_ATTR_MAX_DYNAMIC_SHARED: c_int = 8;
+    const FUNC_ATTR_PREFERRED_SHARED_CARVEOUT: c_int = 9;
 
     /// Devices the shared-memory cache covers.
     const DEVICES: usize = 64;
 
-    /// Each device's shared-memory opt-in of the matmul: 0 not yet, 1 done, -1 refused.
-    static SMEM: [AtomicI8; DEVICES] = [const { AtomicI8::new(0) }; DEVICES];
+    /// Each device's shared-memory opt-in of the matmul and of the first version's: 0 not yet, 1
+    /// done, -1 refused.
+    static SMEM: [[AtomicI8; 2]; DEVICES] = [const { [const { AtomicI8::new(0) }; 2] }; DEVICES];
+
+    /// The quantization's and the matmul's kernels and the matmul's shared memory: the op's, or
+    /// the first version's in the timing test.
+    fn kernels() -> (usize, usize, usize) {
+        #[cfg(test)]
+        if V1.load(Ordering::Relaxed) {
+            return (2, 3, SMEM_BYTES_V1);
+        }
+        (0, 1, SMEM_BYTES)
+    }
 
     /// One stream's quantized input buffer and its size.
     #[derive(Clone, Copy)]
@@ -362,18 +388,28 @@ mod cuda {
         Ok(s)
     }
 
-    fn opt_in(dev: c_int) -> Result<(), String> {
-        let slot = &SMEM[dev as usize];
+    /// The shared memory of matmul `kernel` (`smem` bytes) on `dev`, and all of an SM's for
+    /// shared memory, so two CTAs of the op's fit (a hint: the GPU may keep another split).
+    fn opt_in(dev: c_int, kernel: usize, smem: usize) -> Result<(), String> {
+        let slot = &SMEM[dev as usize][kernel / 2];
         let mut state = slot.load(Ordering::Relaxed);
         if state == 0 {
-            // SAFETY: the table's matmul and its shared memory size.
+            // SAFETY: a matmul of the table and its shared memory size.
             state = unsafe {
                 if cudaFuncSetAttribute(
-                    legion_q40_mm_kernels[1],
+                    legion_q40_mm_kernels[kernel],
                     FUNC_ATTR_MAX_DYNAMIC_SHARED,
-                    SMEM_BYTES as c_int,
+                    smem as c_int,
                 ) == 0
                 {
+                    if cudaFuncSetAttribute(
+                        legion_q40_mm_kernels[kernel],
+                        FUNC_ATTR_PREFERRED_SHARED_CARVEOUT,
+                        100,
+                    ) != 0
+                    {
+                        cudaGetLastError();
+                    }
                     1
                 } else {
                     cudaGetLastError();
@@ -383,7 +419,7 @@ mod cuda {
             slot.store(state, Ordering::Relaxed);
         }
         if state < 0 {
-            return Err(format!("q40_mm: {SMEM_BYTES} bytes of shared memory"));
+            return Err(format!("q40_mm: {smem} bytes of shared memory"));
         }
         Ok(())
     }
@@ -463,6 +499,7 @@ mod cuda {
                 return Err("q40_mm: no current device".into());
             }
             let quant = quant_in(crate::ggml::current_cuda_graph(), dst);
+            let (quant_kernel, kernel, smem) = kernels();
             let s = scratch(dev, stream, quant_bytes(k, n))?;
             let (ntx, nty) = grid(rows, n);
             let n_pad = n_padded(n);
@@ -490,16 +527,16 @@ mod cuda {
                     z: 1,
                 };
                 let quant_block = Dim3 { x: 64, y: 1, z: 1 };
-                launch(0, quant_grid, quant_block, 0, &mut a, stream)?;
+                launch(quant_kernel, quant_grid, quant_block, 0, &mut a, stream)?;
             }
-            opt_in(dev)?;
+            opt_in(dev, kernel, smem)?;
             let grid = Dim3 {
                 x: (ntx * nty) as u32,
                 y: 1,
                 z: 1,
             };
             let block = Dim3 { x: 256, y: 1, z: 1 };
-            launch(1, grid, block, SMEM_BYTES, &mut a, stream)
+            launch(kernel, grid, block, smem, &mut a, stream)
         }
     }
 }

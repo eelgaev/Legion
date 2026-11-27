@@ -19,7 +19,7 @@ const GEMMA: [(i64, i64); 8] = [
     (5376, 2048),
 ];
 
-/// The shapes and step sizes of the GPU check.
+/// The shapes of the timing test: the FFN's and the local attention's.
 const CHECKED: [(i64, i64); 5] = [
     (5376, 21504),
     (21504, 5376),
@@ -27,7 +27,19 @@ const CHECKED: [(i64, i64); 5] = [
     (8192, 5376),
     (5376, 4096),
 ];
-const CHECKED_N: [i64; 4] = [512, 1024, 4095, 4096];
+
+/// The step sizes of the GPU check (at [`GEMMA`]'s shapes): whole and partial last column tiles.
+const CHECKED_N: [i64; 5] = [512, 1024, 4095, 4096, 4097];
+
+/// The GPU tests switch [`V1`] for the whole process: one at a time.
+#[cfg(feature = "cuda")]
+static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The op's kernels (`v1` false) or the first version's from here on.
+#[cfg(feature = "cuda")]
+fn use_v1(v1: bool) {
+    V1.store(v1, Ordering::Relaxed);
+}
 
 fn shape(ty: ffi::ggml_type, ne: [i64; 4]) -> (ffi::ggml_type, [i64; 4], [usize; 4]) {
     let (ts, row) = if ty == types::Q4_0 {
@@ -157,59 +169,122 @@ fn grid_and_quant_bytes_pad_columns_to_tiles() {
     // 672 blocks x 4096 columns x (32 quants + an F32 scale).
     assert_eq!(quant_bytes(21504, 4096), 672 * 4096 * 36);
     assert!(quant_bytes(21504, 4096) <= MAX_QUANT_BYTES);
-    assert_eq!(SMEM_BYTES, 86016);
+    // src/cuda/q40_mm.cu's static asserts; two of the op's CTAs (and their 1 KiB each the GPU
+    // reserves) fit a GB10 SM's 100 KiB.
+    assert_eq!(SMEM_BYTES, 46464);
+    assert_eq!(SMEM_BYTES_V1, 86016);
+    assert!(2 * (SMEM_BYTES + 1024) <= 100 << 10);
 }
 
 /// The raster hands every tile to exactly one CTA, for grids whose row tiles are and are not a
-/// multiple of the group.
+/// multiple of the group, in both versions' groups.
 #[test]
 fn tile_of_covers_every_tile_once() {
-    for (ntx, nty) in [
-        (32, 168),
-        (32, 42),
-        (4, 64),
-        (33, 42),
-        (1, 1),
-        (5, 3),
-        (7, 17),
-    ] {
-        let mut seen = vec![false; (ntx * nty) as usize];
-        for b in 0..ntx * nty {
-            let (it, jt) = tile_of(b, ntx, nty);
-            assert!(
-                (0..nty).contains(&it) && (0..ntx).contains(&jt),
-                "{ntx}x{nty}: {b}"
-            );
-            let at = (it * ntx + jt) as usize;
-            assert!(!seen[at], "{ntx}x{nty}: tile ({it}, {jt}) twice");
-            seen[at] = true;
+    for group in [GROUP, GROUP_V1] {
+        for (ntx, nty) in [
+            (32, 168),
+            (32, 42),
+            (4, 64),
+            (33, 42),
+            (1, 1),
+            (5, 3),
+            (7, 17),
+        ] {
+            let mut seen = vec![false; (ntx * nty) as usize];
+            for b in 0..ntx * nty {
+                let (it, jt) = tile_of(b, ntx, nty, group);
+                assert!(
+                    (0..nty).contains(&it) && (0..ntx).contains(&jt),
+                    "{ntx}x{nty}: {b}"
+                );
+                let at = (it * ntx + jt) as usize;
+                assert!(!seen[at], "{ntx}x{nty}: tile ({it}, {jt}) twice");
+                seen[at] = true;
+            }
+            assert!(seen.iter().all(|&s| s), "{ntx}x{nty}, groups of {group}");
         }
-        assert!(seen.iter().all(|&s| s), "{ntx}x{nty}");
     }
 }
 
-/// A wave of 48 CTAs on the FFN down's grid (32 column tiles x 42 row tiles) reads 8 row tiles
-/// of the weight and 6 column tiles of the input, not 48 column tiles of one or two row tiles.
+/// On the FFN down's grid (32 column tiles x 42 row tiles) a wave of the op's 96 CTAs (two an
+/// SM of a GB10) reads 16 row tiles of the weight and 6 column tiles of the input, the first
+/// version's 48 CTAs 8 and 6, not 48 column tiles of one or two row tiles.
 #[test]
 fn tile_of_groups_row_tiles() {
-    let wave = |w: i64| {
+    let wave = |w: i64, ctas: i64, group: i64| {
         let mut rows = std::collections::BTreeSet::new();
         let mut cols = std::collections::BTreeSet::new();
-        for b in w * 48..(w + 1) * 48 {
-            let (it, jt) = tile_of(b, 32, 42);
+        for b in w * ctas..(w + 1) * ctas {
+            let (it, jt) = tile_of(b, 32, 42, group);
             rows.insert(it);
             cols.insert(jt);
         }
         (rows.len(), cols.len())
     };
-    assert_eq!(wave(0), (8, 6));
-    assert_eq!(tile_of(0, 32, 42), (0, 0));
-    assert_eq!(tile_of(1, 32, 42), (1, 0));
-    assert_eq!(tile_of(8, 32, 42), (0, 1));
-    // The last group holds 42 - 40 = 2 row tiles.
-    assert_eq!(tile_of(5 * 8 * 32, 32, 42), (40, 0));
-    assert_eq!(tile_of(5 * 8 * 32 + 1, 32, 42), (41, 0));
-    assert_eq!(tile_of(5 * 8 * 32 + 2, 32, 42), (40, 1));
+    assert_eq!(wave(0, 96, GROUP), (16, 6));
+    assert_eq!(wave(0, 48, GROUP_V1), (8, 6));
+    assert_eq!(tile_of(0, 32, 42, GROUP), (0, 0));
+    assert_eq!(tile_of(1, 32, 42, GROUP), (1, 0));
+    assert_eq!(tile_of(16, 32, 42, GROUP), (0, 1));
+    // The last group holds 42 - 32 = 10 row tiles.
+    assert_eq!(tile_of(2 * 16 * 32, 32, 42, GROUP), (32, 0));
+    assert_eq!(tile_of(2 * 16 * 32 + 9, 32, 42, GROUP), (41, 0));
+    assert_eq!(tile_of(2 * 16 * 32 + 10, 32, 42, GROUP), (32, 1));
+    // The first version's: its last group holds 42 - 40 = 2 row tiles.
+    assert_eq!(tile_of(8, 32, 42, GROUP_V1), (0, 1));
+    assert_eq!(tile_of(5 * 8 * 32 + 1, 32, 42, GROUP_V1), (41, 0));
+    assert_eq!(tile_of(5 * 8 * 32 + 2, 32, 42, GROUP_V1), (40, 1));
+}
+
+/// Where src/cuda/q40_mm.cu's `q40_quant<1>` puts word `w` of tile column `c` among a block's
+/// 1024 words of the tile (as the matmul reads them from shared memory too).
+fn quant_word(c: usize, w: usize) -> usize {
+    let (nt, g) = (c / 8, c % 8);
+    ((nt / 2 * 8 + g) * 4 + w / 2) * 4 + nt % 2 * 2 + w % 2
+}
+
+/// Where the matmul's copy puts the scale of tile column `c` in a block's scales in shared
+/// memory: `q40_quant<1>`'s rows of 32 (row `c % 8 / 2`), 36 words apart.
+fn quant_scale(c: usize) -> usize {
+    let (nt, g) = (c / 8, c % 8);
+    g / 2 * 36 + 2 * nt + g % 2
+}
+
+/// The op's quantized-input layout (src/cuda/q40_mm.cu's layout 1, mirrored by
+/// [`quant_word`] and [`quant_scale`]): every word and scale of a 128-column tile's block has
+/// one place, and lane (g, q)'s 16-byte reads of n8 tile pair `pr` hold, in order, its B
+/// fragments (slots q and q + 4, words 2q and 2q + 1) of columns 16 pr + g and 16 pr + 8 + g,
+/// and the scales of columns 16 pr + 2q, + 1, 16 pr + 8 + 2q, + 1 (the accumulators' columns).
+#[test]
+fn quant_layout_is_one_read_per_tile_pair() {
+    let mut words = vec![false; 1024];
+    let mut scales = vec![false; 128];
+    for c in 0..128 {
+        for w in 0..8 {
+            let at = quant_word(c, w);
+            assert!(!words[at], "column {c} word {w}");
+            words[at] = true;
+        }
+        let at = quant_scale(c);
+        let row = at / 36 * 32 + at % 36;
+        assert!(at % 36 < 32 && !scales[row], "column {c}");
+        scales[row] = true;
+    }
+    assert!(words.iter().chain(&scales).all(|&s| s));
+    for pr in 0..8 {
+        for (g, q) in (0..8).flat_map(|g| (0..4).map(move |q| (g, q))) {
+            let bq = ((pr * 8 + g) * 4 + q) * 4;
+            let (c0, c1) = (16 * pr + g, 16 * pr + 8 + g);
+            let want = [(c0, 2 * q), (c0, 2 * q + 1), (c1, 2 * q), (c1, 2 * q + 1)];
+            for (i, (c, w)) in want.into_iter().enumerate() {
+                assert_eq!(quant_word(c, w), bq + i, "pair {pr} ({g}, {q}) word {i}");
+            }
+            let (bd, c0, c1) = (q * 36 + pr * 4, 16 * pr + 2 * q, 16 * pr + 8 + 2 * q);
+            for (i, c) in [c0, c0 + 1, c1, c1 + 1].into_iter().enumerate() {
+                assert_eq!(quant_scale(c), bd + i, "pair {pr} ({g}, {q}) scale {i}");
+            }
+        }
+    }
 }
 
 #[test]
@@ -374,49 +449,78 @@ fn case(backend: &mut Backend, ours: bool, k: i64, rows: i64, n: i64) -> Vec<u8>
     y.bytes()
 }
 
-/// On a GB10 the op gives ggml-cuda's MMQ product bit for bit at Gemma 4 31B's shapes and 512
-/// to 4096 columns, wherever ggml runs a CTA per tile (the others are ggml's anyway).
+/// On a GB10 the op, and the first version's kernels, give ggml-cuda's MMQ product bit for bit
+/// at Gemma 4 31B's shapes and 512 to 4097 columns, wherever ggml runs a CTA per tile (the
+/// others are ggml's anyway).
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "needs a GPU"]
 fn cuda_q40_mm_is_ggml_bit_for_bit() {
+    let _one = GPU.lock().unwrap_or_else(|e| e.into_inner());
     let Some((mut gpu, sms)) = gb10() else { return };
     let mut checked = 0;
-    for (k, rows) in CHECKED {
+    for (k, rows) in GEMMA {
         for n in CHECKED_N {
             if !ggml_tiles(rows, k, n, sms) {
                 println!("{k}x{rows}, {n} columns: ggml splits the tiles, not taken");
                 continue;
             }
-            let ours = case(&mut gpu, true, k, rows, n);
             let ggml = case(&mut gpu, false, k, rows, n);
-            let diff = ours
-                .chunks(4)
-                .zip(ggml.chunks(4))
-                .filter(|(a, b)| a != b)
-                .count();
-            println!("{k}x{rows}, {n} columns: {diff} values differ");
-            assert_eq!(diff, 0, "{k}x{rows}, {n} columns: {diff} values moved");
+            for (name, v1) in [("q40_mm", false), ("first version", true)] {
+                use_v1(v1);
+                let ours = case(&mut gpu, true, k, rows, n);
+                use_v1(false);
+                let diff = ours
+                    .chunks(4)
+                    .zip(ggml.chunks(4))
+                    .filter(|(a, b)| a != b)
+                    .count();
+                println!("{k}x{rows}, {n} columns, {name}: {diff} values differ");
+                assert_eq!(diff, 0, "{k}x{rows}, {n} columns, {name}: values moved");
+            }
             checked += 1;
         }
     }
-    // 15 on a GB10's 48 SMs.
+    // 32 on a GB10's 48 SMs.
     assert!(checked > 0, "no case taken");
 }
 
-/// The time per call of ggml's MMQ and the op at Gemma 4 31B's shapes and 4096 columns: 8
-/// calls a graph on two inputs in turn (so every call quantizes), the second of two runs. The
-/// weight is the same for all 8 calls, so it may stay in L2 a little more than in a model.
+/// The time per call of ggml's MMQ, the first version's kernels and the op at Gemma 4 31B's
+/// shapes and 4096 columns: 8 calls a graph on two inputs in turn (so every call quantizes),
+/// the second of two runs. The weight is the same for all 8 calls, so it may stay in L2 a
+/// little more than in a model. Each as a share of the GPU's S8 MMA peak ([`mma_peak`]'s).
+///
+/// [`mma_peak`]: crate::model::core::mma_peak
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "needs a GPU"]
 fn cuda_q40_mm_time_at_4096_rows() {
+    use crate::model::core::mma_peak;
     const CALLS: usize = 8;
+    const NAMES: [&str; 3] = ["ggml", "first version", "q40_mm"];
+    let _one = GPU.lock().unwrap_or_else(|e| e.into_inner());
     let Some((mut gpu, _)) = gb10() else { return };
+    let s8 = mma_peak::FORMS
+        .iter()
+        .position(|f| f.name.contains("S8"))
+        .unwrap();
+    let peak = match mma_peak::measure(0, 20.0) {
+        Ok((_, runs, _)) => mma_peak::best(&runs)
+            .iter()
+            .find(|r| r.form == s8)
+            .map_or(0.0, |r| r.tflops),
+        Err(e) => {
+            println!("mma_peak: {e}");
+            0.0
+        }
+    };
+    println!("S8 MMA peak {peak:.0} TOPS");
     let n = 4096i64;
     for (k, rows) in CHECKED {
-        let mut ms = [0f64; 2];
-        for (i, ours) in [false, true].into_iter().enumerate() {
+        let mut ms = [0f64; 3];
+        for (i, ms) in ms.iter_mut().enumerate() {
+            let ours = i > 0;
+            use_v1(i == 1);
             let ctx = Context::new(64, 64);
             let w = ctx.new_tensor(types::Q4_0, &[k, rows]).as_input();
             // Outputs too, so the second run reads them as set.
@@ -443,16 +547,27 @@ fn cuda_q40_mm_time_at_4096_rows() {
             gpu.compute(&graph).unwrap();
             let t0 = std::time::Instant::now();
             gpu.compute(&graph).unwrap();
-            ms[i] = t0.elapsed().as_secs_f64() * 1e3 / CALLS as f64;
+            *ms = t0.elapsed().as_secs_f64() * 1e3 / CALLS as f64;
+            use_v1(false);
         }
-        let tflops = |ms: f64| 2.0 * (k * rows * n) as f64 / ms / 1e9;
+        let tops = |ms: f64| 2.0 * (k * rows * n) as f64 / ms / 1e9;
+        let line: Vec<String> = NAMES
+            .iter()
+            .zip(ms)
+            .map(|(name, ms)| {
+                let share = if peak > 0.0 {
+                    format!(", {:.0}% of peak", 100.0 * tops(ms) / peak)
+                } else {
+                    String::new()
+                };
+                format!("{name} {ms:.2} ms ({:.0} TOPS{share})", tops(ms))
+            })
+            .collect();
         println!(
-            "{k}x{rows}, {n} columns: ggml {:.2} ms ({:.0} TFLOPS), q40_mm {:.2} ms ({:.0} TFLOPS), {:.2}x",
-            ms[0],
-            tflops(ms[0]),
-            ms[1],
-            tflops(ms[1]),
-            ms[0] / ms[1]
+            "{k}x{rows}, {n} columns: {}; q40_mm {:.2}x ggml, {:.2}x the first version",
+            line.join(", "),
+            ms[0] / ms[2],
+            ms[1] / ms[2]
         );
     }
 }
