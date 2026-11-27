@@ -520,9 +520,8 @@ pub fn mul_mat_a8_dynamic_cols<'a>(
 ) -> Tensor<'a> {
     let [k, n] = x_ne;
     assert!(
-        first >= 0 && count > 0 && first + count <= n && n <= i32::MAX as i64,
-        "mul_mat_a8_dynamic_cols: tokens {first}..{} of {n}",
-        first + count
+        first >= 0 && count > 0 && first <= n && count <= n - first && n <= i32::MAX as i64,
+        "mul_mat_a8_dynamic_cols: {count} tokens from {first} of {n}"
     );
     let m = a8_dynamic_check(w, xq, [k, n, 1, 1], wscale);
     let mut args = vec![w, xq];
