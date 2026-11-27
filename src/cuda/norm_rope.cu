@@ -101,6 +101,27 @@ struct legion_idx_append {
 
 int legion_idx_append_launch(const legion_idx_append * p, void * stream);
 
+// rows_fold (#1183): node_fuse's folds of qwen4exp's prompt-step chains, after allocation, one
+// warp a row (a head of a token): with w, a row's norm and RoPE (rms_norm_f32<256, true> and
+// rope_multi, bit for bit), else a copy; into an F32 tensor of contiguous rows, or (cells) into
+// an F16 cache's rows as set_rows writes them. The K rows (cont, rms_norm, mul, rope_multi,
+// set_rows), the V rows (cont, set_rows) and the indexer queries (rms_norm, mul, rope_multi).
+struct legion_rows_fold {
+    const float * x;          // (c, h, t) at x + c + h * x_s1 + t * x_s2
+    int64_t x_s1, x_s2;
+    const float * w;          // [ncols]; null: a copy (no norm, no RoPE)
+    const int32_t * pos;      // [4 * n_tok]: section s of token t at pos[t + s * n_tok]
+    float * out;              // without cells: [ncols, n_head, n_tok] contiguous
+    __half * cache;           // with cells: cell c's row at cache + c * ld (halves), head h at h * ncols
+    int64_t ld;
+    const int32_t * cells;    // [n_tok], or null
+    int32_t ncols, n_head, n_tok;
+    float eps;
+    legion_rope_params rope;
+};
+
+int legion_rows_fold_launch(const legion_rows_fold * p, void * stream);
+
 }  // extern "C"
 
 namespace {
@@ -289,6 +310,113 @@ __global__ void idx_append_kernel(const legion_idx_append p) {
     }
 }
 
+constexpr int RF_WARPS = 4;  // rows a block
+
+// rope_multi's cos and sin of pair i of token t (nr_rotate's expressions, attn_factor applied).
+__device__ __forceinline__ void rf_cos_sin(const nr_rope & r, const int32_t * pos, int t, int n_pos, int i,
+                                           float & cos_theta, float & sin_theta) {
+    const int iw = 2 * i;
+    const int sect_dims = r.sections[0] + r.sections[1] + r.sections[2] + r.sections[3];
+    const int sec_w = r.sections[1] + r.sections[0];
+    const int sector = (iw / 2) % sect_dims;
+    float theta_base = 0.0;
+    if (r.imrope) {
+        if (sector % 3 == 1 && sector < 3 * r.sections[1]) {
+            theta_base = pos[t + n_pos * 1] * powf(r.theta_scale, iw / 2.0f);
+        } else if (sector % 3 == 2 && sector < 3 * r.sections[2]) {
+            theta_base = pos[t + n_pos * 2] * powf(r.theta_scale, iw / 2.0f);
+        } else if (sector % 3 == 0 && sector < 3 * r.sections[0]) {
+            theta_base = pos[t] * powf(r.theta_scale, iw / 2.0f);
+        } else {
+            theta_base = pos[t + n_pos * 3] * powf(r.theta_scale, iw / 2.0f);
+        }
+    } else {
+        if (sector < r.sections[0]) {
+            theta_base = pos[t] * powf(r.theta_scale, iw / 2.0f);
+        } else if (sector >= r.sections[0] && sector < sec_w) {
+            theta_base = pos[t + n_pos * 1] * powf(r.theta_scale, iw / 2.0f);
+        } else if (sector >= sec_w && sector < sec_w + r.sections[2]) {
+            theta_base = pos[t + n_pos * 2] * powf(r.theta_scale, iw / 2.0f);
+        } else if (sector >= sec_w + r.sections[2]) {
+            theta_base = pos[t + n_pos * 3] * powf(r.theta_scale, iw / 2.0f);
+        }
+    }
+    const float freq_factor = 1.0f;
+    // rope_yarn, forward, ext_factor 0.
+    const float theta_extrap = theta_base / freq_factor;
+    const float theta = r.freq_scale * theta_extrap;
+    cos_theta = cosf(theta) * r.attn_factor;
+    sin_theta = sinf(theta) * r.attn_factor;
+}
+
+// One warp a row of NJ * 32 columns: lane l holds columns l + 32 j. NORM: ggml's rms_norm of
+// 256 threads, where thread c holds column c (NJ <= 8: one column a thread), so warp j's sum is
+// a 32-lane butterfly of column segment j's squares, and the second butterfly over the 8 warp
+// sums (lanes 8-31 zero) is ((s0 + s4) + (s2 + s6)) + ((s1 + s5) + (s3 + s7)) on every lane
+// (the zeros added at offsets 16 and 8 change nothing; segments past NJ are ggml's empty
+// warps, zero); then the weight, and rope_multi's pair (i, i + n_dims / 2) with HJ = n_dims / 64
+// segments in the rotated half, so both columns of a pair lie in one lane. Else a copy. Every
+// lane reads its row before any lane writes (the butterflies), so out may be x's memory.
+template <int NJ, int HJ, bool NORM, bool CELLS>
+__global__ void __launch_bounds__(32 * RF_WARPS) rows_fold_kernel(const legion_rows_fold p, const nr_rope r) {
+    static_assert(NJ >= 1 && NJ <= 8 && (!NORM || (HJ >= 1 && 2 * HJ <= NJ)), "rows_fold shape");
+    const int lane = threadIdx.x % 32;
+    const int64_t row = (int64_t) blockIdx.x * RF_WARPS + threadIdx.x / 32;
+    if (row >= (int64_t) p.n_head * p.n_tok) {
+        return;
+    }
+    const int h = (int) (row % p.n_head);
+    const int t = (int) (row / p.n_head);
+    const float * x = p.x + h * p.x_s1 + t * p.x_s2;
+    float v[NJ];
+#pragma unroll
+    for (int j = 0; j < NJ; ++j) {
+        v[j] = x[lane + 32 * j];
+    }
+    if constexpr (NORM) {
+        float s[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            float tmp = 0.0f;
+            if (j < NJ) {
+                tmp += v[j] * v[j];
+                tmp = nr_warp_sum(tmp);
+            }
+            s[j] = tmp;
+        }
+        const float sum = ((s[0] + s[4]) + (s[2] + s[6])) + ((s[1] + s[5]) + (s[3] + s[7]));
+        const float mean = sum / p.ncols;
+        const float scale = rsqrtf(mean + p.eps);
+#pragma unroll
+        for (int j = 0; j < NJ; ++j) {
+            v[j] = scale * v[j] * p.w[lane + 32 * j];
+        }
+        // Columns past n_dims keep the norm's value.
+#pragma unroll
+        for (int j = 0; j < HJ; ++j) {
+            float cos_theta, sin_theta;
+            rf_cos_sin(r, p.pos, t, p.n_tok, lane + 32 * j, cos_theta, sin_theta);
+            const float x0 = v[j];
+            const float x1 = v[j + HJ];
+            v[j] = x0 * cos_theta - x1 * sin_theta;
+            v[j + HJ] = x0 * sin_theta + x1 * cos_theta;
+        }
+    }
+    if constexpr (CELLS) {
+        __half * dst = p.cache + (int64_t) p.cells[t] * p.ld + (int64_t) h * p.ncols;
+#pragma unroll
+        for (int j = 0; j < NJ; ++j) {
+            dst[lane + 32 * j] = __float2half(v[j]);
+        }
+    } else {
+        float * dst = p.out + row * p.ncols;
+#pragma unroll
+        for (int j = 0; j < NJ; ++j) {
+            dst[lane + 32 * j] = v[j];
+        }
+    }
+}
+
 nr_rope nr_rope_of(const legion_rope_params & rp) {
     nr_rope r;
     r.n_dims = rp.n_dims;
@@ -306,6 +434,18 @@ nr_rope nr_rope_of(const legion_rope_params & rp) {
 bool nr_rope_ok(const legion_rope_params & rp, int ncols) {
     const int sect = rp.sections[0] + rp.sections[1] + rp.sections[2] + rp.sections[3];
     return rp.n_dims > 0 && rp.n_dims % 2 == 0 && rp.n_dims <= ncols && ncols % 2 == 0 && sect > 0;
+}
+
+template <int NJ, int HJ, bool NORM>
+int rows_fold_go(const legion_rows_fold & p, const nr_rope & r, cudaStream_t stream) {
+    const int64_t rows = (int64_t) p.n_head * p.n_tok;
+    const unsigned blocks = (unsigned) ((rows + RF_WARPS - 1) / RF_WARPS);
+    if (p.cells != nullptr) {
+        rows_fold_kernel<NJ, HJ, NORM, true><<<blocks, 32 * RF_WARPS, 0, stream>>>(p, r);
+    } else {
+        rows_fold_kernel<NJ, HJ, NORM, false><<<blocks, 32 * RF_WARPS, 0, stream>>>(p, r);
+    }
+    return (int) cudaGetLastError();
 }
 
 }  // namespace
@@ -342,4 +482,37 @@ extern "C" int legion_idx_append_launch(const legion_idx_append * p, void * stre
     }
     idx_append_kernel<<<p->n_tok, 256, 0, (cudaStream_t) stream>>>(*p);
     return (int) cudaGetLastError();
+}
+
+// Rows of 128 or 256 columns (one column a thread of ggml's 256-thread norm); with the norm,
+// a rotated half of n_dims / 2 columns a multiple of 32 (both columns of a pair in one lane).
+extern "C" int legion_rows_fold_launch(const legion_rows_fold * p, void * stream) {
+    const cudaStream_t s = (cudaStream_t) stream;
+    if ((p->ncols != 128 && p->ncols != 256) || p->n_head < 1 || p->n_tok < 1 ||
+        (p->cells == nullptr && p->out == nullptr) || (p->cells != nullptr && p->cache == nullptr) ||
+        (int64_t) p->n_head * p->n_tok > 2147483647LL * RF_WARPS) {
+        return -1;
+    }
+    const nr_rope none = {};
+    if (p->w == nullptr) {
+        return p->ncols == 128 ? rows_fold_go<4, 0, false>(*p, none, s) : rows_fold_go<8, 0, false>(*p, none, s);
+    }
+    if (!nr_rope_ok(p->rope, p->ncols) || p->rope.n_dims % 64 != 0) {
+        return -1;
+    }
+    const nr_rope r = nr_rope_of(p->rope);
+    const int hj = p->rope.n_dims / 64;
+    if (p->ncols == 128) {
+        switch (hj) {
+            case 1: return rows_fold_go<4, 1, true>(*p, r, s);
+            case 2: return rows_fold_go<4, 2, true>(*p, r, s);
+            default: return -1;
+        }
+    }
+    switch (hj) {
+        case 1: return rows_fold_go<8, 1, true>(*p, r, s);
+        case 2: return rows_fold_go<8, 2, true>(*p, r, s);
+        case 4: return rows_fold_go<8, 4, true>(*p, r, s);
+        default: return -1;
+    }
 }

@@ -29,6 +29,11 @@
 //!   `--dense-fp8-prompt`, and the plain one without it) makes its query's head norm and RoPE
 //!   itself from the projection's rows, as ggml-cuda's `rms_norm` and `rope_multi` kernels make
 //!   them: two kernels per layer gone ([`Graph::q_norm_rope`], #1183).
+//! - qwen4exp's prompt steps (more than 64 tokens) on CUDA write an attention layer's K rows
+//!   to the cache with their head norm and RoPE in one launch (the K `cont` of the joined
+//!   projection's rows, `rms_norm`, `rope_multi` and `set_rows`), its V rows in one (`cont` and
+//!   `set_rows`), the indexer's query norm and RoPE in one and its cache rows in one (`fill`,
+//!   `concat` and `set_rows`), with ggml-cuda's bits ([`Graph::rows_fold`], #1183).
 //! - A gated DeltaNet's FP8 qkv GEMM of a prompt step runs the causal conv, SiLU and q / k head
 //!   norm reading its output (`conv_silu`) in its epilogue, with the bits of the two kernels,
 //!   on a compute capability 12.x GPU: the GEMM's F32 output is no longer written and read
@@ -53,6 +58,7 @@ use std::os::raw::c_int;
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use super::norm_rope;
 use crate::ggml::{ExternalOp, external_params, ffi, make_external};
 
 mod audit;
@@ -173,6 +179,15 @@ pub(crate) struct Counts {
     /// qwen4exp mixers' down matmuls writing their up-mix's BF16 `lo` themselves, the gate's
     /// activation and BF16 rounding nodes turned off ([`Graph::down_lob`], #1183).
     pub down_lob: usize,
+    /// qwen4exp prompt steps' K cache writes made with their head norm and RoPE in one launch
+    /// ([`Graph::rows_fold`], #1183).
+    pub k_rows: usize,
+    /// The same for V (the `cont` of the joined projection's rows and the write).
+    pub v_rows: usize,
+    /// The indexer queries' head norm and RoPE in one launch.
+    pub iq_rope: usize,
+    /// The indexer cache rows (raw key, zero pool-key half) in one launch.
+    pub idx_rows: usize,
     /// Nodes turned into `GGML_OP_NONE`.
     pub none: usize,
 }
@@ -191,6 +206,75 @@ static PLE_LOGGED: AtomicBool = AtomicBool::new(false);
 /// Whether a graph with [`Counts::mtp_in`] was logged (the MTP head's take-ins are graphs of
 /// their own, after the first prompt step's).
 static MTP_IN_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a graph with [`Counts::k_rows`] or [`Counts::iq_rope`] was logged (prompt steps).
+static ROWS_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Whether why [`Graph::rows_fold`] leaves rows of each kind ([`Rows`]) was logged.
+static ROWS_FOLD_LOGGED: [AtomicBool; 4] = [const { AtomicBool::new(false) }; 4];
+
+/// The rows [`Graph::rows_fold`] makes.
+#[derive(Clone, Copy)]
+enum Rows {
+    K,
+    V,
+    Query,
+    Idx,
+}
+
+/// What [`Graph::rows_fold`] turns its node into.
+enum RowsMake {
+    Fold(norm_rope::RowsFold),
+    Idx { raw: Node, cache: Node, cells: Node },
+}
+
+/// A matched head norm and RoPE ([`Graph::match_norm_rope`]).
+struct NormRope {
+    /// The `rms_norm`, `mul` and RoPE nodes, by index.
+    nodes: [usize; 3],
+    raw: Node,
+    w: Node,
+    pos: Node,
+    eps: f32,
+    n_dims: i32,
+    sections: [i32; 4],
+    imrope: bool,
+    freq_base: f32,
+    freq_scale: f32,
+    attn_factor: f32,
+}
+
+impl NormRope {
+    fn norm(&self) -> norm_rope::RowsNorm {
+        norm_rope::RowsNorm {
+            w: self.w,
+            pos: self.pos,
+            eps: self.eps,
+            n_dims: self.n_dims,
+            sections: self.sections,
+            imrope: self.imrope,
+            freq_base: self.freq_base,
+            freq_scale: self.freq_scale,
+            attn_factor: self.attn_factor,
+        }
+    }
+}
+
+/// Whether tensor `t` is named `name`.
+///
+/// # Safety
+/// A valid tensor.
+unsafe fn has_name(t: Node, name: &str) -> bool {
+    // SAFETY: the caller's; ggml keeps names NUL-terminated.
+    unsafe { std::ffi::CStr::from_ptr((*t).name.as_ptr()).to_bytes() == name.as_bytes() }
+}
+
+/// `LEGION_DEBUG_ROWS_FOLD=0`: qwen4exp's prompt-step K / V / indexer rows keep ggml's nodes
+/// (the way before #1183's [`Graph::rows_fold`]), for A/B runs (the same bits either way).
+fn rows_fold_off() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("LEGION_DEBUG_ROWS_FOLD").is_some_and(|v| v == "0"))
+}
 
 /// The pass on CUDA graphs ([`crate::ggml::post_alloc::set_rewrite`]). Then the CPU share's
 /// layers get their shared expert moved to run while the pool works
@@ -232,7 +316,8 @@ unsafe fn fuse(graph: *mut ffi::ggml_cgraph) {
     let first_codes = (c.fp8_codes + c.gdn_codes + c.shexp_codes > 0
         && !CODES_LOGGED.swap(true, Ordering::Relaxed))
         | (c.ple_ops > 0 && !PLE_LOGGED.swap(true, Ordering::Relaxed))
-        | (c.mtp_in > 0 && !MTP_IN_LOGGED.swap(true, Ordering::Relaxed));
+        | (c.mtp_in > 0 && !MTP_IN_LOGGED.swap(true, Ordering::Relaxed))
+        | (c.k_rows + c.iq_rope > 0 && !ROWS_LOGGED.swap(true, Ordering::Relaxed));
     if c != Counts::default() && (LOGGED.fetch_add(1, Ordering::Relaxed) < 4 || first_codes) {
         tracing::info!(
             sum_gate = c.sum_gate,
@@ -255,6 +340,10 @@ unsafe fn fuse(graph: *mut ffi::ggml_cgraph) {
             mtp_in_q8 = c.mtp_in_q8,
             conv_gemm = c.conv_gemm,
             down_lob = c.down_lob,
+            k_rows = c.k_rows,
+            v_rows = c.v_rows,
+            iq_rope = c.iq_rope,
+            idx_rows = c.idx_rows,
             none = c.none,
             "node fuse: small ggml chains as Legion ops (the first graphs; --node-fuse-ggml off)"
         );
@@ -280,6 +369,9 @@ pub(crate) unsafe fn rewrite_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> 
             match (*g.nodes[i]).op {
                 ffi::ggml_op_GGML_OP_MUL => g.moe(i, cuda, &mut c),
                 ffi::ggml_op_GGML_OP_GET_ROWS => g.remap(i, &mut c),
+                ffi::ggml_op_GGML_OP_SET_ROWS | ffi::ggml_op_GGML_OP_ROPE if cuda => {
+                    g.rows_fold(i, &mut c)
+                }
                 ffi::ggml_op_GGML_OP_CUSTOM => {
                     if crate::model::qwen4::qsa_attn::is_gated_codes(g.nodes[i]) {
                         c.fp8_codes += 1;
@@ -1357,11 +1449,76 @@ impl Graph {
             while is_view_op((*rope).op) && !(*rope).src[0].is_null() {
                 rope = (*rope).src[0];
             }
-            let idx = |t: Node| self.index.get(&(t as usize)).copied().filter(|&i| i < at);
-            let is = |t: Node, op: ffi::ggml_op| !t.is_null() && (*t).op == op;
-            if !is(rope, ffi::ggml_op_GGML_OP_ROPE) || root(q) != rope {
+            if (*rope).op != ffi::ggml_op_GGML_OP_ROPE || root(q) != rope {
                 return Err("the query is not a RoPE's output");
             }
+            let ch = self.match_norm_rope(rope, at)?;
+            let [oi, mi, ri] = ch.nodes;
+            let (rms, mul) = (self.nodes[oi], self.nodes[mi]);
+            let NormRope { raw, w, pos, .. } = ch;
+            let ne = (*rope).ne;
+            let d = ne[0];
+            // The attention's query: tokens `off..` of the RoPE's output, viewed as they lie.
+            let (qt, rt) = (&*q, &*rope);
+            let bytes = (qt.data as usize).wrapping_sub(rt.data as usize);
+            let off = bytes / rt.nb[2];
+            if qt.data.is_null()
+                || (qt.data as usize) < (rt.data as usize)
+                || bytes % rt.nb[2] != 0
+                || qt.ne[0] != d
+                || qt.ne[1] != ne[1]
+                || qt.nb[..3] != rt.nb[..3]
+                || (qt.ne[3] != 1 && qt.nb[3] != qt.nb[2] * qt.ne[2] as usize)
+                || off as i64 + qt.ne[2] * qt.ne[3] > ne[2]
+            {
+                return Err("the query is not whole tokens of the RoPE's output");
+            }
+            if !self.only_read_by(rms, &[mi])
+                || !self.only_read_by(mul, &[ri])
+                || !self.only_read_by(rope, &[at])
+            {
+                return Err("the norm, the weight's product or the RoPE has other readers");
+            }
+            if !self.may_read_at(
+                at,
+                attn,
+                &[(raw, false), (w, false), (pos, false)],
+                &[oi, mi, ri],
+            ) {
+                return Err("the query rows' memory is reused before the attention");
+            }
+            // may_read_at sees each node's own output and sources; the writes mix_cast and
+            // gather moved earlier are not among them. None may touch what the attention now
+            // reads.
+            self.unmoved(at, &[raw, w, pos])?;
+            let f = qsa_attn::QNormRope {
+                raw,
+                w,
+                pos,
+                eps: ch.eps,
+                n_dims: ch.n_dims,
+                sections: ch.sections,
+                imrope: ch.imrope,
+                freq_base: ch.freq_base,
+                freq_scale: ch.freq_scale,
+                attn_factor: ch.attn_factor,
+                off: off as i32,
+            };
+            Ok((f, [oi, mi, ri]))
+        }
+    }
+
+    /// The chain `rope_multi(mul(rms_norm(raw, eps), w), pos)` ending at RoPE node `rope` (at
+    /// or before node `at`), as qwen4exp builds a head norm and RoPE (no frequency factors, no
+    /// YaRN, no offset) into F32 rows of their own, or why not.
+    ///
+    /// # Safety
+    /// `rope` is a valid ROPE node.
+    unsafe fn match_norm_rope(&self, rope: Node, at: usize) -> Result<NormRope, &'static str> {
+        // SAFETY: the caller's; nodes and sources are valid tensors of the graph.
+        unsafe {
+            let idx = |t: Node| self.index.get(&(t as usize)).copied().filter(|&i| i <= at);
+            let is = |t: Node, op: ffi::ggml_op| !t.is_null() && (*t).op == op;
             let mul = (*rope).src[0];
             let rms = if is(mul, ffi::ggml_op_GGML_OP_MUL) {
                 (*mul).src[0]
@@ -1411,8 +1568,8 @@ impl Graph {
             {
                 return Err("the RoPE's positions are not 4 per token");
             }
-            // The norm times the weight: of the query rows (columns contiguous), a weight of
-            // a row's size.
+            // The norm times the weight: of the rows (columns contiguous), a weight of a row's
+            // size.
             if (*mul).type_ != f32
                 || !(*mul).view_src.is_null()
                 || (*mul).ne != ne
@@ -1430,51 +1587,10 @@ impl Graph {
                 || (*w).ne != [d, 1, 1, 1]
                 || (*w).nb[0] != 4
             {
-                return Err("the norm is not of the query rows times a weight of a row");
+                return Err("the norm is not of the rows times a weight of a row");
             }
-            // The attention's query: tokens `off..` of the RoPE's output, viewed as they lie.
-            let (qt, rt) = (&*q, &*rope);
-            let bytes = (qt.data as usize).wrapping_sub(rt.data as usize);
-            let off = bytes / rt.nb[2];
-            if qt.data.is_null()
-                || (qt.data as usize) < (rt.data as usize)
-                || bytes % rt.nb[2] != 0
-                || qt.ne[0] != d
-                || qt.ne[1] != ne[1]
-                || qt.nb[..3] != rt.nb[..3]
-                || (qt.ne[3] != 1 && qt.nb[3] != qt.nb[2] * qt.ne[2] as usize)
-                || off as i64 + qt.ne[2] * qt.ne[3] > ne[2]
-            {
-                return Err("the query is not whole tokens of the RoPE's output");
-            }
-            if !self.only_read_by(rms, &[mi])
-                || !self.only_read_by(mul, &[ri])
-                || !self.only_read_by(rope, &[at])
-            {
-                return Err("the norm, the weight's product or the RoPE has other readers");
-            }
-            if !self.may_read_at(
-                at,
-                attn,
-                &[(raw, false), (w, false), (pos, false)],
-                &[oi, mi, ri],
-            ) {
-                return Err("the query rows' memory is reused before the attention");
-            }
-            // may_read_at sees each node's own output and sources; the writes mix_cast and
-            // gather moved earlier (rewrites of nodes before `at`, so already made) are not
-            // among them. None may touch what the attention now reads.
-            for x in [raw, w, pos] {
-                let from = self.index.get(&(root(x) as usize)).map_or(0, |&i| i + 1);
-                if self
-                    .moved
-                    .iter()
-                    .any(|&(k, t)| k >= from && k < at && overlap(t, x))
-                {
-                    return Err("a rewritten node writes what the attention would read");
-                }
-            }
-            let f = qsa_attn::QNormRope {
+            Ok(NormRope {
+                nodes: [oi, mi, ri],
                 raw,
                 w,
                 pos,
@@ -1485,9 +1601,319 @@ impl Graph {
                 freq_base: pf(5),
                 freq_scale: pf(6),
                 attn_factor: pf(8),
-                off: off as i32,
+            })
+        }
+    }
+
+    /// qwen4exp's prompt-step rows at node `at` (a `set_rows` or a RoPE the model named, more
+    /// than [`DECODE_TOKENS`](crate::model::qwen4::qsa_attn::DECODE_TOKENS) tokens) made in
+    /// one launch, with ggml-cuda's bits (#1183):
+    ///
+    /// - an attention layer's K cache write: the `cont` of the joined projection's rows (if
+    ///   any), `rms_norm`, `mul`, `rope_multi` and `set_rows` ([`norm_rope::make_rows_fold`]);
+    /// - its V cache write: the `cont` and `set_rows` (the same op, copying);
+    /// - the indexer's query: `rms_norm`, `mul` and `rope_multi` into the RoPE's tensor;
+    /// - the indexer cache rows: `fill`, `concat` and `set_rows` ([`norm_rope::make_idx_append`]).
+    ///
+    /// The op runs at `at`, reading the chain's first input there; the chain's other nodes
+    /// become `GGML_OP_NONE`. Why a K or query chain does not fold, logged once.
+    ///
+    /// # Safety
+    /// `at` is a node index.
+    unsafe fn rows_fold(&mut self, at: usize, c: &mut Counts) {
+        if rows_fold_off() {
+            return;
+        }
+        // SAFETY: the caller's.
+        unsafe {
+            let Some(m) = self.match_rows(at) else {
+                return;
             };
-            Ok((f, [oi, mi, ri]))
+            match m {
+                Ok((make, none, which)) => {
+                    let node = self.nodes[at];
+                    match make {
+                        RowsMake::Fold(f) => norm_rope::make_rows_fold(node, &f),
+                        RowsMake::Idx { raw, cache, cells } => {
+                            norm_rope::make_idx_append(node, raw, cache, cells)
+                        }
+                    }
+                    for i in none {
+                        (*self.nodes[i]).op = ffi::ggml_op_GGML_OP_NONE;
+                        self.none[i] = true;
+                    }
+                    match which {
+                        Rows::K => c.k_rows += 1,
+                        Rows::V => c.v_rows += 1,
+                        Rows::Query => c.iq_rope += 1,
+                        Rows::Idx => c.idx_rows += 1,
+                    }
+                }
+                Err((which, why)) => {
+                    if !ROWS_FOLD_LOGGED[which as usize].swap(true, Ordering::Relaxed) {
+                        let what = match which {
+                            Rows::K => "the K cache write's norm and RoPE",
+                            Rows::V => "the V cache write's copy",
+                            Rows::Query => "the indexer query's norm and RoPE",
+                            Rows::Idx => "the indexer cache rows",
+                        };
+                        tracing::info!("{what} stay ggml's nodes (logged once): {why}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`Self::rows_fold`]'s chain at `at`: what to make, the nodes it turns off and which
+    /// rows, or why not; None for a node the model did not name.
+    ///
+    /// # Safety
+    /// `at` is the index of a `set_rows` or ROPE node.
+    #[allow(clippy::type_complexity)]
+    unsafe fn match_rows(
+        &self,
+        at: usize,
+    ) -> Option<Result<(RowsMake, Vec<usize>, Rows), (Rows, &'static str)>> {
+        use crate::model::qwen4::qsa_attn::DECODE_TOKENS;
+        // SAFETY: the caller's; nodes and sources are valid tensors of the graph.
+        unsafe {
+            let node = self.nodes[at];
+            let f32 = ffi::ggml_type_GGML_TYPE_F32;
+            let idx = |t: Node| self.index.get(&(t as usize)).copied().filter(|&i| i < at);
+            // The indexer's query: the RoPE itself.
+            if (*node).op == ffi::ggml_op_GGML_OP_ROPE {
+                if !has_name(node, norm_rope::IQ_ROPE) {
+                    return None;
+                }
+                let r = (|| {
+                    let ch = self.match_norm_rope(node, at)?;
+                    let ne = (*node).ne;
+                    if ne[2] <= DECODE_TOKENS as i64 {
+                        return Err("a decode step");
+                    }
+                    if !norm_rope::rows_fold_fits(ne[0], Some(ch.n_dims)) {
+                        return Err("rows of other than 128 or 256 columns, or a RoPE's width");
+                    }
+                    let [oi, mi, _] = ch.nodes;
+                    let (rms, mul) = (self.nodes[oi], self.nodes[mi]);
+                    if !self.only_read_by(rms, &[mi]) || !self.only_read_by(mul, &[at]) {
+                        return Err("the norm or the weight's product has other readers");
+                    }
+                    let inputs = [(ch.raw, true), (ch.w, false), (ch.pos, false)];
+                    if !self.may_read_at(at, node, &inputs, &[oi, mi]) {
+                        return Err("the rows' memory is reused before the RoPE");
+                    }
+                    self.unmoved(at, &[ch.raw, ch.w, ch.pos])?;
+                    let f = norm_rope::RowsFold {
+                        x: ch.raw,
+                        norm: Some(ch.norm()),
+                        cache: None,
+                    };
+                    Ok((RowsMake::Fold(f), vec![oi, mi], Rows::Query))
+                })();
+                return Some(r.map_err(|why| (Rows::Query, why)));
+            }
+            // A cache write: set_rows(cache, rows, cells).
+            let (rows, cells, cache) = ((*node).src[0], (*node).src[1], (*node).src[2]);
+            if rows.is_null() || cells.is_null() || cache.is_null() {
+                return None;
+            }
+            let mut top = rows;
+            while is_view_op((*top).op) && !(*top).src[0].is_null() {
+                top = (*top).src[0];
+            }
+            let which = if has_name(top, norm_rope::K_ROPE) {
+                Rows::K
+            } else if has_name(top, norm_rope::V_CONT) {
+                Rows::V
+            } else if has_name(top, norm_rope::IDX_ROWS) {
+                Rows::Idx
+            } else {
+                return None;
+            };
+            let r = (|| {
+                let n = (*rows).ne[1];
+                if n <= DECODE_TOKENS as i64 {
+                    return Err("a decode step");
+                }
+                // The cache: F16 rows on the GPU (a host pool or tier keeps ggml's nodes, as
+                // the direct writes do), one a cell; I32 cells, one a row.
+                let buf = (*cache).buffer;
+                if (*cache).type_ != ffi::ggml_type_GGML_TYPE_F16
+                    || (*cache).data.is_null()
+                    || (*cache).nb[0] != 2
+                    || (*cache).ne[2] != 1
+                    || (*cache).ne[3] != 1
+                    || (*cache).ne[0] != (*rows).ne[0]
+                    || buf.is_null()
+                    || ffi::ggml_backend_buffer_is_host(buf)
+                {
+                    return Err("not an F16 cache in GPU memory");
+                }
+                if (*cells).type_ != ffi::ggml_type_GGML_TYPE_I32
+                    || !ffi::ggml_is_contiguous(cells)
+                    || (*cells).ne != [n, 1, 1, 1]
+                    || (*rows).ne[2] != 1
+                    || (*rows).ne[3] != 1
+                    || root(rows) != top
+                {
+                    return Err("not one cell a row");
+                }
+                match which {
+                    Rows::K => {
+                        if (*top).op != ffi::ggml_op_GGML_OP_ROPE {
+                            return Err("the rows are not a RoPE's output");
+                        }
+                        let ch = self.match_norm_rope(top, at)?;
+                        let [oi, mi, ri] = ch.nodes;
+                        let (rms, mul) = (self.nodes[oi], self.nodes[mi]);
+                        let ne = (*top).ne;
+                        if ne[0] * ne[1] != (*rows).ne[0] || ne[2] != n {
+                            return Err("the rows are not the RoPE's heads");
+                        }
+                        if !norm_rope::rows_fold_fits(ne[0], Some(ch.n_dims)) {
+                            return Err("heads or a RoPE width the kernel does not take");
+                        }
+                        if !self.only_read_by(rms, &[mi])
+                            || !self.only_read_by(mul, &[ri])
+                            || !self.only_read_by(top, &[at])
+                        {
+                            return Err("the norm, the product or the RoPE has other readers");
+                        }
+                        let mut none = vec![oi, mi, ri];
+                        // The copy of the joined projection's rows, read in place instead.
+                        let mut x = ch.raw;
+                        if (*x).op == ffi::ggml_op_GGML_OP_CONT
+                            && let Some(ci) = idx(x)
+                            && !self.none[ci]
+                            && self.only_read_by(x, &[oi])
+                        {
+                            let s = (*x).src[0];
+                            if !s.is_null()
+                                && (*s).type_ == f32
+                                && !(*s).data.is_null()
+                                && (*s).ne == ne
+                                && (*s).nb[0] == 4
+                            {
+                                x = s;
+                                none.insert(0, ci);
+                            }
+                        }
+                        let inputs = [(x, false), (ch.w, false), (ch.pos, false)];
+                        if !self.may_read_at(at, node, &inputs, &none) {
+                            return Err("the rows' memory is reused before the cache write");
+                        }
+                        self.unmoved(at, &[x, ch.w, ch.pos])?;
+                        let f = norm_rope::RowsFold {
+                            x,
+                            norm: Some(ch.norm()),
+                            cache: Some((cache, cells)),
+                        };
+                        Ok((RowsMake::Fold(f), none, Rows::K))
+                    }
+                    Rows::V => {
+                        let Some(ci) = idx(top) else {
+                            return Err("the copy is not the graph's");
+                        };
+                        let x = (*top).src[0];
+                        let ne = (*top).ne;
+                        if (*top).op != ffi::ggml_op_GGML_OP_CONT
+                            || self.none[ci]
+                            || (*top).type_ != f32
+                            || x.is_null()
+                            || (*x).type_ != f32
+                            || (*x).data.is_null()
+                            || (*x).ne != ne
+                            || (*x).nb[0] != 4
+                            || ne[3] != 1
+                            || ne[0] * ne[1] != (*rows).ne[0]
+                            || ne[2] != n
+                        {
+                            return Err("the rows are not a copy of F32 heads");
+                        }
+                        if !norm_rope::rows_fold_fits(ne[0], None) {
+                            return Err("heads of other than 128 or 256 columns");
+                        }
+                        if !self.only_read_by(top, &[at]) {
+                            return Err("the copy has other readers");
+                        }
+                        if !self.may_read_at(at, node, &[(x, false)], &[ci]) {
+                            return Err("the rows' memory is reused before the cache write");
+                        }
+                        self.unmoved(at, &[x])?;
+                        let f = norm_rope::RowsFold {
+                            x,
+                            norm: None,
+                            cache: Some((cache, cells)),
+                        };
+                        Ok((RowsMake::Fold(f), vec![ci], Rows::V))
+                    }
+                    Rows::Idx => {
+                        // concat(raw, fill(zeros), 0): the raw key, then a zero pool-key half.
+                        let (Some(ci), raw, zeros) = (idx(top), (*top).src[0], (*top).src[1])
+                        else {
+                            return Err("the rows are not the graph's");
+                        };
+                        let zi = if zeros.is_null() { None } else { idx(zeros) };
+                        let Some(zi) = zi else {
+                            return Err("the zero half is not the graph's");
+                        };
+                        if raw.is_null() {
+                            return Err("the rows are not a raw key and a zero half");
+                        }
+                        let d = (*raw).ne[0];
+                        if (*top).op != ffi::ggml_op_GGML_OP_CONCAT
+                            || (*top).op_params[0] != 0
+                            || self.none[ci]
+                            || self.none[zi]
+                            || (*top).type_ != f32
+                            || (*top).ne != [2 * d, n, 1, 1]
+                            || (*raw).type_ != f32
+                            || (*raw).data.is_null()
+                            || (*raw).ne != [d, n, 1, 1]
+                            || (*raw).nb[0] != 4
+                            || (*zeros).op != ffi::ggml_op_GGML_OP_FILL
+                            || (*zeros).op_params[0] != 0
+                            || (*zeros).ne != [d, n, 1, 1]
+                        {
+                            return Err("the rows are not a raw key and a zero half");
+                        }
+                        if !self.only_read_by(top, &[at]) || !self.only_read_by(zeros, &[ci]) {
+                            return Err("the rows or the zeros have other readers");
+                        }
+                        if !self.may_read_at(at, node, &[(raw, false)], &[ci, zi]) {
+                            return Err("the key's memory is reused before the cache write");
+                        }
+                        self.unmoved(at, &[raw])?;
+                        Ok((RowsMake::Idx { raw, cache, cells }, vec![zi, ci], Rows::Idx))
+                    }
+                    Rows::Query => unreachable!("a set_rows node"),
+                }
+            })();
+            Some(r.map_err(|why| (which, why)))
+        }
+    }
+
+    /// Whether none of the writes moved earlier ([`Self::moved`], rewrites of nodes before
+    /// `at`, so already made) lands in what an op at `at` reads (`xs`): [`Self::may_read_at`]
+    /// sees each node's own output and sources only.
+    ///
+    /// # Safety
+    /// Valid tensors of the graph.
+    unsafe fn unmoved(&self, at: usize, xs: &[Node]) -> Result<(), &'static str> {
+        // SAFETY: the caller's.
+        unsafe {
+            for &x in xs {
+                let from = self.index.get(&(root(x) as usize)).map_or(0, |&i| i + 1);
+                if self
+                    .moved
+                    .iter()
+                    .any(|&(k, t)| k >= from && k < at && overlap(t, x))
+                {
+                    return Err("a rewritten node writes what the op would read");
+                }
+            }
+            Ok(())
         }
     }
 

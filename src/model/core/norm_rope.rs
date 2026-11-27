@@ -64,6 +64,15 @@ static IDX_APPEND: ExternalOp = ExternalOp {
     cuda: None,
 };
 
+static ROWS_FOLD: ExternalOp = ExternalOp {
+    name: "rows_fold",
+    cpu: cpu_rows_fold,
+    #[cfg(feature = "cuda")]
+    cuda: Some(cuda_rows_fold),
+    #[cfg(not(feature = "cuda"))]
+    cuda: None,
+};
+
 /// ggml's `GGML_ROPE_TYPE_MROPE` (sections in order); IMROPE interleaves them.
 const ROPE_MROPE: i32 = 8;
 use super::ROPE_IMROPE;
@@ -393,6 +402,175 @@ pub(crate) fn pool_key<'a>(
     )
 }
 
+/// The names Qwen3.8-Flash-Next's graphs give the nodes [`make_rows_fold`]'s chains end in, so
+/// that `node_fuse` folds only those (#1183): an attention layer's K RoPE (of the cache write),
+/// V `cont` (of the cache write), indexer query RoPE and indexer rows `concat`.
+pub(crate) const K_ROPE: &str = "fn_k_rope";
+pub(crate) const V_CONT: &str = "fn_v_cont";
+pub(crate) const IQ_ROPE: &str = "fn_iq_rope";
+pub(crate) const IDX_ROWS: &str = "fn_idx_rows";
+
+/// The norm and RoPE of a [`RowsFold`]: `rope_multi(mul(rms_norm(x, eps), w), pos)` as ggml's
+/// nodes were made (no frequency factors, `ext_factor` 0).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RowsNorm {
+    /// F32 `[d]`.
+    pub w: *mut ffi::ggml_tensor,
+    /// I32 `[4 n]`.
+    pub pos: *mut ffi::ggml_tensor,
+    pub eps: f32,
+    pub n_dims: i32,
+    /// ggml's mrope sections, each at most 255.
+    pub sections: [i32; 4],
+    /// `GGML_ROPE_TYPE_IMROPE`, else `GGML_ROPE_TYPE_MROPE`.
+    pub imrope: bool,
+    pub freq_base: f32,
+    pub freq_scale: f32,
+    pub attn_factor: f32,
+}
+
+/// What [`make_rows_fold`] makes a node compute: rows `x` (F32 `[d, heads, n]`, columns
+/// contiguous), normed and rotated or copied, into the node (F32 `[d, heads, n]`, contiguous)
+/// or into the F16 cache `[d × heads, cells]` at cells `cells` (I32 `[n]`) as `set_rows`
+/// writes them.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RowsFold {
+    pub x: *mut ffi::ggml_tensor,
+    /// None: a copy.
+    pub norm: Option<RowsNorm>,
+    /// The cache and the cells; None: into the node.
+    pub cache: Option<(*mut ffi::ggml_tensor, *mut ffi::ggml_tensor)>,
+}
+
+/// Whether [`make_rows_fold`]'s kernel takes rows of `d` columns with a RoPE of `n_dims`
+/// rotated columns (None: a copy): 128 or 256 columns (one a thread of ggml's 256-thread
+/// norm), a rotated half a whole number of warps wide (64, 128 or, at 256 columns, 256).
+pub(crate) fn rows_fold_fits(d: i64, n_dims: Option<i32>) -> bool {
+    (d == 128 || d == 256)
+        && n_dims.is_none_or(|r| r > 0 && r % 64 == 0 && i64::from(r) <= d && r != 192)
+}
+
+/// [`RowsFold`]'s parameter 0: bit 0 the norm, bit 1 the cache.
+const RF_NORM: i32 = 1;
+const RF_CACHE: i32 = 2;
+
+/// Turns the allocated node `node` into one [`rows_fold`](ROWS_FOLD) launch computing `f`
+/// (`node_fuse`, after allocation, #1183): the node's own memory (F32 rows) or the cache's
+/// rows hold what ggml's chain wrote there, bit for bit.
+///
+/// # Safety
+/// As [`crate::ggml::make_external`] (`node` may be a `set_rows` node, a view of the cache);
+/// `f`'s tensors valid and allocated, of the shapes [`RowsFold`] says, and [`rows_fold_fits`].
+pub(crate) unsafe fn make_rows_fold(node: *mut ffi::ggml_tensor, f: &RowsFold) {
+    let mut srcs = vec![f.x];
+    let mut params = [0i32; 8];
+    if let Some(n) = &f.norm {
+        assert!(
+            n.sections.iter().all(|s| (0..256).contains(s)),
+            "rows_fold: RoPE sections {:?}",
+            n.sections
+        );
+        let packed = n
+            .sections
+            .iter()
+            .enumerate()
+            .fold(0u32, |a, (i, &s)| a | ((s as u32) << (8 * i)));
+        srcs.extend([n.w, n.pos]);
+        params[0] |= RF_NORM;
+        params[1..].copy_from_slice(&[
+            n.eps.to_bits() as i32,
+            n.n_dims,
+            packed as i32,
+            n.imrope as i32,
+            n.freq_base.to_bits() as i32,
+            n.freq_scale.to_bits() as i32,
+            n.attn_factor.to_bits() as i32,
+        ]);
+    }
+    if let Some((cache, cells)) = f.cache {
+        srcs.extend([cache, cells]);
+        params[0] |= RF_CACHE;
+    }
+    // SAFETY: the caller's.
+    unsafe { crate::ggml::make_external(node, &ROWS_FOLD, &srcs, &params) };
+}
+
+/// Turns the allocated `set_rows` node `node` of an indexer cache's rows (ggml's `fill`,
+/// `concat` and `set_rows` of [`idx_append`]'s chain) into an [`idx_append`] launch of `raw`
+/// (F32 `[d, n]`, columns contiguous), `cache` (F16 `[2 d, cells]`) and `cells` (I32 `[n]`):
+/// `node_fuse`, after allocation (#1183).
+///
+/// # Safety
+/// As [`crate::ggml::make_external`] (`node` a view of the cache); the tensors valid and
+/// allocated, of those shapes.
+pub(crate) unsafe fn make_idx_append(
+    node: *mut ffi::ggml_tensor,
+    raw: *mut ffi::ggml_tensor,
+    cache: *mut ffi::ggml_tensor,
+    cells: *mut ffi::ggml_tensor,
+) {
+    // SAFETY: the caller's.
+    unsafe { crate::ggml::make_external(node, &IDX_APPEND, &[raw, cache, cells], &[]) };
+}
+
+/// Whether a graph node is an [`idx_append`] op.
+///
+/// # Safety
+/// `node` is a valid tensor.
+#[cfg(test)]
+pub(crate) unsafe fn is_idx_append(node: *const ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's.
+    unsafe { crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &IDX_APPEND)) }
+}
+
+/// Whether a graph node is a [`make_rows_fold`] op.
+///
+/// # Safety
+/// `node` is a valid tensor.
+#[cfg(test)]
+pub(crate) unsafe fn is_rows_fold(node: *const ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's.
+    unsafe { crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &ROWS_FOLD)) }
+}
+
+/// A [`make_rows_fold`] node's sources and parameters.
+struct RowsOf<'a> {
+    x: &'a ffi::ggml_tensor,
+    /// The weight, the positions and the norm's and RoPE's parameters.
+    norm: Option<(&'a ffi::ggml_tensor, &'a ffi::ggml_tensor, Params)>,
+    cache: Option<(&'a ffi::ggml_tensor, &'a ffi::ggml_tensor)>,
+}
+
+/// # Safety
+/// `dst` is a [`make_rows_fold`] node.
+unsafe fn rows_of(dst: &ffi::ggml_tensor) -> RowsOf<'_> {
+    let p = crate::ggml::external_params(dst);
+    let f = |i: usize| f32::from_bits(p[i] as u32);
+    // SAFETY: the caller's: the sources make_rows_fold put there.
+    unsafe {
+        let src = |i: usize| &*dst.src[i];
+        let norm = (p[0] & RF_NORM != 0).then(|| {
+            let params = Params {
+                eps: f(1),
+                n_dims: p[2] as usize,
+                sections: std::array::from_fn(|i| (((p[3] as u32) >> (8 * i)) & 0xff) as i32),
+                imrope: p[4] != 0,
+                freq_base: f(5),
+                freq_scale: f(6),
+                attn_factor: f(7),
+            };
+            (src(1), src(2), params)
+        });
+        let at = if norm.is_some() { 3 } else { 1 };
+        let cache = (p[0] & RF_CACHE != 0).then(|| (src(at), src(at + 1)));
+        RowsOf {
+            x: src(0),
+            norm,
+            cache,
+        }
+    }
+}
+
 /// The params: eps, then [`Rope::params`].
 struct Params {
     eps: f32,
@@ -400,6 +578,10 @@ struct Params {
     sections: [i32; 4],
     imrope: bool,
     freq_base: f32,
+    /// 1 but in [`make_rows_fold`]'s.
+    freq_scale: f32,
+    /// 1 but in [`make_rows_fold`]'s.
+    attn_factor: f32,
 }
 
 fn params(dst: &ffi::ggml_tensor) -> Params {
@@ -410,6 +592,8 @@ fn params(dst: &ffi::ggml_tensor) -> Params {
         sections: [p[2], p[3], p[4], p[5]],
         imrope: p[6] != 0,
         freq_base: f32::from_bits(p[7] as u32),
+        freq_scale: 1.0,
+        attn_factor: 1.0,
     }
 }
 
@@ -444,8 +628,9 @@ fn cpu_row(x: &[f32], w: &[f32], out: &mut [f32], pos: &[i32], t: usize, n_pos: 
         } else {
             3
         };
-        let theta = pos[t + row * n_pos] as f32 * theta_scale.powf(i as f32);
+        let theta = p.freq_scale * (pos[t + row * n_pos] as f32 * theta_scale.powf(i as f32));
         let (sin, cos) = theta.sin_cos();
+        let (sin, cos) = (sin * p.attn_factor, cos * p.attn_factor);
         let (x0, x1) = (y[i], y[i + half]);
         out[i] = x0 * cos - x1 * sin;
         out[i + half] = x0 * sin + x1 * cos;
@@ -557,6 +742,46 @@ unsafe fn cpu_idx_append(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
     }
 }
 
+unsafe fn cpu_rows_fold(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
+    // SAFETY: a node made by `make_rows_fold`, host tensors (the reference for tests: the CPU
+    // graphs keep ggml's chains).
+    unsafe {
+        let f = rows_of(dst);
+        let x = f.x;
+        let [d, h, n] = [x.ne[0] as usize, x.ne[1] as usize, x.ne[2] as usize];
+        let norm = f.norm.as_ref().map(|(w, pos, p)| {
+            let w = std::slice::from_raw_parts(w.data as *const f32, d);
+            let pos = std::slice::from_raw_parts(pos.data as *const i32, 4 * n);
+            (w, pos, p)
+        });
+        let cells = f
+            .cache
+            .map(|(_, c)| std::slice::from_raw_parts(c.data as *const i32, n));
+        for r in (ith..h * n).step_by(nth) {
+            let (hh, t) = (r % h, r / h);
+            let xr = (x.data as *const u8).add(hh * x.nb[1] + t * x.nb[2]) as *const f32;
+            let xr = std::slice::from_raw_parts(xr, d);
+            let mut y = xr.to_vec();
+            if let Some((w, pos, p)) = norm {
+                cpu_row(xr, w, &mut y, pos, t, n, p);
+            }
+            match (f.cache, cells) {
+                (Some((c, _)), Some(cells)) => {
+                    let row = (c.data as *mut u8).add(cells[t] as usize * c.nb[1]) as *mut u16;
+                    let row = std::slice::from_raw_parts_mut(row.add(hh * d), d);
+                    for (o, v) in row.iter_mut().zip(y) {
+                        *o = ffi::ggml_fp32_to_fp16(v);
+                    }
+                }
+                _ => {
+                    let out = std::slice::from_raw_parts_mut((dst.data as *mut f32).add(r * d), d);
+                    out.copy_from_slice(&y);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(feature = "cuda")]
 #[repr(C)]
 struct RopeC {
@@ -652,7 +877,27 @@ struct IdxAppendC {
 }
 
 #[cfg(feature = "cuda")]
+#[repr(C)]
+struct RowsFoldC {
+    x: *const f32,
+    x_s1: i64,
+    x_s2: i64,
+    w: *const f32,
+    pos: *const i32,
+    out: *mut f32,
+    cache: *mut u16,
+    ld: i64,
+    cells: *const i32,
+    ncols: i32,
+    n_head: i32,
+    n_tok: i32,
+    eps: f32,
+    rope: RopeC,
+}
+
+#[cfg(feature = "cuda")]
 unsafe extern "C" {
+    fn legion_rows_fold_launch(p: *const RowsFoldC, stream: *mut c_void) -> i32;
     fn legion_norm_rope_launch(p: *const NormRopeC, stream: *mut c_void) -> i32;
     fn legion_pool_key_launch(p: *const PoolKeyC, stream: *mut c_void) -> i32;
     fn legion_kv_append_launch(p: *const KvAppendC, stream: *mut c_void) -> i32;
@@ -770,5 +1015,75 @@ unsafe fn cuda_idx_append(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
     }
 }
 
+#[cfg(feature = "cuda")]
+unsafe fn cuda_rows_fold(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
+    // SAFETY: a node made by `make_rows_fold`, device tensors of the stream's device.
+    unsafe {
+        let f = rows_of(dst);
+        let x = f.x;
+        let (w, pos, eps, rope) = match &f.norm {
+            Some((w, pos, p)) => (
+                w.data as *const f32,
+                pos.data as *const i32,
+                p.eps,
+                RopeC {
+                    n_dims: p.n_dims as i32,
+                    sections: p.sections,
+                    imrope: p.imrope as i32,
+                    freq_base: p.freq_base,
+                    freq_scale: p.freq_scale,
+                    attn_factor: p.attn_factor,
+                },
+            ),
+            None => (
+                std::ptr::null(),
+                std::ptr::null(),
+                0.0,
+                RopeC {
+                    n_dims: 0,
+                    sections: [0; 4],
+                    imrope: 0,
+                    freq_base: 0.0,
+                    freq_scale: 1.0,
+                    attn_factor: 1.0,
+                },
+            ),
+        };
+        let (out, cache, ld, cells) = match f.cache {
+            Some((c, cells)) => (
+                std::ptr::null_mut(),
+                c.data as *mut u16,
+                (c.nb[1] / 2) as i64,
+                cells.data as *const i32,
+            ),
+            None => (
+                dst.data as *mut f32,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            ),
+        };
+        let c = RowsFoldC {
+            x: x.data as *const f32,
+            x_s1: (x.nb[1] / 4) as i64,
+            x_s2: (x.nb[2] / 4) as i64,
+            w,
+            pos,
+            out,
+            cache,
+            ld,
+            cells,
+            ncols: x.ne[0] as i32,
+            n_head: x.ne[1] as i32,
+            n_tok: x.ne[2] as i32,
+            eps,
+            rope,
+        };
+        launched("rows_fold", legion_rows_fold_launch(&c, stream))
+    }
+}
+
+#[cfg(test)]
+mod rows_tests;
 #[cfg(test)]
 mod tests;

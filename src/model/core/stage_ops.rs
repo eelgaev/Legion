@@ -132,6 +132,9 @@ pub(crate) const PURE: &[&str] = &[
     "pool_key",
     "kv_append",
     "idx_append",
+    // qwen4exp's prompt-step K / V / indexer rows folded after allocation (#1183): one kernel,
+    // picked by the row size and the RoPE's width.
+    "rows_fold",
     // Selections on thread-block clusters (compute capability 9.0+): the QSA top-k and the
     // heads' greedy argmax, a kernel picked by the row length (#827).
     "cluster_topk",

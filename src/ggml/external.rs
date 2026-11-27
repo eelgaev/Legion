@@ -182,8 +182,9 @@ impl Context {
 /// memory), computed by `op` instead (a post-allocation rewrite, [`super::post_alloc`]).
 ///
 /// # Safety
-/// `node` is a valid node of an allocated graph that has not run, not a view; `srcs` are valid
-/// tensors of that graph.
+/// `node` is a valid node of an allocated graph that has not run, not a view (but a node whose
+/// op writes into its view source, as `set_rows` writes its cache, which `op` then writes);
+/// `srcs` are valid tensors of that graph.
 pub(crate) unsafe fn make_external(
     node: *mut ffi::ggml_tensor,
     op: &'static ExternalOp,

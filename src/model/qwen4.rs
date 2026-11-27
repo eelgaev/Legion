@@ -2120,7 +2120,8 @@ impl Model {
             pass.graph.borrow_mut().expand(node);
         } else {
             let zeros = ctx.fill(ctx.new_tensor(types::F32, &[d, n]), 0.0);
-            let rows = ctx.concat(k_raw, zeros, 0);
+            // `node_fuse` writes these rows in one launch in prompt steps (#1183).
+            let rows = ctx.concat(k_raw, zeros, 0).named(norm_rope::IDX_ROWS);
             pass.kv
                 .idx_write(ctx, &mut pass.graph.borrow_mut(), il, rows, pass.cells);
         }
@@ -2128,7 +2129,9 @@ impl Model {
         let qi = mm(self.lw(il, "indexer.q_proj.weight")?);
         let qi = ctx.reshape_3d(qi, d, q.n_head, n);
         let w = self.lw(il, "indexer.q_norm.weight")?;
-        Ok(Some(self.norm_rope(ctx, qi, w, pass.pos)))
+        // `node_fuse` makes the norm and RoPE one launch in prompt steps (#1183).
+        let iq = self.norm_rope(ctx, qi, w, pass.pos);
+        Ok(Some(iq.named(norm_rope::IQ_ROPE)))
     }
 
     /// Group `gi`'s pool keys in sparse-attention layer `il`: those of the pools this step

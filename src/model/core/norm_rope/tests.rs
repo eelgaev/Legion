@@ -6,7 +6,7 @@ use super::*;
 use crate::ggml::{Backend, ComputeAllocator};
 
 /// Deterministic values in [-1, 1).
-fn noise(n: usize, seed: u64) -> Vec<f32> {
+pub(super) fn noise(n: usize, seed: u64) -> Vec<f32> {
     let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
     (0..n)
         .map(|_| {
@@ -19,7 +19,7 @@ fn noise(n: usize, seed: u64) -> Vec<f32> {
 }
 
 /// Max |a - b| over max |b|.
-fn rel(a: &[f32], b: &[f32]) -> f32 {
+pub(super) fn rel(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
     let scale = b.iter().fold(0f32, |m, v| m.max(v.abs()));
     a.iter()
@@ -29,10 +29,10 @@ fn rel(a: &[f32], b: &[f32]) -> f32 {
         / scale
 }
 
-const EPS: f32 = 1e-6;
+pub(super) const EPS: f32 = 1e-6;
 
 /// qwen3.5 / qwen4exp's RoPE (64 of 256 dims, sections 11, 11, 10), or plain MROPE.
-fn rope(imrope: bool, n_dims: i32) -> Rope {
+pub(super) fn rope(imrope: bool, n_dims: i32) -> Rope {
     Rope {
         n_dims,
         sections: [11, 11, 10, 0],
@@ -44,7 +44,12 @@ fn rope(imrope: bool, n_dims: i32) -> Rope {
     }
 }
 
-fn chain_rope<'a>(ctx: &'a Context, t: Tensor<'a>, pos: Tensor<'a>, r: &Rope) -> Tensor<'a> {
+pub(super) fn chain_rope<'a>(
+    ctx: &'a Context,
+    t: Tensor<'a>,
+    pos: Tensor<'a>,
+    r: &Rope,
+) -> Tensor<'a> {
     ctx.rope_multi(
         t,
         pos,
@@ -63,7 +68,7 @@ fn chain_rope<'a>(ctx: &'a Context, t: Tensor<'a>, pos: Tensor<'a>, r: &Rope) ->
 
 /// Positions: per section row, token t at `base + t` (rows 1-3 offset a little, so each
 /// section's row is seen).
-fn positions(n: usize, base: i32) -> Vec<i32> {
+pub(super) fn positions(n: usize, base: i32) -> Vec<i32> {
     (0..4)
         .flat_map(|s| (0..n as i32).map(move |t| base + t + 3 * s))
         .collect()
@@ -108,7 +113,7 @@ fn norm_rope_case(
     (op.to_f32(), chain.to_f32())
 }
 
-fn as_bytes(v: &[i32]) -> &[u8] {
+pub(super) fn as_bytes(v: &[i32]) -> &[u8] {
     // SAFETY: plain integers.
     unsafe { std::slice::from_raw_parts(v.as_ptr().cast(), v.len() * 4) }
 }
@@ -257,7 +262,7 @@ fn ropes_the_kernels_do_not_take_do_not_fit() {
 }
 
 #[cfg(feature = "cuda")]
-fn gpu() -> Backend {
+pub(super) fn gpu() -> Backend {
     use crate::ggml::{DeviceKind, device_by_kind};
     device_by_kind(DeviceKind::Gpu)
         .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
@@ -449,7 +454,7 @@ fn cuda_bench_pool_key() {
 }
 
 /// Reads an F16 tensor as F32.
-fn f16s(t: Tensor<'_>) -> Vec<f32> {
+pub(super) fn f16s(t: Tensor<'_>) -> Vec<f32> {
     t.bytes()
         .as_chunks::<2>()
         .0
@@ -468,7 +473,7 @@ fn f16_caches<'a>(ctx: &'a Context, row: i64, rows: i64) -> [Tensor<'a>; 2] {
     })
 }
 
-fn fill_f16(t: Tensor<'_>, seed: u64) {
+pub(super) fn fill_f16(t: Tensor<'_>, seed: u64) {
     let h: Vec<u8> = noise(t.elements(), seed)
         .iter()
         .flat_map(|&v| unsafe { ffi::ggml_fp32_to_fp16(v) }.to_le_bytes())
@@ -477,7 +482,7 @@ fn fill_f16(t: Tensor<'_>, seed: u64) {
 }
 
 /// Distinct cells of `n` tokens among `rows`.
-fn cells(n: i64, rows: i64) -> Vec<i32> {
+pub(super) fn cells(n: i64, rows: i64) -> Vec<i32> {
     (0..n).map(|t| ((t * 7 + 3) % rows) as i32).collect()
 }
 

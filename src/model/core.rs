@@ -4297,8 +4297,17 @@ impl Model {
         } else {
             cont(k)
         };
+        let v_copied = !v.is_contiguous();
         let v = cont(v);
         let k = self.norm_rope(ctx, k, w, pos);
+        // qwen4exp's prompt steps: `node_fuse` folds the K chain and the V copy into the
+        // cache writes after allocation (#1183); the names say which nodes it may fold.
+        if !pass.tap.on && crate::model::qwen4::params(hp).is_some() {
+            k.named(norm_rope::K_ROPE);
+            if v_copied {
+                v.named(norm_rope::V_CONT);
+            }
+        }
         pass.kv
             .write(ctx, &mut pass.graph.borrow_mut(), il, k, v, cells);
         Ok(Some((k, v)))
