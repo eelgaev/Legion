@@ -13,7 +13,8 @@
 //!
 //! The grammar covers what follows the `<tool_call>` token up to (not including) the
 //! `</tool_call>` token, which the caller makes the grammar's only end token. `NAME` is one of
-//! the request's tools. A strict tool's parameters follow its schema: its `properties` in
+//! the request's tools (with `--undeclared-tool-calls call`, also any other name, whose call
+//! takes any parameters). A strict tool's parameters follow its schema: its `properties` in
 //! declaration order (the required ones always, the others optionally), nothing else. A value
 //! the parser reads as a string (the property's `type` is or includes `"string"`, or it has no
 //! `type`) is raw text up to `\n</parameter>` (or one of its `enum` / `const` strings); any other
@@ -82,14 +83,15 @@ pub(crate) fn qwen3_coder(tools: &[ToolSpec<'_>], opts: &Options) -> Result<Node
         ]));
     }
     if opts.undeclared_names {
-        // A call whose name the request did not declare: the same shape, any name. The
+        // A call whose name the request did not declare: the same shape, any other name
+        // (declared ones keep their own parameters), one the parser reads back as it is. The
         // parser hands it to the client instead of the markup leaking out as text
         // (`--undeclared-tool-calls call`).
         alts.push(Node::Seq(vec![
-            Node::RawUntil {
-                end: b">\n".to_vec(),
-                forbid: vec![b"<".to_vec(), b"\n".to_vec()],
+            Node::Name {
+                exclude: tools.iter().map(|t| t.name.as_bytes().to_vec()).collect(),
             },
+            lit(">\n"),
             free_params(),
             lit("</function>"),
             Node::Opt(Box::new(lit("\n"))),

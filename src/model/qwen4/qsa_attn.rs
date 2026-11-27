@@ -709,29 +709,76 @@ pub(crate) struct QNormRope {
     pub off: i32,
 }
 
-/// A [`gated_codes`] node's parameter 0 after [`fold_q`]: 1 (MROPE) or 2 (IMROPE); 0 before.
+/// A [`gated_codes`] or [`is_prompt_attn`] node's parameter 0 after [`fold_q`]: 1 (MROPE) or 2
+/// (IMROPE); 0 before.
 const P_FOLD: usize = 0;
 
-/// Whether [`fold_q`] made `node` (a [`gated_codes`] node) read its query before the norm and
-/// RoPE.
+/// Whether `node` is a prompt step's [`attention`] (more than [`DECODE_TOKENS`] tokens, the
+/// output as the query's shape), the node [`fold_q`] takes without codes (#1183: the
+/// attention of prompt steps without `--dense-fp8-prompt`).
+///
+/// # Safety
+/// `node` is a valid tensor.
+pub(crate) unsafe fn is_prompt_attn(node: *const ffi::ggml_tensor) -> bool {
+    // SAFETY: the caller's; an `attention` node's query is a valid tensor.
+    unsafe {
+        if !crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &ATTN)) {
+            return false;
+        }
+        let q = &*(*node).src[0];
+        (*node).ne == q.ne && q.ne[2] * q.ne[3] > DECODE_TOKENS
+    }
+}
+
+/// Where [`fold_q`] puts the fold's sources (the query rows, the weight, the positions) in a
+/// node it takes: past the node's own (a [`gated_codes`] node's gate is its sixth).
+///
+/// # Safety
+/// `node` is a valid tensor.
+unsafe fn fold_srcs(node: *const ffi::ggml_tensor) -> usize {
+    // SAFETY: the caller's.
+    if unsafe { is_gated_codes(node) } {
+        6
+    } else {
+        5
+    }
+}
+
+/// Whether [`fold_q`] made `node` (a [`gated_codes`] or [`is_prompt_attn`] node) read its query
+/// before the norm and RoPE.
 ///
 /// # Safety
 /// `node` is a valid tensor.
 pub(crate) unsafe fn is_q_folded(node: *const ffi::ggml_tensor) -> bool {
     // SAFETY: the caller's.
-    unsafe { is_gated_codes(node) && crate::ggml::external_params(&*node)[P_FOLD] != 0 }
+    unsafe {
+        (is_gated_codes(node) || is_prompt_attn(node))
+            && crate::ggml::external_params(&*node)[P_FOLD] != 0
+    }
 }
 
-/// Why [`fold_q`] does not take the [`gated_codes`] node `node` (`None`: it does): the fold is
-/// `attn_gw_kernel`'s codes path (the launcher's own pick on a compute capability 12.x GPU), at
-/// head size 256 over F16 K and V.
+/// `LEGION_DEBUG_QSA_Q_FOLD=0`: prompt steps without `--dense-fp8-prompt` keep ggml's query
+/// norm and RoPE nodes (the way before #1183's fold of them into the plain prompt attention),
+/// for A/B runs (the same bits either way).
+#[cfg(feature = "cuda")]
+fn plain_fold_off() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("LEGION_DEBUG_QSA_Q_FOLD").is_some_and(|v| v == "0"))
+}
+
+/// Why [`fold_q`] does not take `node`, a [`gated_codes`] or [`is_prompt_attn`] node (`None`:
+/// it does): the fold is `attn_gw_kernel`'s (the launcher's own pick on a compute capability
+/// 12.x GPU, with codes or without), at head size 256 over F16 K and V.
 ///
 /// # Safety
-/// `node` is an allocated [`gated_codes`] node.
+/// `node` is an allocated [`gated_codes`] or [`is_prompt_attn`] node.
 pub(crate) unsafe fn fold_q_off(node: *const ffi::ggml_tensor) -> Option<&'static str> {
     #[cfg(feature = "cuda")]
     // SAFETY: the caller's.
     unsafe {
+        if !is_gated_codes(node) && plain_fold_off() {
+            return Some("LEGION_DEBUG_QSA_Q_FOLD=0");
+        }
         let (q, k, v) = (&*(*node).src[0], &*(*node).src[1], &*(*node).src[2]);
         if k.type_ != types::F16 || v.type_ != types::F16 {
             return Some("a quantized KV cache (the fold reads F16 K and V)");
@@ -745,9 +792,14 @@ pub(crate) unsafe fn fold_q_off(node: *const ffi::ggml_tensor) -> Option<&'stati
         if gw_cg() {
             return Some("LEGION_DEBUG_QSA_GW_L1=0");
         }
-        let cc = crate::ggml::cuda_device_of(k).and_then(crate::hw::per_device::cc);
-        if cc.map(|c| c.0) != Some(12) {
+        let dev = crate::ggml::cuda_device_of(k);
+        if dev.and_then(crate::hw::per_device::cc).map(|c| c.0) != Some(12) {
             return Some("not a compute capability 12.x GPU (the fold is attn_gw_kernel's)");
+        }
+        // The launcher takes the folded kernel only where it would run attn_mma_kernel (sm_80+
+        // code in the binary); a build without it would JIT PTX and refuse the folded node.
+        if dev.is_none_or(|d| cuda::legion_qsa_attn_mma256(d as i32) != 1) {
+            return Some("no sm_80+ attention code in this build");
         }
         None
     }
@@ -758,17 +810,17 @@ pub(crate) unsafe fn fold_q_off(node: *const ffi::ggml_tensor) -> Option<&'stati
     }
 }
 
-/// Makes the [`gated_codes`] node `node` read its query before the head norm and RoPE `f`
-/// (`node_fuse`, after allocation, with ggml's nodes of them turned off): its kernel computes
-/// them as ggml-cuda does ([`fold_q_off`] says where).
+/// Makes `node`, a [`gated_codes`] or [`is_prompt_attn`] node, read its query before the head
+/// norm and RoPE `f` (`node_fuse`, after allocation, with ggml's nodes of them turned off): its
+/// kernel computes them as ggml-cuda does ([`fold_q_off`] says where).
 ///
 /// # Safety
-/// `node` is a [`gated_codes`] node [`fold_q_off`] takes, `f`'s tensors valid and allocated, and
-/// `f` the chain whose output `node`'s query reads, `f.off` tokens in.
+/// `node` is a [`gated_codes`] or [`is_prompt_attn`] node [`fold_q_off`] takes, `f`'s tensors
+/// valid and allocated, and `f` the chain whose output `node`'s query reads, `f.off` tokens in.
 pub(crate) unsafe fn fold_q(node: *mut ffi::ggml_tensor, f: &QNormRope) {
     assert!(
         f.sections.iter().all(|s| (0..256).contains(s)),
-        "qsa_attn_codes: RoPE sections {:?}",
+        "qsa_attn: RoPE sections {:?}",
         f.sections
     );
     let packed = f
@@ -778,7 +830,12 @@ pub(crate) unsafe fn fold_q(node: *mut ffi::ggml_tensor, f: &QNormRope) {
         .fold(0u32, |a, (i, &s)| a | ((s as u32) << (8 * i)));
     // SAFETY: the caller's.
     unsafe {
-        let mut srcs: Vec<*mut ffi::ggml_tensor> = (0..6).map(|i| (*node).src[i]).collect();
+        let (op, base) = if is_gated_codes(node) {
+            (&ATTN_CODES, 6)
+        } else {
+            (&ATTN, 5)
+        };
+        let mut srcs: Vec<*mut ffi::ggml_tensor> = (0..base).map(|i| (*node).src[i]).collect();
         srcs.extend([f.raw, f.w, f.pos]);
         let params = [
             1 + f.imrope as i32,
@@ -790,25 +847,27 @@ pub(crate) unsafe fn fold_q(node: *mut ffi::ggml_tensor, f: &QNormRope) {
             f.attn_factor.to_bits() as i32,
             f.off,
         ];
-        crate::ggml::make_external(node, &ATTN_CODES, &srcs, &params);
+        crate::ggml::make_external(node, op, &srcs, &params);
     }
 }
 
 /// [`fold_q`]'s parameters of a node, `None` where it did not fold the node's query.
 ///
 /// # Safety
-/// `node` is a [`gated_codes`] node.
+/// `node` is a [`gated_codes`] node or a prompt step's [`attention`] node.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 unsafe fn folded(node: &ffi::ggml_tensor) -> Option<QNormRope> {
     let p = crate::ggml::external_params(node);
     if p[P_FOLD] == 0 {
         return None;
     }
+    // SAFETY: the caller's.
+    let base = unsafe { fold_srcs(node) };
     let f = |i: usize| f32::from_bits(p[i] as u32);
     Some(QNormRope {
-        raw: node.src[6],
-        w: node.src[7],
-        pos: node.src[8],
+        raw: node.src[base],
+        w: node.src[base + 1],
+        pos: node.src[base + 2],
         eps: f(3),
         n_dims: p[1],
         sections: std::array::from_fn(|i| (((p[2] as u32) >> (8 * i)) & 0xff) as i32),
@@ -1388,6 +1447,11 @@ unsafe fn read_head(
 unsafe fn cpu_attn(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
     // SAFETY: called by ggml for a node made by `attention`, with host tensors.
     unsafe {
+        // `fold_q` takes CUDA nodes only.
+        assert!(
+            crate::ggml::external_params(dst)[P_FOLD] == 0,
+            "qsa_attn: a folded query on the CPU"
+        );
         let o = Operands::of(dst);
         let rows = o.n_seqs * o.n_tok * o.n_head;
         let mut buf = RowBuf::new(o.d);
@@ -1708,6 +1772,7 @@ mod cuda {
         pub fn legion_qsa_scores_exact_launch(p: *const ScoresExact, stream: *mut c_void) -> i32;
         pub fn legion_qsa_scores_launch(p: *const Scores, stream: *mut c_void) -> i32;
         pub fn legion_qsa_scores_sm7x() -> i32;
+        pub fn legion_qsa_attn_mma256(dev: i32) -> i32;
         pub fn legion_qsa_pool_mask_launch(p: *const PoolMask, stream: *mut c_void) -> i32;
         pub fn legion_qsa_select_launch(p: *const Select, stream: *mut c_void) -> i32;
         pub fn legion_qsa_attn_launch(p: *const Attn, stream: *mut c_void) -> i32;
@@ -1891,7 +1956,12 @@ unsafe fn cuda_select_vis(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
 unsafe fn cuda_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
     // SAFETY: a node made by `attention`, device tensors of the stream's device.
     let o = unsafe { Operands::of(dst) };
-    let p = attn_params(&o)?;
+    let mut p = attn_params(&o)?;
+    // SAFETY: an `attention` node; `fold_q`'s tensors are the node's, allocated.
+    if let Some(f) = unsafe { folded(dst) } {
+        // SAFETY: as above.
+        unsafe { fold_params(&mut p, &f, &o, "qsa_attn")? };
+    }
     let r = launched("qsa_attn", unsafe {
         cuda::legion_qsa_attn_launch(&p, stream)
     });
@@ -1920,32 +1990,8 @@ unsafe fn cuda_attn_codes(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
     p.sync = c.sync;
     // SAFETY: a `gated_codes` node; `fold_q`'s tensors are the node's, allocated.
     if let Some(f) = unsafe { folded(dst) } {
-        // ggml's norm and RoPE nodes are off, so only the fold's kernel makes this query:
-        // a kernel forced after the rewrite is refused, not silently replaced by it.
-        if p.mma_kernel != 0 || p.gw_cg != 0 {
-            let why = "qsa_attn_codes: a prompt kernel was forced after node_fuse folded the \
-                       query under the launcher's choice; build the graph again";
-            return Err(why.into());
-        }
-        // SAFETY: `fold_q`'s sources: the query before the norm (`f.off` tokens in, as the
-        // attention's query viewed the RoPE's output), the weight and the positions.
-        unsafe {
-            let (raw, pos) = (&*f.raw, &*f.pos);
-            p.q = (raw.data as *const u8).add(f.off as usize * raw.nb[2]) as *const f32;
-            p.q_nb1 = raw.nb[1] as i64;
-            p.q_nb2 = raw.nb[2] as i64;
-            p.q_nb3 = (raw.nb[2] * o.n_tok) as i64;
-            p.qn_w = (*f.w).data as *const f32;
-            p.qn_pos = (pos.data as *const i32).add(f.off as usize);
-            p.qn_pos_n = (pos.ne[0] / 4) as i32;
-        }
-        p.qn_eps = f.eps;
-        p.qn_rot = f.n_dims;
-        p.qn_sections = f.sections;
-        p.qn_imrope = f.imrope as i32;
-        p.qn_freq_base = f.freq_base;
-        p.qn_freq_scale = f.freq_scale;
-        p.qn_attn_factor = f.attn_factor;
+        // SAFETY: as above.
+        unsafe { fold_params(&mut p, &f, o, "qsa_attn_codes")? };
     }
     // SAFETY: the node's counters, `codes_sync(tokens)` bytes.
     let e = unsafe { cuda::cudaMemsetAsync(c.sync as *mut c_void, 0, codes_sync(tokens), stream) };
@@ -1976,6 +2022,48 @@ unsafe fn cuda_attn_codes(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
         unsafe { after_attn(o, stream) };
     }
     r
+}
+
+/// The launch parameters `p` of a node whose query [`fold_q`] folded (`f`; `o` the node's
+/// operands): the kernel reads the query rows before the norm and makes the norm and RoPE.
+///
+/// # Safety
+/// `f` read from a live, allocated node whose operands are `o`.
+#[cfg(feature = "cuda")]
+unsafe fn fold_params(
+    p: &mut cuda::Attn,
+    f: &QNormRope,
+    o: &Operands,
+    name: &str,
+) -> Result<(), String> {
+    // ggml's norm and RoPE nodes are off, so only the fold's kernel makes this query: a kernel
+    // forced after the rewrite is refused, not silently replaced by it.
+    if p.mma_kernel != 0 || p.gw_cg != 0 {
+        return Err(format!(
+            "{name}: a prompt kernel was forced after node_fuse folded the query under the \
+             launcher's choice; build the graph again"
+        ));
+    }
+    // SAFETY: `fold_q`'s sources: the query before the norm (`f.off` tokens in, as the
+    // attention's query viewed the RoPE's output), the weight and the positions.
+    unsafe {
+        let (raw, pos) = (&*f.raw, &*f.pos);
+        p.q = (raw.data as *const u8).add(f.off as usize * raw.nb[2]) as *const f32;
+        p.q_nb1 = raw.nb[1] as i64;
+        p.q_nb2 = raw.nb[2] as i64;
+        p.q_nb3 = (raw.nb[2] * o.n_tok) as i64;
+        p.qn_w = (*f.w).data as *const f32;
+        p.qn_pos = (pos.data as *const i32).add(f.off as usize);
+        p.qn_pos_n = (pos.ne[0] / 4) as i32;
+    }
+    p.qn_eps = f.eps;
+    p.qn_rot = f.n_dims;
+    p.qn_sections = f.sections;
+    p.qn_imrope = f.imrope as i32;
+    p.qn_freq_base = f.freq_base;
+    p.qn_freq_scale = f.freq_scale;
+    p.qn_attn_factor = f.attn_factor;
+    Ok(())
 }
 
 /// What follows a prompt step's attention launch: the selections' dump where it is on.

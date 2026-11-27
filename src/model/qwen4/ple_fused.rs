@@ -18,8 +18,8 @@
 //! elsewhere, and ggml-cuda fuses an MoE layer's weighted expert sum (FMA adds) only where its
 //! output does not overlap its inputs, so a layer near the PLE could flip between the two and
 //! move greedy output. So the graph is built and allocated with the chain, and the ops take the
-//! chain's place afterwards ([`rewrite`], #1183): the sums round as without them. On with
-//! `--ple-ops` and with `--dense-fp8-prompt`.
+//! chain's place afterwards ([`rewrite`], #1183): the sums round as without them. On by
+//! default (#1183; `--ple-ops` asks for them too).
 
 #[cfg(feature = "cuda")]
 use std::os::raw::c_void;
@@ -64,18 +64,22 @@ pub(super) const PLE_HC: i64 = 4;
 /// row from there; narrower rows have another order of sums).
 pub(super) const PLE_MIN_E: i64 = 1024;
 
-/// Whether prompt steps take the two ops where they fit (off by default).
-static FUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Whether prompt steps take the two ops where they fit (on by default since #1183: the same
+/// bits as ggml's chain, ~100 ms less a 32K prompt on a GB10).
+static FUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-/// Whether graphs built from now on take the PLE ops for prompt steps on a GPU
-/// (`legion serve --ple-ops`); off keeps ggml's chain.
+/// Whether graphs built from now on take the PLE ops for prompt steps on a GPU (on by default;
+/// `legion serve --ple-ops` asks for them too); off keeps ggml's chain.
 pub fn set_fused_ple(on: bool) {
     FUSED.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// See [`set_fused_ple`].
+/// See [`set_fused_ple`]. `LEGION_DEBUG_PLE_OPS=0` keeps ggml's chain (but under
+/// `--dense-fp8-prompt`), the way before #1183 made the ops the default, for A/B runs.
 pub(super) fn fused_ple() -> bool {
-    FUSED.load(std::sync::atomic::Ordering::Relaxed)
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_PLE_OPS").is_none_or(|v| v != "0"));
+    on && FUSED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The gate and the conv's input for `n` tokens: `key` (F32 `[e · hc, n]`, rows contiguous),

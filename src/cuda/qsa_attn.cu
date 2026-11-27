@@ -118,10 +118,10 @@ struct legion_qsa_attn {
     uint8_t * codes;
     float * scales;
     uint32_t * sync;
-    // With codes on a GB10 (#1183; null: off): q is the query before its head norm and RoPE
-    // (ggml's rms_norm, mul by qn_w and rope_multi, folded into attn_gw_kernel's q load by
-    // node_fuse), and the kernel makes each value as ggml-cuda's rms_norm_f32<256, true> and
-    // rope_multi make it. Only attn_gw_kernel's codes path at head size 256 takes it; every
+    // On a GB10 (#1183; null: off): q is the query before its head norm and RoPE (ggml's
+    // rms_norm, mul by qn_w and rope_multi, folded into attn_gw_kernel's q load by node_fuse),
+    // and the kernel makes each value as ggml-cuda's rms_norm_f32<256, true> and rope_multi
+    // make it. Only attn_gw_kernel at head size 256 takes it (with codes or without); every
     // other launch returns 1.
     const float * qn_w;      // [head_dim]: the norm's weight
     const int32_t * qn_pos;  // section s of token t at qn_pos[t + s * qn_pos_n]
@@ -210,6 +210,9 @@ int legion_qsa_scores_exact_launch(const legion_qsa_scores_exact * p, void * str
 // 1 when every visible CUDA device has compute capability 7.x (7.0, 7.2 or 7.5: the scores
 // kernel's target).
 int legion_qsa_scores_sm7x(void);
+
+// 1 when device `dev` runs attn_mma_kernel<256> (use_mma): the folded prompt path needs it.
+int legion_qsa_attn_mma256(int dev);
 
 }  // extern "C"
 
@@ -500,24 +503,40 @@ std::atomic<bool> chain_notice_said{false};
 // the binary holds code for the kernel built for sm_80+ (a build for older architectures only
 // would JIT its PTX, where the MMA is a trap). Decided once per device.
 template <int HD>
-bool use_mma() {
+bool use_mma_on(int dev) {
     static std::atomic<int> state[64];  // per device: 0 unknown, 1 yes, 2 no
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
+    if (dev < 0 || dev >= 64) {
         return false;
     }
     int s = state[dev].load(std::memory_order_acquire);
     if (s == 0) {
         int major = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        // cudaFuncGetAttributes answers for the current device: switch to `dev` for the query.
+        int cur = -1;
+        const bool moved = cudaGetDevice(&cur) == cudaSuccess && cur != dev &&
+                           cudaSetDevice(dev) == cudaSuccess;
         cudaFuncAttributes a{};
         const bool code = cudaFuncGetAttributes(&a, attn_mma_kernel<HD>) == cudaSuccess &&
                           a.binaryVersion >= 80 && a.ptxVersion >= 80;
+        if (moved) {
+            cudaSetDevice(cur);
+        }
         (void) cudaGetLastError();
         s = major >= 8 && code ? 1 : 2;
         state[dev].store(s, std::memory_order_release);
     }
     return s == 1;
+}
+
+template <int HD>
+bool use_mma() {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    return use_mma_on<HD>(dev);
 }
 
 // Whether the current device takes attn_gb_kernel<HD> by default: compute capability 12.x (the
@@ -1493,18 +1512,20 @@ int launch_gw_variant(const legion_qsa_attn & p, cudaStream_t st) {
 
 template <int HD>
 int launch_attn(const legion_qsa_attn & p, cudaStream_t st) {
-    // q before its norm and RoPE (qn_w): attn_gw_kernel's codes path only, where node_fuse
-    // folds them (the launcher's own pick on a 12.x GPU, F16 K and V, head size 256). With a
-    // kernel forced since, nothing runs (1; the caller refuses that first): the other kernels
-    // read the RoPE's output, which the fold left unwritten.
+    // q before its norm and RoPE (qn_w): attn_gw_kernel only, with codes or without (#1183),
+    // where node_fuse folds them (the launcher's own pick on a 12.x GPU, F16 K and V, head size
+    // 256). With a kernel forced since, nothing runs (1; the caller refuses that first): the
+    // other kernels read the RoPE's output, which the fold left unwritten.
     if (p.qn_w != nullptr) {
         if constexpr (HD == 256) {
-            if (p.k_type == 0 && p.v_type == 0 && p.codes != nullptr && use_mma<HD>() &&
-                p.mma_kernel == 0 && p.gw_cg == 0 &&
-                p.qn_rot > 0 && p.qn_rot % 2 == 0 && p.qn_rot <= HD) {
+            if (p.k_type == 0 && p.v_type == 0 && use_mma<HD>() && p.mma_kernel == 0 &&
+                p.gw_cg == 0 && p.qn_rot > 0 && p.qn_rot % 2 == 0 && p.qn_rot <= HD) {
                 legion_qsa_attn q = p;
                 // As ggml-cuda's rope_multi_cuda (host side).
                 q.qn_theta_scale = powf(p.qn_freq_base, -2.0f / p.qn_rot);
+                if (p.codes == nullptr) {
+                    return launch_gw_variant<HD, GW_CA, false, true>(q, st);
+                }
                 const int r = launch_gw_variant<HD, GW_CA, true, true>(q, st);
                 return r == 0 ? CODES_WRITTEN : r;
             }
@@ -2021,6 +2042,10 @@ int legion_qsa_scores_sm7x(void) {
         }
     }
     return 1;
+}
+
+int legion_qsa_attn_mma256(int dev) {
+    return use_mma_on<256>(dev) ? 1 : 0;
 }
 
 }  // extern "C"

@@ -387,15 +387,17 @@ __device__ __forceinline__ void cp_async16_l1(void * smem, const void * gmem, bo
 // loop, its K/V reads sharing less of L2. The gate rows and the other heads' rows come into L2
 // a few chunks before the epilogue reads them.
 //
-// QN (with CODES, #1183): q is the query before its head norm and RoPE (legion_qsa_attn's
-// qn_*), and the CTA makes each of its heads' values as ggml-cuda makes them in the nodes
-// node_fuse turned off: rms_norm_f32<256, true> (a row's squares summed per 32 columns by a
-// warp's butterfly, the 8 sums by a second butterfly with ggml's zero lanes dropped: x + 0 is
-// x; mean = sum / ncols, rsqrtf(mean + eps), scale * x * w) and rope_multi (qn_rope_cs and
-// qn_column: the pair (i, i + n_dims / 2) rotated by the cos and sin of the position of i's
-// section, the columns past n_dims as the norm left them). The tables live in S.s and the
-// values, made once each into a q tile, in S.v until the first chunk (whose V is issued after
-// the fragments are built: still before its scores).
+// QN (#1183, with or without CODES): q is the query before its head norm and RoPE
+// (legion_qsa_attn's qn_*), and the CTA makes each of its heads' values as ggml-cuda makes
+// them in the nodes node_fuse turned off: rms_norm_f32<256, true> (a row's squares summed per
+// 32 columns by a warp's butterfly, the 8 sums by a second butterfly with ggml's zero lanes
+// dropped: x + 0 is x; mean = sum / ncols, rsqrtf(mean + eps), scale * x * w) and rope_multi
+// (qn_rope_cs and qn_column: the pair (i, i + n_dims / 2) rotated by the cos and sin of the
+// position of i's section, the columns past n_dims as the norm left them). The tables live in
+// S.s and the values, made once each into a q tile, in S.v until the first chunk (whose V is
+// issued after the fragments are built: still before its scores). Without CODES the output is
+// written as the plain kernel writes it (the gated prompt attention's codes are
+// --dense-fp8-prompt's).
 
 // warp_reduce_sum's butterfly over `width` lanes (offsets width / 2 down to 1).
 template <int WIDTH>
@@ -487,7 +489,6 @@ __device__ __forceinline__ void qn_column(float (&x)[ROWS_], int g, const float 
 
 template <int HD, int VAR, bool CODES = false, bool QN = false>
 __global__ void __launch_bounds__(THREADS, 2) attn_gw_kernel(legion_qsa_attn p) {
-    static_assert(!QN || CODES, "the fold is the codes path's");
     extern __shared__ __align__(16) unsigned char smem_raw[];
     GbSmem<HD> & S = *reinterpret_cast<GbSmem<HD> *>(smem_raw);
     constexpr int NW = THREADS / 32;          // warps

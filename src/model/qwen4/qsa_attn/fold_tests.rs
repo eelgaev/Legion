@@ -1,6 +1,6 @@
-//! [`fold_q`] (#1183): the gated prompt attention making its query's head norm and RoPE itself
-//! (`node_fuse`'s rewrite) against ggml's nodes of them, codes and scales bit for bit (CUDA,
-//! ignored tests), and where the rewrite leaves the nodes.
+//! [`fold_q`] (#1183): the prompt attention (gated, and plain) making its query's head norm and
+//! RoPE itself (`node_fuse`'s rewrite) against ggml's nodes of them, codes and scales (or the
+//! plain output) bit for bit (CUDA, ignored tests), and where the rewrite leaves the nodes.
 
 use super::tests::{f16_bytes, noise};
 use super::*;
@@ -37,9 +37,10 @@ fn picks(tokens: usize) -> Vec<Vec<i32>> {
 
 /// The packed activations of [`gated_codes`] over qwen4exp's query chain (`rms_norm`, `mul`,
 /// `rope_multi`, a view of the step's tokens) on `backend`, after `node_fuse`'s rewrite (as on
-/// CUDA). `keep`: the RoPE's output is a graph output, so the rewrite must leave the chain.
-/// Also whether the node's query was folded and the run's [`Fold`].
-fn run(s: &Step, backend: &mut Backend, keep: bool) -> (Vec<u8>, bool, Fold) {
+/// CUDA); without `codes`, the plain prompt attention's output instead (no `--dense-fp8-prompt`).
+/// `keep`: the RoPE's output is a graph output, so the rewrite must leave the chain. Also
+/// whether the node's query was folded and the run's [`Fold`].
+fn run(s: &Step, backend: &mut Backend, keep: bool, codes: bool) -> (Vec<u8>, bool, Fold) {
     let (d, nh, nkv, n) = (s.d, s.n_head, s.n_head_kv, s.n);
     let k = d * nh;
     let blocks = (n as usize).div_ceil(KV_BLOCK);
@@ -80,10 +81,16 @@ fn run(s: &Step, backend: &mut Backend, keep: bool) -> (Vec<u8>, bool, Fold) {
     let table = input(types::I32, &[blocks as i64, 1]);
     let sel = input(types::I32, &[1 + n, n]);
     let att = attention(&ctx, q, kp, vp, table, sel);
-    let o = ctx.reshape_2d(att, k, n);
-    let got = gated_codes(&ctx, o, gate).expect("a prompt step's attention output");
-    // SAFETY: a view of the op's node.
-    let node = ctx.wrap(unsafe { (*got.raw()).view_src }).as_output();
+    let (node, got) = if codes {
+        let o = ctx.reshape_2d(att, k, n);
+        let got = gated_codes(&ctx, o, gate).expect("a prompt step's attention output");
+        // SAFETY: a view of the op's node.
+        let node = ctx.wrap(unsafe { (*got.raw()).view_src }).as_output();
+        (node, Some(got))
+    } else {
+        // A prompt step's attention is its node.
+        (att.as_output(), None)
+    };
     let mut graph = ctx.new_graph(64);
     graph.expand(node);
     if keep {
@@ -134,7 +141,11 @@ fn run(s: &Step, backend: &mut Backend, keep: bool) -> (Vec<u8>, bool, Fold) {
     sel.set_i32(&srows);
     backend.compute(&graph).unwrap();
     // `got` is not in the graph (so has no memory of its own): its bytes are the node's first.
-    (node.bytes_prefix(got.nbytes()), folded, fold)
+    let bytes = match got {
+        Some(got) => node.bytes_prefix(got.nbytes()),
+        None => node.bytes(),
+    };
+    (bytes, folded, fold)
 }
 
 /// What decides a run's fold besides the graph's chain.
@@ -146,18 +157,24 @@ struct Fold {
 }
 
 impl Fold {
-    /// A debug override (`LEGION_DEBUG_QSA_PROMPT_KERNEL`, `LEGION_DEBUG_QSA_GW_L1=0`) keeps the
-    /// fold off on any device.
+    /// A debug override (`LEGION_DEBUG_QSA_PROMPT_KERNEL`, `LEGION_DEBUG_QSA_GW_L1=0`,
+    /// `LEGION_DEBUG_QSA_Q_FOLD=0` for the plain attention) keeps the fold off on any device.
     fn overridden(&self) -> bool {
-        self.off
-            .is_some_and(|w| w.contains("LEGION_DEBUG_QSA_PROMPT_KERNEL") || w.contains("GW_L1"))
+        self.off.is_some_and(|w| {
+            ["LEGION_DEBUG_QSA_PROMPT_KERNEL", "GW_L1", "Q_FOLD"]
+                .iter()
+                .any(|o| w.contains(o))
+        })
     }
 }
 
-/// Where two runs' packed activations first differ.
-fn first_diff(a: &[u8], b: &[u8], k: usize, n: usize) -> Option<String> {
+/// Where two runs' packed activations (without `codes`, F32 attention outputs) first differ.
+fn first_diff(a: &[u8], b: &[u8], k: usize, n: usize, codes: bool) -> Option<String> {
+    assert_eq!(a.len(), b.len());
     let i = a.iter().zip(b).position(|(x, y)| x != y)?;
-    Some(if i < k * n {
+    Some(if !codes {
+        format!("output of token {}, column {}", i / 4 / k, i / 4 % k)
+    } else if i < k * n {
         format!("code of token {}, column {}", i / k, i % k)
     } else {
         format!("scale of token {}", (i - k * n) / 4)
@@ -179,13 +196,13 @@ fn cpu_fold_q_stays_off() {
         base: 0,
         imrope: true,
     };
-    let (want, kept, _) = run(&s, &mut backend, true);
-    let (got, folded, _) = run(&s, &mut backend, false);
-    assert!(!kept && !folded);
-    assert_eq!(
-        first_diff(&want, &got, (s.d * s.n_head) as usize, s.n as usize),
-        None
-    );
+    for codes in [true, false] {
+        let (want, kept, _) = run(&s, &mut backend, true, codes);
+        let (got, folded, _) = run(&s, &mut backend, false, codes);
+        assert!(!kept && !folded);
+        let (k, n) = ((s.d * s.n_head) as usize, s.n as usize);
+        assert_eq!(first_diff(&want, &got, k, n, codes), None, "codes {codes}");
+    }
 }
 
 /// On a GPU, the attention with its query folded (on a compute capability 12.x GPU) against
@@ -202,10 +219,13 @@ fn cuda_fold_q_matches_ggml_norm_rope() {
         .expect("no GPU device")
         .init()
         .unwrap();
-    for (off, total, base, imrope) in [
-        (0, 777, 0, true),
-        (5, 790, 199_999, true),
-        (3, 781, 77, false),
+    for (off, total, base, imrope, codes) in [
+        (0, 777, 0, true, true),
+        (5, 790, 199_999, true, true),
+        (3, 781, 77, false, true),
+        (0, 777, 0, true, false),
+        (5, 790, 199_999, true, false),
+        (3, 781, 77, false, false),
     ] {
         let s = Step {
             d: 256,
@@ -217,8 +237,8 @@ fn cuda_fold_q_matches_ggml_norm_rope() {
             base,
             imrope,
         };
-        let (want, kept, _) = run(&s, &mut backend, true);
-        let (got, folded, fold) = run(&s, &mut backend, false);
+        let (want, kept, _) = run(&s, &mut backend, true, codes);
+        let (got, folded, fold) = run(&s, &mut backend, false, codes);
         assert!(!kept, "a RoPE output with another reader was folded");
         if fold.overridden() {
             assert!(!folded, "folded under a debug override");
@@ -228,9 +248,9 @@ fn cuda_fold_q_matches_ggml_norm_rope() {
         }
         let (k, n) = ((s.d * s.n_head) as usize, s.n as usize);
         assert_eq!(
-            first_diff(&want, &got, k, n),
+            first_diff(&want, &got, k, n, codes),
             None,
-            "token {off} of {total}, positions from {base}, imrope {imrope}"
+            "token {off} of {total}, positions from {base}, imrope {imrope}, codes {codes}"
         );
     }
 }

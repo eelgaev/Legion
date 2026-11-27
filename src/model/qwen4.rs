@@ -1673,9 +1673,9 @@ impl Model {
     /// Whether [`Self::ple`]'s chain after its two matmuls is marked to run as Legion's two ops
     /// ([`ple_fused`]: ggml-cuda's bits in two launches instead of about thirty nodes), for
     /// prompt steps on a GPU: one group, a prompt chunk (more than one token, not a verify),
-    /// the weights and the history in GPU memory, no tensors tapped. On with `--ple-ops`, and
-    /// with `--dense-fp8-prompt` (#1183: ~85 ms of ggml's chain per 12,288-token step on a
-    /// GB10). The graph is built and allocated with the chain, so ggml-cuda fuses the MoE sums
+    /// the weights and the history in GPU memory, no tensors tapped. On by default (#1183: ~85
+    /// ms of ggml's chain per 12,288-token step on a GB10; `LEGION_DEBUG_PLE_OPS=0` keeps the
+    /// chain but under `--dense-fp8-prompt`). The graph is built and allocated with the chain, so ggml-cuda fuses the MoE sums
     /// it fuses without the ops; the ops take the chain's nodes after that
     /// ([`ple_fused::rewrite`]). The first prompt step that keeps the chain logs why, once.
     fn ple_ops<'a>(

@@ -428,7 +428,54 @@ impl Builder<'_> {
                 Ok(l)
             }
             Node::RawUntil { end, forbid } => self.raw_until(end, forbid, next),
+            Node::Name { exclude } => self.name(exclude, next),
         }
+    }
+
+    /// A [`Node::Name`], then `next`: the states of [`NameText`] reachable from its start, one
+    /// per future ([`NameText::key`]), bytes grouped by where they lead.
+    fn name(&mut self, exclude: &[Vec<u8>], next: u32) -> R<u32> {
+        let text = NameText::new(exclude);
+        let start = text.start();
+        let first = self.hole()?;
+        let mut holes = HashMap::from([(text.key(&start), first)]);
+        let mut todo = vec![(start, first)];
+        while let Some((at, hole)) = todo.pop() {
+            let mut targets: Vec<(u32, ByteSet)> = Vec::new();
+            for b in 1u8..=0xFF {
+                let Some(to) = text.step(&at, b) else {
+                    continue;
+                };
+                let key = text.key(&to);
+                let to = match holes.get(&key) {
+                    Some(&h) => h,
+                    None => {
+                        let h = self.hole()?;
+                        holes.insert(key, h);
+                        todo.push((to, h));
+                        h
+                    }
+                };
+                match targets.iter_mut().find(|t| t.0 == to) {
+                    Some(t) => t.1.add(b),
+                    None => targets.push((to, ByteSet::of(&[b]))),
+                }
+            }
+            let mut alts = Vec::with_capacity(targets.len() + 1);
+            if text.accepts(&at) {
+                alts.push(next);
+            }
+            for (to, set) in targets {
+                alts.push(self.set(set, to)?);
+            }
+            if alts.is_empty() {
+                // No way on (not reached: a name can always go on); a hole would mean Match.
+                alts.push(self.set(ByteSet([0; 4]), next)?);
+            }
+            let s = self.alt(&alts)?;
+            self.states[hole as usize] = St::Split(s, s);
+        }
+        Ok(first)
     }
 }
 
@@ -491,6 +538,135 @@ impl<'a> RawText<'a> {
             .find_map(|k| self.prefixes.iter().position(|p| *p == &text[k..]))
             .expect("the empty prefix is a state");
         RawStep::To(to)
+    }
+}
+
+/// The automaton of [`Node::Name`]'s text, over bytes: the byte trie of the excluded names
+/// (a node per prefix: its children and whether a name ends there) run beside a check of the
+/// text's characters.
+pub(crate) struct NameText {
+    trie: Vec<(Vec<(u8, usize)>, bool)>,
+}
+
+/// The last whole character of a name so far.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Last {
+    /// None yet.
+    Nothing,
+    Word,
+    Space,
+}
+
+/// Where a name's text stands.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct NameAt {
+    /// The trie node of the text so far; `None`: no excluded name starts with it.
+    node: Option<usize>,
+    last: Last,
+    /// The bytes of a character not complete yet.
+    part: Vec<u8>,
+}
+
+/// Equal for [`NameAt`]s with the same future.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(crate) enum NameKey {
+    At(NameAt),
+    /// Off the trie, inside a character that cannot be whitespace: only how many bytes are
+    /// left and which can come next matter.
+    Rest {
+        left: u32,
+        next: u64,
+    },
+}
+
+/// The encodings of the multi-byte whitespace characters (what `str::trim` strips).
+fn wide_spaces() -> &'static [Vec<u8>] {
+    static W: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
+    W.get_or_init(|| {
+        (0x80..=0x10FFFF)
+            .filter_map(char::from_u32)
+            .filter(|c| c.is_whitespace())
+            .map(|c| c.to_string().into_bytes())
+            .collect()
+    })
+}
+
+impl NameText {
+    pub(crate) fn new(exclude: &[Vec<u8>]) -> Self {
+        let mut trie: Vec<(Vec<(u8, usize)>, bool)> = vec![(Vec::new(), false)];
+        for name in exclude {
+            let mut n = 0;
+            for &b in name {
+                n = match trie[n].0.iter().find(|c| c.0 == b).map(|c| c.1) {
+                    Some(c) => c,
+                    None => {
+                        trie.push((Vec::new(), false));
+                        let c = trie.len() - 1;
+                        trie[n].0.push((b, c));
+                        c
+                    }
+                };
+            }
+            trie[n].1 = true;
+        }
+        Self { trie }
+    }
+
+    pub(crate) fn start(&self) -> NameAt {
+        NameAt {
+            node: Some(0),
+            last: Last::Nothing,
+            part: Vec::new(),
+        }
+    }
+
+    /// Where `at` goes on byte `b`; `None`: the text cannot be (the start of) a name.
+    pub(crate) fn step(&self, at: &NameAt, b: u8) -> Option<NameAt> {
+        let mut part = at.part.clone();
+        part.push(b);
+        let last = match std::str::from_utf8(&part) {
+            Ok(s) => {
+                let c = s.chars().next().expect("one character");
+                if matches!(c, '\0' | '<' | '>' | '\n') {
+                    return None;
+                }
+                part.clear();
+                match (c.is_whitespace(), at.last) {
+                    (false, _) => Last::Word,
+                    (true, Last::Nothing) => return None,
+                    (true, _) => Last::Space,
+                }
+            }
+            // A valid start of a character.
+            Err(e) if e.valid_up_to() == 0 && e.error_len().is_none() => at.last,
+            Err(_) => return None,
+        };
+        let node = at
+            .node
+            .and_then(|n| self.trie[n].0.iter().find(|c| c.0 == b).map(|c| c.1));
+        Some(NameAt { node, last, part })
+    }
+
+    /// Whether the text so far is a whole name.
+    pub(crate) fn accepts(&self, at: &NameAt) -> bool {
+        at.last == Last::Word && at.part.is_empty() && !at.node.is_some_and(|n| self.trie[n].1)
+    }
+
+    pub(crate) fn key(&self, at: &NameAt) -> NameKey {
+        let p = &at.part;
+        if at.node.is_some() || p.is_empty() || wide_spaces().iter().any(|w| w.starts_with(p)) {
+            return NameKey::At(at.clone());
+        }
+        let mut next = 0u64;
+        for b in 0x80u8..=0xBF {
+            if self.step(at, b).is_some() {
+                next |= 1 << (b - 0x80);
+            }
+        }
+        NameKey::Rest {
+            left: p[0].leading_ones() - p.len() as u32,
+            next,
+        }
     }
 }
 

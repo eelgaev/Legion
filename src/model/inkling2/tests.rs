@@ -2288,22 +2288,42 @@ fn cuda_linear_set_keeps_the_bits() {
 /// [`linear_set_keeps_the_bits`] on the GPU for BF16 weights (#1221 r7, r9): `linear_set_bf16`
 /// against `linear_mv_bf16` at one token, `linear_set_bf16x` against `linear_mv_bf16x` (or
 /// `linear_mv_bf16` at 2 tokens of the short rows) at 2-8 (the GB10 kernels' BF16 GEMV, which
-/// `glm_ops::linear_set_bf16_takes` requires).
+/// `glm_ops::linear_set_bf16_takes` requires). The GB10 kernels and the default BF16 GEMV
+/// ([`glm_ops::BF16_GEMV_DEFAULT`]) are set for the test whatever `LEGION_DEBUG_GLM_BF16_GEMV`
+/// says, and the process's choices put back after it (also when it panics).
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "needs a GPU"]
 fn cuda_linear_set_bf16_keeps_the_bits() {
+    struct Restore {
+        gb10: bool,
+        gemv: u8,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            glm_ops::set_gb10_linear(self.gb10);
+            glm_ops::set_bf16_gemv(self.gemv);
+        }
+    }
+    let _restore = Restore {
+        gb10: glm_ops::gb10_linear(),
+        gemv: glm_ops::bf16_gemv(),
+    };
     glm_ops::set_gb10_linear(true);
+    glm_ops::set_bf16_gemv(glm_ops::BF16_GEMV_DEFAULT);
     linear_set_keeps_the_bits(&mut gpu_backend(), types::BF16, &[1, 2, 3, 5, 8]);
 }
 
-/// #1221 r7: the routed NVFP4 experts as `Model::ink_moe` builds them by default (gate and up
-/// rows with whole row tiles prefetched, SITU stored as BF16, the down projection on the gate
-/// and up rows' plan) against round 6's chain (`nvfp4_mm::mul_mat_id`, F32 SITU, its cast),
-/// over the token counts of decode and verify steps (one past the plan's share too), each
-/// routing over all experts and over a few (more tokens per expert tile): the same bits of the
-/// gate and up rows, the activations and the down rows. `shapes`: `(k, f, n_expert, n_used)`,
-/// `k` the model's width and `f` the experts' (the gate and up rows `2f`).
+/// #1221 r7, r9: the routed NVFP4 experts as `Model::ink_experts` builds them by default
+/// ([`EXPERTS_DEFAULT`]: the gate and up rows on the plain grouped mv, SITU stored as BF16, the
+/// down projection on the gate and up rows' plan with whole row tiles prefetched one tile
+/// ahead, [`EXPERT_MV_T1`]) against round 6's chain (`nvfp4_mm::mul_mat_id`, F32 SITU, its
+/// cast), over the token counts of decode and verify steps (one past the plan's share too),
+/// each routing over all experts and over a few (more tokens per expert tile): the same bits of
+/// the gate and up rows, the activations and the down rows. Also the A/B chains: both
+/// projections with whole row tiles prefetched two ahead (mask bits 1 and 8), and every
+/// [`EXPERT_MVS`] variant. `shapes`: `(k, f, n_expert, n_used)`, `k` the model's width and `f`
+/// the experts' (the gate and up rows `2f`).
 fn experts_keep_the_bits(b: &mut Backend, shapes: &[(i64, i64, i64, i64)], toks: &[i64]) {
     use crate::ggml::ComputeAllocator;
     let mut s = 0x9e37_79b9_7f4a_7c15u64;
@@ -2362,9 +2382,23 @@ fn experts_keep_the_bits(b: &mut Backend, shapes: &[(i64, i64, i64, i64)], toks:
                 let gu0 = nvfp4_mm::mul_mat_id(&ctx, wgu, x, ids, Some(sgu));
                 let a0 = ops::situ(&ctx, gu0, beta, lb, false);
                 let y0 = nvfp4_mm::mul_mat_id(&ctx, wd, a0, ids, Some(sd));
-                let gu1 = nvfp4_mm::mul_mat_id_with(&ctx, wgu, x, ids, Some(sgu), true, None);
+                // The default's chain (as `ink_experts` picks it under `EXPERTS_DEFAULT`).
+                let gu1 = nvfp4_mm::mul_mat_id_mv(&ctx, wgu, x, ids, Some(sgu), false, None, None);
                 let a1 = ops::situ(&ctx, gu1, beta, lb, true);
-                let y1 = nvfp4_mm::mul_mat_id_with(&ctx, wd, a1, ids, Some(sd), true, Some(gu1));
+                let y1 = nvfp4_mm::mul_mat_id_mv(
+                    &ctx,
+                    wd,
+                    a1,
+                    ids,
+                    Some(sd),
+                    false,
+                    Some(gu1),
+                    Some(EXPERT_MV_T1),
+                );
+                // Mask bits 1 and 8: both projections' tiles prefetched two ahead.
+                let gu2 = nvfp4_mm::mul_mat_id_with(&ctx, wgu, x, ids, Some(sgu), true, None);
+                let a2 = ops::situ(&ctx, gu2, beta, lb, true);
+                let y2 = nvfp4_mm::mul_mat_id_with(&ctx, wd, a2, ids, Some(sd), true, Some(gu2));
                 let pairs = [
                     ("gate and up", 2 * f, gu0, gu1),
                     (
@@ -2374,6 +2408,8 @@ fn experts_keep_the_bits(b: &mut Backend, shapes: &[(i64, i64, i64, i64)], toks:
                         ctx.cast(a1, types::F32),
                     ),
                     ("down", k, y0, y1),
+                    ("gate and up (tiles)", 2 * f, gu0, gu2),
+                    ("down (tiles)", k, y0, y2),
                 ]
                 .map(|(what, d, p, q)| {
                     (
@@ -2491,14 +2527,22 @@ fn expert_mv_takes_a_name() {
 }
 
 /// [`experts_keep_the_bits`] on the GPU at Inkling-2-Mini's shapes (2,304 wide, 1,152 per
-/// expert, 8 of 128) and a small one: `nvfp4_mvs` with whole row tiles prefetched and on the
-/// shared plan against the plain grouped mv, and SITU's BF16 store against ggml's cast.
+/// expert, 8 of 128) and a small one: `nvfp4_mvs` as the default runs them (the down
+/// projection's tiles prefetched one ahead, on the shared plan), with the A/B prefetches and
+/// variants, against the plain grouped mv, and SITU's BF16 store against ggml's cast. The
+/// NVFP4 kernels run on device-resident weights on sm_80+ only
+/// ([`nvfp4_mm::device_supported`]): elsewhere the test says so and passes.
 #[cfg(feature = "cuda")]
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "needs an sm_80+ GPU (NVFP4 experts on the device)"]
 fn cuda_experts_keep_the_bits() {
+    let mut gpu = gpu_backend();
+    if !nvfp4_mm::device_supported() {
+        eprintln!("skipped: NVFP4 experts on the device need sm_80+");
+        return;
+    }
     experts_keep_the_bits(
-        &mut gpu_backend(),
+        &mut gpu,
         &[(2304, 1152, 128, 8), (256, 192, 6, 3)],
         &[1, 2, 3, 5, 8, 16, 65],
     );

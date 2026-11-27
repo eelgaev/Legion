@@ -25,10 +25,10 @@
 //!   values to BF16 (ggml's `cpy`, which the BF16 projections read) itself, rounded as
 //!   ggml-cuda's copy rounds them, into the cast's memory, and skips its F32 values where only
 //!   the cast reads them (#1183): a copy kernel per mixer gone ([`Graph::mix_cast`]).
-//! - qwen4exp's gated prompt attention (`--dense-fp8-prompt`, on a compute capability 12.x GPU)
-//!   makes its query's head norm and RoPE itself from the projection's rows, as ggml-cuda's
-//!   `rms_norm` and `rope_multi` kernels make them: two kernels per layer gone
-//!   ([`Graph::q_norm_rope`], #1183).
+//! - qwen4exp's prompt attention on a compute capability 12.x GPU (the gated one of
+//!   `--dense-fp8-prompt`, and the plain one without it) makes its query's head norm and RoPE
+//!   itself from the projection's rows, as ggml-cuda's `rms_norm` and `rope_multi` kernels make
+//!   them: two kernels per layer gone ([`Graph::q_norm_rope`], #1183).
 //! - A gated DeltaNet's FP8 qkv GEMM of a prompt step runs the causal conv, SiLU and q / k head
 //!   norm reading its output (`conv_silu`) in its epilogue, with the bits of the two kernels,
 //!   on a compute capability 12.x GPU: the GEMM's F32 output is no longer written and read
@@ -73,7 +73,8 @@ type Node = *mut ffi::ggml_tensor;
 /// read, its term made from a zero: the same value where that row holds +0.0, as the rows of
 /// the experts another rank holds there; otherwise every row is read, as ggml-cuda reads them.
 /// In that form `src[0]` may be BF16 rows (`fold`'s `fuse_tail`, #1183): each value widened to
-/// F32 as ggml's copy to F32 widens it (exactly), the same sum as of that copy.
+/// F32 as ggml's copy to F32 widens it (exactly), the same sum as of that copy. So may it in
+/// the plain form with the weights and the gate (`fold`'s `plain_tail`, #1183).
 /// `params[3]` of a [`MOE_SUM_GATE`] in its fused-sum form that skips the rows of zero router
 /// weights (`1` reads them all).
 pub(crate) const FMA_SKIP: i32 = 2;
@@ -142,8 +143,9 @@ pub(crate) struct Counts {
     /// #1183): the prompt attention ops that gate and quantize their output
     /// ([`crate::model::qwen4::qsa_attn::gated_codes`]). Counted, not rewritten.
     pub fp8_codes: usize,
-    /// Of those, the ones that make their query's head norm and RoPE themselves, ggml's three
-    /// nodes of them turned off ([`Graph::q_norm_rope`], #1183).
+    /// Prompt attention ops (of those, and the plain ones without `--dense-fp8-prompt`) that
+    /// make their query's head norm and RoPE themselves, ggml's three nodes of them turned off
+    /// ([`Graph::q_norm_rope`], #1183).
     pub q_norm_rope: usize,
     /// The same for the gated DeltaNet delta rule ops that norm their output and write the
     /// ssm_out projection's codes ([`crate::model::core::gdn_mma::codes_on`]). Counted, not
@@ -284,6 +286,8 @@ pub(crate) unsafe fn rewrite_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> 
                         if cuda {
                             g.q_norm_rope(i, &mut c);
                         }
+                    } else if cuda && crate::model::qwen4::qsa_attn::is_prompt_attn(g.nodes[i]) {
+                        g.q_norm_rope(i, &mut c);
                     }
                     if super::gdn_mma::is_codes(g.nodes[i]) {
                         c.gdn_codes += 1;
@@ -1295,8 +1299,9 @@ impl Graph {
         }
     }
 
-    /// The query's head norm and RoPE of the gated prompt attention at `at` (qwen4exp under
-    /// `--dense-fp8-prompt`, [`crate::model::qwen4::qsa_attn::gated_codes`]) on CUDA: where its
+    /// The query's head norm and RoPE of the prompt attention at `at` (qwen4exp's, gated under
+    /// `--dense-fp8-prompt`, [`crate::model::qwen4::qsa_attn::gated_codes`], or plain,
+    /// [`crate::model::qwen4::qsa_attn::is_prompt_attn`]) on CUDA: where its
     /// query is ggml's `rms_norm`, `mul` by the weight and `rope_multi` of the projection's
     /// rows, read by nothing else, the attention kernel makes those values itself from the
     /// rows, as ggml-cuda's kernels make them ([`crate::model::qwen4::qsa_attn::fold_q`]), and
@@ -1335,7 +1340,7 @@ impl Graph {
     /// [`Self::q_norm_rope`]'s chain at `at`: the fold and the nodes it turns off, or why not.
     ///
     /// # Safety
-    /// `at` is a node index of a gated prompt attention.
+    /// `at` is a node index of a gated or plain prompt attention.
     unsafe fn match_q_norm_rope(
         &self,
         at: usize,
@@ -1718,6 +1723,8 @@ unsafe extern "C" {
     static legion_moe_tail_fma4_kernel: *const c_void;
     static legion_moe_tail_fma_x16_kernel: *const c_void;
     static legion_moe_tail_fma4_x16_kernel: *const c_void;
+    static legion_moe_tail_plain_x16_kernel: *const c_void;
+    static legion_moe_tail_plain4_x16_kernel: *const c_void;
     static legion_ids_remap_kernel: *const c_void;
     fn cudaLaunchKernel(
         func: *const c_void,
@@ -1799,10 +1806,11 @@ unsafe fn launch_sum_gate(
         if fma != 0 && (w.is_none() || gate.is_none()) {
             return Err("moe_sum_gate: the fused sum needs the weights and the gate".into());
         }
-        // BF16 experts' rows (`fold`'s `fuse_tail`, #1183): the fused sum's kernel only.
+        // BF16 experts' rows (`fold`'s `fuse_tail` and `plain_tail`, #1183): the tail kernels
+        // only, which take the weights and the gate.
         let x16 = x.type_ == ffi::ggml_type_GGML_TYPE_BF16;
-        if x16 && fma == 0 {
-            return Err("moe_sum_gate: BF16 rows in the fused sum only".into());
+        if x16 && (w.is_none() || gate.is_none()) {
+            return Err("moe_sum_gate: BF16 rows need the weights and the gate".into());
         }
         // Token `t0`'s place in each tensor (the kernels index them by token).
         let g_ld = gate.map_or(0, |(_, g)| g.nb[1] / 4);
@@ -1848,9 +1856,11 @@ unsafe fn launch_sum_gate(
         } else {
             aligned(p.x)
         };
-        let v4 = fma != 0 && e % 4 == 0 && x_aligned && aligned(p.sh) && out_aligned;
+        let v4 = (fma != 0 || x16) && e % 4 == 0 && x_aligned && aligned(p.sh) && out_aligned;
         let (kernel, cols) = match (fma != 0, v4, x16) {
-            (false, _, _) => (legion_moe_sum_gate_kernel, 1),
+            (false, _, false) => (legion_moe_sum_gate_kernel, 1),
+            (false, false, true) => (legion_moe_tail_plain_x16_kernel, 1),
+            (false, true, true) => (legion_moe_tail_plain4_x16_kernel, 4),
             (true, false, false) => (legion_moe_tail_fma_kernel, 1),
             (true, true, false) => (legion_moe_tail_fma4_kernel, 4),
             (true, false, true) => (legion_moe_tail_fma_x16_kernel, 1),

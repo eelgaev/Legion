@@ -120,9 +120,11 @@ pub struct Options {
     pub recursion_depth: usize,
     /// Upper bound on NFA states.
     pub max_nfa_states: usize,
-    /// [`compile_tool_calls`]'s calls may name a tool the request did not declare: the
-    /// name is free and its parameters unconstrained. The parser hands such a call to the
-    /// client when `--undeclared-tool-calls call` is set ([`crate::engine::EngineConfig`]).
+    /// [`compile_tool_calls`]'s calls may name a tool the request did not declare: any name
+    /// that is none of the declared ones and that the parser reads back as it is, with
+    /// unconstrained parameters (a declared name keeps its schema). The parser hands such a
+    /// call to the client when `--undeclared-tool-calls call` is set
+    /// ([`crate::engine::EngineConfig`]).
     pub undeclared_names: bool,
 }
 
@@ -301,24 +303,20 @@ impl GrammarCompiler {
         let mut options = self.options.clone();
         options.undeclared_names = undeclared_names;
         let node = tool_call::qwen3_coder(tools, &options)?;
-        let (nfa, start) = Nfa::build(&node, &options)?;
-        let lazy = Lazy::new(&nfa, start);
-        Ok(Grammar {
-            inner: Arc::new(GrammarInner {
-                table: self.table.clone(),
-                stop: vec![end],
-                nfa,
-                lazy: Mutex::new(lazy),
-            }),
-        })
+        self.finish_with(&node, vec![end], &options)
     }
 
     fn finish(&self, node: &schema::Node) -> Result<Grammar, GrammarError> {
-        self.finish_with(node, self.table.stop.clone())
+        self.finish_with(node, self.table.stop.clone(), &self.options)
     }
 
-    fn finish_with(&self, node: &schema::Node, stop: Vec<u32>) -> Result<Grammar, GrammarError> {
-        let (nfa, start) = Nfa::build(node, &self.options)?;
+    fn finish_with(
+        &self,
+        node: &schema::Node,
+        stop: Vec<u32>,
+        options: &Options,
+    ) -> Result<Grammar, GrammarError> {
+        let (nfa, start) = Nfa::build(node, options)?;
         let lazy = Lazy::new(&nfa, start);
         Ok(Grammar {
             inner: Arc::new(GrammarInner {

@@ -47,6 +47,12 @@ pub(crate) enum Node {
         end: Vec<u8>,
         forbid: Vec<Vec<u8>>,
     },
+    /// A tool-call name: non-empty UTF-8 text without NUL, `<`, `>` or a newline that neither
+    /// starts nor ends with whitespace (so the parser's trim leaves it as it is) and is none
+    /// of `exclude`.
+    Name {
+        exclude: Vec<Vec<u8>>,
+    },
 }
 
 pub(crate) const ANNOTATIONS_OK: &[&str] = &[

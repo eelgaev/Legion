@@ -11,7 +11,7 @@
 //                  With out16 (#1176) the values go out rounded to BF16 instead, into the
 //                  tensor-parallel send buffer of the reduce-scatter that reads the tail.
 //                  With x16 (#1183) the experts' BF16 rows are read in place of their exact
-//                  F32 copy.
+//                  F32 copy; over them also in moe_sum_gate's plain rounding (moe_tail_plain).
 //   ids_remap     the routed expert ids through the layer's expert table: ggml's cont and
 //                  get_rows of the I32 ids (integers, exact).
 //
@@ -37,10 +37,10 @@ struct legion_moe_sum_gate {
     // goes here rounded to BF16 (nearest even, as src/cuda/tp_net.cu's tp_pack_bf16 rounds
     // out's values into the send buffer). 8-byte aligned for the 4-column kernel.
     uint16_t *    out16;
-    // moe_tail_fma, null or the experts' outputs as BF16 [n_embd, k, n_tok] contiguous (#1183,
-    // --nvfp4-expert-rows-bf16), read instead of x: each value widened as ggml-cuda's copy to
-    // F32 widens it (exact), so the F32 rows need not be written and read back. 8-byte aligned
-    // for the 4-column kernel.
+    // moe_tail_fma and moe_tail_plain, null or the experts' outputs as BF16 [n_embd, k, n_tok]
+    // contiguous (#1183, --nvfp4-expert-rows-bf16), read instead of x: each value widened as
+    // ggml-cuda's copy to F32 widens it (exact), so the F32 rows need not be written and read
+    // back. 8-byte aligned for the 4-column kernel.
     const uint16_t * x16;
 };
 
@@ -129,7 +129,11 @@ template <int V> __device__ __forceinline__ void load_cols(const uint16_t * src,
 }
 
 // X16: the rows from p.x16 (BF16) instead of p.x; every other step as the F32 kernel's.
-template <int V, bool X16> __global__ void moe_tail_fma_kernel(const legion_moe_sum_gate p) {
+// PLAIN (#1183, with X16): the sum as ggml's unfused chain rounds it, as moe_sum_gate_kernel
+// does (each product rounded, then one rounded add per expert in expert order), for a tail
+// over BF16 rows whose sum ggml-cuda does not fuse; p.skip_zero is 0 there.
+template <int V, bool X16, bool PLAIN = false>
+__global__ void moe_tail_fma_kernel(const legion_moe_sum_gate p) {
     const int64_t t   = blockIdx.x;
     const int64_t col = ((int64_t) blockIdx.y * blockDim.x + threadIdx.x) * V;
     if (col >= p.n_embd) {
@@ -165,7 +169,12 @@ template <int V, bool X16> __global__ void moe_tail_fma_kernel(const legion_moe_
             if (j0 + q < p.k) {
 #pragma unroll
                 for (int r = 0; r < V; ++r) {
-                    sum[r] = j0 + q == 0 ? __fmul_rn(v[q][r], wj[q]) : __fmaf_rn(v[q][r], wj[q], sum[r]);
+                    if constexpr (PLAIN) {
+                        const float prod = __fmul_rn(v[q][r], wj[q]);
+                        sum[r]           = j0 + q == 0 ? prod : __fadd_rn(sum[r], prod);
+                    } else {
+                        sum[r] = j0 + q == 0 ? __fmul_rn(v[q][r], wj[q]) : __fmaf_rn(v[q][r], wj[q], sum[r]);
+                    }
                 }
             }
         }
@@ -230,3 +239,7 @@ extern "C" const void * const legion_moe_tail_fma_x16_kernel =
     reinterpret_cast<const void *>(&moe_tail_fma_kernel<1, true>);
 extern "C" const void * const legion_moe_tail_fma4_x16_kernel =
     reinterpret_cast<const void *>(&moe_tail_fma_kernel<4, true>);
+extern "C" const void * const legion_moe_tail_plain_x16_kernel =
+    reinterpret_cast<const void *>(&moe_tail_fma_kernel<1, true, true>);
+extern "C" const void * const legion_moe_tail_plain4_x16_kernel =
+    reinterpret_cast<const void *>(&moe_tail_fma_kernel<4, true, true>);

@@ -452,7 +452,7 @@ pub struct Switches {
     /// ([`crate::model::qwen4::set_norm_fma`]).
     pub hc_norm_fma: Option<bool>,
     /// qwen4exp's per-layer embedding as Legion's two ops in prompt steps
-    /// ([`crate::model::qwen4::set_fused_ple`]; off by default).
+    /// ([`crate::model::qwen4::set_fused_ple`]; on by default).
     pub ple: Option<bool>,
     /// The expert cache's work after a step overlapping GPU work (the next MTP pass, the next
     /// stage)

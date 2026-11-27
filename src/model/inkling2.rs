@@ -581,10 +581,25 @@ impl Arch for Ink2Params {
         let name = "output.weight";
         let w = m.w(name)?;
         let ws = m.w("output.scale").ok();
-        let w = if w.ne()[1] > self.n_vocab && w.ne()[2] == 1 {
-            ctx.view_2d(w, [w.ne()[0], self.n_vocab], w.nb()[1], 0)
+        let (w, ws) = if w.ne()[1] > self.n_vocab && w.ne()[2] == 1 {
+            // A scale a row is cut to the same rows; one scale for all stays as it is.
+            let ws = match ws {
+                Some(s) if s.elements() == 1 => Some(s),
+                Some(s) if s.elements() as i64 == w.ne()[1] && s.is_contiguous() => {
+                    Some(ctx.view_1d(s, self.n_vocab, 0))
+                }
+                Some(s) => {
+                    return Err(ModelError::Layout(format!(
+                        "output.scale has {} values for a head of {} rows",
+                        s.elements(),
+                        w.ne()[1]
+                    )));
+                }
+                None => None,
+            };
+            (ctx.view_2d(w, [w.ne()[0], self.n_vocab], w.nb()[1], 0), ws)
         } else {
-            w
+            (w, ws)
         };
         let n: i64 = x.ne()[1..].iter().product();
         let deep = q8_deep().filter(|_| {
