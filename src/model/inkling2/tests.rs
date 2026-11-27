@@ -2188,7 +2188,7 @@ fn linear_set_keeps_the_bits(b: &mut Backend, ty: crate::ggml::ffi::ggml_type, t
     ];
     for (k, ms) in shapes {
         for &n in toks {
-            let ctx = Context::new(32, 32);
+            let ctx = Context::new(64, 64);
             let x = ctx.new_tensor(types::F32, &[k, n]).as_input();
             let ws: Vec<_> = ms
                 .iter()
@@ -2199,12 +2199,20 @@ fn linear_set_keeps_the_bits(b: &mut Backend, ty: crate::ggml::ffi::ggml_type, t
                 .map(|&w| glm_ops::linear_h(&ctx, w, x, None, 1.0, None).as_output())
                 .collect();
             let set: Vec<_> = ws.iter().map(|&w| (w, x, glm_ops::SetEpi::Plain)).collect();
-            let new: Vec<_> = glm_ops::linear_set(&ctx, &set)
-                .into_iter()
-                .map(|t| ctx.cont(t).as_output())
-                .collect();
-            let mut graph = ctx.new_graph(16);
-            for t in old.iter().chain(&new) {
+            let outs =
+                |v: Vec<_>| -> Vec<_> { v.into_iter().map(|t| ctx.cont(t).as_output()).collect() };
+            // The set; Q8_0 also on the staged kernel (#1221 r9), all of it and a product alone.
+            let mut news = vec![("set", outs(glm_ops::linear_set(&ctx, &set)))];
+            if ty == types::Q8_0 {
+                news.push(("staged set", outs(glm_ops::linear_set_staged(&ctx, &set))));
+                let one = set
+                    .iter()
+                    .flat_map(|s| glm_ops::linear_set_staged(&ctx, std::slice::from_ref(s)))
+                    .collect();
+                news.push(("staged, one product", outs(one)));
+            }
+            let mut graph = ctx.new_graph(32);
+            for t in old.iter().chain(news.iter().flat_map(|n| &n.1)) {
                 graph.expand(*t);
             }
             ctx.alloc_graph(&graph, ComputeAllocator::new(b.buffer_type()))
@@ -2223,13 +2231,15 @@ fn linear_set_keeps_the_bits(b: &mut Backend, ty: crate::ggml::ffi::ggml_type, t
                 }
             }
             b.compute(&graph).unwrap();
-            for (j, &m) in ms.iter().enumerate() {
-                let (p, q) = (old[j].to_f32(), new[j].to_f32());
-                assert!(q.iter().any(|&v| v != 0.0), "glm_linear_set: an output");
-                let what = format!("glm_linear_set part {j}, {m} x {k}, {n} tokens");
-                if let Some(line) = first_diff(&what, &p, &q, m as usize) {
-                    eprintln!("first mismatch: {line}");
-                    bad.push(line);
+            for (label, new) in &news {
+                for (j, &m) in ms.iter().enumerate() {
+                    let (p, q) = (old[j].to_f32(), new[j].to_f32());
+                    assert!(q.iter().any(|&v| v != 0.0), "glm_linear_set: an output");
+                    let what = format!("glm_linear_set ({label}) part {j}, {m} x {k}, {n} tokens");
+                    if let Some(line) = first_diff(&what, &p, &q, m as usize) {
+                        eprintln!("first mismatch: {line}");
+                        bad.push(line);
+                    }
                 }
             }
         }
@@ -2244,7 +2254,8 @@ fn linear_set_keeps_the_cpu_bits() {
     linear_set_keeps_the_bits(&mut backend(), types::BF16, &[1, 2, 3, 5, 8]);
 }
 
-/// [`linear_set_keeps_the_bits`] on the GPU: `linear_set_q8` against `linear_mv_q8`.
+/// [`linear_set_keeps_the_bits`] on the GPU: `linear_set_q8` and `linear_set_q8s` (staged, a set
+/// and one product alone; #1221 r9) against `linear_mv_q8`.
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "needs a GPU"]

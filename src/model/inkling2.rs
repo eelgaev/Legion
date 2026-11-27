@@ -103,6 +103,14 @@ fn bf16_set() -> bool {
     *ON.get_or_init(|| std::env::var("LEGION_DEBUG_INK_BF16_SET").map_or(true, |v| v.trim() != "0"))
 }
 
+/// Whether `Model::ink_mm_set` runs Q8_0 sets (and single Q8_0 products) on the staged kernel
+/// (#1221 r9, [`glm_ops::linear_set_staged`]): unless `LEGION_DEBUG_INK_Q8_STAGE=0` (A/B runs:
+/// round 8's linear_set_q8 sets and linear_mv_q8 products). The same bits either way.
+fn q8_set_stage() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LEGION_DEBUG_INK_Q8_STAGE").map_or(true, |v| v.trim() != "0"))
+}
+
 /// [`experts_flags`] given the environment's value.
 pub(crate) fn experts_flags_of(env: Option<&str>) -> u32 {
     const ALL: u32 = EXPERTS_TILE | EXPERTS_PLAN | EXPERTS_BF16_ACT | EXPERTS_TILE_GU;
@@ -613,7 +621,9 @@ impl Model {
     /// them, Q8_0 weights without a scale over up to 8 tokens (decode steps; #1221 r6) or BF16
     /// ones (the NVFP4 checkpoint's) on the GB10 kernels, at one token (linear_mv_bf16's sums,
     /// [`glm_ops::linear_set_bf16_takes`]; r7) and at 2-8 (linear_mv_bf16x's; r9), unless `own`
-    /// (traced runs keep a node a product); else a node each.
+    /// (traced runs keep a node a product); else a node each. Q8_0 sets run CUDA's staged
+    /// kernel ([`glm_ops::linear_set_staged`], [`q8_set_stage`]; r9), and then a single Q8_0
+    /// product (`N` 1) takes it too.
     fn ink_mm_set<'a, const N: usize>(
         &'a self,
         ctx: &'a Context,
@@ -628,8 +638,9 @@ impl Model {
             .map(|n| self.w(&format!("blk.{ip}.{n}")))
             .collect::<Result<Vec<_>, _>>()?;
         let n: i64 = x.ne()[1..].iter().product();
+        let staged = q8_set_stage() && glm_ops::linear_set_takes(&ws, n);
         let set = !own
-            && (2..=glm_ops::SET_MAX).contains(&N)
+            && ((2..=glm_ops::SET_MAX).contains(&N) || (N == 1 && staged))
             && x.ty() == types::F32
             && x.is_contiguous()
             && (glm_ops::linear_set_takes(&ws, n)
@@ -640,7 +651,11 @@ impl Model {
             });
         let out = if set {
             let set: Vec<_> = ws.iter().map(|&w| (w, x, glm_ops::SetEpi::Plain)).collect();
-            glm_ops::linear_set(ctx, &set)
+            if staged {
+                glm_ops::linear_set_staged(ctx, &set)
+            } else {
+                glm_ops::linear_set(ctx, &set)
+            }
         } else {
             names
                 .iter()
@@ -998,18 +1013,18 @@ impl Model {
                 tap.on,
             )?
         } else {
-            [
-                self.ink_mm_b(ctx, ip, "attn_k.weight", xk, &mut rows)?,
-                self.ink_mm_b(ctx, ip, "attn_v.weight", xv, &mut rows)?,
-            ]
+            let [kp] = self.ink_mm_set(ctx, ip, ["attn_k.weight"], xk, &mut rows, tap.on)?;
+            let [vp] = self.ink_mm_set(ctx, ip, ["attn_v.weight"], xv, &mut rows, tap.on)?;
+            [kp, vp]
         };
         let (kdyn, vdyn) = if swa {
             (None, None)
         } else {
-            (
-                Some(self.ink_mm_b(ctx, ip, "attn_k_conv_proj.weight", xk, &mut rows)?),
-                Some(self.ink_mm_b(ctx, ip, "attn_v_conv_proj.weight", xv, &mut rows)?),
-            )
+            let [kd] =
+                self.ink_mm_set(ctx, ip, ["attn_k_conv_proj.weight"], xk, &mut rows, tap.on)?;
+            let [vd] =
+                self.ink_mm_set(ctx, ip, ["attn_v_conv_proj.weight"], xv, &mut rows, tap.on)?;
+            (Some(kd), Some(vd))
         };
         for (name, x) in [("q_proj", q), ("k_proj", kp), ("v_proj", vp)] {
             tap.tap(name, il, x);
@@ -1076,7 +1091,7 @@ impl Model {
         } else {
             ops::clip2(ctx, [q, r], tau)
         };
-        let sinks = self.ink_mm_b(ctx, ip, "attn_sink_proj.weight", xq, &mut rows)?;
+        let [sinks] = self.ink_mm_set(ctx, ip, ["attn_sink_proj.weight"], xq, &mut rows, tap.on)?;
         tap.tap("r_clip", il, r);
         tap.tap("sinks", il, sinks);
         tap.tap("Qcur", il, q);
@@ -1177,7 +1192,14 @@ impl Model {
         tap.tap("attn_gate", il, g);
         let o = ops::sigmul(ctx, o, g);
         tap.tap("attn_gated", il, o);
-        let o = self.ink_mm(ctx, ip, "attn_output.weight", o)?;
+        let [o] = self.ink_mm_set(
+            ctx,
+            ip,
+            ["attn_output.weight"],
+            o,
+            &mut Bf16Rows::default(),
+            tap.on,
+        )?;
         tap.tap("attn_proj", il, o);
         self.ink_conv_add(pass, il, ip, "attn_post_conv.weight", o, None, 2 * kvw, res)
     }
