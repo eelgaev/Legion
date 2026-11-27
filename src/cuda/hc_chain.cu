@@ -43,6 +43,7 @@ struct legion_hc_chain {
 
 int legion_hc_lo_act_launch(const legion_hc_chain * p, void * stream);
 int legion_hc_combine_launch(const legion_hc_chain * p, void * stream);
+int legion_hc_combine16_launch(const legion_hc_chain * p, void * stream);
 int legion_hc_rms_mul_launch(const legion_hc_chain * p, void * stream);
 
 }  // extern "C"
@@ -79,6 +80,28 @@ __global__ void combine_kernel(const legion_hc_chain p, const float bias) {
 
     float sum = p.x[i0 + it * p.x1] * post;
     sum += p.res[i0 + idst * p.r1 + it * p.r2];
+
+    p.dst[i0 + idst * p.e + it * p.e * p.hc] = sum;
+}
+
+// combine_kernel over BF16 streams (#1183, --hc-bf16): p.res holds BF16 values (r1, r2 their
+// strides), each widened exactly (its bits shifted up, as ggml-cuda's copy to F32 widens it),
+// so the copy's values go into the same expressions.
+__global__ void combine16_kernel(const legion_hc_chain p, const float bias) {
+    const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (ir >= p.e * p.hc * p.n) {
+        return;
+    }
+    const int64_t    i0   = ir % p.e;
+    const int64_t    idst = (ir / p.e) % p.hc;
+    const int64_t    it   = ir / (p.e * p.hc);
+    const float      a    = p.scale * p.inj[idst + it * p.i1] + bias;
+    const float      sg   = 1.0f / (1.0f + expf(-a));
+    const float      post = p.scale2 * sg + bias;
+    const uint16_t * res  = reinterpret_cast<const uint16_t *>(p.res);
+
+    float sum = p.x[i0 + it * p.x1] * post;
+    sum += __uint_as_float((uint32_t) res[i0 + idst * p.r1 + it * p.r2] << 16);
 
     p.dst[i0 + idst * p.e + it * p.e * p.hc] = sum;
 }
@@ -154,6 +177,16 @@ extern "C" int legion_hc_combine_launch(const legion_hc_chain * p, void * stream
     constexpr int threads = 256;
     const int64_t blocks = (p->e * p->hc * p->n + threads - 1) / threads;
     combine_kernel<<<(unsigned) blocks, threads, 0, (cudaStream_t) stream>>>(*p, p->bias);
+    return (int) cudaGetLastError();
+}
+
+extern "C" int legion_hc_combine16_launch(const legion_hc_chain * p, void * stream) {
+    if (p->e < 1 || p->hc < 1 || p->n < 1) {
+        return (int) cudaErrorInvalidValue;
+    }
+    constexpr int threads = 256;
+    const int64_t blocks = (p->e * p->hc * p->n + threads - 1) / threads;
+    combine16_kernel<<<(unsigned) blocks, threads, 0, (cudaStream_t) stream>>>(*p, p->bias);
     return (int) cudaGetLastError();
 }
 

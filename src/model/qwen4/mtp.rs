@@ -140,17 +140,18 @@ impl Model {
             None => tok,
         };
         let (ge, gh) = (w("nextn.enorm.weight")?, w("nextn.hnorm.weight")?);
-        // A prompt's take-in under `--dense-fp8-prompt` (#1183): the norms, the repeat and the
-        // concat as one op with their bits ([`super::mtp_in`]); other passes keep the chain.
-        // The take-in's pieces are the passes without output rows (the drafter takes a long
-        // take-in in pieces without logits, then the last rows with the first drafts), here
-        // those of more than 64 tokens: a pass after a decode or verify step outputs drafts,
-        // and its pieces (rows past the last 8 accepted) are over 64 tokens only where a
-        // verify kept over 72. Not asked for without --dense-fp8-prompt (not logged: the
-        // reasons logged are of take-ins that asked).
+        // A prompt's take-in (#1183): the norms, the repeat and the concat as one op with their
+        // bits ([`super::mtp_in`]); other passes keep the chain. The take-in's pieces are the
+        // passes without output rows (the drafter takes a long take-in in pieces without
+        // logits, then the last rows with the first drafts), here those of more than 64
+        // tokens: a pass after a decode or verify step outputs drafts, and its pieces (rows
+        // past the last 8 accepted) are over 64 tokens only where a verify kept over 72. Such
+        // a pass ends at the head's K/V write, with no MoE sum whose fusion the op's smaller
+        // graph could move. `LEGION_DEBUG_MTP_IN=0` keeps the chain but under
+        // `--dense-fp8-prompt` (the way before the op was the default).
         let asked = n_out == 0
             && !crate::model::core::dense_twins::takes_step(n)
-            && self.dense_fp8_mode() == 3;
+            && (super::mtp_in::on() || self.dense_fp8_mode() == 3);
         let fused = asked && {
             let why = super::mtp_in::why_not(tok, h, ge, gh, hc);
             if let Some(why) = &why {

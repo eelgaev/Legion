@@ -26,8 +26,8 @@
 pub mod hc;
 mod hc_chain;
 pub mod hc_down;
-pub(crate) use hc_chain::lo_act_scale;
 pub use hc_chain::set_hc_chain;
+pub(crate) use hc_chain::{lo_act_scale, make_combine16};
 mod hc_mix16;
 pub use hc_mix16::{set_hc_pre, set_mix16, set_rebuild_bf16 as set_mix_rebuild_bf16};
 mod hc_norm;

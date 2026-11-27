@@ -1,5 +1,5 @@
 //! qwen4exp's MTP head input as one external op (#1183): `[enorm(tok) per stream ; hnorm(h)]`,
-//! the `eh_proj` matmul's input, for the head's prompt take-ins under `--dense-fp8-prompt`.
+//! the `eh_proj` matmul's input, for the head's prompt take-ins (on by default; [`on`]).
 //!
 //! ggml's chain in [`super::Model::build_mtp_qwen4`] is six nodes: the embedding's `rms_norm`
 //! and `mul` by `enorm`, its `repeat` to the hc streams, the streams' `rms_norm` and `mul` by
@@ -32,6 +32,13 @@ static MTP_IN: ExternalOp = ExternalOp {
     #[cfg(not(feature = "cuda"))]
     cuda: None,
 };
+
+/// Whether the MTP head's prompt take-ins run the op (on by default, #1183);
+/// `LEGION_DEBUG_MTP_IN=0` keeps ggml's chain but under `--dense-fp8-prompt`, for A/B runs.
+pub(super) fn on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_MTP_IN").is_none_or(|v| v != "0"))
+}
 
 /// The streams the CUDA kernel takes.
 pub(super) const MTP_IN_HC: i64 = 4;

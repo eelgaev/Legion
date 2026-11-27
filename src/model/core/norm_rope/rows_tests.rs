@@ -220,7 +220,10 @@ fn cpu_rows_fold_matches_ggml() {
             n: 66,
             n_dims: 128,
             imrope: false,
-            base: 199_999,
+            // (Not 200K as on the GPU: the CPU reference takes each angle as
+            // `pos · base^(-i/d)` and ggml's CPU RoPE as a running product, both in F32, so far
+            // into the context their angles part by a few 1e-3 radians.)
+            base: 1_999,
             ..QWEN4
         },
     ] {
