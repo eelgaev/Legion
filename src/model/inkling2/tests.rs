@@ -2017,3 +2017,81 @@ fn kv_keeps_the_cpu_bits() {
 fn cuda_kv_keeps_the_bits() {
     kv_keeps_the_bits(&mut gpu_backend());
 }
+
+/// #1221 r6: `ink_clip2` gives two `ink_clip`s' bits: Q's rows and the relative weights' at
+/// Inkling-2-Mini's sizes and the tiny model's, with and without the log-length scale.
+fn clip2_keeps_the_bits(b: &mut Backend) {
+    use crate::ggml::ComputeAllocator;
+    let mut s = 0x9e37_79b9_7f4a_7c15u64;
+    let mut vals = move |n: usize, amp: f32| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 40) as f32 / (1u64 << 23) as f32 - 1.0) * amp
+            })
+            .collect()
+    };
+    let ls = ops::LogScale {
+        floor: 4.0,
+        alpha: 0.3,
+    };
+    let mut bad = Vec::new();
+    for (dq, dr, h) in [(128i64, 16i64, 24i64), (32, 4, 4), (96, 40, 3)] {
+        for n in [1i64, 3, 37] {
+            for tau in [false, true] {
+                let ctx = Context::new(32, 32);
+                let q = ctx.new_tensor(types::F32, &[dq, h, n]).as_input();
+                let qs = ctx.new_tensor(types::F32, &[dq, h]).as_input();
+                let r = ctx.new_tensor(types::F32, &[dr, h, n]).as_input();
+                let rs = ctx.new_tensor(types::F32, &[dr, h]).as_input();
+                let pos = tau.then(|| ctx.new_tensor(types::I32, &[n]).as_input());
+                let tau_of = pos.map(|p| (p, ls));
+                let old = [(q, qs, 3.0f32), (r, rs, 1.5)]
+                    .map(|(x, s, thr)| ops::clip(&ctx, x, Some(s), thr, tau_of).as_output());
+                let new = ops::clip2(&ctx, [(q, qs, 3.0), (r, rs, 1.5)], tau_of);
+                let new = new.map(|t| ctx.cont(t).as_output());
+                let mut graph = ctx.new_graph(16);
+                for t in old.iter().chain(&new) {
+                    graph.expand(*t);
+                }
+                ctx.alloc_graph(&graph, ComputeAllocator::new(b.buffer_type()))
+                    .unwrap();
+                q.set_f32(&vals((dq * h * n) as usize, 4.0));
+                qs.set_f32(&vals((dq * h) as usize, 1.5));
+                r.set_f32(&vals((dr * h * n) as usize, 4.0));
+                rs.set_f32(&vals((dr * h) as usize, 1.5));
+                if let Some(p) = pos {
+                    let v: Vec<i32> = (0..n as i32).map(|i| i * 97 % 5000).collect();
+                    p.set_i32(&v);
+                }
+                b.compute(&graph).unwrap();
+                for (j, d) in [dq, dr].into_iter().enumerate() {
+                    let (p, q) = (old[j].to_f32(), new[j].to_f32());
+                    assert!(q.iter().any(|&v| v != 0.0), "ink_clip2: an output");
+                    let what = format!("ink_clip2 part {j}, rows of {d}, {h} x {n}, tau {tau}");
+                    if let Some(line) = first_diff(&what, &p, &q, d as usize) {
+                        eprintln!("first mismatch: {line}");
+                        bad.push(line);
+                    }
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "\n{}", bad.join("\n"));
+}
+
+/// [`clip2_keeps_the_bits`] on the CPU references.
+#[test]
+fn clip2_keeps_the_cpu_bits() {
+    clip2_keeps_the_bits(&mut backend());
+}
+
+/// [`clip2_keeps_the_bits`] on the GPU: `clip2_kernel` against `clip_kernel`.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_clip2_keeps_the_bits() {
+    clip2_keeps_the_bits(&mut gpu_backend());
+}

@@ -700,6 +700,33 @@ __device__ __forceinline__ float clip_factor(const float (&v)[4], float thr) {
 
 // ---- ink_clip: params thr, has_scale, has_tau, floor, alpha; sources x [d, h, n], scale [d, h],
 // pos [n]. One warp per row (d at most 128). ----
+// ink_clip of one row (lane l with elements l + 32 k): x times sc (if given) clipped to thr,
+// times the log-length factor of position p (if pos): the one expression of clip_kernel and
+// clip2_kernel.
+__device__ __forceinline__ void clip_row(
+    const float * x, const float * sc, int64_t d, float thr, const int32_t * pos, int64_t t,
+    float floor_, float alpha, float * o, int lane) {
+    float v[4];
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        const int64_t i = lane + 32 * k;
+        v[k]            = i < d ? x[i] * (sc ? sc[i] : 1.f) : 0.f;
+    }
+    float f = clip_factor(v, thr);
+    if (pos) {
+        const int32_t p = pos[t];
+        const float   r = fmaxf(((float) p + 1.f) * (1.f / floor_), 1.f);
+        f *= logf(r) * alpha + 1.f;
+    }
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        const int64_t i = lane + 32 * k;
+        if (i < d) {
+            o[i] = v[k] * f;
+        }
+    }
+}
+
 __global__ void clip_kernel(const A a) {
     pdl_wait();
     const float thr       = pf(a.params[0]);
@@ -711,29 +738,36 @@ __global__ void clip_kernel(const A a) {
     if (row >= rows) {
         return;
     }
-    const int64_t hd = row % h, t = row / h;
-    const float * x  = (const float *) src(a, 0) + row * d;
-    const float * sc = has_scale ? (const float *) src(a, 1) + hd * d : nullptr;
-    float         v[4];
-#pragma unroll
-    for (int k = 0; k < 4; k++) {
-        const int64_t i = lane + 32 * k;
-        v[k]            = i < d ? x[i] * (sc ? sc[i] : 1.f) : 0.f;
+    const int64_t   hd  = row % h, t = row / h;
+    const float *   x   = (const float *) src(a, 0) + row * d;
+    const float *   sc  = has_scale ? (const float *) src(a, 1) + hd * d : nullptr;
+    const int32_t * pos = has_tau ? (const int32_t *) src(a, 1 + (has_scale ? 1 : 0)) : nullptr;
+    clip_row(x, sc, d, thr, pos, t, floor_, alpha, (float *) a.dst + row * d, lane);
+}
+
+// ---- ink_clip2 (#1221 r6): ink_clip of two tensors in one launch. Params thr0, thr1, has_tau,
+// floor, alpha; sources x0 [d0, h0, n], scale0 [d0, h0], x1 [d1, h1, n], scale1 [d1, h1],
+// pos [n]; dst x0's rows, then x1's. A warp per row, as clip_kernel. ----
+__global__ void clip2_kernel(const A a) {
+    pdl_wait();
+    const bool    has_tau = a.params[2] != 0;
+    const float   floor_  = pf(a.params[3]), alpha = pf(a.params[4]);
+    const int64_t rows0 = a.src_ne[0][1] * a.src_ne[0][2];
+    const int64_t rows  = rows0 + a.src_ne[2][1] * a.src_ne[2][2];
+    const int     lane  = threadIdx.x % 32;
+    int64_t       row   = (int64_t) blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (row >= rows) {
+        return;
     }
-    float f = clip_factor(v, thr);
-    if (has_tau) {
-        const int32_t p = ((const int32_t *) src(a, 1 + (has_scale ? 1 : 0)))[t];
-        const float   r = fmaxf(((float) p + 1.f) * (1.f / floor_), 1.f);
-        f *= logf(r) * alpha + 1.f;
-    }
-    float * o = (float *) a.dst + row * d;
-#pragma unroll
-    for (int k = 0; k < 4; k++) {
-        const int64_t i = lane + 32 * k;
-        if (i < d) {
-            o[i] = v[k] * f;
-        }
-    }
+    const int     j   = row >= rows0 ? 1 : 0;
+    const int64_t off = j ? rows0 * a.src_ne[0][0] : 0;
+    row -= j * rows0;
+    const int64_t   d = a.src_ne[2 * j][0], h = a.src_ne[2 * j][1];
+    const int64_t   hd = row % h, t = row / h;
+    const float *   x   = (const float *) src(a, 2 * j) + row * d;
+    const float *   sc  = (const float *) src(a, 2 * j + 1) + hd * d;
+    const int32_t * pos = has_tau ? (const int32_t *) src(a, 4) : nullptr;
+    clip_row(x, sc, d, pf(a.params[j]), pos, t, floor_, alpha, (float *) a.dst + off + row * d, lane);
 }
 
 // ---- ink_kv (#1221 r6): a decode step's K and V, the nodes ink_conv (K, then V), ink_clip (K,
@@ -1527,7 +1561,7 @@ __global__ void softcap_kernel(const A a) {
 
 }  // namespace
 
-extern "C" const void * const legion_ink_kernels[24] = {
+extern "C" const void * const legion_ink_kernels[25] = {
     reinterpret_cast<const void *>(&mix_kernel),
     reinterpret_cast<const void *>(&ctrl_in_kernel),
     reinterpret_cast<const void *>(&ctrl_out_kernel),
@@ -1552,4 +1586,5 @@ extern "C" const void * const legion_ink_kernels[24] = {
     reinterpret_cast<const void *>(&rms_kernel<9>),
     reinterpret_cast<const void *>(&rms_kernel<16>),
     reinterpret_cast<const void *>(&kv_kernel),
+    reinterpret_cast<const void *>(&clip2_kernel),
 };

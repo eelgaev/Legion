@@ -41,6 +41,7 @@ external_op!(SITU, "ink_situ", cpu_situ, situ);
 external_op!(MM_ID, "ink_mm_id", cpu_mm_id, mm_id);
 external_op!(SOFTCAP, "ink_softcap", cpu_softcap, softcap);
 external_op!(KV, "ink_kv", cpu_kv, kv);
+external_op!(CLIP2, "ink_clip2", cpu_clip2, clip2);
 
 /// The most states [`mix`] takes (the depth blocks and the current residual): with its query,
 /// the 9 sources ggml takes.
@@ -292,6 +293,65 @@ impl LogScale {
         let v = ((p as f32 + 1.0) * (1.0 / self.floor)).max(1.0);
         v.ln() * self.alpha + 1.0
     }
+}
+
+/// [`clip`] of two tensors in one node (#1221 r6), each `(x, scale, thr)` with its scale and
+/// threshold and both with `tau` when given: the same bits, as views of one F32 output.
+pub fn clip2<'a>(
+    ctx: &'a Context,
+    parts: [(Tensor<'a>, Tensor<'a>, f32); 2],
+    tau: Option<(Tensor<'a>, LogScale)>,
+) -> [Tensor<'a>; 2] {
+    let mut args = Vec::new();
+    for (x, s, _) in parts {
+        let x = contiguous(x);
+        let [d, h, n, _] = x.ne();
+        assert!(d <= 128, "ink_clip2: rows of {d}");
+        assert_eq!(n, contiguous(parts[0].0).ne()[2], "ink_clip2: tokens");
+        assert_eq!(
+            (s.ty(), s.ne()[..2].to_vec()),
+            (types::F32, vec![d, h]),
+            "ink_clip2: F32 [d, h] scale"
+        );
+        args.extend([x, contiguous(s)]);
+    }
+    let (floor, alpha) = match tau {
+        Some((pos, ls)) => {
+            assert_eq!(
+                (pos.ty(), pos.ne()[0]),
+                (types::I32, args[0].ne()[2]),
+                "ink_clip2: positions"
+            );
+            args.push(contiguous(pos));
+            (ls.floor, ls.alpha)
+        }
+        None => (0.0, 0.0),
+    };
+    let len = |x: Tensor<'a>| x.ne()[..3].iter().product::<i64>();
+    let (a, b) = (len(args[0]), len(args[2]));
+    let out = ctx.external_with(
+        &CLIP2,
+        types::F32,
+        [a + b, 1, 1, 1],
+        &args,
+        &[
+            parts[0].2.to_bits() as i32,
+            parts[1].2.to_bits() as i32,
+            tau.is_some() as i32,
+            floor.to_bits() as i32,
+            alpha.to_bits() as i32,
+        ],
+    );
+    let view = |x: Tensor<'a>, off: i64| {
+        let [d, h, n, _] = x.ne();
+        ctx.view_3d(
+            out,
+            [d, h, n],
+            [d as usize * 4, (d * h) as usize * 4],
+            off as usize * 4,
+        )
+    };
+    [view(args[0], 0), view(args[2], a)]
 }
 
 /// A decode step's K and V (#1221 r6): [`conv`] of `kp` and `vp` (F32 `[kvw, n]`, one token a
@@ -875,6 +935,56 @@ unsafe fn cpu_kv(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
     }
 }
 
+/// ink_clip of one row `x` (scale `sc`, the token's log-length factor `tau`) into `o`.
+fn clip_row(x: &[f32], sc: Option<&[f32]>, thr: f32, tau: Option<f32>, o: &mut [f32]) {
+    let mut v = x.to_vec();
+    if let Some(sr) = sc {
+        for i in 0..v.len() {
+            v[i] *= sr[i];
+        }
+    }
+    let mut f = clip_factor(&v, thr);
+    if let Some(t) = tau {
+        f *= t;
+    }
+    for i in 0..v.len() {
+        o[i] = v[i] * f;
+    }
+}
+
+unsafe fn cpu_clip2(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
+    unsafe {
+        let s = |i: usize| &*dst.src[i];
+        let p = external_params(dst);
+        let thr = [f32_param(p[0]), f32_param(p[1])];
+        let ls = LogScale {
+            floor: f32_param(p[3]),
+            alpha: f32_param(p[4]),
+        };
+        let pos = (p[2] != 0).then(|| s(4));
+        let (q, r) = (s(0), s(2));
+        let rows_q = (q.ne[1] * q.ne[2]) as usize;
+        let rows = rows_q + (r.ne[1] * r.ne[2]) as usize;
+        let len_q = rows_q * q.ne[0] as usize;
+        for row in part(rows, ith, nth) {
+            let j = (row >= rows_q) as usize;
+            let (x, sc) = (s(2 * j), s(2 * j + 1));
+            let row = row - j * rows_q;
+            let (d, h) = (x.ne[0] as usize, x.ne[1] as usize);
+            let (hd, t) = (row % h, row / h);
+            let o = f32s_mut(dst, (j * len_q + row * d) * 4, d);
+            let tau = pos.map(|pos| ls.at(at::<i32>(pos, t)));
+            clip_row(
+                f32s(x, row * d * 4, d),
+                Some(f32s(sc, hd * d * 4, d)),
+                thr[j],
+                tau,
+                o,
+            );
+        }
+    }
+}
+
 unsafe fn cpu_clip(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
     unsafe {
         let x = &*dst.src[0];
@@ -890,21 +1000,15 @@ unsafe fn cpu_clip(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
         let rows = h * dst.ne[2] as usize;
         for row in part(rows, ith, nth) {
             let (hd, t) = (row % h, row / h);
-            let mut v = f32s(x, row * d * 4, d).to_vec();
-            if let Some(s) = scale {
-                let sr = f32s(s, hd * d * 4, d);
-                for i in 0..d {
-                    v[i] *= sr[i];
-                }
-            }
-            let mut f = clip_factor(&v, thr);
-            if let Some(pos) = pos {
-                f *= ls.at(at::<i32>(pos, t));
-            }
-            let o = f32s_mut(dst, row * d * 4, d);
-            for i in 0..d {
-                o[i] = v[i] * f;
-            }
+            let sc = scale.map(|s| f32s(s, hd * d * 4, d));
+            let tau = pos.map(|pos| ls.at(at::<i32>(pos, t)));
+            clip_row(
+                f32s(x, row * d * 4, d),
+                sc,
+                thr,
+                tau,
+                f32s_mut(dst, row * d * 4, d),
+            );
         }
     }
 }

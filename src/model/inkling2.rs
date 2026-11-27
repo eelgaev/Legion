@@ -948,26 +948,28 @@ impl Model {
 
         // The global layers' Q and relative weights scale with the log of the position.
         let tau = (!swa).then_some((pos_all, p.log_scale));
-        let q = ops::clip(
-            ctx,
-            ctx.reshape_3d(q, d, nh, n),
-            Some(self.lw(ip, "attn_q_clip.weight")?),
-            p.qk_clip,
-            tau,
-        );
         let kv = convs.map(|(k, v)| {
             (
                 ops::clip(ctx, ctx.reshape_3d(k, d, nkv, n), None, p.qk_clip, None),
                 ops::rms(ctx, ctx.reshape_3d(v, d, nkv, n), None, hp.rms_eps),
             )
         });
-        let r = ops::clip(
-            ctx,
-            ctx.reshape_3d(r, p.n_rel, nh, n),
-            Some(self.lw(ip, "attn_rel_clip.weight")?),
-            p.rel_clip,
-            tau,
+        // Q's and the relative weights' clips: one node of their bits, unless traced.
+        let q = (
+            ctx.reshape_3d(q, d, nh, n),
+            self.lw(ip, "attn_q_clip.weight")?,
+            p.qk_clip,
         );
+        let r = (
+            ctx.reshape_3d(r, p.n_rel, nh, n),
+            self.lw(ip, "attn_rel_clip.weight")?,
+            p.rel_clip,
+        );
+        let [q, r] = if tap.on || d > 128 || p.n_rel > 128 {
+            [q, r].map(|(x, s, thr)| ops::clip(ctx, x, Some(s), thr, tau))
+        } else {
+            ops::clip2(ctx, [q, r], tau)
+        };
         let sinks = self.ink_mm_b(ctx, ip, "attn_sink_proj.weight", xq, &mut rows)?;
         tap.tap("r_clip", il, r);
         tap.tap("sinks", il, sinks);
