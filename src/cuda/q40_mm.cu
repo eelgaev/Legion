@@ -374,7 +374,7 @@ template <class C> __global__ void __launch_bounds__(Q40_THREADS, C::MINB) q40_g
 // Round 3's matmul configuration: BM x BN tiles, WARPS_M x WARPS_N warps of (BM / WARPS_M) x
 // (BN / WARPS_N), a STAGES-deep ring of 4 K blocks a stage, MINB CTAs an SM, raster groups of
 // GROUP row tiles; the input in layout 1.
-template <int BM_, int BN_, int WARPS_M_, int WARPS_N_, int STAGES_, int MINB_, int GROUP_, int LATE_ = 0> struct q40_cfg3 {
+template <int BM_, int BN_, int WARPS_M_, int WARPS_N_, int STAGES_, int MINB_, int GROUP_, int LATE_ = 0, int COLS_ = 0> struct q40_cfg3 {
     static constexpr int BM          = BM_;
     static constexpr int BN          = BN_;
     static constexpr int WARPS_M     = WARPS_M_;
@@ -383,6 +383,7 @@ template <int BM_, int BN_, int WARPS_M_, int WARPS_N_, int STAGES_, int MINB_, 
     static constexpr int MINB        = MINB_;
     static constexpr int GROUP       = GROUP_;
     static constexpr int LATE        = LATE_;            // the next stage's copies after block 0
+    static constexpr int COLS        = COLS_;            // groups of GROUP column tiles
     static constexpr int THREADS     = 32 * WARPS_M * WARPS_N;
     static constexpr int MT          = BM / WARPS_M / 16;
     static constexpr int NT          = BN / WARPS_N / 8;
@@ -431,14 +432,17 @@ template <class C> __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_ge
     const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, g = lane / 4, q = lane % 4;
     const int wm = warp % C::WARPS_M, wn = warp / C::WARPS_M;
 
+    // Groups of GROUP row tiles, column after column (or of GROUP column tiles, row after row).
     const int b         = blockIdx.x;
-    const int per_group = C::GROUP * p.ntx;
+    const int nmaj      = C::COLS ? p.ntx : p.nty;
+    const int nmin      = C::COLS ? p.nty : p.ntx;
+    const int per_group = C::GROUP * nmin;
     const int grp       = b / per_group;
     const int r0        = grp * C::GROUP;
-    const int gsz       = min(C::GROUP, p.nty - r0);
+    const int gsz       = min(C::GROUP, nmaj - r0);
     const int in        = b - grp * per_group;
-    const int it        = r0 + in % gsz;
-    const int jt        = in / gsz;
+    const int it        = C::COLS ? in / gsz : r0 + in % gsz;
+    const int jt        = C::COLS ? r0 + in % gsz : in / gsz;
     const int row0      = it * BM;
     const int col0      = jt * BN;
     const int nst       = p.k / (32 * SB);
@@ -596,12 +600,13 @@ template <class C> __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_ge
 }
 
 // The variants the timing test compares (src/model/q40_mm.rs, `Kernel`).
-using q40_r3a  = q40_cfg3<128, 128, 4, 2, 3, 1, 8>;      // 8 warps of 32 x 64
-using q40_r3aL = q40_cfg3<128, 128, 4, 2, 3, 1, 8, 1>;
-using q40_r3aG = q40_cfg3<128, 128, 4, 2, 3, 1, 16>;
-using q40_r3f  = q40_cfg3<64, 128, 2, 2, 2, 2, 16>;      // 4 warps of 32 x 64, 2 CTAs an SM
-using q40_r3fL = q40_cfg3<64, 128, 2, 2, 2, 2, 16, 1>;
-using q40_r3fG = q40_cfg3<64, 128, 2, 2, 2, 2, 32, 1>;
+using q40_r3a   = q40_cfg3<128, 128, 4, 2, 3, 1, 8>;        // 8 warps of 32 x 64
+using q40_r3f   = q40_cfg3<64, 128, 2, 2, 2, 2, 16>;        // 4 warps of 32 x 64, 2 CTAs an SM
+using q40_r3f8  = q40_cfg3<64, 128, 2, 2, 2, 2, 8>;
+using q40_r3f32 = q40_cfg3<64, 128, 2, 2, 2, 2, 32>;
+using q40_r3c4  = q40_cfg3<64, 128, 2, 2, 2, 2, 4, 0, 1>;   // groups of column tiles
+using q40_r3c8  = q40_cfg3<64, 128, 2, 2, 2, 2, 8, 0, 1>;
+using q40_r3c16 = q40_cfg3<64, 128, 2, 2, 2, 2, 16, 0, 1>;
 
 }  // namespace
 
@@ -624,14 +629,15 @@ struct legion_q40_kernel {
 
 // The op's matmul first, then the others the timing test runs (src/model/q40_mm.rs).
 extern const legion_q40_kernel legion_q40_mm_table[] = {
-    Q40_R3(q40_r3a, "r3 128x128 8w 32x64"),
+    Q40_R3(q40_r3f, "r3 64x128 x2 row group 16"),
     { reinterpret_cast<const void *>(&q40_quant<0>), reinterpret_cast<const void *>(&q40_gemm<q40_v1>), q40_v1::SMEM,
       256, 128, 128, "first version" },
-    Q40_R3(q40_r3aL, "r3 128x128 8w late copy"),
-    Q40_R3(q40_r3aG, "r3 128x128 8w group 16"),
-    Q40_R3(q40_r3f, "r3 64x128 4w x2 CTAs"),
-    Q40_R3(q40_r3fL, "r3 64x128 4w x2 late copy"),
-    Q40_R3(q40_r3fG, "r3 64x128 4w x2 late group 32"),
+    Q40_R3(q40_r3a, "r3 128x128 8w 32x64"),
+    Q40_R3(q40_r3f8, "r3 64x128 x2 row group 8"),
+    Q40_R3(q40_r3f32, "r3 64x128 x2 row group 32"),
+    Q40_R3(q40_r3c4, "r3 64x128 x2 col group 4"),
+    Q40_R3(q40_r3c8, "r3 64x128 x2 col group 8"),
+    Q40_R3(q40_r3c16, "r3 64x128 x2 col group 16"),
 };
 extern const int legion_q40_mm_table_len = sizeof(legion_q40_mm_table) / sizeof(legion_q40_mm_table[0]);
 
