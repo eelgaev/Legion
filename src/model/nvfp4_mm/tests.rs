@@ -1,5 +1,23 @@
 use super::*;
 
+/// [`mul_mat_id_mv`]'s [`P_TILE`] values (#1221 r9): every variant back from its value, and
+/// `mul_mat_id_with`'s 0 and 1 none.
+#[test]
+fn tile_params_round_trip() {
+    assert_eq!(tile_variant(0), None);
+    assert_eq!(tile_variant(1), None);
+    for g in [GLU_MV, GLU_MV_TILE, DOWN_MV_TILE] {
+        assert_eq!(tile_variant(tile_param(g)), Some(g));
+    }
+    let wide = GroupedMv {
+        rtw: 15,
+        rpt: 255,
+        sb: 255,
+        pft: 15,
+    };
+    assert_eq!(tile_variant(tile_param(wide)), Some(wide));
+}
+
 #[test]
 fn token_tiles_cover_the_batch() {
     assert_eq!(tokens_tile(1, 4), 1);
@@ -473,6 +491,66 @@ fn down_shares_the_swiglu_plan() {
     // ggml's CPU silu has its own exp: one BF16 rounding of the product apart at most.
     for (a, b) in a.iter().zip(&b) {
         assert!((a - b).abs() <= 2e-2 * top, "{a} against {b}");
+    }
+}
+
+/// `mul_mat_id_with`'s `plan_of` (#1221 r7): read only on a whole `mul_mat_id` result of the
+/// same routing (the same ids, or copies of the same ones) that made its own plan, at up to
+/// `PLAN_SHARE_MAX_TOKENS` tokens, that node then the last source; `tile` marks the node.
+#[test]
+fn down_reads_an_earlier_mul_mat_ids_plan() {
+    let (k, m, n_expert, n_used) = (128i64, 64i64, 8i64, 2i64);
+    let cpu = crate::ggml::Backend::cpu().unwrap();
+    let weights = Context::new(4, 0);
+    let wgu = weights.new_tensor(types::NVFP4, &[k, 2 * m, n_expert]);
+    let wd = weights.new_tensor(types::NVFP4, &[m, k, n_expert]);
+    let scale = weights.new_tensor(types::F32, &[n_expert]);
+    // Host memory: what `supports` takes on any machine.
+    weights.alloc_tensors(cpu.buffer_type()).unwrap();
+    let ctx = Context::new(256, 0);
+    let node = |t: Tensor<'_>| {
+        // SAFETY: a view of a live node.
+        unsafe { (*t.raw()).view_src }
+    };
+    // SAFETY: a live node.
+    let flags = |t: Tensor<'_>| unsafe {
+        let p = &(*node(t)).op_params;
+        (p[P_PLAN], p[P_TILE])
+    };
+    // SAFETY: a live node.
+    let src = |t: Tensor<'_>, i: usize| unsafe { (*node(t)).src[i] };
+    let none = std::ptr::null_mut();
+    for n_tok in [1i64, 3, 64, 65] {
+        let x = ctx.new_tensor(types::F32, &[k, 1, n_tok]);
+        let ids = ctx.new_tensor(types::I32, &[n_used, n_tok]);
+        let other = ctx.new_tensor(types::I32, &[n_used, n_tok]);
+        let a = ctx.new_tensor(types::BF16, &[m, n_used, n_tok]);
+        let shares = n_tok <= PLAN_SHARE_MAX_TOKENS;
+        let shared = if shares { PLAN_OF_SOURCE } else { 0 };
+        let gu = mul_mat_id_with(&ctx, wgu, x, ids, Some(scale), true, None);
+        assert_eq!(flags(gu), (0, 1));
+        let down = mul_mat_id_with(&ctx, wd, a, ids, Some(scale), true, Some(gu));
+        assert_eq!(flags(down), (shared, 1));
+        let from = if shares { node(gu) } else { none };
+        assert_eq!(src(down, 4), from);
+        // Another routing, a part of the result, or a node on another's plan: its own plan.
+        let apart = mul_mat_id_with(&ctx, wd, a, other, Some(scale), false, Some(gu));
+        assert_eq!(flags(apart), (0, 0));
+        let part = ctx.view_3d(gu, [2 * m, 1, n_tok], [gu.nb()[1], gu.nb()[2]], 0);
+        let d = mul_mat_id_with(&ctx, wd, a, ids, None, true, Some(part));
+        assert_eq!(flags(d), (0, 1));
+        let d = mul_mat_id_with(&ctx, wd, a, ids, None, true, Some(down));
+        assert_eq!(flags(d), (0, 1));
+        // A copy of the same ids (each op makes its own of a strided `ids`).
+        let wide = ctx.new_tensor(types::I32, &[2 * n_used, n_tok]);
+        let strided = ctx.view_2d(wide, [n_used, n_tok], wide.nb()[1], 0);
+        let gu2 = mul_mat_id_with(&ctx, wgu, x, strided, None, true, None);
+        let d = mul_mat_id_with(&ctx, wd, a, strided, None, true, Some(gu2));
+        assert_eq!(flags(d), (shared, 1));
+        let from = if shares { node(gu2) } else { none };
+        assert_eq!(src(d, 3), from);
+        // `mul_mat_id` itself stays as it was.
+        assert_eq!(flags(mul_mat_id(&ctx, wd, a, ids, None)), (0, 0));
     }
 }
 

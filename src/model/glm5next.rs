@@ -778,7 +778,7 @@ impl Model {
 
     /// [`Self::glm_mm_h`] of the weights `w` (`name`'s, or a view of its first rows) and their
     /// scale `ws`.
-    fn glm_mm_w<'a>(
+    pub(crate) fn glm_mm_w<'a>(
         &'a self,
         ctx: &'a Context,
         name: &str,

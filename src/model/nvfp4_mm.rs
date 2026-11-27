@@ -510,6 +510,26 @@ unsafe fn swiglu_plan(x: &ffi::ggml_tensor, n_used: i64, n_tok: i64, n_expert: i
     }
 }
 
+/// The plan of the pairs the earlier [`mul_mat_id`] node of a [`mul_mat_id_with`] node `dst`
+/// with `plan_of` ([`PLAN_OF_SOURCE`]) left after its result, when that source still is that
+/// node where it runs (an input from another backend is a copy) and made its own plan.
+#[cfg(feature = "cuda")]
+unsafe fn source_plan(dst: &ffi::ggml_tensor, n_used: i64, n_tok: i64, n_expert: i64) -> *mut i32 {
+    // SAFETY: `dst` is a node of `id_node` with `from`: its last source (after the scale).
+    unsafe {
+        let node = dst.src[3 + (dst.op_params[P_SCALE] != 0) as usize];
+        if node.is_null()
+            || !crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &NVFP4_MM_ID))
+            || (*node).op_params[P_PLAN] != 0
+        {
+            return std::ptr::null_mut();
+        }
+        let n = &*node;
+        let (out, _) = id_layout((*n.src[0]).ne[1], n_used, n_tok, n_expert, n.nb[0]);
+        (n.data as *mut u8).add(out) as *mut i32
+    }
+}
+
 /// The expert matmul `mul_mat_id(w, x, ids)` of NVFP4 experts `w` (`[k, m, n_expert]`, see
 /// [`supports`]) with activations `x` (`[k, n_x, n_tok]`, `n_x` 1 or `n_used`; F32 rounded to
 /// BF16 here, or BF16) and the router's choices `ids` (I32 `[n_used, n_tok]`), each row times
@@ -532,6 +552,160 @@ pub fn mul_mat_id_act<'a>(
     ids: Tensor<'a>,
     scale: Option<Tensor<'a>>,
     act: Act,
+) -> Tensor<'a> {
+    id_node(ctx, w, x, ids, scale, act, 0, None)
+}
+
+/// Where a [`mul_mat_id_with`] node keeps that its decode mv takes the whole row tile L2
+/// prefetch ([`DOWN_MV_TILE`]) on its own plan too (slots 6 and 7 follow the custom op's
+/// header; no other `mul_mat_id` parameter is there): 1, or a [`mul_mat_id_mv`] variant
+/// ([`tile_param`]).
+const P_TILE: usize = 7;
+
+/// [`P_PLAN`]'s value for a node that reads the plan of an earlier [`mul_mat_id`] node of the
+/// same routing, its last source ([`plan_source`]).
+const PLAN_OF_SOURCE: i32 = 2;
+
+/// The most tokens of a step whose [`mul_mat_id_with`] reads an earlier node's plan: that
+/// node's result stays allocated until this one has run (a few MB at decode batches; a prompt
+/// step's gate and up rows would be hundreds).
+pub const PLAN_SHARE_MAX_TOKENS: i64 = 64;
+
+/// [`mul_mat_id`] with two decode options (#1221 r7), the same sums either way. With `tile`, its
+/// mv at one token per expert tile takes whole row tiles into L2 ([`DOWN_MV_TILE`], as a
+/// SwiGLU's down mv does under [`set_expert_tile_prefetch`]): short rows (Inkling-2's down
+/// projection, k = 1152: 648 bytes) are fetched in long contiguous runs instead of a few stages
+/// of each row at a time. With `plan_of`, the result of an earlier `mul_mat_id` over the same
+/// `ids` (Inkling-2's gate and up rows, before its activation), steps of up to
+/// [`PLAN_SHARE_MAX_TOKENS`] tokens read that node's plan of the pairs instead of making the same
+/// one again (one kernel less), and on CUDA launch the mv as a programmatic dependent of the
+/// kernel ahead, as a SwiGLU's down mv does (its tiles and first weight stages set up while that
+/// kernel ends; see `nvfp4_mvs`): the plan was complete before the earlier node's kernels ran,
+/// and the kernel ahead started after them.
+#[allow(clippy::too_many_arguments)]
+pub fn mul_mat_id_with<'a>(
+    ctx: &'a Context,
+    w: Tensor<'a>,
+    x: Tensor<'a>,
+    ids: Tensor<'a>,
+    scale: Option<Tensor<'a>>,
+    tile: bool,
+    plan_of: Option<Tensor<'a>>,
+) -> Tensor<'a> {
+    mul_mat_id_p(ctx, w, x, ids, scale, tile as i32, plan_of)
+}
+
+/// [`mul_mat_id_with`] with its [`P_TILE`] value `tile` ([`mul_mat_id_mv`]'s variants too).
+fn mul_mat_id_p<'a>(
+    ctx: &'a Context,
+    w: Tensor<'a>,
+    x: Tensor<'a>,
+    ids: Tensor<'a>,
+    scale: Option<Tensor<'a>>,
+    tile: i32,
+    plan_of: Option<Tensor<'a>>,
+) -> Tensor<'a> {
+    let n_expert = w.ne()[2];
+    // As `id_node` takes them: the routing `plan_source` compares.
+    let ids = if ids.is_contiguous() {
+        ids
+    } else {
+        ctx.cont(ids)
+    };
+    let plan_of = plan_of.filter(|_| ids.ne()[1] <= PLAN_SHARE_MAX_TOKENS);
+    let from = plan_of.and_then(|p| plan_source(ctx, p, ids, n_expert));
+    id_node(ctx, w, x, ids, scale, Act::None, tile, from)
+}
+
+/// [`mul_mat_id_with`] whose mv at one token per expert tile runs the grouped mv variant `mv`
+/// (#1221 r9, Inkling-2's A/B runs of its expert shapes) where `tile` would take
+/// [`DOWN_MV_TILE`]: the same bits (every variant's warp takes the same blocks in the same
+/// order). `mv` must be one the CUDA dispatch compiles for one-token tiles without the SwiGLU
+/// (`mvg<1>`); `None` is `mul_mat_id_with`.
+#[allow(clippy::too_many_arguments)]
+pub fn mul_mat_id_mv<'a>(
+    ctx: &'a Context,
+    w: Tensor<'a>,
+    x: Tensor<'a>,
+    ids: Tensor<'a>,
+    scale: Option<Tensor<'a>>,
+    tile: bool,
+    plan_of: Option<Tensor<'a>>,
+    mv: Option<GroupedMv>,
+) -> Tensor<'a> {
+    let tile = mv.map_or(tile as i32, tile_param);
+    mul_mat_id_p(ctx, w, x, ids, scale, tile, plan_of)
+}
+
+/// [`P_TILE`]'s value for a [`mul_mat_id_mv`] variant (0 and 1 are [`mul_mat_id_with`]'s).
+fn tile_param(g: GroupedMv) -> i32 {
+    assert!(
+        (1..16).contains(&g.rtw)
+            && (1..256).contains(&g.rpt)
+            && (1..256).contains(&g.sb)
+            && (0..16).contains(&g.pft),
+        "nvfp4 mul_mat_id_mv: {g:?}"
+    );
+    2 | g.rtw << 4 | g.rpt << 8 | g.sb << 16 | g.pft << 24
+}
+
+/// The [`mul_mat_id_mv`] variant of a [`P_TILE`] value.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn tile_variant(v: i32) -> Option<GroupedMv> {
+    (v & 0xf == 2).then(|| GroupedMv {
+        rtw: (v >> 4) & 0xf,
+        rpt: (v >> 8) & 0xff,
+        sb: (v >> 16) & 0xff,
+        pft: (v >> 24) & 0xf,
+    })
+}
+
+/// The node of `t` when it is the whole result of a [`mul_mat_id`] (or [`mul_mat_id_with`])
+/// node that makes its own plan of the routing `ids` over `n_expert` experts: the node whose
+/// plan [`mul_mat_id_with`]'s `plan_of` reads.
+fn plan_source<'a>(
+    ctx: &'a Context,
+    t: Tensor<'a>,
+    ids: Tensor<'a>,
+    n_expert: i64,
+) -> Option<Tensor<'a>> {
+    // SAFETY: `t`, `ids` and their sources are valid tensors of the context.
+    unsafe {
+        let v = &*t.raw();
+        let node = v.view_src;
+        if node.is_null() || v.view_offs != 0 {
+            return None;
+        }
+        if !crate::ggml::op_of(node).is_some_and(|op| std::ptr::eq(op, &NVFP4_MM_ID)) {
+            return None;
+        }
+        let n = &*node;
+        if n.op_params[P_PLAN] != 0 || n.op_params[P_SKIP] != 0 {
+            return None;
+        }
+        let (w, theirs, ours) = (&*n.src[0], n.src[2], ids.raw());
+        let copy_of = |a: *mut ffi::ggml_tensor| {
+            (*a).op == ffi::ggml_op_GGML_OP_CONT && !(*a).src[0].is_null()
+        };
+        let same_ids = std::ptr::eq(theirs, ours)
+            || (copy_of(theirs) && copy_of(ours) && (*theirs).src[0] == (*ours).src[0]);
+        let whole = v.ne[..3] == [w.ne[1], (*theirs).ne[0], (*theirs).ne[1]];
+        (same_ids && w.ne[2] == n_expert && whole).then(|| ctx.wrap(node))
+    }
+}
+
+/// The node of [`mul_mat_id_act`] and [`mul_mat_id_with`]: `tile` is [`P_TILE`], `from` is
+/// the node whose plan it reads ([`plan_source`]).
+#[allow(clippy::too_many_arguments)]
+fn id_node<'a>(
+    ctx: &'a Context,
+    w: Tensor<'a>,
+    x: Tensor<'a>,
+    ids: Tensor<'a>,
+    scale: Option<Tensor<'a>>,
+    act: Act,
+    tile: i32,
+    from: Option<Tensor<'a>>,
 ) -> Tensor<'a> {
     assert!(supports(w), "unsupported NVFP4 experts {:?}", w.ne());
     let [k, m, n_expert, _] = w.ne();
@@ -561,9 +735,15 @@ pub fn mul_mat_id_act<'a>(
     };
     let esize = crate::ggml::row_size(act.out_type(), 1);
     let (out, plan) = id_layout(m, n_used, n_tok, n_expert, esize);
-    let shared = plan_of_swiglu(x, ids, n_expert);
+    let shared = if from.is_some() {
+        PLAN_OF_SOURCE
+    } else {
+        plan_of_swiglu(x, ids, n_expert) as i32
+    };
     let mut args = vec![w, x, ids];
     args.extend(scale);
+    // Last: the node whose plan this one reads (`plan_source`).
+    args.extend(from);
     let node = ctx.external(
         &NVFP4_MM_ID,
         act.out_type(),
@@ -574,7 +754,8 @@ pub fn mul_mat_id_act<'a>(
     unsafe {
         (*node.raw()).op_params[P_SCALE] = scale.is_some() as i32;
         (*node.raw()).op_params[P_ACT] = act.code();
-        (*node.raw()).op_params[P_PLAN] = shared as i32;
+        (*node.raw()).op_params[P_PLAN] = shared;
+        (*node.raw()).op_params[P_TILE] = tile;
     }
     ctx.view_3d(
         node,
@@ -2052,12 +2233,14 @@ mod cuda {
         let (n_used, n_tok) = (ids.ne[0], ids.ne[1]);
         let x_ld = (x.nb[1] / x.nb[0]) as i64;
         check(k, x_ld, x.data as *const u16)?;
-        // The down matmul of a SwiGLU FFN reads the gate and up op's plan (the same routing).
-        let shared = if dst.op_params[P_PLAN] != 0 {
+        // The down matmul of a SwiGLU FFN reads the gate and up op's plan (the same routing);
+        // a `mul_mat_id_with` with `plan_of` the earlier node's (its last source).
+        let shared = match dst.op_params[P_PLAN] {
+            0 => std::ptr::null_mut(),
+            // SAFETY: a node made by `id_node` with a source of `plan_source`.
+            PLAN_OF_SOURCE => unsafe { source_plan(dst, n_used, n_tok, n_expert) },
             // SAFETY: `x` is a valid tensor; see `swiglu_plan`.
-            unsafe { swiglu_plan(x, n_used, n_tok, n_expert) }
-        } else {
-            std::ptr::null_mut()
+            _ => unsafe { swiglu_plan(x, n_used, n_tok, n_expert) },
         };
         let plan = if shared.is_null() {
             let (out, _) = id_layout(m, n_used, n_tok, n_expert, dst.nb[0]);
@@ -2087,9 +2270,12 @@ mod cuda {
         let pairs = n_used * n_tok;
         // On the plan of a SwiGLU with a row map, a spare tile for the padding pairs that plan
         // may skip (see `swiglu_id`); so for ids that may be -1 ([`skips`]).
-        // SAFETY: a shared plan's `x` is a view of a `swiglu_id_full` node (`swiglu_plan`).
-        let spare =
-            skipping(dst) || (!shared.is_null() && unsafe { swiglu_rows(&*x.view_src) }.is_some());
+        // SAFETY: a SwiGLU's shared plan's `x` is a view of a `swiglu_id_full` node
+        // (`swiglu_plan`). An earlier mul_mat_id's plan (`source_plan`) has no row map.
+        let spare = skipping(dst)
+            || (!shared.is_null()
+                && dst.op_params[P_PLAN] != PLAN_OF_SOURCE
+                && unsafe { swiglu_rows(&*x.view_src) }.is_some());
         // A split (--nvfp4-expert-mv-split): the mv kernel for the experts of up to `cut` pairs
         // first (the kernel ahead stays the SwiGLU mv, see `pdl` below), then the GEMM.
         let (kernel, split) = match forced()
@@ -2118,13 +2304,16 @@ mod cuda {
             },
             (kernel, _) => kernel,
         };
-        // The SwiGLU's down mv at one token per tile (or a forced tile): whole row tiles
-        // prefetched (the same bits as the plain grouped mv).
-        let tile_prefetch = !shared.is_null()
+        // The SwiGLU's down mv at one token per tile (or a forced tile), and a
+        // `mul_mat_id_with`'s: whole row tiles prefetched (the same bits as the plain grouped
+        // mv).
+        let tile_prefetch = (!shared.is_null() || dst.op_params[P_TILE] != 0)
             && EXPERT_TILE_PREFETCH.load(Ordering::Relaxed)
             && matches!(kernel, Kernel::Mv { nt, rtw: 1, kw: 8, rpt }
                 if rpt == GROUPED_MV_RPT && (nt == 1 || forced_nt.is_some()));
-        let grouped = forced_grouped().or(tile_prefetch.then_some(DOWN_MV_TILE));
+        // A `mul_mat_id_mv` node's own variant in place of DOWN_MV_TILE (Inkling-2's A/B runs).
+        let tile_mv = super::tile_variant(dst.op_params[P_TILE]).unwrap_or(DOWN_MV_TILE);
+        let grouped = forced_grouped().or(tile_prefetch.then_some(tile_mv));
         let (_, cols) = kernel.tile();
         let mut p = Params {
             w: w.data as *const u8,

@@ -71,6 +71,108 @@ fn forced_route() -> Option<Vec<i32>> {
     FORCED_ROUTE.with(|r| r.borrow().clone())
 }
 
+/// [`experts_flags`]: the NVFP4 down projection's decode mv takes whole row tiles into L2
+/// ([`nvfp4_mm::mul_mat_id_with`]'s `tile`).
+const EXPERTS_TILE: u32 = 1;
+/// [`experts_flags`]: the NVFP4 down projection reads the gate and up rows' plan of the pairs
+/// and starts while SITU ends ([`nvfp4_mm::mul_mat_id_with`]'s `plan_of`).
+const EXPERTS_PLAN: u32 = 2;
+/// [`experts_flags`]: SITU stores an NVFP4 down projection's input as BF16 ([`ops::situ`]).
+const EXPERTS_BF16_ACT: u32 = 4;
+/// [`experts_flags`]: [`EXPERTS_TILE`] for the gate and up rows.
+const EXPERTS_TILE_GU: u32 = 8;
+/// [`experts_flags`]: without [`EXPERTS_TILE`], the NVFP4 down projection's decode mv takes
+/// whole row tiles into L2 one tile ahead ([`EXPERT_MV_T1`], #1221 r9).
+const EXPERTS_DOWN_T1: u32 = 16;
+/// [`experts_flags`] by default: the shared plan, the BF16 SITU and the down projection's
+/// one-ahead tile prefetch. On a DGX Spark (GB10) the two-ahead prefetches ([`EXPERTS_TILE`],
+/// [`EXPERTS_TILE_GU`]) gained nothing on Inkling-2-Mini (the down's cost 0.3-0.4 tok/s at
+/// decode); one ahead, the down's calls take 60 us instead of 65 (r9).
+const EXPERTS_DEFAULT: u32 = EXPERTS_PLAN | EXPERTS_BF16_ACT | EXPERTS_DOWN_T1;
+
+/// The down projection's decode mv by default ([`EXPERTS_DOWN_T1`], `t1` of [`EXPERT_MVS`]):
+/// 8 row tiles of 16 rows a CTA, as the plain mv's, each whole tile prefetched into L2 one tile
+/// ahead.
+const EXPERT_MV_T1: nvfp4_mm::GroupedMv = nvfp4_mm::GroupedMv {
+    rtw: 1,
+    rpt: 8,
+    sb: 16,
+    pft: 1,
+};
+
+/// How the routed NVFP4 experts run (#1221 r7), all the same bits: [`EXPERTS_TILE`],
+/// [`EXPERTS_PLAN`], [`EXPERTS_BF16_ACT`], [`EXPERTS_TILE_GU`] and [`EXPERTS_DOWN_T1`]
+/// (r9); [`EXPERTS_DEFAULT`] unless
+/// `LEGION_DEBUG_INK_EXPERTS=<mask>` takes others for A/B runs (0: as round 6).
+fn experts_flags() -> u32 {
+    static FLAGS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *FLAGS.get_or_init(|| {
+        let env = std::env::var("LEGION_DEBUG_INK_EXPERTS").ok();
+        experts_flags_of(env.as_deref())
+    })
+}
+
+/// Whether `Model::ink_mm_set` takes BF16 weights (#1221 r7, r9 at 2-8 tokens): unless
+/// `LEGION_DEBUG_INK_BF16_SET=0` (A/B runs: a node a product, as round 6).
+fn bf16_set() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LEGION_DEBUG_INK_BF16_SET").map_or(true, |v| v.trim() != "0"))
+}
+
+/// The grouped mv variants of the NVFP4 experts' one-token tiles an A/B run may pick (#1221 r9,
+/// [`expert_mv`]), all compiled for them (`mvg<1>` without the SwiGLU) and all the same bits:
+/// `pR` R row tiles of 16 rows a CTA (the default's p8), `wWpR` tiles of 16 * W rows, `sS`
+/// stages of S blocks (16 otherwise), `tT` whole row tiles prefetched T tiles ahead (t2 is
+/// `nvfp4_mm::DOWN_MV_TILE`, [`EXPERTS_TILE`]'s).
+pub(crate) const EXPERT_MVS: [(&str, nvfp4_mm::GroupedMv); 15] = {
+    const fn g(rtw: i32, rpt: i32, sb: i32, pft: i32) -> nvfp4_mm::GroupedMv {
+        nvfp4_mm::GroupedMv { rtw, rpt, sb, pft }
+    }
+    [
+        ("p1", g(1, 1, 16, 0)),
+        ("p2", g(1, 2, 16, 0)),
+        ("p4", g(1, 4, 16, 0)),
+        ("p8", g(1, 8, 16, 0)),
+        ("p16", g(1, 16, 16, 0)),
+        ("w2p2", g(2, 2, 16, 0)),
+        ("w2p4", g(2, 4, 16, 0)),
+        ("w4p1", g(4, 1, 16, 0)),
+        ("w4p2", g(4, 2, 16, 0)),
+        ("s24", g(1, 8, 24, 0)),
+        ("s40", g(1, 8, 40, 0)),
+        ("t1", g(1, 8, 16, 1)),
+        ("t2", g(1, 8, 16, 2)),
+        ("t1p4", g(1, 4, 16, 1)),
+        ("t1p16", g(1, 16, 16, 1)),
+    ]
+};
+
+/// The routed NVFP4 experts' grouped mv variant at one-token tiles for A/B runs (#1221 r9): the
+/// [`EXPERT_MVS`] name in `LEGION_DEBUG_INK_DOWN_MV` for the down projection,
+/// `LEGION_DEBUG_INK_GU_MV` for the gate and up rows; unset (or not a name), the default's
+/// ([`EXPERTS_DOWN_T1`]'s `t1` for the down, the plain `p8` for the gate and up rows).
+fn expert_mv(down: bool) -> Option<nvfp4_mm::GroupedMv> {
+    static MV: std::sync::OnceLock<[Option<nvfp4_mm::GroupedMv>; 2]> = std::sync::OnceLock::new();
+    MV.get_or_init(|| {
+        ["LEGION_DEBUG_INK_GU_MV", "LEGION_DEBUG_INK_DOWN_MV"]
+            .map(|var| expert_mv_of(std::env::var(var).ok().as_deref()))
+    })[down as usize]
+}
+
+/// [`expert_mv`] given the environment's value.
+pub(crate) fn expert_mv_of(env: Option<&str>) -> Option<nvfp4_mm::GroupedMv> {
+    let name = env?.trim();
+    EXPERT_MVS.iter().find(|(n, _)| *n == name).map(|&(_, g)| g)
+}
+
+/// [`experts_flags`] given the environment's value.
+pub(crate) fn experts_flags_of(env: Option<&str>) -> u32 {
+    const ALL: u32 =
+        EXPERTS_TILE | EXPERTS_PLAN | EXPERTS_BF16_ACT | EXPERTS_TILE_GU | EXPERTS_DOWN_T1;
+    env.and_then(|v| v.trim().parse::<u32>().ok())
+        .map_or(EXPERTS_DEFAULT, |v| v & ALL)
+}
+
 /// The GGUF architecture name (llama.cpp's).
 pub const ARCH: &str = "inkling2_loop";
 /// The earlier GGUF layout's architecture name.
@@ -445,13 +547,23 @@ impl Arch for Ink2Params {
     /// [`glm_ops::argmax_wide`]'s CTAs (#1221): one CTA a token read the 200K logits slowly;
     /// the same index as `argmax` (the first of the largest) for NaN-free logits. The soft cap
     /// passes a NaN through (`tanh(NaN)` is NaN), so that rests on the output projection.
+    /// The projection reads only the unpadded vocabulary's rows (#1221 r9: the padding's
+    /// logits were cut anyway): the same bits.
     fn head<'a>(
         &self,
         m: &'a Model,
         ctx: &'a Context,
         x: Tensor<'a>,
     ) -> Result<Option<(Tensor<'a>, Tensor<'a>)>, ModelError> {
-        let logits = m.glm_mm(ctx, "output.weight", x)?;
+        let name = "output.weight";
+        let w = m.w(name)?;
+        let ws = m.w("output.scale").ok();
+        let w = if w.ne()[1] > self.n_vocab && w.ne()[2] == 1 {
+            ctx.view_2d(w, [w.ne()[0], self.n_vocab], w.nb()[1], 0)
+        } else {
+            w
+        };
+        let logits = m.glm_mm_w(ctx, name, w, ws, x, None)?;
         let logits = ops::softcap(ctx, logits, self.softcap, self.n_vocab);
         Ok(Some((logits, glm_ops::argmax_wide(ctx, logits))))
     }
@@ -571,8 +683,10 @@ impl Model {
 
     /// [`Self::ink_mm_b`] of block `ip`'s weights `names`, all of `x`: one glm_linear_set node
     /// ([`glm_ops::linear_set`], linear_mv_q8's sums row by row: the same bits) where it takes
-    /// them, Q8_0 weights without a scale over up to 8 tokens (decode steps), unless `own`
-    /// (traced runs keep a node a product); else a node each (#1221 r6).
+    /// them, Q8_0 weights without a scale over up to 8 tokens (decode steps; #1221 r6) or BF16
+    /// ones (the NVFP4 checkpoint's) on the GB10 kernels, at one token (linear_mv_bf16's sums,
+    /// [`glm_ops::linear_set_bf16_takes`]; r7) and at 2-8 (linear_mv_bf16x's; r9), unless `own`
+    /// (traced runs keep a node a product); else a node each.
     fn ink_mm_set<'a, const N: usize>(
         &'a self,
         ctx: &'a Context,
@@ -582,27 +696,49 @@ impl Model {
         rows: &mut Bf16Rows<'a>,
         own: bool,
     ) -> Result<[Tensor<'a>; N], ModelError> {
+        self.ink_mm_setx(ctx, ip, names, [x; N], rows, own)
+    }
+
+    /// [`Self::ink_mm_set`] with an input a product (`xs[j]` for `names[j]`, all of the same
+    /// tokens): a global layer's K and V read different inputs (#1221 r9).
+    fn ink_mm_setx<'a, const N: usize>(
+        &'a self,
+        ctx: &'a Context,
+        ip: usize,
+        names: [&str; N],
+        xs: [Tensor<'a>; N],
+        rows: &mut Bf16Rows<'a>,
+        own: bool,
+    ) -> Result<[Tensor<'a>; N], ModelError> {
         let ws = names
             .iter()
             .map(|n| self.w(&format!("blk.{ip}.{n}")))
             .collect::<Result<Vec<_>, _>>()?;
-        let n: i64 = x.ne()[1..].iter().product();
+        let tokens = |x: &Tensor<'_>| -> i64 { x.ne()[1..].iter().product() };
+        let n = tokens(&xs[0]);
         let set = !own
             && (2..=glm_ops::SET_MAX).contains(&N)
-            && x.ty() == types::F32
-            && x.is_contiguous()
-            && glm_ops::linear_set_takes(&ws, n)
+            && xs
+                .iter()
+                .all(|x| x.ty() == types::F32 && x.is_contiguous() && tokens(x) == n)
+            && (glm_ops::linear_set_takes(&ws, n)
+                || (bf16_set() && glm_ops::linear_set_bf16_takes(&ws, n)))
             && names.iter().all(|name| {
                 name.strip_suffix(".weight")
                     .is_some_and(|b| self.w(&format!("blk.{ip}.{b}.scale")).is_err())
             });
         let out = if set {
-            let set: Vec<_> = ws.iter().map(|&w| (w, x, glm_ops::SetEpi::Plain)).collect();
+            let set: Vec<_> = ws
+                .iter()
+                .zip(xs)
+                .map(|(&w, x)| (w, x, glm_ops::SetEpi::Plain))
+                .collect();
             glm_ops::linear_set_default(ctx, &set)
         } else {
             names
                 .iter()
-                .map(|name| self.ink_mm_b(ctx, ip, name, x, rows))
+                .zip(xs)
+                .map(|(name, x)| self.ink_mm_b(ctx, ip, name, x, rows))
                 .collect::<Result<Vec<_>, _>>()?
         };
         Ok(out
@@ -946,28 +1082,28 @@ impl Model {
             &mut rows,
             tap.on,
         )?;
-        let [kp, vp] = if xk.raw() == xv.raw() {
-            self.ink_mm_set(
-                ctx,
-                ip,
-                ["attn_k.weight", "attn_v.weight"],
-                xk,
-                &mut rows,
-                tap.on,
-            )?
-        } else {
-            [
-                self.ink_mm_b(ctx, ip, "attn_k.weight", xk, &mut rows)?,
-                self.ink_mm_b(ctx, ip, "attn_v.weight", xv, &mut rows)?,
-            ]
-        };
+        // K and V one set, from one input or (a global layer's) two (#1221 r9), and so the
+        // global layers' conv projections.
+        let [kp, vp] = self.ink_mm_setx(
+            ctx,
+            ip,
+            ["attn_k.weight", "attn_v.weight"],
+            [xk, xv],
+            &mut rows,
+            tap.on,
+        )?;
         let (kdyn, vdyn) = if swa {
             (None, None)
         } else {
-            (
-                Some(self.ink_mm_b(ctx, ip, "attn_k_conv_proj.weight", xk, &mut rows)?),
-                Some(self.ink_mm_b(ctx, ip, "attn_v_conv_proj.weight", xv, &mut rows)?),
-            )
+            let [kd, vd] = self.ink_mm_setx(
+                ctx,
+                ip,
+                ["attn_k_conv_proj.weight", "attn_v_conv_proj.weight"],
+                [xk, xv],
+                &mut rows,
+                tap.on,
+            )?;
+            (Some(kd), Some(vd))
         };
         for (name, x) in [("q_proj", q), ("k_proj", kp), ("v_proj", vp)] {
             tap.tap(name, il, x);
@@ -1185,17 +1321,32 @@ impl Model {
         let w = glm_ops::router_w(ctx, logits, ids, true, p.weights_scale);
         tap.tap("ffn_moe_weights", il, w);
         let x = ctx.reshape_3d(h, hp.n_embd, 1, n);
-        let gu = self.ink_experts(ctx, ip, "ffn_gate_up_exps", x, ids)?;
+        let gu = self.ink_experts(ctx, ip, "ffn_gate_up_exps", x, ids, None)?;
         tap.tap("ffn_moe_gate_up", il, gu);
-        let a = ops::situ(ctx, gu, p.situ_beta, p.situ_lb);
-        tap.tap("ffn_moe_act", il, a);
-        let y = self.ink_experts(ctx, ip, "ffn_down_exps", a, ids)?;
+        // An NVFP4 down projection rounds its input to BF16: SITU stores it so (the same
+        // bits, one cast kernel less).
+        let flags = experts_flags();
+        let bf16 = flags & EXPERTS_BF16_ACT != 0
+            && self
+                .w(&format!("blk.{ip}.ffn_down_exps.weight"))
+                .is_ok_and(|w| w.ty() == types::NVFP4);
+        let a = ops::situ(ctx, gu, p.situ_beta, p.situ_lb, bf16);
+        // Traced as F32, as before.
+        if bf16 && tap.on {
+            tap.tap("ffn_moe_act", il, ctx.cast(a, types::F32));
+        } else {
+            tap.tap("ffn_moe_act", il, a);
+        }
+        let y = self.ink_experts(ctx, ip, "ffn_down_exps", a, ids, Some(gu))?;
         tap.tap("ffn_moe_down", il, y);
         Ok(glm_ops::weighted_sum(ctx, y, w))
     }
 
     /// `mul_mat_id` of block `ip`'s expert stack `base` (NVFP4, or what [`ops::mm_id`] takes)
-    /// over `x` (F32 `[k, 1 or n_used, n]`) for the choices `ids`: F32 `[m, n_used, n]`.
+    /// over `x` (F32 `[k, 1 or n_used, n]`, or BF16 for NVFP4) for the choices `ids`: F32
+    /// `[m, n_used, n]`. `gate_up`: the down projection's, the gate and up rows of the same
+    /// routing it follows. NVFP4 experts take [`nvfp4_mm::mul_mat_id_mv`] as
+    /// [`experts_flags`] and [`expert_mv`] say, the down projection with `plan_of` those rows.
     fn ink_experts<'a>(
         &'a self,
         ctx: &'a Context,
@@ -1203,6 +1354,7 @@ impl Model {
         base: &str,
         x: Tensor<'a>,
         ids: Tensor<'a>,
+        gate_up: Option<Tensor<'a>>,
     ) -> Result<Tensor<'a>, ModelError> {
         let name = format!("blk.{ip}.{base}.weight");
         let w = self.w(&name)?;
@@ -1216,7 +1368,19 @@ impl Model {
                     w.ne()
                 )));
             }
-            return Ok(nvfp4_mm::mul_mat_id(ctx, w, x, ids, scale));
+            let flags = experts_flags();
+            let tile = match gate_up {
+                Some(_) => flags & EXPERTS_TILE != 0,
+                None => flags & EXPERTS_TILE_GU != 0,
+            };
+            let plan_of = gate_up.filter(|_| flags & EXPERTS_PLAN != 0);
+            // An A/B pick, else the down's one-ahead prefetch (unless EXPERTS_TILE's two).
+            let down_t1 =
+                gate_up.is_some() && flags & (EXPERTS_TILE | EXPERTS_DOWN_T1) == EXPERTS_DOWN_T1;
+            let mv = expert_mv(gate_up.is_some()).or(down_t1.then_some(EXPERT_MV_T1));
+            return Ok(nvfp4_mm::mul_mat_id_mv(
+                ctx, w, x, ids, scale, tile, plan_of, mv,
+            ));
         }
         if !ops::mm_id_takes(w, scale) {
             return Err(ModelError::Unsupported(format!(

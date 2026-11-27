@@ -590,17 +590,19 @@ pub fn sigmul<'a>(ctx: &'a Context, x: Tensor<'a>, g: Tensor<'a>) -> Tensor<'a> 
 
 /// The experts' SITU activation of the gate | up rows `y` (F32 `[2f, k, n]`, contiguous; gate
 /// the first `f` values of a row): `beta · tanh(g / beta) · sigmoid(g) · lb · tanh(u / lb)`
-/// (`lb` 0: `u` as it is). F32 `[f, k, n]`.
-pub fn situ<'a>(ctx: &'a Context, y: Tensor<'a>, beta: f32, lb: f32) -> Tensor<'a> {
+/// (`lb` 0: `u` as it is). F32 `[f, k, n]`, or with `bf16` those values rounded to BF16 (to
+/// nearest even, as ggml's cast to BF16 rounds them): the input of an NVFP4 down projection,
+/// which would cast it so.
+pub fn situ<'a>(ctx: &'a Context, y: Tensor<'a>, beta: f32, lb: f32, bf16: bool) -> Tensor<'a> {
     let y = contiguous(y);
     let [f2, k, n, _] = y.ne();
     assert_eq!(f2 % 2, 0, "ink_situ: gate | up rows");
     ctx.external_with(
         &SITU,
-        types::F32,
+        if bf16 { types::BF16 } else { types::F32 },
         [f2 / 2, k, n, 1],
         &[y],
-        &[beta.to_bits() as i32, lb.to_bits() as i32],
+        &[beta.to_bits() as i32, lb.to_bits() as i32, bf16 as i32],
     )
 }
 
@@ -1112,6 +1114,14 @@ unsafe fn cpu_situ(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
         let rows = (dst.ne[1] * dst.ne[2]) as usize;
         for row in part(rows, ith, nth) {
             let src = f32s(y, row * 2 * f * 4, 2 * f);
+            if p[2] != 0 {
+                let o = (dst.data as *mut u16).add(row * f);
+                for i in 0..f {
+                    let v = situ_one(src[i], src[f + i], beta, lb);
+                    *o.add(i) = crate::model::nvfp4_mm::bf16_bits(v);
+                }
+                continue;
+            }
             let o = f32s_mut(dst, row * f * 4, f);
             for i in 0..f {
                 o[i] = situ_one(src[i], src[f + i], beta, lb);
