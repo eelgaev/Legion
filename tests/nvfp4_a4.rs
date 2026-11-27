@@ -311,6 +311,87 @@ fn run_swiglu_norm(
     read(out)
 }
 
+/// A tensor-parallel finish's sums `y = x0 + x1 + res` and the SwiGLU pair of
+/// `mul(rms_norm(y, 1e-6), nw)` over the token ranges `parts` on `backend`: the sums and each
+/// part's output in order. `fused`: one `sum_rms_quant_op` node (the finish's kernel, #1133)
+/// whose rows each part's `swiglu_quantized` reads; else ggml's adds and a `swiglu_norm` per
+/// part (the path it replaces).
+fn run_sum_swiglu(
+    backend: &mut Backend,
+    (wg, wu): (&[u8], &[u8]),
+    (xs, nws): ([&[f32]; 3], &[f32]),
+    (k, m, n): (usize, usize, usize),
+    parts: &[(usize, usize)],
+    fused: bool,
+) -> (Vec<u8>, Vec<f32>) {
+    let weights = Context::new(4, 0);
+    let g = weights.new_tensor(types::NVFP4, &[k as i64, m as i64]);
+    let u = weights.new_tensor(types::NVFP4, &[k as i64, m as i64]);
+    let nw = weights.new_tensor(types::F32, &[k as i64]);
+    let tg = weights.new_tensor(types::F32, &[1]);
+    weights.alloc_tensors(backend.buffer_type()).unwrap();
+    g.set_bytes(wg);
+    u.set_bytes(wu);
+    nw.set_f32(nws);
+    tg.set_f32(&[0.5]);
+    let ctx = Context::new(32, 32);
+    let ins: Vec<_> = (0..3)
+        .map(|_| ctx.new_tensor(types::F32, &[k as i64, n as i64]).as_input())
+        .collect();
+    let (sums, outs) = if fused {
+        let s = nvfp4_a4::sum_rms_quant_op(&ctx, &ins[..2], ins[2], nw, 1e-6).as_output();
+        let outs: Vec<_> = parts
+            .iter()
+            .map(|&(at, c)| {
+                let part = (at as i64, c as i64, n as i64);
+                let y = nvfp4_a4::swiglu_quantized(&ctx, g, u, s, part, Some(tg), None);
+                ctx.cont(y).as_output()
+            })
+            .collect();
+        (s, outs)
+    } else {
+        let y = ctx.add(ctx.add(ins[0], ins[1]), ins[2]).as_output();
+        let outs: Vec<_> = parts
+            .iter()
+            .map(|&(at, c)| {
+                let x = ctx.view_2d(y, [k as i64, c as i64], k * 4, at * k * 4);
+                let y = nvfp4_a4::swiglu_norm(&ctx, g, u, x, nw, 1e-6, Some(tg), None);
+                ctx.cont(y).as_output()
+            })
+            .collect();
+        (y, outs)
+    };
+    let mut graph = ctx.new_graph(32);
+    graph.expand(sums);
+    for &t in &outs {
+        graph.expand(t);
+    }
+    ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+        .unwrap();
+    for (t, x) in ins.iter().zip(xs) {
+        t.set_f32(x);
+    }
+    backend.compute(&graph).unwrap();
+    let bytes = sums.bytes()[..4 * k * n].to_vec();
+    (bytes, outs.into_iter().flat_map(read).collect())
+}
+
+/// Two partials and a residual as a tensor-parallel finish adds them: `x0` spread wide, `x1`
+/// smaller, the residual with an all-zero first token (a zero sum row: rms 0).
+fn sum_inputs(k: usize, n: usize) -> [Vec<f32>; 3] {
+    let x0 = activations(k, n, n as u64);
+    let mut x1: Vec<f32> = activations(k, n, 3 * n as u64)
+        .iter()
+        .map(|v| v * 0.25)
+        .collect();
+    let mut res = activations(k, n, 5 * k as u64);
+    for (i, v) in res[..k].iter_mut().enumerate() {
+        *v = -x0[i];
+        x1[i] = 0.0;
+    }
+    [x0, x1, res]
+}
+
 /// How [`run_multi`] runs the matmuls.
 #[derive(Clone, Copy, PartialEq)]
 enum MultiWay {
@@ -552,6 +633,30 @@ fn cpu_fused_residual_and_norm_match_unfused() {
                     "k {k} m {m} n {n}: multi in parts"
                 );
             }
+        }
+    }
+}
+
+/// A tensor-parallel finish's W4A4 rows (#1133): the sums and every part's SwiGLU from the
+/// finish's quantized rows give the bits of ggml's adds and each part's `swiglu_norm`.
+#[test]
+fn cpu_finish_rows_match_the_swiglu_norm() {
+    let mut cpu = Backend::cpu().unwrap();
+    cpu.set_threads(4);
+    for (k, m, n) in [(64, 8, 3), (256, 24, 9)] {
+        let xs = sum_inputs(k, n);
+        let xs = [&xs[0][..], &xs[1][..], &xs[2][..]];
+        let (wg, wu) = (weights(k, m, 3 * k as u64), weights(k, m, m as u64));
+        let nws = norm_weights(k, k as u64);
+        let shape = (k, m, n);
+        for parts in [vec![(0, n)], vec![(0, n - 2), (n - 2, 1), (n - 1, 1)]] {
+            let run = |cpu: &mut Backend, fused| {
+                run_sum_swiglu(cpu, (&wg, &wu), (xs, &nws), shape, &parts, fused)
+            };
+            let (ps, po) = run(&mut cpu, false);
+            let (fs, fo) = run(&mut cpu, true);
+            assert_eq!(ps, fs, "k {k} m {m} n {n} {parts:?}: sums");
+            assert!(same_bits(&po, &fo), "k {k} m {m} n {n} {parts:?}: SwiGLU");
         }
     }
 }
@@ -1119,6 +1224,74 @@ mod cuda {
                 }
             }
             println!("fusions k {k} m {m} n {n}: bit-exact");
+        }
+    }
+
+    /// The finish's sum, norm and quantization kernel of a tensor-parallel step's halves
+    /// (#1133, `nvfp4_a4_sum_rms_quant`, through `sum_rms_quant_op`): its sums are ggml-cuda's
+    /// adds' bits, its codes, scales and decode scales those of `quantize_op` of ggml-cuda's
+    /// norm of the sums (as `nvfp4_a4_rms_quant`'s), and every part's SwiGLU from its rows the
+    /// bits of that part's `swiglu_norm` (the path it replaces), at both norm blocks (k under
+    /// 1024 and from 1024).
+    #[test]
+    #[ignore = "needs a GPU with the FP4 kernels"]
+    fn cuda_finish_rows_match_the_swiglu_norm() {
+        let Some(mut gpu) = gpu() else { return };
+        for (k, m, n, parts) in [
+            (512, 64, 70, vec![(0, 70)]),
+            (1024, 129, 130, vec![(0, 66), (66, 64)]),
+            (5120, 300, 1024, vec![(0, 640), (640, 256), (896, 128)]),
+            (8192, 64, 200, vec![(0, 200)]),
+        ] {
+            let xs = sum_inputs(k, n);
+            let xs = [&xs[0][..], &xs[1][..], &xs[2][..]];
+            let (wg, wu) = (weights(k, m, 3 * k as u64), weights(k, m, m as u64));
+            let nws = norm_weights(k, k as u64);
+            let shape = (k, m, n);
+            let run = |gpu: &mut Backend, fused| {
+                run_sum_swiglu(gpu, (&wg, &wu), (xs, &nws), shape, &parts, fused)
+            };
+            let (ps, po) = run(&mut gpu, false);
+            let (fs, fo) = run(&mut gpu, true);
+            assert_eq!(ps, fs, "k {k} m {m} n {n}: sums");
+            assert!(same_bits(&po, &fo), "k {k} m {m} n {n}: SwiGLU");
+            // The rows themselves, against ggml-cuda's norm quantized.
+            let ctx = Context::new(16, 16);
+            let w = ctx.new_tensor(types::F32, &[k as i64]).as_input();
+            let ins: Vec<_> = (0..3)
+                .map(|_| ctx.new_tensor(types::F32, &[k as i64, n as i64]).as_input())
+                .collect();
+            let f = nvfp4_a4::sum_rms_quant_op(&ctx, &ins[..2], ins[2], w, 1e-6).as_output();
+            let y = ctx.add(ctx.add(ins[0], ins[1]), ins[2]);
+            let q = nvfp4_a4::quantize_op(&ctx, ctx.mul(ctx.rms_norm(y, 1e-6), w)).as_output();
+            let mut graph = ctx.new_graph(16);
+            graph.expand(f);
+            graph.expand(q);
+            ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+                .unwrap();
+            w.set_f32(&nws);
+            for (t, x) in ins.iter().zip(xs) {
+                t.set_f32(x);
+            }
+            gpu.compute(&graph).unwrap();
+            let (f, q) = (f.bytes(), q.bytes());
+            let (q_ld, s_ld, [qc, qs, qd]) = nvfp4_a4::quant_layout(k as i64, n as i64);
+            let (q_ld, s_ld) = (q_ld as usize, s_ld as usize);
+            // `normed_layout`: the sums, 256-byte aligned, then `quant_layout`'s parts.
+            let base = (4 * k * n).div_ceil(256) * 256;
+            for t in 0..n {
+                let same = |at: usize, len: usize| f[base + at..][..len] == q[at..][..len];
+                assert!(same(qc + t * q_ld, q_ld), "k {k} n {n}: codes of token {t}");
+                assert!(
+                    same(qs + t * s_ld, s_ld),
+                    "k {k} n {n}: scales of token {t}"
+                );
+                assert!(
+                    same(qd + 4 * t, 4),
+                    "k {k} n {n}: decode scale of token {t}"
+                );
+            }
+            println!("finish rows k {k} m {m} n {n}: bit-exact");
         }
     }
 

@@ -92,6 +92,26 @@ int legion_nvfp4_a4_rms_quant_launch(const float * x, int64_t x_ld, const float 
                                      int64_t rows, uint8_t * q, int64_t q_ld, uint8_t * s, int64_t s_ld, float * d,
                                      void * stream);
 
+// The finish of a tensor-parallel all-reduce with the norm and quantization above (#1133): row
+// r's x (F32 rows of k, contiguous) is the sum of the n_src partials srcs (rank order; F32, or
+// BF16 with src_bf16) plus res, one __fadd_rn each (src/cuda/tp_net.cu's sums), stored to xs;
+// then legion_nvfp4_a4_rms_quant_launch's codes, scales and decode scale of mul(rms_norm(x,
+// eps), w), from x as the sum left it (not read back). Launched from Rust (cudaLaunchKernel) as
+// legion_nvfp4_a4_sum_rms_quant_256 (k < 1024) or _1024: one CTA of 256 threads a row, k * 4
+// bytes of dynamic shared memory, the struct by value.
+struct legion_nvfp4_a4_sum {
+    const void * srcs[8];
+    const float * res;  // or null
+    const float * w;
+    float * xs;
+    uint8_t * q;
+    uint8_t * s;
+    float * d;
+    int64_t q_ld, s_ld;
+    int32_t n_src, src_bf16, k;
+    float eps;
+};
+
 // The GEMM: tiles_m * tiles_n CTAs of 256 threads, 8 warps of 32 rows x 8 * nt tokens laid
 // out 4 (rows) x 2 (tokens): 128 rows (64 output rows for SwiGLU) x 16 * nt tokens per CTA;
 // nt = 2, 4 or 8, or LEGION_NVFP4_A4_TWO_CTAS | 4 (grouped only: the same tokens, sized for two
@@ -475,6 +495,102 @@ __global__ void __launch_bounds__(RQ_THREADS) nvfp4_a4_rms_quant(const float * x
         amax = fmaxf(amax, red[i]);
     }
     quant_row(y, amax, k, row, q, q_ld, s, s_ld, d, threadIdx.x, RQ_THREADS);
+#else
+    __trap();  // launched only where nvfp4_a4_probe answers 1
+#endif
+}
+
+// tp_net.cu's sum of value o: the partials in rank order, then the residual, one rounding each.
+__device__ __forceinline__ float a4_sum_at(const legion_nvfp4_a4_sum & a, int64_t o) {
+    float acc;
+    if (a.src_bf16) {
+        acc = __bfloat162float(((const __nv_bfloat16 *) a.srcs[0])[o]);
+#pragma unroll
+        for (int r = 1; r < 8; ++r) {
+            if (r < a.n_src) {
+                acc = __fadd_rn(acc, __bfloat162float(((const __nv_bfloat16 *) a.srcs[r])[o]));
+            }
+        }
+    } else {
+        acc = ((const float *) a.srcs[0])[o];
+#pragma unroll
+        for (int r = 1; r < 8; ++r) {
+            if (r < a.n_src) {
+                acc = __fadd_rn(acc, ((const float *) a.srcs[r])[o]);
+            }
+        }
+    }
+    if (a.res != nullptr) {
+        acc = __fadd_rn(acc, a.res[o]);
+    }
+    return acc;
+}
+
+// nvfp4_a4_rms_quant of the sums (legion_nvfp4_a4_sum): its threads take the same columns in
+// the same order, each sum stored to xs and kept in y (the thread's own columns) for the
+// norm's second pass, which reads y instead of x: the same values, the same arithmetic, the
+// same bits (#1133: the post-attention norm of a tensor-parallel step without a pass over the
+// sums).
+template <int BLOCK>
+__global__ void __launch_bounds__(RQ_THREADS) nvfp4_a4_sum_rms_quant(const legion_nvfp4_a4_sum a) {
+#ifdef LEGION_FP4_MMA
+    constexpr int V = BLOCK / RQ_THREADS;
+    static_assert(V * RQ_THREADS == BLOCK, "block");
+    extern __shared__ __align__(16) float y[];
+    __shared__ float red[32];
+    const int64_t row = blockIdx.x;
+    const int k = a.k;
+    const int lane = threadIdx.x % 32, wp = threadIdx.x / 32;
+    float part[V];
+#pragma unroll
+    for (int j = 0; j < V; j++) {
+        const int tid = lane + 32 * (wp + RQ_WARPS * j);
+        float tmp = 0.0f;
+        for (int col = tid; col < k; col += BLOCK) {
+            const int64_t o = row * k + col;
+            const float xi = a4_sum_at(a, o);
+            a.xs[o] = xi;
+            y[col] = xi;
+            tmp += xi * xi;
+        }
+        part[j] = warp_sum(tmp);
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int j = 0; j < V; j++) {
+            red[wp + RQ_WARPS * j] = part[j];
+        }
+    }
+    __syncthreads();
+    float tmp = lane < BLOCK / 32 ? red[lane] : 0.0f;
+    tmp = warp_sum(tmp);
+    const float mean = tmp / k;
+    const float scale = rsqrtf(mean + a.eps);
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < V; j++) {
+        const int tid = lane + 32 * (wp + RQ_WARPS * j);
+        for (int col = tid; col < k; col += BLOCK) {
+            const float v = scale * y[col] * a.w[col];
+            y[col] = v;
+            amax = fmaxf(amax, fabsf(v));
+        }
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    }
+    __syncthreads();  // every warp has read red (the sum) before it is reused
+    if (lane == 0) {
+        red[wp] = amax;
+    }
+    __syncthreads();
+    amax = red[0];
+#pragma unroll
+    for (int i = 1; i < RQ_WARPS; i++) {
+        amax = fmaxf(amax, red[i]);
+    }
+    quant_row(y, amax, k, row, a.q, a.q_ld, a.s, a.s_ld, a.d, threadIdx.x, RQ_THREADS);
 #else
     __trap();  // launched only where nvfp4_a4_probe answers 1
 #endif
@@ -1434,6 +1550,12 @@ int legion_nvfp4_a4_rms_quant_launch(const float * x, int64_t x_ld, const float 
     }
     return status() == 0 ? 0 : 2;
 }
+
+// The kernels as the CUDA runtime knows them (their host stubs), for Rust's cudaLaunchKernel.
+extern "C" const void * const legion_nvfp4_a4_sum_rms_quant_256 =
+    reinterpret_cast<const void *>(&nvfp4_a4_sum_rms_quant<256>);
+extern "C" const void * const legion_nvfp4_a4_sum_rms_quant_1024 =
+    reinterpret_cast<const void *>(&nvfp4_a4_sum_rms_quant<1024>);
 
 // The tiles: 128 rows x 16 * nt tokens, 2 blocks per stage, 4 stages (90 KiB). Measured on
 // the GB10 against 256-row tiles, 1 or 4 blocks per stage, 2 to 7 stages and two CTAs per SM:

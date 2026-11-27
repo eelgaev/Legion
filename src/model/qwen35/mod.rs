@@ -185,7 +185,12 @@ impl Arch for Qwen35 {
             };
             let eps = hp.rms_eps;
             Ok(m.norm_fold(pass, like, w, both, (nl, reader))
-                .map(|bf16| crate::tp_net::Norm { w, eps, bf16 }))
+                .map(|bf16| crate::tp_net::Norm {
+                    w,
+                    eps,
+                    bf16,
+                    a4: false,
+                }))
         };
         for il in layers {
             let split = halves.and_then(|c| {
@@ -210,6 +215,7 @@ impl Arch for Qwen35 {
                 let fusion = FfnFusion {
                     res: Some(x_attn),
                     norm: Some((x_attn, norm_w, hp.rms_eps)),
+                    quant: None,
                 };
                 x = m.ffn_fused(ctx, il, h, fusion)?;
                 if capture.contains(&il) {
@@ -257,6 +263,7 @@ impl Arch for Qwen35 {
                         w: post_w,
                         eps,
                         bf16,
+                        a4: false,
                     };
                     let nd = crate::tp_net::all_reduce_add_norm(ctx, comm, attn, x, nm);
                     (nd.y, m.norm_mul_folded(pass, nd.y, post_w, nd.q, nd.b))

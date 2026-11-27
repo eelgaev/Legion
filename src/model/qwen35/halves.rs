@@ -105,6 +105,35 @@ fn attn_of(v: Option<&str>) -> bool {
     v.map(str::trim) != Some("0")
 }
 
+/// Whether a half's mixer sum also computes its post-attention norm, quantized for the FFN's
+/// W4A4 SwiGLU, in the sum's kernel ([`crate::tp_net::Norm`]'s `a4`, #1133), where every FFN
+/// part of that half runs the W4A4 SwiGLU with the norm in its quantization
+/// ([`Model::a4_swiglu_norm`]): the SwiGLUs then read the finish's rows, and the norm's pass
+/// over the half's sums (168 MB a layer in an 8K step) goes. On, the same bits;
+/// `LEGION_DEBUG_QWEN35_TP_POST_NORM=0` keeps the norm in the SwiGLUs. Read once.
+fn post_norm_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = post_norm_of(
+            std::env::var("LEGION_DEBUG_QWEN35_TP_POST_NORM")
+                .ok()
+                .as_deref(),
+        );
+        if !on {
+            tracing::info!(
+                "post-attention norm in the mixer sums (#1133): off \
+                 (LEGION_DEBUG_QWEN35_TP_POST_NORM=0)"
+            );
+        }
+        on
+    })
+}
+
+/// [`post_norm_on`] for the variable's value `v`.
+fn post_norm_of(v: Option<&str>) -> bool {
+    v.map(str::trim) != Some("0")
+}
+
 /// Whether those halves run the mixer's input projections and conv per half too
 /// ([`Model::delta_net_halves`]'s `inputs`, #1133), so half 0's delta rule and sum start
 /// before half 1's inputs are made: on, the same bits;
@@ -300,7 +329,7 @@ pub(super) fn order(half: &[usize]) -> Vec<Op> {
 /// The rest of layer `il` from its mixer's partial output `attn` (this rank's, `[n_embd, n]`
 /// whole or per half, [`Mixed`]) and the halves `xs` of its input ([`views`]): per half the
 /// mixer's sum (half 0's started before half 1's mixer runs where the mixer has halves) and
-/// the residual add,
+/// the residual add (and on W4A4 MLPs the post-attention norm's NVFP4 rows, [`post_norm_on`]),
 /// per FFN part ([`plan`]) the post-attention norm, the FFN, its sum and the residual add, in
 /// [`order`], summed over `comm` in at most `parts` FFN parts ([`ffn_parts`]). Returns the
 /// layer's output, every part's FFN sum written into one tensor (#1133 r2: no concatenation).
@@ -346,6 +375,17 @@ pub(super) fn tail<'a>(
     let norm_w = m.lw(il, "post_attention_norm.weight")?;
     let parts = plan(n, parts);
     let half: Vec<usize> = parts.iter().map(|&(a, _)| (a >= n0) as usize).collect();
+    // Per half whether its sum's finish computes the post-attention norm's W4A4 rows
+    // ([`post_norm_on`]): where all of its parts' SwiGLUs would compute them (`xs[h]` is of the
+    // sums' shape and type).
+    let fold: [bool; 2] = std::array::from_fn(|h| {
+        let mut own = parts.iter().zip(&half).filter(|&(_, &ph)| ph == h);
+        post_norm_on()
+            && !pass.tap.on
+            && own.all(|(&(_, c), _)| m.a4_swiglu_norm(il, c, xs[h], norm_w))
+    });
+    // Those finishes' nodes (the sums, then the rows).
+    let mut rows: [Option<Tensor<'a>>; 2] = [None, None];
     // Per half its mixer sum finished with its residual added (#1133 r2: in the sum's kernel).
     let mut x_attn: [Option<Tensor<'a>>; 2] = [None, None];
     // Per FFN part its sum's start and residual, until finished.
@@ -358,8 +398,22 @@ pub(super) fn tail<'a>(
             Op::MixerFinish(h) => {
                 let s = mixer[h].take().expect("a mixer half's start");
                 let width = if h == 0 { n0 } else { n1 };
-                let t = micro::finish_add(ctx, s, xs[h], width, 0, None);
-                add(t);
+                let t = if fold[h] {
+                    let nm = crate::tp_net::Norm {
+                        w: norm_w,
+                        eps: m.hp.rms_eps,
+                        bf16: false,
+                        a4: true,
+                    };
+                    let node = micro::finish_add_norm(ctx, s, xs[h], width, 0, None, nm);
+                    add(node);
+                    rows[h] = Some(node);
+                    crate::tp_net::normed_sums(ctx, node, xs[h].ne()[0], width)
+                } else {
+                    let t = micro::finish_add(ctx, s, xs[h], width, 0, None);
+                    add(t);
+                    t
+                };
                 x_attn[h] = Some(t);
             }
             Op::Ffn(j) => {
@@ -375,11 +429,14 @@ pub(super) fn tail<'a>(
                 };
                 // The post-attention norm rides in the W4A4 SwiGLU's quantization, as on one
                 // GPU (ggml's bits); on FP8 MLPs one op writes its per-token FP8 codes, the
-                // bits the whole layer's sum computes them with (`Model::norm_fold`).
+                // bits the whole layer's sum computes them with (`Model::norm_fold`). Where the
+                // half's finish quantized the norm's rows ([`post_norm_on`]), the SwiGLU reads
+                // its tokens of them instead (the same bits).
                 let hn = m.norm_mul(pass, x, norm_w);
                 let fusion = FfnFusion {
                     res: None,
                     norm: Some((x, norm_w, m.hp.rms_eps)),
+                    quant: rows[h].map(|q| (q, off, width)),
                 };
                 ffn[j] = Some((start(m.ffn_fused(ctx, il, hn, fusion)?), x));
             }
