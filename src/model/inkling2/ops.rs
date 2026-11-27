@@ -112,7 +112,8 @@ pub fn mix_in<'a>(
 
 /// Whether [`mix_rms`] takes these states (F32 `[e, n]`, contiguous), query (F32 `[e, nq]`,
 /// contiguous) and norm weights (one per query column, F32 `[e]`, contiguous): up to
-/// [`MIXR_TOKENS`] tokens of rows up to [`MIXR_MAX`], all of them in ggml's sources.
+/// [`MIXR_TOKENS`] tokens of rows up to [`MIXR_MAX`], all of them in an external node's sources
+/// (fewer than `GGML_MAX_SRC`: ggml_custom_4d's limit, `Context::external`'s assert).
 pub fn mix_rms_takes(states: &[Tensor<'_>], query: Tensor<'_>, ws: &[Tensor<'_>]) -> bool {
     let Some(s0) = states.first() else {
         return false;
@@ -120,7 +121,7 @@ pub fn mix_rms_takes(states: &[Tensor<'_>], query: Tensor<'_>, ws: &[Tensor<'_>]
     let [e, n, _, _] = s0.ne();
     let f32_rows = |t: &Tensor<'_>| t.ty() == types::F32 && t.is_contiguous();
     states.len() <= MAX_STATES
-        && states.len() + 1 + ws.len() <= ffi::GGML_MAX_SRC as usize
+        && states.len() + 1 + ws.len() < ffi::GGML_MAX_SRC as usize
         && (1..=MIXR_TOKENS).contains(&n)
         && (1..=MIXR_MAX).contains(&e)
         && states.iter().all(|s| f32_rows(s) && s.ne() == [e, n, 1, 1])

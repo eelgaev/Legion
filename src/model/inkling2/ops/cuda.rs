@@ -278,6 +278,12 @@ unsafe fn src(dst: &ffi::ggml_tensor, i: usize) -> &ffi::ggml_tensor {
     unsafe { &*dst.src[i] }
 }
 
+/// Whether the node has its first `n` sources (a kernel reading a source past them would read
+/// through a null pointer).
+fn has_srcs(dst: &ffi::ggml_tensor, n: i64) -> bool {
+    (0..n.max(0) as usize).all(|i| i < dst.src.len() && !dst.src[i].is_null())
+}
+
 /// The node's element count.
 fn elements(dst: &ffi::ggml_tensor) -> i64 {
     dst.ne.iter().product()
@@ -308,6 +314,9 @@ pub(super) unsafe fn mix(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
     if external_params(dst)[0] > MIX_STATES || dst.ne[2] > MIX_QUERIES {
         return Err("ink_mix: more states or queries than the kernel holds".into());
     }
+    if !has_srcs(dst, external_params(dst)[0] as i64 + 1) {
+        return Err("ink_mix: fewer sources than states and query".into());
+    }
     // params[3]: small steps' rows that `mixr_kernel`'s registers hold (the builder's check)
     let k = if external_params(dst)[3] != 0 && dst.ne[0] <= MIXR_MAX {
         Kernel::MixRegs
@@ -324,6 +333,11 @@ const MIXR_MAX: i64 = 9 * 256;
 pub(super) unsafe fn mix_rms(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
     if external_params(dst)[0] > MIX_STATES || dst.ne[2] > MIX_QUERIES || dst.ne[0] > MIXR_MAX {
         return Err("ink_mix_rms: more states, queries or values than the kernel holds".into());
+    }
+    // the states, the query and (params[4]) a weight a query
+    let p = external_params(dst);
+    if !has_srcs(dst, p[0] as i64 + 1 + if p[4] != 0 { dst.ne[2] } else { 0 }) {
+        return Err("ink_mix_rms: fewer sources than states, query and weights".into());
     }
     // SAFETY: a node of this op, in device memory.
     unsafe {
@@ -343,10 +357,14 @@ pub(super) unsafe fn mix_rms(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Res
 const LIN32_THREADS: i64 = 256;
 
 pub(super) unsafe fn lin32(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
-    // SAFETY: a node of this op; its sources were checked by the builder.
+    let fused = external_params(dst)[2] != 0;
+    // the weight and the input, or (fused) the controller's cur and msg
+    if !has_srcs(dst, if fused { 3 } else { 2 }) {
+        return Err("ink_lin32: fewer sources than the kernel reads".into());
+    }
+    // SAFETY: a node of this op; its sources were checked by the builder (and above).
     unsafe {
         let w = src(dst, 0);
-        let fused = external_params(dst)[2] != 0;
         if w.ne[0] % 32 != 0
             || w.ne[0] / 32 > LIN32_THREADS
             || (fused && src(dst, 1).ne[0] % 32 != 0)

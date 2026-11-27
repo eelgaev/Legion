@@ -1944,6 +1944,9 @@ fn mix_rms_keeps_the_bits(b: &mut Backend) {
             (5, 4),
             (2, 3),
             (7, 3),
+            (5, 3),
+            (4, 4),
+            (7, 1),
         ] {
             for n in [1i64, 3, 8] {
                 for view_q in [false, true] {
@@ -1971,7 +1974,8 @@ fn mix_rms_keeps_the_bits(b: &mut Backend) {
                         .collect();
                     let mixed = mixed.as_output();
                     let fused = ops::mix_rms_takes(&st, q, &ws);
-                    assert_eq!(fused, ns + 1 + ws.len() <= 10, "e {e} ns {ns} nq {nq}");
+                    // an external node takes fewer than GGML_MAX_SRC (10) sources
+                    assert_eq!(fused, ns + 1 + ws.len() < 10, "e {e} ns {ns} nq {nq}");
                     let new =
                         fused.then(|| ops::mix_rms(&ctx, &st, q, MIX_EPS, &ws, 1e-6).as_output());
                     let mut graph = ctx.new_graph(64);
