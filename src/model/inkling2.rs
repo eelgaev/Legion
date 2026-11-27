@@ -1014,6 +1014,7 @@ impl Model {
                     pass.rec.ple_slots(ctx, 0, slot, n_seqs),
                     [kc, vc],
                     cells,
+                    pos_all,
                     kdyn.zip(vdyn).map(|(a, b)| [a, b]),
                     il as i64 * p.slot_width,
                     d,
@@ -1021,6 +1022,7 @@ impl Model {
                     p.qk_clip,
                     hp.rms_eps,
                 )
+                .1
             }
             (None, None) => unreachable!("K and V come from the convs or ops::kv"),
         };

@@ -1924,7 +1924,7 @@ fn kv_keeps_the_bits(b: &mut Backend) {
                     1,
                     &[kwr],
                 );
-                let new = ops::kv(
+                let (new, written) = ops::kv(
                     &ctx,
                     kp,
                     vp,
@@ -1933,16 +1933,17 @@ fn kv_keeps_the_bits(b: &mut Backend) {
                     st[1],
                     [kc[1], vc[1]],
                     cells,
+                    pos,
                     dy,
                     base,
                     d,
                     scale,
                     thr,
                     eps,
-                )
-                .as_output();
+                );
+                let new = new.as_output();
                 let mut graph = ctx.new_graph(32);
-                for t in [ko, vo, vwr, new] {
+                for t in [ko, vo, vwr, new, written] {
                     graph.expand(t);
                 }
                 ctx.alloc_graph(&graph, ComputeAllocator::new(b.buffer_type()))

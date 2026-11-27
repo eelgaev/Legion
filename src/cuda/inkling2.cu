@@ -774,8 +774,10 @@ __global__ void clip2_kernel(const A a) {
 // no scale or tau), ink_rms (V, no weight) and two ds4_cache_write (ratio 1) in one. Params:
 // base (the state channel of K's first; V's follow K's), has_dyn, the conv scale, the clip
 // threshold, rms eps, d; sources kp, vp [kvw, n], kw, vw [K, kvw], state [K - 1, width, n]
-// (written back), kc, vc (F16 [row, cells], written), cells I32 [n], kdyn, vdyn [K * heads, n];
-// dst [kvw, n, 2] K then V. A warp per head row (d at most 128), lane l with elements l + 32 k:
+// (written back), then without has_dyn kc, vc (F16 [row, cells], written) and cells I32 [n],
+// with it kdyn, vdyn [K * heads, n] and no cache writes (ggml takes 9 sources; ds4_cache_write
+// nodes write them); dst [kvw, n, 2] K then V. A warp per head row (d at most 128), lane l
+// with elements l + 32 k:
 // its conv outputs are conv_kernel's (conv_out), the clip clip_kernel's lanes (clip_factor), the
 // rms rms_kernel<1>'s sums (warp k of its block holds elements 32 k ..: their double warp sums,
 // then the sum of the 8 warps', 0 past the row) and rms_scale. ----
@@ -795,8 +797,8 @@ __global__ void kv_kernel(const A a) {
     const int     vv = hr >= nr ? 1 : 0;
     const int64_t head = hr - vv * nr;
     const float * x    = (const float *) src(a, vv) + t * kvw;
-    const float * dr0  = dyn ? (const float *) (src(a, 8 + vv) + t * a.src_nb[8 + vv][1]) : nullptr;
-    const int64_t heads = dyn ? a.src_ne[8 + vv][0] / K : 1;
+    const float * dr0  = dyn ? (const float *) (src(a, 5 + vv) + t * a.src_nb[5 + vv][1]) : nullptr;
+    const int64_t heads = dyn ? a.src_ne[5 + vv][0] / K : 1;
     float         y[4];
 #pragma unroll
     for (int k = 0; k < 4; k++) {
@@ -860,14 +862,23 @@ __global__ void kv_kernel(const A a) {
             o[k] = y[k] * s;
         }
     }
-    float *  out = (float *) a.dst + (vv * n + t) * kvw + head * d;
-    __half * c   = (__half *) ((char *) a.src[5 + vv] + (int64_t) ((const int32_t *) src(a, 7))[t] * a.src_nb[5 + vv][1]) + head * d;
+    float * out = (float *) a.dst + (vv * n + t) * kvw + head * d;
 #pragma unroll
     for (int k = 0; k < 4; k++) {
         const int64_t i = lane + 32 * k;
         if (i < d) {
             out[i] = o[k];
-            c[i]   = __float2half(o[k]);
+        }
+    }
+    if (dyn) {
+        return;
+    }
+    __half * c = (__half *) ((char *) a.src[5 + vv] + (int64_t) ((const int32_t *) src(a, 7))[t] * a.src_nb[5 + vv][1]) + head * d;
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        const int64_t i = lane + 32 * k;
+        if (i < d) {
+            c[i] = __float2half(o[k]);
         }
     }
 }

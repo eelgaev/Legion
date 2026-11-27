@@ -10,6 +10,7 @@
 //! `inkling2-loop.cpp` (MIT, ggml-org/llama.cpp PRs #32694 and #32704).
 
 use crate::ggml::{Context, ExternalOp, Tensor, external_params, ffi, types};
+use crate::model::deepseek41::ops as ds41_ops;
 use crate::model::glm5next::ops::{self as glm_ops, cpu_rms_norm};
 
 #[cfg(feature = "cuda")]
@@ -359,7 +360,9 @@ pub fn clip2<'a>(
 /// `[K * heads, n]` each), K's history at channels `base ..` of `state` and V's after it, then
 /// [`clip`] of K's rows of `d` (no scale or tau, `thr`) and [`rms`] of V's (no weight, `eps`),
 /// written as `ds41_ops::cache_write` (ratio 1) writes them into rows `cells` (I32 `[n]`) of
-/// `kc` and `vc` (F16). One node of those nodes' bits; F32 `[kvw, n, 2]`, K then V.
+/// `kc` and `vc` (F16). One node of those nodes' bits, F32 `[kvw, n, 2]` (K then V), and the
+/// node the caches' readers wait on. With dynamic taps the node would take 10 sources (ggml
+/// takes 9), so there the two cache writes stay nodes of their own, after it (`pos` I32 `[n]`).
 #[allow(clippy::too_many_arguments)]
 pub fn kv<'a>(
     ctx: &'a Context,
@@ -370,13 +373,14 @@ pub fn kv<'a>(
     state: Tensor<'a>,
     caches: [Tensor<'a>; 2],
     cells: Tensor<'a>,
+    pos: Tensor<'a>,
     dynamic: Option<[Tensor<'a>; 2]>,
     base: i64,
     d: i64,
     scale: f32,
     thr: f32,
     eps: f32,
-) -> Tensor<'a> {
+) -> (Tensor<'a>, Tensor<'a>) {
     let (kp, vp) = (contiguous(kp), contiguous(vp));
     let [kvw, n, _, _] = kp.ne();
     assert_eq!(vp.ne(), kp.ne(), "ink_kv: K and V shapes");
@@ -406,16 +410,11 @@ pub fn kv<'a>(
         (types::I32, n),
         "ink_kv: cells"
     );
-    let mut args = vec![
-        kp,
-        vp,
-        kw,
-        vw,
-        state,
-        caches[0],
-        caches[1],
-        contiguous(cells),
-    ];
+    // kp, vp, kw, vw, state, then kc, vc, cells or the dynamic taps
+    let mut args = vec![kp, vp, kw, vw, state];
+    if dynamic.is_none() {
+        args.extend([caches[0], caches[1], contiguous(cells)]);
+    }
     if let Some(dy) = dynamic {
         for t in dy {
             let t = contiguous(t);
@@ -428,7 +427,7 @@ pub fn kv<'a>(
             args.push(t);
         }
     }
-    ctx.external_with(
+    let out = ctx.external_with(
         &KV,
         types::F32,
         [kvw, n, 2, 1],
@@ -441,7 +440,14 @@ pub fn kv<'a>(
             eps.to_bits() as i32,
             d as i32,
         ],
-    )
+    );
+    if dynamic.is_none() {
+        return (out, out);
+    }
+    let half = |j: usize| ctx.view_2d(out, [kvw, n], kvw as usize * 4, j * (kvw * n) as usize * 4);
+    let k_written = ds41_ops::cache_write(ctx, caches[0], half(0), cells, pos, 0, 1, &[]);
+    let v_written = ds41_ops::cache_write(ctx, caches[1], half(1), cells, pos, 0, 1, &[k_written]);
+    (out, v_written)
 }
 
 /// Each row (`[d]` of `x` F32 `[d, h, n]`, contiguous) times `scale` (F32 `[d, h]`) if given,
@@ -888,7 +894,7 @@ fn clip_factor(v: &[f32], thr: f32) -> f32 {
 unsafe fn cpu_kv(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
     unsafe {
         let s = |i: usize| &*dst.src[i];
-        let (state, cells) = (s(4), s(7));
+        let state = s(4);
         let p = external_params(dst);
         let (base, has_dyn, scale) = (p[0] as usize, p[1] != 0, f32_param(p[2]));
         let (thr, eps, d) = (f32_param(p[3]), f32_param(p[4]), p[5] as usize);
@@ -899,7 +905,7 @@ unsafe fn cpu_kv(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
             let (t, hr) = (row / (2 * nr), row % (2 * nr));
             let (vv, head) = (hr / nr, hr % nr);
             let (x, w) = (s(vv), s(2 + vv));
-            let dynamic = has_dyn.then(|| s(8 + vv));
+            let dynamic = has_dyn.then(|| s(5 + vv));
             let per_head = dynamic.map_or(1, |dy| kvw / (dy.ne[0] as usize / k));
             let mut y = vec![0f32; d];
             for (i, yi) in y.iter_mut().enumerate() {
@@ -925,9 +931,13 @@ unsafe fn cpu_kv(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
                 y.iter().map(|v| v * sc * 1.0).collect()
             };
             f32s_mut(dst, ((vv * n + t) * kvw + head * d) * 4, d).copy_from_slice(&o);
+            if has_dyn {
+                // ds4_cache_write nodes write the caches
+                continue;
+            }
             let cache = s(5 + vv);
             let dp =
-                (cache.data as *mut u8).add(at::<i32>(cells, t) as usize * cache.nb[1]) as *mut u16;
+                (cache.data as *mut u8).add(at::<i32>(s(7), t) as usize * cache.nb[1]) as *mut u16;
             for (i, v) in o.iter().enumerate() {
                 *dp.add(head * d + i) = ffi::ggml_fp32_to_fp16(*v);
             }
