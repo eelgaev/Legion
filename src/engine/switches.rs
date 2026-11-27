@@ -396,6 +396,9 @@ pub struct Switches {
     /// Prompt matmuls on Turing GPUs without tensor cores on Legion's dp4a op with MMQ's bits
     /// ([`crate::model::tu_mmq::set_tu_mmq`]).
     pub tu_mmq: Option<bool>,
+    /// Q4_0 prompt matmuls on a GB10 on Legion's op with MMQ's bits
+    /// ([`crate::model::q40_mm::set_q40_mm`]).
+    pub q40_mm: Option<bool>,
     /// qwen4exp's mixer up matmul and gated mix as one op ([`crate::model::qwen4::set_up_mix`]).
     pub hc_up_mix: Option<bool>,
     /// The same op for BF16 mixer up weights ([`crate::model::qwen4::set_up_mix_bf16`], on by
@@ -862,6 +865,7 @@ impl Switches {
             crate::model::q8_mmq::set_q8_mmq_fixup(f);
         }
         set(self.tu_mmq, crate::model::tu_mmq::set_tu_mmq);
+        set(self.q40_mm, crate::model::q40_mm::set_q40_mm);
         set(self.hc_up_mix, qwen4::set_up_mix);
         set(self.hc_up_mix_bf16, qwen4::set_up_mix_bf16);
         set(self.hc_up_mix_ldmatrix, qwen4::set_up_mix_ldmatrix);

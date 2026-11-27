@@ -61,7 +61,10 @@ bits. Its bodies are compiled for 7.x targets only (the Rust side takes compute 
 alone) and trap elsewhere. `tu_mmq.cu` is dp4a code built for Turing only (other
 architectures get `NO_DEVICE_CODE`): ggml-cuda's MMQ chain for GPUs without tensor cores, using
 ggml's tile loaders from `mmq.cuh`, launched from the `legion_tu_mmq_kernels` table by
-`src/model/tu_mmq.rs`.
+`src/model/tu_mmq.rs`. `q40_mm.cu` (Q4_0 prompt matmuls on a GB10, `src/model/q40_mm.rs`) is
+kernels only, launched from the `legion_q40_mm_kernels` table, without any ggml-cuda header: its
+quantization is plain SIMT code, its matmul body (cp.async and int8 `mma.sync`) is compiled for
+sm_80+ and traps elsewhere.
 
 `mmq_preq.cu` has no kernel: it is the one piece of C++ host code the owner allowed for #363,
 the glue that runs ggml-cuda's MMQ (`mul_mat_q_case`, which has no C API) on activations that

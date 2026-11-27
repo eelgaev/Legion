@@ -461,6 +461,10 @@ impl Linear {
             // Q4_K/Q5_K/Q6_K/Q8_0 prompt steps on a Turing GPU without tensor cores: ggml's MMQ
             // chain on dp4a instead of emulated int8 MMA, the same bits (#1214).
             crate::model::tu_mmq::mul_mat(ctx, w, x)
+        } else if crate::model::q40_mm::takes(w, x) {
+            // Q4_0 prompt steps on a GB10 (Gemma 4 QAT): ggml's MMQ bits from a pipelined
+            // int8-MMA tile loop without its I2F conversions.
+            crate::model::q40_mm::mul_mat(ctx, w, x)
         } else {
             let x = bf16_cast_joined(ctx, w, x).unwrap_or(x);
             let res = ctx.mul_mat(w, x);

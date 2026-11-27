@@ -17,6 +17,7 @@ pub mod muse;
 pub mod nemotron_h;
 pub mod nvfp4_a4;
 pub mod nvfp4_mm;
+pub mod q40_mm;
 pub mod q8_mmq;
 pub mod qwen35;
 pub mod qwen4;

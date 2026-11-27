@@ -1056,6 +1056,12 @@ pub(in crate::cli) struct SwitchArgs {
     /// CTA). The same output either way; for comparisons.
     #[arg(long, help_heading = HEADING)]
     tu_mmq_ggml: bool,
+    /// Q4_0 prompt matmuls (512+ tokens) on compute capability 12.x GPUs (GB10; no effect
+    /// elsewhere): all on ggml's MMQ instead of Legion's op (the default: ggml's quantization
+    /// and per-output sums in ggml's order from a pipelined int8 MMA tile loop, taken where
+    /// ggml runs every tile on one CTA). The same output either way; for comparisons.
+    #[arg(long, help_heading = HEADING)]
+    q40_mm_ggml: bool,
     /// qwen4exp prompt steps on compute capability 12.x GPUs (GB10; no effect elsewhere): run
     /// the hyper-connection mixer's up matmul (ggml's MMQ, which writes the gate) and the gated
     /// mix (ggml's hc_pre, which reads it back; Legion's copy of it unless --hc-pre-ggml) as
@@ -1761,6 +1767,7 @@ impl SwitchArgs {
             q8_mmq_stream: self.q8_mmq_stream.then_some(true),
             q8_mmq_fixup: self.q8_mmq_fixup,
             tu_mmq: self.tu_mmq_ggml.then_some(false),
+            q40_mm: self.q40_mm_ggml.then_some(false),
             hc_up_mix: self.hc_up_mix_ggml.then_some(false),
             hc_up_mix_bf16: self.no_hc_up_mix_bf16.then_some(false),
             hc_up_mix_ldmatrix: self.no_hc_up_mix_ldmatrix.then_some(false),
