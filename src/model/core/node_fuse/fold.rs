@@ -54,11 +54,11 @@
 //! because the graph as built must stay as it is: its layout decides which tails round as
 //! ggml-cuda's fused sum (a graph built with one cast fewer moved two of them).
 //!
-//! A tail no such norm reads whose sum ggml-cuda does not fuse, with BF16 expert rows
-//! (`--nvfp4-expert-rows-bf16`, #1183; the last layer's on one GPU, read by the output's
-//! hyper-connection mix) becomes one [`MOE_SUM_GATE`] in its plain form at the gate's add,
-//! reading the BF16 rows ([`Graph::plain_tail`]): the rows' cast to F32, the `mul` and the
-//! adds go, each value rounded as ggml's nodes round it.
+//! A tail no such norm reads whose sum ggml-cuda does not fuse (#1183; the last layer's on one
+//! GPU, read by the output's hyper-connection mix) becomes one [`MOE_SUM_GATE`] in its plain
+//! form at the gate's add ([`Graph::plain_tail`]): the `mul` and the adds go (with BF16 expert
+//! rows, `--nvfp4-expert-rows-bf16`, their cast to F32 too), each value rounded as ggml's nodes
+//! round it, and the tail is no longer left to the layout of the graph planned again.
 //!
 //! Early casts (#1183, after the folds; on by default, `LEGION_DEBUG_EARLY_CAST=0` off): a BF16
 //! FFN mixer's values are cast to BF16 for the routed experts' NVFP4 GEMM and read as F32 by the
@@ -115,6 +115,9 @@ const CONV_CODES: usize = 4;
 /// Relayouts undone (logged the first time).
 static UNDONE: AtomicUsize = AtomicUsize::new(0);
 
+/// Tails left as built so far (the first few logged with why).
+static LEFT_LOGGED: AtomicUsize = AtomicUsize::new(0);
+
 /// Grouped NVFP4 nodes left without their skipped pairs' zeros so far (#1176; logged with the
 /// first relayouts).
 static UNREAD: AtomicUsize = AtomicUsize::new(0);
@@ -139,10 +142,10 @@ fn early_cast() -> bool {
     *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_EARLY_CAST").is_none_or(|v| v != "0"))
 }
 
-/// `LEGION_DEBUG_PLAIN_TAIL=0`: a tail no norm reads whose sum ggml-cuda does not fuse, over
-/// BF16 expert rows, stays ggml's nodes (the BF16 rows' cast to F32, the `mul`, the adds) with
-/// the node fusion's op for the adds and the gate, the way before #1183's [`Graph::plain_tail`],
-/// for A/B runs (the same bits either way).
+/// `LEGION_DEBUG_PLAIN_TAIL=0`: a tail no norm reads whose sum ggml-cuda does not fuse stays
+/// ggml's nodes (with BF16 expert rows their cast to F32, the `mul`, the adds) with the node
+/// fusion's op for the adds and the gate, the way before #1183's [`Graph::plain_tail`], for
+/// A/B runs (the same bits either way).
 fn plain_tail_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_PLAIN_TAIL").is_none_or(|v| v != "0"))
@@ -258,11 +261,24 @@ pub(crate) unsafe fn fold_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> (Un
                 continue;
             };
             let fused = cuda && g.ggml_fuses_sum(&s);
-            if g.fold_tail(&s, fused, cuda, &mut undo.saved) {
-                folded += 1;
-                fma += usize::from(fused);
-            } else {
-                undo.left.push((i, fused));
+            match g.fold_tail(&s, fused, cuda, &mut undo.saved) {
+                Ok(()) => {
+                    folded += 1;
+                    fma += usize::from(fused);
+                }
+                Err(why) => {
+                    if LEFT_LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
+                        let name = std::ffi::CStr::from_ptr((*g.nodes[i]).name.as_ptr());
+                        tracing::info!(
+                            mul = %name.to_string_lossy(),
+                            nodes = n,
+                            fused,
+                            why,
+                            "hc moe fold: a MoE tail left as built (the first few)"
+                        );
+                    }
+                    undo.left.push((i, fused));
+                }
             }
         }
         if folded > 0 && lazy_streams() {
@@ -402,17 +418,23 @@ impl Relaid for Undo {
             let n = ffi::ggml_graph_n_nodes(graph) as usize;
             let nodes = std::slice::from_raw_parts(ffi::ggml_graph_nodes(graph), n).to_vec();
             let g = Graph::new(graph, nodes);
-            let held = self.left.iter().all(|&(at, fused)| {
-                g.match_sum(at)
+            let flipped = self.left.iter().find(|&&(at, fused)| {
+                !g.match_sum(at)
                     .is_some_and(|s| g.ggml_fuses_sum(&s) == fused)
             });
-            if !held && UNDONE.fetch_add(1, Ordering::Relaxed) == 0 {
+            if let Some(&(at, fused)) = flipped
+                && UNDONE.fetch_add(1, Ordering::Relaxed) == 0
+            {
+                let name = std::ffi::CStr::from_ptr((*g.nodes[at]).name.as_ptr());
                 tracing::info!(
+                    mul = %name.to_string_lossy(),
+                    nodes = n,
+                    fused_as_built = fused,
                     "hc moe fold: a tail left unfolded would round differently in the folded \
                      graph's layout; that graph is left as built (logged once)"
                 );
             }
-            held
+            flipped.is_none()
         }
     }
 
@@ -433,7 +455,7 @@ impl Graph {
     /// Folds the tail of the sum `s` (ggml-cuda fusing it in the graph as built: `fused`) into
     /// the norm reading it, where its gate's add is read only by that norm (directly or through
     /// a view of all of it) and only the tail reads its other nodes. Saves the nodes it changes
-    /// first. Whether it did.
+    /// first. Why it did not, where it did not.
     ///
     /// # Safety
     /// `s` is a match of this graph, whose nodes are valid tensors.
@@ -443,11 +465,11 @@ impl Graph {
         fused: bool,
         cuda: bool,
         saved: &mut Vec<(Node, ffi::ggml_tensor)>,
-    ) -> bool {
+    ) -> Result<(), &'static str> {
         // SAFETY: the caller's; nodes and their sources are valid tensors.
         unsafe {
             let Some(gt) = self.match_gate(s.last) else {
-                return false;
+                return Err("no shared expert's gate after the sum");
             };
             let m = self.nodes[s.at];
             let adds: Vec<usize> = (s.at + 1..=s.last)
@@ -458,7 +480,7 @@ impl Graph {
                 .all(|&i| self.only_read_by(self.nodes[i], &adds))
                 || !self.only_read_by(m, &adds)
             {
-                return false;
+                return Err("the sum's nodes have readers outside it");
             }
             let a = self.nodes[gt.add];
             let reader = match *self.users(a) {
@@ -481,7 +503,7 @@ impl Graph {
             let [e, n, _, _] = (*a).ne;
             let x = s.experts;
             if !f32_contiguous(x) || (*x).ne != [e, s.k as i64, n, 1] || s.k > i32::MAX as usize {
-                return false;
+                return Err("the experts' rows are not contiguous F32 [e, k, n]");
             }
             let into_norm = reader.filter(|&(ni, view)| {
                 let norm = self.nodes[ni];
@@ -493,12 +515,15 @@ impl Graph {
             let Some((ni, view)) = into_norm else {
                 // No norm to fold into (under tensor parallelism the rank exchange reads the
                 // tail, #1176): a sum ggml-cuda fuses and its gate as one op at the gate's add;
-                // one it does not, over BF16 rows, in the op's plain form (#1183).
-                return if fused {
-                    self.fuse_tail(s, &gt, saved)
-                } else {
-                    cuda && self.plain_tail(s, &gt, saved)
-                };
+                // one it does not in the op's plain form (#1183).
+                if fused {
+                    self.fuse_tail(s, &gt, saved);
+                    return Ok(());
+                }
+                if !cuda {
+                    return Err("no norm reads it (off CUDA)");
+                }
+                return self.plain_tail(s, &gt, saved);
             };
             let norm = self.nodes[ni];
             let mut dead: Vec<usize> = (s.at..=s.last).collect();
@@ -520,7 +545,7 @@ impl Graph {
             let sum = if fused { FoldSum::Fma } else { FoldSum::Plain };
             fold_moe(norm, x, s.weights, s.k, sum, gt.sh, gt.g);
             self.retire(&dead, root(x));
-            true
+            Ok(())
         }
     }
 
@@ -546,34 +571,41 @@ impl Graph {
         }
     }
 
-    /// The tail of the sum `s`, which ggml-cuda does not fuse, over BF16 rows read back as F32
-    /// (`--nvfp4-expert-rows-bf16`), with its gate `gt` as one [`MOE_SUM_GATE`] in its plain
-    /// form at the gate's add (#1183): each product rounded, the adds in expert order, then the
-    /// gate, as ggml's nodes round them, reading the BF16 rows (the cast is exact), so the
-    /// cast, the `mul` and the adds go. Not under `--tp-moe-ep` (its rows are marked from the
-    /// F32 rows' node), nor with `LEGION_DEBUG_PLAIN_TAIL=0`: there the tail is left to the
-    /// node fusion as before. Saves the nodes it changes first. Whether it did.
+    /// The tail of the sum `s`, which ggml-cuda does not fuse, with its gate `gt` as one
+    /// [`MOE_SUM_GATE`] in its plain form at the gate's add (#1183): each product rounded, the
+    /// adds in expert order, then the gate, as ggml's nodes round them, so the `mul` and the
+    /// adds go. Over BF16 rows read back as F32 (`--nvfp4-expert-rows-bf16`) it reads the BF16
+    /// rows (the cast is exact) and the cast goes too. Taken, the tail no longer depends on
+    /// where the graph planned again puts its nodes (a tail left as built that would round
+    /// otherwise there undoes the whole graph's fold). Not under `--tp-moe-ep` (its rows are
+    /// marked from the F32 rows' node), nor with `LEGION_DEBUG_PLAIN_TAIL=0`: there the tail is
+    /// left to the node fusion as before. Saves the nodes it changes first. Why it did not,
+    /// where it did not.
     ///
     /// # Safety
-    /// As [`Self::fuse_tail`].
+    /// As [`Self::fuse_tail`]; `s`'s experts are `[e, k, n]` contiguous F32.
     unsafe fn plain_tail(
         &mut self,
         s: &Sum,
         gt: &Gate,
         saved: &mut Vec<(Node, ffi::ggml_tensor)>,
-    ) -> bool {
-        if !plain_tail_on() || crate::model::core::tp_ep::active() {
-            return false;
+    ) -> Result<(), &'static str> {
+        if !plain_tail_on() {
+            return Err("no norm reads it, and LEGION_DEBUG_PLAIN_TAIL=0");
+        }
+        if crate::model::core::tp_ep::active() {
+            return Err("no norm reads it, and --tp-moe-ep");
         }
         // SAFETY: the caller's; nodes and their sources are valid tensors.
         unsafe {
-            let Some((rows, cast)) = self.bf16_rows(s.experts, s.at) else {
-                return false;
+            let (rows, cast) = match self.bf16_rows(s.experts, s.at) {
+                Some((rows, i)) => (rows, Some(i)),
+                None => (s.experts, None),
             };
             let a = self.nodes[gt.add];
             let mut dead: Vec<usize> = (s.at..=s.last).collect();
             dead.extend(&gt.chain);
-            dead.push(cast);
+            dead.extend(cast);
             saved.push((a, std::ptr::read(a)));
             saved.extend(
                 dead.iter()
@@ -582,7 +614,7 @@ impl Graph {
             let srcs = [rows, s.weights, gt.sh, gt.g];
             make_external(a, &MOE_SUM_GATE, &srcs, &[1, 1, s.k as i32, 0]);
             self.retire(&dead, root(rows));
-            true
+            Ok(())
         }
     }
 
