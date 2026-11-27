@@ -3,7 +3,8 @@
 //! uses or could use: m16n8k16 BF16 and F16 with F32 sums, F16 with F16 sums, m16n8k32 E4M3
 //! with F32 sums (sm_89+), and on sm_120a / sm_121a (a GB10, RTX 50) `kind::f8f6f4` E4M3 and the
 //! block-scaled `kind::mxf8f6f4` (E4M3, UE8M0 scales) and `kind::mxf4nvf4` (E2M1, UE4M3 scales)
-//! forms. Each form runs over [`WARPS`] warps an SM (one CTA an SM) times [`CHAINS`] independent
+//! forms, and m16n8k32 S8 with S32 sums (the Q4_0 prompt matmuls', `src/cuda/q40_mm.cu`;
+//! its TFLOPS are integer operations). Each form runs over [`WARPS`] warps an SM (one CTA an SM) times [`CHAINS`] independent
 //! accumulators a warp; the best of the sweep is the form's peak, the GEMMs' ceiling to measure
 //! a kernel's TFLOPS against.
 //!
@@ -30,7 +31,7 @@ pub struct Form {
 }
 
 /// The forms, in the kernels' order.
-pub const FORMS: [Form; 7] = [
+pub const FORMS: [Form; 8] = [
     Form {
         name: "m16n8k16 BF16 -> F32",
         needs: "sm_80",
@@ -65,6 +66,11 @@ pub const FORMS: [Form; 7] = [
         name: "mxf4nvf4 4X m16n8k64 E2M1 -> F32",
         needs: "sm_120a",
         mnk: 16 * 8 * 64,
+    },
+    Form {
+        name: "m16n8k32 S8 -> S32",
+        needs: "sm_80",
+        mnk: 16 * 8 * 32,
     },
 ];
 
@@ -208,7 +214,7 @@ mod cuda {
     const CALIBRATE_ITERS: u64 = 1024;
 
     unsafe extern "C" {
-        static legion_mma_peak_kernels: [[*const c_void; 4]; 7];
+        static legion_mma_peak_kernels: [[*const c_void; 4]; 8];
         static legion_mma_peak_probe: *const c_void;
         fn cudaSetDevice(device: c_int) -> c_int;
         fn cudaDeviceGetAttribute(value: *mut c_int, attr: c_int, device: c_int) -> c_int;
