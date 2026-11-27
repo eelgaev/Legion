@@ -14,11 +14,9 @@ Legion is an LLM inference engine for mixture-of-experts models on NVIDIA unifie
 It is Rust first: the host side is Rust, kernels are PTX where we can, and C/C++ only where there
 is no other choice (ggml provides the quantized kernels underneath).
 
-- **Models.** First-class: [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) (Qwen4 architecture),
-  [GLM5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) and [DeepSeek4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash).
-  Also supported: [Gemma 4](https://huggingface.co/google/gemma-4-31B-it), [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) and smaller
-  MoEs such as [Nemotron3.5-30B-A3B](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16),
-  [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) and [Gemma4-26B-A4B](https://huggingface.co/google/gemma-4-26B-A4B-it).
+- **Models.** First-class: Qwen3.8-Flash-Next, GLM5.3-Flash and DeepSeek4.1-Flash. Also Gemma 4,
+  Qwen3.8-27B, Muse Glimmer, Inkling-2-Mini, Nemotron 3.5 and smaller Qwen3.5 / 3.6 models. The full
+  list, with the weights we have run: [Supported models](#supported-models).
 - **Hardware.** Built for unified memory: very good support for the IBM AC922 (V100
   over NVLink 2.0 + ATS) and the DGX Spark (GB10). Gaming PCs with one RTX card too: a MoE
   much bigger than VRAM keeps its experts in RAM, the hot ones cached in VRAM by heat. Minimum GPU: sm_70 (Volta).
@@ -32,11 +30,49 @@ is no other choice (ggml provides the quantized kernels underneath).
   Legion also saves their recurrent states, including one past each reply, so a multi-turn chat or
   an agent loop computes only its new tokens: a repeated 5.8K-token prompt starts in 0.07 s instead
   of 3.6 s on a DGX Spark.
-- **Images.** Qwen3.5 / 3.6, Qwen3.8-27B and Qwen3.8-Flash-Next take images through `--mmproj`, or through the
+- **Images.** Qwen3.5 / 3.6, Qwen3.8-27B, Qwen3.8-Flash-Next, Gemma 4 31B, GLM5.3-Flash and Nemotron 3.5
+  Bolt E4B take images through `--mmproj`, or through the
   vision tower a checkpoint ships (all three APIs and the web UI).
 - **Fast prefill.** Fused expert kernels, sparse attention and pipelined prompt chunks over several
   GPUs.
 - **Easy to use.** One binary: point `legion serve` at a GGUF file or a checkpoint directory.
+
+## Supported models
+
+The weights in brackets are the ones we have run. Other quants of the same model should load too:
+any GGUF type ggml reads, and any safetensors checkpoint in the formats listed.
+
+**First-class**
+
+- [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), Qwen4 architecture (unsloth
+  UD-Q4_K_XL and UD-IQ3_XXS GGUF; GSQ-RCO IQ2_XS GGUF; NVIDIA NVFP4 with its own MTP head). Images.
+- [GLM5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) (unsloth UD-Q4_K_XL GGUF; Maya-S v2
+  IQ2_XXS GGUF; NVIDIA NVFP4). Images.
+- [DeepSeek4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) (IQ2_XXS GGUF). The
+  FP8 / MXFP4 checkpoint is being tuned and hasn't run with its real weights yet.
+
+**Also supported**
+
+- [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) (unsloth UD-Q4_K_XL GGUF with MTP; unsloth
+  and RadixArk NVFP4, with z-lab's DFlash 2 drafter). Images.
+- [Gemma 4 31B](https://huggingface.co/google/gemma-4-31B-it) (unsloth QAT UD-Q4_K_XL GGUF with its
+  MTP assistant; NVIDIA and RedHatAI NVFP4). Images.
+- [Gemma 4 26B-A4B](https://huggingface.co/google/gemma-4-26B-A4B-it) (unsloth QAT UD-Q4_K_XL GGUF
+  with its MTP assistant).
+- Gemma 4 E2B (GGUF).
+- [Muse Glimmer 30B](https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF) (unsloth UD-Q4_K_XL GGUF,
+  with its DFlash drafter). Text only, GGUF only.
+- [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (unsloth UD-Q4_K_XL GGUF,
+  both layouts; Thinking Machines NVFP4). Text only.
+- [Nemotron 3.5 Bolt E4B](https://huggingface.co/unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF) (unsloth
+  UD-Q4_K_XL GGUF, with its DFlash drafter). Images.
+- [Nemotron 3.5 Bolt 74B-A9B](https://huggingface.co/unsloth/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-GGUF)
+  (unsloth UD-Q4_K_XL GGUF).
+- [Nemotron 3.5 30B-A3B and Lightning 30B-A3B](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16)
+  (unsloth UD-Q4_K_XL GGUF; NVIDIA NVFP4 of both).
+- [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) (unsloth UD-Q4_K_XL GGUF).
+- Qwen3.6-27B (NVIDIA NVFP4).
+- Qwen3.5-4B (Q8_0 and UD-Q4_K_XL GGUF) and Fara1.5-4B (Q4_K_M, Q5_K_M and Q8_0 GGUF).
 
 ## GGUF and safetensors, one engine
 
@@ -55,19 +91,11 @@ figures out the rest.
 - **Compare like with like.** One engine and one benchmark for both formats, so a GGUF and an NVFP4
   row of the same model differ only by the weights.
 
-| Model | GGUF | Safetensors |
-|---|---|---|
-| Qwen3.8-Flash-Next | unsloth UD-Q4_K_XL and others | NVIDIA NVFP4 (with its own MTP head) |
-| Qwen3.8-27B | yes | unsloth and RadixArk NVFP4 |
-| GLM5.3-Flash | unsloth UD-Q4_K_XL, Maya-S | NVIDIA NVFP4 |
-| Gemma 4 31B | QAT Q4_0 / UD-Q4_K_XL, with MTP | NVIDIA and RedHatAI NVFP4 |
-| Qwen3.5 / 3.6, Nemotron-H | yes | BF16, FP8, NVFP4 |
-| DeepSeek4.1-Flash | yes | FP8 / MXFP4 (being tuned) |
-| Inkling-2-Mini (text) | unsloth UD-Q4_K_XL, both layouts | Thinking Machines NVFP4 |
+Which files of each model we have run, GGUF and safetensors: [Supported models](#supported-models).
 
-**Status:** Qwen3.5 / 3.6 (dense and MoE), Qwen3.8-Flash-Next, Qwen3.8-27B, Gemma 4, GLM5.3-Flash and
-Nemotron-H serve on CUDA, on one or several GPUs, from GGUF or safetensors. DeepSeek4.1-Flash is
-being tuned.
+**Status:** Qwen3.5 / 3.6 (dense and MoE), Qwen3.8-Flash-Next, Qwen3.8-27B, Gemma 4, GLM5.3-Flash,
+Nemotron-H and Inkling-2-Mini serve on CUDA, on one or several GPUs, from GGUF or safetensors. Muse
+Glimmer serves from GGUF. DeepSeek4.1-Flash is being tuned.
 
 ## Performance
 
