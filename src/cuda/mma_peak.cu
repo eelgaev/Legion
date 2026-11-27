@@ -15,6 +15,7 @@
 //   4 kind::f8f6f4 m16n8k32 E4M3 -> F32    sm_120a / sm_121a
 //   5 kind::mxf8f6f4 block_scale scale_vec::1X m16n8k32 E4M3, UE8M0 scales -> F32   sm_12xa
 //   6 kind::mxf4nvf4 block_scale scale_vec::4X m16n8k64 E2M1, UE4M3 scales -> F32   sm_12xa
+//   7 m16n8k32 S8 x S8 -> S32              sm_80+ (src/cuda/q40_mm.cu's form)
 // A form's body exists only where its architecture is the build target's; elsewhere the kernel
 // traps. legion_mma_peak_probe reports which forms the running device's code has (a bit per
 // form), so the host never launches a trap. The Rust side launches everything with
@@ -45,7 +46,7 @@ namespace {
 #define MP_SM12XA 1
 #endif
 
-constexpr int FORMS = 7;
+constexpr int FORMS = 8;
 constexpr int MAX_THREADS = 1024;  // 32 warps, the sweep's largest CTA
 
 // Whether this architecture's code has form F's body.
@@ -53,9 +54,9 @@ template <int F> __host__ __device__ constexpr bool has_form() {
 #if defined(MP_SM12XA)
     return true;
 #elif defined(MP_SM89)
-    return F <= 3;
+    return F <= 3 || F == 7;
 #elif defined(MP_SM80)
-    return F <= 2;
+    return F <= 2 || F == 7;
 #else
     return false;
 #endif
@@ -82,6 +83,18 @@ template <int F> __device__ __forceinline__ void mma(float (&c)[4], const uint32
                      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
         c[0] = __uint_as_float(h0);
         c[1] = __uint_as_float(h1);
+    } else if constexpr (F == 7) {
+        // Integer sums in the accumulators' bits (register moves only, as form 2).
+        uint32_t s0 = __float_as_uint(c[0]), s1 = __float_as_uint(c[1]), s2 = __float_as_uint(c[2]),
+                 s3 = __float_as_uint(c[3]);
+        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                     "{%0,%1,%2,%3};"
+                     : "+r"(s0), "+r"(s1), "+r"(s2), "+r"(s3)
+                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+        c[0] = __uint_as_float(s0);
+        c[1] = __uint_as_float(s1);
+        c[2] = __uint_as_float(s2);
+        c[3] = __uint_as_float(s3);
     }
 #endif
 #if defined(MP_SM89)
@@ -125,6 +138,8 @@ template <int F> __device__ __forceinline__ uint32_t operand(uint32_t v) {
         return 0x20002000u | (v & 0x03ff03ffu);  // F16 ~2^-7
     } else if constexpr (F <= 5) {
         return 0x20202020u | (v & 0x07070707u);  // E4M3 ~2^-3
+    } else if constexpr (F == 7) {
+        return 0x01010101u | (v & 0x0e0e0e0eu);  // S8 1 .. 15
     } else {
         return 0x11111111u | (v & 0x22222222u);  // E2M1 0.5 or 1.5
     }
@@ -189,6 +204,7 @@ __global__ void mma_peak_probe(int * forms) {
     if (has_form<4>()) m |= 1 << 4;
     if (has_form<5>()) m |= 1 << 5;
     if (has_form<6>()) m |= 1 << 6;
+    if (has_form<7>()) m |= 1 << 7;
     *forms = m;
 }
 
@@ -202,7 +218,7 @@ __global__ void mma_peak_probe(int * forms) {
 // (src/model/core/mma_peak.rs): [form][1, 2, 4, 8 accumulator chains], one legion_mma_peak
 // argument; up to MAX_THREADS threads a CTA, no shared memory.
 extern "C" const void * const legion_mma_peak_kernels[FORMS][4] = {
-    MP_ROW(0), MP_ROW(1), MP_ROW(2), MP_ROW(3), MP_ROW(4), MP_ROW(5), MP_ROW(6),
+    MP_ROW(0), MP_ROW(1), MP_ROW(2), MP_ROW(3), MP_ROW(4), MP_ROW(5), MP_ROW(6), MP_ROW(7),
 };
 
 // The probe (one int * argument, one thread).

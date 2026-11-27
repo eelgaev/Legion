@@ -57,9 +57,9 @@ fn report_names_peaks_and_missing_forms() {
 #[test]
 fn forms_match_the_kernels() {
     // src/cuda/mma_peak.cu's table rows and K of each form.
-    assert_eq!(FORMS.len(), 7);
+    assert_eq!(FORMS.len(), 8);
     let k: Vec<u64> = FORMS.iter().map(|f| f.mnk / (16 * 8)).collect();
-    assert_eq!(k, [16, 16, 16, 32, 32, 32, 64]);
+    assert_eq!(k, [16, 16, 16, 32, 32, 32, 64, 32]);
     assert_eq!(CHAINS, [1, 2, 4, 8]);
 }
 
