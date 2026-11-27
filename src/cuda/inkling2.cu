@@ -301,9 +301,11 @@ __global__ void mix_kernel(const A a) {
 constexpr int RMS_THREADS = 256;
 
 // rms_kernel's scale from the block's sum of squares, the one expression of rms_kernel and
-// kv_kernel.
+// kv_kernel. glm_rms_norm's 1.0f / sqrtf is one MUFU.RSQ under --use_fast_math, but only
+// where ptxas folds the two: #1221 r8's rms_kernel<1> came out as a sqrt and a reciprocal (1
+// ulp off). rsqrtf is that instruction always.
 __device__ __forceinline__ float rms_scale(double sum, int64_t d, float eps) {
-    return 1.0f / sqrtf((float) (sum / d) + eps);
+    return rsqrtf((float) (sum / d) + eps);
 }
 
 // ---- ink_rms: params eps, whether w is a weight; sources x [d, rows] (contiguous), w [d] or
