@@ -120,6 +120,10 @@ pub struct Options {
     pub recursion_depth: usize,
     /// Upper bound on NFA states.
     pub max_nfa_states: usize,
+    /// [`compile_tool_calls`]'s calls may name a tool the request did not declare: the
+    /// name is free and its parameters unconstrained. The parser hands such a call to the
+    /// client when `--undeclared-tool-calls call` is set ([`crate::engine::EngineConfig`]).
+    pub undeclared_names: bool,
 }
 
 impl Default for Options {
@@ -129,6 +133,7 @@ impl Default for Options {
             any_depth: 6,
             recursion_depth: 3,
             max_nfa_states: 400_000,
+            undeclared_names: false,
         }
     }
 }
@@ -291,9 +296,21 @@ impl GrammarCompiler {
         &self,
         tools: &[ToolSpec<'_>],
         end: u32,
+        undeclared_names: bool,
     ) -> Result<Grammar, GrammarError> {
-        let node = tool_call::qwen3_coder(tools, &self.options)?;
-        self.finish_with(&node, vec![end])
+        let mut options = self.options.clone();
+        options.undeclared_names = undeclared_names;
+        let node = tool_call::qwen3_coder(tools, &options)?;
+        let (nfa, start) = Nfa::build(&node, &options)?;
+        let lazy = Lazy::new(&nfa, start);
+        Ok(Grammar {
+            inner: Arc::new(GrammarInner {
+                table: self.table.clone(),
+                stop: vec![end],
+                nfa,
+                lazy: Mutex::new(lazy),
+            }),
+        })
     }
 
     fn finish(&self, node: &schema::Node) -> Result<Grammar, GrammarError> {

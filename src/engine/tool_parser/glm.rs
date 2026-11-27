@@ -21,20 +21,23 @@ const VALUE_CLOSE: &str = "</arg_value>";
 pub struct GlmParser(pub(super) Core);
 
 impl GlmParser {
-    pub fn new(tools: &[Tool]) -> Self {
-        Self(Core::new(parse_glm, tools))
+    pub fn new(tools: &[Tool], call_undeclared: bool) -> Self {
+        Self(Core::new(parse_glm, tools, call_undeclared))
     }
 }
 
 /// `NAME<arg_key>...` into `(name, arguments json)`.
-fn parse_glm(body: &str, tools: &[Tool]) -> Option<(String, String)> {
+fn parse_glm(body: &str, tools: &[Tool], call_undeclared: bool) -> Option<(String, String)> {
     let body = body.trim();
     let end = body.find(KEY_OPEN).unwrap_or(body.len());
     let name = body[..end].trim();
     if name.is_empty() || name.contains(['<', '>', '\n']) {
         return None;
     }
-    let tool = tools.iter().find(|t| t.name == name)?;
+    let tool = tools.iter().find(|t| t.name == name);
+    if tool.is_none() && !call_undeclared {
+        return None;
+    }
     let mut rest = &body[end..];
     let mut args = Map::new();
     loop {
@@ -48,7 +51,7 @@ fn parse_glm(body: &str, tools: &[Tool]) -> Option<(String, String)> {
         let after = after.strip_prefix(VALUE_OPEN)?;
         let close = after.find(VALUE_CLOSE)?;
         let raw = &after[..close];
-        let value = if is_string_param(tool, &key) {
+        let value = if tool.is_some_and(|t| is_string_param(t, &key)) {
             Value::String(raw.to_string())
         } else {
             serde_json::from_str(raw.trim()).unwrap_or_else(|_| Value::String(raw.to_string()))

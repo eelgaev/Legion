@@ -69,7 +69,20 @@ fn compile(tools: &[Tool]) -> Result<Grammar, GrammarError> {
             strict: t.strict.then_some(&t.parameters),
         })
         .collect();
-    compiler().compile_tool_calls(&specs, end_token())
+    compiler().compile_tool_calls(&specs, end_token(), false)
+}
+
+/// As [`compile`], but a call may name a tool the request did not declare
+/// (`--undeclared-tool-calls call`).
+fn compile_undeclared(tools: &[Tool]) -> Result<Grammar, GrammarError> {
+    let specs: Vec<ToolSpec> = tools
+        .iter()
+        .map(|t| ToolSpec {
+            name: &t.name,
+            strict: t.strict.then_some(&t.parameters),
+        })
+        .collect();
+    compiler().compile_tool_calls(&specs, end_token(), true)
 }
 
 /// Feeds `text`'s tokens; the first rejected token's index on failure.
@@ -88,7 +101,12 @@ fn accepts(g: &Grammar, body: &str) -> bool {
 
 /// The calls the engine's parser reads from `<tool_call>{body}</tool_call>`.
 fn parse(tools: &[Tool], body: &str) -> Vec<(String, Value)> {
-    let mut p = Qwen3CoderParser::new(tools);
+    parse_mode(tools, body, false)
+}
+
+/// As [`parse`], with `--undeclared-tool-calls call`.
+fn parse_mode(tools: &[Tool], body: &str, call_undeclared: bool) -> Vec<(String, Value)> {
+    let mut p = Qwen3CoderParser::new(tools, call_undeclared);
     let mut events = p.push(&format!("<tool_call>{body}</tool_call>"));
     events.extend(p.finish());
     events
@@ -345,4 +363,30 @@ fn random_calls_parse_and_follow_the_schema() {
     }
     assert!(done * 2 >= runs, "only {done}/{runs} calls ended");
     assert!(strict > 0, "no call of the strict tool");
+}
+
+#[test]
+fn undeclared_names_need_the_call_policy() {
+    let tools = [weather(), free_tool()];
+    let strict = compile(&tools).unwrap();
+    let free = compile_undeclared(&tools).unwrap();
+    let body = "\n<function=unlisted>\n<parameter=cmd>\nls\n</parameter>\n</function>\n";
+    assert!(
+        !accepts(&strict, body),
+        "a declared-only grammar rejects the name"
+    );
+    assert!(
+        accepts(&free, body),
+        "the policy admits the name in the grammar"
+    );
+    assert_eq!(
+        parse_mode(&tools, body, true),
+        vec![("unlisted".into(), json!({"cmd": "ls"}))],
+        "call mode hands it to the client"
+    );
+    let known = "\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n";
+    assert!(
+        accepts(&strict, known) && accepts(&free, known),
+        "declared names are unaffected"
+    );
 }

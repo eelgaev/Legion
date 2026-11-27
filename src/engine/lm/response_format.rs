@@ -55,7 +55,7 @@ impl LmEngine {
             .grammars
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .compile_tools(&self.tokenizer, tools, end);
+            .compile_tools(&self.tokenizer, tools, end, self.undeclared_tool_calls);
         match compiled {
             Ok(g) => Some(g),
             Err(e) => {
@@ -99,6 +99,7 @@ impl GrammarCache {
         tokenizer: &Tokenizer,
         tools: &[Tool],
         end: u32,
+        undeclared_names: bool,
     ) -> Result<Grammar, GrammarError> {
         let specs: Vec<ToolSpec<'_>> = tools
             .iter()
@@ -109,15 +110,18 @@ impl GrammarCache {
             .collect();
         // A JSON array after the prefix: no collision with a response format's key.
         let key = format!(
-            "tools:{end}:{}",
+            "tools:{end}:{}:u{}",
             serde_json::to_string(
                 &(specs.iter())
                     .map(|s| (s.name, s.strict))
                     .collect::<Vec<_>>()
             )
-            .expect("JSON value")
+            .expect("JSON value"),
+            undeclared_names as u8
         );
-        self.get_or_compile(key, tokenizer, |c| c.compile_tool_calls(&specs, end))
+        self.get_or_compile(key, tokenizer, |c| {
+            c.compile_tool_calls(&specs, end, undeclared_names)
+        })
     }
 
     fn get_or_compile(

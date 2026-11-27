@@ -14,6 +14,7 @@ fn json_overrides_thinking_and_template_kwargs() {
         vision: None,
         info: ModelInfo::default(),
         chat_format: super::super::chat_format::ChatFormat::detect(&tokenizer),
+        undeclared_tool_calls: false,
         tokenizer,
         template: Some(
             ChatTemplate::new(
@@ -193,6 +194,7 @@ fn strict_tools_constrain_only_inside_a_call() {
                 strict: Some(&schema),
             }],
             end,
+            false,
         )
         .unwrap();
     let n = vocab().vocab_size();

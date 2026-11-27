@@ -42,6 +42,18 @@ export function titleFrom(text) {
 }
 
 // Newest first.
+// crypto.randomUUID only exists in secure contexts (https or localhost); the UI is
+// often served over plain http to a LAN address, so fall back to getRandomValues,
+// which is available everywhere, to build the same v4 shape.
+function uuid() {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const h = [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
 export function sortConversations(list) {
   return [...list].sort((a, b) => b.updated - a.updated);
 }
@@ -52,7 +64,7 @@ export async function listConversations() {
 
 export async function createConversation(title) {
   const now = Date.now();
-  const conv = { id: crypto.randomUUID(), title, created: now, updated: now };
+  const conv = { id: uuid(), title, created: now, updated: now };
   await tx(["conversations"], "readwrite", (s) => s.add(conv));
   return conv;
 }
@@ -70,7 +82,7 @@ export async function getMessages(convId) {
 // Stores a message (filling id, parentId, reasoning, created, stats, images) and bumps its conversation.
 export async function addMessage(msg) {
   const full = {
-    id: crypto.randomUUID(),
+    id: uuid(),
     parentId: null,
     reasoning: "",
     created: Date.now(),

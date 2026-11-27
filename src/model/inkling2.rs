@@ -773,7 +773,7 @@ impl Model {
                 .collect();
             match deep {
                 Some(d) => glm_ops::linear_set_deep(ctx, &set, d),
-                None => glm_ops::linear_set(ctx, &set),
+                None => glm_ops::linear_set_default(ctx, &set),
             }
         } else {
             names

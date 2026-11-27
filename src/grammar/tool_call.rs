@@ -81,6 +81,20 @@ pub(crate) fn qwen3_coder(tools: &[ToolSpec<'_>], opts: &Options) -> Result<Node
             Node::Opt(Box::new(lit("\n"))),
         ]));
     }
+    if opts.undeclared_names {
+        // A call whose name the request did not declare: the same shape, any name. The
+        // parser hands it to the client instead of the markup leaking out as text
+        // (`--undeclared-tool-calls call`).
+        alts.push(Node::Seq(vec![
+            Node::RawUntil {
+                end: b">\n".to_vec(),
+                forbid: vec![b"<".to_vec(), b"\n".to_vec()],
+            },
+            free_params(),
+            lit("</function>"),
+            Node::Opt(Box::new(lit("\n"))),
+        ]));
+    }
     let names = schema::alt(alts);
     if matches!(names, Node::Never) {
         return Err(GrammarError::Unsatisfiable);

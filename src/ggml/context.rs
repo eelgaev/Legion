@@ -1683,6 +1683,8 @@ pub struct ComputeAllocator {
     /// Where graphs a relayout rewrites are planned as built, out of this allocator's buffer
     /// ([`Self::headroom`]'s; [`Shadow`]).
     shadow: Option<Shadow>,
+    /// The buffer type it was made for (`buft` before any padding).
+    base: BufferType,
 }
 
 /// A second graph allocator, over address space only ([`super::unbacked`]), that plans a
@@ -2036,7 +2038,13 @@ impl ComputeAllocator {
             moved: std::cell::Cell::new(false),
             failed: std::cell::Cell::new(false),
             shadow: None,
+            base: buft,
         }
+    }
+
+    /// The buffer type it was made for (before the padding of [`Self::padded`] and the like).
+    pub fn base_type(&self) -> BufferType {
+        self.base
     }
 
     /// This allocator with fresh plans on or off ([`set_fresh_plans`] sets the default).
@@ -2310,6 +2318,7 @@ impl ComputeAllocator {
             moved: std::cell::Cell::new(false),
             failed: std::cell::Cell::new(false),
             shadow: None,
+            base: buft,
         }
     }
 

@@ -39,7 +39,7 @@ fn spec(kind: &Kind) -> (TextSpec, UnboundedReceiver<TokenEvent>) {
             .then(|| ReasoningParser::new("<think>", "</think>", false)),
         tools: kind
             .tools
-            .then(|| Box::new(HermesParser::new(&tools)) as Box<dyn ToolParser>),
+            .then(|| Box::new(HermesParser::new(&tools, false)) as Box<dyn ToolParser>),
         stop: StopMatcher::new(kind.stop.clone()),
         logprobs: kind.logprobs,
         shown: Vec::new(),

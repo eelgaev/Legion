@@ -6,17 +6,25 @@
 //! is emitted until the close tag arrives, since a call is only useful whole. A block that does
 //! not parse (bad JSON, unknown tool, ...) is emitted verbatim as `Text` rather than dropped.
 //!
+//! One case is a policy rather than a bug: a block that is well formed but names a tool
+//! the request did not declare. By default it stays text; `--undeclared-tool-calls call`
+//! ([`crate::engine::lm::LmConfig::undeclared_tool_calls`]) hands it to the client as a call,
+//! so a drifted name reaches the tool channel instead of the conversation.
+//!
 //! Formats follow vllm's `hermes_tool_parser.py` and `qwen3coder_tool_parser.py` (Apache-2.0);
 //! Gemma 4's (`<|tool_call>call:NAME{...}<tool_call|>`) is in [`gemma4`], GLM's
 //! (`<tool_call>NAME<arg_key>...</arg_key><arg_value>...</arg_value></tool_call>`) in [`glm`],
-//! Inkling-2's message framing and JSON calls in [`inkling`].
+//! Inkling-2's message framing and JSON calls in [`inkling`], Muse Glimmer's messages and ATEM
+//! calls in [`muse`].
 
 mod gemma4;
 mod glm;
 pub mod inkling;
+pub mod muse;
 pub use gemma4::Gemma4Parser;
 pub use glm::GlmParser;
 pub use inkling::InklingParser;
+pub use muse::MuseParser;
 
 use serde_json::{Map, Value};
 
@@ -48,13 +56,15 @@ pub fn finish_reason(had_calls: bool, base: FinishReason) -> FinishReason {
 }
 
 /// Parses the body between the tags into `(name, arguments json)`.
-type BodyParser = fn(&str, &[Tool]) -> Option<(String, String)>;
+type BodyParser = fn(&str, &[Tool], bool) -> Option<(String, String)>;
 
 struct Core {
     parse: BodyParser,
     open: &'static str,
     close: &'static str,
     tools: Vec<Tool>,
+    /// Hand a well-formed block naming an undeclared tool to the client.
+    call_undeclared: bool,
     inside: bool,
     held: String,
     had_calls: bool,
@@ -63,14 +73,15 @@ struct Core {
 }
 
 impl Core {
-    fn new(parse: BodyParser, tools: &[Tool]) -> Self {
-        Self::with_tags(parse, tools, OPEN, CLOSE)
+    fn new(parse: BodyParser, tools: &[Tool], call_undeclared: bool) -> Self {
+        Self::with_tags(parse, tools, call_undeclared, OPEN, CLOSE)
     }
 
     /// A parser for calls between `open` and `close` instead of `<tool_call>` tags.
     fn with_tags(
         parse: BodyParser,
         tools: &[Tool],
+        call_undeclared: bool,
         open: &'static str,
         close: &'static str,
     ) -> Self {
@@ -79,6 +90,7 @@ impl Core {
             open,
             close,
             tools: tools.to_vec(),
+            call_undeclared,
             inside: false,
             held: String::new(),
             had_calls: false,
@@ -97,7 +109,7 @@ impl Core {
                 let body: String = self.held[..at].to_string();
                 self.held.drain(..at + self.close.len());
                 self.inside = false;
-                match (self.parse)(&body, &self.tools) {
+                match (self.parse)(&body, &self.tools, self.call_undeclared) {
                     Some((name, arguments)) => {
                         self.had_calls = true;
                         self.trim_leading = true;
@@ -166,17 +178,17 @@ fn known(tools: &[Tool], name: &str) -> bool {
 pub struct HermesParser(Core);
 
 impl HermesParser {
-    pub fn new(tools: &[Tool]) -> Self {
-        Self(Core::new(parse_hermes, tools))
+    pub fn new(tools: &[Tool], call_undeclared: bool) -> Self {
+        Self(Core::new(parse_hermes, tools, call_undeclared))
     }
 }
 
-fn parse_hermes(body: &str, tools: &[Tool]) -> Option<(String, String)> {
+fn parse_hermes(body: &str, tools: &[Tool], call_undeclared: bool) -> Option<(String, String)> {
     let Value::Object(obj) = serde_json::from_str(body.trim()).ok()? else {
         return None;
     };
     let name = obj.get("name")?.as_str()?.to_string();
-    if !known(tools, &name) {
+    if name.is_empty() || (!known(tools, &name) && !call_undeclared) {
         return None;
     }
     let arguments = match obj.get("arguments") {
@@ -193,8 +205,8 @@ fn parse_hermes(body: &str, tools: &[Tool]) -> Option<(String, String)> {
 pub struct Qwen3CoderParser(Core);
 
 impl Qwen3CoderParser {
-    pub fn new(tools: &[Tool]) -> Self {
-        Self(Core::new(parse_qwen3_coder, tools))
+    pub fn new(tools: &[Tool], call_undeclared: bool) -> Self {
+        Self(Core::new(parse_qwen3_coder, tools, call_undeclared))
     }
 }
 
@@ -213,11 +225,18 @@ fn escape_pointer(key: &str) -> String {
     key.replace('~', "~0").replace('/', "~1")
 }
 
-fn parse_qwen3_coder(body: &str, tools: &[Tool]) -> Option<(String, String)> {
+fn parse_qwen3_coder(
+    body: &str,
+    tools: &[Tool],
+    call_undeclared: bool,
+) -> Option<(String, String)> {
     let mut rest = body.trim().strip_prefix("<function=")?;
     let end = rest.find('>')?;
     let name = rest[..end].trim().to_string();
-    let tool = tools.iter().find(|t| t.name == name)?;
+    let tool = tools.iter().find(|t| t.name == name);
+    if tool.is_none() && !(call_undeclared && !name.is_empty()) {
+        return None;
+    }
     rest = &rest[end + 1..];
     let mut args = Map::new();
     loop {
@@ -232,7 +251,7 @@ fn parse_qwen3_coder(body: &str, tools: &[Tool]) -> Option<(String, String)> {
         let raw = &after[..close];
         let raw = raw.strip_prefix('\n').unwrap_or(raw);
         let raw = raw.strip_suffix('\n').unwrap_or(raw);
-        let value = if is_string_param(tool, &key) {
+        let value = if tool.is_some_and(|t| is_string_param(t, &key)) {
             Value::String(raw.to_string())
         } else {
             serde_json::from_str(raw.trim()).unwrap_or_else(|_| Value::String(raw.to_string()))
@@ -333,10 +352,40 @@ mod tests {
     }
 
     fn hermes() -> HermesParser {
-        HermesParser::new(&tools())
+        HermesParser::new(&tools(), false)
     }
     fn coder() -> Qwen3CoderParser {
-        Qwen3CoderParser::new(&tools())
+        Qwen3CoderParser::new(&tools(), false)
+    }
+
+    #[test]
+    fn coder_undeclared_name_follows_the_policy() {
+        const FN: &str = "<function=";
+        const PAR: &str = "<parameter=";
+        const PEND: &str = "</parameter>";
+        const FEND: &str = "</function>";
+        let body = format!("{OPEN}{FN}unlisted>\n{PAR}cmd>\nls -la\n{PEND}\n{FEND}{CLOSE}");
+        let (events, had) = run(Qwen3CoderParser::new(&tools(), false), &[&body]);
+        assert!(!had, "text mode must not report a call");
+        assert_eq!(events, vec![text(&body)]);
+
+        let (events, had) = run(Qwen3CoderParser::new(&tools(), true), &[&body]);
+        assert!(had, "call mode hands the call to the client");
+        assert_eq!(events, vec![call("unlisted", "{\"cmd\":\"ls -la\"}")]);
+    }
+
+    #[test]
+    fn hermes_undeclared_name_follows_the_policy() {
+        let json = r#"{"name": "unlisted", "arguments": {"x": 1}}"#;
+        let body = format!("{OPEN}{json}{CLOSE}");
+        assert_eq!(
+            run(HermesParser::new(&tools(), false), &[&body]).0,
+            vec![text(&body)]
+        );
+        assert_eq!(
+            run(HermesParser::new(&tools(), true), &[&body]).0,
+            vec![call("unlisted", "{\"x\":1}")]
+        );
     }
 
     /// Runs `input` split at every char boundary and byte by byte; all must equal `expected`.

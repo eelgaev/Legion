@@ -13,7 +13,7 @@ fn tools() -> Vec<Tool> {
 }
 
 fn args(body: &str) -> Option<Value> {
-    parse_gemma4(body, &tools()).map(|(_, a)| serde_json::from_str(&a).unwrap())
+    parse_gemma4(body, &tools(), false).map(|(_, a)| serde_json::from_str(&a).unwrap())
 }
 
 #[test]
@@ -48,7 +48,7 @@ fn streams_calls_out_of_text() {
         if !text.is_char_boundary(cut) {
             continue;
         }
-        let mut p = Gemma4Parser::new(&tools());
+        let mut p = Gemma4Parser::new(&tools(), false);
         let mut events = p.push(&text[..cut]);
         events.extend(p.push(&text[cut..]));
         events.extend(p.finish());

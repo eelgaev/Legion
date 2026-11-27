@@ -467,6 +467,17 @@ pub fn kv_vmm_remap(
         rt(unsafe { cudaDeviceSynchronize() }, "cudaDeviceSynchronize")?;
     }
     let device = b.device;
+    // New pieces are new allocations: the lent slots' VRAM waiting for a step buffer makes way
+    // for them first.
+    let need: usize = b
+        .maps
+        .iter()
+        .filter(|p| ours(p) && !matches!(p.back, Back::Vram(_)))
+        .map(|p| p.n)
+        .sum();
+    if need > 0 {
+        super::lent_pool::make_raw(device, need);
+    }
     // Whether a piece of `n` bytes may take VRAM (always without a fallback or a reserve: it
     // goes to host memory only once VRAM fails it).
     let room = |n: usize| match host_below {

@@ -542,6 +542,15 @@ as before strict was enforced, with a warning in the log. Gemma 4's tool-call fo
 whose vocabulary has no `<tool_call>` / `</tool_call>` tokens, are not constrained (`strict` is then
 accepted and ignored). `response_format` takes precedence over strict tools in the same request.
 
+**Names the request did not declare.** A call whose markup is complete but whose name is not one of
+the request's `tools` belongs to the reply's text by default (`--undeclared-tool-calls text`), like
+any other block that does not parse. `--undeclared-tool-calls call` hands it to the client as a tool
+call instead, so a client sees an unknown tool it can report rather than call markup leaked into the
+conversation: the name reaches the tool channel, and the arguments are read exactly as above. A call
+naming a declared tool is identical in both modes, as is a request with a `response_format` (which
+never runs a tool parser). Where strict calls are constrained, `call` also widens the grammar to
+accept a free name, which is why the behaviour is opt in.
+
 GPU throughput of constrained requests (for example 32 concurrent JSON schema requests against the
 same batch unconstrained) has not been measured yet.
 

@@ -16,17 +16,23 @@ const QUOTE: &str = "<|\"|>";
 pub struct Gemma4Parser(pub(super) Core);
 
 impl Gemma4Parser {
-    pub fn new(tools: &[Tool]) -> Self {
-        Self(Core::with_tags(parse_gemma4, tools, OPEN, CLOSE))
+    pub fn new(tools: &[Tool], call_undeclared: bool) -> Self {
+        Self(Core::with_tags(
+            parse_gemma4,
+            tools,
+            call_undeclared,
+            OPEN,
+            CLOSE,
+        ))
     }
 }
 
 /// `call:NAME{...}` into `(name, arguments json)`.
-fn parse_gemma4(body: &str, tools: &[Tool]) -> Option<(String, String)> {
+fn parse_gemma4(body: &str, tools: &[Tool], call_undeclared: bool) -> Option<(String, String)> {
     let rest = body.trim().strip_prefix("call:")?;
     let brace = rest.find('{')?;
     let name = rest[..brace].trim().to_string();
-    if !known(tools, &name) {
+    if name.is_empty() || (!known(tools, &name) && !call_undeclared) {
         return None;
     }
     let mut s = &rest[brace..];

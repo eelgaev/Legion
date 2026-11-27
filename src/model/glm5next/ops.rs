@@ -1036,7 +1036,25 @@ pub fn linear_set<'a>(
     ctx: &'a Context,
     set: &[(Tensor<'a>, Tensor<'a>, SetEpi<'a>)],
 ) -> Vec<Tensor<'a>> {
-    linear_set_with(ctx, set, 0)
+    linear_set_with(ctx, set, small_mv_param())
+}
+
+/// [`linear_set`] with [`small_mv`]'s default bits, whatever `LEGION_DEBUG_GLM_SMALL_MV` says:
+/// for other models' sets (Inkling-2, #1221), which GLM's A/B knob must not reach.
+pub fn linear_set_default<'a>(
+    ctx: &'a Context,
+    set: &[(Tensor<'a>, Tensor<'a>, SetEpi<'a>)],
+) -> Vec<Tensor<'a>> {
+    linear_set_with(ctx, set, small_mv_default())
+}
+
+/// [`small_mv`]'s default bits on this GPU, whatever `LEGION_DEBUG_GLM_SMALL_MV` says.
+fn small_mv_default() -> i32 {
+    if GB10_GEMV.load(Ordering::Relaxed) {
+        SMALL_MV_DEFAULT as i32
+    } else {
+        0
+    }
 }
 
 /// How [`linear_set_deep`] lays Q8_0 rows over a warp (#1221 r10): `rows` 1 or 2 rows a warp,
@@ -1072,7 +1090,7 @@ pub fn linear_set_deep<'a>(
         } else {
             0
         };
-    linear_set_with(ctx, set, bits)
+    linear_set_with(ctx, set, small_mv_default() | bits)
 }
 
 /// The CUDA node's params[6] bits of [`linear_set_deep`] (above [`small_mv`]'s bits): on, two
@@ -1095,10 +1113,11 @@ fn leaf_data(t: Tensor<'_>) -> bool {
     }
 }
 
+/// [`linear_set`] with `small` as the node's [`small_mv`] bits.
 fn linear_set_with<'a>(
     ctx: &'a Context,
     set: &[(Tensor<'a>, Tensor<'a>, SetEpi<'a>)],
-    deep: i32,
+    small: i32,
 ) -> Vec<Tensor<'a>> {
     assert!(
         (1..=SET_MAX).contains(&set.len()),
@@ -1112,15 +1131,7 @@ fn linear_set_with<'a>(
         "glm_linear_set: Q8_0 or BF16 (plain), up to 8 tokens"
     );
     let mut args = Vec::new();
-    let mut params = [
-        set.len() as i32,
-        0,
-        0,
-        0,
-        0,
-        n as i32,
-        small_mv_param() | deep,
-    ];
+    let mut params = [set.len() as i32, 0, 0, 0, 0, n as i32, small];
     let mut gate = None;
     for (g, &(w, x, epi)) in set.iter().enumerate() {
         assert_eq!(x.ne()[0], w.ne()[0], "glm_linear_set: x rows");

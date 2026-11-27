@@ -223,7 +223,10 @@ pub use swap_pace::{
     swap_pace_queue,
 };
 mod spill;
-pub use spill::{spill_devices, spill_type, spill_type_keeping};
+pub use spill::{is_lent_type, lent_type, spill_devices, spill_type, spill_type_keeping};
+mod lent_pool;
+pub use lent_pool::close_all as lent_pool_close;
+pub(crate) use lent_pool::{flush as lent_pool_flush, put as lent_pool_put};
 
 thread_local! {
     static LAST_ERROR: RefCell<String> = const { RefCell::new(String::new()) };
@@ -1301,7 +1304,8 @@ pub unsafe fn copy_now(dst: usize, src: usize, bytes: usize) -> Result<(), Strin
     }
 }
 
-/// `(free, total)` VRAM of `device`, as the driver reports it.
+/// `(free, total)` VRAM of `device`, as the driver reports it, with the lent slots' VRAM
+/// waiting for its next taker ([`lent_pool`]) counted free.
 pub fn vram(device: usize) -> Result<(usize, usize), String> {
     use_device(device)?;
     let (mut free, mut total) = (0usize, 0usize);
@@ -1310,11 +1314,16 @@ pub fn vram(device: usize) -> Result<(usize, usize), String> {
         unsafe { cudaMemGetInfo(&mut free, &mut total) },
         "cudaMemGetInfo",
     )?;
-    Ok((free, total))
+    Ok((free + lent_pool::bytes(device), total))
+}
+
+/// Free VRAM on `device`, as [`vram`] counts it.
+pub fn free_vram(device: usize) -> Result<usize, String> {
+    Ok(raw_free_vram(device)? + lent_pool::bytes(device))
 }
 
 /// Free VRAM on `device`, as the driver reports it.
-pub fn free_vram(device: usize) -> Result<usize, String> {
+fn raw_free_vram(device: usize) -> Result<usize, String> {
     use_device(device)?;
     let (mut free, mut total) = (0usize, 0usize);
     // SAFETY: two out-parameters.
@@ -1573,7 +1582,8 @@ fn reback_buffer(b: *mut TieredBuffer, cut: usize) -> Result<(), String> {
     }
 }
 
-/// A new allocation of `n` bytes of `device`, mapped at `at` and accessible to the device.
+/// A new allocation of `n` bytes of `device` (a lent slot's of that size, if one waits in
+/// [`lent_pool`]), mapped at `at` and accessible to the device.
 ///
 /// # Safety
 /// `at..at + n` must be reserved and unmapped.
@@ -1586,12 +1596,14 @@ unsafe fn map_fresh(
     let mut h: CUmemGenericAllocationHandle = 0;
     // SAFETY: creates an allocation and maps it into the caller's reserved range.
     unsafe {
-        cu(
-            timed("cuMemCreate", device, n, || {
-                cuMemCreate(&mut h, n, &prop, 0)
-            }),
-            "cuMemCreate(VRAM slots)",
-        )?;
+        if let Some(lent) = lent_pool::take_exact(device, n) {
+            h = lent;
+        } else {
+            cu(
+                lent_pool::create(device, &mut h, n, &prop),
+                "cuMemCreate(VRAM slots)",
+            )?;
+        }
         if let Err(e) = cu(
             timed("cuMemMap", device, n, || cuMemMap(at, n, 0, h, 0)),
             "cuMemMap(VRAM slots)",
@@ -2643,11 +2655,10 @@ impl DeviceMem {
             let size = want - me.size;
             let prop = alloc_prop(CU_MEM_LOCATION_TYPE_DEVICE, device as i32);
             let mut handle = 0;
-            // SAFETY: creates an allocation.
+            // SAFETY: creates an allocation; pooled lent VRAM is released first when the
+            // driver is short of it.
             cu(
-                timed("cuMemCreate", device, size, || unsafe {
-                    cuMemCreate(&mut handle, size, &prop, 0)
-                }),
+                unsafe { lent_pool::create(device, &mut handle, size, &prop) },
                 "cuMemCreate(staging)",
             )?;
             me.parts.push((handle, size));
@@ -2674,6 +2685,11 @@ impl DeviceMem {
 
     pub fn size(&self) -> usize {
         self.size
+    }
+
+    /// Its allocations, with their sizes, no longer released when it is dropped.
+    fn into_parts(mut self) -> Vec<(CUmemGenericAllocationHandle, usize)> {
+        std::mem::take(&mut self.parts)
     }
 
     /// Its allocations, with their sizes.

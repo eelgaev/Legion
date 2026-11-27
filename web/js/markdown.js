@@ -416,7 +416,18 @@ export function initMarkdown(root) {
     const code = button.closest(".code-block")?.querySelector("code");
     if (!code) return;
     try {
-      await navigator.clipboard.writeText(code.textContent);
+      if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(code.textContent);
+      else {
+        const ta = document.createElement("textarea");
+        ta.value = code.textContent;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        const ok = document.execCommand("copy");
+        ta.remove();
+        if (!ok) throw new Error("copy failed");
+      }
       button.textContent = "Copied";
     } catch {
       button.textContent = "Failed";

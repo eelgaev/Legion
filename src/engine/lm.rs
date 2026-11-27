@@ -1223,6 +1223,9 @@ pub struct LmConfig {
     pub ring_checkpoint_span: usize,
     /// Log why a prompt resumed nothing from the warm sequences.
     pub ring_checkpoint_log: bool,
+    /// `--undeclared-tool-calls call`: a well-formed call naming a tool the request did not
+    /// declare is handed to the client instead of being left in the reply's text.
+    pub undeclared_tool_calls: bool,
     /// `--deterministic`'s admission in waves ([`waves`]): an idle engine gathers requests
     /// until none arrived for this long, admits them in a fixed order, and holds later ones
     /// until it is idle again. `None`: admit requests as they arrive.
@@ -1681,6 +1684,7 @@ impl LmConfig {
             ring_checkpoint_every: RING_CHECKPOINT_EVERY,
             ring_checkpoint_span: RING_CHECKPOINT_SPAN,
             ring_checkpoint_log: false,
+            undeclared_tool_calls: false,
             deterministic_gather: None,
             admit_gather: None,
             prefix_capture_cut: false,
@@ -1785,6 +1789,8 @@ pub struct LmEngine {
     template: Option<ChatTemplate>,
     chat_format: ChatFormat,
     grammars: Mutex<GrammarCache>,
+    /// `--undeclared-tool-calls call` (the strict-call grammar and the reply's parser).
+    undeclared_tool_calls: bool,
     ctx_size: usize,
     /// The KV pool's blocks and the drafts per verify step, as the worker's admission counts
     /// them ([`kv_fit`]): a request that can never fit is refused before it queues.
@@ -6263,6 +6269,7 @@ impl LmEngine {
             ring_ckpt_every: cfg.ring_checkpoint_every,
             ring_ckpt_span: cfg.ring_checkpoint_span,
             ring_ckpts_log: cfg.ring_checkpoint_log,
+            call_undeclared: cfg.undeclared_tool_calls,
             saved: SavedStates::new(saved_slots),
             prefix_interval: cfg.prefix_cache_interval,
             gather: cfg.deterministic_gather,
@@ -6353,6 +6360,7 @@ impl LmEngine {
             template,
             chat_format,
             grammars: Mutex::new(GrammarCache::default()),
+            undeclared_tool_calls: cfg.undeclared_tool_calls,
             ctx_size: cfg.ctx_size,
             kv_blocks,
             spec_k,
@@ -6724,6 +6732,8 @@ struct Worker {
     ring_ckpt_span: usize,
     /// `--ring-checkpoint-log`.
     ring_ckpts_log: bool,
+    /// [`LmConfig::undeclared_tool_calls`].
+    call_undeclared: bool,
     /// MTP drafting without `--spec-fixed`: the depth policy's measured costs
     /// ([`crate::spec::depth`]).
     depth: Option<crate::spec::depth::DepthModel>,
@@ -7240,6 +7250,7 @@ impl Worker {
                 &self.masks,
                 &mut self.outbox,
                 self.next_id,
+                self.call_undeclared,
             ),
             blocks: table.blocks().iter().map(|b| b.0).collect(),
             table,
@@ -9734,6 +9745,7 @@ impl<'t> Active<'t> {
         masks: &Arc<MaskPool>,
         outbox: &mut stream::Outbox,
         id: SeqId,
+        call_undeclared: bool,
     ) -> Self {
         let constraint = match (&job.grammar, &job.tool_grammar, chat_format.strict_tools()) {
             (Some(g), _, _) => Some(Constraint::format(g, masks)),
@@ -9746,7 +9758,7 @@ impl<'t> Active<'t> {
                 .reasoning
                 .map(|inside| chat_format.reasoning_parser(inside)),
             tools: (job.grammar.is_none() && (!job.tools.is_empty() || chat_format.framed()))
-                .then(|| chat_format.tool_parser(&job.tools)),
+                .then(|| chat_format.tool_parser(&job.tools, call_undeclared)),
             stop: StopMatcher::new(job.stop.clone()),
             logprobs: job.sampling.logprobs,
             // The markup only goes where a parser takes it out again.

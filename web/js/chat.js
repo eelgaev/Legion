@@ -331,7 +331,7 @@ async function regenerate(m) {
 
 async function copyMessage(m, button) {
   try {
-    await navigator.clipboard.writeText(m.content); // raw markdown, as stored
+    await copyFallback(m.content); // raw markdown, as stored
     button.textContent = "Copied";
   } catch {
     button.textContent = "Failed";
@@ -339,6 +339,21 @@ async function copyMessage(m, button) {
   setTimeout(() => {
     if (button.isConnected) button.textContent = "Copy";
   }, 1500);
+}
+
+// navigator.clipboard is only exposed in secure contexts; on a plain-http LAN
+// address fall back to the old execCommand path (Safari needs the textarea in the DOM).
+async function copyFallback(text) {
+  if (navigator.clipboard?.writeText) return navigator.clipboard.writeText(text);
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  const ok = document.execCommand("copy");
+  ta.remove();
+  if (!ok) throw new Error("copy failed");
 }
 
 async function deleteMessage(m) {
