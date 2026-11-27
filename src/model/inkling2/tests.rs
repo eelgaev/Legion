@@ -2038,11 +2038,12 @@ fn cuda_mix_rms_keeps_the_bits() {
     mix_rms_keeps_the_bits(&mut gpu_backend());
 }
 
-/// `LEGION_DEBUG_INK_FUSE10`: a mask of the four, all of them unset or unparsed.
+/// `LEGION_DEBUG_INK_FUSE10`: a mask of the four, none of them unset or unparsed.
 #[test]
 fn fuse10_masks() {
-    assert_eq!(fuse10_of(None), FUSE_ALL);
-    assert_eq!(fuse10_of(Some("x")), FUSE_ALL);
+    assert_eq!(fuse10_of(None), 0);
+    assert_eq!(fuse10_of(Some("x")), 0);
+    assert_eq!(fuse10_of(Some("15")), FUSE_ALL);
     assert_eq!(fuse10_of(Some("0")), 0);
     assert_eq!(fuse10_of(Some(" 5 ")), FUSE_CTRL | FUSE_MIX_RMS);
     assert_eq!(fuse10_of(Some("18")), FUSE_ROUTER);
@@ -2053,8 +2054,8 @@ fn fuse10_masks() {
 #[test]
 fn q8_deep_layouts() {
     let d = |rows, loads| Some(glm_ops::DeepQ8 { rows, loads });
-    assert_eq!(q8_deep_of(None), d(2, 2));
-    assert_eq!(q8_deep_of(Some("x")), d(2, 2));
+    assert_eq!(q8_deep_of(None), None);
+    assert_eq!(q8_deep_of(Some("x")), None);
     assert_eq!(q8_deep_of(Some(" 0 ")), None);
     assert_eq!(q8_deep_of(Some("r1u2")), d(1, 2));
     assert_eq!(q8_deep_of(Some("r1u4")), d(1, 4));

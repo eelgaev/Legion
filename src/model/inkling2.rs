@@ -130,37 +130,37 @@ const FUSE_MIX_RMS: u32 = 4;
 const FUSE_MIX: u32 = 8;
 const FUSE_ALL: u32 = FUSE_CTRL | FUSE_ROUTER | FUSE_MIX_RMS | FUSE_MIX;
 
-/// The round 10 fusions on: all of them unless `LEGION_DEBUG_INK_FUSE10=<mask>` takes others
-/// for A/B runs (0: as round 9).
+/// The round 10 fusions on: none (round 9's nodes) unless `LEGION_DEBUG_INK_FUSE10=<mask>`
+/// takes some for A/B runs (all of them lost ~3% of GGUF decode on a GB10).
 fn fuse10() -> u32 {
     static FLAGS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *FLAGS.get_or_init(|| fuse10_of(std::env::var("LEGION_DEBUG_INK_FUSE10").ok().as_deref()))
 }
 
-/// [`fuse10`]'s mask from the variable's value: unset or unparsed, all of them.
+/// [`fuse10`]'s mask from the variable's value: unset or unparsed, none.
 fn fuse10_of(v: Option<&str>) -> u32 {
     v.and_then(|v| v.trim().parse::<u32>().ok())
-        .map_or(FUSE_ALL, |m| m & FUSE_ALL)
+        .map_or(0, |m| m & FUSE_ALL)
 }
 
 /// The Q8_0 attention sets', lone products' and head's warp layout on CUDA's deeper-load set
-/// kernel (#1221 r10, [`glm_ops::linear_set_deep`]): two rows a warp and two loads a lane unless
-/// `LEGION_DEBUG_INK_Q8_DEEP` names another (`r1u2`, `r1u4`, `r2u2`, `r2u4`) or is `0` (round
-/// 9's linear_set_q8 sets and linear_mv_q8 products). The same bits either way.
+/// kernel (#1221 r10, [`glm_ops::linear_set_deep`]): none (round 9's linear_set_q8 sets and
+/// linear_mv_q8 products) unless `LEGION_DEBUG_INK_Q8_DEEP` names one for A/B runs (`r1u2`,
+/// `r1u4`, `r2u2`, `r2u4`: within noise on a GB10). The same bits either way.
 fn q8_deep() -> Option<glm_ops::DeepQ8> {
     static DEEP: std::sync::OnceLock<Option<glm_ops::DeepQ8>> = std::sync::OnceLock::new();
     *DEEP.get_or_init(|| q8_deep_of(std::env::var("LEGION_DEBUG_INK_Q8_DEEP").ok().as_deref()))
 }
 
-/// [`q8_deep`]'s layout from the variable's value: unset or not a name, `r2u2`.
+/// [`q8_deep`]'s layout from the variable's value: unset, `0` or not a name, none.
 fn q8_deep_of(v: Option<&str>) -> Option<glm_ops::DeepQ8> {
     let deep = |rows, loads| Some(glm_ops::DeepQ8 { rows, loads });
     match v.map(str::trim) {
-        Some("0") => None,
         Some("r1u2") => deep(1, 2),
         Some("r1u4") => deep(1, 4),
+        Some("r2u2") => deep(2, 2),
         Some("r2u4") => deep(2, 4),
-        _ => deep(2, 2),
+        _ => None,
     }
 }
 
@@ -593,8 +593,8 @@ impl Arch for Ink2Params {
     /// the same index as `argmax` (the first of the largest) for NaN-free logits. The soft cap
     /// passes a NaN through (`tanh(NaN)` is NaN), so that rests on the output projection.
     /// The projection reads only the unpadded vocabulary's rows (#1221 r9: the padding's
-    /// logits were cut anyway), a Q8_0 head at decode steps on the deeper-load set kernel
-    /// ([`glm_ops::linear_set_deep`], [`q8_deep`]; r10): the same bits.
+    /// logits were cut anyway), a Q8_0 head at decode steps on the deeper-load set kernel when
+    /// an A/B run picks one ([`glm_ops::linear_set_deep`], [`q8_deep`]; r10): the same bits.
     fn head<'a>(
         &self,
         m: &'a Model,
@@ -744,9 +744,9 @@ impl Model {
     /// them, Q8_0 weights without a scale over up to 8 tokens (decode steps; #1221 r6) or BF16
     /// ones (the NVFP4 checkpoint's) on the GB10 kernels, at one token (linear_mv_bf16's sums,
     /// [`glm_ops::linear_set_bf16_takes`]; r7) and at 2-8 (linear_mv_bf16x's; r9), unless `own`
-    /// (traced runs keep a node a product); else a node each. Q8_0 sets run CUDA's deeper-load
-    /// kernel ([`glm_ops::linear_set_deep`], [`q8_deep`]; r10), and then a single Q8_0 product
-    /// (`N` 1) takes it too.
+    /// (traced runs keep a node a product); else a node each. When an A/B run picks it, Q8_0
+    /// sets run CUDA's deeper-load kernel ([`glm_ops::linear_set_deep`], [`q8_deep`]; r10), and
+    /// then a single Q8_0 product (`N` 1) takes it too.
     fn ink_mm_set<'a, const N: usize>(
         &'a self,
         ctx: &'a Context,
