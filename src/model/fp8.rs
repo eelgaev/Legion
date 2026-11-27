@@ -394,6 +394,30 @@ fn a8_dynamic<'a>(
     wscale: Option<Tensor<'a>>,
     res: Option<Tensor<'a>>,
 ) -> Tensor<'a> {
+    let m = a8_dynamic_check(w, xq, x_ne, wscale);
+    let [_, n1, n2, n3] = x_ne;
+    let mut args = vec![w, xq];
+    args.extend(wscale);
+    let mut res_at = 0;
+    if let Some(r) = res {
+        assert!(
+            r.ty() == types::F32 && r.is_contiguous() && r.ne() == [m, n1, n2, n3],
+            "an FP8 matmul residual is contiguous F32 of the output's shape"
+        );
+        res_at = args.len() as i32;
+        args.push(r);
+    }
+    ctx.external_with(&FP8_MM8, types::F32, [m, n1, n2, n3], &args, &[1, res_at])
+}
+
+/// Checks [`a8_dynamic`]'s inputs (`xq` the packed activations of an `x` of shape `x_ne`);
+/// the weight's rows `m`.
+fn a8_dynamic_check(
+    w: Tensor<'_>,
+    xq: Tensor<'_>,
+    x_ne: [i64; 4],
+    wscale: Option<Tensor<'_>>,
+) -> i64 {
     assert_eq!(w.ty(), types::I8);
     assert_eq!(xq.ty(), types::I8);
     let [k, m, _, _] = w.ne();
@@ -413,18 +437,7 @@ fn a8_dynamic<'a>(
             "an FP8 weight scale is F32, one value or one per row ({m})"
         );
     }
-    let mut args = vec![w, xq];
-    args.extend(wscale);
-    let mut res_at = 0;
-    if let Some(r) = res {
-        assert!(
-            r.ty() == types::F32 && r.is_contiguous() && r.ne() == [m, n1, n2, n3],
-            "an FP8 matmul residual is contiguous F32 of the output's shape"
-        );
-        res_at = args.len() as i32;
-        args.push(r);
-    }
-    ctx.external_with(&FP8_MM8, types::F32, [m, n1, n2, n3], &args, &[1, res_at])
+    m
 }
 
 /// The [`Context::shared_node`] key of an activation's [`quantize_dynamic`] (or of the op that
@@ -455,6 +468,70 @@ pub fn mul_mat_dynamic_add<'a>(
 ) -> Tensor<'a> {
     let xq = ctx.shared_node(x, DYNAMIC_KEY, || quantize_dynamic(ctx, x));
     mul_mat_a8_dynamic_add(ctx, w, xq, x.ne(), wscale, res)
+}
+
+/// The [`FP8_MM8`] parameters of a node made by [`mul_mat_a8_dynamic_cols`] (#1133): the
+/// token of its packed activations that its column 0 reads, and how many tokens they hold
+/// (0, as in every other node: the node's own columns).
+const P_X_FIRST: usize = 4;
+const P_X_TOKENS: usize = 5;
+
+/// The first token and the tokens of the packed activations an [`FP8_MM8`] node of `cols`
+/// columns reads ([`P_X_FIRST`], [`P_X_TOKENS`]): `(0, cols)` but for a node of
+/// [`mul_mat_a8_dynamic_cols`].
+fn x_tokens(dst: &ffi::ggml_tensor, cols: i64) -> (i64, i64) {
+    let p = crate::ggml::external_params(dst);
+    match p[P_X_TOKENS] {
+        0 => (0, cols),
+        n => (p[P_X_FIRST] as i64, n as i64),
+    }
+}
+
+/// [`mul_mat_dynamic`] of tokens `first..first + count` of `x` (F32 `[k, n]`) only: F32 `[m,
+/// count]`, from `x`'s packed activations for all its tokens (the op the model gave `x`, see
+/// [`crate::model::fp8_act`], or one [`quantize_dynamic`] of the whole of `x`, shared with
+/// its other matmuls) read in place from token `first` on (#1133: a step's projection per
+/// half of its tokens). Column `j` has the bits of the whole matmul's column `first + j`: each
+/// is its own token's codes and scale times the weight, summed in one k order whatever the
+/// other columns (the GEMMs' tiles all give the same bits; [`launch_cols`] runs column ranges
+/// of a node the same way).
+pub fn mul_mat_dynamic_cols<'a>(
+    ctx: &'a Context,
+    w: Tensor<'a>,
+    x: Tensor<'a>,
+    wscale: Option<Tensor<'a>>,
+    (first, count): (i64, i64),
+) -> Tensor<'a> {
+    let [k, n, n2, n3] = x.ne();
+    assert_eq!([n2, n3], [1, 1], "mul_mat_dynamic_cols: a 2-D x");
+    let xq = ctx.shared_node(x, DYNAMIC_KEY, || quantize_dynamic(ctx, x));
+    mul_mat_a8_dynamic_cols(ctx, w, xq, [k, n], (first, count), wscale)
+}
+
+/// [`mul_mat_a8_dynamic`] of tokens `first..first + count` of the packed activations `xq` of
+/// an `x` of `x_ne` (`[k, n]`): F32 `[m, count]` ([`mul_mat_dynamic_cols`]).
+pub fn mul_mat_a8_dynamic_cols<'a>(
+    ctx: &'a Context,
+    w: Tensor<'a>,
+    xq: Tensor<'a>,
+    x_ne: [i64; 2],
+    (first, count): (i64, i64),
+    wscale: Option<Tensor<'a>>,
+) -> Tensor<'a> {
+    let [k, n] = x_ne;
+    assert!(
+        first >= 0 && count > 0 && first + count <= n && n <= i32::MAX as i64,
+        "mul_mat_a8_dynamic_cols: tokens {first}..{} of {n}",
+        first + count
+    );
+    let m = a8_dynamic_check(w, xq, [k, n, 1, 1], wscale);
+    let mut args = vec![w, xq];
+    args.extend(wscale);
+    let mut params = [0; P_X_TOKENS + 1];
+    params[0] = 1;
+    params[P_X_FIRST] = first as i32;
+    params[P_X_TOKENS] = n as i32;
+    ctx.external_with(&FP8_MM8, types::F32, [m, count, 1, 1], &args, &params)
 }
 
 /// Whether the current GPU multiplies E4M3 on tensor cores (sm_89+), where the W8A8 GEMMs run.
@@ -539,14 +616,17 @@ unsafe fn cpu_fp8_mm8(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
         let (w, x) = (&*dst.src[0], &*dst.src[1]);
         let (k, m) = (w.ne[0] as usize, w.ne[1] as usize);
         let n = (dst.ne[1] * dst.ne[2] * dst.ne[3]) as usize;
+        // A node of some tokens of larger packed activations ([`mul_mat_a8_dynamic_cols`]).
+        let (x0, xn) = x_tokens(dst, n as i64);
+        let (x0, xn) = (x0 as usize, xn as usize);
         let lut: [f32; 256] = std::array::from_fn(|b| e4m3_to_f32(b as u8));
         let wb = std::slice::from_raw_parts(w.data as *const u8, k * m);
-        let xb = std::slice::from_raw_parts(x.data as *const u8, k * n);
+        let xb = std::slice::from_raw_parts((x.data as *const u8).add(x0 * k), k * n);
         // Static: one input scale times the per-tensor weight scale for every element.
         // Dynamic: the token's scale times the row's weight scale.
         let (static_scale, token_scales) = if dynamic {
-            let (codes, _) = dynamic_layout(k as i64, n as i64);
-            let s = (x.data as *const u8).add(codes) as *const f32;
+            let (codes, _) = dynamic_layout(k as i64, xn as i64);
+            let s = ((x.data as *const u8).add(codes) as *const f32).add(x0);
             let ts: Vec<f32> = (0..n).map(|t| s.add(t).read_unaligned()).collect();
             (0.0, ts)
         } else {
@@ -1120,7 +1200,11 @@ pub(crate) unsafe fn conv_gemm(t: *const ffi::ggml_tensor) -> bool {
     // SAFETY: the caller's.
     unsafe {
         let p = crate::ggml::external_params(&*t);
-        sendable(t) && p[0] == 1 && p[P_BY_EXCHANGE] == 0 && !(*t).src[1].is_null()
+        sendable(t)
+            && p[0] == 1
+            && p[P_BY_EXCHANGE] == 0
+            && p[P_X_TOKENS] == 0
+            && !(*t).src[1].is_null()
     }
 }
 
@@ -1213,6 +1297,9 @@ unsafe fn mm8_params(
         Some((a, c)) if res_at == 0 && (a + c) as i64 <= all => (a as i64, c as i64),
         Some(_) => return Err("fp8_mm8: columns past the node's, or with a residual".into()),
     };
+    // A node of some tokens of larger packed activations ([`mul_mat_a8_dynamic_cols`]): its
+    // column 0 is their token `x0` of `xn`.
+    let (x0, xn) = x_tokens(dst, all);
     // SAFETY: a node made by `mul_mat_a8` (src: w, xq, the input scale, the weight's
     // per-tensor scale or nothing) or `mul_mat_a8_dynamic` (src: w, the packed codes and token
     // scales, the weight's scale or nothing, then the residual at `res_at` or nothing), device
@@ -1222,16 +1309,16 @@ unsafe fn mm8_params(
         let (w, x) = (&*dst.src[0], &*dst.src[1]);
         let (k, m) = (w.ne[0], w.ne[1]);
         let (scale, ws) = if dynamic {
-            let (codes, _) = dynamic_layout(k, all);
+            let (codes, _) = dynamic_layout(k, xn);
             let s = (x.data as *const u8).add(codes) as *const f32;
-            (s.add(c0 as usize), 2)
+            (s.add((x0 + c0) as usize), 2)
         } else {
             ((*dst.src[2]).data as *const f32, 3)
         };
         let has_ws = ws != res_at as usize && !dst.src[ws].is_null();
         LaunchParams8 {
             w: w.data as *const u8,
-            x: (x.data as *const u8).add((c0 * k) as usize),
+            x: (x.data as *const u8).add(((x0 + c0) * k) as usize),
             scale,
             dst: match out {
                 Some((o, _)) => o as *mut f32,

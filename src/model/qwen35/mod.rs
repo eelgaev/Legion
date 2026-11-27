@@ -222,7 +222,7 @@ impl Arch for Qwen35 {
             let attn = if !hp.is_recurrent(il) {
                 Mixed::Whole(m.attention(pass, il, h)?)
             } else if split.is_some() && halves::mixer_on() {
-                m.delta_net_halves(pass, il, h, n / 2)?
+                m.delta_net_halves(pass, il, h, n / 2, halves::mixer_inputs_on())?
             } else {
                 Mixed::Whole(m.delta_net(pass, il, h)?)
             };

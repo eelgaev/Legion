@@ -72,11 +72,27 @@ fn on_of(v: Option<&str>) -> bool {
 /// ([`Model::delta_net_halves`]), so that half 0's sum is on the wire while half 1's delta
 /// rule, norm and output projection run: on, the same bits as whole;
 /// `LEGION_DEBUG_QWEN35_TP_MIXER_HALVES=0` keeps the mixer whole (both halves' sums start
-/// after it). Read once.
+/// after it). Read once ([`mixer`]).
 pub(super) fn mixer_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        mixer_on_of(
+    mixer() >= 1
+}
+
+/// Whether those halves run the mixer's input projections and conv per half too
+/// ([`Model::delta_net_halves`]'s `inputs`, #1133), so half 0's delta rule and sum start
+/// before half 1's inputs are made: on, the same bits;
+/// `LEGION_DEBUG_QWEN35_TP_MIXER_HALVES=1` keeps them whole (the halves from the delta rule
+/// on only). Read once ([`mixer`]).
+pub(super) fn mixer_inputs_on() -> bool {
+    mixer() >= 2
+}
+
+/// How much of the DeltaNet mixer runs per half: `LEGION_DEBUG_QWEN35_TP_MIXER_HALVES` 0
+/// (none), 1 (the delta rule, norm and output projection) or 2 (also the input projections
+/// and conv; the default, and any other value). Read once.
+fn mixer() -> u8 {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        mixer_of(
             std::env::var("LEGION_DEBUG_QWEN35_TP_MIXER_HALVES")
                 .ok()
                 .as_deref(),
@@ -84,9 +100,13 @@ pub(super) fn mixer_on() -> bool {
     })
 }
 
-/// [`mixer_on`] for the variable's value `v`.
-fn mixer_on_of(v: Option<&str>) -> bool {
-    v.is_none_or(|s| s.trim() != "0")
+/// [`mixer`] for the variable's value `v`.
+fn mixer_of(v: Option<&str>) -> u8 {
+    match v.map(str::trim) {
+        Some("0") => 0,
+        Some("1") => 1,
+        _ => 2,
+    }
 }
 
 /// The most FFN parts a step's layers take ([`plan`]): `LEGION_DEBUG_QWEN35_TP_PARTS` (2 the
@@ -283,15 +303,16 @@ pub(super) fn tail<'a>(
             } else {
                 ctx.cont_2d(attn, attn.ne()[0], n)
             };
-            ([cols(ctx, attn, 0, n0), cols(ctx, attn, n0, n1)], None)
+            ([cols(ctx, attn, 0, n0), cols(ctx, attn, n0, n1)], [None; 2])
         }
-        Mixed::Halves { out, after } => (out, Some(after)),
+        Mixed::Halves { out, after } => (out, after),
     };
     // Half 0's start goes into the graph first, behind its own mixer half only (each start
     // right behind its projection, [`micro::send_gemm`]); half 1's mixer follows it.
     let mut mixer = [Some(start(halves[0])), Some(start(halves[1]))];
-    // The delta rule's final states into the pool, behind half 1's projection's start.
-    if let Some(t) = after {
+    // The delta rule's final states (and the conv history) into the pool, behind half 1's
+    // projection's start.
+    for t in after.into_iter().flatten() {
         add(t);
     }
     let norm_w = m.lw(il, "post_attention_norm.weight")?;

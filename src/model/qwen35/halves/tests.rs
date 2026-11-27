@@ -9,14 +9,18 @@ fn halves_are_on_unless_the_debug_variable_is_0() {
     assert_eq!(FFN, ["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"]);
 }
 
-/// The DeltaNet mixer in halves by default; `LEGION_DEBUG_QWEN35_TP_MIXER_HALVES=0` whole.
+/// The DeltaNet mixer in halves with its inputs by default; `LEGION_DEBUG_QWEN35_TP_MIXER_HALVES`
+/// `1` the halves from the delta rule on only, `0` whole.
 #[test]
-fn mixer_halves_are_on_unless_the_debug_variable_is_0() {
-    assert!(mixer_on_of(None));
-    assert!(mixer_on_of(Some("1")));
-    assert!(mixer_on_of(Some("")));
-    assert!(!mixer_on_of(Some("0")));
-    assert!(!mixer_on_of(Some(" 0 ")));
+fn mixer_halves_are_on_unless_the_debug_variable_is_0_or_1() {
+    assert_eq!(mixer_of(None), 2);
+    assert_eq!(mixer_of(Some("2")), 2);
+    assert_eq!(mixer_of(Some("")), 2);
+    assert_eq!(mixer_of(Some("x")), 2);
+    assert_eq!(mixer_of(Some("1")), 1);
+    assert_eq!(mixer_of(Some(" 1 ")), 1);
+    assert_eq!(mixer_of(Some("0")), 0);
+    assert_eq!(mixer_of(Some(" 0 ")), 0);
 }
 
 /// Four FFN parts by default; `LEGION_DEBUG_QWEN35_TP_PARTS=2` the halves, at most four.

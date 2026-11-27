@@ -460,6 +460,79 @@ fn wide_store_marks_plain_w8a8_nodes_only() {
     assert!(!mark_wide_store(ctx.mul_mat(wf, x)));
 }
 
+/// [`mul_mat_dynamic_cols`] of a run of tokens reads the whole input's one quantization (the
+/// same packed node) from that token on, and gives the whole matmul's columns, bit for bit, on
+/// the CPU (#1133: a DeltaNet layer's qkv and z per half of a step).
+#[test]
+fn dynamic_cols_are_the_whole_matmuls_columns() {
+    use crate::ggml::{Backend, ComputeAllocator};
+    let (k, m, n) = (128i64, 96i64, 77i64);
+    let mut s = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    // E4M3 codes without NaN (exponents 3 to 10), values in [-1, 1) spread over the tokens.
+    let codes: Vec<u8> = (0..k * m)
+        .map(|_| {
+            let b = next() as u8;
+            b & 0x87 | (3 + (b >> 3) % 8) << 3
+        })
+        .collect();
+    let scales: Vec<f32> = (0..m)
+        .map(|_| 0.002 + 0.001 * (next() >> 40) as f32 / (1u64 << 24) as f32)
+        .collect();
+    let xs: Vec<f32> = (0..k * n)
+        .map(|i| {
+            let v = ((next() >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0;
+            v * 10f32.powi((i / k % 5) as i32 - 2)
+        })
+        .collect();
+    let ctx = Context::new(32, 32);
+    let w = ctx.new_tensor(types::I8, &[k, m]).as_input();
+    let sc = ctx.new_tensor(types::F32, &[m]).as_input();
+    let x = ctx.new_tensor(types::F32, &[k, n]).as_input();
+    let whole = mul_mat_dynamic(&ctx, w, x, Some(sc)).as_output();
+    let runs = [(0, 40), (40, 37), (0, n), (5, 1), (76, 1)];
+    let parts: Vec<Tensor<'_>> = runs
+        .iter()
+        .map(|&r| mul_mat_dynamic_cols(&ctx, w, x, Some(sc), r).as_output())
+        .collect();
+    // SAFETY: nodes of the live context.
+    let src1 = |t: Tensor<'_>| unsafe { (*t.raw()).src[1] };
+    for (&p, &(_, count)) in parts.iter().zip(&runs) {
+        assert_eq!(p.ne(), [m, count, 1, 1]);
+        assert_eq!(src1(p), src1(whole), "the whole input's one quantization");
+    }
+    let mut graph = ctx.new_graph(32);
+    graph.expand(whole);
+    for &p in &parts {
+        graph.expand(p);
+    }
+    let mut cpu = Backend::cpu().unwrap();
+    cpu.set_threads(3);
+    ctx.alloc_graph(&graph, ComputeAllocator::new(cpu.buffer_type()))
+        .unwrap();
+    w.set_bytes(&codes);
+    sc.set_f32(&scales);
+    x.set_f32(&xs);
+    cpu.compute(&graph).unwrap();
+    let whole = whole.bytes();
+    let col = m as usize * 4;
+    assert!(whole.iter().any(|&b| b != 0));
+    for (p, &(first, count)) in parts.iter().zip(&runs) {
+        let (a, c) = (first as usize, count as usize);
+        assert_eq!(
+            p.bytes(),
+            whole[a * col..(a + c) * col],
+            "tokens {first}..{}",
+            first + count
+        );
+    }
+}
+
 /// A xorshift generator for the GPU tests' operands.
 #[cfg(feature = "cuda")]
 struct Rng(u64);

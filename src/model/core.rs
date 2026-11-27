@@ -1653,12 +1653,13 @@ pub(crate) fn concat_tree<'a>(ctx: &'a Context, mut parts: Vec<Tensor<'a>>) -> T
 #[derive(Clone, Copy)]
 pub(crate) enum Mixed<'a> {
     Whole(Tensor<'a>),
-    /// Tokens `0..n0` and `n0..n`. `after`: the copy of the final recurrent states into the
-    /// pool, for the caller to add to the graph after half 0's projection (added earlier, it
-    /// would pull half 1's delta rule ahead of it).
+    /// Tokens `0..n0` and `n0..n`. `after`: the copies of the final recurrent states (and,
+    /// where the conv ran per half too, of the conv history) into the pool, for the caller to
+    /// add to the graph after half 0's projection (added earlier, they would pull half 1's
+    /// delta rule or conv ahead of it).
     Halves {
         out: [Tensor<'a>; 2],
-        after: Tensor<'a>,
+        after: [Option<Tensor<'a>>; 2],
     },
 }
 
@@ -3632,18 +3633,193 @@ impl Model {
     /// one launch keeps in its registers there). Every token the same bits as the whole layer's:
     /// that kernel runs each token's step from the state and the token's inputs alone, and the
     /// norm and the FP8 W8A8 projection with per-token scales are per token at either batch
-    /// ([`Model::fp8_dense`]). The projections in, the conv and the gates stay whole. Where the
-    /// step does not take that kernel and that projection at the whole step and both halves
-    /// (or something else shares the layer: a prefetch, a side stream), the whole layer
-    /// ([`Mixed::Whole`]).
+    /// ([`Model::fp8_dense`]). The projections in, the conv and the gates stay whole (but see
+    /// `inputs`). Where the step does not take that kernel and that projection at the whole
+    /// step and both halves (or something else shares the layer: a prefetch, a side stream),
+    /// the whole layer ([`Mixed::Whole`]).
+    ///
+    /// `inputs`: the input projections and the conv per half too where they can
+    /// ([`Self::delta_net_in_halves`]), so half 0's delta rule and sum do not wait for half 1's
+    /// inputs.
     pub(crate) fn delta_net_halves<'a>(
         &'a self,
         pass: &Pass<'a>,
         il: usize,
         h: Tensor<'a>,
         n0: i64,
+        inputs: bool,
     ) -> Result<Mixed<'a>, ModelError> {
+        if inputs && let Some(m) = self.delta_net_in_halves(pass, il, h, n0)? {
+            return Ok(m);
+        }
         self.delta_net_split(pass, il, h, None, Some(n0))
+    }
+
+    /// [`Self::delta_net_halves`] from the input projections on (#1133): qkv and z per half
+    /// of the step's tokens from h's one set of FP8 codes ([`Self::lmm_cols`]), half 0's conv
+    /// from the pool's history and half 1's from the history half 0's ends with (its last
+    /// d_conv - 1 inputs, the same layout), the gates per half, then the delta rule, norm and
+    /// output projection per half as [`Self::delta_net_halves`] runs them. alpha and beta stay
+    /// whole (small GEMMs), as [`Self::delta_net_layer`] makes them.
+    ///
+    /// Every token the same bits as the whole layer's: the FP8 W8A8 GEMM with per-token scales
+    /// gives each token's column from its own codes and scale in one k order at every batch of
+    /// more than 64 tokens ([`Model::fp8_dense`]); the conv's output for a token is its silu dot
+    /// over its own window of inputs (and the norm of its own heads), which half 1's history
+    /// gives it unchanged; the gates are per token. `None` where the step does not take all
+    /// of it at the whole step and both halves (one prompt group of one sequence, no tap, a
+    /// dense model, `delta_prep`'s and the fused conv's paths, qkv, z and the output projection
+    /// on that GEMM, no joined or twin in-projections, [`gdn_scan`] at every size): checked
+    /// before anything is built.
+    fn delta_net_in_halves<'a>(
+        &'a self,
+        pass: &Pass<'a>,
+        il: usize,
+        h: Tensor<'a>,
+        n0: i64,
+    ) -> Result<Option<Mixed<'a>>, ModelError> {
+        let (ctx, n) = (pass.ctx, pass.n);
+        let hp = &self.hp;
+        let head_k = hp.ssm_d_state;
+        let n_k = hp.ssm_n_group;
+        let n_v = hp.ssm_dt_rank;
+        let head_v = hp.ssm_d_inner / n_v;
+        let qkv_dim = head_k * n_k * 2 + head_v * n_v;
+        let heads = (head_k, n_k, head_v, n_v);
+        let n1 = n - n0;
+        let sizes = [n, n0, n1];
+        let mut groups = pass.groups();
+        let (Some((0, sh)), None) = (groups.next(), groups.next()) else {
+            return Ok(None);
+        };
+        let users = [
+            "attn_qkv.weight",
+            "attn_gate.weight",
+            "ssm_beta.weight",
+            "ssm_alpha.weight",
+        ];
+        let (dt_bias, ssm_a) = (self.lw(il, "ssm_dt.bias")?, self.lw(il, "ssm_a")?);
+        let ssm_state = pass.rec.ssm_slots(ctx, il, sh.slot, sh.n_seqs);
+        let fp8 = |name: &str| {
+            sizes.iter().all(|&c| self.fp8_dense(il, name, c))
+                && !self.twin_prompt_reads(il, name, h)
+        };
+        let twin = |name: &&str| {
+            let name = format!("blk.{il}.{name}");
+            self.w(&name)
+                .is_ok_and(|w| self.linear.is_dense_twin(&name, w))
+        };
+        // qkv and z on the per-token FP8 GEMM, so no dense, grouped or joined launch takes them
+        // (those read plain weights only) and no joined run of z, alpha and beta (plain
+        // weights, or twins) does.
+        let fits = !pass.tap.on
+            && !hp.moe
+            && n0 > 0
+            && n1 > 0
+            && sh.n_seqs == 1
+            && sh.n_tok as i64 == n
+            && !sh.verify
+            && sh.captures.is_empty()
+            && h.ne()[1..] == [n, 1, 1]
+            && h.ty() == types::F32
+            && fused::delta_prep_fits(heads, dt_bias, ssm_a, n)
+            && sizes
+                .iter()
+                .all(|&c| fused::conv_norm_fits(heads, c, false))
+            && fp8(users[0])
+            && fp8(users[1])
+            && self.dense_weights(il, &users[..2]).is_none()
+            && !users[1..].iter().any(twin)
+            && sizes
+                .iter()
+                .all(|&c| gdn_scan::fits_heads([head_k, n_k], [head_v, n_v], ssm_state, c, true))
+            && sizes
+                .iter()
+                .all(|&c| self.fp8_dense(il, "ssm_out.weight", c));
+        if !fits {
+            return Ok(None);
+        }
+        // As the whole layer makes them: h's shared quantization for the projections that take
+        // it, and alpha and beta from it.
+        let hq = self.share_q8(ctx, false, il, &users, h);
+        let takes = |name: &str| {
+            hq.is_some_and(|q| self.plain_weight(il, name).is_some_and(|w| q.takes(w)))
+        };
+        if takes(users[0]) || takes(users[1]) {
+            return Ok(None);
+        }
+        let (alpha_raw, beta_raw) = self.delta_ab(ctx, il, h, true, hq)?;
+        let conv_state = pass.rec.conv_slots(ctx, il, sh.slot, sh.n_seqs);
+        let conv_w = self.lw(il, "ssm_conv1d.weight")?;
+        let prep_eps = hp.rms_eps / head_k as f32;
+        // Half `at..at + len`'s delta rule inputs from its conv over `state` (the pool's
+        // history, or the one half 0's conv ends with), and that conv's history.
+        let inputs = |at: i64, len: i64, state: Tensor<'a>| {
+            let qkv = self.lmm_cols(ctx, il, users[0], h, (at, len))?;
+            let qkv = ctx.reshape_3d(qkv, qkv_dim, len, 1);
+            let (conv, history) = fused::conv_silu_norm(ctx, qkv, state, conv_w, heads, prep_eps);
+            let es = conv.element_size();
+            let row = qkv_dim as usize * es;
+            let nb = [head_k as usize * es, row, row * len as usize];
+            let q = ctx.view_4d(conv, [head_k, n_k, len, 1], nb, 0);
+            let k = ctx.view_4d(
+                conv,
+                [head_k, n_k, len, 1],
+                nb,
+                (head_k * n_k) as usize * es,
+            );
+            let v = ctx.view_4d(
+                conv,
+                [head_v, n_v, len, 1],
+                [head_v as usize * es, row, row * len as usize],
+                (2 * head_k * n_k) as usize * es,
+            );
+            let [g, beta] = fused::delta_gates(
+                ctx,
+                conv,
+                cols(ctx, alpha_raw, at, len),
+                cols(ctx, beta_raw, at, len),
+                dt_bias,
+                ssm_a,
+                heads,
+                prep_eps,
+            );
+            Ok::<_, ModelError>(([q, k, v, g, beta], history))
+        };
+        // The final states after `len` tokens of the delta rule's output `out`.
+        let state_of = |out: Tensor<'a>, len: i64| {
+            let es = out.element_size();
+            ctx.view_4d(
+                out,
+                ssm_state.ne(),
+                [
+                    head_v as usize * es,
+                    (head_v * head_v) as usize * es,
+                    (head_v * head_v * n_v) as usize * es,
+                ],
+                (head_v * n_v * len) as usize * es,
+            )
+        };
+        let rows =
+            |out: Tensor<'a>, len: i64| ctx.view_2d(out, [head_v * n_v, len], out.nb()[1], 0);
+        let ([q, k, v, g, beta], history0) = inputs(0, n0, conv_state)?;
+        let a = gdn_scan::gdn_scan(ctx, q, k, v, g, beta, ssm_state);
+        let z0 = self.lmm_cols(ctx, il, users[1], h, (0, n0))?;
+        let out0 = self.delta_net_out(pass, il, rows(a, n0), z0, None, None, None)?;
+        let ([q, k, v, g, beta], history1) = inputs(n0, n1, history0)?;
+        let b = gdn_scan::gdn_scan(ctx, q, k, v, g, beta, state_of(a, n0));
+        let z1 = self.lmm_cols(ctx, il, users[1], h, (n0, n1))?;
+        let out1 = self.delta_net_out(pass, il, rows(b, n1), z1, None, None, None)?;
+        // Both into the pool once half 1 read them: the conv's history after the step, and
+        // the delta rule's final states.
+        let after = [
+            Some(ctx.cpy(history1, conv_state)),
+            Some(ctx.cpy(state_of(b, n1), ssm_state)),
+        ];
+        Ok(Some(Mixed::Halves {
+            out: [out0, out1],
+            after,
+        }))
     }
 
     /// [`Self::delta_net_res`], or with `split` [`Self::delta_net_halves`].
@@ -3794,28 +3970,9 @@ impl Model {
                 }
             }
         }
-        // Small steps: alpha and beta from one matmul (#256), whose strided rows the op reads;
-        // BF16 ones of 1-8 tokens from one `mul_mat_vec_f` twin launch (#689).
-        let ab_names = ["ssm_alpha.weight", "ssm_beta.weight"];
-        let (alpha_raw, beta_raw) = match ab
-            .or_else(|| {
-                prep.then(|| self.lmm_joined(ctx, il, ab_names[0], ab_names[1], h))
-                    .flatten()
-            })
-            .or_else(|| {
-                match prep
-                    .then(|| self.lmm_mvf(ctx, il, &ab_names, h))
-                    .flatten()?[..]
-                {
-                    [alpha, beta] => Some((alpha, beta)),
-                    _ => None,
-                }
-            }) {
+        let (alpha_raw, beta_raw) = match ab {
             Some(ab) => ab,
-            None => {
-                let beta = self.lmm_q(ctx, il, "ssm_beta.weight", h, hq)?;
-                (self.lmm_q(ctx, il, "ssm_alpha.weight", h, hq)?, beta)
-            }
+            None => self.delta_ab(ctx, il, h, prep, hq)?,
         };
         let chain = (!prep).then(|| {
             let beta = ctx.sigmoid(beta_raw);
@@ -4078,7 +4235,7 @@ impl Model {
                 let rows = |out: Tensor<'a>, len: i64| {
                     ctx.view_2d(out, [head_v * n_v, len], out.nb()[1], 0)
                 };
-                let after = ctx.cpy(state_of(b, n1), ssm_state);
+                let after = [Some(ctx.cpy(state_of(b, n1), ssm_state)), None];
                 let (z0, z1) = (cols(ctx, z, 0, n0), cols(ctx, z, n0, n1));
                 let out = [
                     self.delta_net_out(pass, il, rows(a, n0), z0, None, None, None)?,
@@ -4114,6 +4271,61 @@ impl Model {
         let o = concat_cols(ctx, outs);
         self.delta_net_out(pass, il, o, z, res, gn_node, z_join)
             .map(Mixed::Whole)
+    }
+
+    /// A gated DeltaNet layer's alpha and beta projections of `h` (`[n_v, n]` each, raw) where
+    /// no joined GEMM of the layer's in-projections made them: `prep`, the layer's
+    /// [`fused::delta_prep_fits`]; `hq`, its [`Self::share_q8`].
+    fn delta_ab<'a>(
+        &'a self,
+        ctx: &'a Context,
+        il: usize,
+        h: Tensor<'a>,
+        prep: bool,
+        hq: Option<shared_q8::Shared<'a>>,
+    ) -> Result<(Tensor<'a>, Tensor<'a>), ModelError> {
+        // Small steps: alpha and beta from one matmul (#256), whose strided rows the op reads;
+        // BF16 ones of 1-8 tokens from one `mul_mat_vec_f` twin launch (#689).
+        let ab_names = ["ssm_alpha.weight", "ssm_beta.weight"];
+        let ab = prep
+            .then(|| self.lmm_joined(ctx, il, ab_names[0], ab_names[1], h))
+            .flatten()
+            .or_else(|| {
+                match prep
+                    .then(|| self.lmm_mvf(ctx, il, &ab_names, h))
+                    .flatten()?[..]
+                {
+                    [alpha, beta] => Some((alpha, beta)),
+                    _ => None,
+                }
+            });
+        Ok(match ab {
+            Some(ab) => ab,
+            None => {
+                let beta = self.lmm_q(ctx, il, "ssm_beta.weight", h, hq)?;
+                (self.lmm_q(ctx, il, "ssm_alpha.weight", h, hq)?, beta)
+            }
+        })
+    }
+
+    /// [`Self::lmm`] of tokens `cols` (`(first, count)`) of `x` only, for layer `il`'s FP8
+    /// weight `name` where [`Self::fp8_dense`] takes it at `x`'s tokens and at `count`: column
+    /// `j` has the bits of the whole matmul's column `first + j`
+    /// ([`crate::model::fp8::mul_mat_dynamic_cols`], from `x`'s one set of FP8 codes).
+    fn lmm_cols<'a>(
+        &'a self,
+        ctx: &'a Context,
+        il: usize,
+        name: &str,
+        x: Tensor<'a>,
+        cols: (i64, i64),
+    ) -> Result<Tensor<'a>, ModelError> {
+        let name = format!("blk.{il}.{name}");
+        let w = self.w(&name)?;
+        let scale = linear::scale_name(&name).and_then(|s| self.w(&s).ok());
+        Ok(crate::model::fp8::mul_mat_dynamic_cols(
+            ctx, w, x, scale, cols,
+        ))
     }
 
     /// [`Self::delta_net_layer`]'s rest from the delta rule's rows `o` (F32 `[head_v * n_v,

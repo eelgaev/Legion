@@ -133,17 +133,37 @@ pub(super) fn fits(
     n_tok: i64,
     prompt: bool,
 ) -> bool {
+    g.ne()[0] == 1
+        && [q, v, g].iter().all(|t| t.ty() == types::F32)
+        && fits_heads(
+            [q.ne()[0], q.ne()[1]],
+            [v.ne()[0], v.ne()[1]],
+            state,
+            n_tok,
+            prompt,
+        )
+}
+
+/// [`fits`] for F32 q, k, v and a scalar gate g of `q` (head size, heads) and `v` (head size,
+/// heads): what it asks of the group before they are built (#1133: a step's halves whose
+/// inputs are built per half).
+pub(super) fn fits_heads(
+    q: [i64; 2],
+    v: [i64; 2],
+    state: Tensor<'_>,
+    n_tok: i64,
+    prompt: bool,
+) -> bool {
     ON.load(Ordering::Relaxed)
         && cfg!(feature = "cuda")
         && prompt
         && n_tok >= MIN_TOKENS
-        && q.ne()[0] == HEAD
-        && v.ne()[0] == HEAD
-        && g.ne()[0] == 1
-        && [q, v, g, state].iter().all(|t| t.ty() == types::F32)
+        && q[0] == HEAD
+        && v[0] == HEAD
+        && state.ty() == types::F32
         && !state.is_host()
         && !state.is_meta()
-        && gpu_for(state.cuda_device()).group(super::gdn_mma::ggml_per_token(q.ne()[1], v.ne()[1]))
+        && gpu_for(state.cuda_device()).group(super::gdn_mma::ggml_per_token(q[1], v[1]))
 }
 
 /// ggml's `gated_delta_net(q, k, v, g, beta, state, 1)` as [`GDN_SCAN`]: the same shapes in
