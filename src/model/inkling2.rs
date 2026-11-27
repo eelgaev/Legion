@@ -81,12 +81,28 @@ const EXPERTS_PLAN: u32 = 2;
 const EXPERTS_BF16_ACT: u32 = 4;
 /// [`experts_flags`]: [`EXPERTS_TILE`] for the gate and up rows.
 const EXPERTS_TILE_GU: u32 = 8;
-/// [`experts_flags`] by default: the shared plan and the BF16 SITU. On a DGX Spark (GB10) the
-/// tile prefetches gained nothing on Inkling-2-Mini (the down's cost 0.3-0.4 tok/s at decode).
-const EXPERTS_DEFAULT: u32 = EXPERTS_PLAN | EXPERTS_BF16_ACT;
+/// [`experts_flags`]: without [`EXPERTS_TILE`], the NVFP4 down projection's decode mv takes
+/// whole row tiles into L2 one tile ahead ([`EXPERT_MV_T1`], #1221 r9).
+const EXPERTS_DOWN_T1: u32 = 16;
+/// [`experts_flags`] by default: the shared plan, the BF16 SITU and the down projection's
+/// one-ahead tile prefetch. On a DGX Spark (GB10) the two-ahead prefetches ([`EXPERTS_TILE`],
+/// [`EXPERTS_TILE_GU`]) gained nothing on Inkling-2-Mini (the down's cost 0.3-0.4 tok/s at
+/// decode); one ahead, the down's calls take 60 us instead of 65 (r9).
+const EXPERTS_DEFAULT: u32 = EXPERTS_PLAN | EXPERTS_BF16_ACT | EXPERTS_DOWN_T1;
+
+/// The down projection's decode mv by default ([`EXPERTS_DOWN_T1`], `t1` of [`EXPERT_MVS`]):
+/// 8 row tiles of 16 rows a CTA, as the plain mv's, each whole tile prefetched into L2 one tile
+/// ahead.
+const EXPERT_MV_T1: nvfp4_mm::GroupedMv = nvfp4_mm::GroupedMv {
+    rtw: 1,
+    rpt: 8,
+    sb: 16,
+    pft: 1,
+};
 
 /// How the routed NVFP4 experts run (#1221 r7), all the same bits: [`EXPERTS_TILE`],
-/// [`EXPERTS_PLAN`], [`EXPERTS_BF16_ACT`] and [`EXPERTS_TILE_GU`]; [`EXPERTS_DEFAULT`] unless
+/// [`EXPERTS_PLAN`], [`EXPERTS_BF16_ACT`], [`EXPERTS_TILE_GU`] and [`EXPERTS_DOWN_T1`]
+/// (r9); [`EXPERTS_DEFAULT`] unless
 /// `LEGION_DEBUG_INK_EXPERTS=<mask>` takes others for A/B runs (0: as round 6).
 fn experts_flags() -> u32 {
     static FLAGS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -133,7 +149,8 @@ pub(crate) const EXPERT_MVS: [(&str, nvfp4_mm::GroupedMv); 15] = {
 
 /// The routed NVFP4 experts' grouped mv variant at one-token tiles for A/B runs (#1221 r9): the
 /// [`EXPERT_MVS`] name in `LEGION_DEBUG_INK_DOWN_MV` for the down projection,
-/// `LEGION_DEBUG_INK_GU_MV` for the gate and up rows; unset (or not a name), the default's.
+/// `LEGION_DEBUG_INK_GU_MV` for the gate and up rows; unset (or not a name), the default's
+/// ([`EXPERTS_DOWN_T1`]'s `t1` for the down, the plain `p8` for the gate and up rows).
 fn expert_mv(down: bool) -> Option<nvfp4_mm::GroupedMv> {
     static MV: std::sync::OnceLock<[Option<nvfp4_mm::GroupedMv>; 2]> = std::sync::OnceLock::new();
     MV.get_or_init(|| {
@@ -150,7 +167,8 @@ pub(crate) fn expert_mv_of(env: Option<&str>) -> Option<nvfp4_mm::GroupedMv> {
 
 /// [`experts_flags`] given the environment's value.
 pub(crate) fn experts_flags_of(env: Option<&str>) -> u32 {
-    const ALL: u32 = EXPERTS_TILE | EXPERTS_PLAN | EXPERTS_BF16_ACT | EXPERTS_TILE_GU;
+    const ALL: u32 =
+        EXPERTS_TILE | EXPERTS_PLAN | EXPERTS_BF16_ACT | EXPERTS_TILE_GU | EXPERTS_DOWN_T1;
     env.and_then(|v| v.trim().parse::<u32>().ok())
         .map_or(EXPERTS_DEFAULT, |v| v & ALL)
 }
@@ -1327,8 +1345,8 @@ impl Model {
     /// `mul_mat_id` of block `ip`'s expert stack `base` (NVFP4, or what [`ops::mm_id`] takes)
     /// over `x` (F32 `[k, 1 or n_used, n]`, or BF16 for NVFP4) for the choices `ids`: F32
     /// `[m, n_used, n]`. `gate_up`: the down projection's, the gate and up rows of the same
-    /// routing it follows. NVFP4 experts take [`nvfp4_mm::mul_mat_id_with`] as
-    /// [`experts_flags`] says, the down projection with `plan_of` those rows.
+    /// routing it follows. NVFP4 experts take [`nvfp4_mm::mul_mat_id_mv`] as
+    /// [`experts_flags`] and [`expert_mv`] say, the down projection with `plan_of` those rows.
     fn ink_experts<'a>(
         &'a self,
         ctx: &'a Context,
@@ -1356,7 +1374,10 @@ impl Model {
                 None => flags & EXPERTS_TILE_GU != 0,
             };
             let plan_of = gate_up.filter(|_| flags & EXPERTS_PLAN != 0);
-            let mv = expert_mv(gate_up.is_some());
+            // An A/B pick, else the down's one-ahead prefetch (unless EXPERTS_TILE's two).
+            let down_t1 =
+                gate_up.is_some() && flags & (EXPERTS_TILE | EXPERTS_DOWN_T1) == EXPERTS_DOWN_T1;
+            let mv = expert_mv(gate_up.is_some()).or(down_t1.then_some(EXPERT_MV_T1));
             return Ok(nvfp4_mm::mul_mat_id_mv(
                 ctx, w, x, ids, scale, tile, plan_of, mv,
             ));

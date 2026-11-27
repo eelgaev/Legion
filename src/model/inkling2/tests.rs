@@ -2425,12 +2425,14 @@ fn experts_keep_the_cpu_bits() {
 /// `LEGION_DEBUG_INK_EXPERTS`: a mask of the four, all of them unset or unparsed.
 #[test]
 fn experts_flags_take_a_mask() {
-    assert_eq!(experts_flags_of(None), EXPERTS_PLAN | EXPERTS_BF16_ACT);
-    assert_eq!(experts_flags_of(Some("x")), EXPERTS_PLAN | EXPERTS_BF16_ACT);
-    assert_eq!(experts_flags_of(Some("15")), 15);
+    let default = EXPERTS_PLAN | EXPERTS_BF16_ACT | EXPERTS_DOWN_T1;
+    assert_eq!(experts_flags_of(None), default);
+    assert_eq!(experts_flags_of(Some("x")), default);
+    assert_eq!(experts_flags_of(Some("22")), default);
+    assert_eq!(experts_flags_of(Some("31")), 31);
     assert_eq!(experts_flags_of(Some("0")), 0);
     assert_eq!(experts_flags_of(Some(" 3 ")), EXPERTS_TILE | EXPERTS_PLAN);
-    assert_eq!(experts_flags_of(Some("20")), EXPERTS_BF16_ACT);
+    assert_eq!(experts_flags_of(Some("36")), EXPERTS_BF16_ACT);
     assert_eq!(experts_flags_of(Some("8")), EXPERTS_TILE_GU);
 }
 
@@ -2448,6 +2450,7 @@ fn expert_mv_takes_a_name() {
     };
     assert_eq!(expert_mv_of(Some(" p4 ")), Some(p4));
     assert_eq!(expert_mv_of(Some("t2")), Some(nvfp4_mm::DOWN_MV_TILE));
+    assert_eq!(expert_mv_of(Some("t1")), Some(EXPERT_MV_T1));
     let mut names: Vec<_> = EXPERT_MVS.iter().map(|(n, _)| *n).collect();
     names.sort_unstable();
     names.dedup();
