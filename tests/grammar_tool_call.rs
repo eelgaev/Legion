@@ -390,3 +390,65 @@ fn undeclared_names_need_the_call_policy() {
         "declared names are unaffected"
     );
 }
+
+#[test]
+fn undeclared_names_leave_declared_ones_on_their_schema() {
+    let tools = [weather(), free_tool()];
+    let g = compile_undeclared(&tools).unwrap();
+    // `get_weather` requires `city` and `unit` and takes nothing else.
+    for body in [
+        "\n<function=get_weather>\n</function>\n",
+        "\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n",
+        "\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n\
+         <parameter=unit>\nkelvin\n</parameter>\n</function>\n",
+        "\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n\
+         <parameter=unit>\ncelsius\n</parameter>\n<parameter=color>\nred\n</parameter>\n\
+         </function>\n",
+    ] {
+        assert!(
+            !accepts(&g, body),
+            "a declared strict tool keeps its schema: {body:?}"
+        );
+    }
+    // Names next to the declared ones are undeclared ones.
+    for name in [
+        "unlisted",
+        "get_weathe",
+        "get_weather2",
+        "search_web",
+        "s",
+        "my tool",
+        "天气",
+    ] {
+        let body = format!("\n<function={name}>\n<parameter=x>\n1\n</parameter>\n</function>\n");
+        assert!(accepts(&g, &body), "{name:?}");
+        assert_eq!(
+            parse_mode(&tools, &body, true),
+            vec![(name.to_string(), json!({"x": 1}))],
+            "{name:?}"
+        );
+    }
+}
+
+#[test]
+fn undeclared_names_read_back_as_they_are() {
+    let tools = [weather(), free_tool()];
+    let g = compile_undeclared(&tools).unwrap();
+    // Empty, edged with whitespace, or holding markup: the parser would not read the call
+    // back under the name the grammar let through.
+    for name in [
+        "",
+        " ",
+        " search ",
+        " unlisted",
+        "unlisted ",
+        "unlisted\t",
+        "unlisted\u{a0}",
+        "\u{3000}unlisted",
+        "search>web",
+        "un<listed",
+    ] {
+        let body = format!("\n<function={name}>\n</function>\n");
+        assert!(!accepts(&g, &body), "{name:?}");
+    }
+}

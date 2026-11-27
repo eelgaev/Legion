@@ -549,7 +549,9 @@ call instead, so a client sees an unknown tool it can report rather than call ma
 conversation: the name reaches the tool channel, and the arguments are read exactly as above. A call
 naming a declared tool is identical in both modes, as is a request with a `response_format` (which
 never runs a tool parser). Where strict calls are constrained, `call` also widens the grammar to
-accept a free name, which is why the behaviour is opt in.
+accept a free name, which is why the behaviour is opt in. The free name is never a declared one (a
+declared strict tool keeps its schema) and is one the parser reads back as written: not empty, no
+`<`, `>` or newline, no whitespace at either end. Its parameters are unconstrained.
 
 GPU throughput of constrained requests (for example 32 concurrent JSON schema requests against the
 same batch unconstrained) has not been measured yet.

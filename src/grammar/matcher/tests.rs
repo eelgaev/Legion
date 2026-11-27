@@ -1,4 +1,4 @@
-use super::{RawStep, RawText};
+use super::{DEAD, Lazy, Nfa, Node, Options, RawStep, RawText};
 
 /// Runs `text` through the automaton: `Some(i)`: `end` completes at byte `i`; `None`: a
 /// forbidden string completed first, or `end` never did.
@@ -88,4 +88,94 @@ fn raw_text_without_forbidden_strings_is_kmp() {
     let raw = RawText::new(b"aab", &[]);
     assert_eq!(ends_at(&raw, b"aaab"), Some(3));
     assert_eq!(ends_at(&raw, b"abaab"), Some(4));
+}
+
+/// What [`Node::Name`] should take: a name the tool parser reads back as it is (its trim is
+/// `str::trim`) that is not excluded.
+fn is_name(exclude: &[Vec<u8>], text: &[u8]) -> bool {
+    let Ok(s) = std::str::from_utf8(text) else {
+        return false;
+    };
+    !s.is_empty()
+        && !s.contains(['\0', '<', '>', '\n'])
+        && s.trim() == s
+        && !exclude.iter().any(|e| e == text)
+}
+
+#[test]
+fn name_automaton_matches_the_parsers_names() {
+    let exclude: Vec<Vec<u8>> = ["w", "wx", "a w", "é", "\u{a0}x", "中😀", "<w"]
+        .iter()
+        .map(|s| s.as_bytes().to_vec())
+        .collect();
+    let (nfa, start) = Nfa::build(
+        &Node::Name {
+            exclude: exclude.clone(),
+        },
+        &Options::default(),
+    )
+    .unwrap();
+    let mut lazy = Lazy::new(&nfa, start);
+    let mut takes = |text: &[u8]| {
+        let mut s = 0;
+        for &b in text {
+            s = lazy.step(&nfa, s, b);
+            if s == DEAD {
+                return false;
+            }
+        }
+        lazy.states[s as usize].accepting
+    };
+    // Whole characters, whitespace of every width, and stray or broken UTF-8 bytes.
+    let pieces: &[&[u8]] = &[
+        b"a",
+        b"w",
+        b"x",
+        b" ",
+        b"\t",
+        b"\r",
+        b"<",
+        b">",
+        b"\n",
+        b"\0",
+        "é".as_bytes(),
+        "中".as_bytes(),
+        "😀".as_bytes(),
+        "\u{85}".as_bytes(),
+        "\u{a0}".as_bytes(),
+        "\u{1680}".as_bytes(),
+        "\u{2000}".as_bytes(),
+        "\u{200b}".as_bytes(),
+        "\u{2029}".as_bytes(),
+        "\u{3000}".as_bytes(),
+        b"\xC2",
+        b"\xE2\x80",
+        b"\x80",
+        b"\xED\xA0\x80",
+        b"\xF4\x90\x80\x80",
+        b"\xC0\xAF",
+    ];
+    for name in &exclude {
+        assert!(!takes(name), "{:?}", String::from_utf8_lossy(name));
+    }
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    for _ in 0..20_000 {
+        let len = (seed % 6) as usize;
+        let mut text = Vec::new();
+        for _ in 0..len {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            text.extend_from_slice(pieces[(seed % pieces.len() as u64) as usize]);
+        }
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        assert_eq!(
+            takes(&text),
+            is_name(&exclude, &text),
+            "{:?}",
+            String::from_utf8_lossy(&text)
+        );
+    }
 }
