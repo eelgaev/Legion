@@ -30,7 +30,7 @@ macro_rules! external_op {
 }
 
 external_op!(MIX, "ink_mix", cpu_mix, mix);
-external_op!(RMS, "ink_rms", cpu_rms, rms);
+external_op!(RMS, "ink_rms", cpu_rms_norm, rms);
 external_op!(CTRL_IN, "ink_ctrl_in", cpu_ctrl_in, ctrl_in);
 external_op!(CTRL_OUT, "ink_ctrl_out", cpu_ctrl_out, ctrl_out);
 external_op!(CTRL_GATE, "ink_ctrl_gate", cpu_ctrl_gate, ctrl_gate);
@@ -115,37 +115,6 @@ pub fn rms<'a>(ctx: &'a Context, x: Tensor<'a>, w: Option<Tensor<'a>>, eps: f32)
         &args,
         &[eps.to_bits() as i32, i32::from(early)],
     )
-}
-
-/// [`rms`] of `x` (`[d, n]`) and the same rows rounded to BF16 (ggml's cast of them), from one
-/// node (#1221 r8): `(f32, bf16)`, the F32 rows first, then the BF16 ones, so a BF16 matmul's
-/// input needs no cast kernel of its own. `None` where it does not take `x`: rows wider than
-/// [`RMS_MAX`] or not a multiple of 8 (the BF16 rows start 16-byte aligned), more than 2 dims.
-pub fn rms_bf16<'a>(
-    ctx: &'a Context,
-    x: Tensor<'a>,
-    w: Option<Tensor<'a>>,
-    eps: f32,
-) -> Option<(Tensor<'a>, Tensor<'a>)> {
-    let [d, n, n2, n3] = x.ne();
-    if d > RMS_MAX || d % 8 != 0 || n2 != 1 || n3 != 1 || x.ty() != types::F32 {
-        return None;
-    }
-    let x = contiguous(x);
-    let early = w.is_some_and(weight);
-    let mut args = vec![x];
-    args.extend(w.map(contiguous));
-    // The BF16 rows take half the F32 rows' bytes.
-    let node = ctx.external_with(
-        &RMS,
-        types::F32,
-        [d, n + (n + 1) / 2, 1, 1],
-        &args,
-        &[eps.to_bits() as i32, i32::from(early), 1],
-    );
-    let f = ctx.view_2d(node, [d, n], 4 * d as usize, 0);
-    let b = ctx.view_1d(node, d * n / 2, 4 * (d * n) as usize);
-    Some((f, ctx.reinterpret(b, types::BF16, [d, n, 1, 1])))
 }
 
 /// A loop controller's input: `[rms(cur) | rms(msg)]` (no weight, `eps`), F32 `[2e, n]` from
@@ -718,27 +687,6 @@ fn part(n: usize, ith: usize, nth: usize) -> std::ops::Range<usize> {
 
 fn f32_param(p: i32) -> f32 {
     f32::from_bits(p as u32)
-}
-
-/// `glm_rms_norm`'s reference, then (params[2], [`rms_bf16`]) the BF16 rows of the same
-/// thread's rows (`cpu_rms_norm` splits them as [`part`] does).
-unsafe fn cpu_rms(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
-    unsafe {
-        cpu_rms_norm(dst, ith, nth);
-        if external_params(dst)[2] == 0 {
-            return;
-        }
-        let x = &*dst.src[0];
-        let d = x.ne[0] as usize;
-        let rows = (0..4).map(|i| x.ne[i] as usize).product::<usize>() / d;
-        let f = std::slice::from_raw_parts(dst.data as *const f32, rows * d);
-        let b = std::slice::from_raw_parts_mut((dst.data as *mut u16).add(2 * rows * d), rows * d);
-        for r in part(rows, ith, nth) {
-            for i in r * d..(r + 1) * d {
-                b[i] = glm_ops::to_bf16(f[i]);
-            }
-        }
-    }
 }
 
 /// Element `i` of `t`'s data as `T` (contiguous tensors).

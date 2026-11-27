@@ -313,14 +313,13 @@ pub(super) unsafe fn rms(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<
         10..=16 => Kernel::Rms16,
         _ => return Err("ink_rms: rows wider than the kernel holds".into()),
     };
-    // SAFETY: a node of this op, in device memory; a block per row of x (a node that also
-    // holds the BF16 rows has more elements than x).
+    // SAFETY: a node of this op, in device memory.
     unsafe {
         launch(
             k,
             "ink_rms",
             dst,
-            dim(elements(src(dst, 0)) / dst.ne[0], 1),
+            dim(elements(dst) / dst.ne[0], 1),
             RMS_THREADS as u32,
             0,
             stream,

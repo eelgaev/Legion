@@ -145,10 +145,24 @@ __device__ __forceinline__ float sigmoidf_(float x) {
     return 1.f / (1.f + __expf(-x));
 }
 
-// FP8 E4M3 (FN) to float: (8 + m) 2^(e - 10), m 2^-9 when e is 0. #1221 r8: the float's bits
-// put together (exponent e + 120, the mantissa's top 3 bits m) instead of ldexpf, the same
-// values (exact either way, all normal floats).
+// FP8 E4M3 (FN) to float.
 __device__ __forceinline__ float e4m3(uint8_t b) {
+    const int s = b >> 7, e = (b >> 3) & 15, m = b & 7;
+    float v;
+    if (e == 0) {
+        v = ldexpf((float) m, -9);
+    } else if (e == 15 && m == 7) {
+        v = 0.f;  // NaN in E4M3FN; checkpoints have none
+    } else {
+        v = ldexpf((float) (8 + m), e - 10);
+    }
+    return s ? -v : v;
+}
+
+// e4m3's values with the float's bits put together (exponent e + 120, the mantissa's top 3
+// bits m) instead of ldexpf, no branches (#1221 r8): exact either way, all normal floats. Only
+// mm_id_stage_kernel takes it, so the kernels before it compile as they did.
+__device__ __forceinline__ float e4m3_bits(uint8_t b) {
     const uint32_t a = b & 0x7f, e = a >> 3, m = a & 7;
     float          v = e ? __uint_as_float((e + 120) << 23 | m << 20) : (float) m * 0.001953125f;
     if (a == 0x7f) {
@@ -301,11 +315,9 @@ __global__ void mix_kernel(const A a) {
 constexpr int RMS_THREADS = 256;
 
 // rms_kernel's scale from the block's sum of squares, the one expression of rms_kernel and
-// kv_kernel. glm_rms_norm's 1.0f / sqrtf is one MUFU.RSQ under --use_fast_math, but only
-// where ptxas folds the two: #1221 r8's rms_kernel<1> came out as a sqrt and a reciprocal (1
-// ulp off). rsqrtf is that instruction always.
+// kv_kernel.
 __device__ __forceinline__ float rms_scale(double sum, int64_t d, float eps) {
-    return rsqrtf((float) (sum / d) + eps);
+    return 1.0f / sqrtf((float) (sum / d) + eps);
 }
 
 // ---- ink_rms: params eps, whether w is a weight; sources x [d, rows] (contiguous), w [d] or
@@ -358,19 +370,11 @@ template <int K> __global__ void __launch_bounds__(RMS_THREADS) rms_kernel(const
     sum = warp_sum(lane < RMS_THREADS / 32 ? part[lane] : 0.0);
     const float s = rms_scale(sum, d, pf(a.params[0]));
     float *     o = (float *) a.dst + r * d;
-    // params[2] (#1221 r8): the rows rounded to BF16 too, after all the F32 rows (gridDim.x of
-    // them), as ggml's cast of them would be.
-    __nv_bfloat16 * ob =
-        a.params[2] ? (__nv_bfloat16 *) ((float *) a.dst + gridDim.x * d) + r * d : nullptr;
 #pragma unroll
     for (int k = 0; k < K; k++) {
         const int64_t i = threadIdx.x + (int64_t) k * RMS_THREADS;
         if (i < d) {
-            const float v = w ? xv[k] * s * wv[k] : xv[k] * s;
-            o[i]          = v;
-            if (ob) {
-                ob[i] = __float2bfloat16_rn(v);
-            }
+            o[i] = w ? xv[k] * s * wv[k] : xv[k] * s;
         }
     }
 }
@@ -1761,7 +1765,7 @@ __device__ __forceinline__ void mm_id_stage(const A & a, char (*ring)[MMS_ROWS][
                         } else {
                             const float s =
                                 *(const float *) (buf[rr] + MMS_SCALES + soff[rr] + 4 * g);
-                            v = e4m3(((const uint8_t *) b)[lane]) * s;
+                            v = e4m3_bits(((const uint8_t *) b)[lane]) * s;
                         }
                     }
                     acc[rr] += v * xv;

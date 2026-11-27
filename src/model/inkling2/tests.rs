@@ -1786,14 +1786,8 @@ fn rms_keeps_the_bits(b: &mut Backend) {
                 };
                 let old = glm_ops::rms_norm(&ctx, x, w, 1e-6).as_output();
                 let new = ops::rms(&ctx, x, w, 1e-6).as_output();
-                // #1221 r8: the norm with its BF16 rows, against the cast of glm_rms_norm's.
-                let both = ops::rms_bf16(&ctx, x, w, 1e-6).map(|(f, bf)| {
-                    let cast = ctx.cast(old, types::BF16);
-                    [f, bf, cast].map(|t| ctx.cont(t).as_output())
-                });
-                assert_eq!(both.is_some(), d % 8 == 0, "ink_rms d {d}: BF16 rows taken");
-                let mut graph = ctx.new_graph(32);
-                for t in [old, new].into_iter().chain(both.into_iter().flatten()) {
+                let mut graph = ctx.new_graph(16);
+                for t in [old, new] {
                     graph.expand(t);
                 }
                 ctx.alloc_graph(&graph, ComputeAllocator::new(b.buffer_type()))
@@ -1809,16 +1803,6 @@ fn rms_keeps_the_bits(b: &mut Backend) {
                 if let Some(line) = first_diff(&what, &p, &q, d as usize) {
                     eprintln!("first mismatch: {line}");
                     bad.push(line);
-                }
-                if let Some([f, bf, cast]) = both {
-                    let what = format!("{what}, with BF16 rows");
-                    if let Some(line) = first_diff(&what, &p, &f.to_f32(), d as usize) {
-                        eprintln!("first mismatch: {line}");
-                        bad.push(line);
-                    }
-                    if bf.bytes() != cast.bytes() {
-                        bad.push(format!("{what}: the BF16 rows are not the cast's"));
-                    }
                 }
             }
         }
