@@ -81,9 +81,12 @@ const EXPERTS_PLAN: u32 = 2;
 const EXPERTS_BF16_ACT: u32 = 4;
 /// [`experts_flags`]: [`EXPERTS_TILE`] for the gate and up rows.
 const EXPERTS_TILE_GU: u32 = 8;
+/// [`experts_flags`] by default: the shared plan and the BF16 SITU. On a DGX Spark (GB10) the
+/// tile prefetches gained nothing on Inkling-2-Mini (the down's cost 0.3-0.4 tok/s at decode).
+const EXPERTS_DEFAULT: u32 = EXPERTS_PLAN | EXPERTS_BF16_ACT;
 
 /// How the routed NVFP4 experts run (#1221 r7), all the same bits: [`EXPERTS_TILE`],
-/// [`EXPERTS_PLAN`], [`EXPERTS_BF16_ACT`] and [`EXPERTS_TILE_GU`], all of them by default.
+/// [`EXPERTS_PLAN`], [`EXPERTS_BF16_ACT`] and [`EXPERTS_TILE_GU`]; [`EXPERTS_DEFAULT`] unless
 /// `LEGION_DEBUG_INK_EXPERTS=<mask>` takes others for A/B runs (0: as round 6).
 fn experts_flags() -> u32 {
     static FLAGS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -93,11 +96,18 @@ fn experts_flags() -> u32 {
     })
 }
 
+/// Whether `Model::ink_mm_set` takes BF16 weights (#1221 r7): unless
+/// `LEGION_DEBUG_INK_BF16_SET=0` (A/B runs: a node a product, as round 6).
+fn bf16_set() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LEGION_DEBUG_INK_BF16_SET").map_or(true, |v| v.trim() != "0"))
+}
+
 /// [`experts_flags`] given the environment's value.
 pub(crate) fn experts_flags_of(env: Option<&str>) -> u32 {
     const ALL: u32 = EXPERTS_TILE | EXPERTS_PLAN | EXPERTS_BF16_ACT | EXPERTS_TILE_GU;
     env.and_then(|v| v.trim().parse::<u32>().ok())
-        .map_or(ALL, |v| v & ALL)
+        .map_or(EXPERTS_DEFAULT, |v| v & ALL)
 }
 
 /// The GGUF architecture name (llama.cpp's).
@@ -599,8 +609,10 @@ impl Model {
 
     /// [`Self::ink_mm_b`] of block `ip`'s weights `names`, all of `x`: one glm_linear_set node
     /// ([`glm_ops::linear_set`], linear_mv_q8's sums row by row: the same bits) where it takes
-    /// them, Q8_0 weights without a scale over up to 8 tokens (decode steps), unless `own`
-    /// (traced runs keep a node a product); else a node each (#1221 r6).
+    /// them, Q8_0 weights without a scale over up to 8 tokens (decode steps; #1221 r6) or BF16
+    /// ones (the NVFP4 checkpoint's) at one token on the GB10 kernels (linear_mv_bf16's sums,
+    /// [`glm_ops::linear_set_bf16_takes`]; r7), unless `own` (traced runs keep a node a
+    /// product); else a node each.
     fn ink_mm_set<'a, const N: usize>(
         &'a self,
         ctx: &'a Context,
@@ -619,7 +631,8 @@ impl Model {
             && (2..=glm_ops::SET_MAX).contains(&N)
             && x.ty() == types::F32
             && x.is_contiguous()
-            && glm_ops::linear_set_takes(&ws, n)
+            && (glm_ops::linear_set_takes(&ws, n)
+                || (bf16_set() && glm_ops::linear_set_bf16_takes(&ws, n)))
             && names.iter().all(|name| {
                 name.strip_suffix(".weight")
                     .is_some_and(|b| self.w(&format!("blk.{ip}.{b}.scale")).is_err())

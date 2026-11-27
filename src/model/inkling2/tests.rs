@@ -2099,9 +2099,9 @@ fn cuda_clip2_keeps_the_bits() {
 
 /// `Model::ink_mm_set`'s one glm_linear_set node (`glm_ops::linear_set`) for the products of
 /// one input against the node a product it replaces (`glm_ops::linear_h`, what `glm_mm`
-/// builds for Q8_0 weights): Q, the relative weights and the gate, then K and V, at Inkling-2's
-/// shapes and a small one, over the token counts it takes.
-fn linear_set_keeps_the_bits(b: &mut Backend) {
+/// builds for Q8_0 and BF16 weights): Q, the relative weights and the gate, then K and V, at
+/// Inkling-2's shapes and a small one, `ty` weights over the token counts `toks`.
+fn linear_set_keeps_the_bits(b: &mut Backend, ty: crate::ggml::ffi::ggml_type, toks: &[i64]) {
     use crate::ggml::ComputeAllocator;
     let mut s = 0x2545_f491_4f6c_dd1du64;
     let mut vals = move |n: usize, amp: f32| -> Vec<f32> {
@@ -2121,12 +2121,12 @@ fn linear_set_keeps_the_bits(b: &mut Backend) {
         (64, &[8, 36, 4]),
     ];
     for (k, ms) in shapes {
-        for n in [1i64, 2, 3, 5, 8] {
+        for &n in toks {
             let ctx = Context::new(32, 32);
             let x = ctx.new_tensor(types::F32, &[k, n]).as_input();
             let ws: Vec<_> = ms
                 .iter()
-                .map(|&m| ctx.new_tensor(types::Q8_0, &[k, m]).as_input())
+                .map(|&m| ctx.new_tensor(ty, &[k, m]).as_input())
                 .collect();
             let old: Vec<_> = ws
                 .iter()
@@ -2146,7 +2146,15 @@ fn linear_set_keeps_the_bits(b: &mut Backend) {
             x.set_f32(&vals((k * n) as usize, 3.0));
             for (&w, &m) in ws.iter().zip(ms) {
                 let v = vals((k * m) as usize, 0.5);
-                w.set_bytes(&crate::ggml::quantize(types::Q8_0, &v, k as usize));
+                if ty == types::BF16 {
+                    let raw: Vec<u8> = v
+                        .iter()
+                        .flat_map(|&f| glm_ops::to_bf16(f).to_le_bytes())
+                        .collect();
+                    w.set_bytes(&raw);
+                } else {
+                    w.set_bytes(&crate::ggml::quantize(ty, &v, k as usize));
+                }
             }
             b.compute(&graph).unwrap();
             for (j, &m) in ms.iter().enumerate() {
@@ -2166,7 +2174,8 @@ fn linear_set_keeps_the_bits(b: &mut Backend) {
 /// [`linear_set_keeps_the_bits`] on the CPU references.
 #[test]
 fn linear_set_keeps_the_cpu_bits() {
-    linear_set_keeps_the_bits(&mut backend());
+    linear_set_keeps_the_bits(&mut backend(), types::Q8_0, &[1, 2, 3, 5, 8]);
+    linear_set_keeps_the_bits(&mut backend(), types::BF16, &[1]);
 }
 
 /// [`linear_set_keeps_the_bits`] on the GPU: `linear_set_q8` against `linear_mv_q8`.
@@ -2174,7 +2183,18 @@ fn linear_set_keeps_the_cpu_bits() {
 #[test]
 #[ignore = "needs a GPU"]
 fn cuda_linear_set_keeps_the_bits() {
-    linear_set_keeps_the_bits(&mut gpu_backend());
+    linear_set_keeps_the_bits(&mut gpu_backend(), types::Q8_0, &[1, 2, 3, 5, 8]);
+}
+
+/// [`linear_set_keeps_the_bits`] on the GPU for BF16 weights at one token (#1221 r7):
+/// `linear_set_bf16` against `linear_mv_bf16` (the GB10 kernels' BF16 GEMV, which
+/// `glm_ops::linear_set_bf16_takes` requires).
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_linear_set_bf16_keeps_the_bits() {
+    glm_ops::set_gb10_linear(true);
+    linear_set_keeps_the_bits(&mut gpu_backend(), types::BF16, &[1]);
 }
 
 /// #1221 r7: the routed NVFP4 experts as `Model::ink_moe` builds them by default (gate and up
@@ -2308,8 +2328,9 @@ fn experts_keep_the_cpu_bits() {
 /// `LEGION_DEBUG_INK_EXPERTS`: a mask of the four, all of them unset or unparsed.
 #[test]
 fn experts_flags_take_a_mask() {
-    assert_eq!(experts_flags_of(None), 15);
-    assert_eq!(experts_flags_of(Some("x")), 15);
+    assert_eq!(experts_flags_of(None), EXPERTS_PLAN | EXPERTS_BF16_ACT);
+    assert_eq!(experts_flags_of(Some("x")), EXPERTS_PLAN | EXPERTS_BF16_ACT);
+    assert_eq!(experts_flags_of(Some("15")), 15);
     assert_eq!(experts_flags_of(Some("0")), 0);
     assert_eq!(experts_flags_of(Some(" 3 ")), EXPERTS_TILE | EXPERTS_PLAN);
     assert_eq!(experts_flags_of(Some("20")), EXPERTS_BF16_ACT);
