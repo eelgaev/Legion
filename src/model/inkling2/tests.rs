@@ -1757,3 +1757,422 @@ fn rms_keeps_the_cpu_bits() {
 fn cuda_rms_keeps_the_bits() {
     rms_keeps_the_bits(&mut gpu_backend());
 }
+
+/// #1221 r6: `ink_conv` with the residual gives `glm_add(res, ink_conv(..))`'s bits and leaves
+/// the same history, at decode steps (one token, 1-4 sequences) and prompt steps, with and
+/// without dynamic taps.
+fn conv_add_keeps_the_bits(b: &mut Backend) {
+    use crate::ggml::ComputeAllocator;
+    let mut s = 0x9e37_79b9_7f4a_7c15u64;
+    let mut vals = move |n: usize, amp: f32| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 40) as f32 / (1u64 << 23) as f32 - 1.0) * amp
+            })
+            .collect()
+    };
+    let (k, heads, off, scale) = (4i64, 4i64, 32i64, 1.0 / 5f32.sqrt());
+    let mut bad = Vec::new();
+    for c in [2304i64, 96, 200] {
+        for (n_tok, n_seqs) in [(1i64, 1i64), (1, 4), (2, 3), (37, 2)] {
+            for dynamic in [false, true] {
+                let ng = n_tok * n_seqs;
+                let width = c + 2 * off;
+                let ctx = Context::new(32, 32);
+                let x = ctx.new_tensor(types::F32, &[c, ng]).as_input();
+                let w = ctx.new_tensor(types::F32, &[k, c]).as_input();
+                let r = ctx.new_tensor(types::F32, &[c, ng]).as_input();
+                let d = dynamic.then(|| ctx.new_tensor(types::F32, &[k * heads, ng]).as_input());
+                let st = [0, 1].map(|_| {
+                    ctx.new_tensor(types::F32, &[k - 1, width, n_seqs])
+                        .as_input()
+                        .as_output()
+                });
+                let conv = ops::conv(&ctx, x, w, st[0], d, n_tok, off, scale);
+                let old = glm_ops::add(&ctx, r, conv).as_output();
+                let new = ops::conv_add(&ctx, x, w, st[1], d, n_tok, off, scale, Some(r));
+                let new = new.as_output();
+                let mut graph = ctx.new_graph(16);
+                for t in [old, new] {
+                    graph.expand(t);
+                }
+                ctx.alloc_graph(&graph, ComputeAllocator::new(b.buffer_type()))
+                    .unwrap();
+                x.set_f32(&vals((c * ng) as usize, 2.0));
+                w.set_f32(&vals((k * c) as usize, 1.0));
+                r.set_f32(&vals((c * ng) as usize, 4.0));
+                if let Some(d) = d {
+                    d.set_f32(&vals((k * heads * ng) as usize, 1.0));
+                }
+                let hist = vals(((k - 1) * width * n_seqs) as usize, 2.0);
+                for t in st {
+                    t.set_f32(&hist);
+                }
+                b.compute(&graph).unwrap();
+                let (p, q) = (old.to_f32(), new.to_f32());
+                assert!(q.iter().any(|&v| v != 0.0), "ink_conv c {c}: an output");
+                let what = format!("ink_conv c {c}, {n_tok} x {n_seqs} tokens, dynamic {dynamic}");
+                if let Some(line) = first_diff(&what, &p, &q, c as usize) {
+                    eprintln!("first mismatch: {line}");
+                    bad.push(line);
+                }
+                let (h0, h1) = (st[0].to_f32(), st[1].to_f32());
+                if let Some(line) = first_diff(&format!("{what}, history"), &h0, &h1, 3) {
+                    eprintln!("first mismatch: {line}");
+                    bad.push(line);
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "\n{}", bad.join("\n"));
+}
+
+/// [`conv_add_keeps_the_bits`] on the CPU references.
+#[test]
+fn conv_add_keeps_the_cpu_bits() {
+    conv_add_keeps_the_bits(&mut backend());
+}
+
+/// [`conv_add_keeps_the_bits`] on the GPU: `conv_kernel` and `conv_prompt_kernel` with the
+/// residual against them plus glm5next.cu's `add_kernel`.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_conv_add_keeps_the_bits() {
+    conv_add_keeps_the_bits(&mut gpu_backend());
+}
+
+/// #1221 r6: `ink_kv` gives the bits of the nodes it replaces at a decode step: `ink_conv` of K
+/// and V, `ink_clip` of K, `ink_rms` of V and their two `ds4_cache_write`s. It checks K, V, the
+/// conv history and both caches, at Inkling-2-Mini's heads and smaller ones, with and without
+/// dynamic taps, for 1 and 4 sequences.
+fn kv_keeps_the_bits(b: &mut Backend) {
+    use crate::ggml::ComputeAllocator;
+    use crate::model::deepseek41::ops as ds41_ops;
+    let mut s = 0x2545_f491_4f6c_dd1du64;
+    let mut vals = move |n: usize, amp: f32| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 40) as f32 / (1u64 << 23) as f32 - 1.0) * amp
+            })
+            .collect()
+    };
+    let f16s = |b: &[u8]| -> Vec<f32> {
+        b.chunks_exact(2)
+            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect()
+    };
+    let (k, base, n_cells, thr, eps) = (4i64, 48i64, 8i64, 3.0f32, 1e-6f32);
+    let mut bad = Vec::new();
+    let mut report = |line: Option<String>| {
+        if let Some(line) = line {
+            eprintln!("first mismatch: {line}");
+            bad.push(line);
+        }
+    };
+    for (kvw, d) in [(1024i64, 128i64), (64, 32), (256, 64)] {
+        for n in [1i64, 4] {
+            for dynamic in [false, true] {
+                let heads = kvw / d;
+                let width = base + 2 * kvw + 16;
+                let scale = 1.0 / ((if dynamic { 2 * k } else { k } + 1) as f32).sqrt();
+                let ctx = Context::new(48, 48);
+                let kp = ctx.new_tensor(types::F32, &[kvw, n]).as_input();
+                let vp = ctx.new_tensor(types::F32, &[kvw, n]).as_input();
+                let kw = ctx.new_tensor(types::F32, &[k, kvw]).as_input();
+                let vw = ctx.new_tensor(types::F32, &[k, kvw]).as_input();
+                let dy = dynamic.then(|| {
+                    [0, 1].map(|_| ctx.new_tensor(types::F32, &[k * heads, n]).as_input())
+                });
+                let cells = ctx.new_tensor(types::I32, &[n]).as_input();
+                let pos = ctx.new_tensor(types::I32, &[n]).as_input();
+                let io = |ty, ne: &[i64]| ctx.new_tensor(ty, ne).as_input().as_output();
+                let st = [0, 1].map(|_| io(types::F32, &[k - 1, width, n]));
+                let kc = [0, 1].map(|_| io(types::F16, &[kvw, n_cells]));
+                let vc = [0, 1].map(|_| io(types::F16, &[kvw, n_cells]));
+                // The nodes ink_kv replaces, as ink_attn builds them.
+                let kd = dy.map(|t| t[0]);
+                let vd = dy.map(|t| t[1]);
+                let kconv = ops::conv(&ctx, kp, kw, st[0], kd, 1, base, scale);
+                let vconv = ops::conv(&ctx, vp, vw, st[0], vd, 1, base + kvw, scale);
+                let ko = ops::clip(&ctx, ctx.reshape_3d(kconv, d, heads, n), None, thr, None);
+                let vo = ops::rms(&ctx, ctx.reshape_3d(vconv, d, heads, n), None, eps);
+                let (ko, vo) = (ko.as_output(), vo.as_output());
+                let kwr = ds41_ops::cache_write(
+                    &ctx,
+                    kc[0],
+                    ctx.reshape_2d(ko, kvw, n),
+                    cells,
+                    pos,
+                    0,
+                    1,
+                    &[],
+                );
+                let vwr = ds41_ops::cache_write(
+                    &ctx,
+                    vc[0],
+                    ctx.reshape_2d(vo, kvw, n),
+                    cells,
+                    pos,
+                    0,
+                    1,
+                    &[kwr],
+                );
+                let (new, written) = ops::kv(
+                    &ctx,
+                    kp,
+                    vp,
+                    kw,
+                    vw,
+                    st[1],
+                    [kc[1], vc[1]],
+                    cells,
+                    pos,
+                    dy,
+                    base,
+                    d,
+                    scale,
+                    thr,
+                    eps,
+                );
+                let new = new.as_output();
+                let mut graph = ctx.new_graph(32);
+                for t in [ko, vo, vwr, new, written] {
+                    graph.expand(t);
+                }
+                ctx.alloc_graph(&graph, ComputeAllocator::new(b.buffer_type()))
+                    .unwrap();
+                kp.set_f32(&vals((kvw * n) as usize, 2.0));
+                vp.set_f32(&vals((kvw * n) as usize, 2.0));
+                kw.set_f32(&vals((k * kvw) as usize, 1.0));
+                vw.set_f32(&vals((k * kvw) as usize, 1.0));
+                if let Some(dy) = dy {
+                    for t in dy {
+                        t.set_f32(&vals((k * heads * n) as usize, 1.0));
+                    }
+                }
+                cells.set_i32(&[5, 2, 7, 0][..n as usize]);
+                pos.set_i32(&[9, 3, 40, 1][..n as usize]);
+                let hist = vals(((k - 1) * width * n) as usize, 2.0);
+                let cache: Vec<u8> = vals((kvw * n_cells) as usize, 1.0)
+                    .iter()
+                    .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                    .collect();
+                for i in 0..2 {
+                    st[i].set_f32(&hist);
+                    kc[i].set_bytes(&cache);
+                    vc[i].set_bytes(&cache);
+                }
+                b.compute(&graph).unwrap();
+                let q = new.to_f32();
+                assert!(q.iter().any(|&v| v != 0.0), "ink_kv: an output");
+                let what = format!("ink_kv {kvw} in heads of {d}, {n} tokens, dynamic {dynamic}");
+                let half = (kvw * n) as usize;
+                let w = d as usize;
+                report(first_diff(
+                    &format!("{what}, K"),
+                    &ko.to_f32(),
+                    &q[..half],
+                    w,
+                ));
+                report(first_diff(
+                    &format!("{what}, V"),
+                    &vo.to_f32(),
+                    &q[half..],
+                    w,
+                ));
+                let (h0, h1) = (st[0].to_f32(), st[1].to_f32());
+                report(first_diff(&format!("{what}, history"), &h0, &h1, 3));
+                for (name, c) in [("K cache", kc), ("V cache", vc)] {
+                    let (c0, c1) = (f16s(&c[0].bytes()), f16s(&c[1].bytes()));
+                    report(first_diff(
+                        &format!("{what}, {name}"),
+                        &c0,
+                        &c1,
+                        kvw as usize,
+                    ));
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "\n{}", bad.join("\n"));
+}
+
+/// [`kv_keeps_the_bits`] on the CPU references.
+#[test]
+fn kv_keeps_the_cpu_bits() {
+    kv_keeps_the_bits(&mut backend());
+}
+
+/// [`kv_keeps_the_bits`] on the GPU: `kv_kernel` against `conv_kernel`, `clip_kernel`,
+/// `rms_kernel<1>` and deepseek41.cu's `cache_write_kernel`.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_kv_keeps_the_bits() {
+    kv_keeps_the_bits(&mut gpu_backend());
+}
+
+/// #1221 r6: `ink_clip2` gives two `ink_clip`s' bits: Q's rows and the relative weights' at
+/// Inkling-2-Mini's sizes and the tiny model's, with and without the log-length scale.
+fn clip2_keeps_the_bits(b: &mut Backend) {
+    use crate::ggml::ComputeAllocator;
+    let mut s = 0x9e37_79b9_7f4a_7c15u64;
+    let mut vals = move |n: usize, amp: f32| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 40) as f32 / (1u64 << 23) as f32 - 1.0) * amp
+            })
+            .collect()
+    };
+    let ls = ops::LogScale {
+        floor: 4.0,
+        alpha: 0.3,
+    };
+    let mut bad = Vec::new();
+    for (dq, dr, h) in [(128i64, 16i64, 24i64), (32, 4, 4), (96, 40, 3)] {
+        for n in [1i64, 3, 37] {
+            for tau in [false, true] {
+                let ctx = Context::new(32, 32);
+                let q = ctx.new_tensor(types::F32, &[dq, h, n]).as_input();
+                let qs = ctx.new_tensor(types::F32, &[dq, h]).as_input();
+                let r = ctx.new_tensor(types::F32, &[dr, h, n]).as_input();
+                let rs = ctx.new_tensor(types::F32, &[dr, h]).as_input();
+                let pos = tau.then(|| ctx.new_tensor(types::I32, &[n]).as_input());
+                let tau_of = pos.map(|p| (p, ls));
+                let old = [(q, qs, 3.0f32), (r, rs, 1.5)]
+                    .map(|(x, s, thr)| ops::clip(&ctx, x, Some(s), thr, tau_of).as_output());
+                let new = ops::clip2(&ctx, [(q, qs, 3.0), (r, rs, 1.5)], tau_of);
+                let new = new.map(|t| ctx.cont(t).as_output());
+                let mut graph = ctx.new_graph(16);
+                for t in old.iter().chain(&new) {
+                    graph.expand(*t);
+                }
+                ctx.alloc_graph(&graph, ComputeAllocator::new(b.buffer_type()))
+                    .unwrap();
+                q.set_f32(&vals((dq * h * n) as usize, 4.0));
+                qs.set_f32(&vals((dq * h) as usize, 1.5));
+                r.set_f32(&vals((dr * h * n) as usize, 4.0));
+                rs.set_f32(&vals((dr * h) as usize, 1.5));
+                if let Some(p) = pos {
+                    let v: Vec<i32> = (0..n as i32).map(|i| i * 97 % 5000).collect();
+                    p.set_i32(&v);
+                }
+                b.compute(&graph).unwrap();
+                for (j, d) in [dq, dr].into_iter().enumerate() {
+                    let (p, q) = (old[j].to_f32(), new[j].to_f32());
+                    assert!(q.iter().any(|&v| v != 0.0), "ink_clip2: an output");
+                    let what = format!("ink_clip2 part {j}, rows of {d}, {h} x {n}, tau {tau}");
+                    if let Some(line) = first_diff(&what, &p, &q, d as usize) {
+                        eprintln!("first mismatch: {line}");
+                        bad.push(line);
+                    }
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "\n{}", bad.join("\n"));
+}
+
+/// [`clip2_keeps_the_bits`] on the CPU references.
+#[test]
+fn clip2_keeps_the_cpu_bits() {
+    clip2_keeps_the_bits(&mut backend());
+}
+
+/// [`clip2_keeps_the_bits`] on the GPU: `clip2_kernel` against `clip_kernel`.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_clip2_keeps_the_bits() {
+    clip2_keeps_the_bits(&mut gpu_backend());
+}
+
+/// `Model::ink_mm_set`'s one glm_linear_set node (`glm_ops::linear_set`) for the products of
+/// one input against the node a product it replaces (`glm_ops::linear_h`, what `glm_mm`
+/// builds for Q8_0 weights): Q, the relative weights and the gate, then K and V, at Inkling-2's
+/// shapes and a small one, over the token counts it takes.
+fn linear_set_keeps_the_bits(b: &mut Backend) {
+    use crate::ggml::ComputeAllocator;
+    let mut s = 0x2545_f491_4f6c_dd1du64;
+    let mut vals = move |n: usize, amp: f32| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 40) as f32 / (1u64 << 23) as f32 - 1.0) * amp
+            })
+            .collect()
+    };
+    let mut bad = Vec::new();
+    let shapes: [(i64, &[i64]); 3] = [
+        (2304, &[3072, 384, 3072]),
+        (2304, &[1024, 1024]),
+        (64, &[8, 36, 4]),
+    ];
+    for (k, ms) in shapes {
+        for n in [1i64, 2, 3, 5, 8] {
+            let ctx = Context::new(32, 32);
+            let x = ctx.new_tensor(types::F32, &[k, n]).as_input();
+            let ws: Vec<_> = ms
+                .iter()
+                .map(|&m| ctx.new_tensor(types::Q8_0, &[k, m]).as_input())
+                .collect();
+            let old: Vec<_> = ws
+                .iter()
+                .map(|&w| glm_ops::linear_h(&ctx, w, x, None, 1.0, None).as_output())
+                .collect();
+            let set: Vec<_> = ws.iter().map(|&w| (w, x, glm_ops::SetEpi::Plain)).collect();
+            let new: Vec<_> = glm_ops::linear_set(&ctx, &set)
+                .into_iter()
+                .map(|t| ctx.cont(t).as_output())
+                .collect();
+            let mut graph = ctx.new_graph(16);
+            for t in old.iter().chain(&new) {
+                graph.expand(*t);
+            }
+            ctx.alloc_graph(&graph, ComputeAllocator::new(b.buffer_type()))
+                .unwrap();
+            x.set_f32(&vals((k * n) as usize, 3.0));
+            for (&w, &m) in ws.iter().zip(ms) {
+                let v = vals((k * m) as usize, 0.5);
+                w.set_bytes(&crate::ggml::quantize(types::Q8_0, &v, k as usize));
+            }
+            b.compute(&graph).unwrap();
+            for (j, &m) in ms.iter().enumerate() {
+                let (p, q) = (old[j].to_f32(), new[j].to_f32());
+                assert!(q.iter().any(|&v| v != 0.0), "glm_linear_set: an output");
+                let what = format!("glm_linear_set part {j}, {m} x {k}, {n} tokens");
+                if let Some(line) = first_diff(&what, &p, &q, m as usize) {
+                    eprintln!("first mismatch: {line}");
+                    bad.push(line);
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "\n{}", bad.join("\n"));
+}
+
+/// [`linear_set_keeps_the_bits`] on the CPU references.
+#[test]
+fn linear_set_keeps_the_cpu_bits() {
+    linear_set_keeps_the_bits(&mut backend());
+}
+
+/// [`linear_set_keeps_the_bits`] on the GPU: `linear_set_q8` against `linear_mv_q8`.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_linear_set_keeps_the_bits() {
+    linear_set_keeps_the_bits(&mut gpu_backend());
+}

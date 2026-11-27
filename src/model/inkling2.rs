@@ -569,6 +569,47 @@ impl Model {
         self.glm_mm_shared(ctx, &format!("blk.{ip}.{name}"), x, rows.of(x))
     }
 
+    /// [`Self::ink_mm_b`] of block `ip`'s weights `names`, all of `x`: one glm_linear_set node
+    /// ([`glm_ops::linear_set`], linear_mv_q8's sums row by row: the same bits) where it takes
+    /// them, Q8_0 weights without a scale over up to 8 tokens (decode steps), unless `own`
+    /// (traced runs keep a node a product); else a node each (#1221 r6).
+    fn ink_mm_set<'a, const N: usize>(
+        &'a self,
+        ctx: &'a Context,
+        ip: usize,
+        names: [&str; N],
+        x: Tensor<'a>,
+        rows: &mut Bf16Rows<'a>,
+        own: bool,
+    ) -> Result<[Tensor<'a>; N], ModelError> {
+        let ws = names
+            .iter()
+            .map(|n| self.w(&format!("blk.{ip}.{n}")))
+            .collect::<Result<Vec<_>, _>>()?;
+        let n: i64 = x.ne()[1..].iter().product();
+        let set = !own
+            && (2..=glm_ops::SET_MAX).contains(&N)
+            && x.ty() == types::F32
+            && x.is_contiguous()
+            && glm_ops::linear_set_takes(&ws, n)
+            && names.iter().all(|name| {
+                name.strip_suffix(".weight")
+                    .is_some_and(|b| self.w(&format!("blk.{ip}.{b}.scale")).is_err())
+            });
+        let out = if set {
+            let set: Vec<_> = ws.iter().map(|&w| (w, x, glm_ops::SetEpi::Plain)).collect();
+            glm_ops::linear_set(ctx, &set)
+        } else {
+            names
+                .iter()
+                .map(|name| self.ink_mm_b(ctx, ip, name, x, rows))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(out
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("a product a name")))
+    }
+
     /// `x` RMS-normed times block `ip`'s weight `name`.
     fn ink_rms<'a>(
         &'a self,
@@ -720,6 +761,23 @@ impl Model {
         dynamic: Option<Tensor<'a>>,
         off: i64,
     ) -> Result<Tensor<'a>, ModelError> {
+        self.ink_conv_add(pass, il, ip, name, x, dynamic, off, None)
+    }
+
+    /// [`Self::ink_conv`] plus the residual `res` (F32 `[c, n]`) when given: the sum of
+    /// `glm_add(res, conv)` in the conv's own node, one launch fewer (#1221 r6).
+    #[allow(clippy::too_many_arguments)]
+    fn ink_conv_add<'a>(
+        &'a self,
+        pass: &Pass<'a>,
+        il: usize,
+        ip: usize,
+        name: &str,
+        x: Tensor<'a>,
+        dynamic: Option<Tensor<'a>>,
+        off: i64,
+        res: Option<Tensor<'a>>,
+    ) -> Result<Tensor<'a>, ModelError> {
         let ctx = pass.ctx;
         let p = self.ink();
         let w = self.lw(ip, name)?;
@@ -731,7 +789,7 @@ impl Model {
         for (at, sh) in pass.groups() {
             let ng = sh.tokens() as i64;
             let state = pass.rec.ple_slots(ctx, 0, sh.slot, sh.n_seqs);
-            outs.push(ops::conv(
+            outs.push(ops::conv_add(
                 ctx,
                 cols(ctx, x, at, ng),
                 w,
@@ -740,6 +798,7 @@ impl Model {
                 sh.n_tok as i64,
                 base,
                 scale,
+                res.map(|r| cols(ctx, r, at, ng)),
             ));
         }
         Ok(glm_ops::join_cols(ctx, &outs))
@@ -807,11 +866,17 @@ impl Model {
             tap.tap(name, il, x);
         }
 
-        let out = self.ink_attn(pass, il, ip, &inputs)?;
-        tap.tap("attn_out", il, out);
         // A block's first layer starts a new residual; its input joins the depth blocks.
-        let cur = if ip % p.block == 0 {
+        // Otherwise the residual add is the post conv's own, unless a trace wants the
+        // attention's output by itself.
+        let starts = ip % p.block == 0;
+        let fold = !starts && !tap.on;
+        let out = self.ink_attn(pass, il, ip, &inputs, fold.then_some(inp_sa))?;
+        tap.tap("attn_out", il, out);
+        let cur = if starts {
             blocks.push(inp_sa);
+            out
+        } else if fold {
             out
         } else {
             glm_ops::add(ctx, inp_sa, out)
@@ -835,21 +900,27 @@ impl Model {
         let y = self.ink_moe(pass, il, ip, h)?;
         tap.tap("ffn_moe_out", il, y);
         let kvw = hp.head_dim * hp.n_head_kv;
-        let y = self.ink_conv(pass, il, ip, "ffn_post_conv.weight", y, None, 2 * kvw + e)?;
-        tap.tap("ffn_out", il, y);
-        let out = glm_ops::add(ctx, ffn_inp, y);
+        let name = "ffn_post_conv.weight";
+        let out = if tap.on {
+            let y = self.ink_conv(pass, il, ip, name, y, None, 2 * kvw + e)?;
+            tap.tap("ffn_out", il, y);
+            glm_ops::add(ctx, ffn_inp, y)
+        } else {
+            self.ink_conv_add(pass, il, ip, name, y, None, 2 * kvw + e, Some(ffn_inp))?
+        };
         tap.tap("l_out", il, out);
         Ok(out)
     }
 
     /// Slot `il`'s attention (block `ip`) over its Q, K and V inputs (normed, `[n_embd, n]`):
-    /// gated, projected and through the post conv.
+    /// gated, projected and through the post conv, plus the residual `res` when given.
     fn ink_attn<'a>(
         &'a self,
         pass: &Pass<'a>,
         il: usize,
         ip: usize,
         inputs: &[Tensor<'a>; 3],
+        res: Option<Tensor<'a>>,
     ) -> Result<Tensor<'a>, ModelError> {
         let (ctx, tap) = (pass.ctx, &pass.tap);
         let p = self.ink();
@@ -865,9 +936,31 @@ impl Model {
         let [xq, xk, xv] = *inputs;
 
         let mut rows = Bf16Rows::default();
-        let q = self.ink_mm_b(ctx, ip, "attn_q.weight", xq, &mut rows)?;
-        let kp = self.ink_mm_b(ctx, ip, "attn_k.weight", xk, &mut rows)?;
-        let vp = self.ink_mm_b(ctx, ip, "attn_v.weight", xv, &mut rows)?;
+        // Q, the relative weights and the gate read xq, a sliding layer's K and V one input:
+        // a node a set where it takes them (ink_mm_set), unless traced.
+        let [q, r, g] = self.ink_mm_set(
+            ctx,
+            ip,
+            ["attn_q.weight", "attn_rel.weight", "attn_gate.weight"],
+            xq,
+            &mut rows,
+            tap.on,
+        )?;
+        let [kp, vp] = if xk.raw() == xv.raw() {
+            self.ink_mm_set(
+                ctx,
+                ip,
+                ["attn_k.weight", "attn_v.weight"],
+                xk,
+                &mut rows,
+                tap.on,
+            )?
+        } else {
+            [
+                self.ink_mm_b(ctx, ip, "attn_k.weight", xk, &mut rows)?,
+                self.ink_mm_b(ctx, ip, "attn_v.weight", xv, &mut rows)?,
+            ]
+        };
         let (kdyn, vdyn) = if swa {
             (None, None)
         } else {
@@ -884,61 +977,120 @@ impl Model {
                 tap.tap(name, il, x);
             }
         }
-        let k = self.ink_conv(pass, il, ip, "attn_k_conv.weight", kp, kdyn, 0)?;
-        let v = self.ink_conv(pass, il, ip, "attn_v_conv.weight", vp, vdyn, kvw)?;
-        tap.tap("k_conv", il, k);
-        tap.tap("v_conv", il, v);
-        let r = self.ink_mm_b(ctx, ip, "attn_rel.weight", xq, &mut rows)?;
+        // A decode step (one group, a token a sequence) makes K and V and writes them to the
+        // caches in one node, ops::kv, of the bits of the nodes below (#1221 r6). Traced
+        // runs keep those for their taps.
+        let (kcw, vcw) = (
+            self.lw(ip, "attn_k_conv.weight")?,
+            self.lw(ip, "attn_v_conv.weight")?,
+        );
+        let mut gs = pass.groups();
+        let decode = match (gs.next(), gs.next()) {
+            (Some((_, sh)), None)
+                if !tap.on
+                    && sh.n_tok == 1
+                    && d <= 128
+                    && kvw % d == 0
+                    && kcw.ne()[0] == vcw.ne()[0]
+                    && kcw.ne()[0] <= ops::MAX_TAPS as i64 =>
+            {
+                Some((sh.slot, sh.n_seqs))
+            }
+            _ => None,
+        };
+        let convs = match decode {
+            Some(_) => None,
+            None => {
+                let k = self.ink_conv(pass, il, ip, "attn_k_conv.weight", kp, kdyn, 0)?;
+                let v = self.ink_conv(pass, il, ip, "attn_v_conv.weight", vp, vdyn, kvw)?;
+                tap.tap("k_conv", il, k);
+                tap.tap("v_conv", il, v);
+                Some((k, v))
+            }
+        };
         tap.tap("r_proj", il, r);
 
         // The global layers' Q and relative weights scale with the log of the position.
         let tau = (!swa).then_some((pos_all, p.log_scale));
-        let q = ops::clip(
-            ctx,
+        let kv = convs.map(|(k, v)| {
+            (
+                ops::clip(ctx, ctx.reshape_3d(k, d, nkv, n), None, p.qk_clip, None),
+                ops::rms(ctx, ctx.reshape_3d(v, d, nkv, n), None, hp.rms_eps),
+            )
+        });
+        // Q's and the relative weights' clips: one node of their bits, unless traced.
+        let q = (
             ctx.reshape_3d(q, d, nh, n),
-            Some(self.lw(ip, "attn_q_clip.weight")?),
+            self.lw(ip, "attn_q_clip.weight")?,
             p.qk_clip,
-            tau,
         );
-        let k = ops::clip(ctx, ctx.reshape_3d(k, d, nkv, n), None, p.qk_clip, None);
-        let v = ops::rms(ctx, ctx.reshape_3d(v, d, nkv, n), None, hp.rms_eps);
-        let r = ops::clip(
-            ctx,
+        let r = (
             ctx.reshape_3d(r, p.n_rel, nh, n),
-            Some(self.lw(ip, "attn_rel_clip.weight")?),
+            self.lw(ip, "attn_rel_clip.weight")?,
             p.rel_clip,
-            tau,
         );
+        let [q, r] = if tap.on || d > 128 || p.n_rel > 128 {
+            [q, r].map(|(x, s, thr)| ops::clip(ctx, x, Some(s), thr, tau))
+        } else {
+            ops::clip2(ctx, [q, r], tau)
+        };
         let sinks = self.ink_mm_b(ctx, ip, "attn_sink_proj.weight", xq, &mut rows)?;
         tap.tap("r_clip", il, r);
         tap.tap("sinks", il, sinks);
         tap.tap("Qcur", il, q);
-        tap.tap("Kcur", il, k);
-        tap.tap("Vcur", il, v);
 
         let (kc, vc) = pass.kv.pools(il);
         let cells = pass.write_cells(il);
-        let kw = ds41_ops::cache_write(
-            ctx,
-            kc,
-            ctx.reshape_2d(k, kvw, n),
-            cells,
-            pos_all,
-            0,
-            1,
-            &[],
-        );
-        let vw = ds41_ops::cache_write(
-            ctx,
-            vc,
-            ctx.reshape_2d(v, kvw, n),
-            cells,
-            pos_all,
-            0,
-            1,
-            &[kw],
-        );
-        pass.graph.borrow_mut().expand(vw);
+        let written = match (kv, decode) {
+            (Some((k, v)), _) => {
+                tap.tap("Kcur", il, k);
+                tap.tap("Vcur", il, v);
+                let kw = ds41_ops::cache_write(
+                    ctx,
+                    kc,
+                    ctx.reshape_2d(k, kvw, n),
+                    cells,
+                    pos_all,
+                    0,
+                    1,
+                    &[],
+                );
+                ds41_ops::cache_write(
+                    ctx,
+                    vc,
+                    ctx.reshape_2d(v, kvw, n),
+                    cells,
+                    pos_all,
+                    0,
+                    1,
+                    &[kw],
+                )
+            }
+            (None, Some((slot, n_seqs))) => {
+                let k = kcw.ne()[0];
+                let taps = if kdyn.is_some() { 2 * k } else { k };
+                ops::kv(
+                    ctx,
+                    kp,
+                    vp,
+                    kcw,
+                    vcw,
+                    pass.rec.ple_slots(ctx, 0, slot, n_seqs),
+                    [kc, vc],
+                    cells,
+                    pos_all,
+                    kdyn.zip(vdyn).map(|(a, b)| [a, b]),
+                    il as i64 * p.slot_width,
+                    d,
+                    1.0 / ((taps + 1) as f32).sqrt(),
+                    p.qk_clip,
+                    hp.rms_eps,
+                )
+                .1
+            }
+            (None, None) => unreachable!("K and V come from the convs or ops::kv"),
+        };
+        pass.graph.borrow_mut().expand(written);
 
         let rel = self.lw(ip, "attn_rel_bias.weight")?;
         let scale = 1.0 / (d as f32).sqrt();
@@ -974,19 +1126,18 @@ impl Model {
                 sh.n_tok as i64,
                 scale,
                 window,
-                vw,
+                written,
             );
             outs.push(ctx.reshape_2d(o, d * nh, ng));
         }
         let o = glm_ops::join_cols(ctx, &outs);
         tap.tap("kqv_out", il, o);
-        let g = self.ink_mm_b(ctx, ip, "attn_gate.weight", xq, &mut rows)?;
         tap.tap("attn_gate", il, g);
         let o = ops::sigmul(ctx, o, g);
         tap.tap("attn_gated", il, o);
         let o = self.ink_mm(ctx, ip, "attn_output.weight", o)?;
         tap.tap("attn_proj", il, o);
-        self.ink_conv(pass, il, ip, "attn_post_conv.weight", o, None, 2 * kvw)
+        self.ink_conv_add(pass, il, ip, "attn_post_conv.weight", o, None, 2 * kvw, res)
     }
 
     /// The routed experts of block `ip` over the normed `h` (`[n_embd, n]`).

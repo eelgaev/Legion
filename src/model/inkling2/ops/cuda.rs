@@ -71,7 +71,7 @@ struct LaunchConfig {
 const ATTR_PROGRAMMATIC_STREAM_SERIALIZATION: c_int = 6;
 
 /// The kernels of `legion_ink_kernels`.
-const KERNELS: usize = 23;
+const KERNELS: usize = 25;
 
 unsafe extern "C" {
     /// The kernels as the CUDA runtime knows them (their host stubs' addresses), in
@@ -157,6 +157,10 @@ enum Kernel {
     Rms3,
     Rms9,
     Rms16,
+    /// A decode step's K and V: convs, clip, rms and cache writes (#1221 r6).
+    Kv,
+    /// Two clips in one launch (#1221 r6).
+    Clip2,
 }
 
 /// `RMS_THREADS` of the kernels.
@@ -434,6 +438,49 @@ pub(super) unsafe fn clip(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
             dst,
             dim(cdiv(rows, 8), 1),
             256,
+            0,
+            stream,
+        )
+    }
+}
+
+pub(super) unsafe fn clip2(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
+    // SAFETY: a node of this op; its sources were checked by the builder.
+    unsafe {
+        let (x0, x1) = (src(dst, 0), src(dst, 2));
+        if x0.ne[0] > 128 || x1.ne[0] > 128 {
+            return Err("ink_clip2: rows wider than 128".into());
+        }
+        let rows = x0.ne[1] * x0.ne[2] + x1.ne[1] * x1.ne[2];
+        launch(
+            Kernel::Clip2,
+            "ink_clip2",
+            dst,
+            dim(cdiv(rows, 8), 1),
+            256,
+            0,
+            stream,
+        )
+    }
+}
+
+pub(super) unsafe fn kv(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
+    // SAFETY: a node of this op; its sources were checked by the builder.
+    unsafe {
+        if src(dst, 2).ne[0] > CONV_TAPS {
+            return Err("ink_kv: more taps than the kernel holds".into());
+        }
+        let d = external_params(dst)[5] as i64;
+        if d > 128 {
+            return Err("ink_kv: heads wider than 128".into());
+        }
+        let rows = 2 * (dst.ne[0] / d) * dst.ne[1];
+        launch(
+            Kernel::Kv,
+            "ink_kv",
+            dst,
+            dim(cdiv(rows, 4), 1),
+            128,
             0,
             stream,
         )
