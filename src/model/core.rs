@@ -1648,6 +1648,31 @@ pub(crate) fn concat_tree<'a>(ctx: &'a Context, mut parts: Vec<Tensor<'a>>) -> T
     parts.pop().expect("no parts")
 }
 
+/// A mixer's output projection (a rank's partial under tensor parallelism): one `[n_embd, n]`
+/// tensor, or per half of the step's tokens ([`Model::delta_net_halves`], #1133).
+#[derive(Clone, Copy)]
+pub(crate) enum Mixed<'a> {
+    Whole(Tensor<'a>),
+    /// Tokens `0..n0` and `n0..n`. `after`: the copy of the final recurrent states into the
+    /// pool, for the caller to add to the graph after half 0's projection (added earlier, it
+    /// would pull half 1's delta rule ahead of it).
+    Halves {
+        out: [Tensor<'a>; 2],
+        after: Tensor<'a>,
+    },
+}
+
+impl<'a> Mixed<'a> {
+    /// The whole output; panics on halves (only [`Model::delta_net_halves`]'s caller asks
+    /// for them).
+    pub(crate) fn whole(self) -> Tensor<'a> {
+        match self {
+            Mixed::Whole(t) => t,
+            Mixed::Halves { .. } => panic!("a mixer's halves where its whole output is read"),
+        }
+    }
+}
+
 impl Model {
     pub fn load(
         gguf: &GgufFile,
@@ -3596,18 +3621,54 @@ impl Model {
         h: Tensor<'a>,
         res: Option<Tensor<'a>>,
     ) -> Result<Tensor<'a>, ModelError> {
+        self.delta_net_split(pass, il, h, res, None)
+            .map(Mixed::whole)
+    }
+
+    /// [`Self::delta_net`] of a prompt step under tensor parallelism over machines with its
+    /// delta rule, gated norm and output projection per half of the tokens (`0..n0`, `n0..n`;
+    /// #1133), so that half 0's sum can travel while half 1's mixer runs: the delta rule in two
+    /// launches of [`gdn_scan`], half 1's from the states half 0 ends with (F32, the values the
+    /// one launch keeps in its registers there). Every token the same bits as the whole layer's:
+    /// that kernel runs each token's step from the state and the token's inputs alone, and the
+    /// norm and the FP8 W8A8 projection with per-token scales are per token at either batch
+    /// ([`Model::fp8_dense`]). The projections in, the conv and the gates stay whole. Where the
+    /// step does not take that kernel and that projection at the whole step and both halves
+    /// (or something else shares the layer: a prefetch, a side stream), the whole layer
+    /// ([`Mixed::Whole`]).
+    pub(crate) fn delta_net_halves<'a>(
+        &'a self,
+        pass: &Pass<'a>,
+        il: usize,
+        h: Tensor<'a>,
+        n0: i64,
+    ) -> Result<Mixed<'a>, ModelError> {
+        self.delta_net_split(pass, il, h, None, Some(n0))
+    }
+
+    /// [`Self::delta_net_res`], or with `split` [`Self::delta_net_halves`].
+    fn delta_net_split<'a>(
+        &'a self,
+        pass: &Pass<'a>,
+        il: usize,
+        h: Tensor<'a>,
+        res: Option<Tensor<'a>>,
+        split: Option<i64>,
+    ) -> Result<Mixed<'a>, ModelError> {
         let pf_join = std::cell::Cell::new(None);
-        let out = self.delta_net_layer(pass, il, h, res, &pf_join)?;
+        let out = self.delta_net_layer(pass, il, h, res, &pf_join, split)?;
         // The side stream's z prefetch ([`l2_prefetch`]) joins the compute stream
         // behind the output projection (z never waits for it), in the layer's capture.
-        if let Some(pf) = pf_join.get() {
+        // (Halves only without one.)
+        if let (Some(pf), Mixed::Whole(out)) = (pf_join.get(), out) {
             let j = l2_prefetch::join(pass.ctx, pf, out);
             pass.graph.borrow_mut().expand(j);
         }
         Ok(out)
     }
 
-    /// [`Self::delta_net_res`]'s layer; a side-stream prefetch node it made goes to `pf_join`.
+    /// [`Self::delta_net_split`]'s layer; a side-stream prefetch node it made goes to
+    /// `pf_join`.
     fn delta_net_layer<'a>(
         &'a self,
         pass: &Pass<'a>,
@@ -3615,16 +3676,13 @@ impl Model {
         h: Tensor<'a>,
         res: Option<Tensor<'a>>,
         pf_join: &std::cell::Cell<Option<Tensor<'a>>>,
-    ) -> Result<Tensor<'a>, ModelError> {
+        split: Option<i64>,
+    ) -> Result<Mixed<'a>, ModelError> {
         let (ctx, tap, n) = (pass.ctx, &pass.tap, pass.n);
         debug_assert!(
             res.is_none() || !tap.on,
             "a fused residual in a tapped pass"
         );
-        let plus_res = |out: Tensor<'a>| match res {
-            Some(r) => ctx.add(out, r),
-            None => out,
-        };
         let hp = &self.hp;
         let head_k = hp.ssm_d_state;
         let n_k = hp.ssm_n_group;
@@ -3985,6 +4043,49 @@ impl Model {
                 continue;
             }
             let parts = [q, k, v, g, beta];
+            // [`Self::delta_net_halves`]: the step's one group, whose whole delta rule and
+            // output projection, and each half's, take `gdn_scan` and the FP8 W8A8 GEMM.
+            let halves = split.filter(|&n0| {
+                let n1 = nt - n0;
+                let sizes = [nt, n0, n1];
+                !tap.on
+                    && res.is_none()
+                    && outs.is_empty()
+                    && ns == 1
+                    && nt == n
+                    && n0 > 0
+                    && n1 > 0
+                    && gn_w.is_none()
+                    && z_join.is_none()
+                    && pf_join.get().is_none()
+                    && sizes
+                        .iter()
+                        .all(|&c| gdn_scan::fits(q, v, g, ssm_state, c, true))
+                    && sizes
+                        .iter()
+                        .all(|&c| self.fp8_dense(il, "ssm_out.weight", c))
+            });
+            if let Some(n0) = halves {
+                let n1 = nt - n0;
+                // Half 1 from half 0's final states (F32, contiguous: the layout the op reads
+                // its first states in), as [`capture`]'s pieces run it.
+                let scan = |at: i64, len: i64, state: Tensor<'a>| {
+                    let [q, k, v, g, beta] = parts.map(|t| capture::tokens(ctx, t, at, len));
+                    gdn_scan::gdn_scan(ctx, q, k, v, g, beta, state)
+                };
+                let a = scan(0, n0, ssm_state);
+                let b = scan(n0, n1, state_of(a, n0));
+                let rows = |out: Tensor<'a>, len: i64| {
+                    ctx.view_2d(out, [head_v * n_v, len], out.nb()[1], 0)
+                };
+                let after = ctx.cpy(state_of(b, n1), ssm_state);
+                let (z0, z1) = (cols(ctx, z, 0, n0), cols(ctx, z, n0, n1));
+                let out = [
+                    self.delta_net_out(pass, il, rows(a, n0), z0, None, None, None)?,
+                    self.delta_net_out(pass, il, rows(b, n1), z1, None, None, None)?,
+                ];
+                return Ok(Mixed::Halves { out, after });
+            }
             let out = match gn_w {
                 Some(w)
                     if nt == n
@@ -4011,6 +4112,35 @@ impl Model {
             outs.push(ctx.view_2d(out, [head_v * n_v, ng], out.nb()[1], 0));
         }
         let o = concat_cols(ctx, outs);
+        self.delta_net_out(pass, il, o, z, res, gn_node, z_join)
+            .map(Mixed::Whole)
+    }
+
+    /// [`Self::delta_net_layer`]'s rest from the delta rule's rows `o` (F32 `[head_v * n_v,
+    /// nt]`: the step's tokens, or a half's, [`Self::delta_net_halves`]) and those tokens'
+    /// gate rows `z`: the gated norm and the output projection (plus `res`). `gn_node`: the
+    /// delta rule's node that wrote the norm's BF16 rows too; `z_join`: z's side-stream GEMM,
+    /// joined behind `o`.
+    #[allow(clippy::too_many_arguments)]
+    fn delta_net_out<'a>(
+        &'a self,
+        pass: &Pass<'a>,
+        il: usize,
+        o: Tensor<'a>,
+        z: Tensor<'a>,
+        res: Option<Tensor<'a>>,
+        gn_node: Option<(Tensor<'a>, Tensor<'a>)>,
+        z_join: Option<[Tensor<'a>; 2]>,
+    ) -> Result<Tensor<'a>, ModelError> {
+        let (ctx, tap) = (pass.ctx, &pass.tap);
+        let n = o.ne()[1];
+        let hp = &self.hp;
+        let n_v = hp.ssm_dt_rank;
+        let head_v = hp.ssm_d_inner / n_v;
+        let plus_res = |out: Tensor<'a>| match res {
+            Some(r) => ctx.add(out, r),
+            None => out,
+        };
         let o = ctx.reshape_4d(o, [head_v, n_v, n, 1]);
         tap.tap("attn_output", il, o);
         if let Some(keep) = z_join {

@@ -1,9 +1,11 @@
 //! A dense Qwen3.5+ prompt step under tensor parallelism over machines with each layer's sums
-//! in parts of its tokens (#1133), as Gemma 4's halves (#619): the mixer (gated attention or
-//! gated DeltaNet) runs whole, its output projection's partial is summed per half, and each
-//! FFN part runs as soon as its half's sum is in, so that the transfers run while the GPU
-//! computes: half 1's mixer sum during half 0's FFN, each FFN part's sum during the next
-//! part's FFN.
+//! in parts of its tokens (#1133), as Gemma 4's halves (#619): the mixer's output projection's
+//! partial is summed per half, and each FFN part runs as soon as its half's sum is in, so that
+//! the transfers run while the GPU computes: half 1's mixer sum during half 0's FFN, each FFN
+//! part's sum during the next part's FFN. Gated attention runs whole; gated DeltaNet runs its
+//! delta rule, gated norm and output projection per half where it can
+//! ([`Model::delta_net_halves`], [`mixer_on`]), so half 0's mixer sum travels during half 1's
+//! mixer too.
 //!
 //! The FFN runs on half 0 whole and on half 1 in [`plan`]'s parts, the last of them small: the
 //! last part's sum travels while the GPU has nothing left to do in the layer, so a small last
@@ -25,7 +27,7 @@
 mod tests;
 
 use crate::ggml::Tensor;
-use crate::model::core::{FfnFusion, Model, ModelError, Pass, cols};
+use crate::model::core::{FfnFusion, Mixed, Model, ModelError, Pass, cols};
 use crate::tp_net::micro;
 
 /// Tokens each half of a prompt step needs (a shorter step has little wire time to hide; the
@@ -64,6 +66,27 @@ fn on() -> bool {
 /// [`on`] for the variable's value `v`.
 fn on_of(v: Option<&str>) -> bool {
     v != Some("0")
+}
+
+/// Whether the gated DeltaNet layers of those steps run their mixer per half of the tokens
+/// ([`Model::delta_net_halves`]), so that half 0's sum is on the wire while half 1's delta
+/// rule, norm and output projection run: on, the same bits as whole;
+/// `LEGION_DEBUG_QWEN35_TP_MIXER_HALVES=0` keeps the mixer whole (both halves' sums start
+/// after it). Read once.
+pub(super) fn mixer_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        mixer_on_of(
+            std::env::var("LEGION_DEBUG_QWEN35_TP_MIXER_HALVES")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// [`mixer_on`] for the variable's value `v`.
+fn mixer_on_of(v: Option<&str>) -> bool {
+    v.is_none_or(|s| s.trim() != "0")
 }
 
 /// The most FFN parts a step's layers take ([`plan`]): `LEGION_DEBUG_QWEN35_TP_PARTS` (2 the
@@ -226,8 +249,10 @@ pub(super) fn order(half: &[usize]) -> Vec<Op> {
     out
 }
 
-/// The rest of layer `il` from its mixer's partial output `attn` (this rank's, `[n_embd, n]`)
-/// and the halves `xs` of its input ([`views`]): per half the mixer's sum and the residual add,
+/// The rest of layer `il` from its mixer's partial output `attn` (this rank's, `[n_embd, n]`
+/// whole or per half, [`Mixed`]) and the halves `xs` of its input ([`views`]): per half the
+/// mixer's sum (half 0's started before half 1's mixer runs where the mixer has halves) and
+/// the residual add,
 /// per FFN part ([`plan`]) the post-attention norm, the FFN, its sum and the residual add, in
 /// [`order`], summed over `comm` in at most `parts` FFN parts ([`ffn_parts`]). Returns the
 /// layer's output, every part's FFN sum written into one tensor (#1133 r2: no concatenation).
@@ -236,7 +261,7 @@ pub(super) fn tail<'a>(
     pass: &Pass<'a>,
     il: usize,
     xs: [Tensor<'a>; 2],
-    attn: Tensor<'a>,
+    attn: Mixed<'a>,
     (comm, parts): (i32, usize),
     next: Option<crate::tp_net::Norm<'a>>,
 ) -> Result<(Tensor<'a>, Option<crate::tp_net::Normed<'a>>), ModelError> {
@@ -244,21 +269,31 @@ pub(super) fn tail<'a>(
     let (n0, n1) = (n / 2, n - n / 2);
     let whole = n as usize;
     let add = |t: Tensor<'a>| pass.graph.borrow_mut().expand(t);
-    // Its columns as views ([`cols`]): a copy where the projection's output is strided.
-    let attn = if attn.is_contiguous() {
-        attn
-    } else {
-        ctx.cont_2d(attn, attn.ne()[0], n)
-    };
     let start = |t: Tensor<'a>| {
         let s = micro::all_reduce_start(ctx, comm, t, whole);
         add(s.node);
         s
     };
-    let mut mixer = [
-        Some(start(cols(ctx, attn, 0, n0))),
-        Some(start(cols(ctx, attn, n0, n1))),
-    ];
+    let (halves, after) = match attn {
+        Mixed::Whole(attn) => {
+            // Its columns as views ([`cols`]): a copy where the projection's output is
+            // strided.
+            let attn = if attn.is_contiguous() {
+                attn
+            } else {
+                ctx.cont_2d(attn, attn.ne()[0], n)
+            };
+            ([cols(ctx, attn, 0, n0), cols(ctx, attn, n0, n1)], None)
+        }
+        Mixed::Halves { out, after } => (out, Some(after)),
+    };
+    // Half 0's start goes into the graph first, behind its own mixer half only (each start
+    // right behind its projection, [`micro::send_gemm`]); half 1's mixer follows it.
+    let mut mixer = [Some(start(halves[0])), Some(start(halves[1]))];
+    // The delta rule's final states into the pool, behind half 1's projection's start.
+    if let Some(t) = after {
+        add(t);
+    }
     let norm_w = m.lw(il, "post_attention_norm.weight")?;
     let parts = plan(n, parts);
     let half: Vec<usize> = parts.iter().map(|&(a, _)| (a >= n0) as usize).collect();

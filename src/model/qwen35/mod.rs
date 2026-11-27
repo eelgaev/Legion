@@ -17,7 +17,7 @@ use crate::model::core::arch::same_as;
 use crate::model::core::mtp::MtpGraph;
 use crate::model::core::state::KvPool;
 use crate::model::core::{
-    Arch, ArchRef, FfnFusion, GroupShape, Hparams, Model, ModelError, Pass, StatePool,
+    Arch, ArchRef, FfnFusion, GroupShape, Hparams, Mixed, Model, ModelError, Pass, StatePool,
 };
 
 /// The Qwen3.5 architecture: its hyperparameters are all in [`Hparams`].
@@ -217,10 +217,14 @@ impl Arch for Qwen35 {
                 }
                 continue;
             }
-            let attn = if hp.is_recurrent(il) {
-                m.delta_net(pass, il, h)?
+            // Under the halves, a gated DeltaNet layer's mixer per half of the tokens where it
+            // can (#1133, the same bits), so half 0's sum travels while half 1's runs.
+            let attn = if !hp.is_recurrent(il) {
+                Mixed::Whole(m.attention(pass, il, h)?)
+            } else if split.is_some() && halves::mixer_on() {
+                m.delta_net_halves(pass, il, h, n / 2)?
             } else {
-                m.attention(pass, il, h)?
+                Mixed::Whole(m.delta_net(pass, il, h)?)
             };
             if let Some((sum, xs)) = split {
                 let next = in_norm(il + 1, x)?;
@@ -232,6 +236,7 @@ impl Arch for Qwen35 {
                 }
                 continue;
             }
+            let attn = attn.whole();
             // A rank's share of the heads gives a partial output (`--tp 2`; `attn` without);
             // over machines the residual is added in the sum's kernel (#1133 r2, the same
             // bits), and the post-attention norm where its FFN reads its FP8 codes (#1133).

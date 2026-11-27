@@ -63,7 +63,28 @@ fn case(
     graph.expand(reference);
     ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
         .unwrap();
-    // q and k unit rows (as the l2 norms leave them), g < 0 (a decay), beta in (0, 1).
+    fill([conv, g, beta, state], (h, n_qk, nt, ns));
+    backend.compute(&graph).unwrap();
+    let mut time = |graph: &crate::ggml::Graph<'_>| {
+        if reps == 0 {
+            return 0.0;
+        }
+        backend.compute(graph).unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            backend.compute(graph).unwrap();
+        }
+        t0.elapsed().as_secs_f64() * 1e3 / reps as f64
+    };
+    let (op_ms, ref_ms) = (time(&op_graph), time(&ref_graph));
+    (op.to_f32(), reference.to_f32(), op_ms, ref_ms)
+}
+
+/// Sets a case's inputs (allocated): the conv-like rows (q and k unit rows, as the l2 norms
+/// leave them), g < 0 (a decay), beta in (0, 1), and the first states.
+fn fill([conv, g, beta, state]: [Tensor<'_>; 4], (h, n_qk, nt, ns): Case) {
+    let s = HEAD;
+    let row = 2 * s * n_qk + s * h;
     let mut x = noise((row * nt * ns) as usize, 1);
     for tok in x.chunks_mut(row as usize) {
         for head in tok[..(2 * s * n_qk) as usize].chunks_mut(s as usize) {
@@ -91,20 +112,102 @@ fn case(
             .map(|v| 0.1 * v)
             .collect::<Vec<_>>(),
     );
-    backend.compute(&graph).unwrap();
-    let mut time = |graph: &crate::ggml::Graph<'_>| {
-        if reps == 0 {
-            return 0.0;
-        }
-        backend.compute(graph).unwrap();
-        let t0 = std::time::Instant::now();
-        for _ in 0..reps {
-            backend.compute(graph).unwrap();
-        }
-        t0.elapsed().as_secs_f64() * 1e3 / reps as f64
+}
+
+/// `gdn_scan` over one sequence's `nt` tokens whole and in two launches split at token `n0`,
+/// the second from the first's final states, as a DeltaNet layer's halves run it under tensor
+/// parallelism (`Model::delta_net_halves`, #1133): (whole, split), each the tokens' outputs
+/// then the final states.
+fn halves(backend: &mut Backend, (h, n_qk, nt): (i64, i64, i64), n0: i64) -> (Vec<f32>, Vec<f32>) {
+    let s = HEAD;
+    let row = 2 * s * n_qk + s * h;
+    let ctx = Context::new(64, 64);
+    let conv = ctx.new_tensor(types::F32, &[row, nt, 1]).as_input();
+    let g = ctx.new_tensor(types::F32, &[1, h, nt, 1]).as_input();
+    let beta = ctx.new_tensor(types::F32, &[1, h, nt, 1]).as_input();
+    let state = ctx.new_tensor(types::F32, &[s, s, h, 1]).as_input();
+    let es = 4usize;
+    let nb = [s as usize * es, row as usize * es, (row * nt) as usize * es];
+    let q = ctx.view_4d(conv, [s, n_qk, nt, 1], nb, 0);
+    let k = ctx.view_4d(conv, [s, n_qk, nt, 1], nb, (s * n_qk) as usize * es);
+    let v = ctx.view_4d(conv, [s, h, nt, 1], nb, (2 * s * n_qk) as usize * es);
+    let whole = gdn_scan(&ctx, q, k, v, g, beta, state).as_output();
+    let scan = |at: i64, len: i64, state| {
+        let [q, k, v, g, beta] =
+            [q, k, v, g, beta].map(|t| super::super::capture::tokens(&ctx, t, at, len));
+        gdn_scan(&ctx, q, k, v, g, beta, state).as_output()
     };
-    let (op_ms, ref_ms) = (time(&op_graph), time(&ref_graph));
-    (op.to_f32(), reference.to_f32(), op_ms, ref_ms)
+    let state_of = |out, len: i64| {
+        ctx.view_4d(
+            out,
+            [s, s, h, 1],
+            [
+                s as usize * es,
+                (s * s) as usize * es,
+                (s * s * h) as usize * es,
+            ],
+            (s * h * len) as usize * es,
+        )
+    };
+    let a = scan(0, n0, state);
+    let b = scan(n0, nt - n0, state_of(a, n0));
+    let mut graph = ctx.new_graph(64);
+    graph.expand(whole);
+    graph.expand(b);
+    ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+        .unwrap();
+    fill([conv, g, beta, state], (h, n_qk, nt, 1));
+    backend.compute(&graph).unwrap();
+    // Half 0's tokens, then half 1's tokens and final states.
+    let rows = (s * h * n0) as usize;
+    let mut split = a.to_f32();
+    split.truncate(rows);
+    split.extend(b.to_f32());
+    (whole.to_f32(), split)
+}
+
+/// Splits at odd tokens and inside the kernel's 8-token chunks, a tensor parallel rank's
+/// share of Qwen3.8-27B's heads (24 value, 8 q/k).
+const HALVES: [((i64, i64, i64), i64); 4] = [
+    ((4, 2, 37), 18),
+    ((4, 2, 70), 35),
+    ((24, 8, 41), 20),
+    ((24, 8, 64), 32),
+];
+
+/// The halves give every token's output and the final states the whole launch's bits.
+fn assert_halves_exact(backend: &mut Backend) {
+    for (c, n0) in HALVES {
+        let (whole, split) = halves(backend, c, n0);
+        assert_eq!(whole.len(), split.len(), "{c:?} at {n0}");
+        let differ = whole
+            .iter()
+            .zip(&split)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        assert_eq!(differ, 0, "{c:?} split at {n0}: {differ} values differ");
+    }
+}
+
+#[test]
+fn gdn_scan_halves_are_the_whole_launch() {
+    let mut backend = Backend::cpu().unwrap();
+    backend.set_threads(4);
+    assert_halves_exact(&mut backend);
+}
+
+/// [`gdn_scan_halves_are_the_whole_launch`] on the GPU (its CUDA kernel), any architecture.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_gdn_scan_halves_are_the_whole_launch() {
+    use crate::ggml::{DeviceKind, device_by_kind};
+    let mut gpu = device_by_kind(DeviceKind::Gpu)
+        .or_else(|| device_by_kind(DeviceKind::IntegratedGpu))
+        .expect("no GPU device")
+        .init()
+        .unwrap();
+    assert_halves_exact(&mut gpu);
 }
 
 /// Prompt-sized groups: chunk tails (37 tokens), several sequences, ggml's q/k head broadcast.
