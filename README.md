@@ -66,8 +66,9 @@ figures out the rest.
 | Inkling-2-Mini (text) | unsloth UD-Q4_K_XL, both layouts | Thinking Machines NVFP4 |
 | Muse Glimmer 30B | unsloth UD-Q4_K_XL | — |
 
-**Status:** Qwen3.5 / 3.6 (dense and MoE), Qwen3.8-Flash-Next, Qwen3.8-27B, Gemma 4, GLM5.3-Flash,
-Nemotron-H and Muse Glimmer serve on CUDA, on one or several GPUs, from GGUF or safetensors. DeepSeek4.1-Flash is
+**Status:** Qwen3.5 / 3.6 (dense and MoE), Qwen3.8-Flash-Next, Qwen3.8-27B, Gemma 4, GLM5.3-Flash
+and Nemotron-H serve on CUDA, on one or several GPUs, from GGUF or safetensors; Muse Glimmer serves on CUDA from
+GGUF. DeepSeek4.1-Flash is
 being tuned.
 
 ## Performance
