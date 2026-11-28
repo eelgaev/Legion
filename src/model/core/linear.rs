@@ -693,9 +693,11 @@ impl Linear {
     /// [`Self::geglu_ffn_fused`] where the gate, up and down matmuls all run the Q4_0 prompt
     /// op (Gemma 4 QAT on a GB10): the input quantized once, with `norm` in that quantization
     /// where it fits ([`crate::model::q40_mm::quantize_norm`]), and the GeGLU written straight
-    /// as the down matmul's quantized input ([`crate::model::q40_mm::quantize_geglu`]): the
-    /// bytes of the op's own quantizations of ggml's F32 norm and GeGLU, so the same output,
-    /// without those F32 tensors. `None` elsewhere.
+    /// as the down matmul's quantized input by the gate and up matmuls' own kernel
+    /// ([`crate::model::q40_mm::mul_mat_geglu_q`]; [`crate::model::q40_mm::quantize_geglu`]
+    /// of their outputs where the pair does not fit): the bytes of the op's own quantizations
+    /// of ggml's F32 norm and GeGLU, so the same output, without the F32 tensors. `None`
+    /// elsewhere.
     fn q40_geglu_ffn<'a>(
         &self,
         ctx: &'a Context,
@@ -722,9 +724,14 @@ impl Linear {
             }
             _ => q40_mm::quantize(ctx, x),
         };
-        let u = q40_mm::mul_mat_q(ctx, up.1, xq, n);
-        let g = q40_mm::mul_mat_q(ctx, gate.1, xq, n);
-        let act = q40_mm::quantize_geglu(ctx, g, u, false);
+        // Gate and up in one kernel whose epilogue writes the quantized GeGLU (the same bytes).
+        let act = if q40_mm::geglu_pair_fits(gate.1, up.1) {
+            q40_mm::mul_mat_geglu_q(ctx, gate.1, up.1, xq, n)
+        } else {
+            let u = q40_mm::mul_mat_q(ctx, up.1, xq, n);
+            let g = q40_mm::mul_mat_q(ctx, gate.1, xq, n);
+            q40_mm::quantize_geglu(ctx, g, u, false)
+        };
         Some(q40_mm::mul_mat_q(ctx, down.1, act, n))
     }
 

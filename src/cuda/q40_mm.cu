@@ -58,6 +58,12 @@ struct legion_q40_mm {
     int rows;
     int ntx;           // column tiles
     int nty;           // row tiles
+    // The GeGLU pair (q40_gemm<q40_op, 1>): w the gate, w2 the up weight (rows w_nb1 bytes
+    // apart too), and the quantization of their GeGLU (layout 1, [rows / 32][n_pad][8 words],
+    // the scales after) in place of dst.
+    const void * w2;
+    int * oq;
+    float * od;
 };
 
 }
@@ -145,10 +151,10 @@ __device__ __forceinline__ uint32_t q40_s8x16(const uint32_t nib) {
 //
 // q40_quant4 writes values i0 .. i0 + 3 (xi) of column col: the 8 lanes of an aligned group of 8
 // in a warp hold one 32-value block (i0 / 4 = the lane's index mod 8 within it), every lane of
-// the warp calls it.
+// the warp calls it; with `store` false (a group's column past the input's) it writes nothing.
 template <int LAYOUT>
 __device__ __forceinline__ void q40_quant4(int * yq, float * yd, const int n_pad, const float4 xi, const int col,
-                                           const int i0) {
+                                           const int i0, const bool store = true) {
     float amax = fabsf(xi.x);
     amax = fmaxf(amax, fabsf(xi.y));
     amax = fmaxf(amax, fabsf(xi.z));
@@ -179,9 +185,11 @@ __device__ __forceinline__ void q40_quant4(int * yq, float * yd, const int n_pad
         qat = tile * 8 + ((nt / 2 * 8 + g) * 4 + w / 2) * 4 + nt % 2 * 2 + w % 2;
         dat = tile + (g / 2) * 32 + 2 * nt + g % 2;
     }
-    yq[qat] = *reinterpret_cast<const int *>(&q);
-    if (s == 0) {
-        yd[dat] = __half2float(__float2half(d));
+    if (store) {
+        yq[qat] = *reinterpret_cast<const int *>(&q);
+        if (s == 0) {
+            yd[dat] = __half2float(__float2half(d));
+        }
     }
 }
 
@@ -504,9 +512,20 @@ struct q40_cfg {
 // bytes past it on odd ones, so the copy takes the 80 bytes from the aligned byte below into the
 // row's 20 words (on even stages the last 8 are zero-filled, not read: they are past the stage,
 // maybe past the weight); the row's blocks start 2 words in on odd stages.
-template <class C> __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40_mm p) {
+//
+// EPI 1, the GeGLU pair (FFN gate and up over one input, Gemma 4): row tile it holds gate rows
+// 32 it .. 32 it + 31 (w) in its first 32 rows and the same up rows (w2) in its last 32, so warp
+// row 0 sums the gate's outputs and warp row 1 the up's, each output's chain as in EPI 0 (the
+// same bits as the two matmuls). The epilogue stages both in shared memory, takes
+// q40_gelu(gate) * up as q40_quant_geglu does, and writes their quantization (q40_quant4, block
+// it of each column) to oq / od as the down matmul's input: the bytes of the two matmuls'
+// F32 outputs through q40_quant_geglu, without those outputs.
+template <class C, int EPI = 0>
+__global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40_mm p) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     constexpr int SB = C::SB, MT = C::MT, NT = C::NT, BM = C::BM, BN = C::BN, S = C::STAGES;
+    constexpr int HR = BM / 2;  // EPI 1: hidden rows a tile
+    static_assert(!EPI || (C::WARPS_M == 2 && HR == 16 * MT && HR == 32), "GeGLU pair: a warp row per weight");
     extern __shared__ __align__(16) uint32_t q40_smem[];
     const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, g = lane / 4, q = lane % 4;
     const int wm = warp % C::WARPS_M, wn = warp / C::WARPS_M;
@@ -530,11 +549,17 @@ template <class C> __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_ge
     const char * wg = (const char *) p.w + (long long) row0 * p.w_nb1;
     int  woff[C::WCPT];
     bool wend[C::WCPT];
+    // EPI 1: the copies' rows, of the gate (tile rows below HR) or the up weight.
+    const char * wp[EPI ? C::WCPT : 1];
 #pragma unroll
     for (int i = 0; i < C::WCPT; i++) {
         const int c = tid + i * C::THREADS;
         woff[i]     = (c / 5) * (int) p.w_nb1 + (c % 5) * 16;
         wend[i]     = c % 5 == 4;
+        if constexpr (EPI) {
+            const int r = c / 5;
+            wp[i] = (const char *) (r < HR ? p.w : p.w2) + (long long) (it * HR + r % HR) * p.w_nb1 + (c % 5) * 16;
+        }
     }
     const long long qstep = (long long) p.n_pad * 8;  // words a block
     const int * qg = p.yq + (long long) col0 * 8;
@@ -555,7 +580,13 @@ template <class C> __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_ge
             for (int i = 0; i < C::WCPT; i++) {
                 const int c = tid + i * C::THREADS;
                 if (C::WCH % C::THREADS == 0 || c < C::WCH) {
-                    q40_cp16z(sw + c * 4, w + woff[i], wend[i] && !odd ? 8 : 16);
+                    const char * src;
+                    if constexpr (EPI) {
+                        src = wp[i] + (long long) (st >> 1) * 144 + odd * 64;
+                    } else {
+                        src = w + woff[i];
+                    }
+                    q40_cp16z(sw + c * 4, src, wend[i] && !odd ? 8 : 16);
                 }
             }
             const long long kb0 = (long long) st * SB;
@@ -659,6 +690,42 @@ template <class C> __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_ge
     }
     q40_wait<0>();
 
+    if constexpr (EPI) {
+        // Column c's 32 gate sums at se[c * ES ..], its up sums at se[(BN + c) * ES ..] (ES 36:
+        // the stores below and the 16-byte loads after hit distinct banks).
+        constexpr int ES = 36;
+        static_assert(2 * BN * ES * 4 <= C::SMEM, "GeGLU staging");
+        float * se = reinterpret_cast<float *>(q40_smem);
+        __syncthreads();  // every warp is done with the ring
+#pragma unroll
+        for (int mt = 0; mt < MT; mt++) {
+#pragma unroll
+            for (int nt = 0; nt < NT; nt++) {
+#pragma unroll
+                for (int l = 0; l < 4; l++) {
+                    const int r = mt * 16 + g + (l >> 1) * 8;
+                    const int c = wn * 8 * NT + nt * 8 + 2 * q + (l & 1);
+                    se[(wm * BN + c) * ES + r] = acc[mt][nt][l];
+                }
+            }
+        }
+        __syncthreads();
+        // 8 lanes a column (an aligned group of a warp), lane s of them values 4s .. 4s + 3 of
+        // its block: q40_quant_geglu's values and q40_quant4's quantization.
+        for (int t = tid; t < BN * 8; t += C::THREADS) {
+            const int c = t / 8, s = t % 8;
+            const float4 gv = *reinterpret_cast<const float4 *>(se + c * ES + 4 * s);
+            const float4 uv = *reinterpret_cast<const float4 *>(se + (BN + c) * ES + 4 * s);
+            float4 v;
+            v.x = q40_gelu(gv.x) * uv.x;
+            v.y = q40_gelu(gv.y) * uv.y;
+            v.z = q40_gelu(gv.z) * uv.z;
+            v.w = q40_gelu(gv.w) * uv.w;
+            q40_quant4<1>(p.oq, p.od, p.n_pad, v, col0 + c, it * HR + 4 * s, col0 + c < p.n);
+        }
+        return;
+    }
+
     // The tile's sums to dst (ggml's write back: columns past n are left out).
 #pragma unroll
     for (int mt = 0; mt < MT; mt++) {
@@ -718,5 +785,10 @@ extern const void * const legion_q40_quant_kernels[3] = {
     reinterpret_cast<const void *>(&q40_quant_norm<256>),
     reinterpret_cast<const void *>(&q40_quant_norm<1024>),
 };
+
+// The GeGLU pair (src/model/q40_mm.rs, `cuda::q40_geglu`): the op's matmul over a gate and an
+// up weight, grid ntx * (rows / 32), q40_op's threads and shared memory, writing the quantized
+// GeGLU. Its arguments are a legion_q40_mm.
+extern const void * const legion_q40_geglu_gemm = reinterpret_cast<const void *>(&q40_gemm<q40_op, 1>);
 
 }
