@@ -16,6 +16,13 @@ fn fixed_runs_shapes() {
     assert_eq!(fixed_runs_shape(256, 256, 24, 4, 1, 1), [1, 1, 1, 1]);
     // Runs of one block.
     assert_eq!(fixed_runs_shape(1, 256, 24, 2, 1, 3), [258, 3, 24, 2]);
+    // 16 sequences of 4096 one-block runs need a grid z of 65,536: unsplit; 65,535 fits.
+    assert_eq!(fixed_runs_shape(1, 256, 24, 2, 16, 4096), [1, 1, 1, 1]);
+    assert_eq!(
+        fixed_runs_shape(1, 256, 24, 2, 15, 4369),
+        [258, 4369, 24, 30]
+    );
+    assert!(fixed_runs_fit(65_535, 1) && !fixed_runs_fit(65_536, 1));
 }
 
 /// Off unless set; on, only for groups of 2 to 16 tokens a sequence (and on sm_80+).

@@ -119,9 +119,20 @@ pub fn fixed_split_shape(
     Some(fixed_runs_shape(f, d, n_head, n_tok, n_seqs, table_width))
 }
 
+/// The most blocks a CUDA launch takes on its grid's z axis: the fixed split's launches put
+/// `n_seqs × runs` there.
+const MAX_GRID_Z: usize = 65_535;
+
+/// Whether `n_seqs` sequences of `runs` runs each fit one fixed-split launch's grid
+/// ([`MAX_GRID_Z`]); groups that do not run unsplit (the default's bits).
+fn fixed_runs_fit(runs: usize, n_seqs: usize) -> bool {
+    runs.saturating_mul(n_seqs) <= MAX_GRID_Z
+}
+
 /// The scratch for runs of `f` key blocks over a table of `table_width` blocks a sequence:
 /// `[d + 2, runs, n_head, n_tok × n_seqs]`, a slot per run of the table, or the placeholder
-/// (no split, the default's bits) where the table is one run.
+/// (no split, the default's bits) where the table is one run or the runs of all sequences do
+/// not fit one launch's grid ([`fixed_runs_fit`]).
 fn fixed_runs_shape(
     f: usize,
     d: i64,
@@ -131,7 +142,9 @@ fn fixed_runs_shape(
     table_width: usize,
 ) -> [i64; 4] {
     match table_width.div_ceil(f.max(1)) {
-        runs @ 2.. => [d + 2, runs as i64, n_head, (n_tok * n_seqs) as i64],
+        runs @ 2.. if fixed_runs_fit(runs, n_seqs) => {
+            [d + 2, runs as i64, n_head, (n_tok * n_seqs) as i64]
+        }
         _ => [1, 1, 1, 1],
     }
 }
@@ -1442,7 +1455,10 @@ unsafe fn cuda_paged_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
     if p.max_split > 1
         && let Some(f) = fixed_split_blocks(o.n_tok)
     {
-        if o.ring == 0 && o.table_width.div_ceil(f) == p.max_split as usize {
+        if o.ring == 0
+            && o.table_width.div_ceil(f) == p.max_split as usize
+            && fixed_runs_fit(p.max_split as usize, o.n_seqs)
+        {
             p.split_fixed = f as i32;
         } else {
             p.max_split = 1;

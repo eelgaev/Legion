@@ -338,6 +338,7 @@ fn flags_set_their_switches() {
             moe_pad_skip: Some(false),
             tp_moe_ep_skip: Some(false),
             paged_verify_split: Some(true),
+            paged_verify_split_keys: None,
             paged_verify_split_wmma: Some(true),
             shexp_gate: Some(true),
             decode_fuse: Some(true),
