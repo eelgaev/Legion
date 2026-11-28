@@ -497,7 +497,13 @@ text moved once from the old default (the chats differ after 203, 933 and 167 ch
 `--moe-combine`'s text, logprobs bit for bit; with each of the four switches above added it stays the
 same, while the old default moved under each. No kernels added: decode and 10K / 123K prefill within
 noise (prompt chunks take the fused MoE op and build no chain). The step-buffer sizing grows by about
-10 MiB per GPU (16 expert cache slots of 5,363).
+10 MiB per GPU (16 expert cache slots of 5,363). On a GB10 with NVFP4 the MoE tails that the
+hyper-connection fold turns into one op drop their dependency nodes with the tail; before that the
+nodes kept the experts' F32 rows (and, with `--nvfp4-expert-rows-bf16`, their BF16 to F32 cast)
+alive, costing 8K prefill about 10-40%. When it became the default (Qwen3.8-Flash-Next-NVFP4 + MTP
+on one DGX Spark, the docs/run row flags, `--deterministic`): prefill 8K / 32K 2,674 / 2,897 ->
+2,676 / 2,896 tok/s, decode per step unchanged; the new text accepts slightly fewer MTP drafts
+(mean accepted length 2.98 -> 2.95), so 4-user det decode reads 92.0 -> 90.4 tok/s.
 
 ### Constrained output: JSON and strict tool calls
 
