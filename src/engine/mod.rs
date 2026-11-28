@@ -155,8 +155,8 @@ pub enum ResponseFormat {
 
 /// The [`GenerateRequest::template_kwargs`] key that carries a chat request's
 /// `reasoning_effort` as sent. Not a template variable (a dot cannot be one): the engine takes
-/// it out and passes it on as `reasoning_effort` only to the chat formats whose templates take
-/// the OpenAI levels as they are (Inkling-2's), so other templates render as before.
+/// it out and passes it on only to templates that read it without an `enable_thinking`
+/// (Inkling-2's as sent, GLM-5.3's in its own levels), so other templates render as before.
 pub const EFFORT_KWARG: &str = "legion.reasoning_effort";
 
 /// The [`GenerateRequest::template_kwargs`] key that carries a request's thinking budget (a

@@ -284,9 +284,14 @@ fn pending_after(mut pending: u8, piece: &[u8]) -> u8 {
 /// How a chat template takes a request's `reasoning_effort` itself, if it does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Switch {
-    /// It reads `enable_thinking` (Qwen, GLM, Gemma 4) or `reasoning_effort` (Inkling-2):
-    /// the effort goes there as before.
+    /// It reads `enable_thinking` (Qwen, Gemma 4, DeepSeek-V4.1): the effort goes there as the
+    /// request's `thinking`, as before.
     Native,
+    /// It reads `reasoning_effort` and no `enable_thinking` (Inkling-2): the effort goes there
+    /// as sent.
+    Effort,
+    /// GLM-5.3's `reasoning_effort`: `low` or `high`, anything else is its Max ([`low_high`]).
+    LowHigh,
     /// Muse Glimmer's `reasoning_strength`, `low` or `high` ([`strength`]).
     Strength,
     /// None: the effort becomes a budget ([`effort_budget`]).
@@ -298,11 +303,57 @@ impl Switch {
     pub(super) fn of(src: &str) -> Self {
         if src.contains("reasoning_strength") {
             Self::Strength
-        } else if src.contains("enable_thinking") || src.contains("reasoning_effort") {
+        } else if src.contains("enable_thinking") {
             Self::Native
+        } else if src.contains("reasoning_effort") {
+            if src.contains("['low', 'high']") {
+                Self::LowHigh
+            } else {
+                Self::Effort
+            }
         } else {
             Self::None
         }
+    }
+}
+
+/// Puts a chat request's `reasoning_effort` as sent (`effort`) into the template variables
+/// `kwargs`, where the client's own `chat_template_kwargs` win: as `reasoning_effort` for a
+/// framed format (Inkling-2) and a template that reads it without `enable_thinking`, GLM-5.3's
+/// in its levels ([`low_high`]), and Muse Glimmer's as `reasoning_strength`. Templates with
+/// `enable_thinking` (Qwen, DeepSeek-V4.1) get nothing here: the request's `thinking` is theirs.
+pub(super) fn effort_kwargs(
+    kwargs: &mut serde_json::Map<String, serde_json::Value>,
+    effort: Option<serde_json::Value>,
+    switch: Switch,
+    framed: bool,
+) {
+    let Some(effort) = effort else {
+        return;
+    };
+    if switch == Switch::Strength
+        && let Some(level) = effort.as_str().and_then(strength)
+    {
+        kwargs.entry("reasoning_strength").or_insert(level.into());
+    }
+    let value = match switch {
+        _ if framed => Some(effort),
+        Switch::Effort => Some(effort),
+        Switch::LowHigh => effort.as_str().and_then(low_high).map(Into::into),
+        _ => None,
+    };
+    if let Some(value) = value {
+        kwargs.entry("reasoning_effort").or_insert(value);
+    }
+}
+
+/// GLM-5.3's `reasoning_effort` for an OpenAI effort: its template takes `low` and `high`, and
+/// renders anything else (or none) as `Reasoning Effort: Max`, so `xhigh` and `max` set nothing.
+pub(super) fn low_high(effort: &str) -> Option<&'static str> {
+    match effort {
+        "none" | "minimal" | "low" => Some("low"),
+        "medium" | "high" => Some("high"),
+        _ => None,
     }
 }
 

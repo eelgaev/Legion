@@ -608,10 +608,12 @@ default: without a budget in the request nothing changes. A model whose chat for
 reasoning markers ignores it.
 
 `reasoning_effort` goes to the template's own switch where it has one: `enable_thinking`
-(Qwen, GLM, Gemma 4; `none` and `minimal` turn thinking off), Inkling-2's `reasoning_effort`, and
-Muse Glimmer's `reasoning_strength` (`none`, `minimal`, `low` → `low`; `medium` and up →
-`high`; a `reasoning_strength` in `chat_template_kwargs` wins). A template with none of these
-gets a budget instead, unless the request sent one:
+(Qwen, Gemma 4, DeepSeek-V4.1; `none` and `minimal` turn thinking off), Inkling-2's
+`reasoning_effort` (as sent), GLM-5.3-Flash's `reasoning_effort` (`none`, `minimal`, `low` →
+`low`; `medium`, `high` → `high`; `xhigh`, `max` leave the template's default, Max) and Muse
+Glimmer's `reasoning_strength` (`none`, `minimal`, `low` → `low`; `medium` and up → `high`).
+The same variable in `chat_template_kwargs` wins. A template with none of these gets a budget
+instead, unless the request sent one:
 
 | `reasoning_effort` | Budget |
 |---|---|

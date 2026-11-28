@@ -408,7 +408,15 @@ fn the_effort_goes_to_the_templates_switch_or_becomes_a_budget() {
         Switch::of("{% if enable_thinking %}<think>{% endif %}"),
         Switch::Native
     );
-    assert_eq!(Switch::of("{{ reasoning_effort }}"), Switch::Native);
+    assert_eq!(Switch::of("{{ reasoning_effort }}"), Switch::Effort);
+    assert_eq!(
+        Switch::of("{{ enable_thinking }}{{ reasoning_effort }}"),
+        Switch::Native
+    );
+    assert_eq!(
+        Switch::of("{{ reasoning_effort if reasoning_effort in ['low', 'high'] }}"),
+        Switch::LowHigh
+    );
     assert_eq!(
         Switch::of("{% set rs = reasoning_strength %}"),
         Switch::Strength
@@ -424,4 +432,196 @@ fn the_effort_goes_to_the_templates_switch_or_becomes_a_budget() {
     assert_eq!(effort_budget("medium"), Some(4096));
     assert_eq!(effort_budget("high"), Some(16384));
     assert_eq!(effort_budget("max"), None);
+    assert_eq!(low_high("none"), Some("low"));
+    assert_eq!(low_high("minimal"), Some("low"));
+    assert_eq!(low_high("low"), Some("low"));
+    assert_eq!(low_high("medium"), Some("high"));
+    assert_eq!(low_high("high"), Some("high"));
+    assert_eq!(low_high("xhigh"), None);
+    assert_eq!(low_high("max"), None);
+}
+
+/// A shipped chat template fixture and its source.
+fn fixture(name: &str, bos: &str, eos: &str) -> (crate::chat_template::ChatTemplate, String) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data/chat_template/templates")
+        .join(format!("{name}.jinja"));
+    let src = std::fs::read_to_string(path).unwrap();
+    let tpl = crate::chat_template::ChatTemplate::new(&src, bos, eos).unwrap();
+    (tpl, src)
+}
+
+type Kwargs = serde_json::Map<String, serde_json::Value>;
+
+fn render_kwargs(tpl: &crate::chat_template::ChatTemplate, kwargs: &Kwargs) -> String {
+    let user = crate::engine::Message {
+        role: Some(crate::engine::Role::User),
+        content: "Write a haiku about rain.".into(),
+        ..Default::default()
+    };
+    tpl.render(None, &[user], &[], true, kwargs).unwrap()
+}
+
+/// The prompt a chat renders to with top-level `reasoning_effort` `effort` and the client's
+/// `chat_template_kwargs` `client`, the way the server and `render` build the variables:
+/// `enable_thinking` from the effort unless the client set it, then [`effort_kwargs`].
+fn render_effort(
+    tpl: &crate::chat_template::ChatTemplate,
+    src: &str,
+    framed: bool,
+    effort: Option<&str>,
+    client: &[(&str, serde_json::Value)],
+) -> String {
+    let mut kwargs: Kwargs = client
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), v.clone()))
+        .collect();
+    if let Some(e) = effort
+        && !kwargs.contains_key("enable_thinking")
+    {
+        let on = !matches!(e, "none" | "minimal");
+        kwargs.insert("enable_thinking".into(), on.into());
+    }
+    effort_kwargs(&mut kwargs, effort.map(Into::into), Switch::of(src), framed);
+    render_kwargs(tpl, &kwargs)
+}
+
+/// The pieces of a rendered prompt (split at each `<|`) that hold `needle`, trimmed.
+fn lines_with<'a>(text: &'a str, needle: &str) -> Vec<&'a str> {
+    text.split("<|")
+        .filter(|l| l.contains(needle))
+        .map(str::trim)
+        .collect()
+}
+
+#[test]
+fn glm_takes_the_effort_as_low_or_high() {
+    let (tpl, src) = fixture("glm53", "", "<|endoftext|>");
+    assert_eq!(Switch::of(&src), Switch::LowHigh);
+    // No effort: the prompt is what the template renders without variables.
+    let max = render_kwargs(&tpl, &Kwargs::new());
+    assert_eq!(render_effort(&tpl, &src, false, None, &[]), max);
+    assert_eq!(
+        lines_with(&max, "Reasoning Effort"),
+        ["system|>Reasoning Effort: Max"]
+    );
+    for (effort, line) in [
+        ("none", "Low"),
+        ("minimal", "Low"),
+        ("low", "Low"),
+        ("medium", "High"),
+        ("high", "High"),
+    ] {
+        let got = render_effort(&tpl, &src, false, Some(effort), &[]);
+        assert_eq!(
+            lines_with(&got, "Reasoning Effort"),
+            [format!("system|>Reasoning Effort: {line}")],
+            "{effort}"
+        );
+        // Only that line differs from Max.
+        assert_eq!(
+            got.replace(&format!("Effort: {line}"), "Effort: Max"),
+            max,
+            "{effort}"
+        );
+    }
+    // xhigh and max are the template's Max; an unknown effort leaves it too.
+    for effort in ["xhigh", "max", "bogus"] {
+        assert_eq!(
+            render_effort(&tpl, &src, false, Some(effort), &[]),
+            max,
+            "{effort}"
+        );
+    }
+    // The client's own kwarg wins over the top-level effort.
+    let got = render_effort(
+        &tpl,
+        &src,
+        false,
+        Some("low"),
+        &[("reasoning_effort", "high".into())],
+    );
+    assert_eq!(
+        lines_with(&got, "Reasoning Effort"),
+        ["system|>Reasoning Effort: High"]
+    );
+}
+
+#[test]
+fn inkling_takes_the_effort_as_sent() {
+    let (tpl, src) = fixture("inkling2", "", "<|content_model_end_sampling|>");
+    assert_eq!(Switch::of(&src), Switch::Effort);
+    let default = render_kwargs(&tpl, &Kwargs::new());
+    assert_eq!(render_effort(&tpl, &src, true, None, &[]), default);
+    assert!(default.contains("Thinking effort level: 0.9<|end_message|>"));
+    for (effort, level) in [
+        ("none", "0"),
+        ("minimal", "0.1"),
+        ("low", "0.2"),
+        ("medium", "0.7"),
+        ("high", "0.9"),
+        ("xhigh", "0.99"),
+        ("max", "0.99"),
+    ] {
+        // As before: the effort as sent is the template's `reasoning_effort`.
+        let mut sent = Kwargs::new();
+        sent.insert("reasoning_effort".into(), effort.into());
+        let got = render_effort(&tpl, &src, true, Some(effort), &[]);
+        assert_eq!(got, render_kwargs(&tpl, &sent), "{effort}");
+        assert!(
+            got.contains(&format!("Thinking effort level: {level}<|end_message|>")),
+            "{effort}: {got}"
+        );
+    }
+}
+
+#[test]
+fn templates_with_enable_thinking_get_no_effort() {
+    for (name, bos, eos) in [
+        ("qwen3", "", "<|im_end|>"),
+        (
+            "deepseek41",
+            "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>",
+            "<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>",
+        ),
+    ] {
+        let (tpl, src) = fixture(name, bos, eos);
+        assert_eq!(Switch::of(&src), Switch::Native, "{name}");
+        assert_eq!(
+            render_effort(&tpl, &src, false, None, &[]),
+            render_kwargs(&tpl, &Kwargs::new()),
+            "{name}"
+        );
+        // Every effort is only `enable_thinking`, as before (DeepSeek-V4.1's own
+        // `reasoning_effort` would reject `medium`).
+        for effort in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
+            let mut thinking = Kwargs::new();
+            thinking.insert(
+                "enable_thinking".into(),
+                (!matches!(effort, "none" | "minimal")).into(),
+            );
+            assert_eq!(
+                render_effort(&tpl, &src, false, Some(effort), &[]),
+                render_kwargs(&tpl, &thinking),
+                "{name} {effort}"
+            );
+        }
+    }
+}
+
+#[test]
+fn muse_takes_the_effort_as_strength() {
+    let src = "{{ reasoning_strength }}|{{ reasoning_effort }}";
+    assert_eq!(Switch::of(src), Switch::Strength);
+    let mut kwargs = Kwargs::new();
+    effort_kwargs(&mut kwargs, Some("medium".into()), Switch::of(src), true);
+    assert_eq!(kwargs["reasoning_strength"], "high");
+    assert_eq!(kwargs["reasoning_effort"], "medium");
+    let mut kwargs = Kwargs::new();
+    kwargs.insert("reasoning_strength".into(), "low".into());
+    effort_kwargs(&mut kwargs, Some("high".into()), Switch::of(src), true);
+    assert_eq!(kwargs["reasoning_strength"], "low");
+    let mut kwargs = Kwargs::new();
+    effort_kwargs(&mut kwargs, None, Switch::of(src), true);
+    assert!(kwargs.is_empty());
 }

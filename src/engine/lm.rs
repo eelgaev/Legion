@@ -6445,26 +6445,16 @@ impl LmEngine {
                 if let Some(on) = req.response_format.as_ref().map(|_| false).or(req.thinking) {
                     kwargs.insert("enable_thinking".into(), Value::Bool(on));
                 }
-                // Inkling-2's template reads `reasoning_effort` itself (the client's kwarg
-                // wins); others never see it. Muse Glimmer's takes it as `reasoning_strength`
-                // (low or high).
+                // The effort as the template's own switch takes it, if not `enable_thinking`
+                // (Inkling-2, GLM-5.3, Muse Glimmer); the client's kwargs win.
                 let effort = kwargs.remove(super::EFFORT_KWARG);
                 kwargs.remove(super::BUDGET_KWARG);
-                if self.effort_switch == think_budget::Switch::Strength
-                    && let Some(level) = effort
-                        .as_ref()
-                        .and_then(Value::as_str)
-                        .and_then(think_budget::strength)
-                {
-                    kwargs
-                        .entry("reasoning_strength")
-                        .or_insert(Value::String(level.into()));
-                }
-                if self.chat_format.framed()
-                    && let Some(effort) = effort
-                {
-                    kwargs.entry("reasoning_effort").or_insert(effort);
-                }
+                think_budget::effort_kwargs(
+                    &mut kwargs,
+                    effort,
+                    self.effort_switch,
+                    self.chat_format.framed(),
+                );
                 // Qwen templates only accept a system message first. Later ones (Claude Code
                 // sends system turns mid-conversation) become user turns at their position,
                 // which keeps the conversation's earlier prefix (and its cache) unchanged.
