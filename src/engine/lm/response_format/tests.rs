@@ -14,6 +14,7 @@ fn json_overrides_thinking_and_template_kwargs() {
         vision: None,
         info: ModelInfo::default(),
         chat_format: super::super::chat_format::ChatFormat::detect(&tokenizer),
+        effort_switch: super::super::think_budget::Switch::None,
         undeclared_tool_calls: false,
         tokenizer,
         template: Some(
