@@ -574,25 +574,31 @@ fn cuda_q40_mm_time_at_4096_rows() {
             *ms = t0.elapsed().as_secs_f64() * 1e3 / CALLS as f64;
             use_variant(0);
         }
+        // One line a shape: each matmul's ms and share of the peak (TOPS without a peak).
         let tops = |ms: f64| 2.0 * (k * rows * n) as f64 / ms / 1e9;
-        for (i, &t) in ms.iter().enumerate() {
-            let name = if i == 0 {
-                "ggml".to_string()
-            } else {
-                cuda::kernel_name(i - 1)
-            };
-            let share = if peak > 0.0 {
-                format!(", {:.0}% of peak", 100.0 * tops(t) / peak)
-            } else {
-                String::new()
-            };
-            println!(
-                "{k}x{rows}, {n} columns, {name}: {t:.2} ms ({:.0} TOPS{share}), {:.2}x ggml, {:.2}x the first version",
-                tops(t),
-                ms[0] / t,
-                ms[v1] / t
-            );
-        }
+        let parts: Vec<String> = ms
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| {
+                let name = if i == 0 {
+                    "ggml".to_string()
+                } else {
+                    cuda::kernel_name(i - 1)
+                };
+                let share = if peak > 0.0 {
+                    format!("{:.0}%", 100.0 * tops(t) / peak)
+                } else {
+                    format!("{:.0} TOPS", tops(t))
+                };
+                format!("{name} {t:.2} ({share})")
+            })
+            .collect();
+        println!(
+            "{k}x{rows} at {n}, ms: {}; q40_mm {:.2}x ggml, {:.2}x the first version",
+            parts.join(", "),
+            ms[0] / ms[1],
+            ms[v1] / ms[1]
+        );
     }
 }
 
@@ -1093,7 +1099,10 @@ fn cuda_q40_mm_ffn_time_at_4096_rows() {
             .unwrap();
         gate.set_bytes(&wg);
         up.set_bytes(&wu);
-        down.set_bytes(&wd);
+        if i >= 2 {
+            // Not in the graphs without down: no memory.
+            down.set_bytes(&wd);
+        }
         for (x, b) in xs.iter().zip(&bufs) {
             x.set_bytes(b);
         }

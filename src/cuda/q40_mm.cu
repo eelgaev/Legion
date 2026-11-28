@@ -137,6 +137,40 @@ __device__ __forceinline__ uint32_t q40_s8x16(const uint32_t nib) {
 
 #endif
 
+// The producer-warp matmul's mbarriers: sm_90 and newer (mbarrier.try_wait).
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
+
+__device__ __forceinline__ unsigned q40_sa(const void * p) {
+    return (unsigned) __cvta_generic_to_shared(p);
+}
+
+__device__ __forceinline__ void q40_bar_init(uint64_t * b, const int count) {
+    asm volatile("mbarrier.init.shared.b64 [%0], %1;\n" ::"r"(q40_sa(b)), "r"(count) : "memory");
+}
+
+__device__ __forceinline__ void q40_bar_arrive(uint64_t * b) {
+    asm volatile("{\n.reg .b64 st;\nmbarrier.arrive.shared.b64 st, [%0];\n}\n" ::"r"(q40_sa(b)) : "memory");
+}
+
+// Waits until the phase of parity `parity` of `b` completed.
+__device__ __forceinline__ void q40_bar_wait(uint64_t * b, const int parity) {
+    unsigned ok;
+    do {
+        asm volatile(
+            "{\n.reg .pred p;\nmbarrier.try_wait.parity.shared.b64 p, [%1], %2;\nselp.u32 %0, 1, 0, p;\n}\n"
+            : "=r"(ok)
+            : "r"(q40_sa(b)), "r"(parity)
+            : "memory");
+    } while (!ok);
+}
+
+// An arrival on `b` once this thread's cp.async copies so far landed (counted in b's init).
+__device__ __forceinline__ void q40_cp_arrive(uint64_t * b) {
+    asm volatile("cp.async.mbarrier.arrive.noinc.shared.b64 [%0];\n" ::"r"(q40_sa(b)) : "memory");
+}
+
+#endif
+
 // ggml's quantize_mmq_q8_1 values for a Q4_0 weight (MMQ_Q8_1_DS_LAYOUT_DS4): each 32-value
 // block's absmax over 8 threads of 4 values, d_inv = 127 / amax, roundf(x * d_inv), d = 1 / d_inv
 // stored as F16. Column col's block kb, slot s (values 4s .. 4s + 3) is word w = 2s for s < 4,
@@ -746,6 +780,184 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
 #endif
 }
 
+// q40_gemm of configuration C with a producer warp instead of the barrier a stage: C's warps
+// (the consumers) run q40_gemm's math and write back; one more warp issues every stage's
+// copies, each lane's tracked by the slot's `full` mbarrier (cp.async.mbarrier.arrive), and
+// refills a slot once every consumer warp arrived on its `empty` mbarrier. A consumer waits only
+// for its stage's data, so warps drift up to a stage apart. The same chains: the same bits.
+// C::THREADS + 32 threads, C::SMEM + 16 C::STAGES bytes of shared memory (the mbarriers after
+// the ring). sm_90 and newer.
+template <class C> __global__ void __launch_bounds__(C::THREADS + 32, C::MINB) q40_gemm_ws(const legion_q40_mm p) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    constexpr int SB = C::SB, MT = C::MT, NT = C::NT, BM = C::BM, BN = C::BN, S = C::STAGES;
+    constexpr int CW = C::THREADS / 32;  // consumer warps
+    extern __shared__ __align__(16) uint32_t q40_smem[];
+    uint64_t * full  = reinterpret_cast<uint64_t *>(q40_smem + S * C::STAGE_WORDS);
+    uint64_t * empty = full + S;
+    const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, g = lane / 4, q = lane % 4;
+
+    // The tile, as q40_gemm's.
+    const int b         = blockIdx.x;
+    const int nmaj      = C::COLS ? p.ntx : p.nty;
+    const int nmin      = C::COLS ? p.nty : p.ntx;
+    const int per_group = C::GROUP * nmin;
+    const int grp       = b / per_group;
+    const int r0        = grp * C::GROUP;
+    const int gsz       = min(C::GROUP, nmaj - r0);
+    const int in        = b - grp * per_group;
+    const int it        = C::COLS ? in / gsz : r0 + in % gsz;
+    const int jt        = C::COLS ? r0 + in % gsz : in / gsz;
+    const int row0      = it * BM;
+    const int col0      = jt * BN;
+    const int nst       = p.k / (32 * SB);
+
+    if (tid == 0) {
+#pragma unroll
+        for (int s = 0; s < S; s++) {
+            q40_bar_init(full + s, 32);
+            q40_bar_init(empty + s, CW);
+        }
+    }
+    __syncthreads();
+
+    if (warp == CW) {
+        // The producer: q40_gemm's copies of stage st into slot st % S, 32 lanes.
+        const char * wg = (const char *) p.w + (long long) row0 * p.w_nb1;
+        const long long qstep = (long long) p.n_pad * 8;
+        const int * qg = p.yq + (long long) col0 * 8;
+        for (int st = 0; st < nst; st++) {
+            const int s = st % S;
+            if (st >= S) {
+                q40_bar_wait(empty + s, (st / S - 1) & 1);
+            }
+            uint32_t * sw = q40_smem + s * C::STAGE_WORDS;
+            uint32_t * sq = sw + C::W_WORDS;
+            uint32_t * sd = sq + C::Q_WORDS;
+            const int odd = st & 1;
+            const char * w = wg + (long long) (st >> 1) * 144 + odd * 64;
+            for (int c = lane; c < C::WCH; c += 32) {
+                const int r = c / 5, ch = c % 5;
+                q40_cp16z(sw + c * 4, w + r * (int) p.w_nb1 + ch * 16, ch == 4 && !odd ? 8 : 16);
+            }
+            const long long kb0 = (long long) st * SB;
+#pragma unroll 4
+            for (int c = lane; c < C::QCH; c += 32) {
+                const int bl = c / (2 * BN), wi = c % (2 * BN);
+                q40_cp16(sq + bl * BN * 8 + wi * 4, qg + (kb0 + bl) * qstep + wi * 4);
+            }
+            for (int c = lane; c < C::DCH; c += 32) {
+                const int dbl = c / (BN / 4), dch = c % (BN / 4);
+                q40_cp16(sd + dbl * C::D_BL + dch / 32 * 144 + dch % 32 / 8 * 36 + dch % 8 * 4,
+                         p.yd + (kb0 + dbl) * p.n_pad + col0 + dch * 4);
+            }
+            q40_cp_arrive(full + s);
+        }
+        asm volatile("cp.async.wait_all;\n" ::: "memory");
+        return;
+    }
+
+    const int wm = warp % C::WARPS_M, wn = warp / C::WARPS_M;
+    float acc[MT][NT][4];
+#pragma unroll
+    for (int mt = 0; mt < MT; mt++) {
+#pragma unroll
+        for (int nt = 0; nt < NT; nt++) {
+#pragma unroll
+            for (int l = 0; l < 4; l++) {
+                acc[mt][nt][l] = 0.0f;
+            }
+        }
+    }
+
+    for (int st = 0; st < nst; st++) {
+        const int s = st % S;
+        q40_bar_wait(full + s, (st / S) & 1);
+
+        const uint32_t * sw = q40_smem + s * C::STAGE_WORDS;
+        const uint32_t * sq = sw + C::W_WORDS;
+        const float    * sd = (const float *) (sq + C::Q_WORDS);
+        const uint32_t * sa = sw + (st & 1) * 2 + (wm * 16 * MT + g) * C::WRS;
+#pragma unroll
+        for (int bl = 0; bl < SB; bl++) {
+            uint32_t a[MT][4];
+            float da[MT][2], mda[MT][2];
+#pragma unroll
+            for (int mt = 0; mt < MT; mt++) {
+#pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    const uint32_t * rw = sa + (mt * 16 + h * 8) * C::WRS + 9 * (bl / 2);
+                    uint32_t lo, hi;
+                    unsigned short dh;
+                    if (bl % 2 == 0) {
+                        const uint32_t x0 = rw[q], x1 = rw[q + 1];
+                        lo = __funnelshift_r(x0, x1, 12);
+                        hi = __funnelshift_r(x0, x1, 16);
+                        dh = (unsigned short) (rw[0] & 0xFFFF);
+                    } else {
+                        hi = rw[5 + q];
+                        lo = hi << 4;
+                        dh = (unsigned short) (rw[4] >> 16);
+                    }
+                    a[mt][h]     = q40_s8x16(lo);
+                    a[mt][h + 2] = q40_s8x16(hi);
+                    const float d = __half2float(__ushort_as_half(dh));
+                    da[mt][h]  = __fmul_rn(d, 0.0625f);
+                    mda[mt][h] = __fmul_rn(d, -0.0625f * Q40_MAGIC);
+                }
+            }
+            const uint32_t * bq = sq + bl * BN * 8;
+            const float    * bd = sd + bl * C::D_BL;
+#pragma unroll
+            for (int pi = 0; pi < NT / 2; pi++) {
+                const int pr = wn * (NT / 2) + pi;
+                const uint4  bv = *reinterpret_cast<const uint4 *>(bq + ((pr * 8 + g) * 4 + q) * 4);
+                const float4 dv = *reinterpret_cast<const float4 *>(bd + pr / 8 * 144 + q * 36 + pr % 8 * 4);
+#pragma unroll
+                for (int e = 0; e < 2; e++) {
+                    const int nt = 2 * pi + e;
+                    const int b0 = (int) (e ? bv.z : bv.x), b1 = (int) (e ? bv.w : bv.y);
+                    const float d0 = e ? dv.z : dv.x, d1 = e ? dv.w : dv.y;
+#pragma unroll
+                    for (int mt = 0; mt < MT; mt++) {
+                        int d[4];
+                        q40_mma(d, a[mt], b0, b1);
+                        const float t0 = __fmaf_rn(__int_as_float(d[0]), da[mt][0], mda[mt][0]);
+                        const float t1 = __fmaf_rn(__int_as_float(d[1]), da[mt][0], mda[mt][0]);
+                        const float t2 = __fmaf_rn(__int_as_float(d[2]), da[mt][1], mda[mt][1]);
+                        const float t3 = __fmaf_rn(__int_as_float(d[3]), da[mt][1], mda[mt][1]);
+                        acc[mt][nt][0] = __fmaf_rn(t0, d0, acc[mt][nt][0]);
+                        acc[mt][nt][1] = __fmaf_rn(t1, d1, acc[mt][nt][1]);
+                        acc[mt][nt][2] = __fmaf_rn(t2, d0, acc[mt][nt][2]);
+                        acc[mt][nt][3] = __fmaf_rn(t3, d1, acc[mt][nt][3]);
+                    }
+                }
+            }
+        }
+        __syncwarp();
+        if (lane == 0) {
+            q40_bar_arrive(empty + s);
+        }
+    }
+
+#pragma unroll
+    for (int mt = 0; mt < MT; mt++) {
+#pragma unroll
+        for (int nt = 0; nt < NT; nt++) {
+#pragma unroll
+            for (int l = 0; l < 4; l++) {
+                const int i = row0 + wm * 16 * MT + mt * 16 + g + (l >> 1) * 8;
+                const int j = col0 + wn * 8 * NT + nt * 8 + 2 * q + (l & 1);
+                if (j < p.n) {
+                    p.dst[(long long) j * p.dst_ld + i] = acc[mt][nt][l];
+                }
+            }
+        }
+    }
+#else
+    __trap();
+#endif
+}
+
 using q40_op  = q40_cfg<64, 128, 2, 2, 2, 2, 4, 1>;   // the op's: 4 warps of 32 x 64, 2 CTAs an SM
 using q40_128 = q40_cfg<128, 128, 4, 2, 3, 1, 8, 0>;  // 8 warps of 32 x 64, 1 CTA an SM
 
@@ -774,6 +986,11 @@ extern const legion_q40_kernel legion_q40_mm_table[] = {
       Q40_STAGES * Q40_STAGE_WORDS * 4, Q40_THREADS, Q40_BM, Q40_BN, "first version" },
     { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_128>),
       q40_128::SMEM, q40_128::THREADS, q40_128::BM, q40_128::BN, "128 x 128 tiles" },
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm_ws<q40_op>),
+      q40_op::SMEM + 16 * q40_op::STAGES, q40_op::THREADS + 32, q40_op::BM, q40_op::BN, "producer warp" },
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm_ws<q40_128>),
+      q40_128::SMEM + 16 * q40_128::STAGES, q40_128::THREADS + 32, q40_128::BM, q40_128::BN,
+      "128 x 128 producer warp" },
 };
 extern const int legion_q40_mm_table_len = sizeof(legion_q40_mm_table) / sizeof(legion_q40_mm_table[0]);
 
