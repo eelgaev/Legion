@@ -144,3 +144,13 @@ fn prepare_refuses_before_queueing() {
         EngineError::KvOverflow { .. }
     ));
 }
+
+#[test]
+fn huge_sizes_saturate_instead_of_wrapping() {
+    assert_eq!(context_blocks(usize::MAX, 3), usize::MAX.div_ceil(KV_BLOCK));
+    assert_eq!(
+        blocks(usize::MAX, u32::MAX, usize::MAX, 3),
+        usize::MAX.div_ceil(KV_BLOCK)
+    );
+    assert!(context_blocks(usize::MAX - 1, 8) >= context_blocks(1 << 20, 8));
+}

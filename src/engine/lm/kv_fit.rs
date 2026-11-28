@@ -10,15 +10,15 @@ use crate::model::core::KV_BLOCK;
 /// length, at most `max_ctx`, and the `spec_k` positions a verify step writes past the last
 /// one it keeps.
 pub fn blocks(prompt: usize, max_tokens: u32, max_ctx: usize, spec_k: usize) -> usize {
-    let max_len = (prompt + max_tokens as usize).min(max_ctx);
-    (max_len + spec_k).div_ceil(KV_BLOCK)
+    let max_len = prompt.saturating_add(max_tokens as usize).min(max_ctx);
+    max_len.saturating_add(spec_k).div_ceil(KV_BLOCK)
 }
 
 /// The most [`blocks`] gives for a `ctx_size` context: what the automatic KV pool counts per
 /// context, so a request whose prompt and `max_tokens` fill the context runs with `spec_k`
-/// drafts on.
+/// drafts on. Saturates, so a huge `--ctx-size` asks for more than any pool instead of wrapping.
 pub fn context_blocks(ctx_size: usize, spec_k: usize) -> usize {
-    (ctx_size + spec_k).div_ceil(KV_BLOCK)
+    ctx_size.saturating_add(spec_k).div_ceil(KV_BLOCK)
 }
 
 /// [`blocks`] against a pool of `pool_blocks`: [`EngineError::KvOverflow`] when it needs more.
