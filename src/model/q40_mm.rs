@@ -431,7 +431,14 @@ fn slot_word(s: usize) -> usize {
 /// # Safety
 /// `buf` holds [`quant_bytes`] of `k` x (any `n` padding to `n_pad`) bytes (any alignment: the
 /// scales go in as little-endian bytes, as [`get_col`] reads them).
-unsafe fn put_col(buf: *mut u8, k: usize, n_pad: usize, col: usize, q: &[i8], d: &[f32]) {
+pub(crate) unsafe fn put_col(
+    buf: *mut u8,
+    k: usize,
+    n_pad: usize,
+    col: usize,
+    q: &[i8],
+    d: &[f32],
+) {
     let scales = k / QK as usize * n_pad * 32;
     // SAFETY: the caller's: every offset is within the blocks or the scales.
     unsafe {
@@ -455,7 +462,14 @@ unsafe fn put_col(buf: *mut u8, k: usize, n_pad: usize, col: usize, q: &[i8], d:
 ///
 /// # Safety
 /// As [`put_col`].
-unsafe fn zero_pad_cols(buf: *mut u8, k: usize, n: usize, n_pad: usize, ith: usize, nth: usize) {
+pub(crate) unsafe fn zero_pad_cols(
+    buf: *mut u8,
+    k: usize,
+    n: usize,
+    n_pad: usize,
+    ith: usize,
+    nth: usize,
+) {
     let (q, d) = (vec![0i8; k], vec![0f32; k / QK as usize]);
     for c in (n + ith..n_pad).step_by(nth) {
         // SAFETY: the caller's.
@@ -656,7 +670,7 @@ unsafe fn cpu_q40_mm(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
 }
 
 #[cfg(feature = "cuda")]
-mod cuda {
+pub(crate) mod cuda {
     use std::cell::Cell;
     use std::collections::HashMap;
     use std::os::raw::{c_int, c_void};
@@ -991,6 +1005,54 @@ mod cuda {
         }
     }
 
+    /// The op's quantization (the table's first, layout 1) of the F32 `[k, n]` columns at `x`
+    /// (`x_ld` floats apart) into `out` ([`quant_bytes`] bytes), on `stream`: a [`quantize`]
+    /// node's launch.
+    ///
+    /// # Safety
+    /// `x` and `out` are device memory of the stream's device (the current one) of those
+    /// sizes; `k` is a multiple of 256.
+    pub(crate) unsafe fn quantize_f32(
+        x: *const f32,
+        x_ld: i64,
+        k: i64,
+        n: i64,
+        out: *mut u8,
+        stream: *mut c_void,
+    ) -> Result<(), String> {
+        if !(out as usize).is_multiple_of(16) {
+            return Err("q40_quant: output not 16-byte aligned".into());
+        }
+        let n_pad = n_padded(n);
+        let mut a = Params {
+            w: std::ptr::null(),
+            x,
+            yq: out as *mut i32,
+            // SAFETY: within the caller's `out`.
+            yd: unsafe { out.add((k / QK) as usize * n_pad as usize * 32) } as *mut f32,
+            dst: std::ptr::null_mut(),
+            x_ld,
+            w_nb1: 0,
+            dst_ld: 0,
+            k: k as i32,
+            n: n as i32,
+            n_pad: n_pad as i32,
+            rows: 0,
+            ntx: 0,
+            nty: 0,
+            w2: std::ptr::null(),
+            oq: std::ptr::null_mut(),
+            od: std::ptr::null_mut(),
+        };
+        let grid = Dim3 {
+            x: n as u32,
+            y: (k / K_STEP) as u32,
+            z: 1,
+        };
+        let block = Dim3 { x: 64, y: 1, z: 1 };
+        launch(kernel(0).quant, grid, block, 0, &mut a, stream)
+    }
+
     /// A [`Q40_QUANT`] node: the op's quantization (the table's first, layout 1) of its input,
     /// or one of the fused quantizations.
     pub(super) unsafe fn q40_quant(
@@ -1028,26 +1090,14 @@ mod cuda {
             };
             let block64 = Dim3 { x: 64, y: 1, z: 1 };
             if kind == QUANT_PLAIN {
-                let mut a = Params {
-                    w: std::ptr::null(),
-                    x: x.data as *const f32,
-                    yq,
-                    yd,
-                    dst: std::ptr::null_mut(),
-                    x_ld: (x.nb[1] / 4) as i64,
-                    w_nb1: 0,
-                    dst_ld: 0,
-                    k: k as i32,
-                    n: n as i32,
-                    n_pad: n_pad as i32,
-                    rows: 0,
-                    ntx: 0,
-                    nty: 0,
-                    w2: std::ptr::null(),
-                    oq: std::ptr::null_mut(),
-                    od: std::ptr::null_mut(),
-                };
-                return launch(kernel(0).quant, wide, block64, 0, &mut a, stream);
+                return quantize_f32(
+                    x.data as *const f32,
+                    (x.nb[1] / 4) as i64,
+                    k,
+                    n,
+                    base as *mut u8,
+                    stream,
+                );
             }
             let x2 = &*dst.src[1];
             let mut a = QuantParams {

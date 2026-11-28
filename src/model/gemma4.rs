@@ -996,7 +996,8 @@ impl Model {
             None => vec![None; names.len()],
         };
         let o = self.gemma4_attend_qkv(pass, il, Some(h), multi, pos)?;
-        let o = self.lmm(ctx, il, "attn_output.weight", o)?;
+        // Prompt steps of Q4_0 weights: over the quantization the attention writes (#1161).
+        let o = self.lmm_attn_out(ctx, il, "attn_output.weight", o, !pass.tap.on)?;
         // Over machines: the dense FFN's gate and up read into L2 during the sum's wait
         // (#1181); the steps that do it (9+ tokens) read both in one kernel (the fused GeGLU).
         let ffn = if self.w(&format!("blk.{il}.ffn_gate_inp.weight")).is_ok() {
