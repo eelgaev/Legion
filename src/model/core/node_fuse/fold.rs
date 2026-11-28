@@ -526,13 +526,15 @@ impl Graph {
                 return self.plain_tail(s, &gt, saved);
             };
             let norm = self.nodes[ni];
+            let pins = self.pins(s);
             let mut dead: Vec<usize> = (s.at..=s.last).collect();
             dead.extend(&gt.chain);
             dead.push(gt.add);
             dead.extend(view);
+            dead.extend(&pins);
             // BF16 rows read back as F32 (`--nvfp4-expert-rows-bf16`, #1183): the norm reads
             // the BF16 rows (the cast is exact) and the cast goes too.
-            let (x, cast) = match self.bf16_rows(x, s.at) {
+            let (x, cast) = match self.bf16_rows(x, s.at, &pins) {
                 Some((rows, i)) => (rows, Some(i)),
                 None => (x, None),
             };
@@ -550,24 +552,58 @@ impl Graph {
     }
 
     /// Where `x` is a cast to F32 of contiguous BF16 rows of its shape (a node), read only by the
-    /// node `at`: those rows and the cast's index.
+    /// node `at` and the sum's `pins` ([`Self::pins`], retired with the tail): those rows and
+    /// the cast's index.
     ///
     /// # Safety
     /// `x` is a valid tensor of the graph.
-    unsafe fn bf16_rows(&self, x: Node, at: usize) -> Option<(Node, usize)> {
+    unsafe fn bf16_rows(&self, x: Node, at: usize, pins: &[usize]) -> Option<(Node, usize)> {
         // SAFETY: the caller's; sources are valid tensors.
         unsafe {
             let src = (*x).src[0];
             let i = *self.index.get(&(x as usize))?;
+            // ggml's cast lists itself as its second source.
+            let mut allowed = vec![at, i];
+            allowed.extend(pins);
             ((*x).op == ffi::ggml_op_GGML_OP_CPY
                 && !self.none[i]
                 && !src.is_null()
                 && (*src).type_ == ffi::ggml_type_GGML_TYPE_BF16
                 && ffi::ggml_is_contiguous(src)
                 && (*src).ne == (*x).ne
-                // ggml's cast lists itself as its second source.
-                && self.only_read_by(x, &[at, i]))
+                && self.only_read_by(x, &allowed))
             .then_some((src, i))
+        }
+    }
+
+    /// The dependency nodes that keep the sum `s`'s inputs allocated until its last add (stable
+    /// fusions, `crate::model::core::stable_fusions`, on by default): nodes after the sum,
+    /// `GGML_OP_NONE` views that read nothing but its experts' rows and weights. They only make
+    /// the graph as built fuse the sum whatever the layout; once the tail is made by one op,
+    /// they go with its nodes, so they keep neither the rows nor their BF16 cast alive (with
+    /// them the cast stayed and every prompt step's compute buffer grew by a layer's F32 rows).
+    ///
+    /// # Safety
+    /// `s` is a match of this graph, whose nodes are valid tensors.
+    unsafe fn pins(&self, s: &Sum) -> Vec<usize> {
+        // SAFETY: the caller's; nodes and their sources are valid tensors.
+        unsafe {
+            let mut pins: Vec<usize> = Vec::new();
+            for &u in self.users(s.experts).iter().chain(self.users(s.weights)) {
+                let t = self.nodes[u];
+                let pin = u > s.last
+                    && !self.none[u]
+                    && (*t).op == ffi::ggml_op_GGML_OP_NONE
+                    && !(*t).view_src.is_null()
+                    && (*t)
+                        .src
+                        .iter()
+                        .all(|&x| x.is_null() || x == s.experts || x == s.weights);
+                if pin && !pins.contains(&u) {
+                    pins.push(u);
+                }
+            }
+            pins
         }
     }
 
@@ -598,13 +634,15 @@ impl Graph {
         }
         // SAFETY: the caller's; nodes and their sources are valid tensors.
         unsafe {
-            let (rows, cast) = match self.bf16_rows(s.experts, s.at) {
+            let pins = self.pins(s);
+            let (rows, cast) = match self.bf16_rows(s.experts, s.at, &pins) {
                 Some((rows, i)) => (rows, Some(i)),
                 None => (s.experts, None),
             };
             let a = self.nodes[gt.add];
             let mut dead: Vec<usize> = (s.at..=s.last).collect();
             dead.extend(&gt.chain);
+            dead.extend(&pins);
             dead.extend(cast);
             saved.push((a, std::ptr::read(a)));
             saved.extend(
@@ -635,15 +673,20 @@ impl Graph {
         // SAFETY: the caller's; nodes and their sources are valid tensors.
         unsafe {
             let a = self.nodes[gt.add];
+            let pins = self.pins(s);
             let mut dead: Vec<usize> = (s.at..=s.last).collect();
             dead.extend(&gt.chain);
+            dead.extend(&pins);
             // Rows of zero weights skipped only under --tp-moe-ep, where they hold +0.0.
             let ep = crate::model::core::tp_ep::active() && crate::model::core::tp_ep::skip();
             let fma = if ep { FMA_SKIP } else { 1 };
             // BF16 rows read back as F32 (`--nvfp4-expert-rows-bf16`, #1183): the op reads the
             // BF16 rows (the cast is exact) and the cast goes too, as in `fold_tail` (not under
             // --tp-moe-ep, whose unread rows are marked from the F32 rows' node below).
-            let (x, cast) = match (!ep).then(|| self.bf16_rows(s.experts, s.at)).flatten() {
+            let (x, cast) = match (!ep)
+                .then(|| self.bf16_rows(s.experts, s.at, &pins))
+                .flatten()
+            {
                 Some((rows, i)) => (rows, Some(i)),
                 None => (s.experts, None),
             };
@@ -659,7 +702,9 @@ impl Graph {
                 // their zeros (the experts' rows read by the tail's `mul` alone, so by the new
                 // op alone).
                 let down = root(s.experts);
-                if self.only_read_by(down, &[s.at]) {
+                let mut readers = vec![s.at];
+                readers.extend(&pins);
+                if self.only_read_by(down, &readers) {
                     let at = |t: Node| self.index.get(&(t as usize)).copied();
                     let di = at(down);
                     let marks = nvfp4_mm::unread_nodes(down, |g| {

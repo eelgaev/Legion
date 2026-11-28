@@ -25,17 +25,19 @@ pub(in crate::cli) struct SwitchArgs {
     /// allocations, #410). Off by default. Replaces LEGION_MOE_COMBINE=1.
     #[arg(long, help_heading = HEADING)]
     moe_combine: bool,
-    /// CUDA, MoE layers: keep the inputs of ggml-cuda's fused weighted expert sum and top-k
-    /// router allocated until their outputs, as llama.cpp's scheduler does, so ggml-cuda fuses
-    /// them in every layer whatever the memory layout. Without it a graph change elsewhere
-    /// (--kv-append, --ple-ops, --shexp-gate, ...) can flip some layers' sums between two
-    /// roundings and move greedy text (#472). No extra kernels and no measured speed cost
-    /// (prompt chunks take the fused MoE op and build no chain); the step-buffer sizing grows
-    /// ~10 MiB per GPU on Qwen3.8-Flash-Next. Greedy text moves once from the default (the
-    /// layers that ran unfused now run fused; the same bits as --moe-combine) and then no longer
-    /// follows the layout. Off by default, so the default's text stays as it was.
-    #[arg(long, help_heading = HEADING)]
+    /// The default (#472); accepted for older command lines (see --no-stable-fusions).
+    #[arg(long, hide = true, conflicts_with = "no_stable_fusions")]
     stable_fusions: bool,
+    /// CUDA, MoE layers: let ggml's allocator free the inputs of ggml-cuda's fused weighted
+    /// expert sum and top-k router before their outputs, as before #472. By default they stay
+    /// allocated until the outputs, as llama.cpp's scheduler keeps them, so ggml-cuda fuses
+    /// them in every layer whatever the memory layout. With this flag a graph change elsewhere
+    /// (--kv-append, --ple-ops, --shexp-gate, ...) can flip some layers' sums between two
+    /// roundings and move greedy text again. The default adds no kernels; its step-buffer
+    /// sizing is ~10 MiB per GPU larger on Qwen3.8-Flash-Next. For comparisons with older
+    /// builds' text.
+    #[arg(long, help_heading = HEADING)]
+    no_stable_fusions: bool,
     /// CUDA, gated DeltaNet layers: ggml's chain for the recurrent prep (l2 norms, g, beta, the
     /// replay stores) instead of Legion's one op (the default: the same bits, about 11 kernels
     /// fewer per layer). For comparisons. Replaces LEGION_DELTA_PREP=0.
@@ -1597,7 +1599,11 @@ impl SwitchArgs {
         Switches {
             gated_norm: self.gated_norm.then_some(true),
             moe_combine: self.moe_combine.then_some(true),
-            stable_fusions: self.stable_fusions.then_some(true),
+            stable_fusions: if self.no_stable_fusions {
+                Some(false)
+            } else {
+                self.stable_fusions.then_some(true)
+            },
             delta_prep: self.delta_prep_ggml.then_some(false),
             gdn_scan: self.gdn_scan_ggml.then_some(false),
             gdn_mma: self.gdn_mma.then_some(true),

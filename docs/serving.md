@@ -122,7 +122,7 @@ They replace `LEGION_*` environment variables, which are no longer read (#737; s
 |---|---|---|
 | `--gated-norm` | off | CUDA, gated DeltaNet layers: the output norm and its gate as one op instead of ggml's chain. |
 | `--moe-combine` | off | CUDA, MoE layers: the weighted expert sum as one op, rounded as ggml-cuda's fused reduction whatever the memory layout (#410). |
-| `--stable-fusions` | off | CUDA, MoE layers: keep the inputs of ggml-cuda's fused weighted expert sum (and of ggml's top-k router chain, where a model builds it) allocated until the chain's output, as llama.cpp's scheduler does, so ggml-cuda fuses the sum in every layer whatever the memory layout. Greedy text then no longer moves with unrelated graph changes (`--kv-append`, `--shexp-gate`, `--gated-norm`, a server's history). No extra kernels; the text moves once from the default and equals `--moe-combine`'s. See [Deterministic output](#deterministic-output) (#472). |
+| `--no-stable-fusions` | off | CUDA, MoE layers: let ggml's allocator free the inputs of ggml-cuda's fused weighted expert sum (and of ggml's top-k router chain, where a model builds it) before the chain's output, as before #472. By default they stay allocated until the output, as llama.cpp's scheduler keeps them, so ggml-cuda fuses the sum in every layer whatever the memory layout, and greedy text no longer moves with unrelated graph changes (`--kv-append`, `--shexp-gate`, `--gated-norm`, a server's history). With this flag it can again. The default adds no kernels. `--stable-fusions` (the opt-in before it became the default) is still accepted and changes nothing. See [Deterministic output](#deterministic-output). |
 | `--delta-prep-ggml` | off | CUDA, gated DeltaNet layers: ggml's chain for the recurrent prep instead of Legion's one op (the same bits). For comparisons. |
 | `--node-fuse-ggml` | off | CUDA: ggml's own small kernels instead of the Legion ops that take over their chains once a graph is allocated (the same bits): each MoE layer's weighted expert sum where ggml-cuda runs it unfused (a mul and an add per expert) with the shared expert's sigmoid gate, the gate alone behind the sums ggml-cuda fuses, and the expert cache's id remap (#814). For comparisons. |
 | `--gdn-scan-ggml` | off | CUDA, gated DeltaNet layers, prompt steps on compute capability 7.x GPUs (V100), and on 12.0/12.1 (the GB10) the groups ggml-cuda runs token after token (a tensor parallel rank's share of Qwen3.8-27B) unless `--gdn-mma` takes them: ggml's `gated_delta_net` kernel instead of Legion's `gdn_scan` (the same bits, about 1.5x faster per call on a V100, 2.2x on a GB10 rank; other GPUs always run ggml's). For comparisons. |
@@ -490,13 +490,20 @@ Even with fresh plans, the layout itself follows the graph: a change elsewhere i
 `--shexp-gate`, `--gated-norm`, a new op) can flip which layers ggml-cuda fuses the MoE
 weighted sum in, so greedy text moves with changes that compute the same bits per op (#472). llama.cpp
 does not see this: ggml-cuda asks ggml's scheduler to keep the fusions' inputs allocated until their
-outputs. Legion allocates its graphs itself; `--stable-fusions` adds the same dependency nodes, so the
-fusion fires in every layer whatever the layout. Measured (#472, the setup above, 4,639 slots): the
-text moves once from the default (the chats differ after 203, 933 and 167 characters) and is then
+outputs. Legion allocates its graphs itself and adds the same dependency nodes (by default;
+`--no-stable-fusions` turns them off), so the fusion fires in every
+layer whatever the layout. Measured when it was an opt-in (#472, the setup above, 4,639 slots): the
+text moved once from the old default (the chats differ after 203, 933 and 167 characters) and is then
 `--moe-combine`'s text, logprobs bit for bit; with each of the four switches above added it stays the
-same, while the default moves under each. No kernels added: decode and 10K / 123K prefill within noise
-(prompt chunks take the fused MoE op and build no chain). The step-buffer sizing grows by about 10 MiB
-per GPU (16 expert cache slots of 5,363). Off by default, so the default keeps its bytes.
+same, while the old default moved under each. No kernels added: decode and 10K / 123K prefill within
+noise (prompt chunks take the fused MoE op and build no chain). The step-buffer sizing grows by about
+10 MiB per GPU (16 expert cache slots of 5,363). On a GB10 with NVFP4 the MoE tails that the
+hyper-connection fold turns into one op drop their dependency nodes with the tail; before that the
+nodes kept the experts' F32 rows (and, with `--nvfp4-expert-rows-bf16`, their BF16 to F32 cast)
+alive, costing 8K prefill about 10-40%. When it became the default (Qwen3.8-Flash-Next-NVFP4 + MTP
+on one DGX Spark, the docs/run row flags, `--deterministic`): prefill 8K / 32K 2,674 / 2,897 ->
+2,676 / 2,896 tok/s, decode per step unchanged; the new text accepts slightly fewer MTP drafts
+(mean accepted length 2.98 -> 2.95), so 4-user det decode reads 92.0 -> 90.4 tok/s.
 
 ### Constrained output: JSON and strict tool calls
 

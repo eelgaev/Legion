@@ -1,4 +1,5 @@
-//! `--stable-fusions` (#472): ggml-cuda's layout-dependent MoE fusions always taken.
+//! Stable fusions (#472, on by default; `--no-stable-fusions` turns them off): ggml-cuda's
+//! layout-dependent MoE fusions always taken.
 //!
 //! ggml-cuda fuses a MoE layer's weighted expert sum (a `mul` by the router weights, a view
 //! per expert and the adds) into one kernel that rounds with one FMA per expert, and ggml's
@@ -11,19 +12,20 @@
 //! inputs allocated until the chain's output, so the output never takes their memory. Legion
 //! allocates its graphs without the scheduler; with the switch on, the graph builders add the
 //! same dependencies where they build the chains ([`Graph::keep_until`]). The fusions then
-//! fire in every layer whatever the layout, with no extra kernels: the text moves once from
-//! the default (the layers that ran unfused before now run fused) and then stays put.
+//! fire in every layer whatever the layout, with no extra kernels. Turning it on moved greedy
+//! text once (the layers that ran unfused before now run fused); since then layout-neutral
+//! graph changes leave the text where it is. Off, the old layout-dependent rounding comes back.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::ggml::{Graph, Tensor};
 
-/// Whether graphs built from now on pin the fusions' inputs.
-static ON: AtomicBool = AtomicBool::new(false);
+/// Whether graphs built from now on pin the fusions' inputs (on by default).
+static ON: AtomicBool = AtomicBool::new(true);
 
 /// Sets whether graphs built from now on keep the MoE fusions' inputs allocated until their
-/// outputs (off by default; `legion serve --stable-fusions` turns it on).
+/// outputs (on by default; `legion serve --no-stable-fusions` turns it off).
 pub fn set_stable_fusions(on: bool) {
     ON.store(on, Ordering::Relaxed);
 }
