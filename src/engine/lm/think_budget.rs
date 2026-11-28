@@ -25,7 +25,7 @@ pub(super) struct Marks {
     header: Option<Header>,
     /// The token the model ends its reasoning with.
     close: u32,
-    /// What the budget writes to end it (its last token is `close`).
+    /// What the budget writes to end it (it holds `close`; Qwen's ends in `\n\n` after it).
     inject: Vec<u32>,
     /// The reply starts in a header: Muse's generation prompt ends at `<|start|>assistant`.
     starts_in_header: bool,
@@ -92,7 +92,7 @@ impl Marks {
         let open = tok.token_id(open)?;
         let close = tok.token_id(close)?;
         let inject = tok.encode_with(inject, false, true);
-        (inject.last() == Some(&close)).then_some(Self {
+        inject.contains(&close).then_some(Self {
             open,
             header,
             close,

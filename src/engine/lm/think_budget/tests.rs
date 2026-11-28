@@ -135,7 +135,7 @@ fn each_format_closes_its_reasoning_its_own_way() {
     let format = ChatFormat::detect(&tok);
     let marks = format.think_marks().unwrap();
     assert_eq!(text(&tok, marks.inject()), "\n</think>\n\n");
-    assert_eq!(marks.inject().last(), Some(&id(&tok, "</think>")));
+    assert!(marks.inject().contains(&id(&tok, "</think>")));
 
     let glm = tokenizer(
         &[
@@ -227,7 +227,7 @@ fn reasoning_the_model_opens_counts_from_its_opener() {
         closed.push(t);
     }
     assert_eq!(closed, marks.inject());
-    assert_eq!(closed.last(), Some(&close));
+    assert!(closed.contains(&close));
     assert_eq!(b.used(), 2);
 }
 
