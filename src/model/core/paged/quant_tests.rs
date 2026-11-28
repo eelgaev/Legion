@@ -123,10 +123,15 @@ fn decode_cases(backend: &mut Backend, tol: f32) {
 fn quant_decode_is_off_by_default_and_never_for_f16_or_other_types() {
     use crate::model::core::KvTypes;
     let types = |k, v| KvTypes { k, v };
-    // The flag is process-wide and tests run in parallel: the default only, never set here.
-    assert!(!decode_reads_types(types(KvType::Q8_0, KvType::Q8_0)));
-    assert!(!decode_reads_types(KvTypes::default()));
-    assert!(!decode_reads_types(types(KvType::Q5_1, KvType::Q5_1)));
+    // Off (the model's default): never.
+    assert!(!decode_reads_types(
+        types(KvType::Q8_0, KvType::Q8_0),
+        false
+    ));
+    assert!(!decode_reads_types(types(KvType::F16, KvType::Q4_0), false));
+    // On: never for F16 or other quantized types.
+    assert!(!decode_reads_types(KvTypes::default(), true));
+    assert!(!decode_reads_types(types(KvType::Q5_1, KvType::Q5_1), true));
 }
 
 #[test]

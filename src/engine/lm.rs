@@ -873,28 +873,32 @@ pub(crate) fn kv_floor(
     shared: bool,
     native: bool,
     types: crate::model::core::kv_type::KvTypes,
-) -> Result<usize, String> {
+) -> Result<usize, LoadError> {
     if fit >= ctx_blocks {
         return Ok(fit);
     }
     let tokens = |b: usize| b * KV_BLOCK;
     if explicit {
-        return Err(format!(
+        return Err(LoadError::Device(format!(
             "--kv-cache-tokens must hold at least --ctx-size ({}) tokens",
             tokens(ctx_blocks)
-        ));
+        )));
     }
     if shared {
-        return Err(format!(
+        return Err(LoadError::Device(format!(
             "a {}-token context does not fit next to the memory this GPU (it shares the host's \
              memory) keeps free for the OS and the prompt steps: room for {} tokens. Lower \
              --ctx-size, --max-batch-tokens or --uma-free-gib",
             tokens(ctx_blocks),
             tokens(fit)
-        ));
+        )));
     }
     if native {
-        return Err(no_room_for_native(tokens(ctx_blocks), tokens(fit), types));
+        return Err(LoadError::NoRoom(no_room_for_native(
+            tokens(ctx_blocks),
+            tokens(fit),
+            types,
+        )));
     }
     Ok(ctx_blocks)
 }
@@ -1059,9 +1063,10 @@ pub(crate) fn tower_kv_reserve(
     }
 }
 
-/// Whether [`LmEngine::load`] may load `cfg` a second time with the vision tower on the CPU:
-/// a tower that would run on the GPU (`--mmproj`, or an HF checkpoint's own), one CUDA
-/// process (no tensor-parallel ranks, no node split).
+/// Whether [`LmEngine::load`] may load `cfg` a second time with the vision tower on the CPU
+/// after the KV fit's [`LoadError::NoRoom`]: a tower that would run on the GPU (`--mmproj`, or
+/// an HF checkpoint's own), one CUDA process (no tensor-parallel ranks over GPUs or machines,
+/// no node split).
 pub(crate) fn vision_cpu_retry(cfg: &LmConfig) -> bool {
     matches!(cfg.device, DeviceChoice::Cuda)
         && !cfg.vision_cpu
@@ -1070,12 +1075,7 @@ pub(crate) fn vision_cpu_retry(cfg: &LmConfig) -> bool {
         && cfg.tp <= 1
         && !cfg.tp_per_gpu
         && cfg.tp_pair.is_none()
-}
-
-/// Whether a load error is the KV fit's: the context (or the decode state) not fitting in GPU
-/// memory.
-pub(crate) fn fit_failure(e: &str) -> bool {
-    e.contains("does not fit in GPU memory")
+        && cfg.tp_net.is_none()
 }
 
 /// `--mmproj`: the vision tower (#146), else an HF checkpoint's own (#1195), for a language
@@ -1445,7 +1445,7 @@ pub struct LmConfig {
     pub tu_attn_ffma: bool,
     /// Decode steps over a q8_0 / q4_0 cache on GPUs whose prefill kernels read F16 only
     /// (before sm_80): through the paged decode kernel instead of the gather path, prompt steps
-    /// unchanged ([`crate::model::core::paged::set_quant_decode`]). Not the default's bits.
+    /// unchanged ([`crate::model::core::Model::set_quant_decode`]). Not the default's bits.
     pub paged_quant_decode: bool,
     /// qwen4exp prompt steps: ggml's indexer chain (pool mask, lightning indexer, bias add)
     /// instead of Legion's one-op scores (the same bits), for comparisons.
@@ -1808,6 +1808,10 @@ pub enum LoadError {
     Ggml(#[from] crate::ggml::GgmlError),
     #[error("{0}")]
     Device(String),
+    /// The KV fit's: the context does not fit in GPU memory beside the weights (where a GPU
+    /// vision tower can be the cause, [`LmEngine::load`] loads again with it on the CPU).
+    #[error("{0}")]
+    NoRoom(String),
 }
 
 pub struct LmEngine {
@@ -2691,7 +2695,7 @@ fn auto_host_tokens(
     (fit, fit_full): (Option<usize>, Option<usize>),
     (ctx_blocks, n_blocks): (usize, usize),
     (want, shared): (usize, bool),
-) -> Result<(usize, usize), String> {
+) -> Result<(usize, usize), LoadError> {
     let (Some(_), Some(full)) = (fit, fit_full) else {
         return Ok((0, 0));
     };
@@ -2718,11 +2722,14 @@ fn auto_host_tokens(
         match nodes.iter_mut().find(|n| n.node == node) {
             Some(n) => n.block_bytes += bytes,
             None => nodes.push(host_tier::serve_node(owner, node, bytes).ok_or_else(|| {
-                format!("cannot read NUMA node {node}'s memory for the KV host tier")
+                LoadError::Device(format!(
+                    "cannot read NUMA node {node}'s memory for the KV host tier"
+                ))
             })?),
         }
     }
-    let blocks = host_tier::auto_host_blocks(full, ctx_blocks, want, n_blocks, &nodes)?;
+    let blocks = host_tier::auto_host_blocks(full, ctx_blocks, want, n_blocks, &nodes)
+        .map_err(LoadError::NoRoom)?;
     Ok((
         blocks * KV_BLOCK,
         host_tier::budget_blocks(&nodes) * KV_BLOCK,
@@ -4113,7 +4120,7 @@ impl LmEngine {
     pub fn load(cfg: LmConfig) -> Result<Self, LoadError> {
         let retry = vision_cpu_retry(&cfg).then(|| cfg.clone());
         match Self::load_once(cfg) {
-            Err(LoadError::Device(e)) if retry.is_some() && fit_failure(&e) => {
+            Err(LoadError::NoRoom(e)) if retry.is_some() => {
                 tracing::warn!(
                     error = %e,
                     "vision: the context does not fit beside the GPU vision tower; loading \
@@ -4575,9 +4582,9 @@ impl LmEngine {
         }
         // #1214: decode steps over a quantized cache page where only the decode kernel reads it.
         if device.is_some() {
-            crate::model::core::paged::set_quant_decode(cfg.paged_quant_decode);
+            model.set_quant_decode(cfg.paged_quant_decode);
             if cfg.paged_quant_decode {
-                let on = crate::model::core::paged::decode_reads_types(cfg.cache_types);
+                let on = crate::model::core::paged::decode_reads_types(cfg.cache_types, true);
                 tracing::info!(
                     on,
                     "--paged-quant-decode: decode steps read the quantized cache in place"
@@ -5045,8 +5052,7 @@ impl LmEngine {
                     auto_kv_want(max_seqs, ctx_blocks, cache_split, shared),
                     shared,
                 ),
-            )
-            .map_err(LoadError::Device)?,
+            )?,
         };
         // Per node: the bytes a host block of an automatic tensor-parallel tier takes there
         // (`tp_tier`), for the process's plan.
@@ -5066,8 +5072,7 @@ impl LmEngine {
                 shared,
                 native_ctx,
                 types,
-            )
-            .map_err(LoadError::Device)?;
+            )?;
         }
         // `--tp-per-gpu` (#1131) and `--tp` over a meta device (the head mirrored, #1159): each
         // GPU holds the whole LM head, which a step of 64+ rows on a V100 runs as cuBLAS over

@@ -1542,27 +1542,20 @@ pub fn reads_types(types: super::KvTypes) -> bool {
         || tq::reads(types)
 }
 
-/// Whether decode steps over a cache the prefill kernels do not read on this device page
-/// anyway ([`set_quant_decode`]).
-static QUANT_DECODE: AtomicBool = AtomicBool::new(false);
-
-/// On GPUs before sm_80 with a q8_0 / q4_0 cache (`legion serve --paged-quant-decode`, #1214):
-/// decode steps (one token per sequence) read the cache in place through the paged decode
-/// kernel, which dequantizes q8_0 and q4_0 on every GPU (sm_80+ GPUs run it for their decode
-/// steps), instead of gathering every sequence's span to F16 and transposing V each step.
-/// Prompt steps keep the gather path, so prefill is unchanged; decode is not the default's
-/// bits (F32 dot products and an online softmax against the gather path's F16 matmuls).
-pub fn set_quant_decode(on: bool) {
-    QUANT_DECODE.store(on, Ordering::Relaxed);
-}
-
 /// Whether decode steps over a cache of `types` page where [`reads_types`] says the device's
-/// paged kernels do not take it for every step ([`set_quant_decode`]): q8_0 / q4_0 K and V
-/// (each, or F16 for one), the flag on, CUDA.
-pub fn decode_reads_types(types: super::KvTypes) -> bool {
+/// paged kernels do not take it for every step: q8_0 / q4_0 K and V (each, or F16 for one),
+/// with the model's `--paged-quant-decode` on (`on`, [`super::Model::set_quant_decode`]), CUDA.
+///
+/// On GPUs before sm_80 (#1214) decode steps (one token per sequence) then read the cache in
+/// place through the paged decode kernel, which dequantizes q8_0 and q4_0 on every GPU (sm_80+
+/// GPUs run it for their decode steps), instead of gathering every sequence's span to F16 and
+/// transposing V each step. Prompt steps keep the gather path, so prefill is unchanged; decode
+/// is not the default's bits (F32 dot products and an online softmax against the gather
+/// path's F16 matmuls).
+pub fn decode_reads_types(types: super::KvTypes, on: bool) -> bool {
     use super::KvType::*;
     cfg!(feature = "cuda")
-        && QUANT_DECODE.load(Ordering::Relaxed)
+        && on
         && !types.is_f16()
         && matches!(types.k, F16 | Q8_0 | Q4_0)
         && matches!(types.v, F16 | Q8_0 | Q4_0)
