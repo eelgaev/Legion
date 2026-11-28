@@ -549,6 +549,15 @@ pub(super) struct ModelArgs {
     /// ignore it.
     #[arg(long)]
     pub tu_attn_ffma: bool,
+    /// On GPUs before sm_80 (GTX 16xx, RTX 20xx, V100) with a q8_0 / q4_0 cache: decode steps
+    /// read the cache in place through the paged decode kernel instead of gathering every
+    /// sequence's span to F16 and transposing V each step, whose cost grows with the context
+    /// (a GTX 1660 Ti, Qwen3.5-4B, q8_0 cache: decode 60.1 -> 68.9 tok/s at a 2K context,
+    /// 40.4 -> 62.1 at 8K). Prompt steps keep the gather path. Not the default's bits: greedy
+    /// output can differ from it (F32 dot products and an online softmax against F16
+    /// matmuls). F16 caches and sm_80+ GPUs page every step already and ignore it.
+    #[arg(long)]
+    pub paged_quant_decode: bool,
     /// qwen4exp prompt steps: score the sparse-attention indexer's pools with ggml's ops (pool
     /// mask, lightning indexer, bias add) instead of Legion's one-op kernel, which computes the
     /// same bits faster. For comparisons.
@@ -2187,6 +2196,7 @@ pub async fn run(
                 model_path,
                 mmproj: e.model.mmproj.clone(),
                 no_mmproj: e.model.no_mmproj,
+                vision_cpu: false,
                 model_name: e
                     .model_name
                     .or_else(|| e.model.hfmodel.as_deref().and_then(hfmodel::repo_id)),
@@ -2308,6 +2318,7 @@ pub async fn run(
                 expert_mv: e.model.expert_mv == ExpertMv::Legion,
                 paged_prefill_m884: e.model.paged_prefill_m884,
                 tu_attn_ffma: e.model.tu_attn_ffma,
+                paged_quant_decode: e.model.paged_quant_decode,
                 qsa_scores_ggml: e.model.qsa_scores_ggml,
                 qsa_topk_ggml: e.model.qsa_topk_ggml,
                 hc_post_norm_generic: e.model.hc_post_norm_generic,

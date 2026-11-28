@@ -1059,6 +1059,25 @@ pub(crate) fn tower_kv_reserve(
     }
 }
 
+/// Whether [`LmEngine::load`] may load `cfg` a second time with the vision tower on the CPU:
+/// a tower that would run on the GPU (`--mmproj`, or an HF checkpoint's own), one CUDA
+/// process (no tensor-parallel ranks, no node split).
+pub(crate) fn vision_cpu_retry(cfg: &LmConfig) -> bool {
+    matches!(cfg.device, DeviceChoice::Cuda)
+        && !cfg.vision_cpu
+        && (cfg.mmproj.is_some() || (!cfg.no_mmproj && cfg.model_path.is_dir()))
+        && cfg.node.is_none()
+        && cfg.tp <= 1
+        && !cfg.tp_per_gpu
+        && cfg.tp_pair.is_none()
+}
+
+/// Whether a load error is the KV fit's: the context (or the decode state) not fitting in GPU
+/// memory.
+pub(crate) fn fit_failure(e: &str) -> bool {
+    e.contains("does not fit in GPU memory")
+}
+
 /// `--mmproj`: the vision tower (#146), else an HF checkpoint's own (#1195), for a language
 /// model of architecture `arch` and width `n_embd`, on CUDA device `gpu` (the CPU without
 /// one). Under tensor parallelism over ranks only rank 0 loads it (`follower`: a rank above
@@ -1166,6 +1185,10 @@ pub struct LmConfig {
     pub mmproj: Option<std::path::PathBuf>,
     /// `--no-mmproj`: text only, an HF checkpoint's vision tower is not loaded.
     pub no_mmproj: bool,
+    /// The vision tower on the CPU whatever the device: [`LmEngine::load`]'s second attempt
+    /// where a GPU tower (its weights and largest image's scratch) left the context no room on
+    /// a small GPU (#1214).
+    pub vision_cpu: bool,
     /// Model id reported by /v1/models; `None` takes `general.name` or the file name.
     pub model_name: Option<String>,
     pub device: DeviceChoice,
@@ -1420,6 +1443,10 @@ pub struct LmConfig {
     /// kernel instead of the WMMA one (other GPUs keep their default). Greedy output can differ
     /// from the default (no F16 rounding of Q and P, one pass, another summation order).
     pub tu_attn_ffma: bool,
+    /// Decode steps over a q8_0 / q4_0 cache on GPUs whose prefill kernels read F16 only
+    /// (before sm_80): through the paged decode kernel instead of the gather path, prompt steps
+    /// unchanged ([`crate::model::core::paged::set_quant_decode`]). Not the default's bits.
+    pub paged_quant_decode: bool,
     /// qwen4exp prompt steps: ggml's indexer chain (pool mask, lightning indexer, bias add)
     /// instead of Legion's one-op scores (the same bits), for comparisons.
     pub qsa_scores_ggml: bool,
@@ -1664,6 +1691,7 @@ impl LmConfig {
             model_path: model_path.into(),
             mmproj: None,
             no_mmproj: false,
+            vision_cpu: false,
             model_name: None,
             device,
             ctx_size: 8192,
@@ -1752,6 +1780,7 @@ impl LmConfig {
             glm_prune: None,
             paged_prefill_m884: false,
             tu_attn_ffma: false,
+            paged_quant_decode: false,
             long_prompts: LongPrompts::default(),
             swa_full: false,
             swa_ring: false,
@@ -4077,7 +4106,28 @@ fn model_id(cfg: &LmConfig, gguf: &GgufFile) -> String {
 
 impl LmEngine {
     /// Loads the model (blocking: run it off the async runtime) and starts the worker thread.
-    pub fn load(mut cfg: LmConfig) -> Result<Self, LoadError> {
+    /// On one discrete GPU with a vision tower, where the context does not fit beside the GPU
+    /// tower (its weights and its largest image's scratch, #1195), once more with the tower on
+    /// the CPU, as before #1195 (a GTX 1660 Ti's 6 GB: Qwen3.5-4B Q4_K_M, its f16 mmproj and a
+    /// 12K q8_0 context fit then, #1214).
+    pub fn load(cfg: LmConfig) -> Result<Self, LoadError> {
+        let retry = vision_cpu_retry(&cfg).then(|| cfg.clone());
+        match Self::load_once(cfg) {
+            Err(LoadError::Device(e)) if retry.is_some() && fit_failure(&e) => {
+                tracing::warn!(
+                    error = %e,
+                    "vision: the context does not fit beside the GPU vision tower; loading \
+                     again with the tower on the CPU"
+                );
+                let mut cfg = retry.expect("checked above");
+                cfg.vision_cpu = true;
+                Self::load_once(cfg)
+            }
+            r => r,
+        }
+    }
+
+    fn load_once(mut cfg: LmConfig) -> Result<Self, LoadError> {
         // A dense qwen35 has no meta-device split: `--tp 2` runs it as two ranks (#1163).
         if !cfg.tp_per_gpu && tp_pair::implied(&cfg) {
             tracing::info!("--tp 2 on a dense qwen35 model: one rank per GPU (as --tp-per-gpu)");
@@ -4523,6 +4573,17 @@ impl LmEngine {
             // sm_70's).
             crate::model::core::paged::set_ffma_prefill(true);
         }
+        // #1214: decode steps over a quantized cache page where only the decode kernel reads it.
+        if device.is_some() {
+            crate::model::core::paged::set_quant_decode(cfg.paged_quant_decode);
+            if cfg.paged_quant_decode {
+                let on = crate::model::core::paged::decode_reads_types(cfg.cache_types);
+                tracing::info!(
+                    on,
+                    "--paged-quant-decode: decode steps read the quantized cache in place"
+                );
+            }
+        }
         let mma16 = device.is_some() && crate::model::moe_ffn::mma16();
         let moe_kernel = resolve_moe_kernel(cfg.moe_kernel, mode, integrated, cc_major, mma16);
         if moe_kernel != cfg.moe_kernel {
@@ -4638,7 +4699,7 @@ impl LmEngine {
         let vision_arch = gguf.architecture().unwrap_or_default();
         // The tower runs on the first stage's GPU (#1195), the CPU without one.
         let vision_dev = layout.stages.first().and_then(|(d, _)| *d);
-        let vision_gpu = vision_dev.and_then(cuda_index);
+        let vision_gpu = vision_dev.and_then(cuda_index).filter(|_| !cfg.vision_cpu);
         let vision_early = tower_before_kv(vision_dev.map(|d| d.kind()));
         // Under tensor parallelism only rank 0 loads it (#1195 stage D).
         let vision_follower = tp_start.as_ref().is_some_and(|s| s.rank() > 0);

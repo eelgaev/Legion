@@ -101,6 +101,7 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     cfg.expert_mv = m.expert_mv == super::serve::ExpertMv::Legion;
     cfg.paged_prefill_m884 = m.paged_prefill_m884;
     cfg.tu_attn_ffma = m.tu_attn_ffma;
+    cfg.paged_quant_decode = m.paged_quant_decode;
     cfg.glm_route_bias = m.glm_route_bias;
     cfg.glm_prune = m.glm_prune()?;
     cfg.switches = m.switches.switches();

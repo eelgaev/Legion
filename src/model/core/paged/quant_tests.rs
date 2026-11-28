@@ -99,6 +99,36 @@ fn cases(backend: &mut Backend, tol: f32) {
     }
 }
 
+/// One-token groups only (the decode kernel), the shapes of [`cases`] and Qwen3.5-4B's (heads
+/// of 256, 16 query heads over 4 kv heads), short and over many key blocks.
+fn decode_cases(backend: &mut Backend, tol: f32) {
+    use KvType::*;
+    for (kt, vt) in [(Q8_0, Q8_0), (Q8_0, Q4_0), (Q4_0, Q4_0), (F16, Q8_0)] {
+        for (d, n_head, n_head_kv, window) in [
+            (128, 8, 2, 0),
+            (256, 16, 8, 100),
+            (256, 16, 4, 0),
+            (512, 16, 2, 0),
+        ] {
+            for n_past in [0, 700, 3000] {
+                quant_case(
+                    backend, d, n_head, n_head_kv, window, n_past, 1, kt, vt, tol,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn quant_decode_is_off_by_default_and_never_for_f16_or_other_types() {
+    use crate::model::core::KvTypes;
+    let types = |k, v| KvTypes { k, v };
+    // The flag is process-wide and tests run in parallel: the default only, never set here.
+    assert!(!decode_reads_types(types(KvType::Q8_0, KvType::Q8_0)));
+    assert!(!decode_reads_types(KvTypes::default()));
+    assert!(!decode_reads_types(types(KvType::Q5_1, KvType::Q5_1)));
+}
+
 #[test]
 fn cpu_op_over_quantized_caches_matches_oracle() {
     let mut backend = Backend::cpu().unwrap();
@@ -116,10 +146,11 @@ fn cuda_kernels_over_quantized_caches_match_oracle() {
         .expect("no GPU device")
         .init()
         .unwrap();
-    // Production only sends quantized caches to the kernels where `quant_ok()` (the sm_80+
-    // prefill kernel), so there is nothing to check elsewhere.
+    // Elsewhere production sends quantized caches to the decode kernel only
+    // (`--paged-quant-decode`): its one-token cases, which accumulate in F32 throughout.
     if !quant_ok() {
-        eprintln!("skipped: the quantized-cache paged kernels need sm_80+ on this device");
+        decode_cases(&mut backend, 1e-4);
+        eprintln!("prefill cases skipped: the quantized-cache prefill kernel needs sm_80+");
         return;
     }
     // The prefill kernel's F16 weights against the running max and F16 K/V (see tests.rs).

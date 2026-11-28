@@ -917,3 +917,20 @@ fn tu_attn_ffma_flag() {
         !legion::engine::lm::LmConfig::new("m", legion::engine::lm::DeviceChoice::Cpu).tu_attn_ffma
     );
 }
+
+#[test]
+fn paged_quant_decode_flag() {
+    let model = |argv: &[&str]| {
+        let argv = ["legion", "serve"].into_iter().chain(argv.iter().copied());
+        match Cli::try_parse_from(argv).unwrap().command {
+            Command::Serve(args) => args.engine.model.paged_quant_decode,
+            _ => unreachable!("the parser returned a command other than serve"),
+        }
+    };
+    assert!(!model(&[]));
+    assert!(model(&["--paged-quant-decode"]));
+    assert!(
+        !legion::engine::lm::LmConfig::new("m", legion::engine::lm::DeviceChoice::Cpu)
+            .paged_quant_decode
+    );
+}

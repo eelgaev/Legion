@@ -112,7 +112,10 @@ CMAKE_CUDA_ARCHITECTURES="120;121" cargo build --release --features cuda
   (`--tu-mmq-ggml` keeps ggml's MMQ). `--tu-attn-ffma` runs prompt attention on FP32 FMAs
   instead of the WMMA kernel (3.3x faster attention there, an 8K-token Qwen3.5-4B prompt
   15.3 -> 10.7 s; not the default's bits, so opt-in).
-- Quantized KV caches need compute capability 8.0+, as on the V100.
+- Quantized KV caches (q8_0, q4_0) take the gather path, as on the V100: the paged prompt kernels
+  read them on compute capability 8.0+ only. `--paged-quant-decode` reads them in place for decode
+  steps (a GTX 1660 Ti, Qwen3.5-4B, q8_0: 40.4 -> 62.1 tok/s at an 8K context; not the default's
+  bits, so opt-in).
 
 ```sh
 CMAKE_CUDA_ARCHITECTURES=75 cargo build --release --features cuda

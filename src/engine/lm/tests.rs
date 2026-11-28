@@ -1324,3 +1324,34 @@ fn dense_fp8_runs_over_machines_not_one_machines_tp() {
         .is_ok()
     );
 }
+
+#[test]
+fn a_gpu_vision_tower_that_leaves_no_room_retries_on_the_cpu() {
+    let mut cfg = LmConfig::new("m.gguf", DeviceChoice::Cuda);
+    // Without a tower there is nothing to move.
+    assert!(!vision_cpu_retry(&cfg));
+    cfg.mmproj = Some("mmproj.gguf".into());
+    assert!(vision_cpu_retry(&cfg));
+    // Once only, and on CUDA only.
+    let mut again = cfg.clone();
+    again.vision_cpu = true;
+    assert!(!vision_cpu_retry(&again));
+    let mut cpu = cfg.clone();
+    cpu.device = DeviceChoice::Cpu;
+    assert!(!vision_cpu_retry(&cpu));
+    // Not with tensor-parallel ranks.
+    let mut tp = cfg.clone();
+    tp.tp_per_gpu = true;
+    assert!(!vision_cpu_retry(&tp));
+    let mut tp2 = cfg.clone();
+    tp2.tp = 2;
+    assert!(!vision_cpu_retry(&tp2));
+    // The KV fit's errors only.
+    assert!(fit_failure(
+        "the context of 12288 tokens does not fit in GPU memory (room for 0), and the host ..."
+    ));
+    assert!(fit_failure(
+        "the decode state does not fit in GPU memory beside the weights and the reserve: ..."
+    ));
+    assert!(!fit_failure("--mmproj m.gguf: not a vision tower"));
+}

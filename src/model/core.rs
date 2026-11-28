@@ -2094,6 +2094,23 @@ impl Model {
         }
     }
 
+    /// Whether the step of `groups` over `kv` is a decode step (one token per sequence, not a
+    /// verify step) that pages although [`Self::paged_default`] gathers: a q8_0 / q4_0 cache the
+    /// device's prefill kernels do not read, with `--paged-quant-decode`
+    /// ([`paged::set_quant_decode`]). [`Attention::Auto`] only, on a device pool, where the
+    /// kernels take every attention layer's head shape.
+    pub(crate) fn paged_decode(&self, kv: &KvPool, groups: &[Group<'_>]) -> bool {
+        let decode = !groups.is_empty()
+            && groups
+                .iter()
+                .all(|g| !g.verify && g.seqs.iter().all(|s| s.tokens.len() == 1));
+        decode
+            && self.attention == Attention::Auto
+            && !kv.is_host()
+            && paged::decode_reads_types(kv.types())
+            && self.paged_kernels_fit()
+    }
+
     /// How attention reads the KV cache ([`Self::set_attention`]).
     pub(crate) fn attention_mode(&self) -> Attention {
         self.attention
