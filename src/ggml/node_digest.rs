@@ -185,9 +185,10 @@ unsafe fn step_tokens(g: *mut ffi::ggml_cgraph) -> i64 {
 
 fn cstr(p: *const std::os::raw::c_char) -> String {
     // SAFETY: ggml names and descriptions are NUL-terminated.
-    unsafe { std::ffi::CStr::from_ptr(p) }
+    let s = unsafe { std::ffi::CStr::from_ptr(p) }
         .to_string_lossy()
-        .replace(' ', "_")
+        .replace(' ', "_");
+    if s.is_empty() { "-".to_string() } else { s }
 }
 
 /// One graph's digest files and a pinned staging buffer.
