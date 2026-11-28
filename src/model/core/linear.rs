@@ -634,6 +634,9 @@ impl Linear {
     /// ([`crate::model::nvfp4_a4::geglu`], with `norm` (`(h, w, eps)`, `x` being
     /// `mul(rms_norm(h, eps), w)`) in its activations' quantization when it fits) and the W4A4
     /// down matmul instead: that opt-in moves the outputs anyway.
+    /// First, where the gate and up weights match in shape and all three take the Q4_0 prompt
+    /// op at this batch (no scale, not FP8, [`crate::model::q40_mm::takes_shape`]), it runs
+    /// `q40_geglu_ffn` instead: the same bits as the unfused matmuls.
     pub fn geglu_ffn_fused<'a>(
         &self,
         ctx: &'a Context,
@@ -770,7 +773,11 @@ impl Linear {
     /// as attention's q, k and v projections) as one W4A4 op
     /// ([`crate::model::nvfp4_a4::mul_mat_multi`]: the activations quantized once, with `norm`
     /// (`(h, w, eps)`, `x` being `mul(rms_norm(h, eps), w)`) in that quantization when it fits),
-    /// in batches [`Nvfp4A4`] gives 4-bit activations. `None` (run them one by one) otherwise.
+    /// in batches [`Nvfp4A4`] gives 4-bit activations. First, where `norm` is given and fits
+    /// [`crate::model::q40_mm::norm_fits`] and every weight takes the Q4_0 prompt op at this
+    /// batch (no scale, not FP8, [`crate::model::q40_mm::takes_shape`]), it runs
+    /// `q40_multi` instead: one weight is enough there, the same bits as the unfused
+    /// matmuls. `None` (run them one by one) otherwise.
     pub fn mul_mat_multi<'a>(
         &self,
         ctx: &'a Context,

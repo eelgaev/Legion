@@ -652,6 +652,37 @@ fn quant_columns_round_trip() {
     assert!(seen.iter().all(|&s| s));
 }
 
+/// [`put_col`] writes into a buffer at any alignment: a column put one byte past an F32
+/// boundary reads back as written.
+#[test]
+fn put_col_takes_an_unaligned_buffer() {
+    let (k, n) = (512usize, 3usize);
+    let n_pad = n_padded(n as i64) as usize;
+    let x = input(k, n, 22);
+    let mut raw = vec![0u8; quant_bytes(k as i64, n as i64) + 1];
+    for c in 0..n {
+        let (q, d) = quantize_col(&x[c * k..(c + 1) * k]);
+        // SAFETY: `raw[1..]` holds the blocks and scales of `k` x `n_pad`.
+        unsafe { put_col(raw.as_mut_ptr().add(1), k, n_pad, c, &q, &d) };
+    }
+    assert_eq!(raw[0], 0);
+    for c in 0..n {
+        let (q, d) = quantize_col(&x[c * k..(c + 1) * k]);
+        let (gq, gd) = get_col(&raw[1..], k, n_pad, c);
+        assert_eq!(q, gq, "column {c}");
+        assert!(d.iter().zip(&gd).all(|(a, b)| a.to_bits() == b.to_bits()));
+    }
+}
+
+/// Whether columns `n..n_pad` of a quantization of `k` values (`buf`) are all zero bytes.
+fn pad_cols_zero(buf: &[u8], k: usize, n: usize) -> bool {
+    let n_pad = n_padded(n as i64) as usize;
+    (n..n_pad).all(|c| {
+        let (q, d) = get_col(buf, k, n_pad, c);
+        q.iter().all(|&v| v == 0) && d.iter().all(|v| v.to_bits() == 0)
+    })
+}
+
 /// On the CPU, the op over its input quantized by its own node ([`quantize`], [`mul_mat_q`])
 /// is the op's product, bit for bit.
 #[test]
@@ -702,12 +733,17 @@ fn cpu_fused_quantizations_quantize_their_values() {
     let wv: Vec<f32> = noise(k, 32).iter().map(|v| 1.0 + 0.5 * v).collect();
     nw.set_f32(&wv);
     up.set_f32(&noise(k * n, 33));
+    // Garbage first: the nodes write every byte, the padding columns as zeros.
+    for node in [nq, gq] {
+        node.set_bytes(&vec![0xAA; node.nbytes()]);
+    }
     backend.compute(&graph).unwrap();
     let n_pad = n_padded(n as i64) as usize;
     let qb = quant_bytes(k as i64, n as i64);
     for (want, node) in [(normed, nq), (act, gq)] {
         let want = want.to_f32();
         let bytes = node.bytes();
+        assert!(pad_cols_zero(&bytes, k, n), "padding columns");
         let got: Vec<f32> = bytes[qb..]
             .chunks(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -797,8 +833,9 @@ fn cuda_q40_mm_fused_quant_is_byte_exact() {
             gpu.compute(&graph).unwrap();
             let qb = quant_bytes(k, n);
             let fb = fused.bytes();
-            let values = want
-                .bytes()
+            let wb = want.bytes();
+            assert_eq!(fb.len(), qb + wb.len(), "{kind} {k} x {n}: F32 suffix");
+            let values = wb
                 .chunks(4)
                 .zip(fb[qb..].chunks(4))
                 .filter(|(a, b)| a != b)
@@ -971,10 +1008,15 @@ fn cpu_q40_geglu_pair_is_the_matmuls_and_quantize_geglu() {
     gate.set_bytes(&q4_0_matrix(k as usize, rows as usize, 61));
     up.set_bytes(&q4_0_matrix(k as usize, rows as usize, 62));
     x.set_f32(&input(k as usize, n as usize, 63));
+    got.set_bytes(&vec![0xAA; got.nbytes()]);
     backend.compute(&graph).unwrap();
     assert_eq!(got.ne()[0] as usize, quant_bytes(rows, n));
     let (a, b) = (want.bytes(), got.bytes());
     assert_eq!(quant_cols_differ(&a, &b, rows as usize, n as usize), 0);
+    assert!(
+        pad_cols_zero(&b, rows as usize, n as usize),
+        "padding columns"
+    );
     // The quantized GeGLU is not trivial: the all-zero input column quantizes to zeros, the
     // others not.
     let (q0, _) = get_col(&b, rows as usize, n_padded(n) as usize, 0);

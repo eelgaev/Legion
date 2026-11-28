@@ -429,9 +429,10 @@ fn slot_word(s: usize) -> usize {
 /// `k` x `n_pad`, then the scales).
 ///
 /// # Safety
-/// `buf` holds [`quant_bytes`] of `k` x (any `n` padding to `n_pad`) bytes.
+/// `buf` holds [`quant_bytes`] of `k` x (any `n` padding to `n_pad`) bytes (any alignment: the
+/// scales go in as little-endian bytes, as [`get_col`] reads them).
 unsafe fn put_col(buf: *mut u8, k: usize, n_pad: usize, col: usize, q: &[i8], d: &[f32]) {
-    let scales = (k / QK as usize * n_pad * 32) as isize;
+    let scales = k / QK as usize * n_pad * 32;
     // SAFETY: the caller's: every offset is within the blocks or the scales.
     unsafe {
         for kb in 0..k / QK as usize {
@@ -441,10 +442,24 @@ unsafe fn put_col(buf: *mut u8, k: usize, n_pad: usize, col: usize, q: &[i8], d:
                     *buf.add(at + b) = q[kb * 32 + 4 * s + b] as u8;
                 }
                 if s == 0 {
-                    *(buf.offset(scales) as *mut f32).add(sd) = d[kb];
+                    let le = d[kb].to_le_bytes();
+                    std::ptr::copy_nonoverlapping(le.as_ptr(), buf.add(scales + sd * 4), 4);
                 }
             }
         }
+    }
+}
+
+/// [`put_col`] of zeros into the padding columns `n..n_pad` this thread (`ith` of `nth`)
+/// writes, so every byte of [`quant_bytes`] is written before a reader forms a slice over them.
+///
+/// # Safety
+/// As [`put_col`].
+unsafe fn zero_pad_cols(buf: *mut u8, k: usize, n: usize, n_pad: usize, ith: usize, nth: usize) {
+    let (q, d) = (vec![0i8; k], vec![0f32; k / QK as usize]);
+    for c in (n + ith..n_pad).step_by(nth) {
+        // SAFETY: the caller's.
+        unsafe { put_col(buf, k, n_pad, c, &q, &d) };
     }
 }
 
@@ -512,6 +527,7 @@ unsafe fn cpu_q40_quant(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
             let (q, d) = quantize_col(&v);
             put_col(out, k, n_pad, c, &q, &d);
         }
+        zero_pad_cols(out, k, n, n_pad, ith, nth);
     }
 }
 
@@ -540,6 +556,7 @@ unsafe fn cpu_q40_geglu(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
             let (vq, vd) = quantize_col(&v);
             put_col(dst.data as *mut u8, rows, n_pad, c, &vq, &vd);
         }
+        zero_pad_cols(dst.data as *mut u8, rows, n, n_pad, ith, nth);
     }
 }
 
