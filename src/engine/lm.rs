@@ -6330,6 +6330,18 @@ impl LmEngine {
             _ => None,
         };
         exec.set_tier_passes(tier_step.is_some());
+        // The grid's fold (#1183) only where every MoE router's prompt-step logits come from
+        // Legion's kernel (`--legion-router`): the cuBLAS ones depend on the step's size.
+        let prompt_grid_fold =
+            grid::fold_min(cfg.prompt_grid > 0 && exec.model().routers_on_legion_kernel());
+        if prompt_grid_fold > 0 {
+            tracing::info!(
+                grid = cfg.prompt_grid,
+                fold = prompt_grid_fold,
+                "prompt steps: a prompt's last part of `fold` tokens or more past the grid's \
+                 cells runs in their step (Legion's router kernel on every MoE layer)"
+            );
+        }
         let worker = Worker {
             exec,
             tokenizer: tokenizer.clone(),
@@ -6407,6 +6419,7 @@ impl LmEngine {
             prefill_chunk: cfg.prefill_chunk.max(1),
             prefill_even: cfg.prefill_even,
             prompt_grid: cfg.prompt_grid,
+            prompt_grid_fold,
             ring_step,
             image_step,
             max_ctx: cfg.ctx_size,
@@ -6828,6 +6841,9 @@ struct Worker {
     prefill_even: bool,
     /// [`LmConfig::prompt_grid`].
     prompt_grid: usize,
+    /// On [`Self::prompt_grid`]: a prompt's last part of at least this many tokens past the
+    /// whole cells runs in their step ([`grid::fold_min`]; 0: never).
+    prompt_grid_fold: usize,
     /// With rings: the most prompt tokens a sequence takes per step ([`LmConfig::ring_step`]).
     ring_step: usize,
     /// The most tokens one image whose tokens see each other takes ([`largest_image`]; 0
@@ -8511,7 +8527,8 @@ impl Worker {
                 } else {
                     self.prompt_grid
                 };
-                let tokens = grid::grid_take(tokens, grid);
+                let at_end = end + tokens == s.prompt.len();
+                let tokens = grid::grid_take_folded(tokens, grid, self.prompt_grid_fold, at_end);
                 (tokens > 0).then(|| PromptNext {
                     tokens,
                     logits: if end + tokens == s.prompt.len() {
@@ -8867,11 +8884,15 @@ impl Worker {
             };
             let end = self.save_cut(seq, (seq.n_past + take).min(seq.prompt.len()));
             // `--prompt-step-grid`: whole cells of the grid, the part past them alone, so the
-            // chunk ends are those of grid-sized steps (even steps choose their own sizes).
+            // chunk ends are those of grid-sized steps (even steps choose their own sizes); a
+            // long enough last part of the prompt joins the cells' step where every MoE router
+            // runs on Legion's kernel ([`grid::fold_min`]).
             let end = if self.prefill_even || tier_pass {
                 end
             } else {
-                seq.n_past + grid::grid_take(end - seq.n_past, self.prompt_grid)
+                let at_end = end == seq.prompt.len();
+                let (grid, fold) = (self.prompt_grid, self.prompt_grid_fold);
+                seq.n_past + grid::grid_take_folded(end - seq.n_past, grid, fold, at_end)
             };
             // An image whose tokens see each other runs in one step (#1217): a step stops at
             // its start, the next takes it whole, past the room when it is longer (up to the

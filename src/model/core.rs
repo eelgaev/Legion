@@ -2438,6 +2438,36 @@ impl Model {
         self.router_copies();
     }
 
+    /// Whether every MoE router's logits in steps of [`legion_router::MIN_TOKENS`] or more
+    /// tokens come from Legion's kernel (`--legion-router`, #1183), as the MoE graph builder
+    /// picks it: a fused router, a plain router weight with a BF16 copy, and that copy taken by
+    /// the kernel ([`legion_router::takes_weight`]). False for a model without MoE routers. Its
+    /// logits are then the same bits in a step of any size, which lets `--prompt-step-grid`
+    /// fold a prompt's long last part into the step before it.
+    pub fn routers_on_legion_kernel(&self) -> bool {
+        if !legion_router::on() || self.hp.n_expert > fused::ROUTER_MAX_EXPERTS {
+            return false;
+        }
+        let layers: Vec<usize> = self
+            .weights
+            .tensors()
+            .chain(self.mtp.iter().flat_map(|m| m.tensors()))
+            .filter_map(|t| {
+                let name = t.name();
+                let il = name
+                    .strip_prefix("blk.")?
+                    .strip_suffix(router_bf16::ROUTER)?;
+                il.parse().ok()
+            })
+            .collect();
+        !layers.is_empty()
+            && layers.into_iter().all(|il| {
+                self.plain_weight(il, "ffn_gate_inp.weight")
+                    .and_then(|w| self.router_bf16(il, w))
+                    .is_some_and(legion_router::takes_weight)
+            })
+    }
+
     /// The routers' BF16 copies ([`Self::router_bf16`]), made on first use.
     fn router_copies(&self) -> Option<&router_bf16::RouterBf16> {
         if !router_bf16::on() || !router_mv::device_supported() {
