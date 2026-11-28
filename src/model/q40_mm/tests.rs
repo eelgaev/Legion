@@ -41,6 +41,26 @@ fn use_variant(i: usize) {
     VARIANT.store(i, Ordering::Relaxed);
 }
 
+/// Makes `w`'s repacked copy ([`cuda::repack`]) once its bytes are set.
+#[cfg(feature = "cuda")]
+fn repack_weight(w: Tensor<'_>) {
+    // SAFETY: an allocated Q4_0 weight on the current GPU, its bytes set.
+    unsafe { cuda::repack(&*w.raw()) }.expect("repack");
+}
+
+/// Drops `w`'s repacked copy.
+#[cfg(feature = "cuda")]
+fn forget_weight(w: Tensor<'_>) {
+    // SAFETY: a live tensor.
+    cuda::forget(unsafe { &*w.raw() });
+}
+
+/// Whether the op's matmul picked by [`use_variant`] reads repacked weights.
+#[cfg(feature = "cuda")]
+fn variant_repacked() -> bool {
+    cuda::kernel_repacked(VARIANT.load(Ordering::Relaxed))
+}
+
 fn shape(ty: ffi::ggml_type, ne: [i64; 4]) -> (ffi::ggml_type, [i64; 4], [usize; 4]) {
     let (ts, row) = if ty == types::Q4_0 {
         (BLOCK_BYTES, (ne[0] / QK) as usize * BLOCK_BYTES)
@@ -453,8 +473,16 @@ fn case(backend: &mut Backend, ours: bool, k: i64, rows: i64, n: i64) -> Vec<u8>
         .unwrap();
     w.set_bytes(&q4_0_matrix(k as usize, rows as usize, (k + rows) as u64));
     x.set_f32(&input(k as usize, n as usize, n as u64));
+    let rp = ours && variant_repacked();
+    if rp {
+        repack_weight(w);
+    }
     backend.compute(&graph).unwrap();
-    y.bytes()
+    let out = y.bytes();
+    if rp {
+        forget_weight(w);
+    }
+    out
 }
 
 /// On a GB10 every matmul of the table (the op's, the first version's, ...) gives ggml-cuda's MMQ product bit for bit
@@ -542,6 +570,8 @@ fn cuda_q40_mm_time_at_4096_rows() {
         .map_or(1, |v| v + 1);
     for (k, rows) in CHECKED {
         let mut ms = vec![0f64; runs];
+        // The last repack's time (with its allocation).
+        let mut repack_ms = 0f64;
         for (i, ms) in ms.iter_mut().enumerate() {
             let ours = i > 0;
             use_variant(i.saturating_sub(1));
@@ -568,10 +598,19 @@ fn cuda_q40_mm_time_at_4096_rows() {
             for (s, x) in xs.iter().enumerate() {
                 x.set_f32(&input(k as usize, n as usize, 12 + s as u64));
             }
+            let rp = ours && variant_repacked();
+            if rp {
+                let t0 = std::time::Instant::now();
+                repack_weight(w);
+                repack_ms = t0.elapsed().as_secs_f64() * 1e3;
+            }
             gpu.compute(&graph).unwrap();
             let t0 = std::time::Instant::now();
             gpu.compute(&graph).unwrap();
             *ms = t0.elapsed().as_secs_f64() * 1e3 / CALLS as f64;
+            if rp {
+                forget_weight(w);
+            }
             use_variant(0);
         }
         // One line a shape: each matmul's ms and share of the peak (TOPS without a peak).
@@ -594,7 +633,7 @@ fn cuda_q40_mm_time_at_4096_rows() {
             })
             .collect();
         println!(
-            "{k}x{rows} at {n}, ms: {}; q40_mm {:.2}x ggml, {:.2}x the first version",
+            "{k}x{rows} at {n}, ms: {}; q40_mm {:.2}x ggml, {:.2}x the first version; repack {repack_ms:.1} ms",
             parts.join(", "),
             ms[0] / ms[1],
             ms[v1] / ms[1]
@@ -842,6 +881,23 @@ fn cuda_q40_mm_fused_quant_is_byte_exact() {
                 bad.push(format!("{k}x{rows} at {n}"));
             }
             cases += 1;
+            // Again on the weight's repacked copy.
+            repack_weight(w);
+            gpu.compute(&graph).unwrap();
+            let diff = y
+                .bytes()
+                .chunks(4)
+                .zip(ggml.chunks(4))
+                .filter(|(a, b)| a != b)
+                .count();
+            forget_weight(w);
+            if diff > 0 {
+                println!(
+                    "{k}x{rows}, {n} columns, quantized input, repacked: {diff} values differ from ggml"
+                );
+                bad.push(format!("{k}x{rows} at {n} repacked"));
+            }
+            cases += 1;
         }
     }
     println!(
@@ -892,7 +948,13 @@ fn cuda_q40_mm_fused_time_at_4096_rows() {
         }
         let ms = time(&mut gpu, &graph);
         let tops = 2.0 * (k * rows * n) as f64 / ms / 1e9;
-        println!("{k}x{rows}, {n} columns, quantized input: {ms:.2} ms ({tops:.0} TOPS)");
+        repack_weight(w);
+        let rp = time(&mut gpu, &graph);
+        forget_weight(w);
+        let rtops = 2.0 * (k * rows * n) as f64 / rp / 1e9;
+        println!(
+            "{k}x{rows}, {n} columns, quantized input: {ms:.2} ms ({tops:.0} TOPS), repacked {rp:.2} ms ({rtops:.0} TOPS)"
+        );
     }
     // The producers: 0 ggml's F32 op, 1 it plus the op's quantization, 2 the fused one.
     let eps = 1e-6f32;
@@ -1028,10 +1090,28 @@ fn cuda_q40_mm_geglu_pair_is_byte_exact() {
             up.set_bytes(&wu);
             x.set_f32(&input(k as usize, n as usize, 70 + n as u64));
             gpu.compute(&graph).unwrap();
-            let cols = quant_cols_differ(&want.bytes(), &got.bytes(), rows as usize, n as usize);
+            let want0 = want.bytes();
+            let cols = quant_cols_differ(&want0, &got.bytes(), rows as usize, n as usize);
             if cols > 0 {
                 println!("GeGLU pair {k}x{rows}, {n} columns: {cols} quantized columns differ");
                 bad.push(format!("{k}x{rows} at {n}"));
+            }
+            cases += 1;
+            // Again on the weights' repacked copies (the pair and the two matmuls), against the
+            // matmuls on the weights as loaded.
+            repack_weight(gate);
+            repack_weight(up);
+            gpu.compute(&graph).unwrap();
+            let (r, c) = (rows as usize, n as usize);
+            let cols = quant_cols_differ(&want0, &got.bytes(), r, c)
+                + quant_cols_differ(&want0, &want.bytes(), r, c);
+            forget_weight(gate);
+            forget_weight(up);
+            if cols > 0 {
+                println!(
+                    "GeGLU pair {k}x{rows}, {n} columns, repacked: {cols} quantized columns differ"
+                );
+                bad.push(format!("{k}x{rows} at {n} repacked"));
             }
             cases += 1;
         }
@@ -1066,9 +1146,11 @@ fn cuda_q40_mm_ffn_time_at_4096_rows() {
             )
         })
         .collect();
-    // 0 round 4 gate / up + GeGLU, 1 the pair, 2 and 3 the same with down.
-    let mut ms = [0f64; 4];
+    // 0 round 4 gate / up + GeGLU, 1 the pair, 2 and 3 the same with down, 4 and 5 the pair
+    // and the pair with down on repacked weights.
+    let mut ms = [0f64; 6];
     for (i, ms) in ms.iter_mut().enumerate() {
+        let (pair, with_down, rp) = (i % 2 == 1 || i == 4, (2..4).contains(&i) || i == 5, i >= 4);
         let ctx = Context::new(64, 64);
         let gate = ctx.new_tensor(types::Q4_0, &[k, hid]).as_input();
         let up = ctx.new_tensor(types::Q4_0, &[k, hid]).as_input();
@@ -1079,14 +1161,14 @@ fn cuda_q40_mm_ffn_time_at_4096_rows() {
         let mut last = None;
         for c in 0..CALLS {
             let xq = xs[c % 2];
-            let act = if i % 2 == 0 {
+            let act = if !pair {
                 let g = mul_mat_q(&ctx, gate, xq, n);
                 let u = mul_mat_q(&ctx, up, xq, n);
                 quantize_geglu(&ctx, g, u, false)
             } else {
                 mul_mat_geglu_q(&ctx, gate, up, xq, n)
             };
-            let y = if i >= 2 {
+            let y = if with_down {
                 mul_mat_q(&ctx, down, act, n)
             } else {
                 act
@@ -1099,17 +1181,30 @@ fn cuda_q40_mm_ffn_time_at_4096_rows() {
             .unwrap();
         gate.set_bytes(&wg);
         up.set_bytes(&wu);
-        if i >= 2 {
+        if with_down {
             // Not in the graphs without down: no memory.
             down.set_bytes(&wd);
         }
         for (x, b) in xs.iter().zip(&bufs) {
             x.set_bytes(b);
         }
+        let repacked: Vec<_> = if !rp {
+            vec![]
+        } else if with_down {
+            vec![gate, up, down]
+        } else {
+            vec![gate, up]
+        };
+        for &w in &repacked {
+            repack_weight(w);
+        }
         gpu.compute(&graph).unwrap();
         let t0 = std::time::Instant::now();
         gpu.compute(&graph).unwrap();
         *ms = t0.elapsed().as_secs_f64() * 1e3 / CALLS as f64;
+        for &w in &repacked {
+            forget_weight(w);
+        }
     }
     let tops = |mm: i64, t: f64| 2.0 * (mm * k * hid * n) as f64 / t / 1e9;
     println!(
@@ -1127,5 +1222,14 @@ fn cuda_q40_mm_ffn_time_at_4096_rows() {
         ms[3],
         tops(3, ms[3]),
         ms[2] / ms[3]
+    );
+    println!(
+        "FFN on repacked weights at {n}: pair {:.2} ms ({:.0} TOPS, {:.3}x the pair), with down {:.2} ms ({:.0} TOPS, {:.3}x)",
+        ms[4],
+        tops(2, ms[4]),
+        ms[1] / ms[4],
+        ms[5],
+        tops(3, ms[5]),
+        ms[3] / ms[5]
     );
 }

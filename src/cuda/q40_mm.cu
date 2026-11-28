@@ -490,8 +490,9 @@ __global__ void __launch_bounds__(Q40_THREADS, 1) q40_gemm_v1(const legion_q40_m
 // A configuration of the op's matmul: BM x BN tiles, WARPS_M x WARPS_N warps of (BM / WARPS_M) x
 // (BN / WARPS_N), a STAGES-deep ring of 4 K blocks a stage, MINB CTAs an SM, raster groups of
 // GROUP row tiles (COLS 0, column tiles slowest in a group) or GROUP column tiles (COLS 1, row
-// tiles slowest).
-template <int BM_, int BN_, int WARPS_M_, int WARPS_N_, int STAGES_, int MINB_, int GROUP_, int COLS_>
+// tiles slowest). RP 1 reads the weights repacked at load (q40_repack): a stage's 32-row units
+// are one contiguous 2304-byte chunk each, copied as is.
+template <int BM_, int BN_, int WARPS_M_, int WARPS_N_, int STAGES_, int MINB_, int GROUP_, int COLS_, int RP_ = 0>
 struct q40_cfg {
     static constexpr int BM          = BM_;
     static constexpr int BN          = BN_;
@@ -501,18 +502,19 @@ struct q40_cfg {
     static constexpr int MINB        = MINB_;
     static constexpr int GROUP       = GROUP_;
     static constexpr int COLS        = COLS_;
+    static constexpr int RP          = RP_;
     static constexpr int THREADS     = 32 * WARPS_M * WARPS_N;
     static constexpr int MT          = BM / WARPS_M / 16;  // m16 tiles a warp
     static constexpr int NT          = BN / WARPS_N / 8;   // n8 tiles a warp
     static constexpr int SB          = 4;
     static constexpr int WRS         = 20;               // words a weight row (18 + 2 of the shift)
     static constexpr int D_BL        = BN / 128 * 144;   // scale words a block: 4 rows of 32, 36 apart
-    static constexpr int W_WORDS     = BM * WRS;
+    static constexpr int W_WORDS     = RP ? BM * 18 : BM * WRS;
     static constexpr int Q_WORDS     = SB * BN * 8;
     static constexpr int D_WORDS     = SB * D_BL;
     static constexpr int STAGE_WORDS = W_WORDS + Q_WORDS + D_WORDS;
     static constexpr int SMEM        = STAGES * STAGE_WORDS * 4;
-    static constexpr int WCH         = BM * 5;           // 16-byte weight copies a stage
+    static constexpr int WCH         = RP ? BM / 32 * 144 : BM * 5;  // 16-byte weight copies a stage
     static constexpr int WCPT        = (WCH + THREADS - 1) / THREADS;
     static constexpr int QCH         = SB * BN * 2;      // 16-byte quant copies a stage
     static constexpr int QCPT        = QCH / THREADS;
@@ -520,7 +522,20 @@ struct q40_cfg {
     static_assert(MT >= 1 && NT % 2 == 0 && BN % 128 == 0, "warp tiles of n8 tile pairs");
     static_assert(QCH % THREADS == 0 && DCH <= THREADS, "copies");
     static_assert(SMEM <= 99 * 1024, "shared memory");
+    static_assert(!RP || MT == 2, "repacked: a warp's rows are one 32-row unit");
 };
+
+// The repacked weights (q40_repack, RP 1): 32-row units u (rows 32 u .. 32 u + 31), each the
+// k / 128 stages of 4 K blocks in order, a stage's 4 blocks of the unit 2304 bytes:
+// - 512 words of quants: block bl's word q (its bytes 4q .. 4q + 3) of unit row
+//   16 (j / 2) + 8 (j % 2) + g at word ((bl * 8 + g) * 4 + q) * 4 + j, so lane (g, q) of the
+//   warp reading the unit takes its 4 rows' A words (j = 2 mt + h) of a block in one 16-byte
+//   read;
+// - then 128 F16 scales: block bl's of that row at half (bl * 8 + g) * 4 + j (8 bytes a lane).
+// The same values as the Q4_0 rows, only moved: the MMAs and the sums are the same.
+constexpr int Q40_RP_UNIT  = 32;    // rows a unit
+constexpr int Q40_RP_CHUNK = 2304;  // bytes a unit's stage
+constexpr int Q40_RP_WORDS = Q40_RP_CHUNK / 4;
 
 // The op's matmul of configuration C: a CTA per BM x BN tile (grid ntx * nty, C::THREADS threads,
 // C::SMEM bytes of dynamic shared memory), the input in layout 1 (n_pad a multiple of BN).
@@ -577,15 +592,31 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
     int  woff[C::WCPT];
     bool wend[C::WCPT];
     // EPI 1: the copies' rows, of the gate (tile rows below HR) or the up weight.
-    const char * wp[EPI ? C::WCPT : 1];
+    const char * wp[EPI || C::RP ? C::WCPT : 1];
+    // RP: unit x of the tile (BM / 32 of them; EPI: the gate's unit it, then the up's) from its
+    // first stage; copy c is unit c / 144's 16 bytes c % 144 of a stage.
+    const long long ustride = (long long) nst * Q40_RP_CHUNK;
+    auto unit = [&](const int x) -> const char * {
+        if constexpr (EPI) {
+            return (const char *) (x == 0 ? p.w : p.w2) + it * ustride;
+        } else {
+            return (const char *) p.w + (row0 / Q40_RP_UNIT + x) * ustride;
+        }
+    };
 #pragma unroll
     for (int i = 0; i < C::WCPT; i++) {
         const int c = tid + i * C::THREADS;
-        woff[i]     = (c / 5) * (int) p.w_nb1 + (c % 5) * 16;
-        wend[i]     = c % 5 == 4;
-        if constexpr (EPI) {
-            const int r = c / 5;
-            wp[i] = (const char *) (r < HR ? p.w : p.w2) + (long long) (it * HR + r % HR) * p.w_nb1 + (c % 5) * 16;
+        if constexpr (C::RP) {
+            wp[i] = unit(min(c, C::WCH - 1) / 144) + (c % 144) * 16;
+            woff[i] = 0;
+            wend[i] = false;
+        } else {
+            woff[i] = (c / 5) * (int) p.w_nb1 + (c % 5) * 16;
+            wend[i] = c % 5 == 4;
+            if constexpr (EPI) {
+                const int r = c / 5;
+                wp[i] = (const char *) (r < HR ? p.w : p.w2) + (long long) (it * HR + r % HR) * p.w_nb1 + (c % 5) * 16;
+            }
         }
     }
     const long long qstep = (long long) p.n_pad * 8;  // words a block
@@ -593,12 +624,16 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
     // + tid (THREADS divides 2 BN or 2 BN divides THREADS, so no copy crosses a block).
     static_assert((2 * BN) % C::THREADS == 0 || C::THREADS % (2 * BN) == 0, "quant copies");
     // PF: prefetch c = tid + i * THREADS is row c / 5's sector c % 5 of a pair.
-    constexpr int PCPT = PF ? (5 * BM + C::THREADS - 1) / C::THREADS : 0;
+    // RP: c is unit c / 144's sector c % 144 of a pair (4608 bytes).
+    constexpr int PSEC = C::RP ? BM / 32 * 144 : 5 * BM;  // sectors a pair
+    constexpr int PCPT = PF ? (PSEC + C::THREADS - 1) / C::THREADS : 0;
     const char * pfp[PCPT ? PCPT : 1];
 #pragma unroll
     for (int i = 0; i < PCPT; i++) {
         const int c = tid + i * C::THREADS, r = c / 5;
-        if constexpr (EPI) {
+        if constexpr (C::RP) {
+            pfp[i] = unit(min(c, PSEC - 1) / 144) + (c % 144) * 32;
+        } else if constexpr (EPI) {
             pfp[i] = (const char *) (r < HR ? p.w : p.w2) + (long long) (it * HR + r % HR) * p.w_nb1 + (c % 5) * 32;
         } else {
             pfp[i] = wg + (long long) r * p.w_nb1 + (c % 5) * 32;
@@ -623,7 +658,11 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
 #pragma unroll
             for (int i = 0; i < C::WCPT; i++) {
                 const int c = tid + i * C::THREADS;
-                if (C::WCH % C::THREADS == 0 || c < C::WCH) {
+                if constexpr (C::RP) {
+                    if (C::WCH % C::THREADS == 0 || c < C::WCH) {
+                        q40_cp16(sw + c * 4, wp[i] + (long long) st * Q40_RP_CHUNK);
+                    }
+                } else if (C::WCH % C::THREADS == 0 || c < C::WCH) {
                     const char * src;
                     if constexpr (EPI) {
                         src = wp[i] + wo;
@@ -648,8 +687,12 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
                 if (odd == 0 && pair < nst / 2) {
 #pragma unroll
                     for (int i = 0; i < PCPT; i++) {
-                        if ((5 * BM) % C::THREADS == 0 || tid + i * C::THREADS < 5 * BM) {
-                            q40_prefetch_l2(pfp[i] + pair * 144);
+                        if (PSEC % C::THREADS == 0 || tid + i * C::THREADS < PSEC) {
+                            if constexpr (C::RP) {
+                                q40_prefetch_l2(pfp[i] + (long long) pair * (2 * Q40_RP_CHUNK));
+                            } else {
+                                q40_prefetch_l2(pfp[i] + pair * 144);
+                            }
                         }
                     }
                 }
@@ -685,6 +728,26 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
             // slot q at bits 16 .. of its words q, q + 1; an odd block's are words 9m + 5 ..).
             uint32_t a[MT][4];
             float da[MT][2], mda[MT][2];
+            if constexpr (C::RP) {
+                // The warp's unit wm: its 4 rows' words q of block bl (j = 2 mt + h) and scales.
+                const uint32_t * su = sw + wm * Q40_RP_WORDS;
+                const uint4 qv = *reinterpret_cast<const uint4 *>(su + bl * 128 + (g * 4 + q) * 4);
+                const uint2 dv = *reinterpret_cast<const uint2 *>(su + 512 + bl * 16 + g * 2);
+                const uint32_t qw[4] = { qv.x, qv.y, qv.z, qv.w };
+                const uint32_t dw[2] = { dv.x, dv.y };
+#pragma unroll
+                for (int mt = 0; mt < MT; mt++) {
+#pragma unroll
+                    for (int h = 0; h < 2; h++) {
+                        const uint32_t hi = qw[2 * mt + h];
+                        const unsigned short dh = (unsigned short) (h ? dw[mt] >> 16 : dw[mt] & 0xFFFF);
+                        a[mt][h]     = q40_s8x16(hi << 4);  // K slot q: values 4q .. 4q + 3
+                        a[mt][h + 2] = q40_s8x16(hi);       // K slot q + 4: values 16 + 4q ..
+                        da[mt][h]  = __half2float(__ushort_as_half(dh));
+                        mda[mt][h] = __fmul_rn(da[mt][h], -Q40_MAGIC);
+                    }
+                }
+            } else {
 #pragma unroll
             for (int mt = 0; mt < MT; mt++) {
 #pragma unroll
@@ -707,6 +770,7 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
                     da[mt][h]  = __half2float(__ushort_as_half(dh));
                     mda[mt][h] = __fmul_rn(da[mt][h], -Q40_MAGIC);
                 }
+            }
             }
             const uint32_t * bq = sq + bl * BN * 8;
             const float    * bd = sd + bl * C::D_BL;
@@ -815,8 +879,66 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
 
 using q40_op  = q40_cfg<64, 128, 2, 2, 2, 2, 4, 1>;   // the op's: 4 warps of 32 x 64, 2 CTAs an SM
 using q40_128 = q40_cfg<128, 128, 4, 2, 3, 1, 8, 0>;  // 8 warps of 32 x 64, 1 CTA an SM
+using q40_rp  = q40_cfg<64, 128, 2, 2, 2, 2, 4, 1, 1>;  // the op's on repacked weights
 
 static_assert(q40_op::SMEM == 47616, "src/model/q40_mm.rs SMEM_BYTES");
+static_assert(q40_rp::SMEM <= q40_op::SMEM, "the GeGLU pair's launch");
+
+}  // namespace
+
+extern "C" {
+
+// The repack's launch arguments (src/model/q40_mm.rs, `RepackParams`): a Q4_0 weight of `rows`
+// rows (a multiple of 32) of `k` values (of 128), rows w_nb1 bytes apart, into `out`
+// (rows * k / 32 * 18 bytes, 16-byte aligned) in the layout above q40_repack.
+struct legion_q40_repack {
+    const void * w;
+    void * out;
+    long long w_nb1;
+    int k;
+    int rows;
+};
+
+}
+
+namespace {
+
+// One output word a thread (a grid-stride loop): chunk x = u * nst + st of unit u, stage st;
+// its word i < 512 quants, else two scales.
+__global__ void __launch_bounds__(256) q40_repack(const legion_q40_repack p) {
+    const int nst = p.k / 128;
+    const long long words = (long long) p.rows / Q40_RP_UNIT * nst * Q40_RP_WORDS;
+    const unsigned char * w = (const unsigned char *) p.w;
+    uint32_t * out = (uint32_t *) p.out;
+    for (long long x = (long long) blockIdx.x * blockDim.x + threadIdx.x; x < words;
+         x += (long long) gridDim.x * blockDim.x) {
+        const long long ch = x / Q40_RP_WORDS;
+        const int i = (int) (x - ch * Q40_RP_WORDS);
+        const long long u = ch / nst;
+        const int st = (int) (ch - u * nst);
+        // The unit row of A word j of lane g: 16 (j / 2) + 8 (j % 2) + g.
+        auto row = [&](const int j, const int g) {
+            return u * Q40_RP_UNIT + (j / 2) * 16 + (j % 2) * 8 + g;
+        };
+        uint32_t v;
+        if (i < 512) {
+            const int j = i % 4, q = i / 4 % 4, g = i / 16 % 8, bl = i / 128;
+            const unsigned char * b = w + row(j, g) * p.w_nb1 + (long long) (st * 4 + bl) * 18 + 2 + 4 * q;
+            const unsigned short * h = (const unsigned short *) b;  // 2-byte aligned
+            v = (uint32_t) h[0] | ((uint32_t) h[1] << 16);
+        } else {
+            v = 0;
+#pragma unroll
+            for (int e = 0; e < 2; e++) {
+                const int hx = 2 * (i - 512) + e;
+                const int j = hx % 4, g = hx / 4 % 8, bl = hx / 32;
+                const unsigned char * b = w + row(j, g) * p.w_nb1 + (long long) (st * 4 + bl) * 18;
+                v |= (uint32_t) *(const unsigned short *) b << (16 * e);
+            }
+        }
+        out[x] = v;
+    }
+}
 
 }  // namespace
 
@@ -831,18 +953,25 @@ struct legion_q40_kernel {
     int bm;
     int bn;
     const char * name;
+    int repacked;  // reads the weights repacked (q40_repack), RP 1
 };
 
 // The op's matmul first, then the others the timing test runs (src/model/q40_mm.rs, `Kernel`).
 extern const legion_q40_kernel legion_q40_mm_table[] = {
     { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op>),
-      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "q40_mm" },
+      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "q40_mm", 0 },
     { reinterpret_cast<const void *>(&q40_quant<0>), reinterpret_cast<const void *>(&q40_gemm_v1),
-      Q40_STAGES * Q40_STAGE_WORDS * 4, Q40_THREADS, Q40_BM, Q40_BN, "first version" },
+      Q40_STAGES * Q40_STAGE_WORDS * 4, Q40_THREADS, Q40_BM, Q40_BN, "first version", 0 },
     { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_128>),
-      q40_128::SMEM, q40_128::THREADS, q40_128::BM, q40_128::BN, "128 x 128 tiles" },
+      q40_128::SMEM, q40_128::THREADS, q40_128::BM, q40_128::BN, "128 x 128 tiles", 0 },
     { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 0>),
-      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "no prefetch" },
+      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "no prefetch", 0 },
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_rp>),
+      q40_rp::SMEM, q40_rp::THREADS, q40_rp::BM, q40_rp::BN, "repacked", 1 },
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_rp, 0, 0>),
+      q40_rp::SMEM, q40_rp::THREADS, q40_rp::BM, q40_rp::BN, "repacked, no prefetch", 1 },
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_rp, 0, 2>),
+      q40_rp::SMEM, q40_rp::THREADS, q40_rp::BM, q40_rp::BN, "repacked, prefetch 2", 1 },
 };
 extern const int legion_q40_mm_table_len = sizeof(legion_q40_mm_table) / sizeof(legion_q40_mm_table[0]);
 
@@ -859,5 +988,12 @@ extern const void * const legion_q40_quant_kernels[3] = {
 // up weight, grid ntx * (rows / 32), q40_op's threads and shared memory, writing the quantized
 // GeGLU. Its arguments are a legion_q40_mm.
 extern const void * const legion_q40_geglu_gemm = reinterpret_cast<const void *>(&q40_gemm<q40_op, 1>);
+
+// The same on repacked gate and up weights (q40_rp, the same shared memory or less).
+extern const void * const legion_q40_geglu_gemm_rp = reinterpret_cast<const void *>(&q40_gemm<q40_rp, 1>);
+
+// The repack (src/model/q40_mm.rs, `cuda::repack`): 256 threads, any grid. Its arguments are a
+// legion_q40_repack.
+extern const void * const legion_q40_repack_kernel = reinterpret_cast<const void *>(&q40_repack);
 
 }
