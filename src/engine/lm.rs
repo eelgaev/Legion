@@ -150,22 +150,6 @@ pub fn default_prefill_chunk(
     }
 }
 
-/// `--prompt-step-grid` when none is given (#1183): on a GPU sharing the host's memory with
-/// steps bigger than its default ([`MAX_BATCH_TOKENS_INTEGRATED`]), that default, so a bigger
-/// `--max-batch-tokens` keeps the default step's output; else 0 (none).
-pub fn default_prompt_grid(
-    device: DeviceChoice,
-    integrated: bool,
-    max_batch_tokens: usize,
-) -> usize {
-    match device {
-        DeviceChoice::Cuda if integrated && max_batch_tokens > MAX_BATCH_TOKENS_INTEGRATED => {
-            MAX_BATCH_TOKENS_INTEGRATED
-        }
-        _ => 0,
-    }
-}
-
 /// Whether `--device cuda` runs on an integrated GPU: there is no discrete one, but an
 /// integrated one (the engine's own choice, see `layout`).
 pub fn integrated_gpu() -> bool {
@@ -1324,7 +1308,7 @@ pub struct LmConfig {
     pub prefill_even: bool,
     /// Prompt chunks bigger than this many tokens hold whole multiples of it, and a prompt's
     /// part past them runs alone, as in steps of this size (`--prompt-step-grid`, [`grid`]); 0
-    /// for none. See [`default_prompt_grid`].
+    /// for none (the default).
     pub prompt_grid: usize,
     /// With sliding-window rings: the most prompt tokens a sequence takes per step (its rings
     /// hold the window plus one step). `None`: `max_batch_tokens` on a GPU sharing memory with
