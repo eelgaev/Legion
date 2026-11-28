@@ -577,6 +577,19 @@ fn nvfp4_mvq_either_way() {
 }
 
 #[test]
+fn stable_fusions_either_way() {
+    // No flag: the built-in default (on); the old opt-in flag is still accepted.
+    assert_eq!(switches(&[]).stable_fusions, None);
+    assert_eq!(switches(&["--stable-fusions"]).stable_fusions, Some(true));
+    assert_eq!(
+        switches(&["--no-stable-fusions"]).stable_fusions,
+        Some(false)
+    );
+    let argv = ["legion", "serve", "--stable-fusions", "--no-stable-fusions"];
+    assert!(Cli::try_parse_from(argv).is_err());
+}
+
+#[test]
 fn q8_group_either_way() {
     // No flag: the op's default (q8_group::Mode::Default).
     assert_eq!(switches(&[]).q8_group, None);
@@ -735,6 +748,8 @@ fn help_lists_the_switches_under_their_heading() {
         "--no-mtp-take-in-sort",
         "--gated-norm",
         "--moe-combine",
+        // --stable-fusions is hidden since it became the default.
+        "--no-stable-fusions",
         "--delta-prep-ggml",
         "--gdn-ggml",
         "--gdn-decode-ggml",

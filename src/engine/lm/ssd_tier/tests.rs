@@ -180,3 +180,36 @@ fn the_heat_file_is_in_the_state_directory_and_names_the_checkpoint() {
         at(None, Some("/home/u"))
     );
 }
+
+/// The plan's n-gram row cache is what the loader opens: an explicit `--ngram-ram` size capped
+/// at the table, `all` the whole table, a set cache size, else the bounded default.
+#[test]
+fn the_plan_reserves_an_explicit_ngram_ram() {
+    use crate::residency::lookup_table::RamBudget;
+    let gib = 1u64 << 30;
+    let default = crate::residency::host_tier::bounded_table_cache();
+    assert_eq!(
+        table_cache(RamBudget::Auto, None, 10 * gib, 32 * gib),
+        default
+    );
+    assert_eq!(
+        table_cache(RamBudget::Auto, Some(2 * gib), 10 * gib, 32 * gib),
+        2 * gib
+    );
+    assert_eq!(
+        table_cache(RamBudget::Bytes(4 * gib), None, 10 * gib, 32 * gib),
+        4 * gib
+    );
+    assert_eq!(
+        table_cache(RamBudget::Bytes(40 * gib), None, 10 * gib, 32 * gib),
+        10 * gib
+    );
+    assert_eq!(
+        table_cache(RamBudget::Percent(25.0), None, 10 * gib, 32 * gib),
+        8 * gib
+    );
+    assert_eq!(
+        table_cache(RamBudget::All, None, 10 * gib, 32 * gib),
+        10 * gib
+    );
+}

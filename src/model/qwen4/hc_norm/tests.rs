@@ -1623,6 +1623,65 @@ fn moe_fold_undoes() {
     }
 }
 
+/// Stable fusions' dependency node (`crate::model::core::stable_fusions`, on by default) after
+/// a tail over BF16 rows read back as F32: the fold still takes the BF16 rows, and the node goes
+/// with the tail's, so it keeps neither the F32 rows nor their cast alive.
+#[test]
+fn moe_fold_retires_the_sums_pin() {
+    use crate::ggml::post_alloc::Relaid;
+    let (e, k, n) = (64, 4, 2);
+    let ctx = Context::new(256, 256);
+    let rows16 = ctx.new_tensor(types::BF16, &[e, k, n]).as_input();
+    let experts = ctx.cast(rows16, types::F32);
+    let wr = ctx.new_tensor(types::F32, &[1, k, n]).as_input();
+    let sh = ctx.new_tensor(types::F32, &[e, n]).as_input();
+    let joined = ctx.new_tensor(types::F32, &[3, n]).as_input();
+    let sg = ctx.view_2d(joined, [1, n], joined.nb()[1], 4);
+    let weighted = ctx.mul(experts, wr);
+    let nb = weighted.nb();
+    let view = |j: i64| ctx.view_2d(weighted, [e, n], nb[2], j as usize * nb[1]);
+    let mut sum = ctx.add(view(0), view(1));
+    for j in 2..k {
+        sum = ctx.add(sum, view(j));
+    }
+    let mut graph = ctx.new_graph(256);
+    // As the MoE builders pin the sum's inputs (`stable_fusions::pin_weighted_sum`).
+    assert_eq!(graph.keep_until(&[experts, wr], sum), 1);
+    // SAFETY: the graph's nodes are valid tensors.
+    let pin = unsafe {
+        let n_nodes = ffi::ggml_graph_n_nodes(graph.raw()) as usize;
+        *ffi::ggml_graph_nodes(graph.raw()).add(n_nodes - 1)
+    };
+    let out = ctx.add(sum, ctx.mul(sh, ctx.sigmoid(sg)));
+    let kk = e * FOLD_HC;
+    let res = ctx.new_tensor(types::F32, &[e, FOLD_HC, n]).as_input();
+    let inj = ctx.new_tensor(types::F32, &[FOLD_HC, n]).as_input();
+    let gamma = ctx.new_tensor(types::F32, &[kk]).as_input();
+    let wi = ctx.new_tensor(types::F32, &[kk, FOLD_INJ]).as_input();
+    let down = ctx.new_tensor(types::BF16, &[kk, FOLD_M]).as_input();
+    let p = hc_post_norm_rebuilt_xnb(&ctx, res, out, inj, gamma, wi, 1e-6, down, false);
+    for t in [p.res, p.scales, p.inject, p.xnb] {
+        graph.expand(ctx.cont(t).as_output());
+    }
+    let backend = Backend::cpu().unwrap();
+    ctx.alloc_graph(&graph, ComputeAllocator::new(backend.buffer_type()))
+        .unwrap();
+    // SAFETY: an allocated graph that has not run; its nodes valid tensors.
+    unsafe {
+        assert_eq!((*pin).src[0], experts.raw(), "the pin reads the F32 rows");
+        let norm = (*p.res.raw()).view_src;
+        let (undo, folded, _) = crate::model::core::node_fuse::fold::fold_graph(graph.raw(), false);
+        assert_eq!(folded, 1);
+        assert_eq!((*norm).src[1], rows16.raw(), "the norm reads the BF16 rows");
+        for t in [pin, experts.raw(), out.raw()] {
+            assert_eq!((*t).op, ffi::ggml_op_GGML_OP_NONE);
+            assert!((*t).src.iter().all(|s| s.is_null()));
+        }
+        undo.undo(graph.raw());
+        assert_eq!((*pin).src[0], experts.raw(), "the pin as built again");
+    }
+}
+
 /// Each fold sum rounds as its nodes do: ggml's `mul` and adds, and ggml-cuda's fused FMA sum.
 #[test]
 fn folded_sums_round_as_their_nodes() {

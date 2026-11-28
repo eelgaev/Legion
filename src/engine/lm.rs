@@ -874,28 +874,32 @@ pub(crate) fn kv_floor(
     shared: bool,
     native: bool,
     types: crate::model::core::kv_type::KvTypes,
-) -> Result<usize, String> {
+) -> Result<usize, LoadError> {
     if fit >= ctx_blocks {
         return Ok(fit);
     }
     let tokens = |b: usize| b * KV_BLOCK;
     if explicit {
-        return Err(format!(
+        return Err(LoadError::Device(format!(
             "--kv-cache-tokens must hold at least --ctx-size ({}) tokens",
             tokens(ctx_blocks)
-        ));
+        )));
     }
     if shared {
-        return Err(format!(
+        return Err(LoadError::Device(format!(
             "a {}-token context does not fit next to the memory this GPU (it shares the host's \
              memory) keeps free for the OS and the prompt steps: room for {} tokens. Lower \
              --ctx-size, --max-batch-tokens or --uma-free-gib",
             tokens(ctx_blocks),
             tokens(fit)
-        ));
+        )));
     }
     if native {
-        return Err(no_room_for_native(tokens(ctx_blocks), tokens(fit), types));
+        return Err(LoadError::NoRoom(no_room_for_native(
+            tokens(ctx_blocks),
+            tokens(fit),
+            types,
+        )));
     }
     Ok(ctx_blocks)
 }
@@ -1060,6 +1064,21 @@ pub(crate) fn tower_kv_reserve(
     }
 }
 
+/// Whether [`LmEngine::load`] may load `cfg` a second time with the vision tower on the CPU
+/// after the KV fit's [`LoadError::NoRoom`]: a tower that would run on the GPU (`--mmproj`, or
+/// an HF checkpoint's own), one CUDA process (no tensor-parallel ranks over GPUs or machines,
+/// no node split).
+pub(crate) fn vision_cpu_retry(cfg: &LmConfig) -> bool {
+    matches!(cfg.device, DeviceChoice::Cuda)
+        && !cfg.vision_cpu
+        && (cfg.mmproj.is_some() || (!cfg.no_mmproj && cfg.model_path.is_dir()))
+        && cfg.node.is_none()
+        && cfg.tp <= 1
+        && !cfg.tp_per_gpu
+        && cfg.tp_pair.is_none()
+        && cfg.tp_net.is_none()
+}
+
 /// `--mmproj`: the vision tower (#146), else an HF checkpoint's own (#1195), for a language
 /// model of architecture `arch` and width `n_embd`, on CUDA device `gpu` (the CPU without
 /// one). Under tensor parallelism over ranks only rank 0 loads it (`follower`: a rank above
@@ -1167,6 +1186,10 @@ pub struct LmConfig {
     pub mmproj: Option<std::path::PathBuf>,
     /// `--no-mmproj`: text only, an HF checkpoint's vision tower is not loaded.
     pub no_mmproj: bool,
+    /// The vision tower on the CPU whatever the device: [`LmEngine::load`]'s second attempt
+    /// where a GPU tower (its weights and largest image's scratch) left the context no room on
+    /// a small GPU (#1214).
+    pub vision_cpu: bool,
     /// Model id reported by /v1/models; `None` takes `general.name` or the file name.
     pub model_name: Option<String>,
     pub device: DeviceChoice,
@@ -1421,6 +1444,10 @@ pub struct LmConfig {
     /// kernel instead of the WMMA one (other GPUs keep their default). Greedy output can differ
     /// from the default (no F16 rounding of Q and P, one pass, another summation order).
     pub tu_attn_ffma: bool,
+    /// Decode steps over a q8_0 / q4_0 cache on GPUs whose prefill kernels read F16 only
+    /// (before sm_80): through the paged decode kernel instead of the gather path, prompt steps
+    /// unchanged ([`crate::model::core::Model::set_quant_decode`]). Not the default's bits.
+    pub paged_quant_decode: bool,
     /// qwen4exp prompt steps: ggml's indexer chain (pool mask, lightning indexer, bias add)
     /// instead of Legion's one-op scores (the same bits), for comparisons.
     pub qsa_scores_ggml: bool,
@@ -1665,6 +1692,7 @@ impl LmConfig {
             model_path: model_path.into(),
             mmproj: None,
             no_mmproj: false,
+            vision_cpu: false,
             model_name: None,
             device,
             ctx_size: 8192,
@@ -1753,6 +1781,7 @@ impl LmConfig {
             glm_prune: None,
             paged_prefill_m884: false,
             tu_attn_ffma: false,
+            paged_quant_decode: false,
             long_prompts: LongPrompts::default(),
             swa_full: false,
             swa_ring: false,
@@ -1780,6 +1809,10 @@ pub enum LoadError {
     Ggml(#[from] crate::ggml::GgmlError),
     #[error("{0}")]
     Device(String),
+    /// The KV fit's: the context does not fit in GPU memory beside the weights (where a GPU
+    /// vision tower can be the cause, [`LmEngine::load`] loads again with it on the CPU).
+    #[error("{0}")]
+    NoRoom(String),
 }
 
 pub struct LmEngine {
@@ -1843,8 +1876,8 @@ struct Job {
     stop: Vec<String>,
     ignore_eos: bool,
     min_tokens: u32,
-    /// Split reasoning, and whether the prompt already opened it.
-    reasoning: Option<bool>,
+    /// Split reasoning, and whether the prompt already opened it; content trimming.
+    start: ReplyStart,
     /// The request's thinking budget in reasoning tokens ([`think_budget`]).
     budget: Option<u32>,
     /// The request's tools, for the tool-call parser (none: no parsing).
@@ -2667,7 +2700,7 @@ fn auto_host_tokens(
     (fit, fit_full): (Option<usize>, Option<usize>),
     (ctx_blocks, n_blocks): (usize, usize),
     (want, shared): (usize, bool),
-) -> Result<(usize, usize), String> {
+) -> Result<(usize, usize), LoadError> {
     let (Some(_), Some(full)) = (fit, fit_full) else {
         return Ok((0, 0));
     };
@@ -2694,11 +2727,14 @@ fn auto_host_tokens(
         match nodes.iter_mut().find(|n| n.node == node) {
             Some(n) => n.block_bytes += bytes,
             None => nodes.push(host_tier::serve_node(owner, node, bytes).ok_or_else(|| {
-                format!("cannot read NUMA node {node}'s memory for the KV host tier")
+                LoadError::Device(format!(
+                    "cannot read NUMA node {node}'s memory for the KV host tier"
+                ))
             })?),
         }
     }
-    let blocks = host_tier::auto_host_blocks(full, ctx_blocks, want, n_blocks, &nodes)?;
+    let blocks = host_tier::auto_host_blocks(full, ctx_blocks, want, n_blocks, &nodes)
+        .map_err(LoadError::NoRoom)?;
     Ok((
         blocks * KV_BLOCK,
         host_tier::budget_blocks(&nodes) * KV_BLOCK,
@@ -3500,6 +3536,24 @@ fn build_expert_cache(
     // a margin and the reserve, less what the cache leaves free (the step graphs a lend drops
     // among it).
     let mut cfg = cfg.clone();
+    // No `--cpu-expert-share`: `auto` on an x86 host with one CUDA GPU, else off (#37,
+    // [`crate::residency::cpu_share::default_auto`]).
+    #[cfg(feature = "cuda")]
+    let cuda_gpus = layout_gpus(layout)
+        .filter_map(cuda_index)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    #[cfg(not(feature = "cuda"))]
+    let cuda_gpus = 0;
+    if cfg.cpu_share.unset {
+        cfg.cpu_share = cfg.cpu_share.resolved(cuda_gpus);
+        tracing::debug!(
+            cuda_gpus,
+            share = cfg.cpu_share.share,
+            auto = cfg.cpu_share.auto,
+            "cpu expert share: the default for this run"
+        );
+    }
     // The MTP head (layer n_layer) takes long prompts in as K/V only: no staging.
     cfg.stage_below = Some(hp.n_layer);
     if cfg.lend_keep.is_empty() && !long.is_empty() {
@@ -4082,7 +4136,28 @@ fn model_id(cfg: &LmConfig, gguf: &GgufFile) -> String {
 
 impl LmEngine {
     /// Loads the model (blocking: run it off the async runtime) and starts the worker thread.
-    pub fn load(mut cfg: LmConfig) -> Result<Self, LoadError> {
+    /// On one discrete GPU with a vision tower, where the context does not fit beside the GPU
+    /// tower (its weights and its largest image's scratch, #1195), once more with the tower on
+    /// the CPU, as before #1195 (a GTX 1660 Ti's 6 GB: Qwen3.5-4B Q4_K_M, its f16 mmproj and a
+    /// 12K q8_0 context fit then, #1214).
+    pub fn load(cfg: LmConfig) -> Result<Self, LoadError> {
+        let retry = vision_cpu_retry(&cfg).then(|| cfg.clone());
+        match Self::load_once(cfg) {
+            Err(LoadError::NoRoom(e)) if retry.is_some() => {
+                tracing::warn!(
+                    error = %e,
+                    "vision: the context does not fit beside the GPU vision tower; loading \
+                     again with the tower on the CPU"
+                );
+                let mut cfg = retry.expect("checked above");
+                cfg.vision_cpu = true;
+                Self::load_once(cfg)
+            }
+            r => r,
+        }
+    }
+
+    fn load_once(mut cfg: LmConfig) -> Result<Self, LoadError> {
         // A dense qwen35 has no meta-device split: `--tp 2` runs it as two ranks (#1163).
         if !cfg.tp_per_gpu && tp_pair::implied(&cfg) {
             tracing::info!("--tp 2 on a dense qwen35 model: one rank per GPU (as --tp-per-gpu)");
@@ -4149,7 +4224,7 @@ impl LmEngine {
         }
         let sampling = crate::engine::sampling_defaults::ModelSampling::from_gguf(&gguf);
         let tokenizer = Arc::new(Tokenizer::from_gguf(&gguf)?);
-        let chat_format = ChatFormat::detect(&tokenizer);
+        let chat_format = ChatFormat::detect(&tokenizer).for_arch(gguf.architecture().as_deref());
         let effort_switch = gguf
             .get_str("tokenizer.chat_template")
             .map_or(think_budget::Switch::None, |src| {
@@ -4221,6 +4296,15 @@ impl LmEngine {
             // The RAM is the experts': the n-gram table stays on the SSD.
             if cfg.ngram.io == crate::residency::lookup_table::TableIo::Auto {
                 cfg.ngram.io = crate::residency::lookup_table::TableIo::Direct;
+            }
+            // The direct table's row cache is the share the tier left it (without `--ngram-ram`,
+            // [`crate::residency::host_tier::bounded_table_cache`]).
+            if cfg.ngram.io == crate::residency::lookup_table::TableIo::Direct
+                && cfg.ngram.ram == crate::residency::lookup_table::RamBudget::Auto
+                && cfg.ngram.ram_cache_bytes.is_none()
+                && let Some(t) = &host_tier
+            {
+                cfg.ngram.ram_cache_bytes = Some(t.plan.table);
             }
             // Prompts lend the VRAM cache and run as staged passes
             // ([`crate::residency::host_tier`]), shorter ones than elsewhere: a chunk of an
@@ -4533,6 +4617,17 @@ impl LmEngine {
             // sm_70's).
             crate::model::core::paged::set_ffma_prefill(true);
         }
+        // #1214: decode steps over a quantized cache page where only the decode kernel reads it.
+        if device.is_some() {
+            model.set_quant_decode(cfg.paged_quant_decode);
+            if cfg.paged_quant_decode {
+                let on = crate::model::core::paged::decode_reads_types(cfg.cache_types, true);
+                tracing::info!(
+                    on,
+                    "--paged-quant-decode: decode steps read the quantized cache in place"
+                );
+            }
+        }
         let mma16 = device.is_some() && crate::model::moe_ffn::mma16();
         let moe_kernel = resolve_moe_kernel(cfg.moe_kernel, mode, integrated, cc_major, mma16);
         if moe_kernel != cfg.moe_kernel {
@@ -4648,7 +4743,7 @@ impl LmEngine {
         let vision_arch = gguf.architecture().unwrap_or_default();
         // The tower runs on the first stage's GPU (#1195), the CPU without one.
         let vision_dev = layout.stages.first().and_then(|(d, _)| *d);
-        let vision_gpu = vision_dev.and_then(cuda_index);
+        let vision_gpu = vision_dev.and_then(cuda_index).filter(|_| !cfg.vision_cpu);
         let vision_early = tower_before_kv(vision_dev.map(|d| d.kind()));
         // Under tensor parallelism only rank 0 loads it (#1195 stage D).
         let vision_follower = tp_start.as_ref().is_some_and(|s| s.rank() > 0);
@@ -4792,6 +4887,11 @@ impl LmEngine {
         }
         // Per stage: what its states take, and how many KV blocks fit next to them.
         let ctx_blocks = cfg.ctx_size.div_ceil(KV_BLOCK);
+        // A sequence at the end of its context also holds the `spec_k` positions a verify step
+        // writes past the last one it keeps: the automatic pool holds that per context, so a
+        // request whose prompt and `max_tokens` fill `--ctx-size` runs with speculation on.
+        // The floors (a context must fit) stay at `--ctx-size`.
+        let seq_blocks = kv_fit::context_blocks(cfg.ctx_size, spec_k);
         let shared = layout
             .stages
             .iter()
@@ -4960,7 +5060,7 @@ impl LmEngine {
         let mut n_blocks = match cfg.kv_cache_tokens {
             Some(t) => kv_explicit(t.div_ceil(KV_BLOCK), fit, shared).map_err(LoadError::Device)?,
             None => {
-                let want = auto_kv_want(max_seqs, ctx_blocks, cache_split, shared);
+                let want = auto_kv_want(max_seqs, seq_blocks, cache_split, shared);
                 fit.map_or(want, |f| want.min(f))
             }
         };
@@ -4991,11 +5091,10 @@ impl LmEngine {
                 (fit, fit_full),
                 (ctx_blocks, n_blocks),
                 (
-                    auto_kv_want(max_seqs, ctx_blocks, cache_split, shared),
+                    auto_kv_want(max_seqs, seq_blocks, cache_split, shared),
                     shared,
                 ),
-            )
-            .map_err(LoadError::Device)?,
+            )?,
         };
         // Per node: the bytes a host block of an automatic tensor-parallel tier takes there
         // (`tp_tier`), for the process's plan.
@@ -5015,8 +5114,7 @@ impl LmEngine {
                 shared,
                 native_ctx,
                 types,
-            )
-            .map_err(LoadError::Device)?;
+            )?;
         }
         // `--tp-per-gpu` (#1131) and `--tp` over a meta device (the head mirrored, #1159): each
         // GPU holds the whole LM head, which a step of 64+ rows on a V100 runs as cuBLAS over
@@ -6401,30 +6499,35 @@ impl LmEngine {
     }
 
     /// The request's prompt tokens (what `generate` runs and reports as `prompt_tokens`), for
-    /// chats whether generation starts inside reasoning, and its images, placed in the tokens
-    /// but not yet encoded ([`vision`]).
+    /// chats how the reply starts ([`ReplyStart`]), and its images, placed in the tokens but
+    /// not yet encoded ([`vision`]).
     #[allow(clippy::type_complexity)]
     fn prompt(
         &self,
         req: &GenerateRequest,
-    ) -> Result<(Vec<u32>, Option<bool>, Vec<vision::Pending>), EngineError> {
+    ) -> Result<(Vec<u32>, ReplyStart, Vec<vision::Pending>), EngineError> {
         if req.model != self.info.id {
             return Err(EngineError::ModelNotFound(req.model.clone()));
         }
         let (text, reasoning) = self.render(req)?;
+        let start = ReplyStart {
+            reasoning,
+            trim_content: matches!(req.prompt, Prompt::Chat { .. })
+                && self.chat_format.trims_content(&text),
+        };
         let tokens = self.tokenizer.encode_with(&text, true, true);
         let images: Vec<&super::ImageInput> = match &req.prompt {
             Prompt::Chat { messages, .. } => messages.iter().flat_map(|m| &m.images).collect(),
             Prompt::Text(_) => Vec::new(),
         };
         if images.is_empty() {
-            return Ok((tokens, reasoning, Vec::new()));
+            return Ok((tokens, start, Vec::new()));
         }
         let vision = self.vision.as_ref().ok_or_else(|| {
             EngineError::InvalidRequest("this model does not take images (no --mmproj)".into())
         })?;
         let (tokens, pending) = vision.expand(tokens, &images)?;
-        Ok((tokens, reasoning, pending))
+        Ok((tokens, start, pending))
     }
 
     /// The prompt text, and for chats whether generation starts inside reasoning.
@@ -6525,7 +6628,7 @@ impl LmEngine {
             req.thinking = Some(false);
         }
         let budget = self.thinking_budget(&req)?;
-        let (prompt, reasoning, images) = self.prompt(&req)?;
+        let (prompt, start, images) = self.prompt(&req)?;
         if prompt.is_empty() {
             return Err(EngineError::InvalidRequest("the prompt is empty".into()));
         }
@@ -6569,7 +6672,7 @@ impl LmEngine {
             stop: req.stop,
             ignore_eos: req.ignore_eos,
             min_tokens: req.min_tokens,
-            reasoning,
+            start,
             budget,
             tools,
             cancel: req.cancel,
@@ -6610,7 +6713,7 @@ impl LmEngine {
                 stop: p.stop,
                 ignore_eos: p.ignore_eos,
                 min_tokens: p.min_tokens,
-                reasoning: p.reasoning,
+                start: p.start,
                 budget: p.budget,
                 tools: p.tools,
                 out,
@@ -6637,11 +6740,20 @@ pub struct Prepared {
     stop: Vec<String>,
     ignore_eos: bool,
     min_tokens: u32,
-    reasoning: Option<bool>,
+    start: ReplyStart,
     budget: Option<u32>,
     tools: Vec<super::Tool>,
     cancel: CancellationToken,
     sched: Scheduling,
+}
+
+/// How a request's reply starts, from its rendered prompt.
+#[derive(Debug, Clone, Copy, Default)]
+struct ReplyStart {
+    /// Split reasoning, and whether the prompt already opened it.
+    reasoning: Option<bool>,
+    /// The content's leading whitespace is trimmed ([`ChatFormat::trims_content`]).
+    trim_content: bool,
 }
 
 impl super::replicas::Replica for LmEngine {
@@ -9808,8 +9920,10 @@ impl<'t> Active<'t> {
         let spec = stream::TextSpec {
             grammar: constraint.is_some(),
             reasoning: job
+                .start
                 .reasoning
                 .map(|inside| chat_format.reasoning_parser(inside)),
+            trim_content: job.start.trim_content,
             tools: (job.grammar.is_none() && (!job.tools.is_empty() || chat_format.framed()))
                 .then(|| chat_format.tool_parser(&job.tools, call_undeclared)),
             stop: StopMatcher::new(job.stop.clone()),
@@ -9828,7 +9942,12 @@ impl<'t> Active<'t> {
             .filter(|_| job.grammar.is_none())
             .zip(chat_format.think_marks())
             .map(|(n, marks)| {
-                think_budget::ThinkBudget::new(marks, tokenizer, n, job.reasoning == Some(true))
+                think_budget::ThinkBudget::new(
+                    marks,
+                    tokenizer,
+                    n,
+                    job.start.reasoning == Some(true),
+                )
             });
         Self {
             sampler: Sampler::new(&job.sampling),

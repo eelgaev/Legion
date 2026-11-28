@@ -369,19 +369,21 @@ pub(super) struct ModelArgs {
     /// the same outputs. At several sequences it also folds different users' routings.
     #[arg(long, value_name = "ROUTINGS", value_parser = non_negative, default_value_t = 0.0)]
     pub expert_heat_pass_cap: f32,
-    /// Hybrid decode (opt-in, CUDA; decode and verify steps of up to 8 tokens): the host
-    /// computes this share of each MoE layer's missed experts (those read from host memory) on
-    /// a pinned worker pool per NUMA node while the GPU computes the rest, cutting the bytes the
-    /// GPU reads over the link. 0 (the default) is off. POWER9: changes outputs slightly (the
-    /// host kernels sum in another order than the GPU's). x86 with AVX2, FMA and F16C: the
-    /// same outputs (the host computes the GPU kernels' bits; the activations' quantization
-    /// and SwiGLU stay on the GPU), and `auto` starts each layer's share from the link's and the
-    /// pool's measured time per expert, then moves it toward whichever of the GPU and the pool
-    /// waited. Ignored elsewhere. With the bounded host tier (part of the experts in RAM) the
-    /// host takes only misses held in RAM; those read from disk stay on the GPU. From
-    /// Strata-AC922's POWER9 CPU expert share (`--pcie-frac`).
-    #[arg(long, value_name = "SHARE|auto", value_parser = share_arg, default_value = "0")]
-    pub cpu_expert_share: ShareArg,
+    /// Hybrid decode (CUDA; decode and verify steps of up to 8 tokens): the host computes this
+    /// share of each MoE layer's missed experts (those read from host memory) on a pinned
+    /// worker pool per NUMA node while the GPU computes the rest, cutting the bytes the GPU
+    /// reads over the link. 0 is off. POWER9: changes outputs slightly (the host kernels sum in
+    /// another order than the GPU's). x86 with AVX2, FMA and F16C: the same outputs (the host
+    /// computes the GPU kernels' bits; the activations' quantization and SwiGLU stay on the
+    /// GPU), and `auto` starts each layer's share from the link's and the pool's measured time
+    /// per expert, then moves it toward whichever of the GPU and the pool waited. Ignored
+    /// elsewhere. With the bounded host tier (part of the experts in RAM) the host takes only
+    /// misses held in RAM; those read from disk stay on the GPU. Default: `auto` on such an x86
+    /// host when the model runs on one CUDA GPU (it only acts when experts live in host
+    /// memory), 0 elsewhere (POWER9, the GB10, several GPUs). From Strata-AC922's POWER9 CPU
+    /// expert share (`--pcie-frac`).
+    #[arg(long, value_name = "SHARE|auto", value_parser = share_arg)]
+    pub cpu_expert_share: Option<ShareArg>,
     /// Worker threads of each NUMA node's `--cpu-expert-share` pool (0: `--cpu-expert-smt`
     /// per core of the node, less two cores left to the engine's threads).
     #[arg(long, default_value_t = 0)]
@@ -549,6 +551,15 @@ pub(super) struct ModelArgs {
     /// ignore it.
     #[arg(long)]
     pub tu_attn_ffma: bool,
+    /// On GPUs before sm_80 (GTX 16xx, RTX 20xx, V100) with a q8_0 / q4_0 cache: decode steps
+    /// read the cache in place through the paged decode kernel instead of gathering every
+    /// sequence's span to F16 and transposing V each step, whose cost grows with the context
+    /// (a GTX 1660 Ti, Qwen3.5-4B, q8_0 cache: decode 60.1 -> 68.9 tok/s at a 2K context,
+    /// 40.4 -> 62.1 at 8K). Prompt steps keep the gather path. Not the default's bits: greedy
+    /// output can differ from it (F32 dot products and an online softmax against F16
+    /// matmuls). F16 caches and sm_80+ GPUs page every step already and ignore it.
+    #[arg(long)]
+    pub paged_quant_decode: bool,
     /// qwen4exp prompt steps: score the sparse-attention indexer's pools with ggml's ops (pool
     /// mask, lightning indexer, bias add) instead of Legion's one-op kernel, which computes the
     /// same bits faster. For comparisons.
@@ -1143,10 +1154,12 @@ impl ModelArgs {
             stage_below: None,
             learn_long: !self.no_prefill_learn,
             cpu_share: legion::residency::cpu_share::CpuShareConfig {
-                share: self.cpu_expert_share.share,
-                auto: self.cpu_expert_share.auto,
+                share: self.cpu_expert_share.map_or(0.0, |s| s.share),
+                auto: self.cpu_expert_share.is_some_and(|s| s.auto),
                 workers: self.cpu_expert_workers,
                 smt: self.cpu_expert_smt as usize,
+                // Picked at load from the run's GPUs (`CpuShareConfig::resolved`).
+                unset: self.cpu_expert_share.is_none(),
             },
             ssd: SsdArgs {
                 mode: self.expert_ssd,
@@ -2187,6 +2200,7 @@ pub async fn run(
                 model_path,
                 mmproj: e.model.mmproj.clone(),
                 no_mmproj: e.model.no_mmproj,
+                vision_cpu: false,
                 model_name: e
                     .model_name
                     .or_else(|| e.model.hfmodel.as_deref().and_then(hfmodel::repo_id)),
@@ -2308,6 +2322,7 @@ pub async fn run(
                 expert_mv: e.model.expert_mv == ExpertMv::Legion,
                 paged_prefill_m884: e.model.paged_prefill_m884,
                 tu_attn_ffma: e.model.tu_attn_ffma,
+                paged_quant_decode: e.model.paged_quant_decode,
                 qsa_scores_ggml: e.model.qsa_scores_ggml,
                 qsa_topk_ggml: e.model.qsa_topk_ggml,
                 hc_post_norm_generic: e.model.hc_post_norm_generic,

@@ -491,6 +491,53 @@ pub fn attention_parts<'a>(
     [first, second]
 }
 
+/// Parameter index of an [`attention_quant`] node's mark (1) on a node of the whole op (part
+/// 0): a part's cut ([`P_CUT`]) otherwise, the op's parameters having no slot to spare.
+const P_QUANT: usize = P_CUT;
+
+/// The attention output `o` (F32 `[d × n_head, n]`) quantized for a Q4_0 prompt matmul of `k =
+/// d × n_head` ([`crate::model::q40_mm::mul_mat_q`] of `n` columns), where `o` is the reshape of
+/// one node of the whole op without image spans, a compact cache or a split scratch: the op's
+/// node again, I8, of [`crate::model::q40_mm::quant_bytes`] bytes of the quantization, then the
+/// F32 output. The prompt kernels that take such a group (`paged_prefill_qm`, and
+/// `paged_prefill_mma` in one launch) write the quantization from their output fragments, the
+/// bytes the matmul's own quantization writes from the F32 output, in place of that output;
+/// after any other launch the op quantizes its F32 output so. `None` for any other `o`.
+pub fn attention_quant<'a>(ctx: &'a Context, o: Tensor<'a>) -> Option<Tensor<'a>> {
+    // SAFETY: a valid node; its sources are null or valid tensors of `ctx`.
+    unsafe {
+        let r = o.raw();
+        let a = (*r).src[0];
+        if (*r).op != ffi::ggml_op_GGML_OP_RESHAPE
+            || a.is_null()
+            || !crate::ggml::op_of(a).is_some_and(|op| std::ptr::eq(op, &PAGED_ATTN))
+        {
+            return None;
+        }
+        let params = crate::ggml::external_params(&*a);
+        // The split scratch, a compact cache's head stride, image spans, a part.
+        if params[5..].iter().any(|&p| p != 0) || o.ty() != types::F32 {
+            return None;
+        }
+        let q = &*(*a).src[0];
+        let (k, n) = (q.ne[0] * q.ne[1], q.ne[2] * q.ne[3]);
+        // The quantization's CTAs take 256 values of a column each.
+        if o.ne() != [k, n, 1, 1] || k % 256 != 0 {
+            return None;
+        }
+        let args: Vec<Tensor<'a>> = (*a)
+            .src
+            .iter()
+            .take_while(|s| !s.is_null())
+            .map(|&s| ctx.wrap(s))
+            .collect();
+        let mut p = params.to_vec();
+        p[P_QUANT] = 1;
+        let bytes = crate::model::q40_mm::quant_bytes(k, n) + (k * n) as usize * 4;
+        Some(ctx.external_with(&PAGED_ATTN, types::I8, [bytes as i64, 1, 1, 1], &args, &p))
+    }
+}
+
 /// The cut of a group of `n_tok` tokens in two launches ([`attention_parts`]) whose kernel
 /// takes `qt` tokens per CTA, asked for at token `n0`: the first multiple of `qt` from `n0` on,
 /// at most `n_tok`: the rule of `launch_part` in `src/cuda/paged_attn/common.cuh`, for tests.
@@ -805,6 +852,9 @@ struct Operands {
     part: usize,
     /// The part's cut ([`attention_parts`]'s `n0`).
     cut: usize,
+    /// An [`attention_quant`] node: its bytes, the output's quantization (`d × n_head` values
+    /// a column, `n_tok × n_seqs` columns) before the F32 output (`dst`).
+    quant: Option<*mut u8>,
 }
 
 impl Operands {
@@ -822,6 +872,11 @@ impl Operands {
             let d = q.ne[0] as usize;
             let compact = params[6] > 0;
             let head_stride = if compact { params[6] as usize } else { d };
+            let quant = (part == 0 && params[P_QUANT] > 0).then_some(dst.data as *mut u8);
+            let quant_len = match quant {
+                Some(_) => crate::model::q40_mm::quant_bytes(q.ne[0] * q.ne[1], q.ne[2] * q.ne[3]),
+                None => 0,
+            };
             Self {
                 d,
                 n_head: q.ne[1] as usize,
@@ -844,7 +899,7 @@ impl Operands {
                 n_past: n_past.data as *const i32,
                 scratch: scratch.data as *mut f32,
                 max_split: scratch.ne[1] as usize,
-                dst: dst.data as *mut f32,
+                dst: (dst.data as *mut u8).add(quant_len) as *mut f32,
                 scale: f32::from_bits(params[0] as u32),
                 window: params[1] as usize,
                 ring: params[2] as usize,
@@ -868,7 +923,12 @@ impl Operands {
                 }),
                 span: (params[7] > 0).then(|| src(params[7] as usize).data as *const i32),
                 part,
-                cut: params[P_CUT].max(0) as usize,
+                cut: if part > 0 {
+                    params[P_CUT].max(0) as usize
+                } else {
+                    0
+                },
+                quant,
             }
         }
     }
@@ -906,7 +966,18 @@ unsafe fn cpu_paged_attn(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
             2 => cut..o.n_tok,
             _ => 0..o.n_tok,
         };
-        for row in (ith..rows).step_by(nth) {
+        // An [`attention_quant`] node: each thread's columns (tokens) whole, then their
+        // quantization below.
+        let cols = o.n_seqs * o.n_tok;
+        let mine: Box<dyn Iterator<Item = usize>> = match o.quant {
+            Some(_) => Box::new(
+                (ith..cols)
+                    .step_by(nth)
+                    .flat_map(|c| c * o.n_head..(c + 1) * o.n_head),
+            ),
+            None => Box::new((ith..rows).step_by(nth)),
+        };
+        for row in mine {
             let h = row % o.n_head;
             let t = row / o.n_head % o.n_tok;
             let s = row / (o.n_head * o.n_tok);
@@ -979,6 +1050,16 @@ unsafe fn cpu_paged_attn(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
             }
             std::slice::from_raw_parts_mut(o.dst.add(row * o.d), o.d).copy_from_slice(&out);
         }
+        if let Some(buf) = o.quant {
+            use crate::model::q40_mm;
+            let k = o.d * o.n_head;
+            let n_pad = q40_mm::n_padded(cols as i64) as usize;
+            for c in (ith..cols).step_by(nth) {
+                let (q, d) = q40_mm::quantize_col(std::slice::from_raw_parts(o.dst.add(c * k), k));
+                q40_mm::put_col(buf, k, n_pad, c, &q, &d);
+            }
+            q40_mm::zero_pad_cols(buf, k, cols, n_pad, ith, nth);
+        }
     }
 }
 
@@ -1041,6 +1122,14 @@ struct LaunchParams {
     /// Tokens of the step before this launch's first (a later part of a group in two
     /// launches, [`attention_parts`]); 0 for every other launch.
     q_off: i32,
+    /// Non-null ([`attention_quant`]): the output's [`crate::model::q40_mm`] quantization, its
+    /// blocks, written in place of `dst` by the launches that count in
+    /// `legion_paged_attn_oq_launches`.
+    oq: *mut i32,
+    /// Its scales.
+    od: *mut f32,
+    /// Its padded columns ([`crate::model::q40_mm::n_padded`]).
+    oq_npad: i32,
 }
 
 /// The kernels' code for a cache type (`LEGION_KV_*` in paged_attn.cu), if they read it.
@@ -1081,6 +1170,7 @@ unsafe extern "C" {
     fn legion_paged_attn_vsplit_launches() -> i64;
     fn legion_paged_attn_set_qm(on: i32, this_thread: i32);
     fn legion_paged_attn_qm_launches() -> i64;
+    fn legion_paged_attn_oq_launches() -> i64;
     #[cfg(test)]
     fn legion_paged_attn_part_launches() -> i64;
     fn legion_paged_attn_part_info(out: *mut i32);
@@ -1250,6 +1340,14 @@ pub fn set_ffma_prefill(on: bool) {
     let _ = on;
 }
 
+/// Launches from the calling thread so far that wrote an [`attention_quant`] node's
+/// quantization (tests).
+#[cfg(all(test, feature = "cuda"))]
+fn oq_launches() -> i64 {
+    // SAFETY: reads a thread-local counter.
+    unsafe { legion_paged_attn_oq_launches() }
+}
+
 /// [`set_ffma_prefill`] for launches from the calling thread only, on any GPU (tests).
 #[cfg(all(test, feature = "cuda"))]
 fn set_ffma_prefill_here(on: bool) {
@@ -1299,6 +1397,35 @@ fn m884_launches() -> i64 {
 
 #[cfg(feature = "cuda")]
 unsafe fn cuda_paged_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
+    // SAFETY: a node made by `attention`, all tensors in device memory of the stream's device.
+    let o = unsafe { Operands::of(dst) };
+    let Some(buf) = o.quant else {
+        // SAFETY: the caller's.
+        return unsafe { cuda_paged_attn_launches(dst, stream) };
+    };
+    // SAFETY: as above.
+    let before = unsafe { legion_paged_attn_oq_launches() };
+    unsafe { cuda_paged_attn_launches(dst, stream) }?;
+    // SAFETY: as above.
+    if unsafe { legion_paged_attn_oq_launches() } != before {
+        return Ok(());
+    }
+    // No launch wrote the quantization (an [`attention_quant`] node another kernel ran): the
+    // matmul's own quantization of the F32 output after it.
+    let (k, n) = ((o.d * o.n_head) as i64, (o.n_tok * o.n_seqs) as i64);
+    // SAFETY: the node's F32 output and its quantization's bytes before it.
+    unsafe { crate::model::q40_mm::cuda::quantize_f32(o.dst, k, k, n, buf, stream) }
+}
+
+/// [`cuda_paged_attn`]'s launches of the attention.
+///
+/// # Safety
+/// As [`cuda_paged_attn`]'s.
+#[cfg(feature = "cuda")]
+unsafe fn cuda_paged_attn_launches(
+    dst: &ffi::ggml_tensor,
+    stream: *mut c_void,
+) -> Result<(), String> {
     // SAFETY: a node made by `attention`, all tensors in device memory of the stream's device.
     let o = unsafe { Operands::of(dst) };
     if !qm_pingpong() {
@@ -1356,7 +1483,19 @@ unsafe fn cuda_paged_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
         prefetch: 0,
         span: o.span.unwrap_or(std::ptr::null()),
         q_off: 0,
+        oq: std::ptr::null_mut(),
+        od: std::ptr::null_mut(),
+        oq_npad: 0,
     };
+    if let Some(buf) = o.quant {
+        // The blocks (32 bytes a block of 32 values), then the scales (4 bytes a block).
+        let (k, n) = ((o.d * o.n_head) as i64, (o.n_tok * o.n_seqs) as i64);
+        let scales = crate::model::q40_mm::quant_bytes(k, n) / 36 * 32;
+        p.oq = buf as *mut i32;
+        // SAFETY: within the node's quantization bytes.
+        p.od = unsafe { buf.add(scales) } as *mut f32;
+        p.oq_npad = crate::model::q40_mm::n_padded(n) as i32;
+    }
     // Image spans (#1217): the plain prefill kernels read them, none of the variants.
     let spans = o.span.is_some() && o.n_tok > 1;
     if spans {
@@ -1542,6 +1681,26 @@ pub fn reads_types(types: super::KvTypes) -> bool {
         || tq::reads(types)
 }
 
+/// Whether decode steps over a cache of `types` page where [`reads_types`] says the device's
+/// paged kernels do not take it for every step: q8_0 / q4_0 K and V (each, or F16 for one),
+/// with the model's `--paged-quant-decode` on (`on`, [`super::Model::set_quant_decode`]), CUDA.
+///
+/// On GPUs before sm_80 (#1214) decode steps (one token per sequence) then read the cache in
+/// place through the paged decode kernel, which dequantizes q8_0 and q4_0 on every GPU (sm_80+
+/// GPUs run it for their decode steps), instead of gathering every sequence's span to F16 and
+/// transposing V each step. Prompt steps keep the gather path, so prefill is unchanged; decode
+/// is not the default's bits (F32 dot products and an online softmax against the gather
+/// path's F16 matmuls).
+pub fn decode_reads_types(types: super::KvTypes, on: bool) -> bool {
+    use super::KvType::*;
+    cfg!(feature = "cuda")
+        && on
+        && !types.is_f16()
+        && matches!(types.k, F16 | Q8_0 | Q4_0)
+        && matches!(types.v, F16 | Q8_0 | Q4_0)
+        && !reads_types(types)
+}
+
 /// The cache types of an MTP head's own pool (its dense attention layer) next to a target cache
 /// of `types`, on a GPU (`gpu`) for a model with sparse attention (`sparse`, whose kernels read
 /// q8_0 / q4_0 on every GPU, #263): F16 where the paged kernels do not read `types` on this
@@ -1590,6 +1749,8 @@ mod grid_tests;
 pub mod hopper;
 #[cfg(all(test, feature = "cuda"))]
 mod m884_tests;
+#[cfg(test)]
+mod oq_tests;
 #[cfg(test)]
 mod parts_tests;
 pub mod qm_bench;

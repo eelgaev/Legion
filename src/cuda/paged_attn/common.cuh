@@ -144,6 +144,15 @@ struct legion_paged_attn {
     // n_past[seq] + q_off + t. Only paged_prefill_mma and paged_prefill_qm read it; 0 for every
     // other launch.
     int32_t q_off;
+    // Non-null (a prompt group whose output feeds a Q4_0 prompt matmul, Gemma 4 QAT's o-proj,
+    // src/model/q40_mm.rs): paged_prefill_qm and paged_prefill_mma's plain (one-launch, no
+    // pieces, no split) writes put the output's q40_mm quantization here instead of dst, column
+    // seq * n_tok + t of d * n_head values (layout 1 of src/cuda/q40_mm.cu: blocks at oq, scales
+    // at od, oq_npad columns), the bytes q40_mm's own quantization writes from dst; such a
+    // launch counts in legion_paged_attn_oq_launches. Every other kernel ignores it.
+    int32_t * oq;
+    float * od;
+    int32_t oq_npad;
 };
 
 enum { LEGION_KV_F16 = 0, LEGION_KV_Q8_0 = 1, LEGION_KV_Q4_0 = 2 };
@@ -184,6 +193,9 @@ void legion_paged_attn_set_qm(int on, int this_thread);
 
 // Launches of the queries-as-M kernel from the calling thread so far.
 int64_t legion_paged_attn_qm_launches(void);
+
+// Launches from the calling thread so far that wrote the quantized output (oq) in place of dst.
+int64_t legion_paged_attn_oq_launches(void);
 
 // Whether prefill launches on the current device take the WMMA kernel, which a split scratch
 // (legion_paged_attn::split) replaces for the last token's rows: sm_70 / sm_75 without the
@@ -251,6 +263,7 @@ extern thread_local int64_t t_vsplit_launches;
 extern int g_qm;
 extern thread_local int t_qm;
 extern thread_local int64_t t_qm_launches;
+extern thread_local int64_t t_oq_launches;
 extern thread_local int64_t t_part_launches;
 extern thread_local int32_t t_part_info[3];
 }  // namespace legion_paged
@@ -266,6 +279,7 @@ using legion_paged::t_m884_launches;
 using legion_paged::t_ffma_launches;
 using legion_paged::t_vsplit_launches;
 using legion_paged::t_qm_launches;
+using legion_paged::t_oq_launches;
 using legion_paged::t_part_launches;
 using legion_paged::t_part_info;
 
@@ -417,6 +431,38 @@ __device__ __forceinline__ void store_ml(const legion_paged_attn & p, int64_t ro
     const int64_t rows = (int64_t) p.n_head * p.n_tok * p.n_seqs;
     p.ml[row] = f.z;
     p.ml[rows + row] = f.w;
+}
+
+// The quantized output (p.oq): q40_quant4's expressions (src/cuda/q40_mm.cu) under the same
+// flags, so the bytes q40_mm's quantization writes from the F32 output. A block's scale inverse
+// from its largest |x|.
+__device__ __forceinline__ float oq_dinv(float amax) {
+    return 127.0f / amax;
+}
+
+// Value x's quant as the byte q40_quant4 stores.
+__device__ __forceinline__ uint32_t oq_byte(float x, float d_inv) {
+    const signed char q = roundf(x * d_inv);
+    return (uint8_t) q;
+}
+
+// Layout 1's place of column col's block kb (q40_quant4's): its tile, and the column in it.
+__device__ __forceinline__ int64_t oq_tile(const legion_paged_attn & p, int64_t col, int kb) {
+    return (int64_t) kb * p.oq_npad + (col & ~(int64_t) 127);
+}
+
+// Word `s` (values 4s .. 4s + 3, the first in the low byte) of column col's block kb.
+__device__ __forceinline__ void oq_word(const legion_paged_attn & p, int64_t col, int kb, int s, uint32_t word) {
+    const int w = s < 4 ? 2 * s : 2 * (s - 4) + 1;
+    const int c = (int) (col & 127), nt = c / 8, g = c % 8;
+    p.oq[oq_tile(p, col, kb) * 8 + ((nt / 2 * 8 + g) * 4 + w / 2) * 4 + nt % 2 * 2 + w % 2] = (int32_t) word;
+}
+
+// The scale of column col's block kb.
+__device__ __forceinline__ void oq_scale(const legion_paged_attn & p, int64_t col, int kb, float d_inv) {
+    const int c = (int) (col & 127), nt = c / 8, g = c % 8;
+    const float d = 1.0f / d_inv;
+    p.od[oq_tile(p, col, kb) + (g / 2) * 32 + 2 * nt + g % 2] = __half2float(__float2half(d));
 }
 
 template <int N>

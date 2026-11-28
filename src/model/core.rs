@@ -399,6 +399,8 @@ pub struct Model {
     /// An MTP head loaded from a GGUF of its own ([`Self::load_mtp`]).
     mtp: Option<Weights>,
     attention: Attention,
+    /// Decode steps page over a quantized cache ([`Self::set_quant_decode`]).
+    quant_decode: bool,
     /// How routed experts run over a batch.
     moe_kernel: MoeKernel,
     /// How the fused expert op keeps per-pair outputs (see [`moe_ffn::PairOut`]).
@@ -1707,6 +1709,7 @@ impl Model {
             weights,
             mtp: None,
             attention: Attention::Auto,
+            quant_decode: false,
             moe_kernel: MoeKernel::Auto,
             moe_pair_out: moe_ffn::PairOut::configured(),
             draft_vocab: 0,
@@ -1761,6 +1764,7 @@ impl Model {
             weights,
             mtp: None,
             attention: Attention::Auto,
+            quant_decode: false,
             moe_kernel: MoeKernel::Auto,
             moe_pair_out: moe_ffn::PairOut::configured(),
             draft_vocab: 0,
@@ -1979,6 +1983,12 @@ impl Model {
         self.attention = a;
     }
 
+    /// `--paged-quant-decode` for this model (#1214, off by default): decode steps over a q8_0
+    /// / q4_0 cache the device's prefill kernels do not read page ([`Self::paged_decode`]).
+    pub fn set_quant_decode(&mut self, on: bool) {
+        self.quant_decode = on;
+    }
+
     /// MTP drafts from now on over the first `n` tokens of the vocabulary only (0: all; see
     /// `--spec-draft-vocab`).
     pub fn set_draft_vocab(&mut self, n: usize) {
@@ -2092,6 +2102,23 @@ impl Model {
                     })
             }
         }
+    }
+
+    /// Whether the step of `groups` over `kv` is a decode step (one token per sequence, not a
+    /// verify step) that pages although [`Self::paged_default`] gathers: a q8_0 / q4_0 cache the
+    /// device's prefill kernels do not read, with this model's `--paged-quant-decode`
+    /// ([`Self::set_quant_decode`]). [`Attention::Auto`] only, on a device pool, where the
+    /// kernels take every attention layer's head shape.
+    pub(crate) fn paged_decode(&self, kv: &KvPool, groups: &[Group<'_>]) -> bool {
+        let decode = !groups.is_empty()
+            && groups
+                .iter()
+                .all(|g| !g.verify && g.seqs.iter().all(|s| s.tokens.len() == 1));
+        decode
+            && self.attention == Attention::Auto
+            && !kv.is_host()
+            && paged::decode_reads_types(kv.types(), self.quant_decode)
+            && self.paged_kernels_fit()
     }
 
     /// How attention reads the KV cache ([`Self::set_attention`]).
@@ -2889,6 +2916,33 @@ impl Model {
         x: Tensor<'a>,
     ) -> Result<Tensor<'a>, ModelError> {
         self.mm(ctx, &format!("blk.{il}.{name}"), x)
+    }
+
+    /// [`Self::lmm`] of the attention output `o` (F32 `[d × n_head, n]`): where the weight runs
+    /// the Q4_0 prompt op ([`crate::model::q40_mm`]) and `o` is one paged attention node's
+    /// output ([`paged::attention_quant`]), the matmul over the quantization the attention
+    /// writes, the same output without the F32 tensor and the matmul's quantization pass over it
+    /// (#1161). With `quant` false (something else reads `o`), and elsewhere: [`Self::lmm`].
+    pub(crate) fn lmm_attn_out<'a>(
+        &'a self,
+        ctx: &'a Context,
+        il: usize,
+        name: &str,
+        o: Tensor<'a>,
+        quant: bool,
+    ) -> Result<Tensor<'a>, ModelError> {
+        let full = format!("blk.{il}.{name}");
+        let w = self.w(&full)?;
+        let scale = linear::scale_name(&full).and_then(|s| self.w(&s).ok());
+        if quant
+            && self
+                .linear
+                .q40_takes(&full, w, scale, (o.ty(), o.ne(), o.nb()))
+            && let Some(xq) = paged::attention_quant(ctx, o)
+        {
+            return Ok(crate::model::q40_mm::mul_mat_q(ctx, w, xq, o.ne()[1]));
+        }
+        self.lmm(ctx, il, name, o)
     }
 
     /// [`Self::lmm`] plus `res` (ggml's `add(.., res)`), the add in the matmul's epilogue where

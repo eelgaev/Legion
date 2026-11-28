@@ -13,6 +13,7 @@ thread_local int64_t t_vsplit_launches = 0;
 int g_qm = 1;
 thread_local int t_qm = -1;
 thread_local int64_t t_qm_launches = 0;
+thread_local int64_t t_oq_launches = 0;
 thread_local int64_t t_part_launches = 0;
 thread_local int32_t t_part_info[3] = { 0, 0, 0 };
 
@@ -150,6 +151,10 @@ int64_t legion_paged_attn_vsplit_launches(void) {
 
 int64_t legion_paged_attn_qm_launches(void) {
     return t_qm_launches;
+}
+
+int64_t legion_paged_attn_oq_launches(void) {
+    return t_oq_launches;
 }
 
 int64_t legion_paged_attn_part_launches(void) {

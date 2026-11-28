@@ -28,10 +28,18 @@ pub(super) struct ChatFormat {
     /// Every reply is framed in markup the tool parser takes out, so it runs without tools
     /// too (Inkling-2, Muse Glimmer).
     framed: bool,
+    /// A Qwen model's `<think>` format ([`ChatFormat::for_arch`]): a reply after a think block
+    /// the template closed has its content's leading whitespace trimmed
+    /// ([`ChatFormat::trims_content`]).
+    qwen_think: bool,
     /// The reasoning markers a thinking budget follows and the close it writes
     /// ([`super::think_budget`]); `None`: requests' budgets do nothing.
     think: Option<Marks>,
 }
+
+/// The architectures (`general.architecture`) whose replies after a closed think block have
+/// their content's leading whitespace trimmed: the Qwen ones.
+const QWEN_ARCHS: [&str; 3] = ["qwen35", "qwen35moe", "qwen4exp"];
 
 #[derive(Clone, Copy)]
 enum PromptReasoning {
@@ -67,6 +75,7 @@ impl ChatFormat {
                 strict_tools: None,
                 shown,
                 framed: true,
+                qwen_think: false,
                 think: Marks::tags(tok, inkling::THINKING, inkling::END, inkling::END),
             };
         }
@@ -85,6 +94,7 @@ impl ChatFormat {
                 strict_tools: None,
                 shown,
                 framed: true,
+                qwen_think: false,
                 think: Marks::messages(tok, muse::START, muse::MESSAGE, "to=self", muse::EOM),
             };
         }
@@ -160,12 +170,32 @@ impl ChatFormat {
             shown: Vec::new(),
             framed: false,
             think,
+            qwen_think: false,
         }
     }
 
     /// The markers a thinking budget follows in this format, if it has them.
     pub(super) fn think_marks(&self) -> Option<&Marks> {
         self.think.as_ref()
+    }
+
+    /// The format for a model of architecture `arch` (`general.architecture`): a Qwen model's
+    /// `<think>` format trims a reply's leading whitespace after a closed think block
+    /// ([`Self::trims_content`]).
+    pub(super) fn for_arch(mut self, arch: Option<&str>) -> Self {
+        self.qwen_think = arch.is_some_and(|a| QWEN_ARCHS.contains(&a))
+            && self.reasoning.0 == "<think>"
+            && matches!(self.prompt_reasoning, PromptReasoning::FromPrompt)
+            && !self.framed;
+        self
+    }
+
+    /// Whether the reply to `prompt` (the rendered chat) has its content's leading whitespace
+    /// trimmed, as llama.cpp's chat parser does: a Qwen model's reply right after a think block
+    /// the template closed (thinking off), which starts with the model's ` word` token.
+    /// Reasoning is never trimmed, nor another model's reply.
+    pub(super) fn trims_content(&self, prompt: &str) -> bool {
+        self.qwen_think && prompt.trim_end().ends_with(self.reasoning.1)
     }
 
     /// Control tokens the detokenizer must print for this format's parsers.

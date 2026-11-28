@@ -110,6 +110,16 @@ curl -s localhost:8090/v1/chat/completions -H 'content-type: application/json' \
 }
 ```
 
+A prompt longer than the context, or a prompt plus `max_tokens` that needs more KV cache than the
+whole cache holds, is HTTP 400 `invalid_request_error` with `"code": "context_length_exceeded"`
+on every OpenAI endpoint, streaming or not (the Anthropic endpoints give the same 400 without
+a code).
+
+With thinking off (and for JSON output), a Qwen model's reply comes right after the think block
+the template closed, and its first token often starts with a space (` red`). The content's
+leading whitespace is trimmed, as llama.cpp's chat parser does, streamed or not. Reasoning, raw
+`/v1/completions` text and other models' replies are as the model writes them.
+
 ---
 
 ## `/v1/completions`

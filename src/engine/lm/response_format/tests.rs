@@ -7,13 +7,80 @@ use std::sync::{Arc, Mutex};
 
 #[test]
 fn json_overrides_thinking_and_template_kwargs() {
+    let engine = engine(None);
+    let mut req = request();
+    assert_eq!(
+        engine.render(&req).unwrap(),
+        ("<think></think>".into(), None)
+    );
+    req.response_format = None;
+    assert_eq!(engine.render(&req).unwrap().0, "<think>");
+}
+
+/// A Qwen model's reply right after the think block its template closed (thinking off, or a
+/// JSON reply) starts with its content's leading whitespace trimmed; with thinking on, a raw
+/// completion or another architecture, the content is as the model writes it.
+#[test]
+fn thinking_off_trims_the_qwen_reply_content() {
+    let qwen = engine(Some("qwen35"));
+    let mut req = request();
+    // JSON: thinking off.
+    assert!(qwen.prompt(&req).unwrap().1.trim_content);
+    req.response_format = None;
+    req.template_kwargs = Default::default();
+    req.thinking = Some(false);
+    let (_, start, _) = qwen.prompt(&req).unwrap();
+    assert!(start.trim_content);
+    assert_eq!(start.reasoning, Some(false));
+    req.thinking = Some(true);
+    let (_, start, _) = qwen.prompt(&req).unwrap();
+    assert!(!start.trim_content);
+    assert_eq!(start.reasoning, Some(true));
+    req.thinking = Some(false);
+    req.prompt = Prompt::Text("<think></think>".into());
+    assert!(!qwen.prompt(&req).unwrap().1.trim_content);
+    req.prompt = request().prompt;
+    for arch in [None, Some("nemotron_h")] {
+        assert!(
+            !engine(arch).prompt(&req).unwrap().1.trim_content,
+            "{arch:?}"
+        );
+    }
+}
+
+/// A JSON-mode chat with thinking asked for both ways.
+fn request() -> GenerateRequest {
+    GenerateRequest {
+        model: String::new(),
+        prompt: Prompt::Chat {
+            system: None,
+            messages: vec![],
+            tools: vec![],
+        },
+        sampling: SamplingParams::default(),
+        max_tokens: 32,
+        stop: vec![],
+        ignore_eos: false,
+        min_tokens: 0,
+        thinking: Some(true),
+        response_format: Some(ResponseFormat::JsonObject),
+        template_kwargs: serde_json::from_value(serde_json::json!({"enable_thinking":true}))
+            .unwrap(),
+        cancel: Default::default(),
+        scheduling: Default::default(),
+    }
+}
+
+/// An engine over the Qwen3.5 vocabulary whose template opens or closes a think block, with
+/// the chat format of architecture `arch`.
+fn engine(arch: Option<&str>) -> LmEngine {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/ggml-vocab-qwen35.gguf");
     let tokenizer = Arc::new(Tokenizer::from_gguf(&GgufFile::open(path).unwrap()).unwrap());
-    let engine = LmEngine {
+    LmEngine {
         vision: None,
         info: ModelInfo::default(),
-        chat_format: super::super::chat_format::ChatFormat::detect(&tokenizer),
+        chat_format: super::super::chat_format::ChatFormat::detect(&tokenizer).for_arch(arch),
         effort_switch: super::super::think_budget::Switch::None,
         undeclared_tool_calls: false,
         tokenizer,
@@ -39,32 +106,7 @@ fn json_overrides_thinking_and_template_kwargs() {
         load_report: Default::default(),
         split_probe: None,
         _tier_plan: None,
-    };
-    let mut req = GenerateRequest {
-        model: String::new(),
-        prompt: Prompt::Chat {
-            system: None,
-            messages: vec![],
-            tools: vec![],
-        },
-        sampling: SamplingParams::default(),
-        max_tokens: 32,
-        stop: vec![],
-        ignore_eos: false,
-        min_tokens: 0,
-        thinking: Some(true),
-        response_format: Some(ResponseFormat::JsonObject),
-        template_kwargs: serde_json::from_value(serde_json::json!({"enable_thinking":true}))
-            .unwrap(),
-        cancel: Default::default(),
-        scheduling: Default::default(),
-    };
-    assert_eq!(
-        engine.render(&req).unwrap(),
-        ("<think></think>".into(), None)
-    );
-    req.response_format = None;
-    assert_eq!(engine.render(&req).unwrap().0, "<think>");
+    }
 }
 
 fn vocab() -> &'static Tokenizer {

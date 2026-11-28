@@ -391,6 +391,41 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, Shape<D>::MINB) paged_prefi
                     out[i * 16 + 8] = p.piece > 0 ? f.x * out[i * 16 + 8] + f.y * x1 : x1;
                 }
             }
+        } else if (!SPLIT && p.oq) {
+            // The output's quantization (p.oq) in place of dst: a 32-value block of the column
+            // (i = 2b, 2b + 1) is over its 8 lanes, 4 values each (dims gq, 8 + gq, 16 + gq,
+            // 24 + gq); a 4 x 4 byte transpose over lanes gq = 4h + j gives lane j word 2j + h.
+            // Every lane shuffles.
+            const float inv = 1.0f / l[c];
+            const int64_t qcol = (int64_t) seq * p.n_tok + t;
+            const int kb0 = (kvh * G + col % G) * (D / 32);
+            const int j = gq & 3;
+#pragma unroll
+            for (int b = 0; b < D / 32; b++) {
+                const float x0 = o[2 * b][c] * inv, x1 = o[2 * b][2 + c] * inv;
+                const float x2 = o[2 * b + 1][c] * inv, x3 = o[2 * b + 1][2 + c] * inv;
+                float amax = fabsf(x0);
+                amax = fmaxf(amax, fabsf(x1));
+                amax = fmaxf(amax, fabsf(x2));
+                amax = fmaxf(amax, fabsf(x3));
+#pragma unroll
+                for (int off = 4; off < 32; off <<= 1) {
+                    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off));
+                }
+                const float d_inv = oq_dinv(amax);
+                const uint32_t w = oq_byte(x0, d_inv) | oq_byte(x1, d_inv) << 8 | oq_byte(x2, d_inv) << 16 |
+                                   oq_byte(x3, d_inv) << 24;
+                const uint32_t w8 = __shfl_xor_sync(0xffffffff, w, 8);
+                const uint32_t h  = __byte_perm(w, w8, j < 2 ? 0x5410 : 0x3276);
+                const uint32_t h4 = __shfl_xor_sync(0xffffffff, h, 4);
+                const uint32_t word = __byte_perm(h, h4, (j & 1) ? 0x3715 : 0x6240);
+                if (valid) {
+                    oq_word(p, qcol, kb0 + b, 2 * j + gq / 4, word);
+                    if (gq == 0) {
+                        oq_scale(p, qcol, kb0 + b, d_inv);
+                    }
+                }
+            }
         } else if (valid) {
             const float inv = 1.0f / l[c];
             float * out = p.dst + row * D + gq;
@@ -419,6 +454,7 @@ int launch(const legion_paged_attn & p, cudaStream_t st) {
     }
     constexpr int QT = Shape<D>::COLS / G;
     paged_prefill_mma<D, G, C><<<dim3((p.n_tok + QT - 1) / QT, p.n_head_kv, p.n_seqs), Shape<D>::NW * 32, Shape<D>::SMEM, st>>>(p);
+    t_oq_launches += p.oq != nullptr && !p.ml;
     return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
 

@@ -60,6 +60,7 @@ fn mem(total: u64, available: u64) -> MemInfo {
 fn table(in_ram: bool) -> Option<Table> {
     Some(Table {
         bytes: 27 * GIB,
+        cache: 4 * GIB,
         in_ram,
         direct: false,
     })

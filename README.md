@@ -64,9 +64,11 @@ figures out the rest.
 | Qwen3.5 / 3.6, Nemotron-H | yes | BF16, FP8, NVFP4 |
 | DeepSeek4.1-Flash | yes | FP8 / MXFP4 (being tuned) |
 | Inkling-2-Mini (text) | unsloth UD-Q4_K_XL, both layouts | Thinking Machines NVFP4 |
+| Muse Glimmer 30B | unsloth UD-Q4_K_XL | — |
 
-**Status:** Qwen3.5 / 3.6 (dense and MoE), Qwen3.8-Flash-Next, Qwen3.8-27B, Gemma 4, GLM5.3-Flash and
-Nemotron-H serve on CUDA, on one or several GPUs, from GGUF or safetensors. DeepSeek4.1-Flash is
+**Status:** Qwen3.5 / 3.6 (dense and MoE), Qwen3.8-Flash-Next, Qwen3.8-27B, Gemma 4, GLM5.3-Flash
+and Nemotron-H serve on CUDA, on one or several GPUs, from GGUF or safetensors; Muse Glimmer serves on CUDA from
+GGUF. DeepSeek4.1-Flash is
 being tuned.
 
 ## Performance
@@ -127,9 +129,9 @@ off. llama.cpp runs across two DGX Sparks with its RPC backend (layer split).
 |---|---|---|---|--:|--:|--:|
 | 128 GB DDR5-4800 | Legion | UD-Q4_K_XL GGUF | MTP ¹⁷ | **66-70** | **3,258** | **5,322** |
 | 128 GB DDR5-4800 | Strata v0.2.13.1 | UD-Q4_K_XL GGUF | its own ¹⁸ | 61-64 | 2,788 | 5,245 |
-| 64 GB DDR5-4800 | Legion | UD-Q4_K_XL GGUF | none ¹⁷ | **48-50** | **2,101** | **2,942** |
+| 64 GB DDR5-4800 | Legion | UD-Q4_K_XL GGUF | none ¹⁷ | **50-53** | **2,460** | **3,430** |
 | 64 GB DDR5-4800 | Strata v0.2.13.1 | UD-Q4_K_XL GGUF | its own ¹⁸ | 38-44 | 1,377 | 2,109 |
-| 32 GB DDR5-4800 | Legion | UD-Q4_K_XL GGUF | none ¹⁷ | **26-27** | **1,312** | **1,271** |
+| 32 GB DDR5-4800 | Legion | UD-Q4_K_XL GGUF | none ¹⁷ | **30-31** | **1,458** | **1,353** |
 | 32 GB DDR5-4800 | Strata v0.2.13.1 | UD-Q4_K_XL GGUF | its own ¹⁸ | 16-21 | 616 | 836 |
 
 ### Qwen3.8-27B
@@ -208,6 +210,15 @@ off. llama.cpp runs across two DGX Sparks with its RPC backend (layer split).
 | Legion | [UD-Q4_K_XL GGUF](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) | MTP k=2 ¹³ | **39-44** | **42.7** | 55.4 | **1,198** | **1,171** | 1,120 |
 | llama.cpp b12062 | UD-Q4_K_XL GGUF | MTP n=2 ¹⁵ | 3-4 | 3.4 | — | 25 | — | — |
 
+### Muse Glimmer 30B
+
+#### DGX Spark
+
+| Engine | Weights | Drafting | Decode, 1 user | 4 users | 16 users | Prefill 8K | 32K | 123K |
+|---|---|---|--:|--:|--:|--:|--:|--:|
+| Legion | [UD-Q4_K_XL GGUF](https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF) | none | 13.0 | 50.8 | 157.4 | 927 | 890 | 776 ²⁰ |
+| Legion | UD-Q4_K_XL GGUF | DFlash ²¹ | 17-24 | 51.9 | 138.4 | 927 | 896 | 780 |
+
 ¹ No drafting: llama.cpp b12062 aborts with the MTP drafter on this model. 123K did not finish in 20 minutes.
 
 ² The checkpoint's own MTP head, with the output-moving opt-ins `--spec-gate-cost-model off`, `--nvfp4-expert-rows-bf16` and `--hc-bf16` (see the run command; decode from a 2026-11-12 run, prefill rerun on 2026-11-26; on 2026-11-12, prefill without the last two: 2,146, 2,205, 2,071).
@@ -241,8 +252,8 @@ off. llama.cpp runs across two DGX Sparks with its RPC backend (layer split).
 ¹⁶ The 123K request (about 86K GLM tokens) does not fit the run command's 64K context (`-c 65536`, shared by 16 sequences).
 
 ¹⁷ One RTX 4090 (24 GB, PCIe 4.0, a desktop session using 1.3-1.6 GB of it), a Ryzen 9 7950X3D and DDR5-4800 RAM. The experts that do not fit
-VRAM stay in RAM, and with the opt-in `--cpu-expert-share auto` the CPU computes part of the RAM misses with the GPU's
-bits (same output). 4 sequences (`--max-seqs 4`). 128 GB with MTP drafting (`--spec mtp --spec-k 1`, the head's
+VRAM stay in RAM, and the CPU computes part of the RAM misses with the GPU's bits (same output; `--cpu-expert-share auto`,
+the default on x86 with one GPU). 4 sequences (`--max-seqs 4`). 128 GB with MTP drafting (`--spec mtp --spec-k 1`, the head's
 own GGUF; same greedy chats as without it). 64 and 32 GB: the same PC under a memory limit with no swap, no
 drafting. Decode is three single-user chats
 right after the load, not the fixed benchmark prompts; prefill is one request each, tok/s to the first token. 4 and
@@ -254,7 +265,13 @@ right after the load, not the fixed benchmark prompts; prefill is one request ea
 ¹⁹ Tensor parallel over one QSFP link, with output-moving opt-in flags (see the run command). 123K was not measured
 for either engine: the prompt takes both Sparks above 80 C within a minute.
 
-Measured 2026-10-20 to 2026-11-21. Each new speed record is added here.
+²⁰ The 123K prompt is 126,094 Muse tokens (8K: 8,466, 32K: 33,672). One round of the deterministic client; no
+llama.cpp row yet.
+
+²¹ The repo's own DFlash drafter, `dflash-kquant.gguf` (see the run command). Greedy text can differ from the row
+without drafting at near ties (the verify steps run the batched matmuls). 16 users are faster without it.
+
+Measured 2026-10-20 to 2026-11-28. Each new speed record is added here.
 
 ## Roadmap
 
@@ -294,6 +311,7 @@ The exact `legion serve` command behind every row of the tables, and how it was 
 - [Gemma 4 31B NVFP4 (RedHatAI), 1x Spark](docs/run/spark/gemma-4-31b-nvfp4-1x.md)
 - [Gemma 4 31B NVFP4 (RedHatAI), 2x Spark (tensor parallel)](docs/run/spark/gemma-4-31b-nvfp4-2x-tp.md)
 - [Inkling-2-Mini UD-Q4_K_XL and NVFP4, 1x Spark](docs/run/spark/inkling-2-mini-1x.md)
+- [Muse Glimmer 30B UD-Q4_K_XL, 1x Spark](docs/run/spark/muse-glimmer-1x.md)
 
 **IBM AC922**
 

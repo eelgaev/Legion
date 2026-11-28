@@ -94,6 +94,47 @@ fn qwen_and_nemotron_keep_think_and_coder_parsers() {
 }
 
 #[test]
+fn qwen_trims_content_only_after_a_closed_think_block() {
+    let tok = tokenizer(
+        &["<think>", "</think>", "<tool_call>", "</tool_call>"],
+        "qwen35",
+    );
+    let off = "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+    let on = "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n";
+    // An earlier turn's closed thinking does not start this reply.
+    let earlier = "<|im_start|>assistant\n<think>a</think>\n\nb<|im_end|>\n<|im_start|>assistant\n";
+    for arch in ["qwen35", "qwen35moe", "qwen4exp"] {
+        let format = ChatFormat::detect(&tok).for_arch(Some(arch));
+        assert!(format.trims_content(off), "{arch}");
+        assert!(!format.trims_content(on), "{arch}");
+        assert!(!format.trims_content(earlier), "{arch}");
+        assert!(!format.trims_content(""), "{arch}");
+    }
+    // The same vocabulary under another architecture (or none) keeps the model's text.
+    for arch in [
+        Some("nemotron_h"),
+        Some("deepseek41"),
+        Some("glm5-next"),
+        None,
+    ] {
+        let format = ChatFormat::detect(&tok).for_arch(arch);
+        assert!(!format.trims_content(off), "{arch:?}");
+    }
+    assert!(!ChatFormat::detect(&tok).trims_content(off));
+    // A Qwen architecture over another format's vocabulary (no `<think>`, Gemma 4 channels).
+    let plain = tokenizer(&["<tool_call>", "</tool_call>"], "qwen35");
+    let format = ChatFormat::detect(&plain).for_arch(Some("qwen35"));
+    assert!(!format.trims_content(off));
+    let gemma = tokenizer(
+        &["<|channel>", "<channel|>", "<|tool_call>", "<think>"],
+        "qwen2",
+    );
+    let format = ChatFormat::detect(&gemma).for_arch(Some("qwen35"));
+    assert!(!format.trims_content("<|channel>thought<channel|>"));
+    assert!(!format.trims_content(off));
+}
+
+#[test]
 fn glm_vocabularies_take_the_arg_key_parser_and_no_strict_tools() {
     let tok = tokenizer(
         &[
