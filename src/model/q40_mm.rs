@@ -27,7 +27,11 @@
 //! (fewer columns) stay on ggml's MMVQ / MMQ. Consecutive op nodes on the same input quantize it
 //! once ([`quant_run`]). A GeGLU FFN's gate and up matmuls run as one kernel whose epilogue
 //! writes the GeGLU's quantization for the down matmul ([`mul_mat_geglu_q`]), the bytes of the
-//! two matmuls' F32 outputs through [`quantize_geglu`]. The CPU implementation is a reference for the tests: the same sums
+//! two matmuls' F32 outputs through [`quantize_geglu`]. With `legion serve --q40-repack` the
+//! load makes a copy of each weight the op takes ([`repack_weights`]) in which a tile's 32-row
+//! units are one contiguous 2304-byte chunk a K step (the same quants and scales, moved), and
+//! the op and the pair read those: one 16-byte copy per 16 bytes, no strided rows, the same
+//! bits. Every other reader keeps the weight as loaded. The CPU implementation is a reference for the tests: the same sums
 //! (scalar `mul_add`), not necessarily the GPU's bits (the GPU's division and reciprocal of the
 //! quantization are fast-math ones).
 
@@ -130,6 +134,55 @@ static VARIANT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize:
 /// (`legion serve --q40-mm-ggml`) keeps ggml's MMQ for all.
 pub fn set_q40_mm(on: bool) {
     ON.store(on, Ordering::Relaxed);
+}
+
+/// Whether the load makes repacked copies of the op's weights ([`repack_weights`]).
+static REPACK: AtomicBool = AtomicBool::new(false);
+
+/// Whether the load makes repacked copies of the weights the op reads ([`repack_weights`];
+/// `false`, the default; `true`: `legion serve --q40-repack`).
+pub fn set_q40_repack(on: bool) {
+    REPACK.store(on, Ordering::Relaxed);
+}
+
+/// Whether [`repack_weights`] copies `w`: on (with the op), a weight the op takes for prompt
+/// steps on its GPU ([`takes`] but for ggml's tiling, which depends on the step).
+pub fn repackable(w: Tensor<'_>) -> bool {
+    if !(REPACK.load(Ordering::Relaxed) && ON.load(Ordering::Relaxed) && cfg!(feature = "cuda")) {
+        return false;
+    }
+    // SAFETY: a valid tensor's data pointer (null before allocation).
+    let data = unsafe { (*w.raw()).data } as usize;
+    sms_for(w) > 0
+        && !w.is_host()
+        && !w.is_meta()
+        && data != 0
+        && data.is_multiple_of(16)
+        && fits((w.ty(), w.ne(), w.nb()), f32_shape([w.ne()[0], MIN_TOKENS]))
+}
+
+/// Makes a repacked copy of each weight of `weights` [`repackable`] takes, on its GPU, the
+/// copies done when it returns: the op reads them from then on (the same values in another
+/// order, so the same output; every other reader keeps the weight). The copies and their bytes.
+pub fn repack_weights<'a>(
+    weights: impl IntoIterator<Item = Tensor<'a>>,
+) -> Result<(usize, usize), String> {
+    #[allow(unused_mut)]
+    let (mut count, mut bytes) = (0, 0);
+    for w in weights.into_iter().filter(|&w| repackable(w)) {
+        #[cfg(feature = "cuda")]
+        {
+            // SAFETY: an allocated Q4_0 weight in its GPU's memory, loaded.
+            let b = unsafe { cuda::repack_on(w.cuda_device(), &*w.raw()) }?;
+            if b > 0 {
+                count += 1;
+                bytes += b;
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = w;
+    }
+    Ok((count, bytes))
 }
 
 /// The SMs of `w`'s GPU where the op runs there (compute capability 12.x), else 0 (the
@@ -708,6 +761,162 @@ mod cuda {
         /// The timing test's name for it.
         #[cfg_attr(not(test), allow(dead_code))]
         name: *const std::os::raw::c_char,
+        /// Nonzero: it reads the weights repacked ([`repack`]).
+        repacked: c_int,
+    }
+
+    /// `legion_q40_repack` of `src/cuda/q40_mm.cu`.
+    #[repr(C)]
+    struct RepackParams {
+        w: *const c_void,
+        out: *mut c_void,
+        w_nb1: i64,
+        k: i32,
+        rows: i32,
+    }
+
+    /// A weight's repacked copy ([`repack`]): its device pointer and device, and the weight's
+    /// shape and row stride it was made from.
+    #[derive(Clone, Copy)]
+    struct Repacked {
+        ptr: usize,
+        dev: c_int,
+        shape: (i64, i64, usize),
+    }
+
+    /// The repacked copies by the weight's data pointer. A copy lives as long as the process
+    /// (the weights do) unless [`forget`] drops it (the tests').
+    static REPACKED: Mutex<Option<HashMap<usize, Repacked>>> = Mutex::new(None);
+
+    /// `t`'s shape as the copies key it: `k`, rows and the row stride.
+    fn shape_of(t: &ffi::ggml_tensor) -> (i64, i64, usize) {
+        (t.ne[0], t.ne[1], t.nb[1])
+    }
+
+    /// The repacked copy of the weight `t` on `dev`, if [`repack`] made one of its shape.
+    fn repacked_of(t: &ffi::ggml_tensor, dev: c_int) -> Option<*const c_void> {
+        let map = REPACKED.lock().unwrap();
+        let r = map.as_ref()?.get(&(t.data as usize))?;
+        (r.dev == dev && r.shape == shape_of(t)).then_some(r.ptr as *const c_void)
+    }
+
+    /// Bytes of the repacked copy of a Q4_0 weight of `k` x `rows`.
+    pub(super) fn repacked_bytes(k: i64, rows: i64) -> usize {
+        (k / QK) as usize * rows as usize * BLOCK_BYTES
+    }
+
+    /// Makes the repacked copy of the Q4_0 weight `t` (in the current device's memory, a shape
+    /// [`fits`] takes) on the current device: a new allocation the kernel fills from the
+    /// weight's bytes, waited for. Its bytes, or 0 where `t` has one already.
+    ///
+    /// # Safety
+    /// `t` is an allocated Q4_0 tensor in the current device's memory, its bytes final.
+    pub(super) unsafe fn repack(t: &ffi::ggml_tensor) -> Result<usize, String> {
+        let mut dev: c_int = 0;
+        // SAFETY: plain runtime calls; the kernel reads `t`'s rows (the caller's) and writes
+        // the new allocation of its size.
+        unsafe {
+            if cudaGetDevice(&mut dev) != 0 {
+                cudaGetLastError();
+                return Err("q40_mm repack: no current device".into());
+            }
+            if repacked_of(t, dev).is_some() {
+                return Ok(0);
+            }
+            let (k, rows, nb1) = shape_of(t);
+            let bytes = repacked_bytes(k, rows);
+            let mut out = std::ptr::null_mut();
+            if cudaMalloc(&mut out, bytes) != 0 {
+                cudaGetLastError();
+                return Err(format!("q40_mm repack: cudaMalloc of {bytes} bytes"));
+            }
+            let mut a = RepackParams {
+                w: t.data as *const c_void,
+                out,
+                w_nb1: nb1 as i64,
+                k: k as i32,
+                rows: rows as i32,
+            };
+            let words = bytes / 4;
+            let grid = Dim3 {
+                x: words.div_ceil(256).min(1 << 16) as u32,
+                y: 1,
+                z: 1,
+            };
+            let block = Dim3 { x: 256, y: 1, z: 1 };
+            let done = launch(
+                legion_q40_repack_kernel,
+                grid,
+                block,
+                0,
+                &mut a,
+                std::ptr::null_mut(),
+            )
+            .and_then(|()| match cudaDeviceSynchronize() {
+                0 => Ok(()),
+                e => Err(format!("q40_mm repack: CUDA error {e}")),
+            });
+            if let Err(e) = done {
+                cudaGetLastError();
+                cudaFree(out);
+                return Err(e);
+            }
+            let r = Repacked {
+                ptr: out as usize,
+                dev,
+                shape: (k, rows, nb1),
+            };
+            let mut map = REPACKED.lock().unwrap();
+            map.get_or_insert_with(HashMap::new)
+                .insert(t.data as usize, r);
+            Ok(bytes)
+        }
+    }
+
+    /// [`repack`] on the GPU `dev` (the current one where `None`), the current device kept.
+    ///
+    /// # Safety
+    /// As [`repack`], `t` in `dev`'s memory.
+    pub(super) unsafe fn repack_on(
+        dev: Option<usize>,
+        t: &ffi::ggml_tensor,
+    ) -> Result<usize, String> {
+        // SAFETY: plain runtime calls; the caller's for `repack`.
+        unsafe {
+            let mut was: c_int = 0;
+            if cudaGetDevice(&mut was) != 0 {
+                cudaGetLastError();
+                return Err("q40_mm repack: no current device".into());
+            }
+            let to = dev.map_or(was, |d| d as c_int);
+            if to != was && cudaSetDevice(to) != 0 {
+                cudaGetLastError();
+                return Err(format!("q40_mm repack: device {to}"));
+            }
+            let r = repack(t);
+            if to != was {
+                cudaSetDevice(was);
+            }
+            r
+        }
+    }
+
+    /// Drops `t`'s repacked copy (the tests': the next tensor at its address is another).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn forget(t: &ffi::ggml_tensor) {
+        let r = REPACKED
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|m| m.remove(&(t.data as usize)));
+        if let Some(r) = r {
+            // SAFETY: a copy `repack` allocated, no kernel left reading it (the caller's: the
+            // tests run their graphs to the end first).
+            unsafe {
+                cudaDeviceSynchronize();
+                cudaFree(r.ptr as *mut c_void);
+            }
+        }
     }
 
     /// Most matmuls the shared-memory cache covers.
@@ -721,6 +930,13 @@ mod cuda {
         static legion_q40_quant_kernels: [*const c_void; 3];
         /// The GeGLU pair's matmul (the op's tiles, writing the quantized GeGLU).
         static legion_q40_geglu_gemm: *const c_void;
+        /// The same on repacked weights.
+        static legion_q40_geglu_gemm_rp: *const c_void;
+        /// The repack ([`repack`]).
+        static legion_q40_repack_kernel: *const c_void;
+        fn cudaFree(p: *mut c_void) -> c_int;
+        fn cudaSetDevice(dev: c_int) -> c_int;
+        fn cudaDeviceSynchronize() -> c_int;
         fn cudaLaunchKernel(
             func: *const c_void,
             grid: Dim3,
@@ -749,6 +965,9 @@ mod cuda {
     /// The same for the GeGLU pair's matmul.
     static SMEM_GEGLU: [AtomicI8; DEVICES] = [const { AtomicI8::new(0) }; DEVICES];
 
+    /// The same for the pair on repacked weights.
+    static SMEM_GEGLU_RP: [AtomicI8; DEVICES] = [const { AtomicI8::new(0) }; DEVICES];
+
     /// Matmuls in the table.
     pub(super) fn kernels() -> usize {
         // SAFETY: a constant of src/cuda/q40_mm.cu.
@@ -774,6 +993,19 @@ mod cuda {
     /// The matmul the op runs: the table's first, or the tests' pick.
     fn variant() -> usize {
         VARIANT.load(Ordering::Relaxed)
+    }
+
+    /// Whether the table's matmul `i` reads repacked weights.
+    #[cfg(test)]
+    pub(super) fn kernel_repacked(i: usize) -> bool {
+        kernel(i).repacked != 0
+    }
+
+    /// The table's first matmul on repacked weights (the op's where the weight has a copy).
+    fn repacked_variant() -> usize {
+        (0..kernels())
+            .find(|&i| kernel(i).repacked != 0)
+            .expect("q40_mm: a repacked matmul in the table")
     }
 
     /// One stream's quantized input buffer and its size.
@@ -913,8 +1145,18 @@ mod cuda {
             // A `mul_mat_q` node: its input holds the blocks (layout 1) already.
             let pre = x.type_ == types::I8;
             let quant = !pre && quant_in(crate::ggml::current_cuda_graph(), dst);
-            let v = variant();
+            // The op's matmul on the weight's repacked copy where it has one.
+            let rp = repacked_of(w, dev);
+            let v = match variant() {
+                0 if rp.is_some() => repacked_variant(),
+                v => v,
+            };
             let kern = kernel(v);
+            let wp = if kern.repacked != 0 {
+                rp.ok_or_else(|| format!("q40_mm: matmul {v} reads repacked weights"))?
+            } else {
+                w.data as *const c_void
+            };
             if pre && kern.quant != kernel(0).quant {
                 return Err(format!("q40_mm: matmul {v} reads another layout"));
             }
@@ -934,7 +1176,7 @@ mod cuda {
                 scratch(dev, stream, (k / QK) as usize * n_pad as usize * 36)?.ptr
             };
             let mut a = Params {
-                w: w.data as *const c_void,
+                w: wp,
                 x: x.data as *const f32,
                 yq: base as *mut i32,
                 yd: (base + yd_off) as *mut f32,
@@ -1088,8 +1330,11 @@ mod cuda {
             let (ntx, nty) = ((n + TILE - 1) / TILE, rows / hr);
             let n_pad = ntx * TILE;
             let (xb, ob) = (xq.data as usize, dst.data as usize);
+            // On the weights' repacked copies where both have one.
+            let rp = repacked_of(gate, dev).zip(repacked_of(up, dev));
+            let (wg, wu) = rp.unwrap_or((gate.data as *const c_void, up.data as *const c_void));
             let mut a = Params {
-                w: gate.data as *const c_void,
+                w: wg,
                 x: std::ptr::null(),
                 yq: xb as *mut i32,
                 yd: (xb + (k / QK) as usize * n_pad as usize * 32) as *mut f32,
@@ -1103,12 +1348,16 @@ mod cuda {
                 rows: rows as i32,
                 ntx: ntx as i32,
                 nty: nty as i32,
-                w2: up.data as *const c_void,
+                w2: wu,
                 oq: ob as *mut i32,
                 od: (ob + (rows / QK) as usize * n_pad as usize * 32) as *mut f32,
             };
-            let gemm = legion_q40_geglu_gemm;
-            opt_in_func(&SMEM_GEGLU[dev as usize], gemm, SMEM_BYTES as c_int)?;
+            let (gemm, slot) = if rp.is_some() {
+                (legion_q40_geglu_gemm_rp, &SMEM_GEGLU_RP[dev as usize])
+            } else {
+                (legion_q40_geglu_gemm, &SMEM_GEGLU[dev as usize])
+            };
+            opt_in_func(slot, gemm, SMEM_BYTES as c_int)?;
             let grid = Dim3 {
                 x: (ntx * nty) as u32,
                 y: 1,

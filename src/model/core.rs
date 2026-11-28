@@ -2396,6 +2396,17 @@ impl Model {
         self.router_copies();
     }
 
+    /// Makes the repacked copies of the Q4_0 weights the prompt op reads
+    /// ([`crate::model::q40_mm::repack_weights`], `--q40-repack`), MTP head's included: the
+    /// loader calls it before the caches are sized to the memory left. The copies and bytes.
+    pub fn prepare_q40_repack(&self) -> Result<(usize, usize), String> {
+        crate::model::q40_mm::repack_weights(
+            self.weights
+                .tensors()
+                .chain(self.mtp.iter().flat_map(|m| m.tensors())),
+        )
+    }
+
     /// The routers' BF16 copies ([`Self::router_bf16`]), made on first use.
     fn router_copies(&self) -> Option<&router_bf16::RouterBf16> {
         if !router_bf16::on() || !router_mv::device_supported() {

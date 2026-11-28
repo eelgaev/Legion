@@ -4615,6 +4615,17 @@ impl LmEngine {
         }
         // The MoE routers' BF16 copies (#836) before the caches take the memory left.
         model.prepare_router_bf16();
+        // `--q40-repack`: the Q4_0 prompt op's copies, also before the caches.
+        let t0 = std::time::Instant::now();
+        let (copies, bytes) = model.prepare_q40_repack().map_err(LoadError::Device)?;
+        if copies > 0 {
+            tracing::info!(
+                copies,
+                gib = bytes as f64 / (1u64 << 30) as f64,
+                seconds = t0.elapsed().as_secs_f64(),
+                "--q40-repack: the Q4_0 prompt matmuls' weights repacked (a second copy)"
+            );
+        }
         // What the load read out of the way of the KV cache and the step buffers.
         if drop_cache {
             gguf.release_page_cache();
