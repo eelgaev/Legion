@@ -113,6 +113,28 @@ __device__ __forceinline__ int split_blocks(int max_split, int split, int * b0, 
     return ns;
 }
 
+// The fixed split (legion_paged_attn::split_fixed = f, #1133): the runs of f key blocks from
+// block 0 that a tile's blocks [*b0, *b1] touch (the count returned), and split `split`'s part of
+// them, which replaces [*b0, *b1]; its run (scratch slot) is *b0 / f + split, taken before.
+__device__ __forceinline__ int fixed_split(int f, int split, int * b0, int * b1) {
+    const int r0 = *b0 / f, r1 = *b1 / f, r = r0 + split;
+    *b0 = max(*b0, r * f);
+    *b1 = min(*b1, r * f + f - 1);
+    return r1 - r0 + 1;
+}
+
+// Where a column's result goes under the fixed split: its visible keys first .. last (key
+// indices) lie in runs rc0 .. rc1; the CTA computes run `run`. 0: nowhere (the run is not one of
+// the column's, or the column's single run is another CTA's), 1: dst, as without a split (the
+// column's keys all in this run), 2: scratch slot `run`, for paged_fixed_combine.
+__device__ __forceinline__ int fixed_target(int f, int run, int first, int last) {
+    const int rc0 = first / BLK / f, rc1 = last / BLK / f;
+    if (rc0 == rc1) {
+        return run == rc0 ? 1 : 0;
+    }
+    return run >= rc0 && run <= rc1 ? 2 : 0;
+}
+
 template <int D, int G, bool C = false, bool SPLIT = false>
 __global__ void __launch_bounds__(Shape<D>::NW * 32, Shape<D>::MINB) paged_prefill_mma(const legion_paged_attn p) {
 #ifdef LEGION_PAGED_MMA
@@ -146,7 +168,8 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, Shape<D>::MINB) paged_prefi
     // SPLIT: this CTA's run of the tile's blocks (split_blocks).
     int ns = 1, w_b0 = b_first, w_b1 = b_last;
     if constexpr (SPLIT) {
-        ns = split_blocks(p.max_split, split, &w_b0, &w_b1);
+        ns = p.split_fixed > 0 ? fixed_split(p.split_fixed, split, &w_b0, &w_b1)
+                               : split_blocks(p.max_split, split, &w_b0, &w_b1);
         if (split >= ns) {
             return;
         }
@@ -358,10 +381,19 @@ __global__ void __launch_bounds__(Shape<D>::NW * 32, Shape<D>::MINB) paged_prefi
         const int t = t0 + col / G;
         const bool valid = col < QT * G && t < p.n_tok;
         const int64_t row = ((int64_t) seq * p.n_tok + t) * p.n_head + kvh * G + col % G;
-        if (SPLIT && ns > 1) {
+        // 0: not written, 1: dst, 2: this split's partial in scratch slot `slot`.
+        int target = SPLIT && ns > 1 ? 2 : 1, slot = split;
+        if constexpr (SPLIT) {
+            if (p.split_fixed > 0) {
+                slot   = b_first / p.split_fixed + split;
+                target = fixed_target(p.split_fixed, slot, c_first[c], c_pos[c]);
+            }
+        }
+        if (target == 0) {
+        } else if (target == 2) {
             // This split's (max, sum, unnormalized output) of the column, for the combine.
             if (valid) {
-                float * part = p.scratch + (row * p.max_split + split) * (D + 2);
+                float * part = p.scratch + (row * p.max_split + slot) * (D + 2);
                 if (gq == 0) {
                     part[0] = m[c];
                     part[1] = l[c];
@@ -451,6 +483,45 @@ __global__ void __launch_bounds__(D) paged_split_combine(const legion_paged_attn
     p.dst[row * D + threadIdx.x] = o / l;
 }
 
+// Merges the fixed split's partials (legion_paged_attn::split_fixed, #1133) of row (token, head)
+// blockIdx (y, x), one thread per output dim: the runs of the row's own visible keys, slots
+// first / f .. last / f in that order, with the same arithmetic as paged_split_combine. A row
+// with one run was written by the attention kernel. The rows' runs depend on their positions
+// only, so the bits do not depend on the kernel, the query tiles or the other sequences.
+template <int D>
+__global__ void __launch_bounds__(D) paged_fixed_combine(const legion_paged_attn p) {
+    const int h = blockIdx.x, rt = blockIdx.y;  // rt = seq * n_tok + t
+    const int seq = rt / p.n_tok, t = rt % p.n_tok;
+    const int pos = p.n_past[seq] + t, f = p.split_fixed;
+    const int r0 = first_key(pos, p.window) / BLK / f, r1 = pos / BLK / f;
+    if (r0 == r1) {
+        return;
+    }
+    const int64_t row = (int64_t) rt * p.n_head + h;
+    const float * part = p.scratch + row * p.max_split * (D + 2);
+    float mx = -INFINITY;
+    for (int s = r0; s <= r1; s++) {
+        mx = fmaxf(mx, part[s * (D + 2)]);
+    }
+    float l = 0.0f, o = 0.0f;
+    for (int s = r0; s <= r1; s++) {
+        const float w = exp2f(part[s * (D + 2)] - mx);
+        l += w * part[s * (D + 2) + 1];
+        o += w * part[s * (D + 2) + 2 + threadIdx.x];
+    }
+    p.dst[row * D + threadIdx.x] = o / l;
+}
+
+// The combine after a split launch: by the fixed rule or by max_split even runs.
+template <int D, int G>
+void launch_combine(const legion_paged_attn & p, cudaStream_t st) {
+    if (p.split_fixed > 0) {
+        paged_fixed_combine<D><<<dim3(p.n_head, p.n_tok * p.n_seqs), D, 0, st>>>(p);
+    } else {
+        paged_split_combine<D, G><<<dim3(p.n_head, p.n_tok * p.n_seqs), D, 0, st>>>(p);
+    }
+}
+
 // A small multi-token group split over the key blocks (SPLIT above): p.max_split > 1 splits per
 // tile at most, p.scratch [D + 2, max_split, n_head, n_tok * n_seqs]. Not for pieces of a tiered
 // pool (p.piece_blk, p.ml).
@@ -463,7 +534,7 @@ int launch_split(const legion_paged_attn & p, cudaStream_t st) {
     constexpr int QT = Shape<D>::COLS / G;
     paged_prefill_mma<D, G, C, true><<<dim3((p.n_tok + QT - 1) / QT, p.n_head_kv, p.n_seqs * p.max_split), Shape<D>::NW * 32,
                                        Shape<D>::SMEM, st>>>(p);
-    paged_split_combine<D, G><<<dim3(p.n_head, p.n_tok * p.n_seqs), D, 0, st>>>(p);
+    launch_combine<D, G>(p, st);
     return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
 

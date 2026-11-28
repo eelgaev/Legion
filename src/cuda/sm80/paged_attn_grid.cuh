@@ -470,7 +470,10 @@ __device__ __forceinline__ void grid_quad_sync(int id) {
 
 // PF: the first line of every K and V block of the CTA's keys prefetched into L2 at the start
 // (#689 r19, below).
-template <int D, int G, int NG, int CH_, int NS_, bool PF = true>
+// SPLIT: the fixed split over the key blocks (legion_paged_attn::split_fixed, #1133): the grid's z
+// counts (sequence, split), a CTA walks one run of its keys (fixed_split) and each column goes to
+// dst or to its run's scratch slot (fixed_target), as in paged_prefill_mma<.., SPLIT>.
+template <int D, int G, int NG, int CH_, int NS_, bool PF = true, bool SPLIT = false>
 __global__ void __launch_bounds__(NG * 128, 1) paged_prefill_quad(const legion_paged_attn p) {
 #ifdef LEGION_PAGED_MMA
     using SH = QShape<D, NG, CH_, NS_>;
@@ -492,7 +495,9 @@ __global__ void __launch_bounds__(NG * 128, 1) paged_prefill_quad(const legion_p
 
     // The last columns see the most keys: they go first.
     const int cols = p.n_tok * G;
-    const int c0 = (gridDim.x - 1 - blockIdx.x) * COLS, kvh = blockIdx.y, seq = blockIdx.z;
+    const int c0 = (gridDim.x - 1 - blockIdx.x) * COLS, kvh = blockIdx.y;
+    const int seq = SPLIT ? blockIdx.z / p.max_split : blockIdx.z;
+    const int split = SPLIT ? blockIdx.z % p.max_split : 0;
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int grp = warp / 4, h = warp % 4;   // column group, key block / quarter of the group
     const int gq = lane / 4, tq = lane % 4;   // fragment row group, thread in quad
@@ -504,7 +509,15 @@ __global__ void __launch_bounds__(NG * 128, 1) paged_prefill_quad(const legion_p
     const int k_end   = pos_of(c0 + COLS - 1) + 1;  // keys at or past k_end are never visible
     const int b_first = first_key(pos_of(c0), p.window) / BLK;
     const int b_last  = (k_end - 1) / BLK;
-    const Walk wk = walk(p, seq, b_first, b_last);
+    // SPLIT: this CTA's run of the keys (fixed_split) and its scratch slot.
+    int w_b0 = b_first, w_b1 = b_last, slot = 0;
+    if constexpr (SPLIT) {
+        slot = b_first / p.split_fixed + split;
+        if (split >= fa::fixed_split(p.split_fixed, split, &w_b0, &w_b1)) {
+            return;
+        }
+    }
+    const Walk wk = walk(p, seq, w_b0, w_b1);
     if (piece_idle(p, wk)) {
         return;
     }
@@ -773,7 +786,26 @@ __global__ void __launch_bounds__(NG * 128, 1) paged_prefill_quad(const legion_p
         const bool valid = col < cols;
         const int64_t row = ((int64_t) seq * p.n_tok + col / G) * p.n_head + kvh * G + col % G;
         float * out = p.dst + row * D + gq;
-        if (p.ml) {
+        // SPLIT: 0 not written, 1 dst, 2 this run's partial (max, sum, unnormalized output) in
+        // scratch slot `slot` (paged_fixed_combine).
+        const int target = SPLIT ? fa::fixed_target(p.split_fixed, slot, c_first[c], c_pos[c]) : 1;
+        if (target == 0) {
+        } else if (target == 2) {
+            if (valid) {
+                float * part = p.scratch + (row * p.max_split + slot) * (D + 2);
+                if (h == 0 && gq == 0) {
+                    part[0] = m[c];
+                    part[1] = l[c];
+                }
+                float * po = part + 2 + gq;
+#pragma unroll
+                for (int ob = 0; ob < OB; ob++) {
+                    const int i = ob / HB * (CH / 16) + h * HB + ob % HB;
+                    po[i * 16]     = o[ob][c];
+                    po[i * 16 + 8] = o[ob][2 + c];
+                }
+            }
+        } else if (p.ml) {
             // Pieces (#352): merged into the earlier pieces' output. The column's lanes (all four
             // warps of the group) read its running (max, sum) before one of them writes it.
             const float4 f = valid ? merge_row<true>(p, row, m[c], l[c]) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -835,6 +867,23 @@ int launch(const legion_paged_attn & p, cudaStream_t st) {
     }
     static std::atomic<int8_t> o1[GGML_CUDA_MAX_DEVICES];
     return launch_with<Shape<D, GROUPS>>(paged_prefill_grid<D, G, GROUPS>, o1, p, G, st);
+}
+
+// The fixed split over the key blocks (p.split_fixed > 0, p.max_split > 1, #1133) on the quad
+// kernel, where p.verify_grid picks a wide-grid kernel: a CTA per (column group, kv head,
+// sequence, run), then paged_fixed_combine. The same bits as paged_prefill_mma<.., SPLIT> under
+// the same rule. -1: no shared memory for it on this device (paged_prefill_mma's split instead).
+template <int D, int G>
+int launch_split(const legion_paged_attn & p, cudaStream_t st) {
+    using Q = QShape<D, 1, 256, 3>;
+    static std::atomic<int8_t> os[GGML_CUDA_MAX_DEVICES];
+    if (!legion_device::smem_opt_in(os, paged_prefill_quad<D, G, 1, 256, 3, true, true>, (int) Q::SMEM)) {
+        return -1;
+    }
+    const int x = (p.n_tok * G + Q::COLS - 1) / Q::COLS;
+    paged_prefill_quad<D, G, 1, 256, 3, true, true><<<dim3(x, p.n_head_kv, p.n_seqs * p.max_split), Q::NW * 32, Q::SMEM, st>>>(p);
+    fa::launch_combine<D, G>(p, st);
+    return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
 
 }  // namespace fa_grid

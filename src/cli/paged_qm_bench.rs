@@ -50,9 +50,15 @@ pub struct PagedQmBenchArgs {
     /// Qwen3.8-27B) against `paged_prefill_mma` (#689), `--modes` ignored: `auto` (the default's
     /// pick), `pair` / `quad` (the pair / quad kernel for every group it covers), `quad0` (the
     /// quad kernel without its page prefetch), `split` (over the key blocks as
-    /// `--paged-verify-split`; other bits, timed for reference).
+    /// `--paged-verify-split`; other bits, timed for reference), `fixed` / `fixedmma` (split at
+    /// fixed places as `--paged-verify-split-keys`, #1133, on the default's pick / on
+    /// paged_prefill_mma: rows within one run must keep main's bits, the two must give each
+    /// other's bits, and with `--seqs` above 1 the first sequence's alone).
     #[arg(long, value_delimiter = ',')]
     grid: Vec<String>,
+    /// With `--grid` fixed / fixedmma: keys per run (a multiple of 64).
+    #[arg(long, default_value_t = 16384)]
+    split_keys: usize,
     /// With `--grid` or `--d512`: time each kernel per call as a model's step meets it (#689), in
     /// these modes instead of the plain timing: `warm` (nothing between calls), `rot` (the
     /// layers' pools in turn), `read` (a 1 GiB read before each call), `rotread` (both), `l2` (a
@@ -104,6 +110,18 @@ struct Alt<'a> {
     ) -> (Vec<f32>, f64),
     on: fn(&legion::model::core::paged_split_bench::Group, &str, usize) -> bool,
     edges: fn(&mut legion::ggml::Backend, &str, usize) -> (usize, usize, usize, usize),
+    /// The fixed split's checks of a kernel's output against main's (`--grid`): values that
+    /// differ.
+    check: Option<
+        fn(
+            &mut legion::ggml::Backend,
+            &legion::model::core::KvPool,
+            &legion::model::core::paged_split_bench::Group,
+            &str,
+            &[f32],
+            &[f32],
+        ) -> usize,
+    >,
 }
 
 #[cfg(feature = "cuda")]
@@ -144,11 +162,17 @@ pub fn run(args: PagedQmBenchArgs) -> anyhow::Result<()> {
             run: d512::run,
             on: d512::on_pair,
             edges: d512::edges,
+            check: None,
         };
         return run_alt(&args, &alt, (512, n_head, n_head_kv), &chunks);
     }
     if !args.grid.is_empty() {
         use legion::model::core::paged_grid_bench as grid;
+        anyhow::ensure!(
+            args.split_keys > 0 && args.split_keys % 64 == 0,
+            "--split-keys takes a positive multiple of 64"
+        );
+        grid::set_split_keys(args.split_keys);
         let alt = Alt {
             flag: "--grid",
             picked: &args.grid,
@@ -158,6 +182,7 @@ pub fn run(args: PagedQmBenchArgs) -> anyhow::Result<()> {
             run: grid::run,
             on: grid::on_grid,
             edges: grid::edges,
+            check: Some(grid::fixed_check),
         };
         return run_alt(&args, &alt, heads, &chunks);
     }
@@ -278,7 +303,12 @@ fn run_alt(
     println!("{sms} SMs");
     let mut differ = 0;
     if !args.no_edges {
-        for k in alt.picked.iter().filter(|k| *k != "split") {
+        // split: other bits; fixedmma: checked as fixed's reference.
+        for k in alt
+            .picked
+            .iter()
+            .filter(|k| *k != "split" && *k != "fixedmma")
+        {
             let (cases, ran, total, bad) = (alt.edges)(&mut gpu, k, sms);
             println!(
                 "edges, {k}: {cases} cases ({ran} on the {} kernel), {bad} of {total} values differ",
@@ -333,6 +363,13 @@ fn run_alt(
         }
         let (_, m2) = t("main");
         let main = m1.min(m2);
+        let mut checked = 0;
+        if let Some(check) = alt.check {
+            for (k, b1, _) in &cols {
+                checked += check(&mut gpu, &kv, &g, k, &a1, b1);
+            }
+        }
+        differ += checked;
         print!("{n_past:>7} {n_tok:>6} {seqs:>4} {main:>9.3}");
         for (k, b1, ms) in cols {
             let bad = a1
@@ -341,8 +378,8 @@ fn run_alt(
                 .filter(|(x, y)| x.to_bits() != y.to_bits())
                 .count();
             let bits = match (k.as_str(), bad) {
-                ("split", 0) => "same",
-                ("split", _) => "other",
+                ("split" | "fixed" | "fixedmma", 0) => "same",
+                ("split" | "fixed" | "fixedmma", _) => "other",
                 (_, 0) if (alt.on)(&g, k, sms) => alt.name,
                 (_, 0) => "mma",
                 _ => {

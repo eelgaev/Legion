@@ -251,6 +251,9 @@ pub struct Switches {
     /// Paged attention of 2-16-token groups split over the key blocks
     /// ([`crate::model::core::paged::set_verify_split`]).
     pub paged_verify_split: Option<bool>,
+    /// Paged attention of 2-16-token groups split over the keys at fixed places, every this
+    /// many keys ([`crate::model::core::paged::set_verify_split_keys`]).
+    pub paged_verify_split_keys: Option<usize>,
     /// sm_70 / sm_75: 2-16-token groups' rows split over the key blocks, the WMMA kernel's bits
     /// ([`crate::model::core::paged::set_verify_split_wmma`]).
     pub paged_verify_split_wmma: Option<bool>,
@@ -784,6 +787,9 @@ impl Switches {
             self.paged_verify_split_wmma,
             crate::model::core::paged::set_verify_split_wmma,
         );
+        if let Some(k) = self.paged_verify_split_keys {
+            crate::model::core::paged::set_verify_split_keys(k);
+        }
         set(self.shexp_gate, core::set_shexp_gate);
         set(self.decode_fuse, core::set_decode_fuse);
         set(self.node_fuse, core::set_node_fuse);

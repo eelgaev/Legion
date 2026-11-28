@@ -3270,6 +3270,11 @@ impl Model {
                             [n.max(wmma) as i64, 1, 1, 1]
                         } else if wmma > 0 {
                             [wmma as i64, 1, 1, 1]
+                        } else if let Some(ne) =
+                            paged::fixed_split_shape(d, hp.n_head, g.n_tok, g.n_seqs, g.table)
+                        {
+                            // A verify step split over the keys at fixed places (sm_80+).
+                            ne
                         } else {
                             paged::scratch_shape(d, hp.n_head, min_kv, g.n_tok, g.n_seqs)
                         };
