@@ -880,6 +880,9 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
 using q40_op  = q40_cfg<64, 128, 2, 2, 2, 2, 4, 1>;   // the op's: 4 warps of 32 x 64, 2 CTAs an SM
 using q40_128 = q40_cfg<128, 128, 4, 2, 3, 1, 8, 0>;  // 8 warps of 32 x 64, 1 CTA an SM
 using q40_rp  = q40_cfg<64, 128, 2, 2, 2, 2, 4, 1, 1>;  // the op's on repacked weights
+using q40_rp3 = q40_cfg<64, 128, 2, 2, 3, 1, 4, 1, 1>;  // the same, 3 stages, 1 CTA an SM
+using q40_rpg = q40_cfg<64, 128, 2, 2, 2, 2, 8, 1, 1>;  // the same, groups of 8 column tiles
+using q40_rpw = q40_cfg<128, 128, 4, 2, 3, 1, 8, 0, 1>;  // 128 x 128 tiles on repacked weights
 
 static_assert(q40_op::SMEM == 47616, "src/model/q40_mm.rs SMEM_BYTES");
 static_assert(q40_rp::SMEM <= q40_op::SMEM, "the GeGLU pair's launch");
@@ -972,6 +975,12 @@ extern const legion_q40_kernel legion_q40_mm_table[] = {
       q40_rp::SMEM, q40_rp::THREADS, q40_rp::BM, q40_rp::BN, "repacked, no prefetch", 1 },
     { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_rp, 0, 2>),
       q40_rp::SMEM, q40_rp::THREADS, q40_rp::BM, q40_rp::BN, "repacked, prefetch 2", 1 },
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_rp3>),
+      q40_rp3::SMEM, q40_rp3::THREADS, q40_rp3::BM, q40_rp3::BN, "repacked, 3 stages", 1 },
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_rpg>),
+      q40_rpg::SMEM, q40_rpg::THREADS, q40_rpg::BM, q40_rpg::BN, "repacked, groups of 8", 1 },
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_rpw>),
+      q40_rpw::SMEM, q40_rpw::THREADS, q40_rpw::BM, q40_rpw::BN, "repacked, 128 x 128", 1 },
 };
 extern const int legion_q40_mm_table_len = sizeof(legion_q40_mm_table) / sizeof(legion_q40_mm_table[0]);
 

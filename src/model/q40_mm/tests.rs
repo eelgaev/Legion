@@ -881,7 +881,10 @@ fn cuda_q40_mm_fused_quant_is_byte_exact() {
                 bad.push(format!("{k}x{rows} at {n}"));
             }
             cases += 1;
-            // Again on the weight's repacked copy.
+            // Again on the weight's repacked copy, the inputs set again first (the run may have
+            // reused their memory after their last reader).
+            w.set_bytes(&q4_0_matrix(k as usize, rows as usize, (k + rows) as u64));
+            x.set_f32(&input(k as usize, n as usize, n as u64));
             repack_weight(w);
             gpu.compute(&graph).unwrap();
             let diff = y
@@ -948,6 +951,7 @@ fn cuda_q40_mm_fused_time_at_4096_rows() {
         }
         let ms = time(&mut gpu, &graph);
         let tops = 2.0 * (k * rows * n) as f64 / ms / 1e9;
+        w.set_bytes(&q4_0_matrix(k as usize, rows as usize, 11));
         repack_weight(w);
         let rp = time(&mut gpu, &graph);
         forget_weight(w);
@@ -1098,7 +1102,11 @@ fn cuda_q40_mm_geglu_pair_is_byte_exact() {
             }
             cases += 1;
             // Again on the weights' repacked copies (the pair and the two matmuls), against the
-            // matmuls on the weights as loaded.
+            // matmuls on the weights as loaded. The inputs again first: the run may have
+            // reused their memory after their last reader.
+            gate.set_bytes(&wg);
+            up.set_bytes(&wu);
+            x.set_f32(&input(k as usize, n as usize, 70 + n as u64));
             repack_weight(gate);
             repack_weight(up);
             gpu.compute(&graph).unwrap();

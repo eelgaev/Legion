@@ -1062,6 +1062,12 @@ pub(in crate::cli) struct SwitchArgs {
     /// ggml runs every tile on one CTA). The same output either way; for comparisons.
     #[arg(long, help_heading = HEADING)]
     q40_mm_ggml: bool,
+    /// Those Q4_0 prompt matmuls on copies of their weights repacked at load into one
+    /// contiguous block per tile and step (the same values, so the same output): faster prompt
+    /// steps for a second copy of those weights in GPU memory (about the Q4_0 weights' size,
+    /// taken from the KV pool and rings), and a few seconds of load.
+    #[arg(long, help_heading = HEADING)]
+    q40_repack: bool,
     /// qwen4exp prompt steps on compute capability 12.x GPUs (GB10; no effect elsewhere): run
     /// the hyper-connection mixer's up matmul (ggml's MMQ, which writes the gate) and the gated
     /// mix (ggml's hc_pre, which reads it back; Legion's copy of it unless --hc-pre-ggml) as
@@ -1768,6 +1774,7 @@ impl SwitchArgs {
             q8_mmq_fixup: self.q8_mmq_fixup,
             tu_mmq: self.tu_mmq_ggml.then_some(false),
             q40_mm: self.q40_mm_ggml.then_some(false),
+            q40_repack: self.q40_repack.then_some(true),
             hc_up_mix: self.hc_up_mix_ggml.then_some(false),
             hc_up_mix_bf16: self.no_hc_up_mix_bf16.then_some(false),
             hc_up_mix_ldmatrix: self.no_hc_up_mix_ldmatrix.then_some(false),

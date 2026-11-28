@@ -399,6 +399,9 @@ pub struct Switches {
     /// Q4_0 prompt matmuls on a GB10 on Legion's op with MMQ's bits
     /// ([`crate::model::q40_mm::set_q40_mm`]).
     pub q40_mm: Option<bool>,
+    /// That op on repacked copies of its weights made at load
+    /// ([`crate::model::q40_mm::set_q40_repack`]).
+    pub q40_repack: Option<bool>,
     /// qwen4exp's mixer up matmul and gated mix as one op ([`crate::model::qwen4::set_up_mix`]).
     pub hc_up_mix: Option<bool>,
     /// The same op for BF16 mixer up weights ([`crate::model::qwen4::set_up_mix_bf16`], on by
@@ -866,6 +869,7 @@ impl Switches {
         }
         set(self.tu_mmq, crate::model::tu_mmq::set_tu_mmq);
         set(self.q40_mm, crate::model::q40_mm::set_q40_mm);
+        set(self.q40_repack, crate::model::q40_mm::set_q40_repack);
         set(self.hc_up_mix, qwen4::set_up_mix);
         set(self.hc_up_mix_bf16, qwen4::set_up_mix_bf16);
         set(self.hc_up_mix_ldmatrix, qwen4::set_up_mix_ldmatrix);
