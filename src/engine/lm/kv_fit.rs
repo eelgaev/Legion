@@ -14,6 +14,13 @@ pub fn blocks(prompt: usize, max_tokens: u32, max_ctx: usize, spec_k: usize) -> 
     (max_len + spec_k).div_ceil(KV_BLOCK)
 }
 
+/// The most [`blocks`] gives for a `ctx_size` context: what the automatic KV pool counts per
+/// context, so a request whose prompt and `max_tokens` fill the context runs with `spec_k`
+/// drafts on.
+pub fn context_blocks(ctx_size: usize, spec_k: usize) -> usize {
+    (ctx_size + spec_k).div_ceil(KV_BLOCK)
+}
+
 /// [`blocks`] against a pool of `pool_blocks`: [`EngineError::KvOverflow`] when it needs more.
 pub fn check(
     prompt: usize,

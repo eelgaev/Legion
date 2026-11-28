@@ -22,6 +22,7 @@ struct Kind {
     stop: Vec<String>,
     logprobs: Option<u32>,
     grammar: bool,
+    trim_content: bool,
 }
 
 fn spec(kind: &Kind) -> (TextSpec, UnboundedReceiver<TokenEvent>) {
@@ -37,6 +38,7 @@ fn spec(kind: &Kind) -> (TextSpec, UnboundedReceiver<TokenEvent>) {
         reasoning: kind
             .reasoning
             .then(|| ReasoningParser::new("<think>", "</think>", false)),
+        trim_content: kind.trim_content,
         tools: kind
             .tools
             .then(|| Box::new(HermesParser::new(&tools, false)) as Box<dyn ToolParser>),
@@ -323,4 +325,108 @@ fn zero_min_seqs_never_starts_the_thread() {
         lives.push(live);
     }
     assert!(outbox.thread.is_none());
+}
+
+/// A sequence's events merged into `(reasoning, text)`, and whether its first `Text` event
+/// starts with whitespace (a trimmed start sends none before the content).
+fn merged(events: &[TokenEvent]) -> (String, String, bool) {
+    let (mut r, mut t, mut led) = (String::new(), String::new(), false);
+    for e in events {
+        match e {
+            TokenEvent::Reasoning(s) => r.push_str(s),
+            TokenEvent::Text(s) => {
+                led |= t.is_empty() && s.starts_with(char::is_whitespace);
+                t.push_str(s);
+            }
+            _ => {}
+        }
+    }
+    (r, t, led)
+}
+
+#[test]
+fn trimmed_content_drops_only_its_leading_whitespace() {
+    let trim = Kind {
+        trim_content: true,
+        ..Kind::default()
+    };
+    let thinking = Kind {
+        reasoning: true,
+        ..trim.clone()
+    };
+    let stop = Kind {
+        stop: vec!["x".into()],
+        ..trim.clone()
+    };
+    let logprobs = Kind {
+        logprobs: Some(1),
+        ..trim.clone()
+    };
+    let tools = Kind {
+        tools: true,
+        ..trim.clone()
+    };
+    let seqs = [
+        (trim.clone(), " red apple \n", Close::StopToken),
+        (trim.clone(), "\n\n \t two  words", Close::Length),
+        // Reasoning keeps its whitespace; the content after it starts trimmed.
+        (
+            thinking,
+            "<think> plan </think>\n\n answer",
+            Close::StopToken,
+        ),
+        (trim.clone(), " \n ", Close::StopToken),
+        (stop, "  ax", Close::Length),
+        (logprobs, "  hi", Close::Length),
+        (
+            tools,
+            "\n<tool_call>\n{\"name\": \"get\", \"arguments\": {}}\n</tool_call>",
+            Close::StopToken,
+        ),
+        // Without the trim, the text is as the model wrote it.
+        (Kind::default(), " red apple", Close::StopToken),
+    ];
+    let want = [
+        ("", "red apple \n"),
+        ("", "two  words"),
+        (" plan ", "answer"),
+        ("", ""),
+        ("", "a"),
+        ("", "hi"),
+        ("", ""),
+        ("", " red apple"),
+    ];
+    let here = drive(0, &seqs);
+    let away = drive(1, &seqs);
+    for ((h, _), (a, _)) in here.iter().zip(&away) {
+        assert_eq!(h, a);
+    }
+    for (i, ((events, _), (r, t))) in here.iter().zip(want).enumerate() {
+        let (got_r, got_t, led) = merged(events);
+        assert_eq!((got_r.as_str(), got_t.as_str()), (r, t), "{i}: {events:?}");
+        assert_eq!(led, i == 7, "{i}: {events:?}");
+    }
+    // The leading whitespace's tokens keep their log probabilities.
+    let lps: usize = here[5]
+        .0
+        .iter()
+        .map(|e| match e {
+            TokenEvent::Logprobs(l) => l.len(),
+            _ => 0,
+        })
+        .sum();
+    assert_eq!(lps, 4, "{:?}", here[5].0);
+    assert!(
+        here[6]
+            .0
+            .iter()
+            .any(|e| matches!(e, TokenEvent::ToolCall(_)))
+    );
+    assert!(matches!(
+        here[4].0.last(),
+        Some(TokenEvent::Finished {
+            reason: FinishReason::StopSequence,
+            ..
+        })
+    ));
 }

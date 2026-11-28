@@ -1840,8 +1840,8 @@ struct Job {
     stop: Vec<String>,
     ignore_eos: bool,
     min_tokens: u32,
-    /// Split reasoning, and whether the prompt already opened it.
-    reasoning: Option<bool>,
+    /// Split reasoning, and whether the prompt already opened it; content trimming.
+    start: ReplyStart,
     /// The request's tools, for the tool-call parser (none: no parsing).
     tools: Vec<super::Tool>,
     out: mpsc::UnboundedSender<TokenEvent>,
@@ -4144,7 +4144,7 @@ impl LmEngine {
         }
         let sampling = crate::engine::sampling_defaults::ModelSampling::from_gguf(&gguf);
         let tokenizer = Arc::new(Tokenizer::from_gguf(&gguf)?);
-        let chat_format = ChatFormat::detect(&tokenizer);
+        let chat_format = ChatFormat::detect(&tokenizer).for_arch(gguf.architecture().as_deref());
         let template = match gguf.get_str("tokenizer.chat_template") {
             Some(src) => {
                 let text = |id: Option<u32>| {
@@ -4782,6 +4782,11 @@ impl LmEngine {
         }
         // Per stage: what its states take, and how many KV blocks fit next to them.
         let ctx_blocks = cfg.ctx_size.div_ceil(KV_BLOCK);
+        // A sequence at the end of its context also holds the `spec_k` positions a verify step
+        // writes past the last one it keeps: the automatic pool holds that per context, so a
+        // request whose prompt and `max_tokens` fill `--ctx-size` runs with speculation on.
+        // The floors (a context must fit) stay at `--ctx-size`.
+        let seq_blocks = kv_fit::context_blocks(cfg.ctx_size, spec_k);
         let shared = layout
             .stages
             .iter()
@@ -4950,7 +4955,7 @@ impl LmEngine {
         let mut n_blocks = match cfg.kv_cache_tokens {
             Some(t) => kv_explicit(t.div_ceil(KV_BLOCK), fit, shared).map_err(LoadError::Device)?,
             None => {
-                let want = auto_kv_want(max_seqs, ctx_blocks, cache_split, shared);
+                let want = auto_kv_want(max_seqs, seq_blocks, cache_split, shared);
                 fit.map_or(want, |f| want.min(f))
             }
         };
@@ -4981,7 +4986,7 @@ impl LmEngine {
                 (fit, fit_full),
                 (ctx_blocks, n_blocks),
                 (
-                    auto_kv_want(max_seqs, ctx_blocks, cache_split, shared),
+                    auto_kv_want(max_seqs, seq_blocks, cache_split, shared),
                     shared,
                 ),
             )
@@ -6390,30 +6395,35 @@ impl LmEngine {
     }
 
     /// The request's prompt tokens (what `generate` runs and reports as `prompt_tokens`), for
-    /// chats whether generation starts inside reasoning, and its images, placed in the tokens
-    /// but not yet encoded ([`vision`]).
+    /// chats how the reply starts ([`ReplyStart`]), and its images, placed in the tokens but
+    /// not yet encoded ([`vision`]).
     #[allow(clippy::type_complexity)]
     fn prompt(
         &self,
         req: &GenerateRequest,
-    ) -> Result<(Vec<u32>, Option<bool>, Vec<vision::Pending>), EngineError> {
+    ) -> Result<(Vec<u32>, ReplyStart, Vec<vision::Pending>), EngineError> {
         if req.model != self.info.id {
             return Err(EngineError::ModelNotFound(req.model.clone()));
         }
         let (text, reasoning) = self.render(req)?;
+        let start = ReplyStart {
+            reasoning,
+            trim_content: matches!(req.prompt, Prompt::Chat { .. })
+                && self.chat_format.trims_content(&text),
+        };
         let tokens = self.tokenizer.encode_with(&text, true, true);
         let images: Vec<&super::ImageInput> = match &req.prompt {
             Prompt::Chat { messages, .. } => messages.iter().flat_map(|m| &m.images).collect(),
             Prompt::Text(_) => Vec::new(),
         };
         if images.is_empty() {
-            return Ok((tokens, reasoning, Vec::new()));
+            return Ok((tokens, start, Vec::new()));
         }
         let vision = self.vision.as_ref().ok_or_else(|| {
             EngineError::InvalidRequest("this model does not take images (no --mmproj)".into())
         })?;
         let (tokens, pending) = vision.expand(tokens, &images)?;
-        Ok((tokens, reasoning, pending))
+        Ok((tokens, start, pending))
     }
 
     /// The prompt text, and for chats whether generation starts inside reasoning.
@@ -6485,7 +6495,7 @@ impl LmEngine {
         if grammar.is_some() {
             req.thinking = Some(false);
         }
-        let (prompt, reasoning, images) = self.prompt(&req)?;
+        let (prompt, start, images) = self.prompt(&req)?;
         if prompt.is_empty() {
             return Err(EngineError::InvalidRequest("the prompt is empty".into()));
         }
@@ -6529,7 +6539,7 @@ impl LmEngine {
             stop: req.stop,
             ignore_eos: req.ignore_eos,
             min_tokens: req.min_tokens,
-            reasoning,
+            start,
             tools,
             cancel: req.cancel,
             sched: req.scheduling,
@@ -6569,7 +6579,7 @@ impl LmEngine {
                 stop: p.stop,
                 ignore_eos: p.ignore_eos,
                 min_tokens: p.min_tokens,
-                reasoning: p.reasoning,
+                start: p.start,
                 tools: p.tools,
                 out,
                 cancel: p.cancel,
@@ -6595,10 +6605,19 @@ pub struct Prepared {
     stop: Vec<String>,
     ignore_eos: bool,
     min_tokens: u32,
-    reasoning: Option<bool>,
+    start: ReplyStart,
     tools: Vec<super::Tool>,
     cancel: CancellationToken,
     sched: Scheduling,
+}
+
+/// How a request's reply starts, from its rendered prompt.
+#[derive(Debug, Clone, Copy, Default)]
+struct ReplyStart {
+    /// Split reasoning, and whether the prompt already opened it.
+    reasoning: Option<bool>,
+    /// The content's leading whitespace is trimmed ([`ChatFormat::trims_content`]).
+    trim_content: bool,
 }
 
 impl super::replicas::Replica for LmEngine {
@@ -9755,8 +9774,10 @@ impl<'t> Active<'t> {
         let spec = stream::TextSpec {
             grammar: constraint.is_some(),
             reasoning: job
+                .start
                 .reasoning
                 .map(|inside| chat_format.reasoning_parser(inside)),
+            trim_content: job.start.trim_content,
             tools: (job.grammar.is_none() && (!job.tools.is_empty() || chat_format.framed()))
                 .then(|| chat_format.tool_parser(&job.tools, call_undeclared)),
             stop: StopMatcher::new(job.stop.clone()),
