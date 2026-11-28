@@ -144,6 +144,13 @@ struct legion_paged_attn {
     // n_past[seq] + q_off + t. Only paged_prefill_mma and paged_prefill_qm read it; 0 for every
     // other launch.
     int32_t q_off;
+    // > 0 with max_split > 1 (sm_80+, --paged-verify-split-keys, #1133): a 2-16-token group's
+    // split over the key blocks at fixed places, every this many blocks from block 0, instead of
+    // max_split even runs of each tile's blocks. A row whose visible keys lie in one such run is
+    // written as without a split; a row's other runs go to scratch slot run (key block / this)
+    // and paged_fixed_combine merges them in run order. Which kernel computes a run, and the
+    // other sequences of the batch, do not change a row's bits (sm80/paged_attn.cuh).
+    int32_t split_fixed;
 };
 
 enum { LEGION_KV_F16 = 0, LEGION_KV_Q8_0 = 1, LEGION_KV_Q4_0 = 2 };
@@ -995,6 +1002,15 @@ int launch(const legion_paged_attn & p, cudaStream_t st) {
     } else if (fa::available()) {
         // A split scratch (--paged-verify-split): small groups split over the key blocks.
         if (p.max_split > 1 && !p.piece_blk && !p.ml && !p.span) {
+            // The fixed split (--paged-verify-split-keys, #1133): on the quad kernel where
+            // p.verify_grid picks a wide-grid kernel, else on paged_prefill_mma; the same bits.
+            if constexpr (D == 256 && G == 6 && !C) {
+                if (p.split_fixed > 0 && p.verify_grid > 0) {
+                    if (const int rc = fa_grid::launch_split<D, G>(p, st); rc >= 0) {
+                        return rc;
+                    }
+                }
+            }
             return fa::launch_split<D, G, C>(p, st);
         }
         // Image spans (#1217): paged_prefill_mma reads them, the variants below do not.

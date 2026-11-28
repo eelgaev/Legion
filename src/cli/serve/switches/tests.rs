@@ -976,3 +976,17 @@ fn kv_vmm_keep_implies_kv_vmm_and_no_kv_vmm_turns_both_off() {
         assert!(Cli::try_parse_from(argv).is_err(), "{bad:?} parsed");
     }
 }
+
+#[test]
+fn paged_verify_split_keys_takes_whole_key_blocks() {
+    // Off unless given (#1133); a positive multiple of 64 keys.
+    assert_eq!(switches(&[]).paged_verify_split_keys, None);
+    assert_eq!(
+        switches(&["--paged-verify-split-keys", "16384"]).paged_verify_split_keys,
+        Some(16384)
+    );
+    for bad in ["0", "100", "-64", "x"] {
+        let argv = ["legion", "serve", "--paged-verify-split-keys", bad];
+        assert!(Cli::try_parse_from(argv).is_err(), "{bad} parsed");
+    }
+}

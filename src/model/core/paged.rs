@@ -14,7 +14,7 @@
 
 #[cfg(feature = "cuda")]
 use std::os::raw::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::ggml::{Context, ExternalOp, Tensor, ffi, types};
 
@@ -71,6 +71,69 @@ fn verify_split(n_tok: usize) -> bool {
         return false;
     }
     true
+}
+
+/// The fixed split's run in key blocks, 0 off ([`set_verify_split_keys`]).
+static VERIFY_SPLIT_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether graphs built from now on run the attention of groups of 2 to
+/// [`VERIFY_SPLIT_TOKENS`] tokens per sequence (speculative verify steps) on sm_80+ GPUs split
+/// over the keys at fixed places: every `keys` keys from position 0 (a multiple of 64; 0 off;
+/// `legion serve --paged-verify-split-keys`, #1133). A verify step of one sequence is a few
+/// CTAs, each walking the whole context; split, a 64K context fills the GPU. Each run's (max,
+/// sum, unnormalized output) is computed by the group's kernel (the quad kernel where
+/// [`verify_grid_kind`] picks a wide-grid kernel, else `paged_prefill_mma`, the same bits) and
+/// the runs are merged in order. A row whose visible keys lie in one run (contexts under `keys`)
+/// gets the default's bits; a longer one other bits, but the same whatever the batch, since its
+/// runs depend on its position only. Not for pools with a host tier; ignored on sm_70 / sm_75.
+pub fn set_verify_split_keys(keys: usize) {
+    VERIFY_SPLIT_BLOCKS.store(keys / KV_BLOCK, Ordering::Relaxed);
+}
+
+/// [`set_verify_split_keys`] for the calling thread's graphs and launches only (benches and
+/// tests); `None` follows the process's switch again.
+pub fn set_verify_split_keys_here(keys: Option<usize>) {
+    SPLIT_KEYS_HERE.with(|c| c.set(keys));
+}
+
+/// The fixed split's run in key blocks for a group of `n_tok` tokens per sequence on the
+/// current device ([`set_verify_split_keys`]); `None` where it does not apply.
+fn fixed_split_blocks(n_tok: usize) -> Option<usize> {
+    let f = SPLIT_KEYS_HERE.with(|c| c.get()).map_or_else(
+        || VERIFY_SPLIT_BLOCKS.load(Ordering::Relaxed),
+        |k| k / KV_BLOCK,
+    );
+    (f > 0 && (2..=VERIFY_SPLIT_TOKENS).contains(&n_tok) && quant_ok()).then_some(f)
+}
+
+/// The scratch of a group under the fixed split ([`set_verify_split_keys`]) over a table of
+/// `table_width` blocks a sequence; `None` where it does not apply ([`fixed_runs_shape`]).
+pub fn fixed_split_shape(
+    d: i64,
+    n_head: i64,
+    n_tok: usize,
+    n_seqs: usize,
+    table_width: usize,
+) -> Option<[i64; 4]> {
+    let f = fixed_split_blocks(n_tok)?;
+    Some(fixed_runs_shape(f, d, n_head, n_tok, n_seqs, table_width))
+}
+
+/// The scratch for runs of `f` key blocks over a table of `table_width` blocks a sequence:
+/// `[d + 2, runs, n_head, n_tok × n_seqs]`, a slot per run of the table, or the placeholder
+/// (no split, the default's bits) where the table is one run.
+fn fixed_runs_shape(
+    f: usize,
+    d: i64,
+    n_head: i64,
+    n_tok: usize,
+    n_seqs: usize,
+    table_width: usize,
+) -> [i64; 4] {
+    match table_width.div_ceil(f.max(1)) {
+        runs @ 2.. => [d + 2, runs as i64, n_head, (n_tok * n_seqs) as i64],
+        _ => [1, 1, 1, 1],
+    }
 }
 
 /// Whether small groups with heads of 512 at 8 query heads a kv head take the warp-pair kernel
@@ -181,6 +244,8 @@ thread_local! {
     static GRID_HERE: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
     /// The calling thread's warp-pair prefetch ([`set_d512_prefetch_here`]).
     static PF_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// The calling thread's fixed split, in keys ([`set_verify_split_keys_here`]).
+    static SPLIT_KEYS_HERE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 /// Whether the warp-pair kernel prefetches its keys' pages in the calling thread's launches
@@ -1041,6 +1106,9 @@ struct LaunchParams {
     /// Tokens of the step before this launch's first (a later part of a group in two
     /// launches, [`attention_parts`]); 0 for every other launch.
     q_off: i32,
+    /// With `max_split > 1`: the fixed split's run in key blocks ([`set_verify_split_keys`]);
+    /// 0: `max_split` even runs of each tile's blocks.
+    split_fixed: i32,
 }
 
 /// The kernels' code for a cache type (`LEGION_KV_*` in paged_attn.cu), if they read it.
@@ -1356,6 +1424,7 @@ unsafe fn cuda_paged_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
         prefetch: 0,
         span: o.span.unwrap_or(std::ptr::null()),
         q_off: 0,
+        split_fixed: 0,
     };
     // Image spans (#1217): the plain prefill kernels read them, none of the variants.
     let spans = o.span.is_some() && o.n_tok > 1;
@@ -1367,6 +1436,18 @@ unsafe fn cuda_paged_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
     if o.n_tok > 1 && o.scratch_len < (o.d + 2) * o.max_split * o.n_head * o.n_tok * o.n_seqs {
         p.max_split = 1;
     }
+    // The fixed split (--paged-verify-split-keys): its scratch has a slot per run of the
+    // table's blocks (fixed_split_shape). A ring table's positions run past its entries, so a
+    // sliding-window layer's group runs unsplit (the default's bits).
+    if p.max_split > 1
+        && let Some(f) = fixed_split_blocks(o.n_tok)
+    {
+        if o.ring == 0 && o.table_width.div_ceil(f) == p.max_split as usize {
+            p.split_fixed = f as i32;
+        } else {
+            p.max_split = 1;
+        }
+    }
     p.d512_pair = d512_pair_for(
         o.d,
         o.n_head,
@@ -1377,6 +1458,8 @@ unsafe fn cuda_paged_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
         p.max_split,
     );
     p.prefetch = d512_prefetch_for(p.d512_pair, o.n_seqs);
+    // Under the fixed split, verify_grid > 0 runs the runs on the quad kernel (the same bits as
+    // paged_prefill_mma's split), so the pick is made as for the unsplit group.
     p.verify_grid = verify_grid_for(
         o.d,
         o.n_head,
@@ -1384,7 +1467,7 @@ unsafe fn cuda_paged_attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
         o.n_tok,
         o.n_seqs,
         o.compact,
-        p.max_split,
+        if p.split_fixed > 0 { 1 } else { p.max_split },
     );
     // A prefill group's last rows split over the key blocks, in runs of as many sequences as
     // the scratch holds (the kernel takes it on sm_70 / sm_75's WMMA path only, and not for
@@ -1582,6 +1665,8 @@ pub mod d512_bench;
 mod d512_tests;
 #[cfg(all(test, feature = "cuda"))]
 mod ffma_tests;
+#[cfg(test)]
+mod fixed_split_tests;
 #[cfg(test)]
 mod granule_tests;
 pub mod grid_bench;

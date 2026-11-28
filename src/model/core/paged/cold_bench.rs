@@ -18,7 +18,7 @@
 //! without the calls (the flushes alone), over the calls; the flushes are ggml's `sum_rows` /
 //! `cont`. Nothing here changes a kernel.
 //!
-//! The kernels (#689 r20, [`pick`]): at heads of 256 those of [`grid_bench::KERNELS`] but `split`,
+//! The kernels (#689 r20, [`pick`]): at heads of 256 those of [`grid_bench::KERNELS`] but the splits,
 //! plus `mma` (`paged_prefill_mma` without the queries-as-M kernel); at heads of 512 `main` /
 //! `mma` (`paged_prefill_mma`), `pair` (the warp-pair kernel), `auto` (the default's pick). A
 //! group of one token a sequence is a decode step whatever the kernel (`paged_decode`, split

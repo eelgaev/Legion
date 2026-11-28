@@ -654,6 +654,16 @@ pub(in crate::cli) struct SwitchArgs {
     /// Not used over a pool with a host tier. Off by default.
     #[arg(long, help_heading = HEADING)]
     paged_verify_split: bool,
+    /// CUDA, compute capability 8.0+ (GB10, Ampere and newer; ignored elsewhere): the paged
+    /// attention of groups of 2-16 tokens per sequence (speculative verify steps) split over the
+    /// keys at fixed places, every KEYS keys from the first (a multiple of 64, e.g. 16384), and
+    /// the parts merged in order. At one user a verify step's attention is a few CTAs walking
+    /// the whole context; split, a long context fills the GPU (GB10, Qwen3.8-27B). Requests
+    /// shorter than KEYS keep the default's output bits; longer ones get other bits (the sums
+    /// are taken in another order), the same whatever else the batch holds. Takes precedence
+    /// over --paged-verify-split. Not used over a pool with a host tier. Off by default.
+    #[arg(long, value_name = "KEYS", value_parser = parse_split_keys, help_heading = HEADING)]
+    paged_verify_split_keys: Option<usize>,
     /// CUDA, compute capability 7.0 / 7.5 (V100, Turing): split the paged attention of groups
     /// of 2-16 tokens per sequence (speculative verify steps, short prompt chunks) over the key
     /// blocks across the GPU, at up to 32 CTAs of the WMMA kernel (one per query tile and kv
@@ -1703,6 +1713,7 @@ impl SwitchArgs {
             moe_pad_skip: self.no_moe_pad_skip.then_some(false),
             tp_moe_ep_skip: self.no_tp_moe_ep_skip.then_some(false),
             paged_verify_split: self.paged_verify_split.then_some(true),
+            paged_verify_split_keys: self.paged_verify_split_keys,
             paged_verify_split_wmma: self.paged_verify_split_wmma.then_some(true),
             shexp_gate: self.shexp_gate.then_some(true),
             decode_fuse: self.decode_fuse.then_some(true),
@@ -1855,6 +1866,16 @@ fn mv_tile(value: &str) -> Result<u8, String> {
     match value.parse::<u8>() {
         Ok(nt @ (1 | 2 | 4)) => Ok(nt),
         _ => Err(format!("1, 2 or 4 token tiles, not {value}")),
+    }
+}
+
+/// `--paged-verify-split-keys`: a positive multiple of 64 (whole key blocks).
+fn parse_split_keys(value: &str) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(k) if k > 0 && k % 64 == 0 => Ok(k),
+        _ => Err(format!(
+            "a positive multiple of 64 keys (e.g. 16384), not {value}"
+        )),
     }
 }
 
