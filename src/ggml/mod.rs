@@ -36,7 +36,7 @@ pub use backend::{
 pub(crate) use context::cuda_device_of;
 pub use context::{
     ComputeAllocator, Context, Graph, KeptGraph, KeptParts, SharedAllocator, Tensor, TensorSlot,
-    mapped_tail_padding, set_fresh_plans,
+    mapped_tail_padding, set_fresh_plans, set_mul_mat_grid,
 };
 #[cfg(feature = "cuda")]
 pub(crate) use external::cuda::current_backend as current_cuda_backend;

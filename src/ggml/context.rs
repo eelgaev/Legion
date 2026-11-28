@@ -581,7 +581,28 @@ impl Context {
     // ---- operations (add more as model code needs them) ----
 
     /// `a @ b^T` in ggml terms: `a` is `[k, m]` (weights), `b` is `[k, n]`; result `[m, n]`.
+    ///
+    /// With [`set_mul_mat_grid`] on (`--prompt-step-grid-split`), a float weight's matmul of
+    /// more than a grid of columns that are not whole grid cells runs as two: the whole cells,
+    /// then the rest, so each call has the columns the grid-sized steps give it (cuBLAS picks
+    /// its algorithm from the exact column count).
     pub fn mul_mat<'a>(&'a self, a: Tensor<'a>, b: Tensor<'a>) -> Tensor<'a> {
+        let grid = MUL_MAT_GRID.load(std::sync::atomic::Ordering::Relaxed) as i64;
+        let (an, bn) = (a.ne(), b.ne());
+        let float = matches!(
+            a.ty(),
+            super::types::F32 | super::types::F16 | super::types::BF16
+        );
+        let flat = an[2] == 1 && an[3] == 1 && bn[2] == 1 && bn[3] == 1;
+        if grid > 0 && float && flat && bn[1] > grid && bn[1] % grid != 0 {
+            let head = bn[1] / grid * grid;
+            let nb1 = b.nb()[1];
+            let b0 = self.view_2d(b, [bn[0], head], nb1, 0);
+            let b1 = self.view_2d(b, [bn[0], bn[1] - head], nb1, head as usize * nb1);
+            let y0 = self.wrap(unsafe { ffi::ggml_mul_mat(self.raw(), a.raw(), b0.raw()) });
+            let y1 = self.wrap(unsafe { ffi::ggml_mul_mat(self.raw(), a.raw(), b1.raw()) });
+            return self.concat(y0, y1, 1);
+        }
         self.wrap(unsafe { ffi::ggml_mul_mat(self.raw(), a.raw(), b.raw()) })
     }
 
@@ -2016,6 +2037,17 @@ static FRESH_PLANS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// turns it on; off by default, where the plans (and so the bits) stay as they were.
 pub fn set_fresh_plans(on: bool) {
     FRESH_PLANS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The grid of [`set_mul_mat_grid`] (0: off).
+static MUL_MAT_GRID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Makes float-weight matmuls built from now on split their columns at the last whole cell of
+/// a grid of `grid` columns ([`Context::mul_mat`]; 0: off, the default). With
+/// `--prompt-step-grid-fold` a step holds whole grid cells and a prompt's last part; the split
+/// gives the last part's projections the column count they have in a step of their own.
+pub fn set_mul_mat_grid(grid: usize) {
+    MUL_MAT_GRID.store(grid, std::sync::atomic::Ordering::Relaxed);
 }
 
 // SAFETY: owned exclusively; moved between contexts, never shared.

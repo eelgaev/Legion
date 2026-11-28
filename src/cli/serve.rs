@@ -1349,6 +1349,11 @@ struct EngineArgs {
     /// 0 runs every such part alone.
     #[arg(long, value_name = "TOKENS")]
     prompt_step_grid_fold: Option<usize>,
+    /// Model engine, with --prompt-step-grid and its fold: a float-weight projection of a step
+    /// holding whole grid cells and a prompt's last part runs as two matmuls, the cells and the
+    /// part, so the part's columns get the GEMM a step of their own gives them. Off by default.
+    #[arg(long)]
+    prompt_step_grid_split: bool,
     /// Model engine: before taking requests, run one prompt of about this many tokens (greedy,
     /// one output token). A step larger than any before it grows its buffers: the step's compute
     /// buffer, ggml-cuda's pool and, under --tp-rank, the pinned exchange buffers (registered
@@ -2202,6 +2207,12 @@ pub async fn run(
             let prefill_chunk = e.prefill_chunk.unwrap_or_else(|| {
                 legion::engine::lm::default_prefill_chunk(device, integrated, max_batch_tokens)
             });
+            if e.prompt_step_grid_split {
+                let grid = e.prompt_step_grid.unwrap_or_else(|| {
+                    legion::engine::lm::default_prompt_grid(device, integrated, max_batch_tokens)
+                });
+                legion::ggml::set_mul_mat_grid(grid);
+            }
             let cfg = LmConfig {
                 model_path,
                 mmproj: e.model.mmproj.clone(),
