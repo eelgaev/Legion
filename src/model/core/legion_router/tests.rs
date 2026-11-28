@@ -100,17 +100,32 @@ fn fits_takes_bf16_routers_only() {
 }
 
 #[test]
+fn fits_weight_is_fits_without_the_activations() {
+    let ctx = Context::new(16, 0);
+    assert!(fits_weight(ctx.new_tensor(types::BF16, &[2560, 512])));
+    assert!(!fits_weight(ctx.new_tensor(types::F32, &[2560, 512])));
+    assert!(!fits_weight(ctx.new_tensor(types::BF16, &[96, 8])));
+    assert!(!fits_weight(ctx.new_tensor(types::BF16, &[2560, 512, 2])));
+    // Without CUDA no router takes the op, whatever its weight.
+    if !cfg!(feature = "cuda") {
+        assert!(!takes_weight(ctx.new_tensor(types::BF16, &[2560, 512])));
+    }
+}
+
+#[test]
 fn off_by_default() {
     let ctx = Context::new(16, 0);
     let w = ctx.new_tensor(types::BF16, &[2560, 512]);
     let x = ctx.new_tensor(types::F32, &[2560, 4096]);
     assert!(!on());
     assert!(!takes(w, x));
+    assert_eq!(weight_miss(w), Some("--legion-router is off"));
     set_legion_router(true);
     // Steps of up to 16 tokens keep their own kernels, and without CUDA nothing takes the op.
     assert!(!takes(w, ctx.new_tensor(types::F32, &[2560, 16])));
     if !cfg!(feature = "cuda") {
         assert!(!takes(w, x));
+        assert_eq!(weight_miss(w), Some("not a CUDA build"));
     }
     set_legion_router(false);
 }

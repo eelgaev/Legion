@@ -55,35 +55,62 @@ pub fn on() -> bool {
 /// that runs it ([`device_supported`]), the weight in that GPU's memory, [`fits`], and at least
 /// [`MIN_TOKENS`] tokens.
 pub fn takes(w: Tensor<'_>, x: Tensor<'_>) -> bool {
-    on() && cfg!(feature = "cuda")
-        && !w.is_host()
-        && !w.is_meta()
-        && x.ne()[1] >= MIN_TOKENS
-        && fits(w, x)
-        && device_supported()
+    takes_weight(w) && x.ne()[1] >= MIN_TOKENS && fits(w, x)
 }
 
-/// Whether the op computes `w @ x` for these: a BF16 matrix `w` (`[k_embd, n_expert]`, rows
-/// contiguous and 16-byte aligned, `k_embd` a multiple of 64) and an F32 `x` (`[k_embd, n]`,
-/// values contiguous, columns 16-byte aligned), 2-D both.
+/// Whether the router's BF16 copy `w` takes the op in the steps of [`MIN_TOKENS`] or more
+/// tokens ([`takes`] without the step's activations): switched on, a CUDA build on a GPU that
+/// runs it, the weight in that GPU's memory and [`fits_weight`].
+pub fn takes_weight(w: Tensor<'_>) -> bool {
+    weight_miss(w).is_none()
+}
+
+/// Why [`takes_weight`] refuses the router's BF16 copy `w`; `None` where it takes it.
+pub fn weight_miss(w: Tensor<'_>) -> Option<&'static str> {
+    if !on() {
+        Some("--legion-router is off")
+    } else if !cfg!(feature = "cuda") {
+        Some("not a CUDA build")
+    } else if w.is_host() {
+        Some("the copy is in host memory")
+    } else if w.is_meta() {
+        Some("the copy is split over GPUs")
+    } else if !fits_weight(w) {
+        Some("the copy's shape or layout")
+    } else if !device_supported() {
+        Some("the GPU does not run the kernel")
+    } else {
+        None
+    }
+}
+
+/// Whether the op computes `w @ x` for these: a BF16 matrix `w` ([`fits_weight`]) and an F32
+/// `x` (`[k_embd, n]`, values contiguous, columns 16-byte aligned), 2-D.
 pub fn fits(w: Tensor<'_>, x: Tensor<'_>) -> bool {
-    let [k_embd, _, w2, w3] = w.ne();
     let [xk, n, x2, x3] = x.ne();
-    let (wnb, xnb) = (w.nb(), x.nb());
-    w.ty() == types::BF16
+    let xnb = x.nb();
+    fits_weight(w)
         && x.ty() == types::F32
-        && w2 == 1
-        && w3 == 1
         && x2 == 1
         && x3 == 1
-        && xk == k_embd
-        && k_embd >= 64
-        && k_embd % 64 == 0
+        && xk == w.ne()[0]
         && n >= 1
-        && wnb[0] == 2
-        && wnb[1] % 16 == 0
         && xnb[0] == 4
         && xnb[1] % 16 == 0
+}
+
+/// Whether the op takes `w` as its weight: a 2-D BF16 matrix (`[k_embd, n_expert]`, rows
+/// contiguous and 16-byte aligned, `k_embd` a multiple of 64).
+pub fn fits_weight(w: Tensor<'_>) -> bool {
+    let [k_embd, _, w2, w3] = w.ne();
+    let wnb = w.nb();
+    w.ty() == types::BF16
+        && w2 == 1
+        && w3 == 1
+        && k_embd >= 64
+        && k_embd % 64 == 0
+        && wnb[0] == 2
+        && wnb[1] % 16 == 0
 }
 
 /// Whether the current GPU runs the op: compute capability 8.0 or newer (false without CUDA).

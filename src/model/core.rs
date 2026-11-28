@@ -103,7 +103,7 @@ pub mod stage_ops;
 pub use stable_fusions::set_stable_fusions;
 pub(crate) mod legion_router;
 pub mod route_rec;
-pub use legion_router::set_legion_router;
+pub use legion_router::{on as legion_router_on, set_legion_router};
 pub(crate) mod router_bf16;
 pub use router_bf16::set_router_bf16;
 pub(crate) mod router_mv;
@@ -2436,6 +2436,55 @@ impl Model {
     /// the caches are sized to the memory left.
     pub fn prepare_router_bf16(&self) {
         self.router_copies();
+    }
+
+    /// Whether every MoE router's logits in steps of [`legion_router::MIN_TOKENS`] or more
+    /// tokens come from Legion's kernel (`--legion-router`, #1183), as the MoE graph builder
+    /// picks it: a fused router, a plain router weight with a BF16 copy, and that copy taken by
+    /// the kernel ([`legion_router::takes_weight`]). False for a model without MoE routers. Its
+    /// logits are then the same bits in a step of any size, which lets `--prompt-step-grid`
+    /// fold a prompt's long last part into the step before it.
+    pub fn routers_on_legion_kernel(&self) -> bool {
+        self.legion_router_miss().is_none()
+    }
+
+    /// Why [`Self::routers_on_legion_kernel`] is false (the first router that misses the
+    /// kernel and why); `None` where it is true.
+    pub fn legion_router_miss(&self) -> Option<String> {
+        if !legion_router::on() {
+            return Some("--legion-router is off".into());
+        }
+        if self.hp.n_expert > fused::ROUTER_MAX_EXPERTS {
+            return Some(format!(
+                "{} experts, the fused router takes up to {}",
+                self.hp.n_expert,
+                fused::ROUTER_MAX_EXPERTS
+            ));
+        }
+        let layers: Vec<usize> = self
+            .weights
+            .tensors()
+            .chain(self.mtp.iter().flat_map(|m| m.tensors()))
+            .filter_map(|t| {
+                let name = t.name();
+                let il = name
+                    .strip_prefix("blk.")?
+                    .strip_suffix(router_bf16::ROUTER)?;
+                il.parse().ok()
+            })
+            .collect();
+        if layers.is_empty() {
+            return Some("no MoE routers".into());
+        }
+        layers.into_iter().find_map(|il| {
+            let Some(w) = self.plain_weight(il, "ffn_gate_inp.weight") else {
+                return Some(format!("layer {il}: the router is not a plain weight"));
+            };
+            let Some(b) = self.router_bf16(il, w) else {
+                return Some(format!("layer {il}: the router has no BF16 copy"));
+            };
+            legion_router::weight_miss(b).map(|why| format!("layer {il}: {why}"))
+        })
     }
 
     /// The routers' BF16 copies ([`Self::router_bf16`]), made on first use.
