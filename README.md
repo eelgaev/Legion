@@ -64,9 +64,10 @@ figures out the rest.
 | Qwen3.5 / 3.6, Nemotron-H | yes | BF16, FP8, NVFP4 |
 | DeepSeek4.1-Flash | yes | FP8 / MXFP4 (being tuned) |
 | Inkling-2-Mini (text) | unsloth UD-Q4_K_XL, both layouts | Thinking Machines NVFP4 |
+| Muse Glimmer 30B | unsloth UD-Q4_K_XL | — |
 
-**Status:** Qwen3.5 / 3.6 (dense and MoE), Qwen3.8-Flash-Next, Qwen3.8-27B, Gemma 4, GLM5.3-Flash and
-Nemotron-H serve on CUDA, on one or several GPUs, from GGUF or safetensors. DeepSeek4.1-Flash is
+**Status:** Qwen3.5 / 3.6 (dense and MoE), Qwen3.8-Flash-Next, Qwen3.8-27B, Gemma 4, GLM5.3-Flash,
+Nemotron-H and Muse Glimmer serve on CUDA, on one or several GPUs, from GGUF or safetensors. DeepSeek4.1-Flash is
 being tuned.
 
 ## Performance
@@ -208,6 +209,14 @@ off. llama.cpp runs across two DGX Sparks with its RPC backend (layer split).
 | Legion | [UD-Q4_K_XL GGUF](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) | MTP k=2 ¹³ | **39-44** | **42.7** | 55.4 | **1,198** | **1,171** | 1,120 |
 | llama.cpp b12062 | UD-Q4_K_XL GGUF | MTP n=2 ¹⁵ | 3-4 | 3.4 | — | 25 | — | — |
 
+### Muse Glimmer 30B
+
+#### DGX Spark
+
+| Engine | Weights | Drafting | Decode, 1 user | 4 users | 16 users | Prefill 8K | 32K | 123K |
+|---|---|---|--:|--:|--:|--:|--:|--:|
+| Legion | [UD-Q4_K_XL GGUF](https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF) | none | 13.0 | 50.8 | 157.4 | 927 | 890 | 776 ²⁰ |
+
 ¹ No drafting: llama.cpp b12062 aborts with the MTP drafter on this model. 123K did not finish in 20 minutes.
 
 ² The checkpoint's own MTP head, with the output-moving opt-ins `--spec-gate-cost-model off`, `--nvfp4-expert-rows-bf16` and `--hc-bf16` (see the run command; decode from a 2026-11-12 run, prefill rerun on 2026-11-26; on 2026-11-12, prefill without the last two: 2,146, 2,205, 2,071).
@@ -254,7 +263,10 @@ right after the load, not the fixed benchmark prompts; prefill is one request ea
 ¹⁹ Tensor parallel over one QSFP link, with output-moving opt-in flags (see the run command). 123K was not measured
 for either engine: the prompt takes both Sparks above 80 C within a minute.
 
-Measured 2026-10-20 to 2026-11-21. Each new speed record is added here.
+²⁰ The 123K prompt is 126,094 Muse tokens (8K: 8,466, 32K: 33,672). One round of the deterministic client; no
+llama.cpp row yet.
+
+Measured 2026-10-20 to 2026-11-28. Each new speed record is added here.
 
 ## Roadmap
 
@@ -294,6 +306,7 @@ The exact `legion serve` command behind every row of the tables, and how it was 
 - [Gemma 4 31B NVFP4 (RedHatAI), 1x Spark](docs/run/spark/gemma-4-31b-nvfp4-1x.md)
 - [Gemma 4 31B NVFP4 (RedHatAI), 2x Spark (tensor parallel)](docs/run/spark/gemma-4-31b-nvfp4-2x-tp.md)
 - [Inkling-2-Mini UD-Q4_K_XL and NVFP4, 1x Spark](docs/run/spark/inkling-2-mini-1x.md)
+- [Muse Glimmer 30B UD-Q4_K_XL, 1x Spark](docs/run/spark/muse-glimmer-1x.md)
 
 **IBM AC922**
 
