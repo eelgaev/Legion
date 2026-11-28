@@ -992,10 +992,13 @@ fn cpu_q40_geglu_pair_is_the_matmuls_and_quantize_geglu() {
     let ctx = Context::new(32, 32);
     let gate = ctx.new_tensor(types::Q4_0, &[k, rows]).as_input();
     let up = ctx.new_tensor(types::Q4_0, &[k, rows]).as_input();
-    let x = ctx.new_tensor(types::F32, &[k, n]).as_input();
-    let xq = quantize(&ctx, x);
-    let g = mul_mat_q(&ctx, gate, xq, n);
-    let u = mul_mat_q(&ctx, up, xq, n);
+    // Every node is an output, so the allocator frees none and `got` (allocated last) cannot
+    // take a freed node's memory, such as `x`'s after `xq`: the 0xAA prefill below reaches
+    // `got` only, not the input both paths quantize.
+    let x = ctx.new_tensor(types::F32, &[k, n]).as_input().as_output();
+    let xq = quantize(&ctx, x).as_output();
+    let g = mul_mat_q(&ctx, gate, xq, n).as_output();
+    let u = mul_mat_q(&ctx, up, xq, n).as_output();
     let want = quantize_geglu(&ctx, g, u, false).as_output();
     let got = mul_mat_geglu_q(&ctx, gate, up, xq, n).as_output();
     let mut graph = ctx.new_graph(32);
@@ -1007,9 +1010,17 @@ fn cpu_q40_geglu_pair_is_the_matmuls_and_quantize_geglu() {
         .unwrap();
     gate.set_bytes(&q4_0_matrix(k as usize, rows as usize, 61));
     up.set_bytes(&q4_0_matrix(k as usize, rows as usize, 62));
-    x.set_f32(&input(k as usize, n as usize, 63));
+    let xv = input(k as usize, n as usize, 63);
+    x.set_f32(&xv);
     got.set_bytes(&vec![0xAA; got.nbytes()]);
     backend.compute(&graph).unwrap();
+    assert!(
+        x.to_f32()
+            .iter()
+            .zip(&xv)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "the prefill reached the input"
+    );
     assert_eq!(got.ne()[0] as usize, quant_bytes(rows, n));
     let (a, b) = (want.bytes(), got.bytes());
     assert_eq!(quant_cols_differ(&a, &b, rows as usize, n as usize), 0);
