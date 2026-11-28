@@ -27,7 +27,11 @@
 //! (fewer columns) stay on ggml's MMVQ / MMQ. Consecutive op nodes on the same input quantize it
 //! once ([`quant_run`]). A GeGLU FFN's gate and up matmuls run as one kernel whose epilogue
 //! writes the GeGLU's quantization for the down matmul ([`mul_mat_geglu_q`]), the bytes of the
-//! two matmuls' F32 outputs through [`quantize_geglu`]. The CPU implementation is a reference for the tests: the same sums
+//! two matmuls' F32 outputs through [`quantize_geglu`]. With `legion serve --q40-repack` the
+//! load makes a copy of each weight the op takes ([`repack_weights`]) in which a tile's 32-row
+//! units are one contiguous 2304-byte chunk a K step (the same quants and scales, moved), and
+//! the op and the pair read those: one 16-byte copy per 16 bytes, no strided rows, the same
+//! bits. Every other reader keeps the weight as loaded. The CPU implementation is a reference for the tests: the same sums
 //! (scalar `mul_add`), not necessarily the GPU's bits (the GPU's division and reciprocal of the
 //! quantization are fast-math ones).
 
@@ -916,7 +920,7 @@ mod cuda {
     }
 
     /// Most matmuls the shared-memory cache covers.
-    const KERNELS: usize = 12;
+    const KERNELS: usize = 8;
 
     unsafe extern "C" {
         /// The first of `legion_q40_mm_table_len` entries.
