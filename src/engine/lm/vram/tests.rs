@@ -137,7 +137,8 @@ fn mtp_gate_ends_at_8_only_on_a_two_v100_split_with_the_cache() {
     assert_eq!(until(true, false, false, true, 2, false, 8), None);
     assert_eq!(until(true, false, true, false, 2, false, 8), None);
     assert_eq!(until(true, false, true, true, 1, false, 8), None);
-    assert_eq!(until(true, false, true, true, 4, false, 8), None);
+    assert_eq!(until(true, false, true, true, 4, false, 8), Some(8));
+    assert_eq!(until(true, false, true, true, 3, false, 8), None);
     assert_eq!(until(true, false, true, true, 2, true, 8), None);
 }
 
