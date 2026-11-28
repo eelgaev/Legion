@@ -155,6 +155,9 @@ pub struct Switches {
     /// MoE routers read from their BF16 copies where exact
     /// ([`crate::model::core::set_router_bf16`]).
     pub router_bf16: Option<bool>,
+    /// MoE routers' logits of 17+ token steps in Legion's kernel
+    /// ([`crate::model::core::set_legion_router`]).
+    pub legion_router: Option<bool>,
     /// Late n-gram rows' reads issued by the step's fill
     /// ([`crate::model::qwen4::set_ple_early_reads`]).
     pub ple_early_reads: Option<bool>,
@@ -680,6 +683,7 @@ impl Switches {
         set(self.mvf_ab, core::set_mvf_ab);
         set(self.router_join, core::set_router_join);
         set(self.router_bf16, core::set_router_bf16);
+        set(self.legion_router, core::set_legion_router);
         set(
             self.ple_early_reads,
             crate::model::qwen4::set_ple_early_reads,
