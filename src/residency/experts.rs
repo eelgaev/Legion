@@ -5116,6 +5116,17 @@ fn share_setup(
         tracing::warn!("--cpu-expert-share auto is the exact share (x86) only; the share is off");
         return Ok(0);
     }
+    // A layer left to the GPU: a warning when the share was asked for, a debug line when it is
+    // the default's (no `--cpu-expert-share`).
+    macro_rules! left_to_gpu {
+        ($($arg:tt)*) => {
+            if cfg.cpu_share.unset {
+                tracing::debug!($($arg)*)
+            } else {
+                tracing::warn!($($arg)*)
+            }
+        };
+    }
     let mut plans: Vec<DevicePlan> = Vec::new();
     for (il, f) in found.iter().enumerate() {
         let Some((p, ts)) = f else { continue };
@@ -5124,7 +5135,7 @@ fn share_setup(
         }
         let Some(device) = p.cuda else { continue };
         let (Some(up_gate), Some(down)) = (format_of(ts[1].ty()), format_of(ts[2].ty())) else {
-            tracing::warn!(
+            left_to_gpu!(
                 layer = il,
                 "cpu expert share: unsupported expert type, layer left to the GPU"
             );
@@ -5157,7 +5168,7 @@ fn share_setup(
         if let Some(h) = &me.host
             && ts.iter().any(|t| t.ne()[2] as usize != h.slots())
         {
-            tracing::warn!(
+            left_to_gpu!(
                 layer = il,
                 "cpu expert share: the host tier's RAM slots do not match, layer left to the GPU"
             );
@@ -5170,7 +5181,7 @@ fn share_setup(
                 || !he.n_embd.is_multiple_of(256)
                 || !he.n_ff.is_multiple_of(32))
         {
-            tracing::warn!(
+            left_to_gpu!(
                 layer = il,
                 "cpu expert share: no exact host kernels for the experts, layer left to the GPU"
             );

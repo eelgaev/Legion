@@ -323,6 +323,30 @@ pub fn host_tier_applies(
         && crate::residency::host_tier::sources(gguf, hp.n_layer, hp.n_expert as usize).is_some())
 }
 
+/// The row cache the n-gram table keeps beside the tier, as the loader will open it: an
+/// explicit `--ngram-ram` size (capped at the table), a cache size already set, else the bounded
+/// tier's default ([`crate::residency::host_tier::bounded_table_cache`]). `--ngram-ram all`
+/// counts the whole table.
+pub(crate) fn table_cache(
+    ram: crate::residency::lookup_table::RamBudget,
+    ram_cache_bytes: Option<u64>,
+    table: u64,
+    available: u64,
+) -> u64 {
+    use crate::residency::lookup_table::RamBudget;
+    match ram {
+        RamBudget::Auto => {
+            ram_cache_bytes.unwrap_or_else(crate::residency::host_tier::bounded_table_cache)
+        }
+        RamBudget::All => table,
+        _ => ram
+            .bytes(available)
+            .map_or_else(crate::residency::host_tier::bounded_table_cache, |b| {
+                b.min(table)
+            }),
+    }
+}
+
 /// The bounded host tier's plan when it applies to this load: [`host_tier_wanted`], and the
 /// routed experts do not fit in the host memory there is beside the n-gram table and the KV
 /// host tier ([`crate::residency::host_tier::size`]). `None`: the load is as before.
@@ -349,6 +373,12 @@ pub fn host_tier_plan(
         .flatten()
         .map(|t| Table {
             bytes: t.bytes(),
+            cache: table_cache(
+                cfg.ngram.ram,
+                cfg.ngram.ram_cache_bytes,
+                t.bytes(),
+                crate::residency::lookup_table::MemInfo::read().available,
+            ),
             in_ram: matches!(cfg.ngram.io, TableIo::Ram | TableIo::Mmap),
             direct: cfg.ngram.io == TableIo::Direct,
         });

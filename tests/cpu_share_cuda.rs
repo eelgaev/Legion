@@ -86,6 +86,7 @@ fn host_share_matches_the_gpu() {
         auto: false,
         workers: 4,
         smt: 2,
+        unset: false,
     };
     setup(
         &cfg,
