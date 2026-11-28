@@ -22,6 +22,29 @@ fn residency(argv: &[&str]) -> ResidencyConfig {
 }
 
 #[test]
+fn cpu_expert_share_flag() {
+    // Not given: the load picks it from the run's GPUs (`CpuShareConfig::resolved`).
+    let c = residency(&[]).cpu_share;
+    assert!(c.unset);
+    assert_eq!((c.share, c.auto), (0.0, false));
+    assert!(!ResidencyConfig::default().cpu_share.unset);
+    // An explicit off stays off.
+    let c = residency(&["--cpu-expert-share", "0"]).cpu_share;
+    assert!(!c.unset);
+    assert_eq!((c.share, c.auto), (0.0, false));
+    assert_eq!(c.resolved(1), c);
+    let c = residency(&["--cpu-expert-share", "auto"]).cpu_share;
+    assert!(!c.unset);
+    assert_eq!((c.share, c.auto), (1.0, true));
+    let c = residency(&["--cpu-expert-share", "0.5"]).cpu_share;
+    assert_eq!((c.share, c.auto, c.unset), (0.5, false, false));
+    for bad in ["-0.1", "1.5", "on"] {
+        let argv = ["legion", "serve", "--cpu-expert-share", bad];
+        assert!(Cli::try_parse_from(argv).is_err(), "{bad}");
+    }
+}
+
+#[test]
 fn expert_heat_pass_cap_flag() {
     assert_eq!(residency(&[]).heat_pass_cap, 0.0);
     assert_eq!(ResidencyConfig::default().heat_pass_cap, 0.0);

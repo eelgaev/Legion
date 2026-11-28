@@ -369,19 +369,21 @@ pub(super) struct ModelArgs {
     /// the same outputs. At several sequences it also folds different users' routings.
     #[arg(long, value_name = "ROUTINGS", value_parser = non_negative, default_value_t = 0.0)]
     pub expert_heat_pass_cap: f32,
-    /// Hybrid decode (opt-in, CUDA; decode and verify steps of up to 8 tokens): the host
-    /// computes this share of each MoE layer's missed experts (those read from host memory) on
-    /// a pinned worker pool per NUMA node while the GPU computes the rest, cutting the bytes the
-    /// GPU reads over the link. 0 (the default) is off. POWER9: changes outputs slightly (the
-    /// host kernels sum in another order than the GPU's). x86 with AVX2, FMA and F16C: the
-    /// same outputs (the host computes the GPU kernels' bits; the activations' quantization
-    /// and SwiGLU stay on the GPU), and `auto` starts each layer's share from the link's and the
-    /// pool's measured time per expert, then moves it toward whichever of the GPU and the pool
-    /// waited. Ignored elsewhere. With the bounded host tier (part of the experts in RAM) the
-    /// host takes only misses held in RAM; those read from disk stay on the GPU. From
-    /// Strata-AC922's POWER9 CPU expert share (`--pcie-frac`).
-    #[arg(long, value_name = "SHARE|auto", value_parser = share_arg, default_value = "0")]
-    pub cpu_expert_share: ShareArg,
+    /// Hybrid decode (CUDA; decode and verify steps of up to 8 tokens): the host computes this
+    /// share of each MoE layer's missed experts (those read from host memory) on a pinned
+    /// worker pool per NUMA node while the GPU computes the rest, cutting the bytes the GPU
+    /// reads over the link. 0 is off. POWER9: changes outputs slightly (the host kernels sum in
+    /// another order than the GPU's). x86 with AVX2, FMA and F16C: the same outputs (the host
+    /// computes the GPU kernels' bits; the activations' quantization and SwiGLU stay on the
+    /// GPU), and `auto` starts each layer's share from the link's and the pool's measured time
+    /// per expert, then moves it toward whichever of the GPU and the pool waited. Ignored
+    /// elsewhere. With the bounded host tier (part of the experts in RAM) the host takes only
+    /// misses held in RAM; those read from disk stay on the GPU. Default: `auto` on such an x86
+    /// host when the model runs on one CUDA GPU (it only acts when experts live in host
+    /// memory), 0 elsewhere (POWER9, the GB10, several GPUs). From Strata-AC922's POWER9 CPU
+    /// expert share (`--pcie-frac`).
+    #[arg(long, value_name = "SHARE|auto", value_parser = share_arg)]
+    pub cpu_expert_share: Option<ShareArg>,
     /// Worker threads of each NUMA node's `--cpu-expert-share` pool (0: `--cpu-expert-smt`
     /// per core of the node, less two cores left to the engine's threads).
     #[arg(long, default_value_t = 0)]
@@ -1143,10 +1145,12 @@ impl ModelArgs {
             stage_below: None,
             learn_long: !self.no_prefill_learn,
             cpu_share: legion::residency::cpu_share::CpuShareConfig {
-                share: self.cpu_expert_share.share,
-                auto: self.cpu_expert_share.auto,
+                share: self.cpu_expert_share.map_or(0.0, |s| s.share),
+                auto: self.cpu_expert_share.is_some_and(|s| s.auto),
                 workers: self.cpu_expert_workers,
                 smt: self.cpu_expert_smt as usize,
+                // Picked at load from the run's GPUs (`CpuShareConfig::resolved`).
+                unset: self.cpu_expert_share.is_none(),
             },
             ssd: SsdArgs {
                 mode: self.expert_ssd,

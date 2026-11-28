@@ -198,10 +198,27 @@ pub(crate) fn margin(total: u64) -> u64 {
 /// The direct n-gram tier's row cache at most ([`super::lookup_table`]'s default cap).
 const TABLE_CACHE: u64 = 4 << 30;
 
+/// The direct n-gram tier's row cache beside a bounded tier: the RAM slots are worth more. With
+/// one RTX 4090 at 32 GB (#37) 1 GiB instead of [`TABLE_CACHE`] gave 22 more slots a layer and
+/// +10% decode, +6-8% prefill; the table's cache hit rate did not change (83%).
+const BOUNDED_TABLE_CACHE: u64 = 1 << 30;
+
+/// The direct n-gram tier's row cache beside a bounded tier ([`Table::cache`]):
+/// [`BOUNDED_TABLE_CACHE`], or `LEGION_DEBUG_TIER_NGRAM_MIB` (A/B runs, `docs/debug-env.md`).
+pub fn bounded_table_cache() -> u64 {
+    std::env::var("LEGION_DEBUG_TIER_NGRAM_MIB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(BOUNDED_TABLE_CACHE, |mib| mib << 20)
+}
+
 /// The n-gram table beside the experts, for [`size`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Table {
     pub bytes: u64,
+    /// The row cache a direct table keeps beside a bounded tier ([`bounded_table_cache`]);
+    /// whether the experts fit whole is decided with [`TABLE_CACHE`] all the same.
+    pub cache: u64,
     /// `--ngram-io ram` or `mmap`: the table is in RAM whole whatever the experts get.
     pub in_ram: bool,
     /// `--ngram-io direct`: never in RAM whole.
@@ -271,6 +288,14 @@ pub fn size(
     if room >= all + table_min {
         return Sizing::Whole;
     }
+    // Beside a bounded tier a direct table keeps the row cache it is given ([`Table::cache`]).
+    let table_min = table.map_or(0, |t| {
+        if t.in_ram {
+            t.bytes
+        } else {
+            t.cache.min(t.bytes)
+        }
+    });
     // The most slots that fit with the staging they leave to do ([`stage_sets`]).
     let left = room.saturating_sub(table_min);
     let stage = |slots: usize| {

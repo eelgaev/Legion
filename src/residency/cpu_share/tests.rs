@@ -9,6 +9,37 @@ use crate::cpu::QuantFormat;
 use crate::ggml::{self, types};
 
 #[test]
+fn default_share_is_auto_with_one_cuda_gpu_on_an_exact_host() {
+    assert!(default_auto(true, 1));
+    // No GPU, several GPUs (or tensor parallelism), or a host without the exact kernels
+    // (POWER9, the GB10, an x86 without AVX2/FMA/F16C): off.
+    for (exact, gpus) in [(true, 0), (true, 2), (true, 4), (false, 1), (false, 0)] {
+        assert!(!default_auto(exact, gpus), "{exact} {gpus}");
+    }
+    let unset = CpuShareConfig {
+        unset: true,
+        ..Default::default()
+    };
+    let exact_host = cfg!(target_arch = "x86_64") && crate::cpu::gpu_exact::simd();
+    let one = unset.resolved(1);
+    assert_eq!((one.auto, one.share), (exact_host, f32::from(exact_host)));
+    assert!(one.unset, "the pick stays marked as the default's");
+    for gpus in [0, 2] {
+        let off = unset.resolved(gpus);
+        assert_eq!((off.auto, off.share), (false, 0.0), "{gpus}");
+    }
+    // A share given on the command line is kept, whatever the GPUs.
+    let off = CpuShareConfig::default();
+    assert_eq!(off.resolved(1), off);
+    let auto = CpuShareConfig {
+        share: 1.0,
+        auto: true,
+        ..Default::default()
+    };
+    assert_eq!(auto.resolved(2), auto);
+}
+
+#[test]
 fn threshold_and_dither() {
     assert_eq!(threshold(0.0), 0);
     assert_eq!(threshold(1.0), THRESHOLD_ONE);

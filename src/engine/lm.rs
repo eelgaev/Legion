@@ -3495,6 +3495,24 @@ fn build_expert_cache(
     // a margin and the reserve, less what the cache leaves free (the step graphs a lend drops
     // among it).
     let mut cfg = cfg.clone();
+    // No `--cpu-expert-share`: `auto` on an x86 host with one CUDA GPU, else off (#37,
+    // [`crate::residency::cpu_share::default_auto`]).
+    #[cfg(feature = "cuda")]
+    let cuda_gpus = layout_gpus(layout)
+        .filter_map(cuda_index)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    #[cfg(not(feature = "cuda"))]
+    let cuda_gpus = 0;
+    if cfg.cpu_share.unset {
+        cfg.cpu_share = cfg.cpu_share.resolved(cuda_gpus);
+        tracing::debug!(
+            cuda_gpus,
+            share = cfg.cpu_share.share,
+            auto = cfg.cpu_share.auto,
+            "cpu expert share: the default for this run"
+        );
+    }
     // The MTP head (layer n_layer) takes long prompts in as K/V only: no staging.
     cfg.stage_below = Some(hp.n_layer);
     if cfg.lend_keep.is_empty() && !long.is_empty() {
@@ -4211,6 +4229,15 @@ impl LmEngine {
             // The RAM is the experts': the n-gram table stays on the SSD.
             if cfg.ngram.io == crate::residency::lookup_table::TableIo::Auto {
                 cfg.ngram.io = crate::residency::lookup_table::TableIo::Direct;
+            }
+            // The direct table's row cache is the share the tier left it (without `--ngram-ram`,
+            // [`crate::residency::host_tier::bounded_table_cache`]).
+            if cfg.ngram.io == crate::residency::lookup_table::TableIo::Direct
+                && cfg.ngram.ram == crate::residency::lookup_table::RamBudget::Auto
+                && cfg.ngram.ram_cache_bytes.is_none()
+                && let Some(t) = &host_tier
+            {
+                cfg.ngram.ram_cache_bytes = Some(t.plan.table);
             }
             // Prompts lend the VRAM cache and run as staged passes
             // ([`crate::residency::host_tier`]), shorter ones than elsewhere: a chunk of an

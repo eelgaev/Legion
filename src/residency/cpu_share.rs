@@ -1,8 +1,9 @@
 //! Hybrid decode (#268): the host computes a share of each MoE layer's host-resident experts
 //! (the cache's misses, whose bytes otherwise cross the link to the GPU) on its own cores while
-//! the GPU computes the rest. Opt-in (`--cpu-expert-share`): the host kernels (`crate::cpu`)
-//! sum in another order than the GPU's, so outputs change; with the share at 0 nothing here
-//! runs and the graph is unchanged. CUDA only (the GPU must read host memory coherently); steps
+//! the GPU computes the rest (`--cpu-expert-share`). POWER9 (opt-in): the host kernels
+//! (`crate::cpu`) sum in another order than the GPU's, so outputs change. x86 with AVX2, FMA
+//! and F16C: the exact share (the GPU kernels' bits), `auto` by default with one CUDA GPU
+//! ([`default_auto`]). With the share at 0 nothing here runs and the graph is unchanged. CUDA only (the GPU must read host memory coherently); steps
 //! of at most [`ops::MAX_TOKENS`] tokens (decode and MTP verify steps).
 //!
 //! Adapted from Strata-AC922's POWER9 CPU expert share (eelgaev/Strata-AC922 bd1a96d, 1c9c0ba,
@@ -234,6 +235,10 @@ pub struct CpuShareConfig {
     /// Hardware threads per core the pool uses (POWER9: SMT2 gave 1.95x one thread's kernel
     /// throughput in Strata-AC922).
     pub smt: usize,
+    /// No `--cpu-expert-share` was given: the load picks [`Self::share`] and [`Self::auto`]
+    /// from the run's GPUs ([`Self::resolved`]), and a layer the share cannot take is left to
+    /// the GPU without a warning.
+    pub unset: bool,
 }
 
 /// Cores of each node the pool leaves to the engine thread, the stages' launch threads and
@@ -247,8 +252,37 @@ impl Default for CpuShareConfig {
             auto: false,
             workers: 0,
             smt: 2,
+            unset: false,
         }
     }
+}
+
+impl CpuShareConfig {
+    /// The share of a run without `--cpu-expert-share` ([`Self::unset`]), on `cuda_gpus` CUDA
+    /// GPUs: `auto` where [`default_auto`] says so, else off. A share given stays as it is.
+    pub fn resolved(self, cuda_gpus: usize) -> Self {
+        if !self.unset {
+            return self;
+        }
+        let exact_host = cfg!(target_arch = "x86_64") && crate::cpu::gpu_exact::simd();
+        let on = default_auto(exact_host, cuda_gpus);
+        Self {
+            share: if on { 1.0 } else { 0.0 },
+            auto: on,
+            ..self
+        }
+    }
+}
+
+/// Whether a run without `--cpu-expert-share` gets `auto`: on a host with the exact share's
+/// kernels (`exact_host`: x86 with AVX2, FMA and F16C) when the model runs on one CUDA GPU.
+/// There the share keeps the outputs (the GPU kernels' bits) and was measured on one RTX 4090
+/// with the experts in RAM: +11-12 tok/s decode at 128 GB, +7-8 at 64 GB, prefill unchanged
+/// (#37). Elsewhere it stays off: POWER9's share moves outputs, and several GPUs (or tensor
+/// parallelism) were not measured. It only acts on experts held in host memory, so a model
+/// whose experts all fit in VRAM runs as without it.
+pub fn default_auto(exact_host: bool, cuda_gpus: usize) -> bool {
+    exact_host && cuda_gpus == 1
 }
 
 /// A step's sequence numbers, per device: `publish` takes the next one, `collect` waits for the

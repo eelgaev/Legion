@@ -349,6 +349,7 @@ pub fn host_tier_plan(
         .flatten()
         .map(|t| Table {
             bytes: t.bytes(),
+            cache: host_tier::bounded_table_cache(),
             in_ram: matches!(cfg.ngram.io, TableIo::Ram | TableIo::Mmap),
             direct: cfg.ngram.io == TableIo::Direct,
         });
