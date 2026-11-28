@@ -126,16 +126,22 @@ impl Sampler {
             let inv = 1.0 / p.temperature;
             logits.iter_mut().for_each(|l| *l *= inv);
         }
-        let candidates = self.candidates(logits);
-        let total: f64 = candidates.iter().map(|&(_, p)| p).sum();
-        let mut r = self.rng.next_f64() * total;
-        for &(id, p) in &candidates {
-            if r < p {
-                return id;
-            }
-            r -= p;
+        // The filters do not use the RNG, so drawing first takes the same number.
+        let u = self.rng.next_f64();
+        if self.whole_vocab(logits.len())
+            && let Some(id) = draw_whole_vocab(logits, u)
+        {
+            return id;
         }
-        candidates.last().expect("at least one candidate").0
+        draw(&self.candidates(logits), u)
+    }
+
+    /// Whether [`Self::candidates`] keeps every token (no top-k below the vocabulary, top-p 1,
+    /// no min-p: the API's defaults), sorted. A NaN parameter stays on the general path.
+    fn whole_vocab(&self, n: usize) -> bool {
+        let p = &self.params;
+        let k = p.top_k as usize;
+        (k == 0 || k >= n) && p.min_p <= 0.0 && p.top_p >= 1.0
     }
 
     /// The distribution [`Self::sample`] draws from, for speculative acceptance: penalties
@@ -344,6 +350,84 @@ fn top_p_candidates(logits: &[f32], top_p: f64) -> Option<Vec<(u32, f64)>> {
     }
     None
 }
+
+/// The draw of [`Sampler::sample`]: `u` (uniform in `[0, 1)`) times the candidates' total,
+/// walked down the candidates, most likely first.
+fn draw(candidates: &[(u32, f64)], u: f64) -> u32 {
+    let total: f64 = candidates.iter().map(|&(_, p)| p).sum();
+    let mut r = u * total;
+    for &(id, p) in candidates {
+        if r < p {
+            return id;
+        }
+        r -= p;
+    }
+    candidates.last().expect("at least one candidate").0
+}
+
+/// [`draw`] over the whole sorted vocabulary ([`Sampler::whole_vocab`]) without sorting it and
+/// without libm's `exp` of every logit, which cost ~9 ms per token for a 248K-token row on an
+/// Ivy Bridge Xeon (the general path: a radix sort of all ids and 248K `exp` calls).
+///
+/// The draw only reads the total and the sorted head that the walk passes. The total is
+/// [`approx_exp_sum`]'s estimate, within [`TOTAL_SLACK`] of the general path's sum, so the
+/// general path's `r = u * total` lies in `[lo, hi]`. The walk's steps (`r < p`, then `r -= p`)
+/// are monotone in `r`, so walking `lo` and `hi` together brackets the general path's `r` at
+/// every step: where `hi < p`, both ends (and so the general path) stop at that token; where
+/// only `lo < p`, the bracket straddles it and the general path decides (`None`).
+///
+/// The walk goes down bands of logits, `[max - cut, max - previous cut)` for the cuts of
+/// [`WHOLE_VOCAB_CUTS`], each sorted by [`sort_by_logit`] (larger first, ties by token id): one
+/// after the other they are the general path's order, with the same `p` per token. Most draws
+/// end in the first band of a few to a few thousand tokens. A walk that runs past the last band,
+/// a NaN or a row with no finite logit also go to the general path. The same token for the
+/// same `u`.
+fn draw_whole_vocab(logits: &[f32], u: f64) -> Option<u32> {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    if !max.is_finite() {
+        return None;
+    }
+    let total = approx_exp_sum(logits, max);
+    if !total.is_finite() {
+        return None;
+    }
+    let mut lo = u * (total * (1.0 - 2.0 * TOTAL_SLACK));
+    let mut hi = u * (total * (1.0 + 2.0 * TOTAL_SLACK));
+    let mut upper = f32::INFINITY;
+    let mut ids: Vec<u32> = Vec::new();
+    for cut in WHOLE_VOCAB_CUTS {
+        let floor = (max - cut) as f32;
+        ids.clear();
+        for (c, chunk) in logits.chunks(SCAN_CHUNK).enumerate() {
+            if all_below(chunk, floor) {
+                continue;
+            }
+            for (j, &l) in chunk.iter().enumerate() {
+                if l >= floor && l < upper {
+                    ids.push((c * SCAN_CHUNK + j) as u32);
+                }
+            }
+        }
+        sort_by_logit(&mut ids, logits);
+        for &id in &ids {
+            let p = (logits[id as usize] as f64 - max).exp();
+            if hi < p {
+                return Some(id);
+            }
+            if lo < p {
+                return None;
+            }
+            lo -= p;
+            hi -= p;
+        }
+        upper = floor;
+    }
+    None
+}
+
+/// The bands of [`draw_whole_vocab`]'s walk: distances below the best logit, the last one
+/// taking every logit left.
+const WHOLE_VOCAB_CUTS: [f64; 5] = [4.0, 8.0, 12.0, 20.0, f64::INFINITY];
 
 /// How far [`approx_exp_sum`] may be from the sequential libm sum of the general top-p path,
 /// relative: its `exp` is within 3e-13 of libm's, and the two orders of summation add at most

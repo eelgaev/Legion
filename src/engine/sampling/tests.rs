@@ -486,3 +486,131 @@ fn top_p_fast_path_edge_rows() {
     let all_masked = vec![f32::NEG_INFINITY; 100];
     assert!(top_p_candidates(&all_masked, 0.5).is_none());
 }
+
+/// Uniform draws to check a row at: random ones plus the ends of `[0, 1)`.
+fn draws(rng: &mut Rng, n: usize) -> Vec<f64> {
+    let mut u: Vec<f64> = (0..n).map(|_| rng.next_f64()).collect();
+    u.extend([0.0, 1e-300, 0.5, 1.0 - f64::EPSILON / 2.0]);
+    u
+}
+
+/// The whole-vocabulary draw picks the general path's token for every `u` it decides, over
+/// peaked and flat rows, tempered as `sample` tempers them, and decides almost every draw.
+#[test]
+fn whole_vocab_draw_matches_the_general_path() {
+    let mut rng = Rng::new(1214);
+    let s = Sampler::new(&params(1.0));
+    let (mut n_draws, mut fast) = (0, 0);
+    for n in [1usize, 2, 40, 3_000, 30_000] {
+        for (sd, peaks) in [(3.0, 1), (3.0, 4), (2.5, 30), (1.0, 0), (0.3, 0), (6.0, 2)] {
+            let base = row(&mut rng, n, sd, peaks);
+            for temperature in [0.6f32, 1.0, 1.7] {
+                let inv = 1.0 / temperature;
+                let logits: Vec<f32> = base.iter().map(|&l| l * inv).collect();
+                let candidates = s.general_candidates(&logits);
+                for u in draws(&mut rng, 40) {
+                    let want = draw(&candidates, u);
+                    if let Some(got) = draw_whole_vocab(&logits, u) {
+                        assert_eq!(got, want, "n {n} sd {sd} T {temperature} u {u}");
+                        fast += 1;
+                    }
+                    n_draws += 1;
+                }
+            }
+        }
+    }
+    // The last draw of each row (just below 1) may run past the last band.
+    assert!(
+        fast * 100 >= n_draws * 95,
+        "{fast} of {n_draws} draws on the fast path"
+    );
+}
+
+/// `sample` with the API's defaults (and a top-k of the whole vocabulary) draws the tokens it
+/// drew before the whole-vocabulary path: the general candidates and one draw per token.
+#[test]
+fn whole_vocab_sampling_keeps_its_tokens() {
+    let mut rng = Rng::new(41);
+    let base = row(&mut rng, 20_000, 2.5, 3);
+    for (seed, temperature, top_k) in [(1, 0.6f32, 0), (2, 1.0, 0), (3, 0.6, 20_000), (4, 1.3, 0)] {
+        let p = SamplingParams {
+            seed: Some(seed),
+            top_k,
+            ..params(temperature)
+        };
+        let mut s = Sampler::new(&p);
+        assert!(s.whole_vocab(base.len()));
+        let mut old = Rng::new(seed);
+        for step in 0..200 {
+            // A different row each step: shift some logits.
+            let mut logits = base.clone();
+            logits[step * 97 % base.len()] += 9.0;
+            let mut tempered = logits.clone();
+            if temperature != 1.0 {
+                let inv = 1.0 / temperature;
+                tempered.iter_mut().for_each(|l| *l *= inv);
+            }
+            let want = draw(&s.general_candidates(&tempered), old.next_f64());
+            assert_eq!(s.sample(&mut logits), want, "seed {seed} step {step}");
+        }
+    }
+    // Filters that keep less than the whole vocabulary stay on their own paths.
+    for p in [
+        SamplingParams {
+            top_k: 300,
+            ..params(1.0)
+        },
+        SamplingParams {
+            top_p: 0.9,
+            ..params(1.0)
+        },
+        SamplingParams {
+            min_p: 0.05,
+            ..params(1.0)
+        },
+    ] {
+        assert!(!Sampler::new(&p).whole_vocab(20_000));
+    }
+}
+
+/// Masked (-inf) tokens, ties at the top, a NaN, an infinite logit and fully masked rows.
+#[test]
+fn whole_vocab_draw_edge_rows() {
+    let mut rng = Rng::new(7);
+    let s = Sampler::new(&params(1.0));
+    let mut masked = row(&mut rng, 10_000, 3.0, 2);
+    for t in [0, 5, 9_999] {
+        masked[t] = f32::NEG_INFINITY;
+    }
+    // Ties: the lower token id first, in every band.
+    let mut tied = row(&mut rng, 10_000, 1.0, 0);
+    for t in [3, 50, 51, 7_000, 9_998] {
+        tied[t] = 6.0;
+    }
+    for t in [10, 20, 30] {
+        tied[t] = -2.5;
+    }
+    let flat = vec![0.25f32; 5_000];
+    for logits in [&masked, &tied, &flat] {
+        let candidates = s.general_candidates(logits);
+        let mut decided = 0;
+        for u in draws(&mut rng, 200) {
+            if let Some(got) = draw_whole_vocab(logits, u) {
+                assert_eq!(got, draw(&candidates, u), "u {u}");
+                decided += 1;
+            }
+        }
+        assert!(decided >= 190, "{decided}");
+    }
+    let mut nan = masked.clone();
+    nan[7] = f32::NAN;
+    assert_eq!(draw_whole_vocab(&nan, 0.5), None);
+    let mut inf = masked.clone();
+    inf[7] = f32::INFINITY;
+    assert_eq!(draw_whole_vocab(&inf, 0.5), None);
+    assert_eq!(draw_whole_vocab(&[f32::NEG_INFINITY; 100], 0.5), None);
+    // One finite logit among masked ones: always it.
+    let mut one = vec![f32::NEG_INFINITY; 100];
+    one[42] = -3.0;
+    assert_eq!(draw_whole_vocab(&one, 0.99), Some(42));
+}
