@@ -34,6 +34,7 @@ mod early_commit;
 mod even;
 mod first_rows;
 mod fit;
+mod grid;
 mod host_tier;
 mod host_time;
 mod kv_fit;
@@ -146,6 +147,22 @@ pub fn default_prefill_chunk(
     match device {
         DeviceChoice::Cuda if integrated => max_batch_tokens.max(PREFILL_CHUNK),
         _ => PREFILL_CHUNK,
+    }
+}
+
+/// `--prompt-step-grid` when none is given (#1183): on a GPU sharing the host's memory with
+/// steps bigger than its default ([`MAX_BATCH_TOKENS_INTEGRATED`]), that default, so a bigger
+/// `--max-batch-tokens` keeps the default step's output; else 0 (none).
+pub fn default_prompt_grid(
+    device: DeviceChoice,
+    integrated: bool,
+    max_batch_tokens: usize,
+) -> usize {
+    match device {
+        DeviceChoice::Cuda if integrated && max_batch_tokens > MAX_BATCH_TOKENS_INTEGRATED => {
+            MAX_BATCH_TOKENS_INTEGRATED
+        }
+        _ => 0,
     }
 }
 
@@ -1305,6 +1322,10 @@ pub struct LmConfig {
     /// [`KV_BLOCK`](crate::model::core::KV_BLOCK)) instead of full steps and a short last one
     /// (`--prefill-even`, [`even`]). Off by default.
     pub prefill_even: bool,
+    /// Prompt chunks bigger than this many tokens hold whole multiples of it, and a prompt's
+    /// part past them runs alone, as in steps of this size (`--prompt-step-grid`, [`grid`]); 0
+    /// for none. See [`default_prompt_grid`].
+    pub prompt_grid: usize,
     /// With sliding-window rings: the most prompt tokens a sequence takes per step (its rings
     /// hold the window plus one step). `None`: `max_batch_tokens` on a GPU sharing memory with
     /// the host (GB10: room for the bigger rings, and whole steps prefill faster), else
@@ -1714,6 +1735,7 @@ impl LmConfig {
             first_gpu: 0,
             prefill_chunk: PREFILL_CHUNK,
             prefill_even: false,
+            prompt_grid: 0,
             ring_step: None,
             pipeline_micro: PREFILL_CHUNK,
             pipeline_prompt: PIPELINE_PROMPT,
@@ -6286,6 +6308,7 @@ impl LmEngine {
             max_batch_tokens: cfg.max_batch_tokens.max(1),
             prefill_chunk: cfg.prefill_chunk.max(1),
             prefill_even: cfg.prefill_even,
+            prompt_grid: cfg.prompt_grid,
             ring_step,
             image_step,
             max_ctx: cfg.ctx_size,
@@ -6691,6 +6714,8 @@ struct Worker {
     prefill_chunk: usize,
     /// [`LmConfig::prefill_even`].
     prefill_even: bool,
+    /// [`LmConfig::prompt_grid`].
+    prompt_grid: usize,
     /// With rings: the most prompt tokens a sequence takes per step ([`LmConfig::ring_step`]).
     ring_step: usize,
     /// The most tokens one image whose tokens see each other takes ([`largest_image`]; 0
@@ -8368,6 +8393,13 @@ impl Worker {
                 let s = &prefilling[i];
                 let end = s.n_past + len;
                 let tokens = len.min(s.prompt.len() - end);
+                // `--prompt-step-grid` cuts it as the step will (`plan_step`).
+                let grid = if self.prefill_even {
+                    0
+                } else {
+                    self.prompt_grid
+                };
+                let tokens = grid::grid_take(tokens, grid);
                 (tokens > 0).then(|| PromptNext {
                     tokens,
                     logits: if end + tokens == s.prompt.len() {
@@ -8722,6 +8754,13 @@ impl Worker {
                 take
             };
             let end = self.save_cut(seq, (seq.n_past + take).min(seq.prompt.len()));
+            // `--prompt-step-grid`: whole cells of the grid, the part past them alone, so the
+            // chunk ends are those of grid-sized steps (even steps choose their own sizes).
+            let end = if self.prefill_even || tier_pass {
+                end
+            } else {
+                seq.n_past + grid::grid_take(end - seq.n_past, self.prompt_grid)
+            };
             // An image whose tokens see each other runs in one step (#1217): a step stops at
             // its start, the next takes it whole, past the room when it is longer (up to the
             // largest image, which the rings hold). Text steps keep their room.
