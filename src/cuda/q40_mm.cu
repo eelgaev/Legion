@@ -110,6 +110,11 @@ __device__ __forceinline__ void q40_cp16z(void * smem, const void * gmem, const 
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem), "r"(src));
 }
 
+// Hints the 32-byte sector at p into L2.
+__device__ __forceinline__ void q40_prefetch_l2(const void * p) {
+    asm volatile("prefetch.global.L2 [%0];\n" ::"l"(p));
+}
+
 __device__ __forceinline__ void q40_commit() {
     asm volatile("cp.async.commit_group;\n" ::);
 }
@@ -735,13 +740,16 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm_r5(const legion_
 // the stages come in pairs), so each stage's weight offset and, with two stages, its ring slot
 // are constants. DIAG 1 and 2 are the timing test's bounds, not products: one FFMA an output a
 // block, and none (the integer sums chained through the MMAs' accumulators).
-template <class C, int EPI = 0, int UNROLL = 1, int DIAG = 0, int ROLL = 0>
+//
+// PF > 0 hints the weights PF stage pairs ahead into L2 (5 sectors a row's 144 bytes of a pair).
+template <class C, int EPI = 0, int UNROLL = 1, int DIAG = 0, int ROLL = 0, int PF = 0>
 __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40_mm p) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     constexpr int SB = C::SB, MT = C::MT, NT = C::NT, BM = C::BM, BN = C::BN, S = C::STAGES;
     constexpr int HR = BM / 2;  // EPI 1: hidden rows a tile
     constexpr int WCPR = C::WCPR;
     static_assert(SB == 4 || UNROLL == 1, "two stages a trip: 4 blocks a stage");
+    static_assert(SB == 4 || PF == 0, "prefetch: 4 blocks a stage");
     static_assert(!EPI || (C::WARPS_M == 2 && HR == 16 * MT && HR == 32), "GeGLU pair: a warp row per weight");
     extern __shared__ __align__(16) uint32_t q40_smem[];
     const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, g = lane / 4, q = lane % 4;
@@ -782,6 +790,18 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
     // Quant copy i of a stage: block (i * THREADS) / (2 BN), its 16 bytes (i * THREADS) % (2 BN)
     // + tid (THREADS divides 2 BN or 2 BN divides THREADS, so no copy crosses a block).
     static_assert((2 * BN) % C::THREADS == 0 || C::THREADS % (2 * BN) == 0, "quant copies");
+    // PF: prefetch c = tid + i * THREADS is row c / 5's sector c % 5 of a pair.
+    constexpr int PCPT = PF ? (5 * BM + C::THREADS - 1) / C::THREADS : 0;
+    const char * pfp[PCPT ? PCPT : 1];
+#pragma unroll
+    for (int i = 0; i < PCPT; i++) {
+        const int c = tid + i * C::THREADS, r = c / 5;
+        if constexpr (EPI) {
+            pfp[i] = (const char *) (r < HR ? p.w : p.w2) + (long long) (it * HR + r % HR) * p.w_nb1 + (c % 5) * 32;
+        } else {
+            pfp[i] = wg + (long long) r * p.w_nb1 + (c % 5) * 32;
+        }
+    }
     const int * qg = p.yq + (long long) col0 * 8 + tid * 4;
     // Scale copy tid: block tid / (BN / 4), 4 scales tid % (BN / 4) of the block's BN.
     const int dbl = tid / (BN / 4), dch = tid % (BN / 4);
@@ -824,6 +844,17 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
             }
             if ((C::DCH == C::THREADS || tid < C::DCH) && !(DIAG == 5 && st >= S - 1)) {
                 q40_cp16(sd + ds, dg + (long long) st * (SB * p.n_pad));
+            }
+            if constexpr (PF > 0) {
+                const int pair = st / 2 + PF;
+                if (odd == 0 && pair < nst / 2) {
+#pragma unroll
+                    for (int i = 0; i < PCPT; i++) {
+                        if ((5 * BM) % C::THREADS == 0 || tid + i * C::THREADS < 5 * BM) {
+                            q40_prefetch_l2(pfp[i] + pair * 144);
+                        }
+                    }
+                }
             }
         }
         q40_commit();
@@ -1044,6 +1075,8 @@ using q40_128 = q40_cfg<128, 128, 4, 2, 3, 1, 8, 0>;  // 8 warps of 32 x 64, 1 C
 // Stages of 2 K blocks: a 4-deep ring (3 stages in flight, 49664 bytes) and a 3-deep one at the
 // op's tiles, a 6-deep one at 128 x 128.
 using q40_h4   = q40_cfg<64, 128, 2, 2, 4, 2, 4, 1, 2>;
+using q40_g8   = q40_cfg<64, 128, 2, 2, 2, 2, 8, 1>;
+using q40_g16  = q40_cfg<64, 128, 2, 2, 2, 2, 16, 1>;
 using q40_h3   = q40_cfg<64, 128, 2, 2, 3, 2, 4, 1, 2>;
 using q40_128h = q40_cfg<128, 128, 4, 2, 6, 1, 8, 0, 2>;
 
@@ -1074,16 +1107,18 @@ extern const legion_q40_kernel legion_q40_mm_table[] = {
       q40_128::SMEM, q40_128::THREADS, q40_128::BM, q40_128::BN, "128 x 128 tiles" },
     { reinterpret_cast<const void *>(&q40_quant<1, false>), reinterpret_cast<const void *>(&q40_gemm_r5<q40_op>),
       q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "round 5" },
-    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 1, 3>),
-      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "diag no loads" },
-    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 1, 5>),
-      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "diag no input loads" },
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 1, 0, 0, 2>),
+      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "weights to L2 2 pairs ahead" },
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 1, 0, 0, 6>),
+      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "weights to L2 6 pairs ahead" },
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_g8>),
+      q40_g8::SMEM, q40_g8::THREADS, q40_g8::BM, q40_g8::BN, "groups of 8 column tiles" },
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_g16>),
+      q40_g16::SMEM, q40_g16::THREADS, q40_g16::BM, q40_g16::BN, "groups of 16 column tiles" },
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_g8, 0, 1, 0, 0, 4>),
+      q40_g8::SMEM, q40_g8::THREADS, q40_g8::BM, q40_g8::BN, "groups of 8, L2 4 pairs ahead" },
     { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 1, 6>),
       q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "diag no weight loads" },
-    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_128, 0, 1, 3>),
-      q40_128::SMEM, q40_128::THREADS, q40_128::BM, q40_128::BN, "diag 128 x 128 no loads" },
-    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_128, 0, 1, 5>),
-      q40_128::SMEM, q40_128::THREADS, q40_128::BM, q40_128::BN, "diag 128 x 128 no input loads" },
 };
 extern const int legion_q40_mm_table_len = sizeof(legion_q40_mm_table) / sizeof(legion_q40_mm_table[0]);
 
