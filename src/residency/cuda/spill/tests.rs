@@ -22,3 +22,13 @@ fn vram_part_of_a_decode_state_keeps_its_room() {
     // It fits with the room kept: all in VRAM, as without the spill.
     assert_eq!(vram_part(4 << 30, free, 2 << 30, g), 4 << 30);
 }
+
+/// #814: a lent step buffer is mapped for its own GPU first, then for each peer of the mask
+/// (never twice for its own).
+#[test]
+fn lent_access_lists_the_device_then_its_peers() {
+    assert_eq!(lent_access_ids(1, 0).collect::<Vec<_>>(), [1]);
+    assert_eq!(lent_access_ids(1, 0b101).collect::<Vec<_>>(), [1, 0, 2]);
+    assert_eq!(lent_access_ids(2, 0b1110).collect::<Vec<_>>(), [2, 1, 3]);
+    assert_eq!(lent_access_ids(0, 1 << 63).collect::<Vec<_>>(), [0, 63]);
+}

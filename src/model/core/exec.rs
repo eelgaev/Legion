@@ -3037,6 +3037,16 @@ impl Executor {
     /// a residual's hand-off copy goes GPU to GPU instead of through host memory.
     pub fn set_dataflow_peer(&mut self, on: bool) {
         self.dataflow_peer = on;
+        // The copies also read and write step buffers in the lent slots' VRAM (#814).
+        #[cfg(feature = "cuda")]
+        if on {
+            let dev = |s: usize| self.stages[s].backend.device().discrete_cuda();
+            let pairs: Vec<(usize, usize)> = (1..self.stages.len())
+                .filter_map(|s| Some((dev(s - 1)?, dev(s)?)))
+                .filter(|(a, b)| a != b)
+                .collect();
+            crate::residency::cuda::share_lent_steps(&pairs);
+        }
     }
 
     /// With [`Self::set_dataflow`] on CUDA: each stage's residual goes to the next GPU on a

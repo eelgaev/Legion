@@ -111,6 +111,7 @@ mod sys {
         pub fn cuDeviceGetPCIBusId(id: *mut c_char, len: c_int, d: CUdevice) -> CUresult;
         pub fn cuDeviceGet(d: *mut CUdevice, ordinal: c_int) -> CUresult;
         pub fn cuDeviceGetCount(n: *mut c_int) -> CUresult;
+        pub fn cuDeviceCanAccessPeer(can: *mut c_int, d: CUdevice, peer: CUdevice) -> CUresult;
         pub fn cuDeviceGetAttribute(v: *mut c_int, attr: c_uint, d: CUdevice) -> CUresult;
         pub fn cuMemGetAllocationGranularity(
             g: *mut usize,
@@ -223,7 +224,9 @@ pub use swap_pace::{
     swap_pace_queue,
 };
 mod spill;
-pub use spill::{is_lent_type, lent_type, spill_devices, spill_type, spill_type_keeping};
+pub use spill::{
+    is_lent_type, lent_type, share_lent_steps, spill_devices, spill_type, spill_type_keeping,
+};
 mod lent_pool;
 pub use lent_pool::close_all as lent_pool_close;
 pub(crate) use lent_pool::{flush as lent_pool_flush, put as lent_pool_put};
