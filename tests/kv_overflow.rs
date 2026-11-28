@@ -1,5 +1,6 @@
 //! A request whose prompt and `max_tokens` need more KV cache than the whole cache holds is the
-//! client's error: HTTP 400 `invalid_request_error` on every front end, streaming or not (#125).
+//! client's error: HTTP 400 `invalid_request_error` on every front end, streaming or not (#125),
+//! with OpenAI's `context_length_exceeded` code, as a prompt over the context has.
 
 mod common;
 
@@ -58,6 +59,7 @@ async fn openai_endpoints_answer_400() {
                 "{uri} stream={stream}: {v}"
             );
             assert_eq!(v["error"]["type"], "invalid_request_error", "{uri}: {v}");
+            assert_eq!(v["error"]["code"], "context_length_exceeded", "{uri}: {v}");
             let message = v["error"]["message"].as_str().unwrap();
             assert!(message.contains("the cache holds 64"), "{uri}: {v}");
         }
@@ -65,6 +67,37 @@ async fn openai_endpoints_answer_400() {
         for (uri, body) in openai_requests(8, stream) {
             let (status, _) = send_to(app(), post(uri, body)).await;
             assert_eq!(status, StatusCode::OK, "{uri} stream={stream}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_prompt_over_the_context_is_context_length_exceeded() {
+    let app = || {
+        router(AppState::new(Arc::new(MockEngine::new(MockConfig {
+            step: Duration::ZERO,
+            context_length: 1,
+            ..Default::default()
+        }))))
+    };
+    for stream in [false, true] {
+        for (uri, body) in openai_requests(8, stream) {
+            let (status, body) = send_to(app(), post(uri, body)).await;
+            let v: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{uri} stream={stream}: {v}"
+            );
+            assert_eq!(v["error"]["type"], "invalid_request_error", "{uri}: {v}");
+            assert_eq!(v["error"]["code"], "context_length_exceeded", "{uri}: {v}");
+            assert!(
+                v["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("the context is 1"),
+                "{uri}: {v}"
+            );
         }
     }
 }

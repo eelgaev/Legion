@@ -43,6 +43,34 @@ fn the_report_case_is_refused() {
 }
 
 #[test]
+fn the_automatic_pool_holds_a_full_context_with_drafts() {
+    // The same request against the automatic pool, one sequence or a GPU sharing the host's
+    // memory (whose pool is capped at a context): it counts the drafts' positions per context.
+    let ctx = 262_144;
+    assert_eq!(context_blocks(ctx, 0), ctx / KV_BLOCK);
+    assert_eq!(context_blocks(ctx, 3), ctx / KV_BLOCK + 1);
+    for (max_seqs, shared) in [(1, false), (1, true), (4, true)] {
+        let pool = crate::engine::lm::auto_kv_want(max_seqs, context_blocks(ctx, 3), false, shared);
+        check(228_413, 40_000, ctx, 3, pool).unwrap();
+        check(ctx - 1, u32::MAX, ctx, 3, pool).unwrap();
+        // Without drafts the pool is a context, as before.
+        let pool = crate::engine::lm::auto_kv_want(max_seqs, context_blocks(ctx, 0), false, shared);
+        let contexts = if shared { 1 } else { max_seqs };
+        assert_eq!(pool, contexts * ctx / KV_BLOCK);
+        check(ctx - 1, u32::MAX, ctx, 0, pool).unwrap();
+    }
+    // Any context size: the longest request [`blocks`] counts fits [`context_blocks`].
+    for ctx in [1, 63, 64, 65, 4096, 100_000] {
+        for spec_k in [0, 1, 3, 16, 64] {
+            assert_eq!(
+                blocks(0, u32::MAX, ctx, spec_k),
+                context_blocks(ctx, spec_k)
+            );
+        }
+    }
+}
+
+#[test]
 fn fits_exactly() {
     check(64, 64, 1 << 20, 0, 2).unwrap();
     assert!(check(64, 65, 1 << 20, 0, 2).is_err());
@@ -115,4 +143,14 @@ fn prepare_refuses_before_queueing() {
         e.prepare(request(64)).err().unwrap(),
         EngineError::KvOverflow { .. }
     ));
+}
+
+#[test]
+fn huge_sizes_saturate_instead_of_wrapping() {
+    assert_eq!(context_blocks(usize::MAX, 3), usize::MAX.div_ceil(KV_BLOCK));
+    assert_eq!(
+        blocks(usize::MAX, u32::MAX, usize::MAX, 3),
+        usize::MAX.div_ceil(KV_BLOCK)
+    );
+    assert!(context_blocks(usize::MAX - 1, 8) >= context_blocks(1 << 20, 8));
 }

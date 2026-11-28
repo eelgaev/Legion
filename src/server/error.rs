@@ -11,6 +11,9 @@ use crate::engine::EngineError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
     InvalidRequest,
+    /// An invalid request whose prompt (and `max_tokens`) do not fit the context or the KV
+    /// cache: OpenAI's `context_length_exceeded` code.
+    ContextLength,
     Authentication,
     NotFound,
     Overloaded,
@@ -61,7 +64,7 @@ impl ApiError {
 
     pub fn status(&self) -> StatusCode {
         match self.kind {
-            ErrorKind::InvalidRequest => StatusCode::BAD_REQUEST,
+            ErrorKind::InvalidRequest | ErrorKind::ContextLength => StatusCode::BAD_REQUEST,
             ErrorKind::Authentication => StatusCode::UNAUTHORIZED,
             ErrorKind::NotFound => StatusCode::NOT_FOUND,
             ErrorKind::Overloaded => StatusCode::TOO_MANY_REQUESTS,
@@ -73,6 +76,7 @@ impl ApiError {
     pub fn to_openai(&self) -> openai::ErrorResponse {
         let (kind, code) = match self.kind {
             ErrorKind::InvalidRequest => ("invalid_request_error", None),
+            ErrorKind::ContextLength => ("invalid_request_error", Some("context_length_exceeded")),
             ErrorKind::Authentication => ("authentication_error", Some("invalid_api_key")),
             ErrorKind::NotFound => ("invalid_request_error", Some("model_not_found")),
             ErrorKind::Overloaded => ("rate_limit_error", Some("rate_limit_exceeded")),
@@ -91,7 +95,7 @@ impl ApiError {
 
     pub fn to_anthropic(&self) -> anthropic::ErrorResponse {
         let kind = match self.kind {
-            ErrorKind::InvalidRequest => "invalid_request_error",
+            ErrorKind::InvalidRequest | ErrorKind::ContextLength => "invalid_request_error",
             ErrorKind::Authentication => "authentication_error",
             ErrorKind::NotFound => "not_found_error",
             ErrorKind::Overloaded => "overloaded_error",
@@ -113,9 +117,10 @@ impl From<EngineError> for ApiError {
     fn from(e: EngineError) -> Self {
         let kind = match &e {
             EngineError::ModelNotFound(_) => ErrorKind::NotFound,
-            EngineError::InvalidRequest(_)
-            | EngineError::ContextOverflow { .. }
-            | EngineError::KvOverflow { .. } => ErrorKind::InvalidRequest,
+            EngineError::InvalidRequest(_) => ErrorKind::InvalidRequest,
+            EngineError::ContextOverflow { .. } | EngineError::KvOverflow { .. } => {
+                ErrorKind::ContextLength
+            }
             EngineError::Overloaded => ErrorKind::Overloaded,
             EngineError::Internal(_) => ErrorKind::Internal,
         };

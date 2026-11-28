@@ -36,6 +36,10 @@ pub(super) struct TextSpec {
     /// stays on the engine thread.
     pub(super) grammar: bool,
     pub(super) reasoning: Option<ReasoningParser>,
+    /// The content's leading whitespace is dropped ([`ChatFormat::trims_content`]).
+    ///
+    /// [`ChatFormat::trims_content`]: super::chat_format::ChatFormat::trims_content
+    pub(super) trim_content: bool,
     pub(super) tools: Option<Box<dyn ToolParser>>,
     pub(super) stop: StopMatcher,
     pub(super) logprobs: Option<u32>,
@@ -52,6 +56,8 @@ pub(super) struct TextState<'t> {
     tokenizer: &'t Tokenizer,
     detok: DecodeStream<'t>,
     reasoning: Option<ReasoningParser>,
+    /// No content sent yet, and its leading whitespace is dropped ([`TextSpec::trim_content`]).
+    trim_content: bool,
     tools: Option<Box<dyn ToolParser>>,
     stop: StopMatcher,
     logprobs: Option<u32>,
@@ -76,6 +82,7 @@ impl<'t> TextState<'t> {
             tokenizer,
             detok: tokenizer.decode_stream().show(&spec.shown),
             reasoning: spec.reasoning,
+            trim_content: spec.trim_content,
             tools: spec.tools,
             stop: spec.stop,
             logprobs: spec.logprobs,
@@ -192,8 +199,10 @@ impl<'t> TextState<'t> {
         }
     }
 
-    /// Sends text the stop matcher released, preceded by its tokens' log probabilities.
-    fn send_text(&mut self, text: String, flush: bool) {
+    /// Sends text the stop matcher released, preceded by its tokens' log probabilities. With
+    /// [`TextSpec::trim_content`], the whitespace before the content's first other character
+    /// is dropped (its tokens keep their log probabilities).
+    fn send_text(&mut self, mut text: String, flush: bool) {
         if self.logprobs.is_some() {
             let lps = if flush {
                 self.lp_hold.flush(&text)
@@ -203,6 +212,11 @@ impl<'t> TextState<'t> {
             if !lps.is_empty() {
                 let _ = self.out.send(TokenEvent::Logprobs(lps));
             }
+        }
+        if self.trim_content {
+            let lead = text.len() - text.trim_start_matches(is_space).len();
+            text.drain(..lead);
+            self.trim_content = text.is_empty();
         }
         if !text.is_empty() {
             let _ = self.out.send(TokenEvent::Text(text));
@@ -230,6 +244,12 @@ impl<'t> TextState<'t> {
     pub(super) fn send(&self, ev: TokenEvent) {
         let _ = self.out.send(ev);
     }
+}
+
+/// The whitespace a trimmed content start drops: C's `isspace`, as llama.cpp's chat parser
+/// trims.
+fn is_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c')
 }
 
 /// What the engine thread tells the stream thread about a sequence.
