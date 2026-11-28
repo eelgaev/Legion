@@ -101,7 +101,9 @@ mod spec;
 pub(crate) mod stable_fusions;
 pub mod stage_ops;
 pub use stable_fusions::set_stable_fusions;
+pub(crate) mod legion_router;
 pub mod route_rec;
+pub use legion_router::set_legion_router;
 pub(crate) mod router_bf16;
 pub use router_bf16::set_router_bf16;
 pub(crate) mod router_mv;
@@ -5312,7 +5314,17 @@ impl Model {
                     .filter(|&b| dense_mv::takes_wide(b, h))
                 {
                     Some(b) => (dense_mv::mul_mat_wide(ctx, b, h), None),
-                    None => (self.lmm_q(ctx, il, "ffn_gate_inp.weight", h, hq)?, None),
+                    // Steps of 17+ tokens, which ggml-cuda runs on cuBLAS: Legion's kernel
+                    // with `--legion-router` (#1183, opt-in: other bits).
+                    None => match self
+                        .plain_weight(il, "ffn_gate_inp.weight")
+                        .filter(|_| router)
+                        .and_then(|w| self.router_bf16(il, w))
+                        .filter(|&b| legion_router::takes(b, h))
+                    {
+                        Some(b) => (legion_router::mul_mat(ctx, b, h), None),
+                        None => (self.lmm_q(ctx, il, "ffn_gate_inp.weight", h, hq)?, None),
+                    },
                 },
             },
         };

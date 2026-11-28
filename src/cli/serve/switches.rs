@@ -407,6 +407,17 @@ pub(in crate::cli) struct SwitchArgs {
     /// comparisons, or to save that memory.
     #[arg(long, help_heading = HEADING)]
     no_router_bf16: bool,
+    /// Compute the MoE routers' logits in steps of 17 or more tokens (prompt steps, verify steps
+    /// of 5+ sequences) in Legion's own kernel instead of ggml-cuda's cuBLAS F32 GEMM (#1183).
+    /// cuBLAS picks its algorithm from the step's token count, so a token's router logits
+    /// depend on the size of the step it lands in; the kernel sums every logit in one fixed
+    /// order (exact BF16 products of the router's BF16 copy and a two-part BF16 split of the
+    /// activations, ~16 bits of each value against TF32's 10, F32 sums in K order), the same
+    /// bits in any step. Needs the BF16 copy (see --no-router-bf16: CUDA, compute capability
+    /// 9.0+); other routers keep cuBLAS. Steps of up to 16 tokens are unchanged. Off by default:
+    /// moves the output (other bits than cuBLAS's).
+    #[arg(long, help_heading = HEADING)]
+    legion_router: bool,
     /// Qwen3.8-Flash-Next with the n-gram table read from the SSD (direct reads) and a verify
     /// step that leaves its n-gram rows to its compute: issue the rows' reads only when the
     /// step writes them, after its first layers are launched. By default the step's input fill
@@ -1671,6 +1682,7 @@ impl SwitchArgs {
             mvf_ab: self.no_mvf_ab.then_some(false),
             router_join: self.no_router_join.then_some(false),
             router_bf16: self.no_router_bf16.then_some(false),
+            legion_router: self.legion_router.then_some(true),
             ple_early_reads: self.no_ple_early_reads.then_some(false),
             nvfp4_mmvq_glu: self.nvfp4_mmvq_glu.then_some(true),
             fp8_small_batch_gemv: self.fp8_small_batch_gemv.then_some(true),

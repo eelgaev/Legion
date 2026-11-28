@@ -301,6 +301,7 @@ fn build_cuda_kernels(ggml: &Path) {
         .file("src/cuda/nvfp4_mm/dispatch.cu")
         .file("src/cuda/fused.cu")
         .file("src/cuda/router_mv.cu")
+        .file("src/cuda/legion_router.cu")
         .file("src/cuda/mvf_bf16.cu")
         .file("src/cuda/l2_prefetch.cu")
         .file("src/cuda/mmq_preq.cu")
