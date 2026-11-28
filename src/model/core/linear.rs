@@ -721,7 +721,7 @@ impl Linear {
     /// Whether [`Self::mul_mat`] of the weight `name` (`w`, its `scale`) over an `x` of type,
     /// shape and strides `x` runs the Q4_0 prompt op ([`crate::model::q40_mm`]) and nothing
     /// after it: no scale, no FP8, a matmul the op takes.
-    fn q40_takes(
+    pub(crate) fn q40_takes(
         &self,
         name: &str,
         w: Tensor<'_>,

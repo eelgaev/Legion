@@ -2891,6 +2891,33 @@ impl Model {
         self.mm(ctx, &format!("blk.{il}.{name}"), x)
     }
 
+    /// [`Self::lmm`] of the attention output `o` (F32 `[d × n_head, n]`): where the weight runs
+    /// the Q4_0 prompt op ([`crate::model::q40_mm`]) and `o` is one paged attention node's
+    /// output ([`paged::attention_quant`]), the matmul over the quantization the attention
+    /// writes, the same output without the F32 tensor and the matmul's quantization pass over it
+    /// (#1161). With `quant` false (something else reads `o`), and elsewhere: [`Self::lmm`].
+    pub(crate) fn lmm_attn_out<'a>(
+        &'a self,
+        ctx: &'a Context,
+        il: usize,
+        name: &str,
+        o: Tensor<'a>,
+        quant: bool,
+    ) -> Result<Tensor<'a>, ModelError> {
+        let full = format!("blk.{il}.{name}");
+        let w = self.w(&full)?;
+        let scale = linear::scale_name(&full).and_then(|s| self.w(&s).ok());
+        if quant
+            && self
+                .linear
+                .q40_takes(&full, w, scale, (o.ty(), o.ne(), o.nb()))
+            && let Some(xq) = paged::attention_quant(ctx, o)
+        {
+            return Ok(crate::model::q40_mm::mul_mat_q(ctx, w, xq, o.ne()[1]));
+        }
+        self.lmm(ctx, il, name, o)
+    }
+
     /// [`Self::lmm`] plus `res` (ggml's `add(.., res)`), the add in the matmul's epilogue where
     /// [`linear::Linear::mul_mat_add`] fuses it; just [`Self::lmm`] without `res`.
     pub(crate) fn lmm_add<'a>(

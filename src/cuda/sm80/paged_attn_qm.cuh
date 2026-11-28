@@ -392,6 +392,52 @@ __global__ void __launch_bounds__(Shape<D, PP>::NW * 32, 1) paged_prefill_qm(con
         lr += __shfl_xor_sync(0xffffffff, lr, 2);
         const int row = r0 + gq + 8 * r;
         const int t = t0 + row / G;
+        if (p.oq) {
+            // The output's quantization (p.oq) in place of dst: a 32-value block of the row is
+            // the quad's (dims 8n + 2tq + {0, 1}, n = 4b .. 4b + 3), word 2m + tq / 2 of it the
+            // values of n = 4b + m of tq and its neighbour tq ^ 1. Every lane shuffles.
+            const bool valid = w_rows && row < QT * G && t < p.n_tok;
+            const float inv = 1.0f / lr;
+            const int64_t col = (int64_t) seq * p.n_tok + t;
+            const int kb0 = (kvh * G + row % G) * (D / 32);
+#pragma unroll
+            for (int b = 0; b < D / 32; b++) {
+                float x[8];
+#pragma unroll
+                for (int m = 0; m < 4; m++) {
+                    x[2 * m]     = o[4 * b + m][2 * r] * inv;
+                    x[2 * m + 1] = o[4 * b + m][2 * r + 1] * inv;
+                }
+                float amax = fabsf(x[0]);
+#pragma unroll
+                for (int i = 1; i < 8; i++) {
+                    amax = fmaxf(amax, fabsf(x[i]));
+                }
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1));
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2));
+                const float d_inv = oq_dinv(amax);
+                uint32_t half16[4], other[4];
+#pragma unroll
+                for (int m = 0; m < 4; m++) {
+                    half16[m] = oq_byte(x[2 * m], d_inv) | oq_byte(x[2 * m + 1], d_inv) << 8;
+                    other[m]  = __shfl_xor_sync(0xffffffff, half16[m], 1);
+                }
+                if (valid) {
+                    const int odd = tq & 1;
+#pragma unroll
+                    for (int m = 0; m < 4; m++) {
+                        if ((m >> 1) == odd) {
+                            const uint32_t word = odd ? other[m] | half16[m] << 16 : half16[m] | other[m] << 16;
+                            oq_word(p, col, kb0 + b, 2 * m + tq / 2, word);
+                        }
+                    }
+                    if (tq == 0) {
+                        oq_scale(p, col, kb0 + b, d_inv);
+                    }
+                }
+            }
+            continue;
+        }
         if (w_rows && row < QT * G && t < p.n_tok) {
             const int64_t orow = ((int64_t) seq * p.n_tok + t) * p.n_head + kvh * G + row % G;
             const float inv = 1.0f / lr;
@@ -432,6 +478,7 @@ int run(const legion_paged_attn & p, cudaStream_t st) {
     constexpr int QT = SH::ROWS / G;
     paged_prefill_qm<D, G, PP><<<dim3((p.n_tok + QT - 1) / QT, p.n_head_kv, p.n_seqs), SH::NW * 32, SH::SMEM, st>>>(p);
     t_qm_launches++;
+    t_oq_launches += p.oq != nullptr;
     return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
 
