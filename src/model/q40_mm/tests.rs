@@ -478,10 +478,6 @@ fn cuda_q40_mm_is_ggml_bit_for_bit() {
             }
             let ggml = case(&mut gpu, false, k, rows, n);
             for (v, moved) in moved.iter_mut().enumerate() {
-                // The timing test's bounds, not products.
-                if cuda::kernel_name(v).starts_with("diag") {
-                    continue;
-                }
                 use_variant(v);
                 let ours = case(&mut gpu, true, k, rows, n);
                 use_variant(0);

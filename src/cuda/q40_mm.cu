@@ -138,32 +138,16 @@ __device__ __forceinline__ uint32_t q40_s8(const uint32_t nib) {
     return ((nib & 0x0F0F0F0Fu) + 0x78787878u) ^ 0x80808080u;
 }
 
-// A word of 4 nibbles (in the high 4 bits of each byte) as the int8 values 16 (q - 8).
+// A word of 4 nibbles (in the high 4 bits of each byte) as the int8 values 16 (q - 8):
+// (nib & 0xF0F0F0F0) ^ 0x80808080 as one LOP3 (LUT 0xF0 & 0xCC ^ 0xAA = 0x6A; the compiler's
+// own takes two).
 __device__ __forceinline__ uint32_t q40_s8x16(const uint32_t nib) {
-    return (nib & 0xF0F0F0F0u) ^ 0x80808080u;
-}
-
-// q40_s8x16 as one LOP3 ((a & b) ^ c: LUT 0xF0 & 0xCC ^ 0xAA = 0x6A); the compiler's own takes two.
-__device__ __forceinline__ uint32_t q40_x16(const uint32_t nib) {
     uint32_t r;
     asm("lop3.b32 %0, %1, %2, %3, 0x6A;\n" : "=r"(r) : "r"(nib), "r"(0xF0F0F0F0u), "r"(0x80808080u));
     return r;
 }
 
-// c = a x b + c on the accumulator's bits (the timing test's integer bound).
-__device__ __forceinline__ void q40_mma_acc(float * c, const uint32_t (&a)[4], const int b0, const int b1) {
-    int s0 = __float_as_int(c[0]), s1 = __float_as_int(c[1]), s2 = __float_as_int(c[2]), s3 = __float_as_int(c[3]);
-    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
-        "{%0, %1, %2, %3};\n"
-        : "+r"(s0), "+r"(s1), "+r"(s2), "+r"(s3)
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-    c[0] = __int_as_float(s0);
-    c[1] = __int_as_float(s1);
-    c[2] = __int_as_float(s2);
-    c[3] = __int_as_float(s3);
-}
-
-// A compile-time int (the matmul's stage parity).
+// A compile-time int (the matmul's block parity).
 template <int V> struct q40_k {
     static constexpr int value = V;
 };
@@ -180,12 +164,12 @@ template <int V> struct q40_k {
 //   scales of two n8 tiles are 16 contiguous bytes each. Of tile column c = 8 nt + g (= 8 nt + 2 r
 //   + e), word w (= 2 v + f) is at word ((nt / 2 * 8 + g) * 4 + v) * 4 + nt % 2 * 2 + f of the
 //   tile's 1024 words of block kb (yq[(kb * n_pad + 128 jt) * 8 ..]); the scale at r * 32 + 2 nt
-//   + e of its 128 (yd[kb * n_pad + 128 jt ..]), stored / 16 (D16, the op's matmul's factor).
+//   + e of its 128 (yd[kb * n_pad + 128 jt ..]), stored / 16 (the op's matmul's factor).
 //
 // q40_quant4 writes values i0 .. i0 + 3 (xi) of column col: the 8 lanes of an aligned group of 8
 // in a warp hold one 32-value block (i0 / 4 = the lane's index mod 8 within it), every lane of
 // the warp calls it; with `store` false (a group's column past the input's) it writes nothing.
-template <int LAYOUT, bool D16 = LAYOUT == 1>
+template <int LAYOUT>
 __device__ __forceinline__ void q40_quant4(int * yq, float * yd, const int n_pad, const float4 xi, const int col,
                                            const int i0, const bool store = true) {
     float amax = fabsf(xi.x);
@@ -222,7 +206,7 @@ __device__ __forceinline__ void q40_quant4(int * yq, float * yd, const int n_pad
         yq[qat] = *reinterpret_cast<const int *>(&q);
         if (s == 0) {
             const float dh = __half2float(__float2half(d));
-            yd[dat] = D16 ? dh * 0.0625f : dh;
+            yd[dat] = LAYOUT == 1 ? dh * 0.0625f : dh;
         }
     }
 }
@@ -234,11 +218,11 @@ __device__ __forceinline__ float4 q40_load4(const float * src) {
 }
 
 // Grid (n, k / 256), 64 threads.
-template <int LAYOUT, bool D16 = LAYOUT == 1> __global__ void __launch_bounds__(64) q40_quant(const legion_q40_mm p) {
+template <int LAYOUT> __global__ void __launch_bounds__(64) q40_quant(const legion_q40_mm p) {
     const int i0  = blockIdx.y * 256 + threadIdx.x * 4;
     const int col = blockIdx.x;
     const float4 xi = q40_load4(p.x + (long long) col * p.x_ld + i0);
-    q40_quant4<LAYOUT, D16>(p.yq, p.yd, p.n_pad, xi, col, i0);
+    q40_quant4<LAYOUT>(p.yq, p.yd, p.n_pad, xi, col, i0);
 }
 
 }  // namespace
@@ -507,10 +491,7 @@ __global__ void __launch_bounds__(Q40_THREADS, 1) q40_gemm_v1(const legion_q40_m
 // (BN / WARPS_N), a STAGES-deep ring of 4 K blocks a stage, MINB CTAs an SM, raster groups of
 // GROUP row tiles (COLS 0, column tiles slowest in a group) or GROUP column tiles (COLS 1, row
 // tiles slowest).
-// SB_ K blocks a stage: 4, or 2 (a stage's weight rows 36 bytes from a 16-byte aligned window
-// 0, 4, 8 or 12 bytes before them, so 3 copies a row).
-template <int BM_, int BN_, int WARPS_M_, int WARPS_N_, int STAGES_, int MINB_, int GROUP_, int COLS_,
-          int SB_ = 4>
+template <int BM_, int BN_, int WARPS_M_, int WARPS_N_, int STAGES_, int MINB_, int GROUP_, int COLS_>
 struct q40_cfg {
     static constexpr int BM          = BM_;
     static constexpr int BN          = BN_;
@@ -523,17 +504,15 @@ struct q40_cfg {
     static constexpr int THREADS     = 32 * WARPS_M * WARPS_N;
     static constexpr int MT          = BM / WARPS_M / 16;  // m16 tiles a warp
     static constexpr int NT          = BN / WARPS_N / 8;   // n8 tiles a warp
-    static constexpr int SB          = SB_;
-    static_assert(SB == 4 || SB == 2, "4 or 2 K blocks a stage");
-    static constexpr int WCPR        = SB == 4 ? 5 : 3;  // 16-byte weight copies a row
-    static constexpr int WRS         = 4 * WCPR;         // words a weight row (SB 4: 18 + 2 of the shift)
+    static constexpr int SB          = 4;
+    static constexpr int WRS         = 20;               // words a weight row (18 + 2 of the shift)
     static constexpr int D_BL        = BN / 128 * 144;   // scale words a block: 4 rows of 32, 36 apart
     static constexpr int W_WORDS     = BM * WRS;
     static constexpr int Q_WORDS     = SB * BN * 8;
     static constexpr int D_WORDS     = SB * D_BL;
     static constexpr int STAGE_WORDS = W_WORDS + Q_WORDS + D_WORDS;
     static constexpr int SMEM        = STAGES * STAGE_WORDS * 4;
-    static constexpr int WCH         = BM * WCPR;        // 16-byte weight copies a stage
+    static constexpr int WCH         = BM * 5;           // 16-byte weight copies a stage
     static constexpr int WCPT        = (WCH + THREADS - 1) / THREADS;
     static constexpr int QCH         = SB * BN * 2;      // 16-byte quant copies a stage
     static constexpr int QCPT        = QCH / THREADS;
@@ -542,176 +521,6 @@ struct q40_cfg {
     static_assert(QCH % THREADS == 0 && DCH <= THREADS, "copies");
     static_assert(SMEM <= 99 * 1024, "shared memory");
 };
-
-// Round 5's matmul (the timing test's comparison): q40_gemm's tiles and chains with the
-// scales applied as d / 16 and -M d / 16 from the F16 weight scale, the input's scales as
-// stored by q40_quant<1, false> (d, not d / 16), one stage a loop trip.
-template <class C>
-__global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm_r5(const legion_q40_mm p) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    constexpr int SB = C::SB, MT = C::MT, NT = C::NT, BM = C::BM, BN = C::BN, S = C::STAGES;
-    extern __shared__ __align__(16) uint32_t q40_smem[];
-    const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, g = lane / 4, q = lane % 4;
-    const int wm = warp % C::WARPS_M, wn = warp / C::WARPS_M;
-
-    const int b         = blockIdx.x;
-    const int nmaj      = C::COLS ? p.ntx : p.nty;
-    const int nmin      = C::COLS ? p.nty : p.ntx;
-    const int per_group = C::GROUP * nmin;
-    const int grp       = b / per_group;
-    const int r0        = grp * C::GROUP;
-    const int gsz       = min(C::GROUP, nmaj - r0);
-    const int in        = b - grp * per_group;
-    const int it        = C::COLS ? in / gsz : r0 + in % gsz;
-    const int jt        = C::COLS ? r0 + in % gsz : in / gsz;
-    const int row0      = it * BM;
-    const int col0      = jt * BN;
-    const int nst       = p.k / (32 * SB);
-
-    const char * wg = (const char *) p.w + (long long) row0 * p.w_nb1;
-    int  woff[C::WCPT];
-    bool wend[C::WCPT];
-#pragma unroll
-    for (int i = 0; i < C::WCPT; i++) {
-        const int c = tid + i * C::THREADS;
-        woff[i]     = (c / 5) * (int) p.w_nb1 + (c % 5) * 16;
-        wend[i]     = c % 5 == 4;
-    }
-    const long long qstep = (long long) p.n_pad * 8;
-    const int * qg = p.yq + (long long) col0 * 8;
-    const int dbl = tid / (BN / 4), dch = tid % (BN / 4);
-    const float * dg = p.yd + (long long) dbl * p.n_pad + col0 + dch * 4;
-    const int ds = dbl * C::D_BL + dch / 32 * 144 + dch % 32 / 8 * 36 + dch % 8 * 4;
-
-    auto load = [&](const int st) {
-        if (st < nst) {
-            uint32_t * sw = q40_smem + (st % S) * C::STAGE_WORDS;
-            uint32_t * sq = sw + C::W_WORDS;
-            uint32_t * sd = sq + C::Q_WORDS;
-            const int odd = st & 1;
-            const char * w = wg + (long long) (st >> 1) * 144 + odd * 64;
-#pragma unroll
-            for (int i = 0; i < C::WCPT; i++) {
-                const int c = tid + i * C::THREADS;
-                if (C::WCH % C::THREADS == 0 || c < C::WCH) {
-                    q40_cp16z(sw + c * 4, w + woff[i], wend[i] && !odd ? 8 : 16);
-                }
-            }
-            const long long kb0 = (long long) st * SB;
-#pragma unroll
-            for (int i = 0; i < C::QCPT; i++) {
-                const int c = tid + i * C::THREADS, bl = c / (2 * BN), wi = c % (2 * BN);
-                q40_cp16(sq + bl * BN * 8 + wi * 4, qg + (kb0 + bl) * qstep + wi * 4);
-            }
-            if (C::DCH == C::THREADS || tid < C::DCH) {
-                q40_cp16(sd + ds, dg + kb0 * p.n_pad);
-            }
-        }
-        q40_commit();
-    };
-
-    float acc[MT][NT][4];
-#pragma unroll
-    for (int mt = 0; mt < MT; mt++) {
-#pragma unroll
-        for (int nt = 0; nt < NT; nt++) {
-#pragma unroll
-            for (int l = 0; l < 4; l++) {
-                acc[mt][nt][l] = 0.0f;
-            }
-        }
-    }
-
-#pragma unroll
-    for (int s = 0; s < S - 1; s++) {
-        load(s);
-    }
-    for (int st = 0; st < nst; st++) {
-        q40_wait<S - 2>();
-        __syncthreads();
-        load(st + S - 1);
-
-        const uint32_t * sw = q40_smem + (st % S) * C::STAGE_WORDS;
-        const uint32_t * sq = sw + C::W_WORDS;
-        const float    * sd = (const float *) (sq + C::Q_WORDS);
-        const uint32_t * sa = sw + (st & 1) * 2 + (wm * 16 * MT + g) * C::WRS;
-#pragma unroll
-        for (int bl = 0; bl < SB; bl++) {
-            uint32_t a[MT][4];
-            float da[MT][2], mda[MT][2];
-#pragma unroll
-            for (int mt = 0; mt < MT; mt++) {
-#pragma unroll
-                for (int h = 0; h < 2; h++) {
-                    const uint32_t * rw = sa + (mt * 16 + h * 8) * C::WRS + 9 * (bl / 2);
-                    uint32_t lo, hi;
-                    unsigned short dh;
-                    if (bl % 2 == 0) {
-                        const uint32_t x0 = rw[q], x1 = rw[q + 1];
-                        lo = __funnelshift_r(x0, x1, 12);
-                        hi = __funnelshift_r(x0, x1, 16);
-                        dh = (unsigned short) (rw[0] & 0xFFFF);
-                    } else {
-                        hi = rw[5 + q];
-                        lo = hi << 4;
-                        dh = (unsigned short) (rw[4] >> 16);
-                    }
-                    a[mt][h]     = q40_s8x16(lo);
-                    a[mt][h + 2] = q40_s8x16(hi);
-                    const float d = __half2float(__ushort_as_half(dh));
-                    da[mt][h]  = __fmul_rn(d, 0.0625f);
-                    mda[mt][h] = __fmul_rn(d, -0.0625f * Q40_MAGIC);
-                }
-            }
-            const uint32_t * bq = sq + bl * BN * 8;
-            const float    * bd = sd + bl * C::D_BL;
-#pragma unroll
-            for (int pi = 0; pi < NT / 2; pi++) {
-                const int pr = wn * (NT / 2) + pi;
-                const uint4  bv = *reinterpret_cast<const uint4 *>(bq + ((pr * 8 + g) * 4 + q) * 4);
-                const float4 dv = *reinterpret_cast<const float4 *>(bd + pr / 8 * 144 + q * 36 + pr % 8 * 4);
-#pragma unroll
-                for (int e = 0; e < 2; e++) {
-                    const int nt = 2 * pi + e;
-                    const int b0 = (int) (e ? bv.z : bv.x), b1 = (int) (e ? bv.w : bv.y);
-                    const float d0 = e ? dv.z : dv.x, d1 = e ? dv.w : dv.y;
-#pragma unroll
-                    for (int mt = 0; mt < MT; mt++) {
-                        int d[4];
-                        q40_mma(d, a[mt], b0, b1);
-                        const float t0 = __fmaf_rn(__int_as_float(d[0]), da[mt][0], mda[mt][0]);
-                        const float t1 = __fmaf_rn(__int_as_float(d[1]), da[mt][0], mda[mt][0]);
-                        const float t2 = __fmaf_rn(__int_as_float(d[2]), da[mt][1], mda[mt][1]);
-                        const float t3 = __fmaf_rn(__int_as_float(d[3]), da[mt][1], mda[mt][1]);
-                        acc[mt][nt][0] = __fmaf_rn(t0, d0, acc[mt][nt][0]);
-                        acc[mt][nt][1] = __fmaf_rn(t1, d1, acc[mt][nt][1]);
-                        acc[mt][nt][2] = __fmaf_rn(t2, d0, acc[mt][nt][2]);
-                        acc[mt][nt][3] = __fmaf_rn(t3, d1, acc[mt][nt][3]);
-                    }
-                }
-            }
-        }
-    }
-    q40_wait<0>();
-
-#pragma unroll
-    for (int mt = 0; mt < MT; mt++) {
-#pragma unroll
-        for (int nt = 0; nt < NT; nt++) {
-#pragma unroll
-            for (int l = 0; l < 4; l++) {
-                const int i = row0 + wm * 16 * MT + mt * 16 + g + (l >> 1) * 8;
-                const int j = col0 + wn * 8 * NT + nt * 8 + 2 * q + (l & 1);
-                if (j < p.n) {
-                    p.dst[(long long) j * p.dst_ld + i] = acc[mt][nt][l];
-                }
-            }
-        }
-    }
-#else
-    __trap();
-#endif
-}
 
 // The op's matmul of configuration C: a CTA per BM x BN tile (grid ntx * nty, C::THREADS threads,
 // C::SMEM bytes of dynamic shared memory), the input in layout 1 (n_pad a multiple of BN).
@@ -736,20 +545,13 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm_r5(const legion_
 // these magnitudes), and fma(t', dB / 16, sum) has the exact product fl(C dA) dB of ggml's FFMA,
 // so the same rounding. The weight's scale goes in as converted, with one FMUL for -M dA.
 //
-// UNROLL 2 runs two stages a loop trip, the even and the odd one (k is a multiple of 256, so
-// the stages come in pairs), so each stage's weight offset and, with two stages, its ring slot
-// are constants. DIAG 1 and 2 are the timing test's bounds, not products: one FFMA an output a
-// block, and none (the integer sums chained through the MMAs' accumulators).
-//
-// PF > 0 hints the weights PF stage pairs ahead into L2 (5 sectors a row's 144 bytes of a pair).
-template <class C, int EPI = 0, int UNROLL = 1, int DIAG = 0, int ROLL = 0, int PF = 6>
+// PF > 0 hints the weights PF stage pairs ahead into L2 (on even stages: 5 32-byte sectors a
+// row's 144 bytes of a pair), so their copies hit L2 (the timing test's "no prefetch" is PF 0).
+template <class C, int EPI = 0, int PF = 6>
 __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40_mm p) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     constexpr int SB = C::SB, MT = C::MT, NT = C::NT, BM = C::BM, BN = C::BN, S = C::STAGES;
     constexpr int HR = BM / 2;  // EPI 1: hidden rows a tile
-    constexpr int WCPR = C::WCPR;
-    static_assert(SB == 4 || UNROLL == 1, "two stages a trip: 4 blocks a stage");
-    static_assert(SB == 4 || PF == 0, "prefetch: 4 blocks a stage");
     static_assert(!EPI || (C::WARPS_M == 2 && HR == 16 * MT && HR == 32), "GeGLU pair: a warp row per weight");
     extern __shared__ __align__(16) uint32_t q40_smem[];
     const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, g = lane / 4, q = lane % 4;
@@ -770,7 +572,7 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
     const int col0      = jt * BN;
     const int nst       = p.k / (32 * SB);
 
-    // This thread's weight copies: copy c = tid + i * THREADS is row c / WCPR's 16 bytes c % WCPR.
+    // This thread's weight copies: copy c = tid + i * THREADS is row c / 5's 16 bytes c % 5.
     const char * wg = (const char *) p.w + (long long) row0 * p.w_nb1;
     int  woff[C::WCPT];
     bool wend[C::WCPT];
@@ -779,11 +581,11 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
 #pragma unroll
     for (int i = 0; i < C::WCPT; i++) {
         const int c = tid + i * C::THREADS;
-        woff[i]     = (c / WCPR) * (int) p.w_nb1 + (c % WCPR) * 16;
-        wend[i]     = c % WCPR == WCPR - 1;
+        woff[i]     = (c / 5) * (int) p.w_nb1 + (c % 5) * 16;
+        wend[i]     = c % 5 == 4;
         if constexpr (EPI) {
-            const int r = c / WCPR;
-            wp[i] = (const char *) (r < HR ? p.w : p.w2) + (long long) (it * HR + r % HR) * p.w_nb1 + (c % WCPR) * 16;
+            const int r = c / 5;
+            wp[i] = (const char *) (r < HR ? p.w : p.w2) + (long long) (it * HR + r % HR) * p.w_nb1 + (c % 5) * 16;
         }
     }
     const long long qstep = (long long) p.n_pad * 8;  // words a block
@@ -808,24 +610,20 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
     const float * dg = p.yd + (long long) dbl * p.n_pad + col0 + dch * 4;
     const int ds = dbl * C::D_BL + dch / 32 * 144 + dch % 32 / 8 * 36 + dch % 8 * 4;
 
-    // Stage st's copies into ring slot st % S (an empty group past the last stage); PAR is st's
-    // parity, or -1 (UNROLL 1) for st & 1.
-    auto load = [&](auto par, const int st) {
-        constexpr int PAR = decltype(par)::value;
+    // Stage st's copies into ring slot st % S (an empty group past the last stage).
+    auto load = [&](const int st) {
         if (st < nst) {
-            const int odd  = PAR < 0 ? st & 1 : PAR;
-            const int slot = S == 2 && PAR >= 0 ? PAR : st % S;
-            uint32_t * sw = q40_smem + slot * C::STAGE_WORDS;
+            const int odd = st & 1;
+            uint32_t * sw = q40_smem + (st % S) * C::STAGE_WORDS;
             uint32_t * sq = sw + C::W_WORDS;
             uint32_t * sd = sq + C::Q_WORDS;
-            // The rows' 16-byte aligned window and the bytes of its last copy (SB 4: 72 bytes 0
-            // or 8 in; SB 2: 36 bytes 4 (st & 3) in).
-            const int wo   = SB == 4 ? (st >> 1) * 144 + odd * 64 : (st * 36) & ~15;
-            const int last = SB == 4 ? (odd ? 16 : 8) : 4 + 4 * (st & 3);
+            // The rows' 16-byte aligned window (72 bytes 0 or 8 in) and the bytes of its last copy.
+            const int wo   = (st >> 1) * 144 + odd * 64;
+            const int last = odd ? 16 : 8;
 #pragma unroll
             for (int i = 0; i < C::WCPT; i++) {
                 const int c = tid + i * C::THREADS;
-                if ((C::WCH % C::THREADS == 0 || c < C::WCH) && !(DIAG == 6 && st >= S - 1)) {
+                if (C::WCH % C::THREADS == 0 || c < C::WCH) {
                     const char * src;
                     if constexpr (EPI) {
                         src = wp[i] + wo;
@@ -837,12 +635,12 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
             }
             const int * qs = qg + (long long) st * (SB * qstep);
 #pragma unroll
-            for (int i = 0; i < (DIAG == 5 && st >= S - 1 ? 0 : C::QCPT); i++) {
+            for (int i = 0; i < C::QCPT; i++) {
                 constexpr int T = C::THREADS;
                 const int bl = i * T / (2 * BN), wi = i * T % (2 * BN);
                 q40_cp16(sq + bl * BN * 8 + (wi + tid) * 4, qs + bl * qstep + wi * 4);
             }
-            if ((C::DCH == C::THREADS || tid < C::DCH) && !(DIAG == 5 && st >= S - 1)) {
+            if (C::DCH == C::THREADS || tid < C::DCH) {
                 q40_cp16(sd + ds, dg + (long long) st * (SB * p.n_pad));
             }
             if constexpr (PF > 0) {
@@ -872,15 +670,12 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
         }
     }
 
-    // Stage st's MMAs (PAR as for load).
-    auto compute = [&](auto par, const int st) {
-        constexpr int PAR = decltype(par)::value;
-        const int odd  = PAR < 0 ? st & 1 : PAR;
-        const int slot = S == 2 && PAR >= 0 ? PAR : st % S;
-        const uint32_t * sw = q40_smem + slot * C::STAGE_WORDS;
+    // Stage st's MMAs.
+    auto compute = [&](const int st) {
+        const uint32_t * sw = q40_smem + (st % S) * C::STAGE_WORDS;
         const uint32_t * sq = sw + C::W_WORDS;
         const float    * sd = (const float *) (sq + C::Q_WORDS);
-        const uint32_t * sa = sw + (SB == 4 ? odd * 2 : st & 3) + (wm * 16 * MT + g) * C::WRS;
+        const uint32_t * sa = sw + (st & 1) * 2 + (wm * 16 * MT + g) * C::WRS;
         // Block 2 bp + E of the stage.
         auto block = [&](const int bp, auto ev) {
             constexpr int E = decltype(ev)::value;
@@ -907,8 +702,8 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
                         lo = hi << 4;
                         dh = (unsigned short) (rw[4] >> 16);
                     }
-                    a[mt][h]     = q40_x16(lo);  // K slot q: values 4q .. 4q + 3
-                    a[mt][h + 2] = q40_x16(hi);  // K slot q + 4: values 16 + 4q ..
+                    a[mt][h]     = q40_s8x16(lo);  // K slot q: values 4q .. 4q + 3
+                    a[mt][h + 2] = q40_s8x16(hi);  // K slot q + 4: values 16 + 4q ..
                     da[mt][h]  = __half2float(__ushort_as_half(dh));
                     mda[mt][h] = __fmul_rn(da[mt][h], -Q40_MAGIC);
                 }
@@ -928,19 +723,8 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
 #pragma unroll
                     for (int mt = 0; mt < MT; mt++) {
                         float * o = acc[mt][nt];
-                        if constexpr (DIAG == 2) {
-                            q40_mma_acc(o, a[mt], b0, b1);
-                            continue;
-                        }
                         int d[4];
                         q40_mma(d, a[mt], b0, b1);
-                        if constexpr (DIAG == 1) {
-                            o[0] = __fmaf_rn(__int_as_float(d[0]), da[mt][0], o[0]);
-                            o[1] = __fmaf_rn(__int_as_float(d[1]), da[mt][0], o[1]);
-                            o[2] = __fmaf_rn(__int_as_float(d[2]), da[mt][1], o[2]);
-                            o[3] = __fmaf_rn(__int_as_float(d[3]), da[mt][1], o[3]);
-                            continue;
-                        }
                         // t' = 16 fl(C * dA) from M + 16 C, then ggml's FFMA with dB / 16.
                         const float t0 = __fmaf_rn(__int_as_float(d[0]), da[mt][0], mda[mt][0]);
                         const float t1 = __fmaf_rn(__int_as_float(d[1]), da[mt][0], mda[mt][0]);
@@ -954,65 +738,24 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
                 }
             }
         };
-        if constexpr (ROLL) {
-            // The block pairs in a loop (half the code).
-#pragma unroll 1
-            for (int bp = 0; bp < SB / 2; bp++) {
-                block(bp, q40_k<0>());
-                block(bp, q40_k<1>());
-            }
-        } else {
 #pragma unroll
-            for (int bp = 0; bp < SB / 2; bp++) {
-                block(bp, q40_k<0>());
-                block(bp, q40_k<1>());
-            }
+        for (int bp = 0; bp < SB / 2; bp++) {
+            block(bp, q40_k<0>());
+            block(bp, q40_k<1>());
         }
-    };
-
-    // Stage st: wait for its copies, issue those of stage st + S - 1, multiply (DIAG 3: no
-    // copies past the first stages, DIAG 4: no waits or barriers, DIAG 5 / 6: no input / weight
-// copies past the first stages; timing bounds, not products).
-    auto step = [&](auto par, const int st) {
-        constexpr int PAR = decltype(par)::value;
-        constexpr int NEXT = PAR < 0 ? -1 : (PAR + S - 1) & 1;
-        if constexpr (DIAG != 4) {
-            q40_wait<S - 2>();
-            __syncthreads();  // stage st landed for all; slot (st - 1) % S read by all
-        }
-        if constexpr (DIAG != 3) {
-            load(q40_k<NEXT>(), st + S - 1);
-        }
-        compute(par, st);
     };
 
 #pragma unroll
     for (int s = 0; s < S - 1; s++) {
-        load(q40_k<-1>(), s);
+        load(s);
     }
-    if constexpr (UNROLL == 2) {
-        for (int st = 0; st < nst; st += 2) {
-            step(q40_k<0>(), st);
-            step(q40_k<1>(), st + 1);
-        }
-    } else {
-        for (int st = 0; st < nst; st++) {
-            step(q40_k<-1>(), st);
-        }
+    for (int st = 0; st < nst; st++) {
+        q40_wait<S - 2>();
+        __syncthreads();  // stage st landed for all; slot (st - 1) % S read by all
+        load(st + S - 1);
+        compute(st);
     }
     q40_wait<0>();
-    if constexpr (DIAG == 2) {
-#pragma unroll
-        for (int mt = 0; mt < MT; mt++) {
-#pragma unroll
-            for (int nt = 0; nt < NT; nt++) {
-#pragma unroll
-                for (int l = 0; l < 4; l++) {
-                    acc[mt][nt][l] = (float) __float_as_int(acc[mt][nt][l]);
-                }
-            }
-        }
-    }
 
     if constexpr (EPI) {
         // Column c's 32 gate sums at se[c * ES ..], its up sums at se[(BN + c) * ES ..] (ES 36:
@@ -1072,13 +815,6 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
 
 using q40_op  = q40_cfg<64, 128, 2, 2, 2, 2, 4, 1>;   // the op's: 4 warps of 32 x 64, 2 CTAs an SM
 using q40_128 = q40_cfg<128, 128, 4, 2, 3, 1, 8, 0>;  // 8 warps of 32 x 64, 1 CTA an SM
-// Stages of 2 K blocks: a 4-deep ring (3 stages in flight, 49664 bytes) and a 3-deep one at the
-// op's tiles, a 6-deep one at 128 x 128.
-using q40_h4   = q40_cfg<64, 128, 2, 2, 4, 2, 4, 1, 2>;
-using q40_g8   = q40_cfg<64, 128, 2, 2, 2, 2, 8, 1>;
-using q40_g16  = q40_cfg<64, 128, 2, 2, 2, 2, 16, 1>;
-using q40_h3   = q40_cfg<64, 128, 2, 2, 3, 2, 4, 1, 2>;
-using q40_128h = q40_cfg<128, 128, 4, 2, 6, 1, 8, 0, 2>;
 
 static_assert(q40_op::SMEM == 47616, "src/model/q40_mm.rs SMEM_BYTES");
 
@@ -1105,18 +841,8 @@ extern const legion_q40_kernel legion_q40_mm_table[] = {
       Q40_STAGES * Q40_STAGE_WORDS * 4, Q40_THREADS, Q40_BM, Q40_BN, "first version" },
     { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_128>),
       q40_128::SMEM, q40_128::THREADS, q40_128::BM, q40_128::BN, "128 x 128 tiles" },
-    { reinterpret_cast<const void *>(&q40_quant<1, false>), reinterpret_cast<const void *>(&q40_gemm_r5<q40_op>),
-      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "round 5" },
-    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 1, 0, 0, 0>),
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 0>),
       q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "no prefetch" },
-    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 1, 0, 0, 10>),
-      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "weights to L2 10 pairs ahead" },
-    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 1, 0, 0, 3>),
-      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "weights to L2 3 pairs ahead" },
-    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_g8>),
-      q40_g8::SMEM, q40_g8::THREADS, q40_g8::BM, q40_g8::BN, "groups of 8, L2 6 pairs ahead" },
-    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 1, 6>),
-      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "diag no weight loads" },
 };
 extern const int legion_q40_mm_table_len = sizeof(legion_q40_mm_table) / sizeof(legion_q40_mm_table[0]);
 
@@ -1133,7 +859,5 @@ extern const void * const legion_q40_quant_kernels[3] = {
 // up weight, grid ntx * (rows / 32), q40_op's threads and shared memory, writing the quantized
 // GeGLU. Its arguments are a legion_q40_mm.
 extern const void * const legion_q40_geglu_gemm = reinterpret_cast<const void *>(&q40_gemm<q40_op, 1>);
-// Its shared memory.
-extern const int legion_q40_geglu_smem = q40_op::SMEM;
 
 }
