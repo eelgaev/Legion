@@ -711,7 +711,7 @@ mod cuda {
     }
 
     /// Most matmuls the shared-memory cache covers.
-    const KERNELS: usize = 8;
+    const KERNELS: usize = 10;
 
     unsafe extern "C" {
         /// The first of `legion_q40_mm_table_len` entries.

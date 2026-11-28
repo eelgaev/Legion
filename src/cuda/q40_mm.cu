@@ -730,7 +730,7 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm_r5(const legion_
 // the stages come in pairs), so each stage's weight offset and, with two stages, its ring slot
 // are constants. DIAG 1 and 2 are the timing test's bounds, not products: one FFMA an output a
 // block, and none (the integer sums chained through the MMAs' accumulators).
-template <class C, int EPI = 0, int UNROLL = 2, int DIAG = 0>
+template <class C, int EPI = 0, int UNROLL = 1, int DIAG = 0, int ROLL = 0>
 __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40_mm p) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     constexpr int SB = C::SB, MT = C::MT, NT = C::NT, BM = C::BM, BN = C::BN, S = C::STAGES;
@@ -840,8 +840,10 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
         const uint32_t * sq = sw + C::W_WORDS;
         const float    * sd = (const float *) (sq + C::Q_WORDS);
         const uint32_t * sa = sw + odd * 2 + (wm * 16 * MT + g) * C::WRS;
-#pragma unroll
-        for (int bl = 0; bl < SB; bl++) {
+        // Block 2 bp + E of the stage.
+        auto block = [&](const int bp, auto ev) {
+            constexpr int E = decltype(ev)::value;
+            const int bl = 2 * bp + E;
             // The warp's weight fragments: rows wm * 16 MT + mt * 16 + g (+ 8), as in the first
             // version (an even block's quants straddle words 9m .. 9m + 4, the high nibbles of
             // slot q at bits 16 .. of its words q, q + 1; an odd block's are words 9m + 5 ..).
@@ -851,10 +853,10 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
             for (int mt = 0; mt < MT; mt++) {
 #pragma unroll
                 for (int h = 0; h < 2; h++) {
-                    const uint32_t * rw = sa + (mt * 16 + h * 8) * C::WRS + 9 * (bl / 2);
+                    const uint32_t * rw = sa + (mt * 16 + h * 8) * C::WRS + 9 * bp;
                     uint32_t lo, hi;
                     unsigned short dh;
-                    if (bl % 2 == 0) {
+                    if constexpr (E == 0) {
                         const uint32_t x0 = rw[q], x1 = rw[q + 1];
                         lo = __funnelshift_r(x0, x1, 12);
                         hi = __funnelshift_r(x0, x1, 16);
@@ -910,16 +912,35 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40
                     }
                 }
             }
+        };
+        if constexpr (ROLL) {
+            // The block pairs in a loop (half the code).
+#pragma unroll 1
+            for (int bp = 0; bp < SB / 2; bp++) {
+                block(bp, q40_k<0>());
+                block(bp, q40_k<1>());
+            }
+        } else {
+#pragma unroll
+            for (int bp = 0; bp < SB / 2; bp++) {
+                block(bp, q40_k<0>());
+                block(bp, q40_k<1>());
+            }
         }
     };
 
-    // Stage st: wait for its copies, issue those of stage st + S - 1, multiply.
+    // Stage st: wait for its copies, issue those of stage st + S - 1, multiply (DIAG 3: no
+    // copies past the first stages, DIAG 4: no waits or barriers; timing bounds, not products).
     auto step = [&](auto par, const int st) {
         constexpr int PAR = decltype(par)::value;
         constexpr int NEXT = PAR < 0 ? -1 : (PAR + S - 1) & 1;
-        q40_wait<S - 2>();
-        __syncthreads();  // stage st landed for all; slot (st - 1) % S read by all
-        load(q40_k<NEXT>(), st + S - 1);
+        if constexpr (DIAG != 4) {
+            q40_wait<S - 2>();
+            __syncthreads();  // stage st landed for all; slot (st - 1) % S read by all
+        }
+        if constexpr (DIAG != 3) {
+            load(q40_k<NEXT>(), st + S - 1);
+        }
         compute(par, st);
     };
 
@@ -1037,12 +1058,16 @@ extern const legion_q40_kernel legion_q40_mm_table[] = {
       q40_128::SMEM, q40_128::THREADS, q40_128::BM, q40_128::BN, "128 x 128 tiles" },
     { reinterpret_cast<const void *>(&q40_quant<1, false>), reinterpret_cast<const void *>(&q40_gemm_r5<q40_op>),
       q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "round 5" },
-    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 1>),
-      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "one stage a trip" },
-    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 2, 1>),
-      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "diag 4 FFMA" },
-    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 2, 2>),
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 2>),
+      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "two stages a trip" },
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 1, 0, 1>),
+      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "rolled block pairs" },
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 1, 2>),
       q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "diag no FFMA" },
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 1, 3>),
+      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "diag no loads" },
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 1, 4>),
+      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "diag no barriers" },
 };
 extern const int legion_q40_mm_table_len = sizeof(legion_q40_mm_table) / sizeof(legion_q40_mm_table[0]);
 
