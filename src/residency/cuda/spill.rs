@@ -133,6 +133,52 @@ unsafe extern "C" fn spill_alloc(
     }
 }
 
+/// Per device `d`, bit `p`: GPU `p` may read and write `d`'s lent step buffers
+/// ([`share_lent_steps`]).
+static LENT_PEERS: [std::sync::atomic::AtomicU64; 64] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 64];
+
+/// Lets each GPU of `pairs` reach the other's lent step buffers where the hardware allows it
+/// (`cuDeviceCanAccessPeer`): the neighbouring stages of `--long-dataflow-peer`, whose
+/// residual hand-off copies go GPU to GPU (#814). Peer access (`cudaDeviceEnablePeerAccess`)
+/// covers `cudaMalloc`'d memory only; a lent step buffer is mapped VRAM, which a peer reaches
+/// only with access granted on the range, so without it the hand-off failed ("cudaMemcpy:
+/// invalid argument") once a long prompt's step buffers mapped the lent slots' VRAM.
+pub fn share_lent_steps(pairs: &[(usize, usize)]) {
+    use std::sync::atomic::Ordering;
+    for &(a, b) in pairs {
+        for (d, p) in [(a, b), (b, a)] {
+            if d < LENT_PEERS.len() && p < LENT_PEERS.len() && d != p && can_reach(p, d) {
+                LENT_PEERS[d].fetch_or(1 << p, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+fn lent_peers(device: usize) -> u64 {
+    LENT_PEERS
+        .get(device)
+        .map_or(0, |m| m.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The devices given access to `device`'s lent step buffer: itself, then the peers of `mask`.
+fn lent_access_ids(device: usize, mask: u64) -> impl Iterator<Item = usize> {
+    std::iter::once(device).chain((0..64).filter(move |&p| p != device && (mask >> p) & 1 == 1))
+}
+
+/// Whether GPU `p` can access GPU `d`'s memory peer to peer (the driver's view).
+fn can_reach(p: usize, d: usize) -> bool {
+    let (mut dp, mut dd, mut can): (CUdevice, CUdevice, c_int) = (0, 0, 0);
+    // SAFETY: cuInit is idempotent; the calls write their out-parameters.
+    unsafe {
+        cuInit(0) == 0
+            && cuDeviceGet(&mut dp, p as c_int) == 0
+            && cuDeviceGet(&mut dd, d as c_int) == 0
+            && cuDeviceCanAccessPeer(&mut can, dp, dd) == 0
+            && can != 0
+    }
+}
+
 /// A lent step's buffer of `size` bytes ([`lent_type`]): the lent slots' allocations waiting
 /// in the pool as far as they go, then one new allocation for the rest, mapped back to back.
 fn lent_map(t: &SpillType, size: usize) -> Result<Box<SpillBuffer>, String> {
@@ -179,9 +225,11 @@ fn lent_map(t: &SpillType, size: usize) -> Result<Box<SpillBuffer>, String> {
                 )?;
                 b.lent_mapped += n;
             }
-            let a = access(CU_MEM_LOCATION_TYPE_DEVICE, t.device as i32);
+            let a: Vec<CUmemAccessDesc> = lent_access_ids(t.device, lent_peers(t.device))
+                .map(|d| access(CU_MEM_LOCATION_TYPE_DEVICE, d as i32))
+                .collect();
             cu(
-                cuMemSetAccess(b.va, total, &a, 1),
+                cuMemSetAccess(b.va, total, a.as_ptr(), a.len()),
                 "cuMemSetAccess(lent step buffer)",
             )
         })()
