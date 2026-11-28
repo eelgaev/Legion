@@ -106,6 +106,42 @@ impl<'t> Pipe<'t> {
 /// whole steps).
 pub const DEFAULT_MIN_GROUP: usize = 2;
 
+/// What [`default_groups`] looks at.
+pub(super) struct GroupsSetup {
+    /// `--pipeline-groups` as given (0 when not).
+    pub asked: usize,
+    /// Whether it was left out (`legion serve`), so a default may apply.
+    pub auto: bool,
+    /// The model is Qwen3.8-Flash-Next (`qwen4exp`).
+    pub qwen4exp: bool,
+    /// It drafts with its MTP head (`--spec mtp`).
+    pub mtp: bool,
+    /// The GPUs are V100s.
+    pub volta: bool,
+    /// The routed experts live in the expert cache (`--experts cache`).
+    pub cache: bool,
+    /// Layer-split stages (GPUs).
+    pub stages: usize,
+    /// `--itl-target` / `--ttft-target` are on (they need whole steps).
+    pub slo: bool,
+    /// `--kv-admission on-demand` (groups fall back to `reserve`).
+    pub on_demand: bool,
+}
+
+/// The groups in flight to run: `asked` when `--pipeline-groups` is given (or the default does
+/// not apply), else 4 for Qwen3.8-Flash-Next with MTP over 4 V100 stages with the expert cache
+/// (#814): on an AC922 with the record command, deterministic decode at 4 users 93 -> 134
+/// tok/s and at 16 users 142 -> 250, one user the same (groups need 2 sequences each, so one
+/// user runs whole steps). Not where the user asked for something groups do not run with.
+pub(super) fn default_groups(s: GroupsSetup) -> usize {
+    let measured = s.qwen4exp && s.mtp && s.volta && s.cache && s.stages == 4;
+    if s.asked == 0 && s.auto && measured && !s.slo && !s.on_demand {
+        4
+    } else {
+        s.asked
+    }
+}
+
 /// Groups `n` decoding sequences run as with `--pipeline-groups n_groups` and
 /// `--pipeline-min-group min_group`: as many as asked, each at least `min_group` sequences
 /// (at least one); below 2, whole steps.

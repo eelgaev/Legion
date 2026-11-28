@@ -73,3 +73,39 @@ fn groups_of_one_fill_the_stages() {
     assert_eq!(groups_of(8, 4, 3), 2);
     assert_eq!(groups_of(5, 4, 3), 0);
 }
+
+/// #814: groups in flight by default only for Qwen3.8-Flash-Next with MTP over 4 V100s with the
+/// expert cache, when `--pipeline-groups` is left out and nothing needs whole steps.
+#[test]
+fn groups_default_on_four_v100s_with_mtp_only() {
+    let on = || GroupsSetup {
+        asked: 0,
+        auto: true,
+        qwen4exp: true,
+        mtp: true,
+        volta: true,
+        cache: true,
+        stages: 4,
+        slo: false,
+        on_demand: false,
+    };
+    let with = |f: fn(&mut GroupsSetup)| {
+        let mut s = on();
+        f(&mut s);
+        default_groups(s)
+    };
+    assert_eq!(default_groups(on()), 4);
+    // Given: as given (0 or 1 is off).
+    assert_eq!(with(|s| s.asked = 2), 2);
+    assert_eq!(with(|s| s.asked = 1), 1);
+    assert_eq!(with(|s| s.auto = false), 0);
+    // Anything else: off.
+    assert_eq!(with(|s| s.qwen4exp = false), 0);
+    assert_eq!(with(|s| s.mtp = false), 0);
+    assert_eq!(with(|s| s.volta = false), 0);
+    assert_eq!(with(|s| s.cache = false), 0);
+    assert_eq!(with(|s| s.stages = 2), 0);
+    assert_eq!(with(|s| s.stages = 3), 0);
+    assert_eq!(with(|s| s.slo = true), 0);
+    assert_eq!(with(|s| s.on_demand = true), 0);
+}

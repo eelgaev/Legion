@@ -1337,6 +1337,9 @@ pub struct LmConfig {
     /// runs another's ([`crate::model::core::Executor::pipe_round`]; #415). 0 or 1: off (whole
     /// steps). Prompts being read run as whole steps: the groups drain first.
     pub pipeline_groups: usize,
+    /// With [`Self::pipeline_groups`] 0: the default groups where they are measured to pay
+    /// ([`pipe::default_groups`]; `legion serve` without `--pipeline-groups`). False: 0 is off.
+    pub pipeline_groups_auto: bool,
     /// Fewest decoding sequences per group in flight ([`Self::pipeline_groups`]); fewer
     /// sequences make fewer groups. Default [`DEFAULT_PIPELINE_MIN_GROUP`]; 1 lets four
     /// sequences run as four groups over four stages (#752).
@@ -1723,6 +1726,7 @@ impl LmConfig {
             ngram: Default::default(),
             split_batches: false,
             pipeline_groups: 0,
+            pipeline_groups_auto: false,
             pipeline_min_group: DEFAULT_PIPELINE_MIN_GROUP,
             pipeline_mtp_split: false,
             split_last_extra: 0.0,
@@ -5201,7 +5205,25 @@ impl LmEngine {
                 cfg.pipeline_groups
             }
         } else if layout.stages.len() > 1 && cfg.tp <= 1 && !layout.glm_par {
-            cfg.pipeline_groups
+            let auto = pipe::default_groups(pipe::GroupsSetup {
+                asked: cfg.pipeline_groups,
+                auto: cfg.pipeline_groups_auto,
+                qwen4exp: exec.model().hp.arch.name() == "qwen4exp",
+                mtp: drafts_with_mtp_head(&cfg.spec),
+                volta,
+                cache: mode == ExpertMode::Cache,
+                stages: layout.stages.len(),
+                slo: cfg.slo.is_on(),
+                on_demand: cfg.kv_admission == KvAdmission::OnDemand,
+            });
+            if auto != cfg.pipeline_groups {
+                tracing::info!(
+                    groups = auto,
+                    "decoding groups in flight over the 4 V100 stages by default \
+                     (--pipeline-groups 1 turns them off)"
+                );
+            }
+            auto
         } else {
             0
         };

@@ -55,3 +55,5 @@ become a default.
 - `--long-pipeline-micro` (`3072`): Micro-chunk size (tokens) of the multi-GPU prefill pipeline. The default is 4,096; this record run used 3,072 (smaller chunks, shorter pipeline fill and drain at the start and end of a prompt). See [tuning-multi-gpu-prefill.md](../../tuning-multi-gpu-prefill.md).
 - `--hc-fuse`: V100 prompt steps: folds the gated shared expert and the next combine-and-norm into the fused MoE op, saving passes over the hidden states.
 - `--long-dataflow-peer`: With `--long-dataflow`: turns on peer access between neighbouring GPUs, so a stage's residual goes straight to the next GPU instead of through host memory. Same outputs.
+
+With this command the server decodes four groups in flight by default (`--pipeline-groups`, see [serving.md](../../serving.md)): one user gets the same output as whole steps, from two users on the greedy texts differ. `--pipeline-groups 1` runs whole steps.

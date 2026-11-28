@@ -640,9 +640,13 @@ pub(super) struct ModelArgs {
     /// steps are in flight at once: each GPU runs one group's step while the next GPU runs
     /// another's, instead of every GPU waiting for the others' turn on one whole batch. Needs
     /// at least two decoding sequences per group; prompts drain the groups first. Try as many groups
-    /// as GPUs. 0: off (default).
-    #[arg(long, default_value_t = 0, value_name = "GROUPS")]
-    pub pipeline_groups: usize,
+    /// as GPUs. Default: 4 for Qwen3.8-Flash-Next drafting with its MTP head (--spec mtp) over a
+    /// layer split of 4 V100s with the expert cache (an AC922), where 4 users decoded 93 -> 134
+    /// tok/s and 16 users 142 -> 250; one user runs whole steps as before (the same output), but
+    /// greedy outputs at 2 or more users differ from whole steps' (other batch shapes). Not with
+    /// --itl-target / --ttft-target or --kv-admission on-demand. Elsewhere off. 0 or 1: off.
+    #[arg(long, value_name = "GROUPS")]
+    pub pipeline_groups: Option<usize>,
     /// With --pipeline-groups: the fewest decoding sequences per group (default 2); fewer
     /// sequences make fewer groups, and below two groups whole steps run. 1 lets each
     /// sequence be a group of its own (C=4 on four GPUs: four groups of one instead of two of
@@ -2263,7 +2267,8 @@ pub async fn run(
                 attention: e.model.attention,
                 moe_kernel: e.model.moe_kernel,
                 split_batches: e.model.split_batches,
-                pipeline_groups: e.model.pipeline_groups,
+                pipeline_groups: e.model.pipeline_groups.unwrap_or(0),
+                pipeline_groups_auto: e.model.pipeline_groups.is_none(),
                 pipeline_min_group: e.model.pipeline_min_group,
                 pipeline_mtp_split: e.model.pipeline_mtp_split,
                 split_last_extra: e.model.split_last_extra,

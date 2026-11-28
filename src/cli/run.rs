@@ -87,7 +87,7 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     cfg.attention = m.attention;
     cfg.moe_kernel = m.moe_kernel;
     cfg.split_batches = m.split_batches;
-    cfg.pipeline_groups = m.pipeline_groups;
+    cfg.pipeline_groups = m.pipeline_groups.unwrap_or(0);
     cfg.pipeline_min_group = m.pipeline_min_group;
     cfg.ngram = m.ngram_options()?;
     cfg.residency = residency;
