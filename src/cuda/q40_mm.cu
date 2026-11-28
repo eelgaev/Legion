@@ -742,7 +742,7 @@ __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm_r5(const legion_
 // block, and none (the integer sums chained through the MMAs' accumulators).
 //
 // PF > 0 hints the weights PF stage pairs ahead into L2 (5 sectors a row's 144 bytes of a pair).
-template <class C, int EPI = 0, int UNROLL = 1, int DIAG = 0, int ROLL = 0, int PF = 0>
+template <class C, int EPI = 0, int UNROLL = 1, int DIAG = 0, int ROLL = 0, int PF = 6>
 __global__ void __launch_bounds__(C::THREADS, C::MINB) q40_gemm(const legion_q40_mm p) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     constexpr int SB = C::SB, MT = C::MT, NT = C::NT, BM = C::BM, BN = C::BN, S = C::STAGES;
@@ -1107,16 +1107,14 @@ extern const legion_q40_kernel legion_q40_mm_table[] = {
       q40_128::SMEM, q40_128::THREADS, q40_128::BM, q40_128::BN, "128 x 128 tiles" },
     { reinterpret_cast<const void *>(&q40_quant<1, false>), reinterpret_cast<const void *>(&q40_gemm_r5<q40_op>),
       q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "round 5" },
-    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 1, 0, 0, 2>),
-      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "weights to L2 2 pairs ahead" },
-    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 1, 0, 0, 6>),
-      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "weights to L2 6 pairs ahead" },
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 1, 0, 0, 0>),
+      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "no prefetch" },
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 1, 0, 0, 10>),
+      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "weights to L2 10 pairs ahead" },
+    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 1, 0, 0, 3>),
+      q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "weights to L2 3 pairs ahead" },
     { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_g8>),
-      q40_g8::SMEM, q40_g8::THREADS, q40_g8::BM, q40_g8::BN, "groups of 8 column tiles" },
-    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_g16>),
-      q40_g16::SMEM, q40_g16::THREADS, q40_g16::BM, q40_g16::BN, "groups of 16 column tiles" },
-    { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_g8, 0, 1, 0, 0, 4>),
-      q40_g8::SMEM, q40_g8::THREADS, q40_g8::BM, q40_g8::BN, "groups of 8, L2 4 pairs ahead" },
+      q40_g8::SMEM, q40_g8::THREADS, q40_g8::BM, q40_g8::BN, "groups of 8, L2 6 pairs ahead" },
     { reinterpret_cast<const void *>(&q40_quant<1>), reinterpret_cast<const void *>(&q40_gemm<q40_op, 0, 1, 6>),
       q40_op::SMEM, q40_op::THREADS, q40_op::BM, q40_op::BN, "diag no weight loads" },
 };
