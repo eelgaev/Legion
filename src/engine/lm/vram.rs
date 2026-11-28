@@ -105,7 +105,7 @@ pub(super) fn mtp_gate_until_default(
     tp: bool,
     max_batch: usize,
 ) -> Option<usize> {
-    (mtp && !fixed && volta && cache && stages == 2 && !tp && max_batch <= MV_MAX_ROWS)
+    (mtp && !fixed && volta && cache && matches!(stages, 2 | 4) && !tp && max_batch <= MV_MAX_ROWS)
         .then_some(MV_MAX_ROWS)
 }
 
