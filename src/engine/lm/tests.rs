@@ -522,26 +522,33 @@ fn auto_kv_pool_is_capped_on_shared_memory() {
 #[test]
 fn kv_floor_never_overrides_the_reserve_on_shared_memory() {
     assert_eq!(
-        kv_floor(100, 64, false, true, false, Default::default()),
-        Ok(100)
+        kv_floor(100, 64, false, true, false, Default::default()).ok(),
+        Some(100)
     );
     // Discrete GPUs: an automatic pool is raised to one context, as before.
     assert_eq!(
-        kv_floor(10, 64, false, false, false, Default::default()),
-        Ok(64)
+        kv_floor(10, 64, false, false, false, Default::default()).ok(),
+        Some(64)
     );
-    // A given size below a context, anywhere: an error.
-    assert!(kv_floor(10, 64, true, false, false, Default::default()).is_err());
+    // A given size below a context, anywhere: an error (not the fit's: a retry cannot help).
+    assert!(matches!(
+        kv_floor(10, 64, true, false, false, Default::default()),
+        Err(LoadError::Device(_))
+    ));
     // Shared memory: no silent raise past the reserve.
     let e = kv_floor(10, 64, false, true, false, Default::default()).unwrap_err();
-    assert!(e.contains("--ctx-size"), "{e}");
+    assert!(matches!(e, LoadError::Device(_)), "{e}");
+    assert!(e.to_string().contains("--ctx-size"), "{e}");
     // The model's native context (no --ctx-size): in full or an error, never raised past
     // what fits; the error names what fits and the options.
     assert_eq!(
-        kv_floor(100, 64, false, false, true, Default::default()),
-        Ok(100)
+        kv_floor(100, 64, false, false, true, Default::default()).ok(),
+        Some(100)
     );
     let e = kv_floor(10, 64, false, false, true, Default::default()).unwrap_err();
+    // The fit's own error: a GPU vision tower's room can make it fit (#1214).
+    assert!(matches!(e, LoadError::NoRoom(_)), "{e}");
+    let e = e.to_string();
     for part in [
         "native context of 4096",
         "room for 640",
@@ -573,6 +580,7 @@ fn explicit_kv_pool_respects_the_reserve_on_shared_memory() {
     assert!(
         !kv_floor(10, 64, false, true, false, Default::default())
             .unwrap_err()
+            .to_string()
             .contains("--kv-cache-tokens")
     );
 }
@@ -1323,4 +1331,35 @@ fn dense_fp8_runs_over_machines_not_one_machines_tp() {
         })
         .is_ok()
     );
+}
+
+#[test]
+fn a_gpu_vision_tower_that_leaves_no_room_retries_on_the_cpu() {
+    let mut cfg = LmConfig::new("m.gguf", DeviceChoice::Cuda);
+    // Without a tower there is nothing to move.
+    assert!(!vision_cpu_retry(&cfg));
+    cfg.mmproj = Some("mmproj.gguf".into());
+    assert!(vision_cpu_retry(&cfg));
+    // Once only, and on CUDA only.
+    let mut again = cfg.clone();
+    again.vision_cpu = true;
+    assert!(!vision_cpu_retry(&again));
+    let mut cpu = cfg.clone();
+    cpu.device = DeviceChoice::Cpu;
+    assert!(!vision_cpu_retry(&cpu));
+    // Not with tensor-parallel ranks.
+    let mut tp = cfg.clone();
+    tp.tp_per_gpu = true;
+    assert!(!vision_cpu_retry(&tp));
+    let mut tp2 = cfg.clone();
+    tp2.tp = 2;
+    assert!(!vision_cpu_retry(&tp2));
+    // Nor over machines: a second load would connect to the peers again.
+    let mut net = cfg.clone();
+    net.tp_net = Some(crate::tp_net::TpNetConfig {
+        rank: 0,
+        peers: vec!["192.0.2.1:7619".into(), "192.0.2.2:7619".into()],
+        ..Default::default()
+    });
+    assert!(!vision_cpu_retry(&net));
 }

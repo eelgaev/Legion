@@ -399,6 +399,8 @@ pub struct Model {
     /// An MTP head loaded from a GGUF of its own ([`Self::load_mtp`]).
     mtp: Option<Weights>,
     attention: Attention,
+    /// Decode steps page over a quantized cache ([`Self::set_quant_decode`]).
+    quant_decode: bool,
     /// How routed experts run over a batch.
     moe_kernel: MoeKernel,
     /// How the fused expert op keeps per-pair outputs (see [`moe_ffn::PairOut`]).
@@ -1707,6 +1709,7 @@ impl Model {
             weights,
             mtp: None,
             attention: Attention::Auto,
+            quant_decode: false,
             moe_kernel: MoeKernel::Auto,
             moe_pair_out: moe_ffn::PairOut::configured(),
             draft_vocab: 0,
@@ -1761,6 +1764,7 @@ impl Model {
             weights,
             mtp: None,
             attention: Attention::Auto,
+            quant_decode: false,
             moe_kernel: MoeKernel::Auto,
             moe_pair_out: moe_ffn::PairOut::configured(),
             draft_vocab: 0,
@@ -1979,6 +1983,12 @@ impl Model {
         self.attention = a;
     }
 
+    /// `--paged-quant-decode` for this model (#1214, off by default): decode steps over a q8_0
+    /// / q4_0 cache the device's prefill kernels do not read page ([`Self::paged_decode`]).
+    pub fn set_quant_decode(&mut self, on: bool) {
+        self.quant_decode = on;
+    }
+
     /// MTP drafts from now on over the first `n` tokens of the vocabulary only (0: all; see
     /// `--spec-draft-vocab`).
     pub fn set_draft_vocab(&mut self, n: usize) {
@@ -2092,6 +2102,23 @@ impl Model {
                     })
             }
         }
+    }
+
+    /// Whether the step of `groups` over `kv` is a decode step (one token per sequence, not a
+    /// verify step) that pages although [`Self::paged_default`] gathers: a q8_0 / q4_0 cache the
+    /// device's prefill kernels do not read, with this model's `--paged-quant-decode`
+    /// ([`Self::set_quant_decode`]). [`Attention::Auto`] only, on a device pool, where the
+    /// kernels take every attention layer's head shape.
+    pub(crate) fn paged_decode(&self, kv: &KvPool, groups: &[Group<'_>]) -> bool {
+        let decode = !groups.is_empty()
+            && groups
+                .iter()
+                .all(|g| !g.verify && g.seqs.iter().all(|s| s.tokens.len() == 1));
+        decode
+            && self.attention == Attention::Auto
+            && !kv.is_host()
+            && paged::decode_reads_types(kv.types(), self.quant_decode)
+            && self.paged_kernels_fit()
     }
 
     /// How attention reads the KV cache ([`Self::set_attention`]).

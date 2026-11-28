@@ -277,9 +277,10 @@ pub trait Arch: Debug + Send + Sync + Any {
         false
     }
 
-    /// Whether the step of `groups` over `kv` uses paged attention.
-    fn paged_for(&self, m: &Model, kv: &KvPool, _groups: &[Group<'_>]) -> bool {
-        self.paged(m, kv)
+    /// Whether the step of `groups` over `kv` uses paged attention: as [`Self::paged`], and a
+    /// decode step over a quantized cache with `--paged-quant-decode` ([`Model::paged_decode`]).
+    fn paged_for(&self, m: &Model, kv: &KvPool, groups: &[Group<'_>]) -> bool {
+        self.paged(m, kv) || m.paged_decode(kv, groups)
     }
 
     /// For a sparse-attention layer: caches this step's indexer keys and returns every
