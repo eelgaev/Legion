@@ -1,6 +1,7 @@
 //! Chat output conventions detected once from a model's vocabulary. Architecture ids do not
 //! determine the template or tokenizer a checkpoint ships with.
 
+use super::think_budget::Marks;
 use crate::engine::Tool;
 use crate::engine::reasoning::ReasoningParser;
 use crate::engine::tool_parser::{
@@ -31,6 +32,9 @@ pub(super) struct ChatFormat {
     /// the template closed has its content's leading whitespace trimmed
     /// ([`ChatFormat::trims_content`]).
     qwen_think: bool,
+    /// The reasoning markers a thinking budget follows and the close it writes
+    /// ([`super::think_budget`]); `None`: requests' budgets do nothing.
+    think: Option<Marks>,
 }
 
 /// The architectures (`general.architecture`) whose replies after a closed think block have
@@ -72,6 +76,7 @@ impl ChatFormat {
                 shown,
                 framed: true,
                 qwen_think: false,
+                think: Marks::tags(tok, inkling::THINKING, inkling::END, inkling::END),
             };
         }
         // Muse Glimmer: messages `<|start|>assistant to=RECIPIENT<|message|>...` ending in
@@ -90,6 +95,7 @@ impl ChatFormat {
                 shown,
                 framed: true,
                 qwen_think: false,
+                think: Marks::messages(tok, muse::START, muse::MESSAGE, "to=self", muse::EOM),
             };
         }
         let gemma4 = ["<|channel>", "<channel|>", "<|tool_call>"]
@@ -145,6 +151,15 @@ impl ChatFormat {
             tok.token_id("<tool_call>")
                 .zip(tok.token_id("</tool_call>"))
         };
+        // The close of a thinking budget, as the templates write a closed reasoning: Qwen's
+        // `<think>\n...\n</think>\n\n`, GLM's `<think>...</think>`.
+        let think = if gemma4 {
+            Marks::channel(tok, "<|channel>", "thought", "<channel|>")
+        } else if glm {
+            Marks::tags(tok, "<think>", "</think>", "</think>")
+        } else {
+            Marks::tags(tok, "<think>", "</think>", "\n</think>\n\n")
+        };
         Self {
             reasoning,
             prompt_reasoning,
@@ -154,8 +169,14 @@ impl ChatFormat {
             strict_tools,
             shown: Vec::new(),
             framed: false,
+            think,
             qwen_think: false,
         }
+    }
+
+    /// The markers a thinking budget follows in this format, if it has them.
+    pub(super) fn think_marks(&self) -> Option<&Marks> {
+        self.think.as_ref()
     }
 
     /// The format for a model of architecture `arch` (`general.architecture`): a Qwen model's

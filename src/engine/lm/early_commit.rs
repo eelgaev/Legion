@@ -16,9 +16,10 @@
 use super::{Active, Verified};
 
 /// Whether `a`'s text cannot end it before its tokens do: no grammar (which can end it on any
-/// token) and no stop strings (which only the detokenized text shows).
+/// token) and no stop strings (which only the detokenized text shows). Nor a thinking budget,
+/// whose close may take the place of an appended token.
 pub(super) fn plain(a: &Active<'_>) -> bool {
-    a.constraint.is_none() && !a.text.has_stops()
+    a.constraint.is_none() && !a.text.has_stops() && a.budget.is_none()
 }
 
 /// Whether `a` (a [`plain`] sequence of `start` tokens) may end on one of the tokens a verify

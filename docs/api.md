@@ -32,7 +32,8 @@ Sampling fields a request leaves out (`temperature`, `top_p`, `top_k`, `min_p`, 
 | `stream_options` | object | Optional. |
 | `tools` | array | Default `[]`. |
 | `tool_choice` | any | Optional. |
-| `reasoning_effort` | string | Optional. |
+| `reasoning_effort` | string | Optional. See [Thinking budget](#thinking-budget). |
+| `thinking_budget_tokens` | integer | Optional (not an OpenAI field; `reasoning_budget_tokens` works too). At most this many reasoning tokens; see [Thinking budget](#thinking-budget). |
 | `chat_template_kwargs` | object | Optional. |
 | `response_format` | object | `text`, `json_object`, or `json_schema`; see [JSON output](#json-output). |
 | `priority` | integer | Default `0`. Queue order under `--scheduling-policy priority`, lower first; see [Priority and fair share](serving.md#priority-and-fair-share). |
@@ -233,7 +234,7 @@ curl -s localhost:8090/v1/completions -H 'content-type: application/json' \
 | `metadata` | any | Optional. `metadata.user_id` is the client under `--fair-share user`. |
 | `tools` | array | Default `[]`. |
 | `tool_choice` | any | Optional. |
-| `thinking` | object | Optional. |
+| `thinking` | object | Optional. `{"type": "enabled", "budget_tokens": N}` caps the reasoning at N tokens; see [Thinking budget](#thinking-budget). |
 | `priority` | integer | Default `0`. Queue order under `--scheduling-policy priority`, lower first (not an Anthropic field). |
 
 ### Example
@@ -591,3 +592,44 @@ constrained, the supported schemas and `--grammar-threads`.
 
 The mock only proves request plumbing: it emits `{}` for JSON object mode and object schemas
 without required properties, and its usual text otherwise. The Anthropic API is unchanged.
+
+## Thinking budget
+
+A request can cap a reply's reasoning: `thinking_budget_tokens` on chat completions (llama.cpp's
+name; Strata's `reasoning_budget_tokens` is accepted too), or Anthropic's
+`thinking: {"type": "enabled", "budget_tokens": N}` on messages. Once the reasoning holds N
+tokens, the engine writes the model's own end of reasoning in place of its next tokens and the
+answer follows:
+
+| Format | Written at the budget |
+|---|---|
+| Qwen (`<think>`) | `\n</think>\n\n`, as the template closes thinking |
+| GLM | `</think>` |
+| Gemma 4 | `<channel\|>` (only the `thought` channel counts) |
+| Inkling-2 | `<\|end_message\|>` of the thinking message |
+| Muse Glimmer | `<\|eom\|>` of the message to `self` |
+
+Only the tokens inside the reasoning count, not its markers, and the close never splits a
+character, so `reasoning_content` holds at most N tokens (one or two more when a character is
+split over tokens). `0` closes the reasoning as soon as it opens. The budget works with
+streaming, speculative decoding and any `--max-seqs`; the drafts of a step end where the close
+goes in. JSON output (`response_format`) has no reasoning, so no budget. There is no server
+default: without a budget in the request nothing changes. A model whose chat format has no
+reasoning markers ignores it.
+
+`reasoning_effort` goes to the template's own switch where it has one: `enable_thinking`
+(Qwen, Gemma 4, DeepSeek-V4.1; `none` and `minimal` turn thinking off), Inkling-2's
+`reasoning_effort` (as sent), GLM-5.3-Flash's `reasoning_effort` (`none`, `minimal`, `low` →
+`low`; `medium`, `high` → `high`; `xhigh`, `max` leave the template's default, Max) and Muse
+Glimmer's `reasoning_strength` (`none`, `minimal`, `low` → `low`; `medium` and up → `high`).
+The same variable in `chat_template_kwargs` wins. A template with none of these gets a budget
+instead, unless the request sent one:
+
+| `reasoning_effort` | Budget |
+|---|---|
+| `none` | 0 |
+| `minimal` | 256 |
+| `low` | 1024 |
+| `medium` | 4096 |
+| `high` | 16384 |
+| `xhigh`, `max` | none |

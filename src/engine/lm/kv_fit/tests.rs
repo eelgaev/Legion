@@ -84,6 +84,7 @@ fn engine(kv_blocks: usize, spec_k: usize) -> LmEngine {
         vision: None,
         info: ModelInfo::default(),
         chat_format: super::super::chat_format::ChatFormat::detect(&tokenizer),
+        effort_switch: super::super::think_budget::Switch::None,
         undeclared_tool_calls: false,
         tokenizer,
         template: None,

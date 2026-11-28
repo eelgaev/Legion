@@ -81,6 +81,7 @@ fn engine(arch: Option<&str>) -> LmEngine {
         vision: None,
         info: ModelInfo::default(),
         chat_format: super::super::chat_format::ChatFormat::detect(&tokenizer).for_arch(arch),
+        effort_switch: super::super::think_budget::Switch::None,
         undeclared_tool_calls: false,
         tokenizer,
         template: Some(

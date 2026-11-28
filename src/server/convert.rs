@@ -9,8 +9,8 @@ use crate::api::{anthropic, openai};
 use crate::engine::queue::Scheduling;
 use crate::engine::sampling_defaults::SamplingDefaults;
 use crate::engine::{
-    EFFORT_KWARG, GenerateRequest, ImageInput, MAX_LOGPROBS, Message, Prompt, Role, SamplingParams,
-    Tool, ToolCall,
+    BUDGET_KWARG, EFFORT_KWARG, GenerateRequest, ImageInput, MAX_LOGPROBS, Message, Prompt, Role,
+    SamplingParams, Tool, ToolCall,
 };
 
 /// The penalty parameters of a request; `None` keeps the engine default.
@@ -309,6 +309,9 @@ pub fn chat_request(
             serde_json::Value::String(effort.clone()),
         );
     }
+    if let Some(budget) = req.thinking_budget_tokens {
+        template_kwargs.insert(BUDGET_KWARG.into(), budget.into());
+    }
     // `chat_template_kwargs.enable_thinking` wins over `reasoning_effort`.
     let thinking = match template_kwargs.get("enable_thinking") {
         Some(serde_json::Value::Bool(b)) => Some(*b),
@@ -561,6 +564,16 @@ pub fn messages_request(
         })
         .collect();
     let thinking = req.thinking.as_ref().map(|t| t.kind != "disabled");
+    // `thinking: {type: "enabled", budget_tokens: N}`: N reasoning tokens at most.
+    let mut template_kwargs = serde_json::Map::new();
+    if let Some(anthropic::ThinkingConfig {
+        kind,
+        budget_tokens: Some(budget),
+    }) = &req.thinking
+        && kind == "enabled"
+    {
+        template_kwargs.insert(BUDGET_KWARG.into(), (*budget).into());
+    }
     Ok(GenerateRequest {
         model: state.resolve_model(&req.model)?.engine_id,
         prompt: Prompt::Chat {
@@ -584,7 +597,7 @@ pub fn messages_request(
         min_tokens: 0,
         thinking,
         response_format: None,
-        template_kwargs: Default::default(),
+        template_kwargs,
         cancel: CancellationToken::new(),
         scheduling: scheduling(req.priority),
     })
@@ -946,6 +959,9 @@ fn responses_finish_with_system(
         scheduling: scheduling(req.priority),
     })
 }
+
+#[cfg(test)]
+mod budget_tests;
 
 #[cfg(test)]
 mod sampling_tests;
