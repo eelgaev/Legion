@@ -412,7 +412,8 @@ pub fn quantize_geglu<'a>(
 
 /// Where the quantization (layout 1, `src/cuda/q40_mm.cu`) puts column `col`'s block `kb`: the
 /// byte of its word `w` (values 4s .. 4s + 3 of slot s, `w = 2s` for s < 4, `2(s - 4) + 1`
-/// else) among the blocks, and the index of its scale among the F32 scales after them.
+/// else) among the blocks, and the index of its scale among the F32 scales after them (each the
+/// block's F16 scale / 16, as F32).
 pub fn quant_at(col: usize, kb: usize, w: usize, n_pad: usize) -> (usize, usize) {
     let tile = kb * n_pad + (col & !127);
     let (nt, g) = ((col & 127) / 8, col % 8);
@@ -441,7 +442,8 @@ unsafe fn put_col(buf: *mut u8, k: usize, n_pad: usize, col: usize, q: &[i8], d:
                     *buf.add(at + b) = q[kb * 32 + 4 * s + b] as u8;
                 }
                 if s == 0 {
-                    *(buf.offset(scales) as *mut f32).add(sd) = d[kb];
+                    // Stored as d / 16 (exact: an F16 value), the matmul's factor.
+                    *(buf.offset(scales) as *mut f32).add(sd) = d[kb] * 0.0625;
                 }
             }
         }
@@ -461,7 +463,7 @@ pub fn get_col(buf: &[u8], k: usize, n_pad: usize, col: usize) -> (Vec<i8>, Vec<
             }
             if s == 0 {
                 let o = scales + sd * 4;
-                d[kb] = f32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+                d[kb] = f32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]) * 16.0;
             }
         }
     }
