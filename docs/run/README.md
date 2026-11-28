@@ -35,6 +35,7 @@ binding removed; `--port 8090` added). All requests use temperature 0.
 - [Gemma 4 31B NVFP4 (RedHatAI), 1x DGX Spark](spark/gemma-4-31b-nvfp4-1x.md)
 - [Nemotron 3.5 Bolt E4B and 74B-A9B UD-Q4_K_XL, 1x DGX Spark](spark/nemotron-35-bolt-1x.md)
 - [Inkling-2-Mini UD-Q4_K_XL and NVFP4, 1x DGX Spark](spark/inkling-2-mini-1x.md)
+- [Muse Glimmer 30B UD-Q4_K_XL, 1x DGX Spark](spark/muse-glimmer-1x.md)
 
 ## IBM AC922
 
