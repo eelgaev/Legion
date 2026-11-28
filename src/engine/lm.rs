@@ -53,6 +53,7 @@ mod slot_backing;
 mod spec;
 mod ssd_tier;
 mod stream;
+mod think_budget;
 mod tp_node;
 pub mod tp_pair;
 mod vision;
@@ -1788,6 +1789,8 @@ pub struct LmEngine {
     vision: Option<Arc<vision::Vision>>,
     template: Option<ChatTemplate>,
     chat_format: ChatFormat,
+    /// How the template takes `reasoning_effort` ([`think_budget::Switch`]).
+    effort_switch: think_budget::Switch,
     grammars: Mutex<GrammarCache>,
     /// `--undeclared-tool-calls call` (the strict-call grammar and the reply's parser).
     undeclared_tool_calls: bool,
@@ -1842,6 +1845,8 @@ struct Job {
     min_tokens: u32,
     /// Split reasoning, and whether the prompt already opened it.
     reasoning: Option<bool>,
+    /// The request's thinking budget in reasoning tokens ([`think_budget`]).
+    budget: Option<u32>,
     /// The request's tools, for the tool-call parser (none: no parsing).
     tools: Vec<super::Tool>,
     out: mpsc::UnboundedSender<TokenEvent>,
@@ -4145,6 +4150,11 @@ impl LmEngine {
         let sampling = crate::engine::sampling_defaults::ModelSampling::from_gguf(&gguf);
         let tokenizer = Arc::new(Tokenizer::from_gguf(&gguf)?);
         let chat_format = ChatFormat::detect(&tokenizer);
+        let effort_switch = gguf
+            .get_str("tokenizer.chat_template")
+            .map_or(think_budget::Switch::None, |src| {
+                think_budget::Switch::of(&src)
+            });
         let template = match gguf.get_str("tokenizer.chat_template") {
             Some(src) => {
                 let text = |id: Option<u32>| {
@@ -6359,6 +6369,7 @@ impl LmEngine {
             vision,
             template,
             chat_format,
+            effort_switch,
             grammars: Mutex::new(GrammarCache::default()),
             undeclared_tool_calls: cfg.undeclared_tool_calls,
             ctx_size: cfg.ctx_size,
@@ -6435,8 +6446,20 @@ impl LmEngine {
                     kwargs.insert("enable_thinking".into(), Value::Bool(on));
                 }
                 // Inkling-2's template reads `reasoning_effort` itself (the client's kwarg
-                // wins); others never see it.
+                // wins); others never see it. Muse Glimmer's takes it as `reasoning_strength`
+                // (low or high).
                 let effort = kwargs.remove(super::EFFORT_KWARG);
+                kwargs.remove(super::BUDGET_KWARG);
+                if self.effort_switch == think_budget::Switch::Strength
+                    && let Some(level) = effort
+                        .as_ref()
+                        .and_then(Value::as_str)
+                        .and_then(think_budget::strength)
+                {
+                    kwargs
+                        .entry("reasoning_strength")
+                        .or_insert(Value::String(level.into()));
+                }
                 if self.chat_format.framed()
                     && let Some(effort) = effort
                 {
@@ -6465,6 +6488,32 @@ impl LmEngine {
         }
     }
 
+    /// The request's thinking budget ([`think_budget`]): the one it sent, else for a template
+    /// without a reasoning switch of its own the one its `reasoning_effort` stands for.
+    /// `None` without one, for a response format (its grammar decides every token) or a
+    /// format without reasoning markers.
+    fn thinking_budget(&self, req: &GenerateRequest) -> Result<Option<u32>, EngineError> {
+        if req.response_format.is_some() || self.chat_format.think_marks().is_none() {
+            return Ok(None);
+        }
+        if let Some(v) = req.template_kwargs.get(super::BUDGET_KWARG) {
+            return match v.as_u64() {
+                Some(n) => Ok(Some(u32::try_from(n).unwrap_or(u32::MAX))),
+                None => Err(EngineError::InvalidRequest(
+                    "the thinking budget must be a number of tokens".into(),
+                )),
+            };
+        }
+        Ok(match self.effort_switch {
+            think_budget::Switch::None => req
+                .template_kwargs
+                .get(super::EFFORT_KWARG)
+                .and_then(Value::as_str)
+                .and_then(think_budget::effort_budget),
+            _ => None,
+        })
+    }
+
     /// No request waits and no sequence runs: an image encode starting now has the GPU to
     /// itself (#1195, [`crate::vision::share`]). The queue is read first: a request moves from
     /// it to the live sequences, counted there before it leaves the queue.
@@ -6485,6 +6534,7 @@ impl LmEngine {
         if grammar.is_some() {
             req.thinking = Some(false);
         }
+        let budget = self.thinking_budget(&req)?;
         let (prompt, reasoning, images) = self.prompt(&req)?;
         if prompt.is_empty() {
             return Err(EngineError::InvalidRequest("the prompt is empty".into()));
@@ -6530,6 +6580,7 @@ impl LmEngine {
             ignore_eos: req.ignore_eos,
             min_tokens: req.min_tokens,
             reasoning,
+            budget,
             tools,
             cancel: req.cancel,
             sched: req.scheduling,
@@ -6570,6 +6621,7 @@ impl LmEngine {
                 ignore_eos: p.ignore_eos,
                 min_tokens: p.min_tokens,
                 reasoning: p.reasoning,
+                budget: p.budget,
                 tools: p.tools,
                 out,
                 cancel: p.cancel,
@@ -6596,6 +6648,7 @@ pub struct Prepared {
     ignore_eos: bool,
     min_tokens: u32,
     reasoning: Option<bool>,
+    budget: Option<u32>,
     tools: Vec<super::Tool>,
     cancel: CancellationToken,
     sched: Scheduling,
@@ -8482,6 +8535,7 @@ impl Worker {
                 }
                 seq.draft.tokens.truncate(cap);
                 seq.active.cut_at_trigger(&mut seq.draft.tokens);
+                seq.active.cut_at_budget(&mut seq.draft.tokens);
                 let n = seq.draft.tokens.len();
                 seq.draft.probs.truncate(n);
                 n_tok = n_tok.max(1 + seq.draft.tokens.len());
@@ -8905,6 +8959,13 @@ impl Worker {
                         .active
                         .advance(row, seq.n_past, &self.stop_tokens, &mut self.outbox)
                     {
+                        // The thinking budget's close took the token's place: the rows after
+                        // it followed the model's token (the drafts end there, `cut_at_budget`).
+                        Some(kept) if kept != t => {
+                            seq.next = kept;
+                            appended.push(kept);
+                            break;
+                        }
                         Some(t) => {
                             seq.next = t;
                             appended.push(t);
@@ -9733,6 +9794,8 @@ struct Active<'t> {
     queue_ms: f64,
     /// When its first token was sampled (decode starts).
     first: Option<Instant>,
+    /// The request's thinking budget, when it sent one ([`think_budget`]).
+    budget: Option<think_budget::ThinkBudget<'t>>,
 }
 
 impl<'t> Active<'t> {
@@ -9769,6 +9832,14 @@ impl<'t> Active<'t> {
             out: job.out.clone(),
         };
         let (text, live) = outbox.text(tokenizer, id, spec);
+        // Not under a response format: its grammar decides every token.
+        let budget = job
+            .budget
+            .filter(|_| job.grammar.is_none())
+            .zip(chat_format.think_marks())
+            .map(|(n, marks)| {
+                think_budget::ThinkBudget::new(marks, tokenizer, n, job.reasoning == Some(true))
+            });
         Self {
             sampler: Sampler::new(&job.sampling),
             constraint,
@@ -9789,6 +9860,7 @@ impl<'t> Active<'t> {
             admitted: Instant::now(),
             queue_ms: job.queued_at.elapsed().as_secs_f64() * 1e3,
             first: None,
+            budget,
         }
     }
 
@@ -9848,6 +9920,13 @@ impl<'t> Active<'t> {
         }
     }
 
+    /// Drafts end where the thinking budget replaces a token ([`think_budget::ThinkBudget::cut`]).
+    fn cut_at_budget(&self, drafts: &mut Vec<u32>) {
+        if let Some(b) = &self.budget {
+            b.cut(drafts);
+        }
+    }
+
     /// What a verify step must return for this sequence's `n` rows ([`verify_logits`]).
     fn verify_logits(&self, n: usize) -> Logits {
         verify_logits(self.logits_kind(), n, self.generated, self.min_tokens)
@@ -9879,8 +9958,11 @@ impl<'t> Active<'t> {
             return None;
         }
         let picked = matches!(out, StepRow::Picked(..));
-        let (token, raw) = match out {
-            StepRow::Logits(logits) => {
+        // The thinking budget's close, in place of the model's token.
+        let forced = self.budget.as_ref().and_then(|b| b.forced());
+        let (token, raw) = match (out, forced) {
+            (StepRow::Logits(logits), Some(t)) => (t, self.logprobs.map(|_| logits.to_vec())),
+            (StepRow::Logits(logits), None) => {
                 let raw = self.logprobs.map(|_| logits.to_vec());
                 // Below `min_tokens` stop tokens cannot be produced: mask them before sampling.
                 // `logits_kind` guarantees the full row whenever masking is needed.
@@ -9901,8 +9983,8 @@ impl<'t> Active<'t> {
                 }
                 (self.sampler.sample(logits), raw)
             }
-            StepRow::Argmax(token) => (token, None),
-            StepRow::Picked(token, raw) => (token, raw),
+            (StepRow::Argmax(token), forced) => (forced.unwrap_or(token), None),
+            (StepRow::Picked(token, raw), forced) => (forced.unwrap_or(token), raw),
         };
         self.first.get_or_insert_with(Instant::now);
         if let Some(constraint) = &mut self.constraint {
@@ -9931,6 +10013,9 @@ impl<'t> Active<'t> {
         }
         self.generated += 1;
         self.first_token.get_or_insert_with(Instant::now);
+        if let Some(b) = &mut self.budget {
+            b.accept(token);
+        }
 
         // Stop strings are not checked until `min_tokens` tokens exist.
         let checking = self.generated >= self.min_tokens;

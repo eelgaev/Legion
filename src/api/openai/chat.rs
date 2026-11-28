@@ -41,6 +41,11 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<serde_json::Value>,
     /// `"low" | "medium" | "high"`; any value turns reasoning output on.
     pub reasoning_effort: Option<String>,
+    /// Not in the OpenAI spec (llama.cpp's name; Strata's `reasoning_budget_tokens` works
+    /// too): at most this many reasoning tokens, then the reasoning is closed and the answer
+    /// follows. 0 closes it at once.
+    #[serde(alias = "reasoning_budget_tokens")]
+    pub thinking_budget_tokens: Option<u32>,
     /// Extra chat-template variables (llama.cpp / vLLM convention), e.g. `enable_thinking`.
     pub chat_template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
     /// Not in the OpenAI spec (vLLM extension): lower is served first under
