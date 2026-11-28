@@ -17,11 +17,16 @@ legion serve \
 ```
 
 Deterministic client: 8 fixed prompts (prose, code, lists, chats, a story; thinking off and on), temperature 0,
-256 tokens each, 2 rounds at 1, 4 and 16 users (2026-11-03). At 1 user the speed depends on how many drafts the
-prompt accepts: 24 to 49 tok/s per prompt, 34.8 in all, mean accepted length 3.58. 93.0 tok/s at 4 users, 254.9
-at 16 users. Prefill 8K 791, 32K 704 and 123K 532 tok/s, one request each, from the same server.
+256 tokens each, 2 rounds at 1, 4 and 16 users on each of two servers, medians of the 4 rounds (2026-11-28). At 1
+user the speed depends on how many drafts the prompt accepts: 23 to 49 tok/s per prompt, 35.0 in all, mean accepted
+length 3.6. 93.5 tok/s at 4 users, 250.5 at 16 users (241.6-253.0 over the rounds). Prefill 8K 1,306 and 32K 1,122
+tok/s, one request each from the same servers (mean of the two). 123K 738 tok/s, one request from a third server
+started on a cool GPU (38 C; it peaks at 80 C).
 
-Without `--spec-gate-cost-model off` (the same build, the run before): 16 users 137.0 tok/s, as MTP stops drafting
+The run of 2026-11-03, before the Q4_0 prompt matmuls: 24-49 per prompt, 93.0 at 4 users, 254.9 at 16 users,
+prefill 791 / 704 / 532.
+
+Without `--spec-gate-cost-model off` (the 2026-11-03 build, the run before it): 16 users 137.0 tok/s, as MTP stops drafting
 from 8 decoding sequences; 1 and 4 users 35.1 / 97.1, prefill 871 / 767 / 544 (a cooler GPU; the flag does not
 touch prompt steps).
 
