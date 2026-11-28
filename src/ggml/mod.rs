@@ -11,6 +11,8 @@ mod keep;
 pub mod meta;
 pub mod model_bytes;
 #[cfg(feature = "cuda")]
+mod node_digest;
+#[cfg(feature = "cuda")]
 mod op_profile;
 mod ops;
 mod ops_gemma4;

@@ -463,7 +463,11 @@ impl Backend {
             let raw = self.raw.as_ptr();
             // SAFETY: a live backend; the calls read its interface.
             let cuda = unsafe { ffi::ggml_backend_is_cuda(raw) } && !self.is_meta();
-            if cuda && super::stage_graph::enabled() && !super::op_profile::enabled() {
+            if cuda
+                && super::stage_graph::enabled()
+                && !super::op_profile::enabled()
+                && !super::node_digest::enabled()
+            {
                 // SAFETY: a live CUDA backend and an allocated kept graph (`late` one of its
                 // tensors), used from this thread only (&mut); nothing runs it meanwhile.
                 return unsafe {
@@ -776,12 +780,18 @@ unsafe fn run_graph(
     #[cfg(not(feature = "cuda"))]
     let _ = kept;
     #[cfg(feature = "cuda")]
-    if super::op_profile::enabled() && unsafe { ffi::ggml_backend_is_cuda(raw) } {
-        if let Some(l) = late.take() {
-            (l.fill)();
+    if (super::op_profile::enabled() || super::node_digest::enabled())
+        && unsafe { ffi::ggml_backend_is_cuda(raw) }
+    {
+        // SAFETY: an allocated graph.
+        let digest = unsafe { super::node_digest::begin(g) };
+        if super::op_profile::enabled() || digest.is_some() {
+            if let Some(l) = late.take() {
+                (l.fill)();
+            }
+            // SAFETY: a CUDA backend and an allocated graph, as for any compute.
+            return unsafe { super::op_profile::compute(raw, g, digest) };
         }
-        // SAFETY: a CUDA backend and an allocated graph, as for any compute.
-        return unsafe { super::op_profile::compute(raw, g) };
     }
     #[cfg(feature = "cuda")]
     if super::stage_graph::enabled() && unsafe { ffi::ggml_backend_is_cuda(raw) } {

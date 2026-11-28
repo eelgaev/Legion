@@ -226,6 +226,7 @@ unsafe fn weight_read(
 pub(crate) unsafe fn compute(
     raw: ffi::ggml_backend_t,
     g: *mut ffi::ggml_cgraph,
+    mut digest: Option<super::node_digest::Sink>,
 ) -> Result<(), GgmlError> {
     unsafe {
         cuda::legion_cuda_set_device(raw);
@@ -326,6 +327,9 @@ pub(crate) unsafe fn compute(
                 }
             }
             cudaEventRecord(b, stream);
+            if let Some(d) = digest.as_mut() {
+                d.node(i, node, stream);
+            }
             let key = key.unwrap_or_else(|| key_of(&op, &name));
             marks.push((a, b, format!("{dev}{key}"), read.map_or(0, |r| r.1)));
         }
